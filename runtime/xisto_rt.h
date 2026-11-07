@@ -3930,6 +3930,9 @@ static inline xs_byte *xs_u8_ptr(xs_Uint8Array *b, int64_t i, const xs_site *s) 
 }
 static inline int64_t xs_u8_get(xs_Uint8Array *b, int64_t i, const xs_site *s) { return (int64_t)*xs_u8_ptr(b, i, s); }
 static inline int64_t xs_u8_set(xs_Uint8Array *b, int64_t i, int64_t v, const xs_site *s) { *xs_u8_ptr(b, i, s) = (xs_byte)v; return v; }
+/* b[i] where the compiler proved i within b (bounds-check elimination in emit.c): no check */
+static inline xs_byte *xs_u8_at_nc(xs_Uint8Array *b, int64_t i) { return (xs_byte *)&b->data[i]; }
+static inline int64_t xs_u8_set_nc(xs_Uint8Array *b, int64_t i, int64_t v) { *xs_u8_at_nc(b, i) = (xs_byte)v; return v; }
 
 /* relative index as slice() reads it: negative from the end, clamped; INT64_MIN: "not given" -> dflt */
 static int64_t xs_u8_rel(int64_t i, int64_t len, int64_t dflt) {

@@ -1,0 +1,10 @@
+sum 2040
+255,238,221,204,187,170,153,136,119,102,85,68,204,221,238,255
+CGTAACACGGTT
+67,71,85,66,66,68,65,67,71,71,84,84
+past the end caught: index out of bounds 4896
+below zero caught: index out of bounds 5814
+5
+not a byte caught: index out of bounds
+small table caught: index out of bounds
+flat 31
