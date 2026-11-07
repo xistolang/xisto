@@ -946,6 +946,30 @@ static const char *binop(TokKind op) {
 }
 
 static bool is_f64_type(Type *t) { return t && t->kind == TY_OBJECT && t->cls && t->cls->builtin && strcmp(t->cls->cname, "xs_Float64Array") == 0; }
+static bool is_bytes_type(Type *t) { return t && t->kind == TY_OBJECT && t->cls && t->cls->builtin && strcmp(t->cls->cname, "xs_Uint8Array") == 0; } /* Uint8Array, Buffer */
+/* &b[i] on bytes, through xs_byte (see xs_u8_ptr): without the check when the loop proved the index (bce_safe) */
+static void emit_u8_ptr(Expr *e) {
+    if (bce_safe(e)) {
+        buf_puts(out, "(&((xs_byte *)(");
+        emit_borrowed(e->lhs);
+        buf_puts(out, ")->data)[");
+        if (e->rhs->kind == E_BINARY && (e->rhs->op == TK_PLUS || e->rhs->op == TK_MINUS)) { /* an affine index the guard proved within the array: it cannot overflow */
+            buf_puts(out, "(");
+            emit_expr(e->rhs->lhs);
+            buf_puts(out, e->rhs->op == TK_PLUS ? ") + (" : ") - (");
+            emit_expr(e->rhs->rhs);
+            buf_puts(out, ")");
+        } else emit_expr(e->rhs);
+        buf_puts(out, "])");
+        return;
+    }
+    buf_puts(out, "xs_u8_ptr(");
+    emit_borrowed(e->lhs);
+    buf_puts(out, ", ");
+    emit_expr(e->rhs);
+    site_arg(e->pos);
+    buf_puts(out, ")");
+}
 /* Address of a variable, field or array slot. */
 static void emit_lvalue_ptr(Expr *e) {
     switch (e->kind) {
@@ -2457,6 +2481,14 @@ static void emit_expr_raw(Expr *e) {
     case E_ASSIGN:
         if (e->lhs->kind == E_INDEX && e->lhs->builtin.cfn && strcmp(e->lhs->builtin.cfn, "xs_u8_get") == 0) { /* b[i] = v, b[i] += v: the low 8 bits */
             if (e->op == TK_ASSIGN) {
+                if (bce_safe(e->lhs)) { /* within the array: the store itself (the value of the expression stays the whole int, as xs_u8_set's) */
+                    buf_puts(out, "({ int64_t bv_ = ");
+                    emit_expr(e->rhs);
+                    buf_puts(out, "; *");
+                    emit_u8_ptr(e->lhs);
+                    buf_puts(out, " = (xs_byte)bv_; bv_; })");
+                    return;
+                }
                 buf_puts(out, "xs_u8_set(");
                 emit_borrowed(e->lhs->lhs);
                 buf_puts(out, ", ");
@@ -2467,20 +2499,17 @@ static void emit_expr_raw(Expr *e) {
                 buf_puts(out, ")");
                 return;
             }
-            buf_puts(out, "({ xs_byte *bp_ = xs_u8_ptr(");
-            emit_borrowed(e->lhs->lhs);
-            buf_puts(out, ", ");
-            emit_expr(e->lhs->rhs);
-            site_arg(e->pos);
+            buf_puts(out, "({ xs_byte *bp_ = ");
+            emit_u8_ptr(e->lhs);
             if (tk_bitop_of_assign(e->op)) { /* b[i] ^= k */
                 Expr cur = {0};
                 cur.kind = E_IDENT; cur.type = ty_int; cur.cname = "(int64_t)*bp_";
-                buf_puts(out, "); int64_t bv_ = ");
+                buf_puts(out, "; int64_t bv_ = ");
                 emit_bitop(tk_bitop_of_assign(e->op), &cur, e->rhs);
                 buf_puts(out, "; *bp_ = (xs_byte)bv_; bv_; })");
                 return;
             }
-            buf_printf(out, "); int64_t bv_ = (int64_t)*bp_ %s (", e->op == TK_PLUS_ASSIGN ? "+" : e->op == TK_MINUS_ASSIGN ? "-" : "*");
+            buf_printf(out, "; int64_t bv_ = (int64_t)*bp_ %s (", e->op == TK_PLUS_ASSIGN ? "+" : e->op == TK_MINUS_ASSIGN ? "-" : "*");
             emit_expr(e->rhs);
             buf_puts(out, "); *bp_ = (xs_byte)bv_; bv_; })");
             return;
@@ -2557,12 +2586,9 @@ static void emit_expr_raw(Expr *e) {
         return;
     case E_POSTFIX:
         if (e->lhs->kind == E_INDEX && e->lhs->builtin.cfn && strcmp(e->lhs->builtin.cfn, "xs_u8_get") == 0) { /* b[i]++ */
-            buf_puts(out, "({ xs_byte *bp_ = xs_u8_ptr(");
-            emit_borrowed(e->lhs->lhs);
-            buf_puts(out, ", ");
-            emit_expr(e->lhs->rhs);
-            site_arg(e->pos);
-            buf_printf(out, "); int64_t bv_ = *bp_; *bp_ = (xs_byte)(bv_ %s 1); bv_; })", e->op == TK_PLUSPLUS ? "+" : "-");
+            buf_puts(out, "({ xs_byte *bp_ = ");
+            emit_u8_ptr(e->lhs);
+            buf_printf(out, "; int64_t bv_ = *bp_; *bp_ = (xs_byte)(bv_ %s 1); bv_; })", e->op == TK_PLUSPLUS ? "+" : "-");
             return;
         }
         if (e->type->kind == TY_INT && e->builtin.cfn && strcmp(e->builtin.cfn, "counted_inc") == 0) {
@@ -2631,6 +2657,12 @@ static void emit_expr_raw(Expr *e) {
         buf_puts(out, ")");
         return;
     case E_INDEX:
+        if (e->builtin.cfn && strcmp(e->builtin.cfn, "xs_u8_get") == 0 && bce_safe(e)) { /* b[i] within the array: no check */
+            buf_puts(out, "((int64_t)*");
+            emit_u8_ptr(e);
+            buf_puts(out, ")");
+            return;
+        }
         if (e->builtin.cfn) { /* m[i] on a RegExp match (the group's text, borrowed), b[i] on bytes */
             buf_printf(out, "%s(", e->builtin.cfn);
             emit_borrowed(e->lhs);
@@ -3509,7 +3541,7 @@ typedef struct { const char *i, *a; bool guarded; Expr *idx; } BceLoop; /* guard
    idx: that exact index expression (a[i + E], a[E - i]) is within a */
 static BceLoop bce_loops[16];
 static int nbce;
-/* a is a Float64Array in a local of its own: its length never changes, and nothing but an assignment to a in
+/* a is a Float64Array or bytes in a local of its own: its length never changes, and nothing but an assignment to a in
    the body can make a name another array, so calls and other uses of a do not matter (bce_ok). (Calls are
    allowed only when the names the guard reads are plain locals too, which code called cannot change.) */
 static bool bce_fixed_len;
@@ -3553,11 +3585,13 @@ static bool bce_body_ok(Expr *e, Expr *parent, const char *a) {
     for (int i = 0; i < e->args.len; i++) if (!bce_body_ok(e->args.items[i], e, a)) return false;
     return true;
 }
-/* the indexable types the checks are dropped for: arrays, and Float64Array (the same ->len and ->data) */
-static bool bce_indexable(Type *t) { return t && (t->kind == TY_ARRAY || is_f64_type(t)); }
+/* the indexable types the checks are dropped for: arrays, Float64Array (the same ->len and ->data) and bytes
+   (Uint8Array, Buffer: ->f_length, and the bytes read through xs_byte) */
+static bool bce_indexable(Type *t) { return t && (t->kind == TY_ARRAY || is_f64_type(t) || is_bytes_type(t)); }
+static const char *bce_len_field(Type *t) { return is_bytes_type(t) ? "f_length" : "len"; }
 static bool bce_plain_local(const char *cname) { return cname && strncmp(cname, "v_", 2) == 0; } /* (not a global, nor a cell) */
 static bool bce_ok(Stmt *body, const char *a, Type *t, bool calls_ok) {
-    bce_fixed_len = calls_ok && is_f64_type(t) && bce_plain_local(a);
+    bce_fixed_len = calls_ok && (is_f64_type(t) || is_bytes_type(t)) && bce_plain_local(a);
     bool ok = bce_stmt_ok(body, a);
     bce_fixed_len = false;
     return ok;
@@ -3672,11 +3706,11 @@ static char *bce_version_guard(Stmt *s, const char **arrs, int *na) {
     Stmt *fi = s->for_init;
     if (!fi || fi->kind != S_VAR || !fi->cname || strcmp(fi->cname, i) != 0 || !fi->init || !bce_pure(fi->init)) return NULL;
     const char *cand[8];
-    Type *ct[8];
+    Type *ct[8], *at[8];
     int nc = 0;
     bce_arrays(s->body, i, cand, ct, &nc);
     bool plain = lim->kind == E_NUMBER || bce_plain_local(lim->cname);
-    for (int k = 0; k < nc; k++) if (bce_ok(s->body, cand[k], ct[k], plain) && strcmp(cand[k], i) != 0) arrs[(*na)++] = cand[k];
+    for (int k = 0; k < nc; k++) if (bce_ok(s->body, cand[k], ct[k], plain) && strcmp(cand[k], i) != 0) { at[*na] = ct[k]; arrs[(*na)++] = cand[k]; }
     nbce_aff = 0;
     bce_cur_body = s->body;
     bce_affine(s->body, i);
@@ -3695,14 +3729,14 @@ static char *bce_version_guard(Stmt *s, const char **arrs, int *na) {
     /* i runs over [st, last]: last = LIM - 1 (i < LIM) or LIM (i <= LIM); the loop runs only when st <= last */
     char *last = le ? xs_sprintf("(%s)", l) : xs_sprintf("((%s) - 1)", l);
     buf_printf(&g, "(%s) >= 0", st);
-    for (int k = 0; k < *na; k++) buf_printf(&g, " && %s < (int64_t)(%s)->len", last, ren(arrs[k]));
+    for (int k = 0; k < *na; k++) buf_printf(&g, " && %s < (int64_t)(%s)->%s", last, ren(arrs[k]), bce_len_field(at[k]));
     for (int k = 0; k < nbce_aff; k++) {
         bool ar3 = false;
         char *E = emit_expr_to_str(bce_aff[k].E, &ar3);
-        const char *A = ren(bce_aff[k].a);
-        if (bce_aff[k].sign == 1) buf_printf(&g, " && (%s) + (%s) >= 0 && %s + (%s) < (int64_t)(%s)->len", st, E, last, E, A);        /* i + E */
-        else if (bce_aff[k].sign == 2) buf_printf(&g, " && (%s) - (%s) >= 0 && %s - (%s) < (int64_t)(%s)->len", st, E, last, E, A); /* i - E */
-        else buf_printf(&g, " && (%s) - %s >= 0 && (%s) - (%s) < (int64_t)(%s)->len", E, last, E, st, A);                         /* E - i */
+        const char *A = ren(bce_aff[k].a), *L = bce_len_field(bce_aff[k].t);
+        if (bce_aff[k].sign == 1) buf_printf(&g, " && (%s) + (%s) >= 0 && %s + (%s) < (int64_t)(%s)->%s", st, E, last, E, A, L);        /* i + E */
+        else if (bce_aff[k].sign == 2) buf_printf(&g, " && (%s) - (%s) >= 0 && %s - (%s) < (int64_t)(%s)->%s", st, E, last, E, A, L); /* i - E */
+        else buf_printf(&g, " && (%s) - %s >= 0 && (%s) - (%s) < (int64_t)(%s)->%s", E, last, E, st, A, L);                         /* E - i */
     }
     return g.data;
 }
@@ -3719,6 +3753,90 @@ static bool bce_safe(Expr *e) {
             return r.ok && r.lo >= 0;
         }
     return false;
+}
+
+/* ---- the translate loop, as one runtime call (xs_u8_tr) ----
+   `for (let t = I0; t < LIM; t++) D[t + E] = T[S[F - t]]` over bytes (D, S, T Uint8Array or Buffer; the table
+   optional, so a copy too; each index t, t + E, E + t, t - E or E - t, with I0, LIM, E, F names and numbers)
+   becomes xs_u8_tr(D, I0 + E, S, F - I0, LIM - I0, -1, T): the ranges checked once, then a block of bytes per
+   step through vector table lookups, instead of a byte with three checks. The body is a single store, so no
+   name changes inside the loop. The destination runs forward only: when the arrays overlap, the runtime
+   repeats the loop in the same order. */
+static bool expr_mentions(Expr *e, const char *c) {
+    if (!e) return false;
+    if (e->kind == E_IDENT) return e->cname && strcmp(e->cname, c) == 0;
+    if (expr_mentions(e->lhs, c) || expr_mentions(e->rhs, c)) return true;
+    for (int k = 0; k < e->args.len; k++) if (expr_mentions(e->args.items[k], c)) return true;
+    return false;
+}
+typedef struct { Expr *arr, *E; int sign; bool sub; } TrIdx; /* index = sign * t + E (E NULL: t alone); sub: t - E */
+static bool tr_index(Expr *e, const char *t, TrIdx *x) {
+    if (!e || e->kind != E_INDEX || !e->builtin.cfn || strcmp(e->builtin.cfn, "xs_u8_get") != 0) return false;
+    if (!e->lhs || e->lhs->kind != E_IDENT || !e->lhs->cname || !is_bytes_type(e->lhs->type) || !e->rhs) return false;
+    Expr *i = e->rhs;
+    *x = (TrIdx){e->lhs, NULL, 1, false};
+    if (i->kind == E_IDENT) return i->cname && strcmp(i->cname, t) == 0;
+    if (i->kind != E_BINARY || (i->op != TK_PLUS && i->op != TK_MINUS)) return false;
+    bool li = i->lhs && i->lhs->kind == E_IDENT && i->lhs->cname && strcmp(i->lhs->cname, t) == 0;
+    bool ri = i->rhs && i->rhs->kind == E_IDENT && i->rhs->cname && strcmp(i->rhs->cname, t) == 0;
+    if (li == ri) return false;
+    x->E = li ? i->rhs : i->lhs;
+    if (!bce_pure(x->E) || expr_mentions(x->E, t)) return false;
+    x->sign = li || i->op == TK_PLUS ? 1 : -1;
+    x->sub = li && i->op == TK_MINUS;
+    return true;
+}
+/* the index at t = I0 (held in ti0_): I0 + E, I0 - E or E - I0, with the loop's overflow check and site */
+static void emit_tr_base(TrIdx *x, Expr *idx) {
+    if (!x->E) { buf_puts(out, "ti0_"); return; }
+    buf_puts(out, x->sign < 0 ? "xs_isub_s(" : x->sub ? "xs_isub_s(ti0_, " : "xs_iadd_s(ti0_, ");
+    emit_expr(x->E);
+    if (x->sign < 0) buf_puts(out, ", ti0_");
+    site_arg(idx->pos);
+    buf_puts(out, ")");
+}
+static bool emit_tr_loop(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_BCE")) return false;
+    Expr *u = s->for_update, *c = s->cond;
+    Stmt *fi = s->for_init;
+    if (!u || !u->builtin.cfn || strcmp(u->builtin.cfn, "counted_inc") != 0 || !u->lhs || !u->lhs->cname) return false;
+    const char *t = u->lhs->cname;
+    if (!c || c->kind != E_BINARY || c->op != TK_LT || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, t) != 0) return false;
+    if (!c->rhs || !bce_pure(c->rhs) || expr_mentions(c->rhs, t)) return false;
+    if (!fi || fi->kind != S_VAR || !fi->cname || strcmp(fi->cname, t) != 0 || !fi->init || !bce_pure(fi->init) || expr_mentions(fi->init, t)) return false;
+    Stmt *b = s->body;
+    if (b && b->kind == S_BLOCK) { if (b->stmts.len != 1) return false; b = b->stmts.items[0]; }
+    if (!b || b->kind != S_EXPR || !b->expr) return false;
+    Expr *a = b->expr;
+    if (a->kind != E_ASSIGN || a->op != TK_ASSIGN) return false;
+    TrIdx d, src;
+    Expr *tbl = NULL, *v = a->rhs;
+    if (!tr_index(a->lhs, t, &d) || d.sign != 1) return false;
+    if (v && v->kind == E_INDEX && v->builtin.cfn && strcmp(v->builtin.cfn, "xs_u8_get") == 0 && v->rhs && v->rhs->kind == E_INDEX) {
+        if (!v->lhs || v->lhs->kind != E_IDENT || !v->lhs->cname || !is_bytes_type(v->lhs->type)) return false;
+        tbl = v;
+        v = v->rhs;
+    }
+    if (!tr_index(v, t, &src)) return false;
+    buf_puts(out, "{ int64_t ti0_ = ");
+    emit_expr(fi->init);
+    buf_puts(out, ", tl_ = ");
+    emit_expr(c->rhs);
+    buf_puts(out, "; if (tl_ > ti0_) xs_u8_tr(");
+    emit_borrowed(d.arr);
+    buf_puts(out, ", ");
+    emit_tr_base(&d, a->lhs);
+    buf_puts(out, ", ");
+    emit_borrowed(src.arr);
+    buf_puts(out, ", ");
+    emit_tr_base(&src, v);
+    buf_printf(out, ", xs_tr_n(tl_, ti0_), %d, ", src.sign);
+    if (tbl) emit_borrowed(tbl->lhs); else buf_puts(out, "(xs_Uint8Array *)0");
+    site_arg(a->lhs->pos);
+    site_arg(v->pos);
+    site_arg(tbl ? tbl->pos : v->pos);
+    buf_puts(out, "); }");
+    return true;
 }
 
 /* a for statement (S_FOR); emit_stmt_ marks its counted increment and its checked-index loops first */
@@ -4189,6 +4307,7 @@ static void emit_stmt_(Stmt *s) {
     }
     case S_FOR: {
         mark_counted_inc(s);
+        if (emit_tr_loop(s)) return;
         int saved_nbce = nbce;
         bce_enter(s);
         if (nbce == saved_nbce) { /* not a[i] < a.length: maybe a loop to version (bce_version_guard) */

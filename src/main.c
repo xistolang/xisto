@@ -455,7 +455,7 @@ static char *runtime_object(const char *cc) {
     if (link_tls && tls_awslc()) inc = xs_sprintf("%s -I'%s/include'", inc, awslc_dir());
     else if (link_tls) inc = xs_sprintf("%s -I'%s/bearssl-inc'", inc, xisto_dir);
     char *tmp = xs_sprintf("%s.%d.tmp", obj, (int)getpid());
-    char *cmd = xs_sprintf("%s -std=c11 -O2 %s -ffp-contract=off -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
+    char *cmd = xs_sprintf("%s -std=c11 -O2 %s -ffp-contract=off -fno-math-errno -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
                            "-Wno-ignored-qualifiers -Wno-return-type -Wno-unused-command-line-argument %s %s -c -o '%s' '%s'",
                            cc, extra, XS_LINK_FLAGS, inc, tmp, src);
     if (system(cmd) != 0 || rename(tmp, obj) != 0) {
@@ -535,7 +535,7 @@ static char *compile_units(const char *cc, const char *flags, const char *cfile)
                 fwrite(units[0].data, 1, pre_len, hf);
                 fclose(hf);
                 if (access(hdr, R_OK) != 0) rename(htmp, hdr); else unlink(htmp);
-                char *cmd = xs_sprintf("%s -std=c11 %s -ffp-contract=off -w -I'%s' -x c-header -o '%s' '%s' 2>/dev/null", cc, flags, xisto_dir, tmp, hdr); /* no link flags: they make clang expect several outputs */
+                char *cmd = xs_sprintf("%s -std=c11 %s -ffp-contract=off -fno-math-errno -w -I'%s' -x c-header -o '%s' '%s' 2>/dev/null", cc, flags, xisto_dir, tmp, hdr); /* no link flags: they make clang expect several outputs */
                 if (link_tls && tls_awslc()) cmd = xs_sprintf("%s -I'%s/include'", cmd, awslc_dir());
                 else if (link_tls) cmd = xs_sprintf("%s -I'%s/bearssl-inc'", cmd, xisto_dir);
                 if (system(cmd) != 0 || rename(tmp, pch) != 0) pch = NULL;
@@ -563,7 +563,7 @@ static char *compile_units(const char *cc, const char *flags, const char *cfile)
         fclose(uf);
         free(units[u].data);
         tmps[u] = xs_sprintf("%s.%d.%d.tmp", outs[u], (int)getpid(), u);
-        char *cmd = xs_sprintf("%s -std=c11 %s -ffp-contract=off -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
+        char *cmd = xs_sprintf("%s -std=c11 %s -ffp-contract=off -fno-math-errno -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
                                "-Wno-ignored-qualifiers -Wno-return-type -Wno-unused-command-line-argument %s -I'%s'%s -c -o '%s' '%s'",
                                cc, flags, XS_LINK_FLAGS, xisto_dir, pch ? xs_sprintf(" -include-pch '%s'", pch) : "", tmps[u], ufile);
         if (link_tls && tls_awslc()) cmd = xs_sprintf("%s -I'%s/include'", cmd, awslc_dir());
@@ -668,7 +668,7 @@ static void run_cc_target(const char *cfile, const char *outfile, bool dev) {
         extra = xs_sprintf("-I%s %s", xs_q(xisto_dir), xs_q(obj));
     }
     bool win = strstr(xs_target, "windows") != NULL;
-    char *cmd = xs_sprintf("%s -std=c11 %s -mllvm -hot-cold-split=false -ffp-contract=off -fno-omit-frame-pointer -ffunction-sections -fdata-sections "
+    char *cmd = xs_sprintf("%s -std=c11 %s -mllvm -hot-cold-split=false -ffp-contract=off -fno-math-errno -fno-omit-frame-pointer -ffunction-sections -fdata-sections "
                            "%s -static -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
                            "-Wno-ignored-qualifiers -Wno-return-type -Wno-incompatible-pointer-types-discards-qualifiers -o %s %s %s -lm -lpthread%s",
                            cc, flags, win ? "" : "-Wl,--gc-sections", xs_q(outfile), xs_q(cfile), xs_sprintf("%s %s", extra, tls_extra), win ? " -lws2_32" : "");
@@ -691,7 +691,9 @@ static void run_cc_raw(const char *cfile, const char *outfile, bool dev) {
         flags = xs_sprintf("%s -march=%s", flags, xs_cpu);
 #endif
     }
-    /* JS semantics are strict IEEE 754: no fused multiply-add. */
+    /* JS semantics are strict IEEE 754: no fused multiply-add. -fno-math-errno (the Darwin default, not the
+       Linux one): Math.sqrt never sets errno, so sqrt is one instruction, with no test and call for a negative
+       argument, and a loop of them can be vectorized; the values are the same. */
 #ifdef XS_CLANG_FLAGS
     if (cc_is_clang(cc)) flags = xs_sprintf("%s %s", flags, XS_CLANG_FLAGS);
 #endif
@@ -707,7 +709,7 @@ static void run_cc_raw(const char *cfile, const char *outfile, bool dev) {
     char *input = units ? units : xs_sprintf("'%s'", cfile);
     if (build_dylib) input = xs_sprintf("-dynamiclib -Wl,-exported_symbol,_main %s", input);
     if (units) flags = xs_sprintf("%s -Wno-unused-command-line-argument", flags); /* a link: no compile flags apply */
-    char *cmd = xs_sprintf("%s -std=c11 %s -ffp-contract=off -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality -Wno-ignored-qualifiers -Wno-return-type %s -o '%s' %s %s -lm %s",
+    char *cmd = xs_sprintf("%s -std=c11 %s -ffp-contract=off -fno-math-errno -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality -Wno-ignored-qualifiers -Wno-return-type %s -o '%s' %s %s -lm %s",
                            cc, flags, XS_LINK_FLAGS, outfile, input, rtobj ? xs_sprintf("'%s'", rtobj) : "", XS_LINK_LIBS);
     if (link_tls && tls_awslc()) { /* AWS-LC: libssl is C++ inside, hence the C++ runtime */
         const char *d = awslc_dir();

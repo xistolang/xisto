@@ -22,13 +22,16 @@ function count(seq: Uint8Array, k: int): Map<int, int> {
   if (size <= 0) return counts;
   let key: int = 0;
   for (let i = 0; i < k; i++) key = key * 4 + seq[i];
-  for (let i = 0; ; i++) {
+  // a counted loop (the compiler then reads seq[i] and seq[i + k] without checks); the last k-mer after it
+  const last = size - 1;
+  for (let i = 0; i < last; i++) {
     if (counts.has(key)) counts.set(key, counts.get(key)! + 1);
     else counts.set(key, 1);
-    if (i + 1 >= size) break;
     // the next k-mer: the first nucleotide out (a multiplication, not a division), the next one in
     key = (key - seq[i] * top) * 4 + seq[i + k];
   }
+  if (counts.has(key)) counts.set(key, counts.get(key)! + 1);
+  else counts.set(key, 1);
   return counts;
 }
 
@@ -81,13 +84,21 @@ function sequence(): Uint8Array {
     if (end - at >= 6 && input[at] === 62 && input[at + 1] === 84 && input[at + 2] === 72) { at = end + 1; break; }
     at = end + 1;
   }
-  const seq = new Uint8Array(n - at);
+  const next = input.indexOf(62, at); // the next header, or the end
+  const end: int = next < 0 ? n : next;
+  const seq = new Uint8Array(end - at);
   let len: int = 0;
-  for (let i = at; i < n; i++) {
-    const c = input[i];
-    if (c === 62) break;
-    if (c !== 10) { seq[len] = (c >> 1) & 3; len++; } // a c g t, A C G T: 0 1 3 2
+  // the lines without their newlines: each a copy the compiler makes one call (a memmove)
+  while (at < end) {
+    const nl = input.indexOf(10, at);
+    const le: int = nl < 0 || nl > end ? end : nl;
+    const run = le - at;
+    for (let t = 0; t < run; t++) seq[len + t] = input[at + t];
+    len += run;
+    at = le + 1;
   }
+  // a c g t, A C G T: 0 1 3 2, in one pass the C compiler vectorizes (no newline to skip, no check: i < len)
+  for (let i = 0; i < len; i++) seq[i] = (seq[i] >> 1) & 3;
   return seq.subarray(0, len);
 }
 

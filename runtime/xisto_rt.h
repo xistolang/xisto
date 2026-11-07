@@ -1514,6 +1514,39 @@ typedef struct xs_map {
 #define XS_MAP_DEL 0xFE
 #define XS_MAP_GW 16 /* slots in a group */
 #define XS_MAP_FULL(m, i) ((m)->ctrl[i] < 0x80)
+/* ---- SIMD: the processor's extensions, checked once ----
+   A program is compiled for the base ISA of its target (NEON on arm64, SSE2 on x86-64) so the same binary
+   runs on any processor of that architecture. The routines with a wider path (SSSE3's byte shuffle, AVX2's
+   32-byte registers) are compiled for that extension alone (the target attribute) and chosen per call after
+   a cpuid check cached in a global: one branch per call, not per byte. --cpu=native lets the C compiler use
+   AVX2 everywhere, including here; these paths matter for the portable binary. */
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define XS_NEON 1
+#elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <cpuid.h>
+#include <immintrin.h>
+#define XS_X86 1
+static int xs_cpu_ = -1; /* bit 0: SSSE3; bit 1: AVX2 with the OS saving the YMM registers (racy writes of the same value) */
+static int xs_cpu_bits(void) {
+    if (xs_cpu_ < 0) {
+        unsigned a, b, c, d, bits = 0;
+        if (__get_cpuid(1, &a, &b, &c, &d)) {
+            if (c & bit_SSSE3) bits |= 1;
+            /* AVX2: leaf 7, and XGETBV says the OS keeps the whole YMM state on a context switch */
+            if ((c & bit_OSXSAVE) && (c & bit_AVX) && __get_cpuid_count(7, 0, &a, &b, &c, &d) && (b & bit_AVX2)) {
+                unsigned lo, hi;
+                __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+                if ((lo & 6) == 6) bits |= 2;
+            }
+        }
+        xs_cpu_ = (int)bits;
+    }
+    return xs_cpu_;
+}
+static bool xs_has_ssse3(void) { return (xs_cpu_bits() & 1) != 0; }
+static bool xs_has_avx2(void) { return (xs_cpu_bits() & 2) != 0; }
+#endif
 /* a group's bytes equal to b, as a mask: bit (slot << XS_MAP_GSH) set for each; XS_MAP_GBIT gives the lowest slot */
 #if defined(__aarch64__) && defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -3987,9 +4020,193 @@ XS_NOINLINE int64_t xs_buf_index_of_str(xs_Uint8Array *b, xs_str *p, int64_t fro
     return h ? (int64_t)((const uint8_t *)h - b->data) : -1;
 }
 XS_NOINLINE bool xs_buf_includes_str(xs_Uint8Array *b, xs_str *p, int64_t from) { return xs_buf_index_of_str(b, p, from) >= 0; }
+/* ---- bytes 16 or 32 at a time: reverse(), copyWithin() and the translate loop the compiler recognizes ---- */
+#ifdef XS_NEON
+static inline uint8x16_t xs_rev16(uint8x16_t v) { v = vrev64q_u8(v); return vextq_u8(v, v, 8); } /* the 16 bytes backwards */
+/* x through a 256-byte table held in 16 registers: four 64-entry lookups (tbl gives 0 for an index past the
+   64), each on x less 64 more, or'ed. Any table, no analysis: 11 instructions per 16 bytes. */
+typedef struct { uint8x16x4_t q[4]; } xs_tbl256;
+static inline xs_tbl256 xs_tbl256_load(const uint8_t *tp) {
+    xs_tbl256 t = {{vld1q_u8_x4(tp), vld1q_u8_x4(tp + 64), vld1q_u8_x4(tp + 128), vld1q_u8_x4(tp + 192)}};
+    return t;
+}
+static inline uint8x16_t xs_tbl256_look(const xs_tbl256 *t, uint8x16_t x) {
+    const uint8x16_t k64 = vdupq_n_u8(64);
+    uint8x16_t r = vqtbl4q_u8(t->q[0], x);
+    x = vsubq_u8(x, k64); r = vorrq_u8(r, vqtbl4q_u8(t->q[1], x));
+    x = vsubq_u8(x, k64); r = vorrq_u8(r, vqtbl4q_u8(t->q[2], x));
+    x = vsubq_u8(x, k64); r = vorrq_u8(r, vqtbl4q_u8(t->q[3], x));
+    return r;
+}
+/* dp[t] = tp[sp[t]] (rev: tp[sp[n - 1 - t]]) for n >= 16 bytes, tp a 256-byte table or NULL (a copy); dp and sp
+   are the same bytes or disjoint. The last block is loaded before any store and written last, so a length
+   that is not a multiple of 16 costs one overlapping block, not a scalar tail. */
+static void xs_u8_tr_neon(uint8_t *dp, const uint8_t *sp, int64_t n, const uint8_t *tp, bool rev) {
+    xs_tbl256 t;
+    if (tp) t = xs_tbl256_load(tp);
+    uint8x16_t last = vld1q_u8(rev ? sp : sp + n - 16);
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        uint8x16_t x = rev ? xs_rev16(vld1q_u8(sp + n - 16 - i)) : vld1q_u8(sp + i);
+        vst1q_u8(dp + i, tp ? xs_tbl256_look(&t, x) : x);
+    }
+    if (i < n) {
+        uint8x16_t x = rev ? xs_rev16(last) : last;
+        vst1q_u8(dp + n - 16, tp ? xs_tbl256_look(&t, x) : x);
+    }
+}
+#endif
+#ifdef XS_X86
+/* the 16-entry blocks of a 256-byte table that are not the identity, as bits (SSE2: the base ISA) */
+static unsigned xs_tr_blocks(const uint8_t *tp) {
+    unsigned m = 0;
+    __m128i id = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    const __m128i k16 = _mm_set1_epi8(16);
+    for (int k = 0; k < 16; k++, id = _mm_add_epi8(id, k16))
+        if (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)(tp + 16 * k)), id)) != 0xFFFF) m |= 1u << k;
+    return m;
+}
+#define XS_TR_MAXB 8 /* non-identity blocks a vector lookup pays for (one shuffle + select per block) */
+/* x86 has no 256-entry shuffle: a byte goes through each non-identity block of the table (pshufb on the low
+   nibble, where the high nibble is that block's; the index 0xFF elsewhere, which pshufb maps to 0), the blocks
+   or'ed, and stays itself where no block applied. The same shape as xs_u8_tr_neon (n >= 16; last block first). */
+__attribute__((target("ssse3"))) static void xs_u8_tr_ssse3(uint8_t *dp, const uint8_t *sp, int64_t n, const uint8_t *tp, unsigned blocks, bool rev) {
+    const __m128i ridx = _mm_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+    const __m128i m0f = _mm_set1_epi8(0x0f), ones = _mm_set1_epi8(-1);
+    __m128i tb[XS_TR_MAXB], kb[XS_TR_MAXB];
+    int nb = 0;
+    for (unsigned k = 0; k < 16; k++)
+        if (blocks >> k & 1) { tb[nb] = _mm_loadu_si128((const __m128i *)(tp + 16 * k)); kb[nb] = _mm_set1_epi8((char)k); nb++; }
+    __m128i last = _mm_loadu_si128((const __m128i *)(rev ? sp : sp + n - 16));
+    for (int64_t i = 0, at = 0;; i += 16) {
+        __m128i x;
+        if (i + 16 <= n) { x = _mm_loadu_si128((const __m128i *)(rev ? sp + n - 16 - i : sp + i)); at = i; }
+        else if (i < n) { x = last; at = n - 16; }
+        else break;
+        if (rev) x = _mm_shuffle_epi8(x, ridx);
+        __m128i hi = _mm_and_si128(_mm_srli_epi16(x, 4), m0f), lo = _mm_and_si128(x, m0f), r = _mm_setzero_si128(), hit = _mm_setzero_si128();
+        for (int b = 0; b < nb; b++) {
+            __m128i m = _mm_cmpeq_epi8(hi, kb[b]);
+            r = _mm_or_si128(r, _mm_shuffle_epi8(tb[b], _mm_or_si128(lo, _mm_andnot_si128(m, ones))));
+            hit = _mm_or_si128(hit, m);
+        }
+        _mm_storeu_si128((__m128i *)(dp + at), _mm_or_si128(r, _mm_andnot_si128(hit, x)));
+    }
+}
+__attribute__((target("avx2"))) static inline __m256i xs_rev32_avx2(__m256i v, __m256i ridx) { /* the lanes reversed, then swapped */
+    v = _mm256_shuffle_epi8(v, ridx);
+    return _mm256_permute2x128_si256(v, v, 1);
+}
+/* the same with 32-byte registers and a byte select (n >= 32) */
+__attribute__((target("avx2"))) static void xs_u8_tr_avx2(uint8_t *dp, const uint8_t *sp, int64_t n, const uint8_t *tp, unsigned blocks, bool rev) {
+    const __m256i ridx = _mm256_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+    const __m256i m0f = _mm256_set1_epi8(0x0f);
+    __m256i tb[XS_TR_MAXB], kb[XS_TR_MAXB];
+    int nb = 0;
+    for (unsigned k = 0; k < 16; k++)
+        if (blocks >> k & 1) { tb[nb] = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(tp + 16 * k))); kb[nb] = _mm256_set1_epi8((char)k); nb++; }
+    __m256i last = _mm256_loadu_si256((const __m256i *)(rev ? sp : sp + n - 32));
+    for (int64_t i = 0, at = 0;; i += 32) {
+        __m256i x;
+        if (i + 32 <= n) { x = _mm256_loadu_si256((const __m256i *)(rev ? sp + n - 32 - i : sp + i)); at = i; }
+        else if (i < n) { x = last; at = n - 32; }
+        else break;
+        if (rev) x = xs_rev32_avx2(x, ridx);
+        __m256i hi = _mm256_and_si256(_mm256_srli_epi16(x, 4), m0f), lo = _mm256_and_si256(x, m0f), r = x;
+        for (int b = 0; b < nb; b++) r = _mm256_blendv_epi8(r, _mm256_shuffle_epi8(tb[b], lo), _mm256_cmpeq_epi8(hi, kb[b]));
+        _mm256_storeu_si256((__m256i *)(dp + at), r);
+    }
+}
+/* the outer 16 (32) bytes of p[0..n) swapped, each reversed, while 32 (64) remain; returns the bytes done at each end */
+__attribute__((target("ssse3"))) static int64_t xs_u8_rev_ssse3(uint8_t *p, int64_t n) {
+    const __m128i ridx = _mm_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+    int64_t i = 0, j = n;
+    for (; j - i >= 32; i += 16, j -= 16) {
+        __m128i lo = _mm_loadu_si128((const __m128i *)(p + i)), hi = _mm_loadu_si128((const __m128i *)(p + j - 16));
+        _mm_storeu_si128((__m128i *)(p + i), _mm_shuffle_epi8(hi, ridx));
+        _mm_storeu_si128((__m128i *)(p + j - 16), _mm_shuffle_epi8(lo, ridx));
+    }
+    return i;
+}
+__attribute__((target("avx2"))) static int64_t xs_u8_rev_avx2(uint8_t *p, int64_t n) {
+    const __m256i ridx = _mm256_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+    int64_t i = 0, j = n;
+    for (; j - i >= 64; i += 32, j -= 32) {
+        __m256i lo = _mm256_loadu_si256((const __m256i *)(p + i)), hi = _mm256_loadu_si256((const __m256i *)(p + j - 32));
+        _mm256_storeu_si256((__m256i *)(p + i), xs_rev32_avx2(hi, ridx));
+        _mm256_storeu_si256((__m256i *)(p + j - 32), xs_rev32_avx2(lo, ridx));
+    }
+    return i;
+}
+#endif
 XS_NOINLINE xs_Uint8Array *xs_u8_reverse(xs_Uint8Array *b) {
-    for (int64_t i = 0, j = b->f_length - 1; i < j; i++, j--) { uint8_t t = b->data[i]; b->data[i] = b->data[j]; b->data[j] = t; }
+    uint8_t *p = b->data;
+    int64_t n = b->f_length, i = 0;
+#ifdef XS_NEON
+    for (; n - 2 * i >= 32; i += 16) {
+        uint8x16_t lo = vld1q_u8(p + i), hi = vld1q_u8(p + n - 16 - i);
+        vst1q_u8(p + i, xs_rev16(hi));
+        vst1q_u8(p + n - 16 - i, xs_rev16(lo));
+    }
+#elif defined(XS_X86)
+    if (n >= 64 && xs_has_avx2()) i = xs_u8_rev_avx2(p, n);
+    else if (n >= 32 && xs_has_ssse3()) i = xs_u8_rev_ssse3(p, n);
+#endif
+    for (int64_t j = n - 1 - i; i < j; i++, j--) { uint8_t t = p[i]; p[i] = p[j]; p[j] = t; }
     return xs_retain(b);
+}
+XS_NOINLINE xs_Uint8Array *xs_u8_copy_within(xs_Uint8Array *b, int64_t target, int64_t start, int64_t end) {
+    int64_t len = b->f_length, to = xs_u8_rel(target, len, 0), s = xs_u8_rel(start, len, 0), e = xs_u8_rel(end, len, len);
+    int64_t cnt = e - s;
+    if (cnt > len - to) cnt = len - to;
+    if (cnt > 0) memmove(b->data + to, b->data + s, (size_t)cnt);
+    return xs_retain(b);
+}
+/* The loop `for (let t = 0; t < n; t++) dst[d + t] = table[src[s ± t]]` (emit.c recognizes it, also without the
+   table: a copy) as one call: the three ranges checked once, then a block of bytes per step (xs_u8_tr_neon,
+   xs_u8_tr_avx2...). The result is the loop's, including which index fails: when a range is out of bounds, the
+   table shorter than 256 (a lookup could fail), or the arrays overlap in a way a sequential loop would see
+   (the table inside the written range, the source shifted against the destination, a reversed copy in place),
+   the loop itself runs. dir is 1 or -1: the source index is s + dir * t. */
+static inline int64_t xs_tr_n(int64_t lim, int64_t i0) { /* the iterations of t from i0 below lim (lim > i0), saturated */
+    uint64_t n = (uint64_t)lim - (uint64_t)i0;
+    return n > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)n;
+}
+XS_NOINLINE void xs_u8_tr(xs_Uint8Array *dst, int64_t d, xs_Uint8Array *src, int64_t s, int64_t n, int64_t dir, xs_Uint8Array *table,
+                          const xs_site *sd, const xs_site *ss, const xs_site *st) {
+    if (n <= 0) return;
+    int64_t dl = dst->f_length, sl = src->f_length;
+    bool rev = dir < 0;
+    bool ok = n <= dl && d >= 0 && d <= dl - n && n <= sl && s >= 0 && s < sl && (rev ? s >= n - 1 : s <= sl - n) && (!table || table->f_length >= 256);
+    uint8_t *dp = dst->data + d;
+    const uint8_t *sp = src->data + (rev ? s - (n - 1) : s), *tp = table ? table->data : NULL;
+    uintptr_t du = (uintptr_t)dp, su = (uintptr_t)sp;
+    if (ok && tp && (uintptr_t)tp < du + (uintptr_t)n && du < (uintptr_t)tp + 256) ok = false;
+    if (ok && su != du && su < du + (uintptr_t)n && du < su + (uintptr_t)n) ok = false;
+    if (ok && su == du && rev) ok = false;
+    if (!ok) { /* the loop as written, with every check (it fails where the loop fails) */
+        for (int64_t t = 0; t < n; t++) {
+            int64_t v = xs_u8_get(src, s + dir * t, ss);
+            if (table) v = xs_u8_get(table, v, st);
+            xs_u8_set(dst, d + t, v, sd);
+        }
+        return;
+    }
+    if (!tp && !rev) { memmove(dp, sp, (size_t)n); return; }
+#ifdef XS_NEON
+    if (n >= 16) { xs_u8_tr_neon(dp, sp, n, tp, rev); return; }
+#elif defined(XS_X86)
+    if (n >= 16) {
+        unsigned blocks = tp ? xs_tr_blocks(tp) : 0;
+        if (__builtin_popcount(blocks) <= XS_TR_MAXB) {
+            if (n >= 32 && xs_has_avx2()) { xs_u8_tr_avx2(dp, sp, n, tp, blocks, rev); return; }
+            if (xs_has_ssse3()) { xs_u8_tr_ssse3(dp, sp, n, tp, blocks, rev); return; }
+        }
+    }
+#endif
+    if (!tp) for (int64_t t = 0; t < n; t++) dp[t] = sp[n - 1 - t];
+    else if (rev) for (int64_t t = 0; t < n; t++) dp[t] = tp[sp[n - 1 - t]];
+    else for (int64_t t = 0; t < n; t++) dp[t] = tp[sp[t]];
 }
 XS_NOINLINE bool xs_u8_equals(xs_Uint8Array *a, xs_Uint8Array *b) { return a->f_length == b->f_length && memcmp(a->data, b->data, (size_t)a->f_length) == 0; }
 XS_NOINLINE xs_str *xs_u8_join(xs_Uint8Array *b, xs_str *sep) {
@@ -4222,9 +4439,7 @@ static const char xs_b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 static const char xs_b64url[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 /* arm64: base64 and hex 16 bytes at a time (NEON table lookups); the scalar code does the rest and every
    error, padding and whitespace case. Other targets use the scalar code only. */
-#if defined(__aarch64__) && defined(__ARM_NEON)
-#include <arm_neon.h>
-#define XS_NEON 1
+#ifdef XS_NEON
 /* hex characters to nibbles, 16 pairs at a time; stops before the first block with a non-hex character */
 static int64_t xs_hex_dec_neon(const char *s, int64_t pairs, uint8_t *out) {
     int64_t k = 0;
@@ -4244,18 +4459,11 @@ static int64_t xs_hex_dec_neon(const char *s, int64_t pairs, uint8_t *out) {
     return k;
 }
 #endif
-/* x86-64: the base ISA has no byte shuffle, so SSSE3 is checked once at run time (cpuid) and these functions
-   are compiled for it alone (Muła's and aklomp/base64's algorithms): 12 bytes -> 16 characters, 16 characters
-   -> 12 bytes while every character is in the standard alphabet. Everything else stays scalar. */
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-#include <cpuid.h>
-#include <tmmintrin.h>
+/* x86-64: the base ISA has no byte shuffle, so SSSE3 is checked once at run time (xs_has_ssse3) and these
+   functions are compiled for it alone (Muła's and aklomp/base64's algorithms): 12 bytes -> 16 characters, 16
+   characters -> 12 bytes while every character is in the standard alphabet. Everything else stays scalar. */
+#ifdef XS_X86
 #define XS_X86_B64 1
-static int xs_ssse3_ = -1;
-static bool xs_has_ssse3(void) {
-    if (xs_ssse3_ < 0) { unsigned a, b, c, d; xs_ssse3_ = __get_cpuid(1, &a, &b, &c, &d) && (c & bit_SSSE3) ? 1 : 0; }
-    return xs_ssse3_ == 1;
-}
 /* encodes 12 bytes per round from in (reading 16, so while 16 remain); returns the bytes consumed */
 __attribute__((target("ssse3"))) static int64_t xs_b64_enc_ssse3(const uint8_t *in, int64_t n, char *o, bool url) {
     const __m128i shuf = _mm_set_epi8(10, 11, 9, 10, 7, 8, 6, 7, 4, 5, 3, 4, 1, 2, 0, 1);

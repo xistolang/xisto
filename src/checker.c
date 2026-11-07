@@ -439,6 +439,15 @@ static void check_bytes_member(Expr *e, Class *c) {
         return;
     }
     if (strcmp(m, "reverse") == 0) { ARGS(0, 0); e->builtin.cfn = "xs_u8_reverse"; e->type = ty_object_of(c); return; }
+    if (strcmp(m, "copyWithin") == 0) { /* b.copyWithin(target, start = 0, end = length): a memmove inside the array */
+        ARGS(1, 3);
+        for (int k = 0; k < n; k++) int_arg(&e->args.items[k], "argument of copyWithin");
+        PAD_INT(1, 0);
+        PAD_INT(2, XS_NOT_GIVEN);
+        e->builtin.cfn = "xs_u8_copy_within";
+        e->type = ty_object_of(c);
+        return;
+    }
     if (strcmp(m, "equals") == 0) {
         ARGS(1, 1);
         check_expr(e->args.items[0], NULL);
@@ -474,7 +483,7 @@ static void check_bytes_member(Expr *e, Class *c) {
         return;
     }
     (void)u8;
-    xs_error(e->pos, "supported: length, slice, subarray, set, fill, indexOf, includes, reverse, join, toString, toBase64, toHex (and Buffer: equals, toString(encoding))", "%s has no method '%s'", c->name, m);
+    xs_error(e->pos, "supported: length, slice, subarray, set, fill, indexOf, includes, reverse, copyWithin, join, toString, toBase64, toHex (and Buffer: equals, toString(encoding))", "%s has no method '%s'", c->name, m);
     #undef ARGS
     #undef PAD_INT
 }
