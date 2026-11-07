@@ -4651,16 +4651,146 @@ static bool xs_big_ge(xs_big *a, xs_big *b) { return xs_big_cmp(a, b) >= 0; }
 static bool xs_big_eq(xs_big *a, xs_big *b) { return xs_big_cmp(a, b) == 0; }
 static bool xs_big_ne(xs_big *a, xs_big *b) { return xs_big_cmp(a, b) != 0; }
 
+/* Limb-vector primitives (as GMP's mpn layer): r may be the same array as x (in place), never partly overlapping.
+   The carry chains go through __builtin_addcll / __builtin_subcll where the compiler has them: clang turns a
+   run of them into one adcs / adc chain, about twice as fast as carries recomputed from comparisons (pidigits). */
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_addcll) && __has_builtin(__builtin_subcll)
+#define XB_HAVE_ADDC 1
+#endif
+#endif
+typedef unsigned long long xb_c; /* the carry type of __builtin_addcll */
+static inline __attribute__((always_inline)) uint64_t xb_addc(uint64_t a, uint64_t b, xb_c ci, xb_c *co) {
+#ifdef XB_HAVE_ADDC
+    return __builtin_addcll(a, b, ci, co);
+#else
+    xs_u128 s = (xs_u128)a + b + ci;
+    *co = (xb_c)(s >> 64);
+    return (uint64_t)s;
+#endif
+}
+static inline __attribute__((always_inline)) uint64_t xb_subc(uint64_t a, uint64_t b, xb_c ci, xb_c *co) {
+#ifdef XB_HAVE_ADDC
+    return __builtin_subcll(a, b, ci, co);
+#else
+    uint64_t t = a - b, r = t - ci;
+    *co = (a < b) | (t < ci);
+    return r;
+#endif
+}
+/* r = x + y (n limbs each); returns the carry out */
+static uint64_t xb_add_n(uint64_t *r, const uint64_t *x, const uint64_t *y, int64_t n) {
+    xb_c c = 0;
+    int64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        r[i] = xb_addc(x[i], y[i], c, &c);
+        r[i + 1] = xb_addc(x[i + 1], y[i + 1], c, &c);
+        r[i + 2] = xb_addc(x[i + 2], y[i + 2], c, &c);
+        r[i + 3] = xb_addc(x[i + 3], y[i + 3], c, &c);
+    }
+    for (; i < n; i++) r[i] = xb_addc(x[i], y[i], c, &c);
+    return c;
+}
+/* r = x - y (n limbs each); returns the borrow out */
+static uint64_t xb_sub_n(uint64_t *r, const uint64_t *x, const uint64_t *y, int64_t n) {
+    xb_c c = 0;
+    int64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        r[i] = xb_subc(x[i], y[i], c, &c);
+        r[i + 1] = xb_subc(x[i + 1], y[i + 1], c, &c);
+        r[i + 2] = xb_subc(x[i + 2], y[i + 2], c, &c);
+        r[i + 3] = xb_subc(x[i + 3], y[i + 3], c, &c);
+    }
+    for (; i < n; i++) r[i] = xb_subc(x[i], y[i], c, &c);
+    return c;
+}
+/* r = x + c (n limbs, c a carry of 0 or 1); returns the carry out. Once the carry is gone the rest is a copy. */
+static uint64_t xb_add_1(uint64_t *r, const uint64_t *x, int64_t n, uint64_t c) {
+    int64_t i = 0;
+    for (; i < n && c; i++) { r[i] = x[i] + 1; c = r[i] == 0; }
+    if (r != x && i < n) memcpy(r + i, x + i, 8 * (size_t)(n - i));
+    return c;
+}
+/* r = x - b (n limbs, b a borrow of 0 or 1); returns the borrow out */
+static uint64_t xb_sub_1(uint64_t *r, const uint64_t *x, int64_t n, uint64_t b) {
+    int64_t i = 0;
+    for (; i < n && b; i++) { uint64_t v = x[i]; r[i] = v - 1; b = v == 0; }
+    if (r != x && i < n) memcpy(r + i, x + i, 8 * (size_t)(n - i));
+    return b;
+}
+/* r = x * m (n limbs); returns the high limb. The products are independent: only the additions of each
+   product's high half into the next low half form a chain (and the chain restarts every 4 limbs, the carry
+   folded into the high half, which cannot overflow: the high half of a product is at most 2^64 - 2). */
+static uint64_t xb_mul_1(uint64_t *r, const uint64_t *x, int64_t n, uint64_t m) {
+    uint64_t h = 0;
+    int64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        xs_u128 p0 = (xs_u128)x[i] * m, p1 = (xs_u128)x[i + 1] * m, p2 = (xs_u128)x[i + 2] * m, p3 = (xs_u128)x[i + 3] * m;
+        xb_c c;
+        r[i] = xb_addc((uint64_t)p0, h, 0, &c);
+        r[i + 1] = xb_addc((uint64_t)p1, (uint64_t)(p0 >> 64), c, &c);
+        r[i + 2] = xb_addc((uint64_t)p2, (uint64_t)(p1 >> 64), c, &c);
+        r[i + 3] = xb_addc((uint64_t)p3, (uint64_t)(p2 >> 64), c, &c);
+        h = (uint64_t)(p3 >> 64) + c;
+    }
+    for (; i < n; i++) { xs_u128 p = (xs_u128)x[i] * m + h; r[i] = (uint64_t)p; h = (uint64_t)(p >> 64); }
+    return h;
+}
+/* r += x * m (n limbs); returns the limb carried out */
+static uint64_t xb_addmul_1(uint64_t *r, const uint64_t *x, int64_t n, uint64_t m) {
+    uint64_t h = 0;
+    int64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        xs_u128 p0 = (xs_u128)x[i] * m, p1 = (xs_u128)x[i + 1] * m, p2 = (xs_u128)x[i + 2] * m, p3 = (xs_u128)x[i + 3] * m;
+        xb_c c, d;
+        uint64_t t0 = xb_addc((uint64_t)p0, h, 0, &c);
+        uint64_t t1 = xb_addc((uint64_t)p1, (uint64_t)(p0 >> 64), c, &c);
+        uint64_t t2 = xb_addc((uint64_t)p2, (uint64_t)(p1 >> 64), c, &c);
+        uint64_t t3 = xb_addc((uint64_t)p3, (uint64_t)(p2 >> 64), c, &c);
+        uint64_t h3 = (uint64_t)(p3 >> 64) + c;
+        r[i] = xb_addc(r[i], t0, 0, &d);
+        r[i + 1] = xb_addc(r[i + 1], t1, d, &d);
+        r[i + 2] = xb_addc(r[i + 2], t2, d, &d);
+        r[i + 3] = xb_addc(r[i + 3], t3, d, &d);
+        h = h3 + d; /* (r + x * m over these limbs fits, so this cannot overflow) */
+    }
+    for (; i < n; i++) { xs_u128 p = (xs_u128)x[i] * m + r[i] + h; r[i] = (uint64_t)p; h = (uint64_t)(p >> 64); }
+    return h;
+}
+/* r -= x * m (n limbs); returns the limb borrowed out (to come off the limb above) */
+static uint64_t xb_submul_1(uint64_t *r, const uint64_t *x, int64_t n, uint64_t m) {
+    uint64_t h = 0;
+    int64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        xs_u128 p0 = (xs_u128)x[i] * m, p1 = (xs_u128)x[i + 1] * m, p2 = (xs_u128)x[i + 2] * m, p3 = (xs_u128)x[i + 3] * m;
+        xb_c c, d;
+        uint64_t t0 = xb_addc((uint64_t)p0, h, 0, &c);
+        uint64_t t1 = xb_addc((uint64_t)p1, (uint64_t)(p0 >> 64), c, &c);
+        uint64_t t2 = xb_addc((uint64_t)p2, (uint64_t)(p1 >> 64), c, &c);
+        uint64_t t3 = xb_addc((uint64_t)p3, (uint64_t)(p2 >> 64), c, &c);
+        uint64_t h3 = (uint64_t)(p3 >> 64) + c;
+        r[i] = xb_subc(r[i], t0, 0, &d);
+        r[i + 1] = xb_subc(r[i + 1], t1, d, &d);
+        r[i + 2] = xb_subc(r[i + 2], t2, d, &d);
+        r[i + 3] = xb_subc(r[i + 3], t3, d, &d);
+        h = h3 + d; /* (x * m over these limbs plus a borrow fits in them and one more limb) */
+    }
+    for (; i < n; i++) {
+        xs_u128 p = (xs_u128)x[i] * m + h;
+        uint64_t lo = (uint64_t)p, t = r[i];
+        h = (uint64_t)(p >> 64) + (t < lo);
+        r[i] = t - lo;
+    }
+    return h;
+}
+
 /* a + (bneg ? -|b| : |b|) with a's sign: the core of + and - */
 XS_NOINLINE xs_big *xs_big_addsub(const xs_big *a, const xs_big *b, int bneg) {
     if (a->neg == bneg) { /* same signs: the magnitudes add */
         const xs_big *x = a->n >= b->n ? a : b, *y = x == a ? b : a;
         xs_big *r = xs_big_alloc(x->n + 1);
-        uint64_t c = 0;
-        int32_t i = 0;
-        for (; i < y->n; i++) { xs_u128 s = (xs_u128)x->d[i] + y->d[i] + c; r->d[i] = (uint64_t)s; c = (uint64_t)(s >> 64); }
-        for (; i < x->n; i++) { xs_u128 s = (xs_u128)x->d[i] + c; r->d[i] = (uint64_t)s; c = (uint64_t)(s >> 64); }
-        r->d[i] = c;
+        uint64_t c = xb_add_n(r->d, x->d, y->d, y->n);
+        r->d[x->n] = xb_add_1(r->d + y->n, x->d + y->n, x->n - y->n, c);
         r->neg = a->neg;
         return xs_big_norm(r);
     }
@@ -4668,10 +4798,8 @@ XS_NOINLINE xs_big *xs_big_addsub(const xs_big *a, const xs_big *b, int bneg) {
     if (c == 0) return xs_big_from_int(0);
     const xs_big *x = c > 0 ? a : b, *y = c > 0 ? b : a;
     xs_big *r = xs_big_alloc(x->n);
-    uint64_t br = 0;
-    int32_t i = 0;
-    for (; i < y->n; i++) { uint64_t xi = x->d[i], t = xi - y->d[i] - br; br = (xi < y->d[i]) || (xi - y->d[i] < br); r->d[i] = t; }
-    for (; i < x->n; i++) { uint64_t xi = x->d[i], t = xi - br; br = xi < br; r->d[i] = t; }
+    uint64_t br = xb_sub_n(r->d, x->d, y->d, y->n);
+    xb_sub_1(r->d + y->n, x->d + y->n, x->n - y->n, br);
     r->neg = c > 0 ? a->neg : bneg;
     return xs_big_norm(r);
 }
@@ -4686,20 +4814,10 @@ XS_NOINLINE xs_big *xs_big_neg(xs_big *a) {
 
 XS_NOINLINE xs_big *xs_big_mul(xs_big *a, xs_big *b) {
     if (a->n == 0 || b->n == 0) return xs_big_from_int(0);
-    const xs_big *x = a->n >= b->n ? a : b, *y = x == a ? b : a;
+    const xs_big *x = a->n >= b->n ? a : b, *y = x == a ? b : a; /* the longer one in the inner loop */
     xs_big *r = xs_big_alloc((int64_t)x->n + y->n);
-    if (y->n == 1) { /* by one limb: the common case (acc * k) */
-        uint64_t m = y->d[0], c = 0;
-        for (int32_t i = 0; i < x->n; i++) { xs_u128 p = (xs_u128)x->d[i] * m + c; r->d[i] = (uint64_t)p; c = (uint64_t)(p >> 64); }
-        r->d[x->n] = c;
-    } else {
-        memset(r->d, 0, 8 * (size_t)(x->n + y->n));
-        for (int32_t j = 0; j < y->n; j++) {
-            uint64_t m = y->d[j], c = 0;
-            for (int32_t i = 0; i < x->n; i++) { xs_u128 p = (xs_u128)x->d[i] * m + r->d[i + j] + c; r->d[i + j] = (uint64_t)p; c = (uint64_t)(p >> 64); }
-            r->d[j + x->n] = c;
-        }
-    }
+    r->d[x->n] = xb_mul_1(r->d, x->d, x->n, y->d[0]); /* by one limb: the common case (acc * k) */
+    for (int32_t j = 1; j < y->n; j++) r->d[j + x->n] = xb_addmul_1(r->d + j, x->d, x->n, y->d[j]);
     r->neg = a->neg != b->neg;
     return xs_big_norm(r);
 }
@@ -4712,10 +4830,12 @@ static void xs_big_divmod_mag(const xs_big *a, const xs_big *b, xs_big **qo, xs_
         if (ro) { xs_big *r = xs_big_alloc(m); memcpy(r->d, a->d, 8 * (size_t)m); *ro = xs_big_norm(r); }
         return;
     }
-    if (m == n && n >= 2) { /* the same length: the quotient fits one limb (pidigits' digit), found from the top */
+    if (n >= 2 && (m == n || (m == n + 1 && a->d[n] < b->d[n - 1]))) {
+        /* the quotient fits one limb (pidigits' digit): estimated from the top limbs, as one step of algorithm D */
         int s = __builtin_clzll(b->d[n - 1]);
-        #define XB_SH(x, i) ((i) < 0 ? 0 : s ? ((x)->d[i] << s) | ((i) > 0 ? (x)->d[(i) - 1] >> (64 - s) : 0) : (x)->d[i])
-        uint64_t u2 = s ? a->d[n - 1] >> (64 - s) : 0, u1 = XB_SH(a, n - 1), u0 = XB_SH(a, n - 2);
+        #define XB_L(x, i) ((i) >= 0 && (i) < (x)->n ? (x)->d[i] : 0)
+        #define XB_SH(x, i) (s ? (XB_L(x, i) << s) | (XB_L(x, (i) - 1) >> (64 - s)) : XB_L(x, i))
+        uint64_t u2 = XB_SH(a, n), u1 = XB_SH(a, n - 1), u0 = XB_SH(a, n - 2);
         uint64_t v1 = XB_SH(b, n - 1), v0 = XB_SH(b, n - 2);
         #undef XB_SH
         xs_u128 num = ((xs_u128)u2 << 64) | u1;
@@ -4725,26 +4845,33 @@ static void xs_big_divmod_mag(const xs_big *a, const xs_big *b, xs_big **qo, xs_
             rhat += v1;
             if (rhat >> 64) break;
         }
-        uint64_t qd = (uint64_t)qhat;
-        /* the sign of a - qd * b, in one pass; the remainder too when it is asked for */
-        xs_big *r = ro ? xs_big_alloc(n) : NULL;
-        uint64_t borrow = 0, carry = 0;
-        for (int32_t i = 0; i < n; i++) {
-            xs_u128 pr = (xs_u128)qd * b->d[i] + carry;
-            carry = (uint64_t)(pr >> 64);
-            uint64_t lo = (uint64_t)pr, t = a->d[i] - lo - borrow;
-            borrow = (a->d[i] < lo) || (a->d[i] - lo < borrow);
-            if (r) r->d[i] = t;
+        uint64_t qd = (uint64_t)qhat, top = XB_L(a, n);
+        #undef XB_L
+        bool known = false;
+        if (!ro) {
+            /* Without the remainder, the top two limbs of b usually settle it: with t = n - 2, a - qd * b =
+               (A - qd * B) * 2^(64t) + (a's low t limbs - qd * b's low t limbs), the second term between
+               -qd * 2^(64t) and 2^(64t). So D = A - qd * B (A, B: the limbs from t up) below zero means qd is one
+               too large, and D >= qd means it is right (qd is never too small). Only 0 <= D < qd, which almost
+               never happens, needs the whole product. */
+            xs_u128 p0 = (xs_u128)qd * b->d[n - 2], p1 = (xs_u128)qd * b->d[n - 1] + (uint64_t)(p0 >> 64);
+            xb_c c;
+            uint64_t d0 = xb_subc(a->d[n - 2], (uint64_t)p0, 0, &c);
+            uint64_t d1 = xb_subc(a->d[n - 1], (uint64_t)p1, c, &c);
+            uint64_t d2 = xb_subc(top, (uint64_t)(p1 >> 64), c, &c);
+            if (c) { qd--; known = true; }
+            else if (d2 || d1 || d0 >= qd || n == 2) known = true;
         }
-        bool neg = carry + borrow != 0; /* (a has no limb beyond n: anything carried out is below zero) */
-        if (neg) {
-            qd--;
-            if (r) { /* r += b */
-                uint64_t c = 0;
-                for (int32_t i = 0; i < n; i++) { xs_u128 sm = (xs_u128)r->d[i] + b->d[i] + c; r->d[i] = (uint64_t)sm; c = (uint64_t)(sm >> 64); }
+        if (!known) { /* r = a - qd * b over n limbs; what is borrowed past them comes off a's limb n */
+            xs_big *r = xs_big_alloc(n);
+            memcpy(r->d, a->d, 8 * (size_t)n);
+            uint64_t h = xb_submul_1(r->d, b->d, n, qd);
+            if (h > top) { /* below zero: qd was one too large; the remainder is r + b (the carry out cancels the borrow) */
+                qd--;
+                xb_add_n(r->d, r->d, b->d, n);
             }
+            if (ro) *ro = xs_big_norm(r); else xs_obj_free(r);
         }
-        if (ro) *ro = xs_big_norm(r);
         if (qo) { xs_big *q = xs_big_alloc(1); q->d[0] = qd; *qo = xs_big_norm(q); }
         return;
     }
@@ -4756,8 +4883,8 @@ static void xs_big_divmod_mag(const xs_big *a, const xs_big *b, xs_big **qo, xs_
         if (ro) { xs_big *r = xs_big_alloc(1); r->d[0] = rem; *ro = xs_big_norm(r); }
     } else {
         int s = __builtin_clzll(b->d[n - 1]);
-        uint64_t *vn = malloc(8 * (size_t)n), *un = malloc(8 * (size_t)(m + 1));
-        if (!vn || !un) xs_panic("out of memory");
+        uint64_t *vn = malloc(8 * (size_t)(n + m + 1)), *un = vn + n; /* the divisor and the dividend shifted left by s */
+        if (!vn) xs_panic("out of memory");
         for (int32_t i = n - 1; i > 0; i--) vn[i] = (b->d[i] << s) | (s ? b->d[i - 1] >> (64 - s) : 0);
         vn[0] = b->d[0] << s;
         un[m] = s ? a->d[m - 1] >> (64 - s) : 0;
@@ -4771,23 +4898,12 @@ static void xs_big_divmod_mag(const xs_big *a, const xs_big *b, xs_big **qo, xs_
                 rhat += vn[n - 1];
                 if (rhat >> 64) break;
             }
-            /* un[j..j+n] -= qhat * vn */
-            uint64_t borrow = 0, carry = 0;
-            for (int32_t i = 0; i < n; i++) {
-                xs_u128 p = qhat * vn[i] + carry;
-                carry = (uint64_t)(p >> 64);
-                uint64_t lo = (uint64_t)p, t = un[i + j] - lo - borrow;
-                borrow = (un[i + j] < lo) || (un[i + j] - lo < borrow);
-                un[i + j] = t;
-            }
-            uint64_t t = un[j + n] - carry - borrow;
-            bool neg = (un[j + n] < carry) || (un[j + n] - carry < borrow);
-            un[j + n] = t;
+            uint64_t h = xb_submul_1(un + j, vn, n, (uint64_t)qhat); /* un[j..j+n] -= qhat * vn */
+            bool neg = un[j + n] < h;
+            un[j + n] -= h;
             if (neg) { /* qhat was one too large (rare): add vn back */
                 qhat--;
-                uint64_t c = 0;
-                for (int32_t i = 0; i < n; i++) { xs_u128 sm = (xs_u128)un[i + j] + vn[i] + c; un[i + j] = (uint64_t)sm; c = (uint64_t)(sm >> 64); }
-                un[j + n] += c;
+                un[j + n] += xb_add_n(un + j, un + j, vn, n);
             }
             q->d[j] = (uint64_t)qhat;
         }
@@ -4798,7 +4914,6 @@ static void xs_big_divmod_mag(const xs_big *a, const xs_big *b, xs_big **qo, xs_
             *ro = xs_big_norm(r);
         }
         free(vn);
-        free(un);
     }
     xs_big_norm(q);
     if (qo) *qo = q; else xs_obj_free(q);

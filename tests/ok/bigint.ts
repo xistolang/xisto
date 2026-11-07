@@ -48,3 +48,26 @@ for (let t = 0; t < 600; t++) {
   sum2 += q * 1000n + r % 997n;
 }
 console.log("same-length checks failed:", bad2, sum2);
+// quotients of one limb near the exact multiples (x = y * k + d, d in -2..2 and y - 1), with dividends one limb
+// longer than the divisor too (a small top limb in y); the quotient alone (/) settles it from the top limbs
+let bad3 = 0;
+let sum3 = 0n;
+const L64 = 2n ** 64n;
+for (let t = 0; t < 500; t++) {
+  const limbs = 2 + rnd(12);
+  let y = BigInt(1 + rnd(2000000000)) * BigInt(1 + rnd(4)); // a small top limb
+  for (let i = 1; i < limbs; i++) y = y * L64 + (rnd(3) === 0 ? L64 - 1n : rnd(3) === 0 ? 0n : BigInt(rnd(2000000000)) * BigInt(rnd(2000000000)));
+  const k = rnd(2) === 0 ? BigInt(1 + rnd(9)) : BigInt(1 + rnd(2000000000)) * BigInt(1 + rnd(2000000000)) * 3n;
+  const ds = [-2n, -1n, 0n, 1n, 2n, y - 1n];
+  for (const d of ds) {
+    const x = y * k + d;
+    const q = x / y, r = x % y;
+    const qe = d < 0n ? k - 1n : k;
+    if (q !== qe || q * y + r !== x || r < 0n || r >= y) bad3++;
+    sum3 += q % 1000003n + r % 1009n;
+  }
+}
+console.log("near-multiple checks failed:", bad3, sum3);
+let big1 = 1n; // additions and subtractions whose carries and borrows run through many limbs
+for (let i = 0; i < 9; i++) big1 = big1 * L64;
+console.log(big1 - 1n, (big1 - 1n) + 1n === big1, big1 + big1 - 1n, -(big1 - 1n) - 1n, (big1 - 1n) * (big1 - 1n) - big1 * big1 + 2n * big1);
