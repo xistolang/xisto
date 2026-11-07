@@ -29,7 +29,7 @@ for side in ("main", "branch"):
     subprocess.run([f"{side}/build/xisto", "build", "-o", exe, f"{side}/{prog}"], cwd=os.path.expanduser("~/ab"), env=env, check=True,
                    stdout=subprocess.DEVNULL)
     exes[side] = exe
-inp = os.path.expanduser(f"~/xisto/bench/benchmarksgame/out/{stdin}") if stdin else None
+inp = os.path.expanduser(f"~/ab/inputs/{stdin}") if stdin else None  # (made once, outside any suite run)
 res = {k: [] for k in exes}
 outs = {k: set() for k in exes}
 for _ in range(3):
