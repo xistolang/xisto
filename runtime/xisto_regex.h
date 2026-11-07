@@ -14,6 +14,9 @@
    This part needs only libc: the compiler includes it (XR_CORE_ONLY) to report pattern errors at compile time. */
 #ifndef XISTO_REGEX_H
 #define XISTO_REGEX_H
+#ifndef XS_NOINLINE /* (the compiler includes this header alone, without the runtime's definition) */
+#define XS_NOINLINE __attribute__((noinline)) static
+#endif
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -488,7 +491,7 @@ static bool xr_is_quant_brace(xr_parser *p, size_t at, int *mn, int *mx, size_t 
     return true;
 }
 
-static int xr_atom(xr_parser *p) {
+XS_NOINLINE int xr_atom(xr_parser *p) {
     int c = p->s[p->i];
     switch (c) {
     case '(': {

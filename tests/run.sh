@@ -139,7 +139,7 @@ if sh tests/stack/run.sh > "$OUT/stack.txt" 2>&1 && grep -q 'boom: 500 {"error":
    && grep -q "    at pick (tests/stack/server.ts:7:11)" "$OUT/stack.txt" && grep -q "    at boom (tests/stack/server.ts:10:31)" "$OUT/stack.txt" \
    && grep -q "    at late (tests/stack/server.ts:14:9)" "$OUT/stack.txt" && ! grep -q "warning" "$OUT/stack.txt"; then pass=$((pass+1)); else echo "FAIL stack:"; cat "$OUT/stack.txt"; fail=$((fail+1)); fi
 # runtime functions that can fail or call back into user code must not be inlined (stack traces)
-if python3 tools/noinline-scan.py --check runtime/xisto_rt.h runtime/xisto_net.h runtime/xisto_sqlite.h runtime/xisto_tls.h runtime/xisto_tls_awslc.h > "$OUT/noinline.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL noinline:"; cat "$OUT/noinline.txt"; fail=$((fail+1)); fi
+if python3 tools/noinline-scan.py --check runtime/xisto_rt.h runtime/xisto_net.h runtime/xisto_sqlite.h runtime/xisto_tls.h runtime/xisto_tls_awslc.h runtime/xisto_regex.h > "$OUT/noinline.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL noinline:"; cat "$OUT/noinline.txt"; fail=$((fail+1)); fi
 # TLS is linked only when the program can use https
 if sh tests/tlsgate/run.sh > "$OUT/tlsgate.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL tlsgate:"; cat "$OUT/tlsgate.txt"; fail=$((fail+1)); fi
 fi
