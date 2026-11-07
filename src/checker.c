@@ -3427,6 +3427,42 @@ static void check_expr(Expr *e, Type *expected) {
                 prog->uses_tls = true;
                 return;
             }
+            if (oc->builtin && (strcmp(oc->name, "Worker") == 0 || strcmp(oc->name, "MessagePort") == 0) && e->is_call) {
+                /* bytes too: postMessage(Uint8Array) and on("message", (m: Uint8Array) => ...), as Node's structured
+                   clone carries a typed array; a listener gets the kind it declares */
+                bool w = strcmp(oc->name, "Worker") == 0;
+                Class *u8 = find_class("Uint8Array");
+                if (strcmp(e->str, "postMessage") == 0 && e->args.len == 1) {
+                    check_expr(e->args.items[0], NULL);
+                    Type *t = e->args.items[0]->type;
+                    if (t && t->kind == TY_OBJECT && t->cls && (t->cls == u8 || (t->cls->base && t->cls->base == u8))) {
+                        e->cls = oc;
+                        e->type = ty_void;
+                        e->builtin.cfn = w ? "xs_Worker_postBytes" : "xs_MessagePort_postBytes";
+                        e->builtin.self_first = true;
+                        prog->uses_net = true;
+                        return;
+                    }
+                }
+                if (strcmp(e->str, "on") == 0 && e->args.len == 2 && e->args.items[1]->kind == E_ARROW && e->args.items[1]->arrow &&
+                    e->args.items[1]->arrow->fn && e->args.items[1]->arrow->fn->nparams == 1) {
+                    Type *pt = e->args.items[1]->arrow->fn->params[0].type;
+                    if (pt) pt = resolve(pt, e->pos);
+                    if (pt && pt->kind == TY_OBJECT && pt->cls == u8) {
+                        check_expr(e->args.items[0], ty_string);
+                        expect_type(e->args.items[0], ty_string, "event name");
+                        Type **lp = xs_alloc(sizeof(Type *));
+                        lp[0] = ty_object_of(u8);
+                        check_expr(e->args.items[1], ty_func(lp, 1, ty_void));
+                        e->cls = oc;
+                        e->type = ty_object_of(oc);
+                        e->builtin.cfn = w ? "xs_Worker_on_bytes" : "xs_MessagePort_on_bytes";
+                        e->builtin.self_first = true;
+                        prog->uses_net = true;
+                        return;
+                    }
+                }
+            }
             check_object_member(e, oc);
             if (oc->builtin && (strcmp(oc->name, "DatabaseSync") == 0 || strcmp(oc->name, "RunResult") == 0)) prog->uses_sqlite = true;
             else if (oc->builtin && strcmp(oc->name, "Error") != 0) prog->uses_net = true;
@@ -4585,8 +4621,10 @@ static bool int_shaped(Expr *e, const char *self) {
         switch (e->op) {
         /* (not * or <<: a product grows past 2^63 quickly, an int would stop with an overflow where JavaScript's
            number only loses precision, as in let f = 1; f *= i) */
-        case TK_PLUS: case TK_MINUS: case TK_PERCENT: case TK_AMP: case TK_PIPE: case TK_CARET: case TK_SHR: case TK_USHR:
+        case TK_PLUS: case TK_MINUS: case TK_PERCENT:
             return int_shaped(e->lhs, self) && int_shaped(e->rhs, self);
+        case TK_AMP: case TK_PIPE: case TK_CARET: case TK_SHR: case TK_USHR: case TK_SHL:
+            return true; /* a 32-bit integer whatever the operands (ToInt32): x & 0xff, (a << k) & m */
         default: return false;
         }
     case E_COND: return e->args.len == 2 && int_shaped(e->args.items[0], self) && int_shaped(e->args.items[1], self);
@@ -4607,7 +4645,7 @@ static bool ii_expr_ok(Expr *e, const char *self) { /* every assignment to self 
     if (!e) return true;
     bool tgt = e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && strcmp(e->lhs->str, self) == 0;
     if (e->kind == E_ASSIGN && tgt) {
-        if (e->op == TK_SLASH_ASSIGN || e->op == TK_STAR_ASSIGN || e->op == TK_SHL_ASSIGN) return false;
+        if (e->op == TK_SLASH_ASSIGN || e->op == TK_STAR_ASSIGN) return false;
         if (!int_shaped(e->rhs, self)) return false;
     }
     if (e->kind == E_ARROW && e->arrow && e->arrow->fn && e->arrow->fn->body) {

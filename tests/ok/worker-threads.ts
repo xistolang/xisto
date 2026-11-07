@@ -44,7 +44,10 @@ if (isMainThread) {
               wk.postMessage(JSON.stringify(nj));
               next++;
             } else wk.terminate();
-            if (pending === 0) console.log("pool", results.join(","));
+            if (pending === 0) {
+              console.log("pool", results.join(","));
+              bytesRound();
+            }
           });
           const first = new Job();
           first.id = next;
@@ -61,7 +64,25 @@ if (isMainThread) {
     j.n = sumTo(j.n);
     parentPort.postMessage(JSON.stringify(j));
   });
-} else {
+} else if (workerData !== "bytes") {
   const j: Job = JSON.parse(workerData);
   parentPort.postMessage(`job ${j.id}: ${sumTo(j.n)} (worker ${threadId > 0})`);
+}
+// bytes both ways: a Uint8Array message and a listener that declares it (after the pool, for a fixed order)
+function bytesRound(): void {
+  const bw = new Worker(__filename, { workerData: "bytes" });
+  bw.on("message", (b: Uint8Array) => {
+    console.log("bytes back", b.length, b[0], b[b.length - 1]);
+    bw.terminate();
+  });
+  const out = new Uint8Array(5);
+  for (let i = 0; i < 5; i++) out[i] = i * 50;
+  bw.postMessage(out);
+}
+if (!isMainThread && workerData === "bytes") {
+  parentPort.on("message", (b: Uint8Array) => {
+    const r = new Uint8Array(b.length * 2);
+    for (let i = 0; i < r.length; i++) r[i] = b[i % b.length] + 1;
+    parentPort.postMessage(r);
+  });
 }

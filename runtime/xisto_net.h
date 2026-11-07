@@ -2399,7 +2399,7 @@ XS_NOINLINE xs_stream *xs_gen_stream(void (*body)(void *), void *args, void (*ar
    listener with each message; it keeps the loop (and so the process, at exit) alive until the sender is done,
    as Node waits for its workers. */
 #ifdef XS_THREADS
-typedef struct xs_wmsg { struct xs_wmsg *next; size_t n; char s[]; } xs_wmsg;
+typedef struct xs_wmsg { struct xs_wmsg *next; size_t n; bool bytes; char s[]; } xs_wmsg; /* bytes: a Uint8Array, else text */
 typedef struct xs_wq {
     pthread_mutex_t mu;
     xs_wmsg *head, *tail;
@@ -2419,11 +2419,12 @@ static void xs_wq_wake(xs_wq *q) {
     char c = 1;
     while (write(q->fd[1], &c, 1) < 0 && errno == EINTR) {}
 }
-static void xs_wq_put(xs_wq *q, const char *s, size_t n) {
+static void xs_wq_put(xs_wq *q, const char *s, size_t n, bool bytes) {
     xs_wmsg *m = malloc(sizeof *m + n + 1);
     if (!m) xs_panic("out of memory");
     m->next = NULL;
     m->n = n;
+    m->bytes = bytes;
     memcpy(m->s, s, n);
     m->s[n] = 0;
     pthread_mutex_lock(&q->mu);
@@ -2464,8 +2465,8 @@ static XS_TLS xs_wq *xs_wt_in, *xs_wt_out; /* a worker's queues: from its parent
 static XS_TLS int64_t xs_wt_tid;
 static int64_t xs_wt_next_id = 1;
 
-typedef struct xs_MessagePort { xs_hdr hdr; xs_wq *in, *out; xs_closure *on_msg; bool listening; } xs_MessagePort;
-typedef struct xs_Worker { xs_hdr hdr; xs_wq *to_main, *to_worker; xs_closure *on_msg; bool listening; } xs_Worker;
+typedef struct xs_MessagePort { xs_hdr hdr; xs_wq *in, *out; xs_closure *on_msg; bool listening, on_bytes; } xs_MessagePort;
+typedef struct xs_Worker { xs_hdr hdr; xs_wq *to_main, *to_worker; xs_closure *on_msg; bool listening, on_bytes; } xs_Worker;
 static void xs_MessagePort_free(void *p) { xs_MessagePort *m = p; xs_release(m->on_msg); xs_obj_free(p); }
 static void xs_MessagePort_print(void *p) { (void)p; fputs("MessagePort {}", XS_OUT); }
 static void xs_Worker_free(void *p) {
@@ -2493,7 +2494,7 @@ static int64_t xs_os_parallelism(void) {
 }
 
 /* the listener's coroutine: each message, in order, to the closure; ends when the sender is done */
-typedef struct { xs_wq *q; xs_closure **cb; xs_hdr *owner; } xs_wlisten;
+typedef struct { xs_wq *q; xs_closure **cb; bool *bytes; xs_hdr *owner; } xs_wlisten; /* bytes: the listener takes Uint8Array */
 XS_NOINLINE void xs_wt_listen(void *p) {
     xs_wlisten *L = p;
     for (;;) {
@@ -2502,10 +2503,15 @@ XS_NOINLINE void xs_wt_listen(void *p) {
             n = m->next;
             xs_closure *cl = *L->cb;
             if (cl) {
+                if (m->bytes != *L->bytes)
+                    xs_panic(m->bytes ? "worker_threads: a Uint8Array message reached a listener of text: declare (m: Uint8Array)"
+                                      : "worker_threads: a text message reached a listener of Uint8Array: declare (m: string)");
                 size_t mark = xs_ar_mark();
-                xs_str *s = xs_str_new(m->s, m->n);
-                ((void (*)(void *, xs_str *))cl->fn)(cl, s);
-                xs_release(s);
+                void *v;
+                if (m->bytes) { xs_Uint8Array *b = xs_u8_new((int64_t)m->n); memcpy(b->data, m->s, m->n); v = b; }
+                else v = xs_str_new(m->s, m->n);
+                ((void (*)(void *, void *))cl->fn)(cl, v);
+                xs_release(v);
                 xs_ar_drain(mark);
             }
             free(m);
@@ -2528,11 +2534,12 @@ static void xs_wt_listen_done(xs_coro *co) {
     xs_release(L->owner);
     free(L);
 }
-XS_NOINLINE void xs_wt_listen_start(xs_wq *q, xs_closure **cb, xs_hdr *owner) {
+XS_NOINLINE void xs_wt_listen_start(xs_wq *q, xs_closure **cb, bool *bytes, xs_hdr *owner) {
     if (xs_kq < 0) xs_kq = kqueue();
     xs_wlisten *L = malloc(sizeof *L);
     L->q = q;
     L->cb = cb;
+    L->bytes = bytes;
     L->owner = xs_retain(owner);
     xs_coro *co = xs_coro_new_shared(xs_wt_listen, L);
     co->on_done = xs_wt_listen_done;
@@ -2586,24 +2593,35 @@ XS_NOINLINE xs_Worker *xs_Worker_new(xs_str *data) {
     pthread_attr_destroy(&at);
     return wk;
 }
-XS_NOINLINE xs_Worker *xs_Worker_on(xs_Worker *w, xs_str *ev, xs_closure *cb) {
+XS_NOINLINE xs_Worker *xs_Worker_on_k(xs_Worker *w, xs_str *ev, xs_closure *cb, bool bytes) {
     xs_wt_check_event(ev, "worker");
     xs_assign(w->on_msg, xs_retain(cb));
-    if (!w->listening) { w->listening = true; xs_wt_listen_start(w->to_main, &w->on_msg, &w->hdr); }
+    w->on_bytes = bytes;
+    if (!w->listening) { w->listening = true; xs_wt_listen_start(w->to_main, &w->on_msg, &w->on_bytes, &w->hdr); }
     return xs_retain(w);
 }
-XS_NOINLINE void xs_Worker_postMessage(xs_Worker *w, xs_str *m) { xs_wq_put(w->to_worker, m->data, (size_t)m->len); }
+XS_NOINLINE xs_Worker *xs_Worker_on(xs_Worker *w, xs_str *ev, xs_closure *cb) { return xs_Worker_on_k(w, ev, cb, false); }
+XS_NOINLINE xs_Worker *xs_Worker_on_bytes(xs_Worker *w, xs_str *ev, xs_closure *cb) { return xs_Worker_on_k(w, ev, cb, true); }
+XS_NOINLINE void xs_Worker_postMessage(xs_Worker *w, xs_str *m) { xs_wq_put(w->to_worker, m->data, (size_t)m->len, false); }
+XS_NOINLINE void xs_Worker_postBytes(xs_Worker *w, xs_Uint8Array *b) { xs_wq_put(w->to_worker, (const char *)b->data, (size_t)b->f_length, true); }
 /* the worker's parentPort gets no more messages: its listener ends, and the worker with it once it is idle */
 XS_NOINLINE void xs_Worker_terminate(xs_Worker *w) { xs_wq_close(w->to_worker); }
-XS_NOINLINE xs_MessagePort *xs_MessagePort_on(xs_MessagePort *p, xs_str *ev, xs_closure *cb) {
+XS_NOINLINE xs_MessagePort *xs_MessagePort_on_k(xs_MessagePort *p, xs_str *ev, xs_closure *cb, bool bytes) {
     xs_wt_check_event(ev, "parentPort");
     if (!p->in) xs_panic("parentPort is null on the main thread");
     xs_assign(p->on_msg, xs_retain(cb));
-    if (!p->listening) { p->listening = true; xs_wt_listen_start(p->in, &p->on_msg, &p->hdr); }
+    p->on_bytes = bytes;
+    if (!p->listening) { p->listening = true; xs_wt_listen_start(p->in, &p->on_msg, &p->on_bytes, &p->hdr); }
     return xs_retain(p);
 }
+XS_NOINLINE xs_MessagePort *xs_MessagePort_on(xs_MessagePort *p, xs_str *ev, xs_closure *cb) { return xs_MessagePort_on_k(p, ev, cb, false); }
+XS_NOINLINE xs_MessagePort *xs_MessagePort_on_bytes(xs_MessagePort *p, xs_str *ev, xs_closure *cb) { return xs_MessagePort_on_k(p, ev, cb, true); }
 XS_NOINLINE void xs_MessagePort_postMessage(xs_MessagePort *p, xs_str *m) {
     if (!p->out) xs_panic("parentPort is null on the main thread");
-    xs_wq_put(p->out, m->data, (size_t)m->len);
+    xs_wq_put(p->out, m->data, (size_t)m->len, false);
+}
+XS_NOINLINE void xs_MessagePort_postBytes(xs_MessagePort *p, xs_Uint8Array *b) {
+    if (!p->out) xs_panic("parentPort is null on the main thread");
+    xs_wq_put(p->out, (const char *)b->data, (size_t)b->f_length, true);
 }
 #endif

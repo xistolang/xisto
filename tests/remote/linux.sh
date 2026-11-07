@@ -23,7 +23,7 @@ if command -v apt-get > /dev/null; then
   sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential g++ cmake ninja-build perl python3 xxd curl openssl tzdata git nodejs redis-server netcat-openbsd > /dev/null
 else
-  sudo dnf install -y -q gcc gcc-c++ make cmake ninja-build perl python3 vim-common curl openssl tzdata git nodejs redis6 nmap-ncat tar gzip procps-ng > /dev/null
+  sudo dnf install -y -q --skip-broken gcc gcc-c++ make cmake ninja-build perl python3 vim-common curl openssl tzdata git nodejs redis6 nmap-ncat tar gzip procps-ng > /dev/null
 fi
 REDIS=\$(command -v redis-server || command -v redis6-server)
 pgrep -f "redis.*56379" > /dev/null || \$REDIS --port 56379 --save '' --appendonly no --daemonize yes > /dev/null
