@@ -8,16 +8,17 @@
 set -e
 H=$1; MAIN=$2; BR=$3; shift 3
 SSH="ssh -i $KEY -o BatchMode=yes $H"
+AB=ab-$$ # (a directory per run on the host: two comparisons at once stay apart)
 for side in main branch; do
     d=$MAIN; [ $side = branch ] && d=$BR
     (cd "$d" && COPYFILE_DISABLE=1 tar --exclude=./build --exclude=./bench/out --exclude=./bench/benchmarksgame/out --exclude=./.xisto \
         --exclude=./.claude --exclude='*.o' --exclude=./third_party/aws-lc --exclude=./node_modules -czf /tmp/ab-$side.tgz .)
-    scp -i $KEY -o BatchMode=yes -q /tmp/ab-$side.tgz $H:
-    $SSH "rm -rf ~/ab/$side && mkdir -p ~/ab/$side && tar -xzf ~/ab-$side.tgz -C ~/ab/$side 2>/dev/null && cd ~/ab/$side && make -s TLS=bearssl > /tmp/ab-$side-make.log 2>&1 && echo built $side"
+    scp -i $KEY -o BatchMode=yes -q /tmp/ab-$side.tgz $H:$AB-$side.tgz
+    $SSH "rm -rf ~/$AB/$side && mkdir -p ~/$AB/$side && tar -xzf ~/$AB-$side.tgz -C ~/$AB/$side 2>/dev/null && rm ~/$AB-$side.tgz && cd ~/$AB/$side && make -s TLS=bearssl > /tmp/$AB-$side-make.log 2>&1 && echo built $side"
 done
 for spec in "$@"; do
     [ "$spec" = "--" ] && break
-    $SSH "cd ~/ab && python3 - '$spec'" <<'PY'
+    $SSH "cd ~/$AB && python3 - '$spec'" <<'PY'
 import os, statistics, subprocess, sys, time, hashlib
 spec = sys.argv[1]
 prog, rest = spec.split(" ", 1)
@@ -25,9 +26,8 @@ arg, stdin = (rest.split(" < ") + [None])[:2]
 env = dict(os.environ, XISTO_NODE_COMPAT="1", XISTO_CPU=os.environ.get("XISTO_CPU", ""))
 exes = {}
 for side in ("main", "branch"):
-    exe = f"/tmp/ab-{side}-{os.path.basename(prog)[:-3]}"
-    subprocess.run([f"{side}/build/xisto", "build", "-o", exe, f"{side}/{prog}"], cwd=os.path.expanduser("~/ab"), env=env, check=True,
-                   stdout=subprocess.DEVNULL)
+    exe = f"{os.getcwd()}/{side}-{os.path.basename(prog)[:-3]}"
+    subprocess.run([f"{side}/build/xisto", "build", "-o", exe, f"{side}/{prog}"], env=env, check=True, stdout=subprocess.DEVNULL)
     exes[side] = exe
 inp = os.path.expanduser(f"~/ab/inputs/{stdin}") if stdin else None  # (made once, outside any suite run)
 res = {k: [] for k in exes}
@@ -45,3 +45,4 @@ m, b = statistics.median(res["main"]), statistics.median(res["branch"])
 print(f"{prog} {arg}: main {m:.3f}s  branch {b:.3f}s  ({m / b:.2f}x)  {same}")
 PY
 done
+$SSH "rm -rf ~/$AB" # (the inputs in ~/ab/inputs stay)
