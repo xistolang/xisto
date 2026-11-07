@@ -1481,7 +1481,10 @@ typedef union { double d; int64_t i; void *p; } xs_val;
 #define XS_VBOOL(x) ((xs_val){.i = (x) ? 1 : 0})
 #define XS_VPTR(x) ((xs_val){.p = (x)})
 
-typedef struct { xs_str *skey; int64_t ikey; xs_val val; uint64_t hash; uint8_t state; } xs_map_entry; /* state: 0 empty, 1 used, 2 deleted */
+/* state: 0 empty, 1 used, 2 deleted. A map has string keys or int keys, never both: one field holds either, and an
+   entry is 32 bytes instead of 40 (k-nucleotide's 16M-entry tables are memory-bound) */
+typedef struct { union { xs_str *skey; int64_t ikey; }; xs_val val; uint32_t hash; uint8_t state; } xs_map_entry;
+/* (hash: the low 32 bits, which pick the slot in any table below 2^32 entries, and filter the comparisons) */
 typedef struct xs_map {
     xs_hdr hdr;
     xs_map_entry *entries;
@@ -1494,6 +1497,7 @@ typedef struct xs_map {
     void (*print_val)(void *);
     xs_str *lk;   /* the last string key hashed, held, and its hash: has(k), get(k), set(k, ...) in a row hash once */
     uint64_t lh;
+    int64_t lik;  /* int keys: the last key looked up (where lidx points) */
     size_t lidx;  /* + 1: where lk was found (its entry, or the empty slot it would take); 0 after a grow, delete
                      or clear, which can move or empty slots */
 } xs_map;
@@ -1588,7 +1592,7 @@ static xs_map_entry *xs_map_find(xs_map *m, xs_str *skey, int64_t ikey, uint64_t
     for (;;) {
         xs_map_entry *e = &m->entries[i];
         if (e->state == 0) return e;
-        if (e->state == 1 && e->hash == hash && (m->str_keys ? xs_str_eq(e->skey, skey) : e->ikey == ikey)) return e;
+        if (e->state == 1 && e->hash == (uint32_t)hash && (m->str_keys ? xs_str_eq(e->skey, skey) : e->ikey == ikey)) return e;
         i = (i + 1) & (m->cap - 1);
     }
 }
@@ -1637,6 +1641,15 @@ static uint64_t xs_map_hash_s(xs_map *m, xs_str *k) {
     return h;
 }
 /* xs_map_find for a string key, through the cached slot of the last key */
+/* int keys: has(k), get(k), set(k, ...) in a row probe once (the counting idiom: 125M of them per frame in
+   k-nucleotide); lidx is cleared where the table changes shape (grow, delete, clear) */
+static inline xs_map_entry *xs_map_find_i(xs_map *m, int64_t k, uint64_t h) {
+    if (m->lidx && m->lik == k) return &m->entries[m->lidx - 1];
+    xs_map_entry *e = xs_map_find(m, NULL, k, h);
+    m->lik = k;
+    m->lidx = (size_t)(e - m->entries) + 1;
+    return e;
+}
 static xs_map_entry *xs_map_find_s(xs_map *m, xs_str *k, uint64_t h) {
     if (k == m->lk && m->lidx) return &m->entries[m->lidx - 1];
     xs_map_entry *e = xs_map_find(m, k, 0, h);
@@ -1647,7 +1660,7 @@ static xs_map_entry *xs_map_find_s(xs_map *m, xs_str *k, uint64_t h) {
 static xs_map *xs_map_put(xs_map *m, xs_str *skey, int64_t ikey, xs_val val) {
     if ((m->used + 1) * 10 > m->cap * 7) xs_map_grow(m);
     uint64_t h = m->str_keys ? xs_map_hash_s(m, skey) : xs_hash_int(ikey);
-    xs_map_entry *e = m->str_keys ? xs_map_find_s(m, skey, h) : xs_map_find(m, skey, ikey, h);
+    xs_map_entry *e = m->str_keys ? xs_map_find_s(m, skey, h) : xs_map_find_i(m, ikey, h);
     if (e->state == 1) {
         if (m->val_kind == 3) xs_release_(e->val.p);
         e->val = val;
@@ -1655,24 +1668,35 @@ static xs_map *xs_map_put(xs_map *m, xs_str *skey, int64_t ikey, xs_val val) {
     }
     m->used++;
     e->state = 1;
-    e->hash = h;
+    e->hash = (uint32_t)h;
     xs_map_order_push(m, (size_t)(e - m->entries));
-    e->skey = m->str_keys ? xs_retain(skey) : NULL;
-    e->ikey = ikey;
+    if (m->str_keys) e->skey = xs_retain(skey); else e->ikey = ikey; /* (the same field) */
     e->val = val;
     m->count++;
     return m;
 }
 static xs_map *xs_map_set_s(xs_map *m, xs_str *k, xs_val v) { return xs_map_put(m, k, 0, v); }
-static xs_map *xs_map_set_i(xs_map *m, int64_t k, xs_val v) { return xs_map_put(m, NULL, k, v); }
+static inline __attribute__((always_inline)) xs_map *xs_map_set_i(xs_map *m, int64_t k, xs_val v) {
+    if (m->lidx && m->lik == k && m->val_kind != 3) { /* the key just looked up, a value that is no reference: in place */
+        xs_map_entry *e = &m->entries[m->lidx - 1];
+        if (e->state == 1) { e->val = v; return m; }
+    }
+    return xs_map_put(m, NULL, k, v);
+}
 
 static xs_map_entry *xs_map_lookup(xs_map *m, xs_str *skey, int64_t ikey) {
     uint64_t h = m->str_keys ? xs_map_hash_s(m, skey) : xs_hash_int(ikey);
-    xs_map_entry *e = m->str_keys ? xs_map_find_s(m, skey, h) : xs_map_find(m, skey, ikey, h);
+    xs_map_entry *e = m->str_keys ? xs_map_find_s(m, skey, h) : xs_map_find_i(m, ikey, h);
     return e->state == 1 ? e : NULL;
 }
 static bool xs_map_has_s(xs_map *m, xs_str *k) { return xs_map_lookup(m, k, 0) != NULL; }
-static bool xs_map_has_i(xs_map *m, int64_t k) { return xs_map_lookup(m, NULL, k) != NULL; }
+/* int keys, inlined where they are used: the last key looked up answers at once (has, get, set of one key in a
+   row: the counting idiom), else one probe; nothing asks whether the keys are strings */
+static inline __attribute__((always_inline)) xs_map_entry *xs_map_lookup_i(xs_map *m, int64_t k) {
+    xs_map_entry *e = m->lidx && m->lik == k ? &m->entries[m->lidx - 1] : xs_map_find_i(m, k, xs_hash_int(k));
+    return e->state == 1 ? e : NULL;
+}
+static inline __attribute__((always_inline)) bool xs_map_has_i(xs_map *m, int64_t k) { return xs_map_lookup_i(m, k) != NULL; }
 static bool xs_map_delete_at(xs_map *m, xs_map_entry *e) {
     if (!e) return false;
     m->lidx = 0;
@@ -1699,7 +1723,11 @@ XS_NOINLINE xs_val xs_map_need(xs_map *m, xs_str *skey, int64_t ikey) {
 XS_NOINLINE double xs_map_get_num_s(xs_map *m, xs_str *k) { return xs_map_need(m, k, 0).d; }
 XS_NOINLINE double xs_map_get_num_i(xs_map *m, int64_t k) { return xs_map_need(m, NULL, k).d; }
 XS_NOINLINE int64_t xs_map_get_int_s(xs_map *m, xs_str *k) { return xs_map_need(m, k, 0).i; }
-XS_NOINLINE int64_t xs_map_get_int_i(xs_map *m, int64_t k) { return xs_map_need(m, NULL, k).i; }
+static inline __attribute__((always_inline)) int64_t xs_map_get_int_i(xs_map *m, int64_t k) {
+    xs_map_entry *e = xs_map_lookup_i(m, k);
+    if (__builtin_expect(!e, 0)) return xs_map_need(m, NULL, k).i; /* (it reports the missing key) */
+    return e->val.i;
+}
 XS_NOINLINE bool xs_map_get_bool_s(xs_map *m, xs_str *k) { return xs_map_need(m, k, 0).i != 0; }
 XS_NOINLINE bool xs_map_get_bool_i(xs_map *m, int64_t k) { return xs_map_need(m, NULL, k).i != 0; }
 static void *xs_map_get_ptr_s(xs_map *m, xs_str *k) { xs_map_entry *e = xs_map_lookup(m, k, 0); return e ? e->val.p : NULL; }

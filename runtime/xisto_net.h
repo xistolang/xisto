@@ -2399,7 +2399,8 @@ XS_NOINLINE xs_stream *xs_gen_stream(void (*body)(void *), void *args, void (*ar
    listener with each message; it keeps the loop (and so the process, at exit) alive until the sender is done,
    as Node waits for its workers. */
 #ifdef XS_THREADS
-typedef struct xs_wmsg { struct xs_wmsg *next; size_t n; bool bytes; char s[]; } xs_wmsg; /* bytes: a Uint8Array, else text */
+typedef struct xs_wmsg { struct xs_wmsg *next; size_t n; bool bytes; char *p; char s[]; } xs_wmsg;
+/* bytes: a Uint8Array, its bytes in p (malloc'd: the receiver's Uint8Array takes them over, no second copy); text in s */
 typedef struct xs_wq {
     pthread_mutex_t mu;
     xs_wmsg *head, *tail;
@@ -2420,18 +2421,25 @@ static void xs_wq_wake(xs_wq *q) {
     while (write(q->fd[1], &c, 1) < 0 && errno == EINTR) {}
 }
 static void xs_wq_put(xs_wq *q, const char *s, size_t n, bool bytes) {
-    xs_wmsg *m = malloc(sizeof *m + n + 1);
+    xs_wmsg *m = malloc(sizeof *m + (bytes ? 1 : n + 1));
     if (!m) xs_panic("out of memory");
     m->next = NULL;
     m->n = n;
     m->bytes = bytes;
-    memcpy(m->s, s, n);
-    m->s[n] = 0;
+    m->p = NULL;
+    if (bytes) {
+        m->p = malloc(n ? n : 1);
+        if (!m->p) xs_panic("out of memory");
+        memcpy(m->p, s, n);
+    } else {
+        memcpy(m->s, s, n);
+        m->s[n] = 0;
+    }
     pthread_mutex_lock(&q->mu);
     bool closed = q->closed;
     if (!closed) { if (q->tail) q->tail->next = m; else q->head = m; q->tail = m; }
     pthread_mutex_unlock(&q->mu);
-    if (closed) { free(m); return; } /* (the receiver is gone, as a message to an ended worker in Node) */
+    if (closed) { free(m->p); free(m); return; } /* (the receiver is gone, as a message to an ended worker in Node) */
     xs_wq_wake(q);
 }
 static void xs_wq_close(xs_wq *q) {
@@ -2450,7 +2458,7 @@ static xs_wmsg *xs_wq_take(xs_wq *q, bool *closed) {
 }
 static void xs_wq_unref(xs_wq *q) {
     if (__atomic_sub_fetch(&q->refs, 1, __ATOMIC_ACQ_REL) != 0) return;
-    for (xs_wmsg *m = q->head, *n; m; m = n) { n = m->next; free(m); }
+    for (xs_wmsg *m = q->head, *n; m; m = n) { n = m->next; free(m->p); free(m); }
     close(q->fd[0]);
     close(q->fd[1]);
     pthread_mutex_destroy(&q->mu);
@@ -2508,12 +2516,20 @@ XS_NOINLINE void xs_wt_listen(void *p) {
                                       : "worker_threads: a text message reached a listener of Uint8Array: declare (m: string)");
                 size_t mark = xs_ar_mark();
                 void *v;
-                if (m->bytes) { xs_Uint8Array *b = xs_u8_new((int64_t)m->n); memcpy(b->data, m->s, m->n); v = b; }
+                if (m->bytes) { /* the message's bytes become the array's */
+                    xs_Uint8Array *b = xs_obj_alloc(sizeof *b, xs_u8_free, xs_u8_print);
+                    b->f_length = (int64_t)m->n;
+                    b->data = (uint8_t *)m->p;
+                    b->owner = NULL;
+                    m->p = NULL;
+                    v = b;
+                }
                 else v = xs_str_new(m->s, m->n);
                 ((void (*)(void *, void *))cl->fn)(cl, v);
                 xs_release(v);
                 xs_ar_drain(mark);
             }
+            free(m->p);
             free(m);
         }
         if (closed) return;
