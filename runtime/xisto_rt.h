@@ -565,45 +565,78 @@ typedef struct __attribute__((aligned(64))) xs_type {
 #define XS_RGN (1 << 9)   /* an object of a dual region class made in its region (src/region.c): its count is
                              kept, and reaching zero does nothing; the region's rewind frees it */
 /* Every heap value starts with this 8-byte header: a node of two references is 24 bytes, not 32 (the size
-   classes go in 8-byte steps), and binary-trees moves a quarter less memory. The type is not a pointer but
-   where its descriptor sits relative to one anchor descriptor, in 64-byte units (xs_type is 64-byte aligned):
-   descriptors are static data of the program's image, all within +-128 MB of the anchor (xs_set_type checks). */
+   classes go in 8-byte steps), and binary-trees moves a quarter less memory. cls holds the size class and the
+   flags in its low 10 bits and the type in the other 22: not a pointer but the descriptor's address in
+   64-byte units (xs_type is 64-byte aligned), taken modulo 2^22. Reading it back goes through one anchor
+   descriptor: the 22-bit difference to the anchor, signed, reaches 128 MB each way. Every descriptor sits in
+   one section (xs_types), and the program checks once, at start, that the section fits in that reach; so
+   writing a header is a constant or (the compiler folds XS_TIX of a static descriptor into an address
+   computation), with no subtraction and no check per allocation. */
 typedef struct xs_hdr {
     int32_t rc;
-    unsigned cls : 10;
-    signed tix : 22;
+    uint32_t cls;
 } xs_hdr;
 _Static_assert(sizeof(xs_hdr) == 8, "xs_hdr is 8 bytes");
-#define XS_TYPE_SHIFT 6
-/* the anchor: the type of the static closures of top-level functions used as values (never freed). Its index
-   is 0, so the compiler writes their headers as constants: {XS_IMMORTAL, 0, 0}. */
+#define XS_TIX(t) ((uint32_t)((uintptr_t)(t) << 4)) /* the type's part of hdr.cls (bits 10..31) */
+#if defined(__APPLE__)
+#define XS_TYPE_SEC __attribute__((section("__DATA_CONST,__xs_types")))
+extern const char xs_types_begin[] __asm("section$start$__DATA_CONST$__xs_types");
+extern const char xs_types_end[] __asm("section$end$__DATA_CONST$__xs_types");
+#elif defined(_WIN32) /* (markers merged around the descriptors, as the site table's) */
+#define XS_TYPE_SEC __attribute__((section("xs_types$m")))
+__attribute__((section("xs_types$a"), used, aligned(64))) static const char xs_types_a_[64] = {0};
+__attribute__((section("xs_types$z"), used, aligned(64))) static const char xs_types_z_[64] = {0};
+#define xs_types_begin xs_types_a_
+#define xs_types_end xs_types_z_
+#else
+#define XS_TYPE_SEC __attribute__((section("xs_types")))
+extern const char __start_xs_types[] __attribute__((weak));
+extern const char __stop_xs_types[] __attribute__((weak));
+#define xs_types_begin __start_xs_types
+#define xs_types_end __stop_xs_types
+#endif
+/* the anchor: the type of the static closures of top-level functions used as values (never freed; their
+   headers are written where they are taken, xs_cl_static, since XS_TIX is not a constant initializer) */
 static void xs_print_closure(void *p);
-static const xs_type xs_immortal_closure_type = {NULL, xs_print_closure};
+static const xs_type xs_immortal_closure_type XS_TYPE_SEC = {NULL, xs_print_closure};
 /* (the anchor's address goes through an empty asm: the C compiler, seeing a pointer made from the anchor's,
    would take it to stay inside the anchor and read the anchor's own fields) */
 static inline __attribute__((always_inline)) const xs_type *xs_type_of(const void *p) {
     uintptr_t base = (uintptr_t)&xs_immortal_closure_type;
     __asm__("" : "+r"(base));
-    return (const xs_type *)(base + (uintptr_t)((intptr_t)((const xs_hdr *)p)->tix << XS_TYPE_SHIFT));
+    int32_t d = (int32_t)(((const xs_hdr *)p)->cls - XS_TIX(base)) >> 10; /* (the low 10 bits never borrow) */
+    return (const xs_type *)(base + (uintptr_t)((intptr_t)d << 6));
 }
 static inline __attribute__((always_inline)) void xs_set_type(xs_hdr *h, const xs_type *t) {
-    intptr_t d = (intptr_t)((uintptr_t)t - (uintptr_t)&xs_immortal_closure_type);
-    h->tix = (int)(d >> XS_TYPE_SHIFT);
-    if (__builtin_expect(((intptr_t)h->tix << XS_TYPE_SHIFT) != d, 0)) __builtin_trap(); /* a descriptor out of reach */
+    h->cls = (h->cls & 0x3ff) | XS_TIX(t);
+}
+/* at start: the descriptors within the header's reach (an executable with 2M types; never, but checked) */
+static void xs_types_check(void) {
+    const char *b = xs_types_begin, *e = xs_types_end; /* (weak on ELF: null without the section) */
+    if (b && e && (size_t)(e - b) > ((size_t)1 << 27)) {
+        fprintf(stderr, "xisto: the program's type descriptors do not fit in 128 MB; this is a bug in xisto\n");
+        exit(70);
+    }
 }
 #define XS_IMMORTAL (INT32_MAX / 2)
 
 static XS_TLS int64_t xs_live;   /* allocations alive (literals excluded); per thread when workers > 1 */
 static XS_TLS int64_t xs_allocs; /* total allocations */
 /* Small objects (up to 248 bytes) come from per-thread free lists by 8-byte size class: allocation-heavy
-   code (an object or a string per loop iteration) otherwise spends most of its time in malloc and free. */
-#define XS_SMALL_CLASSES 31
-#define XS_SMALL_MAX (8 * XS_SMALL_CLASSES)
+   code (an object or a string per loop iteration) otherwise spends most of its time in malloc and free.
+   (XS_OBJ_SHIFT=4, e.g. XISTO_CC="cc -DXS_OBJ_SHIFT=4": 16-byte classes, to measure what the finer steps do
+   on a machine) */
+#ifndef XS_OBJ_SHIFT
+#define XS_OBJ_SHIFT 3
+#endif
+#define XS_OBJ_STEP ((size_t)1 << XS_OBJ_SHIFT)
+#define XS_SMALL_CLASSES ((256 >> XS_OBJ_SHIFT) - 1)
+#define XS_SMALL_MAX (XS_SMALL_CLASSES << XS_OBJ_SHIFT)
 typedef struct xs_free_blk { struct xs_free_blk *next; } xs_free_blk;
 static XS_TLS xs_free_blk *xs_small[XS_SMALL_CLASSES + 1];
 static XS_TLS int xs_small_n[XS_SMALL_CLASSES + 1];
 
-/* Small objects (<= 248 bytes) are carved from 256 KB slabs and, once freed, wait on their size class's list
+/* Small objects (<= XS_SMALL_MAX bytes) are carved from 256 KB slabs and, once freed, wait on their size class's list
    for the next allocation; they never go back to malloc. Splitting a 22 MB text into 2.7M strings spent
    most of its time in malloc and free; a slab carve is a pointer bump. */
 static XS_TLS char *xs_slab_p, *xs_slab_end;
@@ -617,7 +650,7 @@ static __attribute__((noinline)) void *xs_slab_new(size_t sz) {
     return h;
 }
 static inline __attribute__((always_inline)) void *xs_slab_carve(int k) {
-    size_t sz = (size_t)k << 3;
+    size_t sz = (size_t)k << XS_OBJ_SHIFT;
     if (xs_slab_p && xs_slab_p + sz <= xs_slab_end) { void *h = xs_slab_p; xs_slab_p += sz; return h; }
     return xs_slab_new(sz);
 }
@@ -634,7 +667,7 @@ static void xs_gc_step(void);
 static inline __attribute__((always_inline)) void *xs_obj_alloc_t(size_t size, const xs_type *type) {
     if (__builtin_expect(xs_gc_due, 0)) xs_gc_step();
     xs_hdr *h;
-    int k = size <= XS_SMALL_MAX ? (int)((size + 7) >> 3) : 0;
+    int k = size <= XS_SMALL_MAX ? (int)((size + XS_OBJ_STEP - 1) >> XS_OBJ_SHIFT) : 0;
     if (k && xs_small[k]) {
         h = (xs_hdr *)xs_small[k];
         xs_small[k] = xs_small[k]->next;
@@ -644,8 +677,7 @@ static inline __attribute__((always_inline)) void *xs_obj_alloc_t(size_t size, c
         h = xs_obj_alloc_slow(size, k);
     }
     h->rc = 1;
-    h->cls = k | (type->visit ? XS_CYC : 0);
-    xs_set_type(h, type);
+    h->cls = (uint32_t)k | (type->visit ? XS_CYC : 0) | XS_TIX(type);
     xs_live++;
     xs_allocs++;
     return h;
@@ -657,8 +689,7 @@ static inline __attribute__((always_inline)) void *xs_obj_on_stack(void *mem, si
     xs_hdr *h = mem; /* cleared where it is declared */
     (void)size;
     h->rc = 1;
-    h->cls = XS_STACK;
-    xs_set_type(h, type);
+    h->cls = XS_STACK | XS_TIX(type);
     xs_live++;
     return h;
 }
@@ -666,7 +697,7 @@ static inline __attribute__((always_inline)) void *xs_obj_on_stack(void *mem, si
 /* the same without clearing: for objects whose every byte is written next (string data) */
 static inline __attribute__((always_inline)) void *xs_obj_alloc_raw(size_t size, const xs_type *type) {
     xs_hdr *h;
-    int k = size <= XS_SMALL_MAX ? (int)((size + 7) >> 3) : 0;
+    int k = size <= XS_SMALL_MAX ? (int)((size + XS_OBJ_STEP - 1) >> XS_OBJ_SHIFT) : 0;
     if (k && xs_small[k]) {
         h = (xs_hdr *)xs_small[k];
         xs_small[k] = xs_small[k]->next;
@@ -678,20 +709,19 @@ static inline __attribute__((always_inline)) void *xs_obj_alloc_raw(size_t size,
         if (!h) xs_panic("out of memory");
     }
     h->rc = 1;
-    h->cls = k | (type->visit ? XS_CYC : 0);
-    xs_set_type(h, type);
+    h->cls = (uint32_t)k | (type->visit ? XS_CYC : 0) | XS_TIX(type);
     xs_live++;
     xs_allocs++;
     return h;
 }
 
 /* xs_obj_alloc(size, free, print): the type is a constant made where it is called */
-#define xs_obj_alloc(size, free_fn, print_fn) xs_obj_alloc_t((size), ({ static const xs_type xs_t_ = {(free_fn), (print_fn)}; &xs_t_; }))
+#define xs_obj_alloc(size, free_fn, print_fn) xs_obj_alloc_t((size), ({ static const xs_type xs_t_ XS_TYPE_SEC = {(free_fn), (print_fn)}; &xs_t_; }))
 
-static inline __attribute__((always_inline)) void xs_obj_free_block(void *p, int k);
+static inline __attribute__((always_inline)) void xs_obj_free_block(void *p, uint32_t k);
 static inline __attribute__((always_inline)) void xs_obj_free(void *p) {
     xs_live--;
-    int k = ((xs_hdr *)p)->cls;
+    uint32_t k = ((xs_hdr *)p)->cls;
     if (__builtin_expect(k & (XS_BUF | XS_STACK), 0)) {
         if (k & XS_STACK) return; /* its frame owns the memory: only the fields were released */
         ((xs_hdr *)p)->cls |= XS_DEAD; /* a suspect: the collector gives the block back (xs_gc_step) */
@@ -701,7 +731,7 @@ static inline __attribute__((always_inline)) void xs_obj_free(void *p) {
     xs_obj_free_block(p, k);
 }
 /* a block back where it came from (k: its size class) */
-static inline __attribute__((always_inline)) void xs_obj_free_block(void *p, int k) {
+static inline __attribute__((always_inline)) void xs_obj_free_block(void *p, uint32_t k) {
     k &= XS_CLS_MASK;
     if (k) { /* from a slab: back on its class's list */
         xs_free_blk *b = p;
@@ -791,7 +821,7 @@ static void xs_str_free(void *p) { xs_obj_free(p); }
 static void xs_print_str(xs_str *s);
 static void xs_str_print_(void *p) { xs_print_str(p); }
 
-static const xs_type xs_str_type = {xs_str_free, xs_str_print_};
+static const xs_type xs_str_type XS_TYPE_SEC = {xs_str_free, xs_str_print_};
 /* a string from a buffer built with offsetof(xs_str, data) bytes reserved in front and room for the NUL:
    the buffer becomes the string, nothing is copied (replace() over 22 MB copied it twice) */
 static xs_str *xs_str_adopt(char *buf, size_t len) {
@@ -846,7 +876,7 @@ static xs_str *xs_str_immortal(const char *bytes, size_t len) {
     if (!s) xs_panic("out of memory");
     s->hdr.rc = XS_IMMORTAL;
     s->hdr.cls = 0;
-    static const xs_type immortal_str = {xs_str_free, xs_str_print_};
+    static const xs_type immortal_str XS_TYPE_SEC = {xs_str_free, xs_str_print_};
     xs_set_type(&s->hdr, &immortal_str);
     s->len = (int64_t)len;
     s->ulen = -1;
@@ -1301,7 +1331,7 @@ XS_ARRAY(bool, xs_arr_bool)
 /* Arrays of strings and objects: the array owns one reference per element. */
 typedef struct xs_arr_ref { xs_hdr hdr; size_t len; void **data; size_t cap; void (*print_elem)(void *); } xs_arr_ref;
 /* an array of region objects (the compiler's region.c) is itself in the region: made and grown there */
-static const xs_type xs_arr_ref_rtype;
+static const xs_type xs_arr_ref_rtype XS_TYPE_SEC;
 static void *xs_region_bytes_cur(size_t n);
 static void xs_arr_ref_free(void *p) {
     xs_arr_ref *a = p;
@@ -1906,6 +1936,12 @@ static void xs_num_to_str(double v, char *out);
 /* ---- closures: a refcounted object whose first field after the header is the code pointer; captures follow ---- */
 
 typedef struct xs_closure { xs_hdr hdr; void *fn; } xs_closure;
+/* a top-level function taken as a value: its static closure (the compiler declares it {XS_IMMORTAL, 0}) gets
+   the anchor type the first time it is taken (every thread writes the same bits) */
+static inline __attribute__((always_inline)) xs_closure *xs_cl_static(xs_closure *c) {
+    if (__builtin_expect(c->hdr.cls == 0, 0)) c->hdr.cls = XS_TIX(&xs_immortal_closure_type);
+    return c;
+}
 
 /* ---- unknown: any value by reference. Primitives are boxed; `x as T` checks the object's type (its free
    function is unique per type) and fails with a TypeError, like a bad cast in a checked language. ---- */
@@ -4735,7 +4771,7 @@ typedef unsigned __int128 xs_u128;
 
 static void xs_big_free(void *p) { xs_obj_free(p); }
 static void xs_big_print(void *p);
-static const xs_type xs_big_type = {xs_big_free, xs_big_print};
+static const xs_type xs_big_type XS_TYPE_SEC = {xs_big_free, xs_big_print};
 
 XS_NOINLINE xs_big *xs_big_alloc(int64_t n) { /* n limbs, not initialised; at least one */
     if (n > ((int64_t)1 << 30)) xs_panic("RangeError: Maximum BigInt size exceeded");
@@ -5540,6 +5576,7 @@ static void xs_init(int argc, char **argv) {
     _setmode(_fileno(stdin), _O_BINARY);
 #endif
     xs_started = xs_now();
+    xs_types_check();
     xs_std_init(argc, argv);
 }
 /* performance.now(): milliseconds since the program started, with the fraction (monotonic, as Node's) */
@@ -5733,13 +5770,13 @@ static void xs_arr_ref_visit(void *p, xs_visit_cb cb, void *arg);
 static void xs_map_visit(void *p, xs_visit_cb cb, void *arg);
 /* an array / map that holds values of a cyclic type: the compiler marks it where it is made */
 static inline void *xs_cyc_arr(void *a) {
-    static const xs_type t = {xs_arr_ref_free, xs_print_xs_arr_ref, xs_arr_ref_visit};
+    static const xs_type t XS_TYPE_SEC = {xs_arr_ref_free, xs_print_xs_arr_ref, xs_arr_ref_visit};
     xs_hdr *h = a;
     if (h && !(h->cls & XS_CYC) && xs_type_of(h)->free == xs_arr_ref_free) { xs_set_type(h, &t); h->cls |= XS_CYC; }
     return a;
 }
 static inline void *xs_cyc_map(void *m) {
-    static const xs_type t = {xs_map_free, xs_print_map, xs_map_visit};
+    static const xs_type t XS_TYPE_SEC = {xs_map_free, xs_print_map, xs_map_visit};
     xs_hdr *h = m;
     if (h && !(h->cls & XS_CYC) && xs_type_of(h)->free == xs_map_free) { xs_set_type(h, &t); h->cls |= XS_CYC; }
     return m;
@@ -5806,15 +5843,15 @@ static __attribute__((noinline)) void xs_region_list(xs_region *r, void *p) {
     }
     r->list[r->nlist++] = p;
 }
-static inline __attribute__((always_inline)) void *xs_region_alloc(xs_region *r, size_t size, const xs_type *type) {
-    size = (size + 7) & ~(size_t)7;
+static inline __attribute__((always_inline)) void *xs_region_alloc_f(xs_region *r, size_t size, const xs_type *type, uint32_t flags) {
+    size = (size + XS_OBJ_STEP - 1) & ~(XS_OBJ_STEP - 1);
     void *p;
     if (__builtin_expect(r->ptr && (size_t)(r->end - r->ptr) >= size, 1)) { p = r->ptr; r->ptr += size; }
     else p = xs_region_more(r, size);
     memset(p, 0, size);
     xs_hdr *h = p;
     h->rc = 1;
-    xs_set_type(h, type);
+    h->cls = flags | XS_TIX(type);
     if (type->drop || xs_region_check > 0) {
         if (__builtin_expect(r->nlist < r->caplist, 1)) r->list[r->nlist++] = p;
         else xs_region_list(r, p);
@@ -5822,17 +5859,14 @@ static inline __attribute__((always_inline)) void *xs_region_alloc(xs_region *r,
     r->nobj++;
     return p;
 }
+#define xs_region_alloc(r, size, type) xs_region_alloc_f((r), (size), (type), 0)
 /* a dual class's object (region.c: the class is made both inside the loop and outside it): in the region while
    one of its loop's iterations runs (on), on the heap otherwise */
-static inline __attribute__((always_inline)) void *xs_region_alloc_dual(xs_region *r, size_t size, const xs_type *type) {
-    xs_hdr *h = xs_region_alloc(r, size, type);
-    h->cls |= XS_RGN;
-    return h;
-}
+#define xs_region_alloc_dual(r, size, type) xs_region_alloc_f((r), (size), (type), XS_RGN)
 static __attribute__((noinline)) void xs_region_reset(xs_region *r) {
     if (xs_region_check > 0) {
-        for (size_t i = 0; i < r->nlist; i++) { xs_hdr *h = r->list[i]; if (xs_type_of(h)->drop) xs_type_of(h)->drop(h); }
-        for (size_t i = 0; i < r->nlist; i++) { xs_hdr *h = r->list[i]; if (xs_type_of(h)->rref) xs_type_of(h)->rref(h); }
+        for (size_t i = 0; i < r->nlist; i++) { xs_hdr *h = r->list[i]; const xs_type *t = xs_type_of(h); if (t->drop) t->drop(h); }
+        for (size_t i = 0; i < r->nlist; i++) { xs_hdr *h = r->list[i]; const xs_type *t = xs_type_of(h); if (t->rref) t->rref(h); }
         for (size_t i = 0; i < r->nlist; i++) {
             xs_hdr *h = r->list[i];
             if (h->rc != 0) {
@@ -5860,7 +5894,7 @@ static void xs_region_enter(xs_region *r) {
 }
 static void *xs_region_bytes_cur(size_t n) {
     xs_region *r = xs_rg_cur;
-    n = (n + 7) & ~(size_t)7;
+    n = (n + XS_OBJ_STEP - 1) & ~(XS_OBJ_STEP - 1);
     if (r->ptr && (size_t)(r->end - r->ptr) >= n) { void *p = r->ptr; r->ptr += n; return p; }
     return xs_region_more(r, n);
 }
@@ -5869,7 +5903,7 @@ static void xs_arr_ref_rref(void *p) { /* the elements are objects of the region
     xs_arr_ref *a = p;
     for (size_t i = 0; i < a->len; i++) if (a->data[i]) ((xs_hdr *)a->data[i])->rc--;
 }
-static const xs_type xs_arr_ref_rtype = {xs_arr_ref_rfree, xs_print_xs_arr_ref, NULL, NULL, xs_arr_ref_rref};
+static const xs_type xs_arr_ref_rtype XS_TYPE_SEC = {xs_arr_ref_rfree, xs_print_xs_arr_ref, NULL, NULL, xs_arr_ref_rref};
 static inline __attribute__((always_inline)) xs_arr_ref *xs_arr_ref_rnew(xs_region *r, void (*print_elem)(void *)) { /* [] */
     xs_rg_cur = r;
     xs_arr_ref *a = xs_region_alloc(r, sizeof *a + XS_INLINE_ELEMS * sizeof(void *), &xs_arr_ref_rtype);

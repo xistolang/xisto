@@ -666,9 +666,9 @@ static const char *cell_struct(Type *t) {
     buf_printf(&cell_fns, "static void %s_print(void *p) { (void)p; fputs(\"[cell]\", XS_OUT); }\n", n.data);
     if (type_cyclic(t)) { /* a shared variable holding something cyclic: a cell can close a cycle */
         buf_printf(&cell_fns, "static void %s_visit(void *p, xs_visit_cb cb, void *arg) { cb((void **)&((%s *)p)->v, arg); }\n", n.data, n.data);
-        buf_printf(&cell_fns, "static const xs_type %s_type = {%s_free, %s_print, %s_visit};\n", n.data, n.data, n.data, n.data);
+        buf_printf(&cell_fns, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, %s_print, %s_visit};\n", n.data, n.data, n.data, n.data);
     } else {
-        buf_printf(&cell_fns, "static const xs_type %s_type = {%s_free, %s_print, NULL};\n", n.data, n.data, n.data);
+        buf_printf(&cell_fns, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, %s_print, NULL};\n", n.data, n.data, n.data);
     }
     buf_printf(&cell_fns, "static %s *%s_new(void) { return xs_obj_alloc_t(sizeof(%s), &%s_type); }\n", n.data, n.data, n.data, n.data);
     return n.data;
@@ -1973,11 +1973,11 @@ static void emit_reflect_codec(Type *t, bool dec) {
                 buf_puts(&b, "\n    return xs_sb_finish(sb);\n}\n");
             }
         }
-        buf_printf(&b, "static xs_closure %s_cl = {{XS_IMMORTAL, 0, 0}, (void *)%s_fn};\n", name, name);
+        buf_printf(&b, "static xs_closure %s_cl = {{XS_IMMORTAL, 0}, (void *)%s_fn};\n", name, name);
         buf_puts(&tramp_fns, b.data);
         free(b.data);
     }
-    buf_printf(out, "(&%s_cl)", name);
+    buf_printf(out, "xs_cl_static(&%s_cl)", name);
 }
 
 /* Math.* never calls back into user code and its failing forms take a site: no brackets, so the C compiler
@@ -2080,9 +2080,9 @@ static void emit_expr_raw(Expr *e) {
             for (int i = 0; i < f->nparams; i++) buf_printf(b, ", %s%s%s", ctype(f->params[i].type), ctype(f->params[i].type)[strlen(ctype(f->params[i].type)) - 1] == '*' ? "" : " ", f->params[i].cname);
             buf_printf(b, ") { (void)env_; %s%s(", f->ret->kind == TY_VOID ? "" : "return ", f->cname);
             for (int i = 0; i < f->nparams; i++) buf_printf(b, "%s%s", i ? ", " : "", f->params[i].cname);
-            buf_printf(b, "); }\nstatic xs_closure %s_cl = {{XS_IMMORTAL, 0, 0}, (void *)%s_tramp};\n", f->cname, f->cname);
+            buf_printf(b, "); }\nstatic xs_closure %s_cl = {{XS_IMMORTAL, 0}, (void *)%s_tramp};\n", f->cname, f->cname);
         }
-        buf_printf(out, "(&%s_cl)", f->cname);
+        buf_printf(out, "xs_cl_static(&%s_cl)", f->cname);
         return;
     }
     case E_THIS: buf_puts(out, ren(e->cname ? e->cname : "self")); return;
@@ -2196,7 +2196,7 @@ static void emit_expr_raw(Expr *e) {
             }
             buf_puts(out, "}\n");
         }
-        buf_printf(out, "static const xs_type %s_type = {%s_free, xs_print_closure, %s};\n", f->cname, f->cname, env_cyc ? xs_sprintf("%s_visit", f->cname) : "NULL");
+        buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, xs_print_closure, %s};\n", f->cname, f->cname, env_cyc ? xs_sprintf("%s_visit", f->cname) : "NULL");
         buf_printf(out, "XS_FN %s%s%s(%s_env *env", ctype(f->ret), ctype(f->ret)[strlen(ctype(f->ret)) - 1] == '*' ? "" : " ", f->cname, f->cname);
         for (int i = 0; i < f->nparams; i++) {
             buf_puts(out, ", ");
@@ -5583,13 +5583,13 @@ void emit_program(Program *p, Buf *o) {
                 }
                 if (holds) buf_printf(out, "static void %s_drop(void *p);\n", c->cname);
                 if (rrefs) buf_printf(out, "static void %s_rref(void *p);\n", c->cname);
-                buf_printf(out, "static const xs_type %s_type = {%s_free, %s_print, NULL, %s, %s};\n", c->cname, c->cname, c->cname,
+                buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, %s_print, NULL, %s, %s};\n", c->cname, c->cname, c->cname,
                            holds ? xs_sprintf("%s_drop", c->cname) : "NULL", rrefs ? xs_sprintf("%s_rref", c->cname) : "NULL");
             } else if (c->rdual) {
                 buf_printf(out, "static void %s_rref(void *p);\n", c->cname);
-                buf_printf(out, "static const xs_type %s_type = {%s_free, %s_print, NULL, NULL, %s_rref};\n", c->cname, c->cname, c->cname, c->cname);
+                buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, %s_print, NULL, NULL, %s_rref};\n", c->cname, c->cname, c->cname, c->cname);
             } else
-            buf_printf(out, "static const xs_type %s_type = {%s_free, %s_print, %s};\n", c->cname, c->cname, c->cname, cy ? xs_sprintf("%s_visit", c->cname) : "NULL");
+            buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, %s_print, %s};\n", c->cname, c->cname, c->cname, cy ? xs_sprintf("%s_visit", c->cname) : "NULL");
         }
     {
         /* literal declarations and their initializer, for the literals the emitted code references */
