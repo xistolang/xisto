@@ -879,6 +879,7 @@ static Capture *add_capture(Arrow *a, const char *name, const char *outer_cname,
         a->captures = realloc(a->captures, sizeof(Capture) * (size_t)a->cap_captures);
     }
     Capture *c = &a->captures[a->ncaptures++];
+    memset(c, 0, sizeof *c); /* (boxed was left as realloc gave it: on gcc 11 builds an arrow lost its `this`) */
     c->name = (char *)name;
     c->outer_cname = (char *)outer_cname;
     c->type = type;

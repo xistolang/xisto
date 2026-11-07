@@ -9,7 +9,7 @@ cd "$(dirname "$0")/../.." || exit 1
 ls build/tests/*.node > /dev/null 2>&1 || { echo "run make test first (Node's outputs)"; exit 1; }
 KEY=${XISTO_REMOTE_KEY:+-i $XISTO_REMOTE_KEY}
 TLS=${XISTO_REMOTE_TLS:-awslc}
-W=bench/out/remote; rm -rf "$W"; mkdir -p "$W/tree/oracle"
+W=bench/out/remote-$$; rm -rf "$W"; mkdir -p "$W/tree/oracle" # (one per run: two runs at once would share it)
 COPYFILE_DISABLE=1 tar --exclude=./build --exclude=./bench/out --exclude='.xisto' --exclude=./third_party/qbe/qbe --exclude='*.o' \
     --exclude='./third_party/aws-lc/aws-lc-[0-9]*[0-9]' --exclude=./node_modules --exclude='*/node_modules' --exclude=./examples/conduit/dist \
     --exclude=./examples/conduit/conduit --exclude='*.bun-build' -cf - . | (cd "$W/tree" && tar -xf -)
