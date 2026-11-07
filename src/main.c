@@ -684,7 +684,6 @@ static void run_cc_raw(const char *cfile, const char *outfile, bool dev) {
     const char *cc = host_cc();
     const char *opt = getenv("XISTO_OPT"); /* the release optimization level (measuring knob) */
     const char *flags = xs_debug ? "-O0 -g" : dev ? "-O0" : opt ? xs_sprintf("-O%s", opt) : "-O3"; /* -O3: objects 5.2 -> 3.7 ns per iteration, nbody 0.42 -> 0.40 s, nothing slower; Conduit builds as fast, smaller (07/11) */
-    if (!xs_cpu && getenv("XISTO_CPU") && *getenv("XISTO_CPU")) xs_cpu = getenv("XISTO_CPU");
     if (xs_cpu && !dev && !xs_debug) { /* (-ffp-contract=off below still forbids fused multiply-adds: the same numbers) */
 #if defined(__aarch64__)
         flags = xs_sprintf("%s -mcpu=%s", flags, xs_cpu);
@@ -1034,6 +1033,7 @@ int main(int argc, char **argv) {
     if (!file) usage();
     if (outname && xs_is_dir(outname)) { fprintf(stderr, "xisto: -o %s is a directory: give the executable's file name (-o %s/name)\n", outname, outname); return 2; }
     if (getenv("XISTO_NODE_COMPAT") && strcmp(getenv("XISTO_NODE_COMPAT"), "1") == 0) xs_node_compat = true;
+    if (!xs_cpu && getenv("XISTO_CPU") && *getenv("XISTO_CPU")) xs_cpu = getenv("XISTO_CPU"); /* (before the cache key) */
 #if defined(_WIN32)
     /* on Windows the program is built for Windows through zig: the same path as --target from elsewhere */
     bool host_target = !xs_target;
