@@ -763,7 +763,7 @@ static const char *isa_fn(Class *c) {
     for (int i = 0; i < nisa; i++) if (strcmp(isa_made[i], name) == 0) return name;
     isa_made = realloc(isa_made, sizeof(char *) * (size_t)(nisa + 1));
     isa_made[nisa++] = name;
-    buf_printf(&isa_fns, "static bool %s(void *v) { void (*f)(void *) = v ? ((xs_hdr *)v)->type->free : NULL; return f && (0", name);
+    buf_printf(&isa_fns, "static bool %s(void *v) { void (*f)(void *) = v ? xs_type_of(v)->free : NULL; return f && (0", name);
     for (int i = 0; i < prog->nclasses; i++) {
         Class *k = prog->classes[i];
         if (k->used && !k->builtin && is_sub(k, c)) buf_printf(&isa_fns, " || f == %s_free", k->cname);
@@ -787,7 +787,7 @@ static const char *dispatcher(Func *m) {
     emit_decl(m->ret, name);
     buf_printf(out, "(%s *self", m->cls->cname);
     for (int i = 0; i < m->nparams; i++) { buf_puts(out, ", "); emit_decl(m->params[i].type, m->params[i].cname); }
-    buf_puts(out, ") {\n    void (*f_)(void *) = ((xs_hdr *)self)->type->free;\n");
+    buf_puts(out, ") {\n    void (*f_)(void *) = xs_type_of(self)->free;\n");
     Buf args = {0};
     for (int i = 0; i < m->nparams; i++) buf_printf(&args, ", %s", m->params[i].cname);
     bool is_void = m->ret->kind == TY_VOID;
@@ -1266,7 +1266,7 @@ static void emit_member(Expr *e) {
         int id = nuf++;
         buf_printf(out, "({ void *uo%d_ = (void *)(", id);
         emit_borrowed(base);
-        buf_printf(out, "); void (*uf%d_)(void *) = ((xs_hdr *)uo%d_)->type->free; ", id, id);
+        buf_printf(out, "); void (*uf%d_)(void *) = xs_type_of(uo%d_)->free; ", id, id);
         for (int i = 0; i < u->nparams; i++) {
             Class *c = u->params[i]->cls;
             if (i < u->nparams - 1) buf_printf(out, "uf%d_ == %s_free ? ((%s *)uo%d_)->f_%s : ", id, c->cname, c->cname, id, e->str);
@@ -1973,7 +1973,7 @@ static void emit_reflect_codec(Type *t, bool dec) {
                 buf_puts(&b, "\n    return xs_sb_finish(sb);\n}\n");
             }
         }
-        buf_printf(&b, "static xs_closure %s_cl = {{XS_IMMORTAL, 0, &xs_immortal_closure_type}, (void *)%s_fn};\n", name, name);
+        buf_printf(&b, "static xs_closure %s_cl = {{XS_IMMORTAL, 0, 0}, (void *)%s_fn};\n", name, name);
         buf_puts(&tramp_fns, b.data);
         free(b.data);
     }
@@ -2080,7 +2080,7 @@ static void emit_expr_raw(Expr *e) {
             for (int i = 0; i < f->nparams; i++) buf_printf(b, ", %s%s%s", ctype(f->params[i].type), ctype(f->params[i].type)[strlen(ctype(f->params[i].type)) - 1] == '*' ? "" : " ", f->params[i].cname);
             buf_printf(b, ") { (void)env_; %s%s(", f->ret->kind == TY_VOID ? "" : "return ", f->cname);
             for (int i = 0; i < f->nparams; i++) buf_printf(b, "%s%s", i ? ", " : "", f->params[i].cname);
-            buf_printf(b, "); }\nstatic xs_closure %s_cl = {{XS_IMMORTAL, 0, &xs_immortal_closure_type}, (void *)%s_tramp};\n", f->cname, f->cname);
+            buf_printf(b, "); }\nstatic xs_closure %s_cl = {{XS_IMMORTAL, 0, 0}, (void *)%s_tramp};\n", f->cname, f->cname);
         }
         buf_printf(out, "(&%s_cl)", f->cname);
         return;
@@ -2446,9 +2446,9 @@ static void emit_expr_raw(Expr *e) {
             Expr *f = union_lit_field(e->lhs) ? e->lhs : e->rhs, *lit = f == e->lhs ? e->rhs : e->lhs;
             static int nuc;
             int id = nuc++;
-            buf_printf(out, "({ void (*ucf%d_)(void *) = ((xs_hdr *)(", id);
+            buf_printf(out, "({ void (*ucf%d_)(void *) = xs_type_of((", id);
             emit_borrowed(f->lhs);
-            buf_printf(out, "))->type->free; %s", e->op == TK_NEQ ? "!" : "");
+            buf_printf(out, "))->free; %s", e->op == TK_NEQ ? "!" : "");
             emit_union_class_test(f->elem_type, f->str, lit->str, xs_sprintf("ucf%d_", id));
             buf_puts(out, "; })");
             return;
@@ -4258,9 +4258,9 @@ static void emit_stmt_(Stmt *s) {
         nl();
         bool by_class = union_lit_field(s->expr); /* switch (s.kind) on a discriminated union: by the object's class */
         if (by_class) {
-            buf_puts(out, "void (*uf_)(void *) = ((xs_hdr *)(");
+            buf_puts(out, "void (*uf_)(void *) = xs_type_of((");
             emit_borrowed(s->expr->lhs);
-            buf_printf(out, "))->type->free;");
+            buf_printf(out, "))->free;");
             nl();
             buf_printf(out, "int which_ = %d;", def);
             for (int i = 0, k = 0; i < s->ncases; i++) {

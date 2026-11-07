@@ -483,7 +483,7 @@ XS_NOINLINE xs_str *xn_pg_NativePool_query(xn_pg_NativePool *p, xs_str *text, xs
     for (int i = 0; i < n; i++) {
         void *v = values->data[i];
         if (!v) { a[i].kind = 0; continue; }
-        void (*f)(void *) = ((xs_hdr *)v)->type->free;
+        void (*f)(void *) = xs_type_of(v)->free;
         if (f == xs_str_free) { a[i].kind = 3; a[i].s = v; }
         else if (f == xs_box_int_free) { a[i].kind = 1; a[i].i = ((xs_box_i *)v)->v; }
         else if (f == xs_box_num_free) { a[i].kind = 2; a[i].d = ((xs_box_d *)v)->v; }

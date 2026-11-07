@@ -541,10 +541,10 @@ static void xs_panicf(const char *fmt, const char *a) {
    Every heap value starts with xs_hdr. The compiler inserts retain/release;
    values created and not stored go to the autorelease pool, drained per statement. */
 
-/* what a heap value is: how it is freed and printed. One per allocation site (static), so the header holds one
-   pointer instead of two: 16 bytes per object. Identity checks compare type->free, which every site of a type shares. */
+/* what a heap value is: how it is freed and printed. One per allocation site (static), held by the header as a
+   22-bit offset (below). Identity checks compare type->free, which every site of a type shares. */
 typedef void (*xs_visit_cb)(void **slot, void *arg);
-typedef struct xs_type {
+typedef struct __attribute__((aligned(64))) xs_type {
     void (*free)(void *);
     void (*print)(void *);
     /* only the types that can be part of a cycle (the compiler sees every type): calls cb on each slot holding a
@@ -555,28 +555,55 @@ typedef struct xs_type {
     void (*drop)(void *);
     void (*rref)(void *);
 } xs_type;
-#define XS_CYC (1 << 8)  /* in hdr.cls: may be part of a cycle */
-#define XS_BUF (1 << 9)  /* in hdr.cls: among the cycle collector's suspects */
-#define XS_STACK (1 << 7) /* in hdr.cls: lives in its creator's stack frame (stack allocation, src/stackalloc.c) */
-#define XS_RGN (1 << 10)  /* in hdr.cls: an object of a dual region class made in its region (src/region.c): its
-                             count is kept, and reaching zero does nothing; the region's rewind frees it */
+/* hdr.cls: the size class in the low bits, then the flags */
+#define XS_CLS_MASK 31    /* size class of the block (8-byte steps), 0 = not pooled */
+#define XS_STACK (1 << 5) /* lives in its creator's stack frame (stack allocation, src/stackalloc.c) */
+#define XS_DEAD (1 << 6)  /* a cycle suspect whose count reached zero: its block waits among the suspects for the
+                             collector, which gives it back (the header has no room for its position there) */
+#define XS_CYC (1 << 7)   /* may be part of a cycle */
+#define XS_BUF (1 << 8)   /* among the cycle collector's suspects */
+#define XS_RGN (1 << 9)   /* an object of a dual region class made in its region (src/region.c): its count is
+                             kept, and reaching zero does nothing; the region's rewind frees it */
+/* Every heap value starts with this 8-byte header: a node of two references is 24 bytes, not 32 (the size
+   classes go in 8-byte steps), and binary-trees moves a quarter less memory. The type is not a pointer but
+   where its descriptor sits relative to one anchor descriptor, in 64-byte units (xs_type is 64-byte aligned):
+   descriptors are static data of the program's image, all within +-128 MB of the anchor (xs_set_type checks). */
 typedef struct xs_hdr {
     int32_t rc;
-    int32_t cls;               /* size class of the block (16-byte steps), 0 = not pooled */
-    const xs_type *type;
+    unsigned cls : 10;
+    signed tix : 22;
 } xs_hdr;
+_Static_assert(sizeof(xs_hdr) == 8, "xs_hdr is 8 bytes");
+#define XS_TYPE_SHIFT 6
+/* the anchor: the type of the static closures of top-level functions used as values (never freed). Its index
+   is 0, so the compiler writes their headers as constants: {XS_IMMORTAL, 0, 0}. */
+static void xs_print_closure(void *p);
+static const xs_type xs_immortal_closure_type = {NULL, xs_print_closure};
+/* (the anchor's address goes through an empty asm: the C compiler, seeing a pointer made from the anchor's,
+   would take it to stay inside the anchor and read the anchor's own fields) */
+static inline __attribute__((always_inline)) const xs_type *xs_type_of(const void *p) {
+    uintptr_t base = (uintptr_t)&xs_immortal_closure_type;
+    __asm__("" : "+r"(base));
+    return (const xs_type *)(base + (uintptr_t)((intptr_t)((const xs_hdr *)p)->tix << XS_TYPE_SHIFT));
+}
+static inline __attribute__((always_inline)) void xs_set_type(xs_hdr *h, const xs_type *t) {
+    intptr_t d = (intptr_t)((uintptr_t)t - (uintptr_t)&xs_immortal_closure_type);
+    h->tix = (int)(d >> XS_TYPE_SHIFT);
+    if (__builtin_expect(((intptr_t)h->tix << XS_TYPE_SHIFT) != d, 0)) __builtin_trap(); /* a descriptor out of reach */
+}
 #define XS_IMMORTAL (INT32_MAX / 2)
 
 static XS_TLS int64_t xs_live;   /* allocations alive (literals excluded); per thread when workers > 1 */
 static XS_TLS int64_t xs_allocs; /* total allocations */
-/* Small objects (up to 256 bytes) come from per-thread free lists by 16-byte size class: allocation-heavy
+/* Small objects (up to 248 bytes) come from per-thread free lists by 8-byte size class: allocation-heavy
    code (an object or a string per loop iteration) otherwise spends most of its time in malloc and free. */
-#define XS_SMALL_CLASSES 16
+#define XS_SMALL_CLASSES 31
+#define XS_SMALL_MAX (8 * XS_SMALL_CLASSES)
 typedef struct xs_free_blk { struct xs_free_blk *next; } xs_free_blk;
 static XS_TLS xs_free_blk *xs_small[XS_SMALL_CLASSES + 1];
 static XS_TLS int xs_small_n[XS_SMALL_CLASSES + 1];
 
-/* Small objects (<= 256 bytes) are carved from 256 KB slabs and, once freed, wait on their size class's list
+/* Small objects (<= 248 bytes) are carved from 256 KB slabs and, once freed, wait on their size class's list
    for the next allocation; they never go back to malloc. Splitting a 22 MB text into 2.7M strings spent
    most of its time in malloc and free; a slab carve is a pointer bump. */
 static XS_TLS char *xs_slab_p, *xs_slab_end;
@@ -590,7 +617,7 @@ static __attribute__((noinline)) void *xs_slab_new(size_t sz) {
     return h;
 }
 static inline __attribute__((always_inline)) void *xs_slab_carve(int k) {
-    size_t sz = (size_t)k << 4;
+    size_t sz = (size_t)k << 3;
     if (xs_slab_p && xs_slab_p + sz <= xs_slab_end) { void *h = xs_slab_p; xs_slab_p += sz; return h; }
     return xs_slab_new(sz);
 }
@@ -602,11 +629,12 @@ static void *xs_obj_alloc_slow(size_t size, int k) {
 }
 /* inlined at every allocation site: the size is a constant there, so the clearing is a few stores */
 static XS_TLS bool xs_gc_due; /* enough suspects: the cycle collector runs at the next allocation */
-static void xs_gc_collect(void);
+static XS_TLS size_t xs_sus_n; /* cycle suspects waiting (alive) */
+static void xs_gc_step(void);
 static inline __attribute__((always_inline)) void *xs_obj_alloc_t(size_t size, const xs_type *type) {
-    if (__builtin_expect(xs_gc_due, 0)) xs_gc_collect();
+    if (__builtin_expect(xs_gc_due, 0)) xs_gc_step();
     xs_hdr *h;
-    int k = size <= 16 * XS_SMALL_CLASSES ? (int)((size + 15) >> 4) : 0;
+    int k = size <= XS_SMALL_MAX ? (int)((size + 7) >> 3) : 0;
     if (k && xs_small[k]) {
         h = (xs_hdr *)xs_small[k];
         xs_small[k] = xs_small[k]->next;
@@ -617,7 +645,7 @@ static inline __attribute__((always_inline)) void *xs_obj_alloc_t(size_t size, c
     }
     h->rc = 1;
     h->cls = k | (type->visit ? XS_CYC : 0);
-    h->type = type;
+    xs_set_type(h, type);
     xs_live++;
     xs_allocs++;
     return h;
@@ -630,7 +658,7 @@ static inline __attribute__((always_inline)) void *xs_obj_on_stack(void *mem, si
     (void)size;
     h->rc = 1;
     h->cls = XS_STACK;
-    h->type = type;
+    xs_set_type(h, type);
     xs_live++;
     return h;
 }
@@ -638,7 +666,7 @@ static inline __attribute__((always_inline)) void *xs_obj_on_stack(void *mem, si
 /* the same without clearing: for objects whose every byte is written next (string data) */
 static inline __attribute__((always_inline)) void *xs_obj_alloc_raw(size_t size, const xs_type *type) {
     xs_hdr *h;
-    int k = size <= 16 * XS_SMALL_CLASSES ? (int)((size + 15) >> 4) : 0;
+    int k = size <= XS_SMALL_MAX ? (int)((size + 7) >> 3) : 0;
     if (k && xs_small[k]) {
         h = (xs_hdr *)xs_small[k];
         xs_small[k] = xs_small[k]->next;
@@ -651,7 +679,7 @@ static inline __attribute__((always_inline)) void *xs_obj_alloc_raw(size_t size,
     }
     h->rc = 1;
     h->cls = k | (type->visit ? XS_CYC : 0);
-    h->type = type;
+    xs_set_type(h, type);
     xs_live++;
     xs_allocs++;
     return h;
@@ -660,15 +688,21 @@ static inline __attribute__((always_inline)) void *xs_obj_alloc_raw(size_t size,
 /* xs_obj_alloc(size, free, print): the type is a constant made where it is called */
 #define xs_obj_alloc(size, free_fn, print_fn) xs_obj_alloc_t((size), ({ static const xs_type xs_t_ = {(free_fn), (print_fn)}; &xs_t_; }))
 
-static void xs_gc_forget(void *p);
+static inline __attribute__((always_inline)) void xs_obj_free_block(void *p, int k);
 static inline __attribute__((always_inline)) void xs_obj_free(void *p) {
     xs_live--;
     int k = ((xs_hdr *)p)->cls;
     if (__builtin_expect(k & (XS_BUF | XS_STACK), 0)) {
         if (k & XS_STACK) return; /* its frame owns the memory: only the fields were released */
-        xs_gc_forget(p);
+        ((xs_hdr *)p)->cls |= XS_DEAD; /* a suspect: the collector gives the block back (xs_gc_step) */
+        xs_sus_n--;
+        return;
     }
-    k &= 0xFF;
+    xs_obj_free_block(p, k);
+}
+/* a block back where it came from (k: its size class) */
+static inline __attribute__((always_inline)) void xs_obj_free_block(void *p, int k) {
+    k &= XS_CLS_MASK;
     if (k) { /* from a slab: back on its class's list */
         xs_free_blk *b = p;
         b->next = xs_small[k];
@@ -688,7 +722,7 @@ static void xs_gc_suspect(void *p);
 static inline void xs_release_(void *p) {
     if (!p) return;
     xs_hdr *h = p;
-    if (--h->rc == 0) h->type->free(p);
+    if (--h->rc == 0) xs_type_of(h)->free(p);
     else if (__builtin_expect((h->cls & (XS_CYC | XS_BUF)) == XS_CYC, 0)) xs_gc_suspect(p); /* may now hang on a cycle only */
 }
 
@@ -762,7 +796,7 @@ static const xs_type xs_str_type = {xs_str_free, xs_str_print_};
    the buffer becomes the string, nothing is copied (replace() over 22 MB copied it twice) */
 static xs_str *xs_str_adopt(char *buf, size_t len) {
     xs_str *s = (xs_str *)buf;
-    if (offsetof(xs_str, data) + len + 1 <= 16 * XS_SMALL_CLASSES) { /* small: the allocator's own block */
+    if (offsetof(xs_str, data) + len + 1 <= XS_SMALL_MAX) { /* small: the allocator's own block */
         xs_str *r = xs_obj_alloc_raw(offsetof(xs_str, data) + len + 1, &xs_str_type);
         memcpy(r->data, s->data, len);
         r->data[len] = 0;
@@ -773,7 +807,7 @@ static xs_str *xs_str_adopt(char *buf, size_t len) {
     }
     s->hdr.rc = 1;
     s->hdr.cls = 0;
-    s->hdr.type = &xs_str_type;
+    xs_set_type(&s->hdr, &xs_str_type);
     s->len = (int64_t)len;
     s->ulen = -1;
     s->data[len] = 0;
@@ -813,7 +847,7 @@ static xs_str *xs_str_immortal(const char *bytes, size_t len) {
     s->hdr.rc = XS_IMMORTAL;
     s->hdr.cls = 0;
     static const xs_type immortal_str = {xs_str_free, xs_str_print_};
-    s->hdr.type = &immortal_str;
+    xs_set_type(&s->hdr, &immortal_str);
     s->len = (int64_t)len;
     s->ulen = -1;
     if (len <= INT32_MAX) { /* literals: their length in UTF-16 units counted once, here (templates add them up) */
@@ -1295,7 +1329,7 @@ static inline void **xs_at_ref(xs_arr_ref *a, int64_t i) { return xs_at_ref_s(a,
 XS_NOINLINE void xs_arr_ref_grow(xs_arr_ref *a) {
     {
         a->cap *= 2;
-        if (a->hdr.type == &xs_arr_ref_rtype) { /* in a region: the old storage goes with it */
+        if (xs_type_of(a) == &xs_arr_ref_rtype) { /* in a region: the old storage goes with it */
             void **d = xs_region_bytes_cur(a->cap * sizeof(void *));
             memcpy(d, a->data, a->len * sizeof(void *));
             a->data = d;
@@ -1419,7 +1453,7 @@ XS_NOINLINE void *xs_Error_wrap(xs_str *name, void *cause) {
     e->f_cause = xs_retain(cause); /* the argument is borrowed */
     return e;
 }
-static inline bool xs_is_a(void *v, void (*free_fn)(void *)) { return v && free_fn && ((xs_hdr *)v)->type->free == free_fn; }
+static inline bool xs_is_a(void *v, void (*free_fn)(void *)) { return v && free_fn && xs_type_of(v)->free == free_fn; }
 /* e.stack: "Error: message" and one "    at ..." line per frame, as in Node; borrowed from the Error */
 static xs_str *xs_Error_stack(xs_Error *e) {
     if (!e->stack) {
@@ -1897,7 +1931,7 @@ XS_NOINLINE void xs_as_fail(const char *what) {
 }
 XS_NOINLINE void *xs_as_ref(void *v, void (*free_fn)(void *), int nullable, const char *what) {
     if (!v) { if (nullable) return NULL; xs_as_fail(what); }
-    if (((xs_hdr *)v)->type->free != free_fn) xs_as_fail(what);
+    if (xs_type_of(v)->free != free_fn) xs_as_fail(what);
     return v;
 }
 /* x.toFixed(d) as JavaScript: the exact decimal value of the double rounded half up in magnitude (printf would
@@ -1940,16 +1974,16 @@ XS_NOINLINE void *xs_as_isa(void *v, bool (*isa)(void *), int nullable, const ch
 }
 XS_NOINLINE void *xs_as_closure(void *v, int nullable) {
     if (!v) { if (nullable) return NULL; xs_as_fail("a function"); }
-    if (((xs_hdr *)v)->type->print != xs_print_closure) xs_as_fail("a function");
+    if (xs_type_of(v)->print != xs_print_closure) xs_as_fail("a function");
     return v;
 }
-XS_NOINLINE int64_t xs_as_int(void *v) { if (!v || ((xs_hdr *)v)->type->free != xs_box_int_free) xs_as_fail("int"); return ((xs_box_i *)v)->v; }
+XS_NOINLINE int64_t xs_as_int(void *v) { if (!v || xs_type_of(v)->free != xs_box_int_free) xs_as_fail("int"); return ((xs_box_i *)v)->v; }
 XS_NOINLINE double xs_as_num(void *v) {
-    if (v && ((xs_hdr *)v)->type->free == xs_box_int_free) return (double)((xs_box_i *)v)->v; /* an int is a number */
-    if (!v || ((xs_hdr *)v)->type->free != xs_box_num_free) xs_as_fail("number");
+    if (v && xs_type_of(v)->free == xs_box_int_free) return (double)((xs_box_i *)v)->v; /* an int is a number */
+    if (!v || xs_type_of(v)->free != xs_box_num_free) xs_as_fail("number");
     return ((xs_box_d *)v)->v;
 }
-XS_NOINLINE bool xs_as_bool(void *v) { if (!v || ((xs_hdr *)v)->type->free != xs_box_bool_free) xs_as_fail("boolean"); return ((xs_box_i *)v)->v != 0; }
+XS_NOINLINE bool xs_as_bool(void *v) { if (!v || xs_type_of(v)->free != xs_box_bool_free) xs_as_fail("boolean"); return ((xs_box_i *)v)->v != 0; }
 XS_NOINLINE int64_t xs_as_int_or_null(void *v) { return v ? xs_as_int(v) : XS_NULL_INT; }
 XS_NOINLINE double xs_as_num_or_null(void *v) { return v ? xs_as_num(v) : xs_null_num(); }
 XS_NOINLINE int8_t xs_as_bool_or_null(void *v) { return v ? (int8_t)xs_as_bool(v) : XS_NULL_BOOL; }
@@ -1967,16 +2001,14 @@ static xs_str *xs_typeof_lit(const char *s) {
 static void xs_print_closure(void *p);
 XS_NOINLINE xs_str *xs_typeof(void *v) {
     if (!v) return xs_typeof_lit("object"); /* typeof null */
-    void (*f)(void *) = ((xs_hdr *)v)->type->free;
+    void (*f)(void *) = xs_type_of(v)->free;
     if (f == xs_str_free) return xs_typeof_lit("string");
     if (f == xs_box_int_free || f == xs_box_num_free) return xs_typeof_lit("number");
     if (f == xs_box_bool_free) return xs_typeof_lit("boolean");
-    if (((xs_hdr *)v)->type->print == xs_print_closure) return xs_typeof_lit("function");
+    if (xs_type_of(v)->print == xs_print_closure) return xs_typeof_lit("function");
     return xs_typeof_lit("object");
 }
 static void xs_print_closure(void *p) { (void)p; fputs("[Function]", XS_OUT); }
-/* immortal closures of top-level functions used as values (static, never freed) */
-static const xs_type xs_immortal_closure_type = {NULL, xs_print_closure};
 
 /* ---- array methods driven by callbacks: one instance per element kind ---- */
 
@@ -2409,7 +2441,7 @@ static inline __attribute__((always_inline)) xs_str *xs_str_on_stack(void *buf, 
     xs_str *s = buf;
     s->hdr.rc = 1;
     s->hdr.cls = XS_STACK;
-    s->hdr.type = &xs_str_type;
+    xs_set_type(&s->hdr, &xs_str_type);
     s->len = len;
     s->ulen = -1;
     xs_live++;
@@ -2846,16 +2878,16 @@ static XS_TLS int xs_dbg_print_budget;
 static void xs_print_obj(void *p) {
     if (xs_dbg_print_budget == 1) { fputs("[Object]", XS_OUT); return; }
     if (xs_dbg_print_budget) xs_dbg_print_budget--;
-    ((xs_hdr *)p)->type->print(p);
+    xs_type_of(p)->print(p);
     if (xs_dbg_print_budget) xs_dbg_print_budget++;
 }
 #else
-static void xs_print_obj(void *p) { ((xs_hdr *)p)->type->print(p); }
+static void xs_print_obj(void *p) { xs_type_of(p)->print(p); }
 #endif
 static void xs_print_obj_or_null(void *p) { if (p) xs_print_obj(p); else fputs("null", XS_OUT); }
 static void xs_print_str_quoted_or_null_(void *p) { if (p) xs_print_str_quoted_(p); else fputs("null", XS_OUT); }
 /* a union or unknown value inside an array or an object: strings quoted, as Node prints them there */
-static void xs_print_any_quoted(void *p) { if (p && ((xs_hdr *)p)->type->free == xs_str_free) xs_print_str_quoted_(p); else xs_print_obj_or_null(p); }
+static void xs_print_any_quoted(void *p) { if (p && xs_type_of(p)->free == xs_str_free) xs_print_str_quoted_(p); else xs_print_obj_or_null(p); }
 static void xs_print_str_or_null(xs_str *s) { if (s) xs_print_str(s); else fputs("null", XS_OUT); }
 static void xs_print_xs_arr_ref(void *p) {
     xs_arr_ref *a = p;
@@ -3879,7 +3911,7 @@ static void xs_buf_print(void *p) {
     if (b->f_length > 50) fprintf(XS_OUT, " ... %lld more byte%s", (long long)(b->f_length - 50), b->f_length - 50 == 1 ? "" : "s");
     fputc('>', XS_OUT);
 }
-static inline bool xs_is_buffer(xs_Uint8Array *b) { return b->hdr.type->print == xs_buf_print; }
+static inline bool xs_is_buffer(xs_Uint8Array *b) { return xs_type_of(b)->print == xs_buf_print; }
 XS_NOINLINE xs_Uint8Array *xs_u8_raw(int64_t n, bool buffer, bool zero) {
     if (n < 0 || n > ((int64_t)1 << 40)) xs_panic("RangeError: Invalid typed array length");
     xs_Uint8Array *b = buffer ? xs_obj_alloc(sizeof *b, xs_u8_free, xs_buf_print) : xs_obj_alloc(sizeof *b, xs_u8_free, xs_u8_print);
@@ -5528,75 +5560,49 @@ static bool xs_rc_counting(void) { /* XISTO_RC_STATS: release everything at exit
    each object's count minus the references from inside the subgraph; what keeps a count above zero is held
    from outside, and so is everything it reaches; the rest is garbage cycles. Those are pinned, their fields
    emptied (releasing what they point to), then unpinned: they free like any object. */
-static XS_TLS void **xs_sus;              /* open addressing set of suspects; NULL empty, XS_GC_TOMB removed */
-static XS_TLS size_t xs_sus_cap, xs_sus_n, xs_sus_used;
 static XS_TLS size_t xs_gc_threshold = 10000;
 static XS_TLS bool xs_gc_running;
+static XS_TLS bool xs_gc_want; /* xs_gc_due because of the live suspects: the collector runs (else a sweep) */
 static XS_TLS int64_t xs_gc_runs, xs_gc_freed;
-#define XS_GC_TOMB ((void *)1)
-static inline size_t xs_ptr_hash(void *p) { uint64_t x = (uint64_t)(uintptr_t)p; x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; return (size_t)x; }
-static void xs_sus_grow(void) {
-    size_t oc = xs_sus_cap;
-    void **old = xs_sus;
-    xs_sus_cap = oc ? oc * 2 : 1024;
-    xs_sus = calloc(xs_sus_cap, sizeof(void *));
-    if (!xs_sus) xs_panic("out of memory");
-    xs_sus_used = xs_sus_n;
-    for (size_t i = 0; i < oc; i++) {
-        void *p = old[i];
-        if (!p || p == XS_GC_TOMB) continue;
-        size_t j = xs_ptr_hash(p) & (xs_sus_cap - 1);
-        while (xs_sus[j]) j = (j + 1) & (xs_sus_cap - 1);
-        xs_sus[j] = p;
-    }
-    free(old);
-}
-/* suspects live in a vector; an object's position (+1) sits in hdr.cls bits 11..31, so adding and forgetting
-   are O(1) with no hashing. Past 2M positions the hash set above takes the rest. */
-#define XS_SLOT_SHIFT 11
-#define XS_SLOT_MAX ((1u << 21) - 1)
+/* Suspects live in a vector. One that is freed by its count before the collector runs (XS_BUF set when it
+   reaches zero) is not taken out: its fields are released as usual, the block stays in the vector marked
+   XS_DEAD (no longer counted in xs_sus_n), and is given back later. So adding is a push and forgetting is a
+   flag, with no position kept in the header (it has no room for one). The collector runs when it did before
+   (enough live suspects); a vector grown to twice that with dead ones is only swept. */
 static XS_TLS void **xs_susv;
 static XS_TLS size_t xs_susv_len, xs_susv_cap;
 static __attribute__((noinline)) void xs_gc_suspect(void *p) {
     if (xs_gc_running) return;
     xs_hdr *h = p;
     h->cls |= XS_BUF;
-    if (xs_susv_len < XS_SLOT_MAX) {
-        if (xs_susv_len == xs_susv_cap) {
-            xs_susv_cap = xs_susv_cap ? xs_susv_cap * 2 : 4096;
-            xs_susv = realloc(xs_susv, sizeof(void *) * xs_susv_cap);
-            if (!xs_susv) xs_panic("out of memory");
-        }
-        xs_susv[xs_susv_len++] = p;
-        h->cls = (h->cls & ((1 << XS_SLOT_SHIFT) - 1)) | (int32_t)((uint32_t)xs_susv_len << XS_SLOT_SHIFT);
-        if (++xs_sus_n >= xs_gc_threshold) xs_gc_due = true;
-        return;
+    if (xs_susv_len == xs_susv_cap) {
+        xs_susv_cap = xs_susv_cap ? xs_susv_cap * 2 : 4096;
+        xs_susv = realloc(xs_susv, sizeof(void *) * xs_susv_cap);
+        if (!xs_susv) xs_panic("out of memory");
     }
-    if ((xs_sus_used + 1) * 2 > xs_sus_cap) xs_sus_grow();
-    size_t j = xs_ptr_hash(p) & (xs_sus_cap - 1);
-    while (xs_sus[j] && xs_sus[j] != XS_GC_TOMB) j = (j + 1) & (xs_sus_cap - 1);
-    if (!xs_sus[j]) xs_sus_used++;
-    xs_sus[j] = p;
-    if (++xs_sus_n >= xs_gc_threshold) xs_gc_due = true;
+    xs_susv[xs_susv_len++] = p;
+    if (++xs_sus_n >= xs_gc_threshold) xs_gc_due = xs_gc_want = true;
+    else if (xs_susv_len >= 2 * xs_gc_threshold) xs_gc_due = true;
 }
-static __attribute__((noinline)) void xs_gc_forget(void *p) { /* a suspect freed by its count */
-    xs_hdr *h = p;
-    uint32_t slot = (uint32_t)h->cls >> XS_SLOT_SHIFT;
-    h->cls &= (1 << XS_SLOT_SHIFT) - 1;
-    h->cls &= ~XS_BUF;
-    if (slot) { xs_susv[slot - 1] = NULL; xs_sus_n--; return; }
-    if (!xs_sus_cap) return;
-    size_t j = xs_ptr_hash(p) & (xs_sus_cap - 1);
-    while (xs_sus[j]) {
-        if (xs_sus[j] == p) { xs_sus[j] = XS_GC_TOMB; xs_sus_n--; return; }
-        j = (j + 1) & (xs_sus_cap - 1);
+static void xs_gc_collect(void);
+/* (at an allocation, when due) the collector, or only a sweep of the dead suspects */
+static __attribute__((noinline)) void xs_gc_step(void) {
+    xs_gc_due = false;
+    if (xs_gc_running) return;
+    if (xs_gc_want) { xs_gc_collect(); return; }
+    size_t n = 0;
+    for (size_t i = 0; i < xs_susv_len; i++) {
+        xs_hdr *h = xs_susv[i];
+        if (h->cls & XS_DEAD) xs_obj_free_block(h, h->cls);
+        else xs_susv[n++] = h;
     }
+    xs_susv_len = n;
 }
 
 /* The examined subgraph. While the collector runs (nothing else does), an object of the subgraph carries XS_INS
    and its count field holds its index here: membership and lookup are a load, no hashing; the counts are
    put back before anything is freed. */
-#define XS_INS (1 << 10)
+#define XS_INS XS_RGN /* (no object of a region class is cyclic) */
 typedef struct { void **obj; int64_t *refs; int32_t *rc0; size_t n, cap; int32_t *edge; size_t *first; size_t ne, ecap, fcap; } xs_gcset;
 static inline bool xs_gc_eligible(void *p) { /* a cyclic object alive, not being freed, not yet in the set */
     xs_hdr *h = p;
@@ -5645,39 +5651,37 @@ static void xs_gc_cb_live(void **slot, void *arg) {
         m->stack[m->sp++] = (size_t)i;
     }
 }
-#define XS_GARB (1 << 10) /* (after the counts are restored, XS_INS's bit marks garbage) */
+#define XS_GARB XS_INS /* (after the counts are restored, XS_INS's bit marks garbage) */
 static void xs_gc_cb_cut(void **slot, void *arg) { /* a reference to other garbage: dropped, not counted down */
     (void)arg;
     if (*slot && (((xs_hdr *)*slot)->cls & XS_GARB)) *slot = NULL;
 }
 static XS_TLS xs_gcset xs_gcs; /* kept between runs: no reallocation every time */
 static __attribute__((noinline)) void xs_gc_collect(void) {
-    xs_gc_due = false;
-    if (xs_gc_running || !xs_sus_n) return;
+    xs_gc_due = xs_gc_want = false;
+    if (xs_gc_running) return;
+    if (!xs_sus_n) { /* only dead ones */
+        for (size_t i = 0; i < xs_susv_len; i++) xs_obj_free_block(xs_susv[i], ((xs_hdr *)xs_susv[i])->cls);
+        xs_susv_len = 0;
+        return;
+    }
     xs_gc_running = true;
     xs_gcset *g = &xs_gcs;
     g->n = 0;
     /* 1. the suspects and every cyclic object they reach */
     for (size_t i = 0; i < xs_susv_len; i++) {
-        void *p = xs_susv[i];
-        if (!p) continue;
-        ((xs_hdr *)p)->cls &= (1 << XS_SLOT_SHIFT) - 1 & ~XS_BUF;
-        if (xs_gc_eligible(p)) xs_gcset_add(g, p);
+        xs_hdr *h = xs_susv[i];
+        if (h->cls & XS_DEAD) { xs_obj_free_block(h, h->cls); continue; } /* freed while it waited here */
+        h->cls &= ~XS_BUF;
+        if (xs_gc_eligible(h)) xs_gcset_add(g, h);
     }
     xs_susv_len = 0;
-    for (size_t i = 0; i < xs_sus_cap && xs_sus_used; i++) {
-        void *p = xs_sus[i];
-        if (!p || p == XS_GC_TOMB) continue;
-        ((xs_hdr *)p)->cls &= ~XS_BUF;
-        if (xs_gc_eligible(p)) xs_gcset_add(g, p);
-    }
-    if (xs_sus_used) memset(xs_sus, 0, sizeof(void *) * xs_sus_cap);
-    xs_sus_n = xs_sus_used = 0;
+    xs_sus_n = 0;
     g->ne = 0;
     for (size_t i = 0; i < g->n; i++) {
         if (g->n + 1 > g->fcap) { g->fcap = (g->n + 1) * 2; g->first = realloc(g->first, sizeof(size_t) * g->fcap); }
         g->first[i] = g->ne;
-        ((xs_hdr *)g->obj[i])->type->visit(g->obj[i], xs_gc_cb_gather, g);
+        xs_type_of(g->obj[i])->visit(g->obj[i], xs_gc_cb_gather, g);
     }
     if (g->n + 1 > g->fcap) { g->fcap = (g->n + 1) * 2; g->first = realloc(g->first, sizeof(size_t) * g->fcap); }
     g->first[g->n] = g->ne;
@@ -5710,13 +5714,13 @@ static __attribute__((noinline)) void xs_gc_collect(void) {
     }
     /* 4. the garbage: references between garbage objects are cut (nothing outside points into it, so no count
        needs to drop), then each is freed by its own free function, which releases everything else it holds */
-    for (size_t i = 0; i < ngarbage; i++) ((xs_hdr *)g->obj[i])->type->visit(g->obj[i], xs_gc_cb_cut, NULL);
+    for (size_t i = 0; i < ngarbage; i++) xs_type_of(g->obj[i])->visit(g->obj[i], xs_gc_cb_cut, NULL);
     xs_gc_running = false;
     for (size_t i = 0; i < ngarbage; i++) {
         xs_hdr *h = g->obj[i];
         h->cls &= ~(XS_GARB | XS_BUF);
         h->rc = 0;
-        h->type->free(h);
+        xs_type_of(h)->free(h);
     }
     xs_gc_runs++;
     xs_gc_freed += (int64_t)ngarbage;
@@ -5731,13 +5735,13 @@ static void xs_map_visit(void *p, xs_visit_cb cb, void *arg);
 static inline void *xs_cyc_arr(void *a) {
     static const xs_type t = {xs_arr_ref_free, xs_print_xs_arr_ref, xs_arr_ref_visit};
     xs_hdr *h = a;
-    if (h && !(h->cls & XS_CYC) && h->type->free == xs_arr_ref_free) { h->type = &t; h->cls |= XS_CYC; }
+    if (h && !(h->cls & XS_CYC) && xs_type_of(h)->free == xs_arr_ref_free) { xs_set_type(h, &t); h->cls |= XS_CYC; }
     return a;
 }
 static inline void *xs_cyc_map(void *m) {
     static const xs_type t = {xs_map_free, xs_print_map, xs_map_visit};
     xs_hdr *h = m;
-    if (h && !(h->cls & XS_CYC) && h->type->free == xs_map_free) { h->type = &t; h->cls |= XS_CYC; }
+    if (h && !(h->cls & XS_CYC) && xs_type_of(h)->free == xs_map_free) { xs_set_type(h, &t); h->cls |= XS_CYC; }
     return m;
 }
 static void xs_arr_ref_visit(void *p, xs_visit_cb cb, void *arg) {
@@ -5803,14 +5807,14 @@ static __attribute__((noinline)) void xs_region_list(xs_region *r, void *p) {
     r->list[r->nlist++] = p;
 }
 static inline __attribute__((always_inline)) void *xs_region_alloc(xs_region *r, size_t size, const xs_type *type) {
-    size = (size + 15) & ~(size_t)15;
+    size = (size + 7) & ~(size_t)7;
     void *p;
     if (__builtin_expect(r->ptr && (size_t)(r->end - r->ptr) >= size, 1)) { p = r->ptr; r->ptr += size; }
     else p = xs_region_more(r, size);
     memset(p, 0, size);
     xs_hdr *h = p;
     h->rc = 1;
-    h->type = type;
+    xs_set_type(h, type);
     if (type->drop || xs_region_check > 0) {
         if (__builtin_expect(r->nlist < r->caplist, 1)) r->list[r->nlist++] = p;
         else xs_region_list(r, p);
@@ -5822,13 +5826,13 @@ static inline __attribute__((always_inline)) void *xs_region_alloc(xs_region *r,
    one of its loop's iterations runs (on), on the heap otherwise */
 static inline __attribute__((always_inline)) void *xs_region_alloc_dual(xs_region *r, size_t size, const xs_type *type) {
     xs_hdr *h = xs_region_alloc(r, size, type);
-    h->cls = XS_RGN;
+    h->cls |= XS_RGN;
     return h;
 }
 static __attribute__((noinline)) void xs_region_reset(xs_region *r) {
     if (xs_region_check > 0) {
-        for (size_t i = 0; i < r->nlist; i++) { xs_hdr *h = r->list[i]; if (h->type->drop) h->type->drop(h); }
-        for (size_t i = 0; i < r->nlist; i++) { xs_hdr *h = r->list[i]; if (h->type->rref) h->type->rref(h); }
+        for (size_t i = 0; i < r->nlist; i++) { xs_hdr *h = r->list[i]; if (xs_type_of(h)->drop) xs_type_of(h)->drop(h); }
+        for (size_t i = 0; i < r->nlist; i++) { xs_hdr *h = r->list[i]; if (xs_type_of(h)->rref) xs_type_of(h)->rref(h); }
         for (size_t i = 0; i < r->nlist; i++) {
             xs_hdr *h = r->list[i];
             if (h->rc != 0) {
@@ -5838,7 +5842,7 @@ static __attribute__((noinline)) void xs_region_reset(xs_region *r) {
             }
         }
     } else {
-        for (size_t i = 0; i < r->nlist; i++) { xs_hdr *h = r->list[i]; h->type->drop(h); }
+        for (size_t i = 0; i < r->nlist; i++) { xs_hdr *h = r->list[i]; xs_type_of(h)->drop(h); }
     }
     r->nlist = 0;
     xs_allocs += r->nobj; /* (never in xs_live: they leave together, here) */
@@ -5856,7 +5860,7 @@ static void xs_region_enter(xs_region *r) {
 }
 static void *xs_region_bytes_cur(size_t n) {
     xs_region *r = xs_rg_cur;
-    n = (n + 15) & ~(size_t)15;
+    n = (n + 7) & ~(size_t)7;
     if (r->ptr && (size_t)(r->end - r->ptr) >= n) { void *p = r->ptr; r->ptr += n; return p; }
     return xs_region_more(r, n);
 }
