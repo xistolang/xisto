@@ -3907,6 +3907,170 @@ static xs_arr_int *xs_u8_to_ints(xs_Uint8Array *b) { /* Array.from(bytes) */
     return a;
 }
 
+/* ---- shared memory: SharedArrayBuffer and Float64Array ----
+   Threads have heaps of their own and counts that are not atomic, so memory that two threads see is a block
+   apart (xs_shblk: plain malloc, its own count atomic), and each thread holds it through objects of its own
+   heap. A SharedArrayBuffer is such a block; a Float64Array is a view on one (a block of its own for
+   `new Float64Array(n)`, which nothing else sees). postMessage of a SharedArrayBuffer, or of a Float64Array on
+   one, gives the receiver a view on the same block, as in Node; a Float64Array on a block of its own goes as a
+   copy. What one thread wrote is seen by another after a message between them (the queue's mutex orders the
+   two): there are no Atomics. */
+typedef struct xs_shblk { int64_t refs; int64_t n; } xs_shblk; /* n bytes follow, 16-byte aligned (malloc's) */
+static inline char *xs_shblk_data(xs_shblk *b) { return (char *)(b + 1); }
+XS_NOINLINE xs_shblk *xs_shblk_new(int64_t n, bool zero) {
+    xs_shblk *b = zero ? calloc(1, sizeof *b + (size_t)n) : malloc(sizeof *b + (size_t)n);
+    if (!b) xs_panic("out of memory");
+    b->refs = 1;
+    b->n = n;
+    return b;
+}
+static inline void xs_shblk_ref(xs_shblk *b) { __atomic_add_fetch(&b->refs, 1, __ATOMIC_RELAXED); }
+static inline void xs_shblk_unref(xs_shblk *b) { if (b && __atomic_sub_fetch(&b->refs, 1, __ATOMIC_ACQ_REL) == 0) free(b); }
+
+typedef struct xs_SharedArrayBuffer { xs_hdr hdr; int64_t f_byteLength; xs_shblk *blk; } xs_SharedArrayBuffer;
+static void xs_sab_free(void *p) { xs_shblk_unref(((xs_SharedArrayBuffer *)p)->blk); xs_obj_free(p); }
+static void xs_sab_print(void *p) { /* SharedArrayBuffer { [Uint8Contents]: <00 01>, [byteLength]: 2 } */
+    xs_SharedArrayBuffer *s = p;
+    const uint8_t *d = (const uint8_t *)xs_shblk_data(s->blk);
+    xs_insp fr;
+    if (!xs_insp_begin(&fr, p, "SharedArrayBuffer", NULL)) return;
+    xs_insp_entry(&fr);
+    fputs("[Uint8Contents]: <", XS_OUT);
+    int64_t n = s->f_byteLength < 100 ? s->f_byteLength : 100; /* (Node shows up to 100 bytes) */
+    for (int64_t i = 0; i < n; i++) fprintf(XS_OUT, i ? " %02x" : "%02x", d[i]);
+    if (s->f_byteLength > 100) fprintf(XS_OUT, " ... %lld more byte%s", (long long)(s->f_byteLength - 100), s->f_byteLength - 100 == 1 ? "" : "s");
+    fputc('>', XS_OUT);
+    xs_insp_entry(&fr);
+    fprintf(XS_OUT, "[byteLength]: %lld", (long long)s->f_byteLength);
+    xs_insp_end(&fr, "SharedArrayBuffer {", "}", false, false, false);
+}
+/* a buffer on blk, whose reference it takes over */
+XS_NOINLINE xs_SharedArrayBuffer *xs_sab_wrap(xs_shblk *blk) {
+    xs_SharedArrayBuffer *s = xs_obj_alloc(sizeof *s, xs_sab_free, xs_sab_print);
+    s->f_byteLength = blk->n;
+    s->blk = blk;
+    return s;
+}
+XS_NOINLINE xs_SharedArrayBuffer *xs_sab_new(int64_t n) {
+    if (n < 0 || n > ((int64_t)1 << 40)) xs_panic("RangeError: Invalid array buffer length");
+    return xs_sab_wrap(xs_shblk_new(n, true));
+}
+
+/* the length is also `len`, the name the loop versioning of emit.c (bce_version_guard) reads arrays' by */
+typedef struct xs_Float64Array { xs_hdr hdr; union { int64_t f_length; int64_t len; }; double *data; xs_shblk *blk; bool shared; } xs_Float64Array;
+static void xs_f64_free(void *p) { xs_shblk_unref(((xs_Float64Array *)p)->blk); xs_obj_free(p); }
+static void xs_f64_print(void *p) {
+    xs_Float64Array *a = p;
+    xs_insp fr;
+    if (!xs_insp_begin(&fr, p, "Float64Array", a->f_length ? NULL : "Float64Array(0) []")) return;
+    int64_t n = a->f_length < 100 ? a->f_length : 100;
+    for (int64_t i = 0; i < n; i++) { xs_insp_entry(&fr); xs_print_num(a->data[i]); }
+    if (a->f_length > 100) { xs_insp_entry(&fr); fprintf(XS_OUT, "... %lld more item%s", (long long)(a->f_length - 100), a->f_length - 100 == 1 ? "" : "s"); }
+    char open[48];
+    snprintf(open, sizeof open, "Float64Array(%lld) [", (long long)a->f_length);
+    xs_insp_end(&fr, open, "]", true, true, a->f_length > 100);
+}
+/* a view of n doubles from the off-th one of blk, whose reference it takes over */
+XS_NOINLINE xs_Float64Array *xs_f64_wrap(xs_shblk *blk, int64_t off, int64_t n, bool shared) {
+    xs_Float64Array *a = xs_obj_alloc(sizeof *a, xs_f64_free, xs_f64_print);
+    a->f_length = n;
+    a->data = (double *)xs_shblk_data(blk) + off;
+    a->blk = blk;
+    a->shared = shared;
+    return a;
+}
+XS_NOINLINE xs_Float64Array *xs_f64_new(int64_t n) {
+    if (n < 0 || n > ((int64_t)1 << 37)) xs_panic("RangeError: Invalid typed array length");
+    return xs_f64_wrap(xs_shblk_new(n * 8, true), 0, n, false);
+}
+XS_NOINLINE xs_Float64Array *xs_f64_from_nums(xs_arr_num *s) {
+    xs_Float64Array *a = xs_f64_wrap(xs_shblk_new((int64_t)s->len * 8, false), 0, (int64_t)s->len, false);
+    if (s->len) memcpy(a->data, s->data, s->len * sizeof(double));
+    return a;
+}
+XS_NOINLINE xs_Float64Array *xs_f64_from_ints(xs_arr_int *s) {
+    xs_Float64Array *a = xs_f64_wrap(xs_shblk_new((int64_t)s->len * 8, false), 0, (int64_t)s->len, false);
+    for (size_t i = 0; i < s->len; i++) a->data[i] = (double)s->data[i];
+    return a;
+}
+XS_NOINLINE xs_Float64Array *xs_f64_copy(xs_Float64Array *s) {
+    xs_Float64Array *a = xs_f64_wrap(xs_shblk_new(s->f_length * 8, false), 0, s->f_length, false);
+    if (s->f_length) memcpy(a->data, s->data, (size_t)s->f_length * sizeof(double));
+    return a;
+}
+/* new Float64Array(sab, byteOffset?, length?): a view on the buffer (INT64_MIN: not given) */
+XS_NOINLINE xs_Float64Array *xs_f64_on(xs_SharedArrayBuffer *s, int64_t off, int64_t n) {
+    if (off == INT64_MIN) off = 0;
+    if (off < 0 || off % 8) xs_panic("RangeError: start offset of Float64Array should be a multiple of 8");
+    if (off > s->f_byteLength) xs_panic("RangeError: start offset is outside the bounds of the buffer");
+    if (n == INT64_MIN) {
+        if ((s->f_byteLength - off) % 8) xs_panic("RangeError: byte length of Float64Array should be a multiple of 8");
+        n = (s->f_byteLength - off) / 8;
+    } else if (n < 0 || n > (s->f_byteLength - off) / 8) xs_panic("RangeError: Invalid typed array length");
+    xs_shblk_ref(s->blk);
+    return xs_f64_wrap(s->blk, off / 8, n, true);
+}
+/* the length, with the bound every Float64Array has: as xs_u8_len, it lets the compiler drop overflow checks */
+static inline int64_t xs_f64_len(xs_Float64Array *a) {
+    int64_t n = a->f_length;
+#if defined(__clang__)
+    __builtin_assume(n >= 0 && n <= ((int64_t)1 << 37));
+#else
+    if (n < 0 || n > ((int64_t)1 << 37)) __builtin_unreachable();
+#endif
+    return n;
+}
+static inline double *xs_f64_at_s(xs_Float64Array *a, int64_t i, const xs_site *s) {
+    if ((uint64_t)i >= (uint64_t)a->f_length) XS_FAIL("index out of bounds", s);
+    return &a->data[i];
+}
+static inline int64_t xs_f64_byte_length(xs_Float64Array *a) { return a->f_length * 8; }
+static inline int64_t xs_f64_byte_offset(xs_Float64Array *a) { return (int64_t)((char *)a->data - xs_shblk_data(a->blk)); }
+XS_NOINLINE xs_Float64Array *xs_f64_fill(xs_Float64Array *a, double v, int64_t start, int64_t end) {
+    int64_t s = xs_u8_rel(start, a->f_length, 0), e = xs_u8_rel(end, a->f_length, a->f_length);
+    for (int64_t i = s; i < e; i++) a->data[i] = v;
+    return xs_retain(a);
+}
+XS_NOINLINE void xs_f64_set_check(int64_t n, int64_t off, int64_t len) {
+    if (off < 0 || off > len || n > len - off) xs_panic("RangeError: offset is out of bounds");
+}
+XS_NOINLINE void xs_f64_set_from(xs_Float64Array *d, xs_Float64Array *s, int64_t off) {
+    xs_f64_set_check(s->f_length, off, d->f_length);
+    if (s->f_length) memmove(d->data + off, s->data, (size_t)s->f_length * sizeof(double)); /* (views on one block may overlap) */
+}
+XS_NOINLINE void xs_f64_set_nums(xs_Float64Array *d, xs_arr_num *s, int64_t off) {
+    xs_f64_set_check((int64_t)s->len, off, d->f_length);
+    if (s->len) memcpy(d->data + off, s->data, s->len * sizeof(double));
+}
+XS_NOINLINE xs_Float64Array *xs_f64_subarray(xs_Float64Array *a, int64_t start, int64_t end) { /* a view on the same block */
+    int64_t s = xs_u8_rel(start, a->f_length, 0), e = xs_u8_rel(end, a->f_length, a->f_length);
+    xs_shblk_ref(a->blk);
+    return xs_f64_wrap(a->blk, (a->data - (double *)xs_shblk_data(a->blk)) + s, e > s ? e - s : 0, a->shared);
+}
+XS_NOINLINE xs_Float64Array *xs_f64_slice(xs_Float64Array *a, int64_t start, int64_t end) { /* a copy, of its own */
+    int64_t s = xs_u8_rel(start, a->f_length, 0), e = xs_u8_rel(end, a->f_length, a->f_length), n = e > s ? e - s : 0;
+    xs_Float64Array *r = xs_f64_wrap(xs_shblk_new(n * 8, false), 0, n, false);
+    if (n) memcpy(r->data, a->data + s, (size_t)n * sizeof(double));
+    return r;
+}
+XS_NOINLINE xs_str *xs_f64_join(xs_Float64Array *a, xs_str *sep) {
+    xs_sb sb = {0};
+    char t[32];
+    for (int64_t i = 0; i < a->f_length; i++) {
+        if (i) xs_sb_put(&sb, sep->data, (size_t)sep->len);
+        if (a->data[i] == 0) xs_sb_put(&sb, "0", 1); /* (-0 joins as 0) */
+        else { xs_num_to_str(a->data[i], t); xs_sb_put(&sb, t, strlen(t)); }
+    }
+    xs_str *r = xs_str_new(sb.data ? sb.data : "", sb.len);
+    free(sb.data);
+    return r;
+}
+XS_NOINLINE xs_str *xs_f64_to_string(xs_Float64Array *a) {
+    xs_str *c = xs_str_new(",", 1), *r = xs_f64_join(a, c);
+    xs_release(c);
+    return r;
+}
+
 /* ---- text ---- */
 XS_NOINLINE xs_Uint8Array *xs_text_encode(xs_str *s) { /* new TextEncoder().encode(s): the UTF-8 bytes */
     xs_Uint8Array *b = xs_u8_raw(s->len, false, false);

@@ -945,6 +945,7 @@ static const char *binop(TokKind op) {
     }
 }
 
+static bool is_f64_type(Type *t) { return t && t->kind == TY_OBJECT && t->cls && t->cls->builtin && strcmp(t->cls->cname, "xs_Float64Array") == 0; }
 /* Address of a variable, field or array slot. */
 static void emit_lvalue_ptr(Expr *e) {
     switch (e->kind) {
@@ -957,6 +958,22 @@ static void emit_lvalue_ptr(Expr *e) {
         buf_printf(out, ")->%s", e->cls->fields[e->field].cname);
         return;
     default: /* E_INDEX */
+        if (is_f64_type(e->lhs->type)) { /* f[i] on a Float64Array: its data, as a number[]'s */
+            bool safe = bce_safe(e);
+            buf_puts(out, safe ? "(&(" : "xs_f64_at_s(");
+            emit_borrowed(e->lhs);
+            buf_puts(out, safe ? ")->data[" : ", ");
+            if (safe && e->rhs->kind == E_BINARY && (e->rhs->op == TK_PLUS || e->rhs->op == TK_MINUS)) {
+                buf_puts(out, "(");
+                emit_expr(e->rhs->lhs);
+                buf_puts(out, e->rhs->op == TK_PLUS ? ") + (" : ") - (");
+                emit_expr(e->rhs->rhs);
+                buf_puts(out, ")");
+            } else emit_expr(e->rhs);
+            if (safe) buf_puts(out, "])");
+            else { site_arg(e->pos); buf_puts(out, ")"); }
+            return;
+        }
         if (bce_safe(e)) { /* within the array: see bce_enter */
             buf_printf(out, arr_is_ref(e->lhs->type) ? "((%s*)&(" : "(&(", ctype(e->type));
             emit_borrowed(e->lhs);
@@ -1735,8 +1752,8 @@ static void emit_member(Expr *e) {
         return;
     }
     /* object */
-    if (e->field >= 0 && e->cls->builtin && strcmp(e->cls->cname, "xs_Uint8Array") == 0) { /* bytes.length: with its bound told to the compiler */
-        buf_puts(out, "xs_u8_len(");
+    if (e->field >= 0 && e->cls->builtin && (strcmp(e->cls->cname, "xs_Uint8Array") == 0 || strcmp(e->cls->cname, "xs_Float64Array") == 0)) {
+        buf_puts(out, e->cls->cname[3] == 'U' ? "xs_u8_len(" : "xs_f64_len("); /* bytes.length: with its bound told to the compiler */
         emit_borrowed(base);
         buf_puts(out, ")");
         return;
@@ -3492,6 +3509,10 @@ typedef struct { const char *i, *a; bool guarded; Expr *idx; } BceLoop; /* guard
    idx: that exact index expression (a[i + E], a[E - i]) is within a */
 static BceLoop bce_loops[16];
 static int nbce;
+/* a is a Float64Array in a local of its own: its length never changes, and nothing but an assignment to a in
+   the body can make a name another array, so calls and other uses of a do not matter (bce_ok). (Calls are
+   allowed only when the names the guard reads are plain locals too, which code called cannot change.) */
+static bool bce_fixed_len;
 static bool bce_body_ok(Expr *e, Expr *parent, const char *a);
 static bool bce_stmt_ok(Stmt *s, const char *a) {
     if (!s) return true;
@@ -3507,17 +3528,19 @@ static bool bce_body_ok(Expr *e, Expr *parent, const char *a) {
     if (!e) return true;
     switch (e->kind) {
     case E_ARROW: case E_AWAIT: return false;
-    case E_CALL: if (e->func) return false; break;
-    case E_NEW_OBJ: if (e->cls && !e->cls->builtin) return false; break;
+    case E_CALL: /* user code: a function, or a closure value (which may change a captured limit, or the array) */
+        if ((e->func || (e->lhs && e->lhs->type && e->lhs->type->kind == TY_FUNC && !e->builtin.cfn)) && !bce_fixed_len) return false;
+        break;
+    case E_NEW_OBJ: if (e->cls && !e->cls->builtin && !bce_fixed_len) return false; break;
     case E_MEMBER:
-        if (e->is_call && e->func) return false;
-        if (e->is_call && e->str) {
+        if (e->is_call && e->func && !bce_fixed_len) return false;
+        if (e->is_call && e->str && !bce_fixed_len) {
             static const char *const resize[] = {"push", "pop", "shift", "unshift", "splice", "fill", "sort", "reverse", "copyWithin", "set", "delete", "clear"};
             for (int i = 0; i < 12; i++) if (strcmp(e->str, resize[i]) == 0) return false;
         }
         break;
     case E_IDENT:
-        if (e->cname && strcmp(e->cname, a) == 0) {
+        if (e->cname && strcmp(e->cname, a) == 0 && !bce_fixed_len) {
             bool as_base = parent && parent->kind == E_INDEX && parent->lhs == e;
             bool as_len = parent && parent->kind == E_MEMBER && !parent->is_call && parent->lhs == e && parent->str && strcmp(parent->str, "length") == 0;
             if (!as_base && !as_len) return false;
@@ -3530,15 +3553,24 @@ static bool bce_body_ok(Expr *e, Expr *parent, const char *a) {
     for (int i = 0; i < e->args.len; i++) if (!bce_body_ok(e->args.items[i], e, a)) return false;
     return true;
 }
+/* the indexable types the checks are dropped for: arrays, and Float64Array (the same ->len and ->data) */
+static bool bce_indexable(Type *t) { return t && (t->kind == TY_ARRAY || is_f64_type(t)); }
+static bool bce_plain_local(const char *cname) { return cname && strncmp(cname, "v_", 2) == 0; } /* (not a global, nor a cell) */
+static bool bce_ok(Stmt *body, const char *a, Type *t, bool calls_ok) {
+    bce_fixed_len = calls_ok && is_f64_type(t) && bce_plain_local(a);
+    bool ok = bce_stmt_ok(body, a);
+    bce_fixed_len = false;
+    return ok;
+}
 static void bce_enter(Stmt *s) {
     Expr *u = s->for_update, *c = s->cond;
     if (nbce == 16 || xs_debug || sm_mode || getenv("XISTO_NO_BCE")) return; /* (a generator: the consumer runs between yields) */
     if (!u || !u->builtin.cfn || strcmp(u->builtin.cfn, "counted_inc") != 0) return;
     Expr *len = c->rhs;
     if (!len || len->kind != E_MEMBER || len->is_call || !len->str || strcmp(len->str, "length") != 0) return;
-    if (!len->lhs || len->lhs->kind != E_IDENT || !len->lhs->cname || !len->lhs->type || len->lhs->type->kind != TY_ARRAY) return;
+    if (!len->lhs || len->lhs->kind != E_IDENT || !len->lhs->cname || !bce_indexable(len->lhs->type)) return;
     const char *a = len->lhs->cname;
-    if (!bce_stmt_ok(s->body, a)) return;
+    if (!bce_ok(s->body, a, len->lhs->type, true)) return;
     bce_loops[nbce++] = (BceLoop){u->lhs->cname, a};
 }
 /* Loop versioning, for the counted loops bce_enter does not cover: `for (...; i < LIM; i++)` with LIM a literal
@@ -3564,14 +3596,14 @@ static bool bce_writes(Stmt *s, const char *n) {
     return false;
 }
 /* a[i + E], a[E + i], a[i - E], a[E - i] with E pure and not written in the loop (bce_version_guard) */
-typedef struct { const char *a; Expr *idx, *E; int sign; } BceAff; /* index = sign * i + E (sign -1 or 1) */
+typedef struct { const char *a; Expr *idx, *E; int sign; Type *t; } BceAff; /* index = sign * i + E (sign -1 or 1) */
 static BceAff bce_aff[16];
 static int nbce_aff;
 static bool bce_pure(Expr *e);
 static Stmt *bce_cur_body;
 static void bce_affine_e(Expr *e, const char *i) {
     if (!e) return;
-    if (e->kind == E_INDEX && e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname && e->lhs->type && e->lhs->type->kind == TY_ARRAY &&
+    if (e->kind == E_INDEX && e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname && bce_indexable(e->lhs->type) &&
         e->rhs && e->rhs->kind == E_BINARY && (e->rhs->op == TK_PLUS || e->rhs->op == TK_MINUS) && nbce_aff < 16) {
         Expr *l = e->rhs->lhs, *r = e->rhs->rhs, *E = NULL;
         int sign = 0;
@@ -3582,7 +3614,7 @@ static void bce_affine_e(Expr *e, const char *i) {
         bool inv = E && bce_pure(E);
         if (inv && E->kind == E_IDENT) inv = !bce_writes(bce_cur_body, E->cname);
         if (inv && E->kind == E_BINARY) inv = false; /* (names only, or numbers: what the guard reads) */
-        if (inv && strcmp(e->lhs->cname, i) != 0) bce_aff[nbce_aff++] = (BceAff){e->lhs->cname, e->rhs, E, li && e->rhs->op == TK_MINUS ? 2 : sign};
+        if (inv && strcmp(e->lhs->cname, i) != 0) bce_aff[nbce_aff++] = (BceAff){e->lhs->cname, e->rhs, E, li && e->rhs->op == TK_MINUS ? 2 : sign, e->lhs->type};
     }
     bce_affine_e(e->lhs, i);
     bce_affine_e(e->rhs, i);
@@ -3595,24 +3627,24 @@ static void bce_affine(Stmt *s, const char *i) {
     for (int k = 0; k < s->stmts.len; k++) bce_affine(s->stmts.items[k], i);
     for (int k = 0; k < s->ncases; k++) bce_affine(s->cases[k].body, i);
 }
-static void bce_arrays_e(Expr *e, const char *i, const char **arrs, int *na) {
+static void bce_arrays_e(Expr *e, const char *i, const char **arrs, Type **ts, int *na) {
     if (!e) return;
-    if (e->kind == E_INDEX && e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname && e->lhs->type && e->lhs->type->kind == TY_ARRAY &&
+    if (e->kind == E_INDEX && e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname && bce_indexable(e->lhs->type) &&
         e->rhs && e->rhs->kind == E_IDENT && e->rhs->cname && strcmp(e->rhs->cname, i) == 0) {
         bool seen = false;
         for (int k = 0; k < *na; k++) if (strcmp(arrs[k], e->lhs->cname) == 0) seen = true;
-        if (!seen && *na < 8) arrs[(*na)++] = e->lhs->cname;
+        if (!seen && *na < 8) { ts[*na] = e->lhs->type; arrs[(*na)++] = e->lhs->cname; }
     }
-    bce_arrays_e(e->lhs, i, arrs, na);
-    bce_arrays_e(e->rhs, i, arrs, na);
-    for (int k = 0; k < e->args.len; k++) bce_arrays_e(e->args.items[k], i, arrs, na);
+    bce_arrays_e(e->lhs, i, arrs, ts, na);
+    bce_arrays_e(e->rhs, i, arrs, ts, na);
+    for (int k = 0; k < e->args.len; k++) bce_arrays_e(e->args.items[k], i, arrs, ts, na);
 }
-static void bce_arrays(Stmt *s, const char *i, const char **arrs, int *na) {
+static void bce_arrays(Stmt *s, const char *i, const char **arrs, Type **ts, int *na) {
     if (!s) return;
-    bce_arrays_e(s->init, i, arrs, na); bce_arrays_e(s->expr, i, arrs, na); bce_arrays_e(s->cond, i, arrs, na); bce_arrays_e(s->for_update, i, arrs, na);
-    bce_arrays(s->for_init, i, arrs, na); bce_arrays(s->body, i, arrs, na); bce_arrays(s->else_body, i, arrs, na);
-    for (int k = 0; k < s->stmts.len; k++) bce_arrays(s->stmts.items[k], i, arrs, na);
-    for (int k = 0; k < s->ncases; k++) bce_arrays(s->cases[k].body, i, arrs, na);
+    bce_arrays_e(s->init, i, arrs, ts, na); bce_arrays_e(s->expr, i, arrs, ts, na); bce_arrays_e(s->cond, i, arrs, ts, na); bce_arrays_e(s->for_update, i, arrs, ts, na);
+    bce_arrays(s->for_init, i, arrs, ts, na); bce_arrays(s->body, i, arrs, ts, na); bce_arrays(s->else_body, i, arrs, ts, na);
+    for (int k = 0; k < s->stmts.len; k++) bce_arrays(s->stmts.items[k], i, arrs, ts, na);
+    for (int k = 0; k < s->ncases; k++) bce_arrays(s->cases[k].body, i, arrs, ts, na);
 }
 /* no calls, assignments or checks that could fail: numbers, names and + - * of them */
 static bool bce_pure(Expr *e) {
@@ -3640,14 +3672,19 @@ static char *bce_version_guard(Stmt *s, const char **arrs, int *na) {
     Stmt *fi = s->for_init;
     if (!fi || fi->kind != S_VAR || !fi->cname || strcmp(fi->cname, i) != 0 || !fi->init || !bce_pure(fi->init)) return NULL;
     const char *cand[8];
+    Type *ct[8];
     int nc = 0;
-    bce_arrays(s->body, i, cand, &nc);
-    for (int k = 0; k < nc; k++) if (bce_stmt_ok(s->body, cand[k]) && strcmp(cand[k], i) != 0) arrs[(*na)++] = cand[k];
+    bce_arrays(s->body, i, cand, ct, &nc);
+    bool plain = lim->kind == E_NUMBER || bce_plain_local(lim->cname);
+    for (int k = 0; k < nc; k++) if (bce_ok(s->body, cand[k], ct[k], plain) && strcmp(cand[k], i) != 0) arrs[(*na)++] = cand[k];
     nbce_aff = 0;
     bce_cur_body = s->body;
     bce_affine(s->body, i);
     int keep = 0;
-    for (int k = 0; k < nbce_aff; k++) if (bce_stmt_ok(s->body, bce_aff[k].a)) bce_aff[keep++] = bce_aff[k];
+    for (int k = 0; k < nbce_aff; k++) {
+        Expr *E = bce_aff[k].E;
+        if (bce_ok(s->body, bce_aff[k].a, bce_aff[k].t, plain && (E->kind == E_NUMBER || bce_plain_local(E->cname)))) bce_aff[keep++] = bce_aff[k];
+    }
     nbce_aff = keep;
     if (!*na && !nbce_aff) return NULL;
     bool ar = false, ar2 = false;
@@ -3880,12 +3917,12 @@ static void emit_stmt_(Stmt *s) {
     }
     case S_FOROF: {
         Type *at = s->expr->type;
-        if (at->kind == TY_OBJECT && at->cls->builtin && strcmp(at->cls->cname, "xs_Uint8Array") == 0) { /* for (const b of bytes) */
+        if (at->kind == TY_OBJECT && at->cls->builtin && (strcmp(at->cls->cname, "xs_Uint8Array") == 0 || is_f64_type(at))) { /* for (const b of bytes) */
             buf_puts(out, "{");
             indent++;
             epush(false);
             nl();
-            buf_puts(out, "xs_Uint8Array *it_ = xs_retain(");
+            buf_printf(out, "%s *it_ = xs_retain(", at->cls->cname);
             emit_borrowed(s->expr);
             buf_puts(out, ");");
             etrack("it_", at);
@@ -3895,7 +3932,7 @@ static void emit_stmt_(Stmt *s) {
             epush(false);
             escope->kind = SC_LOOP_BODY;
             nl();
-            emit_local_decl(ty_int, s->cname);
+            emit_local_decl(is_f64_type(at) ? ty_number : ty_int, s->cname);
             buf_puts(out, " = it_->data[i_];");
             dbg_local(s->name, s->type, s->cname, s->is_const);
             nl();
