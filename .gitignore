@@ -14,3 +14,4 @@ node_modules/
 examples/conduit/dist/
 examples/conduit/conduit
 third_party/qbe/qbe
+.claude/
