@@ -81,6 +81,9 @@ static const char *tls_choice;
 /* --target=linux-arm64|linux-x64: a static Linux executable (musl), built with `zig cc` from any host */
 static const char *xs_target;
 static bool build_dylib; /* xisto run --dev on macOS: the program as a library this process loads (loader.c) */
+static const char *xs_cpu; /* --cpu=native (XISTO_CPU=native): code for this machine's processor, as Rust's
+                             -C target-cpu=native: AVX2 on x86, the core's extensions on arm; the default stays
+                             portable (an executable built for one CPU may not run on an older one) */
 static bool in_process;  /* ... and so built without per-thread state: one event loop, plain globals */
 int xs_run_in_process(const char *path, int argc, char **argv);
 static const char *awslc_dir(void) {
@@ -128,6 +131,7 @@ static void usage(void) {
             "  --no-warnings  do not report unused variables and functions\n"
             "  --profile      count calls and time per function; the table goes to stderr at exit (C backend)\n"
             "  --backend=qbe  generate QBE IL and machine code directly, without C\n"
+            "  --cpu=native   code for this machine's processor (AVX2, ...), as Rust's target-cpu=native; XISTO_CPU=native\n"
             "  --node-compat  accept node:fs, node:sqlite... as names of xisto's own modules (xisto:fs...)\n"
             "  --tls=off      never link TLS: fetch URLs only known at run time must be http:// (TLS at the load balancer)\n"
             "  --tls=bearssl  use BearSSL (TLS 1.2, smaller binary) instead of AWS-LC (TLS 1.3, the default)\n"
@@ -415,7 +419,8 @@ static void run_cc(const char *cfile, const char *outfile, bool dev) {
     uint64_t h = fnv(cc_text, cc_len) ^ (fnv(cc, strlen(cc)) * 31) ^ (dev ? 0x9e3779b97f4a7c15ull : 0) ^ (fnv(XS_HOST, strlen(XS_HOST)) * 3) ^
                  (xs_debug ? 0x51afd7ed558ccdull : 0) ^ (link_tls ? 0x2545f4914f6cdd1dull : 0) ^ (link_sqlite ? 0x27d4eb2f165667c5ull : 0) ^
                  (xs_target ? fnv(xs_target, strlen(xs_target)) * 7 : 0) ^ (build_dylib ? 0x165667b19e3779f9ull : 0) ^
-                 fnv(XS_CC_KEY, strlen(XS_CC_KEY)) * 11; /* the compiler flags this xisto passes: a new set rebuilds */
+                 fnv(XS_CC_KEY, strlen(XS_CC_KEY)) * 11 ^ /* the compiler flags this xisto passes: a new set rebuilds */
+                 (xs_cpu ? fnv(xs_cpu, strlen(xs_cpu)) * 13 : 0);
     char *hit = xs_sprintf("%s/%016llx", cache, (unsigned long long)h);
     if (xs_exists(hit) && xs_copy_file(hit, outfile)) {
         if (show_time) fprintf(stderr, "xisto: cc from cache %.1f ms\n", now_ms() - t0);
@@ -679,6 +684,14 @@ static void run_cc_raw(const char *cfile, const char *outfile, bool dev) {
     const char *cc = host_cc();
     const char *opt = getenv("XISTO_OPT"); /* the release optimization level (measuring knob) */
     const char *flags = xs_debug ? "-O0 -g" : dev ? "-O0" : opt ? xs_sprintf("-O%s", opt) : "-O3"; /* -O3: objects 5.2 -> 3.7 ns per iteration, nbody 0.42 -> 0.40 s, nothing slower; Conduit builds as fast, smaller (07/11) */
+    if (!xs_cpu && getenv("XISTO_CPU") && *getenv("XISTO_CPU")) xs_cpu = getenv("XISTO_CPU");
+    if (xs_cpu && !dev && !xs_debug) { /* (-ffp-contract=off below still forbids fused multiply-adds: the same numbers) */
+#if defined(__aarch64__)
+        flags = xs_sprintf("%s -mcpu=%s", flags, xs_cpu);
+#else
+        flags = xs_sprintf("%s -march=%s", flags, xs_cpu);
+#endif
+    }
     /* JS semantics are strict IEEE 754: no fused multiply-add. */
 #ifdef XS_CLANG_FLAGS
     if (cc_is_clang(cc)) flags = xs_sprintf("%s %s", flags, XS_CLANG_FLAGS);
@@ -956,6 +969,7 @@ bool xs_build_debug(const char *file, const char *exe) {
     xs_debug = true;
     use_qbe = getenv("XISTO_DEBUG_BACKEND") && strcmp(getenv("XISTO_DEBUG_BACKEND"), "qbe") == 0;
     if (getenv("XISTO_NODE_COMPAT") && strcmp(getenv("XISTO_NODE_COMPAT"), "1") == 0) xs_node_compat = true;
+    if (!xs_cpu && getenv("XISTO_CPU") && *getenv("XISTO_CPU")) xs_cpu = getenv("XISTO_CPU");
     if (use_qbe) { compile_to_c(file); build_qbe_cached(last_program, file, exe); return access(exe, X_OK) == 0; }
     Buf b = compile_to_c(file);
     char *cfile = xs_sprintf("%s.c", exe);
@@ -1009,6 +1023,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--profile") == 0) xs_profile = true;
         else if (strcmp(argv[i], "--time") == 0) show_time = true;
         else if (strcmp(argv[i], "--no-warnings") == 0) xs_warnings = false;
+        else if (strncmp(argv[i], "--cpu=", 6) == 0) xs_cpu = argv[i] + 6;
         else if (strcmp(argv[i], "--tls=off") == 0) xs_tls_off = true;
         else if (strcmp(argv[i], "--node-compat") == 0) xs_node_compat = true;
         else if (strcmp(argv[i], "--tls=awslc") == 0 || strcmp(argv[i], "--tls=bearssl") == 0) tls_choice = argv[i] + 6;

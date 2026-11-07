@@ -1,0 +1,12 @@
+# Linux x86_64, 2 cpu; node v26.12.0, bun 1.4.4; median of 1
+program                              xisto                       node                        bun   xisto vs best other  output
+spectralnorm      2.261s    2.26cpu    2.3MB   3.115s    3.13cpu   56.9MB   4.156s    4.19cpu   26.4MB   1.38x faster         same  gz 390/321
+nbody             3.908s    3.91cpu    1.9MB   6.294s    6.30cpu   55.7MB   9.580s    9.59cpu   27.8MB   1.61x faster         same  gz 1247/1169
+fannkuchredux    50.151s   50.13cpu    1.9MB  54.867s   54.86cpu   54.1MB  55.058s   55.06cpu   27.6MB   1.09x faster         same  gz 503/442
+binarytrees       6.378s    6.38cpu  326.8MB  34.437s   50.81cpu  557.6MB  13.327s   16.90cpu 1030.3MB   2.09x faster         same  gz 524/451
+mandelbrot       29.617s   29.61cpu    1.8MB  81.419s   81.37cpu   58.0MB  71.539s   71.51cpu   32.8MB   2.42x faster         same  gz 392/370
+fasta             8.824s    8.57cpu    1.9MB  19.656s   21.63cpu 1711.1MB  15.357s   15.09cpu   89.7MB   1.74x faster         DIFFERS xisto:1 node:1 bun:1  gz 929/818
+knucleotide      82.441s   82.42cpu  653.5MB 136.522s  137.07cpu  647.3MB  94.935s   95.42cpu 1321.6MB   1.15x faster         same  gz 774/678
+revcomp           2.028s    1.31cpu  244.6MB   5.230s    4.66cpu  670.4MB   4.326s    4.40cpu  295.4MB   2.13x faster         same  gz 1497/1195
+regexredux        1.011s    1.01cpu  266.7MB   3.957s    4.11cpu  635.2MB   1.141s    1.15cpu  320.2MB   1.13x faster         same  gz 459/452
+pidigits          1.456s    1.45cpu    2.6MB  11.118s   11.15cpu  120.7MB   2.333s    2.38cpu  101.6MB   1.60x faster         same  gz 470/422

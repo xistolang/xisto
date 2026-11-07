@@ -490,7 +490,9 @@ static Expr *parse_primary(Parser *p) {
                     else if (*q == '"' || *q == '\'') { char qq = *q++; while (*q && *q != qq) { if (*q == '\\') q++; q++; } }
                     q++;
                 }
-                char *src = xs_strndup(start_expr, (size_t)(q - start_expr));
+                size_t sn = (size_t)(q - start_expr);
+                char *src = xs_alloc(sn + 4); /* (zeros after the end: the lexer looks a character or two ahead) */
+                memcpy(src, start_expr, sn);
                 Parser sub = {0};
                 lexer_init(&sub.lx, src);
                 sub.lx.line = line;
