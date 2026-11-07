@@ -4,7 +4,9 @@ https://salsa.debian.org/benchmarksgame-team/benchmarksgame/
 mandelbrot, xisto #2: the rows go in chunks to a pool of workers (node:worker_threads), each chunk comes back
 as bytes; eight pixels at a time, as eight independent sets of variables (what the C compiler turns into
 vector instructions), until all eight have escaped or the 50 iterations are done. A pixel that escaped only
-grows from there, so going on with it changes nothing in the final test, tr + ti <= 4.
+grows from there, so going on with it changes nothing in the final test, tr + ti <= 4: the escape is tested
+every five iterations (the C compiler unrolls the five and keeps the test, a chain of comparisons, as one
+vector value).
  */
 
 import { availableParallelism } from "node:os";
@@ -23,15 +25,17 @@ function row(y: int, w: int, h: int, out: Uint8Array, at: int): void {
     let zi0 = 0, zi1 = 0, zi2 = 0, zi3 = 0, zi4 = 0, zi5 = 0, zi6 = 0, zi7 = 0;
     let tr0 = 0, tr1 = 0, tr2 = 0, tr3 = 0, tr4 = 0, tr5 = 0, tr6 = 0, tr7 = 0;
     let ti0 = 0, ti1 = 0, ti2 = 0, ti3 = 0, ti4 = 0, ti5 = 0, ti6 = 0, ti7 = 0;
-    for (let i = 0; i < 50; i++) {
-      zi0 = 2 * zr0 * zi0 + ci; zr0 = tr0 - ti0 + r0; tr0 = zr0 * zr0; ti0 = zi0 * zi0;
-      zi1 = 2 * zr1 * zi1 + ci; zr1 = tr1 - ti1 + r1; tr1 = zr1 * zr1; ti1 = zi1 * zi1;
-      zi2 = 2 * zr2 * zi2 + ci; zr2 = tr2 - ti2 + r2; tr2 = zr2 * zr2; ti2 = zi2 * zi2;
-      zi3 = 2 * zr3 * zi3 + ci; zr3 = tr3 - ti3 + r3; tr3 = zr3 * zr3; ti3 = zi3 * zi3;
-      zi4 = 2 * zr4 * zi4 + ci; zr4 = tr4 - ti4 + r4; tr4 = zr4 * zr4; ti4 = zi4 * zi4;
-      zi5 = 2 * zr5 * zi5 + ci; zr5 = tr5 - ti5 + r5; tr5 = zr5 * zr5; ti5 = zi5 * zi5;
-      zi6 = 2 * zr6 * zi6 + ci; zr6 = tr6 - ti6 + r6; tr6 = zr6 * zr6; ti6 = zi6 * zi6;
-      zi7 = 2 * zr7 * zi7 + ci; zr7 = tr7 - ti7 + r7; tr7 = zr7 * zr7; ti7 = zi7 * zi7;
+    for (let i = 0; i < 10; i++) {
+      for (let k = 0; k < 5; k++) {
+        zi0 = 2 * zr0 * zi0 + ci; zr0 = tr0 - ti0 + r0; tr0 = zr0 * zr0; ti0 = zi0 * zi0;
+        zi1 = 2 * zr1 * zi1 + ci; zr1 = tr1 - ti1 + r1; tr1 = zr1 * zr1; ti1 = zi1 * zi1;
+        zi2 = 2 * zr2 * zi2 + ci; zr2 = tr2 - ti2 + r2; tr2 = zr2 * zr2; ti2 = zi2 * zi2;
+        zi3 = 2 * zr3 * zi3 + ci; zr3 = tr3 - ti3 + r3; tr3 = zr3 * zr3; ti3 = zi3 * zi3;
+        zi4 = 2 * zr4 * zi4 + ci; zr4 = tr4 - ti4 + r4; tr4 = zr4 * zr4; ti4 = zi4 * zi4;
+        zi5 = 2 * zr5 * zi5 + ci; zr5 = tr5 - ti5 + r5; tr5 = zr5 * zr5; ti5 = zi5 * zi5;
+        zi6 = 2 * zr6 * zi6 + ci; zr6 = tr6 - ti6 + r6; tr6 = zr6 * zr6; ti6 = zi6 * zi6;
+        zi7 = 2 * zr7 * zi7 + ci; zr7 = tr7 - ti7 + r7; tr7 = zr7 * zr7; ti7 = zi7 * zi7;
+      }
       if (!(tr0 + ti0 <= 4) && !(tr1 + ti1 <= 4) && !(tr2 + ti2 <= 4) && !(tr3 + ti3 <= 4) &&
         !(tr4 + ti4 <= 4) && !(tr5 + ti5 <= 4) && !(tr6 + ti6 <= 4) && !(tr7 + ti7 <= 4)) break;
     }
