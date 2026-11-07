@@ -2186,10 +2186,37 @@ static void xs_num_to_str(double v, char *out /* >= 32 bytes */) {
     char *o = out;
     if (v < 0) { *o++ = '-'; v = -v; }
     char tmp[40];
-    int prec;
-    for (prec = 1; prec <= 17; prec++) { /* shortest digit string that round-trips */
-        snprintf(tmp, sizeof tmp, "%.*e", prec - 1, v);
-        if (strtod(tmp, NULL) == v) break;
+    /* the shortest digit string that round-trips. When v's interval (the reals that round to it) is symmetric,
+       rounding to more digits can only come closer to v, so "p digits round-trip" holds from some p on: a binary
+       search over 1..17 finds the least (4 or 5 tries instead of up to 17). At a power of two (zero mantissa) the
+       interval below is half as wide as above, and there the digits are tried one by one, as before. */
+    uint64_t bits;
+    memcpy(&bits, &v, sizeof bits);
+    if (bits & 0xFFFFFFFFFFFFFull) {
+        int lo = 1, hi = 17;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            snprintf(tmp, sizeof tmp, "%.*e", mid - 1, v);
+            if (strtod(tmp, NULL) == v) hi = mid; else lo = mid + 1;
+        }
+        snprintf(tmp, sizeof tmp, "%.*e", lo - 1, v);
+    } else {
+        for (int prec = 1; prec <= 17; prec++) {
+            snprintf(tmp, sizeof tmp, "%.*e", prec - 1, v);
+            if (strtod(tmp, NULL) == v) break;
+            /* a tie: printf rounds it to the even digit, which can fall below the narrow lower half of a power
+               of two's interval; the digit one above, inside it, is the one JavaScript writes (2^-24:
+               5.960464477539063e-8) */
+            char up[40];
+            strcpy(up, tmp);
+            char *e = strchr(up, 'e');
+            int d = (int)(e - up) - 1;
+            while (d >= 0 && (up[d] == '9' || up[d] == '.')) { if (up[d] == '9') up[d] = '0'; d--; }
+            if (d >= 0) {
+                up[d]++;
+                if (strtod(up, NULL) == v) { strcpy(tmp, up); break; }
+            }
+        }
     }
     char digits[24];
     int k = 0;
