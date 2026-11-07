@@ -1,0 +1,10 @@
+kind,target,route,duration,req_per_s,p50_ms,p99_ms,errors,rss_mb,startup_ms,executable_bytes
+server,xisto,/ping,5s,231097,0.232,0.507,0,4.20,2,111088
+server,xisto,/hello?name=isa,5s,228218,0.234,0.497,0,4.47,2,111088
+server,node,/ping,5s,136913,0.398,0.865,0,100.72,11,61220224
+server,node,/hello?name=isa,5s,131713,0.419,0.927,0,108.16,11,61220224
+server,bun,/ping,5s,198223,0.271,0.587,0,34.47,2,88660864
+server,bun,/hello?name=isa,5s,187405,0.288,0.633,0,44.52,2,88660864
+client,xisto,-,-,-,-,-,-,1.91,0.58,-
+client,node,-,-,-,-,-,-,220.30,1.73,-
+client,bun,-,-,-,-,-,-,35.20,1.02,-

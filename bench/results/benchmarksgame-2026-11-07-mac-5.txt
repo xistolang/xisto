@@ -1,0 +1,12 @@
+# Darwin arm64, 10 cpu; node v26.12.0, bun 1.4.4; median of 3
+program                              xisto                       node                        bun   xisto vs best other  output
+spectralnorm      0.851s    0.85cpu    1.6MB   1.102s    1.11cpu   45.9MB   1.313s    1.32cpu   20.1MB   1.29x faster         same  gz 390/321
+nbody             1.604s    1.60cpu    1.2MB   2.344s    2.34cpu   45.5MB   2.486s    2.49cpu   18.8MB   1.46x faster         same  gz 1247/1169
+fannkuchredux    21.475s   21.47cpu    1.4MB  24.883s   24.87cpu   43.3MB  25.797s   25.77cpu   19.1MB   1.16x faster         same  gz 503/442
+binarytrees       2.842s    2.84cpu  325.5MB   5.167s    7.15cpu 1023.8MB   3.466s    4.26cpu 1197.5MB   1.22x faster         same  gz 524/451
+mandelbrot        8.781s    8.78cpu    1.4MB  24.235s   24.06cpu   48.8MB  22.086s   21.90cpu   26.6MB   2.52x faster         same  gz 392/370
+fasta             4.262s    4.25cpu    1.6MB   9.899s    9.90cpu   50.2MB   5.476s    5.43cpu   84.9MB   1.29x faster         same  gz 929/818
+knucleotide      22.410s   22.40cpu  717.5MB  44.651s   44.97cpu  704.4MB  27.480s   27.45cpu 1824.0MB   1.23x faster         same  gz 774/678
+revcomp           0.670s    0.62cpu  245.2MB   1.994s    2.05cpu  689.8MB   1.720s    1.75cpu  286.2MB   2.57x faster         same  gz 1497/1195
+regexredux        0.358s    0.36cpu  289.1MB   1.239s    1.25cpu  853.8MB   0.354s    0.35cpu  364.5MB   1.01x SLOWER         same  gz 459/452
+pidigits          0.650s    0.65cpu    2.9MB   5.652s    5.66cpu  114.0MB   0.728s    0.88cpu   99.1MB   1.12x faster         same  gz 470/422

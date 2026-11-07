@@ -1,0 +1,20 @@
+# Linux x86_64, 1 cpu; node v26.12.0, bun 1.4.4; median of 3
+program                    xisto              node               bun   xisto vs best other
+fib              0.055s    6.4MB   0.217s   66.3MB   0.093s   18.0MB   1.69x faster
+mandelbrot       1.761s    6.4MB   1.806s   69.2MB   1.829s   19.7MB   1.03x faster
+nbody            1.422s    6.5MB   1.343s   68.3MB   1.298s   23.0MB   1.09x SLOWER
+objects          0.063s    6.5MB   0.142s   69.1MB   0.067s   30.4MB   1.06x faster
+sieve            0.257s   29.9MB   1.257s  291.4MB   1.118s  248.8MB   4.36x faster
+binarytrees      0.938s   66.4MB   3.592s  153.6MB   1.695s  125.9MB   1.81x faster
+cycles           0.015s    2.2MB   0.119s   71.0MB   0.049s   31.8MB   3.32x faster
+accessors        0.019s    2.2MB   0.118s   67.2MB   0.043s   21.3MB   2.26x faster
+closures         0.029s    2.2MB   0.193s   68.1MB   0.068s   21.8MB   2.31x faster
+generators       0.008s    2.2MB   0.251s   69.0MB   0.129s   35.3MB   16.75x faster
+generics         0.258s  216.5MB   2.198s  295.6MB   0.998s  320.4MB   3.87x faster
+shapes           0.100s    2.2MB   0.226s   69.7MB   0.197s   23.6MB   1.96x faster
+unions           0.100s    2.2MB   0.237s   69.5MB   0.181s   22.3MB   1.81x faster
+bytes            0.389s  181.3MB   0.647s  233.1MB   0.366s  244.5MB   1.06x SLOWER
+date             0.502s   71.7MB   2.598s  127.2MB   1.233s  168.0MB   2.45x faster
+promise          0.032s   13.8MB   0.176s   84.9MB   0.069s   37.8MB   2.19x faster
+redos            0.002s    2.2MB  12.145s   61.4MB   6.649s   13.7MB   3813.84x faster
+regex            7.197s  238.5MB  43.344s  263.5MB  19.523s  303.8MB   2.71x faster

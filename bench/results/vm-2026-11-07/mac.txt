@@ -1,0 +1,20 @@
+# Darwin arm64, 10 cpu; node v26.12.0, bun 1.4.4; median of 3
+program                    xisto              node               bun   xisto vs best other
+fib              0.022s    1.2MB   0.115s   66.8MB   0.039s   14.0MB   1.81x faster
+mandelbrot       0.497s    1.3MB   0.574s   69.5MB   0.676s   16.3MB   1.16x faster
+nbody            0.397s    1.2MB   0.494s   69.5MB   0.456s   19.1MB   1.15x faster
+objects          0.013s    1.2MB   0.086s   69.5MB   0.025s   28.5MB   1.91x faster
+sieve            0.093s   29.9MB   0.353s  296.0MB   0.240s  245.6MB   2.57x faster
+binarytrees      0.355s   65.3MB   0.440s  195.7MB   0.397s  165.0MB   1.12x faster
+cycles           0.008s    1.3MB   0.081s   73.4MB   0.015s   30.9MB   1.96x faster
+accessors        0.007s    1.3MB   0.079s   71.3MB   0.019s   18.7MB   2.91x faster
+closures         0.010s    1.3MB   0.111s   74.6MB   0.040s   18.0MB   3.87x faster
+generators       0.004s    1.2MB   0.130s   69.8MB   0.036s   34.5MB   9.80x faster
+generics         0.050s  203.2MB   0.324s  412.5MB   0.119s  343.0MB   2.37x faster
+shapes           0.026s    1.2MB   0.131s   70.0MB   0.073s   20.8MB   2.76x faster
+unions           0.026s    1.3MB   0.129s   69.4MB   0.073s   18.9MB   2.82x faster
+bytes            0.088s  180.3MB   0.228s  283.5MB   0.123s  238.3MB   1.39x faster
+date             0.223s   74.4MB   1.044s  193.1MB   0.456s  234.5MB   2.05x faster
+promise          0.019s   14.9MB   0.093s   84.0MB   0.026s   33.4MB   1.34x faster
+redos            0.002s    1.3MB   6.877s   64.2MB   2.987s   10.3MB   1278.88x faster
+regex            0.157s  234.8MB   0.375s  418.5MB   0.198s  337.2MB   1.26x faster

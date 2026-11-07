@@ -1,0 +1,102 @@
+(xdb) b 27
+Breakpoint 1 at vars.ts:27
+(xdb) r
+Breakpoint 1, build at vars.ts:27
+=>  27 |     const count = s.add(i, i * 2);
+(xdb) locals
+n = 3
+s = Shape { name: 'tri', points: [], color: 'green', parent: null }
+i = 0
+(xdb) globals
+limit = 3
+ratio = 0.5
+tags = [ 'a', 'b' ]
+nothing = null
+(xdb) p s
+s = Shape { name: 'tri', points: [], color: 'green', parent: null }
+(xdb) p s.color
+s.color = 'green'
+(xdb) p s.parent
+s.parent = null
+(xdb) p s.nope
+s.nope: no such field
+(xdb) p i + 1
+i + 1: only paths are evaluated: a.b[2].c
+(xdb) p ghost
+ghost: not a variable in scope here
+(xdb) n
+build at vars.ts:28
+=>  28 |     ratio = ratio + Number(count);
+(xdb) locals
+n = 3
+s = Shape {
+  name: 'tri',
+  points: [ { x: 0, y: 0 } ],
+  color: 'green',
+  parent: null
+}
+i = 0
+count = 1
+(xdb) c
+Breakpoint 1, build at vars.ts:27
+=>  27 |     const count = s.add(i, i * 2);
+(xdb) c
+Breakpoint 1, build at vars.ts:27
+=>  27 |     const count = s.add(i, i * 2);
+(xdb) p s.points[1].y
+s.points[1].y = 2
+(xdb) p s.points[9]
+s.points[9]: index out of range (or not an array)
+(xdb) d 1
+Deleted breakpoint 1
+(xdb) b 31
+Breakpoint 2 at vars.ts:31
+(xdb) c
+Breakpoint 2, build at vars.ts:31
+=>  31 |     s.name = s.name + t;
+(xdb) locals
+n = 3
+s = Shape {
+  name: 'tri',
+  points: [ { x: 0, y: 0 }, { x: 1, y: 2 }, { x: 2, y: 4 } ],
+  color: 'green',
+  parent: null
+}
+t = 'a'
+(xdb) b 36
+Breakpoint 3 at vars.ts:36
+(xdb) d 2
+Deleted breakpoint 2
+(xdb) c
+Breakpoint 3, build at vars.ts:36
+=>  36 |     s.name = s.name + "!";
+(xdb) locals
+n = 3
+s = Shape {
+  name: 'triab',
+  points: [ { x: 0, y: 0 }, { x: 1, y: 2 }, { x: 2, y: 4 } ],
+  color: 'green',
+  parent: null
+}
+e = Error: nope
+(xdb) p e.message
+e.message = 'nope'
+(xdb) p e
+e = Error: nope
+(xdb) up
+#1  (top level) at vars.ts:40
+=>  40 | const shape = build(limit);
+(xdb) locals
+limit = 3
+ratio = 6.5
+tags = [ 'a', 'b' ]
+nothing = null
+(xdb) p shape
+shape: not a variable in scope here
+(xdb) s
+build at vars.ts:38
+=>  38 |   return s;
+(xdb) (end of commands: continue)
+triab! 6.5
+xisto: 11 allocations, 0 still alive at exit
+Program exited with code 0

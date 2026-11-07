@@ -1,0 +1,2 @@
+// expect: 'break' outside of a loop or switch
+break;

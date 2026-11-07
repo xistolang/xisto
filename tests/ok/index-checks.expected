@@ -1,0 +1,5 @@
+safe 52 10,12,14,16
+alias caught: array index out of bounds
+call caught: array index out of bounds
+negative caught: array index out of bounds
+ab ac ba bc ca cb 54

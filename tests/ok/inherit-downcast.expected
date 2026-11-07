@@ -1,0 +1,2 @@
+rex: woof
+caught: Error TypeError: the value is not Dog

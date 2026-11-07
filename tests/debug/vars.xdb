@@ -1,0 +1,30 @@
+b 27
+r
+locals
+globals
+p s
+p s.color
+p s.parent
+p s.nope
+p i + 1
+p ghost
+n
+locals
+c
+c
+p s.points[1].y
+p s.points[9]
+d 1
+b 31
+c
+locals
+b 36
+d 2
+c
+locals
+p e.message
+p e
+up
+locals
+p shape
+s

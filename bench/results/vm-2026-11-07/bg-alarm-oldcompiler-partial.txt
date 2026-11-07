@@ -1,0 +1,8 @@
+# Linux aarch64, 2 cpu; node v26.12.0, bun 1.4.4; median of 1
+program                              xisto                       node                        bun   xisto vs best other  output
+spectralnorm      3.676s    3.67cpu    1.7MB   4.060s    4.06cpu   46.5MB   4.816s    4.81cpu   19.4MB   1.10x faster         same
+nbody             7.957s    7.95cpu    1.4MB  10.236s   10.23cpu   45.7MB  14.400s   14.41cpu   20.9MB   1.29x faster         same
+fannkuchredux    58.721s   58.72cpu    1.4MB  67.733s   67.73cpu   43.9MB  64.699s   64.71cpu   20.2MB   1.10x faster         same
+binarytrees      10.675s   10.65cpu  261.4MB                failed       74.603s   23.71cpu  277.0MB   6.99x faster         DIFFERS xisto:1 node:0 bun:1
+mandelbrot       23.517s   23.51cpu    1.3MB  68.570s   68.54cpu   55.1MB  58.066s   58.03cpu   31.0MB   2.47x faster         same
+fasta            10.149s   10.11cpu    1.2MB                failed       15.361s   15.22cpu   89.8MB   1.51x faster         DIFFERS xisto:1 node:0 bun:1

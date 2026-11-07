@@ -1,0 +1,6 @@
+target,mode,time_s,max_rss_mb,result
+xisto,stream,0.32,1.3,1503528
+xisto,readFile,0.32,977.8,1503528
+node,stream,1.14,111.8,1503528
+node,readFile,0.20,873.9,
+bun,stream,0.60,56.5,1503528

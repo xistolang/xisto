@@ -1,0 +1,17 @@
+ping PONG
+flush OK
+get missing null
+set OK
+get olá, mundo
+ttl>0 true
+set NX on existing null
+incr 1 2 12
+exists 1 0
+expire true
+big roundtrip true
+keys 3
+mGet [ '12', null, 'olá, mundo' ]
+del 1 0
+server error: ERR value is not an integer or out of range
+quit OK
+connect error: connect ECONNREFUSED 127.0.0.1:1

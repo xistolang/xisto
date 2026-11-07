@@ -1,0 +1,13 @@
+catch off
+b 11 hits %2
+r
+p it.name
+d 1
+b 11 if ghost == 1
+c
+p it.name
+d 2
+b 11 if it.qty > 3
+c
+p it
+c

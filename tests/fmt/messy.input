@@ -1,0 +1,22 @@
+function f(x: int): int {
+      if (x > 0) {
+return x;   
+  }
+
+
+
+    switch (x) {
+  case 0:
+ return 1;
+        default:
+  return items.filter((t) => {
+  return t > 0;
+        })
+  .length;
+  }
+}
+const s: string = `keep
+   this   
+  exactly`;
+// comment {
+const t: string = "a { b";

@@ -1,0 +1,41 @@
+(xdb) b 11 if it.name == 'pad'
+Breakpoint 1 at cond.ts:11 if it.name == 'pad'
+(xdb) log 11 adding {it.name}: {it.qty} (sum {sum})
+Logpoint 2 at cond.ts:11
+(xdb) info b
+1  cond.ts:11 if it.name == 'pad'
+2  cond.ts:11 log: adding {it.name}: {it.qty} (sum {sum})
+(xdb) catch all
+Stop on all exceptions.
+(xdb) r
+Exception Error: no ink left
+  thrown in check at cond.ts:17
+=>  17 |     throw new Error(`no ${it.name} left`);
+(xdb) p sum
+sum: not a variable in scope here
+(xdb) locals
+it = { name: 'ink', qty: 0 }
+(xdb) c
+caught no ink left
+log: adding pen: 2 (sum 0)
+log: adding ink: 0 (sum 2)
+log: adding pad: 7 (sum 2)
+Breakpoint 1, total at cond.ts:11
+=>  11 |     sum = sum + it.qty;
+(xdb) p it
+it = { name: 'pad', qty: 7 }
+(xdb) p it.qty
+it.qty = 7
+(xdb) bt
+> #0  total at cond.ts:11
+  #1  (top level) at cond.ts:29
+(xdb) c
+log: adding cap: 4 (sum 9)
+total 13
+Exception Error: array index out of bounds
+  thrown in (top level) at cond.ts:30
+=>  30 | const last = items[9];
+(xdb) c
+runtime error: array index out of bounds
+    at cond.ts:30:19
+Program exited with code 70

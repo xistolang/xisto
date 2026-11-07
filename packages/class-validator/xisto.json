@@ -1,0 +1,7 @@
+{
+  "name": "class-validator",
+  "version": "0.1.0",
+  "license": "MIT",
+  "implements": { "class-validator": "^0.14" },
+  "main": "index.ts"
+}

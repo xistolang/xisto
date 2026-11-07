@@ -1,0 +1,3 @@
+main 0 true true
+job 0: 55 (worker true) | job 1: 210 (worker true) | job 2: 465 (worker true)
+pool 0,5050,20100,45150,80200,125250

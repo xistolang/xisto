@@ -1,0 +1,12 @@
+# Darwin arm64, 10 cpu; node v26.12.0, bun 1.4.4; median of 3
+program                              xisto                       node                        bun   xisto vs best other  output
+spectralnorm      0.851s    0.85cpu    1.6MB   1.104s    1.11cpu   46.5MB   1.312s    1.32cpu   20.1MB   1.30x faster         same
+nbody             1.607s    1.61cpu    1.4MB   2.356s    2.35cpu   45.5MB   2.494s    2.50cpu   18.9MB   1.47x faster         same
+fannkuchredux    21.656s   21.64cpu    1.4MB  25.010s   24.97cpu   40.8MB  25.871s   25.81cpu   19.0MB   1.15x faster         same
+binarytrees       3.876s    3.87cpu  257.5MB   5.265s    7.20cpu 1609.7MB   3.482s    4.35cpu 1195.9MB   1.11x SLOWER         same
+mandelbrot        8.742s    8.74cpu    1.4MB  24.409s   24.22cpu   48.7MB  22.414s   22.20cpu   26.4MB   2.56x faster         same
+fasta             4.530s    4.51cpu    1.7MB   9.799s    9.80cpu   50.3MB   5.559s    5.51cpu   84.8MB   1.23x faster         same
+knucleotide      23.141s   23.14cpu  781.6MB  45.118s   45.44cpu  706.1MB  27.111s   27.15cpu 1923.9MB   1.17x faster         same
+revcomp           0.666s    0.62cpu  308.7MB   1.995s    2.05cpu  689.0MB   1.708s    1.73cpu  307.0MB   2.57x faster         same
+regexredux        0.716s    0.71cpu  267.3MB   1.154s    1.18cpu  962.5MB   0.349s    0.34cpu  364.3MB   2.05x SLOWER         same
+pidigits          0.648s    0.65cpu    3.4MB   5.665s    5.67cpu  115.2MB   0.728s    0.88cpu   99.2MB   1.12x faster         same

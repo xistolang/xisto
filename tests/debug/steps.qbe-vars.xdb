@@ -1,0 +1,15 @@
+b 17
+r
+locals
+globals
+s
+locals
+p x
+up
+locals
+p s
+set s = 5
+up
+locals
+p c
+fin

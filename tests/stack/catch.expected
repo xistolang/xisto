@@ -1,0 +1,32 @@
+-- method
+Error: saldo insuficiente
+    at Conta.sacar (tests/stack/catch.ts:5:13)
+    at tests/stack/catch.ts:18:15
+-- arrow
+Error: integer overflow
+    at tests/stack/catch.ts:24:63
+    at tests/stack/catch.ts:24:18
+-- json
+Error: JSON: 'id' must be an integer
+    at tests/stack/catch.ts:30:25
+-- pop
+Error: pop from an empty array
+    at tests/stack/catch.ts:37:5
+-- repeat
+Error: Invalid count value: repeat count must be non-negative
+    at tests/stack/catch.ts:42:20
+-- postfix
+Error: integer overflow
+    at tests/stack/catch.ts:48:4
+-- compound
+Error: integer overflow
+    at tests/stack/catch.ts:54:5
+-- modulo
+Error: integer modulo by zero
+    at tests/stack/catch.ts:61:17
+-- floor
+Error: value out of int range
+    at tests/stack/catch.ts:66:20
+Error: not thrown
+    at tests/stack/catch.ts:70:12
+exit 0

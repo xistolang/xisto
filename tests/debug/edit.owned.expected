@@ -1,0 +1,54 @@
+(xdb) b 9
+Breakpoint 1 at edit.ts:9
+(xdb) r
+Breakpoint 1, describe at edit.ts:9
+=>   9 |   const area = b.size * scale;
+(xdb) set factor = 2.25
+factor = 2.25
+(xdb) set enabled = false
+enabled = false
+(xdb) set count = null
+count = null
+(xdb) set count = 7
+count = 7
+(xdb) set b.label = "big crate"
+b.label = 'big crate'
+(xdb) set b.size = 9
+b.size = 9
+(xdb) set b.note = null
+b.note = null
+(xdb) set level = 2
+level = 2
+(xdb) set level = 5
+cannot set level: not a member of Level
+(xdb) set scale = 99
+cannot set scale: read-only: a const, a captured variable or this
+(xdb) set factor = abc
+cannot set factor: expected a number
+(xdb) set enabled = 1
+cannot set enabled: expected true or false
+(xdb) set b = null
+cannot set b: not editable: only numbers, booleans, strings, enums and null can be set (objects, arrays and maps keep their identity)
+(xdb) set b.size = 9999999999999999999999
+cannot set b.size: out of range for int
+(xdb) locals
+b = { label: 'big crate', size: 9, note: null }
+prefix = 'box:'
+level = 2
+mode = 'fast'
+scale = 10
+factor = 2.25
+enabled = false
+count = 7
+(xdb) up
+#1  (top level) at edit.ts:16
+=>  16 | console.log(describe(box, "box:", Level.Low, Mode.Fast));
+(xdb) set items[1] = 20
+items[1] = 20
+(xdb) set items = null
+cannot set items: read-only: a const, a captured variable or this
+(xdb) c
+box: big crate 90 2.25 false 7 2 fast -
+[ 1, 20, 3 ]
+xisto: 4 allocations, 0 still alive at exit
+Program exited with code 0

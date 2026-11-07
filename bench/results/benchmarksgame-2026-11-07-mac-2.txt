@@ -1,0 +1,7 @@
+# Darwin arm64, 10 cpu; node v26.12.0, bun 1.4.4; median of 3
+program                     xisto              node               bun   xisto vs best other  output
+binarytrees       3.825s  257.5MB   5.168s 1055.8MB   3.558s 1279.2MB   1.07x SLOWER         same
+fasta             4.969s    1.7MB  10.652s 1536.4MB   5.646s   85.0MB   1.14x faster         DIFFERS xisto:1 node:2 bun:1
+knucleotide      22.845s  721.6MB  46.090s  705.7MB  27.180s 1889.8MB   1.19x faster         same
+revcomp           0.670s  308.7MB   1.993s  694.6MB   1.708s  281.5MB   2.55x faster         same
+regexredux        0.835s  268.4MB   1.172s  962.3MB   0.343s  364.2MB   2.44x SLOWER         same

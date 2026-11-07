@@ -1,0 +1,22 @@
+(xdb) b 25
+Breakpoint 1 at steps.ts:25
+(xdb) r
+start
+Breakpoint 1, (top level) at steps.ts:25
+=>  25 | c.add(r);
+(xdb) s
+Counter.add at steps.ts:4
+=>   4 |     this.total = this.total + n;
+(xdb) bt
+> #0  Counter.add at steps.ts:4
+  #1  (top level) at steps.ts:25
+(xdb) s
+Counter.add at steps.ts:5
+=>   5 |     return this.total;
+(xdb) fin
+(top level) at steps.ts:26
+=>  26 | console.log("result", c.total);
+(xdb) (end of commands: continue)
+result 14
+xisto: 1 allocations, 0 still alive at exit
+Program exited with code 0

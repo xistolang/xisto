@@ -1,0 +1,8 @@
+{
+  "name": "@nestjs/swagger",
+  "version": "0.1.0",
+  "license": "MIT",
+  "implements": { "@nestjs/swagger": "^7" },
+  "main": "index.ts",
+  "dependencies": { "@nestjs/common": "0.1.0", "@nestjs/core": "0.1.0" }
+}

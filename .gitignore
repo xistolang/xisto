@@ -1,0 +1,16 @@
+build/
+*.o
+.DS_Store
+bench/out/
+.xisto/
+
+# .NET build output of tools/t0comp
+tools/t0comp/obj/
+tools/t0comp/bin/
+third_party/aws-lc/
+bench/benchmarksgame/out/
+node_modules/
+*.bun-build
+examples/conduit/dist/
+examples/conduit/conduit
+third_party/qbe/qbe

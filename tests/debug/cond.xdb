@@ -1,0 +1,13 @@
+b 11 if it.name == 'pad'
+log 11 adding {it.name}: {it.qty} (sum {sum})
+info b
+catch all
+r
+p sum
+locals
+c
+p it
+p it.qty
+bt
+c
+c

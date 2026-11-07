@@ -1,0 +1,10 @@
+Api.one returns {"$ref":"#/$defs/Wrapped_Article_","$defs":{
+"Wrapped_Article_":{"type":"object","properties":{"item":{"$ref":"#/$defs/Article"},"total":{"type":"integer"}},"required":["item","total"]},
+"Article":{"type":"object","properties":{"slug":{"type":"string"},"tagList":{"type":"array","items":{"type":"string"}},"favoritesCount":{"type":"integer"},"author":{"$ref":"#/$defs/Profile"},"parent":{"$ref":"#/$defs/Article"},"score":{"type":"number"},"role":{"type":"string","enum":["admin","user"]}},"required":["slug","tagList","favoritesCount","author","score","role"]},
+"Profile":{"type":"object","properties":{"username":{"type":"string"},"bio":{"type":"string","nullable":true},"following":{"type":"boolean"}},"required":["username","bio","following"]}}}
+  slug: {"type":"string"}
+  limit: {"type":"integer"}
+  tags: {"type":"array","items":{"type":"string"},"nullable":true}
+Api.two returns {"type":"object","additionalProperties":{"type":"number"}}
+  on: {"type":"boolean"}
+done

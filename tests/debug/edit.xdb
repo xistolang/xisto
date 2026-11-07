@@ -1,0 +1,24 @@
+b 9
+r
+set factor = 2.25
+set enabled = false
+set count = null
+set count = 7
+set prefix = 'BOX:'
+set b.label = "big crate"
+set b.size = 9
+set b.note = null
+set level = 2
+set level = 5
+set mode = 'safe'
+set mode = 'turbo'
+set scale = 99
+set factor = abc
+set enabled = 1
+set b = null
+set b.size = 9999999999999999999999
+locals
+up
+set items[1] = 20
+set items = null
+c

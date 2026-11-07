@@ -1,0 +1,20 @@
+# Darwin arm64, 10 cpu; node v26.12.0, bun 1.4.4; median of 3
+program                             xisto                       node                        bun   xisto vs best other
+fib              0.022s    0.02cpu    1.2MB   0.120s    0.13cpu   66.7MB   0.040s    0.04cpu   14.0MB   1.83x faster
+mandelbrot       0.538s    0.54cpu    1.3MB   0.616s    0.62cpu   69.4MB   0.734s    0.73cpu   16.3MB   1.15x faster
+nbody            0.354s    0.35cpu    1.2MB   0.502s    0.51cpu   70.1MB   0.458s    0.46cpu   19.1MB   1.29x faster
+objects          0.013s    0.01cpu    1.3MB   0.091s    0.10cpu   73.1MB   0.026s    0.04cpu   28.2MB   1.96x faster
+sieve            0.095s    0.09cpu   29.9MB   0.358s    0.36cpu  296.5MB   0.246s    0.25cpu  245.7MB   2.59x faster
+binarytrees      0.243s    0.24cpu   66.2MB   0.440s    0.59cpu  201.1MB   0.389s    0.51cpu  184.8MB   1.60x faster
+cycles           0.007s    0.01cpu    1.3MB   0.079s    0.09cpu   72.2MB   0.015s    0.03cpu   30.9MB   2.27x faster
+accessors        0.007s    0.01cpu    1.2MB   0.078s    0.09cpu   72.5MB   0.018s    0.02cpu   18.6MB   2.66x faster
+closures         0.011s    0.01cpu    1.3MB   0.112s    0.12cpu   69.2MB   0.042s    0.05cpu   18.0MB   3.95x faster
+generators       0.004s    0.00cpu    1.2MB   0.129s    0.14cpu   70.2MB   0.037s    0.05cpu   34.8MB   9.53x faster
+generics         0.051s    0.05cpu  203.2MB   0.317s    0.37cpu  412.3MB   0.119s    0.17cpu  341.0MB   2.36x faster
+shapes           0.026s    0.03cpu    1.2MB   0.130s    0.14cpu   72.4MB   0.073s    0.08cpu   20.8MB   2.77x faster
+unions           0.026s    0.03cpu    1.3MB   0.130s    0.14cpu   69.2MB   0.075s    0.08cpu   19.0MB   2.90x faster
+bytes            0.087s    0.08cpu  180.3MB   0.230s    0.27cpu  283.4MB   0.126s    0.13cpu  237.9MB   1.44x faster
+date             0.146s    0.14cpu   74.4MB   1.043s    1.09cpu  193.7MB   0.456s    0.48cpu  235.4MB   3.13x faster
+promise          0.020s    0.01cpu   14.9MB   0.096s    0.10cpu   84.1MB   0.027s    0.04cpu   34.0MB   1.36x faster
+redos            0.012s    0.01cpu    1.9MB   7.456s    7.45cpu   68.6MB   3.641s    3.63cpu   14.6MB   291.50x faster
+regex            0.157s    0.15cpu  235.9MB   0.377s    0.56cpu  421.3MB   0.202s    0.29cpu  329.4MB   1.29x faster

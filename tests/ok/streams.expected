@@ -1,0 +1,8 @@
+143 71071
+1001 [ 'ERROR line 0', 'INFO line 1', 'INFO line 2' ] [ 'last line without newline' ]
+[ 12, 11, 11, 11, 11 ] 13058
+[ 4, 4, 2 ] 15 14058
+each ERROR line 0
+each ERROR line 7
+143 [ 'error line 0' ]
+last line without newline

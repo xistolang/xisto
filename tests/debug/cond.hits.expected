@@ -1,0 +1,34 @@
+(xdb) catch off
+Stop on no exceptions.
+(xdb) b 11 hits %2
+Breakpoint 1 at cond.ts:11 hits %2
+(xdb) r
+caught no ink left
+Breakpoint 1, total at cond.ts:11
+=>  11 |     sum = sum + it.qty;
+(xdb) p it.name
+it.name = 'ink'
+(xdb) d 1
+Deleted breakpoint 1
+(xdb) b 11 if ghost == 1
+Breakpoint 2 at cond.ts:11 if ghost == 1
+(xdb) c
+warning: breakpoint condition 'ghost == 1': not a variable in scope here
+Breakpoint 2, total at cond.ts:11
+=>  11 |     sum = sum + it.qty;
+(xdb) p it.name
+it.name = 'pad'
+(xdb) d 2
+Deleted breakpoint 2
+(xdb) b 11 if it.qty > 3
+Breakpoint 3 at cond.ts:11 if it.qty > 3
+(xdb) c
+Breakpoint 3, total at cond.ts:11
+=>  11 |     sum = sum + it.qty;
+(xdb) p it
+it = { name: 'cap', qty: 4 }
+(xdb) c
+total 13
+runtime error: array index out of bounds
+    at cond.ts:30:19
+Program exited with code 70

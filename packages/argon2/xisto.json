@@ -1,0 +1,9 @@
+{
+  "name": "argon2",
+  "version": "0.1.0",
+  "license": "MIT",
+  "implements": { "argon2": "^0.41" },
+  "main": "index.ts",
+  "native": ["native/argon2.c"],
+  "needs": ["crypto", "net"]
+}

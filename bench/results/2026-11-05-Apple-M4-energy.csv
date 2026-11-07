@@ -1,0 +1,10 @@
+workload,target,joules_above_idle,seconds,avg_watts,unit,joules_per_unit
+sieve,xisto,2.541,0.69,3.85,run,0.5082
+sieve,node,7.094,1.74,4.27,run,1.4188
+sieve,bun,5.880,1.27,4.81,run,1.1760
+stream-1GB,xisto,2.403,0.70,3.63,run,2.4030
+stream-1GB,node,6.894,1.18,6.00,run,6.8940
+stream-1GB,bun,2.384,0.64,3.92,run,2.3840
+http-list,xisto,144.440,10.24,14.28,100k req,8.2126
+http-list,node,133.065,10.16,13.28,100k req,11.8349
+http-list,bun,131.344,10.22,13.03,100k req,7.9615

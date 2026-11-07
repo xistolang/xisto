@@ -1,0 +1,2 @@
+[ { name: 'dark', on: true }, { name: 'beta', on: false } ]
+true true false

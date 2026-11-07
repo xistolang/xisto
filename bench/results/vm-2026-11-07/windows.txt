@@ -1,0 +1,20 @@
+# Windows AMD64, 2 cpu; node v26.12.0, bun 1.4.4; median of 3 (peak working set sampled)
+program                    xisto              node               bun
+fib              0.076s    1.7MB   0.299s    1.7MB   0.172s    1.7MB
+mandelbrot       1.576s    1.7MB   1.734s    1.7MB   1.702s    1.7MB
+nbody            1.549s    1.7MB   1.824s    1.7MB   1.783s    1.7MB
+objects          0.085s    1.7MB   0.221s    1.7MB   0.131s    1.7MB
+sieve            0.493s    1.6MB   1.297s    1.6MB   1.212s    1.6MB
+binarytrees      1.152s    1.5MB   2.831s    1.5MB   2.052s    1.6MB
+cycles           0.037s    1.5MB   0.194s    1.5MB   0.084s    1.6MB
+accessors        0.029s    1.5MB   0.193s    1.5MB   0.086s    1.6MB
+closures         0.075s    1.5MB   0.303s    1.5MB   0.095s    1.6MB
+generators       0.030s    1.5MB   0.356s    1.5MB   0.193s    1.6MB
+generics         0.304s    1.5MB   1.653s    1.5MB   0.917s    1.5MB
+shapes           0.115s    1.4MB   0.329s    1.4MB   0.353s    1.4MB
+unions           0.101s    1.5MB   0.331s    1.5MB   0.344s    1.5MB
+bytes            0.305s    1.5MB   0.709s    1.5MB   0.627s    1.5MB
+date             0.804s    1.5MB   3.324s    1.6MB   1.361s    1.6MB
+promise          0.061s    1.6MB   0.245s    1.6MB   0.105s    1.6MB
+redos            0.029s    1.6MB  15.113s    1.6MB   7.394s    1.6MB
+regex            0.685s    1.6MB   2.498s    1.6MB   1.326s    1.6MB

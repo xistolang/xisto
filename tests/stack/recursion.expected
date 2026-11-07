@@ -1,0 +1,7 @@
+runtime error: integer overflow
+    at down (tests/stack/recursion.ts:3:38)
+    at down (tests/stack/recursion.ts:5:10)
+    at down (tests/stack/recursion.ts:5:10)
+    at down (tests/stack/recursion.ts:5:10)
+    at tests/stack/recursion.ts:7:13
+exit 70

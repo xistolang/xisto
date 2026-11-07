@@ -1,0 +1,5 @@
+b 12
+r
+p a
+p a.next.next.name
+c

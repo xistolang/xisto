@@ -1,0 +1,9 @@
+{
+  "name": "@nestjs/common",
+  "version": "0.1.0",
+  "license": "MIT",
+  "implements": { "@nestjs/common": "^10" },
+  "main": "index.ts",
+  "native": ["native/body.c"],
+  "dependencies": { "express": "0.1.0" }
+}

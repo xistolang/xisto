@@ -1,0 +1,6 @@
+uncaught Error: negative: -5
+    at check (tests/stack/lib.ts:3:11)
+    at new Pedido (tests/stack/uncaught.ts:6:18)
+    at criar (tests/stack/uncaught.ts:10:10)
+    at tests/stack/uncaught.ts:12:13
+exit 1

@@ -1,0 +1,5108 @@
+/* Xisto runtime. Embedded verbatim at the top of every generated C file. */
+#if !defined(__APPLE__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE /* memmem, arc4random on glibc */
+#endif
+/* Per-thread state is only needed by servers (XISTO_WORKERS); elsewhere a plain global is much cheaper:
+   on macOS every XS_TLS access is a call through the TLV thunk. */
+#ifdef XS_THREADS
+#define XS_TLS _Thread_local
+#else
+#define XS_TLS
+#endif
+#include <ctype.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#if defined(_WIN32)
+/* ---- Windows (xisto build --target=windows-x64): what the C library there lacks ----
+   memmem; open_memstream (the console.log layout writes containers into memory streams and reads them back
+   after each flush): a temporary file whose bytes are copied out on fflush and fclose. */
+static void *xs_memmem(const void *h, size_t hn, const void *n, size_t nn) {
+    if (nn == 0) return (void *)h;
+    for (const char *p = h, *e = (const char *)h + hn; (size_t)(e - p) >= nn; p++)
+        if (*p == *(const char *)n && memcmp(p, n, nn) == 0) return (void *)p;
+    return NULL;
+}
+#define memmem xs_memmem
+typedef struct { FILE *f; char **buf; size_t *size; } xs_wms;
+static xs_wms xs_wmss[256];
+static int xs_nwms;
+static FILE *xs_open_memstream(char **buf, size_t *size) {
+    FILE *f = tmpfile();
+    if (!f || xs_nwms == 256) { fputs("xisto: cannot open a memory stream\n", stderr); exit(1); }
+    xs_wmss[xs_nwms++] = (xs_wms){f, buf, size};
+    *buf = NULL;
+    *size = 0;
+    return f;
+}
+static void xs_wms_sync(xs_wms *m) {
+    fflush(m->f);
+    long end = ftell(m->f);
+    if (end < 0) end = 0;
+    *m->buf = realloc(*m->buf, (size_t)end + 1);
+    fseek(m->f, 0, SEEK_SET);
+    size_t got = fread(*m->buf, 1, (size_t)end, m->f);
+    (*m->buf)[got] = 0;
+    *m->size = got;
+    fseek(m->f, 0, SEEK_END);
+}
+static int xs_wfflush(FILE *f) {
+    for (int i = xs_nwms - 1; i >= 0; i--) if (xs_wmss[i].f == f) { xs_wms_sync(&xs_wmss[i]); return 0; }
+    return fflush(f);
+}
+static int xs_wfclose(FILE *f) {
+    for (int i = xs_nwms - 1; i >= 0; i--)
+        if (xs_wmss[i].f == f) { xs_wms_sync(&xs_wmss[i]); xs_wmss[i] = xs_wmss[--xs_nwms]; break; }
+    return fclose(f);
+}
+#define open_memstream xs_open_memstream
+#define fflush xs_wfflush
+#define fclose xs_wfclose
+#define ftello ftell
+#endif
+
+/* ---- console.log output: Node's util.inspect layout ----
+   Printers write to XS_OUT: stdout, or the buffer of the container being laid out. A container (object, array,
+   Map, typed array) opens a buffer, prints its entries into it, then decides as util.inspect does (depth 2,
+   breakLength 80, compact 3): one line if it fits, else one entry per line indented; arrays of more than six
+   entries in aligned columns; deeper than two levels "[Name]"; a cycle "[Circular *n]", with "<ref *n>" on the
+   object it points back to (written after the children, which is why entries go to a buffer first). */
+/* code that runs once (literal setup, a main that only wires things up): optimizing it buys nothing and was a
+   third of a release build of the Conduit API (312 ms of -O2 on the decorator registrations alone) */
+#if defined(__clang__)
+#define XS_RUN_ONCE __attribute__((optnone, noinline, cold))
+#else
+#define XS_RUN_ONCE __attribute__((cold, optimize("O0")))
+#endif
+static XS_TLS FILE *xs_out_f;
+#define XS_OUT (xs_out_f ? xs_out_f : stdout)
+typedef struct xs_insp { FILE *f, *parent; char *buf; size_t size; size_t *off; int n, cap; int saved_level; void *obj; int recurse; } xs_insp;
+static XS_TLS int xs_insp_level;   /* ctx.indentationLvl */
+static XS_TLS int xs_insp_rt;      /* recurseTimes of the container being printed */
+static XS_TLS int xs_insp_cur;     /* ctx.currentDepth */
+static XS_TLS void **xs_insp_seen;
+static XS_TLS int xs_insp_nseen, xs_insp_seencap;
+static XS_TLS void **xs_circ_obj;
+static XS_TLS int xs_ncirc, xs_circcap;
+static int xs_circ_id(void *o, bool add) {
+    for (int i = 0; i < xs_ncirc; i++) if (xs_circ_obj[i] == o) return i + 1;
+    if (!add) return 0;
+    if (xs_ncirc == xs_circcap) { xs_circcap = xs_circcap ? xs_circcap * 2 : 8; xs_circ_obj = realloc(xs_circ_obj, sizeof(void *) * (size_t)xs_circcap); }
+    xs_circ_obj[xs_ncirc++] = o;
+    return xs_ncirc;
+}
+/* false: the container is not expanded (a cycle or too deep) and its marker is already written */
+/* empty: what an empty container prints ("[]", "Name {}"), at any depth, as Node; NULL if it has entries */
+static __attribute__((noinline)) bool xs_insp_begin(xs_insp *fr, void *obj, const char *name, const char *empty) {
+    for (int i = 0; obj && i < xs_insp_nseen; i++)
+        if (xs_insp_seen[i] == obj) { fprintf(XS_OUT, "[Circular *%d]", xs_circ_id(obj, true)); return false; }
+    if (empty) { fputs(empty, XS_OUT); return false; }
+    if (xs_insp_rt > 2) { fprintf(XS_OUT, "[%s]", name); return false; }
+    if (xs_insp_nseen == 0) xs_ncirc = 0; /* a new top-level value */
+    if (xs_insp_nseen == xs_insp_seencap) { xs_insp_seencap = xs_insp_seencap ? xs_insp_seencap * 2 : 16; xs_insp_seen = realloc(xs_insp_seen, sizeof(void *) * (size_t)xs_insp_seencap); }
+    xs_insp_seen[xs_insp_nseen++] = obj;
+    fr->obj = obj;
+    fr->recurse = ++xs_insp_rt;
+    xs_insp_cur = xs_insp_rt;
+    fr->parent = xs_out_f;
+    fr->buf = NULL;
+    fr->size = 0;
+    fr->f = open_memstream(&fr->buf, &fr->size);
+    xs_out_f = fr->f;
+    fr->off = NULL;
+    fr->n = fr->cap = 0;
+    fr->saved_level = xs_insp_level;
+    xs_insp_level += 2;
+    return true;
+}
+/* the next entry starts here */
+static __attribute__((noinline)) void xs_insp_entry(xs_insp *fr) {
+    fflush(fr->f);
+    if (fr->n == fr->cap) { fr->cap = fr->cap ? fr->cap * 2 : 8; fr->off = realloc(fr->off, sizeof(size_t) * (size_t)(fr->cap + 1)); }
+    fr->off[fr->n++] = (size_t)ftello(fr->f);
+}
+static size_t xs_cp_len(const char *p, size_t n) { size_t k = 0; for (size_t i = 0; i < n; i++) if ((p[i] & 0xC0) != 0x80) k++; return k; }
+static void xs_pad(FILE *o, size_t n) { for (size_t i = 0; i < n; i++) fputc(' ', o); }
+/* open: "Name {", "{", "[", "Map(2) {", "Uint8Array(3) ["; close: "}" or "]"; array: entries are elements
+   (grouped when more than six); numeric: all of them numbers (right-aligned in columns); more: the last entry is
+   "... n more items" */
+static __attribute__((noinline)) void xs_insp_end(xs_insp *fr, const char *open, const char *close, bool array, bool numeric, bool more) {
+    fflush(fr->f);
+    size_t total = (size_t)ftello(fr->f);
+    xs_out_f = fr->parent;
+    xs_insp_level = fr->saved_level;
+    xs_insp_nseen--;
+    xs_insp_rt--;
+    FILE *o = XS_OUT;
+    int n = fr->n;
+    const char **ent = malloc(sizeof(char *) * (size_t)(n ? n : 1));
+    size_t *len = malloc(sizeof(size_t) * (size_t)(n ? n : 1));
+    for (int i = 0; i < n; i++) {
+        size_t a = fr->off[i], b = i + 1 < n ? fr->off[i + 1] : total;
+        ent[i] = fr->buf + a;
+        len[i] = b - a;
+    }
+    char base[32] = "";
+    int id = xs_circ_id(fr->obj, false);
+    if (id) snprintf(base, sizeof base, "<ref *%d>", id);
+    size_t baselen = strlen(base);
+    if (n == 0) {
+        if (baselen) { fputs(base, o); fputc(' ', o); }
+        fputs(open, o);
+        fputs(close, o);
+    } else {
+        /* the entries of the output (rows, when grouped) */
+        int on = n;
+        char **out = NULL;
+        size_t *olen = NULL;
+        bool grouped = false;
+        if (array && n > 6) {
+            int outputLength = more ? n - 1 : n;
+            size_t totalLength = 0, maxLength = 0, sep = 2;
+            size_t *dataLen = malloc(sizeof(size_t) * (size_t)n);
+            for (int i = 0; i < outputLength; i++) {
+                dataLen[i] = xs_cp_len(ent[i], len[i]);
+                totalLength += dataLen[i] + sep;
+                if (maxLength < dataLen[i]) maxLength = dataLen[i];
+            }
+            size_t actualMax = maxLength + sep;
+            if (actualMax * 3 + (size_t)xs_insp_level < 80 && ((double)totalLength / (double)actualMax > 5 || maxLength <= 6)) {
+                double averageBias = sqrt((double)actualMax - (double)totalLength / (double)n);
+                double biasedMax = fmax((double)actualMax - 3 - averageBias, 1);
+                double c1 = round(sqrt(2.5 * biasedMax * (double)outputLength) / biasedMax);
+                double c2 = floor((80.0 - (double)xs_insp_level) / (double)actualMax);
+                int columns = (int)fmin(fmin(c1, c2), fmin(3 * 4, 15));
+                if (columns > 1) {
+                    size_t *maxLineLength = malloc(sizeof(size_t) * (size_t)columns);
+                    for (int i = 0; i < columns; i++) {
+                        size_t lineLength = 0;
+                        for (int j = i; j < n; j += columns) if (j < outputLength && dataLen[j] > lineLength) lineLength = dataLen[j];
+                        maxLineLength[i] = lineLength + sep;
+                    }
+                    int rows = (outputLength + columns - 1) / columns + (more ? 1 : 0);
+                    out = malloc(sizeof(char *) * (size_t)rows);
+                    olen = malloc(sizeof(size_t) * (size_t)rows);
+                    int r = 0;
+                    for (int i = 0; i < outputLength; i += columns) {
+                        int max = i + columns < outputLength ? i + columns : outputLength;
+                        char *line = NULL;
+                        size_t llen = 0;
+                        FILE *lf = open_memstream(&line, &llen);
+                        int j = i;
+                        for (; j < max - 1; j++) {
+                            size_t w = dataLen[j] + 2, pad = maxLineLength[j - i] > w ? maxLineLength[j - i] - w : 0;
+                            if (numeric) { xs_pad(lf, pad); fwrite(ent[j], 1, len[j], lf); fputs(", ", lf); }
+                            else { fwrite(ent[j], 1, len[j], lf); fputs(", ", lf); xs_pad(lf, pad); }
+                        }
+                        if (numeric) {
+                            size_t w = dataLen[j], target = maxLineLength[j - i] - sep;
+                            xs_pad(lf, target > w ? target - w : 0);
+                        }
+                        fwrite(ent[j], 1, len[j], lf);
+                        fclose(lf);
+                        out[r] = line;
+                        olen[r++] = llen;
+                    }
+                    if (more) {
+                        out[r] = malloc(len[n - 1] + 1);
+                        memcpy(out[r], ent[n - 1], len[n - 1]);
+                        olen[r++] = len[n - 1];
+                    }
+                    on = r;
+                    grouped = true;
+                    free(maxLineLength);
+                }
+            }
+            free(dataLen);
+        }
+        const char **e = grouped ? (const char **)out : ent;
+        size_t *el = grouped ? olen : len;
+        bool single = false;
+        if (xs_insp_cur - fr->recurse < 3 && on == n) {
+            size_t start = (size_t)on + (size_t)xs_insp_level + strlen(open) + baselen + 10;
+            size_t totalLength = (size_t)on + start;
+            bool below = totalLength + (size_t)on <= 80;
+            for (int i = 0; i < on && below; i++) {
+                totalLength += xs_cp_len(e[i], el[i]);
+                if (totalLength > 80) below = false;
+            }
+            bool nl = false;
+            for (int i = 0; i < on && !nl; i++) if (memchr(e[i], '\n', el[i])) nl = true;
+            single = below && !nl;
+        }
+        if (baselen) { fputs(base, o); fputc(' ', o); }
+        fputs(open, o);
+        if (single) {
+            for (int i = 0; i < on; i++) { fputs(i ? ", " : " ", o); fwrite(e[i], 1, el[i], o); }
+            fputc(' ', o);
+        } else {
+            for (int i = 0; i < on; i++) {
+                fputs(i ? ",\n" : "\n", o);
+                xs_pad(o, (size_t)xs_insp_level + 2);
+                fwrite(e[i], 1, el[i], o);
+            }
+            fputc('\n', o);
+            xs_pad(o, (size_t)xs_insp_level);
+        }
+        fputs(close, o);
+        if (grouped) { for (int i = 0; i < on; i++) free(out[i]); free(out); free(olen); }
+    }
+    free(ent);
+    free(len);
+    fclose(fr->f);
+    free(fr->buf);
+    free(fr->off);
+}
+
+#include <setjmp.h>
+#if defined(_WIN32) && defined(__aarch64__) /* arm64: mingw's own pair, which unwinds no SEH frames */
+#define _setjmp(b) __mingw_setjmp((b))
+#define _longjmp(b, v) __mingw_longjmp((b), (v))
+#elif defined(_WIN32) /* the C library's own: every register saved; a NULL frame means longjmp unwinds no SEH frames */
+#define _setjmp(b) _setjmp((b), NULL)
+#define _longjmp(b, v) longjmp((b), (v))
+#endif
+#define XS_AI __attribute__((always_inline)) static inline
+/* T | null of a primitive: a sentinel value. int: INT64_MIN; boolean: 2 in an int8_t; number: a NaN with a
+   payload no arithmetic produces (computed NaNs are the quiet 0x7FF8...). */
+#define XS_NULL_INT INT64_MIN
+#define XS_NULL_BOOL ((int8_t)2)
+#define XS_NULL_NUM_BITS 0x7FF4000000000001ull
+static inline double xs_null_num(void) { union { uint64_t u; double d; } x = { XS_NULL_NUM_BITS }; return x.d; }
+static inline bool xs_isnull_num(double d) { union { double d; uint64_t u; } x = { d }; return x.u == XS_NULL_NUM_BITS; }
+/* user functions: one source frame = one machine frame, for stack traces (see "stack traces") */
+/* runtime functions that can fail or call back into user code (tools/noinline-scan.py keeps the list) */
+#define XS_FI static /* user functions that cannot fail: never a frame, free to inline */
+#ifdef XS_NO_TRACE /* XISTO_NO_TRACE=1: the same program without stack-trace support, to measure its cost */
+#define XS_FA static
+#define XS_FN static
+#define XS_NOINLINE static
+#else
+#define XS_FN __attribute__((noinline)) static
+#define XS_NOINLINE __attribute__((noinline)) static
+/* called from one place: inlined there; its sites carry that call (xs_site.inl) */
+#define XS_FA __attribute__((always_inline)) static inline
+#endif
+
+/* A recovery point lets a long-running host (the HTTP server) turn a runtime error inside a
+   request handler into an error response instead of exiting. Locals of the abandoned frames leak. */
+static XS_TLS jmp_buf *xs_recover;
+static XS_TLS const char *xs_recover_msg;
+
+/* try/catch: a stack of jump buffers; the thrown Error waits in xs_thrown until the catch block takes it */
+static XS_TLS jmp_buf **xs_try_stack; /* 256 slots; each coroutine has its own */
+static XS_TLS int xs_try_depth;
+static XS_TLS void *xs_thrown;
+static void *xs_Error_new(void *msg);
+static void xs_throw(void *err);
+#ifdef XS_DEBUG
+static void xs_dbg_exception(const char *name, const char *message, bool caught); /* runtime/xisto_dbg.h */
+#endif
+
+/* the handler stack grows on demand (its capacity in the slot before the first: a coroutine that never
+   nests deeply keeps a few bytes, not 2 KB) */
+static __attribute__((noinline)) void xs_try_grow(void) {
+    int cap = xs_try_stack ? (int)(intptr_t)xs_try_stack[-1] : 0;
+    if (cap >= 512) { fflush(stdout); fprintf(stderr, "runtime error: try blocks nested too deep\n"); exit(70); }
+    int nc = cap ? cap * 4 : 8;
+    if (nc > 512) nc = 512;
+    jmp_buf **raw = realloc(xs_try_stack ? xs_try_stack - 1 : NULL, sizeof(jmp_buf *) * (size_t)(nc + 1));
+    if (!raw) { fprintf(stderr, "runtime error: out of memory\n"); exit(70); }
+    raw[0] = (jmp_buf *)(intptr_t)nc;
+    xs_try_stack = raw + 1;
+}
+/* ---- the cleanup stack: what an exception must release on its way out ----
+   An exception is a longjmp: it skips the releases at the end of every scope between the throw and the catch,
+   in the throwing function and in every function between (a for-of's iterable, a local array, a string).
+   In programs that can catch (a try, or a server, which turns a handler's error into a response), each
+   reference-counted local registers the address of its slot here when it is declared and leaves when its scope
+   ends. A throw releases, while those frames are still alive, everything registered after the catch's mark. */
+static XS_TLS void ***xs_cln;
+static XS_TLS size_t xs_cln_n, xs_cln_cap;
+static __attribute__((noinline)) void xs_cln_grow(void) {
+    xs_cln_cap = xs_cln_cap ? xs_cln_cap * 2 : 256;
+    xs_cln = realloc(xs_cln, sizeof(void **) * xs_cln_cap);
+    if (!xs_cln) { fprintf(stderr, "runtime error: out of memory\n"); exit(70); }
+}
+static inline __attribute__((always_inline)) void xs_cln_push(void **slot) {
+    if (__builtin_expect(xs_cln_n == xs_cln_cap, 0)) xs_cln_grow();
+    xs_cln[xs_cln_n++] = slot;
+}
+static void xs_release_(void *p);
+static __attribute__((noinline)) void xs_cln_unwind(size_t mark) {
+    while (xs_cln_n > mark) {
+        void **slot = xs_cln[--xs_cln_n];
+        void *v = *slot;
+        *slot = NULL;
+        xs_release_(v);
+    }
+}
+static XS_TLS size_t xs_recover_cln; /* the mark of the server's recovery point (the handler's start) */
+/* each handler takes two slots: its jump buffer and the cleanup mark at the try */
+static inline void xs_try_push(jmp_buf *b) {
+    if (!xs_try_stack || 2 * xs_try_depth + 2 > (int)(intptr_t)xs_try_stack[-1]) xs_try_grow();
+    xs_try_stack[2 * xs_try_depth] = b;
+    xs_try_stack[2 * xs_try_depth + 1] = (jmp_buf *)(uintptr_t)xs_cln_n;
+    xs_try_depth++;
+}
+static inline void xs_try_pop(void) { xs_try_depth--; }
+static void *xs_caught(void) { void *e = xs_thrown; xs_thrown = NULL; return e; } /* owned by the catch block */
+
+/* ---- stack traces, free until an error happens ----
+   The compiler describes every call site with an xs_site (function, file, line, column) and puts a label
+   right after each call instruction, recorded in the xs_sites section as {address, site}. Nothing runs on
+   the happy path. When an error is created, the runtime walks the frame-pointer chain (the arm64 ABI keeps
+   it; elsewhere the compiler is given -fno-omit-frame-pointer) and maps each return address to the label
+   that follows it. User functions are never inlined into each other, so each source frame is a machine
+   frame; runtime functions that can fail are not inlined either, so a failure inside them returns to a
+   labelled call. Failures inline in user code (integer overflow, array index) carry their site directly. */
+/* inl: for a function the C compiler inlined into its only caller, that call (printed right after) */
+typedef struct xs_site { const char *fn, *file; const struct xs_site *inl; int32_t line, col; } xs_site;
+_Static_assert(sizeof(xs_site) == 32, "the compiler emits site addresses as table + 32 * index");
+typedef struct { uintptr_t addr; const xs_site *site; } xs_srec;
+#if defined(__APPLE__)
+/* in __DATA_CONST, which every program already has (the GOT), so the table does not add a 16 KB page */
+#define XS_SITES_SEG "__DATA_CONST"
+extern const xs_srec xs_srec_begin[] __asm("section$start$" XS_SITES_SEG "$__xs_sites");
+extern const xs_srec xs_srec_end[] __asm("section$end$" XS_SITES_SEG "$__xs_sites");
+#elif defined(_WIN32)
+/* PE/COFF has no __start_/__stop_ symbols: the linker merges xs_sites$a, xs_sites$m and xs_sites$z in that
+   order, so the entries ($m) sit between two markers (zero padding the linker may add has addr 0, never a
+   match). Without this the table read as empty and a trace on Windows had only its first frame. */
+__attribute__((section("xs_sites$a"), used)) static xs_srec xs_srec_a_[1] = {{0, 0}};
+__attribute__((section("xs_sites$z"), used)) static xs_srec xs_srec_z_[1] = {{0, 0}};
+#define xs_srec_begin ((const xs_srec *)(xs_srec_a_ + 1))
+#define xs_srec_end ((const xs_srec *)xs_srec_z_)
+#else
+extern const xs_srec __start_xs_sites[] __attribute__((weak));
+extern const xs_srec __stop_xs_sites[] __attribute__((weak));
+#define xs_srec_begin __start_xs_sites
+#define xs_srec_end __stop_xs_sites
+#endif
+/* XS_POST(n) right after a call in generated C; n indexes xs_sitetab. %= keeps the label unique when the
+   C compiler duplicates code. The asm is volatile with a memory clobber: it stays after the call and
+   prevents a tail call, so the return address is in the caller, just before the label. */
+#if defined(__APPLE__)
+#define XS_SEC_PUSH ".pushsection " XS_SITES_SEG ",__xs_sites,regular,no_dead_strip\n\t"
+#define XS_L "L"
+#define XS_TAB "_xs_sitetab"
+#elif defined(_WIN32)
+#define XS_SEC_PUSH ".pushsection xs_sites$m,\"dw\"\n\t"
+#define XS_L ".L"
+#define XS_TAB "xs_sitetab"
+#else
+#define XS_SEC_PUSH ".pushsection xs_sites,\"aw\"\n\t"
+#define XS_L ".L"
+#define XS_TAB "xs_sitetab"
+#endif
+#ifdef XS_NO_TRACE
+#define XS_POST(n) ((void)0)
+#else
+#define XS_POST(n) __asm__ volatile(XS_L "xq%=:\n\t" XS_SEC_PUSH ".p2align 3\n\t.quad " XS_L "xq%=\n\t.quad " XS_TAB "+" #n "*32\n\t.popsection" ::: "memory")
+#endif
+#define XS_S(n) (&xs_sitetab[n])
+#define XS_TIGHT 16 /* at most a couple of register moves between a return address and its label */
+#define XS_MAX_FRAMES 40
+typedef struct { const xs_site *top; int n; uintptr_t ra[XS_MAX_FRAMES]; } xs_trace;
+static volatile int xs_never; /* read on error paths so the compiler cannot treat them as noreturn */
+
+#if defined(_WIN32)
+/* Windows: LLVM's x64 frame pointer points into the frame (for SEH unwinding), not at the saved one, so the
+   chain below cannot be walked there; the system walks the stack from the unwind tables (.pdata) instead */
+__declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long skip, unsigned long n, void **frames, unsigned long *hash);
+#endif
+__attribute__((noinline)) static void xs_trace_capture(xs_trace *t, const xs_site *top) {
+    t->top = top;
+    t->n = 0;
+#if defined(_WIN32)
+    t->n = RtlCaptureStackBackTrace(1, XS_MAX_FRAMES, (void **)t->ra, NULL); /* (1: from the caller's return address on) */
+    return;
+#endif
+    uintptr_t *fp = (uintptr_t *)__builtin_frame_address(0);
+    while (fp && t->n < XS_MAX_FRAMES) {
+        uintptr_t *next = (uintptr_t *)fp[0], ra = fp[1];
+        if (!ra) break;
+        t->ra[t->n++] = ra;
+        /* the chain ends at a zero frame pointer (thread and coroutine entry); anything else odd stops the walk */
+        if (next <= fp || (uintptr_t)next - (uintptr_t)fp > ((uintptr_t)8 << 20) || ((uintptr_t)next & 7)) break;
+        fp = next;
+    }
+}
+
+static xs_srec *xs_labels;   /* published once with release order; xs_labels[-1].addr holds the count */
+static int xs_srec_cmp(const void *a, const void *b) {
+    const xs_srec *x = a, *y = b;
+    return x->addr < y->addr ? -1 : x->addr > y->addr;
+}
+/* sorted once, at the first error that is reported */
+static void xs_labels_build(void) {
+    if (__atomic_load_n(&xs_labels, __ATOMIC_ACQUIRE)) return;
+    const xs_srec *b = xs_srec_begin, *e = xs_srec_end;
+    size_t n = b && e > b ? (size_t)(e - b) : 0;
+    xs_srec *ls = malloc((n + 1) * sizeof *ls);
+    if (!ls) return;
+    ls[0].addr = n;
+    ls++;
+    if (n) memcpy(ls, b, n * sizeof *ls);
+    qsort(ls, n, sizeof *ls, xs_srec_cmp);
+    xs_srec *expect = NULL;
+    if (!__atomic_compare_exchange_n(&xs_labels, &expect, ls, false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) free(ls - 1);
+}
+/* the call site a return address belongs to, or NULL (runtime code) */
+static const xs_site *xs_site_of(uintptr_t ra) {
+    const xs_srec *ls = __atomic_load_n(&xs_labels, __ATOMIC_ACQUIRE);
+    if (!ls) return NULL;
+    size_t n = (size_t)ls[-1].addr, lo = 0, hi = n;
+    while (lo < hi) { size_t mid = (lo + hi) / 2; if (ls[mid].addr < ra) lo = mid + 1; else hi = mid; }
+    if (lo < n && ls[lo].addr - ra <= XS_TIGHT) return ls[lo].site;
+    return NULL;
+}
+static size_t xs_site_line(char *out, size_t cap, const xs_site *s) {
+    if (cap == 0) return 0;
+    int n = s->fn && s->fn[0] ? snprintf(out, cap, "    at %s (%s:%d:%d)\n", s->fn, s->file, s->line, s->col)
+                              : snprintf(out, cap, "    at %s:%d:%d\n", s->file, s->line, s->col);
+    return n < 0 ? 0 : (size_t)n < cap ? (size_t)n : cap - 1;
+}
+/* "    at f (file.ts:3:10)\n" per frame, innermost first, as in Node. With a top site (an inline failure),
+   ra[0] is in xs_panic_at and ra[1] is the failing function itself, already described by the top site. */
+static size_t xs_trace_format(const xs_trace *t, char *out, size_t cap) {
+    size_t len = 0;
+    if (cap) out[0] = 0;
+    xs_labels_build();
+    for (const xs_site *s = t->top; s; s = s->inl) len += xs_site_line(out + len, cap - len, s);
+    for (int i = t->top ? 2 : 0; i < t->n; i++)
+        for (const xs_site *s = xs_site_of(t->ra[i]); s; s = s->inl) len += xs_site_line(out + len, cap - len, s);
+    return len;
+}
+static void xs_trace_print(const xs_trace *t, FILE *f) {
+    char buf[4096];
+    xs_trace_format(t, buf, sizeof buf);
+    fputs(buf, f);
+}
+
+static XS_TLS const char *xs_panic_msg_pending;
+static XS_TLS bool xs_panic_pending;
+static XS_TLS xs_trace xs_recover_trace; /* where the error that reached the HTTP handler's recovery point came from */
+static XS_TLS bool xs_recover_client;    /* that error came from reading JSON (a bad request body: 400, not 500) */
+static XS_TLS xs_trace xs_panic_trace;
+__attribute__((noinline)) static void xs_panic_at(const char *msg, const xs_site *site);
+/* from inline code: the barrier keeps the call from becoming a tail call, which would drop the frame; after it
+   the path ends (xs_panic_at throws or exits), which the compiler is told here, at the check, and not on
+   xs_panic_at itself (see docs/poc8-stacktrace.md): otherwise every failed check "may return" having changed
+   any memory, and a loop reloads every array pointer after each index check (nbody: 0.73 s) */
+#define XS_FAIL(msg, site) do { xs_panic_at(msg, site); __asm__ volatile(""); __builtin_unreachable(); } while (0)
+__attribute__((noinline)) static void xs_panic_at(const char *msg, const xs_site *site) {
+    xs_trace_capture(&xs_panic_trace, site);
+#ifdef XS_DEBUG
+    if (xs_try_depth == 0) xs_dbg_exception("Error", msg, false); /* with a try, xs_throw reports it */
+#endif
+    if (xs_try_depth > 0) { /* runtime errors are catchable, as in JavaScript */
+        xs_panic_msg_pending = msg;
+        xs_panic_pending = true;
+        xs_throw(xs_Error_new(NULL));
+    } else if (xs_recover) {
+        xs_recover_trace = xs_panic_trace;
+        xs_recover_client = strncmp(msg, "JSON", 4) == 0; /* only the runtime's JSON reader words panics so */
+        xs_recover_msg = msg;
+        xs_cln_unwind(xs_recover_cln);
+        _longjmp(*xs_recover, 1);
+    }
+    fflush(stdout);
+    fprintf(stderr, "runtime error: %s\n", msg);
+    xs_trace_print(&xs_panic_trace, stderr);
+    if (!xs_never) exit(70);
+}
+static void xs_panic(const char *msg) { xs_panic_at(msg, NULL); }
+
+/* integer to decimal without printf: the hot path of JSON serialization */
+static size_t xs_itoa(int64_t v, char *out /* >= 21 bytes */) {
+    char tmp[21];
+    size_t n = 0;
+    uint64_t u = v < 0 ? (uint64_t)(-(v + 1)) + 1 : (uint64_t)v;
+    do { tmp[n++] = (char)('0' + u % 10); u /= 10; } while (u);
+    size_t k = 0;
+    if (v < 0) out[k++] = '-';
+    while (n) out[k++] = tmp[--n];
+    out[k] = 0;
+    return k;
+}
+
+static void xs_panicf(const char *fmt, const char *a) {
+    static char buf[512];
+    snprintf(buf, sizeof buf, fmt, a);
+    xs_panic(buf);
+}
+
+/* ---- reference counting ----
+   Every heap value starts with xs_hdr. The compiler inserts retain/release;
+   values created and not stored go to the autorelease pool, drained per statement. */
+
+/* what a heap value is: how it is freed and printed. One per allocation site (static), so the header holds one
+   pointer instead of two: 16 bytes per object. Identity checks compare type->free, which every site of a type shares. */
+typedef void (*xs_visit_cb)(void **slot, void *arg);
+typedef struct xs_type {
+    void (*free)(void *);
+    void (*print)(void *);
+    /* only the types that can be part of a cycle (the compiler sees every type): calls cb on each slot holding a
+       reference. Objects of these types carry XS_CYC and are looked at by the cycle collector. */
+    void (*visit)(void *, xs_visit_cb cb, void *arg);
+    /* region classes (the compiler's region.c): drop releases what the object holds outside its region, when
+       the region is rewound; rref takes away its references to other objects of the region (XISTO_REGION_CHECK) */
+    void (*drop)(void *);
+    void (*rref)(void *);
+} xs_type;
+#define XS_CYC (1 << 8)  /* in hdr.cls: may be part of a cycle */
+#define XS_BUF (1 << 9)  /* in hdr.cls: among the cycle collector's suspects */
+#define XS_STACK (1 << 7) /* in hdr.cls: lives in its creator's stack frame (stack allocation, src/stackalloc.c) */
+#define XS_RGN (1 << 10)  /* in hdr.cls: an object of a dual region class made in its region (src/region.c): its
+                             count is kept, and reaching zero does nothing; the region's rewind frees it */
+typedef struct xs_hdr {
+    int32_t rc;
+    int32_t cls;               /* size class of the block (16-byte steps), 0 = not pooled */
+    const xs_type *type;
+} xs_hdr;
+#define XS_IMMORTAL (INT32_MAX / 2)
+
+static XS_TLS int64_t xs_live;   /* allocations alive (literals excluded); per thread when workers > 1 */
+static XS_TLS int64_t xs_allocs; /* total allocations */
+/* Small objects (up to 256 bytes) come from per-thread free lists by 16-byte size class: allocation-heavy
+   code (an object or a string per loop iteration) otherwise spends most of its time in malloc and free. */
+#define XS_SMALL_CLASSES 16
+typedef struct xs_free_blk { struct xs_free_blk *next; } xs_free_blk;
+static XS_TLS xs_free_blk *xs_small[XS_SMALL_CLASSES + 1];
+static XS_TLS int xs_small_n[XS_SMALL_CLASSES + 1];
+
+/* Small objects (<= 256 bytes) are carved from 256 KB slabs and, once freed, wait on their size class's list
+   for the next allocation; they never go back to malloc. Splitting a 22 MB text into 2.7M strings spent
+   most of its time in malloc and free; a slab carve is a pointer bump. */
+static XS_TLS char *xs_slab_p, *xs_slab_end;
+static __attribute__((noinline)) void *xs_slab_new(size_t sz) {
+    size_t chunk = 256 * 1024;
+    xs_slab_p = malloc(chunk);
+    if (!xs_slab_p) xs_panic("out of memory");
+    xs_slab_end = xs_slab_p + chunk;
+    void *h = xs_slab_p;
+    xs_slab_p += sz;
+    return h;
+}
+static inline __attribute__((always_inline)) void *xs_slab_carve(int k) {
+    size_t sz = (size_t)k << 4;
+    if (xs_slab_p && xs_slab_p + sz <= xs_slab_end) { void *h = xs_slab_p; xs_slab_p += sz; return h; }
+    return xs_slab_new(sz);
+}
+static void *xs_obj_alloc_slow(size_t size, int k) {
+    if (k) { void *h = xs_slab_carve(k); memset(h, 0, size); return h; }
+    void *h = calloc(1, size);
+    if (!h) xs_panic("out of memory");
+    return h;
+}
+/* inlined at every allocation site: the size is a constant there, so the clearing is a few stores */
+static XS_TLS bool xs_gc_due; /* enough suspects: the cycle collector runs at the next allocation */
+static void xs_gc_collect(void);
+static inline __attribute__((always_inline)) void *xs_obj_alloc_t(size_t size, const xs_type *type) {
+    if (__builtin_expect(xs_gc_due, 0)) xs_gc_collect();
+    xs_hdr *h;
+    int k = size <= 16 * XS_SMALL_CLASSES ? (int)((size + 15) >> 4) : 0;
+    if (k && xs_small[k]) {
+        h = (xs_hdr *)xs_small[k];
+        xs_small[k] = xs_small[k]->next;
+        xs_small_n[k]--;
+        memset(h, 0, size);
+    } else {
+        h = xs_obj_alloc_slow(size, k);
+    }
+    h->rc = 1;
+    h->cls = k | (type->visit ? XS_CYC : 0);
+    h->type = type;
+    xs_live++;
+    xs_allocs++;
+    return h;
+}
+
+/* an object in its creator's frame (src/stackalloc.c), declared = {0}: a header like any other, so retains, releases and the
+   cleanup stack work unchanged; when its count reaches zero its fields are released and the memory stays */
+static inline __attribute__((always_inline)) void *xs_obj_on_stack(void *mem, size_t size, const xs_type *type) {
+    xs_hdr *h = mem; /* cleared where it is declared */
+    (void)size;
+    h->rc = 1;
+    h->cls = XS_STACK;
+    h->type = type;
+    xs_live++;
+    return h;
+}
+
+/* the same without clearing: for objects whose every byte is written next (string data) */
+static inline __attribute__((always_inline)) void *xs_obj_alloc_raw(size_t size, const xs_type *type) {
+    xs_hdr *h;
+    int k = size <= 16 * XS_SMALL_CLASSES ? (int)((size + 15) >> 4) : 0;
+    if (k && xs_small[k]) {
+        h = (xs_hdr *)xs_small[k];
+        xs_small[k] = xs_small[k]->next;
+        xs_small_n[k]--;
+    } else if (k) {
+        h = xs_slab_carve(k);
+    } else {
+        h = malloc(size);
+        if (!h) xs_panic("out of memory");
+    }
+    h->rc = 1;
+    h->cls = k | (type->visit ? XS_CYC : 0);
+    h->type = type;
+    xs_live++;
+    xs_allocs++;
+    return h;
+}
+
+/* xs_obj_alloc(size, free, print): the type is a constant made where it is called */
+#define xs_obj_alloc(size, free_fn, print_fn) xs_obj_alloc_t((size), ({ static const xs_type xs_t_ = {(free_fn), (print_fn)}; &xs_t_; }))
+
+static void xs_gc_forget(void *p);
+static inline __attribute__((always_inline)) void xs_obj_free(void *p) {
+    xs_live--;
+    int k = ((xs_hdr *)p)->cls;
+    if (__builtin_expect(k & (XS_BUF | XS_STACK), 0)) {
+        if (k & XS_STACK) return; /* its frame owns the memory: only the fields were released */
+        xs_gc_forget(p);
+    }
+    k &= 0xFF;
+    if (k) { /* from a slab: back on its class's list */
+        xs_free_blk *b = p;
+        b->next = xs_small[k];
+        xs_small[k] = b;
+        xs_small_n[k]++;
+        return;
+    }
+    free(p);
+}
+
+static inline void *xs_retain_(void *p) {
+    if (p) ((xs_hdr *)p)->rc++;
+    return p;
+}
+
+static void xs_gc_suspect(void *p);
+static inline void xs_release_(void *p) {
+    if (!p) return;
+    xs_hdr *h = p;
+    if (--h->rc == 0) h->type->free(p);
+    else if (__builtin_expect((h->cls & (XS_CYC | XS_BUF)) == XS_CYC, 0)) xs_gc_suspect(p); /* may now hang on a cycle only */
+}
+
+/* a release whose type the compiler knows (a field of a class without subclasses): the free function is
+   called directly, not through the type, so freeing a tree is a direct recursion the C compiler can work on */
+#define xs_release_as(x, free_fn) do { xs_hdr *h_ = (xs_hdr *)(x); \
+    if (h_) { if (--h_->rc == 0) free_fn(h_); \
+              else if (__builtin_expect((h_->cls & (XS_CYC | XS_BUF)) == XS_CYC, 0)) xs_gc_suspect(h_); } } while (0)
+#define xs_retain(x) ((__typeof__(x))xs_retain_((void *)(x)))
+#define xs_release(x) xs_release_((void *)(x))
+
+/* Stores an owned reference into a slot, releasing the previous value. */
+static inline void *xs_assign_(void **slot, void *val) {
+    void *old = *slot;
+    *slot = val;
+    xs_release_(old);
+    return val;
+}
+#define xs_assign(slot, val) ((__typeof__(slot))xs_assign_((void **)&(slot), (void *)(val)))
+/* the same when the old value's free function is known (xs_release_as) */
+#define xs_assign_as(slot, val, free_fn) ({ __typeof__(slot) av_ = (val); __typeof__(slot) *as_ = &(slot); \
+    void *ao_ = (void *)*as_; *as_ = av_; xs_release_as(ao_, free_fn); av_; })
+
+static XS_TLS void **xs_ar_pool;
+static XS_TLS size_t xs_ar_len, xs_ar_cap;
+
+static inline size_t xs_ar_mark(void) { return xs_ar_len; }
+
+static void *xs_ar_(void *p) {
+    if (xs_ar_len == xs_ar_cap) {
+        xs_ar_cap = xs_ar_cap ? xs_ar_cap * 2 : 64;
+        xs_ar_pool = realloc(xs_ar_pool, xs_ar_cap * sizeof(void *));
+        if (!xs_ar_pool) xs_panic("out of memory");
+    }
+    xs_ar_pool[xs_ar_len++] = p;
+    return p;
+}
+#define xs_ar(x) ((__typeof__(x))xs_ar_((void *)(x)))
+
+static inline void xs_ar_drain(size_t mark) {
+    while (xs_ar_len > mark) xs_release_(xs_ar_pool[--xs_ar_len]);
+}
+
+/* An array length is below 2^40 (arrays are created under that limit; growing past it would take terabytes):
+   said to the compiler, an index under a length times a small constant cannot overflow, and the checks of
+   `a[i] = i * 31 + 7` in a counted loop go away (the loop then vectorizes). */
+static inline __attribute__((always_inline)) int64_t xs_len_bound(int64_t n) {
+#if defined(__clang__)
+    __builtin_assume(n >= 0 && n <= ((int64_t)1 << 40));
+#else
+    if (n < 0 || n > ((int64_t)1 << 40)) __builtin_unreachable();
+#endif
+    return n;
+}
+
+/* ---- strings: immutable, UTF-8 ---- */
+
+typedef struct xs_str {
+    xs_hdr hdr;
+    int64_t len;   /* bytes */
+    int32_t ulen;  /* code points, -1 until first asked (or when more than 2^31) */
+    char data[];   /* always NUL-terminated; allocated from offsetof(xs_str, data): no padding after ulen */
+} xs_str;
+
+static void xs_str_free(void *p) { xs_obj_free(p); }
+static void xs_print_str(xs_str *s);
+static void xs_str_print_(void *p) { xs_print_str(p); }
+
+static const xs_type xs_str_type = {xs_str_free, xs_str_print_};
+/* a string from a buffer built with offsetof(xs_str, data) bytes reserved in front and room for the NUL:
+   the buffer becomes the string, nothing is copied (replace() over 22 MB copied it twice) */
+static xs_str *xs_str_adopt(char *buf, size_t len) {
+    xs_str *s = (xs_str *)buf;
+    if (offsetof(xs_str, data) + len + 1 <= 16 * XS_SMALL_CLASSES) { /* small: the allocator's own block */
+        xs_str *r = xs_obj_alloc_raw(offsetof(xs_str, data) + len + 1, &xs_str_type);
+        memcpy(r->data, s->data, len);
+        r->data[len] = 0;
+        r->len = (int64_t)len;
+        r->ulen = -1;
+        free(buf);
+        return r;
+    }
+    s->hdr.rc = 1;
+    s->hdr.cls = 0;
+    s->hdr.type = &xs_str_type;
+    s->len = (int64_t)len;
+    s->ulen = -1;
+    s->data[len] = 0;
+    xs_live++;
+    xs_allocs++;
+    return s;
+}
+/* inlined where a string is made in a hot path (short templates, xs_cat_n): objects.ts 9.3 -> 7.5 ns per
+   iteration; everywhere else the out-of-line xs_str_alloc keeps the code small */
+static inline __attribute__((always_inline)) xs_str *xs_str_alloc_i(int64_t len) {
+    xs_str *s = xs_obj_alloc_raw(offsetof(xs_str, data) + (size_t)len + 1, &xs_str_type);
+    s->len = len;
+    s->ulen = -1;
+    return s;
+}
+static xs_str *xs_str_alloc(int64_t len) { return xs_str_alloc_i(len); }
+
+static char *xs_strndup_(const char *s, size_t n) {
+    char *d = malloc(n + 1);
+    if (!d) xs_panic("out of memory");
+    memcpy(d, s, n);
+    d[n] = 0;
+    return d;
+}
+
+static xs_str *xs_str_new(const char *bytes, size_t len) {
+    xs_str *s = xs_str_alloc((int64_t)len);
+    memcpy(s->data, bytes, len);
+    s->data[len] = 0;
+    return s;
+}
+
+/* Literals live for the whole program and are never counted. */
+static xs_str *xs_str_immortal(const char *bytes, size_t len) {
+    xs_str *s = malloc(offsetof(xs_str, data) + len + 1);
+    if (!s) xs_panic("out of memory");
+    s->hdr.rc = XS_IMMORTAL;
+    s->hdr.cls = 0;
+    static const xs_type immortal_str = {xs_str_free, xs_str_print_};
+    s->hdr.type = &immortal_str;
+    s->len = (int64_t)len;
+    s->ulen = -1;
+    if (len <= INT32_MAX) { /* literals: their length in UTF-16 units counted once, here (templates add them up) */
+        int32_t u = 0;
+        for (size_t i = 0; i < len; i++) u += ((unsigned char)bytes[i] & 0xC0) != 0x80;
+        s->ulen = u;
+    }
+    memcpy(s->data, bytes, len);
+    s->data[len] = 0;
+    return s;
+}
+
+/* string.length counts Unicode code points (JS counts UTF-16 units; they agree outside emoji and other astral characters). */
+/* a query parameter for node:sqlite and pg: kind 0 null, 1 int, 2 number, 3 string, 4 boolean */
+typedef struct { int kind; int64_t i; double d; xs_str *s; } xs_sqarg;
+/* truthiness of a string (xisto allows it for strings and T | null only): not empty */
+static inline bool xs_str_truthy(xs_str *s) { return s && s->len > 0; }
+static bool xs_str_eq(xs_str *a, xs_str *b);
+static inline bool xs_str_eq_null(xs_str *a, xs_str *b) { return a && b && xs_str_eq(a, b); }
+static int64_t xs_str_len(xs_str *s) {
+    if (s->ulen < 0) {
+        int64_t n = 0;
+        for (int64_t i = 0; i < s->len; i++)
+            if ((s->data[i] & 0xC0) != 0x80) n++;
+        if (n > INT32_MAX) return n; /* too long to cache in the header: counted each time */
+        s->ulen = (int32_t)n;
+    }
+    return s->ulen;
+}
+
+/* Byte offset of the code point at index i (clamped to the end). */
+static int64_t xs_str_byte_at(xs_str *s, int64_t i) {
+    if (xs_str_len(s) == s->len) return i < s->len ? i : s->len; /* ASCII */
+    int64_t n = 0;
+    for (int64_t b = 0; b < s->len; b++) {
+        if ((s->data[b] & 0xC0) != 0x80) {
+            if (n == i) return b;
+            n++;
+        }
+    }
+    return s->len;
+}
+
+static int64_t xs_str_cp_at_byte(xs_str *s, int64_t b) {
+    if (xs_str_len(s) == s->len) return b;
+    int64_t n = 0;
+    for (int64_t i = 0; i < b; i++)
+        if ((s->data[i] & 0xC0) != 0x80) n++;
+    return n;
+}
+
+static xs_str *xs_str_concat(xs_str *a, xs_str *b) {
+    xs_str *s = xs_str_alloc(a->len + b->len);
+    memcpy(s->data, a->data, (size_t)a->len);
+    memcpy(s->data + a->len, b->data, (size_t)b->len);
+    s->data[s->len] = 0;
+    return s;
+}
+
+static inline bool xs_str_eq(xs_str *a, xs_str *b) {
+    return a->len == b->len && memcmp(a->data, b->data, (size_t)a->len) == 0;
+}
+
+static bool xs_str_starts_with(xs_str *s, xs_str *p) {
+    return p->len <= s->len && memcmp(s->data, p->data, (size_t)p->len) == 0;
+}
+
+static bool xs_str_ends_with(xs_str *s, xs_str *p) {
+    return p->len <= s->len && memcmp(s->data + s->len - p->len, p->data, (size_t)p->len) == 0;
+}
+
+/* Substring search. memchr (vectorized in libc) finds candidates for the first byte, memcmp confirms.
+   macOS memmem is a plain byte loop and was 60% of a log-filtering stream; glibc's is fast too, but this
+   is never slower. When candidates are dense (first byte everywhere), fall back to memmem so the
+   worst case stays what libc gives. UTF-8 is self-synchronizing, so a byte match is a character match. */
+static const char *xs_find(const char *h, size_t hn, const char *n, size_t nn) {
+    if (nn == 0) return h;
+    if (nn > hn) return NULL;
+    const char *p = h, *last = h + (hn - nn); /* last possible start */
+    size_t misses = 0;
+    for (;;) {
+        p = memchr(p, (unsigned char)n[0], (size_t)(last - p) + 1);
+        if (!p) return NULL;
+        if (memcmp(p + 1, n + 1, nn - 1) == 0) return p;
+        if (p == last) return NULL;
+        p++;
+        if (++misses > 32 && (size_t)(p - h) < misses * 16) return memmem(p, (size_t)(h + hn - p), n, nn);
+    }
+}
+
+static int64_t xs_str_index_of(xs_str *s, xs_str *p, int64_t from) {
+    int64_t n = xs_str_len(s);
+    if (from < 0) from = 0;
+    if (from > n) from = n;
+    if (p->len == 0) return from;
+    int64_t start = xs_str_byte_at(s, from);
+    if (p->len > s->len - start) return -1;
+    const char *hit = xs_find(s->data + start, (size_t)(s->len - start), p->data, (size_t)p->len);
+    if (!hit) return -1;
+    return xs_str_cp_at_byte(s, (int64_t)(hit - s->data));
+}
+
+static bool xs_str_includes(xs_str *s, xs_str *p) { return xs_find(s->data, (size_t)s->len, p->data, (size_t)p->len) != NULL; }
+
+/* JS slice semantics on code points; XS_SLICE_END from the compiler means "to the end". */
+#define XS_SLICE_END INT64_MIN
+static xs_str *xs_str_slice(xs_str *s, int64_t start, int64_t end) {
+    int64_t n = xs_str_len(s);
+    if (end == XS_SLICE_END) end = n;
+    if (start < 0) start += n;
+    if (end < 0) end += n;
+    if (start < 0) start = 0;
+    if (end > n) end = n;
+    if (start >= end) return xs_str_new("", 0);
+    int64_t a = xs_str_byte_at(s, start), b = xs_str_byte_at(s, end);
+    return xs_str_new(s->data + a, (size_t)(b - a));
+}
+
+/* JS substring: both ends clamped to [0, length] (no counting from the end), swapped when start > end */
+static xs_str *xs_str_substring(xs_str *s, int64_t start, int64_t end) {
+    int64_t n = xs_str_len(s);
+    if (end == XS_SLICE_END || end > n) end = n;
+    if (end < 0) end = 0;
+    if (start < 0) start = 0;
+    if (start > n) start = n;
+    if (start > end) { int64_t t = start; start = end; end = t; }
+    return xs_str_slice(s, start, end);
+}
+
+static xs_str *xs_str_trim(xs_str *s) {
+    int64_t a = 0, b = s->len;
+    while (a < b && isspace((unsigned char)s->data[a])) a++;
+    while (b > a && isspace((unsigned char)s->data[b - 1])) b--;
+    return xs_str_new(s->data + a, (size_t)(b - a));
+}
+
+/* case mapping by code point, as JavaScript's toUpperCase / toLowerCase for the Latin-1 and Latin Extended-A
+   blocks, Greek and Cyrillic (the scripts of the languages the programs here meet); other code points are
+   left as they are. The mappings that change length (ß -> SS, İ -> i̇, ŉ -> ʼN) and Greek's final sigma are in
+   xs_str_case. */
+static uint32_t xs_cp_upper(uint32_t c) {
+    if (c < 0x80) return c >= 'a' && c <= 'z' ? c - 32 : c;
+    if (c >= 0xE0 && c <= 0xFE && c != 0xF7) return c - 32;
+    if (c == 0xFF) return 0x178;
+    if (c == 0xB5) return 0x39C;
+    if (c >= 0x100 && c <= 0x17F) {
+        if ((c >= 0x139 && c <= 0x148) || (c >= 0x179 && c <= 0x17E)) return c & 1 ? c : c - 1;
+        if (c == 0x131) return 'I';
+        if (c == 0x17F) return 'S';
+        if (c <= 0x12F || (c >= 0x132 && c <= 0x137) || (c >= 0x14A && c <= 0x177)) return c & 1 ? c - 1 : c;
+        return c;
+    }
+    if (c >= 0x3B1 && c <= 0x3CB) return c == 0x3C2 ? 0x3A3 : c - 32;
+    switch (c) {
+    case 0x3AC: return 0x386; case 0x3AD: return 0x388; case 0x3AE: return 0x389; case 0x3AF: return 0x38A;
+    case 0x3CC: return 0x38C; case 0x3CD: return 0x38E; case 0x3CE: return 0x38F;
+    }
+    if (c >= 0x430 && c <= 0x44F) return c - 32;
+    if (c >= 0x450 && c <= 0x45F) return c - 80;
+    return c;
+}
+static uint32_t xs_cp_lower(uint32_t c) {
+    if (c < 0x80) return c >= 'A' && c <= 'Z' ? c + 32 : c;
+    if (c >= 0xC0 && c <= 0xDE && c != 0xD7) return c + 32;
+    if (c >= 0x100 && c <= 0x17F) {
+        if ((c >= 0x139 && c <= 0x148) || (c >= 0x179 && c <= 0x17E)) return c & 1 ? c + 1 : c;
+        if (c == 0x178) return 0xFF;
+        if (c <= 0x12F || (c >= 0x132 && c <= 0x137) || (c >= 0x14A && c <= 0x177)) return c & 1 ? c : c + 1;
+        return c;
+    }
+    if (c >= 0x391 && c <= 0x3AB && c != 0x3A2) return c + 32;
+    switch (c) {
+    case 0x386: return 0x3AC; case 0x388: return 0x3AD; case 0x389: return 0x3AE; case 0x38A: return 0x3AF;
+    case 0x38C: return 0x3CC; case 0x38E: return 0x3CD; case 0x38F: return 0x3CE;
+    }
+    if (c >= 0x410 && c <= 0x42F) return c + 32;
+    if (c >= 0x400 && c <= 0x40F) return c + 80;
+    return c;
+}
+/* one code point at p (well-formed UTF-8, as every xs_str is); *n gets its length in bytes */
+static uint32_t xs_u8_next(const unsigned char *p, int *n) {
+    if (p[0] < 0x80) { *n = 1; return p[0]; }
+    if (p[0] < 0xE0) { *n = 2; return (uint32_t)(p[0] & 0x1F) << 6 | (p[1] & 0x3F); }
+    if (p[0] < 0xF0) { *n = 3; return (uint32_t)(p[0] & 0x0F) << 12 | (uint32_t)(p[1] & 0x3F) << 6 | (p[2] & 0x3F); }
+    *n = 4;
+    return (uint32_t)(p[0] & 0x07) << 18 | (uint32_t)(p[1] & 0x3F) << 12 | (uint32_t)(p[2] & 0x3F) << 6 | (p[3] & 0x3F);
+}
+static int xs_u8_put(char *o, uint32_t c) {
+    if (c < 0x80) { o[0] = (char)c; return 1; }
+    if (c < 0x800) { o[0] = (char)(0xC0 | c >> 6); o[1] = (char)(0x80 | (c & 0x3F)); return 2; }
+    if (c < 0x10000) { o[0] = (char)(0xE0 | c >> 12); o[1] = (char)(0x80 | (c >> 6 & 0x3F)); o[2] = (char)(0x80 | (c & 0x3F)); return 3; }
+    o[0] = (char)(0xF0 | c >> 18); o[1] = (char)(0x80 | (c >> 12 & 0x3F)); o[2] = (char)(0x80 | (c >> 6 & 0x3F)); o[3] = (char)(0x80 | (c & 0x3F));
+    return 4;
+}
+static bool xs_cp_cased(uint32_t c) { return xs_cp_upper(c) != c || xs_cp_lower(c) != c; }
+XS_NOINLINE xs_str *xs_str_case(xs_str *s, bool up) {
+    const unsigned char *d = (const unsigned char *)s->data;
+    int64_t n = s->len, i = 0;
+    while (i < n && d[i] < 0x80) i++;
+    if (i == n) { /* ASCII: byte by byte */
+        xs_str *r = xs_str_alloc(n);
+        for (int64_t k = 0; k < n; k++) {
+            unsigned char c = d[k];
+            r->data[k] = (char)(up ? (c >= 'a' && c <= 'z' ? c - 32 : c) : (c >= 'A' && c <= 'Z' ? c + 32 : c));
+        }
+        r->data[n] = 0;
+        r->ulen = s->ulen;
+        return r;
+    }
+    char *buf = malloc((size_t)n * 2 + 8), *o = buf; /* no mapping here grows a code point by more than 2x */
+    if (!buf) xs_panic("out of memory");
+    uint32_t prev = 0;
+    for (int64_t k = 0; k < n;) {
+        int w;
+        uint32_t c = xs_u8_next(d + k, &w);
+        if (up && c == 0xDF) { *o++ = 'S'; *o++ = 'S'; }
+        else if (up && c == 0x149) { o += xs_u8_put(o, 0x2BC); *o++ = 'N'; }
+        else if (!up && c == 0x130) { *o++ = 'i'; o += xs_u8_put(o, 0x307); }
+        else if (!up && c == 0x3A3) { /* final sigma: after a letter, and not before one */
+            bool before = false;
+            if (k + w < n) { int w2; before = xs_cp_cased(xs_u8_next(d + k + w, &w2)); }
+            o += xs_u8_put(o, prev && xs_cp_cased(prev) && !before ? 0x3C2 : 0x3C3);
+        } else o += xs_u8_put(o, up ? xs_cp_upper(c) : xs_cp_lower(c));
+        prev = c;
+        k += w;
+    }
+    xs_str *r = xs_str_new(buf, (size_t)(o - buf));
+    free(buf);
+    return r;
+}
+/* s.charCodeAt(i) / s.codePointAt(i): the code point at index i, NaN past the end */
+static double xs_str_code_at(xs_str *s, int64_t i) {
+    if (i < 0 || i >= xs_str_len(s)) return NAN;
+    int w;
+    return (double)xs_u8_next((const unsigned char *)s->data + xs_str_byte_at(s, i), &w);
+}
+/* String.fromCharCode(...) and String.fromCodePoint(...): fromCharCode takes each value modulo 2^16 (a lone
+   surrogate becomes U+FFFD, as UTF-8 cannot hold it; a high-low pair in a row is the code point it encodes);
+   fromCodePoint throws a RangeError for what is not a code point */
+XS_NOINLINE xs_str *xs_str_from_codes(int n, const double *v, bool points) {
+    char *buf = malloc((size_t)n * 4 + 1), *o = buf;
+    if (!buf) xs_panic("out of memory");
+    for (int i = 0; i < n; i++) {
+        double d = v[i];
+        uint32_t c;
+        if (points) {
+            if (!(d >= 0 && d <= 0x10FFFF) || d != floor(d)) {
+                free(buf);
+                char m[96];
+                snprintf(m, sizeof m, "RangeError: Invalid code point %.17g", d);
+                xs_panic(m);
+            }
+            c = (uint32_t)d;
+        } else c = d == d && !isinf(d) ? (uint32_t)(int64_t)fmod(trunc(d), 65536.0) & 0xFFFF : 0;
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) { /* a surrogate pair, given as two values */
+            double e = v[i + 1];
+            uint32_t lo = points ? (uint32_t)e : e == e && !isinf(e) ? (uint32_t)(int64_t)fmod(trunc(e), 65536.0) & 0xFFFF : 0;
+            if (lo >= 0xDC00 && lo <= 0xDFFF) { c = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00); i++; }
+        }
+        if (c >= 0xD800 && c <= 0xDFFF) c = 0xFFFD;
+        o += xs_u8_put(o, c);
+    }
+    xs_str *r = xs_str_new(buf, (size_t)(o - buf));
+    free(buf);
+    return r;
+}
+XS_NOINLINE xs_str *xs_str_from_char_codes(int n, const double *v) { return xs_str_from_codes(n, v, false); }
+XS_NOINLINE xs_str *xs_str_from_code_points(int n, const double *v) { return xs_str_from_codes(n, v, true); }
+static xs_str *xs_str_upper(xs_str *s) { return xs_str_case(s, true); }
+static xs_str *xs_str_lower(xs_str *s) { return xs_str_case(s, false); }
+
+static inline xs_str *xs_retain_str(xs_str *s) { return xs_retain(s); }
+XS_NOINLINE void xs_assert(bool cond, xs_str *msg) {
+    if (cond) return;
+    static XS_TLS char buf[512];
+    snprintf(buf, sizeof buf, "assertion failed: %s", msg->data);
+    xs_panic(buf);
+}
+
+static int64_t xs_str_last_index_of(xs_str *s, xs_str *p) {
+    if (p->len > s->len) return -1;
+    for (int64_t i = s->len - p->len; i >= 0; i--)
+        if (memcmp(s->data + i, p->data, (size_t)p->len) == 0) return xs_str_cp_at_byte(s, i);
+    return -1;
+}
+static xs_str *xs_str_trim_start(xs_str *s) {
+    int64_t a = 0;
+    while (a < s->len && isspace((unsigned char)s->data[a])) a++;
+    return xs_str_new(s->data + a, (size_t)(s->len - a));
+}
+static xs_str *xs_str_trim_end(xs_str *s) {
+    int64_t b = s->len;
+    while (b > 0 && isspace((unsigned char)s->data[b - 1])) b--;
+    return xs_str_new(s->data, (size_t)b);
+}
+static xs_str *xs_str_slice(xs_str *s, int64_t start, int64_t end);
+static xs_str *xs_str_char_at(xs_str *s, int64_t i) {
+    if (i < 0 || i >= xs_str_len(s)) return xs_str_new("", 0);
+    return xs_str_slice(s, i, i + 1);
+}
+XS_NOINLINE xs_str *xs_str_repeat(xs_str *s, int64_t n) {
+    if (n < 0) xs_panic("Invalid count value: repeat count must be non-negative");
+    if (n && s->len > ((int64_t)1 << 32) / n) xs_panic("Invalid string length");
+    xs_str *r = xs_str_alloc(s->len * n);
+    for (int64_t i = 0; i < n; i++) memcpy(r->data + i * s->len, s->data, (size_t)s->len);
+    r->data[r->len] = 0;
+    return r;
+}
+XS_NOINLINE xs_str *xs_str_pad(xs_str *s, int64_t target, xs_str *fill, bool start) {
+    int64_t len = xs_str_len(s);
+    if (target <= len || fill->len == 0) return xs_retain(s);
+    if (target > ((int64_t)1 << 30)) xs_panic("Invalid string length");
+    int64_t need = target - len, flen = xs_str_len(fill);
+    /* fill is cut on code points; byte length of the padding */
+    int64_t full = need / flen, rest = need % flen;
+    int64_t restb = xs_str_byte_at(fill, rest);
+    int64_t padb = full * fill->len + restb;
+    xs_str *r = xs_str_alloc(s->len + padb);
+    char *p = r->data + (start ? 0 : s->len);
+    for (int64_t i = 0; i < full; i++) { memcpy(p, fill->data, (size_t)fill->len); p += fill->len; }
+    memcpy(p, fill->data, (size_t)restb);
+    memcpy(r->data + (start ? padb : 0), s->data, (size_t)s->len);
+    r->data[r->len] = 0;
+    return r;
+}
+XS_NOINLINE xs_str *xs_str_pad_start(xs_str *s, int64_t n, xs_str *f) { return xs_str_pad(s, n, f, true); }
+XS_NOINLINE xs_str *xs_str_pad_end(xs_str *s, int64_t n, xs_str *f) { return xs_str_pad(s, n, f, false); }
+XS_NOINLINE xs_str *xs_str_replace_impl(xs_str *s, xs_str *a, xs_str *b, bool all) {
+    if (a->len == 0) { /* JS: "" matches at 0 (replace) or between every code unit (replaceAll); support the first */
+        if (all) xs_panic("replaceAll with an empty pattern is not supported");
+        xs_str *r = xs_str_alloc(s->len + b->len);
+        memcpy(r->data, b->data, (size_t)b->len); memcpy(r->data + b->len, s->data, (size_t)s->len); r->data[r->len] = 0;
+        return r;
+    }
+    int64_t count = 0;
+    const char *p = s->data, *end = s->data + s->len;
+    while ((p = xs_find(p, (size_t)(end - p), a->data, (size_t)a->len))) { count++; p += a->len; if (!all) break; }
+    if (count == 0) return xs_retain(s);
+    xs_str *r = xs_str_alloc(s->len + count * (b->len - a->len));
+    char *o = r->data;
+    p = s->data;
+    for (int64_t k = 0; k < count; k++) {
+        const char *hit = xs_find(p, (size_t)(end - p), a->data, (size_t)a->len);
+        memcpy(o, p, (size_t)(hit - p)); o += hit - p;
+        memcpy(o, b->data, (size_t)b->len); o += b->len;
+        p = hit + a->len;
+    }
+    memcpy(o, p, (size_t)(end - p));
+    r->data[r->len] = 0;
+    return r;
+}
+XS_NOINLINE xs_str *xs_str_replace(xs_str *s, xs_str *a, xs_str *b) { return xs_str_replace_impl(s, a, b, false); }
+XS_NOINLINE xs_str *xs_str_replace_all(xs_str *s, xs_str *a, xs_str *b) { return xs_str_replace_impl(s, a, b, true); }
+
+#include <stdarg.h>
+/* template literal: concatenates n borrowed strings into a new one */
+XS_NOINLINE xs_str *xs_tpl(int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    int64_t total = 0;
+    xs_str *parts[64];
+    if (n > 64) xs_panic("template literal with more than 64 parts");
+    for (int i = 0; i < n; i++) { parts[i] = va_arg(ap, xs_str *); total += parts[i]->len; }
+    va_end(ap);
+    xs_str *r = xs_str_alloc(total);
+    char *p = r->data;
+    for (int i = 0; i < n; i++) { memcpy(p, parts[i]->data, (size_t)parts[i]->len); p += parts[i]->len; }
+    *p = 0;
+    return r;
+}
+
+/* ---- arrays: fixed length, bounds-checked ---- */
+
+#define XS_INLINE_ELEMS 4 /* small arrays keep their elements inside the object */
+#define XS_ARRAY(T, name)                                                              \
+    typedef struct name { xs_hdr hdr; size_t len; T *data; size_t cap; } name;        \
+    static void name##_free(void *p) { name *a_ = p; if ((void *)a_->data != (void *)(a_ + 1)) free(a_->data); xs_obj_free(p); } \
+    static void xs_print_##name(void *p);                                              \
+    XS_NOINLINE name *name##_new(int64_t n, T fill) {                                       \
+        if (n < 0 || n > ((int64_t)1 << 40)) xs_panic("invalid array length");         \
+        /* up to XS_INLINE_ELEMS elements live inside the object: no second allocation */ \
+        bool in_ = n <= XS_INLINE_ELEMS;                                               \
+        name *a = in_ ? xs_obj_alloc(sizeof(name) + XS_INLINE_ELEMS * sizeof(T), name##_free, xs_print_##name) \
+                      : xs_obj_alloc(sizeof(name), name##_free, xs_print_##name);      \
+        a->len = (size_t)n;                                                            \
+        a->cap = in_ ? XS_INLINE_ELEMS : (size_t)n;                                    \
+        a->data = in_ ? (T *)(a + 1) : malloc(a->cap * sizeof(T));                     \
+        if (!a->data) xs_panic("out of memory");                                       \
+        for (size_t i = 0; i < a->len; i++) a->data[i] = fill;                         \
+        return a;                                                                      \
+    }                                                                                  \
+    static name *name##_lit(size_t n, const T *items) {                                \
+        name *a = name##_new((int64_t)n, 0);                                           \
+        memcpy(a->data, items, n * sizeof(T));                                         \
+        return a;                                                                      \
+    }                                                                                  \
+    XS_AI T *xs_at_##name##_s(name *a, int64_t i, const xs_site *s) {                \
+        if ((uint64_t)i >= a->len) XS_FAIL("array index out of bounds", s);        \
+        return &a->data[i];                                                            \
+    }                                                                                  \
+    static inline T *xs_at_##name(name *a, int64_t i) { return xs_at_##name##_s(a, i, NULL); } \
+    static int64_t name##_push(name *a, T v) {                                         \
+        if (a->len == a->cap) {                                                        \
+            a->cap *= 2;                                                               \
+            if ((void *)a->data == (void *)(a + 1)) {                                  \
+                T *d_ = malloc(a->cap * sizeof(T));                                    \
+                if (!d_) xs_panic("out of memory");                                    \
+                memcpy(d_, a->data, a->len * sizeof(T));                               \
+                a->data = d_;                                                          \
+            } else {                                                                   \
+                a->data = realloc(a->data, a->cap * sizeof(T));                        \
+                if (!a->data) xs_panic("out of memory");                               \
+            }                                                                          \
+        }                                                                              \
+        a->data[a->len++] = v;                                                         \
+        return (int64_t)a->len;                                                        \
+    }                                                                                  \
+    XS_NOINLINE T name##_pop(name *a) {                                                     \
+        if (a->len == 0) xs_panic("pop from an empty array");                          \
+        return a->data[--a->len];                                                      \
+    }                                                                                  \
+    XS_NOINLINE int64_t name##_unshift(name *a, T v) {                                      \
+        name##_push(a, v);                                                             \
+        memmove(a->data + 1, a->data, (a->len - 1) * sizeof(T));                       \
+        a->data[0] = v;                                                                \
+        return (int64_t)a->len;                                                        \
+    }                                                                                  \
+    XS_NOINLINE T name##_shift(name *a) {                                                   \
+        if (a->len == 0) xs_panic("shift from an empty array");                        \
+        T v = a->data[0];                                                              \
+        memmove(a->data, a->data + 1, (a->len - 1) * sizeof(T));                       \
+        a->len--;                                                                      \
+        return v;                                                                      \
+    }                                                                                  \
+    XS_NOINLINE void name##_splice1(name *a, int64_t i) {                                   \
+        if ((uint64_t)i >= a->len) xs_panic("splice index out of bounds");             \
+        memmove(a->data + i, a->data + i + 1, (a->len - (size_t)i - 1) * sizeof(T));   \
+        a->len--;                                                                      \
+    }
+
+XS_ARRAY(double, xs_arr_num)
+XS_ARRAY(int64_t, xs_arr_int)
+XS_ARRAY(bool, xs_arr_bool)
+#define xs_at_num xs_at_xs_arr_num
+#define xs_at_int xs_at_xs_arr_int
+#define xs_at_bool xs_at_xs_arr_bool
+#define xs_at_num_s xs_at_xs_arr_num_s
+#define xs_at_int_s xs_at_xs_arr_int_s
+#define xs_at_bool_s xs_at_xs_arr_bool_s
+
+/* Arrays of strings and objects: the array owns one reference per element. */
+typedef struct xs_arr_ref { xs_hdr hdr; size_t len; void **data; size_t cap; void (*print_elem)(void *); } xs_arr_ref;
+/* an array of region objects (the compiler's region.c) is itself in the region: made and grown there */
+static const xs_type xs_arr_ref_rtype;
+static void *xs_region_bytes_cur(size_t n);
+static void xs_arr_ref_free(void *p) {
+    xs_arr_ref *a = p;
+    for (size_t i = 0; i < a->len; i++) xs_release_(a->data[i]);
+    if ((void *)a->data != (void *)(a + 1)) free(a->data);
+    xs_obj_free(p);
+}
+static void xs_print_xs_arr_ref(void *p);
+static xs_arr_ref *xs_arr_ref_new(size_t cap, void (*print_elem)(void *)) {
+    bool in_ = cap <= XS_INLINE_ELEMS;
+    xs_arr_ref *a = in_ ? xs_obj_alloc(sizeof *a + XS_INLINE_ELEMS * sizeof(void *), xs_arr_ref_free, xs_print_xs_arr_ref)
+                        : xs_obj_alloc(sizeof *a, xs_arr_ref_free, xs_print_xs_arr_ref);
+    a->cap = in_ ? XS_INLINE_ELEMS : cap;
+    a->data = in_ ? (void **)(a + 1) : malloc(a->cap * sizeof(void *));
+    if (!a->data) xs_panic("out of memory");
+    a->print_elem = print_elem;
+    return a;
+}
+XS_AI void **xs_at_ref_s(xs_arr_ref *a, int64_t i, const xs_site *s) {
+    if ((uint64_t)i >= a->len) XS_FAIL("array index out of bounds", s);
+    return &a->data[i];
+}
+static inline void **xs_at_ref(xs_arr_ref *a, int64_t i) { return xs_at_ref_s(a, i, NULL); }
+/* takes an owned reference; the growth is out of line, the common case (room left) a store and an add */
+XS_NOINLINE void xs_arr_ref_grow(xs_arr_ref *a) {
+    {
+        a->cap *= 2;
+        if (a->hdr.type == &xs_arr_ref_rtype) { /* in a region: the old storage goes with it */
+            void **d = xs_region_bytes_cur(a->cap * sizeof(void *));
+            memcpy(d, a->data, a->len * sizeof(void *));
+            a->data = d;
+        } else if ((void *)a->data == (void *)(a + 1)) {
+            void **d = malloc(a->cap * sizeof(void *));
+            if (!d) xs_panic("out of memory");
+            memcpy(d, a->data, a->len * sizeof(void *));
+            a->data = d;
+        } else {
+            a->data = realloc(a->data, a->cap * sizeof(void *));
+            if (!a->data) xs_panic("out of memory");
+        }
+    }
+}
+static inline __attribute__((always_inline)) int64_t xs_arr_ref_push(xs_arr_ref *a, void *v) {
+    if (__builtin_expect(a->len == a->cap, 0)) xs_arr_ref_grow(a);
+    a->data[a->len++] = v;
+    return (int64_t)a->len;
+}
+/* returns an owned reference */
+XS_NOINLINE void *xs_arr_ref_pop(xs_arr_ref *a) {
+    if (a->len == 0) xs_panic("pop from an empty array");
+    return a->data[--a->len];
+}
+/* takes an owned reference */
+XS_NOINLINE int64_t xs_arr_ref_unshift(xs_arr_ref *a, void *v) {
+    xs_arr_ref_push(a, v);
+    memmove(a->data + 1, a->data, (a->len - 1) * sizeof(void *));
+    a->data[0] = v;
+    return (int64_t)a->len;
+}
+/* returns an owned reference */
+XS_NOINLINE void *xs_arr_ref_shift(xs_arr_ref *a) {
+    if (a->len == 0) xs_panic("shift from an empty array");
+    void *v = a->data[0];
+    memmove(a->data, a->data + 1, (a->len - 1) * sizeof(void *));
+    a->len--;
+    return v;
+}
+XS_NOINLINE void xs_arr_ref_splice1(xs_arr_ref *a, int64_t i) {
+    if ((uint64_t)i >= a->len) xs_panic("splice index out of bounds");
+    void *old = a->data[i];
+    memmove(a->data + i, a->data + i + 1, (a->len - (size_t)i - 1) * sizeof(void *));
+    a->len--;
+    xs_release_(old);
+}
+static void xs_print_str_quoted(xs_str *s);
+static void xs_print_str_quoted_(void *p) { xs_print_str_quoted(p); }
+
+static xs_arr_ref *xs_str_split(xs_str *s, xs_str *sep) {
+    xs_arr_ref *a = xs_arr_ref_new(8, xs_print_str_quoted_);
+    if (sep->len == 0) { /* one element per code point */
+        for (int64_t i = 0; i < s->len;) {
+            int64_t j = i + 1;
+            while (j < s->len && (s->data[j] & 0xC0) == 0x80) j++;
+            xs_arr_ref_push(a, xs_str_new(s->data + i, (size_t)(j - i)));
+            i = j;
+        }
+        return a;
+    }
+    const char *p = s->data, *end = s->data + s->len;
+    for (;;) {
+        const char *hit = xs_find(p, (size_t)(end - p), sep->data, (size_t)sep->len);
+        if (!hit) { xs_arr_ref_push(a, xs_str_new(p, (size_t)(end - p))); break; }
+        xs_arr_ref_push(a, xs_str_new(p, (size_t)(hit - p)));
+        p = hit + sep->len;
+    }
+    return a;
+}
+static void xs_print_obj(void *p);
+#include <stdarg.h>
+static xs_arr_ref *xs_arr_ref_lit(void (*print_elem)(void *), int n, ...) { /* takes owned references */
+    xs_arr_ref *a = xs_arr_ref_new((size_t)n, print_elem);
+    va_list ap;
+    va_start(ap, n);
+    for (int i = 0; i < n; i++) xs_arr_ref_push(a, va_arg(ap, void *));
+    va_end(ap);
+    return a;
+}
+XS_NOINLINE xs_arr_ref *xs_arr_ref_fill(xs_arr_ref *a, int64_t n, void *v) { /* v is borrowed */
+    if (n < 0 || n > ((int64_t)1 << 40)) xs_panic("invalid array length");
+    for (int64_t i = 0; i < n; i++) xs_arr_ref_push(a, xs_retain_(v));
+    return a;
+}
+static inline double xs_to_number_id(double x) { return x; }
+
+/* ---- Error ---- */
+
+typedef struct xs_Error { xs_hdr hdr; xs_str *f_message; xs_str *f_name; void *f_cause; xs_trace *trace; xs_str *stack; } xs_Error;
+static void xs_Error_free(void *p) {
+    xs_Error *e = p;
+    xs_release(e->f_message); xs_release(e->f_name); xs_release(e->stack); xs_release(e->f_cause);
+    free(e->trace);
+    xs_obj_free(p);
+}
+static void xs_Error_print(void *p) { fputs("Error: ", XS_OUT); xs_print_str(((xs_Error *)p)->f_message); }
+__attribute__((noinline)) static void *xs_Error_new(void *msg) {
+    xs_Error *e = xs_obj_alloc(sizeof *e, xs_Error_free, xs_Error_print);
+    if (msg) e->f_message = xs_retain((xs_str *)msg);
+    else if (xs_panic_pending) e->f_message = xs_str_new(xs_panic_msg_pending, strlen(xs_panic_msg_pending));
+    else e->f_message = xs_str_new("", 0);
+    e->f_name = xs_str_new("Error", 5);
+    /* like V8, the stack is captured where the Error is created; it is turned into text only if read */
+    xs_trace t, *src = &t;
+    if (xs_panic_pending) { src = &xs_panic_trace; xs_panic_pending = false; }
+    else xs_trace_capture(&t, NULL);
+    size_t sz = offsetof(xs_trace, ra) + (size_t)src->n * sizeof(uintptr_t);
+    if ((e->trace = malloc(sz))) memcpy(e->trace, src, sz);
+    return e;
+}
+/* an Error from a C message (native packages): the Error is the message's only owner (xs_Error_new retains) */
+XS_NOINLINE void *xs_Error_from(const char *msg) {
+    xs_str *s = xs_str_new(msg, strlen(msg));
+    void *e = xs_Error_new(s);
+    xs_release(s);
+    return e;
+}
+/* throw obj (not an Error): an Error named after the class, with the object as its cause */
+XS_NOINLINE void *xs_Error_wrap(xs_str *name, void *cause) {
+    xs_Error *e = xs_Error_new(name);
+    e->f_cause = xs_retain(cause); /* the argument is borrowed */
+    return e;
+}
+static inline bool xs_is_a(void *v, void (*free_fn)(void *)) { return v && free_fn && ((xs_hdr *)v)->type->free == free_fn; }
+/* e.stack: "Error: message" and one "    at ..." line per frame, as in Node; borrowed from the Error */
+static xs_str *xs_Error_stack(xs_Error *e) {
+    if (!e->stack) {
+        char buf[4096];
+        int n = snprintf(buf, sizeof buf, "%s: %s\n", e->f_name->data, e->f_message->data);
+        size_t len = n < 0 ? 0 : (size_t)n < sizeof buf ? (size_t)n : sizeof buf - 1;
+        if (e->trace) len += xs_trace_format(e->trace, buf + len, sizeof buf - len);
+        if (len && buf[len - 1] == '\n') len--;
+        e->stack = xs_str_new(buf, len);
+    }
+    return e->stack;
+}
+/* takes an owned Error */
+static void xs_throw(void *err) {
+#ifdef XS_DEBUG
+    xs_dbg_exception(((xs_Error *)err)->f_name->data, ((xs_Error *)err)->f_message->data, xs_try_depth > 0);
+#endif
+    if (xs_try_depth > 0) {
+        xs_release(xs_thrown);
+        xs_thrown = err;
+        --xs_try_depth;
+        xs_cln_unwind((size_t)(uintptr_t)xs_try_stack[2 * xs_try_depth + 1]);
+        _longjmp(*xs_try_stack[2 * xs_try_depth], 1);
+    }
+    xs_Error *e = err;
+    if (xs_recover) { /* inside an HTTP handler: becomes an error response */
+        static XS_TLS char buf[512];
+        snprintf(buf, sizeof buf, "%s", e->f_message->data);
+        xs_recover_client = false; /* a thrown Error is the program's, whatever its message says */
+        if (e->trace) memcpy(&xs_recover_trace, e->trace, offsetof(xs_trace, ra) + (size_t)e->trace->n * sizeof(uintptr_t));
+        else xs_recover_trace.n = 0, xs_recover_trace.top = NULL;
+        xs_release(err);
+        xs_recover_msg = buf;
+        xs_cln_unwind(xs_recover_cln);
+        _longjmp(*xs_recover, 1);
+    }
+    fflush(stdout);
+    fprintf(stderr, "uncaught Error: %s\n", e->f_message->data);
+    if (e->trace) xs_trace_print(e->trace, stderr);
+    if (!xs_never) exit(1);
+}
+
+/* x % y on numbers: fmod, but whole numbers below 2^53 (counters, an LCG like fasta's) take the integer
+   remainder, exact for them and much cheaper than the libm call. The sign is the dividend's, -0 included */
+static inline __attribute__((always_inline)) double xs_fmod(double x, double y) {
+    if (__builtin_expect(fabs(x) < 9007199254740992.0 && fabs(y) < 9007199254740992.0 && y != 0 &&
+                         x == (double)(int64_t)x && y == (double)(int64_t)y, 1)) {
+        int64_t r = (int64_t)x % (int64_t)y;
+        return r == 0 ? (signbit(x) ? -0.0 : 0.0) : (double)r;
+    }
+    return fmod(x, y);
+}
+
+/* ---- Map and Set: open addressing, string or int keys, values of any kind ---- */
+
+typedef union { double d; int64_t i; void *p; } xs_val;
+#define XS_VNUM(x) ((xs_val){.d = (x)})
+#define XS_VINT(x) ((xs_val){.i = (x)})
+#define XS_VBOOL(x) ((xs_val){.i = (x) ? 1 : 0})
+#define XS_VPTR(x) ((xs_val){.p = (x)})
+
+typedef struct { xs_str *skey; int64_t ikey; xs_val val; uint64_t hash; uint8_t state; } xs_map_entry; /* state: 0 empty, 1 used, 2 deleted */
+typedef struct xs_map {
+    xs_hdr hdr;
+    xs_map_entry *entries;
+    size_t *order;        /* entry indices in insertion order (JS iteration order); stale slots are skipped */
+    size_t norder, order_cap;
+    size_t cap, count, used;
+    bool is_map, str_keys;
+    int val_kind; /* 0 num, 1 int, 2 bool, 3 heap pointer */
+    void (*print_key)(void *);
+    void (*print_val)(void *);
+    xs_str *lk;   /* the last string key hashed, held, and its hash: has(k), get(k), set(k, ...) in a row hash once */
+    uint64_t lh;
+    size_t lidx;  /* + 1: where lk was found (its entry, or the empty slot it would take); 0 after a grow, delete
+                     or clear, which can move or empty slots */
+} xs_map;
+
+static uint64_t xs_hash_bytes(const char *p, size_t n) { /* 8 bytes a step, then mixed (splitmix64's constants) */
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ (uint64_t)n;
+    while (n >= 8) {
+        uint64_t w;
+        memcpy(&w, p, 8);
+        h = (h ^ w) * 0xbf58476d1ce4e5b9ull;
+        h ^= h >> 31;
+        p += 8;
+        n -= 8;
+    }
+    if (n) {
+        uint64_t w = 0;
+        memcpy(&w, p, n);
+        h = (h ^ w) * 0x94d049bb133111ebull;
+        h ^= h >> 29;
+    }
+    h ^= h >> 32;
+    h *= 0xd6e8feb86659fd93ull;
+    h ^= h >> 32;
+    return h | 1;
+}
+static uint64_t xs_hash_int(int64_t v) {
+    uint64_t h = (uint64_t)v * 11400714819323198485ull;
+    return (h ^ (h >> 29)) | 1;
+}
+
+static void xs_map_free(void *p) {
+    xs_map *m = p;
+    for (size_t i = 0; i < m->cap; i++) {
+        if (m->entries[i].state != 1) continue;
+        if (m->str_keys) xs_release_(m->entries[i].skey);
+        if (m->val_kind == 3) xs_release_(m->entries[i].val.p);
+    }
+    if (m->lk) xs_release_(m->lk);
+    free(m->entries);
+    free(m->order);
+    xs_obj_free(p);
+}
+
+static void xs_print_num(double v);
+static void xs_print_int(int64_t v);
+static void xs_print_bool(bool b);
+static void xs_print_num_v(void *p) { xs_print_num(*(double *)p); }
+static void xs_print_int_v(void *p) { xs_print_int(*(int64_t *)p); }
+static void xs_print_bool_v(void *p) { xs_print_bool(*(int64_t *)p != 0); }
+
+/* Node style: Map(2) { 'a' => 1, 'b' => 2 }  Set(2) { 1, 2 } */
+static void xs_print_map(void *p) {
+    xs_map *m = p;
+    xs_insp fr;
+    if (!xs_insp_begin(&fr, p, m->is_map ? "Map" : "Set", m->count ? NULL : m->is_map ? "Map(0) {}" : "Set(0) {}")) return;
+    size_t shown = 0;
+    for (size_t oi = 0; oi < m->norder; oi++) {
+        xs_map_entry *e = &m->entries[m->order[oi]];
+        if (e->state != 1) continue;
+        xs_insp_entry(&fr);
+        if (shown++ == 100) { fprintf(XS_OUT, "... %zu more item%s", m->count - 100, m->count - 100 == 1 ? "" : "s"); break; }
+        if (m->str_keys) m->print_key(e->skey); else m->print_key(&e->ikey);
+        if (m->is_map) {
+            fputs(" => ", XS_OUT);
+            if (m->val_kind == 3) { if (e->val.p) m->print_val(e->val.p); else fputs("null", XS_OUT); }
+            else m->print_val(&e->val);
+        }
+    }
+    char open[48];
+    snprintf(open, sizeof open, "%s(%zu) {", m->is_map ? "Map" : "Set", m->count);
+    xs_insp_end(&fr, open, "}", false, false, m->count > 100);
+}
+
+static xs_map *xs_map_new(int is_map, int str_keys, int val_kind, void (*print_key)(void *), void (*print_val)(void *)) {
+    xs_map *m = xs_obj_alloc(sizeof *m, xs_map_free, xs_print_map);
+    m->is_map = is_map != 0;
+    m->str_keys = str_keys != 0;
+    m->val_kind = val_kind;
+    m->print_key = print_key;
+    m->print_val = print_val;
+    m->lk = NULL;
+    m->lidx = 0;
+    m->cap = 16;
+    m->entries = calloc(m->cap, sizeof(xs_map_entry));
+    if (!m->entries) xs_panic("out of memory");
+    return m;
+}
+
+/* Tombstones are never reused (they would break insertion order); growth rehashes them away. */
+static xs_map_entry *xs_map_find(xs_map *m, xs_str *skey, int64_t ikey, uint64_t hash) {
+    size_t i = (size_t)hash & (m->cap - 1);
+    for (;;) {
+        xs_map_entry *e = &m->entries[i];
+        if (e->state == 0) return e;
+        if (e->state == 1 && e->hash == hash && (m->str_keys ? xs_str_eq(e->skey, skey) : e->ikey == ikey)) return e;
+        i = (i + 1) & (m->cap - 1);
+    }
+}
+
+static void xs_map_order_push(xs_map *m, size_t idx) {
+    if (m->norder == m->order_cap) {
+        m->order_cap = m->order_cap ? m->order_cap * 2 : 16;
+        m->order = realloc(m->order, m->order_cap * sizeof(size_t));
+        if (!m->order) xs_panic("out of memory");
+    }
+    m->order[m->norder++] = idx;
+}
+
+static void xs_map_grow(xs_map *m) {
+    m->lidx = 0;
+    xs_map_entry *old = m->entries;
+    size_t *old_order = m->order;
+    size_t old_norder = m->norder;
+    if (m->count * 2 > m->cap) m->cap *= 2; /* otherwise just clean tombstones */
+    m->entries = calloc(m->cap, sizeof(xs_map_entry));
+    if (!m->entries) xs_panic("out of memory");
+    m->used = 0;
+    m->order = NULL;
+    m->norder = m->order_cap = 0;
+    for (size_t oi = 0; oi < old_norder; oi++) { /* reinsert in insertion order */
+        xs_map_entry *o = &old[old_order[oi]];
+        if (o->state != 1) continue;
+        xs_map_entry *e = xs_map_find(m, o->skey, o->ikey, o->hash);
+        *e = *o;
+        m->used++;
+        xs_map_order_push(m, (size_t)(e - m->entries));
+    }
+    free(old);
+    free(old_order);
+}
+
+static uint64_t xs_map_hash_s(xs_map *m, xs_str *k) {
+    if (k == m->lk) return m->lh;
+    uint64_t h = xs_hash_bytes(k->data, (size_t)k->len);
+    if (!(k->hdr.cls & XS_STACK)) { /* (a string in a frame cannot be held past it) */
+        if (m->lk) xs_release_(m->lk);
+        m->lk = xs_retain(k);
+        m->lh = h;
+        m->lidx = 0;
+    }
+    return h;
+}
+/* xs_map_find for a string key, through the cached slot of the last key */
+static xs_map_entry *xs_map_find_s(xs_map *m, xs_str *k, uint64_t h) {
+    if (k == m->lk && m->lidx) return &m->entries[m->lidx - 1];
+    xs_map_entry *e = xs_map_find(m, k, 0, h);
+    if (k == m->lk) m->lidx = (size_t)(e - m->entries) + 1;
+    return e;
+}
+/* value is owned when val_kind == 3 */
+static xs_map *xs_map_put(xs_map *m, xs_str *skey, int64_t ikey, xs_val val) {
+    if ((m->used + 1) * 10 > m->cap * 7) xs_map_grow(m);
+    uint64_t h = m->str_keys ? xs_map_hash_s(m, skey) : xs_hash_int(ikey);
+    xs_map_entry *e = m->str_keys ? xs_map_find_s(m, skey, h) : xs_map_find(m, skey, ikey, h);
+    if (e->state == 1) {
+        if (m->val_kind == 3) xs_release_(e->val.p);
+        e->val = val;
+        return m;
+    }
+    m->used++;
+    e->state = 1;
+    e->hash = h;
+    xs_map_order_push(m, (size_t)(e - m->entries));
+    e->skey = m->str_keys ? xs_retain(skey) : NULL;
+    e->ikey = ikey;
+    e->val = val;
+    m->count++;
+    return m;
+}
+static xs_map *xs_map_set_s(xs_map *m, xs_str *k, xs_val v) { return xs_map_put(m, k, 0, v); }
+static xs_map *xs_map_set_i(xs_map *m, int64_t k, xs_val v) { return xs_map_put(m, NULL, k, v); }
+
+static xs_map_entry *xs_map_lookup(xs_map *m, xs_str *skey, int64_t ikey) {
+    uint64_t h = m->str_keys ? xs_map_hash_s(m, skey) : xs_hash_int(ikey);
+    xs_map_entry *e = m->str_keys ? xs_map_find_s(m, skey, h) : xs_map_find(m, skey, ikey, h);
+    return e->state == 1 ? e : NULL;
+}
+static bool xs_map_has_s(xs_map *m, xs_str *k) { return xs_map_lookup(m, k, 0) != NULL; }
+static bool xs_map_has_i(xs_map *m, int64_t k) { return xs_map_lookup(m, NULL, k) != NULL; }
+static bool xs_map_delete_at(xs_map *m, xs_map_entry *e) {
+    if (!e) return false;
+    m->lidx = 0;
+    if (m->str_keys) xs_release_(e->skey);
+    if (m->val_kind == 3) xs_release_(e->val.p);
+    e->state = 2;
+    m->count--;
+    return true;
+}
+static bool xs_map_delete_s(xs_map *m, xs_str *k) { return xs_map_delete_at(m, xs_map_lookup(m, k, 0)); }
+static bool xs_map_delete_i(xs_map *m, int64_t k) { return xs_map_delete_at(m, xs_map_lookup(m, NULL, k)); }
+static void xs_map_clear(xs_map *m) {
+    m->lidx = 0;
+    for (size_t i = 0; i < m->cap; i++) if (m->entries[i].state == 1) xs_map_delete_at(m, &m->entries[i]);
+    memset(m->entries, 0, m->cap * sizeof(xs_map_entry));
+    m->used = 0;
+    m->norder = 0;
+}
+XS_NOINLINE xs_val xs_map_need(xs_map *m, xs_str *skey, int64_t ikey) {
+    xs_map_entry *e = xs_map_lookup(m, skey, ikey);
+    if (!e) xs_panic("Map.get: key not found (check with has() first)");
+    return e->val;
+}
+XS_NOINLINE double xs_map_get_num_s(xs_map *m, xs_str *k) { return xs_map_need(m, k, 0).d; }
+XS_NOINLINE double xs_map_get_num_i(xs_map *m, int64_t k) { return xs_map_need(m, NULL, k).d; }
+XS_NOINLINE int64_t xs_map_get_int_s(xs_map *m, xs_str *k) { return xs_map_need(m, k, 0).i; }
+XS_NOINLINE int64_t xs_map_get_int_i(xs_map *m, int64_t k) { return xs_map_need(m, NULL, k).i; }
+XS_NOINLINE bool xs_map_get_bool_s(xs_map *m, xs_str *k) { return xs_map_need(m, k, 0).i != 0; }
+XS_NOINLINE bool xs_map_get_bool_i(xs_map *m, int64_t k) { return xs_map_need(m, NULL, k).i != 0; }
+static void *xs_map_get_ptr_s(xs_map *m, xs_str *k) { xs_map_entry *e = xs_map_lookup(m, k, 0); return e ? e->val.p : NULL; }
+static void *xs_map_get_ptr_i(xs_map *m, int64_t k) { xs_map_entry *e = xs_map_lookup(m, NULL, k); return e ? e->val.p : NULL; }
+
+/* keys() / values() as new arrays, in insertion-independent (table) order */
+static void *xs_map_keys(xs_map *m, void (*print_elem)(void *)) {
+    if (m->str_keys) {
+        xs_arr_ref *a = xs_arr_ref_new(m->count, print_elem ? print_elem : xs_print_str_quoted_);
+        for (size_t oi = 0; oi < m->norder; oi++) if (m->entries[m->order[oi]].state == 1) xs_arr_ref_push(a, xs_retain(m->entries[m->order[oi]].skey));
+        return a;
+    }
+    xs_arr_int *a = xs_arr_int_new(0, 0);
+    for (size_t oi = 0; oi < m->norder; oi++) if (m->entries[m->order[oi]].state == 1) xs_arr_int_push(a, m->entries[m->order[oi]].ikey);
+    return a;
+}
+#define XS_MAP_EACH(m, e) for (size_t oi_ = 0; oi_ < (m)->norder; oi_++) if ((e = &(m)->entries[(m)->order[oi_]])->state == 1)
+static void *xs_map_values(xs_map *m, void (*print_elem)(void *)) {
+    xs_map_entry *e;
+    switch (m->val_kind) {
+    case 0: { xs_arr_num *a = xs_arr_num_new(0, 0); XS_MAP_EACH(m, e) xs_arr_num_push(a, e->val.d); return a; }
+    case 1: { xs_arr_int *a = xs_arr_int_new(0, 0); XS_MAP_EACH(m, e) xs_arr_int_push(a, e->val.i); return a; }
+    case 2: { xs_arr_bool *a = xs_arr_bool_new(0, false); XS_MAP_EACH(m, e) xs_arr_bool_push(a, e->val.i != 0); return a; }
+    default: { xs_arr_ref *a = xs_arr_ref_new(m->count, print_elem); XS_MAP_EACH(m, e) xs_arr_ref_push(a, xs_retain_(e->val.p)); return a; }
+    }
+}
+
+typedef struct { char *data; size_t len, cap; } xs_sb;
+static void xs_sb_put(xs_sb *b, const char *s, size_t n);
+static void xs_sb_puts(xs_sb *b, const char *s);
+static void xs_sb_int(xs_sb *b, int64_t v);
+static void xs_sb_bool(xs_sb *b, bool v);
+static xs_str *xs_sb_finish(xs_sb *b);
+static void xs_num_to_str(double v, char *out);
+
+/* ---- closures: a refcounted object whose first field after the header is the code pointer; captures follow ---- */
+
+typedef struct xs_closure { xs_hdr hdr; void *fn; } xs_closure;
+
+/* ---- unknown: any value by reference. Primitives are boxed; `x as T` checks the object's type (its free
+   function is unique per type) and fails with a TypeError, like a bad cast in a checked language. ---- */
+typedef struct { xs_hdr hdr; int64_t v; } xs_box_i;
+typedef struct { xs_hdr hdr; double v; } xs_box_d;
+static void xs_box_int_print(void *p) { xs_print_int(((xs_box_i *)p)->v); }
+static void xs_box_num_print(void *p) { xs_print_num(((xs_box_d *)p)->v); }
+static void xs_box_bool_print(void *p) { fputs(((xs_box_i *)p)->v ? "true" : "false", XS_OUT); }
+static void xs_box_int_free(void *p) { xs_obj_free(p); }
+static void xs_box_num_free(void *p) { xs_obj_free(p); }
+static void xs_box_bool_free(void *p) { xs_obj_free(p); }
+static void *xs_box_int(int64_t v) { xs_box_i *b = xs_obj_alloc(sizeof *b, xs_box_int_free, xs_box_int_print); b->v = v; return b; }
+static void *xs_box_num(double v) { xs_box_d *b = xs_obj_alloc(sizeof *b, xs_box_num_free, xs_box_num_print); b->v = v; return b; }
+static void *xs_box_bool(bool v) { xs_box_i *b = xs_obj_alloc(sizeof *b, xs_box_bool_free, xs_box_bool_print); b->v = v; return b; }
+static void *xs_box_int_or_null(int64_t v) { return v == XS_NULL_INT ? NULL : xs_box_int(v); }
+static void *xs_box_num_or_null(double v) { return xs_isnull_num(v) ? NULL : xs_box_num(v); }
+static void *xs_box_bool_or_null(int8_t v) { return v == XS_NULL_BOOL ? NULL : xs_box_bool(v != 0); }
+static void xs_print_closure(void *p);
+XS_NOINLINE void xs_as_fail(const char *what) {
+    static XS_TLS char buf[160];
+    snprintf(buf, sizeof buf, "TypeError: the value is not %s", what);
+    xs_panic(buf);
+}
+XS_NOINLINE void *xs_as_ref(void *v, void (*free_fn)(void *), int nullable, const char *what) {
+    if (!v) { if (nullable) return NULL; xs_as_fail(what); }
+    if (((xs_hdr *)v)->type->free != free_fn) xs_as_fail(what);
+    return v;
+}
+/* x.toFixed(d) as JavaScript: the exact decimal value of the double rounded half up in magnitude (printf would
+   round an exact tie to even), "-" when x < 0, String(x) from 1e21 on */
+static xs_str *xs_str_from_num(double v);
+XS_NOINLINE xs_str *xs_num_to_fixed(double x, int64_t d) {
+    if (d < 0 || d > 100) xs_panic("RangeError: toFixed() digits argument must be between 0 and 100");
+    if (isnan(x)) return xs_str_new("NaN", 3);
+    if (fabs(x) >= 1e21) return xs_str_from_num(x);
+    static XS_TLS char exact[1200];
+    snprintf(exact, sizeof exact, "%.1100f", fabs(x)); /* every digit of the double, exactly */
+    char *dot = strchr(exact, '.');
+    size_t ilen = (size_t)(dot - exact);
+    char out[1300];
+    size_t n = 0;
+    if (x < 0) out[n++] = '-';
+    size_t start = n;
+    memcpy(out + n, exact, ilen);
+    n += ilen;
+    for (int64_t i = 0; i < d; i++) out[n++] = dot[1 + i];
+    if (dot[1 + d] >= '5') { /* round up the magnitude, carrying left */
+        size_t k = n;
+        while (k > start) {
+            k--;
+            if (out[k] == '9') { out[k] = '0'; continue; }
+            out[k]++;
+            break;
+        }
+        if (k == start && out[start] == '0') { memmove(out + start + 1, out + start, n - start); out[start] = '1'; n++; }
+    }
+    if (d > 0) { memmove(out + n - d + 1, out + n - d, (size_t)d); out[n - d] = '.'; n++; }
+    return xs_str_new(out, n);
+}
+XS_NOINLINE xs_str *xs_int_to_fixed(int64_t v, int64_t d) { return xs_num_to_fixed((double)v, d); }
+/* base as Sub: the object's class is Sub or one of its subclasses (isa is generated per class) */
+XS_NOINLINE void *xs_as_isa(void *v, bool (*isa)(void *), int nullable, const char *what) {
+    if (!v) { if (nullable) return NULL; xs_as_fail(what); }
+    if (!isa(v)) xs_as_fail(what);
+    return v;
+}
+XS_NOINLINE void *xs_as_closure(void *v, int nullable) {
+    if (!v) { if (nullable) return NULL; xs_as_fail("a function"); }
+    if (((xs_hdr *)v)->type->print != xs_print_closure) xs_as_fail("a function");
+    return v;
+}
+XS_NOINLINE int64_t xs_as_int(void *v) { if (!v || ((xs_hdr *)v)->type->free != xs_box_int_free) xs_as_fail("int"); return ((xs_box_i *)v)->v; }
+XS_NOINLINE double xs_as_num(void *v) {
+    if (v && ((xs_hdr *)v)->type->free == xs_box_int_free) return (double)((xs_box_i *)v)->v; /* an int is a number */
+    if (!v || ((xs_hdr *)v)->type->free != xs_box_num_free) xs_as_fail("number");
+    return ((xs_box_d *)v)->v;
+}
+XS_NOINLINE bool xs_as_bool(void *v) { if (!v || ((xs_hdr *)v)->type->free != xs_box_bool_free) xs_as_fail("boolean"); return ((xs_box_i *)v)->v != 0; }
+XS_NOINLINE int64_t xs_as_int_or_null(void *v) { return v ? xs_as_int(v) : XS_NULL_INT; }
+XS_NOINLINE double xs_as_num_or_null(void *v) { return v ? xs_as_num(v) : xs_null_num(); }
+XS_NOINLINE int8_t xs_as_bool_or_null(void *v) { return v ? (int8_t)xs_as_bool(v) : XS_NULL_BOOL; }
+/* typeof: immortal strings, so the result needs no release */
+static xs_str *xs_typeof_lit(const char *s) {
+    static xs_str *made[6];
+    static const char *names[6] = {"string", "number", "boolean", "object", "function", "undefined"};
+    for (int i = 0; i < 6; i++)
+        if (strcmp(s, names[i]) == 0) {
+            if (!made[i]) made[i] = xs_str_immortal(names[i], strlen(names[i]));
+            return made[i];
+        }
+    return xs_typeof_lit("object");
+}
+static void xs_print_closure(void *p);
+XS_NOINLINE xs_str *xs_typeof(void *v) {
+    if (!v) return xs_typeof_lit("object"); /* typeof null */
+    void (*f)(void *) = ((xs_hdr *)v)->type->free;
+    if (f == xs_str_free) return xs_typeof_lit("string");
+    if (f == xs_box_int_free || f == xs_box_num_free) return xs_typeof_lit("number");
+    if (f == xs_box_bool_free) return xs_typeof_lit("boolean");
+    if (((xs_hdr *)v)->type->print == xs_print_closure) return xs_typeof_lit("function");
+    return xs_typeof_lit("object");
+}
+static void xs_print_closure(void *p) { (void)p; fputs("[Function]", XS_OUT); }
+/* immortal closures of top-level functions used as values (static, never freed) */
+static const xs_type xs_immortal_closure_type = {NULL, xs_print_closure};
+
+/* ---- array methods driven by callbacks: one instance per element kind ---- */
+
+#define XS_ARR_CALLBACKS(name, T, PUSH_OWNED)                                                              \
+    XS_NOINLINE void xs_arr_forEach_##name(name *a, xs_closure *cl, int arity) {                                \
+        for (size_t i = 0; i < a->len; i++) {                                                             \
+            if (arity == 2) ((void (*)(void *, T, int64_t))cl->fn)(cl, a->data[i], (int64_t)i);           \
+            else ((void (*)(void *, T))cl->fn)(cl, a->data[i]);                                           \
+        }                                                                                                 \
+    }                                                                                                     \
+    XS_NOINLINE bool xs_arr_test_##name(xs_closure *cl, int arity, T v, size_t i) {                             \
+        return arity == 2 ? ((bool (*)(void *, T, int64_t))cl->fn)(cl, v, (int64_t)i) : ((bool (*)(void *, T))cl->fn)(cl, v); \
+    }                                                                                                     \
+    XS_NOINLINE name *xs_arr_filter_##name(name *a, xs_closure *cl, int arity) {                                \
+        name *r = name##_new(0, 0);                                                                       \
+        for (size_t i = 0; i < a->len; i++) if (xs_arr_test_##name(cl, arity, a->data[i], i)) name##_push(r, PUSH_OWNED(a->data[i])); \
+        return r;                                                                                         \
+    }                                                                                                     \
+    XS_NOINLINE int64_t xs_arr_findIndex_##name(name *a, xs_closure *cl, int arity) {                           \
+        for (size_t i = 0; i < a->len; i++) if (xs_arr_test_##name(cl, arity, a->data[i], i)) return (int64_t)i; \
+        return -1;                                                                                        \
+    }                                                                                                     \
+    XS_NOINLINE bool xs_arr_some_##name(name *a, xs_closure *cl, int arity) { return xs_arr_findIndex_##name(a, cl, arity) >= 0; } \
+    XS_NOINLINE bool xs_arr_every_##name(name *a, xs_closure *cl, int arity) {                                  \
+        for (size_t i = 0; i < a->len; i++) if (!xs_arr_test_##name(cl, arity, a->data[i], i)) return false; \
+        return true;                                                                                      \
+    }                                                                                                     \
+    XS_NOINLINE name *xs_arr_sort_##name(name *a, xs_closure *cl, int int_cmp) { /* stable merge sort */        \
+        if (a->len < 2) return a;                                                                         \
+        T *tmp = malloc(a->len * sizeof(T));                                                              \
+        for (size_t w = 1; w < a->len; w *= 2) {                                                          \
+            for (size_t lo = 0; lo < a->len; lo += 2 * w) {                                               \
+                size_t mid = lo + w < a->len ? lo + w : a->len, hi = lo + 2 * w < a->len ? lo + 2 * w : a->len; \
+                size_t i = lo, j = mid, k = lo;                                                           \
+                while (i < mid && j < hi) {                                                               \
+                    double c = int_cmp ? (double)((int64_t (*)(void *, T, T))cl->fn)(cl, a->data[i], a->data[j]) \
+                                       : ((double (*)(void *, T, T))cl->fn)(cl, a->data[i], a->data[j]);  \
+                    tmp[k++] = c <= 0 ? a->data[i++] : a->data[j++];                                       \
+                }                                                                                         \
+                while (i < mid) tmp[k++] = a->data[i++];                                                  \
+                while (j < hi) tmp[k++] = a->data[j++];                                                   \
+            }                                                                                             \
+            memcpy(a->data, tmp, a->len * sizeof(T));                                                     \
+        }                                                                                                 \
+        free(tmp);                                                                                        \
+        return a;                                                                                         \
+    }                                                                                                     \
+    static name *xs_arr_reverse_##name(name *a) {                                                          \
+        for (size_t i = 0, j = a->len ? a->len - 1 : 0; i < j; i++, j--) { T t = a->data[i]; a->data[i] = a->data[j]; a->data[j] = t; } \
+        return a;                                                                                         \
+    }                                                                                                     \
+    static name *xs_arr_slice_##name(name *a, int64_t start, int64_t end) {                                \
+        int64_t n = (int64_t)a->len;                                                                      \
+        if (start < 0) start += n; if (end < 0) end += n; if (start < 0) start = 0; if (end > n) end = n; \
+        name *r = name##_new(0, 0);                                                                       \
+        for (int64_t i = start; i < end; i++) name##_push(r, PUSH_OWNED(a->data[i]));                     \
+        return r;                                                                                         \
+    }
+
+#define XS_ID(x) (x)
+XS_ARR_CALLBACKS(xs_arr_num, double, XS_ID)
+XS_ARR_CALLBACKS(xs_arr_int, int64_t, XS_ID)
+XS_ARR_CALLBACKS(xs_arr_bool, bool, XS_ID)
+/* reference arrays: xs_arr_ref_new takes (cap, printer) and pushes take ownership */
+XS_NOINLINE void xs_arr_forEach_xs_arr_ref(xs_arr_ref *a, xs_closure *cl, int arity) {
+    for (size_t i = 0; i < a->len; i++) {
+        if (arity == 2) ((void (*)(void *, void *, int64_t))cl->fn)(cl, a->data[i], (int64_t)i);
+        else ((void (*)(void *, void *))cl->fn)(cl, a->data[i]);
+    }
+}
+XS_NOINLINE bool xs_arr_test_xs_arr_ref(xs_closure *cl, int arity, void *v, size_t i) {
+    return arity == 2 ? ((bool (*)(void *, void *, int64_t))cl->fn)(cl, v, (int64_t)i) : ((bool (*)(void *, void *))cl->fn)(cl, v);
+}
+XS_NOINLINE xs_arr_ref *xs_arr_filter_xs_arr_ref(xs_arr_ref *a, xs_closure *cl, int arity) {
+    xs_arr_ref *r = xs_arr_ref_new(a->len, a->print_elem);
+    for (size_t i = 0; i < a->len; i++) if (xs_arr_test_xs_arr_ref(cl, arity, a->data[i], i)) xs_arr_ref_push(r, xs_retain_(a->data[i]));
+    return r;
+}
+XS_NOINLINE int64_t xs_arr_findIndex_xs_arr_ref(xs_arr_ref *a, xs_closure *cl, int arity) {
+    for (size_t i = 0; i < a->len; i++) if (xs_arr_test_xs_arr_ref(cl, arity, a->data[i], i)) return (int64_t)i;
+    return -1;
+}
+XS_NOINLINE void *xs_arr_find_xs_arr_ref(xs_arr_ref *a, xs_closure *cl, int arity) { /* borrowed */
+    int64_t i = xs_arr_findIndex_xs_arr_ref(a, cl, arity);
+    return i < 0 ? NULL : a->data[i];
+}
+XS_NOINLINE bool xs_arr_some_xs_arr_ref(xs_arr_ref *a, xs_closure *cl, int arity) { return xs_arr_findIndex_xs_arr_ref(a, cl, arity) >= 0; }
+XS_NOINLINE bool xs_arr_every_xs_arr_ref(xs_arr_ref *a, xs_closure *cl, int arity) {
+    for (size_t i = 0; i < a->len; i++) if (!xs_arr_test_xs_arr_ref(cl, arity, a->data[i], i)) return false;
+    return true;
+}
+XS_NOINLINE xs_arr_ref *xs_arr_sort_xs_arr_ref(xs_arr_ref *a, xs_closure *cl, int int_cmp) {
+    if (a->len < 2) return a;
+    void **tmp = malloc(a->len * sizeof(void *));
+    for (size_t w = 1; w < a->len; w *= 2) {
+        for (size_t lo = 0; lo < a->len; lo += 2 * w) {
+            size_t mid = lo + w < a->len ? lo + w : a->len, hi = lo + 2 * w < a->len ? lo + 2 * w : a->len;
+            size_t i = lo, j = mid, k = lo;
+            while (i < mid && j < hi) {
+                double c = int_cmp ? (double)((int64_t (*)(void *, void *, void *))cl->fn)(cl, a->data[i], a->data[j])
+                                   : ((double (*)(void *, void *, void *))cl->fn)(cl, a->data[i], a->data[j]);
+                tmp[k++] = c <= 0 ? a->data[i++] : a->data[j++];
+            }
+            while (i < mid) tmp[k++] = a->data[i++];
+            while (j < hi) tmp[k++] = a->data[j++];
+        }
+        memcpy(a->data, tmp, a->len * sizeof(void *));
+    }
+    free(tmp);
+    return a;
+}
+static xs_arr_ref *xs_arr_reverse_xs_arr_ref(xs_arr_ref *a) {
+    for (size_t i = 0, j = a->len ? a->len - 1 : 0; i < j; i++, j--) { void *t = a->data[i]; a->data[i] = a->data[j]; a->data[j] = t; }
+    return a;
+}
+static xs_arr_ref *xs_arr_slice_xs_arr_ref(xs_arr_ref *a, int64_t start, int64_t end) {
+    int64_t n = (int64_t)a->len;
+    if (start < 0) start += n; if (end < 0) end += n; if (start < 0) start = 0; if (end > n) end = n;
+    xs_arr_ref *r = xs_arr_ref_new(end > start ? (size_t)(end - start) : 0, a->print_elem);
+    for (int64_t i = start; i < end; i++) xs_arr_ref_push(r, xs_retain_(a->data[i]));
+    return r;
+}
+#define xs_arr_forEach_num xs_arr_forEach_xs_arr_num
+#define xs_arr_forEach_int xs_arr_forEach_xs_arr_int
+#define xs_arr_forEach_bool xs_arr_forEach_xs_arr_bool
+#define xs_arr_forEach_ref xs_arr_forEach_xs_arr_ref
+#define xs_arr_filter_num xs_arr_filter_xs_arr_num
+#define xs_arr_filter_int xs_arr_filter_xs_arr_int
+#define xs_arr_filter_bool xs_arr_filter_xs_arr_bool
+#define xs_arr_filter_ref xs_arr_filter_xs_arr_ref
+#define xs_arr_findIndex_num xs_arr_findIndex_xs_arr_num
+#define xs_arr_findIndex_int xs_arr_findIndex_xs_arr_int
+#define xs_arr_findIndex_bool xs_arr_findIndex_xs_arr_bool
+#define xs_arr_findIndex_ref xs_arr_findIndex_xs_arr_ref
+#define xs_arr_find_ref xs_arr_find_xs_arr_ref
+#define xs_arr_some_num xs_arr_some_xs_arr_num
+#define xs_arr_some_int xs_arr_some_xs_arr_int
+#define xs_arr_some_bool xs_arr_some_xs_arr_bool
+#define xs_arr_some_ref xs_arr_some_xs_arr_ref
+#define xs_arr_every_num xs_arr_every_xs_arr_num
+#define xs_arr_every_int xs_arr_every_xs_arr_int
+#define xs_arr_every_bool xs_arr_every_xs_arr_bool
+#define xs_arr_every_ref xs_arr_every_xs_arr_ref
+#define xs_arr_sort_num xs_arr_sort_xs_arr_num
+#define xs_arr_sort_int xs_arr_sort_xs_arr_int
+#define xs_arr_sort_bool xs_arr_sort_xs_arr_bool
+#define xs_arr_sort_ref xs_arr_sort_xs_arr_ref
+#define xs_arr_reverse_num xs_arr_reverse_xs_arr_num
+#define xs_arr_reverse_int xs_arr_reverse_xs_arr_int
+#define xs_arr_reverse_bool xs_arr_reverse_xs_arr_bool
+#define xs_arr_reverse_ref xs_arr_reverse_xs_arr_ref
+#define xs_arr_slice_num xs_arr_slice_xs_arr_num
+#define xs_arr_slice_int xs_arr_slice_xs_arr_int
+#define xs_arr_slice_bool xs_arr_slice_xs_arr_bool
+#define xs_arr_slice_ref xs_arr_slice_xs_arr_ref
+
+/* map: from any kind to any kind */
+#define XS_ARR_MAP(from, FT, to, TT, NEW, PUSH, fsfx, tsfx)                                                \
+    XS_NOINLINE to *xs_arr_map_##fsfx##_##tsfx(from *a, xs_closure *cl, int arity, void (*pr)(void *)) {        \
+        to *r = NEW;                                                                                       \
+        for (size_t i = 0; i < a->len; i++) {                                                             \
+            TT v = arity == 2 ? ((TT (*)(void *, FT, int64_t))cl->fn)(cl, a->data[i], (int64_t)i) : ((TT (*)(void *, FT))cl->fn)(cl, a->data[i]); \
+            PUSH(r, v);                                                                                    \
+        }                                                                                                 \
+        (void)pr;                                                                                         \
+        return r;                                                                                         \
+    }
+#define XS_MAP_ALL_TO(from, FT, fsfx)                                                                      \
+    XS_ARR_MAP(from, FT, xs_arr_num, double, xs_arr_num_new(0, 0), xs_arr_num_push, fsfx, num)             \
+    XS_ARR_MAP(from, FT, xs_arr_int, int64_t, xs_arr_int_new(0, 0), xs_arr_int_push, fsfx, int)            \
+    XS_ARR_MAP(from, FT, xs_arr_bool, bool, xs_arr_bool_new(0, false), xs_arr_bool_push, fsfx, bool)       \
+    XS_ARR_MAP(from, FT, xs_arr_ref, void *, xs_arr_ref_new(a->len, pr), xs_arr_ref_push, fsfx, ref)
+XS_MAP_ALL_TO(xs_arr_num, double, num)
+XS_MAP_ALL_TO(xs_arr_int, int64_t, int)
+XS_MAP_ALL_TO(xs_arr_bool, bool, bool)
+XS_MAP_ALL_TO(xs_arr_ref, void *, ref)
+
+/* indexOf / join by value */
+static int64_t xs_arr_index_of_num(xs_arr_num *a, double v) { for (size_t i = 0; i < a->len; i++) if (a->data[i] == v) return (int64_t)i; return -1; }
+static int64_t xs_arr_index_of_int(xs_arr_int *a, int64_t v) { for (size_t i = 0; i < a->len; i++) if (a->data[i] == v) return (int64_t)i; return -1; }
+static int64_t xs_arr_index_of_bool(xs_arr_bool *a, bool v) { for (size_t i = 0; i < a->len; i++) if (a->data[i] == v) return (int64_t)i; return -1; }
+/* strings by content; in a (string | null)[] null matches null */
+static int64_t xs_arr_index_of_str(xs_arr_ref *a, xs_str *v) {
+    for (size_t i = 0; i < a->len; i++) {
+        xs_str *x = a->data[i];
+        if (x == v || (x && v && xs_str_eq(x, v))) return (int64_t)i;
+    }
+    return -1;
+}
+static xs_str *xs_arr_join_generic(size_t len, xs_str *sep, void (*item)(xs_sb *, void *, size_t), void *ctx) {
+    xs_sb b = {0};
+    for (size_t i = 0; i < len; i++) {
+        if (i) { if (sep) xs_sb_put(&b, sep->data, (size_t)sep->len); else xs_sb_put(&b, ",", 1); }
+        item(&b, ctx, i);
+    }
+    return xs_sb_finish(&b);
+}
+static void xs_join_num(xs_sb *b, void *ctx, size_t i) { char buf[32]; xs_num_to_str(((xs_arr_num *)ctx)->data[i], buf); if (((xs_arr_num *)ctx)->data[i] == 0) { buf[0] = '0'; buf[1] = 0; } xs_sb_puts(b, buf); }
+static void xs_join_int(xs_sb *b, void *ctx, size_t i) { xs_sb_int(b, ((xs_arr_int *)ctx)->data[i]); }
+static void xs_join_bool(xs_sb *b, void *ctx, size_t i) { xs_sb_bool(b, ((xs_arr_bool *)ctx)->data[i]); }
+static void xs_join_str(xs_sb *b, void *ctx, size_t i) { xs_str *s = ((xs_arr_ref *)ctx)->data[i]; if (s) xs_sb_put(b, s->data, (size_t)s->len); } /* null joins as "" */
+static xs_str *xs_arr_join_num(xs_arr_num *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_num, a); }
+static xs_str *xs_arr_join_int(xs_arr_int *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_int, a); }
+static xs_str *xs_arr_join_bool(xs_arr_bool *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_bool, a); }
+static xs_str *xs_arr_join_str(xs_arr_ref *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_str, a); }
+
+/* ---- int: 64-bit, overflow is a runtime error ---- */
+
+/* The _s forms take the source position of the operation (the compiler passes &xs_sitetab[n]); it is only
+   read on the error path. */
+XS_AI int64_t xs_iadd_s(int64_t a, int64_t b, const xs_site *s) { int64_t r; if (__builtin_add_overflow(a, b, &r)) XS_FAIL("integer overflow", s); return r; }
+XS_AI int64_t xs_isub_s(int64_t a, int64_t b, const xs_site *s) { int64_t r; if (__builtin_sub_overflow(a, b, &r)) XS_FAIL("integer overflow", s); return r; }
+XS_AI int64_t xs_imul_s(int64_t a, int64_t b, const xs_site *s) { int64_t r; if (__builtin_mul_overflow(a, b, &r)) XS_FAIL("integer overflow", s); return r; }
+XS_AI int64_t xs_ineg_s(int64_t a, const xs_site *s) { if (a == INT64_MIN) XS_FAIL("integer overflow", s); return -a; }
+XS_AI int64_t xs_imod_s(int64_t a, int64_t b, const xs_site *s) {
+    if (b == 0) XS_FAIL("integer modulo by zero", s);
+    if (b == -1) return 0;
+    return a % b;
+}
+XS_AI double xs_idiv_s(int64_t a, int64_t b, const xs_site *s) { (void)s; return (double)a / (double)b; }
+XS_AI int64_t xs_iadd_to_s(int64_t *p, int64_t b, const xs_site *s) { return *p = xs_iadd_s(*p, b, s); }
+XS_AI int64_t xs_isub_to_s(int64_t *p, int64_t b, const xs_site *s) { return *p = xs_isub_s(*p, b, s); }
+XS_AI int64_t xs_imul_to_s(int64_t *p, int64_t b, const xs_site *s) { return *p = xs_imul_s(*p, b, s); }
+XS_AI int64_t xs_ipostinc_s(int64_t *p, const xs_site *s) { int64_t old = *p; *p = xs_iadd_s(old, 1, s); return old; }
+XS_AI int64_t xs_ipostdec_s(int64_t *p, const xs_site *s) { int64_t old = *p; *p = xs_isub_s(old, 1, s); return old; }
+static inline int64_t xs_iadd(int64_t a, int64_t b) { return xs_iadd_s(a, b, NULL); }
+static inline int64_t xs_isub(int64_t a, int64_t b) { return xs_isub_s(a, b, NULL); }
+static inline int64_t xs_imul(int64_t a, int64_t b) { return xs_imul_s(a, b, NULL); }
+static inline int64_t xs_ineg(int64_t a) { return xs_ineg_s(a, NULL); }
+static inline int64_t xs_imod(int64_t a, int64_t b) { return xs_imod_s(a, b, NULL); }
+static inline double xs_idiv(int64_t a, int64_t b) { return (double)a / (double)b; } /* int / int is number, as in JS */
+static inline int64_t xs_iadd_to(int64_t *p, int64_t b) { return *p = xs_iadd(*p, b); }
+static inline int64_t xs_isub_to(int64_t *p, int64_t b) { return *p = xs_isub(*p, b); }
+static inline int64_t xs_imul_to(int64_t *p, int64_t b) { return *p = xs_imul(*p, b); }
+static inline int64_t xs_ipostinc(int64_t *p) { int64_t old = *p; *p = xs_iadd(old, 1); return old; }
+static inline int64_t xs_ipostdec(int64_t *p) { int64_t old = *p; *p = xs_isub(old, 1); return old; }
+static inline int64_t xs_iabs(int64_t a) { return a < 0 ? xs_ineg(a) : a; }
+static inline int64_t xs_imin(int64_t a, int64_t b) { return a < b ? a : b; }
+static inline int64_t xs_imax(int64_t a, int64_t b) { return a > b ? a : b; }
+static inline double xs_to_number(int64_t a) { return (double)a; }
+static bool xs_is_finite(double x) { return isfinite(x); }
+static inline bool xs_is_nan(double x) { return x != x; }
+static inline bool xs_is_integer(double x) { return x == x && !isinf(x) && x == floor(x); }
+/* Math.cbrt as V8 has it (FreeBSD's s_cbrt.c, fdlibm): glibc's cbrt is not correctly rounded (cbrt(27) is
+   3.0000000000000004 there), macOS's and V8's give 3. A polynomial to 23 bits, then one Newton step. */
+static double xs_cbrt(double x) {
+    union { double d; uint64_t u; } v = { x };
+    uint32_t hx = (uint32_t)(v.u >> 32), lo = (uint32_t)v.u, sign = hx & 0x80000000u;
+    hx &= 0x7fffffffu;
+    if (hx >= 0x7ff00000u) return x + x; /* NaN, Infinity */
+    union { double d; uint64_t u; } t;
+    if (hx < 0x00100000u) { /* zero or subnormal */
+        if ((hx | lo) == 0) return x;
+        t.u = (uint64_t)0x43500000u << 32; /* 2^54 */
+        t.d *= x;
+        uint32_t high = (uint32_t)(t.u >> 32);
+        t.u = (uint64_t)(sign | ((high & 0x7fffffffu) / 3 + 696219795u)) << 32;
+    } else {
+        t.u = (uint64_t)(sign | (hx / 3 + 715094163u)) << 32;
+    }
+    double r = (t.d * t.d) * (t.d / x);
+    t.d = t.d * ((1.87595182427177009643 + r * (-1.88497979543377169875 + r * 1.621429720105354466140)) +
+                 ((r * r) * r) * (-0.758397934778766047437 + r * 0.145996192886612446982));
+    t.u = (t.u + 0x80000000u) & 0xffffffffc0000000ull; /* rounded away from zero to 23 bits */
+    double s2 = t.d * t.d;
+    r = x / s2;
+    double w = t.d + t.d;
+    r = (r - t.d) / (w + r);
+    return t.d + t.d * r;
+}
+/* Math.min / Math.max of two numbers as JavaScript has them: NaN if either is, and -0 below 0 */
+static inline double xs_fmin(double a, double b) {
+    if (a != a || b != b) return NAN;
+    if (a == b) return signbit(a) ? a : b;
+    return a < b ? a : b;
+}
+static inline double xs_fmax(double a, double b) {
+    if (a != a || b != b) return NAN;
+    if (a == b) return signbit(a) ? b : a;
+    return a > b ? a : b;
+}
+static inline bool xs_is_safe_integer(double x) { return xs_is_integer(x) && fabs(x) <= 9007199254740991.0; }
+
+XS_AI int64_t xs_to_int_s(double x, const xs_site *s) {
+    if (!(x >= -9223372036854775808.0 && x < 9223372036854775808.0)) XS_FAIL("value out of int range", s);
+    return (int64_t)x;
+}
+static inline int64_t xs_to_int(double x) { return xs_to_int_s(x, NULL); }
+static inline int64_t xs_floor_int(double x) { return xs_to_int(floor(x)); }
+static inline int64_t xs_ceil_int(double x) { return xs_to_int(ceil(x)); }
+static inline int64_t xs_trunc_int(double x) { return xs_to_int(trunc(x)); }
+static inline int64_t xs_round_int(double x) {
+    double r = floor(x);
+    if (x - r >= 0.5) r += 1;
+    return xs_to_int(r);
+}
+XS_AI int64_t xs_floor_int_s(double x, const xs_site *s) { return xs_to_int_s(floor(x), s); }
+XS_AI int64_t xs_ceil_int_s(double x, const xs_site *s) { return xs_to_int_s(ceil(x), s); }
+XS_AI int64_t xs_trunc_int_s(double x, const xs_site *s) { return xs_to_int_s(trunc(x), s); }
+XS_AI int64_t xs_round_int_s(double x, const xs_site *s) {
+    double r = floor(x);
+    if (x - r >= 0.5) r += 1;
+    return xs_to_int_s(r, s);
+}
+XS_AI int64_t xs_iabs_s(int64_t a, const xs_site *s) { return a < 0 ? xs_ineg_s(a, s) : a; }
+
+/* ---- number formatting: ECMAScript Number::toString ---- */
+
+static void xs_num_to_str(double v, char *out /* >= 32 bytes */) {
+    if (v != v) { strcpy(out, "NaN"); return; }
+    if (v == 0) { strcpy(out, signbit(v) ? "-0" : "0"); return; } /* console.log shows -0 */
+    if (isinf(v)) { strcpy(out, v > 0 ? "Infinity" : "-Infinity"); return; }
+    char *o = out;
+    if (v < 0) { *o++ = '-'; v = -v; }
+    char tmp[40];
+    int prec;
+    for (prec = 1; prec <= 17; prec++) { /* shortest digit string that round-trips */
+        snprintf(tmp, sizeof tmp, "%.*e", prec - 1, v);
+        if (strtod(tmp, NULL) == v) break;
+    }
+    char digits[24];
+    int k = 0;
+    char *p = tmp;
+    while (*p && *p != 'e') {
+        if (*p != '.') digits[k++] = *p;
+        p++;
+    }
+    while (k > 1 && digits[k - 1] == '0') k--;
+    digits[k] = 0;
+    int n = atoi(p + 1) + 1;
+    if (k <= n && n <= 21) {
+        memcpy(o, digits, (size_t)k); o += k;
+        for (int i = 0; i < n - k; i++) *o++ = '0';
+        *o = 0;
+    } else if (0 < n && n <= 21) {
+        memcpy(o, digits, (size_t)n); o += n;
+        *o++ = '.';
+        memcpy(o, digits + n, (size_t)(k - n)); o += k - n;
+        *o = 0;
+    } else if (-6 < n && n <= 0) {
+        *o++ = '0'; *o++ = '.';
+        for (int i = 0; i < -n; i++) *o++ = '0';
+        memcpy(o, digits, (size_t)k); o += k;
+        *o = 0;
+    } else {
+        int e = n - 1;
+        *o++ = digits[0];
+        if (k > 1) { *o++ = '.'; memcpy(o, digits + 1, (size_t)(k - 1)); o += k - 1; }
+        *o++ = 'e';
+        *o++ = e < 0 ? '-' : '+';
+        int ae = e < 0 ? -e : e; /* at most 324: three digits */
+        if (ae >= 100) *o++ = (char)('0' + ae / 100);
+        if (ae >= 10) *o++ = (char)('0' + ae / 10 % 10);
+        *o++ = (char)('0' + ae % 10);
+        *o = 0;
+    }
+}
+
+static xs_str *xs_str_from_num(double v) {
+    char buf[32];
+    xs_num_to_str(v, buf);
+    if (v == 0) buf[0] = '0', buf[1] = 0; /* String(-0) is "0" */
+    return xs_str_new(buf, strlen(buf));
+}
+
+/* n.toString(radix), 2..36, as JavaScript writes integers */
+XS_NOINLINE xs_str *xs_int_to_radix(int64_t v, int64_t radix) {
+    if (radix < 2 || radix > 36) xs_panic("RangeError: toString() radix must be between 2 and 36");
+    char buf[72];
+    int n = 0;
+    uint64_t u = v < 0 ? (uint64_t)(-(v + 1)) + 1 : (uint64_t)v;
+    do { int d = (int)(u % (uint64_t)radix); buf[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); u /= (uint64_t)radix; } while (u);
+    if (v < 0) buf[n++] = '-';
+    char out[72];
+    for (int i = 0; i < n; i++) out[i] = buf[n - 1 - i];
+    return xs_str_new(out, (size_t)n);
+}
+static xs_str *xs_str_from_int(int64_t v) {
+    char buf[24];
+    size_t n = xs_itoa(v, buf);
+    return xs_str_new(buf, n);
+}
+
+/* a + b + String(i) + ... and template literals: one allocation for the whole text, numbers written in place */
+typedef struct { int k; union { xs_str *s; int64_t i; double d; bool b; }; } xs_part; /* k: 0 string, 1 int, 2 number, 3 boolean */
+static inline int xs_udigits(uint64_t u) {
+    int n = 1;
+    while (u >= 10000) { u /= 10000; n += 4; }
+    return n + (u >= 10) + (u >= 100) + (u >= 1000);
+}
+/* the digits of u, ending at end (two at a time) */
+static inline void xs_uwrite(char *end, uint64_t u) {
+    static const char d2[201] = "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
+                                "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
+                                "8081828384858687888990919293949596979899";
+    while (u >= 100) { unsigned q = (unsigned)(u % 100); u /= 100; end -= 2; end[0] = d2[2 * q]; end[1] = d2[2 * q + 1]; }
+    if (u >= 10) { end -= 2; end[0] = d2[2 * u]; end[1] = d2[2 * u + 1]; }
+    else *--end = (char)('0' + u);
+}
+/* a string in a buffer of its creator's frame (src/stackalloc.c: it dies with a stack object): counted like any
+   other, XS_STACK leaves the memory alone when the count reaches zero */
+static inline __attribute__((always_inline)) xs_str *xs_str_on_stack(void *buf, int64_t len) {
+    xs_str *s = buf;
+    s->hdr.rc = 1;
+    s->hdr.cls = XS_STACK;
+    s->hdr.type = &xs_str_type;
+    s->len = len;
+    s->ulen = -1;
+    xs_live++;
+    return s;
+}
+static inline __attribute__((always_inline)) xs_str *xs_cat_into(void *sbuf, size_t scap, int n, const xs_part *p);
+/* xs_cat_into: inlined where the parts are known (short templates): the kinds fold away and the loops unroll;
+   with a buffer that holds the result, the string lives there */
+static inline __attribute__((always_inline)) xs_str *xs_cat_into(void *sbuf, size_t scap, int n, const xs_part *p) {
+    /* numbers (doubles) are written into a buffer first; integers and booleans go straight into the result */
+    char dbuf[4][32], (*num)[32] = dbuf;
+    int ndbl = 0;
+    for (int i = 0; i < n; i++) ndbl += p[i].k == 2;
+    if (ndbl > 4) num = malloc(sizeof(char[32]) * (size_t)ndbl);
+    int64_t total = 0, ulen = 0; /* ulen < 0 once a string part's length in code points is not known */
+    for (int i = 0, d = 0; i < n; i++) {
+        int64_t l;
+        switch (p[i].k) {
+        case 0: total += p[i].s->len; if (ulen >= 0) ulen = p[i].s->ulen >= 0 ? ulen + p[i].s->ulen : -1; continue;
+        case 1: { int64_t v = p[i].i; l = xs_udigits(v < 0 ? (uint64_t)(-(v + 1)) + 1 : (uint64_t)v) + (v < 0); break; }
+        case 2: if (p[i].d == 0) { num[d][0] = '0'; num[d][1] = 0; l = 1; } else { xs_num_to_str(p[i].d, num[d]); l = (int64_t)strlen(num[d]); } d++; break;
+        default: l = p[i].b ? 4 : 5; break;
+        }
+        total += l;
+        if (ulen >= 0) ulen += l; /* digits, signs, letters: one each */
+    }
+    xs_str *r = sbuf && offsetof(xs_str, data) + (size_t)total + 1 <= scap ? xs_str_on_stack(sbuf, total) : xs_str_alloc_i(total);
+    char *o = r->data;
+    for (int i = 0, d = 0; i < n; i++) {
+        const char *src;
+        size_t l;
+        switch (p[i].k) {
+        case 0: src = p[i].s->data; l = (size_t)p[i].s->len; break;
+        case 1: {
+            int64_t v = p[i].i;
+            uint64_t u = v < 0 ? (uint64_t)(-(v + 1)) + 1 : (uint64_t)v;
+            if (v < 0) *o++ = '-';
+            o += xs_udigits(u);
+            xs_uwrite(o, u);
+            continue;
+        }
+        case 2: src = num[d++]; l = strlen(src); break;
+        default: src = p[i].b ? "true" : "false"; l = p[i].b ? 4 : 5; break;
+        }
+        if (l <= 16) for (size_t k = 0; k < l; k++) o[k] = src[k]; /* short pieces: no call */
+        else memcpy(o, src, l);
+        o += l;
+    }
+    *o = 0;
+    if (ulen >= 0 && ulen <= INT32_MAX) r->ulen = (int32_t)ulen;
+    if (num != dbuf) free(num);
+    return r;
+}
+static inline __attribute__((always_inline)) xs_str *xs_cat_n(int n, const xs_part *p) { return xs_cat_into(NULL, 0, n, p); }
+XS_NOINLINE xs_str *xs_cat(int n, const xs_part *p) { return xs_cat_n(n, p); }
+
+/* parseInt(s, radix): leading space, a sign, 0x for radix 16 (or 0), the longest run of digits; NaN when none */
+XS_NOINLINE double xs_parse_int(xs_str *s, int64_t radix) {
+    const char *p = s->data, *e = s->data + s->len;
+    while (p < e && (*p == ' ' || (*p >= 9 && *p <= 13) || ((unsigned char)p[0] == 0xC2 && p + 1 < e && (unsigned char)p[1] == 0xA0))) p += (unsigned char)*p == 0xC2 ? 2 : 1;
+    bool neg = false;
+    if (p < e && (*p == '+' || *p == '-')) neg = *p++ == '-';
+    if (radix != 0 && (radix < 2 || radix > 36)) return NAN;
+    if ((radix == 0 || radix == 16) && e - p >= 2 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { p += 2; radix = 16; }
+    if (radix == 0) radix = 10;
+    const char *d0 = p;
+    double v = 0;
+    while (p < e) {
+        int c = *p, k = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'z' ? c - 'a' + 10 : c >= 'A' && c <= 'Z' ? c - 'A' + 10 : 99;
+        if (k >= radix) break;
+        v = v * (double)radix + k;
+        p++;
+    }
+    if (p == d0) return NAN;
+    if (radix == 10 && p - d0 > 15) { /* exact rounding of long decimal runs */
+        char buf[400];
+        size_t n = (size_t)(p - d0) < sizeof buf - 1 ? (size_t)(p - d0) : sizeof buf - 1;
+        memcpy(buf, d0, n);
+        buf[n] = 0;
+        v = strtod(buf, NULL);
+    }
+    return neg ? -v : v;
+}
+/* parseFloat(s): the longest prefix that is a decimal literal (or Infinity); NaN when none */
+XS_NOINLINE double xs_parse_float(xs_str *s) {
+    const char *p = s->data, *e = s->data + s->len;
+    while (p < e && (*p == ' ' || (*p >= 9 && *p <= 13))) p++;
+    const char *st = p;
+    if (p < e && (*p == '+' || *p == '-')) p++;
+    if (e - p >= 8 && memcmp(p, "Infinity", 8) == 0) return *st == '-' ? -INFINITY : INFINITY;
+    const char *ds = p;
+    while (p < e && *p >= '0' && *p <= '9') p++;
+    if (p < e && *p == '.') { p++; while (p < e && *p >= '0' && *p <= '9') p++; }
+    if (p == ds || (p == ds + 1 && *ds == '.')) return NAN;
+    if (p < e && (*p == 'e' || *p == 'E')) {
+        const char *q = p + 1;
+        if (q < e && (*q == '+' || *q == '-')) q++;
+        if (q < e && *q >= '0' && *q <= '9') { while (q < e && *q >= '0' && *q <= '9') q++; p = q; }
+    }
+    char buf[512];
+    size_t n = (size_t)(p - st) < sizeof buf - 1 ? (size_t)(p - st) : sizeof buf - 1;
+    memcpy(buf, st, n);
+    buf[n] = 0;
+    return strtod(buf, NULL);
+}
+static xs_str *xs_str_from_bool(bool b) { return b ? xs_str_new("true", 4) : xs_str_new("false", 5); }
+
+static double xs_str_to_number(xs_str *s) {
+    const char *p = s->data, *end = s->data + s->len;
+    while (p < end && isspace((unsigned char)*p)) p++;
+    while (end > p && isspace((unsigned char)end[-1])) end--;
+    if (p == end) return 0;
+    char *stop;
+    double v = strtod(p, &stop);
+    if (stop != end) return NAN;
+    return v;
+}
+
+/* ---- JSON ---- */
+
+typedef enum { XJ_NULL, XJ_BOOL, XJ_NUM, XJ_STR, XJ_ARR, XJ_OBJ } xs_jkind;
+typedef struct xs_jv {
+    xs_jkind kind;
+    double num;
+    bool b;
+    char *str; size_t slen;
+    struct xs_jv **items; size_t n;   /* array items, or object values */
+    char **keys;                      /* object keys */
+} xs_jv;
+
+typedef struct { const char *p, *end, *start; int depth; } xs_jp;
+static XS_TLS bool xs_json_lenient; /* SQLite rows: booleans are stored as 0/1 */
+
+/* Every node and string of one parse comes from an arena, so a failure halfway (which longjmps out
+   through xs_panic) frees everything in one go instead of leaking the partial tree. */
+typedef struct xs_jarena { struct xs_jarena *next; size_t used, cap; char data[]; } xs_jarena;
+static XS_TLS xs_jarena *xs_jarena_cur;
+
+static void *xs_jalloc(size_t n) {
+    n = (n + 15) & ~(size_t)15;
+    xs_jarena *a = xs_jarena_cur;
+    if (!a || a->used + n > a->cap) {
+        size_t cap = n > 65536 ? n : 65536;
+        xs_jarena *b = malloc(sizeof *b + cap);
+        if (!b) xs_panic("out of memory");
+        b->next = a;
+        b->used = 0;
+        b->cap = cap;
+        xs_jarena_cur = b;
+        a = b;
+    }
+    void *p = a->data + a->used;
+    a->used += n;
+    memset(p, 0, n);
+    return p;
+}
+
+/* keeps one block for the next use: row-by-row conversions reuse it instead of malloc/free per row */
+static void xs_jarena_reset(void) {
+    if (!xs_jarena_cur) return;
+    while (xs_jarena_cur->next) {
+        xs_jarena *n = xs_jarena_cur->next;
+        free(xs_jarena_cur);
+        xs_jarena_cur = n;
+    }
+    xs_jarena_cur->used = 0;
+}
+
+static void xs_jarena_free(void) {
+    while (xs_jarena_cur) {
+        xs_jarena *n = xs_jarena_cur->next;
+        free(xs_jarena_cur);
+        xs_jarena_cur = n;
+    }
+}
+
+XS_NOINLINE void xs_json_fail(xs_jp *j, const char *what) {
+    static XS_TLS char buf[256];
+    snprintf(buf, sizeof buf, "JSON: %s at offset %ld", what, (long)(j->p - j->start));
+    xs_jarena_free();
+    xs_panic(buf);
+}
+
+static void xs_json_ws(xs_jp *j) { while (j->p < j->end && isspace((unsigned char)*j->p)) j->p++; }
+
+static xs_jv *xs_json_value(xs_jp *j);
+
+static xs_jv *xs_jv_new(xs_jkind k) {
+    xs_jv *v = xs_jalloc(sizeof *v);
+    v->kind = k;
+    return v;
+}
+
+/* frees the whole parse (the tree is arena-allocated) */
+static void xs_jv_free(xs_jv *v) { (void)v; xs_jarena_free(); }
+
+/* grow an arena array: copy into a bigger arena block (no realloc in arenas) */
+static void *xs_jgrow(void *old, size_t old_n, size_t new_n, size_t elem) {
+    void *p = xs_jalloc(new_n * elem);
+    if (old) memcpy(p, old, old_n * elem);
+    return p;
+}
+
+XS_NOINLINE char *xs_json_string(xs_jp *j, size_t *outlen) {
+    if (j->p >= j->end || *j->p != '"') xs_json_fail(j, "expected a string");
+    j->p++;
+    size_t cap = 32, n = 0;
+    char *out = xs_jalloc(cap);
+    for (;;) {
+        if (j->p >= j->end) xs_json_fail(j, "unterminated string");
+        unsigned char c = (unsigned char)*j->p++;
+        if (c == '"') break;
+        if (n + 4 >= cap) { out = xs_jgrow(out, n, cap * 2, 1); cap *= 2; }
+        if (c == '\\') {
+            if (j->p >= j->end) xs_json_fail(j, "bad escape");
+            char e = *j->p++;
+            switch (e) {
+            case 'n': out[n++] = '\n'; break;
+            case 't': out[n++] = '\t'; break;
+            case 'r': out[n++] = '\r'; break;
+            case 'b': out[n++] = '\b'; break;
+            case 'f': out[n++] = '\f'; break;
+            case '/': out[n++] = '/'; break;
+            case '\\': out[n++] = '\\'; break;
+            case '"': out[n++] = '"'; break;
+            case 'u': {
+                if (j->end - j->p < 4) xs_json_fail(j, "bad \\u escape");
+                unsigned cp = 0;
+                for (int k = 0; k < 4; k++) {
+                    char h = *j->p++;
+                    int hv = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+                    if (hv < 0) xs_json_fail(j, "bad \\u escape");
+                    cp = cp * 16 + (unsigned)hv;
+                }
+                if (cp >= 0xD800 && cp <= 0xDBFF && j->end - j->p >= 6 && j->p[0] == '\\' && j->p[1] == 'u') {
+                    char hex4[5] = {j->p[2], j->p[3], j->p[4], j->p[5], 0};
+                    unsigned lo = (unsigned)strtoul(hex4, NULL, 16);
+                    if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); j->p += 6; }
+                }
+                if (cp < 0x80) out[n++] = (char)cp;
+                else if (cp < 0x800) { out[n++] = (char)(0xC0 | (cp >> 6)); out[n++] = (char)(0x80 | (cp & 0x3F)); }
+                else if (cp < 0x10000) { out[n++] = (char)(0xE0 | (cp >> 12)); out[n++] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[n++] = (char)(0x80 | (cp & 0x3F)); }
+                else { out[n++] = (char)(0xF0 | (cp >> 18)); out[n++] = (char)(0x80 | ((cp >> 12) & 0x3F)); out[n++] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[n++] = (char)(0x80 | (cp & 0x3F)); }
+                break;
+            }
+            default: xs_json_fail(j, "bad escape");
+            }
+        } else {
+            out[n++] = (char)c;
+        }
+    }
+    out[n] = 0;
+    *outlen = n;
+    return out;
+}
+
+XS_NOINLINE xs_jv *xs_json_value(xs_jp *j) {
+    xs_json_ws(j);
+    if (j->p >= j->end) xs_json_fail(j, "unexpected end");
+    if (++j->depth > 200) xs_json_fail(j, "too deep");
+    char c = *j->p;
+    xs_jv *v;
+    if (c == '{') {
+        j->p++;
+        v = xs_jv_new(XJ_OBJ);
+        size_t cap = 0;
+        xs_json_ws(j);
+        if (j->p < j->end && *j->p == '}') { j->p++; j->depth--; return v; }
+        for (;;) {
+            xs_json_ws(j);
+            size_t klen;
+            char *key = xs_json_string(j, &klen);
+            xs_json_ws(j);
+            if (j->p >= j->end || *j->p != ':') xs_json_fail(j, "expected ':'");
+            j->p++;
+            xs_jv *item = xs_json_value(j);
+            if (v->n == cap) { size_t nc = cap ? cap * 2 : 4; v->items = xs_jgrow(v->items, v->n, nc, sizeof(void *)); v->keys = xs_jgrow(v->keys, v->n, nc, sizeof(char *)); cap = nc; }
+            v->keys[v->n] = key;
+            v->items[v->n++] = item;
+            xs_json_ws(j);
+            if (j->p < j->end && *j->p == ',') { j->p++; continue; }
+            if (j->p < j->end && *j->p == '}') { j->p++; break; }
+            xs_json_fail(j, "expected ',' or '}'");
+        }
+    } else if (c == '[') {
+        j->p++;
+        v = xs_jv_new(XJ_ARR);
+        size_t cap = 0;
+        xs_json_ws(j);
+        if (j->p < j->end && *j->p == ']') { j->p++; j->depth--; return v; }
+        for (;;) {
+            xs_jv *item = xs_json_value(j);
+            if (v->n == cap) { size_t nc = cap ? cap * 2 : 4; v->items = xs_jgrow(v->items, v->n, nc, sizeof(void *)); cap = nc; }
+            v->items[v->n++] = item;
+            xs_json_ws(j);
+            if (j->p < j->end && *j->p == ',') { j->p++; continue; }
+            if (j->p < j->end && *j->p == ']') { j->p++; break; }
+            xs_json_fail(j, "expected ',' or ']'");
+        }
+    } else if (c == '"') {
+        v = xs_jv_new(XJ_STR);
+        v->str = xs_json_string(j, &v->slen);
+    } else if (c == 't' && j->end - j->p >= 4 && memcmp(j->p, "true", 4) == 0) {
+        v = xs_jv_new(XJ_BOOL); v->b = true; j->p += 4;
+    } else if (c == 'f' && j->end - j->p >= 5 && memcmp(j->p, "false", 5) == 0) {
+        v = xs_jv_new(XJ_BOOL); j->p += 5;
+    } else if (c == 'n' && j->end - j->p >= 4 && memcmp(j->p, "null", 4) == 0) {
+        v = xs_jv_new(XJ_NULL); j->p += 4;
+    } else if (c == '-' || (c >= '0' && c <= '9')) {
+        v = xs_jv_new(XJ_NUM);
+        char *stop;
+        v->num = strtod(j->p, &stop);
+        if (stop == j->p) xs_json_fail(j, "bad number");
+        j->p = stop;
+    } else {
+        xs_json_fail(j, "unexpected character");
+        return NULL;
+    }
+    j->depth--;
+    return v;
+}
+
+XS_NOINLINE xs_jv *xs_json_parse(xs_str *text) {
+    xs_jarena_free(); /* a previous parse abandoned by a throw */
+    xs_json_lenient = false;
+    xs_jp j = {text->data, text->data + text->len, text->data, 0};
+    xs_jv *v = xs_json_value(&j);
+    xs_json_ws(&j);
+    if (j.p != j.end) xs_json_fail(&j, "trailing characters");
+    return v;
+}
+
+/* Typed readers used by generated code. Missing or mistyped fields are runtime errors with the field name. */
+XS_NOINLINE xs_jv *xs_json_field(xs_jv *obj, const char *name) {
+    if (obj->kind != XJ_OBJ) xs_panic("JSON: expected an object");
+    for (size_t i = 0; i < obj->n; i++)
+        if (strcmp(obj->keys[i], name) == 0) return obj->items[i];
+    xs_panicf("JSON: missing field '%s'", name);
+    return NULL;
+}
+XS_NOINLINE xs_jv *xs_json_field_opt(xs_jv *obj, const char *name) {
+    if (obj->kind != XJ_OBJ) xs_panic("JSON: expected an object");
+    for (size_t i = 0; i < obj->n; i++)
+        if (strcmp(obj->keys[i], name) == 0) return obj->items[i];
+    return NULL;
+}
+XS_NOINLINE double xs_json_num(xs_jv *v, const char *where) { if (v->kind != XJ_NUM) xs_panicf("JSON: '%s' must be a number", where); return v->num; }
+XS_NOINLINE int64_t xs_json_int(xs_jv *v, const char *where) {
+    if (v->kind != XJ_NUM || v->num != floor(v->num)) xs_panicf("JSON: '%s' must be an integer", where);
+    return xs_to_int(v->num);
+}
+XS_NOINLINE bool xs_json_bool(xs_jv *v, const char *where) {
+    if (xs_json_lenient && v->kind == XJ_NUM) return v->num != 0;
+    if (v->kind != XJ_BOOL) xs_panicf("JSON: '%s' must be true or false", where);
+    return v->b;
+}
+XS_NOINLINE xs_str *xs_json_str(xs_jv *v, const char *where) { if (v->kind != XJ_STR) xs_panicf("JSON: '%s' must be a string", where); return xs_str_new(v->str, v->slen); }
+XS_NOINLINE xs_jv *xs_json_arr(xs_jv *v, const char *where) { if (v->kind != XJ_ARR) xs_panicf("JSON: '%s' must be an array", where); return v; }
+
+/* stringify helpers: generated code appends into an xs_sb */
+static void xs_sb_put(xs_sb *b, const char *s, size_t n) {
+    if (b->len + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 512;
+        while (cap < b->len + n + 1) cap *= 2;
+        b->data = realloc(b->data, cap);
+        if (!b->data) xs_panic("out of memory");
+        b->cap = cap;
+    }
+    memcpy(b->data + b->len, s, n);
+    b->len += n;
+    b->data[b->len] = 0;
+}
+static void xs_sb_puts(xs_sb *b, const char *s) { xs_sb_put(b, s, strlen(s)); }
+static void xs_sb_num(xs_sb *b, double v) {
+    char buf[32];
+    if (v != v || isinf(v)) { xs_sb_puts(b, "null"); return; } /* JSON.stringify(NaN) is null */
+    xs_num_to_str(v, buf);
+    if (v == 0) { buf[0] = '0'; buf[1] = 0; }
+    xs_sb_puts(b, buf);
+}
+static void xs_sb_int(xs_sb *b, int64_t v) { char buf[24]; size_t n = xs_itoa(v, buf); xs_sb_put(b, buf, n); }
+static void xs_sb_bool(xs_sb *b, bool v) { xs_sb_puts(b, v ? "true" : "false"); }
+static void xs_sb_str(xs_sb *b, xs_str *s) {
+    xs_sb_put(b, "\"", 1);
+    for (int64_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        char esc[8];
+        switch (c) {
+        case '"': xs_sb_put(b, "\\\"", 2); break;
+        case '\\': xs_sb_put(b, "\\\\", 2); break;
+        case '\n': xs_sb_put(b, "\\n", 2); break;
+        case '\r': xs_sb_put(b, "\\r", 2); break;
+        case '\t': xs_sb_put(b, "\\t", 2); break;
+        case '\b': xs_sb_put(b, "\\b", 2); break;
+        case '\f': xs_sb_put(b, "\\f", 2); break;
+        default:
+            if (c < 0x20) { snprintf(esc, sizeof esc, "\\u%04x", c); xs_sb_puts(b, esc); }
+            else xs_sb_put(b, (const char *)&c, 1);
+        }
+    }
+    xs_sb_put(b, "\"", 1);
+}
+static xs_str *xs_sb_finish(xs_sb *b) {
+    xs_str *s = xs_str_new(b->data ? b->data : "", b->len);
+    free(b->data);
+    return s;
+}
+
+/* ---- console.log ---- */
+
+static void xs_print_num(double v) {
+    char buf[32];
+    xs_num_to_str(v, buf);
+    fputs(buf, XS_OUT);
+}
+
+static void xs_print_int(int64_t v) { char buf[24]; size_t n = xs_itoa(v, buf); fwrite(buf, 1, n, XS_OUT); }
+static void xs_print_bool(bool b) { fputs(b ? "true" : "false", XS_OUT); }
+static void xs_print_str(xs_str *s) { fwrite(s->data, 1, (size_t)s->len, XS_OUT); }
+static void xs_print_str_quoted(xs_str *s) { /* as Node prints strings inside objects */
+    fputc('\'', XS_OUT);
+    for (int64_t i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        if (c == '\'') fputs("\\'", XS_OUT);
+        else if (c == '\n') fputs("\\n", XS_OUT);
+        else fputc(c, XS_OUT);
+    }
+    fputc('\'', XS_OUT);
+}
+#ifdef XS_DEBUG
+/* > 0 while the debugger renders a value: the nesting it may still print. A cycle (parent <-> child) would
+   otherwise recurse until the stack overflows; console.log itself is unchanged. */
+static XS_TLS int xs_dbg_print_budget;
+static void xs_print_obj(void *p) {
+    if (xs_dbg_print_budget == 1) { fputs("[Object]", XS_OUT); return; }
+    if (xs_dbg_print_budget) xs_dbg_print_budget--;
+    ((xs_hdr *)p)->type->print(p);
+    if (xs_dbg_print_budget) xs_dbg_print_budget++;
+}
+#else
+static void xs_print_obj(void *p) { ((xs_hdr *)p)->type->print(p); }
+#endif
+static void xs_print_obj_or_null(void *p) { if (p) xs_print_obj(p); else fputs("null", XS_OUT); }
+static void xs_print_str_quoted_or_null_(void *p) { if (p) xs_print_str_quoted_(p); else fputs("null", XS_OUT); }
+/* a union or unknown value inside an array or an object: strings quoted, as Node prints them there */
+static void xs_print_any_quoted(void *p) { if (p && ((xs_hdr *)p)->type->free == xs_str_free) xs_print_str_quoted_(p); else xs_print_obj_or_null(p); }
+static void xs_print_str_or_null(xs_str *s) { if (s) xs_print_str(s); else fputs("null", XS_OUT); }
+static void xs_print_xs_arr_ref(void *p) {
+    xs_arr_ref *a = p;
+    xs_insp fr;
+    if (!xs_insp_begin(&fr, p, "Array", a->len ? NULL : "[]")) return;
+    for (size_t i = 0; i < a->len && i < 100; i++) {
+        xs_insp_entry(&fr);
+        a->print_elem(a->data[i]);
+    }
+    if (a->len > 100) { xs_insp_entry(&fr); fprintf(XS_OUT, "... %zu more item%s", a->len - 100, a->len - 101 ? "s" : ""); }
+    xs_insp_end(&fr, "[", "]", true, false, a->len > 100);
+}
+#define xs_print_arr_ref xs_print_xs_arr_ref
+static void xs_print_sep(void) { fputc(' ', XS_OUT); }
+static void xs_print_nl(void) { fputc('\n', XS_OUT); }
+
+#define XS_PRINT_ARRAY(name, printer, numeric)                        \
+    static void xs_print_##name(void *p) {                            \
+        name *a = p;                                                  \
+        xs_insp fr;                                                   \
+        if (!xs_insp_begin(&fr, p, "Array", a->len ? NULL : "[]")) return; \
+        for (size_t i = 0; i < a->len && i < 100; i++) {              \
+            xs_insp_entry(&fr);                                       \
+            printer(a->data[i]);                                      \
+        }                                                             \
+        if (a->len > 100) { xs_insp_entry(&fr); fprintf(XS_OUT, "... %zu more item%s", a->len - 100, a->len - 101 ? "s" : ""); } \
+        xs_insp_end(&fr, "[", "]", true, numeric, a->len > 100);       \
+    }
+XS_PRINT_ARRAY(xs_arr_num, xs_print_num, true)
+XS_PRINT_ARRAY(xs_arr_int, xs_print_int, true)
+XS_PRINT_ARRAY(xs_arr_bool, xs_print_bool, false)
+#define xs_print_arr_num xs_print_xs_arr_num
+#define xs_print_arr_int xs_print_xs_arr_int
+#define xs_print_arr_bool xs_print_xs_arr_bool
+
+/* ---- internal indicators ----
+   Built with --profile, every function counts calls and time; the table goes to stderr at exit.
+   XISTO_RC_STATS=1 reports allocations. Both exist to find bottlenecks before the bench does. */
+
+#if !defined(_WIN32)
+#include <sys/resource.h>
+#endif
+#include <time.h>
+
+static inline uint64_t xs_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+typedef struct xs_prof { const char *name; uint64_t calls, ns, self_ns; struct xs_prof *next; } xs_prof;
+static xs_prof *xs_prof_list;
+static uint64_t xs_prof_child_ns; /* time spent in callees of the running function, for self time */
+
+static inline void xs_prof_enter(xs_prof *p, uint64_t *t0, uint64_t *child_mark) {
+    if (!p->next && xs_prof_list != p) { p->next = xs_prof_list ? xs_prof_list : p; xs_prof_list = p; }
+    *t0 = xs_now();
+    *child_mark = xs_prof_child_ns;
+}
+
+static inline void xs_prof_leave(xs_prof *p, uint64_t t0, uint64_t child_mark) {
+    uint64_t dt = xs_now() - t0;
+    uint64_t children = xs_prof_child_ns - child_mark;
+    p->calls++;
+    p->ns += dt;
+    p->self_ns += dt > children ? dt - children : 0;
+    xs_prof_child_ns = child_mark + dt;
+}
+
+static int64_t xs_max_rss_bytes(void) {
+#if defined(_WIN32)
+    return 0; /* not measured there yet */
+#else
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+#if defined(__APPLE__)
+    return (int64_t)ru.ru_maxrss; /* bytes on macOS */
+#else
+    return (int64_t)ru.ru_maxrss * 1024; /* kilobytes on Linux */
+#endif
+#endif
+}
+
+static void xs_prof_report(void) {
+    if (!xs_prof_list) return;
+    /* collect and sort by self time */
+    int n = 0;
+    for (xs_prof *p = xs_prof_list; p; p = p->next == p ? NULL : p->next) n++;
+    xs_prof **v = malloc(sizeof(xs_prof *) * (size_t)n);
+    int i = 0;
+    for (xs_prof *p = xs_prof_list; p; p = p->next == p ? NULL : p->next) v[i++] = p;
+    for (int a = 0; a < n; a++)
+        for (int b = a + 1; b < n; b++)
+            if (v[b]->self_ns > v[a]->self_ns) { xs_prof *t = v[a]; v[a] = v[b]; v[b] = t; }
+    fprintf(stderr, "\nxisto profile (sorted by self time)\n%-28s %12s %12s %12s %10s\n", "function", "calls", "self ms", "total ms", "ns/call");
+    for (int k = 0; k < n; k++) {
+        xs_prof *p = v[k];
+        fprintf(stderr, "%-28s %12llu %12.3f %12.3f %10.0f\n", p->name, (unsigned long long)p->calls, p->self_ns / 1e6, p->ns / 1e6, p->calls ? (double)p->ns / (double)p->calls : 0);
+    }
+    fprintf(stderr, "peak rss %.1f MB, %lld allocations\n", xs_max_rss_bytes() / 1048576.0, (long long)xs_allocs);
+    free(v);
+}
+
+/* ---- streams: pull-based, lazy, one element in flight between stages ----
+   pull(st, out) fills *out with the next element (owned if it is a heap value) and returns false at the end. */
+
+typedef struct xs_stream xs_stream;
+typedef bool (*xs_pull_fn)(xs_stream *st, xs_val *out);
+struct xs_stream {
+    xs_hdr hdr;
+    xs_pull_fn pull;
+    xs_stream *src;        /* upstream stage, retained */
+    xs_closure *fn;        /* callback, retained */
+    int elem_kind;         /* 0 num, 1 int, 2 bool, 3 heap pointer (of the elements this stage produces) */
+    int src_kind;
+    void (*print_elem)(void *);
+    int64_t n, counter;    /* batch size / take limit */
+    /* file source */
+    FILE *file;
+    char *buf; size_t buf_len, buf_cap, buf_pos;
+    bool eof;
+    bool done;
+    void *ext;             /* a generator (runtime/xisto_net.h): its coroutine and arguments */
+    void (*ext_free)(void *);
+};
+
+static void xs_stream_free(void *p) {
+    xs_stream *st = p;
+    if (st->ext_free) st->ext_free(st->ext);
+    xs_release(st->src);
+    xs_release(st->fn);
+    if (st->file) fclose(st->file);
+    free(st->buf);
+    xs_obj_free(p);
+}
+static void xs_print_stream(void *p) { (void)p; fputs("Stream {}", XS_OUT); }
+
+static xs_stream *xs_stream_new(xs_pull_fn pull, xs_stream *src, xs_closure *fn, int elem_kind) {
+    xs_stream *st = xs_obj_alloc(sizeof *st, xs_stream_free, xs_print_stream);
+    st->pull = pull;
+    st->src = xs_retain(src);
+    st->fn = xs_retain(fn);
+    st->elem_kind = elem_kind;
+    st->src_kind = src ? src->elem_kind : 3;
+    return st;
+}
+
+/* a stream that has ended lets go of what it holds at once (its file, the stages above it): one kept in a
+   variable would otherwise keep its file open until the end (Windows then refuses to delete the file) */
+static __attribute__((noinline)) void xs_stream_end(xs_stream *st) {
+    st->done = true;
+    if (st->file) { fclose(st->file); st->file = NULL; }
+    free(st->buf);
+    st->buf = NULL;
+    st->buf_len = st->buf_cap = st->buf_pos = 0;
+    if (st->ext_free) { st->ext_free(st->ext); st->ext_free = NULL; st->ext = NULL; }
+    xs_stream *src = st->src;
+    st->src = NULL;
+    xs_release(src);
+}
+static inline bool xs_stream_pull(xs_stream *st, xs_val *out) {
+    if (st->done) return false;
+    if (st->pull(st, out)) return true;
+    xs_stream_end(st);
+    return false;
+}
+
+static inline void xs_val_release(int kind, xs_val v) { if (kind == 3) xs_release_(v.p); }
+
+/* file sources: 64 KB reads (override with -DXS_STREAM_BUF=... to experiment) */
+#ifndef XS_STREAM_BUF
+#define XS_STREAM_BUF (64 * 1024)
+#endif
+static bool xs_stream_fill(xs_stream *st) {
+    if (st->eof) return false;
+    if (st->buf_pos > 0) { /* keep the unread tail */
+        memmove(st->buf, st->buf + st->buf_pos, st->buf_len - st->buf_pos);
+        st->buf_len -= st->buf_pos;
+        st->buf_pos = 0;
+    }
+    if (st->buf_len == st->buf_cap) { st->buf_cap *= 2; st->buf = realloc(st->buf, st->buf_cap); if (!st->buf) xs_panic("out of memory"); }
+    size_t n = fread(st->buf + st->buf_len, 1, st->buf_cap - st->buf_len, st->file);
+    if (n == 0) { st->eof = true; return false; }
+    st->buf_len += n;
+    return true;
+}
+
+static bool xs_pull_lines(xs_stream *st, xs_val *out) {
+    for (;;) {
+        char *start = st->buf + st->buf_pos;
+        char *nl = memchr(start, '\n', st->buf_len - st->buf_pos);
+        if (nl) {
+            size_t len = (size_t)(nl - start);
+            if (len && start[len - 1] == '\r') len--;
+            out->p = xs_str_new(start, len);
+            st->buf_pos = (size_t)(nl - st->buf) + 1;
+            return true;
+        }
+        if (!xs_stream_fill(st)) { /* last line without newline */
+            size_t len = st->buf_len - st->buf_pos;
+            if (len == 0) return false;
+            out->p = xs_str_new(st->buf + st->buf_pos, len);
+            st->buf_pos = st->buf_len;
+            return true;
+        }
+    }
+}
+
+static bool xs_pull_chunks(xs_stream *st, xs_val *out) {
+    while (st->buf_len - st->buf_pos < (size_t)st->n && !st->eof) xs_stream_fill(st);
+    size_t avail = st->buf_len - st->buf_pos;
+    if (avail == 0) return false;
+    size_t len = avail < (size_t)st->n ? avail : (size_t)st->n;
+    out->p = xs_str_new(st->buf + st->buf_pos, len);
+    st->buf_pos += len;
+    return true;
+}
+
+XS_NOINLINE xs_stream *xs_stream_open(xs_str *path, xs_pull_fn pull, int64_t n) {
+    xs_stream *st = xs_stream_new(pull, NULL, NULL, 3);
+    st->file = fopen(path->data, "rb");
+    if (!st->file) xs_panicf("ENOENT: no such file or directory, open '%s'", path->data);
+    st->buf_cap = XS_STREAM_BUF > (size_t)n * 2 ? XS_STREAM_BUF : (size_t)n * 2;
+    st->buf = malloc(st->buf_cap);
+    st->n = n;
+    st->print_elem = xs_print_str_quoted_;
+    return st;
+}
+XS_NOINLINE xs_stream *xs_stream_lines(xs_str *path) { return xs_stream_open(path, xs_pull_lines, 0); }
+XS_NOINLINE xs_stream *xs_stream_chunks(xs_str *path, int64_t bytes) {
+    if (bytes <= 0) xs_panic("chunks: size must be positive");
+    return xs_stream_open(path, xs_pull_chunks, bytes);
+}
+
+/* stages */
+XS_NOINLINE xs_val xs_call1(xs_closure *fn, int in_kind, int out_kind, xs_val v) {
+    xs_val r = {0};
+    #define CALL(IT, OT, FIELD_IN, FIELD_OUT) r.FIELD_OUT = ((OT (*)(void *, IT))fn->fn)(fn, v.FIELD_IN)
+    switch (in_kind * 4 + out_kind) {
+    case 0: CALL(double, double, d, d); break;   case 1: CALL(double, int64_t, d, i); break;   case 2: r.i = ((bool (*)(void *, double))fn->fn)(fn, v.d); break;   case 3: CALL(double, void *, d, p); break;
+    case 4: CALL(int64_t, double, i, d); break;  case 5: CALL(int64_t, int64_t, i, i); break;  case 6: r.i = ((bool (*)(void *, int64_t))fn->fn)(fn, v.i); break;  case 7: CALL(int64_t, void *, i, p); break;
+    case 8: r.d = ((double (*)(void *, bool))fn->fn)(fn, v.i != 0); break; case 9: r.i = ((int64_t (*)(void *, bool))fn->fn)(fn, v.i != 0); break; case 10: r.i = ((bool (*)(void *, bool))fn->fn)(fn, v.i != 0); break; case 11: r.p = ((void *(*)(void *, bool))fn->fn)(fn, v.i != 0); break;
+    case 12: CALL(void *, double, p, d); break;  case 13: CALL(void *, int64_t, p, i); break;  case 14: r.i = ((bool (*)(void *, void *))fn->fn)(fn, v.p); break;  case 15: CALL(void *, void *, p, p); break;
+    }
+    #undef CALL
+    return r;
+}
+
+XS_NOINLINE bool xs_pull_map(xs_stream *st, xs_val *out) {
+    xs_val v;
+    if (!xs_stream_pull(st->src, &v)) return false;
+    *out = xs_call1(st->fn, st->src_kind, st->elem_kind, v);
+    xs_val_release(st->src_kind, v);
+    return true;
+}
+static xs_stream *xs_stream_map(xs_stream *src, xs_closure *fn, int out_kind, void (*print_elem)(void *)) {
+    xs_stream *st = xs_stream_new(xs_pull_map, src, fn, out_kind);
+    st->print_elem = print_elem;
+    return st;
+}
+
+XS_NOINLINE bool xs_pull_filter(xs_stream *st, xs_val *out) {
+    xs_val v;
+    while (xs_stream_pull(st->src, &v)) {
+        if (xs_call1(st->fn, st->src_kind, 2, v).i) { *out = v; return true; }
+        xs_val_release(st->src_kind, v);
+    }
+    return false;
+}
+static xs_stream *xs_stream_filter(xs_stream *src, xs_closure *fn) {
+    xs_stream *st = xs_stream_new(xs_pull_filter, src, fn, src->elem_kind);
+    st->print_elem = src->print_elem;
+    return st;
+}
+
+static bool xs_pull_take(xs_stream *st, xs_val *out) {
+    if (st->counter >= st->n) return false;
+    if (!xs_stream_pull(st->src, out)) return false;
+    st->counter++;
+    return true;
+}
+static xs_stream *xs_stream_take(xs_stream *src, int64_t n) {
+    xs_stream *st = xs_stream_new(xs_pull_take, src, NULL, src->elem_kind);
+    st->n = n;
+    st->print_elem = src->print_elem;
+    return st;
+}
+
+static void *xs_array_new_for_kind(int kind, size_t cap, void (*print_elem)(void *)) {
+    switch (kind) {
+    case 0: return xs_arr_num_new(0, 0);
+    case 1: return xs_arr_int_new(0, 0);
+    case 2: return xs_arr_bool_new(0, false);
+    default: return xs_arr_ref_new(cap, print_elem);
+    }
+}
+static void xs_array_push_val(int kind, void *arr, xs_val v) { /* takes ownership of heap values */
+    switch (kind) {
+    case 0: xs_arr_num_push(arr, v.d); break;
+    case 1: xs_arr_int_push(arr, v.i); break;
+    case 2: xs_arr_bool_push(arr, v.i != 0); break;
+    default: xs_arr_ref_push(arr, v.p); break;
+    }
+}
+
+static bool xs_pull_batch(xs_stream *st, xs_val *out) {
+    void *arr = NULL;
+    xs_val v;
+    int64_t count = 0;
+    while (count < st->n && xs_stream_pull(st->src, &v)) {
+        if (!arr) arr = xs_array_new_for_kind(st->src_kind, (size_t)st->n, st->print_elem);
+        xs_array_push_val(st->src_kind, arr, v);
+        count++;
+    }
+    if (!arr) return false;
+    out->p = arr;
+    return true;
+}
+XS_NOINLINE xs_stream *xs_stream_batch(xs_stream *src, int64_t n, void (*print_elem)(void *)) {
+    if (n <= 0) xs_panic("batch: size must be positive");
+    xs_stream *st = xs_stream_new(xs_pull_batch, src, NULL, 3);
+    st->n = n;
+    st->print_elem = print_elem; /* printer of the inner elements */
+    return st;
+}
+
+/* terminals */
+XS_NOINLINE void xs_stream_forEach(xs_stream *st, xs_closure *fn) {
+    xs_val v;
+    while (xs_stream_pull(st, &v)) {
+        switch (st->elem_kind) {
+        case 0: ((void (*)(void *, double))fn->fn)(fn, v.d); break;
+        case 1: ((void (*)(void *, int64_t))fn->fn)(fn, v.i); break;
+        case 2: ((void (*)(void *, bool))fn->fn)(fn, v.i != 0); break;
+        default: ((void (*)(void *, void *))fn->fn)(fn, v.p); break;
+        }
+        xs_val_release(st->elem_kind, v);
+    }
+}
+static int64_t xs_stream_count(xs_stream *st) {
+    xs_val v;
+    int64_t n = 0;
+    while (xs_stream_pull(st, &v)) { xs_val_release(st->elem_kind, v); n++; }
+    return n;
+}
+static void *xs_stream_to_array(xs_stream *st, void (*print_elem)(void *)) {
+    /* the partial array sits in the autorelease pool while the stream runs: a throw from a stage (a generator,
+       a callback) lands in a catch that drains the pool, so it is released there */
+    void *arr = xs_ar_(xs_array_new_for_kind(st->elem_kind, 16, print_elem));
+    xs_val v;
+    while (xs_stream_pull(st, &v)) xs_array_push_val(st->elem_kind, arr, v);
+    return xs_retain(arr); /* owned by the caller; the pool's reference goes at the statement's end */
+}
+XS_NOINLINE void xs_stream_write_lines(xs_stream *st, xs_str *path) {
+    FILE *f = fopen(path->data, "wb");
+    if (!f) xs_panicf("EACCES: cannot open '%s' for writing", path->data);
+    xs_val v;
+    while (xs_stream_pull(st, &v)) {
+        xs_str *s = v.p;
+        fwrite(s->data, 1, (size_t)s->len, f);
+        fputc('\n', f);
+        xs_release(s);
+    }
+    fclose(f);
+}
+#define XS_REDUCE(name, T, FIELD, KIND)                                                   \
+    XS_NOINLINE T xs_stream_reduce_##name(xs_stream *st, xs_closure *fn, T init) {             \
+        xs_val acc = {0}; acc.FIELD = init;                                               \
+        xs_val v;                                                                         \
+        while (xs_stream_pull(st, &v)) {                                                  \
+            xs_val next;                                                                  \
+            switch (st->elem_kind) {                                                      \
+            case 0: next.FIELD = ((T (*)(void *, T, double))fn->fn)(fn, acc.FIELD, v.d); break;   \
+            case 1: next.FIELD = ((T (*)(void *, T, int64_t))fn->fn)(fn, acc.FIELD, v.i); break;  \
+            case 2: next.FIELD = ((T (*)(void *, T, bool))fn->fn)(fn, acc.FIELD, v.i != 0); break; \
+            default: next.FIELD = ((T (*)(void *, T, void *))fn->fn)(fn, acc.FIELD, v.p); break;  \
+            }                                                                             \
+            if (KIND == 3) xs_release_(acc.p);                                            \
+            acc = next;                                                                   \
+            xs_val_release(st->elem_kind, v);                                             \
+        }                                                                                 \
+        return acc.FIELD;                                                                 \
+    }
+XS_REDUCE(num, double, d, 0)
+XS_REDUCE(int, int64_t, i, 1)
+XS_NOINLINE bool xs_stream_reduce_bool(xs_stream *st, xs_closure *fn, bool init) {
+    bool acc = init; xs_val v;
+    while (xs_stream_pull(st, &v)) {
+        switch (st->elem_kind) {
+        case 0: acc = ((bool (*)(void *, bool, double))fn->fn)(fn, acc, v.d); break;
+        case 1: acc = ((bool (*)(void *, bool, int64_t))fn->fn)(fn, acc, v.i); break;
+        case 2: acc = ((bool (*)(void *, bool, bool))fn->fn)(fn, acc, v.i != 0); break;
+        default: acc = ((bool (*)(void *, bool, void *))fn->fn)(fn, acc, v.p); break;
+        }
+        xs_val_release(st->elem_kind, v);
+    }
+    return acc;
+}
+XS_REDUCE(ptr, void *, p, 3)
+
+/* ---- std: time, random, process, files ---- */
+
+#include <sys/time.h>
+#include <unistd.h>
+
+static double xs_date_now(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec * 1000.0 + (double)(tv.tv_usec / 1000);
+}
+/* a ** b on ints: exact, an error on overflow (as + - * on ints) or for a negative exponent */
+XS_NOINLINE int64_t xs_ipow_s(int64_t a, int64_t b, const xs_site *s) {
+    if (b < 0) XS_FAIL("negative exponent of an int: write Number(a) ** b", s);
+    int64_t r = 1;
+    while (b) {
+        if (b & 1) { if (__builtin_mul_overflow(r, a, &r)) XS_FAIL("integer overflow", s); }
+        b >>= 1;
+        if (b && __builtin_mul_overflow(a, a, &a)) XS_FAIL("integer overflow", s);
+    }
+    return r;
+}
+static inline double xs_sign(double x) { return x > 0 ? 1 : x < 0 ? -1 : x; } /* NaN and -0 stay */
+static inline double xs_fround(double x) { return (double)(float)x; }
+/* ToInt32 of JS: a number to the 32-bit integer the bitwise operators work on */
+static inline int32_t xs_toi32(double d) {
+    if (!isfinite(d)) return 0;
+    double t = trunc(d);
+    if (fabs(t) < 2147483648.0) return (int32_t)t;
+    double m = fmod(t, 4294967296.0);
+    if (m < 0) m += 4294967296.0;
+    return (int32_t)(uint32_t)m;
+}
+#if defined(__linux__) && (!defined(__GLIBC__) || __GLIBC__ < 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ < 36))
+/* musl (xisto build --target=linux-*) and glibc before 2.36 (Amazon Linux 2023, RHEL 9): no arc4random */
+#include <sys/random.h>
+XS_NOINLINE uint32_t xs_arc4random(void) {
+    static XS_TLS uint32_t pool[256];
+    static XS_TLS int left;
+    if (left == 0) {
+        if (getrandom(pool, sizeof pool, 0) != (ssize_t)sizeof pool) xs_panic("getrandom failed");
+        left = 256;
+    }
+    return pool[--left];
+}
+#define arc4random xs_arc4random
+#endif
+#if defined(_WIN32)
+errno_t __cdecl rand_s(unsigned int *); /* the C library's (RtlGenRandom) */
+static uint32_t xs_win_random(void) { unsigned int v = 0; rand_s(&v); return v; }
+#define arc4random xs_win_random
+#endif
+static double xs_random(void) { return (double)arc4random() / 4294967296.0; }
+
+/* ---- Date: a time value (ms since 1970 UTC, NaN when invalid), as in JS; local time from the system (TZ) ---- */
+typedef struct xs_Date { xs_hdr hdr; double t; } xs_Date;
+#define XS_MS_DAY 86400000.0
+static int64_t xs_days_from_civil(int64_t y, int64_t m, int64_t d) { /* m 1..12 (H. Hinnant) */
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+static void xs_civil_from_days(int64_t z, int64_t *y, int64_t *m, int64_t *d) {
+    z += 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    int64_t doe = z - era * 146097;
+    int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int64_t mp = (5 * doy + 2) / 153;
+    *d = doy - (153 * mp + 2) / 5 + 1;
+    *m = mp < 10 ? mp + 3 : mp - 9;
+    *y = yoe + era * 400 + (*m <= 2);
+}
+/* MakeDay / MakeTime / MakeDate of the spec: fields may overflow (month 13, day 0) */
+static double xs_make_date(double y, double mon, double d, double h, double mi, double s, double ms) {
+    if (!isfinite(y) || !isfinite(mon) || !isfinite(d) || !isfinite(h) || !isfinite(mi) || !isfinite(s) || !isfinite(ms)) return NAN;
+    y = trunc(y); mon = trunc(mon); d = trunc(d); h = trunc(h); mi = trunc(mi); s = trunc(s); ms = trunc(ms);
+    double ym = y + floor(mon / 12);
+    double mn = fmod(mon, 12);
+    if (mn < 0) mn += 12;
+    if (fabs(ym) > 400000) return NAN;
+    double day = (double)xs_days_from_civil((int64_t)ym, (int64_t)mn + 1, 1) + d - 1;
+    return day * XS_MS_DAY + ((h * 60 + mi) * 60 + s) * 1000 + ms;
+}
+static double xs_time_clip(double t) { return !isfinite(t) || fabs(t) > 8.64e15 ? NAN : trunc(t) + 0.0; }
+/* the local offset (ms east of UTC) at UTC time t. localtime_r takes a lock and reads the zone rules (it was
+   90% of a loop of getters), so offsets are cached per UTC day: when the day starts and ends with the same
+   offset, it holds all day; the day of a transition asks the system every time. */
+static double xs_tz_offset_sys(double t) {
+    time_t secs = (time_t)floor(t / 1000);
+    struct tm tm;
+#if defined(_WIN32)
+    if (localtime_s(&tm, &secs) != 0) return 0;
+    return (double)(_mkgmtime(&tm) - secs) * 1000; /* the local wall clock read as UTC, minus the instant */
+#else
+    if (!localtime_r(&secs, &tm)) return 0;
+    return (double)tm.tm_gmtoff * 1000;
+#endif
+}
+static double xs_tz_offset(double t) {
+    if (!isfinite(t)) return 0;
+    static XS_TLS struct { int64_t day[2048]; int32_t off[2048]; bool init; } c; /* off: INT32_MIN on a transition day */
+    if (!c.init) { for (int i = 0; i < 2048; i++) c.day[i] = INT64_MIN; c.init = true; }
+    int64_t day = (int64_t)floor(t / XS_MS_DAY);
+    int slot = (int)(day & 2047);
+    if (c.day[slot] != day) {
+        double a = xs_tz_offset_sys((double)day * XS_MS_DAY), b = xs_tz_offset_sys((double)(day + 1) * XS_MS_DAY - 1000);
+        c.day[slot] = day;
+        c.off[slot] = a == b ? (int32_t)a : INT32_MIN;
+    }
+    return c.off[slot] != INT32_MIN ? (double)c.off[slot] : xs_tz_offset_sys(t);
+}
+/* local wall time -> UTC, as the spec does: the offset in force before a transition wins (a repeated hour
+   is its first occurrence; a skipped one, 02:30 when clocks jump to 03:00, is read with the old offset) */
+static double xs_local_to_utc(double local) {
+    if (!isfinite(local)) return NAN;
+    double before = xs_tz_offset(local - XS_MS_DAY), after = xs_tz_offset(local + XS_MS_DAY);
+    if (xs_tz_offset(local - before) == before) return local - before;
+    if (xs_tz_offset(local - after) == after) return local - after;
+    return local - before;
+}
+typedef struct { int64_t y, mon, d, h, mi, s, ms, wd; } xs_dfields;
+static bool xs_date_fields_(double t, bool local, xs_dfields *f);
+/* d.getFullYear() + d.getMonth() + d.getDate() ...: the last date taken apart is reused */
+static bool xs_date_fields(double t, bool local, xs_dfields *f) {
+    static XS_TLS struct { double t; bool local, ok; xs_dfields f; } last = {NAN, false, false, {0}};
+    if (t == last.t && local == last.local) { *f = last.f; return last.ok; }
+    bool ok = xs_date_fields_(t, local, f);
+    last.t = t;
+    last.local = local;
+    last.ok = ok;
+    last.f = *f;
+    return ok;
+}
+static bool xs_date_fields_(double t, bool local, xs_dfields *f) {
+    if (isnan(t)) return false;
+    if (local) t += xs_tz_offset(t);
+    double days = floor(t / XS_MS_DAY);
+    double msd = t - days * XS_MS_DAY;
+    xs_civil_from_days((int64_t)days, &f->y, &f->mon, &f->d);
+    f->mon -= 1;
+    int64_t m = (int64_t)msd;
+    f->ms = m % 1000; m /= 1000;
+    f->s = m % 60; m /= 60;
+    f->mi = m % 60;
+    f->h = m / 60;
+    f->wd = (((int64_t)days % 7) + 11) % 7; /* 1970-01-01 was a Thursday */
+    return true;
+}
+
+static void xs_Date_free(void *p) { xs_obj_free(p); }
+static void xs_Date_print(void *p);
+static xs_Date *xs_date_make(double t) {
+    xs_Date *d = xs_obj_alloc(sizeof *d, xs_Date_free, xs_Date_print);
+    d->t = xs_time_clip(t);
+    return d;
+}
+XS_NOINLINE xs_Date *xs_Date_new_now(void) { return xs_date_make(xs_date_now()); }
+XS_NOINLINE xs_Date *xs_Date_new_ms(double t) { return xs_date_make(t); }
+XS_NOINLINE xs_Date *xs_Date_new_copy(xs_Date *o) { return xs_date_make(o->t); }
+/* new Date(y, m, d = 1, h = 0, mi = 0, s = 0, ms = 0), in local time; years 0..99 mean 1900..1999 */
+XS_NOINLINE xs_Date *xs_Date_new_parts(double y, double mon, double d, double h, double mi, double s, double ms) {
+    if (isfinite(y) && trunc(y) >= 0 && trunc(y) <= 99) y = 1900 + trunc(y);
+    return xs_date_make(xs_local_to_utc(xs_make_date(y, mon, d, h, mi, s, ms)));
+}
+/* Date.UTC(y, m = 0, d = 1, ...) */
+XS_NOINLINE double xs_Date_UTC(double y, double mon, double d, double h, double mi, double s, double ms) {
+    if (isfinite(y) && trunc(y) >= 0 && trunc(y) <= 99) y = 1900 + trunc(y);
+    return xs_time_clip(xs_make_date(y, mon, d, h, mi, s, ms));
+}
+
+/* ---- parsing: ISO 8601 (date only: UTC; date and time without offset: local), then the legacy forms
+   engines accept: "Fri, 06 Nov 2026 10:00:00 GMT", "Nov 6, 2026 10:00", "2026/11/06 10:00", "11/06/2026" ---- */
+static int xs_dnum(const char **p, const char *e, int min, int max, int64_t *v) {
+    int n = 0;
+    *v = 0;
+    while (*p < e && **p >= '0' && **p <= '9' && n < max) { *v = *v * 10 + (**p - '0'); (*p)++; n++; }
+    return n >= min ? n : -1;
+}
+static double xs_parse_iso(const char *p, const char *e) {
+    int64_t y, mon = 1, d = 1, h = 0, mi = 0, s = 0;
+    double ms = 0;
+    int sign = 1;
+    if (p < e && (*p == '+' || *p == '-')) { sign = *p == '-' ? -1 : 1; p++; if (xs_dnum(&p, e, 6, 6, &y) < 0) return NAN; if (sign < 0 && y == 0) return NAN; }
+    else if (xs_dnum(&p, e, 4, 4, &y) < 0) return NAN;
+    y *= sign;
+    bool has_time = false, utc = true;
+    if (p < e && *p == '-') {
+        p++;
+        if (xs_dnum(&p, e, 2, 2, &mon) < 0 || mon < 1 || mon > 12) return NAN;
+        if (p < e && *p == '-') { p++; if (xs_dnum(&p, e, 2, 2, &d) < 0 || d < 1 || d > 31) return NAN; }
+    }
+    if (p < e && (*p == 'T' || *p == 't' || *p == ' ')) {
+        p++;
+        has_time = true;
+        utc = false;
+        if (xs_dnum(&p, e, 2, 2, &h) < 0 || p >= e || *p != ':') return NAN;
+        p++;
+        if (xs_dnum(&p, e, 2, 2, &mi) < 0) return NAN;
+        if (p < e && *p == ':') {
+            p++;
+            if (xs_dnum(&p, e, 2, 2, &s) < 0) return NAN;
+            if (p < e && (*p == '.' || *p == ',')) {
+                p++;
+                double scale = 100;
+                int nd = 0;
+                while (p < e && *p >= '0' && *p <= '9') { if (nd < 3) ms += (*p - '0') * scale; scale /= 10; p++; nd++; }
+                if (!nd) return NAN;
+            }
+        }
+        if (h > 24 || mi > 59 || s > 59 || (h == 24 && (mi || s || ms))) return NAN;
+        if (p < e && (*p == 'Z' || *p == 'z')) { p++; utc = true; }
+        else if (p < e && (*p == '+' || *p == '-')) {
+            int sg = *p == '-' ? -1 : 1;
+            p++;
+            int64_t oh, om = 0;
+            if (xs_dnum(&p, e, 2, 2, &oh) < 0) return NAN;
+            if (p < e && *p == ':') p++;
+            if (p < e && xs_dnum(&p, e, 2, 2, &om) < 0) return NAN;
+            if (p != e) return NAN;
+            double t = xs_make_date((double)y, (double)(mon - 1), (double)d, (double)h, (double)mi, (double)s, ms);
+            return xs_time_clip(t - sg * (double)(oh * 60 + om) * 60000);
+        }
+    }
+    if (p != e) return NAN;
+    double t = xs_make_date((double)y, (double)(mon - 1), (double)d, (double)h, (double)mi, (double)s, ms);
+    (void)has_time;
+    return xs_time_clip(utc ? t : xs_local_to_utc(t));
+}
+static const char *xs_month_names[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+static const char *xs_day_names[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+static double xs_parse_legacy(const char *p, const char *e) {
+    int64_t nums[8];
+    int nn = 0;
+    int64_t mon = -1, h = -1, mi = 0, s = 0;
+    bool pm = false, am = false, utc = false, slash = false;
+    double off = 0;
+    bool has_off = false;
+    while (p < e) {
+        char c = *p;
+        if (c >= '0' && c <= '9') {
+            int64_t v;
+            const char *st = p;
+            xs_dnum(&p, e, 1, 9, &v);
+            if (p < e && *p == ':' && h < 0) { /* a time: h:mm[:ss] */
+                h = v;
+                p++;
+                if (xs_dnum(&p, e, 1, 2, &mi) < 0) return NAN;
+                if (p < e && *p == ':') { p++; if (xs_dnum(&p, e, 1, 2, &s) < 0) return NAN; }
+                continue;
+            }
+            if (nn == 8) return NAN;
+            (void)st;
+            nums[nn++] = v;
+            if (p < e && *p == '/') { slash = true; p++; }
+            continue;
+        }
+        if ((c == '+' || c == '-') && p + 1 < e && p[1] >= '0' && p[1] <= '9' && (utc || h >= 0)) { /* GMT+0300, +03:00 */
+            int sg = c == '-' ? -1 : 1;
+            p++;
+            int64_t v;
+            int nd = xs_dnum(&p, e, 1, 4, &v);
+            int64_t oh = nd <= 2 ? v : v / 100, om = nd <= 2 ? 0 : v % 100;
+            if (p < e && *p == ':') { p++; xs_dnum(&p, e, 1, 2, &om); }
+            off = sg * (double)(oh * 60 + om) * 60000;
+            has_off = true;
+            continue;
+        }
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+            const char *st = p;
+            while (p < e && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z'))) p++;
+            size_t n = (size_t)(p - st);
+            if ((n == 3 && strncasecmp(st, "GMT", 3) == 0) || (n == 3 && strncasecmp(st, "UTC", 3) == 0) || (n == 1 && (*st == 'Z' || *st == 'z'))) { utc = true; continue; }
+            if (n == 2 && strncasecmp(st, "AM", 2) == 0) { am = true; continue; }
+            if (n == 2 && strncasecmp(st, "PM", 2) == 0) { pm = true; continue; }
+            bool known = false;
+            for (int k = 0; k < 12 && n >= 3; k++) if (strncasecmp(st, xs_month_names[k], 3) == 0) { mon = k; known = true; }
+            for (int k = 0; k < 7 && n >= 3 && !known; k++) if (strncasecmp(st, xs_day_names[k], 3) == 0) known = true;
+            if (!known) return NAN;
+            continue;
+        }
+        if (c == '(') { while (p < e && *p != ')') p++; if (p < e) p++; continue; } /* (Brasilia Standard Time) */
+        if (c == ' ' || c == ',' || c == '.' || c == '-' || c == '/') { p++; continue; }
+        return NAN;
+    }
+    int64_t y, m, d;
+    if (mon >= 0) { /* Nov 6 2026 / 6 Nov 2026 */
+        if (nn < 2) return NAN;
+        m = mon;
+        if (nums[0] > 31) { y = nums[0]; d = nums[1]; } else { d = nums[0]; y = nums[1]; }
+    } else {
+        if (nn < 3) return NAN;
+        if (nums[0] > 31) { y = nums[0]; m = nums[1] - 1; d = nums[2]; } /* 2026/11/06 */
+        else { m = nums[0] - 1; d = nums[1]; y = nums[2]; }             /* 11/06/2026 */
+    }
+    (void)slash;
+    if (y >= 0 && y <= 49) y += 2000;
+    else if (y >= 50 && y <= 99) y += 1900;
+    if (h < 0) h = 0;
+    if (pm && h < 12) h += 12;
+    if (am && h == 12) h = 0;
+    if (m < 0 || m > 11 || d < 1 || d > 31 || h > 24 || mi > 59 || s > 59) return NAN;
+    double t = xs_make_date((double)y, (double)m, (double)d, (double)h, (double)mi, (double)s, 0);
+    if (has_off) return xs_time_clip(t - off);
+    return xs_time_clip(utc ? t : xs_local_to_utc(t));
+}
+XS_NOINLINE double xs_Date_parse(xs_str *s) {
+    const char *p = s->data, *e = s->data + s->len;
+    while (p < e && *p == ' ') p++;
+    while (e > p && e[-1] == ' ') e--;
+    double t = xs_parse_iso(p, e);
+    if (isnan(t)) t = xs_parse_legacy(p, e);
+    return t;
+}
+XS_NOINLINE xs_Date *xs_Date_new_str(xs_str *s) { return xs_date_make(xs_Date_parse(s)); }
+
+/* ---- formatting ---- */
+static inline char *xs_dig(char *o, int64_t v, int w) { for (int i = w - 1; i >= 0; i--) { o[i] = (char)('0' + v % 10); v /= 10; } return o + w; }
+static int xs_iso_into(double t, char *b) {
+    xs_dfields f;
+    xs_date_fields(t, false, &f);
+    char *o = b;
+    if (f.y >= 0 && f.y <= 9999) o = xs_dig(o, f.y, 4);
+    else { *o++ = f.y < 0 ? '-' : '+'; o = xs_dig(o, f.y < 0 ? -f.y : f.y, 6); }
+    *o++ = '-'; o = xs_dig(o, f.mon + 1, 2);
+    *o++ = '-'; o = xs_dig(o, f.d, 2);
+    *o++ = 'T'; o = xs_dig(o, f.h, 2);
+    *o++ = ':'; o = xs_dig(o, f.mi, 2);
+    *o++ = ':'; o = xs_dig(o, f.s, 2);
+    *o++ = '.'; o = xs_dig(o, f.ms, 3);
+    *o++ = 'Z';
+    *o = 0;
+    return (int)(o - b);
+}
+XS_NOINLINE void xr_date_range_error(void) {
+    xs_Error *e = xs_Error_new(xs_str_new("Invalid time value", 18));
+    xs_release(e->f_message);
+    xs_release(e->f_name);
+    e->f_name = xs_str_new("RangeError", 10);
+    xs_throw(e);
+}
+XS_NOINLINE xs_str *xs_Date_toISOString(xs_Date *d) {
+    if (isnan(d->t)) xr_date_range_error();
+    char b[40];
+    int n = xs_iso_into(d->t, b);
+    return xs_str_new(b, (size_t)n);
+}
+static void xs_Date_print(void *p) {
+    xs_Date *d = p;
+    if (isnan(d->t)) { fputs("Invalid Date", XS_OUT); return; }
+    char b[40];
+    fwrite(b, 1, (size_t)xs_iso_into(d->t, b), XS_OUT);
+}
+static xs_str *xs_date_fmt(xs_Date *d, int kind) { /* 0 toString, 1 toDateString, 2 toTimeString, 3 toUTCString */
+    if (isnan(d->t)) return xs_str_new("Invalid Date", 12);
+    xs_dfields f;
+    xs_date_fields(d->t, kind != 3, &f);
+    char b[160], ys[16];
+    if (f.y >= 0) snprintf(ys, sizeof ys, "%04lld", (long long)f.y); else snprintf(ys, sizeof ys, "-%06lld", (long long)-f.y);
+    int n = 0;
+    if (kind == 3) {
+        n = snprintf(b, sizeof b, "%s, %02lld %s %s %02lld:%02lld:%02lld GMT", xs_day_names[f.wd], (long long)f.d, xs_month_names[f.mon], ys, (long long)f.h, (long long)f.mi, (long long)f.s);
+        return xs_str_new(b, (size_t)n);
+    }
+    if (kind != 2) n += snprintf(b + n, sizeof b - (size_t)n, "%s %s %02lld %s", xs_day_names[f.wd], xs_month_names[f.mon], (long long)f.d, ys);
+    if (kind != 1) {
+        double off = xs_tz_offset(d->t) / 60000;
+        int o = (int)off, ao = o < 0 ? -o : o;
+        time_t secs = (time_t)floor(d->t / 1000);
+        struct tm tm;
+#if defined(_WIN32)
+        localtime_s(&tm, &secs);
+        char zone[64];
+        size_t zl = 0;
+        _get_tzname(&zl, zone, sizeof zone, tm.tm_isdst > 0); /* the system's own name: no ICU data */
+        const char *zn = zone;
+#else
+        localtime_r(&secs, &tm);
+        const char *zn = tm.tm_zone ? tm.tm_zone : "";
+#endif
+        n += snprintf(b + n, sizeof b - (size_t)n, "%s%02lld:%02lld:%02lld GMT%c%02d%02d (%s)", kind == 0 ? " " : "", (long long)f.h, (long long)f.mi, (long long)f.s,
+                      o < 0 ? '-' : '+', ao / 60, ao % 60, zn);
+    }
+    return xs_str_new(b, (size_t)n);
+}
+XS_NOINLINE xs_str *xs_Date_toString(xs_Date *d) { return xs_date_fmt(d, 0); }
+XS_NOINLINE xs_str *xs_Date_toDateString(xs_Date *d) { return xs_date_fmt(d, 1); }
+XS_NOINLINE xs_str *xs_Date_toTimeString(xs_Date *d) { return xs_date_fmt(d, 2); }
+XS_NOINLINE xs_str *xs_Date_toUTCString(xs_Date *d) { return xs_date_fmt(d, 3); }
+/* toLocale*String() without arguments: en-US, as Node prints by default ("11/6/2026, 3:01:00 PM") */
+static xs_str *xs_date_locale(xs_Date *d, int kind) { /* 0 both, 1 date, 2 time */
+    if (isnan(d->t)) return xs_str_new("Invalid Date", 12);
+    xs_dfields f;
+    xs_date_fields(d->t, true, &f);
+    char b[80];
+    int n = 0;
+    if (kind != 2) n += snprintf(b + n, sizeof b, "%lld/%lld/%lld", (long long)f.mon + 1, (long long)f.d, (long long)f.y);
+    if (kind == 0) n += snprintf(b + n, sizeof b - (size_t)n, ", ");
+    if (kind != 1) {
+        int64_t h12 = f.h % 12 == 0 ? 12 : f.h % 12;
+        n += snprintf(b + n, sizeof b - (size_t)n, "%lld:%02lld:%02lld %s", (long long)h12, (long long)f.mi, (long long)f.s, f.h < 12 ? "AM" : "PM");
+    }
+    return xs_str_new(b, (size_t)n);
+}
+XS_NOINLINE xs_str *xs_Date_toLocaleString(xs_Date *d) { return xs_date_locale(d, 0); }
+XS_NOINLINE xs_str *xs_Date_toLocaleDateString(xs_Date *d) { return xs_date_locale(d, 1); }
+XS_NOINLINE xs_str *xs_Date_toLocaleTimeString(xs_Date *d) { return xs_date_locale(d, 2); }
+
+/* ---- getters: ints (0 for an invalid date, where JS has NaN) ---- */
+static inline double xs_Date_getTime(xs_Date *d) { return d->t; }
+#define XS_DATE_GET(name, field, local) \
+    static int64_t xs_Date_##name(xs_Date *d) { xs_dfields f; return xs_date_fields(d->t, local, &f) ? f.field : 0; }
+XS_DATE_GET(getFullYear, y, true) XS_DATE_GET(getMonth, mon, true) XS_DATE_GET(getDate, d, true) XS_DATE_GET(getDay, wd, true)
+XS_DATE_GET(getHours, h, true) XS_DATE_GET(getMinutes, mi, true) XS_DATE_GET(getSeconds, s, true) XS_DATE_GET(getMilliseconds, ms, true)
+XS_DATE_GET(getUTCFullYear, y, false) XS_DATE_GET(getUTCMonth, mon, false) XS_DATE_GET(getUTCDate, d, false) XS_DATE_GET(getUTCDay, wd, false)
+XS_DATE_GET(getUTCHours, h, false) XS_DATE_GET(getUTCMinutes, mi, false) XS_DATE_GET(getUTCSeconds, s, false) XS_DATE_GET(getUTCMilliseconds, ms, false)
+static int64_t xs_Date_getTimezoneOffset(xs_Date *d) { return isnan(d->t) ? 0 : (int64_t)(-xs_tz_offset(d->t) / 60000); }
+
+/* ---- setters: set(d, which, n, a, b, c, e): `n` arguments given, the others keep the date's fields ---- */
+XS_NOINLINE double xs_Date_set(xs_Date *d, int64_t which, int64_t n, double a, double b, double c, double e) {
+    /* which: 0 FullYear(y, m, d), 1 Month(m, d), 2 Date(d), 3 Hours(h, mi, s, ms), 4 Minutes(mi, s, ms),
+       5 Seconds(s, ms), 6 Milliseconds(ms); + 8: the UTC versions */
+    bool local = which < 8;
+    int w = (int)(which & 7);
+    xs_dfields f;
+    if (!xs_date_fields(d->t, local, &f)) {
+        if (w != 0) return d->t; /* only setFullYear revives an invalid date */
+        f = (xs_dfields){1970, 0, 1, 0, 0, 0, 0, 0};
+    }
+    double y = (double)f.y, mon = (double)f.mon, dd = (double)f.d, h = (double)f.h, mi = (double)f.mi, s = (double)f.s, ms = (double)f.ms;
+    double v[4] = {a, b, c, e};
+    double *slots[7] = {&y, &mon, &dd, &h, &mi, &s, &ms};
+    int first = w == 0 ? 0 : w == 1 ? 1 : w == 2 ? 2 : w;
+    int maxn = w == 0 ? 3 : w == 1 ? 2 : w == 2 ? 1 : w == 3 ? 4 : w == 4 ? 3 : w == 5 ? 2 : 1;
+    for (int i = 0; i < n && i < maxn; i++) *slots[first + i] = v[i];
+    double t = xs_make_date(y, mon, dd, h, mi, s, ms);
+    d->t = xs_time_clip(local ? xs_local_to_utc(t) : t);
+    return d->t;
+}
+XS_NOINLINE double xs_Date_setTime(xs_Date *d, double t) { d->t = xs_time_clip(t); return d->t; }
+/* JSON: a Date is written as its ISO text (null when invalid, as toJSON gives); a typed read takes that text */
+static void xs_sb_date(xs_sb *b, xs_Date *d) {
+    if (isnan(d->t)) { xs_sb_put(b, "null", 4); return; }
+    char t[40];
+    int n = xs_iso_into(d->t, t);
+    xs_sb_put(b, "\"", 1);
+    xs_sb_put(b, t, (size_t)n);
+    xs_sb_put(b, "\"", 1);
+}
+XS_NOINLINE xs_Date *xs_json_date(xs_jv *v, const char *where) {
+    if (v->kind != XJ_STR) xs_panicf("JSON: '%s' must be a date (ISO text)", where);
+    xs_str *s = xs_str_new(v->str, v->slen);
+    xs_Date *d = xs_Date_new_str(s);
+    xs_release(s);
+    return d;
+}
+
+static xs_arr_ref *xs_argv;
+static xs_map *xs_env;
+static xs_arr_ref *xs_process_argv(void) { return xs_argv; }
+static xs_map *xs_process_env(void) { return xs_env; }
+static void xs_process_exit(int64_t code) { fflush(stdout); exit((int)code); }
+/* process.stdout.write / process.stderr.write: through the same FILE as console.log, so the order is kept */
+static bool xs_stdout_write_str(xs_str *s) { fwrite(s->data, 1, (size_t)s->len, XS_OUT); return true; }
+static bool xs_stderr_write_str(xs_str *s) { fwrite(s->data, 1, (size_t)s->len, stderr); return true; }
+
+#if !defined(_WIN32) /* there, the C library's environ is a macro over a function */
+extern char **environ __attribute__((visibility("default"))); /* the C library's: not one of the runtime's hidden symbols */
+#endif
+static void xs_std_init(int argc, char **argv) {
+    xs_argv = xs_arr_ref_new((size_t)(argc + 1), xs_print_str_quoted_);
+    /* like Node: [runtime, script, ...args]; the executable stands for both */
+    xs_arr_ref_push(xs_argv, xs_str_new(argc ? argv[0] : "", argc ? strlen(argv[0]) : 0));
+    for (int i = 0; i < argc; i++) xs_arr_ref_push(xs_argv, xs_str_new(argv[i], strlen(argv[i])));
+    xs_env = xs_map_new(1, 1, 3, xs_print_str_quoted_, xs_print_str_quoted_);
+    for (char **e = environ; e && *e; e++) {
+        const char *eq = strchr(*e, '=');
+        if (!eq) continue;
+        xs_str *k = xs_str_new(*e, (size_t)(eq - *e));
+        xs_map_set_s(xs_env, k, XS_VPTR(xs_str_new(eq + 1, strlen(eq + 1))));
+        xs_release(k);
+    }
+    xs_argv->hdr.rc = XS_IMMORTAL; /* process-lifetime objects: not counted as allocations or leaks */
+    xs_env->hdr.rc = XS_IMMORTAL;
+    xs_live = 0;
+    xs_allocs = 0;
+}
+
+/* all of a stream that cannot seek (a pipe, the terminal, /dev/stdin), in a malloc'd buffer with `front` bytes
+   kept free at the start (a string's header) and one more at the end (its NUL) */
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#endif
+static char *xs_read_stream(FILE *f, size_t front, size_t *len) {
+    size_t cap = front + 65536, n = 0;
+#if !defined(_WIN32)
+    { /* a regular file (stdin redirected from one): its size, so the buffer is made once instead of doubling */
+        struct stat st;
+        if (fstat(fileno(f), &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+            off_t at = ftello(f);
+            if (at >= 0 && st.st_size > at) cap = front + (size_t)(st.st_size - at) + 2;
+        }
+    }
+#endif
+    char *buf = malloc(cap);
+    if (!buf) xs_panic("out of memory");
+    for (;;) {
+        if (front + n + 1 >= cap) { cap *= 2; buf = realloc(buf, cap); if (!buf) xs_panic("out of memory"); }
+        size_t got = fread(buf + front + n, 1, cap - front - n - 1, f);
+        n += got;
+        if (got == 0) break;
+    }
+    *len = n;
+    return buf;
+}
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#endif
+static void xs_stdin_binary(void) {
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY); /* the bytes as they are, \r\n too, as Node reads them */
+#endif
+}
+/* readFileSync(0, "utf8") and readFileSync(0): all of standard input */
+XS_NOINLINE xs_str *xs_fs_read_stdin(void) {
+    xs_stdin_binary();
+    size_t n;
+    char *buf = xs_read_stream(stdin, offsetof(xs_str, data), &n);
+    buf[offsetof(xs_str, data) + n] = 0;
+    return xs_str_adopt(buf, n);
+}
+XS_NOINLINE xs_str *xs_fs_read(xs_str *path) {
+    FILE *f = fopen(path->data, "rb");
+    if (!f) xs_panicf("ENOENT: no such file or directory, open '%s'", path->data);
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    if (n < 0) { /* not a regular file (/dev/stdin on a pipe): read until the end */
+        size_t m;
+        char *buf = xs_read_stream(f, offsetof(xs_str, data), &m);
+        fclose(f);
+        buf[offsetof(xs_str, data) + m] = 0;
+        return xs_str_adopt(buf, m);
+    }
+    fseek(f, 0, SEEK_SET);
+    xs_str *s = xs_str_alloc(n > 0 ? n : 0);
+    if (n > 0 && fread(s->data, 1, (size_t)n, f) != (size_t)n) { fclose(f); xs_panicf("EIO: cannot read '%s'", path->data); }
+    s->data[s->len] = 0;
+    fclose(f);
+    return s;
+}
+XS_NOINLINE void xs_fs_write_mode(xs_str *path, xs_str *data, const char *mode) {
+    FILE *f = fopen(path->data, mode);
+    if (!f) xs_panicf("EACCES: cannot open '%s' for writing", path->data);
+    fwrite(data->data, 1, (size_t)data->len, f);
+    fclose(f);
+}
+XS_NOINLINE void xs_fs_write(xs_str *path, xs_str *data) { xs_fs_write_mode(path, data, "wb"); }
+XS_NOINLINE void xs_fs_append(xs_str *path, xs_str *data) { xs_fs_write_mode(path, data, "ab"); }
+static bool xs_fs_exists(xs_str *path) { return access(path->data, F_OK) == 0; }
+
+/* ---- bytes: Uint8Array (and Buffer, the same object printed the Node way), TextEncoder/Decoder, base64/hex ----
+   An array owns its bytes, or is a view (subarray) on another one's, which it keeps alive. Indexing is bounds
+   checked like arrays; a write keeps the low 8 bits, as in JS. */
+typedef struct xs_Uint8Array { xs_hdr hdr; int64_t f_length; uint8_t *data; void *owner; } xs_Uint8Array;
+#include <errno.h>
+/* a big block goes to the file with write(2), after what stdio holds: through stdio's small buffer, 254 MB to
+   /dev/null took 140 ms (macOS copies it piece by piece); written straight it is a single call */
+static void xs_write_big(FILE *f, const void *p, size_t n) {
+#if !defined(_WIN32)
+    if (n >= 65536 && !xs_out_f) {
+        fflush(f);
+        int fd = fileno(f);
+        const char *q = p;
+        while (n > 0) {
+            ssize_t w = write(fd, q, n);
+            if (w < 0) { if (errno == EINTR) continue; fwrite(q, 1, n, f); return; } /* (let stdio report it) */
+            q += w;
+            n -= (size_t)w;
+        }
+        return;
+    }
+#endif
+    fwrite(p, 1, n, f);
+}
+static bool xs_stdout_write_bytes(xs_Uint8Array *b) { xs_write_big(XS_OUT, b->data, (size_t)b->f_length); return true; }
+static bool xs_stderr_write_bytes(xs_Uint8Array *b) { xs_write_big(stderr, b->data, (size_t)b->f_length); return true; }
+static uint32_t xs_utf8_cp(const unsigned char *s, size_t n, size_t *len) { /* one code point (U+FFFD for a bad byte) */
+    unsigned c = s[0];
+    if (c < 0x80) { *len = 1; return c; }
+    int k = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+    if (k == 1 || (size_t)k > n) { *len = 1; return 0xFFFD; }
+    uint32_t cp = c & (0xFFu >> (k + 1));
+    for (int i = 1; i < k; i++) cp = (cp << 6) | (s[i] & 0x3Fu);
+    *len = (size_t)k;
+    return cp;
+}
+static void xs_u8_free(void *p) {
+    xs_Uint8Array *b = p;
+    if (b->owner) xs_release(b->owner); else free(b->data);
+    xs_obj_free(p);
+}
+static void xs_u8_print(void *p) {
+    xs_Uint8Array *b = p;
+    xs_insp fr;
+    if (!xs_insp_begin(&fr, p, "Uint8Array", b->f_length ? NULL : "Uint8Array(0) []")) return;
+    int64_t n = b->f_length < 100 ? b->f_length : 100;
+    for (int64_t i = 0; i < n; i++) { xs_insp_entry(&fr); fprintf(XS_OUT, "%d", b->data[i]); }
+    if (b->f_length > 100) { xs_insp_entry(&fr); fprintf(XS_OUT, "... %lld more item%s", (long long)(b->f_length - 100), b->f_length - 100 == 1 ? "" : "s"); }
+    char open[48];
+    snprintf(open, sizeof open, "Uint8Array(%lld) [", (long long)b->f_length);
+    xs_insp_end(&fr, open, "]", true, true, b->f_length > 100);
+}
+static void xs_buf_print(void *p) {
+    xs_Uint8Array *b = p;
+    fputs("<Buffer", XS_OUT);
+    int64_t n = b->f_length < 50 ? b->f_length : 50;
+    for (int64_t i = 0; i < n; i++) fprintf(XS_OUT, " %02x", b->data[i]);
+    if (b->f_length > 50) fprintf(XS_OUT, " ... %lld more byte%s", (long long)(b->f_length - 50), b->f_length - 50 == 1 ? "" : "s");
+    fputc('>', XS_OUT);
+}
+static inline bool xs_is_buffer(xs_Uint8Array *b) { return b->hdr.type->print == xs_buf_print; }
+XS_NOINLINE xs_Uint8Array *xs_u8_raw(int64_t n, bool buffer, bool zero) {
+    if (n < 0 || n > ((int64_t)1 << 40)) xs_panic("RangeError: Invalid typed array length");
+    xs_Uint8Array *b = buffer ? xs_obj_alloc(sizeof *b, xs_u8_free, xs_buf_print) : xs_obj_alloc(sizeof *b, xs_u8_free, xs_u8_print);
+    b->f_length = n;
+    b->data = zero ? calloc((size_t)(n ? n : 1), 1) : malloc((size_t)(n ? n : 1));
+    if (!b->data) xs_panic("out of memory");
+    return b;
+}
+XS_NOINLINE xs_Uint8Array *xs_u8_new(int64_t n) { return xs_u8_raw(n, false, true); }
+XS_NOINLINE xs_Uint8Array *xs_u8_from_ints(xs_arr_int *a) {
+    xs_Uint8Array *b = xs_u8_raw((int64_t)a->len, false, false);
+    for (size_t i = 0; i < a->len; i++) b->data[i] = (uint8_t)a->data[i];
+    return b;
+}
+XS_NOINLINE xs_Uint8Array *xs_u8_from_nums(xs_arr_num *a) {
+    xs_Uint8Array *b = xs_u8_raw((int64_t)a->len, false, false);
+    for (size_t i = 0; i < a->len; i++) { double v = a->data[i]; b->data[i] = isfinite(v) ? (uint8_t)(int64_t)fmod(trunc(v), 256) : 0; }
+    return b;
+}
+XS_NOINLINE xs_Uint8Array *xs_u8_copy_kind(xs_Uint8Array *s, bool buffer) {
+    xs_Uint8Array *b = xs_u8_raw(s->f_length, buffer, false);
+    memcpy(b->data, s->data, (size_t)s->f_length);
+    return b;
+}
+XS_NOINLINE xs_Uint8Array *xs_u8_copy(xs_Uint8Array *s) { return xs_u8_copy_kind(s, false); }
+/* b[i] is read and written as a byte type that is not a character type: a write through uint8_t may alias
+   anything (C's char rule), so the compiler reloaded b->length and b->data after every byte stored; through
+   _BitInt(8) it keeps them in registers (a fill loop went from 54 to 39 ms per 64 MB) */
+#if (defined(__clang__) && __clang_major__ >= 14) || (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 14)
+__extension__ typedef unsigned _BitInt(8) xs_byte;
+#else
+typedef uint8_t xs_byte;
+#endif
+/* the length, with the bound every Uint8Array has (xs_u8_raw): an index below it times a small constant
+   cannot overflow, so the compiler drops those checks in `for (i = 0; i < b.length; i++) b[i] = i * 31` */
+static inline int64_t xs_u8_len(xs_Uint8Array *b) {
+    int64_t n = b->f_length;
+#if defined(__clang__)
+    __builtin_assume(n >= 0 && n <= ((int64_t)1 << 40));
+#else
+    if (n < 0 || n > ((int64_t)1 << 40)) __builtin_unreachable();
+#endif
+    return n;
+}
+static inline xs_byte *xs_u8_ptr(xs_Uint8Array *b, int64_t i, const xs_site *s) {
+    if ((uint64_t)i >= (uint64_t)b->f_length) XS_FAIL("index out of bounds", s);
+    return (xs_byte *)&b->data[i];
+}
+static inline int64_t xs_u8_get(xs_Uint8Array *b, int64_t i, const xs_site *s) { return (int64_t)*xs_u8_ptr(b, i, s); }
+static inline int64_t xs_u8_set(xs_Uint8Array *b, int64_t i, int64_t v, const xs_site *s) { *xs_u8_ptr(b, i, s) = (xs_byte)v; return v; }
+
+/* relative index as slice() reads it: negative from the end, clamped; INT64_MIN: "not given" -> dflt */
+static int64_t xs_u8_rel(int64_t i, int64_t len, int64_t dflt) {
+    if (i == INT64_MIN) return dflt;
+    if (i < 0) { i += len; return i < 0 ? 0 : i; }
+    return i > len ? len : i;
+}
+XS_NOINLINE xs_Uint8Array *xs_u8_slice(xs_Uint8Array *b, int64_t start, int64_t end) { /* a copy (a Buffer's slice is a view, as in Node) */
+    int64_t s = xs_u8_rel(start, b->f_length, 0), e = xs_u8_rel(end, b->f_length, b->f_length);
+    if (xs_is_buffer(b)) {
+        xs_Uint8Array *v = xs_obj_alloc(sizeof *v, xs_u8_free, xs_buf_print);
+        v->f_length = e > s ? e - s : 0;
+        v->data = b->data + s;
+        v->owner = xs_retain(b->owner ? b->owner : b);
+        return v;
+    }
+    xs_Uint8Array *r = xs_u8_raw(e > s ? e - s : 0, false, false);
+    if (e > s) memcpy(r->data, b->data + s, (size_t)(e - s));
+    return r;
+}
+XS_NOINLINE xs_Uint8Array *xs_u8_subarray(xs_Uint8Array *b, int64_t start, int64_t end) { /* a view on the same bytes */
+    int64_t s = xs_u8_rel(start, b->f_length, 0), e = xs_u8_rel(end, b->f_length, b->f_length);
+    xs_Uint8Array *v = xs_is_buffer(b) ? xs_obj_alloc(sizeof *v, xs_u8_free, xs_buf_print) : xs_obj_alloc(sizeof *v, xs_u8_free, xs_u8_print);
+    v->f_length = e > s ? e - s : 0;
+    v->data = b->data + s;
+    v->owner = xs_retain(b->owner ? b->owner : b);
+    return v;
+}
+XS_NOINLINE void xs_u8_set_from(xs_Uint8Array *dst, xs_Uint8Array *src, int64_t off) {
+    if (off < 0 || off + src->f_length > dst->f_length) xs_panic("RangeError: offset is out of bounds");
+    memmove(dst->data + off, src->data, (size_t)src->f_length);
+}
+XS_NOINLINE void xs_u8_set_ints(xs_Uint8Array *dst, xs_arr_int *src, int64_t off) {
+    if (off < 0 || off + (int64_t)src->len > dst->f_length) xs_panic("RangeError: offset is out of bounds");
+    for (size_t i = 0; i < src->len; i++) dst->data[off + (int64_t)i] = (uint8_t)src->data[i];
+}
+XS_NOINLINE xs_Uint8Array *xs_u8_fill(xs_Uint8Array *b, int64_t v, int64_t start, int64_t end) {
+    int64_t s = xs_u8_rel(start, b->f_length, 0), e = xs_u8_rel(end, b->f_length, b->f_length);
+    if (e > s) memset(b->data + s, (int)(uint8_t)v, (size_t)(e - s));
+    return xs_retain(b); /* the array itself (a method result is owned) */
+}
+XS_NOINLINE int64_t xs_u8_index_of(xs_Uint8Array *b, int64_t v, int64_t from) {
+    if (v < 0 || v > 255) return -1;
+    int64_t s = xs_u8_rel(from, b->f_length, 0);
+    if (s >= b->f_length) return -1;
+    const uint8_t *h = memchr(b->data + s, (int)v, (size_t)(b->f_length - s));
+    return h ? (int64_t)(h - b->data) : -1;
+}
+XS_NOINLINE bool xs_u8_includes(xs_Uint8Array *b, int64_t v) { return xs_u8_index_of(b, v, 0) >= 0; }
+XS_NOINLINE int64_t xs_buf_index_of_str(xs_Uint8Array *b, xs_str *p, int64_t from) {
+    int64_t s = xs_u8_rel(from, b->f_length, 0);
+    if (s > b->f_length) return -1;
+    if (p->len == 0) return s;
+    const char *h = xs_find((const char *)b->data + s, (size_t)(b->f_length - s), p->data, (size_t)p->len);
+    return h ? (int64_t)((const uint8_t *)h - b->data) : -1;
+}
+XS_NOINLINE bool xs_buf_includes_str(xs_Uint8Array *b, xs_str *p, int64_t from) { return xs_buf_index_of_str(b, p, from) >= 0; }
+XS_NOINLINE xs_Uint8Array *xs_u8_reverse(xs_Uint8Array *b) {
+    for (int64_t i = 0, j = b->f_length - 1; i < j; i++, j--) { uint8_t t = b->data[i]; b->data[i] = b->data[j]; b->data[j] = t; }
+    return xs_retain(b);
+}
+XS_NOINLINE bool xs_u8_equals(xs_Uint8Array *a, xs_Uint8Array *b) { return a->f_length == b->f_length && memcmp(a->data, b->data, (size_t)a->f_length) == 0; }
+XS_NOINLINE xs_str *xs_u8_join(xs_Uint8Array *b, xs_str *sep) {
+    xs_sb sb = {0};
+    char t[4];
+    for (int64_t i = 0; i < b->f_length; i++) {
+        if (i) xs_sb_put(&sb, sep->data, (size_t)sep->len);
+        int v = b->data[i], n = 0;
+        if (v >= 100) t[n++] = (char)('0' + v / 100);
+        if (v >= 10) t[n++] = (char)('0' + v / 10 % 10);
+        t[n++] = (char)('0' + v % 10);
+        xs_sb_put(&sb, t, (size_t)n);
+    }
+    xs_str *r = xs_str_new(sb.data ? sb.data : "", sb.len);
+    free(sb.data);
+    return r;
+}
+static xs_arr_int *xs_u8_to_ints(xs_Uint8Array *b) { /* Array.from(bytes) */
+    xs_arr_int *a = xs_arr_int_new(b->f_length, 0);
+    for (int64_t i = 0; i < b->f_length; i++) a->data[i] = b->data[i];
+    return a;
+}
+
+/* ---- text ---- */
+XS_NOINLINE xs_Uint8Array *xs_text_encode(xs_str *s) { /* new TextEncoder().encode(s): the UTF-8 bytes */
+    xs_Uint8Array *b = xs_u8_raw(s->len, false, false);
+    memcpy(b->data, s->data, (size_t)s->len);
+    return b;
+}
+/* UTF-8 bytes to a string; ill-formed sequences become U+FFFD, as TextDecoder and Buffer do */
+static xs_str *xs_utf8_decode(const uint8_t *p, int64_t n) {
+    int64_t i = 0;
+    while (i < n && p[i] < 0x80) i++;
+    if (i == n) return xs_str_new((const char *)p, (size_t)n); /* ASCII: as is */
+    xs_sb sb = {0};
+    xs_sb_put(&sb, (const char *)p, (size_t)i);
+    while (i < n) {
+        uint8_t c = p[i];
+        if (c < 0x80) { int64_t j = i; while (j < n && p[j] < 0x80) j++; xs_sb_put(&sb, (const char *)p + i, (size_t)(j - i)); i = j; continue; }
+        int k = c >= 0xF0 && c <= 0xF4 ? 4 : c >= 0xE0 ? 3 : c >= 0xC2 && c < 0xE0 ? 2 : 0;
+        bool ok = k > 0 && i + k <= n;
+        for (int j = 1; ok && j < k; j++) if ((p[i + j] & 0xC0) != 0x80) ok = false;
+        if (ok && k == 3) { uint32_t cp = ((c & 0x0Fu) << 12) | ((p[i + 1] & 0x3Fu) << 6) | (p[i + 2] & 0x3Fu); if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF)) ok = false; }
+        if (ok && k == 4) { uint32_t cp = ((c & 0x07u) << 18) | ((p[i + 1] & 0x3Fu) << 12) | ((p[i + 2] & 0x3Fu) << 6) | (p[i + 3] & 0x3Fu); if (cp < 0x10000 || cp > 0x10FFFF) ok = false; }
+        if (ok) { xs_sb_put(&sb, (const char *)p + i, (size_t)k); i += k; continue; }
+        xs_sb_put(&sb, "\xEF\xBF\xBD", 3);
+        i++;
+        while (i < n && (p[i] & 0xC0) == 0x80 && k > 1) { i++; k--; } /* the maximal subpart is one replacement */
+    }
+    xs_str *r = xs_str_new(sb.data, sb.len);
+    free(sb.data);
+    return r;
+}
+XS_NOINLINE xs_str *xs_text_decode(xs_Uint8Array *b) { return xs_utf8_decode(b->data, b->f_length); }
+typedef struct xs_TextEncoder { xs_hdr hdr; } xs_TextEncoder;
+static void xs_TextEncoder_print(void *p) { (void)p; fputs("TextEncoder { encoding: 'utf-8' }", XS_OUT); }
+static void xs_TextDecoder_print(void *p) { (void)p; fputs("TextDecoder { encoding: 'utf-8' }", XS_OUT); }
+static void xs_TextEncoder_free(void *p) { xs_obj_free(p); }
+XS_NOINLINE xs_TextEncoder *xs_TextEncoder_new(void) { return xs_obj_alloc(sizeof(xs_TextEncoder), xs_TextEncoder_free, xs_TextEncoder_print); }
+XS_NOINLINE xs_TextEncoder *xs_TextDecoder_new(void) { return xs_obj_alloc(sizeof(xs_TextEncoder), xs_TextEncoder_free, xs_TextDecoder_print); }
+XS_NOINLINE xs_Uint8Array *xs_TextEncoder_encode(xs_TextEncoder *t, xs_str *s) { (void)t; return xs_text_encode(s); }
+static xs_str *xs_TextDecoder_decode(xs_TextEncoder *t, xs_Uint8Array *b) { (void)t; return xs_text_decode(b); }
+
+/* ---- base64 / hex ---- */
+static const char xs_b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static const char xs_b64url[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+/* arm64: base64 and hex 16 bytes at a time (NEON table lookups); the scalar code does the rest and every
+   error, padding and whitespace case. Other targets use the scalar code only. */
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define XS_NEON 1
+/* hex characters to nibbles, 16 pairs at a time; stops before the first block with a non-hex character */
+static int64_t xs_hex_dec_neon(const char *s, int64_t pairs, uint8_t *out) {
+    int64_t k = 0;
+    const uint8x16_t c0 = vdupq_n_u8('0'), ca = vdupq_n_u8('a'), lower = vdupq_n_u8(0x20), ten = vdupq_n_u8(10), six = vdupq_n_u8(6);
+    for (; k + 16 <= pairs; k += 16) {
+        uint8x16x2_t c = vld2q_u8((const uint8_t *)s + 2 * k);
+        uint8x16_t n[2], bad = vdupq_n_u8(0);
+        for (int h = 0; h < 2; h++) {
+            uint8x16_t d = vsubq_u8(c.val[h], c0), l = vsubq_u8(vorrq_u8(c.val[h], lower), ca);
+            uint8x16_t isd = vcltq_u8(d, ten), isl = vcltq_u8(l, six);
+            n[h] = vbslq_u8(isd, d, vaddq_u8(l, ten));
+            bad = vorrq_u8(bad, vmvnq_u8(vorrq_u8(isd, isl)));
+        }
+        if (vmaxvq_u8(bad)) break;
+        vst1q_u8(out + k, vorrq_u8(vshlq_n_u8(n[0], 4), n[1]));
+    }
+    return k;
+}
+#endif
+/* x86-64: the base ISA has no byte shuffle, so SSSE3 is checked once at run time (cpuid) and these functions
+   are compiled for it alone (Muła's and aklomp/base64's algorithms): 12 bytes -> 16 characters, 16 characters
+   -> 12 bytes while every character is in the standard alphabet. Everything else stays scalar. */
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <cpuid.h>
+#include <tmmintrin.h>
+#define XS_X86_B64 1
+static int xs_ssse3_ = -1;
+static bool xs_has_ssse3(void) {
+    if (xs_ssse3_ < 0) { unsigned a, b, c, d; xs_ssse3_ = __get_cpuid(1, &a, &b, &c, &d) && (c & bit_SSSE3) ? 1 : 0; }
+    return xs_ssse3_ == 1;
+}
+/* encodes 12 bytes per round from in (reading 16, so while 16 remain); returns the bytes consumed */
+__attribute__((target("ssse3"))) static int64_t xs_b64_enc_ssse3(const uint8_t *in, int64_t n, char *o, bool url) {
+    const __m128i shuf = _mm_set_epi8(10, 11, 9, 10, 7, 8, 6, 7, 4, 5, 3, 4, 1, 2, 0, 1);
+    const __m128i lut = url ? _mm_setr_epi8(65, 71, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -17, 32, 0, 0)
+                            : _mm_setr_epi8(65, 71, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -19, -16, 0, 0);
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 12, o += 16) {
+        __m128i v = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(in + i)), shuf);
+        __m128i t0 = _mm_mulhi_epu16(_mm_and_si128(v, _mm_set1_epi32(0x0fc0fc00)), _mm_set1_epi32(0x04000040));
+        __m128i t1 = _mm_mullo_epi16(_mm_and_si128(v, _mm_set1_epi32(0x003f03f0)), _mm_set1_epi32(0x01000010));
+        __m128i idx = _mm_or_si128(t0, t1); /* sixteen 6-bit values */
+        __m128i r = _mm_subs_epu8(idx, _mm_set1_epi8(51));
+        r = _mm_sub_epi8(r, _mm_cmpgt_epi8(idx, _mm_set1_epi8(25)));
+        _mm_storeu_si128((__m128i *)o, _mm_add_epi8(idx, _mm_shuffle_epi8(lut, r)));
+    }
+    return i;
+}
+/* decodes 16 characters per round while all are in the standard alphabet and 16 more follow (the store writes
+   16 bytes for 12); returns the characters consumed */
+__attribute__((target("ssse3"))) static int64_t xs_b64_dec_ssse3(const char *s, int64_t n, uint8_t *out) {
+    const __m128i lut_lo = _mm_setr_epi8(0x15, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x13, 0x1A, 0x1B, 0x1B, 0x1B, 0x1A);
+    const __m128i lut_hi = _mm_setr_epi8(0x10, 0x10, 0x01, 0x02, 0x04, 0x08, 0x04, 0x08, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10);
+    const __m128i lut_roll = _mm_setr_epi8(0, 16, 19, 4, -65, -65, -71, -71, 0, 0, 0, 0, 0, 0, 0, 0);
+    const __m128i m2f = _mm_set1_epi8(0x2f), zero = _mm_setzero_si128();
+    const __m128i pack = _mm_setr_epi8(2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, -1, -1, -1, -1);
+    int64_t i = 0, o = 0;
+    for (; i + 32 <= n; i += 16, o += 12) {
+        __m128i in = _mm_loadu_si128((const __m128i *)(s + i));
+        __m128i hn = _mm_and_si128(_mm_srli_epi32(in, 4), m2f), ln = _mm_and_si128(in, m2f);
+        __m128i lo = _mm_shuffle_epi8(lut_lo, ln), hi = _mm_shuffle_epi8(lut_hi, hn);
+        if (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_and_si128(lo, hi), zero)) != 0xFFFF) break; /* not all in the alphabet */
+        __m128i v = _mm_add_epi8(in, _mm_shuffle_epi8(lut_roll, _mm_add_epi8(_mm_cmpeq_epi8(in, m2f), hn)));
+        __m128i ab = _mm_maddubs_epi16(v, _mm_set1_epi32(0x01400140));
+        __m128i abc = _mm_madd_epi16(ab, _mm_set1_epi32(0x00011000));
+        _mm_storeu_si128((__m128i *)(out + o), _mm_shuffle_epi8(abc, pack));
+    }
+    return i;
+}
+#endif
+static xs_str *xs_b64_enc_(const uint8_t *p, int64_t n, bool url, bool pad) {
+    const char *t = url ? xs_b64url : xs_b64;
+    int64_t full = n / 3, rem = n % 3;
+    int64_t out = full * 4 + (rem ? (pad ? 4 : rem + 1) : 0);
+    xs_str *s = xs_str_alloc(out);
+    char *o = s->data;
+    /* 12 bits -> two characters per lookup */
+    static uint16_t pairs_std[4096], pairs_url[4096];
+    uint16_t *pt = url ? pairs_url : pairs_std;
+    if (!pt[1]) for (int k = 0; k < 4096; k++) { char c2[2] = {t[k >> 6], t[k & 63]}; memcpy(&pt[k], c2, 2); }
+#ifdef XS_X86_B64
+    if (full >= 6 && xs_has_ssse3()) { /* whole groups of 3 only: the remainder stays for the code below */
+        int64_t used = xs_b64_enc_ssse3(p, full * 3, o, url);
+        p += used; o += used / 3 * 4; full -= used / 3;
+    }
+#endif
+#ifdef XS_NEON
+    { /* 48 bytes -> 64 characters per round */
+        const uint8x16x4_t lut = vld1q_u8_x4((const uint8_t *)t);
+        const uint8x16_t m63 = vdupq_n_u8(63);
+        for (; full >= 16; full -= 16, p += 48, o += 64) {
+            uint8x16x3_t in = vld3q_u8(p);
+            uint8x16x4_t r;
+            r.val[0] = vqtbl4q_u8(lut, vshrq_n_u8(in.val[0], 2));
+            r.val[1] = vqtbl4q_u8(lut, vandq_u8(vorrq_u8(vshlq_n_u8(in.val[0], 4), vshrq_n_u8(in.val[1], 4)), m63));
+            r.val[2] = vqtbl4q_u8(lut, vandq_u8(vorrq_u8(vshlq_n_u8(in.val[1], 2), vshrq_n_u8(in.val[2], 6)), m63));
+            r.val[3] = vqtbl4q_u8(lut, vandq_u8(in.val[2], m63));
+            vst4q_u8((uint8_t *)o, r);
+        }
+    }
+#endif
+    for (int64_t i = 0; i < full; i++, p += 3) {
+        uint32_t v = (uint32_t)p[0] << 16 | (uint32_t)p[1] << 8 | p[2];
+        uint32_t w = (uint32_t)pt[v >> 12] | (uint32_t)pt[v & 0xFFF] << 16;
+        memcpy(o, &w, 4);
+        o += 4;
+    }
+    if (rem) {
+        uint32_t v = (uint32_t)p[0] << 16 | (rem == 2 ? (uint32_t)p[1] << 8 : 0);
+        *o++ = t[v >> 18];
+        *o++ = t[(v >> 12) & 63];
+        if (rem == 2) *o++ = t[(v >> 6) & 63];
+        if (pad) { if (rem == 1) *o++ = '='; *o++ = '='; }
+    }
+    *o = 0;
+    return s;
+}
+/* base64 or base64url, with or without padding, ASCII whitespace skipped (as Node's Buffer.from does);
+   strict: any other character is an error (Uint8Array.fromBase64); else it is skipped and only = stops (Buffer) */
+static int64_t xs_b64_dec_(const char *s, int64_t n, uint8_t *out, bool strict) {
+    static int8_t rev[256];
+    static bool init;
+    if (!init) {
+        memset(rev, -1, sizeof rev);
+        for (int i = 0; i < 64; i++) rev[(unsigned char)xs_b64[i]] = (int8_t)i;
+        rev['-'] = 62; rev['_'] = 63;
+        init = true;
+    }
+    uint32_t acc = 0;
+    int bits = 0;
+    int64_t o = 0;
+    int64_t i = 0;
+    /* fast path: four valid characters make three bytes, two lookups of a character pair (12 bits each);
+       whitespace, '=' and errors go the slow way below */
+    static int16_t *pair;
+    if (!pair) {
+        int16_t *m = malloc(sizeof(int16_t) * 65536);
+        for (int a = 0; a < 256; a++)
+            for (int b = 0; b < 256; b++) {
+                unsigned char k[2] = {(unsigned char)a, (unsigned char)b};
+                uint16_t key;
+                memcpy(&key, k, 2);
+                m[key] = (int16_t)(rev[a] < 0 || rev[b] < 0 ? -1 : rev[a] << 6 | rev[b]);
+            }
+        pair = m;
+    }
+#ifdef XS_X86_B64
+    if (n >= 32 && xs_has_ssse3()) { int64_t used = xs_b64_dec_ssse3(s, n, out); i += used; o += used / 4 * 3; }
+#endif
+#ifdef XS_NEON
+    { /* 64 characters -> 48 bytes per round, while every character is in the alphabet */
+        static uint8_t tab[128];
+        static bool tab_init;
+        if (!tab_init) { for (int c = 0; c < 128; c++) tab[c] = rev[c] < 0 ? 0xFF : (uint8_t)rev[c]; tab_init = true; }
+        const uint8x16x4_t t0 = vld1q_u8_x4(tab), t1 = vld1q_u8_x4(tab + 64);
+        const uint8x16_t k64 = vdupq_n_u8(64), kff = vdupq_n_u8(0xFF), k128 = vdupq_n_u8(128);
+        for (; i + 64 <= n; i += 64, o += 48) {
+            uint8x16x4_t in = vld4q_u8((const uint8_t *)s + i);
+            uint8x16_t v[4], bad = vdupq_n_u8(0);
+            for (int k = 0; k < 4; k++) {
+                uint8x16_t c = in.val[k];
+                v[k] = vorrq_u8(vqtbl4q_u8(t0, c), vqtbl4q_u8(t1, vsubq_u8(c, k64))); /* each table answers 0 off its range */
+                bad = vorrq_u8(bad, vorrq_u8(vceqq_u8(v[k], kff), vcgeq_u8(c, k128)));
+            }
+            if (vmaxvq_u8(bad)) break;
+            uint8x16x3_t r;
+            r.val[0] = vorrq_u8(vshlq_n_u8(v[0], 2), vshrq_n_u8(v[1], 4));
+            r.val[1] = vorrq_u8(vshlq_n_u8(v[1], 4), vshrq_n_u8(v[2], 2));
+            r.val[2] = vorrq_u8(vshlq_n_u8(v[2], 6), v[3]);
+            vst3q_u8(out + o, r);
+        }
+    }
+#endif
+    for (; i + 4 <= n; i += 4) {
+        uint16_t k0, k1;
+        memcpy(&k0, s + i, 2);
+        memcpy(&k1, s + i + 2, 2);
+        int hi = pair[k0], lo = pair[k1];
+        if ((hi | lo) < 0) break;
+        uint32_t v = (uint32_t)hi << 12 | (uint32_t)lo;
+        out[o] = (uint8_t)(v >> 16);
+        out[o + 1] = (uint8_t)(v >> 8);
+        out[o + 2] = (uint8_t)v;
+        o += 3;
+    }
+    for (; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') continue;
+        if (c == '=') break;
+        int v = rev[c];
+        if (v < 0) { if (strict) return -1; continue; } /* Buffer skips what is not base64, as Node does */
+        acc = acc << 6 | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) { bits -= 8; out[o++] = (uint8_t)(acc >> bits); }
+    }
+    return o;
+}
+static int8_t xs_hex_rev[256];
+static void xs_hex_init(void) {
+    if (xs_hex_rev['0'] == 0 && xs_hex_rev['1'] == 1) return;
+    memset(xs_hex_rev, -1, sizeof xs_hex_rev);
+    for (int i = 0; i < 10; i++) xs_hex_rev['0' + i] = (int8_t)i;
+    for (int i = 0; i < 6; i++) { xs_hex_rev['a' + i] = (int8_t)(10 + i); xs_hex_rev['A' + i] = (int8_t)(10 + i); }
+}
+static inline int xs_hexv(int c) { return xs_hex_rev[(unsigned char)c]; }
+static xs_str *xs_hex_encode(const uint8_t *p, int64_t n) {
+    static uint16_t pairs[256];
+    if (!pairs[1]) for (int i = 0; i < 256; i++) { char t[2] = {"0123456789abcdef"[i >> 4], "0123456789abcdef"[i & 15]}; memcpy(&pairs[i], t, 2); }
+    xs_str *s = xs_str_alloc(n * 2);
+    char *o = s->data;
+    int64_t i = 0;
+#ifdef XS_NEON
+    { /* 16 bytes -> 32 characters per round */
+        const uint8x16_t lut = vld1q_u8((const uint8_t *)"0123456789abcdef"), m15 = vdupq_n_u8(15);
+        for (; i + 16 <= n; i += 16, o += 32) {
+            uint8x16_t v = vld1q_u8(p + i);
+            uint8x16x2_t r = {{vqtbl1q_u8(lut, vshrq_n_u8(v, 4)), vqtbl1q_u8(lut, vandq_u8(v, m15))}};
+            vst2q_u8((uint8_t *)o, r);
+        }
+    }
+#endif
+    for (; i + 4 <= n; i += 4, o += 8) { /* four bytes, one 8-byte store */
+        uint64_t w = (uint64_t)pairs[p[i]] | (uint64_t)pairs[p[i + 1]] << 16 | (uint64_t)pairs[p[i + 2]] << 32 | (uint64_t)pairs[p[i + 3]] << 48;
+        memcpy(o, &w, 8);
+    }
+    for (; i < n; i++, o += 2) memcpy(o, &pairs[p[i]], 2);
+    *o = 0;
+    return s;
+}
+/* two hex characters at once: 64K entries, -1 when either is not hex */
+static int16_t *xs_hex_pair_tab(void) {
+    static int16_t *t;
+    if (t) return t;
+    xs_hex_init();
+    int16_t *m = malloc(sizeof(int16_t) * 65536);
+    for (int a = 0; a < 256; a++)
+        for (int b = 0; b < 256; b++) {
+            int h = xs_hex_rev[a], l = xs_hex_rev[b];
+            unsigned char k[2] = {(unsigned char)a, (unsigned char)b};
+            uint16_t key;
+            memcpy(&key, k, 2);
+            m[key] = (int16_t)(h < 0 || l < 0 ? -1 : h << 4 | l);
+        }
+    t = m;
+    return t;
+}
+XS_NOINLINE xs_str *xs_u8_to_base64(xs_Uint8Array *b) { return xs_b64_enc_(b->data, b->f_length, false, true); }
+XS_NOINLINE xs_str *xs_u8_to_hex(xs_Uint8Array *b) { return xs_hex_encode(b->data, b->f_length); }
+XS_NOINLINE xs_Uint8Array *xs_u8_from_base64(xs_str *s) { /* Uint8Array.fromBase64: strict */
+    xs_Uint8Array *b = xs_u8_raw(s->len / 4 * 3 + 3, false, false);
+    int64_t n = xs_b64_dec_(s->data, s->len, b->data, true);
+    if (n < 0) { xs_release(b); xs_panic("SyntaxError: The input is not a valid base64 string"); }
+    b->f_length = n;
+    return b;
+}
+XS_NOINLINE xs_Uint8Array *xs_u8_from_hex(xs_str *s) {
+    xs_hex_init();
+    if (s->len % 2) xs_panic("SyntaxError: Input string must contain hex characters in even length");
+    xs_Uint8Array *b = xs_u8_raw(s->len / 2, false, false);
+    int64_t i0 = 0;
+#ifdef XS_NEON
+    i0 = xs_hex_dec_neon(s->data, s->len / 2, b->data);
+#endif
+    for (int64_t i = i0; i < s->len / 2; i++) {
+        int h = xs_hexv((unsigned char)s->data[2 * i]), l = xs_hexv((unsigned char)s->data[2 * i + 1]);
+        if (h < 0 || l < 0) { xs_release(b); xs_panic("SyntaxError: Input string must contain hex characters in even length"); }
+        b->data[i] = (uint8_t)(h << 4 | l);
+    }
+    return b;
+}
+
+/* ---- Buffer (node:buffer, a global) ---- */
+XS_NOINLINE int xs_buf_enc(xs_str *e) { /* 0 utf8, 1 base64, 2 base64url, 3 hex, 4 latin1/binary, 5 ascii */
+    if (!e) return 0;
+    char t[16];
+    size_t n = (size_t)e->len < sizeof t - 1 ? (size_t)e->len : sizeof t - 1;
+    for (size_t i = 0; i < n; i++) t[i] = (char)tolower((unsigned char)e->data[i]);
+    t[n] = 0;
+    if (!strcmp(t, "utf8") || !strcmp(t, "utf-8")) return 0;
+    if (!strcmp(t, "base64")) return 1;
+    if (!strcmp(t, "base64url")) return 2;
+    if (!strcmp(t, "hex")) return 3;
+    if (!strcmp(t, "latin1") || !strcmp(t, "binary")) return 4;
+    if (!strcmp(t, "ascii")) return 5;
+    xs_panicf("TypeError: Unknown encoding: %s", e->data);
+    return 0;
+}
+XS_NOINLINE xs_Uint8Array *xs_buf_from_str(xs_str *s, xs_str *enc) {
+    int k = xs_buf_enc(enc);
+    if (k == 0) { xs_Uint8Array *b = xs_u8_raw(s->len, true, false); memcpy(b->data, s->data, (size_t)s->len); return b; }
+    if (k == 1 || k == 2) {
+        xs_Uint8Array *b = xs_u8_raw(s->len / 4 * 3 + 3, true, false);
+        b->f_length = xs_b64_dec_(s->data, s->len, b->data, false);
+        return b;
+    }
+    if (k == 3) { /* stops at the first pair that is not hex, as Node does */
+        const int16_t *pt = xs_hex_pair_tab();
+        xs_Uint8Array *b = xs_u8_raw(s->len / 2, true, false);
+        int64_t i = 0;
+#ifdef XS_NEON
+        i = xs_hex_dec_neon(s->data, s->len / 2, b->data);
+#endif
+        for (; i < s->len / 2; i++) {
+            uint16_t key;
+            memcpy(&key, s->data + 2 * i, 2);
+            int v = pt[key];
+            if (v < 0) break;
+            b->data[i] = (uint8_t)v;
+        }
+        b->f_length = i;
+        return b;
+    }
+    /* latin1 / ascii: one byte per code point (the low 8 bits) */
+    xs_Uint8Array *b = xs_u8_raw(xs_str_len(s), true, false);
+    int64_t o = 0;
+    for (int64_t i = 0; i < s->len;) {
+        size_t l;
+        uint32_t c = xs_utf8_cp((const unsigned char *)s->data + i, (size_t)(s->len - i), &l);
+        b->data[o++] = (uint8_t)c;
+        i += (int64_t)l;
+    }
+    b->f_length = o;
+    return b;
+}
+XS_NOINLINE xs_Uint8Array *xs_buf_from_bytes(xs_Uint8Array *s) { return xs_u8_copy_kind(s, true); }
+XS_NOINLINE xs_Uint8Array *xs_buf_from_ints(xs_arr_int *a) {
+    xs_Uint8Array *b = xs_u8_raw((int64_t)a->len, true, false);
+    for (size_t i = 0; i < a->len; i++) b->data[i] = (uint8_t)a->data[i];
+    return b;
+}
+XS_NOINLINE xs_Uint8Array *xs_buf_alloc(int64_t n, int64_t fill) {
+    xs_Uint8Array *b = xs_u8_raw(n, true, fill == 0);
+    if (fill) memset(b->data, (int)(uint8_t)fill, (size_t)n);
+    return b;
+}
+XS_NOINLINE xs_Uint8Array *xs_buf_concat(xs_arr_ref *list) {
+    int64_t total = 0;
+    for (size_t i = 0; i < list->len; i++) total += ((xs_Uint8Array *)list->data[i])->f_length;
+    xs_Uint8Array *b = xs_u8_raw(total, true, false);
+    int64_t o = 0;
+    for (size_t i = 0; i < list->len; i++) {
+        xs_Uint8Array *p = list->data[i];
+        memcpy(b->data + o, p->data, (size_t)p->f_length);
+        o += p->f_length;
+    }
+    return b;
+}
+static int64_t xs_buf_byte_length(xs_str *s) { return s->len; }
+/* buf.toString(encoding = "utf8", start = 0, end = length) */
+XS_NOINLINE xs_str *xs_buf_to_string(xs_Uint8Array *b, xs_str *enc, int64_t start, int64_t end) {
+    int64_t s = start < 0 ? 0 : start > b->f_length ? b->f_length : start;
+    int64_t e = end == INT64_MIN || end > b->f_length ? b->f_length : end < s ? s : end;
+    const uint8_t *p = b->data + s;
+    int64_t n = e - s;
+    switch (xs_buf_enc(enc)) {
+    case 0: return xs_utf8_decode(p, n);
+    case 1: return xs_b64_enc_(p, n, false, true);
+    case 2: return xs_b64_enc_(p, n, true, false);
+    case 3: return xs_hex_encode(p, n);
+    default: { /* latin1 / ascii: each byte a code point (ascii drops the high bit) */
+        bool ascii = xs_buf_enc(enc) == 5;
+        xs_sb sb = {0};
+        for (int64_t i = 0; i < n; i++) {
+            uint8_t c = ascii ? (p[i] & 0x7F) : p[i];
+            if (c < 0x80) { char ch = (char)c; xs_sb_put(&sb, &ch, 1); }
+            else { char t[2] = {(char)(0xC0 | (c >> 6)), (char)(0x80 | (c & 0x3F))}; xs_sb_put(&sb, t, 2); }
+        }
+        xs_str *r = xs_str_new(sb.data ? sb.data : "", sb.len);
+        free(sb.data);
+        return r;
+    }
+    }
+}
+/* the Uint8Array printed by toString: "1,2,3" */
+XS_NOINLINE xs_str *xs_u8_to_string(xs_Uint8Array *b) {
+    if (xs_is_buffer(b)) return xs_buf_to_string(b, NULL, 0, INT64_MIN);
+    xs_str *comma = xs_str_new(",", 1);
+    xs_str *r = xs_u8_join(b, comma);
+    xs_release(comma);
+    return r;
+}
+/* btoa / atob: strings of code points 0..255 <-> base64 */
+XS_NOINLINE xs_str *xs_btoa(xs_str *s) {
+    xs_Uint8Array *b = xs_buf_from_str(s, NULL);
+    int64_t o = 0;
+    for (int64_t i = 0; i < s->len;) {
+        size_t l;
+        uint32_t c = xs_utf8_cp((const unsigned char *)s->data + i, (size_t)(s->len - i), &l);
+        if (c > 255) { xs_release(b); xs_panic("InvalidCharacterError: Invalid character"); }
+        b->data[o++] = (uint8_t)c;
+        i += (int64_t)l;
+    }
+    xs_str *r = xs_b64_enc_(b->data, o, false, true);
+    xs_release(b);
+    return r;
+}
+XS_NOINLINE xs_str *xs_atob(xs_str *s) {
+    uint8_t *tmp = malloc((size_t)(s->len / 4 * 3 + 4));
+    int64_t n = xs_b64_dec_(s->data, s->len, tmp, true);
+    if (n < 0) { free(tmp); xs_panic("InvalidCharacterError: The string to be decoded is not correctly encoded."); }
+    xs_sb sb = {0};
+    for (int64_t i = 0; i < n; i++) {
+        uint8_t c = tmp[i];
+        if (c < 0x80) { char ch = (char)c; xs_sb_put(&sb, &ch, 1); }
+        else { char t[2] = {(char)(0xC0 | (c >> 6)), (char)(0x80 | (c & 0x3F))}; xs_sb_put(&sb, t, 2); }
+    }
+    free(tmp);
+    xs_str *r = xs_str_new(sb.data ? sb.data : "", sb.len);
+    free(sb.data);
+    return r;
+}
+XS_NOINLINE xs_Uint8Array *xs_fs_read_stdin_bytes(void) {
+    xs_stdin_binary();
+    size_t n;
+    char *buf = xs_read_stream(stdin, 0, &n);
+    xs_Uint8Array *b = xs_u8_raw(0, true, false);
+    free(b->data);
+    b->data = (uint8_t *)buf;
+    b->f_length = (int64_t)n;
+    return b;
+}
+/* readFileSync(path) without an encoding: the bytes (a Buffer); writeFileSync(path, bytes) */
+XS_NOINLINE xs_Uint8Array *xs_fs_read_bytes(xs_str *path) {
+    FILE *f = fopen(path->data, "rb");
+    if (!f) xs_panicf("ENOENT: no such file or directory, open '%s'", path->data);
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    if (n < 0) { /* not a regular file: read until the end */
+        size_t m;
+        char *buf = xs_read_stream(f, 0, &m);
+        fclose(f);
+        xs_Uint8Array *b = xs_u8_raw(0, true, false);
+        free(b->data);
+        b->data = (uint8_t *)buf;
+        b->f_length = (int64_t)m;
+        return b;
+    }
+    fseek(f, 0, SEEK_SET);
+    xs_Uint8Array *b = xs_u8_raw(n > 0 ? n : 0, true, false);
+    if (n > 0 && fread(b->data, 1, (size_t)n, f) != (size_t)n) { fclose(f); xs_panicf("EIO: cannot read '%s'", path->data); }
+    fclose(f);
+    return b;
+}
+XS_NOINLINE void xs_fs_write_bytes(xs_str *path, xs_Uint8Array *b) {
+    FILE *f = fopen(path->data, "wb");
+    if (!f) xs_panicf("EACCES: cannot open '%s' for writing", path->data);
+    fwrite(b->data, 1, (size_t)b->f_length, f);
+    fclose(f);
+}
+
+/* execSync from node:child_process: runs the command through /bin/sh and returns its standard output */
+XS_NOINLINE xs_str *xs_exec_sync(xs_str *cmd) {
+    fflush(stdout);
+    FILE *p = popen(cmd->data, "r");
+    if (!p) xs_panicf("Command failed: %s", cmd->data);
+    xs_sb b = {0};
+    char tmp[4096];
+    size_t n;
+    while ((n = fread(tmp, 1, sizeof tmp, p)) > 0) xs_sb_put(&b, tmp, n);
+    int st = pclose(p);
+    if (st != 0) { free(b.data); xs_panicf("Command failed: %s", cmd->data); }
+    return xs_sb_finish(&b);
+}
+XS_NOINLINE void xs_fs_unlink(xs_str *path) { if (unlink(path->data) != 0) xs_panicf("ENOENT: no such file or directory, unlink '%s'", path->data); }
+
+/* BigInt: arbitrary-precision integers, immutable values as in JavaScript.
+   Sign and magnitude, 64-bit limbs (least significant first) in the object itself; products and the
+   division steps through unsigned __int128. Division is Knuth's algorithm D (TAOCP vol. 2, 4.3.1).
+   (here, after the strings and the allocator they use) */
+
+typedef struct xs_big { xs_hdr hdr; int32_t neg; int32_t n; uint64_t d[]; } xs_big;
+typedef unsigned __int128 xs_u128;
+
+static void xs_big_free(void *p) { xs_obj_free(p); }
+static void xs_big_print(void *p);
+static const xs_type xs_big_type = {xs_big_free, xs_big_print};
+
+XS_NOINLINE xs_big *xs_big_alloc(int64_t n) { /* n limbs, not initialised; at least one */
+    if (n > ((int64_t)1 << 30)) xs_panic("RangeError: Maximum BigInt size exceeded");
+    xs_big *b = xs_obj_alloc_raw(sizeof(xs_big) + 8 * (size_t)(n ? n : 1), &xs_big_type);
+    b->neg = 0;
+    b->n = (int32_t)n;
+    return b;
+}
+static xs_big *xs_big_norm(xs_big *b) { /* no leading zero limbs; zero is never negative */
+    while (b->n > 0 && b->d[b->n - 1] == 0) b->n--;
+    if (b->n == 0) b->neg = 0;
+    return b;
+}
+
+XS_NOINLINE xs_big *xs_big_from_int(int64_t v) {
+    xs_big *b = xs_big_alloc(1);
+    b->neg = v < 0;
+    b->d[0] = v < 0 ? (uint64_t)0 - (uint64_t)v : (uint64_t)v;
+    return xs_big_norm(b);
+}
+XS_NOINLINE xs_big *xs_big_from_num(double v) {
+    if (!isfinite(v) || trunc(v) != v) {
+        xs_panicf("RangeError: The number %s cannot be converted to a BigInt because it is not an integer", xs_str_from_num(v)->data);
+    }
+    int e;
+    double m = frexp(fabs(v), &e); /* |v| = m * 2^e, 0.5 <= m < 1 */
+    if (e <= 63) return xs_big_from_int((int64_t)v);
+    uint64_t top = (uint64_t)ldexp(m, 64); /* the 53 significant bits, at the top of a limb */
+    int shift = e - 64, limbs = shift / 64 + 2, bits = shift % 64;
+    xs_big *b = xs_big_alloc(limbs);
+    memset(b->d, 0, 8 * (size_t)limbs);
+    b->d[shift / 64] = top << bits;
+    if (bits) b->d[shift / 64 + 1] = top >> (64 - bits);
+    b->neg = v < 0;
+    return xs_big_norm(b);
+}
+
+/* |a| <=> |b| */
+static int xs_big_mag_cmp(const xs_big *a, const xs_big *b) {
+    if (a->n != b->n) return a->n < b->n ? -1 : 1;
+    for (int32_t i = a->n - 1; i >= 0; i--)
+        if (a->d[i] != b->d[i]) return a->d[i] < b->d[i] ? -1 : 1;
+    return 0;
+}
+static int xs_big_cmp(const xs_big *a, const xs_big *b) {
+    if (a->neg != b->neg) return a->neg ? -1 : 1;
+    int c = xs_big_mag_cmp(a, b);
+    return a->neg ? -c : c;
+}
+static bool xs_big_lt(xs_big *a, xs_big *b) { return xs_big_cmp(a, b) < 0; }
+static bool xs_big_le(xs_big *a, xs_big *b) { return xs_big_cmp(a, b) <= 0; }
+static bool xs_big_gt(xs_big *a, xs_big *b) { return xs_big_cmp(a, b) > 0; }
+static bool xs_big_ge(xs_big *a, xs_big *b) { return xs_big_cmp(a, b) >= 0; }
+static bool xs_big_eq(xs_big *a, xs_big *b) { return xs_big_cmp(a, b) == 0; }
+static bool xs_big_ne(xs_big *a, xs_big *b) { return xs_big_cmp(a, b) != 0; }
+
+/* a + (bneg ? -|b| : |b|) with a's sign: the core of + and - */
+XS_NOINLINE xs_big *xs_big_addsub(const xs_big *a, const xs_big *b, int bneg) {
+    if (a->neg == bneg) { /* same signs: the magnitudes add */
+        const xs_big *x = a->n >= b->n ? a : b, *y = x == a ? b : a;
+        xs_big *r = xs_big_alloc(x->n + 1);
+        uint64_t c = 0;
+        int32_t i = 0;
+        for (; i < y->n; i++) { xs_u128 s = (xs_u128)x->d[i] + y->d[i] + c; r->d[i] = (uint64_t)s; c = (uint64_t)(s >> 64); }
+        for (; i < x->n; i++) { xs_u128 s = (xs_u128)x->d[i] + c; r->d[i] = (uint64_t)s; c = (uint64_t)(s >> 64); }
+        r->d[i] = c;
+        r->neg = a->neg;
+        return xs_big_norm(r);
+    }
+    int c = xs_big_mag_cmp(a, b); /* different signs: the smaller magnitude comes off the larger */
+    if (c == 0) return xs_big_from_int(0);
+    const xs_big *x = c > 0 ? a : b, *y = c > 0 ? b : a;
+    xs_big *r = xs_big_alloc(x->n);
+    uint64_t br = 0;
+    int32_t i = 0;
+    for (; i < y->n; i++) { uint64_t xi = x->d[i], t = xi - y->d[i] - br; br = (xi < y->d[i]) || (xi - y->d[i] < br); r->d[i] = t; }
+    for (; i < x->n; i++) { uint64_t xi = x->d[i], t = xi - br; br = xi < br; r->d[i] = t; }
+    r->neg = c > 0 ? a->neg : bneg;
+    return xs_big_norm(r);
+}
+XS_NOINLINE xs_big *xs_big_add(xs_big *a, xs_big *b) { return xs_big_addsub(a, b, b->neg); }
+XS_NOINLINE xs_big *xs_big_sub(xs_big *a, xs_big *b) { return xs_big_addsub(a, b, b->n ? !b->neg : 0); }
+XS_NOINLINE xs_big *xs_big_neg(xs_big *a) {
+    xs_big *r = xs_big_alloc(a->n);
+    memcpy(r->d, a->d, 8 * (size_t)a->n);
+    r->neg = a->n ? !a->neg : 0;
+    return r;
+}
+
+XS_NOINLINE xs_big *xs_big_mul(xs_big *a, xs_big *b) {
+    if (a->n == 0 || b->n == 0) return xs_big_from_int(0);
+    const xs_big *x = a->n >= b->n ? a : b, *y = x == a ? b : a;
+    xs_big *r = xs_big_alloc((int64_t)x->n + y->n);
+    if (y->n == 1) { /* by one limb: the common case (acc * k) */
+        uint64_t m = y->d[0], c = 0;
+        for (int32_t i = 0; i < x->n; i++) { xs_u128 p = (xs_u128)x->d[i] * m + c; r->d[i] = (uint64_t)p; c = (uint64_t)(p >> 64); }
+        r->d[x->n] = c;
+    } else {
+        memset(r->d, 0, 8 * (size_t)(x->n + y->n));
+        for (int32_t j = 0; j < y->n; j++) {
+            uint64_t m = y->d[j], c = 0;
+            for (int32_t i = 0; i < x->n; i++) { xs_u128 p = (xs_u128)x->d[i] * m + r->d[i + j] + c; r->d[i + j] = (uint64_t)p; c = (uint64_t)(p >> 64); }
+            r->d[j + x->n] = c;
+        }
+    }
+    r->neg = a->neg != b->neg;
+    return xs_big_norm(r);
+}
+
+/* |a| / |b| and |a| % |b| (either may be NULL): Knuth's algorithm D */
+static void xs_big_divmod_mag(const xs_big *a, const xs_big *b, xs_big **qo, xs_big **ro) {
+    int32_t m = a->n, n = b->n;
+    if (xs_big_mag_cmp(a, b) < 0) {
+        if (qo) *qo = xs_big_from_int(0);
+        if (ro) { xs_big *r = xs_big_alloc(m); memcpy(r->d, a->d, 8 * (size_t)m); *ro = xs_big_norm(r); }
+        return;
+    }
+    if (m == n && n >= 2) { /* the same length: the quotient fits one limb (pidigits' digit), found from the top */
+        int s = __builtin_clzll(b->d[n - 1]);
+        #define XB_SH(x, i) ((i) < 0 ? 0 : s ? ((x)->d[i] << s) | ((i) > 0 ? (x)->d[(i) - 1] >> (64 - s) : 0) : (x)->d[i])
+        uint64_t u2 = s ? a->d[n - 1] >> (64 - s) : 0, u1 = XB_SH(a, n - 1), u0 = XB_SH(a, n - 2);
+        uint64_t v1 = XB_SH(b, n - 1), v0 = XB_SH(b, n - 2);
+        #undef XB_SH
+        xs_u128 num = ((xs_u128)u2 << 64) | u1;
+        xs_u128 qhat = num / v1, rhat = num % v1;
+        while (qhat >> 64 || qhat * v0 > ((rhat << 64) | u0)) { /* now q or q + 1 (Knuth, step D3) */
+            qhat--;
+            rhat += v1;
+            if (rhat >> 64) break;
+        }
+        uint64_t qd = (uint64_t)qhat;
+        /* the sign of a - qd * b, in one pass; the remainder too when it is asked for */
+        xs_big *r = ro ? xs_big_alloc(n) : NULL;
+        uint64_t borrow = 0, carry = 0;
+        for (int32_t i = 0; i < n; i++) {
+            xs_u128 pr = (xs_u128)qd * b->d[i] + carry;
+            carry = (uint64_t)(pr >> 64);
+            uint64_t lo = (uint64_t)pr, t = a->d[i] - lo - borrow;
+            borrow = (a->d[i] < lo) || (a->d[i] - lo < borrow);
+            if (r) r->d[i] = t;
+        }
+        bool neg = carry + borrow != 0; /* (a has no limb beyond n: anything carried out is below zero) */
+        if (neg) {
+            qd--;
+            if (r) { /* r += b */
+                uint64_t c = 0;
+                for (int32_t i = 0; i < n; i++) { xs_u128 sm = (xs_u128)r->d[i] + b->d[i] + c; r->d[i] = (uint64_t)sm; c = (uint64_t)(sm >> 64); }
+            }
+        }
+        if (ro) *ro = xs_big_norm(r);
+        if (qo) { xs_big *q = xs_big_alloc(1); q->d[0] = qd; *qo = xs_big_norm(q); }
+        return;
+    }
+    xs_big *q = xs_big_alloc(m - n + 1);
+    if (n == 1) { /* by one limb */
+        uint64_t v = b->d[0], rem = 0;
+        for (int32_t i = m - 1; i >= 0; i--) { xs_u128 cur = ((xs_u128)rem << 64) | a->d[i]; q->d[i] = (uint64_t)(cur / v); rem = (uint64_t)(cur % v); }
+        q->n = m;
+        if (ro) { xs_big *r = xs_big_alloc(1); r->d[0] = rem; *ro = xs_big_norm(r); }
+    } else {
+        int s = __builtin_clzll(b->d[n - 1]);
+        uint64_t *vn = malloc(8 * (size_t)n), *un = malloc(8 * (size_t)(m + 1));
+        if (!vn || !un) xs_panic("out of memory");
+        for (int32_t i = n - 1; i > 0; i--) vn[i] = (b->d[i] << s) | (s ? b->d[i - 1] >> (64 - s) : 0);
+        vn[0] = b->d[0] << s;
+        un[m] = s ? a->d[m - 1] >> (64 - s) : 0;
+        for (int32_t i = m - 1; i > 0; i--) un[i] = (a->d[i] << s) | (s ? a->d[i - 1] >> (64 - s) : 0);
+        un[0] = a->d[0] << s;
+        for (int32_t j = m - n; j >= 0; j--) {
+            xs_u128 num = ((xs_u128)un[j + n] << 64) | un[j + n - 1];
+            xs_u128 qhat = num / vn[n - 1], rhat = num % vn[n - 1];
+            while (qhat >> 64 || qhat * vn[n - 2] > ((rhat << 64) | un[j + n - 2])) {
+                qhat--;
+                rhat += vn[n - 1];
+                if (rhat >> 64) break;
+            }
+            /* un[j..j+n] -= qhat * vn */
+            uint64_t borrow = 0, carry = 0;
+            for (int32_t i = 0; i < n; i++) {
+                xs_u128 p = qhat * vn[i] + carry;
+                carry = (uint64_t)(p >> 64);
+                uint64_t lo = (uint64_t)p, t = un[i + j] - lo - borrow;
+                borrow = (un[i + j] < lo) || (un[i + j] - lo < borrow);
+                un[i + j] = t;
+            }
+            uint64_t t = un[j + n] - carry - borrow;
+            bool neg = (un[j + n] < carry) || (un[j + n] - carry < borrow);
+            un[j + n] = t;
+            if (neg) { /* qhat was one too large (rare): add vn back */
+                qhat--;
+                uint64_t c = 0;
+                for (int32_t i = 0; i < n; i++) { xs_u128 sm = (xs_u128)un[i + j] + vn[i] + c; un[i + j] = (uint64_t)sm; c = (uint64_t)(sm >> 64); }
+                un[j + n] += c;
+            }
+            q->d[j] = (uint64_t)qhat;
+        }
+        q->n = m - n + 1;
+        if (ro) {
+            xs_big *r = xs_big_alloc(n);
+            for (int32_t i = 0; i < n; i++) r->d[i] = (un[i] >> s) | (s ? un[i + 1] << (64 - s) : 0);
+            *ro = xs_big_norm(r);
+        }
+        free(vn);
+        free(un);
+    }
+    xs_big_norm(q);
+    if (qo) *qo = q; else xs_obj_free(q);
+}
+XS_NOINLINE xs_big *xs_big_div(xs_big *a, xs_big *b) { /* truncates toward zero, as in JS */
+    if (b->n == 0) xs_panic("RangeError: Division by zero");
+    xs_big *q;
+    xs_big_divmod_mag(a, b, &q, NULL);
+    q->neg = q->n ? a->neg != b->neg : 0;
+    return q;
+}
+XS_NOINLINE xs_big *xs_big_mod(xs_big *a, xs_big *b) { /* the sign of the dividend, as in JS */
+    if (b->n == 0) xs_panic("RangeError: Division by zero");
+    xs_big *r;
+    xs_big_divmod_mag(a, b, NULL, &r);
+    r->neg = r->n ? a->neg : 0;
+    return r;
+}
+
+XS_NOINLINE xs_big *xs_big_pow(xs_big *a, xs_big *e) { /* square and multiply */
+    if (e->neg) xs_panic("RangeError: Exponent must be non-negative");
+    if (e->n == 0) return xs_big_from_int(1);
+    if (a->n == 0) return xs_big_from_int(0);
+    if (a->n == 1 && a->d[0] == 1) return xs_big_from_int(a->neg && (e->d[0] & 1) ? -1 : 1); /* (-1) ** k at any size */
+    if (e->n > 1 || e->d[0] > ((uint64_t)1 << 32)) xs_panic("RangeError: Maximum BigInt size exceeded");
+    uint64_t k = e->d[0];
+    xs_big *r = xs_big_from_int(1), *base = xs_big_mul(a, r);
+    for (;;) {
+        if (k & 1) { xs_big *t = xs_big_mul(r, base); xs_obj_free(r); r = t; }
+        k >>= 1;
+        if (!k) break;
+        xs_big *t = xs_big_mul(base, base); xs_obj_free(base); base = t;
+    }
+    xs_obj_free(base);
+    return r;
+}
+
+/* decimal digits: 19 at a time (10^19 fits in a limb) */
+static char *xs_big_digits(const xs_big *a, size_t *len) {
+    size_t cap = (size_t)a->n * 20 + 2;
+    char *out = malloc(cap);
+    if (!out) xs_panic("out of memory");
+    if (a->n == 0) { out[0] = '0'; *len = 1; return out; }
+    uint64_t *t = malloc(8 * (size_t)a->n);
+    if (!t) xs_panic("out of memory");
+    memcpy(t, a->d, 8 * (size_t)a->n);
+    int32_t n = a->n;
+    size_t k = cap; /* filled from the end */
+    const uint64_t P = 10000000000000000000ULL;
+    while (n > 0) {
+        uint64_t rem = 0;
+        for (int32_t i = n - 1; i >= 0; i--) { xs_u128 cur = ((xs_u128)rem << 64) | t[i]; t[i] = (uint64_t)(cur / P); rem = (uint64_t)(cur % P); }
+        while (n > 0 && t[n - 1] == 0) n--;
+        for (int i = 0; i < 19 && (n > 0 || rem); i++) { out[--k] = (char)('0' + rem % 10); rem /= 10; }
+    }
+    free(t);
+    if (a->neg) out[--k] = '-';
+    *len = cap - k;
+    memmove(out, out + k, *len);
+    return out;
+}
+XS_NOINLINE xs_str *xs_big_to_string(xs_big *a) {
+    size_t n;
+    char *d = xs_big_digits(a, &n);
+    xs_str *s = xs_str_new(d, n);
+    free(d);
+    return s;
+}
+static void xs_big_print(void *p) { /* console.log(10n) prints 10n */
+    size_t n;
+    char *d = xs_big_digits(p, &n);
+    fwrite(d, 1, n, XS_OUT);
+    fputc('n', XS_OUT);
+    free(d);
+}
+XS_NOINLINE double xs_big_to_number(xs_big *a) { /* rounded to the nearest double, as Number(b) */
+    double v;
+    if (a->n == 0) v = 0;
+    else if (a->n == 1) v = (double)a->d[0];
+    else if (a->n == 2) v = (double)(((xs_u128)a->d[1] << 64) | a->d[0]);
+    else {
+        size_t n;
+        char *d = xs_big_digits(a, &n);
+        d = realloc(d, n + 1);
+        d[n] = 0;
+        v = strtod(d, NULL);
+        free(d);
+        return v;
+    }
+    return a->neg ? -v : v;
+}
+
+/* BigInt("123"), BigInt("0x1f"), and literals too long for an int: decimal with an optional sign, or 0x/0o/0b */
+XS_NOINLINE xs_big *xs_big_parse(const char *s, size_t len, bool *ok) {
+    size_t i = 0, e = len;
+    while (i < e && isspace((unsigned char)s[i])) i++;
+    while (e > i && isspace((unsigned char)s[e - 1])) e--;
+    int base = 10;
+    bool neg = false;
+    if (e - i > 2 && s[i] == '0' && strchr("xXoObB", s[i + 1])) { base = s[i + 1] == 'x' || s[i + 1] == 'X' ? 16 : s[i + 1] == 'o' || s[i + 1] == 'O' ? 8 : 2; i += 2; }
+    else if (i < e && (s[i] == '+' || s[i] == '-')) { neg = s[i] == '-'; i++; if (i == e) { *ok = false; return NULL; } }
+    xs_big *r = xs_big_alloc((int64_t)(e - i) / 4 + 2); /* room: a digit adds at most 4 bits (hex), so len / 16 + 1 limbs would do */
+    r->n = 0;
+    for (; i < e; i++) {
+        int c = (unsigned char)s[i], dv = isdigit(c) ? c - '0' : isxdigit(c) ? (tolower(c) - 'a' + 10) : 99;
+        if (dv >= base) { xs_obj_free(r); *ok = false; return NULL; }
+        uint64_t carry = (uint64_t)dv; /* r = r * base + dv */
+        for (int32_t k = 0; k < r->n; k++) { xs_u128 p = (xs_u128)r->d[k] * (uint64_t)base + carry; r->d[k] = (uint64_t)p; carry = (uint64_t)(p >> 64); }
+        if (carry) r->d[r->n++] = carry;
+    }
+    r->neg = neg;
+    *ok = true;
+    return xs_big_norm(r);
+}
+XS_NOINLINE xs_big *xs_big_from_str(xs_str *s) {
+    bool ok;
+    xs_big *r = xs_big_parse(s->data, (size_t)s->len, &ok);
+    if (!ok) xs_panicf("SyntaxError: Cannot convert %s to a BigInt", s->data);
+    return r;
+}
+
+/* ---- program start / end ---- */
+
+static uint64_t xs_started;
+
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#endif
+static void xs_init(int argc, char **argv) {
+#if defined(_WIN32) /* bytes as written, as Node does: no \r\n translation on the standard streams */
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+    _setmode(_fileno(stdin), _O_BINARY);
+#endif
+    xs_started = xs_now();
+    xs_std_init(argc, argv);
+}
+/* performance.now(): milliseconds since the program started, with the fraction (monotonic, as Node's) */
+static double xs_performance_now(void) { return (double)(xs_now() - xs_started) / 1e6; }
+
+static int xs_rc_counting_;
+static bool xs_rc_counting(void) { /* XISTO_RC_STATS: release everything at exit and report what is left */
+    if (!xs_rc_counting_) xs_rc_counting_ = getenv("XISTO_RC_STATS") ? 1 : 2;
+    return xs_rc_counting_ == 1;
+}
+
+/* ---- cycle collector ----
+   Reference counting frees everything except cycles (a parent and a child pointing at each other). The
+   compiler marks the types that can form one (XS_CYC: a class whose fields can lead back to it, arrays and
+   maps of those, closures that capture them); everything else (strings, DTOs, numbers) never comes here.
+   An XS_CYC object whose count drops but stays above zero becomes a suspect. When there are enough, at the
+   next allocation (never inside a free in progress) the subgraph of suspects is examined as CPython does:
+   each object's count minus the references from inside the subgraph; what keeps a count above zero is held
+   from outside, and so is everything it reaches; the rest is garbage cycles. Those are pinned, their fields
+   emptied (releasing what they point to), then unpinned: they free like any object. */
+static XS_TLS void **xs_sus;              /* open addressing set of suspects; NULL empty, XS_GC_TOMB removed */
+static XS_TLS size_t xs_sus_cap, xs_sus_n, xs_sus_used;
+static XS_TLS size_t xs_gc_threshold = 10000;
+static XS_TLS bool xs_gc_running;
+static XS_TLS int64_t xs_gc_runs, xs_gc_freed;
+#define XS_GC_TOMB ((void *)1)
+static inline size_t xs_ptr_hash(void *p) { uint64_t x = (uint64_t)(uintptr_t)p; x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; return (size_t)x; }
+static void xs_sus_grow(void) {
+    size_t oc = xs_sus_cap;
+    void **old = xs_sus;
+    xs_sus_cap = oc ? oc * 2 : 1024;
+    xs_sus = calloc(xs_sus_cap, sizeof(void *));
+    if (!xs_sus) xs_panic("out of memory");
+    xs_sus_used = xs_sus_n;
+    for (size_t i = 0; i < oc; i++) {
+        void *p = old[i];
+        if (!p || p == XS_GC_TOMB) continue;
+        size_t j = xs_ptr_hash(p) & (xs_sus_cap - 1);
+        while (xs_sus[j]) j = (j + 1) & (xs_sus_cap - 1);
+        xs_sus[j] = p;
+    }
+    free(old);
+}
+/* suspects live in a vector; an object's position (+1) sits in hdr.cls bits 11..31, so adding and forgetting
+   are O(1) with no hashing. Past 2M positions the hash set above takes the rest. */
+#define XS_SLOT_SHIFT 11
+#define XS_SLOT_MAX ((1u << 21) - 1)
+static XS_TLS void **xs_susv;
+static XS_TLS size_t xs_susv_len, xs_susv_cap;
+static __attribute__((noinline)) void xs_gc_suspect(void *p) {
+    if (xs_gc_running) return;
+    xs_hdr *h = p;
+    h->cls |= XS_BUF;
+    if (xs_susv_len < XS_SLOT_MAX) {
+        if (xs_susv_len == xs_susv_cap) {
+            xs_susv_cap = xs_susv_cap ? xs_susv_cap * 2 : 4096;
+            xs_susv = realloc(xs_susv, sizeof(void *) * xs_susv_cap);
+            if (!xs_susv) xs_panic("out of memory");
+        }
+        xs_susv[xs_susv_len++] = p;
+        h->cls = (h->cls & ((1 << XS_SLOT_SHIFT) - 1)) | (int32_t)((uint32_t)xs_susv_len << XS_SLOT_SHIFT);
+        if (++xs_sus_n >= xs_gc_threshold) xs_gc_due = true;
+        return;
+    }
+    if ((xs_sus_used + 1) * 2 > xs_sus_cap) xs_sus_grow();
+    size_t j = xs_ptr_hash(p) & (xs_sus_cap - 1);
+    while (xs_sus[j] && xs_sus[j] != XS_GC_TOMB) j = (j + 1) & (xs_sus_cap - 1);
+    if (!xs_sus[j]) xs_sus_used++;
+    xs_sus[j] = p;
+    if (++xs_sus_n >= xs_gc_threshold) xs_gc_due = true;
+}
+static __attribute__((noinline)) void xs_gc_forget(void *p) { /* a suspect freed by its count */
+    xs_hdr *h = p;
+    uint32_t slot = (uint32_t)h->cls >> XS_SLOT_SHIFT;
+    h->cls &= (1 << XS_SLOT_SHIFT) - 1;
+    h->cls &= ~XS_BUF;
+    if (slot) { xs_susv[slot - 1] = NULL; xs_sus_n--; return; }
+    if (!xs_sus_cap) return;
+    size_t j = xs_ptr_hash(p) & (xs_sus_cap - 1);
+    while (xs_sus[j]) {
+        if (xs_sus[j] == p) { xs_sus[j] = XS_GC_TOMB; xs_sus_n--; return; }
+        j = (j + 1) & (xs_sus_cap - 1);
+    }
+}
+
+/* The examined subgraph. While the collector runs (nothing else does), an object of the subgraph carries XS_INS
+   and its count field holds its index here: membership and lookup are a load, no hashing; the counts are
+   put back before anything is freed. */
+#define XS_INS (1 << 10)
+typedef struct { void **obj; int64_t *refs; int32_t *rc0; size_t n, cap; int32_t *edge; size_t *first; size_t ne, ecap, fcap; } xs_gcset;
+static inline bool xs_gc_eligible(void *p) { /* a cyclic object alive, not being freed, not yet in the set */
+    xs_hdr *h = p;
+    return p && (h->cls & (XS_CYC | XS_INS)) == XS_CYC && h->rc > 0 && h->rc < XS_IMMORTAL;
+}
+static void xs_gcset_add(xs_gcset *g, void *p) {
+    if (g->n == g->cap) {
+        g->cap = g->cap ? g->cap * 2 : 1024;
+        g->obj = realloc(g->obj, sizeof(void *) * g->cap);
+        g->refs = realloc(g->refs, sizeof(int64_t) * g->cap);
+        g->rc0 = realloc(g->rc0, sizeof(int32_t) * g->cap);
+        if (!g->obj || !g->refs || !g->rc0) xs_panic("out of memory");
+    }
+    xs_hdr *h = p;
+    g->obj[g->n] = p;
+    g->refs[g->n] = h->rc;
+    g->rc0[g->n] = h->rc;
+    h->rc = (int32_t)g->n; /* the index, until the counts are restored */
+    h->cls |= XS_INS;
+    g->n++;
+}
+static inline int64_t xs_gc_index(void *p) { xs_hdr *h = p; return p && (h->cls & XS_INS) ? h->rc : -1; }
+/* one visit per object: children join the set, and the edges inside it are written down (CSR) for the
+   passes that follow, which then run over arrays with no indirect calls */
+static void xs_gc_cb_gather(void **slot, void *arg) {
+    xs_gcset *g = arg;
+    void *c = *slot;
+    if (!c) return;
+    if (xs_gc_eligible(c)) xs_gcset_add(g, c);
+    int64_t i = xs_gc_index(c);
+    if (i < 0) return;
+    if (g->ne == g->ecap) { g->ecap = g->ecap ? g->ecap * 2 : 4096; g->edge = realloc(g->edge, sizeof(int32_t) * g->ecap); if (!g->edge) xs_panic("out of memory"); }
+    g->edge[g->ne++] = (int32_t)i;
+}
+static void xs_gc_cb_unref(void **slot, void *arg) {
+    int64_t i = xs_gc_index(*slot);
+    if (i >= 0) ((xs_gcset *)arg)->refs[i]--;
+}
+typedef struct { xs_gcset *g; size_t *stack; size_t sp, cap; } xs_gcmark;
+static void xs_gc_cb_live(void **slot, void *arg) {
+    xs_gcmark *m = arg;
+    int64_t i = xs_gc_index(*slot);
+    if (i >= 0 && m->g->refs[i] <= 0) { /* reached from outside: alive */
+        m->g->refs[i] = 1;
+        if (m->sp == m->cap) { m->cap = m->cap ? m->cap * 2 : 1024; m->stack = realloc(m->stack, sizeof(size_t) * m->cap); }
+        m->stack[m->sp++] = (size_t)i;
+    }
+}
+#define XS_GARB (1 << 10) /* (after the counts are restored, XS_INS's bit marks garbage) */
+static void xs_gc_cb_cut(void **slot, void *arg) { /* a reference to other garbage: dropped, not counted down */
+    (void)arg;
+    if (*slot && (((xs_hdr *)*slot)->cls & XS_GARB)) *slot = NULL;
+}
+static XS_TLS xs_gcset xs_gcs; /* kept between runs: no reallocation every time */
+static __attribute__((noinline)) void xs_gc_collect(void) {
+    xs_gc_due = false;
+    if (xs_gc_running || !xs_sus_n) return;
+    xs_gc_running = true;
+    xs_gcset *g = &xs_gcs;
+    g->n = 0;
+    /* 1. the suspects and every cyclic object they reach */
+    for (size_t i = 0; i < xs_susv_len; i++) {
+        void *p = xs_susv[i];
+        if (!p) continue;
+        ((xs_hdr *)p)->cls &= (1 << XS_SLOT_SHIFT) - 1 & ~XS_BUF;
+        if (xs_gc_eligible(p)) xs_gcset_add(g, p);
+    }
+    xs_susv_len = 0;
+    for (size_t i = 0; i < xs_sus_cap && xs_sus_used; i++) {
+        void *p = xs_sus[i];
+        if (!p || p == XS_GC_TOMB) continue;
+        ((xs_hdr *)p)->cls &= ~XS_BUF;
+        if (xs_gc_eligible(p)) xs_gcset_add(g, p);
+    }
+    if (xs_sus_used) memset(xs_sus, 0, sizeof(void *) * xs_sus_cap);
+    xs_sus_n = xs_sus_used = 0;
+    g->ne = 0;
+    for (size_t i = 0; i < g->n; i++) {
+        if (g->n + 1 > g->fcap) { g->fcap = (g->n + 1) * 2; g->first = realloc(g->first, sizeof(size_t) * g->fcap); }
+        g->first[i] = g->ne;
+        ((xs_hdr *)g->obj[i])->type->visit(g->obj[i], xs_gc_cb_gather, g);
+    }
+    if (g->n + 1 > g->fcap) { g->fcap = (g->n + 1) * 2; g->first = realloc(g->first, sizeof(size_t) * g->fcap); }
+    g->first[g->n] = g->ne;
+    /* 2. subtract the references from inside */
+    for (size_t e = 0; e < g->ne; e++) g->refs[g->edge[e]]--;
+    /* 3. held from outside, and what they reach, stays */
+    static XS_TLS size_t *stack;
+    static XS_TLS size_t scap;
+    if (scap < g->n + 1) { scap = (g->n + 1) * 2; stack = realloc(stack, sizeof(size_t) * scap); }
+    for (size_t i = 0; i < g->n; i++) {
+        if (g->refs[i] <= 0) continue;
+        g->refs[i] = 1;
+        size_t sp = 0;
+        stack[sp++] = i;
+        while (sp) {
+            size_t k = stack[--sp];
+            for (size_t e = g->first[k]; e < g->first[k + 1]; e++) {
+                int32_t c = g->edge[e];
+                if (g->refs[c] <= 0) { g->refs[c] = 1; stack[sp++] = (size_t)c; }
+            }
+        }
+    }
+    /* counts back; the garbage keeps a mark */
+    size_t ngarbage = 0, nalive = 0;
+    for (size_t i = 0; i < g->n; i++) {
+        xs_hdr *h = g->obj[i];
+        h->rc = g->rc0[i];
+        if (g->refs[i] <= 0) { g->obj[ngarbage++] = h; } /* XS_INS stays set: it is XS_GARB now */
+        else { h->cls &= ~XS_INS; nalive++; }
+    }
+    /* 4. the garbage: references between garbage objects are cut (nothing outside points into it, so no count
+       needs to drop), then each is freed by its own free function, which releases everything else it holds */
+    for (size_t i = 0; i < ngarbage; i++) ((xs_hdr *)g->obj[i])->type->visit(g->obj[i], xs_gc_cb_cut, NULL);
+    xs_gc_running = false;
+    for (size_t i = 0; i < ngarbage; i++) {
+        xs_hdr *h = g->obj[i];
+        h->cls &= ~(XS_GARB | XS_BUF);
+        h->rc = 0;
+        h->type->free(h);
+    }
+    xs_gc_runs++;
+    xs_gc_freed += (int64_t)ngarbage;
+    /* the next run waits for as many suspects as there were live objects to look at again: the work stays
+       proportional, and garbage does not pile up while nothing big is alive */
+    xs_gc_threshold = nalive > 10000 ? nalive : 10000;
+}
+/* visit functions of the runtime's own containers (used when the compiler marks them cyclic) */
+static void xs_arr_ref_visit(void *p, xs_visit_cb cb, void *arg);
+static void xs_map_visit(void *p, xs_visit_cb cb, void *arg);
+/* an array / map that holds values of a cyclic type: the compiler marks it where it is made */
+static inline void *xs_cyc_arr(void *a) {
+    static const xs_type t = {xs_arr_ref_free, xs_print_xs_arr_ref, xs_arr_ref_visit};
+    xs_hdr *h = a;
+    if (h && !(h->cls & XS_CYC) && h->type->free == xs_arr_ref_free) { h->type = &t; h->cls |= XS_CYC; }
+    return a;
+}
+static inline void *xs_cyc_map(void *m) {
+    static const xs_type t = {xs_map_free, xs_print_map, xs_map_visit};
+    xs_hdr *h = m;
+    if (h && !(h->cls & XS_CYC) && h->type->free == xs_map_free) { h->type = &t; h->cls |= XS_CYC; }
+    return m;
+}
+static void xs_arr_ref_visit(void *p, xs_visit_cb cb, void *arg) {
+    xs_arr_ref *a = p;
+    for (size_t i = 0; i < a->len; i++) cb(&a->data[i], arg);
+}
+static void xs_map_visit(void *p, xs_visit_cb cb, void *arg) {
+    xs_map *m = p;
+    if (m->val_kind != 3) return;
+    for (size_t i = 0; i < m->cap; i++) if (m->entries[i].state == 1) cb(&m->entries[i].val.p, arg);
+}
+static void (*xs_exit_hook)(void); /* background work to finish first (Promise.race losers) */
+static void xs_before_exit(void) {
+    void (*h)(void) = xs_exit_hook;
+    xs_exit_hook = NULL;
+    if (h) h();
+}
+/* ---- regions (the compiler's region.c) ----
+   The objects of a region class are made in one loop and cannot outlive an iteration of it: they come from an
+   arena that is rewound when the next iteration starts (and after the loop). Their count still moves (code that
+   handles them is ordinary code), but reaching zero frees nothing and they are never cycle suspects. Rewinding
+   runs drop on the objects whose type holds references out of the region (strings, arrays, other objects). */
+typedef struct xs_rchunk { struct xs_rchunk *next; size_t size; _Alignas(16) char data[]; } xs_rchunk;
+typedef struct xs_region {
+    xs_rchunk *first, *cur;
+    char *ptr, *end;
+    void **list;            /* objects to drop when rewound (every object under XISTO_REGION_CHECK) */
+    size_t nlist, caplist;
+    int64_t nobj;           /* objects made since the last rewind (counted into xs_allocs there, not one by one:
+                               with workers each global counter is a per-thread variable, a call on macOS) */
+    bool listed;
+    bool on;                /* a dual region (region.c): an iteration of its loop is running */
+    struct xs_region *next; /* every region that was entered, for the counts at exit */
+} xs_region;
+static XS_TLS xs_region *xs_regions;
+static int xs_region_check = -1; /* XISTO_REGION_CHECK=1: prove at run time that nothing escaped */
+#define XS_RCHUNK (256 * 1024)
+static __attribute__((noinline)) void *xs_region_more(xs_region *r, size_t size) {
+    xs_rchunk *c = r->cur ? r->cur->next : r->first;
+    while (c && c->size < size) c = c->next; /* a reused chunk too small for a big object: the next one */
+    if (!c) {
+        size_t sz = size > XS_RCHUNK ? size : XS_RCHUNK;
+        c = malloc(sizeof(xs_rchunk) + sz);
+        if (!c) xs_panic("out of memory");
+        c->size = sz;
+        c->next = NULL;
+        if (!r->first) r->first = c;
+        else { xs_rchunk *t = r->cur ? r->cur : r->first; while (t->next) t = t->next; t->next = c; }
+    }
+    r->cur = c;
+    r->ptr = c->data;
+    r->end = c->data + c->size;
+    void *p = r->ptr;
+    r->ptr += size;
+    return p;
+}
+static __attribute__((noinline)) void xs_region_list(xs_region *r, void *p) {
+    if (r->nlist == r->caplist) {
+        r->caplist = r->caplist ? r->caplist * 2 : 1024;
+        r->list = realloc(r->list, sizeof(void *) * r->caplist);
+        if (!r->list) xs_panic("out of memory");
+    }
+    r->list[r->nlist++] = p;
+}
+static inline __attribute__((always_inline)) void *xs_region_alloc(xs_region *r, size_t size, const xs_type *type) {
+    size = (size + 15) & ~(size_t)15;
+    void *p;
+    if (__builtin_expect(r->ptr && (size_t)(r->end - r->ptr) >= size, 1)) { p = r->ptr; r->ptr += size; }
+    else p = xs_region_more(r, size);
+    memset(p, 0, size);
+    xs_hdr *h = p;
+    h->rc = 1;
+    h->type = type;
+    if (type->drop || xs_region_check > 0) {
+        if (__builtin_expect(r->nlist < r->caplist, 1)) r->list[r->nlist++] = p;
+        else xs_region_list(r, p);
+    }
+    r->nobj++;
+    return p;
+}
+/* a dual class's object (region.c: the class is made both inside the loop and outside it): in the region while
+   one of its loop's iterations runs (on), on the heap otherwise */
+static inline __attribute__((always_inline)) void *xs_region_alloc_dual(xs_region *r, size_t size, const xs_type *type) {
+    xs_hdr *h = xs_region_alloc(r, size, type);
+    h->cls = XS_RGN;
+    return h;
+}
+static __attribute__((noinline)) void xs_region_reset(xs_region *r) {
+    if (xs_region_check > 0) {
+        for (size_t i = 0; i < r->nlist; i++) { xs_hdr *h = r->list[i]; if (h->type->drop) h->type->drop(h); }
+        for (size_t i = 0; i < r->nlist; i++) { xs_hdr *h = r->list[i]; if (h->type->rref) h->type->rref(h); }
+        for (size_t i = 0; i < r->nlist; i++) {
+            xs_hdr *h = r->list[i];
+            if (h->rc != 0) {
+                fflush(stdout);
+                fprintf(stderr, "xisto: region check: an object of a region class outlived its iteration (count %d); this is a bug in xisto\n", h->rc);
+                exit(70);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < r->nlist; i++) { xs_hdr *h = r->list[i]; h->type->drop(h); }
+    }
+    r->nlist = 0;
+    xs_allocs += r->nobj; /* (never in xs_live: they leave together, here) */
+    r->nobj = 0;
+    r->cur = r->first;
+    r->ptr = r->first ? r->first->data : NULL;
+    r->end = r->first ? r->first->data + r->first->size : NULL;
+}
+static XS_TLS xs_region *xs_rg_cur; /* the region of the loop running (regions do not nest) */
+static void xs_region_enter(xs_region *r) {
+    if (xs_region_check < 0) { const char *e = getenv("XISTO_REGION_CHECK"); xs_region_check = e && strcmp(e, "1") == 0; }
+    if (!r->listed) { r->listed = true; r->next = xs_regions; xs_regions = r; }
+    xs_rg_cur = r;
+    xs_region_reset(r); /* what a loop left by an exception still held */
+}
+static void *xs_region_bytes_cur(size_t n) {
+    xs_region *r = xs_rg_cur;
+    n = (n + 15) & ~(size_t)15;
+    if (r->ptr && (size_t)(r->end - r->ptr) >= n) { void *p = r->ptr; r->ptr += n; return p; }
+    return xs_region_more(r, n);
+}
+static void xs_arr_ref_rfree(void *p) { (void)p; }
+static void xs_arr_ref_rref(void *p) { /* the elements are objects of the region */
+    xs_arr_ref *a = p;
+    for (size_t i = 0; i < a->len; i++) if (a->data[i]) ((xs_hdr *)a->data[i])->rc--;
+}
+static const xs_type xs_arr_ref_rtype = {xs_arr_ref_rfree, xs_print_xs_arr_ref, NULL, NULL, xs_arr_ref_rref};
+static inline __attribute__((always_inline)) xs_arr_ref *xs_arr_ref_rnew(xs_region *r, void (*print_elem)(void *)) { /* [] */
+    xs_rg_cur = r;
+    xs_arr_ref *a = xs_region_alloc(r, sizeof *a + XS_INLINE_ELEMS * sizeof(void *), &xs_arr_ref_rtype);
+    a->cap = XS_INLINE_ELEMS;
+    a->data = (void **)(a + 1);
+    a->print_elem = print_elem;
+    return a;
+}
+static xs_arr_ref *xs_arr_ref_rlit(xs_region *r, void (*print_elem)(void *), int n, ...) { /* takes owned references */
+    xs_rg_cur = r;
+    size_t cap = n <= XS_INLINE_ELEMS ? XS_INLINE_ELEMS : (size_t)n;
+    xs_arr_ref *a = xs_region_alloc(r, sizeof *a + cap * sizeof(void *), &xs_arr_ref_rtype);
+    a->cap = cap;
+    a->data = (void **)(a + 1);
+    a->print_elem = print_elem;
+    va_list ap;
+    va_start(ap, n);
+    for (int i = 0; i < n; i++) a->data[a->len++] = va_arg(ap, void *);
+    va_end(ap);
+    return a;
+}
+
+static void xs_exit(void) {
+    xs_before_exit();
+    if (xs_rc_counting()) { xs_ar_drain(0); for (xs_region *r = xs_regions; r; r = r->next) xs_region_reset(r); xs_gc_collect(); }
+    fflush(stdout);
+    if (getenv("XISTO_RC_STATS")) {
+        fprintf(stderr, "xisto: %lld allocations, %lld still alive at exit\n", (long long)xs_allocs, (long long)xs_live);
+        if (xs_gc_runs) fprintf(stderr, "xisto: cycle collector: %lld objects in cycles freed, %lld runs\n", (long long)xs_gc_freed, (long long)xs_gc_runs);
+    }
+    xs_prof_report();
+}

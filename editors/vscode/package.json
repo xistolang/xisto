@@ -1,0 +1,130 @@
+{
+  "name": "xisto-debug",
+  "displayName": "Xisto Debugger",
+  "description": "Debug Xisto programs: breakpoints, steps, variables, exceptions, logpoints and editing values (xisto dap)",
+  "version": "0.1.0",
+  "publisher": "tessarotto",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onDebugResolve:xisto",
+    "onDebugDynamicConfigurations:xisto"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "Xisto",
+      "properties": {
+        "xisto.path": {
+          "type": "string",
+          "default": "xisto",
+          "description": "The xisto executable (a path, or a name on PATH)."
+        }
+      }
+    },
+    "breakpoints": [
+      {
+        "language": "typescript"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "xisto",
+        "label": "Xisto",
+        "languages": [
+          "typescript"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "The .ts file to build with --debug and run.",
+                "default": "${file}"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Arguments for the program.",
+                "default": []
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory.",
+                "default": "${workspaceFolder}"
+              },
+              "backend": {
+                "type": "string",
+                "enum": [
+                  "c",
+                  "qbe"
+                ],
+                "default": "c",
+                "description": "c: everything; qbe: faster builds, variables read-only."
+              }
+            }
+          },
+          "attach": {
+            "required": [
+              "port",
+              "token"
+            ],
+            "properties": {
+              "port": {
+                "type": "number",
+                "description": "The port the program printed (XISTO_DEBUG_PORT)."
+              },
+              "token": {
+                "type": "string",
+                "description": "The token the program printed (or XISTO_DEBUG_TOKEN)."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "xisto",
+            "request": "launch",
+            "name": "Xisto: debug this file",
+            "program": "${file}",
+            "cwd": "${workspaceFolder}"
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Xisto: Launch",
+            "description": "Build a .ts file with --debug and debug it",
+            "body": {
+              "type": "xisto",
+              "request": "launch",
+              "name": "Xisto",
+              "program": "^\"\\${file}\"",
+              "cwd": "^\"\\${workspaceFolder}\""
+            }
+          },
+          {
+            "label": "Xisto: Attach",
+            "description": "Attach to a --debug program started with XISTO_DEBUG_PORT",
+            "body": {
+              "type": "xisto",
+              "request": "attach",
+              "name": "Xisto: attach",
+              "port": 9229,
+              "token": "the token the program printed"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

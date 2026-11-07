@@ -1,0 +1,16 @@
+(xdb) b 12
+Breakpoint 1 at cycle.ts:12
+(xdb) r
+Breakpoint 1, (top level) at cycle.ts:12
+=>  12 | console.log("linked");
+(xdb) p a
+a = <ref *1> Ring {
+  name: 'a',
+  next: Ring { name: 'b', next: [Circular *1] }
+}
+(xdb) p a.next.next.name
+a.next.next.name = 'a'
+(xdb) c
+linked
+xisto: 2 allocations, 0 still alive at exit
+Program exited with code 0

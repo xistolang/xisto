@@ -1,0 +1,46 @@
+(xdb) b 17
+Breakpoint 1 at steps.ts:17
+(xdb) r
+start
+Breakpoint 1, sumSquares at steps.ts:17
+=>  17 |     s += square(i);
+(xdb) locals
+n = 3
+s = 0
+i = 1
+(xdb) globals
+c = Counter { total: 0 }
+(xdb) s
+square at steps.ts:10
+=>  10 |   const y = x * x;
+(xdb) locals
+x = 1
+(xdb) p x
+x = 1
+(xdb) up
+#1  sumSquares at steps.ts:17
+=>  17 |     s += square(i);
+(xdb) locals
+n = 3
+s = 0
+i = 1
+(xdb) p s
+s = 0
+(xdb) set s = 5
+cannot set s: read-only in a QBE build: its locals live in registers (debug with the C backend to edit)
+(xdb) up
+#2  (top level) at steps.ts:24
+=>  24 | const r = sumSquares(3);
+(xdb) locals
+c = Counter { total: 0 }
+(xdb) p c
+c = Counter { total: 0 }
+(xdb) fin
+Breakpoint 1, sumSquares at steps.ts:17
+=>  17 |     s += square(i);
+(xdb) (end of commands: continue)
+Breakpoint 1, sumSquares at steps.ts:17
+=>  17 |     s += square(i);
+result 14
+xisto: 1 allocations, 0 still alive at exit
+Program exited with code 0

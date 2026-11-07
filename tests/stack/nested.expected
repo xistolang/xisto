@@ -1,0 +1,5 @@
+runtime error: array index out of bounds
+    at f (tests/stack/nested.ts:2:11)
+    at g (tests/stack/nested.ts:5:10)
+    at tests/stack/nested.ts:7:13
+exit 70

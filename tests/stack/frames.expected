@@ -1,0 +1,53 @@
+== filter
+runtime error: array index out of bounds
+    at bad (tests/stack/frames.ts:4:11)
+    at tests/stack/frames.ts:25:40
+    at viaFilter (tests/stack/frames.ts:25:12)
+    at tests/stack/frames.ts:52:15
+exit 70
+== some
+runtime error: array index out of bounds
+    at bad (tests/stack/frames.ts:4:11)
+    at tests/stack/frames.ts:29:38
+    at viaSome (tests/stack/frames.ts:29:12)
+    at tests/stack/frames.ts:55:15
+exit 70
+== sort
+runtime error: array index out of bounds
+    at bad (tests/stack/frames.ts:4:11)
+    at tests/stack/frames.ts:33:36
+    at viaSort (tests/stack/frames.ts:33:6)
+    at tests/stack/frames.ts:58:3
+exit 70
+== foreach
+runtime error: array index out of bounds
+    at bad (tests/stack/frames.ts:4:11)
+    at tests/stack/frames.ts:38:5
+    at viaForEach (tests/stack/frames.ts:37:6)
+    at tests/stack/frames.ts:61:3
+exit 70
+== method
+runtime error: array index out of bounds
+    at bad (tests/stack/frames.ts:4:11)
+    at new Box (tests/stack/frames.ts:11:12)
+    at tests/stack/frames.ts:64:15
+exit 70
+== field-ctor
+runtime error: array index out of bounds
+    at bad (tests/stack/frames.ts:4:11)
+    at new Box (tests/stack/frames.ts:11:12)
+    at makeBox (tests/stack/frames.ts:42:10)
+    at tests/stack/frames.ts:67:15
+exit 70
+== field
+runtime error: array index out of bounds
+    at new Bag (tests/stack/frames.ts:21:15)
+    at makeBag (tests/stack/frames.ts:45:10)
+    at tests/stack/frames.ts:70:15
+exit 70
+== clone
+runtime error: integer overflow
+    at add (tests/stack/frames.ts:7:12)
+    at twice (tests/stack/frames.ts:48:10)
+    at tests/stack/frames.ts:73:23
+exit 70

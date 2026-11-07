@@ -1,0 +1,39 @@
+(xdb) b 17
+Breakpoint 1 at unwind.ts:17
+(xdb) b 24
+Breakpoint 2 at unwind.ts:24
+(xdb) r
+Breakpoint 2, <anonymous> at unwind.ts:24
+=>  24 |   const d = x * 2;
+(xdb) bt
+> #0  <anonymous> at unwind.ts:24
+  #1  (top level) at unwind.ts:23
+(xdb) c
+Breakpoint 2, <anonymous> at unwind.ts:24
+=>  24 |   const d = x * 2;
+(xdb) bt
+> #0  <anonymous> at unwind.ts:24
+  #1  (top level) at unwind.ts:23
+(xdb) n
+<anonymous> at unwind.ts:25
+=>  25 |   return d;
+(xdb) n
+(top level) at unwind.ts:27
+=>  27 | console.log(guarded(5), doubled);
+(xdb) n
+Breakpoint 1, guarded at unwind.ts:17
+=>  17 |     const fallback: int = -1;
+(xdb) bt
+> #0  guarded at unwind.ts:17
+  #1  (top level) at unwind.ts:27
+(xdb) n
+guarded at unwind.ts:18
+=>  18 |     return fallback;
+(xdb) bt
+> #0  guarded at unwind.ts:18
+  #1  (top level) at unwind.ts:27
+(xdb) (end of commands: continue)
+-1 [ 2, 4 ]
+end
+xisto: 5 allocations, 0 still alive at exit
+Program exited with code 0

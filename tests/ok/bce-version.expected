@@ -1,0 +1,9 @@
+dot 550
+pairs 170
+long limit caught: array index out of bounds 176
+negative start caught: array index out of bounds
+11,22,33,44,5 4
+1,2,1,2
+affine 20 0,6,5,4,3,2,1,7
+affine past the end caught: array index out of bounds 33
+affine below zero caught: array index out of bounds 44
