@@ -4654,10 +4654,25 @@ static bool xs_big_ne(xs_big *a, xs_big *b) { return xs_big_cmp(a, b) != 0; }
 /* Limb-vector primitives (as GMP's mpn layer): r may be the same array as x (in place), never partly overlapping.
    The carry chains go through __builtin_addcll / __builtin_subcll where the compiler has them: clang turns a
    run of them into one adcs / adc chain, about twice as fast as carries recomputed from comparisons (pidigits). */
-#if defined(__has_builtin)
+#if defined(__has_builtin) && !defined(XB_NO_ADDC) /* (XB_NO_ADDC, XB_NO_ASM: to test the plain C paths) */
 #if __has_builtin(__builtin_addcll) && __has_builtin(__builtin_subcll)
 #define XB_HAVE_ADDC 1
 #endif
+#endif
+/* aarch64 (Apple silicon, Graviton): add_n, sub_n, mul_1, addmul_1 and submul_1 in assembly. In add_n and
+   sub_n the carry stays in the flags across the whole loop (C can't say that: the loop's own compare clobbers
+   it, so every 4 limbs clang saved and restored it): about 0.28 ns per limb against 0.45 in C on an M4. */
+#if defined(__aarch64__) && (defined(__clang__) || defined(__GNUC__)) && !defined(XB_NO_ASM)
+#define XB_ASM_A64 1
+#else
+#define XB_ASM_A64 0
+#endif
+/* x86-64: add_n and sub_n, the carry kept in CF across the loop (lea, dec and jrcxz leave it alone); mul_1
+   stays in C there (mul clobbers the flags, so the chain is add/adc per limb as the C compiles anyway) */
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__)) && !defined(XB_NO_ASM)
+#define XB_ASM_X64 1
+#else
+#define XB_ASM_X64 0
 #endif
 typedef unsigned long long xb_c; /* the carry type of __builtin_addcll */
 static inline __attribute__((always_inline)) uint64_t xb_addc(uint64_t a, uint64_t b, xb_c ci, xb_c *co) {
@@ -4680,6 +4695,86 @@ static inline __attribute__((always_inline)) uint64_t xb_subc(uint64_t a, uint64
 }
 /* r = x + y (n limbs each); returns the carry out */
 static uint64_t xb_add_n(uint64_t *r, const uint64_t *x, const uint64_t *y, int64_t n) {
+#if XB_ASM_A64
+    uint64_t a0, a1, a2, a3, b0, b1, b2, b3, c;
+    __asm__("cmn xzr, xzr\n\t"                 /* carry clear */
+            "tbz %[n], #0, 1f\n\t"
+            "ldr %[a0], [%[x]], #8\n\t"
+            "ldr %[b0], [%[y]], #8\n\t"
+            "adcs %[a0], %[a0], %[b0]\n\t"
+            "str %[a0], [%[r]], #8\n"
+            "1:\n\t"
+            "tbz %[n], #1, 2f\n\t"
+            "ldp %[a0], %[a1], [%[x]], #16\n\t"
+            "ldp %[b0], %[b1], [%[y]], #16\n\t"
+            "adcs %[a0], %[a0], %[b0]\n\t"
+            "adcs %[a1], %[a1], %[b1]\n\t"
+            "stp %[a0], %[a1], [%[r]], #16\n"
+            "2:\n\t"
+            "lsr %[n], %[n], #2\n\t"           /* (lsr, sub and cbnz leave the carry alone) */
+            "cbz %[n], 4f\n"
+            "3:\n\t"
+            "ldp %[a0], %[a1], [%[x]], #16\n\t"
+            "ldp %[b0], %[b1], [%[y]], #16\n\t"
+            "ldp %[a2], %[a3], [%[x]], #16\n\t"
+            "ldp %[b2], %[b3], [%[y]], #16\n\t"
+            "adcs %[a0], %[a0], %[b0]\n\t"
+            "adcs %[a1], %[a1], %[b1]\n\t"
+            "adcs %[a2], %[a2], %[b2]\n\t"
+            "adcs %[a3], %[a3], %[b3]\n\t"
+            "stp %[a0], %[a1], [%[r]], #16\n\t"
+            "stp %[a2], %[a3], [%[r]], #16\n\t"
+            "sub %[n], %[n], #1\n\t"
+            "cbnz %[n], 3b\n"
+            "4:\n\t"
+            "cset %[c], cs"
+            : [r] "+r"(r), [x] "+r"(x), [y] "+r"(y), [n] "+r"(n), [c] "=r"(c),
+              [a0] "=&r"(a0), [a1] "=&r"(a1), [a2] "=&r"(a2), [a3] "=&r"(a3),
+              [b0] "=&r"(b0), [b1] "=&r"(b1), [b2] "=&r"(b2), [b3] "=&r"(b3)
+            :
+            : "cc", "memory");
+    return c;
+#elif XB_ASM_X64
+    uint64_t a, c = 0, rem = (uint64_t)n & 3, cnt = (uint64_t)n >> 2;
+    __asm__("xor %k[c], %k[c]\n\t"               /* (also clears the carry) */
+            "test %[rem], %[rem]\n\t"
+            "jz 2f\n"
+            "1:\n\t"
+            "mov (%[x]), %[a]\n\t"
+            "adc (%[y]), %[a]\n\t"
+            "mov %[a], (%[r])\n\t"
+            "lea 8(%[x]), %[x]\n\t"                /* (lea and dec leave the carry alone) */
+            "lea 8(%[y]), %[y]\n\t"
+            "lea 8(%[r]), %[r]\n\t"
+            "dec %[rem]\n\t"
+            "jnz 1b\n"
+            "2:\n\t"
+            "jrcxz 4f\n"
+            "3:\n\t"
+            "mov (%[x]), %[a]\n\t"
+            "adc (%[y]), %[a]\n\t"
+            "mov %[a], (%[r])\n\t"
+            "mov 8(%[x]), %[a]\n\t"
+            "adc 8(%[y]), %[a]\n\t"
+            "mov %[a], 8(%[r])\n\t"
+            "mov 16(%[x]), %[a]\n\t"
+            "adc 16(%[y]), %[a]\n\t"
+            "mov %[a], 16(%[r])\n\t"
+            "mov 24(%[x]), %[a]\n\t"
+            "adc 24(%[y]), %[a]\n\t"
+            "mov %[a], 24(%[r])\n\t"
+            "lea 32(%[x]), %[x]\n\t"
+            "lea 32(%[y]), %[y]\n\t"
+            "lea 32(%[r]), %[r]\n\t"
+            "dec %[cnt]\n\t"
+            "jnz 3b\n"
+            "4:\n\t"
+            "setc %b[c]"
+            : [r] "+r"(r), [x] "+r"(x), [y] "+r"(y), [rem] "+r"(rem), [cnt] "+c"(cnt), [c] "=&r"(c), [a] "=&r"(a)
+            :
+            : "cc", "memory");
+    return c;
+#else
     xb_c c = 0;
     int64_t i = 0;
     for (; i + 4 <= n; i += 4) {
@@ -4690,9 +4785,90 @@ static uint64_t xb_add_n(uint64_t *r, const uint64_t *x, const uint64_t *y, int6
     }
     for (; i < n; i++) r[i] = xb_addc(x[i], y[i], c, &c);
     return c;
+#endif
 }
 /* r = x - y (n limbs each); returns the borrow out */
 static uint64_t xb_sub_n(uint64_t *r, const uint64_t *x, const uint64_t *y, int64_t n) {
+#if XB_ASM_A64
+    uint64_t a0, a1, a2, a3, b0, b1, b2, b3, c;
+    __asm__("cmp xzr, xzr\n\t"                 /* no borrow (the carry set, on ARM) */
+            "tbz %[n], #0, 1f\n\t"
+            "ldr %[a0], [%[x]], #8\n\t"
+            "ldr %[b0], [%[y]], #8\n\t"
+            "sbcs %[a0], %[a0], %[b0]\n\t"
+            "str %[a0], [%[r]], #8\n"
+            "1:\n\t"
+            "tbz %[n], #1, 2f\n\t"
+            "ldp %[a0], %[a1], [%[x]], #16\n\t"
+            "ldp %[b0], %[b1], [%[y]], #16\n\t"
+            "sbcs %[a0], %[a0], %[b0]\n\t"
+            "sbcs %[a1], %[a1], %[b1]\n\t"
+            "stp %[a0], %[a1], [%[r]], #16\n"
+            "2:\n\t"
+            "lsr %[n], %[n], #2\n\t"
+            "cbz %[n], 4f\n"
+            "3:\n\t"
+            "ldp %[a0], %[a1], [%[x]], #16\n\t"
+            "ldp %[b0], %[b1], [%[y]], #16\n\t"
+            "ldp %[a2], %[a3], [%[x]], #16\n\t"
+            "ldp %[b2], %[b3], [%[y]], #16\n\t"
+            "sbcs %[a0], %[a0], %[b0]\n\t"
+            "sbcs %[a1], %[a1], %[b1]\n\t"
+            "sbcs %[a2], %[a2], %[b2]\n\t"
+            "sbcs %[a3], %[a3], %[b3]\n\t"
+            "stp %[a0], %[a1], [%[r]], #16\n\t"
+            "stp %[a2], %[a3], [%[r]], #16\n\t"
+            "sub %[n], %[n], #1\n\t"
+            "cbnz %[n], 3b\n"
+            "4:\n\t"
+            "cset %[c], cc"
+            : [r] "+r"(r), [x] "+r"(x), [y] "+r"(y), [n] "+r"(n), [c] "=r"(c),
+              [a0] "=&r"(a0), [a1] "=&r"(a1), [a2] "=&r"(a2), [a3] "=&r"(a3),
+              [b0] "=&r"(b0), [b1] "=&r"(b1), [b2] "=&r"(b2), [b3] "=&r"(b3)
+            :
+            : "cc", "memory");
+    return c;
+#elif XB_ASM_X64
+    uint64_t a, c = 0, rem = (uint64_t)n & 3, cnt = (uint64_t)n >> 2;
+    __asm__("xor %k[c], %k[c]\n\t"               /* (also clears the carry) */
+            "test %[rem], %[rem]\n\t"
+            "jz 2f\n"
+            "1:\n\t"
+            "mov (%[x]), %[a]\n\t"
+            "sbb (%[y]), %[a]\n\t"
+            "mov %[a], (%[r])\n\t"
+            "lea 8(%[x]), %[x]\n\t"                /* (lea and dec leave the carry alone) */
+            "lea 8(%[y]), %[y]\n\t"
+            "lea 8(%[r]), %[r]\n\t"
+            "dec %[rem]\n\t"
+            "jnz 1b\n"
+            "2:\n\t"
+            "jrcxz 4f\n"
+            "3:\n\t"
+            "mov (%[x]), %[a]\n\t"
+            "sbb (%[y]), %[a]\n\t"
+            "mov %[a], (%[r])\n\t"
+            "mov 8(%[x]), %[a]\n\t"
+            "sbb 8(%[y]), %[a]\n\t"
+            "mov %[a], 8(%[r])\n\t"
+            "mov 16(%[x]), %[a]\n\t"
+            "sbb 16(%[y]), %[a]\n\t"
+            "mov %[a], 16(%[r])\n\t"
+            "mov 24(%[x]), %[a]\n\t"
+            "sbb 24(%[y]), %[a]\n\t"
+            "mov %[a], 24(%[r])\n\t"
+            "lea 32(%[x]), %[x]\n\t"
+            "lea 32(%[y]), %[y]\n\t"
+            "lea 32(%[r]), %[r]\n\t"
+            "dec %[cnt]\n\t"
+            "jnz 3b\n"
+            "4:\n\t"
+            "setc %b[c]"
+            : [r] "+r"(r), [x] "+r"(x), [y] "+r"(y), [rem] "+r"(rem), [cnt] "+c"(cnt), [c] "=&r"(c), [a] "=&r"(a)
+            :
+            : "cc", "memory");
+    return c;
+#else
     xb_c c = 0;
     int64_t i = 0;
     for (; i + 4 <= n; i += 4) {
@@ -4703,6 +4879,7 @@ static uint64_t xb_sub_n(uint64_t *r, const uint64_t *x, const uint64_t *y, int6
     }
     for (; i < n; i++) r[i] = xb_subc(x[i], y[i], c, &c);
     return c;
+#endif
 }
 /* r = x + c (n limbs, c a carry of 0 or 1); returns the carry out. Once the carry is gone the rest is a copy. */
 static uint64_t xb_add_1(uint64_t *r, const uint64_t *x, int64_t n, uint64_t c) {
@@ -4719,12 +4896,64 @@ static uint64_t xb_sub_1(uint64_t *r, const uint64_t *x, int64_t n, uint64_t b) 
     return b;
 }
 /* r = x * m (n limbs); returns the high limb. The products are independent: only the additions of each
-   product's high half into the next low half form a chain (and the chain restarts every 4 limbs, the carry
-   folded into the high half, which cannot overflow: the high half of a product is at most 2^64 - 2). */
+   product's high half into the next low half form a chain. */
 static uint64_t xb_mul_1(uint64_t *r, const uint64_t *x, int64_t n, uint64_t m) {
+#if XB_ASM_A64
+    uint64_t a0, a1, a2, a3, h0, h1, h2, h3, h = 0;
+    __asm__("cmn xzr, xzr\n\t"
+            "tbz %[n], #0, 1f\n\t"
+            "ldr %[a0], [%[x]], #8\n\t"
+            "mul %[h0], %[a0], %[m]\n\t"
+            "umulh %[a0], %[a0], %[m]\n\t"
+            "adcs %[h0], %[h0], %[h]\n\t"
+            "mov %[h], %[a0]\n\t"
+            "str %[h0], [%[r]], #8\n"
+            "1:\n\t"
+            "tbz %[n], #1, 2f\n\t"
+            "ldp %[a0], %[a1], [%[x]], #16\n\t"
+            "mul %[h0], %[a0], %[m]\n\t"
+            "umulh %[a0], %[a0], %[m]\n\t"
+            "mul %[h1], %[a1], %[m]\n\t"
+            "umulh %[a1], %[a1], %[m]\n\t"
+            "adcs %[h0], %[h0], %[h]\n\t"
+            "adcs %[h1], %[h1], %[a0]\n\t"
+            "mov %[h], %[a1]\n\t"
+            "stp %[h0], %[h1], [%[r]], #16\n"
+            "2:\n\t"
+            "lsr %[n], %[n], #2\n\t"
+            "cbz %[n], 4f\n"
+            "3:\n\t"
+            "ldp %[a0], %[a1], [%[x]], #16\n\t"
+            "ldp %[a2], %[a3], [%[x]], #16\n\t"
+            "mul %[h0], %[a0], %[m]\n\t"
+            "umulh %[a0], %[a0], %[m]\n\t"
+            "mul %[h1], %[a1], %[m]\n\t"
+            "umulh %[a1], %[a1], %[m]\n\t"
+            "mul %[h2], %[a2], %[m]\n\t"
+            "umulh %[a2], %[a2], %[m]\n\t"
+            "mul %[h3], %[a3], %[m]\n\t"
+            "umulh %[a3], %[a3], %[m]\n\t"
+            "adcs %[h0], %[h0], %[h]\n\t"     /* low halves (in h0..h3) plus the high half below */
+            "adcs %[h1], %[h1], %[a0]\n\t"
+            "adcs %[h2], %[h2], %[a1]\n\t"
+            "adcs %[h3], %[h3], %[a2]\n\t"
+            "mov %[h], %[a3]\n\t"
+            "stp %[h0], %[h1], [%[r]], #16\n\t"
+            "stp %[h2], %[h3], [%[r]], #16\n\t"
+            "sub %[n], %[n], #1\n\t"
+            "cbnz %[n], 3b\n"
+            "4:\n\t"
+            "adc %[h], %[h], xzr"             /* (the high half of a product is at most 2^64 - 2) */
+            : [r] "+r"(r), [x] "+r"(x), [n] "+r"(n), [h] "+r"(h),
+              [a0] "=&r"(a0), [a1] "=&r"(a1), [a2] "=&r"(a2), [a3] "=&r"(a3),
+              [h0] "=&r"(h0), [h1] "=&r"(h1), [h2] "=&r"(h2), [h3] "=&r"(h3)
+            : [m] "r"(m)
+            : "cc", "memory");
+    return h;
+#else
     uint64_t h = 0;
     int64_t i = 0;
-    for (; i + 4 <= n; i += 4) {
+    for (; i + 4 <= n; i += 4) { /* (the chain restarts every 4 limbs, the carry folded into the high half) */
         xs_u128 p0 = (xs_u128)x[i] * m, p1 = (xs_u128)x[i + 1] * m, p2 = (xs_u128)x[i + 2] * m, p3 = (xs_u128)x[i + 3] * m;
         xb_c c;
         r[i] = xb_addc((uint64_t)p0, h, 0, &c);
@@ -4735,55 +4964,135 @@ static uint64_t xb_mul_1(uint64_t *r, const uint64_t *x, int64_t n, uint64_t m) 
     }
     for (; i < n; i++) { xs_u128 p = (xs_u128)x[i] * m + h; r[i] = (uint64_t)p; h = (uint64_t)(p >> 64); }
     return h;
+#endif
 }
-/* r += x * m (n limbs); returns the limb carried out */
-static uint64_t xb_addmul_1(uint64_t *r, const uint64_t *x, int64_t n, uint64_t m) {
+/* r = a + x * m (n limbs; r may be a); returns the limb carried out */
+static uint64_t xb_addmul_1(uint64_t *r, const uint64_t *a, const uint64_t *x, int64_t n, uint64_t m) {
     uint64_t h = 0;
-    int64_t i = 0;
-    for (; i + 4 <= n; i += 4) {
-        xs_u128 p0 = (xs_u128)x[i] * m, p1 = (xs_u128)x[i + 1] * m, p2 = (xs_u128)x[i + 2] * m, p3 = (xs_u128)x[i + 3] * m;
+#if XB_ASM_A64
+    int64_t blocks = n >> 2;
+    if (blocks) {
+        uint64_t a0, a1, a2, a3, l0, l1, l2, l3, r0, r1, r2, r3;
+        __asm__("1:\n\t"
+                "ldp %[a0], %[a1], [%[x]], #16\n\t"
+                "ldp %[a2], %[a3], [%[x]], #16\n\t"
+                "ldp %[r0], %[r1], [%[a]], #16\n\t"
+                "ldp %[r2], %[r3], [%[a]], #16\n\t"
+                "mul %[l0], %[a0], %[m]\n\t"
+                "umulh %[a0], %[a0], %[m]\n\t"
+                "mul %[l1], %[a1], %[m]\n\t"
+                "umulh %[a1], %[a1], %[m]\n\t"
+                "mul %[l2], %[a2], %[m]\n\t"
+                "umulh %[a2], %[a2], %[m]\n\t"
+                "mul %[l3], %[a3], %[m]\n\t"
+                "umulh %[a3], %[a3], %[m]\n\t"
+                "adds %[l0], %[l0], %[h]\n\t"      /* x * m + h over the 4 limbs: l0..l3, a3 on top */
+                "adcs %[l1], %[l1], %[a0]\n\t"
+                "adcs %[l2], %[l2], %[a1]\n\t"
+                "adcs %[l3], %[l3], %[a2]\n\t"
+                "adc %[a3], %[a3], xzr\n\t"
+                "adds %[r0], %[r0], %[l0]\n\t"     /* plus a */
+                "adcs %[r1], %[r1], %[l1]\n\t"
+                "adcs %[r2], %[r2], %[l2]\n\t"
+                "adcs %[r3], %[r3], %[l3]\n\t"
+                "adc %[h], %[a3], xzr\n\t"
+                "stp %[r0], %[r1], [%[r]], #16\n\t"
+                "stp %[r2], %[r3], [%[r]], #16\n\t"
+                "subs %[b], %[b], #1\n\t"
+                "b.ne 1b"
+                : [r] "+r"(r), [a] "+r"(a), [x] "+r"(x), [b] "+r"(blocks), [h] "+r"(h),
+                  [a0] "=&r"(a0), [a1] "=&r"(a1), [a2] "=&r"(a2), [a3] "=&r"(a3),
+                  [l0] "=&r"(l0), [l1] "=&r"(l1), [l2] "=&r"(l2), [l3] "=&r"(l3),
+                  [r0] "=&r"(r0), [r1] "=&r"(r1), [r2] "=&r"(r2), [r3] "=&r"(r3)
+                : [m] "r"(m)
+                : "cc", "memory");
+        n &= 3;
+    }
+#else
+    for (; n >= 4; n -= 4, r += 4, a += 4, x += 4) { /* (two carry chains, each restarting every 4 limbs) */
+        xs_u128 p0 = (xs_u128)x[0] * m, p1 = (xs_u128)x[1] * m, p2 = (xs_u128)x[2] * m, p3 = (xs_u128)x[3] * m;
         xb_c c, d;
         uint64_t t0 = xb_addc((uint64_t)p0, h, 0, &c);
         uint64_t t1 = xb_addc((uint64_t)p1, (uint64_t)(p0 >> 64), c, &c);
         uint64_t t2 = xb_addc((uint64_t)p2, (uint64_t)(p1 >> 64), c, &c);
         uint64_t t3 = xb_addc((uint64_t)p3, (uint64_t)(p2 >> 64), c, &c);
         uint64_t h3 = (uint64_t)(p3 >> 64) + c;
-        r[i] = xb_addc(r[i], t0, 0, &d);
-        r[i + 1] = xb_addc(r[i + 1], t1, d, &d);
-        r[i + 2] = xb_addc(r[i + 2], t2, d, &d);
-        r[i + 3] = xb_addc(r[i + 3], t3, d, &d);
-        h = h3 + d; /* (r + x * m over these limbs fits, so this cannot overflow) */
+        r[0] = xb_addc(a[0], t0, 0, &d);
+        r[1] = xb_addc(a[1], t1, d, &d);
+        r[2] = xb_addc(a[2], t2, d, &d);
+        r[3] = xb_addc(a[3], t3, d, &d);
+        h = h3 + d;
     }
-    for (; i < n; i++) { xs_u128 p = (xs_u128)x[i] * m + r[i] + h; r[i] = (uint64_t)p; h = (uint64_t)(p >> 64); }
+#endif
+    for (int64_t i = 0; i < n; i++) { xs_u128 p = (xs_u128)x[i] * m + a[i] + h; r[i] = (uint64_t)p; h = (uint64_t)(p >> 64); }
     return h;
 }
-/* r -= x * m (n limbs); returns the limb borrowed out (to come off the limb above) */
-static uint64_t xb_submul_1(uint64_t *r, const uint64_t *x, int64_t n, uint64_t m) {
+/* r = a - x * m (n limbs; r may be a); returns the limb borrowed out (to come off the limb above) */
+static uint64_t xb_submul_1(uint64_t *r, const uint64_t *a, const uint64_t *x, int64_t n, uint64_t m) {
     uint64_t h = 0;
-    int64_t i = 0;
-    for (; i + 4 <= n; i += 4) {
-        xs_u128 p0 = (xs_u128)x[i] * m, p1 = (xs_u128)x[i + 1] * m, p2 = (xs_u128)x[i + 2] * m, p3 = (xs_u128)x[i + 3] * m;
+#if XB_ASM_A64
+    int64_t blocks = n >> 2;
+    if (blocks) {
+        uint64_t a0, a1, a2, a3, l0, l1, l2, l3, r0, r1, r2, r3;
+        __asm__("1:\n\t"
+                "ldp %[a0], %[a1], [%[x]], #16\n\t"
+                "ldp %[a2], %[a3], [%[x]], #16\n\t"
+                "ldp %[r0], %[r1], [%[a]], #16\n\t"
+                "ldp %[r2], %[r3], [%[a]], #16\n\t"
+                "mul %[l0], %[a0], %[m]\n\t"
+                "umulh %[a0], %[a0], %[m]\n\t"
+                "mul %[l1], %[a1], %[m]\n\t"
+                "umulh %[a1], %[a1], %[m]\n\t"
+                "mul %[l2], %[a2], %[m]\n\t"
+                "umulh %[a2], %[a2], %[m]\n\t"
+                "mul %[l3], %[a3], %[m]\n\t"
+                "umulh %[a3], %[a3], %[m]\n\t"
+                "adds %[l0], %[l0], %[h]\n\t"
+                "adcs %[l1], %[l1], %[a0]\n\t"
+                "adcs %[l2], %[l2], %[a1]\n\t"
+                "adcs %[l3], %[l3], %[a2]\n\t"
+                "adc %[a3], %[a3], xzr\n\t"
+                "subs %[r0], %[r0], %[l0]\n\t"     /* a minus it */
+                "sbcs %[r1], %[r1], %[l1]\n\t"
+                "sbcs %[r2], %[r2], %[l2]\n\t"
+                "sbcs %[r3], %[r3], %[l3]\n\t"
+                "cinc %[h], %[a3], cc\n\t"          /* (carry clear: a borrow) */
+                "stp %[r0], %[r1], [%[r]], #16\n\t"
+                "stp %[r2], %[r3], [%[r]], #16\n\t"
+                "subs %[b], %[b], #1\n\t"
+                "b.ne 1b"
+                : [r] "+r"(r), [a] "+r"(a), [x] "+r"(x), [b] "+r"(blocks), [h] "+r"(h),
+                  [a0] "=&r"(a0), [a1] "=&r"(a1), [a2] "=&r"(a2), [a3] "=&r"(a3),
+                  [l0] "=&r"(l0), [l1] "=&r"(l1), [l2] "=&r"(l2), [l3] "=&r"(l3),
+                  [r0] "=&r"(r0), [r1] "=&r"(r1), [r2] "=&r"(r2), [r3] "=&r"(r3)
+                : [m] "r"(m)
+                : "cc", "memory");
+        n &= 3;
+    }
+#else
+    for (; n >= 4; n -= 4, r += 4, a += 4, x += 4) { /* (two carry chains, each restarting every 4 limbs) */
+        xs_u128 p0 = (xs_u128)x[0] * m, p1 = (xs_u128)x[1] * m, p2 = (xs_u128)x[2] * m, p3 = (xs_u128)x[3] * m;
         xb_c c, d;
         uint64_t t0 = xb_addc((uint64_t)p0, h, 0, &c);
         uint64_t t1 = xb_addc((uint64_t)p1, (uint64_t)(p0 >> 64), c, &c);
         uint64_t t2 = xb_addc((uint64_t)p2, (uint64_t)(p1 >> 64), c, &c);
         uint64_t t3 = xb_addc((uint64_t)p3, (uint64_t)(p2 >> 64), c, &c);
         uint64_t h3 = (uint64_t)(p3 >> 64) + c;
-        r[i] = xb_subc(r[i], t0, 0, &d);
-        r[i + 1] = xb_subc(r[i + 1], t1, d, &d);
-        r[i + 2] = xb_subc(r[i + 2], t2, d, &d);
-        r[i + 3] = xb_subc(r[i + 3], t3, d, &d);
-        h = h3 + d; /* (x * m over these limbs plus a borrow fits in them and one more limb) */
+        r[0] = xb_subc(a[0], t0, 0, &d);
+        r[1] = xb_subc(a[1], t1, d, &d);
+        r[2] = xb_subc(a[2], t2, d, &d);
+        r[3] = xb_subc(a[3], t3, d, &d);
+        h = h3 + d;
     }
-    for (; i < n; i++) {
+#endif
+    for (int64_t i = 0; i < n; i++) {
         xs_u128 p = (xs_u128)x[i] * m + h;
-        uint64_t lo = (uint64_t)p, t = r[i];
+        uint64_t lo = (uint64_t)p, t = a[i];
         h = (uint64_t)(p >> 64) + (t < lo);
         r[i] = t - lo;
     }
     return h;
 }
-
 /* a + (bneg ? -|b| : |b|) with a's sign: the core of + and - */
 XS_NOINLINE xs_big *xs_big_addsub(const xs_big *a, const xs_big *b, int bneg) {
     if (a->neg == bneg) { /* same signs: the magnitudes add */
@@ -4817,10 +5126,51 @@ XS_NOINLINE xs_big *xs_big_mul(xs_big *a, xs_big *b) {
     const xs_big *x = a->n >= b->n ? a : b, *y = x == a ? b : a; /* the longer one in the inner loop */
     xs_big *r = xs_big_alloc((int64_t)x->n + y->n);
     r->d[x->n] = xb_mul_1(r->d, x->d, x->n, y->d[0]); /* by one limb: the common case (acc * k) */
-    for (int32_t j = 1; j < y->n; j++) r->d[j + x->n] = xb_addmul_1(r->d + j, x->d, x->n, y->d[j]);
+    for (int32_t j = 1; j < y->n; j++) r->d[j + x->n] = xb_addmul_1(r->d + j, r->d + j, x->d, x->n, y->d[j]);
     r->neg = a->neg != b->neg;
     return xs_big_norm(r);
 }
+
+/* a + b * c and a - b * c (the checker joins them: acc += num * 2n): with a one-limb factor, the product goes
+   into a copy of a in the same pass that makes it (addmul_1 / submul_1), no product object in between */
+XS_NOINLINE xs_big *xs_big_addmul_s(xs_big *a, xs_big *b, xs_big *c, int sub) {
+    const xs_big *x = b->n >= c->n ? b : c, *y = x == b ? c : b;
+    if (y->n != 1 || a->n == 0) { /* a longer factor, or nothing to add to: the two steps */
+        xs_big *t = xs_big_mul(b, c), *r = sub ? xs_big_sub(a, t) : xs_big_add(a, t);
+        xs_obj_free(t);
+        return r;
+    }
+    int32_t xn = x->n, an = a->n, top = an > xn ? an : xn + 1, tn = an > xn ? an - xn - 1 : 0; /* tn: a's limbs above xn */
+    xs_big *r = xs_big_alloc(top + 1);
+    const uint64_t *src = a->d;
+    if (an < xn) { /* a shorter than the product: zero-extended in r first */
+        memcpy(r->d, a->d, 8 * (size_t)an);
+        memset(r->d + an, 0, 8 * (size_t)(xn - an));
+        src = r->d;
+    }
+    uint64_t ax = xn < an ? a->d[xn] : 0, m = y->d[0];
+    int pneg = (b->neg != c->neg) ^ sub; /* the sign of what comes onto a */
+    r->neg = a->neg;
+    if (pneg == a->neg) { /* the magnitudes add */
+        uint64_t h = xb_addmul_1(r->d, src, x->d, xn, m), t = ax + h;
+        r->d[xn] = t;
+        r->d[top] = xb_add_1(r->d + xn + 1, a->d + xn + 1, tn, t < h);
+    } else { /* |a| - |x| * m: below zero, the top limbs hold it in two's complement and are negated */
+        uint64_t h = xb_submul_1(r->d, src, x->d, xn, m);
+        r->d[xn] = ax - h;
+        r->d[top] = 0;
+        if (xb_sub_1(r->d + xn + 1, a->d + xn + 1, tn, ax < h)) { /* (pidigits' acc is often negative: common) */
+            int32_t i = 0; /* -r: the low zero limbs stay, the first nonzero one is negated, the rest inverted */
+            while (r->d[i] == 0) i++; /* (r is not zero: it was below zero) */
+            r->d[i] = (uint64_t)0 - r->d[i];
+            for (i++; i < top; i++) r->d[i] = ~r->d[i];
+            r->neg = !a->neg;
+        }
+    }
+    return xs_big_norm(r);
+}
+XS_NOINLINE xs_big *xs_big_addmul(xs_big *a, xs_big *b, xs_big *c) { return xs_big_addmul_s(a, b, c, 0); }
+XS_NOINLINE xs_big *xs_big_submul(xs_big *a, xs_big *b, xs_big *c) { return xs_big_addmul_s(a, b, c, 1); }
 
 /* |a| / |b| and |a| % |b| (either may be NULL): Knuth's algorithm D */
 static void xs_big_divmod_mag(const xs_big *a, const xs_big *b, xs_big **qo, xs_big **ro) {
@@ -4864,8 +5214,7 @@ static void xs_big_divmod_mag(const xs_big *a, const xs_big *b, xs_big **qo, xs_
         }
         if (!known) { /* r = a - qd * b over n limbs; what is borrowed past them comes off a's limb n */
             xs_big *r = xs_big_alloc(n);
-            memcpy(r->d, a->d, 8 * (size_t)n);
-            uint64_t h = xb_submul_1(r->d, b->d, n, qd);
+            uint64_t h = xb_submul_1(r->d, a->d, b->d, n, qd);
             if (h > top) { /* below zero: qd was one too large; the remainder is r + b (the carry out cancels the borrow) */
                 qd--;
                 xb_add_n(r->d, r->d, b->d, n);
@@ -4898,7 +5247,7 @@ static void xs_big_divmod_mag(const xs_big *a, const xs_big *b, xs_big **qo, xs_
                 rhat += vn[n - 1];
                 if (rhat >> 64) break;
             }
-            uint64_t h = xb_submul_1(un + j, vn, n, (uint64_t)qhat); /* un[j..j+n] -= qhat * vn */
+            uint64_t h = xb_submul_1(un + j, un + j, vn, n, (uint64_t)qhat); /* un[j..j+n] -= qhat * vn */
             bool neg = un[j + n] < h;
             un[j + n] -= h;
             if (neg) { /* qhat was one too large (rare): add vn back */

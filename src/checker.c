@@ -2216,6 +2216,17 @@ static const char *big_op(int op) {
     default: return NULL;
     }
 }
+/* xs_big_add(a, xs_big_mul(b, c)) -> xs_big_addmul(a, b, c), and the same for sub: one pass and no product
+   object when a factor is small (acc += num * 2n in pidigits). The operands keep their order (a, b, c). */
+static void big_fuse(Expr *e) {
+    if (e->kind != E_CALL || !e->builtin.cfn || e->args.len != 2) return;
+    bool add = strcmp(e->builtin.cfn, "xs_big_add") == 0, sub = strcmp(e->builtin.cfn, "xs_big_sub") == 0;
+    Expr *m = e->args.items[1];
+    if (!(add || sub) || m->kind != E_CALL || !m->builtin.cfn || strcmp(m->builtin.cfn, "xs_big_mul") != 0 || m->args.len != 2) return;
+    e->args.items[1] = m->args.items[0];
+    expr_list_push(&e->args, m->args.items[1]);
+    e->builtin.cfn = add ? "xs_big_addmul" : "xs_big_submul";
+}
 /* a + b, a < b, a === b... with a bigint on either side: both must be bigints (as in JS, which throws a
    TypeError when they are mixed) */
 static bool big_binary(Expr *e) {
@@ -2228,6 +2239,7 @@ static bool big_binary(Expr *e) {
     const char *f = big_op(e->op);
     if (!f) xs_error(e->pos, "supported on bigint: + - * / % and comparisons", "operator %s is not supported on bigint", tok_kind_name(e->op));
     big_call(e, f, e->lhs, e->rhs, ty_big());
+    big_fuse(e);
     return true;
 }
 
@@ -2641,6 +2653,7 @@ static void check_expr(Expr *e, Type *expected) {
             Expr *cur = expr_copy(target), *call = xs_alloc(sizeof *call);
             call->pos = e->pos;
             big_call(call, f, cur, e->rhs, ty_big());
+            big_fuse(call);
             e->rhs = call;
             e->op = TK_ASSIGN;
         }

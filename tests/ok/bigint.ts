@@ -71,3 +71,22 @@ console.log("near-multiple checks failed:", bad3, sum3);
 let big1 = 1n; // additions and subtractions whose carries and borrows run through many limbs
 for (let i = 0; i < 9; i++) big1 = big1 * L64;
 console.log(big1 - 1n, (big1 - 1n) + 1n === big1, big1 + big1 - 1n, -(big1 - 1n) - 1n, (big1 - 1n) * (big1 - 1n) - big1 * big1 + 2n * big1);
+// a + b * c and a - b * c become one call (xs_big_addmul / submul): every sign, a shorter and longer than the
+// product, a one-limb factor on either side, results that cross zero or land on it
+let fused = 0n;
+let fusedBad = 0;
+for (let t = 0; t < 400; t++) {
+  const a = BigInt(digits(1 + rnd(80))) * (rnd(2) === 0 ? 1n : -1n);
+  const b = BigInt(digits(1 + rnd(80))) * (rnd(2) === 0 ? 1n : -1n);
+  const c = (rnd(3) === 0 ? BigInt(digits(1 + rnd(40))) : BigInt(rnd(5) === 0 ? 0 : 1 + rnd(2000000000))) * (rnd(2) === 0 ? 1n : -1n);
+  const p = b * c;
+  const s1 = a + b * c, s2 = a - b * c, s3 = a + c * b, s4 = p - b * c, s5 = -p + b * c;
+  let acc = a;
+  acc += b * c;
+  let acc2 = a;
+  acc2 -= c * b;
+  if (s1 !== a + p || s2 !== a - p || s3 !== s1 || s4 !== 0n || s5 !== 0n || acc !== s1 || acc2 !== s2) fusedBad++;
+  fused += s1 % 1000003n + s2 % 999983n + (s4 === 0n ? 1n : 0n);
+}
+console.log("fused checks failed:", fusedBad, fused);
+console.log(5n - 2n * 3n, -5n + 2n * 3n, 6n - 2n * 3n, 0n + 7n * 0n, 0n - 7n * 9n, L64 - 1n - (L64 - 1n) * 1n, (L64 * L64) - (L64 + 1n) * (L64 - 1n));
