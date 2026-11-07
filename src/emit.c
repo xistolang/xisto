@@ -840,6 +840,17 @@ static void emit_borrowed(Expr *e);
 static void emit_expr(Expr *e);
 /* an operand of a bitwise operator as uint32_t (ToInt32, then its bits) */
 static void emit_u32(Expr *e) {
+    if (e->kind == E_BINARY && (e->op == TK_PLUS || e->op == TK_MINUS) && e->type->kind == TY_INT && !xs_debug &&
+        (e->lhs->type->kind == TY_INT || e->lhs->type->kind == TY_LITINT) && (e->rhs->type->kind == TY_INT || e->rhs->type->kind == TY_LITINT)) {
+        /* (a + b) >> 1, (h - k) & m: only the low 32 bits are kept, and those of the exact sum are those of the
+           sum mod 2^32, so no overflow check (the check stays wherever the whole sum is used) */
+        buf_puts(out, "((uint32_t)(");
+        emit_u32(e->lhs);
+        buf_puts(out, e->op == TK_PLUS ? " + " : " - ");
+        emit_u32(e->rhs);
+        buf_puts(out, "))");
+        return;
+    }
     if (e->type->kind == TY_NUMBER) { buf_puts(out, "(uint32_t)xs_toi32("); emit_expr(e); buf_puts(out, ")"); }
     else { buf_puts(out, "(uint32_t)("); emit_expr(e); buf_puts(out, ")"); }
 }
