@@ -1473,7 +1473,7 @@ static inline __attribute__((always_inline)) double xs_fmod(double x, double y) 
     return fmod(x, y);
 }
 
-/* ---- Map and Set: open addressing, string or int keys, values of any kind ---- */
+/* ---- Map and Set: a Swiss table, string or int keys, values of any kind, insertion order ---- */
 
 typedef union { double d; int64_t i; void *p; } xs_val;
 #define XS_VNUM(x) ((xs_val){.d = (x)})
@@ -1481,16 +1481,23 @@ typedef union { double d; int64_t i; void *p; } xs_val;
 #define XS_VBOOL(x) ((xs_val){.i = (x) ? 1 : 0})
 #define XS_VPTR(x) ((xs_val){.p = (x)})
 
-/* state: 0 empty, 1 used, 2 deleted. A map has string keys or int keys, never both: one field holds either, and an
-   entry is 32 bytes instead of 40 (k-nucleotide's 16M-entry tables are memory-bound) */
-typedef struct { union { xs_str *skey; int64_t ikey; }; xs_val val; uint32_t hash; uint8_t state; } xs_map_entry;
-/* (hash: the low 32 bits, which pick the slot in any table below 2^32 entries, and filter the comparisons) */
+/* The table is a Swiss table (Abseil, Rust's hashbrown): a control byte per slot, read 16 at a time, holds 7 bits
+   of the key's hash (full), 0x80 (empty) or 0xFE (deleted); the slots hold only the key and the value (16 bytes).
+   A lookup compares the control bytes of a group with SIMD and looks at a slot only where its 7 bits match, so a
+   hit reads one slot and a miss usually none, and a probe seldom goes past the first group (load at most 7/8;
+   7/16 after a rebuild); an int key's slot line is prefetched with the group. A map has string keys or
+   int keys, never both: one field holds either. JS iteration is in insertion order: order[] holds the slots in
+   that order. Deleted slots stay deleted until the table is rebuilt (reusing one would put a live entry under a
+   stale position of order[]), so a lookup stops at the first group with an empty slot, and an insert takes that
+   empty slot. */
+typedef struct { union { xs_str *skey; int64_t ikey; }; xs_val val; } xs_map_entry;
 typedef struct xs_map {
     xs_hdr hdr;
-    xs_map_entry *entries;
-    size_t *order;        /* entry indices in insertion order (JS iteration order); stale slots are skipped */
+    uint8_t *ctrl;        /* cap + 16 control bytes: the last 16 repeat the first 16 (a group read never wraps) */
+    xs_map_entry *slots;  /* cap */
+    uint32_t *order;      /* slots in insertion order (JS iteration order); deleted ones are skipped */
     size_t norder, order_cap;
-    size_t cap, count, used;
+    size_t cap, count, used; /* used: live and deleted slots (what fills the table) */
     bool is_map, str_keys;
     int val_kind; /* 0 num, 1 int, 2 bool, 3 heap pointer */
     void (*print_key)(void *);
@@ -1498,9 +1505,42 @@ typedef struct xs_map {
     xs_str *lk;   /* the last string key hashed, held, and its hash: has(k), get(k), set(k, ...) in a row hash once */
     uint64_t lh;
     int64_t lik;  /* int keys: the last key looked up (where lidx points) */
-    size_t lidx;  /* + 1: where lk was found (its entry, or the empty slot it would take); 0 after a grow, delete
-                     or clear, which can move or empty slots */
+    size_t lidx;  /* + 1: the slot of the last key (its entry, or the empty slot it would take); 0 after a grow,
+                     delete or clear, which can move or empty slots */
+    xs_map_entry *lhit; /* int keys: the entry of lik, NULL when it is not in the map or lidx is 0 */
 } xs_map;
+
+#define XS_MAP_EMPTY 0x80
+#define XS_MAP_DEL 0xFE
+#define XS_MAP_GW 16 /* slots in a group */
+#define XS_MAP_FULL(m, i) ((m)->ctrl[i] < 0x80)
+/* a group's bytes equal to b, as a mask: bit (slot << XS_MAP_GSH) set for each; XS_MAP_GBIT gives the lowest slot */
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+typedef uint64_t xs_map_gmask;
+#define XS_MAP_GSH 2 /* NEON has no movemask: a nibble per byte (shift right and narrow), its top bit kept */
+static inline xs_map_gmask xs_map_gmatch(const uint8_t *g, uint8_t b) {
+    uint8x16_t eq = vceqq_u8(vld1q_u8(g), vdupq_n_u8(b));
+    return vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0) & 0x8888888888888888ull;
+}
+#elif defined(__SSE2__)
+#include <emmintrin.h>
+typedef uint32_t xs_map_gmask;
+#define XS_MAP_GSH 0
+static inline xs_map_gmask xs_map_gmatch(const uint8_t *g, uint8_t b) {
+    return (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)g), _mm_set1_epi8((char)b)));
+}
+#else
+typedef uint32_t xs_map_gmask;
+#define XS_MAP_GSH 0
+static inline xs_map_gmask xs_map_gmatch(const uint8_t *g, uint8_t b) {
+    uint32_t mm = 0;
+    for (int j = 0; j < XS_MAP_GW; j++) mm |= (uint32_t)(g[j] == b) << j;
+    return mm;
+}
+#endif
+#define XS_MAP_GBIT(mm) ((size_t)__builtin_ctzll((uint64_t)(mm)) >> XS_MAP_GSH)
+#define XS_MAP_H2(h) ((uint8_t)((h) >> 57)) /* the control byte of a full slot: the hash's top 7 bits */
 
 static uint64_t xs_hash_bytes(const char *p, size_t n) { /* 8 bytes a step, then mixed (splitmix64's constants) */
     uint64_t h = 0x9E3779B97F4A7C15ull ^ (uint64_t)n;
@@ -1523,23 +1563,29 @@ static uint64_t xs_hash_bytes(const char *p, size_t n) { /* 8 bytes a step, then
     h ^= h >> 32;
     return h | 1;
 }
-static uint64_t xs_hash_int(int64_t v) {
+/* (the top bits, the control byte, are the product's best; the low bits, the slot, get the high ones mixed in) */
+static inline uint64_t xs_hash_int(int64_t v) {
     uint64_t h = (uint64_t)v * 11400714819323198485ull;
-    return (h ^ (h >> 29)) | 1;
+    return h ^ (h >> 29);
 }
 
 static void xs_map_free(void *p) {
     xs_map *m = p;
-    for (size_t i = 0; i < m->cap; i++) {
-        if (m->entries[i].state != 1) continue;
-        if (m->str_keys) xs_release_(m->entries[i].skey);
-        if (m->val_kind == 3) xs_release_(m->entries[i].val.p);
-    }
+    if (m->str_keys || m->val_kind == 3)
+        for (size_t i = 0; i < m->cap; i++) {
+            if (!XS_MAP_FULL(m, i)) continue;
+            if (m->str_keys) xs_release_(m->slots[i].skey);
+            if (m->val_kind == 3) xs_release_(m->slots[i].val.p);
+        }
     if (m->lk) xs_release_(m->lk);
-    free(m->entries);
+    free(m->ctrl);
+    free(m->slots);
     free(m->order);
     xs_obj_free(p);
 }
+
+/* iterates the live entries in insertion order; e points at each (key and value in place) */
+#define XS_MAP_EACH(m, e) for (size_t oi_ = 0; oi_ < (m)->norder; oi_++) if (XS_MAP_FULL(m, (m)->order[oi_]) && ((e = &(m)->slots[(m)->order[oi_]]), 1))
 
 static void xs_print_num(double v);
 static void xs_print_int(int64_t v);
@@ -1554,9 +1600,8 @@ static void xs_print_map(void *p) {
     xs_insp fr;
     if (!xs_insp_begin(&fr, p, m->is_map ? "Map" : "Set", m->count ? NULL : m->is_map ? "Map(0) {}" : "Set(0) {}")) return;
     size_t shown = 0;
-    for (size_t oi = 0; oi < m->norder; oi++) {
-        xs_map_entry *e = &m->entries[m->order[oi]];
-        if (e->state != 1) continue;
+    xs_map_entry *e;
+    XS_MAP_EACH(m, e) {
         xs_insp_entry(&fr);
         if (shown++ == 100) { fprintf(XS_OUT, "... %zu more item%s", m->count - 100, m->count - 100 == 1 ? "" : "s"); break; }
         if (m->str_keys) m->print_key(e->skey); else m->print_key(&e->ikey);
@@ -1571,6 +1616,17 @@ static void xs_print_map(void *p) {
     xs_insp_end(&fr, open, "}", false, false, m->count > 100);
 }
 
+/* an empty table of cap slots (a power of two, 16 or more) */
+static void xs_map_alloc(xs_map *m, size_t cap) {
+    if (cap > (size_t)UINT32_MAX) xs_panic("out of memory"); /* (order[] holds 32-bit slots) */
+    m->cap = cap;
+    m->ctrl = malloc(cap + XS_MAP_GW);
+    m->slots = malloc(cap * sizeof(xs_map_entry)); /* (only a full slot is ever read) */
+    if (!m->ctrl || !m->slots) xs_panic("out of memory");
+    memset(m->ctrl, XS_MAP_EMPTY, cap + XS_MAP_GW);
+    m->used = 0;
+}
+
 static xs_map *xs_map_new(int is_map, int str_keys, int val_kind, void (*print_key)(void *), void (*print_val)(void *)) {
     xs_map *m = xs_obj_alloc(sizeof *m, xs_map_free, xs_print_map);
     m->is_map = is_map != 0;
@@ -1580,53 +1636,101 @@ static xs_map *xs_map_new(int is_map, int str_keys, int val_kind, void (*print_k
     m->print_val = print_val;
     m->lk = NULL;
     m->lidx = 0;
-    m->cap = 16;
-    m->entries = calloc(m->cap, sizeof(xs_map_entry));
-    if (!m->entries) xs_panic("out of memory");
+    m->lhit = NULL;
+    xs_map_alloc(m, 16);
     return m;
 }
 
-/* Tombstones are never reused (they would break insertion order); growth rehashes them away. */
-static xs_map_entry *xs_map_find(xs_map *m, xs_str *skey, int64_t ikey, uint64_t hash) {
-    size_t i = (size_t)hash & (m->cap - 1);
+static inline void xs_map_set_ctrl(xs_map *m, size_t i, uint8_t c) {
+    m->ctrl[i] = c;
+    if (i < XS_MAP_GW) m->ctrl[m->cap + i] = c; /* (the mirror) */
+}
+
+/* Looks an int key up and leaves the answer in the last-key cache: lik = k, lidx = its slot + 1 (its own, or
+   the empty slot it would take), lhit = its entry or NULL. Groups are probed in triangular steps, which visit
+   every group of a power-of-two table. */
+static inline xs_map_entry *xs_map_probe_i(xs_map *m, int64_t k) {
+    uint64_t h = xs_hash_int(k);
+    size_t mask = m->cap - 1, pos = (size_t)h & mask, stride = 0;
+    uint8_t h2 = XS_MAP_H2(h);
+    const uint8_t *ctrl = m->ctrl;
+    xs_map_entry *slots = m->slots;
+    __builtin_prefetch(&slots[pos]); /* (a key mostly sits at pos or right after it: its line comes with the group's) */
+    m->lik = k;
     for (;;) {
-        xs_map_entry *e = &m->entries[i];
-        if (e->state == 0) return e;
-        if (e->state == 1 && e->hash == (uint32_t)hash && (m->str_keys ? xs_str_eq(e->skey, skey) : e->ikey == ikey)) return e;
-        i = (i + 1) & (m->cap - 1);
+        const uint8_t *g = ctrl + pos;
+        for (xs_map_gmask mm = xs_map_gmatch(g, h2); mm; mm &= mm - 1) {
+            size_t i = (pos + XS_MAP_GBIT(mm)) & mask;
+            if (__builtin_expect(slots[i].ikey == k, 1)) { m->lidx = i + 1; return m->lhit = &slots[i]; }
+        }
+        xs_map_gmask em = xs_map_gmatch(g, XS_MAP_EMPTY);
+        if (__builtin_expect(em != 0, 1)) { m->lidx = ((pos + XS_MAP_GBIT(em)) & mask) + 1; return m->lhit = NULL; }
+        stride += XS_MAP_GW;
+        pos = (pos + stride) & mask;
+    }
+}
+/* The slot of a string key: its own when it is in the map, else the empty slot it would take (the caller looks
+   at its control byte) */
+static size_t xs_map_find_slot_s(xs_map *m, xs_str *k, uint64_t h) {
+    size_t mask = m->cap - 1, pos = (size_t)h & mask, stride = 0;
+    uint8_t h2 = XS_MAP_H2(h);
+    for (;;) {
+        const uint8_t *g = m->ctrl + pos;
+        for (xs_map_gmask mm = xs_map_gmatch(g, h2); mm; mm &= mm - 1) {
+            size_t i = (pos + XS_MAP_GBIT(mm)) & mask;
+            xs_str *sk = m->slots[i].skey;
+            if (sk == k || xs_str_eq(sk, k)) return i;
+        }
+        xs_map_gmask em = xs_map_gmatch(g, XS_MAP_EMPTY);
+        if (__builtin_expect(em != 0, 1)) return (pos + XS_MAP_GBIT(em)) & mask;
+        stride += XS_MAP_GW;
+        pos = (pos + stride) & mask;
+    }
+}
+/* the empty slot a new key takes (a rebuild: no key to compare) */
+static size_t xs_map_free_slot(xs_map *m, uint64_t h) {
+    size_t mask = m->cap - 1, pos = (size_t)h & mask, stride = 0;
+    for (;;) {
+        xs_map_gmask em = xs_map_gmatch(m->ctrl + pos, XS_MAP_EMPTY);
+        if (em) return (pos + XS_MAP_GBIT(em)) & mask;
+        stride += XS_MAP_GW;
+        pos = (pos + stride) & mask;
     }
 }
 
 static void xs_map_order_push(xs_map *m, size_t idx) {
     if (m->norder == m->order_cap) {
         m->order_cap = m->order_cap ? m->order_cap * 2 : 16;
-        m->order = realloc(m->order, m->order_cap * sizeof(size_t));
+        m->order = realloc(m->order, m->order_cap * sizeof(uint32_t));
         if (!m->order) xs_panic("out of memory");
     }
-    m->order[m->norder++] = idx;
+    m->order[m->norder++] = (uint32_t)idx;
 }
 
+/* rebuilt in insertion order, twice the size when more than 7/16 of it is live (else the same size: deleted
+   slots cleaned); a string key is hashed again (the table keeps only 7 bits of it) */
 static void xs_map_grow(xs_map *m) {
     m->lidx = 0;
-    xs_map_entry *old = m->entries;
-    size_t *old_order = m->order;
-    size_t old_norder = m->norder;
-    if (m->count * 2 > m->cap) m->cap *= 2; /* otherwise just clean tombstones */
-    m->entries = calloc(m->cap, sizeof(xs_map_entry));
-    if (!m->entries) xs_panic("out of memory");
-    m->used = 0;
-    m->order = NULL;
-    m->norder = m->order_cap = 0;
-    for (size_t oi = 0; oi < old_norder; oi++) { /* reinsert in insertion order */
-        xs_map_entry *o = &old[old_order[oi]];
-        if (o->state != 1) continue;
-        xs_map_entry *e = xs_map_find(m, o->skey, o->ikey, o->hash);
-        *e = *o;
-        m->used++;
-        xs_map_order_push(m, (size_t)(e - m->entries));
+    m->lhit = NULL;
+    uint8_t *old_ctrl = m->ctrl;
+    xs_map_entry *old = m->slots;
+    size_t cap = m->cap;
+    if (m->count * 16 > cap * 7) cap *= 2;
+    xs_map_alloc(m, cap);
+    size_t j = 0;
+    for (size_t oi = 0; oi < m->norder; oi++) { /* reinsert in insertion order; order[] is rewritten in place */
+        size_t s = m->order[oi];
+        if (old_ctrl[s] >= 0x80) continue;
+        xs_map_entry *o = &old[s];
+        uint64_t h = m->str_keys ? xs_hash_bytes(o->skey->data, (size_t)o->skey->len) : xs_hash_int(o->ikey);
+        size_t i = xs_map_free_slot(m, h);
+        xs_map_set_ctrl(m, i, XS_MAP_H2(h));
+        m->slots[i] = *o;
+        m->order[j++] = (uint32_t)i;
     }
+    m->norder = m->used = j;
+    free(old_ctrl);
     free(old);
-    free(old_order);
 }
 
 static uint64_t xs_map_hash_s(xs_map *m, xs_str *k) {
@@ -1640,69 +1744,70 @@ static uint64_t xs_map_hash_s(xs_map *m, xs_str *k) {
     }
     return h;
 }
-/* xs_map_find for a string key, through the cached slot of the last key */
 /* int keys: has(k), get(k), set(k, ...) in a row probe once (the counting idiom: 125M of them per frame in
    k-nucleotide); lidx is cleared where the table changes shape (grow, delete, clear) */
-static inline xs_map_entry *xs_map_find_i(xs_map *m, int64_t k, uint64_t h) {
-    if (m->lidx && m->lik == k) return &m->entries[m->lidx - 1];
-    xs_map_entry *e = xs_map_find(m, NULL, k, h);
-    m->lik = k;
-    m->lidx = (size_t)(e - m->entries) + 1;
-    return e;
+static inline size_t xs_map_find_i(xs_map *m, int64_t k) {
+    if (!(m->lidx && m->lik == k)) xs_map_probe_i(m, k);
+    return m->lidx - 1;
 }
-static xs_map_entry *xs_map_find_s(xs_map *m, xs_str *k, uint64_t h) {
-    if (k == m->lk && m->lidx) return &m->entries[m->lidx - 1];
-    xs_map_entry *e = xs_map_find(m, k, 0, h);
-    if (k == m->lk) m->lidx = (size_t)(e - m->entries) + 1;
-    return e;
+/* the same for a string key, through the cached slot of the last key */
+static size_t xs_map_find_s(xs_map *m, xs_str *k, uint64_t h) {
+    if (k == m->lk && m->lidx) return m->lidx - 1;
+    size_t i = xs_map_find_slot_s(m, k, h);
+    if (k == m->lk) m->lidx = i + 1;
+    return i;
 }
 /* value is owned when val_kind == 3 */
 static xs_map *xs_map_put(xs_map *m, xs_str *skey, int64_t ikey, xs_val val) {
-    if ((m->used + 1) * 10 > m->cap * 7) xs_map_grow(m);
+    if ((m->used + 1) * 8 > m->cap * 7) xs_map_grow(m);
     uint64_t h = m->str_keys ? xs_map_hash_s(m, skey) : xs_hash_int(ikey);
-    xs_map_entry *e = m->str_keys ? xs_map_find_s(m, skey, h) : xs_map_find_i(m, ikey, h);
-    if (e->state == 1) {
+    size_t i = m->str_keys ? xs_map_find_s(m, skey, h) : xs_map_find_i(m, ikey);
+    xs_map_entry *e = &m->slots[i];
+    if (XS_MAP_FULL(m, i)) {
         if (m->val_kind == 3) xs_release_(e->val.p);
         e->val = val;
         return m;
     }
     m->used++;
-    e->state = 1;
-    e->hash = (uint32_t)h;
-    xs_map_order_push(m, (size_t)(e - m->entries));
-    if (m->str_keys) e->skey = xs_retain(skey); else e->ikey = ikey; /* (the same field) */
+    xs_map_set_ctrl(m, i, XS_MAP_H2(h));
+    xs_map_order_push(m, i);
+    if (m->str_keys) e->skey = xs_retain(skey);
+    else { e->ikey = ikey; m->lhit = e; } /* (the same field; lik and lidx are this key's already) */
     e->val = val;
     m->count++;
     return m;
 }
 static xs_map *xs_map_set_s(xs_map *m, xs_str *k, xs_val v) { return xs_map_put(m, k, 0, v); }
 static inline __attribute__((always_inline)) xs_map *xs_map_set_i(xs_map *m, int64_t k, xs_val v) {
-    if (m->lidx && m->lik == k && m->val_kind != 3) { /* the key just looked up, a value that is no reference: in place */
-        xs_map_entry *e = &m->entries[m->lidx - 1];
-        if (e->state == 1) { e->val = v; return m; }
+    if (m->lhit && m->lik == k && m->val_kind != 3) { /* the key just looked up, there, a value that is no
+                                                          reference: in place */
+        m->lhit->val = v;
+        return m;
     }
     return xs_map_put(m, NULL, k, v);
 }
 
 static xs_map_entry *xs_map_lookup(xs_map *m, xs_str *skey, int64_t ikey) {
-    uint64_t h = m->str_keys ? xs_map_hash_s(m, skey) : xs_hash_int(ikey);
-    xs_map_entry *e = m->str_keys ? xs_map_find_s(m, skey, h) : xs_map_find_i(m, ikey, h);
-    return e->state == 1 ? e : NULL;
+    if (!m->str_keys) return m->lidx && m->lik == ikey ? m->lhit : xs_map_probe_i(m, ikey);
+    size_t i = xs_map_find_s(m, skey, xs_map_hash_s(m, skey));
+    return XS_MAP_FULL(m, i) ? &m->slots[i] : NULL;
 }
 static bool xs_map_has_s(xs_map *m, xs_str *k) { return xs_map_lookup(m, k, 0) != NULL; }
 /* int keys, inlined where they are used: the last key looked up answers at once (has, get, set of one key in a
-   row: the counting idiom), else one probe; nothing asks whether the keys are strings */
+   row: the counting idiom), else one probe; nothing asks whether the keys are strings. has() probes always:
+   it is what starts such a row, and a branch on whether its key repeats the last one would be a coin toss
+   where few keys alternate (k-nucleotide's frame 1) */
 static inline __attribute__((always_inline)) xs_map_entry *xs_map_lookup_i(xs_map *m, int64_t k) {
-    xs_map_entry *e = m->lidx && m->lik == k ? &m->entries[m->lidx - 1] : xs_map_find_i(m, k, xs_hash_int(k));
-    return e->state == 1 ? e : NULL;
+    return m->lidx && m->lik == k ? m->lhit : xs_map_probe_i(m, k);
 }
-static inline __attribute__((always_inline)) bool xs_map_has_i(xs_map *m, int64_t k) { return xs_map_lookup_i(m, k) != NULL; }
+static inline __attribute__((always_inline)) bool xs_map_has_i(xs_map *m, int64_t k) { return xs_map_probe_i(m, k) != NULL; }
 static bool xs_map_delete_at(xs_map *m, xs_map_entry *e) {
     if (!e) return false;
     m->lidx = 0;
+    m->lhit = NULL;
     if (m->str_keys) xs_release_(e->skey);
     if (m->val_kind == 3) xs_release_(e->val.p);
-    e->state = 2;
+    xs_map_set_ctrl(m, (size_t)(e - m->slots), XS_MAP_DEL);
     m->count--;
     return true;
 }
@@ -1710,8 +1815,9 @@ static bool xs_map_delete_s(xs_map *m, xs_str *k) { return xs_map_delete_at(m, x
 static bool xs_map_delete_i(xs_map *m, int64_t k) { return xs_map_delete_at(m, xs_map_lookup(m, NULL, k)); }
 static void xs_map_clear(xs_map *m) {
     m->lidx = 0;
-    for (size_t i = 0; i < m->cap; i++) if (m->entries[i].state == 1) xs_map_delete_at(m, &m->entries[i]);
-    memset(m->entries, 0, m->cap * sizeof(xs_map_entry));
+    m->lhit = NULL;
+    for (size_t i = 0; i < m->cap; i++) if (XS_MAP_FULL(m, i)) xs_map_delete_at(m, &m->slots[i]);
+    memset(m->ctrl, XS_MAP_EMPTY, m->cap + XS_MAP_GW);
     m->used = 0;
     m->norder = 0;
 }
@@ -1733,18 +1839,18 @@ XS_NOINLINE bool xs_map_get_bool_i(xs_map *m, int64_t k) { return xs_map_need(m,
 static void *xs_map_get_ptr_s(xs_map *m, xs_str *k) { xs_map_entry *e = xs_map_lookup(m, k, 0); return e ? e->val.p : NULL; }
 static void *xs_map_get_ptr_i(xs_map *m, int64_t k) { xs_map_entry *e = xs_map_lookup(m, NULL, k); return e ? e->val.p : NULL; }
 
-/* keys() / values() as new arrays, in insertion-independent (table) order */
+/* keys() / values() as new arrays, in insertion order */
 static void *xs_map_keys(xs_map *m, void (*print_elem)(void *)) {
+    xs_map_entry *e;
     if (m->str_keys) {
         xs_arr_ref *a = xs_arr_ref_new(m->count, print_elem ? print_elem : xs_print_str_quoted_);
-        for (size_t oi = 0; oi < m->norder; oi++) if (m->entries[m->order[oi]].state == 1) xs_arr_ref_push(a, xs_retain(m->entries[m->order[oi]].skey));
+        XS_MAP_EACH(m, e) xs_arr_ref_push(a, xs_retain(e->skey));
         return a;
     }
     xs_arr_int *a = xs_arr_int_new(0, 0);
-    for (size_t oi = 0; oi < m->norder; oi++) if (m->entries[m->order[oi]].state == 1) xs_arr_int_push(a, m->entries[m->order[oi]].ikey);
+    XS_MAP_EACH(m, e) xs_arr_int_push(a, e->ikey);
     return a;
 }
-#define XS_MAP_EACH(m, e) for (size_t oi_ = 0; oi_ < (m)->norder; oi_++) if ((e = &(m)->entries[(m)->order[oi_]])->state == 1)
 static void *xs_map_values(xs_map *m, void (*print_elem)(void *)) {
     xs_map_entry *e;
     switch (m->val_kind) {
@@ -5638,7 +5744,7 @@ static void xs_arr_ref_visit(void *p, xs_visit_cb cb, void *arg) {
 static void xs_map_visit(void *p, xs_visit_cb cb, void *arg) {
     xs_map *m = p;
     if (m->val_kind != 3) return;
-    for (size_t i = 0; i < m->cap; i++) if (m->entries[i].state == 1) cb(&m->entries[i].val.p, arg);
+    for (size_t i = 0; i < m->cap; i++) if (XS_MAP_FULL(m, i)) cb(&m->slots[i].val.p, arg);
 }
 static void (*xs_exit_hook)(void); /* background work to finish first (Promise.race losers) */
 static void xs_before_exit(void) {
