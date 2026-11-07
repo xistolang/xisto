@@ -68,3 +68,18 @@ const halfc = 0.5;
 let q = 0;
 q = halfc; // a const with a number: q stays a number
 console.log(q + 1);
+// a closure that assigns what it captures: its assignment capCounts (capTotal is a number, capCount an int)
+let capTotal = 0;
+const capAddHalf = (x: number): void => {
+  capTotal += x / 2;
+};
+capAddHalf(3);
+let capCount = 0;
+const capBump = (): void => {
+  capCount++;
+};
+capBump();
+const capLim = Math.max(1, Math.min(capCount, 5)); // Math.max/min of ints: an int
+let capK = 0;
+capK = capLim;
+console.log(capTotal, capCount, capK);

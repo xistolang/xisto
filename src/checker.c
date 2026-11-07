@@ -4615,8 +4615,14 @@ static bool int_shaped(Expr *e, const char *self) {
     case E_MEMBER: /* (not x.length: it can be a getter of the program's own that gives a number, and the
                       types are not known yet here; i < a.length is a comparison, not an assignment, and is fine) */
         if (!e->is_call) return false;
-        return e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && strcmp(e->lhs->str, "Math") == 0 && e->str &&
-               (!strcmp(e->str, "floor") || !strcmp(e->str, "ceil") || !strcmp(e->str, "round") || !strcmp(e->str, "trunc"));
+        if (!(e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && strcmp(e->lhs->str, "Math") == 0 && e->str)) return false;
+        if (!strcmp(e->str, "floor") || !strcmp(e->str, "ceil") || !strcmp(e->str, "round") || !strcmp(e->str, "trunc")) return true;
+        if (!strcmp(e->str, "max") || !strcmp(e->str, "min") || !strcmp(e->str, "abs")) { /* of integers: an integer */
+            if (e->args.len == 0) return false;
+            for (int i = 0; i < e->args.len; i++) if (!int_shaped(e->args.items[i], self)) return false;
+            return true;
+        }
+        return false;
     case E_UNARY: return e->op == TK_MINUS && int_shaped(e->lhs, self);
     case E_BINARY:
         switch (e->op) {
@@ -4642,6 +4648,7 @@ static bool int_shaped(Expr *e, const char *self) {
     default: return false;
     }
 }
+static bool ii_stmt_ok(Stmt *s, const char *self);
 static bool ii_expr_ok(Expr *e, const char *self) { /* every assignment to self inside e is an integer */
     if (!e) return true;
     bool tgt = e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && strcmp(e->lhs->str, self) == 0;
@@ -4650,7 +4657,8 @@ static bool ii_expr_ok(Expr *e, const char *self) { /* every assignment to self 
         if (!int_shaped(e->rhs, self)) return false;
     }
     if (e->kind == E_ARROW && e->arrow && e->arrow->fn && e->arrow->fn->body) {
-        /* (a closure cannot assign what it captures, so nothing to look at) */
+        /* a closure can assign what it captures (the variable then lives in a cell): its assignments count too */
+        if (!ii_stmt_ok(e->arrow->fn->body, self)) return false;
     }
     if (!ii_expr_ok(e->lhs, self) || !ii_expr_ok(e->rhs, self)) return false;
     for (int i = 0; i < e->args.len; i++) if (!ii_expr_ok(e->args.items[i], self)) return false;
@@ -4744,6 +4752,8 @@ static void infer_ints_fn(Stmt *body) {
 
 /* top-level `let`s are globals: functions may assign them too */
 static void infer_ints_top(Program *p) {
+    ii_tn = ii_an = ii_cn = 0; /* the top level's typed names and consts (const lim = Math.max(1, n)), as in a function */
+    for (int i = 0; i < p->top.len; i++) ii_scan(p->top.items[i]);
     for (int i = 0; i < p->top.len; i++) {
         Stmt *v = p->top.items[i];
         if (ii_candidate(v)) {
