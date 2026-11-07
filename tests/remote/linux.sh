@@ -15,7 +15,7 @@ COPYFILE_DISABLE=1 tar --exclude=./build --exclude=./bench/out --exclude='.xisto
     --exclude=./examples/conduit/conduit --exclude='*.bun-build' -cf - . | (cd "$W/tree" && tar -xf -)
 find "$W/tree" -name .xisto -prune -exec rm -rf {} \;
 cp build/tests/*.node "$W/tree/oracle/"
-(cd "$W/tree" && COPYFILE_DISABLE=1 tar --no-xattrs -czf ../xisto.tgz .)
+(cd "$W/tree" && COPYFILE_DISABLE=1 tar --no-xattrs -czf ../xisto-$$.tgz .)
 cat > "$W/remote.sh" <<IN
 #!/bin/sh
 # on the remote machine
@@ -30,14 +30,16 @@ pgrep -f "redis.*56379" > /dev/null || \$REDIS --port 56379 --save '' --appendon
 if ! swapon --show | grep -q swapfile && [ \$(free -m | awk '/Mem/{print \$2}') -lt 3000 ]; then
   sudo dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none && sudo chmod 600 /swapfile && sudo mkswap /swapfile > /dev/null && sudo swapon /swapfile
 fi
-rm -rf ~/xisto && mkdir -p ~/xisto && tar -xzf ~/xisto.tgz -C ~/xisto 2>/dev/null && cd ~/xisto
+R=\$HOME/xisto-$$ # (a directory per run: two suites on the same machine at once stay apart)
+rm -rf \$R && mkdir -p \$R && tar -xzf ~/xisto-$$.tgz -C \$R 2>/dev/null && cd \$R
 git config --global user.email test@example.com; git config --global user.name test
 echo "== \$(uname -sm), \$(cc --version | head -1), TLS $TLS"
 make -s TLS=$TLS > /tmp/xisto-make.log 2>&1 || { tail -20 /tmp/xisto-make.log; exit 1; }
-XISTO_ORACLE_DIR=\$HOME/xisto/oracle make -s TLS=$TLS test 2>&1 | grep -E "^(tests:|FAIL|ok: redis|skip)"
+XISTO_ORACLE_DIR=\$R/oracle make -s TLS=$TLS test 2>&1 | grep -E "^(tests:|FAIL|ok: redis|skip)"
+cd ~ && rm -rf \$R ~/xisto-$$.tgz
 IN
 for h in "$@"; do
-    ( scp $KEY -o BatchMode=yes -q "$W/xisto.tgz" "$W/remote.sh" "$h:" && ssh $KEY -o BatchMode=yes "$h" 'sh remote.sh' > "$W/$h.log" 2>&1
+    ( scp $KEY -o BatchMode=yes -q "$W/xisto-$$.tgz" "$W/remote.sh" "$h:" && ssh $KEY -o BatchMode=yes "$h" 'sh remote.sh' > "$W/$h.log" 2>&1
       echo "### $h"; cat "$W/$h.log" ) &
 done
 wait
