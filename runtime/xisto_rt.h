@@ -3905,6 +3905,22 @@ static bool xs_fs_exists(xs_str *path) { return access(path->data, F_OK) == 0; }
    An array owns its bytes, or is a view (subarray) on another one's, which it keeps alive. Indexing is bounds
    checked like arrays; a write keeps the low 8 bits, as in JS. */
 typedef struct xs_Uint8Array { xs_hdr hdr; int64_t f_length; uint8_t *data; void *owner; } xs_Uint8Array;
+/* 16 bytes in a register (GCC vector extension); the shuffle is one instruction on SSSE3 and NEON */
+#if defined(__SSSE3__) || defined(__ARM_NEON)
+typedef uint8_t xs_u8x16 __attribute__((vector_size(16)));
+static inline xs_u8x16 xs_u8x16_splat(uint8_t v) { return (xs_u8x16){v, v, v, v, v, v, v, v, v, v, v, v, v, v, v, v}; }
+static inline xs_u8x16 xs_u8x16_iota(void) { return (xs_u8x16){0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}; }
+static inline xs_u8x16 xs_u8x16_load(const uint8_t *p) { xs_u8x16 v; memcpy(&v, p, 16); return v; }
+static inline void xs_u8x16_store(uint8_t *p, xs_u8x16 v) { memcpy(p, &v, 16); }
+#if defined(__SSSE3__)
+#include <tmmintrin.h>
+static inline xs_u8x16 xs_u8x16_shuffle(xs_u8x16 v, xs_u8x16 m) { return (xs_u8x16)_mm_shuffle_epi8((__m128i)v, (__m128i)m); }
+#else
+#include <arm_neon.h>
+static inline xs_u8x16 xs_u8x16_shuffle(xs_u8x16 v, xs_u8x16 m) { return (xs_u8x16)vqtbl1q_u8((uint8x16_t)v, (uint8x16_t)m); }
+#endif
+#endif
+
 #include <errno.h>
 /* a big block goes to the file with write(2), after what stdio holds: through stdio's small buffer, 254 MB to
    /dev/null took 140 ms (macOS copies it piece by piece); written straight it is a single call */
@@ -4011,6 +4027,34 @@ static inline xs_byte *xs_u8_ptr(xs_Uint8Array *b, int64_t i, const xs_site *s) 
     return (xs_byte *)&b->data[i];
 }
 static inline int64_t xs_u8_get(xs_Uint8Array *b, int64_t i, const xs_site *s) { return (int64_t)*xs_u8_ptr(b, i, s); }
+/* The swap loop `for (i = lo; i < (hi+lo+1) >> 1; i++) { t = a[i]; a[i] = a[hi+lo-i]; a[hi+lo-i] = t; }` (emit.c
+   emit_u8_idiom): a[lo..hi] reversed in place. The indices are checked once; a range inside the first 16 bytes of
+   a buffer of 16 or more is one 16-byte shuffle (SSSE3 pshufb / NEON tbl), the way the Rust fannkuch-redux keeps
+   its permutation in one register. fannkuch-redux on the Xeon: see historia.md. */
+static inline void xs_u8_rev(xs_Uint8Array *a, int64_t lo, int64_t hi, const xs_site *s) {
+    if (lo >= hi) return; /* (the loop runs no iteration: nothing read, nothing checked) */
+    if (lo < 0 || (uint64_t)hi >= (uint64_t)a->f_length) XS_FAIL("index out of bounds", s);
+    uint8_t *d = a->data;
+#if defined(__SSSE3__) || defined(__ARM_NEON)
+    if (hi < 16 && a->f_length >= 16) {
+        /* mask[i] = i outside [lo, hi], lo + hi - i inside */
+        xs_u8x16 idx = xs_u8x16_iota(), rev = xs_u8x16_splat((uint8_t)(lo + hi)) - idx;
+        xs_u8x16 in = (idx >= xs_u8x16_splat((uint8_t)lo)) & (idx <= xs_u8x16_splat((uint8_t)hi));
+        xs_u8x16 mask = (in & rev) | (~in & idx);
+        xs_u8x16 v = xs_u8x16_load(d);
+        xs_u8x16_store(d, xs_u8x16_shuffle(v, mask));
+        return;
+    }
+#endif
+    for (int64_t i = lo, j = hi; i < j; i++, j--) { uint8_t t = d[i]; d[i] = d[j]; d[j] = t; }
+}
+/* `for (j = lo; j < hi; j++) dst[j] = src[j]` on two byte arrays: one check each side, then a move */
+static inline void xs_u8_copy_range(xs_Uint8Array *dst, xs_Uint8Array *src, int64_t lo, int64_t hi, const xs_site *s) {
+    if (lo >= hi) return;
+    if (lo < 0 || (uint64_t)(hi - 1) >= (uint64_t)src->f_length || (uint64_t)(hi - 1) >= (uint64_t)dst->f_length) XS_FAIL("index out of bounds", s);
+    memmove(dst->data + lo, src->data + lo, (size_t)(hi - lo));
+}
+
 static inline int64_t xs_u8_set(xs_Uint8Array *b, int64_t i, int64_t v, const xs_site *s) { *xs_u8_ptr(b, i, s) = (xs_byte)v; return v; }
 /* b[i] where the compiler proved i within b (bounds-check elimination in emit.c): no check */
 static inline xs_byte *xs_u8_at_nc(xs_Uint8Array *b, int64_t i) { return (xs_byte *)&b->data[i]; }
