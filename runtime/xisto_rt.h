@@ -4136,6 +4136,15 @@ static inline xs_u8_tr_ctx xs_u8_tr_setup(xs_Uint8Array *T) {
     uint8_t L[32], M[32];
     if (T->f_length >= 256 && !getenv("XISTO_NO_U8_TRADE") && xs_u8_tr_is5(T->data, L, M)) {
         c.simd = true;
+#if defined(__SSSE3__)
+        /* x86: pshufb runs on one port only (p5 on Haswell/Broadwell), so M is folded into L: an unmapped letter's
+           entry carries bit 7 (0x80 | idx) and the lookup's sign says "not mapped"; the mapped values must then be
+           below 0x80 (they are letters in the tables this is for; any other table takes the scalar loop) */
+        for (int k = 0; k < 32; k++) {
+            if (!M[k]) L[k] = (uint8_t)(0x80 | k);
+            else if (L[k] & 0x80) c.simd = false;
+        }
+#endif
         c.L0 = xs_u8x16_load(L);
         c.L1 = xs_u8x16_load(L + 16);
         c.M0 = xs_u8x16_load(M);
@@ -4156,12 +4165,20 @@ static inline __attribute__((always_inline)) xs_u8x16 xs_u8_tr_lut32(xs_u8x16 t0
     return (xs_u8x16)vqtbl2q_u8(tab, (uint8x16_t)idx);
 #endif
 }
+typedef int8_t xs_i8x16 __attribute__((vector_size(16)));
 static inline __attribute__((always_inline)) xs_u8x16 xs_u8_tr_vec(const xs_u8_tr_ctx *c, xs_u8x16 v) {
     xs_u8x16 idx = v & xs_u8x16_splat(0x1f);
     xs_u8x16 t = xs_u8_tr_lut32(c->L0, c->L1, idx);
     xs_u8x16 m = (v | xs_u8x16_splat(0x20)) - xs_u8x16_splat('a');
-    xs_u8x16 letter = (xs_u8x16)(m <= xs_u8x16_splat(25)) & xs_u8_tr_lut32(c->M0, c->M1, idx); /* (unsigned compare) and mapped */
+    xs_u8x16 letter = (xs_u8x16)(m <= xs_u8x16_splat(25)); /* (unsigned compare) */
+#if defined(__SSSE3__)
+    xs_u8x16 unmapped = (xs_u8x16)((xs_i8x16)t < (xs_i8x16)xs_u8x16_splat(0)); /* bit 7 of the folded entry: one pcmpgtb */
+    xs_u8x16 take = letter & ~unmapped;
+    return (take & t) | (~take & v);
+#else
+    letter &= xs_u8_tr_lut32(c->M0, c->M1, idx); /* and mapped */
     return (letter & t) | (~letter & v);
+#endif
 }
 #endif
 static inline void xs_u8_trade(const xs_u8_tr_ctx *c, xs_Uint8Array *buf, int64_t a, int64_t b, int64_t run, const xs_site *s) {
