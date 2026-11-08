@@ -4174,27 +4174,40 @@ static inline void xs_u8_trade(const xs_u8_tr_ctx *c, xs_Uint8Array *buf, int64_
     uint8_t *d = buf->data;
     const uint8_t *T = c->T;
 #if defined(__SSSE3__) || defined(__ARM_NEON)
-    if (c->simd && a + run + 16 <= len && b - run - 14 >= 0) {
+    if (c->simd) {
         const xs_u8x16 rev = xs_u8x16_splat(15) - xs_u8x16_iota();
-        int64_t rem = run;
-        while (rem >= 16) {
-            xs_u8x16 A = xs_u8x16_load(d + a), R = xs_u8x16_load(d + b - 15);
-            xs_u8x16_store(d + a, xs_u8_tr_vec(c, xs_u8x16_shuffle(R, rev)));
-            xs_u8x16_store(d + b - 15, xs_u8_tr_vec(c, xs_u8x16_shuffle(A, rev)));
-            a += 16; b -= 16; rem -= 16;
+        if (run >= 16) {
+            /* The run's two regions, [a, a+run) and [b-run+1, b], are walked in blocks of 16 from their outer ends;
+               the last block of each is aligned to the region's inner end, so it overlaps the one before it when
+               run % 16 != 0. Those two final blocks are loaded first, before any store (every block is then
+               computed from the original bytes; the stores write the same final value where they overlap), and
+               stored last. No mask, no block outside its region: nothing to keep, nothing past the buffer. */
+            const int64_t fa = a + run - 16, fb = b - run + 1;
+            xs_u8x16 Af = xs_u8x16_load(d + fa), Rf = xs_u8x16_load(d + fb);
+            xs_u8x16 nAf = xs_u8_tr_vec(c, xs_u8x16_shuffle(Rf, rev)), nRf = xs_u8_tr_vec(c, xs_u8x16_shuffle(Af, rev));
+            int64_t rem = run, aa = a, bb = b;
+            while (rem >= 16) {
+                xs_u8x16 A = xs_u8x16_load(d + aa), R = xs_u8x16_load(d + bb - 15);
+                xs_u8x16_store(d + aa, xs_u8_tr_vec(c, xs_u8x16_shuffle(R, rev)));
+                xs_u8x16_store(d + bb - 15, xs_u8_tr_vec(c, xs_u8x16_shuffle(A, rev)));
+                aa += 16; bb -= 16; rem -= 16;
+            }
+            xs_u8x16_store(d + fa, nAf);
+            xs_u8x16_store(d + fb, nRf);
+            return;
         }
-        if (rem > 0) { /* the tail: blocks past the run keep their bytes */
+        if (a + 16 <= len && b - 15 >= 0) { /* a short run: one masked pair; blocks past the run keep their bytes */
             xs_u8x16 A = xs_u8x16_load(d + a), R = xs_u8x16_load(d + b - 15);
             xs_u8x16 lane = xs_u8x16_iota();
-            xs_u8x16 inA = (xs_u8x16)(lane < xs_u8x16_splat((uint8_t)rem));          /* lanes 0..rem-1 of the a block */
-            xs_u8x16 inR = (xs_u8x16)(lane >= xs_u8x16_splat((uint8_t)(16 - rem))); /* lanes 16-rem..15 of the b block */
+            xs_u8x16 inA = (xs_u8x16)(lane < xs_u8x16_splat((uint8_t)run));          /* lanes 0..run-1 of the a block */
+            xs_u8x16 inR = (xs_u8x16)(lane >= xs_u8x16_splat((uint8_t)(16 - run))); /* lanes 16-run..15 of the b block */
             xs_u8x16 nA = xs_u8_tr_vec(c, xs_u8x16_shuffle(R, rev)), nR = xs_u8_tr_vec(c, xs_u8x16_shuffle(A, rev));
             xs_u8x16_store(d + a, (inA & nA) | (~inA & A));
             /* the b block's bytes outside the run may have just been written by the a block (the two meet in the
                middle of a sequence): kept as they are now, not as they were loaded */
             xs_u8x16_store(d + b - 15, (inR & nR) | (~inR & xs_u8x16_load(d + b - 15)));
+            return;
         }
-        return;
     }
 #endif
     for (int64_t t = 0; t < run; t++) {
@@ -4349,15 +4362,44 @@ static xs_arr_int *xs_u8_to_ints(xs_Uint8Array *b) { /* Array.from(bytes) */
    two): there are no Atomics. */
 typedef struct xs_shblk { int64_t refs; int64_t n; } xs_shblk; /* n bytes follow, 16-byte aligned (malloc's) */
 static inline char *xs_shblk_data(xs_shblk *b) { return (char *)(b + 1); }
+/* Linux: a block of 64 MB or more is mapped (not malloc'ed), pre-faulted in one call (MAP_POPULATE: the kernel
+   zero-fills it in bulk instead of one 4 KB fault per page as the program first touches it) and offered huge
+   pages (fewer TLB misses in the loops over it). revcomp-4/5 read 254 MB of stdin straight into such a block. */
+#if defined(__linux__)
+#include <sys/mman.h>
+#define XS_SHBLK_MAP_MIN ((int64_t)64 << 20)
+static inline bool xs_shblk_mapped(xs_shblk *b) { return b->n >= XS_SHBLK_MAP_MIN; }
+#endif
 XS_NOINLINE xs_shblk *xs_shblk_new(int64_t n, bool zero) {
-    xs_shblk *b = zero ? calloc(1, sizeof *b + (size_t)n) : malloc(sizeof *b + (size_t)n);
+    xs_shblk *b;
+#if defined(__linux__)
+    if (n >= XS_SHBLK_MAP_MIN) {
+        size_t sz = sizeof *b + (size_t)n;
+        void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+        if (p == MAP_FAILED) xs_panic("out of memory");
+#ifdef MADV_HUGEPAGE
+        madvise(p, sz, MADV_HUGEPAGE);
+#endif
+        b = p; /* (zero already) */
+        b->refs = 1;
+        b->n = n;
+        return b;
+    }
+#endif
+    b = zero ? calloc(1, sizeof *b + (size_t)n) : malloc(sizeof *b + (size_t)n);
     if (!b) xs_panic("out of memory");
     b->refs = 1;
     b->n = n;
     return b;
 }
 static inline void xs_shblk_ref(xs_shblk *b) { __atomic_add_fetch(&b->refs, 1, __ATOMIC_RELAXED); }
-static inline void xs_shblk_unref(xs_shblk *b) { if (b && __atomic_sub_fetch(&b->refs, 1, __ATOMIC_ACQ_REL) == 0) free(b); }
+static inline void xs_shblk_free(xs_shblk *b) {
+#if defined(__linux__)
+    if (xs_shblk_mapped(b)) { munmap(b, sizeof *b + (size_t)b->n); return; }
+#endif
+    free(b);
+}
+static inline void xs_shblk_unref(xs_shblk *b) { if (b && __atomic_sub_fetch(&b->refs, 1, __ATOMIC_ACQ_REL) == 0) xs_shblk_free(b); }
 
 typedef struct xs_SharedArrayBuffer { xs_hdr hdr; int64_t f_byteLength; xs_shblk *blk; } xs_SharedArrayBuffer;
 static void xs_sab_free(void *p) { xs_shblk_unref(((xs_SharedArrayBuffer *)p)->blk); xs_obj_free(p); }
