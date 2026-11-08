@@ -64,7 +64,7 @@ typedef enum {
     TK_SWITCH, TK_CASE, TK_DEFAULT, TK_BREAK, TK_CONTINUE, TK_ENUM, TK_TEMPLATE, TK_TRY, TK_CATCH, TK_THROW,
     /* punctuation */
     TK_LPAREN, TK_RPAREN, TK_LBRACE, TK_RBRACE, TK_LBRACKET, TK_RBRACKET,
-    TK_COMMA, TK_SEMI, TK_COLON, TK_DOT, TK_ARROW, TK_QUESTION, TK_AT,
+    TK_COMMA, TK_SEMI, TK_COLON, TK_DOT, TK_ELLIPSIS, TK_ARROW, TK_QUESTION, TK_AT,
     TK_PLUS, TK_MINUS, TK_STAR, TK_SLASH, TK_PERCENT,
     TK_ASSIGN, TK_PLUS_ASSIGN, TK_MINUS_ASSIGN, TK_STAR_ASSIGN, TK_SLASH_ASSIGN,
     TK_PLUSPLUS, TK_MINUSMINUS,
@@ -203,6 +203,7 @@ typedef enum {
     E_UPCAST,    /* a subclass where its base goes: lhs, typed as the base (a C cast) */
     E_SUPER_CALL,/* super(args) in a constructor: the base's initializer on this object (cls = the base) */
     E_REGEX,     /* /pattern/flags: str = pattern, rflags = flags */
+    E_SEQ,       /* a, b in a for loop's update: args evaluated in order, no value */
 } ExprKind;
 
 typedef struct Expr Expr;
@@ -235,6 +236,7 @@ struct Expr {
     Expr *lhs, *rhs;
     ExprList args;
     bool is_call;      /* E_MEMBER */
+    bool spread;       /* E_ARRAY_LIT with ...x elements (each an E_UNARY TK_ELLIPSIS): built by emit_spread_lit */
     Type *elem_type;   /* E_NEW_ARRAY */
     char *cname;       /* E_IDENT: resolved C name; E_FUNC_REF: C function name */
     /* resolved by the checker */
@@ -291,6 +293,7 @@ struct Stmt {
     bool exported;     /* top-level S_VAR */
     char *name;        /* S_VAR */
     bool is_const;
+    bool for_head;     /* S_VAR from for (let i = 0, j = ...): each iteration has its own copy, as JavaScript gives it */
     Type *decl_type;   /* may be NULL (inferred) */
     Type *type;
     char *cname;
@@ -386,6 +389,7 @@ struct Func {
     char **tparams;
     int ntparams;
     void *gen_state;   /* the parser where the parameters start: each instance is parsed again with T bound */
+    void *gen_subst;   /* the substitution in force where it was written (a generic method of a generic class's instance) */
     bool gen_method;
     struct Func **instances;
     char **inst_keys;
@@ -433,6 +437,8 @@ struct Class {
     char **tparams;    /* interface Name<T, U>: a template, instantiated per use (QueryResult<Row>) */
     int ntparams;
     struct Class *generic_of; /* an instance: its template */
+    void *gen_state;   /* class Name<T> { ... }: the parser where the body starts; each instance parses it again with T bound */
+    void *gen_subst;   /* the substitution in force where the template was written (a generic class inside an instance) */
     bool data_only;    /* fields without initializer and no constructor (a DTO): made from JSON, never with new */
     /* inheritance: the base's fields come first (prefix layout), its methods are listed too (their cls is the base) */
     char *base_name;
@@ -538,7 +544,8 @@ char *xs_read_file(const char *path);
 char *xs_format(const char *src); /* xisto fmt */
 void check_program(Program *p);
 void prune_program(Program *p); /* marks what main reaches; emitters skip the rest */
-Func *xs_parse_instance(Func *tmpl, Type **args); /* parser.c: a generic function parsed again with its T bound */
+Func *xs_parse_instance(Func *tmpl, Type **args);
+Class *xs_parse_class_instance(Class *tmpl, Type **args, const char *name); /* parser.c: a generic function parsed again with its T bound */
 extern bool xs_debug;   /* --debug: statement hooks and the debugger agent (docs/debugger.md) */
 extern bool xs_profile; /* --profile: instrument every function with call counts and timing */
 /* region.c: loops whose iterations' objects can be freed in one step (Stmt.region, Class.region) */

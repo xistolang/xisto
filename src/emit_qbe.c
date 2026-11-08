@@ -814,6 +814,7 @@ static char *emit_expr_raw(Expr *e) {
         return "";
     }
     case E_ARRAY_LIT: {
+        if (e->spread) unsupported(e->pos, "spread in array literals");
         if (qref(e->type->elem)) {
             char *r = tmp();
             ins("%s =l call $xr_arr_ref_new(l %d, w %d)", r, e->args.len, print_kind(e->type->elem));
