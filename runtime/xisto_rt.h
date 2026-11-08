@@ -3905,8 +3905,8 @@ static bool xs_fs_exists(xs_str *path) { return access(path->data, F_OK) == 0; }
    An array owns its bytes, or is a view (subarray) on another one's, which it keeps alive. Indexing is bounds
    checked like arrays; a write keeps the low 8 bits, as in JS. */
 typedef struct xs_Uint8Array { xs_hdr hdr; int64_t f_length; uint8_t *data; void *owner; } xs_Uint8Array;
-/* 16 bytes in a register (GCC vector extension); the shuffle is one instruction on SSSE3 and NEON */
-#if defined(__SSSE3__) || defined(__ARM_NEON)
+/* 16 bytes in a register (GCC vector extension); the shuffle is one instruction on SSSE3 and NEON, a loop
+   elsewhere */
 typedef uint8_t xs_u8x16 __attribute__((vector_size(16)));
 static inline xs_u8x16 xs_u8x16_splat(uint8_t v) { return (xs_u8x16){v, v, v, v, v, v, v, v, v, v, v, v, v, v, v, v}; }
 static inline xs_u8x16 xs_u8x16_iota(void) { return (xs_u8x16){0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}; }
@@ -3915,11 +3915,70 @@ static inline void xs_u8x16_store(uint8_t *p, xs_u8x16 v) { memcpy(p, &v, 16); }
 #if defined(__SSSE3__)
 #include <tmmintrin.h>
 static inline xs_u8x16 xs_u8x16_shuffle(xs_u8x16 v, xs_u8x16 m) { return (xs_u8x16)_mm_shuffle_epi8((__m128i)v, (__m128i)m); }
-#else
+#elif defined(__ARM_NEON)
 #include <arm_neon.h>
 static inline xs_u8x16 xs_u8x16_shuffle(xs_u8x16 v, xs_u8x16 m) { return (xs_u8x16)vqtbl1q_u8((uint8x16_t)v, (uint8x16_t)m); }
+#else
+static inline xs_u8x16 xs_u8x16_shuffle(xs_u8x16 v, xs_u8x16 m) { xs_u8x16 r; for (int i = 0; i < 16; i++) r[i] = (m[i] & 0x80) ? 0 : v[m[i] & 15]; return r; }
 #endif
-#endif
+/* A local Uint8Array(N <= 16) that a loop only indexes (emit.c u8reg) lives in one of these for the loop's
+   duration, loaded before and stored after: reads, writes, the reversal and the copy idioms never touch
+   memory, so no byte store ever sits before a 16-byte load (a store that narrow is never forwarded to a load
+   that wide: Intel and Apple alike, ~14 cycles per flip of fannkuch-redux). The reversal's mask comes from a
+   table (one load, off the critical path), as the Rust fannkuch-redux reads its MASK[k]. */
+static xs_u8x16 xs_rev_mask[16][16]; /* [lo][hi]: i outside [lo, hi], lo + hi - i inside (xs_init fills it) */
+static xs_u8x16 xs_shl_mask[16][16]; /* [lo][hi]: i outside [lo, hi], i + 1 inside: a[j] = a[j + 1] for lo <= j <= hi */
+static void xs_rev_mask_init(void) {
+    for (int lo = 0; lo < 16; lo++)
+        for (int hi = 0; hi < 16; hi++)
+            for (int i = 0; i < 16; i++) {
+                xs_rev_mask[lo][hi][i] = (uint8_t)(lo <= i && i <= hi ? lo + hi - i : i);
+                xs_shl_mask[lo][hi][i] = (uint8_t)(lo <= i && i <= hi ? (i + 1) & 15 : i);
+            }
+}
+static inline xs_u8x16 xs_v16_load(const uint8_t *d, int64_t n) { if (n >= 16) return xs_u8x16_load(d); xs_u8x16 v = xs_u8x16_splat(0); memcpy(&v, d, (size_t)n); return v; }
+static inline void xs_v16_store(uint8_t *d, xs_u8x16 v, int64_t n) { if (n >= 16) xs_u8x16_store(d, v); else memcpy(d, &v, (size_t)n); }
+static inline int64_t xs_v16_get_nc(xs_u8x16 v, int64_t i) { return (int64_t)xs_u8x16_shuffle(v, xs_u8x16_splat((uint8_t)i))[0]; }
+static inline int64_t xs_v16_get(xs_u8x16 v, int64_t i, int64_t n, const xs_site *s) {
+    if ((uint64_t)i >= (uint64_t)n) XS_FAIL("index out of bounds", s);
+    return xs_v16_get_nc(v, i);
+}
+static inline xs_u8x16 xs_v16_set_nc(xs_u8x16 v, int64_t i, int64_t b) {
+    xs_u8x16 m = xs_u8x16_iota() == xs_u8x16_splat((uint8_t)i);
+    return (v & ~m) | (xs_u8x16_splat((uint8_t)b) & m);
+}
+static inline xs_u8x16 xs_v16_set(xs_u8x16 v, int64_t i, int64_t b, int64_t n, const xs_site *s) {
+    if ((uint64_t)i >= (uint64_t)n) XS_FAIL("index out of bounds", s);
+    return xs_v16_set_nc(v, i, b);
+}
+/* the swap loop (xs_u8_rev) on a register value */
+static inline xs_u8x16 xs_v16_rev(xs_u8x16 v, int64_t lo, int64_t hi, int64_t n, const xs_site *s) {
+    if (lo >= hi) return v;
+    if (lo < 0 || (uint64_t)hi >= (uint64_t)n) XS_FAIL("index out of bounds", s);
+    return xs_u8x16_shuffle(v, xs_rev_mask[lo][hi]);
+}
+static inline xs_u8x16 xs_v16_range(int64_t lo, int64_t hi) { /* lanes lo <= i < hi */
+    xs_u8x16 idx = xs_u8x16_iota();
+    return (idx >= xs_u8x16_splat((uint8_t)lo)) & (idx < xs_u8x16_splat((uint8_t)hi));
+}
+/* `for (j = lo; j < hi; j++) dst[j] = src[j]` (xs_u8_copy_range) with one side or both in a register */
+static inline xs_u8x16 xs_v16_copy_rr(xs_u8x16 dst, xs_u8x16 src, int64_t lo, int64_t hi, int64_t ndst, int64_t nsrc, const xs_site *s) {
+    if (lo >= hi) return dst;
+    if (lo < 0 || (uint64_t)(hi - 1) >= (uint64_t)nsrc || (uint64_t)(hi - 1) >= (uint64_t)ndst) XS_FAIL("index out of bounds", s);
+    xs_u8x16 m = xs_v16_range(lo, hi);
+    return (dst & ~m) | (src & m);
+}
+static inline xs_u8x16 xs_v16_copy_in(xs_u8x16 dst, xs_Uint8Array *src, int64_t lo, int64_t hi, int64_t ndst, const xs_site *s) {
+    if (lo >= hi) return dst;
+    if (lo < 0 || (uint64_t)(hi - 1) >= (uint64_t)src->f_length || (uint64_t)(hi - 1) >= (uint64_t)ndst) XS_FAIL("index out of bounds", s);
+    xs_u8x16 m = xs_v16_range(lo, hi);
+    return (dst & ~m) | (xs_v16_load(src->data, src->f_length) & m);
+}
+static inline void xs_v16_copy_out(xs_Uint8Array *dst, xs_u8x16 src, int64_t lo, int64_t hi, int64_t nsrc, const xs_site *s) {
+    if (lo >= hi) return;
+    if (lo < 0 || (uint64_t)(hi - 1) >= (uint64_t)nsrc || (uint64_t)(hi - 1) >= (uint64_t)dst->f_length) XS_FAIL("index out of bounds", s);
+    memcpy(dst->data + lo, (const uint8_t *)&src + lo, (size_t)(hi - lo));
+}
 
 #include <errno.h>
 /* a big block goes to the file with write(2), after what stdio holds: through stdio's small buffer, 254 MB to
@@ -4055,6 +4114,18 @@ static inline void xs_u8_copy_range(xs_Uint8Array *dst, xs_Uint8Array *src, int6
     memmove(dst->data + lo, src->data + lo, (size_t)(hi - lo));
 }
 
+/* `for (j = lo; j <= hi; j++) a[j] = a[j + 1]` on a byte array (fannkuch-redux's next permutation): one check,
+   then a move; in a register (emit.c u8reg) it is one shuffle */
+static inline void xs_u8_shl(xs_Uint8Array *a, int64_t lo, int64_t hi, const xs_site *s) {
+    if (lo > hi) return;
+    if (lo < 0 || (uint64_t)(hi + 1) >= (uint64_t)a->f_length) XS_FAIL("index out of bounds", s);
+    memmove(a->data + lo, a->data + lo + 1, (size_t)(hi - lo + 1));
+}
+static inline xs_u8x16 xs_v16_shl(xs_u8x16 v, int64_t lo, int64_t hi, int64_t n, const xs_site *s) {
+    if (lo > hi) return v;
+    if (lo < 0 || (uint64_t)(hi + 1) >= (uint64_t)n) XS_FAIL("index out of bounds", s);
+    return xs_u8x16_shuffle(v, xs_shl_mask[lo][hi]);
+}
 static inline int64_t xs_u8_set(xs_Uint8Array *b, int64_t i, int64_t v, const xs_site *s) { *xs_u8_ptr(b, i, s) = (xs_byte)v; return v; }
 /* b[i] where the compiler proved i within b (bounds-check elimination in emit.c): no check */
 static inline xs_byte *xs_u8_at_nc(xs_Uint8Array *b, int64_t i) { return (xs_byte *)&b->data[i]; }
@@ -5704,6 +5775,7 @@ static void xs_init(int argc, char **argv) {
 #endif
     xs_started = xs_now();
     xs_types_check();
+    xs_rev_mask_init();
     xs_std_init(argc, argv);
 }
 /* performance.now(): milliseconds since the program started, with the fraction (monotonic, as Node's) */
