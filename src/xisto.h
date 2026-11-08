@@ -370,6 +370,8 @@ struct Func {
     Module *call1_mod;
     int call1_site;    /* its xs_sitetab index, once created */
     int clone_state;   /* emitter: 0 unknown, 1 cloned per call site, 2 not */
+    int rg_hoist;      /* emitter: N when every dual class it (transitively) makes belongs to region N; -1 never */
+    bool rg_used;      /* emitter: its region version (f_rN) is reached from region N's loop body */
     bool is_abstract;  /* abstract m(): T; no body, every concrete subclass overrides it */
     int access;        /* 0 public, 1 protected, 2 private */
     bool is_getter, is_setter; /* get x(): T / set x(v: T): named __get_x / __set_x, used as obj.x */
