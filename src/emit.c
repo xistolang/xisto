@@ -2445,11 +2445,13 @@ static void emit_expr_raw(Expr *e) {
         if (e->lhs->type->kind == TY_INT && e->type->kind == TY_INT && e->op == TK_PERCENT && !getenv("XISTO_NO_POW2_MOD")) {
             Rng b = rng_of(e->rhs);
             if (b.ok && b.lo > 0 && pow2_of(e->rhs, 0)) { /* x % 2^n: a mask for x >= 0 (JS keeps the sign of x), no zero to check */
+                /* JS keeps the sign of x: r = x & (d - 1), minus d when x < 0 and r != 0 (no division, which the C
+                   compiler would otherwise compute on both sides of a select: knucleotide-4 3,4 cpu-s with it) */
                 buf_puts(out, "({ int64_t ma_ = (");
                 emit_expr(e->lhs);
                 buf_puts(out, "), mb_ = (");
                 emit_expr(e->rhs);
-                buf_puts(out, "); __builtin_expect(ma_ >= 0, 1) ? (ma_ & (mb_ - 1)) : ma_ % mb_; })");
+                buf_puts(out, "), mr_ = ma_ & (mb_ - 1); mr_ - ((ma_ >> 63) & (mr_ != 0 ? mb_ : 0)); })");
                 return;
             }
         }

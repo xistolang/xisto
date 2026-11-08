@@ -25,12 +25,14 @@ function count(seq: Uint8Array, k: int, lo: int, hi: int): Map<int, int> {
   const top = POW4[k - 1]; // 4 ** (k - 1): what the key keeps of the k-mer before
   let key: int = 0;
   for (let i = lo; i < lo + k; i++) key = key * 4 + seq[i];
-  for (let i = lo; ; i++) {
+  counts.set(key, 1);
+  // the next k-mers: the first nucleotide out (the key modulo 4 ** (k - 1)), the next one in; a counted loop over
+  // the incoming nucleotide, so its bounds are checked once before the loop
+  const end = hi + k - 1;
+  for (let j = lo + k; j < end; j++) {
+    key = (key % top) * 4 + seq[j];
     if (counts.has(key)) counts.set(key, counts.get(key)! + 1);
     else counts.set(key, 1);
-    if (i + 1 >= hi) break;
-    // the next k-mer: the first nucleotide out (the key modulo 4 ** (k - 1)), the next one in
-    key = (key % top) * 4 + seq[i + k];
   }
   return counts;
 }
