@@ -3,8 +3,8 @@ Error: saldo insuficiente
     at Conta.sacar (tests/stack/catch.ts:5:13)
     at tests/stack/catch.ts:18:15
 -- arrow
-Error: integer overflow
-    at tests/stack/catch.ts:24:63
+Error: integer overflow: the result left JavaScript's safe integer range (+-2^53 - 1); use number or bigint
+    at tests/stack/catch.ts:24:60
     at tests/stack/catch.ts:24:18
 -- json
 Error: JSON: 'id' must be an integer
@@ -16,16 +16,16 @@ Error: pop from an empty array
 Error: Invalid count value: repeat count must be non-negative
     at tests/stack/catch.ts:42:20
 -- postfix
-Error: integer overflow
+Error: integer overflow: the result left JavaScript's safe integer range (+-2^53 - 1); use number or bigint
     at tests/stack/catch.ts:48:4
 -- compound
-Error: integer overflow
+Error: integer overflow: the result left JavaScript's safe integer range (+-2^53 - 1); use number or bigint
     at tests/stack/catch.ts:54:5
 -- modulo
 Error: integer modulo by zero
     at tests/stack/catch.ts:61:17
 -- floor
-Error: value out of int range
+Error: value out of int range: an int is an integer of JavaScript's safe range (+-2^53 - 1); use number or bigint
     at tests/stack/catch.ts:66:20
 Error: not thrown
     at tests/stack/catch.ts:70:12

@@ -4,7 +4,7 @@ function bad(i: int): int {
   return a[i];
 }
 function add(i: int): int {
-  return i + 4611686018427387904;
+  return i + 4503599627370496;
 }
 const big: int[] = [5];
 class Box {
@@ -70,5 +70,5 @@ if (which === "field") {
   console.log(makeBag());
 }
 if (which === "clone") {
-  console.log(add(1), twice(4611686018427387904));
+  console.log(add(1), twice(4503599627370496));
 }

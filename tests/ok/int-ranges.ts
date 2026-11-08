@@ -1,6 +1,6 @@
 // integer ranges (emit.c): a + b, a - b, a * b lose their overflow check only when they provably cannot
 // overflow; every case where they can must still report it (and be catchable), as before. Checked against the
-// output without the analysis (XISTO_NO_RANGES=1): int overflow is an error in xisto, not in Node.
+// output without the analysis (XISTO_NO_RANGES=1): int overflow (past 2^53 - 1) is an error in xisto, not in Node.
 const big = new Uint8Array(1000);
 let s: int = 0;
 for (let i: int = 0; i < big.length; i++) {

@@ -888,9 +888,11 @@ static void emit_expr(Expr *e);
 /* an operand of a bitwise operator as uint32_t (ToInt32, then its bits) */
 static void emit_u32(Expr *e) {
     if (e->kind == E_BINARY && (e->op == TK_PLUS || e->op == TK_MINUS) && e->type->kind == TY_INT && !xs_debug &&
-        (e->lhs->type->kind == TY_INT || e->lhs->type->kind == TY_LITINT) && (e->rhs->type->kind == TY_INT || e->rhs->type->kind == TY_LITINT)) {
+        (e->lhs->type->kind == TY_INT || e->lhs->type->kind == TY_LITINT) && (e->rhs->type->kind == TY_INT || e->rhs->type->kind == TY_LITINT) &&
+        rng_of(e).ok) {
         /* (a + b) >> 1, (h - k) & m: only the low 32 bits are kept, and those of the exact sum are those of the
-           sum mod 2^32, so no overflow check (the check stays wherever the whole sum is used) */
+           sum mod 2^32, so no overflow check — when the sum provably stays a safe integer: past 2^53 JS rounds the
+           sum before the 32-bit operator and the low bits differ (XB-075); without the proof the checked sum is used */
         buf_puts(out, "((uint32_t)(");
         emit_u32(e->lhs);
         buf_puts(out, e->op == TK_PLUS ? " + " : " - ");
@@ -3686,7 +3688,7 @@ static EScope *jump_target(bool is_break) {
 }
 
 /* `for (...; i < n; i++)` whose body never writes i: when the update runs, i < n held at the start of the
-   iteration, so i + 1 <= n <= INT64_MAX and the increment needs no overflow check. Without the check (a
+   iteration, so i + 1 <= n <= 2^53 - 1 (every int is a safe integer) and the increment needs no overflow check. Without the check (a
    branch to an error) the C compiler can vectorize the loop. */
 static bool writes_name(Expr *e, const char *c);
 static bool stmt_writes_name(Stmt *s, const char *c) {
@@ -3737,8 +3739,9 @@ static bool cig_find(const char *c, int64_t *v) {
     return false;
 }
 static Rng rng_none(void) { return (Rng){false, 0, 0}; }
+#define RNG_SAFE INT64_C(9007199254740991) /* an int is a safe integer of JS (XB-075): a result outside is checked */
 static Rng rng_mk(__int128 lo, __int128 hi) {
-    if (lo < INT64_MIN || hi > INT64_MAX) return rng_none();
+    if (lo < -RNG_SAFE || hi > RNG_SAFE) return rng_none();
     return (Rng){true, (int64_t)lo, (int64_t)hi};
 }
 static Rng rng_union(Rng a, Rng b) { if (!a.ok || !b.ok) return rng_none(); return (Rng){true, a.lo < b.lo ? a.lo : b.lo, a.hi > b.hi ? a.hi : b.hi}; }
@@ -4002,7 +4005,7 @@ static void rv_compute(Func *owner, Stmt **stmts, int n) {
                 Rng x;
                 if (rv_defs[d].loop) { /* i from its start below the bound: [start, bound - 1] */
                     Rng b = rng_of(rv_defs[d].loop->cond->rhs);
-                    x = b.ok ? (Rng){true, INT64_MIN, b.hi - 1} : rng_none();
+                    x = b.ok ? (Rng){true, -RNG_SAFE, b.hi - 1} : rng_none();
                     /* a counter declared by the loop itself is only read inside it, where it is below the bound: its
                        start does not widen the top (j = i + 1 in `for (let j = i + 1; j < N; j++)` stays under N) */
                     Stmt *fi = rv_defs[d].loop->for_init;

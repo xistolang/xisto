@@ -7,7 +7,7 @@
 
 void xr_init(void) { xs_init(0, NULL); }
 void xr_exit(void) { xs_exit(); }
-void xr_panic_overflow(void) { xs_panic("integer overflow"); }
+void xr_panic_overflow(void) { xs_panic(XS_IOVF_MSG); }
 int64_t xr_imul(int64_t a, int64_t b) { return xs_imul(a, b); }
 int64_t xr_imod(int64_t a, int64_t b) { return xs_imod(a, b); }
 int64_t xr_ineg(int64_t a) { return xs_ineg(a); }

@@ -21,7 +21,7 @@ try {
 }
 try {
   const src: int[] = [1, 2];
-  const xs = src.map((x: int): int => x * 4611686018427387904 * 4);
+  const xs = src.map((x: int): int => x * 4503599627370496 * 4);
   console.log(xs.length);
 } catch (e) {
   show("arrow", e);
@@ -44,13 +44,13 @@ try {
   show("repeat", e);
 }
 try {
-  let i: int = 4611686018427387904 - 1 + 4611686018427387904;
+  let i: int = 4503599627370496 - 1 + 4503599627370496;
   i++;
 } catch (e) {
   show("postfix", e);
 }
 try {
-  let j: int = 4611686018427387904;
+  let j: int = 4503599627370496;
   j += j;
   j += 1;
 } catch (e) {
