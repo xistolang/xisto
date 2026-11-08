@@ -4076,6 +4076,64 @@ static bool emit_map_add(Stmt *s) {
     emit_expr(d); buf_printf(out, ")); XS_POST(%d); } }", post);
     return true;
 }
+/* Two loops over byte arrays that are one runtime call (bounds checked once; a 16-byte shuffle or a memmove):
+     for (let i = LO; i < (S + 1) >> 1; i++) { const t = a[i]; a[i] = a[S - i]; a[S - i] = t; }  -> xs_u8_rev(a, LO, S - LO)
+     for (let j = LO; j < HI; j++) dst[j] = src[j];                                              -> xs_u8_copy_range
+   a, dst, src are names of Uint8Array; LO, S, HI pure (numbers, int names, their sums); the counter is not
+   written in the body. XISTO_NO_U8_IDIOM=1 keeps the loops. */
+static bool u8_name(Expr *e) { return e && e->kind == E_IDENT && e->cname && bce_bytes(e->type); }
+static bool u8_index_of(Expr *e, Expr *arr, Expr *idx) { /* arr[idx] as the program wrote it */
+    return e && e->kind == E_INDEX && e->builtin.cfn && strcmp(e->builtin.cfn, "xs_u8_get") == 0 && same_simple(e->lhs, arr) && same_simple(e->rhs, idx);
+}
+static bool is_sub_of(Expr *e, Expr *S, const char *i) { /* S - i */
+    return e && e->kind == E_BINARY && e->op == TK_MINUS && same_simple(e->lhs, S) && e->rhs && e->rhs->kind == E_IDENT && e->rhs->cname && strcmp(e->rhs->cname, i) == 0;
+}
+static bool emit_u8_idiom(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
+    Stmt *fi = s->for_init;
+    Expr *c = s->cond, *u = s->for_update;
+    if (!fi || fi->kind != S_VAR || !fi->cname || !fi->init || fi->cell || !bce_pure(fi->init)) return false;
+    if (!u || u->kind != E_POSTFIX || u->op != TK_PLUSPLUS || !u->lhs || u->lhs->kind != E_IDENT || !u->lhs->cname || strcmp(u->lhs->cname, fi->cname) != 0) return false;
+    if (!c || c->kind != E_BINARY || c->op != TK_LT || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, fi->cname) != 0) return false;
+    const char *i = fi->cname;
+    Stmt *b = s->body;
+    if (!b || b->kind != S_BLOCK) return false;
+    if (stmt_writes_name(b, i) || writes_name(c->rhs, i)) return false;
+    Expr iv = {0}; iv.kind = E_IDENT; iv.cname = (char *)i; /* the counter, as an index */
+    if (b->stmts.len == 1) { /* copy */
+        Expr *as = b->stmts.items[0]->kind == S_EXPR ? b->stmts.items[0]->expr : NULL;
+        if (!as || as->kind != E_ASSIGN || as->op != TK_ASSIGN || !bce_pure(c->rhs)) return false;
+        Expr *dst = as->lhs, *src = as->rhs;
+        if (!dst || dst->kind != E_INDEX || !dst->builtin.cfn || strcmp(dst->builtin.cfn, "xs_u8_get") != 0 || !u8_name(dst->lhs) || !same_simple(dst->rhs, &iv)) return false;
+        if (!src || src->kind != E_INDEX || !src->builtin.cfn || strcmp(src->builtin.cfn, "xs_u8_get") != 0 || !u8_name(src->lhs) || !same_simple(src->rhs, &iv)) return false;
+        if (strcmp(dst->lhs->cname, src->lhs->cname) == 0) return false;
+        buf_puts(out, "xs_u8_copy_range("); emit_borrowed(dst->lhs); buf_puts(out, ", "); emit_borrowed(src->lhs);
+        buf_puts(out, ", "); emit_expr(fi->init); buf_puts(out, ", "); emit_expr(c->rhs); buf_printf(out, ", XS_S(%d));", new_site(s->pos));
+        return true;
+    }
+    if (b->stmts.len != 3) return false;
+    /* reverse: cond is i < (S + 1) >> 1 */
+    Expr *h = c->rhs;
+    if (!h || h->kind != E_BINARY || h->op != TK_SHR || !h->rhs || h->rhs->kind != E_NUMBER || h->rhs->num != 1) return false;
+    Expr *s1 = h->lhs;
+    if (!s1 || s1->kind != E_BINARY || s1->op != TK_PLUS || !s1->rhs || s1->rhs->kind != E_NUMBER || s1->rhs->num != 1) return false;
+    Expr *S = s1->lhs;
+    if (!bce_pure(S) || S->kind != E_IDENT) return false;
+    Stmt *t = b->stmts.items[0];
+    if (t->kind != S_VAR || !t->is_const || !t->cname || t->cell || !t->init) return false;
+    Expr *a1 = b->stmts.items[1]->kind == S_EXPR ? b->stmts.items[1]->expr : NULL, *a2 = b->stmts.items[2]->kind == S_EXPR ? b->stmts.items[2]->expr : NULL;
+    if (!a1 || !a2 || a1->kind != E_ASSIGN || a2->kind != E_ASSIGN || a1->op != TK_ASSIGN || a2->op != TK_ASSIGN) return false;
+    Expr *ta = t->init;
+    if (!ta || ta->kind != E_INDEX || !ta->builtin.cfn || strcmp(ta->builtin.cfn, "xs_u8_get") != 0 || !u8_name(ta->lhs) || !same_simple(ta->rhs, &iv)) return false;
+    Expr *a = ta->lhs;
+    if (!u8_index_of(a1->lhs, a, &iv) || !a1->rhs || a1->rhs->kind != E_INDEX || !same_simple(a1->rhs->lhs, a) || !is_sub_of(a1->rhs->rhs, S, i)) return false;
+    if (!a2->lhs || a2->lhs->kind != E_INDEX || !same_simple(a2->lhs->lhs, a) || !is_sub_of(a2->lhs->rhs, S, i)) return false;
+    if (!a2->rhs || a2->rhs->kind != E_IDENT || !a2->rhs->cname || strcmp(a2->rhs->cname, t->cname) != 0) return false;
+    if (stmt_writes_name(b, S->cname) || stmt_writes_name(b, a->cname)) return false;
+    buf_puts(out, "xs_u8_rev("); emit_borrowed(a); buf_puts(out, ", "); emit_expr(fi->init); buf_puts(out, ", (");
+    emit_expr(S); buf_puts(out, ") - ("); emit_expr(fi->init); buf_printf(out, "), XS_S(%d));", new_site(s->pos));
+    return true;
+}
 static void emit_stmt_(Stmt *s) {
     used_ar = false;
     switch (s->kind) {
@@ -4490,6 +4548,7 @@ static void emit_stmt_(Stmt *s) {
         return;
     }
     case S_FOR: {
+        if (emit_u8_idiom(s)) { drain_if_needed(); return; }
         mark_counted_inc(s);
         int saved_nbce = nbce;
         bce_enter(s);
