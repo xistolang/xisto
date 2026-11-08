@@ -497,10 +497,18 @@ __attribute__((noinline)) static void xs_panic_at(const char *msg, const xs_site
    any memory, and a loop reloads every array pointer after each index check (nbody: 0.73 s) */
 #define XS_FAIL(msg, site) do { xs_panic_at(msg, site); __asm__ volatile(""); __builtin_unreachable(); } while (0)
 #define XS_ISAFE_MAX INT64_C(9007199254740991)
-#define XS_IOUT(r) ((uint64_t)(r) + (uint64_t)XS_ISAFE_MAX > (uint64_t)(2 * XS_ISAFE_MAX)) /* r outside +-(2^53 - 1) */
-/* with a constant operand (i + 1, depth - 1) only one side of the range can be crossed: one comparison, as the
-   64-bit overflow test was (binarytrees-3 on the M4: +3,5% with the two-sided test, 0 with this) */
-#define XS_IOUT_ADD(r, b) (__builtin_constant_p(b) ? ((b) >= 0 ? (r) > XS_ISAFE_MAX : (r) < -XS_ISAFE_MAX) : XS_IOUT(r))
+/* In range: -2^53 <= r <= 2^53 - 1 (-2^53 is exact in a double too, so Node gives the same number). Inputs are in
+   range, so r = a +- b is within +-2^54. The tests are plain comparisons: in a loop the compiler keeps the 64-bit
+   constant in a register and each test is one compare-and-branch (a shift test was 3-4 instructions: +9% in
+   fannkuch on the Xeon). */
+#define XS_IOUT(r) ((uint64_t)(r) + (UINT64_C(1) << 53) > (UINT64_C(1) << 54) - 1)
+#define XS_IOUT_HI(r) ((r) > XS_ISAFE_MAX)        /* only the top can be crossed (a non-negative or + constant >= 0) */
+#define XS_IOUT_LO(r) ((r) < -XS_ISAFE_MAX - 1)   /* only the bottom (- constant >= 0) */
+/* a sum of two values >= 0 is below 2^54: past the range iff bit 53 is set — a bit test, no 64-bit constant, which
+   matters in a recursive function (binarytrees' itemCheck: the constant cost two callee-saved registers per call) */
+#define XS_IOUT_NN(r) (((r) & (INT64_C(1) << 53)) != 0)
+/* with a constant operand only one side can be crossed: one test (as the 64-bit overflow test was) */
+#define XS_IOUT_ADD(r, b) (__builtin_constant_p(b) ? ((b) >= 0 ? XS_IOUT_HI(r) : XS_IOUT_LO(r)) : XS_IOUT(r))
 #define XS_IOVF_MSG "integer overflow: the result left JavaScript's safe integer range (+-2^53 - 1); use number or bigint"
 __attribute__((noinline)) static void xs_panic_at(const char *msg, const xs_site *site) {
     xs_trace_capture(&xs_panic_trace, site);
@@ -2494,10 +2502,38 @@ static xs_str *xs_arr_join_str(xs_arr_ref *a, xs_str *sep) { return xs_arr_join_
 
 /* The _s forms take the source position of the operation (the compiler passes &xs_sitetab[n]); it is only
    read on the error path. */
-XS_AI int64_t xs_iadd_s(int64_t a, int64_t b, const xs_site *s) { int64_t r = (int64_t)((uint64_t)a + (uint64_t)b); if (__builtin_expect(XS_IOUT_ADD(r, b), 0)) XS_FAIL(XS_IOVF_MSG, s); return r; }
-XS_AI int64_t xs_isub_s(int64_t a, int64_t b, const xs_site *s) { int64_t r = (int64_t)((uint64_t)a - (uint64_t)b); if (__builtin_expect(XS_IOUT_ADD(r, -(b)), 0)) XS_FAIL(XS_IOVF_MSG, s); return r; }
-XS_AI int64_t xs_imul_s(int64_t a, int64_t b, const xs_site *s) { int64_t r; if (__builtin_expect(__builtin_mul_overflow(a, b, &r) | XS_IOUT(r), 0)) XS_FAIL(XS_IOVF_MSG, s); return r; }
-XS_AI int64_t xs_ineg_s(int64_t a, const xs_site *s) { (void)s; return -a; } /* (an int in range negates in range) */
+XS_AI int64_t xs_iadd_s(int64_t a, int64_t b, const xs_site *s) {
+    if (__builtin_constant_p(a) && !__builtin_constant_p(b)) { int64_t t = a; a = b; b = t; }
+    int64_t r = (int64_t)((uint64_t)a + (uint64_t)b);
+    if (__builtin_expect(XS_IOUT_ADD(r, b), 0)) XS_FAIL(XS_IOVF_MSG, s);
+    return r;
+}
+XS_AI int64_t xs_isub_s(int64_t a, int64_t b, const xs_site *s) {
+    int64_t r = (int64_t)((uint64_t)a - (uint64_t)b);
+    if (__builtin_expect(__builtin_constant_p(b) ? (b >= 0 ? XS_IOUT_LO(r) : XS_IOUT_HI(r)) : XS_IOUT(r), 0)) XS_FAIL(XS_IOVF_MSG, s);
+    return r;
+}
+XS_AI int64_t xs_imul_s(int64_t a, int64_t b, const xs_site *s) {
+    if (__builtin_constant_p(a) && !__builtin_constant_p(b)) { int64_t t = a; a = b; b = t; }
+    if (__builtin_constant_p(b) && b > -1024 && b < 1024) { /* |a| <= 2^53, |b| < 2^10: the product fits 64 bits */
+        int64_t r = a * b;
+        if (__builtin_expect(XS_IOUT(r), 0)) XS_FAIL(XS_IOVF_MSG, s);
+        return r;
+    }
+    int64_t r;
+    if (__builtin_expect(__builtin_mul_overflow(a, b, &r) | XS_IOUT(r), 0)) XS_FAIL(XS_IOVF_MSG, s);
+    return r;
+}
+XS_AI int64_t xs_ineg_s(int64_t a, const xs_site *s) { int64_t r = -a; if (__builtin_expect(XS_IOUT_HI(r), 0)) XS_FAIL(XS_IOVF_MSG, s); return r; } /* (-(-2^53)) */
+/* both operands >= 0 (the emitter proved it): only the top of the range can be crossed */
+XS_AI int64_t xs_iadd_nn_s(int64_t a, int64_t b, const xs_site *s) { int64_t r = a + b; if (__builtin_expect(XS_IOUT_NN(r), 0)) XS_FAIL(XS_IOVF_MSG, s); return r; }
+XS_AI int64_t xs_imul_nn_s(int64_t a, int64_t b, const xs_site *s) {
+    if (__builtin_constant_p(a) && !__builtin_constant_p(b)) { int64_t t = a; a = b; b = t; }
+    if (__builtin_constant_p(b) && b >= 0 && b < 1024) { int64_t r = a * b; if (__builtin_expect(XS_IOUT_HI(r), 0)) XS_FAIL(XS_IOVF_MSG, s); return r; }
+    int64_t r;
+    if (__builtin_expect(__builtin_mul_overflow(a, b, &r) | XS_IOUT_HI(r), 0)) XS_FAIL(XS_IOVF_MSG, s);
+    return r;
+}
 XS_AI int64_t xs_imod_s(int64_t a, int64_t b, const xs_site *s) {
     if (b == 0) XS_FAIL("integer modulo by zero", s);
     if (b == -1) return 0;

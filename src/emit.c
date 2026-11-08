@@ -424,6 +424,8 @@ typedef struct BceGArr { const char *name; int64_t n; bool has_rng; int64_t lo, 
 static BceGArr *garr_find(const char *c);
 static Rng rng_of(Expr *e);
 static bool pow2_of(Expr *e, int depth);
+static bool rv_valid; /* (the range tables, below) */
+static Func *rv_owner;
 static bool nn_expr(Expr *e);
 static int byte_hoist_find(Expr *a);
 static bool bce_safe(Expr *e); /* an index the loop already checks (see bce_enter) */
@@ -2486,6 +2488,19 @@ static void emit_expr_raw(Expr *e) {
         if (e->lhs->type->kind == TY_INT && (e->op == TK_PLUS || e->op == TK_MINUS || e->op == TK_STAR || e->op == TK_PERCENT || e->op == TK_SLASH)) {
             const char *fn = e->op == TK_PLUS ? "xs_iadd" : e->op == TK_MINUS ? "xs_isub" : e->op == TK_STAR ? "xs_imul"
                            : e->op == TK_PERCENT ? "xs_imod" : "xs_idiv";
+            /* both operands never negative (XB-075): a sum or product can only cross the top of the safe range, one
+               comparison; a difference of two of them stays inside it, no test at all */
+            bool nn2 = (e->op == TK_PLUS || e->op == TK_MINUS || e->op == TK_STAR) && !getenv("XISTO_NO_NONNEG") && rv_valid &&
+                       rv_owner == cur_func && !ictx && nn_expr(e->lhs) && nn_expr(e->rhs);
+            if (nn2 && e->op == TK_MINUS) {
+                buf_puts(out, "((int64_t)(");
+                emit_expr(e->lhs);
+                buf_puts(out, ") - (int64_t)(");
+                emit_expr(e->rhs);
+                buf_puts(out, "))");
+                return;
+            }
+            if (nn2) fn = e->op == TK_PLUS ? "xs_iadd_nn" : "xs_imul_nn";
             buf_printf(out, "%s%s(", fn, e->op == TK_SLASH ? "" : "_s");
             emit_expr(e->lhs);
             buf_puts(out, ", ");
@@ -5781,11 +5796,11 @@ static void emit_spine(Func *f, Spine *sp) {
     nl();
     buf_puts(out, "if (");
     emit_expr(sp->base->cond);
-    if (sp->k) buf_printf(out, ") return xs_iadd_s(acc_, INT64_C(%lld), XS_S(%d));", (long long)sp->k, new_site(sp->ret->pos));
+    if (sp->k) buf_printf(out, ") return xs_iadd_nn_s(acc_, INT64_C(%lld), XS_S(%d));", (long long)sp->k, new_site(sp->ret->pos));
     else buf_puts(out, ") return acc_;");
     nl();
-    buf_puts(out, "acc_ = xs_iadd_s(acc_, ");
-    if (sp->c) buf_printf(out, "xs_iadd_s(INT64_C(%lld), ", (long long)sp->c);
+    buf_puts(out, "acc_ = xs_iadd_nn_s(acc_, "); /* (every term is >= 0: only the top of the range can be crossed) */
+    if (sp->c) buf_printf(out, "xs_iadd_nn_s(INT64_C(%lld), ", (long long)sp->c);
     emit_expr(sp->calls[0]);
     if (sp->c) buf_printf(out, ", XS_S(%d))", new_site(sp->ret->pos));
     buf_printf(out, ", XS_S(%d));", new_site(sp->ret->pos));
