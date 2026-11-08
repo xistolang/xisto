@@ -4860,7 +4860,7 @@ static void emit_stmt_(Stmt *s) {
 /* ---------- declarations ---------- */
 
 static void emit_signature(Func *f) {
-    if (f->run_once && strcmp(fn_storage(f), "XS_FA") != 0) buf_puts(out, "XS_RUN_ONCE "); /* (always_inline wins) */
+    if (f->run_once && strcmp(fn_storage(f), "XS_FA") != 0 && strcmp(fn_storage(f), "XS_FII") != 0) buf_puts(out, "XS_RUN_ONCE "); /* (always_inline wins) */
     if (f->is_ctor) {
         buf_printf(out, "%s %s *%s(", fn_storage(f), f->cls->cname, f->cname);
     } else {
