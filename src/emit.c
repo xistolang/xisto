@@ -1736,6 +1736,21 @@ static void emit_member(Expr *e) {
         buf_puts(out, ")");
         return;
     }
+    if (base->type->kind == TY_STRING && e->builtin.cfn && is_fresh(base) && !getenv("XISTO_NO_CHAIN_FREE") &&
+        (!strcmp(e->builtin.cfn, "xs_str_replace_re") || !strcmp(e->builtin.cfn, "xs_str_replace_all_re") ||
+         !strcmp(e->builtin.cfn, "xs_str_replace") || !strcmp(e->builtin.cfn, "xs_str_replace_all"))) {
+        /* s.replace(...).replace(...): each intermediate string is released as soon as the next one is made,
+           not at the end of the statement (regex-redux: a chain of five over 50 MB peaked at 273 MB on the
+           Xeon, now ~100). These functions return an owned string (a retained s when nothing matched). */
+        static int nchain;
+        int id = nchain++;
+        buf_printf(out, "({ xs_str *cr%d_ = ", id);
+        emit_expr(base);
+        buf_printf(out, "; xs_str *cq%d_ = %s(cr%d_", id, e->builtin.cfn, id);
+        emit_args_borrowed(&e->args, true);
+        buf_printf(out, "); xs_release_as(cr%d_, xs_str_free); cq%d_; })", id, id);
+        return;
+    }
     if (base->type->kind == TY_STRING || ((base->type->kind == TY_INT || base->type->kind == TY_NUMBER) && e->builtin.cfn)) {
         buf_printf(out, "%s(", e->builtin.cfn);
         emit_borrowed(base);
