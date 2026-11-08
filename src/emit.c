@@ -3181,11 +3181,87 @@ static bool reuse_assign(Expr *e) {
     return true;
 }
 
+/* ---------- Float64Array locals in the frame ----------
+   `const v = new Float64Array(N)`, N a literal <= 16, in a function whose body only indexes v (v[i], v.length) or
+   passes it to user functions that, by the same rule, only index that parameter: v is a double[N] in the C
+   frame (xs_f64_on_frame) instead of an object on the heap, and the C compiler promotes it to registers (SROA)
+   once the loops unroll: n-body's advance with its 11 arrays local, M4 2,40 -> 1,23 s (= Rust). Anything else
+   (stored, returned, captured, iterated, a method called on it, a builtin receiving it) keeps the heap object.
+   XISTO_NO_F64_LOCAL=1 turns it off. */
+static bool f64_mentions_stmt(Stmt *s, const char *cname);
+static bool f64_mentions(Expr *e, const char *cname) {
+    if (!e) return false;
+    if (e->kind == E_IDENT) return e->cname && strcmp(e->cname, cname) == 0;
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn && f64_mentions_stmt(e->arrow->fn->body, cname)) return true;
+    if (f64_mentions(e->lhs, cname) || f64_mentions(e->rhs, cname)) return true;
+    for (int i = 0; i < e->args.len; i++) if (f64_mentions(e->args.items[i], cname)) return true;
+    return false;
+}
+static bool f64_mentions_stmt(Stmt *s, const char *cname) {
+    if (!s) return false;
+    if (f64_mentions(s->init, cname) || f64_mentions(s->expr, cname) || f64_mentions(s->cond, cname) || f64_mentions(s->for_update, cname)) return true;
+    if (f64_mentions_stmt(s->for_init, cname) || f64_mentions_stmt(s->body, cname) || f64_mentions_stmt(s->else_body, cname)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (f64_mentions_stmt(s->stmts.items[i], cname)) return true;
+    for (int i = 0; i < s->ncases; i++) if (f64_mentions_stmt(s->cases[i].body, cname)) return true;
+    return false;
+}
+static bool f64_plain_stmt(Stmt *s, const char *cname, int depth);
+static bool f64_plain_param(Func *f, int i, int depth) {
+    if (depth > 3 || !f || !f->body || i >= f->nparams || f->params[i].cell || !f->params[i].cname) return false;
+    return f64_plain_stmt(f->body, f->params[i].cname, depth);
+}
+static bool f64_is(Expr *e, const char *cname) { return e && e->kind == E_IDENT && e->cname && strcmp(e->cname, cname) == 0; }
+static bool f64_plain_expr(Expr *e, const char *cname, int depth) {
+    if (!e) return true;
+    if (e->kind == E_IDENT) return !f64_is(e, cname); /* a bare use: it escapes */
+    if (e->kind == E_INDEX && f64_is(e->lhs, cname)) return f64_plain_expr(e->rhs, cname, depth);
+    if (e->kind == E_MEMBER && !e->is_call && f64_is(e->lhs, cname) && e->str && strcmp(e->str, "length") == 0) return true;
+    if (e->kind == E_ARROW) { /* captured by a closure: the closure's copy would hold it past the frame */
+        if (!e->arrow) return false;
+        for (int i = 0; i < e->arrow->ncaptures; i++)
+            if (e->arrow->captures[i].outer_cname && strcmp(e->arrow->captures[i].outer_cname, cname) == 0) return false;
+        return !e->arrow->fn || !f64_mentions_stmt(e->arrow->fn->body, cname);
+    }
+    if (e->kind == E_CALL && e->func && e->func->body && !e->builtin.cfn) {
+        if (!f64_plain_expr(e->lhs, cname, depth)) return false;
+        for (int i = 0; i < e->args.len; i++) {
+            if (f64_is(e->args.items[i], cname)) { if (!f64_plain_param(e->func, i, depth + 1)) return false; }
+            else if (!f64_plain_expr(e->args.items[i], cname, depth)) return false;
+        }
+        return true;
+    }
+    if (!f64_plain_expr(e->lhs, cname, depth) || !f64_plain_expr(e->rhs, cname, depth)) return false;
+    for (int i = 0; i < e->args.len; i++) if (!f64_plain_expr(e->args.items[i], cname, depth)) return false;
+    return true;
+}
+static bool f64_plain_stmt(Stmt *s, const char *cname, int depth) {
+    if (!s) return true;
+    if (s->kind == S_FOROF && f64_mentions(s->expr, cname)) return false;
+    if (!f64_plain_expr(s->init, cname, depth) || !f64_plain_expr(s->expr, cname, depth) || !f64_plain_expr(s->cond, cname, depth) || !f64_plain_expr(s->for_update, cname, depth)) return false;
+    if (!f64_plain_stmt(s->for_init, cname, depth) || !f64_plain_stmt(s->body, cname, depth) || !f64_plain_stmt(s->else_body, cname, depth)) return false;
+    for (int i = 0; i < s->stmts.len; i++) if (!f64_plain_stmt(s->stmts.items[i], cname, depth)) return false;
+    for (int i = 0; i < s->ncases; i++) if (!f64_plain_stmt(s->cases[i].body, cname, depth)) return false;
+    return true;
+}
+static int64_t bce_fixed_of(Stmt *s);
+static int64_t f64_local_n(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || !cur_func || !cur_func->body || !is_f64_type(s->type) || getenv("XISTO_NO_F64_LOCAL")) return 0;
+    int64_t n = bce_fixed_of(s);
+    if (n <= 0 || n > 16) return 0;
+    return f64_plain_stmt(cur_func->body, s->cname, 0) ? n : 0;
+}
 static void emit_var(Stmt *s) {
     if (sm_mode) { /* a local of a state-machine generator: a field of the frame, assigned (emit_gen_sm checked it is primitive) */
         buf_printf(out, "%s = ", ren(s->cname));
         emit_expr(s->init);
         buf_puts(out, ";");
+        return;
+    }
+    int64_t fn_ = f64_local_n(s);
+    if (fn_ > 0) { /* a Float64Array in the frame: a double[N] the C compiler keeps in registers */
+        buf_printf(out, "double sd_%s[%lld] = {0}; xs_Float64Array so_%s; xs_Float64Array *%s = xs_f64_on_frame(&so_%s, sd_%s, %lld);",
+                   s->cname, (long long)fn_, s->cname, s->cname, s->cname, s->cname, (long long)fn_);
+        dbg_local(s->name, s->type, s->cname, s->is_const);
         return;
     }
     if (borrowable_init(s)) {
@@ -3582,6 +3658,8 @@ static int64_t bce_fixed_of(Stmt *s) {
     Expr *e = s->init;
     if (e->kind != E_NEW_OBJ || !e->builtin.cfn || (strcmp(e->builtin.cfn, "xs_u8_new") != 0 && strcmp(e->builtin.cfn, "xs_f64_new") != 0) || e->args.len != 1) return 0;
     Expr *n = e->args.items[0];
+    int64_t v;
+    if (n->kind == E_IDENT && n->cname && cig_find(n->cname, &v)) return v > 0 ? v : 0; /* new Float64Array(N), N a top-level const int */
     return n->kind == E_NUMBER && n->is_int_lit && n->ival > 0 ? n->ival : 0;
 }
 static void bce_fix_scan(Stmt *s) {
