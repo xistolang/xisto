@@ -389,7 +389,8 @@ static void check_bytes_member(Expr *e, Class *c) {
     #define PAD_INT(k, v) do { for (int k_ = e->args.len; k_ <= (k); k_++) expr_list_push(&e->args, num_lit(e->pos, (double)(v), true)); } while (0)
     if (!e->is_call) {
         if (strcmp(m, "length") == 0 || strcmp(m, "byteLength") == 0) { e->field = 0; e->type = ty_int; return; }
-        xs_error(e->pos, "supported: length, byteLength", "%s has no property '%s'", c->name, m);
+        if (strcmp(m, "byteOffset") == 0) { e->builtin.cfn = "xs_u8_byte_offset"; e->type = ty_int; return; } /* (into the SharedArrayBuffer or the array it is a view on) */
+        xs_error(e->pos, "supported: length, byteLength, byteOffset", "%s has no property '%s'", c->name, m);
     }
     if (strcmp(m, "slice") == 0 || strcmp(m, "subarray") == 0) {
         ARGS(0, 2);
@@ -3837,10 +3838,17 @@ static void check_expr(Expr *e, Type *expected) {
                 prog->uses_sqlite = true;
                 return;
             }
-            if (strcmp(c->name, "Uint8Array") == 0) { /* new Uint8Array(length | int[] | number[] | bytes) */
-                if (e->args.len != 1) xs_error(e->pos, "new Uint8Array(16), new Uint8Array([1, 2, 3])", "new Uint8Array takes one argument");
+            if (strcmp(c->name, "Uint8Array") == 0) { /* new Uint8Array(length | int[] | number[] | bytes | sab, offset?, length?) */
+                if (e->args.len < 1 || e->args.len > 3) xs_error(e->pos, "new Uint8Array(16), new Uint8Array([1, 2, 3]), new Uint8Array(sharedBuffer)", "new Uint8Array takes one argument (or a SharedArrayBuffer, an offset and a length)");
                 check_expr(e->args.items[0], e->args.items[0]->kind == E_ARRAY_LIT ? ty_array_of(ty_int) : NULL);
                 Type *st = e->args.items[0]->type;
+                if (e->args.len > 1 && !is_sab(st)) xs_error(e->pos, "new Uint8Array(sharedBuffer, byteOffset, length)", "an offset and a length go with a SharedArrayBuffer");
+                if (is_sab(st)) { /* a view on the shared bytes (runtime: xs_u8_on); a message carries it as the block */
+                    for (int k = 1; k < e->args.len; k++) int_arg(&e->args.items[k], k == 1 ? "the byte offset" : "the length");
+                    for (int k = e->args.len; k < 3; k++) expr_list_push(&e->args, num_lit(e->pos, (double)XS_NOT_GIVEN, true));
+                    e->builtin.cfn = "xs_u8_on";
+                    return;
+                }
                 if (st->kind == TY_INT || st->kind == TY_LITINT) { if (st->kind == TY_LITINT) coerce_lit(e->args.items[0], ty_int); e->builtin.cfn = "xs_u8_new"; }
                 else if (is_bytes(st)) e->builtin.cfn = "xs_u8_copy";
                 else if (st->kind == TY_ARRAY && (st->elem->kind == TY_INT || st->elem->kind == TY_LITINT)) e->builtin.cfn = "xs_u8_from_ints";
