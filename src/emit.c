@@ -418,6 +418,7 @@ static bool match_u8_idiom(Stmt *s, U8Idiom *m);
 static bool u8_is_index_on(Expr *e, const char *c);
 static bool same_simple(Expr *a, Expr *b);
 static bool bce_pure(Expr *e);
+static bool stmt_mentions_name(Stmt *s, const char *c);
 typedef struct { const char *cname; int64_t n; } U8Reg;
 static U8Reg u8regs[8];
 static int nu8regs;
@@ -3063,6 +3064,85 @@ static const char *dbg_type(Type *t) {
 
 static int region_reset_pending; /* a region loop's body: rewinds the region before each iteration */
 static bool *region_dual;        /* per region: it has dual classes (xs_rg_on_N says where they are made) */
+/* ---- does the int local x hold a[lo] (lo a literal) right before statement `target`? ----
+   A forward walk of the function body: `x = a[lo]` syncs; any other write to x, a write to a's lane lo (a store
+   at an index that is not a literal other than lo, an idiom whose range reaches lo), or x captured by an arrow,
+   loses it. Branches meet (both must be synced), loops run twice (the body's end and its continues feed the head,
+   breaks feed the exit). Conservative: anything not understood is "not known". */
+static Expr *rot_a; static int64_t rot_lo; static const char *rot_x; static Stmt *rot_target; static int rot_found, rot_state_at;
+static int rot_expr(Expr *e, int st); /* the state after evaluating e */
+static int rot_stmt(Stmt *s, int st, int *brk, int *cont);
+static bool rot_idx_is_other_literal(Expr *i) { return i && i->kind == E_NUMBER && i->is_int_lit && i->ival != rot_lo; }
+static int rot_expr(Expr *e, int st) {
+    if (!e) return st;
+    if (e->kind == E_ARROW) return (e->arrow && e->arrow->fn && stmt_mentions_name(e->arrow->fn->body, rot_x)) ? 0 : st;
+    if ((e->kind == E_ASSIGN || e->kind == E_POSTFIX || e->kind == E_UNARY) && e->lhs) {
+        Expr *t = e->lhs;
+        if (t->kind == E_IDENT && t->cname && strcmp(t->cname, rot_x) == 0) { /* x = ... */
+            if (e->kind != E_ASSIGN || e->op != TK_ASSIGN) return 0;
+            st = rot_expr(e->rhs, st);
+            return u8_is_index_on(e->rhs, rot_a->cname) && e->rhs->rhs->kind == E_NUMBER && e->rhs->rhs->is_int_lit && e->rhs->rhs->ival == rot_lo ? 1 : 0;
+        }
+        if (u8_is_index_on(t, rot_a->cname)) { /* a[i] = ... */
+            st = rot_expr(t->rhs, st); st = rot_expr(e->rhs, st);
+            return rot_idx_is_other_literal(t->rhs) ? st : 0;
+        }
+    }
+    st = rot_expr(e->lhs, st); st = rot_expr(e->rhs, st);
+    for (int i = 0; i < e->args.len; i++) st = rot_expr(e->args.items[i], st);
+    return st;
+}
+static int rot_min(int a, int b) { return a < b ? a : b; }
+static int rot_loop(Stmt *s, int st) {
+    int head = st, exit = st;
+    for (int pass = 0; pass < 2; pass++) {
+        int brk = 1, cont = 1;
+        int h = head;
+        if (s->kind == S_FOR && pass == 0) h = rot_stmt(s->for_init, h, NULL, NULL);
+        h = rot_expr(s->cond, h);
+        if (s->kind == S_FOROF) h = rot_expr(s->expr, h);
+        int end = rot_stmt(s->body, h, &brk, &cont);
+        end = rot_expr(s->for_update, end);
+        head = rot_min(rot_min(st, end), cont);
+        exit = rot_min(rot_min(head, end), brk);
+    }
+    return exit;
+}
+static int rot_stmt(Stmt *s, int st, int *brk, int *cont) {
+    if (!s) return st;
+    if (s == rot_target) { rot_found = 1; rot_state_at = rot_min(rot_state_at, st); }
+    switch (s->kind) {
+    case S_VAR:
+        st = rot_expr(s->init, st);
+        if (s->cname && strcmp(s->cname, rot_x) == 0)
+            return s->init && u8_is_index_on(s->init, rot_a->cname) && s->init->rhs->kind == E_NUMBER && s->init->rhs->is_int_lit && s->init->rhs->ival == rot_lo ? 1 : 0;
+        return st;
+    case S_EXPR: return rot_expr(s->expr, st);
+    case S_IF: { int c = rot_expr(s->cond, st); return rot_min(rot_stmt(s->body, c, brk, cont), s->else_body ? rot_stmt(s->else_body, c, brk, cont) : c); }
+    case S_BLOCK: for (int i = 0; i < s->stmts.len; i++) st = rot_stmt(s->stmts.items[i], st, brk, cont); return st;
+    case S_FOR: case S_WHILE: case S_FOROF: {
+        U8Idiom m; /* an idiom's range reaching lo writes it; otherwise the loop is walked */
+        if (s->kind == S_FOR && match_u8_idiom(s, &m) && m.a && m.a->cname && strcmp(m.a->cname, rot_a->cname) == 0) {
+            if (m.kind == 3 || m.kind == 2) return (m.lo->kind == E_NUMBER && m.lo->ival > rot_lo) ? st : 0; /* [lo'..] */
+            return (m.lo->kind == E_NUMBER && m.lo->ival > rot_lo) ? st : 0;
+        }
+        return rot_loop(s, st);
+    }
+    case S_SWITCH: { int c = rot_expr(s->expr, st), r = c; for (int i = 0; i < s->ncases; i++) r = rot_min(r, rot_stmt(s->cases[i].body, c, brk, cont)); return r; }
+    case S_BREAK: if (brk) *brk = rot_min(*brk, st); return st;
+    case S_CONTINUE: if (cont) *cont = rot_min(*cont, st); return st;
+    case S_RETURN: case S_THROW: return rot_expr(s->expr, st);
+    case S_TRY: return 0;
+    default: return 0;
+    }
+}
+static bool u8_rot_ok(Stmt *target, Expr *a, Expr *lo, Expr *x) {
+    if (!cur_func || !cur_func->body || !x->cname || lo->kind != E_NUMBER || !lo->is_int_lit) return false;
+    rot_a = a; rot_lo = lo->ival; rot_x = x->cname; rot_target = target; rot_found = 0; rot_state_at = 1;
+    int brk = 1, cont = 1;
+    rot_stmt(cur_func->body, 0, &brk, &cont); /* x starts unknown */
+    return rot_found && rot_state_at == 1;
+}
 /* `for (j = lo; j <= K; j++) a[j] = a[j + 1]; a[K + 1] = v;` with a in a register (fannkuch-redux's next
    permutation): one call, the shuffle and the lane (xs_v16_shl_put). b->stmts[*i] is the loop; on a match the
    pair is emitted and *i skips the store. */
@@ -3081,7 +3161,9 @@ static bool emit_u8_shl_put(Stmt *b, int *i) {
     int site = new_site(lp->pos);
     nl();
     emit_dbg_hook(lp);
-    emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_shl_put("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_puts(out, ", ");
+    /* x known to hold a[lo] here: the pair is a rotation, one shuffle (u8_rot_ok) */
+    const char *fn = as->rhs->kind == E_IDENT && m.lo->kind == E_NUMBER && u8_rot_ok(lp, m.a, m.lo, as->rhs) ? "xs_v16_rot" : "xs_v16_shl_put";
+    emit_u8reg_name(m.a); buf_printf(out, " = %s(", fn); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_puts(out, ", ");
     emit_expr(as->rhs); buf_printf(out, ", INT64_C(%lld), XS_S(%d));", (long long)rg->n, site);
     *i += 1;
     return true;

@@ -63,6 +63,27 @@ function escapes(): string {
   const f = () => a[2] + c[3];
   return `${acc} ${f()} ${b[5]} ${c[0]}`;
 }
+// the shift followed by a store of a value that is NOT the first element: not a rotation, same answers
+function notRot(n: int): string {
+  const a = new Uint8Array(16);
+  for (let i = 0; i < n; i++) a[i] = i + 1;
+  let x = a[0];
+  let y = a[1];
+  let out = "";
+  for (let r = 0; r < 6; r++) {
+    const k = (r % (n - 3)) + 1;
+    for (let j = 0; j <= k; j++) a[j] = a[j + 1];
+    a[k + 1] = y; // y came from a[1], not a[0]
+    y = a[1];
+    a[0] = (a[0] + 7) % 16; // a[0] written after x was read
+    for (let j = 1; j <= k; j++) a[j] = a[j + 1];
+    a[k + 1] = x;
+    x = a[0];
+    out += `${a[0]}${a[1]}${a[2]}${a[k + 1]} `;
+  }
+  return out;
+}
 console.log(flips(12, 7), flips(9, 2), flips(15, 5), flips(3, 1));
+console.log(notRot(12), notRot(7));
 console.log(small());
 console.log(escapes());

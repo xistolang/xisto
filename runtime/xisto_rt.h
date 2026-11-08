@@ -3929,6 +3929,7 @@ static inline xs_u8x16 xs_u8x16_shuffle(xs_u8x16 v, xs_u8x16 m) { xs_u8x16 r; fo
 static xs_u8x16 xs_rev_mask[16][16]; /* [lo][hi]: i outside [lo, hi], lo + hi - i inside (xs_init fills it) */
 static xs_u8x16 xs_shl_mask[16][16]; /* [lo][hi]: i outside [lo, hi], i + 1 inside: a[j] = a[j + 1] for lo <= j <= hi */
 static xs_u8x16 xs_lane_mask[16];    /* [i]: 0xff at lane i (a set: one load instead of splat + compare) */
+static xs_u8x16 xs_rot_mask[16][16]; /* [lo][hi]: lanes lo..hi rotated left by one (lo takes lo + 1, ..., hi takes lo) */
 static void xs_rev_mask_init(void) {
     for (int lo = 0; lo < 16; lo++)
         for (int hi = 0; hi < 16; hi++)
@@ -3937,6 +3938,9 @@ static void xs_rev_mask_init(void) {
                 xs_shl_mask[lo][hi][i] = (uint8_t)(lo <= i && i <= hi ? (i + 1) & 15 : i);
             }
     for (int l = 0; l < 16; l++) for (int i = 0; i < 16; i++) xs_lane_mask[l][i] = (uint8_t)(i == l ? 0xff : 0);
+    for (int lo = 0; lo < 16; lo++)
+        for (int hi = 0; hi < 16; hi++)
+            for (int i = 0; i < 16; i++) xs_rot_mask[lo][hi][i] = (uint8_t)(lo <= i && i <= hi ? (i == hi ? lo : i + 1) : i);
 }
 static inline xs_u8x16 xs_v16_load(const uint8_t *d, int64_t n) { if (n >= 16) return xs_u8x16_load(d); xs_u8x16 v = xs_u8x16_splat(0); memcpy(&v, d, (size_t)n); return v; }
 static inline void xs_v16_store(uint8_t *d, xs_u8x16 v, int64_t n) { if (n >= 16) xs_u8x16_store(d, v); else memcpy(d, &v, (size_t)n); }
@@ -4127,6 +4131,13 @@ static inline xs_u8x16 xs_v16_shl(xs_u8x16 v, int64_t lo, int64_t hi, int64_t n,
     if (lo > hi) return v;
     if (lo < 0 || (uint64_t)(hi + 1) >= (uint64_t)n) XS_FAIL("index out of bounds", s);
     return xs_u8x16_shuffle(v, xs_shl_mask[lo][hi]);
+}
+/* the shift followed by `a[hi + 1] = x` where x is known to hold a[lo] (emit.c u8_rot_ok): a rotation of
+   a[lo..hi + 1] to the left, one shuffle (the Rust fannkuch-redux's advance_array) */
+static inline xs_u8x16 xs_v16_rot(xs_u8x16 v, int64_t lo, int64_t hi, int64_t x, int64_t n, const xs_site *s) {
+    if (lo > hi) { if ((uint64_t)(hi + 1) >= (uint64_t)n) XS_FAIL("index out of bounds", s); return xs_v16_set_nc(v, hi + 1, x); } /* (the loop ran nothing) */
+    if (lo < 0 || (uint64_t)(hi + 1) >= (uint64_t)n) XS_FAIL("index out of bounds", s);
+    return xs_u8x16_shuffle(v, xs_rot_mask[lo][hi + 1]);
 }
 /* the shift followed by `a[hi + 1] = b` (fannkuch-redux's next permutation): the shuffle, then the lane */
 static inline xs_u8x16 xs_v16_shl_put(xs_u8x16 v, int64_t lo, int64_t hi, int64_t b, int64_t n, const xs_site *s) {
