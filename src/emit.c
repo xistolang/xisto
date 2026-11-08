@@ -3655,6 +3655,13 @@ static void rv_compute(Func *owner, Stmt **stmts, int n) {
     if (!owner) { int k = 0; for (int i = 0; i < rv_n; i++) if (rv_main_only(rv_name[i])) { rv_name[k] = rv_name[i]; rv_rng[k++] = rv_rng[i]; } rv_n = k; }
     bool *top = calloc((size_t)(rv_n ? rv_n : 1), sizeof(bool));
     for (int d = 0; d < rv_ndefs; d++) { int k = rv_find(rv_defs[d].name); if (k >= 0 && rv_defs[d].top) top[k] = true; }
+    /* a counter the loop declares (`for (let j = i + 1; ...)`): its start is folded into the loop's own definition
+       (below the bound), so the declaration is not a definition of its own */
+    for (int d = 0; d < rv_ndefs; d++) {
+        Stmt *lp = rv_defs[d].loop, *fi = lp ? lp->for_init : NULL;
+        if (!fi || fi->kind != S_VAR || !fi->cname || strcmp(fi->cname, rv_defs[d].name) != 0) continue;
+        for (int e = 0; e < rv_ndefs; e++) if (e != d && !rv_defs[e].loop && rv_defs[e].def == fi->init && strcmp(rv_defs[e].name, fi->cname) == 0) rv_defs[e].def = NULL, rv_defs[e].name = "";
+    }
     rv_valid = true; /* rng_of reads the table while it is being computed */
     for (int round = 0; round < 6; round++) {
         bool moved = false;
@@ -3673,6 +3680,7 @@ static void rv_compute(Func *owner, Stmt **stmts, int n) {
                     Stmt *fi = rv_defs[d].loop->for_init;
                     bool own = fi && fi->kind == S_VAR && fi->cname && strcmp(fi->cname, rv_name[k]) == 0;
                     if (x.ok) { x.lo = INT64_MAX; for (int e = 0; e < rv_ndefs; e++) if (strcmp(rv_defs[e].name, rv_name[k]) == 0 && rv_defs[e].def) { Rng s0 = rng_of(rv_defs[e].def); if (!s0.ok) { x = rng_none(); break; } if (s0.lo < x.lo) x.lo = s0.lo; if (s0.hi > x.hi && !own) x.hi = s0.hi; } }
+                    if (x.ok && own) { Rng s0 = rng_of(fi->init); if (!s0.ok) x = rng_none(); else if (s0.lo < x.lo) x.lo = s0.lo; }
                     if (x.ok && x.lo == INT64_MAX) x = rng_none();
                     if (x.ok && x.lo > x.hi) x.lo = x.hi; /* (a loop that never runs: nothing reads it) */
                 } else x = rng_of(rv_defs[d].def);
