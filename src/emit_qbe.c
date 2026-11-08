@@ -1329,9 +1329,15 @@ static void emit_main_unit(Program *p) {
     }
 }
 
+static bool qtyped(Type *t) { /* Float64Array/Uint8Array: the qbe backend has no lowering for them (a parameter of one crashed it) */
+    return t && t->kind == TY_OBJECT && t->cls && t->cls->builtin && (strcmp(t->cls->cname, "xs_Float64Array") == 0 || strcmp(t->cls->cname, "xs_Uint8Array") == 0);
+}
 static void check_supported(Program *p) {
-    for (int i = 0; i < p->nfuncs; i++)
+    for (int i = 0; i < p->nfuncs; i++) {
         if (p->funcs[i]->used && p->funcs[i]->is_gen) unsupported(p->funcs[i]->pos, "generators");
+        for (int k = 0; p->funcs[i]->used && k < p->funcs[i]->nparams; k++)
+            if (qtyped(p->funcs[i]->params[k].type)) unsupported(p->funcs[i]->pos, "a typed-array parameter");
+    }
     for (int i = 0; i < p->nclasses; i++)
         if (p->classes[i]->used && (p->classes[i]->base || p->classes[i]->nsubs)) unsupported(p->classes[i]->pos, "inheritance");
     if (p->uses_net) unsupported((Pos){1, 1}, "networking");

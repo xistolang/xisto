@@ -365,6 +365,7 @@ struct Func {
     char *ret_src;     /* the return type as written (reflection) */
     int fail_state;    /* emitter: 0 unknown, 1 being computed, 2 cannot fail, 3 can fail (stack traces) */
     int ncalls;        /* emitter: direct call sites; -1 when used as a value */
+    int64_t *fixparam;  /* emitter: the length every call passes for each typed-array parameter (0: not known) */
     struct Expr *call1;     /* the call site when there is exactly one */
     struct Func *call1_in;  /* the function containing it (NULL: top level) */
     Module *call1_mod;

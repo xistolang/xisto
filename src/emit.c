@@ -210,6 +210,112 @@ static void count_calls(Program *p) {
     }
     for (int i = 0; i < p->top.len; i++) count_calls_stmt(p->top.items[i], NULL, p->top.items[i]->mod);
 }
+
+/* ---- typed-array parameters of a fixed length ----
+   A Float64Array/Uint8Array never changes its length, so a parameter has length N when every call of its function
+   passes an array of length N: a local `const a = new Float64Array(N)` of the caller, or a parameter of the caller
+   that has length N itself (to a fixed point). Then its indexing is checked against N like the caller's local is
+   (bce_fixed_n), and with the ranges of the indices the checks go: nbody-5's advance indexes p[4 * PI[q] + k].
+   The calls are visited the way count_calls visits them; a function with a call this pass did not see (ncalls
+   differs), or used as a value, keeps every parameter unknown. XISTO_NO_FIXPARAM=1 turns it off. */
+static int64_t bce_fixed_of(Stmt *s);
+static bool fixp_typed(Type *t) {
+    return t && t->kind == TY_OBJECT && t->cls && t->cls->builtin &&
+           (strcmp(t->cls->cname, "xs_Float64Array") == 0 || strcmp(t->cls->cname, "xs_Uint8Array") == 0);
+}
+static int64_t fixp_local(Stmt *s, const char *c) {
+    if (!s) return 0;
+    if (s->kind == S_VAR && s->cname && strcmp(s->cname, c) == 0) return bce_fixed_of(s);
+    int64_t v;
+    if ((v = fixp_local(s->for_init, c)) || (v = fixp_local(s->body, c)) || (v = fixp_local(s->else_body, c))) return v;
+    for (int i = 0; i < s->stmts.len; i++) if ((v = fixp_local(s->stmts.items[i], c))) return v;
+    for (int i = 0; i < s->ncases; i++) if ((v = fixp_local(s->cases[i].body, c))) return v;
+    return 0;
+}
+static Program *fixp_prog;
+static int64_t fixp_arg(Expr *a, Func *in) {
+    if (!a || a->kind != E_IDENT || !a->cname) return 0;
+    if (in) {
+        for (int i = 0; i < in->nparams; i++)
+            if (in->params[i].cname && strcmp(in->params[i].cname, a->cname) == 0) return in->fixparam ? (in->fixparam[i] > 0 ? in->fixparam[i] : 0) : 0;
+        return fixp_local(in->body, a->cname);
+    }
+    for (int i = 0; i < fixp_prog->top.len; i++) { int64_t v = fixp_local(fixp_prog->top.items[i], a->cname); if (v) return v; }
+    return 0;
+}
+static int *fixp_seen; static Func **fixp_fn; static int fixp_n;
+static void fixp_call(Func *f, Expr *e, Func *in) {
+    if (!f || !f->body || !f->fixparam) return;
+    for (int k = 0; k < fixp_n; k++) if (fixp_fn[k] == f) { fixp_seen[k]++; break; }
+    for (int i = 0; i < f->nparams; i++) {
+        if (!fixp_typed(f->params[i].type)) continue;
+        int64_t n = i < e->args.len ? fixp_arg(e->args.items[i], in) : 0;
+        if (f->fixparam[i] == -1) f->fixparam[i] = n;
+        else if (f->fixparam[i] != n) f->fixparam[i] = 0;
+    }
+}
+static void fixp_stmt(Stmt *s, Func *in);
+static void fixp_expr(Expr *e, Func *in) {
+    if (!e) return;
+    switch (e->kind) {
+    case E_CALL: if (e->func && !e->builtin.cfn) fixp_call(e->func, e, in); break;
+    case E_MEMBER: if (e->is_call && e->func && e->cls && !e->cls->builtin && !e->builtin.cfn) fixp_call(e->func, e, in); break;
+    case E_NEW_OBJ: if (!e->cls->builtin && e->cls->ctor) fixp_call(e->cls->ctor, e, in); break;
+    case E_ARROW: fixp_stmt(e->arrow->fn->body, e->arrow->fn); return;
+    default: break;
+    }
+    fixp_expr(e->lhs, in);
+    fixp_expr(e->rhs, in);
+    for (int i = 0; i < e->args.len; i++) fixp_expr(e->args.items[i], in);
+}
+static void fixp_stmt(Stmt *s, Func *in) {
+    if (!s) return;
+    fixp_expr(s->init, in); fixp_expr(s->expr, in); fixp_expr(s->cond, in); fixp_expr(s->for_update, in);
+    fixp_stmt(s->for_init, in); fixp_stmt(s->body, in); fixp_stmt(s->else_body, in);
+    for (int i = 0; i < s->stmts.len; i++) fixp_stmt(s->stmts.items[i], in);
+    for (int i = 0; i < s->ncases; i++) { fixp_expr(s->cases[i].value, in); fixp_stmt(s->cases[i].body, in); }
+}
+static void fixparam_compute(Program *p) {
+    fixp_prog = p;
+    fixp_n = 0;
+    free(fixp_fn); free(fixp_seen);
+    fixp_fn = calloc((size_t)(p->nfuncs + 1), sizeof(Func *));
+    fixp_seen = calloc((size_t)(p->nfuncs + 1), sizeof(int));
+    for (int i = 0; i < p->nfuncs; i++) {
+        Func *f = p->funcs[i];
+        f->fixparam = NULL;
+        if (xs_debug || getenv("XISTO_NO_FIXPARAM") || f->mod->builtin || f->is_native || !f->used || !f->body || f->escapes || f->ncalls <= 0 || f->is_gen || f->is_async) continue;
+        bool any = false;
+        for (int k = 0; k < f->nparams; k++) if (fixp_typed(f->params[k].type) && !f->params[k].cell) any = true;
+        if (!any) continue;
+        f->fixparam = calloc((size_t)f->nparams, sizeof(int64_t));
+        for (int k = 0; k < f->nparams; k++) f->fixparam[k] = fixp_typed(f->params[k].type) && !f->params[k].cell ? -1 : 0;
+        fixp_fn[fixp_n++] = f;
+    }
+    if (!fixp_n) return;
+    for (int round = 0; round < 4; round++) {
+        int64_t *before = calloc((size_t)fixp_n * 16, sizeof(int64_t));
+        for (int k = 0; k < fixp_n; k++) { fixp_seen[k] = 0; for (int i = 0; i < fixp_fn[k]->nparams && i < 16; i++) before[k * 16 + i] = fixp_fn[k]->fixparam[i]; }
+        /* each round starts from the previous answer: unset (-1) parameters count as "any" */
+        for (int i = 0; i < p->nfuncs; i++) if (!p->funcs[i]->mod->builtin && !p->funcs[i]->is_native && p->funcs[i]->used) fixp_stmt(p->funcs[i]->body, p->funcs[i]);
+        for (int i = 0; i < p->nclasses; i++) {
+            Class *c = p->classes[i];
+            if (!c->used) continue;
+            for (int k = 0; k < c->nfields; k++) fixp_expr(c->fields[k].init, NULL);
+            if (c->ctor) fixp_stmt(c->ctor->body, c->ctor);
+            for (int k = 0; k < c->nmethods; k++) if (c->methods[k]->used && c->methods[k]->cls == c) fixp_stmt(c->methods[k]->body, c->methods[k]);
+        }
+        for (int i = 0; i < p->top.len; i++) fixp_stmt(p->top.items[i], NULL);
+        bool same = true;
+        for (int k = 0; k < fixp_n; k++) for (int i = 0; i < fixp_fn[k]->nparams && i < 16; i++) if (before[k * 16 + i] != fixp_fn[k]->fixparam[i]) same = false;
+        free(before);
+        if (same) break;
+    }
+    for (int k = 0; k < fixp_n; k++) {
+        Func *f = fixp_fn[k];
+        for (int i = 0; i < f->nparams; i++) if (f->fixparam[i] < 0 || fixp_seen[k] != f->ncalls) f->fixparam[i] = 0;
+    }
+}
 static bool inlined_once(Func *f) {
     if (getenv("XISTO_NO_TRACE")) return false;
     if (f->ncalls != 1 || !f->call1 || f->is_async || !f->body || stmt_has_try(f->body) || f->virt_target || f->is_gen) return false;
@@ -3384,7 +3490,7 @@ static bool reuse_assign(Expr *e) {
 }
 
 /* ---------- Float64Array locals in the frame ----------
-   `const v = new Float64Array(N)`, N a literal <= 16, in a function whose body only indexes v (v[i], v.length) or
+   `const v = new Float64Array(N)`, N a literal <= 64 (a frame array of 512 bytes at most), in a function whose body only indexes v (v[i], v.length) or
    passes it to user functions that, by the same rule, only index that parameter: v is a double[N] in the C
    frame (xs_f64_on_frame) instead of an object on the heap, and the C compiler promotes it to registers (SROA)
    once the loops unroll: n-body's advance with its 11 arrays local, M4 2,40 -> 1,23 s (= Rust). Anything else
@@ -3449,7 +3555,7 @@ static int64_t bce_fixed_of(Stmt *s);
 static int64_t f64_local_n(Stmt *s) {
     if (xs_debug || sm_mode || ictx || !cur_func || !cur_func->body || !is_f64_type(s->type) || getenv("XISTO_NO_F64_LOCAL")) return 0;
     int64_t n = bce_fixed_of(s);
-    if (n <= 0 || n > 16) return 0;
+    if (n <= 0 || n > 64) return 0;
     return f64_plain_stmt(cur_func->body, s->cname, 0) ? n : 0;
 }
 static void emit_var(Stmt *s) {
@@ -3978,6 +4084,9 @@ static void rv_compute(Func *owner, Stmt **stmts, int n) {
     nbce_fix_l = 0;
     bce_fix_owner = owner;
     for (int i = 0; i < n; i++) bce_fix_scan(stmts[i]);
+    if (owner && owner->fixparam) /* typed-array parameters every call passes with one length (fixparam_compute) */
+        for (int i = 0; i < owner->nparams && nbce_fix_l < 32; i++)
+            if (owner->fixparam[i] > 0 && owner->params[i].cname) bce_fix_l[nbce_fix_l++] = (BceFix){owner->params[i].cname, owner->fixparam[i]};
     if (xs_debug || getenv("XISTO_NO_RANGES")) return;
     for (int i = 0; i < n; i++) rv_scan_stmt(stmts[i], true);
     if (!owner) { int k = 0; for (int i = 0; i < rv_n; i++) if (rv_main_only(rv_name[i])) { rv_name[k] = rv_name[i]; rv_rng[k++] = rv_rng[i]; } rv_n = k; }
@@ -6846,6 +6955,7 @@ void emit_program(Program *p, Buf *o) {
         if (n && !ns_has(&main_locals, s->cname) && nbce_fix_g < 32) bce_fix_g[nbce_fix_g++] = (BceFix){s->cname, n};
     }
     garr_collect(p); /* the constant arrays and tables (bce_garr) */
+    fixparam_compute(p); /* (after the top-level const ints: new Float64Array(N) reads them) */
     for (int i = 0; i < p->top.len; i++) {
         Stmt *s = p->top.items[i];
         if (s->kind != S_VAR || ns_has(&main_locals, s->cname)) continue;
