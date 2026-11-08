@@ -23,7 +23,10 @@
 #else
 /* frame pointers: stack traces walk them (the arm64 macOS ABI always keeps them). (No gcc-only warning flag
    here: gcc gets -w, and clang would warn about it, and that warning would reach stack traces and the debugger) */
-#define XS_LINK_FLAGS "-fno-omit-frame-pointer -ffunction-sections -fdata-sections -Wl,--gc-sections"
+/* -fno-math-errno: the macOS default; without it sqrt() keeps an errno path and a call, and the magnitudes of
+   nbody-4 stop vectorizing on Linux (Graviton2 6,29 -> 4,90 s with the same C). Node's Math.sqrt(-1) is NaN
+   either way; the runtime never reads errno after a math call. */
+#define XS_LINK_FLAGS "-fno-omit-frame-pointer -fno-math-errno -ffunction-sections -fdata-sections -Wl,--gc-sections"
 /* clang on Linux (preferred when installed): the same tuning as on macOS */
 #define XS_CLANG_FLAGS "-mllvm -hot-cold-split=false -mno-outline -Wno-incompatible-pointer-types-discards-qualifiers"
 #define XS_LINK_LIBS "-lpthread"

@@ -113,6 +113,10 @@ static void site_str(Buf *b, const char *s) {
 }
 static bool inlined_once(Func *f);
 static bool stmt_has_try(Stmt *s);
+static int cur_rg; /* rg-hoist: the dual region being emitted (definition and notes below, with the region versions) */
+static const char *rg_call_name(Func *f);
+static bool rg_inline_new(Expr *e);
+static void mark_init_stores(Class *c, Func *ctor);
 static Func *clone_func;    /* the function being emitted as a per-call-site copy ... */
 static int clone_inl;       /* ... for this call site */
 static const char *force_storage;
@@ -412,6 +416,22 @@ typedef struct BceGArr { const char *name; int64_t n; bool has_rng; int64_t lo, 
 static BceGArr *garr_find(const char *c);
 static Rng rng_of(Expr *e);
 static bool bce_safe(Expr *e); /* an index the loop already checks (see bce_enter) */
+/* u8reg: byte arrays a loop keeps in vector registers (see u8reg_loop) */
+typedef struct { int kind; Expr *a, *src, *lo, *hi, *ca, *cb; Stmt *loop; } U8Idiom; /* kind 1 copy a[j] = src[j], 2 reverse, 3 shift a[j] = a[j+1], 4 trade (a buf, src the table, ca/cb the cursors) */
+static bool match_u8_idiom(Stmt *s, U8Idiom *m);
+static bool u8_is_index_on(Expr *e, const char *c);
+static bool same_simple(Expr *a, Expr *b);
+static bool bce_pure(Expr *e);
+static bool stmt_mentions_name(Stmt *s, const char *c);
+typedef struct { const char *cname; int64_t n; } U8Reg;
+static U8Reg u8regs[8];
+static int nu8regs;
+static U8Reg *u8reg_find(Expr *e) {
+    if (!e || e->kind != E_IDENT || !e->cname) return NULL;
+    for (int k = 0; k < nu8regs; k++) if (strcmp(u8regs[k].cname, e->cname) == 0) return &u8regs[k];
+    return NULL;
+}
+static void emit_u8reg_name(Expr *e) { buf_printf(out, "r_%s", e->cname); }
 static void emit_bce_index(Expr *i);
 static int inl_ids;
 /* a generator compiled as a state machine (emit_gen_sm): its locals, parameters and self live in the frame */
@@ -2190,6 +2210,8 @@ static void emit_expr_raw(Expr *e) {
         cur_func = f;
         in_ctor = false;
         bool saved_vol = vol_locals;
+        int saved_rg = cur_rg;
+        cur_rg = 0; /* a closure runs when it runs: generic calls */
         vol_locals = stmt_has_try(f->body);
         buf_printf(out, "typedef struct { xs_closure base;");
         for (int i = 0; i < a->ncaptures; i++) {
@@ -2243,6 +2265,7 @@ static void emit_expr_raw(Expr *e) {
         escope = saved_scope;
         cur_func = saved_func;
         vol_locals = saved_vol;
+        cur_rg = saved_rg;
         indent = saved_indent;
         in_ctor = saved_ctor;
         used_ar = saved_ar;
@@ -2526,6 +2549,21 @@ static void emit_expr_raw(Expr *e) {
     case E_ASSIGN:
         if (e->lhs->kind == E_INDEX && e->lhs->builtin.cfn && strcmp(e->lhs->builtin.cfn, "xs_u8_get") == 0) { /* b[i] = v, b[i] += v: the low 8 bits */
             bool nc = bce_safe(e->lhs); /* within the bytes: no check */
+            U8Reg *rg = u8reg_find(e->lhs->lhs);
+            if (rg && e->op == TK_ASSIGN) { /* in a register (u8reg_loop): a lane blend, no byte store */
+                buf_puts(out, "({ int64_t vv_ = ");
+                emit_expr(e->rhs);
+                buf_puts(out, "; ");
+                emit_u8reg_name(e->lhs->lhs);
+                buf_puts(out, nc ? " = xs_v16_set_nc(" : " = xs_v16_set(");
+                emit_u8reg_name(e->lhs->lhs);
+                buf_puts(out, ", ");
+                if (nc) emit_bce_index(e->lhs->rhs); else emit_expr(e->lhs->rhs);
+                buf_puts(out, ", vv_");
+                if (!nc) { buf_printf(out, ", INT64_C(%lld)", (long long)rg->n); site_arg(e->pos); }
+                buf_puts(out, "); vv_; })");
+                return;
+            }
             if (e->op == TK_ASSIGN) {
                 buf_puts(out, nc ? "xs_u8_set_nc(" : "xs_u8_set(");
                 emit_borrowed(e->lhs->lhs);
@@ -2695,12 +2733,23 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, ")");
             return;
         }
-        buf_printf(out, "%s(", e->builtin.cfn ? e->builtin.cfn : e->func->cname);
+        buf_printf(out, "%s(", e->builtin.cfn ? e->builtin.cfn : rg_call_name(e->func));
         emit_args_borrowed(&e->args, false);
         buf_puts(out, ")");
         return;
     case E_INDEX:
         if (e->builtin.cfn) { /* m[i] on a RegExp match (the group's text, borrowed), b[i] on bytes */
+            U8Reg *rg = strcmp(e->builtin.cfn, "xs_u8_get") == 0 ? u8reg_find(e->lhs) : NULL;
+            if (rg) { /* the array is in a register for this loop (u8reg_loop) */
+                bool nc = bce_safe(e);
+                buf_puts(out, nc ? "xs_v16_get_nc(" : "xs_v16_get(");
+                emit_u8reg_name(e->lhs);
+                buf_puts(out, ", ");
+                if (nc) emit_bce_index(e->rhs); else emit_expr(e->rhs);
+                if (!nc) { buf_printf(out, ", INT64_C(%lld)", (long long)rg->n); site_arg(e->pos); }
+                buf_puts(out, ")");
+                return;
+            }
             if (strcmp(e->builtin.cfn, "xs_u8_get") == 0 && bce_safe(e)) { /* within the bytes: see bce_safe */
                 buf_puts(out, "((int64_t)*xs_u8_at_nc(");
                 emit_borrowed(e->lhs);
@@ -2735,6 +2784,7 @@ static void emit_expr_raw(Expr *e) {
             buf_printf(out, "%s(", e->builtin.cfn);
             emit_args_borrowed(&e->args, false);
         } else {
+            if (rg_inline_new(e)) return;
             buf_printf(out, "%s_new(", e->cls->cname);
             Func *ct = e->cls->ctor;
             for (int i = 0; i < e->args.len; i++) { /* a consumed parameter takes an owned reference: a new value moves in */
@@ -3022,6 +3072,110 @@ static const char *dbg_type(Type *t) {
 
 static int region_reset_pending; /* a region loop's body: rewinds the region before each iteration */
 static bool *region_dual;        /* per region: it has dual classes (xs_rg_on_N says where they are made) */
+/* ---- does the int local x hold a[lo] (lo a literal) right before statement `target`? ----
+   A forward walk of the function body: `x = a[lo]` syncs; any other write to x, a write to a's lane lo (a store
+   at an index that is not a literal other than lo, an idiom whose range reaches lo), or x captured by an arrow,
+   loses it. Branches meet (both must be synced), loops run twice (the body's end and its continues feed the head,
+   breaks feed the exit). Conservative: anything not understood is "not known". */
+static Expr *rot_a; static int64_t rot_lo; static const char *rot_x; static Stmt *rot_target; static int rot_found, rot_state_at;
+static int rot_expr(Expr *e, int st); /* the state after evaluating e */
+static int rot_stmt(Stmt *s, int st, int *brk, int *cont);
+static bool rot_idx_is_other_literal(Expr *i) { return i && i->kind == E_NUMBER && i->is_int_lit && i->ival != rot_lo; }
+static int rot_expr(Expr *e, int st) {
+    if (!e) return st;
+    if (e->kind == E_ARROW) return (e->arrow && e->arrow->fn && stmt_mentions_name(e->arrow->fn->body, rot_x)) ? 0 : st;
+    if ((e->kind == E_ASSIGN || e->kind == E_POSTFIX || e->kind == E_UNARY) && e->lhs) {
+        Expr *t = e->lhs;
+        if (t->kind == E_IDENT && t->cname && strcmp(t->cname, rot_x) == 0) { /* x = ... */
+            if (e->kind != E_ASSIGN || e->op != TK_ASSIGN) return 0;
+            st = rot_expr(e->rhs, st);
+            return u8_is_index_on(e->rhs, rot_a->cname) && e->rhs->rhs->kind == E_NUMBER && e->rhs->rhs->is_int_lit && e->rhs->rhs->ival == rot_lo ? 1 : 0;
+        }
+        if (u8_is_index_on(t, rot_a->cname)) { /* a[i] = ... */
+            st = rot_expr(t->rhs, st); st = rot_expr(e->rhs, st);
+            return rot_idx_is_other_literal(t->rhs) ? st : 0;
+        }
+    }
+    st = rot_expr(e->lhs, st); st = rot_expr(e->rhs, st);
+    for (int i = 0; i < e->args.len; i++) st = rot_expr(e->args.items[i], st);
+    return st;
+}
+static int rot_min(int a, int b) { return a < b ? a : b; }
+static int rot_loop(Stmt *s, int st) {
+    int head = st, exit = st;
+    for (int pass = 0; pass < 2; pass++) {
+        int brk = 1, cont = 1;
+        int h = head;
+        if (s->kind == S_FOR && pass == 0) h = rot_stmt(s->for_init, h, NULL, NULL);
+        h = rot_expr(s->cond, h);
+        if (s->kind == S_FOROF) h = rot_expr(s->expr, h);
+        int end = rot_stmt(s->body, h, &brk, &cont);
+        end = rot_expr(s->for_update, end);
+        head = rot_min(rot_min(st, end), cont);
+        exit = rot_min(rot_min(head, end), brk);
+    }
+    return exit;
+}
+static int rot_stmt(Stmt *s, int st, int *brk, int *cont) {
+    if (!s) return st;
+    if (s == rot_target) { rot_found = 1; rot_state_at = rot_min(rot_state_at, st); }
+    switch (s->kind) {
+    case S_VAR:
+        st = rot_expr(s->init, st);
+        if (s->cname && strcmp(s->cname, rot_x) == 0)
+            return s->init && u8_is_index_on(s->init, rot_a->cname) && s->init->rhs->kind == E_NUMBER && s->init->rhs->is_int_lit && s->init->rhs->ival == rot_lo ? 1 : 0;
+        return st;
+    case S_EXPR: return rot_expr(s->expr, st);
+    case S_IF: { int c = rot_expr(s->cond, st); return rot_min(rot_stmt(s->body, c, brk, cont), s->else_body ? rot_stmt(s->else_body, c, brk, cont) : c); }
+    case S_BLOCK: for (int i = 0; i < s->stmts.len; i++) st = rot_stmt(s->stmts.items[i], st, brk, cont); return st;
+    case S_FOR: case S_WHILE: case S_FOROF: {
+        U8Idiom m; /* an idiom's range reaching lo writes it; otherwise the loop is walked */
+        if (s->kind == S_FOR && match_u8_idiom(s, &m) && m.a && m.a->cname && strcmp(m.a->cname, rot_a->cname) == 0) {
+            if (m.kind == 3 || m.kind == 2) return (m.lo->kind == E_NUMBER && m.lo->ival > rot_lo) ? st : 0; /* [lo'..] */
+            return (m.lo->kind == E_NUMBER && m.lo->ival > rot_lo) ? st : 0;
+        }
+        return rot_loop(s, st);
+    }
+    case S_SWITCH: { int c = rot_expr(s->expr, st), r = c; for (int i = 0; i < s->ncases; i++) r = rot_min(r, rot_stmt(s->cases[i].body, c, brk, cont)); return r; }
+    case S_BREAK: if (brk) *brk = rot_min(*brk, st); return st;
+    case S_CONTINUE: if (cont) *cont = rot_min(*cont, st); return st;
+    case S_RETURN: case S_THROW: return rot_expr(s->expr, st);
+    case S_TRY: return 0;
+    default: return 0;
+    }
+}
+static bool u8_rot_ok(Stmt *target, Expr *a, Expr *lo, Expr *x) {
+    if (!cur_func || !cur_func->body || !x->cname || lo->kind != E_NUMBER || !lo->is_int_lit) return false;
+    rot_a = a; rot_lo = lo->ival; rot_x = x->cname; rot_target = target; rot_found = 0; rot_state_at = 1;
+    int brk = 1, cont = 1;
+    rot_stmt(cur_func->body, 0, &brk, &cont); /* x starts unknown */
+    return rot_found && rot_state_at == 1;
+}
+/* `for (j = lo; j <= K; j++) a[j] = a[j + 1]; a[K + 1] = v;` with a in a register (fannkuch-redux's next
+   permutation): one call, the shuffle and the lane (xs_v16_shl_put). b->stmts[*i] is the loop; on a match the
+   pair is emitted and *i skips the store. */
+static bool emit_u8_shl_put(Stmt *b, int *i) {
+    if (*i + 1 >= b->stmts.len || xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
+    Stmt *lp = b->stmts.items[*i], *st = b->stmts.items[*i + 1];
+    U8Idiom m;
+    if (lp->kind != S_FOR || !match_u8_idiom(lp, &m) || m.kind != 3 || lp->cond->op != TK_LE) return false;
+    U8Reg *rg = u8reg_find(m.a);
+    if (!rg) return false;
+    Expr *as = st->kind == S_EXPR ? st->expr : NULL;
+    if (!as || as->kind != E_ASSIGN || as->op != TK_ASSIGN || !u8_is_index_on(as->lhs, m.a->cname)) return false;
+    Expr *ix = as->lhs->rhs; /* K + 1 */
+    if (!ix || ix->kind != E_BINARY || ix->op != TK_PLUS || !same_simple(ix->lhs, m.hi) || !ix->rhs || ix->rhs->kind != E_NUMBER || ix->rhs->num != 1) return false;
+    if (!bce_pure(as->rhs) && as->rhs->kind != E_IDENT) return false;
+    int site = new_site(lp->pos);
+    nl();
+    emit_dbg_hook(lp);
+    /* x known to hold a[lo] here: the pair is a rotation, one shuffle (u8_rot_ok) */
+    const char *fn = as->rhs->kind == E_IDENT && m.lo->kind == E_NUMBER && u8_rot_ok(lp, m.a, m.lo, as->rhs) ? "xs_v16_rot" : "xs_v16_shl_put";
+    emit_u8reg_name(m.a); buf_printf(out, " = %s(", fn); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_puts(out, ", ");
+    emit_expr(as->rhs); buf_printf(out, ", INT64_C(%lld), XS_S(%d));", (long long)rg->n, site);
+    *i += 1;
+    return true;
+}
 static void emit_block_kind(Stmt *b, ScopeKind kind) {
     buf_puts(out, "{");
     indent++;
@@ -3034,6 +3188,7 @@ static void emit_block_kind(Stmt *b, ScopeKind kind) {
         region_reset_pending = 0;
     }
     for (int i = 0; i < b->stmts.len; i++) {
+        if (emit_u8_shl_put(b, &i)) continue;
         nl();
         emit_dbg_hook(b->stmts.items[i]);
         emit_stmt(b->stmts.items[i]);
@@ -3060,6 +3215,7 @@ static void emit_block(Stmt *b, bool func_root) {
     Class *after_super = func_root ? inits_after_super : NULL;
     if (func_root) inits_after_super = NULL;
     for (int i = 0; i < b->stmts.len; i++) {
+        if (!after_super && emit_u8_shl_put(b, &i)) continue;
         nl();
         emit_dbg_hook(b->stmts.items[i]);
         emit_stmt(b->stmts.items[i]);
@@ -3181,11 +3337,87 @@ static bool reuse_assign(Expr *e) {
     return true;
 }
 
+/* ---------- Float64Array locals in the frame ----------
+   `const v = new Float64Array(N)`, N a literal <= 16, in a function whose body only indexes v (v[i], v.length) or
+   passes it to user functions that, by the same rule, only index that parameter: v is a double[N] in the C
+   frame (xs_f64_on_frame) instead of an object on the heap, and the C compiler promotes it to registers (SROA)
+   once the loops unroll: n-body's advance with its 11 arrays local, M4 2,40 -> 1,23 s (= Rust). Anything else
+   (stored, returned, captured, iterated, a method called on it, a builtin receiving it) keeps the heap object.
+   XISTO_NO_F64_LOCAL=1 turns it off. */
+static bool f64_mentions_stmt(Stmt *s, const char *cname);
+static bool f64_mentions(Expr *e, const char *cname) {
+    if (!e) return false;
+    if (e->kind == E_IDENT) return e->cname && strcmp(e->cname, cname) == 0;
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn && f64_mentions_stmt(e->arrow->fn->body, cname)) return true;
+    if (f64_mentions(e->lhs, cname) || f64_mentions(e->rhs, cname)) return true;
+    for (int i = 0; i < e->args.len; i++) if (f64_mentions(e->args.items[i], cname)) return true;
+    return false;
+}
+static bool f64_mentions_stmt(Stmt *s, const char *cname) {
+    if (!s) return false;
+    if (f64_mentions(s->init, cname) || f64_mentions(s->expr, cname) || f64_mentions(s->cond, cname) || f64_mentions(s->for_update, cname)) return true;
+    if (f64_mentions_stmt(s->for_init, cname) || f64_mentions_stmt(s->body, cname) || f64_mentions_stmt(s->else_body, cname)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (f64_mentions_stmt(s->stmts.items[i], cname)) return true;
+    for (int i = 0; i < s->ncases; i++) if (f64_mentions_stmt(s->cases[i].body, cname)) return true;
+    return false;
+}
+static bool f64_plain_stmt(Stmt *s, const char *cname, int depth);
+static bool f64_plain_param(Func *f, int i, int depth) {
+    if (depth > 3 || !f || !f->body || i >= f->nparams || f->params[i].cell || !f->params[i].cname) return false;
+    return f64_plain_stmt(f->body, f->params[i].cname, depth);
+}
+static bool f64_is(Expr *e, const char *cname) { return e && e->kind == E_IDENT && e->cname && strcmp(e->cname, cname) == 0; }
+static bool f64_plain_expr(Expr *e, const char *cname, int depth) {
+    if (!e) return true;
+    if (e->kind == E_IDENT) return !f64_is(e, cname); /* a bare use: it escapes */
+    if (e->kind == E_INDEX && f64_is(e->lhs, cname)) return f64_plain_expr(e->rhs, cname, depth);
+    if (e->kind == E_MEMBER && !e->is_call && f64_is(e->lhs, cname) && e->str && strcmp(e->str, "length") == 0) return true;
+    if (e->kind == E_ARROW) { /* captured by a closure: the closure's copy would hold it past the frame */
+        if (!e->arrow) return false;
+        for (int i = 0; i < e->arrow->ncaptures; i++)
+            if (e->arrow->captures[i].outer_cname && strcmp(e->arrow->captures[i].outer_cname, cname) == 0) return false;
+        return !e->arrow->fn || !f64_mentions_stmt(e->arrow->fn->body, cname);
+    }
+    if (e->kind == E_CALL && e->func && e->func->body && !e->builtin.cfn) {
+        if (!f64_plain_expr(e->lhs, cname, depth)) return false;
+        for (int i = 0; i < e->args.len; i++) {
+            if (f64_is(e->args.items[i], cname)) { if (!f64_plain_param(e->func, i, depth + 1)) return false; }
+            else if (!f64_plain_expr(e->args.items[i], cname, depth)) return false;
+        }
+        return true;
+    }
+    if (!f64_plain_expr(e->lhs, cname, depth) || !f64_plain_expr(e->rhs, cname, depth)) return false;
+    for (int i = 0; i < e->args.len; i++) if (!f64_plain_expr(e->args.items[i], cname, depth)) return false;
+    return true;
+}
+static bool f64_plain_stmt(Stmt *s, const char *cname, int depth) {
+    if (!s) return true;
+    if (s->kind == S_FOROF && f64_mentions(s->expr, cname)) return false;
+    if (!f64_plain_expr(s->init, cname, depth) || !f64_plain_expr(s->expr, cname, depth) || !f64_plain_expr(s->cond, cname, depth) || !f64_plain_expr(s->for_update, cname, depth)) return false;
+    if (!f64_plain_stmt(s->for_init, cname, depth) || !f64_plain_stmt(s->body, cname, depth) || !f64_plain_stmt(s->else_body, cname, depth)) return false;
+    for (int i = 0; i < s->stmts.len; i++) if (!f64_plain_stmt(s->stmts.items[i], cname, depth)) return false;
+    for (int i = 0; i < s->ncases; i++) if (!f64_plain_stmt(s->cases[i].body, cname, depth)) return false;
+    return true;
+}
+static int64_t bce_fixed_of(Stmt *s);
+static int64_t f64_local_n(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || !cur_func || !cur_func->body || !is_f64_type(s->type) || getenv("XISTO_NO_F64_LOCAL")) return 0;
+    int64_t n = bce_fixed_of(s);
+    if (n <= 0 || n > 16) return 0;
+    return f64_plain_stmt(cur_func->body, s->cname, 0) ? n : 0;
+}
 static void emit_var(Stmt *s) {
     if (sm_mode) { /* a local of a state-machine generator: a field of the frame, assigned (emit_gen_sm checked it is primitive) */
         buf_printf(out, "%s = ", ren(s->cname));
         emit_expr(s->init);
         buf_puts(out, ";");
+        return;
+    }
+    int64_t fn_ = f64_local_n(s);
+    if (fn_ > 0) { /* a Float64Array in the frame: a double[N] the C compiler keeps in registers */
+        buf_printf(out, "double sd_%s[%lld] = {0}; xs_Float64Array so_%s; xs_Float64Array *%s = xs_f64_on_frame(&so_%s, sd_%s, %lld);",
+                   s->cname, (long long)fn_, s->cname, s->cname, s->cname, s->cname, (long long)fn_);
+        dbg_local(s->name, s->type, s->cname, s->is_const);
         return;
     }
     if (borrowable_init(s)) {
@@ -3582,6 +3814,8 @@ static int64_t bce_fixed_of(Stmt *s) {
     Expr *e = s->init;
     if (e->kind != E_NEW_OBJ || !e->builtin.cfn || (strcmp(e->builtin.cfn, "xs_u8_new") != 0 && strcmp(e->builtin.cfn, "xs_f64_new") != 0) || e->args.len != 1) return 0;
     Expr *n = e->args.items[0];
+    int64_t v;
+    if (n->kind == E_IDENT && n->cname && cig_find(n->cname, &v)) return v > 0 ? v : 0; /* new Float64Array(N), N a top-level const int */
     return n->kind == E_NUMBER && n->is_int_lit && n->ival > 0 ? n->ival : 0;
 }
 static void bce_fix_scan(Stmt *s) {
@@ -3985,8 +4219,11 @@ static void emit_for_(Stmt *s) {
     epush(false);
     if (s->for_init) {
         nl();
+        int saved_rg = cur_rg;
+        cur_rg = 0; /* (runs before the first iteration: the region flag is off) */
         if (s->for_init->kind == S_VAR) emit_var(s->for_init);
         else { emit_expr(s->for_init->expr); buf_puts(out, ";"); }
+        cur_rg = saved_rg;
         drain_if_needed();
     }
     nl();
@@ -4012,13 +4249,191 @@ static void emit_for_(Stmt *s) {
     return;
 }
 
+
+/* ---------- region versions (rg-hoist) ----------
+   A dual class (region.c: made inside its loop and outside it too) tests xs_rg_on_N at every `new`: a TLS load
+   and a branch per object, in binarytrees once per node inside bottomUpTree, where the flag cannot change. A
+   function whose dual allocations all belong to region N (directly or through what it calls) gets a second
+   version f_rN, compiled as if the flag were known true: its `new C` allocates from the region directly, and its
+   calls to such functions go to their _rN versions. The loop body of region N calls the _rN versions; everything
+   else keeps the generic ones. Only entered while an iteration of loop N runs, so the flag is true by
+   construction. XISTO_NO_RG_HOIST=1 disables (measuring knob). */
+static int cur_rg;        /* the dual region whose loop body (or _rN version) is being emitted, 0 otherwise */
+static bool rg_hoist_on;
+static Program *rg_prog;
+static int rg_combine(int a, int b) { return a == 0 ? b : b == 0 ? a : a == b ? a : -1; }
+static bool rg_user_call(Expr *e) { return e && e->kind == E_CALL && e->func && !e->builtin.cfn && e->func->body && !(e->lhs && e->lhs->type && e->lhs->type->kind == TY_FUNC && !e->func); }
+static void rg_scan_stmt(Stmt *s, int *acc, bool final);
+static void rg_scan_expr(Expr *e, int *acc, bool final) {
+    if (!e) return;
+    if (e->kind == E_NEW_OBJ && !e->cls->builtin && e->cls->rdual) *acc = rg_combine(*acc, e->cls->rdual);
+    if (rg_user_call(e)) *acc = rg_combine(*acc, final ? e->func->rg_hoist : e->func->rg_hoist);
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) rg_scan_stmt(e->arrow->fn->body, acc, final); /* (what a closure makes counts; it is never hoisted itself) */
+    rg_scan_expr(e->lhs, acc, final);
+    rg_scan_expr(e->rhs, acc, final);
+    for (int i = 0; i < e->args.len; i++) rg_scan_expr(e->args.items[i], acc, final);
+}
+static void rg_scan_stmt(Stmt *s, int *acc, bool final) {
+    if (!s) return;
+    rg_scan_expr(s->init, acc, final);
+    rg_scan_expr(s->expr, acc, final);
+    rg_scan_expr(s->cond, acc, final);
+    rg_scan_expr(s->for_update, acc, final);
+    rg_scan_stmt(s->for_init, acc, final);
+    rg_scan_stmt(s->body, acc, final);
+    rg_scan_stmt(s->else_body, acc, final);
+    for (int i = 0; i < s->stmts.len; i++) rg_scan_stmt(s->stmts.items[i], acc, final);
+    for (int i = 0; i < s->ncases; i++) { rg_scan_expr(s->cases[i].value, acc, final); rg_scan_stmt(s->cases[i].body, acc, final); }
+}
+static bool rg_candidate(Func *f) {
+    return f->body && !f->is_ctor && !f->is_async && !f->is_gen && !f->virt_target && !f->cls && f->ncalls >= 0 && !stmt_has_try(f->body) && f->used && !f->mod->builtin && !f->is_native;
+}
+/* marks f_rN as reached: f's own calls to region-N functions follow */
+static void rg_mark_stmt(Stmt *s, int N);
+static void rg_mark_expr(Expr *e, int N) {
+    if (!e) return;
+    if (rg_user_call(e) && e->func->rg_hoist == N && !e->func->rg_used) { e->func->rg_used = true; rg_mark_stmt(e->func->body, N); }
+    if (e->kind == E_ARROW) return; /* a closure runs when it runs: generic calls */
+    rg_mark_expr(e->lhs, N); rg_mark_expr(e->rhs, N);
+    for (int i = 0; i < e->args.len; i++) rg_mark_expr(e->args.items[i], N);
+}
+static void rg_mark_stmt(Stmt *s, int N) {
+    if (!s) return;
+    rg_mark_expr(s->init, N); rg_mark_expr(s->expr, N); rg_mark_expr(s->cond, N); rg_mark_expr(s->for_update, N);
+    rg_mark_stmt(s->for_init, N); rg_mark_stmt(s->body, N); rg_mark_stmt(s->else_body, N);
+    for (int i = 0; i < s->stmts.len; i++) rg_mark_stmt(s->stmts.items[i], N);
+    for (int i = 0; i < s->ncases; i++) { rg_mark_expr(s->cases[i].value, N); rg_mark_stmt(s->cases[i].body, N); }
+}
+/* finds the dual region loops and marks what their bodies reach */
+static void rg_loops_stmt(Stmt *s);
+static void rg_loops_expr(Expr *e) {
+    if (!e) return;
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) rg_loops_stmt(e->arrow->fn->body);
+    rg_loops_expr(e->lhs); rg_loops_expr(e->rhs);
+    for (int i = 0; i < e->args.len; i++) rg_loops_expr(e->args.items[i]);
+}
+static void rg_loops_stmt(Stmt *s) {
+    if (!s) return;
+    if ((s->kind == S_FOR || s->kind == S_WHILE || s->kind == S_FOROF) && s->region && region_dual[s->region]) { rg_mark_stmt(s->body, s->region); rg_mark_expr(s->cond, s->region); rg_mark_expr(s->for_update, s->region); }
+    rg_loops_expr(s->init); rg_loops_expr(s->expr); rg_loops_expr(s->cond); rg_loops_expr(s->for_update);
+    rg_loops_stmt(s->for_init); rg_loops_stmt(s->body); rg_loops_stmt(s->else_body);
+    for (int i = 0; i < s->stmts.len; i++) rg_loops_stmt(s->stmts.items[i]);
+    for (int i = 0; i < s->ncases; i++) { rg_loops_expr(s->cases[i].value); rg_loops_stmt(s->cases[i].body); }
+}
+static void rg_compute(Program *p) {
+    rg_prog = p;
+    rg_hoist_on = !xs_debug && !xs_profile && !sm_mode && region_count > 0 && !getenv("XISTO_NO_RG_HOIST");
+    for (int i = 0; i < p->nfuncs; i++) { p->funcs[i]->rg_hoist = 0; p->funcs[i]->rg_used = false; }
+    for (int i = 0; i < p->nclasses; i++) {
+        Class *c = p->classes[i];
+        if (c->ctor) { c->ctor->rg_hoist = -1; c->ctor->rg_used = false; }
+        for (int k = 0; k < c->nmethods; k++) { c->methods[k]->rg_hoist = -1; c->methods[k]->rg_used = false; }
+    }
+    if (!rg_hoist_on) return;
+    bool any = false;
+    for (int i = 0; i < p->nclasses; i++) any |= p->classes[i]->rdual != 0;
+    if (!any) { rg_hoist_on = false; return; }
+    for (int i = 0; i < p->nfuncs; i++) if (!rg_candidate(p->funcs[i])) p->funcs[i]->rg_hoist = -1;
+    for (bool changed = true; changed;) { /* fixpoint over the call graph: what each function makes, with what it calls */
+        changed = false;
+        for (int i = 0; i < p->nfuncs; i++) {
+            Func *f = p->funcs[i];
+            if (f->rg_hoist == -1) continue;
+            int acc = 0;
+            rg_scan_stmt(f->body, &acc, false);
+            if (acc != f->rg_hoist) { f->rg_hoist = acc; changed = true; }
+        }
+    }
+    for (int i = 0; i < p->nfuncs; i++) if (p->funcs[i]->used && !p->funcs[i]->mod->builtin && p->funcs[i]->body) rg_loops_stmt(p->funcs[i]->body);
+    for (int i = 0; i < p->nclasses; i++) {
+        Class *c = p->classes[i];
+        if (!c->used) continue;
+        if (c->ctor) rg_loops_stmt(c->ctor->body);
+        for (int k = 0; k < c->nmethods; k++) if (c->methods[k]->body) rg_loops_stmt(c->methods[k]->body);
+    }
+    for (int i = 0; i < p->top.len; i++) rg_loops_stmt(p->top.items[i]);
+}
+static char *rg_name(Func *f) { return xs_sprintf("%s_r%d", f->cname, f->rg_hoist); }
+/* the callee's name at this call: its region version inside region cur_rg's code, else its own */
+static const char *rg_call_name(Func *f) {
+    if (rg_hoist_on && cur_rg && f && f->rg_hoist == cur_rg && f->rg_used) return rg_name(f);
+    return f->cname;
+}
+/* `new C(args)` of a dual class of the region being emitted, with a small constructor (only `this.f = param`
+   stores, every field set, reference parameters handed over): the allocation from the region and the stores,
+   in place. Returns false when the generic C_new must be used. */
+static bool small_ctor(Func *f);
+static bool rg_inline_new(Expr *e) {
+    Class *c = e->cls;
+    if (!rg_hoist_on || !cur_rg || c->builtin || c->rdual != cur_rg || !c->ctor || !small_ctor(c->ctor) || c->stack_at) return false;
+    Func *ct = c->ctor;
+    for (int k = 0; k < c->nfields; k++) if (c->fields[k].init) return false;
+    mark_init_stores(c, ct);
+    if (!ctor_sets_every_field(c)) return false;
+    int src[8]; /* per field: the parameter index, or -1 */
+    for (int k = 0; k < c->nfields; k++) src[k] = -1;
+    for (int i = 0; i < ct->body->stmts.len; i++) {
+        Expr *a = ct->body->stmts.items[i]->expr;
+        int f = a->lhs->field;
+        if (f < 0 || f >= c->nfields || a->rhs->kind != E_IDENT) return false;
+        int pi = -1;
+        for (int j = 0; j < ct->nparams; j++) if (ct->params[j].cname && a->rhs->cname && strcmp(ct->params[j].cname, a->rhs->cname) == 0) pi = j;
+        if (pi < 0 || (cref(c->fields[f].type) && !ct->params[pi].consumed)) return false;
+        src[f] = pi;
+    }
+    for (int k = 0; k < c->nfields; k++) if (src[k] < 0) return false;
+    if (e->args.len != ct->nparams) return false;
+    buf_puts(out, "({ ");
+    for (int i = 0; i < e->args.len; i++) { /* the arguments first, in order, as the call would */
+        emit_decl(ct->params[i].type, xs_sprintf("ra%d_", i));
+        buf_puts(out, " = ");
+        if (ct->params[i].consumed) emit_owned(e->args.items[i]); else emit_borrowed(e->args.items[i]);
+        buf_puts(out, "; ");
+    }
+    buf_printf(out, "%s *ro_ = xs_region_alloc_dual_nz(&xs_rg_%d, sizeof(%s), &%s_type);", c->cname, c->rdual, c->cname, c->cname);
+    for (int k = 0; k < c->nfields; k++) buf_printf(out, " ro_->%s = ra%d_;", c->fields[k].cname, src[k]);
+    buf_puts(out, " ro_; })");
+    return true;
+}
+/* f's region version: the same body, emitted with cur_rg = N (into clone_fns, after the generic bodies) */
+static void emit_rg_clone(Func *f) {
+    Buf *saved_out = out;
+    EScope *saved_scope = escope;
+    Func *saved_func = cur_func;
+    int saved_indent = indent, saved_rg = cur_rg;
+    bool saved_ctor = in_ctor, saved_ar = used_ar, saved_vol = vol_locals;
+    Class *saved_class = cur_class;
+    Module *saved_mod = cur_mod;
+    Expr *saved_b = bracketing;
+    Buf b = {0};
+    out = &b;
+    indent = 0;
+    escope = NULL;
+    in_ctor = false;
+    bracketing = NULL;
+    cur_rg = f->rg_hoist;
+    char *cname = f->cname;
+    f->cname = rg_name(f);
+    buf_putc(out, '\n');
+    emit_signature(f);
+    f->cname = cname;
+    emit_func_body(f);
+    buf_puts(&clone_fns, b.data);
+    free(b.data);
+    out = saved_out; escope = saved_scope; cur_func = saved_func; indent = saved_indent; cur_rg = saved_rg;
+    in_ctor = saved_ctor; used_ar = saved_ar; vol_locals = saved_vol; cur_class = saved_class; cur_mod = saved_mod; bracketing = saved_b;
+}
+
 static void emit_stmt_(Stmt *s);
 static void emit_stmt(Stmt *s) {
     if ((s->kind == S_FOR || s->kind == S_WHILE || s->kind == S_FOROF) && s->region) { /* region.c: the iterations' objects go in one step */
         buf_printf(out, "xs_region_enter(&xs_rg_%d);", s->region);
         nl();
         region_reset_pending = s->region;
+        int saved_rg = cur_rg;
+        if (region_dual[s->region] && !sm_mode && !ictx) cur_rg = s->region; /* its body calls the region versions */
         emit_stmt_(s);
+        cur_rg = saved_rg;
         region_reset_pending = 0;
         nl();
         buf_printf(out, region_dual[s->region] ? "xs_rg_on_%d = false; xs_region_reset(&xs_rg_%d);" : "xs_region_reset(&xs_rg_%d);", s->region, s->region);
@@ -4036,6 +4451,7 @@ static bool same_simple(Expr *a, Expr *b) {
     if (a->kind == E_NUMBER) return a->num == b->num;
     if (a->kind == E_THIS) return true;
     if (a->kind == E_MEMBER && !a->is_call && !b->is_call) return a->field == b->field && a->field >= 0 && same_simple(a->lhs, b->lhs);
+    if (a->kind == E_BINARY) return a->op == b->op && same_simple(a->lhs, b->lhs) && same_simple(a->rhs, b->rhs);
     return false;
 }
 static Expr *single_expr_stmt(Stmt *b) {
@@ -4081,37 +4497,87 @@ static bool emit_map_add(Stmt *s) {
      for (let j = LO; j < HI; j++) dst[j] = src[j];                                              -> xs_u8_copy_range
    a, dst, src are names of Uint8Array; LO, S, HI pure (numbers, int names, their sums); the counter is not
    written in the body. XISTO_NO_U8_IDIOM=1 keeps the loops. */
+/* text a body wants at its function's entry (emit_func_body puts it after ar_mark); only while the function's
+   body goes to the same buffer */
+static Buf *fn_prelude_out;
+static size_t fn_prelude_pos;
+static Buf fn_prelude_text;
 static bool u8_name(Expr *e) { return e && e->kind == E_IDENT && e->cname && bce_bytes(e->type); }
+/* a + t or b - t, with a name a, the counter t */
+static Expr *u8_cursor(Expr *e, const char *t, bool plus) {
+    if (!e || e->kind != E_BINARY || e->op != (plus ? TK_PLUS : TK_MINUS)) return NULL;
+    if (!e->lhs || e->lhs->kind != E_IDENT || !e->lhs->cname || !e->lhs->type || e->lhs->type->kind != TY_INT) return NULL;
+    if (!e->rhs || e->rhs->kind != E_IDENT || !e->rhs->cname || strcmp(e->rhs->cname, t) != 0) return NULL;
+    return e->lhs;
+}
+static bool u8_at(Expr *e, Expr *arr, Expr *idx) { /* arr[idx] */
+    return e && e->kind == E_INDEX && e->builtin.cfn && strcmp(e->builtin.cfn, "xs_u8_get") == 0 && same_simple(e->lhs, arr) && same_simple(e->rhs, idx);
+}
+/* the trade of reverse-complement (kind 4): { const x = buf[a + t]; buf[a + t] = T[buf[b - t]]; buf[b - t] = T[x]; }
+   with T a Uint8Array the body does not write (a global or a parameter: its context is set up at the function's
+   entry), buf the same array on both sides, the cursors a and b names the body does not write */
+static bool match_u8_trade(Expr *c, const char *t, Stmt *b, U8Idiom *m) {
+    Stmt *d = b->stmts.items[0];
+    if (d->kind != S_VAR || !d->is_const || !d->cname || d->cell || !d->init) return false;
+    Expr *a1 = b->stmts.items[1]->kind == S_EXPR ? b->stmts.items[1]->expr : NULL, *a2 = b->stmts.items[2]->kind == S_EXPR ? b->stmts.items[2]->expr : NULL;
+    if (!a1 || !a2 || a1->kind != E_ASSIGN || a2->kind != E_ASSIGN || a1->op != TK_ASSIGN || a2->op != TK_ASSIGN) return false;
+    Expr *x = d->init;
+    if (!x || x->kind != E_INDEX || !x->builtin.cfn || strcmp(x->builtin.cfn, "xs_u8_get") != 0 || !u8_name(x->lhs)) return false;
+    Expr *buf = x->lhs, *ia = x->rhs, *a = u8_cursor(ia, t, true);
+    if (!a || !u8_at(a1->lhs, buf, ia)) return false;
+    Expr *r1 = a1->rhs;
+    if (!r1 || r1->kind != E_INDEX || !r1->builtin.cfn || strcmp(r1->builtin.cfn, "xs_u8_get") != 0 || !u8_name(r1->lhs)) return false;
+    Expr *T = r1->lhs, *inner = r1->rhs;
+    if (!inner || inner->kind != E_INDEX || !inner->builtin.cfn || strcmp(inner->builtin.cfn, "xs_u8_get") != 0 || !same_simple(inner->lhs, buf)) return false;
+    Expr *ib = inner->rhs, *bb = u8_cursor(ib, t, false);
+    if (!bb || strcmp(bb->cname, a->cname) == 0 || strcmp(T->cname, buf->cname) == 0 || !u8_at(a2->lhs, buf, ib)) return false;
+    Expr *r2 = a2->rhs;
+    if (!r2 || r2->kind != E_INDEX || !r2->builtin.cfn || strcmp(r2->builtin.cfn, "xs_u8_get") != 0 || !same_simple(r2->lhs, T)) return false;
+    if (!r2->rhs || r2->rhs->kind != E_IDENT || !r2->rhs->cname || strcmp(r2->rhs->cname, d->cname) != 0) return false;
+    if (!bce_pure(c->rhs) || stmt_writes_name(b, a->cname) || stmt_writes_name(b, bb->cname) || stmt_writes_name(b, buf->cname) || stmt_writes_name(b, T->cname)) return false;
+    m->kind = 4; m->a = buf; m->src = T; m->hi = c->rhs; m->ca = a; m->cb = bb;
+    return true;
+}
 static bool u8_index_of(Expr *e, Expr *arr, Expr *idx) { /* arr[idx] as the program wrote it */
     return e && e->kind == E_INDEX && e->builtin.cfn && strcmp(e->builtin.cfn, "xs_u8_get") == 0 && same_simple(e->lhs, arr) && same_simple(e->rhs, idx);
 }
 static bool is_sub_of(Expr *e, Expr *S, const char *i) { /* S - i */
     return e && e->kind == E_BINARY && e->op == TK_MINUS && same_simple(e->lhs, S) && e->rhs && e->rhs->kind == E_IDENT && e->rhs->cname && strcmp(e->rhs->cname, i) == 0;
 }
-static bool emit_u8_idiom(Stmt *s) {
-    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
+/* A local Uint8Array(N <= 16) a loop only indexes (get, set, the idioms below) lives in a vector register for
+   the loop (u8reg_setup): xs_v16_* in xisto_rt.h. One list for the nested scopes being emitted. */
+static bool match_u8_idiom(Stmt *s, U8Idiom *m) {
+    if (s->kind != S_FOR) return false;
     Stmt *fi = s->for_init;
     Expr *c = s->cond, *u = s->for_update;
     if (!fi || fi->kind != S_VAR || !fi->cname || !fi->init || fi->cell || !bce_pure(fi->init)) return false;
     if (!u || u->kind != E_POSTFIX || u->op != TK_PLUSPLUS || !u->lhs || u->lhs->kind != E_IDENT || !u->lhs->cname || strcmp(u->lhs->cname, fi->cname) != 0) return false;
-    if (!c || c->kind != E_BINARY || c->op != TK_LT || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, fi->cname) != 0) return false;
+    if (!c || c->kind != E_BINARY || (c->op != TK_LT && c->op != TK_LE) || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, fi->cname) != 0) return false;
     const char *i = fi->cname;
     Stmt *b = s->body;
     if (!b || b->kind != S_BLOCK) return false;
     if (stmt_writes_name(b, i) || writes_name(c->rhs, i)) return false;
     Expr iv = {0}; iv.kind = E_IDENT; iv.cname = (char *)i; /* the counter, as an index */
-    if (b->stmts.len == 1) { /* copy */
+    m->loop = s; m->lo = fi->init;
+    if (b->stmts.len == 1) { /* copy, or shift */
         Expr *as = b->stmts.items[0]->kind == S_EXPR ? b->stmts.items[0]->expr : NULL;
         if (!as || as->kind != E_ASSIGN || as->op != TK_ASSIGN || !bce_pure(c->rhs)) return false;
         Expr *dst = as->lhs, *src = as->rhs;
         if (!dst || dst->kind != E_INDEX || !dst->builtin.cfn || strcmp(dst->builtin.cfn, "xs_u8_get") != 0 || !u8_name(dst->lhs) || !same_simple(dst->rhs, &iv)) return false;
-        if (!src || src->kind != E_INDEX || !src->builtin.cfn || strcmp(src->builtin.cfn, "xs_u8_get") != 0 || !u8_name(src->lhs) || !same_simple(src->rhs, &iv)) return false;
-        if (strcmp(dst->lhs->cname, src->lhs->cname) == 0) return false;
-        buf_puts(out, "xs_u8_copy_range("); emit_borrowed(dst->lhs); buf_puts(out, ", "); emit_borrowed(src->lhs);
-        buf_puts(out, ", "); emit_expr(fi->init); buf_puts(out, ", "); emit_expr(c->rhs); buf_printf(out, ", XS_S(%d));", new_site(s->pos));
+        if (!src || src->kind != E_INDEX || !src->builtin.cfn || strcmp(src->builtin.cfn, "xs_u8_get") != 0 || !u8_name(src->lhs)) return false;
+        if (same_simple(src->rhs, &iv)) {
+            if (c->op != TK_LT || strcmp(dst->lhs->cname, src->lhs->cname) == 0) return false;
+            m->kind = 1; m->a = dst->lhs; m->src = src->lhs; m->hi = c->rhs;
+            return true;
+        }
+        /* a[j] = a[j + 1], j <= K (or j < K: the last j is K - 1) */
+        Expr *r = src->rhs;
+        if (strcmp(dst->lhs->cname, src->lhs->cname) != 0 || !r || r->kind != E_BINARY || r->op != TK_PLUS || !same_simple(r->lhs, &iv) || !r->rhs || r->rhs->kind != E_NUMBER || r->rhs->num != 1) return false;
+        m->kind = 3; m->a = dst->lhs; m->src = NULL; m->hi = c->rhs;
         return true;
     }
-    if (b->stmts.len != 3) return false;
+    if (b->stmts.len != 3 || c->op != TK_LT) return false;
+    if (match_u8_trade(c, i, b, m)) return true;
     /* reverse: cond is i < (S + 1) >> 1 */
     Expr *h = c->rhs;
     if (!h || h->kind != E_BINARY || h->op != TK_SHR || !h->rhs || h->rhs->kind != E_NUMBER || h->rhs->num != 1) return false;
@@ -4130,12 +4596,156 @@ static bool emit_u8_idiom(Stmt *s) {
     if (!a2->lhs || a2->lhs->kind != E_INDEX || !same_simple(a2->lhs->lhs, a) || !is_sub_of(a2->lhs->rhs, S, i)) return false;
     if (!a2->rhs || a2->rhs->kind != E_IDENT || !a2->rhs->cname || strcmp(a2->rhs->cname, t->cname) != 0) return false;
     if (stmt_writes_name(b, S->cname) || stmt_writes_name(b, a->cname)) return false;
-    buf_puts(out, "xs_u8_rev("); emit_borrowed(a); buf_puts(out, ", "); emit_expr(fi->init); buf_puts(out, ", (");
-    emit_expr(S); buf_puts(out, ") - ("); emit_expr(fi->init); buf_printf(out, "), XS_S(%d));", new_site(s->pos));
+    m->kind = 2; m->a = a; m->src = NULL; m->hi = S;
+    return true;
+}
+/* the loops `for (j = lo; j < hi; j++) dst[j] = src[j]`, the swap loop of a reversal, and `a[j] = a[j + 1]`
+   on byte arrays become one runtime call each (xs_u8_copy_range, xs_u8_rev, xs_u8_shl), or one shuffle when
+   the array is in a register. XISTO_NO_U8_IDIOM=1 keeps the loops. */
+static bool emit_u8_idiom(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
+    U8Idiom m;
+    if (!match_u8_idiom(s, &m)) return false;
+    if (m.kind == 4) { /* xs_u8_trade with the table's context set up once, at the function's entry */
+        if (getenv("XISTO_NO_U8_TRADE") || !fn_prelude_out || fn_prelude_out != out || !cur_func || u8reg_find(m.a) || u8reg_find(m.src)) return false;
+        bool param = false; /* T is in scope at the entry: a parameter, or a global (the function's locals are v_*) */
+        for (int k = 0; k < cur_func->nparams; k++) if (cur_func->params[k].cname && strcmp(cur_func->params[k].cname, m.src->cname) == 0) param = true;
+        if (!param && strncmp(m.src->cname, "g", 1) != 0) return false;
+        if (cur_func->body && stmt_writes_name(cur_func->body, m.src->cname)) return false;
+        int site = new_site(s->pos);
+        buf_printf(&fn_prelude_text, "\n    xs_u8_tr_ctx xs_trc%d_ = xs_u8_tr_setup(%s);", site, ren(m.src->cname));
+        buf_printf(out, "xs_u8_trade(&xs_trc%d_, ", site); emit_borrowed(m.a); buf_puts(out, ", (");
+        emit_expr(m.ca); buf_puts(out, ") + ("); emit_expr(m.lo); buf_puts(out, "), (");
+        emit_expr(m.cb); buf_puts(out, ") - ("); emit_expr(m.lo); buf_puts(out, "), (");
+        emit_expr(m.hi); buf_puts(out, ") - ("); emit_expr(m.lo); buf_printf(out, "), XS_S(%d));", site);
+        return true;
+    }
+    int site = new_site(s->pos);
+    U8Reg *ra = u8reg_find(m.a), *rs = m.kind == 1 ? u8reg_find(m.src) : NULL;
+    if (m.kind == 1) {
+        if (ra && rs) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_copy_rr("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_u8reg_name(m.src); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", INT64_C(%lld), INT64_C(%lld), XS_S(%d));", (long long)ra->n, (long long)rs->n, site); }
+        else if (ra) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_copy_in("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_borrowed(m.src); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", INT64_C(%lld), XS_S(%d));", (long long)ra->n, site); }
+        else if (rs) { buf_puts(out, "xs_v16_copy_out("); emit_borrowed(m.a); buf_puts(out, ", "); emit_u8reg_name(m.src); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", INT64_C(%lld), XS_S(%d));", (long long)rs->n, site); }
+        else { buf_puts(out, "xs_u8_copy_range("); emit_borrowed(m.a); buf_puts(out, ", "); emit_borrowed(m.src); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", XS_S(%d));", site); }
+        return true;
+    }
+    if (m.kind == 2) {
+        if (ra) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_rev("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_puts(out, ") - ("); emit_expr(m.lo); buf_printf(out, "), INT64_C(%lld), XS_S(%d));", (long long)ra->n, site); }
+        else { buf_puts(out, "xs_u8_rev("); emit_borrowed(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_puts(out, ") - ("); emit_expr(m.lo); buf_printf(out, "), XS_S(%d));", site); }
+        return true;
+    }
+    /* shift: the last j is K (<=) or K - 1 (<) */
+    const char *last = s->cond->op == TK_LE ? "" : " - INT64_C(1)";
+    if (ra) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_shl("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_printf(out, ")%s, INT64_C(%lld), XS_S(%d));", last, (long long)ra->n, site); }
+    else { buf_puts(out, "xs_u8_shl("); emit_borrowed(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_printf(out, ")%s, XS_S(%d));", last, site); }
+    return true;
+}
+/* ---- u8reg: which byte arrays a loop may keep in registers ----
+   Candidates: `const a = new Uint8Array(N)` (N literal <= 16) declared in the current function and, in the whole
+   function, only ever indexed (a[i] read, a[i] = v, the idioms above): never passed, stored, returned, measured
+   (.length), iterated, captured by an arrow. In the loop every use must be a read, a plain store or an idiom
+   (a[i]++ and a[i] += v stay memory forms: such a loop is not promoted). */
+static bool u8_use_ok(Expr *e, const char *c, bool in_loop);
+static bool stmt_mentions_name(Stmt *s, const char *c);
+static bool u8_stmt_ok(Stmt *s, const char *c, bool in_loop) {
+    if (!s) return true;
+    if (in_loop && s->kind == S_TRY) return false;
+    if (in_loop && s->kind == S_FOR && !getenv("XISTO_NO_U8_IDIOM")) {
+        U8Idiom m;
+        if (match_u8_idiom(s, &m) && m.kind != 4) return u8_use_ok(m.lo, c, in_loop) && u8_use_ok(m.hi, c, in_loop); /* the idiom's own uses are fine */
+    }
+    if (s->kind == S_VAR && s->cname && strcmp(s->cname, c) == 0) return !in_loop; /* its declaration (outside the loop) */
+    if (!u8_use_ok(s->init, c, in_loop) || !u8_use_ok(s->expr, c, in_loop) || !u8_use_ok(s->cond, c, in_loop) || !u8_use_ok(s->for_update, c, in_loop)) return false;
+    if (!u8_stmt_ok(s->for_init, c, in_loop) || !u8_stmt_ok(s->body, c, in_loop) || !u8_stmt_ok(s->else_body, c, in_loop)) return false;
+    for (int i = 0; i < s->stmts.len; i++) if (!u8_stmt_ok(s->stmts.items[i], c, in_loop)) return false;
+    for (int i = 0; i < s->ncases; i++) if (!u8_use_ok(s->cases[i].value, c, in_loop) || !u8_stmt_ok(s->cases[i].body, c, in_loop)) return false;
+    return true;
+}
+static bool u8_is_index_on(Expr *e, const char *c) {
+    return e && e->kind == E_INDEX && e->builtin.cfn && strcmp(e->builtin.cfn, "xs_u8_get") == 0 && e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname && strcmp(e->lhs->cname, c) == 0;
+}
+static bool u8_use_ok(Expr *e, const char *c, bool in_loop) {
+    if (!e) return true;
+    if (e->kind == E_IDENT) return !(e->cname && strcmp(e->cname, c) == 0); /* a bare use: it escapes */
+    if (e->kind == E_ARROW) return e->arrow && e->arrow->fn && u8_stmt_ok(e->arrow->fn->body, c, in_loop) && !stmt_mentions_name(e->arrow->fn->body, c);
+    if (u8_is_index_on(e, c)) return u8_use_ok(e->rhs, c, in_loop); /* a read */
+    if ((e->kind == E_ASSIGN || e->kind == E_POSTFIX || e->kind == E_UNARY) && u8_is_index_on(e->lhs, c)) {
+        if (in_loop && !(e->kind == E_ASSIGN && e->op == TK_ASSIGN)) return false; /* a[i]++, a[i] += v */
+        return u8_use_ok(e->lhs->rhs, c, in_loop) && u8_use_ok(e->rhs, c, in_loop);
+    }
+    if (!u8_use_ok(e->lhs, c, in_loop) || !u8_use_ok(e->rhs, c, in_loop)) return false;
+    for (int i = 0; i < e->args.len; i++) if (!u8_use_ok(e->args.items[i], c, in_loop)) return false;
+    return true;
+}
+static bool expr_mentions_name(Expr *e, const char *c) {
+    if (!e) return false;
+    if (e->kind == E_IDENT) return e->cname && strcmp(e->cname, c) == 0;
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn && stmt_mentions_name(e->arrow->fn->body, c)) return true;
+    if (expr_mentions_name(e->lhs, c) || expr_mentions_name(e->rhs, c)) return true;
+    for (int i = 0; i < e->args.len; i++) if (expr_mentions_name(e->args.items[i], c)) return true;
+    return false;
+}
+static bool stmt_mentions_name(Stmt *s, const char *c) {
+    if (!s) return false;
+    if (expr_mentions_name(s->init, c) || expr_mentions_name(s->expr, c) || expr_mentions_name(s->cond, c) || expr_mentions_name(s->for_update, c)) return true;
+    if (stmt_mentions_name(s->for_init, c) || stmt_mentions_name(s->body, c) || stmt_mentions_name(s->else_body, c)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (stmt_mentions_name(s->stmts.items[i], c)) return true;
+    for (int i = 0; i < s->ncases; i++) if (expr_mentions_name(s->cases[i].value, c) || stmt_mentions_name(s->cases[i].body, c)) return true;
+    return false;
+}
+/* the fixed byte arrays declared in the function body, as candidates */
+static void u8_candidates(Stmt *s, U8Reg *c, int *n) {
+    if (!s) return;
+    if (s->kind == S_VAR && *n < 8) {
+        int64_t len = bce_fixed_of(s);
+        if (len && len <= 16 && s->init->builtin.cfn && strcmp(s->init->builtin.cfn, "xs_u8_new") == 0) c[(*n)++] = (U8Reg){s->cname, len};
+    }
+    u8_candidates(s->for_init, c, n); u8_candidates(s->body, c, n); u8_candidates(s->else_body, c, n);
+    for (int i = 0; i < s->stmts.len; i++) u8_candidates(s->stmts.items[i], c, n);
+    for (int i = 0; i < s->ncases; i++) u8_candidates(s->cases[i].body, c, n);
+}
+/* The loop s: its registers are chosen, loaded before it, the loop is emitted (by emit_stmt_), the registers
+   stored after. Returns false when there is nothing to promote. XISTO_NO_U8_REG=1 turns it off. */
+static bool u8reg_loop(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || !cur_func || !cur_func->body || stmt_has_try(cur_func->body) || getenv("XISTO_NO_U8_REG") || getenv("XISTO_NO_U8_IDIOM")) return false;
+    if (s->kind != S_WHILE && s->kind != S_FOR) return false;
+    U8Idiom m;
+    if (s->kind == S_FOR && match_u8_idiom(s, &m)) return false; /* one shuffle already */
+    U8Reg cand[8]; int nc = 0;
+    u8_candidates(cur_func->body, cand, &nc);
+    U8Reg chosen[8]; int nch = 0;
+    for (int k = 0; k < nc && nu8regs + nch < 8; k++) {
+        Expr iv = {0}; iv.kind = E_IDENT; iv.cname = (char *)cand[k].cname;
+        if (u8reg_find(&iv)) continue; /* an outer loop holds it already */
+        if (!stmt_mentions_name(s, cand[k].cname)) continue; /* not used here */
+        if (!u8_stmt_ok(cur_func->body, cand[k].cname, false)) continue; /* escapes somewhere */
+        if (!u8_stmt_ok(s, cand[k].cname, true)) continue; /* a use the register cannot serve */
+        chosen[nch++] = cand[k];
+    }
+    if (!nch) return false;
+    int base = nu8regs;
+    buf_puts(out, "{");
+    indent++;
+    for (int k = 0; k < nch; k++) {
+        u8regs[nu8regs++] = chosen[k];
+        nl();
+        buf_printf(out, "xs_u8x16 r_%s = xs_v16_load(%s->data, INT64_C(%lld));", chosen[k].cname, ren(chosen[k].cname), (long long)chosen[k].n);
+    }
+    nl();
+    emit_stmt_(s);
+    for (int k = 0; k < nch; k++) {
+        nl();
+        buf_printf(out, "xs_v16_store(%s->data, r_%s, INT64_C(%lld));", ren(chosen[k].cname), chosen[k].cname, (long long)chosen[k].n);
+    }
+    nu8regs = base;
+    indent--;
+    nl();
+    buf_puts(out, "}");
     return true;
 }
 static void emit_stmt_(Stmt *s) {
     used_ar = false;
+    if ((s->kind == S_WHILE || s->kind == S_FOR) && u8reg_loop(s)) { drain_if_needed(); return; }
     switch (s->kind) {
     case S_VAR:
         emit_var(s);
@@ -4191,7 +4801,7 @@ static void emit_stmt_(Stmt *s) {
         indent++;
         nl();
         buf_puts(out, "xs_Error *thrown_ = ");
-        emit_owned(s->expr);
+        { int rg_ = cur_rg; cur_rg = 0; emit_owned(s->expr); cur_rg = rg_; } /* (evaluated once, before the iterations) */
         buf_puts(out, ";");
         for (EScope *sc = escope; sc; sc = sc->parent) {
             emit_releases(sc);
@@ -4283,7 +4893,7 @@ static void emit_stmt_(Stmt *s) {
             epush(false);
             nl();
             buf_printf(out, "%s *it_ = xs_retain(", at->cls->cname);
-            emit_borrowed(s->expr);
+            { int rg_ = cur_rg; cur_rg = 0; emit_borrowed(s->expr); cur_rg = rg_; } /* (evaluated once, before the iterations) */
             buf_puts(out, ");");
             etrack("it_", at);
             nl();
@@ -4333,7 +4943,7 @@ static void emit_stmt_(Stmt *s) {
             epush(false);
             nl();
             buf_puts(out, "xs_stream *st_ = xs_retain(");
-            emit_borrowed(s->expr);
+            { int rg_ = cur_rg; cur_rg = 0; emit_borrowed(s->expr); cur_rg = rg_; } /* (evaluated once, before the iterations) */
             buf_puts(out, ");");
             etrack("st_", at);
             nl();
@@ -4424,7 +5034,7 @@ static void emit_stmt_(Stmt *s) {
         epush(false);
         nl();
         buf_printf(out, "%s *it_ = xs_retain(", arr_struct(at));
-        emit_borrowed(s->expr);
+        { int rg_ = cur_rg; cur_rg = 0; emit_borrowed(s->expr); cur_rg = rg_; } /* (evaluated once, before the iterations) */
         buf_puts(out, ");");
         etrack("it_", at);
         nl();
@@ -4671,7 +5281,7 @@ static void emit_stmt_(Stmt *s) {
 /* ---------- declarations ---------- */
 
 static void emit_signature(Func *f) {
-    if (f->run_once && strcmp(fn_storage(f), "XS_FA") != 0) buf_puts(out, "XS_RUN_ONCE "); /* (always_inline wins) */
+    if (f->run_once && strcmp(fn_storage(f), "XS_FA") != 0 && strcmp(fn_storage(f), "XS_FII") != 0) buf_puts(out, "XS_RUN_ONCE "); /* (always_inline wins) */
     if (f->is_ctor) {
         buf_printf(out, "%s %s *%s(", fn_storage(f), f->cls->cname, f->cname);
     } else {
@@ -4835,18 +5445,123 @@ static void emit_gen(Func *f) {
     buf_printf(out, "\n    return xs_gen_stream(%s_body, a_, %s_args_free, %d, %s);\n}\n", n, n, val_kind(elem), strcmp(pe, "0") == 0 ? "NULL" : pe);
 }
 
+
+/* ---------- recursion on the right spine (spine) ----------
+   f(x) = `const a = x.p; ... if (<base>) return K; return c + f(A) + f(B);` with int results, K and c literals >= 0
+   and two recursive calls: the second call is the last thing the function does besides the add, so the
+   function can loop on B with an accumulator and recurse only on A. Every partial sum is a sum of node
+   contributions >= 0, hence <= the total: the checked adds overflow exactly when the nested form would, and the
+   nodes are visited in the same order (A's subtree whole, then B). Not for number (reassociation would change
+   the rounding). The LLVM does this itself for the Rust item_check; the checked add (jo) stops it here.
+   binarytrees: 2 calls + 2 returns per node become 1 + 1 (M4 serial 2,47 -> 1,72 s user). XISTO_NO_SPINE=1 disables. */
+static bool spine_leaves(Expr *e, Func *f, Expr **calls, int *ncalls, int64_t *c) {
+    if (!e) return false;
+    if (e->kind == E_BINARY && e->op == TK_PLUS && e->type && e->type->kind == TY_INT && !e->builtin.cfn)
+        return spine_leaves(e->lhs, f, calls, ncalls, c) && spine_leaves(e->rhs, f, calls, ncalls, c);
+    if (e->kind == E_NUMBER && e->is_int_lit && e->num >= 0 && e->num <= 1e9) { *c += (int64_t)e->num; return true; }
+    if (e->kind == E_CALL && e->func == f && !e->builtin.cfn && e->args.len == 1) {
+        if (*ncalls >= 2) return false;
+        calls[(*ncalls)++] = e;
+        return true;
+    }
+    return false;
+}
+static Stmt *spine_single(Stmt *b) {
+    if (!b) return NULL;
+    if (b->kind == S_BLOCK) return b->stmts.len == 1 ? spine_single(b->stmts.items[0]) : NULL;
+    return b;
+}
+static bool spine_pure(Expr *e) { /* the base test: reads of the parameter and its fields, comparisons, null */
+    if (!e) return true;
+    switch (e->kind) {
+    case E_IDENT: case E_NULL: case E_NUMBER: case E_THIS: return true;
+    case E_MEMBER: return !e->is_call && spine_pure(e->lhs);
+    case E_BINARY: case E_UNARY: return spine_pure(e->lhs) && spine_pure(e->rhs);
+    case E_AS: return e->op == TK_NOT && !e->elem_type && spine_pure(e->lhs);
+    default: return false;
+    }
+}
+typedef struct { int ndecls; Stmt *decls[8]; Stmt *base; Stmt *ret; Expr *calls[2]; int64_t c; int64_t k; } Spine;
+static bool spine_fn(Func *f, Spine *sp) {
+    if (xs_debug || xs_profile || getenv("XISTO_NO_SPINE")) return false;
+    if (!f->body || f->is_async || f->is_gen || f->cls || f->nparams != 1 || !f->ret || f->ret->kind != TY_INT) return false;
+    Type *pt = f->params[0].type;
+    if (!pt || pt->kind != TY_OBJECT || !pt->cls || pt->cls->builtin || f->params[0].cell) return false;
+    Stmt *b = f->body;
+    if (b->kind != S_BLOCK || b->stmts.len < 2 || b->stmts.len > 10) return false;
+    int i = 0;
+    sp->ndecls = 0;
+    while (i < b->stmts.len && b->stmts.items[i]->kind == S_VAR) {
+        Stmt *d = b->stmts.items[i];
+        if (!d->is_const || !borrowable_init(d) || sp->ndecls >= 8) return false;
+        sp->decls[sp->ndecls++] = d;
+        i++;
+    }
+    if (i + 2 != b->stmts.len) return false;
+    Stmt *s_if = b->stmts.items[i], *s_ret = b->stmts.items[i + 1];
+    if (s_if->kind != S_IF || s_if->else_body || !spine_pure(s_if->cond)) return false;
+    Stmt *base = spine_single(s_if->body);
+    if (!base || base->kind != S_RETURN || !base->expr || base->expr->kind != E_NUMBER || !base->expr->is_int_lit || base->expr->num < 0) return false;
+    if (s_ret->kind != S_RETURN || !s_ret->expr) return false;
+    int n = 0;
+    sp->c = 0;
+    if (!spine_leaves(s_ret->expr, f, sp->calls, &n, &sp->c) || n != 2) return false;
+    if (!spine_pure(sp->calls[0]->args.items[0]) || !spine_pure(sp->calls[1]->args.items[0])) return false;
+    sp->base = s_if; sp->ret = s_ret; sp->k = (int64_t)base->expr->num;
+    return true;
+}
+static void emit_spine(Func *f, Spine *sp) {
+    buf_puts(out, " { /* recursion on the right spine: a loop on the second call (see spine_fn) */");
+    indent++;
+    nl();
+    buf_puts(out, "size_t ar_mark = xs_ar_mark();");
+    nl();
+    buf_puts(out, "(void)ar_mark;");
+    nl();
+    buf_puts(out, "int64_t acc_ = INT64_C(0);");
+    nl();
+    buf_puts(out, "for (;;) {");
+    indent++;
+    epush(true);
+    for (int i = 0; i < sp->ndecls; i++) { nl(); emit_var(sp->decls[i]); }
+    nl();
+    buf_puts(out, "if (");
+    emit_expr(sp->base->cond);
+    if (sp->k) buf_printf(out, ") return xs_iadd_s(acc_, INT64_C(%lld), XS_S(%d));", (long long)sp->k, new_site(sp->ret->pos));
+    else buf_puts(out, ") return acc_;");
+    nl();
+    buf_puts(out, "acc_ = xs_iadd_s(acc_, ");
+    if (sp->c) buf_printf(out, "xs_iadd_s(INT64_C(%lld), ", (long long)sp->c);
+    emit_expr(sp->calls[0]);
+    if (sp->c) buf_printf(out, ", XS_S(%d))", new_site(sp->ret->pos));
+    buf_printf(out, ", XS_S(%d));", new_site(sp->ret->pos));
+    nl();
+    buf_printf(out, "%s = ", f->params[0].cname);
+    emit_borrowed(sp->calls[1]->args.items[0]);
+    buf_puts(out, ";");
+    epop();
+    indent--;
+    nl();
+    buf_puts(out, "}");
+    indent--;
+    nl();
+    buf_puts(out, "}\n");
+}
 static void emit_func_body(Func *f) {
     cur_func = f;
     if (f->mod) cur_mod = f->mod;
     if (f->body) rv_compute(f, &f->body, 1);
     if (f->is_gen) { emit_gen(f); cur_func = NULL; return; }
     vol_locals = stmt_has_try(f->body);
+    { Spine sp_; if (spine_fn(f, &sp_)) { emit_spine(f, &sp_); cur_func = NULL; return; } }
     buf_puts(out, " {");
     indent++;
     nl();
     buf_puts(out, "size_t ar_mark = xs_ar_mark();");
     nl();
     buf_puts(out, "(void)ar_mark;");
+    Buf *saved_pbuf = fn_prelude_out; size_t saved_ppos = fn_prelude_pos; Buf saved_ptext = fn_prelude_text;
+    fn_prelude_out = out; fn_prelude_pos = out->len; fn_prelude_text = (Buf){0};
     emit_prof_enter(f);
     emit_dbg_enter(f);
     dbg_params(f, false, NULL);
@@ -4857,6 +5572,14 @@ static void emit_func_body(Func *f) {
     indent--;
     nl();
     buf_puts(out, "}\n");
+    if (fn_prelude_text.len) { /* what the body asked to have at the entry (emit_u8_idiom: the table setup) */
+        size_t n = fn_prelude_text.len, pos = fn_prelude_pos;
+        buf_puts(out, fn_prelude_text.data); /* (room) */
+        memmove(out->data + pos + n, out->data + pos, out->len - n - pos);
+        memcpy(out->data + pos, fn_prelude_text.data, n);
+        free(fn_prelude_text.data);
+    }
+    fn_prelude_out = saved_pbuf; fn_prelude_pos = saved_ppos; fn_prelude_text = saved_ptext;
     cur_func = NULL;
 }
 
@@ -5666,6 +6389,7 @@ void emit_program(Program *p, Buf *o) {
     region_dual = xs_alloc(sizeof(bool) * (size_t)(region_count + 1));
     for (int i = 0; i < p->nclasses; i++) if (p->classes[i]->rdual) region_dual[p->classes[i]->rdual] = true;
     if (!xs_debug && !xs_profile) stack_compute(p, class_cyclic);
+    rg_compute(p);
     use_cln = (p->uses_net || program_has_try(p)) && !getenv("XISTO_NO_CLN"); /* XISTO_NO_CLN: measuring knob */
     find_consumed(p);
     find_run_once(p);
@@ -5760,6 +6484,13 @@ void emit_program(Program *p, Buf *o) {
         if (p->funcs[i]->mod->builtin || p->funcs[i]->is_native || !p->funcs[i]->used) continue;
         emit_signature(p->funcs[i]);
         buf_puts(out, ";\n");
+        if (rg_hoist_on && p->funcs[i]->rg_hoist > 0 && p->funcs[i]->rg_used) { /* its region version (rg-hoist) */
+            char *cname = p->funcs[i]->cname;
+            p->funcs[i]->cname = rg_name(p->funcs[i]);
+            emit_signature(p->funcs[i]);
+            p->funcs[i]->cname = cname;
+            buf_puts(out, ";\n");
+        }
     }
     /* class bodies, functions and main go to a separate buffer so JSON helpers they need can be placed first */
     Buf body = {0};
@@ -5783,6 +6514,7 @@ void emit_program(Program *p, Buf *o) {
         emit_signature(p->funcs[i]);
         emit_func_body(p->funcs[i]);
     }
+    if (rg_hoist_on) for (int i = 0; i < p->nfuncs; i++) if (p->funcs[i]->rg_hoist > 0 && p->funcs[i]->rg_used) emit_rg_clone(p->funcs[i]);
 
     vol_locals = false;
     for (int i = 0; i < p->top.len; i++) if (stmt_has_try(p->top.items[i])) vol_locals = true;
