@@ -50,6 +50,8 @@ function fannkuch(n: int, fact: int[], idxMin: int, idxMax: int): Result {
         for (let j = 1; j < n; j++) pp[j] = p[j];
         let p0 = first;
         while (true) {
+          const next = pp[p0]; // (the reversal below leaves pp[p0] as it is)
+          if (next === 0) break;
           flips++;
           const half = (p0 + 1) >> 1; // pp[1..p0-1] reversed: i and p0 - i trade places while i < p0 - i
           for (let i = 1; i < half; i++) {
@@ -57,10 +59,8 @@ function fannkuch(n: int, fact: int[], idxMin: int, idxMax: int): Result {
             pp[i] = pp[p0 - i];
             pp[p0 - i] = t;
           }
-          const t = pp[p0];
           pp[p0] = p0;
-          p0 = t;
-          if (pp[p0] === 0) break;
+          p0 = next;
         }
       }
       if (maxFlips < flips) maxFlips = flips;

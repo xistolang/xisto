@@ -396,6 +396,7 @@ static ICtx *ictx;
 typedef struct { bool ok; int64_t lo, hi; } Rng; /* integer ranges (see rng_of) */
 static Rng rng_of(Expr *e);
 static bool bce_safe(Expr *e); /* an index the loop already checks (see bce_enter) */
+static void emit_bce_index(Expr *i);
 static int inl_ids;
 /* a generator compiled as a state machine (emit_gen_sm): its locals, parameters and self live in the frame */
 static const char *tmpl_into; /* the next short template's buffer (a string on the stack, stackalloc.c) */
@@ -839,6 +840,17 @@ static void emit_borrowed(Expr *e);
 static void emit_expr(Expr *e);
 /* an operand of a bitwise operator as uint32_t (ToInt32, then its bits) */
 static void emit_u32(Expr *e) {
+    if (e->kind == E_BINARY && (e->op == TK_PLUS || e->op == TK_MINUS) && e->type->kind == TY_INT && !xs_debug &&
+        (e->lhs->type->kind == TY_INT || e->lhs->type->kind == TY_LITINT) && (e->rhs->type->kind == TY_INT || e->rhs->type->kind == TY_LITINT)) {
+        /* (a + b) >> 1, (h - k) & m: only the low 32 bits are kept, and those of the exact sum are those of the
+           sum mod 2^32, so no overflow check (the check stays wherever the whole sum is used) */
+        buf_puts(out, "((uint32_t)(");
+        emit_u32(e->lhs);
+        buf_puts(out, e->op == TK_PLUS ? " + " : " - ");
+        emit_u32(e->rhs);
+        buf_puts(out, "))");
+        return;
+    }
     if (e->type->kind == TY_NUMBER) { buf_puts(out, "(uint32_t)xs_toi32("); emit_expr(e); buf_puts(out, ")"); }
     else { buf_puts(out, "(uint32_t)("); emit_expr(e); buf_puts(out, ")"); }
 }
@@ -978,14 +990,7 @@ static void emit_lvalue_ptr(Expr *e) {
             buf_printf(out, arr_is_ref(e->lhs->type) ? "((%s*)&(" : "(&(", ctype(e->type));
             emit_borrowed(e->lhs);
             buf_puts(out, ")->data[");
-            if (e->rhs->kind == E_BINARY && (e->rhs->op == TK_PLUS || e->rhs->op == TK_MINUS)) {
-                /* an affine index the guard proved within the array: it cannot overflow, no check */
-                buf_puts(out, "(");
-                emit_expr(e->rhs->lhs);
-                buf_puts(out, e->rhs->op == TK_PLUS ? ") + (" : ") - (");
-                emit_expr(e->rhs->rhs);
-                buf_puts(out, ")");
-            } else emit_expr(e->rhs);
+            emit_bce_index(e->rhs);
             buf_puts(out, "])");
             return;
         }
@@ -1992,6 +1997,34 @@ static bool needs_brackets(Expr *e) {
 }
 static void emit_expr_raw(Expr *e);
 static void emit_expr_(Expr *e);
+/* a boolean that is cheap to compute and cannot fail or have an effect: comparisons, !, && and || of
+   primitive names, literals and floating-point + - * (integer arithmetic is checked, so it is left out);
+   *budget bounds the work evaluated without the short circuit */
+static bool flat_prim(Type *t) { return t && (t->kind == TY_NUMBER || t->kind == TY_INT || t->kind == TY_BOOLEAN); }
+static bool flat_val(Expr *e, int *budget) {
+    if (!e || !e->type || --*budget < 0) return false;
+    switch (e->kind) {
+    case E_NUMBER: case E_BOOL: return true;
+    case E_IDENT: return flat_prim(e->type) && !e->builtin.cfn;
+    case E_UNARY:
+        if (e->op == TK_NOT && !e->elem_type) return e->type->kind == TY_BOOLEAN && flat_val(e->lhs, budget);
+        if (e->op == TK_MINUS) return e->type->kind == TY_NUMBER && flat_val(e->lhs, budget);
+        return false;
+    case E_BINARY:
+        if (e->builtin.cfn || !flat_prim(e->lhs->type) || !flat_prim(e->rhs->type)) return false;
+        switch (e->op) {
+        case TK_LT: case TK_LE: case TK_GT: case TK_GE: case TK_EQ: case TK_NEQ: break;
+        case TK_AND: case TK_OR: if (e->type->kind != TY_BOOLEAN || e->lhs->type->kind != TY_BOOLEAN || e->rhs->type->kind != TY_BOOLEAN) return false; break;
+        case TK_PLUS: case TK_MINUS: case TK_STAR:
+            if (e->type->kind != TY_NUMBER || e->lhs->type->kind != TY_NUMBER || e->rhs->type->kind != TY_NUMBER) return false;
+            break;
+        default: return false;
+        }
+        return flat_val(e->lhs, budget) && flat_val(e->rhs, budget);
+    default: return false;
+    }
+}
+static bool flat_bool(Expr *e, int *budget) { return e && e->type && e->type->kind == TY_BOOLEAN && flat_val(e, budget); }
 /* arrays and maps of cyclic values, where they are made: their visit lets the collector see through them */
 static void emit_expr(Expr *e) {
     if (e->type && cyc_prog && (e->type->kind == TY_ARRAY || e->type->kind == TY_MAP) &&
@@ -2319,6 +2352,19 @@ static void emit_expr_raw(Expr *e) {
         return;
     case E_BINARY:
         if (tk_bitop(e->op)) { emit_bitop(e->op, e->lhs, e->rhs); return; }
+        if ((e->op == TK_AND || e->op == TK_OR) && e->type->kind == TY_BOOLEAN && !xs_debug) {
+            int budget = 64;
+            if (flat_bool(e->lhs, &budget) && flat_bool(e->rhs, &budget)) {
+                /* both sides cheap and unable to fail: evaluated both, as & or |, so that a chain of
+                   comparisons is one value the C compiler can vectorize (mandelbrot's "all eight escaped") */
+                buf_puts(out, "(");
+                emit_expr(e->lhs);
+                buf_puts(out, e->op == TK_AND ? " & " : " | ");
+                emit_expr(e->rhs);
+                buf_puts(out, ")");
+                return;
+            }
+        }
         if (e->op == TK_STARSTAR) {
             buf_puts(out, e->type->kind == TY_INT ? "xs_ipow_s(" : "pow(");
             emit_expr(e->lhs);
@@ -2456,22 +2502,22 @@ static void emit_expr_raw(Expr *e) {
         return;
     case E_ASSIGN:
         if (e->lhs->kind == E_INDEX && e->lhs->builtin.cfn && strcmp(e->lhs->builtin.cfn, "xs_u8_get") == 0) { /* b[i] = v, b[i] += v: the low 8 bits */
+            bool nc = bce_safe(e->lhs); /* within the bytes: no check */
             if (e->op == TK_ASSIGN) {
-                buf_puts(out, "xs_u8_set(");
+                buf_puts(out, nc ? "xs_u8_set_nc(" : "xs_u8_set(");
                 emit_borrowed(e->lhs->lhs);
                 buf_puts(out, ", ");
-                emit_expr(e->lhs->rhs);
+                if (nc) emit_bce_index(e->lhs->rhs); else emit_expr(e->lhs->rhs);
                 buf_puts(out, ", ");
                 emit_expr(e->rhs);
-                site_arg(e->pos);
+                if (!nc) site_arg(e->pos);
                 buf_puts(out, ")");
                 return;
             }
-            buf_puts(out, "({ xs_byte *bp_ = xs_u8_ptr(");
+            buf_puts(out, nc ? "({ xs_byte *bp_ = xs_u8_at_nc(" : "({ xs_byte *bp_ = xs_u8_ptr(");
             emit_borrowed(e->lhs->lhs);
             buf_puts(out, ", ");
-            emit_expr(e->lhs->rhs);
-            site_arg(e->pos);
+            if (nc) emit_bce_index(e->lhs->rhs); else { emit_expr(e->lhs->rhs); site_arg(e->pos); }
             if (tk_bitop_of_assign(e->op)) { /* b[i] ^= k */
                 Expr cur = {0};
                 cur.kind = E_IDENT; cur.type = ty_int; cur.cname = "(int64_t)*bp_";
@@ -2557,11 +2603,11 @@ static void emit_expr_raw(Expr *e) {
         return;
     case E_POSTFIX:
         if (e->lhs->kind == E_INDEX && e->lhs->builtin.cfn && strcmp(e->lhs->builtin.cfn, "xs_u8_get") == 0) { /* b[i]++ */
-            buf_puts(out, "({ xs_byte *bp_ = xs_u8_ptr(");
+            bool nc = bce_safe(e->lhs); /* within the bytes: no check */
+            buf_puts(out, nc ? "({ xs_byte *bp_ = xs_u8_at_nc(" : "({ xs_byte *bp_ = xs_u8_ptr(");
             emit_borrowed(e->lhs->lhs);
             buf_puts(out, ", ");
-            emit_expr(e->lhs->rhs);
-            site_arg(e->pos);
+            if (nc) emit_bce_index(e->lhs->rhs); else { emit_expr(e->lhs->rhs); site_arg(e->pos); }
             buf_printf(out, "); int64_t bv_ = *bp_; *bp_ = (xs_byte)(bv_ %s 1); bv_; })", e->op == TK_PLUSPLUS ? "+" : "-");
             return;
         }
@@ -2632,6 +2678,14 @@ static void emit_expr_raw(Expr *e) {
         return;
     case E_INDEX:
         if (e->builtin.cfn) { /* m[i] on a RegExp match (the group's text, borrowed), b[i] on bytes */
+            if (strcmp(e->builtin.cfn, "xs_u8_get") == 0 && bce_safe(e)) { /* within the bytes: see bce_safe */
+                buf_puts(out, "((int64_t)*xs_u8_at_nc(");
+                emit_borrowed(e->lhs);
+                buf_puts(out, ", ");
+                emit_bce_index(e->rhs);
+                buf_puts(out, "))");
+                return;
+            }
             buf_printf(out, "%s(", e->builtin.cfn);
             emit_borrowed(e->lhs);
             buf_puts(out, ", ");
@@ -3459,12 +3513,46 @@ static void rv_scan_stmt(Stmt *s, bool decls) {
     for (int i = 0; i < s->stmts.len; i++) rv_scan_stmt(s->stmts.items[i], decls);
     for (int i = 0; i < s->ncases; i++) { rv_scan_expr(s->cases[i].value); rv_scan_stmt(s->cases[i].body, decls); }
 }
+/* `const t = new Uint8Array(256)`: bytes whose length is known (a Uint8Array's length never changes, and a
+   const is never assigned again), so t[x] needs no check when x's range is within it (bce_safe): the
+   function's own (bce_fix_l, for bce_fix_owner) and the globals' (bce_fix_g, every function sees them); bce_fixed_n */
+typedef struct { const char *name; int64_t n; } BceFix;
+static BceFix bce_fix_l[32], bce_fix_g[32];
+static int nbce_fix_l, nbce_fix_g;
+static Func *bce_fix_owner;
+static int64_t bce_fixed_of(Stmt *s) {
+    if (s->kind != S_VAR || !s->is_const || !s->cname || s->cell || !s->init) return 0;
+    Expr *e = s->init;
+    if (e->kind != E_NEW_OBJ || !e->builtin.cfn || strcmp(e->builtin.cfn, "xs_u8_new") != 0 || e->args.len != 1) return 0;
+    Expr *n = e->args.items[0];
+    return n->kind == E_NUMBER && n->is_int_lit && n->ival > 0 ? n->ival : 0;
+}
+static void bce_fix_scan(Stmt *s) {
+    if (!s) return;
+    int64_t n = bce_fixed_of(s);
+    if (n && nbce_fix_l < 32) bce_fix_l[nbce_fix_l++] = (BceFix){s->cname, n};
+    bce_fix_scan(s->for_init);
+    bce_fix_scan(s->body);
+    bce_fix_scan(s->else_body);
+    for (int i = 0; i < s->stmts.len; i++) bce_fix_scan(s->stmts.items[i]);
+    for (int i = 0; i < s->ncases; i++) bce_fix_scan(s->cases[i].body);
+}
+static int64_t bce_fixed_n(const char *c) {
+    if (xs_debug || getenv("XISTO_NO_BCE")) return 0;
+    if (bce_fix_owner == cur_func && rv_owner == cur_func)
+        for (int i = 0; i < nbce_fix_l; i++) if (strcmp(bce_fix_l[i].name, c) == 0) return bce_fix_l[i].n;
+    for (int i = 0; i < nbce_fix_g; i++) if (strcmp(bce_fix_g[i].name, c) == 0) return bce_fix_g[i].n;
+    return 0;
+}
 /* top-level code (main): only its own locals; a top-level variable functions also use is not one of them */
 static bool rv_main_only(const char *c);
 static void rv_compute(Func *owner, Stmt **stmts, int n) {
     rv_n = rv_ndefs = 0;
     rv_owner = owner;
     rv_valid = false;
+    nbce_fix_l = 0;
+    bce_fix_owner = owner;
+    for (int i = 0; i < n; i++) bce_fix_scan(stmts[i]);
     if (xs_debug || getenv("XISTO_NO_RANGES")) return;
     for (int i = 0; i < n; i++) rv_scan_stmt(stmts[i], true);
     if (!owner) { int k = 0; for (int i = 0; i < rv_n; i++) if (rv_main_only(rv_name[i])) { rv_name[k] = rv_name[i]; rv_rng[k++] = rv_rng[i]; } rv_n = k; }
@@ -3509,10 +3597,12 @@ typedef struct { const char *i, *a; bool guarded; Expr *idx; } BceLoop; /* guard
    idx: that exact index expression (a[i + E], a[E - i]) is within a */
 static BceLoop bce_loops[16];
 static int nbce;
-/* a is a Float64Array in a local of its own: its length never changes, and nothing but an assignment to a in
-   the body can make a name another array, so calls and other uses of a do not matter (bce_ok). (Calls are
-   allowed only when the names the guard reads are plain locals too, which code called cannot change.) */
+/* a is a Float64Array or a Uint8Array in a local of its own: its length never changes, and nothing but an
+   assignment to a in the body can make a name another array, so calls and other uses of a do not matter
+   (bce_ok). (Calls are allowed only when the names the guard reads are plain locals too, which code called
+   cannot change.) */
 static bool bce_fixed_len;
+static bool bce_bytes(Type *t) { return t && t->kind == TY_OBJECT && t->cls && t->cls->builtin && t->cls->cname && strcmp(t->cls->cname, "xs_Uint8Array") == 0; }
 static bool bce_body_ok(Expr *e, Expr *parent, const char *a);
 static bool bce_stmt_ok(Stmt *s, const char *a) {
     if (!s) return true;
@@ -3553,11 +3643,12 @@ static bool bce_body_ok(Expr *e, Expr *parent, const char *a) {
     for (int i = 0; i < e->args.len; i++) if (!bce_body_ok(e->args.items[i], e, a)) return false;
     return true;
 }
-/* the indexable types the checks are dropped for: arrays, and Float64Array (the same ->len and ->data) */
-static bool bce_indexable(Type *t) { return t && (t->kind == TY_ARRAY || is_f64_type(t)); }
+/* the indexable types the checks are dropped for: arrays, Float64Array (the same ->len and ->data) and
+   Uint8Array (bytes: ->f_length, xs_u8_at_nc) */
+static bool bce_indexable(Type *t) { return t && (t->kind == TY_ARRAY || is_f64_type(t) || bce_bytes(t)); }
 static bool bce_plain_local(const char *cname) { return cname && strncmp(cname, "v_", 2) == 0; } /* (not a global, nor a cell) */
 static bool bce_ok(Stmt *body, const char *a, Type *t, bool calls_ok) {
-    bce_fixed_len = calls_ok && is_f64_type(t) && bce_plain_local(a);
+    bce_fixed_len = calls_ok && (is_f64_type(t) || bce_bytes(t)) && bce_plain_local(a);
     bool ok = bce_stmt_ok(body, a);
     bce_fixed_len = false;
     return ok;
@@ -3595,8 +3686,19 @@ static bool bce_writes(Stmt *s, const char *n) {
     for (int i = 0; i < s->ncases; i++) if (bce_writes(s->cases[i].body, n)) return true;
     return false;
 }
+/* the length of an array, a Float64Array or bytes (a Uint8Array: its length never changes), as C */
+static Type *bce_arr_t[8]; /* bce_version_guard: the types of the arrays in arrs */
+static const char *bce_len_c(const char *a, Type *t) { return xs_sprintf(bce_bytes(t) ? "(%s)->f_length" : "(int64_t)(%s)->len", ren(a)); }
+/* the same pure expression (bce_pure: names, numbers, + and -) */
+static bool bce_same(Expr *a, Expr *b) {
+    if (!a || !b || a->kind != b->kind) return false;
+    if (a->kind == E_NUMBER) return a->is_int_lit && b->is_int_lit && a->ival == b->ival;
+    if (a->kind == E_IDENT) return a->cname && b->cname && strcmp(a->cname, b->cname) == 0;
+    if (a->kind == E_BINARY) return a->op == b->op && bce_same(a->lhs, b->lhs) && bce_same(a->rhs, b->rhs);
+    return false;
+}
 /* a[i + E], a[E + i], a[i - E], a[E - i] with E pure and not written in the loop (bce_version_guard) */
-typedef struct { const char *a; Expr *idx, *E; int sign; Type *t; } BceAff; /* index = sign * i + E (sign -1 or 1) */
+typedef struct { const char *a; Expr *idx, *E; int sign; Type *t; } BceAff; /* index = sign * i + E (sign -1 or 1, 2: i - E) */
 static BceAff bce_aff[16];
 static int nbce_aff;
 static bool bce_pure(Expr *e);
@@ -3676,7 +3778,8 @@ static char *bce_version_guard(Stmt *s, const char **arrs, int *na) {
     int nc = 0;
     bce_arrays(s->body, i, cand, ct, &nc);
     bool plain = lim->kind == E_NUMBER || bce_plain_local(lim->cname);
-    for (int k = 0; k < nc; k++) if (bce_ok(s->body, cand[k], ct[k], plain) && strcmp(cand[k], i) != 0) arrs[(*na)++] = cand[k];
+    for (int k = 0; k < nc; k++)
+        if (bce_ok(s->body, cand[k], ct[k], plain) && strcmp(cand[k], i) != 0) { bce_arr_t[*na] = ct[k]; arrs[(*na)++] = cand[k]; }
     nbce_aff = 0;
     bce_cur_body = s->body;
     bce_affine(s->body, i);
@@ -3695,20 +3798,28 @@ static char *bce_version_guard(Stmt *s, const char **arrs, int *na) {
     /* i runs over [st, last]: last = LIM - 1 (i < LIM) or LIM (i <= LIM); the loop runs only when st <= last */
     char *last = le ? xs_sprintf("(%s)", l) : xs_sprintf("((%s) - 1)", l);
     buf_printf(&g, "(%s) >= 0", st);
-    for (int k = 0; k < *na; k++) buf_printf(&g, " && %s < (int64_t)(%s)->len", last, ren(arrs[k]));
+    for (int k = 0; k < *na; k++) buf_printf(&g, " && %s < %s", last, bce_len_c(arrs[k], bce_arr_t[k]));
     for (int k = 0; k < nbce_aff; k++) {
+        bool dup = false; /* a[p0 - i] read and written: the same clause once */
+        for (int j = 0; j < k && !dup; j++) dup = strcmp(bce_aff[j].a, bce_aff[k].a) == 0 && bce_aff[j].sign == bce_aff[k].sign && bce_same(bce_aff[j].E, bce_aff[k].E);
+        if (dup) continue;
         bool ar3 = false;
         char *E = emit_expr_to_str(bce_aff[k].E, &ar3);
-        const char *A = ren(bce_aff[k].a);
-        if (bce_aff[k].sign == 1) buf_printf(&g, " && (%s) + (%s) >= 0 && %s + (%s) < (int64_t)(%s)->len", st, E, last, E, A);        /* i + E */
-        else if (bce_aff[k].sign == 2) buf_printf(&g, " && (%s) - (%s) >= 0 && %s - (%s) < (int64_t)(%s)->len", st, E, last, E, A); /* i - E */
-        else buf_printf(&g, " && (%s) - %s >= 0 && (%s) - (%s) < (int64_t)(%s)->len", E, last, E, st, A);                         /* E - i */
+        const char *A = bce_len_c(bce_aff[k].a, bce_aff[k].t);
+        if (bce_aff[k].sign == 1) buf_printf(&g, " && (%s) + (%s) >= 0 && %s + (%s) < %s", st, E, last, E, A);        /* i + E */
+        else if (bce_aff[k].sign == 2) buf_printf(&g, " && (%s) - (%s) >= 0 && %s - (%s) < %s", st, E, last, E, A); /* i - E */
+        else buf_printf(&g, " && (%s) - %s >= 0 && (%s) - (%s) < %s", E, last, E, st, A);                         /* E - i */
     }
     return g.data;
 }
 /* a[i] that needs no check: the index and the array of an enclosing safe counted loop, i >= 0 */
 static bool bce_safe(Expr *e) {
     if (!e || e->kind != E_INDEX || !e->lhs || e->lhs->kind != E_IDENT || !e->rhs || ictx) return false;
+    if (e->lhs->cname && bce_bytes(e->lhs->type)) { /* bytes of a known length, an index whose range is within it */
+        int64_t n = bce_fixed_n(e->lhs->cname);
+        Rng r = n > 0 ? rng_of(e->rhs) : rng_none();
+        if (r.ok && r.lo >= 0 && r.hi < n) return true;
+    }
     for (int k = nbce - 1; k >= 0; k--) /* an affine index a versioned loop's guard proved within the array */
         if (bce_loops[k].idx == e->rhs && strcmp(bce_loops[k].a, e->lhs->cname) == 0) return true;
     if (e->rhs->kind != E_IDENT) return false;
@@ -3719,6 +3830,18 @@ static bool bce_safe(Expr *e) {
             return r.ok && r.lo >= 0;
         }
     return false;
+}
+
+/* the index of an a[i] bce_safe allows, unchecked */
+static void emit_bce_index(Expr *i) {
+    if (i->kind == E_BINARY && (i->op == TK_PLUS || i->op == TK_MINUS) && i->type && i->type->kind == TY_INT) {
+        /* an affine index the guard proved within the array (or a sum whose range is known): no overflow check */
+        buf_puts(out, "(");
+        emit_expr(i->lhs);
+        buf_puts(out, i->op == TK_PLUS ? ") + (" : ") - (");
+        emit_expr(i->rhs);
+        buf_puts(out, ")");
+    } else emit_expr(i);
 }
 
 /* a for statement (S_FOR); emit_stmt_ marks its counted increment and its checked-index loops first */
@@ -5281,6 +5404,12 @@ void emit_program(Program *p, Buf *o) {
         bool top_try = false;
         for (int i = 0; i < p->top.len; i++) if (stmt_has_try(p->top.items[i])) top_try = true;
         find_main_locals(p, top_try);
+    }
+    nbce_fix_g = 0; /* the globals of a known length (bce_fixed_n) */
+    for (int i = 0; i < p->top.len; i++) {
+        Stmt *s = p->top.items[i];
+        int64_t n = bce_fixed_of(s);
+        if (n && !ns_has(&main_locals, s->cname) && nbce_fix_g < 32) bce_fix_g[nbce_fix_g++] = (BceFix){s->cname, n};
     }
     for (int i = 0; i < p->top.len; i++) {
         Stmt *s = p->top.items[i];
