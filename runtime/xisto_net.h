@@ -2468,6 +2468,17 @@ static void xs_wq_put_sab(xs_wq *q, xs_SharedArrayBuffer *s) {
     xs_shblk_ref(s->blk);
     xs_wq_put_blk(q, XS_WM_SAB, s->blk, 0, s->f_byteLength, true);
 }
+/* a Uint8Array on a SharedArrayBuffer goes as its block (the receiver sees the same bytes, as in Node); bytes of
+   its own, as a copy */
+static void xs_wq_put_u8(xs_wq *q, xs_Uint8Array *b) {
+    xs_shblk *k = xs_u8_shared(b);
+    if (k) {
+        xs_shblk_ref(k);
+        xs_wq_put_blk(q, XS_WM_BYTES, k, (int64_t)((char *)b->data - xs_shblk_data(k)), b->f_length, true);
+        return;
+    }
+    xs_wq_put(q, (const char *)b->data, (size_t)b->f_length, true);
+}
 static void xs_wq_put_f64(xs_wq *q, xs_Float64Array *a) {
     if (a->shared) { /* the same memory, as Node shares a typed array on a SharedArrayBuffer */
         xs_shblk_ref(a->blk);
@@ -2557,12 +2568,11 @@ XS_NOINLINE void xs_wt_listen(void *p) {
                 void *v;
                 if (m->kind == XS_WM_SAB) { v = xs_sab_wrap(m->blk); m->blk = NULL; } /* (the message's reference becomes the view's) */
                 else if (m->kind == XS_WM_F64) { v = xs_f64_wrap(m->blk, m->off, (int64_t)m->n, m->shared); m->blk = NULL; }
-                else if (m->kind == XS_WM_BYTES) { /* the message's bytes become the array's */
+                else if (m->kind == XS_WM_BYTES) { /* the message's bytes become the array's; a block: a view on it */
                     xs_Uint8Array *b = xs_obj_alloc(sizeof *b, xs_u8_free, xs_u8_print);
                     b->f_length = (int64_t)m->n;
-                    b->data = (uint8_t *)m->p;
-                    b->owner = NULL;
-                    m->p = NULL;
+                    if (m->blk) { b->data = (uint8_t *)xs_shblk_data(m->blk) + m->off; b->owner = xs_sab_wrap(m->blk); m->blk = NULL; }
+                    else { b->data = (uint8_t *)m->p; b->owner = NULL; m->p = NULL; }
                     v = b;
                 }
                 else v = xs_str_new(m->s, m->n);
@@ -2663,7 +2673,7 @@ XS_NOINLINE xs_Worker *xs_Worker_on_bytes(xs_Worker *w, xs_str *ev, xs_closure *
 XS_NOINLINE xs_Worker *xs_Worker_on_sab(xs_Worker *w, xs_str *ev, xs_closure *cb) { return xs_Worker_on_k(w, ev, cb, XS_WM_SAB); }
 XS_NOINLINE xs_Worker *xs_Worker_on_f64(xs_Worker *w, xs_str *ev, xs_closure *cb) { return xs_Worker_on_k(w, ev, cb, XS_WM_F64); }
 XS_NOINLINE void xs_Worker_postMessage(xs_Worker *w, xs_str *m) { xs_wq_put(w->to_worker, m->data, (size_t)m->len, false); }
-XS_NOINLINE void xs_Worker_postBytes(xs_Worker *w, xs_Uint8Array *b) { xs_wq_put(w->to_worker, (const char *)b->data, (size_t)b->f_length, true); }
+XS_NOINLINE void xs_Worker_postBytes(xs_Worker *w, xs_Uint8Array *b) { xs_wq_put_u8(w->to_worker, b); }
 XS_NOINLINE void xs_Worker_postSab(xs_Worker *w, xs_SharedArrayBuffer *s) { xs_wq_put_sab(w->to_worker, s); }
 XS_NOINLINE void xs_Worker_postF64(xs_Worker *w, xs_Float64Array *a) { xs_wq_put_f64(w->to_worker, a); }
 /* the worker's parentPort gets no more messages: its listener ends, and the worker with it once it is idle */
@@ -2686,7 +2696,7 @@ XS_NOINLINE void xs_MessagePort_postMessage(xs_MessagePort *p, xs_str *m) {
 }
 XS_NOINLINE void xs_MessagePort_postBytes(xs_MessagePort *p, xs_Uint8Array *b) {
     if (!p->out) xs_panic("parentPort is null on the main thread");
-    xs_wq_put(p->out, (const char *)b->data, (size_t)b->f_length, true);
+    xs_wq_put_u8(p->out, b);
 }
 XS_NOINLINE void xs_MessagePort_postSab(xs_MessagePort *p, xs_SharedArrayBuffer *s) {
     if (!p->out) xs_panic("parentPort is null on the main thread");

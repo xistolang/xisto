@@ -4135,6 +4135,28 @@ XS_NOINLINE xs_SharedArrayBuffer *xs_sab_new(int64_t n) {
     if (n < 0 || n > ((int64_t)1 << 40)) xs_panic("RangeError: Invalid array buffer length");
     return xs_sab_wrap(xs_shblk_new(n, true));
 }
+/* new Uint8Array(sab, byteOffset?, length?): a view on the buffer's bytes (INT64_MIN: not given). It holds the
+   buffer as a subarray holds its array (owner), so a message carries it as the block, not as a copy. */
+XS_NOINLINE xs_Uint8Array *xs_u8_on(xs_SharedArrayBuffer *s, int64_t off, int64_t n) {
+    if (off == INT64_MIN) off = 0;
+    if (off < 0 || off > s->f_byteLength) xs_panic("RangeError: start offset is outside the bounds of the buffer");
+    if (n == INT64_MIN) n = s->f_byteLength - off;
+    else if (n < 0 || n > s->f_byteLength - off) xs_panic("RangeError: Invalid typed array length");
+    xs_Uint8Array *b = xs_obj_alloc(sizeof *b, xs_u8_free, xs_u8_print);
+    b->f_length = n;
+    b->data = (uint8_t *)xs_shblk_data(s->blk) + off;
+    b->owner = xs_retain(s);
+    return b;
+}
+/* the shared block under a Uint8Array on a SharedArrayBuffer (or a subarray of one); NULL for bytes of its own */
+static inline xs_shblk *xs_u8_shared(xs_Uint8Array *b) {
+    return b->owner && xs_type_of(b->owner)->free == xs_sab_free ? ((xs_SharedArrayBuffer *)b->owner)->blk : NULL;
+}
+static inline int64_t xs_u8_byte_offset(xs_Uint8Array *b) {
+    xs_shblk *k = xs_u8_shared(b);
+    if (k) return (int64_t)((char *)b->data - xs_shblk_data(k));
+    return b->owner ? (int64_t)(b->data - ((xs_Uint8Array *)b->owner)->data) : 0;
+}
 
 /* the length is also `len`, the name the loop versioning of emit.c (bce_version_guard) reads arrays' by */
 typedef struct xs_Float64Array { xs_hdr hdr; union { int64_t f_length; int64_t len; }; double *data; xs_shblk *blk; bool shared; } xs_Float64Array;
