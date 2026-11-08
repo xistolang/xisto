@@ -1590,16 +1590,20 @@ typedef struct xs_map {
 
 #define XS_MAP_EMPTY 0x80
 #define XS_MAP_DEL 0xFE
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#define XS_MAP_GW 8 /* slots in a group: 8 on NEON (no movemask: cmeq.8b + fmov + and, as hashbrown does there) */
+#else
 #define XS_MAP_GW 16 /* slots in a group */
+#endif
 #define XS_MAP_FULL(m, i) ((m)->ctrl[i] < 0x80)
 /* a group's bytes equal to b, as a mask: bit (slot << XS_MAP_GSH) set for each; XS_MAP_GBIT gives the lowest slot */
 #if defined(__aarch64__) && defined(__ARM_NEON)
 #include <arm_neon.h>
 typedef uint64_t xs_map_gmask;
-#define XS_MAP_GSH 2 /* NEON has no movemask: a nibble per byte (shift right and narrow), its top bit kept */
+#define XS_MAP_GSH 3 /* a byte per slot, its bit 7 set where the control byte matches */
 static inline xs_map_gmask xs_map_gmatch(const uint8_t *g, uint8_t b) {
-    uint8x16_t eq = vceqq_u8(vld1q_u8(g), vdupq_n_u8(b));
-    return vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0) & 0x8888888888888888ull;
+    uint8x8_t eq = vceq_u8(vld1_u8(g), vdup_n_u8(b));
+    return vget_lane_u64(vreinterpret_u64_u8(eq), 0) & 0x8080808080808080ull;
 }
 #elif defined(__SSE2__)
 #include <emmintrin.h>
@@ -1879,6 +1883,27 @@ static inline __attribute__((always_inline)) xs_map_entry *xs_map_lookup_i(xs_ma
     return m->lidx && m->lik == k ? m->lhit : xs_map_probe_i(m, k);
 }
 static inline __attribute__((always_inline)) bool xs_map_has_i(xs_map *m, int64_t k) { return xs_map_probe_i(m, k) != NULL; }
+/* m.set(k, m.get(k) + d) / m.set(k, d) (emit.c emit_map_add): one probe that does not touch the last-key cache (its
+   three stores, and the reloads of cap/ctrl/slots they force on the compiler: on the Neoverse N1 the loop had 61
+   instructions per symbol against the Rust table's 28), the insert out of line so m stays in a register */
+static __attribute__((noinline)) void xs_map_add_slow_i(xs_map *m, int64_t k, int64_t d) { xs_map_put(m, NULL, k, XS_VINT(d)); }
+static inline __attribute__((always_inline)) xs_map_entry *xs_map_seek_i(xs_map *m, int64_t k) {
+    uint64_t h = xs_hash_int(k);
+    size_t mask = m->cap - 1, pos = (size_t)h & mask, stride = 0;
+    uint8_t h2 = XS_MAP_H2(h);
+    const uint8_t *ctrl = m->ctrl;
+    xs_map_entry *slots = m->slots;
+    for (;;) {
+        const uint8_t *g = ctrl + pos;
+        for (xs_map_gmask mm = xs_map_gmatch(g, h2); mm; mm &= mm - 1) {
+            size_t i = (pos + XS_MAP_GBIT(mm)) & mask;
+            if (__builtin_expect(slots[i].ikey == k, 1)) return &slots[i];
+        }
+        if (__builtin_expect(xs_map_gmatch(g, XS_MAP_EMPTY) != 0, 1)) return NULL;
+        stride += XS_MAP_GW;
+        pos = (pos + stride) & mask;
+    }
+}
 static bool xs_map_delete_at(xs_map *m, xs_map_entry *e) {
     if (!e) return false;
     m->lidx = 0;
