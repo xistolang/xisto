@@ -5389,12 +5389,115 @@ static void emit_gen(Func *f) {
     buf_printf(out, "\n    return xs_gen_stream(%s_body, a_, %s_args_free, %d, %s);\n}\n", n, n, val_kind(elem), strcmp(pe, "0") == 0 ? "NULL" : pe);
 }
 
+
+/* ---------- recursion on the right spine (spine) ----------
+   f(x) = `const a = x.p; ... if (<base>) return K; return c + f(A) + f(B);` with int results, K and c literals >= 0
+   and two recursive calls: the second call is the last thing the function does besides the add, so the
+   function can loop on B with an accumulator and recurse only on A. Every partial sum is a sum of node
+   contributions >= 0, hence <= the total: the checked adds overflow exactly when the nested form would, and the
+   nodes are visited in the same order (A's subtree whole, then B). Not for number (reassociation would change
+   the rounding). The LLVM does this itself for the Rust item_check; the checked add (jo) stops it here.
+   binarytrees: 2 calls + 2 returns per node become 1 + 1 (M4 serial 2,47 -> 1,72 s user). XISTO_NO_SPINE=1 disables. */
+static bool spine_leaves(Expr *e, Func *f, Expr **calls, int *ncalls, int64_t *c) {
+    if (!e) return false;
+    if (e->kind == E_BINARY && e->op == TK_PLUS && e->type && e->type->kind == TY_INT && !e->builtin.cfn)
+        return spine_leaves(e->lhs, f, calls, ncalls, c) && spine_leaves(e->rhs, f, calls, ncalls, c);
+    if (e->kind == E_NUMBER && e->is_int_lit && e->num >= 0 && e->num <= 1e9) { *c += (int64_t)e->num; return true; }
+    if (e->kind == E_CALL && e->func == f && !e->builtin.cfn && e->args.len == 1) {
+        if (*ncalls >= 2) return false;
+        calls[(*ncalls)++] = e;
+        return true;
+    }
+    return false;
+}
+static Stmt *spine_single(Stmt *b) {
+    if (!b) return NULL;
+    if (b->kind == S_BLOCK) return b->stmts.len == 1 ? spine_single(b->stmts.items[0]) : NULL;
+    return b;
+}
+static bool spine_pure(Expr *e) { /* the base test: reads of the parameter and its fields, comparisons, null */
+    if (!e) return true;
+    switch (e->kind) {
+    case E_IDENT: case E_NULL: case E_NUMBER: case E_THIS: return true;
+    case E_MEMBER: return !e->is_call && spine_pure(e->lhs);
+    case E_BINARY: case E_UNARY: return spine_pure(e->lhs) && spine_pure(e->rhs);
+    case E_AS: return e->op == TK_NOT && !e->elem_type && spine_pure(e->lhs);
+    default: return false;
+    }
+}
+typedef struct { int ndecls; Stmt *decls[8]; Stmt *base; Expr *ret; Expr *calls[2]; int64_t c; int64_t k; } Spine;
+static bool spine_fn(Func *f, Spine *sp) {
+    if (xs_debug || xs_profile || getenv("XISTO_NO_SPINE")) return false;
+    if (!f->body || f->is_async || f->is_gen || f->cls || f->nparams != 1 || !f->ret || f->ret->kind != TY_INT) return false;
+    Type *pt = f->params[0].type;
+    if (!pt || pt->kind != TY_OBJECT || !pt->cls || pt->cls->builtin || f->params[0].cell) return false;
+    Stmt *b = f->body;
+    if (b->kind != S_BLOCK || b->stmts.len < 2 || b->stmts.len > 10) return false;
+    int i = 0;
+    sp->ndecls = 0;
+    while (i < b->stmts.len && b->stmts.items[i]->kind == S_VAR) {
+        Stmt *d = b->stmts.items[i];
+        if (!d->is_const || !borrowable_init(d) || sp->ndecls >= 8) return false;
+        sp->decls[sp->ndecls++] = d;
+        i++;
+    }
+    if (i + 2 != b->stmts.len) return false;
+    Stmt *s_if = b->stmts.items[i], *s_ret = b->stmts.items[i + 1];
+    if (s_if->kind != S_IF || s_if->else_body || !spine_pure(s_if->cond)) return false;
+    Stmt *base = spine_single(s_if->body);
+    if (!base || base->kind != S_RETURN || !base->expr || base->expr->kind != E_NUMBER || !base->expr->is_int_lit || base->expr->num < 0) return false;
+    if (s_ret->kind != S_RETURN || !s_ret->expr) return false;
+    int n = 0;
+    sp->c = 0;
+    if (!spine_leaves(s_ret->expr, f, sp->calls, &n, &sp->c) || n != 2) return false;
+    if (!spine_pure(sp->calls[0]->args.items[0]) || !spine_pure(sp->calls[1]->args.items[0])) return false;
+    sp->base = s_if; sp->ret = s_ret; sp->k = (int64_t)base->expr->num;
+    return true;
+}
+static void emit_spine(Func *f, Spine *sp) {
+    buf_puts(out, " { /* recursion on the right spine: a loop on the second call (see spine_fn) */");
+    indent++;
+    nl();
+    buf_puts(out, "size_t ar_mark = xs_ar_mark();");
+    nl();
+    buf_puts(out, "(void)ar_mark;");
+    nl();
+    buf_puts(out, "int64_t acc_ = INT64_C(0);");
+    nl();
+    buf_puts(out, "for (;;) {");
+    indent++;
+    epush(true);
+    for (int i = 0; i < sp->ndecls; i++) { nl(); emit_var(sp->decls[i]); }
+    nl();
+    buf_puts(out, "if (");
+    emit_expr(sp->base->cond);
+    if (sp->k) buf_printf(out, ") return xs_iadd_s(acc_, INT64_C(%lld), XS_S(%d));", (long long)sp->k, new_site(sp->ret->pos));
+    else buf_puts(out, ") return acc_;");
+    nl();
+    buf_puts(out, "acc_ = xs_iadd_s(acc_, ");
+    if (sp->c) buf_printf(out, "xs_iadd_s(INT64_C(%lld), ", (long long)sp->c);
+    emit_expr(sp->calls[0]);
+    if (sp->c) buf_printf(out, ", XS_S(%d))", new_site(sp->ret->pos));
+    buf_printf(out, ", XS_S(%d));", new_site(sp->ret->pos));
+    nl();
+    buf_printf(out, "%s = ", f->params[0].cname);
+    emit_borrowed(sp->calls[1]->args.items[0]);
+    buf_puts(out, ";");
+    epop();
+    indent--;
+    nl();
+    buf_puts(out, "}");
+    indent--;
+    nl();
+    buf_puts(out, "}\n");
+}
 static void emit_func_body(Func *f) {
     cur_func = f;
     if (f->mod) cur_mod = f->mod;
     if (f->body) rv_compute(f, &f->body, 1);
     if (f->is_gen) { emit_gen(f); cur_func = NULL; return; }
     vol_locals = stmt_has_try(f->body);
+    { Spine sp_; if (spine_fn(f, &sp_)) { emit_spine(f, &sp_); cur_func = NULL; return; } }
     buf_puts(out, " {");
     indent++;
     nl();
