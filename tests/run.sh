@@ -18,7 +18,7 @@ for f in tests/ok/*.ts; do
         cp "${f%.ts}.expected" "$OUT/$name.node"   # APIs only Xisto has (streams): the expected output is checked in
     elif [ -n "$XISTO_ORACLE_DIR" ] && [ -f "$XISTO_ORACLE_DIR/$name.node" ]; then
         cp "$XISTO_ORACLE_DIR/$name.node" "$OUT/$name.node"   # Node's outputs from another machine (a system whose Node cannot run .ts)
-    elif ! node "$f" > "$OUT/$name.node" 2>&1; then
+    elif ! node --import ./packages/xisto/register.mjs "$f" > "$OUT/$name.node" 2>&1; then   # (xisto:io, xisto:bytes: the reference implementations)
         if ! bun "$f" > "$OUT/$name.node" 2>&1; then
             echo "FAIL $f: neither node nor bun can run the program"; cat "$OUT/$name.node" | head -5; fail=$((fail+1)); continue
         fi

@@ -4618,6 +4618,23 @@ XS_NOINLINE int64_t xs_u8_index_of(xs_Uint8Array *b, int64_t v, int64_t from) {
     return h ? (int64_t)(h - b->data) : -1;
 }
 XS_NOINLINE bool xs_u8_includes(xs_Uint8Array *b, int64_t v) { return xs_u8_index_of(b, v, 0) >= 0; }
+/* JS: from defaults to length - 1; a negative from counts from the end; past the end it is the last index */
+XS_NOINLINE int64_t xs_u8_last_index_of(xs_Uint8Array *b, int64_t v, int64_t from) {
+    if (v < 0 || v > 255) return -1;
+    int64_t k = from == INT64_MIN ? b->f_length - 1 : from < 0 ? b->f_length + from : from >= b->f_length ? b->f_length - 1 : from;
+    const uint8_t *d = b->data;
+    const uint64_t ones = 0x0101010101010101ull, highs = 0x8080808080808080ull, pat = ones * (uint64_t)v;
+    while (k >= 7) { /* 8 bytes a step, d[k-7..k]: the highest matching byte is the answer */
+        uint64_t w;
+        memcpy(&w, d + k - 7, 8);
+        uint64_t x = w ^ pat, hit = (x - ones) & ~x & highs; /* a byte of x is zero where w has v (the lowest
+                                                                  hit is exact; higher ones can be false) */
+        if (hit) { for (int64_t q = k; q >= k - 7; q--) if (d[q] == (uint8_t)v) return q; }
+        k -= 8;
+    }
+    for (; k >= 0; k--) if (d[k] == (uint8_t)v) return k;
+    return -1;
+}
 XS_NOINLINE int64_t xs_buf_index_of_str(xs_Uint8Array *b, xs_str *p, int64_t from) {
     int64_t s = xs_u8_rel(from, b->f_length, 0);
     if (s > b->f_length) return -1;

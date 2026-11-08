@@ -1,0 +1,7 @@
+{
+  "name": "xisto",
+  "version": "0.1.0",
+  "description": "The xisto: modules for Node: the reference implementations of what the xisto compiler builds in",
+  "type": "module",
+  "exports": { "./register": "./register.mjs", "./io": "./io.ts", "./bytes": "./bytes.ts" }
+}
