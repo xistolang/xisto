@@ -394,6 +394,8 @@ typedef struct ICtx {
 } ICtx;
 static ICtx *ictx;
 typedef struct { bool ok; int64_t lo, hi; } Rng; /* integer ranges (see rng_of) */
+typedef struct BceGArr { const char *name; int64_t n; bool has_rng; int64_t lo, hi; } BceGArr; /* a constant array (see garr_collect) */
+static BceGArr *garr_find(const char *c);
 static Rng rng_of(Expr *e);
 static bool bce_safe(Expr *e); /* an index the loop already checks (see bce_enter) */
 static void emit_bce_index(Expr *i);
@@ -987,6 +989,13 @@ static void emit_lvalue_ptr(Expr *e) {
             return;
         }
         if (bce_safe(e)) { /* within the array: see bce_enter */
+            BceGArr *g = e->lhs->kind == E_IDENT ? garr_find(e->lhs->cname) : NULL;
+            if (g && g->has_rng) { /* a constant table: its C copy, so the entry is a constant where the index is (nbody-3: x[PI[p]]) */
+                buf_printf(out, "(&%s_c[", e->lhs->cname);
+                emit_bce_index(e->rhs);
+                buf_puts(out, "])");
+                return;
+            }
             buf_printf(out, arr_is_ref(e->lhs->type) ? "((%s*)&(" : "(&(", ctype(e->type));
             emit_borrowed(e->lhs);
             buf_puts(out, ")->data[");
@@ -3426,6 +3435,14 @@ static Rng *rv_rng;
 static int rv_n, rv_cap;
 static Func *rv_owner;
 static bool rv_valid;
+typedef struct { const char *name; int64_t n; } BceFix;
+static BceFix cig[64]; /* the top-level `const N: int = literal` (garr_collect): N has that one value */
+static int ncig;
+static bool cig_find(const char *c, int64_t *v) {
+    if (!c) return false;
+    for (int i = 0; i < ncig; i++) if (strcmp(cig[i].name, c) == 0) { *v = cig[i].n; return true; }
+    return false;
+}
 static Rng rng_none(void) { return (Rng){false, 0, 0}; }
 static Rng rng_mk(__int128 lo, __int128 hi) {
     if (lo < INT64_MIN || hi > INT64_MAX) return rng_none();
@@ -3437,12 +3454,22 @@ static Rng rng_of(Expr *e) {
     if (!e || !e->type || !rv_valid || rv_owner != cur_func || ictx) return rng_none();
     switch (e->kind) {
     case E_NUMBER: if (e->is_int_lit) return (Rng){true, e->ival, e->ival}; return rng_none();
-    case E_IDENT: { int k = e->cname ? rv_find(e->cname) : -1; return k >= 0 ? rv_rng[k] : rng_none(); }
+    case E_IDENT: {
+        int k = e->cname ? rv_find(e->cname) : -1;
+        if (k >= 0) return rv_rng[k];
+        int64_t v;
+        if (e->type->kind == TY_INT && cig_find(e->cname, &v)) return (Rng){true, v, v}; /* a const global with one value */
+        return rng_none();
+    }
     case E_MEMBER:
         if (!e->is_call && e->str && strcmp(e->str, "length") == 0) return (Rng){true, 0, RNG_LEN};
         return rng_none();
     case E_INDEX:
         if (e->builtin.cfn && strcmp(e->builtin.cfn, "xs_u8_get") == 0) return (Rng){true, 0, 255};
+        if (!e->builtin.cfn && e->lhs && e->lhs->kind == E_IDENT && e->type->kind == TY_INT) { /* T[p]: the entries of a constant table */
+            BceGArr *g = garr_find(e->lhs->cname);
+            if (g && g->has_rng) return (Rng){true, g->lo, g->hi};
+        }
         return rng_none();
     case E_UNARY:
         if (e->op == TK_MINUS) { Rng a = rng_of(e->lhs); if (a.ok) return rng_mk(-(__int128)a.hi, -(__int128)a.lo); }
@@ -3530,17 +3557,16 @@ static void rv_scan_stmt(Stmt *s, bool decls) {
     for (int i = 0; i < s->stmts.len; i++) rv_scan_stmt(s->stmts.items[i], decls);
     for (int i = 0; i < s->ncases; i++) { rv_scan_expr(s->cases[i].value); rv_scan_stmt(s->cases[i].body, decls); }
 }
-/* `const t = new Uint8Array(256)`: bytes whose length is known (a Uint8Array's length never changes, and a
-   const is never assigned again), so t[x] needs no check when x's range is within it (bce_safe): the
+/* `const t = new Uint8Array(256)` or `new Float64Array(8)`: a length that is known (a typed array's length never
+   changes, and a const is never assigned again), so t[x] needs no check when x's range is within it (bce_safe): the
    function's own (bce_fix_l, for bce_fix_owner) and the globals' (bce_fix_g, every function sees them); bce_fixed_n */
-typedef struct { const char *name; int64_t n; } BceFix;
 static BceFix bce_fix_l[32], bce_fix_g[32];
 static int nbce_fix_l, nbce_fix_g;
 static Func *bce_fix_owner;
 static int64_t bce_fixed_of(Stmt *s) {
     if (s->kind != S_VAR || !s->is_const || !s->cname || s->cell || !s->init) return 0;
     Expr *e = s->init;
-    if (e->kind != E_NEW_OBJ || !e->builtin.cfn || strcmp(e->builtin.cfn, "xs_u8_new") != 0 || e->args.len != 1) return 0;
+    if (e->kind != E_NEW_OBJ || !e->builtin.cfn || (strcmp(e->builtin.cfn, "xs_u8_new") != 0 && strcmp(e->builtin.cfn, "xs_f64_new") != 0) || e->args.len != 1) return 0;
     Expr *n = e->args.items[0];
     return n->kind == E_NUMBER && n->is_int_lit && n->ival > 0 ? n->ival : 0;
 }
@@ -3554,12 +3580,66 @@ static void bce_fix_scan(Stmt *s) {
     for (int i = 0; i < s->stmts.len; i++) bce_fix_scan(s->stmts.items[i]);
     for (int i = 0; i < s->ncases; i++) bce_fix_scan(s->cases[i].body);
 }
+/* Top-level `const T: int[] = [0, 0, 1, 2]` and `const x: number[] = [...]` / `new Array<number>(N).fill(v)` that the
+   whole program only indexes (`T[i]`, `T.length`; never passed, stored, iterated or resized): their length is
+   the literal's, so `x[i]` needs no check when i's range is within it (bce_safe), and a table of int literals
+   that is never written gives `T[p]` the range of its elements (rng_of): `const i = PI[p]; x[i]` is unchecked
+   when every entry of PI is below x's length (nbody-3). */
+static BceGArr bce_garr[32];
+static int nbce_garr;
+static bool garr_expr(Expr *e, Expr *parent, bool target, const char *c, bool elem_w);
+static bool garr_stmt(Stmt *s, const char *c, bool elem_w) {
+    if (!s) return true;
+    if (!garr_expr(s->init, NULL, false, c, elem_w) || !garr_expr(s->expr, NULL, false, c, elem_w) || !garr_expr(s->cond, NULL, false, c, elem_w) ||
+        !garr_expr(s->for_update, NULL, false, c, elem_w)) return false;
+    if (!garr_stmt(s->for_init, c, elem_w) || !garr_stmt(s->body, c, elem_w) || !garr_stmt(s->else_body, c, elem_w)) return false;
+    for (int i = 0; i < s->stmts.len; i++) if (!garr_stmt(s->stmts.items[i], c, elem_w)) return false;
+    for (int i = 0; i < s->ncases; i++) if (!garr_expr(s->cases[i].value, NULL, false, c, elem_w) || !garr_stmt(s->cases[i].body, c, elem_w)) return false;
+    return true;
+}
+/* target: e is the left side of an assignment or ++/-- (or inside the index of one) */
+static bool garr_expr(Expr *e, Expr *parent, bool target, const char *c, bool elem_w) {
+    if (!e) return true;
+    if (e->kind == E_IDENT && e->cname && strcmp(e->cname, c) == 0) {
+        bool as_base = parent && parent->kind == E_INDEX && parent->lhs == e && !parent->builtin.cfn;
+        bool as_len = parent && parent->kind == E_MEMBER && !parent->is_call && parent->lhs == e && parent->str && strcmp(parent->str, "length") == 0;
+        if (as_len) return true;
+        if (!as_base) return false;
+        return elem_w || !target;
+    }
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn && !garr_stmt(e->arrow->fn->body, c, elem_w)) return false;
+    bool writes = e->kind == E_ASSIGN || e->kind == E_POSTFIX || (e->kind == E_UNARY && (e->op == TK_PLUSPLUS || e->op == TK_MINUSMINUS));
+    if (!garr_expr(e->lhs, e, target || writes, c, elem_w) || !garr_expr(e->rhs, e, target && e->kind != E_ASSIGN, c, elem_w)) return false;
+    for (int i = 0; i < e->args.len; i++) if (!garr_expr(e->args.items[i], e, false, c, elem_w)) return false;
+    return true;
+}
+static bool garr_program_ok(Program *p, const char *c, bool elem_w) {
+    for (int i = 0; i < p->nfuncs; i++) if (p->funcs[i]->body && !garr_stmt(p->funcs[i]->body, c, elem_w)) return false;
+    for (int i = 0; i < p->nclasses; i++) {
+        Class *k = p->classes[i];
+        for (int f = 0; f < k->nfields; f++) if (!garr_expr(k->fields[f].init, NULL, false, c, elem_w)) return false;
+        if (k->ctor && k->ctor->body && !garr_stmt(k->ctor->body, c, elem_w)) return false;
+        for (int m = 0; m < k->nmethods; m++) if (k->methods[m]->body && !garr_stmt(k->methods[m]->body, c, elem_w)) return false;
+    }
+    for (int i = 0; i < p->top.len; i++) {
+        Stmt *s = p->top.items[i];
+        if (s->kind == S_VAR && s->cname && strcmp(s->cname, c) == 0) { if (!garr_expr(s->init, NULL, false, c, elem_w)) return false; continue; }
+        if (!garr_stmt(s, c, elem_w)) return false;
+    }
+    return true;
+}
+static BceGArr *garr_find(const char *c) {
+    if (!c) return NULL;
+    for (int i = 0; i < nbce_garr; i++) if (strcmp(bce_garr[i].name, c) == 0) return &bce_garr[i];
+    return NULL;
+}
 static int64_t bce_fixed_n(const char *c) {
     if (xs_debug || getenv("XISTO_NO_BCE")) return 0;
     if (bce_fix_owner == cur_func && rv_owner == cur_func)
         for (int i = 0; i < nbce_fix_l; i++) if (strcmp(bce_fix_l[i].name, c) == 0) return bce_fix_l[i].n;
     for (int i = 0; i < nbce_fix_g; i++) if (strcmp(bce_fix_g[i].name, c) == 0) return bce_fix_g[i].n;
-    return 0;
+    BceGArr *g = garr_find(c);
+    return g ? g->n : 0;
 }
 /* top-level code (main): only its own locals; a top-level variable functions also use is not one of them */
 static bool rv_main_only(const char *c);
@@ -3588,8 +3668,13 @@ static void rv_compute(Func *owner, Stmt **stmts, int n) {
                 if (rv_defs[d].loop) { /* i from its start below the bound: [start, bound - 1] */
                     Rng b = rng_of(rv_defs[d].loop->cond->rhs);
                     x = b.ok ? (Rng){true, INT64_MIN, b.hi - 1} : rng_none();
-                    if (x.ok) { x.lo = INT64_MAX; for (int e = 0; e < rv_ndefs; e++) if (strcmp(rv_defs[e].name, rv_name[k]) == 0 && rv_defs[e].def) { Rng s0 = rng_of(rv_defs[e].def); if (!s0.ok) { x = rng_none(); break; } if (s0.lo < x.lo) x.lo = s0.lo; if (s0.hi > x.hi) x.hi = s0.hi; } }
+                    /* a counter declared by the loop itself is only read inside it, where it is below the bound: its
+                       start does not widen the top (j = i + 1 in `for (let j = i + 1; j < N; j++)` stays under N) */
+                    Stmt *fi = rv_defs[d].loop->for_init;
+                    bool own = fi && fi->kind == S_VAR && fi->cname && strcmp(fi->cname, rv_name[k]) == 0;
+                    if (x.ok) { x.lo = INT64_MAX; for (int e = 0; e < rv_ndefs; e++) if (strcmp(rv_defs[e].name, rv_name[k]) == 0 && rv_defs[e].def) { Rng s0 = rng_of(rv_defs[e].def); if (!s0.ok) { x = rng_none(); break; } if (s0.lo < x.lo) x.lo = s0.lo; if (s0.hi > x.hi && !own) x.hi = s0.hi; } }
                     if (x.ok && x.lo == INT64_MAX) x = rng_none();
+                    if (x.ok && x.lo > x.hi) x.lo = x.hi; /* (a loop that never runs: nothing reads it) */
                 } else x = rng_of(rv_defs[d].def);
                 if (!x.ok) { ok = false; break; }
                 r = first ? x : rng_union(r, x);
@@ -3795,8 +3880,12 @@ static char *bce_version_guard(Stmt *s, const char **arrs, int *na) {
     int nc = 0;
     bce_arrays(s->body, i, cand, ct, &nc);
     bool plain = lim->kind == E_NUMBER || bce_plain_local(lim->cname);
-    for (int k = 0; k < nc; k++)
+    Rng ir = rng_of(u->lhs); /* the counter's range: a[i] on an array of a known length within it needs no version (bce_safe) */
+    for (int k = 0; k < nc; k++) {
+        int64_t fixed = bce_fixed_n(cand[k]);
+        if (fixed > 0 && ir.ok && ir.lo >= 0 && ir.hi < fixed) continue;
         if (bce_ok(s->body, cand[k], ct[k], plain) && strcmp(cand[k], i) != 0) { bce_arr_t[*na] = ct[k]; arrs[(*na)++] = cand[k]; }
+    }
     nbce_aff = 0;
     bce_cur_body = s->body;
     bce_affine(s->body, i);
@@ -3832,7 +3921,7 @@ static char *bce_version_guard(Stmt *s, const char **arrs, int *na) {
 /* a[i] that needs no check: the index and the array of an enclosing safe counted loop, i >= 0 */
 static bool bce_safe(Expr *e) {
     if (!e || e->kind != E_INDEX || !e->lhs || e->lhs->kind != E_IDENT || !e->rhs || ictx) return false;
-    if (e->lhs->cname && bce_bytes(e->lhs->type)) { /* bytes of a known length, an index whose range is within it */
+    if (e->lhs->cname && bce_indexable(e->lhs->type)) { /* an array of a known length, an index whose range is within it */
         int64_t n = bce_fixed_n(e->lhs->cname);
         Rng r = n > 0 ? rng_of(e->rhs) : rng_none();
         if (r.ok && r.lo >= 0 && r.hi < n) return true;
@@ -5372,6 +5461,53 @@ static void find_consumed(Program *p) {
         }
     }
 }
+/* the length a top-level const array declaration fixes: a literal's count, or new Array<T>(N).fill(v) with N a
+   literal or a const global with one; 0 when not known */
+static int64_t garr_len_of(Program *p, Stmt *s) {
+    if (s->kind != S_VAR || !s->is_const || !s->cname || s->cell || s->exported || !s->init || !s->type || s->type->kind != TY_ARRAY) return 0;
+    Expr *e = s->init;
+    if (e->kind == E_ARRAY_LIT) return e->args.len;
+    if (e->kind == E_MEMBER && e->is_call && e->str && strcmp(e->str, "fill") == 0 && e->lhs && e->lhs->kind == E_NEW_ARRAY && e->lhs->lhs) {
+        Expr *n = e->lhs->lhs;
+        if (n->kind == E_NUMBER && n->is_int_lit) return n->ival > 0 ? n->ival : 0;
+        if (n->kind == E_IDENT && n->cname)
+            for (int i = 0; i < p->top.len; i++) {
+                Stmt *d = p->top.items[i];
+                if (d->kind == S_VAR && d->cname && strcmp(d->cname, n->cname) == 0)
+                    return const_lit_global(d) && d->init->kind == E_NUMBER && d->init->is_int_lit && d->init->ival > 0 ? d->init->ival : 0;
+            }
+    }
+    return 0;
+}
+static void garr_collect(Program *p) {
+    nbce_garr = ncig = 0;
+    if (xs_debug || getenv("XISTO_NO_BCE")) return;
+    for (int i = 0; i < p->top.len && ncig < 64; i++) { /* `const N: int = 5`: a known value wherever it is read */
+        Stmt *s = p->top.items[i];
+        if (s->kind == S_VAR && s->cname && !s->exported && const_lit_global(s) && s->type->kind == TY_INT && s->init->kind == E_NUMBER && s->init->is_int_lit)
+            cig[ncig++] = (BceFix){s->cname, s->init->ival};
+    }
+    for (int i = 0; i < p->top.len && nbce_garr < 32; i++) {
+        Stmt *s = p->top.items[i];
+        int64_t n = garr_len_of(p, s);
+        if (!n || ns_has(&main_locals, s->cname) || !garr_program_ok(p, s->cname, true)) continue;
+        BceGArr g = {s->cname, n, false, 0, 0};
+        Expr *e = s->init;
+        if (e->kind == E_ARRAY_LIT && s->type->elem && s->type->elem->kind == TY_INT && garr_program_ok(p, s->cname, false)) {
+            g.has_rng = true;
+            for (int k = 0; k < e->args.len; k++) {
+                Expr *v = e->args.items[k];
+                bool neg = v->kind == E_UNARY && v->op == TK_MINUS && v->lhs; /* -1 */
+                if (neg) v = v->lhs;
+                if (v->kind != E_NUMBER || !v->is_int_lit) { g.has_rng = false; break; }
+                int64_t val = neg ? -v->ival : v->ival;
+                if (k == 0 || val < g.lo) g.lo = val;
+                if (k == 0 || val > g.hi) g.hi = val;
+            }
+        }
+        bce_garr[nbce_garr++] = g;
+    }
+}
 
 void emit_program(Program *p, Buf *o) {
     out = o;
@@ -5428,9 +5564,20 @@ void emit_program(Program *p, Buf *o) {
         int64_t n = bce_fixed_of(s);
         if (n && !ns_has(&main_locals, s->cname) && nbce_fix_g < 32) bce_fix_g[nbce_fix_g++] = (BceFix){s->cname, n};
     }
+    garr_collect(p); /* the constant arrays and tables (bce_garr) */
     for (int i = 0; i < p->top.len; i++) {
         Stmt *s = p->top.items[i];
         if (s->kind != S_VAR || ns_has(&main_locals, s->cname)) continue;
+        BceGArr *g = garr_find(s->cname);
+        if (g && g->has_rng) { /* a constant int table (garr_collect): also a C constant, read where the index is within it */
+            buf_printf(out, "static const int64_t %s_c[%d] = {", s->cname, s->init->args.len);
+            for (int k = 0; k < s->init->args.len; k++) {
+                Expr *v = s->init->args.items[k];
+                bool neg = v->kind == E_UNARY && v->op == TK_MINUS;
+                buf_printf(out, "%sINT64_C(%lld)", k ? ", " : "", (long long)(neg ? -v->lhs->ival : v->ival));
+            }
+            buf_puts(out, "};\n");
+        }
         if (const_lit_global(s) && !p->uses_workers) {
             buf_puts(out, "static const ");
             emit_decl(s->type, s->cname);
