@@ -496,6 +496,21 @@ __attribute__((noinline)) static void xs_panic_at(const char *msg, const xs_site
    xs_panic_at itself (see docs/poc8-stacktrace.md): otherwise every failed check "may return" having changed
    any memory, and a loop reloads every array pointer after each index check (nbody: 0.73 s) */
 #define XS_FAIL(msg, site) do { xs_panic_at(msg, site); __asm__ volatile(""); __builtin_unreachable(); } while (0)
+#define XS_ISAFE_MAX INT64_C(9007199254740991)
+/* In range: -2^53 <= r <= 2^53 - 1 (-2^53 is exact in a double too, so Node gives the same number). Inputs are in
+   range, so r = a +- b is within +-2^54. The tests are plain comparisons: in a loop the compiler keeps the 64-bit
+   constant in a register and each test is one compare-and-branch (a shift test was 3-4 instructions: +9% in
+   fannkuch on the Xeon). */
+#define XS_IOUT(r) ((uint64_t)(r) + (UINT64_C(1) << 53) > (UINT64_C(1) << 54) - 1)
+#define XS_IOUT_HI(r) ((r) > XS_ISAFE_MAX)        /* only the top can be crossed (a non-negative or + constant >= 0) */
+#define XS_IOUT_LO(r) ((r) < -XS_ISAFE_MAX - 1)   /* only the bottom (- constant >= 0) */
+/* a sum of two values >= 0 is below 2^54: past the range iff bit 53 is set — a bit test, no 64-bit constant, which
+   matters in a recursive function (binarytrees' itemCheck: the constant cost two callee-saved registers per call) */
+#define XS_IOUT_NN(r) (((r) & (INT64_C(1) << 53)) != 0)
+/* with a constant operand only one side can be crossed: one test (as the 64-bit overflow test was) */
+#define XS_IOUT_ADD(r, b) (__builtin_constant_p(b) ? ((b) >= 0 ? XS_IOUT_HI(r) : XS_IOUT_LO(r)) : XS_IOUT(r))
+#define XS_IADD_C_OUT(a, b) ((b) >= 0 ? (a) > XS_ISAFE_MAX - (b) : (a) < -XS_ISAFE_MAX - 1 - (b))
+#define XS_IOVF_MSG "integer overflow: the result left JavaScript's safe integer range (+-2^53 - 1); use number or bigint"
 __attribute__((noinline)) static void xs_panic_at(const char *msg, const xs_site *site) {
     xs_trace_capture(&xs_panic_trace, site);
 #ifdef XS_DEBUG
@@ -1989,7 +2004,7 @@ static __attribute__((noinline)) void xs_map_add_slow_i(xs_map *m, int64_t k, in
     }
     XS_MAP_WIDE(m);
     xs_map_entry *e = xs_map_lookup(m, NULL, k);
-    if (e) { if (__builtin_add_overflow(e->val.i, d, &e->val.i)) XS_FAIL("integer overflow", s); }
+    if (e) { { if (__builtin_expect(__builtin_constant_p(d) ? XS_IADD_C_OUT(e->val.i, d) : XS_IOUT((int64_t)((uint64_t)(e->val.i) + (uint64_t)d)), 0)) XS_FAIL(XS_IOVF_MSG, s); e->val.i += d; } }
     else xs_map_put(m, NULL, k, XS_VINT(d));
 }
 static inline __attribute__((always_inline)) xs_map_entry *xs_map_seek_i(xs_map *m, int64_t k) {
@@ -2037,7 +2052,7 @@ static inline __attribute__((always_inline)) void xs_map_add_i(xs_map *m, int64_
             }
     } else {
         xs_map_entry *e = xs_map_seek_i(m, k);
-        if (__builtin_expect(e != NULL, 1)) { if (__builtin_add_overflow(e->val.i, d, &e->val.i)) XS_FAIL("integer overflow", s); return; }
+        if (__builtin_expect(e != NULL, 1)) { { if (__builtin_expect(__builtin_constant_p(d) ? XS_IADD_C_OUT(e->val.i, d) : XS_IOUT((int64_t)((uint64_t)(e->val.i) + (uint64_t)d)), 0)) XS_FAIL(XS_IOVF_MSG, s); e->val.i += d; } return; }
     }
 slow:
     xs_map_add_slow_i(m, k, d, s);
@@ -2081,7 +2096,7 @@ static inline __attribute__((always_inline)) void xs_map_add_hc(xs_map *m, xs_ma
             for (xs_map_gmask mm = xs_map_gmatch(g, h2); mm; mm &= mm - 1) {
                 size_t i = (pos + XS_MAP_GBIT(mm)) & mask;
                 if (__builtin_expect(slots[i].ikey == k, 1)) {
-                    if (__builtin_add_overflow(slots[i].val.i, d, &slots[i].val.i)) XS_FAIL("integer overflow", s);
+                    { if (__builtin_expect(__builtin_constant_p(d) ? XS_IADD_C_OUT(slots[i].val.i, d) : XS_IOUT((int64_t)((uint64_t)(slots[i].val.i) + (uint64_t)d)), 0)) XS_FAIL(XS_IOVF_MSG, s); slots[i].val.i += d; }
                     return;
                 }
             }
@@ -2481,14 +2496,50 @@ static xs_str *xs_arr_join_int(xs_arr_int *a, xs_str *sep) { return xs_arr_join_
 static xs_str *xs_arr_join_bool(xs_arr_bool *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_bool, a); }
 static xs_str *xs_arr_join_str(xs_arr_ref *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_str, a); }
 
-/* ---- int: 64-bit, overflow is a runtime error ---- */
+/* ---- int: an integer JavaScript represents exactly, |v| <= 2^53 - 1 (Number.MAX_SAFE_INTEGER); leaving that range
+   is a runtime error (XB-075): there Node would round the result and print another number. Every int source keeps
+   the range (literals in the lexer, conversions in xs_to_int_s, the operations below), so a sum or difference of two
+   ints cannot overflow 64 bits and needs only the range test; a product is tested for 64-bit overflow too. */
 
 /* The _s forms take the source position of the operation (the compiler passes &xs_sitetab[n]); it is only
    read on the error path. */
-XS_AI int64_t xs_iadd_s(int64_t a, int64_t b, const xs_site *s) { int64_t r; if (__builtin_add_overflow(a, b, &r)) XS_FAIL("integer overflow", s); return r; }
-XS_AI int64_t xs_isub_s(int64_t a, int64_t b, const xs_site *s) { int64_t r; if (__builtin_sub_overflow(a, b, &r)) XS_FAIL("integer overflow", s); return r; }
-XS_AI int64_t xs_imul_s(int64_t a, int64_t b, const xs_site *s) { int64_t r; if (__builtin_mul_overflow(a, b, &r)) XS_FAIL("integer overflow", s); return r; }
-XS_AI int64_t xs_ineg_s(int64_t a, const xs_site *s) { if (a == INT64_MIN) XS_FAIL("integer overflow", s); return -a; }
+/* with a constant operand the test is on the other operand, before the operation: a + b leaves the range iff a
+   passes MAX - b (one compare against a constant the compiler hoists; testing the result made clang rebuild the
+   constant inside fannkuch's flip loop: +7% on the Xeon) */
+XS_AI int64_t xs_iadd_s(int64_t a, int64_t b, const xs_site *s) {
+    if (__builtin_constant_p(a) && !__builtin_constant_p(b)) { int64_t t = a; a = b; b = t; }
+    if (__builtin_constant_p(b)) { if (__builtin_expect(XS_IADD_C_OUT(a, b), 0)) XS_FAIL(XS_IOVF_MSG, s); return a + b; }
+    int64_t r = (int64_t)((uint64_t)a + (uint64_t)b);
+    if (__builtin_expect(XS_IOUT(r), 0)) XS_FAIL(XS_IOVF_MSG, s);
+    return r;
+}
+XS_AI int64_t xs_isub_s(int64_t a, int64_t b, const xs_site *s) {
+    if (__builtin_constant_p(b)) { if (__builtin_expect(XS_IADD_C_OUT(a, -(b)), 0)) XS_FAIL(XS_IOVF_MSG, s); return a - b; }
+    int64_t r = (int64_t)((uint64_t)a - (uint64_t)b);
+    if (__builtin_expect(XS_IOUT(r), 0)) XS_FAIL(XS_IOVF_MSG, s);
+    return r;
+}
+XS_AI int64_t xs_imul_s(int64_t a, int64_t b, const xs_site *s) {
+    if (__builtin_constant_p(a) && !__builtin_constant_p(b)) { int64_t t = a; a = b; b = t; }
+    if (__builtin_constant_p(b) && b > -1024 && b < 1024) { /* |a| <= 2^53, |b| < 2^10: the product fits 64 bits */
+        int64_t r = a * b;
+        if (__builtin_expect(XS_IOUT(r), 0)) XS_FAIL(XS_IOVF_MSG, s);
+        return r;
+    }
+    int64_t r;
+    if (__builtin_expect(__builtin_mul_overflow(a, b, &r) | XS_IOUT(r), 0)) XS_FAIL(XS_IOVF_MSG, s);
+    return r;
+}
+XS_AI int64_t xs_ineg_s(int64_t a, const xs_site *s) { int64_t r = -a; if (__builtin_expect(XS_IOUT_HI(r), 0)) XS_FAIL(XS_IOVF_MSG, s); return r; } /* (-(-2^53)) */
+/* both operands >= 0 (the emitter proved it): only the top of the range can be crossed */
+XS_AI int64_t xs_iadd_nn_s(int64_t a, int64_t b, const xs_site *s) { int64_t r = a + b; if (__builtin_expect(XS_IOUT_NN(r), 0)) XS_FAIL(XS_IOVF_MSG, s); return r; }
+XS_AI int64_t xs_imul_nn_s(int64_t a, int64_t b, const xs_site *s) {
+    if (__builtin_constant_p(a) && !__builtin_constant_p(b)) { int64_t t = a; a = b; b = t; }
+    if (__builtin_constant_p(b) && b >= 0 && b < 1024) { int64_t r = a * b; if (__builtin_expect(XS_IOUT_HI(r), 0)) XS_FAIL(XS_IOVF_MSG, s); return r; }
+    int64_t r;
+    if (__builtin_expect(__builtin_mul_overflow(a, b, &r) | XS_IOUT_HI(r), 0)) XS_FAIL(XS_IOVF_MSG, s);
+    return r;
+}
 XS_AI int64_t xs_imod_s(int64_t a, int64_t b, const xs_site *s) {
     if (b == 0) XS_FAIL("integer modulo by zero", s);
     if (b == -1) return 0;
@@ -2559,7 +2610,7 @@ static inline double xs_fmax(double a, double b) {
 static inline bool xs_is_safe_integer(double x) { return xs_is_integer(x) && fabs(x) <= 9007199254740991.0; }
 
 XS_AI int64_t xs_to_int_s(double x, const xs_site *s) {
-    if (!(x >= -9223372036854775808.0 && x < 9223372036854775808.0)) XS_FAIL("value out of int range", s);
+    if (!(x >= -9007199254740991.0 && x <= 9007199254740991.0)) XS_FAIL("value out of int range: an int is an integer of JavaScript's safe range (+-2^53 - 1); use number or bigint", s);
     return (int64_t)x;
 }
 static inline int64_t xs_to_int(double x) { return xs_to_int_s(x, NULL); }
@@ -3569,9 +3620,9 @@ XS_NOINLINE int64_t xs_ipow_s(int64_t a, int64_t b, const xs_site *s) {
     if (b < 0) XS_FAIL("negative exponent of an int: write Number(a) ** b", s);
     int64_t r = 1;
     while (b) {
-        if (b & 1) { if (__builtin_mul_overflow(r, a, &r)) XS_FAIL("integer overflow", s); }
+        if (b & 1) { if (__builtin_mul_overflow(r, a, &r) || XS_IOUT(r)) XS_FAIL(XS_IOVF_MSG, s); }
         b >>= 1;
-        if (b && __builtin_mul_overflow(a, a, &a)) XS_FAIL("integer overflow", s);
+        if (b && (__builtin_mul_overflow(a, a, &a) || XS_IOUT(a))) XS_FAIL(XS_IOVF_MSG, s);
     }
     return r;
 }

@@ -1,5 +1,5 @@
-runtime error: integer overflow
-    at down (tests/stack/recursion.ts:3:38)
+runtime error: integer overflow: the result left JavaScript's safe integer range (+-2^53 - 1); use number or bigint
+    at down (tests/stack/recursion.ts:3:35)
     at down (tests/stack/recursion.ts:5:10)
     at down (tests/stack/recursion.ts:5:10)
     at down (tests/stack/recursion.ts:5:10)

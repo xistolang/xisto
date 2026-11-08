@@ -307,14 +307,14 @@ Token lexer_next(Lexer *lx) {
             unsigned long long v = strtoull(clean + 2, &end, base);
             if (*end || end == clean + 2) xs_error(pos, NULL, "malformed %s literal", base == 2 ? "binary" : "octal");
             t.num = (double)v;
-            if (v < 9223372036854775807ULL) { t.ival = (long long)v; t.is_int_lit = true; }
+            if (v <= 9007199254740991ULL) { t.ival = (long long)v; t.is_int_lit = true; } /* an int is a safe integer of JS (XB-075) */
             return t;
         }
         t.num = strtod(clean, NULL);
         if (!strpbrk(clean, ".eE") || (clean[0] == '0' && (clean[1] == 'x' || clean[1] == 'X'))) {
             char *end;
             long long v = strtoll(clean, &end, 0);
-            if (*end == 0 && v < 9223372036854775807LL) {
+            if (*end == 0 && v <= 9007199254740991LL) { /* larger: a number literal, rounded as JS rounds it (XB-075) */
                 t.ival = v;
                 t.is_int_lit = true;
             }

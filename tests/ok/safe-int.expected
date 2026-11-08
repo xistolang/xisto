@@ -1,0 +1,22 @@
+9007199254740991 9007199254740990 -9007199254740991 0
+max+1 -> integer overflow
+-max-1 -9007199254740992
+-max-2 -> integer overflow
+max-(-1) -> integer overflow
+m*m -> integer overflow
+n*n 9007199136250225
+2**53 -> integer overflow
+2**52 4503599627370496
+k 9007199254740991
+k++ -> integer overflow
+(max+2)|0 -> integer overflow
+trunc -> value out of int range: an int is an integer of JavaScript's safe range (+-2^53 - 1); use number or bigint
+trunc ok -9007199254740991
+9007199254740992 9007199254740992 1152921504606847000
+-1 4294967295 -2147483648 4294967295
+3*ok 9007199254740990
+3*hi -> integer overflow
+3*lo -> integer overflow
+grow ok 9007199254740990
+grow hi -> integer overflow
+gap 456789

@@ -530,6 +530,8 @@ typedef struct BceGArr { const char *name; int64_t n; bool has_rng; int64_t lo, 
 static BceGArr *garr_find(const char *c);
 static Rng rng_of(Expr *e);
 static bool pow2_of(Expr *e, int depth);
+static bool rv_valid; /* (the range tables, below) */
+static Func *rv_owner;
 static bool nn_expr(Expr *e);
 static int byte_hoist_find(Expr *a);
 static bool bce_safe(Expr *e); /* an index the loop already checks (see bce_enter) */
@@ -994,9 +996,11 @@ static void emit_expr(Expr *e);
 /* an operand of a bitwise operator as uint32_t (ToInt32, then its bits) */
 static void emit_u32(Expr *e) {
     if (e->kind == E_BINARY && (e->op == TK_PLUS || e->op == TK_MINUS) && e->type->kind == TY_INT && !xs_debug &&
-        (e->lhs->type->kind == TY_INT || e->lhs->type->kind == TY_LITINT) && (e->rhs->type->kind == TY_INT || e->rhs->type->kind == TY_LITINT)) {
+        (e->lhs->type->kind == TY_INT || e->lhs->type->kind == TY_LITINT) && (e->rhs->type->kind == TY_INT || e->rhs->type->kind == TY_LITINT) &&
+        rng_of(e).ok) {
         /* (a + b) >> 1, (h - k) & m: only the low 32 bits are kept, and those of the exact sum are those of the
-           sum mod 2^32, so no overflow check (the check stays wherever the whole sum is used) */
+           sum mod 2^32, so no overflow check — when the sum provably stays a safe integer: past 2^53 JS rounds the
+           sum before the 32-bit operator and the low bits differ (XB-075); without the proof the checked sum is used */
         buf_puts(out, "((uint32_t)(");
         emit_u32(e->lhs);
         buf_puts(out, e->op == TK_PLUS ? " + " : " - ");
@@ -2590,6 +2594,19 @@ static void emit_expr_raw(Expr *e) {
         if (e->lhs->type->kind == TY_INT && (e->op == TK_PLUS || e->op == TK_MINUS || e->op == TK_STAR || e->op == TK_PERCENT || e->op == TK_SLASH)) {
             const char *fn = e->op == TK_PLUS ? "xs_iadd" : e->op == TK_MINUS ? "xs_isub" : e->op == TK_STAR ? "xs_imul"
                            : e->op == TK_PERCENT ? "xs_imod" : "xs_idiv";
+            /* both operands never negative (XB-075): a sum or product can only cross the top of the safe range, one
+               comparison; a difference of two of them stays inside it, no test at all */
+            bool nn2 = (e->op == TK_PLUS || e->op == TK_MINUS || e->op == TK_STAR) && !getenv("XISTO_NO_NONNEG") && rv_valid &&
+                       rv_owner == cur_func && !ictx && nn_expr(e->lhs) && nn_expr(e->rhs);
+            if (nn2 && e->op == TK_MINUS) {
+                buf_puts(out, "((int64_t)(");
+                emit_expr(e->lhs);
+                buf_puts(out, ") - (int64_t)(");
+                emit_expr(e->rhs);
+                buf_puts(out, "))");
+                return;
+            }
+            if (nn2) fn = e->op == TK_PLUS ? "xs_iadd_nn" : "xs_imul_nn";
             buf_printf(out, "%s%s(", fn, e->op == TK_SLASH ? "" : "_s");
             emit_expr(e->lhs);
             buf_puts(out, ", ");
@@ -3792,7 +3809,7 @@ static EScope *jump_target(bool is_break) {
 }
 
 /* `for (...; i < n; i++)` whose body never writes i: when the update runs, i < n held at the start of the
-   iteration, so i + 1 <= n <= INT64_MAX and the increment needs no overflow check. Without the check (a
+   iteration, so i + 1 <= n <= 2^53 - 1 (every int is a safe integer) and the increment needs no overflow check. Without the check (a
    branch to an error) the C compiler can vectorize the loop. */
 static bool writes_name(Expr *e, const char *c);
 static bool stmt_writes_name(Stmt *s, const char *c) {
@@ -3843,8 +3860,9 @@ static bool cig_find(const char *c, int64_t *v) {
     return false;
 }
 static Rng rng_none(void) { return (Rng){false, 0, 0}; }
+#define RNG_SAFE INT64_C(9007199254740991) /* an int is a safe integer of JS (XB-075): a result outside is checked */
 static Rng rng_mk(__int128 lo, __int128 hi) {
-    if (lo < INT64_MIN || hi > INT64_MAX) return rng_none();
+    if (lo < -RNG_SAFE || hi > RNG_SAFE) return rng_none();
     return (Rng){true, (int64_t)lo, (int64_t)hi};
 }
 static Rng rng_union(Rng a, Rng b) { if (!a.ok || !b.ok) return rng_none(); return (Rng){true, a.lo < b.lo ? a.lo : b.lo, a.hi > b.hi ? a.hi : b.hi}; }
@@ -4111,7 +4129,7 @@ static void rv_compute(Func *owner, Stmt **stmts, int n) {
                 Rng x;
                 if (rv_defs[d].loop) { /* i from its start below the bound: [start, bound - 1] */
                     Rng b = rng_of(rv_defs[d].loop->cond->rhs);
-                    x = b.ok ? (Rng){true, INT64_MIN, b.hi - 1} : rng_none();
+                    x = b.ok ? (Rng){true, -RNG_SAFE, b.hi - 1} : rng_none();
                     /* a counter declared by the loop itself is only read inside it, where it is below the bound: its
                        start does not widen the top (j = i + 1 in `for (let j = i + 1; j < N; j++)` stays under N) */
                     Stmt *fi = rv_defs[d].loop->for_init;
@@ -5887,11 +5905,11 @@ static void emit_spine(Func *f, Spine *sp) {
     nl();
     buf_puts(out, "if (");
     emit_expr(sp->base->cond);
-    if (sp->k) buf_printf(out, ") return xs_iadd_s(acc_, INT64_C(%lld), XS_S(%d));", (long long)sp->k, new_site(sp->ret->pos));
+    if (sp->k) buf_printf(out, ") return xs_iadd_nn_s(acc_, INT64_C(%lld), XS_S(%d));", (long long)sp->k, new_site(sp->ret->pos));
     else buf_puts(out, ") return acc_;");
     nl();
-    buf_puts(out, "acc_ = xs_iadd_s(acc_, ");
-    if (sp->c) buf_printf(out, "xs_iadd_s(INT64_C(%lld), ", (long long)sp->c);
+    buf_puts(out, "acc_ = xs_iadd_nn_s(acc_, "); /* (every term is >= 0: only the top of the range can be crossed) */
+    if (sp->c) buf_printf(out, "xs_iadd_nn_s(INT64_C(%lld), ", (long long)sp->c);
     emit_expr(sp->calls[0]);
     if (sp->c) buf_printf(out, ", XS_S(%d))", new_site(sp->ret->pos));
     buf_printf(out, ", XS_S(%d));", new_site(sp->ret->pos));

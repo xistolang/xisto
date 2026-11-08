@@ -390,18 +390,14 @@ static void emit_write_at(Expr *target, const char *v, const char *p) {
 }
 
 static char *checked_add_sub(const char *a, const char *b, bool sub) {
-    char *r = tmp(), *x = tmp(), *y = tmp(), *z = tmp(), *c = tmp();
+    /* ints are safe integers of JS (XB-075): a sum or difference of two cannot overflow 64 bits, and it is an
+       error when it leaves -2^53 .. 2^53 - 1 */
+    char *r = tmp(), *x = tmp(), *c = tmp();
     char *ovf = label("ovf"), *ok = label("ok");
     ins("%s =l %s %s, %s", r, sub ? "sub" : "add", a, b);
-    if (sub) {
-        ins("%s =l xor %s, %s", x, a, b);
-        ins("%s =l xor %s, %s", y, a, r);
-    } else {
-        ins("%s =l xor %s, %s", x, a, r);
-        ins("%s =l xor %s, %s", y, b, r);
-    }
-    ins("%s =l and %s, %s", z, x, y);
-    ins("%s =w csltl %s, 0", c, z);
+    ins("%s =l sar %s, 53", x, r); /* in range: r >> 53 is 0 or -1 (as the C runtime's XS_IOUT) */
+    ins("%s =l add %s, 1", x, x);
+    ins("%s =w cugtl %s, 1", c, x);
     ins("jnz %s, %s, %s", c, ovf, ok);
     blk(ovf);
     ins("call $xr_panic_overflow()");

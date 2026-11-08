@@ -2246,7 +2246,7 @@ static bool fold_lit_int(Expr *e) {
         }
     }
     e->kind = E_NUMBER;
-    e->is_int_lit = true;
+    e->is_int_lit = r >= -9007199254740991LL && r <= 9007199254740991LL; /* 2 ** 53: exact, but a number, not an int (XB-075) */
     e->ival = r;
     e->num = (double)r;
     e->lhs = e->rhs = NULL;
@@ -2449,6 +2449,8 @@ static void check_expr(Expr *e, Type *expected) {
                 if (o->type->kind != TY_INT) ints = false;
             }
             if (e->rhs->kind == E_UNARY && e->rhs->op == TK_MINUS) ints = false; /* 10 ** -2: a fraction */
+            { long long la, lb; /* 2 ** 60: two literals whose power leaves the safe range (fold_lit_int left it): a number, as in JS */
+              if (ints && lit_int_of(e->lhs, &la) && lit_int_of(e->rhs, &lb)) ints = false; }
             if (!ints) for (int k = 0; k < 2; k++) {
                 Expr **o = k ? &e->rhs : &e->lhs;
                 if ((*o)->type->kind == TY_INT) date_num_arg(o, "operand of '**'");

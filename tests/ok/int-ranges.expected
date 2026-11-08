@@ -1,7 +1,7 @@
 safe 19688 0
 written counter 24
-caught: integer overflow
-y 1138687895316952404
+caught: integer overflow: the result left JavaScript's safe integer range (+-2^53 - 1); use number or bigint
+caught: integer overflow: the result left JavaScript's safe integer range (+-2^53 - 1); use number or bigint
 fits 3000000
 closure 3000000000001
 neg -10005

@@ -46,7 +46,7 @@ runtime error: array index out of bounds
     at tests/stack/frames.ts:70:15
 exit 70
 == clone
-runtime error: integer overflow
+runtime error: integer overflow: the result left JavaScript's safe integer range (+-2^53 - 1); use number or bigint
     at add (tests/stack/frames.ts:7:12)
     at twice (tests/stack/frames.ts:48:10)
     at tests/stack/frames.ts:73:23
