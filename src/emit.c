@@ -417,7 +417,7 @@ static BceGArr *garr_find(const char *c);
 static Rng rng_of(Expr *e);
 static bool bce_safe(Expr *e); /* an index the loop already checks (see bce_enter) */
 /* u8reg: byte arrays a loop keeps in vector registers (see u8reg_loop) */
-typedef struct { int kind; Expr *a, *src, *lo, *hi; Stmt *loop; } U8Idiom; /* kind 1 copy a[j] = src[j], 2 reverse, 3 shift a[j] = a[j+1] */
+typedef struct { int kind; Expr *a, *src, *lo, *hi, *ca, *cb; Stmt *loop; } U8Idiom; /* kind 1 copy a[j] = src[j], 2 reverse, 3 shift a[j] = a[j+1], 4 trade (a buf, src the table, ca/cb the cursors) */
 static bool match_u8_idiom(Stmt *s, U8Idiom *m);
 static bool u8_is_index_on(Expr *e, const char *c);
 static bool same_simple(Expr *a, Expr *b);
@@ -4451,6 +4451,7 @@ static bool same_simple(Expr *a, Expr *b) {
     if (a->kind == E_NUMBER) return a->num == b->num;
     if (a->kind == E_THIS) return true;
     if (a->kind == E_MEMBER && !a->is_call && !b->is_call) return a->field == b->field && a->field >= 0 && same_simple(a->lhs, b->lhs);
+    if (a->kind == E_BINARY) return a->op == b->op && same_simple(a->lhs, b->lhs) && same_simple(a->rhs, b->rhs);
     return false;
 }
 static Expr *single_expr_stmt(Stmt *b) {
@@ -4496,7 +4497,47 @@ static bool emit_map_add(Stmt *s) {
      for (let j = LO; j < HI; j++) dst[j] = src[j];                                              -> xs_u8_copy_range
    a, dst, src are names of Uint8Array; LO, S, HI pure (numbers, int names, their sums); the counter is not
    written in the body. XISTO_NO_U8_IDIOM=1 keeps the loops. */
+/* text a body wants at its function's entry (emit_func_body puts it after ar_mark); only while the function's
+   body goes to the same buffer */
+static Buf *fn_prelude_out;
+static size_t fn_prelude_pos;
+static Buf fn_prelude_text;
 static bool u8_name(Expr *e) { return e && e->kind == E_IDENT && e->cname && bce_bytes(e->type); }
+/* a + t or b - t, with a name a, the counter t */
+static Expr *u8_cursor(Expr *e, const char *t, bool plus) {
+    if (!e || e->kind != E_BINARY || e->op != (plus ? TK_PLUS : TK_MINUS)) return NULL;
+    if (!e->lhs || e->lhs->kind != E_IDENT || !e->lhs->cname || !e->lhs->type || e->lhs->type->kind != TY_INT) return NULL;
+    if (!e->rhs || e->rhs->kind != E_IDENT || !e->rhs->cname || strcmp(e->rhs->cname, t) != 0) return NULL;
+    return e->lhs;
+}
+static bool u8_at(Expr *e, Expr *arr, Expr *idx) { /* arr[idx] */
+    return e && e->kind == E_INDEX && e->builtin.cfn && strcmp(e->builtin.cfn, "xs_u8_get") == 0 && same_simple(e->lhs, arr) && same_simple(e->rhs, idx);
+}
+/* the trade of reverse-complement (kind 4): { const x = buf[a + t]; buf[a + t] = T[buf[b - t]]; buf[b - t] = T[x]; }
+   with T a Uint8Array the body does not write (a global or a parameter: its context is set up at the function's
+   entry), buf the same array on both sides, the cursors a and b names the body does not write */
+static bool match_u8_trade(Expr *c, const char *t, Stmt *b, U8Idiom *m) {
+    Stmt *d = b->stmts.items[0];
+    if (d->kind != S_VAR || !d->is_const || !d->cname || d->cell || !d->init) return false;
+    Expr *a1 = b->stmts.items[1]->kind == S_EXPR ? b->stmts.items[1]->expr : NULL, *a2 = b->stmts.items[2]->kind == S_EXPR ? b->stmts.items[2]->expr : NULL;
+    if (!a1 || !a2 || a1->kind != E_ASSIGN || a2->kind != E_ASSIGN || a1->op != TK_ASSIGN || a2->op != TK_ASSIGN) return false;
+    Expr *x = d->init;
+    if (!x || x->kind != E_INDEX || !x->builtin.cfn || strcmp(x->builtin.cfn, "xs_u8_get") != 0 || !u8_name(x->lhs)) return false;
+    Expr *buf = x->lhs, *ia = x->rhs, *a = u8_cursor(ia, t, true);
+    if (!a || !u8_at(a1->lhs, buf, ia)) return false;
+    Expr *r1 = a1->rhs;
+    if (!r1 || r1->kind != E_INDEX || !r1->builtin.cfn || strcmp(r1->builtin.cfn, "xs_u8_get") != 0 || !u8_name(r1->lhs)) return false;
+    Expr *T = r1->lhs, *inner = r1->rhs;
+    if (!inner || inner->kind != E_INDEX || !inner->builtin.cfn || strcmp(inner->builtin.cfn, "xs_u8_get") != 0 || !same_simple(inner->lhs, buf)) return false;
+    Expr *ib = inner->rhs, *bb = u8_cursor(ib, t, false);
+    if (!bb || strcmp(bb->cname, a->cname) == 0 || strcmp(T->cname, buf->cname) == 0 || !u8_at(a2->lhs, buf, ib)) return false;
+    Expr *r2 = a2->rhs;
+    if (!r2 || r2->kind != E_INDEX || !r2->builtin.cfn || strcmp(r2->builtin.cfn, "xs_u8_get") != 0 || !same_simple(r2->lhs, T)) return false;
+    if (!r2->rhs || r2->rhs->kind != E_IDENT || !r2->rhs->cname || strcmp(r2->rhs->cname, d->cname) != 0) return false;
+    if (!bce_pure(c->rhs) || stmt_writes_name(b, a->cname) || stmt_writes_name(b, bb->cname) || stmt_writes_name(b, buf->cname) || stmt_writes_name(b, T->cname)) return false;
+    m->kind = 4; m->a = buf; m->src = T; m->hi = c->rhs; m->ca = a; m->cb = bb;
+    return true;
+}
 static bool u8_index_of(Expr *e, Expr *arr, Expr *idx) { /* arr[idx] as the program wrote it */
     return e && e->kind == E_INDEX && e->builtin.cfn && strcmp(e->builtin.cfn, "xs_u8_get") == 0 && same_simple(e->lhs, arr) && same_simple(e->rhs, idx);
 }
@@ -4536,6 +4577,7 @@ static bool match_u8_idiom(Stmt *s, U8Idiom *m) {
         return true;
     }
     if (b->stmts.len != 3 || c->op != TK_LT) return false;
+    if (match_u8_trade(c, i, b, m)) return true;
     /* reverse: cond is i < (S + 1) >> 1 */
     Expr *h = c->rhs;
     if (!h || h->kind != E_BINARY || h->op != TK_SHR || !h->rhs || h->rhs->kind != E_NUMBER || h->rhs->num != 1) return false;
@@ -4564,6 +4606,20 @@ static bool emit_u8_idiom(Stmt *s) {
     if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
     U8Idiom m;
     if (!match_u8_idiom(s, &m)) return false;
+    if (m.kind == 4) { /* xs_u8_trade with the table's context set up once, at the function's entry */
+        if (getenv("XISTO_NO_U8_TRADE") || !fn_prelude_out || fn_prelude_out != out || !cur_func || u8reg_find(m.a) || u8reg_find(m.src)) return false;
+        bool param = false; /* T is in scope at the entry: a parameter, or a global (the function's locals are v_*) */
+        for (int k = 0; k < cur_func->nparams; k++) if (cur_func->params[k].cname && strcmp(cur_func->params[k].cname, m.src->cname) == 0) param = true;
+        if (!param && strncmp(m.src->cname, "g", 1) != 0) return false;
+        if (cur_func->body && stmt_writes_name(cur_func->body, m.src->cname)) return false;
+        int site = new_site(s->pos);
+        buf_printf(&fn_prelude_text, "\n    xs_u8_tr_ctx xs_trc%d_ = xs_u8_tr_setup(%s);", site, ren(m.src->cname));
+        buf_printf(out, "xs_u8_trade(&xs_trc%d_, ", site); emit_borrowed(m.a); buf_puts(out, ", (");
+        emit_expr(m.ca); buf_puts(out, ") + ("); emit_expr(m.lo); buf_puts(out, "), (");
+        emit_expr(m.cb); buf_puts(out, ") - ("); emit_expr(m.lo); buf_puts(out, "), (");
+        emit_expr(m.hi); buf_puts(out, ") - ("); emit_expr(m.lo); buf_printf(out, "), XS_S(%d));", site);
+        return true;
+    }
     int site = new_site(s->pos);
     U8Reg *ra = u8reg_find(m.a), *rs = m.kind == 1 ? u8reg_find(m.src) : NULL;
     if (m.kind == 1) {
@@ -4596,7 +4652,7 @@ static bool u8_stmt_ok(Stmt *s, const char *c, bool in_loop) {
     if (in_loop && s->kind == S_TRY) return false;
     if (in_loop && s->kind == S_FOR && !getenv("XISTO_NO_U8_IDIOM")) {
         U8Idiom m;
-        if (match_u8_idiom(s, &m)) return u8_use_ok(m.lo, c, in_loop) && u8_use_ok(m.hi, c, in_loop); /* the idiom's own uses are fine */
+        if (match_u8_idiom(s, &m) && m.kind != 4) return u8_use_ok(m.lo, c, in_loop) && u8_use_ok(m.hi, c, in_loop); /* the idiom's own uses are fine */
     }
     if (s->kind == S_VAR && s->cname && strcmp(s->cname, c) == 0) return !in_loop; /* its declaration (outside the loop) */
     if (!u8_use_ok(s->init, c, in_loop) || !u8_use_ok(s->expr, c, in_loop) || !u8_use_ok(s->cond, c, in_loop) || !u8_use_ok(s->for_update, c, in_loop)) return false;
@@ -5504,6 +5560,8 @@ static void emit_func_body(Func *f) {
     buf_puts(out, "size_t ar_mark = xs_ar_mark();");
     nl();
     buf_puts(out, "(void)ar_mark;");
+    Buf *saved_pbuf = fn_prelude_out; size_t saved_ppos = fn_prelude_pos; Buf saved_ptext = fn_prelude_text;
+    fn_prelude_out = out; fn_prelude_pos = out->len; fn_prelude_text = (Buf){0};
     emit_prof_enter(f);
     emit_dbg_enter(f);
     dbg_params(f, false, NULL);
@@ -5514,6 +5572,14 @@ static void emit_func_body(Func *f) {
     indent--;
     nl();
     buf_puts(out, "}\n");
+    if (fn_prelude_text.len) { /* what the body asked to have at the entry (emit_u8_idiom: the table setup) */
+        size_t n = fn_prelude_text.len, pos = fn_prelude_pos;
+        buf_puts(out, fn_prelude_text.data); /* (room) */
+        memmove(out->data + pos + n, out->data + pos, out->len - n - pos);
+        memcpy(out->data + pos, fn_prelude_text.data, n);
+        free(fn_prelude_text.data);
+    }
+    fn_prelude_out = saved_pbuf; fn_prelude_pos = saved_ppos; fn_prelude_text = saved_ptext;
     cur_func = NULL;
 }
 
