@@ -4362,9 +4362,11 @@ static xs_arr_int *xs_u8_to_ints(xs_Uint8Array *b) { /* Array.from(bytes) */
    two): there are no Atomics. */
 typedef struct xs_shblk { int64_t refs; int64_t n; } xs_shblk; /* n bytes follow, 16-byte aligned (malloc's) */
 static inline char *xs_shblk_data(xs_shblk *b) { return (char *)(b + 1); }
-/* Linux: a block of 64 MB or more is mapped (not malloc'ed), pre-faulted in one call (MAP_POPULATE: the kernel
-   zero-fills it in bulk instead of one 4 KB fault per page as the program first touches it) and offered huge
-   pages (fewer TLB misses in the loops over it). revcomp-4/5 read 254 MB of stdin straight into such a block. */
+/* Linux: a block of 64 MB or more is mapped (not malloc'ed) and offered huge pages before it is touched
+   (MADV_HUGEPAGE, honoured when THP is "madvise" or "always"): the first touches then fault 2 MB at a time, ~20x
+   fewer faults, and the loops over it miss the TLB less. Measured on the Xeon for 254 MB: calloc + touch 0,141 s
+   of sys, MAP_POPULATE 0,080, huge pages 0,053 (pre-populating the huge pages costs more than touching them as
+   the bytes arrive). revcomp-4/5 read 254 MB of stdin straight into such a block. */
 #if defined(__linux__)
 #include <sys/mman.h>
 #define XS_SHBLK_MAP_MIN ((int64_t)64 << 20)
@@ -4375,10 +4377,10 @@ XS_NOINLINE xs_shblk *xs_shblk_new(int64_t n, bool zero) {
 #if defined(__linux__)
     if (n >= XS_SHBLK_MAP_MIN) {
         size_t sz = sizeof *b + (size_t)n;
-        void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+        void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) xs_panic("out of memory");
 #ifdef MADV_HUGEPAGE
-        madvise(p, sz, MADV_HUGEPAGE);
+        madvise(p, sz, MADV_HUGEPAGE); /* (before any touch: the faults come in 2 MB) */
 #endif
         b = p; /* (zero already) */
         b->refs = 1;
