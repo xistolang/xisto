@@ -509,6 +509,7 @@ __attribute__((noinline)) static void xs_panic_at(const char *msg, const xs_site
 #define XS_IOUT_NN(r) (((r) & (INT64_C(1) << 53)) != 0)
 /* with a constant operand only one side can be crossed: one test (as the 64-bit overflow test was) */
 #define XS_IOUT_ADD(r, b) (__builtin_constant_p(b) ? ((b) >= 0 ? XS_IOUT_HI(r) : XS_IOUT_LO(r)) : XS_IOUT(r))
+#define XS_IADD_C_OUT(a, b) ((b) >= 0 ? (a) > XS_ISAFE_MAX - (b) : (a) < -XS_ISAFE_MAX - 1 - (b))
 #define XS_IOVF_MSG "integer overflow: the result left JavaScript's safe integer range (+-2^53 - 1); use number or bigint"
 __attribute__((noinline)) static void xs_panic_at(const char *msg, const xs_site *site) {
     xs_trace_capture(&xs_panic_trace, site);
@@ -2003,7 +2004,7 @@ static __attribute__((noinline)) void xs_map_add_slow_i(xs_map *m, int64_t k, in
     }
     XS_MAP_WIDE(m);
     xs_map_entry *e = xs_map_lookup(m, NULL, k);
-    if (e) { { int64_t r_ = (int64_t)((uint64_t)(e->val.i) + (uint64_t)d); if (__builtin_expect(XS_IOUT_ADD(r_, d), 0)) XS_FAIL(XS_IOVF_MSG, s); e->val.i = r_; } }
+    if (e) { { if (__builtin_expect(__builtin_constant_p(d) ? XS_IADD_C_OUT(e->val.i, d) : XS_IOUT((int64_t)((uint64_t)(e->val.i) + (uint64_t)d)), 0)) XS_FAIL(XS_IOVF_MSG, s); e->val.i += d; } }
     else xs_map_put(m, NULL, k, XS_VINT(d));
 }
 static inline __attribute__((always_inline)) xs_map_entry *xs_map_seek_i(xs_map *m, int64_t k) {
@@ -2051,7 +2052,7 @@ static inline __attribute__((always_inline)) void xs_map_add_i(xs_map *m, int64_
             }
     } else {
         xs_map_entry *e = xs_map_seek_i(m, k);
-        if (__builtin_expect(e != NULL, 1)) { { int64_t r_ = (int64_t)((uint64_t)(e->val.i) + (uint64_t)d); if (__builtin_expect(XS_IOUT_ADD(r_, d), 0)) XS_FAIL(XS_IOVF_MSG, s); e->val.i = r_; } return; }
+        if (__builtin_expect(e != NULL, 1)) { { if (__builtin_expect(__builtin_constant_p(d) ? XS_IADD_C_OUT(e->val.i, d) : XS_IOUT((int64_t)((uint64_t)(e->val.i) + (uint64_t)d)), 0)) XS_FAIL(XS_IOVF_MSG, s); e->val.i += d; } return; }
     }
 slow:
     xs_map_add_slow_i(m, k, d, s);
@@ -2095,7 +2096,7 @@ static inline __attribute__((always_inline)) void xs_map_add_hc(xs_map *m, xs_ma
             for (xs_map_gmask mm = xs_map_gmatch(g, h2); mm; mm &= mm - 1) {
                 size_t i = (pos + XS_MAP_GBIT(mm)) & mask;
                 if (__builtin_expect(slots[i].ikey == k, 1)) {
-                    { int64_t r_ = (int64_t)((uint64_t)(slots[i].val.i) + (uint64_t)d); if (__builtin_expect(XS_IOUT_ADD(r_, d), 0)) XS_FAIL(XS_IOVF_MSG, s); slots[i].val.i = r_; }
+                    { if (__builtin_expect(__builtin_constant_p(d) ? XS_IADD_C_OUT(slots[i].val.i, d) : XS_IOUT((int64_t)((uint64_t)(slots[i].val.i) + (uint64_t)d)), 0)) XS_FAIL(XS_IOVF_MSG, s); slots[i].val.i += d; }
                     return;
                 }
             }
@@ -2502,15 +2503,20 @@ static xs_str *xs_arr_join_str(xs_arr_ref *a, xs_str *sep) { return xs_arr_join_
 
 /* The _s forms take the source position of the operation (the compiler passes &xs_sitetab[n]); it is only
    read on the error path. */
+/* with a constant operand the test is on the other operand, before the operation: a + b leaves the range iff a
+   passes MAX - b (one compare against a constant the compiler hoists; testing the result made clang rebuild the
+   constant inside fannkuch's flip loop: +7% on the Xeon) */
 XS_AI int64_t xs_iadd_s(int64_t a, int64_t b, const xs_site *s) {
     if (__builtin_constant_p(a) && !__builtin_constant_p(b)) { int64_t t = a; a = b; b = t; }
+    if (__builtin_constant_p(b)) { if (__builtin_expect(XS_IADD_C_OUT(a, b), 0)) XS_FAIL(XS_IOVF_MSG, s); return a + b; }
     int64_t r = (int64_t)((uint64_t)a + (uint64_t)b);
-    if (__builtin_expect(XS_IOUT_ADD(r, b), 0)) XS_FAIL(XS_IOVF_MSG, s);
+    if (__builtin_expect(XS_IOUT(r), 0)) XS_FAIL(XS_IOVF_MSG, s);
     return r;
 }
 XS_AI int64_t xs_isub_s(int64_t a, int64_t b, const xs_site *s) {
+    if (__builtin_constant_p(b)) { if (__builtin_expect(XS_IADD_C_OUT(a, -(b)), 0)) XS_FAIL(XS_IOVF_MSG, s); return a - b; }
     int64_t r = (int64_t)((uint64_t)a - (uint64_t)b);
-    if (__builtin_expect(__builtin_constant_p(b) ? (b >= 0 ? XS_IOUT_LO(r) : XS_IOUT_HI(r)) : XS_IOUT(r), 0)) XS_FAIL(XS_IOVF_MSG, s);
+    if (__builtin_expect(XS_IOUT(r), 0)) XS_FAIL(XS_IOVF_MSG, s);
     return r;
 }
 XS_AI int64_t xs_imul_s(int64_t a, int64_t b, const xs_site *s) {
