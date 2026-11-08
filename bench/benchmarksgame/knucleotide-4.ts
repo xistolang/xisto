@@ -7,7 +7,7 @@ read from a table of powers of four, then the next one in. The compiler knows th
 within the table's range, so the modulo is a mask and the key cannot overflow: no checks in the loop.
  */
 
-import { readFileSync } from "node:fs";
+import { fstatSync, readFileSync, readSync } from "node:fs";
 import { availableParallelism } from "node:os";
 import { Worker, isMainThread, parentPort } from "node:worker_threads";
 
@@ -66,8 +66,42 @@ function specific(counts: Map<int, int>, code: string): string {
   return `${counts.has(key) ? counts.get(key)! : 0}\t${code}\n`;
 }
 
-// the third sequence, two bits per nucleotide (one per byte), on shared memory
+// the third sequence, two bits per nucleotide (one per byte). From a file the input is read in blocks of 1 MB and
+// converted as it comes, straight into the shared memory (only the sequence is ever held: ~125 MB, not the 254 MB
+// of the input as well); from a pipe it is read whole
 function sequence(): Uint8Array {
+  const st = fstatSync(0);
+  if (!st.isFile() || st.size <= 0) return sequenceWhole(); // (a pipe's size is what it holds at the moment)
+  const size: int = st.size;
+  const seq = new Uint8Array(new SharedArrayBuffer(size));
+  const block = new Uint8Array(1 << 20);
+  let len: int = 0;
+  let state: int = 0; // 0: looking for the line ">TH..."; 1: the rest of that line; 2: in the sequence
+  let lineStart = true;
+  let matched: int = 0; // of ">TH" at the start of a line
+  while (state < 3) {
+    const got = readSync(0, block, 0, block.length, null);
+    if (got <= 0) break;
+    for (let i = 0; i < got; i++) {
+      const c = block[i];
+      if (state === 2) {
+        if (c === 62) { state = 3; break; }
+        if (c !== 10) { seq[len] = (c >> 1) & 3; len++; } // a c g t, A C G T: 0 1 3 2
+      } else if (state === 1) {
+        if (c === 10) state = 2;
+      } else {
+        if (lineStart && c === 62) matched = 1;
+        else if (matched === 1 && c === 84) matched = 2;
+        else if (matched === 2 && c === 72) { matched = 0; state = 1; }
+        else matched = 0;
+        lineStart = c === 10;
+      }
+    }
+  }
+  return seq.subarray(0, len);
+}
+
+function sequenceWhole(): Uint8Array {
   const input = readFileSync(0);
   const n: int = input.length;
   let at: int = 0;

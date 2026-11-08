@@ -4515,12 +4515,9 @@ static bool emit_map_add(Stmt *s) {
     while (g && g->kind == E_AS && g->op == TK_NOT && !g->elem_type) g = g->lhs; /* m.get(k)! */
     if (!map_call(g, "get", m, 1) || !same_simple(g->args.items[0], k)) return false;
     int site = new_site(sum->pos);
-    buf_puts(out, "{ xs_map_entry *me_ = xs_map_seek_i(");
-    emit_borrowed(m); buf_puts(out, ", "); emit_expr(k);
-    buf_puts(out, "); if (__builtin_expect(me_ != NULL, 1)) me_->val.i = xs_iadd_s(me_->val.i, ");
-    emit_expr(d); buf_printf(out, ", XS_S(%d)); else xs_map_add_slow_i(", site);
-    emit_borrowed(m); buf_puts(out, ", "); emit_expr(k); buf_puts(out, ", ");
-    emit_expr(d); buf_puts(out, "); }");
+    buf_puts(out, "xs_map_add_i(");
+    emit_borrowed(m); buf_puts(out, ", "); emit_expr(k); buf_puts(out, ", "); emit_expr(d);
+    buf_printf(out, ", XS_S(%d));", site);
     return true;
 }
 /* Two loops over byte arrays that are one runtime call (bounds checked once; a 16-byte shuffle or a memmove):

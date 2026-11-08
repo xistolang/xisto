@@ -1577,6 +1577,8 @@ typedef struct xs_map {
     size_t norder, order_cap;
     size_t cap, count, used; /* used: live and deleted slots (what fills the table) */
     bool is_map, str_keys;
+    bool compact; /* a Map<int, int> whose keys and values all fit in 32 bits so far: 8-byte slots (key low, value
+                     high), read only by the counting idiom (xs_map_add_i) and put; anything else widens it first */
     int val_kind; /* 0 num, 1 int, 2 bool, 3 heap pointer */
     void (*print_key)(void *);
     void (*print_val)(void *);
@@ -1667,7 +1669,10 @@ static void xs_map_free(void *p) {
 }
 
 /* iterates the live entries in insertion order; e points at each (key and value in place) */
-#define XS_MAP_EACH(m, e) for (size_t oi_ = 0; oi_ < (m)->norder; oi_++) if (XS_MAP_FULL(m, (m)->order[oi_]) && ((e = &(m)->slots[(m)->order[oi_]]), 1))
+static size_t xs_map_pf_min = 4096; /* slots: below, the table is in the L1/L2 and the prefetch is only an instruction */
+static void xs_map_widen(struct xs_map *m);
+#define XS_MAP_WIDE(m) ((m)->compact ? xs_map_widen(m) : (void)0)
+#define XS_MAP_EACH(m, e) for (size_t oi_ = (XS_MAP_WIDE(m), 0); oi_ < (m)->norder; oi_++) if (XS_MAP_FULL(m, (m)->order[oi_]) && ((e = &(m)->slots[(m)->order[oi_]]), 1))
 
 static void xs_print_num(double v);
 static void xs_print_int(int64_t v);
@@ -1703,7 +1708,7 @@ static void xs_map_alloc(xs_map *m, size_t cap) {
     if (cap > (size_t)UINT32_MAX) xs_panic("out of memory"); /* (order[] holds 32-bit slots) */
     m->cap = cap;
     m->ctrl = malloc(cap + XS_MAP_GW);
-    m->slots = malloc(cap * sizeof(xs_map_entry)); /* (only a full slot is ever read) */
+    m->slots = malloc(cap * (m->compact ? sizeof(uint64_t) : sizeof(xs_map_entry))); /* (only a full slot is ever read) */
     if (!m->ctrl || !m->slots) xs_panic("out of memory");
     memset(m->ctrl, XS_MAP_EMPTY, cap + XS_MAP_GW);
     m->used = 0;
@@ -1719,6 +1724,23 @@ static xs_map *xs_map_new(int is_map, int str_keys, int val_kind, void (*print_k
     m->lk = NULL;
     m->lidx = 0;
     m->lhit = NULL;
+    static int no_compact = -1;
+    if (no_compact < 0) {
+        no_compact = getenv("XISTO_NO_MAP_COMPACT") != NULL;
+        const char *pf = getenv("XISTO_MAP_PF_MIN"); /* measuring knob: the table size from which a probe prefetches its slot */
+        if (pf) xs_map_pf_min = (size_t)strtoull(pf, NULL, 10);
+    }
+    /* compact tables pay where the cache does: on the Graviton2 (1 MB L2) k-nucleotide's k = 12 frame 3,0-4,2 -> 2,0 s;
+       on the Xeon the extra checks cost 7-13% and the table already fits, so x86 keeps 16-byte slots
+       (XISTO_MAP_COMPACT=1 forces them, XISTO_NO_MAP_COMPACT=1 turns them off) */
+#if defined(__aarch64__)
+    bool compact_default = true;
+#else
+    bool compact_default = false;
+#endif
+    static int force_compact = -1;
+    if (force_compact < 0) force_compact = getenv("XISTO_MAP_COMPACT") != NULL;
+    m->compact = m->is_map && !m->str_keys && val_kind == 1 && !no_compact && (compact_default || force_compact);
     xs_map_alloc(m, 16);
     return m;
 }
@@ -1732,6 +1754,7 @@ static inline void xs_map_set_ctrl(xs_map *m, size_t i, uint8_t c) {
    the empty slot it would take), lhit = its entry or NULL. Groups are probed in triangular steps, which visit
    every group of a power-of-two table. */
 static inline xs_map_entry *xs_map_probe_i(xs_map *m, int64_t k) {
+    XS_MAP_WIDE(m);
     uint64_t h = xs_hash_int(k);
     size_t mask = m->cap - 1, pos = (size_t)h & mask, stride = 0;
     uint8_t h2 = XS_MAP_H2(h);
@@ -1794,6 +1817,28 @@ static void xs_map_order_push(xs_map *m, size_t idx) {
 static void xs_map_grow(xs_map *m) {
     m->lidx = 0;
     m->lhit = NULL;
+    if (m->compact) { /* the same, 8-byte slots */
+        uint8_t *oc = m->ctrl;
+        uint64_t *os = (uint64_t *)m->slots;
+        size_t cap = m->cap;
+        if (m->count * 16 > cap * 7) cap *= 2;
+        xs_map_alloc(m, cap);
+        uint64_t *ns = (uint64_t *)m->slots;
+        size_t j = 0;
+        for (size_t oi = 0; oi < m->norder; oi++) {
+            size_t s = m->order[oi];
+            if (oc[s] >= 0x80) continue;
+            uint64_t h = xs_hash_int((int64_t)(int32_t)(uint32_t)os[s]);
+            size_t i = xs_map_free_slot(m, h);
+            xs_map_set_ctrl(m, i, XS_MAP_H2(h));
+            ns[i] = os[s];
+            m->order[j++] = (uint32_t)i;
+        }
+        m->norder = m->used = j;
+        free(oc);
+        free(os);
+        return;
+    }
     uint8_t *old_ctrl = m->ctrl;
     xs_map_entry *old = m->slots;
     size_t cap = m->cap;
@@ -1840,7 +1885,25 @@ static size_t xs_map_find_s(xs_map *m, xs_str *k, uint64_t h) {
     return i;
 }
 /* value is owned when val_kind == 3 */
+static size_t xs_map_cfind(xs_map *m, int32_t k, uint64_t h);
 static xs_map *xs_map_put(xs_map *m, xs_str *skey, int64_t ikey, xs_val val) {
+    if (m->compact) {
+        if ((int32_t)ikey == ikey && (int32_t)val.i == val.i) {
+            if ((m->used + 1) * 8 > m->cap * 7) xs_map_grow(m);
+            uint64_t h = xs_hash_int(ikey);
+            size_t i = xs_map_cfind(m, (int32_t)ikey, h);
+            uint64_t *cs = (uint64_t *)m->slots;
+            uint64_t w = (uint64_t)(uint32_t)(int32_t)ikey | ((uint64_t)(uint32_t)(int32_t)val.i << 32);
+            if (XS_MAP_FULL(m, i)) { cs[i] = w; return m; }
+            m->used++;
+            xs_map_set_ctrl(m, i, XS_MAP_H2(h));
+            xs_map_order_push(m, i);
+            cs[i] = w;
+            m->count++;
+            return m;
+        }
+        xs_map_widen(m);
+    }
     if ((m->used + 1) * 8 > m->cap * 7) xs_map_grow(m);
     uint64_t h = m->str_keys ? xs_map_hash_s(m, skey) : xs_hash_int(ikey);
     size_t i = m->str_keys ? xs_map_find_s(m, skey, h) : xs_map_find_i(m, ikey);
@@ -1870,6 +1933,7 @@ static inline __attribute__((always_inline)) xs_map *xs_map_set_i(xs_map *m, int
 }
 
 static xs_map_entry *xs_map_lookup(xs_map *m, xs_str *skey, int64_t ikey) {
+    XS_MAP_WIDE(m);
     if (!m->str_keys) return m->lidx && m->lik == ikey ? m->lhit : xs_map_probe_i(m, ikey);
     size_t i = xs_map_find_s(m, skey, xs_map_hash_s(m, skey));
     return XS_MAP_FULL(m, i) ? &m->slots[i] : NULL;
@@ -1886,7 +1950,48 @@ static inline __attribute__((always_inline)) bool xs_map_has_i(xs_map *m, int64_
 /* m.set(k, m.get(k) + d) / m.set(k, d) (emit.c emit_map_add): one probe that does not touch the last-key cache (its
    three stores, and the reloads of cap/ctrl/slots they force on the compiler: on the Neoverse N1 the loop had 61
    instructions per symbol against the Rust table's 28), the insert out of line so m stays in a register */
-static __attribute__((noinline)) void xs_map_add_slow_i(xs_map *m, int64_t k, int64_t d) { xs_map_put(m, NULL, k, XS_VINT(d)); }
+/* the slot of a key in a compact table: its own, or the empty one it would take */
+static size_t xs_map_cfind(xs_map *m, int32_t k, uint64_t h) {
+    size_t mask = m->cap - 1, pos = (size_t)h & mask, stride = 0;
+    uint8_t h2 = XS_MAP_H2(h);
+    const uint64_t *cs = (const uint64_t *)m->slots;
+    for (;;) {
+        const uint8_t *g = m->ctrl + pos;
+        for (xs_map_gmask mm = xs_map_gmatch(g, h2); mm; mm &= mm - 1) {
+            size_t i = (pos + XS_MAP_GBIT(mm)) & mask;
+            if ((int32_t)(uint32_t)cs[i] == k) return i;
+        }
+        xs_map_gmask em = xs_map_gmatch(g, XS_MAP_EMPTY);
+        if (em) return (pos + XS_MAP_GBIT(em)) & mask;
+        stride += XS_MAP_GW;
+        pos = (pos + stride) & mask;
+    }
+}
+/* a compact table to 16-byte slots, in place (the same slots and order): before anything but the counting idiom */
+static __attribute__((noinline)) void xs_map_widen(xs_map *m) {
+    if (!m->compact) return;
+    uint64_t *cs = (uint64_t *)m->slots;
+    xs_map_entry *ws = malloc(m->cap * sizeof(xs_map_entry));
+    if (!ws) xs_panic("out of memory");
+    for (size_t i = 0; i < m->cap; i++)
+        if (XS_MAP_FULL(m, i)) { ws[i].ikey = (int64_t)(int32_t)(uint32_t)cs[i]; ws[i].val.i = (int64_t)(int32_t)(uint32_t)(cs[i] >> 32); }
+    free(cs);
+    m->slots = ws;
+    m->compact = false;
+    m->lidx = 0;
+    m->lhit = NULL;
+}
+/* the insert of the counting idiom, and every case the inline path leaves: a key or a sum past 32 bits widens */
+static __attribute__((noinline)) void xs_map_add_slow_i(xs_map *m, int64_t k, int64_t d, const xs_site *s) {
+    if (m->compact && (int32_t)k == k) {
+        size_t i = xs_map_cfind(m, (int32_t)k, xs_hash_int(k));
+        if (!XS_MAP_FULL(m, i)) { if ((int32_t)d == d) { xs_map_put(m, NULL, k, XS_VINT(d)); return; } }
+    }
+    XS_MAP_WIDE(m);
+    xs_map_entry *e = xs_map_lookup(m, NULL, k);
+    if (e) { if (__builtin_add_overflow(e->val.i, d, &e->val.i)) XS_FAIL("integer overflow", s); }
+    else xs_map_put(m, NULL, k, XS_VINT(d));
+}
 static inline __attribute__((always_inline)) xs_map_entry *xs_map_seek_i(xs_map *m, int64_t k) {
     uint64_t h = xs_hash_int(k);
     size_t mask = m->cap - 1, pos = (size_t)h & mask, stride = 0;
@@ -1905,6 +2010,38 @@ static inline __attribute__((always_inline)) xs_map_entry *xs_map_seek_i(xs_map 
         pos = (pos + stride) & mask;
     }
 }
+/* m.set(k, (m.get(k) ?? ...) + d): the compact table's slot holds the key in its low 32 bits and the value in the
+   high ones; a sum that leaves 32 bits goes to the slow path, which widens the table and adds there (checked) */
+static inline __attribute__((always_inline)) void xs_map_add_i(xs_map *m, int64_t k, int64_t d, const xs_site *s) {
+    if (__builtin_expect(m->compact, 1)) {
+        uint64_t h = xs_hash_int(k);
+        size_t mask = m->cap - 1, pos = (size_t)h & mask, stride = 0;
+        uint8_t h2 = XS_MAP_H2(h);
+        const uint8_t *ctrl = m->ctrl;
+        uint64_t *cs = (uint64_t *)m->slots;
+        if (mask >= xs_map_pf_min) __builtin_prefetch(&cs[pos]);
+        if (__builtin_expect((int32_t)k == k, 1))
+            for (;;) {
+                const uint8_t *g = ctrl + pos;
+                for (xs_map_gmask mm = xs_map_gmatch(g, h2); mm; mm &= mm - 1) {
+                    size_t i = (pos + XS_MAP_GBIT(mm)) & mask;
+                    if (__builtin_expect((int32_t)(uint32_t)cs[i] == (int32_t)k, 1)) {
+                        int64_t v = (int64_t)(int32_t)(uint32_t)(cs[i] >> 32) + d;
+                        if (__builtin_expect((int32_t)v == v, 1)) { cs[i] = (uint32_t)cs[i] | ((uint64_t)(uint32_t)(int32_t)v << 32); return; }
+                        goto slow;
+                    }
+                }
+                if (__builtin_expect(xs_map_gmatch(g, XS_MAP_EMPTY) != 0, 1)) goto slow;
+                stride += XS_MAP_GW;
+                pos = (pos + stride) & mask;
+            }
+    } else {
+        xs_map_entry *e = xs_map_seek_i(m, k);
+        if (__builtin_expect(e != NULL, 1)) { if (__builtin_add_overflow(e->val.i, d, &e->val.i)) XS_FAIL("integer overflow", s); return; }
+    }
+slow:
+    xs_map_add_slow_i(m, k, d, s);
+}
 static bool xs_map_delete_at(xs_map *m, xs_map_entry *e) {
     if (!e) return false;
     m->lidx = 0;
@@ -1920,6 +2057,7 @@ static bool xs_map_delete_i(xs_map *m, int64_t k) { return xs_map_delete_at(m, x
 static void xs_map_clear(xs_map *m) {
     m->lidx = 0;
     m->lhit = NULL;
+    if (m->compact) { memset(m->ctrl, XS_MAP_EMPTY, m->cap + XS_MAP_GW); m->used = m->norder = m->count = 0; return; }
     for (size_t i = 0; i < m->cap; i++) if (XS_MAP_FULL(m, i)) xs_map_delete_at(m, &m->slots[i]);
     memset(m->ctrl, XS_MAP_EMPTY, m->cap + XS_MAP_GW);
     m->used = 0;
