@@ -24,6 +24,30 @@ static int ntp;
 static char **subst_names;
 static Type **subst_types;
 static int nsubst;
+/* the substitution in force (a generic class's instance): kept with a template written inside it, so its
+   own instances bind the class's parameters too */
+typedef struct { char **names; Type **types; int n; } Subst;
+static Subst *subst_save(void) {
+    if (!nsubst) return NULL;
+    Subst *s = xs_alloc(sizeof *s);
+    s->names = subst_names; s->types = subst_types; s->n = nsubst;
+    return s;
+}
+/* outer (may be NULL) followed by names/types */
+static void subst_push(Subst *outer, char **names, Type **types, int n) {
+    int no = outer ? outer->n : 0;
+    char **nn = xs_alloc(sizeof(char *) * (size_t)(no + n + 1));
+    Type **tt = xs_alloc(sizeof(Type *) * (size_t)(no + n + 1));
+    for (int i = 0; i < no; i++) { nn[i] = outer->names[i]; tt[i] = outer->types[i]; }
+    for (int i = 0; i < n; i++) { nn[no + i] = names[i]; tt[no + i] = types[i]; }
+    subst_names = nn; subst_types = tt; nsubst = no + n;
+}
+static void tp_push(char **names, int n) { /* the type parameters in scope: the enclosing template's and these */
+    char **nn = xs_alloc(sizeof(char *) * (size_t)(ntp + n + 1));
+    for (int i = 0; i < ntp; i++) nn[i] = tp_names[i];
+    for (int i = 0; i < n; i++) nn[ntp + i] = names[i];
+    tp_names = nn; ntp += n;
+}
 
 static void next(Parser *p) {
     p->prev_end = p->tok.start ? p->tok.start + p->tok.len : NULL;
@@ -291,6 +315,8 @@ static void parse_args(Parser *p, ExprList *out) {
     if (!at(p, TK_RPAREN)) {
         do {
             if (at(p, TK_RPAREN)) break; /* trailing comma */
+            if (at(p, TK_ELLIPSIS))
+                xs_error(p->tok.pos, "pass the array itself: f(xs), with a parameter xs: T[]", "spreading arguments into a call is not supported (xisto has no rest parameters)");
             expr_list_push(out, parse_expr(p));
         } while (accept(p, TK_COMMA));
     }
@@ -596,6 +622,16 @@ static Expr *parse_primary(Parser *p) {
         if (!at(p, TK_RBRACKET)) {
             do {
                 if (at(p, TK_RBRACKET)) break; /* trailing comma */
+                if (at(p, TK_ELLIPSIS)) { /* [...a, x]: a's elements in place */
+                    Pos sp = p->tok.pos;
+                    next(p);
+                    Expr *u = new_expr(E_UNARY, sp);
+                    u->op = TK_ELLIPSIS;
+                    u->lhs = parse_expr(p);
+                    expr_list_push(&e->args, u);
+                    e->spread = true;
+                    continue;
+                }
                 expr_list_push(&e->args, parse_expr(p));
             } while (accept(p, TK_COMMA));
         }
@@ -646,6 +682,14 @@ static Expr *parse_primary(Parser *p) {
         }
         Expr *e = new_expr(E_NEW_OBJ, pos);
         e->str = name.str;
+        if (at(p, TK_LT)) { /* new Stack<number>(): a generic class's type arguments */
+            next(p);
+            do {
+                e->targs = realloc(e->targs, sizeof(Type *) * (size_t)(e->ntargs + 1));
+                e->targs[e->ntargs++] = parse_type(p);
+            } while (accept(p, TK_COMMA));
+            expect(p, TK_GT, NULL);
+        }
         parse_args(p, &e->args);
         return e;
     }
@@ -1105,6 +1149,7 @@ static Stmt *parse_stmt(Parser *p) {
     case TK_FOR: {
         next(p);
         Stmt *s = new_stmt(S_FOR, pos);
+        StmtList hoisted = {0}; /* for (let i = 0, j = ...): the declarations, put before the loop */
         accept(p, TK_AWAIT); /* for await (const x of stream): await is syntax only */
         expect(p, TK_LPAREN, NULL);
         if (at(p, TK_LET) || at(p, TK_CONST)) {
@@ -1152,7 +1197,15 @@ static Stmt *parse_stmt(Parser *p) {
                 *p = save;
             }
             s->for_init = parse_var(p);
-            if (p->pending.len) xs_error(s->for_init->pos, "declare the others before the loop", "a for loop declares one variable (or destructures) in xisto");
+            if (p->pending.len) {
+                if (s->for_init->kind != S_VAR || !s->for_init->name || s->for_init->init == NULL)
+                    xs_error(s->for_init->pos, "declare the others before the loop", "a for loop declares one variable (or destructures) in xisto");
+                stmt_list_push(&hoisted, s->for_init);
+                for (int i = 0; i < p->pending.len; i++) stmt_list_push(&hoisted, p->pending.items[i]);
+                for (int i = 0; i < hoisted.len; i++) hoisted.items[i]->for_head = true;
+                p->pending = (StmtList){0};
+                s->for_init = NULL;
+            }
         } else if (!at(p, TK_SEMI)) {
             Stmt *e = new_stmt(S_EXPR, p->tok.pos);
             e->expr = parse_expr(p);
@@ -1161,9 +1214,23 @@ static Stmt *parse_stmt(Parser *p) {
         expect(p, TK_SEMI, "xisto supports only the classic for (init; cond; update) loop");
         if (!at(p, TK_SEMI)) s->cond = parse_expr(p);
         expect(p, TK_SEMI, NULL);
-        if (!at(p, TK_RPAREN)) s->for_update = parse_expr(p);
+        if (!at(p, TK_RPAREN)) {
+            s->for_update = parse_expr(p);
+            if (at(p, TK_COMMA)) { /* i++, j--: the updates in order */
+                Expr *q = new_expr(E_SEQ, s->for_update->pos);
+                expr_list_push(&q->args, s->for_update);
+                while (accept(p, TK_COMMA)) expr_list_push(&q->args, parse_expr(p));
+                s->for_update = q;
+            }
+        }
         expect(p, TK_RPAREN, NULL);
         s->body = parse_loop_body(p);
+        if (hoisted.len) { /* for (let i = 0, j = n - 1; ...): the declarations before the loop, in a block of their own */
+            Stmt *b = new_stmt(S_BLOCK, pos);
+            for (int i = 0; i < hoisted.len; i++) stmt_list_push(&b->stmts, hoisted.items[i]);
+            stmt_list_push(&b->stmts, s);
+            return b;
+        }
         return s;
     }
     case TK_THROW: {
@@ -1360,8 +1427,8 @@ static void parse_generic_rest(Parser *p, Func *f, bool method) {
         *st = *p;
         f->gen_state = st;
         f->gen_method = method;
-        tp_names = f->tparams;
-        ntp = f->ntparams;
+        f->gen_subst = subst_save();
+        tp_push(f->tparams, f->ntparams);
     }
     if (method) parse_params_ex(p, f, false);
     else parse_params(p, f);
@@ -1397,9 +1464,7 @@ Func *xs_parse_instance(Func *tmpl, Type **args) {
     char **sn = subst_names;
     Type **st = subst_types;
     int sk = nsubst;
-    subst_names = tmpl->tparams;
-    subst_types = args;
-    nsubst = tmpl->ntparams;
+    subst_push(tmpl->gen_subst, tmpl->tparams, args, tmpl->ntparams);
     Func *f = xs_alloc(sizeof *f);
     f->pos = tmpl->pos;
     f->name = tmpl->name;
@@ -1479,6 +1544,16 @@ static Class *parse_class_ex(Parser *p, bool abstract) {
     c->is_abstract = abstract;
     expect(p, TK_CLASS, NULL);
     c->name = expect(p, TK_IDENT, NULL).str;
+    if (at(p, TK_LT)) { /* class Name<T, U>: a template, parsed again per list of type arguments */
+        next(p);
+        do {
+            c->tparams = realloc(c->tparams, sizeof(char *) * (size_t)(c->ntparams + 1));
+            c->tparams[c->ntparams++] = expect(p, TK_IDENT, NULL).str;
+            if (at_ident(p, "extends")) { next(p); parse_type(p); }
+        } while (accept(p, TK_COMMA));
+        expect(p, TK_GT, "close the type parameters: class Name<T, U>");
+        if (at_ident(p, "extends")) xs_error(p->tok.pos, NULL, "a generic class cannot extend another class yet");
+    }
     if (at_ident(p, "extends")) {
         next(p);
         c->base_pos = p->tok.pos;
@@ -1494,7 +1569,47 @@ static Class *parse_class_ex(Parser *p, bool abstract) {
             c->implements[c->nimplements++] = t.str;
         } while (accept(p, TK_COMMA));
     }
+    if (c->ntparams) {
+        Parser *st = xs_alloc(sizeof *st);
+        *st = *p;
+        c->gen_state = st;
+        c->gen_subst = subst_save();
+        char **saved = tp_names;
+        int saved_n = ntp;
+        tp_push(c->tparams, c->ntparams);
+        parse_fields_body(p, c);
+        tp_names = saved;
+        ntp = saved_n;
+        if (c->nsfields || c->nsmethods) xs_error(c->pos, NULL, "a generic class has no static members yet");
+        return c;
+    }
     parse_fields_body(p, c);
+    return c;
+}
+
+/* an instance of a generic class: its body parsed again with the type parameters bound (name: Stack<number>) */
+Class *xs_parse_class_instance(Class *tmpl, Type **args, const char *name) {
+    Parser p = *(Parser *)tmpl->gen_state;
+    char **sn = subst_names;
+    Type **st = subst_types;
+    int sk = nsubst;
+    subst_push(tmpl->gen_subst, tmpl->tparams, args, tmpl->ntparams);
+    Class *c = xs_alloc(sizeof *c);
+    c->pos = tmpl->pos;
+    c->name = (char *)name;
+    c->is_abstract = tmpl->is_abstract;
+    c->implements = tmpl->implements;
+    c->nimplements = tmpl->nimplements;
+    c->decos = tmpl->decos;
+    c->mod = tmpl->mod;
+    c->exported = tmpl->exported;
+    c->generic_of = tmpl;
+    parse_fields_body(&p, c);
+    for (int i = 0; i < c->nmethods; i++) c->methods[i]->mod = tmpl->mod;
+    if (c->ctor) c->ctor->mod = tmpl->mod;
+    subst_names = sn;
+    subst_types = st;
+    nsubst = sk;
     return c;
 }
 

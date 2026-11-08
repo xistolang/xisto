@@ -993,6 +993,32 @@ static void emit_borrowed(Expr *e) {
 
 static void emit_borrowed(Expr *e);
 static void emit_expr(Expr *e);
+/* [a, ...xs, b]: a new array, then each element pushed (a spread source's elements in order: an array, or the
+   bytes / numbers of a Uint8Array / Float64Array; strings, Sets and Maps were turned into arrays by the checker) */
+static void emit_spread_lit(Expr *e) {
+    static int nspread;
+    int id = nspread++;
+    const char *as = arr_struct(e->type);
+    bool ref = arr_is_ref(e->type);
+    if (ref) buf_printf(out, "({ xs_arr_ref *sr%d_ = xs_arr_ref_new(%d, %s); ", id, e->args.len, elem_printer(e->type->elem));
+    else buf_printf(out, "({ %s *sr%d_ = %s_new(0, 0); ", as, id, as);
+    for (int i = 0; i < e->args.len; i++) {
+        Expr *a = e->args.items[i];
+        if (a->kind == E_UNARY && a->op == TK_ELLIPSIS) {
+            Type *st = a->lhs->type;
+            bool typed = st->kind == TY_OBJECT; /* Uint8Array / Float64Array */
+            buf_printf(out, "{ %s *ss_ = ", typed ? st->cls->cname : arr_struct(st));
+            emit_borrowed(a->lhs);
+            buf_printf(out, "; for (int64_t i_ = 0; i_ < (int64_t)ss_->%s; i_++) ", typed ? "f_length" : "len");
+            if (ref) buf_printf(out, "xs_arr_ref_push(sr%d_, xs_retain_(ss_->data[i_])); } ", id);
+            else buf_printf(out, "%s_push(sr%d_, ss_->data[i_]); } ", as, id);
+            continue;
+        }
+        if (ref) { buf_printf(out, "xs_arr_ref_push(sr%d_, (void *)", id); emit_owned(a); buf_puts(out, "); "); }
+        else { buf_printf(out, "%s_push(sr%d_, ", as, id); emit_expr(a); buf_puts(out, "); "); }
+    }
+    buf_printf(out, "sr%d_; })", id);
+}
 /* an operand of a bitwise operator as uint32_t (ToInt32, then its bits) */
 static void emit_u32(Expr *e) {
     if (e->kind == E_BINARY && (e->op == TK_PLUS || e->op == TK_MINUS) && e->type->kind == TY_INT && !xs_debug &&
@@ -2937,6 +2963,16 @@ static void emit_expr_raw(Expr *e) {
         }
         emit_lvalue(e);
         return;
+    case E_SEQ: /* a for loop's updates, in order (C's comma operator) */
+        buf_puts(out, "(");
+        for (int i = 0; i < e->args.len; i++) {
+            if (i) buf_puts(out, ", ");
+            buf_puts(out, "(void)(");
+            emit_expr(e->args.items[i]);
+            buf_puts(out, ")");
+        }
+        buf_puts(out, ")");
+        return;
     case E_REGEX: { /* a new RegExp per evaluation, the compiled pattern shared (per thread) */
         buf_puts(out, "xs_RegExp_lit(({ static XS_TLS xr_re *rx_; &rx_; }), ");
         emit_c_string(e->str);
@@ -2967,6 +3003,7 @@ static void emit_expr_raw(Expr *e) {
     case E_NEW_ARRAY:
         return; /* unreachable: the checker rejects it */
     case E_ARRAY_LIT:
+        if (e->spread) { emit_spread_lit(e); return; }
         if (arr_is_ref(e->type)) { /* xs_arr_ref_lit(printer, n, owned...) */
             Type *et = e->type->elem && e->type->elem->kind == TY_NULLABLE ? e->type->elem->elem : e->type->elem;
             (void)et;

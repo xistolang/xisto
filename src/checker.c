@@ -849,6 +849,96 @@ static Class *instantiate(Class *tmpl, Type **args, Pos pos) {
     return c;
 }
 
+/* ---- generic classes: one class per list of type arguments, its body parsed again with them bound ---- */
+static void flatten_fields(Class *c, int depth);
+static void flatten_methods(Class *c);
+static void resolve_signature(Func *f);
+static void check_type_supported(Pos pos, Type *t);
+static Func *eff_ctor(Class *c);
+static Field *find_field(Class *c, const char *name, int *index);
+static Class **class_work; /* instances whose bodies the checker checks after the program's own */
+static int nclass_work;
+static Class *instantiate_class(Class *tmpl, Type **args, Pos pos) {
+    static Class **made;
+    static Type ***made_args;
+    static int nmade;
+    for (int i = 0; i < nmade; i++) {
+        if (made[i]->generic_of != tmpl) continue;
+        bool same = true;
+        for (int k = 0; k < tmpl->ntparams && same; k++) same = ty_equal(made_args[i][k], args[k]);
+        if (same) return made[i];
+    }
+    for (int k = 0; k < tmpl->ntparams; k++)
+        if (args[k]->kind == TY_TPARAM) xs_error(pos, NULL, "internal: a generic class instantiated with a type parameter");
+    Buf name = {0};
+    buf_printf(&name, "%s<", tmpl->name);
+    for (int k = 0; k < tmpl->ntparams; k++) buf_printf(&name, "%s%s", k ? ", " : "", ty_name(args[k]));
+    buf_puts(&name, ">");
+    Class *c = xs_parse_class_instance(tmpl, args, name.data);
+    c->cname = xs_sprintf("c%d_%s_g%d", tmpl->mod->id, tmpl->name, nmade);
+    made = realloc(made, sizeof(Class *) * (size_t)(nmade + 1));
+    made_args = realloc(made_args, sizeof(Type **) * (size_t)(nmade + 1));
+    made[nmade] = c;
+    made_args[nmade] = args;
+    int my = nmade++; /* (resolving its signatures can make more instances) */
+    prog->classes = realloc(prog->classes, sizeof(Class *) * (size_t)(prog->nclasses + 1));
+    prog->classes[prog->nclasses++] = c;
+    prog->cap_classes = prog->nclasses;
+    /* the class pipeline, in the template's module (the caller's scope is put back) */
+    Module *saved_mod = cur_mod;
+    Scope *saved_scope = scope;
+    Class *saved_class = cur_class;
+    const char *sfn = xs_file_name, *ssrc = xs_source;
+    enter_module(tmpl->mod);
+    cur_class = NULL;
+    flatten_fields(c, 0);
+    if (!eff_ctor(c))
+        for (int k = 0; k < c->nfields; k++) if (!c->fields[k].init && !c->fields[k].optional) c->data_only = true;
+    for (int k = 0; k < c->nfields; k++) {
+        Field *fd = &c->fields[k];
+        for (int j = 0; j < k; j++)
+            if (strcmp(fd->name, c->fields[j].name) == 0) xs_error(fd->pos, NULL, "field '%s' is declared twice", fd->name);
+        fd->type = resolve(fd->type, fd->pos);
+        check_type_supported(fd->pos, fd->type);
+        fd->cname = xs_sprintf("f_%s", fd->name);
+    }
+    for (int k = 0; k < c->nmethods; k++) {
+        Func *m = c->methods[k];
+        for (int j = 0; j < k; j++)
+            if (strcmp(m->name, c->methods[j]->name) == 0) xs_error(m->pos, NULL, "method '%s' is declared twice", m->name);
+        if (find_field(c, m->name, NULL)) xs_error(m->pos, NULL, "'%s' is both a field and a method of %s", m->name, c->name);
+        m->cname = xs_sprintf("m%d_%s_g%d_%s", tmpl->mod->id, tmpl->name, my, m->name);
+        if (!m->ntparams) resolve_signature(m);
+    }
+    if (c->ctor) {
+        c->ctor->cname = xs_sprintf("%s_new", c->cname);
+        resolve_signature(c->ctor);
+    }
+    flatten_methods(c);
+    cur_mod = saved_mod;
+    scope = saved_scope;
+    cur_class = saved_class;
+    xs_file_name = sfn;
+    xs_source = ssrc;
+    class_work = realloc(class_work, sizeof(Class *) * (size_t)(nclass_work + 1));
+    class_work[nclass_work++] = c;
+    return c;
+}
+/* a generic class written without type arguments: from the type the place expects (const s: Stack<int> = new Stack()) */
+static Class *generic_new(Expr *e, Class *tmpl, Type *expected) {
+    if (e->ntargs) {
+        if (e->ntargs != tmpl->ntparams)
+            xs_error(e->pos, xs_sprintf("write new %s<...>() with %d type argument(s)", tmpl->name, tmpl->ntparams), "'%s' takes %d type argument(s), got %d", tmpl->name, tmpl->ntparams, e->ntargs);
+        Type **args = xs_alloc(sizeof(Type *) * (size_t)tmpl->ntparams);
+        for (int i = 0; i < e->ntargs; i++) args[i] = resolve(e->targs[i], e->pos);
+        return instantiate_class(tmpl, args, e->pos);
+    }
+    Type *x = expected && expected->kind == TY_NULLABLE ? expected->elem : expected;
+    if (x && x->kind == TY_OBJECT && x->cls && x->cls->generic_of == tmpl) return x->cls;
+    xs_error(e->pos, xs_sprintf("give the type arguments: new %s<Type>()", tmpl->name), "cannot infer the type arguments of %s", tmpl->name);
+    return NULL;
+}
+
 /* [A, B]: one class per list of element types, an interface with fields _0, _1, ... (Class.is_tuple), so a
    tuple is an object like any other for reference counting, arrays, maps and generics; t[0] reads _0 */
 static Class *tuple_class(Type **ps, int n, Pos pos) {
@@ -968,7 +1058,7 @@ static Type *resolve(Type *t, Pos pos) {
                 if (c->ntparams != t->ntargs)
                     xs_error(pos, xs_sprintf("write %s<...> with %d type argument(s)", c->name, c->ntparams), "'%s' takes %d type argument(s), got %d", c->name, c->ntparams, t->ntargs);
                 for (int i = 0; i < t->ntargs; i++) t->targs[i] = resolve(t->targs[i], pos);
-                c = instantiate(c, t->targs, pos);
+                c = c->gen_state ? instantiate_class(c, t->targs, pos) : instantiate(c, t->targs, pos);
             }
             t->cls = c;
         }
@@ -1277,6 +1367,71 @@ static void shadow_union(Binding *b, Type *t);
 static Expr *union_ident(Expr *e);
 static Type *union_subset(Type *u, bool *keep);
 
+static void check_expr(Expr *e, Type *expected);
+static void settle(Expr *e);
+static void expect_type(Expr *e, Type *want, const char *what);
+static void check_type_supported(Pos pos, Type *t);
+static bool is_bytes(Type *t);
+static bool is_f64(Type *t);
+/* [a, ...xs, b]: each spread source an array (a string's code points, a Set's values, a Map's entries, the bytes
+   of a Uint8Array or the numbers of a Float64Array), its elements of the array's element type */
+static void check_spread_lit(Expr *e, Type *elem) {
+    Type **ets = xs_alloc(sizeof(Type *) * (size_t)(e->args.len + 1));
+    for (int i = 0; i < e->args.len; i++) {
+        Expr *a = e->args.items[i];
+        if (!(a->kind == E_UNARY && a->op == TK_ELLIPSIS)) {
+            check_expr(a, elem);
+            ets[i] = a->type;
+            continue;
+        }
+        check_expr(a->lhs, elem && !is_numeric(elem) ? ty_array_of(elem) : NULL);
+        Type *st = a->lhs->type;
+        const char *m = st->kind == TY_STRING ? "split" : st->kind == TY_SET ? "values" : st->kind == TY_MAP ? "entries" : NULL;
+        if (m) { /* an array of its own */
+            Expr *call = xs_alloc(sizeof *call);
+            call->kind = E_MEMBER;
+            call->pos = a->lhs->pos;
+            call->lhs = a->lhs;
+            call->str = (char *)m;
+            call->is_call = true;
+            call->field = -1;
+            if (st->kind == TY_STRING) {
+                Expr *sep = xs_alloc(sizeof *sep);
+                sep->kind = E_STRING;
+                sep->pos = a->lhs->pos;
+                sep->str = "";
+                expr_list_push(&call->args, sep);
+            }
+            a->lhs = call;
+            check_expr(a->lhs, NULL);
+            st = a->lhs->type;
+        }
+        if (is_bytes(st)) ets[i] = ty_int;
+        else if (is_f64(st)) ets[i] = ty_number;
+        else if (st->kind == TY_ARRAY) ets[i] = st->elem;
+        else xs_error(a->lhs->pos, "spread an array, a string, a Set, a Map, a Uint8Array or a Float64Array", "cannot spread %s", ty_name(st));
+        a->type = st;
+    }
+    if (!elem) { /* as TypeScript: numbers win over ints; else the first element's type */
+        for (int i = 0; i < e->args.len && !elem; i++) if (ets[i]->kind == TY_NUMBER) elem = ty_number;
+        for (int i = 0; i < e->args.len && !elem; i++) if (ets[i]->kind == TY_INT) elem = ty_int;
+        if (!elem) {
+            Expr *a0 = e->args.items[0];
+            if (!(a0->kind == E_UNARY && a0->op == TK_ELLIPSIS)) { settle(a0); ets[0] = a0->type; }
+            elem = ets[0];
+        }
+    }
+    for (int i = 0; i < e->args.len; i++) {
+        Expr *a = e->args.items[i];
+        if (a->kind == E_UNARY && a->op == TK_ELLIPSIS) {
+            bool ok = ty_equal(ets[i], elem) || (ets[i]->kind == TY_INT && elem->kind == TY_NUMBER && (is_bytes(a->type) || is_f64(a->type)));
+            if (!ok) xs_error(a->pos, NULL, "the spread elements are %s, but the array holds %s", ty_name(ets[i]), ty_name(elem));
+        } else expect_type(a, elem, "array element");
+    }
+    e->type = ty_array_of(elem);
+    check_type_supported(e->pos, e->type);
+}
+
 static void coerce_lit(Expr *e, Type *want) {
     if (e->type->kind != TY_LITINT) return;
     e->type = want;
@@ -1284,6 +1439,7 @@ static void coerce_lit(Expr *e, Type *want) {
         coerce_lit(e->lhs, want);
         if (e->rhs) coerce_lit(e->rhs, want);
     }
+    if (e->kind == E_COND && e->args.len == 2) { coerce_lit(e->args.items[0], want); coerce_lit(e->args.items[1], want); }
 }
 
 static void settle(Expr *e) {
@@ -1934,7 +2090,14 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
     bool *done = xs_alloc(sizeof(bool) * (size_t)(e->args.len + 1));
     for (int i = 0; i < e->args.len; i++) {
         if (!has_tparam(tmpl->params[i].type) || e->ntargs) continue;
-        check_expr(e->args.items[i], NULL);
+        Type *pt = tmpl->params[i].type, *ctx = NULL;
+        if (e->args.items[i]->kind == E_ARROW && pt->kind == TY_FUNC) { /* map<U>(f: (x: T) => U) with (x) => ...: x from the
+                                                                            parameter, U from what the arrow returns */
+            bool params_known = true;
+            for (int k = 0; k < pt->nparams; k++) if (has_tparam(pt->params[k])) params_known = false;
+            if (params_known) ctx = ty_func(pt->params, pt->nparams, has_tparam(pt->ret) ? NULL : pt->ret);
+        }
+        check_expr(e->args.items[i], ctx);
         done[i] = true;
         unify(tmpl->params[i].type, e->args.items[i]->type, tmpl, bind);
     }
@@ -3654,6 +3817,10 @@ static void check_expr(Expr *e, Type *expected) {
     case E_NEW_ARRAY:
         xs_error(e->pos, "write: new Array<T>(n).fill(x)", "a new array must be filled before use");
         return;
+    case E_SEQ: /* i++, j-- in a for loop's update */
+        for (int i = 0; i < e->args.len; i++) check_expr(e->args.items[i], NULL);
+        e->type = ty_void;
+        return;
     case E_REGEX: { /* /pattern/flags: compiled here once so a bad pattern is a compile error */
         const char *err = NULL;
         int fl = xr_parse_flags(e->rflags, strlen(e->rflags), &err);
@@ -3856,6 +4023,8 @@ static void check_expr(Expr *e, Type *expected) {
             int n; const char **cands = class_names(&n);
             xs_error(e->pos, xs_help_suggest(e->str, cands, n, "declare it: class Name { ... }"), "unknown class '%s'", e->str);
         }
+        if (c->gen_state) c = generic_new(e, c, expected);
+        else if (e->ntargs) xs_error(e->pos, NULL, "'%s' is not generic", c->name);
         e->cls = c;
         e->type = ty_object_of(c);
         if (c->builtin && c->ctor && c->ctor->is_native) { /* a native package's class: its C constructor */
@@ -4018,6 +4187,7 @@ static void check_expr(Expr *e, Type *expected) {
             return;
         }
         Type *elem = expected && expected->kind == TY_ARRAY ? expected->elem : NULL;
+        if (e->spread) { check_spread_lit(e, elem); return; }
         if (e->args.len == 0) {
             if (!elem) xs_error(e->pos, "give it a type: const xs: number[] = [];", "cannot infer the type of an empty array");
             e->type = expected;
@@ -4465,7 +4635,16 @@ static bool md_stmt(Stmt *s) {
 
 static void check_stmt(Stmt *s) {
     switch (s->kind) {
-    case S_VAR: check_var(s, false); return;
+    case S_VAR:
+        if (s->for_head) { /* for (let i = 0, j = n - 1; ...): the loop's variables, a copy per iteration */
+            bool sv = for_init_decl;
+            for_init_decl = true;
+            check_var(s, false);
+            for_init_decl = sv;
+            return;
+        }
+        check_var(s, false);
+        return;
     case S_EXPR:
         check_expr(s->expr, NULL);
         settle(s->expr);
@@ -4611,8 +4790,24 @@ static void check_stmt(Stmt *s) {
             s->expr = call;
             check_expr(s->expr, NULL);
         }
+        if (s->expr->type->kind == TY_STRING) { /* for (const ch of str): its code points, one string each (as JavaScript) */
+            Expr *sep = xs_alloc(sizeof *sep);
+            sep->kind = E_STRING;
+            sep->pos = s->expr->pos;
+            sep->str = "";
+            Expr *call = xs_alloc(sizeof *call);
+            call->kind = E_MEMBER;
+            call->pos = s->expr->pos;
+            call->lhs = s->expr;
+            call->str = "split";
+            call->is_call = true;
+            call->field = -1;
+            expr_list_push(&call->args, sep);
+            s->expr = call;
+            check_expr(s->expr, NULL);
+        }
         if (s->expr->type->kind != TY_ARRAY && s->expr->type->kind != TY_STREAM)
-            xs_error(s->expr->pos, "for...of iterates arrays, streams, Map and Set", "cannot iterate over %s", ty_name(s->expr->type));
+            xs_error(s->expr->pos, "for...of iterates arrays, strings, streams, Map and Set", "cannot iterate over %s", ty_name(s->expr->type));
         Type *elem = s->expr->type->elem;
         if (s->decl_type) {
             s->decl_type = resolve(s->decl_type, s->pos);
@@ -4859,11 +5054,15 @@ static bool ii_stmt_ok(Stmt *s, const char *self) {
     for (int i = 0; i < s->ncases; i++) if (!ii_expr_ok(s->cases[i].value, self) || !ii_stmt_ok(s->cases[i].body, self)) return false;
     return true;
 }
-static bool ii_candidate(Stmt *s) {
-    if (!s || s->kind != S_VAR || s->is_const || s->decl_type || !s->init || !s->name) return false;
-    Expr *v = s->init;
+static bool ii_int_lit(Expr *v) { /* 3, -3, c ? 1 : 8 (any depth of ?: whose branches are integer literals) */
+    if (!v) return false;
     if (v->kind == E_UNARY && v->op == TK_MINUS) v = v->lhs;
+    if (v && v->kind == E_COND && v->args.len == 2) return ii_int_lit(v->args.items[0]) && ii_int_lit(v->args.items[1]);
     return v && v->kind == E_NUMBER && v->is_int_lit;
+}
+static bool ii_candidate(Stmt *s) {
+    if (!s || s->kind != S_VAR || s->decl_type || !s->init || !s->name) return false;
+    return ii_int_lit(s->init);
 }
 static void ii_mark(Stmt *s, bool ok) {
     s->infer_int = ok;
@@ -5153,6 +5352,40 @@ static void check_field_init(Class *c) {
 
 static bool failed_;
 
+/* a class's field initializers, constructor and methods */
+static void check_class_bodies(Class *c) {
+    enter_module(c->mod);
+    for (int k = c->nbase_fields; k < c->nfields; k++) { /* the inherited ones were checked in their class */
+        Field *fd = &c->fields[k];
+        if (!fd->init) continue;
+        cur_class = c;
+        RECOVER_BEGIN
+            check_expr(fd->init, fd->type);
+            expect_type(fd->init, fd->type, xs_sprintf("initializer of field '%s'", fd->name));
+        RECOVER_END
+    }
+    cur_class = NULL;
+    if (c->ctor) {
+        RECOVER_BEGIN
+            super_calls = 0;
+            if (c->base) {
+                StmtList *l = &c->ctor->body->stmts;
+                Stmt *s0 = l->len ? l->items[0] : NULL;
+                if (!s0 || s0->kind != S_EXPR || s0->expr->kind != E_CALL || !s0->expr->lhs || s0->expr->lhs->kind != E_IDENT || strcmp(s0->expr->lhs->str, "super") != 0)
+                    xs_error(s0 ? s0->pos : c->ctor->pos, xs_sprintf("start the constructor with super(...): %s extends %s", c->name, c->base->name),
+                             "the constructor of %s must call super(...) first", c->name);
+            }
+            check_func(c->ctor);
+            if (c->base && super_calls != 1) xs_error(c->ctor->pos, NULL, "super(...) is called once, as the first statement of the constructor");
+        RECOVER_END
+    }
+    RECOVER_BEGIN check_field_init(c); RECOVER_END
+    for (int k = 0; k < c->nmethods; k++) {
+        if (c->methods[k]->cls != c || c->methods[k]->is_abstract || c->methods[k]->ntparams) continue; /* inherited, or a template */
+        RECOVER_BEGIN check_func(c->methods[k]); RECOVER_END
+    }
+}
+
 void check_program(Program *p) {
     prog = p;
     init_builtins();
@@ -5317,41 +5550,22 @@ void check_program(Program *p) {
     }
     for (int i = 0; i < p->nclasses; i++) {
         Class *c = p->classes[i];
-        enter_module(c->mod);
-        for (int k = c->nbase_fields; k < c->nfields; k++) { /* the inherited ones were checked in their class */
-            Field *fd = &c->fields[k];
-            if (!fd->init) continue;
-            cur_class = c;
-            RECOVER_BEGIN
-                check_expr(fd->init, fd->type);
-                expect_type(fd->init, fd->type, xs_sprintf("initializer of field '%s'", fd->name));
-            RECOVER_END
-        }
-        cur_class = NULL;
-        if (c->ctor) {
-            RECOVER_BEGIN
-                super_calls = 0;
-                if (c->base) {
-                    StmtList *l = &c->ctor->body->stmts;
-                    Stmt *s0 = l->len ? l->items[0] : NULL;
-                    if (!s0 || s0->kind != S_EXPR || s0->expr->kind != E_CALL || !s0->expr->lhs || s0->expr->lhs->kind != E_IDENT || strcmp(s0->expr->lhs->str, "super") != 0)
-                        xs_error(s0 ? s0->pos : c->ctor->pos, xs_sprintf("start the constructor with super(...): %s extends %s", c->name, c->base->name),
-                                 "the constructor of %s must call super(...) first", c->name);
-                }
-                check_func(c->ctor);
-                if (c->base && super_calls != 1) xs_error(c->ctor->pos, NULL, "super(...) is called once, as the first statement of the constructor");
-            RECOVER_END
-        }
-        RECOVER_BEGIN check_field_init(c); RECOVER_END
-        for (int k = 0; k < c->nmethods; k++) {
-            if (c->methods[k]->cls != c || c->methods[k]->is_abstract || c->methods[k]->ntparams) continue; /* inherited, or a template */
-            RECOVER_BEGIN check_func(c->methods[k]); RECOVER_END
-        }
+        if (c->gen_state || c->generic_of) continue; /* a generic class's template; instances are checked below */
+        check_class_bodies(c);
     }
     for (int i = 0; i < p->nfuncs; i++)
         if (!p->funcs[i]->mod->builtin && !p->funcs[i]->ntparams) { RECOVER_BEGIN check_func(p->funcs[i]); RECOVER_END }
-    /* generic instances (an instance can make more); then they join the program like any function or method */
-    for (int w = 0; w < ngen_work; w++) { RECOVER_BEGIN check_func(gen_work[w]); RECOVER_END }
+    /* generic instances, classes and functions (an instance can make more); then they join the program */
+    for (int w = 0, cw = 0; w < ngen_work || cw < nclass_work;) {
+        if (cw < nclass_work) { check_class_bodies(class_work[cw++]); continue; }
+        RECOVER_BEGIN check_func(gen_work[w]); RECOVER_END
+        w++;
+    }
+    {   /* the templates of generic classes leave the program: only their instances are emitted */
+        int k = 0;
+        for (int i = 0; i < p->nclasses; i++) if (!p->classes[i]->gen_state) p->classes[k++] = p->classes[i];
+        p->nclasses = k;
+    }
     for (int w = 0; w < ngen_work; w++) {
         Func *f = gen_work[w];
         if (f->cls) {

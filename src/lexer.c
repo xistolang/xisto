@@ -57,6 +57,7 @@ const char *tok_kind_name(TokKind k) {
     case TK_SEMI: return "';'";
     case TK_COLON: return "':'";
     case TK_DOT: return "'.'";
+    case TK_ELLIPSIS: return "'...'";
     case TK_PLUS: return "'+'";
     case TK_MINUS: return "'-'";
     case TK_STAR: return "'*'";
@@ -384,7 +385,9 @@ Token lexer_next(Lexer *lx) {
     case ',': return make(lx, TK_COMMA, pos, start);
     case ';': return make(lx, TK_SEMI, pos, start);
     case ':': return make(lx, TK_COLON, pos, start);
-    case '.': return make(lx, TK_DOT, pos, start);
+    case '.':
+        if (n1 == '.' && peek(lx, 1) == '.') { advance(lx); advance(lx); return make(lx, TK_ELLIPSIS, pos, start); }
+        return make(lx, TK_DOT, pos, start);
     case '@': return make(lx, TK_AT, pos, start); /* decorators */
     case '?':
         if (n1 == '?' || n1 == '.') xs_error(pos, "there is no undefined or null in xisto, so '\?\?' and '?.' do not exist", "'?%c' is not supported", n1);
