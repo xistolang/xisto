@@ -5481,7 +5481,7 @@ static bool spine_pure(Expr *e) { /* the base test: reads of the parameter and i
     default: return false;
     }
 }
-typedef struct { int ndecls; Stmt *decls[8]; Stmt *base; Expr *ret; Expr *calls[2]; int64_t c; int64_t k; } Spine;
+typedef struct { int ndecls; Stmt *decls[8]; Stmt *base; Stmt *ret; Expr *calls[2]; int64_t c; int64_t k; } Spine;
 static bool spine_fn(Func *f, Spine *sp) {
     if (xs_debug || xs_profile || getenv("XISTO_NO_SPINE")) return false;
     if (!f->body || f->is_async || f->is_gen || f->cls || f->nparams != 1 || !f->ret || f->ret->kind != TY_INT) return false;
