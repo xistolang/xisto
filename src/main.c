@@ -321,6 +321,7 @@ static Buf compile_to_c(const char *path) {
         emit_program_qbe(p, &b);
     } else {
         if (getenv("XISTO_NO_TRACE")) buf_puts(&b, "#define XS_NO_TRACE 1\n"); /* measuring knob: no stack-trace support */
+        if (getenv("XISTO_REGION_CHECK") && strcmp(getenv("XISTO_REGION_CHECK"), "1") == 0) buf_puts(&b, "#define XS_REGION_CHECK 1\n"); /* regions: run-time proof (xisto_rt.h) */
         if (xs_debug) buf_puts(&b, "#define XS_DEBUG 1\n");
         if (p->uses_workers) in_process = false; /* (worker threads: an executable of its own, built with XS_THREADS) */
         if (p->uses_net && !in_process) buf_puts(&b, "#define XS_THREADS 1\n"); /* servers may run worker threads */

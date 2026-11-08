@@ -298,8 +298,22 @@ static bool func_fails(Func *f) {
     return fails;
 }
 /* the C storage of a user function: out of line only when it can be a frame of a stack trace */
+/* a constructor that only stores its arguments into a few fields (binarytrees' TreeNode): inlined at every
+   `new`, so the allocation and the stores sit in the caller (Xeon: -4%; it cannot fail, so no frame is lost) */
+static bool small_ctor(Func *f) {
+    if (!f->is_ctor || !f->cls || f->cls->nfields > 4 || func_fails(f)) return false;
+    if (!f->body || f->body->stmts.len > f->cls->nfields) return false;
+    for (int i = 0; i < f->body->stmts.len; i++) {
+        Stmt *st = f->body->stmts.items[i];
+        if (st->kind != S_EXPR || st->expr->kind != E_ASSIGN || st->expr->op != TK_ASSIGN) return false;
+        if (!st->expr->lhs || st->expr->lhs->kind != E_MEMBER || st->expr->lhs->lhs->kind != E_THIS) return false;
+        if (st->expr->rhs->kind != E_IDENT && st->expr->rhs->kind != E_NUMBER && st->expr->rhs->kind != E_NULL) return false;
+    }
+    return true;
+}
 static const char *fn_storage(Func *f) {
     if (force_storage) return force_storage;
+    if (small_ctor(f)) return "XS_FII";
     return !func_fails(f) ? "XS_FI" : inlined_once(f) ? "XS_FA" : "XS_FN";
 }
 
@@ -5029,6 +5043,23 @@ static bool arr_or_map_cyclic(Type *t) {
 /* the static type descriptor of a class: free, print and, when cyclic, visit */
 static const char *class_type_ref(Class *c) { return xs_sprintf("&%s_type", c->cname); }
 
+/* the leading this.f = v of fields without initializer: plain stores (see E_ASSIGN), marked before the
+   allocation line is chosen (ctor_sets_every_field reads the marks) */
+static void mark_init_stores(Class *c, Func *ctor) {
+    if (xs_debug || !ctor || !ctor->body) return;
+    bool *seen = calloc((size_t)(c->nfields ? c->nfields : 1), sizeof(bool));
+    for (int k = 0; k < ctor->body->stmts.len; k++) {
+        Stmt *st = ctor->body->stmts.items[k];
+        Expr *e = st->kind == S_EXPR ? st->expr : NULL;
+        if (!e || e->kind != E_ASSIGN || e->op != TK_ASSIGN || !e->lhs || e->lhs->kind != E_MEMBER || !e->lhs->lhs ||
+            e->lhs->lhs->kind != E_THIS || e->lhs->field < 0 || e->lhs->field >= c->nfields || expr_has_this(e->rhs)) break;
+        int f = e->lhs->field;
+        if (seen[f] || c->fields[f].init) break;
+        seen[f] = true;
+        if (!e->builtin.cfn) e->builtin.cfn = "init_store";
+    }
+    free(seen);
+}
 static void emit_class(Class *c) {
     cur_class = c;
     cur_mod = c->mod;
@@ -5167,11 +5198,15 @@ static void emit_class(Class *c) {
     indent++;
     nl();
     if (c->stack_at) buf_puts(out, "/* self: cleared, counted, typed */");
-    else if (c->region) buf_printf(out, "%s *self = xs_region_alloc(&xs_rg_%d, sizeof(%s), &%s_type);", c->cname, c->region, c->cname, c->cname);
-    else if (c->rdual) /* region.c: in its loop's region while an iteration runs, on the heap otherwise */
-        buf_printf(out, "%s *self = xs_rg_on_%d ? xs_region_alloc_dual(&xs_rg_%d, sizeof(%s), &%s_type) : xs_obj_alloc_t(sizeof(%s), &%s_type);",
-                   c->cname, c->rdual, c->rdual, c->cname, c->cname, c->cname, c->cname);
-    else buf_printf(out, "%s *self = xs_obj_alloc_t(sizeof(%s), &%s_type);", c->cname, c->cname, c->cname);
+    else { /* nz: the constructor writes every field before anything reads one, so the memory is not cleared first */
+        mark_init_stores(c, ctor);
+        const char *nz = ctor_sets_every_field(c) ? "_nz" : "";
+        if (c->region) buf_printf(out, "%s *self = xs_region_alloc%s(&xs_rg_%d, sizeof(%s), &%s_type);", c->cname, nz, c->region, c->cname, c->cname);
+        else if (c->rdual) /* region.c: in its loop's region while an iteration runs, on the heap otherwise */
+            buf_printf(out, "%s *self = xs_rg_on_%d ? xs_region_alloc_dual%s(&xs_rg_%d, sizeof(%s), &%s_type) : xs_obj_alloc_t%s(sizeof(%s), &%s_type);",
+                       c->cname, c->rdual, nz, c->rdual, c->cname, c->cname, nz, c->cname, c->cname);
+        else buf_printf(out, "%s *self = xs_obj_alloc_t%s(sizeof(%s), &%s_type);", c->cname, nz, c->cname, c->cname);
+    }
     for (int i = 0; i < c->nfields; i++) /* nullable primitives start as their null sentinel, not 0 */
         if (!c->fields[i].init && null_prim(c->fields[i].type)) { nl(); buf_printf(out, "self->%s = %s;", c->fields[i].cname, null_value(c->fields[i].type)); }
     nl();
@@ -5197,20 +5232,6 @@ static void emit_class(Class *c) {
         emit_dbg_enter(ctor);
         dbg_params(ctor, false, NULL);
         nl();
-        if (!xs_debug) { /* the leading this.f = v of fields without initializer: plain stores (see E_ASSIGN) */
-            bool *seen = calloc((size_t)(c->nfields ? c->nfields : 1), sizeof(bool));
-            for (int k = 0; k < ctor->body->stmts.len; k++) {
-                Stmt *st = ctor->body->stmts.items[k];
-                Expr *e = st->kind == S_EXPR ? st->expr : NULL;
-                if (!e || e->kind != E_ASSIGN || e->op != TK_ASSIGN || !e->lhs || e->lhs->kind != E_MEMBER || !e->lhs->lhs ||
-                    e->lhs->lhs->kind != E_THIS || e->lhs->field < 0 || e->lhs->field >= c->nfields || expr_has_this(e->rhs)) break;
-                int f = e->lhs->field;
-                if (seen[f] || c->fields[f].init) break;
-                seen[f] = true;
-                if (!e->builtin.cfn) e->builtin.cfn = "init_store";
-            }
-            free(seen);
-        }
         emit_block(ctor->body, true);
         emit_dbg_finish();
         emit_prof_leave();

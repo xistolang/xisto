@@ -277,6 +277,7 @@ static inline bool xs_isnull_num(double d) { union { double d; uint64_t u; } x =
 /* user functions: one source frame = one machine frame, for stack traces (see "stack traces") */
 /* runtime functions that can fail or call back into user code (tools/noinline-scan.py keeps the list) */
 #define XS_FI static /* user functions that cannot fail: never a frame, free to inline */
+#define XS_FII __attribute__((always_inline)) static inline /* ... and small enough to inline everywhere (emit.c small_ctor) */
 #ifdef XS_NO_TRACE /* XISTO_NO_TRACE=1: the same program without stack-trace support, to measure its cost */
 #define XS_FA static
 #define XS_FN static
@@ -663,11 +664,19 @@ static void *xs_obj_alloc_slow(size_t size, int k) {
     if (!h) xs_panic("out of memory");
     return h;
 }
+static void *xs_obj_alloc_slow_nz(size_t size, int k) { /* (the caller writes every byte that matters) */
+    if (k) return xs_slab_carve(k);
+    void *h = malloc(size);
+    if (!h) xs_panic("out of memory");
+    return h;
+}
 /* inlined at every allocation site: the size is a constant there, so the clearing is a few stores */
 static XS_TLS bool xs_gc_due; /* enough suspects: the cycle collector runs at the next allocation */
 static XS_TLS size_t xs_sus_n; /* cycle suspects waiting (alive) */
 static void xs_gc_step(void);
-static inline __attribute__((always_inline)) void *xs_obj_alloc_t(size_t size, const xs_type *type) {
+/* zero: clear the object (fields start as 0/NULL); false when the constructor writes every field first
+   (emit.c ctor_sets_every_field: binarytrees on the Xeon, -5% with the region's variant) */
+static inline __attribute__((always_inline)) void *xs_obj_alloc_tz(size_t size, const xs_type *type, bool zero) {
     if (__builtin_expect(xs_gc_due, 0)) xs_gc_step();
     xs_hdr *h;
     int k = size <= XS_SMALL_MAX ? (int)((size + XS_OBJ_STEP - 1) >> XS_OBJ_SHIFT) : 0;
@@ -675,9 +684,9 @@ static inline __attribute__((always_inline)) void *xs_obj_alloc_t(size_t size, c
         h = (xs_hdr *)xs_small[k];
         xs_small[k] = xs_small[k]->next;
         xs_small_n[k]--;
-        memset(h, 0, size);
+        if (zero) memset(h, 0, size);
     } else {
-        h = xs_obj_alloc_slow(size, k);
+        h = zero ? xs_obj_alloc_slow(size, k) : xs_obj_alloc_slow_nz(size, k);
     }
     h->rc = 1;
     h->cls = (uint32_t)k | (type->visit ? XS_CYC : 0) | XS_TIX(type);
@@ -685,6 +694,8 @@ static inline __attribute__((always_inline)) void *xs_obj_alloc_t(size_t size, c
     xs_allocs++;
     return h;
 }
+#define xs_obj_alloc_t(size, type) xs_obj_alloc_tz((size), (type), true)
+#define xs_obj_alloc_t_nz(size, type) xs_obj_alloc_tz((size), (type), false)
 
 /* an object in its creator's frame (src/stackalloc.c), declared = {0}: a header like any other, so retains, releases and the
    cleanup stack work unchanged; when its count reaches zero its fields are released and the memory stays */
@@ -5832,14 +5843,20 @@ typedef struct xs_region {
     char *ptr, *end;
     void **list;            /* objects to drop when rewound (every object under XISTO_REGION_CHECK) */
     size_t nlist, caplist;
-    int64_t nobj;           /* objects made since the last rewind (counted into xs_allocs there, not one by one:
+    int64_t nobj;           /* XS_REGION_CHECK: objects made since the last rewind (counted into xs_allocs there, not one by one:
                                with workers each global counter is a per-thread variable, a call on macOS) */
     bool listed;
     bool on;                /* a dual region (region.c): an iteration of its loop is running */
     struct xs_region *next; /* every region that was entered, for the counts at exit */
 } xs_region;
 static XS_TLS xs_region *xs_regions;
-static int xs_region_check = -1; /* XISTO_REGION_CHECK=1: prove at run time that nothing escaped */
+#ifdef XS_REGION_CHECK /* XISTO_REGION_CHECK=1 at build time (main.c): prove at run time that nothing escaped */
+static int xs_region_check = -1;
+#define XS_REGION_CHECK_INIT() do { if (xs_region_check < 0) { const char *e_ = getenv("XISTO_REGION_CHECK"); xs_region_check = e_ && strcmp(e_, "1") == 0; } } while (0)
+#else /* the checks fold away: no load and branch per allocation (binarytrees on the Xeon: -8% with the count below) */
+#define xs_region_check 0
+#define XS_REGION_CHECK_INIT() do { } while (0)
+#endif
 #define XS_RCHUNK (256 * 1024)
 static __attribute__((noinline)) void *xs_region_more(xs_region *r, size_t size) {
     xs_rchunk *c = r->cur ? r->cur->next : r->first;
@@ -5868,12 +5885,12 @@ static __attribute__((noinline)) void xs_region_list(xs_region *r, void *p) {
     }
     r->list[r->nlist++] = p;
 }
-static inline __attribute__((always_inline)) void *xs_region_alloc_f(xs_region *r, size_t size, const xs_type *type, uint32_t flags) {
+static inline __attribute__((always_inline)) void *xs_region_alloc_f(xs_region *r, size_t size, const xs_type *type, uint32_t flags, bool zero) {
     size = (size + XS_OBJ_STEP - 1) & ~(XS_OBJ_STEP - 1);
     void *p;
     if (__builtin_expect(r->ptr && (size_t)(r->end - r->ptr) >= size, 1)) { p = r->ptr; r->ptr += size; }
     else p = xs_region_more(r, size);
-    memset(p, 0, size);
+    if (zero) memset(p, 0, size); /* (not when the constructor writes every field: binarytrees -5% on the Xeon) */
     xs_hdr *h = p;
     h->rc = 1;
     h->cls = flags | XS_TIX(type);
@@ -5881,13 +5898,17 @@ static inline __attribute__((always_inline)) void *xs_region_alloc_f(xs_region *
         if (__builtin_expect(r->nlist < r->caplist, 1)) r->list[r->nlist++] = p;
         else xs_region_list(r, p);
     }
+#ifdef XS_REGION_CHECK
     r->nobj++;
+#endif
     return p;
 }
-#define xs_region_alloc(r, size, type) xs_region_alloc_f((r), (size), (type), 0)
+#define xs_region_alloc(r, size, type) xs_region_alloc_f((r), (size), (type), 0, true)
+#define xs_region_alloc_nz(r, size, type) xs_region_alloc_f((r), (size), (type), 0, false)
 /* a dual class's object (region.c: the class is made both inside the loop and outside it): in the region while
    one of its loop's iterations runs (on), on the heap otherwise */
-#define xs_region_alloc_dual(r, size, type) xs_region_alloc_f((r), (size), (type), XS_RGN)
+#define xs_region_alloc_dual(r, size, type) xs_region_alloc_f((r), (size), (type), XS_RGN, true)
+#define xs_region_alloc_dual_nz(r, size, type) xs_region_alloc_f((r), (size), (type), XS_RGN, false)
 static __attribute__((noinline)) void xs_region_reset(xs_region *r) {
     if (xs_region_check > 0) {
         for (size_t i = 0; i < r->nlist; i++) { xs_hdr *h = r->list[i]; const xs_type *t = xs_type_of(h); if (t->drop) t->drop(h); }
@@ -5912,7 +5933,7 @@ static __attribute__((noinline)) void xs_region_reset(xs_region *r) {
 }
 static XS_TLS xs_region *xs_rg_cur; /* the region of the loop running (regions do not nest) */
 static void xs_region_enter(xs_region *r) {
-    if (xs_region_check < 0) { const char *e = getenv("XISTO_REGION_CHECK"); xs_region_check = e && strcmp(e, "1") == 0; }
+    XS_REGION_CHECK_INIT();
     if (!r->listed) { r->listed = true; r->next = xs_regions; xs_regions = r; }
     xs_rg_cur = r;
     xs_region_reset(r); /* what a loop left by an exception still held */
