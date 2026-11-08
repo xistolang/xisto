@@ -5835,6 +5835,11 @@ void emit_program(Program *p, Buf *o) {
     epop();
     emit_dbg_finish();
     if (wbody) { /* main: the setup once, then the program, as any thread */
+        /* the body's own top-level locals: each thread releases its own here (main cannot see them) */
+        for (int i = 0; i < p->top.len; i++) {
+            Stmt *s = p->top.items[i];
+            if (s->kind == S_VAR && cref(s->type) && ns_has(&main_locals, s->cname)) { nl(); buf_printf(out, "if (xs_rc_counting()) xs_release(%s);", s->cname); }
+        }
         indent--;
         nl();
         buf_puts(out, "}\nint main(int argc, char **argv) {");
@@ -5856,7 +5861,7 @@ void emit_program(Program *p, Buf *o) {
     buf_puts(out, "if (xs_rc_counting()) {");
     for (int i = 0; i < p->top.len; i++) {
         Stmt *s = p->top.items[i];
-        if (s->kind == S_VAR && cref(s->type)) {
+        if (s->kind == S_VAR && cref(s->type) && !(wbody && ns_has(&main_locals, s->cname))) {
             nl();
             buf_printf(out, "    xs_release(%s);", s->cname);
         }
