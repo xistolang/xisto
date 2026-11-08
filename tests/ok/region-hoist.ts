@@ -68,3 +68,16 @@ for (let k = 1; k <= 20; k++) {
 let again: int = 0;
 for (let d = 1; d <= 4; d++) again += count(build(d));
 console.log("sum", sum, "again", again);
+
+// made before the first iteration (the for's init) or as the iterable: heap objects, kept past the loop
+const keptNodes: Node[] = [];
+function keepNode(n: Node): int {
+  keptNodes.push(n);
+  return 0;
+}
+for (let i: int = keepNode(build(2)); i < 2; i++) {
+  const t = build(i);
+  keepNode(wrap(0));
+  total += count(t);
+}
+console.log("init kept", count(keptNodes[0]), keptNodes.length, total);

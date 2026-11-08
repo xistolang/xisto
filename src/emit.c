@@ -3993,8 +3993,11 @@ static void emit_for_(Stmt *s) {
     epush(false);
     if (s->for_init) {
         nl();
+        int saved_rg = cur_rg;
+        cur_rg = 0; /* (runs before the first iteration: the region flag is off) */
         if (s->for_init->kind == S_VAR) emit_var(s->for_init);
         else { emit_expr(s->for_init->expr); buf_puts(out, ";"); }
+        cur_rg = saved_rg;
         drain_if_needed();
     }
     nl();
@@ -4377,7 +4380,7 @@ static void emit_stmt_(Stmt *s) {
         indent++;
         nl();
         buf_puts(out, "xs_Error *thrown_ = ");
-        emit_owned(s->expr);
+        { int rg_ = cur_rg; cur_rg = 0; emit_owned(s->expr); cur_rg = rg_; } /* (evaluated once, before the iterations) */
         buf_puts(out, ";");
         for (EScope *sc = escope; sc; sc = sc->parent) {
             emit_releases(sc);
@@ -4469,7 +4472,7 @@ static void emit_stmt_(Stmt *s) {
             epush(false);
             nl();
             buf_printf(out, "%s *it_ = xs_retain(", at->cls->cname);
-            emit_borrowed(s->expr);
+            { int rg_ = cur_rg; cur_rg = 0; emit_borrowed(s->expr); cur_rg = rg_; } /* (evaluated once, before the iterations) */
             buf_puts(out, ");");
             etrack("it_", at);
             nl();
@@ -4519,7 +4522,7 @@ static void emit_stmt_(Stmt *s) {
             epush(false);
             nl();
             buf_puts(out, "xs_stream *st_ = xs_retain(");
-            emit_borrowed(s->expr);
+            { int rg_ = cur_rg; cur_rg = 0; emit_borrowed(s->expr); cur_rg = rg_; } /* (evaluated once, before the iterations) */
             buf_puts(out, ");");
             etrack("st_", at);
             nl();
@@ -4610,7 +4613,7 @@ static void emit_stmt_(Stmt *s) {
         epush(false);
         nl();
         buf_printf(out, "%s *it_ = xs_retain(", arr_struct(at));
-        emit_borrowed(s->expr);
+        { int rg_ = cur_rg; cur_rg = 0; emit_borrowed(s->expr); cur_rg = rg_; } /* (evaluated once, before the iterations) */
         buf_puts(out, ");");
         etrack("it_", at);
         nl();
