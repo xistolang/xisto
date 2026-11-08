@@ -413,6 +413,11 @@ static BceGArr *garr_find(const char *c);
 static Rng rng_of(Expr *e);
 static bool bce_safe(Expr *e); /* an index the loop already checks (see bce_enter) */
 /* u8reg: byte arrays a loop keeps in vector registers (see u8reg_loop) */
+typedef struct { int kind; Expr *a, *src, *lo, *hi; Stmt *loop; } U8Idiom; /* kind 1 copy a[j] = src[j], 2 reverse, 3 shift a[j] = a[j+1] */
+static bool match_u8_idiom(Stmt *s, U8Idiom *m);
+static bool u8_is_index_on(Expr *e, const char *c);
+static bool same_simple(Expr *a, Expr *b);
+static bool bce_pure(Expr *e);
 typedef struct { const char *cname; int64_t n; } U8Reg;
 static U8Reg u8regs[8];
 static int nu8regs;
@@ -3058,6 +3063,29 @@ static const char *dbg_type(Type *t) {
 
 static int region_reset_pending; /* a region loop's body: rewinds the region before each iteration */
 static bool *region_dual;        /* per region: it has dual classes (xs_rg_on_N says where they are made) */
+/* `for (j = lo; j <= K; j++) a[j] = a[j + 1]; a[K + 1] = v;` with a in a register (fannkuch-redux's next
+   permutation): one call, the shuffle and the lane (xs_v16_shl_put). b->stmts[*i] is the loop; on a match the
+   pair is emitted and *i skips the store. */
+static bool emit_u8_shl_put(Stmt *b, int *i) {
+    if (*i + 1 >= b->stmts.len || xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
+    Stmt *lp = b->stmts.items[*i], *st = b->stmts.items[*i + 1];
+    U8Idiom m;
+    if (lp->kind != S_FOR || !match_u8_idiom(lp, &m) || m.kind != 3 || lp->cond->op != TK_LE) return false;
+    U8Reg *rg = u8reg_find(m.a);
+    if (!rg) return false;
+    Expr *as = st->kind == S_EXPR ? st->expr : NULL;
+    if (!as || as->kind != E_ASSIGN || as->op != TK_ASSIGN || !u8_is_index_on(as->lhs, m.a->cname)) return false;
+    Expr *ix = as->lhs->rhs; /* K + 1 */
+    if (!ix || ix->kind != E_BINARY || ix->op != TK_PLUS || !same_simple(ix->lhs, m.hi) || !ix->rhs || ix->rhs->kind != E_NUMBER || ix->rhs->num != 1) return false;
+    if (!bce_pure(as->rhs) && as->rhs->kind != E_IDENT) return false;
+    int site = new_site(lp->pos);
+    nl();
+    emit_dbg_hook(lp);
+    emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_shl_put("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_puts(out, ", ");
+    emit_expr(as->rhs); buf_printf(out, ", INT64_C(%lld), XS_S(%d));", (long long)rg->n, site);
+    *i += 1;
+    return true;
+}
 static void emit_block_kind(Stmt *b, ScopeKind kind) {
     buf_puts(out, "{");
     indent++;
@@ -3070,6 +3098,7 @@ static void emit_block_kind(Stmt *b, ScopeKind kind) {
         region_reset_pending = 0;
     }
     for (int i = 0; i < b->stmts.len; i++) {
+        if (emit_u8_shl_put(b, &i)) continue;
         nl();
         emit_dbg_hook(b->stmts.items[i]);
         emit_stmt(b->stmts.items[i]);
@@ -3096,6 +3125,7 @@ static void emit_block(Stmt *b, bool func_root) {
     Class *after_super = func_root ? inits_after_super : NULL;
     if (func_root) inits_after_super = NULL;
     for (int i = 0; i < b->stmts.len; i++) {
+        if (!after_super && emit_u8_shl_put(b, &i)) continue;
         nl();
         emit_dbg_hook(b->stmts.items[i]);
         emit_stmt(b->stmts.items[i]);
@@ -4126,7 +4156,6 @@ static bool is_sub_of(Expr *e, Expr *S, const char *i) { /* S - i */
 }
 /* A local Uint8Array(N <= 16) a loop only indexes (get, set, the idioms below) lives in a vector register for
    the loop (u8reg_setup): xs_v16_* in xisto_rt.h. One list for the nested scopes being emitted. */
-typedef struct { int kind; Expr *a, *src, *lo, *hi; Stmt *loop; } U8Idiom; /* kind 1 copy a[j] = src[j], 2 reverse, 3 shift a[j] = a[j+1] */
 static bool match_u8_idiom(Stmt *s, U8Idiom *m) {
     if (s->kind != S_FOR) return false;
     Stmt *fi = s->for_init;
