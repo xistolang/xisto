@@ -3061,11 +3061,28 @@ static int dbg_local(const char *name, Type *t, const char *addr, bool is_const)
 /* `const l = this.left` where left is never written after construction: the object stays in that field while
    `this` lives (all of this method), so the local borrows it: no retain, no release */
 static bool mut_has(Class *c, const char *name);
+/* an object that certainly outlives the local being declared: `this` outside a constructor (the constructor may
+   still store the field), or a parameter of reference type (the checker refuses to reassign those, and the
+   caller's reference keeps the object alive for the whole call). A nullable base reaches here through x! */
+static bool stable_base(Expr *b) {
+    while (b && b->kind == E_AS && b->op == TK_NOT && !b->elem_type) b = b->lhs;
+    if (!b || !cur_func) return false;
+    if (b->kind == E_THIS) return cur_func->cls && !cur_func->is_ctor;
+    if (b->kind == E_IDENT && b->cname && !b->builtin.cfn)
+        for (int i = 0; i < cur_func->nparams; i++) {
+            Param *pm = &cur_func->params[i];
+            if (pm->cname && !pm->cell && strcmp(pm->cname, b->cname) == 0) return cref(pm->type);
+        }
+    return false;
+}
+/* `const x = base.field` where the field is only written during construction and base outlives the scope: x
+   borrows the field's reference (no retain, no release, no cleanup slot). Every use that keeps x retains it as
+   it would any other local (binarytrees-2: 0,65 -> 0,42 s on the M4, 4,90 -> 3,17 s on the Graviton2). */
 static bool borrowable_init(Stmt *s) {
     Expr *e = s->init;
     if (!s->is_const || s->cell || !e || !cref(s->type) || xs_debug || getenv("XISTO_NO_BORROW")) return false;
     if (e->kind != E_MEMBER || e->is_call || e->field < 0 || !e->cls || e->cls->builtin || e->cls->is_interface) return false;
-    if (!e->lhs || e->lhs->kind != E_THIS || !cur_func || !cur_func->cls || cur_func->is_ctor) return false;
+    if (!stable_base(e->lhs)) return false;
     return !mut_has(e->cls, e->cls->fields[e->field].name);
 }
 /* Reuse (XB-036): x = x.m(args) where m only returns new C(...) of x's own exact class and cannot fail. When x
