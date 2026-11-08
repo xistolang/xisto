@@ -28,15 +28,16 @@ if (isMainThread) {
   const own = new Uint8Array([10, 20, 30]);
   const w = new Worker(__filename, { workerData: "" });
   let got = 0;
+  // one message at a time: the next goes out only after the reply to the last (the printout reads the shared
+  // memory, so a worker already on the next message would make the output depend on timing)
   w.on("message", (m: string) => {
     got++;
     console.log(m, shared.join(","), own.join(","));
-    if (got === 3) w.terminate();
+    if (got === 1) w.postMessage(shared.subarray(4)); // a view on part of it: offset kept
+    else if (got === 2) { w.postMessage(own); own[0] = 99; } // a copy: the worker's writes stay there
+    else w.terminate();
   });
   w.postMessage(shared);          // the same memory: the worker's writes show here
-  w.postMessage(shared.subarray(4)); // a view on part of it: offset kept
-  w.postMessage(own);             // a copy: the worker's writes stay there
-  own[0] = 99;
 } else {
   parentPort.on("message", (m: Uint8Array) => {
     const before = m.join(",");
