@@ -1893,6 +1893,7 @@ static inline __attribute__((always_inline)) xs_map_entry *xs_map_seek_i(xs_map 
     uint8_t h2 = XS_MAP_H2(h);
     const uint8_t *ctrl = m->ctrl;
     xs_map_entry *slots = m->slots;
+    __builtin_prefetch(&slots[pos]); /* (as probe_i: without it k-nucleotide k=12/18 on the N1 is 4,3 -> 5,2 s) */
     for (;;) {
         const uint8_t *g = ctrl + pos;
         for (xs_map_gmask mm = xs_map_gmatch(g, h2); mm; mm &= mm - 1) {

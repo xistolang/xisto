@@ -412,9 +412,10 @@ typedef struct ICtx {
 } ICtx;
 static ICtx *ictx;
 typedef struct { bool ok; int64_t lo, hi; } Rng; /* integer ranges (see rng_of) */
-typedef struct BceGArr { const char *name; int64_t n; bool has_rng; int64_t lo, hi; } BceGArr; /* a constant array (see garr_collect) */
+typedef struct BceGArr { const char *name; int64_t n; bool has_rng; int64_t lo, hi; bool pow2; } BceGArr; /* a constant array (see garr_collect) */
 static BceGArr *garr_find(const char *c);
 static Rng rng_of(Expr *e);
+static bool pow2_of(Expr *e, int depth);
 static bool bce_safe(Expr *e); /* an index the loop already checks (see bce_enter) */
 /* u8reg: byte arrays a loop keeps in vector registers (see u8reg_loop) */
 typedef struct { int kind; Expr *a, *src, *lo, *hi, *ca, *cb; Stmt *loop; } U8Idiom; /* kind 1 copy a[j] = src[j], 2 reverse, 3 shift a[j] = a[j+1], 4 trade (a buf, src the table, ca/cb the cursors) */
@@ -2441,6 +2442,17 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, "))");
             return;
         }
+        if (e->lhs->type->kind == TY_INT && e->type->kind == TY_INT && e->op == TK_PERCENT && !getenv("XISTO_NO_POW2_MOD")) {
+            Rng b = rng_of(e->rhs);
+            if (b.ok && b.lo > 0 && pow2_of(e->rhs, 0)) { /* x % 2^n: a mask for x >= 0 (JS keeps the sign of x), no zero to check */
+                buf_puts(out, "({ int64_t ma_ = (");
+                emit_expr(e->lhs);
+                buf_puts(out, "), mb_ = (");
+                emit_expr(e->rhs);
+                buf_puts(out, "); __builtin_expect(ma_ >= 0, 1) ? (ma_ & (mb_ - 1)) : ma_ % mb_; })");
+                return;
+            }
+        }
         if (e->lhs->type->kind == TY_INT && (e->op == TK_PLUS || e->op == TK_MINUS || e->op == TK_STAR || e->op == TK_PERCENT || e->op == TK_SLASH)) {
             const char *fn = e->op == TK_PLUS ? "xs_iadd" : e->op == TK_MINUS ? "xs_isub" : e->op == TK_STAR ? "xs_imul"
                            : e->op == TK_PERCENT ? "xs_imod" : "xs_idiv";
@@ -3744,8 +3756,8 @@ static Rng rng_of(Expr *e) {
             return i32;
         case TK_PIPE: case TK_CARET: case TK_SHL: return i32;
         case TK_USHR: return (Rng){true, 0, (int64_t)UINT32_MAX};
-        case TK_PERCENT:
-            if (b.ok && b.lo == b.hi && b.lo > 0) return a.ok && a.lo >= 0 ? (Rng){true, 0, b.lo - 1} : (Rng){true, -(b.lo - 1), b.lo - 1};
+        case TK_PERCENT: /* |x % b| < b: with b in [lo, hi], lo > 0, the result is within (-hi, hi) */
+            if (b.ok && b.lo > 0) return a.ok && a.lo >= 0 ? (Rng){true, 0, b.hi - 1} : (Rng){true, -(b.hi - 1), b.hi - 1};
             return rng_none();
         default: return rng_none();
         }
@@ -3760,6 +3772,23 @@ static int rv_ndefs, rv_cdefs;
 static void rv_def(const char *name, Expr *def, Stmt *loop, bool top) {
     if (rv_ndefs == rv_cdefs) { rv_cdefs = rv_cdefs ? rv_cdefs * 2 : 64; rv_defs = realloc(rv_defs, sizeof(RvDef) * (size_t)rv_cdefs); }
     rv_defs[rv_ndefs++] = (RvDef){name, def, loop, top};
+}
+/* is e certainly a positive power of two? a literal, an entry of a constant table of powers of two, or an int
+   local every definition of which is one (knucleotide-4: `const top = TOPS[k - 1]`) */
+static bool pow2_of(Expr *e, int depth) {
+    if (!e || depth > 4) return false;
+    if (e->kind == E_NUMBER) return e->is_int_lit && e->ival > 0 && (e->ival & (e->ival - 1)) == 0;
+    if (e->kind == E_INDEX && !e->builtin.cfn && e->lhs && e->lhs->kind == E_IDENT) { BceGArr *g = garr_find(e->lhs->cname); return g && g->has_rng && g->pow2; }
+    if (e->kind == E_IDENT && e->cname && rv_valid && rv_owner == cur_func && !ictx) {
+        bool any = false;
+        for (int i = 0; i < rv_ndefs; i++) {
+            if (strcmp(rv_defs[i].name, e->cname) != 0) continue;
+            if (rv_defs[i].top || !rv_defs[i].def || !pow2_of(rv_defs[i].def, depth + 1)) return false;
+            any = true;
+        }
+        return any;
+    }
+    return false;
 }
 static void rv_scan_stmt(Stmt *s, bool decls);
 static void rv_scan_expr(Expr *e) {
@@ -6353,7 +6382,7 @@ static void garr_collect(Program *p) {
         Stmt *s = p->top.items[i];
         int64_t n = garr_len_of(p, s);
         if (!n || ns_has(&main_locals, s->cname) || !garr_program_ok(p, s->cname, true)) continue;
-        BceGArr g = {s->cname, n, false, 0, 0};
+        BceGArr g = {s->cname, n, false, 0, 0, false};
         Expr *e = s->init;
         if (e->kind == E_ARRAY_LIT && s->type->elem && s->type->elem->kind == TY_INT && garr_program_ok(p, s->cname, false)) {
             g.has_rng = true;
@@ -6365,6 +6394,8 @@ static void garr_collect(Program *p) {
                 int64_t val = neg ? -v->ival : v->ival;
                 if (k == 0 || val < g.lo) g.lo = val;
                 if (k == 0 || val > g.hi) g.hi = val;
+                bool p2 = val > 0 && (val & (val - 1)) == 0;
+                g.pow2 = k == 0 ? p2 : g.pow2 && p2; /* every entry a power of two: x % T[i] is a mask */
             }
         }
         bce_garr[nbce_garr++] = g;
