@@ -4048,6 +4048,28 @@ static inline void xs_u8_rev(xs_Uint8Array *a, int64_t lo, int64_t hi, const xs_
 #endif
     for (int64_t i = lo, j = hi; i < j; i++, j--) { uint8_t t = d[i]; d[i] = d[j]; d[j] = t; }
 }
+/* The reversal followed by `a[e] = v` on the same bytes (fannkuch: `pp[p0] = p0` after a flip): one vector
+   load, the shuffle, the byte blended in, one store, so no byte store sits between two vector loads (a byte
+   store before a 16-byte load defeats store forwarding: ~15 cycles per flip on the Xeon) */
+static inline void xs_u8_rev_put(xs_Uint8Array *a, int64_t lo, int64_t hi, int64_t e, int64_t v, const xs_site *s) {
+    if ((uint64_t)e >= (uint64_t)a->f_length) XS_FAIL("index out of bounds", s);
+    uint8_t *d = a->data;
+    if (lo >= hi) { d[e] = (uint8_t)v; return; }
+    if (lo < 0 || (uint64_t)hi >= (uint64_t)a->f_length) XS_FAIL("index out of bounds", s);
+#if defined(__SSSE3__) || defined(__ARM_NEON)
+    if (hi < 16 && e < 16 && a->f_length >= 16) {
+        xs_u8x16 idx = xs_u8x16_iota(), rev = xs_u8x16_splat((uint8_t)(lo + hi)) - idx;
+        xs_u8x16 in = (idx >= xs_u8x16_splat((uint8_t)lo)) & (idx <= xs_u8x16_splat((uint8_t)hi));
+        xs_u8x16 mask = (in & rev) | (~in & idx);
+        xs_u8x16 r = xs_u8x16_shuffle(xs_u8x16_load(d), mask);
+        xs_u8x16 at = idx == xs_u8x16_splat((uint8_t)e);
+        xs_u8x16_store(d, (at & xs_u8x16_splat((uint8_t)v)) | (~at & r));
+        return;
+    }
+#endif
+    for (int64_t i = lo, j = hi; i < j; i++, j--) { uint8_t t = d[i]; d[i] = d[j]; d[j] = t; }
+    d[e] = (uint8_t)v;
+}
 /* `for (j = lo; j < hi; j++) dst[j] = src[j]` on two byte arrays: one check each side, then a move */
 static inline void xs_u8_copy_range(xs_Uint8Array *dst, xs_Uint8Array *src, int64_t lo, int64_t hi, const xs_site *s) {
     if (lo >= hi) return;

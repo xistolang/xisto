@@ -3022,6 +3022,9 @@ static const char *dbg_type(Type *t) {
 
 static int region_reset_pending; /* a region loop's body: rewinds the region before each iteration */
 static bool *region_dual;        /* per region: it has dual classes (xs_rg_on_N says where they are made) */
+static bool match_u8_rev(Stmt *s, Expr **pa, Expr **plo, Expr **pS);
+static bool match_u8_put(Stmt *st, Expr *a, Expr **pe, Expr **pv);
+static void emit_u8_rev_call(const char *fn, Expr *a, Expr *lo, Expr *S, Expr *e, Expr *v, Pos pos);
 static void emit_block_kind(Stmt *b, ScopeKind kind) {
     buf_puts(out, "{");
     indent++;
@@ -3036,6 +3039,12 @@ static void emit_block_kind(Stmt *b, ScopeKind kind) {
     for (int i = 0; i < b->stmts.len; i++) {
         nl();
         emit_dbg_hook(b->stmts.items[i]);
+        Expr *ra, *rlo, *rS, *pe, *pv; /* a byte reversal followed by a store into the same bytes: one call */
+        if (i + 1 < b->stmts.len && b->stmts.items[i]->kind == S_FOR && match_u8_rev(b->stmts.items[i], &ra, &rlo, &rS) && match_u8_put(b->stmts.items[i + 1], ra, &pe, &pv)) {
+            emit_u8_rev_call("xs_u8_rev_put", ra, rlo, rS, pe, pv, b->stmts.items[i]->pos);
+            i++;
+            continue;
+        }
         emit_stmt(b->stmts.items[i]);
     }
     emit_releases(escope);
@@ -3062,6 +3071,12 @@ static void emit_block(Stmt *b, bool func_root) {
     for (int i = 0; i < b->stmts.len; i++) {
         nl();
         emit_dbg_hook(b->stmts.items[i]);
+        Expr *ra, *rlo, *rS, *pe, *pv; /* a byte reversal followed by a store into the same bytes: one call */
+        if (i + 1 < b->stmts.len && b->stmts.items[i]->kind == S_FOR && match_u8_rev(b->stmts.items[i], &ra, &rlo, &rS) && match_u8_put(b->stmts.items[i + 1], ra, &pe, &pv)) {
+            emit_u8_rev_call("xs_u8_rev_put", ra, rlo, rS, pe, pv, b->stmts.items[i]->pos);
+            i++;
+            continue;
+        }
         emit_stmt(b->stmts.items[i]);
         if (i == 0 && after_super) emit_own_field_inits(after_super); /* super(...) ran: now the class's own fields */
     }
@@ -4088,6 +4103,54 @@ static bool u8_index_of(Expr *e, Expr *arr, Expr *idx) { /* arr[idx] as the prog
 static bool is_sub_of(Expr *e, Expr *S, const char *i) { /* S - i */
     return e && e->kind == E_BINARY && e->op == TK_MINUS && same_simple(e->lhs, S) && e->rhs && e->rhs->kind == E_IDENT && e->rhs->cname && strcmp(e->rhs->cname, i) == 0;
 }
+/* the reversal loop: a, its first index LO and the sum S (the segment is [LO, S - LO]) */
+static bool match_u8_rev(Stmt *s, Expr **pa, Expr **plo, Expr **pS) {
+    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
+    Stmt *fi = s->for_init;
+    Expr *c = s->cond, *u = s->for_update;
+    if (s->kind != S_FOR || !fi || fi->kind != S_VAR || !fi->cname || !fi->init || fi->cell || !bce_pure(fi->init)) return false;
+    if (!u || u->kind != E_POSTFIX || u->op != TK_PLUSPLUS || !u->lhs || u->lhs->kind != E_IDENT || !u->lhs->cname || strcmp(u->lhs->cname, fi->cname) != 0) return false;
+    if (!c || c->kind != E_BINARY || c->op != TK_LT || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, fi->cname) != 0) return false;
+    const char *i = fi->cname;
+    Stmt *b = s->body;
+    if (!b || b->kind != S_BLOCK || b->stmts.len != 3) return false;
+    if (stmt_writes_name(b, i) || writes_name(c->rhs, i)) return false;
+    Expr iv = {0}; iv.kind = E_IDENT; iv.cname = (char *)i;
+    /* reverse: cond is i < (S + 1) >> 1 */
+    Expr *h = c->rhs;
+    if (!h || h->kind != E_BINARY || h->op != TK_SHR || !h->rhs || h->rhs->kind != E_NUMBER || h->rhs->num != 1) return false;
+    Expr *s1 = h->lhs;
+    if (!s1 || s1->kind != E_BINARY || s1->op != TK_PLUS || !s1->rhs || s1->rhs->kind != E_NUMBER || s1->rhs->num != 1) return false;
+    Expr *S = s1->lhs;
+    if (!bce_pure(S) || S->kind != E_IDENT) return false;
+    Stmt *t = b->stmts.items[0];
+    if (t->kind != S_VAR || !t->is_const || !t->cname || t->cell || !t->init) return false;
+    Expr *a1 = b->stmts.items[1]->kind == S_EXPR ? b->stmts.items[1]->expr : NULL, *a2 = b->stmts.items[2]->kind == S_EXPR ? b->stmts.items[2]->expr : NULL;
+    if (!a1 || !a2 || a1->kind != E_ASSIGN || a2->kind != E_ASSIGN || a1->op != TK_ASSIGN || a2->op != TK_ASSIGN) return false;
+    Expr *ta = t->init;
+    if (!ta || ta->kind != E_INDEX || !ta->builtin.cfn || strcmp(ta->builtin.cfn, "xs_u8_get") != 0 || !u8_name(ta->lhs) || !same_simple(ta->rhs, &iv)) return false;
+    Expr *a = ta->lhs;
+    if (!u8_index_of(a1->lhs, a, &iv) || !a1->rhs || a1->rhs->kind != E_INDEX || !same_simple(a1->rhs->lhs, a) || !is_sub_of(a1->rhs->rhs, S, i)) return false;
+    if (!a2->lhs || a2->lhs->kind != E_INDEX || !same_simple(a2->lhs->lhs, a) || !is_sub_of(a2->lhs->rhs, S, i)) return false;
+    if (!a2->rhs || a2->rhs->kind != E_IDENT || !a2->rhs->cname || strcmp(a2->rhs->cname, t->cname) != 0) return false;
+    if (stmt_writes_name(b, S->cname) || stmt_writes_name(b, a->cname)) return false;
+    *pa = a; *plo = fi->init; *pS = S;
+    return true;
+}
+/* the statement after a reversal: `a[E] = V` on the same bytes, E and V pure */
+static bool match_u8_put(Stmt *st, Expr *a, Expr **pe, Expr **pv) {
+    Expr *as = st && st->kind == S_EXPR ? st->expr : NULL;
+    if (!as || as->kind != E_ASSIGN || as->op != TK_ASSIGN || !as->lhs || as->lhs->kind != E_INDEX || !as->lhs->builtin.cfn) return false;
+    if (strcmp(as->lhs->builtin.cfn, "xs_u8_get") != 0 || !same_simple(as->lhs->lhs, a) || !bce_pure(as->lhs->rhs) || !bce_pure(as->rhs)) return false;
+    *pe = as->lhs->rhs; *pv = as->rhs;
+    return true;
+}
+static void emit_u8_rev_call(const char *fn, Expr *a, Expr *lo, Expr *S, Expr *e, Expr *v, Pos pos) {
+    buf_printf(out, "%s(", fn); emit_borrowed(a); buf_puts(out, ", "); emit_expr(lo); buf_puts(out, ", (");
+    emit_expr(S); buf_puts(out, ") - ("); emit_expr(lo); buf_puts(out, ")");
+    if (e) { buf_puts(out, ", "); emit_expr(e); buf_puts(out, ", "); emit_expr(v); }
+    buf_printf(out, ", XS_S(%d));", new_site(pos));
+}
 static bool emit_u8_idiom(Stmt *s) {
     if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
     Stmt *fi = s->for_init;
@@ -4111,27 +4174,9 @@ static bool emit_u8_idiom(Stmt *s) {
         buf_puts(out, ", "); emit_expr(fi->init); buf_puts(out, ", "); emit_expr(c->rhs); buf_printf(out, ", XS_S(%d));", new_site(s->pos));
         return true;
     }
-    if (b->stmts.len != 3) return false;
-    /* reverse: cond is i < (S + 1) >> 1 */
-    Expr *h = c->rhs;
-    if (!h || h->kind != E_BINARY || h->op != TK_SHR || !h->rhs || h->rhs->kind != E_NUMBER || h->rhs->num != 1) return false;
-    Expr *s1 = h->lhs;
-    if (!s1 || s1->kind != E_BINARY || s1->op != TK_PLUS || !s1->rhs || s1->rhs->kind != E_NUMBER || s1->rhs->num != 1) return false;
-    Expr *S = s1->lhs;
-    if (!bce_pure(S) || S->kind != E_IDENT) return false;
-    Stmt *t = b->stmts.items[0];
-    if (t->kind != S_VAR || !t->is_const || !t->cname || t->cell || !t->init) return false;
-    Expr *a1 = b->stmts.items[1]->kind == S_EXPR ? b->stmts.items[1]->expr : NULL, *a2 = b->stmts.items[2]->kind == S_EXPR ? b->stmts.items[2]->expr : NULL;
-    if (!a1 || !a2 || a1->kind != E_ASSIGN || a2->kind != E_ASSIGN || a1->op != TK_ASSIGN || a2->op != TK_ASSIGN) return false;
-    Expr *ta = t->init;
-    if (!ta || ta->kind != E_INDEX || !ta->builtin.cfn || strcmp(ta->builtin.cfn, "xs_u8_get") != 0 || !u8_name(ta->lhs) || !same_simple(ta->rhs, &iv)) return false;
-    Expr *a = ta->lhs;
-    if (!u8_index_of(a1->lhs, a, &iv) || !a1->rhs || a1->rhs->kind != E_INDEX || !same_simple(a1->rhs->lhs, a) || !is_sub_of(a1->rhs->rhs, S, i)) return false;
-    if (!a2->lhs || a2->lhs->kind != E_INDEX || !same_simple(a2->lhs->lhs, a) || !is_sub_of(a2->lhs->rhs, S, i)) return false;
-    if (!a2->rhs || a2->rhs->kind != E_IDENT || !a2->rhs->cname || strcmp(a2->rhs->cname, t->cname) != 0) return false;
-    if (stmt_writes_name(b, S->cname) || stmt_writes_name(b, a->cname)) return false;
-    buf_puts(out, "xs_u8_rev("); emit_borrowed(a); buf_puts(out, ", "); emit_expr(fi->init); buf_puts(out, ", (");
-    emit_expr(S); buf_puts(out, ") - ("); emit_expr(fi->init); buf_printf(out, "), XS_S(%d));", new_site(s->pos));
+    Expr *a, *lo, *S;
+    if (!match_u8_rev(s, &a, &lo, &S)) return false;
+    emit_u8_rev_call("xs_u8_rev", a, lo, S, NULL, NULL, s->pos);
     return true;
 }
 static void emit_stmt_(Stmt *s) {
