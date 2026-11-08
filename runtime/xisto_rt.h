@@ -4277,6 +4277,17 @@ static inline int64_t xs_f64_len(xs_Float64Array *a) {
 #endif
     return n;
 }
+/* a Float64Array that lives in its function's frame (emit.c f64_local_n: fixed small length, only ever indexed, never
+   escaping): no heap, no count; the C compiler sees a plain double[N] and keeps it in registers (n-body) */
+static inline __attribute__((always_inline)) xs_Float64Array *xs_f64_on_frame(xs_Float64Array *a, double *data, int64_t n) {
+    a->hdr.rc = 1;
+    a->hdr.cls = XS_STACK;
+    a->f_length = n;
+    a->data = data;
+    a->blk = NULL;
+    a->shared = false;
+    return a;
+}
 static inline double *xs_f64_at_s(xs_Float64Array *a, int64_t i, const xs_site *s) {
     if ((uint64_t)i >= (uint64_t)a->f_length) XS_FAIL("index out of bounds", s);
     return &a->data[i];
