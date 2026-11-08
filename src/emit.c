@@ -424,6 +424,8 @@ typedef struct BceGArr { const char *name; int64_t n; bool has_rng; int64_t lo, 
 static BceGArr *garr_find(const char *c);
 static Rng rng_of(Expr *e);
 static bool pow2_of(Expr *e, int depth);
+static bool nn_expr(Expr *e);
+static int byte_hoist_find(Expr *a);
 static bool bce_safe(Expr *e); /* an index the loop already checks (see bce_enter) */
 /* u8reg: byte arrays a loop keeps in vector registers (see u8reg_loop) */
 typedef struct { int kind; Expr *a, *src, *lo, *hi, *ca, *cb; Stmt *loop; } U8Idiom; /* kind 1 copy a[j] = src[j], 2 reverse, 3 shift a[j] = a[j+1], 4 trade (a buf, src the table, ca/cb the cursors) */
@@ -2470,11 +2472,12 @@ static void emit_expr_raw(Expr *e) {
             if (b.ok && b.lo > 0 && pow2_of(e->rhs, 0)) { /* x % 2^n: a mask for x >= 0 (JS keeps the sign of x), no zero to check */
                 /* JS keeps the sign of x: r = x & (d - 1), minus d when x < 0 and r != 0 (no division, which the C
                    compiler would otherwise compute on both sides of a select: knucleotide-4 3,4 cpu-s with it) */
+                bool nn = nn_expr(e->lhs); /* never negative: the mask alone */
                 buf_puts(out, "({ int64_t ma_ = (");
                 emit_expr(e->lhs);
                 buf_puts(out, "), mb_ = (");
                 emit_expr(e->rhs);
-                buf_puts(out, "), mr_ = ma_ & (mb_ - 1); mr_ - ((ma_ >> 63) & (mr_ != 0 ? mb_ : 0)); })");
+                buf_puts(out, nn ? "); ma_ & (mb_ - 1); })" : "), mr_ = ma_ & (mb_ - 1); mr_ - ((ma_ >> 63) & (mr_ != 0 ? mb_ : 0)); })");
                 return;
             }
         }
@@ -2785,6 +2788,12 @@ static void emit_expr_raw(Expr *e) {
                 if (nc) emit_bce_index(e->rhs); else emit_expr(e->rhs);
                 if (!nc) { buf_printf(out, ", INT64_C(%lld)", (long long)rg->n); site_arg(e->pos); }
                 buf_puts(out, ")");
+                return;
+            }
+            if (strcmp(e->builtin.cfn, "xs_u8_get") == 0 && bce_safe(e) && byte_hoist_find(e->lhs) >= 0) { /* the loop's local data pointer */
+                buf_printf(out, "((int64_t)bh%d_[", byte_hoist_find(e->lhs));
+                emit_bce_index(e->rhs);
+                buf_puts(out, "])");
                 return;
             }
             if (strcmp(e->builtin.cfn, "xs_u8_get") == 0 && bce_safe(e)) { /* within the bytes: see bce_safe */
@@ -3715,6 +3724,7 @@ static void mark_counted_inc(Stmt *s) {
 #define RNG_LEN ((int64_t)1 << 40) /* the bound of every length (xs_len_bound) */
 static const char **rv_name;
 static Rng *rv_rng;
+static bool *rv_nn; /* the variable is never negative (rv_compute: a greatest fixpoint over its definitions) */
 static int rv_n, rv_cap;
 static Func *rv_owner;
 static bool rv_valid;
@@ -3835,7 +3845,7 @@ static void rv_scan_stmt(Stmt *s, bool decls) {
     if (!s) return;
     if (s->kind == S_VAR && s->type && s->type->kind == TY_INT && s->cname && !s->cell && decls) {
         if (rv_find(s->cname) < 0) {
-            if (rv_n == rv_cap) { rv_cap = rv_cap ? rv_cap * 2 : 64; rv_name = realloc(rv_name, sizeof(char *) * (size_t)rv_cap); rv_rng = realloc(rv_rng, sizeof(Rng) * (size_t)rv_cap); }
+            if (rv_n == rv_cap) { rv_cap = rv_cap ? rv_cap * 2 : 64; rv_name = realloc(rv_name, sizeof(char *) * (size_t)rv_cap); rv_rng = realloc(rv_rng, sizeof(Rng) * (size_t)rv_cap); rv_nn = realloc(rv_nn, sizeof(bool) * (size_t)rv_cap); }
             rv_name[rv_n] = s->cname;
             rv_rng[rv_n++] = rng_none();
         }
@@ -3943,6 +3953,22 @@ static int64_t bce_fixed_n(const char *c) {
     BceGArr *g = garr_find(c);
     return g ? g->n : 0;
 }
+/* e is never negative, given the variables rv_nn marks: literals, bytes, ranges at or above 0, and + * % of such
+   values (int + and * either trap on overflow or are proven not to overflow, so they never wrap below zero) */
+static bool nn_expr(Expr *e) {
+    if (!e || !e->type || e->type->kind != TY_INT) return false;
+    Rng r = rng_of(e);
+    if (r.ok && r.lo >= 0) return true;
+    switch (e->kind) {
+    case E_IDENT: { int k = e->cname ? rv_find(e->cname) : -1; return k >= 0 && rv_nn[k]; }
+    case E_BINARY:
+        if (e->op == TK_PLUS || e->op == TK_STAR) return nn_expr(e->lhs) && nn_expr(e->rhs);
+        if (e->op == TK_PERCENT) { Rng b = rng_of(e->rhs); return b.ok && b.lo > 0 && nn_expr(e->lhs); }
+        return false;
+    case E_COND: return e->args.len == 2 && nn_expr(e->args.items[0]) && nn_expr(e->args.items[1]);
+    default: return false;
+    }
+}
 /* top-level code (main): only its own locals; a top-level variable functions also use is not one of them */
 static bool rv_main_only(const char *c);
 static void rv_compute(Func *owner, Stmt **stmts, int n) {
@@ -3996,6 +4022,23 @@ static void rv_compute(Func *owner, Stmt **stmts, int n) {
         }
         if (!moved) break;
         if (round == 5) for (int k = 0; k < rv_n; k++) rv_rng[k] = rng_none(); /* not settled: know nothing */
+    }
+    /* never negative: start from every variable with known definitions and drop the ones a definition can make
+       negative, until nothing moves (`key = (key % top) * 4 + seq[j]` from `key = 0`: the key of k-nucleotide). A
+       counted loop's counter only goes up from its start, so the start decides */
+    for (int k = 0; k < rv_n; k++) rv_nn[k] = !top[k] && !getenv("XISTO_NO_NONNEG");
+    for (bool moved = true; moved;) {
+        moved = false;
+        for (int k = 0; k < rv_n; k++) {
+            if (!rv_nn[k]) continue;
+            bool any = false;
+            for (int d = 0; d < rv_ndefs; d++) {
+                if (strcmp(rv_defs[d].name, rv_name[k]) != 0 || rv_defs[d].loop) continue;
+                if (!rv_defs[d].def || !nn_expr(rv_defs[d].def)) { rv_nn[k] = false; moved = true; break; }
+                any = true;
+            }
+            if (rv_nn[k] && !any) { rv_nn[k] = false; moved = true; }
+        }
     }
     free(top);
 }
@@ -4519,8 +4562,8 @@ static Expr *map_call(Expr *e, const char *op, Expr *m, int nargs) { /* m.op(...
     if (!e->lhs || !e->lhs->type || e->lhs->type->kind != TY_MAP || !same_simple(e->lhs, m)) return NULL;
     return e;
 }
-static bool emit_map_add(Stmt *s) {
-    if (xs_debug || sm_mode || getenv("XISTO_NO_MAP_ADD")) return false;
+static bool map_add_match(Stmt *s, Expr **pm, Expr **pk, Expr **pd, Expr **psum) {
+    if (xs_debug || sm_mode || getenv("XISTO_NO_MAP_ADD") || !s || s->kind != S_IF) return false;
     Expr *has = s->cond;
     if (!has || has->kind != E_MEMBER || !has->is_call || !has->builtin.cfn || strcmp(has->builtin.cfn, "has") != 0 || has->args.len != 1) return false;
     Expr *m = has->lhs;
@@ -4538,11 +4581,149 @@ static bool emit_map_add(Stmt *s) {
     if (same_simple(dd, d)) { /* get + d */ } else if (same_simple(g, d)) { Expr *t = g; g = dd; dd = t; } else return false;
     while (g && g->kind == E_AS && g->op == TK_NOT && !g->elem_type) g = g->lhs; /* m.get(k)! */
     if (!map_call(g, "get", m, 1) || !same_simple(g->args.items[0], k)) return false;
-    int site = new_site(sum->pos);
-    buf_puts(out, "xs_map_add_i(");
-    emit_borrowed(m); buf_puts(out, ", "); emit_expr(k); buf_puts(out, ", "); emit_expr(d);
+    *pm = m; *pk = k; *pd = d; *psum = sum;
+    return true;
+}
+/* maps whose fields a loop holds in locals (map_hoist_enter): the map's C name and the local's id */
+static struct { const char *m; int id; } map_hoist[8];
+static int nmap_hoist, map_hoist_ids;
+static int byte_hoist_find(Expr *a);
+static int map_hoist_find(Expr *m) {
+    if (!m || m->kind != E_IDENT || !m->cname) return -1;
+    for (int i = nmap_hoist - 1; i >= 0; i--) if (strcmp(map_hoist[i].m, m->cname) == 0) return map_hoist[i].id;
+    return -1;
+}
+static bool emit_map_add(Stmt *s) {
+    Expr *m, *k, *d, *sum;
+    if (!map_add_match(s, &m, &k, &d, &sum)) return false;
+    int site = new_site(sum->pos), hc = map_hoist_find(m);
+    if (hc >= 0) buf_printf(out, "xs_map_add_hc(");
+    else buf_puts(out, "xs_map_add_i(");
+    emit_borrowed(m);
+    if (hc >= 0) buf_printf(out, ", &mhc%d_", hc);
+    buf_puts(out, ", "); emit_expr(k); buf_puts(out, ", "); emit_expr(d);
     buf_printf(out, ", XS_S(%d));", site);
     return true;
+}
+/* A loop whose body touches a local Map<int, int> only through the counting idiom, calls no user function and
+   makes no closure (nothing else can reach the map while it runs): the table's fields are read into a local
+   before the loop and again only after the idiom's slow path (xs_map_add_hc). The same loop's byte arrays read
+   unchecked (a name not written in the loop: a Uint8Array's data never moves) get their data pointer in a local
+   (byte_hoist): a store of the counter may alias the fields, so the C compiler reloads them on every iteration.
+   k-nucleotide, Xeon: 5,2 -> 3,9 cpu-s with both. XISTO_NO_LOOP_HOIST=1 keeps the loads. */
+static bool hoist_body_ok(Stmt *s);
+static void emit_stmt_for_inner(Stmt *s);
+static bool hoist_expr_ok(Expr *e) {
+    if (!e) return true;
+    if (e->kind == E_ARROW || e->kind == E_AWAIT) return false;
+    if (e->kind == E_CALL) return false;
+    if (e->kind == E_NEW_OBJ && e->cls && !e->cls->builtin) return false;
+    if (e->kind == E_MEMBER && e->is_call && !(e->lhs && e->lhs->type && e->lhs->type->kind == TY_MAP) && !(e->cls && e->cls->builtin) && !e->builtin.cfn) return false;
+    if (!hoist_expr_ok(e->lhs) || !hoist_expr_ok(e->rhs)) return false;
+    for (int i = 0; i < e->args.len; i++) if (!hoist_expr_ok(e->args.items[i])) return false;
+    return true;
+}
+static bool hoist_body_ok(Stmt *s) {
+    if (!s) return true;
+    if (s->kind == S_TRY || s->kind == S_YIELD || s->kind == S_RETURN) return false;
+    if (!hoist_expr_ok(s->init) || !hoist_expr_ok(s->expr) || !hoist_expr_ok(s->cond) || !hoist_expr_ok(s->for_update)) return false;
+    if (!hoist_body_ok(s->for_init) || !hoist_body_ok(s->body) || !hoist_body_ok(s->else_body)) return false;
+    for (int i = 0; i < s->stmts.len; i++) if (!hoist_body_ok(s->stmts.items[i])) return false;
+    for (int i = 0; i < s->ncases; i++) if (!hoist_body_ok(s->cases[i].body)) return false;
+    return true;
+}
+/* occurrences of the name c in e/s, and how many of them are the counting idiom's (4 per idiom) */
+static int name_uses_e(Expr *e, const char *c) {
+    if (!e) return 0;
+    int n = e->kind == E_IDENT && e->cname && strcmp(e->cname, c) == 0;
+    n += name_uses_e(e->lhs, c) + name_uses_e(e->rhs, c);
+    for (int i = 0; i < e->args.len; i++) n += name_uses_e(e->args.items[i], c);
+    return n;
+}
+static int name_uses(Stmt *s, const char *c, int *idiom) {
+    if (!s) return 0;
+    Expr *m, *k, *d, *sum;
+    if (map_add_match(s, &m, &k, &d, &sum) && m->kind == E_IDENT && strcmp(m->cname, c) == 0) {
+        int n = name_uses_e(s->cond, c) + name_uses(s->body, c, idiom) + name_uses(s->else_body, c, idiom);
+        *idiom += n;
+        return n;
+    }
+    int n = name_uses_e(s->init, c) + name_uses_e(s->expr, c) + name_uses_e(s->cond, c) + name_uses_e(s->for_update, c);
+    n += name_uses(s->for_init, c, idiom) + name_uses(s->body, c, idiom) + name_uses(s->else_body, c, idiom);
+    for (int i = 0; i < s->stmts.len; i++) n += name_uses(s->stmts.items[i], c, idiom);
+    for (int i = 0; i < s->ncases; i++) n += name_uses_e(s->cases[i].value, c) + name_uses(s->cases[i].body, c, idiom);
+    return n;
+}
+static void collect_idiom_maps(Stmt *s, const char **ms, int *nm) {
+    if (!s) return;
+    Expr *m, *k, *d, *sum;
+    if (map_add_match(s, &m, &k, &d, &sum)) {
+        if (m->kind == E_IDENT && m->cname && *nm < 8) { bool seen = false; for (int i = 0; i < *nm; i++) seen |= strcmp(ms[i], m->cname) == 0; if (!seen) ms[(*nm)++] = m->cname; }
+        return;
+    }
+    collect_idiom_maps(s->for_init, ms, nm); collect_idiom_maps(s->body, ms, nm); collect_idiom_maps(s->else_body, ms, nm);
+    for (int i = 0; i < s->stmts.len; i++) collect_idiom_maps(s->stmts.items[i], ms, nm);
+    for (int i = 0; i < s->ncases; i++) collect_idiom_maps(s->cases[i].body, ms, nm);
+}
+/* byte arrays read in s (E_INDEX xs_u8_get on a name) */
+static void collect_byte_reads_e(Expr *e, const char **as, int *na) {
+    if (!e) return;
+    if (e->kind == E_INDEX && e->builtin.cfn && strcmp(e->builtin.cfn, "xs_u8_get") == 0 && e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname && *na < 8) {
+        bool seen = false;
+        for (int i = 0; i < *na; i++) seen |= strcmp(as[i], e->lhs->cname) == 0;
+        if (!seen) as[(*na)++] = e->lhs->cname;
+    }
+    collect_byte_reads_e(e->lhs, as, na); collect_byte_reads_e(e->rhs, as, na);
+    for (int i = 0; i < e->args.len; i++) collect_byte_reads_e(e->args.items[i], as, na);
+}
+static void collect_byte_reads(Stmt *s, const char **as, int *na) {
+    if (!s) return;
+    collect_byte_reads_e(s->init, as, na); collect_byte_reads_e(s->expr, as, na); collect_byte_reads_e(s->cond, as, na); collect_byte_reads_e(s->for_update, as, na);
+    collect_byte_reads(s->for_init, as, na); collect_byte_reads(s->body, as, na); collect_byte_reads(s->else_body, as, na);
+    for (int i = 0; i < s->stmts.len; i++) collect_byte_reads(s->stmts.items[i], as, na);
+    for (int i = 0; i < s->ncases; i++) collect_byte_reads(s->cases[i].body, as, na);
+}
+static bool declares(Stmt *s, const char *c) {
+    if (!s) return false;
+    if (s->kind == S_VAR && s->cname && strcmp(s->cname, c) == 0) return true;
+    if (declares(s->for_init, c) || declares(s->body, c) || declares(s->else_body, c)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (declares(s->stmts.items[i], c)) return true;
+    for (int i = 0; i < s->ncases; i++) if (declares(s->cases[i].body, c)) return true;
+    return false;
+}
+static struct { const char *a; int id; } byte_hoist[8];
+static int nbyte_hoist, byte_hoist_ids;
+static int byte_hoist_find(Expr *a) {
+    if (!a || a->kind != E_IDENT || !a->cname) return -1;
+    for (int i = nbyte_hoist - 1; i >= 0; i--) if (strcmp(byte_hoist[i].a, a->cname) == 0) return byte_hoist[i].id;
+    return -1;
+}
+/* emits the locals before loop s (inside an open brace the caller closes) and pushes them; returns how many it pushed */
+static int loop_hoist_enter(Stmt *s, int *nb) {
+    *nb = 0;
+    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_LOOP_HOIST") || !hoist_body_ok(s->body) || !hoist_expr_ok(s->cond) || !hoist_expr_ok(s->for_update)) return 0;
+    const char *ms[8]; int nm = 0, pushed = 0;
+    collect_idiom_maps(s->body, ms, &nm);
+    for (int i = 0; i < nm && nmap_hoist < 8; i++) {
+        int idiom = 0;
+        int all = name_uses(s->body, ms[i], &idiom) + name_uses_e(s->cond, ms[i]) + name_uses_e(s->for_update, ms[i]);
+        if (all != idiom || bce_writes(s, ms[i]) || declares(s, ms[i])) continue;
+        int id = map_hoist_ids++;
+        buf_printf(out, "xs_map_hc mhc%d_ = xs_map_hc_of(%s); ", id, ren(ms[i]));
+        map_hoist[nmap_hoist].m = ms[i]; map_hoist[nmap_hoist++].id = id;
+        pushed++;
+    }
+    const char *as[8]; int na = 0;
+    collect_byte_reads(s->body, as, &na);
+    collect_byte_reads_e(s->cond, as, &na);
+    for (int i = 0; i < na && nbyte_hoist < 8; i++) {
+        if (bce_writes(s, as[i]) || declares(s, as[i])) continue;
+        int id = byte_hoist_ids++;
+        buf_printf(out, "__typeof__((%s)->data) bh%d_ = (%s)->data; (void)bh%d_; ", ren(as[i]), id, ren(as[i]), id);
+        byte_hoist[nbyte_hoist].a = as[i]; byte_hoist[nbyte_hoist++].id = id;
+        (*nb)++;
+    }
+    return pushed;
 }
 /* Two loops over byte arrays that are one runtime call (bounds checked once; a 16-byte shuffle or a memmove):
      for (let i = LO; i < (S + 1) >> 1; i++) { const t = a[i]; a[i] = a[S - i]; a[S - i] = t; }  -> xs_u8_rev(a, LO, S - LO)
@@ -4795,6 +4976,33 @@ static bool u8reg_loop(Stmt *s) {
     buf_puts(out, "}");
     return true;
 }
+static void emit_stmt_for_inner(Stmt *s) { /* a for: bounds checks proved by the loop, or a versioned copy */
+    int saved_nbce = nbce;
+    bce_enter(s);
+    if (nbce == saved_nbce) { /* not a[i] < a.length: maybe a loop to version (bce_version_guard) */
+        const char *arrs[8];
+        int na = 0;
+        char *g = bce_version_guard(s, arrs, &na);
+        if (g) {
+            buf_printf(out, "if (%s) ", g);
+            for (int k = 0; k < na; k++) bce_loops[nbce++] = (BceLoop){s->for_update->lhs->cname, arrs[k], true, NULL};
+            int naff = nbce_aff;
+            BceAff aff[16];
+            memcpy(aff, bce_aff, sizeof aff);
+            for (int k = 0; k < naff && nbce < 16; k++) bce_loops[nbce++] = (BceLoop){s->for_update->lhs->cname, aff[k].a, true, aff[k].idx};
+            bce_versions++;
+            emit_for_(s);
+            nbce = saved_nbce;
+            buf_puts(out, " else ");
+            emit_for_(s);
+            bce_versions--;
+            return;
+        }
+    }
+    emit_for_(s);
+    nbce = saved_nbce;
+    return;
+    }
 static void emit_stmt_(Stmt *s) {
     used_ar = false;
     if ((s->kind == S_WHILE || s->kind == S_FOR) && u8reg_loop(s)) { drain_if_needed(); return; }
@@ -5212,30 +5420,21 @@ static void emit_stmt_(Stmt *s) {
     case S_FOR: {
         if (emit_u8_idiom(s)) { drain_if_needed(); return; }
         mark_counted_inc(s);
-        int saved_nbce = nbce;
-        bce_enter(s);
-        if (nbce == saved_nbce) { /* not a[i] < a.length: maybe a loop to version (bce_version_guard) */
-            const char *arrs[8];
-            int na = 0;
-            char *g = bce_version_guard(s, arrs, &na);
-            if (g) {
-                buf_printf(out, "if (%s) ", g);
-                for (int k = 0; k < na; k++) bce_loops[nbce++] = (BceLoop){s->for_update->lhs->cname, arrs[k], true, NULL};
-                int naff = nbce_aff;
-                BceAff aff[16];
-                memcpy(aff, bce_aff, sizeof aff);
-                for (int k = 0; k < naff && nbce < 16; k++) bce_loops[nbce++] = (BceLoop){s->for_update->lhs->cname, aff[k].a, true, aff[k].idx};
-                bce_versions++;
-                emit_for_(s);
-                nbce = saved_nbce;
-                buf_puts(out, " else ");
-                emit_for_(s);
-                bce_versions--;
+        {
+            size_t mark = out->len;
+            buf_puts(out, "{ ");
+            int nb = 0, nm = loop_hoist_enter(s, &nb);
+            if (nm || nb) {
+                emit_stmt_for_inner(s);
+                nmap_hoist -= nm;
+                nbyte_hoist -= nb;
+                buf_puts(out, " }");
                 return;
             }
+            out->len = mark; /* nothing to hold: as before */
+            if (out->data) out->data[mark] = 0;
         }
-        emit_for_(s);
-        nbce = saved_nbce;
+        emit_stmt_for_inner(s);
         return;
     }
     case S_YIELD: { /* hand the value over; when the consumer is gone, leave as a return does */

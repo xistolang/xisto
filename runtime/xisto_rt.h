@@ -2042,6 +2042,58 @@ static inline __attribute__((always_inline)) void xs_map_add_i(xs_map *m, int64_
 slow:
     xs_map_add_slow_i(m, k, d, s);
 }
+/* the add idiom in a loop that touches the map only through it (emit.c map_hoist): the table's fields held in
+   locals across the loop, read again only after the slow path (which may grow or widen the table). Without this
+   the C compiler reloads cap, ctrl and slots on every symbol: a store of the counter may alias them (k-nucleotide
+   on the Xeon, with the fields of the sequence hoisted as well: 5,2 -> 3,9 cpu-s) */
+typedef struct { size_t mask; const uint8_t *ctrl; void *slots; bool compact, pf; } xs_map_hc;
+static inline __attribute__((always_inline)) xs_map_hc xs_map_hc_of(xs_map *m) {
+    return (xs_map_hc){m->cap - 1, m->ctrl, m->slots, m->compact, m->cap - 1 >= xs_map_pf_min};
+}
+static inline __attribute__((always_inline)) void xs_map_add_hc(xs_map *m, xs_map_hc *c, int64_t k, int64_t d, const xs_site *s) {
+    uint64_t h = xs_hash_int(k);
+    size_t mask = c->mask, pos = (size_t)h & mask, stride = 0;
+    uint8_t h2 = XS_MAP_H2(h);
+    const uint8_t *ctrl = c->ctrl;
+    if (__builtin_expect(c->compact, 1)) {
+        uint64_t *cs = (uint64_t *)c->slots;
+        if (c->pf) __builtin_prefetch(&cs[pos]);
+        if (__builtin_expect((int32_t)k == k, 1))
+            for (;;) {
+                const uint8_t *g = ctrl + pos;
+                for (xs_map_gmask mm = xs_map_gmatch(g, h2); mm; mm &= mm - 1) {
+                    size_t i = (pos + XS_MAP_GBIT(mm)) & mask;
+                    if (__builtin_expect((int32_t)(uint32_t)cs[i] == (int32_t)k, 1)) {
+                        int64_t v = (int64_t)(int32_t)(uint32_t)(cs[i] >> 32) + d;
+                        if (__builtin_expect((int32_t)v == v, 1)) { cs[i] = (uint32_t)cs[i] | ((uint64_t)(uint32_t)(int32_t)v << 32); return; }
+                        goto slow;
+                    }
+                }
+                if (__builtin_expect(xs_map_gmatch(g, XS_MAP_EMPTY) != 0, 1)) goto slow;
+                stride += XS_MAP_GW;
+                pos = (pos + stride) & mask;
+            }
+    } else {
+        xs_map_entry *slots = c->slots;
+        if (c->pf) __builtin_prefetch(&slots[pos]);
+        for (;;) {
+            const uint8_t *g = ctrl + pos;
+            for (xs_map_gmask mm = xs_map_gmatch(g, h2); mm; mm &= mm - 1) {
+                size_t i = (pos + XS_MAP_GBIT(mm)) & mask;
+                if (__builtin_expect(slots[i].ikey == k, 1)) {
+                    if (__builtin_add_overflow(slots[i].val.i, d, &slots[i].val.i)) XS_FAIL("integer overflow", s);
+                    return;
+                }
+            }
+            if (__builtin_expect(xs_map_gmatch(g, XS_MAP_EMPTY) != 0, 1)) break;
+            stride += XS_MAP_GW;
+            pos = (pos + stride) & mask;
+        }
+    }
+slow:
+    xs_map_add_slow_i(m, k, d, s);
+    *c = xs_map_hc_of(m);
+}
 static bool xs_map_delete_at(xs_map *m, xs_map_entry *e) {
     if (!e) return false;
     m->lidx = 0;
