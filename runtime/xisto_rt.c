@@ -89,13 +89,13 @@ double xr_str_code_at(xs_str *s, int64_t i) { return xs_str_code_at(s, i); }
    kinds: 0 number, 1 int, 2 boolean, 3 string, 4 other reference, 5 optional reference, 6 nullable reference, 7 nullable string */
 typedef struct { const char *name; int64_t nfields, is_interface; struct { const char *name; int64_t off, kind; } f[]; } xr_desc;
 static void xr_desc_free(void *p) {
-    xr_desc *d = *(xr_desc **)((char *)p + 16);
+    xr_desc *d = *(xr_desc **)((char *)p + sizeof(xs_hdr));
     for (int64_t i = 0; i < d->nfields; i++)
         if (d->f[i].kind >= 3) xs_release_(*(void **)((char *)p + d->f[i].off));
     xs_obj_free(p);
 }
 static void xr_desc_print(void *p) {
-    xr_desc *d = *(xr_desc **)((char *)p + 16);
+    xr_desc *d = *(xr_desc **)((char *)p + sizeof(xs_hdr));
     if (d->is_interface) fputs("{", stdout); else printf("%s {", d->name);
     bool first = true;
     for (int64_t i = 0; i < d->nfields; i++) {
@@ -117,7 +117,7 @@ static void xr_desc_print(void *p) {
 }
 void *xr_obj_new(int64_t size, void *desc) {
     void *o = xs_obj_alloc((size_t)size, xr_desc_free, xr_desc_print);
-    *(void **)((char *)o + 16) = desc;
+    *(void **)((char *)o + sizeof(xs_hdr)) = desc;
     return o;
 }
 void xr_assign_slot(void **slot, void *v) { void *old = *slot; *slot = v; xs_release_(old); }

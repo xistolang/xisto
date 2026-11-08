@@ -218,9 +218,9 @@ static const char *arr_suffix(Type *arr) {
 }
 static bool is_str_like(Type *t) { return t->kind == TY_STRING || (t->kind == TY_ENUM && t->en->is_string); }
 
-/* object layout: xs_hdr (24 bytes), descriptor pointer (8), then one 8-byte slot per field */
-static int field_off(int idx) { return 24 + 8 * idx; } /* 16-byte header, then the field descriptor */
-static int obj_size(Class *c) { return 24 + 8 * (c->nfields ? c->nfields : 1); }
+/* object layout: xs_hdr (8 bytes), descriptor pointer (8), then one 8-byte slot per field */
+static int field_off(int idx) { return 16 + 8 * idx; } /* 8-byte header, then the field descriptor */
+static int obj_size(Class *c) { return 16 + 8 * (c->nfields ? c->nfields : 1); }
 
 /* "xs_str_slice" -> "xr_str_slice": the exported wrappers in runtime/xisto_rt.c */
 static char *xr_name(const char *cfn) { return xs_sprintf("xr_%s", strncmp(cfn, "xs_", 3) == 0 ? cfn + 3 : cfn); }
@@ -264,14 +264,14 @@ static char *emit_number_const(double v) {
     return xs_strndup(buf, strlen(buf));
 }
 
-/* &a[i], checked in line (XB-006): the length at offset 16 and the data pointer at 24 of every runtime array
+/* &a[i], checked in line (XB-006): the length at offset 8 and the data pointer at 16 of every runtime array
    (xs_hdr, len, data); an index outside calls the runtime's accessor, which stops with the usual message.
    Before, every a[i] was a call (nbody through qbe: 1.74 s against 0.41 s for the C backend). */
 static char *elem_ptr(Type *arr, const char *a, const char *i) {
     char *lenp = tmp(), *len = tmp(), *in = tmp(), *dp = tmp(), *data = tmp(), *off = tmp(), *p = tmp();
     char *bad = label("oob"), *good = label("inb");
     int sz = qref(arr->elem) || arr->elem->kind == TY_NUMBER || arr->elem->kind == TY_INT || arr->elem->kind == TY_ENUM ? 8 : 1;
-    ins("%s =l add %s, 16", lenp, a);
+    ins("%s =l add %s, 8", lenp, a);
     ins("%s =l loadl %s", len, lenp);
     ins("%s =w cultl %s, %s", in, i, len); /* unsigned: a negative index is out too */
     ins("jnz %s, %s, %s", in, good, bad);
@@ -279,7 +279,7 @@ static char *elem_ptr(Type *arr, const char *a, const char *i) {
     ins("call $xr_at_%s(l %s, l %s)", arr_suffix(arr), a, i);
     ins("hlt");
     blk(good);
-    ins("%s =l add %s, 24", dp, a);
+    ins("%s =l add %s, 16", dp, a);
     ins("%s =l loadl %s", data, dp);
     if (sz == 8) ins("%s =l mul %s, 8", off, i); else ins("%s =l copy %s", off, i);
     ins("%s =l add %s, %s", p, data, off);
