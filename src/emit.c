@@ -610,6 +610,8 @@ static void epop(void) { dbg_scope_end(escope); escope = escope->parent; }
 /* programs that can catch (a try, or a server) register their reference-counted locals on the cleanup stack,
    so an exception releases them (runtime: xs_cln_push) */
 static bool use_cln;
+static bool spine_wide_on(void) { return !getenv("XISTO_NO_SPINE_DEFER"); }
+static bool prog_try; /* a try somewhere in the program: an error may be caught and execution go on */
 static bool expr_has_try(Expr *e);
 static bool stmt_has_try_deep(Stmt *s) {
     if (!s) return false;
@@ -4712,19 +4714,24 @@ static bool map_add_match(Stmt *s, Expr **pm, Expr **pk, Expr **pd, Expr **psum)
     return true;
 }
 /* maps whose fields a loop holds in locals (map_hoist_enter): the map's C name and the local's id */
-static struct { const char *m; int id; } map_hoist[8];
+static struct { const char *m; int id; bool defer; int site; } map_hoist[8]; /* defer: the adds test only 64 bits; site: the first such add (its range test runs after the loop) */
 static int nmap_hoist, map_hoist_ids;
 static int byte_hoist_find(Expr *a);
-static int map_hoist_find(Expr *m) {
+static int map_hoist_slot(Expr *m) {
     if (!m || m->kind != E_IDENT || !m->cname) return -1;
-    for (int i = nmap_hoist - 1; i >= 0; i--) if (strcmp(map_hoist[i].m, m->cname) == 0) return map_hoist[i].id;
+    for (int i = nmap_hoist - 1; i >= 0; i--) if (strcmp(map_hoist[i].m, m->cname) == 0) return i;
     return -1;
 }
+static int map_hoist_find(Expr *m) { int i = map_hoist_slot(m); return i >= 0 ? map_hoist[i].id : -1; }
 static bool emit_map_add(Stmt *s) {
     Expr *m, *k, *d, *sum;
     if (!map_add_match(s, &m, &k, &d, &sum)) return false;
-    int site = new_site(sum->pos), hc = map_hoist_find(m);
-    if (hc >= 0) buf_printf(out, "xs_map_add_hc(");
+    int site = new_site(sum->pos), hc = map_hoist_find(m), hs = map_hoist_slot(m);
+    /* a constant d >= 0 in a loop whose range test is deferred to its end (loop_hoist_enter) */
+    bool dfr = hc >= 0 && map_hoist[hs].defer && d->kind == E_NUMBER && d->is_int_lit && d->num >= 0;
+    if (dfr && !map_hoist[hs].site) map_hoist[hs].site = site;
+    if (dfr) buf_printf(out, "xs_map_add_hcd(");
+    else if (hc >= 0) buf_printf(out, "xs_map_add_hc(");
     else buf_puts(out, "xs_map_add_i(");
     emit_borrowed(m);
     if (hc >= 0) buf_printf(out, ", &mhc%d_", hc);
@@ -4826,6 +4833,15 @@ static int byte_hoist_find(Expr *a) {
     return -1;
 }
 /* emits the locals before loop s (inside an open brace the caller closes) and pushes them; returns how many it pushed */
+/* a return somewhere in s (arrow bodies aside: loop_hoist loops make no closures) */
+static bool stmt_has_return(Stmt *s) {
+    if (!s) return false;
+    if (s->kind == S_RETURN || s->kind == S_YIELD) return true;
+    if (stmt_has_return(s->for_init) || stmt_has_return(s->body) || stmt_has_return(s->else_body)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (stmt_has_return(s->stmts.items[i])) return true;
+    for (int i = 0; i < s->ncases; i++) if (stmt_has_return(s->cases[i].body)) return true;
+    return false;
+}
 static int loop_hoist_enter(Stmt *s, int *nb) {
     *nb = 0;
     if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_LOOP_HOIST") || !hoist_body_ok(s->body) || !hoist_expr_ok(s->cond) || !hoist_expr_ok(s->for_update)) return 0;
@@ -4837,6 +4853,11 @@ static int loop_hoist_enter(Stmt *s, int *nb) {
         if (all != idiom || bce_writes(s, ms[i]) || declares(s, ms[i])) continue;
         int id = map_hoist_ids++;
         buf_printf(out, "xs_map_hc mhc%d_ = xs_map_hc_of(%s); ", id, ren(ms[i]));
+        /* the range test of constant adds waits for the loop's end when nothing can see the map before it: no
+           return leaves the loop past the test, no try in the program can catch an error raised in it, and the map
+           is a local of this function (a failed request of a server drops it with the call) */
+        map_hoist[nmap_hoist].defer = !prog_try && ms[i][0] == 'v' && !getenv("XISTO_NO_DEFER_RANGE") && !stmt_has_return(s->body); /* (a local: a server's request that fails takes it along) */
+        map_hoist[nmap_hoist].site = 0;
         map_hoist[nmap_hoist].m = ms[i]; map_hoist[nmap_hoist++].id = id;
         pushed++;
     }
@@ -5553,6 +5574,8 @@ static void emit_stmt_(Stmt *s) {
             int nb = 0, nm = loop_hoist_enter(s, &nb);
             if (nm || nb) {
                 emit_stmt_for_inner(s);
+                for (int i = nmap_hoist - nm; i < nmap_hoist; i++) /* the deferred range tests (see loop_hoist_enter) */
+                    if (map_hoist[i].site) buf_printf(out, " xs_map_check_range(%s, XS_S(%d));", ren(map_hoist[i].m), map_hoist[i].site);
                 nmap_hoist -= nm;
                 nbyte_hoist -= nb;
                 buf_puts(out, " }");
@@ -5888,7 +5911,12 @@ static bool spine_fn(Func *f, Spine *sp) {
     sp->base = s_if; sp->ret = s_ret; sp->k = (int64_t)base->expr->num;
     return true;
 }
-static void emit_spine(Func *f, Spine *sp) {
+/* the loop of the spine (see spine_fn): every term is >= 0, so the sum only rises and a partial sum that left the
+   safe range leaves the total out of it too; the inner version (NAME_sp, the recursion's target) tests only the
+   64-bit overflow, and NAME tests the range once on the final value. binary-trees, Xeon: the range test per node
+   (a 2^53 mask kept in a callee-saved register, a push and pop per call) was 7% of the CPU. */
+static void emit_spine_loop(Func *f, Spine *sp, bool wide) {
+    const char *add = wide ? "xs_iadd_w_s" : "xs_iadd_nn_s";
     buf_puts(out, " { /* recursion on the right spine: a loop on the second call (see spine_fn) */");
     indent++;
     nl();
@@ -5905,11 +5933,11 @@ static void emit_spine(Func *f, Spine *sp) {
     nl();
     buf_puts(out, "if (");
     emit_expr(sp->base->cond);
-    if (sp->k) buf_printf(out, ") return xs_iadd_nn_s(acc_, INT64_C(%lld), XS_S(%d));", (long long)sp->k, new_site(sp->ret->pos));
+    if (sp->k) buf_printf(out, ") return %s(acc_, INT64_C(%lld), XS_S(%d));", add, (long long)sp->k, new_site(sp->ret->pos));
     else buf_puts(out, ") return acc_;");
     nl();
-    buf_puts(out, "acc_ = xs_iadd_nn_s(acc_, "); /* (every term is >= 0: only the top of the range can be crossed) */
-    if (sp->c) buf_printf(out, "xs_iadd_nn_s(INT64_C(%lld), ", (long long)sp->c);
+    buf_printf(out, "acc_ = %s(acc_, ", add);
+    if (sp->c) buf_printf(out, "%s(INT64_C(%lld), ", add, (long long)sp->c);
     emit_expr(sp->calls[0]);
     if (sp->c) buf_printf(out, ", XS_S(%d))", new_site(sp->ret->pos));
     buf_printf(out, ", XS_S(%d));", new_site(sp->ret->pos));
@@ -5924,6 +5952,27 @@ static void emit_spine(Func *f, Spine *sp) {
     indent--;
     nl();
     buf_puts(out, "}\n");
+}
+static void emit_spine(Func *f, Spine *sp) {
+    if (!spine_wide_on()) { emit_spine_loop(f, sp, false); return; }
+    char *cname = f->cname, *inner = xs_sprintf("%s_sp", f->cname);
+    int site = new_site(sp->ret->pos);
+    buf_printf(out, " { int64_t r_ = %s(%s); if (__builtin_expect(XS_IOUT_NN(r_), 0)) XS_FAIL(XS_IOVF_MSG, XS_S(%d)); return r_; }\n", inner, f->params[0].cname, site);
+    /* the inner version, into clone_fns (its prototype is with the others): the recursive call is to it */
+    Buf *saved_out = out;
+    int saved_indent = indent;
+    Buf b = {0};
+    out = &b;
+    indent = 0;
+    f->cname = inner;
+    buf_putc(out, '\n');
+    emit_signature(f);
+    emit_spine_loop(f, sp, true);
+    f->cname = cname;
+    buf_puts(&clone_fns, b.data);
+    free(b.data);
+    out = saved_out;
+    indent = saved_indent;
 }
 static void emit_func_body(Func *f) {
     cur_func = f;
@@ -6934,6 +6983,7 @@ void emit_program(Program *p, Buf *o) {
     for (int i = 0; i < p->nclasses; i++) if (p->classes[i]->rdual) region_dual[p->classes[i]->rdual] = true;
     if (!xs_debug && !xs_profile) stack_compute(p, class_cyclic);
     rg_compute(p);
+    prog_try = program_has_try(p);
     use_cln = (p->uses_net || program_has_try(p)) && !getenv("XISTO_NO_CLN"); /* XISTO_NO_CLN: measuring knob */
     find_consumed(p);
     find_run_once(p);
@@ -7030,6 +7080,19 @@ void emit_program(Program *p, Buf *o) {
         if (p->funcs[i]->mod->builtin || p->funcs[i]->is_native || !p->funcs[i]->used) continue;
         emit_signature(p->funcs[i]);
         buf_puts(out, ";\n");
+        if (spine_wide_on() && p->funcs[i]->body && !p->funcs[i]->is_gen) { /* its inner spine version (emit_spine) */
+            Func *saved = cur_func; Spine sp_;
+            cur_func = p->funcs[i];
+            bool sp = spine_fn(p->funcs[i], &sp_);
+            cur_func = saved;
+            if (sp) {
+                char *cname = p->funcs[i]->cname;
+                p->funcs[i]->cname = xs_sprintf("%s_sp", cname);
+                emit_signature(p->funcs[i]);
+                p->funcs[i]->cname = cname;
+                buf_puts(out, ";\n");
+            }
+        }
         if (rg_hoist_on && p->funcs[i]->rg_hoist > 0 && p->funcs[i]->rg_used) { /* its region version (rg-hoist) */
             char *cname = p->funcs[i]->cname;
             p->funcs[i]->cname = rg_name(p->funcs[i]);

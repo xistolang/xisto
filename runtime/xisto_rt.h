@@ -2065,7 +2065,11 @@ typedef struct { size_t mask; const uint8_t *ctrl; void *slots; bool compact, pf
 static inline __attribute__((always_inline)) xs_map_hc xs_map_hc_of(xs_map *m) {
     return (xs_map_hc){m->cap - 1, m->ctrl, m->slots, m->compact, m->cap - 1 >= xs_map_pf_min};
 }
-static inline __attribute__((always_inline)) void xs_map_add_hc(xs_map *m, xs_map_hc *c, int64_t k, int64_t d, const xs_site *s) {
+/* defer (a constant): the counting loop's adds of a constant d >= 0 test only the 64-bit overflow, and the loop is
+   followed by xs_map_check_range (emit.c, loop_hoist): every add raises a value, so one that left the safe range
+   is still out of it when the loop ends; nothing reads the map before (k-nucleotide, Xeon: the range test of the
+   counter was 6% of the CPU) */
+static inline __attribute__((always_inline)) void xs_map_add_hc_f(xs_map *m, xs_map_hc *c, int64_t k, int64_t d, const xs_site *s, int defer) {
     uint64_t h = xs_hash_int(k);
     size_t mask = c->mask, pos = (size_t)h & mask, stride = 0;
     uint8_t h2 = XS_MAP_H2(h);
@@ -2096,7 +2100,8 @@ static inline __attribute__((always_inline)) void xs_map_add_hc(xs_map *m, xs_ma
             for (xs_map_gmask mm = xs_map_gmatch(g, h2); mm; mm &= mm - 1) {
                 size_t i = (pos + XS_MAP_GBIT(mm)) & mask;
                 if (__builtin_expect(slots[i].ikey == k, 1)) {
-                    { if (__builtin_expect(__builtin_constant_p(d) ? XS_IADD_C_OUT(slots[i].val.i, d) : XS_IOUT((int64_t)((uint64_t)(slots[i].val.i) + (uint64_t)d)), 0)) XS_FAIL(XS_IOVF_MSG, s); slots[i].val.i += d; }
+                    if (defer) { if (__builtin_expect(__builtin_add_overflow(slots[i].val.i, d, &slots[i].val.i), 0)) XS_FAIL(XS_IOVF_MSG, s); }
+                    else { if (__builtin_expect(__builtin_constant_p(d) ? XS_IADD_C_OUT(slots[i].val.i, d) : XS_IOUT((int64_t)((uint64_t)(slots[i].val.i) + (uint64_t)d)), 0)) XS_FAIL(XS_IOVF_MSG, s); slots[i].val.i += d; }
                     return;
                 }
             }
@@ -2108,6 +2113,14 @@ static inline __attribute__((always_inline)) void xs_map_add_hc(xs_map *m, xs_ma
 slow:
     xs_map_add_slow_i(m, k, d, s);
     *c = xs_map_hc_of(m);
+}
+#define xs_map_add_hc(m, c, k, d, s) xs_map_add_hc_f((m), (c), (k), (d), (s), 0)
+#define xs_map_add_hcd(m, c, k, d, s) xs_map_add_hc_f((m), (c), (k), (d), (s), 1)
+/* after a loop of deferred adds: every int value back in the safe range, else the error at the add's site */
+static void xs_map_check_range(xs_map *m, const xs_site *s) {
+    if (m->compact) return; /* (32-bit values: always in range) */
+    for (size_t i = 0; i < m->cap; i++)
+        if (XS_MAP_FULL(m, i) && __builtin_expect(XS_IOUT(m->slots[i].val.i), 0)) XS_FAIL(XS_IOVF_MSG, s);
 }
 static bool xs_map_delete_at(xs_map *m, xs_map_entry *e) {
     if (!e) return false;
@@ -2532,6 +2545,9 @@ XS_AI int64_t xs_imul_s(int64_t a, int64_t b, const xs_site *s) {
 }
 XS_AI int64_t xs_ineg_s(int64_t a, const xs_site *s) { int64_t r = -a; if (__builtin_expect(XS_IOUT_HI(r), 0)) XS_FAIL(XS_IOVF_MSG, s); return r; } /* (-(-2^53)) */
 /* both operands >= 0 (the emitter proved it): only the top of the range can be crossed */
+/* only the 64-bit overflow: the caller tests the range once on the final value (emit.c, spine: a sum of terms >= 0
+   rises, so a partial sum out of the range leaves the total out of it too) */
+XS_AI int64_t xs_iadd_w_s(int64_t a, int64_t b, const xs_site *s) { int64_t r; if (__builtin_expect(__builtin_add_overflow(a, b, &r), 0)) XS_FAIL(XS_IOVF_MSG, s); return r; }
 XS_AI int64_t xs_iadd_nn_s(int64_t a, int64_t b, const xs_site *s) { int64_t r = a + b; if (__builtin_expect(XS_IOUT_NN(r), 0)) XS_FAIL(XS_IOVF_MSG, s); return r; }
 XS_AI int64_t xs_imul_nn_s(int64_t a, int64_t b, const xs_site *s) {
     if (__builtin_constant_p(a) && !__builtin_constant_p(b)) { int64_t t = a; a = b; b = t; }
