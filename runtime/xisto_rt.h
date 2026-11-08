@@ -4826,6 +4826,53 @@ XS_NOINLINE void xs_fs_write_bytes(xs_str *path, xs_Uint8Array *b) {
     fclose(f);
 }
 
+/* node:fs on file descriptors (checker: check_fs_fd_call): openSync, closeSync, fstatSync, readSync */
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+typedef struct xs_Stats { xs_hdr hdr; int64_t f_size; int64_t mode; } xs_Stats;
+static void xs_Stats_print(void *p) { fprintf(XS_OUT, "Stats { size: %lld }", (long long)((xs_Stats *)p)->f_size); }
+static void xs_Stats_free(void *p) { xs_obj_free(p); }
+XS_NOINLINE xs_Stats *xs_fs_fstat(int64_t fd) {
+    struct stat st;
+    if (fstat((int)fd, &st) != 0) { char m_[96]; snprintf(m_, sizeof m_, "EBADF: bad file descriptor, fstat (%lld)", (long long)fd); xs_panic(m_); }
+    xs_Stats *s = xs_obj_alloc(sizeof *s, xs_Stats_free, xs_Stats_print);
+    s->f_size = (int64_t)st.st_size;
+    s->mode = (int64_t)st.st_mode;
+    return s;
+}
+static bool xs_Stats_isFile(xs_Stats *s) { return S_ISREG((mode_t)s->mode); }
+static bool xs_Stats_isDirectory(xs_Stats *s) { return S_ISDIR((mode_t)s->mode); }
+XS_NOINLINE int64_t xs_fs_open(xs_str *path, xs_str *flags) {
+    int fl = strcmp(flags->data, "w") == 0 ? O_WRONLY | O_CREAT | O_TRUNC : strcmp(flags->data, "a") == 0 ? O_WRONLY | O_CREAT | O_APPEND : strcmp(flags->data, "r+") == 0 ? O_RDWR : O_RDONLY;
+    int fd = open(path->data, fl, 0666);
+    if (fd < 0) xs_panicf("ENOENT: no such file or directory, open '%s'", path->data);
+    return fd;
+}
+XS_NOINLINE void xs_fs_close(int64_t fd) {
+    if (close((int)fd) != 0) { char m_[96]; snprintf(m_, sizeof m_, "EBADF: bad file descriptor, close (%lld)", (long long)fd); xs_panic(m_); }
+}
+/* readSync(fd, buffer, offset, length, position): bytes read (0 at the end), straight into the buffer's bytes;
+   length -1: to the buffer's end; position -1: where the descriptor is (and it moves), else that position (it
+   does not move), like Node */
+XS_NOINLINE int64_t xs_fs_read_sync(int64_t fd, xs_Uint8Array *b, int64_t off, int64_t len, int64_t pos) {
+    char m_[160];
+    if (off < 0 || off > b->f_length) { snprintf(m_, sizeof m_, "RangeError: The value of \"offset\" is out of range. It must be >= 0 && <= %lld. Received %lld", (long long)b->f_length, (long long)off); xs_panic(m_); }
+    if (len < 0) len = b->f_length - off;
+    if (len > b->f_length - off) { snprintf(m_, sizeof m_, "RangeError: The value of \"length\" is out of range. It must be >= 0 && <= %lld. Received %lld", (long long)(b->f_length - off), (long long)len); xs_panic(m_); }
+    if (len == 0) return 0;
+    if (fd == 0) xs_stdin_binary();
+    ssize_t r;
+#ifdef _WIN32
+    if (pos >= 0) { off_t cur = lseek((int)fd, 0, SEEK_CUR); lseek((int)fd, (off_t)pos, SEEK_SET); r = read((int)fd, b->data + off, (size_t)len); lseek((int)fd, cur, SEEK_SET); }
+    else r = read((int)fd, b->data + off, (size_t)len);
+#else
+    r = pos >= 0 ? pread((int)fd, b->data + off, (size_t)len, (off_t)pos) : read((int)fd, b->data + off, (size_t)len);
+#endif
+    if (r < 0) { snprintf(m_, sizeof m_, "EIO: read failed on file descriptor %lld", (long long)fd); xs_panic(m_); }
+    return (int64_t)r;
+}
+
 /* execSync from node:child_process: runs the command through /bin/sh and returns its standard output */
 XS_NOINLINE xs_str *xs_exec_sync(xs_str *cmd) {
     fflush(stdout);

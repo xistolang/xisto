@@ -196,6 +196,11 @@ static void init_builtins(void) {
     bi_field(sab, "byteLength", ty_int);
     Class *f64 = bi_class("Float64Array", "xs_Float64Array");
     bi_field(f64, "length", ty_int);
+    /* fs.fstatSync (runtime/xisto_rt.h, xs_fs_fstat): the size and the kind of what a descriptor is open on */
+    Class *stc = bi_class("Stats", "xs_Stats");
+    bi_field(stc, "size", ty_int);
+    bi_method(stc, "isFile", "xs_Stats_isFile", ty_boolean, 0);
+    bi_method(stc, "isDirectory", "xs_Stats_isDirectory", ty_boolean, 0);
     Class *tenc = bi_class("TextEncoder", "xs_TextEncoder");
     bi_method(tenc, "encode", "xs_TextEncoder_encode", ty_object_of(u8), 1, ty_string);
     Class *tdec = bi_class("TextDecoder", "xs_TextEncoder");
@@ -364,6 +369,60 @@ static void check_date_member(Expr *e) {
 }
 static bool is_bytes(Type *t) {
     return t && t->kind == TY_OBJECT && t->cls->builtin && (strcmp(t->cls->name, "Uint8Array") == 0 || strcmp(t->cls->name, "Buffer") == 0);
+}
+/* node:fs on file descriptors: openSync(path, flags?), closeSync(fd), fstatSync(fd) (a Stats: size, isFile(),
+   isDirectory()) and readSync(fd, buffer, offset?, length?, position?) -> bytes read, the buffer a Uint8Array
+   (a view on a SharedArrayBuffer too: the bytes land in it, no copy); position null or left out reads at the
+   current position, a number reads there without moving it (pread), as in Node. Missing arguments become -1
+   (offset: 0), so the runtime takes one shape. */
+static bool check_fs_fd_call(Expr *e, Func *f) {
+    const char *n = f->name;
+    bool is_open = strcmp(n, "openSync") == 0, is_close = strcmp(n, "closeSync") == 0, is_stat = strcmp(n, "fstatSync") == 0, is_read = strcmp(n, "readSync") == 0;
+    if (!is_open && !is_close && !is_stat && !is_read) return false;
+    if (is_open) {
+        if (e->args.len < 1 || e->args.len > 2) xs_error(e->pos, "openSync(path, \"r\" | \"w\" | \"a\" | \"r+\")", "openSync takes a path and optionally the flags");
+        check_expr(e->args.items[0], ty_string);
+        expect_type(e->args.items[0], ty_string, "path of openSync");
+        if (e->args.len == 2) {
+            Expr *fl = e->args.items[1];
+            check_expr(fl, ty_string);
+            if (fl->kind != E_STRING || (strcmp(fl->str, "r") != 0 && strcmp(fl->str, "w") != 0 && strcmp(fl->str, "a") != 0 && strcmp(fl->str, "r+") != 0))
+                xs_error(fl->pos, "supported: \"r\", \"w\", \"a\", \"r+\"", "unsupported flags of openSync");
+        } else {
+            Expr *fl = xs_alloc(sizeof *fl);
+            fl->kind = E_STRING; fl->pos = e->pos; fl->str = "r"; fl->type = ty_string; fl->field = -1;
+            expr_list_push(&e->args, fl);
+        }
+        e->func = NULL; e->builtin.cfn = "xs_fs_open"; e->type = ty_int;
+        return true;
+    }
+    if (e->args.len < 1) xs_error(e->pos, NULL, "%s takes a file descriptor", n);
+    check_expr(e->args.items[0], ty_int);
+    expect_type(e->args.items[0], ty_int, xs_sprintf("file descriptor of %s", n));
+    if (is_close) {
+        if (e->args.len != 1) xs_error(e->pos, NULL, "closeSync takes only the file descriptor");
+        e->func = NULL; e->builtin.cfn = "xs_fs_close"; e->type = ty_void;
+        return true;
+    }
+    if (is_stat) {
+        if (e->args.len != 1) xs_error(e->pos, NULL, "fstatSync takes only the file descriptor");
+        e->func = NULL; e->builtin.cfn = "xs_fs_fstat"; e->type = ty_object_of(find_class("Stats"));
+        return true;
+    }
+    if (e->args.len < 2 || e->args.len > 5 || e->args.len == 3) /* (Node reads a third argument alone as an options object) */
+        xs_error(e->pos, "readSync(fd, buffer) or readSync(fd, buffer, offset, length, position?)", "readSync takes 2, 4 or 5 arguments");
+    check_expr(e->args.items[1], NULL);
+    if (!is_bytes(e->args.items[1]->type)) xs_error(e->args.items[1]->pos, NULL, "buffer of readSync must be a Uint8Array or Buffer, but this is %s", ty_name(e->args.items[1]->type));
+    for (int i = 2; i < 5; i++) {
+        if (i < e->args.len) {
+            Expr *a = e->args.items[i];
+            if (a->kind == E_NULL) { e->args.items[i] = num_lit(a->pos, -1, true); continue; }
+            check_expr(a, ty_int);
+            expect_type(a, ty_int, i == 2 ? "offset of readSync" : i == 3 ? "length of readSync" : "position of readSync");
+        } else expr_list_push(&e->args, num_lit(e->pos, i == 2 ? 0 : -1, true));
+    }
+    e->func = NULL; e->builtin.cfn = "xs_fs_read_sync"; e->type = ty_int;
+    return true;
 }
 static bool is_f64(Type *t) { return t && t->kind == TY_OBJECT && t->cls->builtin && strcmp(t->cls->name, "Float64Array") == 0; }
 static bool is_sab(Type *t) { return t && t->kind == TY_OBJECT && t->cls->builtin && strcmp(t->cls->name, "SharedArrayBuffer") == 0; }
@@ -2902,6 +2961,7 @@ static void check_expr(Expr *e, Type *expected) {
                 xs_error(o->pos, "write execSync(command, { encoding: \"utf8\" })", "unsupported execSync options");
             e->args.len = 1;
         }
+        if (f->mod && f->mod->builtin && check_fs_fd_call(e, f)) return;
         if (f->mod && f->mod->builtin && strcmp(f->name, "readFileSync") == 0) {
             if (e->args.len < 1 || e->args.len > 2) xs_error(e->pos, NULL, "readFileSync takes a path and optionally \"utf8\"");
             Expr *a0 = e->args.items[0];
