@@ -416,6 +416,21 @@ typedef struct BceGArr { const char *name; int64_t n; bool has_rng; int64_t lo, 
 static BceGArr *garr_find(const char *c);
 static Rng rng_of(Expr *e);
 static bool bce_safe(Expr *e); /* an index the loop already checks (see bce_enter) */
+/* u8reg: byte arrays a loop keeps in vector registers (see u8reg_loop) */
+typedef struct { int kind; Expr *a, *src, *lo, *hi; Stmt *loop; } U8Idiom; /* kind 1 copy a[j] = src[j], 2 reverse, 3 shift a[j] = a[j+1] */
+static bool match_u8_idiom(Stmt *s, U8Idiom *m);
+static bool u8_is_index_on(Expr *e, const char *c);
+static bool same_simple(Expr *a, Expr *b);
+static bool bce_pure(Expr *e);
+typedef struct { const char *cname; int64_t n; } U8Reg;
+static U8Reg u8regs[8];
+static int nu8regs;
+static U8Reg *u8reg_find(Expr *e) {
+    if (!e || e->kind != E_IDENT || !e->cname) return NULL;
+    for (int k = 0; k < nu8regs; k++) if (strcmp(u8regs[k].cname, e->cname) == 0) return &u8regs[k];
+    return NULL;
+}
+static void emit_u8reg_name(Expr *e) { buf_printf(out, "r_%s", e->cname); }
 static void emit_bce_index(Expr *i);
 static int inl_ids;
 /* a generator compiled as a state machine (emit_gen_sm): its locals, parameters and self live in the frame */
@@ -2533,6 +2548,21 @@ static void emit_expr_raw(Expr *e) {
     case E_ASSIGN:
         if (e->lhs->kind == E_INDEX && e->lhs->builtin.cfn && strcmp(e->lhs->builtin.cfn, "xs_u8_get") == 0) { /* b[i] = v, b[i] += v: the low 8 bits */
             bool nc = bce_safe(e->lhs); /* within the bytes: no check */
+            U8Reg *rg = u8reg_find(e->lhs->lhs);
+            if (rg && e->op == TK_ASSIGN) { /* in a register (u8reg_loop): a lane blend, no byte store */
+                buf_puts(out, "({ int64_t vv_ = ");
+                emit_expr(e->rhs);
+                buf_puts(out, "; ");
+                emit_u8reg_name(e->lhs->lhs);
+                buf_puts(out, nc ? " = xs_v16_set_nc(" : " = xs_v16_set(");
+                emit_u8reg_name(e->lhs->lhs);
+                buf_puts(out, ", ");
+                if (nc) emit_bce_index(e->lhs->rhs); else emit_expr(e->lhs->rhs);
+                buf_puts(out, ", vv_");
+                if (!nc) { buf_printf(out, ", INT64_C(%lld)", (long long)rg->n); site_arg(e->pos); }
+                buf_puts(out, "); vv_; })");
+                return;
+            }
             if (e->op == TK_ASSIGN) {
                 buf_puts(out, nc ? "xs_u8_set_nc(" : "xs_u8_set(");
                 emit_borrowed(e->lhs->lhs);
@@ -2708,6 +2738,17 @@ static void emit_expr_raw(Expr *e) {
         return;
     case E_INDEX:
         if (e->builtin.cfn) { /* m[i] on a RegExp match (the group's text, borrowed), b[i] on bytes */
+            U8Reg *rg = strcmp(e->builtin.cfn, "xs_u8_get") == 0 ? u8reg_find(e->lhs) : NULL;
+            if (rg) { /* the array is in a register for this loop (u8reg_loop) */
+                bool nc = bce_safe(e);
+                buf_puts(out, nc ? "xs_v16_get_nc(" : "xs_v16_get(");
+                emit_u8reg_name(e->lhs);
+                buf_puts(out, ", ");
+                if (nc) emit_bce_index(e->rhs); else emit_expr(e->rhs);
+                if (!nc) { buf_printf(out, ", INT64_C(%lld)", (long long)rg->n); site_arg(e->pos); }
+                buf_puts(out, ")");
+                return;
+            }
             if (strcmp(e->builtin.cfn, "xs_u8_get") == 0 && bce_safe(e)) { /* within the bytes: see bce_safe */
                 buf_puts(out, "((int64_t)*xs_u8_at_nc(");
                 emit_borrowed(e->lhs);
@@ -3030,6 +3071,29 @@ static const char *dbg_type(Type *t) {
 
 static int region_reset_pending; /* a region loop's body: rewinds the region before each iteration */
 static bool *region_dual;        /* per region: it has dual classes (xs_rg_on_N says where they are made) */
+/* `for (j = lo; j <= K; j++) a[j] = a[j + 1]; a[K + 1] = v;` with a in a register (fannkuch-redux's next
+   permutation): one call, the shuffle and the lane (xs_v16_shl_put). b->stmts[*i] is the loop; on a match the
+   pair is emitted and *i skips the store. */
+static bool emit_u8_shl_put(Stmt *b, int *i) {
+    if (*i + 1 >= b->stmts.len || xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
+    Stmt *lp = b->stmts.items[*i], *st = b->stmts.items[*i + 1];
+    U8Idiom m;
+    if (lp->kind != S_FOR || !match_u8_idiom(lp, &m) || m.kind != 3 || lp->cond->op != TK_LE) return false;
+    U8Reg *rg = u8reg_find(m.a);
+    if (!rg) return false;
+    Expr *as = st->kind == S_EXPR ? st->expr : NULL;
+    if (!as || as->kind != E_ASSIGN || as->op != TK_ASSIGN || !u8_is_index_on(as->lhs, m.a->cname)) return false;
+    Expr *ix = as->lhs->rhs; /* K + 1 */
+    if (!ix || ix->kind != E_BINARY || ix->op != TK_PLUS || !same_simple(ix->lhs, m.hi) || !ix->rhs || ix->rhs->kind != E_NUMBER || ix->rhs->num != 1) return false;
+    if (!bce_pure(as->rhs) && as->rhs->kind != E_IDENT) return false;
+    int site = new_site(lp->pos);
+    nl();
+    emit_dbg_hook(lp);
+    emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_shl_put("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_puts(out, ", ");
+    emit_expr(as->rhs); buf_printf(out, ", INT64_C(%lld), XS_S(%d));", (long long)rg->n, site);
+    *i += 1;
+    return true;
+}
 static void emit_block_kind(Stmt *b, ScopeKind kind) {
     buf_puts(out, "{");
     indent++;
@@ -3042,6 +3106,7 @@ static void emit_block_kind(Stmt *b, ScopeKind kind) {
         region_reset_pending = 0;
     }
     for (int i = 0; i < b->stmts.len; i++) {
+        if (emit_u8_shl_put(b, &i)) continue;
         nl();
         emit_dbg_hook(b->stmts.items[i]);
         emit_stmt(b->stmts.items[i]);
@@ -3068,6 +3133,7 @@ static void emit_block(Stmt *b, bool func_root) {
     Class *after_super = func_root ? inits_after_super : NULL;
     if (func_root) inits_after_super = NULL;
     for (int i = 0; i < b->stmts.len; i++) {
+        if (!after_super && emit_u8_shl_put(b, &i)) continue;
         nl();
         emit_dbg_hook(b->stmts.items[i]);
         emit_stmt(b->stmts.items[i]);
@@ -3189,11 +3255,87 @@ static bool reuse_assign(Expr *e) {
     return true;
 }
 
+/* ---------- Float64Array locals in the frame ----------
+   `const v = new Float64Array(N)`, N a literal <= 16, in a function whose body only indexes v (v[i], v.length) or
+   passes it to user functions that, by the same rule, only index that parameter: v is a double[N] in the C
+   frame (xs_f64_on_frame) instead of an object on the heap, and the C compiler promotes it to registers (SROA)
+   once the loops unroll: n-body's advance with its 11 arrays local, M4 2,40 -> 1,23 s (= Rust). Anything else
+   (stored, returned, captured, iterated, a method called on it, a builtin receiving it) keeps the heap object.
+   XISTO_NO_F64_LOCAL=1 turns it off. */
+static bool f64_mentions_stmt(Stmt *s, const char *cname);
+static bool f64_mentions(Expr *e, const char *cname) {
+    if (!e) return false;
+    if (e->kind == E_IDENT) return e->cname && strcmp(e->cname, cname) == 0;
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn && f64_mentions_stmt(e->arrow->fn->body, cname)) return true;
+    if (f64_mentions(e->lhs, cname) || f64_mentions(e->rhs, cname)) return true;
+    for (int i = 0; i < e->args.len; i++) if (f64_mentions(e->args.items[i], cname)) return true;
+    return false;
+}
+static bool f64_mentions_stmt(Stmt *s, const char *cname) {
+    if (!s) return false;
+    if (f64_mentions(s->init, cname) || f64_mentions(s->expr, cname) || f64_mentions(s->cond, cname) || f64_mentions(s->for_update, cname)) return true;
+    if (f64_mentions_stmt(s->for_init, cname) || f64_mentions_stmt(s->body, cname) || f64_mentions_stmt(s->else_body, cname)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (f64_mentions_stmt(s->stmts.items[i], cname)) return true;
+    for (int i = 0; i < s->ncases; i++) if (f64_mentions_stmt(s->cases[i].body, cname)) return true;
+    return false;
+}
+static bool f64_plain_stmt(Stmt *s, const char *cname, int depth);
+static bool f64_plain_param(Func *f, int i, int depth) {
+    if (depth > 3 || !f || !f->body || i >= f->nparams || f->params[i].cell || !f->params[i].cname) return false;
+    return f64_plain_stmt(f->body, f->params[i].cname, depth);
+}
+static bool f64_is(Expr *e, const char *cname) { return e && e->kind == E_IDENT && e->cname && strcmp(e->cname, cname) == 0; }
+static bool f64_plain_expr(Expr *e, const char *cname, int depth) {
+    if (!e) return true;
+    if (e->kind == E_IDENT) return !f64_is(e, cname); /* a bare use: it escapes */
+    if (e->kind == E_INDEX && f64_is(e->lhs, cname)) return f64_plain_expr(e->rhs, cname, depth);
+    if (e->kind == E_MEMBER && !e->is_call && f64_is(e->lhs, cname) && e->str && strcmp(e->str, "length") == 0) return true;
+    if (e->kind == E_ARROW) { /* captured by a closure: the closure's copy would hold it past the frame */
+        if (!e->arrow) return false;
+        for (int i = 0; i < e->arrow->ncaptures; i++)
+            if (e->arrow->captures[i].outer_cname && strcmp(e->arrow->captures[i].outer_cname, cname) == 0) return false;
+        return !e->arrow->fn || !f64_mentions_stmt(e->arrow->fn->body, cname);
+    }
+    if (e->kind == E_CALL && e->func && e->func->body && !e->builtin.cfn) {
+        if (!f64_plain_expr(e->lhs, cname, depth)) return false;
+        for (int i = 0; i < e->args.len; i++) {
+            if (f64_is(e->args.items[i], cname)) { if (!f64_plain_param(e->func, i, depth + 1)) return false; }
+            else if (!f64_plain_expr(e->args.items[i], cname, depth)) return false;
+        }
+        return true;
+    }
+    if (!f64_plain_expr(e->lhs, cname, depth) || !f64_plain_expr(e->rhs, cname, depth)) return false;
+    for (int i = 0; i < e->args.len; i++) if (!f64_plain_expr(e->args.items[i], cname, depth)) return false;
+    return true;
+}
+static bool f64_plain_stmt(Stmt *s, const char *cname, int depth) {
+    if (!s) return true;
+    if (s->kind == S_FOROF && f64_mentions(s->expr, cname)) return false;
+    if (!f64_plain_expr(s->init, cname, depth) || !f64_plain_expr(s->expr, cname, depth) || !f64_plain_expr(s->cond, cname, depth) || !f64_plain_expr(s->for_update, cname, depth)) return false;
+    if (!f64_plain_stmt(s->for_init, cname, depth) || !f64_plain_stmt(s->body, cname, depth) || !f64_plain_stmt(s->else_body, cname, depth)) return false;
+    for (int i = 0; i < s->stmts.len; i++) if (!f64_plain_stmt(s->stmts.items[i], cname, depth)) return false;
+    for (int i = 0; i < s->ncases; i++) if (!f64_plain_stmt(s->cases[i].body, cname, depth)) return false;
+    return true;
+}
+static int64_t bce_fixed_of(Stmt *s);
+static int64_t f64_local_n(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || !cur_func || !cur_func->body || !is_f64_type(s->type) || getenv("XISTO_NO_F64_LOCAL")) return 0;
+    int64_t n = bce_fixed_of(s);
+    if (n <= 0 || n > 16) return 0;
+    return f64_plain_stmt(cur_func->body, s->cname, 0) ? n : 0;
+}
 static void emit_var(Stmt *s) {
     if (sm_mode) { /* a local of a state-machine generator: a field of the frame, assigned (emit_gen_sm checked it is primitive) */
         buf_printf(out, "%s = ", ren(s->cname));
         emit_expr(s->init);
         buf_puts(out, ";");
+        return;
+    }
+    int64_t fn_ = f64_local_n(s);
+    if (fn_ > 0) { /* a Float64Array in the frame: a double[N] the C compiler keeps in registers */
+        buf_printf(out, "double sd_%s[%lld] = {0}; xs_Float64Array so_%s; xs_Float64Array *%s = xs_f64_on_frame(&so_%s, sd_%s, %lld);",
+                   s->cname, (long long)fn_, s->cname, s->cname, s->cname, s->cname, (long long)fn_);
+        dbg_local(s->name, s->type, s->cname, s->is_const);
         return;
     }
     if (borrowable_init(s)) {
@@ -3590,6 +3732,8 @@ static int64_t bce_fixed_of(Stmt *s) {
     Expr *e = s->init;
     if (e->kind != E_NEW_OBJ || !e->builtin.cfn || (strcmp(e->builtin.cfn, "xs_u8_new") != 0 && strcmp(e->builtin.cfn, "xs_f64_new") != 0) || e->args.len != 1) return 0;
     Expr *n = e->args.items[0];
+    int64_t v;
+    if (n->kind == E_IDENT && n->cname && cig_find(n->cname, &v)) return v > 0 ? v : 0; /* new Float64Array(N), N a top-level const int */
     return n->kind == E_NUMBER && n->is_int_lit && n->ival > 0 ? n->ival : 0;
 }
 static void bce_fix_scan(Stmt *s) {
@@ -4277,30 +4421,39 @@ static bool u8_index_of(Expr *e, Expr *arr, Expr *idx) { /* arr[idx] as the prog
 static bool is_sub_of(Expr *e, Expr *S, const char *i) { /* S - i */
     return e && e->kind == E_BINARY && e->op == TK_MINUS && same_simple(e->lhs, S) && e->rhs && e->rhs->kind == E_IDENT && e->rhs->cname && strcmp(e->rhs->cname, i) == 0;
 }
-static bool emit_u8_idiom(Stmt *s) {
-    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
+/* A local Uint8Array(N <= 16) a loop only indexes (get, set, the idioms below) lives in a vector register for
+   the loop (u8reg_setup): xs_v16_* in xisto_rt.h. One list for the nested scopes being emitted. */
+static bool match_u8_idiom(Stmt *s, U8Idiom *m) {
+    if (s->kind != S_FOR) return false;
     Stmt *fi = s->for_init;
     Expr *c = s->cond, *u = s->for_update;
     if (!fi || fi->kind != S_VAR || !fi->cname || !fi->init || fi->cell || !bce_pure(fi->init)) return false;
     if (!u || u->kind != E_POSTFIX || u->op != TK_PLUSPLUS || !u->lhs || u->lhs->kind != E_IDENT || !u->lhs->cname || strcmp(u->lhs->cname, fi->cname) != 0) return false;
-    if (!c || c->kind != E_BINARY || c->op != TK_LT || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, fi->cname) != 0) return false;
+    if (!c || c->kind != E_BINARY || (c->op != TK_LT && c->op != TK_LE) || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, fi->cname) != 0) return false;
     const char *i = fi->cname;
     Stmt *b = s->body;
     if (!b || b->kind != S_BLOCK) return false;
     if (stmt_writes_name(b, i) || writes_name(c->rhs, i)) return false;
     Expr iv = {0}; iv.kind = E_IDENT; iv.cname = (char *)i; /* the counter, as an index */
-    if (b->stmts.len == 1) { /* copy */
+    m->loop = s; m->lo = fi->init;
+    if (b->stmts.len == 1) { /* copy, or shift */
         Expr *as = b->stmts.items[0]->kind == S_EXPR ? b->stmts.items[0]->expr : NULL;
         if (!as || as->kind != E_ASSIGN || as->op != TK_ASSIGN || !bce_pure(c->rhs)) return false;
         Expr *dst = as->lhs, *src = as->rhs;
         if (!dst || dst->kind != E_INDEX || !dst->builtin.cfn || strcmp(dst->builtin.cfn, "xs_u8_get") != 0 || !u8_name(dst->lhs) || !same_simple(dst->rhs, &iv)) return false;
-        if (!src || src->kind != E_INDEX || !src->builtin.cfn || strcmp(src->builtin.cfn, "xs_u8_get") != 0 || !u8_name(src->lhs) || !same_simple(src->rhs, &iv)) return false;
-        if (strcmp(dst->lhs->cname, src->lhs->cname) == 0) return false;
-        buf_puts(out, "xs_u8_copy_range("); emit_borrowed(dst->lhs); buf_puts(out, ", "); emit_borrowed(src->lhs);
-        buf_puts(out, ", "); emit_expr(fi->init); buf_puts(out, ", "); emit_expr(c->rhs); buf_printf(out, ", XS_S(%d));", new_site(s->pos));
+        if (!src || src->kind != E_INDEX || !src->builtin.cfn || strcmp(src->builtin.cfn, "xs_u8_get") != 0 || !u8_name(src->lhs)) return false;
+        if (same_simple(src->rhs, &iv)) {
+            if (c->op != TK_LT || strcmp(dst->lhs->cname, src->lhs->cname) == 0) return false;
+            m->kind = 1; m->a = dst->lhs; m->src = src->lhs; m->hi = c->rhs;
+            return true;
+        }
+        /* a[j] = a[j + 1], j <= K (or j < K: the last j is K - 1) */
+        Expr *r = src->rhs;
+        if (strcmp(dst->lhs->cname, src->lhs->cname) != 0 || !r || r->kind != E_BINARY || r->op != TK_PLUS || !same_simple(r->lhs, &iv) || !r->rhs || r->rhs->kind != E_NUMBER || r->rhs->num != 1) return false;
+        m->kind = 3; m->a = dst->lhs; m->src = NULL; m->hi = c->rhs;
         return true;
     }
-    if (b->stmts.len != 3) return false;
+    if (b->stmts.len != 3 || c->op != TK_LT) return false;
     /* reverse: cond is i < (S + 1) >> 1 */
     Expr *h = c->rhs;
     if (!h || h->kind != E_BINARY || h->op != TK_SHR || !h->rhs || h->rhs->kind != E_NUMBER || h->rhs->num != 1) return false;
@@ -4319,12 +4472,142 @@ static bool emit_u8_idiom(Stmt *s) {
     if (!a2->lhs || a2->lhs->kind != E_INDEX || !same_simple(a2->lhs->lhs, a) || !is_sub_of(a2->lhs->rhs, S, i)) return false;
     if (!a2->rhs || a2->rhs->kind != E_IDENT || !a2->rhs->cname || strcmp(a2->rhs->cname, t->cname) != 0) return false;
     if (stmt_writes_name(b, S->cname) || stmt_writes_name(b, a->cname)) return false;
-    buf_puts(out, "xs_u8_rev("); emit_borrowed(a); buf_puts(out, ", "); emit_expr(fi->init); buf_puts(out, ", (");
-    emit_expr(S); buf_puts(out, ") - ("); emit_expr(fi->init); buf_printf(out, "), XS_S(%d));", new_site(s->pos));
+    m->kind = 2; m->a = a; m->src = NULL; m->hi = S;
+    return true;
+}
+/* the loops `for (j = lo; j < hi; j++) dst[j] = src[j]`, the swap loop of a reversal, and `a[j] = a[j + 1]`
+   on byte arrays become one runtime call each (xs_u8_copy_range, xs_u8_rev, xs_u8_shl), or one shuffle when
+   the array is in a register. XISTO_NO_U8_IDIOM=1 keeps the loops. */
+static bool emit_u8_idiom(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
+    U8Idiom m;
+    if (!match_u8_idiom(s, &m)) return false;
+    int site = new_site(s->pos);
+    U8Reg *ra = u8reg_find(m.a), *rs = m.kind == 1 ? u8reg_find(m.src) : NULL;
+    if (m.kind == 1) {
+        if (ra && rs) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_copy_rr("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_u8reg_name(m.src); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", INT64_C(%lld), INT64_C(%lld), XS_S(%d));", (long long)ra->n, (long long)rs->n, site); }
+        else if (ra) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_copy_in("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_borrowed(m.src); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", INT64_C(%lld), XS_S(%d));", (long long)ra->n, site); }
+        else if (rs) { buf_puts(out, "xs_v16_copy_out("); emit_borrowed(m.a); buf_puts(out, ", "); emit_u8reg_name(m.src); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", INT64_C(%lld), XS_S(%d));", (long long)rs->n, site); }
+        else { buf_puts(out, "xs_u8_copy_range("); emit_borrowed(m.a); buf_puts(out, ", "); emit_borrowed(m.src); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", XS_S(%d));", site); }
+        return true;
+    }
+    if (m.kind == 2) {
+        if (ra) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_rev("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_puts(out, ") - ("); emit_expr(m.lo); buf_printf(out, "), INT64_C(%lld), XS_S(%d));", (long long)ra->n, site); }
+        else { buf_puts(out, "xs_u8_rev("); emit_borrowed(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_puts(out, ") - ("); emit_expr(m.lo); buf_printf(out, "), XS_S(%d));", site); }
+        return true;
+    }
+    /* shift: the last j is K (<=) or K - 1 (<) */
+    const char *last = s->cond->op == TK_LE ? "" : " - INT64_C(1)";
+    if (ra) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_shl("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_printf(out, ")%s, INT64_C(%lld), XS_S(%d));", last, (long long)ra->n, site); }
+    else { buf_puts(out, "xs_u8_shl("); emit_borrowed(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_printf(out, ")%s, XS_S(%d));", last, site); }
+    return true;
+}
+/* ---- u8reg: which byte arrays a loop may keep in registers ----
+   Candidates: `const a = new Uint8Array(N)` (N literal <= 16) declared in the current function and, in the whole
+   function, only ever indexed (a[i] read, a[i] = v, the idioms above): never passed, stored, returned, measured
+   (.length), iterated, captured by an arrow. In the loop every use must be a read, a plain store or an idiom
+   (a[i]++ and a[i] += v stay memory forms: such a loop is not promoted). */
+static bool u8_use_ok(Expr *e, const char *c, bool in_loop);
+static bool stmt_mentions_name(Stmt *s, const char *c);
+static bool u8_stmt_ok(Stmt *s, const char *c, bool in_loop) {
+    if (!s) return true;
+    if (in_loop && s->kind == S_TRY) return false;
+    if (in_loop && s->kind == S_FOR && !getenv("XISTO_NO_U8_IDIOM")) {
+        U8Idiom m;
+        if (match_u8_idiom(s, &m)) return u8_use_ok(m.lo, c, in_loop) && u8_use_ok(m.hi, c, in_loop); /* the idiom's own uses are fine */
+    }
+    if (s->kind == S_VAR && s->cname && strcmp(s->cname, c) == 0) return !in_loop; /* its declaration (outside the loop) */
+    if (!u8_use_ok(s->init, c, in_loop) || !u8_use_ok(s->expr, c, in_loop) || !u8_use_ok(s->cond, c, in_loop) || !u8_use_ok(s->for_update, c, in_loop)) return false;
+    if (!u8_stmt_ok(s->for_init, c, in_loop) || !u8_stmt_ok(s->body, c, in_loop) || !u8_stmt_ok(s->else_body, c, in_loop)) return false;
+    for (int i = 0; i < s->stmts.len; i++) if (!u8_stmt_ok(s->stmts.items[i], c, in_loop)) return false;
+    for (int i = 0; i < s->ncases; i++) if (!u8_use_ok(s->cases[i].value, c, in_loop) || !u8_stmt_ok(s->cases[i].body, c, in_loop)) return false;
+    return true;
+}
+static bool u8_is_index_on(Expr *e, const char *c) {
+    return e && e->kind == E_INDEX && e->builtin.cfn && strcmp(e->builtin.cfn, "xs_u8_get") == 0 && e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname && strcmp(e->lhs->cname, c) == 0;
+}
+static bool u8_use_ok(Expr *e, const char *c, bool in_loop) {
+    if (!e) return true;
+    if (e->kind == E_IDENT) return !(e->cname && strcmp(e->cname, c) == 0); /* a bare use: it escapes */
+    if (e->kind == E_ARROW) return e->arrow && e->arrow->fn && u8_stmt_ok(e->arrow->fn->body, c, in_loop) && !stmt_mentions_name(e->arrow->fn->body, c);
+    if (u8_is_index_on(e, c)) return u8_use_ok(e->rhs, c, in_loop); /* a read */
+    if ((e->kind == E_ASSIGN || e->kind == E_POSTFIX || e->kind == E_UNARY) && u8_is_index_on(e->lhs, c)) {
+        if (in_loop && !(e->kind == E_ASSIGN && e->op == TK_ASSIGN)) return false; /* a[i]++, a[i] += v */
+        return u8_use_ok(e->lhs->rhs, c, in_loop) && u8_use_ok(e->rhs, c, in_loop);
+    }
+    if (!u8_use_ok(e->lhs, c, in_loop) || !u8_use_ok(e->rhs, c, in_loop)) return false;
+    for (int i = 0; i < e->args.len; i++) if (!u8_use_ok(e->args.items[i], c, in_loop)) return false;
+    return true;
+}
+static bool expr_mentions_name(Expr *e, const char *c) {
+    if (!e) return false;
+    if (e->kind == E_IDENT) return e->cname && strcmp(e->cname, c) == 0;
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn && stmt_mentions_name(e->arrow->fn->body, c)) return true;
+    if (expr_mentions_name(e->lhs, c) || expr_mentions_name(e->rhs, c)) return true;
+    for (int i = 0; i < e->args.len; i++) if (expr_mentions_name(e->args.items[i], c)) return true;
+    return false;
+}
+static bool stmt_mentions_name(Stmt *s, const char *c) {
+    if (!s) return false;
+    if (expr_mentions_name(s->init, c) || expr_mentions_name(s->expr, c) || expr_mentions_name(s->cond, c) || expr_mentions_name(s->for_update, c)) return true;
+    if (stmt_mentions_name(s->for_init, c) || stmt_mentions_name(s->body, c) || stmt_mentions_name(s->else_body, c)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (stmt_mentions_name(s->stmts.items[i], c)) return true;
+    for (int i = 0; i < s->ncases; i++) if (expr_mentions_name(s->cases[i].value, c) || stmt_mentions_name(s->cases[i].body, c)) return true;
+    return false;
+}
+/* the fixed byte arrays declared in the function body, as candidates */
+static void u8_candidates(Stmt *s, U8Reg *c, int *n) {
+    if (!s) return;
+    if (s->kind == S_VAR && *n < 8) {
+        int64_t len = bce_fixed_of(s);
+        if (len && len <= 16 && s->init->builtin.cfn && strcmp(s->init->builtin.cfn, "xs_u8_new") == 0) c[(*n)++] = (U8Reg){s->cname, len};
+    }
+    u8_candidates(s->for_init, c, n); u8_candidates(s->body, c, n); u8_candidates(s->else_body, c, n);
+    for (int i = 0; i < s->stmts.len; i++) u8_candidates(s->stmts.items[i], c, n);
+    for (int i = 0; i < s->ncases; i++) u8_candidates(s->cases[i].body, c, n);
+}
+/* The loop s: its registers are chosen, loaded before it, the loop is emitted (by emit_stmt_), the registers
+   stored after. Returns false when there is nothing to promote. XISTO_NO_U8_REG=1 turns it off. */
+static bool u8reg_loop(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || !cur_func || !cur_func->body || stmt_has_try(cur_func->body) || getenv("XISTO_NO_U8_REG") || getenv("XISTO_NO_U8_IDIOM")) return false;
+    if (s->kind != S_WHILE && s->kind != S_FOR) return false;
+    U8Idiom m;
+    if (s->kind == S_FOR && match_u8_idiom(s, &m)) return false; /* one shuffle already */
+    U8Reg cand[8]; int nc = 0;
+    u8_candidates(cur_func->body, cand, &nc);
+    U8Reg chosen[8]; int nch = 0;
+    for (int k = 0; k < nc && nu8regs + nch < 8; k++) {
+        Expr iv = {0}; iv.kind = E_IDENT; iv.cname = (char *)cand[k].cname;
+        if (u8reg_find(&iv)) continue; /* an outer loop holds it already */
+        if (!stmt_mentions_name(s, cand[k].cname)) continue; /* not used here */
+        if (!u8_stmt_ok(cur_func->body, cand[k].cname, false)) continue; /* escapes somewhere */
+        if (!u8_stmt_ok(s, cand[k].cname, true)) continue; /* a use the register cannot serve */
+        chosen[nch++] = cand[k];
+    }
+    if (!nch) return false;
+    int base = nu8regs;
+    buf_puts(out, "{");
+    indent++;
+    for (int k = 0; k < nch; k++) {
+        u8regs[nu8regs++] = chosen[k];
+        nl();
+        buf_printf(out, "xs_u8x16 r_%s = xs_v16_load(%s->data, INT64_C(%lld));", chosen[k].cname, ren(chosen[k].cname), (long long)chosen[k].n);
+    }
+    nl();
+    emit_stmt_(s);
+    for (int k = 0; k < nch; k++) {
+        nl();
+        buf_printf(out, "xs_v16_store(%s->data, r_%s, INT64_C(%lld));", ren(chosen[k].cname), chosen[k].cname, (long long)chosen[k].n);
+    }
+    nu8regs = base;
+    indent--;
+    nl();
+    buf_puts(out, "}");
     return true;
 }
 static void emit_stmt_(Stmt *s) {
     used_ar = false;
+    if ((s->kind == S_WHILE || s->kind == S_FOR) && u8reg_loop(s)) { drain_if_needed(); return; }
     switch (s->kind) {
     case S_VAR:
         emit_var(s);
