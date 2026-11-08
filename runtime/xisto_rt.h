@@ -624,8 +624,11 @@ static XS_TLS int64_t xs_live;   /* allocations alive (literals excluded); per t
 static XS_TLS int64_t xs_allocs; /* total allocations */
 /* Small objects (up to 248 bytes) come from per-thread free lists by 8-byte size class: allocation-heavy
    code (an object or a string per loop iteration) otherwise spends most of its time in malloc and free.
-   (XS_OBJ_SHIFT=4, e.g. XISTO_CC="cc -DXS_OBJ_SHIFT=4": 16-byte classes, to measure what the finer steps do
-   on a machine) */
+   The step is 8 because the header is 8 bytes and a 24-byte node then takes a class of its own: on the
+   reference machine (Linux x86, Xeon E5) binary-trees ran 1.22x faster than main with 8-byte classes and
+   1.00x with 16-byte ones; on the M4 and an Intel Mac 8 also won. The Graviton2 alone preferred 16 (one node
+   in three straddles a cache line at 24). XS_OBJ_SHIFT=4 (XISTO_CC="cc -DXS_OBJ_SHIFT=4") gives 16-byte
+   classes, to measure on a machine. */
 #ifndef XS_OBJ_SHIFT
 #define XS_OBJ_SHIFT 3
 #endif
