@@ -4031,6 +4031,113 @@ static inline int64_t xs_u8_get(xs_Uint8Array *b, int64_t i, const xs_site *s) {
    emit_u8_idiom): a[lo..hi] reversed in place. The indices are checked once; a range inside the first 16 bytes of
    a buffer of 16 or more is one 16-byte shuffle (SSSE3 pshufb / NEON tbl), the way the Rust fannkuch-redux keeps
    its permutation in one register. fannkuch-redux on the Xeon: see historia.md. */
+/* The two-cursor table trade of reverse-complement (emit.c emit_u8_idiom):
+     for (t = 0; t < run; t++) { x = buf[a+t]; buf[a+t] = T[buf[b-t]]; buf[b-t] = T[x]; }
+   T a Uint8Array(256) the loop does not write. The setup, once per function (T is invariant there), decides
+   whether T is "letters by 5 bits" (T[c] == L[c & 0x1f] for A..Z and a..z, T[c] == c for every other byte) and
+   keeps L in two vectors; then a step takes 16 bytes of each side, reverses them with a shuffle, translates
+   them (L by a 32-entry lookup; a non-letter stays itself, by a blend on an unsigned compare, so the result is
+   T[c] bit for bit for any byte) and stores them on the other side, both loads before both stores (blocks that
+   overlap in the middle of the run are exact; a block past the run is stored under a lane < rem mask). Any
+   other table, a buffer too close to its ends, or XISTO_NO_U8_TRADE=1 at build time: the scalar loop. */
+typedef struct { const uint8_t *T; bool simd;
+#if defined(__SSSE3__) || defined(__ARM_NEON)
+    xs_u8x16 L0, L1, M0, M1; /* L: the letters' values by their 5 low bits; M: 0xff where a letter is mapped */
+#endif
+} xs_u8_tr_ctx;
+/* "letters by 5 bits": a letter either keeps itself in both cases, or both cases go to one value L[c & 0x1f]
+   (M marks those); every other byte keeps itself. The complement table is one (16 letter pairs mapped, the 10
+   others identity); a table that moves a digit, or maps 'e' and 'E' apart, is not. */
+static inline bool xs_u8_tr_is5(const uint8_t *T, uint8_t *L, uint8_t *M) {
+    for (int i = 0; i < 32; i++) { L[i] = 0; M[i] = 0; }
+    for (int i = 0; i < 26; i++) {
+        int up = 'A' + i, lo = 'a' + i, k = up & 0x1f;
+        if (T[up] == up && T[lo] == lo) continue;
+        if (T[lo] != T[up]) return false;
+        L[k] = T[up];
+        M[k] = 0xff;
+    }
+    for (int c = 0; c < 256; c++) {
+        bool letter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        if (!letter && T[c] != c) return false;
+    }
+    return true;
+}
+static inline xs_u8_tr_ctx xs_u8_tr_setup(xs_Uint8Array *T) {
+    xs_u8_tr_ctx c;
+    c.T = T->data;
+    c.simd = false;
+#if defined(__SSSE3__) || defined(__ARM_NEON)
+    uint8_t L[32], M[32];
+    if (T->f_length >= 256 && !getenv("XISTO_NO_U8_TRADE") && xs_u8_tr_is5(T->data, L, M)) {
+        c.simd = true;
+        c.L0 = xs_u8x16_load(L);
+        c.L1 = xs_u8x16_load(L + 16);
+        c.M0 = xs_u8x16_load(M);
+        c.M1 = xs_u8x16_load(M + 16);
+    }
+#endif
+    return c;
+}
+#if defined(__SSSE3__) || defined(__ARM_NEON)
+/* 16 bytes through the table: letter ? L[c & 0x1f] : c */
+/* 32 entries by a 5-bit index: one tbl on NEON; two pshufb on x86 (idx + 0x70: bit 7 set for idx >= 16, so
+   the first gives 0 there; idx - 0x10 wraps negative for idx < 16, so the second gives 0 there) */
+static inline __attribute__((always_inline)) xs_u8x16 xs_u8_tr_lut32(xs_u8x16 t0, xs_u8x16 t1, xs_u8x16 idx) {
+#if defined(__SSSE3__)
+    return xs_u8x16_shuffle(t0, idx + xs_u8x16_splat(0x70)) | xs_u8x16_shuffle(t1, idx - xs_u8x16_splat(0x10));
+#else
+    uint8x16x2_t tab = {{(uint8x16_t)t0, (uint8x16_t)t1}};
+    return (xs_u8x16)vqtbl2q_u8(tab, (uint8x16_t)idx);
+#endif
+}
+static inline __attribute__((always_inline)) xs_u8x16 xs_u8_tr_vec(const xs_u8_tr_ctx *c, xs_u8x16 v) {
+    xs_u8x16 idx = v & xs_u8x16_splat(0x1f);
+    xs_u8x16 t = xs_u8_tr_lut32(c->L0, c->L1, idx);
+    xs_u8x16 m = (v | xs_u8x16_splat(0x20)) - xs_u8x16_splat('a');
+    xs_u8x16 letter = (xs_u8x16)(m <= xs_u8x16_splat(25)) & xs_u8_tr_lut32(c->M0, c->M1, idx); /* (unsigned compare) and mapped */
+    return (letter & t) | (~letter & v);
+}
+#endif
+static inline void xs_u8_trade(const xs_u8_tr_ctx *c, xs_Uint8Array *buf, int64_t a, int64_t b, int64_t run, const xs_site *s) {
+    if (run <= 0) return;
+    int64_t len = buf->f_length;
+    if (a < 0 || b >= len || a + run - 1 >= len || b - run + 1 < 0) {
+        xs_u8_get(buf, a < 0 ? a : b >= len ? b : a + run - 1 >= len ? a + run - 1 : b - run + 1, s); /* (the panic, with the index) */
+        return;
+    }
+    uint8_t *d = buf->data;
+    const uint8_t *T = c->T;
+#if defined(__SSSE3__) || defined(__ARM_NEON)
+    if (c->simd && a + run + 16 <= len && b - run - 14 >= 0) {
+        const xs_u8x16 rev = xs_u8x16_splat(15) - xs_u8x16_iota();
+        int64_t rem = run;
+        while (rem >= 16) {
+            xs_u8x16 A = xs_u8x16_load(d + a), R = xs_u8x16_load(d + b - 15);
+            xs_u8x16_store(d + a, xs_u8_tr_vec(c, xs_u8x16_shuffle(R, rev)));
+            xs_u8x16_store(d + b - 15, xs_u8_tr_vec(c, xs_u8x16_shuffle(A, rev)));
+            a += 16; b -= 16; rem -= 16;
+        }
+        if (rem > 0) { /* the tail: blocks past the run keep their bytes */
+            xs_u8x16 A = xs_u8x16_load(d + a), R = xs_u8x16_load(d + b - 15);
+            xs_u8x16 lane = xs_u8x16_iota();
+            xs_u8x16 inA = (xs_u8x16)(lane < xs_u8x16_splat((uint8_t)rem));          /* lanes 0..rem-1 of the a block */
+            xs_u8x16 inR = (xs_u8x16)(lane >= xs_u8x16_splat((uint8_t)(16 - rem))); /* lanes 16-rem..15 of the b block */
+            xs_u8x16 nA = xs_u8_tr_vec(c, xs_u8x16_shuffle(R, rev)), nR = xs_u8_tr_vec(c, xs_u8x16_shuffle(A, rev));
+            xs_u8x16_store(d + a, (inA & nA) | (~inA & A));
+            /* the b block's bytes outside the run may have just been written by the a block (the two meet in the
+               middle of a sequence): kept as they are now, not as they were loaded */
+            xs_u8x16_store(d + b - 15, (inR & nR) | (~inR & xs_u8x16_load(d + b - 15)));
+        }
+        return;
+    }
+#endif
+    for (int64_t t = 0; t < run; t++) {
+        uint8_t x = d[a + t];
+        d[a + t] = T[d[b - t]];
+        d[b - t] = T[x];
+    }
+}
 static inline void xs_u8_rev(xs_Uint8Array *a, int64_t lo, int64_t hi, const xs_site *s) {
     if (lo >= hi) return; /* (the loop runs no iteration: nothing read, nothing checked) */
     if (lo < 0 || (uint64_t)hi >= (uint64_t)a->f_length) XS_FAIL("index out of bounds", s);
