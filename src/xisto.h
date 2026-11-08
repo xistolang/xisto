@@ -445,6 +445,7 @@ struct Class {
     int rdual;         /* region.c: dual, made inside that loop and outside it too: in the region while an iteration
                           runs (xs_rg_on_N), on the heap otherwise; counted either way, and freed with the region */
     bool stack_at;     /* stackalloc.c: some of its objects live in frames: Class_new_at(mem, ...) is emitted */
+    bool nohdr;        /* emitter: objects without the 8-byte header (region objects that nothing counts, see nohdr_compute) */
     bool is_tuple;     /* [A, B]: a class the checker makes per list of element types, fields _0, _1, ... */
     bool flattened;
     bool methods_flat;

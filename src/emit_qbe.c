@@ -840,7 +840,9 @@ static char *emit_expr_raw(Expr *e) {
         return r;
     }
     case E_NEW_ARRAY: return "";
+    default: break;
     }
+    unsupported(e->pos, "this expression"); /* (an empty operand would reach qbe as invalid IL) */
     return "";
 }
 

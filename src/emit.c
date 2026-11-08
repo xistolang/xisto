@@ -10,8 +10,16 @@ static bool cref(Type *t) { return ty_is_heap(t) || (t->kind == TY_ENUM && t->en
    are freed with their region, so their retains and releases are dropped (kept when XISTO_REGION_CHECK=1 at
    build time, which checks at run time that the counts come back to zero) */
 static int region_checked = -1;
+/* a class whose objects have no header (nohdr_compute): nothing ever counts, prints or frees them one by one */
+static bool nohdr_ty(Type *t) {
+    Type *u = t && t->kind == TY_NULLABLE ? t->elem : t;
+    return u && u->kind == TY_OBJECT && u->cls && u->cls->nohdr;
+}
+/* a reference whose holder retains and releases it: every heap type but the header-less ones */
+static bool crc(Type *t) { return cref(t) && !nohdr_ty(t); }
 static bool rcnt(Type *t) {
     if (!cref(t)) return false;
+    if (nohdr_ty(t)) return false;
     Type *u = t->kind == TY_NULLABLE ? t->elem : t;
     if (u->kind == TY_OBJECT && u->cls && u->cls->region) {
         if (region_checked < 0) region_checked = getenv("XISTO_REGION_CHECK") && strcmp(getenv("XISTO_REGION_CHECK"), "1") == 0;
@@ -699,7 +707,7 @@ static const char *cell_struct(Type *t) {
     cell_made = realloc(cell_made, sizeof(char *) * (size_t)(ncell + 1));
     cell_made[ncell++] = n.data;
     buf_printf(&cell_fns, "typedef struct { xs_hdr hdr; %s v; } %s;\n", ctype(t), n.data);
-    buf_printf(&cell_fns, "static void %s_free(void *p) { %sxs_obj_free(p); }\n", n.data, cref(t) ? xs_sprintf("xs_release(((%s *)p)->v); ", n.data) : "");
+    buf_printf(&cell_fns, "static void %s_free(void *p) { %sxs_obj_free(p); }\n", n.data, crc(t) ? xs_sprintf("xs_release(((%s *)p)->v); ", n.data) : "");
     buf_printf(&cell_fns, "static void %s_print(void *p) { (void)p; fputs(\"[cell]\", XS_OUT); }\n", n.data);
     if (type_cyclic(t)) { /* a shared variable holding something cyclic: a cell can close a cycle */
         buf_printf(&cell_fns, "static void %s_visit(void *p, xs_visit_cb cb, void *arg) { cb((void **)&((%s *)p)->v, arg); }\n", n.data, n.data);
@@ -2241,7 +2249,7 @@ static void emit_expr_raw(Expr *e) {
         buf_printf(out, "static void %s_free(void *p) {\n    %s_env *env = p; (void)env;\n", f->cname, f->cname);
         for (int i = 0; i < a->ncaptures; i++) {
             Capture *c = &a->captures[i];
-            if (cref(c->type) || c->is_this || c->boxed) buf_printf(out, "    xs_release(env->%s);\n", c->is_this ? "self" : xs_sprintf("c_%s", c->name));
+            if (crc(c->type) || c->is_this || c->boxed) buf_printf(out, "    xs_release(env->%s);\n", c->is_this ? "self" : xs_sprintf("c_%s", c->name));
         }
  buf_puts(out, "    xs_obj_free(p);\n}\n");
         bool env_cyc = false; /* a closure that captures something cyclic can be part of a cycle itself */
@@ -2290,7 +2298,7 @@ static void emit_expr_raw(Expr *e) {
         for (int i = 0; i < a->ncaptures; i++) {
             Capture *c = &a->captures[i];
             const char *field = c->is_this ? "self" : xs_sprintf("c_%s", c->name);
-            if (cref(c->type) || c->is_this || c->boxed) buf_printf(out, " cl_->%s = xs_retain(%s);", field, c->outer_cname);
+            if (crc(c->type) || c->is_this || c->boxed) buf_printf(out, " cl_->%s = xs_retain(%s);", field, c->outer_cname);
             else buf_printf(out, " cl_->%s = %s;", field, c->outer_cname);
         }
         buf_puts(out, " (xs_closure *)cl_; })");
@@ -3238,7 +3246,7 @@ static void emit_block(Stmt *b, bool func_root) {
         if (!pm->cell) continue;
         const char *cs = cell_struct(pm->type);
         nl();
-        buf_printf(out, "%s *%s = %s_new(); (%s->v) = %s%s%s;", cs, pm->cell, cs, pm->cell, cref(pm->type) ? "xs_retain(" : "", pm->cname, cref(pm->type) ? ")" : "");
+        buf_printf(out, "%s *%s = %s_new(); (%s->v) = %s%s%s;", cs, pm->cell, cs, pm->cell, crc(pm->type) ? "xs_retain(" : "", pm->cname, crc(pm->type) ? ")" : "");
         etrack(pm->cell, ty_unknown);
     }
     Class *after_super = func_root ? inits_after_super : NULL;
@@ -3359,7 +3367,7 @@ static bool reuse_assign(Expr *e) {
     buf_printf(out, "} else { %s = %s_new(", x, c->cname);
     for (int j = 0; j < ne->args.len; j++) {
         if (j) buf_puts(out, ", ");
-        if (ct->params[j].consumed && cref(ct->params[j].type)) buf_printf(out, "xs_retain(ru%d_%d)", id, j);
+        if (ct->params[j].consumed && crc(ct->params[j].type)) buf_printf(out, "xs_retain(ru%d_%d)", id, j);
         else buf_printf(out, "ru%d_%d", id, j);
     }
     buf_printf(out, "); xs_release_as(self, %s_free); } }", c->cname);
@@ -4436,7 +4444,8 @@ static bool rg_inline_new(Expr *e) {
         if (ct->params[i].consumed) emit_owned(e->args.items[i]); else emit_borrowed(e->args.items[i]);
         buf_puts(out, "; ");
     }
-    buf_printf(out, "%s *ro_ = xs_region_alloc_dual_nz(&xs_rg_%d, sizeof(%s), &%s_type);", c->cname, c->rdual, c->cname, c->cname);
+    if (c->nohdr) buf_printf(out, "%s *ro_ = xs_region_alloc_nh(&xs_rg_%d, sizeof(%s));", c->cname, c->rdual, c->cname);
+    else buf_printf(out, "%s *ro_ = xs_region_alloc_dual_nz(&xs_rg_%d, sizeof(%s), &%s_type);", c->cname, c->rdual, c->cname, c->cname);
     for (int k = 0; k < c->nfields; k++) buf_printf(out, " ro_->%s = ra%d_;", c->fields[k].cname, src[k]);
     buf_puts(out, " ro_; })");
     return true;
@@ -5422,7 +5431,7 @@ static bool emit_gen_sm(Func *f) {
     for (int i = 0; i < sm_nvars; i++) { emit_decl(sm_vars[i]->type, sm_vars[i]->cname); buf_puts(out, "; "); }
     buf_printf(out, "} %s_fr;\n", n);
     buf_printf(out, "static void %s_fr_free(void *p) { %s_fr *fr_ = p; (void)fr_; %s", n, n, f->cls ? "xs_release(fr_->self); " : "");
-    for (int i = 0; i < f->nparams; i++) if (cref(f->params[i].type)) buf_printf(out, "xs_release(fr_->%s); ", f->params[i].cname);
+    for (int i = 0; i < f->nparams; i++) if (crc(f->params[i].type)) buf_printf(out, "xs_release(fr_->%s); ", f->params[i].cname);
     buf_puts(out, "free(p); }\n");
     buf_printf(out, "static bool %s_pull(xs_stream *st_, xs_val *out_) {\n    %s_fr *fr_ = st_->ext;\n    size_t ar_mark = xs_ar_mark(); (void)ar_mark;\n    switch (fr_->state_) {\n    case 0:;", n, n);
     int saved_indent = indent;
@@ -5442,7 +5451,7 @@ static bool emit_gen_sm(Func *f) {
     buf_printf(out, " {\n    %s_fr *fr_ = calloc(1, sizeof *fr_);\n    if (!fr_) xs_panic(\"out of memory\");", n);
     if (f->cls) buf_puts(out, "\n    fr_->self = xs_retain(self);");
     for (int i = 0; i < f->nparams; i++)
-        buf_printf(out, cref(f->params[i].type) ? "\n    fr_->%s = xs_retain(%s);" : "\n    fr_->%s = %s;", f->params[i].cname, f->params[i].cname);
+        buf_printf(out, crc(f->params[i].type) ? "\n    fr_->%s = xs_retain(%s);" : "\n    fr_->%s = %s;", f->params[i].cname, f->params[i].cname);
     const char *pe = elem_printer(elem);
     buf_printf(out, "\n    xs_stream *st_ = xs_stream_new(%s_pull, NULL, NULL, %d);\n    st_->print_elem = %s;\n    st_->ext = fr_;\n    st_->ext_free = %s_fr_free;\n    return st_;\n}\n",
                n, val_kind(elem), strcmp(pe, "0") == 0 ? "NULL" : pe, n);
@@ -5460,7 +5469,7 @@ static void emit_gen(Func *f) {
     for (int i = 0; i < f->nparams; i++) { emit_decl(f->params[i].type, f->params[i].cname); buf_puts(out, "; "); }
     buf_printf(&a, "char unused_; } %s_args;\n", n);
     buf_printf(&a, "static void %s_args_free(void *p) { %s_args *a_ = p; (void)a_; %s", n, n, f->cls ? "xs_release(a_->self); " : "");
-    for (int i = 0; i < f->nparams; i++) if (cref(f->params[i].type)) buf_printf(&a, "xs_release(a_->%s); ", f->params[i].cname);
+    for (int i = 0; i < f->nparams; i++) if (crc(f->params[i].type)) buf_printf(&a, "xs_release(a_->%s); ", f->params[i].cname);
     buf_puts(&a, "free(p); }\n");
     buf_printf(&a, "static void %s_body(void *p_) {\n    %s_args *a_ = p_; (void)a_;", n, n);
     if (f->cls) buf_printf(&a, "\n    %s *self = a_->self; (void)self;", f->cls->cname);
@@ -5483,7 +5492,7 @@ static void emit_gen(Func *f) {
     buf_printf(out, " {\n    %s_args *a_ = calloc(1, sizeof *a_);\n    if (!a_) xs_panic(\"out of memory\");", n);
     if (f->cls) buf_puts(out, "\n    a_->self = xs_retain(self);");
     for (int i = 0; i < f->nparams; i++)
-        buf_printf(out, cref(f->params[i].type) ? "\n    a_->%s = xs_retain(%s);" : "\n    a_->%s = %s;", f->params[i].cname, f->params[i].cname);
+        buf_printf(out, crc(f->params[i].type) ? "\n    a_->%s = xs_retain(%s);" : "\n    a_->%s = %s;", f->params[i].cname, f->params[i].cname);
     const char *pe = elem_printer(elem);
     buf_printf(out, "\n    return xs_gen_stream(%s_body, a_, %s_args_free, %d, %s);\n}\n", n, n, val_kind(elem), strcmp(pe, "0") == 0 ? "NULL" : pe);
 }
@@ -5965,6 +5974,9 @@ static void emit_class(Class *c) {
             buf_puts(out, "\n}");
         }
         buf_putc(out, '\n');
+    } else if (c->nohdr) { /* no header: nothing counts its objects, so nothing frees one (nohdr_compute) */
+        buf_printf(out, "\nstatic inline void %s_free(void *p) { (void)p; }", c->cname);
+        buf_printf(out, "\nstatic void %s_rref(void *p) { (void)p; }\n", c->cname);
     } else {
     /* a hint: where the class is known (xs_release_as, a scope's end) the free is a few releases, worth inlining */
     buf_printf(out, "\nstatic inline void %s_free(void *p) {", c->cname);
@@ -6077,7 +6089,9 @@ static void emit_class(Class *c) {
     else { /* nz: the constructor writes every field before anything reads one, so the memory is not cleared first */
         mark_init_stores(c, ctor);
         const char *nz = ctor_sets_every_field(c) ? "_nz" : "";
-        if (c->region) buf_printf(out, "%s *self = xs_region_alloc%s(&xs_rg_%d, sizeof(%s), &%s_type);", c->cname, nz, c->region, c->cname, c->cname);
+        if (c->nohdr && c->region) buf_printf(out, "%s *self = xs_region_alloc_nh(&xs_rg_%d, sizeof(%s));", c->cname, c->region, c->cname);
+        else if (c->nohdr) buf_printf(out, "%s *self = xs_rg_on_%d ? xs_region_alloc_nh(&xs_rg_%d, sizeof(%s)) : xs_nh_heap(sizeof(%s));", c->cname, c->rdual, c->rdual, c->cname, c->cname);
+        else if (c->region) buf_printf(out, "%s *self = xs_region_alloc%s(&xs_rg_%d, sizeof(%s), &%s_type);", c->cname, nz, c->region, c->cname, c->cname);
         else if (c->rdual) /* region.c: in its loop's region while an iteration runs, on the heap otherwise */
             buf_printf(out, "%s *self = xs_rg_on_%d ? xs_region_alloc_dual%s(&xs_rg_%d, sizeof(%s), &%s_type) : xs_obj_alloc_t%s(sizeof(%s), &%s_type);",
                        c->cname, c->rdual, nz, c->rdual, c->cname, c->cname, nz, c->cname, c->cname);
@@ -6317,6 +6331,165 @@ static void find_run_once(Program *p) {
     #undef RO_PUSH
 }
 
+/* ---- objects without a header ----
+   The 8-byte header (count + type) of an object is read by retain/release, print, the cycle collector, JSON
+   and reflection. A class whose objects never meet any of those does not need it: binary-trees' TreeNode is 16
+   bytes instead of 24, and its walk reads two thirds of the lines (Xeon: -14% CPU, 350 -> 300 MB). The class
+   qualifies when the program proves, conservatively:
+   - its objects live in a region (region.c: region or dual), its fields are numbers or references to itself,
+     written only by the constructor, no base, subclasses, methods, decorators, frames (stackalloc.c), cycles;
+   - no other type mentions it except directly (C or C | null): not in arrays, maps, sets, other classes'
+     fields; and a value of it is never handed to a built-in (console.log, JSON, postMessage, strings), cast or
+     concatenated: only stored in variables and its own fields, passed to user functions, compared, tested;
+   - outside its loop's region (a dual class), every `new` runs a bounded number of times: inside a builder
+     function (its body is one return), called from code that runs once (main's top level outside loops, or a
+     function only called from there), or inside the region's loop. Those objects come from an arena that is
+     never given back (they would have lived as long as the program's single call that made them).
+   Retains and releases of its values are dropped (rcnt), like a region class's. XISTO_NO_NOHDR=1 turns it off;
+   XISTO_REGION_CHECK=1 (which counts region objects) does too. */
+static Class *nh_c;
+static bool nh_ok;
+static Func **nh_builders; static int nh_nb;
+static bool nh_mentions(Type *t) { /* nested: in an array, a map, a set */
+    if (!t) return false;
+    switch (t->kind) {
+    case TY_OBJECT: return t->cls == nh_c;
+    case TY_ARRAY: case TY_NULLABLE: case TY_SET: return nh_mentions(t->elem);
+    case TY_MAP: return nh_mentions(t->key) || nh_mentions(t->elem);
+    default: return false;
+    }
+}
+static bool nh_direct(Type *t) { return t && ((t->kind == TY_OBJECT && t->cls == nh_c) || (t->kind == TY_NULLABLE && t->elem && t->elem->kind == TY_OBJECT && t->elem->cls == nh_c)); }
+static bool nh_is_builder(Func *f) { for (int i = 0; i < nh_nb; i++) if (nh_builders[i] == f) return true; return false; }
+static bool nh_expr_news(Expr *e) {
+    if (!e) return false;
+    if (e->kind == E_NEW_OBJ && e->cls == nh_c) return true;
+    if (e->kind == E_ARROW) return false;
+    if (nh_expr_news(e->lhs) || nh_expr_news(e->rhs)) return true;
+    for (int i = 0; i < e->args.len; i++) if (nh_expr_news(e->args.items[i])) return true;
+    return false;
+}
+static bool nh_stmt_news(Stmt *s) {
+    if (!s) return false;
+    if (nh_expr_news(s->init) || nh_expr_news(s->expr) || nh_expr_news(s->cond) || nh_expr_news(s->for_update)) return true;
+    if (nh_stmt_news(s->for_init) || nh_stmt_news(s->body) || nh_stmt_news(s->else_body)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (nh_stmt_news(s->stmts.items[i])) return true;
+    for (int i = 0; i < s->ncases; i++) if (nh_stmt_news(s->cases[i].body)) return true;
+    return false;
+}
+static bool nh_cold(Func *f) { /* runs a bounded number of times: only called once-ish from main's straight line */
+    if (!f || f->escapes || f->is_gen || f->is_async || f->cls) return false;
+    bool any = false;
+    for (int k = 0; k < nro; k++) {
+        RoEdge *e = &ro_edges[k];
+        if (e->callee != f) continue;
+        any = true;
+        if (e->hot || e->caller == f) return false;
+        if (e->caller && !nh_cold(e->caller)) return false; /* (the call graph of cold code is shallow) */
+    }
+    return any;
+}
+static void nh_stmt(Stmt *s, Func *ctx, int loop, int rg);
+static void nh_expr(Expr *e, Expr *parent, Func *ctx, int loop, int rg) {
+    if (!e || !nh_ok) return;
+    if (e->type && nh_mentions(e->type) && !nh_direct(e->type)) { nh_ok = false; return; }
+    if (e->type && nh_direct(e->type) && parent) { /* where a value of the class may go */
+        bool fine = false;
+        switch (parent->kind) {
+        case E_CALL: fine = parent->func && parent->func->body && !parent->builtin.cfn && parent->lhs != e; break;
+        case E_NEW_OBJ: fine = parent->cls == nh_c; break;
+        case E_MEMBER: fine = !parent->is_call && parent->lhs == e && parent->field >= 0; break;
+        case E_ASSIGN: fine = parent->op == TK_ASSIGN; break;
+        case E_BINARY: fine = parent->op != TK_PLUS && !parent->builtin.cfn; break;
+        case E_COND: fine = true; break;
+        case E_UNARY: fine = parent->op == TK_NOT; break;
+        case E_AS: fine = parent->op == TK_NOT && !parent->elem_type; break;
+        default: fine = false;
+        }
+        if (!fine) { nh_ok = false; return; }
+    }
+    if (e->kind == E_NEW_OBJ && e->cls == nh_c) { /* bounded outside the region */
+        bool ok = rg == nh_c->rdual || rg == nh_c->region || (ctx && nh_is_builder(ctx)) || (loop == 0 && (!ctx || nh_cold(ctx)));
+        if (!ok) { nh_ok = false; return; }
+    }
+    if ((e->kind == E_CALL || (e->kind == E_MEMBER && e->is_call)) && e->func && nh_is_builder(e->func) && ctx != e->func && !(ctx && nh_is_builder(ctx))) {
+        bool ok = rg == nh_c->rdual || rg == nh_c->region || (loop == 0 && (!ctx || nh_cold(ctx)));
+        if (!ok) { nh_ok = false; return; }
+    }
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) { nh_stmt(e->arrow->fn->body, e->arrow->fn, loop + 1000, rg); return; }
+    nh_expr(e->lhs, e, ctx, loop, rg);
+    nh_expr(e->rhs, e, ctx, loop, rg);
+    for (int i = 0; i < e->args.len; i++) nh_expr(e->args.items[i], e, ctx, loop, rg);
+}
+static void nh_stmt(Stmt *s, Func *ctx, int loop, int rg) {
+    if (!s || !nh_ok) return;
+    bool isloop = s->kind == S_FOR || s->kind == S_WHILE || s->kind == S_FOROF;
+    int l = loop + isloop, r = isloop && s->region ? s->region : rg;
+    if (s->kind == S_VAR && s->type && nh_mentions(s->type) && !nh_direct(s->type)) { nh_ok = false; return; }
+    if (s->kind == S_FOROF && s->expr && s->expr->type && nh_mentions(s->expr->type)) { nh_ok = false; return; }
+    nh_expr(s->init, NULL, ctx, loop, rg);
+    nh_expr(s->expr, NULL, ctx, s->kind == S_FOROF ? loop : l, s->kind == S_FOROF ? rg : r);
+    nh_expr(s->cond, NULL, ctx, l, r);
+    nh_expr(s->for_update, NULL, ctx, l, r);
+    nh_stmt(s->for_init, ctx, loop, rg);
+    nh_stmt(s->body, ctx, l, r);
+    nh_stmt(s->else_body, ctx, loop, rg);
+    for (int i = 0; i < s->stmts.len; i++) nh_stmt(s->stmts.items[i], ctx, loop, rg);
+    for (int i = 0; i < s->ncases; i++) { nh_expr(s->cases[i].value, NULL, ctx, loop, rg); nh_stmt(s->cases[i].body, ctx, loop, rg); }
+}
+static bool nh_type_bad(Type *t) { return t && nh_mentions(t) && !nh_direct(t); }
+static void nohdr_compute(Program *p) {
+    if (xs_debug || xs_profile || getenv("XISTO_NO_NOHDR")) return;
+    if (region_checked < 0) region_checked = getenv("XISTO_REGION_CHECK") && strcmp(getenv("XISTO_REGION_CHECK"), "1") == 0;
+    if (region_checked) return;
+    for (int ci = 0; ci < p->nclasses; ci++) {
+        Class *c = p->classes[ci];
+        if (!c->used || c->builtin || !(c->region || c->rdual) || c->base || c->nsubs || c->is_interface || c->is_abstract ||
+            c->nmethods || c->stack_at || c->data_only || c->decos.len || class_cyclic(c) || !c->ctor) continue;
+        nh_c = c;
+        nh_ok = true;
+        for (int k = 0; k < c->nfields && nh_ok; k++) {
+            Type *ft = c->fields[k].type;
+            if (c->fields[k].init && cref(ft)) nh_ok = false;
+            if (cref(ft) && !nh_direct(ft)) nh_ok = false;
+            if (mut_has(c, c->fields[k].name)) nh_ok = false;
+        }
+        for (int cj = 0; cj < p->nclasses && nh_ok; cj++) {
+            Class *o = p->classes[cj];
+            if (o == c || !o->used) continue;
+            for (int k = 0; k < o->nfields; k++) if (nh_mentions(o->fields[k].type)) nh_ok = false;
+        }
+        if (!nh_ok) continue;
+        /* the builders: free functions whose body is one return and that make the class */
+        nh_nb = 0;
+        for (int i = 0; i < p->nfuncs; i++) {
+            Func *f = p->funcs[i];
+            if (!f->body || !f->used || f->mod->builtin || f->is_native) continue;
+            for (int k = 0; k < f->nparams; k++) if (nh_type_bad(f->params[k].type)) nh_ok = false;
+            if (nh_type_bad(f->ret)) nh_ok = false;
+            if (!nh_stmt_news(f->body)) continue;
+            Stmt *b = f->body;
+            if (b->kind == S_BLOCK && b->stmts.len == 1 && b->stmts.items[0]->kind == S_RETURN && !f->escapes && !f->is_gen && !f->is_async && !f->cls) {
+                nh_builders = realloc(nh_builders, sizeof(Func *) * (size_t)(nh_nb + 1));
+                nh_builders[nh_nb++] = f;
+            }
+        }
+        for (int i = 0; i < p->nfuncs && nh_ok; i++) {
+            Func *f = p->funcs[i];
+            if (f->body && f->used && !f->mod->builtin && !f->is_native) nh_stmt(f->body, f, 0, 0);
+        }
+        for (int cj = 0; cj < p->nclasses && nh_ok; cj++) {
+            Class *o = p->classes[cj];
+            if (!o->used || o->builtin) continue;
+            if (o->ctor && o->ctor->body && o != c) nh_stmt(o->ctor->body, o->ctor, 1000, 0); /* (a constructor may run many times) */
+            for (int k = 0; k < o->nmethods; k++) if (o->methods[k]->body && o->methods[k]->cls == o) nh_stmt(o->methods[k]->body, o->methods[k], 1000, 0);
+            for (int k = 0; k < o->nfields; k++) nh_expr(o->fields[k].init, NULL, NULL, 1000, 0);
+        }
+        for (int i = 0; i < p->top.len && nh_ok; i++) nh_stmt(p->top.items[i], NULL, 0, 0);
+        if (nh_ok) c->nohdr = true;
+    }
+}
+
 /* ---- consumed constructor parameters ----
    `constructor(l: Tree, r: Tree) { this.left = l; this.right = r; }`: the reference each argument brings is the
    one the field keeps. The caller hands over ownership (a new value moves in, a borrowed one is retained once)
@@ -6438,6 +6611,7 @@ void emit_program(Program *p, Buf *o) {
     use_cln = (p->uses_net || program_has_try(p)) && !getenv("XISTO_NO_CLN"); /* XISTO_NO_CLN: measuring knob */
     find_consumed(p);
     find_run_once(p);
+    nohdr_compute(p);
     count_calls(p);
     buf_puts(out, "\n/* ---- program ---- */\nextern const xs_site xs_sitetab[];\n");
     for (int r = 1; r <= region_count; r++) {
@@ -6453,7 +6627,7 @@ void emit_program(Program *p, Buf *o) {
     for (int i = 0; i < p->nclasses; i++) {
         Class *c = p->classes[i];
         if (!c->used || c->builtin) continue;
-        buf_printf(out, "struct %s { xs_hdr hdr;", c->cname);
+        buf_printf(out, c->nohdr ? "struct %s { /* no header: nohdr_compute */" : "struct %s { xs_hdr hdr;", c->cname);
         for (int k = 0; k < c->nfields; k++) {
             buf_puts(out, " ");
             emit_decl(c->fields[k].type, c->fields[k].cname);
@@ -6615,7 +6789,7 @@ void emit_program(Program *p, Buf *o) {
         /* the body's own top-level locals: each thread releases its own here (main cannot see them) */
         for (int i = 0; i < p->top.len; i++) {
             Stmt *s = p->top.items[i];
-            if (s->kind == S_VAR && cref(s->type) && ns_has(&main_locals, s->cname)) { nl(); buf_printf(out, "if (xs_rc_counting()) xs_release(%s);", s->cname); }
+            if (s->kind == S_VAR && crc(s->type) && ns_has(&main_locals, s->cname)) { nl(); buf_printf(out, "if (xs_rc_counting()) xs_release(%s);", s->cname); }
         }
         indent--;
         nl();
@@ -6638,7 +6812,7 @@ void emit_program(Program *p, Buf *o) {
     buf_puts(out, "if (xs_rc_counting()) {");
     for (int i = 0; i < p->top.len; i++) {
         Stmt *s = p->top.items[i];
-        if (s->kind == S_VAR && cref(s->type) && !(wbody && ns_has(&main_locals, s->cname))) {
+        if (s->kind == S_VAR && crc(s->type) && !(wbody && ns_has(&main_locals, s->cname))) {
             nl();
             buf_printf(out, "    xs_release(%s);", s->cname);
         }

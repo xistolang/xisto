@@ -6429,6 +6429,28 @@ static inline __attribute__((always_inline)) void *xs_region_alloc_f(xs_region *
     return p;
 }
 #define xs_region_alloc(r, size, type) xs_region_alloc_f((r), (size), (type), 0, true)
+/* objects without a header (emit.c nohdr_compute): a bump in the region, nothing written; outside the region, an
+   arena that is never given back (the emitter proved those objects are made a bounded number of times) */
+static inline __attribute__((always_inline)) void *xs_region_alloc_nh(xs_region *r, size_t size) {
+    size = (size + XS_OBJ_STEP - 1) & ~(XS_OBJ_STEP - 1);
+    void *p;
+    if (__builtin_expect(r->ptr && (size_t)(r->end - r->ptr) >= size, 1)) { p = r->ptr; r->ptr += size; }
+    else p = xs_region_more(r, size);
+    return p;
+}
+static XS_TLS char *xs_nh_p, *xs_nh_end;
+static void *xs_nh_heap(size_t size) {
+    size = (size + XS_OBJ_STEP - 1) & ~(XS_OBJ_STEP - 1);
+    if (__builtin_expect(!xs_nh_p || (size_t)(xs_nh_end - xs_nh_p) < size, 0)) {
+        size_t n = size > ((size_t)1 << 20) ? size : ((size_t)1 << 20);
+        xs_nh_p = malloc(n);
+        if (!xs_nh_p) xs_panic("out of memory");
+        xs_nh_end = xs_nh_p + n;
+    }
+    void *p = xs_nh_p;
+    xs_nh_p += size;
+    return p;
+}
 #define xs_region_alloc_nz(r, size, type) xs_region_alloc_f((r), (size), (type), 0, false)
 /* a dual class's object (region.c: the class is made both inside the loop and outside it): in the region while
    one of its loop's iterations runs (on), on the heap otherwise */
