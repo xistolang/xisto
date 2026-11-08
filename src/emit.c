@@ -113,6 +113,10 @@ static void site_str(Buf *b, const char *s) {
 }
 static bool inlined_once(Func *f);
 static bool stmt_has_try(Stmt *s);
+static int cur_rg; /* rg-hoist: the dual region being emitted (definition and notes below, with the region versions) */
+static const char *rg_call_name(Func *f);
+static bool rg_inline_new(Expr *e);
+static void mark_init_stores(Class *c, Func *ctor);
 static Func *clone_func;    /* the function being emitted as a per-call-site copy ... */
 static int clone_inl;       /* ... for this call site */
 static const char *force_storage;
@@ -2206,6 +2210,8 @@ static void emit_expr_raw(Expr *e) {
         cur_func = f;
         in_ctor = false;
         bool saved_vol = vol_locals;
+        int saved_rg = cur_rg;
+        cur_rg = 0; /* a closure runs when it runs: generic calls */
         vol_locals = stmt_has_try(f->body);
         buf_printf(out, "typedef struct { xs_closure base;");
         for (int i = 0; i < a->ncaptures; i++) {
@@ -2259,6 +2265,7 @@ static void emit_expr_raw(Expr *e) {
         escope = saved_scope;
         cur_func = saved_func;
         vol_locals = saved_vol;
+        cur_rg = saved_rg;
         indent = saved_indent;
         in_ctor = saved_ctor;
         used_ar = saved_ar;
@@ -2726,7 +2733,7 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, ")");
             return;
         }
-        buf_printf(out, "%s(", e->builtin.cfn ? e->builtin.cfn : e->func->cname);
+        buf_printf(out, "%s(", e->builtin.cfn ? e->builtin.cfn : rg_call_name(e->func));
         emit_args_borrowed(&e->args, false);
         buf_puts(out, ")");
         return;
@@ -2777,6 +2784,7 @@ static void emit_expr_raw(Expr *e) {
             buf_printf(out, "%s(", e->builtin.cfn);
             emit_args_borrowed(&e->args, false);
         } else {
+            if (rg_inline_new(e)) return;
             buf_printf(out, "%s_new(", e->cls->cname);
             Func *ct = e->cls->ctor;
             for (int i = 0; i < e->args.len; i++) { /* a consumed parameter takes an owned reference: a new value moves in */
@@ -4211,8 +4219,11 @@ static void emit_for_(Stmt *s) {
     epush(false);
     if (s->for_init) {
         nl();
+        int saved_rg = cur_rg;
+        cur_rg = 0; /* (runs before the first iteration: the region flag is off) */
         if (s->for_init->kind == S_VAR) emit_var(s->for_init);
         else { emit_expr(s->for_init->expr); buf_puts(out, ";"); }
+        cur_rg = saved_rg;
         drain_if_needed();
     }
     nl();
@@ -4238,13 +4249,191 @@ static void emit_for_(Stmt *s) {
     return;
 }
 
+
+/* ---------- region versions (rg-hoist) ----------
+   A dual class (region.c: made inside its loop and outside it too) tests xs_rg_on_N at every `new`: a TLS load
+   and a branch per object, in binarytrees once per node inside bottomUpTree, where the flag cannot change. A
+   function whose dual allocations all belong to region N (directly or through what it calls) gets a second
+   version f_rN, compiled as if the flag were known true: its `new C` allocates from the region directly, and its
+   calls to such functions go to their _rN versions. The loop body of region N calls the _rN versions; everything
+   else keeps the generic ones. Only entered while an iteration of loop N runs, so the flag is true by
+   construction. XISTO_NO_RG_HOIST=1 disables (measuring knob). */
+static int cur_rg;        /* the dual region whose loop body (or _rN version) is being emitted, 0 otherwise */
+static bool rg_hoist_on;
+static Program *rg_prog;
+static int rg_combine(int a, int b) { return a == 0 ? b : b == 0 ? a : a == b ? a : -1; }
+static bool rg_user_call(Expr *e) { return e && e->kind == E_CALL && e->func && !e->builtin.cfn && e->func->body && !(e->lhs && e->lhs->type && e->lhs->type->kind == TY_FUNC && !e->func); }
+static void rg_scan_stmt(Stmt *s, int *acc, bool final);
+static void rg_scan_expr(Expr *e, int *acc, bool final) {
+    if (!e) return;
+    if (e->kind == E_NEW_OBJ && !e->cls->builtin && e->cls->rdual) *acc = rg_combine(*acc, e->cls->rdual);
+    if (rg_user_call(e)) *acc = rg_combine(*acc, final ? e->func->rg_hoist : e->func->rg_hoist);
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) rg_scan_stmt(e->arrow->fn->body, acc, final); /* (what a closure makes counts; it is never hoisted itself) */
+    rg_scan_expr(e->lhs, acc, final);
+    rg_scan_expr(e->rhs, acc, final);
+    for (int i = 0; i < e->args.len; i++) rg_scan_expr(e->args.items[i], acc, final);
+}
+static void rg_scan_stmt(Stmt *s, int *acc, bool final) {
+    if (!s) return;
+    rg_scan_expr(s->init, acc, final);
+    rg_scan_expr(s->expr, acc, final);
+    rg_scan_expr(s->cond, acc, final);
+    rg_scan_expr(s->for_update, acc, final);
+    rg_scan_stmt(s->for_init, acc, final);
+    rg_scan_stmt(s->body, acc, final);
+    rg_scan_stmt(s->else_body, acc, final);
+    for (int i = 0; i < s->stmts.len; i++) rg_scan_stmt(s->stmts.items[i], acc, final);
+    for (int i = 0; i < s->ncases; i++) { rg_scan_expr(s->cases[i].value, acc, final); rg_scan_stmt(s->cases[i].body, acc, final); }
+}
+static bool rg_candidate(Func *f) {
+    return f->body && !f->is_ctor && !f->is_async && !f->is_gen && !f->virt_target && !f->cls && f->ncalls >= 0 && !stmt_has_try(f->body) && f->used && !f->mod->builtin && !f->is_native;
+}
+/* marks f_rN as reached: f's own calls to region-N functions follow */
+static void rg_mark_stmt(Stmt *s, int N);
+static void rg_mark_expr(Expr *e, int N) {
+    if (!e) return;
+    if (rg_user_call(e) && e->func->rg_hoist == N && !e->func->rg_used) { e->func->rg_used = true; rg_mark_stmt(e->func->body, N); }
+    if (e->kind == E_ARROW) return; /* a closure runs when it runs: generic calls */
+    rg_mark_expr(e->lhs, N); rg_mark_expr(e->rhs, N);
+    for (int i = 0; i < e->args.len; i++) rg_mark_expr(e->args.items[i], N);
+}
+static void rg_mark_stmt(Stmt *s, int N) {
+    if (!s) return;
+    rg_mark_expr(s->init, N); rg_mark_expr(s->expr, N); rg_mark_expr(s->cond, N); rg_mark_expr(s->for_update, N);
+    rg_mark_stmt(s->for_init, N); rg_mark_stmt(s->body, N); rg_mark_stmt(s->else_body, N);
+    for (int i = 0; i < s->stmts.len; i++) rg_mark_stmt(s->stmts.items[i], N);
+    for (int i = 0; i < s->ncases; i++) { rg_mark_expr(s->cases[i].value, N); rg_mark_stmt(s->cases[i].body, N); }
+}
+/* finds the dual region loops and marks what their bodies reach */
+static void rg_loops_stmt(Stmt *s);
+static void rg_loops_expr(Expr *e) {
+    if (!e) return;
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) rg_loops_stmt(e->arrow->fn->body);
+    rg_loops_expr(e->lhs); rg_loops_expr(e->rhs);
+    for (int i = 0; i < e->args.len; i++) rg_loops_expr(e->args.items[i]);
+}
+static void rg_loops_stmt(Stmt *s) {
+    if (!s) return;
+    if ((s->kind == S_FOR || s->kind == S_WHILE || s->kind == S_FOROF) && s->region && region_dual[s->region]) { rg_mark_stmt(s->body, s->region); rg_mark_expr(s->cond, s->region); rg_mark_expr(s->for_update, s->region); }
+    rg_loops_expr(s->init); rg_loops_expr(s->expr); rg_loops_expr(s->cond); rg_loops_expr(s->for_update);
+    rg_loops_stmt(s->for_init); rg_loops_stmt(s->body); rg_loops_stmt(s->else_body);
+    for (int i = 0; i < s->stmts.len; i++) rg_loops_stmt(s->stmts.items[i]);
+    for (int i = 0; i < s->ncases; i++) { rg_loops_expr(s->cases[i].value); rg_loops_stmt(s->cases[i].body); }
+}
+static void rg_compute(Program *p) {
+    rg_prog = p;
+    rg_hoist_on = !xs_debug && !xs_profile && !sm_mode && region_count > 0 && !getenv("XISTO_NO_RG_HOIST");
+    for (int i = 0; i < p->nfuncs; i++) { p->funcs[i]->rg_hoist = 0; p->funcs[i]->rg_used = false; }
+    for (int i = 0; i < p->nclasses; i++) {
+        Class *c = p->classes[i];
+        if (c->ctor) { c->ctor->rg_hoist = -1; c->ctor->rg_used = false; }
+        for (int k = 0; k < c->nmethods; k++) { c->methods[k]->rg_hoist = -1; c->methods[k]->rg_used = false; }
+    }
+    if (!rg_hoist_on) return;
+    bool any = false;
+    for (int i = 0; i < p->nclasses; i++) any |= p->classes[i]->rdual != 0;
+    if (!any) { rg_hoist_on = false; return; }
+    for (int i = 0; i < p->nfuncs; i++) if (!rg_candidate(p->funcs[i])) p->funcs[i]->rg_hoist = -1;
+    for (bool changed = true; changed;) { /* fixpoint over the call graph: what each function makes, with what it calls */
+        changed = false;
+        for (int i = 0; i < p->nfuncs; i++) {
+            Func *f = p->funcs[i];
+            if (f->rg_hoist == -1) continue;
+            int acc = 0;
+            rg_scan_stmt(f->body, &acc, false);
+            if (acc != f->rg_hoist) { f->rg_hoist = acc; changed = true; }
+        }
+    }
+    for (int i = 0; i < p->nfuncs; i++) if (p->funcs[i]->used && !p->funcs[i]->mod->builtin && p->funcs[i]->body) rg_loops_stmt(p->funcs[i]->body);
+    for (int i = 0; i < p->nclasses; i++) {
+        Class *c = p->classes[i];
+        if (!c->used) continue;
+        if (c->ctor) rg_loops_stmt(c->ctor->body);
+        for (int k = 0; k < c->nmethods; k++) if (c->methods[k]->body) rg_loops_stmt(c->methods[k]->body);
+    }
+    for (int i = 0; i < p->top.len; i++) rg_loops_stmt(p->top.items[i]);
+}
+static char *rg_name(Func *f) { return xs_sprintf("%s_r%d", f->cname, f->rg_hoist); }
+/* the callee's name at this call: its region version inside region cur_rg's code, else its own */
+static const char *rg_call_name(Func *f) {
+    if (rg_hoist_on && cur_rg && f && f->rg_hoist == cur_rg && f->rg_used) return rg_name(f);
+    return f->cname;
+}
+/* `new C(args)` of a dual class of the region being emitted, with a small constructor (only `this.f = param`
+   stores, every field set, reference parameters handed over): the allocation from the region and the stores,
+   in place. Returns false when the generic C_new must be used. */
+static bool small_ctor(Func *f);
+static bool rg_inline_new(Expr *e) {
+    Class *c = e->cls;
+    if (!rg_hoist_on || !cur_rg || c->builtin || c->rdual != cur_rg || !c->ctor || !small_ctor(c->ctor) || c->stack_at) return false;
+    Func *ct = c->ctor;
+    for (int k = 0; k < c->nfields; k++) if (c->fields[k].init) return false;
+    mark_init_stores(c, ct);
+    if (!ctor_sets_every_field(c)) return false;
+    int src[8]; /* per field: the parameter index, or -1 */
+    for (int k = 0; k < c->nfields; k++) src[k] = -1;
+    for (int i = 0; i < ct->body->stmts.len; i++) {
+        Expr *a = ct->body->stmts.items[i]->expr;
+        int f = a->lhs->field;
+        if (f < 0 || f >= c->nfields || a->rhs->kind != E_IDENT) return false;
+        int pi = -1;
+        for (int j = 0; j < ct->nparams; j++) if (ct->params[j].cname && a->rhs->cname && strcmp(ct->params[j].cname, a->rhs->cname) == 0) pi = j;
+        if (pi < 0 || (cref(c->fields[f].type) && !ct->params[pi].consumed)) return false;
+        src[f] = pi;
+    }
+    for (int k = 0; k < c->nfields; k++) if (src[k] < 0) return false;
+    if (e->args.len != ct->nparams) return false;
+    buf_puts(out, "({ ");
+    for (int i = 0; i < e->args.len; i++) { /* the arguments first, in order, as the call would */
+        emit_decl(ct->params[i].type, xs_sprintf("ra%d_", i));
+        buf_puts(out, " = ");
+        if (ct->params[i].consumed) emit_owned(e->args.items[i]); else emit_borrowed(e->args.items[i]);
+        buf_puts(out, "; ");
+    }
+    buf_printf(out, "%s *ro_ = xs_region_alloc_dual_nz(&xs_rg_%d, sizeof(%s), &%s_type);", c->cname, c->rdual, c->cname, c->cname);
+    for (int k = 0; k < c->nfields; k++) buf_printf(out, " ro_->%s = ra%d_;", c->fields[k].cname, src[k]);
+    buf_puts(out, " ro_; })");
+    return true;
+}
+/* f's region version: the same body, emitted with cur_rg = N (into clone_fns, after the generic bodies) */
+static void emit_rg_clone(Func *f) {
+    Buf *saved_out = out;
+    EScope *saved_scope = escope;
+    Func *saved_func = cur_func;
+    int saved_indent = indent, saved_rg = cur_rg;
+    bool saved_ctor = in_ctor, saved_ar = used_ar, saved_vol = vol_locals;
+    Class *saved_class = cur_class;
+    Module *saved_mod = cur_mod;
+    Expr *saved_b = bracketing;
+    Buf b = {0};
+    out = &b;
+    indent = 0;
+    escope = NULL;
+    in_ctor = false;
+    bracketing = NULL;
+    cur_rg = f->rg_hoist;
+    char *cname = f->cname;
+    f->cname = rg_name(f);
+    buf_putc(out, '\n');
+    emit_signature(f);
+    f->cname = cname;
+    emit_func_body(f);
+    buf_puts(&clone_fns, b.data);
+    free(b.data);
+    out = saved_out; escope = saved_scope; cur_func = saved_func; indent = saved_indent; cur_rg = saved_rg;
+    in_ctor = saved_ctor; used_ar = saved_ar; vol_locals = saved_vol; cur_class = saved_class; cur_mod = saved_mod; bracketing = saved_b;
+}
+
 static void emit_stmt_(Stmt *s);
 static void emit_stmt(Stmt *s) {
     if ((s->kind == S_FOR || s->kind == S_WHILE || s->kind == S_FOROF) && s->region) { /* region.c: the iterations' objects go in one step */
         buf_printf(out, "xs_region_enter(&xs_rg_%d);", s->region);
         nl();
         region_reset_pending = s->region;
+        int saved_rg = cur_rg;
+        if (region_dual[s->region] && !sm_mode && !ictx) cur_rg = s->region; /* its body calls the region versions */
         emit_stmt_(s);
+        cur_rg = saved_rg;
         region_reset_pending = 0;
         nl();
         buf_printf(out, region_dual[s->region] ? "xs_rg_on_%d = false; xs_region_reset(&xs_rg_%d);" : "xs_region_reset(&xs_rg_%d);", s->region, s->region);
@@ -4556,7 +4745,7 @@ static void emit_stmt_(Stmt *s) {
         indent++;
         nl();
         buf_puts(out, "xs_Error *thrown_ = ");
-        emit_owned(s->expr);
+        { int rg_ = cur_rg; cur_rg = 0; emit_owned(s->expr); cur_rg = rg_; } /* (evaluated once, before the iterations) */
         buf_puts(out, ";");
         for (EScope *sc = escope; sc; sc = sc->parent) {
             emit_releases(sc);
@@ -4648,7 +4837,7 @@ static void emit_stmt_(Stmt *s) {
             epush(false);
             nl();
             buf_printf(out, "%s *it_ = xs_retain(", at->cls->cname);
-            emit_borrowed(s->expr);
+            { int rg_ = cur_rg; cur_rg = 0; emit_borrowed(s->expr); cur_rg = rg_; } /* (evaluated once, before the iterations) */
             buf_puts(out, ");");
             etrack("it_", at);
             nl();
@@ -4698,7 +4887,7 @@ static void emit_stmt_(Stmt *s) {
             epush(false);
             nl();
             buf_puts(out, "xs_stream *st_ = xs_retain(");
-            emit_borrowed(s->expr);
+            { int rg_ = cur_rg; cur_rg = 0; emit_borrowed(s->expr); cur_rg = rg_; } /* (evaluated once, before the iterations) */
             buf_puts(out, ");");
             etrack("st_", at);
             nl();
@@ -4789,7 +4978,7 @@ static void emit_stmt_(Stmt *s) {
         epush(false);
         nl();
         buf_printf(out, "%s *it_ = xs_retain(", arr_struct(at));
-        emit_borrowed(s->expr);
+        { int rg_ = cur_rg; cur_rg = 0; emit_borrowed(s->expr); cur_rg = rg_; } /* (evaluated once, before the iterations) */
         buf_puts(out, ");");
         etrack("it_", at);
         nl();
@@ -5036,7 +5225,7 @@ static void emit_stmt_(Stmt *s) {
 /* ---------- declarations ---------- */
 
 static void emit_signature(Func *f) {
-    if (f->run_once && strcmp(fn_storage(f), "XS_FA") != 0) buf_puts(out, "XS_RUN_ONCE "); /* (always_inline wins) */
+    if (f->run_once && strcmp(fn_storage(f), "XS_FA") != 0 && strcmp(fn_storage(f), "XS_FII") != 0) buf_puts(out, "XS_RUN_ONCE "); /* (always_inline wins) */
     if (f->is_ctor) {
         buf_printf(out, "%s %s *%s(", fn_storage(f), f->cls->cname, f->cname);
     } else {
@@ -6031,6 +6220,7 @@ void emit_program(Program *p, Buf *o) {
     region_dual = xs_alloc(sizeof(bool) * (size_t)(region_count + 1));
     for (int i = 0; i < p->nclasses; i++) if (p->classes[i]->rdual) region_dual[p->classes[i]->rdual] = true;
     if (!xs_debug && !xs_profile) stack_compute(p, class_cyclic);
+    rg_compute(p);
     use_cln = (p->uses_net || program_has_try(p)) && !getenv("XISTO_NO_CLN"); /* XISTO_NO_CLN: measuring knob */
     find_consumed(p);
     find_run_once(p);
@@ -6125,6 +6315,13 @@ void emit_program(Program *p, Buf *o) {
         if (p->funcs[i]->mod->builtin || p->funcs[i]->is_native || !p->funcs[i]->used) continue;
         emit_signature(p->funcs[i]);
         buf_puts(out, ";\n");
+        if (rg_hoist_on && p->funcs[i]->rg_hoist > 0 && p->funcs[i]->rg_used) { /* its region version (rg-hoist) */
+            char *cname = p->funcs[i]->cname;
+            p->funcs[i]->cname = rg_name(p->funcs[i]);
+            emit_signature(p->funcs[i]);
+            p->funcs[i]->cname = cname;
+            buf_puts(out, ";\n");
+        }
     }
     /* class bodies, functions and main go to a separate buffer so JSON helpers they need can be placed first */
     Buf body = {0};
@@ -6148,6 +6345,7 @@ void emit_program(Program *p, Buf *o) {
         emit_signature(p->funcs[i]);
         emit_func_body(p->funcs[i]);
     }
+    if (rg_hoist_on) for (int i = 0; i < p->nfuncs; i++) if (p->funcs[i]->rg_hoist > 0 && p->funcs[i]->rg_used) emit_rg_clone(p->funcs[i]);
 
     vol_locals = false;
     for (int i = 0; i < p->top.len; i++) if (stmt_has_try(p->top.items[i])) vol_locals = true;
