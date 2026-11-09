@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "types": [],
+    "paths": {
+      "xisto:io": ["./packages/xisto/io.ts"],
+      "xisto:bytes": ["./packages/xisto/bytes.ts"]
+    }
+  },
+  "files": ["xisto.d.ts", "packages/xisto/io.ts", "packages/xisto/bytes.ts", "bench/benchmarksgame/revcomp.ts", "tests/ok/xisto-bytes.ts", "tests/ok/u8-last-index.ts"]
+}
