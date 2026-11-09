@@ -5386,6 +5386,14 @@ static bool xs_find_par(const char *h, size_t hn, const char *nd, size_t nn, con
     static int off = -1;
     if (off < 0) off = getenv("XISTO_NO_GEN_PAR") != NULL;
     if (off || hn < ((size_t)1 << 24) || nn == 0 || nn > hn) return false;
+    /* the first megabyte on this thread first: a search that hits near its start (indexOf("\n", from) walking a long
+       text, line by line) must not wake every thread for a hit 60 bytes away (knucleotide-2: 4 s -> 64 s, 25 s of
+       system time, before this). Every match starting in the first megabyte is found here, so the threads search
+       only what follows */
+    const size_t pre = (size_t)1 << 20;
+    const char *near = memmem(h, pre + nn - 1, nd, nn);
+    if (near) { *hit = near; return true; }
+    h += pre; hn -= pre;
     if (!xs_rap_acquire()) return false;
     xs_rap_start_threads();
     if (xs_rap_nthreads < 1) { xs_rap_release(); return false; }
