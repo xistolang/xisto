@@ -26,7 +26,9 @@ function flips(n: int, rounds: int): string {
     const a = r % n, b = (r * 7 + 3) % n;
     const t = perm1[a]; perm1[a] = perm1[b]; perm1[b] = t;
   }
-  return `${n}: ${total} ${most} [${perm1.join(",")}]`;
+  let shown = "";
+  for (let i = 0; i < n; i++) shown += `${perm1[i]},`;
+  return `${n}: ${total} ${most} [${shown}]`;
 }
 
 const sizes: int[] = [1, 2, 5, 9, 16, 17, 23];
