@@ -293,14 +293,33 @@ static void build_qbe_cached(Program *p, const char *entry, const char *outfile)
     if (show_time) fprintf(stderr, "xisto: ld %.1f ms\n", now_ms() - t0);
 }
 
+/* the code is for an x86 processor with 4-lane double vectors (AVX2): --cpu=native on such a machine, or a named
+   x86-64-v3/v4 or Haswell-or-later target; never for another system (--target) */
+static bool cpu_wide_f64(void) {
+    const char *f = getenv("XISTO_WIDE_F64");
+    if (f && *f) return strcmp(f, "0") != 0;
+#if defined(__x86_64__)
+    if (!xs_cpu || xs_target) return false;
+    if (strcmp(xs_cpu, "native") == 0) return __builtin_cpu_supports("avx2");
+    static const char *wide[] = {"x86-64-v3", "x86-64-v4", "haswell", "broadwell", "skylake", "skylake-avx512", "cascadelake",
+                                 "icelake-client", "icelake-server", "alderlake", "sapphirerapids", "znver1", "znver2", "znver3", "znver4"};
+    for (size_t i = 0; i < sizeof wide / sizeof *wide; i++) if (strcmp(xs_cpu, wide[i]) == 0) return true;
+#endif
+    return false;
+}
+
 static Program *last_program;
 
 static Buf compile_to_c(const char *path) {
     double t0 = now_ms();
     Program *p = parse_program(path);
     last_program = p;
+    inplace_program(p); /* (before the checker: a callee renamed) */
     if (!use_qbe) columns_program(p); /* (the qbe backend takes no typed-array parameter yet) */
-    if (!use_qbe) distribute_program(p); /* (after columns: it only touches loops over columns) */
+    if (!use_qbe) {
+        xs_wide_f64 = cpu_wide_f64();
+        distribute_program(p); /* (after columns: it only touches loops over columns) */
+    }
     double t1 = now_ms();
     check_program(p);
     double t2 = now_ms();

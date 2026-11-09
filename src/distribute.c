@@ -20,6 +20,7 @@
 #include <stdio.h>
 
 static int dist_id;
+bool xs_wide_f64;
 
 static bool is_ident(Expr *e, const char *name) { return e && e->kind == E_IDENT && e->str && (!name || strcmp(e->str, name) == 0); }
 static bool int_lit(Expr *e, long long *v) {
@@ -161,6 +162,22 @@ static bool pure(Ctx *c, Expr *e) {
     }
 }
 
+static bool has_index(Expr *e) {
+    if (!e) return false;
+    if (e->kind == E_INDEX) return true;
+    if (has_index(e->lhs) || has_index(e->rhs)) return true;
+    for (int i = 0; i < e->args.len; i++) if (has_index(e->args.items[i])) return true;
+    return false;
+}
+static bool is_slow(Expr *e) {
+    if (!e) return false;
+    if (e->kind == E_BINARY && e->op == TK_SLASH) return true;
+    if (e->kind == E_MEMBER && e->is_call && is_ident(e->lhs, "Math") && e->str && strcmp(e->str, "sqrt") == 0) return true;
+    if (is_slow(e->lhs) || is_slow(e->rhs)) return true;
+    for (int i = 0; i < e->args.len; i++) if (is_slow(e->args.items[i])) return true;
+    return false;
+}
+
 static void uses_expr(Expr *e, Names *u) {
     if (!e) return;
     if (e->kind == E_IDENT && e->str) add(u, e->str);
@@ -245,32 +262,62 @@ static Stmt *try_loop(Func *f, Stmt *outer) {
         }
     }
     if (!nh || nh == l->len || !c.slow) return NULL;
+    /* with 4-lane double vectors (xs_wide_f64), the slow pure consts that read no column (n-body's sq and mag) go in
+       a third, flat pass over the pairs, from the slots of the consts they read: the loop the C compiler turns
+       into vector square roots and divisions (vsqrtpd, vdivpd), as the hand-written #5 does. Stage A: the pure
+       consts that read columns; stage B: the ones that read no column (only earlier pure consts, values from
+       outside, literals); a const that reads a column and a stage-B const stays in the loop (pass 2), reading the
+       stage-B const back from its slot. Same expressions on the same operands: the same doubles. */
+    char *stage = xs_alloc((size_t)l->len); /* 'A', 'B', 'L' (late: back in pass 2), 0 */
+    bool flat = false;
+    if (xs_wide_f64 && !getenv("XISTO_NO_DIST_FLAT")) {
+        Names bset = {0};
+        bool slow_b = false;
+        for (int s = 0; s < l->len; s++) {
+            if (!hoist[s]) continue;
+            Stmt *st = l->items[s];
+            Names u = {0};
+            uses_expr(st->init, &u);
+            bool reads_b = false;
+            for (int k = 0; k < u.n; k++) if (has(&bset, u.v[k])) reads_b = true;
+            if (!has_index(st->init)) {
+                stage[s] = 'B';
+                add(&bset, st->name);
+                if (is_slow(st->init)) slow_b = true;
+            } else stage[s] = reads_b ? 'L' : 'A';
+        }
+        flat = slow_b;
+        if (flat) for (int s = 0; s < l->len; s++) if (stage[s] == 'L') hoist[s] = false;
+    }
     /* the pure consts the rest of the body reads: each gets its slots */
-    Names need = {0};
+    Names need = {0}, needb = {0};
     for (int s = 0; s < l->len; s++) {
         if (hoist[s]) continue;
         Stmt *st = l->items[s];
         uses_expr(st->kind == S_VAR ? st->init : st->expr, &need);
     }
+    if (flat) for (int s = 0; s < l->len; s++) if (stage[s] == 'B') uses_expr(l->items[s]->init, &needb);
     int id = ++dist_id;
     Pos pos = outer->pos;
     const char *p = xs_sprintf("__dist%d_p", id);
     Stmt *blk = mk_stmt(S_BLOCK, pos);
     for (int s = 0; s < l->len; s++) {
-        if (!hoist[s] || !has(&need, l->items[s]->name)) continue;
+        if (!hoist[s]) continue;
+        const char *nm = l->items[s]->name;
+        if (!has(&need, nm) && !(flat && stage[s] == 'A' && has(&needb, nm))) continue;
         Expr *n = mk(E_NEW_OBJ, pos);
         n->str = "Float64Array";
         expr_list_push(&n->args, mk_int(pairs, pos));
-        stmt_list_push(&blk->stmts, mk_var(xs_sprintf("__dist%d_%s", id, l->items[s]->name), n, true, pos));
+        stmt_list_push(&blk->stmts, mk_var(xs_sprintf("__dist%d_%s", id, nm), n, true, pos));
     }
     stmt_list_push(&blk->stmts, mk_var(p, mk_int(0, pos), false, pos));
     /* pass 1 */
     Stmt *body1 = mk_stmt(S_BLOCK, pos);
     for (int s = 0; s < l->len; s++) {
-        if (!hoist[s]) continue;
+        if (!hoist[s] || (flat && stage[s] != 'A')) continue;
         Stmt *st = l->items[s];
         stmt_list_push(&body1->stmts, mk_var(st->name, st->init, true, st->pos));
-        if (has(&need, st->name))
+        if (has(&need, st->name) || (flat && has(&needb, st->name)))
             stmt_list_push(&body1->stmts, mk_expr_stmt(mk_assign(mk_index(xs_sprintf("__dist%d_%s", id, st->name), p, st->pos), mk_ident(st->name, st->pos))));
     }
     stmt_list_push(&body1->stmts, mk_expr_stmt(mk_inc(p, pos)));
@@ -296,6 +343,29 @@ static Stmt *try_loop(Func *f, Stmt *outer) {
     stmt_list_push(&ob->stmts, in1);
     out1->body = ob;
     stmt_list_push(&blk->stmts, out1);
+    if (flat) { /* pass 1b: the flat loop over the pairs */
+        const char *q = xs_sprintf("__dist%d_q", id);
+        Stmt *bb = mk_stmt(S_BLOCK, pos);
+        for (int s = 0; s < l->len; s++)
+            if (stage[s] == 'A' && has(&needb, l->items[s]->name))
+                stmt_list_push(&bb->stmts, mk_var(l->items[s]->name, mk_index(xs_sprintf("__dist%d_%s", id, l->items[s]->name), q, pos), true, pos));
+        for (int s = 0; s < l->len; s++) {
+            if (stage[s] != 'B') continue;
+            Stmt *st = l->items[s];
+            stmt_list_push(&bb->stmts, mk_var(st->name, st->init, true, st->pos));
+            if (has(&need, st->name))
+                stmt_list_push(&bb->stmts, mk_expr_stmt(mk_assign(mk_index(xs_sprintf("__dist%d_%s", id, st->name), q, st->pos), mk_ident(st->name, st->pos))));
+        }
+        Stmt *fl = mk_stmt(S_FOR, pos);
+        fl->for_init = mk_var(q, mk_int(0, pos), false, pos);
+        fl->cond = mk(E_BINARY, pos);
+        fl->cond->op = TK_LT;
+        fl->cond->lhs = mk_ident(q, pos);
+        fl->cond->rhs = mk_int(pairs, pos);
+        fl->for_update = mk_inc(q, pos);
+        fl->body = bb;
+        stmt_list_push(&blk->stmts, fl);
+    }
     stmt_list_push(&blk->stmts, mk_expr_stmt(mk_assign(mk_ident(p, pos), mk_int(0, pos))));
     /* pass 2: the original loop, the pure consts read back */
     StmtList rest = {0};
@@ -310,7 +380,7 @@ static Stmt *try_loop(Func *f, Stmt *outer) {
     stmt_list_push(&rest, mk_expr_stmt(mk_inc(p, pos)));
     body->stmts = rest;
     stmt_list_push(&blk->stmts, outer);
-    if (getenv("XISTO_DISTRIBUTE_WHY")) fprintf(stderr, "distribute: pair loop over %s, %s in %s: %d consts in pass 1, %lld pairs\n", i, j, f->name, nh, pairs);
+    if (getenv("XISTO_DISTRIBUTE_WHY")) fprintf(stderr, "distribute: pair loop over %s, %s in %s: %d consts in pass 1, %lld pairs%s\n", i, j, f->name, nh, pairs, flat ? ", flat pass for the slow ones" : "");
     return blk;
 }
 
