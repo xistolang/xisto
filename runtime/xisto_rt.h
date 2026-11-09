@@ -4333,6 +4333,17 @@ static inline xs_u8x16 xs_v16_rev(xs_u8x16 v, int64_t lo, int64_t hi, int64_t n,
     if (lo < 0 || (uint64_t)hi >= (uint64_t)XS_V16_LEN(n)) XS_FAIL(XS_V16_OOB(n), s);
     return xs_u8x16_shuffle(v, xs_rev_mask[lo][hi]);
 }
+/* the element xs_v16_rev(v, lo, hi) brings to lo, from v before the shuffle (0 when the reversal fails: it
+   throws first) */
+static inline int64_t xs_v16_rev_head(xs_u8x16 v, int64_t lo, int64_t hi, int64_t n) {
+    int64_t at = lo < hi ? hi : lo;
+    return (uint64_t)at < (uint64_t)XS_V16_LEN(n) && at >= 0 ? xs_v16_get_nc(v, at) : 0;
+}
+/* a[lo] right after the reversal: the element above, with a[lo]'s own check */
+static inline int64_t xs_v16_head_after(int64_t h, int64_t lo, int64_t n, const xs_site *s) {
+    if ((uint64_t)lo >= (uint64_t)XS_V16_LEN(n)) XS_FAIL(XS_V16_OOB(n), s);
+    return h;
+}
 static inline xs_u8x16 xs_v16_range(int64_t lo, int64_t hi) { /* lanes lo <= i < hi */
     xs_u8x16 idx = xs_u8x16_iota();
     return (idx >= xs_u8x16_splat((uint8_t)lo)) & (idx < xs_u8x16_splat((uint8_t)hi));

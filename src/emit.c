@@ -581,6 +581,7 @@ static const char *ren(const char *name) {
 static EScope *escope;
 static void emit_releases(EScope *s);
 static void emit_block(Stmt *b, bool func_root);
+static Stmt *blk_prev_stmt; /* in the block loops: the statement before the one being emitted, in the same block */
 static void nl(void);
 
 static void epush(bool func_root) {
@@ -3451,6 +3452,7 @@ static void emit_block_kind(Stmt *b, ScopeKind kind) {
         if (emit_u8_shl_put(b, &i)) continue;
         nl();
         emit_dbg_hook(b->stmts.items[i]);
+        blk_prev_stmt = i > 0 ? b->stmts.items[i - 1] : NULL;
         emit_stmt(b->stmts.items[i]);
     }
     emit_releases(escope);
@@ -3478,6 +3480,7 @@ static void emit_block(Stmt *b, bool func_root) {
         if (!after_super && emit_u8_shl_put(b, &i)) continue;
         nl();
         emit_dbg_hook(b->stmts.items[i]);
+        blk_prev_stmt = i > 0 ? b->stmts.items[i - 1] : NULL;
         emit_stmt(b->stmts.items[i]);
         if (i == 0 && after_super) emit_own_field_inits(after_super); /* super(...) ran: now the class's own fields */
     }
@@ -5187,6 +5190,10 @@ static bool emit_u8_while_rev(Stmt *s) {
 /* the loops `for (j = lo; j < hi; j++) dst[j] = src[j]`, the swap loop of a reversal, and `a[j] = a[j + 1]`
    on byte arrays become one runtime call each (xs_u8_copy_range, xs_u8_rev, xs_u8_shl), or one shuffle when
    the array is in a register. XISTO_NO_U8_IDIOM=1 keeps the loops. */
+static const char *rev_head_name, *rev_head_n;
+static Expr *rev_head_lo;
+static int rev_head_site;
+static Stmt *rev_head_stmt;
 static bool emit_u8_idiom(Stmt *s) {
     if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
     U8Idiom m;
@@ -5215,6 +5222,18 @@ static bool emit_u8_idiom(Stmt *s) {
         return true;
     }
     if (m.kind == 2) {
+        /* the element the reversal brings to lo (old a[hi], or a[lo] when lo >= hi), read from the value before
+           the shuffle: a read of a[lo] right after (k = perm[0] in a flip loop) takes it without waiting for the
+           shuffle (rev_head below) */
+        if (ra && fn_prelude_out == out && !getenv("XISTO_NO_REV_HEAD")) {
+            buf_printf(&fn_prelude_text, "\n    int64_t rh%d_ = 0; (void)rh%d_;", site, site);
+            buf_printf(out, "rh%d_ = xs_v16_rev_head(", site); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", %s); ", rgn(ra));
+            rev_head_name = m.a->cname;
+            rev_head_lo = m.lo;
+            rev_head_site = site;
+            rev_head_n = rgn(ra);
+            rev_head_stmt = s; /* for the next statement of the same block only */
+        }
         if (ra) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_rev("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_puts(out, ") - ("); emit_expr(m.lo); buf_printf(out, "), %s, XS_S(%d));", rgn(ra), site); }
         else { buf_puts(out, "xs_u8_rev("); emit_borrowed(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_puts(out, ") - ("); emit_expr(m.lo); buf_printf(out, "), XS_S(%d));", site); }
         return true;
@@ -5521,8 +5540,26 @@ static void emit_stmt_for_inner(Stmt *s) { /* a for: bounds checks proved by the
     nbce = saved_nbce;
     return;
     }
+static bool same_simple(Expr *a, Expr *b);
 static void emit_stmt_(Stmt *s) {
     used_ar = false;
+    if (rev_head_stmt) {
+        /* the statement right after a register reversal: `x = a[lo]` takes the element the reversal put there */
+        Stmt *prev = rev_head_stmt;
+        rev_head_stmt = NULL;
+        if (blk_prev_stmt == prev) {
+        Expr *e = s->kind == S_EXPR ? s->expr : NULL;
+        if (e && e->kind == E_ASSIGN && e->op == TK_ASSIGN && e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname &&
+            e->lhs->type && e->lhs->type->kind == TY_INT && !u8reg_find(e->lhs) && e->rhs && e->rhs->kind == E_INDEX &&
+            e->rhs->lhs && e->rhs->lhs->kind == E_IDENT && e->rhs->lhs->cname && strcmp(e->rhs->lhs->cname, rev_head_name) == 0 &&
+            same_simple(e->rhs->rhs, rev_head_lo) && bce_pure(rev_head_lo)) {
+            int site = new_site(s->pos);
+            buf_printf(out, "(%s = xs_v16_head_after(rh%d_, ", ren(e->lhs->cname), rev_head_site); emit_expr(rev_head_lo); buf_printf(out, ", %s, XS_S(%d)));", rev_head_n, site);
+            drain_if_needed();
+            return;
+        }
+        }
+    }
     if (s->kind == S_FOR && lane_loop(s)) { drain_if_needed(); return; }
     if ((s->kind == S_WHILE || s->kind == S_FOR) && u8reg_loop(s)) { drain_if_needed(); return; }
     switch (s->kind) {
@@ -6324,7 +6361,36 @@ static const char *lane_cond(Expr *c, Buf *checks) {
     JV a = lane_jv(c->lhs, true, checks), b = lane_jv(c->rhs, true, checks);
     if (!a.c || !b.c) return NULL;
     /* a side without a lane value is one double: added to a zero vector, so the comparison is per lane */
-    return xs_sprintf("((xs_i8)(((xs_f8){0} + %s) %s ((xs_f8){0} + %s)))", jam_num_of(a), op, jam_num_of(b));
+    const char *as = jam_num_of(a), *bs = jam_num_of(b);
+    bool av = strstr(as, "lz_") || strstr(as, "lxd_"), bv = strstr(bs, "lz_") || strstr(bs, "lxd_");
+    /* a side already in lanes is compared as it is (x + 0.0 is not x for -0.0: the compiler would keep the add) */
+    return xs_sprintf("((xs_i8)(%s%s%s %s %s%s%s))", av ? "(" : "((xs_f8){0} + ", as, ")", op, bv ? "(" : "((xs_f8){0} + ", bs, ")");
+}
+/* mask-only: the rest S reads the state only through the loop's own condition T (one term besides i < K). A lane
+   whose T went false stopped there, so T is false at its last values; a lane that ran all K iterations was never
+   stopped, so its values are the exact ones. S's T is then (the lane ran to the end) && T: no lane needs its values
+   kept from the iteration it stopped (no blends), and the all-stopped exit can be tested every few iterations. */
+static Expr *lane_T;
+static Expr *lane_hits[32];
+static int nlane_hits;
+static bool lane_state_name(const char *cname) { int k = lane_find(cname); return k >= 0 && lane_v[k].state; }
+static bool lane_only_T_e(Expr *e) {
+    if (!e) return true;
+    if (same_simple(e, lane_T)) { if (nlane_hits >= 32) return false; lane_hits[nlane_hits++] = e; return true; }
+    if (e->kind == E_IDENT) return !(e->cname && lane_state_name(e->cname));
+    if (e->kind == E_ARROW) return false;
+    if (!lane_only_T_e(e->lhs) || !lane_only_T_e(e->rhs)) return false;
+    for (int i = 0; i < e->args.len; i++) if (!lane_only_T_e(e->args.items[i])) return false;
+    return true;
+}
+static bool lane_only_T_s(Stmt *s) {
+    if (!s) return true;
+    if (s->kind == S_VAR && s->cname && lane_state_name(s->cname)) return false;
+    if (!lane_only_T_e(s->init) || !lane_only_T_e(s->expr) || !lane_only_T_e(s->cond) || !lane_only_T_e(s->for_update)) return false;
+    if (!lane_only_T_s(s->for_init) || !lane_only_T_s(s->body) || !lane_only_T_s(s->else_body)) return false;
+    for (int i = 0; i < s->stmts.len; i++) if (!lane_only_T_s(s->stmts.items[i])) return false;
+    for (int i = 0; i < s->ncases; i++) if (!lane_only_T_e(s->cases[i].value) || !lane_only_T_s(s->cases[i].body)) return false;
+    return true;
 }
 static bool lane_incr(Expr *u, const char *name) { /* x++, ++x, x += 1 */
     if (!u || !u->lhs || u->lhs->kind != E_IDENT || !u->lhs->cname || strcmp(u->lhs->cname, name) != 0) return false;
@@ -6417,6 +6483,21 @@ static bool lane_loop(Stmt *s) {
         if (terms[k] && !(cnd[k] = lane_cond(terms[k], &checks))) return false;
     }
     JV kv = lane_jv(K, false, NULL);
+    /* mask-only (above): one condition term besides i < K, and S reads the state only through it */
+    bool monly = false;
+    {
+        int nc = 0, ci = -1;
+        for (int k = 0; k < nt; k++) if (cnd[k]) { nc++; ci = k; }
+        static int off = -1;
+        if (off < 0) off = getenv("XISTO_NO_LANE_MASK") && *getenv("XISTO_NO_LANE_MASK") ? 1 : 0;
+        if (nc == 1 && !off) {
+            lane_T = terms[ci];
+            nlane_hits = 0;
+            monly = true;
+            for (int k = p + 1; k < b->stmts.len && monly; k++) if (!lane_only_T_s(b->stmts.items[k])) monly = false;
+            if (nlane_hits == 0) monly = false;
+        }
+    }
     /* emitted: the loop variable, the groups of eight, then the loop as written for the rest */
     const char *xc = ren(fi->cname);
     buf_puts(out, "{");
@@ -6460,6 +6541,34 @@ static bool lane_loop(Stmt *s) {
     nl();
     buf_puts(out, "xs_i8 act_ = (xs_i8){0} - 1;");
     nl();
+    static int lane_lbl = 0;
+    int lbl = ++lane_lbl;
+    if (monly) {
+        /* four iterations between the all-stopped tests: a stopped lane changes nothing S can see */
+        buf_printf(out, "int64_t i_ = INT64_C(%lld);", (long long)li->init->ival);
+        nl();
+        buf_printf(out, "for (; (double)(i_ + 4) <= %s; i_ += 4) {", jam_num_of(kv));
+        indent++;
+        for (int r = 0; r < 4; r++) {
+            for (int k = 0; k < nt; k++) if (cnd[k]) { nl(); buf_printf(out, "act_ &= %s;", cnd[k]); }
+            for (int k = 0; k < nu; k++) { nl(); buf_printf(out, "lz_%s = %s;", L->body->stmts.items[k]->expr->lhs->cname, upd[k]); }
+        }
+        nl();
+        buf_printf(out, "{ xs_i8 r_ = act_ | __builtin_shufflevector(act_, act_, 4, 5, 6, 7, 0, 1, 2, 3); if ((r_[0] | r_[1] | r_[2] | r_[3]) == 0) goto lend%d_; }", lbl);
+        indent--;
+        nl();
+        buf_puts(out, "}");
+        nl();
+        buf_printf(out, "for (; (double)i_ < %s; i_++) {", jam_num_of(kv));
+        indent++;
+        for (int k = 0; k < nt; k++) if (cnd[k]) { nl(); buf_printf(out, "act_ &= %s;", cnd[k]); }
+        for (int k = 0; k < nu; k++) { nl(); buf_printf(out, "lz_%s = %s;", L->body->stmts.items[k]->expr->lhs->cname, upd[k]); }
+        indent--;
+        nl();
+        buf_puts(out, "}");
+        nl();
+        buf_printf(out, "lend%d_:;", lbl);
+    } else {
     buf_printf(out, "for (int64_t i_ = INT64_C(%lld); (double)i_ < %s; i_++) {", (long long)li->init->ival, jam_num_of(kv));
     indent++;
     for (int k = 0; k < nt; k++) if (cnd[k]) { nl(); buf_printf(out, "act_ &= %s;", cnd[k]); }
@@ -6475,6 +6584,7 @@ static bool lane_loop(Stmt *s) {
     indent--;
     nl();
     buf_puts(out, "}");
+    }
     for (int k = 0; k < nlane_v; k++) if (lane_v[k].state) { nl(); buf_printf(out, "memcpy(lv_%s, &lz_%s, 64);", lane_v[k].cname, lane_v[k].cname); }
     nl();
     buf_puts(out, "for (int l_ = 0; l_ < 8; l_++) {");
@@ -6482,12 +6592,34 @@ static bool lane_loop(Stmt *s) {
     nl();
     buf_printf(out, "int64_t %s = lb_ + l_;", xc);
     for (int k = 0; k < nlane_v; k++) { nl(); buf_printf(out, "double %s = lv_%s[l_];", ren(lane_v[k].cname), lane_v[k].cname); }
+    /* mask-only: each T of S becomes (lact_ && T) for this lane */
+    Expr saved_hits[32];
+    if (monly) {
+        nl();
+        buf_puts(out, "const bool lact_ = act_[l_] != 0; (void)lact_;");
+        for (int h = 0; h < nlane_hits; h++) {
+            Expr *m = lane_hits[h];
+            saved_hits[h] = *m;
+            Expr *orig = malloc(sizeof(Expr)), *id = calloc(1, sizeof(Expr));
+            *orig = *m;
+            id->kind = E_IDENT;
+            id->cname = id->str = "lact_";
+            id->type = m->type;
+            id->pos = m->pos;
+            m->kind = E_BINARY;
+            m->op = TK_AND;
+            m->lhs = id;
+            m->rhs = orig;
+            m->args = (ExprList){0};
+        }
+    }
     Stmt rest = *b;
     rest.stmts.items = b->stmts.items + p + 1;
     rest.stmts.len = b->stmts.len - p - 1;
     rest.stmts.cap = rest.stmts.len;
     nl();
     emit_stmt_(&rest);
+    if (monly) for (int h = 0; h < nlane_hits; h++) *lane_hits[h] = saved_hits[h];
     indent--;
     nl();
     buf_puts(out, "}");
