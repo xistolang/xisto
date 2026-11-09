@@ -7567,6 +7567,13 @@ static void emit_func_body(Func *f) {
     buf_puts(out, "size_t ar_mark = xs_ar_mark();");
     nl();
     buf_puts(out, "(void)ar_mark;");
+    if (f->mod && f->mod->file && strcmp(f->mod->file, "xisto:bytes") == 0 && f->name) { /* a big range on several threads (xs_u8_rev_par) */
+        if (strcmp(f->name, "reverseAround") == 0 && f->nparams == 5) {
+            nl(); buf_printf(out, "if (xs_u8_rev_par(%s, %s, %s, %s, %s)) return;", f->params[0].cname, f->params[1].cname, f->params[2].cname, f->params[3].cname, f->params[4].cname);
+        } else if (strcmp(f->name, "reverseMapped") == 0 && f->nparams == 4) {
+            nl(); buf_printf(out, "if (xs_u8_rev_par(%s, %s, -1, %s, %s)) return;", f->params[0].cname, f->params[1].cname, f->params[2].cname, f->params[3].cname);
+        }
+    }
     Buf *saved_pbuf = fn_prelude_out; size_t saved_ppos = fn_prelude_pos; Buf saved_ptext = fn_prelude_text;
     fn_prelude_out = out; fn_prelude_pos = out->len; fn_prelude_text = (Buf){0};
     emit_prof_enter(f);
