@@ -328,7 +328,10 @@ static Buf compile_to_c(const char *path) {
         if (getenv("XISTO_REGION_CHECK") && strcmp(getenv("XISTO_REGION_CHECK"), "1") == 0) buf_puts(&b, "#define XS_REGION_CHECK 1\n"); /* regions: run-time proof (xisto_rt.h) */
         if (xs_debug) buf_puts(&b, "#define XS_DEBUG 1\n");
         if (p->uses_workers) in_process = false; /* (worker threads: an executable of its own, built with XS_THREADS) */
-        if (p->uses_net && !in_process) buf_puts(&b, "#define XS_THREADS 1\n"); /* servers may run worker threads */
+        if (p->uses_parallel && !xs_debug) par_analyze(p); /* (the debugger, like the QBE backend, runs the plain loops) */
+        if (p->par_native) in_process = false; /* (xisto:parallel: a thread pool, so per-thread runtime state) */
+        if ((p->uses_net || p->par_native) && !in_process) buf_puts(&b, "#define XS_THREADS 1\n"); /* servers may run worker threads */
+        if (p->par_native) buf_puts(&b, "#define XS_PARALLEL 1\n");
         if (p->uses_tls) { buf_puts(&b, "#define XS_WITH_TLS 1\n"); link_tls = true; }
         if (p->uses_regex) buf_puts(&b, "#define XS_RT_REGEX 1\n");
         rt_src.len = 0;

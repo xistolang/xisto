@@ -6680,3 +6680,133 @@ static void xs_exit(void) {
     }
     xs_prof_report();
 }
+
+/* ---- xisto:parallel: a pool of threads for the calls of fn (emit.c emit_par_variant) ----
+   One job at a time: main publishes it, wakes the pool and takes part; every thread takes chunks of indices
+   from a shared counter and runs body(ctx, i), which stores fn(i) in a slot of its own. A thrown error is
+   caught per chunk and kept if its index is the lowest so far (later chunks are then skipped: the loop would
+   never reach them). Objects made on a worker belong to main afterwards: its allocation counts move with them.
+   Runtime state is per thread (XS_THREADS); the program's globals are shared, and nothing writes them while a
+   job runs (the compiler proved fn does not). */
+#ifdef XS_PARALLEL
+#include <pthread.h>
+#include <stdatomic.h>
+typedef struct {
+    void (*body)(void *ctx, int64_t i);
+    void *ctx;
+    int64_t n, chunk;
+    _Atomic int64_t next;
+    _Atomic int64_t err_i; /* the lowest failing index (n: none) */
+    void *err;             /* its error (owned), under xs_pool_mu */
+    _Atomic int64_t live, allocs; /* what the workers allocated and did not free */
+} xs_pool_job;
+static pthread_mutex_t xs_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t xs_pool_wake = PTHREAD_COND_INITIALIZER, xs_pool_done = PTHREAD_COND_INITIALIZER;
+static xs_pool_job *xs_pool_cur;
+static uint64_t xs_pool_gen;
+static int xs_pool_nthreads = -1; /* workers besides main (-1: pool not made yet) */
+static int xs_pool_busy;          /* workers still on the current job */
+static XS_TLS bool xs_pool_inside; /* this thread is running a job: a nested parallel call runs as the loop */
+
+static void xs_pool_chunks(xs_pool_job *j) {
+    bool was = xs_pool_inside;
+    xs_pool_inside = true;
+    for (;;) {
+        int64_t s = atomic_fetch_add(&j->next, j->chunk);
+        if (s >= j->n || s > atomic_load(&j->err_i)) break;
+        int64_t e = s + j->chunk < j->n ? s + j->chunk : j->n;
+        volatile int64_t i = s;
+        jmp_buf tb;
+        size_t am = xs_ar_mark();
+        xs_try_push(&tb);
+        if (_setjmp(tb) == 0) {
+            for (; i < e; i++) j->body(j->ctx, i);
+            xs_try_pop();
+        } else {
+            void *err = xs_caught();
+            xs_ar_drain(am);
+            pthread_mutex_lock(&xs_pool_mu);
+            if (i < atomic_load(&j->err_i)) { xs_release(j->err); j->err = err; atomic_store(&j->err_i, (int64_t)i); }
+            else xs_release(err);
+            pthread_mutex_unlock(&xs_pool_mu);
+        }
+    }
+    xs_pool_inside = was;
+}
+static void *xs_pool_worker(void *arg) {
+    (void)arg;
+    uint64_t seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&xs_pool_mu);
+        while (xs_pool_gen == seen) pthread_cond_wait(&xs_pool_wake, &xs_pool_mu);
+        seen = xs_pool_gen;
+        xs_pool_job *j = xs_pool_cur;
+        pthread_mutex_unlock(&xs_pool_mu);
+        int64_t live0 = xs_live, allocs0 = xs_allocs;
+        xs_pool_chunks(j);
+        atomic_fetch_add(&j->live, xs_live - live0);
+        atomic_fetch_add(&j->allocs, xs_allocs - allocs0);
+        xs_live = live0, xs_allocs = allocs0;
+        pthread_mutex_lock(&xs_pool_mu);
+        if (--xs_pool_busy == 0) pthread_cond_signal(&xs_pool_done);
+        pthread_mutex_unlock(&xs_pool_mu);
+    }
+    return NULL;
+}
+/* the number of threads a job runs on: XISTO_THREADS, else one per core */
+static int xs_pool_threads(void) {
+    if (xs_pool_nthreads < 0) {
+        const char *s = getenv("XISTO_THREADS");
+        long n = s && *s ? strtol(s, NULL, 10) : sysconf(_SC_NPROCESSORS_ONLN);
+        if (n < 1) n = 1;
+        if (n > 256) n = 256;
+        xs_pool_nthreads = 0;
+        for (long k = 1; k < n; k++) {
+            pthread_t t;
+            pthread_attr_t at;
+            pthread_attr_init(&at);
+            pthread_attr_setstacksize(&at, (size_t)64 << 20); /* deep recursion as on the main thread */
+            if (pthread_create(&t, &at, xs_pool_worker, NULL) == 0) { pthread_detach(t); xs_pool_nthreads++; }
+            pthread_attr_destroy(&at);
+        }
+    }
+    return xs_pool_nthreads + 1;
+}
+/* worth a job: more than one index, more than one thread, and not already inside one */
+static bool xs_pool_worth(int64_t n) { return n > 1 && !xs_pool_inside && xs_pool_threads() > 1; }
+/* runs body(ctx, i) for every i in [0, n) on the pool; afterwards j->err_i < n tells the failing index */
+static void xs_pool_run(xs_pool_job *j, int64_t n, void (*body)(void *, int64_t), void *ctx) {
+    int t = xs_pool_threads();
+    j->body = body, j->ctx = ctx, j->n = n, j->err = NULL;
+    int64_t c = n / ((int64_t)t * 16);
+    j->chunk = c < 1 ? 1 : c;
+    atomic_store(&j->next, 0);
+    atomic_store(&j->err_i, n);
+    atomic_store(&j->live, 0);
+    atomic_store(&j->allocs, 0);
+    pthread_mutex_lock(&xs_pool_mu);
+    xs_pool_cur = j;
+    xs_pool_busy = xs_pool_nthreads;
+    xs_pool_gen++;
+    pthread_cond_broadcast(&xs_pool_wake);
+    pthread_mutex_unlock(&xs_pool_mu);
+    xs_pool_chunks(j);
+    pthread_mutex_lock(&xs_pool_mu);
+    while (xs_pool_busy > 0) pthread_cond_wait(&xs_pool_done, &xs_pool_mu);
+    pthread_mutex_unlock(&xs_pool_mu);
+    xs_live += atomic_load(&j->live);
+    xs_allocs += atomic_load(&j->allocs);
+}
+/* the replay closure: the module's own loop runs again on main, and its fn hands back the value already made for
+   index i, or throws the error of the failing index there (so what happens before it happens as in the loop) */
+typedef struct { xs_closure base; xs_pool_job *job; void *slots; size_t slot_size; void (*drop)(void *slot); } xs_pool_replay;
+XS_NOINLINE void xs_pool_fail(xs_pool_replay *r, int64_t i) {
+    xs_pool_job *j = r->job;
+    if (r->drop) for (int64_t k = i + 1; k < j->n; k++) r->drop((char *)r->slots + (size_t)k * r->slot_size);
+    free(r->slots);
+    r->slots = NULL;
+    void *err = j->err;
+    j->err = NULL;
+    xs_throw(err);
+}
+#endif

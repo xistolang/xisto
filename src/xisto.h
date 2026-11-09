@@ -254,6 +254,7 @@ struct Expr {
     char *rflags;      /* E_REGEX */
     int ntargs;
     int region;        /* E_ARRAY_LIT of region objects made inside that region's loop (region.c): lives in the region */
+    bool par_native;   /* E_CALL of xisto:parallel whose fn was proved independent (parallel.c): the pool version */
 };
 
 typedef struct {
@@ -399,6 +400,9 @@ struct Func {
     StmtList param_decls; /* f([a, b]: T) / ({ x }) => ...: the declarations that open the body (parser) */
     bool *sa_param_esc; /* stackalloc.c: which parameters may outlive the call (NULL: not analyzed, all may) */
     bool sa_this_esc;
+    int par_state;     /* parallel.c: 0 not analyzed, 1 being analyzed, 2 safe on a worker thread, 3 not (par_why) */
+    const char *par_why;
+    bool par_native;   /* an instance of a xisto:parallel function some call runs on the pool: emit its _par version */
 };
 
 typedef struct {
@@ -527,6 +531,9 @@ typedef struct {
     int nlits, cap_lits;
     bool uses_net;
     bool uses_workers; /* imports xisto:worker_threads: per-thread globals, the program body callable (emit.c) */
+    bool uses_parallel; /* imports xisto:parallel (parser) */
+    bool par_native;   /* some call of it runs on the thread pool (parallel.c): per-thread runtime state (XS_THREADS),
+                          the program globals shared */
     bool uses_gen;     /* generators: the coroutine runtime, without worker threads (plain globals, no TLS) */
     bool uses_sqlite;
     bool uses_regex;    /* RegExp: runtime/xisto_regex.h joins the program */
@@ -540,6 +547,7 @@ void expr_list_push(ExprList *l, Expr *e);
 void stmt_list_push(StmtList *l, Stmt *s);
 
 Program *parse_program(const char *entry_file);
+void par_analyze(Program *p); /* parallel.c: which xisto:parallel calls can run on the thread pool */
 char *xs_read_file(const char *path);
 char *xs_format(const char *src); /* xisto fmt */
 void check_program(Program *p);

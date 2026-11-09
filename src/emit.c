@@ -2250,7 +2250,7 @@ static void emit_expr_(Expr *e) {
     Func *callee = e->kind == E_NEW_OBJ ? (e->cls->builtin ? NULL : e->cls->ctor) : e->func;
     int id = callee && callee->body && inlined_once(callee) && callee->call1 == e ? call1_site(callee) : new_site(e->pos);
     bool user_call = callee && callee->body && !e->builtin.cfn && e->kind != E_NEW_OBJ && !(e->kind == E_MEMBER && (!e->cls || e->cls->builtin));
-    char *clone = user_call && cloned_per_site(callee) ? emit_clone(callee, id) : NULL;
+    char *clone = user_call && !e->par_native && cloned_per_site(callee) ? emit_clone(callee, id) : NULL;
     Expr *saved_b = bracketing;
     bool is_void = !e->type || e->type->kind == TY_VOID;
     buf_puts(out, is_void ? "({ " : "({ __auto_type xr_ = ");
@@ -2924,7 +2924,8 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, ")");
             return;
         }
-        buf_printf(out, "%s(", e->builtin.cfn ? e->builtin.cfn : rg_call_name(e->func));
+        if (e->par_native) buf_printf(out, "%s_par(", e->func->cname); /* xisto:parallel on the pool */
+        else buf_printf(out, "%s(", e->builtin.cfn ? e->builtin.cfn : rg_call_name(e->func));
         emit_args_borrowed(&e->args, false);
         buf_puts(out, ")");
         return;
@@ -5786,6 +5787,52 @@ static void emit_signature(Func *f) {
     buf_puts(out, ")");
 }
 
+/* ---- xisto:parallel: the pool version of an instance (parallel.c proved the call's fn independent) ----
+   C_par runs fn for every index on the pool (xs_pool_run) into a buffer of slots, then runs the module's own loop,
+   C itself, with a closure that hands back slot i, or throws the error of the failing index when the loop gets
+   there: the array, the combining order and the error are the loop's. */
+static void par_signature(Func *f) {
+    buf_puts(out, "XS_NOINLINE ");
+    emit_decl(f->ret, xs_sprintf("%s_par", f->cname));
+    buf_puts(out, "(");
+    for (int i = 0; i < f->nparams; i++) {
+        if (i) buf_puts(out, ", ");
+        emit_decl(f->params[i].type, f->params[i].cname);
+    }
+    buf_puts(out, ")");
+}
+static void emit_par_variant(Func *f) {
+    const char *kind = (f->template_of ? f->template_of : f)->name;
+    bool map = strcmp(kind, "parallelMap") == 0, fill = strcmp(kind, "parallelFill") == 0;
+    Type *ft = f->params[1].type;
+    const char *rt = ctype(ft->ret), *cn = f->cname;
+    const char *items_t = map ? ctype(f->params[0].type) : NULL, *item_t = map ? ctype(f->params[0].type->elem) : NULL;
+    bool heap = ty_is_heap(ft->ret);
+    buf_printf(out, "\ntypedef struct { xs_closure *fn; %s *slots;%s%s } %s_pctx;\n", rt, map ? " " : "", map ? xs_sprintf("%sitems;", items_t) : "", cn);
+    buf_printf(out, "static void %s_pbody(void *c_, int64_t i) {\n    %s_pctx *c = c_;\n    c->slots[i] = ", cn, cn);
+    emit_closure_call_prefix(ft);
+    buf_printf(out, "c->fn->fn)(c->fn, %si);\n}\n", map ? "c->items->data[i], " : "");
+    buf_printf(out, "static %s %s_preplay(xs_pool_replay *r, %si) {\n", rt, cn, map ? xs_sprintf("%s item, int64_t ", item_t) : "int64_t ");
+    if (map) buf_puts(out, "    (void)item;\n");
+    buf_puts(out, "    if (i == atomic_load(&r->job->err_i)) xs_pool_fail(r, i);\n");
+    buf_printf(out, "    %s v = ((%s *)r->slots)[i];\n", rt, rt);
+    if (heap) buf_printf(out, "    ((%s *)r->slots)[i] = 0;\n", rt);
+    buf_puts(out, "    return v;\n}\n");
+    if (heap) buf_printf(out, "static void %s_pdrop(void *s) { xs_release(*(void **)s); }\n", cn);
+    par_signature(f);
+    const char *n = map || fill ? xs_sprintf("(int64_t)%s->len", f->params[0].cname) : f->params[0].cname;
+    buf_printf(out, " {\n    int64_t n_ = %s;\n    if (!xs_pool_worth(n_)) return %s(", n, cn);
+    for (int i = 0; i < f->nparams; i++) buf_printf(out, "%s%s", i ? ", " : "", f->params[i].cname);
+    buf_printf(out, ");\n    %s_pctx c_ = {%s, calloc((size_t)n_, sizeof(%s))%s%s};\n", cn, f->params[1].cname, rt, map ? ", " : "", map ? f->params[0].cname : "");
+    buf_puts(out, "    if (!c_.slots) xs_panic(\"out of memory\");\n    xs_pool_job j_;\n");
+    buf_printf(out, "    xs_pool_run(&j_, n_, %s_pbody, &c_);\n", cn);
+    buf_printf(out, "    xs_pool_replay r_ = {{{XS_IMMORTAL, 0}, (void *)%s_preplay}, &j_, c_.slots, sizeof(%s), %s};\n", cn, rt, heap ? xs_sprintf("%s_pdrop", cn) : "NULL");
+    bool is_void = !f->ret || f->ret->kind == TY_VOID;
+    buf_printf(out, "    %s%s(", is_void ? "" : xs_sprintf("%s%sres_ = ", ctype(f->ret), ctype(f->ret)[strlen(ctype(f->ret)) - 1] == '*' ? "" : " "), cn);
+    for (int i = 0; i < f->nparams; i++) buf_printf(out, "%s%s", i ? ", " : "", i == 1 ? "(xs_closure *)&r_" : f->params[i].cname);
+    buf_printf(out, ");\n    free(r_.slots);\n%s}\n", is_void ? "" : "    return res_;\n");
+}
+
 static void emit_prof_enter(Func *f) {
     if (!xs_profile) return;
     nl();
@@ -7228,6 +7275,7 @@ void emit_program(Program *p, Buf *o) {
         if (p->funcs[i]->mod->builtin || p->funcs[i]->is_native || !p->funcs[i]->used) continue;
         emit_signature(p->funcs[i]);
         buf_puts(out, ";\n");
+        if (p->funcs[i]->par_native) { par_signature(p->funcs[i]); buf_puts(out, ";\n"); } /* its pool version (xisto:parallel) */
         if (p->funcs[i]->body && !p->funcs[i]->is_gen) { /* its inner spine version (emit_spine, emit_spine_num) */
             Func *saved = cur_func; Spine sp_;
             cur_func = p->funcs[i];
@@ -7279,6 +7327,7 @@ void emit_program(Program *p, Buf *o) {
         buf_putc(out, '\n');
         emit_signature(p->funcs[i]);
         emit_func_body(p->funcs[i]);
+        if (p->funcs[i]->par_native) emit_par_variant(p->funcs[i]);
     }
     if (rg_hoist_on) for (int i = 0; i < p->nfuncs; i++) if (p->funcs[i]->rg_hoist > 0 && p->funcs[i]->rg_used) emit_rg_clone(p->funcs[i]);
 

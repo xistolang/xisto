@@ -2115,6 +2115,18 @@ static Func *instantiate_func(Func *tmpl, Type **args) {
     gen_work[ngen_work++] = inst;
     return inst;
 }
+/* t with the type parameters bound so far replaced (the others kept, so has_tparam still sees them) */
+static Type *subst_bound(Type *t, Func *tmpl, Type **bind) {
+    if (!t || !has_tparam(t)) return t;
+    switch (t->kind) {
+    case TY_TPARAM:
+        for (int i = 0; i < tmpl->ntparams; i++) if (bind[i] && strcmp(tmpl->tparams[i], t->tname) == 0) return bind[i];
+        return t;
+    case TY_ARRAY: { Type *el = subst_bound(t->elem, tmpl, bind); return has_tparam(el) ? t : ty_array_of(el); }
+    case TY_NULLABLE: { Type *el = subst_bound(t->elem, tmpl, bind); return has_tparam(el) ? t : ty_nullable_of(el); }
+    default: return t; /* (maps, sets, functions of T: left to the second check, as before) */
+    }
+}
 /* a call of a generic function or method: T from the explicit types, the arguments, or the expected result */
 static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char *what) {
     Type **bind = xs_alloc(sizeof(Type *) * (size_t)tmpl->ntparams);
@@ -2127,14 +2139,27 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
     if (e->args.len < required || e->args.len > tmpl->nparams)
         xs_error(e->pos, NULL, "%s takes %d%s argument(s), got %d", what, required, required == tmpl->nparams ? "" : xs_sprintf(" to %d", tmpl->nparams), e->args.len);
     bool *done = xs_alloc(sizeof(bool) * (size_t)(e->args.len + 1));
+    /* two passes: the arguments that are not arrows first (they bind T from their own types), then the arrows,
+       whose untyped parameters take the types bound so far: parallelMap(items: T[], fn: (item: T) => R) with
+       (s) => s.length gets s: string from items */
+    for (int pass = 0; pass < 2; pass++)
     for (int i = 0; i < e->args.len; i++) {
         if (!has_tparam(tmpl->params[i].type) || e->ntargs) continue;
+        bool arrow = e->args.items[i]->kind == E_ARROW;
+        if (arrow != (pass == 1)) continue;
         Type *pt = tmpl->params[i].type, *ctx = NULL;
-        if (e->args.items[i]->kind == E_ARROW && pt->kind == TY_FUNC) { /* map<U>(f: (x: T) => U) with (x) => ...: x from the
-                                                                            parameter, U from what the arrow returns */
+        if (arrow && pt->kind == TY_FUNC) { /* map<U>(f: (x: T) => U) with (x) => ...: x from the parameter (or from T
+                                               bound by an earlier argument), U from what the arrow returns */
             bool params_known = true;
-            for (int k = 0; k < pt->nparams; k++) if (has_tparam(pt->params[k])) params_known = false;
-            if (params_known) ctx = ty_func(pt->params, pt->nparams, has_tparam(pt->ret) ? NULL : pt->ret);
+            Type **ps = xs_alloc(sizeof(Type *) * (size_t)(pt->nparams + 1));
+            for (int k = 0; k < pt->nparams; k++) {
+                ps[k] = subst_bound(pt->params[k], tmpl, bind);
+                if (has_tparam(ps[k])) params_known = false;
+            }
+            if (params_known) {
+                Type *rt = subst_bound(pt->ret, tmpl, bind);
+                ctx = ty_func(ps, pt->nparams, has_tparam(rt) ? NULL : rt);
+            }
         }
         check_expr(e->args.items[i], ctx);
         done[i] = true;
@@ -3962,6 +3987,18 @@ static void check_expr(Expr *e, Type *expected) {
         Arrow *a = e->arrow;
         Func *f = a->fn;
         Type *want = expected && expected->kind == TY_FUNC ? expected : NULL;
+        if (want && want->nparams > f->nparams && !f->param_decls.len) { /* (item) => ... where (item, index) is expected:
+                                                                              JavaScript drops the extra arguments; here the
+                                                                              arrow takes them, unnamed, so the call matches */
+            Param *ps = xs_alloc(sizeof(Param) * (size_t)want->nparams);
+            memcpy(ps, f->params, sizeof(Param) * (size_t)f->nparams);
+            for (int i = f->nparams; i < want->nparams; i++) {
+                memset(&ps[i], 0, sizeof(Param));
+                ps[i].name = xs_sprintf("__unused%d", i);
+            }
+            f->params = ps;
+            f->nparams = want->nparams;
+        }
         if (want && want->nparams != f->nparams)
             xs_error(e->pos, NULL, "this arrow function takes %d parameter(s), but %d are expected here", f->nparams, want->nparams);
         for (int i = 0; i < f->nparams; i++) {
