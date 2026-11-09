@@ -117,6 +117,33 @@ export function writeStdoutLent(bytes: Uint8Array): void {
   process.stdout.write(bytes);
 }
 
+/**
+ * Says that a part of {@link readStdinPartsInPlace} is about to be turned in place and then written with
+ * {@link writeStdoutLent}: in xisto its write may start with the bytes that are already final while the rest is
+ * still being turned. The compiler calls it before `reverse(part, ...)` when `writeStdoutLent(part)` follows; a
+ * program has no reason to call it by hand.
+ *
+ * @param bytes - The part that the next statements turn and then write.
+ *
+ * @remarks
+ * Compatibility: in Node it does nothing (the write is {@link writeStdoutLent}'s). In xisto, `reverse` over
+ * several threads hands the front of the part to the write as its outer pairs are done; only final bytes go out,
+ * so the output is the same as writing after the reverse. When nothing is written behind (a small part, stdout a
+ * terminal), it does nothing either.
+ *
+ * @example
+ * ```ts
+ * import { readStdinPartsInPlace, writeStdoutLent, writeStdoutLentBegin } from "xisto:io";
+ * import { reverse } from "xisto:bytes";
+ * for (const record of readStdinPartsInPlace({ splitBefore: ">" })) {
+ *   writeStdoutLentBegin(record);
+ *   reverse(record, { skip: "\n", from: record.indexOf(10) + 1 });
+ *   writeStdoutLent(record);
+ * }
+ * ```
+ */
+export function writeStdoutLentBegin(bytes: Uint8Array): void {}
+
 /** Where {@link readStdinParts} cuts standard input: give exactly one of the two. */
 export interface StdinPartsOptions {
   /** A new part starts at each occurrence of this character: every part but the first begins with it. */
@@ -201,7 +228,7 @@ function* stdinParts(options: StdinPartsOptions, inPlace: boolean): Generator<Ui
     // the parts before start are done with: what is left of the last read moves to the front, once they take half
     // the array or it is full (so the next part is mostly read past the last one, while that one may still be going
     // out in xisto, and memory still holds about two parts, not the whole input)
-    if (inPlace && start > 0 && (start >= buf.length >> 1 || have === buf.length)) {
+    if (inPlace && start > 0 && !file && (start >= buf.length >> 1 || have === buf.length)) {
       const left = have - start;
       buf.set(buf.subarray(start, have), 0); // (in xisto, after a lent write has gone past these bytes)
       have = left;

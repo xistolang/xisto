@@ -105,8 +105,8 @@ static void try_loop(Module *m, const char *where, Stmt *s) {
     /* writeStdout(part) as the last statement of the body: the program changes none of the part's bytes after the
        call (it does not outlive the iteration, and the iteration ends there), so the write may go out straight
        from the part (writeStdoutLent: the reader waits before it overwrites them) */
-    Stmt *last = s->body;
-    while (last && last->kind == S_BLOCK && last->stmts.len > 0) last = last->stmts.items[last->stmts.len - 1];
+    Stmt *last = s->body, *holder = NULL;
+    while (last && last->kind == S_BLOCK && last->stmts.len > 0) { holder = last; last = last->stmts.items[last->stmts.len - 1]; }
     Expr *w = last && last->kind == S_EXPR ? last->expr : NULL;
     const char *nolent = getenv("XISTO_NO_LENT_WRITE");
     if ((nolent && *nolent && strcmp(nolent, "0") != 0) || !w || w->kind != E_CALL || !is_ident(w->lhs, "writeStdout") || w->args.len != 1 ||
@@ -125,6 +125,42 @@ static void try_loop(Module *m, const char *where, Stmt *s) {
     }
     w->lhs->str = "writeStdoutLent";
     if (getenv("XISTO_INPLACE_WHY")) fprintf(stderr, "inplace: %s writes '%s' with no copy\n", where, s->name);
+    /* `reverse(part, ...)` (xisto:bytes) just before: the part is lent before it (writeStdoutLentBegin), so the reverse
+       over several threads hands the front of the output to the write as its outer pairs are done; nothing is
+       written before it is final, so the bytes that go out are those of the write after the reverse */
+    const char *noearly = getenv("XISTO_NO_LENT_EARLY");
+    if ((noearly && *noearly && strcmp(noearly, "0") != 0) || !holder || holder->stmts.len < 2) return;
+    Stmt *prev = holder->stmts.items[holder->stmts.len - 2];
+    Expr *r = prev && prev->kind == S_EXPR ? prev->expr : NULL;
+    if (!r || r->kind != E_CALL || !is_ident(r->lhs, "reverse") || r->args.len < 1 || !is_ident(r->args.items[0], s->name) ||
+        !imported(m, "reverse", "xisto:bytes"))
+        return;
+    has = false;
+    for (int k = 0; k < io->n; k++) if (strcmp(io->names[k], "writeStdoutLentBegin") == 0) has = true;
+    if (!has) {
+        io->names = realloc(io->names, (size_t)(io->n + 1) * sizeof *io->names);
+        io->positions = realloc(io->positions, (size_t)(io->n + 1) * sizeof *io->positions);
+        io->names[io->n] = "writeStdoutLentBegin";
+        io->positions[io->n] = io->pos;
+        io->n++;
+    }
+    Expr *arg = xs_alloc(sizeof *arg);
+    *arg = *w->args.items[0];
+    Expr *callee = xs_alloc(sizeof *callee);
+    *callee = *w->lhs;
+    callee->str = "writeStdoutLentBegin";
+    Expr *bcall = xs_alloc(sizeof *bcall);
+    *bcall = *w;
+    bcall->lhs = callee;
+    bcall->args = (ExprList){0};
+    expr_list_push(&bcall->args, arg);
+    Stmt *begin = xs_alloc(sizeof *begin);
+    *begin = *prev;
+    begin->expr = bcall;
+    stmt_list_push(&holder->stmts, NULL); /* (room) */
+    for (int k = holder->stmts.len - 1; k > holder->stmts.len - 3; k--) holder->stmts.items[k] = holder->stmts.items[k - 1];
+    holder->stmts.items[holder->stmts.len - 3] = begin;
+    if (getenv("XISTO_INPLACE_WHY")) fprintf(stderr, "inplace: %s lends '%s' before its reverse\n", where, s->name);
 }
 
 static void walk(Module *m, const char *where, Stmt *s) {
