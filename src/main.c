@@ -299,6 +299,7 @@ static Buf compile_to_c(const char *path) {
     double t0 = now_ms();
     Program *p = parse_program(path);
     last_program = p;
+    if (!use_qbe) columns_program(p); /* (the qbe backend takes no typed-array parameter yet) */
     double t1 = now_ms();
     check_program(p);
     double t2 = now_ms();
