@@ -3405,6 +3405,38 @@ static void xs_sb_str(xs_sb *b, xs_str *s) {
     }
     xs_sb_put(b, "\"", 1);
 }
+/* a parsed JSON value written back as text: an `object` element of an array or a field read from JSON keeps
+   its value as JSON text (xisto's `object`); strings re-escaped, numbers as JavaScript writes them */
+static void xs_json_text_into(xs_sb *b, const xs_jv *v) {
+    switch (v->kind) {
+    case XJ_NULL: xs_sb_put(b, "null", 4); break;
+    case XJ_BOOL: if (v->b) xs_sb_put(b, "true", 4); else xs_sb_put(b, "false", 5); break;
+    case XJ_NUM: xs_sb_num(b, v->num); break;
+    case XJ_STR: { xs_str *t = xs_str_new(v->str, v->slen); xs_sb_str(b, t); xs_release(t); break; }
+    case XJ_ARR:
+        xs_sb_put(b, "[", 1);
+        for (size_t k = 0; k < v->n; k++) { if (k) xs_sb_put(b, ",", 1); xs_json_text_into(b, v->items[k]); }
+        xs_sb_put(b, "]", 1);
+        break;
+    case XJ_OBJ:
+        xs_sb_put(b, "{", 1);
+        for (size_t k = 0; k < v->n; k++) {
+            if (k) xs_sb_put(b, ",", 1);
+            xs_str *key = xs_str_new(v->keys[k], strlen(v->keys[k]));
+            xs_sb_str(b, key);
+            xs_release(key);
+            xs_sb_put(b, ":", 1);
+            xs_json_text_into(b, v->items[k]);
+        }
+        xs_sb_put(b, "}", 1);
+        break;
+    }
+}
+XS_NOINLINE xs_str *xs_json_text(const xs_jv *v) {
+    xs_sb b = {0};
+    xs_json_text_into(&b, v);
+    return xs_sb_finish(&b);
+}
 static xs_str *xs_sb_finish(xs_sb *b) {
     xs_str *s = xs_str_new(b->data ? b->data : "", b->len);
     free(b->data);
