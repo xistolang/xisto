@@ -2725,6 +2725,8 @@ XS_AI int64_t xs_imod_s(int64_t a, int64_t b, const xs_site *s) {
 }
 XS_AI double xs_idiv_s(int64_t a, int64_t b, const xs_site *s) { (void)s; return (double)a / (double)b; }
 XS_AI int64_t xs_iadd_to_s(int64_t *p, int64_t b, const xs_site *s) { return *p = xs_iadd_s(*p, b, s); }
+/* a loop counter whose range test waits for the loop's end (emit.c, dctr): it only rises, one by one */
+XS_AI void xs_ichk_hi_s(int64_t v, const xs_site *s) { if (__builtin_expect(XS_IOUT_HI(v), 0)) XS_FAIL(XS_IOVF_MSG, s); }
 XS_AI int64_t xs_isub_to_s(int64_t *p, int64_t b, const xs_site *s) { return *p = xs_isub_s(*p, b, s); }
 XS_AI int64_t xs_imul_to_s(int64_t *p, int64_t b, const xs_site *s) { return *p = xs_imul_s(*p, b, s); }
 XS_AI int64_t xs_ipostinc_s(int64_t *p, const xs_site *s) { int64_t old = *p; *p = xs_iadd_s(old, 1, s); return old; }
