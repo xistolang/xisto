@@ -94,6 +94,29 @@ export function writeStdout(bytes: Uint8Array): void {
   process.stdout.write(bytes);
 }
 
+/**
+ * Writes bytes to standard output, as {@link writeStdout}, for a part of {@link readStdinPartsInPlace} that the
+ * program does not change after the call: the compiler calls it in place of {@link writeStdout} there, and a
+ * program has no reason to call it by hand.
+ *
+ * @param bytes - The bytes to write: a part the program will not change again.
+ *
+ * @remarks
+ * Compatibility: in Node, `process.stdout.write`, as {@link writeStdout}. In xisto, a block written behind goes
+ * out straight from the part, with no copy: the parts' reader waits until the write has gone past the bytes it
+ * reads the next part into, so what goes out is what the bytes were at the call. The compiler uses it only for
+ * `writeStdout(part)` as the last statement of a `for (const part of readStdinParts(...))` read in place.
+ *
+ * @example
+ * ```ts
+ * import { readStdinPartsInPlace, writeStdoutLent } from "xisto:io";
+ * for (const record of readStdinPartsInPlace({ splitBefore: ">" })) writeStdoutLent(record);
+ * ```
+ */
+export function writeStdoutLent(bytes: Uint8Array): void {
+  process.stdout.write(bytes);
+}
+
 /** Where {@link readStdinParts} cuts standard input: give exactly one of the two. */
 export interface StdinPartsOptions {
   /** A new part starts at each occurrence of this character: every part but the first begins with it. */
@@ -175,9 +198,12 @@ function* stdinParts(options: StdinPartsOptions, inPlace: boolean): Generator<Ui
   let start = 0; // where the part being read starts
   let scan = 0; // where the search for the next cut goes on
   for (;;) {
-    if (inPlace && start > 0) { // the parts before start are done with: what is left of the last read moves to the front
+    // the parts before start are done with: what is left of the last read moves to the front, once they take half
+    // the array or it is full (so the next part is mostly read past the last one, while that one may still be going
+    // out in xisto, and memory still holds about two parts, not the whole input)
+    if (inPlace && start > 0 && (start >= buf.length >> 1 || have === buf.length)) {
       const left = have - start;
-      for (let k = 0; k < left; k++) buf[k] = buf[start + k];
+      buf.set(buf.subarray(start, have), 0); // (in xisto, after a lent write has gone past these bytes)
       have = left;
       scan -= start;
       start = 0;

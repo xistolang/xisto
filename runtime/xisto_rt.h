@@ -4529,6 +4529,19 @@ static struct {
     int state;               /* 0: not decided, 1: on, -1: off */
 } xs_aw = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, 0, 0, 0, 0};
 static volatile size_t xs_aw_pending; /* (read without the lock: only a hint that xs_out_drain has work) */
+/* a lent write (writeStdoutLent): the bytes of a part read in place, written by the thread straight from the part,
+   with no copy into the ring. The compiler lends a part only where the program writes none of its bytes after the
+   call (src/inplace.c: the last statement of the loop); the only other writer of those bytes is the parts' reader,
+   through Uint8Array.set and readSync, and both wait (xs_lent_wait) until the thread has written past what they
+   overwrite. So what goes out is what the bytes were at the call, as Node's synchronous write. The part is
+   retained while lent and released by the program's thread (refcounts are not atomic). */
+static struct {
+    xs_Uint8Array *b;   /* the part, retained */
+    const uint8_t *p;
+    size_t n, done;     /* done: written so far (under xs_aw.mu) */
+    int active;         /* being written */
+    xs_Uint8Array *spent; /* written, still to release (by the program's thread) */
+} xs_lent;
 #define XS_AW_CAP ((size_t)64 << 20) /* (a ring that holds a big part whole frees the program to read the next while the last is written: 32 MB 0,150 s, 64 MB 0,133 s on 250 MB, -5 0,126) */
 #define XS_AW_STEP ((size_t)1 << 20) /* each copy and each write: the ring frees and fills a step at a time, so neither side waits for a whole ring */
 static void *xs_aw_main(void *arg) {
@@ -4536,7 +4549,27 @@ static void *xs_aw_main(void *arg) {
     int fd = fileno(stdout);
     for (;;) {
         pthread_mutex_lock(&xs_aw.mu);
-        while (xs_aw.used == 0) pthread_cond_wait(&xs_aw.more, &xs_aw.mu);
+        while (xs_aw.used == 0 && !xs_lent.active) pthread_cond_wait(&xs_aw.more, &xs_aw.mu);
+        if (xs_lent.active) { /* (the ring is empty while a lent write goes out: xs_stdout_write_lent waits for it) */
+            size_t k = xs_lent.n - xs_lent.done < XS_AW_STEP ? xs_lent.n - xs_lent.done : XS_AW_STEP;
+            const uint8_t *lq = xs_lent.p + xs_lent.done;
+            pthread_mutex_unlock(&xs_aw.mu);
+            size_t lleft = k;
+            while (lleft > 0) {
+                ssize_t w = write(fd, lq, lleft);
+                if (w < 0 && errno == EINTR) continue;
+                if (w <= 0) break;
+                lq += w;
+                lleft -= (size_t)w;
+            }
+            pthread_mutex_lock(&xs_aw.mu);
+            xs_lent.done += k;
+            if (xs_lent.done >= xs_lent.n) { xs_lent.active = 0; xs_lent.spent = xs_lent.b; xs_lent.b = NULL; }
+            xs_aw_pending = xs_aw.used + (xs_lent.active ? xs_lent.n - xs_lent.done : 0);
+            pthread_cond_broadcast(&xs_aw.less);
+            pthread_mutex_unlock(&xs_aw.mu);
+            continue;
+        }
         size_t span = xs_aw.used < XS_AW_CAP - xs_aw.head ? xs_aw.used : XS_AW_CAP - xs_aw.head;
         if (span > XS_AW_STEP) span = XS_AW_STEP;
         const char *q = xs_aw.buf + xs_aw.head;
@@ -4558,12 +4591,24 @@ static void *xs_aw_main(void *arg) {
     }
     return NULL;
 }
+static void xs_lent_release(void) { /* (the program's thread, under xs_aw.mu) */
+    if (xs_lent.spent) { xs_release(xs_lent.spent); xs_lent.spent = NULL; }
+}
 static void xs_out_drain_slow(void) {
     pthread_mutex_lock(&xs_aw.mu);
-    while (xs_aw.used > 0) pthread_cond_wait(&xs_aw.less, &xs_aw.mu);
+    while (xs_aw.used > 0 || xs_lent.active) pthread_cond_wait(&xs_aw.less, &xs_aw.mu);
+    xs_lent_release();
     pthread_mutex_unlock(&xs_aw.mu);
 }
-static inline void xs_out_drain(void) { if (xs_aw_pending) xs_out_drain_slow(); }
+/* before the bytes [p, p + n) are overwritten: wait until a lent write has gone past them */
+static void xs_lent_wait(const uint8_t *p, size_t n) {
+    if (!xs_lent.active && !xs_lent.spent) return; /* (a hint read without the lock: set only by this thread, cleared by the writer) */
+    pthread_mutex_lock(&xs_aw.mu);
+    while (xs_lent.active && p < xs_lent.p + xs_lent.n && xs_lent.p + xs_lent.done < p + n) pthread_cond_wait(&xs_aw.less, &xs_aw.mu);
+    xs_lent_release();
+    pthread_mutex_unlock(&xs_aw.mu);
+}
+static inline void xs_out_drain(void) { if (xs_aw_pending || xs_lent.spent) xs_out_drain_slow(); }
 static void xs_aw_atexit(void) { xs_out_drain(); }
 static bool xs_aw_on(void) {
     if (xs_aw.state == 0) {
@@ -4587,6 +4632,12 @@ static bool xs_aw_on(void) {
 }
 static void xs_aw_put(const uint8_t *p, size_t n) {
     fflush(stdout); /* what stdio holds came before */
+    if (xs_lent.active || xs_lent.spent) { /* a lent write goes first */
+        pthread_mutex_lock(&xs_aw.mu);
+        while (xs_lent.active) pthread_cond_wait(&xs_aw.less, &xs_aw.mu);
+        xs_lent_release();
+        pthread_mutex_unlock(&xs_aw.mu);
+    }
     while (n > 0) {
         pthread_mutex_lock(&xs_aw.mu);
         while (xs_aw.used == XS_AW_CAP) pthread_cond_wait(&xs_aw.less, &xs_aw.mu);
@@ -4614,9 +4665,33 @@ static bool xs_stdout_write_bytes(xs_Uint8Array *b) {
     xs_write_big(XS_OUT, b->data, n);
     return true;
 }
+/* writeStdoutLent (xisto:io; only the compiler calls it, src/inplace.c): as xs_stdout_write_bytes, but a block
+   written behind goes out straight from the part instead of a copy in the ring (see xs_lent).
+   XISTO_NO_LENT_WRITE=1: the copy, as writeStdout. */
+static bool xs_stdout_write_lent(xs_Uint8Array *b) {
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("XISTO_NO_LENT_WRITE"); off = e && *e && strcmp(e, "0") != 0; }
+    size_t n = (size_t)b->f_length;
+    if (off || !(n >= ((size_t)1 << 20) && (xs_stdin_reading || xs_aw_pending) && !xs_out_f && xs_aw_on())) return xs_stdout_write_bytes(b);
+    fflush(stdout);
+    pthread_mutex_lock(&xs_aw.mu);
+    while (xs_aw.used > 0 || xs_lent.active) pthread_cond_wait(&xs_aw.less, &xs_aw.mu); /* (in order: what went before goes first) */
+    xs_lent_release();
+    xs_lent.b = xs_retain(b);
+    xs_lent.p = b->data;
+    xs_lent.n = n;
+    xs_lent.done = 0;
+    xs_lent.active = 1;
+    xs_aw_pending = n;
+    pthread_cond_signal(&xs_aw.more);
+    pthread_mutex_unlock(&xs_aw.mu);
+    return true;
+}
 #else
 static inline void xs_out_drain(void) {}
+static inline void xs_lent_wait(const uint8_t *p, size_t n) { (void)p; (void)n; }
 static bool xs_stdout_write_bytes(xs_Uint8Array *b) { xs_write_big(XS_OUT, b->data, (size_t)b->f_length); return true; }
+static bool xs_stdout_write_lent(xs_Uint8Array *b) { return xs_stdout_write_bytes(b); }
 #endif
 static bool xs_stderr_write_bytes(xs_Uint8Array *b) { xs_out_drain(); xs_write_big(stderr, b->data, (size_t)b->f_length); return true; }
 static uint32_t xs_utf8_cp(const unsigned char *s, size_t n, size_t *len) { /* one code point (U+FFFD for a bad byte) */
@@ -5301,6 +5376,7 @@ XS_NOINLINE xs_Uint8Array *xs_u8_subarray(xs_Uint8Array *b, int64_t start, int64
 }
 XS_NOINLINE void xs_u8_set_from(xs_Uint8Array *dst, xs_Uint8Array *src, int64_t off) {
     if (off < 0 || off + src->f_length > dst->f_length) xs_panic("RangeError: offset is out of bounds");
+    xs_lent_wait(dst->data + off, (size_t)src->f_length);
     memmove(dst->data + off, src->data, (size_t)src->f_length);
 }
 XS_NOINLINE void xs_u8_set_ints(xs_Uint8Array *dst, xs_arr_int *src, int64_t off) {
@@ -6148,6 +6224,7 @@ XS_NOINLINE int64_t xs_fs_read_sync(int64_t fd, xs_Uint8Array *b, int64_t off, i
     if (len > b->f_length - off) { snprintf(m_, sizeof m_, "RangeError: The value of \"length\" is out of range. It must be >= 0 && <= %lld. Received %lld", (long long)(b->f_length - off), (long long)len); xs_panic(m_); }
     if (len == 0) return 0;
     if (fd == 0) xs_stdin_binary();
+    xs_lent_wait(b->data + off, (size_t)len);
     ssize_t r;
 #ifdef _WIN32
     if (pos >= 0) { off_t cur = lseek((int)fd, 0, SEEK_CUR); lseek((int)fd, (off_t)pos, SEEK_SET); r = read((int)fd, b->data + off, (size_t)len); lseek((int)fd, cur, SEEK_SET); }
@@ -7381,6 +7458,7 @@ static xs_arr_ref *xs_arr_ref_rlit(xs_region *r, void (*print_elem)(void *), int
 }
 
 static void xs_exit(void) {
+    xs_out_drain(); /* (a lent part is released before the count below) */
     xs_before_exit();
     if (xs_rc_counting()) { xs_ar_drain(0); for (xs_region *r = xs_regions; r; r = r->next) xs_region_reset(r); xs_gc_collect(); }
     fflush(stdout);

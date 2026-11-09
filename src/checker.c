@@ -3321,6 +3321,9 @@ static void check_expr(Expr *e, Type *expected) {
             e->lhs = NULL;
             e->is_call = false;
             e->builtin.cfn = t->kind == TY_STRING ? (err ? "xs_stderr_write_str" : "xs_stdout_write_str") : (err ? "xs_stderr_write_bytes" : "xs_stdout_write_bytes");
+            if (!err && t->kind != TY_STRING && cur_func && cur_func->mod && cur_func->mod->file && strcmp(cur_func->mod->file, "xisto:io") == 0 && cur_func->name &&
+                strcmp(cur_func->name, "writeStdoutLent") == 0)
+                e->builtin.cfn = "xs_stdout_write_lent"; /* (xisto:io's writeStdoutLent: the part, with no copy) */
             e->type = ty_boolean;
             return;
         }
