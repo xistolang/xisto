@@ -185,6 +185,9 @@ if sh tests/pkg/run.sh > "$OUT/pkg.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg.txt
 # redis package against a live server (skipped without one)
 if sh tests/redis/run.sh > "$OUT/redis.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/redis.txt"; else echo "FAIL redis:"; cat "$OUT/redis.txt"; fail=$((fail+1)); fi
 
+# oracledb package against a live database (skipped without XISTO_ORACLE_URL)
+if sh tests/oracledb/run.sh > "$OUT/oracledb.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/oracledb.txt"; else echo "FAIL oracledb:"; cat "$OUT/oracledb.txt"; fail=$((fail+1)); fi
+
 # debugger: CLI transcripts and the agent driven over DAP (docs/debugger.md)
 if sh tests/debug/run.sh > "$OUT/debug.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL debugger:"; cat "$OUT/debug.txt"; fail=$((fail+1)); fi
 
