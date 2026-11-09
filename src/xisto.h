@@ -105,6 +105,8 @@ typedef enum {
        parser, so `Array<Array<int>>` still closes two type argument lists */
     TK_AMP, TK_CARET, TK_TILDE, TK_SHL, TK_SHR, TK_USHR, TK_STARSTAR,
     TK_AMP_ASSIGN, TK_PIPE_ASSIGN, TK_CARET_ASSIGN, TK_SHL_ASSIGN, TK_SHR_ASSIGN, TK_USHR_ASSIGN,
+    /* null: a ?? b, a ??= b, a?.b (xisto's only empty value is null; see MANIFESTO, "null, não undefined") */
+    TK_QQ, TK_QQ_ASSIGN, TK_QDOT,
 } TokKind;
 
 typedef struct {
@@ -182,6 +184,8 @@ typedef struct Type {
     struct Type **targs;  /* Name<A, B> before resolution: the type arguments of a generic interface */
     int ntargs;
     struct Type *elem;    /* TY_ARRAY, TY_SET, TY_STREAM: element; TY_NULLABLE: the non-null type; TY_MAP: value */
+    bool absent;          /* TY_NULLABLE of an optional field or parameter (x?: T): its null is JavaScript's undefined, so it
+                             prints as undefined (JSON leaves the field out); the same type as T | null otherwise */
     struct Type *key;     /* TY_MAP */
     Class *cls;           /* TY_OBJECT */
     Enum *en;             /* TY_ENUM */
@@ -193,6 +197,7 @@ typedef struct Type {
 
 extern Type *ty_number, *ty_int, *ty_litint, *ty_boolean, *ty_string, *ty_void, *ty_null, *ty_json, *ty_unknown;
 Type *ty_nullable_of(Type *inner);
+Type *ty_optional_of(Type *inner); /* x?: T */
 static inline bool tk_bitop(int k) { return k == TK_AMP || k == TK_PIPE || k == TK_CARET || k == TK_SHL || k == TK_SHR || k == TK_USHR; }
 static inline int tk_bitop_of_assign(int k) { /* &= -> & ...; 0 when not a bitwise compound assignment */
     return k == TK_AMP_ASSIGN ? TK_AMP : k == TK_PIPE_ASSIGN ? TK_PIPE : k == TK_CARET_ASSIGN ? TK_CARET : k == TK_SHL_ASSIGN ? TK_SHL : k == TK_SHR_ASSIGN ? TK_SHR : k == TK_USHR_ASSIGN ? TK_USHR : 0;
@@ -287,6 +292,7 @@ struct Expr {
     int region;        /* E_ARRAY_LIT of region objects made inside that region's loop (region.c): lives in the region */
     bool par_native;   /* E_CALL of xisto:parallel whose fn was proved independent (parallel.c): the pool version */
     bool rng_set;      /* E_IDENT: a range the pass that built it proved (distribute.c's pair slot counter) */
+    bool loose;        /* E_BINARY: written == or != (the same as === / !== when no coercion could happen) */
     long long rng_lo, rng_hi;
 };
 
