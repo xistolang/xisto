@@ -1,0 +1,27 @@
+make rc 0 errors 0
+tests: 291 passed, 0 failed (30 programs also verified through the qbe backend)
+steal before 4923852
+# Linux x86_64, 2 cpu; median of 5
+nbody          xisto  nbody                   2.456s     2.45cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-2                 7.380s     7.38cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-3                 4.969s     4.97cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-4                 3.631s     3.63cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-5                 2.586s     2.58cpu      2.0MB  par  1.0  same
+fannkuchredux  xisto  fannkuchredux           9.017s    17.87cpu      2.0MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-2        11.742s    23.15cpu      2.3MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-3        11.218s    22.31cpu      2.3MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-4         7.620s    15.13cpu      2.3MB  par  2.0  same
+knucleotide    xisto  knucleotide             1.700s     3.10cpu    363.8MB  par  1.8  same
+knucleotide    xisto  knucleotide-2           4.206s     7.18cpu    367.7MB  par  1.7  same
+knucleotide    xisto  knucleotide-3           3.592s     6.79cpu    363.8MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           2.533s     4.48cpu    156.7MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           2.067s     3.98cpu    156.6MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           1.321s     2.47cpu    156.6MB  par  1.9  same
+revcomp        xisto  revcomp                 1.028s     0.41cpu    188.4MB  par  0.4  same
+revcomp        xisto  revcomp-2               1.199s     0.31cpu    244.2MB  par  0.3  same
+revcomp        xisto  revcomp-3               1.230s     0.41cpu    486.8MB  par  0.3  same
+revcomp        xisto  revcomp-4               1.086s     0.24cpu    244.6MB  par  0.2  same
+revcomp        xisto  revcomp-5               1.057s     0.32cpu    308.8MB  par  0.3  same
+revcomp        xisto  revcomp-6               0.978s     0.30cpu    188.8MB  par  0.3  same
+revcomp        xisto  revcomp-7               1.062s     0.31cpu    189.5MB  par  0.3  same
+steal after 4923979
