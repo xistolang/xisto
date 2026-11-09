@@ -553,6 +553,8 @@ typedef struct { int kind; Expr *a, *src, *lo, *hi, *ca, *cb; Stmt *loop; } U8Id
 static bool match_u8_idiom(Stmt *s, U8Idiom *m);
 static bool u8_is_index_on(Expr *e, const char *c);
 static bool lane_loop(Stmt *s); /* (XB-085) */
+static bool ctr_inc_free(Expr *e); /* (XB-089) */
+static bool bce_writes(Stmt *s, const char *n);
 static bool same_simple(Expr *a, Expr *b);
 static bool bce_pure(Expr *e);
 static bool stmt_mentions_name(Stmt *s, const char *c);
@@ -2973,6 +2975,12 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, "++)");
             return;
         }
+        if (e->type->kind == TY_INT && ctr_inc_free(e)) { /* a counter the loop's bound covers (ctr_scan) */
+            buf_puts(out, "((*");
+            emit_lvalue_ptr(e->lhs);
+            buf_puts(out, ")++)");
+            return;
+        }
         if (e->type->kind == TY_INT) {
             buf_puts(out, e->op == TK_PLUSPLUS ? "xs_ipostinc_s(" : "xs_ipostdec_s(");
             emit_lvalue_ptr(e->lhs);
@@ -4245,6 +4253,32 @@ static int64_t bce_fixed_n(const char *c) {
     BceGArr *g = garr_find(c);
     return g ? g->n : 0;
 }
+/* A local `const X: int[] = new Array<int>(N).fill(v)` (or number[]), N a literal or a top-level const int, that
+   its function only indexes (`X[i]`, `X[i] = v`, `X[i]++`, `X.length`; never passed, stored, aliased, iterated,
+   pushed or resized): its length stays N, so `X[i]` needs no check when i's range is within it (bce_safe).
+   collections.ts: `tally[key]++` with `key = (...) & mask`, mask below the table's 65536 entries. */
+static bool garr_stmt(Stmt *s, const char *c, bool elem_w);
+static void bce_fix_arr_scan(Stmt *s, Stmt **all, int n) {
+    if (!s || nbce_fix_l >= 32) return;
+    if (s->kind == S_VAR && s->is_const && s->cname && !s->cell && s->init && s->type && s->type->kind == TY_ARRAY &&
+        s->type->elem && (s->type->elem->kind == TY_INT || s->type->elem->kind == TY_NUMBER) && !getenv("XISTO_NO_ARR_FIX")) {
+        Expr *e = s->init;
+        if (e->kind == E_MEMBER && e->is_call && e->str && strcmp(e->str, "fill") == 0 && e->args.len == 1 && e->lhs && e->lhs->kind == E_NEW_ARRAY && e->lhs->lhs) {
+            Expr *len = e->lhs->lhs;
+            int64_t v = 0;
+            if (len->kind == E_NUMBER && len->is_int_lit) v = len->ival;
+            else if (len->kind == E_IDENT && len->cname && !cig_find(len->cname, &v)) v = 0;
+            bool only = v > 0;
+            for (int i = 0; i < n && only; i++) only = garr_stmt(all[i], s->cname, true);
+            if (only) bce_fix_l[nbce_fix_l++] = (BceFix){s->cname, v};
+        }
+    }
+    bce_fix_arr_scan(s->for_init, all, n);
+    bce_fix_arr_scan(s->body, all, n);
+    bce_fix_arr_scan(s->else_body, all, n);
+    for (int i = 0; i < s->stmts.len; i++) bce_fix_arr_scan(s->stmts.items[i], all, n);
+    for (int i = 0; i < s->ncases; i++) bce_fix_arr_scan(s->cases[i].body, all, n);
+}
 /* e is never negative, given the variables rv_nn marks: literals, bytes, ranges at or above 0, and + * % of such
    values (int + and * either trap on overflow or are proven not to overflow, so they never wrap below zero) */
 static bool nn_expr(Expr *e) {
@@ -4420,13 +4454,191 @@ static void nzv_compute(Func *owner, Stmt **stmts, int n) {
 }
 /* top-level code (main): only its own locals; a top-level variable functions also use is not one of them */
 static bool rv_main_only(const char *c);
+/* Counters in a local int[] (XB-089): `const X = new Array<int>(N).fill(K)` (K a literal >= 0) and, later in the
+   same block, the one counted loop `for (let j = A; j < B; j++)` that writes it, only by statements `X[e]++` at its
+   own level (c of them, none in a nested loop); everywhere else X is only read. Every element is then at most
+   K + c * (B - A) when the loop ends, so the increments add without the range test, and one test after the loop
+   (on that bound: the elements are scanned only when it passes 2^53 - 1) raises the error at the first one's site.
+   As the Map counters' deferred test (loop_hoist_enter): no try in the program, X a local, no return in the loop. */
+typedef struct { Stmt *loop; const char *x; int64_t k; int c; Expr *first; bool armed; } CtrLoop;
+static CtrLoop ctr_loops[8];
+static int nctr_loops;
+static Expr *ctr_inc_e[32];
+static int ctr_inc_l[32], nctr_inc;
+static bool ctr_expr_mentions(Expr *e, const char *x);
+static bool ctr_stmt_mentions(Stmt *s, const char *x) {
+    if (!s) return false;
+    if ((s->kind == S_VAR && s->cname && strcmp(s->cname, x) == 0) || ctr_expr_mentions(s->init, x) || ctr_expr_mentions(s->expr, x) ||
+        ctr_expr_mentions(s->cond, x) || ctr_expr_mentions(s->for_update, x)) return true;
+    if (ctr_stmt_mentions(s->for_init, x) || ctr_stmt_mentions(s->body, x) || ctr_stmt_mentions(s->else_body, x)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (ctr_stmt_mentions(s->stmts.items[i], x)) return true;
+    for (int i = 0; i < s->ncases; i++) if (ctr_expr_mentions(s->cases[i].value, x) || ctr_stmt_mentions(s->cases[i].body, x)) return true;
+    return false;
+}
+static bool ctr_expr_mentions(Expr *e, const char *x) {
+    if (!e) return false;
+    if (e->kind == E_IDENT && e->cname && strcmp(e->cname, x) == 0) return true;
+    if (e->kind == E_ARROW && e->arrow) { /* a closure that captures it */
+        for (int i = 0; i < e->arrow->ncaptures; i++) if (e->arrow->captures[i].outer_cname && strcmp(e->arrow->captures[i].outer_cname, x) == 0) return true;
+        if (e->arrow->fn && ctr_stmt_mentions(e->arrow->fn->body, x)) return true;
+    }
+    if (ctr_expr_mentions(e->lhs, x) || ctr_expr_mentions(e->rhs, x)) return true;
+    for (int i = 0; i < e->args.len; i++) if (ctr_expr_mentions(e->args.items[i], x)) return true;
+    return false;
+}
+/* `X[e]++` as a statement, e not mentioning X */
+static bool ctr_is_inc(Stmt *s, const char *x) {
+    if (!s || s->kind != S_EXPR || !s->expr) return false;
+    Expr *e = s->expr;
+    if (e->kind != E_POSTFIX || e->op != TK_PLUSPLUS || !e->type || e->type->kind != TY_INT) return false;
+    Expr *ix = e->lhs;
+    return ix && ix->kind == E_INDEX && !ix->builtin.cfn && ix->lhs && ix->lhs->kind == E_IDENT && ix->lhs->cname &&
+           strcmp(ix->lhs->cname, x) == 0 && !ctr_expr_mentions(ix->rhs, x);
+}
+/* some `X[e]++` statement in s */
+static bool ctr_has_inc(Stmt *s, const char *x) {
+    if (!s) return false;
+    if (ctr_is_inc(s, x)) return true;
+    if (ctr_has_inc(s->for_init, x) || ctr_has_inc(s->body, x) || ctr_has_inc(s->else_body, x)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (ctr_has_inc(s->stmts.items[i], x)) return true;
+    for (int i = 0; i < s->ncases; i++) if (ctr_has_inc(s->cases[i].body, x)) return true;
+    return false;
+}
+/* the loop's body: X only in `X[e]++` statements, none inside a nested loop; counts them, notes them */
+static bool ctr_body_ok(Stmt *s, const char *x, int *c, Expr **incs, int *ni, bool nested) {
+    if (!s) return true;
+    if (ctr_is_inc(s, x)) {
+        if (nested || *ni >= 8) return false;
+        incs[(*ni)++] = s->expr;
+        (*c)++;
+        return true;
+    }
+    if (s->kind == S_EXPR || s->kind == S_RETURN || s->kind == S_THROW || s->kind == S_YIELD) return !ctr_expr_mentions(s->expr, x);
+    if (s->kind == S_VAR) return !ctr_expr_mentions(s->init, x);
+    if (ctr_expr_mentions(s->cond, x) || ctr_expr_mentions(s->for_update, x) || ctr_expr_mentions(s->expr, x)) return false;
+    bool loop = s->kind == S_FOR || s->kind == S_WHILE || s->kind == S_FOROF;
+    if (loop && ctr_stmt_mentions(s, x)) return false;
+    if (!ctr_body_ok(s->for_init, x, c, incs, ni, nested) || !ctr_body_ok(s->body, x, c, incs, ni, nested) || !ctr_body_ok(s->else_body, x, c, incs, ni, nested)) return false;
+    for (int i = 0; i < s->stmts.len; i++) if (!ctr_body_ok(s->stmts.items[i], x, c, incs, ni, nested)) return false;
+    for (int i = 0; i < s->ncases; i++) if (ctr_expr_mentions(s->cases[i].value, x) || !ctr_body_ok(s->cases[i].body, x, c, incs, ni, nested)) return false;
+    return true;
+}
+/* outside the loop: X only read (garr_expr with no element writes), the loop itself skipped */
+static bool garr_expr(Expr *e, Expr *parent, bool target, const char *c, bool elem_w);
+static bool ctr_reads_only(Stmt *s, const char *x, Stmt *skip) {
+    if (!s || s == skip) return true;
+    if (!garr_expr(s->init, NULL, false, x, false) || !garr_expr(s->expr, NULL, false, x, false) || !garr_expr(s->cond, NULL, false, x, false) ||
+        !garr_expr(s->for_update, NULL, false, x, false)) return false;
+    if (!ctr_reads_only(s->for_init, x, skip) || !ctr_reads_only(s->body, x, skip) || !ctr_reads_only(s->else_body, x, skip)) return false;
+    for (int i = 0; i < s->stmts.len; i++) if (!ctr_reads_only(s->stmts.items[i], x, skip)) return false;
+    for (int i = 0; i < s->ncases; i++) if (!garr_expr(s->cases[i].value, NULL, false, x, false) || !ctr_reads_only(s->cases[i].body, x, skip)) return false;
+    return true;
+}
+static bool bce_pure(Expr *e);
+static bool stmt_has_return(Stmt *s);
+/* a counted loop for (let j = A; j < B; j++): A pure and B a name or a number, none of their names written in it */
+static bool ctr_counted(Stmt *f) {
+    if (!f || f->kind != S_FOR || !f->for_init || f->for_init->kind != S_VAR || !f->for_init->cname || !f->for_init->init) return false;
+    const char *j = f->for_init->cname;
+    Expr *u = f->for_update, *c = f->cond;
+    if (!u || u->kind != E_POSTFIX || u->op != TK_PLUSPLUS || !u->lhs || u->lhs->kind != E_IDENT || !u->lhs->cname || strcmp(u->lhs->cname, j) != 0) return false;
+    if (!c || c->kind != E_BINARY || c->op != TK_LT || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, j) != 0) return false;
+    Expr *b = c->rhs, *a = f->for_init->init;
+    if (!b || !b->type || b->type->kind != TY_INT || !a->type || a->type->kind != TY_INT || !bce_pure(a)) return false;
+    if (b->kind == E_IDENT) { if (!b->cname || bce_writes(f->body, b->cname)) return false; }
+    else if (b->kind != E_NUMBER) return false;
+    if (bce_writes(f->body, j)) return false;
+    /* A's names: not written in the loop */
+    Expr *st[16]; int ns = 0; st[ns++] = a;
+    while (ns) {
+        Expr *e = st[--ns];
+        if (!e) continue;
+        if (e->kind == E_IDENT && e->cname && bce_writes(f->body, e->cname)) return false;
+        if (ns + 2 < 16) { st[ns++] = e->lhs; st[ns++] = e->rhs; } else return false;
+    }
+    return true;
+}
+static void ctr_scan(Stmt *s, Stmt **all, int n) {
+    if (!s) return;
+    for (int i = 0; i < s->stmts.len; i++) {
+        Stmt *d = s->stmts.items[i];
+        if (nctr_loops >= 8 || !d || d->kind != S_VAR || !d->is_const || !d->cname || d->cell || d->cname[0] != 'v' || !d->init || !d->type ||
+            d->type->kind != TY_ARRAY || !d->type->elem || d->type->elem->kind != TY_INT) continue;
+        Expr *e = d->init;
+        if (e->kind != E_MEMBER || !e->is_call || !e->str || strcmp(e->str, "fill") != 0 || e->args.len != 1 || !e->lhs || e->lhs->kind != E_NEW_ARRAY) continue;
+        Expr *kv = e->args.items[0];
+        if (kv->kind != E_NUMBER || !kv->is_int_lit || kv->ival < 0) continue;
+        Stmt *loop = NULL; /* the one later sibling that mentions X: a counted loop */
+        bool bad = false;
+        for (int k = i + 1; k < s->stmts.len && !bad; k++) {
+            Stmt *t = s->stmts.items[k];
+            if (ctr_counted(t) && ctr_has_inc(t->body, d->cname)) { if (loop) bad = true; else loop = t; }
+        }
+        if (getenv("XISTO_CTR_WHY")) fprintf(stderr, "ctr %s loop=%d bad=%d\n", d->cname, loop != NULL, bad);
+        if (bad || !loop || stmt_has_return(loop->body)) continue;
+        int c = 0, ni = 0;
+        Expr *incs[8];
+        if (!ctr_body_ok(loop->body, d->cname, &c, incs, &ni, false) || c == 0) { if (getenv("XISTO_CTR_WHY")) fprintf(stderr, "ctr %s body c=%d\n", d->cname, c); continue; }
+        if (ctr_expr_mentions(loop->cond, d->cname) || ctr_expr_mentions(loop->for_update, d->cname) || ctr_stmt_mentions(loop->for_init, d->cname)) continue;
+        bool reads = true;
+        for (int k = 0; k < n && reads; k++) reads = ctr_reads_only(all[k], d->cname, loop);
+        if (!reads) { if (getenv("XISTO_CTR_WHY")) fprintf(stderr, "ctr %s reads\n", d->cname); continue; }
+        int li = nctr_loops++;
+        ctr_loops[li] = (CtrLoop){loop, d->cname, kv->ival, c, incs[0], false};
+        for (int q = 0; q < ni && nctr_inc < 32; q++) { ctr_inc_e[nctr_inc] = incs[q]; ctr_inc_l[nctr_inc++] = li; }
+    }
+    ctr_scan(s->for_init, all, n);
+    ctr_scan(s->body, all, n);
+    ctr_scan(s->else_body, all, n);
+    for (int i = 0; i < s->stmts.len; i++) ctr_scan(s->stmts.items[i], all, n);
+    for (int i = 0; i < s->ncases; i++) ctr_scan(s->cases[i].body, all, n);
+}
+static void ctr_compute(Stmt **stmts, int n) {
+    nctr_loops = nctr_inc = 0;
+    if (xs_debug || sm_mode || prog_try || getenv("XISTO_NO_ARR_COUNTERS")) return;
+    for (int i = 0; i < n; i++) ctr_scan(stmts[i], stmts, n);
+}
+/* an increment the loop's bound covers, while that loop is being emitted */
+static bool ctr_inc_free(Expr *e) {
+    for (int i = 0; i < nctr_inc; i++) if (ctr_inc_e[i] == e) return ctr_loops[ctr_inc_l[i]].armed;
+    return false;
+}
+static int ctr_loop_of(Stmt *s) {
+    for (int i = 0; i < nctr_loops; i++) if (ctr_loops[i].loop == s) return i;
+    return -1;
+}
+/* the range one definition gives its variable k (rv_compute) */
+static Rng rv_def_rng(int d, int k) {
+    Rng x;
+    if (rv_defs[d].loop) { /* i from its start below the bound: [start, bound - 1] */
+        Rng b = rng_of(rv_defs[d].loop->cond->rhs);
+        x = b.ok ? (Rng){true, -RNG_SAFE, b.hi - 1} : rng_none();
+        /* a counter declared by the loop itself is only read inside it, where it is below the bound: its
+           start does not widen the top (j = i + 1 in `for (let j = i + 1; j < N; j++)` stays under N) */
+        Stmt *fi = rv_defs[d].loop->for_init;
+        bool own = fi && fi->kind == S_VAR && fi->cname && strcmp(fi->cname, rv_name[k]) == 0;
+        if (x.ok) { x.lo = INT64_MAX; for (int e = 0; e < rv_ndefs; e++) if (strcmp(rv_defs[e].name, rv_name[k]) == 0 && rv_defs[e].def) { Rng s0 = rng_of(rv_defs[e].def); if (!s0.ok) { x = rng_none(); break; } if (s0.lo < x.lo) x.lo = s0.lo; if (s0.hi > x.hi && !own) x.hi = s0.hi; } }
+        if (x.ok && own) { Rng s0 = rng_of(fi->init); if (!s0.ok) x = rng_none(); else if (s0.lo < x.lo) x.lo = s0.lo; }
+        if (x.ok && x.lo == INT64_MAX) x = rng_none();
+        if (x.ok && x.lo > x.hi) x.lo = x.hi; /* (a loop that never runs: nothing reads it) */
+    } else x = rng_of(rv_defs[d].def);
+    return x;
+}
+/* the definition only copies another tracked variable whose range is not known (yet) */
+static bool rv_copy_pending(Expr *def, int k) {
+    if (!def || def->kind != E_IDENT || !def->cname) return false;
+    int j = rv_find(def->cname);
+    return j >= 0 && j != k && !rv_rng[j].ok;
+}
 static void rv_compute(Func *owner, Stmt **stmts, int n) {
     rv_n = rv_ndefs = 0;
     rv_owner = owner;
     rv_valid = false;
     nbce_fix_l = 0;
     bce_fix_owner = owner;
+    ctr_compute(stmts, n);
     for (int i = 0; i < n; i++) bce_fix_scan(stmts[i]);
+    for (int i = 0; i < n; i++) bce_fix_arr_scan(stmts[i], stmts, n);
     if (owner && owner->fixparam) /* typed-array parameters every call passes with one length (fixparam_compute) */
         for (int i = 0; i < owner->nparams && nbce_fix_l < 32; i++)
             if (owner->fixparam[i] > 0 && owner->params[i].cname) bce_fix_l[nbce_fix_l++] = (BceFix){owner->params[i].cname, owner->fixparam[i]};
@@ -4443,6 +4655,10 @@ static void rv_compute(Func *owner, Stmt **stmts, int n) {
         for (int e = 0; e < rv_ndefs; e++) if (e != d && !rv_defs[e].loop && rv_defs[e].def == fi->init && strcmp(rv_defs[e].name, fi->cname) == 0) rv_defs[e].def = NULL, rv_defs[e].name = "";
     }
     rv_valid = true; /* rng_of reads the table while it is being computed */
+    /* optimistic: a definition that only copies a variable not known yet (`key = start` where `const start = key`)
+       is left out until that variable is known; the ranges found are then checked to be inductive (every definition
+       within its variable's range), and a variable that fails knows nothing, until nothing fails */
+    bool optimistic = !getenv("XISTO_NO_RANGE_CYCLES");
     for (int round = 0; round < 6; round++) {
         bool moved = false;
         for (int k = 0; k < rv_n; k++) {
@@ -4451,19 +4667,8 @@ static void rv_compute(Func *owner, Stmt **stmts, int n) {
             bool first = true, ok = true;
             for (int d = 0; d < rv_ndefs && ok; d++) {
                 if (strcmp(rv_defs[d].name, rv_name[k]) != 0) continue;
-                Rng x;
-                if (rv_defs[d].loop) { /* i from its start below the bound: [start, bound - 1] */
-                    Rng b = rng_of(rv_defs[d].loop->cond->rhs);
-                    x = b.ok ? (Rng){true, -RNG_SAFE, b.hi - 1} : rng_none();
-                    /* a counter declared by the loop itself is only read inside it, where it is below the bound: its
-                       start does not widen the top (j = i + 1 in `for (let j = i + 1; j < N; j++)` stays under N) */
-                    Stmt *fi = rv_defs[d].loop->for_init;
-                    bool own = fi && fi->kind == S_VAR && fi->cname && strcmp(fi->cname, rv_name[k]) == 0;
-                    if (x.ok) { x.lo = INT64_MAX; for (int e = 0; e < rv_ndefs; e++) if (strcmp(rv_defs[e].name, rv_name[k]) == 0 && rv_defs[e].def) { Rng s0 = rng_of(rv_defs[e].def); if (!s0.ok) { x = rng_none(); break; } if (s0.lo < x.lo) x.lo = s0.lo; if (s0.hi > x.hi && !own) x.hi = s0.hi; } }
-                    if (x.ok && own) { Rng s0 = rng_of(fi->init); if (!s0.ok) x = rng_none(); else if (s0.lo < x.lo) x.lo = s0.lo; }
-                    if (x.ok && x.lo == INT64_MAX) x = rng_none();
-                    if (x.ok && x.lo > x.hi) x.lo = x.hi; /* (a loop that never runs: nothing reads it) */
-                } else x = rng_of(rv_defs[d].def);
+                Rng x = rv_def_rng(d, k);
+                if (!x.ok && optimistic && rv_copy_pending(rv_defs[d].def, k)) continue;
                 if (!x.ok) { ok = false; break; }
                 r = first ? x : rng_union(r, x);
                 first = false;
@@ -4474,6 +4679,17 @@ static void rv_compute(Func *owner, Stmt **stmts, int n) {
         }
         if (!moved) break;
         if (round == 5) for (int k = 0; k < rv_n; k++) rv_rng[k] = rng_none(); /* not settled: know nothing */
+    }
+    for (bool failed = optimistic; failed;) { /* inductive: each definition within its variable's range */
+        failed = false;
+        for (int k = 0; k < rv_n; k++) {
+            if (!rv_rng[k].ok) continue;
+            for (int d = 0; d < rv_ndefs; d++) {
+                if (strcmp(rv_defs[d].name, rv_name[k]) != 0) continue;
+                Rng x = rv_def_rng(d, k);
+                if (!x.ok || x.lo < rv_rng[k].lo || x.hi > rv_rng[k].hi) { rv_rng[k] = rng_none(); failed = true; break; }
+            }
+        }
     }
     /* never negative: start from every variable with known definitions and drop the ones a definition can make
        negative, until nothing moves (`key = (key % top) * 4 + seq[j]` from `key = 0`: the key of k-nucleotide). A
@@ -5744,6 +5960,25 @@ static bool u8reg_loop(Stmt *s) {
     buf_puts(out, "}");
     return true;
 }
+/* the loop, its counters' increments unchecked while it is emitted, then the test on their bound (ctr_scan) */
+static void emit_stmt_for_inner(Stmt *s);
+static void ctr_emit_for(Stmt *s) {
+    int li = ctr_loop_of(s);
+    if (li < 0) { emit_stmt_for_inner(s); return; }
+    CtrLoop *cl = &ctr_loops[li];
+    buf_puts(out, "{ ");
+    cl->armed = true;
+    emit_stmt_for_inner(s);
+    cl->armed = false;
+    buf_puts(out, " if (__builtin_expect((int64_t)(");
+    emit_expr(s->cond->rhs);
+    buf_puts(out, ") - (int64_t)(");
+    emit_expr(s->for_init->init);
+    buf_printf(out, ") > (XS_ISAFE_MAX - INT64_C(%lld)) / %d, 0)) xs_arr_int_check_range(%s", (long long)cl->k, cl->c, ren(cl->x));
+    site_arg(cl->first->pos);
+    buf_puts(out, "); }");
+}
+
 static void emit_stmt_for_inner(Stmt *s) { /* a for: bounds checks proved by the loop, or a versioned copy */
     int saved_nbce = nbce;
     bce_enter(s);
@@ -6228,7 +6463,7 @@ static void emit_stmt_(Stmt *s) {
             buf_puts(out, "{ ");
             int nb = 0, nm = loop_hoist_enter(s, &nb);
             if (nm || nb) {
-                emit_stmt_for_inner(s);
+                ctr_emit_for(s);
                 for (int i = nmap_hoist - nm; i < nmap_hoist; i++) /* the deferred range tests (see loop_hoist_enter) */
                     if (map_hoist[i].site) buf_printf(out, " xs_map_check_range(%s, XS_S(%d));", ren(map_hoist[i].m), map_hoist[i].site);
                 nmap_hoist -= nm;
@@ -6239,7 +6474,7 @@ static void emit_stmt_(Stmt *s) {
             out->len = mark; /* nothing to hold: as before */
             if (out->data) out->data[mark] = 0;
         }
-        emit_stmt_for_inner(s);
+        ctr_emit_for(s);
         return;
     }
     case S_YIELD: { /* hand the value over; when the consumer is gone, leave as a return does */

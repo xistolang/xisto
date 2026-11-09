@@ -172,7 +172,7 @@ const POW2_16: int[] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
 const BASE: int[] = [1, 2, 4, 8, 16, 32, 64, 128];
 
 const MIN_PIECE: int = 1 << 16; // fewer characters than this per thread are not worth a thread
-const MAP_PIECES: int = 3; // pieces of a length counted in a Map (each piece's table is merged afterwards)
+const MAP_PIECES: int = 2; // pieces of a length counted in a Map (each piece's table is merged afterwards; M4: 3 pieces cost 0,3 cpu-s more for the same wall time)
 
 // which bytes occur in bytes[lo, hi): 1 at the byte's index; any byte from 128 up sets index 128
 function bytesIn(bytes: Uint8Array, lo: int, hi: int): int[] {
@@ -186,8 +186,8 @@ function bytesIn(bytes: Uint8Array, lo: int, hi: int): int[] {
 }
 
 // the substrings of `length` characters that start at lo..hi-1, each packed into a number (`bits` per
-// character, the first one highest), in the order they first appear: key, count, first start, key, ...
-// (letters: the byte of each character code)
+// character, the first one highest), in the order they first appear: key, count, key, count, ... (letters: the
+// byte of each character code; the key alone gives the substring back, see counterOf)
 function countPiece(bytes: Uint8Array, letters: int[], length: int, bits: int, lo: int, hi: int): int[] {
   const out: int[] = [];
   if (hi <= lo) return out;
@@ -211,13 +211,12 @@ function countPiece(bytes: Uint8Array, letters: int[], length: int, bits: int, l
     for (let k = 0; k <= mask; k++) if (tally[k] > 0) distinct++;
     const seen: int[] = new Array<int>(65536).fill(0);
     key = start;
-    for (let j = lo + length - 1; j < end && out.length < 3 * distinct; j++) {
+    for (let j = lo + length - 1; j < end && out.length < 2 * distinct; j++) {
       key = ((key << bits) | code[bytes[j]]) & mask;
       if (seen[key] === 0) {
         seen[key] = 1;
         out.push(key);
         out.push(tally[key]);
-        out.push(j + 1 - length);
       }
     }
     return out;
@@ -225,45 +224,46 @@ function countPiece(bytes: Uint8Array, letters: int[], length: int, bits: int, l
   const top = POW2[bits * (length - 1)]; // what a key keeps of the substring before it (never past 52 bits)
   let key: int = 0;
   for (let i = lo; i < lo + length - 1; i++) key = key * base + code[bytes[i]];
-  const counts = new Map<int, int>();
-  const first: int[] = []; // where each key first starts, in the order of the map
+  const counts = new Map<int, int>(); // (a Map keeps the order the keys first appear in)
   for (let j = lo + length - 1; j < end; j++) {
     key = (key % top) * base + code[bytes[j]];
     if (counts.has(key)) counts.set(key, counts.get(key)! + 1);
     else counts.set(key, 1);
-    if (counts.size > first.length) first.push(j + 1 - length);
   }
-  let i = 0;
   for (const [k, c] of counts) {
     out.push(k);
     out.push(c);
-    out.push(first[i]);
-    i++;
   }
   return out;
 }
 
-// the counter of one length: the pieces' triples in flat[from, to) added up in their order; each substring
-// taken from the text where it first occurs
-function counterOf(bytes: Uint8Array, flat: int[], from: int, to: int, length: int): Counter<string> {
+// the counter of one length: the pieces' pairs in flat[from, to) added up in their order (each piece's keys in
+// the order they first appear, the pieces in text order: so the order of first appearance in the whole text);
+// each substring made back from its key, `bits` per character, the first one highest
+function counterOf(letters: int[], bits: int, flat: int[], from: int, to: int, length: int): Counter<string> {
   const slot = new Map<int, int>();
+  const keys: int[] = [];
   const counts: int[] = [];
-  const first: int[] = [];
-  for (let i = from; i < to; i += 3) {
+  for (let i = from; i < to; i += 2) {
     const k = flat[i];
     if (slot.has(k)) counts[slot.get(k)!] += flat[i + 1];
     else {
       slot.set(k, counts.length);
+      keys.push(k);
       counts.push(flat[i + 1]);
-      first.push(flat[i + 2]);
     }
   }
   const result = new Counter<string>();
   if (counts.length === 0) return result;
+  const base = BASE[bits];
   const decoder = new TextDecoder();
   const piece = new Uint8Array(length);
   for (let i = 0; i < counts.length; i++) {
-    for (let c = 0; c < length; c++) piece[c] = bytes[first[i] + c];
+    let key = keys[i];
+    for (let c = length - 1; c >= 0; c--) {
+      piece[c] = letters[key % base];
+      key = Math.trunc(key / base);
+    }
     result.add(decoder.decode(piece), counts[i]);
   }
   return result;
@@ -335,7 +335,7 @@ export function countSubstrings(text: string, lengths: int[]): Counter<string>[]
     }
   }
   const parts = parallelFrom(taskOf.length, (t) => countPiece(bytes, letters, lengths[taskOf[t]], bits, taskLo[t], taskHi[t]));
-  // each length's triples together, its pieces in text order (so first occurrences stay in order)
+  // each length's pairs together, its pieces in text order (so first occurrences stay in order)
   let total = 0;
   for (const part of parts) total += part.length;
   const flat: int[] = new Array<int>(total).fill(0);
@@ -352,7 +352,7 @@ export function countSubstrings(text: string, lengths: int[]): Counter<string>[]
     }
     to[li] = at;
   }
-  const counters = parallelFrom(lengths.length, (li) => counterOf(bytes, flat, from[li], to[li], lengths[li]));
+  const counters = parallelFrom(lengths.length, (li) => counterOf(letters, bits, flat, from[li], to[li], lengths[li]));
   // the lengths not packed: counted with strings
   for (let li = 0; li < lengths.length; li++) {
     const length = lengths[li];
