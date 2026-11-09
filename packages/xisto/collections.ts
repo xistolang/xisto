@@ -233,6 +233,66 @@ function bytesIn(bytes: Uint8Array, lo: int, hi: int): int[] {
   return seen;
 }
 
+// countPiece for the lengths of few possible keys (bits * length <= 16): a table indexed by the key, then the keys
+// in the order they first appear (a second pass from the start, until every key counted has been seen: the few keys
+// of a short length all show up early)
+function countTable(codes: Uint8Array, length: int, bits: int, lo: int, hi: int): int[] {
+  const out: int[] = [];
+  const end = hi + length - 1;
+  const mask = POW2_16[bits * length] - 1; // (keys of at most 16 bits: the shifts of JavaScript's 32 bits hold them)
+  let key: int = 0;
+  for (let i = lo; i < lo + length - 1; i++) key = ((key << bits) | codes[i]) & mask;
+  const tally: int[] = new Array<int>(65536).fill(0);
+  const start = key;
+  for (let j = lo + length - 1; j < end; j++) {
+    key = ((key << bits) | codes[j]) & mask;
+    tally[key]++;
+  }
+  let distinct = 0;
+  for (let k = 0; k <= mask; k++) if (tally[k] > 0) distinct++;
+  const seen: int[] = new Array<int>(65536).fill(0);
+  key = start;
+  for (let j = lo + length - 1; j < end && out.length < 2 * distinct; j++) {
+    key = ((key << bits) | codes[j]) & mask;
+    if (seen[key] === 0) {
+      seen[key] = 1;
+      out.push(key);
+      out.push(tally[key]);
+    }
+  }
+  return out;
+}
+
+// countTable for four letters (DNA, two bits a character): the same keys, with key * 4 + code (one lea on x86) in
+// place of a shift by a variable, an or and a sign extension on the key's chain, the loop's critical path (Xeon:
+// 2,8 -> 2,0 cycles a character over the 625 M of the short lengths)
+function countTable4(codes: Uint8Array, length: int, lo: int, hi: int): int[] {
+  const out: int[] = [];
+  const end = hi + length - 1;
+  const mask = POW2_16[2 * length] - 1;
+  let key: int = 0;
+  for (let i = lo; i < lo + length - 1; i++) key = (key * 4 + codes[i]) & mask;
+  const tally: int[] = new Array<int>(65536).fill(0);
+  const start = key;
+  for (let j = lo + length - 1; j < end; j++) {
+    key = (key * 4 + codes[j]) & mask;
+    tally[key]++;
+  }
+  let distinct = 0;
+  for (let k = 0; k <= mask; k++) if (tally[k] > 0) distinct++;
+  const seen: int[] = new Array<int>(65536).fill(0);
+  key = start;
+  for (let j = lo + length - 1; j < end && out.length < 2 * distinct; j++) {
+    key = (key * 4 + codes[j]) & mask;
+    if (seen[key] === 0) {
+      seen[key] = 1;
+      out.push(key);
+      out.push(tally[key]);
+    }
+  }
+  return out;
+}
+
 // the substrings of `length` characters that start at lo..hi-1, each packed into a number (`bits` per
 // character, the first one highest), in the order they first appear: key, count, key, count, ... (codes: each
 // character already as its number, see countSubstrings; the key alone gives the substring back, see counterOf)
@@ -241,32 +301,7 @@ function countPiece(codes: Uint8Array, length: int, bits: int, lo: int, hi: int)
   if (hi <= lo) return out;
   const base = BASE[bits];
   const end = hi + length - 1;
-  if (bits * length <= 16) { // few possible keys: a table indexed by the key
-    const mask = POW2_16[bits * length] - 1; // (keys of at most 16 bits: the shifts of JavaScript's 32 bits hold them)
-    let key: int = 0;
-    for (let i = lo; i < lo + length - 1; i++) key = ((key << bits) | codes[i]) & mask;
-    const tally: int[] = new Array<int>(65536).fill(0);
-    const start = key;
-    for (let j = lo + length - 1; j < end; j++) {
-      key = ((key << bits) | codes[j]) & mask;
-      tally[key]++;
-    }
-    // the order they first appear: a second pass from the start, until every key counted has been seen (the few
-    // keys of a short length all show up early)
-    let distinct = 0;
-    for (let k = 0; k <= mask; k++) if (tally[k] > 0) distinct++;
-    const seen: int[] = new Array<int>(65536).fill(0);
-    key = start;
-    for (let j = lo + length - 1; j < end && out.length < 2 * distinct; j++) {
-      key = ((key << bits) | codes[j]) & mask;
-      if (seen[key] === 0) {
-        seen[key] = 1;
-        out.push(key);
-        out.push(tally[key]);
-      }
-    }
-    return out;
-  }
+  if (bits * length <= 16) return bits === 2 ? countTable4(codes, length, lo, hi) : countTable(codes, length, bits, lo, hi);
   const top = POW2[bits * (length - 1)]; // what a key keeps of the substring before it (at most 2 ** 45: bits * length <= PACKED_BITS)
   let key: int = 0;
   for (let i = lo; i < lo + length - 1; i++) key = key * base + codes[i];
