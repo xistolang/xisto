@@ -172,7 +172,7 @@ const POW2_16: int[] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
 const BASE: int[] = [1, 2, 4, 8, 16, 32, 64, 128];
 
 const MIN_PIECE: int = 1 << 16; // fewer characters than this per thread are not worth a thread
-const MAP_PIECES: int = 3; // pieces of a length counted in a Map (each piece's table is merged afterwards)
+const MAP_PIECES: int = 2; // pieces of a length counted in a Map (each piece's table is merged afterwards; M4: 3 pieces cost 0,3 cpu-s more for the same wall time)
 
 // which bytes occur in bytes[lo, hi): 1 at the byte's index; any byte from 128 up sets index 128
 function bytesIn(bytes: Uint8Array, lo: int, hi: int): int[] {
