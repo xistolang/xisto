@@ -1125,7 +1125,8 @@ static void emit_cat_part(Expr *p) {
 
 static void emit_c_string(const char *s) {
     buf_putc(out, '"');
-    for (; *s; s++) {
+    unsigned char prev = 0;
+    for (; *s; prev = (unsigned char)*s, s++) {
         unsigned char c = (unsigned char)*s;
         if (c == 0xC0 && (unsigned char)s[1] == 0x80) { buf_puts(out, "\\000"); s++; continue; } /* NUL (xs_lit_len) */
         switch (c) {
@@ -1134,6 +1135,7 @@ static void emit_c_string(const char *s) {
         case '\n': buf_puts(out, "\\n"); break;
         case '\t': buf_puts(out, "\\t"); break;
         case '\r': buf_puts(out, "\\r"); break;
+        case '?': buf_puts(out, prev == '?' ? "\\?" : "?"); break; /* "??/" "??=" ... are trigraphs in C11: a '?' after a '?' goes out as \?, so no two meet */
         default:
             if (c < 32 || c == 127) buf_printf(out, "\\%03o", c);
             else buf_putc(out, (char)c);
