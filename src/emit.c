@@ -1942,6 +1942,51 @@ static void emit_member(Expr *e) {
         buf_puts(out, ")");
         return;
     }
+    if (base->type->kind == TY_STRING && e->builtin.cfn && !getenv("XISTO_NO_CHAIN_FUSE")) {
+        /* s.slice(a, b) followed by .replaceAll("<one ASCII character>", "") and/or .toUpperCase()/.toLowerCase(),
+           in either order: one runtime pass over the source range (an ASCII s; anything else runs the calls as
+           written, inside the same function) */
+        Expr *cur = e, *src = NULL, *sl = NULL, *pat = NULL;
+        int mode = 0, steps = 0;
+        bool case_first = false, ok = true;
+        while (ok && cur->kind == E_MEMBER && cur->is_call && cur->builtin.cfn && cur->lhs->type && cur->lhs->type->kind == TY_STRING) {
+            const char *f = cur->builtin.cfn;
+            if ((!strcmp(f, "xs_str_upper") || !strcmp(f, "xs_str_lower")) && !mode) {
+                mode = !strcmp(f, "xs_str_upper") ? 1 : 2;
+                if (pat) case_first = true; /* the replaceAll seen first is the outer call: case mapped inside it */
+                steps++;
+                cur = cur->lhs;
+            } else if (!strcmp(f, "xs_str_replace_all") && !pat && cur->args.len == 2 && cur->args.items[0]->kind == E_STRING &&
+                       cur->args.items[1]->kind == E_STRING && strlen(cur->args.items[0]->str) == 1 &&
+                       (unsigned char)cur->args.items[0]->str[0] < 0x80 && cur->args.items[1]->str[0] == 0) {
+                pat = cur->args.items[0];
+                if (mode) case_first = false; /* case call outside the replaceAll */
+                steps++;
+                cur = cur->lhs;
+            } else if (!strcmp(f, "xs_str_slice") && cur->args.len == 2) {
+                sl = cur;
+                src = cur->lhs;
+                break;
+            } else ok = false;
+        }
+        if (ok && sl && steps >= 1 && (pat || mode)) {
+            static int nfuse;
+            int id = nfuse++;
+            bool own = is_fresh(src);
+            buf_printf(out, "({ xs_str *fs%d_ = ", id);
+            if (own) emit_expr(src); else emit_borrowed(src);
+            buf_printf(out, "; xs_str *fr%d_ = xs_str_chain_fused(fs%d_, ", id, id);
+            emit_expr(sl->args.items[0]);
+            buf_puts(out, ", ");
+            emit_expr(sl->args.items[1]);
+            buf_puts(out, ", ");
+            if (pat) emit_borrowed(pat); else buf_puts(out, "NULL");
+            buf_printf(out, ", %d, %s); ", mode, case_first ? "true" : "false");
+            if (own) buf_printf(out, "xs_release_as(fs%d_, xs_str_free); ", id);
+            buf_printf(out, "fr%d_; })", id);
+            return;
+        }
+    }
     if (base->type->kind == TY_STRING && e->builtin.cfn && is_fresh(base) && !getenv("XISTO_NO_CHAIN_FREE") &&
         (!strcmp(e->builtin.cfn, "xs_str_replace_re") || !strcmp(e->builtin.cfn, "xs_str_replace_all_re") ||
          !strcmp(e->builtin.cfn, "xs_str_replace") || !strcmp(e->builtin.cfn, "xs_str_replace_all") ||
@@ -5685,6 +5730,35 @@ static Expr *rev_head_lo;
 static int rev_head_site;
 static bool rev_head_ix; /* the reversal is within the array (ix_prove): the read after it needs no check */
 static Stmt *rev_head_stmt;
+/* `for (let i = lo; i < hi; i++) D[i] = T[S[i]]` on byte arrays (a translation through a table): the runtime splits
+   a large range over threads when the ranges are in bounds, T has 256 bytes and the arrays do not overlap other
+   than D and S being the same bytes; otherwise (it says so) the loop runs as written. XISTO_NO_U8_MAP_PAR=1 keeps
+   the loop. */
+static bool emit_u8_map_par(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_MAP_PAR") || s->kind != S_FOR) return false;
+    Stmt *fi = s->for_init;
+    Expr *c = s->cond, *u = s->for_update;
+    if (!fi || fi->kind != S_VAR || !fi->cname || !fi->init || fi->cell || !bce_pure(fi->init)) return false;
+    if (!u || u->kind != E_POSTFIX || u->op != TK_PLUSPLUS || !u->lhs || u->lhs->kind != E_IDENT || !u->lhs->cname || strcmp(u->lhs->cname, fi->cname) != 0) return false;
+    if (!c || c->kind != E_BINARY || c->op != TK_LT || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, fi->cname) != 0 || !bce_pure(c->rhs)) return false;
+    Stmt *b = s->body;
+    if (!b || b->kind != S_BLOCK || b->stmts.len != 1 || b->stmts.items[0]->kind != S_EXPR) return false;
+    Expr *as = b->stmts.items[0]->expr;
+    if (!as || as->kind != E_ASSIGN || as->op != TK_ASSIGN) return false;
+    Expr iv = {0}; iv.kind = E_IDENT; iv.cname = fi->cname;
+    Expr *dst = as->lhs, *tv = as->rhs;
+    if (!byte_ix(dst) || !u8_name(dst->lhs) || !same_simple(dst->rhs, &iv)) return false;
+    if (!byte_ix(tv) || !u8_name(tv->lhs)) return false;
+    Expr *sv = tv->rhs;
+    if (!byte_ix(sv) || !u8_name(sv->lhs) || !same_simple(sv->rhs, &iv)) return false;
+    Expr *D = dst->lhs, *T = tv->lhs, *S = sv->lhs;
+    if (u8reg_find(D) || u8reg_find(T) || u8reg_find(S)) return false;
+    if (writes_name(c->rhs, fi->cname)) return false;
+    buf_puts(out, "if (!xs_u8_map_par(");
+    emit_borrowed(D); buf_puts(out, ", "); emit_borrowed(S); buf_puts(out, ", "); emit_borrowed(T); buf_puts(out, ", ");
+    emit_expr(fi->init); buf_puts(out, ", "); emit_expr(c->rhs); buf_puts(out, ")) ");
+    return false; /* (the loop follows: the fallback) */
+}
 static bool emit_u8_idiom(Stmt *s) {
     if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
     U8Idiom m;
@@ -6616,6 +6690,7 @@ static void emit_stmt_(Stmt *s) {
     }
     case S_FOR: {
         if (emit_u8_idiom(s)) { drain_if_needed(); return; }
+        emit_u8_map_par(s);
         mark_counted_inc(s);
         {
             size_t mark = out->len;
