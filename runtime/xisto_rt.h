@@ -837,6 +837,29 @@ static inline __attribute__((always_inline)) int64_t xs_len_bound(int64_t n) {
     return n;
 }
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+/* Linux: the 2 MB-aligned inside of a block of 64 MB or more is offered huge pages before it is touched
+   (MADV_HUGEPAGE, honoured when THP is "madvise" or "always"), as the shared blocks are (xs_shblk_new): the
+   first touches fault 2 MB at a time. The block stays malloc's, freed as any other. Typed arrays (revcomp.ts
+   reads 254 MB of stdin into one; Graviton2: the reads' sys time halves), the buffer of readFileSync(0) and
+   strings of that size (knucleotide.ts: 250 MB read, a 125 MB slice; Xeon: 337 -> see historia). XISTO_NO_U8_HUGE=1 turns it off. */
+static inline void xs_big_hint(void *data, int64_t n) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    if (n < ((int64_t)64 << 20)) return;
+    static int off = -1;
+    if (off < 0) off = getenv("XISTO_NO_U8_HUGE") != NULL;
+    if (off) return;
+    uintptr_t lo = ((uintptr_t)data + ((uintptr_t)2 << 20) - 1) & ~(((uintptr_t)2 << 20) - 1);
+    uintptr_t hi = ((uintptr_t)data + (uintptr_t)n) & ~(((uintptr_t)2 << 20) - 1);
+    if (hi > lo) madvise((void *)lo, hi - lo, MADV_HUGEPAGE);
+#else
+    (void)data, (void)n;
+#endif
+}
+#define xs_u8_huge_hint xs_big_hint
+
 /* ---- strings: immutable, UTF-8 ---- */
 
 typedef struct xs_str {
@@ -882,7 +905,11 @@ static inline __attribute__((always_inline)) xs_str *xs_str_alloc_i(int64_t len)
     s->ulen = -1;
     return s;
 }
-static xs_str *xs_str_alloc(int64_t len) { return xs_str_alloc_i(len); }
+static xs_str *xs_str_alloc(int64_t len) {
+    xs_str *s = xs_str_alloc_i(len);
+    xs_big_hint(s->data, len); /* (64 MB or more: huge pages before the first touch) */
+    return s;
+}
 
 static char *xs_strndup_(const char *s, size_t n) {
     char *d = malloc(n + 1);
@@ -4234,8 +4261,9 @@ static char *xs_read_stream(FILE *f, size_t front, size_t *len) {
 #endif
     char *buf = malloc(cap);
     if (!buf) xs_panic("out of memory");
+    xs_big_hint(buf, (int64_t)cap);
     for (;;) {
-        if (front + n + 1 >= cap) { cap *= 2; buf = realloc(buf, cap); if (!buf) xs_panic("out of memory"); }
+        if (front + n + 1 >= cap) { cap *= 2; buf = realloc(buf, cap); if (!buf) xs_panic("out of memory"); xs_big_hint(buf, (int64_t)cap); }
         size_t got = fread(buf + front + n, 1, cap - front - n - 1, f);
         n += got;
         if (got == 0) break;
@@ -4566,23 +4594,6 @@ static inline bool xs_is_buffer(xs_Uint8Array *b) { return xs_type_of(b)->print 
 #if defined(__linux__)
 #include <sys/mman.h>
 #endif
-/* Linux: the 2 MB-aligned inside of a block of 64 MB or more is offered huge pages before it is touched
-   (MADV_HUGEPAGE, honoured when THP is "madvise" or "always"), as the shared blocks are (xs_shblk_new): the
-   first touches fault 2 MB at a time. The block stays malloc's, freed as any other. revcomp.ts reads 254 MB of
-   stdin into one (Graviton2: the reads' sys time halves). XISTO_NO_U8_HUGE=1 turns it off. */
-static inline void xs_u8_huge_hint(void *data, int64_t n) {
-#if defined(__linux__) && defined(MADV_HUGEPAGE)
-    if (n < ((int64_t)64 << 20)) return;
-    static int off = -1;
-    if (off < 0) off = getenv("XISTO_NO_U8_HUGE") != NULL;
-    if (off) return;
-    uintptr_t lo = ((uintptr_t)data + ((uintptr_t)2 << 20) - 1) & ~(((uintptr_t)2 << 20) - 1);
-    uintptr_t hi = ((uintptr_t)data + (uintptr_t)n) & ~(((uintptr_t)2 << 20) - 1);
-    if (hi > lo) madvise((void *)lo, hi - lo, MADV_HUGEPAGE);
-#else
-    (void)data, (void)n;
-#endif
-}
 XS_NOINLINE xs_Uint8Array *xs_u8_raw(int64_t n, bool buffer, bool zero) {
     if (n < 0 || n > ((int64_t)1 << 40)) xs_panic("RangeError: Invalid typed array length");
     xs_Uint8Array *b = buffer ? xs_obj_alloc(sizeof *b, xs_u8_free, xs_buf_print) : xs_obj_alloc(sizeof *b, xs_u8_free, xs_u8_print);
