@@ -4563,12 +4563,33 @@ static void xs_buf_print(void *p) {
     fputc('>', XS_OUT);
 }
 static inline bool xs_is_buffer(xs_Uint8Array *b) { return xs_type_of(b)->print == xs_buf_print; }
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+/* Linux: the 2 MB-aligned inside of a block of 64 MB or more is offered huge pages before it is touched
+   (MADV_HUGEPAGE, honoured when THP is "madvise" or "always"), as the shared blocks are (xs_shblk_new): the
+   first touches fault 2 MB at a time. The block stays malloc's, freed as any other. revcomp.ts reads 254 MB of
+   stdin into one (Graviton2: the reads' sys time halves). XISTO_NO_U8_HUGE=1 turns it off. */
+static inline void xs_u8_huge_hint(void *data, int64_t n) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    if (n < ((int64_t)64 << 20)) return;
+    static int off = -1;
+    if (off < 0) off = getenv("XISTO_NO_U8_HUGE") != NULL;
+    if (off) return;
+    uintptr_t lo = ((uintptr_t)data + ((uintptr_t)2 << 20) - 1) & ~(((uintptr_t)2 << 20) - 1);
+    uintptr_t hi = ((uintptr_t)data + (uintptr_t)n) & ~(((uintptr_t)2 << 20) - 1);
+    if (hi > lo) madvise((void *)lo, hi - lo, MADV_HUGEPAGE);
+#else
+    (void)data, (void)n;
+#endif
+}
 XS_NOINLINE xs_Uint8Array *xs_u8_raw(int64_t n, bool buffer, bool zero) {
     if (n < 0 || n > ((int64_t)1 << 40)) xs_panic("RangeError: Invalid typed array length");
     xs_Uint8Array *b = buffer ? xs_obj_alloc(sizeof *b, xs_u8_free, xs_buf_print) : xs_obj_alloc(sizeof *b, xs_u8_free, xs_u8_print);
     b->f_length = n;
     b->data = zero ? calloc((size_t)(n ? n : 1), 1) : malloc((size_t)(n ? n : 1));
     if (!b->data) xs_panic("out of memory");
+    xs_u8_huge_hint(b->data, n);
     return b;
 }
 XS_NOINLINE xs_Uint8Array *xs_u8_new(int64_t n) { return xs_u8_raw(n, false, true); }
@@ -4762,6 +4783,29 @@ static inline void xs_u8_trade(const xs_u8_tr_ctx *c, xs_Uint8Array *buf, int64_
    bytes of the neighbouring task). Exact: the same pairs, the same table. Left to the one-thread loop: a range
    below 1 MB, fewer than 4 cores, a table that maps another byte to `keep` (the loop would then see the new `keep` bytes),
    and XISTO_NO_REV_PAR=1. Its own threads (no runtime state is touched: raw bytes only), made at the first use. */
+/* memchr, 64 bytes per step on NEON for Linux (glibc's arm64 memchr is the generic one on the Graviton2, Amazon
+   Linux: __memchr_generic; readStdinParts scans 254 MB for '>' with it); libc's elsewhere (vectorized there) */
+static inline const uint8_t *xs_memchr(const uint8_t *p, int c, size_t n) {
+#if defined(__ARM_NEON) && defined(__linux__)
+    const uint8_t *e = p + n;
+    const uint8x16_t cv = vdupq_n_u8((uint8_t)c);
+    while (p + 64 <= e) {
+        uint8x16_t a = vceqq_u8(vld1q_u8(p), cv), b = vceqq_u8(vld1q_u8(p + 16), cv);
+        uint8x16_t x = vceqq_u8(vld1q_u8(p + 32), cv), y = vceqq_u8(vld1q_u8(p + 48), cv);
+        if (vmaxvq_u8(vorrq_u8(vorrq_u8(a, b), vorrq_u8(x, y)))) {
+            uint8x16_t q[4] = {a, b, x, y};
+            for (int k = 0; k < 4; k++) {
+                uint64_t m = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(q[k]), 4)), 0);
+                if (m) return p + 16 * k + (__builtin_ctzll(m) >> 2);
+            }
+        }
+        p += 64;
+    }
+    return memchr(p, c, (size_t)(e - p));
+#else
+    return memchr(p, c, n);
+#endif
+}
 #if !defined(_WIN32)
 #include <pthread.h>
 #include <stdatomic.h>
@@ -4777,14 +4821,30 @@ static pthread_cond_t xs_rap_wake = PTHREAD_COND_INITIALIZER, xs_rap_done = PTHR
 static xs_rap_job *xs_rap_cur;
 static uint64_t xs_rap_gen;
 static int xs_rap_nthreads = -1, xs_rap_busy;
+/* 16 bytes compared at once: a bit mask of the equal lanes, XS_EQ_SHIFT bits per lane (NEON: 4, through a narrowing
+   shift; x86: 1, pmovmskb), so the first is ctz >> shift and the last (63 - clz) >> shift */
+#if defined(__ARM_NEON)
+#define XS_EQ_SHIFT 2
+static inline uint64_t xs_u8x16_eqmask(xs_u8x16 v, xs_u8x16 c) {
+    return vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(vceqq_u8((uint8x16_t)v, (uint8x16_t)c)), 4)), 0);
+}
+#elif defined(__SSSE3__)
+#define XS_EQ_SHIFT 0
+static inline uint64_t xs_u8x16_eqmask(xs_u8x16 v, xs_u8x16 c) { return (uint64_t)(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8((__m128i)v, (__m128i)c)); }
+#endif
 static int64_t xs_rap_count(const uint8_t *p, int64_t n, int keep) {
-    int64_t k = 0;
-    const uint8_t *e = p + n;
-    while (p < e) {
-        const uint8_t *q = memchr(p, keep, (size_t)(e - p));
-        if (!q) break;
-        k++; p = q + 1;
+    int64_t k = 0, i = 0;
+    const uint8_t c = (uint8_t)keep;
+#if defined(__SSSE3__) || defined(__ARM_NEON)
+    const xs_u8x16 cv = xs_u8x16_splat(c);
+    while (i + 16 <= n) { /* 16 at a time into byte counters, 255 blocks at most before they are summed */
+        xs_u8x16 acc = xs_u8x16_splat(0);
+        int64_t stop = i + (int64_t)16 * 255 < n ? i + (int64_t)16 * 255 : n - 15;
+        for (; i < stop; i += 16) acc -= (xs_u8x16)(xs_u8x16_load(p + i) == cv); /* (an equal lane is -1) */
+        for (int l = 0; l < 16; l++) k += acc[l];
     }
+#endif
+    for (; i < n; i++) k += p[i] == c; /* (a memchr per kept byte cost more than the whole block) */
     return n - k;
 }
 /* the position of the byte of rank r (0-based, among those that are not keep) */
@@ -4795,7 +4855,7 @@ static int64_t xs_rap_pos(const xs_rap_job *j, int64_t r) {
     int64_t need = r - j->pre[lo];
     const uint8_t *p = j->d + j->start + lo * j->blk, *e = j->d + (j->start + (lo + 1) * j->blk < j->end ? j->start + (lo + 1) * j->blk : j->end);
     for (;;) {
-        const uint8_t *q = memchr(p, j->keep, (size_t)(e - p));
+        const uint8_t *q = xs_memchr(p, j->keep, (size_t)(e - p));
         int64_t seg = (q ? q : e) - p;
         if (need < seg) return (p - j->d) + need;
         need -= seg;
@@ -4820,13 +4880,44 @@ static void xs_rap_trade(const xs_rap_job *j, int64_t a, int64_t b, int64_t run,
 }
 static int64_t xs_rap_next_keep(const xs_rap_job *j, int64_t i) {
     if (j->keep < 0) return j->end;
-    const uint8_t *q = memchr(j->d + i, j->keep, (size_t)(j->end - i));
-    return q ? q - j->d : j->end;
+    const uint8_t *d = j->d;
+    int64_t x = i;
+#if defined(__SSSE3__) || defined(__ARM_NEON)
+    const xs_u8x16 cv = xs_u8x16_splat((uint8_t)j->keep);
+    for (; x + 16 <= j->end; x += 16) { /* 16 at a time: stretches are short (lines), a memchr call per line costs more than the scan */
+        uint64_t m = xs_u8x16_eqmask(xs_u8x16_load(d + x), cv);
+        if (m) return x + (__builtin_ctzll(m) >> XS_EQ_SHIFT);
+    }
+#endif
+    for (int k = 0; k < 16 && x + 8 <= j->end; k++) { /* 8 at a time first: stretches are short (lines), a memchr call per line costs more than the scan */
+        uint64_t w;
+        memcpy(&w, d + x, 8);
+        uint64_t v = w ^ (0x0101010101010101ull * (uint8_t)j->keep);
+        uint64_t z = (v - 0x0101010101010101ull) & ~v & 0x8080808080808080ull;
+        if (z) { /* the first keep byte among them (the lowest flagged byte is exact) */
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+            return x + (__builtin_ctzll(z) >> 3);
+#else
+            break;
+#endif
+        }
+        x += 8;
+    }
+    const uint8_t *q = xs_memchr(d + x, j->keep, (size_t)(j->end - x));
+    return q ? q - d : j->end;
 }
 static int64_t xs_rap_prev_keep(const xs_rap_job *j, int64_t k) { /* the position after the keep before k (or start) */
     if (j->keep < 0) return j->start;
     const uint8_t *d = j->d;
     int64_t x = k;
+#if defined(__SSSE3__) || defined(__ARM_NEON)
+    const xs_u8x16 cv = xs_u8x16_splat((uint8_t)j->keep);
+    while (x - 15 >= j->start) { /* 16 at a time, d[x - 15..x]: the last keep among them */
+        uint64_t m = xs_u8x16_eqmask(xs_u8x16_load(d + x - 15), cv);
+        if (m) return x - 15 + ((63 - __builtin_clzll(m)) >> XS_EQ_SHIFT) + 1;
+        x -= 16;
+    }
+#endif
     while (x - 8 >= j->start) { /* 8 at a time: a keep byte among them? */
         uint64_t w;
         memcpy(&w, d + x - 7, 8);
@@ -4860,6 +4951,27 @@ static void xs_rap_task(xs_rap_job *j, int64_t t) {
             if (k < kstart) { while (d[k] == j->keep) k--; kstart = xs_rap_prev_keep(j, k); }
         }
     }
+}
+/* one thread: the two cursors of reverseAround (xisto:bytes), each inside its stretch between two keep bytes; a run
+   in which neither leaves its stretch is one trade (the same pairs as the TS loop: the k-th byte that is not keep
+   from the front with the k-th from the back) */
+static void xs_rap_seq(xs_rap_job *j) {
+    const uint8_t *d = j->d;
+    int64_t i = j->start, k = j->end - 1;
+    while (k >= j->start && d[k] == j->keep) k--;
+    int64_t iend = xs_rap_next_keep(j, i), kstart = xs_rap_prev_keep(j, k);
+    while (i < k) {
+        if (i == iend) { i++; iend = xs_rap_next_keep(j, i); continue; }
+        if (k < kstart) { k--; kstart = xs_rap_prev_keep(j, k); continue; }
+        int64_t run = iend - i;
+        if (k - kstart + 1 < run) run = k - kstart + 1;
+        int64_t meet = (k - i + 1) >> 1;
+        if (meet < run) run = meet;
+        if (run == 0) break;
+        xs_rap_trade(j, i, k, run, k - 16, i + 16); /* (masked only when the two 16-byte blocks are apart) */
+        i += run; k -= run;
+    }
+    if (i == k && d[i] != j->keep) j->d[i] = j->c.T[d[i]]; /* the middle byte */
 }
 static void xs_rap_work(xs_rap_job *j) {
     int64_t n = j->phase == 0 ? j->nblk : j->ntask;
@@ -4902,11 +5014,21 @@ static void xs_rap_run(xs_rap_job *j, int phase) {
 /* true: done here; false: the caller runs its own loop */
 XS_NOINLINE bool xs_u8_rev_par(xs_Uint8Array *buf, xs_Uint8Array *table, int64_t keep, int64_t start, int64_t end) {
     int64_t n = end - start;
-    if (n < ((int64_t)1 << 20) || start < 0 || end > buf->f_length || table->f_length != 256 || keep > 255) return false;
+    if (n < 4096 || start < 0 || end > buf->f_length || table->f_length != 256 || keep > 255) return false;
     static int off = -1;
     if (off < 0) off = getenv("XISTO_NO_REV_PAR") != NULL;
     if (off) return false;
     if (keep >= 0) for (int b = 0; b < 256; b++) if (b != keep && table->data[b] == keep) return false;
+    static int seq_off = -1;
+    if (seq_off < 0) seq_off = getenv("XISTO_NO_REV_SEQ") != NULL;
+    if (n < ((int64_t)1 << 20)) { /* small: one thread, here when there are stretches (no threads started) */
+        if (keep < 0 || seq_off) return false;
+        xs_rap_job j;
+        memset(&j, 0, sizeof j);
+        j.d = buf->data; j.c = xs_u8_tr_setup(table); j.keep = (int)keep; j.start = start; j.end = end;
+        xs_rap_seq(&j);
+        return true;
+    }
     if (xs_rap_nthreads < 0) {
         const char *s = getenv("XISTO_THREADS");
         long t = s && *s ? strtol(s, NULL, 10) : sysconf(_SC_NPROCESSORS_ONLN);
@@ -4917,7 +5039,18 @@ XS_NOINLINE bool xs_u8_rev_par(xs_Uint8Array *buf, xs_Uint8Array *table, int64_t
             if (pthread_create(&th, NULL, xs_rap_worker, NULL) == 0) { pthread_detach(th); xs_rap_nthreads++; }
         }
     }
-    if (xs_rap_nthreads < 3) return false; /* (2 cores: the counting pass eats the gain, measured on the M4 with 2 threads: 31 ms either way, twice the CPU) */
+    static int min_threads = -1; /* the fewest extra threads that split the pairs (XISTO_REV_PAR_MIN): one, since the count
+                                    and the stretch scans go 16 bytes at a time (Graviton2, 2 cores, 254 MB: 114 -> 73 ms;
+                                    with a memchr per kept byte the count ate the gain: 31 ms either way on the M4) */
+    if (min_threads < 0) { const char *m = getenv("XISTO_REV_PAR_MIN"); min_threads = m && *m ? (int)strtol(m, NULL, 10) : 1; }
+    if (xs_rap_nthreads < min_threads) { /* one thread, here */
+        if (keep < 0 || seq_off) return false;
+        xs_rap_job j;
+        memset(&j, 0, sizeof j);
+        j.d = buf->data; j.c = xs_u8_tr_setup(table); j.keep = (int)keep; j.start = start; j.end = end;
+        xs_rap_seq(&j);
+        return true;
+    }
     xs_rap_job j;
     memset(&j, 0, sizeof j);
     j.d = buf->data; j.c = xs_u8_tr_setup(table); j.keep = (int)keep; j.start = start; j.end = end;
@@ -5040,7 +5173,7 @@ XS_NOINLINE int64_t xs_u8_index_of(xs_Uint8Array *b, int64_t v, int64_t from) {
     if (v < 0 || v > 255) return -1;
     int64_t s = xs_u8_rel(from, b->f_length, 0);
     if (s >= b->f_length) return -1;
-    const uint8_t *h = memchr(b->data + s, (int)v, (size_t)(b->f_length - s));
+    const uint8_t *h = xs_memchr(b->data + s, (int)v, (size_t)(b->f_length - s));
     return h ? (int64_t)(h - b->data) : -1;
 }
 XS_NOINLINE bool xs_u8_includes(xs_Uint8Array *b, int64_t v) { return xs_u8_index_of(b, v, 0) >= 0; }
