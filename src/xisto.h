@@ -551,6 +551,7 @@ void par_analyze(Program *p); /* parallel.c: which xisto:parallel calls can run 
 char *xs_read_file(const char *path);
 char *xs_format(const char *src); /* xisto fmt */
 void check_program(Program *p);
+void columns_program(Program *p); /* columns.c: a local array of number-only objects as one Float64Array per field */
 void prune_program(Program *p); /* marks what main reaches; emitters skip the rest */
 Func *xs_parse_instance(Func *tmpl, Type **args);
 Class *xs_parse_class_instance(Class *tmpl, Type **args, const char *name); /* parser.c: a generic function parsed again with its T bound */

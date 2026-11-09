@@ -1190,6 +1190,20 @@ XS_NOINLINE xs_str *xs_str_from_codes(int n, const double *v, bool points) {
 XS_NOINLINE xs_str *xs_str_from_char_codes(int n, const double *v) { return xs_str_from_codes(n, v, false); }
 XS_NOINLINE xs_str *xs_str_from_code_points(int n, const double *v) { return xs_str_from_codes(n, v, true); }
 static xs_str *xs_str_upper(xs_str *s) { return xs_str_case(s, true); }
+/* toUpperCase / toLowerCase of a temporary only the caller holds (rc 1): an ASCII text is mapped in its own buffer
+   and comes back retained (the caller's release leaves it alive); otherwise as a new string */
+XS_NOINLINE xs_str *xs_str_case_mv(xs_str *s, bool up) {
+    if (s->hdr.rc != 1 || s->len <= XS_SMALL_MAX) return xs_str_case(s, up);
+    unsigned char *d = (unsigned char *)s->data;
+    int64_t n = s->len;
+    if (xs_ascii_prefix(d, n) != n) return xs_str_case(s, up);
+    if (up) { for (int64_t k = 0; k < n; k++) d[k] = (unsigned char)(d[k] >= 'a' && d[k] <= 'z' ? d[k] - 32 : d[k]); }
+    else { for (int64_t k = 0; k < n; k++) d[k] = (unsigned char)(d[k] >= 'A' && d[k] <= 'Z' ? d[k] + 32 : d[k]); }
+    s->ulen = n <= INT32_MAX ? (int32_t)n : -1;
+    return xs_retain(s);
+}
+static xs_str *xs_str_upper_mv(xs_str *s) { return xs_str_case_mv(s, true); }
+static xs_str *xs_str_lower_mv(xs_str *s) { return xs_str_case_mv(s, false); }
 static xs_str *xs_str_lower(xs_str *s) { return xs_str_case(s, false); }
 
 static inline xs_str *xs_retain_str(xs_str *s) { return xs_retain(s); }
@@ -1248,7 +1262,9 @@ XS_NOINLINE xs_str *xs_str_pad(xs_str *s, int64_t target, xs_str *fill, bool sta
 }
 XS_NOINLINE xs_str *xs_str_pad_start(xs_str *s, int64_t n, xs_str *f) { return xs_str_pad(s, n, f, true); }
 XS_NOINLINE xs_str *xs_str_pad_end(xs_str *s, int64_t n, xs_str *f) { return xs_str_pad(s, n, f, false); }
-XS_NOINLINE xs_str *xs_str_replace_impl(xs_str *s, xs_str *a, xs_str *b, bool all) {
+/* inplace: s is a temporary only the caller holds (rc 1, about to be released): a long text that does not grow is
+   rewritten in its own buffer, and s comes back retained (the caller's release leaves it alive) */
+XS_NOINLINE xs_str *xs_str_replace_impl2(xs_str *s, xs_str *a, xs_str *b, bool all, bool inplace) {
     if (a->len == 0) { /* JS: "" matches at 0 (replace) or between every code unit (replaceAll); support the first */
         if (all) xs_panic("replaceAll with an empty pattern is not supported");
         xs_str *r = xs_str_alloc(s->len + b->len);
@@ -1259,7 +1275,9 @@ XS_NOINLINE xs_str *xs_str_replace_impl(xs_str *s, xs_str *a, xs_str *b, bool al
     const char *p = s->data, *end = s->data + s->len;
     if (all && b->len <= a->len && s->len > XS_SMALL_MAX) { /* a long text that does not grow: one pass into a buffer
         of its size (the result is at most as long; finding every match twice cost as much as the copy) */
-        xs_str *r = xs_str_alloc(s->len);
+        inplace = inplace && s->hdr.rc == 1 && b != s && a != s;
+        xs_str *r = inplace ? s : xs_str_alloc(s->len);
+        int32_t ulen0 = s->ulen;
         char *o = r->data;
         const char *hit;
         if (a->len == 1 && b->len == 0) { /* one character removed (the newlines of a text): eight bytes at a time,
@@ -1269,31 +1287,32 @@ XS_NOINLINE xs_str *xs_str_replace_impl(xs_str *s, xs_str *a, xs_str *b, bool al
                 uint64_t w;
                 memcpy(&w, p, 8);
                 uint64_t x = w ^ c8;
-                if (!((x - ones) & ~x & 0x8080808080808080ULL)) { memcpy(o, p, 8); o += 8; p += 8; continue; }
+                if (!((x - ones) & ~x & 0x8080808080808080ULL)) { memcpy(o, &w, 8); o += 8; p += 8; continue; } /* (w: the bytes already read, so o may trail p in the same buffer) */
                 for (int k = 0; k < 8; k++, p++) { if (*p != a->data[0]) *o++ = *p; else count++; }
             }
             for (; p < end; p++) { if (*p != a->data[0]) *o++ = *p; else count++; }
-            if (count == 0) { xs_release(r); return xs_retain(s); }
+            if (count == 0) { if (r != s) xs_release(r); return xs_retain(s); }
             r->len = o - r->data;
             r->data[r->len] = 0;
-            if (s->ulen >= 0 && s->ulen - count <= INT32_MAX) r->ulen = (int32_t)(s->ulen - count);
-            return r;
+            r->ulen = ulen0 >= 0 && ulen0 - count <= INT32_MAX ? (int32_t)(ulen0 - count) : -1;
+            return r == s ? xs_retain(s) : r;
         }
         while ((hit = xs_find(p, (size_t)(end - p), a->data, (size_t)a->len))) {
-            memcpy(o, p, (size_t)(hit - p)); o += hit - p;
+            memmove(o, p, (size_t)(hit - p)); o += hit - p;
             memcpy(o, b->data, (size_t)b->len); o += b->len;
             p = hit + a->len;
             count++;
         }
-        if (count == 0) { xs_release(r); return xs_retain(s); }
-        memcpy(o, p, (size_t)(end - p)); o += end - p;
+        if (count == 0) { if (r != s) xs_release(r); return xs_retain(s); }
+        memmove(o, p, (size_t)(end - p)); o += end - p;
         r->len = o - r->data;
         r->data[r->len] = 0;
-        if (s->ulen >= 0) {
-            int64_t u = s->ulen + count * (xs_str_len(b) - xs_str_len(a));
+        r->ulen = -1;
+        if (ulen0 >= 0) {
+            int64_t u = ulen0 + count * (xs_str_len(b) - xs_str_len(a));
             if (u >= 0 && u <= INT32_MAX) r->ulen = (int32_t)u;
         }
-        return r;
+        return r == s ? xs_retain(s) : r;
     }
     while ((p = xs_find(p, (size_t)(end - p), a->data, (size_t)a->len))) { count++; p += a->len; if (!all) break; }
     if (count == 0) return xs_retain(s);
@@ -1314,6 +1333,8 @@ XS_NOINLINE xs_str *xs_str_replace_impl(xs_str *s, xs_str *a, xs_str *b, bool al
     }
     return r;
 }
+XS_NOINLINE xs_str *xs_str_replace_impl(xs_str *s, xs_str *a, xs_str *b, bool all) { return xs_str_replace_impl2(s, a, b, all, false); }
+XS_NOINLINE xs_str *xs_str_replace_all_mv(xs_str *s, xs_str *a, xs_str *b) { return xs_str_replace_impl2(s, a, b, true, true); }
 XS_NOINLINE xs_str *xs_str_replace(xs_str *s, xs_str *a, xs_str *b) { return xs_str_replace_impl(s, a, b, false); }
 XS_NOINLINE xs_str *xs_str_replace_all(xs_str *s, xs_str *a, xs_str *b) { return xs_str_replace_impl(s, a, b, true); }
 

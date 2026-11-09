@@ -1889,7 +1889,8 @@ static void emit_member(Expr *e) {
     }
     if (base->type->kind == TY_STRING && e->builtin.cfn && is_fresh(base) && !getenv("XISTO_NO_CHAIN_FREE") &&
         (!strcmp(e->builtin.cfn, "xs_str_replace_re") || !strcmp(e->builtin.cfn, "xs_str_replace_all_re") ||
-         !strcmp(e->builtin.cfn, "xs_str_replace") || !strcmp(e->builtin.cfn, "xs_str_replace_all"))) {
+         !strcmp(e->builtin.cfn, "xs_str_replace") || !strcmp(e->builtin.cfn, "xs_str_replace_all") ||
+         !strcmp(e->builtin.cfn, "xs_str_upper") || !strcmp(e->builtin.cfn, "xs_str_lower"))) {
         /* s.replace(...).replace(...): each intermediate string is released as soon as the next one is made,
            not at the end of the statement (regex-redux: a chain of five over 50 MB peaked at 273 MB on the
            Xeon, now ~100). These functions return an owned string (a retained s when nothing matched). */
@@ -1897,7 +1898,15 @@ static void emit_member(Expr *e) {
         int id = nchain++;
         buf_printf(out, "({ xs_str *cr%d_ = ", id);
         emit_expr(base);
-        buf_printf(out, "; xs_str *cq%d_ = %s(cr%d_", id, e->builtin.cfn, id);
+        /* replaceAll that does not grow, toUpperCase/toLowerCase of ASCII: in the temporary's own buffer when
+           nothing else holds it (rc 1 at run time; the slice + replaceAll + toUpperCase of k-nucleotide's 125 MB
+           made two copies of it, now none) */
+        const char *fn = e->builtin.cfn;
+        bool mv = !getenv("XISTO_NO_STR_INPLACE");
+        if (mv && !strcmp(fn, "xs_str_replace_all")) fn = "xs_str_replace_all_mv";
+        else if (mv && !strcmp(fn, "xs_str_upper")) fn = "xs_str_upper_mv";
+        else if (mv && !strcmp(fn, "xs_str_lower")) fn = "xs_str_lower_mv";
+        buf_printf(out, "; xs_str *cq%d_ = %s(cr%d_", id, fn, id);
         emit_args_borrowed(&e->args, true);
         buf_printf(out, "); xs_release_as(cr%d_, xs_str_free); cq%d_; })", id, id);
         return;
