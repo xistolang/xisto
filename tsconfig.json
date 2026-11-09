@@ -9,7 +9,8 @@
     "types": [],
     "paths": {
       "xisto:io": ["./packages/xisto/io.ts"],
-      "xisto:bytes": ["./packages/xisto/bytes.ts"]
+      "xisto:bytes": ["./packages/xisto/bytes.ts"],
+      "xisto:parallel": ["./packages/xisto/parallel.ts"]
     }
   },
   "files": ["xisto.d.ts", "packages/xisto/io.ts", "packages/xisto/bytes.ts", "bench/benchmarksgame/revcomp.ts", "tests/ok/xisto-bytes.ts", "tests/ok/u8-last-index.ts"]

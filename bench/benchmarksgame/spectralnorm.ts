@@ -3,30 +3,32 @@
 //
 // contributed by Ian Osgood
 // modified for Node.js by Isaac Gouy
-// (xisto: the same program with types; node/spectralnorm-node-1.js is the original)
+// (xisto: the same program with types, each product's rows computed at the same time with xisto:parallel;
+// node/spectralnorm-node-1.js is the original)
+import { parallelFill } from "xisto:parallel";
 
 function A(i: int, j: int): number {
   return 1 / (Number((i + j) * (i + j + 1)) / 2 + Number(i) + 1);
 }
 
 function Au(u: number[], v: number[]): void {
-  for (let i = 0; i < u.length; ++i) {
+  parallelFill(v, (i) => {
     let t = 0;
     for (let j = 0; j < u.length; ++j) {
       t += A(i, j) * u[j];
     }
-    v[i] = t;
-  }
+    return t;
+  });
 }
 
 function Atu(u: number[], v: number[]): void {
-  for (let i = 0; i < u.length; ++i) {
+  parallelFill(v, (i) => {
     let t = 0;
     for (let j = 0; j < u.length; ++j) {
       t += A(j, i) * u[j];
     }
-    v[i] = t;
-  }
+    return t;
+  });
 }
 
 function AtAu(u: number[], v: number[], w: number[]): void {

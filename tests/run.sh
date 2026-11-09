@@ -26,6 +26,16 @@ for f in tests/ok/*.ts; do
     if ! $XISTO build -o "$OUT/$name" "$f" > "$OUT/$name.build" 2>&1; then
         echo "FAIL $f: xisto build failed"; cat "$OUT/$name.build"; fail=$((fail+1)); continue
     fi
+    # "// warns: TEXT" lines: each TEXT must be among the build's warnings; "// warns: none": no warning at all
+    wfail=
+    while IFS= read -r w; do
+        if [ -z "$w" ]; then :
+        elif [ "$w" = "none" ]; then grep -q "warning" "$OUT/$name.build" && wfail="no warning expected, got: $(grep warning "$OUT/$name.build" | head -3)"
+        elif ! grep -qF -- "$w" "$OUT/$name.build"; then wfail="missing warning: $w"; fi
+    done <<EOF_WARNS
+$(sed -n 's|^// warns: ||p' "$f")
+EOF_WARNS
+    if [ -n "$wfail" ]; then echo "FAIL $f: $wfail"; fail=$((fail+1)); continue; fi
     XISTO_RC_STATS=1 "$OUT/$name" > "$OUT/$name.xisto" 2> "$OUT/$name.stats"
     if ! grep -q ' 0 still alive' "$OUT/$name.stats"; then
         echo "FAIL $f: leak: $(cat "$OUT/$name.stats")"; fail=$((fail+1)); continue
