@@ -985,10 +985,11 @@ static const char *dispatcher(Func *m) {
     buf_puts(out, "static ");
     emit_decl(m->ret, name);
     buf_printf(out, "(%s *self", m->cls->cname);
-    for (int i = 0; i < m->nparams; i++) { buf_puts(out, ", "); emit_decl(m->params[i].type, m->params[i].cname); }
+    /* its own argument names: an abstract method's parameters get no C names (it has no body to check) */
+    for (int i = 0; i < m->nparams; i++) { buf_puts(out, ", "); emit_decl(m->params[i].type, xs_sprintf("a%d_", i)); }
     buf_puts(out, ") {\n    void (*f_)(void *) = xs_type_of(self)->free;\n");
     Buf args = {0};
-    for (int i = 0; i < m->nparams; i++) buf_printf(&args, ", %s", m->params[i].cname);
+    for (int i = 0; i < m->nparams; i++) buf_printf(&args, ", a%d_", i);
     bool is_void = m->ret->kind == TY_VOID;
     for (int i = 0; i < prog->nclasses; i++) {
         Class *k = prog->classes[i];
@@ -1622,8 +1623,14 @@ static void emit_member(Expr *e) {
             static int nparse;
             int id = nparse++;
             Buf h = {0};
-            buf_printf(&h, "XS_NOINLINE %s json_parse_%d(xs_str *s) { xs_jv *jv_ = xs_json_parse(s); %s r_ = ", ctype(e->type), id, ctype(e->type));
-            json_emit_read(&h, e->type, "jv_", "value");
+            if (e->type->kind == TY_JSON) /* into `object` (held as JSON text): parsed as JSON.parse would, and written back
+                                             as JSON.stringify writes the value ("\u00e7" comes out as "ç", spacing goes) */
+                buf_printf(&h, "XS_NOINLINE xs_str *json_parse_%d(xs_str *s) { xs_jv *jv_ = xs_json_parse(s); xs_str *r_ = xs_json_text(jv_", id);
+            else {
+                buf_printf(&h, "XS_NOINLINE %s json_parse_%d(xs_str *s) { xs_jv *jv_ = xs_json_parse(s); %s r_ = ", ctype(e->type), id, ctype(e->type));
+                json_emit_read(&h, e->type, "jv_", "value");
+            }
+            if (e->type->kind == TY_JSON) buf_puts(&h, ")");
             buf_puts(&h, "; xs_jv_free(jv_); return r_; }\n");
             buf_puts(&json_fns, h.data);
             free(h.data);

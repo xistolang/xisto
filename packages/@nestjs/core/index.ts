@@ -13,6 +13,9 @@ import {
   __params,
   __routes,
   __validated,
+  __jsonValues,
+  __tokens,
+  __values,
   bodyField,
   ExecutionContext,
   GuardDef,
@@ -89,9 +92,21 @@ function resolve(ci: ClassInfo, providers: Map<string, ClassInfo>, instances: Ma
   }
   const args: unknown[] = [];
   for (const p of ci.params) {
+    // a token (@Inject, @InjectRepository) or a value registered for the type: what the parameter receives
+    const token = __tokens.get(ci.id + "#" + String(p.index)) ?? p.type.id;
+    const value = __values.get(token);
+    if (value !== null) {
+      args.push(value);
+      continue;
+    }
+    const json = __jsonValues.get(token);
+    if (json !== null) {
+      args.push(p.type.decode(json));
+      continue;
+    }
     const dep = providers.get(p.type.id);
     if (dep === null) {
-      throw new Error(`Nest can't resolve dependencies of the ${ci.name} (${p.type.id} at index [${p.index}]). Make sure it is available in the current module.`);
+      throw new Error(`Nest can't resolve dependencies of the ${ci.name} (${token} at index [${p.index}]). Make sure it is available in the current module.`);
     }
     args.push(resolve(dep, providers, instances, depth + 1));
   }
