@@ -2,16 +2,12 @@
 // https://salsa.debian.org/benchmarksgame-team/benchmarksgame/
 //
 //  Contributed by Ian Osgood
-//  (xisto: the same program with types, the counts as int; node/fasta-node-1.js is the original. The tables are a Map where the
-//   original has an object used as one, iterated with for...in in the same insertion order)
+//  (xisto: the random sequences from xisto:random, a generator with the program's constants and the characters
+//   drawn with their probabilities; node/fasta-node-1.js is the original)
 
-let last = 42;
-const A = 3877, C = 29573, M = 139968;
+import { LinearCongruential, WeightedCharacters } from "xisto:random";
 
-function rand(max: number): number {
-  last = (last * A + C) % M;
-  return max * last / M;
-}
+const random = new LinearCongruential({ seed: 42, multiplier: 3877, increment: 29573, modulus: 139968 });
 
 const ALU =
   "GGCCGGGCGCGGTGGCTCACGCCTGTAATCCCAGCACTTTGG" +
@@ -22,27 +18,13 @@ const ALU =
   "AGGCGGAGGTTGCAGTGAGCCGAGATCGCGCCACTGCACTCC" +
   "AGCCTGGGCGACAGAGCGAGACTCCGTCTCAAAAA";
 
-const IUB = new Map<string, number>([
-  ["a", 0.27], ["c", 0.12], ["g", 0.12], ["t", 0.27],
-  ["B", 0.02], ["D", 0.02], ["H", 0.02], ["K", 0.02],
-  ["M", 0.02], ["N", 0.02], ["R", 0.02], ["S", 0.02],
-  ["V", 0.02], ["W", 0.02], ["Y", 0.02]
-]);
+const IUB = new WeightedCharacters(random, "acgtBDHKMNRSVWY",
+  [0.27, 0.12, 0.12, 0.27, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02]);
 
-const HomoSap = new Map<string, number>([
-  ["a", 0.3029549426680],
-  ["c", 0.1979883004921],
-  ["g", 0.1975473066391],
-  ["t", 0.3015094502008]
-]);
+const HomoSap = new WeightedCharacters(random, "acgt",
+  [0.3029549426680, 0.1979883004921, 0.1975473066391, 0.3015094502008]);
 
-function makeCumulative(table: Map<string, number>): void {
-  let last = "";
-  for (const [c, p] of table) {
-    if (last !== "") table.set(c, p + table.get(last)!);
-    last = c;
-  }
-}
+const LINE = 60, BLOCK = 1000 * LINE; // written a block of lines at a time
 
 function fastaRepeat(n: int, seq: string): void {
   let seqi: int = 0, lenOut: int = 60;
@@ -60,22 +42,11 @@ function fastaRepeat(n: int, seq: string): void {
   }
 }
 
-function fastaRandom(n: int, table: Map<string, number>): void {
-  let line: string[] = new Array<string>(60).fill("");
-  makeCumulative(table);
+function fastaRandom(n: int, characters: WeightedCharacters): void {
   while (n > 0) {
-    if (n < line.length) line = new Array<string>(n).fill("");
-    for (let i = 0; i < line.length; i++) {
-      const r = rand(1);
-      for (const [c, p] of table) {
-        if (r < p) {
-          line[i] = c;
-          break;
-        }
-      }
-    }
-    console.log(line.join(""));
-    n -= line.length;
+    const size = Math.min(n, BLOCK);
+    process.stdout.write(characters.pick(size, { lineLength: LINE }));
+    n -= size;
   }
 }
 
