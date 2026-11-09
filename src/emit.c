@@ -4115,6 +4115,7 @@ static Rng rng_mk(__int128 lo, __int128 hi) {
 static Rng rng_union(Rng a, Rng b) { if (!a.ok || !b.ok) return rng_none(); return (Rng){true, a.lo < b.lo ? a.lo : b.lo, a.hi > b.hi ? a.hi : b.hi}; }
 static int rv_find(const char *c) { for (int i = 0; i < rv_n; i++) if (strcmp(rv_name[i], c) == 0) return i; return -1; }
 static Rng rng_of(Expr *e) {
+    if (e && e->rng_set) return (Rng){true, e->rng_lo, e->rng_hi};
     if (!e || !e->type || !rv_valid || rv_owner != cur_func || ictx) return rng_none();
     switch (e->kind) {
     case E_NUMBER: if (e->is_int_lit) return (Rng){true, e->ival, e->ival}; return rng_none();

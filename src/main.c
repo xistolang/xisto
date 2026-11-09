@@ -294,12 +294,23 @@ static void build_qbe_cached(Program *p, const char *entry, const char *outfile)
 }
 
 /* the code is for an x86 processor with 4-lane double vectors (AVX2): --cpu=native on such a machine, or a named
-   x86-64-v3/v4 or Haswell-or-later target; never for another system (--target). Off unless XISTO_WIDE_F64=1:
-   the only user (distribute's flat pass) measured slower on the Xeon E5-2686 v4 (nbody.ts 3,10 -> 4,24 s, 09/11) */
+   x86-64-v3/v4 or Haswell-or-later target; never for another system (--target). Distribute's flat pass
+   (vsqrtpd/vdivpd over the pairs) goes with pad4's columns of 4 lanes: alone, reading x y z from three columns, it
+   measured slower on the Xeon E5-2686 v4 (nbody.ts 3,10 -> 4,24 s, 09/11); XISTO_WIDE_F64=0/1 forces it */
+static bool cpu_avx2_target(void);
 static bool cpu_wide_f64(void) {
     const char *f = getenv("XISTO_WIDE_F64");
     if (f && *f) return strcmp(f, "0") != 0;
-    if (1) return false;
+    return xs_pad4; /* only with the x y z columns of 4 lanes (pad4): alone it was slower (nbody.ts 3,10 -> 4,24 s) */
+}
+/* pad4 (columns.c, pad4.c): x y z columns of 4 lanes, on the same targets; XISTO_PAD4=0/1 forces it */
+static bool cpu_pad4(void) {
+    const char *f = getenv("XISTO_PAD4");
+    if (f && *f) return strcmp(f, "0") != 0;
+    if (getenv("XISTO_NO_PAD4")) return false;
+    return cpu_avx2_target();
+}
+static bool cpu_avx2_target(void) {
 #if defined(__x86_64__)
     if (!xs_cpu || xs_target) return false;
     if (strcmp(xs_cpu, "native") == 0) return __builtin_cpu_supports("avx2");
@@ -317,7 +328,11 @@ static Buf compile_to_c(const char *path) {
     Program *p = parse_program(path);
     last_program = p;
     inplace_program(p); /* (before the checker: a callee renamed) */
-    if (!use_qbe) columns_program(p); /* (the qbe backend takes no typed-array parameter yet) */
+    if (!use_qbe) {
+        xs_pad4 = cpu_pad4();
+        columns_program(p); /* (the qbe backend takes no typed-array parameter yet) */
+        pad4_program(p);
+    }
     if (!use_qbe) {
         xs_wide_f64 = cpu_wide_f64();
         distribute_program(p); /* (after columns: it only touches loops over columns) */

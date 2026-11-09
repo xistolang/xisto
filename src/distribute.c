@@ -72,10 +72,16 @@ static Expr *mk_assign(Expr *lhs, Expr *rhs) {
     a->rhs = rhs;
     return a;
 }
+static long long slot_pairs; /* the pair loop being split: its slot counter p (and the flat q) runs 0 .. pairs-1 */
 static Expr *mk_index(const char *arr, const char *ix, Pos pos) {
     Expr *e = mk(E_INDEX, pos);
     e->lhs = mk_ident(arr, pos);
     e->rhs = mk_ident(ix, pos);
+    if (slot_pairs > 0) { /* where a slot is read or written, p is the number of pairs before this one: in range */
+        e->rhs->rng_set = true;
+        e->rhs->rng_lo = 0;
+        e->rhs->rng_hi = slot_pairs - 1;
+    }
     return e;
 }
 static Expr *mk_inc(const char *name, Pos pos) {
@@ -136,6 +142,13 @@ typedef struct {
 } Ctx;
 
 /* the expression is pure in the sense above */
+/* 4 * v + q (pad4's lane q of element v) */
+static bool lane_ix(Expr *e, const char *v) {
+    long long q, four;
+    return e && e->kind == E_BINARY && e->op == TK_PLUS && int_lit(e->rhs, &q) && e->lhs && e->lhs->kind == E_BINARY &&
+           e->lhs->op == TK_STAR && int_lit(e->lhs->lhs, &four) && four == 4 && is_ident(e->lhs->rhs, v);
+}
+
 static bool pure(Ctx *c, Expr *e) {
     if (!e) return false;
     switch (e->kind) {
@@ -151,7 +164,7 @@ static bool pure(Ctx *c, Expr *e) {
     case E_UNARY: return e->op == TK_MINUS && !e->rhs && pure(c, e->lhs);
     case E_INDEX:
         return is_ident(e->lhs, NULL) && strstr(e->lhs->str, "__col_") && !has(c->w, e->lhs->str) && !has(c->local, e->lhs->str) &&
-               (is_ident(e->rhs, c->i) || is_ident(e->rhs, c->j));
+               (is_ident(e->rhs, c->i) || is_ident(e->rhs, c->j) || lane_ix(e->rhs, c->i) || lane_ix(e->rhs, c->j));
     case E_MEMBER:
         if (e->is_call && is_ident(e->lhs, "Math") && strcmp(e->str, "sqrt") == 0 && e->args.len == 1) {
             c->slow = true;
@@ -224,6 +237,40 @@ static bool same_bound(Expr *a, Expr *b) {
     return is_ident(a, NULL) && is_ident(b, a->str);
 }
 
+/* pad4 quads among the hoisted consts: a, b, c, a__l3 in a row (pad4.c) share one slot array of 4 lanes per pair,
+   so pass 1 stores them as one vector and pass 2 reads them back as one */
+static int quad_of(StmtList *l, bool *hoist, int s, int *lane) {
+    for (int a = s - 3; a <= s; a++) {
+        if (a < 0 || a + 3 >= l->len) continue;
+        bool ok = true;
+        for (int k = 0; k < 4; k++) if (!hoist[a + k] || l->items[a + k]->kind != S_VAR) ok = false;
+        if (!ok) continue;
+        if (strcmp(l->items[a + 3]->name, xs_sprintf("%s__l3", l->items[a]->name)) != 0) continue;
+        *lane = s - a;
+        return a;
+    }
+    return -1;
+}
+static Expr *slot_ix(StmtList *l, bool *hoist, int s, int id, const char *p, Pos pos) {
+    int lane, a = quad_of(l, hoist, s, &lane);
+    if (a < 0) return mk_index(xs_sprintf("__dist%d_%s", id, l->items[s]->name), p, pos);
+    Expr *e = mk(E_INDEX, pos);
+    e->lhs = mk_ident(xs_sprintf("__dist%d_%s4", id, l->items[a]->name), pos);
+    Expr *m = mk(E_BINARY, pos);
+    m->op = TK_STAR;
+    m->lhs = mk_int(4, pos);
+    m->rhs = mk_ident(p, pos);
+    m->rhs->rng_set = true;
+    m->rhs->rng_lo = 0;
+    m->rhs->rng_hi = slot_pairs - 1;
+    Expr *ad = mk(E_BINARY, pos);
+    ad->op = TK_PLUS;
+    ad->lhs = m;
+    ad->rhs = mk_int(lane, pos);
+    e->rhs = ad;
+    return e;
+}
+
 static Stmt *try_loop(Func *f, Stmt *outer) {
     Expr *b1, *b2;
     const char *i = loop_var(outer, NULL, &b1);
@@ -235,6 +282,7 @@ static Stmt *try_loop(Func *f, Stmt *outer) {
     long long k;
     if (!bound_value(f, b1, &k) || k < 2) return NULL;
     long long pairs = k * (k - 1) / 2;
+    slot_pairs = 0;
     if (pairs > 64) return NULL; /* (the slots live in the frame: f64-local takes at most 64 doubles) */
     Stmt *body = inner->body;
     if (!body || body->kind != S_BLOCK) return NULL;
@@ -298,17 +346,23 @@ static Stmt *try_loop(Func *f, Stmt *outer) {
     }
     if (flat) for (int s = 0; s < l->len; s++) if (stage[s] == 'B') uses_expr(l->items[s]->init, &needb);
     int id = ++dist_id;
+    slot_pairs = pairs;
     Pos pos = outer->pos;
     const char *p = xs_sprintf("__dist%d_p", id);
     Stmt *blk = mk_stmt(S_BLOCK, pos);
     for (int s = 0; s < l->len; s++) {
         if (!hoist[s]) continue;
-        const char *nm = l->items[s]->name;
-        if (!has(&need, nm) && !(flat && stage[s] == 'A' && has(&needb, nm))) continue;
+        int lane, a = quad_of(l, hoist, s, &lane);
+        bool needed = false;
+        for (int k = a < 0 ? s : a; k <= (a < 0 ? s : a + 3); k++) {
+            const char *nm = l->items[k]->name;
+            if (has(&need, nm) || (flat && stage[k] == 'A' && has(&needb, nm))) needed = true;
+        }
+        if (!needed || (a >= 0 && lane != 0)) continue;
         Expr *n = mk(E_NEW_OBJ, pos);
         n->str = "Float64Array";
-        expr_list_push(&n->args, mk_int(pairs, pos));
-        stmt_list_push(&blk->stmts, mk_var(xs_sprintf("__dist%d_%s", id, nm), n, true, pos));
+        expr_list_push(&n->args, mk_int(a < 0 ? pairs : 4 * pairs, pos));
+        stmt_list_push(&blk->stmts, mk_var(xs_sprintf("__dist%d_%s%s", id, l->items[s]->name, a < 0 ? "" : "4"), n, true, pos));
     }
     stmt_list_push(&blk->stmts, mk_var(p, mk_int(0, pos), false, pos));
     /* pass 1 */
@@ -317,8 +371,9 @@ static Stmt *try_loop(Func *f, Stmt *outer) {
         if (!hoist[s] || (flat && stage[s] != 'A')) continue;
         Stmt *st = l->items[s];
         stmt_list_push(&body1->stmts, mk_var(st->name, st->init, true, st->pos));
-        if (has(&need, st->name) || (flat && has(&needb, st->name)))
-            stmt_list_push(&body1->stmts, mk_expr_stmt(mk_assign(mk_index(xs_sprintf("__dist%d_%s", id, st->name), p, st->pos), mk_ident(st->name, st->pos))));
+        int lane;
+        if (has(&need, st->name) || (flat && has(&needb, st->name)) || quad_of(l, hoist, s, &lane) >= 0)
+            stmt_list_push(&body1->stmts, mk_expr_stmt(mk_assign(slot_ix(l, hoist, s, id, p, st->pos), mk_ident(st->name, st->pos))));
     }
     stmt_list_push(&body1->stmts, mk_expr_stmt(mk_inc(p, pos)));
     Stmt *in1 = mk_stmt(S_FOR, pos);
@@ -348,7 +403,7 @@ static Stmt *try_loop(Func *f, Stmt *outer) {
         Stmt *bb = mk_stmt(S_BLOCK, pos);
         for (int s = 0; s < l->len; s++)
             if (stage[s] == 'A' && has(&needb, l->items[s]->name))
-                stmt_list_push(&bb->stmts, mk_var(l->items[s]->name, mk_index(xs_sprintf("__dist%d_%s", id, l->items[s]->name), q, pos), true, pos));
+                stmt_list_push(&bb->stmts, mk_var(l->items[s]->name, slot_ix(l, hoist, s, id, q, pos), true, pos));
         for (int s = 0; s < l->len; s++) {
             if (stage[s] != 'B') continue;
             Stmt *st = l->items[s];
@@ -373,13 +428,14 @@ static Stmt *try_loop(Func *f, Stmt *outer) {
         Stmt *st = l->items[s];
         if (hoist[s]) {
             if (!has(&need, st->name)) continue;
-            st->init = mk_index(xs_sprintf("__dist%d_%s", id, st->name), p, st->pos);
+            st->init = slot_ix(l, hoist, s, id, p, st->pos);
         }
         stmt_list_push(&rest, st);
     }
     stmt_list_push(&rest, mk_expr_stmt(mk_inc(p, pos)));
     body->stmts = rest;
     stmt_list_push(&blk->stmts, outer);
+    slot_pairs = 0;
     if (getenv("XISTO_DISTRIBUTE_WHY")) fprintf(stderr, "distribute: pair loop over %s, %s in %s: %d consts in pass 1, %lld pairs%s\n", i, j, f->name, nh, pairs, flat ? ", flat pass for the slow ones" : "");
     return blk;
 }

@@ -32,7 +32,14 @@ typedef struct {
     Class *cls;
     int k;                 /* elements */
     int *param_field;      /* constructor parameter j -> field index (-1: not stored) */
+    /* the columns: one per field, or (pad4, x86 with AVX2) one of 4 lanes for each trio Px Py Pz (x y z, 0) */
+    int ncols;
+    const char **csuf;     /* column c's name suffix */
+    int *cw;               /* column c's lanes per element: 1, or 4 */
+    int *fcol, *flane;     /* field fi -> its column, and its lane there (-1: a column of its own) */
 } Shape;
+
+bool xs_pad4; /* main.c: the target has 4-lane double vectors (AVX2) and XISTO_NO_PAD4 is not set */
 
 /* names in scope while walking a function: what each one is */
 enum { N_OTHER, N_ARRAY, N_ELEM, N_SAFE, N_LEN };
@@ -95,7 +102,7 @@ static int field_index(Class *c, const char *name) {
         if (strcmp(c->fields[i].name, name) == 0) return i;
     return -1;
 }
-static char *col_name(const char *arr, const char *field) { return xs_sprintf("%s__col_%s", arr, field); }
+static char *col_name(const char *arr, const char *suf) { return xs_sprintf("%s__col_%s", arr, suf); }
 
 static Expr *mk(ExprKind k, Pos pos) {
     Expr *e = xs_alloc(sizeof *e);
@@ -171,6 +178,39 @@ static Shape *shape_of(Program *p, const char *cname) {
     }
     for (int i = 0; i < c->nfields; i++)
         if (!set[i]) return NULL;
+    int nf = c->nfields;
+    sh->csuf = xs_alloc(sizeof(char *) * (size_t)nf);
+    sh->cw = xs_alloc(sizeof(int) * (size_t)nf);
+    sh->fcol = xs_alloc(sizeof(int) * (size_t)nf);
+    sh->flane = xs_alloc(sizeof(int) * (size_t)nf);
+    for (int i = 0; i < nf; i++) sh->fcol[i] = -1;
+    /* pad4: fields P+"x", P+"y", P+"z" share one column, 4 lanes per element (the fourth stays 0) */
+    for (int i = 0; xs_pad4 && i < nf; i++) {
+        const char *n = c->fields[i].name;
+        size_t L = strlen(n);
+        if (sh->fcol[i] >= 0 || L == 0 || n[L - 1] != 'x') continue;
+        char *ny = xs_sprintf("%s", n), *nz = xs_sprintf("%s", n);
+        ny[L - 1] = 'y';
+        nz[L - 1] = 'z';
+        int iy = field_index(c, ny), iz = field_index(c, nz);
+        if (iy < 0 || iz < 0 || sh->fcol[iy] >= 0 || sh->fcol[iz] >= 0) continue;
+        char *pre = xs_sprintf("%.*s", (int)(L - 1), n);
+        int col = sh->ncols++;
+        sh->csuf[col] = xs_sprintf("c4_%sxyz", pre);
+        sh->cw[col] = 4;
+        sh->fcol[i] = sh->fcol[iy] = sh->fcol[iz] = col;
+        sh->flane[i] = 0;
+        sh->flane[iy] = 1;
+        sh->flane[iz] = 2;
+    }
+    for (int i = 0; i < nf; i++) {
+        if (sh->fcol[i] >= 0) continue;
+        int col = sh->ncols++;
+        sh->csuf[col] = c->fields[i].name;
+        sh->cw[col] = 1;
+        sh->fcol[i] = col;
+        sh->flane[i] = -1;
+    }
     return sh;
 }
 
@@ -242,10 +282,22 @@ static const char *safe_loop_var(Walk *w, Stmt *s) {
 }
 
 /* X[e].field and b.field: the column, indexed */
-static void to_column(Expr *e, const char *arr, Expr *index) {
-    const char *field = e->str;
+static void to_column(Expr *e, Shape *sh, const char *arr, Expr *index) {
+    int fi = field_index(sh->cls, e->str);
+    int col = sh->fcol[fi], lane = sh->flane[fi];
     e->kind = E_INDEX;
-    e->lhs = mk_ident(col_name(arr, field), e->pos);
+    e->lhs = mk_ident(col_name(arr, sh->csuf[col]), e->pos);
+    if (lane >= 0) { /* 4 * index + lane */
+        Expr *m = mk(E_BINARY, e->pos);
+        m->op = TK_STAR;
+        m->lhs = mk_int(4, e->pos);
+        m->rhs = index;
+        Expr *a = mk(E_BINARY, e->pos);
+        a->op = TK_PLUS;
+        a->lhs = m;
+        a->rhs = mk_int(lane, e->pos);
+        index = a;
+    }
     e->rhs = index;
     e->str = NULL;
 }
@@ -274,13 +326,13 @@ static void walk_expr(Walk *w, Expr *e) {
             if (field_index(w->sh->cls, e->str) < 0) { fail(w, "not a field"); return; }
             Expr *ix = e->lhs->rhs;
             if (!safe_index(w, ix)) { fail(w, "an index not proved in range"); return; }
-            if (w->rewrite) to_column(e, w->arr, ix);
+            if (w->rewrite) to_column(e, w->sh, w->arr, ix);
             return;
         }
         if (!e->is_call && is_ident(e->lhs) && kind_of(w, e->lhs->str) == N_ELEM) {
             if (w->in_arrow) { fail(w, "a closure uses an element"); return; }
             if (field_index(w->sh->cls, e->str) < 0) { fail(w, "not a field"); return; }
-            if (w->rewrite) to_column(e, w->arr, mk_ident(lookup(w, e->lhs->str)->ix, e->pos));
+            if (w->rewrite) to_column(e, w->sh, w->arr, mk_ident(lookup(w, e->lhs->str)->ix, e->pos));
             return;
         }
         walk_expr(w, e->lhs);
@@ -311,8 +363,8 @@ static void walk_expr(Walk *w, Expr *e) {
                 ExprList args = {0};
                 for (int i = 0; i < e->args.len; i++) {
                     if (i != pos) { expr_list_push(&args, e->args.items[i]); continue; }
-                    for (int fi = 0; fi < w->sh->cls->nfields; fi++)
-                        expr_list_push(&args, mk_ident(col_name(w->arr, w->sh->cls->fields[fi].name), e->args.items[i]->pos));
+                    for (int ci = 0; ci < w->sh->ncols; ci++)
+                        expr_list_push(&args, mk_ident(col_name(w->arr, w->sh->csuf[ci]), e->args.items[i]->pos));
                 }
                 for (int i = 0; i < e->args.len; i++)
                     if (i != pos) walk_expr(w, e->args.items[i]);
@@ -553,13 +605,14 @@ static bool plain_function(Func *f) {
 static void declare_columns(StmtList *out, Stmt *decl, Shape *sh) {
     Class *c = sh->cls;
     Pos pos = decl->pos;
-    for (int fi = 0; fi < c->nfields; fi++) {
+    (void)c;
+    for (int ci = 0; ci < sh->ncols; ci++) {
         Stmt *v = mk_stmt(S_VAR, pos);
-        v->name = col_name(decl->name, c->fields[fi].name);
+        v->name = col_name(decl->name, sh->csuf[ci]);
         v->is_const = true;
         Expr *n = mk(E_NEW_OBJ, pos);
         n->str = "Float64Array";
-        expr_list_push(&n->args, mk_int(sh->k, pos));
+        expr_list_push(&n->args, mk_int((long long)sh->k * sh->cw[ci], pos));
         v->init = n;
         stmt_list_push(out, v);
     }
@@ -572,8 +625,8 @@ static void declare_columns(StmtList *out, Stmt *decl, Shape *sh) {
             if (fi < 0) st->expr = ne->args.items[j];
             else {
                 Expr *ix = mk(E_INDEX, ne->args.items[j]->pos);
-                ix->lhs = mk_ident(col_name(decl->name, c->fields[fi].name), pos);
-                ix->rhs = mk_int(k, pos);
+                ix->lhs = mk_ident(col_name(decl->name, sh->csuf[sh->fcol[fi]]), pos);
+                ix->rhs = mk_int(sh->flane[fi] >= 0 ? 4LL * k + sh->flane[fi] : k, pos);
                 Expr *as = mk(E_ASSIGN, ne->args.items[j]->pos);
                 as->op = TK_ASSIGN;
                 as->lhs = ix;
@@ -598,14 +651,14 @@ static bool param_ok(Program *p, Func *f, int pos, Shape *sh, bool rewrite) {
     free(w.names);
     if (!w.ok) return false;
     if (rewrite) {
-        int nf = sh->cls->nfields;
+        int nf = sh->ncols;
         Param *ps = xs_alloc(sizeof(Param) * (size_t)(f->nparams - 1 + nf));
         int n = 0;
         for (int j = 0; j < f->nparams; j++) {
             if (j != pos) { ps[n++] = f->params[j]; continue; }
             for (int fi = 0; fi < nf; fi++) {
                 Param q = {0};
-                q.name = col_name(pr->name, sh->cls->fields[fi].name);
+                q.name = col_name(pr->name, sh->csuf[fi]);
                 q.type = f64_type();
                 ps[n++] = q;
             }

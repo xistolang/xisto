@@ -255,6 +255,8 @@ struct Expr {
     int ntargs;
     int region;        /* E_ARRAY_LIT of region objects made inside that region's loop (region.c): lives in the region */
     bool par_native;   /* E_CALL of xisto:parallel whose fn was proved independent (parallel.c): the pool version */
+    bool rng_set;      /* E_IDENT: a range the pass that built it proved (distribute.c's pair slot counter) */
+    long long rng_lo, rng_hi;
 };
 
 typedef struct {
@@ -556,6 +558,8 @@ void check_program(Program *p);
 void columns_program(Program *p); /* columns.c: a local array of number-only objects as one Float64Array per field */
 void distribute_program(Program *p); /* distribute.c: a pair loop over columns, its pure slow consts first for every pair */
 void inplace_program(Program *p); /* inplace.c: for-of over readStdinParts whose part stays in its iteration reads in place */
+extern bool xs_pad4; /* columns.c: x y z fields as one column of 4 lanes (x86 with AVX2) */
+void pad4_program(Program *p); /* pad4.c */
 extern bool xs_wide_f64; /* distribute.c: the target has 4-lane double vectors (AVX2): the slow consts that read no column go in a flat loop */
 void prune_program(Program *p); /* marks what main reaches; emitters skip the rest */
 Func *xs_parse_instance(Func *tmpl, Type **args);
