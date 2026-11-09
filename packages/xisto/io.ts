@@ -198,7 +198,10 @@ function* stdinParts(options: StdinPartsOptions, inPlace: boolean): Generator<Ui
   let start = 0; // where the part being read starts
   let scan = 0; // where the search for the next cut goes on
   for (;;) {
-    if (inPlace && start > 0) { // the parts before start are done with: what is left of the last read moves to the front
+    // the parts before start are done with: what is left of the last read moves to the front, once they take half
+    // the array or it is full (so the next part is mostly read past the last one, while that one may still be going
+    // out in xisto, and memory still holds about two parts, not the whole input)
+    if (inPlace && start > 0 && (start >= buf.length >> 1 || have === buf.length)) {
       const left = have - start;
       buf.set(buf.subarray(start, have), 0); // (in xisto, after a lent write has gone past these bytes)
       have = left;
