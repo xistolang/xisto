@@ -1,5 +1,6 @@
 /**
- * Standard input and output as bytes: read all of stdin into one array, write an array to stdout.
+ * Standard input and output as bytes: read all of stdin into one array, or part by part as it arrives; write
+ * an array to stdout.
  *
  * For programs that work on raw bytes (a DNA file, a binary format, text that does not need decoding): no
  * encoding, no line splitting, no stream events; one call to read and one to write.
@@ -77,8 +78,11 @@ export function readStdin(): Uint8Array {
  * @param bytes - The bytes to write.
  *
  * @remarks
- * Compatibility: in Node, `process.stdout.write`, which finishes the write before the program exits; in xisto,
- * the runtime's write, done when the call returns.
+ * Compatibility: in Node, `process.stdout.write`, which finishes the write before the program exits. In xisto,
+ * a block of 1 MB or more going to a pipe or a file is copied at the call and written by a thread of the runtime
+ * while the program goes on (so reading and computing the next part overlap the write); what goes out is what
+ * the bytes were at the call, in the program's order with every other output, and all of it before the program
+ * exits. Changing the array after the call changes nothing that is written, as in Node.
  *
  * @example
  * ```ts
@@ -88,4 +92,82 @@ export function readStdin(): Uint8Array {
  */
 export function writeStdout(bytes: Uint8Array): void {
   process.stdout.write(bytes);
+}
+
+/** Where {@link readStdinParts} cuts standard input: give exactly one of the two. */
+export interface StdinPartsOptions {
+  /** A new part starts at each occurrence of this character: every part but the first begins with it. */
+  splitBefore?: string;
+  /** A part ends after each occurrence of this character: every part but the last ends with it. */
+  splitAfter?: string;
+}
+
+const PART_BLOCK: int = 1 << 22; // bytes asked of each read: a part is given as soon as the next one starts
+
+/**
+ * Reads standard input part by part: each part is given as soon as it is complete, while the rest is still
+ * being read.
+ *
+ * The parts are cut at a character: with `splitBefore: ">"`, each part runs from one `>` to the next (the
+ * records of a FASTA file); with `splitAfter: "\n"`, each part is a line with its line break. Put together in
+ * order, the parts are the whole input, byte for byte.
+ *
+ * @param options - Where to cut: `splitBefore` or `splitAfter`, one ASCII character.
+ * @returns The parts, in input order. Each is a view into the input as read: change it in place freely (the
+ *   other parts do not share its bytes); bytes before the first `splitBefore` character are a part of their own.
+ * @throws Error when neither or both options are given, or the character is not one ASCII character.
+ * @throws Error when stdin cannot be read (it is closed, or is a directory).
+ *
+ * @remarks
+ * Compatibility: the same in Node and in xisto (this file, with `readSync`). With {@link writeStdout} in xisto,
+ * the write of one part overlaps the reading of the next. A file given as stdin is read into one array of its
+ * size; a pipe, into an array that grows as a part does not end.
+ *
+ * @example
+ * ```ts
+ * import { readStdinParts, writeStdout } from "xisto:io";
+ * for (const record of readStdinParts({ splitBefore: ">" })) {
+ *   writeStdout(record.reverse()); // each record back to front, in order
+ * }
+ * ```
+ */
+export function* readStdinParts(options: StdinPartsOptions = {}): Generator<Uint8Array> {
+  const { splitBefore = "", splitAfter = "" } = options;
+  if ((splitBefore === "") === (splitAfter === "")) {
+    throw new Error("readStdinParts: give one of splitBefore or splitAfter");
+  }
+  const at = splitBefore !== "" ? splitBefore : splitAfter;
+  const mark = at.length === 1 ? Math.trunc(at.charCodeAt(0)) : 128; // (a char code is an int)
+  if (mark > 127) throw new Error(`readStdinParts: expected one ASCII character to split at, got ${JSON.stringify(at)}`);
+  const after = splitAfter !== "";
+  const file = fstatSync(0).isFile();
+  let buf = new Uint8Array(file ? fstatSync(0).size + 1 : 1 << 20); // (a file: one byte more, so its end is a read of 0)
+  let have = 0; // bytes read into buf
+  let start = 0; // where the part being read starts
+  let scan = 0; // where the search for the next cut goes on
+  for (;;) {
+    if (have === buf.length) { // the part has not ended: room for more, keeping it at the front
+      const bigger = new Uint8Array(Math.max(buf.length * 2, 1 << 20));
+      bigger.set(buf.subarray(start, have));
+      have -= start;
+      scan -= start;
+      start = 0;
+      buf = bigger;
+    }
+    const n = readSync(0, buf, have, Math.min(PART_BLOCK, buf.length - have), null);
+    if (n <= 0) break;
+    have += n;
+    for (;;) {
+      const found = buf.subarray(scan, have).indexOf(mark);
+      if (found < 0) {
+        scan = have;
+        break;
+      }
+      const cut = after ? scan + found + 1 : scan + found;
+      if (cut > start) yield buf.subarray(start, cut);
+      start = cut;
+      scan = scan + found + 1;
+    }
+  }
+  if (have > start) yield buf.subarray(start, have);
 }

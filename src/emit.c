@@ -1619,6 +1619,7 @@ static void emit_member(Expr *e) {
             if (nzp) emit_nzd(a); else emit_borrowed(a);
             buf_puts(out, "; ");
         }
+        buf_puts(out, "xs_out_drain(); "); /* (XB-091: stdout written behind goes out first) */
         for (int i = 0; i < e->args.len; i++) {
             Expr *a = e->args.items[i];
             if (i) buf_puts(out, "xs_print_sep(); ");
