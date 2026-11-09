@@ -5957,7 +5957,9 @@ static bool dctr_is(Expr *e) {
    everywhere in the condition and the body c <= i <= max(c, E). The loop is emitted twice: without the checks of
    a[i] (and of E's own arithmetic), run when c < a.length and E < a.length for each such a (the arrays the body
    cannot resize, bce_ok) and E is a safe integer; and as written otherwise, which fails where it failed.
-   (fannkuch-redux's next permutation as one writes it first: count[i].) XISTO_NO_WIB=1 keeps the checks. */
+   (fannkuch-redux's next permutation as one writes it first: count[i].) Off unless XISTO_WIB=1: measured on the
+   Xeon E5-2686 v4 it gains nothing there (1.31-1.35 u against 1.31 u without, n = 11, one CPU): the guard runs once
+   per permutation and the loop it covers rarely runs more than once. */
 static bool wib_busy;
 static bool wib_e_ok(Expr *e) { /* a literal, a name, or a name +/- a literal */
     if (!e || !e->type || e->type->kind != TY_INT) return false;
@@ -6008,7 +6010,7 @@ static void wib_arrays_s(Stmt *s, const char *i, const char **arrs, Type **ts, i
 }
 /* the guard (C) of while loop w in block b at index wi, its counter and bound in *ci and *E; NULL when it does not apply */
 static char *wib_match(Stmt *b, int wi, Stmt *w, const char **ci, Expr **E, const char **arrs, int *na) {
-    if (wib_busy || xs_debug || sm_mode || ictx || getenv("XISTO_NO_WIB") || getenv("XISTO_NO_BCE") || !b || !w->body || w->body->kind != S_BLOCK) return NULL;
+    if (wib_busy || xs_debug || sm_mode || ictx || !getenv("XISTO_WIB") || getenv("XISTO_NO_BCE") || !b || !w->body || w->body->kind != S_BLOCK) return NULL;
     Stmt *body = w->body;
     const char *i = NULL;
     int inc = -1;
@@ -6039,9 +6041,11 @@ static char *wib_match(Stmt *b, int wi, Stmt *w, const char **ci, Expr **E, cons
     wib_e_c(&g, e);
     buf_puts(&g, ") >= -INT64_C(9007199254740991)");
     for (int k = 0; k < keep; k++) {
-        buf_printf(&g, " && INT64_C(%lld) < %s && (", (long long)dv->init->ival, bce_len_c(arrs[k], ts[k]));
+        int fk = fx_find(arrs[k]);
+        const char *len = fk >= 0 && fx_decl[fk] ? xs_sprintf("%s_fxl", ren(arrs[k])) : bce_len_c(arrs[k], ts[k]); /* (a C local under fix-hoist) */
+        buf_printf(&g, " && INT64_C(%lld) < %s && (", (long long)dv->init->ival, len);
         wib_e_c(&g, e);
-        buf_printf(&g, ") < %s", bce_len_c(arrs[k], ts[k]));
+        buf_printf(&g, ") < %s", len);
     }
     *ci = i; *E = e; *na = keep;
     return g.data;
