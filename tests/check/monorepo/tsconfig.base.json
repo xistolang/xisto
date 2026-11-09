@@ -1,0 +1,10 @@
+{
+  // the paths every app sees
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@lib/*": ["libs/*/src"],
+      "@app/util": ["libs/util/src/index.ts"],
+    },
+  },
+}

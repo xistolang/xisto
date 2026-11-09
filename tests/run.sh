@@ -89,6 +89,20 @@ for f in tests/err/*.ts; do
     fi
 done
 
+# xisto check: each folder of tests/check is a small project; its summary, its --details and its exit status are
+# checked in (expected.summary, expected.details, expected.rc)
+for d in tests/check/*/; do
+    d=${d%/}
+    name=check-$(basename "$d")
+    $XISTO check "$d" > "$OUT/$name.summary" 2>&1; rc=$?
+    $XISTO check --details "$d" > "$OUT/$name.details" 2>&1
+    if [ "$rc" = "$(cat "$d/expected.rc")" ] && cmp -s "$OUT/$name.summary" "$d/expected.summary" && cmp -s "$OUT/$name.details" "$d/expected.details"; then
+        pass=$((pass+1))
+    else
+        echo "FAIL $d: xisto check (exit $rc)"; diff "$d/expected.summary" "$OUT/$name.summary" | head; diff "$d/expected.details" "$OUT/$name.details" | head; fail=$((fail+1))
+    fi
+done
+
 # stderr: console.error/warn go to stderr and log/info/debug to stdout, each as Node writes it (the expected files are
 # Node's two streams, checked in: the tests/ok oracle merges them)
 for f in tests/stderr/*.ts; do

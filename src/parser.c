@@ -1,3 +1,4 @@
+#include <sys/stat.h>
 #include <errno.h>
 #include <ctype.h>
 #include "xisto.h"
@@ -66,7 +67,7 @@ static const char *found(Parser *p) {
 }
 
 static Token expect(Parser *p, TokKind k, const char *help) {
-    if (!at(p, k)) xs_error(p->tok.pos, help, "expected %s but found %s", tok_kind_name(k), found(p));
+    if (!at(p, k)) xs_error(XS1008, p->tok.pos, help, "expected %s but found %s", tok_kind_name(k), found(p));
     Token t = p->tok;
     next(p);
     return t;
@@ -130,6 +131,7 @@ static bool looks_like_fn_type(Parser *p) {
 static Type *union_of(Type *a, Type *b);
 static Type *parse_type(Parser *p) {
     Type *t;
+    accept(p, TK_PIPE); /* type T =\n  | "a"\n  | "b": a union may open with '|' */
     if (at(p, TK_LBRACKET)) { /* [A, B]: a tuple */
         next(p);
         Type **ps = NULL;
@@ -151,7 +153,7 @@ static Type *parse_type(Parser *p) {
         }
         if (at(p, TK_PIPE)) {
             next(p);
-            if (!at_ident(p, "null")) xs_error(p->tok.pos, "the only union with a tuple xisto supports is [A, B] | null", "expected 'null' after '|'");
+            if (!at_ident(p, "null")) xs_error(XS1013, p->tok.pos, "the only union with a tuple xisto supports is [A, B] | null", "expected 'null' after '|'");
             next(p);
             t = ty_nullable_of(t);
         }
@@ -176,7 +178,7 @@ static Type *parse_type(Parser *p) {
         }
         if (at(p, TK_PIPE)) {
             next(p);
-            if (!at_ident(p, "null")) xs_error(p->tok.pos, "the only union xisto supports is T | null", "expected 'null' after '|'");
+            if (!at_ident(p, "null")) xs_error(XS1013, p->tok.pos, "the only union xisto supports is T | null", "expected 'null' after '|'");
             next(p);
             t = ty_nullable_of(t);
         }
@@ -201,7 +203,7 @@ static Type *parse_type(Parser *p) {
         return ty_func(params, n, parse_type(p));
     }
     if (!at(p, TK_IDENT))
-        xs_error(p->tok.pos, "supported types: number, int, boolean, string, void, T[], class names, (a: A) => R", "expected a type but found %s", found(p));
+        xs_error(XS1019, p->tok.pos, "supported types: number, int, boolean, string, void, T[], class names, (a: A) => R", "expected a type but found %s", found(p));
     Token name = p->tok;
     const char *n = name.str;
     next(p);
@@ -214,7 +216,7 @@ static Type *parse_type(Parser *p) {
     else if (strcmp(n, "unknown") == 0) t = ty_unknown;
 
     else if (strcmp(n, "any") == 0)
-        xs_error(name.pos, "every value in xisto has one static type", "'any' is not supported");
+        xs_error(XS2007, name.pos, "every value in xisto has one static type", "'any' is not supported");
     else if (strcmp(n, "Promise") == 0) { /* Promise<T> is T: async is syntax only */
         expect(p, TK_LT, "write Promise<T>");
         t = parse_type(p);
@@ -249,9 +251,9 @@ static Type *parse_type(Parser *p) {
         t = ty_stream_of(parse_type(p));
         expect(p, TK_GT, NULL);
     } else if (strcmp(n, "null") == 0) {
-        xs_error(name.pos, "write the nullable type as T | null", "'null' alone is not a type");
+        xs_error(XS2008, name.pos, "write the nullable type as T | null", "'null' alone is not a type");
     } else if (strcmp(n, "undefined") == 0) {
-        xs_error(name.pos, "xisto has no undefined; use T | null", "'undefined' is not a type");
+        xs_error(XS2009, name.pos, "xisto has no undefined; use T | null", "'undefined' is not a type");
     } else if (nsubst && ({ int k_ = -1; for (int i_ = 0; i_ < nsubst; i_++) if (strcmp(subst_names[i_], n) == 0) k_ = i_; k_ >= 0 ? (t = subst_types[k_], 1) : 0; })) {
         /* an instance: T is the type it was made for */
     } else if (({ bool tp_ = false; for (int i_ = 0; i_ < ntp; i_++) if (strcmp(tp_names[i_], n) == 0) tp_ = true; tp_; })) {
@@ -316,7 +318,7 @@ static void parse_args(Parser *p, ExprList *out) {
         do {
             if (at(p, TK_RPAREN)) break; /* trailing comma */
             if (at(p, TK_ELLIPSIS))
-                xs_error(p->tok.pos, "pass the array itself: f(xs), with a parameter xs: T[]", "spreading arguments into a call is not supported (xisto has no rest parameters)");
+                xs_error(XS6032, p->tok.pos, "pass the array itself: f(xs), with a parameter xs: T[]", "spreading arguments into a call is not supported (xisto has no rest parameters)");
             expr_list_push(out, parse_expr(p));
         } while (accept(p, TK_COMMA));
     }
@@ -435,7 +437,7 @@ static Expr *parse_primary(Parser *p) {
         Expr *e = new_expr(E_REGEX, pos);
         p->lx.pos = (size_t)(p->tok.start - p->lx.src);
         p->lx.col = pos.col;
-        if (!lexer_regex(&p->lx, p->tok.start, &e->str, &e->rflags)) xs_error(pos, "close it: /pattern/flags", "unterminated regular expression");
+        if (!lexer_regex(&p->lx, p->tok.start, &e->str, &e->rflags)) xs_error(XS1034, pos, "close it: /pattern/flags", "unterminated regular expression");
         next(p);
         return e;
     }
@@ -526,9 +528,9 @@ static Expr *parse_primary(Parser *p) {
                 sub.prog = p->prog;
                 sub.mod = p->mod;
                 next(&sub);
-                if (at(&sub, TK_EOF)) xs_error((Pos){line, col}, NULL, "empty ${} in template literal");
+                if (at(&sub, TK_EOF)) xs_error(XS1007, (Pos){line, col}, NULL, "empty ${} in template literal");
                 Expr *inner = parse_expr(&sub);
-                if (!at(&sub, TK_EOF)) xs_error(sub.tok.pos, NULL, "unexpected %s inside ${}", tok_kind_name(sub.tok.kind));
+                if (!at(&sub, TK_EOF)) xs_error(XS1028, sub.tok.pos, NULL, "unexpected %s inside ${}", tok_kind_name(sub.tok.kind));
                 expr_list_push(&e->args, inner);
                 for (const char *c = start_expr; c < q; c++) { if (*c == '\n') { line++; col = 1; } else col++; }
                 q++; col++; /* closing brace */
@@ -537,7 +539,7 @@ static Expr *parse_primary(Parser *p) {
             if (*q == '\\') {
                 const char *bad = NULL;
                 int n = xs_unescape(q + 1, &lit, &bad);
-                if (!n) xs_error((Pos){line, col}, bad, "malformed escape sequence in template literal");
+                if (!n) xs_error(XS1025, (Pos){line, col}, bad, "malformed escape sequence in template literal");
                 for (int k = 0; k <= n; k++) { if (q[k] == '\n') { line++; col = 1; } else col++; }
                 q += n + 1;
                 continue;
@@ -561,7 +563,7 @@ static Expr *parse_primary(Parser *p) {
     }
     case TK_ASYNC: {
         next(p);
-        if (!looks_like_arrow(p)) xs_error(pos, NULL, "expected an arrow function after 'async'");
+        if (!looks_like_arrow(p)) xs_error(XS1020, pos, NULL, "expected an arrow function after 'async'");
         Expr *e = parse_arrow(p);
         e->arrow->fn->is_async = true;
         return e;
@@ -600,11 +602,11 @@ static Expr *parse_primary(Parser *p) {
         while (!at(p, TK_RBRACE)) {
             Token key;
             if (at(p, TK_IDENT) || at(p, TK_STRING)) { key = p->tok; next(p); }
-            else { xs_error(p->tok.pos, "keys are names or strings: { id: 1, \"Content-Type\": \"x\" }", "expected a key in the object literal"); return NULL; }
+            else { xs_error(XS1018, p->tok.pos, "keys are names or strings: { id: 1, \"Content-Type\": \"x\" }", "expected a key in the object literal"); return NULL; }
             Expr *val;
             if (accept(p, TK_COLON)) val = parse_assign(p);
             else { /* shorthand { id } */
-                if (key.kind != TK_IDENT) xs_error(key.pos, NULL, "a string key needs a value");
+                if (key.kind != TK_IDENT) xs_error(XS8078, key.pos, NULL, "a string key needs a value");
                 val = new_expr(E_IDENT, key.pos);
                 val->str = key.str;
             }
@@ -675,7 +677,7 @@ static Expr *parse_primary(Parser *p) {
             expect(p, TK_LPAREN, NULL);
             if (!at(p, TK_RPAREN)) { /* new Map<K, V>(entries) / new Set<T>(values): an array to start from */
                 expr_list_push(&e->args, parse_expr(p));
-                if (at(p, TK_COMMA)) xs_error(p->tok.pos, NULL, "new Map/Set takes at most one argument");
+                if (at(p, TK_COMMA)) xs_error(XS7072, p->tok.pos, NULL, "new Map/Set takes at most one argument");
             }
             expect(p, TK_RPAREN, NULL);
             return e;
@@ -694,10 +696,10 @@ static Expr *parse_primary(Parser *p) {
         return e;
     }
     case TK_FUNCTION:
-        xs_error(pos, "declare the function at the top level and pass its name", "function expressions are not supported");
+        xs_error(XS6025, pos, "declare the function at the top level and pass its name", "function expressions are not supported");
         return NULL;
     default:
-        xs_error(pos, NULL, "expected an expression but found %s", found(p));
+        xs_error(XS1021, pos, NULL, "expected an expression but found %s", found(p));
         return NULL;
     }
 }
@@ -825,7 +827,7 @@ static Expr *binary(TokKind op, Pos pos, Expr *l, Expr *r) {
 static Expr *parse_pow(Parser *p) {
     Expr *e = parse_unary(p);
     if (at(p, TK_STARSTAR)) {
-        if (e->kind == E_UNARY && !(p->prev_end && p->prev_end[-1] == ')')) xs_error(p->tok.pos, "write (-a) ** b or -(a ** b)", "a unary operator before ** needs parentheses");
+        if (e->kind == E_UNARY && !(p->prev_end && p->prev_end[-1] == ')')) xs_error(XS1006, p->tok.pos, "write (-a) ** b or -(a ** b)", "a unary operator before ** needs parentheses");
         Pos pos = p->tok.pos;
         next(p);
         return binary(TK_STARSTAR, pos, e, parse_pow(p));
@@ -944,7 +946,7 @@ static Expr *parse_assign(Parser *p) {
         Pos pos = shr ? shr_pos : p->tok.pos;
         TokKind op = shr ? shr : p->tok.kind;
         if (lhs->kind != E_IDENT && lhs->kind != E_INDEX && !(lhs->kind == E_MEMBER && !lhs->is_call))
-            xs_error(pos, NULL, "the left side of an assignment must be a variable, a field or an array element");
+            xs_error(XS8139, pos, NULL, "the left side of an assignment must be a variable, a field or an array element");
         if (!shr) next(p);
         Expr *e = new_expr(E_ASSIGN, pos);
         e->op = op;
@@ -959,7 +961,7 @@ static Expr *parse_expr(Parser *p) { return parse_assign(p); }
 
 static void expect_semi(Parser *p) {
     if (!at(p, TK_SEMI))
-        xs_error(p->tok.pos, "xisto requires explicit semicolons; automatic semicolon insertion is not supported",
+        xs_error(XS1009, p->tok.pos, "xisto requires explicit semicolons; automatic semicolon insertion is not supported",
                  "expected ';' but found %s", found(p));
     next(p);
 }
@@ -995,10 +997,10 @@ static void destructure(Parser *p, Stmt *holder, bool is_const, bool array) {
             d->is_const = is_const;
             d->init = sl;
             stmt_list_push(&p->pending, d);
-            if (!at(p, TK_RBRACKET)) xs_error(p->tok.pos, NULL, "the rest element must be the last one");
+            if (!at(p, TK_RBRACKET)) xs_error(XS8140, p->tok.pos, NULL, "the rest element must be the last one");
             break;
         }
-        if (at(p, TK_DOT) || at(p, TK_ELLIPSIS)) xs_error(p->tok.pos, "name the fields one by one", "'...rest' in an object destructuring is not supported");
+        if (at(p, TK_DOT) || at(p, TK_ELLIPSIS)) xs_error(XS6006, p->tok.pos, "name the fields one by one", "'...rest' in an object destructuring is not supported");
         Token nm = expect(p, TK_IDENT, array ? "a name for the element" : "a field name");
         const char *field = nm.str, *var = nm.str;
         if (!array && accept(p, TK_COLON)) var = expect(p, TK_IDENT, "the name to give the field: { field: name }").str;
@@ -1057,7 +1059,7 @@ static Stmt *parse_var(Parser *p) {
     s->name = name.str;
     if (accept(p, TK_COLON)) s->decl_type = parse_type(p);
     if (!at(p, TK_ASSIGN))
-        xs_error(p->tok.pos, "xisto has no 'undefined', so every variable starts with a value", "variable '%s' must be initialized", s->name);
+        xs_error(XS8146, p->tok.pos, "xisto has no 'undefined', so every variable starts with a value", "variable '%s' must be initialized", s->name);
     next(p);
     s->init = parse_expr(p);
     while (at(p, TK_COMMA)) { /* let a = 1, b = 2: the next ones follow as their own declarations */
@@ -1068,7 +1070,7 @@ static Stmt *parse_var(Parser *p) {
         d->name = nm.str;
         if (accept(p, TK_COLON)) d->decl_type = parse_type(p);
         if (!at(p, TK_ASSIGN))
-            xs_error(p->tok.pos, "xisto has no 'undefined', so every variable starts with a value", "variable '%s' must be initialized", d->name);
+            xs_error(XS8146, p->tok.pos, "xisto has no 'undefined', so every variable starts with a value", "variable '%s' must be initialized", d->name);
         next(p);
         d->init = parse_expr(p);
         stmt_list_push(&p->pending, d);
@@ -1089,7 +1091,7 @@ static Stmt *parse_block(Parser *p) {
     Stmt *b = new_stmt(S_BLOCK, p->tok.pos);
     expect(p, TK_LBRACE, NULL);
     while (!at(p, TK_RBRACE)) {
-        if (at(p, TK_EOF)) xs_error(p->tok.pos, NULL, "unexpected end of file inside a block");
+        if (at(p, TK_EOF)) xs_error(XS1031, p->tok.pos, NULL, "unexpected end of file inside a block");
         stmt_list_push(&b->stmts, parse_stmt(p));
         drain_pending(p, &b->stmts, NULL, false);
     }
@@ -1099,13 +1101,13 @@ static Stmt *parse_block(Parser *p) {
 
 static Stmt *parse_body(Parser *p) {
     if (!at(p, TK_LBRACE))
-        xs_error(p->tok.pos, "xisto requires braces around the body of if, else, while and for", "expected '{'");
+        xs_error(XS1015, p->tok.pos, "xisto requires braces around the body of if, else, while and for", "expected '{'");
     return parse_block(p);
 }
 /* the body of if, else, while and for: a block, or (as in TypeScript) one statement, which is then a block of one */
 static Stmt *parse_loop_body(Parser *p) {
     if (at(p, TK_LBRACE)) return parse_block(p);
-    if (at(p, TK_LET) || at(p, TK_CONST)) xs_error(p->tok.pos, "put it in braces: { let x = ...; }", "a declaration cannot be the body of if, else, while or for");
+    if (at(p, TK_LET) || at(p, TK_CONST)) xs_error(XS6013, p->tok.pos, "put it in braces: { let x = ...; }", "a declaration cannot be the body of if, else, while or for");
     Stmt *b = new_stmt(S_BLOCK, p->tok.pos);
     stmt_list_push(&b->stmts, parse_stmt(p));
     return b;
@@ -1114,7 +1116,7 @@ static Stmt *parse_loop_body(Parser *p) {
 static Stmt *parse_stmt(Parser *p) {
     Pos pos = p->tok.pos;
     if (!p->in_gen && at_ident(p, "yield") && !peek_is(p, TK_ASSIGN) && !peek_is(p, TK_LPAREN) && !peek_is(p, TK_DOT) && !peek_is(p, TK_SEMI))
-        xs_error(pos, "make it a generator: function* name(): Generator<T> { ... }", "'yield' is used inside a generator");
+        xs_error(XS8070, pos, "make it a generator: function* name(): Generator<T> { ... }", "'yield' is used inside a generator");
     if (p->in_gen && at_ident(p, "yield")) { /* yield v;  yield* other;  (statements, in a generator) */
         next(p);
         if (accept(p, TK_STAR)) { /* for (const v of other) yield v; */
@@ -1135,7 +1137,7 @@ static Stmt *parse_stmt(Parser *p) {
             return loop;
         }
         Stmt *y = new_stmt(S_YIELD, pos);
-        if (at(p, TK_SEMI) || at(p, TK_RBRACE)) xs_error(pos, "yield a value: yield x;", "a generator yields values");
+        if (at(p, TK_SEMI) || at(p, TK_RBRACE)) xs_error(XS8075, pos, "yield a value: yield x;", "a generator yields values");
         y->expr = parse_expr(p);
         expect_semi(p);
         return y;
@@ -1180,7 +1182,7 @@ static Stmt *parse_stmt(Parser *p) {
                 if (at(p, TK_LBRACKET) || at(p, TK_LBRACE)) { /* for (const [k, v] of e): the pattern opens the body */
                     Stmt *holder = new_stmt(S_VAR, p->tok.pos);
                     destructure(p, holder, is_const, at(p, TK_LBRACKET));
-                    if (!at_ident(p, "of")) xs_error(p->tok.pos, NULL, "expected 'of' after the destructuring of a for loop");
+                    if (!at_ident(p, "of")) xs_error(XS1014, p->tok.pos, NULL, "expected 'of' after the destructuring of a for loop");
                     next(p);
                     s->kind = S_FOROF;
                     s->name = holder->name;
@@ -1212,14 +1214,14 @@ static Stmt *parse_stmt(Parser *p) {
                         s->body = parse_loop_body(p);
                         return s;
                     }
-                    if (at_ident(p, "in")) xs_error(p->tok.pos, "use for (const x of array) or a classic for loop", "'for...in' is not supported");
+                    if (at_ident(p, "in")) xs_error(XS6010, p->tok.pos, "use for (const x of array) or a classic for loop", "'for...in' is not supported");
                 }
                 *p = save;
             }
             s->for_init = parse_var(p);
             if (p->pending.len) {
                 if (s->for_init->kind != S_VAR || !s->for_init->name || s->for_init->init == NULL)
-                    xs_error(s->for_init->pos, "declare the others before the loop", "a for loop declares one variable (or destructures) in xisto");
+                    xs_error(XS6014, s->for_init->pos, "declare the others before the loop", "a for loop declares one variable (or destructures) in xisto");
                 stmt_list_push(&hoisted, s->for_init);
                 for (int i = 0; i < p->pending.len; i++) stmt_list_push(&hoisted, p->pending.items[i]);
                 for (int i = 0; i < hoisted.len; i++) hoisted.items[i]->for_head = true;
@@ -1264,7 +1266,7 @@ static Stmt *parse_stmt(Parser *p) {
         next(p);
         Stmt *s = new_stmt(S_TRY, pos);
         s->body = parse_body(p);
-        if (!at(p, TK_CATCH) && !at_ident(p, "finally")) xs_error(p->tok.pos, NULL, "expected 'catch' or 'finally' after the try block");
+        if (!at(p, TK_CATCH) && !at_ident(p, "finally")) xs_error(XS1010, p->tok.pos, NULL, "expected 'catch' or 'finally' after the try block");
         if (accept(p, TK_CATCH)) {
             if (accept(p, TK_LPAREN)) {
                 s->name = expect(p, TK_IDENT, NULL).str;
@@ -1285,7 +1287,7 @@ static Stmt *parse_stmt(Parser *p) {
     case TK_CONTINUE: {
         Stmt *s = new_stmt(p->tok.kind == TK_BREAK ? S_BREAK : S_CONTINUE, pos);
         next(p);
-        if (at(p, TK_IDENT)) xs_error(p->tok.pos, NULL, "labels are not supported");
+        if (at(p, TK_IDENT)) xs_error(XS6026, p->tok.pos, NULL, "labels are not supported");
         expect_semi(p);
         return s;
     }
@@ -1302,7 +1304,7 @@ static Stmt *parse_stmt(Parser *p) {
             Case c = {0};
             c.pos = p->tok.pos;
             if (accept(p, TK_DEFAULT)) {
-                if (has_default) xs_error(c.pos, NULL, "two default cases");
+                if (has_default) xs_error(XS1027, c.pos, NULL, "two default cases");
                 has_default = true;
             } else {
                 expect(p, TK_CASE, "expected 'case' or 'default'");
@@ -1311,7 +1313,7 @@ static Stmt *parse_stmt(Parser *p) {
             expect(p, TK_COLON, NULL);
             c.body = new_stmt(S_BLOCK, p->tok.pos);
             while (!at(p, TK_CASE) && !at(p, TK_DEFAULT) && !at(p, TK_RBRACE)) {
-                if (at(p, TK_EOF)) xs_error(p->tok.pos, NULL, "unexpected end of file inside switch");
+                if (at(p, TK_EOF)) xs_error(XS1032, p->tok.pos, NULL, "unexpected end of file inside switch");
                 stmt_list_push(&c.body->stmts, parse_stmt(p));
                 drain_pending(p, &c.body->stmts, NULL, false);
             }
@@ -1335,15 +1337,15 @@ static Stmt *parse_stmt(Parser *p) {
         return parse_block(p);
     case TK_FUNCTION:
     case TK_ASYNC:
-        xs_error(pos, "move it to the top level of the file", "nested functions are not supported");
+        xs_error(XS6028, pos, "move it to the top level of the file", "nested functions are not supported");
         return NULL;
     case TK_IMPORT:
     case TK_EXPORT:
-        xs_error(pos, "imports and exports go at the top level of the file", "'%s' is not allowed here", p->tok.kind == TK_IMPORT ? "import" : "export");
+        xs_error(XS6004, pos, "imports and exports go at the top level of the file", "'%s' is not allowed here", p->tok.kind == TK_IMPORT ? "import" : "export");
         return NULL;
     case TK_CLASS:
     case TK_ENUM:
-        xs_error(pos, "move it to the top level of the file", "nested classes and enums are not supported");
+        xs_error(XS6027, pos, "move it to the top level of the file", "nested classes and enums are not supported");
         return NULL;
     default: {
         Stmt *s = new_stmt(S_EXPR, pos);
@@ -1385,7 +1387,7 @@ static void parse_params_ex(Parser *p, Func *f, bool is_ctor) {
         parse_decorators(p, &prm.decos);
         Pos mpos = p->tok.pos;
         while (at_ident(p, "public") || at_ident(p, "private") || at_ident(p, "protected") || at_ident(p, "readonly")) {
-            if (!is_ctor) xs_error(p->tok.pos, NULL, "'%s' applies to constructor parameters only", p->tok.str);
+            if (!is_ctor) xs_error(XS8044, p->tok.pos, NULL, "'%s' applies to constructor parameters only", p->tok.str);
             prm.is_prop = true;
             if (at_ident(p, "private")) prm.access = 2;
             else if (at_ident(p, "protected")) prm.access = 1;
@@ -1406,7 +1408,7 @@ static void parse_params_ex(Parser *p, Func *f, bool is_ctor) {
         } else name = expect(p, TK_IDENT, NULL);
         bool opt = accept(p, TK_QUESTION);
         if (!at(p, TK_COLON))
-            xs_error(p->tok.pos, "parameters need an explicit type: (n: number)", "parameter '%s' has no type", name.str);
+            xs_error(XS3013, p->tok.pos, "parameters need an explicit type: (n: number)", "parameter '%s' has no type", name.str);
         next(p);
         prm.name = name.str;
         const char *tfrom = p->tok.start;
@@ -1418,7 +1420,7 @@ static void parse_params_ex(Parser *p, Func *f, bool is_ctor) {
         }
         if (accept(p, TK_ASSIGN)) prm.dflt = parse_expr(p);
         if (!prm.dflt && f->nparams > 0 && f->params[f->nparams - 1].dflt)
-            xs_error(name.pos, "give it a default too, or move it before the optional ones", "parameter '%s' follows an optional parameter", name.str);
+            xs_error(XS9029, name.pos, "give it a default too, or move it before the optional ones", "parameter '%s' follows an optional parameter", name.str);
         f->params[f->nparams++] = prm;
         if (!accept(p, TK_COMMA)) break;
     }
@@ -1453,7 +1455,7 @@ static void parse_generic_rest(Parser *p, Func *f, bool method) {
     if (method) parse_params_ex(p, f, false);
     else parse_params(p, f);
     if (!at(p, TK_COLON))
-        xs_error(p->tok.pos, method ? "write the return type: ping(): string { ... }" : "write the return type: function f(): number { ... }",
+        xs_error(XS3001, p->tok.pos, method ? "write the return type: ping(): string { ... }" : "write the return type: function f(): number { ... }",
                  "%s '%s' has no return type", method ? "method" : "function", f->name);
     next(p);
     const char *rfrom = p->tok.start;
@@ -1535,12 +1537,12 @@ static Class *parse_interface(Parser *p) {
         expect(p, TK_GT, NULL);
     }
     if (at_ident(p, "extends")) { /* interface B extends A, C: their fields first */
-        if (is_type) xs_error(p->tok.pos, NULL, "a type alias does not extend; use interface B extends A");
+        if (is_type) xs_error(XS8079, p->tok.pos, NULL, "a type alias does not extend; use interface B extends A");
         next(p);
         do {
             c->iface_bases = realloc(c->iface_bases, sizeof(char *) * (size_t)(c->niface_bases + 1));
             c->iface_bases[c->niface_bases++] = expect(p, TK_IDENT, NULL).str;
-            if (at(p, TK_LT)) xs_error(p->tok.pos, NULL, "extending a generic interface is not supported yet");
+            if (at(p, TK_LT)) xs_error(XS6023, p->tok.pos, NULL, "extending a generic interface is not supported yet");
         } while (accept(p, TK_COMMA));
     }
     if (is_type) {
@@ -1572,13 +1574,13 @@ static Class *parse_class_ex(Parser *p, bool abstract) {
             if (at_ident(p, "extends")) { next(p); parse_type(p); }
         } while (accept(p, TK_COMMA));
         expect(p, TK_GT, "close the type parameters: class Name<T, U>");
-        if (at_ident(p, "extends")) xs_error(p->tok.pos, NULL, "a generic class cannot extend another class yet");
+        if (at_ident(p, "extends")) xs_error(XS6015, p->tok.pos, NULL, "a generic class cannot extend another class yet");
     }
     if (at_ident(p, "extends")) {
         next(p);
         c->base_pos = p->tok.pos;
         c->base_name = expect(p, TK_IDENT, NULL).str;
-        if (at(p, TK_LT)) xs_error(p->tok.pos, NULL, "extending a generic class is not supported yet");
+        if (at(p, TK_LT)) xs_error(XS6022, p->tok.pos, NULL, "extending a generic class is not supported yet");
     }
     if (at_ident(p, "implements")) { /* recorded; the methods are what the framework calls */
         next(p);
@@ -1600,7 +1602,7 @@ static Class *parse_class_ex(Parser *p, bool abstract) {
         parse_fields_body(p, c);
         tp_names = saved;
         ntp = saved_n;
-        if (c->nsfields || c->nsmethods) xs_error(c->pos, NULL, "a generic class has no static members yet");
+        if (c->nsfields || c->nsmethods) xs_error(XS6016, c->pos, NULL, "a generic class has no static members yet");
         return c;
     }
     parse_fields_body(p, c);
@@ -1636,13 +1638,13 @@ Class *xs_parse_class_instance(Class *tmpl, Type **args, const char *name) {
 static void parse_fields_body(Parser *p, Class *c) {
     expect(p, TK_LBRACE, NULL);
     while (!at(p, TK_RBRACE)) {
-        if (at(p, TK_EOF)) xs_error(p->tok.pos, NULL, "unexpected end of file inside '%s'", c->name);
+        if (at(p, TK_EOF)) xs_error(XS1030, p->tok.pos, NULL, "unexpected end of file inside '%s'", c->name);
         DecoList decos = {0};
         parse_decorators(p, &decos);
         Pos pos = p->tok.pos;
         int mods = skip_modifiers(p);
-        if ((mods & MOD_ABSTRACT) && !c->is_abstract) xs_error(pos, "write abstract class Name", "an abstract member needs an abstract class");
-        if ((mods & MOD_STATIC) && c->is_interface) xs_error(pos, NULL, "interfaces have no static members");
+        if ((mods & MOD_ABSTRACT) && !c->is_abstract) xs_error(XS8080, pos, "write abstract class Name", "an abstract member needs an abstract class");
+        if ((mods & MOD_STATIC) && c->is_interface) xs_error(XS8109, pos, NULL, "interfaces have no static members");
         bool is_async = accept(p, TK_ASYNC);
         bool gen_method = !c->is_interface && accept(p, TK_STAR); /* *values(): a generator method */
         if (gen_method && at(p, TK_LBRACKET)) { /* *[Symbol.iterator](): what for...of uses on the object */
@@ -1650,7 +1652,7 @@ static void parse_fields_body(Parser *p, Class *c) {
             Token sym = expect(p, TK_IDENT, NULL);
             expect(p, TK_DOT, "write *[Symbol.iterator]()");
             Token it = expect(p, TK_IDENT, NULL);
-            if (strcmp(sym.str, "Symbol") != 0 || strcmp(it.str, "iterator") != 0) xs_error(sym.pos, NULL, "only [Symbol.iterator] is supported as a computed method name");
+            if (strcmp(sym.str, "Symbol") != 0 || strcmp(it.str, "iterator") != 0) xs_error(XS6029, sym.pos, NULL, "only [Symbol.iterator] is supported as a computed method name");
             expect(p, TK_RBRACKET, NULL);
         }
         bool sym_iter = gen_method && at(p, TK_LPAREN) && p->prev_end && p->prev_end[-1] == ']';
@@ -1662,12 +1664,12 @@ static void parse_fields_body(Parser *p, Class *c) {
         Token name;
         if (sym_iter) { name = p->tok; name.kind = TK_IDENT; name.str = "__iterator"; name.pos = pos; }
         else name = expect(p, TK_IDENT, NULL);
-        if (gen_method && !at(p, TK_LPAREN) && !at(p, TK_LT)) xs_error(name.pos, NULL, "'*' marks a generator method: *%s(): Generator<T> { ... }", name.str);
+        if (gen_method && !at(p, TK_LPAREN) && !at(p, TK_LT)) xs_error(XS8064, name.pos, NULL, "'*' marks a generator method: *%s(): Generator<T> { ... }", name.str);
         if (accessor) {
-            if (!at(p, TK_LPAREN)) xs_error(p->tok.pos, NULL, "write %s %s(...) { ... }", accessor == 1 ? "get" : "set", name.str);
+            if (!at(p, TK_LPAREN)) xs_error(XS1037, p->tok.pos, NULL, "write %s %s(...) { ... }", accessor == 1 ? "get" : "set", name.str);
             name.str = xs_sprintf("__%s_%s", accessor == 1 ? "get" : "set", name.str);
         }
-        if (at(p, TK_LPAREN) && c->is_interface) xs_error(name.pos, "interfaces hold data only; use a class for methods", "method '%s' in interface '%s'", name.str, c->name);
+        if (at(p, TK_LPAREN) && c->is_interface) xs_error(XS8113, name.pos, "interfaces hold data only; use a class for methods", "method '%s' in interface '%s'", name.str, c->name);
         if (at(p, TK_LPAREN) || (at(p, TK_LT) && !c->is_interface)) { /* method or constructor (or a generic method) */
             Func *f = xs_alloc(sizeof *f);
             f->pos = pos;
@@ -1680,7 +1682,7 @@ static void parse_fields_body(Parser *p, Class *c) {
             f->is_setter = accessor == 2;
             f->is_gen = gen_method;
             if (at(p, TK_LT)) { /* a generic method: m<T>(x: T): T */
-                if (strcmp(name.str, "constructor") == 0) xs_error(pos, NULL, "a constructor has no type parameters");
+                if (strcmp(name.str, "constructor") == 0) xs_error(XS6012, pos, NULL, "a constructor has no type parameters");
                 parse_tparams(p, f);
                 parse_generic_rest(p, f, true);
                 if (mods & MOD_STATIC) {
@@ -1700,14 +1702,14 @@ static void parse_fields_body(Parser *p, Class *c) {
             if (strcmp(name.str, "constructor") == 0) {
                 f->is_ctor = true;
                 f->ret = ty_void;
-                if (at(p, TK_COLON)) xs_error(p->tok.pos, NULL, "a constructor has no return type");
-                if (c->ctor) xs_error(pos, NULL, "class '%s' has two constructors", c->name);
+                if (at(p, TK_COLON)) xs_error(XS8072, p->tok.pos, NULL, "a constructor has no return type");
+                if (c->ctor) xs_error(XS9014, pos, NULL, "class '%s' has two constructors", c->name);
                 c->ctor = f;
             } else {
                 if (f->is_setter && !at(p, TK_COLON)) f->ret = ty_void; /* set x(v: T) { ... } */
                 else {
                     if (!at(p, TK_COLON))
-                        xs_error(p->tok.pos, "write the return type: ping(): string { ... }", "method '%s' has no return type", f->name);
+                        xs_error(XS3012, p->tok.pos, "write the return type: ping(): string { ... }", "method '%s' has no return type", f->name);
                     next(p);
                     const char *rfrom = p->tok.start;
                     f->ret = parse_type(p);
@@ -1726,7 +1728,7 @@ static void parse_fields_body(Parser *p, Class *c) {
                 }
             }
             if (mods & MOD_ABSTRACT) { /* abstract m(): T; */
-                if (f->is_ctor) xs_error(pos, NULL, "a constructor cannot be abstract");
+                if (f->is_ctor) xs_error(XS8071, pos, NULL, "a constructor cannot be abstract");
                 f->is_abstract = true;
                 f->body = new_stmt(S_BLOCK, pos);
                 accept(p, TK_SEMI);
@@ -1781,7 +1783,7 @@ static void parse_fields_body(Parser *p, Class *c) {
                 }
             }
         } else { /* field */
-            if (is_async) xs_error(pos, NULL, "'async' applies to methods only");
+            if (is_async) xs_error(XS6007, pos, NULL, "'async' applies to methods only");
             Field fd = {0};
             fd.name = name.str;
             fd.pos = pos;
@@ -1791,7 +1793,7 @@ static void parse_fields_body(Parser *p, Class *c) {
             fd.owner = c;
             if (accept(p, TK_QUESTION)) fd.optional = true;
             if (!at(p, TK_COLON))
-                xs_error(p->tok.pos, "fields need an explicit type: base: string;", "field '%s' has no type", name.str);
+                xs_error(XS3011, p->tok.pos, "fields need an explicit type: base: string;", "field '%s' has no type", name.str);
             next(p);
             const char *tfrom = p->tok.start;
             fd.type = parse_type(p);
@@ -1799,9 +1801,9 @@ static void parse_fields_body(Parser *p, Class *c) {
             if (fd.optional) fd.type = ty_nullable_of(fd.type);
             if (accept(p, TK_ASSIGN)) fd.init = parse_expr(p);
             if (!accept(p, TK_SEMI) && !at(p, TK_RBRACE)) accept(p, TK_COMMA); /* interfaces also separate with ',' or nothing */
-            if (mods & MOD_ABSTRACT) xs_error(pos, NULL, "fields cannot be abstract");
+            if (mods & MOD_ABSTRACT) xs_error(XS8106, pos, NULL, "fields cannot be abstract");
             if (mods & MOD_STATIC) { /* a top-level variable, made by the caller where the class is declared */
-                if (!fd.init) xs_error(pos, xs_sprintf("static %s: T = value;", name.str), "a static field needs a value");
+                if (!fd.init) xs_error(XS8077, pos, xs_sprintf("static %s: T = value;", name.str), "a static field needs a value");
                 c->sfields = realloc(c->sfields, sizeof(Field) * (size_t)(c->nsfields + 1));
                 c->sfield_ro = realloc(c->sfield_ro, sizeof(bool) * (size_t)(c->nsfields + 1));
                 c->sfield_ro[c->nsfields] = (mods & MOD_READONLY) != 0;
@@ -1942,6 +1944,12 @@ static void parse_import(Parser *p, Module *m) {
     Import im = {0};
     im.pos = pos;
     int cap = 0;
+    if (at_ident(p, "type")) { /* import type { A } from "m": types are imported like everything else */
+        Lexer save = p->lx;
+        Token t0 = p->tok;
+        next(p);
+        if (!at(p, TK_LBRACE)) { p->lx = save; p->tok = t0; } /* (import type from "m": a default import named type) */
+    }
     if (at(p, TK_IDENT)) { /* import name from "m": m's default export, which must have this name */
         Token name = p->tok;
         next(p);
@@ -1954,7 +1962,7 @@ static void parse_import(Parser *p, Module *m) {
         goto from;
     }
     if (!at(p, TK_LBRACE))
-        xs_error(p->tok.pos, "xisto supports named imports only: import { a, b } from \"./file\";", "expected '{' after import");
+        xs_error(XS1016, p->tok.pos, "xisto supports named imports only: import { a, b } from \"./file\";", "expected '{' after import");
     next(p);
     while (!at(p, TK_RBRACE)) {
         Token name = expect(p, TK_IDENT, NULL);
@@ -1977,7 +1985,7 @@ static void parse_import(Parser *p, Module *m) {
     }
     expect(p, TK_RBRACE, NULL);
 from:
-    if (!at_ident(p, "from")) xs_error(p->tok.pos, NULL, "expected 'from'");
+    if (!at_ident(p, "from")) xs_error(XS1011, p->tok.pos, NULL, "expected 'from'");
     next(p);
     Token path = expect(p, TK_STRING, "write the path as a string: from \"./file\"");
     im.path = path.str;
@@ -2050,13 +2058,13 @@ static Enum *parse_enum(Parser *p) {
             if (at(p, TK_STRING)) { m.is_string = true; m.sval = p->tok.str; next(p); }
             else if (at(p, TK_NUMBER) && p->tok.is_int_lit) { m.ival = p->tok.ival; next(p); next_val = m.ival + 1; }
             else if (at(p, TK_MINUS)) { next(p); Token n = expect(p, TK_NUMBER, NULL); m.ival = -n.ival; next_val = m.ival + 1; }
-            else xs_error(p->tok.pos, "enum members are integer or string constants", "unsupported enum value");
+            else xs_error(XS6041, p->tok.pos, "enum members are integer or string constants", "unsupported enum value");
         } else {
             m.ival = next_val++;
         }
         if (m.is_string) nstr++;
         for (int i = 0; i < en->nmembers; i++)
-            if (strcmp(en->members[i].name, m.name) == 0) xs_error(mpos, NULL, "enum member '%s' is declared twice", m.name);
+            if (strcmp(en->members[i].name, m.name) == 0) xs_error(XS9019, mpos, NULL, "enum member '%s' is declared twice", m.name);
         if (en->nmembers == cap) {
             cap = cap ? cap * 2 : 4;
             en->members = realloc(en->members, sizeof(EnumMember) * (size_t)cap);
@@ -2065,9 +2073,9 @@ static Enum *parse_enum(Parser *p) {
         if (!accept(p, TK_COMMA)) break;
     }
     expect(p, TK_RBRACE, NULL);
-    if (nstr && nstr != en->nmembers) xs_error(en->pos, "use all strings or all integers", "enum '%s' mixes string and integer members", en->name);
+    if (nstr && nstr != en->nmembers) xs_error(XS6021, en->pos, "use all strings or all integers", "enum '%s' mixes string and integer members", en->name);
     en->is_string = nstr > 0;
-    if (en->nmembers == 0) xs_error(en->pos, NULL, "enum '%s' has no members", en->name);
+    if (en->nmembers == 0) xs_error(XS9017, en->pos, NULL, "enum '%s' has no members", en->name);
     return en;
 }
 
@@ -2206,6 +2214,174 @@ static void reflect_module(Program *prog, Module *m, int top_start) {
     }
 }
 
+/* xisto check: the name a failed top-level declaration declares (function, class, interface, type, enum, const,
+   let), read from its first line; the checker keeps uses of it quiet (src/checker.c missing_name) */
+const char **xs_failed_decls;
+int xs_nfailed_decls;
+static void note_failed_decl(const char *src, int line) {
+    const char *s = src;
+    for (int l = 1; *s && l < line; s++) if (*s == '\n') l++;
+    const char *kw[] = {"export ", "default ", "declare ", "abstract ", "async ", NULL};
+    for (bool again = true; again;) {
+        again = false;
+        while (*s == ' ' || *s == '\t') s++;
+        for (int k = 0; kw[k]; k++) if (strncmp(s, kw[k], strlen(kw[k])) == 0) { s += strlen(kw[k]); again = true; }
+    }
+    const char *decl[] = {"function", "class", "interface", "type", "enum", "const", "let", NULL};
+    for (int k = 0; decl[k]; k++) {
+        size_t n = strlen(decl[k]);
+        if (strncmp(s, decl[k], n) != 0 || !(s[n] == ' ' || s[n] == '*')) continue;
+        s += n;
+        while (*s == ' ' || *s == '*') s++;
+        const char *b = s;
+        while (*s == '_' || *s == '$' || (*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || (*s >= '0' && *s <= '9')) s++;
+        if (s == b) return;
+        xs_failed_decls = realloc(xs_failed_decls, sizeof(char *) * (size_t)(xs_nfailed_decls + 1));
+        xs_failed_decls[xs_nfailed_decls++] = xs_strndup(b, (size_t)(s - b));
+        return;
+    }
+}
+
+/* a token that can start a top-level declaration (xisto check resumes there after an error, at column 1) */
+static bool at_top_start(Parser *p) {
+    switch (p->tok.kind) {
+    case TK_EXPORT: case TK_FUNCTION: case TK_CLASS: case TK_CONST: case TK_LET: case TK_ENUM: case TK_ASYNC: case TK_IMPORT: case TK_AT:
+        return true;
+    case TK_IDENT:
+        return strcmp(p->tok.str, "interface") == 0 || strcmp(p->tok.str, "type") == 0 || strcmp(p->tok.str, "abstract") == 0 || strcmp(p->tok.str, "declare") == 0;
+    default:
+        return false;
+    }
+}
+
+/* xisto check: a module that could not be loaded (reported): empty, and its names are not reported again */
+static Module *missing_module(Program *prog, const char *spec) {
+    const char *path = xs_sprintf("missing:%s", spec);
+    for (int i = 0; i < prog->nmodules; i++)
+        if (strcmp(prog->modules[i]->path, path) == 0) return prog->modules[i];
+    Module *m = xs_alloc(sizeof *m);
+    m->builtin = true;
+    m->missing = true;
+    m->file = (char *)spec;
+    m->path = (char *)path;
+    m->src = "";
+    m->loaded = true;
+    if (prog->nmodules == prog->cap_modules) {
+        prog->cap_modules = prog->cap_modules ? prog->cap_modules * 2 : 4;
+        prog->modules = realloc(prog->modules, sizeof(Module *) * (size_t)prog->cap_modules);
+    }
+    m->id = prog->nmodules;
+    prog->modules[prog->nmodules++] = m;
+    return m;
+}
+
+static Module *load_module(Program *prog, const char *file, Pos from_pos, const char *from_file);
+static Module *missing_module(Program *prog, const char *spec);
+
+/* export { a } from "m", export * from "m", export { a, b }; (also with "type"): not a declaration */
+static bool reexport_ahead(Parser *p) {
+    if (!at(p, TK_EXPORT)) return false;
+    Lexer save = p->lx;
+    Token t0 = p->tok;
+    next(p);
+    if (at_ident(p, "type")) next(p);
+    bool r = at(p, TK_LBRACE) || at(p, TK_STAR);
+    p->lx = save;
+    p->tok = t0;
+    return r;
+}
+
+/* loads what an import or re-export names (xisto check: one that cannot be loaded is reported and left empty) */
+static void load_import(Program *prog, Module *m, Import *im) {
+    Program *pp = parsing_prog;
+    Module *pm = parsing_mod;
+    if (xs_check_mode) {
+        jmp_buf *saved = xs_error_recover;
+        jmp_buf ib;
+        xs_error_recover = &ib;
+        if (_setjmp(ib) == 0) im->from = load_module(prog, im->path, im->pos, m->path);
+        else im->from = missing_module(prog, im->path);
+        xs_error_recover = saved;
+    } else im->from = load_module(prog, im->path, im->pos, m->path);
+    xs_file_name = m->file;
+    xs_source = m->src;
+    parsing_prog = pp;
+    parsing_mod = pm;
+}
+
+/* export { a, b } from "m" and export * from "m" (a barrel's re-exports), and export { a, b }; of names declared here */
+static void parse_reexport(Parser *p, Module *m, Program *prog, bool load_now) {
+    Pos pos = p->tok.pos;
+    expect(p, TK_EXPORT, NULL);
+    if (at_ident(p, "type")) next(p);
+    Import im = {0};
+    im.pos = pos;
+    im.reexport = true;
+    int cap = 0;
+    if (accept(p, TK_STAR)) {
+        if (at_ident(p, "as")) {
+            next(p);
+            Token ns = expect(p, TK_IDENT, NULL);
+            xs_error(XS1039, ns.pos, "re-export the names one by one: export { a, b } from \"./file\"", "'export * as %s' (a namespace re-export) is not supported", ns.str);
+        }
+        im.star = true;
+    } else {
+        expect(p, TK_LBRACE, NULL);
+        while (!at(p, TK_RBRACE)) {
+            if (at_ident(p, "type")) { /* export { type A } */
+                Lexer save = p->lx;
+                Token t0 = p->tok;
+                next(p);
+                if (!at(p, TK_IDENT)) { p->lx = save; p->tok = t0; }
+            }
+            Token name = expect(p, TK_IDENT, NULL);
+            if (at_ident(p, "as")) {
+                next(p);
+                Token alias = expect(p, TK_IDENT, NULL);
+                if (strcmp(alias.str, name.str) != 0)
+                    xs_error(XS1038, alias.pos, "re-export it under its own name", "renaming in a re-export ('%s as %s') is not supported", name.str, alias.str);
+            }
+            if (im.n == cap) {
+                cap = cap ? cap * 2 : 4;
+                im.names = realloc(im.names, sizeof(char *) * (size_t)cap);
+                im.positions = realloc(im.positions, sizeof(Pos) * (size_t)cap);
+            }
+            im.names[im.n] = name.str;
+            im.positions[im.n++] = name.pos;
+            if (!accept(p, TK_COMMA)) break;
+        }
+        expect(p, TK_RBRACE, NULL);
+        if (!at_ident(p, "from")) { /* export { a, b };: names declared in this module */
+            m->local_exports = realloc(m->local_exports, sizeof(char *) * (size_t)(m->nlocal_exports + im.n));
+            for (int i = 0; i < im.n; i++) m->local_exports[m->nlocal_exports++] = im.names[i];
+            expect_semi(p);
+            return;
+        }
+    }
+    if (!at_ident(p, "from")) xs_error(XS1011, p->tok.pos, NULL, "expected 'from'");
+    next(p);
+    Token path = expect(p, TK_STRING, "write the path as a string: from \"./file\"");
+    im.path = path.str;
+    expect_semi(p);
+    m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+    m->imports[m->nimports++] = im;
+    if (load_now) load_import(prog, m, &m->imports[m->nimports - 1]);
+}
+
+/* export { a, b };: the listed declarations of this module are exported */
+static void apply_local_exports(Program *prog, Module *m, int top_start) {
+    for (int k = 0; k < m->nlocal_exports; k++) {
+        const char *n = m->local_exports[k];
+        for (int i = 0; i < prog->nfuncs; i++) if (prog->funcs[i]->mod == m && strcmp(prog->funcs[i]->name, n) == 0) prog->funcs[i]->exported = true;
+        for (int i = 0; i < prog->nclasses; i++) if (prog->classes[i]->mod == m && strcmp(prog->classes[i]->name, n) == 0) prog->classes[i]->exported = true;
+        for (int i = 0; i < prog->nenums; i++) if (prog->enums[i]->mod == m && strcmp(prog->enums[i]->name, n) == 0) prog->enums[i]->exported = true;
+        for (int i = top_start; i < prog->top.len; i++) {
+            Stmt *st = prog->top.items[i];
+            if (st->mod == m && st->kind == S_VAR && st->name && strcmp(st->name, n) == 0) st->exported = true;
+        }
+    }
+}
+
 static void parse_module(Program *prog, Module *m) {
     xs_file_name = m->file;
     xs_source = m->src;
@@ -2215,24 +2391,70 @@ static void parse_module(Program *prog, Module *m) {
     p.mod = m;
     next(&p);
     /* imports first: load dependencies before this module's own declarations are recorded */
-    while (at(&p, TK_IMPORT)) parse_import(&p, m);
+    jmp_buf *volatile outer_recover = xs_error_recover;
+    jmp_buf prb;
+    volatile int recoveries = 0;
+    volatile int last_line = -1, last_col = -1;
+    if (xs_check_mode) { /* xisto check: an import that does not parse costs that import, not the file */
+        xs_error_recover = &prb;
+        if (_setjmp(prb) != 0) {
+            xs_file_name = m->file;
+            xs_source = m->src;
+            xs_lex_skipping = true;
+            while (!at(&p, TK_EOF) && !at(&p, TK_IMPORT) && !(p.tok.pos.col == 1 && at_top_start(&p))) next(&p);
+            xs_lex_skipping = false;
+        }
+    }
+    while (at(&p, TK_IMPORT) || reexport_ahead(&p)) {
+        if (at(&p, TK_IMPORT)) parse_import(&p, m);
+        else parse_reexport(&p, m, prog, false);
+    }
     for (int i = 0; i < m->nimports; i++) {
         Import *im = &m->imports[i];
-        im->from = load_module(prog, im->path, im->pos, m->path);
+        if (xs_check_mode) { /* a module or package that cannot be loaded: reported, and checking goes on without it */
+            jmp_buf ib;
+            xs_error_recover = &ib;
+            if (_setjmp(ib) == 0) im->from = load_module(prog, im->path, im->pos, m->path);
+            else im->from = missing_module(prog, im->path);
+            xs_error_recover = &prb;
+        } else im->from = load_module(prog, im->path, im->pos, m->path);
         xs_file_name = m->file;
         xs_source = m->src;
     }
     parsing_prog = prog;
     parsing_mod = m;
     int top_start = prog->top.len;
+    volatile int decl_line = 0;
+    if (xs_check_mode) if (_setjmp(prb) != 0) { /* a declaration that does not parse: on to the next line that starts one */
+        xs_file_name = m->file;
+        xs_source = m->src;
+        if (decl_line) note_failed_decl(m->src, decl_line); /* its name: uses of it were reported with it */
+        parsing_prog = prog;
+        parsing_mod = m;
+        if (++recoveries > 500 || (p.tok.pos.line == last_line && p.tok.pos.col == last_col && !at(&p, TK_EOF))) {
+            xs_error_recover = outer_recover; /* no progress: the rest of this file is not read */
+            apply_local_exports(prog, m, top_start);
+            reflect_module(prog, m, top_start);
+            return;
+        }
+        last_line = p.tok.pos.line;
+        last_col = p.tok.pos.col;
+        xs_lex_skipping = true;
+        if (!at(&p, TK_EOF)) next(&p);
+        /* the next line that starts at column 1 and does not close a block: a declaration or a top-level statement */
+        while (!at(&p, TK_EOF) && !(p.tok.pos.col == 1 && !at(&p, TK_RBRACE) && !at(&p, TK_RPAREN) && !at(&p, TK_RBRACKET))) next(&p);
+        xs_lex_skipping = false;
+    }
     while (!at(&p, TK_EOF)) {
+        decl_line = p.tok.pos.line;
+        if (reexport_ahead(&p)) { parse_reexport(&p, m, prog, true); continue; } /* (also after declarations) */
         DecoList decos = {0};
         parse_decorators(&p, &decos);
         bool exported = accept(&p, TK_EXPORT);
         bool is_default = exported && at(&p, TK_DEFAULT) && (next(&p), true);
         bool is_declare = at_ident(&p, "declare") && (next(&p), true);
         if (is_declare) { /* a native package's binding: no body here, the C is in the package */
-            if (!m->native_prefix) xs_error(p.tok.pos, "declare functions and classes in a package with C sources (xisto.json \"native\")", "'declare' outside a native package");
+            if (!m->native_prefix) xs_error(XS6008, p.tok.pos, "declare functions and classes in a package with C sources (xisto.json \"native\")", "'declare' outside a native package");
             if (at(&p, TK_FUNCTION)) {
                 Pos pos = p.tok.pos;
                 next(&p);
@@ -2251,16 +2473,16 @@ static void parse_module(Program *prog, Module *m) {
                 add_func(prog, f);
                 continue;
             }
-            if (!at(&p, TK_CLASS)) xs_error(p.tok.pos, NULL, "expected 'function' or 'class' after 'declare'");
+            if (!at(&p, TK_CLASS)) xs_error(XS1012, p.tok.pos, NULL, "expected 'function' or 'class' after 'declare'");
             Class *c = parse_declared_class(&p, m->native_prefix);
             c->mod = m;
             c->exported = exported;
             add_class(prog, c);
             continue;
         }
-        if (decos.len && !at(&p, TK_CLASS)) xs_error(decos.items[0].pos, NULL, "decorators apply to classes, their members and parameters");
-        if (is_default && !at(&p, TK_FUNCTION) && !at(&p, TK_ASYNC)) xs_error(p.tok.pos, NULL, "'export default' applies to functions only");
-        if (at(&p, TK_IMPORT)) xs_error(p.tok.pos, "put every import at the top of the file", "import after declarations");
+        if (decos.len && !at(&p, TK_CLASS)) xs_error(XS6020, decos.items[0].pos, NULL, "decorators apply to classes, their members and parameters");
+        if (is_default && !at(&p, TK_FUNCTION) && !at(&p, TK_ASYNC)) xs_error(XS6009, p.tok.pos, NULL, "'export default' applies to functions only");
+        if (at(&p, TK_IMPORT)) xs_error(XS1022, p.tok.pos, "put every import at the top of the file", "import after declarations");
         if (at(&p, TK_FUNCTION) || at(&p, TK_ASYNC)) {
             Pos pos = p.tok.pos;
             bool is_async = accept(&p, TK_ASYNC);
@@ -2295,7 +2517,7 @@ static void parse_module(Program *prog, Module *m) {
             prog->enums[prog->nenums++] = en;
         } else {
             if (exported && !at(&p, TK_LET) && !at(&p, TK_CONST))
-                xs_error(p.tok.pos, "export applies to function, class, let and const", "expected a declaration after 'export'");
+                xs_error(XS1017, p.tok.pos, "export applies to function, class, let and const", "expected a declaration after 'export'");
             Stmt *st = parse_stmt(&p);
             st->mod = m;
             st->exported = exported;
@@ -2303,6 +2525,8 @@ static void parse_module(Program *prog, Module *m) {
             drain_pending(&p, &prog->top, m, exported);
         }
     }
+    if (xs_check_mode) xs_error_recover = outer_recover;
+    apply_local_exports(prog, m, top_start);
     reflect_module(prog, m, top_start);
 }
 
@@ -2362,9 +2586,13 @@ static void parse_module(Program *prog, Module *m);
 /* xisto:fs is the canonical name of a built-in module; node:fs (and the bare fs, sqlite) only in Node
    compatibility mode: these are xisto's implementations of the Node contracts, not Node itself. */
 static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos) {
-    bool node = strncmp(spec, "node:", 5) == 0 || strcmp(spec, "fs") == 0 || strcmp(spec, "sqlite") == 0;
-    if (node && !xs_node_compat)
-        xs_error(from_pos, xs_sprintf("import it as \"xisto:%s\", or build with --node-compat (XISTO_NODE_COMPAT=1) to keep the Node name",
+    bool node = strncmp(spec, "node:", 5) == 0 || strcmp(spec, "fs") == 0 || strcmp(spec, "sqlite") == 0 ||
+                (strncmp(spec, "xisto:", 6) != 0 && xs_node_core_name(spec)); /* "path": Node's name without "node:" */
+    if (node && !xs_node_compat && xs_check_mode) /* xisto check: counted, and the program is checked as with xisto:* */
+        xs_error_continue(XS4001, from_pos, xs_sprintf("import it as \"xisto:%s\"", strncmp(spec, "node:", 5) == 0 ? spec + 5 : spec),
+                          "'%s' is xisto's implementation of a Node module, not Node itself", spec);
+    else if (node && !xs_node_compat)
+        xs_error(XS4001, from_pos, xs_sprintf("import it as \"xisto:%s\", or build with --node-compat (XISTO_NODE_COMPAT=1) to keep the Node name",
                                       strncmp(spec, "node:", 5) == 0 ? spec + 5 : spec),
                  "'%s' is xisto's implementation of a Node module, not Node itself", spec);
     const char *name = strncmp(spec, "node:", 5) == 0 ? spec + 5 : strncmp(spec, "xisto:", 6) == 0 ? spec + 6 : spec;
@@ -2444,7 +2672,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         add_func(prog, f);
         return m;
     }
-    xs_error(from_pos, "built-in modules: xisto:fs, xisto:sqlite, xisto:timers/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:sqlite, xisto:timers/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
     return NULL;
 }
 
@@ -2454,12 +2682,16 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
     pending_prefix = NULL;
     if (from_file && (strncmp(file, "node:", 5) == 0 || strncmp(file, "xisto:", 6) == 0 || strcmp(file, "fs") == 0 || strcmp(file, "sqlite") == 0))
         return load_builtin_module(prog, file, from_pos);
+    if (from_file && xs_node_core_name(file)) return load_builtin_module(prog, file, from_pos); /* "path": read as node:path */
+    char *alias = from_file && file[0] != '.' ? xs_tsconfig_resolve(from_file, file) : NULL; /* a tsconfig "paths" name */
     if (from_file && file[0] == '.') {
         char dir[PATH_MAX];
         strncpy(dir, from_file, sizeof dir - 1);
         char *slash = strrchr(dir, '/');
         if (slash) *slash = 0; else strcpy(dir, ".");
         snprintf(path, sizeof path, "%s/%s", dir, file);
+    } else if (alias) {
+        snprintf(path, sizeof path, "%s", alias);
     } else if (from_file) {
         /* a package: <project>/.xisto/pkgs/<name>/, entry from its xisto.json "main", else index.ts or src/index.ts */
         char dir[PATH_MAX];
@@ -2489,8 +2721,8 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
                 if (access(probe, R_OK) == 0) { found = xs_strndup(probe, strlen(probe)); break; }
             }
         }
-        if (!found && has_project) xs_error(from_pos, xs_sprintf("install it: xisto add <git url or path> --name %s", file), "package '%s' is not installed", file);
-        if (!found) xs_error(from_pos, xs_sprintf("import files with a relative path (\"./file\"), or add the package: xisto add <git url> --name %s", file), "cannot resolve '%s'", file);
+        if (!found && has_project) xs_error(XS5005, from_pos, xs_sprintf("install it: xisto add <git url or path> --name %s", file), "package '%s' is not installed", file);
+        if (!found) xs_error(XS5003, from_pos, xs_sprintf("import files with a relative path (\"./file\"), or add the package: xisto add <git url> --name %s", file), "cannot resolve '%s'", file);
         char *entry = NULL;
         char *meta = xs_read_file(xs_sprintf("%s/xisto.json", found));
         if (meta) {
@@ -2508,10 +2740,21 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
         strncpy(path, file, sizeof path - 1);
     }
     size_t n = strlen(path);
-    if (access(path, R_OK) != 0 && !(n > 3 && strcmp(path + n - 3, ".ts") == 0)) strncat(path, ".ts", sizeof path - n - 1);
+    struct stat dst;
+    if (stat(path, &dst) == 0 && S_ISDIR(dst.st_mode)) { /* a folder: its index.ts */
+        strncat(path, access(xs_sprintf("%s/index.ts", path), R_OK) == 0 || access(xs_sprintf("%s/index.tsx", path), R_OK) != 0 ? "/index.ts" : "/index.tsx", sizeof path - n - 1);
+        n = strlen(path);
+    } else if (n > 3 && strcmp(path + n - 3, ".js") == 0 && access(path, R_OK) != 0) { /* "./x.js" written for ES modules: ./x.ts */
+        path[n - 3] = 0;
+        n -= 3;
+    }
+    if (access(path, R_OK) != 0 && !(n > 3 && strcmp(path + n - 3, ".ts") == 0)) {
+        if (access(xs_sprintf("%s.tsx", path), R_OK) == 0) strncat(path, ".tsx", sizeof path - n - 1);
+        else strncat(path, ".ts", sizeof path - n - 1);
+    }
     char real[PATH_MAX];
     if (!xs_real_path(path, real)) {
-        if (from_file) xs_error(from_pos, NULL, "cannot find module '%s' (looked for %s)", file, path);
+        if (from_file) xs_error(XS5001, from_pos, NULL, "cannot find module '%s' (looked for %s)", file, path);
         fprintf(stderr, "xisto: cannot open '%s'\n", file);
         exit(1);
     }
@@ -2527,7 +2770,7 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
                     if (in && x->loading) { const char *b = strrchr(x->file, '/'); buf_printf(&chain, "%s -> ", b ? b + 1 : x->file); }
                 }
                 { const char *b = strrchr(m->file, '/'); buf_puts(&chain, b ? b + 1 : m->file); }
-                xs_error(from_pos, xs_sprintf("the cycle is %s; move the shared code into a third file that both import", chain.data), "circular import of '%s'", file);
+                xs_error(XS5004, from_pos, xs_sprintf("the cycle is %s; move the shared code into a third file that both import", chain.data), "circular import of '%s'", file);
             }
             return m;
         }
@@ -2538,7 +2781,7 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
     m->path = xs_strndup(real, strlen(real));
     m->file = from_file ? xs_sprintf("%s", path) : (char *)file;
     m->src = xs_read_file(real);
-    if (!m->src) xs_error(from_pos, NULL, "cannot read '%s'", path);
+    if (!m->src) xs_error(XS5002, from_pos, NULL, "cannot read '%s'", path);
     m->loading = true;
     if (prog->nmodules == prog->cap_modules) {
         prog->cap_modules = prog->cap_modules ? prog->cap_modules * 2 : 4;

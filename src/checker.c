@@ -5,6 +5,19 @@
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
+/* xisto check: names imported from a module that could not be loaded; a use of one was already reported (the
+   import), so it stops checking that statement quietly instead of reporting an unknown name */
+static const char **missing_names;
+static int nmissing_names;
+extern const char **xs_failed_decls;
+extern int xs_nfailed_decls;
+static bool missing_name(const char *name) {
+    if (!xs_check_mode) return false;
+    if (strncmp(name, "__", 2) == 0) return true; /* a name the compiler made (a decorator's value...): its cause was reported */
+    for (int i = 0; i < nmissing_names; i++) if (strcmp(missing_names[i], name) == 0) return true;
+    for (int i = 0; i < xs_nfailed_decls; i++) if (strcmp(xs_failed_decls[i], name) == 0) return true;
+    return false;
+}
 
 typedef struct Binding {
     char *name;
@@ -72,17 +85,45 @@ static void enter_module(Module *m) {
     xs_source = m->src;
 }
 
-/* True when `name` is imported by the current module from `from`. */
-static bool imports_name(Module *m, Module *from, const char *name) {
-    if (!m) return false;
-    for (int i = 0; i < m->nimports; i++)
-        if (m->imports[i].from == from)
-            for (int k = 0; k < m->imports[i].n; k++)
-                if (strcmp(m->imports[i].names[k], name) == 0) return true;
+/* True when module `via` gives `name` declared in `from`: it is `from`, or it re-exports the name from a module that
+   gives it (export { name } from "m", export * from "m"; a barrel of barrels too) */
+static bool gives_name(Module *via, Module *from, const char *name, int depth) {
+    if (!via || depth > 32) return false;
+    if (via == from) return true;
+    for (int i = 0; i < via->nimports; i++) {
+        Import *im = &via->imports[i];
+        if (!im->reexport || !im->from) continue;
+        bool listed = im->star;
+        for (int k = 0; k < im->n && !listed; k++) listed = strcmp(im->names[k], name) == 0;
+        if (listed && gives_name(im->from, from, name, depth + 1)) return true;
+    }
     return false;
 }
 
+/* True when `name` is imported by the current module from `from` (directly, or through a module that re-exports it). */
+static bool imports_name(Module *m, Module *from, const char *name) {
+    if (!m) return false;
+    for (int i = 0; i < m->nimports; i++)
+        for (int k = 0; k < m->imports[i].n; k++)
+            if (strcmp(m->imports[i].names[k], name) == 0 && gives_name(m->imports[i].from, from, name, 0)) return true;
+    return false;
+}
+
+/* xisto check: the member at pos is written after '?.' (read on as '.', and already counted) */
+static bool after_optional_dot(Pos pos) {
+    const char *s = xs_source;
+    if (!s) return false;
+    int line = 1;
+    while (*s && line < pos.line) { if (*s == '\n') line++; s++; }
+    const char *at = s + (pos.col > 0 ? pos.col - 1 : 0);
+    const char *q = at;
+    while (q > s && (q[-1] == ' ' || q[-1] == '\t')) q--;
+    return q - s >= 2 && q[-1] == '.' && q[-2] == '?';
+}
+
 /* ---------- built-in classes ---------- */
+static int reexports_name(Program *p, Module *via, const char *name, int depth);
+static bool reexports_or_has(Module *m, const char *name); /* (scope search through export * from) */
 
 static Class **builtins;
 static int nbuiltins;
@@ -310,7 +351,7 @@ static void date_num_arg(Expr **slot, const char *what) {
         *slot = c;
         return;
     }
-    if (a->type->kind != TY_NUMBER) xs_error(a->pos, NULL, "%s must be a number, but this is %s", what, ty_name(a->type));
+    if (a->type->kind != TY_NUMBER) xs_error(XS8020, a->pos, NULL, "%s must be a number, but this is %s", what, ty_name(a->type));
 }
 static Expr *num_lit(Pos pos, double v, bool is_int) {
     Expr *z = xs_alloc(sizeof *z);
@@ -333,12 +374,12 @@ static void check_date_member(Expr *e) {
     };
     const char *m = e->str;
     e->field = -1;
-    if (!e->is_call) xs_error(e->pos, "Date has methods only: d.getTime(), d.getFullYear(), d.toISOString() ...", "Date has no property '%s'", m);
+    if (!e->is_call) xs_error(XS7011, e->pos, "Date has methods only: d.getTime(), d.getFullYear(), d.toISOString() ...", "Date has no property '%s'", m);
     for (size_t i = 0; i < sizeof gets / sizeof gets[0]; i++) {
         if (strcmp(m, gets[i].name) != 0) continue;
         if (e->args.len != 0) {
-            if (strncmp(m, "toLocale", 8) == 0) xs_error(e->pos, "call it without arguments (en-US, as Node by default); Intl is not supported yet", "Date.%s with locales and options is not supported", m);
-            xs_error(e->pos, NULL, "Date.%s takes no arguments", m);
+            if (strncmp(m, "toLocale", 8) == 0) xs_error(XS7014, e->pos, "call it without arguments (en-US, as Node by default); Intl is not supported yet", "Date.%s with locales and options is not supported", m);
+            xs_error(XS7013, e->pos, NULL, "Date.%s takes no arguments", m);
         }
         const char *cf = strcmp(m, "valueOf") == 0 ? "getTime" : strcmp(m, "toJSON") == 0 ? "toISOString" : strcmp(m, "toGMTString") == 0 ? "toUTCString" : m;
         e->builtin.cfn = xs_sprintf("xs_Date_%s", cf);
@@ -346,7 +387,7 @@ static void check_date_member(Expr *e) {
         return;
     }
     if (strcmp(m, "setTime") == 0) {
-        if (e->args.len != 1) xs_error(e->pos, NULL, "Date.setTime takes one argument");
+        if (e->args.len != 1) xs_error(XS7017, e->pos, NULL, "Date.setTime takes one argument");
         date_num_arg(&e->args.items[0], "the time value");
         e->builtin.cfn = "xs_Date_setTime";
         e->type = ty_number;
@@ -355,7 +396,7 @@ static void check_date_member(Expr *e) {
     for (size_t i = 0; i < sizeof sets / sizeof sets[0]; i++) {
         if (strcmp(m, sets[i].name) != 0) continue;
         int n = e->args.len;
-        if (n < 1 || n > sets[i].max) xs_error(e->pos, NULL, "Date.%s takes 1 to %d arguments, got %d", m, sets[i].max, n);
+        if (n < 1 || n > sets[i].max) xs_error(XS7012, e->pos, NULL, "Date.%s takes 1 to %d arguments, got %d", m, sets[i].max, n);
         for (int k = 0; k < n; k++) date_num_arg(&e->args.items[k], xs_sprintf("argument %d of Date.%s", k + 1, m));
         /* xs_Date_set(d, which, n, a, b, c, e) */
         ExprList args = {0};
@@ -367,7 +408,7 @@ static void check_date_member(Expr *e) {
         e->type = ty_number;
         return;
     }
-    xs_error(e->pos, "supported: getTime, getFullYear/Month/Date/Day/Hours/Minutes/Seconds/Milliseconds (and getUTC...), getTimezoneOffset, toISOString, toJSON, toString, toDateString, toTimeString, toUTCString, toLocaleString, set... and setUTC...", "Date has no method '%s'", m);
+    xs_error(XS7010, e->pos, "supported: getTime, getFullYear/Month/Date/Day/Hours/Minutes/Seconds/Milliseconds (and getUTC...), getTimezoneOffset, toISOString, toJSON, toString, toDateString, toTimeString, toUTCString, toLocaleString, set... and setUTC...", "Date has no method '%s'", m);
 }
 static bool is_bytes(Type *t) {
     return t && t->kind == TY_OBJECT && t->cls->builtin && (strcmp(t->cls->name, "Uint8Array") == 0 || strcmp(t->cls->name, "Buffer") == 0);
@@ -382,14 +423,14 @@ static bool check_fs_fd_call(Expr *e, Func *f) {
     bool is_open = strcmp(n, "openSync") == 0, is_close = strcmp(n, "closeSync") == 0, is_stat = strcmp(n, "fstatSync") == 0, is_read = strcmp(n, "readSync") == 0;
     if (!is_open && !is_close && !is_stat && !is_read) return false;
     if (is_open) {
-        if (e->args.len < 1 || e->args.len > 2) xs_error(e->pos, "openSync(path, \"r\" | \"w\" | \"a\" | \"r+\")", "openSync takes a path and optionally the flags");
+        if (e->args.len < 1 || e->args.len > 2) xs_error(XS7078, e->pos, "openSync(path, \"r\" | \"w\" | \"a\" | \"r+\")", "openSync takes a path and optionally the flags");
         check_expr(e->args.items[0], ty_string);
         expect_type(e->args.items[0], ty_string, "path of openSync");
         if (e->args.len == 2) {
             Expr *fl = e->args.items[1];
             check_expr(fl, ty_string);
             if (fl->kind != E_STRING || (strcmp(fl->str, "r") != 0 && strcmp(fl->str, "w") != 0 && strcmp(fl->str, "a") != 0 && strcmp(fl->str, "r+") != 0))
-                xs_error(fl->pos, "supported: \"r\", \"w\", \"a\", \"r+\"", "unsupported flags of openSync");
+                xs_error(XS7121, fl->pos, "supported: \"r\", \"w\", \"a\", \"r+\"", "unsupported flags of openSync");
         } else {
             Expr *fl = xs_alloc(sizeof *fl);
             fl->kind = E_STRING; fl->pos = e->pos; fl->str = "r"; fl->type = ty_string; fl->field = -1;
@@ -398,23 +439,23 @@ static bool check_fs_fd_call(Expr *e, Func *f) {
         e->func = NULL; e->builtin.cfn = "xs_fs_open"; e->type = ty_int;
         return true;
     }
-    if (e->args.len < 1) xs_error(e->pos, NULL, "%s takes a file descriptor", n);
+    if (e->args.len < 1) xs_error(XS8031, e->pos, NULL, "%s takes a file descriptor", n);
     check_expr(e->args.items[0], ty_int);
     expect_type(e->args.items[0], ty_int, xs_sprintf("file descriptor of %s", n));
     if (is_close) {
-        if (e->args.len != 1) xs_error(e->pos, NULL, "closeSync takes only the file descriptor");
+        if (e->args.len != 1) xs_error(XS7051, e->pos, NULL, "closeSync takes only the file descriptor");
         e->func = NULL; e->builtin.cfn = "xs_fs_close"; e->type = ty_void;
         return true;
     }
     if (is_stat) {
-        if (e->args.len != 1) xs_error(e->pos, NULL, "fstatSync takes only the file descriptor");
+        if (e->args.len != 1) xs_error(XS7057, e->pos, NULL, "fstatSync takes only the file descriptor");
         e->func = NULL; e->builtin.cfn = "xs_fs_fstat"; e->type = ty_object_of(find_class("Stats"));
         return true;
     }
     if (e->args.len < 2 || e->args.len > 5 || e->args.len == 3) /* (Node reads a third argument alone as an options object) */
-        xs_error(e->pos, "readSync(fd, buffer) or readSync(fd, buffer, offset, length, position?)", "readSync takes 2, 4 or 5 arguments");
+        xs_error(XS7085, e->pos, "readSync(fd, buffer) or readSync(fd, buffer, offset, length, position?)", "readSync takes 2, 4 or 5 arguments");
     check_expr(e->args.items[1], NULL);
-    if (!is_bytes(e->args.items[1]->type)) xs_error(e->args.items[1]->pos, NULL, "buffer of readSync must be a Uint8Array or Buffer, but this is %s", ty_name(e->args.items[1]->type));
+    if (!is_bytes(e->args.items[1]->type)) xs_error(XS7049, e->args.items[1]->pos, NULL, "buffer of readSync must be a Uint8Array or Buffer, but this is %s", ty_name(e->args.items[1]->type));
     for (int i = 2; i < 5; i++) {
         if (i < e->args.len) {
             Expr *a = e->args.items[i];
@@ -446,12 +487,12 @@ static void check_bytes_member(Expr *e, Class *c) {
     Class *u8 = find_class("Uint8Array");
     int n = e->args.len;
     e->field = -1;
-    #define ARGS(lo, hi) do { if (n < (lo) || n > (hi)) xs_error(e->pos, NULL, "%s.%s takes %d to %d argument(s), got %d", c->name, m, (lo), (hi), n); } while (0)
+    #define ARGS(lo, hi) do { if (n < (lo) || n > (hi)) xs_error(XS8039, e->pos, NULL, "%s.%s takes %d to %d argument(s), got %d", c->name, m, (lo), (hi), n); } while (0)
     #define PAD_INT(k, v) do { for (int k_ = e->args.len; k_ <= (k); k_++) expr_list_push(&e->args, num_lit(e->pos, (double)(v), true)); } while (0)
     if (!e->is_call) {
         if (strcmp(m, "length") == 0 || strcmp(m, "byteLength") == 0) { e->field = 0; e->type = ty_int; return; }
         if (strcmp(m, "byteOffset") == 0) { e->builtin.cfn = "xs_u8_byte_offset"; e->type = ty_int; return; } /* (into the SharedArrayBuffer or the array it is a view on) */
-        xs_error(e->pos, "supported: length, byteLength, byteOffset", "%s has no property '%s'", c->name, m);
+        xs_error(XS8015, e->pos, "supported: length, byteLength, byteOffset", "%s has no property '%s'", c->name, m);
     }
     if (strcmp(m, "slice") == 0 || strcmp(m, "subarray") == 0) {
         ARGS(0, 2);
@@ -467,7 +508,7 @@ static void check_bytes_member(Expr *e, Class *c) {
         Type *st = e->args.items[0]->type;
         if (is_bytes(st)) e->builtin.cfn = "xs_u8_set_from";
         else if (st->kind == TY_ARRAY && (st->elem->kind == TY_INT || st->elem->kind == TY_LITINT)) e->builtin.cfn = "xs_u8_set_ints";
-        else xs_error(e->args.items[0]->pos, NULL, "%s.set copies from a Uint8Array or an int[], not %s", c->name, ty_name(st));
+        else xs_error(XS8043, e->args.items[0]->pos, NULL, "%s.set copies from a Uint8Array or an int[], not %s", c->name, ty_name(st));
         if (n == 2) int_arg(&e->args.items[1], "the offset"); else PAD_INT(1, 0);
         e->type = ty_void;
         return;
@@ -513,7 +554,7 @@ static void check_bytes_member(Expr *e, Class *c) {
     if (strcmp(m, "equals") == 0) {
         ARGS(1, 1);
         check_expr(e->args.items[0], NULL);
-        if (!is_bytes(e->args.items[0]->type)) xs_error(e->args.items[0]->pos, NULL, "equals compares with a Buffer or Uint8Array");
+        if (!is_bytes(e->args.items[0]->type)) xs_error(XS7052, e->args.items[0]->pos, NULL, "equals compares with a Buffer or Uint8Array");
         e->builtin.cfn = "xs_u8_equals";
         e->type = ty_boolean;
         return;
@@ -545,7 +586,7 @@ static void check_bytes_member(Expr *e, Class *c) {
         return;
     }
     (void)u8;
-    xs_error(e->pos, "supported: length, slice, subarray, set, fill, indexOf, lastIndexOf, includes, reverse, join, toString, toBase64, toHex (and Buffer: equals, toString(encoding))", "%s has no method '%s'", c->name, m);
+    xs_error(XS8014, e->pos, "supported: length, slice, subarray, set, fill, indexOf, lastIndexOf, includes, reverse, join, toString, toBase64, toHex (and Buffer: equals, toString(encoding))", "%s has no method '%s'", c->name, m);
     #undef ARGS
     #undef PAD_INT
 }
@@ -554,7 +595,7 @@ static void check_f64_member(Expr *e, Class *c) {
     const char *m = e->str;
     int n = e->args.len;
     e->field = -1;
-    #define ARGS(lo, hi) do { if (n < (lo) || n > (hi)) xs_error(e->pos, NULL, "Float64Array.%s takes %d to %d argument(s), got %d", m, (lo), (hi), n); } while (0)
+    #define ARGS(lo, hi) do { if (n < (lo) || n > (hi)) xs_error(XS7021, e->pos, NULL, "Float64Array.%s takes %d to %d argument(s), got %d", m, (lo), (hi), n); } while (0)
     #define PAD_INT(k, v) do { for (int k_ = e->args.len; k_ <= (k); k_++) expr_list_push(&e->args, num_lit(e->pos, (double)(v), true)); } while (0)
     if (!e->is_call) {
         if (strcmp(m, "length") == 0) { e->field = 0; e->type = ty_int; return; }
@@ -563,7 +604,7 @@ static void check_f64_member(Expr *e, Class *c) {
             e->type = ty_int;
             return;
         }
-        xs_error(e->pos, "supported: length, byteLength, byteOffset", "Float64Array has no property '%s'", m);
+        xs_error(XS7019, e->pos, "supported: length, byteLength, byteOffset", "Float64Array has no property '%s'", m);
     }
     if (strcmp(m, "slice") == 0 || strcmp(m, "subarray") == 0) {
         ARGS(0, 2);
@@ -579,7 +620,7 @@ static void check_f64_member(Expr *e, Class *c) {
         Type *st = e->args.items[0]->type;
         if (is_f64(st)) e->builtin.cfn = "xs_f64_set_from";
         else if (st->kind == TY_ARRAY && st->elem->kind == TY_NUMBER) e->builtin.cfn = "xs_f64_set_nums";
-        else xs_error(e->args.items[0]->pos, NULL, "Float64Array.set copies from a Float64Array or a number[], not %s", ty_name(st));
+        else xs_error(XS7022, e->args.items[0]->pos, NULL, "Float64Array.set copies from a Float64Array or a number[], not %s", ty_name(st));
         if (n == 2) int_arg(&e->args.items[1], "the offset"); else PAD_INT(1, 0);
         e->type = ty_void;
         return;
@@ -605,7 +646,7 @@ static void check_f64_member(Expr *e, Class *c) {
         return;
     }
     if (strcmp(m, "toString") == 0) { ARGS(0, 0); e->builtin.cfn = "xs_f64_to_string"; e->type = ty_string; return; }
-    xs_error(e->pos, "supported: length, byteLength, byteOffset, fill, set, subarray, slice, join, toString", "Float64Array has no method '%s'", m);
+    xs_error(XS7018, e->pos, "supported: length, byteLength, byteOffset, fill, set, subarray, slice, join, toString", "Float64Array has no method '%s'", m);
     #undef ARGS
     #undef PAD_INT
 }
@@ -615,10 +656,10 @@ static void check_bytes_static(Expr *e, const char *ns) {
     bool is_buf = strcmp(ns, "Buffer") == 0;
     Class *u8 = find_class("Uint8Array"), *bc = find_class(is_buf ? "Buffer" : "Uint8Array");
     int n = e->args.len;
-    if (!e->is_call) xs_error(e->pos, NULL, "%s.%s is not a value", ns, m);
+    if (!e->is_call) xs_error(XS8037, e->pos, NULL, "%s.%s is not a value", ns, m);
     e->type = ty_object_of(bc);
     if (strcmp(m, "from") == 0) {
-        if (n < 1 || n > 2) xs_error(e->pos, NULL, "%s.from takes a source%s", ns, is_buf ? " and an optional encoding" : "");
+        if (n < 1 || n > 2) xs_error(XS8041, e->pos, NULL, "%s.from takes a source%s", ns, is_buf ? " and an optional encoding" : "");
         check_expr(e->args.items[0], e->args.items[0]->kind == E_ARRAY_LIT ? ty_array_of(ty_int) : NULL);
         Type *st = e->args.items[0]->type;
         if (is_buf && st->kind == TY_STRING) {
@@ -627,11 +668,11 @@ static void check_bytes_static(Expr *e, const char *ns) {
             e->builtin.cfn = "xs_buf_from_str";
             return;
         }
-        if (n != 1) xs_error(e->pos, NULL, "%s.from(bytes) takes one argument", ns);
+        if (n != 1) xs_error(XS8042, e->pos, NULL, "%s.from(bytes) takes one argument", ns);
         if (is_bytes(st)) { e->builtin.cfn = is_buf ? "xs_buf_from_bytes" : "xs_u8_copy"; return; }
         if (st->kind == TY_ARRAY && (st->elem->kind == TY_INT || st->elem->kind == TY_LITINT)) { e->builtin.cfn = is_buf ? "xs_buf_from_ints" : "xs_u8_from_ints"; return; }
         if (!is_buf && st->kind == TY_ARRAY && st->elem->kind == TY_NUMBER) { e->builtin.cfn = "xs_u8_from_nums"; return; }
-        xs_error(e->args.items[0]->pos, NULL, "%s.from takes %s, not %s", ns, is_buf ? "a string, bytes or an int[]" : "bytes, an int[] or a number[]", ty_name(st));
+        xs_error(XS8040, e->args.items[0]->pos, NULL, "%s.from takes %s, not %s", ns, is_buf ? "a string, bytes or an int[]" : "bytes, an int[] or a number[]", ty_name(st));
     }
     if (!is_buf && strcmp(m, "of") == 0) { /* Uint8Array.of(1, 2, 3): from an array literal */
         Expr *lit = xs_alloc(sizeof *lit);
@@ -645,29 +686,29 @@ static void check_bytes_static(Expr *e, const char *ns) {
         return;
     }
     if (!is_buf && (strcmp(m, "fromBase64") == 0 || strcmp(m, "fromHex") == 0)) {
-        if (n != 1) xs_error(e->pos, NULL, "Uint8Array.%s takes one string", m);
+        if (n != 1) xs_error(XS7042, e->pos, NULL, "Uint8Array.%s takes one string", m);
         check_expr(e->args.items[0], ty_string);
         expect_type(e->args.items[0], ty_string, xs_sprintf("argument of Uint8Array.%s", m));
         e->builtin.cfn = m[4] == 'B' ? "xs_u8_from_base64" : "xs_u8_from_hex";
         return;
     }
     if (is_buf && (strcmp(m, "alloc") == 0 || strcmp(m, "allocUnsafe") == 0)) {
-        if (n < 1 || n > (m[5] == 'U' ? 1 : 2)) xs_error(e->pos, NULL, "Buffer.%s takes a size%s", m, m[5] == 'U' ? "" : " and an optional fill byte");
+        if (n < 1 || n > (m[5] == 'U' ? 1 : 2)) xs_error(XS7004, e->pos, NULL, "Buffer.%s takes a size%s", m, m[5] == 'U' ? "" : " and an optional fill byte");
         for (int k = 0; k < n; k++) int_arg(&e->args.items[k], xs_sprintf("argument of Buffer.%s", m));
         if (n == 1) expr_list_push(&e->args, num_lit(e->pos, 0, true));
         e->builtin.cfn = "xs_buf_alloc";
         return;
     }
     if (is_buf && strcmp(m, "concat") == 0) {
-        if (n != 1) xs_error(e->pos, NULL, "Buffer.concat takes a list of buffers");
+        if (n != 1) xs_error(XS7007, e->pos, NULL, "Buffer.concat takes a list of buffers");
         check_expr(e->args.items[0], ty_array_of(ty_object_of(bc)));
         Type *lt = e->args.items[0]->type;
-        if (lt->kind != TY_ARRAY || !is_bytes(lt->elem)) xs_error(e->args.items[0]->pos, NULL, "Buffer.concat takes Buffer[] or Uint8Array[], not %s", ty_name(lt));
+        if (lt->kind != TY_ARRAY || !is_bytes(lt->elem)) xs_error(XS7006, e->args.items[0]->pos, NULL, "Buffer.concat takes Buffer[] or Uint8Array[], not %s", ty_name(lt));
         e->builtin.cfn = "xs_buf_concat";
         return;
     }
     if (is_buf && strcmp(m, "byteLength") == 0) {
-        if (n != 1) xs_error(e->pos, NULL, "Buffer.byteLength takes one string");
+        if (n != 1) xs_error(XS7005, e->pos, NULL, "Buffer.byteLength takes one string");
         check_expr(e->args.items[0], ty_string);
         expect_type(e->args.items[0], ty_string, "argument of Buffer.byteLength");
         e->builtin.cfn = "xs_buf_byte_length";
@@ -675,7 +716,7 @@ static void check_bytes_static(Expr *e, const char *ns) {
         return;
     }
     (void)u8;
-    xs_error(e->pos, is_buf ? "supported: Buffer.from, alloc, allocUnsafe, concat, byteLength" : "supported: Uint8Array.from, of, fromBase64, fromHex", "unknown %s member '%s'", ns, m);
+    xs_error(XS7105, e->pos, is_buf ? "supported: Buffer.from, alloc, allocUnsafe, concat, byteLength" : "supported: Uint8Array.from, of, fromBase64, fromHex", "unknown %s member '%s'", ns, m);
 }
 static Type *tuple_type(Type **ps, int n, Pos pos);
 static void check_stmt(Stmt *s);
@@ -706,21 +747,21 @@ static Expr *thunk_of(Expr *x) {
    concurrently on the event loop (runtime/xisto_net.h, xs_par_run): their I/O waits overlap. */
 static void check_promise(Expr *e, Type *expected) {
     const char *m = e->str;
-    if (!e->is_call) xs_error(e->pos, NULL, "Promise.%s is not a value", m);
+    if (!e->is_call) xs_error(XS7030, e->pos, NULL, "Promise.%s is not a value", m);
     if (strcmp(m, "resolve") == 0) { /* the value itself */
-        if (e->args.len != 1) xs_error(e->pos, NULL, "Promise.resolve takes one value");
+        if (e->args.len != 1) xs_error(XS7035, e->pos, NULL, "Promise.resolve takes one value");
         Expr *v = e->args.items[0];
         check_expr(v, expected);
         *e = *v;
         return;
     }
     bool race = strcmp(m, "race") == 0 || strcmp(m, "any") == 0;
-    if (!race && strcmp(m, "all") != 0) xs_error(e->pos, "supported: Promise.all, Promise.race, Promise.any, Promise.resolve", "unknown Promise member '%s'", m);
-    if (e->args.len != 1) xs_error(e->pos, NULL, "Promise.%s takes an array", m);
+    if (!race && strcmp(m, "all") != 0) xs_error(XS7111, e->pos, "supported: Promise.all, Promise.race, Promise.any, Promise.resolve", "unknown Promise member '%s'", m);
+    if (e->args.len != 1) xs_error(XS7032, e->pos, NULL, "Promise.%s takes an array", m);
     Expr *a = e->args.items[0];
     prog->uses_gen = true; /* the coroutines and the event loop */
     if (a->kind == E_ARRAY_LIT) { /* each element a task */
-        if (a->args.len == 0) xs_error(a->pos, NULL, "Promise.%s of an empty list", m);
+        if (a->args.len == 0) xs_error(XS7031, a->pos, NULL, "Promise.%s of an empty list", m);
         Type *t = NULL;
         bool mixed = false;
         ExprList thunks = {0};
@@ -729,11 +770,11 @@ static void check_promise(Expr *e, Type *expected) {
             Expr *th = thunk_of(a->args.items[i]);
             check_expr(th, NULL);
             Type *rt = th->arrow->fn->ret;
-            if (rt->kind == TY_VOID) xs_error(a->args.items[i]->pos, NULL, "an element of Promise.%s gives no value", m);
+            if (rt->kind == TY_VOID) xs_error(XS8081, a->args.items[i]->pos, NULL, "an element of Promise.%s gives no value", m);
             rts[i] = rt;
             if (!t) t = rt;
             else if (!ty_equal(t, rt)) {
-                if (race) xs_error(a->args.items[i]->pos, "give the elements one type (an interface or a union)", "the elements of Promise.%s are %s and %s", m, ty_name(t), ty_name(rt));
+                if (race) xs_error(XS8134, a->args.items[i]->pos, "give the elements one type (an interface or a union)", "the elements of Promise.%s are %s and %s", m, ty_name(t), ty_name(rt));
                 mixed = true;
             }
             expr_list_push(&thunks, th);
@@ -760,9 +801,9 @@ static void check_promise(Expr *e, Type *expected) {
         e->type = race ? a->type->elem : a->type;
         return;
     }
-    if (a->type->kind != TY_ARRAY) xs_error(a->pos, NULL, "Promise.%s takes an array, not %s", m, ty_name(a->type));
+    if (a->type->kind != TY_ARRAY) xs_error(XS7033, a->pos, NULL, "Promise.%s takes an array, not %s", m, ty_name(a->type));
     /* values already computed (async calls have finished): all is the array, race its first element */
-    if (race) xs_error(a->pos, "write the calls in place: Promise.race([a(), b()])", "Promise.race of values already computed");
+    if (race) xs_error(XS7034, a->pos, "write the calls in place: Promise.race([a(), b()])", "Promise.race of values already computed");
     *e = *a;
 }
 static bool is_regexp(Type *t) { return t && t->kind == TY_OBJECT && t->cls->builtin && strcmp(t->cls->name, "RegExp") == 0; }
@@ -880,7 +921,7 @@ static Class *instantiate_class(Class *tmpl, Type **args, Pos pos) {
         if (same) return made[i];
     }
     for (int k = 0; k < tmpl->ntparams; k++)
-        if (args[k]->kind == TY_TPARAM) xs_error(pos, NULL, "internal: a generic class instantiated with a type parameter");
+        if (args[k]->kind == TY_TPARAM) xs_error(XS9902, pos, NULL, "internal: a generic class instantiated with a type parameter");
     Buf name = {0};
     buf_printf(&name, "%s<", tmpl->name);
     for (int k = 0; k < tmpl->ntparams; k++) buf_printf(&name, "%s%s", k ? ", " : "", ty_name(args[k]));
@@ -908,7 +949,7 @@ static Class *instantiate_class(Class *tmpl, Type **args, Pos pos) {
     for (int k = 0; k < c->nfields; k++) {
         Field *fd = &c->fields[k];
         for (int j = 0; j < k; j++)
-            if (strcmp(fd->name, c->fields[j].name) == 0) xs_error(fd->pos, NULL, "field '%s' is declared twice", fd->name);
+            if (strcmp(fd->name, c->fields[j].name) == 0) xs_error(XS9023, fd->pos, NULL, "field '%s' is declared twice", fd->name);
         fd->type = resolve(fd->type, fd->pos);
         check_type_supported(fd->pos, fd->type);
         fd->cname = xs_sprintf("f_%s", fd->name);
@@ -916,8 +957,8 @@ static Class *instantiate_class(Class *tmpl, Type **args, Pos pos) {
     for (int k = 0; k < c->nmethods; k++) {
         Func *m = c->methods[k];
         for (int j = 0; j < k; j++)
-            if (strcmp(m->name, c->methods[j]->name) == 0) xs_error(m->pos, NULL, "method '%s' is declared twice", m->name);
-        if (find_field(c, m->name, NULL)) xs_error(m->pos, NULL, "'%s' is both a field and a method of %s", m->name, c->name);
+            if (strcmp(m->name, c->methods[j]->name) == 0) xs_error(XS9027, m->pos, NULL, "method '%s' is declared twice", m->name);
+        if (find_field(c, m->name, NULL)) xs_error(XS9007, m->pos, NULL, "'%s' is both a field and a method of %s", m->name, c->name);
         m->cname = xs_sprintf("m%d_%s_g%d_%s", tmpl->mod->id, tmpl->name, my, m->name);
         if (!m->ntparams) resolve_signature(m);
     }
@@ -939,14 +980,14 @@ static Class *instantiate_class(Class *tmpl, Type **args, Pos pos) {
 static Class *generic_new(Expr *e, Class *tmpl, Type *expected) {
     if (e->ntargs) {
         if (e->ntargs != tmpl->ntparams)
-            xs_error(e->pos, xs_sprintf("write new %s<...>() with %d type argument(s)", tmpl->name, tmpl->ntparams), "'%s' takes %d type argument(s), got %d", tmpl->name, tmpl->ntparams, e->ntargs);
+            xs_error(XS8063, e->pos, xs_sprintf("write new %s<...>() with %d type argument(s)", tmpl->name, tmpl->ntparams), "'%s' takes %d type argument(s), got %d", tmpl->name, tmpl->ntparams, e->ntargs);
         Type **args = xs_alloc(sizeof(Type *) * (size_t)tmpl->ntparams);
         for (int i = 0; i < e->ntargs; i++) args[i] = resolve(e->targs[i], e->pos);
         return instantiate_class(tmpl, args, e->pos);
     }
     Type *x = expected && expected->kind == TY_NULLABLE ? expected->elem : expected;
     if (x && x->kind == TY_OBJECT && x->cls && x->cls->generic_of == tmpl) return x->cls;
-    xs_error(e->pos, xs_sprintf("give the type arguments: new %s<Type>()", tmpl->name), "cannot infer the type arguments of %s", tmpl->name);
+    xs_error(XS3007, e->pos, xs_sprintf("give the type arguments: new %s<Type>()", tmpl->name), "cannot infer the type arguments of %s", tmpl->name);
     return NULL;
 }
 
@@ -962,7 +1003,7 @@ static Class *tuple_class(Type **ps, int n, Pos pos) {
         for (int k = 0; k < n && same; k++) same = ty_equal(c->fields[k].type, ps[k]);
         if (same) return c;
     }
-    if (n < 1) xs_error(pos, NULL, "an empty tuple type [] has no use");
+    if (n < 1) xs_error(XS3005, pos, NULL, "an empty tuple type [] has no use");
     Class *c = xs_alloc(sizeof *c);
     Buf name = {0};
     buf_puts(&name, "[");
@@ -1010,12 +1051,12 @@ static Type *resolve(Type *t, Pos pos) {
         t->key = resolve(t->key, pos);
         t->elem = resolve(t->elem, pos);
         if (t->key->kind != TY_STRING && t->key->kind != TY_INT)
-            xs_error(pos, "Map keys are string or int in xisto", "unsupported Map key type '%s'", ty_name(t->key));
+            xs_error(XS6035, pos, "Map keys are string or int in xisto", "unsupported Map key type '%s'", ty_name(t->key));
         return t;
     case TY_NULLABLE:
         t->elem = resolve(t->elem, pos);
         if (!nullable_ok(t->elem))
-            xs_error(pos, "values that can be null: strings, numbers, booleans, enums, arrays, objects, Map and Set", "'%s | null' is not supported", ty_name(t->elem));
+            xs_error(XS2003, pos, "values that can be null: strings, numbers, booleans, enums, arrays, objects, Map and Set", "'%s | null' is not supported", ty_name(t->elem));
         return t;
     case TY_FUNC:
         for (int i = 0; i < t->nparams; i++) t->params[i] = resolve(t->params[i], pos);
@@ -1034,7 +1075,7 @@ static Type *resolve(Type *t, Pos pos) {
                 bool dup = false;
                 for (int j = 0; j < n && !dup; j++) dup = ty_equal(m[j], xs[k]) && (m[j]->tname == xs[k]->tname || (m[j]->tname && xs[k]->tname && strcmp(m[j]->tname, xs[k]->tname) == 0));
                 if (dup) continue;
-                if (xs[k]->kind == TY_VOID || xs[k]->kind == TY_FUNC) xs_error(pos, NULL, "'%s' cannot be part of a union", ty_name(xs[k]));
+                if (xs[k]->kind == TY_VOID || xs[k]->kind == TY_FUNC) xs_error(XS2004, pos, NULL, "'%s' cannot be part of a union", ty_name(xs[k]));
                 m = realloc(m, sizeof(Type *) * (size_t)(n + 1));
                 m[n++] = xs[k];
             }
@@ -1051,7 +1092,8 @@ static Type *resolve(Type *t, Pos pos) {
             Class *c = find_class(t->cls->name);
             if (!c) {
                 int n; const char **cands = class_names(&n);
-                xs_error(t->cls->pos.line ? t->cls->pos : pos, xs_help_suggest(t->cls->name, cands, n, "declare the class above, or use number, int, boolean, string or T[]"), "unknown type '%s'", t->cls->name);
+                if (missing_name(t->cls->name)) xs_error_quiet();
+                xs_error(XS9033, t->cls->pos.line ? t->cls->pos : pos, xs_help_suggest(t->cls->name, cands, n, "declare the class above, or use number, int, boolean, string or T[]"), "unknown type '%s'", t->cls->name);
             }
             if (c->alias) { /* type Name = A | B: the aliased type, resolved once in its own module */
                 Module *sm = cur_mod;
@@ -1067,7 +1109,7 @@ static Type *resolve(Type *t, Pos pos) {
             }
             if (c->ntparams || t->ntargs) {
                 if (c->ntparams != t->ntargs)
-                    xs_error(pos, xs_sprintf("write %s<...> with %d type argument(s)", c->name, c->ntparams), "'%s' takes %d type argument(s), got %d", c->name, c->ntparams, t->ntargs);
+                    xs_error(XS8063, pos, xs_sprintf("write %s<...> with %d type argument(s)", c->name, c->ntparams), "'%s' takes %d type argument(s), got %d", c->name, c->ntparams, t->ntargs);
                 for (int i = 0; i < t->ntargs; i++) t->targs[i] = resolve(t->targs[i], pos);
                 c = c->gen_state ? instantiate_class(c, t->targs, pos) : instantiate(c, t->targs, pos);
             }
@@ -1283,10 +1325,10 @@ static int arrow_depth(void) {
 
 static Binding *declare(Pos pos, const char *name, Type *type, bool is_const, bool global, bool is_param) {
     for (Binding *b = scope->head; b; b = b->next)
-        if (strcmp(b->name, name) == 0) xs_error(pos, NULL, "'%s' is already declared in this scope", name);
+        if (strcmp(b->name, name) == 0) xs_error(XS9003, pos, NULL, "'%s' is already declared in this scope", name);
     /* a variable may shadow a built-in function or namespace (lines, fetch, console...), as in TypeScript; class
        and enum names stay reserved */
-    if (find_class(name) || find_enum(name)) xs_error(pos, NULL, "'%s' is built in and cannot be redeclared", name);
+    if (find_class(name) || find_enum(name)) xs_error(XS9009, pos, NULL, "'%s' is built in and cannot be redeclared", name);
     Binding *b = xs_alloc(sizeof *b);
     b->name = (char *)name;
     b->type = type;
@@ -1311,17 +1353,17 @@ static bool is_numeric(Type *t) { return t->kind == TY_NUMBER || t->kind == TY_I
 
 static void check_type_supported(Pos pos, Type *t) {
     if (t->kind == TY_ARRAY && (t->elem->kind == TY_VOID || (t->elem->kind == TY_NULLABLE && !ty_is_heap(t->elem))))
-        xs_error(pos, "arrays hold number, int, boolean, string, enums, objects, functions, arrays, Map and Set, and (T | null) of strings, objects and arrays; not nullable numbers",
+        xs_error(XS6039, pos, "arrays hold number, int, boolean, string, enums, objects, functions, arrays, Map and Set, and (T | null) of strings, objects and arrays; not nullable numbers",
                  "unsupported array type '%s'", ty_name(t));
     if (t->kind == TY_SET && t->elem->kind != TY_STRING && t->elem->kind != TY_INT)
-        xs_error(pos, "Set elements are string or int in xisto", "unsupported Set element type '%s'", ty_name(t));
+        xs_error(XS6037, pos, "Set elements are string or int in xisto", "unsupported Set element type '%s'", ty_name(t));
     if (t->kind == TY_CHAN && (t->elem->kind == TY_VOID || t->elem->kind == TY_FUNC))
-        xs_error(pos, NULL, "unsupported channel element type '%s'", ty_name(t->elem));
+        xs_error(XS6040, pos, NULL, "unsupported channel element type '%s'", ty_name(t->elem));
     if (t->kind == TY_MAP && (t->elem->kind == TY_VOID || t->elem->kind == TY_FUNC || t->elem->kind == TY_NULLABLE))
-        xs_error(pos, NULL, "unsupported Map value type '%s'", ty_name(t->elem));
+        xs_error(XS6036, pos, NULL, "unsupported Map value type '%s'", ty_name(t->elem));
     if (t->kind == TY_STREAM && (t->elem->kind == TY_FUNC || t->elem->kind == TY_VOID || t->elem->kind == TY_NULLABLE || t->elem->kind == TY_STREAM))
-        xs_error(pos, NULL, "unsupported stream element type '%s'", ty_name(t->elem));
-    if (t->kind == TY_VOID) xs_error(pos, NULL, "void is not a value type");
+        xs_error(XS6042, pos, NULL, "unsupported stream element type '%s'", ty_name(t->elem));
+    if (t->kind == TY_VOID) xs_error(XS8147, pos, NULL, "void is not a value type");
 }
 
 /* JSON.stringify / JSON.parse cover primitives, strings, classes whose fields are all serializable, and arrays of those. */
@@ -1420,7 +1462,7 @@ static void check_spread_lit(Expr *e, Type *elem) {
         if (is_bytes(st)) ets[i] = ty_int;
         else if (is_f64(st)) ets[i] = ty_number;
         else if (st->kind == TY_ARRAY) ets[i] = st->elem;
-        else xs_error(a->lhs->pos, "spread an array, a string, a Set, a Map, a Uint8Array or a Float64Array", "cannot spread %s", ty_name(st));
+        else xs_error(XS8101, a->lhs->pos, "spread an array, a string, a Set, a Map, a Uint8Array or a Float64Array", "cannot spread %s", ty_name(st));
         a->type = st;
     }
     if (!elem) { /* as TypeScript: numbers win over ints; else the first element's type */
@@ -1436,7 +1478,7 @@ static void check_spread_lit(Expr *e, Type *elem) {
         Expr *a = e->args.items[i];
         if (a->kind == E_UNARY && a->op == TK_ELLIPSIS) {
             bool ok = ty_equal(ets[i], elem) || (ets[i]->kind == TY_INT && elem->kind == TY_NUMBER && (is_bytes(a->type) || is_f64(a->type)));
-            if (!ok) xs_error(a->pos, NULL, "the spread elements are %s, but the array holds %s", ty_name(ets[i]), ty_name(elem));
+            if (!ok) xs_error(XS8141, a->pos, NULL, "the spread elements are %s, but the array holds %s", ty_name(ets[i]), ty_name(elem));
         } else expect_type(a, elem, "array element");
     }
     e->type = ty_array_of(elem);
@@ -1566,7 +1608,7 @@ static void expect_type(Expr *e, Type *want, const char *what) {
     if (ty_equal(e->type, want) && !(want->kind == TY_STRING && want->tname)) return;
     if (want->kind == TY_STRING && want->tname && e->type->kind == TY_STRING) { /* a string literal type: that value only */
         if (e->kind != E_STRING || strcmp(e->str, want->tname) != 0)
-            xs_error(e->pos, NULL, "%s must be \"%s\"", what, want->tname);
+            xs_error(XS8019, e->pos, NULL, "%s must be \"%s\"", what, want->tname);
         return;
     }
     if ((want->kind == TY_UNION || (want->kind == TY_NULLABLE && want->elem->kind == TY_UNION)) && enter_union(e, want)) return;
@@ -1585,29 +1627,29 @@ static void expect_type(Expr *e, Type *want, const char *what) {
         return;
     }
     if (e->type->kind == TY_NULL)
-        xs_error(e->pos, xs_sprintf("declare it as %s | null", ty_name(want)), "%s must be %s, but this is null", what, ty_name(want));
+        xs_error(XS2002, e->pos, xs_sprintf("declare it as %s | null", ty_name(want)), "%s must be %s, but this is null", what, ty_name(want));
     const char *help = NULL;
     if (e->type->kind == TY_NULLABLE && ty_equal(e->type->elem, want))
         help = "it may be null; check first: if (x !== null) { ... }";
     if (e->type->kind == TY_INT && want->kind == TY_NUMBER) help = "convert explicitly: Number(x)";
     else if (e->type->kind == TY_NUMBER && want->kind == TY_INT) help = "convert explicitly: Math.trunc(x), Math.floor(x), Math.ceil(x) or Math.round(x)";
     else if (is_numeric(e->type) && want->kind == TY_STRING) help = "convert explicitly: String(x)";
-    xs_error(e->pos, help, "%s must be %s, but this is %s", what, ty_name(want), ty_name(e->type));
+    xs_error(XS8018, e->pos, help, "%s must be %s, but this is %s", what, ty_name(want), ty_name(e->type));
 }
 
 static Type *unify_numeric(Expr *e, const char *what) {
     Expr *a = e->lhs, *b = e->rhs;
     if (!is_numeric(a->type) && a->type->kind != TY_LITINT)
-        xs_error(a->pos, NULL, "left operand of %s must be int or number, but this is %s", what, ty_name(a->type));
+        xs_error(XS8112, a->pos, NULL, "left operand of %s must be int or number, but this is %s", what, ty_name(a->type));
     if (!is_numeric(b->type) && b->type->kind != TY_LITINT)
-        xs_error(b->pos, NULL, "right operand of %s must be int or number, but this is %s", what, ty_name(b->type));
+        xs_error(XS8121, b->pos, NULL, "right operand of %s must be int or number, but this is %s", what, ty_name(b->type));
     if (a->type->kind == TY_LITINT && b->type->kind == TY_LITINT) return ty_litint;
     if (a->type->kind == TY_LITINT) coerce_lit(a, b->type);
     if (b->type->kind == TY_LITINT) coerce_lit(b, a->type);
     if (a->type->kind == TY_INT && b->type->kind == TY_NUMBER) widen_inferred(a);
     else if (a->type->kind == TY_NUMBER && b->type->kind == TY_INT) widen_inferred(b);
     if (!ty_equal(a->type, b->type))
-        xs_error(e->pos, "int and number do not mix; convert with Number(i) or Math.trunc(x)",
+        xs_error(XS8084, e->pos, "int and number do not mix; convert with Number(i) or Math.trunc(x)",
                  "cannot apply %s to %s and %s", what, ty_name(a->type), ty_name(b->type));
     return a->type;
 }
@@ -1632,7 +1674,7 @@ static Expr *dflt_subst(Expr *d, Func *f, Expr **args, int nargs, Pos at) {
                 bool simple = a && (a->kind == E_NUMBER || a->kind == E_STRING || a->kind == E_NULL ||
                                     (p && (p->kind == E_IDENT || p->kind == E_THIS)));
                 if (!simple)
-                    xs_error(at, xs_sprintf("put the argument for '%s' in a const first, or give every argument", f->params[k].name),
+                    xs_error(XS8132, at, xs_sprintf("put the argument for '%s' in a const first, or give every argument", f->params[k].name),
                              "the default of a later parameter reads '%s', and the argument given for it cannot be read twice", d->str);
                 return dflt_subst(a, f, NULL, 0, at); /* (a copy of the argument as written) */
             }
@@ -1650,8 +1692,8 @@ static void check_args(Expr *e, Func *f, const char *what) {
     int required = f->nparams;
     while (required > 0 && f->params[required - 1].dflt) required--;
     if (e->args.len < required || e->args.len > f->nparams) {
-        if (required == f->nparams) xs_error(e->pos, NULL, "%s takes %d argument(s), got %d", what, f->nparams, e->args.len);
-        xs_error(e->pos, NULL, "%s takes %d to %d argument(s), got %d", what, required, f->nparams, e->args.len);
+        if (required == f->nparams) xs_error(XS8026, e->pos, NULL, "%s takes %d argument(s), got %d", what, f->nparams, e->args.len);
+        xs_error(XS8027, e->pos, NULL, "%s takes %d to %d argument(s), got %d", what, required, f->nparams, e->args.len);
     }
     /* left-out arguments: the declared defaults, evaluated at the call as in JavaScript */
     for (int i = e->args.len, given = e->args.len; i < f->nparams; i++) expr_list_push(&e->args, dflt_arg(f, i, e->args.items, given, e->pos));
@@ -1675,16 +1717,16 @@ static void check_math(Expr *e) {
                 e->type = ty_number;
                 return;
             }
-        xs_error(e->pos, "supported: Math.PI, E, LN2, LN10, LOG2E, LOG10E, SQRT2, SQRT1_2", "unknown Math constant '%s'", e->str);
+        xs_error(XS7108, e->pos, "supported: Math.PI, E, LN2, LN10, LOG2E, LOG10E, SQRT2, SQRT1_2", "unknown Math constant '%s'", e->str);
     }
     const char *fn = e->str;
     if (strcmp(fn, "imul") == 0 || strcmp(fn, "clz32") == 0) { /* 32-bit integer math: ints */
         int na = fn[0] == 'i' ? 2 : 1;
-        if (e->args.len != na) xs_error(e->pos, NULL, "Math.%s takes %d argument(s), got %d", fn, na, e->args.len);
+        if (e->args.len != na) xs_error(XS7026, e->pos, NULL, "Math.%s takes %d argument(s), got %d", fn, na, e->args.len);
         for (int k = 0; k < na; k++) {
             check_expr(e->args.items[k], ty_int);
             if (e->args.items[k]->type->kind == TY_LITINT) coerce_lit(e->args.items[k], ty_int);
-            if (!is_numeric(e->args.items[k]->type)) xs_error(e->args.items[k]->pos, NULL, "argument of Math.%s must be int or number", fn);
+            if (!is_numeric(e->args.items[k]->type)) xs_error(XS7046, e->args.items[k]->pos, NULL, "argument of Math.%s must be int or number", fn);
         }
         e->type = ty_int;
         return;
@@ -1693,7 +1735,7 @@ static void check_math(Expr *e) {
         if (strcmp(fn, fns[i].name) != 0) continue;
         bool minmax = strcmp(fn, "min") == 0 || strcmp(fn, "max") == 0; /* any number of arguments, as in JS */
         if (!minmax && e->args.len != fns[i].nargs)
-            xs_error(e->pos, NULL, "Math.%s takes %d argument(s), got %d", fn, fns[i].nargs, e->args.len);
+            xs_error(XS7026, e->pos, NULL, "Math.%s takes %d argument(s), got %d", fn, fns[i].nargs, e->args.len);
         for (int k = 0; k < e->args.len; k++) check_expr(e->args.items[k], NULL);
         bool generic = strcmp(fn, "abs") == 0 || strcmp(fn, "min") == 0 || strcmp(fn, "max") == 0;
         bool to_int = strcmp(fn, "floor") == 0 || strcmp(fn, "ceil") == 0 || strcmp(fn, "round") == 0 || strcmp(fn, "trunc") == 0;
@@ -1713,7 +1755,7 @@ static void check_math(Expr *e) {
     {
         const char *names[sizeof fns / sizeof fns[0]];
         for (size_t i = 0; i < sizeof fns / sizeof fns[0]; i++) names[i] = fns[i].name;
-        xs_error(e->pos, xs_help_suggest(e->str, names, (int)(sizeof fns / sizeof fns[0]), "supported: sqrt floor ceil abs round trunc min max pow sin cos tan log exp"), "unknown Math function '%s'", e->str);
+        xs_error(XS7109, e->pos, xs_help_suggest(e->str, names, (int)(sizeof fns / sizeof fns[0]), "supported: sqrt floor ceil abs round trunc min max pow sin cos tan log exp"), "unknown Math function '%s'", e->str);
     }
 }
 
@@ -1728,21 +1770,21 @@ static bool check_string_regex(Expr *e) {
     Expr *a0 = e->args.items[0];
     check_expr(a0, NULL);
     if (!is_regexp(a0->type)) {
-        if (rx_only) xs_error(a0->pos, "pass a RegExp: s.match(/a+/), or new RegExp(text)", "string.%s takes a RegExp", m);
+        if (rx_only) xs_error(XS7096, a0->pos, "pass a RegExp: s.match(/a+/), or new RegExp(text)", "string.%s takes a RegExp", m);
         return false; /* the string versions (the argument is checked again there: no harm) */
     }
     prog->uses_regex = true;
     Class *mc = find_class("RegExpExecArray");
     e->builtin.self_first = true;
     if (strcmp(m, "match") == 0 || strcmp(m, "matchAll") == 0 || strcmp(m, "search") == 0) {
-        if (e->args.len != 1) xs_error(e->pos, NULL, "string.%s takes one argument", m);
+        if (e->args.len != 1) xs_error(XS7098, e->pos, NULL, "string.%s takes one argument", m);
         if (m[5] == 'A') { e->builtin.cfn = "xs_str_match_all_re"; e->type = ty_array_of(ty_object_of(mc)); }
         else if (m[0] == 'm') { e->builtin.cfn = "xs_str_match_re"; e->type = ty_nullable_of(ty_object_of(mc)); }
         else { e->builtin.cfn = "xs_str_search_re"; e->type = ty_int; }
         return true;
     }
     if (strcmp(m, "split") == 0) {
-        if (e->args.len > 2) xs_error(e->pos, NULL, "string.split takes a separator and an optional limit");
+        if (e->args.len > 2) xs_error(XS7099, e->pos, NULL, "string.split takes a separator and an optional limit");
         if (e->args.len == 2) { check_expr(e->args.items[1], ty_int); expect_type(e->args.items[1], ty_int, "the split limit"); }
         else {
             Expr *lim = xs_alloc(sizeof *lim);
@@ -1754,12 +1796,12 @@ static bool check_string_regex(Expr *e) {
         return true;
     }
     /* replace / replaceAll: a string with $1, $<name>, $&..., or (match, p1, ...) => string */
-    if (e->args.len != 2) xs_error(e->pos, NULL, "string.%s takes a pattern and a replacement", m);
+    if (e->args.len != 2) xs_error(XS7097, e->pos, NULL, "string.%s takes a pattern and a replacement", m);
     bool all = strcmp(m, "replaceAll") == 0;
     Expr *r = e->args.items[1];
     if (r->kind == E_ARROW || (r->kind == E_IDENT && 0)) {
         int np = r->arrow->fn->nparams;
-        if (np > 8) xs_error(r->pos, NULL, "a replacement callback takes at most 8 parameters (the match and 7 groups)");
+        if (np > 8) xs_error(XS6019, r->pos, NULL, "a replacement callback takes at most 8 parameters (the match and 7 groups)");
         Type **ps = xs_alloc(sizeof(Type *) * (size_t)(np ? np : 1));
         for (int k = 0; k < np; k++) ps[k] = ty_string;
         Type *ft = ty_func(ps, np, ty_string);
@@ -1771,7 +1813,7 @@ static bool check_string_regex(Expr *e) {
         e->builtin.cfn = all ? "xs_str_replace_all_re_fn" : "xs_str_replace_re_fn";
     } else {
         check_expr(r, ty_string);
-        if (r->type->kind == TY_FUNC) xs_error(r->pos, "write the callback inline: s.replace(re, (m, p1) => ...)", "a replacement callback must be an arrow function written in place");
+        if (r->type->kind == TY_FUNC) xs_error(XS6018, r->pos, "write the callback inline: s.replace(re, (m, p1) => ...)", "a replacement callback must be an arrow function written in place");
         expect_type(r, ty_string, xs_sprintf("the replacement of string.%s", m));
         e->builtin.cfn = all ? "xs_str_replace_all_re" : "xs_str_replace_re";
     }
@@ -1798,7 +1840,7 @@ static bool check_string_member_more(Expr *e) {
     for (size_t i = 0; i < sizeof ms / sizeof ms[0]; i++) {
         if (strcmp(e->str, ms[i].name) != 0) continue;
         if (e->args.len < ms[i].min || e->args.len > ms[i].max)
-            xs_error(e->pos, NULL, "string.%s takes %d to %d argument(s), got %d", e->str, ms[i].min, ms[i].max, e->args.len);
+            xs_error(XS7095, e->pos, NULL, "string.%s takes %d to %d argument(s), got %d", e->str, ms[i].min, ms[i].max, e->args.len);
         for (int k = 0; k < e->args.len; k++) {
             Type *want = (k == 0 ? ms[i].a1 : ms[i].a2) == TY_STRING ? ty_string : ty_int;
             check_expr(e->args.items[k], want);
@@ -1846,7 +1888,7 @@ static void check_string_member(Expr *e) {
             e->builtin.self_first = true;
             return;
         }
-        xs_error(e->pos, "supported: length, startsWith, endsWith, includes, indexOf, slice, trim, toUpperCase, toLowerCase", "string has no property '%s'", e->str);
+        xs_error(XS7093, e->pos, "supported: length, startsWith, endsWith, includes, indexOf, slice, trim, toUpperCase, toLowerCase", "string has no property '%s'", e->str);
     }
     for (size_t i = 0; i < sizeof ms / sizeof ms[0]; i++) {
         if (strcmp(e->str, ms[i].name) != 0) continue;
@@ -1854,7 +1896,7 @@ static void check_string_member(Expr *e) {
         bool slice = strcmp(e->str, "slice") == 0 || strcmp(e->str, "substring") == 0;
         bool index_of = strcmp(e->str, "indexOf") == 0;
         if ((slice || index_of) ? (e->args.len < 1 || e->args.len > 2) : e->args.len != n)
-            xs_error(e->pos, NULL, "string.%s takes %d argument(s), got %d", e->str, n, e->args.len);
+            xs_error(XS7094, e->pos, NULL, "string.%s takes %d argument(s), got %d", e->str, n, e->args.len);
         Type *argt = ms[i].arg == TY_STRING ? ty_string : ty_int;
         for (int k = 0; k < e->args.len; k++) {
             Type *want = (index_of && k == 1) ? ty_int : argt; /* indexOf(search, fromIndex) */
@@ -1886,7 +1928,7 @@ static void check_string_member(Expr *e) {
         const char *names[sizeof ms / sizeof ms[0] + 1];
         for (size_t i = 0; i < sizeof ms / sizeof ms[0]; i++) names[i] = ms[i].name;
         names[sizeof ms / sizeof ms[0]] = "length";
-        xs_error(e->pos, xs_help_suggest(e->str, names, (int)(sizeof ms / sizeof ms[0]) + 1, "supported: length, startsWith, endsWith, includes, indexOf, lastIndexOf, slice, substring, trim, trimStart, trimEnd, toUpperCase, toLowerCase, split, replace, replaceAll, padStart, padEnd, repeat, charAt"), "string has no method '%s'", e->str);
+        xs_error(XS7092, e->pos, xs_help_suggest(e->str, names, (int)(sizeof ms / sizeof ms[0]) + 1, "supported: length, startsWith, endsWith, includes, indexOf, lastIndexOf, slice, substring, trim, trimStart, trimEnd, toUpperCase, toLowerCase, split, replace, replaceAll, padStart, padEnd, repeat, charAt"), "string has no method '%s'", e->str);
     }
 }
 
@@ -1895,8 +1937,8 @@ static void check_stream_member(Expr *e) {
     Type *t = e->lhs->type;
     Type *elem = t->elem;
     const char *m = e->str;
-    if (!e->is_call) xs_error(e->pos, "streams have methods only: map, filter, batch, take, forEach, reduce, toArray, count, writeLines", "Stream has no property '%s'", m);
-    #define NARGS(n) do { if (e->args.len != (n)) xs_error(e->pos, NULL, "Stream.%s takes %d argument(s), got %d", m, (n), e->args.len); } while (0)
+    if (!e->is_call) xs_error(XS7038, e->pos, "streams have methods only: map, filter, batch, take, forEach, reduce, toArray, count, writeLines", "Stream has no property '%s'", m);
+    #define NARGS(n) do { if (e->args.len != (n)) xs_error(XS7039, e->pos, NULL, "Stream.%s takes %d argument(s), got %d", m, (n), e->args.len); } while (0)
     if (strcmp(m, "map") == 0 || strcmp(m, "filter") == 0 || strcmp(m, "forEach") == 0) {
         NARGS(1);
         Expr *cb = e->args.items[0];
@@ -1906,11 +1948,11 @@ static void check_stream_member(Expr *e) {
         if (is_map && !(cb->kind == E_ARROW && !cb->arrow->fn->ret)) { check_expr(cb, NULL); }
         else check_expr(cb, cbt);
         if (cb->type->kind != TY_FUNC || cb->type->nparams != 1 || !ty_equal(cb->type->params[0], elem))
-            xs_error(cb->pos, NULL, "the callback of Stream.%s takes one %s", m, ty_name(elem));
+            xs_error(XS7100, cb->pos, NULL, "the callback of Stream.%s takes one %s", m, ty_name(elem));
         if (!is_map) expect_type(cb, cbt, xs_sprintf("callback of Stream.%s", m));
         if (is_map) {
             Type *rt = cb->type->ret;
-            if (rt->kind == TY_VOID || rt->kind == TY_FUNC || rt->kind == TY_NULLABLE) xs_error(cb->pos, NULL, "map cannot produce a stream of %s", ty_name(rt));
+            if (rt->kind == TY_VOID || rt->kind == TY_FUNC || rt->kind == TY_NULLABLE) xs_error(XS7063, cb->pos, NULL, "map cannot produce a stream of %s", ty_name(rt));
             e->type = ty_stream_of(rt);
         } else if (strcmp(m, "filter") == 0) e->type = t;
         else e->type = ty_void;
@@ -1947,7 +1989,7 @@ static void check_stream_member(Expr *e) {
     if (strcmp(m, "count") == 0) { NARGS(0); e->type = ty_int; e->builtin.cfn = m; return; }
     if (strcmp(m, "writeLines") == 0) {
         NARGS(1);
-        if (elem->kind != TY_STRING) xs_error(e->pos, "map the elements to strings first", "writeLines needs a Stream<string>, this is %s", ty_name(t));
+        if (elem->kind != TY_STRING) xs_error(XS7122, e->pos, "map the elements to strings first", "writeLines needs a Stream<string>, this is %s", ty_name(t));
         check_expr(e->args.items[0], ty_string);
         expect_type(e->args.items[0], ty_string, "path of writeLines");
         e->type = ty_void;
@@ -1956,7 +1998,7 @@ static void check_stream_member(Expr *e) {
     }
     #undef NARGS
     static const char *names[] = {"map", "filter", "batch", "take", "forEach", "reduce", "toArray", "count", "writeLines"};
-    xs_error(e->pos, xs_help_suggest(m, names, 9, NULL), "Stream has no method '%s'", m);
+    xs_error(XS7037, e->pos, xs_help_suggest(m, names, 9, NULL), "Stream has no method '%s'", m);
 }
 
 static void check_map_member(Expr *e) {
@@ -1967,9 +2009,9 @@ static void check_map_member(Expr *e) {
     const char *m = e->str;
     if (!e->is_call) {
         if (strcmp(m, "size") == 0) { e->type = ty_int; e->builtin.cfn = "size"; return; }
-        xs_error(e->pos, is_map ? "Map has: size, get, set, has, delete, clear, keys, values, entries" : "Set has: size, add, has, delete, clear, values", "%s has no property '%s'", ty_name(t), m);
+        xs_error(XS8015, e->pos, is_map ? "Map has: size, get, set, has, delete, clear, keys, values, entries" : "Set has: size, add, has, delete, clear, values", "%s has no property '%s'", ty_name(t), m);
     }
-    #define ARGS(n) do { if (e->args.len != (n)) xs_error(e->pos, NULL, "%s.%s takes %d argument(s), got %d", is_map ? "Map" : "Set", m, (n), e->args.len); } while (0)
+    #define ARGS(n) do { if (e->args.len != (n)) xs_error(XS8038, e->pos, NULL, "%s.%s takes %d argument(s), got %d", is_map ? "Map" : "Set", m, (n), e->args.len); } while (0)
     #define ARG(i, ty, what) do { check_expr(e->args.items[i], ty); expect_type(e->args.items[i], ty, what); } while (0)
     if (strcmp(m, "has") == 0 || strcmp(m, "delete") == 0) {
         ARGS(1); ARG(0, k, is_map ? "Map key" : "Set element");
@@ -1997,7 +2039,7 @@ static void check_map_member(Expr *e) {
     #undef ARGS
     #undef ARG
     static const char *mnames[] = {"size", "get", "set", "has", "delete", "clear", "keys", "values", "add", "entries"};
-    xs_error(e->pos, xs_help_suggest(m, mnames, 9, NULL), "%s has no method '%s'", ty_name(t), m);
+    xs_error(XS8014, e->pos, xs_help_suggest(m, mnames, 9, NULL), "%s has no method '%s'", ty_name(t), m);
 }
 
 static Field *find_field(Class *c, const char *name, int *index) {
@@ -2133,13 +2175,13 @@ static Type *subst_bound(Type *t, Func *tmpl, Type **bind) {
 static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char *what) {
     Type **bind = xs_alloc(sizeof(Type *) * (size_t)tmpl->ntparams);
     if (e->ntargs) {
-        if (e->ntargs != tmpl->ntparams) xs_error(e->pos, NULL, "%s takes %d type argument(s), got %d", what, tmpl->ntparams, e->ntargs);
+        if (e->ntargs != tmpl->ntparams) xs_error(XS8028, e->pos, NULL, "%s takes %d type argument(s), got %d", what, tmpl->ntparams, e->ntargs);
         for (int i = 0; i < e->ntargs; i++) bind[i] = resolve(e->targs[i], e->pos);
     }
     int required = tmpl->nparams;
     while (required > 0 && tmpl->params[required - 1].dflt) required--;
     if (e->args.len < required || e->args.len > tmpl->nparams)
-        xs_error(e->pos, NULL, "%s takes %d%s argument(s), got %d", what, required, required == tmpl->nparams ? "" : xs_sprintf(" to %d", tmpl->nparams), e->args.len);
+        xs_error(XS8029, e->pos, NULL, "%s takes %d%s argument(s), got %d", what, required, required == tmpl->nparams ? "" : xs_sprintf(" to %d", tmpl->nparams), e->args.len);
     bool *done = xs_alloc(sizeof(bool) * (size_t)(e->args.len + 1));
     /* two passes: the arguments that are not arrows first (they bind T from their own types), then the arrows,
        whose untyped parameters take the types bound so far: parallelMap(items: T[], fn: (item: T) => R) with
@@ -2169,7 +2211,7 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
     }
     if (expected && has_tparam(tmpl->ret)) unify(tmpl->ret, expected, tmpl, bind);
     for (int i = 0; i < tmpl->ntparams; i++)
-        if (!bind[i]) xs_error(e->pos, xs_sprintf("give it: %s<Type>(...)", tmpl->name), "cannot infer type parameter %s of %s", tmpl->tparams[i], what);
+        if (!bind[i]) xs_error(XS3010, e->pos, xs_sprintf("give it: %s<Type>(...)", tmpl->name), "cannot infer type parameter %s of %s", tmpl->tparams[i], what);
     Func *inst = instantiate_func(tmpl, bind);
     for (int i = e->args.len, given = e->args.len; i < inst->nparams; i++) /* defaults, as written for this instance */
         expr_list_push(&e->args, dflt_arg(inst, i, e->args.items, given, e->pos));
@@ -2186,9 +2228,9 @@ static void check_access(int access, Class *owner, const char *name, Pos pos) {
     if (!access || !owner || checking_generated) return;
     Class *in = cur_class ? cur_class : cur_func ? cur_func->cls : NULL;
     if (access == 2 && in != owner)
-        xs_error(pos, xs_sprintf("use it inside %s, or make it public", owner->name), "'%s' is private to %s", name, owner->name);
+        xs_error(XS8055, pos, xs_sprintf("use it inside %s, or make it public", owner->name), "'%s' is private to %s", name, owner->name);
     if (access == 1 && !(in && is_subclass(in, owner)))
-        xs_error(pos, xs_sprintf("use it inside %s or a class that extends it", owner->name), "'%s' is protected in %s", name, owner->name);
+        xs_error(XS8056, pos, xs_sprintf("use it inside %s or a class that extends it", owner->name), "'%s' is protected in %s", name, owner->name);
 }
 static const char *prop_name(const char *m) { return strncmp(m, "__get_", 6) == 0 || strncmp(m, "__set_", 6) == 0 ? m + 6 : m; }
 
@@ -2229,7 +2271,7 @@ static void check_object_member(Expr *e, Class *c) {
         e->lhs = fld;
         e->func = NULL;
         e->cls = NULL;
-        if (e->args.len != ft->nparams) xs_error(e->pos, NULL, "'%s' takes %d argument(s), got %d", f->name, ft->nparams, e->args.len);
+        if (e->args.len != ft->nparams) xs_error(XS8062, e->pos, NULL, "'%s' takes %d argument(s), got %d", f->name, ft->nparams, e->args.len);
         for (int i = 0; i < e->args.len; i++) {
             check_expr(e->args.items[i], ft->params[i]);
             expect_type(e->args.items[i], ft->params[i], xs_sprintf("argument %d of '%s'", i + 1, f->name));
@@ -2243,7 +2285,7 @@ static void check_object_member(Expr *e, Class *c) {
         return;
     }
     if (f) {
-        if (e->is_call) xs_error(e->pos, NULL, "'%s' is a field of %s, not a method", e->str, c->name);
+        if (e->is_call) xs_error(XS8048, e->pos, NULL, "'%s' is a field of %s, not a method", e->str, c->name);
         check_access(f->access, f->owner, f->name, e->pos);
         e->field = idx;
         e->type = f->type;
@@ -2267,25 +2309,25 @@ static void check_object_member(Expr *e, Class *c) {
     }
     if (!e->is_call && !c->builtin) { /* obj.x with get x(): a call */
         Func *g = find_method(c, xs_sprintf("__get_%s", e->str));
-        if (!g && find_method(c, xs_sprintf("__set_%s", e->str))) xs_error(e->pos, "add get %s(): T { ... }", "'%s' of %s has a setter but no getter", e->str, c->name);
+        if (!g && find_method(c, xs_sprintf("__set_%s", e->str))) xs_error(XS8060, e->pos, "add get %s(): T { ... }", "'%s' of %s has a setter but no getter", e->str, c->name);
         if (g) { e->str = g->name; e->is_call = true; }
     }
     Func *m = find_method(c, e->str);
     if (!m) {
         int n; const char **cands = member_names(c, &n);
         if (c->builtin && strcmp(c->name, "Error") == 0) { cands = (const char *[]){"message", "name", "stack"}; n = 3; }
-        xs_error(e->pos, xs_help_suggest(e->str, cands, n, NULL), "%s has no member '%s'", c->name, e->str);
+        xs_error(XS8013, e->pos, xs_help_suggest(e->str, cands, n, NULL), "%s has no member '%s'", c->name, e->str);
     }
-    if (!e->is_call) xs_error(e->pos, "call it: obj.method(...)", "'%s' is a method of %s, and methods are not values", e->str, c->name);
+    if (!e->is_call) xs_error(XS8049, e->pos, "call it: obj.method(...)", "'%s' is a method of %s, and methods are not values", e->str, c->name);
     if (!c->builtin) check_access(m->access, m->cls, prop_name(m->name), e->pos);
-    if (m->is_setter && e->args.len == 1 && strncmp(e->str, "__set_", 6) != 0) xs_error(e->pos, NULL, "'%s' is a setter: assign it", prop_name(m->name));
+    if (m->is_setter && e->args.len == 1 && strncmp(e->str, "__set_", 6) != 0) xs_error(XS8050, e->pos, NULL, "'%s' is a setter: assign it", prop_name(m->name));
     if (m->ntparams) { /* a generic method: its instance for these types */
         Func *inst = check_generic_call(e, m, NULL, xs_sprintf("%s.%s", c->name, m->name));
         e->func = inst;
         e->type = inst->ret;
         return;
     }
-    if (e->ntargs) xs_error(e->pos, NULL, "%s.%s is not generic", c->name, m->name);
+    if (e->ntargs) xs_error(XS6003, e->pos, NULL, "%s.%s is not generic", c->name, m->name);
     check_args(e, m, xs_sprintf("%s.%s", c->name, m->name));
     e->func = m;
     e->type = m->ret;
@@ -2324,11 +2366,11 @@ static void anon_objlit(Expr *e) {
     c->fields = xs_alloc(sizeof(Field) * (size_t)(e->args.len ? e->args.len : 1));
     for (int i = 0; i < e->args.len; i++) {
         Expr *v = e->args.items[i];
-        for (int k = 0; k < i; k++) if (strcmp(e->keys[k], e->keys[i]) == 0) xs_error(v->pos, NULL, "field '%s' is given twice", e->keys[i]);
+        for (int k = 0; k < i; k++) if (strcmp(e->keys[k], e->keys[i]) == 0) xs_error(XS9024, v->pos, NULL, "field '%s' is given twice", e->keys[i]);
         check_expr(v, v->kind == E_OBJLIT ? ty_json : NULL);
         settle(v);
-        if (v->type->kind == TY_NULL) xs_error(v->pos, "give the object a declared type", "cannot infer the type of null here");
-        if (!json_ok(v->type, 0)) xs_error(v->pos, NULL, "%s cannot be part of a JSON value", ty_name(v->type));
+        if (v->type->kind == TY_NULL) xs_error(XS3009, v->pos, "give the object a declared type", "cannot infer the type of null here");
+        if (!json_ok(v->type, 0)) xs_error(XS8004, v->pos, NULL, "%s cannot be part of a JSON value", ty_name(v->type));
         c->fields[i] = (Field){.name = e->keys[i], .pos = v->pos, .type = v->type, .cname = xs_sprintf("f_%s", e->keys[i])};
     }
     c->nfields = c->cap_fields = e->args.len;
@@ -2518,12 +2560,12 @@ static void big_fuse(Expr *e) {
 static bool big_binary(Expr *e) {
     if (!is_big(e->lhs->type) && !is_big(e->rhs->type)) return false;
     if (!is_big(e->lhs->type) || !is_big(e->rhs->type))
-        xs_error(e->pos, "convert one side: BigInt(i) or Number(b)", "cannot mix bigint and %s", ty_name(is_big(e->lhs->type) ? e->rhs->type : e->lhs->type));
+        xs_error(XS8094, e->pos, "convert one side: BigInt(i) or Number(b)", "cannot mix bigint and %s", ty_name(is_big(e->lhs->type) ? e->rhs->type : e->lhs->type));
     const char *cmp = e->op == TK_LT ? "xs_big_lt" : e->op == TK_LE ? "xs_big_le" : e->op == TK_GT ? "xs_big_gt" : e->op == TK_GE ? "xs_big_ge"
                     : e->op == TK_EQ ? "xs_big_eq" : e->op == TK_NEQ ? "xs_big_ne" : NULL;
     if (cmp) { big_call(e, cmp, e->lhs, e->rhs, ty_boolean); return true; }
     const char *f = big_op(e->op);
-    if (!f) xs_error(e->pos, "supported on bigint: + - * / % and comparisons", "operator %s is not supported on bigint", tok_kind_name(e->op));
+    if (!f) xs_error(XS6031, e->pos, "supported on bigint: + - * / % and comparisons", "operator %s is not supported on bigint", tok_kind_name(e->op));
     big_call(e, f, e->lhs, e->rhs, ty_big());
     big_fuse(e);
     return true;
@@ -2541,7 +2583,7 @@ static void check_expr(Expr *e, Type *expected) {
         return;
     case E_BOOL: e->type = ty_boolean; return;
     case E_THIS:
-        if (!cur_class) xs_error(e->pos, NULL, "'this' outside of a class");
+        if (!cur_class) xs_error(XS8069, e->pos, NULL, "'this' outside of a class");
         e->type = ty_object_of(cur_class);
         e->cname = (char *)this_cname();
         return;
@@ -2553,7 +2595,7 @@ static void check_expr(Expr *e, Type *expected) {
         Binding *b = lookup(e->str);
         if (!b) {
             Func *f = lookup_func(e->str);
-            if (f && f->ntparams) xs_error(e->pos, xs_sprintf("wrap it: (x: Type) => %s(x)", f->name), "the generic function '%s' is not a value", f->name);
+            if (f && f->ntparams) xs_error(XS8136, e->pos, xs_sprintf("wrap it: (x: Type) => %s(x)", f->name), "the generic function '%s' is not a value", f->name);
             if (f) { /* a function used as a value */
                 Type **ps = xs_alloc(sizeof(Type *) * (size_t)(f->nparams ? f->nparams : 1));
                 for (int i = 0; i < f->nparams; i++) ps[i] = f->params[i].type;
@@ -2568,9 +2610,9 @@ static void check_expr(Expr *e, Type *expected) {
                 char *ci = xs_sprintf("__ci_%s", cv->name);
                 for (Binding *mb = mod_scopes[cv->mod->id]->head; mb; mb = mb->next)
                     if (strcmp(mb->name, ci) == 0) { e->type = mb->type; e->cname = mb->cname; return; }
-                xs_error(e->pos, "decorate the class (@Injectable(), @Controller(), ...) so the compiler describes it", "class '%s' is used as a value, but it has no ClassInfo", e->str);
+                xs_error(XS9901, e->pos, "decorate the class (@Injectable(), @Controller(), ...) so the compiler describes it", "class '%s' is used as a value, but it has no ClassInfo", e->str);
             }
-            if (is_builtin_name(e->str)) xs_error(e->pos, NULL, "'%s' is built in and not a value", e->str);
+            if (is_builtin_name(e->str)) xs_error(XS8053, e->pos, NULL, "'%s' is built in and not a value", e->str);
             if (strcmp(e->str, "NaN") == 0 || strcmp(e->str, "Infinity") == 0) { /* the global constants */
                 e->kind = E_NUMBER;
                 e->num = e->str[0] == 'N' ? NAN : INFINITY;
@@ -2593,10 +2635,11 @@ static void check_expr(Expr *e, Type *expected) {
                 return;
             }
             if (strcmp(e->str, "undefined") == 0 || strcmp(e->str, "null") == 0)
-                xs_error(e->pos, "every value in xisto has a concrete type; there is no 'undefined' or 'null'", "'%s' does not exist", e->str);
+                xs_error(XS2005, e->pos, "every value in xisto has a concrete type; there is no 'undefined' or 'null'", "'%s' does not exist", e->str);
             {
                 int n; const char **cands = visible_names(&n);
-                xs_error(e->pos, xs_help_suggest(e->str, cands, n, "declare it first: let name: type = value;"), "unknown variable '%s'", e->str);
+                if (missing_name(e->str)) xs_error_quiet();
+                xs_error(XS9034, e->pos, xs_help_suggest(e->str, cands, n, "declare it first: let name: type = value;"), "unknown variable '%s'", e->str);
             }
         }
         for (Binding *o = b; o; o = o->origin)
@@ -2636,7 +2679,7 @@ static void check_expr(Expr *e, Type *expected) {
         if (e->op == TK_TILDE) { /* ~x: 32-bit complement, an int */
             check_expr(e->lhs, ty_int);
             if (e->lhs->type->kind == TY_LITINT) coerce_lit(e->lhs, ty_int);
-            if (!is_numeric(e->lhs->type)) xs_error(e->lhs->pos, NULL, "operand of '~' must be int or number, but this is %s", ty_name(e->lhs->type));
+            if (!is_numeric(e->lhs->type)) xs_error(XS8118, e->lhs->pos, NULL, "operand of '~' must be int or number, but this is %s", ty_name(e->lhs->type));
             e->type = ty_int;
             return;
         }
@@ -2646,11 +2689,11 @@ static void check_expr(Expr *e, Type *expected) {
             expect_type(e->lhs, ty_boolean, "operand of '!'");
             e->type = ty_boolean;
         } else if (is_big(e->lhs->type)) { /* -b */
-            if (e->op != TK_MINUS) xs_error(e->pos, NULL, "unary '+' is not allowed on bigint (as in JS)");
+            if (e->op != TK_MINUS) xs_error(XS6034, e->pos, NULL, "unary '+' is not allowed on bigint (as in JS)");
             big_call(e, "xs_big_neg", e->lhs, NULL, ty_big());
         } else {
             if (!is_numeric(e->lhs->type) && e->lhs->type->kind != TY_LITINT)
-                xs_error(e->lhs->pos, NULL, "operand of unary '-' must be int or number, but this is %s", ty_name(e->lhs->type));
+                xs_error(XS8119, e->lhs->pos, NULL, "operand of unary '-' must be int or number, but this is %s", ty_name(e->lhs->type));
             e->type = e->lhs->type;
         }
         return;
@@ -2663,7 +2706,7 @@ static void check_expr(Expr *e, Type *expected) {
             check_expr(e->lhs, NULL);
             check_expr(e->rhs, NULL);
             if (is_big(e->lhs->type) || is_big(e->rhs->type)) {
-                if (!is_big(e->lhs->type) || !is_big(e->rhs->type)) xs_error(e->pos, "convert one side: BigInt(i) or Number(b)", "cannot mix bigint and another type in '**'");
+                if (!is_big(e->lhs->type) || !is_big(e->rhs->type)) xs_error(XS8095, e->pos, "convert one side: BigInt(i) or Number(b)", "cannot mix bigint and another type in '**'");
                 big_call(e, "xs_big_pow", e->lhs, e->rhs, ty_big());
                 return;
             }
@@ -2671,7 +2714,7 @@ static void check_expr(Expr *e, Type *expected) {
             for (int k = 0; k < 2; k++) {
                 Expr *o = k ? e->rhs : e->lhs;
                 if (o->type->kind == TY_LITINT) coerce_lit(o, ty_int);
-                if (!is_numeric(o->type)) xs_error(o->pos, NULL, "operand of '**' must be int or number, but this is %s", ty_name(o->type));
+                if (!is_numeric(o->type)) xs_error(XS8116, o->pos, NULL, "operand of '**' must be int or number, but this is %s", ty_name(o->type));
                 if (o->type->kind != TY_INT) ints = false;
             }
             if (e->rhs->kind == E_UNARY && e->rhs->op == TK_MINUS) ints = false; /* 10 ** -2: a fraction */
@@ -2690,7 +2733,7 @@ static void check_expr(Expr *e, Type *expected) {
             for (int k = 0; k < 2; k++) {
                 Expr *o = k ? e->rhs : e->lhs;
                 if (o->type->kind == TY_LITINT) coerce_lit(o, ty_int);
-                if (!is_numeric(o->type)) xs_error(o->pos, NULL, "operand of %s must be int or number, but this is %s", tok_kind_name(e->op), ty_name(o->type));
+                if (!is_numeric(o->type)) xs_error(XS8115, o->pos, NULL, "operand of %s must be int or number, but this is %s", tok_kind_name(e->op), ty_name(o->type));
             }
             e->type = ty_int;
             return;
@@ -2758,8 +2801,8 @@ static void check_expr(Expr *e, Type *expected) {
         }
         if (e->op == TK_IDENT) { /* x instanceof C */
             Class *c = find_class(e->rhs->str);
-            if (!c || c->is_interface) xs_error(e->rhs->pos, "instanceof tests classes (interfaces have no run-time identity)", "'%s' is not a class", e->rhs->str);
-            if (!ty_is_heap(e->lhs->type)) xs_error(e->lhs->pos, NULL, "instanceof needs an object, but this is %s", ty_name(e->lhs->type));
+            if (!c || c->is_interface) xs_error(XS9010, e->rhs->pos, "instanceof tests classes (interfaces have no run-time identity)", "'%s' is not a class", e->rhs->str);
+            if (!ty_is_heap(e->lhs->type)) xs_error(XS8108, e->lhs->pos, NULL, "instanceof needs an object, but this is %s", ty_name(e->lhs->type));
             e->rhs->cls = c;
             e->rhs->type = ty_object_of(c);
             e->type = ty_boolean;
@@ -2809,7 +2852,7 @@ static void check_expr(Expr *e, Type *expected) {
                     for (Class *k = lt->cls; k && !related; k = k->base) if (k == rt->cls) related = true;
                 if (!related && lt->kind == TY_OBJECT && rt->kind == TY_OBJECT)
                     for (Class *k = rt->cls; k && !related; k = k->base) if (k == lt->cls) related = true;
-                if (!related) xs_error(e->pos, NULL, "cannot compare %s with %s", ty_name(e->lhs->type), ty_name(e->rhs->type));
+                if (!related) xs_error(XS8089, e->pos, NULL, "cannot compare %s with %s", ty_name(e->lhs->type), ty_name(e->rhs->type));
                 e->type = ty_boolean;
                 e->builtin.cfn = "ref_eq";
                 return;
@@ -2818,7 +2861,7 @@ static void check_expr(Expr *e, Type *expected) {
             if (e->lhs->type->kind == TY_NULL || e->rhs->type->kind == TY_NULL) {
                 Expr *other = e->lhs->type->kind == TY_NULL ? e->rhs : e->lhs;
                 if (other->type->kind != TY_NULLABLE && other->type->kind != TY_NULL && other->type->kind != TY_UNKNOWN)
-                    xs_error(e->pos, "only values declared as T | null can be null", "%s can never be null", ty_name(other->type));
+                    xs_error(XS2001, e->pos, "only values declared as T | null can be null", "%s can never be null", ty_name(other->type));
                 e->type = ty_boolean;
                 return;
             }
@@ -2831,16 +2874,16 @@ static void check_expr(Expr *e, Type *expected) {
                     e->builtin.cfn = "nullable_eq";
                     return;
                 }
-                xs_error(e->pos, "compare against null first: if (x !== null)", "cannot compare values that may be null");
+                xs_error(XS2011, e->pos, "compare against null first: if (x !== null)", "cannot compare values that may be null");
             }
             if (is_numeric(e->lhs->type) || is_numeric(e->rhs->type) || e->lhs->type->kind == TY_LITINT) {
                 Type *t = unify_numeric(e, "equality");
                 if (t->kind == TY_LITINT) { coerce_lit(e->lhs, ty_number); coerce_lit(e->rhs, ty_number); }
             } else if (!ty_equal(e->lhs->type, e->rhs->type)) {
-                xs_error(e->pos, NULL, "cannot compare %s with %s", ty_name(e->lhs->type), ty_name(e->rhs->type));
+                xs_error(XS8089, e->pos, NULL, "cannot compare %s with %s", ty_name(e->lhs->type), ty_name(e->rhs->type));
             }
             if (e->lhs->type->kind == TY_ARRAY || e->lhs->type->kind == TY_OBJECT || e->lhs->type->kind == TY_FUNC)
-                xs_error(e->pos, NULL, "%s values cannot be compared with '==='", ty_name(e->lhs->type));
+                xs_error(XS8036, e->pos, NULL, "%s values cannot be compared with '==='", ty_name(e->lhs->type));
             e->type = ty_boolean;
             return;
         case TK_AND: case TK_OR:
@@ -2851,7 +2894,7 @@ static void check_expr(Expr *e, Type *expected) {
             e->type = ty_boolean;
             return;
         default:
-            xs_error(e->pos, NULL, "internal: unexpected binary operator");
+            xs_error(XS9903, e->pos, NULL, "internal: unexpected binary operator");
         }
         return;
     case E_ASSIGN:
@@ -2912,34 +2955,34 @@ static void check_expr(Expr *e, Type *expected) {
             Binding *b = lookup(target->str);
             for (Binding *o = b; o; o = o->origin) if (o->lit_number) widen_rhs = true;
             if (strncmp(b->cname, "env->", 5) == 0)
-                xs_error(e->pos, "arrow functions capture by value; keep the state in an object or array and change that", "cannot assign to '%s', captured from the enclosing function", target->str);
-            if (b->is_const) xs_error(e->pos, "declare it with 'let' if it changes", "cannot assign to constant '%s'", target->str);
+                xs_error(XS8085, e->pos, "arrow functions capture by value; keep the state in an object or array and change that", "cannot assign to '%s', captured from the enclosing function", target->str);
+            if (b->is_const) xs_error(XS8087, e->pos, "declare it with 'let' if it changes", "cannot assign to constant '%s'", target->str);
             if (b->is_param && ty_is_heap(b->type))
-                xs_error(e->pos, "copy it into a local first: let s: string = param;", "cannot reassign parameter '%s' of reference type", target->str);
+                xs_error(XS8099, e->pos, "copy it into a local first: let s: string = param;", "cannot reassign parameter '%s' of reference type", target->str);
             if (b->orig) { narrowed = b; target->type = b->orig; }
         } else if (target->kind == E_INDEX) {
-            if (target->builtin.cfn && strcmp(target->builtin.cfn, "xs_u8_get") != 0) xs_error(e->pos, NULL, "a match's groups are read-only");
+            if (target->builtin.cfn && strcmp(target->builtin.cfn, "xs_u8_get") != 0) xs_error(XS8076, e->pos, NULL, "a match's groups are read-only");
         } else if (target->kind == E_MEMBER && target->field >= 0) {
             if (target->cls->builtin && !(strcmp(target->cls->name, "RegExp") == 0 && strcmp(target->str, "lastIndex") == 0))
-                xs_error(e->pos, NULL, "the fields of %s are read-only", target->cls->name);
+                xs_error(XS8135, e->pos, NULL, "the fields of %s are read-only", target->cls->name);
             Field *fd = &target->cls->fields[target->field];
             if (fd->readonly && !(cur_func && cur_func->is_ctor && cur_func->cls == fd->owner))
-                xs_error(e->pos, xs_sprintf("assign it in the constructor of %s, or drop readonly", fd->owner ? fd->owner->name : target->cls->name), "cannot assign to '%s': it is readonly", fd->name);
+                xs_error(XS8086, e->pos, xs_sprintf("assign it in the constructor of %s, or drop readonly", fd->owner ? fd->owner->name : target->cls->name), "cannot assign to '%s': it is readonly", fd->name);
         } else {
-            xs_error(e->pos, NULL, "the left side must be a variable, a field or an array element");
+            xs_error(XS8138, e->pos, NULL, "the left side must be a variable, a field or an array element");
         }
         if (e->kind == E_POSTFIX) {
             if (!is_numeric(target->type))
-                xs_error(e->pos, NULL, "operand of '++'/'--' must be int or number, but this is %s", ty_name(target->type));
+                xs_error(XS8117, e->pos, NULL, "operand of '++'/'--' must be int or number, but this is %s", ty_name(target->type));
             e->type = target->type;
             return;
         }
         check_expr(e->rhs, target->type);
         if (e->op != TK_ASSIGN && is_big(target->type)) { /* acc += x: acc = acc + x (a bigint is a value: a new one) */
             const char *f = big_op(e->op);
-            if (!f) xs_error(e->pos, "supported on bigint: += -= *= /=", "%s is not supported on bigint", tok_kind_name(e->op));
-            if (!is_big(e->rhs->type)) xs_error(e->rhs->pos, "convert it: BigInt(i)", "cannot mix bigint and %s", ty_name(e->rhs->type));
-            if (!rereadable(target)) xs_error(e->pos, "store the target in a const first", "compound assignment of a bigint needs a variable or a field");
+            if (!f) xs_error(XS6002, e->pos, "supported on bigint: += -= *= /=", "%s is not supported on bigint", tok_kind_name(e->op));
+            if (!is_big(e->rhs->type)) xs_error(XS8094, e->rhs->pos, "convert it: BigInt(i)", "cannot mix bigint and %s", ty_name(e->rhs->type));
+            if (!rereadable(target)) xs_error(XS8104, e->pos, "store the target in a const first", "compound assignment of a bigint needs a variable or a field");
             Expr *cur = expr_copy(target), *call = xs_alloc(sizeof *call);
             call->pos = e->pos;
             big_call(call, f, cur, e->rhs, ty_big());
@@ -2948,13 +2991,13 @@ static void check_expr(Expr *e, Type *expected) {
             e->op = TK_ASSIGN;
         }
         if (e->op == TK_SLASH_ASSIGN && target->type->kind == TY_INT)
-            xs_error(e->pos, "division yields number; write x = Math.trunc(x / y)", "'/=' cannot be applied to an int");
+            xs_error(XS8065, e->pos, "division yields number; write x = Math.trunc(x / y)", "'/=' cannot be applied to an int");
         if (e->op != TK_ASSIGN && !is_numeric(target->type) && !(e->op == TK_PLUS_ASSIGN && target->type->kind == TY_STRING))
-            xs_error(e->pos, NULL, "compound assignment needs int, number or string, but this is %s", ty_name(target->type));
+            xs_error(XS8103, e->pos, NULL, "compound assignment needs int, number or string, but this is %s", ty_name(target->type));
         if (tk_bitop_of_assign(e->op)) { /* x &= m: x must hold the int result */
-            if (target->type->kind != TY_INT) xs_error(e->pos, "declare it as int: bitwise operators give 32-bit integers", "%s needs an int on the left, but this is %s", tok_kind_name(e->op), ty_name(target->type));
+            if (target->type->kind != TY_INT) xs_error(XS8024, e->pos, "declare it as int: bitwise operators give 32-bit integers", "%s needs an int on the left, but this is %s", tok_kind_name(e->op), ty_name(target->type));
             if (e->rhs->type->kind == TY_LITINT) coerce_lit(e->rhs, ty_int);
-            if (!is_numeric(e->rhs->type)) xs_error(e->rhs->pos, NULL, "right side of %s must be int or number", tok_kind_name(e->op));
+            if (!is_numeric(e->rhs->type)) xs_error(XS8122, e->rhs->pos, NULL, "right side of %s must be int or number", tok_kind_name(e->op));
             e->type = ty_int;
             return;
         }
@@ -3011,17 +3054,17 @@ static void check_expr(Expr *e, Type *expected) {
             Type **ps = xs_alloc(sizeof(Type *));
             if (strcmp(which, "decoder") == 0) { ps[0] = ty_string; e->type = ty_func(ps, 1, ty_unknown); }
             else if (strcmp(which, "encoder") == 0) { ps[0] = ty_unknown; e->type = ty_func(ps, 1, ty_string); }
-            else xs_error(e->pos, NULL, "unknown reflection intrinsic '%s'", e->builtin.cfn);
+            else xs_error(XS7116, e->pos, NULL, "unknown reflection intrinsic '%s'", e->builtin.cfn);
             return;
         }
-        if (e->lhs->kind != E_IDENT) xs_error(e->pos, NULL, "only named functions can be called");
+        if (e->lhs->kind != E_IDENT) xs_error(XS6030, e->pos, NULL, "only named functions can be called");
         if (strcmp(e->lhs->str, "super") == 0 && !lookup("super")) { /* super(...): the base's constructor on this object */
             Class *cc = cur_func ? cur_func->cls : NULL;
             if (!cur_func || !cur_func->is_ctor || !cc || !cc->base)
-                xs_error(e->pos, NULL, "super(...) is called in the constructor of a class that extends another");
+                xs_error(XS8125, e->pos, NULL, "super(...) is called in the constructor of a class that extends another");
             Func *bc = eff_ctor(cc->base);
             if (bc) check_args(e, bc, xs_sprintf("the constructor of %s", cc->base->name));
-            else if (e->args.len) xs_error(e->pos, NULL, "%s has no constructor, so super() takes no arguments", cc->base->name);
+            else if (e->args.len) xs_error(XS8011, e->pos, NULL, "%s has no constructor, so super() takes no arguments", cc->base->name);
             e->kind = E_SUPER_CALL;
             e->cls = cc->base;
             e->func = bc;
@@ -3032,7 +3075,7 @@ static void check_expr(Expr *e, Type *expected) {
         const char *name = e->lhs->str;
         if (!lookup_func(name) && !lookup(name)) {
             if (strcmp(name, "isNaN") == 0 || strcmp(name, "isFinite") == 0) { /* the globals, on numbers */
-                if (e->args.len != 1) xs_error(e->pos, NULL, "%s takes exactly one argument", name);
+                if (e->args.len != 1) xs_error(XS8032, e->pos, NULL, "%s takes exactly one argument", name);
                 check_expr(e->args.items[0], ty_number);
                 expect_type(e->args.items[0], ty_number, xs_sprintf("argument of %s", name));
                 e->type = ty_boolean;
@@ -3040,7 +3083,7 @@ static void check_expr(Expr *e, Type *expected) {
                 return;
             }
             if (strcmp(name, "btoa") == 0 || strcmp(name, "atob") == 0) { /* base64 of a string of bytes (code points 0..255) */
-                if (e->args.len != 1) xs_error(e->pos, NULL, "%s takes one string", name);
+                if (e->args.len != 1) xs_error(XS8035, e->pos, NULL, "%s takes one string", name);
                 check_expr(e->args.items[0], ty_string);
                 expect_type(e->args.items[0], ty_string, xs_sprintf("argument of %s", name));
                 e->type = ty_string;
@@ -3049,7 +3092,7 @@ static void check_expr(Expr *e, Type *expected) {
             }
             if (strcmp(name, "parseInt") == 0 || strcmp(name, "parseFloat") == 0) { /* the JS globals: number, NaN when no digits */
                 bool pi = name[5] == 'I';
-                if (e->args.len < 1 || e->args.len > (pi ? 2 : 1)) xs_error(e->pos, pi ? "parseInt(text) or parseInt(text, radix)" : "parseFloat(text)", "%s takes %s", name, pi ? "a string and an optional radix" : "one string");
+                if (e->args.len < 1 || e->args.len > (pi ? 2 : 1)) xs_error(XS8030, e->pos, pi ? "parseInt(text) or parseInt(text, radix)" : "parseFloat(text)", "%s takes %s", name, pi ? "a string and an optional radix" : "one string");
                 check_expr(e->args.items[0], ty_string);
                 expect_type(e->args.items[0], ty_string, xs_sprintf("argument of %s", name));
                 if (pi) {
@@ -3065,7 +3108,7 @@ static void check_expr(Expr *e, Type *expected) {
                 return;
             }
             if (strcmp(name, "BigInt") == 0) { /* BigInt(int | number | string); 123n is BigInt(123) */
-                if (e->args.len != 1) xs_error(e->pos, NULL, "BigInt() takes exactly one argument");
+                if (e->args.len != 1) xs_error(XS7003, e->pos, NULL, "BigInt() takes exactly one argument");
                 Expr *a = e->args.items[0];
                 check_expr(a, NULL);
                 if (a->type->kind == TY_LITINT) coerce_lit(a, ty_int);
@@ -3073,12 +3116,12 @@ static void check_expr(Expr *e, Type *expected) {
                 else if (a->type->kind == TY_NUMBER) e->builtin.cfn = "xs_big_from_num";
                 else if (a->type->kind == TY_STRING) e->builtin.cfn = "xs_big_from_str";
                 else if (is_big(a->type)) { *e = *a; return; }
-                else xs_error(a->pos, NULL, "BigInt() converts int, number or string, but this is %s", ty_name(a->type));
+                else xs_error(XS7002, a->pos, NULL, "BigInt() converts int, number or string, but this is %s", ty_name(a->type));
                 e->type = ty_big();
                 return;
             }
             if (strcmp(name, "Number") == 0) {
-                if (e->args.len != 1) xs_error(e->pos, NULL, "Number() takes exactly one argument");
+                if (e->args.len != 1) xs_error(XS7028, e->pos, NULL, "Number() takes exactly one argument");
                 check_expr(e->args.items[0], NULL);
                 Expr *a = e->args.items[0];
                 if (a->type->kind == TY_LITINT) coerce_lit(a, ty_number);
@@ -3086,12 +3129,12 @@ static void check_expr(Expr *e, Type *expected) {
                 else if (a->type->kind == TY_INT) e->builtin.cfn = "xs_to_number";
                 else if (a->type->kind == TY_NUMBER) e->builtin.cfn = "xs_to_number_id";
                 else if (is_big(a->type)) e->builtin.cfn = "xs_big_to_number";
-                else xs_error(a->pos, NULL, "Number() converts int, bigint or string to number, but this is %s", ty_name(a->type));
+                else xs_error(XS7027, a->pos, NULL, "Number() converts int, bigint or string to number, but this is %s", ty_name(a->type));
                 e->type = ty_number;
                 return;
             }
             if (strcmp(name, "String") == 0) {
-                if (e->args.len != 1) xs_error(e->pos, NULL, "String() takes exactly one argument");
+                if (e->args.len != 1) xs_error(XS7041, e->pos, NULL, "String() takes exactly one argument");
                 check_expr(e->args.items[0], NULL);
                 Expr *a = e->args.items[0];
                 settle(a);
@@ -3101,12 +3144,12 @@ static void check_expr(Expr *e, Type *expected) {
                 else if (a->type->kind == TY_STRING) e->builtin.cfn = "xs_retain_str";
                 else if (is_big(a->type)) e->builtin.cfn = "xs_big_to_string";
                 else if (a->type->kind == TY_ENUM) e->builtin.cfn = a->type->en->is_string ? "xs_retain_str" : "xs_str_from_int";
-                else xs_error(a->pos, NULL, "String() converts int, number or boolean, but this is %s", ty_name(a->type));
+                else xs_error(XS7040, a->pos, NULL, "String() converts int, number or boolean, but this is %s", ty_name(a->type));
                 e->type = ty_string;
                 return;
             }
             if (strcmp(name, "assert") == 0) {
-                if (e->args.len < 1 || e->args.len > 2) xs_error(e->pos, "assert(condition, \"message\")", "assert takes a condition and an optional message");
+                if (e->args.len < 1 || e->args.len > 2) xs_error(XS7048, e->pos, "assert(condition, \"message\")", "assert takes a condition and an optional message");
                 check_expr(e->args.items[0], ty_boolean);
                 expect_type(e->args.items[0], ty_boolean, "assert condition");
                 if (e->args.len == 2) { check_expr(e->args.items[1], ty_string); expect_type(e->args.items[1], ty_string, "assert message"); }
@@ -3123,7 +3166,7 @@ static void check_expr(Expr *e, Type *expected) {
             }
             if (strcmp(name, "lines") == 0 || strcmp(name, "chunks") == 0) {
                 bool is_lines = name[0] == 'l';
-                if (e->args.len != (is_lines ? 1 : 2)) xs_error(e->pos, is_lines ? "lines(path)" : "chunks(path, bytes)", "%s takes %d argument(s)", name, is_lines ? 1 : 2);
+                if (e->args.len != (is_lines ? 1 : 2)) xs_error(XS8025, e->pos, is_lines ? "lines(path)" : "chunks(path, bytes)", "%s takes %d argument(s)", name, is_lines ? 1 : 2);
                 check_expr(e->args.items[0], ty_string);
                 expect_type(e->args.items[0], ty_string, xs_sprintf("path of %s", name));
                 if (!is_lines) { check_expr(e->args.items[1], ty_int); expect_type(e->args.items[1], ty_int, "chunk size"); }
@@ -3132,13 +3175,13 @@ static void check_expr(Expr *e, Type *expected) {
                 return;
             }
             if (strcmp(name, "fetch") == 0) {
-                if (e->args.len < 1 || e->args.len > 2) xs_error(e->pos, "fetch(url) or fetch(url, { method, headers, body, signal })", "fetch() takes a URL and optional options");
+                if (e->args.len < 1 || e->args.len > 2) xs_error(XS7054, e->pos, "fetch(url) or fetch(url, { method, headers, body, signal })", "fetch() takes a URL and optional options");
                 check_expr(e->args.items[0], ty_string);
                 expect_type(e->args.items[0], ty_string, "argument of fetch");
                 if (e->args.len == 2) {
                     /* the options object of the Fetch API, checked by key: method, body, headers, signal */
                     Expr *init = e->args.items[1];
-                    if (init->kind != E_OBJLIT) xs_error(init->pos, "write the options inline: fetch(url, { method: \"POST\", body })", "fetch options must be an object literal");
+                    if (init->kind != E_OBJLIT) xs_error(XS7053, init->pos, "write the options inline: fetch(url, { method: \"POST\", body })", "fetch options must be an object literal");
                     for (int i = 0; i < init->args.len; i++) {
                         const char *k = init->keys[i];
                         Expr *v = init->args.items[i];
@@ -3146,7 +3189,7 @@ static void check_expr(Expr *e, Type *expected) {
                             check_expr(v, ty_string);
                             expect_type(v, ty_string, xs_sprintf("fetch option '%s'", k));
                         } else if (strcmp(k, "headers") == 0) {
-                            if (v->kind != E_OBJLIT) xs_error(v->pos, "headers: { \"Content-Type\": \"application/json\" }", "headers must be an object literal");
+                            if (v->kind != E_OBJLIT) xs_error(XS7058, v->pos, "headers: { \"Content-Type\": \"application/json\" }", "headers must be an object literal");
                             for (int h = 0; h < v->args.len; h++) {
                                 check_expr(v->args.items[h], ty_string);
                                 expect_type(v->args.items[h], ty_string, xs_sprintf("header '%s'", v->keys[h]));
@@ -3155,13 +3198,13 @@ static void check_expr(Expr *e, Type *expected) {
                             v->type = ty_void;
                         } else if (strcmp(k, "signal") == 0) {
                             if (!(v->kind == E_MEMBER && v->is_call && v->lhs->kind == E_IDENT && strcmp(v->lhs->str, "AbortSignal") == 0 && strcmp(v->str, "timeout") == 0 && v->args.len == 1))
-                                xs_error(v->pos, "signal: AbortSignal.timeout(5000)", "the only supported signal is AbortSignal.timeout(ms)");
+                                xs_error(XS7102, v->pos, "signal: AbortSignal.timeout(5000)", "the only supported signal is AbortSignal.timeout(ms)");
                             check_expr(v->args.items[0], ty_int);
                             expect_type(v->args.items[0], ty_int, "timeout in milliseconds");
                             v->type = ty_int;
                         } else {
                             static const char *keys[] = {"method", "body", "headers", "signal"};
-                            xs_error(v->pos, xs_help_suggest(k, keys, 4, "supported: method, body, headers, signal"), "unsupported fetch option '%s'", k);
+                            xs_error(XS7120, v->pos, xs_help_suggest(k, keys, 4, "supported: method, body, headers, signal"), "unsupported fetch option '%s'", k);
                         }
                     }
                     init->type = ty_void;
@@ -3171,7 +3214,7 @@ static void check_expr(Expr *e, Type *expected) {
                 prog->uses_net = true;
                 /* TLS is linked only when https can happen: an http:// URL (TLS ends at the load balancer) costs nothing */
                 int scheme = url_scheme(e->args.items[0]);
-                if (scheme == 1 && xs_tls_off) xs_error(e->args.items[0]->pos, "remove --tls=off, or call the service over http://", "https URL, but the program is built with --tls=off");
+                if (scheme == 1 && xs_tls_off) xs_error(XS7059, e->args.items[0]->pos, "remove --tls=off, or call the service over http://", "https URL, but the program is built with --tls=off");
                 if (scheme == 1 || (scheme == -1 && !xs_tls_off)) prog->uses_tls = true;
                 return;
             }
@@ -3183,7 +3226,7 @@ static void check_expr(Expr *e, Type *expected) {
                 Type *ft = b->type;
                 e->lhs->type = ft;
                 e->lhs->cname = b->cname;
-                if (e->args.len != ft->nparams) xs_error(e->pos, NULL, "'%s' takes %d argument(s), got %d", name, ft->nparams, e->args.len);
+                if (e->args.len != ft->nparams) xs_error(XS8062, e->pos, NULL, "'%s' takes %d argument(s), got %d", name, ft->nparams, e->args.len);
                 for (int i = 0; i < e->args.len; i++) {
                     check_expr(e->args.items[i], ft->params[i]);
                     expect_type(e->args.items[i], ft->params[i], xs_sprintf("argument %d of '%s'", i + 1, name));
@@ -3191,29 +3234,31 @@ static void check_expr(Expr *e, Type *expected) {
                 e->type = ft->ret;
                 return;
             }
-            if (b) xs_error(e->pos, NULL, "'%s' is a variable, not a function", name);
-            if (find_class(name)) xs_error(e->pos, xs_sprintf("write new %s(...)", name), "'%s' is a class; construct it with 'new'", name);
+            if (b && missing_name(name)) xs_error_quiet();
+            if (b) xs_error(XS8052, e->pos, NULL, "'%s' is a variable, not a function", name);
+            if (find_class(name)) xs_error(XS8046, e->pos, xs_sprintf("write new %s(...)", name), "'%s' is a class; construct it with 'new'", name);
             {
                 int n; const char **cands = visible_names(&n);
-                xs_error(e->pos, xs_help_suggest(name, cands, n, "declare it at the top level: function name(...): type { ... }"), "unknown function '%s'", name);
+                if (missing_name(name)) xs_error_quiet();
+                xs_error(XS9032, e->pos, xs_help_suggest(name, cands, n, "declare it at the top level: function name(...): type { ... }"), "unknown function '%s'", name);
             }
         }
         if (f->mod && f->mod->builtin && strcmp(f->name, "execSync") == 0 && e->args.len == 2) {
             /* execSync(cmd, { encoding: "utf8" }): xisto always returns the output as a string */
             Expr *o = e->args.items[1];
             if (o->kind != E_OBJLIT || o->args.len != 1 || strcmp(o->keys[0], "encoding") != 0 || o->args.items[0]->kind != E_STRING)
-                xs_error(o->pos, "write execSync(command, { encoding: \"utf8\" })", "unsupported execSync options");
+                xs_error(XS7119, o->pos, "write execSync(command, { encoding: \"utf8\" })", "unsupported execSync options");
             e->args.len = 1;
         }
         if (f->mod && f->mod->builtin && check_fs_fd_call(e, f)) return;
         if (f->mod && f->mod->builtin && strcmp(f->name, "readFileSync") == 0) {
-            if (e->args.len < 1 || e->args.len > 2) xs_error(e->pos, NULL, "readFileSync takes a path and optionally \"utf8\"");
+            if (e->args.len < 1 || e->args.len > 2) xs_error(XS7084, e->pos, NULL, "readFileSync takes a path and optionally \"utf8\"");
             Expr *a0 = e->args.items[0];
             if (a0->kind == E_NUMBER && a0->is_int_lit && a0->ival == 0) { /* readFileSync(0): standard input, as in Node */
                 if (e->args.len == 2) {
                     Expr *enc = e->args.items[1];
                     if (enc->kind != E_STRING || (strcmp(enc->str, "utf8") != 0 && strcmp(enc->str, "utf-8") != 0))
-                        xs_error(enc->pos, "text is read as UTF-8: readFileSync(0, \"utf8\")", "unsupported encoding");
+                        xs_error(XS7118, enc->pos, "text is read as UTF-8: readFileSync(0, \"utf8\")", "unsupported encoding");
                 }
                 e->func = NULL;
                 e->builtin.cfn = e->args.len == 2 ? "xs_fs_read_stdin" : "xs_fs_read_stdin_bytes";
@@ -3232,7 +3277,7 @@ static void check_expr(Expr *e, Type *expected) {
             if (e->args.len == 2) {
                 Expr *enc = e->args.items[1];
                 if (enc->kind != E_STRING || (strcmp(enc->str, "utf8") != 0 && strcmp(enc->str, "utf-8") != 0))
-                    xs_error(enc->pos, "text is read as UTF-8: readFileSync(path, \"utf8\"); for other encodings, readFileSync(path).toString(\"base64\")", "unsupported encoding");
+                    xs_error(XS7118, enc->pos, "text is read as UTF-8: readFileSync(path, \"utf8\"); for other encodings, readFileSync(path).toString(\"base64\")", "unsupported encoding");
                 e->args.len = 1;
             }
             e->func = f;
@@ -3245,7 +3290,7 @@ static void check_expr(Expr *e, Type *expected) {
             e->type = inst->ret;
             return;
         }
-        if (e->ntargs) xs_error(e->pos, NULL, "'%s' is not generic", f->name);
+        if (e->ntargs) xs_error(XS6005, e->pos, NULL, "'%s' is not generic", f->name);
         if (f->mod && f->mod->builtin && f->cname && strcmp(f->cname, "xs_fs_write") == 0 && e->args.len == 2) { /* writeFileSync(path, bytes) */
             check_expr(e->args.items[1], NULL);
             if (is_bytes(e->args.items[1]->type)) {
@@ -3265,13 +3310,13 @@ static void check_expr(Expr *e, Type *expected) {
     }
     case E_INDEX:
         check_expr(e->lhs, NULL);
-        if (e->lhs->type->kind == TY_NULLABLE) xs_error(e->pos, "check it first: if (x !== null) { ... }", "indexed value may be null");
+        if (e->lhs->type->kind == TY_NULLABLE) xs_error(XS2015, e->pos, "check it first: if (x !== null) { ... }", "indexed value may be null");
         check_expr(e->rhs, ty_int);
         if (e->lhs->type->kind == TY_OBJECT && e->lhs->type->cls->is_tuple) { /* t[0]: its field (the index is a constant) */
             Class *tc = e->lhs->type->cls;
             long long k;
-            if (!lit_int_of(e->rhs, &k)) xs_error(e->rhs->pos, "a tuple's elements have different types: index it with a number written in place, t[0]", "the index of a tuple must be a constant");
-            if (k < 0 || k >= tc->nfields) xs_error(e->rhs->pos, NULL, "index %lld is out of the tuple %s (length %d)", k, tc->name, tc->nfields);
+            if (!lit_int_of(e->rhs, &k)) xs_error(XS8137, e->rhs->pos, "a tuple's elements have different types: index it with a number written in place, t[0]", "the index of a tuple must be a constant");
+            if (k < 0 || k >= tc->nfields) xs_error(XS8107, e->rhs->pos, NULL, "index %lld is out of the tuple %s (length %d)", k, tc->name, tc->nfields);
             e->kind = E_MEMBER;
             e->str = tc->fields[k].name;
             e->rhs = NULL;
@@ -3282,7 +3327,7 @@ static void check_expr(Expr *e, Type *expected) {
             return;
         }
         if (e->lhs->type->kind == TY_STRING)
-            xs_error(e->pos, "use s.slice(i, i + 1)", "strings cannot be indexed in xisto-2");
+            xs_error(XS6033, e->pos, "use s.slice(i, i + 1)", "strings cannot be indexed in xisto-2");
         if (is_bytes(e->lhs->type)) { /* b[i]: a byte, as an int (bounds checked) */
             expect_type(e->rhs, ty_int, "byte index");
             e->builtin.cfn = "xs_u8_get";
@@ -3291,7 +3336,7 @@ static void check_expr(Expr *e, Type *expected) {
         }
         if (is_f64(e->lhs->type)) { /* f[i]: a number, read and written in place (bounds checked) */
             if (e->rhs->type->kind == TY_NUMBER)
-                xs_error(e->rhs->pos, "declare the index as int, or convert it with Math.trunc(x)", "Float64Array index must be int, but this is number");
+                xs_error(XS7020, e->rhs->pos, "declare the index as int, or convert it with Math.trunc(x)", "Float64Array index must be int, but this is number");
             expect_type(e->rhs, ty_int, "Float64Array index");
             e->type = ty_number;
             return;
@@ -3302,9 +3347,9 @@ static void check_expr(Expr *e, Type *expected) {
             e->type = ty_string;
             return;
         }
-        if (e->lhs->type->kind != TY_ARRAY) xs_error(e->pos, NULL, "cannot index a value of type %s", ty_name(e->lhs->type));
+        if (e->lhs->type->kind != TY_ARRAY) xs_error(XS8091, e->pos, NULL, "cannot index a value of type %s", ty_name(e->lhs->type));
         if (e->rhs->type->kind == TY_NUMBER)
-            xs_error(e->rhs->pos, "declare the index as int, or convert it with Math.trunc(x)", "array index must be int, but this is number");
+            xs_error(XS8082, e->rhs->pos, "declare the index as int, or convert it with Math.trunc(x)", "array index must be int, but this is number");
         expect_type(e->rhs, ty_int, "array index");
         e->type = e->lhs->type->elem;
         return;
@@ -3313,10 +3358,10 @@ static void check_expr(Expr *e, Type *expected) {
             (strcmp(e->lhs->str, "stdout") == 0 || strcmp(e->lhs->str, "stderr") == 0) && e->lhs->lhs->kind == E_IDENT &&
             strcmp(e->lhs->lhs->str, "process") == 0 && !lookup("process")) { /* process.stdout.write(text or bytes) */
             bool err = strcmp(e->lhs->str, "stderr") == 0;
-            if (e->args.len != 1) xs_error(e->pos, NULL, "process.%s.write takes one argument (a string or a Uint8Array)", e->lhs->str);
+            if (e->args.len != 1) xs_error(XS7080, e->pos, NULL, "process.%s.write takes one argument (a string or a Uint8Array)", e->lhs->str);
             check_expr(e->args.items[0], NULL);
             Type *t = e->args.items[0]->type;
-            if (t->kind != TY_STRING && !is_bytes(t)) xs_error(e->args.items[0]->pos, NULL, "process.%s.write writes a string or a Uint8Array, not %s", e->lhs->str, ty_name(t));
+            if (t->kind != TY_STRING && !is_bytes(t)) xs_error(XS7081, e->args.items[0]->pos, NULL, "process.%s.write writes a string or a Uint8Array, not %s", e->lhs->str, ty_name(t));
             e->kind = E_CALL;
             e->lhs = NULL;
             e->is_call = false;
@@ -3329,9 +3374,9 @@ static void check_expr(Expr *e, Type *expected) {
         }
         if (e->lhs->kind == E_IDENT && strcmp(e->lhs->str, "super") == 0 && !lookup("super")) { /* super.m(...) */
             Class *cc = cur_func ? cur_func->cls : NULL;
-            if (!cc || !cc->base) xs_error(e->pos, NULL, "super is used inside a class that extends another");
+            if (!cc || !cc->base) xs_error(XS8124, e->pos, NULL, "super is used inside a class that extends another");
             if (!e->is_call || !find_method(cc->base, e->str))
-                xs_error(e->pos, xs_sprintf("read fields with this.%s", e->str), "%s has no method '%s'", cc->base->name, e->str);
+                xs_error(XS8014, e->pos, xs_sprintf("read fields with this.%s", e->str), "%s has no method '%s'", cc->base->name, e->str);
             Expr *self = xs_alloc(sizeof *self);
             self->kind = E_THIS;
             self->pos = e->lhs->pos;
@@ -3349,7 +3394,7 @@ static void check_expr(Expr *e, Type *expected) {
             for (int k = 0; sc && !sc->builtin && k < sc->nstatics_user; k++) { /* Class.staticMember */
                 if (strcmp(sc->static_names[k], e->str) != 0) continue;
                 if (sc->static_is_method[k]) {
-                    if (!e->is_call) xs_error(e->pos, "call it: Class.method(...)", "static methods are not values");
+                    if (!e->is_call) xs_error(XS8123, e->pos, "call it: Class.method(...)", "static methods are not values");
                     Expr *callee = xs_alloc(sizeof *callee);
                     callee->kind = E_IDENT;
                     callee->pos = e->pos;
@@ -3361,7 +3406,7 @@ static void check_expr(Expr *e, Type *expected) {
                     check_expr(e, expected);
                     return;
                 }
-                if (e->is_call) xs_error(e->pos, NULL, "'%s' is a static field of %s, not a method", e->str, sc->name);
+                if (e->is_call) xs_error(XS8051, e->pos, NULL, "'%s' is a static field of %s, not a method", e->str, sc->name);
                 e->kind = E_IDENT;
                 e->str = sc->static_gen[k];
                 e->lhs = NULL;
@@ -3381,14 +3426,14 @@ static void check_expr(Expr *e, Type *expected) {
                 return;
             }
             if (strcmp(ns, "performance") == 0) {
-                if (!e->is_call || strcmp(e->str, "now") != 0 || e->args.len != 0) xs_error(e->pos, "supported: performance.now()", "unknown performance member '%s'", e->str);
+                if (!e->is_call || strcmp(e->str, "now") != 0 || e->args.len != 0) xs_error(XS7114, e->pos, "supported: performance.now()", "unknown performance member '%s'", e->str);
                 e->type = ty_number;
                 e->builtin.cfn = "xs_performance_now";
                 return;
             }
             if (strcmp(ns, "Date") == 0) {
                 if (e->is_call && strcmp(e->str, "parse") == 0) {
-                    if (e->args.len != 1) xs_error(e->pos, NULL, "Date.parse takes one string");
+                    if (e->args.len != 1) xs_error(XS7016, e->pos, NULL, "Date.parse takes one string");
                     check_expr(e->args.items[0], ty_string);
                     expect_type(e->args.items[0], ty_string, "argument of Date.parse");
                     e->type = ty_number;
@@ -3397,14 +3442,14 @@ static void check_expr(Expr *e, Type *expected) {
                 }
                 if (e->is_call && strcmp(e->str, "UTC") == 0) {
                     int n = e->args.len;
-                    if (n < 1 || n > 7) xs_error(e->pos, NULL, "Date.UTC takes 1 to 7 arguments");
+                    if (n < 1 || n > 7) xs_error(XS7015, e->pos, NULL, "Date.UTC takes 1 to 7 arguments");
                     for (int k = 0; k < n; k++) date_num_arg(&e->args.items[k], xs_sprintf("argument %d of Date.UTC", k + 1));
                     for (int k = n; k < 7; k++) expr_list_push(&e->args, num_lit(e->pos, k == 2 ? 1 : 0, false));
                     e->type = ty_number;
                     e->builtin.cfn = "xs_Date_UTC";
                     return;
                 }
-                if (!e->is_call || strcmp(e->str, "now") != 0 || e->args.len != 0) xs_error(e->pos, "supported: Date.now(), Date.parse(text), Date.UTC(y, m, ...)", "unknown Date member '%s'", e->str);
+                if (!e->is_call || strcmp(e->str, "now") != 0 || e->args.len != 0) xs_error(XS7106, e->pos, "supported: Date.now(), Date.parse(text), Date.UTC(y, m, ...)", "unknown Date member '%s'", e->str);
                 e->type = ty_number;
                 e->builtin.cfn = "xs_date_now";
                 return;
@@ -3413,16 +3458,16 @@ static void check_expr(Expr *e, Type *expected) {
                 if (!e->is_call && strcmp(e->str, "argv") == 0) { e->type = ty_array_of(ty_string); e->builtin.cfn = "xs_process_argv"; return; }
                 if (!e->is_call && strcmp(e->str, "env") == 0) { e->type = ty_map_of(ty_string, ty_string); e->builtin.cfn = "xs_process_env"; return; }
                 if (e->is_call && strcmp(e->str, "exit") == 0) {
-                    if (e->args.len > 1) xs_error(e->pos, NULL, "process.exit takes at most one argument");
+                    if (e->args.len > 1) xs_error(XS7082, e->pos, NULL, "process.exit takes at most one argument");
                     if (e->args.len == 1) { check_expr(e->args.items[0], ty_int); expect_type(e->args.items[0], ty_int, "exit code"); }
                     e->type = ty_void;
                     e->builtin.cfn = "xs_process_exit";
                     return;
                 }
-                xs_error(e->pos, "supported: process.argv, process.env.get(name), process.exit(code), process.stdout.write(x), process.stderr.write(x)", "unknown process member '%s'", e->str);
+                xs_error(XS7115, e->pos, "supported: process.argv, process.env.get(name), process.exit(code), process.stdout.write(x), process.stderr.write(x)", "unknown process member '%s'", e->str);
             }
             if (strcmp(ns, "Array") == 0 && e->is_call && (strcmp(e->str, "from") == 0 || strcmp(e->str, "isArray") == 0)) {
-                if (e->args.len != 1) xs_error(e->pos, "Array.from(array, Set or Map); Array.isArray(x)", "Array.%s takes one argument here", e->str);
+                if (e->args.len != 1) xs_error(XS7001, e->pos, "Array.from(array, Set or Map); Array.isArray(x)", "Array.%s takes one argument here", e->str);
                 Expr *src = e->args.items[0];
                 check_expr(src, expected && strcmp(e->str, "from") == 0 ? expected : NULL);
                 Type *st = src->type;
@@ -3433,7 +3478,7 @@ static void check_expr(Expr *e, Type *expected) {
                 }
                 /* a copy of an array; a Set's values or a Map's entries (already arrays of their own) */
                 const char *m = st->kind == TY_ARRAY ? "slice" : st->kind == TY_SET ? "values" : st->kind == TY_MAP ? "entries" : NULL;
-                if (!m) xs_error(src->pos, "Array.from takes an array, a Set or a Map", "cannot make an array from %s", ty_name(st));
+                if (!m) xs_error(XS8093, src->pos, "Array.from takes an array, a Set or a Map", "cannot make an array from %s", ty_name(st));
                 e->lhs = src;
                 e->str = (char *)m;
                 e->args.len = 0;
@@ -3452,7 +3497,7 @@ static void check_expr(Expr *e, Type *expected) {
                     };
                     for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
                         if (strcmp(e->str, k[i].n) == 0) { e->kind = E_NUMBER; e->num = k[i].v; e->lhs = NULL; e->type = ty_number; e->field = -1; return; }
-                    xs_error(e->pos, help, "unknown Number member '%s'", e->str);
+                    xs_error(XS7110, e->pos, help, "unknown Number member '%s'", e->str);
                 }
                 if (strcmp(e->str, "parseFloat") == 0 || strcmp(e->str, "parseInt") == 0) { /* the globals of the same name */
                     Expr *g = xs_alloc(sizeof *g);
@@ -3466,8 +3511,8 @@ static void check_expr(Expr *e, Type *expected) {
                 }
                 const char *fn = strcmp(e->str, "isNaN") == 0 ? "xs_is_nan" : strcmp(e->str, "isInteger") == 0 ? "xs_is_integer"
                                : strcmp(e->str, "isFinite") == 0 ? "xs_is_finite" : strcmp(e->str, "isSafeInteger") == 0 ? "xs_is_safe_integer" : NULL;
-                if (!fn) xs_error(e->pos, help, "unknown Number member '%s'", e->str);
-                if (e->args.len != 1) xs_error(e->pos, NULL, "Number.%s takes exactly one argument", e->str);
+                if (!fn) xs_error(XS7110, e->pos, help, "unknown Number member '%s'", e->str);
+                if (e->args.len != 1) xs_error(XS7029, e->pos, NULL, "Number.%s takes exactly one argument", e->str);
                 check_expr(e->args.items[0], ty_number);
                 /* unlike the global isNaN/isFinite, Number.isX(v) of an int is fine (no conversion happens) */
                 if (e->args.items[0]->type->kind == TY_LITINT) coerce_lit(e->args.items[0], ty_number);
@@ -3480,7 +3525,7 @@ static void check_expr(Expr *e, Type *expected) {
                 for (int k = 0; k < e->args.len; k++) { /* ints or numbers: each a code point */
                     check_expr(e->args.items[k], ty_number);
                     if (e->args.items[k]->type->kind == TY_LITINT) coerce_lit(e->args.items[k], ty_number);
-                    if (!is_numeric(e->args.items[k]->type)) xs_error(e->args.items[k]->pos, NULL, "argument of String.%s must be a number, but this is %s", e->str, ty_name(e->args.items[k]->type));
+                    if (!is_numeric(e->args.items[k]->type)) xs_error(XS7047, e->args.items[k]->pos, NULL, "argument of String.%s must be a number, but this is %s", e->str, ty_name(e->args.items[k]->type));
                 }
                 e->type = ty_string;
                 e->builtin.cfn = e->str[4] == 'C' && e->str[5] == 'h' ? "xs_str_from_char_codes" : "xs_str_from_code_points";
@@ -3488,14 +3533,14 @@ static void check_expr(Expr *e, Type *expected) {
             }
             if (strcmp(ns, "JSON") == 0) {
                 if (!e->is_call || (strcmp(e->str, "stringify") != 0 && strcmp(e->str, "parse") != 0))
-                    xs_error(e->pos, "supported: JSON.stringify(value), JSON.parse(text) assigned to a typed variable", "unknown JSON member '%s'", e->str);
-                if (e->args.len != 1) xs_error(e->pos, NULL, "JSON.%s takes exactly one argument", e->str);
+                    xs_error(XS7107, e->pos, "supported: JSON.stringify(value), JSON.parse(text) assigned to a typed variable", "unknown JSON member '%s'", e->str);
+                if (e->args.len != 1) xs_error(XS7025, e->pos, NULL, "JSON.%s takes exactly one argument", e->str);
                 if (strcmp(e->str, "stringify") == 0) {
                     check_expr(e->args.items[0], NULL);
                     settle(e->args.items[0]);
                     Type *t = e->args.items[0]->type;
                     if (t->kind == TY_JSON) { Expr *v = e->args.items[0]; *e = *v; e->type = ty_string; return; } /* already JSON */
-                    if (!json_ok(t, 0)) xs_error(e->args.items[0]->pos, "JSON covers number, int, boolean, string, arrays and classes made of those", "cannot serialize %s to JSON", ty_name(t));
+                    if (!json_ok(t, 0)) xs_error(XS8100, e->args.items[0]->pos, "JSON covers number, int, boolean, string, arrays and classes made of those", "cannot serialize %s to JSON", ty_name(t));
                     e->type = ty_string;
                     e->builtin.cfn = "json_stringify"; /* resolved by the emitter per type */
                     return;
@@ -3503,8 +3548,8 @@ static void check_expr(Expr *e, Type *expected) {
                 check_expr(e->args.items[0], ty_string);
                 if (e->args.items[0]->type->kind == TY_JSON) e->args.items[0]->type = ty_string; /* JSON text already */
                 expect_type(e->args.items[0], ty_string, "argument of JSON.parse");
-                if (!expected) xs_error(e->pos, "write the type: const t: Todo = JSON.parse(text);", "JSON.parse needs to know the type it produces");
-                if (!json_ok(expected, 0)) xs_error(e->pos, "JSON covers number, int, boolean, string, arrays and classes made of those", "cannot parse JSON into %s", ty_name(expected));
+                if (!expected) xs_error(XS3003, e->pos, "write the type: const t: Todo = JSON.parse(text);", "JSON.parse needs to know the type it produces");
+                if (!json_ok(expected, 0)) xs_error(XS8096, e->pos, "JSON covers number, int, boolean, string, arrays and classes made of those", "cannot parse JSON into %s", ty_name(expected));
                 e->type = expected;
                 e->builtin.cfn = "json_parse";
                 return;
@@ -3512,26 +3557,26 @@ static void check_expr(Expr *e, Type *expected) {
             if (strcmp(ns, "console") == 0) {
                 if (!e->is_call || (strcmp(e->str, "log") != 0 && strcmp(e->str, "info") != 0 && strcmp(e->str, "debug") != 0 &&
                                     strcmp(e->str, "error") != 0 && strcmp(e->str, "warn") != 0))
-                    xs_error(e->pos, "supported: console.log, console.info, console.debug (stdout), console.error, console.warn (stderr)", "unknown console member '%s'", e->str);
+                    xs_error(XS7112, e->pos, "supported: console.log, console.info, console.debug (stdout), console.error, console.warn (stderr)", "unknown console member '%s'", e->str);
                 for (int i = 0; i < e->args.len; i++) {
                     check_expr(e->args.items[i], NULL);
                     settle(e->args.items[i]);
                     Type *t = e->args.items[i]->type;
                     if (t->kind == TY_VOID || t->kind == TY_FUNC)
-                        xs_error(e->args.items[i]->pos, NULL, "cannot print a %s value", ty_name(t));
+                        xs_error(XS8097, e->args.items[i]->pos, NULL, "cannot print a %s value", ty_name(t));
                 }
                 e->type = ty_void;
                 return;
             }
             Enum *en = find_enum(ns);
             if (en) {
-                if (e->is_call) xs_error(e->pos, NULL, "enum members are values, not functions");
+                if (e->is_call) xs_error(XS9020, e->pos, NULL, "enum members are values, not functions");
                 int idx = -1;
                 for (int i = 0; i < en->nmembers; i++) if (strcmp(en->members[i].name, e->str) == 0) idx = i;
                 if (idx < 0) {
                     const char **names = xs_alloc(sizeof(char *) * (size_t)en->nmembers);
                     for (int i = 0; i < en->nmembers; i++) names[i] = en->members[i].name;
-                    xs_error(e->pos, xs_help_suggest(e->str, names, en->nmembers, NULL), "enum %s has no member '%s'", en->name, e->str);
+                    xs_error(XS9016, e->pos, xs_help_suggest(e->str, names, en->nmembers, NULL), "enum %s has no member '%s'", en->name, e->str);
                 }
                 e->kind = E_ENUM_VAL;
                 e->en = en;
@@ -3545,7 +3590,7 @@ static void check_expr(Expr *e, Type *expected) {
                 Func *m = NULL;
                 for (int i = 0; i < c->nstatics; i++)
                     if (strcmp(c->statics[i]->name, e->str) == 0) m = c->statics[i];
-                if (!m || !e->is_call) xs_error(e->pos, NULL, "%s has no static member '%s'", c->name, e->str);
+                if (!m || !e->is_call) xs_error(XS8016, e->pos, NULL, "%s has no static member '%s'", c->name, e->str);
                 check_args(e, m, xs_sprintf("%s.%s", c->name, m->name));
                 e->func = m;
                 e->cls = c;
@@ -3558,22 +3603,24 @@ static void check_expr(Expr *e, Type *expected) {
         if (e->lhs->kind == E_NEW_ARRAY) {
             Expr *na = e->lhs;
             if (!e->is_call || strcmp(e->str, "fill") != 0)
-                xs_error(e->pos, "write: new Array<T>(n).fill(x)", "a new array must be filled before use");
+                xs_error(XS6017, e->pos, "write: new Array<T>(n).fill(x)", "a new array must be filled before use");
             na->elem_type = resolve(na->elem_type, na->pos);
             check_type_supported(na->pos, ty_array_of(na->elem_type));
             check_expr(na->lhs, ty_int);
             if (na->lhs->type->kind == TY_NUMBER)
-                xs_error(na->lhs->pos, "declare it as int, or convert with Math.trunc(x)", "array length must be int, but this is number");
+                xs_error(XS8083, na->lhs->pos, "declare it as int, or convert with Math.trunc(x)", "array length must be int, but this is number");
             expect_type(na->lhs, ty_int, "array length");
-            if (e->args.len != 1) xs_error(e->pos, NULL, "fill takes exactly one argument");
+            if (e->args.len != 1) xs_error(XS7055, e->pos, NULL, "fill takes exactly one argument");
             check_expr(e->args.items[0], na->elem_type);
             expect_type(e->args.items[0], na->elem_type, "fill value");
             na->type = e->type = ty_array_of(na->elem_type);
             return;
         }
         check_expr(e->lhs, NULL);
-        if (e->lhs->type->kind == TY_NULLABLE)
-            xs_error(e->pos, "check it first: if (x !== null) { ... }  (fields need a local copy: const v = this.f;)", "'%s' may be null", e->str);
+        if (e->lhs->type->kind == TY_NULLABLE) {
+            if (xs_check_mode && after_optional_dot(e->pos)) xs_error_quiet(); /* x?.name: the '?.' was counted where it is */
+            xs_error(XS2006, e->pos, "check it first: if (x !== null) { ... }  (fields need a local copy: const v = this.f;)", "'%s' may be null", e->str);
+        }
         if (e->lhs->type->kind == TY_MAP || e->lhs->type->kind == TY_SET) {
             check_map_member(e);
             return;
@@ -3595,20 +3642,20 @@ static void check_expr(Expr *e, Type *expected) {
                 e->type = m[0] == 'r' ? el : ty_void; e->builtin.cfn = m; return;
             }
             static const char *cm[] = {"send", "receive", "close", "size"};
-            xs_error(e->pos, xs_help_suggest(m, cm, 4, "Channel has send(value), receive(), close() and size"), "Channel has no member '%s'", m);
+            xs_error(XS7008, e->pos, xs_help_suggest(m, cm, 4, "Channel has send(value), receive(), close() and size"), "Channel has no member '%s'", m);
         }
         if (e->lhs->type->kind == TY_UNION) { /* s.kind: a field every member has, read by the object's class */
             Type *u = e->lhs->type;
-            if (e->is_call) xs_error(e->pos, "narrow it first: if (x instanceof C) / if (typeof x === \"string\") / if (x.kind === \"...\")", "cannot call a method on %s", ty_name(u));
+            if (e->is_call) xs_error(XS8088, e->pos, "narrow it first: if (x instanceof C) / if (typeof x === \"string\") / if (x.kind === \"...\")", "cannot call a method on %s", ty_name(u));
             Type *ft = NULL;
             bool all_lit = true;
             for (int i = 0; i < u->nparams; i++) {
                 Type *m = u->params[i];
                 Field *fd = m->kind == TY_OBJECT && !m->cls->builtin ? find_field(m->cls, e->str, NULL) : NULL;
-                if (!fd) xs_error(e->pos, "narrow it first to the member that has it", "'%s' is not a field of every member of %s (%s has none)", e->str, ty_name(u), ty_name(m));
+                if (!fd) xs_error(XS8054, e->pos, "narrow it first to the member that has it", "'%s' is not a field of every member of %s (%s has none)", e->str, ty_name(u), ty_name(m));
                 if (!(fd->type->kind == TY_STRING && fd->type->tname)) all_lit = false;
                 if (!ft) ft = fd->type;
-                else if (!ty_equal(ft, fd->type)) xs_error(e->pos, NULL, "'%s' has different types in the members of %s", e->str, ty_name(u));
+                else if (!ty_equal(ft, fd->type)) xs_error(XS8045, e->pos, NULL, "'%s' has different types in the members of %s", e->str, ty_name(u));
             }
             e->type = all_lit ? ty_string : ft;
             e->elem_type = u;
@@ -3624,7 +3671,7 @@ static void check_expr(Expr *e, Type *expected) {
                 return;
             }
             if (e->is_call && strcmp(e->str, "push") == 0) {
-                if (e->args.len != 1) xs_error(e->pos, NULL, "push takes exactly one argument in xisto");
+                if (e->args.len != 1) xs_error(XS7083, e->pos, NULL, "push takes exactly one argument in xisto");
                 check_expr(e->args.items[0], elem);
                 expect_type(e->args.items[0], elem, "argument of push");
                 e->type = ty_int;
@@ -3632,13 +3679,13 @@ static void check_expr(Expr *e, Type *expected) {
                 return;
             }
             if (e->is_call && strcmp(e->str, "pop") == 0) {
-                if (e->args.len != 0) xs_error(e->pos, NULL, "pop takes no arguments");
+                if (e->args.len != 0) xs_error(XS7079, e->pos, NULL, "pop takes no arguments");
                 e->type = elem;
                 e->builtin.cfn = "pop";
                 return;
             }
             if (e->is_call && strcmp(e->str, "unshift") == 0) {
-                if (e->args.len != 1) xs_error(e->pos, NULL, "unshift takes exactly one argument in xisto");
+                if (e->args.len != 1) xs_error(XS7117, e->pos, NULL, "unshift takes exactly one argument in xisto");
                 check_expr(e->args.items[0], elem);
                 expect_type(e->args.items[0], elem, "argument of unshift");
                 e->type = ty_int;
@@ -3646,18 +3693,18 @@ static void check_expr(Expr *e, Type *expected) {
                 return;
             }
             if (e->is_call && strcmp(e->str, "shift") == 0) {
-                if (e->args.len != 0) xs_error(e->pos, NULL, "shift takes no arguments");
+                if (e->args.len != 0) xs_error(XS7087, e->pos, NULL, "shift takes no arguments");
                 e->type = elem;
                 e->builtin.cfn = "shift";
                 return;
             }
             if (e->is_call && strcmp(e->str, "splice") == 0) {
-                if (e->args.len != 2) xs_error(e->pos, "xisto supports splice(index, 1) to remove one element", "splice takes two arguments: splice(index, 1)");
+                if (e->args.len != 2) xs_error(XS7091, e->pos, "xisto supports splice(index, 1) to remove one element", "splice takes two arguments: splice(index, 1)");
                 check_expr(e->args.items[0], ty_int);
                 expect_type(e->args.items[0], ty_int, "splice index");
                 check_expr(e->args.items[1], ty_int);
                 if (e->args.items[1]->kind != E_NUMBER || e->args.items[1]->ival != 1)
-                    xs_error(e->args.items[1]->pos, "xisto supports splice(index, 1) only", "splice count must be the literal 1");
+                    xs_error(XS7090, e->args.items[1]->pos, "xisto supports splice(index, 1) only", "splice count must be the literal 1");
                 e->type = ty_void;
                 e->builtin.cfn = "splice1";
                 return;
@@ -3667,13 +3714,13 @@ static void check_expr(Expr *e, Type *expected) {
                 #define CB(nparams_, ret_) ({ Type **ps_ = xs_alloc(sizeof(Type *) * 2); ps_[0] = elem; ps_[1] = ty_int; ty_func(ps_, nparams_, ret_); })
                 if (strcmp(m, "forEach") == 0 || strcmp(m, "filter") == 0 || strcmp(m, "find") == 0 || strcmp(m, "findIndex") == 0 ||
                     strcmp(m, "some") == 0 || strcmp(m, "every") == 0 || strcmp(m, "map") == 0) {
-                    if (e->args.len != 1) xs_error(e->pos, NULL, "%s takes one function", m);
+                    if (e->args.len != 1) xs_error(XS8034, e->pos, NULL, "%s takes one function", m);
                     Expr *cb = e->args.items[0];
                     bool is_map = strcmp(m, "map") == 0, is_each = strcmp(m, "forEach") == 0;
                     /* the callback takes (element) or (element, index); map infers its result type from the callback */
                     int np = 1;
                     if (cb->kind == E_ARROW) np = cb->arrow->fn->nparams;
-                    if (np < 1 || np > 2) xs_error(cb->pos, NULL, "the callback of %s takes (element) or (element, index)", m);
+                    if (np < 1 || np > 2) xs_error(XS8129, cb->pos, NULL, "the callback of %s takes (element) or (element, index)", m);
                     Type *cbt = CB(np, is_map ? NULL : is_each ? ty_void : ty_boolean);
                     if (is_map) {
                         if (cb->kind == E_ARROW && !cb->arrow->fn->ret) { /* infer the element type of the result */
@@ -3688,17 +3735,17 @@ static void check_expr(Expr *e, Type *expected) {
                         check_expr(cb, cbt);
                         expect_type(cb, cbt, xs_sprintf("callback of %s", m));
                     }
-                    if (cb->type->kind != TY_FUNC) xs_error(cb->pos, NULL, "%s needs a function", m);
+                    if (cb->type->kind != TY_FUNC) xs_error(XS8023, cb->pos, NULL, "%s needs a function", m);
                     if (is_map) {
                         Type *rt = cb->type->ret;
                         if (rt->kind == TY_VOID || rt->kind == TY_FUNC || rt->kind == TY_NULLABLE)
-                            xs_error(cb->pos, NULL, "map cannot produce arrays of %s", ty_name(rt));
+                            xs_error(XS7064, cb->pos, NULL, "map cannot produce arrays of %s", ty_name(rt));
                         e->type = ty_array_of(rt);
                         check_type_supported(e->pos, e->type);
                     } else if (strcmp(m, "filter") == 0) {
                         e->type = e->lhs->type;
                     } else if (strcmp(m, "find") == 0) {
-                        if (!ty_is_heap(elem)) xs_error(e->pos, "for arrays of numbers use findIndex", "find needs an array of objects or strings (it returns T | null)");
+                        if (!ty_is_heap(elem)) xs_error(XS7056, e->pos, "for arrays of numbers use findIndex", "find needs an array of objects or strings (it returns T | null)");
                         e->type = ty_nullable_of(elem);
                     } else if (strcmp(m, "findIndex") == 0) {
                         e->type = ty_int;
@@ -3713,9 +3760,9 @@ static void check_expr(Expr *e, Type *expected) {
                 }
                 #undef CB
                 if (strcmp(m, "indexOf") == 0 || strcmp(m, "includes") == 0) {
-                    if (e->args.len != 1) xs_error(e->pos, NULL, "%s takes one argument", m);
+                    if (e->args.len != 1) xs_error(XS8033, e->pos, NULL, "%s takes one argument", m);
                     if (elem->kind == TY_OBJECT || elem->kind == TY_ARRAY || elem->kind == TY_MAP || elem->kind == TY_SET)
-                        xs_error(e->pos, "use findIndex with a comparison", "%s compares by value and works on arrays of numbers, strings, booleans and enums", m);
+                        xs_error(XS8006, e->pos, "use findIndex with a comparison", "%s compares by value and works on arrays of numbers, strings, booleans and enums", m);
                     check_expr(e->args.items[0], elem);
                     expect_type(e->args.items[0], elem, xs_sprintf("argument of %s", m));
                     e->type = strcmp(m, "indexOf") == 0 ? ty_int : ty_boolean;
@@ -3723,35 +3770,35 @@ static void check_expr(Expr *e, Type *expected) {
                     return;
                 }
                 if (strcmp(m, "join") == 0) {
-                    if (e->args.len > 1) xs_error(e->pos, NULL, "join takes at most one argument");
+                    if (e->args.len > 1) xs_error(XS7060, e->pos, NULL, "join takes at most one argument");
                     if (e->args.len == 1) { check_expr(e->args.items[0], ty_string); expect_type(e->args.items[0], ty_string, "separator of join"); }
                     if (elem->kind == TY_OBJECT || elem->kind == TY_ARRAY || elem->kind == TY_MAP || elem->kind == TY_SET)
-                        xs_error(e->pos, "map the elements to strings first", "join works on arrays of numbers, strings, booleans and enums");
+                        xs_error(XS7061, e->pos, "map the elements to strings first", "join works on arrays of numbers, strings, booleans and enums");
                     e->type = ty_string;
                     e->builtin.cfn = m;
                     return;
                 }
                 if (strcmp(m, "sort") == 0) {
-                    if (e->args.len != 1) xs_error(e->pos, "JavaScript's default sort compares as strings; xisto requires a comparator: sort((a, b) => a - b)", "sort takes a comparator function");
+                    if (e->args.len != 1) xs_error(XS7089, e->pos, "JavaScript's default sort compares as strings; xisto requires a comparator: sort((a, b) => a - b)", "sort takes a comparator function");
                     Type **ps = xs_alloc(sizeof(Type *) * 2); ps[0] = elem; ps[1] = elem;
                     Type *cbt = ty_func(ps, 2, NULL);
                     Expr *cb = e->args.items[0];
                     if (cb->kind == E_ARROW && !cb->arrow->fn->ret) check_expr(cb, cbt); else check_expr(cb, NULL);
                     if (cb->type->kind != TY_FUNC || cb->type->nparams != 2 || !ty_equal(cb->type->params[0], elem) || !is_numeric(cb->type->ret))
-                        xs_error(cb->pos, NULL, "the comparator must be (a: %s, b: %s) => number", ty_name(elem), ty_name(elem));
+                        xs_error(XS8130, cb->pos, NULL, "the comparator must be (a: %s, b: %s) => number", ty_name(elem), ty_name(elem));
                     e->type = e->lhs->type;
                     e->builtin.cfn = m;
                     e->field = cb->type->ret->kind == TY_INT ? 1 : 0;
                     return;
                 }
                 if (strcmp(m, "reverse") == 0) {
-                    if (e->args.len != 0) xs_error(e->pos, NULL, "reverse takes no arguments");
+                    if (e->args.len != 0) xs_error(XS7086, e->pos, NULL, "reverse takes no arguments");
                     e->type = e->lhs->type;
                     e->builtin.cfn = m;
                     return;
                 }
                 if (strcmp(m, "slice") == 0) {
-                    if (e->args.len > 2) xs_error(e->pos, NULL, "slice takes at most two arguments");
+                    if (e->args.len > 2) xs_error(XS7088, e->pos, NULL, "slice takes at most two arguments");
                     for (int i = 0; i < e->args.len; i++) { check_expr(e->args.items[i], ty_int); expect_type(e->args.items[i], ty_int, "argument of slice"); }
                     e->type = e->lhs->type;
                     e->builtin.cfn = m;
@@ -3760,7 +3807,7 @@ static void check_expr(Expr *e, Type *expected) {
             }
             {
                 static const char *names[] = {"length", "push", "pop", "unshift", "shift", "splice", "forEach", "map", "filter", "find", "findIndex", "some", "every", "indexOf", "includes", "join", "sort", "reverse", "slice"};
-                xs_error(e->pos, xs_help_suggest(e->str, names, 19, "arrays support indexing, length, push, pop, unshift, shift, splice(i, 1), forEach, map, filter, find, findIndex, some, every, indexOf, includes, join, sort(cmp), reverse, slice"), "unsupported array member '%s'", e->str);
+                xs_error(XS6038, e->pos, xs_help_suggest(e->str, names, 19, "arrays support indexing, length, push, pop, unshift, shift, splice(i, 1), forEach, map, filter, find, findIndex, some, every, indexOf, includes, join, sort(cmp), reverse, slice"), "unsupported array member '%s'", e->str);
             }
             return;
         }
@@ -3773,7 +3820,7 @@ static void check_expr(Expr *e, Type *expected) {
                 /* stmt.run(...params) / stmt.all(...params) / stmt.get(...params): parameters are bound by their static type */
                 const char *m = e->str;
                 if (!e->is_call || (strcmp(m, "run") != 0 && strcmp(m, "all") != 0 && strcmp(m, "get") != 0))
-                    xs_error(e->pos, "StatementSync has run(...params), all(...params) and get(...params)", "StatementSync has no member '%s'", m);
+                    xs_error(XS7036, e->pos, "StatementSync has run(...params), all(...params) and get(...params)", "StatementSync has no member '%s'", m);
                 for (int i = 0; i < e->args.len; i++) {
                     Expr *a = e->args.items[i];
                     check_expr(a, NULL);
@@ -3781,7 +3828,7 @@ static void check_expr(Expr *e, Type *expected) {
                     TypeKind k = a->type->kind;
                     bool ok = k == TY_INT || k == TY_NUMBER || k == TY_STRING || k == TY_BOOLEAN || k == TY_NULL ||
                               (k == TY_ENUM) || (k == TY_NULLABLE && a->type->elem->kind == TY_STRING);
-                    if (!ok) xs_error(a->pos, "parameters are int, number, string, boolean or null", "cannot bind %s as a SQL parameter", ty_name(a->type));
+                    if (!ok) xs_error(XS7050, a->pos, "parameters are int, number, string, boolean or null", "cannot bind %s as a SQL parameter", ty_name(a->type));
                 }
                 if (strcmp(m, "run") == 0) e->type = ty_object_of(find_class("RunResult"));
                 else {
@@ -3789,9 +3836,9 @@ static void check_expr(Expr *e, Type *expected) {
                     Type *want = expected;
                     Type *row = !want ? NULL : all ? (want->kind == TY_ARRAY ? want->elem : NULL) : (want->kind == TY_NULLABLE ? want->elem : NULL);
                     if (!row || row->kind != TY_OBJECT || row->cls->builtin)
-                        xs_error(e->pos, all ? "write the row type: const rows: Todo[] = stmt.all();" : "write the row type: const row: Todo | null = stmt.get(id);",
+                        xs_error(XS3002, e->pos, all ? "write the row type: const rows: Todo[] = stmt.all();" : "write the row type: const row: Todo | null = stmt.get(id);",
                                  "%s() needs to know the row type it produces", m);
-                    if (!json_ok(row, 0)) xs_error(e->pos, NULL, "%s cannot be built from a row", ty_name(row));
+                    if (!json_ok(row, 0)) xs_error(XS8001, e->pos, NULL, "%s cannot be built from a row", ty_name(row));
                     e->type = want;
                 }
                 e->builtin.cfn = m;
@@ -3804,16 +3851,16 @@ static void check_expr(Expr *e, Type *expected) {
                 check_expr(e->args.items[0], ty_int);
                 expect_type(e->args.items[0], ty_int, "port");
                 Expr *o = e->args.items[1];
-                if (o->kind != E_OBJLIT) xs_error(o->pos, "app.listen(443, { cert: \"cert.pem\", key: \"key.pem\" })", "listen options must be an object literal");
+                if (o->kind != E_OBJLIT) xs_error(XS7062, o->pos, "app.listen(443, { cert: \"cert.pem\", key: \"key.pem\" })", "listen options must be an object literal");
                 Expr *cert = NULL, *key = NULL;
                 for (int i = 0; i < o->args.len; i++) {
                     if (strcmp(o->keys[i], "cert") == 0) cert = o->args.items[i];
                     else if (strcmp(o->keys[i], "key") == 0) key = o->args.items[i];
-                    else xs_error(o->args.items[i]->pos, "supported: cert, key", "unknown listen option '%s'", o->keys[i]);
+                    else xs_error(XS7113, o->args.items[i]->pos, "supported: cert, key", "unknown listen option '%s'", o->keys[i]);
                     check_expr(o->args.items[i], ty_string);
                     expect_type(o->args.items[i], ty_string, xs_sprintf("listen option '%s'", o->keys[i]));
                 }
-                if (!cert || !key) xs_error(o->pos, "give both: { cert: \"cert.pem\", key: \"key.pem\" }", "HTTPS needs a certificate and a key");
+                if (!cert || !key) xs_error(XS7023, o->pos, "give both: { cert: \"cert.pem\", key: \"key.pem\" }", "HTTPS needs a certificate and a key");
                 e->args.len = 1;
                 expr_list_push(&e->args, cert);
                 expr_list_push(&e->args, key);
@@ -3821,7 +3868,7 @@ static void check_expr(Expr *e, Type *expected) {
                 e->type = ty_void;
                 e->builtin.cfn = "xs_Server_listen_tls";
                 e->builtin.self_first = true;
-                if (xs_tls_off) xs_error(o->pos, "remove --tls=off, or listen without cert/key behind the load balancer", "HTTPS server, but the program is built with --tls=off");
+                if (xs_tls_off) xs_error(XS7024, o->pos, "remove --tls=off, or listen without cert/key behind the load balancer", "HTTPS server, but the program is built with --tls=off");
                 prog->uses_net = true;
                 prog->uses_tls = true;
                 return;
@@ -3878,7 +3925,7 @@ static void check_expr(Expr *e, Type *expected) {
                     expect_type(e->args.items[0], ty_int, "radix");
                 }
                 bool is_int = e->lhs->type->kind == TY_INT;
-                if (!is_int && e->args.len == 1) xs_error(e->pos, "convert first: Math.trunc(x).toString(16)", "toString(radix) works on int");
+                if (!is_int && e->args.len == 1) xs_error(XS7104, e->pos, "convert first: Math.trunc(x).toString(16)", "toString(radix) works on int");
                 e->builtin.cfn = is_int ? (e->args.len ? "xs_int_to_radix" : "xs_str_from_int") : "xs_str_from_num";
                 e->type = ty_string;
                 return;
@@ -3891,14 +3938,14 @@ static void check_expr(Expr *e, Type *expected) {
                 e->type = ty_string;
                 return;
             }
-            xs_error(e->pos, NULL, "%s has no member '%s'", ty_name(e->lhs->type), e->str);
+            xs_error(XS8013, e->pos, NULL, "%s has no member '%s'", ty_name(e->lhs->type), e->str);
             return;
         default:
-            xs_error(e->pos, NULL, "%s has no member '%s'", ty_name(e->lhs->type), e->str);
+            xs_error(XS8013, e->pos, NULL, "%s has no member '%s'", ty_name(e->lhs->type), e->str);
         }
         return;
     case E_NEW_ARRAY:
-        xs_error(e->pos, "write: new Array<T>(n).fill(x)", "a new array must be filled before use");
+        xs_error(XS6017, e->pos, "write: new Array<T>(n).fill(x)", "a new array must be filled before use");
         return;
     case E_SEQ: /* i++, j-- in a for loop's update */
         for (int i = 0; i < e->args.len; i++) check_expr(e->args.items[i], NULL);
@@ -3907,9 +3954,9 @@ static void check_expr(Expr *e, Type *expected) {
     case E_REGEX: { /* /pattern/flags: compiled here once so a bad pattern is a compile error */
         const char *err = NULL;
         int fl = xr_parse_flags(e->rflags, strlen(e->rflags), &err);
-        if (fl < 0) xs_error(e->pos, "flags: d g i m s u v y, each at most once", "invalid regular expression flags '%s'", e->rflags);
+        if (fl < 0) xs_error(XS8111, e->pos, "flags: d g i m s u v y, each at most once", "invalid regular expression flags '%s'", e->rflags);
         xr_re *re = xr_compile(e->str, strlen(e->str), fl, &err);
-        if (!re) xs_error(e->pos, NULL, "invalid regular expression /%s/: %s", e->str, err);
+        if (!re) xs_error(XS8110, e->pos, NULL, "invalid regular expression /%s/: %s", e->str, err);
         xr_free(re);
         e->type = ty_object_of(find_class("RegExp"));
         prog->uses_regex = true;
@@ -3932,7 +3979,7 @@ static void check_expr(Expr *e, Type *expected) {
         if (v->type->kind == TY_LITINT && is_numeric(want)) coerce_lit(v, want);
         if (ty_equal(v->type, want)) { *e = *v; return; }
         if (v->type->kind == TY_UNKNOWN) { /* checked at run time: the emitter compares the object's type */
-            if (!unknown_target(want)) xs_error(e->pos, NULL, "cannot check %s at run time", ty_name(want));
+            if (!unknown_target(want)) xs_error(XS2010, e->pos, NULL, "cannot check %s at run time", ty_name(want));
             e->type = want;
             e->elem_type = want;
             return;
@@ -3949,7 +3996,7 @@ static void check_expr(Expr *e, Type *expected) {
                 if (is_subclass(w->cls, g->cls)) { e->type = want; e->elem_type = want; e->op = TK_CLASS; return; } /* op marks a downcast */
             }
         }
-        xs_error(e->pos, "xisto checks types statically: 'as' converts an object (JSON) value or restates the same type", "cannot convert %s to %s", ty_name(v->type), ty_name(want));
+        xs_error(XS8090, e->pos, "xisto checks types statically: 'as' converts an object (JSON) value or restates the same type", "cannot convert %s to %s", ty_name(v->type), ty_name(want));
         return;
     }
     case E_OBJLIT: {
@@ -3975,31 +4022,31 @@ static void check_expr(Expr *e, Type *expected) {
             }
             if (!pick && nobj == 1)
                 for (int i = 0; i < t->nparams; i++) if (t->params[i]->kind == TY_OBJECT) pick = t->params[i];
-            if (!pick) xs_error(e->pos, "give the member's kind field its literal value", "cannot tell which member of %s this object is", ty_name(t));
+            if (!pick) xs_error(XS2014, e->pos, "give the member's kind field its literal value", "cannot tell which member of %s this object is", ty_name(t));
             t = pick;
         }
         if (t && t->kind == TY_JSON) { anon_objlit(e); return; }
         if (!t || t->kind != TY_OBJECT)
-            xs_error(e->pos, "give it a type: const t: Todo = { ... };  (declare Todo with interface or class)", "an object literal needs a declared type here");
+            xs_error(XS3006, e->pos, "give it a type: const t: Todo = { ... };  (declare Todo with interface or class)", "an object literal needs a declared type here");
         Class *c = t->cls;
-        if (c->builtin) xs_error(e->pos, NULL, "%s cannot be built from an object literal", c->name);
-        if (c->ctor) xs_error(e->pos, xs_sprintf("write new %s(...)", c->name), "%s has a constructor; build it with new", c->name);
+        if (c->builtin) xs_error(XS8002, e->pos, NULL, "%s cannot be built from an object literal", c->name);
+        if (c->ctor) xs_error(XS8008, e->pos, xs_sprintf("write new %s(...)", c->name), "%s has a constructor; build it with new", c->name);
         bool *given = xs_alloc(sizeof(bool) * (size_t)(c->nfields + 1));
         for (int i = 0; i < e->args.len; i++) {
             int idx = -1;
             for (int k = 0; k < c->nfields; k++) if (strcmp(c->fields[k].name, e->keys[i]) == 0) idx = k;
             if (idx < 0) {
                 int n; const char **cands = member_names(c, &n);
-                xs_error(e->args.items[i]->pos, xs_help_suggest(e->keys[i], cands, n, NULL), "%s has no field '%s'", c->name, e->keys[i]);
+                xs_error(XS8012, e->args.items[i]->pos, xs_help_suggest(e->keys[i], cands, n, NULL), "%s has no field '%s'", c->name, e->keys[i]);
             }
-            if (given[idx]) xs_error(e->args.items[i]->pos, NULL, "field '%s' is given twice", e->keys[i]);
+            if (given[idx]) xs_error(XS9024, e->args.items[i]->pos, NULL, "field '%s' is given twice", e->keys[i]);
             given[idx] = true;
             check_expr(e->args.items[i], c->fields[idx].type);
             expect_type(e->args.items[i], c->fields[idx].type, xs_sprintf("field '%s'", e->keys[i]));
         }
         for (int k = 0; k < c->nfields; k++)
             if (!given[k] && !c->fields[k].init && !c->fields[k].optional)
-                xs_error(e->pos, xs_sprintf("add %s: ... (or declare it optional: %s?: %s)", c->fields[k].name, c->fields[k].name, ty_name(c->fields[k].type)),
+                xs_error(XS9028, e->pos, xs_sprintf("add %s: ... (or declare it optional: %s?: %s)", c->fields[k].name, c->fields[k].name, ty_name(c->fields[k].type)),
                          "missing field '%s' of %s", c->fields[k].name, c->name);
         e->cls = c;
         e->type = t;
@@ -4022,13 +4069,13 @@ static void check_expr(Expr *e, Type *expected) {
             f->nparams = want->nparams;
         }
         if (want && want->nparams != f->nparams)
-            xs_error(e->pos, NULL, "this arrow function takes %d parameter(s), but %d are expected here", f->nparams, want->nparams);
+            xs_error(XS8145, e->pos, NULL, "this arrow function takes %d parameter(s), but %d are expected here", f->nparams, want->nparams);
         for (int i = 0; i < f->nparams; i++) {
             if (f->params[i].type) f->params[i].type = resolve(f->params[i].type, e->pos);
             else if (want) f->params[i].type = want->params[i];
-            else xs_error(e->pos, "write the type: (x: number) => ...", "parameter '%s' needs a type here", f->params[i].name);
+            else xs_error(XS3014, e->pos, "write the type: (x: number) => ...", "parameter '%s' needs a type here", f->params[i].name);
             if (want && !ty_equal(f->params[i].type, want->params[i]))
-                xs_error(e->pos, NULL, "parameter '%s' is %s, but %s is expected here", f->params[i].name, ty_name(f->params[i].type), ty_name(want->params[i]));
+                xs_error(XS8120, e->pos, NULL, "parameter '%s' is %s, but %s is expected here", f->params[i].name, ty_name(f->params[i].type), ty_name(want->params[i]));
         }
         if (f->ret) f->ret = resolve(f->ret, e->pos);
         else if (want) f->ret = want->ret;
@@ -4059,12 +4106,12 @@ static void check_expr(Expr *e, Type *expected) {
                 settle(r->expr);
                 f->ret = r->expr->type;
                 if (f->ret->kind == TY_VOID) { r->kind = S_EXPR; }
-                else if (f->ret->kind == TY_NULL) xs_error(r->expr->pos, "write the return type: (x): Todo | null => ...", "cannot infer the return type from null");
+                else if (f->ret->kind == TY_NULL) xs_error(XS2012, r->expr->pos, "write the return type: (x): Todo | null => ...", "cannot infer the return type from null");
             } else {
                 f->ret = ty_void;
                 check_block(f->body);
                 for (int i = 0; i < f->body->stmts.len; i++) if (f->body->stmts.items[i]->kind == S_RETURN && f->body->stmts.items[i]->expr)
-                    xs_error(f->body->stmts.items[i]->pos, "write the return type: (x): number => { ... }", "an arrow function with a block body needs a return type to return a value");
+                    xs_error(XS3004, f->body->stmts.items[i]->pos, "write the return type: (x): number => { ... }", "an arrow function with a block body needs a return type to return a value");
             }
         } else {
             if (a->expr_body && f->ret->kind == TY_VOID) {
@@ -4076,7 +4123,7 @@ static void check_expr(Expr *e, Type *expected) {
             } else {
                 check_block(f->body);
                 if (f->ret->kind != TY_VOID && !always_returns(f->body))
-                    xs_error(e->pos, "add a return at the end", "this arrow function may reach its end without returning a %s", ty_name(f->ret));
+                    xs_error(XS8144, e->pos, "add a return at the end", "this arrow function may reach its end without returning a %s", ty_name(f->ret));
             }
         }
         pop_scope();
@@ -4093,11 +4140,11 @@ static void check_expr(Expr *e, Type *expected) {
         e->type = resolve(e->elem_type, e->pos);
         check_type_supported(e->pos, e->type);
         if (e->type->kind == TY_CHAN) {
-            if (e->args.len > 1) xs_error(e->pos, NULL, "new Channel<T>(capacity) takes at most one argument");
+            if (e->args.len > 1) xs_error(XS7067, e->pos, NULL, "new Channel<T>(capacity) takes at most one argument");
             if (e->args.len == 1) { check_expr(e->args.items[0], ty_int); expect_type(e->args.items[0], ty_int, "channel capacity"); }
             Type *el = e->type->elem;
             if (el->kind == TY_VOID || el->kind == TY_FUNC || el->kind == TY_NULLABLE || el->kind == TY_NULL)
-                xs_error(e->pos, NULL, "unsupported channel element type '%s'", ty_name(el));
+                xs_error(XS6040, e->pos, NULL, "unsupported channel element type '%s'", ty_name(el));
             prog->uses_net = true; /* parked receivers and senders are coroutines of the event loop */
         } else if (e->args.len == 1) { /* new Map<K, V>([[k, v], ...]) / new Set<T>([a, b]): an array of entries or values */
             bool is_map = e->type->kind == TY_MAP;
@@ -4116,10 +4163,11 @@ static void check_expr(Expr *e, Type *expected) {
         Class *c = find_class(e->str);
         if (!c) {
             int n; const char **cands = class_names(&n);
-            xs_error(e->pos, xs_help_suggest(e->str, cands, n, "declare it: class Name { ... }"), "unknown class '%s'", e->str);
+            if (missing_name(e->str)) xs_error_quiet();
+            xs_error(XS9031, e->pos, xs_help_suggest(e->str, cands, n, "declare it: class Name { ... }"), "unknown class '%s'", e->str);
         }
         if (c->gen_state) c = generic_new(e, c, expected);
-        else if (e->ntargs) xs_error(e->pos, NULL, "'%s' is not generic", c->name);
+        else if (e->ntargs) xs_error(XS6005, e->pos, NULL, "'%s' is not generic", c->name);
         e->cls = c;
         e->type = ty_object_of(c);
         if (c->builtin && c->ctor && c->ctor->is_native) { /* a native package's class: its C constructor */
@@ -4130,16 +4178,16 @@ static void check_expr(Expr *e, Type *expected) {
         if (c->builtin) {
             if (strcmp(c->name, "Worker") == 0) { /* new Worker(__filename, { workerData: text }): this program, on a thread */
                 const char *hint = "new Worker(__filename, { workerData: JSON.stringify(task) }): the worker runs this same program";
-                if (e->args.len < 1 || e->args.len > 2) xs_error(e->pos, hint, "Worker takes the program's file and its options");
+                if (e->args.len < 1 || e->args.len > 2) xs_error(XS7043, e->pos, hint, "Worker takes the program's file and its options");
                 Expr *f = e->args.items[0];
                 if (!(f->kind == E_IDENT && f->str && strcmp(f->str, "__filename") == 0))
-                    xs_error(f->pos, hint, "a worker runs this program again: its file must be __filename");
+                    xs_error(XS7044, f->pos, hint, "a worker runs this program again: its file must be __filename");
                 Expr *data = NULL;
                 if (e->args.len == 2) {
                     Expr *o = e->args.items[1];
-                    if (o->kind != E_OBJLIT) xs_error(o->pos, hint, "the options are an object literal");
+                    if (o->kind != E_OBJLIT) xs_error(XS7103, o->pos, hint, "the options are an object literal");
                     for (int k = 0; k < o->args.len; k++) {
-                        if (strcmp(o->keys[k], "workerData") != 0) xs_error(o->args.items[k]->pos, hint, "the only option is workerData");
+                        if (strcmp(o->keys[k], "workerData") != 0) xs_error(XS7101, o->args.items[k]->pos, hint, "the only option is workerData");
                         data = o->args.items[k];
                     }
                 }
@@ -4157,7 +4205,7 @@ static void check_expr(Expr *e, Type *expected) {
                 return;
             }
             if (strcmp(c->name, "DatabaseSync") == 0) {
-                if (e->args.len != 1) xs_error(e->pos, "new DatabaseSync(\"app.db\") or new DatabaseSync(\":memory:\")", "DatabaseSync takes a path");
+                if (e->args.len != 1) xs_error(XS7009, e->pos, "new DatabaseSync(\"app.db\") or new DatabaseSync(\":memory:\")", "DatabaseSync takes a path");
                 check_expr(e->args.items[0], ty_string);
                 expect_type(e->args.items[0], ty_string, "database path");
                 e->builtin.cfn = "xs_DatabaseSync_new";
@@ -4165,10 +4213,10 @@ static void check_expr(Expr *e, Type *expected) {
                 return;
             }
             if (strcmp(c->name, "Uint8Array") == 0) { /* new Uint8Array(length | int[] | number[] | bytes | sab, offset?, length?) */
-                if (e->args.len < 1 || e->args.len > 3) xs_error(e->pos, "new Uint8Array(16), new Uint8Array([1, 2, 3]), new Uint8Array(sharedBuffer)", "new Uint8Array takes one argument (or a SharedArrayBuffer, an offset and a length)");
+                if (e->args.len < 1 || e->args.len > 3) xs_error(XS7077, e->pos, "new Uint8Array(16), new Uint8Array([1, 2, 3]), new Uint8Array(sharedBuffer)", "new Uint8Array takes one argument (or a SharedArrayBuffer, an offset and a length)");
                 check_expr(e->args.items[0], e->args.items[0]->kind == E_ARRAY_LIT ? ty_array_of(ty_int) : NULL);
                 Type *st = e->args.items[0]->type;
-                if (e->args.len > 1 && !is_sab(st)) xs_error(e->pos, "new Uint8Array(sharedBuffer, byteOffset, length)", "an offset and a length go with a SharedArrayBuffer");
+                if (e->args.len > 1 && !is_sab(st)) xs_error(XS7045, e->pos, "new Uint8Array(sharedBuffer, byteOffset, length)", "an offset and a length go with a SharedArrayBuffer");
                 if (is_sab(st)) { /* a view on the shared bytes (runtime: xs_u8_on); a message carries it as the block */
                     for (int k = 1; k < e->args.len; k++) int_arg(&e->args.items[k], k == 1 ? "the byte offset" : "the length");
                     for (int k = e->args.len; k < 3; k++) expr_list_push(&e->args, num_lit(e->pos, (double)XS_NOT_GIVEN, true));
@@ -4179,21 +4227,21 @@ static void check_expr(Expr *e, Type *expected) {
                 else if (is_bytes(st)) e->builtin.cfn = "xs_u8_copy";
                 else if (st->kind == TY_ARRAY && (st->elem->kind == TY_INT || st->elem->kind == TY_LITINT)) e->builtin.cfn = "xs_u8_from_ints";
                 else if (st->kind == TY_ARRAY && st->elem->kind == TY_NUMBER) e->builtin.cfn = "xs_u8_from_nums";
-                else xs_error(e->args.items[0]->pos, NULL, "new Uint8Array takes a length, an int[] or number[], or bytes, not %s", ty_name(st));
+                else xs_error(XS7076, e->args.items[0]->pos, NULL, "new Uint8Array takes a length, an int[] or number[], or bytes, not %s", ty_name(st));
                 return;
             }
             if (strcmp(c->name, "SharedArrayBuffer") == 0) { /* new SharedArrayBuffer(bytes): zeroed, shared by postMessage */
-                if (e->args.len != 1) xs_error(e->pos, "new SharedArrayBuffer(8 * n)", "new SharedArrayBuffer takes its length in bytes");
+                if (e->args.len != 1) xs_error(XS7075, e->pos, "new SharedArrayBuffer(8 * n)", "new SharedArrayBuffer takes its length in bytes");
                 int_arg(&e->args.items[0], "the length of a SharedArrayBuffer");
                 e->builtin.cfn = "xs_sab_new";
                 return;
             }
             if (strcmp(c->name, "Float64Array") == 0) { /* new Float64Array(length | number[] | int[] | Float64Array | sab, offset?, length?) */
                 const char *hint = "new Float64Array(n), new Float64Array([1.5, 2]), new Float64Array(sharedBuffer)";
-                if (e->args.len < 1 || e->args.len > 3) xs_error(e->pos, hint, "new Float64Array takes one argument (or a SharedArrayBuffer, an offset and a length)");
+                if (e->args.len < 1 || e->args.len > 3) xs_error(XS7071, e->pos, hint, "new Float64Array takes one argument (or a SharedArrayBuffer, an offset and a length)");
                 check_expr(e->args.items[0], e->args.items[0]->kind == E_ARRAY_LIT ? ty_array_of(ty_number) : NULL);
                 Type *st = e->args.items[0]->type;
-                if (e->args.len > 1 && !is_sab(st)) xs_error(e->pos, hint, "an offset and a length go with a SharedArrayBuffer");
+                if (e->args.len > 1 && !is_sab(st)) xs_error(XS7045, e->pos, hint, "an offset and a length go with a SharedArrayBuffer");
                 if (st->kind == TY_INT || st->kind == TY_LITINT) { if (st->kind == TY_LITINT) coerce_lit(e->args.items[0], ty_int); e->builtin.cfn = "xs_f64_new"; }
                 else if (is_f64(st)) e->builtin.cfn = "xs_f64_copy";
                 else if (is_sab(st)) {
@@ -4203,16 +4251,16 @@ static void check_expr(Expr *e, Type *expected) {
                 }
                 else if (st->kind == TY_ARRAY && st->elem->kind == TY_NUMBER) e->builtin.cfn = "xs_f64_from_nums";
                 else if (st->kind == TY_ARRAY && (st->elem->kind == TY_INT || st->elem->kind == TY_LITINT)) e->builtin.cfn = "xs_f64_from_ints";
-                else xs_error(e->args.items[0]->pos, hint, "new Float64Array takes a length, a number[], a Float64Array or a SharedArrayBuffer, not %s", ty_name(st));
+                else xs_error(XS7070, e->args.items[0]->pos, hint, "new Float64Array takes a length, a number[], a Float64Array or a SharedArrayBuffer, not %s", ty_name(st));
                 return;
             }
             if (strcmp(c->name, "TextEncoder") == 0 || strcmp(c->name, "TextDecoder") == 0) {
-                if (e->args.len > (c->name[4] == 'D' ? 1 : 0)) xs_error(e->pos, NULL, "new %s() takes no arguments (UTF-8 only)", c->name);
+                if (e->args.len > (c->name[4] == 'D' ? 1 : 0)) xs_error(XS7065, e->pos, NULL, "new %s() takes no arguments (UTF-8 only)", c->name);
                 if (e->args.len == 1) { check_expr(e->args.items[0], ty_string); expect_type(e->args.items[0], ty_string, "the encoding"); e->args.len = 0; }
                 e->builtin.cfn = c->name[4] == 'E' ? "xs_TextEncoder_new" : "xs_TextDecoder_new";
                 return;
             }
-            if (strcmp(c->name, "Buffer") == 0) xs_error(e->pos, "use Buffer.from(...) or Buffer.alloc(n)", "new Buffer() is deprecated (and not supported)");
+            if (strcmp(c->name, "Buffer") == 0) xs_error(XS7066, e->pos, "use Buffer.from(...) or Buffer.alloc(n)", "new Buffer() is deprecated (and not supported)");
             if (strcmp(c->name, "Date") == 0) { /* new Date(), new Date(ms | text | date), new Date(y, m, d?, h?, mi?, s?, ms?) */
                 int n = e->args.len;
                 if (n == 0) { e->builtin.cfn = "xs_Date_new_now"; return; }
@@ -4225,14 +4273,14 @@ static void check_expr(Expr *e, Type *expected) {
                     e->builtin.cfn = "xs_Date_new_ms";
                     return;
                 }
-                if (n > 7) xs_error(e->pos, NULL, "new Date takes at most 7 arguments");
+                if (n > 7) xs_error(XS7068, e->pos, NULL, "new Date takes at most 7 arguments");
                 for (int k = 0; k < n; k++) date_num_arg(&e->args.items[k], xs_sprintf("argument %d of new Date", k + 1));
                 for (int k = n; k < 7; k++) expr_list_push(&e->args, num_lit(e->pos, k == 2 ? 1 : 0, false));
                 e->builtin.cfn = "xs_Date_new_parts";
                 return;
             }
             if (strcmp(c->name, "RegExp") == 0) { /* new RegExp(pattern, flags = "") */
-                if (e->args.len < 1 || e->args.len > 2) xs_error(e->pos, "new RegExp(\"a+b\", \"gi\")", "new RegExp takes a pattern and optional flags");
+                if (e->args.len < 1 || e->args.len > 2) xs_error(XS7073, e->pos, "new RegExp(\"a+b\", \"gi\")", "new RegExp takes a pattern and optional flags");
                 for (int k = 0; k < e->args.len; k++) {
                     check_expr(e->args.items[k], ty_string);
                     expect_type(e->args.items[k], ty_string, k == 0 ? "the RegExp pattern" : "the RegExp flags");
@@ -4248,25 +4296,25 @@ static void check_expr(Expr *e, Type *expected) {
                 return;
             }
             if (strcmp(c->name, "Error") == 0) {
-                if (e->args.len > 1) xs_error(e->pos, NULL, "new Error() takes at most one argument");
+                if (e->args.len > 1) xs_error(XS7069, e->pos, NULL, "new Error() takes at most one argument");
                 if (e->args.len == 1) { check_expr(e->args.items[0], ty_string); expect_type(e->args.items[0], ty_string, "the Error message"); }
                 e->builtin.cfn = "xs_Error_new";
                 return;
             }
             if (strcmp(c->name, "Server") != 0)
-                xs_error(e->pos, NULL, "%s cannot be constructed directly", c->name);
-            if (e->args.len != 0) xs_error(e->pos, NULL, "new Server() takes no arguments");
+                xs_error(XS8003, e->pos, NULL, "%s cannot be constructed directly", c->name);
+            if (e->args.len != 0) xs_error(XS7074, e->pos, NULL, "new Server() takes no arguments");
             e->builtin.cfn = "xs_Server_new";
             prog->uses_net = true;
             return;
         }
-        if (c->is_interface) xs_error(e->pos, xs_sprintf("write an object literal: const x: %s = { ... };", c->name), "'%s' is an interface; it has no constructor", c->name);
-        if (c->data_only) xs_error(e->pos, "give its fields initializers (or a constructor that sets them) to build it with new", "%s has fields without a value: it is filled from JSON, not constructed", c->name);
-        if (c->is_abstract) xs_error(e->pos, "make an instance of a class that extends it", "%s is abstract", c->name);
+        if (c->is_interface) xs_error(XS9005, e->pos, xs_sprintf("write an object literal: const x: %s = { ... };", c->name), "'%s' is an interface; it has no constructor", c->name);
+        if (c->data_only) xs_error(XS8009, e->pos, "give its fields initializers (or a constructor that sets them) to build it with new", "%s has fields without a value: it is filled from JSON, not constructed", c->name);
+        if (c->is_abstract) xs_error(XS8017, e->pos, "make an instance of a class that extends it", "%s is abstract", c->name);
         if (eff_ctor(c)) {
             check_args(e, eff_ctor(c), xs_sprintf("the constructor of %s", c->name));
         } else if (e->args.len != 0) {
-            xs_error(e->pos, NULL, "%s has no constructor, so 'new %s()' takes no arguments", c->name, c->name);
+            xs_error(XS8010, e->pos, NULL, "%s has no constructor, so 'new %s()' takes no arguments", c->name, c->name);
         }
         return;
     }
@@ -4274,7 +4322,7 @@ static void check_expr(Expr *e, Type *expected) {
         if (expected && expected->kind == TY_NULLABLE) expected = expected->elem;
         if (expected && expected->kind == TY_OBJECT && expected->cls->is_tuple) { /* [x, y] as a tuple: its fields */
             Class *tc = expected->cls;
-            if (e->args.len != tc->nfields) xs_error(e->pos, NULL, "the tuple %s has %d elements, but this gives %d", tc->name, tc->nfields, e->args.len);
+            if (e->args.len != tc->nfields) xs_error(XS8142, e->pos, NULL, "the tuple %s has %d elements, but this gives %d", tc->name, tc->nfields, e->args.len);
             e->kind = E_OBJLIT;
             e->keys = xs_alloc(sizeof(char *) * (size_t)tc->nfields);
             for (int k = 0; k < tc->nfields; k++) e->keys[k] = tc->fields[k].name;
@@ -4284,7 +4332,7 @@ static void check_expr(Expr *e, Type *expected) {
         Type *elem = expected && expected->kind == TY_ARRAY ? expected->elem : NULL;
         if (e->spread) { check_spread_lit(e, elem); return; }
         if (e->args.len == 0) {
-            if (!elem) xs_error(e->pos, "give it a type: const xs: number[] = [];", "cannot infer the type of an empty array");
+            if (!elem) xs_error(XS3008, e->pos, "give it a type: const xs: number[] = [];", "cannot infer the type of an empty array");
             e->type = expected;
             check_type_supported(e->pos, e->type);
             return;
@@ -4321,7 +4369,7 @@ static void check_expr(Expr *e, Type *expected) {
             }
             TypeKind k = part->type->kind;
             if (k != TY_STRING && k != TY_INT && k != TY_NUMBER && k != TY_BOOLEAN && k != TY_ENUM)
-                xs_error(part->pos, "template literals take strings, numbers, ints, booleans and enums; call a method that returns a string for the rest", "cannot put a %s inside a template literal", ty_name(part->type));
+                xs_error(XS8098, part->pos, "template literals take strings, numbers, ints, booleans and enums; call a method that returns a string for the rest", "cannot put a %s inside a template literal", ty_name(part->type));
         }
         e->type = ty_string;
         return;
@@ -4329,7 +4377,7 @@ static void check_expr(Expr *e, Type *expected) {
         check_expr(e->lhs, NULL);
         if (e->lhs->type->kind != TY_BOOLEAN && truthy_type(e->lhs->type)) make_truthy(e->lhs, "condition of '?:'");
         if (e->lhs->type->kind != TY_BOOLEAN)
-            xs_error(e->lhs->pos, "there is no truthiness in xisto; compare explicitly", "condition of '?:' must be boolean, but this is %s", ty_name(e->lhs->type));
+            xs_error(XS8105, e->lhs->pos, "there is no truthiness in xisto; compare explicitly", "condition of '?:' must be boolean, but this is %s", ty_name(e->lhs->type));
         Expr *a = e->args.items[0], *b = e->args.items[1];
         {
             NSet ts = {0}, fs = {0};
@@ -4365,13 +4413,13 @@ static void check_expr(Expr *e, Type *expected) {
                 else u = ty_nullable_of(u);
             }
             if (!u && expected && (expected->kind == TY_UNION || (expected->kind == TY_NULLABLE && expected->elem->kind == TY_UNION))) u = expected; /* both go into the union */
-            if (!u) xs_error(e->pos, NULL, "the two branches of '?:' must have the same type, but they are %s and %s", ty_name(ta), ty_name(tb));
+            if (!u) xs_error(XS8143, e->pos, NULL, "the two branches of '?:' must have the same type, but they are %s and %s", ty_name(ta), ty_name(tb));
             expect_type(a, u, "first branch of '?:'");
             expect_type(b, u, "second branch of '?:'");
             e->type = u;
             return;
         }
-        if (a->type->kind == TY_VOID) xs_error(e->pos, NULL, "the branches of '?:' cannot be void");
+        if (a->type->kind == TY_VOID) xs_error(XS8128, e->pos, NULL, "the branches of '?:' cannot be void");
         e->type = a->type;
         return;
     }
@@ -4444,8 +4492,8 @@ static void check_var(Stmt *s, bool global) {
         check_type_supported(s->pos, s->decl_type);
     }
     check_expr(s->init, s->decl_type);
-    if (s->init->type->kind == TY_VOID) xs_error(s->init->pos, NULL, "cannot store a void value");
-    if (s->init->type->kind == TY_NULL && !s->decl_type) xs_error(s->init->pos, "write the type: let x: Todo | null = null;", "cannot infer the type of '%s' from null", s->name);
+    if (s->init->type->kind == TY_VOID) xs_error(XS8102, s->init->pos, NULL, "cannot store a void value");
+    if (s->init->type->kind == TY_NULL && !s->decl_type) xs_error(XS2013, s->init->pos, "write the type: let x: Todo | null = null;", "cannot infer the type of '%s' from null", s->name);
     if (s->decl_type) expect_type(s->init, s->decl_type, xs_sprintf("initializer of '%s' (declared as %s)", s->name, ty_name(s->decl_type)));
     settle(s->init);
     s->type = s->decl_type ? s->decl_type : s->init->type;
@@ -4476,7 +4524,7 @@ static Expr *str_truthy_call(Expr *v) {
 /* rewrites e (already checked, of a truthy type) in place into a boolean test */
 static void make_truthy(Expr *e, const char *what) {
     if (!rereadable(e))
-        xs_error(e->pos, "store it in a const first, or compare explicitly", "%s must be boolean (truthiness applies to names and fields only)", what);
+        xs_error(XS8021, e->pos, "store it in a const first, or compare explicitly", "%s must be boolean (truthiness applies to names and fields only)", what);
     Expr *v = expr_copy(e);
     memset(e, 0, sizeof *e);
     e->pos = v->pos;
@@ -4509,7 +4557,7 @@ static void check_cond(Expr *c, const char *what) {
     check_expr(c, NULL);
     if (c->type->kind != TY_BOOLEAN && truthy_type(c->type)) make_truthy(c, what);
     if (c->type->kind != TY_BOOLEAN)
-        xs_error(c->pos, "there is no truthiness for numbers in xisto; compare explicitly, e.g. 'x !== 0'", "%s must be boolean, but this is %s", what, ty_name(c->type));
+        xs_error(XS8022, c->pos, "there is no truthiness for numbers in xisto; compare explicitly, e.g. 'x !== 0'", "%s must be boolean, but this is %s", what, ty_name(c->type));
 }
 
 /* A field read through a variable or `this` (o.f, this.f) of a nullable type: the name its narrowing goes by in
@@ -4827,7 +4875,7 @@ static void check_stmt(Stmt *s) {
             return;
         }
         if (t->kind != TY_OBJECT || t->cls != err)
-            xs_error(s->expr->pos, "throw new Error(\"message\"), or an object of one of your classes", "%s cannot be thrown", ty_name(t));
+            xs_error(XS8005, s->expr->pos, "throw new Error(\"message\"), or an object of one of your classes", "%s cannot be thrown", ty_name(t));
         return;
     }
     case S_TRY: {
@@ -4863,7 +4911,7 @@ static void check_stmt(Stmt *s) {
         }
         if (is_bytes(s->expr->type) || is_f64(s->expr->type)) { /* for (const b of bytes): ints; of a Float64Array: numbers */
             Type *et = is_f64(s->expr->type) ? ty_number : ty_int;
-            if (s->decl_type) { s->decl_type = resolve(s->decl_type, s->pos); if (s->decl_type->kind != et->kind) xs_error(s->pos, NULL, "the elements are %s, not %s", ty_name(et), ty_name(s->decl_type)); }
+            if (s->decl_type) { s->decl_type = resolve(s->decl_type, s->pos); if (s->decl_type->kind != et->kind) xs_error(XS8133, s->pos, NULL, "the elements are %s, not %s", ty_name(et), ty_name(s->decl_type)); }
             s->type = et;
             push_scope();
             decl_no_cell = true;
@@ -4903,11 +4951,11 @@ static void check_stmt(Stmt *s) {
             check_expr(s->expr, NULL);
         }
         if (s->expr->type->kind != TY_ARRAY && s->expr->type->kind != TY_STREAM)
-            xs_error(s->expr->pos, "for...of iterates arrays, strings, streams, Map and Set", "cannot iterate over %s", ty_name(s->expr->type));
+            xs_error(XS8092, s->expr->pos, "for...of iterates arrays, strings, streams, Map and Set", "cannot iterate over %s", ty_name(s->expr->type));
         Type *elem = s->expr->type->elem;
         if (s->decl_type) {
             s->decl_type = resolve(s->decl_type, s->pos);
-            if (!ty_equal(s->decl_type, elem)) xs_error(s->pos, NULL, "the elements are %s, not %s", ty_name(elem), ty_name(s->decl_type));
+            if (!ty_equal(s->decl_type, elem)) xs_error(XS8133, s->pos, NULL, "the elements are %s, not %s", ty_name(elem), ty_name(s->decl_type));
         }
         s->type = elem;
         push_scope();
@@ -4925,12 +4973,12 @@ static void check_stmt(Stmt *s) {
     }
     case S_BREAK:
         if (!loop_depth && !switch_depth) {
-            xs_error(s->pos, NULL, "'break' outside of a loop or switch");
+            xs_error(XS8066, s->pos, NULL, "'break' outside of a loop or switch");
         }
         return;
     case S_CONTINUE:
         if (!loop_depth) {
-            xs_error(s->pos, NULL, "'continue' outside of a loop");
+            xs_error(XS8067, s->pos, NULL, "'continue' outside of a loop");
         }
         return;
     case S_SWITCH: {
@@ -4938,7 +4986,7 @@ static void check_stmt(Stmt *s) {
         settle(s->expr);
         Type *t = s->expr->type;
         if (!is_numeric(t) && t->kind != TY_STRING && t->kind != TY_BOOLEAN && t->kind != TY_ENUM)
-            xs_error(s->expr->pos, NULL, "switch works on int, number, string, boolean or enum, but this is %s", ty_name(t));
+            xs_error(XS8127, s->expr->pos, NULL, "switch works on int, number, string, boolean or enum, but this is %s", ty_name(t));
         for (int i = 0; i < s->ncases; i++) {
             Case *c = &s->cases[i];
             if (c->value) {
@@ -4960,7 +5008,7 @@ static void check_stmt(Stmt *s) {
                     keep[k] = fd && fd->type->tname && strcmp(fd->type->tname, c->value->str) == 0;
                 }
                 Type *t = union_subset(u, keep);
-                if (!t) xs_error(c->value->pos, NULL, "no member of %s has %s \"%s\"", ty_name(u), sx->str, c->value->str);
+                if (!t) xs_error(XS8114, c->value->pos, NULL, "no member of %s has %s \"%s\"", ty_name(u), sx->str, c->value->str);
                 check_block_union(c->body, sb, t);
             } else check_block(c->body);
         }
@@ -4969,23 +5017,23 @@ static void check_stmt(Stmt *s) {
     }
     case S_YIELD: {
         if (!cur_func || !cur_func->is_gen)
-            xs_error(s->pos, "make it a generator: function* name(): Generator<T> { ... }", "'yield' is used inside a generator");
-        if (finally_depth) xs_error(s->pos, NULL, "'yield' inside a try with finally is not supported yet");
+            xs_error(XS8070, s->pos, "make it a generator: function* name(): Generator<T> { ... }", "'yield' is used inside a generator");
+        if (finally_depth) xs_error(XS6011, s->pos, NULL, "'yield' inside a try with finally is not supported yet");
         Type *elem = cur_func->ret->elem;
         check_expr(s->expr, elem);
         expect_type(s->expr, elem, xs_sprintf("value yielded by '%s'", cur_func->name));
         return;
     }
     case S_RETURN:
-        if (!cur_func) xs_error(s->pos, NULL, "'return' outside of a function");
-        if (cur_func->is_gen && s->expr) xs_error(s->expr->pos, "yield it, then return;", "a generator returns no value");
+        if (!cur_func) xs_error(XS8068, s->pos, NULL, "'return' outside of a function");
+        if (cur_func->is_gen && s->expr) xs_error(XS8074, s->expr->pos, "yield it, then return;", "a generator returns no value");
         if (s->expr) {
             if (cur_func->ret->kind == TY_VOID)
-                xs_error(s->expr->pos, NULL, "'%s' is void and cannot return a value", cur_func->name);
+                xs_error(XS8057, s->expr->pos, NULL, "'%s' is void and cannot return a value", cur_func->name);
             check_expr(s->expr, cur_func->ret);
             expect_type(s->expr, cur_func->ret, xs_sprintf("return value of '%s'", cur_func->name));
         } else if (cur_func->ret->kind != TY_VOID && !cur_func->is_gen) {
-            xs_error(s->pos, NULL, "'%s' must return a value of type %s", cur_func->name, ty_name(cur_func->ret));
+            xs_error(XS8059, s->pos, NULL, "'%s' must return a value of type %s", cur_func->name, ty_name(cur_func->ret));
         }
         return;
     case S_BLOCK: check_block(s); return;
@@ -5433,19 +5481,19 @@ static void check_func(Func *f) {
     for (int i = 0; i < f->nparams; i++) {
         for (int j = 0; j < i; j++)
             if (strcmp(f->params[i].name, f->params[j].name) == 0)
-                xs_error(f->pos, NULL, "parameter '%s' is declared twice", f->params[i].name);
+                xs_error(XS9030, f->pos, NULL, "parameter '%s' is declared twice", f->params[i].name);
         Binding *pb = declare(f->pos, f->params[i].name, f->params[i].type, false, false, true);
         f->params[i].cname = pb->plain ? pb->plain : pb->cname;
         f->params[i].cell = pb->cell;
     }
     if (f->is_gen) {
-        if (f->ret->kind != TY_STREAM) xs_error(f->pos, "write the return type: function* f(): Generator<T>", "a generator returns Generator<T> (or Iterable<T>)");
+        if (f->ret->kind != TY_STREAM) xs_error(XS8073, f->pos, "write the return type: function* f(): Generator<T>", "a generator returns Generator<T> (or Iterable<T>)");
         prog->uses_gen = true; /* its body runs on a coroutine stack */
     }
     check_block(f->body);
     pop_scope();
     if (f->ret->kind != TY_VOID && !f->is_gen && !always_returns(f->body))
-        xs_error(f->pos, "add a return at the end of the function", "'%s' may reach its end without returning a %s", f->name, ty_name(f->ret));
+        xs_error(XS8058, f->pos, "add a return at the end of the function", "'%s' may reach its end without returning a %s", f->name, ty_name(f->ret));
     tmp_counter = saved_tmp;
     cur_func = NULL;
     cur_class = NULL;
@@ -5455,7 +5503,7 @@ static void check_func(Func *f) {
 /* the base's fields first (the same layout prefix), then the class's own; interfaces take their bases' fields */
 static void flatten_fields(Class *c, int depth) {
     if (c->flattened) return;
-    if (depth > 64) xs_error(c->pos, NULL, "'%s' extends itself", c->name);
+    if (depth > 64) xs_error(XS9001, c->pos, NULL, "'%s' extends itself", c->name);
     c->flattened = true;
     Class **bases = NULL;
     int nb = 0;
@@ -5466,7 +5514,7 @@ static void flatten_fields(Class *c, int depth) {
         ib = xs_alloc(sizeof(Class *) * (size_t)c->niface_bases);
         for (int i = 0; i < c->niface_bases; i++) {
             Class *b = find_class(c->iface_bases[i]);
-            if (!b || !b->is_interface) xs_error(c->pos, NULL, "'%s' is not an interface %s can extend", c->iface_bases[i], c->name);
+            if (!b || !b->is_interface) xs_error(XS9011, c->pos, NULL, "'%s' is not an interface %s can extend", c->iface_bases[i], c->name);
             ib[i] = b;
         }
         bases = ib;
@@ -5476,7 +5524,7 @@ static void flatten_fields(Class *c, int depth) {
     int total = 0;
     for (int i = 0; i < nb; i++) {
         c->flattened = false; /* a cycle comes back here */
-        if (bases[i] == c || is_subclass(bases[i], c)) xs_error(c->pos, NULL, "'%s' extends itself", c->name);
+        if (bases[i] == c || is_subclass(bases[i], c)) xs_error(XS9001, c->pos, NULL, "'%s' extends itself", c->name);
         flatten_fields(bases[i], depth + 1);
         c->flattened = true;
         total += bases[i]->nfields;
@@ -5486,14 +5534,14 @@ static void flatten_fields(Class *c, int depth) {
     for (int i = 0; i < nb; i++)
         for (int k = 0; k < bases[i]->nfields; k++) {
             for (int j = 0; j < n; j++)
-                if (strcmp(all[j].name, bases[i]->fields[k].name) == 0) xs_error(c->pos, NULL, "field '%s' comes from two interfaces", all[j].name);
+                if (strcmp(all[j].name, bases[i]->fields[k].name) == 0) xs_error(XS9021, c->pos, NULL, "field '%s' comes from two interfaces", all[j].name);
             all[n++] = bases[i]->fields[k];
         }
     int inherited = n;
     for (int k = 0; k < c->nfields; k++) {
         for (int j = 0; j < inherited; j++)
             if (strcmp(all[j].name, c->fields[k].name) == 0)
-                xs_error(c->fields[k].pos, "a subclass keeps the base's fields: assign it in the constructor instead", "field '%s' is already declared in %s", c->fields[k].name, nb == 1 ? bases[0]->name : "a base");
+                xs_error(XS9022, c->fields[k].pos, "a subclass keeps the base's fields: assign it in the constructor instead", "field '%s' is already declared in %s", c->fields[k].name, nb == 1 ? bases[0]->name : "a base");
         all[n++] = c->fields[k];
     }
     c->fields = all;
@@ -5525,9 +5573,9 @@ static void flatten_methods(Class *c) {
             buf_puts(&sig, "(");
             for (int k = 0; k < bm->nparams; k++) buf_printf(&sig, "%s%s: %s", k ? ", " : "", bm->params[k].name, ty_name(bm->params[k].type));
             buf_printf(&sig, "): %s", ty_name(bm->ret));
-            xs_error(own->pos, xs_sprintf("keep the signature of %s.%s%s", b->name, bm->name, sig.data), "'%s' overrides %s.%s with another signature", own->name, b->name, bm->name);
+            xs_error(XS8061, own->pos, xs_sprintf("keep the signature of %s.%s%s", b->name, bm->name, sig.data), "'%s' overrides %s.%s with another signature", own->name, b->name, bm->name);
         }
-        if (find_field(b, own->name, NULL)) xs_error(own->pos, NULL, "'%s' is a field of %s", own->name, b->name);
+        if (find_field(b, own->name, NULL)) xs_error(XS8047, own->pos, NULL, "'%s' is a field of %s", own->name, b->name);
         /* every method it overrides, at every level up, learns about it */
         for (Class *up = b; up; up = up->base) {
             Func *m = NULL;
@@ -5540,7 +5588,7 @@ static void flatten_methods(Class *c) {
     if (!c->is_abstract)
         for (int k = 0; k < c->nmethods; k++)
             if (c->methods[k]->is_abstract)
-                xs_error(c->pos, xs_sprintf("implement %s(...) in %s, or declare %s abstract", c->methods[k]->name, c->name, c->name),
+                xs_error(XS8007, c->pos, xs_sprintf("implement %s(...) in %s, or declare %s abstract", c->methods[k]->name, c->name, c->name),
                          "%s does not implement the abstract method %s.%s", c->name, c->methods[k]->cls->name, c->methods[k]->name);
 }
 
@@ -5560,7 +5608,7 @@ static void check_field_init(Class *c) {
         }
         if (!assigned && !eff_ctor(c)) { c->data_only = true; continue; } /* a DTO: JSON fills it; `new` is refused */
         if (!assigned)
-            xs_error(fd->pos, "give it an initializer, or assign this.%s in the constructor", "field '%s' of %s is never initialized", fd->name, c->name);
+            xs_error(XS9025, fd->pos, "give it an initializer, or assign this.%s in the constructor", "field '%s' of %s is never initialized", fd->name, c->name);
     }
 }
 
@@ -5599,11 +5647,11 @@ static void check_class_bodies(Class *c) {
                 StmtList *l = &c->ctor->body->stmts;
                 Stmt *s0 = l->len ? l->items[0] : NULL;
                 if (!s0 || s0->kind != S_EXPR || s0->expr->kind != E_CALL || !s0->expr->lhs || s0->expr->lhs->kind != E_IDENT || strcmp(s0->expr->lhs->str, "super") != 0)
-                    xs_error(s0 ? s0->pos : c->ctor->pos, xs_sprintf("start the constructor with super(...): %s extends %s", c->name, c->base->name),
+                    xs_error(XS8131, s0 ? s0->pos : c->ctor->pos, xs_sprintf("start the constructor with super(...): %s extends %s", c->name, c->base->name),
                              "the constructor of %s must call super(...) first", c->name);
             }
             check_func(c->ctor);
-            if (c->base && super_calls != 1) xs_error(c->ctor->pos, NULL, "super(...) is called once, as the first statement of the constructor");
+            if (c->base && super_calls != 1) xs_error(XS8126, c->ctor->pos, NULL, "super(...) is called once, as the first statement of the constructor");
         RECOVER_END
     }
     RECOVER_BEGIN check_field_init(c); RECOVER_END
@@ -5626,20 +5674,20 @@ void check_program(Program *p) {
         Enum *en = p->enums[i];
         enter_module(en->mod);
         for (int j = 0; j < i; j++)
-            if (p->enums[j]->mod == en->mod && strcmp(en->name, p->enums[j]->name) == 0) xs_error(en->pos, NULL, "enum '%s' is declared twice", en->name);
+            if (p->enums[j]->mod == en->mod && strcmp(en->name, p->enums[j]->name) == 0) xs_error(XS9018, en->pos, NULL, "enum '%s' is declared twice", en->name);
         for (int j = 0; j < p->nclasses; j++)
-            if (p->classes[j]->mod == en->mod && strcmp(p->classes[j]->name, en->name) == 0) xs_error(en->pos, NULL, "'%s' is both an enum and a class", en->name);
+            if (p->classes[j]->mod == en->mod && strcmp(p->classes[j]->name, en->name) == 0) xs_error(XS9008, en->pos, NULL, "'%s' is both an enum and a class", en->name);
     }
     for (int i = 0; i < p->nclasses; i++) {
         Class *c = p->classes[i];
         enter_module(c->mod);
         for (int j = 0; j < i; j++)
-            if (p->classes[j]->mod == c->mod && strcmp(c->name, p->classes[j]->name) == 0) xs_error(c->pos, NULL, "class '%s' is declared twice", c->name);
+            if (p->classes[j]->mod == c->mod && strcmp(c->name, p->classes[j]->name) == 0) xs_error(XS9015, c->pos, NULL, "class '%s' is declared twice", c->name);
         for (int j = 0; j < nbuiltins; j++)
             if (strcmp(c->name, builtins[j]->name) == 0 && !((strcmp(c->name, "Worker") == 0 || strcmp(c->name, "MessagePort") == 0) && !wt_imports(c->mod, c->name)))
-                xs_error(c->pos, NULL, "'%s' is a built-in class", c->name);
+                xs_error(XS9002, c->pos, NULL, "'%s' is a built-in class", c->name);
         SYM_EACH(funcs_by_name, c->name, e)
-            if (((Func *)e->decl)->mod == c->mod) xs_error(c->pos, NULL, "'%s' is both a class and a function", c->name);
+            if (((Func *)e->decl)->mod == c->mod) xs_error(XS9006, c->pos, NULL, "'%s' is both a class and a function", c->name);
         if (!c->builtin) c->cname = xs_sprintf("c%d_%s", c->mod->id, c->name); /* declared (native) classes keep their C name */
     }
     for (int i = 0; i < p->nfuncs; i++) {
@@ -5647,8 +5695,8 @@ void check_program(Program *p) {
         if (f->mod->builtin) continue;
         enter_module(f->mod);
         SYM_EACH(funcs_by_name, f->name, e)
-            if (e->decl != f && ((Func *)e->decl)->mod == f->mod) xs_error(f->pos, NULL, "function '%s' is declared twice", f->name);
-        if (find_class(f->name) || find_enum(f->name)) xs_error(f->pos, NULL, "'%s' is built in and cannot be redeclared", f->name); /* a function may shadow lines, fetch... */
+            if (e->decl != f && ((Func *)e->decl)->mod == f->mod) xs_error(XS9026, f->pos, NULL, "function '%s' is declared twice", f->name);
+        if (find_class(f->name) || find_enum(f->name)) xs_error(XS9009, f->pos, NULL, "'%s' is built in and cannot be redeclared", f->name); /* a function may shadow lines, fetch... */
         if (!f->is_native) f->cname = xs_sprintf("f%d_%s", f->mod->id, f->name);
     }
     /* imports must name exported functions, classes or variables of the source module */
@@ -5656,6 +5704,13 @@ void check_program(Program *p) {
         Module *m = p->modules[mi];
         for (int i = 0; i < m->nimports; i++) {
             Import *im = &m->imports[i];
+            if (im->from->missing) { /* reported where it was imported */
+                for (int k = 0; k < im->n; k++) {
+                    missing_names = realloc(missing_names, sizeof(char *) * (size_t)(nmissing_names + 1));
+                    missing_names[nmissing_names++] = im->names[k];
+                }
+                continue;
+            }
             for (int k = 0; k < im->n; k++) {
                 const char *name = im->names[k];
                 bool found = false;
@@ -5670,15 +5725,24 @@ void check_program(Program *p) {
                 if (found && im->is_default) { /* import x from "m": x must be m's default export */
                     bool ok = false;
                     SYM_EACH(funcs_by_name, name, e) if (((Func *)e->decl)->mod == im->from && ((Func *)e->decl)->is_default) ok = true;
-                    if (!ok) { enter_module(m); xs_error(im->positions[k], "import it by name: import { x } from \"m\"", "'%s' is not the default export of '%s'", name, im->path); }
+                    if (!ok) { enter_module(m); xs_error(XS9013, im->positions[k], "import it by name: import { x } from \"m\"", "'%s' is not the default export of '%s'", name, im->path); }
                 }
                 for (int j = 0; j < p->top.len && !found; j++) {
                     Stmt *st = p->top.items[j];
                     if (st->kind == S_VAR && st->mod == im->from && strcmp(st->name, name) == 0) found = st->exported;
                 }
+                if (!found) { /* re-exported by im->from (export { name } from, export * from) */
+                    int r = reexports_name(p, im->from, name, 0);
+                    if (r == 2) { /* from a module that could not be loaded: reported there */
+                        missing_names = realloc(missing_names, sizeof(char *) * (size_t)(nmissing_names + 1));
+                        missing_names[nmissing_names++] = (char *)name;
+                        continue;
+                    }
+                    found = r == 1;
+                }
                 if (!found) {
                     enter_module(m);
-                    xs_error(im->positions[k], xs_sprintf("add 'export' in front of its declaration in %s", im->from->file), "'%s' is not exported by '%s'", name, im->path);
+                    xs_error(XS9012, im->positions[k], xs_sprintf("add 'export' in front of its declaration in %s", im->from->file), "'%s' is not exported by '%s'", name, im->path);
                 }
             }
         }
@@ -5696,10 +5760,11 @@ void check_program(Program *p) {
             Class *b = find_class(c->base_name);
             if (!b) {
                 int n; const char **cands = class_names(&n);
-                xs_error(c->base_pos, xs_help_suggest(c->base_name, cands, n, NULL), "unknown class '%s'", c->base_name);
+                if (missing_name(c->base_name)) xs_error_quiet();
+                xs_error(XS9031, c->base_pos, xs_help_suggest(c->base_name, cands, n, NULL), "unknown class '%s'", c->base_name);
             }
-            if (b->is_interface) xs_error(c->base_pos, xs_sprintf("class %s implements %s", c->name, b->name), "'%s' is an interface; a class extends classes", b->name);
-            if (b->builtin) xs_error(c->base_pos, "wrap it in a field instead", "extending the built-in class %s is not supported", b->name);
+            if (b->is_interface) xs_error(XS9004, c->base_pos, xs_sprintf("class %s implements %s", c->name, b->name), "'%s' is an interface; a class extends classes", b->name);
+            if (b->builtin) xs_error(XS6024, c->base_pos, "wrap it in a field instead", "extending the built-in class %s is not supported", b->name);
             c->base = b;
             b->subs = realloc(b->subs, sizeof(Class *) * (size_t)(b->nsubs + 1));
             b->subs[b->nsubs++] = c;
@@ -5716,7 +5781,7 @@ void check_program(Program *p) {
         for (int k = 0; k < c->nfields; k++) {
             Field *fd = &c->fields[k];
             for (int j = 0; j < k; j++)
-                if (strcmp(fd->name, c->fields[j].name) == 0) xs_error(fd->pos, NULL, "field '%s' is declared twice", fd->name);
+                if (strcmp(fd->name, c->fields[j].name) == 0) xs_error(XS9023, fd->pos, NULL, "field '%s' is declared twice", fd->name);
             fd->type = resolve(fd->type, fd->pos);
             check_type_supported(fd->pos, fd->type);
             fd->cname = xs_sprintf("f_%s", fd->name);
@@ -5724,8 +5789,8 @@ void check_program(Program *p) {
         for (int k = 0; k < c->nmethods; k++) {
             Func *m = c->methods[k];
             for (int j = 0; j < k; j++)
-                if (strcmp(m->name, c->methods[j]->name) == 0) xs_error(m->pos, NULL, "method '%s' is declared twice", m->name);
-            if (find_field(c, m->name, NULL)) xs_error(m->pos, NULL, "'%s' is both a field and a method of %s", m->name, c->name);
+                if (strcmp(m->name, c->methods[j]->name) == 0) xs_error(XS9027, m->pos, NULL, "method '%s' is declared twice", m->name);
+            if (find_field(c, m->name, NULL)) xs_error(XS9007, m->pos, NULL, "'%s' is both a field and a method of %s", m->name, c->name);
             if (!m->is_native) m->cname = xs_sprintf("m%d_%s_%s", c->mod->id, c->name, m->name);
             if (!m->ntparams) resolve_signature(m);
         }
@@ -5745,6 +5810,19 @@ void check_program(Program *p) {
             Import *im = &m->imports[i];
             for (int k = 0; k < im->n; k++) {
                 Scope *src = mod_scopes[im->from->id];
+                { /* a name the module only re-exports with export * from "m": the scope of the module that has it */
+                    Module *via = im->from;
+                    for (int depth = 0; depth < 32 && via; depth++) {
+                        bool has = false;
+                        for (Binding *b = mod_scopes[via->id]->head; b && !has; b = b->next) has = strcmp(b->name, im->names[k]) == 0;
+                        if (has) { src = mod_scopes[via->id]; break; }
+                        Module *next_via = NULL;
+                        for (int q = 0; q < via->nimports && !next_via; q++)
+                            if (via->imports[q].star && via->imports[q].from && !via->imports[q].from->missing && reexports_or_has(via->imports[q].from, im->names[k]))
+                                next_via = via->imports[q].from;
+                        via = next_via;
+                    }
+                }
                 size_t nl = strlen(im->names[k]);
                 for (Binding *b = src->head; b; b = b->next) {
                     bool is_static = strncmp(b->name, im->names[k], nl) == 0 && strncmp(b->name + nl, "__s_", 4) == 0; /* Class.static */
@@ -5809,4 +5887,43 @@ void check_program(Program *p) {
         if (!xs_json_errors) fprintf(stderr, "xisto: %d error%s\n", xs_error_count, xs_error_count == 1 ? "" : "s");
         exit(1);
     }
+}
+
+/* 1: module `via` re-exports `name` (export { name } from "m", export * from "m"), declared and exported where it comes
+   from; 2: through a module that could not be loaded (xisto check); 0: not */
+static int reexports_name(Program *p, Module *via, const char *name, int depth) {
+    if (!via || depth > 32) return 0;
+    for (int i = 0; i < via->nimports; i++) {
+        Import *im = &via->imports[i];
+        if (!im->reexport || !im->from) continue;
+        bool listed = im->star;
+        for (int k = 0; k < im->n && !listed; k++) listed = strcmp(im->names[k], name) == 0;
+        if (!listed) continue;
+        if (im->from->missing) return 2;
+        Module *m = im->from;
+        bool here = false;
+        SYM_EACH(funcs_by_name, name, e) if (((Func *)e->decl)->mod == m && ((Func *)e->decl)->exported) here = true;
+        SYM_EACH(classes_by_name, name, e) if (((Class *)e->decl)->mod == m && ((Class *)e->decl)->exported) here = true;
+        SYM_EACH(enums_by_name, name, e) if (((Enum *)e->decl)->mod == m && ((Enum *)e->decl)->exported) here = true;
+        for (int j = 0; j < p->top.len && !here; j++) {
+            Stmt *st = p->top.items[j];
+            if (st->kind == S_VAR && st->mod == m && st->name && strcmp(st->name, name) == 0 && st->exported) here = true;
+        }
+        if (here) return 1;
+        int r = reexports_name(p, m, name, depth + 1);
+        if (r) return r;
+    }
+    return 0;
+}
+
+/* module m's scope has `name`, or a module it re-exports with export * from does (at any depth) */
+static bool reexports_or_has(Module *m, const char *name) {
+    for (int depth = 0; depth < 32 && m; depth++) {
+        for (Binding *b = mod_scopes[m->id]->head; b; b = b->next) if (strcmp(b->name, name) == 0) return true;
+        Module *next = NULL;
+        for (int q = 0; q < m->nimports && !next; q++)
+            if (m->imports[q].star && m->imports[q].from && !m->imports[q].from->missing && reexports_or_has(m->imports[q].from, name)) next = m->imports[q].from;
+        m = next;
+    }
+    return false;
 }

@@ -117,9 +117,39 @@ static const char *source_line(Pos pos) {
 jmp_buf *xs_error_recover; /* set by the checker: an error is reported and checking continues elsewhere */
 int xs_error_count;
 
-static void report(const char *severity, Pos pos, const char *help, const char *msg) {
+static const struct { const char *name; DiagCat cat; } diag_table[] = {
+    {"", DC_INTERNAL},
+#define DIAG(code, cat, msg) {#code, cat},
+#include "diag.def"
+#undef DIAG
+};
+const char *xs_diag_name(DiagCode c) { return c > 0 && c < XS_DIAG_COUNT ? diag_table[c].name : ""; }
+DiagCat xs_diag_cat(DiagCode c) { return c > 0 && c < XS_DIAG_COUNT ? diag_table[c].cat : DC_INTERNAL; }
+static const struct { const char *id, *title, *fix; } cat_table[DC_COUNT] = {
+    [DC_SYNTAX] = {"syntax", "syntax xisto does not read", "manual"},
+    [DC_DYNAMIC] = {"dynamic", "dynamic value (any, undefined, maybe null)", "manual"},
+    [DC_MISSING_TYPE] = {"missing-type", "missing type annotation", "manual"},
+    [DC_NODE_IMPORT] = {"node-import", "Node module import (node:x -> xisto:x)", "automatic"},
+    [DC_MODULE] = {"module", "module or package not available", "package"},
+    [DC_UNSUPPORTED] = {"unsupported", "TypeScript feature not supported", "manual"},
+    [DC_RUNTIME_API] = {"runtime-api", "built-in API missing or used differently", "manual"},
+    [DC_TYPE_RULE] = {"type-rule", "type error under xisto's rules", "manual"},
+    [DC_DECLARATION] = {"declaration", "unknown, duplicate or unexported name", "manual"},
+    [DC_INTERNAL] = {"internal", "internal compiler error", "report"},
+    [DC_SEMANTIC] = {"semantic", "may behave differently from Node", "review"},
+};
+const char *xs_diag_cat_title(DiagCat c) { return c < DC_COUNT ? cat_table[c].title : ""; }
+const char *xs_diag_cat_fix(DiagCat c) { return c < DC_COUNT ? cat_table[c].fix : ""; }
+const char *xs_diag_cat_id(DiagCat c) { return c < DC_COUNT ? cat_table[c].id : ""; }
+bool xs_check_mode;
+bool xs_lex_skipping;
+int xs_quiet_count;
+
+static void report(DiagCode code, const char *severity, Pos pos, const char *help, const char *msg) {
     if (xs_json_errors) {
-        fprintf(stderr, "{\"severity\":\"%s\",\"file\":", severity); json_str(stderr, xs_file_name);
+        fprintf(stderr, "{\"severity\":\"%s\",", severity);
+        if (code) { fputs("\"code\":", stderr); json_str(stderr, xs_diag_name(code)); fputs(",\"category\":", stderr); json_str(stderr, xs_diag_cat_id(xs_diag_cat(code))); fputc(',', stderr); }
+        fputs("\"file\":", stderr); json_str(stderr, xs_file_name);
         fprintf(stderr, ",\"line\":%d,\"col\":%d,\"message\":", pos.line, pos.col); json_str(stderr, msg);
         fputs(",\"help\":", stderr);
         if (help) json_str(stderr, help); else fputs("null", stderr);
@@ -127,7 +157,8 @@ static void report(const char *severity, Pos pos, const char *help, const char *
         fputs("}\n", stderr);
         return;
     }
-    fprintf(stderr, "%s:%d:%d: %s: %s\n", xs_file_name, pos.line, pos.col, severity, msg);
+    if (code) fprintf(stderr, "%s:%d:%d: %s[%s]: %s\n", xs_file_name, pos.line, pos.col, severity, xs_diag_name(code), msg);
+    else fprintf(stderr, "%s:%d:%d: %s: %s\n", xs_file_name, pos.line, pos.col, severity, msg);
     print_source_line(pos);
     if (help) fprintf(stderr, "  help: %s\n", help);
 }
@@ -142,20 +173,30 @@ static char *vformat(const char *fmt, va_list ap) {
     return msg;
 }
 
-void xs_error(Pos pos, const char *help, const char *fmt, ...) {
+void xs_error(DiagCode code, Pos pos, const char *help, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     char *msg = vformat(fmt, ap);
     va_end(ap);
-    report("error", pos, help, msg);
+    report(code, "error", pos, help, msg);
     xs_error_count++;
-    if (xs_error_recover && xs_error_count < 20) _longjmp(*xs_error_recover, 1);
+    if (xs_error_recover && (xs_error_count < 20 || xs_check_mode)) _longjmp(*xs_error_recover, 1);
     if (xs_error_recover && !xs_json_errors) fprintf(stderr, "xisto: stopping after %d errors\n", xs_error_count);
     exit(1);
 }
 
+void xs_error_continue(DiagCode code, Pos pos, const char *help, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    char *msg = vformat(fmt, ap);
+    va_end(ap);
+    report(code, "error", pos, help, msg);
+    xs_error_count++;
+}
+
 /* stops checking the current statement for an error already reported (a use of a failed declaration) */
 void xs_error_quiet(void) {
+    xs_quiet_count++;
     if (xs_error_recover) _longjmp(*xs_error_recover, 1);
     exit(1);
 }
@@ -171,7 +212,7 @@ void xs_warn(Pos pos, const char *help, const char *fmt, ...) {
     va_start(ap, fmt);
     char *msg = vformat(fmt, ap);
     va_end(ap);
-    report("warning", pos, help, msg);
+    report(XS0000, "warning", pos, help, msg);
     xs_warning_count++;
 }
 

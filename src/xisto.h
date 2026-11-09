@@ -37,8 +37,42 @@ extern const char *xs_file_name;
 extern const char *xs_source;
 
 #include <setjmp.h>
-void xs_error(Pos pos, const char *help, const char *fmt, ...);
+/* Diagnostics: every error has a stable code from src/diag.def (XS1001...) and a category; `xisto check` counts
+   what a program needs, by category. The category says what kind of change it asks for. */
+typedef enum {
+    DC_SYNTAX,       /* the text does not parse as the TypeScript xisto reads */
+    DC_DYNAMIC,      /* any, undefined, a value that may be null where xisto needs one type */
+    DC_MISSING_TYPE, /* a type the code has to write: a parameter, a return, an empty array */
+    DC_NODE_IMPORT,  /* node:fs and friends: imported as xisto:fs */
+    DC_MODULE,       /* a module or package that cannot be found or installed */
+    DC_UNSUPPORTED,  /* a TypeScript feature xisto does not have (yet) */
+    DC_RUNTIME_API,  /* a built-in (Date, Buffer, string...) used in a way xisto does not provide */
+    DC_TYPE_RULE,    /* a type error under xisto's rules (int and number, one static type per value) */
+    DC_DECLARATION,  /* an unknown, duplicate or unexported name */
+    DC_INTERNAL,     /* a compiler bug */
+    DC_SEMANTIC,     /* compiles, but may give another result than Node: to review (warnings) */
+    DC_COUNT
+} DiagCat;
+typedef enum {
+    XS0000, /* no code */
+#define DIAG(code, cat, msg) code,
+#include "diag.def"
+#undef DIAG
+    XS_DIAG_COUNT
+} DiagCode;
+const char *xs_diag_name(DiagCode c); /* "XS3014" */
+DiagCat xs_diag_cat(DiagCode c);
+const char *xs_diag_cat_title(DiagCat c);  /* "missing type annotation" */
+const char *xs_diag_cat_fix(DiagCat c);    /* "manual", "automatic", "package", "review", "report" */
+const char *xs_diag_cat_id(DiagCat c);     /* "missing-type" */
+void xs_error(DiagCode code, Pos pos, const char *help, const char *fmt, ...);
 void xs_error_quiet(void); /* back to the recovery point without a message: the error was reported */
+bool xs_node_core_name(const char *spec);                  /* "path", "fs/promises": a Node module without "node:" */
+char *xs_tsconfig_resolve(const char *from_file, const char *spec); /* a tsconfig "paths" name: its file or folder, or NULL */
+extern bool xs_lex_skipping; /* xisto check: the parser is skipping a declaration that did not parse (no lexer errors there) */
+extern bool xs_check_mode; /* xisto check: report every error (no limit of 20) and keep going where possible */
+extern int xs_quiet_count;   /* follow-on errors kept quiet (a use of a declaration that failed) */
+void xs_error_continue(DiagCode code, Pos pos, const char *help, const char *fmt, ...); /* report, count, go on */
 void xs_warn(Pos pos, const char *help, const char *fmt, ...);
 extern jmp_buf *xs_error_recover; /* when set, xs_error longjmps here instead of exiting (up to 20 errors) */
 extern int xs_error_count;
@@ -505,6 +539,8 @@ typedef struct {
     char *path;        /* as written */
     Module *from;      /* resolved */
     Pos pos;
+    bool reexport;     /* export { a, b } from "m" / export * from "m": the names are this module's exports too */
+    bool star;         /* export * from "m": every name m exports (names is empty) */
 } Import;
 
 struct Module {
@@ -514,8 +550,11 @@ struct Module {
     char *src;
     Import *imports;
     int nimports;
+    char **local_exports; /* export { a, b }; (no "from"): names declared here, exported by a list */
+    int nlocal_exports;
     bool loading, loaded;
     bool builtin;      /* "node:fs" and friends: functions provided by the runtime */
+    bool missing;      /* xisto check: a module that could not be loaded (reported); its imported names are not reported again */
     char *native_prefix; /* package modules: C names of `declare` functions and classes start with this ("xn_pg_") */
 };
 

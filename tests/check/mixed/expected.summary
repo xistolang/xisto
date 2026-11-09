@@ -1,0 +1,19 @@
+xisto check: 2 files, 9 changes needed in 2 files
+
+  kind of change                                 changes  files  fix
+  syntax xisto does not read                           2      1  manual
+  dynamic value (any, undefined, maybe null)           2      2  manual
+  missing type annotation                              1      1  manual
+  Node module import (node:x -> xisto:x)               1      1  automatic
+  module or package not available                      1      1  package
+  type error under xisto's rules                       2      2  manual
+  (3 follow-on errors of these hidden)
+
+  most changes:
+        7  main.ts
+        2  lib/helper.ts
+
+  packages:
+    @acme/missing                    not installed            1 file  (xisto add <git url> --name @acme/missing)
+
+  xisto check --details lists every place to change.

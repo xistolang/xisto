@@ -1,0 +1,57 @@
+lib/helper.ts (2)
+  2:16  XS8018  right operand of string concatenation must be string, but this is number
+       2 |   return "x" + n;
+         |                ^
+    help: convert explicitly: String(x)
+  4:15  XS2005  'undefined' does not exist
+       4 | let nothing = undefined;
+         |               ^
+    help: every value in xisto has a concrete type; there is no 'undefined' or 'null'
+
+main.ts (7)
+  2:1  XS4001  'node:fs' is xisto's implementation of a Node module, not Node itself
+       2 | import { readFileSync } from "node:fs";
+         | ^
+    help: import it as "xisto:fs"
+  3:1  XS5003  cannot resolve '@acme/missing'
+       3 | import { Injectable } from "@acme/missing";
+         | ^
+    help: import files with a relative path ("./file"), or add the package: xisto add <git url> --name @acme/missing
+  6:17  XS3013  parameter 'x' has no type
+       6 | function twice(x) { return x * 2; }
+         |                 ^
+    help: parameters need an explicit type: (n: number)
+  7:14  XS2007  'any' is not supported
+       7 | const loose: any = 1;
+         |              ^
+    help: every value in xisto has one static type
+  15:3  XS1008  expected identifier but found 'return'
+      15 |   return 1;
+         |   ^
+    help: a field name
+  18:16  XS8018  initializer of 'n' (declared as int) must be int, but this is number
+      18 | const n: int = 3.5;
+         |                ^
+    help: convert explicitly: Math.trunc(x), Math.floor(x), Math.ceil(x) or Math.round(x)
+  19:6  XS1009  expected ';' but found ':'
+      19 | label: for (let i = 0; i < 2; i++) break label;
+         |      ^
+    help: xisto requires explicit semicolons; automatic semicolon insertion is not supported
+
+xisto check: 2 files, 9 changes needed in 2 files
+
+  kind of change                                 changes  files  fix
+  syntax xisto does not read                           2      1  manual
+  dynamic value (any, undefined, maybe null)           2      2  manual
+  missing type annotation                              1      1  manual
+  Node module import (node:x -> xisto:x)               1      1  automatic
+  module or package not available                      1      1  package
+  type error under xisto's rules                       2      2  manual
+  (3 follow-on errors of these hidden)
+
+  most changes:
+        7  main.ts
+        2  lib/helper.ts
+
+  packages:
+    @acme/missing                    not installed            1 file  (xisto add <git url> --name @acme/missing)

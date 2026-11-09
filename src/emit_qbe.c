@@ -99,7 +99,7 @@ static void qtrack(const char *name, Type *t) {
 }
 
 static void unsupported(Pos pos, const char *what) {
-    xs_error(pos, "build without --backend=qbe to use the C path", "%s is not supported by the qbe backend yet", what);
+    xs_error(XS6001, pos, "build without --backend=qbe to use the C path", "%s is not supported by the qbe backend yet", what);
 }
 
 /* QBE base type letter for a xisto type */
