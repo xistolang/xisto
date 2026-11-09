@@ -1,0 +1,13 @@
+steal before 4935556
+# Linux x86_64, 2 cpu; median of 9
+binarytrees    xisto  binarytrees             1.854s     3.41cpu    258.8MB  par  1.8  same
+binarytrees    xisto  binarytrees-2           1.860s     3.48cpu    240.1MB  par  1.9  same
+binarytrees    xisto  binarytrees-3           1.749s     3.34cpu    229.1MB  par  1.9  same
+binarytrees    xisto  binarytrees-4           3.524s     3.52cpu    227.0MB  par  1.0  same
+knucleotide    xisto  knucleotide             1.393s     2.65cpu    364.2MB  par  1.9  same
+knucleotide    xisto  knucleotide-2           4.167s     7.16cpu    367.6MB  par  1.7  same
+knucleotide    xisto  knucleotide-3           3.555s     6.74cpu    364.0MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           2.481s     4.39cpu    156.9MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           2.065s     3.97cpu    157.9MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           1.321s     2.49cpu    156.9MB  par  1.9  same
+steal after 4935599
