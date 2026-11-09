@@ -96,6 +96,7 @@ static char *lit_cname(int id) {
 static char *lit_nm(int id) { return lit_cname(lit_ref(id)); }
 /* cur_func: function being emitted (NULL for main), declared with the debugger hooks above */
 static bool in_ctor;
+static bool ctor_cln; /* the constructor registered self on the cleanup stack: its returns take it off */
 static bool in_init;   /* emitting Class_init (inheritance): a return leaves without a value */
 static Class *inits_after_super; /* the class whose own field initializers follow its super(...) */
 static void emit_own_field_inits(Class *c);
@@ -6562,7 +6563,7 @@ static void emit_stmt_(Stmt *s) {
         drain_if_needed();
         emit_prof_leave();
         nl();
-        if (in_ctor) buf_puts(out, in_init ? "return;" : "return self;");
+        if (in_ctor) buf_puts(out, in_init ? "return;" : ctor_cln ? "xs_cln_n--; return self;" : "return self;");
         else if (s->expr) buf_puts(out, "return ret_;");
         else buf_puts(out, "return;");
         indent--;
@@ -7668,9 +7669,10 @@ static void emit_hier_ctor(Class *c) {
     buf_printf(out, "XS_FN %s *%s_new(", c->cname, c->cname);
     for (int i = 0; ec && i < ec->nparams; i++) { if (i) buf_puts(out, ", "); emit_decl(ec->params[i].type, ec->params[i].cname); }
     if (!ec || !ec->nparams) buf_puts(out, "void");
-    buf_printf(out, ") {\n    %s *self = xs_obj_alloc_t(sizeof(%s), &%s_type);\n    %s_init(self", c->cname, c->cname, c->cname, c->cname);
+    buf_printf(out, ") {\n    %s *self = xs_obj_alloc_t(sizeof(%s), &%s_type);%s\n    %s_init(self", c->cname, c->cname, c->cname,
+               use_cln ? " xs_cln_push((void **)&self); /* (an exception in a constructor releases self and its fields) */" : "", c->cname);
     for (int i = 0; ec && i < ec->nparams; i++) buf_printf(out, ", %s", ec->params[i].cname);
-    buf_puts(out, ");\n    return self;\n}\n");
+    buf_puts(out, use_cln ? ");\n    xs_cln_n--;\n    return self;\n}\n" : ");\n    return self;\n}\n");
 }
 
 /* ---- which types can be part of a reference cycle ----
@@ -8055,7 +8057,10 @@ static void emit_class(Class *c) {
     if (c->stack_at) buf_puts(out, "/* self: cleared, counted, typed */");
     else { /* nz: the constructor writes every field before anything reads one, so the memory is not cleared first */
         mark_init_stores(c, ctor);
-        const char *nz = ctor_sets_every_field(c) ? "_nz" : "";
+        /* a program that can catch: an exception in the constructor must release self and the fields set so far,
+           so self is cleared (no field left to chance) and registered on the cleanup stack */
+        bool cln_self = use_cln && !c->nohdr && !c->region && !c->rdual;
+        const char *nz = ctor_sets_every_field(c) && !cln_self ? "_nz" : "";
         if (c->nohdr && c->region) buf_printf(out, "%s *self = xs_region_alloc_nh(&xs_rg_%d, sizeof(%s));", c->cname, c->region, c->cname);
         else if (c->nohdr) buf_printf(out, "%s *self = xs_rg_on_%d ? xs_region_alloc_nh(&xs_rg_%d, sizeof(%s)) : xs_nh_heap(sizeof(%s));", c->cname, c->rdual, c->rdual, c->cname, c->cname);
         else if (c->region) buf_printf(out, "%s *self = xs_region_alloc%s(&xs_rg_%d, sizeof(%s), &%s_type);", c->cname, nz, c->region, c->cname, c->cname);
@@ -8063,6 +8068,7 @@ static void emit_class(Class *c) {
             buf_printf(out, "%s *self = xs_rg_on_%d ? xs_region_alloc_dual%s(&xs_rg_%d, sizeof(%s), &%s_type) : xs_obj_alloc_t%s(sizeof(%s), &%s_type);",
                        c->cname, c->rdual, nz, c->rdual, c->cname, c->cname, nz, c->cname, c->cname);
         else buf_printf(out, "%s *self = xs_obj_alloc_t%s(sizeof(%s), &%s_type);", c->cname, nz, c->cname, c->cname);
+        if (cln_self) { buf_puts(out, " xs_cln_push((void **)&self);"); ctor_cln = true; }
     }
     for (int i = 0; i < c->nfields; i++) /* nullable primitives start as their null sentinel, not 0 */
         if (!c->fields[i].init && null_prim(c->fields[i].type)) { nl(); buf_printf(out, "self->%s = %s;", c->fields[i].cname, null_value(c->fields[i].type)); }
@@ -8096,7 +8102,8 @@ static void emit_class(Class *c) {
         cur_func = NULL;
     }
     nl();
-    buf_puts(out, "return self;");
+    buf_puts(out, ctor_cln ? "xs_cln_n--; return self;" : "return self;");
+    ctor_cln = false;
     indent--;
     nl();
     buf_puts(out, "}\n");
