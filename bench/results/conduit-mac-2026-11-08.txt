@@ -1,0 +1,29 @@
+# Mac M4 (10 cpu), conduit xisto × Node v26.12.0, 2026-11-08 21:20; 30 s por rota, 20 conexões; STARTS=5 COLD=10
+== xisto : startup 21 ms (median of 5), rss at rest 2.6 MB
+   list (2 queries, 20 of 50)         cold    2.74 ms  warm    0.45 ms  cache
+   article by slug                    cold    1.44 ms  warm    0.45 ms  cache
+   current user (guard, JWT, query)   cold    1.06 ms  warm    0.53 ms  não usa cache
+   tags                               cold    0.64 ms  warm    0.34 ms  não usa cache
+   login (argon2)                     cold   26.01 ms  warm   22.09 ms  não usa cache
+   [cache] list (2 queries, 20 of 50)             15937 req/s  p50    1.08 ms  p99    3.10 ms  cpu/1k    39.1 ms  cpu 0.62 cores  rss    5.9 MB  ok 478156/478156
+   [cache] article by slug                        30011 req/s  p50    0.47 ms  p99    1.96 ms  cpu/1k    12.7 ms  cpu 0.38 cores  rss    4.3 MB  ok 900369/900369
+   [cache] current user (guard, JWT, query)       12702 req/s  p50    1.54 ms  p99    2.42 ms  cpu/1k    41.1 ms  cpu 0.52 cores  rss    5.4 MB  ok 381053/381053
+   [cache] tags                                   26054 req/s  p50    0.74 ms  p99    1.32 ms  cpu/1k    19.3 ms  cpu 0.50 cores  rss    4.2 MB  ok 781667/781667
+   [cache] login (argon2)                            61 req/s  p50  325.25 ms  p99  555.61 ms  cpu/1k 132489.0 ms  cpu 8.05 cores  rss  197.2 MB  ok 1824/1824
+   [no-cache] list (2 queries, 20 of 50)              7436 req/s  p50    2.59 ms  p99    4.44 ms  cpu/1k   104.0 ms  cpu 0.77 cores  rss    5.7 MB  ok 223079/223079
+   [no-cache] article by slug                        11953 req/s  p50    1.64 ms  p99    2.54 ms  cpu/1k    37.6 ms  cpu 0.45 cores  rss    4.8 MB  ok 358594/358594
+   rss after the load 4.8 MB
+== node : startup 268 ms (median of 5), rss at rest 136.0 MB
+   list (2 queries, 20 of 50)         cold    2.54 ms  warm    0.56 ms  cache
+   article by slug                    cold    2.06 ms  warm    0.55 ms  cache
+   current user (guard, JWT, query)   cold    1.85 ms  warm    0.88 ms  não usa cache
+   tags                               cold    1.12 ms  warm    0.45 ms  não usa cache
+   login (argon2)                     cold   30.95 ms  warm   29.35 ms  não usa cache
+   [cache] list (2 queries, 20 of 50)             15942 req/s  p50    1.10 ms  p99    3.55 ms  cpu/1k    48.1 ms  cpu 0.76 cores  rss  162.7 MB  ok 478320/478320
+   [cache] article by slug                        28470 req/s  p50    0.63 ms  p99    1.71 ms  cpu/1k    22.7 ms  cpu 0.64 cores  rss  137.1 MB  ok 854132/854132
+   [cache] current user (guard, JWT, query)        7342 req/s  p50    2.64 ms  p99    4.55 ms  cpu/1k   135.1 ms  cpu 0.99 cores  rss  157.3 MB  ok 220259/220259
+   [cache] tags                                   19524 req/s  p50    1.00 ms  p99    1.71 ms  cpu/1k    41.6 ms  cpu 0.81 cores  rss  132.2 MB  ok 585750/585750
+   [cache] login (argon2)                            50 req/s  p50  401.27 ms  p99  456.10 ms  cpu/1k 180127.7 ms  cpu 8.93 cores  rss  387.5 MB  ok 1488/1488
+   [no-cache] list (2 queries, 20 of 50)              7086 req/s  p50    2.76 ms  p99    4.51 ms  cpu/1k   121.6 ms  cpu 0.86 cores  rss  153.2 MB  ok 212580/212580
+   [no-cache] article by slug                         9231 req/s  p50    2.12 ms  p99    3.57 ms  cpu/1k    80.3 ms  cpu 0.74 cores  rss  147.5 MB  ok 276924/276924
+   rss after the load 147.5 MB
