@@ -555,6 +555,8 @@ char *xs_format(const char *src); /* xisto fmt */
 void check_program(Program *p);
 void columns_program(Program *p); /* columns.c: a local array of number-only objects as one Float64Array per field */
 void distribute_program(Program *p); /* distribute.c: a pair loop over columns, its pure slow consts first for every pair */
+void inplace_program(Program *p); /* inplace.c: for-of over readStdinParts whose part stays in its iteration reads in place */
+extern bool xs_wide_f64; /* distribute.c: the target has 4-lane double vectors (AVX2): the slow consts that read no column go in a flat loop */
 void prune_program(Program *p); /* marks what main reaches; emitters skip the rest */
 Func *xs_parse_instance(Func *tmpl, Type **args);
 Class *xs_parse_class_instance(Class *tmpl, Type **args, const char *name); /* parser.c: a generic function parsed again with its T bound */

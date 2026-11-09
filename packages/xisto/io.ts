@@ -132,6 +132,35 @@ const PART_BLOCK: int = 1 << 22; // bytes asked of each read: a part is given as
  * ```
  */
 export function* readStdinParts(options: StdinPartsOptions = {}): Generator<Uint8Array> {
+  yield* stdinParts(options, false);
+}
+
+/**
+ * Reads standard input part by part, as {@link readStdinParts}, but each part is valid only until the next one
+ * is asked for: the array the input is read into is used again from its start, so memory holds the largest part
+ * (and one read) instead of the whole input.
+ *
+ * @param options - Where to cut: `splitBefore` or `splitAfter`, one ASCII character.
+ * @returns The parts, in input order; a part's bytes are overwritten once the loop goes on to the next.
+ * @throws Error as {@link readStdinParts}.
+ *
+ * @remarks
+ * The compiler calls this one in place of {@link readStdinParts} in a `for (const part of readStdinParts(...))`
+ * whose part never outlives its iteration (it is only read, changed in place, measured, or given to xisto:bytes
+ * functions and {@link writeStdout}, which takes the bytes at the call): the output is the same. Called by hand,
+ * keeping a part past its iteration sees later input in it. Compatibility: the same in Node and in xisto.
+ *
+ * @example
+ * ```ts
+ * import { readStdinPartsInPlace, writeStdout } from "xisto:io";
+ * for (const record of readStdinPartsInPlace({ splitBefore: ">" })) writeStdout(record.reverse());
+ * ```
+ */
+export function* readStdinPartsInPlace(options: StdinPartsOptions = {}): Generator<Uint8Array> {
+  yield* stdinParts(options, true);
+}
+
+function* stdinParts(options: StdinPartsOptions, inPlace: boolean): Generator<Uint8Array> {
   const { splitBefore = "", splitAfter = "" } = options;
   if ((splitBefore === "") === (splitAfter === "")) {
     throw new Error("readStdinParts: give one of splitBefore or splitAfter");
@@ -146,6 +175,13 @@ export function* readStdinParts(options: StdinPartsOptions = {}): Generator<Uint
   let start = 0; // where the part being read starts
   let scan = 0; // where the search for the next cut goes on
   for (;;) {
+    if (inPlace && start > 0) { // the parts before start are done with: what is left of the last read moves to the front
+      const left = have - start;
+      for (let k = 0; k < left; k++) buf[k] = buf[start + k];
+      have = left;
+      scan -= start;
+      start = 0;
+    }
     if (have === buf.length) { // the part has not ended: room for more, keeping it at the front
       const bigger = new Uint8Array(Math.max(buf.length * 2, 1 << 20));
       bigger.set(buf.subarray(start, have));
