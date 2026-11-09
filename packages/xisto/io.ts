@@ -144,6 +144,12 @@ export function writeStdoutLent(bytes: Uint8Array): void {
  */
 export function writeStdoutLentBegin(bytes: Uint8Array): void {}
 
+// whether memory touched for the first time is cheap (in xisto on Linux with huge pages; in Node, no: either way
+// the same parts come out, only memory and time change)
+function freshPagesCheap(): boolean {
+  return false;
+}
+
 /** Where {@link readStdinParts} cuts standard input: give exactly one of the two. */
 export interface StdinPartsOptions {
   /** A new part starts at each occurrence of this character: every part but the first begins with it. */
@@ -220,6 +226,9 @@ function* stdinParts(options: StdinPartsOptions, inPlace: boolean): Generator<Ui
   if (mark > 127) throw new Error(`readStdinParts: expected one ASCII character to split at, got ${JSON.stringify(at)}`);
   const after = splitAfter !== "";
   const file = fstatSync(0).isFile();
+  // a file read in place: its bytes go on into the rest of the array (sized for the whole file) instead of moving
+  // to the front, where fresh memory is cheap to touch; there the next part is read while the last one goes out
+  const reuseFront = !file || !freshPagesCheap();
   let buf = new Uint8Array(file ? fstatSync(0).size + 1 : 1 << 20); // (a file: one byte more, so its end is a read of 0)
   let have = 0; // bytes read into buf
   let start = 0; // where the part being read starts
@@ -228,7 +237,7 @@ function* stdinParts(options: StdinPartsOptions, inPlace: boolean): Generator<Ui
     // the parts before start are done with: what is left of the last read moves to the front, once they take half
     // the array or it is full (so the next part is mostly read past the last one, while that one may still be going
     // out in xisto, and memory still holds about two parts, not the whole input)
-    if (inPlace && start > 0 && !file && (start >= buf.length >> 1 || have === buf.length)) {
+    if (inPlace && start > 0 && reuseFront && (start >= buf.length >> 1 || have === buf.length)) {
       const left = have - start;
       buf.set(buf.subarray(start, have), 0); // (in xisto, after a lent write has gone past these bytes)
       have = left;

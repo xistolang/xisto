@@ -859,6 +859,24 @@ static inline void xs_big_hint(void *data, int64_t n) {
 #endif
 }
 #define xs_u8_huge_hint xs_big_hint
+/* the first touch of fresh pages is cheap here (huge pages offered and honoured: THP "madvise" or "always"), so a
+   reader may go on into fresh memory instead of reusing the front (xisto:io's freshPagesCheap; macOS: no) */
+static bool xs_fresh_pages_cheap(void) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    static int v = -1;
+    if (v < 0) {
+        v = 0;
+        if (!getenv("XISTO_NO_U8_HUGE")) {
+            FILE *f = fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r");
+            char t[128] = {0};
+            if (f) { if (fgets(t, sizeof t, f)) v = strstr(t, "[always]") || strstr(t, "[madvise]"); fclose(f); }
+        }
+    }
+    return v > 0;
+#else
+    return false;
+#endif
+}
 
 /* ---- strings: immutable, UTF-8 ---- */
 
@@ -5444,7 +5462,7 @@ XS_NOINLINE bool xs_u8_rev_par(xs_Uint8Array *buf, xs_Uint8Array *table, int64_t
     j.half = j.m >> 1;
     j.ntask = (int64_t)threads * 8;
     if (j.half > 0 && xs_lent_open(j.d + start, (size_t)n)) { /* a begun part (writeStdoutLentBegin): the front goes out as it is done */
-        j.ntask = (int64_t)threads * 32; /* (smaller steps: the first bytes are final sooner) */
+        if (j.ntask < 64) j.ntask = 64; /* (smaller steps where there are few threads: the first bytes are final sooner) */
         j.tdone = calloc((size_t)j.ntask, sizeof *j.tdone);
         if (j.tdone) { j.publish = true; xs_lent_publish(j.d + start); }
     }

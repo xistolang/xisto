@@ -8137,6 +8137,9 @@ static void emit_func_body(Func *f) {
     if (f->mod && f->mod->file && strcmp(f->mod->file, "xisto:io") == 0 && f->name && strcmp(f->name, "writeStdoutLentBegin") == 0 && f->nparams == 1) {
         nl(); buf_printf(out, "xs_stdout_lent_begin(%s);", f->params[0].cname); /* (the body is empty: in Node it does nothing) */
     }
+    if (f->mod && f->mod->file && strcmp(f->mod->file, "xisto:io") == 0 && f->name && strcmp(f->name, "freshPagesCheap") == 0 && f->nparams == 0) {
+        nl(); buf_puts(out, "return xs_fresh_pages_cheap();"); /* (the body's false is Node's answer) */
+    }
     Buf *saved_pbuf = fn_prelude_out; size_t saved_ppos = fn_prelude_pos; Buf saved_ptext = fn_prelude_text;
     fn_prelude_out = out; fn_prelude_pos = out->len; fn_prelude_text = (Buf){0};
     emit_prof_enter(f);
