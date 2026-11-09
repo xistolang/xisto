@@ -122,6 +122,7 @@ static void site_str(Buf *b, const char *s) {
 static bool inlined_once(Func *f);
 static bool stmt_has_try(Stmt *s);
 static int cur_rg; /* rg-hoist: the dual region being emitted (definition and notes below, with the region versions) */
+static bool rg_hoist_on; /* (defined with cur_rg below) */
 static const char *rg_call_name(Func *f);
 static bool rg_inline_new(Expr *e);
 static void mark_init_stores(Class *c, Func *ctor);
@@ -1620,6 +1621,8 @@ static void emit_member(Expr *e) {
             buf_puts(out, "; ");
         }
         buf_puts(out, "xs_out_drain(); "); /* (XB-091: stdout written behind goes out first) */
+        bool to_err = strcmp(e->str, "error") == 0 || strcmp(e->str, "warn") == 0; /* (as Node: error, warn -> stderr) */
+        if (to_err) buf_puts(out, "fflush(stdout); FILE *pf_ = xs_out_f; xs_out_f = stderr; ");
         for (int i = 0; i < e->args.len; i++) {
             Expr *a = e->args.items[i];
             if (i) buf_puts(out, "xs_print_sep(); ");
@@ -1630,7 +1633,7 @@ static void emit_member(Expr *e) {
             emit_print_arg(&tmpv);
             buf_puts(out, "; ");
         }
-        buf_puts(out, "xs_print_nl(); })");
+        buf_puts(out, to_err ? "xs_print_nl(); xs_out_f = pf_; })" : "xs_print_nl(); })");
         return;
     }
     if (base->kind == E_IDENT && !base->cname && e->cls && e->cls->builtin && e->func && e->field < 0 && e->builtin.cfn && !e->builtin.self_first) {
@@ -2319,7 +2322,9 @@ static void emit_expr_(Expr *e) {
     Func *callee = e->kind == E_NEW_OBJ ? (e->cls->builtin ? NULL : e->cls->ctor) : e->func;
     int id = callee && callee->body && inlined_once(callee) && callee->call1 == e ? call1_site(callee) : new_site(e->pos);
     bool user_call = callee && callee->body && !e->builtin.cfn && e->kind != E_NEW_OBJ && !(e->kind == E_MEMBER && (!e->cls || e->cls->builtin));
-    char *clone = user_call && !e->par_native && cloned_per_site(callee) ? emit_clone(callee, id) : NULL;
+    /* (inside a region's code, a callee with a region version calls that version: it has no per-site clone) */
+    bool rg_version = rg_hoist_on && cur_rg && callee && callee->rg_hoist == cur_rg && callee->rg_used;
+    char *clone = user_call && !e->par_native && !rg_version && cloned_per_site(callee) ? emit_clone(callee, id) : NULL;
     Expr *saved_b = bracketing;
     bool is_void = !e->type || e->type->kind == TY_VOID;
     buf_puts(out, is_void ? "({ " : "({ __auto_type xr_ = ");

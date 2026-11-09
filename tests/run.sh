@@ -89,6 +89,16 @@ for f in tests/err/*.ts; do
     fi
 done
 
+# stderr: console.error/warn go to stderr and log/info/debug to stdout, each as Node writes it (the expected files are
+# Node's two streams, checked in: the tests/ok oracle merges them)
+for f in tests/stderr/*.ts; do
+    name=stderr-$(basename "$f" .ts)
+    if ! $XISTO build -o "$OUT/$name" "$f" > "$OUT/$name.build" 2>&1; then echo "FAIL $f: xisto build failed"; cat "$OUT/$name.build"; fail=$((fail+1)); continue; fi
+    "$OUT/$name" > "$OUT/$name.out" 2> "$OUT/$name.err" < /dev/null
+    if cmp -s "$OUT/$name.out" "${f%.ts}.stdout" && cmp -s "$OUT/$name.err" "${f%.ts}.stderr"; then pass=$((pass+1));
+    else echo "FAIL $f: stdout or stderr differs from node"; diff "${f%.ts}.stdout" "$OUT/$name.out" | head; diff "${f%.ts}.stderr" "$OUT/$name.err" | head; fail=$((fail+1)); fi
+done
+
 # xisto fmt: the messy file formats to the gabarito, and the whole tree is already formatted
 cp tests/fmt/messy.input "$OUT/messy.ts"
 $XISTO fmt "$OUT/messy.ts" > /dev/null 2>&1
