@@ -73,6 +73,13 @@ static Token expect(Parser *p, TokKind k, const char *help) {
     return t;
 }
 
+/* a property name: an identifier or any keyword (obj.default, { default: 0 }, interface { delete?: x }) */
+static Token expect_prop_name(Parser *p, const char *help) {
+    const char *w = tok_keyword_text(p->tok.kind);
+    if (w) { Token t = p->tok; t.kind = TK_IDENT; t.str = (char *)w; next(p); return t; }
+    return expect(p, TK_IDENT, help);
+}
+
 static bool accept(Parser *p, TokKind k) {
     if (at(p, k)) {
         next(p);
@@ -100,7 +107,6 @@ static Expr *parse_expr(Parser *p);
 static Expr *parse_assign(Parser *p);
 static Stmt *parse_stmt(Parser *p);
 static Type *parse_type(Parser *p);
-static Token expect_name(Parser *p);
 
 /* Unresolved class names are stored as objects of a placeholder class; the checker resolves them. */
 static Type *named_type(Parser *p, Token name) {
@@ -603,7 +609,7 @@ static Expr *parse_primary(Parser *p) {
         while (!at(p, TK_RBRACE)) {
             Token key;
             if (at(p, TK_IDENT) || at(p, TK_STRING)) { key = p->tok; next(p); }
-            else if (peek_is(p, TK_COLON) && tok_kind_name(p->tok.kind)[0] == '\'') key = expect_name(p); /* { enum: E } */
+            else if (tok_keyword_text(p->tok.kind) && (p->tok.kind != TK_THIS)) { key = expect_prop_name(p, NULL); }
             else { xs_error(XS1018, p->tok.pos, "keys are names or strings: { id: 1, \"Content-Type\": \"x\" }", "expected a key in the object literal"); return NULL; }
             Expr *val;
             if (accept(p, TK_COLON)) val = parse_assign(p);
@@ -758,7 +764,7 @@ static Expr *parse_postfix(Parser *p) {
             nopt++;
             if (at(p, TK_LBRACKET)) continue; /* a?.[i]: the index below */
             if (at(p, TK_LPAREN)) xs_error(XS6043, pos, "call it when it is not null: if (f !== null) f(x)", "'?.(' (calling a value that may be null) is not supported");
-            Token name = expect(p, TK_IDENT, NULL);
+            Token name = expect_prop_name(p, NULL);
             Expr *m = new_expr(E_MEMBER, name.pos);
             m->lhs = e;
             m->str = name.str;
@@ -777,7 +783,7 @@ static Expr *parse_postfix(Parser *p) {
             e = ix;
         } else if (at(p, TK_DOT)) {
             next(p);
-            Token name = expect_name(p);
+            Token name = expect_prop_name(p, NULL);
             Expr *m = new_expr(E_MEMBER, name.pos);
             m->lhs = e;
             m->str = name.str;
@@ -1574,21 +1580,6 @@ static int skip_modifiers(Parser *p) {
 }
 
 
-/* a property name: an identifier, or a keyword used as one (TypeScript allows { enum: E }, obj.default, a field
-   named class): the keyword's text becomes the name */
-static Token expect_name(Parser *p) {
-    if (at(p, TK_IDENT)) return expect(p, TK_IDENT, NULL);
-    const char *k = tok_kind_name(p->tok.kind);
-    size_t n = k ? strlen(k) : 0;
-    if (n > 2 && k[0] == '\'' && k[n - 1] == '\'' && isalpha((unsigned char)k[1])) {
-        Token t = p->tok;
-        t.kind = TK_IDENT;
-        t.str = xs_strndup(k + 1, n - 2);
-        next(p);
-        return t;
-    }
-    return expect(p, TK_IDENT, NULL);
-}
 static void parse_fields_body(Parser *p, Class *c);
 
 /* interface Name { a: T; b?: U }  or  type Name = { a: T, b: U }; */
@@ -1734,7 +1725,7 @@ static void parse_fields_body(Parser *p, Class *c) {
         }
         Token name;
         if (sym_iter) { name = p->tok; name.kind = TK_IDENT; name.str = "__iterator"; name.pos = pos; }
-        else name = expect_name(p);
+        else name = expect_prop_name(p, NULL);
         if (gen_method && !at(p, TK_LPAREN) && !at(p, TK_LT)) xs_error(XS8064, name.pos, NULL, "'*' marks a generator method: *%s(): Generator<T> { ... }", name.str);
         if (accessor) {
             if (!at(p, TK_LPAREN)) xs_error(XS1037, p->tok.pos, NULL, "write %s %s(...) { ... }", accessor == 1 ? "get" : "set", name.str);
@@ -1921,7 +1912,7 @@ static Class *parse_declared_class(Parser *p, const char *prefix) {
     expect(p, TK_LBRACE, NULL);
     while (!at(p, TK_RBRACE)) {
         skip_modifiers(p);
-        Token name = expect(p, TK_IDENT, NULL);
+        Token name = expect_prop_name(p, NULL);
         if (at(p, TK_LPAREN)) {
             Func *f = xs_alloc(sizeof *f);
             f->pos = name.pos;

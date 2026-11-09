@@ -16,6 +16,12 @@ export const __settings: Map<string, MethodSetting[]> = new Map<string, MethodSe
 export const __injects: Map<string, InjectDef[]> = new Map<string, InjectDef[]>();
 export const __catches: Map<string, string[]> = new Map<string, string[]>();
 export const __custom: CustomParam[] = [];
+// values a constructor parameter receives without a provider class: by token (@InjectRepository) or by the
+// parameter's type id (a DataSource TypeOrmModule.forRoot made). __values holds ready instances; __jsonValues the
+// JSON the parameter's own type decodes into the exact instance it asks for (a Repository<User> from forFeature).
+export const __values: Map<string, unknown> = new Map<string, unknown>();
+export const __jsonValues: Map<string, string> = new Map<string, string>();
+export const __tokens: Map<string, string> = new Map<string, string>(); // "<class id>#<parameter index>" -> token
 
 /** HTTP status codes, as @nestjs/common names them. */
 export enum HttpStatus {

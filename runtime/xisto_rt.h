@@ -3359,35 +3359,6 @@ XS_NOINLINE bool xs_json_bool(xs_jv *v, const char *where) {
     if (v->kind != XJ_BOOL) xs_panicf("JSON: '%s' must be true or false", where);
     return v->b;
 }
-static void xs_sb_num(xs_sb *b, double v);
-static void xs_sb_str(xs_sb *b, xs_str *s);
-static void xs_json_raw_into(xs_sb *b, xs_jv *v) { /* a parsed JSON value written back as JSON text */
-    switch (v->kind) {
-    case XJ_NULL: xs_sb_put(b, "null", 4); break;
-    case XJ_BOOL: xs_sb_bool(b, v->b); break;
-    case XJ_NUM: xs_sb_num(b, v->num); break;
-    case XJ_STR: { xs_str *s = xs_str_new(v->str, v->slen); xs_sb_str(b, s); xs_release(s); break; }
-    case XJ_ARR:
-        xs_sb_put(b, "[", 1);
-        for (size_t i = 0; i < v->n; i++) { if (i) xs_sb_put(b, ",", 1); xs_json_raw_into(b, v->items[i]); }
-        xs_sb_put(b, "]", 1);
-        break;
-    case XJ_OBJ:
-        xs_sb_put(b, "{", 1);
-        for (size_t i = 0; i < v->n; i++) {
-            if (i) xs_sb_put(b, ",", 1);
-            xs_str *k = xs_str_new(v->keys[i], strlen(v->keys[i]));
-            xs_sb_str(b, k);
-            xs_release(k);
-            xs_sb_put(b, ":", 1);
-            xs_json_raw_into(b, v->items[i]);
-        }
-        xs_sb_put(b, "}", 1);
-        break;
-    }
-}
-/* an `object` field read from JSON: its JSON text, as an object value is held */
-XS_NOINLINE xs_str *xs_json_raw(xs_jv *v, const char *where) { (void)where; xs_sb b = {0}; xs_json_raw_into(&b, v); return xs_sb_finish(&b); }
 XS_NOINLINE xs_str *xs_json_str(xs_jv *v, const char *where) { if (v->kind != XJ_STR) xs_panicf("JSON: '%s' must be a string", where); return xs_str_new(v->str, v->slen); }
 XS_NOINLINE xs_jv *xs_json_arr(xs_jv *v, const char *where) { if (v->kind != XJ_ARR) xs_panicf("JSON: '%s' must be an array", where); return v; }
 
@@ -3470,6 +3441,51 @@ static xs_str *xs_sb_finish(xs_sb *b) {
     xs_str *s = xs_str_new(b->data ? b->data : "", b->len);
     free(b->data);
     return s;
+}
+
+/* a parsed JSON value back as its text, with JSON's own number spelling (packages/typeorm's native code) */
+static void xs_sb_jstr(xs_sb *b, const char *p, size_t n) {
+    xs_sb_put(b, "\"", 1);
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)p[i];
+        char esc[8];
+        switch (c) {
+        case '"': xs_sb_put(b, "\\\"", 2); break;
+        case '\\': xs_sb_put(b, "\\\\", 2); break;
+        case '\n': xs_sb_put(b, "\\n", 2); break;
+        case '\r': xs_sb_put(b, "\\r", 2); break;
+        case '\t': xs_sb_put(b, "\\t", 2); break;
+        case '\b': xs_sb_put(b, "\\b", 2); break;
+        case '\f': xs_sb_put(b, "\\f", 2); break;
+        default:
+            if (c < 0x20) { snprintf(esc, sizeof esc, "\\u%04x", c); xs_sb_puts(b, esc); }
+            else xs_sb_put(b, (const char *)&c, 1);
+        }
+    }
+    xs_sb_put(b, "\"", 1);
+}
+static void xs_jv_write(xs_sb *b, xs_jv *v) {
+    switch (v->kind) {
+    case XJ_NULL: xs_sb_puts(b, "null"); break;
+    case XJ_BOOL: xs_sb_bool(b, v->b); break;
+    case XJ_NUM: xs_sb_num(b, v->num); break;
+    case XJ_STR: xs_sb_jstr(b, v->str, v->slen); break;
+    case XJ_ARR:
+        xs_sb_put(b, "[", 1);
+        for (size_t i = 0; i < v->n; i++) { if (i) xs_sb_put(b, ",", 1); xs_jv_write(b, v->items[i]); }
+        xs_sb_put(b, "]", 1);
+        break;
+    case XJ_OBJ:
+        xs_sb_put(b, "{", 1);
+        for (size_t i = 0; i < v->n; i++) {
+            if (i) xs_sb_put(b, ",", 1);
+            xs_sb_jstr(b, v->keys[i], strlen(v->keys[i]));
+            xs_sb_put(b, ":", 1);
+            xs_jv_write(b, v->items[i]);
+        }
+        xs_sb_put(b, "}", 1);
+        break;
+    }
 }
 
 /* ---- console.log ---- */

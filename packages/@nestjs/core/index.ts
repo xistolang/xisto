@@ -18,6 +18,9 @@ import {
   __routes,
   __settings,
   __validated,
+  __jsonValues,
+  __tokens,
+  __values,
   bodyField,
   ClassProvider,
   DynamicModule,
@@ -325,6 +328,20 @@ function construct(ci: ClassInfo, depth: int): unknown {
         token = d.token;
         optional = d.optional;
       }
+    }
+    // a value registered without a provider class (TypeOrmModule): by token (@InjectRepository) or by the
+    // parameter's type id (a DataSource). __values holds ready instances; __jsonValues the JSON the parameter's own
+    // type decodes into the exact instance it asks for (a Repository<User>).
+    const key = __tokens.get(ci.id + "#" + String(p.index)) ?? (typeof token === "string" ? (token as string) : p.type.id);
+    const value = __values.get(key);
+    if (value !== null) {
+      args.push(value);
+      continue;
+    }
+    const json = __jsonValues.get(key);
+    if (json !== null) {
+      args.push(p.type.decode(json));
+      continue;
     }
     if (token === null) {
       const byType = __classes.get(p.type.id);

@@ -169,6 +169,7 @@ void lexer_init(Lexer *lx, const char *src);
 Token lexer_next(Lexer *lx);
 bool lexer_regex(Lexer *lx, const char *slash, char **pattern, char **flags); /* re-reads a '/' token as /pattern/flags */
 const char *tok_kind_name(TokKind k);
+const char *tok_keyword_text(TokKind k);
 
 /* ---------- types ---------- */
 
