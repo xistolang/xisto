@@ -110,6 +110,7 @@ static const char *par_file; /* the module of the call being checked */
    like the program's: their bodies are what runs) */
 static bool other_package(Func *f) {
     return f && f->mod && f->mod->file && strncmp(f->mod->file, "xisto:", 6) == 0 && strcmp(f->mod->file, "xisto:parallel") != 0 &&
+           strcmp(f->mod->file, "xisto:fractal") != 0 && /* (pure functions of numbers: checked by their bodies, like the program's) */
            !(par_file && strcmp(f->mod->file, par_file) == 0);
 }
 

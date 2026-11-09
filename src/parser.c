@@ -2411,12 +2411,15 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->loading = false;
         return m;
     }
-    if (strcmp(name, "io") == 0 || strcmp(name, "bytes") == 0 || strcmp(name, "parallel") == 0 || strcmp(name, "collections") == 0) { /* packages/xisto: the same file Node runs */
-        extern const unsigned char xs_pkg_io_ts[], xs_pkg_bytes_ts[], xs_pkg_parallel_ts[], xs_pkg_collections_ts[];
+    if (strcmp(name, "io") == 0 || strcmp(name, "bytes") == 0 || strcmp(name, "parallel") == 0 || strcmp(name, "collections") == 0 ||
+        strcmp(name, "fractal") == 0 || strcmp(name, "random") == 0) { /* packages/xisto: the same file Node runs */
+        extern const unsigned char xs_pkg_io_ts[], xs_pkg_bytes_ts[], xs_pkg_parallel_ts[], xs_pkg_collections_ts[], xs_pkg_fractal_ts[],
+            xs_pkg_random_ts[];
         bool io = strcmp(name, "io") == 0, par = strcmp(name, "parallel") == 0, coll = strcmp(name, "collections") == 0;
+        bool frac = strcmp(name, "fractal") == 0, rnd = strcmp(name, "random") == 0;
         m->builtin = false;
-        m->file = io ? "xisto:io" : par ? "xisto:parallel" : coll ? "xisto:collections" : "xisto:bytes";
-        m->src = (char *)(io ? xs_pkg_io_ts : par ? xs_pkg_parallel_ts : coll ? xs_pkg_collections_ts : xs_pkg_bytes_ts);
+        m->file = io ? "xisto:io" : par ? "xisto:parallel" : coll ? "xisto:collections" : frac ? "xisto:fractal" : rnd ? "xisto:random" : "xisto:bytes";
+        m->src = (char *)(io ? xs_pkg_io_ts : par ? xs_pkg_parallel_ts : coll ? xs_pkg_collections_ts : frac ? xs_pkg_fractal_ts : rnd ? xs_pkg_random_ts : xs_pkg_bytes_ts);
         if (par) prog->uses_parallel = true; /* (main.c: built with per-thread runtime state, XS_THREADS) */
         m->loading = true;
         parse_module(prog, m);
@@ -2441,7 +2444,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         add_func(prog, f);
         return m;
     }
-    xs_error(from_pos, "built-in modules: xisto:fs, xisto:sqlite, xisto:timers/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:io, xisto:bytes, xisto:parallel, xisto:collections", "unknown built-in module '%s'", spec);
+    xs_error(from_pos, "built-in modules: xisto:fs, xisto:sqlite, xisto:timers/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
     return NULL;
 }
 
