@@ -186,23 +186,21 @@ function bytesIn(bytes: Uint8Array, lo: int, hi: int): int[] {
 }
 
 // the substrings of `length` characters that start at lo..hi-1, each packed into a number (`bits` per
-// character, the first one highest), in the order they first appear: key, count, key, count, ... (letters: the
-// byte of each character code; the key alone gives the substring back, see counterOf)
-function countPiece(bytes: Uint8Array, letters: int[], length: int, bits: int, lo: int, hi: int): int[] {
+// character, the first one highest), in the order they first appear: key, count, key, count, ... (codes: each
+// character already as its number, see countSubstrings; the key alone gives the substring back, see counterOf)
+function countPiece(codes: Uint8Array, length: int, bits: int, lo: int, hi: int): int[] {
   const out: int[] = [];
   if (hi <= lo) return out;
-  const code = new Uint8Array(256);
-  for (let i = 0; i < letters.length; i++) code[letters[i]] = i;
   const base = BASE[bits];
   const end = hi + length - 1;
   if (bits * length <= 16) { // few possible keys: a table indexed by the key
     const mask = POW2_16[bits * length] - 1; // (keys of at most 16 bits: the shifts of JavaScript's 32 bits hold them)
     let key: int = 0;
-    for (let i = lo; i < lo + length - 1; i++) key = ((key << bits) | code[bytes[i]]) & mask;
+    for (let i = lo; i < lo + length - 1; i++) key = ((key << bits) | codes[i]) & mask;
     const tally: int[] = new Array<int>(65536).fill(0);
     const start = key;
     for (let j = lo + length - 1; j < end; j++) {
-      key = ((key << bits) | code[bytes[j]]) & mask;
+      key = ((key << bits) | codes[j]) & mask;
       tally[key]++;
     }
     // the order they first appear: a second pass from the start, until every key counted has been seen (the few
@@ -212,7 +210,7 @@ function countPiece(bytes: Uint8Array, letters: int[], length: int, bits: int, l
     const seen: int[] = new Array<int>(65536).fill(0);
     key = start;
     for (let j = lo + length - 1; j < end && out.length < 2 * distinct; j++) {
-      key = ((key << bits) | code[bytes[j]]) & mask;
+      key = ((key << bits) | codes[j]) & mask;
       if (seen[key] === 0) {
         seen[key] = 1;
         out.push(key);
@@ -223,10 +221,10 @@ function countPiece(bytes: Uint8Array, letters: int[], length: int, bits: int, l
   }
   const top = POW2[bits * (length - 1)]; // what a key keeps of the substring before it (never past 52 bits)
   let key: int = 0;
-  for (let i = lo; i < lo + length - 1; i++) key = key * base + code[bytes[i]];
+  for (let i = lo; i < lo + length - 1; i++) key = key * base + codes[i];
   const counts = new Map<int, int>(); // (a Map keeps the order the keys first appear in)
   for (let j = lo + length - 1; j < end; j++) {
-    key = (key % top) * base + code[bytes[j]];
+    key = (key % top) * base + codes[j];
     if (counts.has(key)) counts.set(key, counts.get(key)! + 1);
     else counts.set(key, 1);
   }
@@ -334,7 +332,14 @@ export function countSubstrings(text: string, lengths: int[]): Counter<string>[]
       }
     }
   }
-  const parts = parallelFrom(taskOf.length, (t) => countPiece(bytes, letters, lengths[taskOf[t]], bits, taskLo[t], taskHi[t]));
+  // each character as its number, once (in place: these bytes are this function's own copy of the text), instead
+  // of through a table in every length's pass
+  if (ascii) {
+    const code = new Uint8Array(256);
+    for (let i = 0; i < letters.length; i++) code[letters[i]] = i;
+    for (let i = 0; i < n; i++) bytes[i] = code[bytes[i]];
+  }
+  const parts = parallelFrom(taskOf.length, (t) => countPiece(bytes, lengths[taskOf[t]], bits, taskLo[t], taskHi[t]));
   // each length's pairs together, its pieces in text order (so first occurrences stay in order)
   let total = 0;
   for (const part of parts) total += part.length;
