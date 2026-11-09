@@ -1,4 +1,4 @@
-apps/api/src/main.ts (6)
+apps/api/src/main.ts (3)
   5:1  XS4001  'path' is xisto's implementation of a Node module, not Node itself
        5 | import { join } from 'path';
          | ^
@@ -11,29 +11,16 @@ apps/api/src/main.ts (6)
        6 | import { connect } from 'some-orm';
          | ^
     help: import files with a relative path ("./file"), or add the package: xisto add <git url> --name some-orm
-  11:16  XS1002  '==' is not supported
-      11 |   return value == null ? '' : value.replace(/[\r\n]/g, '_');
-         |                ^
-    help: xisto has no type coercion, so '==' and '===' would mean the same thing; use '==='
-  15:11  XS1003  '?.' is not supported
-      15 |   return o?.id ?? 0;
-         |           ^
-    help: there is no undefined or null in xisto, so '??' and '?.' do not exist
-  15:16  XS1003  '??' is not supported
-      15 |   return o?.id ?? 0;
-         |                ^
-    help: there is no undefined or null in xisto, so '??' and '?.' do not exist
 
-xisto check: 6 files, 6 changes needed in 1 file
+xisto check: 6 files, 3 changes needed in 1 file
 
   kind of change                                 changes  files  fix
-  syntax xisto does not read                           3      1  manual
   Node module import (node:x -> xisto:x)               1      1  automatic
   module or package not available                      2      1  package
-  (3 follow-on errors of these hidden)
+  (2 follow-on errors of these hidden)
 
   most changes:
-        6  apps/api/src/main.ts
+        3  apps/api/src/main.ts
 
   tests: 1 change in 1 of 1 test file, not counted above (--tests counts them)
 

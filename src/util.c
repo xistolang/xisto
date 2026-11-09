@@ -288,6 +288,14 @@ Type *ty_nullable_of(Type *inner) {
     return t;
 }
 
+/* x?: T: T | null whose null is "absent" (undefined in JavaScript's output); x?: T | null stays T | null */
+Type *ty_optional_of(Type *inner) {
+    if (inner->kind == TY_NULLABLE) return inner;
+    Type *t = ty_nullable_of(inner);
+    t->absent = true;
+    return t;
+}
+
 Type *ty_strip_null(Type *t) { return t->kind == TY_NULLABLE ? t->elem : t; }
 
 Type *ty_map_of(Type *key, Type *value) {

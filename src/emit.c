@@ -931,7 +931,9 @@ static bool is_fresh(Expr *e) {
         if (e->op == 0 && e->lhs->type && e->lhs->type->kind == TY_UNKNOWN) return is_fresh(e->lhs); /* f() as T: a reference passes its ownership on */
         return false;
     case E_COND:
-        if (e->builtin.cfn && strcmp(e->builtin.cfn, "or_once") == 0) return true; /* always owned: see emit_or_once */
+        if (e->builtin.cfn && (strcmp(e->builtin.cfn, "or_once") == 0 || strcmp(e->builtin.cfn, "qq_once") == 0)) return true; /* always owned: see emit_or_once */
+        if (e->builtin.cfn && strcmp(e->builtin.cfn, "optchain") == 0) /* owned when the rest is, or when a was (the rest then retains) */
+            return is_fresh(e->args.items[0]) || is_fresh(e->lhs);
         return is_fresh(e->args.items[0]) || is_fresh(e->args.items[1]);
     default: return false;
     }
@@ -1288,6 +1290,17 @@ static const char *printer_for(Type *t) {
 }
 
 static void emit_print_arg(Expr *a) {
+    if (a->type->kind == TY_NULLABLE && a->type->absent && !null_prim(a->type)) { /* x?: T left out: undefined, as Node prints it */
+        Buf b = {0};
+        Buf *saved = out;
+        out = &b;
+        emit_borrowed(a);
+        out = saved;
+        buf_printf(out, "({ %s v_ = %s; if (%s) %s(v_); else fputs(\"undefined\", XS_OUT); })", ctype(a->type), b.data, not_null(a->type, "v_"),
+                   a->type->elem->kind == TY_STRING ? "xs_print_str_or_null" : "xs_print_obj_or_null");
+        free(b.data);
+        return;
+    }
     if (a->type->kind == TY_NULLABLE || a->type->kind == TY_NULL) {
         /* strings inside nullable print raw at top level, like Node */
         if (null_prim(a->type)) {
@@ -1296,7 +1309,8 @@ static void emit_print_arg(Expr *a) {
             out = &b;
             emit_expr(a);
             out = saved;
-            buf_printf(out, "({ %s v_ = %s; if (%s) %s(v_); else fputs(\"null\", XS_OUT); })", ctype(a->type), b.data, not_null(a->type, "v_"), printer_for(a->type->elem));
+            buf_printf(out, "({ %s v_ = %s; if (%s) %s(v_); else fputs(\"%s\", XS_OUT); })", ctype(a->type), b.data, not_null(a->type, "v_"), printer_for(a->type->elem),
+                       a->type->absent ? "undefined" : "null");
             free(b.data);
             return;
         }
@@ -1592,18 +1606,11 @@ static void emit_member(Expr *e) {
         const char *fn = e->builtin.cfn;
         if (strcmp(fn, "json_stringify") == 0) {
             Expr *a = e->args.items[0];
-            buf_puts(out, "({ xs_sb sb_ = {0}; xs_sb *sb = &sb_; ");
-            json_emit_value(out, a->type, "(ARG)");
-            /* replace the placeholder with the borrowed argument */
-            {
-                size_t at = out->len;
-                char *tail = xs_strndup(out->data, at);
-                char *ph = strstr(tail, "(ARG)");
-                out->len = (size_t)(ph - tail);
-                out->data[out->len] = 0;
-                emit_borrowed(a);
-                buf_puts(out, ph + 5);
-            }
+            buf_printf(out, "({ xs_sb sb_ = {0}; xs_sb *sb = &sb_; %s ja_ = ", ctype(a->type)); /* the borrowed argument, read once
+                                   (a T | null is tested, then written: one placeholder replaced would miss the second read) */
+            emit_borrowed(a);
+            buf_puts(out, "; ");
+            json_emit_value(out, a->type, "ja_");
             buf_puts(out, " xs_sb_finish(sb); })");
             return;
         }
@@ -2641,6 +2648,18 @@ static void emit_expr_raw(Expr *e) {
         for (int i = 0; i < e->args.len; i++) {
             Expr *part = e->args.items[i];
             if (i) buf_puts(out, ", ");
+            if (part->type->kind == TY_NULLABLE) { /* ${x} with x: T | null: null (or undefined for x?: T) when it is */
+                Type *pt = part->type, *el = pt->elem;
+                Buf b = {0};
+                Buf *saved = out;
+                out = &b;
+                if (cref(el)) emit_borrowed(part); else emit_expr(part);
+                out = saved;
+                const char *f = el->kind == TY_STRING || (el->kind == TY_ENUM && el->en->is_string) ? "0, .s" : el->kind == TY_NUMBER ? "2, .d" : el->kind == TY_BOOLEAN ? "3, .b" : "1, .i";
+                buf_printf(out, "({ %s tn_ = %s; %s ? (xs_part){%s = tn_} : (xs_part){0, .s = %s}; })", ctype(pt), b.data, not_null(pt, "tn_"), f, lit_nm(part->lit_id));
+                free(b.data);
+                continue;
+            }
             switch (part->type->kind) {
             case TY_STRING: emit_cat_part(part); break;
             case TY_INT: buf_puts(out, "{1, .i = "); emit_expr(part); buf_puts(out, "}"); break;
@@ -2662,7 +2681,33 @@ static void emit_expr_raw(Expr *e) {
         buf_puts(out, ")");
         return;
     case E_COND: {
-        if (e->builtin.cfn && strcmp(e->builtin.cfn, "or_once") == 0) { /* f() || d: f() once, d only when needed; owned */
+        if (e->builtin.cfn && strcmp(e->builtin.cfn, "optchain") == 0) { /* a?.rest: a once in a constant, the rest only when it is not null */
+            static int noc;
+            int id = noc++;
+            Expr *base = e->lhs, *rest = e->args.items[0];
+            Type *bt = base->type;
+            bool bown = rcnt(bt) && is_fresh(base); /* a new value: released after the rest has read it */
+            buf_printf(out, "({ %s %s = ", ctype(bt), e->cname);
+            emit_expr(base);
+            buf_puts(out, "; ");
+            if (e->type->kind == TY_VOID) {
+                buf_printf(out, "if (%s) { ", not_null(bt, e->cname));
+                emit_expr(rest);
+                buf_puts(out, "; }");
+                if (bown) buf_printf(out, " xs_release(%s);", e->cname);
+                buf_puts(out, " })");
+                return;
+            }
+            bool own = is_fresh(e);
+            buf_printf(out, "%s ocr%d_; if (%s) ocr%d_ = ", ctype(e->type), id, not_null(bt, e->cname), id);
+            if (own) emit_owned(rest); else emit_expr(rest);
+            buf_printf(out, "; else ocr%d_ = %s;", id, null_value(e->type));
+            if (bown) buf_printf(out, " xs_release(%s);", e->cname);
+            buf_printf(out, " ocr%d_; })", id);
+            return;
+        }
+        if (e->builtin.cfn && (strcmp(e->builtin.cfn, "or_once") == 0 || strcmp(e->builtin.cfn, "qq_once") == 0)) { /* f() || d, f() ?? d: f() once, d only when needed; owned */
+            bool qq = strcmp(e->builtin.cfn, "qq_once") == 0; /* ??: only null takes the default ("" and 0 are values) */
             static int nor;
             int id = nor++;
             Type *lt = e->lhs->type;
@@ -2670,7 +2715,7 @@ static void emit_expr_raw(Expr *e) {
             buf_printf(out, "({ %s oo%d_ = ", ctype(lt), id);
             if (ref) emit_owned(e->lhs); else emit_expr(e->lhs);
             const char *v = xs_sprintf("oo%d_", id);
-            const char *test = lt->kind == TY_STRING ? xs_sprintf("xs_str_truthy(%s)", v)
+            const char *test = qq ? not_null(lt, v) : lt->kind == TY_STRING ? xs_sprintf("xs_str_truthy(%s)", v)
                              : lt->elem->kind == TY_STRING ? xs_sprintf("(%s && xs_str_truthy(%s))", v, v) : not_null(lt, v);
             buf_printf(out, "; %s or%d_; if (%s) or%d_ = oo%d_; else { %sor%d_ = ", ctype(e->type), id, test, id, id, ref ? xs_sprintf("xs_release(oo%d_); ", id) : "", id);
             if (ref) emit_owned(e->args.items[0]); else emit_expr(e->args.items[0]);

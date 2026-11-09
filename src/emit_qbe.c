@@ -531,6 +531,7 @@ static char *emit_expr_raw(Expr *e) {
     case E_NEW_MAP: unsupported(e->pos, "Map, Set and Channel"); return "";
     case E_ARROW: unsupported(e->pos, "arrow functions"); return "";
     case E_COND: {
+        if (e->builtin.cfn) { unsupported(e->pos, "'?.', '\?\?' and 'f() || d'"); return ""; }
         char *res = tmp(), *tl = label("then"), *el = label("else"), *end = label("endc");
         char *c = emit_expr(e->lhs);
         ins("jnz %s, %s, %s", c, tl, el);

@@ -732,11 +732,41 @@ static int parse_type_args(Parser *p, Type ***out) {
     return n;
 }
 
+/* a?.b.c: the chain from a?. on is built on a temporary that holds a (`__ocN`), and the whole chain becomes
+   E_COND with builtin "optchain": lhs = a, str = the temporary, args[0] = the rest; the checker makes it
+   `a !== null ? rest : null`. Every ?. in one postfix chain nests inside the one before it, so a?.b?.c stops
+   at the first null */
+static int noptc;
+static Expr *ident_expr(Pos pos, const char *name);
 static Expr *parse_postfix(Parser *p) {
     Expr *e = parse_primary(p);
+    Expr *obase[32];
+    char *otmp[32];
+    Pos opos[32];
+    int nopt = 0;
     for (;;) {
         Pos pos = p->tok.pos;
-        if (at(p, TK_LBRACKET)) {
+        if (at(p, TK_QDOT)) {
+            next(p);
+            if (nopt == 32) xs_error(XS1040, pos, "split the chain in two", "too many '?.' in one chain");
+            obase[nopt] = e;
+            otmp[nopt] = xs_sprintf("__oc%d", ++noptc);
+            opos[nopt] = pos;
+            e = ident_expr(pos, otmp[nopt]);
+            nopt++;
+            if (at(p, TK_LBRACKET)) continue; /* a?.[i]: the index below */
+            if (at(p, TK_LPAREN)) xs_error(XS6043, pos, "call it when it is not null: if (f !== null) f(x)", "'?.(' (calling a value that may be null) is not supported");
+            Token name = expect(p, TK_IDENT, NULL);
+            Expr *m = new_expr(E_MEMBER, name.pos);
+            m->lhs = e;
+            m->str = name.str;
+            if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs);
+            if (at(p, TK_LPAREN)) {
+                m->is_call = true;
+                parse_args(p, &m->args);
+            }
+            e = m;
+        } else if (at(p, TK_LBRACKET)) {
             next(p);
             Expr *ix = new_expr(E_INDEX, pos);
             ix->lhs = e;
@@ -768,6 +798,14 @@ static Expr *parse_postfix(Parser *p) {
             next(p);
             e = pf;
         } else {
+            for (int k = nopt - 1; k >= 0; k--) { /* the innermost ?. first: it reads the temporary of the one before */
+                Expr *c = new_expr(E_COND, opos[k]);
+                c->lhs = obase[k];
+                c->str = otmp[k];
+                c->builtin.cfn = "optchain";
+                expr_list_push(&c->args, e);
+                e = c;
+            }
             return e;
         }
     }
@@ -915,21 +953,33 @@ static bool gt_glued(Parser *p) {
     return g;
 }
 BINARY_LEVEL(parse_rel_base, parse_as, at(p, TK_LT) || at(p, TK_LE) || (at(p, TK_GT) && !gt_glued(p)) || at(p, TK_GE))
-BINARY_LEVEL(parse_eq, parse_rel, at(p, TK_EQ) || at(p, TK_NEQ))
+static Expr *parse_eq(Parser *p) {
+    Expr *e = parse_rel(p);
+    while (at(p, TK_EQ) || at(p, TK_NEQ)) {
+        TokKind op = p->tok.kind;
+        Pos pos = p->tok.pos;
+        bool loose = p->tok.len == 2; /* == and != (=== and !== are 3 long) */
+        next(p);
+        e = binary(op, pos, e, parse_rel(p));
+        e->loose = loose;
+    }
+    return e;
+}
 BINARY_LEVEL(parse_band, parse_eq, at(p, TK_AMP))
 BINARY_LEVEL(parse_bxor, parse_band, at(p, TK_CARET))
 BINARY_LEVEL(parse_bor, parse_bxor, at(p, TK_PIPE))
 BINARY_LEVEL(parse_and, parse_bor, at(p, TK_AND))
 BINARY_LEVEL(parse_or, parse_and, at(p, TK_OR))
+BINARY_LEVEL(parse_qq, parse_or, at(p, TK_QQ)) /* a ?? b: the value of a unless it is null */
 
 static bool is_assign_op(TokKind k) {
     return k == TK_ASSIGN || k == TK_PLUS_ASSIGN || k == TK_MINUS_ASSIGN || k == TK_STAR_ASSIGN || k == TK_SLASH_ASSIGN ||
-           k == TK_AMP_ASSIGN || k == TK_PIPE_ASSIGN || k == TK_CARET_ASSIGN || k == TK_SHL_ASSIGN;
+           k == TK_AMP_ASSIGN || k == TK_PIPE_ASSIGN || k == TK_CARET_ASSIGN || k == TK_SHL_ASSIGN || k == TK_QQ_ASSIGN;
 }
 
 static Expr *parse_assign(Parser *p);
 static Expr *parse_assign(Parser *p) {
-    Expr *lhs = parse_or(p);
+    Expr *lhs = parse_qq(p);
     if (at(p, TK_QUESTION)) { /* ternary, right associative */
         Expr *e = new_expr(E_COND, p->tok.pos);
         next(p);
@@ -1414,8 +1464,8 @@ static void parse_params_ex(Parser *p, Func *f, bool is_ctor) {
         const char *tfrom = p->tok.start;
         prm.type = parse_type(p);
         prm.type_src = span(p, tfrom);
-        if (opt) { /* x?: T is T | null, null when left out */
-            prm.type = ty_nullable_of(prm.type);
+        if (opt) { /* x?: T is T | null, null when left out (printed as undefined, like JavaScript) */
+            prm.type = ty_optional_of(prm.type);
             prm.dflt = new_expr(E_NULL, name.pos);
         }
         if (accept(p, TK_ASSIGN)) prm.dflt = parse_expr(p);
@@ -1798,7 +1848,7 @@ static void parse_fields_body(Parser *p, Class *c) {
             const char *tfrom = p->tok.start;
             fd.type = parse_type(p);
             fd.type_src = span(p, tfrom);
-            if (fd.optional) fd.type = ty_nullable_of(fd.type);
+            if (fd.optional) fd.type = ty_optional_of(fd.type);
             if (accept(p, TK_ASSIGN)) fd.init = parse_expr(p);
             if (!accept(p, TK_SEMI) && !at(p, TK_RBRACE)) accept(p, TK_COMMA); /* interfaces also separate with ',' or nothing */
             if (mods & MOD_ABSTRACT) xs_error(XS8106, pos, NULL, "fields cannot be abstract");
@@ -1859,7 +1909,7 @@ static Class *parse_declared_class(Parser *p, const char *prefix) {
             if (accept(p, TK_QUESTION)) fd.optional = true;
             expect(p, TK_COLON, NULL);
             fd.type = parse_type(p);
-            if (fd.optional) fd.type = ty_nullable_of(fd.type);
+            if (fd.optional) fd.type = ty_optional_of(fd.type);
             c->fields = realloc(c->fields, sizeof(Field) * (size_t)(c->nfields + 1));
             c->fields[c->nfields++] = fd;
         }

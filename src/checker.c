@@ -1402,6 +1402,11 @@ static Expr *str_lit(Pos pos, const char *str) {
 static void check_expr(Expr *e, Type *expected);
 static bool truthy_type(Type *t);
 static void make_truthy(Expr *e, const char *what);
+static void check_optchain(Expr *e, Type *expected);
+static void check_nullish(Expr *e, Type *expected);
+static bool missing_get(Expr *l);
+static Expr *copy_target(Expr *x);
+static void check_loose_eq(Expr *e);
 static bool rereadable(Expr *e);
 static Expr *expr_copy(Expr *e);
 static const char **member_names(Class *c, int *n);
@@ -2634,7 +2639,9 @@ static void check_expr(Expr *e, Type *expected) {
                 check_expr(e, ty_string);
                 return;
             }
-            if (strcmp(e->str, "undefined") == 0 || strcmp(e->str, "null") == 0)
+            if (strcmp(e->str, "undefined") == 0) /* null is xisto's only empty value (MANIFESTO: null, não undefined) */
+                xs_error(XS2016, e->pos, "xisto's one empty value is null: write null, and test with x == null (true for an absent optional too)", "'undefined' is not a value in xisto");
+            if (strcmp(e->str, "null") == 0)
                 xs_error(XS2005, e->pos, "every value in xisto has a concrete type; there is no 'undefined' or 'null'", "'%s' does not exist", e->str);
             {
                 int n; const char **cands = visible_names(&n);
@@ -2698,6 +2705,7 @@ static void check_expr(Expr *e, Type *expected) {
         }
         return;
     case E_BINARY:
+        if (e->op == TK_QQ) { check_nullish(e, expected); return; }
         if ((e->op == TK_STARSTAR || tk_bitop(e->op)) && fold_lit_int(e)) { /* 2 ** 53, 1 << 4: a literal, typed by its use */
             check_expr(e, expected);
             return;
@@ -2841,6 +2849,7 @@ static void check_expr(Expr *e, Type *expected) {
             return;
         }
         case TK_EQ: case TK_NEQ: {
+            if (e->loose) check_loose_eq(e); /* == / !=: the same as === / !== when nothing would be converted */
             /* objects, arrays and functions compare by reference (the same object), as in JS; T | null too */
             Type *lt = e->lhs->type->kind == TY_NULLABLE ? e->lhs->type->elem : e->lhs->type;
             Type *rt = e->rhs->type->kind == TY_NULLABLE ? e->rhs->type->elem : e->rhs->type;
@@ -2899,6 +2908,18 @@ static void check_expr(Expr *e, Type *expected) {
         return;
     case E_ASSIGN:
     case E_POSTFIX: {
+        if (e->kind == E_ASSIGN && e->op == TK_QQ_ASSIGN) { /* a ??= b: a = a ?? b (b runs only when a is null) */
+            Expr *again = copy_target(e->lhs);
+            if (!again) xs_error(XS8139, e->pos, "use a variable, a field or an element with a simple index: x ?\?= v", "the left side of '?\?=' must be a variable, a field or an array element");
+            Expr *qq = xs_alloc(sizeof *qq);
+            qq->kind = E_BINARY;
+            qq->op = TK_QQ;
+            qq->pos = e->pos;
+            qq->lhs = again;
+            qq->rhs = e->rhs;
+            e->op = TK_ASSIGN;
+            e->rhs = qq;
+        }
         Expr *target = e->lhs;
         const char *path_assigned = NULL; /* o.f = v: the field path, narrowed or not by what v is */
         if (e->kind == E_ASSIGN && target->kind == E_MEMBER && !target->is_call && rereadable(target->lhs) &&
@@ -4368,12 +4389,20 @@ static void check_expr(Expr *e, Type *expected) {
                 e->args.items[i] = part = t;
             }
             TypeKind k = part->type->kind;
+            if (k == TY_NULLABLE) { /* ${x} with x: T | null: "null", or "undefined" for x?: T (the text JavaScript writes) */
+                TypeKind ek = part->type->elem->kind;
+                if (ek == TY_STRING || ek == TY_INT || ek == TY_NUMBER || ek == TY_BOOLEAN || ek == TY_ENUM) {
+                    part->lit_id = intern(part->type->absent ? "undefined" : "null");
+                    continue;
+                }
+            }
             if (k != TY_STRING && k != TY_INT && k != TY_NUMBER && k != TY_BOOLEAN && k != TY_ENUM)
                 xs_error(XS8098, part->pos, "template literals take strings, numbers, ints, booleans and enums; call a method that returns a string for the rest", "cannot put a %s inside a template literal", ty_name(part->type));
         }
         e->type = ty_string;
         return;
     case E_COND: {
+        if (e->builtin.cfn && strcmp(e->builtin.cfn, "optchain") == 0) { check_optchain(e, expected); return; }
         check_expr(e->lhs, NULL);
         if (e->lhs->type->kind != TY_BOOLEAN && truthy_type(e->lhs->type)) make_truthy(e->lhs, "condition of '?:'");
         if (e->lhs->type->kind != TY_BOOLEAN)
@@ -4522,6 +4551,160 @@ static Expr *str_truthy_call(Expr *v) {
     return c;
 }
 /* rewrites e (already checked, of a truthy type) in place into a boolean test */
+
+/* ---------- null: a?.b, a ?? b, a ??= b (MANIFESTO, "null, não undefined") ---------- */
+/* v !== null for a checked v of a nullable type (no truthiness: "" and 0 are values) */
+static Expr *null_test_of(Expr *v) {
+    Expr *nul = xs_alloc(sizeof *nul);
+    nul->kind = E_NULL;
+    nul->pos = v->pos;
+    nul->type = ty_null; /* (the emitter tests a number's sentinel by this) */
+    Expr *test = xs_alloc(sizeof *test);
+    test->kind = E_BINARY;
+    test->op = TK_NEQ;
+    test->pos = v->pos;
+    test->lhs = v;
+    test->rhs = nul;
+    test->type = ty_boolean;
+    return test;
+}
+/* a?.rest (parsed as E_COND "optchain": lhs = a, str = the temporary, args[0] = the rest built on it): a is
+   evaluated once into a constant of a's non-null type that the rest reads; the whole is the rest's type made
+   nullable (null when a is null), or void for a call that returns nothing. Emitted by emit.c (E_COND optchain) */
+static void check_optchain(Expr *e, Type *expected) {
+    Expr *base = e->lhs, *rest = e->args.items[0];
+    check_expr(base, NULL);
+    settle(base);
+    Type *bt = base->type;
+    if (bt->kind == TY_NULL) xs_error(XS2001, e->pos, "only values declared as T | null can be null", "null can never be read with '?.'");
+    Type *t = bt->kind == TY_NULLABLE ? bt->elem : bt;
+    push_scope();
+    Binding *b = declare(e->pos, e->str, t, true, false, false);
+    b->no_warn = true;
+    b->used = true;
+    check_expr(rest, expected && expected->kind == TY_NULLABLE ? expected->elem : expected);
+    settle(rest);
+    missing_get(rest); /* a?.get(k): absent for a missing k too */
+    pop_scope();
+    e->cname = b->cname;
+    Type *rt = rest->type;
+    if (rt->kind == TY_VOID) e->type = ty_void;
+    else if (rt->kind == TY_NULLABLE || rt->kind == TY_NULL) e->type = rt;
+    else { /* a null a gives JavaScript's undefined: absent (a rest that is itself T | null keeps its null) */
+        if (!nullable_ok(rt)) xs_error(XS2011, e->pos, "read it after a null test: if (a !== null) ...", "'?.' cannot give a %s or null", ty_name(rt));
+        e->type = ty_optional_of(rt);
+    }
+}
+/* m.get(k) with a primitive value (a missing key is an error there: get has no null for it), read through ?? or ?.:
+   m.has(k) ? m.get(k) : absent, as JavaScript's undefined for a missing key. m a name or a field, k a name or a literal */
+static bool missing_get(Expr *l) {
+    if (!(l->kind == E_MEMBER && l->is_call && l->builtin.cfn && strcmp(l->builtin.cfn, "get") == 0 && l->lhs->type &&
+          l->lhs->type->kind == TY_MAP && l->type && l->type->kind != TY_NULLABLE && l->type->kind != TY_UNKNOWN && rereadable(l->lhs) && l->args.len == 1))
+        return false;
+    Expr *k = l->args.items[0];
+    if (k->kind != E_IDENT && k->kind != E_STRING && k->kind != E_NUMBER) return false;
+    Expr *get = expr_copy(l);
+    Expr *has = xs_alloc(sizeof *has);
+    has->kind = E_MEMBER;
+    has->pos = l->pos;
+    has->lhs = expr_copy(l->lhs);
+    has->str = "has";
+    has->is_call = true;
+    has->field = -1;
+    expr_list_push(&has->args, expr_copy(k));
+    check_expr(has, NULL);
+    Type *t = ty_optional_of(get->type);
+    Expr *nul = xs_alloc(sizeof *nul);
+    nul->kind = E_NULL;
+    nul->pos = l->pos;
+    nul->type = t;
+    memset(l, 0, sizeof *l);
+    l->kind = E_COND;
+    l->pos = get->pos;
+    l->lhs = has;
+    expr_list_push(&l->args, get);
+    expr_list_push(&l->args, nul);
+    l->type = t;
+    return true;
+}
+/* a ?? b: a unless it is null; b runs only then. With a never null, a (b is checked, never run) */
+static void check_nullish(Expr *e, Type *expected) {
+    check_expr(e->lhs, NULL);
+    settle(e->lhs);
+    Type *lt = e->lhs->type;
+    if (lt->kind == TY_NULL) {
+        Expr *r = e->rhs;
+        check_expr(r, expected);
+        *e = *r;
+        return;
+    }
+    Expr *l = e->lhs;
+    if (lt->kind != TY_NULLABLE && missing_get(l)) lt = l->type; /* m.get(k) ?? d: absent when k is missing */
+    if (lt->kind != TY_NULLABLE) {
+        check_expr(e->rhs, lt);
+        *e = *l;
+        return;
+    }
+    Type *want = lt->elem;
+    check_expr(e->rhs, want);
+    if (e->rhs->type->kind == TY_LITINT && is_numeric(want)) coerce_lit(e->rhs, want);
+    Type *res = want;
+    if (e->rhs->type->kind == TY_NULL || e->rhs->type->kind == TY_NULLABLE) res = ty_nullable_of(want);
+    expect_type(e->rhs, res, "default after '?\?'");
+    Expr *d = e->rhs;
+    if (!rereadable(e->lhs)) { /* f() ?? d: f() once (emit.c, or_once with a null test) */
+        e->kind = E_COND;
+        e->op = 0;
+        e->rhs = NULL;
+        e->args.len = 0;
+        expr_list_push(&e->args, d);
+        e->builtin.cfn = "qq_once";
+        e->type = res;
+        return;
+    }
+    Expr *val = expr_copy(e->lhs);
+    if (res == want) val->type = want; /* read only after the test passed */
+    Expr *test = null_test_of(expr_copy(e->lhs));
+    e->kind = E_COND;
+    e->op = 0;
+    e->lhs = test;
+    e->rhs = NULL;
+    e->args.len = 0;
+    expr_list_push(&e->args, val);
+    expr_list_push(&e->args, d);
+    e->type = res;
+}
+/* a copy of an unchecked target of ??= (a, a.b, this.b, a[i] with a simple index), to read it on the right */
+static Expr *copy_target(Expr *x) {
+    if (!x) return NULL;
+    switch (x->kind) {
+    case E_IDENT: case E_THIS: case E_NUMBER: return expr_copy(x);
+    case E_MEMBER:
+        if (x->is_call) break;
+        { Expr *c = expr_copy(x); c->lhs = copy_target(x->lhs); return c->lhs ? c : NULL; }
+    case E_INDEX:
+        { Expr *c = expr_copy(x); c->lhs = copy_target(x->lhs); c->rhs = copy_target(x->rhs); return c->lhs && c->rhs ? c : NULL; }
+    default: break;
+    }
+    return NULL;
+}
+/* == / != between values that JavaScript would convert first (1 == "1", 0 == false): refused */
+static int js_kind(Type *t) { /* 1 number, 2 string, 3 boolean, 0 other */
+    if (t->kind == TY_NULLABLE) t = t->elem;
+    if (t->kind == TY_NUMBER || t->kind == TY_INT || t->kind == TY_LITINT || (t->kind == TY_ENUM && !t->en->is_string)) return 1;
+    if (t->kind == TY_STRING || (t->kind == TY_ENUM && t->en->is_string)) return 2;
+    if (t->kind == TY_BOOLEAN) return 3;
+    return 0;
+}
+static void check_loose_eq(Expr *e) {
+    int a = js_kind(e->lhs->type), b = js_kind(e->rhs->type);
+    if (!a || !b || a == b) return;
+    const char *op = e->op == TK_EQ ? "==" : "!=";
+    const char *help = (a == 1 && b == 2) || (a == 2 && b == 1) ? "JavaScript would turn the string into a number first; say which: Number(s) === n, or String(n) === s"
+                     : "JavaScript would turn the boolean into a number first; compare values of one type";
+    xs_error(XS8148, e->pos, help, "'%s' between %s and %s would convert one of them", op, ty_name(e->lhs->type), ty_name(e->rhs->type));
+}
+
 static void make_truthy(Expr *e, const char *what) {
     if (!rereadable(e))
         xs_error(XS8021, e->pos, "store it in a const first, or compare explicitly", "%s must be boolean (truthiness applies to names and fields only)", what);

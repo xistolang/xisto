@@ -70,6 +70,9 @@ const char *tok_kind_name(TokKind k) {
     case TK_SLASH_ASSIGN: return "'/='";
     case TK_AMP: return "'&'";
     case TK_STARSTAR: return "'**'";
+    case TK_QQ: return "'?\?'";
+    case TK_QQ_ASSIGN: return "'?\?='";
+    case TK_QDOT: return "'?.'";
     case TK_CARET: return "'^'";
     case TK_TILDE: return "'~'";
     case TK_SHL: return "'<<'";
@@ -390,16 +393,9 @@ Token lexer_next(Lexer *lx) {
         return make(lx, TK_DOT, pos, start);
     case '@': return make(lx, TK_AT, pos, start); /* decorators */
     case '?':
-        if (n1 == '?' || (n1 == '.' && !isdigit((unsigned char)n2))) { /* (a ? .5 : b is a conditional) */
-            if (!xs_check_mode) xs_error(XS1003, pos, "there is no undefined or null in xisto, so '\?\?' and '?.' do not exist", "'?%c' is not supported", n1);
-            /* xisto check: counted where it is (also in a declaration skipped after another error: a real change, and nothing
-               else reads as these two characters), then read on as '.' or '||' so the rest of the code is still checked */
-            xs_error_continue(XS1003, pos, "there is no undefined or null in xisto, so '\?\?' and '?.' do not exist", "'?%c' is not supported", n1);
-            advance(lx);
-            if (n1 == '?') { if (peek(lx, 0) == '=') { advance(lx); return make(lx, TK_ASSIGN, pos, start); } return make(lx, TK_OR, pos, start); }
-            if (peek(lx, 0) == '[' || peek(lx, 0) == '(') return lexer_next(lx); /* a?.[i], f?.(x): the index or the call */
-            return make(lx, TK_DOT, pos, start);
-        }
+        if (n1 == '?' && n2 == '=') { advance(lx); advance(lx); return make(lx, TK_QQ_ASSIGN, pos, start); }
+        if (n1 == '?') { advance(lx); return make(lx, TK_QQ, pos, start); }
+        if (n1 == '.' && !(n2 >= '0' && n2 <= '9')) { advance(lx); return make(lx, TK_QDOT, pos, start); } /* (a?.5:1 is a ternary) */
         return make(lx, TK_QUESTION, pos, start);
     case '+':
         if (n1 == '+') { advance(lx); return make(lx, TK_PLUSPLUS, pos, start); }
@@ -419,22 +415,12 @@ Token lexer_next(Lexer *lx) {
     case '%': return make(lx, TK_PERCENT, pos, start);
     case '=':
         if (n1 == '=' && n2 == '=') { advance(lx); advance(lx); return make(lx, TK_EQ, pos, start); }
-        if (n1 == '=') {
-            if (!xs_check_mode) xs_error(XS1002, pos, "xisto has no type coercion, so '==' and '===' would mean the same thing; use '==='", "'==' is not supported");
-            xs_error_continue(XS1002, pos, "xisto has no type coercion, so '==' and '===' would mean the same thing; use '==='", "'==' is not supported");
-            advance(lx);
-            return make(lx, TK_EQ, pos, start); /* (xisto check: read on as '===') */
-        }
+        if (n1 == '=') { advance(lx); return make(lx, TK_EQ, pos, start); } /* ==: the parser marks it loose (len 2) */
         if (n1 == '>') { advance(lx); return make(lx, TK_ARROW, pos, start); }
         return make(lx, TK_ASSIGN, pos, start);
     case '!':
         if (n1 == '=' && n2 == '=') { advance(lx); advance(lx); return make(lx, TK_NEQ, pos, start); }
-        if (n1 == '=') {
-            if (!xs_check_mode) xs_error(XS1001, pos, "use '!=='", "'!=' is not supported");
-            xs_error_continue(XS1001, pos, "use '!=='", "'!=' is not supported");
-            advance(lx);
-            return make(lx, TK_NEQ, pos, start); /* (xisto check: read on as '!==') */
-        }
+        if (n1 == '=') { advance(lx); return make(lx, TK_NEQ, pos, start); } /* != */
         return make(lx, TK_NOT, pos, start);
     case '<':
         if (n1 == '=') { advance(lx); return make(lx, TK_LE, pos, start); }
