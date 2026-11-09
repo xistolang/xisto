@@ -2199,6 +2199,12 @@ static void xs_map_check_range(xs_map *m, const xs_site *s) {
     for (size_t i = 0; i < m->cap; i++)
         if (XS_MAP_FULL(m, i) && __builtin_expect(XS_IOUT(m->slots[i].val.i), 0)) XS_FAIL(XS_IOVF_MSG, s);
 }
+/* after a loop of unchecked counters in an int[] whose bound passed 2^53 - 1 (emit.c, ctr_emit_for): every element
+   back in the safe range, else the error at the first increment's site */
+static void xs_arr_int_check_range(xs_arr_int *a, const xs_site *s) {
+    for (int64_t i = 0; i < (int64_t)a->len; i++)
+        if (__builtin_expect(XS_IOUT(a->data[i]), 0)) XS_FAIL(XS_IOVF_MSG, s);
+}
 static bool xs_map_delete_at(xs_map *m, xs_map_entry *e) {
     if (!e) return false;
     m->lidx = 0;
