@@ -294,10 +294,12 @@ static void build_qbe_cached(Program *p, const char *entry, const char *outfile)
 }
 
 /* the code is for an x86 processor with 4-lane double vectors (AVX2): --cpu=native on such a machine, or a named
-   x86-64-v3/v4 or Haswell-or-later target; never for another system (--target) */
+   x86-64-v3/v4 or Haswell-or-later target; never for another system (--target). Off unless XISTO_WIDE_F64=1:
+   the only user (distribute's flat pass) measured slower on the Xeon E5-2686 v4 (nbody.ts 3,10 -> 4,24 s, 09/11) */
 static bool cpu_wide_f64(void) {
     const char *f = getenv("XISTO_WIDE_F64");
     if (f && *f) return strcmp(f, "0") != 0;
+    if (1) return false;
 #if defined(__x86_64__)
     if (!xs_cpu || xs_target) return false;
     if (strcmp(xs_cpu, "native") == 0) return __builtin_cpu_supports("avx2");
