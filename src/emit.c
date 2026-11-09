@@ -1219,6 +1219,15 @@ static void emit_lvalue_ptr(Expr *e) {
                 buf_puts(out, "])");
                 return;
             }
+            if (!arr_is_ref(e->lhs->type) && e->lhs->kind == E_IDENT) { /* its data in a C local (fix-hoist): no reload after stores */
+                int k = fx_find(e->lhs->cname);
+                if (k >= 0 && fx_decl[k]) {
+                    buf_printf(out, "(&%s_fxd[", ren(e->lhs->cname));
+                    emit_bce_index(e->rhs);
+                    buf_puts(out, "])");
+                    return;
+                }
+            }
             buf_printf(out, arr_is_ref(e->lhs->type) ? "((%s*)&(" : "(&(", ctype(e->type));
             emit_borrowed(e->lhs);
             buf_puts(out, ")->data[");
@@ -3497,55 +3506,103 @@ static bool *region_dual;        /* per region: it has dual classes (xs_rg_on_N 
    loses it. Branches meet (both must be synced), loops run twice (the body's end and its continues feed the head,
    breaks feed the exit). Conservative: anything not understood is "not known". */
 static Expr *rot_a; static int64_t rot_lo; static const char *rot_x; static Stmt *rot_target; static int rot_found, rot_state_at;
+static const char *rot_y; /* state 2: a[lo] was stored from the local rot_y (unchanged since), so x = rot_y syncs */
+#define ROT_TOP 3          /* no path has reached the point yet (the meet's identity) */
+static int rot_meet(int a, int b) { return a == ROT_TOP ? b : b == ROT_TOP ? a : a == b ? a : 0; }
+/* the least value of a local int that is only declared with int literals and only grown (+= a literal >= 0, ++):
+   INT64_MIN when it is written any other way */
+static int64_t rot_cmin_v;
+static bool rot_cmin_ok;
+static void rot_cmin_e(Expr *e, const char *n) {
+    if (!e || !rot_cmin_ok) return;
+    if (e->kind == E_ARROW) { if (e->arrow && e->arrow->fn && stmt_mentions_name(e->arrow->fn->body, n)) rot_cmin_ok = false; return; }
+    if ((e->kind == E_ASSIGN || e->kind == E_POSTFIX || e->kind == E_UNARY) && e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname && strcmp(e->lhs->cname, n) == 0) {
+        bool grow = (e->kind == E_ASSIGN && e->op == TK_PLUS_ASSIGN && e->rhs && e->rhs->kind == E_NUMBER && e->rhs->is_int_lit && e->rhs->ival >= 0) ||
+                    (e->kind == E_POSTFIX && e->op == TK_PLUSPLUS) || (e->kind == E_UNARY && e->op == TK_PLUSPLUS);
+        if (e->kind == E_UNARY && e->op != TK_PLUSPLUS && e->op != TK_MINUSMINUS) grow = true; /* (not a write: -x, !x) */
+        if (!grow) { rot_cmin_ok = false; return; }
+    }
+    rot_cmin_e(e->lhs, n); rot_cmin_e(e->rhs, n);
+    for (int i = 0; i < e->args.len; i++) rot_cmin_e(e->args.items[i], n);
+}
+static void rot_cmin_s(Stmt *s, const char *n) {
+    if (!s || !rot_cmin_ok) return;
+    if (s->kind == S_VAR && s->cname && strcmp(s->cname, n) == 0) {
+        if (s->cell || !s->init || s->init->kind != E_NUMBER || !s->init->is_int_lit) { rot_cmin_ok = false; return; }
+        if (s->init->ival < rot_cmin_v) rot_cmin_v = s->init->ival;
+    }
+    rot_cmin_e(s->init, n); rot_cmin_e(s->expr, n); rot_cmin_e(s->cond, n); rot_cmin_e(s->for_update, n);
+    rot_cmin_s(s->for_init, n); rot_cmin_s(s->body, n); rot_cmin_s(s->else_body, n);
+    for (int i = 0; i < s->stmts.len; i++) rot_cmin_s(s->stmts.items[i], n);
+    for (int i = 0; i < s->ncases; i++) rot_cmin_s(s->cases[i].body, n);
+}
+static bool rot_idx_above(Expr *i) { /* an index provably above lo: a local counter that starts above it and only grows */
+    if (!i || i->kind != E_IDENT || !i->cname || strncmp(i->cname, "v_", 2) != 0 || !cur_func || !cur_func->body) return false;
+    if (i->type && i->type->kind != TY_INT) return false;
+    rot_cmin_v = INT64_MAX; rot_cmin_ok = true;
+    rot_cmin_s(cur_func->body, i->cname);
+    return rot_cmin_ok && rot_cmin_v != INT64_MAX && rot_cmin_v > rot_lo;
+}
 static int rot_expr(Expr *e, int st); /* the state after evaluating e */
 static int rot_stmt(Stmt *s, int st, int *brk, int *cont);
 static bool rot_idx_is_other_literal(Expr *i) { return i && i->kind == E_NUMBER && i->is_int_lit && i->ival != rot_lo; }
 static int rot_expr(Expr *e, int st) {
     if (!e) return st;
-    if (e->kind == E_ARROW) return (e->arrow && e->arrow->fn && stmt_mentions_name(e->arrow->fn->body, rot_x)) ? 0 : st;
+    if (e->kind == E_ARROW) return (e->arrow && e->arrow->fn && (stmt_mentions_name(e->arrow->fn->body, rot_x) || (rot_y && stmt_mentions_name(e->arrow->fn->body, rot_y)))) ? 0 : st;
     if ((e->kind == E_ASSIGN || e->kind == E_POSTFIX || e->kind == E_UNARY) && e->lhs) {
         Expr *t = e->lhs;
         if (t->kind == E_IDENT && t->cname && strcmp(t->cname, rot_x) == 0) { /* x = ... */
             if (e->kind != E_ASSIGN || e->op != TK_ASSIGN) return 0;
-            st = rot_expr(e->rhs, st);
+            int before = rot_expr(e->rhs, st);
+            if (before == 2 && rot_y && e->rhs->kind == E_IDENT && e->rhs->cname && strcmp(e->rhs->cname, rot_y) == 0) return 1; /* x = y, a[lo] holds y */
             return u8_is_index_on(e->rhs, rot_a->cname) && e->rhs->rhs->kind == E_NUMBER && e->rhs->rhs->is_int_lit && e->rhs->rhs->ival == rot_lo ? 1 : 0;
+        }
+        if (rot_y && t->kind == E_IDENT && t->cname && strcmp(t->cname, rot_y) == 0) { /* y written: a[lo] no longer known to hold it */
+            st = rot_expr(e->rhs, st);
+            return st == 2 ? 0 : st;
         }
         if (u8_is_index_on(t, rot_a->cname)) { /* a[i] = ... */
             st = rot_expr(t->rhs, st); st = rot_expr(e->rhs, st);
-            return rot_idx_is_other_literal(t->rhs) ? st : 0;
+            Expr *ix = t->rhs;
+            if (ix && ix->kind == E_NUMBER && ix->is_int_lit && ix->ival == rot_lo && e->kind == E_ASSIGN && e->op == TK_ASSIGN && e->rhs && e->rhs->kind == E_IDENT && e->rhs->cname) {
+                if (strcmp(e->rhs->cname, rot_x) == 0) return 1;                              /* a[lo] = x */
+                if (!rot_y || strcmp(rot_y, e->rhs->cname) == 0) { rot_y = e->rhs->cname; return 2; } /* a[lo] = y */
+                return 0;
+            }
+            return rot_idx_is_other_literal(ix) || rot_idx_above(ix) ? st : 0;
         }
     }
     st = rot_expr(e->lhs, st); st = rot_expr(e->rhs, st);
     for (int i = 0; i < e->args.len; i++) st = rot_expr(e->args.items[i], st);
     return st;
 }
-static int rot_min(int a, int b) { return a < b ? a : b; }
 static int rot_loop(Stmt *s, int st) {
     int head = st, exit = st;
-    for (int pass = 0; pass < 2; pass++) {
-        int brk = 1, cont = 1;
+    for (int pass = 0; pass < 3; pass++) {
+        int brk = ROT_TOP, cont = ROT_TOP;
         int h = head;
         if (s->kind == S_FOR && pass == 0) h = rot_stmt(s->for_init, h, NULL, NULL);
         h = rot_expr(s->cond, h);
         if (s->kind == S_FOROF) h = rot_expr(s->expr, h);
         int end = rot_stmt(s->body, h, &brk, &cont);
         end = rot_expr(s->for_update, end);
-        head = rot_min(rot_min(st, end), cont);
-        exit = rot_min(rot_min(head, end), brk);
+        head = rot_meet(rot_meet(st, end), cont);
+        exit = rot_meet(rot_meet(head, end), brk);
     }
     return exit;
 }
 static int rot_stmt(Stmt *s, int st, int *brk, int *cont) {
     if (!s) return st;
-    if (s == rot_target) { rot_found = 1; rot_state_at = rot_min(rot_state_at, st); }
+    if (s == rot_target) { rot_found = 1; rot_state_at = rot_meet(rot_state_at, st); }
     switch (s->kind) {
     case S_VAR:
         st = rot_expr(s->init, st);
+        if (st == 2 && rot_y && s->cname && strcmp(s->cname, rot_y) == 0) return 0;
         if (s->cname && strcmp(s->cname, rot_x) == 0)
             return s->init && u8_is_index_on(s->init, rot_a->cname) && s->init->rhs->kind == E_NUMBER && s->init->rhs->is_int_lit && s->init->rhs->ival == rot_lo ? 1 : 0;
         return st;
     case S_EXPR: return rot_expr(s->expr, st);
-    case S_IF: { int c = rot_expr(s->cond, st); return rot_min(rot_stmt(s->body, c, brk, cont), s->else_body ? rot_stmt(s->else_body, c, brk, cont) : c); }
+    case S_IF: { int c = rot_expr(s->cond, st); return rot_meet(rot_stmt(s->body, c, brk, cont), s->else_body ? rot_stmt(s->else_body, c, brk, cont) : c); }
     case S_BLOCK: for (int i = 0; i < s->stmts.len; i++) st = rot_stmt(s->stmts.items[i], st, brk, cont); return st;
     case S_FOR: case S_WHILE: case S_FOROF: {
         U8Idiom m; /* an idiom's range reaching lo writes it; otherwise the loop is walked */
@@ -3555,9 +3612,9 @@ static int rot_stmt(Stmt *s, int st, int *brk, int *cont) {
         }
         return rot_loop(s, st);
     }
-    case S_SWITCH: { int c = rot_expr(s->expr, st), r = c; for (int i = 0; i < s->ncases; i++) r = rot_min(r, rot_stmt(s->cases[i].body, c, brk, cont)); return r; }
-    case S_BREAK: if (brk) *brk = rot_min(*brk, st); return st;
-    case S_CONTINUE: if (cont) *cont = rot_min(*cont, st); return st;
+    case S_SWITCH: { int c = rot_expr(s->expr, st), r = c; for (int i = 0; i < s->ncases; i++) r = rot_meet(r, rot_stmt(s->cases[i].body, c, brk, cont)); return r; }
+    case S_BREAK: if (brk) *brk = rot_meet(*brk, st); return st;
+    case S_CONTINUE: if (cont) *cont = rot_meet(*cont, st); return st;
     case S_RETURN: case S_THROW: return rot_expr(s->expr, st);
     case S_TRY: return 0;
     default: return 0;
@@ -3565,8 +3622,8 @@ static int rot_stmt(Stmt *s, int st, int *brk, int *cont) {
 }
 static bool u8_rot_ok(Stmt *target, Expr *a, Expr *lo, Expr *x) {
     if (!cur_func || !cur_func->body || !x->cname || lo->kind != E_NUMBER || !lo->is_int_lit) return false;
-    rot_a = a; rot_lo = lo->ival; rot_x = x->cname; rot_target = target; rot_found = 0; rot_state_at = 1;
-    int brk = 1, cont = 1;
+    rot_a = a; rot_lo = lo->ival; rot_x = x->cname; rot_target = target; rot_found = 0; rot_state_at = ROT_TOP; rot_y = NULL;
+    int brk = ROT_TOP, cont = ROT_TOP;
     rot_stmt(cur_func->body, 0, &brk, &cont); /* x starts unknown */
     return rot_found && rot_state_at == 1;
 }
@@ -5893,6 +5950,106 @@ static bool dctr_is(Expr *e) {
     for (int i = 0; i < ndctr; i++) if (dctr_e[i] == e) return true;
     return false;
 }
+/* ---- index checks of a while loop's counter (wib, XB-098) ----
+   `let i = c; ...; while (... && i < E && ...) { ... i += 1; ... }` (in that block, c an int literal >= 0, nothing
+   between the declaration and the loop writing i, one increment at the body's top level and no other write of i, E
+   a literal or a name (+/- a literal) the loop does not write): i starts at c and only grows while i < E held, so
+   everywhere in the condition and the body c <= i <= max(c, E). The loop is emitted twice: without the checks of
+   a[i] (and of E's own arithmetic), run when c < a.length and E < a.length for each such a (the arrays the body
+   cannot resize, bce_ok) and E is a safe integer; and as written otherwise, which fails where it failed.
+   (fannkuch-redux's next permutation as one writes it first: count[i].) Off unless XISTO_WIB=1: measured on the
+   Xeon E5-2686 v4 it gains nothing there (1.31-1.35 u against 1.31 u without, n = 11, one CPU): the guard runs once
+   per permutation and the loop it covers rarely runs more than once. */
+static bool wib_busy;
+static bool wib_e_ok(Expr *e) { /* a literal, a name, or a name +/- a literal */
+    if (!e || !e->type || e->type->kind != TY_INT) return false;
+    if (e->kind == E_NUMBER) return e->is_int_lit && e->ival > -(INT64_C(1) << 52) && e->ival < (INT64_C(1) << 52);
+    if (e->kind == E_IDENT) return e->cname && (strncmp(e->cname, "v_", 2) == 0 || e->cname[0] == 'g'); /* (a plain local or a global, not a cell) */
+    if (e->kind == E_BINARY && (e->op == TK_PLUS || e->op == TK_MINUS))
+        return (e->lhs->kind == E_IDENT && wib_e_ok(e->lhs) && e->rhs->kind == E_NUMBER && wib_e_ok(e->rhs)) ||
+               (e->op == TK_PLUS && e->lhs->kind == E_NUMBER && wib_e_ok(e->lhs) && e->rhs->kind == E_IDENT && wib_e_ok(e->rhs));
+    return false;
+}
+static void wib_e_c(Buf *g, Expr *e) { /* E as plain C (no overflow: names are safe integers, literals below 2^52) */
+    if (e->kind == E_NUMBER) { buf_printf(g, "INT64_C(%lld)", (long long)e->ival); return; }
+    if (e->kind == E_IDENT) { buf_puts(g, ren(e->cname)); return; }
+    buf_puts(g, "("); wib_e_c(g, e->lhs); buf_puts(g, e->op == TK_PLUS ? " + " : " - "); wib_e_c(g, e->rhs); buf_puts(g, ")");
+}
+static Expr *wib_bound(Expr *c, const char *i) { /* the E of a top-level conjunct `i < E` */
+    if (!c || c->kind != E_BINARY) return NULL;
+    if (c->op == TK_AND) { Expr *e = wib_bound(c->lhs, i); return e ? e : wib_bound(c->rhs, i); }
+    if (c->op == TK_LT && c->lhs && c->lhs->kind == E_IDENT && c->lhs->cname && strcmp(c->lhs->cname, i) == 0 && wib_e_ok(c->rhs)) return c->rhs;
+    return NULL;
+}
+static bool wib_names_ok(Expr *e, Stmt *w) { /* E's names: not written by the loop; a global only when the body calls no user code */
+    if (!e) return true;
+    if (e->kind == E_IDENT) {
+        if (bce_writes(w->body, e->cname) || bce_writes_e(w->cond, e->cname)) return false;
+        if (!bce_plain_local(e->cname)) { bce_fixed_len = false; bool ok = bce_stmt_ok(w->body, "\x01") && bce_body_ok(w->cond, NULL, "\x01"); return ok; }
+        return true;
+    }
+    return wib_names_ok(e->lhs, w) && wib_names_ok(e->rhs, w);
+}
+static void wib_arrays(Expr *e, const char *i, const char **arrs, Type **ts, int *na) {
+    if (!e) return;
+    if (e->kind == E_INDEX && e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname && e->rhs && e->rhs->kind == E_IDENT && e->rhs->cname &&
+        strcmp(e->rhs->cname, i) == 0 && bce_indexable(e->lhs->type) && !e->builtin.cfn) {
+        bool seen = false;
+        for (int k = 0; k < *na; k++) if (strcmp(arrs[k], e->lhs->cname) == 0) seen = true;
+        if (!seen && *na < 8) { ts[*na] = e->lhs->type; arrs[(*na)++] = e->lhs->cname; }
+    }
+    wib_arrays(e->lhs, i, arrs, ts, na); wib_arrays(e->rhs, i, arrs, ts, na);
+    for (int k = 0; k < e->args.len; k++) wib_arrays(e->args.items[k], i, arrs, ts, na);
+}
+static void wib_arrays_s(Stmt *s, const char *i, const char **arrs, Type **ts, int *na) {
+    if (!s) return;
+    wib_arrays(s->init, i, arrs, ts, na); wib_arrays(s->expr, i, arrs, ts, na); wib_arrays(s->cond, i, arrs, ts, na); wib_arrays(s->for_update, i, arrs, ts, na);
+    wib_arrays_s(s->for_init, i, arrs, ts, na); wib_arrays_s(s->body, i, arrs, ts, na); wib_arrays_s(s->else_body, i, arrs, ts, na);
+    for (int k = 0; k < s->stmts.len; k++) wib_arrays_s(s->stmts.items[k], i, arrs, ts, na);
+    for (int k = 0; k < s->ncases; k++) wib_arrays_s(s->cases[k].body, i, arrs, ts, na);
+}
+/* the guard (C) of while loop w in block b at index wi, its counter and bound in *ci and *E; NULL when it does not apply */
+static char *wib_match(Stmt *b, int wi, Stmt *w, const char **ci, Expr **E, const char **arrs, int *na) {
+    if (wib_busy || xs_debug || sm_mode || ictx || !getenv("XISTO_WIB") || getenv("XISTO_NO_BCE") || !b || !w->body || w->body->kind != S_BLOCK) return NULL;
+    Stmt *body = w->body;
+    const char *i = NULL;
+    int inc = -1;
+    for (int k = 0; k < body->stmts.len; k++) {
+        const char *c = NULL;
+        if (dctr_inc(body->stmts.items[k], &c) && wib_bound(w->cond, c)) { if (inc >= 0) return NULL; inc = k; i = c; }
+    }
+    if (!i) return NULL;
+    for (int k = 0; k < body->stmts.len; k++) if (k != inc && bce_writes(body->stmts.items[k], i)) return NULL;
+    if (bce_writes_e(w->cond, i)) return NULL;
+    int d = -1;
+    for (int k = 0; k < wi; k++) { Stmt *t = b->stmts.items[k]; if (t->kind == S_VAR && t->cname && strcmp(t->cname, i) == 0) d = k; }
+    if (d < 0) return NULL;
+    Stmt *dv = b->stmts.items[d];
+    if (dv->cell || !dv->init || dv->init->kind != E_NUMBER || !dv->init->is_int_lit || dv->init->ival < 0 || dv->init->ival > RNG_LEN) return NULL;
+    for (int k = d + 1; k < wi; k++) if (bce_writes(b->stmts.items[k], i)) return NULL;
+    Expr *e = wib_bound(w->cond, i);
+    if (!e || !wib_names_ok(e, w)) return NULL;
+    Type *ts[8];
+    int n = 0;
+    wib_arrays(w->cond, i, arrs, ts, &n);
+    wib_arrays_s(body, i, arrs, ts, &n);
+    int keep = 0;
+    for (int k = 0; k < n; k++) if (bce_ok(body, arrs[k], ts[k], false) && bce_body_ok(w->cond, NULL, arrs[k])) { ts[keep] = ts[k]; arrs[keep++] = arrs[k]; }
+    if (!keep) return NULL;
+    Buf g = {0};
+    buf_puts(&g, "(");
+    wib_e_c(&g, e);
+    buf_puts(&g, ") >= -INT64_C(9007199254740991)");
+    for (int k = 0; k < keep; k++) {
+        int fk = fx_find(arrs[k]);
+        const char *len = fk >= 0 && fx_decl[fk] ? xs_sprintf("%s_fxl", ren(arrs[k])) : bce_len_c(arrs[k], ts[k]); /* (a C local under fix-hoist) */
+        buf_printf(&g, " && INT64_C(%lld) < %s && (", (long long)dv->init->ival, len);
+        wib_e_c(&g, e);
+        buf_printf(&g, ") < %s", len);
+    }
+    *ci = i; *E = e; *na = keep;
+    return g.data;
+}
 static bool emit_u8_idiom(Stmt *s) {
     if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
     U8Idiom m;
@@ -6443,6 +6600,34 @@ static void emit_stmt_(Stmt *s) {
         return;
     }
     case S_WHILE: {
+        {
+            const char *wi_i = NULL, *wi_a[8];
+            Expr *wi_e = NULL;
+            int wi_n = 0;
+            char *g = blk_cur ? wib_match(blk_cur, blk_cur_i, s, &wi_i, &wi_e, wi_a, &wi_n) : NULL;
+            if (g) {
+                buf_printf(out, "if (%s) {", g);
+                indent++;
+                int saved = nbce;
+                for (int k = 0; k < wi_n && nbce < 16; k++) bce_loops[nbce++] = (BceLoop){wi_i, wi_a[k], true, NULL};
+                bool rs = wi_e->rng_set; long long rl = wi_e->rng_lo, rh = wi_e->rng_hi;
+                if (wi_e->kind == E_BINARY) { wi_e->rng_set = true; wi_e->rng_lo = -RNG_SAFE; wi_e->rng_hi = RNG_LEN; } /* (the guard bounds it) */
+                wib_busy = true;
+                nl(); emit_stmt(s);
+                wib_busy = false;
+                wi_e->rng_set = rs; wi_e->rng_lo = rl; wi_e->rng_hi = rh;
+                nbce = saved;
+                indent--;
+                nl(); buf_puts(out, "} else {");
+                indent++;
+                wib_busy = true;
+                nl(); emit_stmt(s);
+                wib_busy = false;
+                indent--;
+                nl(); buf_puts(out, "}");
+                return;
+            }
+        }
         if (emit_u8_while_rev(s)) { drain_if_needed(); return; }
         Expr *dc[4];
         int saved_ndctr = ndctr;
