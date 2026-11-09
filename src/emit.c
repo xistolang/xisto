@@ -604,6 +604,9 @@ static EScope *escope;
 static void emit_releases(EScope *s);
 static void emit_block(Stmt *b, bool func_root);
 static Stmt *blk_prev_stmt; /* in the block loops: the statement before the one being emitted, in the same block */
+static bool dctr_is(Expr *e);
+static Stmt *blk_cur; /* the block whose statement is being emitted, and its index (dctr) */
+static int blk_cur_i;
 static void nl(void);
 
 static void epush(bool func_root) {
@@ -3014,6 +3017,12 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, "; })");
             return;
         }
+        if (e->type->kind == TY_INT && e->op == TK_PLUS_ASSIGN && dctr_is(e)) { /* (dctr: the test waits for the loop's end) */
+            buf_puts(out, "(");
+            emit_lvalue(e->lhs);
+            buf_puts(out, " += 1)");
+            return;
+        }
         if (e->type->kind == TY_INT && e->op != TK_ASSIGN) {
             const char *fn = e->op == TK_PLUS_ASSIGN ? "xs_iadd_to" : e->op == TK_MINUS_ASSIGN ? "xs_isub_to" : "xs_imul_to";
             buf_printf(out, "%s_s(", fn);
@@ -3042,6 +3051,12 @@ static void emit_expr_raw(Expr *e) {
         }
         if (e->type->kind == TY_INT && e->builtin.cfn && strcmp(e->builtin.cfn, "counted_inc") == 0) {
             buf_puts(out, "(");   /* the i++ of `for (...; i < n; i++)`: cannot overflow (see S_FOR) */
+            emit_lvalue(e->lhs);
+            buf_puts(out, "++)");
+            return;
+        }
+        if (e->type->kind == TY_INT && e->op == TK_PLUSPLUS && e->kind == E_POSTFIX && dctr_is(e)) { /* (dctr: the test waits for the loop's end) */
+            buf_puts(out, "(");
             emit_lvalue(e->lhs);
             buf_puts(out, "++)");
             return;
@@ -3558,7 +3573,65 @@ static bool u8_rot_ok(Stmt *target, Expr *a, Expr *lo, Expr *x) {
 /* `for (j = lo; j <= K; j++) a[j] = a[j + 1]; a[K + 1] = v;` with a in a register (fannkuch-redux's next
    permutation): one call, the shuffle and the lane (xs_v16_shl_put). b->stmts[*i] is the loop; on a match the
    pair is emitted and *i skips the store. */
+/* `a[L - 1] = y; for (j = L; j < E; j++) a[j] = a[j + 1]; a[E] = x;` (or j <= K and a[K + 1]) with a in a register and
+   y holding a[L] (a[L] itself, or a const read from it right before): the three together move a[L..E] down one
+   place and put x at E, one shuffle and one lane (xs_v16_shl_put on [L - 1, E - 1]); a rotation of a[L - 1..E], one
+   shuffle, when x is known to hold a[L - 1] before the first store (u8_rot_ok). Both when the shift runs at least
+   once (E >= L). (fannkuch-redux's next permutation as one writes it first.) When
+   E < L the statements run as written. The checks: a rotation of [L - 1, E] is in range exactly when E is, as the
+   statements' own tests. XISTO_NO_ROT3=1 keeps them. */
+static bool emit_u8_rot3(Stmt *b, int *i) {
+    if (*i + 2 >= b->stmts.len || xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM") || getenv("XISTO_NO_ROT3")) return false;
+    Stmt *s0 = b->stmts.items[*i], *lp = b->stmts.items[*i + 1], *st = b->stmts.items[*i + 2];
+    Expr *e0 = s0->kind == S_EXPR ? s0->expr : NULL;
+    if (!e0 || e0->kind != E_ASSIGN || e0->op != TK_ASSIGN || !e0->lhs || e0->lhs->kind != E_INDEX || !e0->lhs->lhs || e0->lhs->lhs->kind != E_IDENT || !e0->lhs->lhs->cname) return false;
+    Expr *a = e0->lhs->lhs;
+    U8Reg *rg = u8reg_find(a);
+    if (!rg || !e0->lhs->rhs || e0->lhs->rhs->kind != E_NUMBER || !e0->lhs->rhs->is_int_lit) return false;
+    int64_t L1 = e0->lhs->rhs->ival; /* L - 1 */
+    U8Idiom m;
+    if (lp->kind != S_FOR || !match_u8_idiom(lp, &m) || m.kind != 3 || !m.a || !m.a->cname || strcmp(m.a->cname, a->cname) != 0) return false;
+    if (!m.lo || m.lo->kind != E_NUMBER || !m.lo->is_int_lit || m.lo->ival != L1 + 1) return false;
+    bool le = lp->cond->op == TK_LE;
+    if (!le && lp->cond->op != TK_LT) return false;
+    /* y holds a[L]: a[L] itself, or a const read from a[L] right before s0 with nothing between */
+    Expr *y = e0->rhs;
+    bool y_ok = y && u8_is_index_on(y, a->cname) && y->rhs->kind == E_NUMBER && y->rhs->is_int_lit && y->rhs->ival == L1 + 1;
+    if (!y_ok && y && y->kind == E_IDENT && y->cname && *i > 0) {
+        Stmt *d = b->stmts.items[*i - 1];
+        y_ok = d->kind == S_VAR && d->cname && strcmp(d->cname, y->cname) == 0 && d->init && u8_is_index_on(d->init, a->cname) &&
+               d->init->rhs->kind == E_NUMBER && d->init->rhs->is_int_lit && d->init->rhs->ival == L1 + 1;
+    }
+    if (!y_ok) return false;
+    /* the store after the loop: a[E] = x (j < E) or a[K + 1] = x (j <= K) */
+    Expr *as = st->kind == S_EXPR ? st->expr : NULL;
+    if (!as || as->kind != E_ASSIGN || as->op != TK_ASSIGN || !u8_is_index_on(as->lhs, a->cname) || !as->rhs || as->rhs->kind != E_IDENT || !as->rhs->cname) return false;
+    Expr *ix = as->lhs->rhs;
+    if (le) { if (!ix || ix->kind != E_BINARY || ix->op != TK_PLUS || !same_simple(ix->lhs, m.hi) || !ix->rhs || ix->rhs->kind != E_NUMBER || ix->rhs->num != 1) return false; }
+    else if (!same_simple(ix, lp->cond->rhs) || !bce_pure(ix)) return false;
+    Expr lo1 = {0}; lo1.kind = E_NUMBER; lo1.is_int_lit = true; lo1.ival = L1; lo1.num = (double)L1; lo1.type = ty_int;
+    const char *fn = u8_rot_ok(s0, a, &lo1, as->rhs) ? "xs_v16_rot" : "xs_v16_shl_put";
+    int site = new_site(lp->pos);
+    nl();
+    emit_dbg_hook(s0);
+    /* hi of the rotation: E - 1 (j < E) or K */
+    buf_puts(out, "if ((");
+    if (le) emit_expr(m.hi); else { buf_puts(out, "("); emit_expr(ix); buf_puts(out, ") - 1"); }
+    buf_printf(out, ") >= INT64_C(%lld)) { ", (long long)L1);
+    emit_u8reg_name(a); buf_printf(out, " = %s(", fn); emit_u8reg_name(a); buf_printf(out, ", INT64_C(%lld), ", (long long)L1);
+    if (le) emit_expr(m.hi); else { buf_puts(out, "("); emit_expr(ix); buf_puts(out, ") - 1"); }
+    buf_puts(out, ", "); emit_expr(as->rhs); buf_printf(out, ", %s, XS_S(%d)); } else ", rgn(rg), site);
+    buf_puts(out, "{");
+    indent++;
+    for (int k = 0; k < 3; k++) { nl(); emit_stmt(b->stmts.items[*i + k]); }
+    indent--;
+    nl();
+    buf_puts(out, "}");
+    *i += 2;
+    return true;
+}
 static bool emit_u8_shl_put(Stmt *b, int *i) {
+    if (emit_u8_rot3(b, i)) return true;
     if (*i + 1 >= b->stmts.len || xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
     Stmt *lp = b->stmts.items[*i], *st = b->stmts.items[*i + 1];
     U8Idiom m;
@@ -3596,7 +3669,7 @@ static void emit_block_kind(Stmt *b, ScopeKind kind) {
         nl();
         emit_dbg_hook(b->stmts.items[i]);
         blk_prev_stmt = i > 0 ? b->stmts.items[i - 1] : NULL;
-        emit_stmt(b->stmts.items[i]);
+        { Stmt *sb = blk_cur; int si = blk_cur_i; blk_cur = b; blk_cur_i = i; emit_stmt(b->stmts.items[i]); blk_cur = sb; blk_cur_i = si; }
     }
     emit_releases(escope);
     epop();
@@ -3624,7 +3697,7 @@ static void emit_block(Stmt *b, bool func_root) {
         nl();
         emit_dbg_hook(b->stmts.items[i]);
         blk_prev_stmt = i > 0 ? b->stmts.items[i - 1] : NULL;
-        emit_stmt(b->stmts.items[i]);
+        { Stmt *sb = blk_cur; int si = blk_cur_i; blk_cur = b; blk_cur_i = i; emit_stmt(b->stmts.items[i]); blk_cur = sb; blk_cur_i = si; }
         if (i == 0 && after_super) emit_own_field_inits(after_super); /* super(...) ran: now the class's own fields */
     }
     emit_releases(escope);
@@ -5760,6 +5833,66 @@ static bool emit_u8_map_par(Stmt *s) {
     emit_expr(fi->init); buf_puts(out, ", "); emit_expr(c->rhs); buf_puts(out, ")) ");
     return false; /* (the loop follows: the fallback) */
 }
+/* ---- a while loop's counter with its range test at the loop's end (XISTO_NO_LOOP_CTR=1 keeps the test) ----
+   while (...) { ...; c += 1; ... } where c is a local int declared with a literal in the same block before the loop
+   (nothing between mentions it), `c += 1` (or c++) is the body's only mention of c at its own level and nothing else
+   in the loop reads or writes c, and the body has no return, break, throw, try or yield, in a program without try:
+   the increments add without the test, and one test after the loop raises the error at the increment's site. c can
+   pass 2^53 - 1 only after 2^53 iterations of the loop, and nothing reads it in between (as the Map counters'
+   deferred test, loop_hoist_enter). */
+static Expr *dctr_e[8];
+static int ndctr;
+static bool dctr_has_exit(Stmt *s) {
+    if (!s) return false;
+    if (s->kind == S_RETURN || s->kind == S_BREAK || s->kind == S_THROW || s->kind == S_TRY || s->kind == S_YIELD) return true;
+    if (dctr_has_exit(s->for_init) || dctr_has_exit(s->body) || dctr_has_exit(s->else_body)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (dctr_has_exit(s->stmts.items[i])) return true;
+    for (int i = 0; i < s->ncases; i++) if (dctr_has_exit(s->cases[i].body)) return true;
+    return false;
+}
+static bool ctr_stmt_mentions(Stmt *s, const char *x);
+static bool ctr_expr_mentions(Expr *e, const char *x);
+/* the increment statement's expression, and its variable, when s is `c += 1` / `c++` on a local int */
+static Expr *dctr_inc(Stmt *s, const char **c) {
+    if (!s || s->kind != S_EXPR || !s->expr) return NULL;
+    Expr *e = s->expr;
+    bool inc = (e->kind == E_ASSIGN && e->op == TK_PLUS_ASSIGN && e->rhs && e->rhs->kind == E_NUMBER && e->rhs->is_int_lit && e->rhs->ival == 1) ||
+               (e->kind == E_POSTFIX && e->op == TK_PLUSPLUS);
+    if (!inc || !e->type || e->type->kind != TY_INT || !e->lhs || e->lhs->kind != E_IDENT || !e->lhs->cname || e->lhs->cname[0] != 'v') return NULL;
+    *c = e->lhs->cname;
+    return e;
+}
+/* the deferred counters of while loop w (in block b at index wi): noted in dctr_e, their checks' sites in sites */
+static int dctr_enter(Stmt *b, int wi, Stmt *w, Expr **found, int max) {
+    if (xs_debug || sm_mode || ictx || prog_try || getenv("XISTO_NO_LOOP_CTR") || !b || !w || !w->body || w->body->kind != S_BLOCK) return 0;
+    if (dctr_has_exit(w->body)) return 0;
+    int n = 0;
+    Stmt *body = w->body;
+    for (int i = 0; i < body->stmts.len && n < max; i++) {
+        const char *c = NULL;
+        Expr *e = dctr_inc(body->stmts.items[i], &c);
+        if (!e) continue;
+        bool ok = !ctr_expr_mentions(w->cond, c);
+        for (int k = 0; k < body->stmts.len && ok; k++) if (k != i && ctr_stmt_mentions(body->stmts.items[k], c)) ok = false;
+        /* declared with an int literal earlier in b, nothing between it and the loop mentioning c */
+        int d = -1;
+        for (int k = 0; k < wi && ok; k++) {
+            Stmt *t = b->stmts.items[k];
+            if (t->kind == S_VAR && t->cname && strcmp(t->cname, c) == 0) d = k;
+        }
+        if (!ok || d < 0 || b->stmts.items[d]->cell || !b->stmts.items[d]->init || b->stmts.items[d]->init->kind != E_NUMBER ||
+            !b->stmts.items[d]->init->is_int_lit || b->stmts.items[d]->init->ival < 0) continue;
+        for (int k = d + 1; k < wi && ok; k++) if (ctr_stmt_mentions(b->stmts.items[k], c)) ok = false;
+        if (!ok) continue;
+        found[n++] = e;
+    }
+    for (int k = 0; k < n && ndctr < 8; k++) dctr_e[ndctr++] = found[k];
+    return n;
+}
+static bool dctr_is(Expr *e) {
+    for (int i = 0; i < ndctr; i++) if (dctr_e[i] == e) return true;
+    return false;
+}
 static bool emit_u8_idiom(Stmt *s) {
     if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
     U8Idiom m;
@@ -6311,6 +6444,9 @@ static void emit_stmt_(Stmt *s) {
     }
     case S_WHILE: {
         if (emit_u8_while_rev(s)) { drain_if_needed(); return; }
+        Expr *dc[4];
+        int saved_ndctr = ndctr;
+        int ndc = blk_cur ? dctr_enter(blk_cur, blk_cur_i, s, dc, 4) : 0;
         /* a condition that makes temporaries is drained on every iteration, not after the loop */
         bool cond_ar;
         char *cond = emit_expr_to_str(s->cond, &cond_ar);
@@ -6321,6 +6457,11 @@ static void emit_stmt_(Stmt *s) {
             buf_printf(out, "while (1) { bool cond_ = (%s); xs_ar_drain(ar_mark); if (!cond_) break; ", cond);
             emit_block_kind(s->body, SC_LOOP_BODY);
             buf_puts(out, " }");
+        }
+        ndctr = saved_ndctr;
+        for (int k = 0; k < ndc; k++) {
+            int site = new_site(dc[k]->pos);
+            buf_printf(out, " xs_ichk_hi_s(%s, XS_S(%d));", ren(dc[k]->lhs->cname), site);
         }
         used_ar = false;
         return;
