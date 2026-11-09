@@ -3359,6 +3359,35 @@ XS_NOINLINE bool xs_json_bool(xs_jv *v, const char *where) {
     if (v->kind != XJ_BOOL) xs_panicf("JSON: '%s' must be true or false", where);
     return v->b;
 }
+static void xs_sb_num(xs_sb *b, double v);
+static void xs_sb_str(xs_sb *b, xs_str *s);
+static void xs_json_raw_into(xs_sb *b, xs_jv *v) { /* a parsed JSON value written back as JSON text */
+    switch (v->kind) {
+    case XJ_NULL: xs_sb_put(b, "null", 4); break;
+    case XJ_BOOL: xs_sb_bool(b, v->b); break;
+    case XJ_NUM: xs_sb_num(b, v->num); break;
+    case XJ_STR: { xs_str *s = xs_str_new(v->str, v->slen); xs_sb_str(b, s); xs_release(s); break; }
+    case XJ_ARR:
+        xs_sb_put(b, "[", 1);
+        for (size_t i = 0; i < v->n; i++) { if (i) xs_sb_put(b, ",", 1); xs_json_raw_into(b, v->items[i]); }
+        xs_sb_put(b, "]", 1);
+        break;
+    case XJ_OBJ:
+        xs_sb_put(b, "{", 1);
+        for (size_t i = 0; i < v->n; i++) {
+            if (i) xs_sb_put(b, ",", 1);
+            xs_str *k = xs_str_new(v->keys[i], strlen(v->keys[i]));
+            xs_sb_str(b, k);
+            xs_release(k);
+            xs_sb_put(b, ":", 1);
+            xs_json_raw_into(b, v->items[i]);
+        }
+        xs_sb_put(b, "}", 1);
+        break;
+    }
+}
+/* an `object` field read from JSON: its JSON text, as an object value is held */
+XS_NOINLINE xs_str *xs_json_raw(xs_jv *v, const char *where) { (void)where; xs_sb b = {0}; xs_json_raw_into(&b, v); return xs_sb_finish(&b); }
 XS_NOINLINE xs_str *xs_json_str(xs_jv *v, const char *where) { if (v->kind != XJ_STR) xs_panicf("JSON: '%s' must be a string", where); return xs_str_new(v->str, v->slen); }
 XS_NOINLINE xs_jv *xs_json_arr(xs_jv *v, const char *where) { if (v->kind != XJ_ARR) xs_panicf("JSON: '%s' must be an array", where); return v; }
 
@@ -4312,6 +4341,7 @@ static xs_arr_ref *xs_argv;
 static xs_map *xs_env;
 static xs_arr_ref *xs_process_argv(void) { return xs_argv; }
 static xs_map *xs_process_env(void) { return xs_env; }
+static int64_t xs_process_pid(void) { return (int64_t)getpid(); } /* process.pid */
 static void xs_process_exit(int64_t code) { fflush(stdout); exit((int)code); }
 /* process.stdout.write / process.stderr.write: through the same FILE as console.log, so the order is kept */
 static inline void xs_out_drain(void);

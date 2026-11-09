@@ -1600,6 +1600,20 @@ static bool enter_union(Expr *e, Type *want) {
 }
 static void expect_type(Expr *e, Type *want, const char *what) {
     if ((want->kind == TY_NUMBER || (want->kind == TY_NULLABLE && want->elem->kind == TY_NUMBER)) && widen_inferred(e)) return;
+    if (e->type->kind == TY_INT && (want->kind == TY_NUMBER || (want->kind == TY_NULLABLE && want->elem->kind == TY_NUMBER))) {
+        /* an int where a number goes (total: items.length): exact, since an int is within ±(2^53−1); TypeScript has
+           only number, so code written for it does this everywhere */
+        Expr *a = xs_alloc(sizeof *a);
+        *a = *e;
+        memset(e, 0, sizeof *e);
+        e->kind = E_CALL; e->pos = a->pos; e->field = -1; e->type = ty_number;
+        e->builtin.cfn = "xs_to_number";
+        expr_list_push(&e->args, a);
+        Expr *callee = xs_alloc(sizeof *callee);
+        callee->kind = E_IDENT; callee->pos = a->pos; callee->str = "Number"; callee->field = -1;
+        e->lhs = callee;
+        if (want->kind == TY_NUMBER) return;
+    }
     /* a numeric enum is a number (TypeScript): HttpStatus.UNAUTHORIZED where an int goes */
     if (e->type->kind == TY_ENUM && !e->type->en->is_string && (want->kind == TY_INT || want->kind == TY_NUMBER)) { if (want->kind == TY_INT) e->type = ty_int; else return; }
     if (e->type->kind == TY_INT && want->kind == TY_INT) return;
@@ -2215,6 +2229,8 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
         unify(tmpl->params[i].type, e->args.items[i]->type, tmpl, bind);
     }
     if (expected && has_tparam(tmpl->ret)) unify(tmpl->ret, expected, tmpl, bind);
+    for (int i = 0; i < tmpl->ntparams; i++) /* <T = string>: what nothing bound takes its default */
+        if (!bind[i] && tmpl->tdefaults && tmpl->tdefaults[i]) bind[i] = resolve(tmpl->tdefaults[i], e->pos);
     for (int i = 0; i < tmpl->ntparams; i++)
         if (!bind[i]) xs_error(XS3010, e->pos, xs_sprintf("give it: %s<Type>(...)", tmpl->name), "cannot infer type parameter %s of %s", tmpl->tparams[i], what);
     Func *inst = instantiate_func(tmpl, bind);
@@ -3103,6 +3119,29 @@ static void check_expr(Expr *e, Type *expected) {
                 e->builtin.cfn = name[2] == 'N' ? "xs_is_nan" : "xs_is_finite";
                 return;
             }
+            if (strcmp(name, "setTimeout") == 0 || strcmp(name, "setInterval") == 0) { /* Node's timers: a callback later, on the event loop */
+                if (e->args.len != 2) xs_error(XS8035, e->pos, xs_sprintf("%s(() => { ... }, ms)", name), "%s takes a callback and a delay in milliseconds", name);
+                Type *cbt = ty_func(NULL, 0, ty_void);
+                check_expr(e->args.items[0], cbt);
+                expect_type(e->args.items[0], cbt, xs_sprintf("callback of %s", name));
+                check_expr(e->args.items[1], ty_number);
+                if (e->args.items[1]->type->kind == TY_LITINT) coerce_lit(e->args.items[1], ty_number);
+                expect_type(e->args.items[1], ty_number, "the delay");
+                e->type = ty_int;
+                e->builtin.cfn = name[3] == 'T' ? "xs_set_timeout" : "xs_set_interval";
+                prog->uses_net = true; /* timers live with the event loop */
+                return;
+            }
+            if (strcmp(name, "clearTimeout") == 0 || strcmp(name, "clearInterval") == 0) {
+                if (e->args.len != 1) xs_error(XS8035, e->pos, NULL, "%s takes the timer's id", name);
+                check_expr(e->args.items[0], ty_number);
+                if (e->args.items[0]->type->kind == TY_LITINT) coerce_lit(e->args.items[0], ty_number);
+                expect_type(e->args.items[0], ty_number, "the timer's id");
+                e->type = ty_void;
+                e->builtin.cfn = "xs_clear_timer";
+                prog->uses_net = true;
+                return;
+            }
             if (strcmp(name, "btoa") == 0 || strcmp(name, "atob") == 0) { /* base64 of a string of bytes (code points 0..255) */
                 if (e->args.len != 1) xs_error(XS8035, e->pos, NULL, "%s takes one string", name);
                 check_expr(e->args.items[0], ty_string);
@@ -3230,7 +3269,11 @@ static void check_expr(Expr *e, Type *expected) {
                     }
                     init->type = ty_void;
                 }
-                e->type = ty_object_of(find_class("Response"));
+                { /* the built-in Response, also where a module has a class of that name (Express's) */
+                    Class *fr = NULL;
+                    for (int i = 0; i < nbuiltins; i++) if (strcmp(builtins[i]->name, "Response") == 0) fr = builtins[i];
+                    e->type = ty_object_of(fr);
+                }
                 e->builtin.cfn = "xs_fetch";
                 prog->uses_net = true;
                 /* TLS is linked only when https can happen: an http:// URL (TLS ends at the load balancer) costs nothing */
@@ -3478,6 +3521,7 @@ static void check_expr(Expr *e, Type *expected) {
             if (strcmp(ns, "process") == 0) {
                 if (!e->is_call && strcmp(e->str, "argv") == 0) { e->type = ty_array_of(ty_string); e->builtin.cfn = "xs_process_argv"; return; }
                 if (!e->is_call && strcmp(e->str, "env") == 0) { e->type = ty_map_of(ty_string, ty_string); e->builtin.cfn = "xs_process_env"; return; }
+                if (!e->is_call && strcmp(e->str, "pid") == 0) { e->type = ty_int; e->builtin.cfn = "xs_process_pid"; return; }
                 if (e->is_call && strcmp(e->str, "exit") == 0) {
                     if (e->args.len > 1) xs_error(XS7082, e->pos, NULL, "process.exit takes at most one argument");
                     if (e->args.len == 1) { check_expr(e->args.items[0], ty_int); expect_type(e->args.items[0], ty_int, "exit code"); }
@@ -3611,6 +3655,13 @@ static void check_expr(Expr *e, Type *expected) {
                 Func *m = NULL;
                 for (int i = 0; i < c->nstatics; i++)
                     if (strcmp(c->statics[i]->name, e->str) == 0) m = c->statics[i];
+                if (!m && !e->is_call && strcmp(e->str, "name") == 0) { /* MyService.name: the class's name, as a string */
+                    e->kind = E_STRING;
+                    e->str = c->name;
+                    e->lhs = NULL;
+                    check_expr(e, expected);
+                    return;
+                }
                 if (!m || !e->is_call) xs_error(XS8016, e->pos, NULL, "%s has no static member '%s'", c->name, e->str);
                 check_args(e, m, xs_sprintf("%s.%s", c->name, m->name));
                 e->func = m;
@@ -4043,6 +4094,36 @@ static void check_expr(Expr *e, Type *expected) {
             }
             if (!pick && nobj == 1)
                 for (int i = 0; i < t->nparams; i++) if (t->params[i]->kind == TY_OBJECT) pick = t->params[i];
+            bool any_lit = false; /* (a union told apart by a kind field never falls back to keys: a wrong kind is an error) */
+            for (int i = 0; i < t->nparams; i++) {
+                Type *m = t->params[i];
+                if (m->kind != TY_OBJECT || m->cls->builtin) continue;
+                for (int k = 0; k < m->cls->nfields; k++) if (m->cls->fields[k].type->kind == TY_STRING && m->cls->fields[k].type->tname) any_lit = true;
+            }
+            if (!pick && !any_lit) { /* by its keys: the one member that has a field for every key given and gets every field it
+                            requires ({ provide, useValue } is a ValueProvider, { provide, useFactory } a FactoryProvider) */
+                int nfit = 0;
+                Type *fit = NULL;
+                for (int i = 0; i < t->nparams; i++) {
+                    Type *m = t->params[i];
+                    if (m->kind != TY_OBJECT || m->cls->builtin || m->cls->ctor) continue;
+                    bool ok = true;
+                    for (int j = 0; j < e->args.len && ok; j++) {
+                        bool has = false;
+                        for (int k = 0; k < m->cls->nfields; k++) if (strcmp(m->cls->fields[k].name, e->keys[j]) == 0) has = true;
+                        if (!has) ok = false;
+                    }
+                    for (int k = 0; k < m->cls->nfields && ok; k++) {
+                        Field *fd = &m->cls->fields[k];
+                        if (fd->optional || fd->init) continue;
+                        bool given = false;
+                        for (int j = 0; j < e->args.len; j++) if (strcmp(e->keys[j], fd->name) == 0) given = true;
+                        if (!given) ok = false;
+                    }
+                    if (ok) { nfit++; fit = m; }
+                }
+                if (nfit == 1) pick = fit;
+            }
             if (!pick) xs_error(XS2014, e->pos, "give the member's kind field its literal value", "cannot tell which member of %s this object is", ty_name(t));
             t = pick;
         }
@@ -5867,7 +5948,8 @@ void check_program(Program *p) {
         for (int j = 0; j < i; j++)
             if (p->classes[j]->mod == c->mod && strcmp(c->name, p->classes[j]->name) == 0) xs_error(XS9015, c->pos, NULL, "class '%s' is declared twice", c->name);
         for (int j = 0; j < nbuiltins; j++)
-            if (strcmp(c->name, builtins[j]->name) == 0 && !((strcmp(c->name, "Worker") == 0 || strcmp(c->name, "MessagePort") == 0) && !wt_imports(c->mod, c->name)))
+            if (strcmp(c->name, builtins[j]->name) == 0 && !((strcmp(c->name, "Worker") == 0 || strcmp(c->name, "MessagePort") == 0) && !wt_imports(c->mod, c->name)) &&
+                strcmp(c->name, "Response") != 0) /* (Express's Response: a module's own class comes first where it is declared or imported) */
                 xs_error(XS9002, c->pos, NULL, "'%s' is a built-in class", c->name);
         SYM_EACH(funcs_by_name, c->name, e)
             if (((Func *)e->decl)->mod == c->mod) xs_error(XS9006, c->pos, NULL, "'%s' is both a class and a function", c->name);

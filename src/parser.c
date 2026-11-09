@@ -100,6 +100,7 @@ static Expr *parse_expr(Parser *p);
 static Expr *parse_assign(Parser *p);
 static Stmt *parse_stmt(Parser *p);
 static Type *parse_type(Parser *p);
+static Token expect_name(Parser *p);
 
 /* Unresolved class names are stored as objects of a placeholder class; the checker resolves them. */
 static Type *named_type(Parser *p, Token name) {
@@ -602,6 +603,7 @@ static Expr *parse_primary(Parser *p) {
         while (!at(p, TK_RBRACE)) {
             Token key;
             if (at(p, TK_IDENT) || at(p, TK_STRING)) { key = p->tok; next(p); }
+            else if (peek_is(p, TK_COLON) && tok_kind_name(p->tok.kind)[0] == '\'') key = expect_name(p); /* { enum: E } */
             else { xs_error(XS1018, p->tok.pos, "keys are names or strings: { id: 1, \"Content-Type\": \"x\" }", "expected a key in the object literal"); return NULL; }
             Expr *val;
             if (accept(p, TK_COLON)) val = parse_assign(p);
@@ -775,7 +777,7 @@ static Expr *parse_postfix(Parser *p) {
             e = ix;
         } else if (at(p, TK_DOT)) {
             next(p);
-            Token name = expect(p, TK_IDENT, NULL);
+            Token name = expect_name(p);
             Expr *m = new_expr(E_MEMBER, name.pos);
             m->lhs = e;
             m->str = name.str;
@@ -1484,8 +1486,11 @@ static void parse_tparams(Parser *p, Func *f) {
     expect(p, TK_LT, NULL);
     do {
         f->tparams = realloc(f->tparams, sizeof(char *) * (size_t)(f->ntparams + 1));
+        f->tdefaults = realloc(f->tdefaults, sizeof(Type *) * (size_t)(f->ntparams + 1));
+        f->tdefaults[f->ntparams] = NULL;
         f->tparams[f->ntparams++] = expect(p, TK_IDENT, NULL).str;
         if (at_ident(p, "extends")) { next(p); parse_type(p); }
+        if (accept(p, TK_ASSIGN)) f->tdefaults[f->ntparams - 1] = parse_type(p); /* <T = string> */
     } while (accept(p, TK_COMMA));
     expect(p, TK_GT, "close the type parameters: <T, U>");
 }
@@ -1568,6 +1573,22 @@ static int skip_modifiers(Parser *p) {
     }
 }
 
+
+/* a property name: an identifier, or a keyword used as one (TypeScript allows { enum: E }, obj.default, a field
+   named class): the keyword's text becomes the name */
+static Token expect_name(Parser *p) {
+    if (at(p, TK_IDENT)) return expect(p, TK_IDENT, NULL);
+    const char *k = tok_kind_name(p->tok.kind);
+    size_t n = k ? strlen(k) : 0;
+    if (n > 2 && k[0] == '\'' && k[n - 1] == '\'' && isalpha((unsigned char)k[1])) {
+        Token t = p->tok;
+        t.kind = TK_IDENT;
+        t.str = xs_strndup(k + 1, n - 2);
+        next(p);
+        return t;
+    }
+    return expect(p, TK_IDENT, NULL);
+}
 static void parse_fields_body(Parser *p, Class *c);
 
 /* interface Name { a: T; b?: U }  or  type Name = { a: T, b: U }; */
@@ -1713,7 +1734,7 @@ static void parse_fields_body(Parser *p, Class *c) {
         }
         Token name;
         if (sym_iter) { name = p->tok; name.kind = TK_IDENT; name.str = "__iterator"; name.pos = pos; }
-        else name = expect(p, TK_IDENT, NULL);
+        else name = expect_name(p);
         if (gen_method && !at(p, TK_LPAREN) && !at(p, TK_LT)) xs_error(XS8064, name.pos, NULL, "'*' marks a generator method: *%s(): Generator<T> { ... }", name.str);
         if (accessor) {
             if (!at(p, TK_LPAREN)) xs_error(XS1037, p->tok.pos, NULL, "write %s %s(...) { ... }", accessor == 1 ? "get" : "set", name.str);
@@ -1842,12 +1863,30 @@ static void parse_fields_body(Parser *p, Class *c) {
             fd.readonly = (mods & MOD_READONLY) != 0;
             fd.owner = c;
             if (accept(p, TK_QUESTION)) fd.optional = true;
-            if (!at(p, TK_COLON))
+            bool inferred = false;
+            if (!at(p, TK_COLON) && at(p, TK_ASSIGN) && !fd.optional) { /* logger = new Logger(X.name), count = 0: the type the
+                                                                          value has, when its syntax says it */
+                Parser look = *p;
+                next(&look);
+                if (at(&look, TK_NEW)) {
+                    next(&look);
+                    if (at(&look, TK_IDENT)) {
+                        const char *from = look.tok.start;
+                        Type *t = parse_type(&look);
+                        if (at(&look, TK_LPAREN) && t && t->kind != TY_ARRAY) { fd.type = t; fd.type_src = span(&look, from); inferred = true; }
+                    }
+                } else if (at(&look, TK_STRING) || at(&look, TK_TEMPLATE)) { fd.type = ty_string; fd.type_src = "string"; inferred = true; }
+                else if (at(&look, TK_TRUE) || at(&look, TK_FALSE)) { fd.type = ty_boolean; fd.type_src = "boolean"; inferred = true; }
+                else if (at(&look, TK_NUMBER)) { fd.type = ty_number; fd.type_src = "number"; inferred = true; }
+            }
+            if (!inferred && !at(p, TK_COLON))
                 xs_error(XS3011, p->tok.pos, "fields need an explicit type: base: string;", "field '%s' has no type", name.str);
-            next(p);
-            const char *tfrom = p->tok.start;
-            fd.type = parse_type(p);
-            fd.type_src = span(p, tfrom);
+            if (!inferred) {
+                next(p);
+                const char *tfrom = p->tok.start;
+                fd.type = parse_type(p);
+                fd.type_src = span(p, tfrom);
+            }
             if (fd.optional) fd.type = ty_optional_of(fd.type);
             if (accept(p, TK_ASSIGN)) fd.init = parse_expr(p);
             if (!accept(p, TK_SEMI) && !at(p, TK_RBRACE)) accept(p, TK_COMMA); /* interfaces also separate with ',' or nothing */
@@ -2145,6 +2184,10 @@ static bool class_decorated(Class *c) {
     return false;
 }
 static void tinfo(Buf *b, const char *t) {
+    if (strcmp(t, "object") == 0 || strcmp(t, "unknown") == 0) { /* any value: no JSON adapters of its own */
+        buf_puts(b, "{ kind: \"other\", id: \"unknown\", decode: (json: string): unknown => null, encode: (value: unknown): string => \"null\", schema: \"{}\" }");
+        return;
+    }
     buf_printf(b, "{ kind: __reflect_kind(%s), id: __reflect_typeid(%s), decode: __reflect_decoder(%s), encode: __reflect_encoder(%s), schema: __reflect_schema(%s) }", t, t, t, t, t);
 }
 static void params_info(Buf *b, Func *f) {
@@ -2170,6 +2213,8 @@ static void reflect_class(Buf *g, Module *m, Class *c) {
     params_info(g, c->ctor);
     bool data_only = false; /* a DTO (fields without values, no constructor): no `new`, JSON makes it */
     for (int k = 0; k < c->nfields && !c->ctor; k++) if (!c->fields[k].init && !c->fields[k].optional) data_only = true;
+    for (int k = 0; c->ctor && k < c->ctor->nparams; k++) /* new X(response: object): not built by an injector */
+        if (c->ctor->params[k].type_src && strcmp(c->ctor->params[k].type_src, "object") == 0) data_only = true;
     if (data_only) {
         buf_printf(g, ",\n  construct: (args: unknown[]): unknown => { throw new Error(\"%s is filled from JSON, not constructed\"); },\n  methods: [", c->name);
     } else {
@@ -2177,10 +2222,13 @@ static void reflect_class(Buf *g, Module *m, Class *c) {
         call_args(g, c->ctor);
         buf_puts(g, "),\n  methods: [");
     }
+    bool first_m = true;
     for (int k = 0; k < c->nmethods; k++) {
         Func *f = c->methods[k];
+        if (f->ntparams) continue; /* a generic method (get<T>(key)): no single signature to describe; decorators never name one */
         bool is_void = strcmp(f->ret_src, "void") == 0 || strcmp(f->ret_src, "Promise<void>") == 0;
-        buf_printf(g, "%s\n    { name: \"%s\", params: ", k ? "," : "", f->name);
+        buf_printf(g, "%s\n    { name: \"%s\", params: ", first_m ? "" : ",", f->name);
+        first_m = false;
         params_info(g, f);
         buf_puts(g, ", returns: ");
         if (is_void) tinfo(g, "void"); else tinfo(g, f->ret_src);
@@ -2196,12 +2244,14 @@ static void reflect_class(Buf *g, Module *m, Class *c) {
         buf_printf(g, ", get: (o: unknown): unknown => (o as %s).%s }", c->name, fd->name);
     }
     buf_puts(g, "],\n};\n");
-    for (int k = 0; k < c->nmethods; k++) {
+    for (int k = 0, rk = 0; k < c->nmethods; k++) {
         Func *f = c->methods[k];
+        if (f->ntparams) continue; /* (not described: see above) */
         for (int i = f->nparams - 1; i >= 0; i--)
             for (int d = f->params[i].decos.len - 1; d >= 0; d--)
-                apply(g, &f->params[i].decos.items[d], xs_sprintf("%s, %s.methods[%d], %d", ci_name, ci_name, k, i));
-        for (int d = f->decos.len - 1; d >= 0; d--) apply(g, &f->decos.items[d], xs_sprintf("%s, %s.methods[%d]", ci_name, ci_name, k));
+                apply(g, &f->params[i].decos.items[d], xs_sprintf("%s, %s.methods[%d], %d", ci_name, ci_name, rk, i));
+        for (int d = f->decos.len - 1; d >= 0; d--) apply(g, &f->decos.items[d], xs_sprintf("%s, %s.methods[%d]", ci_name, ci_name, rk));
+        rk++;
     }
     for (int k = 0; k < c->nfields; k++)
         for (int d = c->fields[k].decos.len - 1; d >= 0; d--) apply(g, &c->fields[k].decos.items[d], xs_sprintf("%s, %s.fields[%d]", ci_name, ci_name, k));
@@ -2749,7 +2799,13 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
         dir[sizeof dir - 1] = 0;
         char *found = NULL;
         bool has_project = false;
-        for (;;) {
+        const char *extra = getenv("XISTO_PKGS"); /* --pkgs DIR: packages installed outside the project */
+        if (extra && *extra) {
+            char probe[PATH_MAX];
+            snprintf(probe, sizeof probe, "%s/%s", extra, file);
+            if (access(probe, R_OK) == 0) found = xs_strndup(probe, strlen(probe));
+        }
+        for (; !found;) {
             char *slash = strrchr(dir, '/');
             if (!slash) break;
             *slash = 0;

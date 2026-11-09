@@ -1,0 +1,8 @@
+{
+  "name": "@nestjs/config",
+  "version": "0.1.0",
+  "license": "MIT",
+  "implements": { "@nestjs/config": "^3" },
+  "main": "index.ts",
+  "dependencies": { "@nestjs/common": "0.1.0" }
+}

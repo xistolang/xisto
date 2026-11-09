@@ -1395,6 +1395,7 @@ static void json_emit_value(Buf *b, Type *t, const char *expr) { /* appends into
 
 static void json_emit_read(Buf *b, Type *t, const char *jv, const char *where) { /* yields an owned value expression */
     switch (t->kind) {
+    case TY_JSON: buf_printf(b, "xs_json_raw(%s, \"%s\")", jv, where); break; /* an `object` field: its JSON text */
     case TY_NUMBER: buf_printf(b, "xs_json_num(%s, \"%s\")", jv, where); break;
     case TY_INT: buf_printf(b, "xs_json_int(%s, \"%s\")", jv, where); break;
     case TY_BOOLEAN: buf_printf(b, "xs_json_bool(%s, \"%s\")", jv, where); break;

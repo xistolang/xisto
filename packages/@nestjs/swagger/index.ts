@@ -1,7 +1,7 @@
 // @nestjs/swagger for xisto: the OpenAPI 3.0 document of a Nest application, built from what the @nestjs/common
 // decorators recorded and from the types the compiler knows (TypeInfo.schema). DTOs need no @ApiProperty: the
 // shape of every body, parameter and response is its TypeScript type, as the Nest CLI plugin would derive it.
-import { ClassInfo, MethodInfo } from "xisto:reflect";
+import { ClassInfo, FieldInfo, MethodInfo } from "xisto:reflect";
 import { __controllers, __guards, __params, __routes, GuardDef, ParamDef, RouteDef } from "@nestjs/common";
 import { joinPath, moduleControllers, NestApplication } from "@nestjs/core";
 
@@ -55,9 +55,11 @@ export interface ApiOperationOptions {
   summary?: string;
   description?: string;
 }
-export interface ApiResponseOptions {
+export class ApiResponseOptions {
   status: int;
   description?: string;
+  type: unknown = null;
+  isArray?: boolean;
 }
 interface OperationDoc {
   method: string;
@@ -115,6 +117,64 @@ export function ApiResponse(o: ApiResponseOptions): (c: ClassInfo, m: MethodInfo
       list.push(d);
     }
   };
+}
+
+/** Options of @ApiProperty / @ApiPropertyOptional (the schema comes from the field's type; these are accepted). */
+export class ApiPropertyOptions {
+  description?: string;
+  example: unknown = null;
+  required?: boolean;
+  type: unknown = null;
+  enum: unknown = null;
+  isArray?: boolean;
+  format?: string;
+  nullable?: boolean;
+  default: unknown = null;
+  minimum?: number;
+  maximum?: number;
+  maxLength?: int;
+  minLength?: int;
+  deprecated?: boolean;
+}
+
+/** Documents a DTO field (its schema is the field's TypeScript type). */
+export function ApiProperty(o: ApiPropertyOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return (c: ClassInfo, f: FieldInfo): void => {};
+}
+
+/** Documents an optional DTO field. */
+export function ApiPropertyOptional(o: ApiPropertyOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return (c: ClassInfo, f: FieldInfo): void => {};
+}
+
+/** Options of @ApiBody, @ApiParam and @ApiQuery (accepted: the route's types already describe them). */
+export class ApiParamOptions {
+  name?: string;
+  description?: string;
+  required?: boolean;
+  type: unknown = null;
+  example: unknown = null;
+  enum: unknown = null;
+  schema: unknown = null;
+  isArray?: boolean;
+}
+
+export function ApiBody(o: ApiParamOptions = {}): (c: ClassInfo, m: MethodInfo) => void {
+  return (c: ClassInfo, m: MethodInfo): void => {};
+}
+export function ApiParam(o: ApiParamOptions = {}): (c: ClassInfo, m: MethodInfo) => void {
+  return (c: ClassInfo, m: MethodInfo): void => {};
+}
+export function ApiQuery(o: ApiParamOptions = {}): (c: ClassInfo, m: MethodInfo) => void {
+  return (c: ClassInfo, m: MethodInfo): void => {};
+}
+/** The media types a route accepts (accepted). */
+export function ApiConsumes(mime: string): (c: ClassInfo, m: MethodInfo) => void {
+  return (c: ClassInfo, m: MethodInfo): void => {};
+}
+/** The media types a route answers with (accepted). */
+export function ApiProduces(mime: string): (c: ClassInfo, m: MethodInfo) => void {
+  return (c: ClassInfo, m: MethodInfo): void => {};
 }
 
 // ---- the document ----
