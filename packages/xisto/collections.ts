@@ -51,6 +51,47 @@ import { parallelFrom } from "xisto:parallel";
  */
 export class Counter<K> {
   private readonly counts: Map<K, int> = new Map<K, int>();
+  // a counter whose counts are still somewhere else (countSubstrings: packed keys): get asks lookup, anything that
+  // needs the values themselves first moves every count in with fill (once)
+  private pending: boolean = false;
+  private lookup: (key: K) => int = (key: K) => 0;
+  private fill: (into: Counter<K>) => void = (into: Counter<K>) => {};
+
+  /**
+   * Makes this counter answer {@link Counter.get} from somewhere else, and fill itself only when something needs
+   * every value ({@link Counter.entries}, {@link Counter.mostCommon}, {@link Counter.size}, {@link Counter.has},
+   * {@link Counter.add}). Used by {@link countSubstrings}, so that a k-mer count looked up for a few keys never
+   * builds a string for each of its millions of substrings.
+   *
+   * @param lookup - The count of one value, as {@link Counter.get} gives it (0 for a value never counted).
+   * @param fill - Adds every value with its count to the counter it is given, in the order they first occurred;
+   *   called once, the first time it is needed.
+   *
+   * @remarks
+   * Compatibility: the same in Node and in xisto. Meant for a function that builds counters, like
+   * {@link countSubstrings}; a counter made with `new Counter()` does not need it.
+   *
+   * @example
+   * ```ts
+   * const c = new Counter<string>();
+   * c.deferTo((key) => (key === "a" ? 3 : 0), (into) => into.add("a", 3));
+   * console.log(c.get("a"), c.size); // 3 1
+   * ```
+   */
+  deferTo(lookup: (key: K) => int, fill: (into: Counter<K>) => void): void {
+    this.pending = true;
+    this.lookup = lookup;
+    this.fill = fill;
+  }
+
+  private materialize(): void {
+    if (!this.pending) return;
+    this.pending = false;
+    const fill = this.fill;
+    this.fill = (into: Counter<K>) => {};
+    this.lookup = (key: K) => 0;
+    fill(this);
+  }
 
   /**
    * Counts a value once more, or `count` more times.
@@ -68,6 +109,7 @@ export class Counter<K> {
    * ```
    */
   add(key: K, count: int = 1): void {
+    this.materialize();
     if (this.counts.has(key)) this.counts.set(key, this.counts.get(key)! + count);
     else this.counts.set(key, count);
   }
@@ -86,6 +128,7 @@ export class Counter<K> {
    * ```
    */
   get(key: K): int {
+    if (this.pending) return this.lookup(key);
     return this.counts.has(key) ? this.counts.get(key)! : 0;
   }
 
@@ -103,6 +146,7 @@ export class Counter<K> {
    * ```
    */
   has(key: K): boolean {
+    this.materialize();
     return this.counts.has(key);
   }
 
@@ -119,6 +163,7 @@ export class Counter<K> {
    * ```
    */
   get size(): int {
+    this.materialize();
     return this.counts.size;
   }
 
@@ -137,6 +182,7 @@ export class Counter<K> {
    * ```
    */
   entries(): [K, int][] {
+    this.materialize();
     return Array.from(this.counts);
   }
 
@@ -154,6 +200,7 @@ export class Counter<K> {
    * ```
    */
   mostCommon(): [K, int][] {
+    this.materialize();
     return Array.from(this.counts).sort((a: [K, int], b: [K, int]) => b[1] - a[1]);
   }
 }
@@ -173,6 +220,7 @@ const PACKED_BITS: int = 46; // a substring is packed into a key when bits * len
 const POW2_16: int[] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
 const BASE: int[] = [1, 2, 4, 8, 16, 32, 64, 128];
 
+const SAMPLE: int = 1 << 16; // the start of a text whose characters are taken as all of them, then checked
 const MIN_PIECE: int = 1 << 16; // fewer characters than this per thread are not worth a thread
 const MAP_PIECES: int = 2; // pieces of a length counted in a Map (each piece's table is merged afterwards; M4: 3 pieces cost 0,3 cpu-s more for the same wall time)
 
@@ -238,7 +286,7 @@ function countPiece(codes: Uint8Array, length: int, bits: int, lo: int, hi: int)
 // the counter of one length: the pieces' pairs in flat[from, to) added up in their order (each piece's keys in
 // the order they first appear, the pieces in text order: so the order of first appearance in the whole text);
 // each substring made back from its key, `bits` per character, the first one highest
-function counterOf(letters: int[], bits: int, flat: int[], from: int, to: int, length: int): Counter<string> {
+function counterOf(letters: int[], bits: int, flat: int[], from: int, to: int, length: int, result: Counter<string>): void {
   const slot = new Map<int, int>();
   const keys: int[] = [];
   const counts: int[] = [];
@@ -251,8 +299,7 @@ function counterOf(letters: int[], bits: int, flat: int[], from: int, to: int, l
       counts.push(flat[i + 1]);
     }
   }
-  const result = new Counter<string>();
-  if (counts.length === 0) return result;
+  if (counts.length === 0) return;
   const base = BASE[bits];
   const decoder = new TextDecoder();
   const piece = new Uint8Array(length);
@@ -264,7 +311,31 @@ function counterOf(letters: int[], bits: int, flat: int[], from: int, to: int, l
     }
     result.add(decoder.decode(piece), counts[i]);
   }
-  return result;
+}
+
+// the count of one substring from the pieces' pairs in flat[from, to) (its key packed as countPiece packs it;
+// 0 for a substring of another length or with a character the text does not have): what Counter.get answers
+// before anything needs every substring as a string
+function packedCount(key: string, codeOf: int[], bits: int, flat: int[], from: int, to: int, length: int): int {
+  if (key.length !== length) return 0;
+  const base = BASE[bits];
+  let k: int = 0;
+  for (let c = 0; c < length; c++) {
+    const ch = Math.trunc(key.charCodeAt(c));
+    if (ch >= 128 || codeOf[ch] < 0) return 0;
+    k = k * base + codeOf[ch];
+  }
+  let total: int = 0;
+  for (let i = from; i < to; i += 2) if (flat[i] === k) total += flat[i + 1];
+  return total;
+}
+
+// a counter for one length that answers get from the packed pairs and makes the strings only when they are needed
+function deferredCounter(letters: int[], codeOf: int[], bits: int, flat: int[], from: int, to: int, length: int): Counter<string> {
+  const counter = new Counter<string>();
+  counter.deferTo((key: string) => packedCount(key, codeOf, bits, flat, from, to, length),
+    (into: Counter<string>) => counterOf(letters, bits, flat, from, to, length, into));
+  return counter;
 }
 
 /**
@@ -298,16 +369,37 @@ export function countSubstrings(text: string, lengths: int[]): Counter<string>[]
   const bytes = new TextEncoder().encode(text);
   const n = bytes.length;
   const threads = availableParallelism();
-  // the characters that occur (each numbered by its place in letters: any numbering gives the same counts)
-  const scans = Math.max(1, Math.min(threads, Math.trunc(n / MIN_PIECE)));
-  const seen = parallelFrom(scans, (p) => bytesIn(bytes, Math.trunc(n * p / scans), Math.trunc(n * (p + 1) / scans)));
-  const letters: int[] = [];
+  // the characters that occur (each numbered by its place in letters: any numbering gives the same counts).
+  // First a guess from the start of the text, checked by converting every character with it (a character it does
+  // not know becomes 255, which no letter's number is) and looking for a 255 (one fast search); a text with
+  // another character further on is scanned whole, as before
+  let letters: int[] = [];
   let ascii = true;
-  for (const s of seen) if (s[128] === 1) ascii = false;
-  for (let b = 0; b < 128; b++) {
-    let occurs = false;
-    for (const s of seen) if (s[b] === 1) occurs = true;
-    if (occurs) letters.push(b);
+  let converted = false;
+  if (n > SAMPLE) {
+    const sample = bytesIn(bytes, 0, SAMPLE);
+    if (sample[128] === 0) {
+      for (let b = 0; b < 128; b++) if (sample[b] === 1) letters.push(b);
+      const code = new Uint8Array(256).fill(255);
+      for (let i = 0; i < letters.length; i++) code[letters[i]] = i;
+      for (let i = 0; i < n; i++) bytes[i] = code[bytes[i]];
+      if (bytes.indexOf(255) < 0) converted = true;
+      else { // another character further on: the text's bytes back, and the whole scan
+        const again = new TextEncoder().encode(text);
+        for (let i = 0; i < n; i++) bytes[i] = again[i];
+        letters = [];
+      }
+    }
+  }
+  if (!converted) {
+    const scans = Math.max(1, Math.min(threads, Math.trunc(n / MIN_PIECE)));
+    const seen = parallelFrom(scans, (p) => bytesIn(bytes, Math.trunc(n * p / scans), Math.trunc(n * (p + 1) / scans)));
+    for (const s of seen) if (s[128] === 1) ascii = false;
+    for (let b = 0; b < 128; b++) {
+      let occurs = false;
+      for (const s of seen) if (s[b] === 1) occurs = true;
+      if (occurs) letters.push(b);
+    }
   }
   let bits: int = 1;
   while (POW2[bits] < letters.length) bits++;
@@ -334,7 +426,7 @@ export function countSubstrings(text: string, lengths: int[]): Counter<string>[]
   }
   // each character as its number, once (in place: these bytes are this function's own copy of the text), instead
   // of through a table in every length's pass
-  if (ascii) {
+  if (ascii && !converted) {
     const code = new Uint8Array(256);
     for (let i = 0; i < letters.length; i++) code[letters[i]] = i;
     for (let i = 0; i < n; i++) bytes[i] = code[bytes[i]];
@@ -357,7 +449,15 @@ export function countSubstrings(text: string, lengths: int[]): Counter<string>[]
     }
     to[li] = at;
   }
-  const counters = parallelFrom(lengths.length, (li) => counterOf(letters, bits, flat, from[li], to[li], lengths[li]));
+  const codeOf: int[] = new Array<int>(128).fill(-1);
+  for (let i = 0; i < letters.length; i++) codeOf[letters[i]] = i;
+  const counters: Counter<string>[] = [];
+  for (let li = 0; li < lengths.length; li++) {
+    const length = lengths[li];
+    if (ascii && length > 0 && length <= n && bits * length <= PACKED_BITS) {
+      counters.push(deferredCounter(letters, codeOf, bits, flat, from[li], to[li], length));
+    } else counters.push(new Counter<string>());
+  }
   // the lengths not packed: counted with strings
   for (let li = 0; li < lengths.length; li++) {
     const length = lengths[li];
