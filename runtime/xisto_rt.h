@@ -4190,8 +4190,9 @@ static xs_arr_ref *xs_process_argv(void) { return xs_argv; }
 static xs_map *xs_process_env(void) { return xs_env; }
 static void xs_process_exit(int64_t code) { fflush(stdout); exit((int)code); }
 /* process.stdout.write / process.stderr.write: through the same FILE as console.log, so the order is kept */
-static bool xs_stdout_write_str(xs_str *s) { fwrite(s->data, 1, (size_t)s->len, XS_OUT); return true; }
-static bool xs_stderr_write_str(xs_str *s) { fwrite(s->data, 1, (size_t)s->len, stderr); return true; }
+static inline void xs_out_drain(void);
+static bool xs_stdout_write_str(xs_str *s) { xs_out_drain(); fwrite(s->data, 1, (size_t)s->len, XS_OUT); return true; }
+static bool xs_stderr_write_str(xs_str *s) { xs_out_drain(); fwrite(s->data, 1, (size_t)s->len, stderr); return true; }
 
 #if !defined(_WIN32) /* there, the C library's environ is a macro over a function */
 extern char **environ __attribute__((visibility("default"))); /* the C library's: not one of the runtime's hidden symbols */
@@ -4416,8 +4417,117 @@ static void xs_write_big(FILE *f, const void *p, size_t n) {
 #endif
     fwrite(p, 1, n, f);
 }
+/* stdin still being read (XB-091): set by readSync on fd 0 while its end has not been reached (a file: the offset
+   short of its size; anything else: no read of 0 bytes yet). Writing behind pays only then: the program has
+   reading left to overlap with the write, or a write still going out ahead of it; after the input, with nothing
+   pending (or with no input), a write at the call costs no copy. */
+static int xs_stdin_reading;
+/* ---- stdout written behind (XB-091): a big block for stdout (1 MB or more, stdout a pipe or a file, not a
+   terminal), while stdin is still being read, is copied into a ring of 64 MB and written by a thread of its own,
+   so the program goes on (reading and computing the next part) while the reader of the pipe takes it. The copy is made at the call, so what is
+   written is what the bytes were then, as Node's synchronous write; every other way to stdout waits for the ring
+   first (console.*, process.stdout.write of a string or a small block: xs_out_drain), and so does the exit
+   (atexit), so the order is the program's. XISTO_NO_WRITE_BEHIND=1: written at the call, as before. */
+#if !defined(_WIN32)
+#include <pthread.h>
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t more, less;
+    char *buf;
+    size_t head, tail, used; /* the bytes to write: buf[head..] for used bytes, wrapping at XS_AW_CAP */
+    int state;               /* 0: not decided, 1: on, -1: off */
+} xs_aw = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, 0, 0, 0, 0};
+static volatile size_t xs_aw_pending; /* (read without the lock: only a hint that xs_out_drain has work) */
+#define XS_AW_CAP ((size_t)64 << 20) /* (a ring that holds a big part whole frees the program to read the next while the last is written: 32 MB 0,150 s, 64 MB 0,133 s on 250 MB, -5 0,126) */
+#define XS_AW_STEP ((size_t)1 << 20) /* each copy and each write: the ring frees and fills a step at a time, so neither side waits for a whole ring */
+static void *xs_aw_main(void *arg) {
+    (void)arg;
+    int fd = fileno(stdout);
+    for (;;) {
+        pthread_mutex_lock(&xs_aw.mu);
+        while (xs_aw.used == 0) pthread_cond_wait(&xs_aw.more, &xs_aw.mu);
+        size_t span = xs_aw.used < XS_AW_CAP - xs_aw.head ? xs_aw.used : XS_AW_CAP - xs_aw.head;
+        if (span > XS_AW_STEP) span = XS_AW_STEP;
+        const char *q = xs_aw.buf + xs_aw.head;
+        pthread_mutex_unlock(&xs_aw.mu);
+        size_t left = span;
+        while (left > 0) { /* (a failed write drops the rest of the span, as a closed pipe: the reader is gone) */
+            ssize_t w = write(fd, q, left);
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) break;
+            q += w;
+            left -= (size_t)w;
+        }
+        pthread_mutex_lock(&xs_aw.mu);
+        xs_aw.head = (xs_aw.head + span) % XS_AW_CAP;
+        xs_aw.used -= span;
+        xs_aw_pending = xs_aw.used;
+        pthread_cond_broadcast(&xs_aw.less);
+        pthread_mutex_unlock(&xs_aw.mu);
+    }
+    return NULL;
+}
+static void xs_out_drain_slow(void) {
+    pthread_mutex_lock(&xs_aw.mu);
+    while (xs_aw.used > 0) pthread_cond_wait(&xs_aw.less, &xs_aw.mu);
+    pthread_mutex_unlock(&xs_aw.mu);
+}
+static inline void xs_out_drain(void) { if (xs_aw_pending) xs_out_drain_slow(); }
+static void xs_aw_atexit(void) { xs_out_drain(); }
+static bool xs_aw_on(void) {
+    if (xs_aw.state == 0) {
+        struct stat st;
+        const char *off = getenv("XISTO_NO_WRITE_BEHIND");
+        bool ok = !(off && *off && strcmp(off, "0") != 0) && fstat(fileno(stdout), &st) == 0 && !isatty(fileno(stdout)) &&
+                  (S_ISFIFO(st.st_mode) || S_ISREG(st.st_mode) || S_ISSOCK(st.st_mode));
+        pthread_t th;
+        if (ok) ok = (xs_aw.buf = malloc(XS_AW_CAP)) != NULL;
+        if (ok) {
+            pthread_attr_t at;
+            pthread_attr_init(&at);
+            pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+            ok = pthread_create(&th, &at, xs_aw_main, NULL) == 0;
+            pthread_attr_destroy(&at);
+        }
+        if (ok) atexit(xs_aw_atexit);
+        xs_aw.state = ok ? 1 : -1;
+    }
+    return xs_aw.state > 0;
+}
+static void xs_aw_put(const uint8_t *p, size_t n) {
+    fflush(stdout); /* what stdio holds came before */
+    while (n > 0) {
+        pthread_mutex_lock(&xs_aw.mu);
+        while (xs_aw.used == XS_AW_CAP) pthread_cond_wait(&xs_aw.less, &xs_aw.mu);
+        size_t room = XS_AW_CAP - xs_aw.used, upto = XS_AW_CAP - xs_aw.tail;
+        size_t k = n < room ? n : room;
+        if (k > upto) k = upto;
+        if (k > XS_AW_STEP) k = XS_AW_STEP;
+        char *dst = xs_aw.buf + xs_aw.tail;
+        pthread_mutex_unlock(&xs_aw.mu);
+        memcpy(dst, p, k); /* (the free part of the ring: the writer never reads it) */
+        pthread_mutex_lock(&xs_aw.mu);
+        xs_aw.tail = (xs_aw.tail + k) % XS_AW_CAP;
+        xs_aw.used += k;
+        xs_aw_pending = xs_aw.used;
+        pthread_cond_signal(&xs_aw.more);
+        pthread_mutex_unlock(&xs_aw.mu);
+        p += k;
+        n -= k;
+    }
+}
+static bool xs_stdout_write_bytes(xs_Uint8Array *b) {
+    size_t n = (size_t)b->f_length;
+    if (n >= ((size_t)1 << 20) && (xs_stdin_reading || xs_aw_pending) && !xs_out_f && xs_aw_on()) { xs_aw_put(b->data, n); return true; } /* (behind a write still going out: its turn comes then anyway) */
+    xs_out_drain();
+    xs_write_big(XS_OUT, b->data, n);
+    return true;
+}
+#else
+static inline void xs_out_drain(void) {}
 static bool xs_stdout_write_bytes(xs_Uint8Array *b) { xs_write_big(XS_OUT, b->data, (size_t)b->f_length); return true; }
-static bool xs_stderr_write_bytes(xs_Uint8Array *b) { xs_write_big(stderr, b->data, (size_t)b->f_length); return true; }
+#endif
+static bool xs_stderr_write_bytes(xs_Uint8Array *b) { xs_out_drain(); xs_write_big(stderr, b->data, (size_t)b->f_length); return true; }
 static uint32_t xs_utf8_cp(const unsigned char *s, size_t n, size_t *len) { /* one code point (U+FFFD for a bad byte) */
     unsigned c = s[0];
     if (c < 0x80) { *len = 1; return c; }
@@ -5581,6 +5691,14 @@ XS_NOINLINE int64_t xs_fs_read_sync(int64_t fd, xs_Uint8Array *b, int64_t off, i
     r = pos >= 0 ? pread((int)fd, b->data + off, (size_t)len, (off_t)pos) : read((int)fd, b->data + off, (size_t)len);
 #endif
     if (r < 0) { snprintf(m_, sizeof m_, "EIO: read failed on file descriptor %lld", (long long)fd); xs_panic(m_); }
+#ifndef _WIN32
+    if (fd == 0 && pos < 0) { /* (XB-091: is there input left to read?) */
+        struct stat st;
+        if (r == 0) xs_stdin_reading = 0;
+        else if (fstat(0, &st) == 0 && S_ISREG(st.st_mode)) xs_stdin_reading = lseek(0, 0, SEEK_CUR) < st.st_size;
+        else xs_stdin_reading = 1;
+    }
+#endif
     return (int64_t)r;
 }
 

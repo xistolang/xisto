@@ -13,13 +13,14 @@ qbe=0
 
 for f in tests/ok/*.ts; do
     name=$(basename "$f" .ts)
+    in=/dev/null; [ -f "${f%.ts}.stdin" ] && in="${f%.ts}.stdin"   # NAME.stdin next to the program: its standard input, for Node and for xisto
     # oracle: Node; Bun when Node cannot run the file (Node strips types but does not transform enums)
     if [ -f "${f%.ts}.expected" ]; then
         cp "${f%.ts}.expected" "$OUT/$name.node"   # APIs only Xisto has (streams): the expected output is checked in
     elif [ -n "$XISTO_ORACLE_DIR" ] && [ -f "$XISTO_ORACLE_DIR/$name.node" ]; then
         cp "$XISTO_ORACLE_DIR/$name.node" "$OUT/$name.node"   # Node's outputs from another machine (a system whose Node cannot run .ts)
-    elif ! node --import ./packages/xisto/register.mjs "$f" > "$OUT/$name.node" 2>&1; then   # (xisto:io, xisto:bytes: the reference implementations)
-        if ! bun "$f" > "$OUT/$name.node" 2>&1; then
+    elif ! node --import ./packages/xisto/register.mjs "$f" < "$in" > "$OUT/$name.node" 2>&1; then   # (xisto:io, xisto:bytes: the reference implementations)
+        if ! bun "$f" < "$in" > "$OUT/$name.node" 2>&1; then
             echo "FAIL $f: neither node nor bun can run the program"; cat "$OUT/$name.node" | head -5; fail=$((fail+1)); continue
         fi
     fi
@@ -36,7 +37,7 @@ for f in tests/ok/*.ts; do
 $(sed -n 's|^// warns: ||p' "$f")
 EOF_WARNS
     if [ -n "$wfail" ]; then echo "FAIL $f: $wfail"; fail=$((fail+1)); continue; fi
-    XISTO_RC_STATS=1 "$OUT/$name" > "$OUT/$name.xisto" 2> "$OUT/$name.stats"
+    XISTO_RC_STATS=1 "$OUT/$name" < "$in" > "$OUT/$name.xisto" 2> "$OUT/$name.stats"
     if ! grep -q ' 0 still alive' "$OUT/$name.stats"; then
         echo "FAIL $f: leak: $(cat "$OUT/$name.stats")"; fail=$((fail+1)); continue
     fi
@@ -49,7 +50,7 @@ EOF_WARNS
     fi
     # the same program through the QBE backend, when it is inside the subset that backend covers
     if $XISTO build --backend=qbe -o "$OUT/$name-qbe" "$f" > "$OUT/$name.qbe.build" 2>&1; then
-        XISTO_RC_STATS=1 "$OUT/$name-qbe" > "$OUT/$name.qbe" 2> "$OUT/$name.qbe.stats"
+        XISTO_RC_STATS=1 "$OUT/$name-qbe" < "$in" > "$OUT/$name.qbe" 2> "$OUT/$name.qbe.stats"
         if ! grep -q ' 0 still alive' "$OUT/$name.qbe.stats"; then
             echo "FAIL $f (qbe): leak: $(cat "$OUT/$name.qbe.stats")"; fail=$((fail+1))
         elif cmp -s "$OUT/$name.node" "$OUT/$name.qbe"; then
