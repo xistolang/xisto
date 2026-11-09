@@ -183,6 +183,14 @@ def run():
             br = 0
             while j < n:
                 ch = src[j]
+                if src.startswith("/*", j):  # a comment inside a declaration (a struct's fields): an apostrophe there
+                    e = src.find("*/", j + 2)  # read as a character literal lost the braces (--dev broke on xs_lent)
+                    j = n if e < 0 else e + 2
+                    continue
+                if src.startswith("//", j):
+                    e = src.find("\n", j)
+                    j = n if e < 0 else e
+                    continue
                 if ch == "(":
                     par += 1
                 elif ch == ")":

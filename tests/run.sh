@@ -180,6 +180,13 @@ for f in tests/qbe/*.ts; do
     $XISTO build --backend=qbe -o "$OUT/qbe-unsup" "$f" > "$OUT/qbe-unsup.txt" 2>&1; rc=$?
     if [ $rc -eq 1 ] && grep -qF -- "$want" "$OUT/qbe-unsup.txt"; then pass=$((pass+1)); else echo "FAIL qbe $f (exit $rc)"; head -3 "$OUT/qbe-unsup.txt"; fail=$((fail+1)); fi
 done
+# --dev (the runtime as a library, tools/rtsplit.py): a few programs must build and print what Node prints. Nothing
+# else in the suite builds with --dev, and a runtime comment once broke every --dev build unnoticed
+for n in arrays classes closures-ref nullish write-behind xisto-collections; do
+    f=tests/ok/$n.ts
+    [ -f "$f" ] && [ -f "$OUT/$n.node" ] || continue
+    if $XISTO run --dev "$f" < /dev/null > "$OUT/$n.dev" 2>&1 && cmp -s "$OUT/$n.node" "$OUT/$n.dev"; then pass=$((pass+1)); else echo "FAIL --dev $f"; head -5 "$OUT/$n.dev"; fail=$((fail+1)); fi
+done
 # size budget: a program importing a 200-function module and using one must produce the same binary as the function alone
 for backend in "" "--backend=qbe"; do
     $XISTO build $backend -o "$OUT/size-one" tests/size/uses-one.ts > /dev/null 2>&1 && $XISTO build $backend -o "$OUT/size-alone" tests/size/standalone.ts > /dev/null 2>&1 || { echo "FAIL size budget: build failed ($backend)"; fail=$((fail+1)); continue; }
