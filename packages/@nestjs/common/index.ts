@@ -141,6 +141,21 @@ export const __params: Map<string, ParamDef[]> = new Map<string, ParamDef[]>();
 export const __guards: Map<string, GuardDef[]> = new Map<string, GuardDef[]>();
 export const __validated: Map<string, int[]> = new Map<string, int[]>();
 export const __custom: CustomParam[] = [];
+// values a constructor parameter receives without a provider class: by token (@Inject(token), @InjectRepository) or by
+// the parameter's type id (a DataSource TypeOrmModule.forRoot made). __values holds ready instances; __jsonValues the
+// JSON the parameter's own type decodes into the exact instance it asks for (a Repository<User> from forFeature).
+export const __values: Map<string, unknown> = new Map<string, unknown>();
+export const __jsonValues: Map<string, string> = new Map<string, string>();
+export const __tokens: Map<string, string> = new Map<string, string>(); // "<class id>#<parameter index>" -> token
+
+/** @Inject(token) on a constructor parameter: it receives the value registered under that token */
+export function Inject(token: string): (c: ClassInfo, m: MethodInfo | null, index: int) => void {
+  return (c: ClassInfo, m: MethodInfo | null, index: int): void => {
+    if (m === null) {
+      __tokens.set(c.id + "#" + String(index), token);
+    }
+  };
+}
 
 function methodIndex(c: ClassInfo, m: MethodInfo): int {
   for (let i: int = 0; i < c.methods.length; i++) {

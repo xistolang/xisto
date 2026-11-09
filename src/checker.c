@@ -813,6 +813,7 @@ static const char **class_names(int *n);
 /* Replaces placeholder class names left by the parser with the real classes. */
 static bool nullable_ok(Type *inner) {
     return inner->kind == TY_UNION || inner->kind == TY_STRING || inner->kind == TY_ARRAY || inner->kind == TY_OBJECT || inner->kind == TY_MAP || inner->kind == TY_SET ||
+           inner->kind == TY_JSON || /* object | null: the JSON text or NULL (where?: object in an options interface) */
            inner->kind == TY_INT || inner->kind == TY_NUMBER || inner->kind == TY_BOOLEAN || inner->kind == TY_ENUM; /* primitives: a sentinel */
 }
 
@@ -1545,7 +1546,18 @@ static void to_unknown(Expr *e) {
     Type *b = nul ? t->elem : t;
     const char *fn = b->kind == TY_NUMBER ? "xs_box_num" : b->kind == TY_BOOLEAN ? "xs_box_bool"
                    : (b->kind == TY_INT || (b->kind == TY_ENUM && !b->en->is_string)) ? "xs_box_int" : NULL;
-    if (!fn) { e->type = ty_unknown; return; } /* a reference: the same pointer */
+    if (!fn) { /* a reference: the same pointer */
+        if (e->kind == E_ARRAY_LIT || e->kind == E_OBJLIT || e->kind == E_NEW_MAP) {
+            /* a literal is emitted from its own type: keep it under a cast ([...] where a union or unknown goes) */
+            Expr *v = expr_copy(e);
+            memset(e, 0, sizeof *e);
+            e->kind = E_UPCAST;
+            e->pos = v->pos;
+            e->lhs = v;
+        }
+        e->type = ty_unknown;
+        return;
+    }
     Expr *v = expr_copy(e);
     memset(e, 0, sizeof *e);
     e->kind = E_CALL;
@@ -1607,6 +1619,8 @@ static void expect_type(Expr *e, Type *want, const char *what) {
     if (want->kind == TY_ARRAY && want->elem->kind == TY_UNKNOWN && e->type->kind == TY_ARRAY && ty_is_heap(e->type->elem)) return;
     if (want->kind == TY_UNKNOWN && e->type->kind != TY_UNKNOWN && e->type->kind != TY_VOID) { to_unknown(e); return; }
     if (want->kind == TY_JSON && e->type->kind != TY_JSON && e->type->kind != TY_NULL && (e->type->kind == TY_LITINT || json_ok(e->type, 0))) { to_json(e); return; }
+    if (want->kind == TY_NULLABLE && want->elem->kind == TY_JSON && e->type->kind != TY_JSON && e->type->kind != TY_NULL && e->type->kind != TY_NULLABLE &&
+        (e->type->kind == TY_LITINT || json_ok(e->type, 0))) { to_json(e); return; } /* into object | null */
     if (e->type->kind == TY_JSON && json_target(want)) { from_json(e, want); return; }
     if (e->type->kind == TY_LITINT && is_numeric(want)) coerce_lit(e, want);
     if (e->type->kind == TY_LITINT && want->kind == TY_NULLABLE && is_numeric(want->elem)) coerce_lit(e, want->elem);
@@ -2672,7 +2686,12 @@ static void check_expr(Expr *e, Type *expected) {
             check_expr(e->lhs, NULL);
             settle(e->lhs);
             Type *t = e->lhs->type;
-            if (t->kind == TY_UNKNOWN || t->kind == TY_UNION) { e->builtin.cfn = "xs_typeof"; e->type = ty_string; return; }
+            if (t->kind == TY_UNKNOWN || t->kind == TY_UNION ||
+                (t->kind == TY_NULLABLE && (t->elem->kind == TY_UNION || t->elem->kind == TY_UNKNOWN))) { /* (x?: string | number too) */
+                e->builtin.cfn = "xs_typeof";
+                e->type = ty_string;
+                return;
+            }
             Type *b = t->kind == TY_NULLABLE ? t->elem : t;
             const char *v = is_big(b) ? "bigint" : b->kind == TY_STRING || (b->kind == TY_ENUM && b->en->is_string) ? "string"
                           : is_numeric(b) || b->kind == TY_ENUM ? "number" : b->kind == TY_BOOLEAN ? "boolean" : b->kind == TY_FUNC ? "function" : "object";
@@ -4008,6 +4027,7 @@ static void check_expr(Expr *e, Type *expected) {
         if (want->kind == TY_UNKNOWN) { *e = *v; to_unknown(e); return; }
         if (v->type->kind == TY_JSON && json_target(want)) { *e = *v; from_json(e, want); return; }
         if (want->kind == TY_JSON && json_ok(v->type, 0)) { *e = *v; to_json(e); return; }
+        if (want->kind == TY_NULLABLE && want->elem->kind == TY_JSON && v->type->kind != TY_NULL && v->type->kind != TY_NULLABLE && json_ok(v->type, 0)) { *e = *v; to_json(e); return; }
         if (want->kind == TY_NULLABLE && ty_equal(v->type, want->elem)) { *e = *v; e->type = want; return; }
         if (v->type->kind == TY_NULLABLE && ty_equal(v->type->elem, want)) { e->type = want; e->op = TK_NOT; e->elem_type = NULL; return; } /* T | null as T: checked */
         { /* base as Sub: checked at run time (a TypeError when the object is not a Sub); Sub as Base: an upcast */
@@ -4341,6 +4361,11 @@ static void check_expr(Expr *e, Type *expected) {
     }
     case E_ARRAY_LIT: {
         if (expected && expected->kind == TY_NULLABLE) expected = expected->elem;
+        if (expected && expected->kind == TY_UNION) { /* string | string[]: the literal is the array member */
+            Type *arr = NULL;
+            for (int i = 0; i < expected->nparams; i++) if (expected->params[i]->kind == TY_ARRAY && !arr) arr = expected->params[i];
+            expected = arr;
+        }
         if (expected && expected->kind == TY_OBJECT && expected->cls->is_tuple) { /* [x, y] as a tuple: its fields */
             Class *tc = expected->cls;
             if (e->args.len != tc->nfields) xs_error(XS8142, e->pos, NULL, "the tuple %s has %d elements, but this gives %d", tc->name, tc->nfields, e->args.len);
@@ -4351,6 +4376,12 @@ static void check_expr(Expr *e, Type *expected) {
             return;
         }
         Type *elem = expected && expected->kind == TY_ARRAY ? expected->elem : NULL;
+        /* [{ a: 1 }, { a: 2 }] where an object goes: each element an object too (their literals need no declared type) */
+        if (expected && expected->kind == TY_JSON && !e->spread && e->args.len > 0) {
+            bool lits = false;
+            for (int i = 0; i < e->args.len; i++) if (e->args.items[i]->kind == E_OBJLIT || e->args.items[i]->kind == E_ARRAY_LIT) lits = true;
+            if (lits) elem = ty_json;
+        }
         if (e->spread) { check_spread_lit(e, elem); return; }
         if (e->args.len == 0) {
             if (!elem) xs_error(XS3008, e->pos, "give it a type: const xs: number[] = [];", "cannot infer the type of an empty array");

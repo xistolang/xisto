@@ -1,0 +1,4 @@
+{
+  "name": "typeorm-tests",
+  "main": "src/sql.ts"
+}
