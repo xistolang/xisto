@@ -5061,6 +5061,100 @@ static void ii_enter(Func *f, bool reset) {
     for (int i = 0; i < f->nparams; i++) ii_typed(f->params[i].name, f->params[i].type);
     ii_scan(f->body);
 }
+/* XB-088: modular state (an LCG, a hash): `last = (last * A + C) % M`. A product is no int by its form (it can pass
+   2^53, where a number only loses precision), unless its operands are bounded: the integer literals and consts, and
+   the variable itself when every assignment to it, anywhere in the program, is an integer literal or a `% K` of a
+   literal K (so it stays below the largest K). The bound of the whole expression must stay inside the safe range. */
+static bool ii_lit_of(Expr *e, double *v) {
+    if (!e) return false;
+    if (e->kind == E_NUMBER && e->is_int_lit) { *v = e->num; return true; }
+    if (e->kind == E_UNARY && e->op == TK_MINUS && e->lhs && e->lhs->kind == E_NUMBER && e->lhs->is_int_lit) { *v = -e->lhs->num; return true; }
+    if (e->kind == E_IDENT && e->str)
+        for (int i = ii_cn - 1; i >= 0; i--) if (strcmp(ii_cnames[i], e->str) == 0) return ii_depth < 8 && ii_lit_of(ii_cinit[i], v);
+    return false;
+}
+static double ii_mod_k(Expr *e) { /* `x % K` with a literal 0 < K <= 2^26: K; else 0 */
+    double k;
+    if (e && e->kind == E_BINARY && e->op == TK_PERCENT && ii_lit_of(e->rhs, &k) && k > 0 && k <= 67108864.0) return k;
+    return 0;
+}
+/* a function with a parameter or a function-scope variable of that name: its uses of the name are its own */
+static bool ii_shadows(Func *f, const char *name) {
+    if (!f || !name) return false;
+    for (int i = 0; i < f->nparams; i++) if (f->params[i].name && strcmp(f->params[i].name, name) == 0) return true;
+    Stmt *b = f->body;
+    if (b && b->kind == S_BLOCK)
+        for (int i = 0; i < b->stmts.len; i++) {
+            Stmt *v = b->stmts.items[i];
+            if (v && v->kind == S_VAR && v->name && strcmp(v->name, name) == 0) return true;
+        }
+    return false;
+}
+bool ii_mod_scan_s_(Stmt *s, const char *self, double *b);
+static double ii_self_bound; /* (of ii_self_bound_of: 0 not bounded) */
+static const char *ii_self_bound_of;
+static bool ii_mod_scan_e(Expr *e, const char *self, double *b) {
+    if (!e) return true;
+    if (e->kind == E_ASSIGN && e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && strcmp(e->lhs->str, self) == 0) {
+        double v, k;
+        if (e->op != TK_ASSIGN) return false;
+        if (ii_lit_of(e->rhs, &v)) { if (fabs(v) > *b) *b = fabs(v); }
+        else if ((k = ii_mod_k(e->rhs)) > 0) { if (k > *b) *b = k; }
+        else return false;
+    }
+    if ((e->kind == E_POSTFIX || (e->kind == E_UNARY && (e->op == TK_PLUSPLUS || e->op == TK_MINUSMINUS))) &&
+        e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && strcmp(e->lhs->str, self) == 0) return false;
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) { /* (closures assign what they capture) */
+        Stmt *body = e->arrow->fn->body;
+        if (!ii_mod_scan_s_(body, self, b)) return false;
+    }
+    if (!ii_mod_scan_e(e->lhs, self, b) || !ii_mod_scan_e(e->rhs, self, b)) return false;
+    for (int i = 0; i < e->args.len; i++) if (!ii_mod_scan_e(e->args.items[i], self, b)) return false;
+    return true;
+}
+bool ii_mod_scan_s_(Stmt *s, const char *self, double *b) {
+    if (!s) return true;
+    if (s->kind == S_VAR && s->name && strcmp(s->name, self) == 0 && s->init) {
+        double v, k;
+        if (ii_lit_of(s->init, &v)) { if (fabs(v) > *b) *b = fabs(v); }
+        else if ((k = ii_mod_k(s->init)) > 0) { if (k > *b) *b = k; }
+        else return false;
+    }
+    if (!ii_mod_scan_e(s->init, self, b) || !ii_mod_scan_e(s->expr, self, b) || !ii_mod_scan_e(s->cond, self, b) || !ii_mod_scan_e(s->for_update, self, b)) return false;
+    if (!ii_mod_scan_s_(s->for_init, self, b) || !ii_mod_scan_s_(s->body, self, b) || !ii_mod_scan_s_(s->else_body, self, b)) return false;
+    for (int i = 0; i < s->stmts.len; i++) if (!ii_mod_scan_s_(s->stmts.items[i], self, b)) return false;
+    for (int i = 0; i < s->ncases; i++) if (!ii_mod_scan_e(s->cases[i].value, self, b) || !ii_mod_scan_s_(s->cases[i].body, self, b)) return false;
+    return true;
+}
+static double ii_self_mod_bound(const char *self) { /* every assignment to self in the program: its bound, or 0 */
+    double b = 0;
+    if (!prog) return 0;
+    for (int i = 0; i < prog->top.len; i++) if (!ii_mod_scan_s_(prog->top.items[i], self, &b)) return 0;
+    for (int f = 0; f < prog->nfuncs; f++) if (!ii_shadows(prog->funcs[f], self) && !ii_mod_scan_s_(prog->funcs[f]->body, self, &b)) return 0;
+    for (int c = 0; c < prog->nclasses; c++) {
+        Class *cl = prog->classes[c];
+        if (cl->builtin) continue;
+        for (int m = 0; m < cl->nmethods; m++) if (!ii_shadows(cl->methods[m], self) && !ii_mod_scan_s_(cl->methods[m]->body, self, &b)) return 0;
+        if (cl->ctor && !ii_shadows(cl->ctor, self) && !ii_mod_scan_s_(cl->ctor->body, self, &b)) return 0;
+    }
+    return b;
+}
+static double ii_bound(Expr *e, const char *self) { /* |e| at most this, or -1 */
+    double v;
+    if (!e) return -1;
+    if (ii_lit_of(e, &v)) return fabs(v);
+    if (e->kind == E_IDENT && e->str && strcmp(e->str, self) == 0) {
+        if (!ii_self_bound_of || strcmp(ii_self_bound_of, self) != 0) { ii_self_bound_of = self; ii_self_bound = ii_self_mod_bound(self); }
+        return ii_self_bound > 0 ? ii_self_bound : -1;
+    }
+    if (e->kind == E_BINARY && (e->op == TK_PLUS || e->op == TK_MINUS || e->op == TK_STAR)) {
+        double a = ii_bound(e->lhs, self), b = ii_bound(e->rhs, self);
+        if (a < 0 || b < 0) return -1;
+        return e->op == TK_STAR ? a * b : a + b;
+    }
+    if (e->kind == E_BINARY && e->op == TK_PERCENT) { double k = ii_mod_k(e); return k > 0 ? k : -1; }
+    return -1;
+}
 static bool int_shaped(Expr *e, const char *self) {
     if (!e) return false;
     switch (e->kind) {
@@ -5117,6 +5211,10 @@ static bool int_shaped(Expr *e, const char *self) {
         /* (not * or <<: a product grows past 2^63 quickly, an int would stop with an overflow where JavaScript's
            number only loses precision, as in let f = 1; f *= i) */
         case TK_PLUS: case TK_MINUS: case TK_PERCENT:
+            if (e->op == TK_PERCENT && ii_mod_k(e) > 0 && !getenv("XISTO_NO_MOD_INT")) { /* XB-088: (last * A + C) % M */
+                double b = ii_bound(e->lhs, self);
+                if (b >= 0 && b <= 9007199254740991.0) return true;
+            }
             return int_shaped(e->lhs, self) && int_shaped(e->rhs, self);
         case TK_AMP: case TK_PIPE: case TK_CARET: case TK_SHR: case TK_USHR: case TK_SHL:
             return true; /* a 32-bit integer whatever the operands (ToInt32): x & 0xff, (a << k) & m */
@@ -5251,11 +5349,11 @@ static void infer_ints_top(Program *p) {
         if (ii_candidate(v)) {
             bool ok = true;
             for (int k = i + 1; k < p->top.len && ok; k++) ok = ii_stmt_ok(p->top.items[k], v->name);
-            for (int f = 0; f < p->nfuncs && ok; f++) ok = ii_stmt_ok(p->funcs[f]->body, v->name);
+            for (int f = 0; f < p->nfuncs && ok; f++) ok = ii_shadows(p->funcs[f], v->name) || ii_stmt_ok(p->funcs[f]->body, v->name);
             for (int c = 0; c < p->nclasses && ok; c++) {
                 Class *cl = p->classes[c];
-                for (int m = 0; m < cl->nmethods && ok; m++) ok = ii_stmt_ok(cl->methods[m]->body, v->name);
-                if (cl->ctor) ok = ok && ii_stmt_ok(cl->ctor->body, v->name);
+                for (int m = 0; m < cl->nmethods && ok; m++) ok = ii_shadows(cl->methods[m], v->name) || ii_stmt_ok(cl->methods[m]->body, v->name);
+                if (cl->ctor) ok = ok && (ii_shadows(cl->ctor, v->name) || ii_stmt_ok(cl->ctor->body, v->name));
             }
             ii_mark(v, ok);
         }

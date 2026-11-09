@@ -533,6 +533,19 @@ static bool pow2_of(Expr *e, int depth);
 static bool rv_valid; /* (the range tables, below) */
 static Func *rv_owner;
 static bool nn_expr(Expr *e);
+static bool may_nz(Expr *e); /* XB-087: an int expression that may be JavaScript's -0 */
+static int nz_mute; /* emitting where a zero's sign cannot be seen (x + 1, x / 2 + Number(i)): no -0 work */
+static void emit_nzd(Expr *e); /* ... and its value as a double, -0 kept */
+static const char **nzv; /* int locals that keep their -0 in a double beside them (<cname>_z), of nzv_owner */
+static int nnzv;
+static Func *nzv_owner;
+typedef struct NzvSet { Func *owner; const char **names; int n; struct NzvSet *next; } NzvSet;
+static NzvSet *nzv_sets; /* every function's (a clone emitted inside another function recomputes its own) */
+static bool nzv_has(const char *c) {
+    for (NzvSet *z = nzv_sets; z && c; z = z->next)
+        if (z->owner == cur_func) { for (int i = 0; i < z->n; i++) if (strcmp(z->names[i], c) == 0) return true; return false; }
+    return false;
+}
 static int byte_hoist_find(Expr *a);
 static bool bce_safe(Expr *e); /* an index the loop already checks (see bce_enter) */
 /* u8reg: byte arrays a loop keeps in vector registers (see u8reg_loop) */
@@ -1584,6 +1597,7 @@ static void emit_member(Expr *e) {
             buf_puts(out, e->args.len ? "})" : "0})");
             return;
         }
+        if (!nz_mute && strcmp(fn, "xs_to_number") == 0 && e->args.len == 1 && may_nz(e->args.items[0])) { emit_nzd(e->args.items[0]); return; } /* XB-087 */
         buf_printf(out, "%s(", fn); /* Number.isNaN, Date.now, process.argv ... */
         emit_args_borrowed(&e->args, false);
         buf_puts(out, ")");
@@ -1595,9 +1609,11 @@ static void emit_member(Expr *e) {
         for (int i = 0; i < e->args.len; i++) {
             Expr *a = e->args.items[i];
             Type *t = a->type->kind == TY_NULL ? ty_nullable_of(ty_string) : a->type;
+            bool nzp = a->type->kind == TY_INT && may_nz(a); /* XB-087: console.log(-0) prints -0 */
+            if (nzp) t = ty_number;
             emit_decl(t, xs_sprintf("la%d_", i));
             buf_puts(out, " = ");
-            emit_borrowed(a);
+            if (nzp) emit_nzd(a); else emit_borrowed(a);
             buf_puts(out, "; ");
         }
         for (int i = 0; i < e->args.len; i++) {
@@ -1606,6 +1622,7 @@ static void emit_member(Expr *e) {
             Expr tmpv = *a;
             tmpv.kind = E_IDENT;
             tmpv.cname = xs_sprintf("la%d_", i);
+            if (a->type->kind == TY_INT && may_nz(a)) tmpv.type = ty_number;
             emit_print_arg(&tmpv);
             buf_puts(out, "; ");
         }
@@ -2256,7 +2273,32 @@ static bool flat_val(Expr *e, int *budget) {
 }
 static bool flat_bool(Expr *e, int *budget) { return e && e->type && e->type->kind == TY_BOOLEAN && flat_val(e, budget); }
 /* arrays and maps of cyclic values, where they are made: their visit lets the collector see through them */
+static bool may_nz(Expr *e);
+static bool nz_sure(Expr *e) { /* certainly not -0 */
+    if (!e || !e->type) return false;
+    if (e->type->kind == TY_INT) return !may_nz(e);
+    if (e->kind == E_NUMBER) return !(e->num == 0 && signbit(e->num));
+    if (e->kind == E_CALL && e->builtin.cfn && strcmp(e->builtin.cfn, "xs_to_number") == 0 && e->args.len == 1) return !may_nz(e->args.items[0]);
+    if (e->kind == E_BINARY && e->type->kind == TY_NUMBER && e->op == TK_PLUS) return nz_sure(e->lhs) || nz_sure(e->rhs);
+    return false;
+}
+
+static bool nz_passes(Expr *e) {
+    if (!e || !e->type) return false;
+    if (e->kind == E_BINARY && e->type->kind == TY_NUMBER && (e->op == TK_PLUS || e->op == TK_MINUS || e->op == TK_STAR || e->op == TK_SLASH)) return true;
+    if (e->kind == E_UNARY && e->op == TK_MINUS && e->type->kind == TY_NUMBER) return true;
+    if (e->kind == E_CALL && e->builtin.cfn && strcmp(e->builtin.cfn, "xs_to_number") == 0) return true;
+    return false;
+}
+static void emit_expr_m(Expr *e);
 static void emit_expr(Expr *e) {
+    if (!nz_mute || nz_passes(e)) { emit_expr_m(e); return; }
+    int saved = nz_mute;
+    nz_mute = 0;
+    emit_expr_m(e);
+    nz_mute = saved;
+}
+static void emit_expr_m(Expr *e) {
     if (e->type && cyc_prog && (e->type->kind == TY_ARRAY || e->type->kind == TY_MAP) &&
         (e->kind == E_ARRAY_LIT || e->kind == E_NEW_MAP || e->kind == E_NEW_ARRAY || (e->kind == E_MEMBER && e->is_call) || e->kind == E_CALL) &&
         arr_or_map_cyclic(e->type)) {
@@ -2658,6 +2700,14 @@ static void emit_expr_raw(Expr *e) {
                 buf_puts(out, "))");
                 return;
             }
+            if (e->op == TK_SLASH && !nz_mute && (may_nz(e->lhs) || may_nz(e->rhs))) { /* XB-087: 1 / (x * -3) is -Infinity at x = 0 */
+                buf_puts(out, "(");
+                emit_nzd(e->lhs);
+                buf_puts(out, " / ");
+                emit_nzd(e->rhs);
+                buf_puts(out, ")");
+                return;
+            }
             if (nn2) fn = e->op == TK_PLUS ? "xs_iadd_nn" : "xs_imul_nn";
             buf_printf(out, "%s%s(", fn, e->op == TK_SLASH ? "" : "_s");
             emit_expr(e->lhs);
@@ -2752,6 +2802,19 @@ static void emit_expr_raw(Expr *e) {
             emit_borrowed(e->lhs);
             buf_puts(out, ", ");
             emit_borrowed(e->rhs);
+            buf_puts(out, ")");
+            return;
+        }
+        if (e->type->kind == TY_NUMBER && (e->op == TK_PLUS || e->op == TK_MINUS)) { /* XB-087: a + y with y never -0 is
+                                                                                 never -0, whatever the sign of a zero a */
+            int saved = nz_mute;
+            buf_puts(out, "(");
+            nz_mute = saved || (e->op == TK_PLUS && nz_sure(e->rhs));
+            emit_expr(e->lhs);
+            buf_printf(out, " %s ", binop(e->op));
+            nz_mute = saved || nz_sure(e->lhs);
+            emit_expr(e->rhs);
+            nz_mute = saved;
             buf_puts(out, ")");
             return;
         }
@@ -2921,6 +2984,7 @@ static void emit_expr_raw(Expr *e) {
         buf_puts(out, e->op == TK_PLUSPLUS ? "++)" : "--)");
         return;
     case E_CALL:
+        if (!nz_mute && e->builtin.cfn && strcmp(e->builtin.cfn, "xs_to_number") == 0 && e->args.len == 1 && may_nz(e->args.items[0])) { emit_nzd(e->args.items[0]); return; } /* XB-087 */
         if (e->builtin.cfn && (strcmp(e->builtin.cfn, "__reflect_decoder") == 0 || strcmp(e->builtin.cfn, "__reflect_encoder") == 0)) {
             emit_reflect_codec(e->elem_type, e->builtin.cfn[10] == 'd');
             return;
@@ -3503,9 +3567,16 @@ static bool mut_has(Class *c, const char *name);
 /* an object that certainly outlives the local being declared: `this` outside a constructor (the constructor may
    still store the field), or a parameter of reference type (the checker refuses to reassign those, and the
    caller's reference keeps the object alive for the whole call). A nullable base reaches here through x! */
+static const char *md_tuple[16]; /* the entry tuples of the map_direct loops being emitted (for (const [k, v] of map)) */
+static int nmd_tuple;
 static bool stable_base(Expr *b) {
     while (b && b->kind == E_AS && b->op == TK_NOT && !b->elem_type) b = b->lhs;
-    if (!b || !cur_func) return false;
+    if (!b) return false;
+    /* XB-088: the entry of a map the loop holds and its body cannot change: its key and value live through the
+       iteration (for (const [c, p] of table): c borrows the key, no retain, no release) */
+    if (b->kind == E_IDENT && b->cname && !getenv("XISTO_NO_MD_BORROW"))
+        for (int i = 0; i < nmd_tuple; i++) if (strcmp(md_tuple[i], b->cname) == 0) return true;
+    if (!cur_func) return false;
     if (b->kind == E_THIS) return cur_func->cls && !cur_func->is_ctor;
     if (b->kind == E_IDENT && b->cname && !b->builtin.cfn)
         for (int i = 0; i < cur_func->nparams; i++) {
@@ -3520,7 +3591,10 @@ static bool stable_base(Expr *b) {
 static bool borrowable_init(Stmt *s) {
     Expr *e = s->init;
     if (!s->is_const || s->cell || !e || !cref(s->type) || xs_debug || getenv("XISTO_NO_BORROW")) return false;
-    if (e->kind != E_MEMBER || e->is_call || e->field < 0 || !e->cls || e->cls->builtin || e->cls->is_interface) return false;
+    if (e->kind != E_MEMBER || e->is_call || e->field < 0 || !e->cls || e->cls->builtin) return false;
+    if (e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname && !getenv("XISTO_NO_MD_BORROW")) /* XB-088: a map entry's tuple (stable_base) */
+        for (int i = 0; i < nmd_tuple; i++) if (strcmp(md_tuple[i], e->lhs->cname) == 0) return true;
+    if (e->cls->is_interface) return false;
     if (!stable_base(e->lhs)) return false;
     return !mut_has(e->cls, e->cls->fields[e->field].name);
 }
@@ -4183,6 +4257,163 @@ static bool nn_expr(Expr *e) {
     case E_COND: return e->args.len == 2 && nn_expr(e->args.items[0]) && nn_expr(e->args.items[1]);
     default: return false;
     }
+}
+/* XB-087: JavaScript's -0. An int slot (variable, field, element) holds 0 for it, but an expression can still produce
+   one: x * -3 at x = 0, -x, x % 2 of a negative x, Math.trunc(-0.5). Where the value is seen as a number (1 / v,
+   Number(v), console.log), such an expression is computed as a double with the sign kept; the int result and its
+   range check are the same. */
+static bool nz_nn(Expr *e) {
+    if (!e) return false;
+    if (e->kind == E_NUMBER) return e->num >= 0;
+    return rv_valid && rv_owner == cur_func && !ictx && nn_expr(e);
+}
+static bool nz_nonzero(Expr *e) { return e && e->kind == E_NUMBER && e->num != 0; }
+static bool nzm(Expr *e, const char *fn) {
+    return e && e->kind == E_MEMBER && e->is_call && e->lhs && e->lhs->kind == E_IDENT && !e->lhs->cname && e->func == NULL &&
+           e->lhs->str && strcmp(e->lhs->str, "Math") == 0 && e->str && strcmp(e->str, fn) == 0;
+}
+static bool may_nz(Expr *e) {
+    if (!e || !e->type || e->type->kind != TY_INT || getenv("XISTO_NO_NEGZERO")) return false;
+    switch (e->kind) {
+    case E_IDENT: return !ictx && nzv_has(e->cname);
+    case E_UNARY: return e->op == TK_MINUS && !nz_nonzero(e->lhs);
+    case E_BINARY:
+        if (e->lhs->type->kind != TY_INT) return false;
+        switch (e->op) {
+        case TK_STAR:
+            if (e->lhs->kind == E_NUMBER && e->lhs->num > 0) return may_nz(e->rhs); /* 2 * y: -0 only from a -0 y */
+            if (e->rhs->kind == E_NUMBER && e->rhs->num > 0) return may_nz(e->lhs);
+            return !(nz_nn(e->lhs) && nz_nn(e->rhs)) || may_nz(e->lhs) || may_nz(e->rhs);
+        case TK_PERCENT: return !nz_nn(e->lhs) || may_nz(e->lhs);
+        case TK_PLUS: return may_nz(e->lhs) && may_nz(e->rhs);
+        case TK_MINUS: return may_nz(e->lhs);
+        default: return false;
+        }
+    case E_COND: return e->args.len == 2 && (may_nz(e->args.items[0]) || may_nz(e->args.items[1]));
+    case E_MEMBER:
+        if (nzm(e, "trunc") || nzm(e, "ceil") || nzm(e, "round") || nzm(e, "floor"))
+            return e->args.len == 1 && e->args.items[0]->type->kind == TY_NUMBER;
+        if (nzm(e, "min") || nzm(e, "max")) {
+            for (int k = 0; k < e->args.len; k++) if (may_nz(e->args.items[k])) return true;
+            return false;
+        }
+        return false;
+    default: return false;
+    }
+}
+static void emit_nzd(Expr *e) {
+    static int nzn;
+    if (!may_nz(e)) { buf_puts(out, "((double)("); emit_expr(e); buf_puts(out, "))"); return; }
+    int id = nzn++;
+    switch (e->kind) {
+    case E_IDENT: buf_printf(out, "%s_z", e->cname); return;
+    case E_UNARY: buf_puts(out, "(-"); emit_nzd(e->lhs); buf_puts(out, ")"); return; /* (inside the safe range both ways) */
+    case E_COND:
+        buf_puts(out, "(");
+        emit_expr(e->lhs);
+        buf_puts(out, " ? ");
+        emit_nzd(e->args.items[0]);
+        buf_puts(out, " : ");
+        emit_nzd(e->args.items[1]);
+        buf_puts(out, ")");
+        return;
+    case E_BINARY: { /* in doubles: integers of the safe range give the exact result, and the range test on it is
+                        the int's (a sum or product past 2^53 - 1 rounds to 2^53 or more); a zero keeps its JS sign */
+        if (!may_nz(e->lhs) && !may_nz(e->rhs) && (e->op == TK_STAR || e->op == TK_PERCENT)) {
+            /* integer operands (no -0 in them): the int operation as always, the sign looked at only for a zero */
+            buf_printf(out, "({ int64_t za%d_ = ", id);
+            emit_expr(e->lhs);
+            buf_printf(out, ", zb%d_ = ", id);
+            emit_expr(e->rhs);
+            buf_printf(out, ", zr%d_ = %s(za%d_, zb%d_", id, e->op == TK_STAR ? "xs_imul_s" : "xs_imod_s", id, id);
+            site_arg(e->pos);
+            if (e->op == TK_STAR) buf_printf(out, "); __builtin_expect(zr%d_ != 0, 1) ? (double)zr%d_ : (double)za%d_ * (double)zb%d_; })", id, id, id, id);
+            else buf_printf(out, "); __builtin_expect(zr%d_ != 0, 1) ? (double)zr%d_ : (za%d_ < 0 ? -0.0 : 0.0); })", id, id, id);
+            return;
+        }
+        const char *fn = e->op == TK_STAR ? "xs_dmul_s" : e->op == TK_PERCENT ? "xs_dmod_s" : e->op == TK_PLUS ? "xs_dadd_s" : "xs_dsub_s";
+        buf_printf(out, "%s(", fn);
+        emit_nzd(e->lhs);
+        buf_puts(out, ", ");
+        emit_nzd(e->rhs);
+        site_arg(e->pos);
+        buf_puts(out, ")");
+        return;
+    }
+    case E_MEMBER:
+        if (nzm(e, "min") || nzm(e, "max")) {
+            bool mn = e->str[1] == 'i';
+            buf_puts(out, "({ ");
+            for (int k = 0; k < e->args.len; k++) { buf_printf(out, "double zm%d_%d_ = ", id, k); emit_nzd(e->args.items[k]); buf_puts(out, "; "); }
+            buf_printf(out, "double zr%d_ = zm%d_0_; ", id, id);
+            for (int k = 1; k < e->args.len; k++) buf_printf(out, "zr%d_ = %s(zr%d_, zm%d_%d_); ", id, mn ? "xs_fmin" : "xs_fmax", id, id, k);
+            buf_printf(out, "zr%d_; })", id);
+            return;
+        }
+        buf_printf(out, "xs_%s_d_s(", e->str); /* Math.trunc / ceil / round / floor: the double, range-checked */
+        emit_expr(e->args.items[0]);
+        site_arg(e->pos);
+        buf_puts(out, ")");
+        return;
+    default: buf_puts(out, "((double)("); emit_expr(e); buf_puts(out, "))"); return;
+    }
+}
+/* XB-087: the int locals initialized with a value that may be -0 and never written again (const, or a let nothing
+   assigns, increments or captures): they keep the double beside them, so 1 / y and console.log(y) see the -0 */
+static bool nzv_written(Stmt *s, const char *c, int in_arrow);
+static bool nzv_written_e(Expr *e, const char *c, int in_arrow) {
+    if (!e) return false;
+    bool me = e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && strcmp(e->lhs->str, c) == 0; /* (by name: any write to a
+                                                                                                   variable of that name) */
+    if ((e->kind == E_ASSIGN || e->kind == E_POSTFIX) && me) return true;
+    if (e->kind == E_UNARY && (e->op == TK_PLUSPLUS || e->op == TK_MINUSMINUS) && me) return true;
+    if (in_arrow && e->kind == E_IDENT && e->str && strcmp(e->str, c) == 0) return true; /* captured */
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn && nzv_written(e->arrow->fn->body, c, 1)) return true;
+    if (nzv_written_e(e->lhs, c, in_arrow) || nzv_written_e(e->rhs, c, in_arrow)) return true;
+    for (int i = 0; i < e->args.len; i++) if (nzv_written_e(e->args.items[i], c, in_arrow)) return true;
+    return false;
+}
+static bool nzv_written(Stmt *s, const char *c, int in_arrow) {
+    if (!s) return false;
+    if (nzv_written_e(s->init, c, in_arrow) || nzv_written_e(s->expr, c, in_arrow) || nzv_written_e(s->cond, c, in_arrow) || nzv_written_e(s->for_update, c, in_arrow)) return true;
+    if (nzv_written(s->for_init, c, in_arrow) || nzv_written(s->body, c, in_arrow) || nzv_written(s->else_body, c, in_arrow)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (nzv_written(s->stmts.items[i], c, in_arrow)) return true;
+    for (int i = 0; i < s->ncases; i++) if (nzv_written_e(s->cases[i].value, c, in_arrow) || nzv_written(s->cases[i].body, c, in_arrow)) return true;
+    return false;
+}
+static Stmt **nzv_root; static int nzv_nroot;
+static void nzv_scan(Stmt *s) {
+    if (!s) return;
+    if (s->kind == S_VAR && s->cname && s->name && s->init && s->type && s->type->kind == TY_INT && !nzv_has(s->cname) &&
+        strspn(s->cname, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") == strlen(s->cname) && may_nz(s->init)) {
+        bool w = false;
+        for (int i = 0; i < nzv_nroot && !w; i++) w = nzv_written(nzv_root[i], s->name, 0);
+        if (!w) {
+            nzv = realloc(nzv, sizeof *nzv * (size_t)(nnzv + 1)); nzv[nnzv++] = s->cname;
+            for (NzvSet *q = nzv_sets; q; q = q->next) if (q->owner == nzv_owner) { q->names = nzv; q->n = nnzv; }
+        }
+    }
+    nzv_scan(s->for_init); nzv_scan(s->body); nzv_scan(s->else_body);
+    for (int i = 0; i < s->stmts.len; i++) nzv_scan(s->stmts.items[i]);
+    for (int i = 0; i < s->ncases; i++) nzv_scan(s->cases[i].body);
+}
+static void nzv_compute(Func *owner, Stmt **stmts, int n) {
+    NzvSet *z = NULL;
+    for (NzvSet *q = nzv_sets; q; q = q->next) if (q->owner == owner) z = q;
+    if (!z) { z = calloc(1, sizeof *z); z->owner = owner; z->next = nzv_sets; nzv_sets = z; }
+    z->n = 0;
+    nzv = NULL; nnzv = 0; nzv_owner = owner;
+    if (getenv("XISTO_NO_NEGZERO") || (owner && (owner->is_gen || owner->is_async))) return;
+    nzv_root = stmts; nzv_nroot = n;
+    Func *saved = cur_func; cur_func = owner; /* (may_nz reads the ranges of this function, and the set being built) */
+    z->names = NULL;
+    for (int round = 0; round < 3; round++) {
+        int before = nnzv;
+        for (int i = 0; i < n; i++) nzv_scan(stmts[i]);
+        z->names = nzv; z->n = nnzv;
+        if (nnzv == before) break;
+    }
+    cur_func = saved;
 }
 /* top-level code (main): only its own locals; a top-level variable functions also use is not one of them */
 static bool rv_main_only(const char *c);
@@ -5527,6 +5758,19 @@ static void emit_stmt_(Stmt *s) {
     if ((s->kind == S_WHILE || s->kind == S_FOR) && u8reg_loop(s)) { drain_if_needed(); return; }
     switch (s->kind) {
     case S_VAR:
+        if (s->cname && s->init && !ictx && nzv_has(s->cname)) { /* XB-087: the double first, the int from it */
+            buf_printf(out, "double %s_z = ", s->cname);
+            emit_nzd(s->init);
+            buf_puts(out, "; ");
+            Expr *saved = s->init, tmp = *saved;
+            tmp.kind = E_IDENT;
+            tmp.cname = xs_sprintf("((int64_t)%s_z)", s->cname);
+            s->init = &tmp;
+            emit_var(s);
+            s->init = saved;
+            drain_if_needed();
+            return;
+        }
         emit_var(s);
         drain_if_needed();
         return;
@@ -5796,7 +6040,9 @@ static void emit_stmt_(Stmt *s) {
             }
             dbg_local(s->name, s->type, s->cname, s->is_const);
             nl();
+            if (nmd_tuple < 16) md_tuple[nmd_tuple++] = s->cname;
             emit_block(s->body, false);
+            nmd_tuple--;
             emit_releases(escope);
             epop();
             indent--;
@@ -6943,7 +7189,7 @@ static void emit_spine_num(Func *f, Spine *sp) {
 static void emit_func_body(Func *f) {
     cur_func = f;
     if (f->mod) cur_mod = f->mod;
-    if (f->body) rv_compute(f, &f->body, 1);
+    if (f->body) { rv_compute(f, &f->body, 1); nzv_compute(f, &f->body, 1); }
     if (f->is_gen) { emit_gen(f); cur_func = NULL; return; }
     vol_locals = stmt_has_try(f->body);
     { Spine sp_; if (spine_fn(f, &sp_)) { if (sp_.num) emit_spine_num(f, &sp_); else emit_spine(f, &sp_); cur_func = NULL; return; } }
@@ -8129,6 +8375,8 @@ void emit_program(Program *p, Buf *o) {
     }
     cur_func = NULL;
     rv_compute(NULL, p->top.items, p->top.len);
+    nzv_compute(NULL, p->top.items, p->top.len);
+    for (int i = 0; i < nnzv; i++) { nl(); buf_printf(out, "double %s_z = 0; (void)%s_z;", nzv[i], nzv[i]); } /* XB-087 (only main reads them) */
     emit_dbg_enter(NULL);
     epush(true);
     for (int i = 0; i < p->top.len; i++) {
@@ -8141,6 +8389,7 @@ void emit_program(Program *p, Buf *o) {
         } else if (s->kind == S_VAR) {
             used_ar = false;
             buf_printf(out, "%s = ", s->cname);
+            if (s->init && nzv_has(s->cname)) { buf_printf(out, "(int64_t)(%s_z = ", s->cname); emit_nzd(s->init); buf_puts(out, ")"); } else
             emit_owned(s->init);
             buf_puts(out, ";");
             dbg_local(s->name, s->type, s->cname, s->is_const);

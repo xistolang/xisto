@@ -2725,6 +2725,25 @@ XS_AI int64_t xs_round_int_s(double x, const xs_site *s) {
     if (x - r >= 0.5) r += 1;
     return xs_to_int_s(r, s);
 }
+/* XB-087: int operations as doubles where the value is read as a number, so a -0 stays (0 * -3, -4 % 2): the operands
+   are integers of the safe range, so the double result is exact while it is inside the range, and past it is 2^53 or
+   more: the same test, the same error as the int's */
+#define XS_DOUT(r) (!(__builtin_fabs(r) <= 9007199254740991.0))
+XS_AI double xs_dmul_s(double a, double b, const xs_site *s) { double r = a * b; if (__builtin_expect(XS_DOUT(r), 0)) XS_FAIL(XS_IOVF_MSG, s); return r; }
+XS_AI double xs_dadd_s(double a, double b, const xs_site *s) { double r = a + b; if (__builtin_expect(XS_DOUT(r), 0)) XS_FAIL(XS_IOVF_MSG, s); return r; }
+XS_AI double xs_dsub_s(double a, double b, const xs_site *s) { double r = a - b; if (__builtin_expect(XS_DOUT(r), 0)) XS_FAIL(XS_IOVF_MSG, s); return r; }
+XS_AI double xs_dmod_s(double a, double b, const xs_site *s) { if (b == 0) XS_FAIL("integer modulo by zero", s); return fmod(a, b); }
+/* XB-087: the same, as the double JavaScript gives (Math.trunc(-0.5) is -0), range-checked like the int */
+XS_AI double xs_trunc_d_s(double x, const xs_site *s) { double r = trunc(x); (void)xs_to_int_s(r, s); return r; }
+XS_AI double xs_floor_d_s(double x, const xs_site *s) { double r = floor(x); (void)xs_to_int_s(r, s); return r; }
+XS_AI double xs_ceil_d_s(double x, const xs_site *s) { double r = ceil(x); (void)xs_to_int_s(r, s); return r; }
+XS_AI double xs_round_d_s(double x, const xs_site *s) {
+    double r = floor(x);
+    if (x - r >= 0.5) r += 1;
+    if (r == 0 && (x < 0 || __builtin_signbit(x))) r = -0.0;
+    (void)xs_to_int_s(r, s);
+    return r;
+}
 XS_AI int64_t xs_iabs_s(int64_t a, const xs_site *s) { return a < 0 ? xs_ineg_s(a, s) : a; }
 
 /* ---- number formatting: ECMAScript Number::toString ---- */
