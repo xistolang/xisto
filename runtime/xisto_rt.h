@@ -4753,6 +4753,195 @@ static inline void xs_u8_trade(const xs_u8_tr_ctx *c, xs_Uint8Array *buf, int64_
         d[b - t] = T[x];
     }
 }
+/* ---- reverse of xisto:bytes on several threads (XB-092): reverseAround / reverseMapped of a big range. Both trade
+   the k-th byte that is not `keep` from the front with the k-th from the back, mapped through the table (keep < 0:
+   every byte). Those pairs are independent, so the pairs are cut into tasks by rank: a first pass counts the
+   bytes that are not `keep` in blocks of the range (each thread its blocks), so each task finds the positions of
+   its first front and back rank and trades its pairs in runs between two `keep` bytes, as the one-thread loop
+   does (xs_u8_trade's 16-byte blocks; a run below 16 bytes in plain bytes: the masked short path would rewrite
+   bytes of the neighbouring task). Exact: the same pairs, the same table. Left to the one-thread loop: a range
+   below 1 MB, fewer than 4 cores, a table that maps another byte to `keep` (the loop would then see the new `keep` bytes),
+   and XISTO_NO_REV_PAR=1. Its own threads (no runtime state is touched: raw bytes only), made at the first use. */
+#if !defined(_WIN32)
+#include <pthread.h>
+#include <stdatomic.h>
+typedef struct {
+    uint8_t *d; xs_u8_tr_ctx c; int keep;
+    int64_t start, end, m, half, blk, nblk, ntask;
+    int64_t *pre; /* bytes that are not keep before block b (nblk + 1 entries) */
+    int phase;
+    atomic_int_fast64_t next;
+} xs_rap_job;
+static pthread_mutex_t xs_rap_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t xs_rap_wake = PTHREAD_COND_INITIALIZER, xs_rap_done = PTHREAD_COND_INITIALIZER;
+static xs_rap_job *xs_rap_cur;
+static uint64_t xs_rap_gen;
+static int xs_rap_nthreads = -1, xs_rap_busy;
+static int64_t xs_rap_count(const uint8_t *p, int64_t n, int keep) {
+    int64_t k = 0;
+    const uint8_t *e = p + n;
+    while (p < e) {
+        const uint8_t *q = memchr(p, keep, (size_t)(e - p));
+        if (!q) break;
+        k++; p = q + 1;
+    }
+    return n - k;
+}
+/* the position of the byte of rank r (0-based, among those that are not keep) */
+static int64_t xs_rap_pos(const xs_rap_job *j, int64_t r) {
+    if (j->keep < 0) return j->start + r;
+    int64_t lo = 0, hi = j->nblk - 1; /* the last block b with pre[b] <= r */
+    while (lo < hi) { int64_t mid = (lo + hi + 1) >> 1; if (j->pre[mid] <= r) lo = mid; else hi = mid - 1; }
+    int64_t need = r - j->pre[lo];
+    const uint8_t *p = j->d + j->start + lo * j->blk, *e = j->d + (j->start + (lo + 1) * j->blk < j->end ? j->start + (lo + 1) * j->blk : j->end);
+    for (;;) {
+        const uint8_t *q = memchr(p, j->keep, (size_t)(e - p));
+        int64_t seg = (q ? q : e) - p;
+        if (need < seg) return (p - j->d) + need;
+        need -= seg;
+        p = q + 1;
+    }
+}
+/* trades run pairs from a up and b down; masked (the 16-byte short path, which rewrites bytes next to the run)
+   only when those bytes are the task's own: inside [a, fend] and [bstart, b] */
+static void xs_rap_trade(const xs_rap_job *j, int64_t a, int64_t b, int64_t run, int64_t fend, int64_t bstart) {
+    uint8_t *d = j->d;
+#if defined(__SSSE3__) || defined(__ARM_NEON)
+    if (j->c.simd && (run >= 16 || (a + 15 <= fend && b - 15 >= bstart))) {
+        xs_Uint8Array fake;
+        memset(&fake, 0, sizeof fake);
+        fake.data = d; fake.f_length = j->end;
+        xs_u8_trade(&j->c, &fake, a, b, run, NULL);
+        return;
+    }
+#endif
+    const uint8_t *T = j->c.T;
+    for (int64_t t = 0; t < run; t++) { uint8_t x = d[a + t]; d[a + t] = T[d[b - t]]; d[b - t] = T[x]; }
+}
+static int64_t xs_rap_next_keep(const xs_rap_job *j, int64_t i) {
+    if (j->keep < 0) return j->end;
+    const uint8_t *q = memchr(j->d + i, j->keep, (size_t)(j->end - i));
+    return q ? q - j->d : j->end;
+}
+static int64_t xs_rap_prev_keep(const xs_rap_job *j, int64_t k) { /* the position after the keep before k (or start) */
+    if (j->keep < 0) return j->start;
+    const uint8_t *d = j->d;
+    int64_t x = k;
+    while (x - 8 >= j->start) { /* 8 at a time: a keep byte among them? */
+        uint64_t w;
+        memcpy(&w, d + x - 7, 8);
+        uint64_t v = w ^ (0x0101010101010101ull * (uint8_t)j->keep);
+        if ((v - 0x0101010101010101ull) & ~v & 0x8080808080808080ull) break;
+        x -= 8;
+    }
+    while (x >= j->start && d[x] != j->keep) x--;
+    return x + 1;
+}
+static void xs_rap_task(xs_rap_job *j, int64_t t) {
+    if (j->phase == 0) { /* count block t */
+        int64_t s = j->start + t * j->blk, e = s + j->blk < j->end ? s + j->blk : j->end;
+        j->pre[t + 1] = xs_rap_count(j->d + s, e - s, j->keep);
+        return;
+    }
+    int64_t r0 = j->half * t / j->ntask, r1 = j->half * (t + 1) / j->ntask, left = r1 - r0;
+    if (left <= 0) return;
+    int64_t i = xs_rap_pos(j, r0), k = xs_rap_pos(j, j->m - 1 - r0);
+    int64_t fend = xs_rap_pos(j, r1 - 1), bstart = xs_rap_pos(j, j->m - r1); /* this task's own bytes */
+    const uint8_t *d = j->d;
+    int64_t iend = xs_rap_next_keep(j, i), kstart = xs_rap_prev_keep(j, k);
+    while (left > 0) {
+        int64_t run = iend - i;
+        if (k - kstart + 1 < run) run = k - kstart + 1;
+        if (left < run) run = left;
+        xs_rap_trade(j, i, k, run, fend, bstart);
+        i += run; k -= run; left -= run;
+        if (left > 0) {
+            if (i == iend) { while (d[i] == j->keep) i++; iend = xs_rap_next_keep(j, i); }
+            if (k < kstart) { while (d[k] == j->keep) k--; kstart = xs_rap_prev_keep(j, k); }
+        }
+    }
+}
+static void xs_rap_work(xs_rap_job *j) {
+    int64_t n = j->phase == 0 ? j->nblk : j->ntask;
+    for (;;) {
+        int64_t t = atomic_fetch_add(&j->next, 1);
+        if (t >= n) break;
+        xs_rap_task(j, t);
+    }
+}
+static void *xs_rap_worker(void *arg) {
+    (void)arg;
+    uint64_t seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&xs_rap_mu);
+        while (xs_rap_gen == seen) pthread_cond_wait(&xs_rap_wake, &xs_rap_mu);
+        seen = xs_rap_gen;
+        xs_rap_job *j = xs_rap_cur;
+        pthread_mutex_unlock(&xs_rap_mu);
+        xs_rap_work(j);
+        pthread_mutex_lock(&xs_rap_mu);
+        if (--xs_rap_busy == 0) pthread_cond_signal(&xs_rap_done);
+        pthread_mutex_unlock(&xs_rap_mu);
+    }
+    return NULL;
+}
+static void xs_rap_run(xs_rap_job *j, int phase) {
+    j->phase = phase;
+    atomic_store(&j->next, 0);
+    pthread_mutex_lock(&xs_rap_mu);
+    xs_rap_cur = j;
+    xs_rap_busy = xs_rap_nthreads;
+    xs_rap_gen++;
+    pthread_cond_broadcast(&xs_rap_wake);
+    pthread_mutex_unlock(&xs_rap_mu);
+    xs_rap_work(j);
+    pthread_mutex_lock(&xs_rap_mu);
+    while (xs_rap_busy > 0) pthread_cond_wait(&xs_rap_done, &xs_rap_mu);
+    pthread_mutex_unlock(&xs_rap_mu);
+}
+/* true: done here; false: the caller runs its own loop */
+XS_NOINLINE bool xs_u8_rev_par(xs_Uint8Array *buf, xs_Uint8Array *table, int64_t keep, int64_t start, int64_t end) {
+    int64_t n = end - start;
+    if (n < ((int64_t)1 << 20) || start < 0 || end > buf->f_length || table->f_length != 256 || keep > 255) return false;
+    static int off = -1;
+    if (off < 0) off = getenv("XISTO_NO_REV_PAR") != NULL;
+    if (off) return false;
+    if (keep >= 0) for (int b = 0; b < 256; b++) if (b != keep && table->data[b] == keep) return false;
+    if (xs_rap_nthreads < 0) {
+        const char *s = getenv("XISTO_THREADS");
+        long t = s && *s ? strtol(s, NULL, 10) : sysconf(_SC_NPROCESSORS_ONLN);
+        if (t > 64) t = 64;
+        xs_rap_nthreads = 0;
+        for (long k = 1; k < t; k++) {
+            pthread_t th;
+            if (pthread_create(&th, NULL, xs_rap_worker, NULL) == 0) { pthread_detach(th); xs_rap_nthreads++; }
+        }
+    }
+    if (xs_rap_nthreads < 3) return false; /* (2 cores: the counting pass eats the gain, measured on the M4 with 2 threads: 31 ms either way, twice the CPU) */
+    xs_rap_job j;
+    memset(&j, 0, sizeof j);
+    j.d = buf->data; j.c = xs_u8_tr_setup(table); j.keep = (int)keep; j.start = start; j.end = end;
+    int threads = xs_rap_nthreads + 1;
+    if (keep >= 0) {
+        j.blk = (int64_t)1 << 18;
+        j.nblk = (n + j.blk - 1) / j.blk;
+        j.pre = malloc(sizeof(int64_t) * (size_t)(j.nblk + 1));
+        if (!j.pre) return false;
+        j.pre[0] = 0;
+        xs_rap_run(&j, 0);
+        for (int64_t b = 0; b < j.nblk; b++) j.pre[b + 1] += j.pre[b];
+        j.m = j.pre[j.nblk];
+    } else j.m = n;
+    j.half = j.m >> 1;
+    j.ntask = (int64_t)threads * 8;
+    if (j.half > 0) xs_rap_run(&j, 1);
+    if (j.m & 1) { int64_t p = xs_rap_pos(&j, j.half); j.d[p] = j.c.T[j.d[p]]; }
+    free(j.pre);
+    return true;
+}
+#else
+static bool xs_u8_rev_par(xs_Uint8Array *buf, xs_Uint8Array *table, int64_t keep, int64_t start, int64_t end) { (void)buf, (void)table, (void)keep, (void)start, (void)end; return false; }
+#endif
 static inline void xs_u8_rev(xs_Uint8Array *a, int64_t lo, int64_t hi, const xs_site *s) {
     if (lo >= hi) return; /* (the loop runs no iteration: nothing read, nothing checked) */
     if (lo < 0 || (uint64_t)hi >= (uint64_t)a->f_length) XS_FAIL("index out of bounds", s);
