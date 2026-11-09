@@ -1362,6 +1362,58 @@ XS_NOINLINE xs_str *xs_str_replace_impl2(xs_str *s, xs_str *a, xs_str *b, bool a
 }
 XS_NOINLINE xs_str *xs_str_replace_impl(xs_str *s, xs_str *a, xs_str *b, bool all) { return xs_str_replace_impl2(s, a, b, all, false); }
 XS_NOINLINE xs_str *xs_str_replace_all_mv(xs_str *s, xs_str *a, xs_str *b) { return xs_str_replace_impl2(s, a, b, true, true); }
+
+/* s.slice(a, b), then .replaceAll(one ASCII character, "") and/or .toUpperCase()/.toLowerCase() (the compiler's
+   fused chain; pat NULL: no replaceAll; mode 0 none, 1 upper, 2 lower; case_first: the case call is inside the
+   replaceAll). An ASCII s: one pass over the source range into a new string, sixteen bytes at a time (k-nucleotide's
+   125 MB: three passes and a copy before, one now). Anything else: the calls one after another, as written. */
+XS_NOINLINE xs_str *xs_str_chain_fused(xs_str *s, int64_t start, int64_t end, xs_str *pat, int mode, bool case_first) {
+    int64_t n = xs_str_len(s);
+    if (s->ulen != s->len || (pat && (pat->len != 1 || (unsigned char)pat->data[0] >= 0x80)) || getenv("XISTO_NO_CHAIN_FUSE")) {
+        xs_str *t = xs_str_slice(s, start, end), *u;
+        if (mode && case_first) { u = mode == 1 ? xs_str_upper(t) : xs_str_lower(t); xs_release_as(t, xs_str_free); t = u; }
+        if (pat) { xs_str *e = xs_str_new("", 0); u = xs_str_replace_impl(t, pat, e, true); xs_release_as(e, xs_str_free); xs_release_as(t, xs_str_free); t = u; }
+        if (mode && !case_first) { u = mode == 1 ? xs_str_upper(t) : xs_str_lower(t); xs_release_as(t, xs_str_free); t = u; }
+        return t;
+    }
+    if (end == XS_SLICE_END) end = n;
+    if (start < 0) start += n;
+    if (end < 0) end += n;
+    if (start < 0) start = 0;
+    if (end > n) end = n;
+    if (start >= end) return xs_str_new("", 0);
+    const unsigned char *p = (const unsigned char *)s->data + start, *q = (const unsigned char *)s->data + end;
+    xs_str *r = xs_str_alloc(end - start);
+    unsigned char *o = (unsigned char *)r->data;
+    int ch = pat ? (unsigned char)pat->data[0] : 256;
+    /* the character to drop, compared before or after the case mapping (as the calls are nested) */
+    unsigned char lo = mode == 1 ? 'a' : 'A', hi = mode == 1 ? 'z' : 'Z';
+    int delta = mode == 1 ? -32 : 32;
+    typedef unsigned char v16 __attribute__((vector_size(16), aligned(1)));
+    v16 vlo = (v16){0} + lo, vhi = (v16){0} + hi, vd = (v16){0} + (unsigned char)delta, vc = (v16){0} + (unsigned char)(ch & 0xff);
+    while (p + 16 <= q) {
+        v16 x;
+        memcpy(&x, p, 16);
+        v16 m = mode ? (v16)((x >= vlo) & (x <= vhi)) : (v16){0};
+        v16 y = x + (m & vd);
+        v16 hit = ch < 256 ? (v16)((case_first ? y : x) == vc) : (v16){0};
+        uint64_t h[2];
+        memcpy(h, &hit, 16);
+        if (!(h[0] | h[1])) { memcpy(o, &y, 16); o += 16; p += 16; continue; }
+        unsigned char yb[16], xb[16];
+        memcpy(yb, &y, 16); memcpy(xb, &x, 16);
+        for (int k = 0; k < 16; k++) if ((case_first ? yb[k] : xb[k]) != ch) *o++ = yb[k];
+        p += 16;
+    }
+    for (; p < q; p++) {
+        unsigned char x = *p, y = mode && x >= lo && x <= hi ? (unsigned char)(x + delta) : x;
+        if ((case_first ? y : x) != ch) *o++ = y;
+    }
+    r->len = (int64_t)(o - (unsigned char *)r->data);
+    r->data[r->len] = 0;
+    r->ulen = r->len <= INT32_MAX ? (int32_t)r->len : -1;
+    return r;
+}
 XS_NOINLINE xs_str *xs_str_replace(xs_str *s, xs_str *a, xs_str *b) { return xs_str_replace_impl(s, a, b, false); }
 XS_NOINLINE xs_str *xs_str_replace_all(xs_str *s, xs_str *a, xs_str *b) { return xs_str_replace_impl(s, a, b, true); }
 
@@ -4831,6 +4883,7 @@ static inline const uint8_t *xs_memchr(const uint8_t *p, int c, size_t n) {
 #include <stdatomic.h>
 typedef struct {
     uint8_t *d; xs_u8_tr_ctx c; int keep;
+    const uint8_t *src, *map; /* phase 2: d[i] = map[src[i]] over [start, end) in ntask pieces */
     int64_t start, end, m, half, blk, nblk, ntask;
     int64_t *pre; /* bytes that are not keep before block b (nblk + 1 entries) */
     int phase;
@@ -4993,12 +5046,20 @@ static void xs_rap_seq(xs_rap_job *j) {
     }
     if (i == k && d[i] != j->keep) j->d[i] = j->c.T[d[i]]; /* the middle byte */
 }
+static void xs_map_task(xs_rap_job *j, int64_t t) {
+    int64_t n = j->end - j->start, a = j->start + n * t / j->ntask, b = j->start + n * (t + 1) / j->ntask;
+    uint8_t *restrict d = j->d;
+    const uint8_t *restrict src = j->src, *restrict T = j->map;
+    if (d == src) { uint8_t *p = d; for (int64_t i = a; i < b; i++) p[i] = T[p[i]]; }
+    else for (int64_t i = a; i < b; i++) d[i] = T[src[i]];
+}
 static void xs_rap_work(xs_rap_job *j) {
     int64_t n = j->phase == 0 ? j->nblk : j->ntask;
     for (;;) {
         int64_t t = atomic_fetch_add(&j->next, 1);
         if (t >= n) break;
-        xs_rap_task(j, t);
+        if (j->phase == 2) xs_map_task(j, t);
+        else xs_rap_task(j, t);
     }
 }
 static void *xs_rap_worker(void *arg) {
@@ -5030,6 +5091,42 @@ static void xs_rap_run(xs_rap_job *j, int phase) {
     pthread_mutex_lock(&xs_rap_mu);
     while (xs_rap_busy > 0) pthread_cond_wait(&xs_rap_done, &xs_rap_mu);
     pthread_mutex_unlock(&xs_rap_mu);
+}
+static void xs_rap_start_threads(void) {
+    if (xs_rap_nthreads >= 0) return;
+    const char *s = getenv("XISTO_THREADS");
+    long t = s && *s ? strtol(s, NULL, 10) : sysconf(_SC_NPROCESSORS_ONLN);
+    if (t > 64) t = 64;
+    xs_rap_nthreads = 0;
+    for (long k = 1; k < t; k++) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, xs_rap_worker, NULL) == 0) { pthread_detach(th); xs_rap_nthreads++; }
+    }
+}
+/* `for (i = lo; i < hi; i++) D[i] = T[S[i]]` on byte arrays, split over threads: every element on its own, so the
+   pieces in any order give the loop's bytes, when the ranges are in bounds (no error to raise), T has 256 entries
+   (every byte indexes it) and nothing overlaps but D and S being the same bytes (in place). true: done here;
+   false: the caller runs its loop (a small range, one core, anything else) */
+XS_NOINLINE bool xs_u8_map_par(xs_Uint8Array *D, xs_Uint8Array *S, xs_Uint8Array *T, int64_t lo, int64_t hi) {
+    static int off = -1;
+    if (off < 0) off = getenv("XISTO_NO_U8_MAP_PAR") != NULL;
+    if (off || hi - lo < ((int64_t)1 << 21) || lo < 0 || hi > D->f_length || hi > S->f_length || T->f_length < 256) return false;
+    uintptr_t d0 = (uintptr_t)(D->data + lo), d1 = (uintptr_t)(D->data + hi), s0 = (uintptr_t)(S->data + lo), s1 = (uintptr_t)(S->data + hi);
+    uintptr_t t0 = (uintptr_t)T->data, t1 = t0 + 256;
+    if (d0 != s0 && d0 < s1 && s0 < d1) return false; /* D and S overlapping at an offset: the loop's order matters */
+    if (t0 < d1 && d0 < t1) return false;           /* the table among the bytes written */
+    static atomic_int busy; /* one job at a time on the shared threads: a call from another thread meanwhile loops */
+    int expect = 0;
+    if (!atomic_compare_exchange_strong(&busy, &expect, 1)) return false;
+    xs_rap_start_threads();
+    if (xs_rap_nthreads < 1) { atomic_store(&busy, 0); return false; }
+    xs_rap_job j;
+    memset(&j, 0, sizeof j);
+    j.d = D->data; j.src = S->data; j.map = T->data; j.start = lo; j.end = hi;
+    j.ntask = (int64_t)(xs_rap_nthreads + 1) * 4;
+    xs_rap_run(&j, 2);
+    atomic_store(&busy, 0);
+    return true;
 }
 /* true: done here; false: the caller runs its own loop */
 XS_NOINLINE bool xs_u8_rev_par(xs_Uint8Array *buf, xs_Uint8Array *table, int64_t keep, int64_t start, int64_t end) {
@@ -5094,6 +5191,7 @@ XS_NOINLINE bool xs_u8_rev_par(xs_Uint8Array *buf, xs_Uint8Array *table, int64_t
 }
 #else
 static bool xs_u8_rev_par(xs_Uint8Array *buf, xs_Uint8Array *table, int64_t keep, int64_t start, int64_t end) { (void)buf, (void)table, (void)keep, (void)start, (void)end; return false; }
+static bool xs_u8_map_par(xs_Uint8Array *D, xs_Uint8Array *S, xs_Uint8Array *T, int64_t lo, int64_t hi) { (void)D, (void)S, (void)T, (void)lo, (void)hi; return false; }
 #endif
 static inline void xs_u8_rev(xs_Uint8Array *a, int64_t lo, int64_t hi, const xs_site *s) {
     if (lo >= hi) return; /* (the loop runs no iteration: nothing read, nothing checked) */
