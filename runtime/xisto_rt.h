@@ -966,11 +966,16 @@ static int64_t xs_ascii_prefix(const unsigned char *d, int64_t n) {
     while (i < n && d[i] < 0x80) i++;
     return i;
 }
+static bool xs_ulen_par(const unsigned char *d, int64_t n, int64_t *count);
+static bool xs_copy_par(unsigned char *dst, const unsigned char *src, int64_t n);
 static int64_t xs_str_len(xs_str *s) {
     if (s->ulen < 0) {
-        int64_t n = xs_ascii_prefix((const unsigned char *)s->data, s->len);
-        for (int64_t i = n; i < s->len; i++)
-            if ((s->data[i] & 0xC0) != 0x80) n++;
+        int64_t n;
+        if (!xs_ulen_par((const unsigned char *)s->data, s->len, &n)) { /* (a long string: counted over the threads) */
+            n = xs_ascii_prefix((const unsigned char *)s->data, s->len);
+            for (int64_t i = n; i < s->len; i++)
+                if ((s->data[i] & 0xC0) != 0x80) n++;
+        }
         if (n > INT32_MAX) return n; /* too long to cache in the header: counted each time */
         s->ulen = (int32_t)n;
     }
@@ -1037,6 +1042,7 @@ static const char *xs_find(const char *h, size_t hn, const char *n, size_t nn) {
     }
 }
 
+static bool xs_find_par(const char *h, size_t hn, const char *nd, size_t nn, const char **hit);
 static int64_t xs_str_index_of(xs_str *s, xs_str *p, int64_t from) {
     int64_t n = xs_str_len(s);
     if (from < 0) from = 0;
@@ -1044,7 +1050,9 @@ static int64_t xs_str_index_of(xs_str *s, xs_str *p, int64_t from) {
     if (p->len == 0) return from;
     int64_t start = xs_str_byte_at(s, from);
     if (p->len > s->len - start) return -1;
-    const char *hit = xs_find(s->data + start, (size_t)(s->len - start), p->data, (size_t)p->len);
+    const char *hit;
+    if (!xs_find_par(s->data + start, (size_t)(s->len - start), p->data, (size_t)p->len, &hit)) /* (a long text: searched over the threads) */
+        hit = xs_find(s->data + start, (size_t)(s->len - start), p->data, (size_t)p->len);
     if (!hit) return -1;
     return xs_str_cp_at_byte(s, (int64_t)(hit - s->data));
 }
@@ -4908,6 +4916,8 @@ typedef struct {
     int64_t fw; /* > 0: every line has fw bytes, then keep (the last one fw or fewer), proved by the count: positions by arithmetic */
     atomic_int fw_bad; /* phase 0: a block whose keeps are not where fw puts them */
     const unsigned char *csrc; unsigned char *cout; int cmode, cch; bool ccase; int64_t *ckept; /* phases 3, 4: the fused chain in ntask pieces */
+    unsigned char *gdst; int64_t *gcount; /* phase 5: code points of csrc in ntask pieces into gcount; 6: csrc copied to gdst */
+    const char *gneedle; size_t gnn; atomic_int_fast64_t gfirst; /* phase 7: the first piece with a hit of gneedle in csrc (gcount: its offset or -1) */
     int phase;
     atomic_int_fast64_t next;
 } xs_rap_job;
@@ -5093,6 +5103,25 @@ static void xs_map_task(xs_rap_job *j, int64_t t) {
     if (d == src) { uint8_t *p = d; for (int64_t i = a; i < b; i++) p[i] = T[p[i]]; }
     else for (int64_t i = a; i < b; i++) d[i] = T[src[i]];
 }
+static void xs_gen_task(xs_rap_job *j, int64_t t) {
+    int64_t n = j->end - j->start, a = j->start + n * t / j->ntask, b = j->start + n * (t + 1) / j->ntask;
+    const unsigned char *d = j->csrc;
+    if (j->phase == 6) { memcpy(j->gdst + a, d + a, (size_t)(b - a)); return; }
+    if (j->phase == 7) { /* the hits that start in [a, b); a piece after one that has a hit is not searched */
+        j->gcount[t] = -1;
+        if (t > atomic_load(&j->gfirst)) return;
+        int64_t e = b + (int64_t)j->gnn - 1 < j->end ? b + (int64_t)j->gnn - 1 : j->end;
+        const char *h = e - a >= (int64_t)j->gnn ? xs_find((const char *)d + a, (size_t)(e - a), j->gneedle, j->gnn) : NULL;
+        if (!h) return;
+        j->gcount[t] = (int64_t)(h - (const char *)d);
+        int_fast64_t cur = atomic_load(&j->gfirst);
+        while (t < cur && !atomic_compare_exchange_weak(&j->gfirst, &cur, t)) {}
+        return;
+    }
+    int64_t c = 0;
+    for (int64_t i = a; i < b; i++) c += (d[i] & 0xC0) != 0x80; /* (vectorized: no branch) */
+    j->gcount[t] = c;
+}
 static void xs_chain_task(xs_rap_job *j, int64_t t) {
     int64_t n = j->end - j->start, a = j->start + n * t / j->ntask, b = j->start + n * (t + 1) / j->ntask;
     if (j->phase == 3) j->ckept[t + 1] = xs_chain_pass(j->csrc + a, j->csrc + b, NULL, j->cmode, j->cch, j->ccase);
@@ -5105,6 +5134,7 @@ static void xs_rap_work(xs_rap_job *j) {
         if (t >= n) break;
         if (j->phase == 2) xs_map_task(j, t);
         else if (j->phase == 3 || j->phase == 4) xs_chain_task(j, t);
+        else if (j->phase >= 5 && j->phase <= 7) xs_gen_task(j, t);
         else xs_rap_task(j, t);
     }
 }
@@ -5251,6 +5281,69 @@ XS_NOINLINE bool xs_u8_rev_par(xs_Uint8Array *buf, xs_Uint8Array *table, int64_t
 }
 /* the fused string chain (xs_str_chain_fused) over threads: each piece first counts the bytes it keeps, then writes
    them where the pieces before it end (the same bytes as one pass). From 4 MB; false: the caller makes one pass */
+/* a long string's length in code points (xs_str_len) and a long copy (TextEncoder.encode) over the threads: pieces
+   counted or copied on their own, the same count and bytes as one pass. From 16 MB; false: the caller does it */
+static bool xs_ulen_par(const unsigned char *d, int64_t n, int64_t *count) {
+    static int off = -1;
+    if (off < 0) off = getenv("XISTO_NO_GEN_PAR") != NULL;
+    if (off || n < ((int64_t)1 << 24)) return false;
+    if (!xs_rap_acquire()) return false;
+    xs_rap_start_threads();
+    if (xs_rap_nthreads < 1) { xs_rap_release(); return false; }
+    xs_rap_job j;
+    memset(&j, 0, sizeof j);
+    j.csrc = d; j.start = 0; j.end = n;
+    j.ntask = (int64_t)(xs_rap_nthreads + 1) * 4;
+    j.gcount = malloc(sizeof(int64_t) * (size_t)j.ntask);
+    if (!j.gcount) { xs_rap_release(); return false; }
+    xs_rap_run(&j, 5);
+    int64_t c = 0;
+    for (int64_t t = 0; t < j.ntask; t++) c += j.gcount[t];
+    free(j.gcount);
+    xs_rap_release();
+    *count = c;
+    return true;
+}
+/* the first occurrence of nd in h over the threads (indexOf of a long string, of a byte in a long Uint8Array): the
+   pieces searched in order, each its own first hit, none after the first piece with one; the earliest hit is the
+   one a single search finds. From 16 MB; false: the caller searches */
+static bool xs_find_par(const char *h, size_t hn, const char *nd, size_t nn, const char **hit) {
+    static int off = -1;
+    if (off < 0) off = getenv("XISTO_NO_GEN_PAR") != NULL;
+    if (off || hn < ((size_t)1 << 24) || nn == 0 || nn > hn) return false;
+    if (!xs_rap_acquire()) return false;
+    xs_rap_start_threads();
+    if (xs_rap_nthreads < 1) { xs_rap_release(); return false; }
+    xs_rap_job j;
+    memset(&j, 0, sizeof j);
+    j.csrc = (const unsigned char *)h; j.start = 0; j.end = (int64_t)hn;
+    j.gneedle = nd; j.gnn = nn;
+    j.ntask = (int64_t)(xs_rap_nthreads + 1) * 4;
+    atomic_store(&j.gfirst, j.ntask);
+    j.gcount = malloc(sizeof(int64_t) * (size_t)j.ntask);
+    if (!j.gcount) { xs_rap_release(); return false; }
+    xs_rap_run(&j, 7);
+    int64_t f = atomic_load(&j.gfirst);
+    *hit = f < j.ntask ? h + j.gcount[f] : NULL;
+    free(j.gcount);
+    xs_rap_release();
+    return true;
+}
+static bool xs_copy_par(unsigned char *dst, const unsigned char *src, int64_t n) {
+    static int off = -1;
+    if (off < 0) off = getenv("XISTO_NO_GEN_PAR") != NULL;
+    if (off || n < ((int64_t)1 << 24)) return false;
+    if (!xs_rap_acquire()) return false;
+    xs_rap_start_threads();
+    if (xs_rap_nthreads < 1) { xs_rap_release(); return false; }
+    xs_rap_job j;
+    memset(&j, 0, sizeof j);
+    j.csrc = src; j.gdst = dst; j.start = 0; j.end = n;
+    j.ntask = (int64_t)(xs_rap_nthreads + 1) * 4;
+    xs_rap_run(&j, 6);
+    xs_rap_release();
+    return true;
+}
 static bool xs_str_chain_par(const unsigned char *p, int64_t len, unsigned char *o, int mode, int ch, bool case_first, int64_t *written) {
     static int off = -1;
     if (off < 0) off = getenv("XISTO_NO_CHAIN_PAR") != NULL;
@@ -5278,6 +5371,9 @@ static bool xs_str_chain_par(const unsigned char *p, int64_t len, unsigned char 
 static bool xs_u8_rev_par(xs_Uint8Array *buf, xs_Uint8Array *table, int64_t keep, int64_t start, int64_t end) { (void)buf, (void)table, (void)keep, (void)start, (void)end; return false; }
 static bool xs_u8_map_par(xs_Uint8Array *D, xs_Uint8Array *S, xs_Uint8Array *T, int64_t lo, int64_t hi) { (void)D, (void)S, (void)T, (void)lo, (void)hi; return false; }
 static bool xs_str_chain_par(const unsigned char *p, int64_t len, unsigned char *o, int mode, int ch, bool case_first, int64_t *written) { (void)p, (void)len, (void)o, (void)mode, (void)ch, (void)case_first, (void)written; return false; }
+static bool xs_ulen_par(const unsigned char *d, int64_t n, int64_t *count) { (void)d, (void)n, (void)count; return false; }
+static bool xs_copy_par(unsigned char *dst, const unsigned char *src, int64_t n) { (void)dst, (void)src, (void)n; return false; }
+static bool xs_find_par(const char *h, size_t hn, const char *nd, size_t nn, const char **hit) { (void)h, (void)hn, (void)nd, (void)nn, (void)hit; return false; }
 #endif
 static inline void xs_u8_rev(xs_Uint8Array *a, int64_t lo, int64_t hi, const xs_site *s) {
     if (lo >= hi) return; /* (the loop runs no iteration: nothing read, nothing checked) */
@@ -5377,7 +5473,10 @@ XS_NOINLINE int64_t xs_u8_index_of(xs_Uint8Array *b, int64_t v, int64_t from) {
     if (v < 0 || v > 255) return -1;
     int64_t s = xs_u8_rel(from, b->f_length, 0);
     if (s >= b->f_length) return -1;
-    const uint8_t *h = xs_memchr(b->data + s, (int)v, (size_t)(b->f_length - s));
+    const char *hp;
+    unsigned char c = (unsigned char)v;
+    const uint8_t *h = xs_find_par((const char *)b->data + s, (size_t)(b->f_length - s), (const char *)&c, 1, &hp) ? (const uint8_t *)hp
+                                                                                                            : xs_memchr(b->data + s, (int)v, (size_t)(b->f_length - s));
     return h ? (int64_t)(h - b->data) : -1;
 }
 XS_NOINLINE bool xs_u8_includes(xs_Uint8Array *b, int64_t v) { return xs_u8_index_of(b, v, 0) >= 0; }
@@ -5678,7 +5777,7 @@ XS_NOINLINE xs_str *xs_f64_to_string(xs_Float64Array *a) {
 /* ---- text ---- */
 XS_NOINLINE xs_Uint8Array *xs_text_encode(xs_str *s) { /* new TextEncoder().encode(s): the UTF-8 bytes */
     xs_Uint8Array *b = xs_u8_raw(s->len, false, false);
-    memcpy(b->data, s->data, (size_t)s->len);
+    if (!xs_copy_par(b->data, (const unsigned char *)s->data, s->len)) memcpy(b->data, s->data, (size_t)s->len);
     return b;
 }
 /* UTF-8 bytes to a string; ill-formed sequences become U+FFFD, as TextDecoder and Buffer do */
