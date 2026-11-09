@@ -334,6 +334,97 @@ static bool par_site(Expr *e, const char *kind, const char **why) {
     return true;
 }
 
+/* XB-093: a callback proved independent that returns a number or a boolean cannot hand out anything it made (the
+   proof forbids writing anything shared, and its result is a value), so every object a call makes is garbage when
+   the call returns. Its body `{ S...; return E; }` becomes
+       { let r; while (true) { S...; r = E; break; } return r; }
+   with the loop marked par_once: region.c then proves and gives that one-iteration loop a region like any other
+   (per thread: the regions are thread-local), and its objects go with one rewind per call instead of one free each.
+   Only when the body's one return is its last statement. XISTO_NO_PAR_REGION=1 keeps the body as written. */
+static int par_returns(Stmt *s) {
+    if (!s) return 0;
+    int n = s->kind == S_RETURN;
+    n += par_returns(s->body) + par_returns(s->else_body) + par_returns(s->for_init);
+    for (int i = 0; i < s->stmts.len; i++) n += par_returns(s->stmts.items[i]);
+    for (int i = 0; i < s->ncases; i++) n += par_returns(s->cases[i].body);
+    return n;
+}
+/* whether code makes objects of a program class, itself or through the functions it calls (nothing to free per
+   call otherwise: the body stays as written, and its form for jam) */
+static bool par_makes_s(Stmt *s, Func ***seen, int *nseen);
+static bool par_makes_f(Func *f, Func ***seen, int *nseen) {
+    if (!f || !f->body) return false;
+    for (int i = 0; i < *nseen; i++) if ((*seen)[i] == f) return false;
+    *seen = realloc(*seen, sizeof(Func *) * (size_t)(*nseen + 1));
+    (*seen)[(*nseen)++] = f;
+    return par_makes_s(f->body, seen, nseen);
+}
+static bool par_makes_e(Expr *e, Func ***seen, int *nseen) {
+    if (!e) return false;
+    if (e->kind == E_NEW_OBJ && e->cls && !e->cls->builtin) return true;
+    if ((e->kind == E_CALL || e->kind == E_MEMBER) && e->func && !e->builtin.cfn && par_makes_f(e->func, seen, nseen)) return true;
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn && par_makes_s(e->arrow->fn->body, seen, nseen)) return true;
+    if (par_makes_e(e->lhs, seen, nseen) || par_makes_e(e->rhs, seen, nseen)) return true;
+    for (int i = 0; i < e->args.len; i++) if (par_makes_e(e->args.items[i], seen, nseen)) return true;
+    return false;
+}
+static bool par_makes_s(Stmt *s, Func ***seen, int *nseen) {
+    if (!s) return false;
+    if (par_makes_e(s->init, seen, nseen) || par_makes_e(s->expr, seen, nseen) || par_makes_e(s->cond, seen, nseen) || par_makes_e(s->for_update, seen, nseen)) return true;
+    if (par_makes_s(s->for_init, seen, nseen) || par_makes_s(s->body, seen, nseen) || par_makes_s(s->else_body, seen, nseen)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (par_makes_s(s->stmts.items[i], seen, nseen)) return true;
+    for (int i = 0; i < s->ncases; i++) if (par_makes_s(s->cases[i].body, seen, nseen)) return true;
+    return false;
+}
+static void par_once_body(Func *fn) {
+    static int seq;
+    Stmt *b = fn->body;
+    Func **seen = NULL;
+    int nseen = 0;
+    bool makes = par_makes_s(b, &seen, &nseen);
+    free(seen);
+    if (!makes) return;
+    Type *rt = fn->ret;
+    if (!b || b->kind != S_BLOCK || !b->stmts.len || !rt) return;
+    if (!(rt->kind == TY_NUMBER || rt->kind == TY_INT || rt->kind == TY_BOOLEAN)) return;
+    Stmt *last = b->stmts.items[b->stmts.len - 1];
+    if (last->kind != S_RETURN || !last->expr || par_returns(b) != 1) return;
+    Pos pos = last->pos;
+    char *cname = xs_sprintf("prv%d_", seq++);
+    Stmt *var = xs_alloc(sizeof *var);
+    var->kind = S_VAR; var->pos = pos; var->name = cname; var->cname = cname; var->type = rt;
+    Expr *zero = xs_alloc(sizeof *zero);
+    zero->pos = pos; zero->field = -1; zero->type = rt;
+    if (rt->kind == TY_BOOLEAN) { zero->kind = E_BOOL; zero->boolean = false; }
+    else { zero->kind = E_NUMBER; zero->num = 0; zero->ival = 0; zero->is_int_lit = rt->kind == TY_INT; }
+    var->init = zero;
+    Expr *lhs = xs_alloc(sizeof *lhs);
+    lhs->kind = E_IDENT; lhs->pos = pos; lhs->str = cname; lhs->cname = cname; lhs->type = rt; lhs->field = -1;
+    Expr *asg = xs_alloc(sizeof *asg);
+    asg->kind = E_ASSIGN; asg->pos = pos; asg->op = TK_ASSIGN; asg->lhs = lhs; asg->rhs = last->expr; asg->type = rt; asg->field = -1;
+    Stmt *set = xs_alloc(sizeof *set);
+    set->kind = S_EXPR; set->pos = pos; set->expr = asg;
+    Stmt *brk = xs_alloc(sizeof *brk);
+    brk->kind = S_BREAK; brk->pos = pos;
+    Stmt *inner = xs_alloc(sizeof *inner);
+    inner->kind = S_BLOCK; inner->pos = b->pos;
+    for (int i = 0; i + 1 < b->stmts.len; i++) stmt_list_push(&inner->stmts, b->stmts.items[i]);
+    stmt_list_push(&inner->stmts, set);
+    stmt_list_push(&inner->stmts, brk);
+    Expr *yes = xs_alloc(sizeof *yes);
+    yes->kind = E_BOOL; yes->pos = pos; yes->boolean = true; yes->type = ty_boolean; yes->field = -1;
+    Stmt *loop = xs_alloc(sizeof *loop);
+    loop->kind = S_WHILE; loop->pos = b->pos; loop->cond = yes; loop->body = inner; loop->par_once = true;
+    Expr *rd = xs_alloc(sizeof *rd);
+    *rd = *lhs;
+    Stmt *ret = xs_alloc(sizeof *ret);
+    ret->kind = S_RETURN; ret->pos = pos; ret->expr = rd;
+    b->stmts.len = 0;
+    stmt_list_push(&b->stmts, var);
+    stmt_list_push(&b->stmts, loop);
+    stmt_list_push(&b->stmts, ret);
+}
+
 static Program *par_prog;
 static const char *par_src;
 static void par_scan_e(Expr *e);
@@ -361,6 +452,8 @@ static void par_scan_e(Expr *e) {
         seen[nseen++] = e;
         const char *why = NULL;
         if (par_site(e, kind, &why)) {
+            Expr *fn = e->args.items[1];
+            if (fn->kind == E_ARROW && fn->arrow && fn->arrow->fn && !getenv("XISTO_NO_PAR_REGION")) par_once_body(fn->arrow->fn);
             e->par_native = true;
             e->func->par_native = true;
             par_prog->par_native = true;

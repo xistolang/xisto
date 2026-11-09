@@ -4,10 +4,10 @@
    contributed by Léo Sarrazin
    multi thread by Andrey Filatkin
    sequential by Isaac Gouy
-   (xisto: the same program with types, the depths built at the same time with xisto:parallel;
+   (xisto: the same program with types, the trees of each depth built at the same time with xisto:parallel;
    node/binarytrees-node-7.js is the original)
 */
-import { parallelMap } from "xisto:parallel";
+import { parallelReduce } from "xisto:parallel";
 
 function mainThread(): void {
   const maxDepth = Math.max(6, Math.trunc(parseInt(process.argv[2])));
@@ -18,20 +18,13 @@ function mainThread(): void {
 
   const longLivedTree = bottomUpTree(maxDepth);
 
-  const depths: int[] = [];
-  for (let depth = 4; depth <= maxDepth; depth += 2) depths.push(depth);
-  const lines = parallelMap(depths, (depth) => work(1 << maxDepth - depth + 4, depth));
-  for (const line of lines) console.log(line);
+  for (let depth = 4; depth <= maxDepth; depth += 2) {
+    const iterations = 1 << maxDepth - depth + 4;
+    const check = parallelReduce(iterations, () => itemCheck(bottomUpTree(depth)), (sum, one) => sum + one, 0);
+    console.log(`${iterations}\t trees of depth ${depth}\t check: ${check}`);
+  }
 
   console.log(`long lived tree of depth ${maxDepth}\t check: ${itemCheck(longLivedTree)}`);
-}
-
-function work(iterations: int, depth: int): string {
-  let check = 0;
-  for (let i = 0; i < iterations; i++) {
-    check += itemCheck(bottomUpTree(depth));
-  }
-  return `${iterations}\t trees of depth ${depth}\t check: ${check}`;
 }
 
 class TreeNode {

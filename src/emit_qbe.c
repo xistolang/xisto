@@ -735,6 +735,7 @@ static char *emit_expr_raw(Expr *e) {
             return r;
         }
         if (base->kind == E_IDENT && !base->cname && strcmp(base->str, "console") == 0) {
+            if (strcmp(e->str, "error") == 0 || strcmp(e->str, "warn") == 0) { unsupported(e->pos, xs_sprintf("console.%s", e->str)); return ""; }
             for (int i = 0; i < e->args.len; i++) {
                 if (i) ins("call $xr_print_sep()");
                 emit_print(e->args.items[i]);

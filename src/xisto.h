@@ -318,6 +318,8 @@ struct Stmt {
     bool on_stack;     /* S_VAR = new C(...): the object lives in the frame (stackalloc.c) */
     unsigned stack_str; /* ... and these constructor arguments (bits), fresh strings that die with it, too */
     bool infer_int;    /* S_VAR `let i = 0` whose every assignment is an integer: an int (checker, XB-034) */
+    bool par_once;     /* S_WHILE made by parallel.c around the body of a pool callback returning a number or a boolean:
+                          one iteration per call, so region.c can give the callback's objects a region (XB-093) */
     bool map_direct;   /* S_FOROF `for (const [k, v] of map)` whose body cannot change the map: over its entries
                           in place, one tuple in the frame per entry, no snapshot array (checker, emit) */
 };

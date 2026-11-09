@@ -461,9 +461,28 @@ static void try_loop(Stmt *L, int home) {
     build_node(home); /* back to the whole home code */
 }
 
+/* XB-093: the one-iteration loop parallel.c put around a pool callback's body (par_once), inside an arrow of the
+   code of node `home`: tried like the loops of that code (arrows are not looked into otherwise: a closure may run
+   anywhere, inside another region's iteration too; a pool callback's calls are the pool's) */
+static void find_par_loops(Expr *e, int home) {
+    if (!e) return;
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn && e->arrow->fn->body) {
+        Stmt *b = e->arrow->fn->body;
+        for (int i = 0; i < b->stmts.len; i++)
+            if (b->stmts.items[i]->kind == S_WHILE && b->stmts.items[i]->par_once && !b->stmts.items[i]->region) try_loop(b->stmts.items[i], home);
+    }
+    find_par_loops(e->lhs, home);
+    find_par_loops(e->rhs, home);
+    for (int i = 0; i < e->args.len; i++) find_par_loops(e->args.items[i], home);
+}
+
 /* the loops of a piece of code, outermost first; a loop that gets a region is not looked into */
 static void find_loops(Stmt *s, int home) {
     if (!s) return;
+    find_par_loops(s->init, home);
+    find_par_loops(s->expr, home);
+    find_par_loops(s->cond, home);
+    find_par_loops(s->for_update, home);
     if (((s->kind == S_FOR || s->kind == S_WHILE) || (s->kind == S_FOROF && s->expr && s->expr->type && s->expr->type->kind == TY_ARRAY)) && s->body) {
         try_loop(s, home); /* for...of over an array too: the array is made before, each element comes from outside */
         if (s->region) return;

@@ -22,6 +22,8 @@ typedef struct Binding {
     bool union_narrow; /* a union variable seen as one of its members (or fewer of them): read through a conversion */
     bool poisoned;   /* its declaration failed (already reported): a use stops checking that statement quietly */
     bool inferred_int; /* `let i = 0` taken as an int (XB-034): becomes a number by itself where a number goes */
+    bool lit_number; /* `let s = 0` (or 0.5, or any number) with no type written: s += i takes an int i as Number(i), as
+                        JavaScript adds it (XB-094); the type the dev never wrote does not ask for a conversion */
     struct Binding *next;
 } Binding;
 
@@ -2905,8 +2907,10 @@ static void check_expr(Expr *e, Type *expected) {
             path_assigned = path_key(target); /* settled after the value is checked (below) */
         }
         Binding *narrowed = NULL;
+        bool widen_rhs = false; /* XB-094 */
         if (target->kind == E_IDENT) {
             Binding *b = lookup(target->str);
+            for (Binding *o = b; o; o = o->origin) if (o->lit_number) widen_rhs = true;
             if (strncmp(b->cname, "env->", 5) == 0)
                 xs_error(e->pos, "arrow functions capture by value; keep the state in an object or array and change that", "cannot assign to '%s', captured from the enclosing function", target->str);
             if (b->is_const) xs_error(e->pos, "declare it with 'let' if it changes", "cannot assign to constant '%s'", target->str);
@@ -2953,6 +2957,20 @@ static void check_expr(Expr *e, Type *expected) {
             if (!is_numeric(e->rhs->type)) xs_error(e->rhs->pos, NULL, "right side of %s must be int or number", tok_kind_name(e->op));
             e->type = ty_int;
             return;
+        }
+        if (widen_rhs && e->op != TK_ASSIGN && target->type->kind == TY_NUMBER && e->rhs->type->kind == TY_INT &&
+            (e->op == TK_PLUS_ASSIGN || e->op == TK_MINUS_ASSIGN || e->op == TK_STAR_ASSIGN || e->op == TK_SLASH_ASSIGN) &&
+            !getenv("XISTO_NO_LIT_WIDEN")) {
+            Expr *a = xs_alloc(sizeof *a);
+            *a = *e->rhs;
+            Expr *c = e->rhs;
+            memset(c, 0, sizeof *c);
+            c->kind = E_CALL; c->pos = a->pos; c->field = -1; c->type = ty_number;
+            c->builtin.cfn = "xs_to_number";
+            expr_list_push(&c->args, a);
+            Expr *callee = xs_alloc(sizeof *callee);
+            callee->kind = E_IDENT; callee->pos = a->pos; callee->str = "Number"; callee->field = -1;
+            c->lhs = callee;
         }
         expect_type(e->rhs, target->type, e->op == TK_ASSIGN ? "assigned value" : "right side of compound assignment");
         e->type = target->type;
@@ -3489,8 +3507,9 @@ static void check_expr(Expr *e, Type *expected) {
                 return;
             }
             if (strcmp(ns, "console") == 0) {
-                if (!e->is_call || strcmp(e->str, "log") != 0)
-                    xs_error(e->pos, "supported: console.log(...)", "unknown console member '%s'", e->str);
+                if (!e->is_call || (strcmp(e->str, "log") != 0 && strcmp(e->str, "info") != 0 && strcmp(e->str, "debug") != 0 &&
+                                    strcmp(e->str, "error") != 0 && strcmp(e->str, "warn") != 0))
+                    xs_error(e->pos, "supported: console.log, console.info, console.debug (stdout), console.error, console.warn (stderr)", "unknown console member '%s'", e->str);
                 for (int i = 0; i < e->args.len; i++) {
                     check_expr(e->args.items[i], NULL);
                     settle(e->args.items[i]);
@@ -4428,6 +4447,7 @@ static void check_var(Stmt *s, bool global) {
     settle(s->init);
     s->type = s->decl_type ? s->decl_type : s->init->type;
     Binding *b = declare(s->pos, s->name, s->type, s->is_const, global, false);
+    if (!s->decl_type && !s->is_const && s->type->kind == TY_NUMBER) b->lit_number = true;
     s->cname = b->cname;
     s->cell = b->cell;
 }

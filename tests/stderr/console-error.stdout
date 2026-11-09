@@ -1,0 +1,4 @@
+out 1 [ 1, 2, 3 ]
+info true
+debug [ 1.5, -2 ]
+end
