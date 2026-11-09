@@ -539,16 +539,27 @@ static bool bce_safe(Expr *e); /* an index the loop already checks (see bce_ente
 typedef struct { int kind; Expr *a, *src, *lo, *hi, *ca, *cb; Stmt *loop; } U8Idiom; /* kind 1 copy a[j] = src[j], 2 reverse, 3 shift a[j] = a[j+1], 4 trade (a buf, src the table, ca/cb the cursors) */
 static bool match_u8_idiom(Stmt *s, U8Idiom *m);
 static bool u8_is_index_on(Expr *e, const char *c);
+static bool lane_loop(Stmt *s); /* (XB-085) */
 static bool same_simple(Expr *a, Expr *b);
 static bool bce_pure(Expr *e);
 static bool stmt_mentions_name(Stmt *s, const char *c);
-typedef struct { const char *cname; int64_t n; } U8Reg;
+typedef struct { const char *cname; int64_t n; bool i64; } U8Reg; /* i64: an int[] proved to hold bytes (n: at run time) */
 static U8Reg u8regs[8];
 static int nu8regs;
 static U8Reg *u8reg_find(Expr *e) {
     if (!e || e->kind != E_IDENT || !e->cname) return NULL;
     for (int k = 0; k < nu8regs; k++) if (strcmp(u8regs[k].cname, e->cname) == 0) return &u8regs[k];
     return NULL;
+}
+static bool i64reg(Expr *e) { U8Reg *r = u8reg_find(e); return r && r->i64; }
+/* the register's length as the helpers take it: a literal, or the int[]'s (XS_V16_ARR: its error message) */
+static const char *rgn(U8Reg *r) {
+    static char b[4][96];
+    static int k;
+    k = (k + 1) & 3;
+    if (r->i64) snprintf(b[k], sizeof b[k], "nr_%s", r->cname);
+    else snprintf(b[k], sizeof b[k], "INT64_C(%lld)", (long long)r->n);
+    return b[k];
 }
 static void emit_u8reg_name(Expr *e) { buf_printf(out, "r_%s", e->cname); }
 static void emit_bce_index(Expr *i);
@@ -2751,6 +2762,22 @@ static void emit_expr_raw(Expr *e) {
         buf_puts(out, ")");
         return;
     case E_ASSIGN:
+        if (e->lhs->kind == E_INDEX && !e->lhs->builtin.cfn && e->op == TK_ASSIGN && i64reg(e->lhs->lhs)) { /* an int[] in a register: a lane (the value is a byte, u8_int_proof) */
+            U8Reg *rg = u8reg_find(e->lhs->lhs);
+            bool nc = bce_safe(e->lhs);
+            buf_puts(out, "({ int64_t vv_ = ");
+            emit_expr(e->rhs);
+            buf_puts(out, "; ");
+            emit_u8reg_name(e->lhs->lhs);
+            buf_puts(out, nc ? " = xs_v16_set_nc(" : " = xs_v16_set(");
+            emit_u8reg_name(e->lhs->lhs);
+            buf_puts(out, ", ");
+            if (nc) emit_bce_index(e->lhs->rhs); else emit_expr(e->lhs->rhs);
+            buf_puts(out, ", vv_");
+            if (!nc) { buf_printf(out, ", %s", rgn(rg)); site_arg(e->pos); }
+            buf_puts(out, "); vv_; })");
+            return;
+        }
         if (e->lhs->kind == E_INDEX && e->lhs->builtin.cfn && strcmp(e->lhs->builtin.cfn, "xs_u8_get") == 0) { /* b[i] = v, b[i] += v: the low 8 bits */
             bool nc = bce_safe(e->lhs); /* within the bytes: no check */
             U8Reg *rg = u8reg_find(e->lhs->lhs);
@@ -2764,7 +2791,7 @@ static void emit_expr_raw(Expr *e) {
                 buf_puts(out, ", ");
                 if (nc) emit_bce_index(e->lhs->rhs); else emit_expr(e->lhs->rhs);
                 buf_puts(out, ", vv_");
-                if (!nc) { buf_printf(out, ", INT64_C(%lld)", (long long)rg->n); site_arg(e->pos); }
+                if (!nc) { buf_printf(out, ", %s", rgn(rg)); site_arg(e->pos); }
                 buf_puts(out, "); vv_; })");
                 return;
             }
@@ -2943,6 +2970,17 @@ static void emit_expr_raw(Expr *e) {
         buf_puts(out, ")");
         return;
     case E_INDEX:
+        if (!e->builtin.cfn && i64reg(e->lhs)) { /* an int[] in a register for this loop (u8reg_loop): a lane */
+            U8Reg *rg = u8reg_find(e->lhs);
+            bool nc = bce_safe(e);
+            buf_puts(out, nc ? "xs_v16_get_nc(" : "xs_v16_get(");
+            emit_u8reg_name(e->lhs);
+            buf_puts(out, ", ");
+            if (nc) emit_bce_index(e->rhs); else emit_expr(e->rhs);
+            if (!nc) { buf_printf(out, ", %s", rgn(rg)); site_arg(e->pos); }
+            buf_puts(out, ")");
+            return;
+        }
         if (e->builtin.cfn) { /* m[i] on a RegExp match (the group's text, borrowed), b[i] on bytes */
             U8Reg *rg = strcmp(e->builtin.cfn, "xs_u8_get") == 0 ? u8reg_find(e->lhs) : NULL;
             if (rg) { /* the array is in a register for this loop (u8reg_loop) */
@@ -2951,7 +2989,7 @@ static void emit_expr_raw(Expr *e) {
                 emit_u8reg_name(e->lhs);
                 buf_puts(out, ", ");
                 if (nc) emit_bce_index(e->rhs); else emit_expr(e->rhs);
-                if (!nc) { buf_printf(out, ", INT64_C(%lld)", (long long)rg->n); site_arg(e->pos); }
+                if (!nc) { buf_printf(out, ", %s", rgn(rg)); site_arg(e->pos); }
                 buf_puts(out, ")");
                 return;
             }
@@ -3394,7 +3432,7 @@ static bool emit_u8_shl_put(Stmt *b, int *i) {
     /* x known to hold a[lo] here: the pair is a rotation, one shuffle (u8_rot_ok) */
     const char *fn = as->rhs->kind == E_IDENT && m.lo->kind == E_NUMBER && u8_rot_ok(lp, m.a, m.lo, as->rhs) ? "xs_v16_rot" : "xs_v16_shl_put";
     emit_u8reg_name(m.a); buf_printf(out, " = %s(", fn); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_puts(out, ", ");
-    emit_expr(as->rhs); buf_printf(out, ", INT64_C(%lld), XS_S(%d));", (long long)rg->n, site);
+    emit_expr(as->rhs); buf_printf(out, ", %s, XS_S(%d));", rgn(rg), site);
     *i += 1;
     return true;
 }
@@ -4964,7 +5002,11 @@ static int loop_hoist_enter(Stmt *s, int *nb) {
 static Buf *fn_prelude_out;
 static size_t fn_prelude_pos;
 static Buf fn_prelude_text;
-static bool u8_name(Expr *e) { return e && e->kind == E_IDENT && e->cname && bce_bytes(e->type); }
+static bool u8_name(Expr *e) { return e && e->kind == E_IDENT && e->cname && (bce_bytes(e->type) || i64reg(e)); }
+/* a[i] on a byte array: a Uint8Array, or an int[] held in a register (u8reg, proved to hold bytes) */
+static bool byte_ix(Expr *e) {
+    return e && e->kind == E_INDEX && ((e->builtin.cfn && strcmp(e->builtin.cfn, "xs_u8_get") == 0) || (!e->builtin.cfn && i64reg(e->lhs)));
+}
 /* a + t or b - t, with a name a, the counter t */
 static Expr *u8_cursor(Expr *e, const char *t, bool plus) {
     if (!e || e->kind != E_BINARY || e->op != (plus ? TK_PLUS : TK_MINUS)) return NULL;
@@ -5001,32 +5043,62 @@ static bool match_u8_trade(Expr *c, const char *t, Stmt *b, U8Idiom *m) {
     return true;
 }
 static bool u8_index_of(Expr *e, Expr *arr, Expr *idx) { /* arr[idx] as the program wrote it */
-    return e && e->kind == E_INDEX && e->builtin.cfn && strcmp(e->builtin.cfn, "xs_u8_get") == 0 && same_simple(e->lhs, arr) && same_simple(e->rhs, idx);
+    return byte_ix(e) && same_simple(e->lhs, arr) && same_simple(e->rhs, idx);
 }
 static bool is_sub_of(Expr *e, Expr *S, const char *i) { /* S - i */
     return e && e->kind == E_BINARY && e->op == TK_MINUS && same_simple(e->lhs, S) && e->rhs && e->rhs->kind == E_IDENT && e->rhs->cname && strcmp(e->rhs->cname, i) == 0;
 }
 /* A local Uint8Array(N <= 16) a loop only indexes (get, set, the idioms below) lives in a vector register for
    the loop (u8reg_setup): xs_v16_* in xisto_rt.h. One list for the nested scopes being emitted. */
+static Stmt *u8_prev_stmt(Stmt *s, Stmt *t) { /* the statement right before t in its block */
+    if (!s) return NULL;
+    for (int i = 0; i < s->stmts.len; i++) {
+        if (s->stmts.items[i] == t) return i ? s->stmts.items[i - 1] : NULL;
+        Stmt *r = u8_prev_stmt(s->stmts.items[i], t);
+        if (r) return r;
+    }
+    Stmt *r;
+    if ((r = u8_prev_stmt(s->for_init, t)) || (r = u8_prev_stmt(s->body, t)) || (r = u8_prev_stmt(s->else_body, t))) return r;
+    for (int i = 0; i < s->ncases; i++) if ((r = u8_prev_stmt(s->cases[i].body, t))) return r;
+    return NULL;
+}
+static Stmt *u8_const_decl(Stmt *s, const char *cname) { /* a const local's declaration, in s */
+    if (!s) return NULL;
+    if (s->kind == S_VAR && s->is_const && !s->cell && s->cname && strcmp(s->cname, cname) == 0) return s;
+    Stmt *d;
+    if ((d = u8_const_decl(s->for_init, cname)) || (d = u8_const_decl(s->body, cname)) || (d = u8_const_decl(s->else_body, cname))) return d;
+    for (int i = 0; i < s->stmts.len; i++) if ((d = u8_const_decl(s->stmts.items[i], cname))) return d;
+    for (int i = 0; i < s->ncases; i++) if ((d = u8_const_decl(s->cases[i].body, cname))) return d;
+    return NULL;
+}
 static bool match_u8_idiom(Stmt *s, U8Idiom *m) {
     if (s->kind != S_FOR) return false;
     Stmt *fi = s->for_init;
     Expr *c = s->cond, *u = s->for_update;
     if (!fi || fi->kind != S_VAR || !fi->cname || !fi->init || fi->cell || !bce_pure(fi->init)) return false;
     if (!u || u->kind != E_POSTFIX || u->op != TK_PLUSPLUS || !u->lhs || u->lhs->kind != E_IDENT || !u->lhs->cname || strcmp(u->lhs->cname, fi->cname) != 0) return false;
-    if (!c || c->kind != E_BINARY || (c->op != TK_LT && c->op != TK_LE) || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, fi->cname) != 0) return false;
+    /* 2 * i < S (or i * 2 < S): for integers the same as i < (S + 1) >> 1, the reversal's own bound */
+    Expr *twice_bound = NULL;
+    if (c && c->kind == E_BINARY && c->op == TK_LT && c->lhs && c->lhs->kind == E_BINARY && c->lhs->op == TK_STAR) {
+        Expr *k2 = c->lhs, *iv2 = NULL;
+        if (k2->lhs && k2->lhs->kind == E_NUMBER && k2->lhs->num == 2) iv2 = k2->rhs;
+        else if (k2->rhs && k2->rhs->kind == E_NUMBER && k2->rhs->num == 2) iv2 = k2->lhs;
+        if (iv2 && iv2->kind == E_IDENT && iv2->cname && strcmp(iv2->cname, fi->cname) == 0 && iv2->type && iv2->type->kind == TY_INT) twice_bound = c->rhs;
+    }
+    if (!twice_bound && (!c || c->kind != E_BINARY || (c->op != TK_LT && c->op != TK_LE) || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, fi->cname) != 0)) return false;
     const char *i = fi->cname;
     Stmt *b = s->body;
     if (!b || b->kind != S_BLOCK) return false;
     if (stmt_writes_name(b, i) || writes_name(c->rhs, i)) return false;
     Expr iv = {0}; iv.kind = E_IDENT; iv.cname = (char *)i; /* the counter, as an index */
     m->loop = s; m->lo = fi->init;
+    if (twice_bound && b->stmts.len != 3) return false;
     if (b->stmts.len == 1) { /* copy, or shift */
         Expr *as = b->stmts.items[0]->kind == S_EXPR ? b->stmts.items[0]->expr : NULL;
         if (!as || as->kind != E_ASSIGN || as->op != TK_ASSIGN || !bce_pure(c->rhs)) return false;
         Expr *dst = as->lhs, *src = as->rhs;
-        if (!dst || dst->kind != E_INDEX || !dst->builtin.cfn || strcmp(dst->builtin.cfn, "xs_u8_get") != 0 || !u8_name(dst->lhs) || !same_simple(dst->rhs, &iv)) return false;
-        if (!src || src->kind != E_INDEX || !src->builtin.cfn || strcmp(src->builtin.cfn, "xs_u8_get") != 0 || !u8_name(src->lhs)) return false;
+        if (!byte_ix(dst) || !u8_name(dst->lhs) || !same_simple(dst->rhs, &iv)) return false;
+        if (!byte_ix(src) || !u8_name(src->lhs)) return false;
         if (same_simple(src->rhs, &iv)) {
             if (c->op != TK_LT || strcmp(dst->lhs->cname, src->lhs->cname) == 0) return false;
             m->kind = 1; m->a = dst->lhs; m->src = src->lhs; m->hi = c->rhs;
@@ -5039,20 +5111,27 @@ static bool match_u8_idiom(Stmt *s, U8Idiom *m) {
         return true;
     }
     if (b->stmts.len != 3 || c->op != TK_LT) return false;
-    if (match_u8_trade(c, i, b, m)) return true;
-    /* reverse: cond is i < (S + 1) >> 1 */
-    Expr *h = c->rhs;
-    if (!h || h->kind != E_BINARY || h->op != TK_SHR || !h->rhs || h->rhs->kind != E_NUMBER || h->rhs->num != 1) return false;
-    Expr *s1 = h->lhs;
-    if (!s1 || s1->kind != E_BINARY || s1->op != TK_PLUS || !s1->rhs || s1->rhs->kind != E_NUMBER || s1->rhs->num != 1) return false;
-    Expr *S = s1->lhs;
+    if (!twice_bound && match_u8_trade(c, i, b, m)) return true;
+    /* reverse: cond is i < (S + 1) >> 1, or 2 * i < S */
+    Expr *S = twice_bound;
+    if (!S) {
+        Expr *h = c->rhs;
+        if (h && h->kind == E_IDENT && h->cname && cur_func && cur_func->body) { /* const half = (S + 1) >> 1, written before */
+            Stmt *d = u8_const_decl(cur_func->body, h->cname);
+            if (d && d->init && u8_prev_stmt(cur_func->body, s) == d) h = d->init; /* (right before the loop: S unchanged since) */
+        }
+        if (!h || h->kind != E_BINARY || h->op != TK_SHR || !h->rhs || h->rhs->kind != E_NUMBER || h->rhs->num != 1) return false;
+        Expr *s1 = h->lhs;
+        if (!s1 || s1->kind != E_BINARY || s1->op != TK_PLUS || !s1->rhs || s1->rhs->kind != E_NUMBER || s1->rhs->num != 1) return false;
+        S = s1->lhs;
+    }
     if (!bce_pure(S) || S->kind != E_IDENT) return false;
     Stmt *t = b->stmts.items[0];
     if (t->kind != S_VAR || !t->is_const || !t->cname || t->cell || !t->init) return false;
     Expr *a1 = b->stmts.items[1]->kind == S_EXPR ? b->stmts.items[1]->expr : NULL, *a2 = b->stmts.items[2]->kind == S_EXPR ? b->stmts.items[2]->expr : NULL;
     if (!a1 || !a2 || a1->kind != E_ASSIGN || a2->kind != E_ASSIGN || a1->op != TK_ASSIGN || a2->op != TK_ASSIGN) return false;
     Expr *ta = t->init;
-    if (!ta || ta->kind != E_INDEX || !ta->builtin.cfn || strcmp(ta->builtin.cfn, "xs_u8_get") != 0 || !u8_name(ta->lhs) || !same_simple(ta->rhs, &iv)) return false;
+    if (!byte_ix(ta) || !u8_name(ta->lhs) || !same_simple(ta->rhs, &iv)) return false;
     Expr *a = ta->lhs;
     if (!u8_index_of(a1->lhs, a, &iv) || !a1->rhs || a1->rhs->kind != E_INDEX || !same_simple(a1->rhs->lhs, a) || !is_sub_of(a1->rhs->rhs, S, i)) return false;
     if (!a2->lhs || a2->lhs->kind != E_INDEX || !same_simple(a2->lhs->lhs, a) || !is_sub_of(a2->lhs->rhs, S, i)) return false;
@@ -5129,20 +5208,20 @@ static bool emit_u8_idiom(Stmt *s) {
     int site = new_site(s->pos);
     U8Reg *ra = u8reg_find(m.a), *rs = m.kind == 1 ? u8reg_find(m.src) : NULL;
     if (m.kind == 1) {
-        if (ra && rs) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_copy_rr("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_u8reg_name(m.src); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", INT64_C(%lld), INT64_C(%lld), XS_S(%d));", (long long)ra->n, (long long)rs->n, site); }
-        else if (ra) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_copy_in("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_borrowed(m.src); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", INT64_C(%lld), XS_S(%d));", (long long)ra->n, site); }
-        else if (rs) { buf_puts(out, "xs_v16_copy_out("); emit_borrowed(m.a); buf_puts(out, ", "); emit_u8reg_name(m.src); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", INT64_C(%lld), XS_S(%d));", (long long)rs->n, site); }
+        if (ra && rs) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_copy_rr("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_u8reg_name(m.src); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", %s, %s, XS_S(%d));", rgn(ra), rgn(rs), site); }
+        else if (ra) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_copy_in("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_borrowed(m.src); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", %s, XS_S(%d));", rgn(ra), site); }
+        else if (rs) { buf_puts(out, "xs_v16_copy_out("); emit_borrowed(m.a); buf_puts(out, ", "); emit_u8reg_name(m.src); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", %s, XS_S(%d));", rgn(rs), site); }
         else { buf_puts(out, "xs_u8_copy_range("); emit_borrowed(m.a); buf_puts(out, ", "); emit_borrowed(m.src); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", XS_S(%d));", site); }
         return true;
     }
     if (m.kind == 2) {
-        if (ra) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_rev("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_puts(out, ") - ("); emit_expr(m.lo); buf_printf(out, "), INT64_C(%lld), XS_S(%d));", (long long)ra->n, site); }
+        if (ra) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_rev("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_puts(out, ") - ("); emit_expr(m.lo); buf_printf(out, "), %s, XS_S(%d));", rgn(ra), site); }
         else { buf_puts(out, "xs_u8_rev("); emit_borrowed(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_puts(out, ") - ("); emit_expr(m.lo); buf_printf(out, "), XS_S(%d));", site); }
         return true;
     }
     /* shift: the last j is K (<=) or K - 1 (<) */
     const char *last = s->cond->op == TK_LE ? "" : " - INT64_C(1)";
-    if (ra) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_shl("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_printf(out, ")%s, INT64_C(%lld), XS_S(%d));", last, (long long)ra->n, site); }
+    if (ra) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_shl("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_printf(out, ")%s, %s, XS_S(%d));", last, rgn(ra), site); }
     else { buf_puts(out, "xs_u8_shl("); emit_borrowed(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_printf(out, ")%s, XS_S(%d));", last, site); }
     return true;
 }
@@ -5167,8 +5246,11 @@ static bool u8_stmt_ok(Stmt *s, const char *c, bool in_loop) {
     for (int i = 0; i < s->ncases; i++) if (!u8_use_ok(s->cases[i].value, c, in_loop) || !u8_stmt_ok(s->cases[i].body, c, in_loop)) return false;
     return true;
 }
+static bool int_arr_type(Type *t) { return t && t->kind == TY_ARRAY && t->elem && t->elem->kind == TY_INT; }
 static bool u8_is_index_on(Expr *e, const char *c) {
-    return e && e->kind == E_INDEX && e->builtin.cfn && strcmp(e->builtin.cfn, "xs_u8_get") == 0 && e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname && strcmp(e->lhs->cname, c) == 0;
+    if (!e || e->kind != E_INDEX || !e->lhs || e->lhs->kind != E_IDENT || !e->lhs->cname || strcmp(e->lhs->cname, c) != 0) return false;
+    if (e->builtin.cfn) return strcmp(e->builtin.cfn, "xs_u8_get") == 0;
+    return int_arr_type(e->lhs->type); /* an int[] (u8reg: the ones proved to hold bytes) */
 }
 static bool u8_use_ok(Expr *e, const char *c, bool in_loop) {
     if (!e) return true;
@@ -5210,8 +5292,131 @@ static void u8_candidates(Stmt *s, U8Reg *c, int *n) {
     for (int i = 0; i < s->stmts.len; i++) u8_candidates(s->stmts.items[i], c, n);
     for (int i = 0; i < s->ncases; i++) u8_candidates(s->cases[i].body, c, n);
 }
+/* ---- int[] that hold bytes: register candidates too ----
+   `const a: int[] = new Array<int>(N).fill(K)` among the function body's statements, K a literal 0..255, only
+   indexed (u8_stmt_ok, as for a Uint8Array), and every value stored into it a byte: a literal 0..255, a
+   Uint8Array's element, such an int[]'s element, an int local whose every value is one of these, c ? x : y of
+   two, or the store's own index (a[i] = i: below the length, which the register loop's guard keeps <= 16; the
+   length never changes). Proved together, as a fixpoint: all assumed, then the ones with another store dropped
+   until none is. XISTO_NO_INT_REG=1 turns it off. */
+typedef struct { const char *cname; bool ok; int top; } BvName; /* top: the index of its body statement (arrays) */
+static BvName bv_arr[16], bv_loc[256];
+static int nbv_arr, nbv_loc;
+static Stmt *bv_body; /* the body the proof is for */
+static const char *i64_deny[16]; /* int[]s the loop being emitted keeps in memory (the guard's other branch) */
+static int ni64_deny;
+static BvName *bv_find(BvName *v, int n, const char *c) {
+    for (int k = 0; k < n; k++) if (strcmp(v[k].cname, c) == 0) return &v[k];
+    return NULL;
+}
+static bool bv_byte(Expr *e) {
+    if (!e) return false;
+    if (e->kind == E_NUMBER) return e->is_int_lit && e->ival >= 0 && e->ival <= 255;
+    if (e->kind == E_INDEX && e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname) {
+        if (e->builtin.cfn) return strcmp(e->builtin.cfn, "xs_u8_get") == 0;
+        BvName *a = bv_find(bv_arr, nbv_arr, e->lhs->cname);
+        return a && a->ok;
+    }
+    if (e->kind == E_IDENT && e->cname) { BvName *l = bv_find(bv_loc, nbv_loc, e->cname); return l && l->ok; }
+    if (e->kind == E_COND) return e->args.len == 2 && bv_byte(e->args.items[0]) && bv_byte(e->args.items[1]);
+    return false;
+}
+static void bv_locals(Stmt *s) {
+    if (!s) return;
+    if (s->kind == S_VAR && s->cname && !s->cell && s->type && s->type->kind == TY_INT && nbv_loc < 256) bv_loc[nbv_loc++] = (BvName){s->cname, true, 0};
+    bv_locals(s->for_init); bv_locals(s->body); bv_locals(s->else_body);
+    for (int i = 0; i < s->stmts.len; i++) bv_locals(s->stmts.items[i]);
+    for (int i = 0; i < s->ncases; i++) bv_locals(s->cases[i].body);
+}
+static void bv_drop(BvName *n, bool *changed) { if (n && n->ok) { n->ok = false; *changed = true; } }
+static void bv_stmt(Stmt *s, bool *changed);
+static void bv_expr(Expr *e, bool *changed) {
+    if (!e) return;
+    if (e->kind == E_ASSIGN || e->kind == E_POSTFIX || (e->kind == E_UNARY && (e->op == TK_PLUSPLUS || e->op == TK_MINUSMINUS))) {
+        Expr *l = e->lhs;
+        bool plain = e->kind == E_ASSIGN && e->op == TK_ASSIGN;
+        if (l && l->kind == E_IDENT && l->cname) {
+            BvName *n = bv_find(bv_loc, nbv_loc, l->cname);
+            if (n && n->ok && (!plain || !bv_byte(e->rhs))) bv_drop(n, changed);
+        } else if (l && l->kind == E_INDEX && !l->builtin.cfn && l->lhs && l->lhs->kind == E_IDENT && l->lhs->cname) {
+            BvName *a = bv_find(bv_arr, nbv_arr, l->lhs->cname);
+            if (a && a->ok && (!plain || !(bv_byte(e->rhs) || (bce_pure(e->rhs) && same_simple(e->rhs, l->rhs))))) bv_drop(a, changed);
+        }
+    }
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) bv_stmt(e->arrow->fn->body, changed);
+    bv_expr(e->lhs, changed); bv_expr(e->rhs, changed);
+    for (int i = 0; i < e->args.len; i++) bv_expr(e->args.items[i], changed);
+}
+static void bv_stmt(Stmt *s, bool *changed) {
+    if (!s) return;
+    if (s->kind == S_VAR && s->cname) {
+        BvName *n = bv_find(bv_loc, nbv_loc, s->cname);
+        if (n && n->ok && !bv_byte(s->init)) bv_drop(n, changed);
+    }
+    bv_expr(s->init, changed); bv_expr(s->expr, changed); bv_expr(s->cond, changed); bv_expr(s->for_update, changed);
+    bv_stmt(s->for_init, changed); bv_stmt(s->body, changed); bv_stmt(s->else_body, changed);
+    for (int i = 0; i < s->stmts.len; i++) bv_stmt(s->stmts.items[i], changed);
+    for (int i = 0; i < s->ncases; i++) { bv_expr(s->cases[i].value, changed); bv_stmt(s->cases[i].body, changed); }
+}
+/* `new Array<int>(N).fill(K)`, K a literal byte */
+static bool bv_new_bytes(Expr *e) {
+    if (!e || e->kind != E_MEMBER || !e->is_call || !e->str || strcmp(e->str, "fill") != 0 || !e->lhs || e->lhs->kind != E_NEW_ARRAY || !e->lhs->lhs) return false;
+    if (e->args.len != 1) return false;
+    Expr *k = e->args.items[0];
+    return k && k->kind == E_NUMBER && k->is_int_lit && k->ival >= 0 && k->ival <= 255;
+}
+static void bv_prove(Stmt *body) {
+    if (bv_body == body) return;
+    bv_body = body;
+    nbv_arr = nbv_loc = 0;
+    if (!body || body->kind != S_BLOCK || getenv("XISTO_NO_INT_REG")) return;
+    for (int i = 0; i < body->stmts.len && nbv_arr < 16; i++) {
+        Stmt *d = body->stmts.items[i];
+        if (d->kind != S_VAR || !d->is_const || !d->cname || d->cell || !int_arr_type(d->type) || !bv_new_bytes(d->init)) continue;
+        if (!u8_stmt_ok(body, d->cname, false)) continue; /* escapes, or measured */
+        bv_arr[nbv_arr++] = (BvName){d->cname, true, i};
+    }
+    if (!nbv_arr) return;
+    bv_locals(body);
+    bool changed = true;
+    while (changed) { changed = false; bv_stmt(body, &changed); }
+}
+/* an int[] in a register pays off only where a copy, reversal or shift of it becomes one shuffle: element by
+   element, a lane extract and a blend cost more than the load and store they replace */
+static bool i64_idiom_in(Stmt *s, const char *c) {
+    if (!s) return false;
+    U8Idiom m;
+    if (s->kind == S_FOR && match_u8_idiom(s, &m) && m.kind >= 1 && m.kind <= 3 &&
+        ((m.a && m.a->cname && strcmp(m.a->cname, c) == 0) || (m.src && m.src->cname && strcmp(m.src->cname, c) == 0))) return true;
+    if (i64_idiom_in(s->for_init, c) || i64_idiom_in(s->body, c) || i64_idiom_in(s->else_body, c)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (i64_idiom_in(s->stmts.items[i], c)) return true;
+    for (int i = 0; i < s->ncases; i++) if (i64_idiom_in(s->cases[i].body, c)) return true;
+    return false;
+}
+/* chosen[0..n): the arrays the loop may hold; the int[]s among them that no idiom uses are dropped (all held
+   while the idioms are matched: a copy needs both sides in registers) */
+static int i64_pays(Stmt *s, U8Reg *chosen, int n) {
+    int base = nu8regs;
+    for (int k = 0; k < n && nu8regs < 8; k++) u8regs[nu8regs++] = chosen[k];
+    bool keep[8];
+    for (int k = 0; k < n; k++) keep[k] = !chosen[k].i64 || i64_idiom_in(s->body, chosen[k].cname);
+    nu8regs = base;
+    int m = 0;
+    for (int k = 0; k < n; k++) if (keep[k]) chosen[m++] = chosen[k];
+    return m;
+}
+static bool stmt_contains(Stmt *s, Stmt *t) {
+    if (!s) return false;
+    if (s == t) return true;
+    if (stmt_contains(s->for_init, t) || stmt_contains(s->body, t) || stmt_contains(s->else_body, t)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (stmt_contains(s->stmts.items[i], t)) return true;
+    for (int i = 0; i < s->ncases; i++) if (stmt_contains(s->cases[i].body, t)) return true;
+    return false;
+}
 /* The loop s: its registers are chosen, loaded before it, the loop is emitted (by emit_stmt_), the registers
-   stored after. Returns false when there is nothing to promote. XISTO_NO_U8_REG=1 turns it off. */
+   stored after. Returns false when there is nothing to promote. XISTO_NO_U8_REG=1 turns it off. With an int[]
+   among them the loop is emitted twice: in registers when every proved int[] declared before it has at most 16
+   elements (the bytes proof needs that of the ones it reads too), in memory otherwise. */
 static bool u8reg_loop(Stmt *s) {
     if (xs_debug || sm_mode || ictx || !cur_func || !cur_func->body || stmt_has_try(cur_func->body) || getenv("XISTO_NO_U8_REG") || getenv("XISTO_NO_U8_IDIOM")) return false;
     if (s->kind != S_WHILE && s->kind != S_FOR) return false;
@@ -5219,7 +5424,18 @@ static bool u8reg_loop(Stmt *s) {
     if (s->kind == S_FOR && match_u8_idiom(s, &m)) return false; /* one shuffle already */
     U8Reg cand[8]; int nc = 0;
     u8_candidates(cur_func->body, cand, &nc);
+    bv_prove(cur_func->body);
+    int top = -1; /* the body statement holding s */
+    if (nbv_arr && cur_func->body->kind == S_BLOCK)
+        for (int i = 0; i < cur_func->body->stmts.len; i++) if (stmt_contains(cur_func->body->stmts.items[i], s)) { top = i; break; }
+    for (int k = 0; k < nbv_arr && nc < 8; k++) {
+        if (!bv_arr[k].ok || bv_arr[k].top >= top) continue;
+        bool denied = false;
+        for (int d = 0; d < ni64_deny; d++) if (strcmp(i64_deny[d], bv_arr[k].cname) == 0) denied = true;
+        if (!denied) cand[nc++] = (U8Reg){bv_arr[k].cname, 0, true};
+    }
     U8Reg chosen[8]; int nch = 0;
+    bool any_i64 = false;
     for (int k = 0; k < nc && nu8regs + nch < 8; k++) {
         Expr iv = {0}; iv.kind = E_IDENT; iv.cname = (char *)cand[k].cname;
         if (u8reg_find(&iv)) continue; /* an outer loop holds it already */
@@ -5228,22 +5444,51 @@ static bool u8reg_loop(Stmt *s) {
         if (!u8_stmt_ok(s, cand[k].cname, true)) continue; /* a use the register cannot serve */
         chosen[nch++] = cand[k];
     }
+    nch = i64_pays(s, chosen, nch);
+    for (int k = 0; k < nch; k++) if (chosen[k].i64) any_i64 = true;
     if (!nch) return false;
     int base = nu8regs;
     buf_puts(out, "{");
     indent++;
+    if (any_i64) {
+        nl();
+        buf_puts(out, "if (1");
+        for (int k = 0; k < nbv_arr; k++)
+            if (bv_arr[k].ok && bv_arr[k].top < top) buf_printf(out, " && %s->len <= 16", ren(bv_arr[k].cname));
+        buf_puts(out, ") {");
+        indent++;
+    }
     for (int k = 0; k < nch; k++) {
         u8regs[nu8regs++] = chosen[k];
         nl();
-        buf_printf(out, "xs_u8x16 r_%s = xs_v16_load(%s->data, INT64_C(%lld));", chosen[k].cname, ren(chosen[k].cname), (long long)chosen[k].n);
+        if (chosen[k].i64) {
+            buf_printf(out, "int64_t nr_%s = (int64_t)%s->len | XS_V16_ARR; ", chosen[k].cname, ren(chosen[k].cname));
+            buf_printf(out, "xs_u8x16 r_%s = xs_v16_load_i64(%s->data, (int64_t)%s->len);", chosen[k].cname, ren(chosen[k].cname), ren(chosen[k].cname));
+        } else
+            buf_printf(out, "xs_u8x16 r_%s = xs_v16_load(%s->data, INT64_C(%lld));", chosen[k].cname, ren(chosen[k].cname), (long long)chosen[k].n);
     }
     nl();
     emit_stmt_(s);
     for (int k = 0; k < nch; k++) {
         nl();
-        buf_printf(out, "xs_v16_store(%s->data, r_%s, INT64_C(%lld));", ren(chosen[k].cname), chosen[k].cname, (long long)chosen[k].n);
+        if (chosen[k].i64) buf_printf(out, "xs_v16_store_i64(%s->data, r_%s, (int64_t)%s->len);", ren(chosen[k].cname), chosen[k].cname, ren(chosen[k].cname));
+        else buf_printf(out, "xs_v16_store(%s->data, r_%s, INT64_C(%lld));", ren(chosen[k].cname), chosen[k].cname, (long long)chosen[k].n);
     }
     nu8regs = base;
+    if (any_i64) {
+        indent--;
+        nl();
+        buf_puts(out, "} else {");
+        indent++;
+        int saved_deny = ni64_deny;
+        for (int k = 0; k < nch; k++) if (chosen[k].i64 && ni64_deny < 16) i64_deny[ni64_deny++] = chosen[k].cname;
+        nl();
+        emit_stmt_(s);
+        ni64_deny = saved_deny;
+        indent--;
+        nl();
+        buf_puts(out, "}");
+    }
     indent--;
     nl();
     buf_puts(out, "}");
@@ -5278,6 +5523,7 @@ static void emit_stmt_for_inner(Stmt *s) { /* a for: bounds checks proved by the
     }
 static void emit_stmt_(Stmt *s) {
     used_ar = false;
+    if (s->kind == S_FOR && lane_loop(s)) { drain_if_needed(); return; }
     if ((s->kind == S_WHILE || s->kind == S_FOR) && u8reg_loop(s)) { drain_if_needed(); return; }
     switch (s->kind) {
     case S_VAR:
@@ -5966,6 +6212,297 @@ static JV jam_expr(Jam *J, Expr *e) {
     default:
         return no;
     }
+}
+/* ---- lanes: eight iterations of a counted loop at once (XB-085) ----
+   for (let x = A; x < B; x++) {
+       let v1 = I1, v2 = I2, ...;                       (P: numbers, each from x and values the loop never writes)
+       for (let i = I0; i < K && C; i++) { v = U; ... }  (the state: numbers only, C and U pure arithmetic of them)
+       S                                                 (the rest: anything, reading the state's last values)
+   }
+   runs P for x .. x+7 together: the inner loop in vectors of eight lanes, a lane frozen (its values kept) from
+   the iteration its own C is false, the loop left when every lane is; then S once per lane, in order, with that
+   lane's x and state. Every lane does exactly the operations the loop does for its x (the same doubles); P
+   writes nothing and cannot fail (its integer operations run in doubles under a bound checked before, as jam
+   does: outside it, the plain loop runs), so computing it ahead changes nothing S can see. The last B − A mod 8
+   iterations, and the loop when the bound check fails, run as written. XISTO_NO_LANES=1 turns it off. */
+typedef struct { const char *cname, *name; bool state; } LaneVar;
+static LaneVar lane_v[24];
+static int nlane_v;
+static Stmt *lane_body;
+static const char *lane_x, *lane_xname, *lane_i;
+static JamSub lane_subs[64];
+static int nlane_subs;
+static Stmt *lane_decl(Stmt *s, const char *cname) { /* the declaration of a local, in s */
+    if (!s) return NULL;
+    if (s->kind == S_VAR && s->cname && strcmp(s->cname, cname) == 0) return s;
+    Stmt *d;
+    if ((d = lane_decl(s->for_init, cname)) || (d = lane_decl(s->body, cname)) || (d = lane_decl(s->else_body, cname))) return d;
+    for (int i = 0; i < s->stmts.len; i++) if ((d = lane_decl(s->stmts.items[i], cname))) return d;
+    for (int i = 0; i < s->ncases; i++) if ((d = lane_decl(s->cases[i].body, cname))) return d;
+    return NULL;
+}
+static bool lane_s_ok(Stmt *s, int loops, int brk) { /* S: no break of the loop, no try, no yield */
+    if (!s) return true;
+    if (s->kind == S_BREAK && brk == 0) return false;
+    if (s->kind == S_TRY || s->kind == S_YIELD) return false;
+    bool lp = s->kind == S_FOR || s->kind == S_WHILE || s->kind == S_FOROF;
+    int l2 = loops + (lp ? 1 : 0), b2 = brk + (lp || s->kind == S_SWITCH ? 1 : 0);
+    if (!lane_s_ok(s->for_init, l2, b2) || !lane_s_ok(s->body, l2, b2) || !lane_s_ok(s->else_body, l2, b2)) return false;
+    for (int i = 0; i < s->stmts.len; i++) if (!lane_s_ok(s->stmts.items[i], l2, b2)) return false;
+    for (int i = 0; i < s->ncases; i++) if (!lane_s_ok(s->cases[i].body, l2, b2)) return false;
+    return true;
+}
+/* an identifier P reads that is not one of its own: a local or parameter the loop never writes (and no closure
+   does: not a cell), or a const global */
+static bool lane_inv(Expr *e) {
+    if (!e->cname || !e->str || !e->type) return false;
+    if (e->type->kind != TY_INT && e->type->kind != TY_NUMBER) return false;
+    for (int k = 0; k < nlane_subs; k++) if (strcmp(lane_subs[k].name, e->str) == 0) return true; /* (known already) */
+    bool found = false;
+    for (int k = 0; k < cur_func->nparams; k++)
+        if (cur_func->params[k].cname && strcmp(cur_func->params[k].cname, e->cname) == 0) { if (cur_func->params[k].cell) return false; found = true; }
+    if (!found && cur_func->body) {
+        Stmt *d = lane_decl(cur_func->body, e->cname);
+        if (d) { if (d->cell) return false; found = true; }
+    }
+    if (found) {
+        if (stmt_writes_name(lane_body, e->cname)) return false;
+    } else {
+        bool g = false;
+        for (int i = 0; prog && i < prog->top.len; i++) {
+            Stmt *t = prog->top.items[i];
+            if (t->kind == S_VAR && t->cname && strcmp(t->cname, e->cname) == 0 && t->is_const && !t->cell) g = true;
+        }
+        if (!g) return false;
+    }
+    if (nlane_subs >= 64) return false;
+    if (e->type->kind == TY_INT) lane_subs[nlane_subs++] = (JamSub){e->str, (JV){xs_sprintf("(double)%s", ren(e->cname)), 'i', xs_sprintf("__builtin_fabs((double)%s)", ren(e->cname)), true, false}};
+    else lane_subs[nlane_subs++] = (JamSub){e->str, (JV){ren(e->cname), 'n', NULL, false, false}};
+    return true;
+}
+/* every identifier in e is x, a lane variable, or an invariant (added to the substitutions) */
+static bool lane_idents(Expr *e, bool allow_state) {
+    if (!e) return true;
+    if (e->kind == E_IDENT) {
+        if (!e->str || !e->cname) return false;
+        if (strcmp(e->cname, lane_x) == 0) return true;
+        if (lane_i && strcmp(e->cname, lane_i) == 0) return false;
+        for (int k = 0; k < nlane_v; k++) if (strcmp(lane_v[k].cname, e->cname) == 0) return allow_state || !lane_v[k].state;
+        return lane_inv(e);
+    }
+    if (e->kind == E_ARROW || e->kind == E_ASSIGN || e->kind == E_POSTFIX) return false;
+    if (e->kind == E_CALL && e->func) { /* jam inlines a one-return function: its parameters are its own */
+        for (int i = 0; i < e->args.len; i++) if (!lane_idents(e->args.items[i], allow_state)) return false;
+        return true;
+    }
+    if (!lane_idents(e->lhs, allow_state) || !lane_idents(e->rhs, allow_state)) return false;
+    for (int i = 0; i < e->args.len; i++) if (!lane_idents(e->args.items[i], allow_state)) return false;
+    return true;
+}
+static int lane_find(const char *cname) { for (int k = 0; k < nlane_v; k++) if (strcmp(lane_v[k].cname, cname) == 0) return k; return -1; }
+/* jam_expr with the lane substitutions: in the init (one lane, l_) or in vectors (lz_*) */
+static JV lane_jv(Expr *e, bool vec, Buf *checks) {
+    JamSub subs[96];
+    int n = 0;
+    for (int k = 0; k < nlane_subs; k++) subs[n++] = lane_subs[k];
+    subs[n++] = (JamSub){lane_xname, vec ? (JV){"lxd_", 'i', "xm_", true, false} : (JV){"(double)(lb_ + l_)", 'i', "xm_", true, false}};
+    for (int k = 0; k < nlane_v; k++) subs[n++] = (JamSub){lane_v[k].name, (JV){xs_sprintf(vec ? "lz_%s" : "lv_%s[l_]", lane_v[k].cname), 'n', NULL, false, false}};
+    Jam J = {0};
+    J.iname = J.jname = J.aname = "";
+    J.subs = subs;
+    J.nsubs = n;
+    J.depth = 1; /* identifiers through the substitutions only */
+    J.checks = checks;
+    return jam_expr(&J, e);
+}
+/* C, one term of the inner loop's condition, as a lane mask (vectors of all ones where true) */
+static const char *lane_cond(Expr *c, Buf *checks) {
+    if (!c || c->kind != E_BINARY) return NULL;
+    const char *op = c->op == TK_LT ? "<" : c->op == TK_LE ? "<=" : c->op == TK_GT ? ">" : c->op == TK_GE ? ">=" : c->op == TK_EQ ? "==" : c->op == TK_NEQ ? "!=" : NULL;
+    if (!op || !c->lhs || !c->rhs || !c->lhs->type || !c->rhs->type) return NULL;
+    if ((c->lhs->type->kind != TY_NUMBER && !jam_is_int(c->lhs->type)) || (c->rhs->type->kind != TY_NUMBER && !jam_is_int(c->rhs->type))) return NULL;
+    JV a = lane_jv(c->lhs, true, checks), b = lane_jv(c->rhs, true, checks);
+    if (!a.c || !b.c) return NULL;
+    /* a side without a lane value is one double: added to a zero vector, so the comparison is per lane */
+    return xs_sprintf("((xs_i8)(((xs_f8){0} + %s) %s ((xs_f8){0} + %s)))", jam_num_of(a), op, jam_num_of(b));
+}
+static bool lane_incr(Expr *u, const char *name) { /* x++, ++x, x += 1 */
+    if (!u || !u->lhs || u->lhs->kind != E_IDENT || !u->lhs->cname || strcmp(u->lhs->cname, name) != 0) return false;
+    if ((u->kind == E_POSTFIX || u->kind == E_UNARY) && u->op == TK_PLUSPLUS) return true;
+    return u->kind == E_ASSIGN && u->op == TK_PLUS_ASSIGN && u->rhs && u->rhs->kind == E_NUMBER && u->rhs->is_int_lit && u->rhs->ival == 1;
+}
+static void lane_terms(Expr *c, Expr **t, int *n) { /* a && b && ...: its terms */
+    if (c && c->kind == E_BINARY && c->op == TK_AND) { lane_terms(c->lhs, t, n); lane_terms(c->rhs, t, n); return; }
+    if (*n < 8) t[(*n)++] = c; else *n = 99;
+}
+static bool lane_loop(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || !cur_func || !cur_func->body || getenv("XISTO_NO_LANES")) return false;
+    if (s->kind != S_FOR || !s->for_init || !s->body || s->body->kind != S_BLOCK) return false;
+    Stmt *fi = s->for_init;
+    if (fi->kind != S_VAR || !fi->cname || !fi->name || fi->cell || !fi->init || !fi->type || fi->type->kind != TY_INT || !bce_pure(fi->init)) return false;
+    Expr *c = s->cond;
+    if (!c || c->kind != E_BINARY || c->op != TK_LT || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, fi->cname) != 0) return false;
+    Expr *B = c->rhs;
+    if (!B || !B->type || B->type->kind != TY_INT || !bce_pure(B) || (B->kind != E_IDENT && !(B->kind == E_NUMBER && B->is_int_lit))) return false;
+    if (B->kind == E_IDENT && stmt_writes_name(s->body, B->cname)) return false;
+    if (!lane_incr(s->for_update, fi->cname)) return false;
+    Stmt *b = s->body;
+    int p = 0;
+    while (p < b->stmts.len && b->stmts.items[p]->kind == S_VAR) p++;
+    if (p == 0 || p > 16 || p >= b->stmts.len || b->stmts.items[p]->kind != S_FOR) return false;
+    Stmt *L = b->stmts.items[p];
+    if (stmt_writes_name(s->body, fi->cname)) return false;
+    lane_body = s->body;
+    lane_x = fi->cname;
+    lane_xname = fi->name;
+    lane_i = NULL;
+    nlane_v = nlane_subs = 0;
+    for (int k = 0; k < p; k++) {
+        Stmt *d = b->stmts.items[k];
+        if (!d->cname || !d->name || d->cell || !d->init || !d->type || d->type->kind != TY_NUMBER) return false;
+        if (!lane_idents(d->init, true)) return false;
+        lane_v[nlane_v++] = (LaneVar){d->cname, d->name, false};
+    }
+    /* the inner loop: for (let i = I0; i < K && C...; i++) { v = U; ... } */
+    Stmt *li = L->for_init;
+    if (!li || li->kind != S_VAR || !li->cname || li->cell || !li->init || li->init->kind != E_NUMBER || !li->init->is_int_lit) return false;
+    if (!lane_incr(L->for_update, li->cname) || !L->body || L->body->kind != S_BLOCK || L->body->stmts.len == 0) return false;
+    lane_i = li->cname;
+    Expr *terms[8];
+    int nt = 0;
+    lane_terms(L->cond, terms, &nt);
+    if (nt == 0 || nt > 8) return false;
+    Expr *K = NULL;
+    for (int k = 0; k < nt; k++) {
+        Expr *t = terms[k];
+        if (t && t->kind == E_BINARY && t->op == TK_LT && t->lhs && t->lhs->kind == E_IDENT && t->lhs->cname && strcmp(t->lhs->cname, lane_i) == 0) {
+            if (K) return false;
+            K = t->rhs;
+            if (!K || !K->type || K->type->kind != TY_INT || !(K->kind == E_NUMBER ? K->is_int_lit : (K->kind == E_IDENT && lane_idents(K, false)))) return false;
+            terms[k] = NULL;
+        }
+    }
+    if (!K) return false;
+    for (int k = 0; k < L->body->stmts.len; k++) {
+        Stmt *u = L->body->stmts.items[k];
+        Expr *a = u->kind == S_EXPR ? u->expr : NULL;
+        if (!a || a->kind != E_ASSIGN || a->op != TK_ASSIGN || !a->lhs || a->lhs->kind != E_IDENT || !a->lhs->cname) return false;
+        int v = lane_find(a->lhs->cname);
+        if (v < 0) return false;
+        lane_v[v].state = true;
+    }
+    for (int k = 0; k < L->body->stmts.len; k++) if (!lane_idents(L->body->stmts.items[k]->expr->rhs, true)) return false;
+    for (int k = 0; k < nt; k++) if (terms[k] && !lane_idents(terms[k], true)) return false;
+    for (int k = p + 1; k < b->stmts.len; k++) if (!lane_s_ok(b->stmts.items[k], 0, 0)) return false;
+    /* the C of it, and the bound checks of its integer operations */
+    Buf checks = {0};
+    buf_puts(&checks, "");
+    const char *init[16];
+    for (int k = 0; k < p; k++) {
+        JV v = lane_jv(b->stmts.items[k]->init, false, &checks);
+        if (!v.c) return false;
+        init[k] = jam_num_of(v);
+    }
+    const char *upd[16];
+    int nu = L->body->stmts.len;
+    if (nu > 16) return false;
+    for (int k = 0; k < nu; k++) {
+        JV v = lane_jv(L->body->stmts.items[k]->expr->rhs, true, &checks);
+        if (!v.c) return false;
+        upd[k] = jam_num_of(v);
+    }
+    const char *cnd[8];
+    for (int k = 0; k < nt; k++) {
+        cnd[k] = NULL;
+        if (terms[k] && !(cnd[k] = lane_cond(terms[k], &checks))) return false;
+    }
+    JV kv = lane_jv(K, false, NULL);
+    /* emitted: the loop variable, the groups of eight, then the loop as written for the rest */
+    const char *xc = ren(fi->cname);
+    buf_puts(out, "{");
+    indent++;
+    nl();
+    emit_stmt_(fi);
+    nl();
+    buf_puts(out, "typedef double xs_f8 __attribute__((vector_size(64)));");
+    nl();
+    buf_puts(out, "typedef int64_t xs_i8 __attribute__((vector_size(64)));");
+    nl();
+    buf_puts(out, "const double xm_ = __builtin_fmax(__builtin_fabs((double)("); emit_expr(B); buf_printf(out, ")) + 1.0, __builtin_fabs((double)%s)) + 8.0;", xc);
+    nl();
+    buf_puts(out, "bool lok_ = true;");
+    if (checks.data && checks.len) {
+        char *t = checks.data;
+        Buf ck = {0};
+        buf_puts(&ck, "");
+        for (char *q = t; *q;) {
+            char *r = strstr(q, "return false;");
+            if (!r) { buf_puts(&ck, q); break; }
+            buf_printf(&ck, "%.*slok_ = false;", (int)(r - q), q);
+            q = r + strlen("return false;");
+        }
+        nl();
+        buf_puts(out, "{ "); buf_puts(out, ck.data); buf_puts(out, " }");
+    }
+    nl();
+    buf_printf(out, "if (lok_) for (; %s <= (", xc); emit_expr(B); buf_printf(out, ") - 8; %s += 8) {", xc);
+    indent++;
+    nl();
+    buf_printf(out, "const int64_t lb_ = %s;", xc);
+    for (int k = 0; k < nlane_v; k++) { nl(); buf_printf(out, "double lv_%s[8];", lane_v[k].cname); }
+    nl();
+    buf_puts(out, "for (int l_ = 0; l_ < 8; l_++) {");
+    for (int k = 0; k < nlane_v; k++) buf_printf(out, " lv_%s[l_] = %s;", lane_v[k].cname, init[k]);
+    buf_puts(out, " }");
+    nl();
+    buf_puts(out, "xs_f8 lxd_; for (int l_ = 0; l_ < 8; l_++) lxd_[l_] = (double)(lb_ + l_); (void)lxd_;");
+    for (int k = 0; k < nlane_v; k++) { nl(); buf_printf(out, "xs_f8 lz_%s; memcpy(&lz_%s, lv_%s, 64);", lane_v[k].cname, lane_v[k].cname, lane_v[k].cname); }
+    nl();
+    buf_puts(out, "xs_i8 act_ = (xs_i8){0} - 1;");
+    nl();
+    buf_printf(out, "for (int64_t i_ = INT64_C(%lld); (double)i_ < %s; i_++) {", (long long)li->init->ival, jam_num_of(kv));
+    indent++;
+    for (int k = 0; k < nt; k++) if (cnd[k]) { nl(); buf_printf(out, "act_ &= %s;", cnd[k]); }
+    nl();
+    buf_puts(out, "{ xs_i8 r_ = act_ | __builtin_shufflevector(act_, act_, 4, 5, 6, 7, 0, 1, 2, 3); if ((r_[0] | r_[1] | r_[2] | r_[3]) == 0) break; }");
+    for (int k = 0; k < nlane_v; k++) if (lane_v[k].state) { nl(); buf_printf(out, "const xs_f8 lo_%s = lz_%s;", lane_v[k].cname, lane_v[k].cname); }
+    for (int k = 0; k < nu; k++) {
+        nl();
+        buf_printf(out, "lz_%s = %s;", L->body->stmts.items[k]->expr->lhs->cname, upd[k]);
+    }
+    for (int k = 0; k < nlane_v; k++)
+        if (lane_v[k].state) { nl(); buf_printf(out, "lz_%s = (xs_f8)(((xs_i8)lz_%s & act_) | ((xs_i8)lo_%s & ~act_));", lane_v[k].cname, lane_v[k].cname, lane_v[k].cname); }
+    indent--;
+    nl();
+    buf_puts(out, "}");
+    for (int k = 0; k < nlane_v; k++) if (lane_v[k].state) { nl(); buf_printf(out, "memcpy(lv_%s, &lz_%s, 64);", lane_v[k].cname, lane_v[k].cname); }
+    nl();
+    buf_puts(out, "for (int l_ = 0; l_ < 8; l_++) {");
+    indent++;
+    nl();
+    buf_printf(out, "int64_t %s = lb_ + l_;", xc);
+    for (int k = 0; k < nlane_v; k++) { nl(); buf_printf(out, "double %s = lv_%s[l_];", ren(lane_v[k].cname), lane_v[k].cname); }
+    Stmt rest = *b;
+    rest.stmts.items = b->stmts.items + p + 1;
+    rest.stmts.len = b->stmts.len - p - 1;
+    rest.stmts.cap = rest.stmts.len;
+    nl();
+    emit_stmt_(&rest);
+    indent--;
+    nl();
+    buf_puts(out, "}");
+    indent--;
+    nl();
+    buf_puts(out, "}");
+    /* the rest, as written */
+    Stmt tail = *s;
+    tail.for_init = NULL;
+    nl();
+    emit_stmt_(&tail);
+    indent--;
+    nl();
+    buf_puts(out, "}");
+    return true;
 }
 static bool jam_is_ident(Expr *e, const char *name) { return e && e->kind == E_IDENT && e->str && strcmp(e->str, name) == 0; }
 static Stmt *jam_single(Stmt *s) {
