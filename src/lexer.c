@@ -328,7 +328,7 @@ Token lexer_next(Lexer *lx) {
         int depth = 0;
         for (;;) {
             char d = peek(lx, 0);
-            if (!d) xs_error(XS1036, pos, NULL, "unterminated template literal");
+            if (!d) { if (xs_lex_skipping) return make(lx, TK_EOF, pos, start); xs_error(XS1036, pos, NULL, "unterminated template literal"); }
             if (d == '`' && depth == 0) break;
             if (d == '\\') { advance(lx); if (peek(lx, 0)) advance(lx); continue; }
             if (d == '$' && peek(lx, 1) == '{') { advance(lx); advance(lx); depth++; continue; }
@@ -352,7 +352,7 @@ Token lexer_next(Lexer *lx) {
         Buf b = {0};
         for (;;) {
             char d = peek(lx, 0);
-            if (!d || d == '\n') xs_error(XS1035, pos, NULL, "unterminated string literal");
+            if (!d || d == '\n') { if (xs_lex_skipping) break; xs_error(XS1035, pos, NULL, "unterminated string literal"); }
             if (d == quote) {
                 advance(lx);
                 break;
@@ -390,7 +390,16 @@ Token lexer_next(Lexer *lx) {
         return make(lx, TK_DOT, pos, start);
     case '@': return make(lx, TK_AT, pos, start); /* decorators */
     case '?':
-        if (n1 == '?' || n1 == '.') xs_error(XS1003, pos, "there is no undefined or null in xisto, so '\?\?' and '?.' do not exist", "'?%c' is not supported", n1);
+        if (n1 == '?' || (n1 == '.' && !isdigit((unsigned char)n2))) { /* (a ? .5 : b is a conditional) */
+            if (!xs_check_mode) xs_error(XS1003, pos, "there is no undefined or null in xisto, so '\?\?' and '?.' do not exist", "'?%c' is not supported", n1);
+            /* xisto check: counted where it is (also in a declaration skipped after another error: a real change, and nothing
+               else reads as these two characters), then read on as '.' or '||' so the rest of the code is still checked */
+            xs_error_continue(XS1003, pos, "there is no undefined or null in xisto, so '\?\?' and '?.' do not exist", "'?%c' is not supported", n1);
+            advance(lx);
+            if (n1 == '?') { if (peek(lx, 0) == '=') { advance(lx); return make(lx, TK_ASSIGN, pos, start); } return make(lx, TK_OR, pos, start); }
+            if (peek(lx, 0) == '[' || peek(lx, 0) == '(') return lexer_next(lx); /* a?.[i], f?.(x): the index or the call */
+            return make(lx, TK_DOT, pos, start);
+        }
         return make(lx, TK_QUESTION, pos, start);
     case '+':
         if (n1 == '+') { advance(lx); return make(lx, TK_PLUSPLUS, pos, start); }
@@ -410,12 +419,22 @@ Token lexer_next(Lexer *lx) {
     case '%': return make(lx, TK_PERCENT, pos, start);
     case '=':
         if (n1 == '=' && n2 == '=') { advance(lx); advance(lx); return make(lx, TK_EQ, pos, start); }
-        if (n1 == '=') xs_error(XS1002, pos, "xisto has no type coercion, so '==' and '===' would mean the same thing; use '==='", "'==' is not supported");
+        if (n1 == '=') {
+            if (!xs_check_mode) xs_error(XS1002, pos, "xisto has no type coercion, so '==' and '===' would mean the same thing; use '==='", "'==' is not supported");
+            xs_error_continue(XS1002, pos, "xisto has no type coercion, so '==' and '===' would mean the same thing; use '==='", "'==' is not supported");
+            advance(lx);
+            return make(lx, TK_EQ, pos, start); /* (xisto check: read on as '===') */
+        }
         if (n1 == '>') { advance(lx); return make(lx, TK_ARROW, pos, start); }
         return make(lx, TK_ASSIGN, pos, start);
     case '!':
         if (n1 == '=' && n2 == '=') { advance(lx); advance(lx); return make(lx, TK_NEQ, pos, start); }
-        if (n1 == '=') xs_error(XS1001, pos, "use '!=='", "'!=' is not supported");
+        if (n1 == '=') {
+            if (!xs_check_mode) xs_error(XS1001, pos, "use '!=='", "'!=' is not supported");
+            xs_error_continue(XS1001, pos, "use '!=='", "'!=' is not supported");
+            advance(lx);
+            return make(lx, TK_NEQ, pos, start); /* (xisto check: read on as '!==') */
+        }
         return make(lx, TK_NOT, pos, start);
     case '<':
         if (n1 == '=') { advance(lx); return make(lx, TK_LE, pos, start); }
@@ -438,6 +457,8 @@ Token lexer_next(Lexer *lx) {
         return make(lx, TK_CARET, pos, start);
     case '~': return make(lx, TK_TILDE, pos, start);
     }
+    if (xs_lex_skipping) { advance(lx); return lexer_next(lx); } /* xisto check skipping a declaration that did not parse: a
+                                                                  regex read there as '/' meets its '\' — not a change to count */
     xs_error(XS1029, pos, NULL, "unexpected character '%c'", c);
     return make(lx, TK_EOF, pos, start);
 }

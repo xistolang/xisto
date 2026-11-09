@@ -85,17 +85,45 @@ static void enter_module(Module *m) {
     xs_source = m->src;
 }
 
-/* True when `name` is imported by the current module from `from`. */
-static bool imports_name(Module *m, Module *from, const char *name) {
-    if (!m) return false;
-    for (int i = 0; i < m->nimports; i++)
-        if (m->imports[i].from == from)
-            for (int k = 0; k < m->imports[i].n; k++)
-                if (strcmp(m->imports[i].names[k], name) == 0) return true;
+/* True when module `via` gives `name` declared in `from`: it is `from`, or it re-exports the name from a module that
+   gives it (export { name } from "m", export * from "m"; a barrel of barrels too) */
+static bool gives_name(Module *via, Module *from, const char *name, int depth) {
+    if (!via || depth > 32) return false;
+    if (via == from) return true;
+    for (int i = 0; i < via->nimports; i++) {
+        Import *im = &via->imports[i];
+        if (!im->reexport || !im->from) continue;
+        bool listed = im->star;
+        for (int k = 0; k < im->n && !listed; k++) listed = strcmp(im->names[k], name) == 0;
+        if (listed && gives_name(im->from, from, name, depth + 1)) return true;
+    }
     return false;
 }
 
+/* True when `name` is imported by the current module from `from` (directly, or through a module that re-exports it). */
+static bool imports_name(Module *m, Module *from, const char *name) {
+    if (!m) return false;
+    for (int i = 0; i < m->nimports; i++)
+        for (int k = 0; k < m->imports[i].n; k++)
+            if (strcmp(m->imports[i].names[k], name) == 0 && gives_name(m->imports[i].from, from, name, 0)) return true;
+    return false;
+}
+
+/* xisto check: the member at pos is written after '?.' (read on as '.', and already counted) */
+static bool after_optional_dot(Pos pos) {
+    const char *s = xs_source;
+    if (!s) return false;
+    int line = 1;
+    while (*s && line < pos.line) { if (*s == '\n') line++; s++; }
+    const char *at = s + (pos.col > 0 ? pos.col - 1 : 0);
+    const char *q = at;
+    while (q > s && (q[-1] == ' ' || q[-1] == '\t')) q--;
+    return q - s >= 2 && q[-1] == '.' && q[-2] == '?';
+}
+
 /* ---------- built-in classes ---------- */
+static int reexports_name(Program *p, Module *via, const char *name, int depth);
+static bool reexports_or_has(Module *m, const char *name); /* (scope search through export * from) */
 
 static Class **builtins;
 static int nbuiltins;
@@ -3589,8 +3617,10 @@ static void check_expr(Expr *e, Type *expected) {
             return;
         }
         check_expr(e->lhs, NULL);
-        if (e->lhs->type->kind == TY_NULLABLE)
+        if (e->lhs->type->kind == TY_NULLABLE) {
+            if (xs_check_mode && after_optional_dot(e->pos)) xs_error_quiet(); /* x?.name: the '?.' was counted where it is */
             xs_error(XS2006, e->pos, "check it first: if (x !== null) { ... }  (fields need a local copy: const v = this.f;)", "'%s' may be null", e->str);
+        }
         if (e->lhs->type->kind == TY_MAP || e->lhs->type->kind == TY_SET) {
             check_map_member(e);
             return;
@@ -5701,6 +5731,15 @@ void check_program(Program *p) {
                     Stmt *st = p->top.items[j];
                     if (st->kind == S_VAR && st->mod == im->from && strcmp(st->name, name) == 0) found = st->exported;
                 }
+                if (!found) { /* re-exported by im->from (export { name } from, export * from) */
+                    int r = reexports_name(p, im->from, name, 0);
+                    if (r == 2) { /* from a module that could not be loaded: reported there */
+                        missing_names = realloc(missing_names, sizeof(char *) * (size_t)(nmissing_names + 1));
+                        missing_names[nmissing_names++] = (char *)name;
+                        continue;
+                    }
+                    found = r == 1;
+                }
                 if (!found) {
                     enter_module(m);
                     xs_error(XS9012, im->positions[k], xs_sprintf("add 'export' in front of its declaration in %s", im->from->file), "'%s' is not exported by '%s'", name, im->path);
@@ -5771,6 +5810,19 @@ void check_program(Program *p) {
             Import *im = &m->imports[i];
             for (int k = 0; k < im->n; k++) {
                 Scope *src = mod_scopes[im->from->id];
+                { /* a name the module only re-exports with export * from "m": the scope of the module that has it */
+                    Module *via = im->from;
+                    for (int depth = 0; depth < 32 && via; depth++) {
+                        bool has = false;
+                        for (Binding *b = mod_scopes[via->id]->head; b && !has; b = b->next) has = strcmp(b->name, im->names[k]) == 0;
+                        if (has) { src = mod_scopes[via->id]; break; }
+                        Module *next_via = NULL;
+                        for (int q = 0; q < via->nimports && !next_via; q++)
+                            if (via->imports[q].star && via->imports[q].from && !via->imports[q].from->missing && reexports_or_has(via->imports[q].from, im->names[k]))
+                                next_via = via->imports[q].from;
+                        via = next_via;
+                    }
+                }
                 size_t nl = strlen(im->names[k]);
                 for (Binding *b = src->head; b; b = b->next) {
                     bool is_static = strncmp(b->name, im->names[k], nl) == 0 && strncmp(b->name + nl, "__s_", 4) == 0; /* Class.static */
@@ -5835,4 +5887,43 @@ void check_program(Program *p) {
         if (!xs_json_errors) fprintf(stderr, "xisto: %d error%s\n", xs_error_count, xs_error_count == 1 ? "" : "s");
         exit(1);
     }
+}
+
+/* 1: module `via` re-exports `name` (export { name } from "m", export * from "m"), declared and exported where it comes
+   from; 2: through a module that could not be loaded (xisto check); 0: not */
+static int reexports_name(Program *p, Module *via, const char *name, int depth) {
+    if (!via || depth > 32) return 0;
+    for (int i = 0; i < via->nimports; i++) {
+        Import *im = &via->imports[i];
+        if (!im->reexport || !im->from) continue;
+        bool listed = im->star;
+        for (int k = 0; k < im->n && !listed; k++) listed = strcmp(im->names[k], name) == 0;
+        if (!listed) continue;
+        if (im->from->missing) return 2;
+        Module *m = im->from;
+        bool here = false;
+        SYM_EACH(funcs_by_name, name, e) if (((Func *)e->decl)->mod == m && ((Func *)e->decl)->exported) here = true;
+        SYM_EACH(classes_by_name, name, e) if (((Class *)e->decl)->mod == m && ((Class *)e->decl)->exported) here = true;
+        SYM_EACH(enums_by_name, name, e) if (((Enum *)e->decl)->mod == m && ((Enum *)e->decl)->exported) here = true;
+        for (int j = 0; j < p->top.len && !here; j++) {
+            Stmt *st = p->top.items[j];
+            if (st->kind == S_VAR && st->mod == m && st->name && strcmp(st->name, name) == 0 && st->exported) here = true;
+        }
+        if (here) return 1;
+        int r = reexports_name(p, m, name, depth + 1);
+        if (r) return r;
+    }
+    return 0;
+}
+
+/* module m's scope has `name`, or a module it re-exports with export * from does (at any depth) */
+static bool reexports_or_has(Module *m, const char *name) {
+    for (int depth = 0; depth < 32 && m; depth++) {
+        for (Binding *b = mod_scopes[m->id]->head; b; b = b->next) if (strcmp(b->name, name) == 0) return true;
+        Module *next = NULL;
+        for (int q = 0; q < m->nimports && !next; q++)
+            if (m->imports[q].star && m->imports[q].from && !m->imports[q].from->missing && reexports_or_has(m->imports[q].from, name)) next = m->imports[q].from;
+        m = next;
+    }
+    return false;
 }

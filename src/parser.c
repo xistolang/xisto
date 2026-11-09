@@ -1,3 +1,4 @@
+#include <sys/stat.h>
 #include <errno.h>
 #include <ctype.h>
 #include "xisto.h"
@@ -130,6 +131,7 @@ static bool looks_like_fn_type(Parser *p) {
 static Type *union_of(Type *a, Type *b);
 static Type *parse_type(Parser *p) {
     Type *t;
+    accept(p, TK_PIPE); /* type T =\n  | "a"\n  | "b": a union may open with '|' */
     if (at(p, TK_LBRACKET)) { /* [A, B]: a tuple */
         next(p);
         Type **ps = NULL;
@@ -1942,6 +1944,12 @@ static void parse_import(Parser *p, Module *m) {
     Import im = {0};
     im.pos = pos;
     int cap = 0;
+    if (at_ident(p, "type")) { /* import type { A } from "m": types are imported like everything else */
+        Lexer save = p->lx;
+        Token t0 = p->tok;
+        next(p);
+        if (!at(p, TK_LBRACE)) { p->lx = save; p->tok = t0; } /* (import type from "m": a default import named type) */
+    }
     if (at(p, TK_IDENT)) { /* import name from "m": m's default export, which must have this name */
         Token name = p->tok;
         next(p);
@@ -2267,6 +2275,113 @@ static Module *missing_module(Program *prog, const char *spec) {
     return m;
 }
 
+static Module *load_module(Program *prog, const char *file, Pos from_pos, const char *from_file);
+static Module *missing_module(Program *prog, const char *spec);
+
+/* export { a } from "m", export * from "m", export { a, b }; (also with "type"): not a declaration */
+static bool reexport_ahead(Parser *p) {
+    if (!at(p, TK_EXPORT)) return false;
+    Lexer save = p->lx;
+    Token t0 = p->tok;
+    next(p);
+    if (at_ident(p, "type")) next(p);
+    bool r = at(p, TK_LBRACE) || at(p, TK_STAR);
+    p->lx = save;
+    p->tok = t0;
+    return r;
+}
+
+/* loads what an import or re-export names (xisto check: one that cannot be loaded is reported and left empty) */
+static void load_import(Program *prog, Module *m, Import *im) {
+    Program *pp = parsing_prog;
+    Module *pm = parsing_mod;
+    if (xs_check_mode) {
+        jmp_buf *saved = xs_error_recover;
+        jmp_buf ib;
+        xs_error_recover = &ib;
+        if (_setjmp(ib) == 0) im->from = load_module(prog, im->path, im->pos, m->path);
+        else im->from = missing_module(prog, im->path);
+        xs_error_recover = saved;
+    } else im->from = load_module(prog, im->path, im->pos, m->path);
+    xs_file_name = m->file;
+    xs_source = m->src;
+    parsing_prog = pp;
+    parsing_mod = pm;
+}
+
+/* export { a, b } from "m" and export * from "m" (a barrel's re-exports), and export { a, b }; of names declared here */
+static void parse_reexport(Parser *p, Module *m, Program *prog, bool load_now) {
+    Pos pos = p->tok.pos;
+    expect(p, TK_EXPORT, NULL);
+    if (at_ident(p, "type")) next(p);
+    Import im = {0};
+    im.pos = pos;
+    im.reexport = true;
+    int cap = 0;
+    if (accept(p, TK_STAR)) {
+        if (at_ident(p, "as")) {
+            next(p);
+            Token ns = expect(p, TK_IDENT, NULL);
+            xs_error(XS1039, ns.pos, "re-export the names one by one: export { a, b } from \"./file\"", "'export * as %s' (a namespace re-export) is not supported", ns.str);
+        }
+        im.star = true;
+    } else {
+        expect(p, TK_LBRACE, NULL);
+        while (!at(p, TK_RBRACE)) {
+            if (at_ident(p, "type")) { /* export { type A } */
+                Lexer save = p->lx;
+                Token t0 = p->tok;
+                next(p);
+                if (!at(p, TK_IDENT)) { p->lx = save; p->tok = t0; }
+            }
+            Token name = expect(p, TK_IDENT, NULL);
+            if (at_ident(p, "as")) {
+                next(p);
+                Token alias = expect(p, TK_IDENT, NULL);
+                if (strcmp(alias.str, name.str) != 0)
+                    xs_error(XS1038, alias.pos, "re-export it under its own name", "renaming in a re-export ('%s as %s') is not supported", name.str, alias.str);
+            }
+            if (im.n == cap) {
+                cap = cap ? cap * 2 : 4;
+                im.names = realloc(im.names, sizeof(char *) * (size_t)cap);
+                im.positions = realloc(im.positions, sizeof(Pos) * (size_t)cap);
+            }
+            im.names[im.n] = name.str;
+            im.positions[im.n++] = name.pos;
+            if (!accept(p, TK_COMMA)) break;
+        }
+        expect(p, TK_RBRACE, NULL);
+        if (!at_ident(p, "from")) { /* export { a, b };: names declared in this module */
+            m->local_exports = realloc(m->local_exports, sizeof(char *) * (size_t)(m->nlocal_exports + im.n));
+            for (int i = 0; i < im.n; i++) m->local_exports[m->nlocal_exports++] = im.names[i];
+            expect_semi(p);
+            return;
+        }
+    }
+    if (!at_ident(p, "from")) xs_error(XS1011, p->tok.pos, NULL, "expected 'from'");
+    next(p);
+    Token path = expect(p, TK_STRING, "write the path as a string: from \"./file\"");
+    im.path = path.str;
+    expect_semi(p);
+    m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+    m->imports[m->nimports++] = im;
+    if (load_now) load_import(prog, m, &m->imports[m->nimports - 1]);
+}
+
+/* export { a, b };: the listed declarations of this module are exported */
+static void apply_local_exports(Program *prog, Module *m, int top_start) {
+    for (int k = 0; k < m->nlocal_exports; k++) {
+        const char *n = m->local_exports[k];
+        for (int i = 0; i < prog->nfuncs; i++) if (prog->funcs[i]->mod == m && strcmp(prog->funcs[i]->name, n) == 0) prog->funcs[i]->exported = true;
+        for (int i = 0; i < prog->nclasses; i++) if (prog->classes[i]->mod == m && strcmp(prog->classes[i]->name, n) == 0) prog->classes[i]->exported = true;
+        for (int i = 0; i < prog->nenums; i++) if (prog->enums[i]->mod == m && strcmp(prog->enums[i]->name, n) == 0) prog->enums[i]->exported = true;
+        for (int i = top_start; i < prog->top.len; i++) {
+            Stmt *st = prog->top.items[i];
+            if (st->mod == m && st->kind == S_VAR && st->name && strcmp(st->name, n) == 0) st->exported = true;
+        }
+    }
+}
+
 static void parse_module(Program *prog, Module *m) {
     xs_file_name = m->file;
     xs_source = m->src;
@@ -2285,10 +2400,15 @@ static void parse_module(Program *prog, Module *m) {
         if (_setjmp(prb) != 0) {
             xs_file_name = m->file;
             xs_source = m->src;
+            xs_lex_skipping = true;
             while (!at(&p, TK_EOF) && !at(&p, TK_IMPORT) && !(p.tok.pos.col == 1 && at_top_start(&p))) next(&p);
+            xs_lex_skipping = false;
         }
     }
-    while (at(&p, TK_IMPORT)) parse_import(&p, m);
+    while (at(&p, TK_IMPORT) || reexport_ahead(&p)) {
+        if (at(&p, TK_IMPORT)) parse_import(&p, m);
+        else parse_reexport(&p, m, prog, false);
+    }
     for (int i = 0; i < m->nimports; i++) {
         Import *im = &m->imports[i];
         if (xs_check_mode) { /* a module or package that cannot be loaded: reported, and checking goes on without it */
@@ -2313,17 +2433,21 @@ static void parse_module(Program *prog, Module *m) {
         parsing_mod = m;
         if (++recoveries > 500 || (p.tok.pos.line == last_line && p.tok.pos.col == last_col && !at(&p, TK_EOF))) {
             xs_error_recover = outer_recover; /* no progress: the rest of this file is not read */
+            apply_local_exports(prog, m, top_start);
             reflect_module(prog, m, top_start);
             return;
         }
         last_line = p.tok.pos.line;
         last_col = p.tok.pos.col;
+        xs_lex_skipping = true;
         if (!at(&p, TK_EOF)) next(&p);
         /* the next line that starts at column 1 and does not close a block: a declaration or a top-level statement */
         while (!at(&p, TK_EOF) && !(p.tok.pos.col == 1 && !at(&p, TK_RBRACE) && !at(&p, TK_RPAREN) && !at(&p, TK_RBRACKET))) next(&p);
+        xs_lex_skipping = false;
     }
     while (!at(&p, TK_EOF)) {
         decl_line = p.tok.pos.line;
+        if (reexport_ahead(&p)) { parse_reexport(&p, m, prog, true); continue; } /* (also after declarations) */
         DecoList decos = {0};
         parse_decorators(&p, &decos);
         bool exported = accept(&p, TK_EXPORT);
@@ -2402,6 +2526,7 @@ static void parse_module(Program *prog, Module *m) {
         }
     }
     if (xs_check_mode) xs_error_recover = outer_recover;
+    apply_local_exports(prog, m, top_start);
     reflect_module(prog, m, top_start);
 }
 
@@ -2461,7 +2586,8 @@ static void parse_module(Program *prog, Module *m);
 /* xisto:fs is the canonical name of a built-in module; node:fs (and the bare fs, sqlite) only in Node
    compatibility mode: these are xisto's implementations of the Node contracts, not Node itself. */
 static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos) {
-    bool node = strncmp(spec, "node:", 5) == 0 || strcmp(spec, "fs") == 0 || strcmp(spec, "sqlite") == 0;
+    bool node = strncmp(spec, "node:", 5) == 0 || strcmp(spec, "fs") == 0 || strcmp(spec, "sqlite") == 0 ||
+                (strncmp(spec, "xisto:", 6) != 0 && xs_node_core_name(spec)); /* "path": Node's name without "node:" */
     if (node && !xs_node_compat && xs_check_mode) /* xisto check: counted, and the program is checked as with xisto:* */
         xs_error_continue(XS4001, from_pos, xs_sprintf("import it as \"xisto:%s\"", strncmp(spec, "node:", 5) == 0 ? spec + 5 : spec),
                           "'%s' is xisto's implementation of a Node module, not Node itself", spec);
@@ -2556,12 +2682,16 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
     pending_prefix = NULL;
     if (from_file && (strncmp(file, "node:", 5) == 0 || strncmp(file, "xisto:", 6) == 0 || strcmp(file, "fs") == 0 || strcmp(file, "sqlite") == 0))
         return load_builtin_module(prog, file, from_pos);
+    if (from_file && xs_node_core_name(file)) return load_builtin_module(prog, file, from_pos); /* "path": read as node:path */
+    char *alias = from_file && file[0] != '.' ? xs_tsconfig_resolve(from_file, file) : NULL; /* a tsconfig "paths" name */
     if (from_file && file[0] == '.') {
         char dir[PATH_MAX];
         strncpy(dir, from_file, sizeof dir - 1);
         char *slash = strrchr(dir, '/');
         if (slash) *slash = 0; else strcpy(dir, ".");
         snprintf(path, sizeof path, "%s/%s", dir, file);
+    } else if (alias) {
+        snprintf(path, sizeof path, "%s", alias);
     } else if (from_file) {
         /* a package: <project>/.xisto/pkgs/<name>/, entry from its xisto.json "main", else index.ts or src/index.ts */
         char dir[PATH_MAX];
@@ -2610,7 +2740,18 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
         strncpy(path, file, sizeof path - 1);
     }
     size_t n = strlen(path);
-    if (access(path, R_OK) != 0 && !(n > 3 && strcmp(path + n - 3, ".ts") == 0)) strncat(path, ".ts", sizeof path - n - 1);
+    struct stat dst;
+    if (stat(path, &dst) == 0 && S_ISDIR(dst.st_mode)) { /* a folder: its index.ts */
+        strncat(path, access(xs_sprintf("%s/index.ts", path), R_OK) == 0 || access(xs_sprintf("%s/index.tsx", path), R_OK) != 0 ? "/index.ts" : "/index.tsx", sizeof path - n - 1);
+        n = strlen(path);
+    } else if (n > 3 && strcmp(path + n - 3, ".js") == 0 && access(path, R_OK) != 0) { /* "./x.js" written for ES modules: ./x.ts */
+        path[n - 3] = 0;
+        n -= 3;
+    }
+    if (access(path, R_OK) != 0 && !(n > 3 && strcmp(path + n - 3, ".ts") == 0)) {
+        if (access(xs_sprintf("%s.tsx", path), R_OK) == 0) strncat(path, ".tsx", sizeof path - n - 1);
+        else strncat(path, ".ts", sizeof path - n - 1);
+    }
     char real[PATH_MAX];
     if (!xs_real_path(path, real)) {
         if (from_file) xs_error(XS5001, from_pos, NULL, "cannot find module '%s' (looked for %s)", file, path);

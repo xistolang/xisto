@@ -7,6 +7,7 @@
 #include "xisto.h"
 #include <dirent.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,7 @@
 typedef struct {
     char *file, *code, *category, *message, *help, *source;
     int line, col;
+    bool test; /* in a test file (*.spec.ts, *.test.ts, __tests__/, __mocks__/) */
 } Diag;
 
 typedef struct {
@@ -151,7 +153,7 @@ static char *project_main(const char *dir) {
 
 typedef struct {
     char *name, *status;
-    int files;
+    int files, test_files;
 } Pkg;
 static Pkg *pkgs;
 static int npkgs;
@@ -168,12 +170,28 @@ static const char *package_status(const char *root, const char *name) {
     return "not installed";
 }
 
+/* a test file: counted apart from the application's code */
+static bool test_file(const char *path) {
+    size_t n = strlen(path);
+    const char *suffixes[] = {".spec.ts", ".test.ts", ".spec.tsx", ".test.tsx", ".e2e-spec.ts", NULL};
+    for (int i = 0; suffixes[i]; i++) {
+        size_t k = strlen(suffixes[i]);
+        if (n >= k && strcmp(path + n - k, suffixes[i]) == 0) return true;
+    }
+    return strstr(path, "__tests__/") || strstr(path, "__mocks__/");
+}
+
 /* the bare package names a file imports (not relative paths, not node:, xisto: or the built-in fs and sqlite) */
 static void scan_imports(const char *root, const char *file) {
     char *src = xs_read_file(file);
     if (!src) return;
     Strs seen = {0};
     for (char *p = src; (p = strstr(p, "from ")) || (p = NULL); p++) {
+        /* an import's or a re-export's "from": its line starts with import, export or the '}' that closes a list */
+        char *ls = p;
+        while (ls > src && ls[-1] != '\n') ls--;
+        while (*ls == ' ' || *ls == '\t') ls++;
+        if (strncmp(ls, "import", 6) != 0 && strncmp(ls, "export", 6) != 0 && *ls != '}') continue;
         char *q = p + 5;
         while (*q == ' ') q++;
         if (*q != '"' && *q != '\'') continue;
@@ -181,9 +199,10 @@ static void scan_imports(const char *root, const char *file) {
         char *end = strchr(q, quote);
         if (!end || end - q > 200) continue;
         char *spec = xs_sprintf("%.*s", (int)(end - q), q);
-        if (spec[0] == '.' || spec[0] == '/' || strncmp(spec, "node:", 5) == 0 || strncmp(spec, "xisto:", 6) == 0 || strcmp(spec, "fs") == 0 ||
-            strcmp(spec, "sqlite") == 0)
+        if (spec[0] == '.' || spec[0] == '/' || strncmp(spec, "node:", 5) == 0 || strncmp(spec, "xisto:", 6) == 0 || strcmp(spec, "sqlite") == 0 ||
+            xs_node_core_name(spec)) /* (a Node module without "node:" is counted as a Node module import) */
             continue;
+        if (xs_tsconfig_resolve(file, spec)) continue; /* a tsconfig "paths" name: the project's own code */
         char *name = spec; /* "@scope/pkg/sub" -> "@scope/pkg", "pkg/sub" -> "pkg" */
         char *slash = strchr(spec[0] == '@' ? (strchr(spec, '/') ? strchr(spec, '/') + 1 : spec) : spec, '/');
         if (slash) name = xs_sprintf("%.*s", (int)(slash - spec), spec);
@@ -193,20 +212,44 @@ static void scan_imports(const char *root, const char *file) {
         while (k < npkgs && strcmp(pkgs[k].name, name) != 0) k++;
         if (k == npkgs) {
             pkgs = realloc(pkgs, sizeof(Pkg) * (size_t)(npkgs + 1));
-            pkgs[npkgs++] = (Pkg){name, (char *)package_status(root, name), 0};
+            pkgs[npkgs++] = (Pkg){name, (char *)package_status(root, name), 0, 0};
         }
-        pkgs[k].files++;
+        if (test_file(file)) pkgs[k].test_files++; else pkgs[k].files++;
     }
 }
 
 /* ---------- the run ---------- */
 
-static char *display(const char *path, const char *cwd) {
+/* a path as shown: relative to the folder that was checked (else to the current one) */
+static char *display(const char *path, const char *cwd, const char *root) {
     char real[PATH_MAX];
     const char *p = xs_real_path(path, real) ? real : path;
+    size_t r = strlen(root);
+    if (r && strncmp(p, root, r) == 0 && p[r] == '/') return xs_sprintf("%s", p + r + 1);
     size_t n = strlen(cwd);
     if (strncmp(p, cwd, n) == 0 && p[n] == '/') return xs_sprintf("%s", p + n + 1);
     return xs_sprintf("%s", p);
+}
+
+/* the diagnostics already kept, by file, line, column and message (a hash set: a large project has tens of thousands) */
+static char **seen_keys;
+static size_t seen_cap, seen_len;
+static uint64_t hash_str(const char *s) { uint64_t h = 1469598103934665603ull; while (*s) h = (h ^ (unsigned char)*s++) * 1099511628211ull; return h; }
+static bool seen_add(const char *key) {
+    if (seen_len * 2 >= seen_cap) {
+        size_t nc = seen_cap ? seen_cap * 2 : 1024;
+        char **nk = calloc(nc, sizeof(char *));
+        for (size_t i = 0; i < seen_cap; i++)
+            if (seen_keys[i]) { size_t j = hash_str(seen_keys[i]) & (nc - 1); while (nk[j]) j = (j + 1) & (nc - 1); nk[j] = seen_keys[i]; }
+        free(seen_keys);
+        seen_keys = nk;
+        seen_cap = nc;
+    }
+    size_t j = hash_str(key) & (seen_cap - 1);
+    while (seen_keys[j]) { if (strcmp(seen_keys[j], key) == 0) return false; j = (j + 1) & (seen_cap - 1); }
+    seen_keys[j] = (char *)key;
+    seen_len++;
+    return true;
 }
 
 static void check_entry(const char *self, const char *file, Strs *covered, const char *cwd, const char *root_real) {
@@ -228,11 +271,9 @@ static void check_entry(const char *self, const char *file, Strs *covered, const
         const char *rp = xs_real_path(d.file, real) ? real : d.file;
         size_t rn = strlen(root_real);
         if (strncmp(rp, root_real, rn) != 0 || strstr(rp, "/.xisto/") || strstr(rp, "/node_modules/")) continue; /* a package's own code */
-        d.file = display(d.file, cwd);
-        bool dup = false;
-        for (int i = 0; i < ndiags && !dup; i++)
-            dup = diags[i].line == d.line && diags[i].col == d.col && strcmp(diags[i].file, d.file) == 0 && strcmp(diags[i].message, d.message) == 0;
-        if (dup) continue;
+        d.file = display(d.file, cwd, root_real);
+        d.test = test_file(d.file);
+        if (!seen_add(xs_sprintf("%s\x1f%d\x1f%d\x1f%s", d.file, d.line, d.col, d.message))) continue;
         if (ndiags == cap_diags) {
             cap_diags = cap_diags ? cap_diags * 2 : 64;
             diags = realloc(diags, sizeof(Diag) * (size_t)cap_diags);
@@ -253,12 +294,28 @@ static int cmp_diag(const void *a, const void *b) {
     return x->col - y->col;
 }
 
+static void count_table(bool want_test, bool all) {
+    printf("\n  %-46s %7s  %5s  %s\n", "kind of change", "changes", "files", "fix");
+    for (int c = 0; c < DC_COUNT; c++) {
+        int n = 0;
+        Strs fs = {0};
+        for (int i = 0; i < ndiags; i++)
+            if ((all || diags[i].test == want_test) && diags[i].category && strcmp(diags[i].category, xs_diag_cat_id((DiagCat)c)) == 0) {
+                n++;
+                if (!strs_has(&fs, diags[i].file)) strs_push(&fs, diags[i].file);
+            }
+        if (n) printf("  %-46s %7d  %5d  %s\n", xs_diag_cat_title((DiagCat)c), n, fs.len, xs_diag_cat_fix((DiagCat)c));
+        free(fs.items);
+    }
+}
+
 int cmd_check(int argc, char **argv) {
-    bool details = false;
+    bool details = false, with_tests = false;
     Strs paths = {0};
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--details") == 0) details = true;
-        else if (argv[i][0] == '-') { fprintf(stderr, "xisto check: unknown option '%s' (only --details)\n", argv[i]); return 2; }
+        else if (strcmp(argv[i], "--tests") == 0) with_tests = true;
+        else if (argv[i][0] == '-') { fprintf(stderr, "xisto check: unknown option '%s' (--details, --tests)\n", argv[i]); return 2; }
         else {
             char *p = xs_sprintf("%s", argv[i]);
             for (size_t n = strlen(p); n > 1 && p[n - 1] == '/'; n--) p[n - 1] = 0; /* "dir/" as "dir" */
@@ -310,13 +367,23 @@ int cmd_check(int argc, char **argv) {
 
     bool tty = isatty(1);
     const char *B = tty ? "\033[1m" : "", *R = tty ? "\033[0m" : "", *D = tty ? "\033[2m" : "";
-    Strs affected = {0};
-    for (int i = 0; i < ndiags; i++) if (!strs_has(&affected, diags[i].file)) strs_push(&affected, diags[i].file);
+    int app_files = 0, test_files_n = 0;
+    for (int i = 0; i < files.len; i++) { if (test_file(display(files.items[i], cwd, root_real))) test_files_n++; else app_files++; }
+    Strs affected = {0}, test_affected = {0};
+    int app_n = 0, test_n = 0;
+    for (int i = 0; i < ndiags; i++) {
+        if (diags[i].test) { test_n++; if (!strs_has(&test_affected, diags[i].file)) strs_push(&test_affected, diags[i].file); }
+        else { app_n++; if (!strs_has(&affected, diags[i].file)) strs_push(&affected, diags[i].file); }
+    }
+    int shown_n = with_tests ? ndiags : app_n;
+    int shown_files = with_tests ? app_files + test_files_n : app_files;
+    int shown_affected = affected.len + (with_tests ? test_affected.len : 0);
 
     if (details) {
         for (int i = 0; i < ndiags;) {
             int j = i;
             while (j < ndiags && strcmp(diags[j].file, diags[i].file) == 0) j++;
+            if (diags[i].test && !with_tests) { i = j; continue; }
             printf("%s%s%s (%d)\n", B, diags[i].file, R, j - i);
             for (int k = i; k < j; k++) {
                 Diag *d = &diags[k];
@@ -332,46 +399,45 @@ int cmd_check(int argc, char **argv) {
         }
     }
 
-    if (!ndiags) printf("xisto check: %d file%s, no changes needed\n", files.len, files.len == 1 ? "" : "s");
-    else printf("%sxisto check: %d file%s, %d change%s needed in %d file%s%s\n", B, files.len, files.len == 1 ? "" : "s", ndiags,
-                ndiags == 1 ? "" : "s", affected.len, affected.len == 1 ? "" : "s", R);
-    if (ndiags) {
-        printf("\n  %-46s %7s  %5s  %s\n", "kind of change", "changes", "files", "fix");
-        for (int c = 0; c < DC_COUNT; c++) {
-            int n = 0;
-            Strs fs = {0};
-            for (int i = 0; i < ndiags; i++)
-                if (diags[i].category && strcmp(diags[i].category, xs_diag_cat_id((DiagCat)c)) == 0) {
-                    n++;
-                    if (!strs_has(&fs, diags[i].file)) strs_push(&fs, diags[i].file);
-                }
-            if (n) printf("  %-46s %7d  %5d  %s\n", xs_diag_cat_title((DiagCat)c), n, fs.len, xs_diag_cat_fix((DiagCat)c));
-            free(fs.items);
-        }
+    if (!shown_n) printf("xisto check: %d file%s, no changes needed\n", shown_files, shown_files == 1 ? "" : "s");
+    else printf("%sxisto check: %d file%s, %d change%s needed in %d file%s%s\n", B, shown_files, shown_files == 1 ? "" : "s", shown_n,
+                shown_n == 1 ? "" : "s", shown_affected, shown_affected == 1 ? "" : "s", R);
+    if (shown_n) {
+        count_table(false, with_tests);
         if (quiet_total) printf("  (%d follow-on error%s of these hidden)\n", quiet_total, quiet_total == 1 ? "" : "s");
         /* the files with the most changes */
-        int *counts = calloc((size_t)affected.len, sizeof(int));
+        Strs *af = &affected;
+        Strs both = {0};
+        if (with_tests) { for (int k = 0; k < affected.len; k++) strs_push(&both, affected.items[k]); for (int k = 0; k < test_affected.len; k++) strs_push(&both, test_affected.items[k]); af = &both; }
+        int *counts = calloc((size_t)af->len + 1, sizeof(int));
         for (int i = 0; i < ndiags; i++)
-            for (int k = 0; k < affected.len; k++) if (strcmp(diags[i].file, affected.items[k]) == 0) { counts[k]++; break; }
-        printf("\n  most changes:");
-        for (int shown = 0; shown < 5 && shown < affected.len; shown++) {
+            for (int k = 0; k < af->len; k++) if (strcmp(diags[i].file, af->items[k]) == 0) { counts[k]++; break; }
+        printf("\n  most changes:\n");
+        for (int shown = 0; shown < 5 && shown < af->len; shown++) {
             int best = -1;
-            for (int k = 0; k < affected.len; k++) if (counts[k] >= 0 && (best < 0 || counts[k] > counts[best])) best = k;
-            printf("%s %s (%d)", shown ? "," : "", affected.items[best], counts[best]);
+            for (int k = 0; k < af->len; k++) if (counts[k] >= 0 && (best < 0 || counts[k] > counts[best])) best = k;
+            printf("    %5d  %s\n", counts[best], af->items[best]);
             counts[best] = -1;
         }
-        printf("\n");
         free(counts);
     }
+    if (!with_tests && test_files_n)
+        printf("\n  tests: %d change%s in %d of %d test file%s, not counted above (--tests counts them)\n", test_n, test_n == 1 ? "" : "s",
+               test_affected.len, test_files_n, test_files_n == 1 ? "" : "s");
     if (npkgs) {
         printf("\n  packages:\n");
         for (int k = 0; k < npkgs; k++) {
-            printf("    %-28s %-26s %d file%s", pkgs[k].name, pkgs[k].status, pkgs[k].files, pkgs[k].files == 1 ? "" : "s");
+            int nf = pkgs[k].files + (with_tests ? pkgs[k].test_files : 0);
+            if (!with_tests && !pkgs[k].files) continue;
+            printf("    %-32s %-24s %d file%s", pkgs[k].name, pkgs[k].status, nf, nf == 1 ? "" : "s");
             if (strcmp(pkgs[k].status, "not installed") == 0) printf("  (xisto add <git url> --name %s)", pkgs[k].name);
             printf("\n");
         }
+        int test_only = 0;
+        for (int k = 0; k < npkgs; k++) if (!pkgs[k].files) test_only++;
+        if (!with_tests && test_only) printf("    (and %d package%s only the tests import)\n", test_only, test_only == 1 ? "" : "s");
     }
     if (crashed) printf("\n  note: the compiler stopped early on %d file%s; their changes may be incomplete\n", crashed, crashed == 1 ? "" : "s");
-    if (ndiags && !details) printf("\n  xisto check --details lists every place to change.\n");
-    return ndiags ? 1 : 0;
+    if (shown_n && !details) printf("\n  xisto check --details lists every place to change.\n");
+    return shown_n ? 1 : 0;
 }

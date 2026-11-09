@@ -1,0 +1,17 @@
+xisto check: 6 files, 6 changes needed in 1 file
+
+  kind of change                                 changes  files  fix
+  syntax xisto does not read                           3      1  manual
+  Node module import (node:x -> xisto:x)               1      1  automatic
+  module or package not available                      2      1  package
+  (3 follow-on errors of these hidden)
+
+  most changes:
+        6  apps/api/src/main.ts
+
+  tests: 1 change in 1 of 1 test file, not counted above (--tests counts them)
+
+  packages:
+    some-orm                         not installed            1 file  (xisto add <git url> --name some-orm)
+
+  xisto check --details lists every place to change.

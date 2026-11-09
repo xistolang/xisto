@@ -142,6 +142,7 @@ const char *xs_diag_cat_title(DiagCat c) { return c < DC_COUNT ? cat_table[c].ti
 const char *xs_diag_cat_fix(DiagCat c) { return c < DC_COUNT ? cat_table[c].fix : ""; }
 const char *xs_diag_cat_id(DiagCat c) { return c < DC_COUNT ? cat_table[c].id : ""; }
 bool xs_check_mode;
+bool xs_lex_skipping;
 int xs_quiet_count;
 
 static void report(DiagCode code, const char *severity, Pos pos, const char *help, const char *msg) {

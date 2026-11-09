@@ -9,9 +9,11 @@ xisto check: 2 files, 9 changes needed in 2 files
   type error under xisto's rules                       2      2  manual
   (3 follow-on errors of these hidden)
 
-  most changes: tests/check/mixed/main.ts (7), tests/check/mixed/lib/helper.ts (2)
+  most changes:
+        7  main.ts
+        2  lib/helper.ts
 
   packages:
-    @acme/missing                not installed              1 file  (xisto add <git url> --name @acme/missing)
+    @acme/missing                    not installed            1 file  (xisto add <git url> --name @acme/missing)
 
   xisto check --details lists every place to change.

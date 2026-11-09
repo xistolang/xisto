@@ -67,6 +67,9 @@ const char *xs_diag_cat_fix(DiagCat c);    /* "manual", "automatic", "package", 
 const char *xs_diag_cat_id(DiagCat c);     /* "missing-type" */
 void xs_error(DiagCode code, Pos pos, const char *help, const char *fmt, ...);
 void xs_error_quiet(void); /* back to the recovery point without a message: the error was reported */
+bool xs_node_core_name(const char *spec);                  /* "path", "fs/promises": a Node module without "node:" */
+char *xs_tsconfig_resolve(const char *from_file, const char *spec); /* a tsconfig "paths" name: its file or folder, or NULL */
+extern bool xs_lex_skipping; /* xisto check: the parser is skipping a declaration that did not parse (no lexer errors there) */
 extern bool xs_check_mode; /* xisto check: report every error (no limit of 20) and keep going where possible */
 extern int xs_quiet_count;   /* follow-on errors kept quiet (a use of a declaration that failed) */
 void xs_error_continue(DiagCode code, Pos pos, const char *help, const char *fmt, ...); /* report, count, go on */
@@ -536,6 +539,8 @@ typedef struct {
     char *path;        /* as written */
     Module *from;      /* resolved */
     Pos pos;
+    bool reexport;     /* export { a, b } from "m" / export * from "m": the names are this module's exports too */
+    bool star;         /* export * from "m": every name m exports (names is empty) */
 } Import;
 
 struct Module {
@@ -545,6 +550,8 @@ struct Module {
     char *src;
     Import *imports;
     int nimports;
+    char **local_exports; /* export { a, b }; (no "from"): names declared here, exported by a list */
+    int nlocal_exports;
     bool loading, loaded;
     bool builtin;      /* "node:fs" and friends: functions provided by the runtime */
     bool missing;      /* xisto check: a module that could not be loaded (reported); its imported names are not reported again */
