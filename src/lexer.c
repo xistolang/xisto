@@ -11,6 +11,12 @@ static const struct { const char *word; TokKind kind; } keywords[] = {
     {"enum", TK_ENUM}, {"try", TK_TRY}, {"catch", TK_CATCH}, {"throw", TK_THROW},
 };
 
+/* the word of a keyword token (NULL for other tokens): TypeScript reads any keyword as a property name */
+const char *tok_keyword_text(TokKind k) {
+    for (size_t i = 0; i < sizeof keywords / sizeof *keywords; i++) if (keywords[i].kind == k) return keywords[i].word;
+    return NULL;
+}
+
 const char *tok_kind_name(TokKind k) {
     switch (k) {
     case TK_EOF: return "end of file";
