@@ -978,7 +978,27 @@ static void destructure(Parser *p, Stmt *holder, bool is_const, bool array) {
     int idx = 0;
     while (!at(p, array ? TK_RBRACKET : TK_RBRACE)) {
         if (array && at(p, TK_COMMA)) { next(p); idx++; continue; } /* a hole */
-        if (at(p, TK_DOT)) xs_error(p->tok.pos, "take the rest with a slice: const rest = a.slice(n)", "'...rest' in a destructuring is not supported");
+        if (array && at(p, TK_ELLIPSIS)) { /* const [a, ...rest] = e: rest = e.slice(the elements before it) */
+            next(p);
+            Token rn = expect(p, TK_IDENT, "a name for the rest of the elements");
+            Expr *sl = new_expr(E_MEMBER, rn.pos);
+            sl->lhs = ident_expr(rn.pos, tmp);
+            sl->str = "slice";
+            sl->is_call = true;
+            Expr *ix = new_expr(E_NUMBER, rn.pos);
+            ix->is_int_lit = true;
+            ix->ival = idx;
+            ix->num = idx;
+            expr_list_push(&sl->args, ix);
+            Stmt *d = new_stmt(S_VAR, rn.pos);
+            d->name = (char *)rn.str;
+            d->is_const = is_const;
+            d->init = sl;
+            stmt_list_push(&p->pending, d);
+            if (!at(p, TK_RBRACKET)) xs_error(p->tok.pos, NULL, "the rest element must be the last one");
+            break;
+        }
+        if (at(p, TK_DOT) || at(p, TK_ELLIPSIS)) xs_error(p->tok.pos, "name the fields one by one", "'...rest' in an object destructuring is not supported");
         Token nm = expect(p, TK_IDENT, array ? "a name for the element" : "a field name");
         const char *field = nm.str, *var = nm.str;
         if (!array && accept(p, TK_COLON)) var = expect(p, TK_IDENT, "the name to give the field: { field: name }").str;
@@ -2391,12 +2411,12 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->loading = false;
         return m;
     }
-    if (strcmp(name, "io") == 0 || strcmp(name, "bytes") == 0 || strcmp(name, "parallel") == 0) { /* packages/xisto: the same file Node runs */
-        extern const unsigned char xs_pkg_io_ts[], xs_pkg_bytes_ts[], xs_pkg_parallel_ts[];
-        bool io = strcmp(name, "io") == 0, par = strcmp(name, "parallel") == 0;
+    if (strcmp(name, "io") == 0 || strcmp(name, "bytes") == 0 || strcmp(name, "parallel") == 0 || strcmp(name, "collections") == 0) { /* packages/xisto: the same file Node runs */
+        extern const unsigned char xs_pkg_io_ts[], xs_pkg_bytes_ts[], xs_pkg_parallel_ts[], xs_pkg_collections_ts[];
+        bool io = strcmp(name, "io") == 0, par = strcmp(name, "parallel") == 0, coll = strcmp(name, "collections") == 0;
         m->builtin = false;
-        m->file = io ? "xisto:io" : par ? "xisto:parallel" : "xisto:bytes";
-        m->src = (char *)(io ? xs_pkg_io_ts : par ? xs_pkg_parallel_ts : xs_pkg_bytes_ts);
+        m->file = io ? "xisto:io" : par ? "xisto:parallel" : coll ? "xisto:collections" : "xisto:bytes";
+        m->src = (char *)(io ? xs_pkg_io_ts : par ? xs_pkg_parallel_ts : coll ? xs_pkg_collections_ts : xs_pkg_bytes_ts);
         if (par) prog->uses_parallel = true; /* (main.c: built with per-thread runtime state, XS_THREADS) */
         m->loading = true;
         parse_module(prog, m);
@@ -2421,7 +2441,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         add_func(prog, f);
         return m;
     }
-    xs_error(from_pos, "built-in modules: xisto:fs, xisto:sqlite, xisto:timers/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:io, xisto:bytes, xisto:parallel", "unknown built-in module '%s'", spec);
+    xs_error(from_pos, "built-in modules: xisto:fs, xisto:sqlite, xisto:timers/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:io, xisto:bytes, xisto:parallel, xisto:collections", "unknown built-in module '%s'", spec);
     return NULL;
 }
 
