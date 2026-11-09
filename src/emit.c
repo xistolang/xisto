@@ -4378,6 +4378,16 @@ static bool bce_pure(Expr *e) {
     if (e->kind == E_BINARY && (e->op == TK_PLUS || e->op == TK_MINUS)) return bce_pure(e->lhs) && bce_pure(e->rhs);
     return false;
 }
+/* a name declared inside the loop's body (a const, a for...of variable, a caught error): the guard before the
+   loop cannot read it */
+static bool bce_declares(Stmt *s, const char *n) {
+    if (!s || !n) return false;
+    if ((s->kind == S_VAR || s->kind == S_FOROF || s->kind == S_TRY) && s->cname && strcmp(s->cname, n) == 0) return true;
+    if (bce_declares(s->for_init, n) || bce_declares(s->body, n) || bce_declares(s->else_body, n)) return true;
+    for (int k = 0; k < s->stmts.len; k++) if (bce_declares(s->stmts.items[k], n)) return true;
+    for (int k = 0; k < s->ncases; k++) if (bce_declares(s->cases[k].body, n)) return true;
+    return false;
+}
 static int bce_versions; /* versioned loops around the one being emitted (two levels at most: 4 copies) */
 /* the guard of a versioned loop ("" when the loop is not one), and its arrays in arrs */
 static char *bce_version_guard(Stmt *s, const char **arrs, int *na) {
@@ -4404,6 +4414,7 @@ static char *bce_version_guard(Stmt *s, const char **arrs, int *na) {
     for (int k = 0; k < nc; k++) {
         int64_t fixed = bce_fixed_n(cand[k]);
         if (fixed > 0 && ir.ok && ir.lo >= 0 && ir.hi < fixed) continue;
+        if (bce_declares(s->body, cand[k])) continue;
         if (bce_ok(s->body, cand[k], ct[k], plain) && strcmp(cand[k], i) != 0) { bce_arr_t[*na] = ct[k]; arrs[(*na)++] = cand[k]; }
     }
     nbce_aff = 0;
@@ -4412,6 +4423,7 @@ static char *bce_version_guard(Stmt *s, const char **arrs, int *na) {
     int keep = 0;
     for (int k = 0; k < nbce_aff; k++) {
         Expr *E = bce_aff[k].E;
+        if (bce_declares(s->body, bce_aff[k].a) || (E->kind == E_IDENT && bce_declares(s->body, E->cname))) continue;
         if (bce_ok(s->body, bce_aff[k].a, bce_aff[k].t, plain && (E->kind == E_NUMBER || bce_plain_local(E->cname)))) bce_aff[keep++] = bce_aff[k];
     }
     nbce_aff = keep;
@@ -4826,6 +4838,23 @@ static int name_uses(Stmt *s, const char *c, int *idiom) {
     for (int i = 0; i < s->ncases; i++) n += name_uses_e(s->cases[i].value, c) + name_uses(s->cases[i].body, c, idiom);
     return n;
 }
+/* reads of c.size in e/s: the hoisted table (xs_map_hc) leaves the map's own count up to date, so they may stay */
+static int size_reads_e(Expr *e, const char *c) {
+    if (!e) return 0;
+    int n = e->kind == E_MEMBER && !e->is_call && e->str && strcmp(e->str, "size") == 0 && e->lhs && e->lhs->kind == E_IDENT &&
+            e->lhs->cname && strcmp(e->lhs->cname, c) == 0 && e->lhs->type && e->lhs->type->kind == TY_MAP;
+    n += size_reads_e(e->lhs, c) + size_reads_e(e->rhs, c);
+    for (int i = 0; i < e->args.len; i++) n += size_reads_e(e->args.items[i], c);
+    return n;
+}
+static int size_reads(Stmt *s, const char *c) {
+    if (!s) return 0;
+    int n = size_reads_e(s->init, c) + size_reads_e(s->expr, c) + size_reads_e(s->cond, c) + size_reads_e(s->for_update, c);
+    n += size_reads(s->for_init, c) + size_reads(s->body, c) + size_reads(s->else_body, c);
+    for (int i = 0; i < s->stmts.len; i++) n += size_reads(s->stmts.items[i], c);
+    for (int i = 0; i < s->ncases; i++) n += size_reads_e(s->cases[i].value, c) + size_reads(s->cases[i].body, c);
+    return n;
+}
 static void collect_idiom_maps(Stmt *s, const char **ms, int *nm) {
     if (!s) return;
     Expr *m, *k, *d, *sum;
@@ -4888,6 +4917,7 @@ static int loop_hoist_enter(Stmt *s, int *nb) {
     for (int i = 0; i < nm && nmap_hoist < 8; i++) {
         int idiom = 0;
         int all = name_uses(s->body, ms[i], &idiom) + name_uses_e(s->cond, ms[i]) + name_uses_e(s->for_update, ms[i]);
+        idiom += size_reads(s->body, ms[i]) + size_reads_e(s->cond, ms[i]);
         if (all != idiom || bce_writes(s, ms[i]) || declares(s, ms[i])) continue;
         int id = map_hoist_ids++;
         buf_printf(out, "xs_map_hc mhc%d_ = xs_map_hc_of(%s); ", id, ren(ms[i]));

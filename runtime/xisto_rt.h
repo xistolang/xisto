@@ -926,10 +926,23 @@ typedef struct { int kind; int64_t i; double d; xs_str *s; } xs_sqarg;
 static inline bool xs_str_truthy(xs_str *s) { return s && s->len > 0; }
 static bool xs_str_eq(xs_str *a, xs_str *b);
 static inline bool xs_str_eq_null(xs_str *a, xs_str *b) { return a && b && xs_str_eq(a, b); }
+/* how many bytes of d[0, n) from the start are ASCII: eight words at a time, so an ASCII text of 125 MB is
+   checked at memory speed instead of byte by byte */
+static int64_t xs_ascii_prefix(const unsigned char *d, int64_t n) {
+    int64_t i = 0;
+    while (i + 64 <= n) {
+        uint64_t acc = 0;
+        for (int k = 0; k < 8; k++) { uint64_t w; memcpy(&w, d + i + 8 * k, 8); acc |= w; }
+        if (acc & 0x8080808080808080ULL) break;
+        i += 64;
+    }
+    while (i < n && d[i] < 0x80) i++;
+    return i;
+}
 static int64_t xs_str_len(xs_str *s) {
     if (s->ulen < 0) {
-        int64_t n = 0;
-        for (int64_t i = 0; i < s->len; i++)
+        int64_t n = xs_ascii_prefix((const unsigned char *)s->data, s->len);
+        for (int64_t i = n; i < s->len; i++)
             if ((s->data[i] & 0xC0) != 0x80) n++;
         if (n > INT32_MAX) return n; /* too long to cache in the header: counted each time */
         s->ulen = (int32_t)n;
@@ -1022,7 +1035,9 @@ static xs_str *xs_str_slice(xs_str *s, int64_t start, int64_t end) {
     if (end > n) end = n;
     if (start >= end) return xs_str_new("", 0);
     int64_t a = xs_str_byte_at(s, start), b = xs_str_byte_at(s, end);
-    return xs_str_new(s->data + a, (size_t)(b - a));
+    xs_str *r = xs_str_new(s->data + a, (size_t)(b - a));
+    if (s->ulen == s->len) r->ulen = (int32_t)(b - a); /* a piece of an ASCII string: its length is known */
+    return r;
 }
 
 /* JS substring: both ends clamped to [0, length] (no counting from the end), swapped when start > end */
@@ -1104,8 +1119,7 @@ static int xs_u8_put(char *o, uint32_t c) {
 static bool xs_cp_cased(uint32_t c) { return xs_cp_upper(c) != c || xs_cp_lower(c) != c; }
 XS_NOINLINE xs_str *xs_str_case(xs_str *s, bool up) {
     const unsigned char *d = (const unsigned char *)s->data;
-    int64_t n = s->len, i = 0;
-    while (i < n && d[i] < 0x80) i++;
+    int64_t n = s->len, i = xs_ascii_prefix(d, n);
     if (i == n) { /* ASCII: byte by byte */
         xs_str *r = xs_str_alloc(n);
         for (int64_t k = 0; k < n; k++) {
@@ -1113,7 +1127,7 @@ XS_NOINLINE xs_str *xs_str_case(xs_str *s, bool up) {
             r->data[k] = (char)(up ? (c >= 'a' && c <= 'z' ? c - 32 : c) : (c >= 'A' && c <= 'Z' ? c + 32 : c));
         }
         r->data[n] = 0;
-        r->ulen = s->ulen;
+        r->ulen = n <= INT32_MAX ? (int32_t)n : -1;
         return r;
     }
     char *buf = malloc((size_t)n * 2 + 8), *o = buf; /* no mapping here grows a code point by more than 2x */
@@ -1243,6 +1257,44 @@ XS_NOINLINE xs_str *xs_str_replace_impl(xs_str *s, xs_str *a, xs_str *b, bool al
     }
     int64_t count = 0;
     const char *p = s->data, *end = s->data + s->len;
+    if (all && b->len <= a->len && s->len > XS_SMALL_MAX) { /* a long text that does not grow: one pass into a buffer
+        of its size (the result is at most as long; finding every match twice cost as much as the copy) */
+        xs_str *r = xs_str_alloc(s->len);
+        char *o = r->data;
+        const char *hit;
+        if (a->len == 1 && b->len == 0) { /* one character removed (the newlines of a text): eight bytes at a time,
+            a word without it copied whole (one call per match cost as much as the copy) */
+            const uint64_t ones = 0x0101010101010101ULL, c8 = ones * (unsigned char)a->data[0];
+            while (p + 8 <= end) {
+                uint64_t w;
+                memcpy(&w, p, 8);
+                uint64_t x = w ^ c8;
+                if (!((x - ones) & ~x & 0x8080808080808080ULL)) { memcpy(o, p, 8); o += 8; p += 8; continue; }
+                for (int k = 0; k < 8; k++, p++) { if (*p != a->data[0]) *o++ = *p; else count++; }
+            }
+            for (; p < end; p++) { if (*p != a->data[0]) *o++ = *p; else count++; }
+            if (count == 0) { xs_release(r); return xs_retain(s); }
+            r->len = o - r->data;
+            r->data[r->len] = 0;
+            if (s->ulen >= 0 && s->ulen - count <= INT32_MAX) r->ulen = (int32_t)(s->ulen - count);
+            return r;
+        }
+        while ((hit = xs_find(p, (size_t)(end - p), a->data, (size_t)a->len))) {
+            memcpy(o, p, (size_t)(hit - p)); o += hit - p;
+            memcpy(o, b->data, (size_t)b->len); o += b->len;
+            p = hit + a->len;
+            count++;
+        }
+        if (count == 0) { xs_release(r); return xs_retain(s); }
+        memcpy(o, p, (size_t)(end - p)); o += end - p;
+        r->len = o - r->data;
+        r->data[r->len] = 0;
+        if (s->ulen >= 0) {
+            int64_t u = s->ulen + count * (xs_str_len(b) - xs_str_len(a));
+            if (u >= 0 && u <= INT32_MAX) r->ulen = (int32_t)u;
+        }
+        return r;
+    }
     while ((p = xs_find(p, (size_t)(end - p), a->data, (size_t)a->len))) { count++; p += a->len; if (!all) break; }
     if (count == 0) return xs_retain(s);
     xs_str *r = xs_str_alloc(s->len + count * (b->len - a->len));
@@ -1256,6 +1308,10 @@ XS_NOINLINE xs_str *xs_str_replace_impl(xs_str *s, xs_str *a, xs_str *b, bool al
     }
     memcpy(o, p, (size_t)(end - p));
     r->data[r->len] = 0;
+    if (s->ulen >= 0) { /* the length in code points follows from the parts' (no recount of a long result) */
+        int64_t u = s->ulen + count * (xs_str_len(b) - xs_str_len(a));
+        if (u >= 0 && u <= INT32_MAX) r->ulen = (int32_t)u;
+    }
     return r;
 }
 XS_NOINLINE xs_str *xs_str_replace(xs_str *s, xs_str *a, xs_str *b) { return xs_str_replace_impl(s, a, b, false); }

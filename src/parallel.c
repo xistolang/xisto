@@ -12,7 +12,8 @@
    - Whatever fn makes is its own: objects, arrays and strings it creates may be changed freely, and its
      methods and constructors are checked the same way with `this` its own.
    - No calls with effects outside: console, process, timers, fetch, Date.now, Math.random, a function value
-     (what it runs is not known here), a function of another package, await.
+     (what it runs is not known here), a function of another package (the call's own package is checked like
+     the program), await.
 
    The runtime side (runtime/xisto_rt.h, XS_PARALLEL) runs fn into a buffer on the pool and then replays the
    module's loop on the calling thread with the values made, so order, combine and errors are the loop's. */
@@ -104,8 +105,12 @@ static bool ns_call_ok(PCtx *c, const char *ns, const char *member) {
 }
 
 static bool user_func(Func *f) { return f && f->body && !f->is_native; }
+static const char *par_file; /* the module of the call being checked */
+/* a function of an xisto: package other than the one the call is in (a package's own functions are checked
+   like the program's: their bodies are what runs) */
 static bool other_package(Func *f) {
-    return f && f->mod && f->mod->file && strncmp(f->mod->file, "xisto:", 6) == 0 && strcmp(f->mod->file, "xisto:parallel") != 0;
+    return f && f->mod && f->mod->file && strncmp(f->mod->file, "xisto:", 6) == 0 && strcmp(f->mod->file, "xisto:parallel") != 0 &&
+           !(par_file && strcmp(f->mod->file, par_file) == 0);
 }
 
 static bool par_expr(PCtx *c, Expr *e) {
@@ -330,7 +335,7 @@ static bool par_site(Expr *e, const char *kind, const char **why) {
 }
 
 static Program *par_prog;
-static const char *par_file, *par_src;
+static const char *par_src;
 static void par_scan_e(Expr *e);
 static void par_scan_s(Stmt *s) {
     if (!s) return;
