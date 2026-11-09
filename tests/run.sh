@@ -184,6 +184,10 @@ if sh tests/pkg/run.sh > "$OUT/pkg.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg.txt
 
 # redis package against a live server (skipped without one)
 if sh tests/redis/run.sh > "$OUT/redis.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/redis.txt"; else echo "FAIL redis:"; cat "$OUT/redis.txt"; fail=$((fail+1)); fi
+# exceljs package: streaming XLSX (ZIP + deflate), checked as XML, by LibreOffice when installed, constant memory
+if sh tests/exceljs/run.sh > "$OUT/exceljs.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/exceljs.txt"; else echo "FAIL exceljs:"; cat "$OUT/exceljs.txt"; fail=$((fail+1)); fi
+# @elastic/elasticsearch package against a fake cluster (Node)
+if sh tests/elasticsearch/run.sh > "$OUT/elasticsearch.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/elasticsearch.txt"; else echo "FAIL elasticsearch:"; cat "$OUT/elasticsearch.txt"; fail=$((fail+1)); fi
 
 # debugger: CLI transcripts and the agent driven over DAP (docs/debugger.md)
 if sh tests/debug/run.sh > "$OUT/debug.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL debugger:"; cat "$OUT/debug.txt"; fail=$((fail+1)); fi
