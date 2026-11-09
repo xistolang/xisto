@@ -4283,11 +4283,19 @@ static void xs_rev_mask_init(void) {
         for (int hi = 0; hi < 16; hi++)
             for (int i = 0; i < 16; i++) xs_rot_mask[lo][hi][i] = (uint8_t)(lo <= i && i <= hi ? (i == hi ? lo : i + 1) : i);
 }
+/* n, the register's length: a Uint8Array's, or an int[]'s with XS_V16_ARR set (emit.c u8reg, int arrays proved to
+   hold bytes): the same checks, each with the message of the array the program wrote */
+#define XS_V16_ARR (INT64_C(1) << 32)
+#define XS_V16_LEN(n) ((n) & INT64_C(0xffffffff))
+#define XS_V16_OOB(n) (((n) & XS_V16_ARR) ? "array index out of bounds" : "index out of bounds")
 static inline xs_u8x16 xs_v16_load(const uint8_t *d, int64_t n) { if (n >= 16) return xs_u8x16_load(d); xs_u8x16 v = xs_u8x16_splat(0); memcpy(&v, d, (size_t)n); return v; }
 static inline void xs_v16_store(uint8_t *d, xs_u8x16 v, int64_t n) { if (n >= 16) xs_u8x16_store(d, v); else memcpy(d, &v, (size_t)n); }
+/* an int[] of n <= 16 elements, each a byte (proved), in a register and back */
+static inline xs_u8x16 xs_v16_load_i64(const int64_t *d, int64_t n) { xs_u8x16 v = xs_u8x16_splat(0); for (int64_t i = 0; i < n; i++) v[i] = (uint8_t)d[i]; return v; }
+static inline void xs_v16_store_i64(int64_t *d, xs_u8x16 v, int64_t n) { for (int64_t i = 0; i < n; i++) d[i] = (int64_t)v[i]; }
 static inline int64_t xs_v16_get_nc(xs_u8x16 v, int64_t i) { return (int64_t)xs_u8x16_shuffle(v, xs_u8x16_splat((uint8_t)i))[0]; }
 static inline int64_t xs_v16_get(xs_u8x16 v, int64_t i, int64_t n, const xs_site *s) {
-    if ((uint64_t)i >= (uint64_t)n) XS_FAIL("index out of bounds", s);
+    if ((uint64_t)i >= (uint64_t)XS_V16_LEN(n)) XS_FAIL(XS_V16_OOB(n), s);
     return xs_v16_get_nc(v, i);
 }
 static inline xs_u8x16 xs_v16_set_nc(xs_u8x16 v, int64_t i, int64_t b) { /* (i < 16: checked, or proved) */
@@ -4295,35 +4303,39 @@ static inline xs_u8x16 xs_v16_set_nc(xs_u8x16 v, int64_t i, int64_t b) { /* (i <
     return (v & ~m) | (xs_u8x16_splat((uint8_t)b) & m);
 }
 static inline xs_u8x16 xs_v16_set(xs_u8x16 v, int64_t i, int64_t b, int64_t n, const xs_site *s) {
-    if ((uint64_t)i >= (uint64_t)n) XS_FAIL("index out of bounds", s);
+    if ((uint64_t)i >= (uint64_t)XS_V16_LEN(n)) XS_FAIL(XS_V16_OOB(n), s);
     return xs_v16_set_nc(v, i, b);
 }
 /* the swap loop (xs_u8_rev) on a register value */
 static inline xs_u8x16 xs_v16_rev(xs_u8x16 v, int64_t lo, int64_t hi, int64_t n, const xs_site *s) {
     if (lo >= hi) return v;
-    if (lo < 0 || (uint64_t)hi >= (uint64_t)n) XS_FAIL("index out of bounds", s);
+    if (lo < 0 || (uint64_t)hi >= (uint64_t)XS_V16_LEN(n)) XS_FAIL(XS_V16_OOB(n), s);
     return xs_u8x16_shuffle(v, xs_rev_mask[lo][hi]);
 }
 static inline xs_u8x16 xs_v16_range(int64_t lo, int64_t hi) { /* lanes lo <= i < hi */
     xs_u8x16 idx = xs_u8x16_iota();
     return (idx >= xs_u8x16_splat((uint8_t)lo)) & (idx < xs_u8x16_splat((uint8_t)hi));
 }
-/* `for (j = lo; j < hi; j++) dst[j] = src[j]` (xs_u8_copy_range) with one side or both in a register */
+/* `for (j = lo; j < hi; j++) dst[j] = src[j]` (xs_u8_copy_range) with one side or both in a register (the read
+   of src checked first, as the loop reads before it stores) */
 static inline xs_u8x16 xs_v16_copy_rr(xs_u8x16 dst, xs_u8x16 src, int64_t lo, int64_t hi, int64_t ndst, int64_t nsrc, const xs_site *s) {
     if (lo >= hi) return dst;
-    if (lo < 0 || (uint64_t)(hi - 1) >= (uint64_t)nsrc || (uint64_t)(hi - 1) >= (uint64_t)ndst) XS_FAIL("index out of bounds", s);
+    if (lo < 0 || (uint64_t)(hi - 1) >= (uint64_t)XS_V16_LEN(nsrc)) XS_FAIL(XS_V16_OOB(nsrc), s);
+    if ((uint64_t)(hi - 1) >= (uint64_t)XS_V16_LEN(ndst)) XS_FAIL(XS_V16_OOB(ndst), s);
     xs_u8x16 m = xs_v16_range(lo, hi);
     return (dst & ~m) | (src & m);
 }
 static inline xs_u8x16 xs_v16_copy_in(xs_u8x16 dst, xs_Uint8Array *src, int64_t lo, int64_t hi, int64_t ndst, const xs_site *s) {
     if (lo >= hi) return dst;
-    if (lo < 0 || (uint64_t)(hi - 1) >= (uint64_t)src->f_length || (uint64_t)(hi - 1) >= (uint64_t)ndst) XS_FAIL("index out of bounds", s);
+    if (lo < 0 || (uint64_t)(hi - 1) >= (uint64_t)src->f_length) XS_FAIL("index out of bounds", s);
+    if ((uint64_t)(hi - 1) >= (uint64_t)XS_V16_LEN(ndst)) XS_FAIL(XS_V16_OOB(ndst), s);
     xs_u8x16 m = xs_v16_range(lo, hi);
     return (dst & ~m) | (xs_v16_load(src->data, src->f_length) & m);
 }
 static inline void xs_v16_copy_out(xs_Uint8Array *dst, xs_u8x16 src, int64_t lo, int64_t hi, int64_t nsrc, const xs_site *s) {
     if (lo >= hi) return;
-    if (lo < 0 || (uint64_t)(hi - 1) >= (uint64_t)nsrc || (uint64_t)(hi - 1) >= (uint64_t)dst->f_length) XS_FAIL("index out of bounds", s);
+    if (lo < 0 || (uint64_t)(hi - 1) >= (uint64_t)XS_V16_LEN(nsrc)) XS_FAIL(XS_V16_OOB(nsrc), s);
+    if ((uint64_t)(hi - 1) >= (uint64_t)dst->f_length) XS_FAIL("index out of bounds", s);
     memcpy(dst->data + lo, (const uint8_t *)&src + lo, (size_t)(hi - lo));
 }
 
@@ -4607,20 +4619,20 @@ static inline void xs_u8_shl(xs_Uint8Array *a, int64_t lo, int64_t hi, const xs_
 }
 static inline xs_u8x16 xs_v16_shl(xs_u8x16 v, int64_t lo, int64_t hi, int64_t n, const xs_site *s) {
     if (lo > hi) return v;
-    if (lo < 0 || (uint64_t)(hi + 1) >= (uint64_t)n) XS_FAIL("index out of bounds", s);
+    if (lo < 0 || (uint64_t)(hi + 1) >= (uint64_t)XS_V16_LEN(n)) XS_FAIL(XS_V16_OOB(n), s);
     return xs_u8x16_shuffle(v, xs_shl_mask[lo][hi]);
 }
 /* the shift followed by `a[hi + 1] = x` where x is known to hold a[lo] (emit.c u8_rot_ok): a rotation of
    a[lo..hi + 1] to the left, one shuffle (the Rust fannkuch-redux's advance_array) */
 static inline xs_u8x16 xs_v16_rot(xs_u8x16 v, int64_t lo, int64_t hi, int64_t x, int64_t n, const xs_site *s) {
-    if (lo > hi) { if ((uint64_t)(hi + 1) >= (uint64_t)n) XS_FAIL("index out of bounds", s); return xs_v16_set_nc(v, hi + 1, x); } /* (the loop ran nothing) */
-    if (lo < 0 || (uint64_t)(hi + 1) >= (uint64_t)n) XS_FAIL("index out of bounds", s);
+    if (lo > hi) { if ((uint64_t)(hi + 1) >= (uint64_t)XS_V16_LEN(n)) XS_FAIL(XS_V16_OOB(n), s); return xs_v16_set_nc(v, hi + 1, x); } /* (the loop ran nothing) */
+    if (lo < 0 || (uint64_t)(hi + 1) >= (uint64_t)XS_V16_LEN(n)) XS_FAIL(XS_V16_OOB(n), s);
     return xs_u8x16_shuffle(v, xs_rot_mask[lo][hi + 1]);
 }
 /* the shift followed by `a[hi + 1] = b` (fannkuch-redux's next permutation): the shuffle, then the lane */
 static inline xs_u8x16 xs_v16_shl_put(xs_u8x16 v, int64_t lo, int64_t hi, int64_t b, int64_t n, const xs_site *s) {
-    if (lo > hi) { if ((uint64_t)(hi + 1) >= (uint64_t)n) XS_FAIL("index out of bounds", s); return xs_v16_set_nc(v, hi + 1, b); }
-    if (lo < 0 || (uint64_t)(hi + 1) >= (uint64_t)n) XS_FAIL("index out of bounds", s);
+    if (lo > hi) { if ((uint64_t)(hi + 1) >= (uint64_t)XS_V16_LEN(n)) XS_FAIL(XS_V16_OOB(n), s); return xs_v16_set_nc(v, hi + 1, b); }
+    if (lo < 0 || (uint64_t)(hi + 1) >= (uint64_t)XS_V16_LEN(n)) XS_FAIL(XS_V16_OOB(n), s);
     return xs_v16_set_nc(xs_u8x16_shuffle(v, xs_shl_mask[lo][hi]), hi + 1, b);
 }
 static inline int64_t xs_u8_set(xs_Uint8Array *b, int64_t i, int64_t v, const xs_site *s) { *xs_u8_ptr(b, i, s) = (xs_byte)v; return v; }
