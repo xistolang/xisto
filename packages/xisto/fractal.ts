@@ -144,8 +144,8 @@ function near(cr: number, ci: number): boolean {
   return cr * cr + ci * ci < 3.99;
 }
 
-// eight points, |c| < 2 and radius ≥ 2 checked: the first step gives z = c exactly, then four steps at a time with
-// the escape tested between them (only when the byte before was all out: inside the set nothing escapes, and the
+// eight points, |c| < 2 and radius ≥ 2 checked: the first step gives z = c exactly, then the steps with
+// the escape tested every fourth one (only when the byte before was all out: inside the set nothing escapes, and the
 // test would only cost); all eight out at a test: they stay out, the byte is 0
 function byte8(r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number, r7: number,
                ci: number, iterations: int, lim: number, prev: int): int {
@@ -154,28 +154,11 @@ function byte8(r0: number, r1: number, r2: number, r3: number, r4: number, r5: n
   let tr0 = r0 * r0, tr1 = r1 * r1, tr2 = r2 * r2, tr3 = r3 * r3, tr4 = r4 * r4, tr5 = r5 * r5, tr6 = r6 * r6, tr7 = r7 * r7;
   const cc = ci * ci;
   let ti0 = cc, ti1 = cc, ti2 = cc, ti3 = cc, ti4 = cc, ti5 = cc, ti6 = cc, ti7 = cc;
-  let left = iterations - 1;
-  while (left >= 4) {
-    for (let k = 0; k < 4; k++) {
-      zi0 = 2 * zr0 * zi0 + ci; zr0 = tr0 - ti0 + r0; tr0 = zr0 * zr0; ti0 = zi0 * zi0;
-      zi1 = 2 * zr1 * zi1 + ci; zr1 = tr1 - ti1 + r1; tr1 = zr1 * zr1; ti1 = zi1 * zi1;
-      zi2 = 2 * zr2 * zi2 + ci; zr2 = tr2 - ti2 + r2; tr2 = zr2 * zr2; ti2 = zi2 * zi2;
-      zi3 = 2 * zr3 * zi3 + ci; zr3 = tr3 - ti3 + r3; tr3 = zr3 * zr3; ti3 = zi3 * zi3;
-      zi4 = 2 * zr4 * zi4 + ci; zr4 = tr4 - ti4 + r4; tr4 = zr4 * zr4; ti4 = zi4 * zi4;
-      zi5 = 2 * zr5 * zi5 + ci; zr5 = tr5 - ti5 + r5; tr5 = zr5 * zr5; ti5 = zi5 * zi5;
-      zi6 = 2 * zr6 * zi6 + ci; zr6 = tr6 - ti6 + r6; tr6 = zr6 * zr6; ti6 = zi6 * zi6;
-      zi7 = 2 * zr7 * zi7 + ci; zr7 = tr7 - ti7 + r7; tr7 = zr7 * zr7; ti7 = zi7 * zi7;
-    }
-    left -= 4;
-    if (prev === 0) {
-      const m0 = tr0 + ti0, m1 = tr1 + ti1, m2 = tr2 + ti2, m3 = tr3 + ti3;
-      const m4 = tr4 + ti4, m5 = tr5 + ti5, m6 = tr6 + ti6, m7 = tr7 + ti7;
-      const lo = (!(m0 <= lim) && !(m1 <= lim)) && (!(m2 <= lim) && !(m3 <= lim));
-      const hi = (!(m4 <= lim) && !(m5 <= lim)) && (!(m6 <= lim) && !(m7 <= lim));
-      if (lo && hi) return 0;
-    }
-  }
-  while (left > 0) {
+  // one loop with the test every fourth step, not blocks of four and a remainder loop: with a step count known
+  // only at run time, the remainder loop made the C compiler pack the lanes differently across the two loops
+  // (blends and spills; Xeon 5,69 -> 3,95 u), and the test lands on the same steps (5, 9, 13...)
+  const steps = iterations - 1;
+  for (let i = 1; i <= steps; i++) {
     zi0 = 2 * zr0 * zi0 + ci; zr0 = tr0 - ti0 + r0; tr0 = zr0 * zr0; ti0 = zi0 * zi0;
     zi1 = 2 * zr1 * zi1 + ci; zr1 = tr1 - ti1 + r1; tr1 = zr1 * zr1; ti1 = zi1 * zi1;
     zi2 = 2 * zr2 * zi2 + ci; zr2 = tr2 - ti2 + r2; tr2 = zr2 * zr2; ti2 = zi2 * zi2;
@@ -184,7 +167,13 @@ function byte8(r0: number, r1: number, r2: number, r3: number, r4: number, r5: n
     zi5 = 2 * zr5 * zi5 + ci; zr5 = tr5 - ti5 + r5; tr5 = zr5 * zr5; ti5 = zi5 * zi5;
     zi6 = 2 * zr6 * zi6 + ci; zr6 = tr6 - ti6 + r6; tr6 = zr6 * zr6; ti6 = zi6 * zi6;
     zi7 = 2 * zr7 * zi7 + ci; zr7 = tr7 - ti7 + r7; tr7 = zr7 * zr7; ti7 = zi7 * zi7;
-    left--;
+    if ((i & 3) === 0 && prev === 0) {
+      const m0 = tr0 + ti0, m1 = tr1 + ti1, m2 = tr2 + ti2, m3 = tr3 + ti3;
+      const m4 = tr4 + ti4, m5 = tr5 + ti5, m6 = tr6 + ti6, m7 = tr7 + ti7;
+      const lo = (!(m0 <= lim) && !(m1 <= lim)) && (!(m2 <= lim) && !(m3 <= lim));
+      const hi = (!(m4 <= lim) && !(m5 <= lim)) && (!(m6 <= lim) && !(m7 <= lim));
+      if (lo && hi) return 0;
+    }
   }
   let b = 0;
   if (tr0 + ti0 <= lim) b |= 128;
