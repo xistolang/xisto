@@ -6,7 +6,7 @@ cd "$(dirname "$0")/../.."
 X=build/xisto; D=tests/tlsgate; O=${TMPDIR:-/tmp}/xisto-tlsgate.$$; mkdir -p $O
 fail=0
 check() { # file flags expected-tls-line
-    got=$($X build --time $2 -o $O/out $D/$1.ts 2>&1 | grep -E "^xisto: tls|error:" | head -1 | sed 's/^.*error: /error: /')
+    got=$($X build --time $2 -o $O/out $D/$1.ts 2>&1 | grep -E "^xisto: tls|error(\[XS[0-9]+\])?:" | head -1 | sed -E 's/^.*error(\[XS[0-9]+\])?: /error: /')  # (the code, error[XS7059], is not part of the check)
     case "$got" in "$3"*) echo "ok   $1 ${2:-default}: $got";; *) echo "FAIL $1 ${2:-default}: got '$got', want '$3'"; fail=1;; esac
 }
 check http_literal  ""          "xisto: tls not linked"

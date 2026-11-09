@@ -124,6 +124,8 @@ static void usage(void) {
             "  xisto dap                                                debug adapter for IDEs (DAP over stdin/stdout)\n"
             "  xisto clean [DIR]                                        remove the build cache (.xisto/cache) of a project\n"
             "  xisto fmt [--check] FILE.ts...                           format in place (--check: exit 1 if any file would change)\n"
+            "  xisto check [--details] [PATH...]                        what a project needs to change to compile with xisto\n"
+            "                                                           (PATH: a folder, a tsconfig.json or .ts files; --details: every place)\n"
             "  xisto test [DIR]                                         build and run every *.test.ts under DIR\n"
             "  xisto add SOURCE[@REF] [--name NAME]                     add a package from a git URL or path (source, locked by commit)\n"
             "  xisto install                                            fetch every package at the commit in xisto.lock\n"
@@ -1030,6 +1032,30 @@ bool xs_build_debug(const char *file, const char *exe) {
     return access(exe, X_OK) == 0;
 }
 
+/* xisto check's child: one entry file in collect mode. Prints the modules it loaded (so the parent does not check
+   them again), every error as a JSON line on the same stream, and "quiet N" (follow-on errors hidden) at the end. */
+static void check1_done(void) {
+    printf("quiet\t%d\n", xs_quiet_count);
+    fflush(stdout);
+}
+
+static int cmd_check1(const char *file, const char *argv0) {
+    find_xisto_dir(argv0);
+    xs_check_mode = true;
+    xs_json_errors = true;
+    xs_warnings = false;
+    dup2(1, 2); /* one stream, in order */
+    atexit(check1_done);
+    Program *p = parse_program(file);
+    for (int i = 0; i < p->nmodules; i++)
+        if (!p->modules[i]->builtin) printf("module\t%s\n", p->modules[i]->path);
+    fflush(stdout);
+    check_program(p);
+    return 0;
+}
+
+int cmd_check(int argc, char **argv);
+
 int main(int argc, char **argv) {
 #if defined(_WIN32)
     if (argc >= 2 && (!strcmp(argv[1], "debug") || !strcmp(argv[1], "dap"))) {
@@ -1041,6 +1067,8 @@ int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "install") == 0) return cmd_install();
     if (argc >= 2 && strcmp(argv[1], "clean") == 0) return clean_cache(argc >= 3 ? argv[2] : ".");
     if (argc >= 2 && strcmp(argv[1], "fmt") == 0) return cmd_fmt(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "check") == 0) return cmd_check(argc, argv);
+    if (argc >= 3 && strcmp(argv[1], "__check1") == 0) return cmd_check1(argv[2], argv[0]);
     if (argc >= 2 && strcmp(argv[1], "test") == 0) { find_xisto_dir(argv[0]); return cmd_test(argc, argv); }
     if (argc >= 2 && strcmp(argv[1], "debug") == 0) { find_xisto_dir(argv[0]); return cmd_debug(argc, argv); }
     if (argc >= 2 && strcmp(argv[1], "dap") == 0) { find_xisto_dir(argv[0]); return cmd_debug(argc, argv); }

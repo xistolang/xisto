@@ -193,7 +193,7 @@ static void skip_space_and_comments(Lexer *lx) {
             advance(lx);
             advance(lx);
             while (peek(lx, 0) && !(peek(lx, 0) == '*' && peek(lx, 1) == '/')) advance(lx);
-            if (!peek(lx, 0)) xs_error(start, NULL, "unterminated block comment");
+            if (!peek(lx, 0)) xs_error(XS1033, start, NULL, "unterminated block comment");
             advance(lx);
             advance(lx);
         } else {
@@ -274,7 +274,7 @@ Token lexer_next(Lexer *lx) {
             if (peek(lx, 0) == 'e' || peek(lx, 0) == 'E') {
                 advance(lx);
                 if (peek(lx, 0) == '+' || peek(lx, 0) == '-') advance(lx);
-                if (!isdigit((unsigned char)peek(lx, 0))) xs_error(pos, NULL, "malformed number literal");
+                if (!isdigit((unsigned char)peek(lx, 0))) xs_error(XS1026, pos, NULL, "malformed number literal");
                 while (isdigit((unsigned char)peek(lx, 0))) advance(lx);
             }
         }
@@ -282,8 +282,8 @@ Token lexer_next(Lexer *lx) {
             Token t = make(lx, TK_NUMBER, pos, start);
             bool radix = t.len > 1 && t.start[0] == '0' && strchr("xXoObB", t.start[1]);
             for (int i = 0; i < t.len && !radix; i++)
-                if (t.start[i] == '.' || t.start[i] == 'e' || t.start[i] == 'E') xs_error(pos, NULL, "a BigInt literal is an integer: no '.' or exponent");
-            if (!radix && t.len > 1 && t.start[0] == '0') xs_error(pos, NULL, "a BigInt literal has no leading zero");
+                if (t.start[i] == '.' || t.start[i] == 'e' || t.start[i] == 'E') xs_error(XS1005, pos, NULL, "a BigInt literal is an integer: no '.' or exponent");
+            if (!radix && t.len > 1 && t.start[0] == '0') xs_error(XS1004, pos, NULL, "a BigInt literal has no leading zero");
             char *clean = xs_alloc((size_t)t.len + 1);
             int n = 0;
             for (int i = 0; i < t.len; i++)
@@ -306,7 +306,7 @@ Token lexer_next(Lexer *lx) {
             int base = clean[1] == 'b' || clean[1] == 'B' ? 2 : 8;
             char *end;
             unsigned long long v = strtoull(clean + 2, &end, base);
-            if (*end || end == clean + 2) xs_error(pos, NULL, "malformed %s literal", base == 2 ? "binary" : "octal");
+            if (*end || end == clean + 2) xs_error(XS1023, pos, NULL, "malformed %s literal", base == 2 ? "binary" : "octal");
             t.num = (double)v;
             if (v <= 9007199254740991ULL) { t.ival = (long long)v; t.is_int_lit = true; } /* an int is a safe integer of JS (XB-075) */
             return t;
@@ -328,7 +328,7 @@ Token lexer_next(Lexer *lx) {
         int depth = 0;
         for (;;) {
             char d = peek(lx, 0);
-            if (!d) xs_error(pos, NULL, "unterminated template literal");
+            if (!d) xs_error(XS1036, pos, NULL, "unterminated template literal");
             if (d == '`' && depth == 0) break;
             if (d == '\\') { advance(lx); if (peek(lx, 0)) advance(lx); continue; }
             if (d == '$' && peek(lx, 1) == '{') { advance(lx); advance(lx); depth++; continue; }
@@ -352,7 +352,7 @@ Token lexer_next(Lexer *lx) {
         Buf b = {0};
         for (;;) {
             char d = peek(lx, 0);
-            if (!d || d == '\n') xs_error(pos, NULL, "unterminated string literal");
+            if (!d || d == '\n') xs_error(XS1035, pos, NULL, "unterminated string literal");
             if (d == quote) {
                 advance(lx);
                 break;
@@ -362,7 +362,7 @@ Token lexer_next(Lexer *lx) {
                 advance(lx);
                 const char *bad = NULL;
                 int n = xs_unescape(lx->src + lx->pos, &b, &bad);
-                if (!n) xs_error(p, bad, "malformed escape sequence in string literal");
+                if (!n) xs_error(XS1024, p, bad, "malformed escape sequence in string literal");
                 while (n--) advance(lx);
             } else {
                 buf_putc(&b, advance(lx));
@@ -390,7 +390,7 @@ Token lexer_next(Lexer *lx) {
         return make(lx, TK_DOT, pos, start);
     case '@': return make(lx, TK_AT, pos, start); /* decorators */
     case '?':
-        if (n1 == '?' || n1 == '.') xs_error(pos, "there is no undefined or null in xisto, so '\?\?' and '?.' do not exist", "'?%c' is not supported", n1);
+        if (n1 == '?' || n1 == '.') xs_error(XS1003, pos, "there is no undefined or null in xisto, so '\?\?' and '?.' do not exist", "'?%c' is not supported", n1);
         return make(lx, TK_QUESTION, pos, start);
     case '+':
         if (n1 == '+') { advance(lx); return make(lx, TK_PLUSPLUS, pos, start); }
@@ -410,12 +410,12 @@ Token lexer_next(Lexer *lx) {
     case '%': return make(lx, TK_PERCENT, pos, start);
     case '=':
         if (n1 == '=' && n2 == '=') { advance(lx); advance(lx); return make(lx, TK_EQ, pos, start); }
-        if (n1 == '=') xs_error(pos, "xisto has no type coercion, so '==' and '===' would mean the same thing; use '==='", "'==' is not supported");
+        if (n1 == '=') xs_error(XS1002, pos, "xisto has no type coercion, so '==' and '===' would mean the same thing; use '==='", "'==' is not supported");
         if (n1 == '>') { advance(lx); return make(lx, TK_ARROW, pos, start); }
         return make(lx, TK_ASSIGN, pos, start);
     case '!':
         if (n1 == '=' && n2 == '=') { advance(lx); advance(lx); return make(lx, TK_NEQ, pos, start); }
-        if (n1 == '=') xs_error(pos, "use '!=='", "'!=' is not supported");
+        if (n1 == '=') xs_error(XS1001, pos, "use '!=='", "'!=' is not supported");
         return make(lx, TK_NOT, pos, start);
     case '<':
         if (n1 == '=') { advance(lx); return make(lx, TK_LE, pos, start); }
@@ -438,6 +438,6 @@ Token lexer_next(Lexer *lx) {
         return make(lx, TK_CARET, pos, start);
     case '~': return make(lx, TK_TILDE, pos, start);
     }
-    xs_error(pos, NULL, "unexpected character '%c'", c);
+    xs_error(XS1029, pos, NULL, "unexpected character '%c'", c);
     return make(lx, TK_EOF, pos, start);
 }
