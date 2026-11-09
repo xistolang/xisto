@@ -178,12 +178,10 @@ const MAP_PIECES: int = 2; // pieces of a length counted in a Map (each piece's 
 
 // which bytes occur in bytes[lo, hi): 1 at the byte's index; any byte from 128 up sets index 128
 function bytesIn(bytes: Uint8Array, lo: int, hi: int): int[] {
+  const marks = new Uint8Array(256); // (indexed by the byte itself: no test per byte)
+  for (let i = lo; i < hi; i++) marks[bytes[i]] = 1;
   const seen: int[] = new Array<int>(129).fill(0);
-  for (let i = lo; i < hi; i++) {
-    const b = bytes[i];
-    if (b >= 128) seen[128] = 1;
-    else seen[b] = 1;
-  }
+  for (let b = 0; b < 256; b++) if (marks[b] === 1) seen[b < 128 ? b : 128] = 1;
   return seen;
 }
 

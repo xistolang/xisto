@@ -4886,6 +4886,8 @@ typedef struct {
     const uint8_t *src, *map; /* phase 2: d[i] = map[src[i]] over [start, end) in ntask pieces */
     int64_t start, end, m, half, blk, nblk, ntask;
     int64_t *pre; /* bytes that are not keep before block b (nblk + 1 entries) */
+    int64_t fw; /* > 0: every line has fw bytes, then keep (the last one fw or fewer), proved by the count: positions by arithmetic */
+    atomic_int fw_bad; /* phase 0: a block whose keeps are not where fw puts them */
     int phase;
     atomic_int_fast64_t next;
 } xs_rap_job;
@@ -4923,6 +4925,7 @@ static int64_t xs_rap_count(const uint8_t *p, int64_t n, int keep) {
 /* the position of the byte of rank r (0-based, among those that are not keep) */
 static int64_t xs_rap_pos(const xs_rap_job *j, int64_t r) {
     if (j->keep < 0) return j->start + r;
+    if (j->fw > 0) return j->start + r + r / j->fw; /* (fw bytes, then a keep) */
     int64_t lo = 0, hi = j->nblk - 1; /* the last block b with pre[b] <= r */
     while (lo < hi) { int64_t mid = (lo + hi + 1) >> 1; if (j->pre[mid] <= r) lo = mid; else hi = mid - 1; }
     int64_t need = r - j->pre[lo];
@@ -4953,6 +4956,7 @@ static void xs_rap_trade(const xs_rap_job *j, int64_t a, int64_t b, int64_t run,
 }
 static int64_t xs_rap_next_keep(const xs_rap_job *j, int64_t i) {
     if (j->keep < 0) return j->end;
+    if (j->fw > 0) { int64_t q = j->start + (i - j->start) / (j->fw + 1) * (j->fw + 1) + j->fw; return q < j->end ? q : j->end; }
     const uint8_t *d = j->d;
     int64_t x = i;
 #if defined(__SSSE3__) || defined(__ARM_NEON)
@@ -4981,6 +4985,10 @@ static int64_t xs_rap_next_keep(const xs_rap_job *j, int64_t i) {
 }
 static int64_t xs_rap_prev_keep(const xs_rap_job *j, int64_t k) { /* the position after the keep before k (or start) */
     if (j->keep < 0) return j->start;
+    if (j->fw > 0) {
+        int64_t o = (k - j->start) % (j->fw + 1);
+        return o == j->fw ? k + 1 : k - o; /* (k a keep itself: the position after it, as the scan) */
+    }
     const uint8_t *d = j->d;
     int64_t x = k;
 #if defined(__SSSE3__) || defined(__ARM_NEON)
@@ -5004,7 +5012,15 @@ static int64_t xs_rap_prev_keep(const xs_rap_job *j, int64_t k) { /* the positio
 static void xs_rap_task(xs_rap_job *j, int64_t t) {
     if (j->phase == 0) { /* count block t */
         int64_t s = j->start + t * j->blk, e = s + j->blk < j->end ? s + j->blk : j->end;
-        j->pre[t + 1] = xs_rap_count(j->d + s, e - s, j->keep);
+        int64_t c = xs_rap_count(j->d + s, e - s, j->keep);
+        j->pre[t + 1] = c;
+        if (j->fw > 0 && !atomic_load(&j->fw_bad)) { /* the keeps the fixed width puts in [s, e): as many as counted, each where it says */
+            int64_t w1 = j->fw + 1, a = s - j->start - j->fw, b = e - j->start - j->fw; /* keep k at start + fw + k * w1 */
+            int64_t k0 = a <= 0 ? 0 : (a + w1 - 1) / w1, k1 = b <= 0 ? 0 : (b + w1 - 1) / w1; /* the k with s <= p_k < e */
+            bool ok = (e - s) - c == k1 - k0;
+            for (int64_t k = k0; ok && k < k1; k++) ok = j->d[j->start + j->fw + k * w1] == (uint8_t)j->keep;
+            if (!ok) atomic_store(&j->fw_bad, 1);
+        }
         return;
     }
     int64_t r0 = j->half * t / j->ntask, r1 = j->half * (t + 1) / j->ntask, left = r1 - r0;
@@ -5173,6 +5189,12 @@ XS_NOINLINE bool xs_u8_rev_par(xs_Uint8Array *buf, xs_Uint8Array *table, int64_t
     j.d = buf->data; j.c = xs_u8_tr_setup(table); j.keep = (int)keep; j.start = start; j.end = end;
     int threads = xs_rap_nthreads + 1;
     if (keep >= 0) {
+        static int fixed_off = -1; /* lines of one width (the first line's), checked by the count: no scan for the keeps */
+        if (fixed_off < 0) fixed_off = getenv("XISTO_NO_REV_FIXED") != NULL;
+        if (!fixed_off) {
+            const uint8_t *f = xs_memchr(j.d + start, (int)keep, (size_t)n);
+            j.fw = f && f - (j.d + start) >= 1 ? f - (j.d + start) : 0;
+        }
         j.blk = (int64_t)1 << 18;
         j.nblk = (n + j.blk - 1) / j.blk;
         j.pre = malloc(sizeof(int64_t) * (size_t)(j.nblk + 1));
@@ -5181,6 +5203,7 @@ XS_NOINLINE bool xs_u8_rev_par(xs_Uint8Array *buf, xs_Uint8Array *table, int64_t
         xs_rap_run(&j, 0);
         for (int64_t b = 0; b < j.nblk; b++) j.pre[b + 1] += j.pre[b];
         j.m = j.pre[j.nblk];
+        if (atomic_load(&j.fw_bad)) j.fw = 0;
     } else j.m = n;
     j.half = j.m >> 1;
     j.ntask = (int64_t)threads * 8;
