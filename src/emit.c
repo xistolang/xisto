@@ -5017,6 +5017,50 @@ static bool match_u8_idiom(Stmt *s, U8Idiom *m) {
     m->kind = 2; m->a = a; m->src = NULL; m->hi = S;
     return true;
 }
+/* the reversal written with while (fannkuch's first program, byte arrays):
+     while (2 * i < S) { const t = a[i]; a[i] = a[S - i]; a[S - i] = t; i += 1; }   (also i * 2, i++, i = i + 1)
+   swaps i and S - i from the current i up: the same as reversing a[i..S - i], after which i is the first value
+   with 2 * i >= S, (S + 1) >> 1. One xs_u8_rev, bounds checked once (an index out of range still throws, before
+   any swap instead of after some: the program stops either way). a, S pure and not written; i an int local. */
+static bool emit_u8_while_rev(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
+    Expr *c = s->cond;
+    if (!c || c->kind != E_BINARY || c->op != TK_LT || !bce_pure(c->rhs)) return false;
+    Expr *two = c->lhs, *iv = NULL;
+    if (!two || two->kind != E_BINARY || two->op != TK_STAR) return false;
+    if (two->lhs && two->lhs->kind == E_NUMBER && two->lhs->num == 2) iv = two->rhs;
+    else if (two->rhs && two->rhs->kind == E_NUMBER && two->rhs->num == 2) iv = two->lhs;
+    if (!iv || iv->kind != E_IDENT || !iv->cname || !iv->type || iv->type->kind != TY_INT) return false;
+    const char *i = iv->cname;
+    Stmt *b = s->body;
+    if (!b || b->kind != S_BLOCK || b->stmts.len != 4) return false;
+    Expr *S = c->rhs;
+    if (writes_name(S, i)) return false;
+    Stmt *t = b->stmts.items[0];
+    if (t->kind != S_VAR || !t->is_const || !t->cname || t->cell || !t->init) return false;
+    Expr *a1 = b->stmts.items[1]->kind == S_EXPR ? b->stmts.items[1]->expr : NULL, *a2 = b->stmts.items[2]->kind == S_EXPR ? b->stmts.items[2]->expr : NULL;
+    Expr *inc = b->stmts.items[3]->kind == S_EXPR ? b->stmts.items[3]->expr : NULL;
+    if (!a1 || !a2 || !inc || a1->kind != E_ASSIGN || a2->kind != E_ASSIGN || a1->op != TK_ASSIGN || a2->op != TK_ASSIGN) return false;
+    bool incok = (inc->kind == E_POSTFIX && inc->op == TK_PLUSPLUS && same_simple(inc->lhs, iv)) ||
+                 (inc->kind == E_ASSIGN && inc->op == TK_PLUS_ASSIGN && same_simple(inc->lhs, iv) && inc->rhs && inc->rhs->kind == E_NUMBER && inc->rhs->num == 1) ||
+                 (inc->kind == E_ASSIGN && inc->op == TK_ASSIGN && same_simple(inc->lhs, iv) && inc->rhs && inc->rhs->kind == E_BINARY && inc->rhs->op == TK_PLUS &&
+                  same_simple(inc->rhs->lhs, iv) && inc->rhs->rhs && inc->rhs->rhs->kind == E_NUMBER && inc->rhs->rhs->num == 1);
+    if (!incok) return false;
+    Expr *ta = t->init;
+    if (!ta || ta->kind != E_INDEX || !ta->builtin.cfn || strcmp(ta->builtin.cfn, "xs_u8_get") != 0 || !u8_name(ta->lhs) || !same_simple(ta->rhs, iv)) return false;
+    Expr *a = ta->lhs;
+    if (u8reg_find(a)) return false;
+    if (!u8_index_of(a1->lhs, a, iv) || !a1->rhs || a1->rhs->kind != E_INDEX || !same_simple(a1->rhs->lhs, a) || !is_sub_of(a1->rhs->rhs, S, i)) return false;
+    if (!a2->lhs || a2->lhs->kind != E_INDEX || !same_simple(a2->lhs->lhs, a) || !is_sub_of(a2->lhs->rhs, S, i)) return false;
+    if (!a2->rhs || a2->rhs->kind != E_IDENT || !a2->rhs->cname || strcmp(a2->rhs->cname, t->cname) != 0) return false;
+    if (S->kind == E_IDENT && stmt_writes_name(b, S->cname)) return false;
+    if (stmt_writes_name(b, a->cname)) return false;
+    int site = new_site(s->pos);
+    buf_puts(out, "if (INT64_C(2) * ("); emit_expr(iv); buf_puts(out, ") < ("); emit_expr(S); buf_puts(out, ")) { xs_u8_rev(");
+    emit_borrowed(a); buf_puts(out, ", "); emit_expr(iv); buf_puts(out, ", ("); emit_expr(S); buf_puts(out, ") - ("); emit_expr(iv);
+    buf_printf(out, "), XS_S(%d)); ", site); emit_expr(iv); buf_puts(out, " = (("); emit_expr(S); buf_puts(out, ") + 1) >> 1; }");
+    return true;
+}
 /* the loops `for (j = lo; j < hi; j++) dst[j] = src[j]`, the swap loop of a reversal, and `a[j] = a[j + 1]`
    on byte arrays become one runtime call each (xs_u8_copy_range, xs_u8_rev, xs_u8_shl), or one shuffle when
    the array is in a register. XISTO_NO_U8_IDIOM=1 keeps the loops. */
@@ -5226,6 +5270,7 @@ static void emit_stmt_(Stmt *s) {
         return;
     }
     case S_WHILE: {
+        if (emit_u8_while_rev(s)) { drain_if_needed(); return; }
         /* a condition that makes temporaries is drained on every iteration, not after the loop */
         bool cond_ar;
         char *cond = emit_expr_to_str(s->cond, &cond_ar);
@@ -5892,11 +5937,15 @@ static void emit_gen(Func *f) {
    nodes are visited in the same order (A's subtree whole, then B). Not for number (reassociation would change
    the rounding). The LLVM does this itself for the Rust item_check; the checked add (jo) stops it here.
    binarytrees: 2 calls + 2 returns per node become 1 + 1 (M4 serial 2,47 -> 1,72 s user). XISTO_NO_SPINE=1 disables. */
+static bool spine_int_lit(Expr *e) { /* a literal that is a whole number >= 0 (written 1 or 1.0) */
+    return e && e->kind == E_NUMBER && e->num >= 0 && e->num <= 1e9 && e->num == (double)(int64_t)e->num;
+}
 static bool spine_leaves(Expr *e, Func *f, Expr **calls, int *ncalls, int64_t *c) {
     if (!e) return false;
-    if (e->kind == E_BINARY && e->op == TK_PLUS && e->type && e->type->kind == TY_INT && !e->builtin.cfn)
+    TypeKind want = f->ret->kind; /* int, or number (spine_fn: the whole-number proof) */
+    if (e->kind == E_BINARY && e->op == TK_PLUS && e->type && e->type->kind == want && !e->builtin.cfn)
         return spine_leaves(e->lhs, f, calls, ncalls, c) && spine_leaves(e->rhs, f, calls, ncalls, c);
-    if (e->kind == E_NUMBER && e->is_int_lit && e->num >= 0 && e->num <= 1e9) { *c += (int64_t)e->num; return true; }
+    if (spine_int_lit(e) && (e->is_int_lit || want == TY_NUMBER)) { *c += (int64_t)e->num; return true; }
     if (e->kind == E_CALL && e->func == f && !e->builtin.cfn && e->args.len == 1) {
         if (*ncalls >= 2) return false;
         calls[(*ncalls)++] = e;
@@ -5919,10 +5968,14 @@ static bool spine_pure(Expr *e) { /* the base test: reads of the parameter and i
     default: return false;
     }
 }
-typedef struct { int ndecls; Stmt *decls[8]; Stmt *base; Stmt *ret; Expr *calls[2]; int64_t c; int64_t k; } Spine;
+typedef struct { int ndecls; Stmt *decls[8]; Stmt *base; Stmt *ret; Expr *calls[2]; int64_t c; int64_t k; bool num; } Spine;
+static bool spine_suppress; /* emitting the plain body of a number spine function (its exact fallback) */
 static bool spine_fn(Func *f, Spine *sp) {
     if (xs_debug || xs_profile || getenv("XISTO_NO_SPINE")) return false;
-    if (!f->body || f->is_async || f->is_gen || f->cls || f->nparams != 1 || !f->ret || f->ret->kind != TY_INT) return false;
+    if (spine_suppress) return false;
+    if (!f->body || f->is_async || f->is_gen || f->cls || f->nparams != 1 || !f->ret) return false;
+    if (f->ret->kind != TY_INT && (f->ret->kind != TY_NUMBER || getenv("XISTO_NO_SPINE_NUM"))) return false;
+    sp->num = f->ret->kind == TY_NUMBER;
     Type *pt = f->params[0].type;
     if (!pt || pt->kind != TY_OBJECT || !pt->cls || pt->cls->builtin || f->params[0].cell) return false;
     Stmt *b = f->body;
@@ -5939,7 +5992,7 @@ static bool spine_fn(Func *f, Spine *sp) {
     Stmt *s_if = b->stmts.items[i], *s_ret = b->stmts.items[i + 1];
     if (s_if->kind != S_IF || s_if->else_body || !spine_pure(s_if->cond)) return false;
     Stmt *base = spine_single(s_if->body);
-    if (!base || base->kind != S_RETURN || !base->expr || base->expr->kind != E_NUMBER || !base->expr->is_int_lit || base->expr->num < 0) return false;
+    if (!base || base->kind != S_RETURN || !base->expr || !spine_int_lit(base->expr) || (!sp->num && !base->expr->is_int_lit)) return false;
     if (s_ret->kind != S_RETURN || !s_ret->expr) return false;
     int n = 0;
     sp->c = 0;
@@ -6011,13 +6064,71 @@ static void emit_spine(Func *f, Spine *sp) {
     out = saved_out;
     indent = saved_indent;
 }
+/* the number spine (spine_fn with a number result): `if (base) return K; return c + f(A) + f(B)` with K, c whole
+   numbers >= 0. Proof that the loop gives Node's double bit for bit: every term is a whole number >= 0, so every
+   partial sum of the nested form is a whole number between 0 and the total; when the total is below 2^53 each of
+   those sums is exact in a double, and exact sums do not depend on the order. So NAME_sp sums in int64 and gives
+   up (-1) as soon as a partial sum would pass 2^53 - 1; then NAME computes the nested form in double as written
+   (NAME_dbl, the plain body: the function only reads fields and calls itself, so computing again is safe).
+   binarytrees.ts (itemCheck: number), M4: the simple program gets the loop of the int one. XISTO_NO_SPINE_NUM=1. */
+static void emit_spine_num(Func *f, Spine *sp) {
+    char *cname = f->cname, *inner = xs_sprintf("%s_sp", cname), *dbl = xs_sprintf("%s_dbl", cname);
+    const char *pn = f->params[0].cname;
+    buf_printf(out, " { int64_t r_ = %s(%s); if (__builtin_expect(r_ >= 0, 1)) return (double)r_; return %s(%s); }\n", inner, pn, dbl, pn);
+    Buf *saved_out = out;
+    int saved_indent = indent;
+    Buf b = {0};
+    out = &b;
+    indent = 0;
+    buf_printf(out, "\nXS_FN int64_t %s(", inner);
+    emit_decl(f->params[0].type, pn);
+    buf_puts(out, ") { /* the number spine in int64 (see emit_spine_num): -1 once a partial sum leaves 2^53 - 1 */");
+    indent++;
+    nl(); buf_puts(out, "size_t ar_mark = xs_ar_mark();"); nl(); buf_puts(out, "(void)ar_mark;");
+    nl(); buf_puts(out, "const int64_t safe_ = (INT64_C(1) << 53) - 1;");
+    nl(); buf_puts(out, "int64_t acc_ = INT64_C(0);");
+    nl(); buf_puts(out, "for (;;) {");
+    indent++;
+    epush(true);
+    for (int i = 0; i < sp->ndecls; i++) { nl(); emit_var(sp->decls[i]); }
+    nl(); buf_puts(out, "if (");
+    emit_expr(sp->base->cond);
+    buf_printf(out, ") return acc_ > safe_ - INT64_C(%lld) ? -1 : acc_ + INT64_C(%lld);", (long long)sp->k, (long long)sp->k);
+    nl(); buf_puts(out, "int64_t t_ = ");
+    f->cname = inner;
+    emit_expr(sp->calls[0]);
+    f->cname = cname;
+    buf_puts(out, ";");
+    nl(); buf_printf(out, "if (t_ < 0 || t_ > safe_ - INT64_C(%lld) - acc_) return -1;", (long long)sp->c);
+    nl(); buf_printf(out, "acc_ += t_ + INT64_C(%lld);", (long long)sp->c);
+    nl(); buf_printf(out, "%s = ", pn);
+    emit_borrowed(sp->calls[1]->args.items[0]);
+    buf_puts(out, ";");
+    epop();
+    indent--;
+    nl(); buf_puts(out, "}");
+    indent--;
+    nl(); buf_puts(out, "}\n");
+    /* the exact fallback: the body as written, under NAME_dbl */
+    f->cname = dbl;
+    buf_putc(out, '\n');
+    emit_signature(f);
+    spine_suppress = true;
+    emit_func_body(f);
+    spine_suppress = false;
+    f->cname = cname;
+    buf_puts(&clone_fns, b.data);
+    free(b.data);
+    out = saved_out;
+    indent = saved_indent;
+}
 static void emit_func_body(Func *f) {
     cur_func = f;
     if (f->mod) cur_mod = f->mod;
     if (f->body) rv_compute(f, &f->body, 1);
     if (f->is_gen) { emit_gen(f); cur_func = NULL; return; }
     vol_locals = stmt_has_try(f->body);
-    { Spine sp_; if (spine_fn(f, &sp_)) { emit_spine(f, &sp_); cur_func = NULL; return; } }
+    { Spine sp_; if (spine_fn(f, &sp_)) { if (sp_.num) emit_spine_num(f, &sp_); else emit_spine(f, &sp_); cur_func = NULL; return; } }
     buf_puts(out, " {");
     indent++;
     nl();
@@ -7117,12 +7228,21 @@ void emit_program(Program *p, Buf *o) {
         if (p->funcs[i]->mod->builtin || p->funcs[i]->is_native || !p->funcs[i]->used) continue;
         emit_signature(p->funcs[i]);
         buf_puts(out, ";\n");
-        if (spine_wide_on() && p->funcs[i]->body && !p->funcs[i]->is_gen) { /* its inner spine version (emit_spine) */
+        if (p->funcs[i]->body && !p->funcs[i]->is_gen) { /* its inner spine version (emit_spine, emit_spine_num) */
             Func *saved = cur_func; Spine sp_;
             cur_func = p->funcs[i];
             bool sp = spine_fn(p->funcs[i], &sp_);
             cur_func = saved;
-            if (sp) {
+            if (sp && sp_.num) { /* emit_spine_num: the int64 loop and the plain fallback */
+                char *cname = p->funcs[i]->cname;
+                buf_printf(out, "XS_FN int64_t %s_sp(", cname);
+                emit_decl(p->funcs[i]->params[0].type, p->funcs[i]->params[0].cname);
+                buf_puts(out, ");\n");
+                p->funcs[i]->cname = xs_sprintf("%s_dbl", cname);
+                emit_signature(p->funcs[i]);
+                p->funcs[i]->cname = cname;
+                buf_puts(out, ";\n");
+            } else if (sp && spine_wide_on()) {
                 char *cname = p->funcs[i]->cname;
                 p->funcs[i]->cname = xs_sprintf("%s_sp", cname);
                 emit_signature(p->funcs[i]);

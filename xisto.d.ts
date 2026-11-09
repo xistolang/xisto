@@ -27,6 +27,14 @@ declare class Server {
 // Divergences that need a declaration for tsc: process.env is a Map in Xisto.
 declare namespace process {
   const env: Map<string, string>;
+  const stdout: { write(data: string | Uint8Array): boolean };
+}
+
+// xisto:fs, as the xisto: packages use it (packages/xisto/*.ts; the packages themselves are found through the
+// "paths" of tsconfig.json, so an editor shows their doc comments).
+declare module "xisto:fs" {
+  export function fstatSync(fd: int): { isFile(): boolean; size: int };
+  export function readSync(fd: int, buffer: Uint8Array, offset: int, length: int, position: int | null): int;
 }
 
 // Streams (Xisto only): lazy, pull-based pipelines over files.

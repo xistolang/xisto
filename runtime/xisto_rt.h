@@ -4618,6 +4618,38 @@ XS_NOINLINE int64_t xs_u8_index_of(xs_Uint8Array *b, int64_t v, int64_t from) {
     return h ? (int64_t)(h - b->data) : -1;
 }
 XS_NOINLINE bool xs_u8_includes(xs_Uint8Array *b, int64_t v) { return xs_u8_index_of(b, v, 0) >= 0; }
+/* JS: from defaults to length - 1; a negative from counts from the end; past the end it is the last index */
+XS_NOINLINE int64_t xs_u8_last_index_of(xs_Uint8Array *b, int64_t v, int64_t from) {
+    if (v < 0 || v > 255) return -1;
+    int64_t k = from == INT64_MIN ? b->f_length - 1 : from < 0 ? b->f_length + from : from >= b->f_length ? b->f_length - 1 : from;
+    const uint8_t *d = b->data;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    const uint8x16_t pv = vdupq_n_u8((uint8_t)v);
+    while (k >= 15) { /* 16 bytes a step, d[k-15..k]; the mask has 4 bits per byte (shrn), the highest is the answer */
+        uint8x16_t eq = vceqq_u8(vld1q_u8(d + k - 15), pv);
+        uint64_t m = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0);
+        if (m) return k - 15 + (63 - __builtin_clzll(m)) / 4;
+        k -= 16;
+    }
+#elif defined(__SSE2__)
+    const __m128i pv = _mm_set1_epi8((char)v);
+    while (k >= 15) { /* 16 bytes a step, d[k-15..k]: bit i of the mask is byte k-15+i, the highest is the answer */
+        uint32_t m = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)(d + k - 15)), pv));
+        if (m) return k - 15 + (31 - __builtin_clz(m));
+        k -= 16;
+    }
+#endif
+    const uint64_t lows = 0x7f7f7f7f7f7f7f7full, pat = 0x0101010101010101ull * (uint64_t)v;
+    while (k >= 7) { /* 8 bytes a step, d[k-7..k] (little-endian load: byte k is the top one) */
+        uint64_t w;
+        memcpy(&w, d + k - 7, 8);
+        uint64_t x = w ^ pat, z = ~(((x & lows) + lows) | x | lows); /* exactly the high bit of each zero byte of x */
+        if (z) return k - 7 + (63 - __builtin_clzll(z)) / 8;
+        k -= 8;
+    }
+    for (; k >= 0; k--) if (d[k] == (uint8_t)v) return k;
+    return -1;
+}
 XS_NOINLINE int64_t xs_buf_index_of_str(xs_Uint8Array *b, xs_str *p, int64_t from) {
     int64_t s = xs_u8_rel(from, b->f_length, 0);
     if (s > b->f_length) return -1;

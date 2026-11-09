@@ -2391,6 +2391,17 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->loading = false;
         return m;
     }
+    if (strcmp(name, "io") == 0 || strcmp(name, "bytes") == 0) { /* packages/xisto: the same file Node runs */
+        extern const unsigned char xs_pkg_io_ts[], xs_pkg_bytes_ts[];
+        bool io = strcmp(name, "io") == 0;
+        m->builtin = false;
+        m->file = io ? "xisto:io" : "xisto:bytes";
+        m->src = (char *)(io ? xs_pkg_io_ts : xs_pkg_bytes_ts);
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
     if (strcmp(name, "worker_threads") == 0 || strcmp(name, "os") == 0) { /* written in xisto over runtime functions */
         bool wt = strcmp(name, "worker_threads") == 0;
         m->builtin = false;
@@ -2409,7 +2420,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         add_func(prog, f);
         return m;
     }
-    xs_error(from_pos, "built-in modules: xisto:fs, xisto:sqlite, xisto:timers/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os", "unknown built-in module '%s'", spec);
+    xs_error(from_pos, "built-in modules: xisto:fs, xisto:sqlite, xisto:timers/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:io, xisto:bytes", "unknown built-in module '%s'", spec);
     return NULL;
 }
 

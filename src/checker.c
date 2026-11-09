@@ -479,6 +479,15 @@ static void check_bytes_member(Expr *e, Class *c) {
         e->type = ty_object_of(c);
         return;
     }
+    if (strcmp(m, "lastIndexOf") == 0) { /* from the end (or from a given index) back */
+        ARGS(1, 2);
+        for (int k = 0; k < n; k++) int_arg(&e->args.items[k], "argument of lastIndexOf");
+        PAD_INT(1, XS_NOT_GIVEN);
+        if (n < 2) e->args.items[1]->ival = XS_NOT_GIVEN;
+        e->builtin.cfn = "xs_u8_last_index_of";
+        e->type = ty_int;
+        return;
+    }
     if (strcmp(m, "indexOf") == 0 || strcmp(m, "includes") == 0) {
         bool io = m[1] == 'n' && m[2] == 'd';
         ARGS(1, io ? 2 : 1);
@@ -534,7 +543,7 @@ static void check_bytes_member(Expr *e, Class *c) {
         return;
     }
     (void)u8;
-    xs_error(e->pos, "supported: length, slice, subarray, set, fill, indexOf, includes, reverse, join, toString, toBase64, toHex (and Buffer: equals, toString(encoding))", "%s has no method '%s'", c->name, m);
+    xs_error(e->pos, "supported: length, slice, subarray, set, fill, indexOf, lastIndexOf, includes, reverse, join, toString, toBase64, toHex (and Buffer: equals, toString(encoding))", "%s has no method '%s'", c->name, m);
     #undef ARGS
     #undef PAD_INT
 }
@@ -1601,6 +1610,40 @@ static Type *unify_numeric(Expr *e, const char *what) {
     return a->type;
 }
 
+/* A left-out argument's default as written, for this call. A default can read the parameters before it
+   (function f(a: Uint8Array, end: int = a.length)): those names are the call's own arguments, not whatever the
+   caller calls a; each becomes a copy of that argument when it can be read twice without a difference (a name, a
+   field, a literal), and otherwise the call must give the argument. */
+static Expr *dflt_subst(Expr *d, Func *f, Expr **args, int nargs, Pos at);
+static Expr *dflt_arg(Func *f, int i, Expr **args, int nargs, Pos at) {
+    return dflt_subst(f->params[i].dflt, f, args, nargs, at);
+}
+static Expr *dflt_subst(Expr *d, Func *f, Expr **args, int nargs, Pos at) {
+    if (!d) return NULL;
+    Expr *c = xs_alloc(sizeof *c);
+    *c = *d;
+    if (d->kind == E_IDENT && d->str)
+        for (int k = 0; k < nargs && k < f->nparams; k++)
+            if (f->params[k].name && strcmp(f->params[k].name, d->str) == 0) {
+                Expr *a = args[k], *p = a;
+                while (p && p->kind == E_MEMBER && !p->is_call) p = p->lhs; /* (x, x.y.z: no call on the way) */
+                bool simple = a && (a->kind == E_NUMBER || a->kind == E_STRING || a->kind == E_NULL ||
+                                    (p && (p->kind == E_IDENT || p->kind == E_THIS)));
+                if (!simple)
+                    xs_error(at, xs_sprintf("put the argument for '%s' in a const first, or give every argument", f->params[k].name),
+                             "the default of a later parameter reads '%s', and the argument given for it cannot be read twice", d->str);
+                return dflt_subst(a, f, NULL, 0, at); /* (a copy of the argument as written) */
+            }
+    if (d->kind == E_ARROW) return c; /* (an arrow's own names are its own) */
+    c->lhs = dflt_subst(d->lhs, f, args, nargs, at);
+    c->rhs = dflt_subst(d->rhs, f, args, nargs, at);
+    if (d->args.len) {
+        c->args = (ExprList){0};
+        for (int k = 0; k < d->args.len; k++) expr_list_push(&c->args, dflt_subst(d->args.items[k], f, args, nargs, at));
+    }
+    return c;
+}
+
 static void check_args(Expr *e, Func *f, const char *what) {
     int required = f->nparams;
     while (required > 0 && f->params[required - 1].dflt) required--;
@@ -1609,11 +1652,7 @@ static void check_args(Expr *e, Func *f, const char *what) {
         xs_error(e->pos, NULL, "%s takes %d to %d argument(s), got %d", what, required, f->nparams, e->args.len);
     }
     /* left-out arguments: the declared defaults, evaluated at the call as in JavaScript */
-    for (int i = e->args.len; i < f->nparams; i++) {
-        Expr *d = xs_alloc(sizeof *d);
-        *d = *f->params[i].dflt;
-        expr_list_push(&e->args, d);
-    }
+    for (int i = e->args.len, given = e->args.len; i < f->nparams; i++) expr_list_push(&e->args, dflt_arg(f, i, e->args.items, given, e->pos));
     for (int i = 0; i < e->args.len; i++) {
         check_expr(e->args.items[i], f->params[i].type);
         expect_type(e->args.items[i], f->params[i].type, xs_sprintf("argument '%s' of %s", f->params[i].name, what));
@@ -2105,11 +2144,8 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
     for (int i = 0; i < tmpl->ntparams; i++)
         if (!bind[i]) xs_error(e->pos, xs_sprintf("give it: %s<Type>(...)", tmpl->name), "cannot infer type parameter %s of %s", tmpl->tparams[i], what);
     Func *inst = instantiate_func(tmpl, bind);
-    for (int i = e->args.len; i < inst->nparams; i++) { /* defaults, as written for this instance */
-        Expr *d = xs_alloc(sizeof *d);
-        *d = *inst->params[i].dflt;
-        expr_list_push(&e->args, d);
-    }
+    for (int i = e->args.len, given = e->args.len; i < inst->nparams; i++) /* defaults, as written for this instance */
+        expr_list_push(&e->args, dflt_arg(inst, i, e->args.items, given, e->pos));
     for (int i = 0; i < e->args.len; i++) {
         if (!done[i]) check_expr(e->args.items[i], inst->params[i].type);
         expect_type(e->args.items[i], inst->params[i].type, xs_sprintf("argument '%s' of %s", inst->params[i].name, what));
@@ -4956,6 +4992,10 @@ static bool ii_known(const char *n) { for (int i = 0; i < ii_n; i++) if (strcmp(
 static const char **ii_tnames; static int ii_tn;
 static const char **ii_anames; static int ii_an;
 static const char **ii_cnames; static Expr **ii_cinit; static int ii_cn; /* const j = i + 1: j is what its value is */
+/* let end = a.indexOf(x); if (end < 0) end = a.length: an integer when its start and every assignment are */
+static const char **ii_lnames; static Expr **ii_linit; static int ii_ln;
+static Stmt *ii_body; /* the function being inferred */
+static bool ii_stmt_ok(Stmt *s, const char *self);
 static int ii_depth;
 static bool ii_in(const char **l, int n, const char *s) { for (int i = 0; i < n; i++) if (strcmp(l[i], s) == 0) return true; return false; }
 static void ii_typed(const char *name, Type *t) {
@@ -4970,12 +5010,17 @@ static void ii_scan(Stmt *s) {
         ii_cnames = realloc(ii_cnames, sizeof(char *) * (size_t)(ii_cn + 1)); ii_cinit = realloc(ii_cinit, sizeof(Expr *) * (size_t)(ii_cn + 1));
         ii_cnames[ii_cn] = s->name; ii_cinit[ii_cn++] = s->init;
     }
+    if (s->kind == S_VAR && !s->is_const && !s->decl_type && s->init && s->name) {
+        ii_lnames = realloc(ii_lnames, sizeof(char *) * (size_t)(ii_ln + 1)); ii_linit = realloc(ii_linit, sizeof(Expr *) * (size_t)(ii_ln + 1));
+        ii_lnames[ii_ln] = s->name; ii_linit[ii_ln++] = s->init;
+    }
     ii_scan(s->for_init); ii_scan(s->body); ii_scan(s->else_body);
     for (int i = 0; i < s->stmts.len; i++) ii_scan(s->stmts.items[i]);
     for (int i = 0; i < s->ncases; i++) ii_scan(s->cases[i].body);
 }
 static void ii_enter(Func *f, bool reset) {
-    if (reset) ii_tn = ii_an = ii_cn = 0;
+    if (reset) ii_tn = ii_an = ii_cn = ii_ln = 0;
+    ii_body = f->body;
     for (int i = 0; i < f->nparams; i++) ii_typed(f->params[i].name, f->params[i].type);
     ii_scan(f->body);
 }
@@ -4992,11 +5037,35 @@ static bool int_shaped(Expr *e, const char *self) {
                 ii_depth++; bool r = int_shaped(ii_cinit[i], self); ii_depth--;
                 return r;
             }
+        for (int i = ii_ln - 1; i >= 0; i--)
+            if (strcmp(ii_lnames[i], e->str) == 0) {
+                if (ii_depth > 4 || !ii_body) return false;
+                ii_depth++; bool r = int_shaped(ii_linit[i], e->str) && ii_stmt_ok(ii_body, e->str); ii_depth--;
+                return r;
+            }
         return false;
     case E_INDEX: return e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && ii_in(ii_anames, ii_an, e->lhs->str);
     case E_MEMBER: /* (not x.length: it can be a getter of the program's own that gives a number, and the
                       types are not known yet here; i < a.length is a comparison, not an assignment, and is fine) */
-        if (!e->is_call) return false;
+        if (!e->is_call) { /* x.length: an int on a string, an array, a typed array; unless the program has a
+                             field, getter or method of that name of its own */
+            if (!e->str || strcmp(e->str, "length") != 0) return false;
+            for (int c = 0; prog && c < prog->nclasses; c++) {
+                Class *k = prog->classes[c];
+                if (k->builtin) continue; /* (the built-in ones: their length is an int) */
+                for (int f = 0; f < k->nfields; f++) if (k->fields[f].name && !strcmp(k->fields[f].name, "length")) return false;
+                for (int f = 0; f < k->nmethods; f++)
+                    if (k->methods[f]->name && (!strcmp(k->methods[f]->name, "length") || !strcmp(k->methods[f]->name, "__get_length"))) return false;
+            }
+            return true;
+        }
+        if (e->str && (!strcmp(e->str, "indexOf") || !strcmp(e->str, "findIndex"))) { /* a position: an int on a
+               string, an array, a typed array; unless the program has a method of that name of its own */
+            for (int c = 0; prog && c < prog->nclasses; c++)
+                for (int k = 0; !prog->classes[c]->builtin && k < prog->classes[c]->nmethods; k++)
+                    if (prog->classes[c]->methods[k]->name && !strcmp(prog->classes[c]->methods[k]->name, e->str)) return false;
+            return true;
+        }
         if (!(e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && strcmp(e->lhs->str, "Math") == 0 && e->str)) return false;
         if (!strcmp(e->str, "floor") || !strcmp(e->str, "ceil") || !strcmp(e->str, "round") || !strcmp(e->str, "trunc")) return true;
         if (!strcmp(e->str, "max") || !strcmp(e->str, "min") || !strcmp(e->str, "abs")) { /* of integers: an integer */
