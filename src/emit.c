@@ -483,6 +483,11 @@ static bool cloned_per_site(Func *f) {
 static void emit_func_body(Func *f);
 static void emit_signature(Func *f);
 static char *emit_clone(Func *f, int csite);
+static int fx_find(const char *c);
+static void ix_prove(Stmt *body);
+static bool ix_arr_ok(Expr *a);
+static bool ix_val(Expr *e);
+static bool fx_decl[32];
 static void emit_promise(Expr *e);
 
 /* ", XS_S(n)": the site argument of the checked operations */
@@ -1217,6 +1222,20 @@ static void emit_lvalue_ptr(Expr *e) {
             emit_bce_index(e->rhs);
             buf_puts(out, "])");
             return;
+        }
+        if (!arr_is_ref(e->lhs->type) && e->lhs->kind == E_IDENT) {
+            int k = fx_find(e->lhs->cname);
+            if (k >= 0 && fx_decl[k]) {
+                static int fxn;
+                int id = fxn++;
+                const char *nm = ren(e->lhs->cname);
+                buf_printf(out, "({ int64_t fxi%d_ = (", id);
+                emit_expr(e->rhs);
+                buf_printf(out, "); (uint64_t)fxi%d_ < (uint64_t)%s_fxl ? &%s_fxd[fxi%d_] : xs_at_%s_s(%s, fxi%d_", id, nm, nm, id, arr_suffix(e->lhs->type), nm, id);
+                site_arg(e->pos);
+                buf_puts(out, "); })");
+                return;
+            }
         }
         if (arr_is_ref(e->lhs->type)) buf_printf(out, "((%s*)xs_at_ref_s(", ctype(e->type));
         else buf_printf(out, "xs_at_%s_s(", arr_suffix(e->lhs->type));
@@ -4180,6 +4199,20 @@ static void rv_scan_stmt(Stmt *s, bool decls) {
 static BceFix bce_fix_l[32], bce_fix_g[32];
 static int nbce_fix_l, nbce_fix_g;
 static Func *bce_fix_owner;
+/* fixed local arrays (any length): `const X = new Array<int>(N).fill(v)` that its function only indexes keeps its
+   data and length for its whole life, so the emitted code reads them from C locals (X_fxd, X_fxl) set at the
+   declaration. The check stays (and its failure goes through the usual call, with its message); the C compiler
+   no longer reloads X->data and X->len after every store to an element (an int64 store may alias them).
+   fannkuchredux.ts, count[]: Graviton2 1,74 -> 1,68 u. XISTO_NO_FIX_HOIST=1: off */
+static const char *fx_l[32];
+static bool fx_decl[32];
+static int nfx_l;
+static Func *fx_owner;
+static int fx_find(const char *c) {
+    if (!c || fx_owner != cur_func) return -1;
+    for (int i = 0; i < nfx_l; i++) if (strcmp(fx_l[i], c) == 0) return i;
+    return -1;
+}
 static int64_t bce_fixed_of(Stmt *s) {
     if (s->kind != S_VAR || !s->is_const || !s->cname || s->cell || !s->init) return 0;
     Expr *e = s->init;
@@ -4275,9 +4308,10 @@ static void bce_fix_arr_scan(Stmt *s, Stmt **all, int n) {
             int64_t v = 0;
             if (len->kind == E_NUMBER && len->is_int_lit) v = len->ival;
             else if (len->kind == E_IDENT && len->cname && !cig_find(len->cname, &v)) v = 0;
-            bool only = v > 0;
+            bool only = true;
             for (int i = 0; i < n && only; i++) only = garr_stmt(all[i], s->cname, true);
-            if (only) bce_fix_l[nbce_fix_l++] = (BceFix){s->cname, v};
+            if (only && v > 0) bce_fix_l[nbce_fix_l++] = (BceFix){s->cname, v};
+            if (only && nfx_l < 32 && !xs_debug && !getenv("XISTO_NO_FIX_HOIST")) { fx_decl[nfx_l] = false; fx_l[nfx_l++] = s->cname; }
         }
     }
     bce_fix_arr_scan(s->for_init, all, n);
@@ -4643,6 +4677,8 @@ static void rv_compute(Func *owner, Stmt **stmts, int n) {
     rv_valid = false;
     nbce_fix_l = 0;
     bce_fix_owner = owner;
+    nfx_l = 0;
+    fx_owner = owner;
     ctr_compute(stmts, n);
     for (int i = 0; i < n; i++) bce_fix_scan(stmts[i]);
     for (int i = 0; i < n; i++) bce_fix_arr_scan(stmts[i], stmts, n);
@@ -5647,6 +5683,7 @@ static bool emit_u8_while_rev(Stmt *s) {
 static const char *rev_head_name, *rev_head_n;
 static Expr *rev_head_lo;
 static int rev_head_site;
+static bool rev_head_ix; /* the reversal is within the array (ix_prove): the read after it needs no check */
 static Stmt *rev_head_stmt;
 static bool emit_u8_idiom(Stmt *s) {
     if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
@@ -5679,16 +5716,24 @@ static bool emit_u8_idiom(Stmt *s) {
         /* the element the reversal brings to lo (old a[hi], or a[lo] when lo >= hi), read from the value before
            the shuffle: a read of a[lo] right after (k = perm[0] in a flip loop) takes it without waiting for the
            shuffle (rev_head below) */
+        /* a[lo..hi] with lo the literal 0 and hi an index value of a (ix_prove): within a, nothing to check */
+        bool ixr = false;
+        if (ra && cur_func) {
+            ix_prove(cur_func->body);
+            ixr = ix_arr_ok(m.a) && m.lo && m.lo->kind == E_NUMBER && m.lo->is_int_lit && m.lo->ival == 0 && ix_val(m.hi);
+        }
         if (ra && fn_prelude_out == out && !getenv("XISTO_NO_REV_HEAD")) {
             buf_printf(&fn_prelude_text, "\n    int64_t rh%d_ = 0; (void)rh%d_;", site, site);
-            buf_printf(out, "rh%d_ = xs_v16_rev_head(", site); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", %s); ", rgn(ra));
+            buf_printf(out, ixr ? "rh%d_ = xs_v16_rev_head_nc(" : "rh%d_ = xs_v16_rev_head(", site); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_printf(out, ", %s); ", rgn(ra));
             rev_head_name = m.a->cname;
             rev_head_lo = m.lo;
             rev_head_site = site;
             rev_head_n = rgn(ra);
+            rev_head_ix = ixr;
             rev_head_stmt = s; /* for the next statement of the same block only */
         }
-        if (ra) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_rev("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_puts(out, ") - ("); emit_expr(m.lo); buf_printf(out, "), %s, XS_S(%d));", rgn(ra), site); }
+        if (ra && ixr) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_rev_nc("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", "); emit_expr(m.hi); buf_puts(out, ");"); }
+        else if (ra) { emit_u8reg_name(m.a); buf_puts(out, " = xs_v16_rev("); emit_u8reg_name(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_puts(out, ") - ("); emit_expr(m.lo); buf_printf(out, "), %s, XS_S(%d));", rgn(ra), site); }
         else { buf_puts(out, "xs_u8_rev("); emit_borrowed(m.a); buf_puts(out, ", "); emit_expr(m.lo); buf_puts(out, ", ("); emit_expr(m.hi); buf_puts(out, ") - ("); emit_expr(m.lo); buf_printf(out, "), XS_S(%d));", site); }
         return true;
     }
@@ -5853,6 +5898,106 @@ static void bv_prove(Stmt *body) {
     bv_locals(body);
     bool changed = true;
     while (changed) { changed = false; bv_stmt(body, &changed); }
+}
+/* ---- int[]s that hold indices of themselves ----
+   `const a: int[] = new Array<int>(L).fill(0)` among the function body's statements (L a literal or a top-level
+   const: every such array has the same length), only indexed (u8_stmt_ok), and every value stored into one of them
+   an index value: an element of one of them, an int local whose every value is one, c ? x : y of two, or the
+   store's own index (a[i] = i: the store happens only when i < L). An index value is then in [0, L), and some
+   element exists, so L >= 1. Fannkuch's permutations: perm1[i] = i, then only moves of their own elements;
+   k = perm[0] can be no other than an index, so reversing perm[0..k] and reading perm[0] need no check.
+   Proved as a fixpoint, like the bytes above. XISTO_NO_IX_PROOF=1 turns it off. */
+static BvName ix_arr[16], ix_loc[256];
+static int nix_arr, nix_loc;
+static Stmt *ix_body;
+static bool ix_val(Expr *e) {
+    if (!e) return false;
+    if (e->kind == E_INDEX && !e->builtin.cfn && e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname) {
+        BvName *a = bv_find(ix_arr, nix_arr, e->lhs->cname);
+        return a && a->ok;
+    }
+    if (e->kind == E_IDENT && e->cname) { BvName *l = bv_find(ix_loc, nix_loc, e->cname); return l && l->ok; }
+    if (e->kind == E_COND) return e->args.len == 2 && ix_val(e->args.items[0]) && ix_val(e->args.items[1]);
+    return false;
+}
+static void ix_stmt(Stmt *s, bool *changed);
+static void ix_expr(Expr *e, bool *changed) {
+    if (!e) return;
+    if (e->kind == E_ASSIGN || e->kind == E_POSTFIX || (e->kind == E_UNARY && (e->op == TK_PLUSPLUS || e->op == TK_MINUSMINUS))) {
+        Expr *l = e->lhs;
+        bool plain = e->kind == E_ASSIGN && e->op == TK_ASSIGN;
+        if (l && l->kind == E_IDENT && l->cname) {
+            BvName *n = bv_find(ix_loc, nix_loc, l->cname);
+            if (n && n->ok && (!plain || !ix_val(e->rhs))) bv_drop(n, changed);
+        } else if (l && l->kind == E_INDEX && !l->builtin.cfn && l->lhs && l->lhs->kind == E_IDENT && l->lhs->cname) {
+            BvName *a = bv_find(ix_arr, nix_arr, l->lhs->cname);
+            if (a && a->ok && (!plain || !(ix_val(e->rhs) || (bce_pure(e->rhs) && same_simple(e->rhs, l->rhs))))) bv_drop(a, changed);
+        }
+    }
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) ix_stmt(e->arrow->fn->body, changed);
+    ix_expr(e->lhs, changed); ix_expr(e->rhs, changed);
+    for (int i = 0; i < e->args.len; i++) ix_expr(e->args.items[i], changed);
+}
+static void ix_stmt(Stmt *s, bool *changed) {
+    if (!s) return;
+    if (s->kind == S_VAR && s->cname) {
+        BvName *n = bv_find(ix_loc, nix_loc, s->cname);
+        if (n && n->ok && !ix_val(s->init)) bv_drop(n, changed);
+    }
+    ix_expr(s->init, changed); ix_expr(s->expr, changed); ix_expr(s->cond, changed); ix_expr(s->for_update, changed);
+    ix_stmt(s->for_init, changed); ix_stmt(s->body, changed); ix_stmt(s->else_body, changed);
+    for (int i = 0; i < s->stmts.len; i++) ix_stmt(s->stmts.items[i], changed);
+    for (int i = 0; i < s->ncases; i++) { ix_expr(s->cases[i].value, changed); ix_stmt(s->cases[i].body, changed); }
+}
+/* the length of `new Array<int>(L).fill(0)` when L is a literal or a top-level const (the same value for every
+   array made with it), else NULL */
+static Expr *ix_new_len(Expr *e) {
+    if (!e || e->kind != E_MEMBER || !e->is_call || !e->str || strcmp(e->str, "fill") != 0 || !e->lhs || e->lhs->kind != E_NEW_ARRAY || !e->lhs->lhs) return NULL;
+    if (e->args.len != 1 || !e->args.items[0] || e->args.items[0]->kind != E_NUMBER || !e->args.items[0]->is_int_lit || e->args.items[0]->ival != 0) return NULL;
+    Expr *L = e->lhs->lhs;
+    if (L->kind == E_NUMBER && L->is_int_lit) return L;
+    if (L->kind != E_IDENT || !L->cname || !prog) return NULL;
+    for (int i = 0; i < prog->top.len; i++) {
+        Stmt *t = prog->top.items[i];
+        if (t->kind == S_VAR && t->is_const && t->cname && strcmp(t->cname, L->cname) == 0) return L;
+    }
+    return NULL;
+}
+static void ix_prove(Stmt *body) {
+    if (ix_body == body) return;
+    ix_body = body;
+    nix_arr = nix_loc = 0;
+    if (!body || body->kind != S_BLOCK || getenv("XISTO_NO_IX_PROOF") || getenv("XISTO_NO_INT_REG")) return;
+    Expr *len = NULL;
+    for (int i = 0; i < body->stmts.len && nix_arr < 16; i++) {
+        Stmt *d = body->stmts.items[i];
+        if (d->kind != S_VAR || !d->is_const || !d->cname || d->cell || !int_arr_type(d->type)) continue;
+        Expr *L = ix_new_len(d->init);
+        if (!L || (len && !same_simple(L, len))) continue;
+        if (!u8_stmt_ok(body, d->cname, false)) continue;
+        len = L;
+        ix_arr[nix_arr++] = (BvName){d->cname, true, i};
+    }
+    if (!nix_arr) return;
+    nix_loc = 0;
+    {   /* the body's int locals */
+        Stmt *stack[512]; int sp = 0; stack[sp++] = body;
+        while (sp) {
+            Stmt *s = stack[--sp];
+            if (!s) continue;
+            if (s->kind == S_VAR && s->cname && !s->cell && s->type && s->type->kind == TY_INT && nix_loc < 256) ix_loc[nix_loc++] = (BvName){s->cname, true, 0};
+            if (sp < 500) { stack[sp++] = s->for_init; stack[sp++] = s->body; stack[sp++] = s->else_body; }
+            for (int i = 0; i < s->stmts.len && sp < 510; i++) stack[sp++] = s->stmts.items[i];
+            for (int i = 0; i < s->ncases && sp < 510; i++) stack[sp++] = s->cases[i].body;
+        }
+    }
+    bool changed = true;
+    while (changed) { changed = false; ix_stmt(body, &changed); }
+}
+static bool ix_arr_ok(Expr *a) {
+    if (!a || a->kind != E_IDENT || !a->cname) return false;
+    BvName *n = bv_find(ix_arr, nix_arr, a->cname);
+    return n && n->ok;
 }
 /* an int[] in a register pays off only where a copy, reversal or shift of it becomes one shuffle: element by
    element, a lane extract and a blend cost more than the load and store they replace */
@@ -6027,7 +6172,8 @@ static void emit_stmt_(Stmt *s) {
             e->rhs->lhs && e->rhs->lhs->kind == E_IDENT && e->rhs->lhs->cname && strcmp(e->rhs->lhs->cname, rev_head_name) == 0 &&
             same_simple(e->rhs->rhs, rev_head_lo) && bce_pure(rev_head_lo)) {
             int site = new_site(s->pos);
-            buf_printf(out, "(%s = xs_v16_head_after(rh%d_, ", ren(e->lhs->cname), rev_head_site); emit_expr(rev_head_lo); buf_printf(out, ", %s, XS_S(%d)));", rev_head_n, site);
+            if (rev_head_ix) buf_printf(out, "(%s = rh%d_);", ren(e->lhs->cname), rev_head_site); /* a[0]: some index value exists, so a is not empty */
+            else { buf_printf(out, "(%s = xs_v16_head_after(rh%d_, ", ren(e->lhs->cname), rev_head_site); emit_expr(rev_head_lo); buf_printf(out, ", %s, XS_S(%d)));", rev_head_n, site); }
             drain_if_needed();
             return;
         }
@@ -6051,6 +6197,12 @@ static void emit_stmt_(Stmt *s) {
             return;
         }
         emit_var(s);
+        { int k = s->cname ? fx_find(s->cname) : -1;
+          if (k >= 0 && s->type && s->type->elem) {
+              const char *et = s->type->elem->kind == TY_INT ? "int64_t" : "double";
+              buf_printf(out, " %s *%s_fxd = (%s)->data; int64_t %s_fxl = (int64_t)(%s)->len; (void)%s_fxd; (void)%s_fxl;", et, ren(s->cname), ren(s->cname), ren(s->cname), ren(s->cname), ren(s->cname), ren(s->cname));
+              fx_decl[k] = true;
+          } }
         drain_if_needed();
         return;
     case S_EXPR:
