@@ -90,14 +90,19 @@ function sequence(): Uint8Array {
     let i: int = 0;
     while (i < got && state < 3) {
       if (state === 2) {
-        // the sequence: every byte but the newlines, two bits each; a '>' ends it. Branch-free: a newline is
-        // written and then overwritten (seq is as long as the input, so there is always room)
+        // the sequence: every byte but the newlines, two bits each; a '>' ends it. Line by line: the newline
+        // found with indexOf, the line converted by a counted loop with no data-dependent store position, so the
+        // C compiler vectorizes it (Graviton2: the parse 0,27 -> 0,12 s, before any worker starts)
         const stop = view.indexOf(62, i);
         const lim: int = stop < 0 ? got : stop;
-        for (let t = i; t < lim; t++) {
-          const c = block[t];
-          seq[len] = (c >> 1) & 3; // a c g t, A C G T: 0 1 3 2
-          len += c === 10 ? 0 : 1;
+        let t: int = i;
+        while (t < lim) {
+          let e: int = view.indexOf(10, t);
+          if (e < 0 || e > lim) e = lim;
+          const base: int = len - t;
+          for (let u = t; u < e; u++) seq[base + u] = (block[u] >> 1) & 3; // a c g t, A C G T: 0 1 3 2
+          len += e - t;
+          t = e + 1;
         }
         if (stop >= 0) state = 3;
         i = got;
@@ -135,11 +140,17 @@ function sequenceWhole(): Uint8Array {
     at = end + 1;
   }
   const seq = new Uint8Array(new SharedArrayBuffer(n - at));
+  const stop = input.indexOf(62, at);
+  const lim: int = stop < 0 ? n : stop;
   let len: int = 0;
-  for (let i = at; i < n; i++) {
-    const c = input[i];
-    if (c === 62) break;
-    if (c !== 10) { seq[len] = (c >> 1) & 3; len++; } // a c g t, A C G T: 0 1 3 2
+  let t: int = at;
+  while (t < lim) { // line by line, as sequence() does
+    let e: int = input.indexOf(10, t);
+    if (e < 0 || e > lim) e = lim;
+    const base: int = len - t;
+    for (let u = t; u < e; u++) seq[base + u] = (input[u] >> 1) & 3; // a c g t, A C G T: 0 1 3 2
+    len += e - t;
+    t = e + 1;
   }
   return seq.subarray(0, len);
 }
@@ -161,7 +172,7 @@ function mainThread(): void {
   for (let f = 0; f < KS.length; f++) {
     const k = KS[f];
     const big = k > 6;
-    parts[f] = big ? nbig * 2 : nworkers;
+    parts[f] = big ? (nworkers > 2 ? nbig * 2 : nbig) : nworkers; // (with two workers, one table each, as many as the small frames: fewer tables to fill and merge)
     for (let p = 0; p < parts[f]; p++) {
       if (big) { bigK.push(k); bigP.push(p); } else { smallK.push(k); smallP.push(p); }
     }
