@@ -797,6 +797,9 @@ static void emit_closure_call_prefix(Type *ft) {
 }
 
 static Buf arrow_fns;     /* arrow function bodies and env structs, emitted before the code that creates them */
+static void jam_try(Arrow *a); /* (XB-083) */
+static bool jam_used;       /* a parallelFill pool variant asked for xs_jam8_of */
+static Buf jam_tab;         /* its cases */
 static Buf tramp_fns;     /* trampolines turning top-level functions into closure values */
 static int ntramps;
 static char **tramp_names;
@@ -2425,6 +2428,7 @@ static void emit_expr_raw(Expr *e) {
         buf_puts(out, "}\n");
         buf_puts(&arrow_fns, body.data);
         free(body.data);
+        jam_try(a);
         out = saved_out;
         escope = saved_scope;
         cur_func = saved_func;
@@ -5801,6 +5805,189 @@ static void par_signature(Func *f) {
     }
     buf_puts(out, ")");
 }
+
+/* ---- jam: eight rows of a dot product at a time (XB-083) ----
+   A callback of parallelFill shaped like one row of a matrix-vector product,
+       (i) => { let t = K; for (let j = 0; j < a.length; ++j) t += E; return t; }
+   with E pure (numbers, the row i, the column j, a[j], captured numbers, Number(), + - * /, calls of functions
+   whose body is one `return`), also gets NAME_x8(env, i, out): rows i..i+7 at once, each row's sum added in the
+   same order as the callback adds it (the same doubles), but eight independent chains the processor overlaps and
+   the vectorizer packs. Integer arithmetic in E runs in doubles: while every value stays within ±(2^53 − 1) that is
+   the same integer, and a flag notes any value outside; then the eight rows are not trusted (false) and the pool
+   runs them one by one through the callback, which checks each operation and reports the error where it is.
+   XISTO_NO_JAM=1 turns it off. */
+typedef struct { const char *c; char kind; const char *bound; bool nz, nn; } JV; /* (jam_expr) */
+typedef struct { const char *name; JV v; } JamSub; /* an inlined function's parameter */
+typedef struct {
+    Arrow *a;
+    const char *iname, *jname, *aname; /* row parameter, column variable, the array of the loop's bound */
+    int lane;
+    JamSub *subs;
+    int nsubs;
+    int depth;
+    Buf *checks; /* lane 0 only: one test per integer operation, on a bound of its value over the eight rows and every column */
+} Jam;
+static const char *jam_dbl(double v) {
+    char *s = xs_sprintf("%.17g", v);
+    if (!strpbrk(s, ".eEn")) s = xs_sprintf("%s.0", s);
+    return s;
+}
+static Capture *jam_capture(Arrow *a, const char *name) {
+    for (int i = 0; i < a->ncaptures; i++) if (!a->captures[i].is_this && strcmp(a->captures[i].name, name) == 0) return &a->captures[i];
+    return NULL;
+}
+static bool jam_is_int(Type *t) { return t && (t->kind == TY_INT || t->kind == TY_LITINT); }
+static bool jam_is_num(Type *t) { return t && t->kind == TY_NUMBER; }
+static bool jam_num_array(Type *t) { return t && ((t->kind == TY_ARRAY && jam_is_num(t->elem)) || is_f64_type(t)); }
+/* E as C for one lane. kind 'i': an integer held in a double, with bound (a C expression no smaller than |E| on
+   any of the eight rows and any column: |a ± b| ≤ A + B, |a·b| ≤ A·B), nz (never -0: the double is the integer
+   as Number() gives it) and nn (never negative); kind 'n': a number. c NULL: E is not plain. */
+static const char *jam_num_of(JV v) { return v.kind == 'i' && !v.nz ? xs_sprintf("(%s + 0.0)", v.c) : v.c; } /* (x + 0.0: -0 becomes 0) */
+static JV jam_expr(Jam *J, Expr *e) {
+    JV no = {0};
+    if (!e || !e->type) return no;
+    switch (e->kind) {
+    case E_NUMBER:
+        if (jam_is_int(e->type)) return (JV){jam_dbl((double)e->ival), 'i', jam_dbl(fabs((double)e->ival)), true, e->ival >= 0};
+        if (jam_is_num(e->type)) return (JV){jam_dbl(e->num), 'n', NULL, false, false};
+        return no;
+    case E_IDENT: {
+        if (!e->str) return no;
+        for (int k = J->nsubs - 1; k >= 0; k--) if (strcmp(J->subs[k].name, e->str) == 0) return J->subs[k].v;
+        if (J->depth > 0) return no; /* an inlined function sees its parameters only */
+        if (strcmp(e->str, J->iname) == 0) return (JV){xs_sprintf("(double)(i_ + %d)", J->lane), 'i', "ib_", true, true}; /* (an index) */
+        if (strcmp(e->str, J->jname) == 0) return (JV){"(double)j_", 'i', "jb_", true, true};
+        Capture *c = jam_capture(J->a, e->str);
+        if (!c || c->boxed) return no;
+        if (jam_is_int(c->type)) return (JV){xs_sprintf("(double)env->c_%s", c->name), 'i', xs_sprintf("__builtin_fabs((double)env->c_%s)", c->name), true, false};
+        if (jam_is_num(c->type)) return (JV){xs_sprintf("env->c_%s", c->name), 'n', NULL, false, false};
+        return no;
+    }
+    case E_INDEX: /* a[j] on the array of the bound: in range */
+        if (e->builtin.cfn && !is_f64_type(e->lhs->type)) return no;
+        if (J->depth > 0 || !e->lhs || e->lhs->kind != E_IDENT || !e->rhs || e->rhs->kind != E_IDENT) return no;
+        if (strcmp(e->lhs->str, J->aname) != 0 || strcmp(e->rhs->str, J->jname) != 0) return no;
+        return (JV){"ad_[j_]", 'n', NULL, false, false};
+    case E_UNARY: {
+        if (e->op != TK_MINUS) return no;
+        JV x = jam_expr(J, e->lhs);
+        if (!x.c || (x.kind == 'i' && !jam_is_int(e->type))) return no;
+        return (JV){xs_sprintf("(-%s)", x.c), x.kind, x.bound, false, false};
+    }
+    case E_BINARY: {
+        if (e->builtin.cfn && strcmp(e->builtin.cfn, "xs_idiv") != 0 && strcmp(e->builtin.cfn, "xs_idiv_s") != 0) return no;
+        if (e->op != TK_PLUS && e->op != TK_MINUS && e->op != TK_STAR && e->op != TK_SLASH) return no;
+        JV x = jam_expr(J, e->lhs), y = jam_expr(J, e->rhs);
+        if (!x.c || !y.c) return no;
+        const char *op = e->op == TK_PLUS ? "+" : e->op == TK_MINUS ? "-" : e->op == TK_STAR ? "*" : "/";
+        if (jam_is_int(e->type)) { /* an integer operation: the same value while within ±(2^53 − 1) */
+            if (x.kind != 'i' || y.kind != 'i' || e->op == TK_SLASH) return no;
+            const char *bd = xs_sprintf("(%s %s %s)", x.bound, e->op == TK_STAR ? "*" : "+", y.bound);
+            /* 2^52: the bound itself is computed in doubles, a few roundings below the integer limit */
+            if (J->checks) buf_printf(J->checks, "    if (!(%s <= 4503599627370496.0)) return false;\n", bd);
+            /* -0 only from (-0) + (-0), (-0) - 0, or a zero product of opposite signs */
+            bool nz = e->op == TK_PLUS ? (x.nz || y.nz) : e->op == TK_MINUS ? x.nz : (x.nz && y.nz && x.nn && y.nn);
+            bool nn = e->op == TK_MINUS ? false : (x.nn && y.nn);
+            return (JV){xs_sprintf("(%s %s %s)", x.c, op, y.c), 'i', bd, nz, nn};
+        }
+        if (!jam_is_num(e->type)) return no;
+        return (JV){xs_sprintf("(%s %s %s)", jam_num_of(x), op, jam_num_of(y)), 'n', NULL, false, false};
+    }
+    case E_CALL: {
+        if (e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && strcmp(e->lhs->str, "Number") == 0 && e->args.len == 1 && e->builtin.cfn &&
+            (strcmp(e->builtin.cfn, "xs_to_number") == 0 || strcmp(e->builtin.cfn, "xs_to_number_id") == 0)) {
+            JV x = jam_expr(J, e->args.items[0]);
+            if (!x.c) return no;
+            return (JV){jam_num_of(x), 'n', NULL, false, false};
+        }
+        Func *f = e->func;
+        if (!f || e->builtin.cfn || f->is_native || f->cls || f->is_async || !f->body || f->nparams != e->args.len || J->depth > 4) return no;
+        if (f->body->kind != S_BLOCK || f->body->stmts.len != 1 || f->body->stmts.items[0]->kind != S_RETURN) return no;
+        if (!jam_is_num(f->ret) && !jam_is_int(f->ret)) return no;
+        JamSub *subs = calloc((size_t)(f->nparams ? f->nparams : 1), sizeof(JamSub));
+        for (int k = 0; k < f->nparams; k++) {
+            Param *p = &f->params[k];
+            if (p->dflt || p->cell || (!jam_is_num(p->type) && !jam_is_int(p->type))) return no;
+            JV x = jam_expr(J, e->args.items[k]);
+            if (!x.c) return no;
+            if (jam_is_num(p->type) && x.kind == 'i') x = (JV){jam_num_of(x), 'n', NULL, false, false};
+            if (jam_is_int(p->type) && x.kind != 'i') return no;
+            subs[k] = (JamSub){p->name, x};
+        }
+        Jam inner = *J;
+        inner.subs = subs; /* the callee sees its own parameters only */
+        inner.nsubs = f->nparams;
+        inner.depth = J->depth + 1;
+        JV x = jam_expr(&inner, f->body->stmts.items[0]->expr);
+        if (!x.c) return no;
+        if (jam_is_num(f->ret) && x.kind == 'i') x = (JV){jam_num_of(x), 'n', NULL, false, false};
+        if (jam_is_int(f->ret) && x.kind != 'i') return no;
+        return x;
+    }
+    default:
+        return no;
+    }
+}
+static bool jam_is_ident(Expr *e, const char *name) { return e && e->kind == E_IDENT && e->str && strcmp(e->str, name) == 0; }
+static Stmt *jam_single(Stmt *s) {
+    while (s && s->kind == S_BLOCK && s->stmts.len == 1) s = s->stmts.items[0];
+    return s;
+}
+static void jam_try(Arrow *a) {
+    static int off = -1;
+    if (off < 0) off = getenv("XISTO_NO_JAM") && *getenv("XISTO_NO_JAM") ? 1 : 0;
+    Func *f = a->fn;
+    if (off || xs_debug || f->nparams != 1 || !jam_is_int(f->params[0].type) || !jam_is_num(f->ret) || f->params[0].cell) return;
+    Stmt *b = f->body;
+    if (!b || b->kind != S_BLOCK || b->stmts.len != 3) return;
+    Stmt *tv = b->stmts.items[0], *loop = b->stmts.items[1], *ret = b->stmts.items[2];
+    if (tv->kind != S_VAR || tv->cell || !jam_is_num(tv->type) || !tv->init || tv->init->kind != E_NUMBER) return;
+    loop = jam_single(loop);
+    if (!loop || loop->kind != S_FOR || ret->kind != S_RETURN || !jam_is_ident(ret->expr, tv->name)) return;
+    Stmt *jv = loop->for_init;
+    if (!jv || jv->kind != S_VAR || jv->cell || !jam_is_int(jv->type) || !jv->init || jv->init->kind != E_NUMBER || jv->init->ival != 0) return;
+    Expr *c = loop->cond;
+    if (!c || c->kind != E_BINARY || c->op != TK_LT || !jam_is_ident(c->lhs, jv->name)) return;
+    Expr *len = c->rhs;
+    if (!len || len->kind != E_MEMBER || len->is_call || !len->str || strcmp(len->str, "length") != 0 || !len->lhs || len->lhs->kind != E_IDENT) return;
+    Capture *arr = jam_capture(a, len->lhs->str);
+    if (!arr || arr->boxed || !jam_num_array(arr->type)) return;
+    Expr *u = loop->for_update;
+    bool step1 = u && (((u->kind == E_UNARY || u->kind == E_POSTFIX) && u->op == TK_PLUSPLUS && jam_is_ident(u->lhs, jv->name)) ||
+                       (u->kind == E_ASSIGN && u->op == TK_PLUS_ASSIGN && jam_is_ident(u->lhs, jv->name) && u->rhs && u->rhs->kind == E_NUMBER && jam_is_int(u->rhs->type) && u->rhs->ival == 1));
+    if (!step1) return;
+    Stmt *st = jam_single(loop->body);
+    if (!st || st->kind != S_EXPR || !st->expr || st->expr->kind != E_ASSIGN || st->expr->op != TK_PLUS_ASSIGN || !jam_is_ident(st->expr->lhs, tv->name)) return;
+    Buf checks = {0};
+    Jam J = {a, f->params[0].name, jv->name, arr->name, 0, NULL, 0, 0, &checks};
+    const char *terms[8];
+    for (int k = 0; k < 8; k++) {
+        J.lane = k;
+        J.checks = k == 0 ? &checks : NULL;
+        JV x = jam_expr(&J, st->expr->rhs);
+        if (!x.c) { free(checks.data); return; }
+        terms[k] = jam_num_of(x);
+    }
+    const char *cn = f->cname;
+    Buf *o = &arrow_fns;
+    buf_printf(o, "static __attribute__((unused)) bool %s_x8(void *env_, int64_t i_, double *out_) { /* rows i_..i_+7 (jam, XB-083) */\n", cn);
+    buf_printf(o, "    %s_env *env = env_;\n", cn);
+    buf_printf(o, "    int64_t n_ = (int64_t)env->c_%s->len;\n    const double *ad_ = env->c_%s->data;\n", arr->name, arr->name);
+    /* every integer operation within range for rows i_..i_+7 and columns 0..n_-1, or the rows go one by one */
+    buf_puts(o, "    double ib_ = (double)(i_ + 7), jb_ = (double)(n_ > 0 ? n_ - 1 : 0);\n    (void)ib_; (void)jb_;\n");
+    if (checks.data) buf_puts(o, checks.data);
+    free(checks.data);
+    const char *k0 = jam_dbl(tv->init->num);
+    if (jam_is_int(tv->init->type)) k0 = jam_dbl((double)tv->init->ival);
+    buf_printf(o, "    double t0_ = %s, t1_ = %s, t2_ = %s, t3_ = %s, t4_ = %s, t5_ = %s, t6_ = %s, t7_ = %s;\n", k0, k0, k0, k0, k0, k0, k0, k0);
+    buf_puts(o, "    for (int64_t j_ = 0; j_ < n_; j_++) {\n");
+    for (int k = 0; k < 8; k++) buf_printf(o, "        t%d_ += %s;\n", k, terms[k]);
+    buf_puts(o, "    }\n");
+    for (int k = 0; k < 8; k++) buf_printf(o, "    out_[%d] = t%d_;\n", k, k);
+    buf_puts(o, "    return true;\n}\n");
+    buf_printf(&jam_tab, "    if (fn == (void *)%s) return (void *)%s_x8;\n", cn, cn);
+}
+
 static void emit_par_variant(Func *f) {
     const char *kind = (f->template_of ? f->template_of : f)->name;
     bool map = strcmp(kind, "parallelMap") == 0, fill = strcmp(kind, "parallelFill") == 0;
@@ -5808,10 +5995,16 @@ static void emit_par_variant(Func *f) {
     const char *rt = ctype(ft->ret), *cn = f->cname;
     const char *items_t = map ? ctype(f->params[0].type) : NULL, *item_t = map ? ctype(f->params[0].type->elem) : NULL;
     bool heap = ty_is_heap(ft->ret);
-    buf_printf(out, "\ntypedef struct { xs_closure *fn; %s *slots;%s%s } %s_pctx;\n", rt, map ? " " : "", map ? xs_sprintf("%sitems;", items_t) : "", cn);
+    bool jam = fill && ft->ret && ft->ret->kind == TY_NUMBER && ft->nparams == 1 && ft->params[0] && (ft->params[0]->kind == TY_INT || ft->params[0]->kind == TY_LITINT);
+    buf_printf(out, "\ntypedef struct { xs_closure *fn; %s *slots;%s%s%s } %s_pctx;\n", rt, map ? " " : "", map ? xs_sprintf("%sitems;", items_t) : "", jam ? " bool (*jam)(void *, int64_t, double *);" : "", cn);
     buf_printf(out, "static void %s_pbody(void *c_, int64_t i) {\n    %s_pctx *c = c_;\n    c->slots[i] = ", cn, cn);
     emit_closure_call_prefix(ft);
     buf_printf(out, "c->fn->fn)(c->fn, %si);\n}\n", map ? "c->items->data[i], " : "");
+    if (jam) { /* eight rows at once when the callback has a jam version (XB-083) */
+        if (!jam_used) buf_puts(out, "static void *xs_jam8_of(void *fn);\n");
+        jam_used = true;
+        buf_printf(out, "static bool %s_pbody8(void *c_, int64_t i) {\n    %s_pctx *c = c_;\n    return c->jam(c->fn, i, c->slots + i);\n}\n", cn, cn);
+    }
     buf_printf(out, "static %s %s_preplay(xs_pool_replay *r, %si) {\n", rt, cn, map ? xs_sprintf("%s item, int64_t ", item_t) : "int64_t ");
     if (map) buf_puts(out, "    (void)item;\n");
     buf_puts(out, "    if (i == atomic_load(&r->job->err_i)) xs_pool_fail(r, i);\n");
@@ -5823,9 +6016,11 @@ static void emit_par_variant(Func *f) {
     const char *n = map || fill ? xs_sprintf("(int64_t)%s->len", f->params[0].cname) : f->params[0].cname;
     buf_printf(out, " {\n    int64_t n_ = %s;\n    if (!xs_pool_worth(n_)) return %s(", n, cn);
     for (int i = 0; i < f->nparams; i++) buf_printf(out, "%s%s", i ? ", " : "", f->params[i].cname);
-    buf_printf(out, ");\n    %s_pctx c_ = {%s, calloc((size_t)n_, sizeof(%s))%s%s};\n", cn, f->params[1].cname, rt, map ? ", " : "", map ? f->params[0].cname : "");
+    buf_printf(out, ");\n    %s_pctx c_ = {%s, calloc((size_t)n_, sizeof(%s))%s%s%s};\n", cn, f->params[1].cname, rt, map ? ", " : "", map ? f->params[0].cname : "",
+               jam ? xs_sprintf(", (bool (*)(void *, int64_t, double *))xs_jam8_of(%s->fn)", f->params[1].cname) : "");
     buf_puts(out, "    if (!c_.slots) xs_panic(\"out of memory\");\n    xs_pool_job j_;\n");
-    buf_printf(out, "    xs_pool_run(&j_, n_, %s_pbody, &c_);\n", cn);
+    if (jam) buf_printf(out, "    xs_pool_run8(&j_, n_, %s_pbody, c_.jam ? %s_pbody8 : NULL, &c_);\n", cn, cn);
+    else buf_printf(out, "    xs_pool_run(&j_, n_, %s_pbody, &c_);\n", cn);
     buf_printf(out, "    xs_pool_replay r_ = {{{XS_IMMORTAL, 0}, (void *)%s_preplay}, &j_, c_.slots, sizeof(%s), %s};\n", cn, rt, heap ? xs_sprintf("%s_pdrop", cn) : "NULL");
     bool is_void = !f->ret || f->ret->kind == TY_VOID;
     buf_printf(out, "    %s%s(", is_void ? "" : xs_sprintf("%s%sres_ = ", ctype(f->ret), ctype(f->ret)[strlen(ctype(f->ret)) - 1] == '*' ? "" : " "), cn);
@@ -7485,6 +7680,12 @@ void emit_program(Program *p, Buf *o) {
     if (arrow_fns.data) buf_puts(out, arrow_fns.data);
     if (gen_fns.data) { buf_puts(out, gen_fns.data); gen_fns.len = 0; gen_fns.data[0] = 0; }
     buf_puts(out, body.data ? body.data : "");
+    if (jam_used) { /* the jam versions of the callbacks (XB-083) */
+        buf_printf(out, "\nstatic void *xs_jam8_of(void *fn) {\n%s    (void)fn;\n    return NULL;\n}\n", jam_tab.data ? jam_tab.data : "");
+    }
+    jam_used = false;
+    jam_tab.len = 0;
+    if (jam_tab.data) jam_tab.data[0] = 0;
     /* call sites for stack traces: read only when an error is reported */
     if (!nsites) buf_puts(&site_tab, "    {0}");
     buf_printf(out, "\n__attribute__((used)) const xs_site xs_sitetab[] = {\n%s\n};\n", site_tab.data);

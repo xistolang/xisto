@@ -2573,6 +2573,8 @@ static inline int64_t xs_imul(int64_t a, int64_t b) { return xs_imul_s(a, b, NUL
 static inline int64_t xs_ineg(int64_t a) { return xs_ineg_s(a, NULL); }
 static inline int64_t xs_imod(int64_t a, int64_t b) { return xs_imod_s(a, b, NULL); }
 static inline double xs_idiv(int64_t a, int64_t b) { return (double)a / (double)b; } /* int / int is number, as in JS */
+/* jam (XB-083): an integer computed in a double; *bad notes a value outside ±(2^53 − 1) (the int would have failed) */
+static inline double xs_jam_ck(bool *bad, double r) { *bad |= !(__builtin_fabs(r) <= 9007199254740991.0); return r; }
 static inline int64_t xs_iadd_to(int64_t *p, int64_t b) { return *p = xs_iadd(*p, b); }
 static inline int64_t xs_isub_to(int64_t *p, int64_t b) { return *p = xs_isub(*p, b); }
 static inline int64_t xs_imul_to(int64_t *p, int64_t b) { return *p = xs_imul(*p, b); }
@@ -6693,6 +6695,7 @@ static void xs_exit(void) {
 #include <stdatomic.h>
 typedef struct {
     void (*body)(void *ctx, int64_t i);
+    bool (*body8)(void *ctx, int64_t i); /* rows i..i+7 at once, or false: run them one by one (jam, XB-083) */
     void *ctx;
     int64_t n, chunk;
     _Atomic int64_t next;
@@ -6720,6 +6723,11 @@ static void xs_pool_chunks(xs_pool_job *j) {
         size_t am = xs_ar_mark();
         xs_try_push(&tb);
         if (_setjmp(tb) == 0) {
+            if (j->body8) /* (body8 never throws: false sends the rows to body, which reports the error where it is) */
+                while (i < e) {
+                    if (i + 7 < e && j->body8(j->ctx, i)) i += 8;
+                    else j->body(j->ctx, i++);
+                }
             for (; i < e; i++) j->body(j->ctx, i);
             xs_try_pop();
         } else {
@@ -6775,11 +6783,12 @@ static int xs_pool_threads(void) {
 /* worth a job: more than one index, more than one thread, and not already inside one */
 static bool xs_pool_worth(int64_t n) { return n > 1 && !xs_pool_inside && xs_pool_threads() > 1; }
 /* runs body(ctx, i) for every i in [0, n) on the pool; afterwards j->err_i < n tells the failing index */
-static void xs_pool_run(xs_pool_job *j, int64_t n, void (*body)(void *, int64_t), void *ctx) {
+static void xs_pool_run8(xs_pool_job *j, int64_t n, void (*body)(void *, int64_t), bool (*body8)(void *, int64_t), void *ctx) {
     int t = xs_pool_threads();
-    j->body = body, j->ctx = ctx, j->n = n, j->err = NULL;
+    j->body8 = body8, j->body = body, j->ctx = ctx, j->n = n, j->err = NULL;
     int64_t c = n / ((int64_t)t * 16);
     j->chunk = c < 1 ? 1 : c;
+    if (body8) j->chunk = (j->chunk + 7) & ~(int64_t)7; /* whole groups of eight rows */
     atomic_store(&j->next, 0);
     atomic_store(&j->err_i, n);
     atomic_store(&j->live, 0);
@@ -6796,6 +6805,9 @@ static void xs_pool_run(xs_pool_job *j, int64_t n, void (*body)(void *, int64_t)
     pthread_mutex_unlock(&xs_pool_mu);
     xs_live += atomic_load(&j->live);
     xs_allocs += atomic_load(&j->allocs);
+}
+static void xs_pool_run(xs_pool_job *j, int64_t n, void (*body)(void *, int64_t), void *ctx) {
+    xs_pool_run8(j, n, body, NULL, ctx);
 }
 /* the replay closure: the module's own loop runs again on main, and its fn hands back the value already made for
    index i, or throws the error of the failing index there (so what happens before it happens as in the loop) */
