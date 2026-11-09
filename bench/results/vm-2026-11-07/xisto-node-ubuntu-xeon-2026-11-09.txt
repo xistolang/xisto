@@ -1,0 +1,92 @@
+steal before 4925675
+# Linux x86_64, 2 cpu; /home/ubuntu/node24/bin/node v24.22.2; median of 3
+spectralnorm   xisto  spectralnorm                0.461s     0.89cpu      2.1MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-2              1.384s     2.63cpu      2.2MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-3              0.562s     0.92cpu      2.3MB  par  1.6  same
+spectralnorm   xisto  spectralnorm-4              0.474s     0.90cpu      2.3MB  par  1.9  same
+spectralnorm   node   spectralnorm-node-1         3.698s     3.71cpu     53.4MB  par  1.0  same
+spectralnorm   node   spectralnorm.ts             5.107s     5.13cpu     71.7MB  par  1.0  same
+nbody          xisto  nbody                       2.457s     2.46cpu      1.9MB  par  1.0  same
+nbody          xisto  nbody-2                     7.237s     7.23cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-3                     4.933s     4.93cpu      1.9MB  par  1.0  same
+nbody          xisto  nbody-4                     3.626s     3.62cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-5                     2.580s     2.58cpu      1.9MB  par  1.0  same
+nbody          node   nbody-node-8                6.295s     6.30cpu     53.2MB  par  1.0  same
+nbody          node   nbody.ts                   51.517s    51.83cpu     89.7MB  par  1.0  same
+fannkuchredux  xisto  fannkuchredux               8.975s    17.77cpu      2.0MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-2            11.808s    23.33cpu      2.3MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-3            11.326s    22.41cpu      2.3MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-4             7.640s    15.13cpu      2.3MB  par  2.0  same
+fannkuchredux  node   fannkuchredux-node-8       54.862s    54.86cpu     50.8MB  par  1.0  same
+fannkuchredux  node   fannkuchredux.ts           50.309s    50.33cpu     73.2MB  par  1.0  same
+binarytrees    xisto  binarytrees                 1.853s     3.41cpu    258.8MB  par  1.8  same
+binarytrees    xisto  binarytrees-2               1.800s     3.32cpu    239.9MB  par  1.8  same
+binarytrees    xisto  binarytrees-3               1.766s     3.37cpu    229.0MB  par  1.9  same
+binarytrees    xisto  binarytrees-4               3.714s     3.71cpu    227.0MB  par  1.0  same
+binarytrees    node   binarytrees-node-7         33.573s    50.05cpu    681.5MB  par  1.5  same
+binarytrees    node   binarytrees.ts             15.884s    19.80cpu    825.0MB  par  1.2  same
+mandelbrot     xisto  mandelbrot                  2.143s     4.03cpu     33.6MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-2                3.152s     5.88cpu     32.8MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-3                2.368s     4.41cpu     32.9MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-4                2.182s     4.08cpu     33.1MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-5                2.068s     3.85cpu     33.0MB  par  1.9  same
+mandelbrot     node   mandelbrot-node-1          82.841s    82.81cpu     55.7MB  par  1.0  same
+mandelbrot     node   mandelbrot.ts              14.479s    14.49cpu    123.7MB  par  1.0  same
+fasta          xisto  fasta                       1.110s     0.29cpu      5.4MB  par  0.3  same
+fasta          xisto  fasta-2                     1.304s     0.56cpu      2.1MB  par  0.4  same
+fasta          node   fasta-node-1               19.459s    21.40cpu   1775.2MB  par  1.1  DIFFERS
+fasta          node   fasta.ts                    3.074s     2.69cpu    911.6MB  par  0.9  same
+knucleotide    xisto  knucleotide                 1.685s     3.08cpu    363.9MB  par  1.8  same
+knucleotide    xisto  knucleotide-2               4.144s     7.08cpu    367.8MB  par  1.7  same
+knucleotide    xisto  knucleotide-3               3.598s     6.78cpu    363.8MB  par  1.9  same
+knucleotide    xisto  knucleotide-4               2.497s     4.41cpu    156.9MB  par  1.8  same
+knucleotide    xisto  knucleotide-5               2.063s     3.95cpu    156.9MB  par  1.9  same
+knucleotide    xisto  knucleotide-6               1.325s     2.48cpu    157.7MB  par  1.9  same
+knucleotide    node   knucleotide-node-8        104.726s   105.28cpu    738.2MB  par  1.0  same
+knucleotide    node   knucleotide.ts             26.931s    27.00cpu    926.5MB  par  1.0  same
+revcomp        xisto  revcomp                     0.977s     0.36cpu    188.6MB  par  0.4  same
+revcomp        xisto  revcomp-2                   1.196s     0.31cpu    244.2MB  par  0.3  same
+revcomp        xisto  revcomp-3                   1.184s     0.36cpu    486.8MB  par  0.3  same
+revcomp        xisto  revcomp-4                   1.081s     0.24cpu    244.6MB  par  0.2  same
+revcomp        xisto  revcomp-5                   1.045s     0.31cpu    308.7MB  par  0.3  same
+revcomp        xisto  revcomp-6                   0.969s     0.29cpu    188.8MB  par  0.3  same
+revcomp        xisto  revcomp-7                   1.044s     0.29cpu    189.5MB  par  0.3  same
+revcomp        node   revcomp-node-2              5.457s     4.91cpu    832.2MB  par  0.9  same
+revcomp        node   revcomp.ts                  1.845s     1.02cpu    315.5MB  par  0.6  same
+regexredux     xisto  regexredux                  0.950s     0.95cpu    148.7MB  par  1.0  same
+regexredux     node   regexredux-node-4           4.737s     4.91cpu    803.9MB  par  1.0  same
+regexredux     node   regexredux.ts               4.689s     4.85cpu    941.5MB  par  1.0  same
+pidigits       xisto  pidigits                    0.630s     0.63cpu      2.6MB  par  1.0  same
+pidigits       node   pidigits-node-3            10.790s    10.81cpu    118.3MB  par  1.0  same
+pidigits       node   pidigits.ts                10.349s    10.38cpu    134.0MB  par  1.0  same
+
+### O melhor de cada: o programa xisto mais rápido × o programa Node do jogo
+
+| problema | xisto | Node | tempo xisto | tempo Node | CPU xisto | CPU Node | mem xisto | mem Node | xisto mais rápido |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| spectralnorm | spectralnorm | spectralnorm-node-1 | **0,46 s** | 3,70 s | **0,89 u** | 3,71 u | **2,1 MB** | 53 MB | 8,0x |
+| nbody | nbody | nbody-node-8 | **2,46 s** | 6,30 s | **2,46 u** | 6,30 u | **1,9 MB** | 53 MB | 2,6x |
+| fannkuchredux | fannkuchredux-4 | fannkuchredux-node-8 | **7,64 s** | 54,86 s | **15,13 u** | 54,86 u | **2,3 MB** | 51 MB | 7,2x |
+| binarytrees | binarytrees-3 | binarytrees-node-7 | **1,77 s** | 33,57 s | **3,37 u** | 50,05 u | **229 MB** | 681 MB | 19,0x |
+| mandelbrot | mandelbrot-5 | mandelbrot-node-1 | **2,07 s** | 82,84 s | **3,85 u** | 82,81 u | **33 MB** | 56 MB | 40,1x |
+| fasta | fasta | falhou | | | | | | | |
+| knucleotide | knucleotide-6 | knucleotide-node-8 | **1,32 s** | 104,73 s | **2,48 u** | 105,28 u | **158 MB** | 738 MB | 79,1x |
+| revcomp | revcomp-6 | revcomp-node-2 | **0,97 s** | 5,46 s | **0,29 u** | 4,91 u | **189 MB** | 832 MB | 5,6x |
+| regexredux | regexredux | regexredux-node-4 | **0,95 s** | 4,74 s | **0,95 u** | 4,91 u | **149 MB** | 804 MB | 5,0x |
+| pidigits | pidigits | pidigits-node-3 | **0,63 s** | 10,79 s | **0,63 u** | 10,81 u | **2,6 MB** | 118 MB | 17,1x |
+
+### O mesmo programa: <problema>.ts compilado pelo xisto × o mesmo arquivo no Node
+
+| problema | xisto | Node | tempo xisto | tempo Node | CPU xisto | CPU Node | mem xisto | mem Node | xisto mais rápido |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| spectralnorm | spectralnorm | spectralnorm.ts | **0,46 s** | 5,11 s | **0,89 u** | 5,13 u | **2,1 MB** | 72 MB | 11,1x |
+| nbody | nbody | nbody.ts | **2,46 s** | 51,52 s | **2,46 u** | 51,83 u | **1,9 MB** | 90 MB | 21,0x |
+| fannkuchredux | fannkuchredux | fannkuchredux.ts | **8,97 s** | 50,31 s | **17,77 u** | 50,33 u | **2,0 MB** | 73 MB | 5,6x |
+| binarytrees | binarytrees | binarytrees.ts | **1,85 s** | 15,88 s | **3,41 u** | 19,80 u | **259 MB** | 825 MB | 8,6x |
+| mandelbrot | mandelbrot | mandelbrot.ts | **2,14 s** | 14,48 s | **4,03 u** | 14,49 u | **34 MB** | 124 MB | 6,8x |
+| fasta | fasta | fasta.ts | **1,11 s** | 3,07 s | **0,29 u** | 2,69 u | **5,4 MB** | 912 MB | 2,8x |
+| knucleotide | knucleotide | knucleotide.ts | **1,68 s** | 26,93 s | **3,08 u** | 27,00 u | **364 MB** | 926 MB | 16,0x |
+| revcomp | revcomp | revcomp.ts | **0,98 s** | 1,84 s | **0,36 u** | 1,02 u | **189 MB** | 316 MB | 1,9x |
+| regexredux | regexredux | regexredux.ts | **0,95 s** | 4,69 s | **0,95 u** | 4,85 u | **149 MB** | 942 MB | 4,9x |
+| pidigits | pidigits | pidigits.ts | **0,63 s** | 10,35 s | **0,63 u** | 10,38 u | **2,6 MB** | 134 MB | 16,4x |
+steal after 4926285
