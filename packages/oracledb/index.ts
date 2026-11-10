@@ -33,6 +33,22 @@ export let fetchAsString: int[] = [];
  */
 export let fetchAsBuffer: int[] = [];
 
+/**
+ * Rows fetched ahead with a query's first round trip, and rows per later round trip (node-oracledb's
+ * oracledb.prefetchRows and oracledb.fetchArraySize, set by assignment).
+ * Compatibility: accepted; the thin driver here fetches with its own sizes.
+ */
+export let prefetchRows: number = 2;
+export let fetchArraySize: number = 100;
+
+/**
+ * Thick mode (Oracle Client libraries) is not available: xisto's driver is thin only. Throws as node-oracledb
+ * does on a machine with no Oracle Client, so code that falls back to thin mode keeps working.
+ */
+export function initOracleClient(): void {
+  throw new Error("DPI-1047: Cannot locate an Oracle Client library: xisto's oracledb runs in thin mode only");
+}
+
 /** How to reach the database and who logs in. */
 export interface ConnectionAttributes {
   /** The database user. */
