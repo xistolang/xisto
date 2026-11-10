@@ -6,9 +6,9 @@
 // (`const r: SearchResult = await client.search({ ... })`).
 //
 // Compatibility with npm's client:
-// - Errors are Error values whose message is the client's (the error type, then the root causes); xisto cannot
-//   extend Error, so there is no err.meta.statusCode: pass { ignore: [404] } in the options to get the body of a
-//   404 instead of an error (as the npm client allows), or test the message.
+// - Errors are the client's: ResponseError (an HTTP error status: err.meta.statusCode, err.meta.body, err.statusCode),
+//   ConnectionError, TimeoutError, each an Error with the npm client's message and name; catch (e) { if (e
+//   instanceof ResponseError && e.meta.statusCode === 404) ... }, or pass { ignore: [404] } to get the body instead.
 // - Calls covered: search, count, index, get, update, delete, bulk, ping, info, close, cluster.health,
 //   indices.create, indices.exists, indices.delete, indices.putMapping, indices.putIndexTemplate, ilm.putLifecycle.
 
@@ -74,6 +74,52 @@ function optSegment(params: string, key: string): string {
   const raw = field(params, key);
   const v = raw === "" ? "" : text(raw);
   return v === "" ? "" : "/" + encode(v, true);
+}
+
+/** What an error response was: its status and its body (the JSON, or the text as a JSON string). */
+export interface ResponseMeta {
+  statusCode: int;
+  body: object;
+}
+
+/** An error status from the cluster, as the npm client's errors.ResponseError. */
+export class ResponseError extends Error {
+  meta: ResponseMeta;
+  constructor(status: int, body: string) {
+    super(errorMessage(status, body));
+    this.name = "ResponseError";
+    this.meta = { statusCode: status, body: parseBody(body) };
+  }
+  get statusCode(): int {
+    return this.meta.statusCode;
+  }
+  get body(): object {
+    return this.meta.body;
+  }
+}
+
+/** The cluster could not be reached, as the npm client's errors.ConnectionError. */
+export class ConnectionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConnectionError";
+  }
+}
+
+/** No answer within requestTimeout, as the npm client's errors.TimeoutError. */
+export class TimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TimeoutError";
+  }
+}
+
+function parseBody(body: string): object {
+  try {
+    return JSON.parse(body) as object;
+  } catch (e) {
+    return JSON.parse(JSON.stringify(body)) as object;
+  }
 }
 
 /** The message of the npm client's ResponseError for a response body. */
@@ -162,10 +208,11 @@ class Transport {
         attempt++;
         continue;
       }
-      if (failure !== "") throw new Error(failure);
+      if (failure === "Request timed out") throw new TimeoutError(failure);
+      if (failure !== "") throw new ConnectionError(failure);
       if (status >= 400 && ignore.findIndex((c) => c === status) < 0) {
         if (method === "HEAD" && status === 404) return new Reply(status, "");
-        throw new Error(errorMessage(status, txt));
+        throw new ResponseError(status, txt);
       }
       return new Reply(status, txt);
     }

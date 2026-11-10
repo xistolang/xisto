@@ -523,7 +523,13 @@ struct Class {
     struct Func **smethods;
     int nsmethods;
     Type *alias;       /* type Name = A | B: a name for another type (not an object shape) */
+    bool extends_error; /* class X extends Error: fields message and name first, laid out as the runtime's Error */
 };
+/* a class that extends Error, directly or through its bases */
+static inline bool is_error_class(struct Class *c) {
+    for (; c; c = c->base) if (c->extends_error) return true;
+    return false;
+}
 
 typedef struct {
     char *name;

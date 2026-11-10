@@ -1,7 +1,7 @@
 // @elastic/elasticsearch (packages/@elastic/elasticsearch) against tests/elasticsearch/server.mjs: each call's
 // method, path, query string and body (what the fake cluster echoes back), the decoded responses, a 404 as an
 // error and with ignore: [404], a retry after a 503, a timeout, basic auth and NDJSON bulk bodies.
-import { Client } from "@elastic/elasticsearch";
+import { Client, ResponseError, TimeoutError } from "@elastic/elasticsearch";
 
 interface Echo { method: string; path: string; body: string; auth: string; type: string }
 interface Source { company: string; amount: number }
@@ -53,7 +53,8 @@ try {
   await client.get({ index: "orders", id: "missing" });
   console.log("get missing: no error?");
 } catch (e) {
-  console.log("get missing: error");
+  if (e instanceof ResponseError) console.log("get missing: error", e.name, e.meta.statusCode, e.statusCode);
+  else console.log("get missing: error");
 }
 const missing: Missing = await client.get({ index: "orders", id: "missing" }, { ignore: [404] });
 console.log("get missing with ignore:", missing._id, missing.found);
@@ -94,7 +95,7 @@ try {
   await client.search({ index: "slow", size: 1 }, { requestTimeout: 200, maxRetries: 0 });
   console.log("slow: no timeout?");
 } catch (e) {
-  console.log("slow:", e.message);
+  console.log("slow:", e.message, e.name, e instanceof TimeoutError);
 }
 
 await client.close();
