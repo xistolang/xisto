@@ -5,5 +5,5 @@
   "implements": { "@nestjs/common": "^10" },
   "main": "index.ts",
   "native": ["native/body.c"],
-  "dependencies": { "express": "0.1.0" }
+  "dependencies": { "express": "0.1.0", "rxjs": "0.1.0" }
 }

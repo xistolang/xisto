@@ -1,0 +1,10 @@
+{
+  "name": "passport-jwt",
+  "version": "0.1.0",
+  "license": "MIT",
+  "implements": { "passport-jwt": "^4" },
+  "main": "index.ts",
+  "native": ["native/verify.c"],
+  "needs": ["crypto"],
+  "dependencies": { "express": "0.1.0" }
+}

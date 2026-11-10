@@ -1804,8 +1804,17 @@ static Class *parse_class_ex(Parser *p, bool abstract) {
         next(p);
         c->base_pos = p->tok.pos;
         Token bt = expect(p, TK_IDENT, NULL);
-        if (at(p, TK_LPAREN)) c->mixin = parse_mixin_rest(p, bt); /* extends PartialType(CreateDto) */
-        else c->base_name = bt.str;
+        bool mapped = !strcmp(bt.str, "PartialType") || !strcmp(bt.str, "OmitType") || !strcmp(bt.str, "PickType") || !strcmp(bt.str, "IntersectionType");
+        if (at(p, TK_LPAREN) && mapped) c->mixin = parse_mixin_rest(p, bt); /* extends PartialType(CreateDto) */
+        else if (at(p, TK_LPAREN)) { /* extends PassportStrategy(Strategy, "jwt"), AuthGuard(["jwt"]): a class factory as the
+                                       library writes it. X extends F; F.__mixin(args) is a class decorator on X (what the
+                                       factory would have closed over is recorded per class) */
+            const char *from = p->tok.start;
+            ExprList args = {0};
+            parse_args(p, &args);
+            c->base_name = bt.str;
+            c->mixin_call = xs_sprintf("%s.__mixin%s", bt.str, span(p, from));
+        } else c->base_name = bt.str;
         if (at(p, TK_LT)) xs_error(XS6022, p->tok.pos, NULL, "extending a generic class is not supported yet");
     }
     if (at_ident(p, "implements")) { /* recorded; the methods are what the framework calls */
@@ -2339,8 +2348,8 @@ static bool class_decorated(Class *c) {
     return false;
 }
 static void tinfo(Buf *b, const char *t) {
-    if (strcmp(t, "object") == 0 || strcmp(t, "unknown") == 0) { /* any value: no JSON adapters of its own */
-        buf_puts(b, "{ kind: \"other\", id: \"unknown\", decode: (json: string): unknown => null, encode: (value: unknown): string => \"null\", schema: \"{}\" }");
+    if (strcmp(t, "object") == 0 || strcmp(t, "unknown") == 0) { /* any value: read as null, written by its type at run time */
+        buf_puts(b, "{ kind: \"other\", id: \"unknown\", decode: (json: string): unknown => null, encode: (value: unknown): string => JSON.stringify(value), schema: \"{}\" }");
         return;
     }
     buf_printf(b, "{ kind: __reflect_kind(%s), id: __reflect_typeid(%s), decode: __reflect_decoder(%s), encode: __reflect_encoder(%s), schema: __reflect_schema(%s) }", t, t, t, t, t);
@@ -2362,7 +2371,20 @@ static void apply(Buf *b, Decorator *d, const char *target) {
     int n = ndeco++;
     buf_printf(b, "const __deco%d = %s;\n__deco%d(%s);\n", n, d->src, n, target);
 }
-static void reflect_class(Buf *g, Module *m, Class *c) {
+/* the class X extends, when it has a ClassInfo too (decorated): ClassInfo.base, where a framework finds the
+   methods X inherits (a guard's canActivate from AuthGuard) */
+static Class *reflected_base(Program *prog, Class *c) {
+    if (!c->base_name || strchr(c->base_name, '<')) return NULL;
+    Class *found = NULL;
+    for (int i = 0; i < prog->nclasses; i++) {
+        Class *b = prog->classes[i];
+        if (b == c || b->builtin || b->is_interface || strcmp(b->name, c->base_name) != 0) continue;
+        if (b->mod == c->mod) return class_decorated(b) ? b : NULL;
+        if (!found) found = b;
+    }
+    return found && class_decorated(found) ? found : NULL;
+}
+static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
     const char *ci_name = xs_sprintf("__ci_%s", c->name);
     buf_printf(g, "const %s: ClassInfo = {\n  id: \"%s#%s\",\n  name: \"%s\",\n  params: ", ci_name, xs_display_path(m->file), c->name, c->name);
     params_info(g, c->ctor);
@@ -2398,7 +2420,8 @@ static void reflect_class(Buf *g, Module *m, Class *c) {
         tinfo(g, fd->type_src ? fd->type_src : "unknown");
         buf_printf(g, ", get: (o: unknown): unknown => (o as %s).%s }", c->name, fd->name);
     }
-    buf_puts(g, "],\n};\n");
+    Class *base = reflected_base(prog, c);
+    buf_printf(g, "],\n  isInstance: (value: unknown): boolean => value instanceof %s,\n  base: %s,\n};\n", c->name, base ? base->name : "null");
     for (int k = 0, rk = 0; k < c->nmethods; k++) {
         Func *f = c->methods[k];
         if (f->ntparams) continue; /* (not described: see above) */
@@ -2440,7 +2463,7 @@ static void reflect_module(Program *prog, Module *m, int top_start) {
         Class *c = prog->classes[ci];
         if (c->mod != m || c->builtin || c->is_interface || !class_decorated(c)) continue;
         Buf g = {0};
-        reflect_class(&g, m, c);
+        reflect_class(&g, prog, m, c);
         if (getenv("XISTO_SHOW_REFLECT")) fprintf(stderr, "/* reflection of %s in %s */\n%s\n", c->name, m->file, g.data);
         const char *saved_src = xs_source;
         xs_source = g.data;
@@ -2772,6 +2795,18 @@ static void parse_module(Program *prog, Module *m) {
             if (abstract) next(&p);
             Class *c = parse_class_ex(&p, abstract);
             c->decos = decos;
+            if (c->mixin_call) { /* (see Class.mixin_call) */
+                Decorator d = {0};
+                d.pos = c->base_pos;
+                d.name = "__mixin";
+                d.called = true;
+                d.src = c->mixin_call;
+                c->decos.items = realloc(c->decos.items, sizeof(Decorator) * (size_t)(c->decos.len + 1));
+                memmove(c->decos.items + 1, c->decos.items, sizeof(Decorator) * (size_t)c->decos.len); /* first in the list: decorators apply bottom up, so the factory's runs after the class's own */
+                c->decos.items[0] = d;
+                c->decos.len++;
+                c->decos.cap = c->decos.len;
+            }
             c->mod = m;
             c->exported = exported;
             add_class(prog, c);
@@ -2837,7 +2872,8 @@ static const char xs_reflect_src[] =
     "  invoke: (self: unknown, args: unknown[]) => unknown;\n}\n"
     "export interface FieldInfo {\n  name: string;\n  optional: boolean;\n  type: TypeInfo;\n  get: (target: unknown) => unknown;\n}\n"
     "export interface ClassInfo {\n  id: string;\n  name: string;\n  params: ParamInfo[];\n"
-    "  construct: (args: unknown[]) => unknown;\n  methods: MethodInfo[];\n  fields: FieldInfo[];\n}\n";
+    "  construct: (args: unknown[]) => unknown;\n  methods: MethodInfo[];\n  fields: FieldInfo[];\n"
+    "  isInstance: (value: unknown) => boolean;\n  base: ClassInfo | null;\n}\n";
 /* xisto:worker_threads: Node's contract restricted to strings (workerData and messages are text: JSON.stringify
    on one side, a typed JSON.parse on the other, as Node runs it too). Worker and MessagePort are built-in
    classes; these are the per-thread values, from the runtime (xisto_net.h, "worker threads") */
