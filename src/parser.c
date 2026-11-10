@@ -241,6 +241,24 @@ static Type *parse_type(Parser *p) {
         }
         return t;
     }
+    if (at(p, TK_NUMBER) || at(p, TK_TRUE) || at(p, TK_FALSE) || (at(p, TK_MINUS) && peek_is(p, TK_NUMBER))) {
+        /* 1 | 2 | 3, true, false: a number or boolean literal type is checked as number / boolean */
+        bool num = !at(p, TK_TRUE) && !at(p, TK_FALSE);
+        if (at(p, TK_MINUS)) next(p);
+        next(p);
+        t = num ? ty_number : ty_boolean;
+        while (at(p, TK_PIPE) && (peek_is(p, TK_NUMBER) || peek_is(p, TK_TRUE) || peek_is(p, TK_FALSE) || peek_is(p, TK_MINUS))) {
+            next(p);
+            if (at(p, TK_MINUS)) next(p);
+            next(p);
+        }
+        while (at(p, TK_LBRACKET) && peek_is(p, TK_RBRACKET)) { next(p); next(p); t = ty_array_of(t); }
+        if (accept(p, TK_PIPE)) {
+            if (at_ident(p, "null") || at_ident(p, "undefined")) { next(p); t = ty_nullable_of(t); if (accept(p, TK_PIPE)) t = union_of(t, parse_type(p)); }
+            else t = union_of(t, parse_type(p));
+        }
+        return t;
+    }
     if (at(p, TK_STRING)) { /* a string literal type: "circle" (a string that can only be that) */
         t = xs_alloc(sizeof *t);
         t->kind = TY_STRING;
@@ -378,10 +396,16 @@ static Type *parse_type(Parser *p) {
     }
     if (at(p, TK_PIPE)) { /* T | null, or a union A | B | ... */
         next(p);
-        if (at_ident(p, "null")) {
+        if (at_ident(p, "null") || at_ident(p, "undefined")) { /* T | undefined: the same nullable type (xisto has one
+                                                                    empty, null; an absent optional reads as it) */
             next(p);
             t = ty_nullable_of(t);
-            if (accept(p, TK_PIPE)) t = union_of(t, parse_type(p));
+            while (at(p, TK_PIPE)) {
+                next(p);
+                if (at_ident(p, "null") || at_ident(p, "undefined")) { next(p); continue; }
+                t = union_of(t, parse_type(p));
+                break;
+            }
         } else {
             t = union_of(t, parse_type(p));
         }
@@ -913,6 +937,11 @@ static Expr *parse_postfix(Parser *p) {
 }
 
 static Expr *parse_unary(Parser *p) {
+    if (at_ident(p, "void") && !peek_is(p, TK_SEMI) && !peek_is(p, TK_RPAREN) && !peek_is(p, TK_COMMA)) {
+        /* void expr: evaluated for its effects, its value dropped (void promise(); () => void f()) */
+        next(p);
+        return parse_unary(p);
+    }
     if (at_ident(p, "delete") && peek_is(p, TK_IDENT)) { /* delete m[k] / delete m.k: m.delete(k) (a Record, a Map) */
         Pos dpos = p->tok.pos;
         next(p);
@@ -1036,6 +1065,7 @@ static Expr *parse_shift(Parser *p) {
 static Expr *parse_as(Parser *p) {
     Expr *e = parse_shift(p);
     while (at_ident(p, "as")) {
+        if (peek_is(p, TK_CONST)) { next(p); next(p); continue; } /* x as const: the literal keeps its own type */
         Expr *a = new_expr(E_AS, p->tok.pos);
         next(p);
         a->lhs = e;
@@ -2707,7 +2737,27 @@ static void parse_module(Program *prog, Module *m) {
         }
         if (decos.len && !at(&p, TK_CLASS)) xs_error(XS6020, decos.items[0].pos, NULL, "decorators apply to classes, their members and parameters");
         if (is_default && !at(&p, TK_FUNCTION) && !at(&p, TK_ASYNC)) xs_error(XS6009, p.tok.pos, NULL, "'export default' applies to functions only");
-        if (at(&p, TK_IMPORT)) xs_error(XS1022, p.tok.pos, "put every import at the top of the file", "import after declarations");
+        if (at(&p, TK_IMPORT)) { /* an import after declarations (ES hoists it): read and loaded here; names resolve in the
+                                    checker, after the whole file, so declarations above may use them */
+            int n0 = m->nimports;
+            parse_import(&p, m);
+            for (int i = n0; i < m->nimports; i++) {
+                Import *im = &m->imports[i];
+                if (xs_check_mode) {
+                    jmp_buf ib;
+                    jmp_buf *saved = xs_error_recover;
+                    xs_error_recover = &ib;
+                    if (_setjmp(ib) == 0) im->from = load_module(prog, im->path, im->pos, m->path);
+                    else im->from = missing_module(prog, im->path);
+                    xs_error_recover = saved;
+                } else im->from = load_module(prog, im->path, im->pos, m->path);
+                xs_file_name = m->file;
+                xs_source = m->src;
+                parsing_prog = prog;
+                parsing_mod = m;
+            }
+            continue;
+        }
         if (at(&p, TK_FUNCTION) || at(&p, TK_ASYNC)) {
             Pos pos = p.tok.pos;
             bool is_async = accept(&p, TK_ASYNC);
