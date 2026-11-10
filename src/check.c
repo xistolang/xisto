@@ -326,8 +326,9 @@ int cmd_check(int argc, char **argv) {
         if (strcmp(argv[i], "--details") == 0) details = true;
         else if (strcmp(argv[i], "--tests") == 0) with_tests = true;
         else if (strcmp(argv[i], "--deny-warnings") == 0) deny_warnings = true;
+        else if (strcmp(argv[i], "--tsc-checked") == 0) xs_setenv("XISTO_TSC_CHECKED", "1"); /* (the children read it) */
         else if (strcmp(argv[i], "--pkgs") == 0 && i + 1 < argc) { if (!xs_use_pkgs_dir(argv[++i])) return 2; }
-        else if (argv[i][0] == '-') { fprintf(stderr, "xisto check: unknown option '%s' (--details, --tests, --deny-warnings, --pkgs DIR)\n", argv[i]); return 2; }
+        else if (argv[i][0] == '-') { fprintf(stderr, "xisto check: unknown option '%s' (--details, --tests, --deny-warnings, --tsc-checked, --pkgs DIR)\n", argv[i]); return 2; }
         else {
             char *p = xs_sprintf("%s", argv[i]);
             for (size_t n = strlen(p); n > 1 && p[n - 1] == '/'; n--) p[n - 1] = 0; /* "dir/" as "dir" */

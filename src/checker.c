@@ -1663,6 +1663,8 @@ static bool missing_get(Expr *l);
 static Expr *copy_target(Expr *x);
 static void check_loose_eq(Expr *e);
 static bool rereadable(Expr *e);
+static bool pure_read(Expr *e);
+static bool static_bool(Expr *e, bool *val);
 static Expr *expr_copy(Expr *e);
 /* rec[k] / rec.k (a Record's get, V | null) read as an object: as in JavaScript, a missing entry is a TypeError */
 static Expr *rec_get_nn(Expr *x) {
@@ -2190,6 +2192,28 @@ static bool builtin_ctor_value(Expr *e, Type *expected) {
     return false;
 }
 static Binding *lookup(const char *name);
+/* x: T | null used where T is needed (x.f, x[i], x < y): read as x! — a TypeError if it is null — with warning
+   XS2107 (XB-133): TypeScript proved it non-null where xisto's narrowing cannot follow */
+/* --tsc-checked (XISTO_TSC_CHECKED=1, XB-133): the program already passes tsc --strict, so what tsc accepted compiles,
+   checked at run time where xisto's types cannot follow it (with a warning each) */
+static bool tsc_checked(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("XISTO_TSC_CHECKED") && strcmp(getenv("XISTO_TSC_CHECKED"), "1") == 0;
+    return on;
+}
+static void nonnull_checked(Expr *e, const char *what) {
+    xs_warn_rule(XS2107, e->pos, "check first: if (x !== null) { ... }, or write x! where you know it is set",
+                 "%s may be null where %s goes: checked at run time", what, ty_name(e->type->elem));
+    Expr *inner = xs_alloc(sizeof *inner);
+    *inner = *e;
+    memset(e, 0, sizeof *e);
+    e->kind = E_AS;
+    e->op = TK_NOT;
+    e->pos = inner->pos;
+    e->lhs = inner;
+    e->field = -1;
+    e->type = inner->type->elem;
+}
 static bool shape_copy(Expr *e, Type *want);
 static void expect_type(Expr *e, Type *want, const char *what) {
     if (want->kind == TY_PROMISE || (want->kind == TY_NULLABLE && want->elem->kind == TY_PROMISE)) { /* a promise kept (XB-106) */
@@ -2306,6 +2330,35 @@ static void expect_type(Expr *e, Type *want, const char *what) {
         xs_error(XS2002, e->pos, xs_sprintf("declare it as %s | null", ty_name(want)), "%s must be %s, but this is null", what, ty_name(want));
     if (shape_copy(e, want)) return;
     if (want->kind == TY_NULLABLE && shape_copy(e, want->elem)) return;
+    if (tsc_checked() && e->type->kind == TY_UNKNOWN && want->kind != TY_VOID && !ty_is_any(want) && unknown_target(want)) {
+        /* an unknown (a row's value, a { k: null } field) where T goes, in code tsc checked: as T, checked at run time */
+        xs_warn_rule(XS2108, e->pos, "give the value its type where it is made, or cast it: x as T",
+                     "%s is unknown where %s goes: checked at run time", what, ty_name(want));
+        if (dyn_to(e, want)) return;
+    }
+    if (tsc_checked() && e->type->kind == TY_NULLABLE && want->kind != TY_NULLABLE && want->kind != TY_VOID) {
+        /* T | null where T goes (XB-133): TypeScript proved it non-null where xisto's narrowing cannot (a test in
+           another function, an index it trusts); read as x! — a TypeError if it is null — with a warning */
+        xs_warn_rule(XS2107, e->pos, "check first: if (x !== null) { ... }, or write x! where you know it is set",
+                     "%s may be null where %s goes: checked at run time", what, ty_name(want));
+        Expr *inner = xs_alloc(sizeof *inner);
+        *inner = *e;
+        memset(e, 0, sizeof *e);
+        e->kind = E_AS;
+        e->op = TK_NOT;
+        e->pos = inner->pos;
+        e->lhs = inner;
+        e->field = -1;
+        e->type = inner->type->elem;
+        expect_type(e, want, what);
+        return;
+    }
+    if (tsc_checked() && e->type->kind == TY_NUMBER && want->kind == TY_INT) {
+        /* xs.slice(0, n) with n a number: as JavaScript reads an index (ToIntegerOrInfinity), the number truncated */
+        xs_warn_rule(XS2109, e->pos, "declare it int, or convert: Math.trunc(x)", "%s is a number where an int goes: truncated", what);
+        wrap_call(e, "xs_trunc_int", ty_int);
+        return;
+    }
     const char *help = NULL;
     if (e->type->kind == TY_NULLABLE && ty_equal(e->type->elem, want))
         help = "it may be null; check first: if (x !== null) { ... }";
@@ -3165,6 +3218,13 @@ static void unify(Type *pat, Type *got, Func *tmpl, Type **bind) {
                 if (strcmp(tmpl->tparams[i], pat->ret->tname) == 0 && !bind[i]) bind[i] = got->ret;
             return;
         }
+        if (pat->ret && pat->ret->kind == TY_PROMISE && pat->ret->elem->kind == TY_TPARAM && got->ret &&
+            (got->ret->kind == TY_VOID || (got->ret->kind == TY_PROMISE && got->ret->elem->kind == TY_VOID))) {
+            /* protege<T>(fn: () => Promise<T>) with an async callback that gives nothing: T is void */
+            for (int i = 0; i < tmpl->ntparams; i++)
+                if (strcmp(tmpl->tparams[i], pat->ret->elem->tname) == 0 && !bind[i]) bind[i] = ty_void;
+            return;
+        }
         unify(pat->ret, got->ret, tmpl, bind);
         return;
     case TY_OBJECT: /* Box<T> against an instance of Box */
@@ -3457,7 +3517,7 @@ static void infer_objlit(Expr *e) {
         for (int k = 0; k < i; k++) if (strcmp(e->keys[k], e->keys[i]) == 0) xs_error(XS9024, v->pos, NULL, "field '%s' is given twice", e->keys[i]);
         check_expr(v, NULL);
         settle(v);
-        if (v->type->kind == TY_NULL) xs_error(XS3009, v->pos, "give the object a declared type", "cannot infer the type of null here");
+        if (v->type->kind == TY_NULL) v->type = ty_unknown; /* { a: null } with no declared type: an unknown field that holds null */
         if (v->type->kind == TY_VOID) xs_error(XS8102, v->pos, NULL, "cannot store a void value");
         ts[i] = v->type->kind == TY_INT && v->kind != E_NUMBER ? ty_number : v->type; /* (TypeScript: a number) */
         if (ts[i] != v->type) expect_type(v, ts[i], xs_sprintf("field '%s'", e->keys[i]));
@@ -3512,7 +3572,7 @@ static void anon_objlit(Expr *e) {
         for (int k = 0; k < i; k++) if (strcmp(e->keys[k], e->keys[i]) == 0) xs_error(XS9024, v->pos, NULL, "field '%s' is given twice", e->keys[i]);
         check_expr(v, v->kind == E_OBJLIT ? ty_json : NULL);
         settle(v);
-        if (v->type->kind == TY_NULL) xs_error(XS3009, v->pos, "give the object a declared type", "cannot infer the type of null here");
+        if (v->type->kind == TY_NULL) v->type = ty_unknown; /* (an unknown that holds null) */
         json_ok_unknown = true; /* (an unknown member is written by what it holds) */
         bool jok = json_ok(v->type, 0);
         json_ok_unknown = false;
@@ -4300,6 +4360,15 @@ static void check_expr_in(Expr *e, Type *expected) {
             return;
         }
         check_expr(e->lhs, NULL);
+        if (e->op == TK_AND) {
+            bool sv;
+            if (static_bool(e->lhs, &sv) && !sv) { /* typeof n === "object" && ...: false, the right side never runs */
+                Pos at = e->pos;
+                memset(e, 0, sizeof *e);
+                e->kind = E_BOOL; e->boolean = false; e->type = ty_boolean; e->field = -1; e->pos = at;
+                return;
+            }
+        }
         if (e->op == TK_AND) { /* x !== null && x.f : the right side sees x narrowed */
             if (e->lhs->type->kind != TY_BOOLEAN && truthy_type(e->lhs->type) && rereadable(e->lhs))
                 make_truthy(e->lhs, "left operand of '&&'"); /* raw && raw.f: becomes raw !== null && ..., which narrows */
@@ -4504,7 +4573,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (other->type->kind != TY_NULLABLE && other->type->kind != TY_NULL && other->type->kind != TY_UNKNOWN) {
                     /* x === null (or undefined) with x never null: always false, as TypeScript lets it be written
                        (a check kept from code where the value could be absent) */
-                    if (!rereadable(other))
+                    if (!pure_read(other))
                         xs_error(XS2001, e->pos, "only values declared as T | null can be null", "%s can never be null", ty_name(other->type));
                     bool neq = e->op == TK_NEQ;
                     Binding *ob = other->kind == E_IDENT ? lookup(other->str) : NULL;
@@ -4540,6 +4609,15 @@ static void check_expr_in(Expr *e, Type *expected) {
                         to_unknown(r);
                         dyn_call(e, "xs_dyn_eq", ty_boolean, l, r, NULL);
                         if (neq) { Expr *v = expr_copy(e); memset(e, 0, sizeof *e); e->kind = E_UNARY; e->op = TK_NOT; e->pos = v->pos; e->field = -1; e->lhs = v; e->type = ty_boolean; }
+                        return;
+                    }
+                }
+                { /* a === b with both references of one class (T | null): the same object, or both null */
+                    Type *lt = ty_strip_null(e->lhs->type), *rt = ty_strip_null(e->rhs->type);
+                    if (((lt->kind == TY_OBJECT || lt->kind == TY_ARRAY || lt->kind == TY_MAP || lt->kind == TY_SET) && ty_equal(lt, rt)) ||
+                        (lt->kind == TY_PROMISE && rt->kind == TY_PROMISE)) { /* (a promise kept: the same one) */
+                        e->type = ty_boolean;
+                        e->builtin.cfn = "ref_eq";
                         return;
                     }
                 }
@@ -4595,6 +4673,18 @@ static void check_expr_in(Expr *e, Type *expected) {
             qq->rhs = e->rhs;
             e->op = TK_ASSIGN;
             e->rhs = qq;
+        }
+        if (e->kind == E_POSTFIX && ((e->lhs->kind == E_INDEX) || (e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->str)) &&
+            e->lhs->lhs && plain_path(e->lhs->lhs) && !(e->lhs->lhs->kind == E_IDENT && !lookup(e->lhs->lhs->str))) {
+            check_expr(e->lhs->lhs, NULL); /* (a path: checking it twice is harmless) */
+            Type *rt = e->lhs->lhs->type;
+            if (rt && rt->kind == TY_MAP && rt->record) { /* counts[k]++ on a Record<string, number>: counts[k] += 1 */
+                Expr *one = xs_alloc(sizeof *one);
+                one->kind = E_NUMBER; one->pos = e->pos; one->field = -1; one->num = 1; one->ival = 1; one->is_int_lit = true;
+                e->kind = E_ASSIGN;
+                e->op = e->op == TK_MINUSMINUS ? TK_MINUS_ASSIGN : TK_PLUS_ASSIGN;
+                e->rhs = one;
+            }
         }
         Expr *target = e->lhs;
         bool dyn_target = false;
@@ -5242,7 +5332,10 @@ static void check_expr_in(Expr *e, Type *expected) {
             check_expr(e, expected);
             return;
         }
-        if (e->lhs->type->kind == TY_NULLABLE) xs_error(XS2015, e->pos, "check it first: if (x !== null) { ... }", "indexed value may be null");
+        if (e->lhs->type->kind == TY_NULLABLE) {
+            if (!tsc_checked()) xs_error(XS2015, e->pos, "check it first: if (x !== null) { ... }", "indexed value may be null");
+            nonnull_checked(e->lhs, "the indexed value");
+        }
         check_expr(e->rhs, ty_int);
         if (e->lhs->type->kind == TY_OBJECT && e->lhs->type->cls->is_tuple) { /* t[0]: its field (the index is a constant) */
             Class *tc = e->lhs->type->cls;
@@ -5467,6 +5560,38 @@ static void check_expr_in(Expr *e, Type *expected) {
                 xs_error(XS7115, e->pos, "supported: process.argv, process.env.get(name), process.cwd(), process.exit(code), process.stdout.write(x), process.stderr.write(x)", "unknown process member '%s'", e->str);
             }
             if (strcmp(ns, "Array") == 0 && e->is_call && (strcmp(e->str, "from") == 0 || strcmp(e->str, "isArray") == 0)) {
+                if (e->str[0] == 'f' && e->args.len == 2) {
+                    Expr *src = e->args.items[0], *fn = e->args.items[1];
+                    Expr *c = xs_alloc(sizeof *c);
+                    c->kind = E_CALL; c->pos = e->pos; c->field = -1;
+                    Expr *callee = xs_alloc(sizeof *callee);
+                    callee->kind = E_IDENT; callee->pos = e->pos; callee->field = -1;
+                    c->lhs = callee;
+                    if (src->kind == E_OBJLIT && src->args.len == 1 && strcmp(src->keys[0], "length") == 0) {
+                        /* Array.from({ length: n }, (_, i) => ...): n results of the function, as JavaScript makes them */
+                        int np = 2;
+                        if (fn->kind == E_ARROW) np = fn->arrow->fn->nparams;
+                        else if (fn->kind == E_IDENT) { check_expr(fn, NULL); if (fn->type->kind == TY_FUNC) np = fn->type->nparams; } /* (a name: checked twice, harmless) */
+                        callee->str = np == 0 ? "__xs_fromLength0" : "__xs_fromLength";
+                        expr_list_push(&c->args, src->args.items[0]); /* (checked as the call's int argument) */
+                        expr_list_push(&c->args, fn);
+                        *e = *c;
+                        check_expr(e, expected);
+                        return;
+                    }
+                    /* Array.from(xs, f): Array.from(xs).map(f) */
+                    Expr *inner = xs_alloc(sizeof *inner);
+                    *inner = *e;
+                    inner->args = (ExprList){0};
+                    expr_list_push(&inner->args, src);
+                    memset(&e->args, 0, sizeof e->args);
+                    expr_list_push(&e->args, fn);
+                    e->lhs = inner;
+                    e->str = "map";
+                    e->field = -1;
+                    check_expr(e, expected);
+                    return;
+                }
                 if (e->args.len != 1) xs_error(XS7001, e->pos, "Array.from(array, Set or Map); Array.isArray(x)", "Array.%s takes one argument here", e->str);
                 Expr *src = e->args.items[0];
                 check_expr(src, expected && strcmp(e->str, "from") == 0 ? expected : NULL);
@@ -5680,7 +5805,8 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         if (e->lhs->type->kind == TY_NULLABLE) {
             if (xs_check_mode && after_optional_dot(e->pos)) xs_error_quiet(); /* x?.name: the '?.' was counted where it is */
-            xs_error(XS2006, e->pos, "check it first: if (x !== null) { ... }  (fields need a local copy: const v = this.f;)", "'%s' may be null", e->str);
+            if (tsc_checked() && e->str && strcmp(e->str, "unref") && strcmp(e->str, "ref")) nonnull_checked(e->lhs, xs_sprintf("the value read for '.%s'", e->str));
+            else xs_error(XS2006, e->pos, "check it first: if (x !== null) { ... }  (fields need a local copy: const v = this.f;)", "'%s' may be null", e->str);
         }
         if (!e->is_call && e->str && e->lhs->builtin.cfn && strcmp(e->lhs->builtin.cfn, "xs_process_env") == 0 && strcmp(e->str, "size") != 0) {
             /* process.env.NAME: process.env.get("NAME") (a string, or null when it is not set) */
@@ -6250,6 +6376,13 @@ static void check_expr_in(Expr *e, Type *expected) {
                 }
                 if (nfit == 1) pick = fit;
             }
+            if (!pick) { /* Record<string, V> | unknown[]: an object literal is the one Record (it is never an array) */
+                int nrec = 0;
+                Type *rec = NULL;
+                for (int i = 0; i < t->nparams; i++)
+                    if ((t->params[i]->kind == TY_MAP && t->params[i]->record) || t->params[i]->kind == TY_JSON) { nrec++; rec = t->params[i]; }
+                if (nrec == 1) pick = rec;
+            }
             if (!pick) xs_error(XS2014, e->pos, "give the member's kind field its literal value", "cannot tell which member of %s this object is", ty_name(t));
             t = pick;
         }
@@ -6642,6 +6775,10 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         if (e->spread) { check_spread_lit(e, elem); return; }
         if (e->args.len == 0) {
+            if (!elem && expected && (ty_is_any(expected) || expected->kind == TY_UNKNOWN)) { /* x ?? [] with x an any: unknown[] */
+                e->type = ty_array_of(ty_unknown);
+                return;
+            }
             if (!elem) xs_error(XS3008, e->pos, "give it a type: const xs: number[] = [];", "cannot infer the type of an empty array");
             e->type = expected;
             check_type_supported(e->pos, e->type);
@@ -6723,6 +6860,15 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (e->lhs->type->kind != TY_BOOLEAN)
             xs_error(XS8105, e->lhs->pos, "there is no truthiness in xisto; compare explicitly", "condition of '?:' must be boolean, but this is %s", ty_name(e->lhs->type));
         Expr *a = e->args.items[0], *b = e->args.items[1];
+        {
+            bool sv;
+            if (static_bool(e->lhs, &sv)) { /* a condition the types decide: only the branch that runs is checked */
+                Expr *live = sv ? a : b;
+                check_expr(live, expected);
+                *e = *live;
+                return;
+            }
+        }
         {
             NSet ts = {0}, fs = {0};
             narrow_set(e->lhs, true, &ts);
@@ -6885,6 +7031,34 @@ static bool cond_truthy_type(Type *t) { return truthy_type(t) || t->kind == TY_I
 static bool rereadable(Expr *e) {
     if (e->kind == E_IDENT || e->kind == E_THIS) return true;
     return e->kind == E_MEMBER && !e->is_call && e->field >= 0 && rereadable(e->lhs);
+}
+/* a checked condition the types decide: typeof n === "object" with n a number, false && x (TypeScript narrows the
+   value to never there; the branch it guards never runs, so it is not checked) */
+static bool static_bool(Expr *e, bool *val) {
+    if (!e) return false;
+    if (e->kind == E_BOOL) { *val = e->boolean; return true; }
+    if (e->kind == E_BINARY && (e->op == TK_EQ || e->op == TK_NEQ) && e->lhs->kind == E_STRING && e->rhs->kind == E_STRING &&
+        e->lhs->str && e->rhs->str && !e->builtin.cfn) {
+        bool same = strcmp(e->lhs->str, e->rhs->str) == 0;
+        *val = e->op == TK_EQ ? same : !same;
+        return true;
+    }
+    if (e->kind == E_BINARY && e->op == TK_AND) {
+        bool a;
+        if (static_bool(e->lhs, &a) && !a) { *val = false; return true; }
+    }
+    return false;
+}
+/* a read with no call in it (x, o.f, o.f!, xs[i], m[3]): dropping it changes nothing */
+static bool pure_read(Expr *e) {
+    if (!e) return false;
+    switch (e->kind) {
+    case E_IDENT: case E_THIS: case E_NUMBER: case E_STRING: case E_BOOL: case E_NULL: return true;
+    case E_MEMBER: return !e->is_call && pure_read(e->lhs);
+    case E_INDEX: return pure_read(e->lhs) && pure_read(e->rhs);
+    case E_AS: return pure_read(e->lhs);
+    default: return false;
+    }
 }
 static Expr *expr_copy(Expr *e) { Expr *c = xs_alloc(sizeof *c); *c = *e; return c; }
 static Expr *str_truthy_call(Expr *v) {
@@ -7186,13 +7360,26 @@ static void check_cond(Expr *c, const char *what) {
 
 /* A field read through a variable or `this` (o.f, this.f) of a nullable type: the name its narrowing goes by in
    the scopes, from the variable's C name (unique, so an inner `o` that shadows it is another path), or NULL */
+/* the stable reference a path starts from: x, this, x.f, this.f.g (fields only, no calls), or NULL */
+static const char *path_base(Expr *e) {
+    while (e && e->kind == E_AS && e->op == TK_NOT && !e->elem_type) e = e->lhs; /* o.f narrowed already: the same path */
+    if (!e) return NULL;
+    if (e->kind == E_THIS) return "this";
+    if (e->kind == E_IDENT) {
+        Binding *b = lookup(e->str);
+        return b && b->cname ? b->cname : NULL;
+    }
+    if (e->kind == E_MEMBER && !e->is_call && e->field >= 0 && e->cls && !e->cls->builtin) {
+        const char *in = path_base(e->lhs);
+        return in ? xs_sprintf("%s.%d.%s", in, e->field, e->cls->name) : NULL;
+    }
+    return NULL;
+}
 static const char *path_key(Expr *m) {
     if (!m || m->kind != E_MEMBER || m->is_call || m->field < 0 || !m->type || m->type->kind != TY_NULLABLE || !m->cls || m->cls->builtin) return NULL;
-    if (m->lhs->kind == E_THIS) return xs_sprintf("\x01this.%d.%s", m->field, m->cls->name);
-    if (m->lhs->kind != E_IDENT) return NULL;
-    Binding *b = lookup(m->lhs->str);
-    if (!b || !b->cname) return NULL;
-    return xs_sprintf("\x01%s.%d.%s", b->cname, m->field, m->cls->name);
+    const char *in = path_base(m->lhs); /* o.f, this.f and deeper: ctx.aut.f, as TypeScript narrows them */
+    if (!in) return NULL;
+    return xs_sprintf("\x01%s.%d.%s", in, m->field, m->cls->name);
 }
 /* `x !== null` / `x === null` on a nullable local: returns the binding and whether the test is "not null". */
 static Binding *narrow_target(Expr *cond, bool *not_null) {
@@ -7349,6 +7536,21 @@ static UNarrow union_narrow(Expr *c) {
         else r.else_t = a.else_t;
         return r;
     }
+    if (c->kind == E_CALL && c->builtin.cfn && strcmp(c->builtin.cfn, "xs_is_array") == 0 && c->args.len == 1) {
+        /* Array.isArray(x) with x: Record<string, V> | V[]: the array member, and the rest on the other side */
+        Expr *id = union_ident(c->args.items[0]);
+        Binding *b = id ? lookup(id->str) : NULL;
+        if (!b) return r;
+        Type *u = b->type;
+        if (u->kind == TY_UNKNOWN) { r.b = b; r.then_t = ty_array_of(ty_unknown); return r; } /* v: unknown, an array: unknown[] */
+        if (u->kind != TY_UNION) return r;
+        bool *keep = xs_alloc(sizeof(bool) * (size_t)u->nparams), *other = xs_alloc(sizeof(bool) * (size_t)u->nparams);
+        for (int i = 0; i < u->nparams; i++) { keep[i] = u->params[i]->kind == TY_ARRAY; other[i] = !keep[i]; }
+        r.b = b;
+        r.then_t = union_subset(u, keep);
+        r.else_t = union_subset(u, other);
+        return r;
+    }
     bool is_ufield = c->kind == E_MEMBER && c->builtin.cfn && strcmp(c->builtin.cfn, "union_field") == 0;
     if (c->kind != E_BINARY && !is_ufield) return r;
     bool neg = c->kind == E_BINARY && c->op == TK_NEQ;
@@ -7385,6 +7587,7 @@ static UNarrow union_narrow(Expr *c) {
         else if (how == 1 && strcmp(lit->str, "string") == 0) t = ty_string;
         else if (how == 1 && strcmp(lit->str, "number") == 0) t = ty_number;
         else if (how == 1 && strcmp(lit->str, "boolean") == 0) t = ty_boolean;
+        else if (how == 1 && strcmp(lit->str, "symbol") == 0 && find_class("symbol")) t = ty_object_of(find_class("symbol"));
         if (!t) return r;
         r.b = b;
         if (neg) r.else_t = t; else r.then_t = t;

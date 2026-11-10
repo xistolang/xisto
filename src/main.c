@@ -124,7 +124,7 @@ static void usage(void) {
             "  xisto dap                                                debug adapter for IDEs (DAP over stdin/stdout)\n"
             "  xisto clean [DIR]                                        remove the build cache (.xisto/cache) of a project\n"
             "  xisto fmt [--check] FILE.ts...                           format in place (--check: exit 1 if any file would change)\n"
-            "  xisto check [--details] [--deny-warnings] [--pkgs DIR] [PATH...]  what a project needs to change to compile with xisto\n"
+            "  xisto check [--details] [--deny-warnings] [--tsc-checked] [--pkgs DIR] [PATH...]  what a project needs to change to compile with xisto\n"
             "                                                           (PATH: a folder, a tsconfig.json or .ts files; --details: every place)\n"
             "  xisto test [DIR]                                         build and run every *.test.ts under DIR\n"
             "  xisto add SOURCE[@REF] [--name NAME]                     add a package from a git URL or path (source, locked by commit)\n"
@@ -140,6 +140,9 @@ static void usage(void) {
             "  --backend=qbe  generate QBE IL and machine code directly, without C\n"
             "  --cpu=native   code for this machine's processor (AVX2, ...), as Rust's target-cpu=native; XISTO_CPU=native\n"
             "  --node-compat  accept node:fs, node:sqlite... as names of xisto's own modules (xisto:fs...)\n"
+            "  --tsc-checked  the code already passes tsc --strict: what tsc accepted compiles, checked at run time, with a\n"
+            "                 warning (T | null where T goes XS2107, unknown where T goes XS2108, number where int goes XS2109);\n"
+            "                 XISTO_TSC_CHECKED=1; also for xisto check\n"
             "  --tls=off      never link TLS: fetch URLs only known at run time must be http:// (TLS at the load balancer)\n"
             "  --tls=bearssl  use BearSSL (TLS 1.2, smaller binary) instead of AWS-LC (TLS 1.3, the default)\n"
             "\n"
@@ -1105,6 +1108,7 @@ int main(int argc, char **argv) {
         else if (strncmp(argv[i], "--cpu=", 6) == 0) xs_cpu = argv[i] + 6;
         else if (strcmp(argv[i], "--tls=off") == 0) xs_tls_off = true;
         else if (strcmp(argv[i], "--node-compat") == 0) xs_node_compat = true;
+        else if (strcmp(argv[i], "--tsc-checked") == 0) xs_setenv("XISTO_TSC_CHECKED", "1");
         else if (strcmp(argv[i], "--tls=awslc") == 0 || strcmp(argv[i], "--tls=bearssl") == 0) tls_choice = argv[i] + 6;
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) outname = argv[++i];
         else if (strcmp(argv[i], "--pkgs") == 0 && i + 1 < argc) { if (!xs_use_pkgs_dir(argv[++i])) return 2; }

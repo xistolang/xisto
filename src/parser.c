@@ -1272,7 +1272,7 @@ static Expr *parse_postfix(Parser *p) {
             Expr *m = new_expr(E_MEMBER, name.pos);
             m->lhs = e;
             m->str = name.str;
-            if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat")) wants_arrays = true;
+            if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from")) wants_arrays = true;
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs);
             if (at(p, TK_LPAREN)) {
                 m->is_call = true;
@@ -1305,7 +1305,7 @@ static Expr *parse_postfix(Parser *p) {
             Expr *m = new_expr(E_MEMBER, name.pos);
             m->lhs = e;
             m->str = name.str;
-            if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat")) wants_arrays = true;
+            if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from")) wants_arrays = true;
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs); /* obj.m<T>(x) */
             if (at(p, TK_LPAREN)) {
                 m->is_call = true;
@@ -4012,6 +4012,16 @@ static const char xs_arrays_src[] =
     "export function __xs_flatMap<U, T>(xs: T[], f: (x: T, i: int) => U[]): U[] {\n"
     "  const out: U[] = [];\n"
     "  for (let i = 0; i < xs.length; i++) { const ys = f(xs[i], i); for (const y of ys) out.push(y); }\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_fromLength<T>(n: int, f: (v: unknown, i: int) => T): T[] {\n"
+    "  const out: T[] = [];\n"
+    "  for (let i = 0; i < n; i++) out.push(f(null, i));\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_fromLength0<T>(n: int, f: () => T): T[] {\n"
+    "  const out: T[] = [];\n"
+    "  for (let i = 0; i < n; i++) out.push(f());\n"
     "  return out;\n"
     "}\n"
     "export function __xs_flat<U>(xs: U[][]): U[] {\n"
