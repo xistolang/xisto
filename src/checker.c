@@ -1154,15 +1154,19 @@ static Type *ret_unpromise(Type *t, bool *async) {
     *async = true;
     Type **m = xs_alloc(sizeof(Type *) * (size_t)u->nparams);
     int n = 0;
+    bool nul = t->kind == TY_NULLABLE;
     for (int i = 0; i < u->nparams; i++) {
         Type *x = u->params[i]->kind == TY_PROMISE ? u->params[i]->elem : u->params[i];
+        if (x->kind == TY_NULLABLE) { nul = true; x = x->elem; } /* Promise<T> | T with T = X | null: X | null */
+        if (x->kind == TY_NULL) { nul = true; continue; }
         bool dup = false;
         for (int k = 0; k < n && !dup; k++) dup = ty_equal(m[k], x);
         if (!dup) m[n++] = x;
     }
+    if (n == 0) return ty_null;
     Type *r = m[0];
     if (n > 1) { r = xs_alloc(sizeof *r); *r = *u; r->params = m; r->nparams = n; }
-    return t->kind == TY_NULLABLE ? ty_nullable_of(r) : r;
+    return nul ? ty_nullable_of(r) : r;
 }
 static Type *resolve(Type *t, Pos pos) {
     if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__ret_of:", 9) == 0) { /* (generated reflection) */
@@ -2951,6 +2955,9 @@ static bool has_tparam(Type *t) {
     case TY_OBJECT:
         for (int i = 0; i < t->ntargs; i++) if (has_tparam(t->targs[i])) return true;
         return false;
+    case TY_UNION:
+        for (int i = 0; i < t->nparams; i++) if (has_tparam(t->params[i])) return true;
+        return false;
     default: return false;
     }
 }
@@ -2965,6 +2972,15 @@ static void unify(Type *pat, Type *got, Func *tmpl, Type **bind) {
         return;
     }
     if (pat->kind == TY_NULLABLE) { unify(pat->elem, got->kind == TY_NULLABLE ? got->elem : got, tmpl, bind); return; }
+    if (pat->kind == TY_UNION && got->kind != TY_UNION) { /* Promise<T> | T against a value or a promise of one: T */
+        Type *g = got->kind == TY_PROMISE ? got->elem : got;
+        for (int m = 0; m < pat->nparams; m++) {
+            Type *pm = pat->params[m];
+            if (pm->kind == TY_PROMISE) unify(pm->elem, g, tmpl, bind);
+            else if (pm->kind == TY_TPARAM) unify(pm, g, tmpl, bind);
+        }
+        return;
+    }
     if (pat->kind == TY_PROMISE && got->kind != TY_PROMISE) { unify(pat->elem, got, tmpl, bind); return; } /* () => Promise<T> against an async function's R */
     if (pat->kind == TY_OBJECT && pat->ntargs && got->kind == TY_UNION) { /* Item<T> (a generic alias) against Item<number>: its
                                                                             members carry the alias's arguments */
@@ -3074,8 +3090,16 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
         unify(tmpl->params[i].type, e->args.items[i]->type, tmpl, bind);
     }
     if (expected && tmpl->ret && has_tparam(tmpl->ret)) unify(tmpl->ret, expected, tmpl, bind);
-    for (int i = 0; i < tmpl->ntparams; i++) /* <T = string>: what nothing bound takes its default */
-        if (!bind[i] && tmpl->tdefaults && tmpl->tdefaults[i]) bind[i] = resolve(tmpl->tdefaults[i], e->pos);
+    for (int i = 0; i < tmpl->ntparams; i++) /* <T = string>: what nothing bound takes its default, read where it is written */
+        if (!bind[i] && tmpl->tdefaults && tmpl->tdefaults[i]) {
+            Module *dm = tmpl->cls ? tmpl->cls->mod : tmpl->mod;
+            Module *was = cur_mod;
+            Scope *ss = scope;
+            const char *sfn = xs_file_name, *ssrc = xs_source;
+            if (dm && dm != cur_mod) enter_module(dm);
+            bind[i] = resolve(tmpl->tdefaults[i], e->pos);
+            cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
+        }
     for (int i = 0; i < tmpl->ntparams; i++)
         if (!bind[i]) xs_error(XS3010, e->pos, xs_sprintf("give it: %s<Type>(...)", tmpl->name), "cannot infer type parameter %s of %s", tmpl->tparams[i], what);
     Func *inst = instantiate_func(tmpl, bind);
@@ -6673,6 +6697,18 @@ static UNarrow union_narrow(Expr *c) {
         c->rhs->cls && is_error_class(c->rhs->cls)) { /* catch (e) { if (e instanceof HttpException) ... }: e is the thrown object */
         r.b = b;
         r.then_t = ty_object_of(c->rhs->cls);
+        return r;
+    }
+    if (b->type->kind == TY_UNKNOWN && (how == 1 || how == 2)) { /* x: unknown (or any): x instanceof C / typeof x === "string" */
+        Type *t = NULL;
+        if (how == 2 && c->rhs->cls && !c->rhs->cls->is_interface && !(c->rhs->cls->ntparams && !c->rhs->cls->generic_of))
+            t = ty_object_of(c->rhs->cls); /* (a generic class: which instance is not known, so x stays unknown) */
+        else if (how == 1 && strcmp(lit->str, "string") == 0) t = ty_string;
+        else if (how == 1 && strcmp(lit->str, "number") == 0) t = ty_number;
+        else if (how == 1 && strcmp(lit->str, "boolean") == 0) t = ty_boolean;
+        if (!t) return r;
+        r.b = b;
+        if (neg) r.else_t = t; else r.then_t = t;
         return r;
     }
     Type *u = b->type;

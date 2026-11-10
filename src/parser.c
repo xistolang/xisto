@@ -3446,6 +3446,19 @@ static Class *reflected_base(Program *prog, Class *c) {
 }
 static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
     const char *ci_name = xs_sprintf("__ci_%s", c->name);
+    if (c->ntparams) { /* a generic class (PagedResultDto<T>): no one type to describe; its fields are listed by name */
+        buf_printf(g, "const %s: ClassInfo = {\n  id: \"%s#%s\",\n  name: \"%s\",\n  params: [],\n"
+                      "  construct: (args: unknown[]): unknown => { throw new Error(\"%s is generic: not constructed by reflection\"); },\n  methods: [],\n  fields: [",
+                   ci_name, xs_display_path(m->file), c->name, c->name, c->name);
+        for (int k = 0; k < c->nfields; k++) {
+            Field *fd = &c->fields[k];
+            buf_printf(g, "%s\n    { name: \"%s\", optional: %s, type: ", k ? "," : "", fd->name, fd->optional ? "true" : "false");
+            tinfo(g, "unknown");
+            buf_puts(g, ", get: (o: unknown): unknown => null }");
+        }
+        buf_puts(g, "],\n  isInstance: (value: unknown): boolean => false,\n  base: null,\n};\n");
+        return;
+    }
     buf_printf(g, "const %s: ClassInfo = {\n  id: \"%s#%s\",\n  name: \"%s\",\n  params: ", ci_name, xs_display_path(m->file), c->name, c->name);
     params_info(g, c->ctor);
     bool data_only = false; /* a DTO (fields without values, no constructor): no `new`, JSON makes it */
