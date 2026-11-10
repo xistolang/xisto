@@ -68,7 +68,7 @@ build/%.o: src/%.c src/xisto.h | build
 
 build/checker.o: runtime/xisto_regex.h
 
-build/rt_embed.c: tools/rtsplit.py packages/xisto/io.ts packages/xisto/bytes.ts packages/xisto/parallel.ts packages/xisto/collections.ts packages/xisto/fractal.ts packages/xisto/random.ts runtime/xisto_regex.h runtime/xisto_rt.h runtime/xisto_net.h runtime/xisto_sqlite.h runtime/xisto_tls.h runtime/xisto_tls_awslc.h runtime/xisto_crypto.h runtime/xisto_dbg_json.h runtime/xisto_dbg.h | build
+build/rt_embed.c: tools/rtsplit.py runtime/node/async_hooks.ts runtime/node/crypto.ts runtime/node/stream.ts packages/xisto/io.ts packages/xisto/bytes.ts packages/xisto/parallel.ts packages/xisto/collections.ts packages/xisto/fractal.ts packages/xisto/random.ts runtime/xisto_regex.h runtime/xisto_rt.h runtime/xisto_net.h runtime/xisto_sqlite.h runtime/xisto_tls.h runtime/xisto_tls_awslc.h runtime/xisto_crypto.h runtime/xisto_dbg_json.h runtime/xisto_dbg.h | build
 	{ echo 'const unsigned char xs_runtime_h[] = {'; xxd -i < runtime/xisto_rt.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_net_h[] = {'; xxd -i < runtime/xisto_net.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_sqlite_h[] = {'; xxd -i < runtime/xisto_sqlite.h; echo ', 0x00 };'; \
@@ -78,6 +78,7 @@ build/rt_embed.c: tools/rtsplit.py packages/xisto/io.ts packages/xisto/bytes.ts 
 	  echo 'const unsigned char xs_runtime_regex_h[] = {'; xxd -i < runtime/xisto_regex.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_dbg_json_h[] = {'; xxd -i < runtime/xisto_dbg_json.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_dbg_h[] = {'; xxd -i < runtime/xisto_dbg.h; echo ', 0x00 };'; \
+	  for n in async_hooks crypto stream; do echo "const unsigned char xs_node_$${n}_ts[] = {"; xxd -i < runtime/node/$$n.ts; echo ', 0x00 };'; done; \
 	  echo 'const unsigned char xs_pkg_io_ts[] = {'; xxd -i < packages/xisto/io.ts; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_pkg_bytes_ts[] = {'; xxd -i < packages/xisto/bytes.ts; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_pkg_parallel_ts[] = {'; xxd -i < packages/xisto/parallel.ts; echo ', 0x00 };'; \

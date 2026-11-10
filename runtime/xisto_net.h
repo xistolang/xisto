@@ -496,6 +496,7 @@ struct xs_coro {
     bool shared;
     char *copy, *copy_base;
     size_t copy_len, copy_cap;
+    void *als;                /* its node:async_hooks context (an owned reference; xs_als_cur while it runs) */
     struct xs_coro *next;     /* free list */
 };
 static XS_TLS xs_coro *xs_coro_dead; /* finished during this event batch: recycled after it */
@@ -511,6 +512,7 @@ static XS_TLS void **xs_main_ar_pool; static XS_TLS size_t xs_main_ar_len, xs_ma
 static XS_TLS jmp_buf **xs_main_try; static XS_TLS int xs_main_try_depth; static XS_TLS void *xs_main_thrown;
 static XS_TLS jmp_buf *xs_main_recover; static XS_TLS const char *xs_main_recover_msg;
 static XS_TLS void ***xs_main_cln; static XS_TLS size_t xs_main_cln_n, xs_main_cln_cap, xs_main_recover_cln;
+static XS_TLS void *xs_main_als;
 
 __attribute__((used)) void xs_coro_finish(void);
 #ifndef XS_RT_DECL
@@ -538,6 +540,8 @@ XS_NOINLINE xs_coro *xs_coro_new(void (*entry)(void *), void *arg) {
         co->ar_pool = malloc(co->ar_cap * sizeof(void *));
         co->try_stack = NULL; /* grows on first use (xs_try_push) */
     }
+    if (co->als) xs_release_(co->als);
+    co->als = xs_als_cur ? xs_retain_(xs_als_cur) : NULL; /* the context it was created in */
     co->done = false;
     co->on_done = NULL;
     co->ar_len = 0;
@@ -585,6 +589,8 @@ XS_NOINLINE xs_coro *xs_coro_new_shared(void (*entry)(void *), void *arg) {
         co->ar_cap = 8;
         co->ar_pool = malloc(co->ar_cap * sizeof(void *));
     }
+    if (co->als) xs_release_(co->als);
+    co->als = xs_als_cur ? xs_retain_(xs_als_cur) : NULL; /* the context it was created in */
     co->done = false;
     co->on_done = NULL;
     co->ar_len = 0;
@@ -639,6 +645,7 @@ static void xs_coro_resume(xs_coro *co) {
     xs_try_stack = co->try_stack; xs_try_depth = co->try_depth; xs_thrown = co->thrown;
     xs_recover = co->recover; xs_recover_msg = co->recover_msg;
     xs_req_t0 = co->req_t0;
+    xs_main_als = xs_als_cur; xs_als_cur = co->als; co->als = NULL;
     xs_cur_coro = co;
     if (co->shared) memcpy(co->copy_base, co->copy, co->copy_len); /* its stack back where it was */
     xs_ctx_swap(&xs_sched_sp, co->sp);
@@ -657,6 +664,8 @@ static void xs_coro_resume(xs_coro *co) {
     co->cln = xs_cln; co->cln_n = xs_cln_n; co->cln_cap = xs_cln_cap; co->recover_cln = xs_recover_cln;
     xs_cln = xs_main_cln; xs_cln_n = xs_main_cln_n; xs_cln_cap = xs_main_cln_cap; xs_recover_cln = xs_main_recover_cln;
     co->req_t0 = xs_req_t0;
+    if (co->done) { if (xs_als_cur) xs_release_(xs_als_cur); co->als = NULL; } else co->als = xs_als_cur;
+    xs_als_cur = xs_main_als; xs_main_als = NULL;
     xs_cur_coro = NULL;
     xs_ar_pool = xs_main_ar_pool; xs_ar_len = xs_main_ar_len; xs_ar_cap = xs_main_ar_cap;
     xs_try_stack = xs_main_try; xs_try_depth = xs_main_try_depth; xs_thrown = xs_main_thrown;
@@ -2542,6 +2551,40 @@ static xs_MessagePort *xs_wt_port(void) { /* parentPort: on the main thread, a p
     m->in = xs_wt_in;
     m->out = xs_wt_out;
     return m;
+}
+/* node:os: the machine's name, the system and the user's folders, as Node gives them */
+XS_NOINLINE xs_str *xs_os_host_name(void) {
+    char b[256];
+    if (gethostname(b, sizeof b) != 0) b[0] = 0;
+    b[sizeof b - 1] = 0;
+    return xs_str_new(b, strlen(b));
+}
+XS_NOINLINE xs_str *xs_os_platform_name(void) {
+#if defined(__APPLE__)
+    return xs_str_new("darwin", 6);
+#elif defined(_WIN32)
+    return xs_str_new("win32", 5);
+#else
+    return xs_str_new("linux", 5);
+#endif
+}
+XS_NOINLINE xs_str *xs_os_arch_name(void) {
+#if defined(__aarch64__) || defined(__arm64__)
+    return xs_str_new("arm64", 5);
+#else
+    return xs_str_new("x64", 3);
+#endif
+}
+XS_NOINLINE xs_str *xs_os_tmp_dir(void) { /* $TMPDIR without its trailing slash (Node), else /tmp */
+    const char *t = getenv("TMPDIR");
+    if (!t || !*t) return xs_str_new("/tmp", 4);
+    size_t n = strlen(t);
+    while (n > 1 && t[n - 1] == '/') n--;
+    return xs_str_new(t, n);
+}
+XS_NOINLINE xs_str *xs_os_home_dir(void) {
+    const char *h = getenv("HOME");
+    return h ? xs_str_new(h, strlen(h)) : xs_str_new("", 0);
 }
 static int64_t xs_os_parallelism(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);

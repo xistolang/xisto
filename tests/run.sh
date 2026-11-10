@@ -130,7 +130,7 @@ sh tests/http/run.sh > "$OUT/http.txt" 2>&1
 if grep -q "200 POST abc123 7 xisto" "$OUT/http.txt" && grep -q "timeout: The operation was aborted due to timeout" "$OUT/http.txt" && grep -q "200 slept 20" "$OUT/http.txt" \
    && grep -q "overlapped (20 ok)" "$OUT/http.txt" && grep -q "during SIGTERM: slept 700" "$OUT/http.txt" && grep -q "refused: True" "$OUT/http.txt" \
    && grep -q "server exit code: 0" "$OUT/http.txt" && grep -q "channel delivered: True" "$OUT/http.txt" \
-   && grep -q "pipelined: 3 responses" "$OUT/http.txt" && grep -q "parked client left: idle cpu" "$OUT/http.txt"; then pass=$((pass+1)); else echo "FAIL http:"; cat "$OUT/http.txt"; fail=$((fail+1)); fi
+   && grep -q "pipelined: 3 responses" "$OUT/http.txt" && grep -q "async local storage per request: isolated (30 ok)" "$OUT/http.txt" && grep -q "parked client left: idle cpu" "$OUT/http.txt"; then pass=$((pass+1)); else echo "FAIL http:"; cat "$OUT/http.txt"; fail=$((fail+1)); fi
 # crypto patches to BearSSL (third_party/bearssl/XISTO_PATCHES.md): differential tests
 for t in p256_comb p256_sign p256_montymul; do
     extra=""; [ $t = p256_sign ] && extra=tests/crypto/ecdsa_sign_orig.c
