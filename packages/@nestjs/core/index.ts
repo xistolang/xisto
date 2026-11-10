@@ -177,6 +177,9 @@ export function tokenKey(token: unknown): string {
   if (typeof token === "string") {
     return "s:" + (token as string);
   }
+  if (typeof token === "symbol") { /* Symbol("X"): itself (two symbols with one description are two tokens) */
+    return "y:" + String((token as symbol).__id);
+  }
   const c = token as ClassInfo;
   return "c:" + c.id;
 }
@@ -185,6 +188,9 @@ function tokenName(token: unknown): string {
   if (typeof token === "string") {
     return token as string;
   }
+  if (typeof token === "symbol") {
+    return String(token as symbol);
+  }
   return (token as ClassInfo).name;
 }
 
@@ -192,7 +198,7 @@ function asClass(x: unknown): ClassInfo | null {
   if (x instanceof ValueProvider || x instanceof ClassProvider || x instanceof ExistingProvider || x instanceof FactoryProvider) {
     return null;
   }
-  if (x instanceof DynamicModule || typeof x === "string") {
+  if (x instanceof DynamicModule || typeof x === "string" || typeof x === "symbol") {
     return null;
   }
   return x as ClassInfo;

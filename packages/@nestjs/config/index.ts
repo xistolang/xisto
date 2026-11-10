@@ -3,13 +3,58 @@
 import { readFileSync, existsSync } from "xisto:fs";
 import { DynamicModule, Injectable, Module } from "@nestjs/common";
 
-/** Options of ConfigModule.forRoot. */
+/**
+ * A namespace of configuration: registerAs("database", () => ({ ... })) gives one, which ConfigModule.forRoot
+ * loads ({ load: [databaseConfig] }); then config.get("database.host") reads it.
+ * Compatibility: Nest's registerAs returns the factory function itself (with a KEY); here it is this object,
+ * which forRoot's load and get() use the same way.
+ */
+export class ConfigFactory {
+  KEY: string;
+  namespace: string;
+  build: () => any;
+  constructor(namespace: string, build: () => any) {
+    this.KEY = `CONFIGURATION(${namespace})`;
+    this.namespace = namespace;
+    this.build = build;
+  }
+}
+
+/** A configuration namespace from a factory, read when ConfigModule.forRoot loads it. */
+export function registerAs<T>(token: string, factory: () => T): ConfigFactory {
+  return new ConfigFactory(token, (): any => factory() as any);
+}
+
+/** Options of ConfigModule.forRoot. envFilePath: a file, or a list (the first that exists wins each key). */
 export class ConfigModuleOptions {
   isGlobal?: boolean;
-  envFilePath?: string;
+  envFilePath?: string | string[];
   ignoreEnvFile?: boolean;
   cache?: boolean;
   expandVariables?: boolean;
+  load?: ConfigFactory[];
+}
+
+/** The namespaces forRoot loaded, by name (their factories' values). */
+const loaded: Record<string, any> = {};
+
+/** a.b.c in the loaded namespaces: null when a part is not there (as lodash get gives undefined) */
+function lookupPath(path: string): any {
+  const parts = path.split(".");
+  if (!(parts[0] in loaded)) {
+    return null;
+  }
+  let cur: any = loaded[parts[0]];
+  for (let i = 1; i < parts.length; i++) {
+    if (cur == null || typeof cur !== "object") {
+      return null;
+    }
+    if (!(parts[i] in cur)) {
+      return null;
+    }
+    cur = cur[parts[i]];
+  }
+  return cur;
 }
 
 /**
@@ -23,19 +68,27 @@ export class ConfigService {
   /** The value of `key`, or `defaultValue` (null when not given) when it is not set. */
   get<T = string>(key: string, defaultValue: T | null = null): T | null {
     const v = process.env.get(key);
-    if (v === null) {
+    if (v !== null) {
+      return v as unknown as T;
+    }
+    const found: any = lookupPath(key); /* a loaded namespace: "database", "app.port" */
+    if (found == null) {
       return defaultValue;
     }
-    return v as unknown as T;
+    return found as T;
   }
 
   /** The value of `key`; throws when it is not set. */
   getOrThrow<T = string>(key: string): T {
     const v = process.env.get(key);
-    if (v === null) {
+    if (v !== null) {
+      return v as unknown as T;
+    }
+    const found: any = lookupPath(key);
+    if (found == null) {
       throw new TypeError(`Configuration key "${key}" does not exist`);
     }
-    return v as unknown as T;
+    return found as T;
   }
 }
 
@@ -75,15 +128,21 @@ export class ConfigModule {
   /** Loads the .env file (unless ignoreEnvFile) and provides ConfigService. */
   static forRoot(options: ConfigModuleOptions = {}): DynamicModule {
     if (!(options.ignoreEnvFile || false)) {
-      const path = options.envFilePath || ".env";
-      if (existsSync(path)) {
-        const vars = parseEnv(readFileSync(path, "utf8"));
-        for (const [k, v] of vars) {
-          if (process.env.get(k) === null) {
-            process.env.set(k, v);
+      const given = options.envFilePath;
+      const paths: string[] = given == null ? [".env"] : typeof given === "string" ? [given] : (given as string[]);
+      for (const path of paths) {
+        if (existsSync(path)) {
+          const vars = parseEnv(readFileSync(path, "utf8"));
+          for (const [k, v] of vars) {
+            if (process.env.get(k) === null) {
+              process.env.set(k, v);
+            }
           }
         }
       }
+    }
+    for (const f of options.load ?? []) {
+      loaded[f.namespace] = f.build();
     }
     return { module: ConfigModule, providers: [ConfigService], exports: [ConfigService], global: options.isGlobal || false };
   }
