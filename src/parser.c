@@ -121,6 +121,34 @@ static Program *parsing_prog;
 static Module *parsing_mod;
 static void add_class(Program *prog, Class *c);
 static void parse_fields_body(Parser *p, Class *c);
+/* PartialType(A) / OmitType(A, ["k"] as const) / PickType(A, ["k"]) / IntersectionType(A, B), name already read */
+static Mixin *parse_mixin_rest(Parser *p, Token name) {
+    Mixin *m = xs_alloc(sizeof *m);
+    m->pos = name.pos;
+    if (!at(p, TK_LPAREN)) { m->cls = name.str; return m; }
+    if (strcmp(name.str, "PartialType") && strcmp(name.str, "OmitType") && strcmp(name.str, "PickType") && strcmp(name.str, "IntersectionType"))
+        xs_error(XS6022, name.pos, "extend PartialType(A), OmitType(A, [...]), PickType(A, [...]) or IntersectionType(A, B), or a class", "a class cannot extend the result of '%s(...)'", name.str);
+    m->kind = name.str;
+    next(p);
+    m->a = parse_mixin_rest(p, expect(p, TK_IDENT, NULL));
+    if (accept(p, TK_COMMA) && !at(p, TK_RPAREN)) {
+        if (strcmp(m->kind, "IntersectionType") == 0) m->b = parse_mixin_rest(p, expect(p, TK_IDENT, NULL));
+        else {
+            expect(p, TK_LBRACKET, "the keys as an array: OmitType(A, [\"id\"] as const)");
+            while (!at(p, TK_RBRACKET)) {
+                Token k = expect(p, TK_STRING, "the keys are strings");
+                m->keys = realloc(m->keys, sizeof(char *) * (size_t)(m->nkeys + 1));
+                m->keys[m->nkeys++] = k.str;
+                if (!accept(p, TK_COMMA)) break;
+            }
+            expect(p, TK_RBRACKET, NULL);
+            if (at_ident(p, "as")) { next(p); next(p); } /* as const */
+        }
+    }
+    accept(p, TK_COMMA);
+    expect(p, TK_RPAREN, NULL);
+    return m;
+}
 static Type *union_of(Type *a, Type *b);
 static bool peek_is(Parser *p, TokKind k);
 static bool looks_like_type_args(Parser *p);
@@ -1739,7 +1767,9 @@ static Class *parse_class_ex(Parser *p, bool abstract) {
     if (at_ident(p, "extends")) {
         next(p);
         c->base_pos = p->tok.pos;
-        c->base_name = expect(p, TK_IDENT, NULL).str;
+        Token bt = expect(p, TK_IDENT, NULL);
+        if (at(p, TK_LPAREN)) c->mixin = parse_mixin_rest(p, bt); /* extends PartialType(CreateDto) */
+        else c->base_name = bt.str;
         if (at(p, TK_LT)) xs_error(XS6022, p->tok.pos, NULL, "extending a generic class is not supported yet");
     }
     if (at_ident(p, "implements")) { /* recorded; the methods are what the framework calls */

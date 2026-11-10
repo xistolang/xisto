@@ -77,6 +77,22 @@ const bearerOf: Map<string, boolean> = new Map<string, boolean>();
 const operationsOf: Map<string, OperationDoc[]> = new Map<string, OperationDoc[]>();
 const responsesOf: Map<string, ResponseDoc[]> = new Map<string, ResponseDoc[]>();
 
+// the mapped types: class UpdateDto extends PartialType(CreateDto) {} copies CreateDto's fields (with their
+// decorators) into UpdateDto, each optional; OmitType(A, ["k"] as const) leaves keys out, PickType(A, ["k"]) keeps
+// only them, IntersectionType(A, B) joins two. The compiler does the copying: these are the names to import.
+export function PartialType(cls: ClassInfo): ClassInfo {
+  return cls;
+}
+export function OmitType(cls: ClassInfo, keys: string[]): ClassInfo {
+  return cls;
+}
+export function PickType(cls: ClassInfo, keys: string[]): ClassInfo {
+  return cls;
+}
+export function IntersectionType(a: ClassInfo, b: ClassInfo): ClassInfo {
+  return a;
+}
+
 export function ApiTags(tag: string): (c: ClassInfo) => void {
   return (c: ClassInfo): void => {
     const list = tagsOf.get(c.id);
