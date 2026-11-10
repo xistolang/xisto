@@ -830,6 +830,7 @@ static const char **class_names(int *n);
 /* Replaces placeholder class names left by the parser with the real classes. */
 static bool nullable_ok(Type *inner) {
     return inner->kind == TY_UNION || inner->kind == TY_STRING || inner->kind == TY_ARRAY || inner->kind == TY_OBJECT || inner->kind == TY_MAP || inner->kind == TY_SET ||
+           inner->kind == TY_FUNC || /* onDone?: () => void: a closure or NULL */
            inner->kind == TY_JSON || /* object | null: the JSON text or NULL (where?: object in an options interface) */
            inner->kind == TY_INT || inner->kind == TY_NUMBER || inner->kind == TY_BOOLEAN || inner->kind == TY_ENUM; /* primitives: a sentinel */
 }
@@ -1101,15 +1102,22 @@ static Type *resolve(Type *t, Pos pos) {
         *t = *r; /* (in place: whoever holds it now holds the function's type) */
         return t;
     }
+    if (t->kind == TY_TPARAM && t->tname && strcmp(t->tname, "__nonnull") == 0) { /* NonNullable<T> */
+        Type *r = ty_strip_null(resolve(t->elem, pos));
+        *t = *r;
+        return t;
+    }
     if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__typeof:", 9) == 0) { /* typeof x */
         Binding *b = lookup(t->tname + 9);
         if (!b || !b->type) { /* a module constant not checked yet: the type its literal has (const X = ['a', 'b'] as const) */
-            for (int i = 0; i < prog->top.len; i++) {
-                Stmt *st = prog->top.items[i];
-                if (st->kind != S_VAR || st->mod != cur_mod || !st->name || strcmp(st->name, t->tname + 9) != 0 || !st->init) continue;
-                Type *lt = st->decl_type ? resolve(st->decl_type, pos) : literal_type(st->init);
-                if (lt) { *t = *lt; return t; }
-            }
+            for (int pass = 0; pass < 2; pass++) /* this module's, then an exported one (imported by name) */
+                for (int i = 0; i < prog->top.len; i++) {
+                    Stmt *st = prog->top.items[i];
+                    if (st->kind != S_VAR || !st->name || strcmp(st->name, t->tname + 9) != 0 || !st->init) continue;
+                    if (pass == 0 ? st->mod != cur_mod : !st->exported) continue;
+                    Type *lt = st->decl_type ? resolve(st->decl_type, pos) : literal_type(st->init);
+                    if (lt) { *t = *lt; return t; }
+                }
         }
         if (!b || !b->type) xs_error(XS1019, pos, "write the type itself", "typeof %s: no variable '%s' here (or its type is not known yet)", t->tname + 9, t->tname + 9);
         *t = *b->type;
@@ -1166,6 +1174,7 @@ static Type *resolve(Type *t, Pos pos) {
         t->elem = resolve(t->elem, pos);
         if (t->elem->kind == TY_UNKNOWN) { Type *u = t->elem; *t = *u; return t; } /* unknown | null, x?: unknown: unknown holds null already */
         if (t->elem->kind == TY_TPARAM) return t; /* T | null in a template's own text: checked per instance */
+        if (t->elem->kind == TY_NULLABLE) { bool ab = t->absent; Type *u = t->elem; *t = *u; t->absent = t->absent || ab; return t; } /* (T | null) | null */
         if (!nullable_ok(t->elem))
             xs_error(XS2003, pos, "values that can be null: strings, numbers, booleans, enums, arrays, objects, Map and Set", "'%s | null' is not supported", ty_name(t->elem));
         return t;
@@ -1192,7 +1201,10 @@ static Type *resolve(Type *t, Pos pos) {
             }
         }
         Type *u = m[0];
-        if (n > 1) { u = xs_alloc(sizeof *u); u->kind = TY_UNION; u->params = m; u->nparams = n; }
+        bool strs = n > 1;
+        for (int i = 0; i < n && strs; i++) strs = m[i]->kind == TY_STRING;
+        if (strs) u = ty_string; /* 'A' | 'B': a string (TypeScript checks which ones) */
+        else if (n > 1) { u = xs_alloc(sizeof *u); u->kind = TY_UNION; u->params = m; u->nparams = n; }
         return nul ? ty_nullable_of(u) : u;
     }
     case TY_OBJECT:
@@ -1497,7 +1509,8 @@ static void check_type_supported(Pos pos, Type *t) {
         xs_error(XS6037, pos, "Set elements are string or int in xisto", "unsupported Set element type '%s'", ty_name(t));
     if (t->kind == TY_CHAN && (t->elem->kind == TY_VOID || t->elem->kind == TY_FUNC))
         xs_error(XS6040, pos, NULL, "unsupported channel element type '%s'", ty_name(t->elem));
-    if (t->kind == TY_MAP && (t->elem->kind == TY_VOID || t->elem->kind == TY_FUNC || (t->elem->kind == TY_NULLABLE && !ty_is_heap(t->elem))))
+    if (t->kind == TY_MAP && (t->elem->kind == TY_VOID || t->elem->kind == TY_FUNC ||
+                              (t->elem->kind == TY_NULLABLE && !ty_is_heap(t->elem) && t->elem->elem->kind != TY_NUMBER)))
         xs_error(XS6036, pos, NULL, "unsupported Map value type '%s'", ty_name(t->elem));
     if (t->kind == TY_STREAM && (t->elem->kind == TY_FUNC || t->elem->kind == TY_VOID || t->elem->kind == TY_NULLABLE || t->elem->kind == TY_STREAM))
         xs_error(XS6042, pos, NULL, "unsupported stream element type '%s'", ty_name(t->elem));
@@ -2481,7 +2494,14 @@ static void class_fields_all(Class *k, FieldSet *out) {
         enter_module(was);
         if (b && !b->builtin) class_fields_all(b, out);
     }
-    for (int i = 0; i < k->nfields; i++) fs_add(out, k->fields[i]);
+    Module *was = cur_mod;
+    enter_module(k->mod);
+    for (int i = 0; i < k->nfields; i++) {
+        Field f = k->fields[i];
+        if (f.type && !k->ntparams) f.type = resolve(f.type, f.pos); /* in the module that wrote it: its names are there */
+        fs_add(out, f);
+    }
+    enter_module(was);
 }
 static bool key_in(Mixin *m, const char *name) {
     for (int i = 0; i < m->nkeys; i++) if (strcmp(m->keys[i], name) == 0) return true;
@@ -2506,6 +2526,10 @@ static void mixin_eval(Mixin *m, FieldSet *out) {
         if (partial && !f.optional) {
             f.optional = true; /* (the initializer stays: Nest's mapped types inherit them) */
             f.type = ty_optional_of(f.type);
+        }
+        if (strcmp(m->kind, "RequiredType") == 0 && f.optional) { /* Required<A>: every field present */
+            f.optional = false;
+            f.type = ty_strip_null(f.type);
         }
         fs_add(out, f);
     }
@@ -2734,14 +2758,15 @@ static void check_object_member(Expr *e, Class *c) {
     }
     int idx;
     Field *f = find_field(c, e->str, &idx);
-    if (f && e->is_call && f->type->kind == TY_FUNC) { /* obj.run(x) where run is a function-valued field */
-        Type *ft = f->type;
+    bool null_fn = f && e->is_call && e->opt_call && f->type->kind == TY_NULLABLE && f->type->elem->kind == TY_FUNC;
+    if (f && e->is_call && (f->type->kind == TY_FUNC || null_fn)) { /* obj.run(x) where run is a function-valued field (obj.run?.(x): may be null) */
+        Type *ft = null_fn ? f->type->elem : f->type;
         Expr *fld = expr_copy(e);
         fld->is_call = false;
         fld->args.len = 0;
         fld->args.items = NULL;
         fld->field = idx;
-        fld->type = ft;
+        fld->type = null_fn ? f->type : ft;
         e->kind = E_CALL;
         e->lhs = fld;
         e->func = NULL;
@@ -2753,6 +2778,8 @@ static void check_object_member(Expr *e, Class *c) {
             expect_type(e->args.items[i], ft->params[i], xs_sprintf("argument %d of '%s'", i + 1, f->name));
         }
         e->type = ft->ret;
+        if (null_fn && ft->ret->kind != TY_VOID) e->type = ty_nullable_of(ft->ret);
+        e->opt_call = null_fn;
         return;
     }
     if (c->is_tuple && !e->is_call && strcmp(e->str, "length") == 0) { /* t.length: a constant */
