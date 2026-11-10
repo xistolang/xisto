@@ -9780,7 +9780,7 @@ void emit_program(Program *p, Buf *o) {
                      "    XS_JU_ARR_(xs_arr_bool, xs_sb_bool)\n"
                      "    XS_JU_ARR_(xs_arr_ref, xs_json_unknown)\n"
                      "#undef XS_JU_ARR_\n");
-        if (xs_any_used) /* an object made as an any: a Record<string, any> */
+        /* a Record<string, V> (an object made as an any, or a literal where an unknown goes) */
             buf_puts(&u, "    if (f_ == xs_map_free && ((xs_map *)v)->str_keys) {\n"
                          "        xs_map *m_ = v; xs_map_entry *e_; bool first_ = true; xs_sb_put(sb, \"{\", 1);\n"
                          "        XS_MAP_EACH(m_, e_) {\n"

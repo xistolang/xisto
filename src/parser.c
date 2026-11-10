@@ -3223,7 +3223,9 @@ static Expr *ns_member(Parser *p, Expr *e, Token name) {
         im->names[im->n] = name.str;
         im->positions[im->n++] = name.pos;
     }
-    return ident_expr(name.pos, name.str);
+    Expr *id = ident_expr(name.pos, name.str);
+    id->boolean = true; /* (read through a namespace: ns.x = v writes the module's let, as a CommonJS module object allows) */
+    return id;
 }
 
 static void parse_import(Parser *p, Module *m) {

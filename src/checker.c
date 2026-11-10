@@ -2185,11 +2185,22 @@ static void expect_type(Expr *e, Type *want, const char *what) {
     }
     /* a numeric enum is a number (TypeScript): HttpStatus.UNAUTHORIZED where an int goes */
     if (e->type->kind == TY_ENUM && !e->type->en->is_string && (want->kind == TY_INT || want->kind == TY_NUMBER)) { if (want->kind == TY_INT) e->type = ty_int; else return; }
+    if (want->kind == TY_ENUM && !want->en->is_string && (e->type->kind == TY_INT || e->type->kind == TY_LITINT) && e->kind != E_NUMBER) {
+        /* status = exception.getStatus(): a number where a numeric enum goes, as TypeScript allows */
+        if (e->type->kind == TY_LITINT) coerce_lit(e, ty_int);
+        e->type = want;
+        return;
+    }
     if (e->type->kind == TY_INT && want->kind == TY_INT) return;
     /* T[] of references is laid out like unknown[]: string[] where unknown[] goes */
     if (want->kind == TY_ARRAY && want->elem->kind == TY_UNKNOWN && e->type->kind == TY_ARRAY && ty_is_heap(e->type->elem)) return;
     if (want->kind == TY_UNKNOWN && e->type->kind != TY_UNKNOWN && e->type->kind != TY_VOID) { to_unknown(e); return; }
-    if (want->kind == TY_JSON && e->type->kind != TY_JSON && e->type->kind != TY_NULL && (e->type->kind == TY_LITINT || json_ok(e->type, 0))) { to_json(e); return; }
+    if (want->kind == TY_JSON && e->type->kind != TY_JSON && e->type->kind != TY_NULL) { /* unknown members: written by what they hold, as JSON.stringify does */
+        json_ok_unknown = true;
+        bool ok = e->type->kind == TY_LITINT || json_ok(e->type, 0);
+        json_ok_unknown = false;
+        if (ok) { to_json(e); return; }
+    }
     if (want->kind == TY_NULLABLE && want->elem->kind == TY_JSON && e->type->kind != TY_JSON && e->type->kind != TY_NULL && e->type->kind != TY_NULLABLE &&
         (e->type->kind == TY_LITINT || json_ok(e->type, 0))) { to_json(e); return; } /* into object | null */
     if (e->type->kind == TY_JSON && json_target(want)) { from_json(e, want); return; }
@@ -3332,7 +3343,10 @@ static void anon_objlit(Expr *e) {
         check_expr(v, v->kind == E_OBJLIT ? ty_json : NULL);
         settle(v);
         if (v->type->kind == TY_NULL) xs_error(XS3009, v->pos, "give the object a declared type", "cannot infer the type of null here");
-        if (!json_ok(v->type, 0)) xs_error(XS8004, v->pos, NULL, "%s cannot be part of a JSON value", ty_name(v->type));
+        json_ok_unknown = true; /* (an unknown member is written by what it holds) */
+        bool jok = json_ok(v->type, 0);
+        json_ok_unknown = false;
+        if (!jok) xs_error(XS8004, v->pos, NULL, "%s cannot be part of a JSON value", ty_name(v->type));
         c->fields[i] = (Field){.name = e->keys[i], .pos = v->pos, .type = v->type, .cname = field_cname(e->keys[i])};
     }
     c->nfields = c->cap_fields = e->args.len;
@@ -4375,7 +4389,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             for (Binding *o = b; o; o = o->origin) if (o->lit_number) widen_rhs = true;
             if (strncmp(b->cname, "env->", 5) == 0)
                 xs_error(XS8085, e->pos, "arrow functions capture by value; keep the state in an object or array and change that", "cannot assign to '%s', captured from the enclosing function", target->str);
-            if (b->is_const) xs_error(XS8087, e->pos, "declare it with 'let' if it changes", "cannot assign to constant '%s'", target->str);
+            if (b->is_const && !target->boolean) xs_error(XS8087, e->pos, "declare it with 'let' if it changes", "cannot assign to constant '%s'", target->str);
             if (b->is_param && ty_is_heap(b->type))
                 xs_error(XS8099, e->pos, "copy it into a local first: let s: string = param;", "cannot reassign parameter '%s' of reference type", target->str);
             if (b->orig) { narrowed = b; target->type = b->orig; }
@@ -5384,7 +5398,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                     Type *cbt = CB(np, is_map ? NULL : is_each ? ty_void : ty_boolean);
                     if (is_map) {
                         if (cb->kind == E_ARROW && !cb->arrow->fn->ret) { /* infer the element type of the result */
-                            cbt->ret = NULL;
+                            /* (xs.map((c) => ({ ... })) where an Achado[] goes: each result is an Achado) */
+                            cbt->ret = expected && expected->kind == TY_ARRAY && expected->elem->kind == TY_OBJECT ? expected->elem : NULL;
                             check_expr(cb, cbt);
                         } else {
                             check_expr(cb, NULL);
@@ -5764,6 +5779,11 @@ static void check_expr_in(Expr *e, Type *expected) {
             t = pick;
         }
         if (t && t->kind == TY_JSON) { anon_objlit(e); return; }
+        if (t && t->kind == TY_UNKNOWN && !ty_is_any(t) && !e->spread) { /* { a: 1 } where an unknown goes (a Record<string, unknown>'s value): a Record of its own */
+            static Type *rec_unknown;
+            if (!rec_unknown) { rec_unknown = xs_alloc(sizeof *rec_unknown); *rec_unknown = *ty_map_of(ty_string, ty_unknown); rec_unknown->record = true; }
+            t = rec_unknown;
+        }
         if (t && t->kind == TY_MAP && t->record) { /* a Record<K, V> written as { a: 1, b: 2 }: new Map([["a", 1], ["b", 2]]) */
             Expr *arr = xs_alloc(sizeof *arr);
             arr->kind = E_ARRAY_LIT; arr->pos = e->pos; arr->field = -1;
@@ -6117,6 +6137,12 @@ static void check_expr_in(Expr *e, Type *expected) {
     }
     case E_ARRAY_LIT: {
         if (expected && expected->kind == TY_NULLABLE) expected = expected->elem;
+        if (expected && expected->kind == TY_UNKNOWN && !ty_is_any(expected) && e->args.len) {
+            /* [name, date, 3] where an unknown goes: an unknown[] (each element as what it is) */
+            static Type *arr_unknown;
+            if (!arr_unknown) arr_unknown = ty_array_of(ty_unknown);
+            expected = arr_unknown;
+        }
         if (expected && expected->kind == TY_UNION) { /* string | string[]: the literal is the array member */
             Type *arr = NULL;
             for (int i = 0; i < expected->nparams; i++) if (expected->params[i]->kind == TY_ARRAY && !arr) arr = expected->params[i];
@@ -6224,6 +6250,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (bb->kind == TY_NULL) bb = ba;
             if (ba->kind != TY_NULL && ty_equal(ba, bb)) u = ba;
             else if (is_numeric(ba) && is_numeric(bb)) u = ty_number; /* Math.trunc(n) : null-or-number: a number */
+            else if (ty_is_any(ta) || ty_is_any(tb)) { u = ty_any; nul = false; } /* data ? user[data] : user: an any (the other side read by name too) */
             else if (ba->kind == TY_OBJECT && bb->kind == TY_OBJECT && !ba->cls->is_interface && !bb->cls->is_interface)
                 for (Class *c = ba->cls; c && !u; c = c->base) if (is_subclass(bb->cls, c)) u = ty_object_of(c);
             if (u && nul) {
@@ -6326,7 +6353,10 @@ static void check_var(Stmt *s, bool global) {
 /* ---- truthiness, narrowly: a string is true when not empty; T | null when not null (and, for strings, not
    empty). Numbers are never coerced. Only names and fields, which can be read twice: the test is rewritten
    into the explicit comparisons, so narrowing keeps working. ---- */
-static bool truthy_type(Type *t) { return t->kind == TY_STRING || t->kind == TY_NULLABLE || ty_is_any(t); }
+static bool truthy_type(Type *t) {
+    return t->kind == TY_STRING || t->kind == TY_NULLABLE || t->kind == TY_UNKNOWN ||
+           t->kind == TY_OBJECT || t->kind == TY_ARRAY || t->kind == TY_MAP || t->kind == TY_SET || t->kind == TY_FUNC;
+}
 static bool rereadable(Expr *e) {
     if (e->kind == E_IDENT || e->kind == E_THIS) return true;
     return e->kind == E_MEMBER && !e->is_call && e->field >= 0 && rereadable(e->lhs);
@@ -6499,7 +6529,15 @@ static void check_loose_eq(Expr *e) {
 }
 
 static void make_truthy(Expr *e, const char *what) {
-    if (ty_is_any(e->type)) { dyn_wrap(e, "xs_dyn_truthy", ty_boolean); return; } /* JavaScript's truthiness, at run time */
+    if (e->type->kind == TY_UNKNOWN) { dyn_wrap(e, "xs_dyn_truthy", ty_boolean); return; } /* JavaScript's truthiness, at run time (any and unknown) */
+    if (e->type->kind == TY_OBJECT || e->type->kind == TY_ARRAY || e->type->kind == TY_MAP || e->type->kind == TY_SET || e->type->kind == TY_FUNC) {
+        /* if (this.dataSource): a value that is never null is an object, always truthy */
+        if (!rereadable(e)) xs_error(XS8021, e->pos, "store it in a const first, or compare explicitly", "%s must be boolean (truthiness applies to names and fields only)", what);
+        Pos at = e->pos;
+        memset(e, 0, sizeof *e);
+        e->kind = E_BOOL; e->boolean = true; e->type = ty_boolean; e->field = -1; e->pos = at;
+        return;
+    }
     if (!rereadable(e)) { /* !xs?.length, if (m[k]), f() && ...: the value once, then its truthiness, through ((t) => !!t)(value) */
         if (e->type->kind == TY_VOID || e->type->kind == TY_NULL)
             xs_error(XS8021, e->pos, "store it in a const first, or compare explicitly", "%s must be boolean (truthiness applies to names and fields only)", what);
