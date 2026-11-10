@@ -1258,10 +1258,10 @@ export class SelectQueryBuilder<T> {
     this.params = text + "}";
   }
 
-  select(selection: string | string[] = []): SelectQueryBuilder<T> {
+  select(selection: string | string[] = [], selectionAliasName: string = ""): SelectQueryBuilder<T> {
     this.selects = [];
     if (typeof selection === "string") {
-      this.selects.push(selection);
+      this.selects.push(selectionAliasName.length > 0 ? selection + " AS " + quote(selectionAliasName) : selection);
     } else {
       for (const s of selection) {
         this.selects.push(s);

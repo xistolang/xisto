@@ -4848,6 +4848,10 @@ XS_NOINLINE int64_t xs_num_key(double d) {
     }
     return (int64_t)d;
 }
+XS_NOINLINE int64_t xs_num_key_find(double d) { /* m.get(n): a number that is not whole is a key no entry has */
+    if (d != d || d != trunc(d) || fabs(d) > 9007199254740991.0) return INT64_MIN;
+    return (int64_t)d;
+}
 XS_NOINLINE xs_arr_int *xs_num_keys(xs_arr_num *a) { /* new Set<number>(xs): the numbers as keys (the argument is borrowed) */
     xs_arr_int *r = xs_arr_int_new(0, 0);
     for (size_t i = 0; i < a->len; i++) xs_arr_int_push(r, xs_num_key(a->data[i]));

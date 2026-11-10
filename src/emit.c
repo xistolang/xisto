@@ -1412,7 +1412,7 @@ static void json_emit_read(Buf *b, Type *t, const char *jv, const char *where) {
     case TY_BOOLEAN: buf_printf(b, "xs_json_bool(%s, \"%s\")", jv, where); break;
     case TY_STRING: buf_printf(b, "xs_json_str(%s, \"%s\")", jv, where); break;
     case TY_JSON: buf_printf(b, "xs_json_text(%s)", jv); break; /* any value, kept as its JSON text (an object[] read back) */
-    case TY_UNKNOWN: buf_printf(b, "((void)(%s), xs_panicf(\"JSON: '%%s' is unknown, which JSON cannot be read into\", \"%s\"), (void *)NULL)", jv, where); break;
+    case TY_UNKNOWN: buf_printf(b, "xs_jv_any(%s)", jv); (void)where; break; /* a value of its own kind: number, string, boolean, null, unknown[] or Record */
     case TY_OBJECT:
         if (t->cls->builtin && strcmp(t->cls->name, "Date") == 0) { buf_printf(b, "xs_json_date(%s, \"%s\")", jv, where); break; }
         ensure_json(t);
