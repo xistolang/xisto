@@ -2532,6 +2532,94 @@ XS_NOINLINE void *xs_as_arr_of(void *v, void (*el_free)(void *), int el_nullable
     }
     return v;
 }
+/* x.toPrecision(p) as JavaScript: p significant digits; exponential when the exponent is < -6 or >= p */
+static xs_str *xs_str_from_num(double v);
+XS_NOINLINE xs_str *xs_num_to_precision(double x, int64_t p) {
+    if (isnan(x) || isinf(x)) return xs_str_from_num(x);
+    if (p < 1 || p > 100) xs_panic("RangeError: toPrecision() argument must be between 1 and 100");
+    char buf[160], out[200];
+    snprintf(buf, sizeof buf, "%.*e", (int)(p - 1), x); /* d.ddde±X, rounded */
+    char *ep = strchr(buf, 'e');
+    int e = atoi(ep + 1);
+    *ep = 0;
+    char digits[128];
+    size_t nd = 0;
+    bool neg = buf[0] == '-';
+    for (char *c = buf + (neg ? 1 : 0); *c; c++) if (*c != '.') digits[nd++] = *c;
+    digits[nd] = 0;
+    size_t n = 0;
+    if (neg) out[n++] = '-';
+    if (x == 0) e = 0;
+    if (e < -6 || e >= p) {
+        out[n++] = digits[0];
+        if (nd > 1) { out[n++] = '.'; memcpy(out + n, digits + 1, nd - 1); n += nd - 1; }
+        n += (size_t)snprintf(out + n, sizeof out - n, "e%c%d", e < 0 ? '-' : '+', abs(e));
+    } else if (e >= 0) {
+        memcpy(out + n, digits, (size_t)e + 1); n += (size_t)e + 1;
+        if ((size_t)e + 1 < nd) { out[n++] = '.'; memcpy(out + n, digits + e + 1, nd - (size_t)e - 1); n += nd - (size_t)e - 1; }
+    } else {
+        out[n++] = '0'; out[n++] = '.';
+        for (int i = 0; i < -e - 1; i++) out[n++] = '0';
+        memcpy(out + n, digits, nd); n += nd;
+    }
+    return xs_str_new(out, n);
+}
+/* x.toLocaleString(locale, { style, currency, minimumFractionDigits, maximumFractionDigits }) for 'pt-BR' and
+   'en-US' (other locales as en-US): the shortest decimal of x rounded half away from zero at maxfd digits (as ICU),
+   trailing zeros kept down to minfd, the integer part grouped by threes; currency 'BRL' / 'USD' / other codes */
+XS_NOINLINE xs_str *xs_num_to_locale(double x, xs_str *locale, xs_str *currency, int64_t minfd, int64_t maxfd) {
+    if (isnan(x)) return xs_str_new("NaN", 3);
+    if (isinf(x)) return xs_str_new(x < 0 ? "-\xe2\x88\x9e" : "\xe2\x88\x9e", x < 0 ? 4 : 3);
+    bool br = locale && locale->len >= 2 && memcmp(locale->data, "pt", 2) == 0;
+    char gsep = br ? '.' : ',', dsep = br ? ',' : '.';
+    if (maxfd < minfd) maxfd = minfd;
+    char dec[400];
+    if (fabs(x) >= 1e21 || (fabs(x) < 1e-6 && x != 0)) snprintf(dec, sizeof dec, "%.*f", (int)maxfd + 1, fabs(x));
+    else { xs_str *sh = xs_str_from_num(fabs(x)); size_t l = (size_t)sh->len < sizeof dec - 1 ? (size_t)sh->len : sizeof dec - 1; memcpy(dec, sh->data, l); dec[l] = 0; xs_release_(sh); }
+    char ip[400], fp[400];
+    char *dot = strchr(dec, '.');
+    size_t il = dot ? (size_t)(dot - dec) : strlen(dec);
+    memcpy(ip + 1, dec, il); ip[0] = '0'; il++; ip[il] = 0; /* a leading 0 takes a carry */
+    size_t fl = 0;
+    if (dot) for (char *c = dot + 1; *c; c++) fp[fl++] = *c;
+    fp[fl] = 0;
+    if ((int64_t)fl > maxfd) { /* round half away from zero at maxfd */
+        bool up = fp[maxfd] >= '5';
+        fl = (size_t)maxfd;
+        if (up) {
+            int64_t k = (int64_t)fl - 1;
+            for (; k >= 0; k--) { if (fp[k] == '9') fp[k] = '0'; else { fp[k]++; break; } }
+            if (k < 0) {
+                int64_t j = (int64_t)il - 1;
+                for (; j >= 0; j--) { if (ip[j] == '9') ip[j] = '0'; else { ip[j]++; break; } }
+            }
+        }
+    }
+    while ((int64_t)fl > minfd && fp[fl - 1] == '0') fl--;
+    while ((int64_t)fl < minfd) fp[fl++] = '0';
+    const char *ipd = ip;
+    while (*ipd == '0' && ipd[1]) ipd++;
+    size_t ni = strlen(ipd);
+    bool zero = true;
+    for (size_t i = 0; i < ni; i++) if (ipd[i] != '0') zero = false;
+    for (size_t i = 0; i < fl; i++) if (fp[i] != '0') zero = false;
+    char out[1000];
+    size_t n = 0;
+    (void)zero;
+    if (signbit(x)) out[n++] = '-'; /* (ICU keeps the sign of a value that rounds to 0, and of -0) */
+    if (currency) {
+        if (currency->len == 3 && memcmp(currency->data, "BRL", 3) == 0) { memcpy(out + n, "R$\xc2\xa0", 4); n += 4; }
+        else if (currency->len == 3 && memcmp(currency->data, "USD", 3) == 0) { if (br) { memcpy(out + n, "US$\xc2\xa0", 6); n += 6; } else out[n++] = '$'; }
+        else { memcpy(out + n, currency->data, (size_t)currency->len); n += (size_t)currency->len; memcpy(out + n, "\xc2\xa0", 2); n += 2; }
+    }
+    for (size_t i = 0; i < ni; i++) {
+        out[n++] = ipd[i];
+        size_t left = ni - 1 - i;
+        if (left && left % 3 == 0) out[n++] = gsep;
+    }
+    if (fl) { out[n++] = dsep; memcpy(out + n, fp, fl); n += fl; }
+    return xs_str_new(out, n);
+}
 /* x.toFixed(d) as JavaScript: the exact decimal value of the double rounded half up in magnitude (printf would
    round an exact tie to even), "-" when x < 0, String(x) from 1e21 on */
 static xs_str *xs_str_from_num(double v);
@@ -2834,6 +2922,8 @@ XS_NOINLINE bool xs_dyn_has(void *o, xs_str *k) {
     if (t->free == xs_map_free) return ((xs_map *)o)->str_keys && xs_map_lookup(o, k, 0) != NULL;
     return false;
 }
+/* 'k' in u, u a union of objects (held as an unknown): the member it holds has k */
+XS_NOINLINE bool xs_union_has(void *o, xs_str *k) { return o && xs_dyn_has(o, k); }
 XS_NOINLINE int64_t xs_dyn_as_int(void *v) {
     if (v && xs_type_of(v)->free == xs_box_num_free) { /* a number with no fraction (JavaScript has only numbers) */
         double d = ((xs_box_d *)v)->v;

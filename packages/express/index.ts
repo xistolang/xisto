@@ -18,6 +18,8 @@ export class Request {
   ip: string = "";
   /** What an authentication guard put on the request (@nestjs/passport: validate()'s value). */
   user: any = null;
+  /** The route's parameters (/:id), by name. */
+  params: Record<string, string> = {};
   private readonly all: Map<string, string> = new Map<string, string>();
   private readonly queries: Map<string, string> = new Map<string, string>();
 
@@ -166,6 +168,12 @@ export class Response {
   }
 
   /** Ends the response, with an optional last piece of text. */
+  /** once("drain", fn): the body is buffered, so it never waits: fn runs now. Other events never come. */
+  once(event: string, fn: () => void): Response {
+    if (event === "drain") fn();
+    return this;
+  }
+
   end(chunk: string = ""): Response {
     this.text = this.text + chunk;
     this.finished = true;

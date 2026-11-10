@@ -1655,7 +1655,8 @@ static void emit_member(Expr *e) {
                                              as JSON.stringify writes the value ("\u00e7" comes out as "ç", spacing goes) */
                 buf_printf(&h, "XS_NOINLINE xs_str *json_parse_%d(xs_str *s) { xs_jv *jv_ = xs_json_parse(s); xs_str *r_ = xs_json_text(jv_", id);
             else {
-                buf_printf(&h, "XS_NOINLINE %s json_parse_%d(xs_str *s) { xs_jv *jv_ = xs_json_parse(s); %s r_ = ", ctype(e->type), id, ctype(e->type));
+                buf_printf(&h, "XS_NOINLINE %s json_parse_%d(xs_str *s) { %sxs_jv *jv_ = xs_json_parse(s); %s r_ = ", ctype(e->type), id,
+                           e->type->kind == TY_NULLABLE ? "if (!s) return NULL; " : "", ctype(e->type)); /* (object | null into T | null: null is null) */
                 json_emit_read(&h, e->type, "jv_", "value");
             }
             if (e->type->kind == TY_JSON) buf_puts(&h, ")");
