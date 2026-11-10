@@ -168,6 +168,19 @@ static bool looks_like_fn_type(Parser *p) {
     return fn;
 }
 static Type *union_of(Type *a, Type *b);
+static Type *parse_type(Parser *p);
+/* after '|': the rest of a union, where null and undefined make it nullable (T | null | U, 'a' | 'b' | null) */
+static Type *union_rest(Parser *p, Type *t) {
+    for (;;) {
+        if (at_ident(p, "null") || at_ident(p, "undefined")) {
+            next(p);
+            t = ty_nullable_of(t);
+            if (!accept(p, TK_PIPE)) return t;
+            continue;
+        }
+        return union_of(t, parse_type(p));
+    }
+}
 /* { a: T; b?: U }: an object type written in place is an interface of its own, named from its text (the same text,
    tokens apart from spacing, is the same interface, so values of one place pass to another) */
 static Type *parse_inline_object_type(Parser *p) {
@@ -198,11 +211,89 @@ static Type *parse_inline_object_type(Parser *p) {
     return ty_object_of(c);
 }
 
+
+/* a type made from others (A & B, Omit<A, 'k'>, Pick<A, 'k'>, Partial<A>): an interface of its own whose fields the
+   checker copies in, as for class X extends IntersectionType(A, B); named from its text, as an inline object type */
+static Type *anon_iface(Parser *p, const char *open, Pos pos, Mixin *m) {
+    const char *close = p->prev_end;
+    uint64_t h = 1469598103934665603ULL;
+    for (const char *q = open; q < close; q++) if (!isspace((unsigned char)*q)) { h ^= (unsigned char)*q; h *= 1099511628211ULL; }
+    if (nsubst) h ^= (uint64_t)(uintptr_t)subst_types;
+    const char *name = xs_sprintf("__Obj_%016llx", (unsigned long long)h);
+    Program *prog = p->prog;
+    for (int i = 0; i < prog->nclasses; i++)
+        if (prog->classes[i]->mod == p->mod && strcmp(prog->classes[i]->name, name) == 0) return ty_object_of(prog->classes[i]);
+    Class *c = xs_alloc(sizeof *c);
+    c->pos = pos;
+    c->is_interface = true;
+    c->name = (char *)name;
+    c->mod = p->mod;
+    c->exported = true;
+    c->mixin = m;
+    add_class(prog, c);
+    return ty_object_of(c);
+}
+/* one side of an intersection or the argument of Omit/Pick/Partial: an interface or class, by name */
+static Mixin *mixin_of_type(Type *t, Pos pos) {
+    if (t->kind != TY_OBJECT || t->ntargs)
+        xs_error(XS1019, pos, "intersect interfaces or object types: A & { extra: T }", "unsupported type in an intersection or mapped type");
+    Mixin *m = xs_alloc(sizeof *m);
+    m->pos = pos;
+    m->cls = t->cls->name;
+    return m;
+}
+/* 'a' | 'b': the keys of Omit/Pick */
+static void mixin_keys(Mixin *m, Type *k, Pos pos) {
+    Type **ks = k->kind == TY_UNION ? k->params : &k;
+    int n = k->kind == TY_UNION ? k->nparams : 1;
+    for (int i = 0; i < n; i++) {
+        if (ks[i]->kind != TY_STRING || !ks[i]->tname) xs_error(XS1019, pos, "name the keys: Omit<A, 'id' | 'name'>", "the keys are string literals");
+        m->keys = realloc(m->keys, sizeof(char *) * (size_t)(m->nkeys + 1));
+        m->keys[m->nkeys++] = (char *)ks[i]->tname;
+    }
+}
+/* A & B (& C ...): '&' binds tighter than '|' (A & B | null is (A & B) | null) */
+static Type *inter_rest(Parser *p, Type *t, const char *open, Pos pos) {
+    while (at(p, TK_AMP)) {
+        next(p);
+        Type *r = parse_type(p);
+        Type *tail = NULL; /* what came after '|' on the right */
+        bool nul = false;
+        if (r->kind == TY_NULLABLE) { nul = true; r = r->elem; }
+        if (r->kind == TY_UNION) {
+            tail = r->nparams > 2 ? ({ Type *u = xs_alloc(sizeof *u); *u = *r; u->params++; u->nparams--; u; }) : r->params[1];
+            r = r->params[0];
+        }
+        Mixin *m = xs_alloc(sizeof *m);
+        m->pos = pos;
+        m->kind = "IntersectionType";
+        m->a = mixin_of_type(t, pos);
+        m->b = mixin_of_type(r, pos);
+        t = anon_iface(p, open, pos, m);
+        if (tail) t = union_of(t, tail);
+        if (nul) t = ty_nullable_of(t);
+    }
+    return t;
+}
 static Type *parse_type(Parser *p) {
     Type *t;
+    if (at_ident(p, "asserts") && peek_is(p, TK_IDENT)) next(p); /* asserts x is T: a check that throws, read as its boolean */
+    if (at(p, TK_IDENT) || at(p, TK_THIS)) { /* x is T: a type predicate is the boolean the function returns */
+        Parser look = *p;
+        next(&look);
+        if (at_ident(&look, "is")) {
+            *p = look;
+            next(p);
+            parse_type(p);
+            return ty_boolean;
+        }
+    }
     accept(p, TK_PIPE); /* type T =\n  | "a"\n  | "b": a union may open with '|' */
+    const char *open = p->tok.start;
+    Pos tpos = p->tok.pos;
     if (at(p, TK_LBRACE)) { /* { a: T; b?: U }: an object type in place */
         t = parse_inline_object_type(p);
+        if (at(p, TK_AMP)) t = inter_rest(p, t, open, tpos);
         while (at(p, TK_LBRACKET)) {
             next(p);
             expect(p, TK_RBRACKET, NULL);
@@ -265,7 +356,7 @@ static Type *parse_type(Parser *p) {
         t->kind = TY_STRING;
         t->tname = p->tok.str;
         next(p);
-        if (accept(p, TK_PIPE)) return union_of(t, parse_type(p));
+        if (accept(p, TK_PIPE)) return union_rest(p, t);
         return t;
     }
     if (at(p, TK_LPAREN) && !looks_like_fn_type(p)) { /* (T | null)[]: parentheses group a type */
@@ -279,9 +370,7 @@ static Type *parse_type(Parser *p) {
         }
         if (at(p, TK_PIPE)) {
             next(p);
-            if (!at_ident(p, "null")) xs_error(XS1013, p->tok.pos, "the only union xisto supports is T | null", "expected 'null' after '|'");
-            next(p);
-            t = ty_nullable_of(t);
+            t = union_rest(p, t);
         }
         return t;
     }
@@ -382,7 +471,8 @@ static Type *parse_type(Parser *p) {
         expect(p, TK_COMMA, "write Record<K, V>");
         Type *v = parse_type(p);
         expect(p, TK_GT, NULL);
-        t = ty_map_of(k->kind == TY_STRING && k->tname ? ty_string : k, v); /* (a key union of literals: string keys) */
+        t = ty_map_of(k->kind == TY_STRING && k->tname ? ty_string : k->kind == TY_NUMBER ? ty_int : k, v); /* (a key union of
+            literals: string keys; Record<number, V>: int keys) */
         if (t->key->kind == TY_UNION) t->key = ty_string;
         Type *r = xs_alloc(sizeof *r);
         *r = *t;
@@ -410,6 +500,23 @@ static Type *parse_type(Parser *p) {
         t = xs_alloc(sizeof *t);
         t->kind = TY_TPARAM;
         t->tname = n;
+    } else if ((strcmp(n, "Omit") == 0 || strcmp(n, "Pick") == 0 || strcmp(n, "Partial") == 0) && at(p, TK_LT)) {
+        /* Omit<A, 'k'>, Pick<A, 'k'>, Partial<A>: A's fields, some left out or optional (as OmitType(A, [...])) */
+        next(p);
+        Mixin *m = xs_alloc(sizeof *m);
+        m->pos = name.pos;
+        m->kind = n[0] == 'O' ? "OmitType" : n[1] == 'i' ? "PickType" : "PartialType";
+        Type *inner = parse_type(p);
+        if (inner->kind == TY_MAP) { /* Partial<Record<K, V>>: a Record's keys are already optional */
+            if (n[1] != 'a') { expect(p, TK_COMMA, NULL); parse_type(p); }
+            expect(p, TK_GT, NULL);
+            t = inner;
+        } else {
+            m->a = mixin_of_type(inner, name.pos);
+            if (n[1] != 'a') { expect(p, TK_COMMA, xs_sprintf("write %s<A, 'key'>", n)); mixin_keys(m, parse_type(p), name.pos); }
+            expect(p, TK_GT, NULL);
+            t = anon_iface(p, open, name.pos, m);
+        }
     } else {
         t = named_type(p, name);
         if (at(p, TK_LT)) { /* Name<A, B>: a generic interface */
@@ -421,6 +528,7 @@ static Type *parse_type(Parser *p) {
             expect(p, TK_GT, NULL);
         }
     }
+    if (at(p, TK_AMP)) t = inter_rest(p, t, open, tpos);
     while (at(p, TK_LBRACKET)) {
         next(p);
         if (at(p, TK_STRING)) { /* Input['campo']: the type of that field (the checker reads it) */
@@ -506,9 +614,15 @@ static bool looks_like_arrow(Parser *p) {
             else if (at(p, TK_RPAREN)) depth--;
             next(p);
         }
-        if (at(p, TK_COLON)) { /* return type annotation */
+        if (at(p, TK_COLON)) { /* return type annotation: skipped by tokens (a ternary's ': b' is not one) */
             next(p);
-            parse_type(p);
+            int d = 0;
+            while (!at(p, TK_EOF) && !(d == 0 && at(p, TK_ARROW))) {
+                if (at(p, TK_LPAREN) || at(p, TK_LBRACKET) || at(p, TK_LBRACE) || at(p, TK_LT)) d++;
+                else if (at(p, TK_RPAREN) || at(p, TK_RBRACKET) || at(p, TK_RBRACE) || at(p, TK_GT)) { if (--d < 0) break; }
+                else if (d == 0 && (at(p, TK_SEMI) || at(p, TK_COMMA) || at(p, TK_COLON) || at(p, TK_QUESTION) || at(p, TK_ASSIGN))) break;
+                next(p);
+            }
         }
         ok = at(p, TK_ARROW);
     }
@@ -770,6 +884,19 @@ static Expr *parse_primary(Parser *p) {
         int cap = 0;
         while (!at(p, TK_RBRACE)) {
             Token key;
+            if (at(p, TK_NUMBER) && peek_is(p, TK_COLON)) { /* { 3: v }: a numeric key, a Record's entry as { [3]: v } */
+                Expr *u = new_expr(E_UNARY, p->tok.pos);
+                u->op = TK_LBRACKET;
+                u->lhs = parse_primary(p);
+                expect(p, TK_COLON, NULL);
+                u->rhs = parse_assign(p);
+                if (e->args.len == cap) { cap = cap ? cap * 2 : 4; e->keys = realloc(e->keys, sizeof(char *) * (size_t)cap); }
+                e->keys[e->args.len] = "[]";
+                expr_list_push(&e->args, u);
+                e->spread = true;
+                if (!accept(p, TK_COMMA)) break;
+                continue;
+            }
             if (at(p, TK_ELLIPSIS) || at(p, TK_LBRACKET)) {
                 /* { ...base, x: 1 }: base's fields in place; { [k]: v }: a key computed at run time (a Record). The
                    checker expands both; the key is a marker no name can be */
@@ -950,6 +1077,14 @@ static Expr *parse_postfix(Parser *p) {
     int nopt = 0;
     for (;;) {
         Pos pos = p->tok.pos;
+        if (at(p, TK_QDOT) && e->kind == E_MEMBER && !e->is_call && peek_is(p, TK_LPAREN)) {
+            /* x.m?.(): a method is never null; the call as written (a function field that may be null is refused by the
+               checker, as for x.f()) */
+            next(p);
+            e->is_call = true;
+            parse_args(p, &e->args);
+            continue;
+        }
         if (at(p, TK_QDOT)) {
             next(p);
             if (nopt == 32) xs_error(XS1040, pos, "split the chain in two", "too many '?.' in one chain");
@@ -1143,7 +1278,12 @@ static Expr *parse_shift(Parser *p) {
 /* `x as T` binds like a relational operator in TypeScript */
 static Expr *parse_as(Parser *p) {
     Expr *e = parse_shift(p);
-    while (at_ident(p, "as")) {
+    while (at_ident(p, "as") || at_ident(p, "satisfies")) {
+        if (at_ident(p, "satisfies")) { /* x satisfies T: TypeScript's check of x against T; the value is x as written */
+            next(p);
+            parse_type(p);
+            continue;
+        }
         if (peek_is(p, TK_CONST)) { next(p); next(p); continue; } /* x as const: the literal keeps its own type */
         Expr *a = new_expr(E_AS, p->tok.pos);
         next(p);
@@ -1332,6 +1472,7 @@ static Expr *unset_value(Type *t, Pos pos) {
     case TY_STRING: if (t->tname) return NULL; e = new_expr(E_STRING, pos); e->str = ""; return e;
     case TY_BOOLEAN: e = new_expr(E_BOOL, pos); e->boolean = false; return e;
     case TY_NULLABLE: return new_expr(E_NULL, pos);
+    case TY_OBJECT: e = new_expr(E_NULL, pos); e->unset = true; return e; /* (the checker picks the empty value) */
     case TY_ARRAY: return new_expr(E_ARRAY_LIT, pos);
     case TY_MAP: case TY_SET: if (t->record) return new_expr(E_OBJLIT, pos); e = new_expr(E_NEW_MAP, pos); e->elem_type = t; return e;
     default: return NULL;
@@ -1902,7 +2043,18 @@ static Class *parse_interface(Parser *p) {
     }
     if (is_type) {
         expect(p, TK_ASSIGN, NULL);
-        if (!at(p, TK_LBRACE)) { /* type Shape = Circle | Rect; type Id = string | number; */
+        bool composite = false; /* type R = { ok: A } | { erro: B }; type R = { a: A } & B: a union or an intersection */
+        if (at(p, TK_LBRACE)) {
+            Parser look = *p;
+            int d = 0;
+            do {
+                if (at(&look, TK_LBRACE)) d++;
+                else if (at(&look, TK_RBRACE)) d--;
+                next(&look);
+            } while (d > 0 && !at(&look, TK_EOF));
+            composite = at(&look, TK_PIPE) || at(&look, TK_AMP) || at(&look, TK_LBRACKET);
+        }
+        if (!at(p, TK_LBRACE) || composite) { /* type Shape = Circle | Rect; type Id = string | number; */
             c->alias = parse_type(p);
             accept(p, TK_SEMI);
             return c;
@@ -2029,6 +2181,7 @@ static void parse_fields_body(Parser *p, Class *c) {
         }
         Token name;
         if (sym_iter) { name = p->tok; name.kind = TK_IDENT; name.str = "__iterator"; name.pos = pos; }
+        else if (at(p, TK_STRING)) { name = p->tok; name.kind = TK_IDENT; next(p); } /* '@timestamp': string */
         else name = expect_prop_name(p, NULL);
         if (gen_method && !at(p, TK_LPAREN) && !at(p, TK_LT)) xs_error(XS8064, name.pos, NULL, "'*' marks a generator method: *%s(): Generator<T> { ... }", name.str);
         if (accessor) {
@@ -2357,6 +2510,30 @@ static bool generic_arrow_ahead(Parser *p) {
     return at(&look, TK_GT) || at(&look, TK_COMMA) || at(&look, TK_ASSIGN) || at_ident(&look, "extends");
 }
 
+/* the rest of the module declares `name` at its top level: a line that starts (after export / declare / abstract)
+   with class / interface / type / function / enum / const / let and then the name (read as text: a lexer this far
+   ahead would not know where a regular expression starts) */
+static bool declares_top(Parser *p, const char *name) {
+    const char *q = p->lx.src + p->lx.pos;
+    size_t n = strlen(name);
+    static const char *const lead[] = {"export ", "declare ", "default ", "abstract ", "async "};
+    static const char *const kw[] = {"class ", "interface ", "type ", "function ", "enum ", "const ", "let "};
+    for (; *q; q++) {
+        if (q != p->lx.src && q[-1] != '\n') continue;
+        const char *r = q;
+        for (bool again = true; again;) {
+            again = false;
+            for (size_t k = 0; k < sizeof lead / sizeof *lead; k++)
+                if (strncmp(r, lead[k], strlen(lead[k])) == 0) { r += strlen(lead[k]); again = true; }
+        }
+        for (size_t k = 0; k < sizeof kw / sizeof *kw; k++)
+            if (strncmp(r, kw[k], strlen(kw[k])) == 0) {
+                const char *w = r + strlen(kw[k]);
+                if (strncmp(w, name, n) == 0 && !isalnum((unsigned char)w[n]) && w[n] != '_' && w[n] != '$') return true;
+            }
+    }
+    return false;
+}
 static void parse_import(Parser *p, Module *m) {
     Pos pos = p->tok.pos;
     expect(p, TK_IMPORT, NULL);
@@ -2396,6 +2573,13 @@ static void parse_import(Parser *p, Module *m) {
             p->alias_to = realloc(p->alias_to, sizeof(char *) * (size_t)(p->nalias + 1));
             p->alias_from[p->nalias] = alias.str;
             p->alias_to[p->nalias++] = name.str;
+            /* import { A as B } in a module that declares its own A: the local A reads as A__local from here on */
+            if (strcmp(alias.str, name.str) != 0 && declares_top(p, name.str)) {
+                p->alias_from = realloc(p->alias_from, sizeof(char *) * (size_t)(p->nalias + 1));
+                p->alias_to = realloc(p->alias_to, sizeof(char *) * (size_t)(p->nalias + 1));
+                p->alias_from[p->nalias] = name.str;
+                p->alias_to[p->nalias++] = xs_sprintf("%s__local", name.str);
+            }
         }
         if (im.n == cap) {
             cap = cap ? cap * 2 : 4;

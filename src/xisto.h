@@ -274,6 +274,8 @@ struct Expr {
     long long ival;
     bool is_int_lit;
     bool big_lit;      /* the argument of BigInt(...) made from a 123n literal */
+    void *ctx;         /* checker: where its names resolve when that is not where it is checked (a parameter's default) */
+    bool unset;        /* E_NULL: the start of `let x: Cls;` (assigned before any read, TypeScript checks it) */
     bool boolean;      /* E_BOOL */
     char *str;         /* E_STRING literal, E_IDENT name, E_MEMBER member name, E_NEW_OBJ class name */
     TokKind op;
