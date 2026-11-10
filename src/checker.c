@@ -2173,6 +2173,65 @@ static void error_class(Class *c) {
     f->body = body;
     c->ctor = f;
 }
+/* class X extends PartialType(Y): Y's fields (its bases' first) copied into X, optional for PartialType, without
+   the keys OmitType leaves out or with only those PickType keeps; X extends nothing (as in Nest, a new class) */
+typedef struct { Field *f; int n; } FieldSet;
+static void mixin_eval(Mixin *m, FieldSet *out);
+static void apply_mixin(Class *c);
+static void fs_add(FieldSet *out, Field f) {
+    for (int i = 0; i < out->n; i++) if (strcmp(out->f[i].name, f.name) == 0) { out->f[i] = f; return; } /* redeclared below */
+    out->f = realloc(out->f, sizeof(Field) * (size_t)(out->n + 1));
+    out->f[out->n++] = f;
+}
+static void class_fields_all(Class *k, FieldSet *out) {
+    if (k->mixin && !k->mixin_done) { Module *was = cur_mod; apply_mixin(k); enter_module(was); }
+    if (k->base_name) {
+        Module *was = cur_mod;
+        enter_module(k->mod);
+        Class *b = find_class(k->base_name);
+        enter_module(was);
+        if (b && !b->builtin) class_fields_all(b, out);
+    }
+    for (int i = 0; i < k->nfields; i++) fs_add(out, k->fields[i]);
+}
+static bool key_in(Mixin *m, const char *name) {
+    for (int i = 0; i < m->nkeys; i++) if (strcmp(m->keys[i], name) == 0) return true;
+    return false;
+}
+static void mixin_eval(Mixin *m, FieldSet *out) {
+    if (!m->kind) {
+        Class *k = find_class(m->cls);
+        if (!k || k->builtin) xs_error(XS9031, m->pos, NULL, "unknown class '%s'", m->cls);
+        Module *was = cur_mod;
+        enter_module(k->mod);
+        class_fields_all(k, out);
+        enter_module(was);
+        return;
+    }
+    FieldSet a = {0};
+    mixin_eval(m->a, &a);
+    bool partial = strcmp(m->kind, "PartialType") == 0, omit = strcmp(m->kind, "OmitType") == 0, pick = strcmp(m->kind, "PickType") == 0;
+    for (int i = 0; i < a.n; i++) {
+        Field f = a.f[i];
+        if ((omit && key_in(m, f.name)) || (pick && !key_in(m, f.name))) continue;
+        if (partial && !f.optional) {
+            f.optional = true; /* (the initializer stays: Nest's mapped types inherit them) */
+            f.type = ty_optional_of(f.type);
+        }
+        fs_add(out, f);
+    }
+    if (m->b) mixin_eval(m->b, out);
+}
+static void apply_mixin(Class *c) {
+    if (c->mixin_done) return;
+    c->mixin_done = true;
+    FieldSet fs = {0};
+    mixin_eval(c->mixin, &fs);
+    for (int i = 0; i < c->nfields; i++) fs_add(&fs, c->fields[i]);
+    for (int i = 0; i < fs.n; i++) fs.f[i].owner = c;
+    c->fields = fs.f;
+    c->nfields = c->cap_fields = fs.n;
+}
 static Func *eff_ctor(Class *c) {
     for (; c; c = c->base) if (c->ctor) return c->ctor;
     return NULL;
@@ -6320,6 +6379,7 @@ void check_program(Program *p) {
     for (int i = 0; i < p->nclasses; i++) {
         Class *c = p->classes[i];
         enter_module(c->mod);
+        if (c->mixin) apply_mixin(c);
         if (c->base_name) {
             Class *b = find_class(c->base_name);
             if (!b) {

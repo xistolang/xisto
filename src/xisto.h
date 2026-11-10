@@ -524,7 +524,19 @@ struct Class {
     int nsmethods;
     Type *alias;       /* type Name = A | B: a name for another type (not an object shape) */
     bool extends_error; /* class X extends Error: fields message and name first, laid out as the runtime's Error */
+    struct Mixin *mixin; /* class X extends PartialType(Y) (OmitType, PickType, IntersectionType): Y's fields copied in */
+    bool mixin_done;
 };
+/* PartialType(Y), OmitType(Y, ["a"] as const), PickType(Y, ["a"]), IntersectionType(A, B): the mapped types of
+   @nestjs/swagger (and @nestjs/mapped-types), a class or another mapped type as each argument */
+typedef struct Mixin {
+    const char *kind;  /* "PartialType", ...; NULL: just the class */
+    const char *cls;
+    Pos pos;
+    struct Mixin *a, *b;
+    char **keys;
+    int nkeys;
+} Mixin;
 /* a class that extends Error, directly or through its bases */
 static inline bool is_error_class(struct Class *c) {
     for (; c; c = c->base) if (c->extends_error) return true;
