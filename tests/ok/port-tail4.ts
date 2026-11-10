@@ -57,3 +57,20 @@ console.log(big(n), big(2.5));
 const raw: object = JSON.parse('[{"a":1,"b":"x","c":[1,{"d":true}]},{"a":null}]') as object;
 const rs = raw as Record<string, unknown>[];
 console.log(rs.length, rs[0]['b'], rs[1]['a'], JSON.stringify(rs[0]['c']));
+
+function igual(a: number | null, c: number | null): boolean { return a == null || c == null ? a === c : Math.abs(a - c) < 1e-6; }
+console.log(igual(null, null), igual(1, null), igual(2, 2), igual(2, 3));
+const t1: string | null = 'a', t2: string | null = null;
+console.log(t1 === t2, t1 !== t2, t2 === null);
+const id = 7;
+const params = n > 2 ? [id, 'ativo', 10, 0] : [id, 'x'];
+console.log(params.length, params[1]);
+
+const base: Record<string, unknown> = { a: 1, b: 'x' };
+const extra: Record<string, unknown> = { b: 'y', c: true };
+const junto: Record<string, unknown> = { ...base, ...extra, d: null };
+console.log(junto, Object.keys(junto).length);
+const nums: Record<string, number> = { p: 1 };
+const copia = { ...nums };
+copia['q'] = 2;
+console.log(nums, copia);

@@ -836,8 +836,8 @@ export type ObjectLiteral = object;
 export interface FindManyOptions {
   where?: object;
   order?: object;
-  skip?: int;
-  take?: int;
+  skip?: number;
+  take?: number;
   select?: string[];
 }
 
@@ -996,13 +996,20 @@ export class Repository<T> {
   /** The SELECT a find runs (with its parameters), for tests and logging. */
   findSql(options: FindManyOptions = {}): string {
     const binds = new Binds(this.executor.dialect());
-    return this.selectSql(options.where ?? null, options.order ?? null, options.skip ?? 0, options.take ?? 0, options.select ?? [], binds);
+    return this.selectSql(options.where ?? null, options.order ?? null, Math.trunc(options.skip ?? 0), Math.trunc(options.take ?? 0), options.select ?? [], binds);
   }
 
   async find(options: FindManyOptions = {}): Promise<T[]> {
     const binds = new Binds(this.executor.dialect());
-    const sql = this.selectSql(options.where ?? null, options.order ?? null, options.skip ?? 0, options.take ?? 0, options.select ?? [], binds);
+    const sql = this.selectSql(options.where ?? null, options.order ?? null, Math.trunc(options.skip ?? 0), Math.trunc(options.take ?? 0), options.select ?? [], binds);
     return this.entities(await this.executor.rows(sql, binds.values));
+  }
+
+  /** the page of entities and the count of all that match (TypeORM runs both queries the same way) */
+  async findAndCount(options: FindManyOptions = {}): Promise<[T[], int]> {
+    const rows = await this.find(options);
+    const total = await this.count(options);
+    return [rows, total];
   }
 
   async findBy(where: object): Promise<T[]> {
@@ -1638,18 +1645,26 @@ export class SelectQueryBuilder<T> {
     return sql + pageSql(binds.dialect, this.skipN, this.takeN);
   }
 
-  async getRawMany(): Promise<object> {
+  private async rawRows(): Promise<object> {
     const binds = new Binds(this.executor.dialect());
     const sql = this.build(binds);
     return this.executor.rows(sql, binds.values);
   }
 
-  async getRawOne(): Promise<object | null> {
-    const rows = await this.getRawMany();
+  /** the rows as TypeORM gives them: getRawMany<Row>() decodes each row as Row; without a type, rows read by name */
+  async getRawMany<R = any>(): Promise<R[]> {
+    const raw: object = await this.rawRows();
+    const rows: R[] = raw;
+    return rows;
+  }
+
+  async getRawOne<R = any>(): Promise<R | null> {
+    const rows = await this.rawRows();
     if (len(rows) === 0) {
       return null;
     }
-    return at(rows, 0);
+    const one: R = at(rows, 0);
+    return one;
   }
 
   async getMany(): Promise<T[]> {
@@ -1657,7 +1672,7 @@ export class SelectQueryBuilder<T> {
     if (m === null) {
       throw new Error("getMany() needs an entity: createQueryBuilder(Entity, alias) or repository.createQueryBuilder(alias)");
     }
-    const rows = await this.getRawMany();
+    const rows = await this.rawRows();
     const mapped = remap(rows, m.spec());
     const out: T[] = JSON.parse(JSON.stringify(mapped));
     return out;
@@ -1666,6 +1681,12 @@ export class SelectQueryBuilder<T> {
   async getOne(): Promise<T | null> {
     const many = await this.getMany();
     return many.length > 0 ? many[0] : null;
+  }
+
+  async getManyAndCount(): Promise<[T[], int]> {
+    const many = await this.getMany();
+    const total = await this.getCount();
+    return [many, total];
   }
 
   async getCount(): Promise<int> {
