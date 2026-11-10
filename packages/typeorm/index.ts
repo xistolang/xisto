@@ -1163,7 +1163,7 @@ export class Repository<T> {
     return entity;
   }
 
-  async query<T = object>(sql: string, params: unknown[] = []): Promise<T> {
+  async query<T = any>(sql: string, params: unknown[] = []): Promise<T> {
     const raw: object = await this.executor.rows(sql, params);
     const rows: T = raw; // query<Row[]>(...) decodes the rows as Row[], like TypeORM's query<T>
     return rows;
@@ -1707,7 +1707,7 @@ export class EntityManager {
   get connection(): DataSource {
     return this.executor.dataSource;
   }
-  async query<T = object>(sql: string, params: unknown[] = []): Promise<T> {
+  async query<T = any>(sql: string, params: unknown[] = []): Promise<T> {
     const raw: object = await this.executor.rows(sql, params);
     const rows: T = raw; // query<Row[]>(...) decodes the rows as Row[], like TypeORM's query<T>
     return rows;
@@ -1814,7 +1814,7 @@ export class QueryRunner {
   }
 
   /** raw SQL on this runner's connection; useStructuredResult: TypeORM's QueryResult (see EntityManager.queryResult) */
-  async query<T = object>(sql: string, params: unknown[] = [], useStructuredResult: boolean = false): Promise<T> {
+  async query<T = any>(sql: string, params: unknown[] = [], useStructuredResult: boolean = false): Promise<T> {
     await this.connect();
     if (useStructuredResult) {
       return this.manager.queryResult<T>(sql, params);
@@ -1875,7 +1875,7 @@ export class DataSource {
   }
 
   /** raw SQL with the dialect's binds ($1 for postgres, :1 for oracle); the rows as an object to decode */
-  async query<T = object>(sql: string, params: unknown[] = []): Promise<T> {
+  async query<T = any>(sql: string, params: unknown[] = []): Promise<T> {
     return this.manager.query<T>(sql, params);
   }
 

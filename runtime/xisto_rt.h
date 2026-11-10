@@ -2505,6 +2505,15 @@ XS_NOINLINE void *xs_as_ref(void *v, void (*free_fn)(void *), int nullable, cons
     if (xs_type_of(v)->free != free_fn) xs_as_fail(what);
     return v;
 }
+/* timer.unref() / timer.ref(): accepted on a timer handle, no effect */
+static inline void xs_timer_ref_noop(int64_t t) { (void)t; }
+/* a number where a string method takes a position (s.slice(0, n / 2)): JavaScript's ToIntegerOrInfinity, NaN 0 */
+XS_NOINLINE int64_t xs_num_to_index(double v) {
+    if (v != v) return 0;
+    if (v >= 9.2e18) return INT64_MAX;
+    if (v <= -9.2e18) return INT64_MIN + 1;
+    return (int64_t)v;
+}
 /* n ?? 'text' with n a number | null: String(n), or null for the default (JavaScript's number | string, read as text) */
 static xs_str *xs_str_from_num(double v);
 static xs_str *xs_str_from_int(int64_t v);

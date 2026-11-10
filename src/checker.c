@@ -493,6 +493,16 @@ static Expr *null_str(Pos pos) { /* a missing optional string argument: NULL in 
     return n;
 }
 #define XS_NOT_GIVEN (-9223372036854775807LL - 1) /* INT64_MIN: an index argument left out */
+/* a number where a position goes (s.slice(0, n / 2), '0'.repeat(w - n)): truncated, as JavaScript reads it */
+static void index_of_number(Expr *a) {
+    if (a->type->kind != TY_NUMBER) return;
+    Expr *v = xs_alloc(sizeof *v);
+    *v = *a;
+    memset(a, 0, sizeof *a);
+    a->kind = E_CALL; a->pos = v->pos; a->field = -1; a->type = ty_int;
+    a->builtin.cfn = "xs_num_to_index";
+    expr_list_push(&a->args, v);
+}
 static void int_arg(Expr **slot, const char *what) {
     check_expr(*slot, ty_int);
     expect_type(*slot, ty_int, what);
@@ -2596,6 +2606,7 @@ static bool check_string_member_more(Expr *e) {
         for (int k = 0; k < e->args.len; k++) {
             Type *want = (k == 0 ? ms[i].a1 : ms[i].a2) == TY_STRING ? ty_string : ty_int;
             check_expr(e->args.items[k], want);
+            if (want == ty_int) index_of_number(e->args.items[k]);
             expect_type(e->args.items[k], want, xs_sprintf("argument of string.%s", e->str));
         }
         if ((strcmp(e->str, "padStart") == 0 || strcmp(e->str, "padEnd") == 0) && e->args.len == 1) {
@@ -2653,6 +2664,7 @@ static void check_string_member(Expr *e) {
         for (int k = 0; k < e->args.len; k++) {
             Type *want = (index_of && k == 1) ? ty_int : argt; /* indexOf(search, fromIndex) */
             check_expr(e->args.items[k], want);
+            if (want == ty_int) index_of_number(e->args.items[k]);
             expect_type(e->args.items[k], want, xs_sprintf("argument of string.%s", e->str));
         }
         if (index_of && e->args.len == 1) { /* default start: 0 */
@@ -5813,6 +5825,13 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->type = ty_string;
                 return;
             }
+            if (e->is_call && e->args.len == 0 && e->lhs->type->kind == TY_INT && (!strcmp(e->str, "unref") || !strcmp(e->str, "ref"))) {
+                /* timer.unref?.() on a setTimeout / setInterval handle (an int here): accepted, it changes nothing
+                   (a server keeps running; XB-123) */
+                e->builtin.cfn = "xs_timer_ref_noop";
+                e->type = ty_void;
+                return;
+            }
             xs_error(XS8013, e->pos, NULL, "%s has no member '%s'", ty_name(e->lhs->type), e->str);
             return;
         default:
@@ -5883,7 +5902,13 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         if (want->kind == TY_UNKNOWN) { *e = *v; to_unknown(e); return; }
         if (v->type->kind == TY_JSON && json_target(want)) { *e = *v; from_json(e, want); return; }
-        if (want->kind == TY_JSON && json_ok(v->type, 0)) { *e = *v; to_json(e); return; }
+        if (want->kind == TY_JSON) { /* x as object: written as JSON text (an unknown inside by its type at run time) */
+            bool ju = json_ok_unknown;
+            json_ok_unknown = true;
+            bool ok = json_ok(v->type, 0);
+            json_ok_unknown = ju;
+            if (ok) { *e = *v; to_json(e); return; }
+        }
         if (want->kind == TY_NULLABLE && want->elem->kind == TY_JSON && v->type->kind != TY_NULL && v->type->kind != TY_NULLABLE && json_ok(v->type, 0)) { *e = *v; to_json(e); return; }
         if (want->kind == TY_NULLABLE && ty_equal(v->type, want->elem)) { *e = *v; e->type = want; return; }
         if (v->type->kind == TY_NULLABLE && ty_equal(v->type->elem, want)) { e->type = want; e->op = TK_NOT; e->elem_type = NULL; return; } /* T | null as T: checked */
@@ -5892,6 +5917,17 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (g->kind == TY_OBJECT && w->kind == TY_OBJECT && !g->cls->is_interface && !w->cls->is_interface) {
                 if (is_subclass(g->cls, w->cls)) { *e = *v; upcast(e, want); return; }
                 if (is_subclass(w->cls, g->cls)) { e->type = want; e->elem_type = want; e->op = TK_CLASS; return; } /* op marks a downcast */
+            }
+        }
+        { /* (dto as { nuTitular?: number }).nuTitular: TypeScript reads the same object through another shape; here a
+             copy of it in that shape (through its JSON: the fields both have), read-only in effect */
+            Type *w = want->kind == TY_NULLABLE ? want->elem : want;
+            Type *g = v->type->kind == TY_NULLABLE ? v->type->elem : v->type;
+            if (w->kind == TY_OBJECT && !w->cls->builtin && g->kind == TY_OBJECT && !g->cls->builtin && json_ok(g, 0) && json_target(w) && v->type->kind != TY_NULLABLE) {
+                *e = *v;
+                to_json(e);
+                from_json(e, want);
+                return;
             }
         }
         xs_error(XS8090, e->pos, "xisto checks types statically: 'as' converts an object (JSON) value or restates the same type", "cannot convert %s to %s", ty_name(v->type), ty_name(want));
