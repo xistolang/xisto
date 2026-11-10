@@ -1,0 +1,6 @@
+total number 42
+rotulo string "painel"
+resumo interface {"itens":3,"ok":true}
+limpo
+limpa void 
+done

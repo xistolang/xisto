@@ -1112,8 +1112,10 @@ export class Repository<T> {
     return entity;
   }
 
-  async query(sql: string, params: unknown[] = []): Promise<object> {
-    return this.executor.rows(sql, params);
+  async query<T = object>(sql: string, params: unknown[] = []): Promise<T> {
+    const raw: object = await this.executor.rows(sql, params);
+    const rows: T = raw; // query<Row[]>(...) decodes the rows as Row[], like TypeORM's query<T>
+    return rows;
   }
 
   createQueryBuilder(alias: string = ""): SelectQueryBuilder<T> {
@@ -1650,8 +1652,10 @@ export class EntityManager {
   get connection(): DataSource {
     return this.executor.dataSource;
   }
-  async query(sql: string, params: unknown[] = []): Promise<object> {
-    return this.executor.rows(sql, params);
+  async query<T = object>(sql: string, params: unknown[] = []): Promise<T> {
+    const raw: object = await this.executor.rows(sql, params);
+    const rows: T = raw; // query<Row[]>(...) decodes the rows as Row[], like TypeORM's query<T>
+    return rows;
   }
   /** getRepository<User>(User): the class gives its metadata, the type argument the entities' type */
   getRepository<T>(entity: ClassInfo): Repository<T> {
@@ -1726,9 +1730,9 @@ export class QueryRunner {
     this.isReleased = true;
   }
 
-  async query(sql: string, params: unknown[] = []): Promise<object> {
+  async query<T = object>(sql: string, params: unknown[] = []): Promise<T> {
     await this.connect();
-    return this.manager.query(sql, params);
+    return this.manager.query<T>(sql, params);
   }
 }
 
@@ -1783,8 +1787,8 @@ export class DataSource {
   }
 
   /** raw SQL with the dialect's binds ($1 for postgres, :1 for oracle); the rows as an object to decode */
-  async query(sql: string, params: unknown[] = []): Promise<object> {
-    return this.manager.query(sql, params);
+  async query<T = object>(sql: string, params: unknown[] = []): Promise<T> {
+    return this.manager.query<T>(sql, params);
   }
 
   /** getRepository<User>(User): the class gives its metadata, the type argument the entities' type */
