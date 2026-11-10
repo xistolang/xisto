@@ -3765,6 +3765,55 @@ XS_NOINLINE bool xs_is_array(void *v) {
     return f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free;
 }
 /* a < b on strings: by their characters (UTF-8 bytes order as code points do) */
+/* a.localeCompare(b): the order of ICU's root collation for Latin text, as Node gives it by default: first the
+   letters without accents or case (spaces and punctuation < digits < letters), then the accents (none first), then
+   the case (lower first). Other scripts compare by code point after Latin (a gap: ICU orders them too). */
+static uint32_t xs_lc_next(const unsigned char **p, const unsigned char *end) {
+    const unsigned char *s = *p;
+    uint32_t c = *s++;
+    if (c >= 0xC0 && s < end) {
+        int n = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : 1;
+        c &= n == 3 ? 0x07 : n == 2 ? 0x0F : 0x1F;
+        while (n-- && s < end) c = (c << 6) | (*s++ & 0x3F);
+    }
+    *p = s;
+    return c;
+}
+static void xs_lc_key(uint32_t c, uint32_t *pri, int *sec, int *ter) {
+    static const char *acc[2] = { /* Latin-1 letters 0xC0..0xFF: base letter and accent (1 acute, 2 grave, 3 circumflex, 4 ring, 5 diaeresis, 6 tilde, 7 cedilla, 8 stroke) */
+        "a2a1a3a6a5a4..c7e2e1e3e5i2i1i3i5..n6o2o1o3o6o5..o8u2u1u3u5y1....",
+        "a2a1a3a6a5a4..c7e2e1e3e5i2i1i3i5..n6o2o1o3o6o5..o8u2u1u3u5y1..y5" };
+    *sec = 0; *ter = 0;
+    if (c >= 0xC0 && c <= 0xFF && c != 0xD7 && c != 0xF7) {
+        int up = c < 0xE0, i = (int)(c - (up ? 0xC0 : 0xE0));
+        const char *e = acc[up ? 0 : 1] + 2 * i;
+        if (e[0] != '.') { *pri = 2000u + (uint32_t)(e[0] - 'a'); *sec = e[1] - '0'; *ter = up; return; }
+    }
+    if (c >= 'a' && c <= 'z') { *pri = 2000u + (c - 'a'); return; }
+    if (c >= 'A' && c <= 'Z') { *pri = 2000u + (c - 'A'); *ter = 1; return; }
+    if (c >= '0' && c <= '9') { *pri = 1000u + (c - '0'); return; }
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { *pri = 10u + c; return; }
+    if (c < 0x80) { *pri = 100u + c; return; }
+    *pri = 10000u + c;
+}
+static int xs_lc_level(xs_str *a, xs_str *b, int level) {
+    const unsigned char *p = (const unsigned char *)a->data, *pe = p + a->len, *q = (const unsigned char *)b->data, *qe = q + b->len;
+    for (;;) {
+        if (p >= pe || q >= qe) return p >= pe && q >= qe ? 0 : p >= pe ? -1 : 1;
+        uint32_t x = xs_lc_next(&p, pe), y = xs_lc_next(&q, qe), px, py;
+        int sx, sy, tx, ty;
+        xs_lc_key(x, &px, &sx, &tx);
+        xs_lc_key(y, &py, &sy, &ty);
+        long dx = level == 0 ? (long)px : level == 1 ? sx : tx, dy = level == 0 ? (long)py : level == 1 ? sy : ty;
+        if (dx != dy) return dx < dy ? -1 : 1;
+    }
+}
+XS_NOINLINE int64_t xs_str_locale_compare(xs_str *a, xs_str *b, ...) {
+    for (int l = 0; l < 3; l++) { int c = xs_lc_level(a, b, l); if (c) return c; }
+    return 0;
+}
+/* s.normalize(form): the text as it is (source text and the database's are NFC already; a gap for NFD input) */
+XS_NOINLINE xs_str *xs_str_normalize(xs_str *s, ...) { return xs_retain(s); }
 XS_NOINLINE int64_t xs_str_order(xs_str *a, xs_str *b) {
     size_t n = a->len < b->len ? (size_t)a->len : (size_t)b->len;
     int c = memcmp(a->data, b->data, n);

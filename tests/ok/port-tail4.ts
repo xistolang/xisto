@@ -74,3 +74,18 @@ const nums: Record<string, number> = { p: 1 };
 const copia = { ...nums };
 copia['q'] = 2;
 console.log(nums, copia);
+
+const nomes = ['Óscar', 'ana', 'Ana', 'álvaro', 'Bruno', 'beatriz', 'Érica', 'eduardo', 'zé', 'item 10', 'item 2', 'ção', 'cao', 'Cão'];
+console.log([...nomes].sort((a, b) => a.localeCompare(b)).join(','));
+console.log('a'.localeCompare('A'), 'A'.localeCompare('a'), 'é'.localeCompare('e'), 'b'.localeCompare('á'), 'x'.localeCompare('x'));
+const v: string | number = n > 2 ? 'dez' : 10;
+console.log(`v=${v}`, 'Ação'.normalize('NFC'));
+
+const linha: Record<string, unknown> = { FL: 'S', N: 3 };
+const flag2: string | null = null;
+const efetivo = flag2 ?? linha['FL'];
+const efetivo2: string | null = 'N';
+console.log(efetivo, efetivo2 ?? linha['FL'], flag2 ?? 0);
+const acum: number[] = [];
+acum.push(1, 2, 3);
+console.log(acum);
