@@ -24,7 +24,8 @@ for f in tests/ok/*.ts; do
             echo "FAIL $f: neither node nor bun can run the program"; cat "$OUT/$name.node" | head -5; fail=$((fail+1)); continue
         fi
     fi
-    if ! $XISTO build -o "$OUT/$name" "$f" > "$OUT/$name.build" 2>&1; then
+    bflags=$(sed -n 's|^// build: ||p' "$f")   # "// build: --flag": options for this program's builds
+    if ! $XISTO build $bflags -o "$OUT/$name" "$f" > "$OUT/$name.build" 2>&1; then
         echo "FAIL $f: xisto build failed"; cat "$OUT/$name.build"; fail=$((fail+1)); continue
     fi
     # "// warns: TEXT" lines: each TEXT must be among the build's warnings; "// warns: none": no warning at all
@@ -49,7 +50,7 @@ EOF_WARNS
         fail=$((fail+1))
     fi
     # the same program through the QBE backend, when it is inside the subset that backend covers
-    if $XISTO build --backend=qbe -o "$OUT/$name-qbe" "$f" > "$OUT/$name.qbe.build" 2>&1; then
+    if $XISTO build $bflags --backend=qbe -o "$OUT/$name-qbe" "$f" > "$OUT/$name.qbe.build" 2>&1; then
         XISTO_RC_STATS=1 "$OUT/$name-qbe" < "$in" > "$OUT/$name.qbe" 2> "$OUT/$name.qbe.stats"
         if ! grep -q ' 0 still alive' "$OUT/$name.qbe.stats"; then
             echo "FAIL $f (qbe): leak: $(cat "$OUT/$name.qbe.stats")"; fail=$((fail+1))
