@@ -1058,6 +1058,7 @@ static Type *tuple_type(Type **ps, int n, Pos pos) {
     return t;
 }
 
+static Binding *lookup(const char *name);
 static Type *resolve(Type *t, Pos pos) {
     if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__ret_of:", 9) == 0) { /* (generated reflection) */
         const char *dot = strchr(t->tname + 9, '.');
@@ -1072,6 +1073,18 @@ static Type *resolve(Type *t, Pos pos) {
         if (!f || f->ntparams) xs_error(XS1019, pos, "write the type itself", "ReturnType<typeof %s>: no function '%s' here", t->tname + 12, t->tname + 12);
         Type *r = fret(f, pos);
         *t = *r; /* (in place: whoever holds it now holds the function's type) */
+        return t;
+    }
+    if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__typeof:", 9) == 0) { /* typeof x */
+        Binding *b = lookup(t->tname + 9);
+        if (!b || !b->type) xs_error(XS1019, pos, "write the type itself", "typeof %s: no variable '%s' here (or its type is not known yet)", t->tname + 9, t->tname + 9);
+        *t = *b->type;
+        return t;
+    }
+    if (t->kind == TY_TPARAM && t->tname && strcmp(t->tname, "__elem_of") == 0) { /* T[number] */
+        Type *o = resolve(t->elem, pos);
+        if (o->kind != TY_ARRAY) xs_error(XS1019, pos, "write the type itself", "%s[number]: %s is not an array type", ty_name(o), ty_name(o));
+        *t = *o->elem;
         return t;
     }
     if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__field_of:", 11) == 0) { /* T['k'] */
@@ -3865,9 +3878,14 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (af && af->nparams == ft->nparams) /* a const arrow's literal defaults fill the arguments left out */
                     while (e->args.len < ft->nparams) {
                         Expr *d = af->params[e->args.len].dflt;
-                        if (!d || !(d->kind == E_NUMBER || d->kind == E_STRING || d->kind == E_BOOL || d->kind == E_NULL)) break;
-                        Expr *c = xs_alloc(sizeof *c);
-                        *c = *d;
+                        bool lit = d && (d->kind == E_NUMBER || d->kind == E_STRING || d->kind == E_BOOL || d->kind == E_NULL);
+                        bool made = d && d->kind == E_NEW_OBJ; /* (agora = new Date()): made again at each call, as in JS */
+                        for (int k = 0; made && k < d->args.len; k++) {
+                            Expr *a = d->args.items[k];
+                            made = a->kind == E_NUMBER || a->kind == E_STRING || a->kind == E_BOOL || (a->kind == E_UNARY && a->lhs && a->lhs->kind == E_NUMBER);
+                        }
+                        if (!lit && !made) break;
+                        Expr *c = dflt_subst(d, af, NULL, 0, e->pos);
                         c->pos = e->pos;
                         expr_list_push(&e->args, c);
                     }

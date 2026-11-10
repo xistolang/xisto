@@ -18,6 +18,8 @@ typedef struct {
     int nalias;
     StmtList pending;     /* declarations a destructuring adds after its own (const [a, b] = e) */
     bool no_in;           /* a for (...) header: `in` there starts for...in, not the operator */
+    bool spread_ok;       /* a statement on its own: xs.push(...ys) is read (and becomes a loop) */
+    Expr *spread_arg;     /* the ...ys read there */
 } Parser;
 
 /* generics: the type parameters in scope while a template is parsed, or their types while an instance is */
@@ -299,11 +301,7 @@ static Type *parse_type(Parser *p) {
             expect(p, TK_RBRACKET, NULL);
             t = ty_array_of(t);
         }
-        if (at(p, TK_PIPE)) {
-            next(p);
-            if (at_ident(p, "null")) { next(p); t = ty_nullable_of(t); if (accept(p, TK_PIPE)) t = union_of(t, parse_type(p)); }
-            else t = union_of(t, parse_type(p));
-        }
+        if (accept(p, TK_PIPE)) t = union_rest(p, t);
         return t;
     }
     if (at(p, TK_LBRACKET)) { /* [A, B]: a tuple */
@@ -365,6 +363,16 @@ static Type *parse_type(Parser *p) {
         expect(p, TK_RPAREN, NULL);
         while (at(p, TK_LBRACKET)) {
             next(p);
+            if (at_ident(p, "number")) { /* (typeof XS)[number] */
+                next(p);
+                expect(p, TK_RBRACKET, NULL);
+                Type *ix = xs_alloc(sizeof *ix);
+                ix->kind = TY_TPARAM;
+                ix->tname = "__elem_of";
+                ix->elem = t;
+                t = ix;
+                continue;
+            }
             expect(p, TK_RBRACKET, NULL);
             t = ty_array_of(t);
         }
@@ -380,17 +388,28 @@ static Type *parse_type(Parser *p) {
         int n = 0, cap = 0;
         while (!at(p, TK_RPAREN)) {
             expect(p, TK_IDENT, NULL);
+            bool opt = accept(p, TK_QUESTION); /* (sql: string, binds?: B) => R: B | null */
             expect(p, TK_COLON, "function types name their parameters: (req: HttpRequest) => HttpResponse");
             if (n == cap) {
                 cap = cap ? cap * 2 : 4;
                 params = realloc(params, sizeof(Type *) * (size_t)cap);
             }
             params[n++] = parse_type(p);
+            if (opt) params[n - 1] = ty_nullable_of(params[n - 1]);
             if (!accept(p, TK_COMMA)) break;
         }
         expect(p, TK_RPAREN, NULL);
         expect(p, TK_ARROW, NULL);
         return ty_func(params, n, parse_type(p));
+    }
+    if (at_ident(p, "typeof") && peek_is(p, TK_IDENT)) { /* typeof x: the type of the variable x (the checker reads it) */
+        next(p);
+        Token v = expect(p, TK_IDENT, NULL);
+        t = xs_alloc(sizeof *t);
+        t->kind = TY_TPARAM;
+        t->tname = xs_sprintf("__typeof:%s", v.str);
+        if (at(p, TK_DOT)) xs_error(XS1019, p->tok.pos, "write the type itself", "typeof takes a variable's name (typeof a.b is not supported)");
+        goto suffix;
     }
     if (!at(p, TK_IDENT))
         xs_error(XS1019, p->tok.pos, "supported types: number, int, boolean, string, void, T[], class names, (a: A) => R", "expected a type but found %s", found(p));
@@ -529,8 +548,19 @@ static Type *parse_type(Parser *p) {
         }
     }
     if (at(p, TK_AMP)) t = inter_rest(p, t, open, tpos);
+suffix:
     while (at(p, TK_LBRACKET)) {
         next(p);
+        if (at_ident(p, "number")) { /* T[number]: the element type of the array type T */
+            next(p);
+            expect(p, TK_RBRACKET, NULL);
+            Type *ix = xs_alloc(sizeof *ix);
+            ix->kind = TY_TPARAM;
+            ix->tname = "__elem_of";
+            ix->elem = t;
+            t = ix;
+            continue;
+        }
         if (at(p, TK_STRING)) { /* Input['campo']: the type of that field (the checker reads it) */
             Type *ix = xs_alloc(sizeof *ix);
             ix->kind = TY_TPARAM;
@@ -591,6 +621,15 @@ static void parse_args(Parser *p, ExprList *out) {
     if (!at(p, TK_RPAREN)) {
         do {
             if (at(p, TK_RPAREN)) break; /* trailing comma */
+            if (at(p, TK_ELLIPSIS) && p->spread_ok && !p->spread_arg && out->len == 0) {
+                Expr *u = new_expr(E_UNARY, p->tok.pos);
+                next(p);
+                u->op = TK_ELLIPSIS;
+                u->lhs = parse_assign(p);
+                p->spread_arg = u;
+                expr_list_push(out, u);
+                continue;
+            }
             if (at(p, TK_ELLIPSIS))
                 xs_error(XS6032, p->tok.pos, "pass the array itself: f(xs), with a parameter xs: T[]", "spreading arguments into a call is not supported (xisto has no rest parameters)");
             expr_list_push(out, parse_expr(p));
@@ -676,7 +715,9 @@ static Expr *parse_arrow(Parser *p) {
                 p->pending = saved;
             } else name = expect(p, TK_IDENT, NULL);
             Param prm = {.name = name.str};
+            bool opt = accept(p, TK_QUESTION); /* (x?: T) => ...: T | null, null when left out */
             if (accept(p, TK_COLON)) prm.type = parse_type(p); /* untyped parameters take their type from the context */
+            if (opt && prm.type) { prm.type = ty_optional_of(prm.type); prm.dflt = new_expr(E_NULL, name.pos); }
             else if (at(p, TK_ASSIGN) && !default_literal_type(p, &prm))
                 xs_error(XS3013, p->tok.pos, "give the parameter a type: (w: number = 2)", "parameter '%s' has no type", name.str);
             if (accept(p, TK_ASSIGN)) prm.dflt = parse_assign(p); /* (n: number, w = 2) => ... */
@@ -1809,7 +1850,33 @@ static Stmt *parse_stmt(Parser *p) {
         return NULL;
     default: {
         Stmt *s = new_stmt(S_EXPR, pos);
+        bool so = p->spread_ok; Expr *sa = p->spread_arg;
+        p->spread_ok = true;
+        p->spread_arg = NULL;
         s->expr = parse_expr(p);
+        Expr *spread = p->spread_arg;
+        p->spread_ok = so; p->spread_arg = sa;
+        if (spread) { /* xs.push(...ys);: for (const __sp of ys) xs.push(__sp); */
+            Expr *c = s->expr, *t = c->kind == E_MEMBER ? c->lhs : NULL;
+            while (t && t->kind == E_MEMBER && !t->is_call) t = t->lhs;
+            if (c->kind != E_MEMBER || !c->is_call || strcmp(c->str, "push") != 0 || c->args.len != 1 || c->args.items[0] != spread ||
+                !t || (t->kind != E_IDENT && t->kind != E_THIS))
+                xs_error(XS6032, spread->pos, "pass the array itself: f(xs), with a parameter xs: T[]", "spreading arguments into a call is not supported (xisto has no rest parameters)");
+            static int nsp;
+            char *v = xs_sprintf("__sp%d", ++nsp);
+            Expr *ref = new_expr(E_IDENT, spread->pos);
+            ref->str = v;
+            c->args.items[0] = ref;
+            s->kind = S_FOROF;
+            s->name = v;
+            s->is_const = true;
+            s->expr = spread->lhs;
+            Stmt *call = new_stmt(S_EXPR, pos);
+            call->expr = c;
+            Stmt *body = new_stmt(S_BLOCK, pos);
+            stmt_list_push(&body->stmts, call);
+            s->body = body;
+        }
         expect_semi(p);
         return s;
     }
@@ -1842,6 +1909,15 @@ static bool default_literal_type(Parser *p, Param *prm) {
     if (at(&look, TK_NUMBER)) { prm->type = ty_number; prm->type_src = "number"; }
     else if (!neg && (at(&look, TK_STRING) || at(&look, TK_TEMPLATE))) { prm->type = ty_string; prm->type_src = "string"; }
     else if (!neg && (at(&look, TK_TRUE) || at(&look, TK_FALSE))) { prm->type = ty_boolean; prm->type_src = "boolean"; }
+    else if (!neg && at(&look, TK_NEW)) { /* (agora = new Date()): the class it makes */
+        next(&look);
+        if (!at(&look, TK_IDENT)) return false;
+        Token cn = look.tok;
+        next(&look);
+        if (!at(&look, TK_LPAREN)) return false;
+        prm->type = named_type(p, cn);
+        prm->type_src = cn.str;
+    }
     else return false;
     return true;
 }
