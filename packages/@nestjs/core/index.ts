@@ -93,10 +93,10 @@ interface ExtraRoute {
 
 /** What DiscoveryService gives for one provider or controller. */
 export class InstanceWrapper {
-  name: string;
-  token: unknown;
-  instance: unknown;
-  metatype: ClassInfo | null;
+  name: string = "";
+  token: unknown = null;
+  instance: unknown = null;
+  metatype: ClassInfo | null = null;
 }
 
 /** The providers and controllers the application built (import DiscoveryModule to inject it). */

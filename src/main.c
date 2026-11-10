@@ -348,7 +348,9 @@ static Buf compile_to_c(const char *path) {
     for (int i = 0; i < p->nfuncs; i++) {
         Func *f = p->funcs[i];
         if (f->used || f->exported || f->mod->builtin || f->name[0] == '_' || f->template_of || (f->ntparams && f->ninstances)) continue;
-        if (f->mod->file && (strncmp(f->mod->file, "xisto:", 6) == 0 || strstr(f->mod->file, "/.xisto/pkgs/"))) continue; /* a package's helpers, unused by this program */
+        const char *pk = getenv("XISTO_PKGS"); /* (--pkgs DIR) */
+        if (f->mod->file && (strncmp(f->mod->file, "xisto:", 6) == 0 || strstr(f->mod->file, "/.xisto/pkgs/") || (pk && *pk && strncmp(f->mod->file, pk, strlen(pk)) == 0)))
+            continue; /* a package's helpers, unused by this program */
         xs_file_name = f->mod->file;
         xs_source = f->mod->src;
         xs_warn(f->pos, "remove it, or export it if another module should use it", "function '%s' is never used", f->name);
