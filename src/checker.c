@@ -1753,6 +1753,8 @@ static bool is_bytes(Type *t);
 static bool is_f64(Type *t);
 /* [a, ...xs, b]: each spread source an array (a string's code points, a Set's values, a Map's entries, the bytes
    of a Uint8Array or the numbers of a Float64Array), its elements of the array's element type */
+static bool shape_copy_array(Expr *e, Type *want);
+static bool plain_data(Class *c);
 static void check_spread_lit(Expr *e, Type *elem) {
     Type **ets = xs_alloc(sizeof(Type *) * (size_t)(e->args.len + 1));
     for (int i = 0; i < e->args.len; i++) {
@@ -1802,6 +1804,16 @@ static void check_spread_lit(Expr *e, Type *elem) {
         json_ok_unknown = ju;
         if (objs && differ) elem = ty_json;
     }
+    if (!elem && e->args.len > 1) { /* [{ term: .. }, ...filtros] with filtros: Record<string, unknown>[]: the Record (objects copied in) */
+        Type *rec = NULL;
+        bool fits = true;
+        for (int i = 0; i < e->args.len; i++) {
+            Type *t = ets[i];
+            if (t->kind == TY_MAP && t->record && t->key->kind == TY_STRING && t->elem->kind == TY_UNKNOWN) { if (!rec) rec = t; }
+            else if (!(t->kind == TY_OBJECT && plain_data(t->cls))) fits = false;
+        }
+        if (rec && fits) elem = rec;
+    }
     if (!elem) { /* as TypeScript: numbers win over ints; else the first element's type */
         for (int i = 0; i < e->args.len && !elem; i++) if (ets[i]->kind == TY_NUMBER) elem = ty_number;
         for (int i = 0; i < e->args.len && !elem; i++) if (ets[i]->kind == TY_INT) elem = ty_int;
@@ -1820,6 +1832,7 @@ static void check_spread_lit(Expr *e, Type *elem) {
                 a->type = a->lhs->type;
                 ok = true;
             }
+            if (!ok && a->lhs->type->kind == TY_ARRAY && shape_copy_array(a->lhs, ty_array_of(elem))) { a->type = a->lhs->type; ok = true; } /* ...rows where shapes with their fields go: copies */
             if (!ok) xs_error(XS8141, a->pos, NULL, "the spread elements are %s, but the array holds %s", ty_name(ets[i]), ty_name(elem));
         } else expect_type(a, elem, "array element");
     }
@@ -2730,6 +2743,7 @@ static bool shape_ok(Type *g, Type *want) {
     probe.kind = E_NULL; probe.field = -1; probe.type = g;
     Type *w = want->kind == TY_NULLABLE ? want->elem : want, *h = g->kind == TY_NULLABLE ? g->elem : g;
     if (h->kind != TY_OBJECT || !plain_data(h->cls)) return false;
+    if (w->kind == TY_MAP && w->record && w->key->kind == TY_STRING) return true; /* rows where Record<string, unknown>[] goes: each one's fields */
     if (w->kind != TY_OBJECT || h->cls == w->cls) return false;
     Class *dst = w->cls, *src = h->cls;
     bool data_cls = !dst->builtin && !dst->is_interface && !dst->is_abstract && dst->nsubs == 0 && !dst->tparams &&
@@ -2743,6 +2757,8 @@ static bool shape_ok(Type *g, Type *want) {
 }
 static bool shape_copy_array(Expr *e, Type *want) {
     Type *g = e->type;
+    bool nul = false; /* T[] | null where U[] | null goes: __arr === null ? null : __arr.map(...) */
+    if (g && want && g->kind == TY_NULLABLE && g->elem->kind == TY_ARRAY && want->kind == TY_NULLABLE) { g = g->elem; nul = true; }
     if (!g || !want || g->kind != TY_ARRAY) return false;
     Type *w = want->kind == TY_NULLABLE ? want->elem : want;
     if (w->kind != TY_ARRAY || ty_equal(g->elem, w->elem)) return false;
@@ -2764,18 +2780,34 @@ static bool shape_copy_array(Expr *e, Type *want) {
     Expr *call = xs_alloc(sizeof *call); /* __arr.map(fn): a member call */
     call->kind = E_MEMBER; call->pos = pos; call->field = -1; call->is_call = true; call->lhs = av; call->str = "map";
     expr_list_push(&call->args, mapfn);
-    Expr *arrow = thunk_of(call);
+    Expr *body = call;
+    if (nul) {
+        Expr *a1 = xs_alloc(sizeof *a1);
+        a1->kind = E_IDENT; a1->pos = pos; a1->field = -1; a1->str = "__arr";
+        Expr *z = xs_alloc(sizeof *z);
+        z->kind = E_NULL; z->pos = pos; z->field = -1;
+        Expr *t = xs_alloc(sizeof *t);
+        t->kind = E_BINARY; t->op = TK_EQ; t->pos = pos; t->field = -1; t->lhs = a1; t->rhs = z;
+        Expr *z2 = xs_alloc(sizeof *z2);
+        z2->kind = E_NULL; z2->pos = pos; z2->field = -1;
+        Expr *c = xs_alloc(sizeof *c);
+        c->kind = E_COND; c->pos = pos; c->field = -1; c->lhs = t;
+        expr_list_push(&c->args, z2);
+        expr_list_push(&c->args, call);
+        body = c;
+    }
+    Expr *arrow = thunk_of(body);
     Func *f = arrow->arrow->fn;
     f->params = xs_alloc(sizeof(Param));
     memset(f->params, 0, sizeof(Param));
-    f->params[0].name = "__arr"; f->params[0].type = g; f->nparams = 1;
-    f->ret = w;
+    f->params[0].name = "__arr"; f->params[0].type = nul ? ty_nullable_of(g) : g; f->nparams = 1;
+    f->ret = nul ? ty_nullable_of(w) : w;
     memset(e, 0, sizeof *e);
     e->kind = E_CALL; e->pos = pos; e->field = -1; e->is_call = true;
     e->lhs = arrow;
     expr_list_push(&e->args, inner);
     check_expr(arrow, NULL);
-    e->type = w;
+    e->type = f->ret;
     return true;
 }
 
@@ -6357,9 +6389,10 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         e->lhs = rec_get_nn(e->lhs);
         if (e->is_call && e->str && (strcmp(e->str, "then") == 0 || strcmp(e->str, "catch") == 0 || strcmp(e->str, "finally") == 0)) {
-            Type *lt = e->lhs->type;
-            Class *lc = lt->kind == TY_OBJECT ? lt->cls : NULL;
-            if (lt->kind == TY_PROMISE || (pr_is_call(e->lhs) && lt->kind != TY_NULLABLE && !(lc && find_method(lc, e->str)))) { /* XB-106 */
+            Type *lt = e->lhs->type, *ls = ty_strip_null(lt);
+            Class *lc = ls->kind == TY_OBJECT ? ls->cls : NULL;
+            /* (f().catch(...) with f async and giving T | null: the promise's method, not the value's; x?.then stays the value's) */
+            if (lt->kind == TY_PROMISE || (pr_is_call(e->lhs) && (lt->kind != TY_NULLABLE || e->op != TK_QDOT) && !(lc && find_method(lc, e->str)))) { /* XB-106 */
                 if (lt->kind != TY_PROMISE) pr_spawn(e->lhs);
                 check_pr_member(e, expected);
                 return;
