@@ -2505,6 +2505,24 @@ XS_NOINLINE void *xs_as_ref(void *v, void (*free_fn)(void *), int nullable, cons
     if (xs_type_of(v)->free != free_fn) xs_as_fail(what);
     return v;
 }
+/* n ?? 'text' with n a number | null: String(n), or null for the default (JavaScript's number | string, read as text) */
+static xs_str *xs_str_from_num(double v);
+static xs_str *xs_str_from_int(int64_t v);
+XS_NOINLINE xs_str *xs_str_of_num_or_null(double v) { return xs_isnull_num(v) ? NULL : xs_str_from_num(v); }
+XS_NOINLINE xs_str *xs_str_of_int_or_null(int64_t v) { return v == XS_NULL_INT ? NULL : xs_str_from_int(v); }
+/* unknown as T[] with T an object: the array and each element checked (an any of rows read by name, Records,
+   is not a T[]: a TypeError, not a struct read from a Map) */
+XS_NOINLINE void *xs_as_arr_of(void *v, void (*el_free)(void *), int el_nullable, int nullable, const char *what) {
+    if (!v) { if (nullable) return NULL; xs_as_fail(what); }
+    if (xs_type_of(v)->free != xs_arr_ref_free) xs_as_fail(what);
+    xs_arr_ref *a = v;
+    for (size_t i = 0; i < a->len; i++) {
+        void *x = a->data[i];
+        if (!x) { if (el_nullable) continue; xs_as_fail(what); }
+        if (xs_type_of(x)->free != el_free) xs_as_fail(what);
+    }
+    return v;
+}
 /* x.toFixed(d) as JavaScript: the exact decimal value of the double rounded half up in magnitude (printf would
    round an exact tie to even), "-" when x < 0, String(x) from 1e21 on */
 static xs_str *xs_str_from_num(double v);

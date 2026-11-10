@@ -2434,6 +2434,9 @@ static char *from_unknown(Type *t, const char *expr) {
         return xs_sprintf("((%s)xs_as_ref(%s, %s, %d, \"%s\"))", ctype(b), expr, fr, nul, what);
     }
     case TY_ARRAY: {
+        Type *el = b->elem->kind == TY_NULLABLE ? b->elem->elem : b->elem;
+        if (el->kind == TY_OBJECT && !in_hierarchy(el->cls) && !el->cls->builtin) /* each element checked too */
+            return xs_sprintf("((%s)xs_as_arr_of(%s, %s_free, %d, %d, \"%s\"))", ctype(b), expr, el->cls->cname, b->elem->kind == TY_NULLABLE, nul, what);
         const char *fr = arr_is_ref(b) ? "xs_arr_ref_free" : xs_sprintf("%s_free", arr_struct(b));
         return xs_sprintf("((%s)xs_as_ref(%s, %s, %d, \"%s\"))", ctype(b), expr, fr, nul, what);
     }
