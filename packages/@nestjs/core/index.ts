@@ -1,33 +1,69 @@
-// @nestjs/core for xisto: NestFactory.create(AppModule) walks the modules @Module recorded, builds every
-// provider and controller once (constructor parameters by type, like Nest's injector), and registers each
-// route on xisto's HTTP server with guards, parameter decorators, the ValidationPipe and Nest's error bodies.
+// @nestjs/core for xisto: NestFactory.create(AppModule) walks the modules @Module recorded (static and dynamic),
+// builds every provider and controller once (constructor parameters by type or by @Inject token, like Nest's
+// injector), and registers each route on xisto's HTTP server with versioning, guards, pipes, exception filters,
+// parameter decorators, the ValidationPipe and Nest's error bodies.
 import { ClassInfo, MethodInfo } from "xisto:reflect";
-import { Request } from "express";
+import { Request, RequestHandler, Response } from "express";
 import { validationMessages } from "class-validator";
 import {
+  __catches,
   __classes,
   __controllers,
   __custom,
+  __global,
   __guards,
+  __injects,
   __modules,
   __params,
   __routes,
+  __settings,
   __validated,
   __jsonValues,
   __tokens,
   __values,
   bodyField,
+  ClassProvider,
+  DynamicModule,
   ExecutionContext,
+  ExistingProvider,
+  FactoryProvider,
   GuardDef,
   HttpException,
+  InjectDef,
+  Logger,
+  LoggerService,
+  MethodSetting,
   ModuleMetadata,
   ParamDef,
+  Provider,
   RouteDef,
+  ValidationPipe,
+  ValueProvider,
+  VersioningType,
 } from "@nestjs/common";
+import { FileInterceptorSpec, readUpload, UploadedFileData, uploadField } from "./upload";
 
-export interface NestApplicationOptions {
+export { FileInterceptorSpec, UploadedFileData } from "./upload";
+
+/** Options of NestFactory.create. */
+export class NestApplicationOptions {
   cors?: boolean;
+  bufferLogs?: boolean;
+  logger?: boolean;
 }
+
+/** app.enableVersioning({ type: VersioningType.URI, defaultVersion: "1" }) */
+export class VersioningOptions {
+  type: VersioningType;
+  defaultVersion?: string;
+  prefix?: string;
+}
+
+/** The token of a global interceptor, filter, guard or pipe given as a provider. */
+export const APP_INTERCEPTOR = "APP_INTERCEPTOR";
+export const APP_FILTER = "APP_FILTER";
+export const APP_GUARD = "APP_GUARD";
+export const APP_PIPE = "APP_PIPE";
 
 interface Route {
   verb: string;
@@ -40,6 +76,11 @@ interface Route {
   validate: boolean;
   status: int;
   cors: boolean;
+  headers: string[];
+  filters: unknown[];
+  filterInfos: ClassInfo[];
+  upload: string; // the multipart field FileInterceptor reads ("" none)
+  middleware: RequestHandler[];
 }
 
 const JSON_TYPE = "application/json; charset=utf-8";
@@ -50,72 +91,280 @@ interface ExtraRoute {
   handler: (req: HttpRequest) => HttpResponse;
 }
 
-// the controllers the root module reaches through its imports, in Nest's order
-export function moduleControllers(root: ClassInfo): ClassInfo[] {
-  const providers: Map<string, ClassInfo> = new Map<string, ClassInfo>();
-  const controllers: ClassInfo[] = [];
-  collect(root.id, providers, controllers, new Map<string, boolean>());
-  return controllers;
+/** What DiscoveryService gives for one provider or controller. */
+export class InstanceWrapper {
+  name: string = "";
+  token: unknown = null;
+  instance: unknown = null;
+  metatype: ClassInfo | null = null;
 }
 
-function collect(id: string, providers: Map<string, ClassInfo>, controllers: ClassInfo[], seen: Map<string, boolean>): void {
-  if (seen.has(id)) {
+/** The providers and controllers the application built (import DiscoveryModule to inject it). */
+@Injectable0()
+export class DiscoveryService {
+  getProviders(): InstanceWrapper[] {
+    return container.wrappers.filter((w: InstanceWrapper): boolean => !isController(w));
+  }
+  getControllers(): InstanceWrapper[] {
+    return container.wrappers.filter((w: InstanceWrapper): boolean => isController(w));
+  }
+}
+
+function isController(w: InstanceWrapper): boolean {
+  const m = w.metatype;
+  return m !== null && __controllers.has(m.id);
+}
+
+// (DiscoveryService is decorated here without importing Injectable twice under the same name)
+function Injectable0(): (c: ClassInfo) => void {
+  return (c: ClassInfo): void => {
+    __classes.set(c.id, c);
+  };
+}
+
+/** Makes DiscoveryService injectable. */
+@Module({ providers: [DiscoveryService], exports: [DiscoveryService] })
+export class DiscoveryModule {}
+
+function Module(meta: ModuleMetadata): (c: ClassInfo) => void {
+  return (c: ClassInfo): void => {
+    __classes.set(c.id, c);
+    __modules.set(c.id, meta);
+  };
+}
+
+// ---- the container: tokens, providers, instances ----
+interface Entry {
+  key: string;
+  token: unknown;
+  provider: unknown; // a ClassInfo, or one of the provider objects
+}
+
+class Container {
+  entries: Map<string, Entry> = new Map<string, Entry>();
+  instances: Map<string, unknown> = new Map<string, unknown>();
+  built: string[] = [];
+  wrappers: InstanceWrapper[] = [];
+  controllers: ClassInfo[] = [];
+  globals: unknown[] = []; // APP_FILTER / APP_GUARD / APP_INTERCEPTOR providers
+  collected: boolean = false;
+}
+
+// the modules, providers and controllers the root reaches, read once
+function ensureCollected(root: ClassInfo): void {
+  if (container.collected) {
     return;
   }
-  seen.set(id, true);
-  const meta = __modules.get(id);
-  if (meta === null) {
-    throw new Error(`Nest can't find the module ${id}: is it decorated with @Module()?`);
+  container.collected = true;
+  collect(root, new Map<string, boolean>());
+}
+
+const container: Container = new Container();
+
+/** The key a token is stored under: a class by its id, a string as itself. */
+export function tokenKey(token: unknown): string {
+  if (typeof token === "string") {
+    return "s:" + (token as string);
   }
-  const imports = meta.imports || [];
-  for (const m of imports) {
-    collect(m.id, providers, controllers, seen);
+  const c = token as ClassInfo;
+  return "c:" + c.id;
+}
+
+function tokenName(token: unknown): string {
+  if (typeof token === "string") {
+    return token as string;
   }
-  const provided = meta.providers || [];
-  for (const p of provided) {
-    providers.set(p.id, p);
+  return (token as ClassInfo).name;
+}
+
+function asClass(x: unknown): ClassInfo | null {
+  if (x instanceof ValueProvider || x instanceof ClassProvider || x instanceof ExistingProvider || x instanceof FactoryProvider) {
+    return null;
   }
-  const ctrls = meta.controllers || [];
-  for (const c of ctrls) {
-    controllers.push(c);
+  if (x instanceof DynamicModule || typeof x === "string") {
+    return null;
+  }
+  return x as ClassInfo;
+}
+
+function register(p: unknown): void {
+  if (p instanceof ValueProvider) {
+    const v = p as ValueProvider;
+    addEntry(v.provide, p);
+    return;
+  }
+  if (p instanceof ClassProvider) {
+    const v = p as ClassProvider;
+    addEntry(v.provide, p);
+    return;
+  }
+  if (p instanceof ExistingProvider) {
+    const v = p as ExistingProvider;
+    addEntry(v.provide, p);
+    return;
+  }
+  if (p instanceof FactoryProvider) {
+    const v = p as FactoryProvider;
+    addEntry(v.provide, p);
+    return;
+  }
+  const c = asClass(p);
+  if (c !== null) {
+    addEntry(c, c);
   }
 }
 
-// one instance per provider, its constructor parameters resolved by type first
-function resolve(ci: ClassInfo, providers: Map<string, ClassInfo>, instances: Map<string, unknown>, depth: int): unknown {
-  const have = instances.get(ci.id);
+function addEntry(token: unknown, provider: unknown): void {
+  const key = tokenKey(token);
+  if (key === "s:APP_FILTER" || key === "s:APP_GUARD" || key === "s:APP_INTERCEPTOR" || key === "s:APP_PIPE") {
+    container.globals.push(provider);
+    return;
+  }
+  container.entries.set(key, { key: key, token: token, provider: provider });
+}
+
+// the modules the root reaches through its imports (static and dynamic), in Nest's order
+function collect(m: unknown, seen: Map<string, boolean>): void {
+  if (m instanceof DynamicModule) {
+    const d = m as DynamicModule;
+    const key = "dyn:" + d.module.id;
+    collectMeta(d.module, seen);
+    if (seen.has(key)) {
+      return;
+    }
+    seen.set(key, true);
+    for (const i of d.imports || []) {
+      collect(i, seen);
+    }
+    for (const p of d.providers || []) {
+      register(p);
+    }
+    for (const c of d.controllers || []) {
+      container.controllers.push(c);
+    }
+    return;
+  }
+  const c = asClass(m);
+  if (c !== null) {
+    collectMeta(c, seen);
+  }
+}
+
+function collectMeta(c: ClassInfo, seen: Map<string, boolean>): void {
+  if (seen.has(c.id)) {
+    return;
+  }
+  seen.set(c.id, true);
+  const meta = __modules.get(c.id);
+  if (meta === null) {
+    throw new Error(`Nest can't find the module ${c.name}: is it decorated with @Module()?`);
+  }
+  for (const i of meta.imports || []) {
+    collect(i, seen);
+  }
+  for (const p of meta.providers || []) {
+    register(p);
+  }
+  for (const ctl of meta.controllers || []) {
+    container.controllers.push(ctl);
+  }
+}
+
+// (every provider is visible to every module: a module's exports narrow nothing here, as in a Nest app that compiles)
+function resolveToken(token: unknown, optional: boolean, who: string, index: int, depth: int): unknown {
+  const key = tokenKey(token);
+  const have = container.instances.get(key);
   if (have !== null) {
     return have;
   }
-  if (depth > 32) {
-    throw new Error(`Nest can't resolve dependencies of ${ci.name}: circular dependency`);
+  const e = container.entries.get(key);
+  if (e === null) {
+    if (optional) {
+      return null;
+    }
+    throw new Error(`Nest can't resolve dependencies of the ${who} (?). Please make sure that the argument ${tokenName(token)} at index [${index}] is available in the current module context.`);
   }
+  const made = build(e.provider, depth + 1);
+  container.instances.set(key, made);
+  addWrapper(e, made);
+  return made;
+}
+
+function addWrapper(e: Entry, instance: unknown): void {
+  const cls = asClass(e.provider);
+  container.wrappers.push({ name: tokenName(e.token), token: e.token, instance: instance, metatype: cls });
+}
+
+function build(provider: unknown, depth: int): unknown {
+  if (depth > 64) {
+    throw new Error("Nest can't resolve dependencies: a circular dependency between providers");
+  }
+  if (provider instanceof ValueProvider) {
+    return (provider as ValueProvider).useValue;
+  }
+  if (provider instanceof FactoryProvider) {
+    return (provider as FactoryProvider).useFactory();
+  }
+  if (provider instanceof ExistingProvider) {
+    return resolveToken((provider as ExistingProvider).useExisting, false, "alias", 0, depth);
+  }
+  if (provider instanceof ClassProvider) {
+    return construct((provider as ClassProvider).useClass, depth);
+  }
+  const c = provider as ClassInfo;
+  return construct(c, depth);
+}
+
+/** Builds a class with its constructor parameters resolved (by @Inject token, or by type). */
+function construct(ci: ClassInfo, depth: int): unknown {
+  const injects0 = __injects.get(ci.id);
+  const injects: InjectDef[] = injects0 || [];
   const args: unknown[] = [];
   for (const p of ci.params) {
-    // a token (@Inject, @InjectRepository) or a value registered for the type: what the parameter receives
-    const token = __tokens.get(ci.id + "#" + String(p.index)) ?? p.type.id;
-    const value = __values.get(token);
+    let token: unknown = null;
+    let optional = false;
+    for (const d of injects) {
+      if (d.index === p.index) {
+        token = d.token;
+        optional = d.optional;
+      }
+    }
+    // a value registered without a provider class (TypeOrmModule): by token (@InjectRepository) or by the
+    // parameter's type id (a DataSource). __values holds ready instances; __jsonValues the JSON the parameter's own
+    // type decodes into the exact instance it asks for (a Repository<User>).
+    const key = __tokens.get(ci.id + "#" + String(p.index)) ?? (typeof token === "string" ? (token as string) : p.type.id);
+    const value = __values.get(key);
     if (value !== null) {
       args.push(value);
       continue;
     }
-    const json = __jsonValues.get(token);
+    const json = __jsonValues.get(key);
     if (json !== null) {
       args.push(p.type.decode(json));
       continue;
     }
-    const dep = providers.get(p.type.id);
-    if (dep === null) {
-      throw new Error(`Nest can't resolve dependencies of the ${ci.name} (${token} at index [${p.index}]). Make sure it is available in the current module.`);
+    if (token === null) {
+      const byType = __classes.get(p.type.id);
+      if (byType === null) {
+        if (optional) {
+          args.push(null);
+          continue;
+        }
+        throw new Error(`Nest can't resolve dependencies of the ${ci.name} (${p.type.id} at index [${p.index}]). Make sure it is available in the current module.`);
+      }
+      token = byType;
     }
-    args.push(resolve(dep, providers, instances, depth + 1));
+    args.push(resolveToken(token, optional, ci.name, p.index, depth));
   }
-  const made = ci.construct(args);
-  instances.set(ci.id, made);
-  return made;
+  return ci.construct(args);
 }
 
-// "/" + the non-empty parts without their slashes: the path Nest gives prefix + controller + route
+/** The instance under a token (app.get(Service)). */
+export function getInstance(token: unknown): unknown {
+  return resolveToken(token, false, "application", 0, 0);
+}
+
+// "/" + the non-empty parts without their slashes: the path Nest gives prefix + version + controller + route
 export function joinPath(parts: string[]): string {
   let out = "";
   for (const p of parts) {
@@ -136,51 +385,167 @@ export function joinPath(parts: string[]): string {
   return out;
 }
 
-function reply(r: Route, status: int, contentType: string, body: string): HttpResponse {
-  const res = HttpResponse.of(status, contentType, body);
+// the controllers the root module reaches (@nestjs/swagger documents them)
+export function moduleControllers(root: ClassInfo): ClassInfo[] {
+  ensureCollected(root);
+  return container.controllers;
+}
+
+function settingsOf(c: ClassInfo, method: int, kind: string): MethodSetting[] {
+  const all0 = __settings.get(c.id);
+  const all: MethodSetting[] = all0 || [];
+  return all.filter((s: MethodSetting): boolean => s.kind === kind && (s.method === method || s.method === -1));
+}
+
+// (headers a middleware set, such as helmet's, go on every reply)
+function reply(r: Route, response: Response, status: int, contentType: string, body: string): HttpResponse {
+  const ct = body.length === 0 ? "" : contentType;
+  response.statusCode = status;
+  response.headersReady(ct);
+  let res = HttpResponse.of(status, ct, body);
+  for (let i = 0; i < response.headerCount(); i++) {
+    if (response.headerName(i).toLowerCase() !== "content-type") {
+      res = res.header(response.headerName(i), response.headerValue(i));
+    }
+  }
+  for (let i = 0; i + 1 < r.headers.length; i += 2) {
+    res = res.header(r.headers[i], r.headers[i + 1]);
+  }
   if (r.cors) {
     return res.header("Access-Control-Allow-Origin", "*");
   }
   return res;
 }
 
-function badRequest(r: Route, messages: string[]): HttpResponse {
-  return reply(r, 400, JSON_TYPE, `{"statusCode":400,"message":${JSON.stringify(messages)},"error":"Bad Request"}`);
+function fromResponse(r: Route, res: Response): HttpResponse {
+  const body = res.getBody();
+  res.headersReady(body.length === 0 ? "" : "text/html; charset=utf-8");
+  let ct = res.getHeader("Content-Type");
+  let out = HttpResponse.of(res.statusCode, body.length === 0 && ct === null ? "" : ct === null ? "text/html; charset=utf-8" : ct, body);
+  for (let i = 0; i < res.headerCount(); i++) {
+    if (res.headerName(i).toLowerCase() !== "content-type") {
+      out = out.header(res.headerName(i), res.headerValue(i));
+    }
+  }
+  for (let i = 0; i + 1 < r.headers.length; i += 2) {
+    out = out.header(r.headers[i], r.headers[i + 1]);
+  }
+  if (r.cors) {
+    return out.header("Access-Control-Allow-Origin", "*");
+  }
+  return out;
 }
 
-function failure(r: Route, e: Error): HttpResponse {
+function badRequest(r: Route, response: Response, messages: string[]): HttpResponse {
+  return reply(r, response, 400, JSON_TYPE, `{"message":${JSON.stringify(messages)},"error":"Bad Request","statusCode":400}`);
+}
+
+function badRequestText(r: Route, response: Response, message: string): HttpResponse {
+  return reply(r, response, 400, JSON_TYPE, `{"message":${JSON.stringify(message)},"error":"Bad Request","statusCode":400}`);
+}
+
+// the exception filter that catches this error, or -1
+function filterFor(r: Route, e: Error): int {
+  const cause = e.cause;
+  for (let i = 0; i < r.filters.length; i++) {
+    const names0 = __catches.get(r.filterInfos[i].id);
+    const names: string[] = names0 || [];
+    if (names.length === 0) {
+      return i;
+    }
+    if (cause instanceof HttpException) {
+      for (const n of names) {
+        if (n === "HttpException" || n === (cause as HttpException).exceptionName) {
+          return i;
+        }
+      }
+    }
+  }
+  return -1;
+}
+
+function failure(r: Route, e: Error, ctx: ExecutionContext): HttpResponse {
+  const f = filterFor(r, e);
+  if (f >= 0) {
+    const m = r.filterInfos[f].methods.find((x: MethodInfo): boolean => x.name === "catch");
+    if (m !== null) {
+      const cause = e.cause;
+      let thrown: unknown = e;
+      if (cause !== null) {
+        thrown = cause;
+      }
+      m.invoke(r.filters[f], [thrown, ctx]);
+      return fromResponse(r, ctx.getResponse());
+    }
+  }
   const cause = e.cause;
   if (cause instanceof HttpException) {
     const h = cause as HttpException;
     const text = JSON.stringify(h.response);
     if (text.startsWith("\"")) {
-      return reply(r, h.status, JSON_TYPE, `{"statusCode":${h.status},"message":${text}}`);
+      return reply(r, ctx.getResponse(), h.status, JSON_TYPE, `{"statusCode":${h.status},"message":${text}}`);
     }
-    return reply(r, h.status, JSON_TYPE, text);
+    return reply(r, ctx.getResponse(), h.status, JSON_TYPE, text);
   }
-  console.log(`[Nest] ERROR [ExceptionsHandler] ${e.message}\n${e.stack}`);
-  return reply(r, 500, JSON_TYPE, `{"statusCode":500,"message":"Internal server error"}`);
+  new Logger("ExceptionsHandler").error(e.message, e.stack);
+  return reply(r, ctx.getResponse(), 500, JSON_TYPE, `{"statusCode":500,"message":"Internal server error"}`);
+}
+
+function isInt(s: string): boolean {
+  if (s.length === 0) {
+    return false;
+  }
+  let i = 0;
+  if (s.startsWith("-")) {
+    i = 1;
+  }
+  if (i >= s.length) {
+    return false;
+  }
+  for (; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 48 || c > 57) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function handle(r: Route, req: HttpRequest): HttpResponse {
-  const auth = req.header("authorization");
-  let header: string | null = null;
-  if (auth.length > 0) {
-    header = auth;
+  const request = new Request();
+  request.method = req.method;
+  request.url = req.path;
+  request.path = req.path;
+  request.body = req.body;
+  for (const h of ["authorization", "content-type", "accept", "user-agent", "accept-encoding", "x-request-id"]) {
+    const v = req.header(h);
+    if (v.length > 0) {
+      request.setHeaderValue(h, v);
+    }
   }
-  const request: Request = { method: req.method, url: req.path, headers: { authorization: header }, body: req.body };
-  const ctx = new ExecutionContext(request);
+  const response = new Response();
+  const ctx = new ExecutionContext(request, response);
   try {
+    for (const mw of r.middleware) {
+      let passed = false;
+      mw(request, response, (): void => {
+        passed = true;
+      });
+      if (!passed || response.finished) {
+        return fromResponse(r, response);
+      }
+    }
     for (let g: int = 0; g < r.guards.length; g++) {
       const ok = r.guardMethods[g].invoke(r.guards[g], [ctx]) as boolean;
       if (!ok) {
-        return reply(r, 403, JSON_TYPE, `{"statusCode":403,"message":"Forbidden resource","error":"Forbidden"}`);
+        return reply(r, response, 403, JSON_TYPE, `{"message":"Forbidden resource","error":"Forbidden","statusCode":403}`);
       }
     }
     const args: unknown[] = [];
     for (let i: int = 0; i < r.method.params.length; i++) {
       args.push(null);
     }
+    let usesRes = false;
     for (const p of r.params) {
       const type = r.method.params[p.index].type;
       if (p.source === "body") {
@@ -195,43 +560,98 @@ function handle(r: Route, req: HttpRequest): HttpResponse {
         try {
           value = type.decode(text);
         } catch (je) {
-          return reply(r, 400, JSON_TYPE, `{"statusCode":400,"message":${JSON.stringify(je.message)},"error":"Bad Request"}`);
+          return badRequestText(r, response, je.message);
         }
         if (r.validate && type.kind === "class") {
-          const messages = validationMessages(value, type.id);
+          const messages = validationMessages(value, type.id, text);
           if (messages.length > 0) {
-            return badRequest(r, messages);
+            return badRequest(r, response, messages);
           }
         }
         args[p.index] = value;
-      } else if (p.source === "param") {
-        args[p.index] = req.param(p.key);
-      } else if (p.source === "query") {
-        args[p.index] = req.query(p.key);
+      } else if (p.source === "param" || p.source === "query") {
+        const raw = p.source === "param" ? req.param(p.key) : req.query(p.key);
+        if (p.pipe === "ParseIntPipe") {
+          if (!isInt(raw)) {
+            return badRequestText(r, response, "Validation failed (numeric string is expected)");
+          }
+          args[p.index] = parseInt(raw, 10);
+        } else if (p.pipe === "ParseFloatPipe") {
+          const n = Number(raw);
+          if (raw.length === 0 || isNaN(n)) {
+            return badRequestText(r, response, "Validation failed (numeric string is expected)");
+          }
+          args[p.index] = n;
+        } else if (p.pipe === "ParseBoolPipe") {
+          if (raw !== "true" && raw !== "false") {
+            return badRequestText(r, response, "Validation failed (boolean string is expected)");
+          }
+          args[p.index] = raw === "true";
+        } else if (raw.length === 0 && type.kind !== "string") {
+          args[p.index] = null; // (a value that is absent: Nest gives undefined)
+        } else {
+          args[p.index] = raw;
+        }
       } else if (p.source === "headers") {
         args[p.index] = req.header(p.key);
+      } else if (p.source === "req") {
+        args[p.index] = request;
+      } else if (p.source === "res") {
+        args[p.index] = response;
+        usesRes = true;
+      } else if (p.source === "file") {
+        const f = readUpload(req, r.upload);
+        if (f === null) {
+          args[p.index] = null;
+        } else {
+          args[p.index] = f;
+        }
       } else {
         args[p.index] = __custom[p.custom].fn(p.key, ctx);
       }
     }
     const result = r.method.invoke(r.instance, args);
+    if (usesRes) {
+      return fromResponse(r, response);
+    }
     if (r.method.returns.kind === "void" || result === null) {
-      return reply(r, r.status, "text/html; charset=utf-8", "");
+      return reply(r, response, r.status, "text/html; charset=utf-8", "");
     }
     if (r.method.returns.kind === "string") {
-      return reply(r, r.status, "text/html; charset=utf-8", result as string);
+      return reply(r, response, r.status, "text/html; charset=utf-8", result as string);
     }
-    return reply(r, r.status, JSON_TYPE, r.method.returns.encode(result));
+    return reply(r, response, r.status, JSON_TYPE, r.method.returns.encode(result));
   } catch (e) {
-    return failure(r, e);
+    return failure(r, e, ctx);
   }
 }
 
+function lifecycle(name: string): void {
+  for (const w of container.wrappers) {
+    const m = w.metatype;
+    if (m === null || w.instance === null) {
+      continue;
+    }
+    const f = m.methods.find((x: MethodInfo): boolean => x.name === name);
+    if (f !== null) {
+      f.invoke(w.instance, []);
+    }
+  }
+}
+
+/** The application NestFactory.create gives: configure it, then listen. */
 export class NestApplication {
   private readonly root: ClassInfo;
-  private readonly cors: boolean;
+  private cors: boolean;
   private prefix: string = "";
   private readonly extras: ExtraRoute[] = [];
+  private versioning: boolean = false;
+  private defaultVersion: string = "";
+  private versionPrefix: string = "v";
+  private validateAll: boolean = false;
+  private readonly middleware: RequestHandler[] = [];
+  private readonly globalFilters: unknown[] = [];
+  private initialized: boolean = false;
 
   constructor(root: ClassInfo, cors: boolean) {
     this.root = root;
@@ -250,19 +670,85 @@ export class NestApplication {
     return this.root;
   }
 
+  /** URI versioning: @Version("1") routes are served under /v1. */
+  enableVersioning(options: VersioningOptions): NestApplication {
+    this.versioning = options.type === VersioningType.URI;
+    this.defaultVersion = options.defaultVersion || "";
+    if (options.prefix !== null) {
+      this.versionPrefix = options.prefix || "v";
+    }
+    return this;
+  }
+
+  enableCors(): void {
+    this.cors = true;
+  }
+
+  /** A middleware for every request (helmet(), compression()). */
+  use(handler: RequestHandler): NestApplication {
+    this.middleware.push(handler);
+    return this;
+  }
+
+  /** new ValidationPipe() for every route: class bodies are validated. */
+  useGlobalPipes(pipe: ValidationPipe): NestApplication {
+    this.validateAll = true;
+    return this;
+  }
+
+  /** An exception filter for every route (register it as { provide: APP_FILTER, useClass: MyFilter } instead: accepted, not applied). */
+  useGlobalFilters(filter: unknown): NestApplication {
+    this.globalFilters.push(filter);
+    return this;
+  }
+
+  /** Sends Nest's log lines to another logger: nestjs-pino's Logger takes them over as soon as it is built, so this only accepts it. */
+  useLogger(logger: unknown): void {}
+
+  /** Runs onModuleDestroy and onApplicationShutdown on exit (accepted; xisto runs them on close()). */
+  enableShutdownHooks(): NestApplication {
+    return this;
+  }
+
+  /** The instance of a provider. */
+  get(token: unknown): unknown {
+    this.init();
+    return getInstance(token);
+  }
+
   // xisto: a GET route served next to the controllers' (what Nest does through getHttpAdapter())
   addGetRoute(path: string, handler: (req: HttpRequest) => HttpResponse): void {
     this.extras.push({ path: joinPath([path]), handler: handler });
   }
 
-  async listen(port: int): Promise<void> {
-    const providers: Map<string, ClassInfo> = new Map<string, ClassInfo>();
-    const controllers: ClassInfo[] = [];
-    collect(this.root.id, providers, controllers, new Map<string, boolean>());
-    const instances: Map<string, unknown> = new Map<string, unknown>();
+  /** Builds the modules and providers (listen does it too). */
+  init(): void {
+    if (this.initialized) {
+      return;
+    }
+    this.initialized = true;
+    ensureCollected(this.root);
+    for (const e of container.entries.values()) {
+      resolveToken(e.token, false, "application", 0, 0);
+    }
+    lifecycle("onModuleInit");
+  }
+
+  async listen(port: number, host: string = ""): Promise<void> {
+    this.init();
     const server = new Server();
-    for (const c of controllers) {
-      const instance = resolve(c, providers, instances, 0);
+    const filterInstances: unknown[] = [];
+    const filterInfos: ClassInfo[] = [];
+    for (const g of container.globals) {
+      const c = asClass(g);
+      if (c !== null && __catches.has(c.id)) {
+        filterInstances.push(build(c, 0));
+        filterInfos.push(c);
+      }
+    }
+    for (const c of container.controllers) {
+      const instance = construct(c, 0);
+      container.wrappers.push({ name: c.name, token: c, instance: instance, metatype: c });
       const base0 = __controllers.get(c.id);
       const routes0 = __routes.get(c.id);
       const params0 = __params.get(c.id);
@@ -281,32 +767,72 @@ export class NestApplication {
           if (g.method !== rd.method) {
             continue;
           }
-          const gi = resolve(g.guard, providers, instances, 0);
-          gs.push(gi);
+          gs.push(construct(g.guard, 0));
           const m = g.guard.methods.find((x: MethodInfo): boolean => x.name === "canActivate");
           if (m === null) {
             throw new Error(`${g.guard.name} has no canActivate()`);
           }
           gms.push(m);
         }
+        let status: int = rd.verb === "POST" ? 201 : 200;
+        for (const s of settingsOf(c, rd.method, "code")) {
+          status = s.code;
+        }
+        let version = this.defaultVersion;
+        for (const s of settingsOf(c, rd.method, "version")) {
+          if (s.method === rd.method || version === this.defaultVersion) {
+            version = s.text;
+          }
+        }
+        const headers: string[] = [];
+        for (const s of settingsOf(c, rd.method, "header")) {
+          headers.push(s.text);
+          headers.push(s.value as string);
+        }
+        const fis: unknown[] = [];
+        const finfo: ClassInfo[] = [];
+        for (const s of settingsOf(c, rd.method, "filter")) {
+          const fc = s.cls;
+          if (fc !== null) {
+            fis.push(construct(fc, 0));
+            finfo.push(fc);
+          }
+        }
+        for (let i = 0; i < filterInstances.length; i++) {
+          fis.push(filterInstances[i]);
+          finfo.push(filterInfos[i]);
+        }
+        let upload = "";
+        for (const s of settingsOf(c, rd.method, "interceptor")) {
+          const f = uploadField(s.value);
+          if (f.length > 0) {
+            upload = f;
+          }
+        }
+        const v = this.versioning && version.length > 0 ? this.versionPrefix + version : "";
         const r: Route = {
           verb: rd.verb,
-          path: joinPath([this.prefix, base, rd.path]),
+          path: joinPath([this.prefix, v, base, rd.path]),
           instance: instance,
           method: c.methods[rd.method],
           params: mine,
           guards: gs,
           guardMethods: gms,
-          validate: validated.includes(rd.method),
-          status: rd.verb === "POST" ? 201 : 200,
+          validate: this.validateAll || validated.includes(rd.method),
+          status: status,
           cors: this.cors,
+          headers: headers,
+          filters: fis,
+          filterInfos: finfo,
+          upload: upload,
+          middleware: this.middleware,
         };
         const h = (req: HttpRequest): HttpResponse => handle(r, req);
         if (rd.verb === "GET") {
           server.get(r.path, h);
         } else if (rd.verb === "POST") {
           server.post(r.path, h);
-        } else if (rd.verb === "PUT") {
+        } else if (rd.verb === "PUT" || rd.verb === "PATCH") {
           server.put(r.path, h);
         } else {
           server.delete(r.path, h);
@@ -316,14 +842,22 @@ export class NestApplication {
     for (const x of this.extras) {
       server.get(x.path, x.handler);
     }
-    server.listen(port);
+    lifecycle("onApplicationBootstrap");
+    new Logger("NestApplication").log("Nest application successfully started");
+    server.listen(Math.trunc(port));
+  }
+
+  /** Runs onModuleDestroy and onApplicationShutdown. */
+  async close(): Promise<void> {
+    lifecycle("onModuleDestroy");
+    lifecycle("beforeApplicationShutdown");
+    lifecycle("onApplicationShutdown");
   }
 }
 
-export interface NestFactoryStatic {
-  create: (module: ClassInfo, options: NestApplicationOptions) => NestApplication;
+/** NestFactory.create(AppModule, options?): the application, ready to configure and listen. */
+export class NestFactory {
+  static create(module: ClassInfo, options: NestApplicationOptions = {}): NestApplication {
+    return new NestApplication(module, options.cors || false);
+  }
 }
-
-export const NestFactory: NestFactoryStatic = {
-  create: (module: ClassInfo, options: NestApplicationOptions): NestApplication => new NestApplication(module, options.cors || false),
-};

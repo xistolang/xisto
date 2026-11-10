@@ -1,33 +1,114 @@
-// class-validator: decorators record rules per class (xisto:reflect); validate() checks an instance.
+// class-validator: decorators record rules per class (xisto:reflect); validationMessages() checks an instance and
+// gives class-validator 0.14's messages, in its order (per property, the property's rules in the order the
+// decorators run: bottom up). The compiler has already built the body into the declared types, so a value of the
+// wrong type never reaches these rules (the body decoder answers 400 first).
 import { ClassInfo, FieldInfo } from "xisto:reflect";
+import { typeOf } from "class-transformer";
 
 interface Rule {
   field: FieldInfo;
   kind: string;
+  n: number;
+  list: string[];
+  pattern: RegExp | null;
 }
 
 const rules: Map<string, Rule[]> = new Map<string, Rule[]>();
+const names: Map<string, string> = new Map<string, string>(); // class name -> class id
 
-function add(c: ClassInfo, f: FieldInfo, kind: string): void {
+function add(c: ClassInfo, f: FieldInfo, kind: string, n: number = 0, list: string[] = [], pattern: RegExp | null = null): void {
+  names.set(c.name, c.id);
   if (!rules.has(c.id)) {
     rules.set(c.id, []);
   }
-  const list = rules.get(c.id);
-  if (list !== null) {
-    list.push({ field: f, kind: kind });
+  const all = rules.get(c.id);
+  if (all !== null) {
+    all.push({ field: f, kind: kind, n: n, list: list, pattern: pattern });
   }
 }
 
-export function IsNotEmpty(): (c: ClassInfo, f: FieldInfo) => void {
+function rule(kind: string, n: number = 0, list: string[] = [], pattern: RegExp | null = null): (c: ClassInfo, f: FieldInfo) => void {
   return (c: ClassInfo, f: FieldInfo): void => {
-    add(c, f, "isNotEmpty");
+    add(c, f, kind, n, list, pattern);
   };
 }
 
-export function IsEmail(): (c: ClassInfo, f: FieldInfo) => void {
-  return (c: ClassInfo, f: FieldInfo): void => {
-    add(c, f, "isEmail");
-  };
+/** Options every decorator takes (`each` and `message` are accepted). */
+export class ValidationOptions {
+  message?: string;
+  each?: boolean;
+}
+
+/** Skips the field's other rules when it is null or absent. */
+export function IsOptional(): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("isOptional");
+}
+/** "$property should not be empty" for "", null and absent. */
+export function IsNotEmpty(o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("isNotEmpty");
+}
+export function IsDefined(o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("isDefined");
+}
+export function IsString(o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("isString");
+}
+/** Any number (class-validator's isNumber with no options). */
+export function IsNumber(options: ValidationOptions = {}, o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("isNumber");
+}
+export function IsInt(o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("isInt");
+}
+export function IsBoolean(o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("isBoolean");
+}
+export function IsArray(o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("isArray");
+}
+export function IsEmail(o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("isEmail");
+}
+/** An ISO 8601 date (2026-11-10 or 2026-11-10T12:30:00Z). */
+export function IsDateString(o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("isDateString");
+}
+export function IsISO8601(o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("isIso8601");
+}
+export function MaxLength(max: int, o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("maxLength", max);
+}
+export function MinLength(min: int, o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("minLength", min);
+}
+export function Min(min: number, o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("min", min);
+}
+export function Max(max: number, o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("max", max);
+}
+export function ArrayMaxSize(max: int, o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("arrayMaxSize", max);
+}
+export function ArrayMinSize(min: int, o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("arrayMinSize", min);
+}
+/** One of the given values. */
+export function IsIn(values: string[], o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("isIn", 0, values);
+}
+/** One of an enum's values: pass Object.values(MyEnum) (a string array), as the values to accept. */
+export function IsEnum(values: string[], o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("isEnum", 0, values);
+}
+/** Matches the regular expression. */
+export function Matches(pattern: RegExp, o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("matches", 0, [], pattern);
+}
+/** Validates the nested object (or each object of the array) with its own class's rules. */
+export function ValidateNested(o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return rule("validateNested");
 }
 
 // local@domain.tld, the shape class-validator's isEmail accepts for ordinary addresses
@@ -48,6 +129,13 @@ export function isEmail(value: string): boolean {
   return labels[labels.length - 1].length >= 2;
 }
 
+const ISO_DATE = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(T([01]\d|2[0-3]):[0-5]\d(:[0-5]\d(\.\d+)?)?(Z|[+-]([01]\d|2[0-3]):?[0-5]\d)?)?$/;
+
+/** class-validator's isISO8601 for the common forms: a date, or a date and time with an optional offset. */
+export function isISO8601(value: string): boolean {
+  return ISO_DATE.test(value);
+}
+
 function empty(v: unknown): boolean {
   if (v === null) {
     return true;
@@ -58,21 +146,252 @@ function empty(v: unknown): boolean {
   return false;
 }
 
-// class-validator's messages, in field order: "username should not be empty", "email must be an email"
-export function validationMessages(target: unknown, classId: string): string[] {
-  const out: string[] = [];
-  const list = rules.get(classId);
-  if (list === null) {
+function numberText(n: number): string {
+  return `${n}`;
+}
+
+function check(r: Rule, v: unknown, prop: string, out: string[], isArr: boolean): void {
+  const k = r.kind;
+  if (k === "isNotEmpty" && empty(v)) {
+    out.push(`${prop} should not be empty`);
+  } else if (k === "isDefined" && v === null) {
+    out.push(`${prop} should not be null or undefined`);
+  } else if (k === "isString" && typeof v !== "string") {
+    out.push(`${prop} must be a string`);
+  } else if (k === "isNumber" && (typeof v !== "number" || !isFinite(v as number))) {
+    out.push(`${prop} must be a number conforming to the specified constraints`);
+  } else if (k === "isInt" && (typeof v !== "number" || !Number.isInteger(v as number))) {
+    out.push(`${prop} must be an integer number`);
+  } else if (k === "isBoolean" && typeof v !== "boolean") {
+    out.push(`${prop} must be a boolean value`);
+  } else if (k === "isArray" && !isArr) {
+    out.push(`${prop} must be an array`);
+  } else if (k === "isEmail" && (typeof v !== "string" || !isEmail(v as string))) {
+    out.push(`${prop} must be an email`);
+  } else if ((k === "isDateString" || k === "isIso8601") && (typeof v !== "string" || !isISO8601(v as string))) {
+    out.push(`${prop} must be a valid ISO 8601 date string`);
+  } else if (k === "maxLength" && (typeof v !== "string" || Number((v as string).length) > r.n)) {
+    out.push(`${prop} must be shorter than or equal to ${numberText(r.n)} characters`);
+  } else if (k === "minLength" && (typeof v !== "string" || Number((v as string).length) < r.n)) {
+    out.push(`${prop} must be longer than or equal to ${numberText(r.n)} characters`);
+  } else if (k === "min" && (typeof v !== "number" || (v as number) < r.n)) {
+    out.push(`${prop} must not be less than ${numberText(r.n)}`);
+  } else if (k === "max" && (typeof v !== "number" || (v as number) > r.n)) {
+    out.push(`${prop} must not be greater than ${numberText(r.n)}`);
+  } else if (k === "arrayMaxSize" && (!isArr || Number((v as unknown[]).length) > r.n)) {
+    out.push(`${prop} must contain no more than ${numberText(r.n)} elements`);
+  } else if (k === "arrayMinSize" && (!isArr || Number((v as unknown[]).length) < r.n)) {
+    out.push(`${prop} must contain at least ${numberText(r.n)} elements`);
+  } else if ((k === "isIn" || k === "isEnum") && !inList(v, r.list)) {
+    out.push(`${prop} must be one of the following values: ${r.list.join(", ")}`);
+  } else if (k === "matches") {
+    const p = r.pattern;
+    if (p !== null && (typeof v !== "string" || !p.test(v as string))) {
+      out.push(`${prop} must match ${p.toString()} regular expression`);
+    }
+  }
+}
+
+function inList(v: unknown, list: string[]): boolean {
+  if (typeof v === "string") {
+    return list.includes(v as string);
+  }
+  if (typeof v === "number") {
+    return list.includes(`${v as number}`);
+  }
+  return false;
+}
+
+// the class id of a nested field: @Type(() => X) first, then the field's declared class
+function nestedClass(owner: string, f: FieldInfo): string {
+  const t = typeOf(owner, f.name);
+  if (t !== null) {
+    return t.id;
+  }
+  if (f.type.kind === "class") {
+    return f.type.id;
+  }
+  let n = f.type.id;
+  if (n.endsWith("[]")) {
+    n = n.slice(0, n.length - 2);
+  }
+  const hash = n.lastIndexOf("#");
+  if (hash >= 0) {
+    n = n.slice(hash + 1, n.length);
+  }
+  return names.get(n) || "";
+}
+
+// The JSON the body arrived as, read just enough to tell a key that is absent (undefined for class-validator) from
+// one that is there: the decoded object holds "" or 0 for both.
+class Skim {
+  text: string;
+  at: int = 0;
+  constructor(text: string) {
+    this.text = text;
+  }
+  space(): void {
+    while (this.at < this.text.length && " \t\r\n".includes(this.text.slice(this.at, this.at + 1))) {
+      this.at++;
+    }
+  }
+  str(): string {
+    let out = "";
+    this.at++; // the opening quote
+    while (this.at < this.text.length && this.text.slice(this.at, this.at + 1) !== "\"") {
+      if (this.text.slice(this.at, this.at + 1) === "\\") {
+        this.at++;
+      }
+      out = out + this.text.slice(this.at, this.at + 1);
+      this.at++;
+    }
+    this.at++;
     return out;
   }
-  for (const r of list) {
-    const v = r.field.get(target);
-    if (r.kind === "isNotEmpty" && empty(v)) {
-      out.push(`${r.field.name} should not be empty`);
+  // skips one value and gives its text
+  value(): string {
+    this.space();
+    const start = this.at;
+    let depth = 0;
+    while (this.at < this.text.length) {
+      const ch = this.text.slice(this.at, this.at + 1);
+      if (ch === "\"") {
+        this.str();
+        if (depth === 0) {
+          break;
+        }
+        continue;
+      }
+      if (ch === "{" || ch === "[") {
+        depth++;
+      } else if (ch === "}" || ch === "]") {
+        if (depth === 0) {
+          break;
+        }
+        depth--;
+        if (depth === 0) {
+          this.at++;
+          break;
+        }
+      } else if (depth === 0 && (ch === "," || ch === " " || ch === "\n" || ch === "\r" || ch === "\t")) {
+        break;
+      }
+      this.at++;
     }
-    if (r.kind === "isEmail" && (empty(v) || !isEmail(v as string))) {
-      out.push(`${r.field.name} must be an email`);
+    return this.text.slice(start, this.at);
+  }
+}
+
+// the keys of a JSON object and their values' text (an empty map when the text is not an object)
+function objectKeys(json: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const s = new Skim(json);
+  s.space();
+  if (s.at >= json.length || json.slice(s.at, s.at + 1) !== "{") {
+    return out;
+  }
+  s.at++;
+  while (s.at < json.length) {
+    s.space();
+    if (s.at >= json.length || json.slice(s.at, s.at + 1) !== "\"") {
+      break;
+    }
+    const key = s.str();
+    s.space();
+    s.at++; // the colon
+    out.set(key, s.value());
+    s.space();
+    if (s.at < json.length && json.slice(s.at, s.at + 1) === ",") {
+      s.at++;
     }
   }
+  return out;
+}
+
+// the elements of a JSON array, as text
+function arrayItems(json: string): string[] {
+  const out: string[] = [];
+  const s = new Skim(json);
+  s.space();
+  if (s.at >= json.length || json.slice(s.at, s.at + 1) !== "[") {
+    return out;
+  }
+  s.at++;
+  while (s.at < json.length) {
+    s.space();
+    if (s.at >= json.length || json.slice(s.at, s.at + 1) === "]") {
+      break;
+    }
+    out.push(s.value());
+    s.space();
+    if (s.at < json.length && json.slice(s.at, s.at + 1) === ",") {
+      s.at++;
+    }
+  }
+  return out;
+}
+
+function validateInto(target: unknown, classId: string, prefix: string, out: string[], json: string): void {
+  const list = rules.get(classId);
+  if (list === null) {
+    return;
+  }
+  const keys = objectKeys(json);
+  const knowsKeys = json.length > 0;
+  // the properties in the order their first rule was recorded; per property, its rules in recording order
+  const order: string[] = [];
+  for (const r of list) {
+    if (!order.includes(r.field.name)) {
+      order.push(r.field.name);
+    }
+  }
+  for (const name of order) {
+    const mine = list.filter((r: Rule): boolean => r.field.name === name);
+    const f = mine[0].field;
+    let v = f.get(target);
+    const raw = keys.get(name) || "";
+    if (knowsKeys && (!keys.has(name) || raw === "null")) {
+      v = null; // absent from the body: undefined for class-validator
+    }
+    const optional = mine.some((r: Rule): boolean => r.kind === "isOptional");
+    if (optional && v === null) {
+      continue;
+    }
+    const prop = prefix + name;
+    // (an array by the field's declared type: the value is held as unknown here)
+    const isArr = v !== null && (f.type.kind === "array" || f.type.id.endsWith("[]"));
+    const own: string[] = [];
+    const nested: string[] = [];
+    for (const r of mine) {
+      if (r.kind === "validateNested") {
+        const cls = nestedClass(classId, f);
+        if (v === null || cls.length === 0) {
+          continue;
+        }
+        if (isArr) {
+          const items = v as unknown[];
+          const texts = arrayItems(raw);
+          for (let i = 0; i < items.length; i++) {
+            validateInto(items[i], cls, `${prop}.${i}.`, nested, i < texts.length ? texts[i] : "");
+          }
+        } else {
+          validateInto(v, cls, `${prop}.`, nested, raw);
+        }
+        continue;
+      }
+      check(r, v, prop, own, isArr);
+    }
+    // Nest's ValidationPipe lists a property's nested errors in place of its own when it has both
+    for (const m of nested.length > 0 ? nested : own) {
+      out.push(m);
+    }
+  }
+}
+
+// class-validator's messages, as the ValidationPipe lists them: "username should not be empty", "email must be an email"
+// `json` is the body the object was decoded from, so keys it lacks count as undefined ("" when unknown).
+export function validationMessages(target: unknown, classId: string, json: string = ""): string[] {
+  const out: string[] = [];
+  validateInto(target, classId, "", out, json);
   return out;
 }

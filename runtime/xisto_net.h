@@ -1745,8 +1745,8 @@ static void xs_server_respond_x(xs_client *c, int64_t status, const char *ctype,
     h += xs_itoa(status, h);
     *h++ = ' ';
     const char *st = xs_status_text(status); size_t stl = strlen(st); memcpy(h, st, stl); h += stl;
-    memcpy(h, "\r\nContent-Type: ", 16); h += 16;
-    size_t ctl = strlen(ctype); if (ctl > 128) ctl = 128; memcpy(h, ctype, ctl); h += ctl;
+    size_t ctl = strlen(ctype); if (ctl > 128) ctl = 128;
+    if (ctl) { memcpy(h, "\r\nContent-Type: ", 16); h += 16; memcpy(h, ctype, ctl); h += ctl; } /* "" sends none */
     memcpy(h, "\r\nContent-Length: ", 18); h += 18;
     h += xs_itoa((int64_t)body_len, h);
     if (extra && extra->len) { memcpy(h, "\r\n", 2); h += 2; memcpy(h, extra->data, (size_t)extra->len - 2); h += extra->len - 2; }
@@ -2614,6 +2614,55 @@ XS_NOINLINE void xs_wt_listen_start(xs_wq *q, xs_closure **cb, uint8_t *kind, xs
     xs_tasks_live++;
     xs_exit_hook = xs_tasks_drain;
     xs_ready_push(co); /* it starts when the loop runs: after the code that set the listener up */
+}
+/* ---- setTimeout / setInterval (Node's globals): each timer is a coroutine on the event loop. It starts when the
+   loop runs (a server's, or the one the program's exit waits on), sleeps, then calls its callback; an interval goes
+   on until clearInterval. Like Node, a pending timer keeps the program alive. */
+typedef struct xs_ttask { xs_closure *cb; int64_t ms; bool repeat, cancelled; int64_t id; struct xs_ttask *next; } xs_ttask;
+static xs_ttask *xs_ttasks;
+static int64_t xs_tnext = 1;
+XS_NOINLINE void xs_ttask_run(void *p) {
+    xs_ttask *t = p;
+    for (;;) {
+        xs_sleep_ms(t->ms);
+        if (t->cancelled) return;
+        size_t mark = xs_ar_mark();
+        ((void (*)(void *))t->cb->fn)(t->cb);
+        xs_ar_drain(mark);
+        if (!t->repeat || t->cancelled) return;
+    }
+}
+static void xs_ttask_done(xs_coro *co) {
+    xs_ttask *t = co->arg;
+    xs_tasks_live--;
+    xs_coro_recycle(co);
+    for (xs_ttask **pp = &xs_ttasks; *pp; pp = &(*pp)->next)
+        if (*pp == t) { *pp = t->next; break; }
+    xs_release(t->cb);
+    free(t);
+}
+XS_NOINLINE int64_t xs_timer_start(xs_closure *cb, double ms, bool repeat) {
+    if (xs_kq < 0) xs_kq = kqueue();
+    xs_ttask *t = calloc(1, sizeof *t);
+    t->cb = xs_retain(cb);
+    t->ms = !(ms >= 1) ? 1 : ms > 2147483647.0 ? 1 : (int64_t)ms; /* (Node: below 1 or above 2^31-1 ms is 1) */
+    t->repeat = repeat;
+    t->id = xs_tnext++;
+    t->next = xs_ttasks;
+    xs_ttasks = t;
+    xs_coro *co = xs_coro_new_shared(xs_ttask_run, t);
+    co->on_done = xs_ttask_done;
+    xs_tasks_live++;
+    xs_exit_hook = xs_tasks_drain;
+    xs_ready_push(co);
+    return t->id;
+}
+XS_NOINLINE int64_t xs_set_timeout(xs_closure *cb, double ms) { return xs_timer_start(cb, ms, false); }
+XS_NOINLINE int64_t xs_set_interval(xs_closure *cb, double ms) { return xs_timer_start(cb, ms, true); }
+XS_NOINLINE void xs_clear_timer(double idn) { /* the timer's coroutine ends when it next wakes */
+    int64_t id = (int64_t)idn;
+    for (xs_ttask *t = xs_ttasks; t; t = t->next)
+        if (t->id == id) t->cancelled = true;
 }
 XS_NOINLINE void xs_wt_check_event(xs_str *ev, const char *who) {
     if (ev->len != 7 || memcmp(ev->data, "message", 7) != 0)

@@ -160,6 +160,8 @@ static int npkgs;
 
 static const char *package_status(const char *root, const char *name) {
     char dir[PATH_MAX];
+    const char *extra = getenv("XISTO_PKGS");
+    if (extra && *extra && access(xs_sprintf("%s/%s", extra, name), R_OK) == 0) return "installed (--pkgs)";
     if (!xs_real_path(root, dir)) snprintf(dir, sizeof dir, "%s", root);
     for (;;) {
         if (access(xs_sprintf("%s/.xisto/pkgs/%s", dir, name), R_OK) == 0) return "installed (.xisto/pkgs)";
@@ -315,7 +317,8 @@ int cmd_check(int argc, char **argv) {
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--details") == 0) details = true;
         else if (strcmp(argv[i], "--tests") == 0) with_tests = true;
-        else if (argv[i][0] == '-') { fprintf(stderr, "xisto check: unknown option '%s' (--details, --tests)\n", argv[i]); return 2; }
+        else if (strcmp(argv[i], "--pkgs") == 0 && i + 1 < argc) { if (!xs_use_pkgs_dir(argv[++i])) return 2; }
+        else if (argv[i][0] == '-') { fprintf(stderr, "xisto check: unknown option '%s' (--details, --tests, --pkgs DIR)\n", argv[i]); return 2; }
         else {
             char *p = xs_sprintf("%s", argv[i]);
             for (size_t n = strlen(p); n > 1 && p[n - 1] == '/'; n--) p[n - 1] = 0; /* "dir/" as "dir" */

@@ -42,6 +42,7 @@ static void use_type(Type *t) {
     case TY_ARRAY: case TY_SET: case TY_NULLABLE: use_type(t->elem); break;
     case TY_MAP: use_type(t->key); use_type(t->elem); break;
     case TY_FUNC: for (int i = 0; i < t->nparams; i++) use_type(t->params[i]); use_type(t->ret); break;
+    case TY_UNION: for (int i = 0; i < t->nparams; i++) use_type(t->params[i]); break;
     default: break;
     }
 }
@@ -65,6 +66,9 @@ static void walk_expr(Expr *e) {
         push_func(e->func);
         break;
     case E_NEW_OBJ:
+        use_class(e->cls);
+        break;
+    case E_OBJLIT: /* (a literal that became a union member's class: its type may read as the union now) */
         use_class(e->cls);
         break;
     case E_ARROW:

@@ -6,7 +6,7 @@ X=../../build/xisto
 mkdir -p .xisto/pkgs # (the packages from this repository, as examples/conduit/setup.sh links them)
 ln -sfn ../../../../packages/typeorm .xisto/pkgs/typeorm
 ln -sfn ../../../../packages/pg .xisto/pkgs/pg
-for p in express class-validator; do ln -sfn "../../../../packages/$p" ".xisto/pkgs/$p"; done
+for p in express class-validator class-transformer; do ln -sfn "../../../../packages/$p" ".xisto/pkgs/$p"; done
 mkdir -p .xisto/pkgs/@nestjs
 for p in common core typeorm; do ln -sfn "../../../../../packages/@nestjs/$p" ".xisto/pkgs/@nestjs/$p"; done
 fail=0
