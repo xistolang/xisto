@@ -6445,7 +6445,9 @@ static void check_expr_in(Expr *e, Type *expected) {
                             check_expr(cb, cbt);
                         } else {
                             /* xs.map(([c]): [string, V] => ...): the return type written, the parameters from the elements */
-                            check_expr(cb, cb->kind == E_ARROW ? CB(np, NULL) : NULL);
+                            bool untyped = false;
+                            if (cb->kind == E_ARROW) for (int k = 0; k < cb->arrow->fn->nparams; k++) if (!cb->arrow->fn->params[k].type) untyped = true;
+                            check_expr(cb, untyped ? CB(np, NULL) : NULL);
                             /* the parameters must still match the elements: the runtime calls it with them */
                             if (cb->type->kind == TY_FUNC) expect_type(cb, CB(np, cb->type->ret), xs_sprintf("callback of %s", m));
                         }
