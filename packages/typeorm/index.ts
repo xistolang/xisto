@@ -1359,19 +1359,23 @@ export class SelectQueryBuilder<T> {
     return this;
   }
 
-  skip(n: int): SelectQueryBuilder<T> {
+  skip(count: number): SelectQueryBuilder<T> { // (a number, as TypeORM takes: its integer part)
+    const n: int = Math.trunc(count);
     this.skipN = n;
     return this;
   }
-  take(n: int): SelectQueryBuilder<T> {
+  take(count: number): SelectQueryBuilder<T> { // (a number, as TypeORM takes: its integer part)
+    const n: int = Math.trunc(count);
     this.takeN = n;
     return this;
   }
-  offset(n: int): SelectQueryBuilder<T> {
+  offset(count: number): SelectQueryBuilder<T> { // (a number, as TypeORM takes: its integer part)
+    const n: int = Math.trunc(count);
     this.skipN = n;
     return this;
   }
-  limit(n: int): SelectQueryBuilder<T> {
+  limit(count: number): SelectQueryBuilder<T> { // (a number, as TypeORM takes: its integer part)
+    const n: int = Math.trunc(count);
     this.takeN = n;
     return this;
   }
