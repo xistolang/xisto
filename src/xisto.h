@@ -402,6 +402,7 @@ typedef struct {
     bool consumed;     /* constructors: the caller hands over a reference the body stores in a field (no retain) */
     char *cell;        /* captured by a closure and reassigned: copied into this heap cell on entry */
     char *type_src;    /* the type as written (reflection) */
+    bool rest;         /* ...xs: T[]: the arguments from here on, as one array (checker, check_args) */
 } Param;
 
 struct Func {

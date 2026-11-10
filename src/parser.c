@@ -282,8 +282,34 @@ static Type *inter_rest(Parser *p, Type *t, const char *open, Pos pos) {
     }
     return t;
 }
+/* one type term, skipped: Name, Name<...>, Name['k'][number], typeof x */
+static void skip_type_term(Parser *p) {
+    if (at_ident(p, "typeof")) next(p);
+    if (at_ident(p, "keyof")) next(p);
+    next(p);
+    while (at(p, TK_DOT)) { next(p); next(p); }
+    if (at(p, TK_LT)) { int d = 0; do { if (at(p, TK_LT)) d++; else if (at(p, TK_GT)) d--; next(p); } while (d > 0 && !at(p, TK_EOF)); }
+    while (at(p, TK_LBRACKET)) { int d = 0; do { if (at(p, TK_LBRACKET)) d++; else if (at(p, TK_RBRACKET)) d--; next(p); } while (d > 0 && !at(p, TK_EOF)); }
+}
 static Type *parse_type(Parser *p) {
     Type *t;
+    if (at_ident(p, "keyof") && peek_is(p, TK_IDENT)) { /* keyof T (& string): the names of T's fields, a string */
+        next(p);
+        skip_type_term(p);
+        if (at(p, TK_AMP)) { Parser look = *p; next(&look); if (at_ident(&look, "string")) { *p = look; next(p); } }
+        t = ty_string;
+        if (at(p, TK_PIPE)) { t = union_rest(p, t); }
+        return t;
+    }
+    if (at_ident(p, "Exclude") && peek_is(p, TK_LT)) { /* Exclude<A, B>: A (the values left out are TypeScript's check) */
+        next(p);
+        next(p);
+        t = parse_type(p);
+        expect(p, TK_COMMA, NULL);
+        parse_type(p);
+        expect(p, TK_GT, NULL);
+        return t;
+    }
     if (at_ident(p, "asserts") && peek_is(p, TK_IDENT)) next(p); /* asserts x is T: a check that throws, read as its boolean */
     if (at(p, TK_IDENT) || at(p, TK_THIS)) { /* x is T: a type predicate is the boolean the function returns */
         Parser look = *p;
@@ -517,6 +543,8 @@ static Type *parse_type(Parser *p) {
         expect(p, TK_LT, "write Stream<T>");
         t = ty_stream_of(parse_type(p));
         expect(p, TK_GT, NULL);
+    } else if (strcmp(n, "null") == 0 && (at(p, TK_SEMI) || at(p, TK_COMMA) || at(p, TK_RBRACE))) {
+        t = ty_unknown; /* attachBlob: null (a field that is only ever null): an unknown, which null fits */
     } else if (strcmp(n, "null") == 0) {
         xs_error(XS2008, name.pos, "write the nullable type as T | null", "'null' alone is not a type");
     } else if (strcmp(n, "undefined") == 0) {
@@ -624,23 +652,37 @@ static Type *union_of(Type *a, Type *b) {
     return nul ? ty_nullable_of(u) : u;
 }
 
+static bool at_push_call; /* parse_postfix: the call being read is a member named push */
 static void parse_args(Parser *p, ExprList *out) {
     expect(p, TK_LPAREN, NULL);
+    bool so = p->spread_ok; /* (only the statement's own call: xs.push(...ys)) */
     if (!at(p, TK_RPAREN)) {
         do {
             if (at(p, TK_RPAREN)) break; /* trailing comma */
-            if (at(p, TK_ELLIPSIS) && p->spread_ok && !p->spread_arg && out->len == 0) {
+            if (at(p, TK_ELLIPSIS) && so && !p->spread_arg && out->len == 0 && at_push_call) {
                 Expr *u = new_expr(E_UNARY, p->tok.pos);
                 next(p);
                 u->op = TK_ELLIPSIS;
+                p->spread_ok = false;
                 u->lhs = parse_assign(p);
+                p->spread_ok = so;
                 p->spread_arg = u;
                 expr_list_push(out, u);
                 continue;
             }
-            if (at(p, TK_ELLIPSIS))
-                xs_error(XS6032, p->tok.pos, "pass the array itself: f(xs), with a parameter xs: T[]", "spreading arguments into a call is not supported (xisto has no rest parameters)");
+            if (at(p, TK_ELLIPSIS)) { /* f(...xs): for a rest parameter, or Math.max (the checker says where it fits) */
+                Expr *u = new_expr(E_UNARY, p->tok.pos);
+                next(p);
+                u->op = TK_ELLIPSIS;
+                p->spread_ok = false;
+                u->lhs = parse_assign(p);
+                p->spread_ok = so;
+                expr_list_push(out, u);
+                continue;
+            }
+            p->spread_ok = false;
             expr_list_push(out, parse_expr(p));
+            p->spread_ok = so;
         } while (accept(p, TK_COMMA));
     }
     expect(p, TK_RPAREN, NULL);
@@ -735,7 +777,7 @@ static Expr *parse_arrow(Parser *p) {
             bool opt = accept(p, TK_QUESTION); /* (x?: T) => ...: T | null, null when left out */
             if (accept(p, TK_COLON)) prm.type = parse_type(p); /* untyped parameters take their type from the context */
             if (opt && prm.type) { prm.type = ty_optional_of(prm.type); prm.dflt = new_expr(E_NULL, name.pos); }
-            else if (at(p, TK_ASSIGN) && !default_literal_type(p, &prm))
+            else if (!prm.type && at(p, TK_ASSIGN) && !default_literal_type(p, &prm))
                 xs_error(XS3013, p->tok.pos, "give the parameter a type: (w: number = 2)", "parameter '%s' has no type", name.str);
             if (accept(p, TK_ASSIGN)) prm.dflt = parse_assign(p); /* (n: number, w = 2) => ... */
             f->params[f->nparams++] = prm;
@@ -1184,7 +1226,9 @@ static Expr *parse_postfix(Parser *p) {
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs);
             if (at(p, TK_LPAREN)) {
                 m->is_call = true;
+                at_push_call = strcmp(m->str, "push") == 0;
                 parse_args(p, &m->args);
+                at_push_call = false;
             }
             e = m;
         } else if (at(p, TK_LBRACKET)) {
@@ -1214,7 +1258,9 @@ static Expr *parse_postfix(Parser *p) {
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs); /* obj.m<T>(x) */
             if (at(p, TK_LPAREN)) {
                 m->is_call = true;
+                at_push_call = strcmp(m->str, "push") == 0;
                 parse_args(p, &m->args);
+                at_push_call = false;
             }
             e = m;
         } else if (at(p, TK_TEMPLATE) && e->kind == E_MEMBER && !e->is_call && e->lhs->kind == E_IDENT && strcmp(e->lhs->str, "String") == 0 &&
@@ -1525,9 +1571,44 @@ static void destructure(Parser *p, Stmt *holder, bool is_const, bool array) {
             break;
         }
         if (at(p, TK_DOT) || at(p, TK_ELLIPSIS)) xs_error(XS6006, p->tok.pos, "name the fields one by one", "'...rest' in an object destructuring is not supported");
+        if (array && (at(p, TK_LBRACKET) || at(p, TK_LBRACE))) { /* const [a, { b }] = e: the element into a const, then its pattern */
+            Pos ep = p->tok.pos;
+            Stmt *d = new_stmt(S_VAR, ep);
+            d->is_const = true;
+            Expr *read = new_expr(E_INDEX, ep);
+            read->lhs = ident_expr(ep, tmp);
+            Expr *ix = new_expr(E_NUMBER, ep);
+            ix->is_int_lit = true; ix->ival = idx; ix->num = idx;
+            read->rhs = ix;
+            d->init = read;
+            stmt_list_push(&p->pending, d);
+            Stmt sub = {0};
+            destructure(p, &sub, is_const, at(p, TK_LBRACKET));
+            d->name = sub.name;
+            idx++;
+            if (!accept(p, TK_COMMA)) break;
+            continue;
+        }
         Token nm = expect(p, TK_IDENT, array ? "a name for the element" : "a field name");
         const char *field = nm.str, *var = nm.str;
-        if (!array && accept(p, TK_COLON)) var = expect(p, TK_IDENT, "the name to give the field: { field: name }").str;
+        if (!array && accept(p, TK_COLON)) {
+            if (at(p, TK_LBRACKET) || at(p, TK_LBRACE)) { /* const { a: { b } } = e */
+                Stmt *d = new_stmt(S_VAR, nm.pos);
+                d->is_const = true;
+                Expr *read = new_expr(E_MEMBER, nm.pos);
+                read->lhs = ident_expr(nm.pos, tmp);
+                read->str = (char *)field;
+                d->init = read;
+                stmt_list_push(&p->pending, d);
+                Stmt sub = {0};
+                destructure(p, &sub, is_const, at(p, TK_LBRACKET));
+                d->name = sub.name;
+                idx++;
+                if (!accept(p, TK_COMMA)) break;
+                continue;
+            }
+            var = expect(p, TK_IDENT, "the name to give the field: { field: name }").str;
+        }
         Expr *read;
         if (array) {
             read = new_expr(E_INDEX, nm.pos);
@@ -2182,6 +2263,7 @@ static void parse_params_ex(Parser *p, Func *f, bool is_ctor) {
         }
         (void)mpos;
         Token name;
+        bool rest = accept(p, TK_ELLIPSIS); /* ...xs: T[] */
         if (at(p, TK_LBRACKET) || at(p, TK_LBRACE)) { /* f([a, b]: [int, int]) / f({ x, y }: Point): a hidden parameter */
             StmtList saved = p->pending;
             p->pending = (StmtList){0};
@@ -2209,6 +2291,10 @@ static void parse_params_ex(Parser *p, Func *f, bool is_ctor) {
             prm.dflt = new_expr(E_NULL, name.pos);
         }
         if (accept(p, TK_ASSIGN)) prm.dflt = parse_expr(p);
+        if (rest) { /* none given: an empty array */
+            prm.rest = true;
+            if (!prm.dflt) prm.dflt = new_expr(E_ARRAY_LIT, name.pos);
+        }
         if (!prm.dflt && f->nparams > 0 && f->params[f->nparams - 1].dflt)
             xs_error(XS9029, name.pos, "give it a default too, or move it before the optional ones", "parameter '%s' follows an optional parameter", name.str);
         f->params[f->nparams++] = prm;
@@ -2370,6 +2456,19 @@ static Class *parse_interface(Parser *p) {
         }
         if (!at(p, TK_LBRACE) || composite) { /* type Shape = Circle | Rect; type Id = string | number; */
             c->alias = parse_type(p);
+            if (at_ident(p, "extends")) { /* type Ok = A extends B ? true : never: a conditional type, read as its true branch */
+                next(p);
+                parse_type(p);
+                expect(p, TK_QUESTION, NULL);
+                c->alias = parse_type(p);
+                expect(p, TK_COLON, NULL);
+                int d = 0;
+                while (!at(p, TK_EOF) && !(d == 0 && at(p, TK_SEMI))) {
+                    if (at(p, TK_LT) || at(p, TK_LPAREN) || at(p, TK_LBRACE) || at(p, TK_LBRACKET)) d++;
+                    else if (at(p, TK_GT) || at(p, TK_RPAREN) || at(p, TK_RBRACE) || at(p, TK_RBRACKET)) d--;
+                    next(p);
+                }
+            }
             accept(p, TK_SEMI);
             return c;
         }
@@ -2469,8 +2568,26 @@ Class *xs_parse_class_instance(Class *tmpl, Type **args, const char *name) {
 
 static void parse_fields_body(Parser *p, Class *c) {
     expect(p, TK_LBRACE, NULL);
+    char **sn0 = subst_names;
+    Type **st0 = subst_types;
+    int sk0 = nsubst;
     while (!at(p, TK_RBRACE)) {
+        subst_names = sn0; subst_types = st0; nsubst = sk0; /* (a member's own defaulted type parameters end with it) */
         if (at(p, TK_EOF)) xs_error(XS1030, p->tok.pos, NULL, "unexpected end of file inside '%s'", c->name);
+        if (c->is_interface && at(p, TK_LBRACKET)) { /* [k: string]: T; an index signature: the declared fields are what xisto reads */
+            Parser look = *p;
+            next(&look);
+            if (at(&look, TK_IDENT) && peek_is(&look, TK_COLON)) {
+                int d = 0;
+                while (!at(p, TK_EOF) && !(d == 0 && (at(p, TK_SEMI) || at(p, TK_COMMA) || at(p, TK_RBRACE)))) {
+                    if (at(p, TK_LBRACKET) || at(p, TK_LT) || at(p, TK_LPAREN) || at(p, TK_LBRACE)) d++;
+                    else if (at(p, TK_RBRACKET) || at(p, TK_GT) || at(p, TK_RPAREN) || at(p, TK_RBRACE)) d--;
+                    next(p);
+                }
+                if (!accept(p, TK_SEMI)) accept(p, TK_COMMA);
+                continue;
+            }
+        }
         DecoList decos = {0};
         parse_decorators(p, &decos);
         Pos pos = p->tok.pos;
@@ -2501,6 +2618,13 @@ static void parse_fields_body(Parser *p, Class *c) {
         if (accessor) {
             if (!at(p, TK_LPAREN)) xs_error(XS1037, p->tok.pos, NULL, "write %s %s(...) { ... }", accessor == 1 ? "get" : "set", name.str);
             name.str = xs_sprintf("__%s_%s", accessor == 1 ? "get" : "set", name.str);
+        }
+        if (at(p, TK_LT) && c->is_interface) { /* query<T = any>(...): T: the method with its type parameters' defaults */
+            Func tmp = {0};
+            parse_tparams(p, &tmp);
+            for (int i = 0; i < tmp.ntparams; i++)
+                if (!tmp.tdefaults[i]) xs_error(XS8113, name.pos, "write the method's signature with its types: name(x: T): R;", "method '%s' in interface '%s'", name.str, c->name);
+            subst_push(subst_save(), tmp.tparams, tmp.tdefaults, tmp.ntparams);
         }
         if (at(p, TK_LPAREN) && c->is_interface) { /* execute(input: In): Out; an abstract method (see iface_methods) */
             if (is_async || accessor) xs_error(XS8113, name.pos, "write the method's signature: name(x: T): R;", "method '%s' in interface '%s'", name.str, c->name);
@@ -2690,6 +2814,7 @@ static void parse_fields_body(Parser *p, Class *c) {
             c->fields[c->nfields++] = fd;
         }
     }
+    subst_names = sn0; subst_types = st0; nsubst = sk0;
     next(p);
 }
 
@@ -3462,6 +3587,12 @@ static void parse_module(Program *prog, Module *m) {
         bool exported = accept(&p, TK_EXPORT);
         bool is_default = exported && at(&p, TK_DEFAULT) && (next(&p), true);
         bool is_declare = at_ident(&p, "declare") && (next(&p), true);
+        if (is_declare && at_ident(&p, "global") && peek_is(&p, TK_LBRACE)) { /* declare global { ... }: TypeScript's own types, augmented */
+            next(&p);
+            int d = 0;
+            do { if (at(&p, TK_LBRACE)) d++; else if (at(&p, TK_RBRACE)) d--; next(&p); } while (d > 0 && !at(&p, TK_EOF));
+            continue;
+        }
         if (is_declare) { /* a native package's binding: no body here, the C is in the package */
             if (!m->native_prefix) xs_error(XS6008, p.tok.pos, "declare functions and classes in a package with C sources (xisto.json \"native\")", "'declare' outside a native package");
             if (at(&p, TK_FUNCTION)) {

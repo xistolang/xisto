@@ -1880,7 +1880,24 @@ static Expr *dflt_subst(Expr *d, Func *f, Expr **args, int nargs, Pos at) {
     return c;
 }
 
+static bool is_spread(Expr *a) { return a && a->kind == E_UNARY && a->op == TK_ELLIPSIS; }
 static void check_args(Expr *e, Func *f, const char *what) {
+    if (f->nparams && f->params[f->nparams - 1].rest) { /* ...xs: T[]: the arguments from there on, one array (or f(...ys): ys) */
+        int r = f->nparams - 1;
+        if (e->args.len == f->nparams && is_spread(e->args.items[r])) e->args.items[r] = e->args.items[r]->lhs;
+        else if (e->args.len > r) {
+            Expr *arr = xs_alloc(sizeof *arr);
+            arr->kind = E_ARRAY_LIT; arr->pos = e->args.items[r]->pos; arr->field = -1;
+            for (int i = r; i < e->args.len; i++) {
+                if (is_spread(e->args.items[i])) xs_error(XS6032, e->args.items[i]->pos, "pass the array itself: f(xs), with a parameter xs: T[]", "spreading arguments into a call is not supported (xisto has no rest parameters)");
+                expr_list_push(&arr->args, e->args.items[i]);
+            }
+            e->args.len = r;
+            expr_list_push(&e->args, arr);
+        }
+    }
+    for (int i = 0; i < e->args.len; i++)
+        if (is_spread(e->args.items[i])) xs_error(XS6032, e->args.items[i]->pos, "pass the array itself: f(xs), with a parameter xs: T[]", "spreading arguments into a call is not supported (xisto has no rest parameters)");
     int required = f->nparams;
     while (required > 0 && f->params[required - 1].dflt) required--;
     if (e->args.len < required || e->args.len > f->nparams) {
@@ -1926,6 +1943,18 @@ static void check_math(Expr *e) {
     for (size_t i = 0; i < sizeof fns / sizeof fns[0]; i++) {
         if (strcmp(fn, fns[i].name) != 0) continue;
         bool minmax = strcmp(fn, "min") == 0 || strcmp(fn, "max") == 0; /* any number of arguments, as in JS */
+        if (minmax && e->args.len == 1 && is_spread(e->args.items[0])) { /* Math.max(...xs): over the array (-Infinity when empty) */
+            Expr *a = e->args.items[0]->lhs;
+            check_expr(a, NULL);
+            Type *at = a->type;
+            if (at->kind != TY_ARRAY || !is_numeric(at->elem)) xs_error(XS7026, a->pos, NULL, "Math.%s(...xs) takes an array of numbers", fn);
+            Pos pos = e->pos;
+            memset(e, 0, sizeof *e);
+            e->kind = E_CALL; e->pos = pos; e->field = -1; e->type = ty_number;
+            e->builtin.cfn = at->elem->kind == TY_NUMBER ? (fn[1] == 'a' ? "xs_math_max_nums" : "xs_math_min_nums") : (fn[1] == 'a' ? "xs_math_max_ints" : "xs_math_min_ints");
+            expr_list_push(&e->args, a);
+            return;
+        }
         if (!minmax && e->args.len != fns[i].nargs)
             xs_error(XS7026, e->pos, NULL, "Math.%s takes %d argument(s), got %d", fn, fns[i].nargs, e->args.len);
         for (int k = 0; k < e->args.len; k++) check_expr(e->args.items[k], NULL);
@@ -3593,6 +3622,11 @@ static void check_expr_in(Expr *e, Type *expected) {
             target->lhs && plain_path(target->lhs) && !(target->lhs->kind == E_IDENT && !lookup(target->lhs->str))) {
             check_expr(target->lhs, NULL); /* a variable or a field path: checking it twice is harmless */
             target->lhs = rec_get_nn(target->lhs);
+            if (target->kind == E_INDEX && target->lhs->type && target->lhs->type->kind == TY_OBJECT && !target->lhs->type->cls->builtin &&
+                !target->lhs->type->cls->is_tuple && target->rhs->kind != E_STRING && target->rhs->kind != E_NUMBER) {
+                check_expr(target->rhs, NULL);
+                if (target->rhs->type->kind == TY_STRING) { xs_note_dynamic(target->pos); to_any(target->lhs); } /* o[k] = v, k: keyof O */
+            }
             if (target->lhs->type && ty_is_any(target->lhs->type)) { /* o.a.f = v with o.a an any (a field, a Record's value) */
                 if (e->op != TK_ASSIGN) xs_error(XS2018, e->pos, "read it, compute, and assign: x.f = x.f + v (or give x its type)", "compound assignment to a field of an any is not supported");
                 Expr *key;
@@ -4158,6 +4192,16 @@ static void check_expr_in(Expr *e, Type *expected) {
             expr_list_push(&e->args, key);
             check_expr(e, expected);
             return;
+        }
+        if (e->lhs->type->kind == TY_OBJECT && !e->lhs->type->cls->is_tuple && !e->lhs->type->cls->builtin && e != dyn_lvalue &&
+            (e->rhs->kind == E_IDENT || (e->rhs->kind == E_MEMBER && !e->rhs->is_call))) {
+            check_expr(e->rhs, NULL);
+            if (e->rhs->type->kind == TY_STRING) { /* o[k] with k: keyof O (a string): the field named k, by name (the dynamic path) */
+                xs_note_dynamic(e->pos);
+                to_any(e->lhs);
+                dyn_call(e, "xs_dyn_get", ty_any, e->lhs, e->rhs, NULL);
+                return;
+            }
         }
         if (e->lhs->type->kind == TY_OBJECT && !e->lhs->type->cls->is_tuple && !e->lhs->type->cls->builtin && e->rhs->kind == E_STRING) {
             e->kind = E_MEMBER; /* o['@timestamp']: the field of that name */
