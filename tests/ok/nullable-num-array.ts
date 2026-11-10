@@ -14,3 +14,8 @@ ys.push(2.5);
 console.log(ys, xs.slice(1, 3), xs.map((v) => v ?? 0));
 const parsed: (number | null)[] = JSON.parse("[1,null,2]");
 console.log(parsed, parsed[1]);
+// join: a null slot is "" (XB-150)
+const joinN: (number | null)[] = [1, null, 2.5, null];
+console.log(joinN.join(","), "|", joinN.join(), "|", joinN.join(" - "));
+const joinI: (int | null)[] = [3, null, 4];
+console.log(joinI.join("-"));

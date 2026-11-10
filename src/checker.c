@@ -235,7 +235,8 @@ static void init_builtins(void) {
     Class *err = bi_class("Error", "xs_Error");
     bi_field(err, "message", ty_string);
     bi_field(err, "name", ty_string);
-    bi_field(err, "cause", ty_unknown); /* an object thrown with throw: the Error carries it */
+    bi_field(err, "__thrown", ty_unknown); /* an object thrown with throw: the Error carries it (instanceof, casts) */
+    bi_field(err, "cause", ty_unknown); /* new Error(message, { cause }) (null when not given) */
 
     bi_class("Date", "xs_Date"); /* members: check_date_member */
     Class *sym = bi_class("symbol", "xs_Symbol"); /* Symbol("desc"): equal only to itself (by reference) */
@@ -7396,10 +7397,23 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
             if (strcmp(c->name, "Error") == 0) {
-                /* new Error(message, { cause }): the options are not kept (xisto's Error has no cause yet) */
-                if (e->args.len == 2 && e->args.items[1]->kind == E_OBJLIT) e->args.len = 1;
-                if (e->args.len > 1) xs_error(XS7069, e->pos, NULL, "new Error() takes at most one argument");
+                /* new Error(message, { cause }): the cause is kept as err.cause, as in JS (other options are ignored) */
+                Expr *cause = NULL;
+                if (e->args.len == 2 && e->args.items[1]->kind == E_OBJLIT) {
+                    Expr *o = e->args.items[1];
+                    for (int k = 0; k < o->args.len; k++)
+                        if (o->keys && o->keys[k] && strcmp(o->keys[k], "cause") == 0) cause = o->args.items[k];
+                    e->args.len = 1;
+                }
+                if (e->args.len > 1) xs_error(XS7069, e->pos, NULL, "new Error() takes a message and an options object ({ cause })");
                 if (e->args.len == 1) { check_expr(e->args.items[0], ty_string); expect_type(e->args.items[0], ty_string, "the Error message"); }
+                if (cause) {
+                    check_expr(cause, ty_unknown);
+                    expect_type(cause, ty_unknown, "the Error cause");
+                    expr_list_push(&e->args, cause);
+                    e->builtin.cfn = "xs_Error_new_cause";
+                    return;
+                }
                 e->builtin.cfn = "xs_Error_new";
                 return;
             }
