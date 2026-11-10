@@ -908,6 +908,7 @@ static void flatten_fields(Class *c, int depth);
 static void flatten_methods(Class *c);
 static void resolve_signature(Func *f);
 static Type *fret(Func *f, Pos pos);
+static Func *lookup_func(const char *name);
 static void ret_infer_stmt(Stmt *s);
 static void ret_infer_begin(Func *f);
 static void ret_infer_end(Func *f, Pos pos);
@@ -1052,6 +1053,23 @@ static Type *resolve(Type *t, Pos pos) {
         for (int i = 0; c && i < c->nmethods; i++) if (strcmp(c->methods[i]->name, dot + 1) == 0) m = c->methods[i];
         if (!m) xs_error(XS9031, pos, NULL, "no method %s", t->tname + 9);
         return fret(m, pos);
+    }
+    if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__ret_of_fn:", 12) == 0) { /* ReturnType<typeof f> */
+        Func *f = lookup_func(t->tname + 12);
+        if (!f || f->ntparams) xs_error(XS1019, pos, "write the type itself", "ReturnType<typeof %s>: no function '%s' here", t->tname + 12, t->tname + 12);
+        Type *r = fret(f, pos);
+        *t = *r; /* (in place: whoever holds it now holds the function's type) */
+        return t;
+    }
+    if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__field_of:", 11) == 0) { /* T['k'] */
+        const char *k = t->tname + 11;
+        Type *o = resolve(t->elem, pos);
+        Type *b = o->kind == TY_NULLABLE ? o->elem : o;
+        Field *fd = b->kind == TY_OBJECT && !b->cls->builtin ? find_field(b->cls, k, NULL) : NULL;
+        if (!fd) xs_error(XS1019, pos, "write the type itself", "%s has no field '%s'", ty_name(o), k);
+        if (!fd->type) xs_error(XS1019, pos, "write the field's type", "the type of %s.%s is not known yet here", b->cls->name, k);
+        *t = *resolve(fd->type, pos);
+        return t;
     }
     switch (t->kind) {
     case TY_TUPLE: { /* in place: whoever holds this type now holds the tuple's object type */
@@ -6699,6 +6717,17 @@ static void check_class_bodies(Class *c) {
 /* items = ['a', 'b'], seen = new Set([1]), limits = { min: 1 }: a field without a written type has its value's */
 static void infer_field_type(Class *c, Field *fd) {
     if (!fd->init) xs_error(XS3011, fd->pos, "fields need an explicit type: base: string;", "field '%s' has no type", fd->name);
+    if (fd->init->kind == E_IDENT && !fd->init->type) {
+        /* rotina = ROTINA_X: a const of this module (the module's code is checked later): its written type, or its literal's */
+        for (int i = 0; i < prog->top.len; i++) {
+            Stmt *st = prog->top.items[i];
+            if (st->kind != S_VAR || st->mod != c->mod || !st->name || strcmp(st->name, fd->init->str) != 0 || !st->is_const) continue;
+            Type *t = st->decl_type ? resolve(st->decl_type, st->pos)
+                    : st->init->kind == E_STRING ? ty_string : st->init->kind == E_BOOL ? ty_boolean : st->init->kind == E_NUMBER ? ty_number : NULL;
+            if (t) { fd->type = t; return; }
+        }
+        xs_error(XS3011, fd->pos, xs_sprintf("write the type: %s: T = %s;", fd->name, fd->init->str), "field '%s' has no type", fd->name);
+    }
     if (!fd->init->type) {
         Class *cc = cur_class;
         cur_class = c;

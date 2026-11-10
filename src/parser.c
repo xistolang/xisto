@@ -333,13 +333,18 @@ static Type *parse_type(Parser *p) {
     } else if (strcmp(n, "ReturnType") == 0 && at(p, TK_LT)) { /* ReturnType<typeof setTimeout>: a timer id */
         Parser look = *p;
         next(&look);
-        bool timer = at_ident(&look, "typeof") && (next(&look), at_ident(&look, "setTimeout") || at_ident(&look, "setInterval"));
-        if (!timer) xs_error(XS1019, name.pos, "write the type itself", "ReturnType<...> is supported for setTimeout and setInterval only");
+        if (!at_ident(&look, "typeof")) xs_error(XS1019, name.pos, "write the type itself", "ReturnType<...> takes typeof a function");
         next(&look);
-        if (!at(&look, TK_GT)) xs_error(XS1019, name.pos, "write the type itself", "ReturnType<...> is supported for setTimeout and setInterval only");
+        Token fn = expect(&look, TK_IDENT, NULL);
+        if (!at(&look, TK_GT)) xs_error(XS1019, name.pos, "write the type itself", "ReturnType<typeof f> takes a function's name");
         next(&look);
         *p = look;
-        t = ty_int;
+        if (strcmp(fn.str, "setTimeout") == 0 || strcmp(fn.str, "setInterval") == 0) t = ty_int;
+        else { /* ReturnType<typeof load>: what load returns (the checker reads it, inferred or written) */
+            t = xs_alloc(sizeof *t);
+            t->kind = TY_TPARAM;
+            t->tname = xs_sprintf("__ret_of_fn:%s", fn.str);
+        }
     }
 
     else if (strcmp(n, "any") == 0)
@@ -418,6 +423,16 @@ static Type *parse_type(Parser *p) {
     }
     while (at(p, TK_LBRACKET)) {
         next(p);
+        if (at(p, TK_STRING)) { /* Input['campo']: the type of that field (the checker reads it) */
+            Type *ix = xs_alloc(sizeof *ix);
+            ix->kind = TY_TPARAM;
+            ix->tname = xs_sprintf("__field_of:%s", p->tok.str);
+            ix->elem = t;
+            next(p);
+            expect(p, TK_RBRACKET, NULL);
+            t = ix;
+            continue;
+        }
         expect(p, TK_RBRACKET, NULL);
         t = ty_array_of(t);
     }
@@ -2159,7 +2174,8 @@ static void parse_fields_body(Parser *p, Class *c) {
                 } else if (at(&look, TK_STRING) || at(&look, TK_TEMPLATE)) { fd.type = ty_string; fd.type_src = "string"; inferred = true; }
                 else if (at(&look, TK_TRUE) || at(&look, TK_FALSE)) { fd.type = ty_boolean; fd.type_src = "boolean"; inferred = true; }
                 else if (at(&look, TK_NUMBER)) { fd.type = ty_number; fd.type_src = "number"; inferred = true; }
-                else if (at(&look, TK_LBRACKET) || at(&look, TK_LBRACE) || at(&look, TK_MINUS) || at(&look, TK_SLASH)) {
+                else if (at(&look, TK_LBRACKET) || at(&look, TK_LBRACE) || at(&look, TK_MINUS) || at(&look, TK_SLASH)
+                         || (at(&look, TK_IDENT) && (peek_is(&look, TK_SEMI) || peek_is(&look, TK_RBRACE)))) {
                     /* items = ['a'], limits = { min: 1 }, re = /x/: typed by the value, which the checker checks first */
                     fd.type = NULL; fd.type_src = NULL; inferred = true;
                 }
