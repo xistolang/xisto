@@ -4,15 +4,15 @@ interface Pedido {
   id: number;
   cliente: string;
   itens: string[];
-  desconto: number | null;
+  desconto: number;
 }
 
 function carrega(id: number) {
-  return { id, cliente: "ana", itens: ["a", "b"], desconto: null as number | null };
+  return { id, cliente: "ana", itens: ["a", "b"], desconto: 0 };
 }
 
 function resumo(c: Pedido["cliente"], itens: Pedido["itens"], d: Pedido["desconto"]): string {
-  return `${c}:${itens.length}:${d ?? 0}`;
+  return `${c}:${itens.length}:${d}`;
 }
 
 const MODO = "rapido";
