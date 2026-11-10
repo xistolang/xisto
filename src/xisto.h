@@ -519,6 +519,7 @@ struct Class {
     int nbase_fields;  /* fields[0..nbase_fields) are inherited */
     bool is_abstract;
     bool iface_methods; /* an interface that declares methods: the base of the class that implements it (checker) */
+    bool iface_base;    /* that interface, made the abstract base: an implementation declares its fields again */
     int region;        /* region.c: its objects live in that loop's region (allocated there, freed per iteration) */
     int rdual;         /* region.c: dual, made inside that loop and outside it too: in the region while an iteration
                           runs (xs_rg_on_N), on the heap otherwise; counted either way, and freed with the region */

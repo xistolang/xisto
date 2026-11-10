@@ -505,7 +505,8 @@ static Type *parse_type(Parser *p) {
         }
     }
 
-    else if (strcmp(n, "any") == 0) { /* the dynamic path: an unknown read and written by name, checked at run time */
+    else if (strcmp(n, "any") == 0 || strcmp(n, "never") == 0) { /* the dynamic path: an unknown read and written by name, checked
+                                                                     at run time (x as never: TypeScript's cast to anything, the same) */
         t = ty_any;
         if (!no_dyn_note) xs_note_dynamic(name.pos);
     }
@@ -529,7 +530,7 @@ static Type *parse_type(Parser *p) {
         expect(p, TK_LT, "write Array<T> or T[]");
         t = ty_array_of(parse_type(p));
         expect(p, TK_GT, NULL);
-    } else if (strcmp(n, "Map") == 0) {
+    } else if (strcmp(n, "Map") == 0 || strcmp(n, "ReadonlyMap") == 0) {
         expect(p, TK_LT, "write Map<K, V>");
         Type *k = parse_type(p);
         expect(p, TK_COMMA, "write Map<K, V>");
@@ -549,7 +550,7 @@ static Type *parse_type(Parser *p) {
         *r = *t;
         r->record = true;
         t = r;
-    } else if (strcmp(n, "Set") == 0) {
+    } else if (strcmp(n, "Set") == 0 || strcmp(n, "ReadonlySet") == 0) { /* (ReadonlySet<T>: a Set the code only reads) */
         expect(p, TK_LT, "write Set<T>");
         t = ty_set_of(parse_type(p));
         expect(p, TK_GT, NULL);
@@ -3680,6 +3681,25 @@ static void parse_reexport(Parser *p, Module *m, Program *prog, bool load_now) {
 static void apply_local_exports(Program *prog, Module *m, int top_start) {
     for (int k = 0; k < m->nlocal_exports; k++) {
         const char *n = m->local_exports[k];
+        /* export { A } / export type { A } of an imported name: re-exported from where it came */
+        for (int i = 0, ni = m->nimports; i < ni; i++) {
+            Import *im = &m->imports[i];
+            if (im->reexport || im->star || im->is_default) continue;
+            bool has = false;
+            for (int q = 0; q < im->n && !has; q++) has = strcmp(im->names[q], n) == 0;
+            if (!has) continue;
+            Import re = *im;
+            re.names = xs_alloc(sizeof(char *));
+            re.names[0] = (char *)n;
+            re.positions = xs_alloc(sizeof(Pos));
+            re.positions[0] = im->pos;
+            re.n = 1;
+            re.reexport = true;
+            m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+            m->imports[m->nimports++] = re;
+            im = &m->imports[i];
+            break;
+        }
         for (int i = 0; i < prog->nfuncs; i++) if (prog->funcs[i]->mod == m && strcmp(prog->funcs[i]->name, n) == 0) prog->funcs[i]->exported = true;
         for (int i = 0; i < prog->nclasses; i++) if (prog->classes[i]->mod == m && strcmp(prog->classes[i]->name, n) == 0) prog->classes[i]->exported = true;
         for (int i = 0; i < prog->nenums; i++) if (prog->enums[i]->mod == m && strcmp(prog->enums[i]->name, n) == 0) prog->enums[i]->exported = true;

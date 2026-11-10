@@ -8370,9 +8370,10 @@ static void emit_func_body(Func *f) {
 static void emit_own_field_inits(Class *c) {
     for (int i = c->nbase_fields; i < c->nfields; i++)
         if (!c->fields[i].init && null_prim(c->fields[i].type)) { nl(); buf_printf(out, "self->%s = %s;", c->fields[i].cname, null_value(c->fields[i].type)); }
-    for (int i = c->nbase_fields; i < c->nfields; i++) {
+    for (int i = 0; i < c->nfields; i++) {
         Field *fd = &c->fields[i];
         if (!fd->init) continue;
+        if (i < c->nbase_fields && fd->owner != c) continue; /* (an interface's field the class gives a value: its own) */
         used_ar = false;
         nl();
         buf_printf(out, "self->%s = ", fd->cname);

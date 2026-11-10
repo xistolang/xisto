@@ -836,6 +836,7 @@ static bool nullable_ok(Type *inner) {
 
 /* ---- generic interfaces: one concrete interface per list of type arguments ---- */
 static Type *resolve(Type *t, Pos pos);
+static Type *ty_numkey(void);
 static Type *subst(Type *t, Class *tmpl, Type **args) {
     switch (t->kind) {
     case TY_OBJECT:
@@ -1070,6 +1071,20 @@ static Type *tuple_type(Type **ps, int n, Pos pos) {
 }
 
 static Binding *lookup(const char *name);
+/* the type a literal has, read before checking (typeof X of a module constant): numbers, strings, booleans and arrays of one of them */
+static Type *literal_type(Expr *e) {
+    if (!e) return NULL;
+    if (e->kind == E_AS) return literal_type(e->lhs);
+    if (e->kind == E_NUMBER) return ty_number;
+    if (e->kind == E_STRING) return ty_string;
+    if (e->kind == E_BOOL) return ty_boolean;
+    if (e->kind == E_ARRAY_LIT && e->args.len) {
+        Type *el = literal_type(e->args.items[0]);
+        for (int i = 1; el && i < e->args.len; i++) if (literal_type(e->args.items[i]) != el) el = NULL;
+        return el ? ty_array_of(el) : NULL;
+    }
+    return NULL;
+}
 static Type *resolve(Type *t, Pos pos) {
     if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__ret_of:", 9) == 0) { /* (generated reflection) */
         const char *dot = strchr(t->tname + 9, '.');
@@ -1088,6 +1103,14 @@ static Type *resolve(Type *t, Pos pos) {
     }
     if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__typeof:", 9) == 0) { /* typeof x */
         Binding *b = lookup(t->tname + 9);
+        if (!b || !b->type) { /* a module constant not checked yet: the type its literal has (const X = ['a', 'b'] as const) */
+            for (int i = 0; i < prog->top.len; i++) {
+                Stmt *st = prog->top.items[i];
+                if (st->kind != S_VAR || st->mod != cur_mod || !st->name || strcmp(st->name, t->tname + 9) != 0 || !st->init) continue;
+                Type *lt = st->decl_type ? resolve(st->decl_type, pos) : literal_type(st->init);
+                if (lt) { *t = *lt; return t; }
+            }
+        }
         if (!b || !b->type) xs_error(XS1019, pos, "write the type itself", "typeof %s: no variable '%s' here (or its type is not known yet)", t->tname + 9, t->tname + 9);
         *t = *b->type;
         return t;
@@ -1115,15 +1138,34 @@ static Type *resolve(Type *t, Pos pos) {
         *t = *o;
         return t;
     }
-    case TY_ARRAY: case TY_SET: case TY_STREAM: t->elem = resolve(t->elem, pos); return t;
+    case TY_SET:
+        t->elem = resolve(t->elem, pos);
+        if (t->elem->kind == TY_NUMBER) t->elem = ty_numkey(); /* Set<number>: whole numbers, as Map<number, V> */
+        if (t->elem->kind == TY_STRING && t->elem->tname) t->elem = ty_string;
+        if (t->elem->kind == TY_UNION) {
+            bool strs = true;
+            for (int i = 0; i < t->elem->nparams; i++) strs = strs && t->elem->params[i]->kind == TY_STRING;
+            if (strs) t->elem = ty_string; /* Set<'a' | 'b'>: strings */
+        }
+        return t;
+    case TY_ARRAY: case TY_STREAM: t->elem = resolve(t->elem, pos); return t;
     case TY_MAP:
         t->key = resolve(t->key, pos);
         t->elem = resolve(t->elem, pos);
+        if (t->key->kind == TY_NUMBER) t->key = ty_numkey(); /* Map<number, V>: keys are whole numbers (ids), checked when one goes in */
+        if (t->key->kind == TY_STRING && t->key->tname) t->key = ty_string; /* Map<'a' | 'b', V>: string keys */
+        if (t->key->kind == TY_UNION) {
+            bool strs = true;
+            for (int i = 0; i < t->key->nparams; i++) strs = strs && t->key->params[i]->kind == TY_STRING;
+            if (strs) t->key = ty_string;
+        }
         if (t->key->kind != TY_STRING && t->key->kind != TY_INT)
             xs_error(XS6035, pos, "Map keys are string or int in xisto", "unsupported Map key type '%s'", ty_name(t->key));
         return t;
     case TY_NULLABLE:
         t->elem = resolve(t->elem, pos);
+        if (t->elem->kind == TY_UNKNOWN) { Type *u = t->elem; *t = *u; return t; } /* unknown | null, x?: unknown: unknown holds null already */
+        if (t->elem->kind == TY_TPARAM) return t; /* T | null in a template's own text: checked per instance */
         if (!nullable_ok(t->elem))
             xs_error(XS2003, pos, "values that can be null: strings, numbers, booleans, enums, arrays, objects, Map and Set", "'%s | null' is not supported", ty_name(t->elem));
         return t;
@@ -1455,7 +1497,7 @@ static void check_type_supported(Pos pos, Type *t) {
         xs_error(XS6037, pos, "Set elements are string or int in xisto", "unsupported Set element type '%s'", ty_name(t));
     if (t->kind == TY_CHAN && (t->elem->kind == TY_VOID || t->elem->kind == TY_FUNC))
         xs_error(XS6040, pos, NULL, "unsupported channel element type '%s'", ty_name(t->elem));
-    if (t->kind == TY_MAP && (t->elem->kind == TY_VOID || t->elem->kind == TY_FUNC || t->elem->kind == TY_NULLABLE))
+    if (t->kind == TY_MAP && (t->elem->kind == TY_VOID || t->elem->kind == TY_FUNC || (t->elem->kind == TY_NULLABLE && !ty_is_heap(t->elem))))
         xs_error(XS6036, pos, NULL, "unsupported Map value type '%s'", ty_name(t->elem));
     if (t->kind == TY_STREAM && (t->elem->kind == TY_FUNC || t->elem->kind == TY_VOID || t->elem->kind == TY_NULLABLE || t->elem->kind == TY_STREAM))
         xs_error(XS6042, pos, NULL, "unsupported stream element type '%s'", ty_name(t->elem));
@@ -1772,7 +1814,27 @@ static bool enter_union(Expr *e, Type *want) {
     e->type = want;
     return true;
 }
+/* the key of a Map<number, V> (an element of a Set<number>): an int, made from a number that must be whole */
+static Type *ty_numkey(void) {
+    static Type *t;
+    if (!t) { t = xs_alloc(sizeof *t); *t = *ty_int; t->tname = "numkey"; }
+    return t;
+}
+static bool is_numkey(Type *t) { return t && t->kind == TY_INT && t->tname && strcmp(t->tname, "numkey") == 0; }
+static void wrap_call(Expr *e, const char *cfn, Type *type) {
+    Expr *a = xs_alloc(sizeof *a);
+    *a = *e;
+    memset(e, 0, sizeof *e);
+    e->kind = E_CALL; e->pos = a->pos; e->field = -1; e->type = type;
+    e->builtin.cfn = cfn;
+    expr_list_push(&e->args, a);
+}
 static void expect_type(Expr *e, Type *want, const char *what) {
+    if (is_numkey(want) && e->type->kind == TY_NUMBER) { wrap_call(e, "xs_num_key", ty_int); return; } /* m.set(id, v), id: number */
+    if (want->kind == TY_ARRAY && is_numkey(want->elem) && e->type->kind == TY_ARRAY && e->type->elem->kind == TY_NUMBER) {
+        wrap_call(e, "xs_num_keys", want); /* new Set<number>(ids) */
+        return;
+    }
     if (ty_is_any(want) && e->type->kind != TY_VOID) { to_any(e); return; } /* (null too: an any may be null) */
     if (ty_is_any(e->type) && want->kind != TY_VOID && want->kind != TY_UNKNOWN && dyn_to(e, want)) return;
     if ((want->kind == TY_NUMBER || (want->kind == TY_NULLABLE && want->elem->kind == TY_NUMBER)) && widen_inferred(e)) return;
@@ -6990,6 +7052,18 @@ static void flatten_fields(Class *c, int depth) {
         }
     int inherited = n;
     for (int k = 0; k < c->nfields; k++) {
+        bool again = false;
+        for (int j = 0; j < inherited && c->base && c->base->iface_base; j++)
+            if (strcmp(all[j].name, c->fields[k].name) == 0) { /* readonly rotina = "A" of interface Proc { rotina: string; ... } */
+                Field f = all[j];
+                f.init = c->fields[k].init;
+                f.pos = c->fields[k].pos;
+                f.readonly = c->fields[k].readonly; /* (the implementation's own: it assigns it) */
+                f.owner = c;
+                all[j] = f;
+                again = true;
+            }
+        if (again) continue;
         for (int j = 0; j < inherited; j++)
             if (strcmp(all[j].name, c->fields[k].name) == 0)
                 xs_error(XS9022, c->fields[k].pos, "a subclass keeps the base's fields: assign it in the constructor instead", "field '%s' is already declared in %s", c->fields[k].name, nb == 1 ? bases[0]->name : "a base");
@@ -7047,8 +7121,9 @@ static void flatten_methods(Class *c) {
 
 static void check_field_init(Class *c) {
     if (c->is_interface) return; /* object literals fill interfaces */
-    for (int i = c->nbase_fields; i < c->nfields; i++) {
+    for (int i = 0; i < c->nfields; i++) {
         Field *fd = &c->fields[i];
+        if (i < c->nbase_fields && fd->owner != c) continue;
         if (fd->init || fd->optional) continue;
         bool assigned = false;
         if (c->ctor) {
@@ -7134,9 +7209,10 @@ static Type *fret(Func *f, Pos pos) {
 /* a class's field initializers, constructor and methods */
 static void check_class_bodies(Class *c) {
     enter_module(c->mod);
-    for (int k = c->nbase_fields; k < c->nfields; k++) { /* the inherited ones were checked in their class */
+    for (int k = 0; k < c->nfields; k++) { /* the inherited ones were checked in their class */
         Field *fd = &c->fields[k];
         if (!fd->init) continue;
+        if (k < c->nbase_fields && fd->owner != c) continue; /* (an interface's field this class gives a value) */
         cur_class = c;
         RECOVER_BEGIN
             if (!fd->init->type) check_expr(fd->init, fd->type); /* (an inferred field's value gave its type: checked) */
@@ -7293,11 +7369,12 @@ void check_program(Program *p) {
         Class *c = p->classes[i];
         if (!c->iface_methods || !c->is_interface) continue;
         enter_module(c->mod);
-        if (c->nfields || c->ntparams || c->niface_bases)
+        if (c->ntparams || c->niface_bases) /* (fields: the base's, which the implementation declares again) */
             xs_error(XS8113, c->pos, "keep the methods in an interface of their own (or use an abstract class)",
                      "interface '%s' has methods and %s", c->name, c->ntparams ? "type parameters" : c->nfields ? "fields" : "bases");
         c->is_interface = false;
         c->is_abstract = true;
+        c->iface_base = true;
     }
     for (int i = 0; i < p->nclasses; i++) {
         Class *c = p->classes[i];
