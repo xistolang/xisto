@@ -1,4 +1,5 @@
 import { setTimeout } from "node:timers/promises";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 function echo(req: HttpRequest): HttpResponse {
   return HttpResponse.json(`{"method":"${req.method}","token":"${req.header("X-Token")}","body":${req.body}}`);
@@ -23,9 +24,28 @@ async function publish(req: HttpRequest): Promise<HttpResponse> {
   return HttpResponse.text("sent");
 }
 
+// node:async_hooks: each request runs in its own store, which must survive its awaits while others interleave
+const requestId = new AsyncLocalStorage<string>();
+
+async function whoAmI(): Promise<string> {
+  await setTimeout(5);
+  return requestId.getStore() ?? "none";
+}
+
+async function ctx(req: HttpRequest): Promise<HttpResponse> {
+  const id = req.query("id");
+  const ms: int = Math.trunc(Number(req.query("ms")));
+  return requestId.run(id, async (): Promise<HttpResponse> => {
+    await setTimeout(ms);
+    const seen = await whoAmI();
+    return HttpResponse.text(`${id}=${requestId.getStore() ?? "none"}/${seen}`);
+  });
+}
+
 const app: Server = new Server();
 app.get("/wait", wait);
 app.post("/publish", publish);
 app.post("/echo", echo);
 app.get("/slow", slow);
+app.get("/ctx", ctx);
 app.listen(8080);
