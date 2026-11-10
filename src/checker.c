@@ -6756,6 +6756,7 @@ static void infer_field_type(Class *c, Field *fd) {
 void check_program(Program *p) {
     prog = p;
     init_builtins();
+    if (nsev_s) cap_sev = nsev_s; /* (the array was cut to that size: its capacity too, or the next event writes past it) */
     for (int i = 0; i < p->nfuncs; i++) sym_add(&funcs_by_name, p->funcs[i]->name, p->funcs[i]);
     for (int i = 0; i < p->nclasses; i++) sym_add(&classes_by_name, p->classes[i]->name, p->classes[i]);
     for (int i = 0; i < p->nenums; i++) sym_add(&enums_by_name, p->enums[i]->name, p->enums[i]);
