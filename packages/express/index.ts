@@ -128,12 +128,23 @@ export class Response {
     return this.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
   }
 
-  /** Sends a text body and ends the response; Content-Type defaults to text/html, as in Express. */
-  send(body: string): Response {
-    if (this.getHeader("Content-Type") === null) {
-      this.setHeader("Content-Type", "text/html; charset=utf-8");
+  /**
+   * Sends a body and ends the response. A string: Content-Type defaults to text/html, as in Express. A Buffer:
+   * its bytes as they are, Content-Type application/octet-stream unless one is set (res.send(xlsx)).
+   */
+  send(body: string | Buffer): Response {
+    if (typeof body === "string") {
+      if (this.getHeader("Content-Type") === null) {
+        this.setHeader("Content-Type", "text/html; charset=utf-8");
+      }
+      this.text = body;
+      this.finished = true;
+      return this;
     }
-    this.text = body;
+    if (this.getHeader("Content-Type") === null) {
+      this.setHeader("Content-Type", "application/octet-stream");
+    }
+    this.text = body.toString("xisto:raw");
     this.finished = true;
     return this;
   }

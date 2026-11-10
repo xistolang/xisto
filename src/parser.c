@@ -322,8 +322,10 @@ static Type *parse_type(Parser *p) {
         if (at_ident(&look, "is")) {
             *p = look;
             next(p);
-            parse_type(p);
-            return ty_boolean;
+            Type *b = xs_alloc(sizeof *b); /* a boolean that says what its argument is (elem): filter narrows by it */
+            *b = *ty_boolean;
+            b->elem = parse_type(p);
+            return b;
         }
     }
     accept(p, TK_PIPE); /* type T =\n  | "a"\n  | "b": a union may open with '|' */
@@ -1306,6 +1308,7 @@ static Expr *parse_postfix(Parser *p) {
             m->lhs = e;
             m->str = name.str;
             if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from")) wants_arrays = true;
+            if (!strcmp(name.str, "length") && at(p, TK_ASSIGN)) wants_arrays = true; /* xs.length = 0 */
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs); /* obj.m<T>(x) */
             if (at(p, TK_LPAREN)) {
                 m->is_call = true;
@@ -4023,6 +4026,11 @@ static const char xs_arrays_src[] =
     "  const out: T[] = [];\n"
     "  for (let i = 0; i < n; i++) out.push(f());\n"
     "  return out;\n"
+    "}\n"
+    "export function __xs_truncate<T>(xs: T[], n: int): int {\n"
+    "  if (n > xs.length) throw new Error(\"RangeError: xisto cannot make an array longer by setting its length\");\n"
+    "  while (xs.length > n) xs.pop();\n"
+    "  return n;\n"
     "}\n"
     "export function __xs_flat<U>(xs: U[][]): U[] {\n"
     "  const out: U[] = [];\n"
