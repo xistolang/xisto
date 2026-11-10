@@ -176,6 +176,28 @@ async function main(): Promise<void> {
   const ra: Result<object, number[]> = await conn.execute("begin :1 := :2 + 1; end;", [after, inb]);
   console.log("depois", JSON.stringify(ra.outBinds));
 
+  // long IN strings of a block: up to 32767 bytes as VARCHAR2
+  const sizes: int[] = [5000, 32767];
+  for (const n of sizes) {
+    const len: BindParameter = { dir: BIND_OUT, type: NUMBER };
+    const r: Result<object, number[]> = await conn.execute("begin :1 := length(:2); end;", [len, "y".repeat(n)]);
+    console.log("in longo", n, JSON.stringify(r.outBinds));
+  }
+
+  // over 32767 bytes: a temporary CLOB / BLOB (multibyte text, bytes back through a BLOB OUT)
+  const longText = "ação-" + "çé".repeat(20000) + "-fim";
+  const n2: BindParameter = { dir: BIND_OUT, type: NUMBER };
+  const t2: BindParameter = { dir: BIND_OUT, type: STRING, maxSize: 40 };
+  const rl: Result<object, object> = await conn.execute("begin :1 := dbms_lob.getlength(:2); :3 := dbms_lob.substr(:2, 12, 1) || '|' || dbms_lob.substr(:2, 6, dbms_lob.getlength(:2) - 5); end;", [n2, longText, t2]);
+  console.log("clob in", JSON.stringify(rl.outBinds));
+  const raw = new Uint8Array(70000);
+  for (let i = 0; i < raw.length; i++) raw[i] = (i * 7) % 256;
+  const bin: BindParameter = { dir: BIND_IN, type: BLOB, val: raw };
+  const bn: BindParameter = { dir: BIND_OUT, type: NUMBER };
+  const bh: BindParameter = { dir: BIND_OUT, type: STRING, maxSize: 40 };
+  const rbb: Result<object, object> = await conn.execute("begin :1 := dbms_lob.getlength(:2); :3 := rawtohex(dbms_lob.substr(:2, 6, 1)) || '|' || rawtohex(dbms_lob.substr(:2, 6, 69995)); end;", [bn, bin, bh]);
+  console.log("blob in", JSON.stringify(rbb.outBinds));
+
   // many calls on one connection (temporary LOBs freed as they go)
   let sum = 0;
   for (let i = 0; i < 300; i++) {
