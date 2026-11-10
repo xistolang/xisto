@@ -1,6 +1,6 @@
 // typeorm against a live PostgreSQL (tests/typeorm/run.sh points it at the xisto-pg container): repository,
 // query builder, raw queries and transactions on a table of its own, dropped at the end
-import { Column, DataSource, Entity, In, LessThanOrEqual, PrimaryColumn } from "typeorm";
+import { Column, DataSource, Entity, In, LessThanOrEqual, PrimaryColumn, QueryFailedError } from "typeorm";
 
 @Entity("typeorm_test_item")
 class Item {
@@ -86,6 +86,7 @@ async function main(): Promise<void> {
     await ds.query("SELECT * FROM typeorm_no_such_table", []);
   } catch (e) {
     console.log("error: " + (e.message.indexOf("typeorm_no_such_table") >= 0 ? "relation missing" : e.message));
+    if (e instanceof QueryFailedError) console.log(e.name, e.query, e.parameters.length, e.driverError.message === e.message);
   }
   await ds.query("DROP TABLE typeorm_test_item");
   await ds.destroy();

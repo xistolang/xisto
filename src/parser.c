@@ -17,6 +17,7 @@ typedef struct {
     char **alias_from, **alias_to;
     int nalias;
     StmtList pending;     /* declarations a destructuring adds after its own (const [a, b] = e) */
+    bool no_in;           /* a for (...) header: `in` there starts for...in, not the operator */
 } Parser;
 
 /* generics: the type parameters in scope while a template is parsed, or their types while an instance is */
@@ -119,6 +120,36 @@ static Type *named_type(Parser *p, Token name) {
 static Program *parsing_prog;
 static Module *parsing_mod;
 static void add_class(Program *prog, Class *c);
+static void parse_fields_body(Parser *p, Class *c);
+/* PartialType(A) / OmitType(A, ["k"] as const) / PickType(A, ["k"]) / IntersectionType(A, B), name already read */
+static Mixin *parse_mixin_rest(Parser *p, Token name) {
+    Mixin *m = xs_alloc(sizeof *m);
+    m->pos = name.pos;
+    if (!at(p, TK_LPAREN)) { m->cls = name.str; return m; }
+    if (strcmp(name.str, "PartialType") && strcmp(name.str, "OmitType") && strcmp(name.str, "PickType") && strcmp(name.str, "IntersectionType"))
+        xs_error(XS6022, name.pos, "extend PartialType(A), OmitType(A, [...]), PickType(A, [...]) or IntersectionType(A, B), or a class", "a class cannot extend the result of '%s(...)'", name.str);
+    m->kind = name.str;
+    next(p);
+    m->a = parse_mixin_rest(p, expect(p, TK_IDENT, NULL));
+    if (accept(p, TK_COMMA) && !at(p, TK_RPAREN)) {
+        if (strcmp(m->kind, "IntersectionType") == 0) m->b = parse_mixin_rest(p, expect(p, TK_IDENT, NULL));
+        else {
+            expect(p, TK_LBRACKET, "the keys as an array: OmitType(A, [\"id\"] as const)");
+            while (!at(p, TK_RBRACKET)) {
+                Token k = expect(p, TK_STRING, "the keys are strings");
+                m->keys = realloc(m->keys, sizeof(char *) * (size_t)(m->nkeys + 1));
+                m->keys[m->nkeys++] = k.str;
+                if (!accept(p, TK_COMMA)) break;
+            }
+            expect(p, TK_RBRACKET, NULL);
+            if (at_ident(p, "as")) { next(p); next(p); } /* as const */
+        }
+    }
+    accept(p, TK_COMMA);
+    expect(p, TK_RPAREN, NULL);
+    return m;
+}
+static Type *union_of(Type *a, Type *b);
 static bool peek_is(Parser *p, TokKind k);
 static bool looks_like_type_args(Parser *p);
 static int parse_type_args(Parser *p, Type ***out);
@@ -136,9 +167,53 @@ static bool looks_like_fn_type(Parser *p) {
     return fn;
 }
 static Type *union_of(Type *a, Type *b);
+/* { a: T; b?: U }: an object type written in place is an interface of its own, named from its text (the same text,
+   tokens apart from spacing, is the same interface, so values of one place pass to another) */
+static Type *parse_inline_object_type(Parser *p) {
+    const char *open = p->tok.start;
+    Pos pos = p->tok.pos;
+    Class *c = xs_alloc(sizeof *c);
+    c->pos = pos;
+    c->is_interface = true;
+    c->name = "(inline)";
+    parse_fields_body(p, c);
+    const char *close = p->prev_end;
+    /* the key: the tokens of the body without spacing (and the module: a type written in one file is that file's) */
+    Buf key = {0};
+    for (const char *q = open; q < close; q++) if (!isspace((unsigned char)*q)) buf_putc(&key, *q);
+    if (nsubst) for (int i = 0; i < nsubst; i++) buf_printf(&key, "|%s", subst_names[i]); /* (an instance: its own copy) */
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < key.len; i++) { h ^= (unsigned char)key.data[i]; h *= 1099511628211ULL; }
+    if (nsubst) h ^= (uint64_t)(uintptr_t)subst_types; /* (types bound per instance: a different interface per instance) */
+    free(key.data);
+    const char *name = xs_sprintf("__Obj_%016llx", (unsigned long long)h);
+    Program *prog = p->prog;
+    for (int i = 0; i < prog->nclasses; i++)
+        if (prog->classes[i]->mod == p->mod && strcmp(prog->classes[i]->name, name) == 0) return ty_object_of(prog->classes[i]);
+    c->name = name;
+    c->mod = p->mod;
+    c->exported = true; /* (a parameter's type: the caller's module names it too) */
+    add_class(prog, c);
+    return ty_object_of(c);
+}
+
 static Type *parse_type(Parser *p) {
     Type *t;
     accept(p, TK_PIPE); /* type T =\n  | "a"\n  | "b": a union may open with '|' */
+    if (at(p, TK_LBRACE)) { /* { a: T; b?: U }: an object type in place */
+        t = parse_inline_object_type(p);
+        while (at(p, TK_LBRACKET)) {
+            next(p);
+            expect(p, TK_RBRACKET, NULL);
+            t = ty_array_of(t);
+        }
+        if (at(p, TK_PIPE)) {
+            next(p);
+            if (at_ident(p, "null")) { next(p); t = ty_nullable_of(t); if (accept(p, TK_PIPE)) t = union_of(t, parse_type(p)); }
+            else t = union_of(t, parse_type(p));
+        }
+        return t;
+    }
     if (at(p, TK_LBRACKET)) { /* [A, B]: a tuple */
         next(p);
         Type **ps = NULL;
@@ -234,7 +309,13 @@ static Type *parse_type(Parser *p) {
         t = ty_stream_of(parse_type(p));
         while (accept(p, TK_COMMA)) parse_type(p);
         expect(p, TK_GT, NULL);
-    } else if (strcmp(n, "Array") == 0) {
+    } else if (strcmp(n, "readonly") == 0) { /* readonly T[]: T[] (that it is not written to is TypeScript's check) */
+        t = parse_type(p);
+    } else if (strcmp(n, "Readonly") == 0) { /* Readonly<T>: T */
+        expect(p, TK_LT, "write Readonly<T>");
+        t = parse_type(p);
+        expect(p, TK_GT, NULL);
+    } else if (strcmp(n, "Array") == 0 || strcmp(n, "ReadonlyArray") == 0) {
         expect(p, TK_LT, "write Array<T> or T[]");
         t = ty_array_of(parse_type(p));
         expect(p, TK_GT, NULL);
@@ -245,6 +326,18 @@ static Type *parse_type(Parser *p) {
         Type *v = parse_type(p);
         expect(p, TK_GT, NULL);
         t = ty_map_of(k, v);
+    } else if (strcmp(n, "Record") == 0) { /* Record<K, V>: a Map read and written as an object */
+        expect(p, TK_LT, "write Record<K, V>");
+        Type *k = parse_type(p);
+        expect(p, TK_COMMA, "write Record<K, V>");
+        Type *v = parse_type(p);
+        expect(p, TK_GT, NULL);
+        t = ty_map_of(k->kind == TY_STRING && k->tname ? ty_string : k, v); /* (a key union of literals: string keys) */
+        if (t->key->kind == TY_UNION) t->key = ty_string;
+        Type *r = xs_alloc(sizeof *r);
+        *r = *t;
+        r->record = true;
+        t = r;
     } else if (strcmp(n, "Set") == 0) {
         expect(p, TK_LT, "write Set<T>");
         t = ty_set_of(parse_type(p));
@@ -820,6 +913,21 @@ static Expr *parse_postfix(Parser *p) {
 }
 
 static Expr *parse_unary(Parser *p) {
+    if (at_ident(p, "delete") && peek_is(p, TK_IDENT)) { /* delete m[k] / delete m.k: m.delete(k) (a Record, a Map) */
+        Pos dpos = p->tok.pos;
+        next(p);
+        Expr *t = parse_unary(p);
+        Expr *key;
+        if (t->kind == E_INDEX) key = t->rhs;
+        else if (t->kind == E_MEMBER && !t->is_call) { key = new_expr(E_STRING, t->pos); key->str = t->str; }
+        else xs_error(XS1021, dpos, "delete an entry of a Record: delete m[key]", "expected an expression but found 'delete'");
+        Expr *call = new_expr(E_MEMBER, dpos);
+        call->lhs = t->lhs;
+        call->str = "delete";
+        call->is_call = true;
+        expr_list_push(&call->args, key);
+        return call;
+    }
     if (at_ident(p, "typeof")) { /* typeof x: "string", "number", "boolean", "object", "function" */
         Expr *e = new_expr(E_UNARY, p->tok.pos);
         e->op = TK_IDENT;
@@ -940,8 +1048,13 @@ static Expr *parse_rel_base(Parser *p);
 /* x instanceof C: the class name is kept in the right operand as an identifier */
 static Expr *parse_rel(Parser *p) {
     Expr *e = parse_rel_base(p);
-    while (at_ident(p, "instanceof")) {
+    while (at_ident(p, "instanceof") || (at_ident(p, "in") && !p->no_in)) {
         Pos pos = p->tok.pos;
+        if (at_ident(p, "in")) { /* "key" in obj */
+            next(p);
+            e = binary(TK_IN, pos, e, parse_rel_base(p));
+            continue;
+        }
         next(p);
         Expr *c = new_expr(E_IDENT, p->tok.pos);
         c->str = expect(p, TK_IDENT, "write a class name: x instanceof Foo").str;
@@ -1272,7 +1385,26 @@ static Stmt *parse_stmt(Parser *p) {
                         s->body = parse_loop_body(p);
                         return s;
                     }
-                    if (at_ident(p, "in")) xs_error(XS6010, p->tok.pos, "use for (const x of array) or a classic for loop", "'for...in' is not supported");
+                    if (at_ident(p, "in")) { /* for (const k in obj): for (const k of Object.keys(obj)) */
+                        Pos ipos = p->tok.pos;
+                        next(p);
+                        Expr *obj = parse_expr(p);
+                        Expr *ns = new_expr(E_IDENT, ipos);
+                        ns->str = "Object";
+                        Expr *call = new_expr(E_MEMBER, ipos);
+                        call->lhs = ns;
+                        call->str = "keys";
+                        call->is_call = true;
+                        expr_list_push(&call->args, obj);
+                        s->kind = S_FOROF;
+                        s->name = name.str;
+                        s->is_const = is_const;
+                        s->decl_type = dt;
+                        s->expr = call;
+                        expect(p, TK_RPAREN, NULL);
+                        s->body = parse_loop_body(p);
+                        return s;
+                    }
                 }
                 *p = save;
             }
@@ -1641,7 +1773,9 @@ static Class *parse_class_ex(Parser *p, bool abstract) {
     if (at_ident(p, "extends")) {
         next(p);
         c->base_pos = p->tok.pos;
-        c->base_name = expect(p, TK_IDENT, NULL).str;
+        Token bt = expect(p, TK_IDENT, NULL);
+        if (at(p, TK_LPAREN)) c->mixin = parse_mixin_rest(p, bt); /* extends PartialType(CreateDto) */
+        else c->base_name = bt.str;
         if (at(p, TK_LT)) xs_error(XS6022, p->tok.pos, NULL, "extending a generic class is not supported yet");
     }
     if (at_ident(p, "implements")) { /* recorded; the methods are what the framework calls */

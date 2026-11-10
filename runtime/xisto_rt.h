@@ -1722,6 +1722,29 @@ XS_NOINLINE void *xs_Error_wrap(xs_str *name, void *cause) {
     e->f_cause = xs_retain(cause); /* the argument is borrowed */
     return e;
 }
+/* throw obj, obj of a class that extends Error: its first fields are message and name, laid out as xs_Error's */
+XS_NOINLINE void *xs_Error_wrap_err(void *cause) {
+    struct { xs_hdr hdr; xs_str *message; xs_str *name; } *o = cause;
+    xs_Error *e = xs_Error_new(o->message);
+    xs_release(e->f_name);
+    e->f_name = xs_retain(o->name);
+    e->f_cause = xs_retain(cause); /* the argument is borrowed */
+    return e;
+}
+/* String(err): "name: message", or the one that is not empty (an Error, or an object of a class that extends Error:
+   both start with message and name) */
+XS_NOINLINE xs_str *xs_Error_to_string(void *v) {
+    struct { xs_hdr hdr; xs_str *message; xs_str *name; } *o = v;
+    if (!o->message->len) return xs_retain(o->name);
+    if (!o->name->len) return xs_retain(o->message);
+    xs_str *sep = xs_str_new(": ", 2), *a = xs_str_concat(o->name, sep), *r = xs_str_concat(a, o->message);
+    xs_release(sep); xs_release(a);
+    return r;
+}
+/* the object a caught Error was thrown as (an object of a class that extends Error), or NULL */
+static inline void *xs_Error_thrown(void *v) {
+    return v && xs_type_of(v)->free == xs_Error_free ? ((xs_Error *)v)->f_cause : NULL;
+}
 static inline bool xs_is_a(void *v, void (*free_fn)(void *)) { return v && free_fn && xs_type_of(v)->free == free_fn; }
 /* e.stack: "Error: message" and one "    at ..." line per frame, as in Node; borrowed from the Error */
 static xs_str *xs_Error_stack(xs_Error *e) {
@@ -1802,6 +1825,7 @@ typedef struct xs_map {
     size_t norder, order_cap;
     size_t cap, count, used; /* used: live and deleted slots (what fills the table) */
     bool is_map, str_keys;
+    bool record;  /* a Record<string, V> (an object used as a dictionary): printed as { a: 1 }, written to JSON as one */
     bool compact; /* a Map<int, int> whose keys and values all fit in 32 bits so far: 8-byte slots (key low, value
                      high), read only by the counting idiom (xs_map_add_i) and put; anything else widens it first */
     int val_kind; /* 0 num, 1 int, 2 bool, 3 heap pointer */
@@ -1906,10 +1930,31 @@ static void xs_print_num_v(void *p) { xs_print_num(*(double *)p); }
 static void xs_print_int_v(void *p) { xs_print_int(*(int64_t *)p); }
 static void xs_print_bool_v(void *p) { xs_print_bool(*(int64_t *)p != 0); }
 
-/* Node style: Map(2) { 'a' => 1, 'b' => 2 }  Set(2) { 1, 2 } */
+/* Node style: Map(2) { 'a' => 1, 'b' => 2 }  Set(2) { 1, 2 }; a record: { a: 1, 'b-c': 2 } */
+static void xs_print_key_ident(xs_str *k) { /* an object key as Node shows it: bare when it is an identifier, else quoted */
+    bool ident = k->len > 0 && !(k->data[0] >= '0' && k->data[0] <= '9');
+    for (int64_t i = 0; i < k->len && ident; i++) {
+        char c = k->data[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '$' || (unsigned char)c >= 0x80)) ident = false;
+    }
+    if (ident) fwrite(k->data, 1, (size_t)k->len, XS_OUT); else xs_print_str_quoted_(k);
+}
 static void xs_print_map(void *p) {
     xs_map *m = p;
     xs_insp fr;
+    if (m->record) {
+        if (!xs_insp_begin(&fr, p, "Object", m->count ? NULL : "{}")) return;
+        xs_map_entry *e;
+        XS_MAP_EACH(m, e) {
+            xs_insp_entry(&fr);
+            xs_print_key_ident(e->skey);
+            fputs(": ", XS_OUT);
+            if (m->val_kind == 3) { if (e->val.p) m->print_val(e->val.p); else fputs("null", XS_OUT); }
+            else m->print_val(&e->val);
+        }
+        xs_insp_end(&fr, "{", "}", false, false, false);
+        return;
+    }
     if (!xs_insp_begin(&fr, p, m->is_map ? "Map" : "Set", m->count ? NULL : m->is_map ? "Map(0) {}" : "Set(0) {}")) return;
     size_t shown = 0;
     xs_map_entry *e;
@@ -1939,6 +1984,7 @@ static void xs_map_alloc(xs_map *m, size_t cap) {
     m->used = 0;
 }
 
+static inline xs_map *xs_map_rec(xs_map *m) { m->record = true; return m; } /* (a Record<string, V>: see xs_map.record) */
 static xs_map *xs_map_new(int is_map, int str_keys, int val_kind, void (*print_key)(void *), void (*print_val)(void *)) {
     xs_map *m = xs_obj_alloc(sizeof *m, xs_map_free, xs_print_map);
     m->is_map = is_map != 0;
@@ -3372,6 +3418,7 @@ XS_NOINLINE bool xs_json_bool(xs_jv *v, const char *where) {
 }
 XS_NOINLINE xs_str *xs_json_str(xs_jv *v, const char *where) { if (v->kind != XJ_STR) xs_panicf("JSON: '%s' must be a string", where); return xs_str_new(v->str, v->slen); }
 XS_NOINLINE xs_jv *xs_json_arr(xs_jv *v, const char *where) { if (v->kind != XJ_ARR) xs_panicf("JSON: '%s' must be an array", where); return v; }
+XS_NOINLINE xs_jv *xs_json_obj(xs_jv *v, const char *where) { if (v->kind != XJ_OBJ) xs_panicf("JSON: '%s' must be an object", where); return v; }
 
 /* stringify helpers: generated code appends into an xs_sb */
 static void xs_sb_put(xs_sb *b, const char *s, size_t n) {

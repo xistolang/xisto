@@ -136,22 +136,25 @@ function metadataById(id: string, name: string): EntityMetadata {
   return m;
 }
 
-// TypeORM's error classes, for code that names them; a failed query throws an Error with the driver's message
-export class EntityMetadataNotFoundError {
-  readonly name: string = "EntityMetadataNotFoundError";
-  readonly message: string;
+// TypeORM's error classes: a failed query throws a QueryFailedError with the driver's message and error
+export class EntityMetadataNotFoundError extends Error {
   constructor(entity: string) {
-    this.message = `No metadata for "${entity}" was found.`;
+    super(`No metadata for "${entity}" was found.`);
+    this.name = "EntityMetadataNotFoundError";
   }
 }
 
-export class QueryFailedError {
-  readonly name: string = "QueryFailedError";
-  readonly message: string;
+export class QueryFailedError extends Error {
   readonly query: string;
-  constructor(query: string, message: string) {
-    this.message = message;
+  readonly parameters: unknown[];
+  /** the driver's own error ("ORA-00942: ...", "relation ... does not exist") */
+  readonly driverError: Error;
+  constructor(query: string, parameters: unknown[], driverError: Error) {
+    super(driverError.message);
+    this.name = "QueryFailedError";
     this.query = query;
+    this.parameters = parameters;
+    this.driverError = driverError;
   }
 }
 
@@ -859,9 +862,7 @@ export class Executor {
       }
       return await this.dataSource.driver().run(sql, params);
     } catch (e) {
-      // TypeORM's QueryFailedError carries the driver's message ("ORA-00942: ...", "relation ... does not exist"):
-      // an Error with that message, so e.message reads the same
-      throw new Error(e.message);
+      throw new QueryFailedError(sql, params, e);
     }
   }
   async rows(sql: string, params: unknown[]): Promise<object> {

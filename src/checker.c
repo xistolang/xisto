@@ -1374,6 +1374,7 @@ static bool json_ok(Type *t, int depth) {
     case TY_NUMBER: case TY_INT: case TY_BOOLEAN: case TY_STRING: case TY_ENUM: return true;
     case TY_JSON: return true; /* embedded as it is */
     case TY_ARRAY: case TY_NULLABLE: return json_ok(t->elem, depth + 1);
+    case TY_MAP: return t->record && t->key->kind == TY_STRING && json_ok(t->elem, depth + 1); /* a Record: an object */
     case TY_OBJECT:
         if (t->cls->builtin) return strcmp(t->cls->name, "Date") == 0; /* as its ISO text */
         for (int i = 0; i < t->cls->nfields; i++)
@@ -1410,6 +1411,18 @@ static Expr *copy_target(Expr *x);
 static void check_loose_eq(Expr *e);
 static bool rereadable(Expr *e);
 static Expr *expr_copy(Expr *e);
+/* rec[k] / rec.k (a Record's get, V | null) read as an object: as in JavaScript, a missing entry is a TypeError */
+static Expr *rec_get_nn(Expr *x) {
+    if (!(x->type && x->type->kind == TY_NULLABLE && x->kind == E_MEMBER && x->is_call && strcmp(x->str, "get") == 0 &&
+          x->lhs->type && x->lhs->type->kind == TY_MAP && x->lhs->type->record)) return x;
+    Expr *nn = xs_alloc(sizeof *nn);
+    nn->kind = E_AS; nn->op = TK_NOT; nn->pos = x->pos; nn->field = -1;
+    nn->lhs = x;
+    nn->type = x->type->elem;
+    return nn;
+}
+/* x, this, x.a.b before checking: a path with no call in it, safe to check twice */
+static bool plain_path(Expr *e) { return e->kind == E_IDENT || e->kind == E_THIS || (e->kind == E_MEMBER && !e->is_call && e->op != TK_QDOT && plain_path(e->lhs)); }
 static const char **member_names(Class *c, int *n);
 static bool always_returns(Stmt *s);
 static void check_block(Stmt *b);
@@ -2040,6 +2053,16 @@ static void check_map_member(Expr *e) {
     Type *k = is_map ? t->key : t->elem;
     Type *v = t->elem;
     const char *m = e->str;
+    if (!e->is_call && is_map && t->record) { /* m.k on a Record: m.get("k") */
+        Expr *key = xs_alloc(sizeof *key);
+        key->kind = E_STRING; key->pos = e->pos; key->field = -1; key->str = (char *)m;
+        key->type = ty_string; key->lit_id = intern(m);
+        e->str = "get";
+        e->is_call = true;
+        e->args = (ExprList){0};
+        expr_list_push(&e->args, key);
+        m = e->str;
+    }
     if (!e->is_call) {
         if (strcmp(m, "size") == 0) { e->type = ty_int; e->builtin.cfn = "size"; return; }
         xs_error(XS8015, e->pos, is_map ? "Map has: size, get, set, has, delete, clear, keys, values, entries" : "Set has: size, add, has, delete, clear, values", "%s has no property '%s'", ty_name(t), m);
@@ -2096,6 +2119,119 @@ static bool is_subclass(Class *sub, Class *base) {
     return false;
 }
 /* the constructor `new C(...)` runs: its own, or the nearest base's */
+/* class X extends Error: fields message and name come first, laid out as the runtime's Error (xs_Error_wrap_err
+   reads them when the object is thrown); without a constructor, X's is constructor(message = "") { super(message) } */
+static void error_class(Class *c) {
+    c->extends_error = true;
+    const char *names[2] = {"message", "name"}, *inits[2] = {"", "Error"};
+    for (int k = 1; k >= 0; k--) { /* name, then message in front of it */
+        int at = -1;
+        for (int i = 0; i < c->nfields; i++) if (strcmp(c->fields[i].name, names[k]) == 0) at = i;
+        Field f;
+        if (at >= 0) { /* declared by the class (name = "QueryFailedError"): moved to the front */
+            f = c->fields[at];
+            memmove(&c->fields[1], &c->fields[0], sizeof(Field) * (size_t)at);
+        } else {
+            memset(&f, 0, sizeof f);
+            f.name = (char *)names[k];
+            f.pos = c->pos;
+            f.type = ty_string;
+            f.type_src = "string";
+            f.owner = c;
+            f.init = str_lit(c->pos, inits[k]);
+            c->fields = realloc(c->fields, sizeof(Field) * (size_t)(c->nfields + 1));
+            c->cap_fields = c->nfields + 1;
+            memmove(&c->fields[1], &c->fields[0], sizeof(Field) * (size_t)c->nfields);
+            c->nfields++;
+        }
+        c->fields[0] = f;
+    }
+    if (c->ctor) return;
+    Func *f = xs_alloc(sizeof *f);
+    f->name = "constructor";
+    f->pos = c->pos;
+    f->mod = c->mod;
+    f->cls = c;
+    f->is_ctor = true;
+    f->ret = ty_void;
+    f->exported = c->exported;
+    f->params = xs_alloc(sizeof(Param));
+    f->nparams = 1;
+    f->params[0].name = "message";
+    f->params[0].type = ty_string;
+    f->params[0].type_src = "string";
+    f->params[0].dflt = str_lit(c->pos, "");
+    Expr *sup = xs_alloc(sizeof *sup), *arg = xs_alloc(sizeof *arg), *call = xs_alloc(sizeof *call);
+    sup->kind = E_IDENT; sup->pos = c->pos; sup->str = "super"; sup->field = -1;
+    arg->kind = E_IDENT; arg->pos = c->pos; arg->str = "message"; arg->field = -1;
+    call->kind = E_CALL; call->pos = c->pos; call->lhs = sup; call->field = -1;
+    expr_list_push(&call->args, arg);
+    Stmt *st = xs_alloc(sizeof *st), *body = xs_alloc(sizeof *body);
+    st->kind = S_EXPR; st->pos = c->pos; st->expr = call;
+    body->kind = S_BLOCK; body->pos = c->pos;
+    stmt_list_push(&body->stmts, st);
+    f->body = body;
+    c->ctor = f;
+}
+/* class X extends PartialType(Y): Y's fields (its bases' first) copied into X, optional for PartialType, without
+   the keys OmitType leaves out or with only those PickType keeps; X extends nothing (as in Nest, a new class) */
+typedef struct { Field *f; int n; } FieldSet;
+static void mixin_eval(Mixin *m, FieldSet *out);
+static void apply_mixin(Class *c);
+static void fs_add(FieldSet *out, Field f) {
+    for (int i = 0; i < out->n; i++) if (strcmp(out->f[i].name, f.name) == 0) { out->f[i] = f; return; } /* redeclared below */
+    out->f = realloc(out->f, sizeof(Field) * (size_t)(out->n + 1));
+    out->f[out->n++] = f;
+}
+static void class_fields_all(Class *k, FieldSet *out) {
+    if (k->mixin && !k->mixin_done) { Module *was = cur_mod; apply_mixin(k); enter_module(was); }
+    if (k->base_name) {
+        Module *was = cur_mod;
+        enter_module(k->mod);
+        Class *b = find_class(k->base_name);
+        enter_module(was);
+        if (b && !b->builtin) class_fields_all(b, out);
+    }
+    for (int i = 0; i < k->nfields; i++) fs_add(out, k->fields[i]);
+}
+static bool key_in(Mixin *m, const char *name) {
+    for (int i = 0; i < m->nkeys; i++) if (strcmp(m->keys[i], name) == 0) return true;
+    return false;
+}
+static void mixin_eval(Mixin *m, FieldSet *out) {
+    if (!m->kind) {
+        Class *k = find_class(m->cls);
+        if (!k || k->builtin) xs_error(XS9031, m->pos, NULL, "unknown class '%s'", m->cls);
+        Module *was = cur_mod;
+        enter_module(k->mod);
+        class_fields_all(k, out);
+        enter_module(was);
+        return;
+    }
+    FieldSet a = {0};
+    mixin_eval(m->a, &a);
+    bool partial = strcmp(m->kind, "PartialType") == 0, omit = strcmp(m->kind, "OmitType") == 0, pick = strcmp(m->kind, "PickType") == 0;
+    for (int i = 0; i < a.n; i++) {
+        Field f = a.f[i];
+        if ((omit && key_in(m, f.name)) || (pick && !key_in(m, f.name))) continue;
+        if (partial && !f.optional) {
+            f.optional = true; /* (the initializer stays: Nest's mapped types inherit them) */
+            f.type = ty_optional_of(f.type);
+        }
+        fs_add(out, f);
+    }
+    if (m->b) mixin_eval(m->b, out);
+}
+static void apply_mixin(Class *c) {
+    if (c->mixin_done) return;
+    c->mixin_done = true;
+    FieldSet fs = {0};
+    mixin_eval(c->mixin, &fs);
+    for (int i = 0; i < c->nfields; i++) fs_add(&fs, c->fields[i]);
+    for (int i = 0; i < fs.n; i++) fs.f[i].owner = c;
+    c->fields = fs.f;
+    c->nfields = c->cap_fields = fs.n;
+}
 static Func *eff_ctor(Class *c) {
     for (; c; c = c->base) if (c->ctor) return c->ctor;
     return NULL;
@@ -2747,6 +2883,44 @@ static void check_expr(Expr *e, Type *expected) {
         return;
     case E_BINARY:
         if (e->op == TK_QQ) { check_nullish(e, expected); return; }
+        if (e->op == TK_IN) { /* "k" in m: m.has(k) on a Record; on an object, whether the field is there */
+            check_expr(e->rhs, NULL);
+            Type *rt = e->rhs->type;
+            if (rt->kind == TY_MAP && rt->record) {
+                Expr *key = e->lhs;
+                e->kind = E_MEMBER;
+                e->lhs = e->rhs;
+                e->rhs = NULL;
+                e->str = "has";
+                e->is_call = true;
+                e->args = (ExprList){0};
+                expr_list_push(&e->args, key);
+                check_expr(e, expected);
+                return;
+            }
+            Type *ot = ty_strip_null(rt);
+            if (ot->kind == TY_OBJECT && !ot->cls->builtin && e->lhs->kind == E_STRING) {
+                Field *fd = find_field(ot->cls, e->lhs->str, NULL);
+                if (fd && fd->optional) { /* "f" in o: o.f is there (an optional field left out is not) */
+                    Expr *mem = xs_alloc(sizeof *mem);
+                    mem->kind = E_MEMBER; mem->pos = e->pos; mem->field = -1; mem->lhs = e->rhs; mem->str = e->lhs->str;
+                    Expr *nul = xs_alloc(sizeof *nul);
+                    nul->kind = E_NULL; nul->pos = e->pos; nul->field = -1;
+                    e->op = TK_NEQ;
+                    e->lhs = mem;
+                    e->rhs = nul;
+                    check_expr(e, expected);
+                    return;
+                }
+                bool has = fd != NULL || find_method(ot->cls, e->lhs->str) != NULL;
+                e->kind = E_BOOL;
+                e->boolean = has;
+                e->lhs = e->rhs = NULL;
+                e->type = ty_boolean;
+                return;
+            }
+            xs_error(XS8015, e->pos, "use it on a Record<string, V> or an object with a string literal key: \"name\" in obj", "'in' needs a Record or an object and a key written in place");
+        }
         if ((e->op == TK_STARSTAR || tk_bitop(e->op)) && fold_lit_int(e)) { /* 2 ** 53, 1 << 4: a literal, typed by its use */
             check_expr(e, expected);
             return;
@@ -2811,8 +2985,10 @@ static void check_expr(Expr *e, Type *expected) {
             /* x === null || x.f : the right side runs when the left is false, so x is not null there */
             NSet fs = {0};
             narrow_set(e->lhs, false, &fs);
+            UNarrow un = union_narrow(e->lhs); /* !(e instanceof X) || e.code: X on the right */
             push_scope();
-            shadow_set(&fs);
+            if (un.b && un.else_t) shadow_union(un.b, un.else_t);
+            else shadow_set(&fs);
             check_expr(e->rhs, NULL);
             pop_scope();
         } else if (e->op == TK_IDENT) { /* instanceof: the right side is a class name, checked below */
@@ -2962,6 +3138,40 @@ static void check_expr(Expr *e, Type *expected) {
             e->rhs = qq;
         }
         Expr *target = e->lhs;
+        if (e->kind == E_ASSIGN && ((target->kind == E_INDEX) || (target->kind == E_MEMBER && !target->is_call && target->str)) &&
+            target->lhs && plain_path(target->lhs) && !(target->lhs->kind == E_IDENT && !lookup(target->lhs->str))) {
+            check_expr(target->lhs, NULL); /* a variable or a field path: checking it twice is harmless */
+            target->lhs = rec_get_nn(target->lhs);
+            if (target->lhs->type && target->lhs->type->kind == TY_MAP && target->lhs->type->record) { /* m[k] = v: m.set(k, v) */
+                Expr *key;
+                if (target->kind == E_INDEX) key = target->rhs;
+                else {
+                    key = xs_alloc(sizeof *key);
+                    key->kind = E_STRING; key->pos = target->pos; key->field = -1; key->str = target->str;
+                }
+                Expr *val = e->rhs;
+                if (e->op != TK_ASSIGN) { /* m[k] += v: m.set(k, m.get(k) + v) */
+                    TokKind op = e->op == TK_PLUS_ASSIGN ? TK_PLUS : e->op == TK_MINUS_ASSIGN ? TK_MINUS : e->op == TK_STAR_ASSIGN ? TK_STAR : TK_SLASH;
+                    Expr *get = xs_alloc(sizeof *get);
+                    get->kind = E_MEMBER; get->pos = target->pos; get->field = -1; get->lhs = target->lhs; get->str = "get"; get->is_call = true;
+                    expr_list_push(&get->args, key);
+                    Expr *bin = xs_alloc(sizeof *bin);
+                    bin->kind = E_BINARY; bin->pos = e->pos; bin->field = -1; bin->op = op; bin->lhs = get; bin->rhs = val;
+                    val = bin;
+                }
+                Expr *map = target->lhs;
+                e->kind = E_MEMBER;
+                e->lhs = map;
+                e->rhs = NULL;
+                e->str = "set";
+                e->is_call = true;
+                e->args = (ExprList){0};
+                expr_list_push(&e->args, key);
+                expr_list_push(&e->args, val);
+                check_expr(e, NULL);
+                return;
+            }
+        }
         const char *path_assigned = NULL; /* o.f = v: the field path, narrowed or not by what v is */
         if (e->kind == E_ASSIGN && target->kind == E_MEMBER && !target->is_call && rereadable(target->lhs) &&
             !(target->lhs->kind == E_IDENT && !lookup(target->lhs->str))) { /* obj.x = v with set x(v) (not Class.static) */
@@ -3122,6 +3332,20 @@ static void check_expr(Expr *e, Type *expected) {
         if (e->lhs->kind != E_IDENT) xs_error(XS6030, e->pos, NULL, "only named functions can be called");
         if (strcmp(e->lhs->str, "super") == 0 && !lookup("super")) { /* super(...): the base's constructor on this object */
             Class *cc = cur_func ? cur_func->cls : NULL;
+            if (cur_func && cur_func->is_ctor && cc && cc->extends_error) { /* Error's constructor: super(message, { cause }?) */
+                if (e->args.len > 2) xs_error(XS8027, e->pos, NULL, "the constructor of Error takes 0 to 2 argument(s), got %d", e->args.len);
+                Expr *msg = e->args.len ? e->args.items[0] : str_lit(e->pos, "");
+                Expr *self = xs_alloc(sizeof *self), *fm = xs_alloc(sizeof *fm);
+                self->kind = E_THIS; self->pos = e->pos; self->field = -1;
+                fm->kind = E_MEMBER; fm->pos = e->pos; fm->lhs = self; fm->str = "message"; fm->field = -1;
+                memset(&e->args, 0, sizeof e->args);
+                e->kind = E_ASSIGN;
+                e->op = TK_ASSIGN;
+                e->lhs = fm;
+                e->rhs = msg;
+                check_expr(e, NULL);
+                return;
+            }
             if (!cur_func || !cur_func->is_ctor || !cc || !cc->base)
                 xs_error(XS8125, e->pos, NULL, "super(...) is called in the constructor of a class that extends another");
             Func *bc = eff_ctor(cc->base);
@@ -3229,6 +3453,8 @@ static void check_expr(Expr *e, Type *expected) {
                 else if (a->type->kind == TY_STRING) e->builtin.cfn = "xs_retain_str";
                 else if (is_big(a->type)) e->builtin.cfn = "xs_big_to_string";
                 else if (a->type->kind == TY_ENUM) e->builtin.cfn = a->type->en->is_string ? "xs_retain_str" : "xs_str_from_int";
+                else if (a->type->kind == TY_OBJECT && (is_error_class(a->type->cls) || (a->type->cls->builtin && strcmp(a->type->cls->name, "Error") == 0)))
+                    e->builtin.cfn = "xs_Error_to_string"; /* "Name: message", as Error.prototype.toString */
                 else xs_error(XS7040, a->pos, NULL, "String() converts int, number or boolean, but this is %s", ty_name(a->type));
                 e->type = ty_string;
                 return;
@@ -3399,6 +3625,17 @@ static void check_expr(Expr *e, Type *expected) {
     }
     case E_INDEX:
         check_expr(e->lhs, NULL);
+        if (e->lhs->type->kind == TY_MAP && e->lhs->type->record) { /* m[k] on a Record: m.get(k) */
+            Expr *key = e->rhs;
+            e->kind = E_MEMBER;
+            e->str = "get";
+            e->is_call = true;
+            e->rhs = NULL;
+            e->args = (ExprList){0};
+            expr_list_push(&e->args, key);
+            check_expr(e, expected);
+            return;
+        }
         if (e->lhs->type->kind == TY_NULLABLE) xs_error(XS2015, e->pos, "check it first: if (x !== null) { ... }", "indexed value may be null");
         check_expr(e->rhs, ty_int);
         if (e->lhs->type->kind == TY_OBJECT && e->lhs->type->cls->is_tuple) { /* t[0]: its field (the index is a constant) */
@@ -3443,6 +3680,39 @@ static void check_expr(Expr *e, Type *expected) {
         e->type = e->lhs->type->elem;
         return;
     case E_MEMBER:
+        if (e->is_call && e->str && e->lhs && e->lhs->kind == E_IDENT && strcmp(e->lhs->str, "Object") == 0 && !lookup("Object") &&
+            (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")) && e->args.len == 1) {
+            /* Object.keys(m) / values / entries: of a Record, its entries' (m.keys()...); of an object, its fields' names */
+            Expr *o = e->args.items[0];
+            check_expr(o, NULL);
+            Type *ot = o->type;
+            if (ot->kind == TY_MAP && ot->record) {
+                e->lhs = o;
+                e->args = (ExprList){0};
+                check_expr(e, expected);
+                return;
+            }
+            Type *st = ty_strip_null(ot);
+            if (!strcmp(e->str, "keys") && st->kind == TY_OBJECT && !st->cls->builtin) {
+                Class *c = st->cls;
+                bool opt = false;
+                for (int i = 0; i < c->nfields; i++) if (c->fields[i].optional) opt = true;
+                if (opt) xs_error(XS8015, e->pos, "keep the keys in a Record<string, V>, or list the fields you need", "Object.keys of %s, which has optional fields, is not supported yet", c->name);
+                e->kind = E_ARRAY_LIT;
+                e->lhs = NULL;
+                e->str = NULL;
+                e->is_call = false;
+                e->args = (ExprList){0};
+                for (int i = 0; i < c->nfields; i++) {
+                    Expr *k = xs_alloc(sizeof *k);
+                    k->kind = E_STRING; k->pos = e->pos; k->field = -1; k->str = (char *)c->fields[i].name;
+                    expr_list_push(&e->args, k);
+                }
+                check_expr(e, ty_array_of(ty_string));
+                return;
+            }
+            xs_error(XS8015, e->pos, "Object.keys, values and entries take a Record<string, V> (and keys, an object)", "Object.%s of %s is not supported", e->str, ty_name(ot));
+        }
         if (e->is_call && e->str && strcmp(e->str, "write") == 0 && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->str &&
             (strcmp(e->lhs->str, "stdout") == 0 || strcmp(e->lhs->str, "stderr") == 0) && e->lhs->lhs->kind == E_IDENT &&
             strcmp(e->lhs->lhs->str, "process") == 0 && !lookup("process")) { /* process.stdout.write(text or bytes) */
@@ -3714,6 +3984,7 @@ static void check_expr(Expr *e, Type *expected) {
             return;
         }
         check_expr(e->lhs, NULL);
+        e->lhs = rec_get_nn(e->lhs);
         if (e->lhs->type->kind == TY_NULLABLE) {
             if (xs_check_mode && after_optional_dot(e->pos)) xs_error_quiet(); /* x?.name: the '?.' was counted where it is */
             xs_error(XS2006, e->pos, "check it first: if (x !== null) { ... }  (fields need a local copy: const v = this.f;)", "'%s' may be null", e->str);
@@ -4154,6 +4425,27 @@ static void check_expr(Expr *e, Type *expected) {
             t = pick;
         }
         if (t && t->kind == TY_JSON) { anon_objlit(e); return; }
+        if (t && t->kind == TY_MAP && t->record) { /* a Record<K, V> written as { a: 1, b: 2 }: new Map([["a", 1], ["b", 2]]) */
+            Expr *arr = xs_alloc(sizeof *arr);
+            arr->kind = E_ARRAY_LIT; arr->pos = e->pos; arr->field = -1;
+            for (int i = 0; i < e->args.len; i++) {
+                Expr *pair = xs_alloc(sizeof *pair);
+                pair->kind = E_ARRAY_LIT; pair->pos = e->args.items[i]->pos; pair->field = -1;
+                Expr *k = xs_alloc(sizeof *k);
+                k->kind = E_STRING; k->pos = pair->pos; k->field = -1; k->str = e->keys[i];
+                expr_list_push(&pair->args, k);
+                expr_list_push(&pair->args, e->args.items[i]);
+                expr_list_push(&arr->args, pair);
+            }
+            e->kind = E_NEW_MAP;
+            e->elem_type = t;
+            e->args = (ExprList){0};
+            e->keys = NULL;
+            if (arr->args.len) expr_list_push(&e->args, arr);
+            check_expr(e, t);
+            e->type = t;
+            return;
+        }
         if (!t || t->kind != TY_OBJECT)
             xs_error(XS3006, e->pos, "give it a type: const t: Todo = { ... };  (declare Todo with interface or class)", "an object literal needs a declared type here");
         Class *c = t->cls;
@@ -4971,6 +5263,23 @@ static Expr *union_ident(Expr *e) { /* x, or x seen through a narrowing */
 }
 static UNarrow union_narrow(Expr *c) {
     UNarrow r = {0};
+    if (c->kind == E_UNARY && c->op == TK_NOT) { /* !(x instanceof C): the branches swap */
+        r = union_narrow(c->lhs);
+        Type *t = r.then_t;
+        r.then_t = r.else_t;
+        r.else_t = t;
+        return r;
+    }
+    if (c->kind == E_BINARY && (c->op == TK_AND || c->op == TK_OR)) {
+        /* a caught Error narrowed on one side: (e instanceof X && ...) true, (!(e instanceof X) || ...) false */
+        UNarrow a = union_narrow(c->lhs);
+        bool err = a.b && a.b->type->kind == TY_OBJECT && a.b->type->cls->builtin && strcmp(a.b->type->cls->name, "Error") == 0;
+        if (!err) return r;
+        r.b = a.b;
+        if (c->op == TK_AND) r.then_t = a.then_t;
+        else r.else_t = a.else_t;
+        return r;
+    }
     if (c->kind != E_BINARY) return r;
     bool neg = c->op == TK_NEQ;
     Expr *id = NULL, *lit = NULL;
@@ -4987,6 +5296,12 @@ static UNarrow union_narrow(Expr *c) {
     if (!id) return r;
     Binding *b = lookup(id->str);
     if (!b) return r;
+    if (how == 2 && !neg && b->type->kind == TY_OBJECT && b->type->cls->builtin && strcmp(b->type->cls->name, "Error") == 0 &&
+        c->rhs->cls && is_error_class(c->rhs->cls)) { /* catch (e) { if (e instanceof HttpException) ... }: e is the thrown object */
+        r.b = b;
+        r.then_t = ty_object_of(c->rhs->cls);
+        return r;
+    }
     Type *u = b->type;
     bool nul = u->kind == TY_NULLABLE && u->elem->kind == TY_UNION; /* number | string | null: null stays on the other side */
     if (nul) u = u->elem;
@@ -5156,6 +5471,18 @@ static void check_stmt(Stmt *s) {
         check_expr(s->expr, NULL);
         Class *err = find_class("Error");
         Type *t = s->expr->type;
+        if (t->kind == TY_OBJECT && is_error_class(t->cls)) {
+            /* an object of a class that extends Error: an Error with its message and name, the object its cause */
+            Expr *v = expr_copy(s->expr);
+            Expr *w = xs_alloc(sizeof *w);
+            w->kind = E_CALL;
+            w->pos = v->pos;
+            w->builtin.cfn = "xs_Error_wrap_err";
+            w->type = ty_object_of(err);
+            expr_list_push(&w->args, v);
+            s->expr = w;
+            return;
+        }
         if (t->kind == TY_OBJECT && t->cls != err && !t->cls->builtin) {
             /* any object can be thrown, as in JavaScript: it travels as an Error whose cause is the object */
             Expr *v = expr_copy(s->expr);
@@ -6076,6 +6403,7 @@ void check_program(Program *p) {
     for (int i = 0; i < p->nclasses; i++) {
         Class *c = p->classes[i];
         enter_module(c->mod);
+        if (c->mixin) apply_mixin(c);
         if (c->base_name) {
             Class *b = find_class(c->base_name);
             if (!b) {
@@ -6084,6 +6412,7 @@ void check_program(Program *p) {
                 xs_error(XS9031, c->base_pos, xs_help_suggest(c->base_name, cands, n, NULL), "unknown class '%s'", c->base_name);
             }
             if (b->is_interface) xs_error(XS9004, c->base_pos, xs_sprintf("class %s implements %s", c->name, b->name), "'%s' is an interface; a class extends classes", b->name);
+            if (b->builtin && strcmp(b->name, "Error") == 0) { error_class(c); continue; }
             if (b->builtin) xs_error(XS6024, c->base_pos, "wrap it in a field instead", "extending the built-in class %s is not supported", b->name);
             c->base = b;
             b->subs = realloc(b->subs, sizeof(Class *) * (size_t)(b->nsubs + 1));

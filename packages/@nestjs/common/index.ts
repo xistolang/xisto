@@ -80,12 +80,14 @@ export enum HttpStatus {
  * @example throw new HttpException({ message: "taken", statusCode: 409 }, 409)
  */
 @Injectable()
-export class HttpException {
+export class HttpException extends Error {
   readonly response: object;
   readonly status: int;
   /** The class's name, which @Catch(SomeException) compares (set by each built-in exception). */
   exceptionName: string = "HttpException";
   constructor(response: object, status: int) {
+    super(HttpException.messageOf(response));
+    this.name = "HttpException";
     this.response = response;
     this.status = status;
   }
@@ -96,8 +98,8 @@ export class HttpException {
     return this.response;
   }
   /** The message Nest gives the error: the body's message, or the description. */
-  get message(): string {
-    const text = JSON.stringify(this.response);
+  static messageOf(response: object): string {
+    const text = JSON.stringify(response);
     if (text.startsWith("\"")) {
       return JSON.parse(text) as string;
     }
@@ -127,6 +129,7 @@ export class BadRequestException extends HttpException {
   constructor(message: string = "", description: string = "Bad Request") {
     super(HttpException.createBody(message, description, HttpStatus.BAD_REQUEST), HttpStatus.BAD_REQUEST);
     this.exceptionName = "BadRequestException";
+    this.name = "BadRequestException";
   }
 }
 @Injectable()
@@ -134,6 +137,7 @@ export class UnauthorizedException extends HttpException {
   constructor(message: string = "", description: string = "Unauthorized") {
     super(HttpException.createBody(message, description, HttpStatus.UNAUTHORIZED), HttpStatus.UNAUTHORIZED);
     this.exceptionName = "UnauthorizedException";
+    this.name = "UnauthorizedException";
   }
 }
 @Injectable()
@@ -141,6 +145,7 @@ export class ForbiddenException extends HttpException {
   constructor(message: string = "", description: string = "Forbidden") {
     super(HttpException.createBody(message, description, HttpStatus.FORBIDDEN), HttpStatus.FORBIDDEN);
     this.exceptionName = "ForbiddenException";
+    this.name = "ForbiddenException";
   }
 }
 @Injectable()
@@ -148,6 +153,7 @@ export class NotFoundException extends HttpException {
   constructor(message: string = "", description: string = "Not Found") {
     super(HttpException.createBody(message, description, HttpStatus.NOT_FOUND), HttpStatus.NOT_FOUND);
     this.exceptionName = "NotFoundException";
+    this.name = "NotFoundException";
   }
 }
 @Injectable()
@@ -155,6 +161,7 @@ export class MethodNotAllowedException extends HttpException {
   constructor(message: string = "", description: string = "Method Not Allowed") {
     super(HttpException.createBody(message, description, HttpStatus.METHOD_NOT_ALLOWED), HttpStatus.METHOD_NOT_ALLOWED);
     this.exceptionName = "MethodNotAllowedException";
+    this.name = "MethodNotAllowedException";
   }
 }
 @Injectable()
@@ -162,6 +169,7 @@ export class NotAcceptableException extends HttpException {
   constructor(message: string = "", description: string = "Not Acceptable") {
     super(HttpException.createBody(message, description, HttpStatus.NOT_ACCEPTABLE), HttpStatus.NOT_ACCEPTABLE);
     this.exceptionName = "NotAcceptableException";
+    this.name = "NotAcceptableException";
   }
 }
 @Injectable()
@@ -169,6 +177,7 @@ export class RequestTimeoutException extends HttpException {
   constructor(message: string = "", description: string = "Request Timeout") {
     super(HttpException.createBody(message, description, HttpStatus.REQUEST_TIMEOUT), HttpStatus.REQUEST_TIMEOUT);
     this.exceptionName = "RequestTimeoutException";
+    this.name = "RequestTimeoutException";
   }
 }
 @Injectable()
@@ -176,6 +185,7 @@ export class ConflictException extends HttpException {
   constructor(message: string = "", description: string = "Conflict") {
     super(HttpException.createBody(message, description, HttpStatus.CONFLICT), HttpStatus.CONFLICT);
     this.exceptionName = "ConflictException";
+    this.name = "ConflictException";
   }
 }
 @Injectable()
@@ -183,6 +193,7 @@ export class GoneException extends HttpException {
   constructor(message: string = "", description: string = "Gone") {
     super(HttpException.createBody(message, description, HttpStatus.GONE), HttpStatus.GONE);
     this.exceptionName = "GoneException";
+    this.name = "GoneException";
   }
 }
 @Injectable()
@@ -190,6 +201,7 @@ export class PreconditionFailedException extends HttpException {
   constructor(message: string = "", description: string = "Precondition Failed") {
     super(HttpException.createBody(message, description, HttpStatus.PRECONDITION_FAILED), HttpStatus.PRECONDITION_FAILED);
     this.exceptionName = "PreconditionFailedException";
+    this.name = "PreconditionFailedException";
   }
 }
 @Injectable()
@@ -197,6 +209,7 @@ export class PayloadTooLargeException extends HttpException {
   constructor(message: string = "", description: string = "Payload Too Large") {
     super(HttpException.createBody(message, description, HttpStatus.PAYLOAD_TOO_LARGE), HttpStatus.PAYLOAD_TOO_LARGE);
     this.exceptionName = "PayloadTooLargeException";
+    this.name = "PayloadTooLargeException";
   }
 }
 @Injectable()
@@ -204,6 +217,7 @@ export class UnsupportedMediaTypeException extends HttpException {
   constructor(message: string = "", description: string = "Unsupported Media Type") {
     super(HttpException.createBody(message, description, HttpStatus.UNSUPPORTED_MEDIA_TYPE), HttpStatus.UNSUPPORTED_MEDIA_TYPE);
     this.exceptionName = "UnsupportedMediaTypeException";
+    this.name = "UnsupportedMediaTypeException";
   }
 }
 @Injectable()
@@ -211,6 +225,7 @@ export class UnprocessableEntityException extends HttpException {
   constructor(message: string = "", description: string = "Unprocessable Entity") {
     super(HttpException.createBody(message, description, HttpStatus.UNPROCESSABLE_ENTITY), HttpStatus.UNPROCESSABLE_ENTITY);
     this.exceptionName = "UnprocessableEntityException";
+    this.name = "UnprocessableEntityException";
   }
 }
 @Injectable()
@@ -218,6 +233,7 @@ export class InternalServerErrorException extends HttpException {
   constructor(message: string = "", description: string = "Internal Server Error") {
     super(HttpException.createBody(message, description, HttpStatus.INTERNAL_SERVER_ERROR), HttpStatus.INTERNAL_SERVER_ERROR);
     this.exceptionName = "InternalServerErrorException";
+    this.name = "InternalServerErrorException";
   }
 }
 @Injectable()
@@ -225,6 +241,7 @@ export class NotImplementedException extends HttpException {
   constructor(message: string = "", description: string = "Not Implemented") {
     super(HttpException.createBody(message, description, HttpStatus.NOT_IMPLEMENTED), HttpStatus.NOT_IMPLEMENTED);
     this.exceptionName = "NotImplementedException";
+    this.name = "NotImplementedException";
   }
 }
 @Injectable()
@@ -232,6 +249,7 @@ export class BadGatewayException extends HttpException {
   constructor(message: string = "", description: string = "Bad Gateway") {
     super(HttpException.createBody(message, description, HttpStatus.BAD_GATEWAY), HttpStatus.BAD_GATEWAY);
     this.exceptionName = "BadGatewayException";
+    this.name = "BadGatewayException";
   }
 }
 @Injectable()
@@ -239,6 +257,7 @@ export class ServiceUnavailableException extends HttpException {
   constructor(message: string = "", description: string = "Service Unavailable") {
     super(HttpException.createBody(message, description, HttpStatus.SERVICE_UNAVAILABLE), HttpStatus.SERVICE_UNAVAILABLE);
     this.exceptionName = "ServiceUnavailableException";
+    this.name = "ServiceUnavailableException";
   }
 }
 @Injectable()
@@ -246,6 +265,7 @@ export class GatewayTimeoutException extends HttpException {
   constructor(message: string = "", description: string = "Gateway Timeout") {
     super(HttpException.createBody(message, description, HttpStatus.GATEWAY_TIMEOUT), HttpStatus.GATEWAY_TIMEOUT);
     this.exceptionName = "GatewayTimeoutException";
+    this.name = "GatewayTimeoutException";
   }
 }
 
