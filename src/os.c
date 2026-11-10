@@ -324,3 +324,15 @@ long long xs_tree_size(const char *dir, int *count) {
     if (count) *count = n;
     return total;
 }
+
+/* --pkgs DIR: packages installed outside the project (a checkout that must stay untouched). The children of
+   xisto check read it from XISTO_PKGS. */
+bool xs_use_pkgs_dir(const char *dir) {
+    char abs[PATH_MAX];
+    if (!xs_real_path(dir, abs)) {
+        fprintf(stderr, "xisto: --pkgs: '%s' is not a folder\n", dir);
+        return false;
+    }
+    xs_setenv("XISTO_PKGS", abs);
+    return true;
+}

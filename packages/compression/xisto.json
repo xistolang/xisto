@@ -1,0 +1,8 @@
+{
+  "name": "compression",
+  "version": "0.1.0",
+  "license": "MIT",
+  "implements": { "compression": "^1" },
+  "main": "index.ts",
+  "dependencies": { "express": "0.1.0" }
+}

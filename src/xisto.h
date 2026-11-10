@@ -144,6 +144,7 @@ const char *xs_tmp_base(void);
 char *xs_make_temp_dir(const char *prefix);
 const char *xs_home(void);
 char *xs_real_path(const char *path, char *out);
+bool xs_use_pkgs_dir(const char *dir);
 int xs_ncpus(void);
 int xs_pid(void);
 void xs_list_files(const char *dir, const char *suf1, const char *suf2, char ***out, int *n);
@@ -434,6 +435,7 @@ struct Func {
     /* generic functions and methods (function f<T>(x: T): T): a template, instantiated per list of types */
     char **tparams;
     int ntparams;
+    Type **tdefaults;  /* <T = string>: the type a parameter takes when nothing binds it (NULL: none) */
     void *gen_state;   /* the parser where the parameters start: each instance is parsed again with T bound */
     void *gen_subst;   /* the substitution in force where it was written (a generic method of a generic class's instance) */
     bool gen_method;

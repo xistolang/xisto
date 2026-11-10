@@ -1,0 +1,8 @@
+{
+  "name": "nestjs-pino",
+  "version": "0.1.0",
+  "license": "MIT",
+  "implements": { "nestjs-pino": "^4" },
+  "main": "index.ts",
+  "dependencies": { "@nestjs/common": "0.1.0" }
+}

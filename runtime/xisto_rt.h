@@ -3443,7 +3443,8 @@ static xs_str *xs_sb_finish(xs_sb *b) {
     free(b->data);
     return s;
 }
-/* a parsed JSON value back as its text (an `object` field read from JSON keeps the value's JSON) */
+
+/* a parsed JSON value back as its text, with JSON's own number spelling (packages/typeorm's native code) */
 static void xs_sb_jstr(xs_sb *b, const char *p, size_t n) {
     xs_sb_put(b, "\"", 1);
     for (size_t i = 0; i < n; i++) {
@@ -4389,6 +4390,7 @@ static xs_arr_ref *xs_argv;
 static xs_map *xs_env;
 static xs_arr_ref *xs_process_argv(void) { return xs_argv; }
 static xs_map *xs_process_env(void) { return xs_env; }
+static int64_t xs_process_pid(void) { return (int64_t)getpid(); } /* process.pid */
 static void xs_process_exit(int64_t code) { fflush(stdout); exit((int)code); }
 /* process.stdout.write / process.stderr.write: through the same FILE as console.log, so the order is kept */
 static inline void xs_out_drain(void);
