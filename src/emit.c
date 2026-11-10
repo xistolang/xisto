@@ -3139,7 +3139,9 @@ static void emit_expr_raw(Expr *e) {
             }
             buf_puts(out, "xs_is_a(");
             emit_expr(e->lhs);
-            buf_printf(out, ", %s)", strcmp(c->name, "Error") == 0 ? "xs_Error_free" : c->builtin ? "NULL" : xs_sprintf("%s_free", c->cname));
+            buf_printf(out, ", %s)", strcmp(c->name, "Error") == 0 ? "xs_Error_free" : c->builtin && strcmp(c->name, "Date") == 0 ? "xs_Date_free" :
+                       c->builtin && (strcmp(c->name, "Uint8Array") == 0 || strcmp(c->name, "Buffer") == 0) ? "xs_u8_free" :
+                       c->builtin ? "NULL" : xs_sprintf("%s_free", c->cname));
             return;
         }
         if ((e->op == TK_EQ || e->op == TK_NEQ) && (null_prim(e->lhs->type) || null_prim(e->rhs->type)) &&
