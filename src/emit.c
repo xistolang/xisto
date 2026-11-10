@@ -808,6 +808,7 @@ static const char *ctype(Type *t) {
     case TY_MAP: case TY_SET: return "xs_map *";
     case TY_STREAM: return "xs_stream *";
     case TY_CHAN: return "xs_chan *";
+    case TY_PROMISE: return "xs_promise *";
     }
     return "?";
 }
@@ -913,7 +914,7 @@ static const char *map_val_printer(Type *v) {
 static bool is_fresh(Expr *e) {
     if (!rcnt(e->type)) return false;
     switch (e->kind) {
-    case E_CALL: case E_NEW_OBJ: case E_ARRAY_LIT: case E_NEW_ARRAY: case E_TEMPLATE: case E_NEW_MAP: case E_ARROW: case E_OBJLIT: case E_REGEX: return true;
+    case E_CALL: case E_NEW_OBJ: case E_ARRAY_LIT: case E_NEW_ARRAY: case E_TEMPLATE: case E_NEW_MAP: case E_ARROW: case E_OBJLIT: case E_REGEX: case E_SPAWN: return true;
     case E_FUNC_REF: return false; /* immortal */
     case E_MEMBER:
         if (!e->is_call) return false;
@@ -1286,6 +1287,7 @@ static const char *printer_for(Type *t) {
     case TY_MAP: case TY_SET: return "xs_print_map";
     case TY_STREAM: return "xs_print_stream";
     case TY_CHAN: return "xs_print_obj";
+    case TY_PROMISE: return "xs_print_obj";
     case TY_NULLABLE: return "xs_print_obj_or_null";
     case TY_UNION: return "xs_print_obj_or_null";
     default: return "xs_print_obj";
@@ -1344,6 +1346,7 @@ static void emit_print_arg(Expr *a) {
     case TY_OBJECT: buf_puts(out, "xs_print_obj("); break;
     case TY_ENUM: buf_puts(out, a->type->en->is_string ? "xs_print_str(" : "xs_print_int("); break;
     case TY_UNION: case TY_UNKNOWN: buf_puts(out, "xs_print_obj_or_null("); break;
+    case TY_PROMISE: buf_puts(out, "xs_print_obj("); break;
     default: break;
     }
     emit_borrowed(a);
@@ -2158,6 +2161,30 @@ static void emit_member(Expr *e) {
    are owned (references move into the array). */
 static void emit_promise(Expr *e) {
     const char *fn = e->builtin.cfn;
+    if (strcmp(fn, "promise_all_arr") == 0 || strcmp(fn, "promise_race_arr") == 0) { /* an array of promises kept (XB-106) */
+        static int npa;
+        int id = npa++;
+        Type *t = e->elem_type;
+        int k = t->kind == TY_VOID ? 4 : val_kind(t);
+        const char *sf = k == 0 ? "d" : k == 1 ? "i" : k == 2 ? "b" : k == 3 ? "p" : "v";
+        buf_printf(out, "({ xs_arr_ref *pa%d_ = ", id);
+        emit_borrowed(e->args.items[0]);
+        buf_puts(out, "; ");
+        if (fn[8] == 'r') {
+            buf_printf(out, "xs_promise *pw%d_ = xs_promise_race_arr(pa%d_); %s pr%d_ = (%s)xs_promise_await_%s(pw%d_); xs_release(pw%d_); pr%d_; })",
+                       id, id, ctype(t), id, ctype(t), sf, id, id, id);
+            return;
+        }
+        if (k == 4) { buf_printf(out, "for (size_t i_ = 0; i_ < pa%d_->len; i_++) xs_promise_await_v(pa%d_->data[i_]); })", id, id); return; }
+        Type *at = e->type;
+        if (arr_is_ref(at))
+            buf_printf(out, "xs_arr_ref *pr%d_ = xs_arr_ref_new(pa%d_->len, %s); ", id, id, elem_printer(t));
+        else
+            buf_printf(out, "%s *pr%d_ = %s_new(0, 0); ", arr_struct(at), id, arr_struct(at));
+        buf_printf(out, "for (size_t i_ = 0; i_ < pa%d_->len; i_++) %s_push(pr%d_, xs_promise_await_%s(pa%d_->data[i_])); pr%d_; })",
+                   id, arr_is_ref(at) ? "xs_arr_ref" : arr_struct(at), id, sf, id, id);
+        return;
+    }
     if (strcmp(fn, "promise_all_tuple") == 0) { /* elements of different types: each task its own kind, a tuple of them */
         static int npt;
         int id = npt++;
@@ -2217,6 +2244,68 @@ static void emit_promise(Expr *e) {
                    arr_struct(at), id, arr_struct(at), id, arr_struct(at), id, id, vf, k == 2 ? " != 0" : "");
     }
     buf_printf(out, "xs_par_unref(pg%d_); pr%d_; })", id, id);
+}
+
+/* An async call kept as a promise (XB-106): the callee and its arguments are evaluated here, as JavaScript
+   does, into a block on the heap; the call itself runs on a coroutine of its own (runtime/xisto_net.h,
+   xs_promise_spawn), which starts at once and settles the promise when the call returns or throws. The call is
+   emitted again in a function of its own, each argument read from the block. */
+static void emit_decl(Type *t, const char *name);
+static bool sp_plain(Expr *a) {
+    return a->kind == E_NUMBER || a->kind == E_STRING || a->kind == E_BOOL || a->kind == E_NULL || a->kind == E_FUNC_REF ||
+           (a->kind == E_IDENT && !a->cname) || !a->type || a->type->kind == TY_LITINT;
+}
+static int sp_kind(Type *t) { return !t || t->kind == TY_VOID || t->kind == TY_NULL ? 4 : val_kind(t); }
+static void emit_spawn(Expr *e) {
+    static int nsp;
+    int id = nsp++;
+    Expr *c = e->lhs;
+    Expr **slot[128];
+    int n = 0;
+    bool named = c->kind == E_CALL && (c->func || c->builtin.cfn);
+    if (c->lhs && !named && !sp_plain(c->lhs) && n < 128) slot[n++] = &c->lhs;
+    for (int i = 0; i < c->args.len && n < 128; i++) if (!sp_plain(c->args.items[i])) slot[n++] = &c->args.items[i];
+    Expr *orig[128];
+    Expr *fake = xs_alloc(sizeof(Expr) * (size_t)(n ? n : 1));
+    for (int i = 0; i < n; i++) {
+        orig[i] = *slot[i];
+        fake[i].kind = E_IDENT; fake[i].pos = orig[i]->pos; fake[i].type = orig[i]->type; fake[i].field = -1;
+        fake[i].cname = xs_sprintf("s_->o%d", i);
+    }
+    Buf h = {0};
+    Buf *saved = out;
+    int saved_indent = indent;
+    bool saved_ar = used_ar;
+    out = &h;
+    indent = 1;
+    buf_puts(out, "typedef struct { ");
+    for (int i = 0; i < n; i++) { emit_decl(orig[i]->type, xs_sprintf("o%d", i)); buf_puts(out, "; "); }
+    buf_printf(out, "char u_; } xs_sp%d;\n", id);
+    buf_printf(out, "static void xs_sp%d_free(void *a_) { xs_sp%d *s_ = a_; (void)s_; ", id, id);
+    for (int i = 0; i < n; i++) if (crc(orig[i]->type)) buf_printf(out, "xs_release(s_->o%d); ", i);
+    buf_puts(out, "free(a_); }\n");
+    buf_printf(out, "static xs_val xs_sp%d_run(void *a_) {\n    xs_sp%d *s_ = a_; (void)s_;\n    xs_val r_ = {0};\n    size_t ar_mark = xs_ar_mark(); (void)ar_mark;\n    ", id, id);
+    for (int i = 0; i < n; i++) *slot[i] = &fake[i];
+    int k = sp_kind(c->type);
+    if (k == 4) emit_expr(c);
+    else {
+        buf_printf(out, "r_.%s = ", k == 0 ? "d" : k == 3 ? "p" : "i");
+        if (k == 3 && crc(c->type)) emit_owned(c); else emit_expr(c);
+    }
+    for (int i = 0; i < n; i++) *slot[i] = orig[i];
+    buf_puts(out, ";\n    xs_ar_drain(ar_mark);\n    return r_;\n}\n");
+    out = saved;
+    indent = saved_indent;
+    used_ar = saved_ar;
+    buf_puts(&clone_fns, h.data);
+    free(h.data);
+    buf_printf(out, "({ xs_sp%d *sp%d_ = malloc(sizeof *sp%d_); ", id, id, id);
+    for (int i = 0; i < n; i++) {
+        buf_printf(out, "sp%d_->o%d = ", id, i);
+        if (crc(orig[i]->type)) emit_owned(orig[i]); else emit_expr(orig[i]);
+        buf_puts(out, "; ");
+    }
+    buf_printf(out, "xs_promise_spawn(%d, xs_sp%d_run, xs_sp%d_free, sp%d_); })", k, id, id, id);
 }
 
 /* emits f's copy for the call whose site is csite (into clone_fns) and returns its C name */
@@ -2557,6 +2646,7 @@ static void emit_expr_raw(Expr *e) {
     }
     case E_THIS: buf_puts(out, ren(e->cname ? e->cname : "self")); return;
     case E_AWAIT: emit_expr(e->lhs); return;
+    case E_SPAWN: emit_spawn(e); return;
     case E_NULL: buf_puts(out, e->type ? null_value(e->type) : "NULL"); return;
     case E_UPCAST: /* a subclass as its base: the same object */
         buf_printf(out, "((%s)(", ctype(e->type));
@@ -3584,6 +3674,7 @@ static char *dbg_tag(Type *t) {
     case TY_FUNC: return "fn";
     case TY_STREAM: return "stream";
     case TY_CHAN: return "chan";
+    case TY_PROMISE: return "promise";
     default: return "other";
     }
 }
@@ -8481,7 +8572,7 @@ static void cyc_succ(Type *t, bool *out, bool *any) { /* the classes a value of 
     case TY_ARRAY: case TY_NULLABLE: case TY_SET: cyc_succ(t->elem, out, any); return;
     case TY_MAP: cyc_succ(t->key, out, any); cyc_succ(t->elem, out, any); return;
     case TY_UNION: for (int i = 0; i < t->nparams; i++) cyc_succ(t->params[i], out, any); return;
-    case TY_FUNC: case TY_UNKNOWN: case TY_STREAM: case TY_CHAN: *any = true; return;
+    case TY_FUNC: case TY_UNKNOWN: case TY_STREAM: case TY_CHAN: case TY_PROMISE: *any = true; return;
     default: return;
     }
 }
@@ -8589,7 +8680,7 @@ static void cyc_succ2(Type *t, bool *out, bool *mout, bool *any, bool mutable_) 
     case TY_ARRAY: case TY_SET: cyc_succ2(t->elem, out, mout, any, true); return;
     case TY_MAP: cyc_succ2(t->key, out, mout, any, true); cyc_succ2(t->elem, out, mout, any, true); return;
     case TY_UNION: for (int i = 0; i < t->nparams; i++) cyc_succ2(t->params[i], out, mout, any, mutable_); return;
-    case TY_FUNC: case TY_UNKNOWN: case TY_STREAM: case TY_CHAN: *any = true; return;
+    case TY_FUNC: case TY_UNKNOWN: case TY_STREAM: case TY_CHAN: case TY_PROMISE: *any = true; return;
     default: return;
     }
 }

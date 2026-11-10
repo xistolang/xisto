@@ -108,8 +108,8 @@ export class JwksClient {
   }
 }
 
-function fetchKeys(uri: string, timeout: int): SigningKey[] {
-  const text = getText(uri, timeout);
+async function fetchKeys(uri: string, timeout: int): Promise<SigningKey[]> {
+  const text = await getText(uri, timeout);
   let set = new JsonWebKeySet();
   try {
     set = JSON.parse(text);

@@ -181,7 +181,8 @@ typedef enum { TY_NUMBER, TY_INT, TY_LITINT, TY_BOOLEAN, TY_STRING, TY_VOID, TY_
                TY_UNKNOWN, /* any value by reference (primitives boxed); `as T` checks the type at run time */
                TY_TPARAM,  /* T inside a generic function's template (tname): replaced in each instance */
                TY_UNION,   /* A | B (members in params): held like unknown (boxed); narrowed by typeof, instanceof, a kind */
-               TY_TUPLE    /* [A, B] as written (params): resolved to the object type of a tuple class (Class.is_tuple) */ } TypeKind;
+               TY_TUPLE,   /* [A, B] as written (params): resolved to the object type of a tuple class (Class.is_tuple) */
+               TY_PROMISE  /* Promise<T> kept as a value (elem: T); as a return type it is T and the function async (XB-106) */ } TypeKind;
 
 typedef struct Class Class;
 typedef struct Module Module;
@@ -203,6 +204,7 @@ typedef struct Type {
     int nparams;
     struct Type *ret;     /* TY_FUNC */
     bool rest;            /* TY_FUNC: the last parameter is ...xs: T[] (the arguments from there on, one array) */
+    bool async_ret;       /* TY_FUNC: written (..) => Promise<R> (ret is R): a call not awaited can be kept as a promise */
     const char *tname;    /* TY_TPARAM; TY_STRING: a string literal type ("circle"), the only value allowed */
 } Type;
 
@@ -219,6 +221,7 @@ Type *ty_map_of(Type *key, Type *value);
 Type *ty_set_of(Type *elem);
 Type *ty_stream_of(Type *elem);
 Type *ty_chan_of(Type *elem);
+Type *ty_promise_of(Type *elem); /* Promise<T> (Promise<Promise<T>> is Promise<T>) */
 Type *ty_strip_null(Type *t);
 Type *ty_array_of(Type *elem);
 Type *ty_object_of(Class *cls);
@@ -253,6 +256,7 @@ typedef enum {
     E_SUPER_CALL,/* super(args) in a constructor: the base's initializer on this object (cls = the base) */
     E_REGEX,     /* /pattern/flags: str = pattern, rflags = flags */
     E_SEQ,       /* a, b in a for loop's update: args evaluated in order, no value */
+    E_SPAWN,     /* an async call kept as a promise (lhs: the call, checked): it runs on a coroutine of its own */
 } ExprKind;
 
 typedef struct Expr Expr;
@@ -418,6 +422,7 @@ struct Func {
     Type *ret;
     Stmt *body;        /* S_BLOCK; NULL for built-ins */
     bool is_async;
+    bool ret_promise;  /* declared to return Promise<T> (ret is T): async whether or not it is written async */
     Class *cls;        /* owning class for methods, else NULL */
     bool is_ctor;
     char *cname;

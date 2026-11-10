@@ -2468,6 +2468,7 @@ static void xs_num_to_str(double v, char *out);
 /* ---- closures: a refcounted object whose first field after the header is the code pointer; captures follow ---- */
 
 typedef struct xs_closure { xs_hdr hdr; void *fn; } xs_closure;
+typedef struct xs_promise xs_promise; /* (runtime/xisto_net.h: a field may hold one in a program that never makes one) */
 /* a top-level function taken as a value: its static closure (the compiler declares it {XS_IMMORTAL, 0}) gets
    the anchor type the first time it is taken (every thread writes the same bits) */
 static inline __attribute__((always_inline)) xs_closure *xs_cl_static(xs_closure *c) {

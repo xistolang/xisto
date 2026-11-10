@@ -777,6 +777,7 @@ static void xs_wait_fd(int fd, int16_t filter) { xs_wait_fd_ms(fd, filter, -1); 
 
 static XS_TLS int64_t xs_tasks_live; /* Promise.all/race tasks not finished yet */
 static void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_ms);
+static void xs_unh_check(void); /* (Promise values, below) */
 /* setTimeout from node:timers/promises: inside a handler the coroutine sleeps and the server keeps going */
 XS_NOINLINE void xs_sleep_ms(int64_t ms) {
     if (ms < 0) ms = 0;
@@ -901,6 +902,7 @@ XS_NOINLINE void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_m
             if (co->done && co->on_done) co->on_done(co);
         }
         xs_coro_flush_dead();
+        xs_unh_check();
         if (stop && stop(arg)) return;
         int64_t wait = -1;
         if (deadline_ms >= 0) { wait = deadline_ms - (int64_t)xs_date_now(); if (wait <= 0) return; }
@@ -965,7 +967,389 @@ XS_NOINLINE void xs_par_check(xs_tgroup *g) {
 }
 static inline xs_val xs_par_take(xs_tgroup *g, int i) { g->t[i].taken = true; return g->t[i].out; }
 /* the program ends when the background tasks (race losers) do, as in Node */
-XS_NOINLINE void xs_tasks_drain(void) { if (xs_tasks_live > 0 && !xs_cur_coro) xs_loop_run(NULL, NULL, -1); }
+XS_NOINLINE void xs_tasks_drain(void) { if (xs_tasks_live > 0 && !xs_cur_coro) xs_loop_run(NULL, NULL, -1); xs_unh_check(); }
+
+/* ---- Promise values (XB-106) ----
+   await f() and a statement f() call the async function directly (its I/O parks the caller): no promise is made.
+   A promise is made only where the program keeps one: const p = f(), a field or parameter of type Promise<T>,
+   p.then/catch/finally, new Promise(...), Promise.resolve/reject as a value. The call then runs on a coroutine of
+   its own, started at once (as in Node, the body runs until its first wait before the caller goes on); the promise
+   settles when it returns or throws. then/catch/finally callbacks are microtasks: coroutines on the ready list, in
+   the order their promises settle. await of a pending promise parks the coroutine (from plain code, runs the loop);
+   a rejection nobody handles ends the program as Node does (exit code 1). */
+typedef struct xs_promise xs_promise;
+typedef struct xs_pwait { xs_coro *co; struct xs_pwait *next; } xs_pwait; /* on the heap: a parked task's stack moves */
+typedef struct xs_preact {
+    int how;                /* 0 then (ok and/or err), 1 finally (ok, no argument) */
+    xs_closure *ok, *err;
+    int okk, errk;          /* what each returns: a val kind, 4 nothing, 5 a promise (awaited) */
+    xs_promise *src, *dst;
+    struct xs_preact *next;
+} xs_preact;
+struct xs_promise {
+    xs_hdr hdr;
+    int8_t state;           /* 0 pending, 1 fulfilled, 2 rejected */
+    int8_t kind;            /* of the value: 0 number, 1 int, 2 boolean, 3 reference, 4 none (void) */
+    bool handled, in_unh;
+    xs_val val;             /* fulfilled: owned when a reference */
+    void *err;              /* rejected: the Error, owned */
+    xs_pwait *waiters;
+    xs_preact *reacts, *reacts_tail;
+    xs_promise *unh_next;
+};
+static XS_TLS xs_promise *xs_unh; /* rejected, no handler yet */
+static void xs_promise_free(void *p) {
+    xs_promise *q = p;
+    if (q->state == 1 && q->kind == 3) xs_release_(q->val.p);
+    if (q->state == 2 && q->err) xs_release_(q->err);
+    xs_obj_free(p);
+}
+static void xs_print_any_quoted(void *p);
+static void xs_promise_print(void *p) {
+    xs_promise *q = p;
+    fputs("Promise { ", XS_OUT);
+    if (q->state == 0) fputs("<pending>", XS_OUT);
+    else if (q->state == 2) { fputs("<rejected> ", XS_OUT); xs_print_obj(q->err); }
+    else switch (q->kind) {
+        case 0: xs_print_num(q->val.d); break;
+        case 1: xs_print_int(q->val.i); break;
+        case 2: xs_print_bool(q->val.i != 0); break;
+        case 3: xs_print_any_quoted(q->val.p); break;
+        default: fputs("undefined", XS_OUT); break;
+    }
+    fputs(" }", XS_OUT);
+}
+XS_NOINLINE xs_promise *xs_promise_make(int kind) {
+    xs_promise *p = xs_obj_alloc(sizeof *p, xs_promise_free, xs_promise_print);
+    p->kind = (int8_t)kind;
+    return p;
+}
+static void xs_unh_drop(xs_promise *p) {
+    if (!p->in_unh) return;
+    for (xs_promise **pp = &xs_unh; *pp; pp = &(*pp)->unh_next)
+        if (*pp == p) { *pp = p->unh_next; break; }
+    p->in_unh = false;
+    xs_release_(p);
+}
+XS_NOINLINE void xs_preact_sched(xs_preact *r);
+XS_NOINLINE void xs_promise_settled(xs_promise *p) {
+    for (xs_pwait *w = p->waiters, *n; w; w = n) { n = w->next; xs_ready_push(w->co); free(w); }
+    p->waiters = NULL;
+    xs_preact *r = p->reacts;
+    p->reacts = p->reacts_tail = NULL;
+    if (r) p->handled = true;
+    for (xs_preact *n; r; r = n) { n = r->next; xs_preact_sched(r); }
+    if (p->state == 2 && !p->handled) { p->in_unh = true; p->unh_next = xs_unh; xs_unh = xs_retain_(p); }
+}
+XS_NOINLINE void xs_promise_fulfill(xs_promise *p, xs_val v) {
+    if (p->state != 0) { if (p->kind == 3) xs_release_(v.p); return; }
+    p->state = 1;
+    p->val = v;
+    xs_promise_settled(p);
+}
+XS_NOINLINE void xs_promise_reject(xs_promise *p, void *err) {
+    if (p->state != 0) { xs_release_(err); return; }
+    p->state = 2;
+    p->err = err;
+    xs_promise_settled(p);
+}
+/* a rejection that no handler took by the time the loop has nothing ready: the program ends, as in Node */
+static void xs_unh_check(void) {
+    if (!xs_unh) return;
+    xs_promise *p = xs_unh;
+    while (p->unh_next) p = p->unh_next; /* the first rejected */
+    xs_Error *e = p->err;
+    fflush(stdout);
+    xs_out_drain();
+    fprintf(stderr, "uncaught Error (in promise): %s\n", e->f_message->data);
+    if (e->trace) xs_trace_print(e->trace, stderr);
+    if (!xs_never) exit(1);
+}
+
+/* resume a coroutine from inside another (a call that makes a promise starts its coroutine at once): the outer
+   coroutine's runtime state is the "scheduler's" for this resume, and the real scheduler's is kept aside */
+static void xs_coro_resume_any(xs_coro *co) {
+    if (!xs_cur_coro) { xs_coro_resume(co); return; }
+    xs_coro *outer = xs_cur_coro;
+    void **m_ar = xs_main_ar_pool; size_t m_al = xs_main_ar_len, m_ac = xs_main_ar_cap;
+    jmp_buf **m_try = xs_main_try; int m_td = xs_main_try_depth; void *m_th = xs_main_thrown;
+    jmp_buf *m_rec = xs_main_recover; const char *m_rm = xs_main_recover_msg;
+    void ***m_cln = xs_main_cln; size_t m_cn = xs_main_cln_n, m_cc = xs_main_cln_cap, m_rc = xs_main_recover_cln;
+    void *m_als = xs_main_als;
+    void *sched = xs_sched_sp;
+    xs_coro_resume(co);
+    xs_sched_sp = sched;
+    xs_main_ar_pool = m_ar; xs_main_ar_len = m_al; xs_main_ar_cap = m_ac;
+    xs_main_try = m_try; xs_main_try_depth = m_td; xs_main_thrown = m_th;
+    xs_main_recover = m_rec; xs_main_recover_msg = m_rm;
+    xs_main_cln = m_cln; xs_main_cln_n = m_cn; xs_main_cln_cap = m_cc; xs_main_recover_cln = m_rc;
+    xs_main_als = m_als;
+    xs_cur_coro = outer;
+}
+
+/* a call kept as a promise: the compiler packs the callee's arguments (run reads them, afree releases them) */
+typedef struct xs_spawn { xs_promise *p; xs_val (*run)(void *); void (*afree)(void *); void *args; } xs_spawn;
+XS_NOINLINE void xs_spawn_entry(void *x) {
+    xs_spawn *s = x;
+    size_t mark = xs_ar_mark();
+    jmp_buf jb;
+    xs_try_push(&jb);
+    if (_setjmp(jb) == 0) {
+        xs_val v = s->run(s->args);
+        xs_try_pop();
+        xs_promise_fulfill(s->p, v);
+    } else {
+        xs_promise_reject(s->p, xs_caught());
+    }
+    xs_ar_drain(mark);
+    s->afree(s->args);
+    s->args = NULL;
+}
+static void xs_spawn_done(xs_coro *co) {
+    xs_spawn *s = co->arg;
+    xs_tasks_live--;
+    xs_coro_recycle(co);
+    xs_release_(s->p);
+    free(s);
+}
+static void xs_tasks_drain(void);
+XS_NOINLINE xs_promise *xs_promise_spawn(int kind, xs_val (*run)(void *), void (*afree)(void *), void *args) {
+    if (xs_kq < 0) xs_kq = kqueue();
+    xs_exit_hook = xs_tasks_drain;
+    xs_promise *p = xs_promise_make(kind);
+    xs_spawn *s = malloc(sizeof *s);
+    s->p = xs_retain_(p);
+    s->run = run;
+    s->afree = afree;
+    s->args = args;
+    xs_coro *co = xs_coro_new(xs_spawn_entry, s);
+    co->on_done = xs_spawn_done;
+    xs_tasks_live++;
+    xs_coro_resume_any(co); /* runs until its first wait, as an async function does */
+    if (co->done) { co->on_done(co); if (!xs_cur_coro) xs_coro_flush_dead(); }
+    return p;
+}
+XS_NOINLINE xs_promise *xs_promise_resolved(int kind, xs_val v) {
+    xs_promise *p = xs_promise_make(kind);
+    if (kind == 3) xs_retain_(v.p);
+    p->state = 1;
+    p->val = v;
+    return p;
+}
+static inline xs_promise *xs_promise_resolved_d(double v) { return xs_promise_resolved(0, (xs_val){.d = v}); }
+static inline xs_promise *xs_promise_resolved_i(int64_t v) { return xs_promise_resolved(1, (xs_val){.i = v}); }
+static inline xs_promise *xs_promise_resolved_b(bool v) { return xs_promise_resolved(2, (xs_val){.i = v}); }
+static inline xs_promise *xs_promise_resolved_p(void *v) { return xs_promise_resolved(3, (xs_val){.p = v}); }
+static inline xs_promise *xs_promise_resolved_v(void) { return xs_promise_resolved(4, (xs_val){0}); }
+XS_NOINLINE xs_promise *xs_promise_rejected(int kind, void *err) {
+    xs_promise *p = xs_promise_make(kind);
+    xs_exit_hook = xs_tasks_drain;
+    xs_promise_reject(p, xs_retain_(err));
+    return p;
+}
+
+/* await p */
+static bool xs_promise_stop(void *p) {
+    xs_promise *q = p;
+    if (q->state != 0) return true;
+    if (xs_tasks_live == 0 && !xs_ready_head) { /* nothing left that could settle it: Node's loop would be empty */
+        xs_unh_check();
+        fflush(stdout);
+        xs_out_drain();
+        exit(0);
+    }
+    return false;
+}
+XS_NOINLINE xs_val xs_promise_await(xs_promise *p) {
+    p->handled = true;
+    xs_unh_drop(p);
+    if (xs_cur_coro && xs_kq >= 0) {
+        if (p->state != 0 && xs_ready_head) { xs_ready_push(xs_cur_coro); xs_coro_yield(); } /* one tick: the reactions queued before go first */
+        while (p->state == 0) {
+            xs_pwait *w = malloc(sizeof *w);
+            w->co = xs_cur_coro;
+            w->next = NULL;
+            xs_pwait **pp = &p->waiters;
+            while (*pp) pp = &(*pp)->next;
+            *pp = w;
+            xs_coro_yield();
+        }
+    } else if (p->state == 0 || xs_ready_head) {
+        if (xs_kq < 0) xs_kq = kqueue();
+        xs_loop_run(xs_promise_stop, p, -1);
+    }
+    if (p->state == 2) xs_throw(xs_retain_(p->err));
+    xs_val v = p->val;
+    if (p->kind == 3) xs_retain_(v.p);
+    return v;
+}
+XS_NOINLINE double xs_promise_await_d(xs_promise *p) { return xs_promise_await(p).d; }
+XS_NOINLINE int64_t xs_promise_await_i(xs_promise *p) { return xs_promise_await(p).i; }
+XS_NOINLINE bool xs_promise_await_b(xs_promise *p) { return xs_promise_await(p).i != 0; }
+XS_NOINLINE void *xs_promise_await_p(xs_promise *p) { return p ? xs_promise_await(p).p : NULL; } /* (await of null: null) */
+XS_NOINLINE void xs_promise_await_v(xs_promise *p) { if (p) (void)xs_promise_await(p); }
+
+/* calls a callback: argument of kind ak (5: none), result of kind rk (4: none, 5: a promise, awaited) */
+XS_NOINLINE xs_val xs_pcall(xs_closure *cl, int ak, xs_val a, int rk) {
+    xs_val v = {0};
+    void *fn = cl->fn;
+#define XS_PCALL(R, put) \
+    switch (ak) { \
+        case 0: put ((R (*)(void *, double))fn)(cl, a.d); break; \
+        case 1: put ((R (*)(void *, int64_t))fn)(cl, a.i); break; \
+        case 2: put ((R (*)(void *, bool))fn)(cl, a.i != 0); break; \
+        case 3: put ((R (*)(void *, void *))fn)(cl, a.p); break; \
+        default: put ((R (*)(void *))fn)(cl); break; }
+    switch (rk) {
+    case 0: XS_PCALL(double, v.d =) break;
+    case 1: XS_PCALL(int64_t, v.i =) break;
+    case 2: XS_PCALL(bool, v.i =) break;
+    case 3: XS_PCALL(void *, v.p =) break;
+    case 4: XS_PCALL(void, ) break;
+    default: {
+        XS_PCALL(void *, v.p =)
+        xs_promise *q = v.p;
+        jmp_buf jb;
+        xs_try_push(&jb);
+        if (_setjmp(jb) == 0) { v = xs_promise_await(q); xs_try_pop(); }
+        else { xs_release_(q); xs_throw(xs_caught()); }
+        xs_release_(q);
+        break;
+    }
+    }
+#undef XS_PCALL
+    return v;
+}
+XS_NOINLINE void xs_preact_run(void *x) {
+    xs_preact *r = x;
+    xs_promise *s = r->src, *d = r->dst;
+    size_t mark = xs_ar_mark();
+    jmp_buf jb;
+    xs_try_push(&jb);
+    if (_setjmp(jb) == 0) {
+        if (r->how == 1) {
+            xs_val ig = xs_pcall(r->ok, 5, (xs_val){0}, r->okk);
+            if (r->okk == 3) xs_release_(ig.p);
+            xs_try_pop();
+            if (s->state == 1) { xs_val v = s->val; if (s->kind == 3) xs_retain_(v.p); xs_promise_fulfill(d, v); }
+            else xs_promise_reject(d, xs_retain_(s->err));
+        } else {
+            bool ok = s->state == 1;
+            xs_closure *cb = ok ? r->ok : r->err;
+            if (!cb) {
+                xs_try_pop();
+                if (ok) { xs_val v = s->val; if (s->kind == 3) xs_retain_(v.p); xs_promise_fulfill(d, v); }
+                else xs_promise_reject(d, xs_retain_(s->err));
+            } else {
+                xs_val v = xs_pcall(cb, ok ? (s->kind == 4 ? 5 : s->kind) : 3, ok ? s->val : (xs_val){.p = s->err}, ok ? r->okk : r->errk);
+                xs_try_pop();
+                xs_promise_fulfill(d, v);
+            }
+        }
+    } else {
+        xs_promise_reject(d, xs_caught());
+    }
+    xs_ar_drain(mark);
+}
+static void xs_preact_done(xs_coro *co) {
+    xs_preact *r = co->arg;
+    xs_tasks_live--;
+    xs_coro_recycle(co);
+    xs_release_(r->src);
+    xs_release_(r->dst);
+    if (r->ok) xs_release_(r->ok);
+    if (r->err) xs_release_(r->err);
+    free(r);
+}
+XS_NOINLINE void xs_preact_sched(xs_preact *r) {
+    xs_coro *co = xs_coro_new_shared(xs_preact_run, r);
+    co->on_done = xs_preact_done;
+    xs_ready_push(co);
+}
+/* p.then(ok, err) / p.catch(err) / p.finally(ok): the new promise (kind dk) */
+XS_NOINLINE xs_promise *xs_promise_then(xs_promise *p, int how, xs_closure *ok, int okk, xs_closure *err, int errk, int dk) {
+    if (xs_kq < 0) xs_kq = kqueue();
+    xs_exit_hook = xs_tasks_drain;
+    xs_promise *d = xs_promise_make(dk);
+    xs_preact *r = calloc(1, sizeof *r);
+    r->how = how;
+    r->ok = ok ? xs_retain_(ok) : NULL;
+    r->err = err ? xs_retain_(err) : NULL;
+    r->okk = okk;
+    r->errk = errk;
+    r->src = xs_retain_(p);
+    r->dst = xs_retain_(d);
+    xs_tasks_live++;
+    p->handled = true;
+    xs_unh_drop(p);
+    if (p->state != 0) xs_preact_sched(r);
+    else {
+        if (p->reacts_tail) p->reacts_tail->next = r; else p->reacts = r;
+        p->reacts_tail = r;
+    }
+    return d;
+}
+
+/* Promise.race(ps): a promise that settles as the first of them does */
+static void xs_presolver_print(void *x);
+XS_NOINLINE void xs_prace_fwd(xs_promise *from, xs_promise *to) {
+    if (from->state == 1) { xs_val v = from->val; if (from->kind == 3) xs_retain_(v.p); xs_promise_fulfill(to, v); }
+    else xs_promise_reject(to, xs_retain_(from->err));
+}
+typedef struct { xs_closure c; xs_promise *to, *from; } xs_prace_cl;
+static void xs_prace_cl_free(void *x) { xs_prace_cl *r = x; xs_release_(r->to); xs_release_(r->from); xs_obj_free(x); }
+XS_NOINLINE void xs_prace_cb(void *c) { xs_prace_cl *r = c; xs_prace_fwd(r->from, r->to); }
+XS_NOINLINE xs_promise *xs_promise_race_arr(xs_arr_ref *ps) {
+    if (ps->len == 0) xs_panic("Promise.race of an empty list never settles");
+    xs_promise *to = xs_promise_make(((xs_promise *)ps->data[0])->kind);
+    for (size_t i = 0; i < ps->len && to->state == 0; i++) {
+        xs_promise *q = ps->data[i];
+        if (q->state != 0) { q->handled = true; xs_unh_drop(q); xs_prace_fwd(q, to); break; }
+        xs_prace_cl *cl = xs_obj_alloc(sizeof *cl, xs_prace_cl_free, xs_presolver_print);
+        cl->c.fn = (void *)xs_prace_cb;
+        cl->to = xs_retain_(to);
+        cl->from = xs_retain_(q);
+        xs_promise *d = xs_promise_then(q, 1, &cl->c, 4, NULL, 4, q->kind);
+        d->handled = true;
+        xs_release_(d);
+        xs_release_(cl);
+    }
+    return to;
+}
+/* new Promise((resolve, reject) => ...): the two functions are closures that hold the promise */
+typedef struct { xs_closure c; xs_promise *p; } xs_presolver;
+static void xs_presolver_free(void *x) { xs_release_(((xs_presolver *)x)->p); xs_obj_free(x); }
+static void xs_presolver_print(void *x) { (void)x; fputs("[Function (anonymous)]", XS_OUT); }
+XS_NOINLINE void xs_pres_d(void *c, double v) { xs_promise_fulfill(((xs_presolver *)c)->p, (xs_val){.d = v}); }
+XS_NOINLINE void xs_pres_i(void *c, int64_t v) { xs_promise_fulfill(((xs_presolver *)c)->p, (xs_val){.i = v}); }
+XS_NOINLINE void xs_pres_b(void *c, bool v) { xs_promise_fulfill(((xs_presolver *)c)->p, (xs_val){.i = v}); }
+XS_NOINLINE void xs_pres_p(void *c, void *v) { xs_promise_fulfill(((xs_presolver *)c)->p, (xs_val){.p = v ? xs_retain_(v) : NULL}); }
+XS_NOINLINE void xs_pres_v(void *c) { xs_promise_fulfill(((xs_presolver *)c)->p, (xs_val){0}); }
+XS_NOINLINE void xs_prej(void *c, void *e) { xs_exit_hook = xs_tasks_drain; xs_promise_reject(((xs_presolver *)c)->p, xs_retain_(e)); }
+static xs_closure *xs_presolver_new(xs_promise *p, void *fn) {
+    xs_presolver *r = xs_obj_alloc(sizeof *r, xs_presolver_free, xs_presolver_print);
+    r->c.fn = fn;
+    r->p = xs_retain_(p);
+    return &r->c;
+}
+XS_NOINLINE xs_promise *xs_promise_new(int kind, xs_closure *exec) {
+    if (xs_kq < 0) xs_kq = kqueue();
+    xs_promise *p = xs_promise_make(kind);
+    void *fn = kind == 0 ? (void *)xs_pres_d : kind == 1 ? (void *)xs_pres_i : kind == 2 ? (void *)xs_pres_b : kind == 3 ? (void *)xs_pres_p : (void *)xs_pres_v;
+    xs_closure *res = xs_presolver_new(p, fn), *rej = xs_presolver_new(p, (void *)xs_prej);
+    jmp_buf jb;
+    xs_try_push(&jb);
+    if (_setjmp(jb) == 0) {
+        ((void (*)(void *, void *, void *))exec->fn)(exec, res, rej);
+        xs_try_pop();
+    } else {
+        xs_exit_hook = xs_tasks_drain;
+        xs_promise_reject(p, xs_caught());
+    }
+    xs_release_(res);
+    xs_release_(rej);
+    return p;
+}
 
 typedef struct xs_chan_wait { xs_coro *co; xs_val val; bool has_val; struct xs_chan_wait *next; } xs_chan_wait;
 typedef struct xs_chan {
