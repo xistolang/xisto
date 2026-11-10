@@ -286,7 +286,8 @@ struct Expr {
     TokKind op;
     Expr *lhs, *rhs;
     ExprList args;
-    bool is_call;      /* E_MEMBER */
+    bool is_call;
+    bool opt_call;     /* x.f?.(args): f may be a function that is null (then the call is skipped) */      /* E_MEMBER */
     bool spread;       /* E_ARRAY_LIT with ...x elements (each an E_UNARY TK_ELLIPSIS): built by emit_spread_lit */
     Type *elem_type;   /* E_NEW_ARRAY */
     char *cname;       /* E_IDENT: resolved C name; E_FUNC_REF: C function name */

@@ -510,6 +510,14 @@ static Type *parse_type(Parser *p) {
         t = ty_any;
         if (!no_dyn_note) xs_note_dynamic(name.pos);
     }
+    else if (strcmp(n, "NonNullable") == 0) { /* NonNullable<T>: T without null (the checker strips it) */
+        expect(p, TK_LT, "write NonNullable<T>");
+        t = xs_alloc(sizeof *t);
+        t->kind = TY_TPARAM;
+        t->tname = "__nonnull";
+        t->elem = parse_type(p);
+        expect(p, TK_GT, NULL);
+    }
     else if (strcmp(n, "Promise") == 0) { /* Promise<T> is T: async is syntax only */
         expect(p, TK_LT, "write Promise<T>");
         t = parse_type(p);
@@ -574,20 +582,21 @@ static Type *parse_type(Parser *p) {
         t = xs_alloc(sizeof *t);
         t->kind = TY_TPARAM;
         t->tname = n;
-    } else if ((strcmp(n, "Omit") == 0 || strcmp(n, "Pick") == 0 || strcmp(n, "Partial") == 0) && at(p, TK_LT)) {
+    } else if ((strcmp(n, "Omit") == 0 || strcmp(n, "Pick") == 0 || strcmp(n, "Partial") == 0 || strcmp(n, "Required") == 0) && at(p, TK_LT)) {
         /* Omit<A, 'k'>, Pick<A, 'k'>, Partial<A>: A's fields, some left out or optional (as OmitType(A, [...])) */
         next(p);
         Mixin *m = xs_alloc(sizeof *m);
         m->pos = name.pos;
-        m->kind = n[0] == 'O' ? "OmitType" : n[1] == 'i' ? "PickType" : "PartialType";
+        m->kind = n[0] == 'O' ? "OmitType" : n[1] == 'i' ? "PickType" : n[0] == 'R' ? "RequiredType" : "PartialType";
+        bool one_arg = n[0] == 'R' || n[1] == 'a'; /* Partial<A>, Required<A> */
         Type *inner = parse_type(p);
         if (inner->kind == TY_MAP) { /* Partial<Record<K, V>>: a Record's keys are already optional */
-            if (n[1] != 'a') { expect(p, TK_COMMA, NULL); parse_type(p); }
+            if (!one_arg) { expect(p, TK_COMMA, NULL); parse_type(p); }
             expect(p, TK_GT, NULL);
             t = inner;
         } else {
             m->a = mixin_of_type(inner, name.pos);
-            if (n[1] != 'a') { expect(p, TK_COMMA, xs_sprintf("write %s<A, 'key'>", n)); mixin_keys(m, parse_type(p), name.pos); }
+            if (!one_arg) { expect(p, TK_COMMA, xs_sprintf("write %s<A, 'key'>", n)); mixin_keys(m, parse_type(p), name.pos); }
             expect(p, TK_GT, NULL);
             t = anon_iface(p, open, name.pos, m);
         }
@@ -1237,6 +1246,7 @@ static Expr *parse_postfix(Parser *p) {
                checker, as for x.f()) */
             next(p);
             e->is_call = true;
+            e->opt_call = true;
             parse_args(p, &e->args);
             continue;
         }
@@ -3119,6 +3129,18 @@ static bool method_object(Parser *p, Program *prog, Module *m, bool exported) {
     return true;
 }
 
+/* const NAME = () => ... / const NAME = async () => ...: an arrow with no parameters at the top level */
+static bool thunk_arrow_ahead(Parser *p) {
+    Parser look = *p;
+    next(&look);
+    if (!at(&look, TK_IDENT)) return false;
+    next(&look);
+    if (!accept(&look, TK_ASSIGN)) return false;
+    accept(&look, TK_ASYNC);
+    if (!accept(&look, TK_LPAREN) || !accept(&look, TK_RPAREN)) return false;
+    return at(&look, TK_COLON); /* () : R => ...: with its return type written (one inferred would be read too early) */
+}
+
 /* the rest of the module declares `name` at its top level: a line that starts (after export / declare / abstract)
    with class / interface / type / function / enum / const / let and then the name (read as text: a lexer this far
    ahead would not know where a regular expression starts) */
@@ -3881,6 +3903,22 @@ static void parse_module(Program *prog, Module *m) {
                 prog->enums = realloc(prog->enums, sizeof(Enum *) * (size_t)prog->cap_enums);
             }
             prog->enums[prog->nenums++] = en;
+        } else if (at(&p, TK_CONST) && thunk_arrow_ahead(&p)) {
+            /* const config = (): Config => ({ ... }): a function (ReturnType<typeof config> names its type) */
+            Pos pos = p.tok.pos;
+            next(&p);
+            Token nm = expect(&p, TK_IDENT, NULL);
+            expect(&p, TK_ASSIGN, NULL);
+            Func *f = xs_alloc(sizeof *f);
+            f->pos = pos;
+            f->is_async = accept(&p, TK_ASYNC);
+            f->name = nm.str;
+            f->gen_arrow = true;
+            parse_generic_rest(&p, f, false);
+            f->gen_arrow = false; /* (from here, a function like any other) */
+            f->mod = m;
+            f->exported = exported;
+            add_func(prog, f);
         } else if (at(&p, TK_CONST) && method_object(&p, prog, m, exported)) {
             /* (an object with methods: read as a one-instance class, above) */
         } else if (at(&p, TK_CONST) && generic_arrow_ahead(&p)) {

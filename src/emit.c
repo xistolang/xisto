@@ -3311,6 +3311,26 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, ")");
             return;
         }
+        if (e->opt_call && e->lhs && e->lhs->type && e->lhs->type->kind == TY_NULLABLE && e->lhs->type->elem->kind == TY_FUNC) {
+            /* x.f?.(args): the function once; called when it is not null (otherwise the value is null) */
+            static int noc;
+            int id = noc++;
+            Type *ft = e->lhs->type->elem;
+            bool v = e->type->kind == TY_VOID;
+            buf_printf(out, "({ xs_closure *oc%d_ = (xs_closure *)", id);
+            emit_borrowed(e->lhs);
+            buf_puts(out, "; ");
+            if (!v) buf_printf(out, "%s ocr%d_ = %s; ", ctype(e->type), id, null_value(e->type));
+            buf_printf(out, "if (oc%d_) ", id);
+            if (!v) buf_printf(out, "ocr%d_ = ", id);
+            emit_closure_call_prefix(ft);
+            buf_printf(out, "oc%d_->fn)(oc%d_", id, id);
+            emit_args_borrowed(&e->args, true);
+            buf_puts(out, ");");
+            if (!v) buf_printf(out, " ocr%d_;", id);
+            buf_puts(out, " })");
+            return;
+        }
         if (e->lhs && e->lhs->type && e->lhs->type->kind == TY_FUNC && !e->func && !e->builtin.cfn &&
             e->lhs->kind != E_IDENT && e->lhs->kind != E_THIS && !(e->lhs->kind == E_MEMBER && !e->lhs->is_call)) {
             /* (() => ...)(), f(a)(b): the function value once, in a temporary */

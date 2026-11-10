@@ -1336,6 +1336,9 @@ static void check_supported(Program *p) {
         if (p->funcs[i]->used && p->funcs[i]->is_gen) unsupported(p->funcs[i]->pos, "generators");
         for (int k = 0; p->funcs[i]->used && k < p->funcs[i]->nparams; k++)
             if (qtyped(p->funcs[i]->params[k].type)) unsupported(p->funcs[i]->pos, "a typed-array parameter");
+            else if (p->funcs[i]->used && p->funcs[i]->params[k].type->kind == TY_NULLABLE && p->funcs[i]->params[k].type->elem->kind != TY_STRING &&
+                     !ty_is_heap(p->funcs[i]->params[k].type))
+                unsupported(p->funcs[i]->pos, "a nullable number or boolean parameter"); /* (was invalid IL: XB-111) */
     }
     for (int i = 0; i < p->nclasses; i++)
         if (p->classes[i]->used && (p->classes[i]->base || p->classes[i]->nsubs)) unsupported(p->classes[i]->pos, "inheritance");
