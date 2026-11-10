@@ -2583,6 +2583,23 @@ static void expect_type(Expr *e, Type *want, const char *what) {
                      "%s is unknown where %s goes: checked at run time", what, ty_name(want));
         if (dyn_to(e, want)) return;
     }
+    if (tsc_checked() && want->kind != TY_VOID && !ty_is_any(want) &&
+        (e->type->kind == TY_UNION || (e->type->kind == TY_NULLABLE && e->type->elem->kind == TY_UNION))) {
+        /* string | number where string goes, in code tsc checked: a typeof test xisto's narrowing does not follow (in
+           another function, through a helper): the member it holds, checked at run time */
+        Type *u = e->type->kind == TY_NULLABLE ? e->type->elem : e->type;
+        bool member = false;
+        for (int i = 0; i < u->nparams && !member; i++) {
+            Type *m = u->params[i];
+            if (ty_equal(m, wu) || (is_numeric(m) && is_numeric(wu))) member = true;
+        }
+        if (member) {
+            xs_warn_rule(XS2108, e->pos, "narrow it first: if (typeof x === 'string') { ... }",
+                         "%s is %s where %s goes: checked at run time", what, ty_name(e->type), ty_name(want));
+            to_unknown(e);
+            if (dyn_to(e, want)) return;
+        }
+    }
     if (tsc_checked() && e->type->kind == TY_NULLABLE && want->kind != TY_NULLABLE && want->kind != TY_VOID) {
         /* T | null where T goes (XB-133): TypeScript proved it non-null where xisto's narrowing cannot (a test in
            another function, an index it trusts); read as x! — a TypeError if it is null — with a warning */
@@ -2762,18 +2779,28 @@ static bool shape_copy_array(Expr *e, Type *want) {
     return true;
 }
 
-static void tsc_numeric_operand(Expr *x) { /* --tsc-checked: a number | null or an unknown operand, as tsc accepted it */
+static void tsc_numeric_operand(Expr *x, bool plus) { /* --tsc-checked: a number | null or an unknown operand, as tsc accepted it */
     if (!tsc_checked()) return;
     if (x->type->kind == TY_NULLABLE && is_numeric(x->type->elem)) { nonnull_checked(x, "the operand"); return; }
     if (x->type->kind == TY_UNKNOWN) {
         xs_warn_rule(XS2108, x->pos, "declare its type", "the operand is unknown where a number goes: checked at run time");
         dyn_wrap(x, "xs_dyn_num", ty_number);
+        return;
+    }
+    if (x->type->kind == TY_UNION && !plus) { /* string | number narrowed by a test xisto does not follow: the number, checked
+                                                (not for +, where a string concatenates) */
+        bool num = false;
+        for (int i = 0; i < x->type->nparams; i++) if (is_numeric(x->type->params[i])) num = true;
+        if (!num) return;
+        xs_warn_rule(XS2108, x->pos, "narrow it first: if (typeof x === 'number') { ... }", "the operand is %s where a number goes: checked at run time", ty_name(x->type));
+        to_unknown(x);
+        dyn_wrap(x, "xs_dyn_num", ty_number);
     }
 }
 static Type *unify_numeric(Expr *e, const char *what) {
     Expr *a = e->lhs, *b = e->rhs;
-    tsc_numeric_operand(a);
-    tsc_numeric_operand(b);
+    tsc_numeric_operand(a, e->op == TK_PLUS);
+    tsc_numeric_operand(b, e->op == TK_PLUS);
     if (!is_numeric(a->type) && a->type->kind != TY_LITINT)
         xs_error(XS8112, a->pos, NULL, "left operand of %s must be int or number, but this is %s", what, ty_name(a->type));
     if (!is_numeric(b->type) && b->type->kind != TY_LITINT)
@@ -5063,6 +5090,14 @@ static void check_expr_in(Expr *e, Type *expected) {
                     }
                 }
                 xs_error(XS2011, e->pos, "compare against null first: if (x !== null)", "cannot compare values that may be null");
+            }
+            for (int side = 0; side < 2; side++) { /* v === 'x' with v: string | number: by what v holds (TypeScript allows it) */
+                Expr *u = side ? e->rhs : e->lhs, *o = side ? e->lhs : e->rhs;
+                Type *ot = o->type;
+                if (u->type->kind == TY_UNION && (ot->kind == TY_STRING || ot->kind == TY_BOOLEAN || is_numeric(ot) || ot->kind == TY_LITINT)) {
+                    to_unknown(u);
+                    break;
+                }
             }
             if ((e->lhs->type->kind == TY_UNKNOWN) != (e->rhs->type->kind == TY_UNKNOWN)) {
                 /* v === '' / v === true with v: unknown: the same value, at run time (as with an any) */
@@ -7522,6 +7557,28 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (objs && differ) {
                 for (int i = 0; i < e->args.len; i++) expect_type(e->args.items[i], ty_json, "array element");
                 e->type = ty_array_of(ty_json);
+                return;
+            }
+        }
+        if (!elem && tsc_checked() && e->args.len > 2) { /* (two elements: a [key, value] pair, a tuple where one goes) */
+            /* --tsc-checked: [date, 'x', n], [s, xs]: elements of kinds no one of them takes all the others (TypeScript:
+               a union element type), an unknown[] (each element as what it is, checked where it is read) */
+            Type *t0 = NULL;
+            bool mixed = false;
+            for (int i = 0; i < e->args.len && !mixed; i++) {
+                Type *t = e->args.items[i]->type;
+                if (t->kind == TY_NULL) continue;
+                t = ty_strip_null(t);
+                if (t->kind == TY_LITINT) t = ty_int;
+                if (!t0) t0 = t;
+                else if (!ty_equal(t, t0) && !(is_numeric(t) && is_numeric(t0))) mixed = true;
+                if (t->kind == TY_UNION) mixed = true;
+            }
+            if (mixed) {
+                static Type *arr_unknown3;
+                if (!arr_unknown3) arr_unknown3 = ty_array_of(ty_unknown);
+                for (int i = 0; i < e->args.len; i++) expect_type(e->args.items[i], ty_unknown, "array element");
+                e->type = arr_unknown3;
                 return;
             }
         }
