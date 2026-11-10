@@ -1,8 +1,12 @@
-lib/helper.ts (2)
+lib/helper.ts (2, 1 warning)
   2:16  XS8018  right operand of string concatenation must be string, but this is number
        2 |   return "x" + n;
          |                ^
     help: convert explicitly: String(x)
+  4:15  XS2101  warning: 'undefined' is deprecated in xisto: it is read as null
+       4 | let nothing = undefined;
+         |               ^
+    help: write null: xisto has one empty value
   4:15  XS2013  cannot infer the type of 'nothing' from null
        4 | let nothing = undefined;
          |               ^
@@ -47,6 +51,10 @@ xisto check: 2 files, 7 changes needed in 2 files
   most changes:
         5  main.ts
         2  lib/helper.ts
+
+  warnings (compile; to review)                   uses  files
+    XS2101   deprecated                                  1      1
+  (xisto check --details shows each place; --deny-warnings counts them as changes)
 
   dynamic path (any): runs, slower                     1      1  optional
   (compiles: each use is read and written by name and checked at run time; a declared type is faster)

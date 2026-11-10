@@ -107,6 +107,16 @@ for d in tests/check/*/; do
         [ -f "$d/entry" ] && diff "$d/expected.entry" "$OUT/$name.entry" | head; fail=$((fail+1))
     fi
 done
+# rule warnings (XB-118): a build prints one line with their count and still builds; --deny-warnings makes them
+# errors in the build and changes in xisto check
+$XISTO build tests/check/warnings/main.ts -o "$OUT/warnings-bin" > "$OUT/warnings-build.txt" 2>&1; wrc=$?
+$XISTO build --deny-warnings tests/check/warnings/main.ts -o "$OUT/warnings-deny" > /dev/null 2>&1; drc=$?
+$XISTO check --deny-warnings tests/check/warnings > /dev/null 2>&1; crc=$?
+if [ "$wrc" = 0 ] && [ "$drc" = 1 ] && [ "$crc" = 1 ] && [ "$(wc -l < "$OUT/warnings-build.txt")" -eq 1 ] && grep -q '^xisto: 5 warnings (XS2101 1' "$OUT/warnings-build.txt"; then
+    pass=$((pass+1))
+else
+    echo "FAIL rule warnings: build rc=$wrc, --deny-warnings rc=$drc, check --deny-warnings rc=$crc"; cat "$OUT/warnings-build.txt" | head -5; fail=$((fail+1))
+fi
 
 # stderr: console.error/warn go to stderr and log/info/debug to stdout, each as Node writes it (the expected files are
 # Node's two streams, checked in: the tests/ok oracle merges them)

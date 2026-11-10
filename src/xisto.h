@@ -52,6 +52,8 @@ typedef enum {
     DC_INTERNAL,     /* a compiler bug */
     DC_SEMANTIC,     /* compiles, but may give another result than Node: to review (warnings) */
     DC_DYNPATH,      /* compiles: `any`, read and written by name and checked at run time (notes, not changes) */
+    DC_DEPRECATED,   /* compiles, with a warning: a form xisto reads another way (undefined as null) */
+    DC_IMPLICIT,     /* compiles, with a warning: a conversion xisto makes for the code (int to number) */
     DC_COUNT
 } DiagCat;
 typedef enum {
@@ -76,6 +78,9 @@ extern int xs_quiet_count;   /* follow-on errors kept quiet (a use of a declarat
 void xs_error_continue(DiagCode code, Pos pos, const char *help, const char *fmt, ...); /* report, count, go on */
 void xs_warn(Pos pos, const char *help, const char *fmt, ...);
 void xs_note_dynamic(Pos pos); /* xisto check: a use of any (the dynamic path), counted apart */
+void xs_warn_rule(DiagCode code, Pos pos, const char *help, const char *fmt, ...); /* XB-118: compiles, with a warning */
+void xs_warn_rule_summary(void);
+extern bool xs_show_warnings, xs_deny_warnings;
 extern jmp_buf *xs_error_recover; /* when set, xs_error longjmps here instead of exiting (up to 20 errors) */
 extern int xs_error_count;
 extern bool xs_warnings;

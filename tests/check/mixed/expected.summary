@@ -13,6 +13,10 @@ xisto check: 2 files, 7 changes needed in 2 files
         5  main.ts
         2  lib/helper.ts
 
+  warnings (compile; to review)                   uses  files
+    XS2101   deprecated                                  1      1
+  (xisto check --details shows each place; --deny-warnings counts them as changes)
+
   dynamic path (any): runs, slower                     1      1  optional
   (compiles: each use is read and written by name and checked at run time; a declared type is faster)
 

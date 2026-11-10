@@ -124,7 +124,7 @@ static void usage(void) {
             "  xisto dap                                                debug adapter for IDEs (DAP over stdin/stdout)\n"
             "  xisto clean [DIR]                                        remove the build cache (.xisto/cache) of a project\n"
             "  xisto fmt [--check] FILE.ts...                           format in place (--check: exit 1 if any file would change)\n"
-            "  xisto check [--details] [--pkgs DIR] [PATH...]           what a project needs to change to compile with xisto\n"
+            "  xisto check [--details] [--deny-warnings] [--pkgs DIR] [PATH...]  what a project needs to change to compile with xisto\n"
             "                                                           (PATH: a folder, a tsconfig.json or .ts files; --details: every place)\n"
             "  xisto test [DIR]                                         build and run every *.test.ts under DIR\n"
             "  xisto add SOURCE[@REF] [--name NAME]                     add a package from a git URL or path (source, locked by commit)\n"
@@ -134,6 +134,8 @@ static void usage(void) {
             "  --debug        a debuggable binary: -O0 -g, statement hooks and the debugger agent (never in release)\n"
             "  --json         report each error and warning as one JSON object per line on stderr (editors, AI agents)\n"
             "  --no-warnings  do not report unused variables and functions\n"
+            "  --warnings     list each rule warning (undefined read as null, int mixed with number...); a build prints their count\n"
+            "  --deny-warnings  rule warnings are errors (CI); also for xisto check\n"
             "  --profile      count calls and time per function; the table goes to stderr at exit (C backend)\n"
             "  --backend=qbe  generate QBE IL and machine code directly, without C\n"
             "  --cpu=native   code for this machine's processor (AVX2, ...), as Rust's target-cpu=native; XISTO_CPU=native\n"
@@ -1098,6 +1100,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--profile") == 0) xs_profile = true;
         else if (strcmp(argv[i], "--time") == 0) show_time = true;
         else if (strcmp(argv[i], "--no-warnings") == 0) xs_warnings = false;
+        else if (strcmp(argv[i], "--warnings") == 0) xs_show_warnings = true;
+        else if (strcmp(argv[i], "--deny-warnings") == 0) xs_deny_warnings = true;
         else if (strncmp(argv[i], "--cpu=", 6) == 0) xs_cpu = argv[i] + 6;
         else if (strcmp(argv[i], "--tls=off") == 0) xs_tls_off = true;
         else if (strcmp(argv[i], "--node-compat") == 0) xs_node_compat = true;

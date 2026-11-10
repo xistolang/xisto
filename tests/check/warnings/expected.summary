@@ -1,0 +1,9 @@
+xisto check: 1 file, no changes needed
+
+  warnings (compile; to review)                   uses  files
+    XS2101   deprecated                                  1      1
+    XS2102   deprecated                                  1      1
+    XS2103   implicit                                    1      1
+    XS2104   implicit                                    1      1
+    XS2105   implicit                                    1      1
+  (xisto check --details shows each place; --deny-warnings counts them as changes)

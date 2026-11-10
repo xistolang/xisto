@@ -4659,6 +4659,12 @@ XS_NOINLINE double xs_Date_parse(xs_str *s) {
     return t;
 }
 XS_NOINLINE xs_Date *xs_Date_new_str(xs_str *s) { return xs_date_make(xs_Date_parse(s)); }
+/* new Date(v) with v an any: a Date is copied, a string parsed, anything else converted to a number (null is 0) */
+XS_NOINLINE xs_Date *xs_Date_new_dyn(void *v) {
+    if (v && xs_type_of(v)->free == xs_Date_free) return xs_date_make(((xs_Date *)v)->t);
+    if (v && xs_type_of(v)->free == xs_str_free) return xs_Date_new_str(v);
+    return xs_date_make(xs_dyn_num(v));
+}
 
 /* ---- formatting ---- */
 static inline char *xs_dig(char *o, int64_t v, int w) { for (int i = w - 1; i >= 0; i--) { o[i] = (char)('0' + v % 10); v /= 10; } return o + w; }
