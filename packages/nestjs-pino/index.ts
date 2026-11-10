@@ -36,12 +36,22 @@ export class PinoHttpOptions {
   messageKey?: string;
   ecsVersion?: string;
   serviceName?: string;
+  autoLogging?: boolean; // (accepted: requests are not logged by this module)
+  redact?: string[]; // (accepted: the lines it writes carry no request headers)
+  transport?: PinoTransport; // (accepted: pino-pretty is not run; lines stay JSON)
+}
+/** pinoHttp.transport: { target: "pino-pretty", options } (accepted, not run) */
+export class PinoTransport {
+  target?: string;
+  options?: Record<string, unknown>;
 }
 /** renameContext: the key the context goes under ("log.logger" with ECS). */
 export class LoggerModuleParams {
   pinoHttp?: PinoHttpOptions;
   renameContext?: string;
 }
+/** nestjs-pino's name for what LoggerModule.forRoot takes. */
+export type Params = LoggerModuleParams;
 
 const state: PinoState = { min: 30, ecsVersion: "", serviceName: "", contextKey: "context" };
 interface PinoState {
@@ -62,7 +72,18 @@ class PinoLine {
 
 // @elastic/ecs-pino-format's line: {"log.level","@timestamp","process.pid","host.hostname","ecs.version",
 // "service.name","event.dataset", the context, "message"}
-function ecsLine(level: string, message: string, context: string): string {
+// a logger call's own fields ({ "http.status": 200 }), as pino merges them into the line: ',"k":v' each
+function fieldsText(fields: Record<string, unknown> | null): string {
+  let out = "";
+  if (fields !== null) {
+    for (const k of Object.keys(fields)) {
+      out += `,${JSON.stringify(k)}:${JSON.stringify(fields[k])}`;
+    }
+  }
+  return out;
+}
+
+function ecsLine(level: string, message: string, context: string, fields: Record<string, unknown> | null = null): string {
   let line = `{"log.level":${JSON.stringify(LABELS.get(level) ?? "info")},"@timestamp":${JSON.stringify(new Date().toISOString())}`;
   line += `,"process.pid":${process.pid},"host.hostname":${JSON.stringify(hostname())},"ecs.version":${JSON.stringify(state.ecsVersion)}`;
   if (state.serviceName.length > 0) {
@@ -71,16 +92,24 @@ function ecsLine(level: string, message: string, context: string): string {
   if (context.length > 0) {
     line += `,${JSON.stringify(state.contextKey)}:${JSON.stringify(context)}`;
   }
-  return line + `,"message":${JSON.stringify(message)}}`;
+  return line + fieldsText(fields) + `,"message":${JSON.stringify(message)}}`;
 }
 
-function write(level: string, message: string, context: string): void {
+function write(level: string, message: string, context: string, fields: Record<string, unknown> | null = null): void {
   const n = LEVELS.has(level) ? LEVELS.get(level) : 30;
   if (n < state.min) {
     return;
   }
   if (state.ecsVersion.length > 0) {
-    console.log(ecsLine(level, message, context));
+    console.log(ecsLine(level, message, context, fields));
+    return;
+  }
+  if (fields !== null) { // pino's line with the call's fields before msg
+    let text = `{"level":${n},"time":${Date.now()},"pid":${process.pid},"hostname":${JSON.stringify(process.env.get("HOSTNAME") ?? "localhost")}`;
+    if (context.length > 0) {
+      text += `,"context":${JSON.stringify(context)}`;
+    }
+    console.log(text + fieldsText(fields) + `,"msg":${JSON.stringify(message)}}`);
     return;
   }
   const line: PinoLine = { level: n, time: Date.now(), pid: process.pid, hostname: process.env.get("HOSTNAME") ?? "localhost", msg: message };
@@ -123,7 +152,44 @@ export class Logger {
   }
 }
 
-@Module({ providers: [Logger], exports: [Logger] })
+/**
+ * nestjs-pino's PinoLogger: pino's methods with a context of its own; the first argument may be the line's
+ * own fields: logger.info({ "http.status": 200 }, "GET / 200").
+ */
+@Injectable()
+export class PinoLogger {
+  private context: string = "";
+  setContext(context: string): void {
+    this.context = context;
+  }
+  private emit(level: string, a: Record<string, unknown> | string, msg: string): void {
+    if (typeof a === "string") {
+      write(level, a, this.context);
+    } else {
+      write(level, msg, this.context, a);
+    }
+  }
+  trace(a: Record<string, unknown> | string, msg: string = ""): void {
+    this.emit("trace", a, msg);
+  }
+  debug(a: Record<string, unknown> | string, msg: string = ""): void {
+    this.emit("debug", a, msg);
+  }
+  info(a: Record<string, unknown> | string, msg: string = ""): void {
+    this.emit("info", a, msg);
+  }
+  warn(a: Record<string, unknown> | string, msg: string = ""): void {
+    this.emit("warn", a, msg);
+  }
+  error(a: Record<string, unknown> | string, msg: string = ""): void {
+    this.emit("error", a, msg);
+  }
+  fatal(a: Record<string, unknown> | string, msg: string = ""): void {
+    this.emit("fatal", a, msg);
+  }
+}
+
+@Module({ providers: [Logger, PinoLogger], exports: [Logger, PinoLogger] })
 export class LoggerModule {
   /** Provides the pino Logger; pinoHttp.level sets the lowest level written (default "info"). */
   static forRoot(params: LoggerModuleParams = {}): DynamicModule {
@@ -137,6 +203,6 @@ export class LoggerModule {
       state.serviceName = http.serviceName ?? "";
     }
     state.contextKey = params.renameContext ?? "context";
-    return { module: LoggerModule, providers: [Logger], exports: [Logger], global: true };
+    return { module: LoggerModule, providers: [Logger, PinoLogger], exports: [Logger, PinoLogger], global: true };
   }
 }

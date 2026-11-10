@@ -2,7 +2,7 @@
 // gives class-validator 0.14's messages, in its order (per property, the property's rules in the order the
 // decorators run: bottom up). The compiler has already built the body into the declared types, so a value of the
 // wrong type never reaches these rules (the body decoder answers 400 first).
-import { ClassInfo, FieldInfo } from "xisto:reflect";
+import { ClassInfo, FieldInfo, MethodInfo } from "xisto:reflect";
 import { typeOf } from "class-transformer";
 
 interface Rule {
@@ -11,6 +11,8 @@ interface Rule {
   n: number;
   list: string[];
   pattern: RegExp | null;
+  custom: ClassInfo | null; // registerDecorator's validator: a @ValidatorConstraint class
+  message: string; // the decorator's own message ("" for the default)
 }
 
 const rules: Map<string, Rule[]> = new Map<string, Rule[]>();
@@ -23,7 +25,7 @@ function add(c: ClassInfo, f: FieldInfo, kind: string, n: number = 0, list: stri
   }
   const all = rules.get(c.id);
   if (all !== null) {
-    all.push({ field: f, kind: kind, n: n, list: list, pattern: pattern });
+    all.push({ field: f, kind: kind, n: n, list: list, pattern: pattern, custom: null, message: "" });
   }
 }
 
@@ -37,6 +39,67 @@ function rule(kind: string, n: number = 0, list: string[] = [], pattern: RegExp 
 export class ValidationOptions {
   message?: string;
   each?: boolean;
+}
+
+/** What @ValidatorConstraint({ name, async }) takes. */
+export class ValidatorConstraintOptions {
+  name?: string;
+  async?: boolean;
+}
+/** Marks a class whose validate(value) and defaultMessage() a custom decorator uses (registerDecorator). */
+export function ValidatorConstraint(o: ValidatorConstraintOptions = {}): (c: ClassInfo) => void {
+  return (c: ClassInfo): void => {};
+}
+/** What a custom constraint class implements: validate(value): boolean and, optionally, defaultMessage(): string. */
+export interface ValidatorConstraintInterface {}
+/** What registerDecorator takes: the class and property, and the constraint class that validates it. */
+export class ValidationDecoratorOptions {
+  target: ClassInfo;
+  propertyName: string;
+  name?: string;
+  options?: ValidationOptions | null;
+  constraints?: unknown[];
+  validator: ClassInfo;
+}
+/** A custom rule: the constraint's validate(value) runs on the property (a missing value fails without a call). */
+export function registerDecorator(o: ValidationDecoratorOptions): void {
+  const f = o.target.fields.find((x: FieldInfo): boolean => x.name === o.propertyName);
+  if (f === null) {
+    return;
+  }
+  add(o.target, f, "custom");
+  const all = rules.get(o.target.id);
+  if (all !== null) {
+    const r = all[all.length - 1];
+    r.custom = o.validator;
+    const opts = o.options;
+    r.message = opts !== null && opts.message !== null ? opts.message : "";
+  }
+}
+
+// a custom rule's verdict: the constraint class's validate(value)
+function customValid(c: ClassInfo, v: unknown): boolean {
+  if (v === null) {
+    return false;
+  }
+  const m = c.methods.find((x: MethodInfo): boolean => x.name === "validate");
+  if (m === null) {
+    return true;
+  }
+  return (m.invoke(c.construct([]), [v]) as boolean) === true;
+}
+function customMessage(r: Rule, prop: string): string {
+  if (r.message.length > 0) {
+    return r.message;
+  }
+  const c = r.custom;
+  if (c !== null) {
+    const m = c.methods.find((x: MethodInfo): boolean => x.name === "defaultMessage");
+    if (m !== null) {
+      return m.invoke(c.construct([]), []) as string;
+    }
+  }
+  return `${prop} is invalid`;
 }
 
 /** Skips the field's other rules when it is null or absent. */
@@ -184,6 +247,11 @@ function check(r: Rule, v: unknown, prop: string, out: string[], isArr: boolean)
     out.push(`${prop} must contain at least ${numberText(r.n)} elements`);
   } else if ((k === "isIn" || k === "isEnum") && !inList(v, r.list)) {
     out.push(`${prop} must be one of the following values: ${r.list.join(", ")}`);
+  } else if (k === "custom") {
+    const c = r.custom;
+    if (c !== null && !customValid(c, v)) {
+      out.push(customMessage(r, prop));
+    }
   } else if (k === "matches") {
     const p = r.pattern;
     if (p !== null && (typeof v !== "string" || !p.test(v as string))) {
