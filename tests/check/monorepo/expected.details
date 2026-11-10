@@ -1,12 +1,8 @@
-apps/api/src/main.ts (3)
+apps/api/src/main.ts (2)
   5:1  XS4001  'path' is xisto's implementation of a Node module, not Node itself
        5 | import { join } from 'path';
          | ^
     help: import it as "xisto:path"
-  5:1  XS5006  unknown built-in module 'path'
-       5 | import { join } from 'path';
-         | ^
-    help: built-in modules: xisto:fs, xisto:sqlite, xisto:timers/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random
   6:1  XS5003  cannot resolve 'some-orm'
        6 | import { connect } from 'some-orm';
          | ^
@@ -18,15 +14,15 @@ libs/util/src/index.ts (1)
          | ^
     help: import files with a relative path ("./file"), or add the package: xisto add <git url> --name tiny-format
 
-xisto check: 6 files, 4 changes needed in 2 files
+xisto check: 6 files, 3 changes needed in 2 files
 
   kind of change                                 changes  files  fix
   Node module import (node:x -> xisto:x)               1      1  automatic
-  module or package not available                      3      2  package
+  module or package not available                      2      2  package
   (3 follow-on errors of these hidden)
 
   most changes:
-        3  apps/api/src/main.ts
+        2  apps/api/src/main.ts
         1  libs/util/src/index.ts
 
   tests: 0 changes in 0 of 1 test file, not counted above (--tests counts them)

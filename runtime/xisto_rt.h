@@ -1725,6 +1725,15 @@ XS_NOINLINE void *xs_Error_wrap(xs_str *name, void *cause) {
     e->f_cause = xs_retain(cause); /* the argument is borrowed */
     return e;
 }
+/* throw v, v unknown: a caught Error (what a catch gives) is thrown again as it is; another value travels as the
+   cause of an Error, as throw obj does (the argument is borrowed) */
+XS_NOINLINE void *xs_Error_of_unknown(void *v) {
+    if (v && xs_type_of(v)->free == xs_Error_free) return xs_retain(v);
+    xs_str *name = xs_str_new("Error", 5);
+    void *e = xs_Error_wrap(name, v);
+    xs_release(name);
+    return e;
+}
 /* throw obj, obj of a class that extends Error: its first fields are message and name, laid out as xs_Error's */
 XS_NOINLINE void *xs_Error_wrap_err(void *cause) {
     struct { xs_hdr hdr; xs_str *message; xs_str *name; } *o = cause;
@@ -4749,6 +4758,15 @@ static xs_map *xs_env;
 static xs_arr_ref *xs_process_argv(void) { return xs_argv; }
 static xs_map *xs_process_env(void) { return xs_env; }
 static int64_t xs_process_pid(void) { return (int64_t)getpid(); } /* process.pid */
+static xs_str *xs_process_cwd(void) { /* process.cwd() */
+    char b[4096];
+#if defined(_WIN32)
+    if (!_getcwd(b, (int)sizeof b)) return xs_str_new("", 0);
+#else
+    if (!getcwd(b, sizeof b)) return xs_str_new("", 0);
+#endif
+    return xs_str_new(b, strlen(b));
+}
 static void xs_process_exit(int64_t code) { fflush(stdout); exit((int)code); }
 /* process.stdout.write / process.stderr.write: through the same FILE as console.log, so the order is kept */
 static inline void xs_out_drain(void);

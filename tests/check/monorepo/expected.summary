@@ -1,12 +1,12 @@
-xisto check: 6 files, 4 changes needed in 2 files
+xisto check: 6 files, 3 changes needed in 2 files
 
   kind of change                                 changes  files  fix
   Node module import (node:x -> xisto:x)               1      1  automatic
-  module or package not available                      3      2  package
+  module or package not available                      2      2  package
   (3 follow-on errors of these hidden)
 
   most changes:
-        3  apps/api/src/main.ts
+        2  apps/api/src/main.ts
         1  libs/util/src/index.ts
 
   tests: 0 changes in 0 of 1 test file, not counted above (--tests counts them)

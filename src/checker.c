@@ -846,6 +846,7 @@ static Type *subst(Type *t, Class *tmpl, Type **args) {
             *n = *t;
             Class *ph = xs_alloc(sizeof *ph);
             *ph = *t->cls;
+            ph->cname = NULL; /* (a member of a generic alias names its template: resolved by name, then instantiated) */
             n->cls = ph;
             n->targs = xs_alloc(sizeof(Type *) * (size_t)t->ntargs);
             for (int i = 0; i < t->ntargs; i++) n->targs[i] = subst(t->targs[i], tmpl, args);
@@ -861,6 +862,13 @@ static Type *subst(Type *t, Class *tmpl, Type **args) {
         }
         return t;
     case TY_ARRAY: return ty_array_of(subst(t->elem, tmpl, args));
+    case TY_UNION: {
+        Type *n = xs_alloc(sizeof *n);
+        *n = *t;
+        n->params = xs_alloc(sizeof(Type *) * (size_t)(t->nparams ? t->nparams : 1));
+        for (int i = 0; i < t->nparams; i++) n->params[i] = subst(t->params[i], tmpl, args);
+        return n;
+    }
     case TY_NULLABLE: return ty_nullable_of(subst(t->elem, tmpl, args));
     case TY_SET: return ty_set_of(subst(t->elem, tmpl, args));
     case TY_MAP: return ty_map_of(subst(t->key, tmpl, args), subst(t->elem, tmpl, args));
@@ -1156,6 +1164,25 @@ static Type *resolve(Type *t, Pos pos) {
                 if (missing_name(t->cls->name)) xs_error_quiet();
                 xs_error(XS9033, t->cls->pos.line ? t->cls->pos : pos, xs_help_suggest(t->cls->name, cands, n, "declare the class above, or use number, int, boolean, string or T[]"), "unknown type '%s'", t->cls->name);
             }
+            if (c->alias && c->ntparams) { /* type Item<T> = A<T> | B<T>: the alias with these arguments, resolved per use */
+                Type **ta = xs_alloc(sizeof(Type *) * (size_t)c->ntparams);
+                int n = 0;
+                for (; n < t->ntargs && n < c->ntparams; n++) ta[n] = resolve(t->targs[n], pos);
+                while (n < c->ntparams && c->ctdefaults && c->ctdefaults[n]) { ta[n] = c->ctdefaults[n]; n++; }
+                if (n != c->ntparams || t->ntargs > c->ntparams)
+                    xs_error(XS8063, pos, xs_sprintf("write %s<...> with %d type argument(s)", c->name, c->ntparams), "'%s' takes %d type argument(s), got %d", c->name, c->ntparams, t->ntargs);
+                Type *a = subst(c->alias, c, ta);
+                Module *sm = cur_mod;
+                Scope *ss = scope;
+                const char *sfn = xs_file_name, *ssrc = xs_source;
+                enter_module(c->mod);
+                a = resolve(a, c->pos);
+                cur_mod = sm;
+                scope = ss;
+                xs_file_name = sfn;
+                xs_source = ssrc;
+                return a;
+            }
             if (c->alias) { /* type Name = A | B: the aliased type, resolved once in its own module */
                 Module *sm = cur_mod;
                 Scope *ss = scope;
@@ -1167,6 +1194,14 @@ static Type *resolve(Type *t, Pos pos) {
                 xs_file_name = sfn;
                 xs_source = ssrc;
                 return c->alias;
+            }
+            if (c->ntparams > t->ntargs && c->ctdefaults && c->ctdefaults[t->ntargs]) { /* Name<A> of Name<A, B = X>: the defaults */
+                Type **ta = xs_alloc(sizeof(Type *) * (size_t)c->ntparams);
+                for (int i = 0; i < t->ntargs; i++) ta[i] = t->targs[i];
+                int n = t->ntargs;
+                while (n < c->ntparams && c->ctdefaults[n]) { ta[n] = c->ctdefaults[n]; n++; }
+                t->targs = ta;
+                t->ntargs = n;
             }
             if (c->ntparams || t->ntargs) {
                 if (c->ntparams != t->ntargs)
@@ -1881,6 +1916,21 @@ static Expr *dflt_subst(Expr *d, Func *f, Expr **args, int nargs, Pos at) {
 }
 
 static bool is_spread(Expr *a) { return a && a->kind == E_UNARY && a->op == TK_ELLIPSIS; }
+/* a call through a function value whose last parameter is ...xs: T[]: the arguments from there on, one array */
+static void pack_rest(Expr *e, Type *ft) {
+    if (!ft || !ft->rest || !ft->nparams) return;
+    int r = ft->nparams - 1;
+    if (e->args.len == ft->nparams && is_spread(e->args.items[r])) { e->args.items[r] = e->args.items[r]->lhs; return; }
+    if (e->args.len < r) return; /* (too few: reported by the caller) */
+    Expr *arr = xs_alloc(sizeof *arr);
+    arr->kind = E_ARRAY_LIT; arr->pos = e->args.len > r ? e->args.items[r]->pos : e->pos; arr->field = -1;
+    for (int i = r; i < e->args.len; i++) {
+        if (is_spread(e->args.items[i])) xs_error(XS6032, e->args.items[i]->pos, "pass the array itself: f(xs), with a parameter xs: T[]", "spreading arguments into a call is not supported (xisto has no rest parameters)");
+        expr_list_push(&arr->args, e->args.items[i]);
+    }
+    e->args.len = r;
+    expr_list_push(&e->args, arr);
+}
 static void check_args(Expr *e, Func *f, const char *what) {
     if (f->nparams && f->params[f->nparams - 1].rest) { /* ...xs: T[]: the arguments from there on, one array (or f(...ys): ys) */
         int r = f->nparams - 1;
@@ -2463,6 +2513,15 @@ static void unify(Type *pat, Type *got, Func *tmpl, Type **bind) {
         return;
     }
     if (pat->kind == TY_NULLABLE) { unify(pat->elem, got->kind == TY_NULLABLE ? got->elem : got, tmpl, bind); return; }
+    if (pat->kind == TY_OBJECT && pat->ntargs && got->kind == TY_UNION) { /* Item<T> (a generic alias) against Item<number>: its
+                                                                            members carry the alias's arguments */
+        for (int m = 0; m < got->nparams; m++) {
+            Type *mt = got->params[m];
+            if (mt->kind != TY_OBJECT || mt->ntargs != pat->ntargs) continue;
+            for (int i = 0; i < pat->ntargs; i++) unify(pat->targs[i], mt->targs[i], tmpl, bind);
+        }
+        return;
+    }
     if (pat->kind != got->kind) return;
     switch (pat->kind) {
     case TY_ARRAY: case TY_SET: case TY_STREAM: case TY_CHAN: unify(pat->elem, got->elem, tmpl, bind); return;
@@ -2625,6 +2684,7 @@ static void check_object_member(Expr *e, Class *c) {
         e->lhs = fld;
         e->func = NULL;
         e->cls = NULL;
+        pack_rest(e, ft);
         if (e->args.len != ft->nparams) xs_error(XS8062, e->pos, NULL, "'%s' takes %d argument(s), got %d", f->name, ft->nparams, e->args.len);
         for (int i = 0; i < e->args.len; i++) {
             check_expr(e->args.items[i], ft->params[i]);
@@ -3192,6 +3252,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->func = f;
                 e->cname = f->cname;
                 e->type = ty_func(ps, f->nparams, fret(f, e->pos));
+                e->type->rest = f->nparams && f->params[f->nparams - 1].rest;
                 return;
             }
             Class *cv = find_class(e->str);
@@ -3836,6 +3897,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             check_expr(e->lhs, NULL);
             Type *ft = e->lhs->type;
             if (ft->kind != TY_FUNC) xs_error(XS6030, e->pos, NULL, "only named functions can be called");
+            pack_rest(e, ft);
             if (e->args.len != ft->nparams) xs_error(XS8062, e->pos, NULL, "'%s' takes %d argument(s), got %d", "the function", ft->nparams, e->args.len);
             for (int i = 0; i < e->args.len; i++) {
                 check_expr(e->args.items[i], ft->params[i]);
@@ -4073,6 +4135,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                         nul->kind = E_NULL; nul->pos = e->pos; nul->field = -1;
                         expr_list_push(&e->args, nul);
                     }
+                pack_rest(e, ft);
                 Func *af = b->origin && b->origin->arrow_fn ? b->origin->arrow_fn : b->arrow_fn;
                 if (af && af->nparams == ft->nparams) /* a const arrow's literal defaults fill the arguments left out */
                     while (e->args.len < ft->nparams) {
@@ -4393,6 +4456,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (!e->is_call && strcmp(e->str, "argv") == 0) { e->type = ty_array_of(ty_string); e->builtin.cfn = "xs_process_argv"; return; }
                 if (!e->is_call && strcmp(e->str, "env") == 0) { e->type = ty_map_of(ty_string, ty_string); e->builtin.cfn = "xs_process_env"; return; }
                 if (!e->is_call && strcmp(e->str, "pid") == 0) { e->type = ty_int; e->builtin.cfn = "xs_process_pid"; return; }
+                if (e->is_call && strcmp(e->str, "cwd") == 0 && e->args.len == 0) { e->type = ty_string; e->builtin.cfn = "xs_process_cwd"; return; }
                 if (e->is_call && strcmp(e->str, "exit") == 0) {
                     if (e->args.len > 1) xs_error(XS7082, e->pos, NULL, "process.exit takes at most one argument");
                     if (e->args.len == 1) { check_expr(e->args.items[0], ty_int); expect_type(e->args.items[0], ty_int, "exit code"); }
@@ -4400,7 +4464,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     e->builtin.cfn = "xs_process_exit";
                     return;
                 }
-                xs_error(XS7115, e->pos, "supported: process.argv, process.env.get(name), process.exit(code), process.stdout.write(x), process.stderr.write(x)", "unknown process member '%s'", e->str);
+                xs_error(XS7115, e->pos, "supported: process.argv, process.env.get(name), process.cwd(), process.exit(code), process.stdout.write(x), process.stderr.write(x)", "unknown process member '%s'", e->str);
             }
             if (strcmp(ns, "Array") == 0 && e->is_call && (strcmp(e->str, "from") == 0 || strcmp(e->str, "isArray") == 0)) {
                 if (e->args.len != 1) xs_error(XS7001, e->pos, "Array.from(array, Set or Map); Array.isArray(x)", "Array.%s takes one argument here", e->str);
@@ -5172,6 +5236,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         Type **ps = xs_alloc(sizeof(Type *) * (size_t)(f->nparams ? f->nparams : 1));
         for (int i = 0; i < f->nparams; i++) ps[i] = f->params[i].type;
         e->type = ty_func(ps, f->nparams, f->ret);
+        e->type->rest = f->nparams && f->params[f->nparams - 1].rest;
         return;
     }
     case E_NEW_MAP:
@@ -5904,11 +5969,18 @@ static UNarrow union_narrow(Expr *c) {
         else r.else_t = a.else_t;
         return r;
     }
-    if (c->kind != E_BINARY) return r;
-    bool neg = c->op == TK_NEQ;
-    Expr *id = NULL, *lit = NULL;
-    int how = 0; /* 1 typeof, 2 instanceof, 3 discriminant field */
-    if (c->op == TK_IDENT) { id = union_ident(c->lhs); how = 2; }
+    bool is_ufield = c->kind == E_MEMBER && c->builtin.cfn && strcmp(c->builtin.cfn, "union_field") == 0;
+    if (c->kind != E_BINARY && !is_ufield) return r;
+    bool neg = c->kind == E_BINARY && c->op == TK_NEQ;
+    Expr *id = NULL, *lit = NULL, *bfield = NULL;
+    bool bwant = true;
+    int how = 0; /* 1 typeof, 2 instanceof, 3 discriminant field, 4 boolean discriminant ({ ok: true } | { ok: false }) */
+    if (is_ufield) { id = union_ident(c->lhs); how = 4; bfield = c; }
+    else if ((c->op == TK_EQ || c->op == TK_NEQ) && (c->rhs->kind == E_BOOL || c->lhs->kind == E_BOOL)) {
+        Expr *a = c->rhs->kind == E_BOOL ? c->lhs : c->rhs, *bl = c->rhs->kind == E_BOOL ? c->rhs : c->lhs;
+        if (a->kind == E_MEMBER && a->builtin.cfn && strcmp(a->builtin.cfn, "union_field") == 0) { id = union_ident(a->lhs); how = 4; bfield = a; bwant = bl->boolean; }
+    }
+    else if (c->op == TK_IDENT) { id = union_ident(c->lhs); how = 2; }
     else if (c->op == TK_EQ || c->op == TK_NEQ) {
         Expr *a = c->lhs, *b = c->rhs;
         if (b->kind != E_STRING) { Expr *t = a; a = b; b = t; }
@@ -5936,6 +6008,11 @@ static UNarrow union_narrow(Expr *c) {
         bool yes = false;
         if (how == 1) yes = strcmp(typeof_name(m), lit->str) == 0;
         else if (how == 2) yes = m->kind == TY_OBJECT && c->rhs->cls && is_subclass(m->cls, c->rhs->cls);
+        else if (how == 4) {
+            Field *fd = m->kind == TY_OBJECT ? find_field(m->cls, bfield->str, NULL) : NULL;
+            if (!fd || fd->type->kind != TY_BOOLEAN || !fd->type->tname) return (UNarrow){0}; /* not a literal true / false */
+            yes = strcmp(fd->type->tname, bwant ? "true" : "false") == 0;
+        }
         else {
             Field *fd = m->kind == TY_OBJECT ? find_field(m->cls, c->lhs->kind == E_MEMBER ? c->lhs->str : c->rhs->str, NULL) : NULL;
             yes = fd && fd->type->tname && strcmp(fd->type->tname, lit->str) == 0;
@@ -6122,6 +6199,17 @@ static void check_stmt(Stmt *s) {
             w->builtin.cfn = "xs_Error_wrap";
             w->type = ty_object_of(err);
             expr_list_push(&w->args, name);
+            expr_list_push(&w->args, v);
+            s->expr = w;
+            return;
+        }
+        if (t->kind == TY_UNKNOWN) { /* throw item.erro (unknown, any): an Error rethrown as it is; another value, as the cause of one */
+            Expr *v = expr_copy(s->expr);
+            Expr *w = xs_alloc(sizeof *w);
+            w->kind = E_CALL;
+            w->pos = v->pos;
+            w->builtin.cfn = "xs_Error_of_unknown";
+            w->type = ty_object_of(err);
             expr_list_push(&w->args, v);
             s->expr = w;
             return;
@@ -7164,6 +7252,8 @@ void check_program(Program *p) {
                 SYM_EACH(enums_by_name, name, e) if (((Enum *)e->decl)->mod == im->from) found = found || ((Enum *)e->decl)->exported;
                 if (!found && strcmp(im->from->file, "xisto:worker_threads") == 0 && (strcmp(name, "Worker") == 0 || strcmp(name, "MessagePort") == 0))
                     found = true; /* built-in classes */
+                if (!found && im->from->builtin && strcmp(im->from->file, "perf_hooks") == 0 && strcmp(name, "performance") == 0)
+                    found = true; /* the built-in performance */
                 if (!found && im->from->builtin && strcmp(im->from->file, "sqlite") == 0)
                     for (int j = 0; j < nbuiltins; j++)
                         if (strcmp(builtins[j]->name, name) == 0 && (strcmp(name, "DatabaseSync") == 0 || strcmp(name, "StatementSync") == 0)) found = true;

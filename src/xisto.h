@@ -202,6 +202,7 @@ typedef struct Type {
     struct Type **params; /* TY_FUNC */
     int nparams;
     struct Type *ret;     /* TY_FUNC */
+    bool rest;            /* TY_FUNC: the last parameter is ...xs: T[] (the arguments from there on, one array) */
     const char *tname;    /* TY_TPARAM; TY_STRING: a string literal type ("circle"), the only value allowed */
 } Type;
 
@@ -503,6 +504,7 @@ struct Class {
     char **implements; /* `implements A, B`: names only, the shape is not checked */
     int nimplements;
     char **tparams;    /* interface Name<T, U>: a template, instantiated per use (QueryResult<Row>) */
+    struct Type **ctdefaults;     /* interface/class Name<T = unknown>: the type a parameter takes when it is left out (NULL: none) */
     int ntparams;
     struct Class *generic_of; /* an instance: its template */
     void *gen_state;   /* class Name<T> { ... }: the parser where the body starts; each instance parses it again with T bound */
