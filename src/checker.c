@@ -2227,6 +2227,12 @@ static void expect_type(Expr *e, Type *want, const char *what) {
         return;
     }
     if (ty_is_any(want) && e->type->kind == TY_JSON) { wrap_call(e, "xs_json_any", want); return; } /* rows of query<T = any>() */
+    if (ty_is_any(e->type) && (want->kind == TY_JSON || (want->kind == TY_NULLABLE && want->elem->kind == TY_JSON))) {
+        e->type = ty_unknown; /* an any where an object goes (where: filtro): written as JSON by what it holds */
+        to_json(e);
+        if (want->kind == TY_NULLABLE) e->type = want;
+        return;
+    }
     if (ty_is_any(want) && e->type->kind != TY_VOID) { to_any(e); return; } /* (null too: an any may be null) */
     if (ty_is_any(e->type) && want->kind != TY_VOID && want->kind != TY_UNKNOWN && dyn_to(e, want)) return;
     if ((want->kind == TY_NUMBER || (want->kind == TY_NULLABLE && want->elem->kind == TY_NUMBER)) && widen_inferred(e)) return;
@@ -3911,6 +3917,57 @@ static bool objlit_expand(Expr *e, Type *expected) {
         e->type = rec;
         return true;
     }
+    { /* { ...rec, k: v } with rec a Record: a Record of rec's entries and then k (later keys win, as in JavaScript):
+         new Map([...rec.entries(), ['k', v]]) read as an object */
+        Type *v = t && t->kind == TY_MAP && t->record && t->key->kind == TY_STRING ? t->elem : NULL;
+        bool any_rec = false, ok = true;
+        for (int i = 0; i < e->args.len && ok; i++) {
+            if (strcmp(e->keys[i], "...") != 0) continue;
+            Type *st = pure_type(e->args.items[i]->lhs);
+            if (st && st->kind == TY_MAP && st->record && st->key->kind == TY_STRING) {
+                any_rec = true;
+                if (!v) v = st->elem;
+                else if (!ty_equal(v, st->elem)) ok = false;
+            } else ok = false; /* (a Record and an object spread together: not this) */
+        }
+        if (any_rec && ok) {
+            for (int i = 0; i < e->args.len; i++) if (strcmp(e->keys[i], "[]") == 0) ok = false;
+        }
+        if (any_rec && ok) {
+            Type *rec = xs_alloc(sizeof *rec);
+            *rec = *ty_map_of(ty_string, v);
+            rec->record = true;
+            Expr *arr = xs_alloc(sizeof *arr);
+            arr->kind = E_ARRAY_LIT; arr->pos = e->pos; arr->field = -1; arr->spread = true;
+            for (int i = 0; i < e->args.len; i++) {
+                Expr *a = e->args.items[i];
+                if (strcmp(e->keys[i], "...") == 0) {
+                    Expr *ent = xs_alloc(sizeof *ent);
+                    ent->kind = E_MEMBER; ent->pos = a->pos; ent->field = -1; ent->lhs = a->lhs; ent->str = "entries"; ent->is_call = true;
+                    Expr *sp = xs_alloc(sizeof *sp);
+                    sp->kind = E_UNARY; sp->op = TK_ELLIPSIS; sp->pos = a->pos; sp->field = -1; sp->lhs = ent;
+                    expr_list_push(&arr->args, sp);
+                    continue;
+                }
+                Expr *pair = xs_alloc(sizeof *pair);
+                pair->kind = E_ARRAY_LIT; pair->pos = a->pos; pair->field = -1;
+                Expr *k = xs_alloc(sizeof *k);
+                k->kind = E_STRING; k->pos = a->pos; k->field = -1; k->str = e->keys[i];
+                expr_list_push(&pair->args, k);
+                expr_list_push(&pair->args, a);
+                expr_list_push(&arr->args, pair);
+            }
+            e->kind = E_NEW_MAP;
+            e->elem_type = rec;
+            e->args = (ExprList){0};
+            e->keys = NULL;
+            e->spread = false;
+            expr_list_push(&e->args, arr);
+            check_expr(e, rec);
+            e->type = rec;
+            return true;
+        }
+    }
     Class *target = t && t->kind == TY_OBJECT && !t->cls->builtin ? t->cls : NULL;
     char **keys = xs_alloc(sizeof(char *) * 8);
     int cap = 8;
@@ -4468,6 +4525,21 @@ static void check_expr_in(Expr *e, Type *expected) {
                     e->type = ty_boolean;
                     e->builtin.cfn = "nullable_eq";
                     return;
+                }
+                { /* a === b with both T | null (T a primitive): equal when both are null or both hold the same value */
+                    Type *lt = ty_strip_null(e->lhs->type), *rt = ty_strip_null(e->rhs->type);
+                    bool prim = (is_numeric(lt) && is_numeric(rt)) || (lt->kind == TY_STRING && rt->kind == TY_STRING) ||
+                                (lt->kind == TY_BOOLEAN && rt->kind == TY_BOOLEAN);
+                    if (prim) {
+                        bool neq = e->op == TK_NEQ;
+                        Expr *l = e->lhs, *r = e->rhs;
+                        if (lt->kind == TY_INT && rt->kind != TY_INT) { /* (int | null) with (number | null): as numbers */ }
+                        to_unknown(l);
+                        to_unknown(r);
+                        dyn_call(e, "xs_dyn_eq", ty_boolean, l, r, NULL);
+                        if (neq) { Expr *v = expr_copy(e); memset(e, 0, sizeof *e); e->kind = E_UNARY; e->op = TK_NOT; e->pos = v->pos; e->field = -1; e->lhs = v; e->type = ty_boolean; }
+                        return;
+                    }
                 }
                 xs_error(XS2011, e->pos, "compare against null first: if (x !== null)", "cannot compare values that may be null");
             }
@@ -6558,6 +6630,25 @@ static void check_expr_in(Expr *e, Type *expected) {
             return;
         }
         for (int i = 0; i < e->args.len; i++) check_expr(e->args.items[i], elem);
+        if (!elem) { /* [id, 'x', 3]: values of several kinds, an unknown[] (TypeScript: (string | number)[]) */
+            int ks = 0, kn = 0, kb = 0, ko = 0;
+            for (int i = 0; i < e->args.len; i++) {
+                Type *t = e->args.items[i]->type;
+                if (t->kind == TY_NULL) continue;
+                t = ty_strip_null(t);
+                if (t->kind == TY_STRING) ks = 1;
+                else if (is_numeric(t) || t->kind == TY_LITINT) kn = 1;
+                else if (t->kind == TY_BOOLEAN) kb = 1;
+                else ko = 1;
+            }
+            if (ks + kn + kb > 1 && !ko) {
+                static Type *arr_unknown2;
+                if (!arr_unknown2) arr_unknown2 = ty_array_of(ty_unknown);
+                for (int i = 0; i < e->args.len; i++) expect_type(e->args.items[i], ty_unknown, "array element");
+                e->type = arr_unknown2;
+                return;
+            }
+        }
         if (!elem) {
             for (int i = 0; i < e->args.len; i++)
                 if (is_numeric(e->args.items[i]->type)) elem = e->args.items[i]->type;
