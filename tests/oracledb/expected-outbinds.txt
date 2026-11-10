@@ -1,0 +1,22 @@
+fn_msg S recebi 13 caracteres: {"a":1,"ç":2 ação -1
+pr_soma 7.25 2026-03-13T04:30:00.000Z OLÁ!
+posicional [42,"pos 7"]
+nulos null null null
+texto 4000 4000 xabcdefghija efghi
+texto 32767 32767 xabcdefghija bcdef
+clob 50000 ção-001.,;ção-002.,;çã ção-000.,;
+blob 12000 cafe0100cafe0200 cafeb800
+clob vazio [""]
+bool 1 [true]
+bool -1 [false]
+pequeno ORA-06502: PL/SQL: value or conversion error: character string buffer too small
+erro ORA-20001: regra de negócio 42
+campos Error ORA-20001 20001 0 false
+campos ORA-00942 942 14
+campos NJS-098 - 0
+depois [4]
+in longo 5000 [5000]
+in longo 32767 [32767]
+clob in [40009,"ação-çéçéçéç|çé-fim"]
+blob in [70000,"00070E151C23|E6EDF4FB0209"]
+300 clobs 9000

@@ -1,6 +1,7 @@
 #!/bin/sh
 # packages/oracledb against a live Oracle Database: XISTO_ORACLE_URL=oracle://user:password@host:port/service
 # (docker: gvenzl/oracle-free on 127.0.0.1:1521, service FREEPDB1). The test creates and drops table XISTO_ITEMS.
+# outbinds.ts: PL/SQL OUT and IN OUT binds (expected-outbinds.txt from tests/oracledb/outbinds.js on node-oracledb 6.10 thin).
 # Without the variable the test is skipped, not failed. expected.txt is what node-oracledb 6 thin prints for the
 # same operations; the client runs in America/Sao_Paulo since DATE and TIMESTAMP are read in the local time zone.
 cd "$(dirname "$0")" || exit 1
@@ -17,4 +18,11 @@ for mode in fast classic; do
     if ! cmp -s expected.txt "$OUT/out.txt"; then echo "FAIL: output ($mode login)"; diff expected.txt "$OUT/out.txt"; exit 1; fi
     if ! grep -q ' 0 still alive' "$OUT/stats.txt"; then echo "FAIL: leak ($mode login): $(cat "$OUT/stats.txt")"; exit 1; fi
 done
-echo "ok: oracledb client (fast and classic login, types, DML, binds, transactions, ORA errors, 250 rows, CLOB/BLOB, 1500 statements, pool, 0 alive)"
+cp outbinds.ts "$OUT/outbinds.ts"
+XISTO_NODE_COMPAT=1 $X build -o "$OUT/outbinds" "$OUT/outbinds.ts" 2>/dev/null || { XISTO_NODE_COMPAT=1 $X build -o "$OUT/outbinds" "$OUT/outbinds.ts"; exit 1; }
+for tz in America/Sao_Paulo; do
+    TZ=$tz XISTO_RC_STATS=1 "$OUT/outbinds" > "$OUT/outbinds.txt" 2> "$OUT/outbinds-stats.txt"
+    if ! cmp -s expected-outbinds.txt "$OUT/outbinds.txt"; then echo "FAIL: OUT binds ($tz)"; diff expected-outbinds.txt "$OUT/outbinds.txt"; exit 1; fi
+    if ! grep -q ' 0 still alive' "$OUT/outbinds-stats.txt"; then echo "FAIL: leak (OUT binds): $(cat "$OUT/outbinds-stats.txt")"; exit 1; fi
+done
+echo "ok: oracledb client (fast and classic login, types, DML, binds, transactions, ORA errors, 250 rows, CLOB/BLOB, 1500 statements, pool, 0 alive; OUT/IN OUT binds by name and position, NUMBER/STRING/DATE/BOOLEAN/CLOB/BLOB, NULL, 32767 bytes, CLOB/BLOB temporary LOBs)"
