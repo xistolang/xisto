@@ -199,6 +199,8 @@ fi
 if sh tests/pg/run.sh > "$OUT/pg-pool.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL pg pool:"; cat "$OUT/pg-pool.txt"; fail=$((fail+1)); fi
 # typeorm: generated SQL for postgres and oracle; a live PostgreSQL when one is up (tests/typeorm/run.sh)
 if sh tests/typeorm/run.sh > "$OUT/typeorm.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL typeorm:"; cat "$OUT/typeorm.txt"; fail=$((fail+1)); fi
+# class-validator: rule semantics against class-validator 0.14 (tests/validator/run.sh)
+if sh tests/validator/run.sh > "$OUT/validator.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL validator:"; cat "$OUT/validator.txt"; fail=$((fail+1)); fi
 # packages: xisto add / install from a local git repository
 if sh tests/pkg/run.sh > "$OUT/pkg.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg.txt")" -ge 7 ] && ! grep -q FAIL "$OUT/pkg.txt"; then pass=$((pass+1)); else echo "FAIL packages:"; cat "$OUT/pkg.txt"; fail=$((fail+1)); fi
 if sh examples/nest-features/test/run.sh > "$OUT/nest-features.txt" 2>&1 && grep -q '^ok: nest-features' "$OUT/nest-features.txt"; then pass=$((pass+1)); else echo "FAIL nest-features:"; cat "$OUT/nest-features.txt"; fail=$((fail+1)); fi

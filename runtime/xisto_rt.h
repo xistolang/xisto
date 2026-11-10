@@ -1691,14 +1691,22 @@ static inline double xs_to_number_id(double x) { return x; }
 
 /* ---- Error ---- */
 
-typedef struct xs_Error { xs_hdr hdr; xs_str *f_message; xs_str *f_name; void *f_cause; xs_trace *trace; xs_str *stack; } xs_Error;
+/* f___thrown: the object a throw carried (an object of a class that extends Error, or another value): instanceof and
+   casts on a caught Error read it. f_cause: new Error(message, { cause }), as in JS (null when not given). */
+typedef struct xs_Error { xs_hdr hdr; xs_str *f_message; xs_str *f_name; void *f___thrown; xs_trace *trace; xs_str *stack; void *f_cause; } xs_Error;
 static void xs_Error_free(void *p) {
     xs_Error *e = p;
-    xs_release(e->f_message); xs_release(e->f_name); xs_release(e->stack); xs_release(e->f_cause);
+    xs_release(e->f_message); xs_release(e->f_name); xs_release(e->stack); xs_release(e->f___thrown); xs_release(e->f_cause);
     free(e->trace);
     xs_obj_free(p);
 }
-static void xs_Error_print(void *p) { fputs("Error: ", XS_OUT); xs_print_str(((xs_Error *)p)->f_message); }
+static void xs_print_any_quoted(void *p);
+/* console.log(err): its first line; a cause as Node prints it below the stack ("{\n  [cause]: ...\n}") */
+static void xs_Error_print(void *p) {
+    xs_Error *e = p;
+    fputs("Error: ", XS_OUT); xs_print_str(e->f_message);
+    if (e->f_cause) { fputs(" {\n  [cause]: ", XS_OUT); xs_print_any_quoted(e->f_cause); fputs("\n}", XS_OUT); }
+}
 __attribute__((noinline)) static void *xs_Error_new(void *msg) {
     xs_Error *e = xs_obj_alloc(sizeof *e, xs_Error_free, xs_Error_print);
     if (msg) e->f_message = xs_retain((xs_str *)msg);
@@ -1713,6 +1721,12 @@ __attribute__((noinline)) static void *xs_Error_new(void *msg) {
     if ((e->trace = malloc(sz))) memcpy(e->trace, src, sz);
     return e;
 }
+/* new Error(message, { cause }): the cause is kept as err.cause (both arguments borrowed) */
+XS_NOINLINE void *xs_Error_new_cause(void *msg, void *cause) {
+    xs_Error *e = xs_Error_new(msg);
+    e->f_cause = xs_retain(cause);
+    return e;
+}
 /* an Error from a C message (native packages): the Error is the message's only owner (xs_Error_new retains) */
 XS_NOINLINE void *xs_Error_from(const char *msg) {
     xs_str *s = xs_str_new(msg, strlen(msg));
@@ -1723,7 +1737,7 @@ XS_NOINLINE void *xs_Error_from(const char *msg) {
 /* throw obj (not an Error): an Error named after the class, with the object as its cause */
 XS_NOINLINE void *xs_Error_wrap(xs_str *name, void *cause) {
     xs_Error *e = xs_Error_new(name);
-    e->f_cause = xs_retain(cause); /* the argument is borrowed */
+    e->f___thrown = xs_retain(cause); /* the argument is borrowed */
     return e;
 }
 /* throw v, v unknown: a caught Error (what a catch gives) is thrown again as it is; another value travels as the
@@ -1741,7 +1755,7 @@ XS_NOINLINE void *xs_Error_wrap_err(void *cause) {
     xs_Error *e = xs_Error_new(o->message);
     xs_release(e->f_name);
     e->f_name = xs_retain(o->name);
-    e->f_cause = xs_retain(cause); /* the argument is borrowed */
+    e->f___thrown = xs_retain(cause); /* the argument is borrowed */
     return e;
 }
 /* String(err): "name: message", or the one that is not empty (an Error, or an object of a class that extends Error:
@@ -1756,7 +1770,7 @@ XS_NOINLINE xs_str *xs_Error_to_string(void *v) {
 }
 /* the object a caught Error was thrown as (an object of a class that extends Error), or NULL */
 static inline void *xs_Error_thrown(void *v) {
-    return v && xs_type_of(v)->free == xs_Error_free ? ((xs_Error *)v)->f_cause : NULL;
+    return v && xs_type_of(v)->free == xs_Error_free ? ((xs_Error *)v)->f___thrown : NULL;
 }
 static inline bool xs_is_a(void *v, void (*free_fn)(void *)) { return v && free_fn && xs_type_of(v)->free == free_fn; }
 /* e.stack: "Error: message" and one "    at ..." line per frame, as in Node; borrowed from the Error */
@@ -3212,6 +3226,11 @@ static xs_str *xs_arr_join_num(xs_arr_num *a, xs_str *sep) { return xs_arr_join_
 static xs_str *xs_arr_join_int(xs_arr_int *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_int, a); }
 static xs_str *xs_arr_join_bool(xs_arr_bool *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_bool, a); }
 static xs_str *xs_arr_join_str(xs_arr_ref *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_str, a); }
+/* (number | null)[] and (int | null)[]: a null slot joins as "", as in JavaScript */
+static void xs_join_num_n(xs_sb *b, void *ctx, size_t i) { if (!xs_isnull_num(((xs_arr_num *)ctx)->data[i])) xs_join_num(b, ctx, i); }
+static void xs_join_int_n(xs_sb *b, void *ctx, size_t i) { if (((xs_arr_int *)ctx)->data[i] != XS_NULL_INT) xs_join_int(b, ctx, i); }
+static xs_str *xs_arr_join_num_n(xs_arr_num *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_num_n, a); }
+static xs_str *xs_arr_join_int_n(xs_arr_int *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_int_n, a); }
 
 /* ---- int: an integer JavaScript represents exactly, |v| <= 2^53 - 1 (Number.MAX_SAFE_INTEGER); leaving that range
    is a runtime error (XB-075): there Node would round the result and print another number. Every int source keeps

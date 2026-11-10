@@ -474,7 +474,7 @@ function badRequestText(r: Route, response: Response, message: string): HttpResp
 
 // the exception filter that catches this error, or -1
 function filterFor(r: Route, e: Error): int {
-  const cause = e.cause;
+  const cause = e.__thrown;
   for (let i = 0; i < r.filters.length; i++) {
     const names0 = __catches.get(r.filterInfos[i].id);
     const names: string[] = names0 || [];
@@ -497,7 +497,7 @@ function failure(r: Route, e: Error, ctx: ExecutionContext): HttpResponse {
   if (f >= 0) {
     const m = r.filterInfos[f].methods.find((x: MethodInfo): boolean => x.name === "catch");
     if (m !== null) {
-      const cause = e.cause;
+      const cause = e.__thrown;
       let thrown: unknown = e;
       if (cause !== null) {
         thrown = cause;
@@ -506,7 +506,7 @@ function failure(r: Route, e: Error, ctx: ExecutionContext): HttpResponse {
       return fromResponse(r, ctx.getResponse());
     }
   }
-  const cause = e.cause;
+  const cause = e.__thrown;
   if (cause instanceof HttpException) {
     const h = cause as HttpException;
     const text = JSON.stringify(h.response);

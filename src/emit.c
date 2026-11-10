@@ -1954,7 +1954,8 @@ static void emit_member(Expr *e) {
             return;
         }
         if (strcmp(op, "join") == 0) {
-            buf_printf(out, "xs_arr_join_%s(", at->elem->kind == TY_STRING || (at->elem->kind == TY_ENUM && at->elem->en->is_string) || (at->elem->kind == TY_NULLABLE && at->elem->elem->kind == TY_STRING) ? "str" : arr_suffix(at));
+            bool nnum = at->elem->kind == TY_NULLABLE && (at->elem->elem->kind == TY_NUMBER || at->elem->elem->kind == TY_INT); /* (number | null)[]: "" for null */
+            buf_printf(out, "xs_arr_join_%s%s(", at->elem->kind == TY_STRING || (at->elem->kind == TY_ENUM && at->elem->en->is_string) || (at->elem->kind == TY_NULLABLE && at->elem->elem->kind == TY_STRING) ? "str" : arr_suffix(at), nnum ? "_n" : "");
             emit_borrowed(base);
             buf_puts(out, ", ");
             if (e->args.len) emit_borrowed(e->args.items[0]); else buf_puts(out, "NULL");

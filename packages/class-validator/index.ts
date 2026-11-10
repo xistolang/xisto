@@ -10,6 +10,7 @@ interface Rule {
   kind: string;
   n: number;
   list: string[];
+  kinds: string; // per list entry: 'n' for a number value, anything else a string (IsIn compares by value and type)
   pattern: RegExp | null;
   custom: ClassInfo | null; // registerDecorator's validator: a @ValidatorConstraint class
   message: string; // the decorator's own message ("" for the default)
@@ -18,14 +19,14 @@ interface Rule {
 const rules: Map<string, Rule[]> = new Map<string, Rule[]>();
 const names: Map<string, string> = new Map<string, string>(); // class name -> class id
 
-function add(c: ClassInfo, f: FieldInfo, kind: string, n: number = 0, list: string[] = [], pattern: RegExp | null = null): void {
+function add(c: ClassInfo, f: FieldInfo, kind: string, n: number = 0, list: string[] = [], pattern: RegExp | null = null, kinds: string = ""): void {
   names.set(c.name, c.id);
   if (!rules.has(c.id)) {
     rules.set(c.id, []);
   }
   const all = rules.get(c.id);
   if (all !== null) {
-    all.push({ field: f, kind: kind, n: n, list: list, pattern: pattern, custom: null, message: "" });
+    all.push({ field: f, kind: kind, n: n, list: list, kinds: kinds, pattern: pattern, custom: null, message: "" });
   }
 }
 
@@ -160,8 +161,14 @@ export function ArrayMinSize(min: int, o: ValidationOptions = {}): (c: ClassInfo
 /** One of the given values. */
 export function IsIn(values: (string | number)[], o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
   const texts: string[] = [];
-  for (const v of values) texts.push(String(v)); // (numbers by their text: inList compares a number value that way)
-  return rule("isIn", 0, texts);
+  let kinds = "";
+  for (const v of values) {
+    texts.push(String(v));
+    kinds += typeof v === "number" ? "n" : "s";
+  }
+  return (c: ClassInfo, f: FieldInfo): void => {
+    add(c, f, "isIn", 0, texts, null, kinds);
+  };
 }
 /** One of an enum's values: pass Object.values(MyEnum) (a string array), as the values to accept. */
 export function IsEnum(values: string[], o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
@@ -247,7 +254,7 @@ function check(r: Rule, v: unknown, prop: string, out: string[], isArr: boolean)
     out.push(`${prop} must contain no more than ${numberText(r.n)} elements`);
   } else if (k === "arrayMinSize" && (!isArr || Number((v as unknown[]).length) < r.n)) {
     out.push(`${prop} must contain at least ${numberText(r.n)} elements`);
-  } else if ((k === "isIn" || k === "isEnum") && !inList(v, r.list)) {
+  } else if ((k === "isIn" || k === "isEnum") && !inList(v, r.list, r.kinds)) {
     out.push(`${prop} must be one of the following values: ${r.list.join(", ")}`);
   } else if (k === "custom") {
     const c = r.custom;
@@ -262,12 +269,23 @@ function check(r: Rule, v: unknown, prop: string, out: string[], isArr: boolean)
   }
 }
 
-function inList(v: unknown, list: string[]): boolean {
+// class-validator's isIn: some(p => p === value), so the string "1" is not the number 1
+function inList(v: unknown, list: string[], kinds: string): boolean {
   if (typeof v === "string") {
-    return list.includes(v as string);
+    for (let i = 0; i < list.length; i++) {
+      if (kinds.charAt(i) !== "n" && list[i] === (v as string)) {
+        return true;
+      }
+    }
+    return false;
   }
   if (typeof v === "number") {
-    return list.includes(`${v as number}`);
+    const t = `${v as number}`;
+    for (let i = 0; i < list.length; i++) {
+      if (kinds.charAt(i) === "n" && list[i] === t) {
+        return true;
+      }
+    }
   }
   return false;
 }
