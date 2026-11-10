@@ -2687,6 +2687,8 @@ static bool check_string_member_more(Expr *e) {
         {"charAt", "xs_str_char_at", 1, 1, TY_INT, TY_VOID, 1},
         {"charCodeAt", "xs_str_code_at", 0, 1, TY_INT, TY_VOID, 3},
         {"codePointAt", "xs_str_code_at", 0, 1, TY_INT, TY_VOID, 3},
+        {"localeCompare", "xs_str_locale_compare", 1, 2, TY_STRING, TY_STRING, 2},
+        {"normalize", "xs_str_normalize", 0, 1, TY_STRING, TY_VOID, 1},
     };
     if (!e->is_call) return false;
     for (size_t i = 0; i < sizeof ms / sizeof ms[0]; i++) {
@@ -5736,6 +5738,22 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->type = ty_int;
                 return;
             }
+            if (e->is_call && strcmp(e->str, "push") == 0 && e->args.len > 1 && rereadable(e->lhs)) {
+                /* xs.push(a, b): xs.push(a); xs.push(b) (in order; the value of the last is the new length) */
+                Expr *seq = xs_alloc(sizeof *seq);
+                seq->kind = E_SEQ; seq->pos = e->pos; seq->field = -1;
+                for (int i = 0; i < e->args.len; i++) {
+                    Expr *p1 = xs_alloc(sizeof *p1);
+                    p1->kind = E_MEMBER; p1->pos = e->args.items[i]->pos; p1->field = -1; p1->is_call = true; p1->str = "push";
+                    p1->lhs = pure_copy(e->lhs);
+                    expr_list_push(&p1->args, e->args.items[i]);
+                    check_expr(p1, NULL);
+                    expr_list_push(&seq->args, p1);
+                }
+                seq->type = ty_void;
+                *e = *seq;
+                return;
+            }
             if (e->is_call && strcmp(e->str, "push") == 0) {
                 if (e->args.len != 1) xs_error(XS7083, e->pos, NULL, "push takes exactly one argument in xisto");
                 check_expr(e->args.items[0], elem);
@@ -6679,6 +6697,12 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->args.items[i] = part = t;
             }
             if (ty_is_any(part->type)) { dyn_wrap(part, "xs_dyn_str", ty_string); continue; } /* ${x}: String(x) */
+            if (part->type->kind == TY_UNION || part->type->kind == TY_UNKNOWN ||
+                (part->type->kind == TY_NULLABLE && part->type->elem->kind == TY_UNION)) { /* ${x} with x: string | number: by what it holds */
+                if (part->type->kind == TY_NULLABLE) to_unknown(part);
+                dyn_wrap(part, "xs_dyn_str", ty_string);
+                continue;
+            }
             TypeKind k = part->type->kind;
             if (k == TY_NULLABLE) { /* ${x} with x: T | null: "null", or "undefined" for x?: T (the text JavaScript writes) */
                 TypeKind ek = part->type->elem->kind;
@@ -6982,6 +7006,13 @@ static void check_nullish(Expr *e, Type *expected) {
     }
     check_expr(e->rhs, want);
     if (e->rhs->type->kind == TY_LITINT && is_numeric(want)) coerce_lit(e->rhs, want);
+    if (!ty_is_any(want) && want->kind != TY_UNKNOWN &&
+        (e->rhs->type->kind == TY_UNKNOWN || (want->kind == TY_STRING && (is_numeric(e->rhs->type) || e->rhs->type->kind == TY_LITINT)))) {
+        /* s ?? row.X with X unknown, s ?? 0: TypeScript gives string | unknown, string | number: an unknown here */
+        to_unknown(l);
+        lt = l->type;
+        want = ty_unknown;
+    }
     Type *res = want;
     if ((e->rhs->type->kind == TY_NULL || e->rhs->type->kind == TY_NULLABLE) && !ty_is_any(want)) res = ty_nullable_of(want);
     expect_type(e->rhs, res, "default after '?\?'");
