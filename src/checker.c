@@ -2484,7 +2484,7 @@ static void check_math(Expr *e) {
         if (generic) {
             Type *t = NULL;
             for (int k = 0; k < e->args.len; k++)
-                if (is_numeric(e->args.items[k]->type)) t = e->args.items[k]->type;
+                if (is_numeric(e->args.items[k]->type) && (!t || e->args.items[k]->type->kind == TY_NUMBER)) t = e->args.items[k]->type; /* (an int among numbers: a number) */
             if (!t || e->args.len == 0) t = ty_number; /* Math.max(): -Infinity */
             for (int k = 0; k < e->args.len; k++) expect_type(e->args.items[k], t, xs_sprintf("argument of Math.%s", fn));
             e->type = t;
@@ -3077,6 +3077,20 @@ static Type *subst_bound(Type *t, Func *tmpl, Type **bind) {
     default: return t; /* (maps, sets, functions of T: left to the second check, as before) */
     }
 }
+static bool names_tparam(Type *t, const char *n) {
+    if (!t) return false;
+    if (t->kind == TY_TPARAM) return t->tname && strcmp(t->tname, n) == 0;
+    if (t->elem && names_tparam(t->elem, n)) return true;
+    if (t->key && names_tparam(t->key, n)) return true;
+    if (t->kind == TY_FUNC || t->kind == TY_UNION) { for (int i = 0; i < t->nparams; i++) if (names_tparam(t->params[i], n)) return true; }
+    if (t->kind == TY_FUNC && names_tparam(t->ret, n)) return true;
+    if (t->kind == TY_OBJECT) for (int i = 0; i < t->ntargs; i++) if (names_tparam(t->targs[i], n)) return true;
+    return false;
+}
+static bool has_tparam_in_params(Func *tmpl, const char *n) {
+    for (int i = 0; i < tmpl->nparams; i++) if (names_tparam(tmpl->params[i].type, n)) return true;
+    return false;
+}
 /* a call of a generic function or method: T from the explicit types, the arguments, or the expected result */
 static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char *what) {
     Type **bind = xs_alloc(sizeof(Type *) * (size_t)tmpl->ntparams);
@@ -3126,6 +3140,8 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
             bind[i] = resolve(tmpl->tdefaults[i], e->pos);
             cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
         }
+    for (int i = 0; i < tmpl->ntparams; i++) /* T that nothing gives (only in the result, as executeQuery<T>(sql)): unknown, as TypeScript infers it */
+        if (!bind[i] && !has_tparam_in_params(tmpl, tmpl->tparams[i])) bind[i] = ty_unknown;
     for (int i = 0; i < tmpl->ntparams; i++)
         if (!bind[i]) xs_error(XS3010, e->pos, xs_sprintf("give it: %s<Type>(...)", tmpl->name), "cannot infer type parameter %s of %s", tmpl->tparams[i], what);
     Func *inst = instantiate_func(tmpl, bind);
@@ -3808,6 +3824,26 @@ static void check_expr_in(Expr *e, Type *expected) {
                 xs_error(XS9901, e->pos, "decorate the class (@Injectable(), @Controller(), ...) so the compiler describes it", "class '%s' is used as a value, but it has no ClassInfo", e->str);
             }
             if (builtin_ctor_value(e, expected)) return;
+            {
+                Enum *en = find_enum(e->str);
+                if (en) { /* an enum as a value (@IsEnum(Status), enum: Status in a Swagger option): its values, as strings */
+                    Pos at = e->pos;
+                    memset(e, 0, sizeof *e);
+                    e->kind = E_ARRAY_LIT; e->pos = at; e->field = -1;
+                    for (int k = 0; k < en->nmembers; k++) {
+                        EnumMember *mb = &en->members[k];
+                        Expr *v = xs_alloc(sizeof *v);
+                        v->kind = E_STRING; v->pos = at; v->field = -1;
+                        v->str = mb->is_string ? mb->sval : xs_sprintf("%lld", mb->ival);
+                        expr_list_push(&e->args, v);
+                    }
+                    static Type *arr_str;
+                    if (!arr_str) arr_str = ty_array_of(ty_string);
+                    check_expr(e, arr_str);
+                    if (expected && expected->kind == TY_UNKNOWN) expect_type(e, expected, "the enum's values");
+                    return;
+                }
+            }
             if (is_builtin_name(e->str)) xs_error(XS8053, e->pos, NULL, "'%s' is built in and not a value", e->str);
             if (strcmp(e->str, "NaN") == 0 || strcmp(e->str, "Infinity") == 0) { /* the global constants */
                 e->kind = E_NUMBER;
@@ -4209,6 +4245,22 @@ static void check_expr_in(Expr *e, Type *expected) {
                     return;
                 }
                 xs_error(XS2011, e->pos, "compare against null first: if (x !== null)", "cannot compare values that may be null");
+            }
+            if ((e->lhs->type->kind == TY_UNKNOWN) != (e->rhs->type->kind == TY_UNKNOWN)) {
+                /* v === '' / v === true with v: unknown: the same value, at run time (as with an any) */
+                Expr *l = e->lhs, *r = e->rhs;
+                Type *ot = l->type->kind == TY_UNKNOWN ? r->type : l->type;
+                if (ot->kind == TY_STRING || ot->kind == TY_BOOLEAN || is_numeric(ot) || ot->kind == TY_LITINT || ot->kind == TY_ENUM) {
+                    if (l->type->kind == TY_LITINT) coerce_lit(l, ty_number);
+                    if (r->type->kind == TY_LITINT) coerce_lit(r, ty_number);
+                    to_any(l);
+                    to_any(r);
+                    xs_any_used = true;
+                    bool neq = e->op == TK_NEQ;
+                    dyn_call(e, "xs_dyn_eq", ty_boolean, l, r, NULL);
+                    if (neq) { Expr *v = expr_copy(e); memset(e, 0, sizeof *e); e->kind = E_UNARY; e->op = TK_NOT; e->pos = v->pos; e->field = -1; e->lhs = v; e->type = ty_boolean; }
+                    return;
+                }
             }
             if (is_numeric(e->lhs->type) || is_numeric(e->rhs->type) || e->lhs->type->kind == TY_LITINT) {
                 Type *t = unify_numeric(e, "equality");
