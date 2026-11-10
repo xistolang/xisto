@@ -698,7 +698,7 @@ function runHandler(r: Route, req: HttpRequest, request: Request, response: Resp
         args[p.index] = f;
       }
     } else {
-      args[p.index] = __custom[p.custom].fn(p.key, ctx);
+      args[p.index] = __custom[p.custom].fn(p.key === "" ? null : p.key, ctx); // @Dec(): data is undefined in Nest
     }
   }
   const result = r.method.invoke(r.instance, args);

@@ -450,7 +450,7 @@ export interface GuardDef {
   guard: ClassInfo;
 }
 export interface CustomParam {
-  fn: (data: string, ctx: ExecutionContext) => unknown;
+  fn: (data: string | null, ctx: ExecutionContext) => unknown;
 }
 /** A method-level setting: version, status code, filters, interceptors (method -1: the whole class). */
 export interface MethodSetting {
@@ -701,7 +701,7 @@ export function UploadedFile(): (c: ClassInfo, m: MethodInfo | null, index: int)
 }
 
 // const UserId = createParamDecorator((data, ctx) => ...); then @UserId() on a parameter
-export function createParamDecorator(fn: (data: string, ctx: ExecutionContext) => unknown): () => (c: ClassInfo, m: MethodInfo | null, index: int) => void {
+export function createParamDecorator(fn: (data: string | null, ctx: ExecutionContext) => unknown): () => (c: ClassInfo, m: MethodInfo | null, index: int) => void {
   const id = __custom.length;
   __custom.push({ fn: fn });
   return (): (c: ClassInfo, m: MethodInfo | null, index: int) => void => param("custom", "", id, null);
