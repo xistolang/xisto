@@ -12,7 +12,7 @@ lib/helper.ts (1, 2 warnings)
          |               ^
     help: write the type: let x: Todo | null = null;
 
-main.ts (5, 1 dynamic path)
+main.ts (5, 1 warning)
   2:1  XS4001  'node:fs' is xisto's implementation of a Node module, not Node itself
        2 | import { readFileSync } from "node:fs";
          | ^
@@ -25,9 +25,10 @@ main.ts (5, 1 dynamic path)
        6 | function twice(x) { return x * 2; }
          |                 ^
     help: parameters need an explicit type: (n: number)
-  7:14  XS2007  note: 'any' takes the dynamic path: read and written by name, checked at run time (slower than a typed value)
+  7:14  XS2007  warning: 'any' takes the dynamic path: each access is looked up by name and checked at run time (about 10x slower than a typed access)
        7 | const loose: any = 1;
          |              ^
+    help: declare a type (an interface, a class, Record<string, T>) to take the typed path
   15:3  XS1008  expected identifier but found 'return'
       15 |   return 1;
          |   ^
@@ -53,12 +54,10 @@ xisto check: 2 files, 6 changes needed in 2 files
         1  lib/helper.ts
 
   warnings (compile; to review)                   uses  files
+    XS2007   dynamic-path                                1      1
     XS2101   deprecated                                  1      1
     XS2106   implicit                                    1      1
   (xisto check --details shows each place; --deny-warnings counts them as changes)
-
-  dynamic path (any): runs, slower                     1      1  optional
-  (compiles: each use is read and written by name and checked at run time; a declared type is faster)
 
   packages:
     @acme/missing                    not installed            1 file  (xisto add <git url> --name @acme/missing)

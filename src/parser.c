@@ -852,6 +852,10 @@ static Expr *parse_arrow(Parser *p) {
 }
 
 static bool tmpl_raw; /* parsing the template of String.raw`...` */
+static bool wants_errors; /* TypeError, RangeError, SyntaxError or ReferenceError was named: xisto:errors is loaded */
+static bool is_js_error_name(const char *n) {
+    return n && (!strcmp(n, "TypeError") || !strcmp(n, "RangeError") || !strcmp(n, "SyntaxError") || !strcmp(n, "ReferenceError"));
+}
 static Expr *parse_primary(Parser *p) {
     Pos pos = p->tok.pos;
     if (at(p, TK_IDENT) && strncmp(p->tok.str, "__reflect_", 10) == 0) { /* __reflect_kind(T) & co: generated code only */
@@ -1179,6 +1183,7 @@ static Expr *parse_primary(Parser *p) {
         }
         Expr *e = new_expr(E_NEW_OBJ, pos);
         e->str = name.str;
+        if (is_js_error_name(name.str)) wants_errors = true;
         if (at(p, TK_LT)) { /* new Stack<number>(): a generic class's type arguments */
             next(p);
             do {
@@ -1245,6 +1250,7 @@ static Expr *ident_expr(Pos pos, const char *name);
 static Expr *ns_member(Parser *p, Expr *e, Token name);
 static Expr *parse_postfix(Parser *p) {
     Expr *e = parse_primary(p);
+    if (e && e->kind == E_IDENT && is_js_error_name(e->str)) wants_errors = true;
     Expr *obase[32];
     char *otmp[32];
     Pos opos[32];
@@ -1281,6 +1287,8 @@ static Expr *parse_postfix(Parser *p) {
                 at_push_call = strcmp(m->str, "push") == 0;
                 parse_args(p, &m->args);
                 at_push_call = false;
+                if (!strcmp(m->str, "splice") && m->args.len == 1) wants_arrays = true; /* xs.splice(i): __xs_spliceFrom */
+                if (!strcmp(m->str, "entries") && m->args.len == 0) wants_arrays = true; /* xs.entries(): __xs_entries */
             }
             e = m;
         } else if (at(p, TK_LBRACKET)) {
@@ -1316,6 +1324,8 @@ static Expr *parse_postfix(Parser *p) {
                 at_push_call = strcmp(m->str, "push") == 0;
                 parse_args(p, &m->args);
                 at_push_call = false;
+                if (!strcmp(m->str, "splice") && m->args.len == 1) wants_arrays = true; /* xs.splice(i): __xs_spliceFrom */
+                if (!strcmp(m->str, "entries") && m->args.len == 0) wants_arrays = true; /* xs.entries(): __xs_entries */
             }
             e = m;
         } else if (at(p, TK_TEMPLATE) && e->kind == E_MEMBER && !e->is_call && e->lhs->kind == E_IDENT && strcmp(e->lhs->str, "String") == 0 &&
@@ -2866,11 +2876,15 @@ static void parse_fields_body(Parser *p, Class *c) {
                     st->expr = as;
                     /* insert at nprops, keeping the order of the parameters */
                     StmtList *l = &f->body->stmts;
-                    /* after super(...): a derived class has no `this` before it */
+                    /* after super(...): a derived class has no `this` before it. Statements that do not use `this` may come
+                       before super(...), as TypeScript allows (const url = config.get(...); super({ url })) */
                     int at0 = nprops;
-                    if (c->base_name && l->len > nprops && l->items[nprops]->kind == S_EXPR && l->items[nprops]->expr->kind == E_CALL &&
-                        l->items[nprops]->expr->lhs && l->items[nprops]->expr->lhs->kind == E_IDENT && strcmp(l->items[nprops]->expr->lhs->str, "super") == 0)
-                        at0 = nprops + 1;
+                    if (c->base_name)
+                        for (int k = 0; k < l->len; k++) {
+                            Stmt *sk = l->items[k];
+                            if (sk->kind == S_EXPR && sk->expr->kind == E_CALL && sk->expr->lhs && sk->expr->lhs->kind == E_IDENT &&
+                                strcmp(sk->expr->lhs->str, "super") == 0) { at0 = k + 1 + nprops; break; }
+                        }
                     stmt_list_push(l, st);
                     memmove(&l->items[at0 + 1], &l->items[at0], sizeof(Stmt *) * (size_t)(l->len - 1 - at0));
                     l->items[at0] = st;
@@ -3043,6 +3057,7 @@ static void add_statics(Program *prog, Module *m, Class *c) {
         int k = c->nstatics_user++;
         c->static_names[k] = f->name;
         f->name = xs_sprintf("%s__s_%s", c->name, f->name);
+        f->static_of = c;
         c->static_gen[k] = f->name;
         c->static_is_method[k] = true;
         f->mod = m;
@@ -3451,6 +3466,7 @@ static Enum *parse_enum(Parser *p) {
    first) then the member's decorators (bottom up); constructor parameters; then the class (bottom up). */
 static bool class_decorated(Class *c) {
     if (c->decos.len) return true;
+    if (c->base_name && strcmp(c->base_name, "Error") == 0) return true; /* an error class: a value too (@Catch(MyError)) */
     if (c->mixin) return true; /* class UpdateDto extends PartialType(CreateDto) {}: a value too (@Body() dto: UpdateDto) */
     for (int i = 0; i < c->nfields; i++) if (c->fields[i].decos.len) return true;
     for (int i = 0; i < c->nmethods; i++) {
@@ -4082,11 +4098,30 @@ static const char xs_arrays_src[] =
     "  for (let i = 0; i < xs.length; i++) { const v = f(xs[i]); if (p(v)) out.push(v!); }\n"
     "  return out;\n"
     "}\n"
+    "export function __xs_entries<T>(xs: T[]): [int, T][] {\n"
+    "  const out: [int, T][] = [];\n"
+    "  for (let i = 0; i < xs.length; i++) out.push([i, xs[i]]);\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_spliceFrom<T>(xs: T[], i: int): T[] {\n"
+    "  const n = xs.length;\n"
+    "  const k = i < 0 ? Math.max(n + i, 0) : Math.min(i, n);\n"
+    "  const out: T[] = [];\n"
+    "  for (let j = k; j < n; j++) out.push(xs[j]);\n"
+    "  while (xs.length > k) xs.pop();\n"
+    "  return out;\n"
+    "}\n"
     "export function __xs_flat<U>(xs: U[][]): U[] {\n"
     "  const out: U[] = [];\n"
     "  for (const ys of xs) for (const y of ys) out.push(y);\n"
     "  return out;\n"
     "}\n";
+/* xisto:errors: JavaScript's Error subclasses, visible in every module like Error itself */
+static const char xs_errors_src[] =
+    "export class TypeError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"TypeError\"; }\n}\n"
+    "export class RangeError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"RangeError\"; }\n}\n"
+    "export class SyntaxError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"SyntaxError\"; }\n}\n"
+    "export class ReferenceError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"ReferenceError\"; }\n}\n";
 /* xisto:reflect: the descriptors the compiler builds for decorated classes (see "static reflection") */
 static const char xs_reflect_src[] =
     "// What a type is, and how to read and write a value of it as JSON.\n"
@@ -4192,6 +4227,15 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->builtin = false;
         m->file = "xisto:arrays";
         m->src = (char *)xs_arrays_src;
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
+    if (strcmp(name, "errors") == 0) { /* xisto:errors: TypeError & co (see xs_errors_src) */
+        m->builtin = false;
+        m->file = "xisto:errors";
+        m->src = (char *)xs_errors_src;
         m->loading = true;
         parse_module(prog, m);
         m->loading = false;
@@ -4405,6 +4449,7 @@ Program *parse_program(const char *entry_file) {
     Program *prog = xs_alloc(sizeof *prog);
     load_module(prog, entry_file, (Pos){0, 0}, NULL);
     if (wants_arrays) load_module(prog, "xisto:arrays", (Pos){1, 1}, entry_file);
+    if (wants_errors) load_module(prog, "xisto:errors", (Pos){1, 1}, entry_file);
     /* top-level statements were appended in parse order (entry first); reorder by module order */
     StmtList ordered = {0};
     for (int mi = 0; mi < prog->nmodules; mi++)

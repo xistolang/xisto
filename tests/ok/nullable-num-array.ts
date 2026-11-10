@@ -1,0 +1,16 @@
+const src: string[] = ["1.5", "", "3", "x"];
+const xs: (number | null)[] = src.map((s) => (s === "" ? null : Number(s)));
+console.log(xs);
+console.log(JSON.stringify(xs), xs.length);
+xs.push(null);
+xs.push(7);
+for (const v of xs) console.log(v === null ? "null!" : v + 1);
+console.log(xs.filter((v) => v != null).length, xs.indexOf(null), xs.includes(null));
+const ks: (int | null)[] = [1, null, 3];
+ks.push(null);
+console.log(ks, ks[1] == null, ks[2]);
+const ys: (number | null)[] = [];
+ys.push(2.5);
+console.log(ys, xs.slice(1, 3), xs.map((v) => v ?? 0));
+const parsed: (number | null)[] = JSON.parse("[1,null,2]");
+console.log(parsed, parsed[1]);
