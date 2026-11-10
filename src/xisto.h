@@ -442,11 +442,18 @@ struct Func {
     void *gen_state;   /* the parser where the parameters start: each instance is parsed again with T bound */
     void *gen_subst;   /* the substitution in force where it was written (a generic method of a generic class's instance) */
     bool gen_method;
+    bool gen_arrow;    /* const f = <T>(x: T) => ...: parsed as a generic function (its body after =>) */
     struct Func **instances;
     char **inst_keys;
     int ninstances;
     struct Func *template_of;
     bool inst_checked;
+    int ret_infer;     /* the return type left out: 1 to infer, 2 being inferred (its body checked), 3 inferred */
+    struct Type *ret_acc; /* while inferred: the type the returns checked so far agree on */
+    bool ret_null, ret_bare; /* a `return null;` / a `return;` among them */
+    bool ret_failed;      /* its body had errors while inferred: uses of its result stop quietly */
+    ExprList ret_exprs;   /* the returned values checked, converted to the type found at the end */
+    ExprList ret_late;    /* `return [];`: checked once the type is known (it has no type by itself) */
     StmtList param_decls; /* f([a, b]: T) / ({ x }) => ...: the declarations that open the body (parser) */
     bool *sa_param_esc; /* stackalloc.c: which parameters may outlive the call (NULL: not analyzed, all may) */
     bool sa_this_esc;
@@ -502,6 +509,7 @@ struct Class {
     int nsubs;
     int nbase_fields;  /* fields[0..nbase_fields) are inherited */
     bool is_abstract;
+    bool iface_methods; /* an interface that declares methods: the base of the class that implements it (checker) */
     int region;        /* region.c: its objects live in that loop's region (allocated there, freed per iteration) */
     int rdual;         /* region.c: dual, made inside that loop and outside it too: in the region while an iteration
                           runs (xs_rg_on_N), on the heap otherwise; counted either way, and freed with the region */
