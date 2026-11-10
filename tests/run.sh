@@ -96,10 +96,15 @@ for d in tests/check/*/; do
     name=check-$(basename "$d")
     $XISTO check "$d" > "$OUT/$name.summary" 2>&1; rc=$?
     $XISTO check --details "$d" > "$OUT/$name.details" 2>&1
-    if [ "$rc" = "$(cat "$d/expected.rc")" ] && cmp -s "$OUT/$name.summary" "$d/expected.summary" && cmp -s "$OUT/$name.details" "$d/expected.details"; then
+    # (a folder with an `entry` file: also checked from that .ts file, whose report counts the packages the libs it
+    # reaches import: expected.entry)
+    if [ -f "$d/entry" ]; then $XISTO check "$d/$(cat "$d/entry")" > "$OUT/$name.entry" 2>&1; else : > "$OUT/$name.entry"; fi
+    if [ "$rc" = "$(cat "$d/expected.rc")" ] && cmp -s "$OUT/$name.summary" "$d/expected.summary" && cmp -s "$OUT/$name.details" "$d/expected.details" &&
+       { [ ! -f "$d/entry" ] || cmp -s "$OUT/$name.entry" "$d/expected.entry"; }; then
         pass=$((pass+1))
     else
-        echo "FAIL $d: xisto check (exit $rc)"; diff "$d/expected.summary" "$OUT/$name.summary" | head; diff "$d/expected.details" "$OUT/$name.details" | head; fail=$((fail+1))
+        echo "FAIL $d: xisto check (exit $rc)"; diff "$d/expected.summary" "$OUT/$name.summary" | head; diff "$d/expected.details" "$OUT/$name.details" | head
+        [ -f "$d/entry" ] && diff "$d/expected.entry" "$OUT/$name.entry" | head; fail=$((fail+1))
     fi
 done
 
@@ -186,6 +191,7 @@ if sh tests/typeorm/run.sh > "$OUT/typeorm.txt" 2>&1; then pass=$((pass+1)); els
 # packages: xisto add / install from a local git repository
 if sh tests/pkg/run.sh > "$OUT/pkg.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg.txt")" -ge 7 ] && ! grep -q FAIL "$OUT/pkg.txt"; then pass=$((pass+1)); else echo "FAIL packages:"; cat "$OUT/pkg.txt"; fail=$((fail+1)); fi
 if sh examples/nest-features/test/run.sh > "$OUT/nest-features.txt" 2>&1 && grep -q '^ok: nest-features' "$OUT/nest-features.txt"; then pass=$((pass+1)); else echo "FAIL nest-features:"; cat "$OUT/nest-features.txt"; fail=$((fail+1)); fi
+if sh examples/nest-auth/test/run.sh > "$OUT/nest-auth.txt" 2>&1 && grep -q '^ok: nest-auth' "$OUT/nest-auth.txt"; then pass=$((pass+1)); else echo "FAIL nest-auth:"; cat "$OUT/nest-auth.txt"; fail=$((fail+1)); fi
 
 # redis package against a live server (skipped without one)
 if sh tests/redis/run.sh > "$OUT/redis.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/redis.txt"; else echo "FAIL redis:"; cat "$OUT/redis.txt"; fail=$((fail+1)); fi

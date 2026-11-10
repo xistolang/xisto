@@ -1,0 +1,7 @@
+{
+  "name": "rxjs",
+  "version": "0.1.0",
+  "license": "MIT",
+  "implements": { "rxjs": "^7" },
+  "main": "index.ts"
+}
