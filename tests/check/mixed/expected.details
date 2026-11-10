@@ -8,7 +8,7 @@ lib/helper.ts (2)
          |               ^
     help: xisto's one empty value is null: write null, and test with x == null (true for an absent optional too)
 
-main.ts (7)
+main.ts (5, 1 dynamic path)
   2:1  XS4001  'node:fs' is xisto's implementation of a Node module, not Node itself
        2 | import { readFileSync } from "node:fs";
          | ^
@@ -21,10 +21,9 @@ main.ts (7)
        6 | function twice(x) { return x * 2; }
          |                 ^
     help: parameters need an explicit type: (n: number)
-  7:14  XS2007  'any' is not supported
+  7:14  XS2007  note: 'any' takes the dynamic path: read and written by name, checked at run time (slower than a typed value)
        7 | const loose: any = 1;
          |              ^
-    help: every value in xisto has one static type
   15:3  XS1008  expected identifier but found 'return'
       15 |   return 1;
          |   ^
@@ -33,16 +32,12 @@ main.ts (7)
       18 | const n: int = 3.5;
          |                ^
     help: convert explicitly: Math.trunc(x), Math.floor(x), Math.ceil(x) or Math.round(x)
-  19:6  XS1009  expected ';' but found ':'
-      19 | label: for (let i = 0; i < 2; i++) break label;
-         |      ^
-    help: xisto requires explicit semicolons; automatic semicolon insertion is not supported
 
-xisto check: 2 files, 9 changes needed in 2 files
+xisto check: 2 files, 7 changes needed in 2 files
 
   kind of change                                 changes  files  fix
-  syntax xisto does not read                           2      1  manual
-  dynamic value (any, undefined, maybe null)           2      2  manual
+  syntax xisto does not read                           1      1  manual
+  dynamic value (any, undefined, maybe null)           1      1  manual
   missing type annotation                              1      1  manual
   Node module import (node:x -> xisto:x)               1      1  automatic
   module or package not available                      1      1  package
@@ -50,8 +45,11 @@ xisto check: 2 files, 9 changes needed in 2 files
   (3 follow-on errors of these hidden)
 
   most changes:
-        7  main.ts
+        5  main.ts
         2  lib/helper.ts
+
+  dynamic path (any): runs, slower                     1      1  optional
+  (compiles: each use is read and written by name and checked at run time; a declared type is faster)
 
   packages:
     @acme/missing                    not installed            1 file  (xisto add <git url> --name @acme/missing)

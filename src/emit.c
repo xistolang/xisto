@@ -2254,15 +2254,87 @@ static char *emit_clone(Func *f, int csite) {
     return name;
 }
 
+/* any (checker.c, the dynamic path): each class's fields by name, offset and kind, for x.f / x[k] on an any. A field
+   of a class type is written only with an object of that class (or a subclass): its isa function says. */
+static const char *dyn_ref(Class *c) { return xs_any_used ? xs_sprintf(", .dyn = &%s_dyn", c->cname) : ""; }
+static const char *dyn_isa(Program *p, Type *t, Buf *fns) {
+    static char **made;
+    static int nmade;
+    const char *name = NULL;
+    Buf body = {0};
+    switch (t->kind) {
+    case TY_OBJECT:
+        if (t->cls->builtin) {
+            if (strcmp(t->cls->name, "Date") != 0) return NULL;
+            name = "xs_dynisa_Date";
+            buf_puts(&body, "return xs_type_of(v)->free == xs_Date_free;");
+            break;
+        }
+        name = xs_sprintf("xs_dynisa_%s", t->cls->cname);
+        buf_puts(&body, "void (*f_)(void *) = xs_type_of(v)->free; return 0");
+        for (int i = 0; i < p->nclasses; i++) {
+            Class *k = p->classes[i];
+            if (k->used && !k->builtin && is_sub(k, t->cls)) buf_printf(&body, " || f_ == %s_free", k->cname);
+        }
+        buf_puts(&body, ";");
+        break;
+    case TY_ARRAY:
+        name = xs_sprintf("xs_dynisa_%s", arr_struct(t));
+        buf_printf(&body, "return xs_type_of(v)->free == %s_free;", arr_struct(t));
+        break;
+    case TY_MAP: case TY_SET: name = "xs_dynisa_map"; buf_puts(&body, "return xs_type_of(v)->free == xs_map_free;"); break;
+    case TY_FUNC: name = "xs_dynisa_fn"; buf_puts(&body, "return xs_type_of(v)->print == xs_print_closure;"); break;
+    default: return NULL;
+    }
+    for (int i = 0; i < nmade; i++) if (strcmp(made[i], name) == 0) { free(body.data); return name; }
+    made = realloc(made, sizeof(char *) * (size_t)(nmade + 1));
+    made[nmade++] = (char *)name;
+    buf_printf(fns, "static bool %s(void *v) { %s }\n", name, body.data);
+    free(body.data);
+    return name;
+}
+static void emit_dyn_tables(Program *p) {
+    for (int i = 0; i < p->nclasses; i++)
+        if (p->classes[i]->used && !p->classes[i]->builtin) buf_printf(out, "static void %s_free(void *p);\n", p->classes[i]->cname);
+    Buf fns = {0}, tabs = {0};
+    for (int i = 0; i < p->nclasses; i++) {
+        Class *c = p->classes[i];
+        if (!c->used || c->builtin) continue;
+        if (c->nfields) buf_printf(&tabs, "static const xs_dyn_field %s_dynf[] = {\n", c->cname);
+        for (int k = 0; k < c->nfields; k++) {
+            Field *f = &c->fields[k];
+            Type *t = f->type;
+            bool nul = t->kind == TY_NULLABLE;
+            Type *b = nul ? t->elem : t;
+            const char *kind, *isa = NULL;
+            if (b->kind == TY_NUMBER) kind = nul ? "XD_NNUM" : "XD_NUM";
+            else if (int_like(b) || b->kind == TY_LITINT) kind = nul ? "XD_NINT" : "XD_INT";
+            else if (b->kind == TY_BOOLEAN) kind = nul ? "XD_NBOOL" : "XD_BOOL";
+            else if (b->kind == TY_STRING || b->kind == TY_ENUM) kind = "XD_STR";
+            else if (b->kind == TY_UNKNOWN || b->kind == TY_UNION) kind = "XD_ANY";
+            else { kind = "XD_REF"; isa = dyn_isa(p, b, &fns); }
+            buf_printf(&tabs, "    {\"%s\", %zu, (uint32_t)offsetof(%s, %s), %s, %d, %d, %s, \"%s\"},\n", f->name, strlen(f->name), c->cname, f->cname, kind,
+                       nul || f->optional, f->optional, isa ? isa : "NULL", ty_name(b));
+        }
+        if (c->nfields) buf_puts(&tabs, "};\n");
+        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s};\n", c->cname, c->name, c->nfields, c->nfields ? xs_sprintf("%s_dynf", c->cname) : "NULL");
+    }
+    if (fns.data) buf_puts(out, fns.data);
+    if (tabs.data) buf_puts(out, tabs.data);
+    free(fns.data);
+    free(tabs.data);
+}
 /* C expression: `expr` (an unknown) checked and converted to t, as `expr as t` */
+static bool fu_dyn; /* from an any: an int may come as a number with no fraction (JavaScript has only numbers) */
 static char *from_unknown(Type *t, const char *expr) {
     bool nul = t->kind == TY_NULLABLE;
     Type *b = nul ? t->elem : t;
     const char *what = ty_name(t);
+    const char *as_int = fu_dyn ? "xs_dyn_as_int" : "xs_as_int";
     switch (b->kind) {
-    case TY_INT: return xs_sprintf("xs_as_int%s(%s)", nul ? "_or_null" : "", expr);
+    case TY_INT: return xs_sprintf("%s%s(%s)", as_int, nul ? "_or_null" : "", expr);
     case TY_ENUM:
-        if (!b->en->is_string) return xs_sprintf("xs_as_int%s(%s)", nul ? "_or_null" : "", expr);
+        if (!b->en->is_string) return xs_sprintf("%s%s(%s)", as_int, nul ? "_or_null" : "", expr);
         return xs_sprintf("((xs_str *)xs_as_ref(%s, xs_str_free, %d, \"%s\"))", expr, nul, what);
     case TY_STRING: return xs_sprintf("((xs_str *)xs_as_ref(%s, xs_str_free, %d, \"%s\"))", expr, nul, what);
     case TY_NUMBER: return xs_sprintf("xs_as_num%s(%s)", nul ? "_or_null" : "", expr);
@@ -2506,7 +2578,9 @@ static void emit_expr_raw(Expr *e) {
             /* f() as number: unbox the fresh box, then let it go */
             static int nub;
             int id = nub++;
+            fu_dyn = ty_is_any(e->lhs->type);
             buf_printf(out, "({ void *ub%d_ = %s; %s uv%d_ = %s; xs_release(ub%d_); uv%d_; })", id, b.data, ctype(e->type), id, from_unknown(e->elem_type, xs_sprintf("ub%d_", id)), id, id);
+            fu_dyn = false;
             free(b.data);
             return;
         }
@@ -2531,7 +2605,9 @@ static void emit_expr_raw(Expr *e) {
             free(b.data);
             return;
         }
+        fu_dyn = e->lhs->type && ty_is_any(e->lhs->type);
         buf_puts(out, from_unknown(e->elem_type, b.data));
+        fu_dyn = false;
         free(b.data);
         return;
     }
@@ -2756,7 +2832,7 @@ static void emit_expr_raw(Expr *e) {
             buf_printf(out, "({ %s oo%d_ = ", ctype(lt), id);
             if (ref) emit_owned(e->lhs); else emit_expr(e->lhs);
             const char *v = xs_sprintf("oo%d_", id);
-            const char *test = qq ? not_null(lt, v) : lt->kind == TY_STRING ? xs_sprintf("xs_str_truthy(%s)", v)
+            const char *test = qq ? not_null(lt, v) : ty_is_any(lt) ? xs_sprintf("xs_dyn_truthy(%s)", v) : lt->kind == TY_STRING ? xs_sprintf("xs_str_truthy(%s)", v)
                              : lt->elem->kind == TY_STRING ? xs_sprintf("(%s && xs_str_truthy(%s))", v, v) : not_null(lt, v);
             buf_printf(out, "; %s or%d_; if (%s) or%d_ = oo%d_; else { %sor%d_ = ", ctype(e->type), id, test, id, id, ref ? xs_sprintf("xs_release(oo%d_); ", id) : "", id);
             if (ref) emit_owned(e->args.items[0]); else emit_expr(e->args.items[0]);
@@ -3233,6 +3309,20 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, "}, ");
             if (timeout) emit_expr(timeout); else buf_puts(out, "-1");
             buf_puts(out, ")");
+            return;
+        }
+        if (e->lhs && e->lhs->type && e->lhs->type->kind == TY_FUNC && !e->func && !e->builtin.cfn &&
+            e->lhs->kind != E_IDENT && e->lhs->kind != E_THIS && !(e->lhs->kind == E_MEMBER && !e->lhs->is_call)) {
+            /* (() => ...)(), f(a)(b): the function value once, in a temporary */
+            static int ncc;
+            int id = ncc++;
+            buf_printf(out, "({ xs_closure *cc%d_ = (xs_closure *)", id);
+            emit_borrowed(e->lhs);
+            buf_puts(out, "; ");
+            emit_closure_call_prefix(e->lhs->type);
+            buf_printf(out, "cc%d_->fn)(cc%d_", id, id);
+            emit_args_borrowed(&e->args, true);
+            buf_puts(out, "); })");
             return;
         }
         if (e->lhs && e->lhs->type && e->lhs->type->kind == TY_FUNC && !e->func && !e->builtin.cfn) { /* calling a closure value */
@@ -9503,6 +9593,7 @@ void emit_program(Program *p, Buf *o) {
     nl();
     buf_puts(out, "}\n");
     out = main_out;
+    if (xs_any_used) emit_dyn_tables(p); /* any: every class's fields by name (before the descriptors that point to them) */
     /* class free/print prototypes are needed by JSON parsers that allocate objects */
     for (int i = 0; i < p->nclasses; i++)
         if (p->classes[i]->used && !p->classes[i]->builtin) {
@@ -9518,13 +9609,13 @@ void emit_program(Program *p, Buf *o) {
                 }
                 if (holds) buf_printf(out, "static void %s_drop(void *p);\n", c->cname);
                 if (rrefs) buf_printf(out, "static void %s_rref(void *p);\n", c->cname);
-                buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, %s_print, NULL, %s, %s};\n", c->cname, c->cname, c->cname,
-                           holds ? xs_sprintf("%s_drop", c->cname) : "NULL", rrefs ? xs_sprintf("%s_rref", c->cname) : "NULL");
+                buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, %s_print, NULL, %s, %s%s};\n", c->cname, c->cname, c->cname,
+                           holds ? xs_sprintf("%s_drop", c->cname) : "NULL", rrefs ? xs_sprintf("%s_rref", c->cname) : "NULL", dyn_ref(c));
             } else if (c->rdual) {
                 buf_printf(out, "static void %s_rref(void *p);\n", c->cname);
-                buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, %s_print, NULL, NULL, %s_rref};\n", c->cname, c->cname, c->cname, c->cname);
+                buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, %s_print, NULL, NULL, %s_rref%s};\n", c->cname, c->cname, c->cname, c->cname, dyn_ref(c));
             } else
-            buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, %s_print, %s};\n", c->cname, c->cname, c->cname, cy ? xs_sprintf("%s_visit", c->cname) : "NULL");
+            buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, %s_print, %s%s};\n", c->cname, c->cname, c->cname, cy ? xs_sprintf("%s_visit", c->cname) : "NULL", dyn_ref(c));
         }
     {
         /* literal declarations and their initializer, for the literals the emitted code references */
@@ -9575,6 +9666,17 @@ void emit_program(Program *p, Buf *o) {
                      "    XS_JU_ARR_(xs_arr_bool, xs_sb_bool)\n"
                      "    XS_JU_ARR_(xs_arr_ref, xs_json_unknown)\n"
                      "#undef XS_JU_ARR_\n");
+        if (xs_any_used) /* an object made as an any: a Record<string, any> */
+            buf_puts(&u, "    if (f_ == xs_map_free && ((xs_map *)v)->str_keys) {\n"
+                         "        xs_map *m_ = v; xs_map_entry *e_; bool first_ = true; xs_sb_put(sb, \"{\", 1);\n"
+                         "        XS_MAP_EACH(m_, e_) {\n"
+                         "            if (!first_) xs_sb_put(sb, \",\", 1); first_ = false; xs_sb_str(sb, e_->skey); xs_sb_put(sb, \":\", 1);\n"
+                         "            if (m_->val_kind == 0) xs_sb_num(sb, e_->val.d); else if (m_->val_kind == 1) xs_sb_int(sb, e_->val.i);\n"
+                         "            else if (m_->val_kind == 2) xs_sb_bool(sb, e_->val.i != 0); else xs_json_unknown(sb, e_->val.p);\n"
+                         "        }\n"
+                         "        xs_sb_put(sb, \"}\", 1); return;\n"
+                         "    }\n"
+                         "    if (f_ == xs_Date_free) { xs_sb_date(sb, v); return; }\n");
         for (int i = 0; i < ncls; i++)
             buf_printf(&u, "    if (f_ == %s_free) { json_put_%s(sb, (%s *)v); return; }\n", cls[i]->cname, type_tag(ty_object_of(cls[i])), cls[i]->cname);
         buf_puts(&u, "    xs_panic(\"TypeError: this value cannot be written as JSON\");\n}\n");

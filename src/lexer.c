@@ -335,18 +335,35 @@ Token lexer_next(Lexer *lx) {
     if (c == '`') { /* template literal: keep the raw text; the parser splits it into parts */
         advance(lx);
         int depth = 0;
+        char last = 0; /* inside ${...}: the last character that is not a space (a '/' after an operator starts a regex) */
         for (;;) {
             char d = peek(lx, 0);
             if (!d) { if (xs_lex_skipping) return make(lx, TK_EOF, pos, start); xs_error(XS1036, pos, NULL, "unterminated template literal"); }
             if (d == '`' && depth == 0) break;
             if (d == '\\') { advance(lx); if (peek(lx, 0)) advance(lx); continue; }
-            if (d == '$' && peek(lx, 1) == '{') { advance(lx); advance(lx); depth++; continue; }
+            if (d == '$' && peek(lx, 1) == '{') { advance(lx); advance(lx); depth++; last = '{'; continue; }
+            if (d == '/' && depth && peek(lx, 1) != '/' && peek(lx, 1) != '*' && (!last || strchr("({[,=:?!&|+-*%<>~^;", last))) {
+                /* ${s.replace(/"/g, "'")}: a regex, whose quotes and braces are its own */
+                advance(lx);
+                bool in_class = false;
+                while (peek(lx, 0) && peek(lx, 0) != '\n' && (peek(lx, 0) != '/' || in_class)) {
+                    char r = advance(lx);
+                    if (r == '\\' && peek(lx, 0)) advance(lx);
+                    else if (r == '[') in_class = true;
+                    else if (r == ']') in_class = false;
+                }
+                if (peek(lx, 0) == '/') advance(lx);
+                last = 'a';
+                continue;
+            }
+            if (depth && d != ' ' && d != '\t' && d != '\n') last = d;
             if (d == '{' && depth) depth++;
             if (d == '}' && depth) depth--;
             if ((d == '"' || d == '\'') && depth) { /* a string inside ${...} */
                 char q = advance(lx);
                 while (peek(lx, 0) && peek(lx, 0) != q) { if (peek(lx, 0) == '\\') advance(lx); advance(lx); }
                 if (peek(lx, 0)) advance(lx);
+                last = 'a';
                 continue;
             }
             advance(lx);

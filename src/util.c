@@ -137,6 +137,7 @@ static const struct { const char *id, *title, *fix; } cat_table[DC_COUNT] = {
     [DC_DECLARATION] = {"declaration", "unknown, duplicate or unexported name", "manual"},
     [DC_INTERNAL] = {"internal", "internal compiler error", "report"},
     [DC_SEMANTIC] = {"semantic", "may behave differently from Node", "review"},
+    [DC_DYNPATH] = {"dynamic-path", "dynamic path (any): runs, slower", "optional"},
 };
 const char *xs_diag_cat_title(DiagCat c) { return c < DC_COUNT ? cat_table[c].title : ""; }
 const char *xs_diag_cat_fix(DiagCat c) { return c < DC_COUNT ? cat_table[c].fix : ""; }
@@ -216,6 +217,13 @@ void xs_warn(Pos pos, const char *help, const char *fmt, ...) {
     xs_warning_count++;
 }
 
+/* a use of any: compiles (the dynamic path), so it is no change to make; xisto check lists it apart */
+void xs_note_dynamic(Pos pos) {
+    if (!xs_check_mode || !xs_json_errors) return;
+    report(XS2007, "note", pos, "a declared type (an interface, a class, Record<string, T>) takes the typed path, with no check at run time",
+           "'any' takes the dynamic path: read and written by name, checked at run time (slower than a typed value)");
+}
+
 static int edit_distance(const char *a, const char *b) {
     size_t la = strlen(a), lb = strlen(b);
     int *prev = xs_alloc(sizeof(int) * (lb + 1)), *cur = xs_alloc(sizeof(int) * (lb + 1));
@@ -276,9 +284,10 @@ void stmt_list_push(StmtList *l, Stmt *s) {
 
 static Type t_number = {.kind = TY_NUMBER}, t_int = {.kind = TY_INT}, t_litint = {.kind = TY_LITINT},
             t_boolean = {.kind = TY_BOOLEAN}, t_string = {.kind = TY_STRING}, t_void = {.kind = TY_VOID}, t_null = {.kind = TY_NULL},
-            t_json = {.kind = TY_JSON}, t_unknown = {.kind = TY_UNKNOWN};
+            t_json = {.kind = TY_JSON}, t_unknown = {.kind = TY_UNKNOWN},
+            t_any = {.kind = TY_UNKNOWN, .tname = "any"}; /* any: an unknown read and written by name (the dynamic path) */
 Type *ty_number = &t_number, *ty_int = &t_int, *ty_litint = &t_litint, *ty_boolean = &t_boolean,
-     *ty_string = &t_string, *ty_void = &t_void, *ty_null = &t_null, *ty_json = &t_json, *ty_unknown = &t_unknown;
+     *ty_string = &t_string, *ty_void = &t_void, *ty_null = &t_null, *ty_json = &t_json, *ty_unknown = &t_unknown, *ty_any = &t_any;
 
 Type *ty_nullable_of(Type *inner) {
     if (inner->kind == TY_NULLABLE) return inner;
@@ -413,7 +422,7 @@ const char *ty_name(Type *t) {
         return b.data;
     }
     case TY_JSON: return "object";
-    case TY_UNKNOWN: return "unknown";
+    case TY_UNKNOWN: return t->tname ? t->tname : "unknown";
     case TY_MAP: return xs_sprintf("Map<%s, %s>", ty_name(t->key), ty_name(t->elem));
     case TY_SET: return xs_sprintf("Set<%s>", ty_name(t->elem));
     case TY_STREAM: return xs_sprintf("Stream<%s>", ty_name(t->elem));

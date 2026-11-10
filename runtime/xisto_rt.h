@@ -574,6 +574,9 @@ typedef struct __attribute__((aligned(64))) xs_type {
        the region is rewound; rref takes away its references to other objects of the region (XISTO_REGION_CHECK) */
     void (*drop)(void *);
     void (*rref)(void *);
+    /* the program's classes when it uses `any` (src/checker.c, dynamic path): their fields by name, read and
+       written through x.f / x[k] on an any; NULL otherwise */
+    const struct xs_dyn_cls *dyn;
 } xs_type;
 /* hdr.cls: the size class in the low bits, then the flags */
 #define XS_CLS_MASK 31    /* size class of the block (8-byte steps), 0 = not pooled */
@@ -2545,9 +2548,9 @@ XS_NOINLINE double xs_as_num_or_null(void *v) { return v ? xs_as_num(v) : xs_nul
 XS_NOINLINE int8_t xs_as_bool_or_null(void *v) { return v ? (int8_t)xs_as_bool(v) : XS_NULL_BOOL; }
 /* typeof: immortal strings, so the result needs no release */
 static xs_str *xs_typeof_lit(const char *s) {
-    static xs_str *made[6];
-    static const char *names[6] = {"string", "number", "boolean", "object", "function", "undefined"};
-    for (int i = 0; i < 6; i++)
+    static xs_str *made[7];
+    static const char *names[7] = {"string", "number", "boolean", "object", "function", "undefined", "symbol"};
+    for (int i = 0; i < 7; i++)
         if (strcmp(s, names[i]) == 0) {
             if (!made[i]) made[i] = xs_str_immortal(names[i], strlen(names[i]));
             return made[i];
@@ -2555,16 +2558,307 @@ static xs_str *xs_typeof_lit(const char *s) {
     return xs_typeof_lit("object");
 }
 static void xs_print_closure(void *p);
+/* ---- symbol: Symbol("desc"), a value equal only to itself (Nest's injection tokens); description as given ---- */
+typedef struct xs_Symbol { xs_hdr hdr; xs_str *f_description; int64_t f___id; } xs_Symbol;
+static void xs_Symbol_free(void *p) { xs_release(((xs_Symbol *)p)->f_description); xs_obj_free(p); }
+static void xs_Symbol_print(void *p) {
+    xs_Symbol *y = p;
+    fputs("Symbol(", XS_OUT);
+    if (y->f_description) xs_print_str(y->f_description);
+    fputs(")", XS_OUT);
+}
+static int64_t xs_symbol_ids;
+XS_NOINLINE xs_Symbol *xs_Symbol_new(xs_str *description) {
+    xs_Symbol *y = xs_obj_alloc(sizeof *y, xs_Symbol_free, xs_Symbol_print);
+    y->f_description = xs_retain(description);
+    y->f___id = __atomic_add_fetch(&xs_symbol_ids, 1, __ATOMIC_RELAXED);
+    return y;
+}
+static xs_str *xs_str_concat(xs_str *a, xs_str *b);
+/* String(sym): "Symbol(desc)" */
+XS_NOINLINE xs_str *xs_Symbol_to_string(xs_Symbol *y) {
+    xs_str *d = y->f_description;
+    size_t n = d ? (size_t)d->len : 0;
+    xs_str *r = xs_str_new("Symbol(", 7);
+    xs_str *t = xs_str_new(d ? d->data : "", n);
+    xs_str *a = xs_str_concat(r, t);
+    xs_release(r);
+    xs_release(t);
+    xs_str *close = xs_str_new(")", 1);
+    xs_str *out = xs_str_concat(a, close);
+    xs_release(a);
+    xs_release(close);
+    return out;
+}
 XS_NOINLINE xs_str *xs_typeof(void *v) {
     if (!v) return xs_typeof_lit("object"); /* typeof null */
     void (*f)(void *) = xs_type_of(v)->free;
     if (f == xs_str_free) return xs_typeof_lit("string");
     if (f == xs_box_int_free || f == xs_box_num_free) return xs_typeof_lit("number");
     if (f == xs_box_bool_free) return xs_typeof_lit("boolean");
+    if (f == xs_Symbol_free) return xs_typeof_lit("symbol");
     if (xs_type_of(v)->print == xs_print_closure) return xs_typeof_lit("function");
     return xs_typeof_lit("object");
 }
 static void xs_print_closure(void *p) { (void)p; fputs("[Function]", XS_OUT); }
+
+/* ---- any: the dynamic path (MANIFESTO, "Ponto importante: any"). An any is an unknown (a reference, primitives
+   boxed) the program reads and writes by name. An object of a class keeps its struct: x.f and x[k] go through
+   the class's field table (xs_dyn_cls, generated per class when the program uses any), so it takes no memory
+   of its own; a name the class does not have is a TypeError (JavaScript would read undefined, or add the
+   field). An object made as an any ({} or { a: 1 } typed any) is a Record<string, unknown>. ---- */
+enum { XD_NUM, XD_INT, XD_BOOL, XD_NNUM, XD_NINT, XD_NBOOL, XD_STR, XD_REF, XD_ANY };
+typedef struct { const char *name; uint32_t len, off; uint8_t kind, nullable, optional; bool (*isa)(void *); const char *tname; } xs_dyn_field;
+typedef struct xs_dyn_cls { const char *name; int32_t n; const xs_dyn_field *f; } xs_dyn_cls;
+static double xs_str_to_number(xs_str *s);
+static xs_str *xs_str_from_int(int64_t v);
+static const xs_dyn_field *xs_dyn_field_of(const xs_dyn_cls *c, xs_str *k) {
+    for (int32_t i = 0; i < c->n; i++)
+        if (c->f[i].len == (uint32_t)k->len && memcmp(c->f[i].name, k->data, (size_t)k->len) == 0) return &c->f[i];
+    return NULL;
+}
+static const char *xs_dyn_what(void *v) {
+    if (!v) return "null";
+    const xs_type *t = xs_type_of(v);
+    if (t->dyn) return t->dyn->name;
+    if (t->free == xs_str_free) return "a string";
+    if (t->free == xs_box_int_free || t->free == xs_box_num_free) return "a number";
+    if (t->free == xs_box_bool_free) return "a boolean";
+    if (t->free == xs_map_free) return "a Map";
+    if (t->free == xs_arr_ref_free || t->free == xs_arr_num_free || t->free == xs_arr_int_free || t->free == xs_arr_bool_free) return "an array";
+    if (t->print == xs_print_closure) return "a function";
+    return "an object";
+}
+XS_NOINLINE void xs_dyn_fail_read(void *o, xs_str *k) {
+    static XS_TLS char buf[300];
+    if (!o) snprintf(buf, sizeof buf, "TypeError: Cannot read properties of null (reading '%.*s')", (int)(k->len > 100 ? 100 : k->len), k->data);
+    else snprintf(buf, sizeof buf, "TypeError: %s has no field '%.*s' (an any reads the fields its class declares)", xs_dyn_what(o), (int)(k->len > 100 ? 100 : k->len), k->data);
+    xs_panic(buf);
+}
+XS_NOINLINE void xs_dyn_fail_write(void *o, xs_str *k, const char *why) {
+    static XS_TLS char buf[300];
+    if (!o) snprintf(buf, sizeof buf, "TypeError: Cannot set properties of null (setting '%.*s')", (int)(k->len > 100 ? 100 : k->len), k->data);
+    else snprintf(buf, sizeof buf, "TypeError: cannot set '%.*s' of %s: %s", (int)(k->len > 100 ? 100 : k->len), k->data, xs_dyn_what(o), why);
+    xs_panic(buf);
+}
+/* a field's value as an any (owned) */
+static void *xs_dyn_load(const xs_dyn_field *f, void *o) {
+    char *p = (char *)o + f->off;
+    switch (f->kind) {
+    case XD_NUM: return xs_box_num(*(double *)p);
+    case XD_INT: return xs_box_int(*(int64_t *)p);
+    case XD_BOOL: return xs_box_bool(*(bool *)p);
+    case XD_NNUM: return xs_box_num_or_null(*(double *)p);
+    case XD_NINT: return xs_box_int_or_null(*(int64_t *)p);
+    case XD_NBOOL: return xs_box_bool_or_null(*(int8_t *)p);
+    default: return xs_retain_(*(void **)p);
+    }
+}
+static void *xs_dyn_map_val(xs_map *m, xs_val v) {
+    switch (m->val_kind) {
+    case 0: return xs_box_num(v.d);
+    case 1: return xs_box_int(v.i);
+    case 2: return xs_box_bool(v.i != 0);
+    default: return xs_retain_(v.p);
+    }
+}
+XS_NOINLINE int64_t xs_dyn_as_int(void *v);
+XS_NOINLINE double xs_dyn_as_num(void *v) { return xs_as_num(v); }
+/* o.k / o[k] on an any: an owned any (null for a key a Record does not have, as JavaScript's undefined) */
+XS_NOINLINE void *xs_dyn_get(void *o, xs_str *k) {
+    if (!o) xs_dyn_fail_read(o, k);
+    const xs_type *t = xs_type_of(o);
+    if (t->dyn) {
+        const xs_dyn_field *f = xs_dyn_field_of(t->dyn, k);
+        if (!f) xs_dyn_fail_read(o, k);
+        return xs_dyn_load(f, o);
+    }
+    if (t->free == xs_map_free) {
+        xs_map *m = o;
+        if (!m->str_keys) xs_dyn_fail_read(o, k);
+        xs_map_entry *e = xs_map_lookup(m, k, 0);
+        return e ? xs_dyn_map_val(m, e->val) : NULL;
+    }
+    if (k->len == 6 && memcmp(k->data, "length", 6) == 0) {
+        if (t->free == xs_str_free) return xs_box_int(((xs_str *)o)->len); /* (bytes: the ASCII text a row holds) */
+        if (t->free == xs_arr_ref_free) return xs_box_int((int64_t)((xs_arr_ref *)o)->len);
+        if (t->free == xs_arr_num_free) return xs_box_int((int64_t)((xs_arr_num *)o)->len);
+        if (t->free == xs_arr_int_free) return xs_box_int((int64_t)((xs_arr_int *)o)->len);
+        if (t->free == xs_arr_bool_free) return xs_box_int((int64_t)((xs_arr_bool *)o)->len);
+    }
+    xs_dyn_fail_read(o, k);
+    return NULL;
+}
+/* o?.k: null when o is */
+XS_NOINLINE void *xs_dyn_get_opt(void *o, xs_str *k) { return o ? xs_dyn_get(o, k) : NULL; }
+/* o[i] on an any: an array's element (null past its end, as undefined), or a Record's key i */
+XS_NOINLINE void *xs_dyn_at(void *o, int64_t i) {
+    if (!o) xs_panic("TypeError: Cannot read properties of null (reading an index)");
+    const xs_type *t = xs_type_of(o);
+    if (t->free == xs_arr_ref_free) { xs_arr_ref *a = o; return i >= 0 && (size_t)i < a->len ? xs_retain_(a->data[i]) : NULL; }
+    if (t->free == xs_arr_num_free) { xs_arr_num *a = o; return i >= 0 && (size_t)i < a->len ? xs_box_num(a->data[i]) : NULL; }
+    if (t->free == xs_arr_int_free) { xs_arr_int *a = o; return i >= 0 && (size_t)i < a->len ? xs_box_int(a->data[i]) : NULL; }
+    if (t->free == xs_arr_bool_free) { xs_arr_bool *a = o; return i >= 0 && (size_t)i < a->len ? xs_box_bool(a->data[i]) : NULL; }
+    xs_str *k = xs_str_from_int(i);
+    void *r = xs_dyn_get(o, k);
+    xs_release(k);
+    return r;
+}
+/* o[k] with k an any: a string key or an index */
+XS_NOINLINE void *xs_dyn_get_any(void *o, void *k) {
+    if (k && xs_type_of(k)->free == xs_str_free) return xs_dyn_get(o, k);
+    return xs_dyn_at(o, xs_dyn_as_int(k));
+}
+/* the value v (an any, borrowed) stored in a field: checked against the field's type */
+XS_NOINLINE void xs_dyn_store(const xs_dyn_field *f, void *o, xs_str *k, void *v) {
+    char *p = (char *)o + f->off;
+    switch (f->kind) {
+    case XD_NUM: if (!v) xs_dyn_fail_write(o, k, "the field is a number, not null"); *(double *)p = xs_as_num(v); return;
+    case XD_INT: if (!v) xs_dyn_fail_write(o, k, "the field is an int, not null"); *(int64_t *)p = xs_dyn_as_int(v); return;
+    case XD_BOOL: if (!v) xs_dyn_fail_write(o, k, "the field is a boolean, not null"); *(bool *)p = xs_as_bool(v); return;
+    case XD_NNUM: *(double *)p = v ? xs_as_num(v) : xs_null_num(); return;
+    case XD_NINT: *(int64_t *)p = v ? xs_dyn_as_int(v) : XS_NULL_INT; return;
+    case XD_NBOOL: *(int8_t *)p = v ? (int8_t)xs_as_bool(v) : XS_NULL_BOOL; return;
+    case XD_STR:
+        if (!v && !f->nullable) xs_dyn_fail_write(o, k, "the field is a string, not null");
+        if (v && xs_type_of(v)->free != xs_str_free) xs_dyn_fail_write(o, k, "the field is a string");
+        break;
+    case XD_REF:
+        if (!v && !f->nullable) xs_dyn_fail_write(o, k, "the field cannot be null");
+        if (v && f->isa && !f->isa(v)) xs_dyn_fail_write(o, k, f->tname ? f->tname : "another type");
+        if (v && !f->isa) xs_dyn_fail_write(o, k, "its type is not checked at run time; assign it through a typed value");
+        break;
+    default: break;
+    }
+    void *old = *(void **)p;
+    *(void **)p = xs_retain_(v);
+    xs_release_(old);
+}
+/* o.k = v / o[k] = v on an any (v an any, borrowed) */
+XS_NOINLINE void xs_dyn_set(void *o, xs_str *k, void *v) {
+    if (!o) xs_dyn_fail_write(o, k, "");
+    const xs_type *t = xs_type_of(o);
+    if (t->dyn) {
+        const xs_dyn_field *f = xs_dyn_field_of(t->dyn, k);
+        if (!f) xs_dyn_fail_write(o, k, "its class has no such field (an any writes the fields its class declares)");
+        xs_dyn_store(f, o, k, v);
+        return;
+    }
+    if (t->free == xs_map_free && ((xs_map *)o)->str_keys) {
+        xs_map *m = o;
+        xs_val x;
+        switch (m->val_kind) {
+        case 0: x.d = xs_as_num(v); break;
+        case 1: x.i = xs_dyn_as_int(v); break;
+        case 2: x.i = xs_as_bool(v); break;
+        default: x.p = xs_retain_(v);
+        }
+        xs_map_set_s(m, k, x);
+        return;
+    }
+    xs_dyn_fail_write(o, k, "it has no fields");
+}
+XS_NOINLINE void xs_dyn_set_any(void *o, void *k, void *v) {
+    if (k && xs_type_of(k)->free == xs_str_free) { xs_dyn_set(o, k, v); return; }
+    int64_t i = xs_dyn_as_int(k);
+    if (o && xs_type_of(o)->free == xs_arr_ref_free) {
+        xs_arr_ref *a = o;
+        if (i < 0 || (size_t)i >= a->len) xs_panic("RangeError: index out of the array (xisto arrays do not grow by index)");
+        void *old = a->data[i];
+        a->data[i] = xs_retain_(v);
+        xs_release_(old);
+        return;
+    }
+    xs_str *ks = xs_str_from_int(i);
+    xs_dyn_set(o, ks, v);
+    xs_release(ks);
+}
+/* k in o: the class has the field (an optional one only when it is given: left out, it is not there); a Record's key */
+XS_NOINLINE bool xs_dyn_has(void *o, xs_str *k) {
+    if (!o) xs_panic("TypeError: Cannot use 'in' operator to search for a key in null");
+    const xs_type *t = xs_type_of(o);
+    if (t->dyn) {
+        const xs_dyn_field *f = xs_dyn_field_of(t->dyn, k);
+        if (!f) return false;
+        if (!f->optional) return true;
+        void *v = xs_dyn_load(f, o);
+        bool has = v != NULL;
+        xs_release(v);
+        return has;
+    }
+    if (t->free == xs_map_free) return ((xs_map *)o)->str_keys && xs_map_lookup(o, k, 0) != NULL;
+    return false;
+}
+XS_NOINLINE int64_t xs_dyn_as_int(void *v) {
+    if (v && xs_type_of(v)->free == xs_box_num_free) { /* a number with no fraction (JavaScript has only numbers) */
+        double d = ((xs_box_d *)v)->v;
+        if (d == (double)(int64_t)d && fabs(d) <= 9007199254740991.0) return (int64_t)d;
+        xs_as_fail("int");
+    }
+    return xs_as_int(v);
+}
+XS_NOINLINE int64_t xs_dyn_as_int_or_null(void *v) { return v ? xs_dyn_as_int(v) : XS_NULL_INT; }
+/* if (x), !x, x && y on an any: JavaScript's truthiness */
+XS_NOINLINE bool xs_dyn_truthy(void *v) {
+    if (!v) return false;
+    const xs_type *t = xs_type_of(v);
+    if (t->free == xs_box_num_free) { double d = ((xs_box_d *)v)->v; return d != 0 && d == d; }
+    if (t->free == xs_box_int_free || t->free == xs_box_bool_free) return ((xs_box_i *)v)->v != 0;
+    if (t->free == xs_str_free) return ((xs_str *)v)->len > 0;
+    return true;
+}
+/* a === b with an any on one side (both anys, borrowed): the same number, string or boolean, or the same object */
+XS_NOINLINE bool xs_dyn_eq(void *a, void *b) {
+    if (!a || !b) return a == b;
+    if (a == b) return true;
+    const xs_type *ta = xs_type_of(a), *tb = xs_type_of(b);
+    bool na = ta->free == xs_box_num_free || ta->free == xs_box_int_free, nb = tb->free == xs_box_num_free || tb->free == xs_box_int_free;
+    if (na || nb) return na && nb && xs_as_num(a) == xs_as_num(b);
+    if (ta->free == xs_str_free && tb->free == xs_str_free) {
+        xs_str *x = a, *y = b;
+        return x->len == y->len && memcmp(x->data, y->data, (size_t)x->len) == 0;
+    }
+    if (ta->free == xs_box_bool_free && tb->free == xs_box_bool_free) return ((xs_box_i *)a)->v == ((xs_box_i *)b)->v;
+    return false;
+}
+/* Number(x) / arithmetic on an any: as JavaScript converts (null is 0, a string is parsed, an object is NaN) */
+XS_NOINLINE double xs_dyn_num(void *v) {
+    if (!v) return 0;
+    const xs_type *t = xs_type_of(v);
+    if (t->free == xs_box_num_free) return ((xs_box_d *)v)->v;
+    if (t->free == xs_box_int_free || t->free == xs_box_bool_free) return (double)((xs_box_i *)v)->v;
+    if (t->free == xs_str_free) return xs_str_to_number(v);
+    return NAN;
+}
+/* String(x) / `${x}` on an any (owned) */
+static xs_str *xs_dyn_lit(const char *s) { return xs_str_new(s, strlen(s)); }
+XS_NOINLINE xs_str *xs_dyn_str(void *v) {
+    if (!v) return xs_dyn_lit("null");
+    const xs_type *t = xs_type_of(v);
+    if (t->free == xs_str_free) return xs_retain_(v);
+    if (t->free == xs_box_num_free) return xs_str_from_num(((xs_box_d *)v)->v);
+    if (t->free == xs_box_int_free) return xs_str_from_int(((xs_box_i *)v)->v);
+    if (t->free == xs_box_bool_free) return xs_dyn_lit(((xs_box_i *)v)->v ? "true" : "false");
+    if (t->free == xs_Symbol_free) return xs_Symbol_to_string(v);
+    return xs_dyn_lit("[object Object]");
+}
+/* a + b with an any on one side (borrowed): a string when either is one, else a number */
+XS_NOINLINE void *xs_dyn_add(void *a, void *b) {
+    bool sa = a && xs_type_of(a)->free == xs_str_free, sb = b && xs_type_of(b)->free == xs_str_free;
+    if (sa || sb) {
+        xs_str *x = xs_dyn_str(a), *y = xs_dyn_str(b);
+        xs_str *r = xs_str_concat(x, y);
+        xs_release(x);
+        xs_release(y);
+        return r;
+    }
+    bool ia = a && xs_type_of(a)->free == xs_box_int_free, ib = b && xs_type_of(b)->free == xs_box_int_free;
+    if (ia && ib) {
+        int64_t r;
+        if (!__builtin_add_overflow(((xs_box_i *)a)->v, ((xs_box_i *)b)->v, &r) && r <= 9007199254740991LL && r >= -9007199254740991LL) return xs_box_int(r);
+    }
+    return xs_box_num(xs_dyn_num(a) + xs_dyn_num(b));
+}
 
 /* ---- array methods driven by callbacks: one instance per element kind ---- */
 

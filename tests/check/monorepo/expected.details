@@ -23,13 +23,13 @@ xisto check: 6 files, 4 changes needed in 2 files
   kind of change                                 changes  files  fix
   Node module import (node:x -> xisto:x)               1      1  automatic
   module or package not available                      3      2  package
-  (4 follow-on errors of these hidden)
+  (3 follow-on errors of these hidden)
 
   most changes:
         3  apps/api/src/main.ts
         1  libs/util/src/index.ts
 
-  tests: 1 change in 1 of 1 test file, not counted above (--tests counts them)
+  tests: 0 changes in 0 of 1 test file, not counted above (--tests counts them)
 
   packages:
     some-orm                         not installed            1 file  (xisto add <git url> --name some-orm)
