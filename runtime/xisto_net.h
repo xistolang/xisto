@@ -1241,8 +1241,10 @@ XS_NOINLINE void xs_preact_run(void *x) {
                 if (ok) { xs_val v = s->val; if (s->kind == 3) xs_retain_(v.p); xs_promise_fulfill(d, v); }
                 else xs_promise_reject(d, xs_retain_(s->err));
             } else {
-                xs_val v = xs_pcall(cb, ok ? (s->kind == 4 ? 5 : s->kind) : 3, ok ? s->val : (xs_val){.p = s->err}, ok ? r->okk : r->errk);
+                int ck = ok ? r->okk : r->errk;
+                xs_val v = xs_pcall(cb, ok ? (s->kind == 4 ? 5 : s->kind) : 3, ok ? s->val : (xs_val){.p = s->err}, ck);
                 xs_try_pop();
+                if (d->kind == 4 && ck == 3 && v.p) { xs_release_(v.p); v.p = NULL; } /* a dropped promise's value */
                 xs_promise_fulfill(d, v);
             }
         }
