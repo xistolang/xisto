@@ -3,10 +3,10 @@ lib/helper.ts (2)
        2 |   return "x" + n;
          |                ^
     help: convert explicitly: String(x)
-  4:15  XS2016  'undefined' is not a value in xisto
+  4:15  XS2013  cannot infer the type of 'nothing' from null
        4 | let nothing = undefined;
          |               ^
-    help: xisto's one empty value is null: write null, and test with x == null (true for an absent optional too)
+    help: write the type: let x: Todo | null = null;
 
 main.ts (5, 1 dynamic path)
   2:1  XS4001  'node:fs' is xisto's implementation of a Node module, not Node itself

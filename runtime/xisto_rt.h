@@ -3731,6 +3731,45 @@ XS_NOINLINE bool xs_json_bool(xs_jv *v, const char *where) {
 XS_NOINLINE xs_str *xs_json_str(xs_jv *v, const char *where) { if (v->kind != XJ_STR) xs_panicf("JSON: '%s' must be a string", where); return xs_str_new(v->str, v->slen); }
 XS_NOINLINE xs_jv *xs_json_arr(xs_jv *v, const char *where) { if (v->kind != XJ_ARR) xs_panicf("JSON: '%s' must be an array", where); return v; }
 XS_NOINLINE xs_jv *xs_json_obj(xs_jv *v, const char *where) { if (v->kind != XJ_OBJ) xs_panicf("JSON: '%s' must be an object", where); return v; }
+/* a < b on strings: by their characters (UTF-8 bytes order as code points do) */
+XS_NOINLINE int64_t xs_str_order(xs_str *a, xs_str *b) {
+    size_t n = a->len < b->len ? (size_t)a->len : (size_t)b->len;
+    int c = memcmp(a->data, b->data, n);
+    if (c) return c < 0 ? -1 : 1;
+    return a->len < b->len ? -1 : a->len > b->len ? 1 : 0;
+}
+/* JSON as an any (the dynamic path): an object is a Record<string, unknown>, an array an unknown[], numbers and
+   booleans boxed (what raw query rows are in TypeORM's query<T = any>) */
+static void xs_print_any_quoted(void *p);
+static void *xs_jv_any(xs_jv *v) {
+    switch (v->kind) {
+    case XJ_NULL: return NULL;
+    case XJ_BOOL: return xs_box_bool(v->b);
+    case XJ_NUM: return xs_box_num(v->num);
+    case XJ_STR: return xs_str_new(v->str, v->slen);
+    case XJ_ARR: {
+        xs_arr_ref *a = xs_arr_ref_new(v->n, xs_print_any_quoted);
+        for (size_t i = 0; i < v->n; i++) xs_arr_ref_push(a, xs_jv_any(v->items[i]));
+        return a;
+    }
+    default: {
+        xs_map *m = xs_map_rec(xs_map_new(1, 1, 3, xs_print_str_quoted_, xs_print_any_quoted));
+        for (size_t i = 0; i < v->n; i++) {
+            xs_str *k = xs_str_new(v->keys[i], strlen(v->keys[i]));
+            xs_map_set_s(m, k, XS_VPTR(xs_jv_any(v->items[i])));
+            xs_release(k);
+        }
+        return m;
+    }
+    }
+}
+XS_NOINLINE void *xs_json_any(xs_str *text) {
+    if (!text) return NULL;
+    xs_jv *v = xs_json_parse(text);
+    void *r = xs_jv_any(v);
+    xs_jarena_reset();
+    return r;
+}
 
 /* stringify helpers: generated code appends into an xs_sb */
 static void xs_sb_put(xs_sb *b, const char *s, size_t n) {

@@ -3398,6 +3398,7 @@ static Enum *parse_enum(Parser *p) {
    first) then the member's decorators (bottom up); constructor parameters; then the class (bottom up). */
 static bool class_decorated(Class *c) {
     if (c->decos.len) return true;
+    if (c->mixin) return true; /* class UpdateDto extends PartialType(CreateDto) {}: a value too (@Body() dto: UpdateDto) */
     for (int i = 0; i < c->nfields; i++) if (c->fields[i].decos.len) return true;
     for (int i = 0; i < c->nmethods; i++) {
         if (c->methods[i]->decos.len) return true;
@@ -3992,7 +3993,12 @@ static const char xs_reflect_src[] =
     "export interface FieldInfo {\n  name: string;\n  optional: boolean;\n  type: TypeInfo;\n  get: (target: unknown) => unknown;\n}\n"
     "export interface ClassInfo {\n  id: string;\n  name: string;\n  params: ParamInfo[];\n"
     "  construct: (args: unknown[]) => unknown;\n  methods: MethodInfo[];\n  fields: FieldInfo[];\n"
-    "  isInstance: (value: unknown) => boolean;\n  base: ClassInfo | null;\n}\n";
+    "  isInstance: (value: unknown) => boolean;\n  base: ClassInfo | null;\n}\n"
+    "// Number, String, Boolean and Date where a class goes as a value (type: Number, @Type(() => Date)): what they describe\n"
+    "export const __ci_Number: ClassInfo = { id: \"Number\", name: \"Number\", params: [], construct: (args: unknown[]): unknown => 0, methods: [], fields: [], isInstance: (v: unknown): boolean => typeof v === \"number\", base: null };\n"
+    "export const __ci_String: ClassInfo = { id: \"String\", name: \"String\", params: [], construct: (args: unknown[]): unknown => \"\", methods: [], fields: [], isInstance: (v: unknown): boolean => typeof v === \"string\", base: null };\n"
+    "export const __ci_Boolean: ClassInfo = { id: \"Boolean\", name: \"Boolean\", params: [], construct: (args: unknown[]): unknown => false, methods: [], fields: [], isInstance: (v: unknown): boolean => typeof v === \"boolean\", base: null };\n"
+    "export const __ci_Date: ClassInfo = { id: \"Date\", name: \"Date\", params: [], construct: (args: unknown[]): unknown => new Date(0), methods: [], fields: [], isInstance: (v: unknown): boolean => v instanceof Date, base: null };\n";
 /* xisto:worker_threads: Node's contract restricted to strings (workerData and messages are text: JSON.stringify
    on one side, a typed JSON.parse on the other, as Node runs it too). Worker and MessagePort are built-in
    classes; these are the per-thread values, from the runtime (xisto_net.h, "worker threads") */
