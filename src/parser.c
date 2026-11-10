@@ -20,6 +20,11 @@ typedef struct {
     bool no_in;           /* a for (...) header: `in` there starts for...in, not the operator */
     bool spread_ok;       /* a statement on its own: xs.push(...ys) is read (and becomes a loop) */
     Expr *spread_arg;     /* the ...ys read there */
+    /* import * as ns from "m" (and const ns = require("m")): ns.name reads m's export `name`, which the import then
+       lists (the names are resolved by the checker, after the whole module) */
+    char **ns_alias;
+    int *ns_import;
+    int nns;
 } Parser;
 
 /* generics: the type parameters in scope while a template is parsed, or their types while an instance is */
@@ -416,6 +421,7 @@ static Type *parse_type(Parser *p) {
     Token name = p->tok;
     const char *n = name.str;
     next(p);
+    if (strcmp(n, "unique") == 0 && at_ident(p, "symbol")) { n = "symbol"; name = p->tok; next(p); } /* unique symbol: a symbol */
     if (strcmp(n, "number") == 0) t = ty_number;
     else if (strcmp(n, "int") == 0) t = ty_int;
     else if (strcmp(n, "boolean") == 0) t = ty_boolean;
@@ -455,8 +461,10 @@ static Type *parse_type(Parser *p) {
         }
     }
 
-    else if (strcmp(n, "any") == 0)
-        xs_error(XS2007, name.pos, "every value in xisto has one static type", "'any' is not supported");
+    else if (strcmp(n, "any") == 0) { /* the dynamic path: an unknown read and written by name, checked at run time */
+        t = ty_any;
+        xs_note_dynamic(name.pos);
+    }
     else if (strcmp(n, "Promise") == 0) { /* Promise<T> is T: async is syntax only */
         expect(p, TK_LT, "write Promise<T>");
         t = parse_type(p);
@@ -648,9 +656,18 @@ static bool looks_like_arrow(Parser *p) {
     } else if (at(p, TK_LPAREN)) {
         next(p);
         int depth = 1;
+        TokKind prev = TK_LPAREN;
         while (!at(p, TK_EOF) && depth > 0) {
             if (at(p, TK_LPAREN)) depth++;
             else if (at(p, TK_RPAREN)) depth--;
+            if ((at(p, TK_SLASH) || at(p, TK_SLASH_ASSIGN)) && prev != TK_IDENT && prev != TK_NUMBER && prev != TK_STRING && prev != TK_RPAREN &&
+                prev != TK_RBRACKET && prev != TK_TEMPLATE) { /* ( ... || /re/.test(s)): a regex, read as one (its '\' is no token) */
+                char *pat, *fl;
+                p->lx.pos = (size_t)(p->tok.start - p->lx.src);
+                p->lx.col = p->tok.pos.col;
+                if (!lexer_regex(&p->lx, p->tok.start, &pat, &fl)) break;
+            }
+            prev = p->tok.kind;
             next(p);
         }
         if (at(p, TK_COLON)) { /* return type annotation: skipped by tokens (a ternary's ': b' is not one) */
@@ -744,6 +761,7 @@ static Expr *parse_arrow(Parser *p) {
     return e;
 }
 
+static bool tmpl_raw; /* parsing the template of String.raw`...` */
 static Expr *parse_primary(Parser *p) {
     Pos pos = p->tok.pos;
     if (at(p, TK_IDENT) && strncmp(p->tok.str, "__reflect_", 10) == 0) { /* __reflect_kind(T) & co: generated code only */
@@ -836,10 +854,25 @@ static Expr *parse_primary(Parser *p) {
                 q += 2; col += 2;
                 const char *start_expr = q;
                 int depth = 1;
+                char last = '{'; /* the last character that is not a space: a '/' after an operator starts a regex */
                 while (*q && depth) {
                     if (*q == '{') depth++;
                     else if (*q == '}') { depth--; if (!depth) break; }
-                    else if (*q == '"' || *q == '\'') { char qq = *q++; while (*q && *q != qq) { if (*q == '\\') q++; q++; } }
+                    else if (*q == '"' || *q == '\'') { char qq = *q++; while (*q && *q != qq) { if (*q == '\\') q++; q++; } last = 'a'; q++; continue; }
+                    else if (*q == '/' && q[1] != '/' && q[1] != '*' && strchr("({[,=:?!&|+-*%<>~^;", last)) { /* ${s.replace(/"/g, "'")} */
+                        bool in_class = false;
+                        q++;
+                        while (*q && *q != '\n' && (*q != '/' || in_class)) {
+                            if (*q == '\\' && q[1]) q++;
+                            else if (*q == '[') in_class = true;
+                            else if (*q == ']') in_class = false;
+                            q++;
+                        }
+                        last = 'a';
+                        if (*q) q++;
+                        continue;
+                    }
+                    if (*q != ' ' && *q != '\t' && *q != '\n') last = *q;
                     q++;
                 }
                 size_t sn = (size_t)(q - start_expr);
@@ -858,6 +891,13 @@ static Expr *parse_primary(Parser *p) {
                 expr_list_push(&e->args, inner);
                 for (const char *c = start_expr; c < q; c++) { if (*c == '\n') { line++; col = 1; } else col++; }
                 q++; col++; /* closing brace */
+                continue;
+            }
+            if (*q == '\\' && tmpl_raw) { /* String.raw`...`: the backslash and what follows, as written */
+                buf_putc(&lit, *q);
+                col++;
+                q++;
+                if (*q) { if (*q == '\n') { line++; col = 1; } else col++; buf_putc(&lit, *q); q++; }
                 continue;
             }
             if (*q == '\\') {
@@ -1110,6 +1150,7 @@ static int parse_type_args(Parser *p, Type ***out) {
    at the first null */
 static int noptc;
 static Expr *ident_expr(Pos pos, const char *name);
+static Expr *ns_member(Parser *p, Expr *e, Token name);
 static Expr *parse_postfix(Parser *p) {
     Expr *e = parse_primary(p);
     Expr *obase[32];
@@ -1156,6 +1197,17 @@ static Expr *parse_postfix(Parser *p) {
         } else if (at(p, TK_DOT)) {
             next(p);
             Token name = expect_prop_name(p, NULL);
+            Expr *nsx = ns_member(p, e, name);
+            if (nsx) { /* ns.f(...), ns.x: the module's own name */
+                e = nsx;
+                if (at(p, TK_LPAREN)) {
+                    Expr *c = new_expr(E_CALL, name.pos);
+                    c->lhs = e;
+                    parse_args(p, &c->args);
+                    e = c;
+                }
+                continue;
+            }
             Expr *m = new_expr(E_MEMBER, name.pos);
             m->lhs = e;
             m->str = name.str;
@@ -1165,6 +1217,17 @@ static Expr *parse_postfix(Parser *p) {
                 parse_args(p, &m->args);
             }
             e = m;
+        } else if (at(p, TK_TEMPLATE) && e->kind == E_MEMBER && !e->is_call && e->lhs->kind == E_IDENT && strcmp(e->lhs->str, "String") == 0 &&
+                   strcmp(e->str, "raw") == 0) { /* String.raw`a\d${x}`: the template with its backslashes kept */
+            tmpl_raw = true;
+            e = parse_primary(p);
+            tmpl_raw = false;
+        } else if (at(p, TK_LPAREN) && !nopt && e->kind != E_IDENT && !(e->kind == E_MEMBER && !e->is_call)) {
+            /* (() => { ... })(), f(a)(b): a call of the function value the expression gives */
+            Expr *c = new_expr(E_CALL, pos);
+            c->lhs = e;
+            parse_args(p, &c->args);
+            e = c;
         } else if (at(p, TK_NOT)) { /* x!: asserts not null (checked at run time in xisto) */
             next(p);
             Expr *nn = new_expr(E_AS, pos);
@@ -1406,7 +1469,8 @@ static Expr *parse_assign(Parser *p) {
     if (shr || is_assign_op(p->tok.kind)) {
         Pos pos = shr ? shr_pos : p->tok.pos;
         TokKind op = shr ? shr : p->tok.kind;
-        if (lhs->kind != E_IDENT && lhs->kind != E_INDEX && !(lhs->kind == E_MEMBER && !lhs->is_call))
+        if (lhs->kind != E_IDENT && lhs->kind != E_INDEX && !(lhs->kind == E_MEMBER && !lhs->is_call) &&
+            !(op == TK_ASSIGN && (lhs->kind == E_ARRAY_LIT || lhs->kind == E_OBJLIT))) /* ([a, b] = [b, a]: a statement, lowered there) */
             xs_error(XS8139, pos, NULL, "the left side of an assignment must be a variable, a field or an array element");
         if (!shr) next(p);
         Expr *e = new_expr(E_ASSIGN, pos);
@@ -1431,7 +1495,6 @@ static void expect_semi(Parser *p) {
    it (an index or a field), queued in p->pending to follow in the same scope. The checker gives the reads
    their meaning: on an array a[i] (checked), on a tuple its field, on an object its field. */
 static int ndestr;
-static Expr *ident_expr(Pos pos, const char *name) { Expr *e = new_expr(E_IDENT, pos); e->str = (char *)name; return e; }
 static void destructure(Parser *p, Stmt *holder, bool is_const, bool array) {
     Pos pos = p->tok.pos;
     char *tmp = xs_sprintf("__d%d", ++ndestr);
@@ -1595,6 +1658,101 @@ static Stmt *parse_loop_body(Parser *p) {
     return b;
 }
 
+/* ---- do { } while (c) and labeled loops, lowered here to what the checker and both backends know ---- */
+static Expr *ident_expr(Pos pos, const char *name) { Expr *e = new_expr(E_IDENT, pos); e->str = (char *)name; return e; }
+static Stmt *flag_var(Pos pos, const char *name, bool value) {
+    Stmt *v = new_stmt(S_VAR, pos);
+    v->name = (char *)name;
+    v->decl_type = ty_boolean;
+    Expr *b = new_expr(E_BOOL, pos);
+    b->boolean = value;
+    v->init = b;
+    return v;
+}
+static Stmt *flag_set(Pos pos, const char *name, bool value) {
+    Stmt *s = new_stmt(S_EXPR, pos);
+    Expr *a = new_expr(E_ASSIGN, pos);
+    a->op = TK_ASSIGN;
+    a->lhs = ident_expr(pos, name);
+    Expr *b = new_expr(E_BOOL, pos);
+    b->boolean = value;
+    a->rhs = b;
+    s->expr = a;
+    return s;
+}
+static Stmt *block2(Pos pos, Stmt *a, Stmt *b) {
+    Stmt *k = new_stmt(S_BLOCK, pos);
+    stmt_list_push(&k->stmts, a);
+    if (b) stmt_list_push(&k->stmts, b);
+    return k;
+}
+/* do BODY while (C);  ->  { let d = true; while (d || C) { d = false; BODY } } (continue reaches C, as in JS) */
+static Stmt *lower_do(Parser *p, Pos pos, Stmt *body, Expr *cond) {
+    static int nd;
+    char *d = xs_sprintf("__do%d", ++nd);
+    Stmt *w = new_stmt(S_WHILE, pos);
+    Expr *or = new_expr(E_BINARY, pos);
+    or->op = TK_OR;
+    or->lhs = ident_expr(pos, d);
+    or->rhs = cond;
+    w->cond = or;
+    w->body = block2(pos, flag_set(pos, d, false), body);
+    (void)p;
+    return block2(pos, flag_var(pos, d, true), w);
+}
+/* label: loop, with break label / continue label inside inner loops or switches: each becomes flag = true; break;
+   and after every inner loop or switch that holds one, the flag is tested (break again, or, at the labeled
+   loop's own level, break or continue it) */
+typedef struct { const char *label, *bflag, *cflag; bool usedb, usedc; } LabelLow;
+static bool is_loop(Stmt *s) { return s->kind == S_WHILE || s->kind == S_FOR || s->kind == S_FOROF; }
+static bool label_walk(LabelLow *L, Stmt **slot, int depth, int loops);
+static Stmt *label_check(Pos pos, LabelLow *L, bool b, int depth) {
+    Stmt *i = new_stmt(S_IF, pos);
+    i->cond = ident_expr(pos, b ? L->bflag : L->cflag);
+    if (depth > 0 || b) i->body = block2(pos, new_stmt(S_BREAK, pos), NULL); /* (an if's body is a block) */
+    else i->body = block2(pos, flag_set(pos, L->cflag, false), new_stmt(S_CONTINUE, pos));
+    return i;
+}
+static bool label_walk(LabelLow *L, Stmt **slot, int depth, int loops) {
+    Stmt *s = *slot;
+    if (!s) return false;
+    if ((s->kind == S_BREAK || s->kind == S_CONTINUE) && s->name && strcmp(s->name, L->label) == 0) {
+        bool b = s->kind == S_BREAK;
+        s->name = NULL;
+        if (b ? depth == 0 : loops == 0) return false; /* the labeled loop's own break / continue */
+        if (b) L->usedb = true; else L->usedc = true;
+        *slot = block2(s->pos, flag_set(s->pos, b ? L->bflag : L->cflag, true), new_stmt(S_BREAK, s->pos));
+        return true;
+    }
+    bool inner = is_loop(s) || s->kind == S_SWITCH;
+    int d = depth + (inner ? 1 : 0), lp = loops + (is_loop(s) ? 1 : 0);
+    bool any = false;
+    any |= label_walk(L, &s->body, d, lp);
+    if (s->kind == S_IF || s->kind == S_TRY) any |= label_walk(L, &s->else_body, d, lp);
+    if (s->kind == S_TRY) any |= label_walk(L, &s->for_init, d, lp);
+    for (int i = 0; i < s->stmts.len; i++) any |= label_walk(L, &s->stmts.items[i], d, lp);
+    for (int i = 0; i < s->ncases; i++) any |= label_walk(L, &s->cases[i].body, d, lp);
+    if (inner && any) { /* after it: the flag says whether to go on leaving */
+        Stmt *k = block2(s->pos, s, NULL);
+        if (L->usedb) stmt_list_push(&k->stmts, label_check(s->pos, L, true, depth));
+        if (L->usedc) stmt_list_push(&k->stmts, label_check(s->pos, L, false, depth));
+        *slot = k;
+    }
+    return any;
+}
+static Stmt *lower_label(Pos pos, const char *label, Stmt *loop) {
+    static int nl;
+    int id = ++nl;
+    LabelLow L = {label, xs_sprintf("__brk%d", id), xs_sprintf("__cnt%d", id), false, false};
+    label_walk(&L, &loop->body, 0, 0);
+    if (!L.usedb && !L.usedc) return loop;
+    Stmt *k = new_stmt(S_BLOCK, pos);
+    if (L.usedb) stmt_list_push(&k->stmts, flag_var(pos, L.bflag, false));
+    if (L.usedc) stmt_list_push(&k->stmts, flag_var(pos, L.cflag, false));
+    stmt_list_push(&k->stmts, loop);
+    return k;
+}
+
 static Stmt *parse_stmt(Parser *p) {
     Pos pos = p->tok.pos;
     if (!p->in_gen && at_ident(p, "yield") && !peek_is(p, TK_ASSIGN) && !peek_is(p, TK_LPAREN) && !peek_is(p, TK_DOT) && !peek_is(p, TK_SEMI))
@@ -1623,6 +1781,34 @@ static Stmt *parse_stmt(Parser *p) {
         y->expr = parse_expr(p);
         expect_semi(p);
         return y;
+    }
+    if (at(p, TK_IDENT) && peek_is(p, TK_COLON)) { /* label: a loop */
+        Token lt = p->tok;
+        next(p);
+        next(p);
+        if (!at(p, TK_FOR) && !at(p, TK_WHILE) && !at_ident(p, "do")) xs_error(XS6026, lt.pos, "put the label on a loop", "labels are supported on loops only");
+        Stmt *loop = parse_stmt(p);
+        Stmt *inner = loop;
+        while (inner->kind == S_BLOCK && inner->stmts.len) inner = inner->stmts.items[inner->stmts.len - 1]; /* (a lowered do or for) */
+        if (!is_loop(inner)) xs_error(XS6026, lt.pos, "put the label on a loop", "labels are supported on loops only");
+        Stmt *low = lower_label(lt.pos, lt.str, inner);
+        if (low == inner) return loop;
+        if (inner == loop) return low;
+        Stmt *o = loop; /* replace the loop inside the block it came in */
+        while (o->kind == S_BLOCK && o->stmts.items[o->stmts.len - 1] != inner) o = o->stmts.items[o->stmts.len - 1];
+        o->stmts.items[o->stmts.len - 1] = low;
+        return loop;
+    }
+    if (at_ident(p, "do")) { /* do { ... } while (c);  (do is a reserved word in JS) */
+        next(p);
+        Stmt *body = parse_loop_body(p);
+        if (!at(p, TK_WHILE)) xs_error(XS1008, p->tok.pos, NULL, "expected %s but found %s", "'while'", tok_kind_name(p->tok.kind));
+        next(p);
+        expect(p, TK_LPAREN, NULL);
+        Expr *c = parse_expr(p);
+        expect(p, TK_RPAREN, NULL);
+        expect_semi(p);
+        return lower_do(p, pos, body, c);
     }
     switch (p->tok.kind) {
     case TK_LET:
@@ -1788,7 +1974,7 @@ static Stmt *parse_stmt(Parser *p) {
     case TK_CONTINUE: {
         Stmt *s = new_stmt(p->tok.kind == TK_BREAK ? S_BREAK : S_CONTINUE, pos);
         next(p);
-        if (at(p, TK_IDENT)) xs_error(XS6026, p->tok.pos, NULL, "labels are not supported");
+        if (at(p, TK_IDENT)) { s->name = p->tok.str; next(p); } /* break label: lowered by the labeled loop (lower_label) */
         expect_semi(p);
         return s;
     }
@@ -1854,6 +2040,58 @@ static Stmt *parse_stmt(Parser *p) {
         p->spread_ok = true;
         p->spread_arg = NULL;
         s->expr = parse_expr(p);
+        if (s->expr->kind == E_ASSIGN && s->expr->op == TK_ASSIGN && (s->expr->lhs->kind == E_ARRAY_LIT || s->expr->lhs->kind == E_OBJLIT)) {
+            /* [a, b] = [b, a];  ({ x: v, y } = o);  each value into a const first, then each target */
+            Expr *pat = s->expr->lhs, *val = s->expr->rhs;
+            expect_semi(p);
+            p->spread_ok = so; p->spread_arg = sa;
+            static int nds;
+            int id = ++nds;
+            Stmt *k = new_stmt(S_BLOCK, pos);
+            bool arr = pat->kind == E_ARRAY_LIT;
+            bool both = arr && val->kind == E_ARRAY_LIT && val->args.len == pat->args.len;
+            char *src = NULL;
+            if (!both) {
+                src = xs_sprintf("__ds%d", id);
+                Stmt *v = new_stmt(S_VAR, pos);
+                v->name = src;
+                v->is_const = true;
+                v->init = val;
+                stmt_list_push(&k->stmts, v);
+            }
+            for (int i = 0; i < pat->args.len; i++) {
+                if (both) {
+                    Stmt *v = new_stmt(S_VAR, pos);
+                    v->name = xs_sprintf("__ds%d_%d", id, i);
+                    v->is_const = true;
+                    v->init = val->args.items[i];
+                    stmt_list_push(&k->stmts, v);
+                }
+            }
+            for (int i = 0; i < pat->args.len; i++) {
+                Expr *from;
+                if (both) from = ident_expr(pos, xs_sprintf("__ds%d_%d", id, i));
+                else if (arr) {
+                    from = new_expr(E_INDEX, pos);
+                    from->lhs = ident_expr(pos, src);
+                    Expr *n = new_expr(E_NUMBER, pos);
+                    n->is_int_lit = true; n->ival = i; n->num = i;
+                    from->rhs = n;
+                } else {
+                    from = new_expr(E_MEMBER, pos);
+                    from->lhs = ident_expr(pos, src);
+                    from->str = pat->keys[i];
+                }
+                Stmt *st = new_stmt(S_EXPR, pos);
+                Expr *a = new_expr(E_ASSIGN, pos);
+                a->op = TK_ASSIGN;
+                a->lhs = pat->args.items[i];
+                a->rhs = from;
+                st->expr = a;
+                stmt_list_push(&k->stmts, st);
+            }
+            return k;
+        }
         Expr *spread = p->spread_arg;
         p->spread_ok = so; p->spread_arg = sa;
         if (spread) { /* xs.push(...ys);: for (const __sp of ys) xs.push(__sp); */
@@ -2610,6 +2848,60 @@ static bool declares_top(Parser *p, const char *name) {
     }
     return false;
 }
+static void ns_register(Parser *p, Module *m, const char *alias) {
+    p->ns_alias = realloc(p->ns_alias, sizeof(char *) * (size_t)(p->nns + 1));
+    p->ns_import = realloc(p->ns_import, sizeof(int) * (size_t)(p->nns + 1));
+    p->ns_alias[p->nns] = (char *)alias;
+    p->ns_import[p->nns++] = m->nimports; /* (the import is pushed next) */
+}
+/* const X = require("m");  (CommonJS, as TypeScript compiles `import * as X`): read as import * as X from "m" */
+static bool require_ahead(Parser *p) {
+    if (!at(p, TK_CONST) && !at(p, TK_LET)) return false;
+    Parser look = *p;
+    next(&look);
+    if (!at(&look, TK_IDENT)) return false;
+    next(&look);
+    if (!at(&look, TK_ASSIGN)) return false;
+    next(&look);
+    if (!at_ident(&look, "require")) return false;
+    next(&look);
+    if (!at(&look, TK_LPAREN)) return false;
+    next(&look);
+    return at(&look, TK_STRING);
+}
+static void parse_require(Parser *p, Module *m) {
+    Import im = {0};
+    im.pos = p->tok.pos;
+    next(p);
+    Token name = expect(p, TK_IDENT, NULL);
+    expect(p, TK_ASSIGN, NULL);
+    next(p); /* require */
+    expect(p, TK_LPAREN, NULL);
+    im.path = expect(p, TK_STRING, NULL).str;
+    expect(p, TK_RPAREN, NULL);
+    expect_semi(p);
+    ns_register(p, m, name.str);
+    m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+    m->imports[m->nimports++] = im;
+}
+/* ns.name, with ns an `import * as`: the name, now listed by that import */
+static Expr *ns_member(Parser *p, Expr *e, Token name) {
+    if (e->kind != E_IDENT || !p->nns || !p->mod) return NULL;
+    int k = -1;
+    for (int i = 0; i < p->nns; i++) if (strcmp(p->ns_alias[i], e->str) == 0) k = i;
+    if (k < 0) return NULL;
+    Import *im = &p->mod->imports[p->ns_import[k]];
+    bool listed = false;
+    for (int i = 0; i < im->n && !listed; i++) listed = strcmp(im->names[i], name.str) == 0;
+    if (!listed) {
+        im->names = realloc(im->names, sizeof(char *) * (size_t)(im->n + 1));
+        im->positions = realloc(im->positions, sizeof(Pos) * (size_t)(im->n + 1));
+        im->names[im->n] = name.str;
+        im->positions[im->n++] = name.pos;
+    }
+    return ident_expr(name.pos, name.str);
+}
+
 static void parse_import(Parser *p, Module *m) {
     Pos pos = p->tok.pos;
     expect(p, TK_IMPORT, NULL);
@@ -2631,6 +2923,14 @@ static void parse_import(Parser *p, Module *m) {
         im.names[0] = name.str;
         im.positions[0] = name.pos;
         im.n = 1;
+        goto from;
+    }
+    if (at(p, TK_STAR)) { /* import * as ns from "m" */
+        next(p);
+        if (!at_ident(p, "as")) xs_error(XS1016, p->tok.pos, "write import * as name from \"./file\"", "expected '{' after import");
+        next(p);
+        Token ns = expect(p, TK_IDENT, NULL);
+        ns_register(p, m, ns.str);
         goto from;
     }
     if (!at(p, TK_LBRACE))
@@ -3191,10 +3491,10 @@ static void parse_module(Program *prog, Module *m) {
         }
         if (decos.len && !at(&p, TK_CLASS)) xs_error(XS6020, decos.items[0].pos, NULL, "decorators apply to classes, their members and parameters");
         if (is_default && !at(&p, TK_FUNCTION) && !at(&p, TK_ASYNC)) xs_error(XS6009, p.tok.pos, NULL, "'export default' applies to functions only");
-        if (at(&p, TK_IMPORT)) { /* an import after declarations (ES hoists it): read and loaded here; names resolve in the
+        if (at(&p, TK_IMPORT) || require_ahead(&p)) { /* an import after declarations (ES hoists it): read and loaded here; names resolve in the
                                     checker, after the whole file, so declarations above may use them */
             int n0 = m->nimports;
-            parse_import(&p, m);
+            if (at(&p, TK_IMPORT)) parse_import(&p, m); else parse_require(&p, m);
             for (int i = n0; i < m->nimports; i++) {
                 Import *im = &m->imports[i];
                 if (xs_check_mode) {

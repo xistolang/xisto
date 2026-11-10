@@ -18,6 +18,7 @@ typedef struct {
     char *file, *code, *category, *message, *help, *source;
     int line, col;
     bool test; /* in a test file (*.spec.ts, *.test.ts, __tests__/, __mocks__/) */
+    bool note; /* a use of any (the dynamic path): compiles, so it is listed apart, not as a change */
 } Diag;
 
 typedef struct {
@@ -80,7 +81,7 @@ static bool parse_diag(const char *line, Diag *d) {
         if (*p == '"') sval = json_string(&p);
         else if (strncmp(p, "null", 4) == 0) p += 4;
         else { ival = strtol(p, (char **)&p, 10); }
-        if (strcmp(key, "severity") == 0) error = sval && strcmp(sval, "error") == 0;
+        if (strcmp(key, "severity") == 0) { error = sval && (strcmp(sval, "error") == 0 || strcmp(sval, "note") == 0); d->note = sval && strcmp(sval, "note") == 0; }
         else if (strcmp(key, "code") == 0) d->code = sval, sval = NULL;
         else if (strcmp(key, "category") == 0) d->category = sval, sval = NULL;
         else if (strcmp(key, "file") == 0) d->file = sval, sval = NULL;
@@ -302,7 +303,7 @@ static void count_table(bool want_test, bool all) {
         int n = 0;
         Strs fs = {0};
         for (int i = 0; i < ndiags; i++)
-            if ((all || diags[i].test == want_test) && diags[i].category && strcmp(diags[i].category, xs_diag_cat_id((DiagCat)c)) == 0) {
+            if (!diags[i].note && (all || diags[i].test == want_test) && diags[i].category && strcmp(diags[i].category, xs_diag_cat_id((DiagCat)c)) == 0) {
                 n++;
                 if (!strs_has(&fs, diags[i].file)) strs_push(&fs, diags[i].file);
             }
@@ -389,7 +390,15 @@ int cmd_check(int argc, char **argv) {
     for (int i = 0; i < files.len; i++) { if (test_file(display(files.items[i], cwd, root_real))) test_files_n++; else app_files++; }
     Strs affected = {0}, test_affected = {0};
     int app_n = 0, test_n = 0;
+    int notes_n = 0;
+    Strs note_files = {0};
     for (int i = 0; i < ndiags; i++) {
+        if (diags[i].note) {
+            if (diags[i].test && !with_tests) continue;
+            notes_n++;
+            if (!strs_has(&note_files, diags[i].file)) strs_push(&note_files, diags[i].file);
+            continue;
+        }
         if (diags[i].test) { test_n++; if (!strs_has(&test_affected, diags[i].file)) strs_push(&test_affected, diags[i].file); }
         else { app_n++; if (!strs_has(&affected, diags[i].file)) strs_push(&affected, diags[i].file); }
     }
@@ -402,15 +411,18 @@ int cmd_check(int argc, char **argv) {
             int j = i;
             while (j < ndiags && strcmp(diags[j].file, diags[i].file) == 0) j++;
             if (diags[i].test && !with_tests) { i = j; continue; }
-            printf("%s%s%s (%d)\n", B, diags[i].file, R, j - i);
+            int nchanges = 0;
+            for (int k = i; k < j; k++) if (!diags[k].note) nchanges++;
+            if (nchanges == j - i) printf("%s%s%s (%d)\n", B, diags[i].file, R, j - i);
+            else printf("%s%s%s (%d, %d dynamic path)\n", B, diags[i].file, R, nchanges, j - i - nchanges);
             for (int k = i; k < j; k++) {
                 Diag *d = &diags[k];
-                printf("  %d:%d  %s  %s\n", d->line, d->col, d->code ? d->code : "", d->message);
+                printf("  %d:%d  %s  %s%s\n", d->line, d->col, d->code ? d->code : "", d->note ? "note: " : "", d->message);
                 if (d->source && *d->source) {
                     printf("    %s%4d |%s %s\n", D, d->line, R, d->source);
                     printf("    %s     |%s %*s^\n", D, R, d->col > 0 ? d->col - 1 : 0, "");
                 }
-                if (d->help) printf("    help: %s\n", d->help);
+                if (d->help && !d->note) printf("    help: %s\n", d->help);
             }
             printf("\n");
             i = j;
@@ -429,7 +441,7 @@ int cmd_check(int argc, char **argv) {
         if (with_tests) { for (int k = 0; k < affected.len; k++) strs_push(&both, affected.items[k]); for (int k = 0; k < test_affected.len; k++) strs_push(&both, test_affected.items[k]); af = &both; }
         int *counts = calloc((size_t)af->len + 1, sizeof(int));
         for (int i = 0; i < ndiags; i++)
-            for (int k = 0; k < af->len; k++) if (strcmp(diags[i].file, af->items[k]) == 0) { counts[k]++; break; }
+            for (int k = 0; !diags[i].note && k < af->len; k++) if (strcmp(diags[i].file, af->items[k]) == 0) { counts[k]++; break; }
         printf("\n  most changes:\n");
         for (int shown = 0; shown < 5 && shown < af->len; shown++) {
             int best = -1;
@@ -439,6 +451,9 @@ int cmd_check(int argc, char **argv) {
         }
         free(counts);
     }
+    if (notes_n)
+        printf("\n  %-46s %7d  %5d  %s\n  %s(compiles: each use is read and written by name and checked at run time; a declared type is faster)%s\n",
+               xs_diag_cat_title(DC_DYNPATH), notes_n, note_files.len, xs_diag_cat_fix(DC_DYNPATH), D, R);
     if (!with_tests && test_files_n)
         printf("\n  tests: %d change%s in %d of %d test file%s, not counted above (--tests counts them)\n", test_n, test_n == 1 ? "" : "s",
                test_affected.len, test_files_n, test_files_n == 1 ? "" : "s");

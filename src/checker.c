@@ -238,6 +238,9 @@ static void init_builtins(void) {
     bi_field(err, "cause", ty_unknown); /* an object thrown with throw: the Error carries it */
 
     bi_class("Date", "xs_Date"); /* members: check_date_member */
+    Class *sym = bi_class("symbol", "xs_Symbol"); /* Symbol("desc"): equal only to itself (by reference) */
+    bi_field(sym, "description", ty_nullable_of(ty_string));
+    bi_field(sym, "__id", ty_int); /* (its number, for packages that key a map by it: Nest's injection tokens) */
     Class *bigc = bi_class("bigint", "xs_big"); /* BigInt values: the operators become calls (big_binary) */
     bi_method(bigc, "toString", "xs_big_to_string", ty_string, 0);
     /* bytes (runtime/xisto_rt.h): Uint8Array, and Buffer, the same object printed the Node way; members: check_bytes_member */
@@ -1639,12 +1642,63 @@ static void to_unknown(Expr *e) {
     e->type = ty_unknown;
     expr_list_push(&e->args, v);
 }
+/* ---------- any: the dynamic path (MANIFESTO, "Ponto importante: any") ----------
+   An any is an unknown (a reference; primitives boxed) that is read and written by name: x.f, x[k], x.f = v,
+   k in x go to the runtime (xs_dyn_*, through the field table of the object's class), and an any where a T goes
+   is checked at run time, as `x as T`. Typed code is not touched: these rules apply only where a value's type
+   is any. */
+static Expr *dyn_lvalue; /* the target of the assignment being checked: xs[i] = v of an any[] stays an element */
+bool xs_any_used; /* the program reads or writes an any by name: the emitter gives every class its field table */
+static Field *find_field(Class *c, const char *name, int *index);
+static Func *find_method(Class *c, const char *name);
+static Expr *dyn_key(Pos pos, const char *s) {
+    Expr *k = xs_alloc(sizeof *k);
+    k->kind = E_STRING; k->pos = pos; k->field = -1; k->str = (char *)s; k->type = ty_string; k->lit_id = intern(s);
+    return k;
+}
+/* e becomes cfn(a, b, c) (the arguments already checked), a runtime call of type t */
+static void dyn_call(Expr *e, const char *cfn, Type *t, Expr *a, Expr *b, Expr *c) {
+    Pos pos = e->pos;
+    memset(e, 0, sizeof *e);
+    e->kind = E_CALL; e->pos = pos; e->field = -1; e->builtin.cfn = cfn; e->type = t;
+    if (a) expr_list_push(&e->args, a);
+    if (b) expr_list_push(&e->args, b);
+    if (c) expr_list_push(&e->args, c);
+    xs_any_used = true;
+}
+/* x becomes cfn(x) */
+static void dyn_wrap(Expr *x, const char *cfn, Type *t) { Expr *v = xs_alloc(sizeof *v); *v = *x; dyn_call(x, cfn, t, v, NULL, NULL); }
+static void to_unknown(Expr *e);
+/* a checked value as an any: references as they are, primitives boxed */
+static void to_any(Expr *e) {
+    if (ty_is_any(e->type)) return;
+    if (e->type->kind != TY_UNKNOWN) to_unknown(e);
+    e->type = ty_any;
+}
+static Type *record_of_any(void) {
+    static Type *r;
+    if (!r) { r = xs_alloc(sizeof *r); *r = *ty_map_of(ty_string, ty_any); r->record = true; }
+    return r;
+}
+/* an any where a T goes: checked at run time (`x as T`); false when T cannot be checked */
+static bool unknown_target(Type *t);
+static bool dyn_to(Expr *e, Type *want) {
+    Type *w = want->kind == TY_NULLABLE ? want->elem : want;
+    if (w->kind == TY_UNION || w->kind == TY_UNKNOWN) { e->type = want; return true; } /* held the same way (a union is not checked) */
+    if (!unknown_target(want)) return false;
+    Expr *v = xs_alloc(sizeof *v);
+    *v = *e;
+    Pos pos = e->pos;
+    memset(e, 0, sizeof *e);
+    e->kind = E_AS; e->pos = pos; e->field = -1; e->lhs = v; e->elem_type = want; e->type = want;
+    return true;
+}
 static bool unknown_target(Type *t) {
     Type *b = t->kind == TY_NULLABLE ? t->elem : t;
     switch (b->kind) {
     case TY_INT: case TY_NUMBER: case TY_BOOLEAN: case TY_STRING: case TY_ARRAY: case TY_MAP: case TY_SET: case TY_FUNC: return true;
     case TY_ENUM: return true;
-    case TY_OBJECT: return !b->cls->builtin || strcmp(b->cls->name, "Error") == 0 || (b->cls->ctor && b->cls->ctor->is_native);
+    case TY_OBJECT: return !b->cls->builtin || strcmp(b->cls->name, "Error") == 0 || strcmp(b->cls->name, "symbol") == 0 || (b->cls->ctor && b->cls->ctor->is_native);
     default: return false;
     }
 }
@@ -1684,6 +1738,8 @@ static bool enter_union(Expr *e, Type *want) {
     return true;
 }
 static void expect_type(Expr *e, Type *want, const char *what) {
+    if (ty_is_any(want) && e->type->kind != TY_VOID) { to_any(e); return; } /* (null too: an any may be null) */
+    if (ty_is_any(e->type) && want->kind != TY_VOID && want->kind != TY_UNKNOWN && dyn_to(e, want)) return;
     if ((want->kind == TY_NUMBER || (want->kind == TY_NULLABLE && want->elem->kind == TY_NUMBER)) && widen_inferred(e)) return;
     if (e->type->kind == TY_INT && (want->kind == TY_NUMBER || (want->kind == TY_NULLABLE && want->elem->kind == TY_NUMBER))) {
         /* an int where a number goes (total: items.length): exact, since an int is within ±(2^53−1); TypeScript has
@@ -3178,7 +3234,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
             Type *b = t->kind == TY_NULLABLE ? t->elem : t;
-            const char *v = is_big(b) ? "bigint" : b->kind == TY_STRING || (b->kind == TY_ENUM && b->en->is_string) ? "string"
+            const char *v = is_big(b) ? "bigint" : b->kind == TY_OBJECT && b->cls->builtin && strcmp(b->cls->name, "symbol") == 0 ? "symbol" : b->kind == TY_STRING || (b->kind == TY_ENUM && b->en->is_string) ? "string"
                           : is_numeric(b) || b->kind == TY_ENUM ? "number" : b->kind == TY_BOOLEAN ? "boolean" : b->kind == TY_FUNC ? "function" : "object";
             if (t->kind == TY_NULLABLE && b->kind != TY_OBJECT) { e->builtin.cfn = "xs_typeof_nullable"; e->str = (char *)v; e->type = ty_string; return; }
             e->kind = E_STRING;
@@ -3213,6 +3269,12 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (e->op == TK_IN) { /* "k" in m: m.has(k) on a Record; on an object, whether the field is there */
             check_expr(e->rhs, NULL);
             Type *rt = e->rhs->type;
+            if (ty_is_any(rt)) { /* k in x: x's class has the field, filled (or a Record has the key), at run time */
+                check_expr(e->lhs, ty_string);
+                expect_type(e->lhs, ty_string, "key of 'in'");
+                dyn_call(e, "xs_dyn_has", ty_boolean, e->rhs, e->lhs, NULL);
+                return;
+            }
             if (rt->kind == TY_MAP && rt->record) {
                 Expr *key = e->lhs;
                 e->kind = E_MEMBER;
@@ -3360,6 +3422,38 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->type = ty_boolean;
             return;
         }
+        if (ty_is_any(e->lhs->type) || ty_is_any(e->rhs->type)) { /* an any on one side: JavaScript's rules, at run time */
+            Expr *l = e->lhs, *r = e->rhs;
+            switch (e->op) {
+            case TK_PLUS:
+                if (l->type->kind == TY_STRING || r->type->kind == TY_STRING) { /* s + x: String(x) */
+                    if (ty_is_any(l->type)) dyn_wrap(l, "xs_dyn_str", ty_string);
+                    if (ty_is_any(r->type)) dyn_wrap(r, "xs_dyn_str", ty_string);
+                    break;
+                }
+                if (l->type->kind == TY_LITINT) coerce_lit(l, ty_number);
+                if (r->type->kind == TY_LITINT) coerce_lit(r, ty_number);
+                to_any(l);
+                to_any(r);
+                dyn_call(e, "xs_dyn_add", ty_any, l, r, NULL);
+                return;
+            case TK_MINUS: case TK_STAR: case TK_SLASH: case TK_PERCENT: case TK_LT: case TK_LE: case TK_GT: case TK_GE:
+                if (ty_is_any(l->type)) dyn_wrap(l, "xs_dyn_num", ty_number);
+                if (ty_is_any(r->type)) dyn_wrap(r, "xs_dyn_num", ty_number);
+                break;
+            case TK_EQ: case TK_NEQ:
+                if (l->type->kind == TY_NULL || r->type->kind == TY_NULL) break; /* x === null: a null reference */
+                if (l->type->kind == TY_LITINT) coerce_lit(l, ty_number);
+                if (r->type->kind == TY_LITINT) coerce_lit(r, ty_number);
+                to_any(l);
+                to_any(r);
+                { bool neq = e->op == TK_NEQ;
+                  dyn_call(e, "xs_dyn_eq", ty_boolean, l, r, NULL);
+                  if (neq) { Expr *v = expr_copy(e); memset(e, 0, sizeof *e); e->kind = E_UNARY; e->op = TK_NOT; e->pos = v->pos; e->field = -1; e->lhs = v; e->type = ty_boolean; } }
+                return;
+            default: break;
+            }
+        }
         if (big_binary(e)) return;
         switch (e->op) {
         case TK_PLUS:
@@ -3465,10 +3559,56 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->rhs = qq;
         }
         Expr *target = e->lhs;
+        bool dyn_target = false;
+        if (e->kind == E_ASSIGN && ((target->kind == E_INDEX) || (target->kind == E_MEMBER && !target->is_call && target->str)) && target->lhs &&
+            target->lhs->kind == E_AS && target->lhs->elem_type && ty_is_any(target->lhs->elem_type) && target->lhs->lhs->kind != E_OBJLIT) {
+            /* (o as any).f = v: o's own field when its class has it (the cast only quiets TypeScript), else by name */
+            Expr *o = target->lhs, *inner = o->lhs;
+            check_expr(inner, NULL);
+            Type *it = inner->type;
+            if (target->kind == E_MEMBER && it->kind == TY_OBJECT && !it->cls->builtin && find_field(it->cls, target->str, NULL) && plain_path(inner))
+                target->lhs = inner;
+            else { *o = *inner; to_any(o); dyn_target = true; }
+        }
+        if (dyn_target) {
+            /* x.f = v / x[k] = v on an any: by name, checked at run time */
+            {
+                if (e->op != TK_ASSIGN) xs_error(XS2018, e->pos, "read it, compute, and assign: x.f = x.f + v (or give x its type)", "compound assignment to a field of an any is not supported");
+                Expr *key;
+                const char *fn = "xs_dyn_set";
+                if (target->kind == E_MEMBER) key = dyn_key(target->pos, target->str);
+                else {
+                    key = target->rhs;
+                    check_expr(key, NULL);
+                    if (key->type->kind == TY_LITINT) coerce_lit(key, ty_int); else settle(key);
+                    if (key->type->kind != TY_STRING) { to_any(key); fn = "xs_dyn_set_any"; }
+                }
+                check_expr(e->rhs, ty_any);
+                to_any(e->rhs);
+                dyn_call(e, fn, ty_void, target->lhs, key, e->rhs);
+                return;
+            }
+        }
         if (e->kind == E_ASSIGN && ((target->kind == E_INDEX) || (target->kind == E_MEMBER && !target->is_call && target->str)) &&
             target->lhs && plain_path(target->lhs) && !(target->lhs->kind == E_IDENT && !lookup(target->lhs->str))) {
             check_expr(target->lhs, NULL); /* a variable or a field path: checking it twice is harmless */
             target->lhs = rec_get_nn(target->lhs);
+            if (target->lhs->type && ty_is_any(target->lhs->type)) { /* o.a.f = v with o.a an any (a field, a Record's value) */
+                if (e->op != TK_ASSIGN) xs_error(XS2018, e->pos, "read it, compute, and assign: x.f = x.f + v (or give x its type)", "compound assignment to a field of an any is not supported");
+                Expr *key;
+                const char *fn = "xs_dyn_set";
+                if (target->kind == E_MEMBER) key = dyn_key(target->pos, target->str);
+                else {
+                    key = target->rhs;
+                    check_expr(key, NULL);
+                    if (key->type->kind == TY_LITINT) coerce_lit(key, ty_int); else settle(key);
+                    if (key->type->kind != TY_STRING) { to_any(key); fn = "xs_dyn_set_any"; }
+                }
+                check_expr(e->rhs, ty_any);
+                to_any(e->rhs);
+                dyn_call(e, fn, ty_void, target->lhs, key, e->rhs);
+                return;
+            }
             if (target->lhs->type && target->lhs->type->kind == TY_MAP && target->lhs->type->record) { /* m[k] = v: m.set(k, v) */
                 Expr *key;
                 if (target->kind == E_INDEX) key = target->rhs;
@@ -3542,7 +3682,9 @@ static void check_expr_in(Expr *e, Type *expected) {
         Binding *ub = target->kind == E_IDENT ? lookup(target->str) : NULL;
         if (ub && ub->union_narrow) { target->type = ub->orig; target->cname = ub->cname; } /* x = ...: the union again */
         else {
+            dyn_lvalue = target;
             check_expr(target, NULL);
+            dyn_lvalue = NULL;
             /* o.f = v with o.f narrowed: the target is the field itself, not its checked read (inner reads, as
                the n.next of n.next.next = v, stay checked reads) */
             if (target->kind == E_AS && target->op == TK_NOT && !target->elem_type && target->lhs->kind == E_MEMBER) *target = *target->lhs;
@@ -3656,7 +3798,18 @@ static void check_expr_in(Expr *e, Type *expected) {
             else xs_error(XS7116, e->pos, NULL, "unknown reflection intrinsic '%s'", e->builtin.cfn);
             return;
         }
-        if (e->lhs->kind != E_IDENT) xs_error(XS6030, e->pos, NULL, "only named functions can be called");
+        if (e->lhs->kind != E_IDENT) { /* (() => ...)(), f(a)(b): the function value an expression gives */
+            check_expr(e->lhs, NULL);
+            Type *ft = e->lhs->type;
+            if (ft->kind != TY_FUNC) xs_error(XS6030, e->pos, NULL, "only named functions can be called");
+            if (e->args.len != ft->nparams) xs_error(XS8062, e->pos, NULL, "'%s' takes %d argument(s), got %d", "the function", ft->nparams, e->args.len);
+            for (int i = 0; i < e->args.len; i++) {
+                check_expr(e->args.items[i], ft->params[i]);
+                expect_type(e->args.items[i], ft->params[i], xs_sprintf("argument %d", i + 1));
+            }
+            e->type = ft->ret;
+            return;
+        }
         if (strcmp(e->lhs->str, "super") == 0 && !lookup("super")) { /* super(...): the base's constructor on this object */
             Class *cc = cur_func ? cur_func->cls : NULL;
             if (cur_func && cur_func->is_ctor && cc && cc->extends_error) { /* Error's constructor: super(message, { cause }?) */
@@ -3756,6 +3909,15 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->type = ty_big();
                 return;
             }
+            if (strcmp(name, "Symbol") == 0 && !lookup("Symbol")) { /* Symbol("desc"): a new symbol */
+                if (e->args.len > 1) xs_error(XS7123, e->pos, NULL, "Symbol() takes at most one argument (the description)");
+                if (e->args.len == 0) { Expr *nul = xs_alloc(sizeof *nul); nul->kind = E_NULL; nul->pos = e->pos; nul->field = -1; expr_list_push(&e->args, nul); }
+                check_expr(e->args.items[0], ty_nullable_of(ty_string));
+                expect_type(e->args.items[0], ty_nullable_of(ty_string), "the description of a symbol");
+                e->builtin.cfn = "xs_Symbol_new";
+                e->type = ty_object_of(find_class("symbol"));
+                return;
+            }
             if (strcmp(name, "Number") == 0) {
                 if (e->args.len != 1) xs_error(XS7028, e->pos, NULL, "Number() takes exactly one argument");
                 check_expr(e->args.items[0], NULL);
@@ -3765,6 +3927,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 else if (a->type->kind == TY_INT) e->builtin.cfn = "xs_to_number";
                 else if (a->type->kind == TY_NUMBER) e->builtin.cfn = "xs_to_number_id";
                 else if (is_big(a->type)) e->builtin.cfn = "xs_big_to_number";
+                else if (a->type->kind == TY_UNKNOWN) { e->builtin.cfn = "xs_dyn_num"; xs_any_used = true; } /* as JavaScript converts, at run time */
                 else xs_error(XS7027, a->pos, NULL, "Number() converts int, bigint or string to number, but this is %s", ty_name(a->type));
                 e->type = ty_number;
                 return;
@@ -3782,6 +3945,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                 else if (a->type->kind == TY_ENUM) e->builtin.cfn = a->type->en->is_string ? "xs_retain_str" : "xs_str_from_int";
                 else if (a->type->kind == TY_OBJECT && (is_error_class(a->type->cls) || (a->type->cls->builtin && strcmp(a->type->cls->name, "Error") == 0)))
                     e->builtin.cfn = "xs_Error_to_string"; /* "Name: message", as Error.prototype.toString */
+                else if (a->type->kind == TY_UNKNOWN) { e->builtin.cfn = "xs_dyn_str"; xs_any_used = true; }
+                else if (a->type->kind == TY_OBJECT && a->type->cls->builtin && strcmp(a->type->cls->name, "symbol") == 0) e->builtin.cfn = "xs_Symbol_to_string";
                 else xs_error(XS7040, a->pos, NULL, "String() converts int, number or boolean, but this is %s", ty_name(a->type));
                 e->type = ty_string;
                 return;
@@ -3973,6 +4138,16 @@ static void check_expr_in(Expr *e, Type *expected) {
     }
     case E_INDEX:
         check_expr(e->lhs, NULL);
+        if (ty_is_any(e->lhs->type)) { /* x[k] on an any: a field or key by name, an element by index */
+            check_expr(e->rhs, NULL);
+            Expr *k = e->rhs;
+            if (k->type->kind == TY_LITINT) coerce_lit(k, ty_int); else settle(k);
+            if (k->type->kind == TY_STRING) dyn_call(e, "xs_dyn_get", ty_any, e->lhs, k, NULL);
+            else if (k->type->kind == TY_INT) dyn_call(e, "xs_dyn_at", ty_any, e->lhs, k, NULL);
+            else if (ty_is_any(k->type)) dyn_call(e, "xs_dyn_get_any", ty_any, e->lhs, k, NULL);
+            else xs_error(XS8091, k->pos, NULL, "an any is indexed by a string or an int, not %s", ty_name(k->type));
+            return;
+        }
         if (e->lhs->type->kind == TY_MAP && e->lhs->type->record) { /* m[k] on a Record: m.get(k) */
             Expr *key = e->rhs;
             e->kind = E_MEMBER;
@@ -4033,6 +4208,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (e->rhs->type->kind == TY_NUMBER)
             xs_error(XS8082, e->rhs->pos, "declare the index as int, or convert it with Math.trunc(x)", "array index must be int, but this is number");
         expect_type(e->rhs, ty_int, "array index");
+        if (ty_is_any(e->lhs->type->elem) && e != dyn_lvalue) { dyn_call(e, "xs_dyn_at", ty_any, e->lhs, e->rhs, NULL); return; } /* rows[i] of an any[]: null past the end, as undefined */
         e->type = e->lhs->type->elem;
         return;
     case E_MEMBER:
@@ -4342,8 +4518,27 @@ static void check_expr_in(Expr *e, Type *expected) {
             na->type = e->type = ty_array_of(na->elem_type);
             return;
         }
-        check_expr(e->lhs, NULL);
+        { /* (x as any).f with x of a class that has f: the typed path (the cast only quiets TypeScript) */
+            Expr *as = e->lhs;
+            bool done = false;
+            if (as->kind == E_AS && as->elem_type && ty_is_any(as->elem_type) && e->str && as->lhs->kind != E_OBJLIT && as->lhs->kind != E_ARRAY_LIT) {
+                Expr *inner = as->lhs;
+                check_expr(inner, NULL);
+                Type *it = inner->type;
+                Class *ic = it->kind == TY_OBJECT && !it->cls->builtin ? it->cls : NULL;
+                if (ic && (e->is_call ? find_method(ic, e->str) != NULL : (find_field(ic, e->str, NULL) || find_method(ic, xs_sprintf("__get_%s", e->str)))))
+                    e->lhs = inner;
+                else { *as = *inner; to_any(as); }
+                done = true;
+            }
+            if (!done) check_expr(e->lhs, NULL);
+        }
         e->lhs = rec_get_nn(e->lhs);
+        if (ty_is_any(e->lhs->type)) { /* x.f on an any: by name, through the object's class (or a Record's key) */
+            if (e->is_call) xs_error(XS2017, e->pos, "give the value its type (as SomeClass) to call its methods", "cannot call '%s' on an any: its methods are not looked up by name", e->str);
+            dyn_call(e, e->op == TK_QDOT ? "xs_dyn_get_opt" : "xs_dyn_get", ty_any, e->lhs, dyn_key(e->pos, e->str), NULL);
+            return;
+        }
         if (e->lhs->type->kind == TY_NULLABLE) {
             if (xs_check_mode && after_optional_dot(e->pos)) xs_error_quiet(); /* x?.name: the '?.' was counted where it is */
             xs_error(XS2006, e->pos, "check it first: if (x !== null) { ... }  (fields need a local copy: const v = this.f;)", "'%s' may be null", e->str);
@@ -4713,6 +4908,8 @@ static void check_expr_in(Expr *e, Type *expected) {
         check_expr(e->lhs, want);
         Expr *v = e->lhs;
         if (v->type->kind == TY_LITINT && is_numeric(want)) coerce_lit(v, want);
+        if (ty_is_any(want)) { *e = *v; to_any(e); return; } /* x as any: the same value, read by name from here on */
+        if (ty_is_any(v->type) && (want->kind == TY_UNION || (want->kind == TY_NULLABLE && want->elem->kind == TY_UNION))) { *e = *v; e->type = want; return; }
         if (ty_equal(v->type, want)) { *e = *v; return; }
         if (v->type->kind == TY_UNKNOWN) { /* checked at run time: the emitter compares the object's type */
             if (!unknown_target(want)) xs_error(XS2010, e->pos, NULL, "cannot check %s at run time", ty_name(want));
@@ -4737,6 +4934,12 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     }
     case E_OBJLIT: {
+        if (expected && (ty_is_any(expected) || (expected->kind == TY_NULLABLE && ty_is_any(expected->elem)))) {
+            /* { a: 1 } where an any goes: a Record<string, any> (rule 2 of any) */
+            check_expr(e, record_of_any());
+            to_any(e);
+            return;
+        }
         if (e->spread && objlit_expand(e, expected)) return;
         Type *t = expected && expected->kind == TY_NULLABLE ? expected->elem : expected;
         if (t && t->kind == TY_UNION) { /* which member: the one whose literal field (kind: "circle") the object gives */
@@ -5170,6 +5373,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 big_call(t, "xs_big_to_string", part, NULL, ty_string);
                 e->args.items[i] = part = t;
             }
+            if (ty_is_any(part->type)) { dyn_wrap(part, "xs_dyn_str", ty_string); continue; } /* ${x}: String(x) */
             TypeKind k = part->type->kind;
             if (k == TY_NULLABLE) { /* ${x} with x: T | null: "null", or "undefined" for x?: T (the text JavaScript writes) */
                 TypeKind ek = part->type->elem->kind;
@@ -5318,7 +5522,7 @@ static void check_var(Stmt *s, bool global) {
 /* ---- truthiness, narrowly: a string is true when not empty; T | null when not null (and, for strings, not
    empty). Numbers are never coerced. Only names and fields, which can be read twice: the test is rewritten
    into the explicit comparisons, so narrowing keeps working. ---- */
-static bool truthy_type(Type *t) { return t->kind == TY_STRING || t->kind == TY_NULLABLE; }
+static bool truthy_type(Type *t) { return t->kind == TY_STRING || t->kind == TY_NULLABLE || ty_is_any(t); }
 static bool rereadable(Expr *e) {
     if (e->kind == E_IDENT || e->kind == E_THIS) return true;
     return e->kind == E_MEMBER && !e->is_call && e->field >= 0 && rereadable(e->lhs);
@@ -5371,7 +5575,8 @@ static void check_optchain(Expr *e, Type *expected) {
     pop_scope();
     e->cname = b->cname;
     Type *rt = rest->type;
-    if (rt->kind == TY_VOID) e->type = ty_void;
+    if (ty_is_any(rt)) e->type = rt; /* (an any may be null already) */
+    else if (rt->kind == TY_VOID) e->type = ty_void;
     else if (rt->kind == TY_NULLABLE || rt->kind == TY_NULL) e->type = rt;
     else { /* a null a gives JavaScript's undefined: absent (a rest that is itself T | null keeps its null) */
         if (!nullable_ok(rt)) xs_error(XS2011, e->pos, "read it after a null test: if (a !== null) ...", "'?.' cannot give a %s or null", ty_name(rt));
@@ -5422,6 +5627,7 @@ static void check_nullish(Expr *e, Type *expected) {
         return;
     }
     Expr *l = e->lhs;
+    if (ty_is_any(lt)) lt = ty_nullable_of(lt); /* an any may be null */
     if (lt->kind != TY_NULLABLE && missing_get(l)) lt = l->type; /* m.get(k) ?? d: absent when k is missing */
     if (lt->kind != TY_NULLABLE) {
         check_expr(e->rhs, lt);
@@ -5432,7 +5638,7 @@ static void check_nullish(Expr *e, Type *expected) {
     check_expr(e->rhs, want);
     if (e->rhs->type->kind == TY_LITINT && is_numeric(want)) coerce_lit(e->rhs, want);
     Type *res = want;
-    if (e->rhs->type->kind == TY_NULL || e->rhs->type->kind == TY_NULLABLE) res = ty_nullable_of(want);
+    if ((e->rhs->type->kind == TY_NULL || e->rhs->type->kind == TY_NULLABLE) && !ty_is_any(want)) res = ty_nullable_of(want);
     expect_type(e->rhs, res, "default after '?\?'");
     Expr *d = e->rhs;
     if (!rereadable(e->lhs)) { /* f() ?? d: f() once (emit.c, or_once with a null test) */
@@ -5489,6 +5695,7 @@ static void check_loose_eq(Expr *e) {
 }
 
 static void make_truthy(Expr *e, const char *what) {
+    if (ty_is_any(e->type)) { dyn_wrap(e, "xs_dyn_truthy", ty_boolean); return; } /* JavaScript's truthiness, at run time */
     if (!rereadable(e))
         xs_error(XS8021, e->pos, "store it in a const first, or compare explicitly", "%s must be boolean (truthiness applies to names and fields only)", what);
     Expr *v = expr_copy(e);
@@ -5973,11 +6180,14 @@ static void check_stmt(Stmt *s) {
         return;
     }
     case S_BREAK:
+    case S_CONTINUE:
+        if (s->name) xs_error(XS6044, s->pos, "put the label on a loop that holds this statement", "no loop labeled '%s' around this %s", s->name, s->kind == S_BREAK ? "break" : "continue");
+        if (s->kind == S_CONTINUE) goto check_continue;
         if (!loop_depth && !switch_depth) {
             xs_error(XS8066, s->pos, NULL, "'break' outside of a loop or switch");
         }
         return;
-    case S_CONTINUE:
+    check_continue:
         if (!loop_depth) {
             xs_error(XS8067, s->pos, NULL, "'continue' outside of a loop");
         }

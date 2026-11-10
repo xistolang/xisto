@@ -51,6 +51,7 @@ typedef enum {
     DC_DECLARATION,  /* an unknown, duplicate or unexported name */
     DC_INTERNAL,     /* a compiler bug */
     DC_SEMANTIC,     /* compiles, but may give another result than Node: to review (warnings) */
+    DC_DYNPATH,      /* compiles: `any`, read and written by name and checked at run time (notes, not changes) */
     DC_COUNT
 } DiagCat;
 typedef enum {
@@ -74,6 +75,7 @@ extern bool xs_check_mode; /* xisto check: report every error (no limit of 20) a
 extern int xs_quiet_count;   /* follow-on errors kept quiet (a use of a declaration that failed) */
 void xs_error_continue(DiagCode code, Pos pos, const char *help, const char *fmt, ...); /* report, count, go on */
 void xs_warn(Pos pos, const char *help, const char *fmt, ...);
+void xs_note_dynamic(Pos pos); /* xisto check: a use of any (the dynamic path), counted apart */
 extern jmp_buf *xs_error_recover; /* when set, xs_error longjmps here instead of exiting (up to 20 errors) */
 extern int xs_error_count;
 extern bool xs_warnings;
@@ -203,7 +205,9 @@ typedef struct Type {
     const char *tname;    /* TY_TPARAM; TY_STRING: a string literal type ("circle"), the only value allowed */
 } Type;
 
-extern Type *ty_number, *ty_int, *ty_litint, *ty_boolean, *ty_string, *ty_void, *ty_null, *ty_json, *ty_unknown;
+extern Type *ty_number, *ty_int, *ty_litint, *ty_boolean, *ty_string, *ty_void, *ty_null, *ty_json, *ty_unknown, *ty_any;
+extern bool xs_any_used; /* checker.c: the program reads or writes an any by name */
+static inline bool ty_is_any(const Type *t) { return t && t->kind == TY_UNKNOWN && t->tname; } /* any: the dynamic path */
 Type *ty_nullable_of(Type *inner);
 Type *ty_optional_of(Type *inner); /* x?: T */
 static inline bool tk_bitop(int k) { return k == TK_AMP || k == TK_PIPE || k == TK_CARET || k == TK_SHL || k == TK_SHR || k == TK_USHR; }

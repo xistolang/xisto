@@ -63,7 +63,7 @@ build/xisto_rt_dbg.o: runtime/xisto_rt.c runtime/xisto_rt.h runtime/xisto_dbg.h 
 build/xisto: $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $(OBJ) -lm
 
-build/%.o: src/%.c src/xisto.h | build
+build/%.o: src/%.c src/xisto.h src/diag.def | build
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 build/checker.o: runtime/xisto_regex.h
