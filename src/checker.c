@@ -1142,6 +1142,28 @@ static Type *literal_type(Expr *e) {
     }
     return NULL;
 }
+/* a return type: Promise<T> is T (the function is async); T | Promise<T> too (XB-106) */
+static Type *ret_unpromise(Type *t, bool *async) {
+    if (!t) return t;
+    if (t->kind == TY_PROMISE) { *async = true; return t->elem; }
+    Type *u = t->kind == TY_NULLABLE ? t->elem : t;
+    if (u->kind != TY_UNION) return t;
+    bool any = false;
+    for (int i = 0; i < u->nparams; i++) if (u->params[i]->kind == TY_PROMISE) any = true;
+    if (!any) return t;
+    *async = true;
+    Type **m = xs_alloc(sizeof(Type *) * (size_t)u->nparams);
+    int n = 0;
+    for (int i = 0; i < u->nparams; i++) {
+        Type *x = u->params[i]->kind == TY_PROMISE ? u->params[i]->elem : u->params[i];
+        bool dup = false;
+        for (int k = 0; k < n && !dup; k++) dup = ty_equal(m[k], x);
+        if (!dup) m[n++] = x;
+    }
+    Type *r = m[0];
+    if (n > 1) { r = xs_alloc(sizeof *r); *r = *u; r->params = m; r->nparams = n; }
+    return t->kind == TY_NULLABLE ? ty_nullable_of(r) : r;
+}
 static Type *resolve(Type *t, Pos pos) {
     if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__ret_of:", 9) == 0) { /* (generated reflection) */
         const char *dot = strchr(t->tname + 9, '.');
@@ -1241,7 +1263,7 @@ static Type *resolve(Type *t, Pos pos) {
     case TY_FUNC:
         for (int i = 0; i < t->nparams; i++) t->params[i] = resolve(t->params[i], pos);
         t->ret = resolve(t->ret, pos);
-        if (t->ret->kind == TY_PROMISE) { t->ret = t->ret->elem; t->async_ret = true; } /* () => Promise<R>: an async function returning R */
+        { bool as = false; t->ret = ret_unpromise(t->ret, &as); if (as) t->async_ret = true; } /* () => Promise<R>: an async function returning R */
         return t;
     case TY_UNION: { /* members resolved, nested unions flattened, repeats dropped; null makes it nullable */
         Type **m = NULL;
@@ -3801,7 +3823,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             } else {
                 check_expr(e->rhs, NULL);
             }
-        } else if (e->op == TK_OR && !(e->lhs->type->kind != TY_BOOLEAN && truthy_type(e->lhs->type))) {
+        } else if (e->op == TK_OR && !is_numeric(e->lhs->type) && !(e->lhs->type->kind != TY_BOOLEAN && truthy_type(e->lhs->type))) {
             /* x === null || x.f : the right side runs when the left is false, so x is not null there */
             NSet fs = {0};
             narrow_set(e->lhs, false, &fs);
@@ -3812,6 +3834,20 @@ static void check_expr_in(Expr *e, Type *expected) {
             check_expr(e->rhs, NULL);
             pop_scope();
         } else if (e->op == TK_IDENT) { /* instanceof: the right side is a class name, checked below */
+        } else if (e->op == TK_OR && is_numeric(e->lhs->type)) { /* parseInt(s, 10) || 3001: the number unless 0 or NaN */
+            Type *nt = e->lhs->type;
+            check_expr(e->rhs, nt);
+            if (e->rhs->type->kind == TY_LITINT) coerce_lit(e->rhs, nt);
+            expect_type(e->rhs, nt, "default after '||'");
+            if (!(e->rhs->kind == E_NUMBER || rereadable(e->rhs)))
+                xs_error(XS8021, e->rhs->pos, "store the default in a const first", "the default after '||' of a number must be a literal or a name");
+            Expr *a = e->lhs, *b = e->rhs;
+            e->kind = E_CALL; e->op = 0; e->lhs = NULL; e->rhs = NULL; e->args = (ExprList){0};
+            e->builtin.cfn = nt->kind == TY_INT ? "xs_int_or" : "xs_num_or";
+            expr_list_push(&e->args, a);
+            expr_list_push(&e->args, b);
+            e->type = nt;
+            return;
         } else if (e->op == TK_OR && truthy_type(e->lhs->type)) { /* value || default */
             Type *want = e->lhs->type->kind == TY_NULLABLE ? e->lhs->type->elem : e->lhs->type;
             check_expr(e->rhs, want);
@@ -5002,6 +5038,13 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (xs_check_mode && after_optional_dot(e->pos)) xs_error_quiet(); /* x?.name: the '?.' was counted where it is */
             xs_error(XS2006, e->pos, "check it first: if (x !== null) { ... }  (fields need a local copy: const v = this.f;)", "'%s' may be null", e->str);
         }
+        if (!e->is_call && e->str && e->lhs->builtin.cfn && strcmp(e->lhs->builtin.cfn, "xs_process_env") == 0 && strcmp(e->str, "size") != 0) {
+            /* process.env.NAME: process.env.get("NAME") (a string, or null when it is not set) */
+            e->is_call = true;
+            e->args = (ExprList){0};
+            expr_list_push(&e->args, str_lit(e->pos, e->str));
+            e->str = "get";
+        }
         if (e->lhs->type->kind == TY_MAP || e->lhs->type->kind == TY_SET) {
             check_map_member(e);
             return;
@@ -5370,6 +5413,11 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (ty_is_any(want)) { *e = *v; to_any(e); return; } /* x as any: the same value, read by name from here on */
         if (ty_is_any(v->type) && (want->kind == TY_UNION || (want->kind == TY_NULLABLE && want->elem->kind == TY_UNION))) { *e = *v; e->type = want; return; }
         if (ty_equal(v->type, want)) { *e = *v; return; }
+        if (v->type->kind == TY_UNKNOWN && (want->kind == TY_UNION || (want->kind == TY_NULLABLE && want->elem->kind == TY_UNION))) {
+            *e = *v; /* unknown as A | B: a union is held as unknown is (boxed); its uses narrow it */
+            e->type = want;
+            return;
+        }
         if (v->type->kind == TY_UNKNOWN) { /* checked at run time: the emitter compares the object's type */
             if (!unknown_target(want)) xs_error(XS2010, e->pos, NULL, "cannot check %s at run time", ty_name(want));
             e->type = want;
@@ -5531,7 +5579,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         if (f->ret) f->ret = resolve(f->ret, e->pos);
         else if (want) f->ret = want->ret;
-        if (f->ret && f->ret->kind == TY_PROMISE) { f->ret = f->ret->elem; f->ret_promise = true; }
+        { bool as = false; f->ret = ret_unpromise(f->ret, &as); if (as) f->ret_promise = true; }
         if (f->is_async || (want && want->async_ret)) f->ret_promise = true;
         /* (x): int => ... where a function returning unknown is expected: TypeScript accepts it (the return type
            is covariant); the arrow returns unknown and its returns are converted (boxed) */
@@ -6822,7 +6870,7 @@ static void resolve_signature(Func *f) {
     }
     if (f->ret) f->ret = resolve(f->ret, f->pos);
     else if (!f->ret_infer) f->ret_infer = 1; /* left out: inferred from the body (fret) */
-    if (f->ret && f->ret->kind == TY_PROMISE) { f->ret = f->ret->elem; f->ret_promise = true; } /* (): Promise<T>: T, and async (XB-106) */
+    { bool as = false; f->ret = ret_unpromise(f->ret, &as); if (as) f->ret_promise = true; } /* (): Promise<T>: T, and async (XB-106) */
     if (f->is_async) f->ret_promise = true;
 }
 
@@ -7376,6 +7424,24 @@ static void flatten_fields(Class *c, int depth) {
 
 /* the base's methods the class does not override join its list (still owned by the base); an override keeps the
    signature; a concrete class has no abstract method left */
+
+static bool inline_cls(Type *t) { return t && t->kind == TY_OBJECT && t->cls && t->cls->name && strncmp(t->cls->name, "__Obj_", 6) == 0; }
+/* a: the type of an override's parameter or result; b: the overridden one's. When both are object types written in
+   place with the same fields (by name and type), the override takes b's */
+static Type *inline_same(Type *a, Type *b) {
+    if (!a || !b || ty_equal(a, b)) return a;
+    if (a->kind == TY_ARRAY && b->kind == TY_ARRAY) return inline_same(a->elem, b->elem) == b->elem ? b : a;
+    bool na = a->kind == TY_NULLABLE, nb = b->kind == TY_NULLABLE;
+    if (na != nb) return a;
+    Type *x = na ? a->elem : a, *y = nb ? b->elem : b;
+    if (!inline_cls(x) || !inline_cls(y) || x->cls->nfields != y->cls->nfields) return a;
+    for (int i = 0; i < x->cls->nfields; i++) {
+        Field *g = find_field(y->cls, x->cls->fields[i].name, NULL);
+        if (!g || !x->cls->fields[i].type || !g->type) return a;
+        if (!ty_equal(x->cls->fields[i].type, g->type) && inline_same(x->cls->fields[i].type, g->type) != g->type) return a;
+    }
+    return b;
+}
 static void flatten_methods(Class *c) {
     if (!c->base || c->nbase_fields < 0) return;
     if (c->base->base && !c->base->methods_flat) flatten_methods(c->base);
@@ -7393,6 +7459,27 @@ static void flatten_methods(Class *c) {
         }
         if (!own->ret && bm->ret && own->ret_infer == 1) { own->ret = bm->ret; own->ret_infer = 0; } /* an override that
                                                                          leaves out its return type returns what it overrides */
+        if (own->nparams < bm->nparams && own->body && !own->ntparams) { /* auditAppa(): void overriding auditAppa(a, b): TypeScript
+                                                                            lets an override take fewer; it takes the rest, unnamed */
+            bool prefix = true;
+            for (int k = 0; prefix && k < own->nparams; k++) prefix = ty_equal(own->params[k].type, bm->params[k].type);
+            if (prefix) {
+                Param *ps = xs_alloc(sizeof(Param) * (size_t)bm->nparams);
+                memcpy(ps, own->params, sizeof(Param) * (size_t)own->nparams);
+                for (int k = own->nparams; k < bm->nparams; k++) {
+                    memset(&ps[k], 0, sizeof(Param));
+                    ps[k].name = xs_sprintf("__unused%d", k);
+                    ps[k].type = bm->params[k].type;
+                }
+                own->params = ps;
+                own->nparams = bm->nparams;
+            }
+        }
+        if (own->nparams == bm->nparams) { /* { existe: boolean; canal: Num } and { ...; canal: NumeroOracle | null }: object types
+                                                written in place that have the same fields are one type */
+            own->ret = inline_same(own->ret, bm->ret);
+            for (int k = 0; k < own->nparams; k++) own->params[k].type = inline_same(own->params[k].type, bm->params[k].type);
+        }
         bool same = own->nparams == bm->nparams && (!own->ret || !bm->ret || ty_equal(own->ret, bm->ret));
         for (int k = 0; same && k < own->nparams; k++) same = ty_equal(own->params[k].type, bm->params[k].type);
         if (!same) {
