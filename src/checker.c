@@ -2575,7 +2575,8 @@ static void expect_type(Expr *e, Type *want, const char *what) {
     if (shape_copy(e, want)) return;
     if (want->kind == TY_NULLABLE && shape_copy(e, want->elem)) return;
     if (shape_copy_array(e, want)) { if (want->kind == TY_NULLABLE) e->type = want; return; }
-    if (tsc_checked() && e->type->kind == TY_UNKNOWN && want->kind != TY_VOID && !ty_is_any(want) && unknown_target(want)) {
+    Type *wu = want->kind == TY_NULLABLE ? want->elem : want;
+    if (tsc_checked() && e->type->kind == TY_UNKNOWN && want->kind != TY_VOID && !ty_is_any(want) && (unknown_target(want) || wu->kind == TY_UNION)) {
         /* an unknown (a row's value, a { k: null } field) where T goes, in code tsc checked: as T, checked at run time */
         xs_warn_rule(XS2108, e->pos, "give the value its type where it is made, or cast it: x as T",
                      "%s is unknown where %s goes: checked at run time", what, ty_name(want));

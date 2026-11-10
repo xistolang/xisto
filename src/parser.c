@@ -494,6 +494,10 @@ static Type *parse_type(Parser *p) {
         if (strcmp(k.str, "Timeout") != 0 && strcmp(k.str, "Timer") != 0 && strcmp(k.str, "Immediate") != 0)
             xs_error(XS1019, k.pos, "NodeJS.Timeout is the one NodeJS type xisto knows", "unsupported type NodeJS.%s", k.str);
         t = ty_int;
+    } else if (strcmp(n, "Awaited") == 0 && at(p, TK_LT)) { /* Awaited<T>: T (a Promise<T> is held as the T it settles to) */
+        next(p);
+        t = parse_type(p);
+        expect(p, TK_GT, "close Awaited<T> with '>'");
     } else if (strcmp(n, "ReturnType") == 0 && at(p, TK_LT)) { /* ReturnType<typeof setTimeout>: a timer id */
         Parser look = *p;
         next(&look);
@@ -1719,13 +1723,16 @@ static Expr *unset_value(Type *t, Pos pos) {
     Expr *e;
     switch (t->kind) {
     case TY_NUMBER: case TY_INT: e = new_expr(E_NUMBER, pos); e->num = 0; e->is_int_lit = true; return e;
-    case TY_STRING: if (t->tname) return NULL; e = new_expr(E_STRING, pos); e->str = ""; return e;
+    case TY_STRING:
+        if (t->tname) { e = new_expr(E_NULL, pos); e->unset = true; return e; } /* a name resolved later (an interface, ReturnType<...>): the checker picks */
+        e = new_expr(E_STRING, pos); e->str = ""; return e;
     case TY_BOOLEAN: e = new_expr(E_BOOL, pos); e->boolean = false; return e;
     case TY_NULLABLE: return new_expr(E_NULL, pos);
     case TY_OBJECT: e = new_expr(E_NULL, pos); e->unset = true; return e; /* (the checker picks the empty value) */
     case TY_ARRAY: return new_expr(E_ARRAY_LIT, pos);
     case TY_MAP: case TY_SET: if (t->record) return new_expr(E_OBJLIT, pos); e = new_expr(E_NEW_MAP, pos); e->elem_type = t; return e;
     case TY_UNKNOWN: return new_expr(E_NULL, pos); /* let x: any; / unknown: null until assigned */
+    case TY_TPARAM: if (t->tname && !strncmp(t->tname, "__ret_of_fn:", 12)) { e = new_expr(E_NULL, pos); e->unset = true; return e; } return NULL; /* let r: ReturnType<typeof f>; */
     default: return NULL;
     }
 }
