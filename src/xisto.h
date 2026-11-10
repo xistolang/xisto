@@ -490,6 +490,7 @@ typedef struct {
     Expr *init;        /* may be NULL */
     char *cname;
     bool optional;     /* `name?: T`: T | null, starts as null */
+    bool definite;     /* `name!: T`: assigned before it is read (TypeScript trusts it), outside the constructor too */
     DecoList decos;
     char *type_src;    /* the type as written, without the ? (reflection) */
     int access;        /* 0 public, 1 protected, 2 private */

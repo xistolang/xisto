@@ -1718,6 +1718,44 @@ static Expr *unset_value(Type *t, Pos pos) {
     default: return NULL;
     }
 }
+/* const x: T = f().finally(() => { if (cur === x) ... }): a closure in the initializer reads x, which JavaScript
+   allows (the closure runs after x is set). Lowered to `let x: T; x = f()...;`, so the closures share x's cell. */
+static bool st_names(Stmt *s, const char *n);
+static bool ex_names(Expr *e, const char *n, bool in_arrow) {
+    if (!e) return false;
+    if (e->kind == E_IDENT && in_arrow && e->str && strcmp(e->str, n) == 0) return true;
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) {
+        for (int i = 0; i < e->arrow->fn->nparams; i++) if (e->arrow->fn->params[i].name && strcmp(e->arrow->fn->params[i].name, n) == 0) return false;
+        return st_names(e->arrow->fn->body, n);
+    }
+    if (ex_names(e->lhs, n, in_arrow) || ex_names(e->rhs, n, in_arrow)) return true;
+    for (int i = 0; i < e->args.len; i++) if (ex_names(e->args.items[i], n, in_arrow)) return true;
+    return false;
+}
+static bool st_names(Stmt *s, const char *n) {
+    if (!s) return false;
+    if (ex_names(s->expr, n, true) || ex_names(s->init, n, true) || ex_names(s->cond, n, true) || ex_names(s->for_update, n, true)) return true;
+    if (st_names(s->for_init, n) || st_names(s->body, n) || st_names(s->else_body, n)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (st_names(s->stmts.items[i], n)) return true;
+    for (int i = 0; i < s->ncases; i++) if (ex_names(s->cases[i].value, n, true) || st_names(s->cases[i].body, n)) return true;
+    return false;
+}
+static void self_ref_split(Parser *p, Stmt *s) {
+    if (!s->decl_type || !s->init || !s->name || !ex_names(s->init, s->name, false)) return;
+    Expr *init = s->init;
+    Expr *u = new_expr(E_NULL, s->pos);
+    u->unset = true; /* (assigned right after, before any read) */
+    s->init = u;
+    s->is_const = false;
+    Stmt *a = new_stmt(S_EXPR, init->pos);
+    Expr *as = new_expr(E_ASSIGN, init->pos);
+    as->lhs = new_expr(E_IDENT, s->pos);
+    as->lhs->str = s->name;
+    as->rhs = init;
+    as->op = TK_ASSIGN;
+    a->expr = as;
+    stmt_list_push(&p->pending, a);
+}
 static Stmt *parse_var(Parser *p) {
     Stmt *s = new_stmt(S_VAR, p->tok.pos);
     s->is_const = at(p, TK_CONST);
@@ -1739,6 +1777,7 @@ static Stmt *parse_var(Parser *p) {
             xs_error(XS8146, p->tok.pos, "xisto has no 'undefined', so every variable starts with a value", "variable '%s' must be initialized", s->name);
         next(p);
         s->init = parse_expr(p);
+        self_ref_split(p, s);
     }
     while (at(p, TK_COMMA)) { /* let a = 1, b = 2: the next ones follow as their own declarations */
         next(p);
@@ -2842,7 +2881,7 @@ static void parse_fields_body(Parser *p, Class *c) {
             fd.readonly = (mods & MOD_READONLY) != 0;
             fd.owner = c;
             if (accept(p, TK_QUESTION)) fd.optional = true;
-            else if (at(p, TK_NOT) && peek_is(p, TK_COLON)) next(p); /* total!: number: set before it is read (by the
+            else if (at(p, TK_NOT) && peek_is(p, TK_COLON)) { next(p); fd.definite = true; } /* total!: number: set before it is read (by the
                                                                          constructor, or by JSON for a DTO) */
             bool inferred = false;
             if (!at(p, TK_COLON) && at(p, TK_ASSIGN) && !fd.optional) { /* logger = new Logger(X.name), count = 0: the type the
