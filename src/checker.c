@@ -2119,6 +2119,60 @@ static bool is_subclass(Class *sub, Class *base) {
     return false;
 }
 /* the constructor `new C(...)` runs: its own, or the nearest base's */
+/* class X extends Error: fields message and name come first, laid out as the runtime's Error (xs_Error_wrap_err
+   reads them when the object is thrown); without a constructor, X's is constructor(message = "") { super(message) } */
+static void error_class(Class *c) {
+    c->extends_error = true;
+    const char *names[2] = {"message", "name"}, *inits[2] = {"", "Error"};
+    for (int k = 1; k >= 0; k--) { /* name, then message in front of it */
+        int at = -1;
+        for (int i = 0; i < c->nfields; i++) if (strcmp(c->fields[i].name, names[k]) == 0) at = i;
+        Field f;
+        if (at >= 0) { /* declared by the class (name = "QueryFailedError"): moved to the front */
+            f = c->fields[at];
+            memmove(&c->fields[1], &c->fields[0], sizeof(Field) * (size_t)at);
+        } else {
+            memset(&f, 0, sizeof f);
+            f.name = (char *)names[k];
+            f.pos = c->pos;
+            f.type = ty_string;
+            f.type_src = "string";
+            f.owner = c;
+            f.init = str_lit(c->pos, inits[k]);
+            c->fields = realloc(c->fields, sizeof(Field) * (size_t)(c->nfields + 1));
+            c->cap_fields = c->nfields + 1;
+            memmove(&c->fields[1], &c->fields[0], sizeof(Field) * (size_t)c->nfields);
+            c->nfields++;
+        }
+        c->fields[0] = f;
+    }
+    if (c->ctor) return;
+    Func *f = xs_alloc(sizeof *f);
+    f->name = "constructor";
+    f->pos = c->pos;
+    f->mod = c->mod;
+    f->cls = c;
+    f->is_ctor = true;
+    f->ret = ty_void;
+    f->exported = c->exported;
+    f->params = xs_alloc(sizeof(Param));
+    f->nparams = 1;
+    f->params[0].name = "message";
+    f->params[0].type = ty_string;
+    f->params[0].type_src = "string";
+    f->params[0].dflt = str_lit(c->pos, "");
+    Expr *sup = xs_alloc(sizeof *sup), *arg = xs_alloc(sizeof *arg), *call = xs_alloc(sizeof *call);
+    sup->kind = E_IDENT; sup->pos = c->pos; sup->str = "super"; sup->field = -1;
+    arg->kind = E_IDENT; arg->pos = c->pos; arg->str = "message"; arg->field = -1;
+    call->kind = E_CALL; call->pos = c->pos; call->lhs = sup; call->field = -1;
+    expr_list_push(&call->args, arg);
+    Stmt *st = xs_alloc(sizeof *st), *body = xs_alloc(sizeof *body);
+    st->kind = S_EXPR; st->pos = c->pos; st->expr = call;
+    body->kind = S_BLOCK; body->pos = c->pos;
+    stmt_list_push(&body->stmts, st);
+    f->body = body;
+    c->ctor = f;
+}
 static Func *eff_ctor(Class *c) {
     for (; c; c = c->base) if (c->ctor) return c->ctor;
     return NULL;
@@ -2866,8 +2920,10 @@ static void check_expr(Expr *e, Type *expected) {
             /* x === null || x.f : the right side runs when the left is false, so x is not null there */
             NSet fs = {0};
             narrow_set(e->lhs, false, &fs);
+            UNarrow un = union_narrow(e->lhs); /* !(e instanceof X) || e.code: X on the right */
             push_scope();
-            shadow_set(&fs);
+            if (un.b && un.else_t) shadow_union(un.b, un.else_t);
+            else shadow_set(&fs);
             check_expr(e->rhs, NULL);
             pop_scope();
         } else if (e->op == TK_IDENT) { /* instanceof: the right side is a class name, checked below */
@@ -3211,6 +3267,20 @@ static void check_expr(Expr *e, Type *expected) {
         if (e->lhs->kind != E_IDENT) xs_error(XS6030, e->pos, NULL, "only named functions can be called");
         if (strcmp(e->lhs->str, "super") == 0 && !lookup("super")) { /* super(...): the base's constructor on this object */
             Class *cc = cur_func ? cur_func->cls : NULL;
+            if (cur_func && cur_func->is_ctor && cc && cc->extends_error) { /* Error's constructor: super(message, { cause }?) */
+                if (e->args.len > 2) xs_error(XS8027, e->pos, NULL, "the constructor of Error takes 0 to 2 argument(s), got %d", e->args.len);
+                Expr *msg = e->args.len ? e->args.items[0] : str_lit(e->pos, "");
+                Expr *self = xs_alloc(sizeof *self), *fm = xs_alloc(sizeof *fm);
+                self->kind = E_THIS; self->pos = e->pos; self->field = -1;
+                fm->kind = E_MEMBER; fm->pos = e->pos; fm->lhs = self; fm->str = "message"; fm->field = -1;
+                memset(&e->args, 0, sizeof e->args);
+                e->kind = E_ASSIGN;
+                e->op = TK_ASSIGN;
+                e->lhs = fm;
+                e->rhs = msg;
+                check_expr(e, NULL);
+                return;
+            }
             if (!cur_func || !cur_func->is_ctor || !cc || !cc->base)
                 xs_error(XS8125, e->pos, NULL, "super(...) is called in the constructor of a class that extends another");
             Func *bc = eff_ctor(cc->base);
@@ -3318,6 +3388,8 @@ static void check_expr(Expr *e, Type *expected) {
                 else if (a->type->kind == TY_STRING) e->builtin.cfn = "xs_retain_str";
                 else if (is_big(a->type)) e->builtin.cfn = "xs_big_to_string";
                 else if (a->type->kind == TY_ENUM) e->builtin.cfn = a->type->en->is_string ? "xs_retain_str" : "xs_str_from_int";
+                else if (a->type->kind == TY_OBJECT && (is_error_class(a->type->cls) || (a->type->cls->builtin && strcmp(a->type->cls->name, "Error") == 0)))
+                    e->builtin.cfn = "xs_Error_to_string"; /* "Name: message", as Error.prototype.toString */
                 else xs_error(XS7040, a->pos, NULL, "String() converts int, number or boolean, but this is %s", ty_name(a->type));
                 e->type = ty_string;
                 return;
@@ -5126,6 +5198,23 @@ static Expr *union_ident(Expr *e) { /* x, or x seen through a narrowing */
 }
 static UNarrow union_narrow(Expr *c) {
     UNarrow r = {0};
+    if (c->kind == E_UNARY && c->op == TK_NOT) { /* !(x instanceof C): the branches swap */
+        r = union_narrow(c->lhs);
+        Type *t = r.then_t;
+        r.then_t = r.else_t;
+        r.else_t = t;
+        return r;
+    }
+    if (c->kind == E_BINARY && (c->op == TK_AND || c->op == TK_OR)) {
+        /* a caught Error narrowed on one side: (e instanceof X && ...) true, (!(e instanceof X) || ...) false */
+        UNarrow a = union_narrow(c->lhs);
+        bool err = a.b && a.b->type->kind == TY_OBJECT && a.b->type->cls->builtin && strcmp(a.b->type->cls->name, "Error") == 0;
+        if (!err) return r;
+        r.b = a.b;
+        if (c->op == TK_AND) r.then_t = a.then_t;
+        else r.else_t = a.else_t;
+        return r;
+    }
     if (c->kind != E_BINARY) return r;
     bool neg = c->op == TK_NEQ;
     Expr *id = NULL, *lit = NULL;
@@ -5142,6 +5231,12 @@ static UNarrow union_narrow(Expr *c) {
     if (!id) return r;
     Binding *b = lookup(id->str);
     if (!b) return r;
+    if (how == 2 && !neg && b->type->kind == TY_OBJECT && b->type->cls->builtin && strcmp(b->type->cls->name, "Error") == 0 &&
+        c->rhs->cls && is_error_class(c->rhs->cls)) { /* catch (e) { if (e instanceof HttpException) ... }: e is the thrown object */
+        r.b = b;
+        r.then_t = ty_object_of(c->rhs->cls);
+        return r;
+    }
     Type *u = b->type;
     bool nul = u->kind == TY_NULLABLE && u->elem->kind == TY_UNION; /* number | string | null: null stays on the other side */
     if (nul) u = u->elem;
@@ -5311,6 +5406,18 @@ static void check_stmt(Stmt *s) {
         check_expr(s->expr, NULL);
         Class *err = find_class("Error");
         Type *t = s->expr->type;
+        if (t->kind == TY_OBJECT && is_error_class(t->cls)) {
+            /* an object of a class that extends Error: an Error with its message and name, the object its cause */
+            Expr *v = expr_copy(s->expr);
+            Expr *w = xs_alloc(sizeof *w);
+            w->kind = E_CALL;
+            w->pos = v->pos;
+            w->builtin.cfn = "xs_Error_wrap_err";
+            w->type = ty_object_of(err);
+            expr_list_push(&w->args, v);
+            s->expr = w;
+            return;
+        }
         if (t->kind == TY_OBJECT && t->cls != err && !t->cls->builtin) {
             /* any object can be thrown, as in JavaScript: it travels as an Error whose cause is the object */
             Expr *v = expr_copy(s->expr);
@@ -6221,6 +6328,7 @@ void check_program(Program *p) {
                 xs_error(XS9031, c->base_pos, xs_help_suggest(c->base_name, cands, n, NULL), "unknown class '%s'", c->base_name);
             }
             if (b->is_interface) xs_error(XS9004, c->base_pos, xs_sprintf("class %s implements %s", c->name, b->name), "'%s' is an interface; a class extends classes", b->name);
+            if (b->builtin && strcmp(b->name, "Error") == 0) { error_class(c); continue; }
             if (b->builtin) xs_error(XS6024, c->base_pos, "wrap it in a field instead", "extending the built-in class %s is not supported", b->name);
             c->base = b;
             b->subs = realloc(b->subs, sizeof(Class *) * (size_t)(b->nsubs + 1));

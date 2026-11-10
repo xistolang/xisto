@@ -1711,6 +1711,29 @@ XS_NOINLINE void *xs_Error_wrap(xs_str *name, void *cause) {
     e->f_cause = xs_retain(cause); /* the argument is borrowed */
     return e;
 }
+/* throw obj, obj of a class that extends Error: its first fields are message and name, laid out as xs_Error's */
+XS_NOINLINE void *xs_Error_wrap_err(void *cause) {
+    struct { xs_hdr hdr; xs_str *message; xs_str *name; } *o = cause;
+    xs_Error *e = xs_Error_new(o->message);
+    xs_release(e->f_name);
+    e->f_name = xs_retain(o->name);
+    e->f_cause = xs_retain(cause); /* the argument is borrowed */
+    return e;
+}
+/* String(err): "name: message", or the one that is not empty (an Error, or an object of a class that extends Error:
+   both start with message and name) */
+XS_NOINLINE xs_str *xs_Error_to_string(void *v) {
+    struct { xs_hdr hdr; xs_str *message; xs_str *name; } *o = v;
+    if (!o->message->len) return xs_retain(o->name);
+    if (!o->name->len) return xs_retain(o->message);
+    xs_str *sep = xs_str_new(": ", 2), *a = xs_str_concat(o->name, sep), *r = xs_str_concat(a, o->message);
+    xs_release(sep); xs_release(a);
+    return r;
+}
+/* the object a caught Error was thrown as (an object of a class that extends Error), or NULL */
+static inline void *xs_Error_thrown(void *v) {
+    return v && xs_type_of(v)->free == xs_Error_free ? ((xs_Error *)v)->f_cause : NULL;
+}
 static inline bool xs_is_a(void *v, void (*free_fn)(void *)) { return v && free_fn && xs_type_of(v)->free == free_fn; }
 /* e.stack: "Error: message" and one "    at ..." line per frame, as in Node; borrowed from the Error */
 static xs_str *xs_Error_stack(xs_Error *e) {

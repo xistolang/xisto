@@ -7,7 +7,7 @@ count 2: POST /orders,orders-2/_count
 index created: PUT /orders/_doc/1?refresh=wait_for {"company":"Ação & Cia","amount":10.5,"tags":["a","b"]} [application/json]
 index generated: POST /orders/_doc {"company":"C"} [application/json]
 get Ação & Cia: GET /orders/_doc/1?_source=true
-get missing: error
+get missing: error ResponseError 404 404
 get missing with ignore: missing false
 update updated: POST /orders/_update/1?retry_on_conflict=3 {"doc":{"amount":11},"doc_as_upsert":true} [application/json]
 delete deleted: DELETE /orders/_doc/1?refresh=true
@@ -19,5 +19,5 @@ indices.putIndexTemplate: PUT /_index_template/orders-tpl {"index_patterns":["or
 ilm.putLifecycle: PUT /_ilm/policy/keep-30d {"policy":{"phases":{"delete":{"min_age":"30d"}}}} [application/json]
 error: index_not_found_exception\n\tRoot causes:\n\t\tindex_not_found_exception: no such index [nope]
 retry after 503: count 7: POST /flaky/_count
-slow: Request timed out
+slow: Request timed out TimeoutError true
 after close: The client is closed

@@ -2506,6 +2506,12 @@ static void emit_expr_raw(Expr *e) {
         }
         if (e->op == TK_DOT) { /* a union narrowed to one member: the test already proved it */
             Type *t = e->type;
+            Type *lt = e->lhs->type;
+            if (t->kind == TY_OBJECT && is_error_class(t->cls) && lt && lt->kind == TY_OBJECT && lt->cls->builtin && strcmp(lt->cls->name, "Error") == 0) {
+                buf_printf(out, "((%s)xs_Error_thrown(%s))", ctype(t), b.data); /* catch (e) { if (e instanceof X) e.code } */
+                free(b.data);
+                return;
+            }
             if (t->kind == TY_NUMBER) buf_printf(out, "xs_as_num(%s)", b.data);
             else if (t->kind == TY_INT || (t->kind == TY_ENUM && !t->en->is_string)) buf_printf(out, "xs_as_int(%s)", b.data);
             else if (t->kind == TY_BOOLEAN) buf_printf(out, "xs_as_bool(%s)", b.data);
@@ -2926,6 +2932,22 @@ static void emit_expr_raw(Expr *e) {
         }
         if (e->op == TK_IDENT) { /* instanceof: the same identity test as `as` */
             Class *c = e->rhs->cls;
+            Type *lt = e->lhs->type;
+            bool l_err = lt->kind == TY_OBJECT && lt->cls->builtin && strcmp(lt->cls->name, "Error") == 0;
+            if (lt->kind == TY_OBJECT && is_error_class(lt->cls) && strcmp(c->name, "Error") == 0 && c->builtin) {
+                buf_puts(out, "((void *)("); /* an object of a class that extends Error is an Error */
+                emit_expr(e->lhs);
+                buf_puts(out, ") != NULL)");
+                return;
+            }
+            if (l_err && is_error_class(c)) { /* a caught Error: the class of the object it was thrown as */
+                if (in_hierarchy(c)) buf_printf(out, "%s(xs_Error_thrown((void *)(", isa_fn(c));
+                else buf_printf(out, "xs_is_a(xs_Error_thrown((void *)(");
+                emit_expr(e->lhs);
+                if (in_hierarchy(c)) buf_puts(out, ")))");
+                else buf_printf(out, ")), %s_free)", c->cname);
+                return;
+            }
             if (in_hierarchy(c)) {
                 buf_printf(out, "%s((void *)(", isa_fn(c));
                 emit_expr(e->lhs);
