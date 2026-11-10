@@ -44,6 +44,17 @@ async function main() {
   }
   const ra = await conn.execute("begin :1 := :2 + 1; end;", [{ dir: BIND_OUT, type: NUMBER }, { dir: BIND_IN, val: 3 }]);
   console.log("depois", JSON.stringify(ra.outBinds));
+  for (const n of [5000, 32767]) {
+    const r = await conn.execute("begin :1 := length(:2); end;", [{ dir: BIND_OUT, type: NUMBER }, "y".repeat(n)]);
+    console.log("in longo", n, JSON.stringify(r.outBinds));
+  }
+  const longText = "ação-" + "çé".repeat(20000) + "-fim";
+  const rl = await conn.execute("begin :1 := dbms_lob.getlength(:2); :3 := dbms_lob.substr(:2, 12, 1) || '|' || dbms_lob.substr(:2, 6, dbms_lob.getlength(:2) - 5); end;", [{ dir: BIND_OUT, type: NUMBER }, longText, { dir: BIND_OUT, type: STRING, maxSize: 40 }]);
+  console.log("clob in", JSON.stringify(rl.outBinds));
+  const raw = Buffer.alloc(70000);
+  for (let i = 0; i < raw.length; i++) raw[i] = (i * 7) % 256;
+  const rbb = await conn.execute("begin :1 := dbms_lob.getlength(:2); :3 := rawtohex(dbms_lob.substr(:2, 6, 1)) || '|' || rawtohex(dbms_lob.substr(:2, 6, 69995)); end;", [{ dir: BIND_OUT, type: NUMBER }, { dir: BIND_IN, type: BLOB, val: raw }, { dir: BIND_OUT, type: STRING, maxSize: 40 }]);
+  console.log("blob in", JSON.stringify(rbb.outBinds));
   let sum = 0;
   for (let i = 0; i < 300; i++) {
     const r = await conn.execute("begin :1 := xisto_pk.fn_clob(:2); end;", [{ dir: BIND_OUT, type: CLOB }, 3]);

@@ -15,4 +15,8 @@ campos Error ORA-20001 20001 0 false
 campos ORA-00942 942 14
 campos NJS-098 - 0
 depois [4]
+in longo 5000 [5000]
+in longo 32767 [32767]
+clob in [40009,"ação-çéçéçéç|çé-fim"]
+blob in [70000,"00070E151C23|E6EDF4FB0209"]
 300 clobs 9000
