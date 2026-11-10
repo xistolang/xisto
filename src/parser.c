@@ -309,7 +309,13 @@ static Type *parse_type(Parser *p) {
         t = ty_stream_of(parse_type(p));
         while (accept(p, TK_COMMA)) parse_type(p);
         expect(p, TK_GT, NULL);
-    } else if (strcmp(n, "Array") == 0) {
+    } else if (strcmp(n, "readonly") == 0) { /* readonly T[]: T[] (that it is not written to is TypeScript's check) */
+        t = parse_type(p);
+    } else if (strcmp(n, "Readonly") == 0) { /* Readonly<T>: T */
+        expect(p, TK_LT, "write Readonly<T>");
+        t = parse_type(p);
+        expect(p, TK_GT, NULL);
+    } else if (strcmp(n, "Array") == 0 || strcmp(n, "ReadonlyArray") == 0) {
         expect(p, TK_LT, "write Array<T> or T[]");
         t = ty_array_of(parse_type(p));
         expect(p, TK_GT, NULL);
