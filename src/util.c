@@ -233,8 +233,32 @@ static bool in_package_file(void) {
     const char *pk = getenv("XISTO_PKGS");
     return pk && *pk && strncmp(f, pk, strlen(pk)) == 0;
 }
+/* a place warned once: a generic function's instances check the same source again */
+static bool warned_before(DiagCode code, Pos pos) {
+    static uint64_t *seen;
+    static size_t cap, n;
+    uint64_t h = 1469598103934665603ull;
+    for (const char *c = xs_file_name ? xs_file_name : ""; *c; c++) h = (h ^ (unsigned char)*c) * 1099511628211ull;
+    h = (h ^ (uint64_t)pos.line) * 1099511628211ull;
+    h = (h ^ (uint64_t)pos.col) * 1099511628211ull;
+    h = (h ^ (uint64_t)code) * 1099511628211ull;
+    if (!h) h = 1;
+    if (n * 2 >= cap) {
+        size_t nc = cap ? cap * 2 : 1024;
+        uint64_t *ns = calloc(nc, sizeof *ns);
+        for (size_t i = 0; i < cap; i++)
+            if (seen[i]) { size_t j = seen[i] & (nc - 1); while (ns[j]) j = (j + 1) & (nc - 1); ns[j] = seen[i]; }
+        free(seen);
+        seen = ns; cap = nc;
+    }
+    size_t j = h & (cap - 1);
+    while (seen[j]) { if (seen[j] == h) return true; j = (j + 1) & (cap - 1); }
+    seen[j] = h; n++;
+    return false;
+}
 void xs_warn_rule(DiagCode code, Pos pos, const char *help, const char *fmt, ...) {
     if (in_package_file()) return;
+    if (warned_before(code, pos)) return;
     va_list ap;
     va_start(ap, fmt);
     char *msg = vformat(fmt, ap);
