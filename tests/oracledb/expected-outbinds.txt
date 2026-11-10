@@ -11,5 +11,8 @@ bool 1 [true]
 bool -1 [false]
 pequeno ORA-06502: PL/SQL: value or conversion error: character string buffer too small
 erro ORA-20001: regra de negócio 42
+campos Error ORA-20001 20001 0 false
+campos ORA-00942 942 14
+campos NJS-098 - 0
 depois [4]
 300 clobs 9000

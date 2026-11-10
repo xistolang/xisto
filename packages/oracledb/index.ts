@@ -154,6 +154,44 @@ declare class NativePool {
   rollback(handle: int): void;
   ping(handle: int): void;
   close(): void;
+  lastOffset(): int;
+}
+
+/**
+ * An error of the database (ORA-) or of the driver (NJS-, DPI-), with node-oracledb's fields.
+ * @example
+ *   try { await conn.execute("begin pkg.p(:1); end;", [7]); }
+ *   catch (e) { if (e instanceof OracleError && e.errorNum >= 20000 && e.errorNum <= 20999) ... }
+ */
+export class OracleError extends Error {
+  /** The ORA- number (20001 for ORA-20001); 0 for a driver error. Compatibility: node-oracledb leaves it undefined then. */
+  errorNum: int = 0;
+  /** "ORA-20001", "NJS-016", "DPI-1047". */
+  code: string = "";
+  /** Where in the SQL the error is (0 when the database does not say). */
+  offset: int = 0;
+  /** Whether the session can go on after it (false: xisto does not tell). */
+  isRecoverable: boolean = false;
+  constructor(message: string, offset: int) {
+    super(message);
+    this.name = "Error";
+    const m = /^([A-Z]{3})-(\d{3,5}):/.exec(message);
+    if (m !== null) {
+      this.code = m[1] + "-" + m[2];
+      if (m[1] === "ORA") this.errorNum = Math.trunc(parseInt(m[2], 10));
+    }
+    this.offset = offset;
+  }
+}
+
+// throws a database or driver error as an OracleError (other errors as they are)
+function rethrow(e: unknown, native: NativePool): void {
+  if (!(e instanceof Error)) throw new Error(String(e)); // (the native driver throws Errors only)
+  const err = e as Error;
+  if (err instanceof OracleError) throw err;
+  const msg = err.message;
+  if (!/^(ORA|NJS|DPI)-\d{3,5}:/.test(msg)) throw err;
+  throw new OracleError(msg, msg.startsWith("ORA-") ? native.lastOffset() : 0);
 }
 
 // the binds of one execute, as the native driver takes them: values, and each bind parameter object's fields
@@ -238,7 +276,12 @@ export class Connection {
   async execute(sql: string, binds: unknown[] = [], options: ExecuteOptions = {}): Promise<object> {
     this.check();
     const b = bindsByPosition(binds);
-    return this.native.execute(this.handle, sql, b.values, b.names, b.dirs, b.types, b.sizes, (options.outFormat ?? OUT_FORMAT_ARRAY) === OUT_FORMAT_OBJECT, options.autoCommit ?? false, options.maxRows ?? 0);
+    try {
+      return this.native.execute(this.handle, sql, b.values, b.names, b.dirs, b.types, b.sizes, (options.outFormat ?? OUT_FORMAT_ARRAY) === OUT_FORMAT_OBJECT, options.autoCommit ?? false, options.maxRows ?? 0);
+    } catch (e) {
+      rethrow(e, this.native);
+      throw e;
+    }
   }
 
   /**
@@ -259,25 +302,45 @@ export class Connection {
   async executeNamed(sql: string, binds: Record<string, unknown>, options: ExecuteOptions = {}): Promise<object> {
     this.check();
     const b = bindsByName(binds);
-    return this.native.execute(this.handle, sql, b.values, b.names, b.dirs, b.types, b.sizes, (options.outFormat ?? OUT_FORMAT_ARRAY) === OUT_FORMAT_OBJECT, options.autoCommit ?? false, options.maxRows ?? 0);
+    try {
+      return this.native.execute(this.handle, sql, b.values, b.names, b.dirs, b.types, b.sizes, (options.outFormat ?? OUT_FORMAT_ARRAY) === OUT_FORMAT_OBJECT, options.autoCommit ?? false, options.maxRows ?? 0);
+    } catch (e) {
+      rethrow(e, this.native);
+      throw e;
+    }
   }
 
   /** Commits the current transaction. @throws Error on a database error */
   async commit(): Promise<void> {
     this.check();
-    this.native.commit(this.handle);
+    try {
+      this.native.commit(this.handle);
+    } catch (e) {
+      rethrow(e, this.native);
+      throw e;
+    }
   }
 
   /** Rolls back the current transaction. @throws Error on a database error */
   async rollback(): Promise<void> {
     this.check();
-    this.native.rollback(this.handle);
+    try {
+      this.native.rollback(this.handle);
+    } catch (e) {
+      rethrow(e, this.native);
+      throw e;
+    }
   }
 
   /** Checks that the session is alive with a round trip. @throws Error when it is not */
   async ping(): Promise<void> {
     this.check();
-    this.native.ping(this.handle);
+    try {
+      this.native.ping(this.handle);
+    } catch (e) {
+      rethrow(e, this.native);
+      throw e;
+    }
   }
 
   /**
@@ -315,7 +378,13 @@ export class Pool {
    * @throws Error when the database cannot be reached or the login is refused
    */
   async getConnection(): Promise<Connection> {
-    const handle = this.native.acquire();
+    let handle: int = 0;
+    try {
+      handle = this.native.acquire();
+    } catch (e) {
+      rethrow(e, this.native);
+      throw e;
+    }
     return new Connection(this.native, handle, false);
   }
 
@@ -346,6 +415,12 @@ export async function createPool(attrs: PoolAttributes): Promise<Pool> {
  */
 export async function getConnection(attrs: ConnectionAttributes): Promise<Connection> {
   const native = new NativePool({ user: attrs.user, password: attrs.password, connectString: attrs.connectString ?? attrs.connectionString, poolMax: 1 });
-  const handle = native.acquire(); // (its own statement: a throw inside the return's arguments would leak native)
+  let handle: int = 0; // (its own statement: a throw inside the return's arguments would leak native)
+  try {
+    handle = native.acquire();
+  } catch (e) {
+    rethrow(e, native);
+    throw e;
+  }
   return new Connection(native, handle, true);
 }

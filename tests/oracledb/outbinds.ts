@@ -1,5 +1,5 @@
 // OUT and IN OUT binds of PL/SQL blocks: the same as node-oracledb 6 thin (expected-outbinds.txt).
-import { getConnection, BIND_IN, BIND_INOUT, BIND_OUT, STRING, NUMBER, DATE, CLOB, BLOB, DB_TYPE_BOOLEAN, BindParameter, Result } from "oracledb";
+import { getConnection, OracleError, BIND_IN, BIND_INOUT, BIND_OUT, STRING, NUMBER, DATE, CLOB, BLOB, DB_TYPE_BOOLEAN, BindParameter, Result } from "oracledb";
 
 const SETUP: string[] = [
   `create or replace package xisto_pk as
@@ -161,6 +161,14 @@ async function main(): Promise<void> {
     await conn.execute("begin xisto_pk.pr_erro(:1); end;", [42]);
   } catch (e) {
     console.log("erro", (e as Error).message.split("\n")[0]);
+    if (e instanceof OracleError) console.log("campos", e.name, e.code, e.errorNum, e.offset, e.isRecoverable);
+  }
+  for (const sql of ["select * from xisto_nao_existe", "select :1 from dual"]) {
+    try {
+      await conn.execute(sql);
+    } catch (e) {
+      if (e instanceof OracleError) console.log("campos", e.code, e.errorNum === 0 ? "-" : String(e.errorNum), e.offset);
+    }
   }
   // the connection still works after them, and IN binds of a block still work
   const inb: BindParameter = { dir: BIND_IN, val: 3 };

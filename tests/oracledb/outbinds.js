@@ -38,7 +38,10 @@ async function main() {
     await conn.execute("begin :1 := xisto_pk.fn_texto(10); end;", [{ dir: BIND_OUT, type: STRING, maxSize: 3 }]);
     console.log("no error");
   } catch (e) { console.log("pequeno", e.message.split("\n")[0]); }
-  try { await conn.execute("begin xisto_pk.pr_erro(:1); end;", [42]); } catch (e) { console.log("erro", e.message.split("\n")[0]); }
+  try { await conn.execute("begin xisto_pk.pr_erro(:1); end;", [42]); } catch (e) { console.log("erro", e.message.split("\n")[0]); console.log("campos", e.name, e.code, e.errorNum, e.offset, e.isRecoverable); }
+  for (const sql of ["select * from xisto_nao_existe", "select :1 from dual"]) {
+    try { await conn.execute(sql); } catch (e) { console.log("campos", e.code, e.errorNum === undefined ? "-" : String(e.errorNum), e.offset ?? 0); }
+  }
   const ra = await conn.execute("begin :1 := :2 + 1; end;", [{ dir: BIND_OUT, type: NUMBER }, { dir: BIND_IN, val: 3 }]);
   console.log("depois", JSON.stringify(ra.outBinds));
   let sum = 0;

@@ -3,7 +3,7 @@
 // the repository, the query builder's OFFSET/FETCH paging, Date columns bound as DATE, transactions on a
 // QueryRunner, PL/SQL OUT binds (query, query(.., true), connect()'s connection) and an ORA error with its
 // message. Tables of its own, dropped at the end.
-import { Column, DataSource, Entity, In, LessThanOrEqual, MoreThan, PrimaryColumn, ViewColumn, ViewEntity } from "typeorm";
+import { Column, DataSource, Entity, In, LessThanOrEqual, MoreThan, PrimaryColumn, QueryFailedError, ViewColumn, ViewEntity } from "typeorm";
 import { BIND_OUT, NUMBER, STRING, BindParameter, Connection, Result } from "oracledb";
 
 interface Structured {
@@ -135,6 +135,7 @@ async function main(): Promise<void> {
     await ds.query("SELECT * FROM XISTO_TO_NO_SUCH_TABLE", []);
   } catch (e) {
     console.log("error: " + e.message.split("\n")[0]);
+    if (e instanceof QueryFailedError) console.log("error fields " + e.name + " " + e.code + " " + String(e.errorNum) + " " + String(e.offset));
   }
   // PL/SQL OUT binds: query() returns outBinds, query(sql, binds, true) a QueryResult, connect() the oracledb connection
   const ret: BindParameter = { dir: BIND_OUT, type: NUMBER };
