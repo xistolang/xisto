@@ -737,6 +737,12 @@ static void check_bytes_static(Expr *e, const char *ns) {
 }
 static Type *tuple_type(Type **ps, int n, Pos pos);
 static void check_stmt(Stmt *s);
+static void wrap_call(Expr *e, const char *cfn, Type *type);
+static void settle(Expr *e);
+static int pr_kind(Type *t);
+static void pr_resolved(Expr *e);
+static void pr_await(Expr *e);
+static Expr *pr_awaited;
 /* () => x: an element of Promise.all([...]) as a task (an arrow, so the checker works out its captures) */
 static Expr *thunk_of(Expr *x) {
     Expr *e = xs_alloc(sizeof *e);
@@ -765,15 +771,44 @@ static Expr *thunk_of(Expr *x) {
 static void check_promise(Expr *e, Type *expected) {
     const char *m = e->str;
     if (!e->is_call) xs_error(XS7030, e->pos, NULL, "Promise.%s is not a value", m);
-    if (strcmp(m, "resolve") == 0) { /* the value itself */
-        if (e->args.len != 1) xs_error(XS7035, e->pos, NULL, "Promise.resolve takes one value");
+    Type *pexp = expected ? ty_strip_null(expected) : NULL;
+    if (strcmp(m, "resolve") == 0) { /* awaited (or where a value goes): the value itself; kept, a fulfilled promise */
+        if (e->args.len > 1) xs_error(XS7035, e->pos, NULL, "Promise.resolve takes one value");
+        if (e->args.len == 0) { /* Promise.resolve(): a Promise<void> */
+            wrap_call(e, "xs_promise_resolved_v", ty_promise_of(ty_void));
+            e->args = (ExprList){0};
+            prog->uses_gen = true;
+            return;
+        }
         Expr *v = e->args.items[0];
-        check_expr(v, expected);
+        bool kept = pr_awaited != e && (!expected || (pexp && pexp->kind == TY_PROMISE));
+        check_expr(v, kept && pexp && pexp->kind == TY_PROMISE ? pexp->elem : expected);
         *e = *v;
+        if (kept && e->type->kind != TY_PROMISE) {
+            if (pexp && pexp->kind == TY_PROMISE) expect_type(e, pexp->elem, "the value of Promise.resolve");
+            settle(e);
+            pr_resolved(e);
+        }
+        return;
+    }
+    if (strcmp(m, "reject") == 0) { /* a rejected promise */
+        if (e->args.len != 1) xs_error(XS7035, e->pos, NULL, "Promise.reject takes one Error");
+        Type *et = ty_object_of(find_class("Error"));
+        check_expr(e->args.items[0], et);
+        expect_type(e->args.items[0], et, "the argument of Promise.reject");
+        Type *T = pexp && pexp->kind == TY_PROMISE ? pexp->elem : ty_void;
+        Expr *x = e->args.items[0];
+        e->kind = E_CALL; e->lhs = NULL; e->is_call = false; e->str = NULL;
+        e->builtin.cfn = "xs_promise_rejected";
+        e->args = (ExprList){0};
+        expr_list_push(&e->args, num_lit(e->pos, pr_kind(T), true));
+        expr_list_push(&e->args, x);
+        e->type = ty_promise_of(T);
+        prog->uses_gen = true;
         return;
     }
     bool race = strcmp(m, "race") == 0 || strcmp(m, "any") == 0;
-    if (!race && strcmp(m, "all") != 0) xs_error(XS7111, e->pos, "supported: Promise.all, Promise.race, Promise.any, Promise.resolve", "unknown Promise member '%s'", m);
+    if (!race && strcmp(m, "all") != 0) xs_error(XS7111, e->pos, "supported: Promise.all, Promise.race, Promise.any, Promise.resolve, Promise.reject", "unknown Promise member '%s'", m);
     if (e->args.len != 1) xs_error(XS7032, e->pos, NULL, "Promise.%s takes an array", m);
     Expr *a = e->args.items[0];
     prog->uses_gen = true; /* the coroutines and the event loop */
@@ -786,6 +821,12 @@ static void check_promise(Expr *e, Type *expected) {
         for (int i = 0; i < a->args.len; i++) {
             Expr *th = thunk_of(a->args.items[i]);
             check_expr(th, NULL);
+            if (th->arrow->fn->ret->kind == TY_PROMISE) { /* a promise kept (XB-106): the task waits for it */
+                Stmt *r = th->arrow->fn->body->stmts.items[th->arrow->fn->body->stmts.len - 1];
+                pr_await(r->expr);
+                th->arrow->fn->ret = r->expr->type;
+                th->type->ret = r->expr->type;
+            }
             Type *rt = th->arrow->fn->ret;
             if (rt->kind == TY_VOID) xs_error(XS8081, a->args.items[i]->pos, NULL, "an element of Promise.%s gives no value", m);
             rts[i] = rt;
@@ -819,6 +860,15 @@ static void check_promise(Expr *e, Type *expected) {
         return;
     }
     if (a->type->kind != TY_ARRAY) xs_error(XS7033, a->pos, NULL, "Promise.%s takes an array, not %s", m, ty_name(a->type));
+    if (a->type->elem->kind == TY_PROMISE) { /* promises kept (XB-106): each one's value, in order (or the first to settle) */
+        Type *t = a->type->elem->elem;
+        if (t->kind == TY_VOID && !race) { e->builtin.cfn = "promise_all_arr"; e->elem_type = t; e->type = ty_void; return; }
+        if (t->kind == TY_VOID) xs_error(XS8081, a->pos, NULL, "the promises of Promise.race give no value");
+        e->builtin.cfn = race ? "promise_race_arr" : "promise_all_arr";
+        e->elem_type = t;
+        e->type = race ? t : ty_array_of(t);
+        return;
+    }
     /* values already computed (async calls have finished): all is the array, race its first element */
     if (race) xs_error(XS7034, a->pos, "write the calls in place: Promise.race([a(), b()])", "Promise.race of values already computed");
     *e = *a;
@@ -831,6 +881,7 @@ static const char **class_names(int *n);
 static bool nullable_ok(Type *inner) {
     return inner->kind == TY_UNION || inner->kind == TY_STRING || inner->kind == TY_ARRAY || inner->kind == TY_OBJECT || inner->kind == TY_MAP || inner->kind == TY_SET ||
            inner->kind == TY_FUNC || /* onDone?: () => void: a closure or NULL */
+           inner->kind == TY_PROMISE || /* Promise<T> | null: a promise or NULL */
            inner->kind == TY_JSON || /* object | null: the JSON text or NULL (where?: object in an options interface) */
            inner->kind == TY_INT || inner->kind == TY_NUMBER || inner->kind == TY_BOOLEAN || inner->kind == TY_ENUM; /* primitives: a sentinel */
 }
@@ -873,11 +924,16 @@ static Type *subst(Type *t, Class *tmpl, Type **args) {
     }
     case TY_NULLABLE: return ty_nullable_of(subst(t->elem, tmpl, args));
     case TY_SET: return ty_set_of(subst(t->elem, tmpl, args));
+    case TY_PROMISE: return ty_promise_of(subst(t->elem, tmpl, args));
     case TY_MAP: return ty_map_of(subst(t->key, tmpl, args), subst(t->elem, tmpl, args));
     case TY_FUNC: {
         Type **ps = xs_alloc(sizeof(Type *) * (size_t)(t->nparams ? t->nparams : 1));
         for (int i = 0; i < t->nparams; i++) ps[i] = subst(t->params[i], tmpl, args);
-        return ty_func(ps, t->nparams, subst(t->ret, tmpl, args));
+        Type *ft = ty_func(ps, t->nparams, subst(t->ret, tmpl, args));
+        ft->rest = t->rest;
+        ft->async_ret = t->async_ret;
+        if (ft->ret && ft->ret->kind == TY_PROMISE) { ft->ret = ft->ret->elem; ft->async_ret = true; }
+        return ft;
     }
     default: return t;
     }
@@ -1157,6 +1213,10 @@ static Type *resolve(Type *t, Pos pos) {
         }
         return t;
     case TY_ARRAY: case TY_STREAM: t->elem = resolve(t->elem, pos); return t;
+    case TY_PROMISE: /* Promise<T> kept as a value */
+        t->elem = resolve(t->elem, pos);
+        if (t->elem->kind == TY_PROMISE) { Type *u = t->elem; *t = *u; }
+        return t;
     case TY_MAP:
         t->key = resolve(t->key, pos);
         t->elem = resolve(t->elem, pos);
@@ -1181,6 +1241,7 @@ static Type *resolve(Type *t, Pos pos) {
     case TY_FUNC:
         for (int i = 0; i < t->nparams; i++) t->params[i] = resolve(t->params[i], pos);
         t->ret = resolve(t->ret, pos);
+        if (t->ret->kind == TY_PROMISE) { t->ret = t->ret->elem; t->async_ret = true; } /* () => Promise<R>: an async function returning R */
         return t;
     case TY_UNION: { /* members resolved, nested unions flattened, repeats dropped; null makes it nullable */
         Type **m = NULL;
@@ -1842,7 +1903,184 @@ static void wrap_call(Expr *e, const char *cfn, Type *type) {
     e->builtin.cfn = cfn;
     expr_list_push(&e->args, a);
 }
+/* ---- Promise values (XB-106) ----
+   An async call has its value when it returns (its waits park the caller): await f(), a statement f(), return f().
+   Where the program keeps the promise instead (a Promise<T> field, variable or parameter, const p = f(), p.then...)
+   the call becomes an E_SPAWN: it runs on a coroutine of its own, and the value is a promise (runtime/xisto_net.h). */
+static int pr_kind(Type *t) { /* the runtime's kind of a promise's value: 0 number, 1 int, 2 boolean, 3 reference, 4 none */
+    if (!t || t->kind == TY_VOID || t->kind == TY_NULL) return 4;
+    Type *b = ty_strip_null(t);
+    switch (b->kind) {
+    case TY_NUMBER: return 0;
+    case TY_INT: case TY_LITINT: return 1;
+    case TY_BOOLEAN: return 2;
+    case TY_ENUM: return b->en->is_string ? 3 : 1;
+    default: return 3;
+    }
+}
+static const char *pr_sfx(int k) { return k == 0 ? "d" : k == 1 ? "i" : k == 2 ? "b" : k == 3 ? "p" : "v"; }
+static bool pr_is_call(Expr *e) { return e->kind == E_CALL || (e->kind == E_MEMBER && e->is_call); }
+static bool pr_async_call(Expr *e) {
+    if (!pr_is_call(e)) return false;
+    if (e->func && (e->func->ret_promise || e->func->is_async)) return true;
+    if (e->kind == E_CALL && !e->func && !e->builtin.cfn && e->lhs && e->lhs->type && e->lhs->type->kind == TY_FUNC && e->lhs->type->async_ret) return true;
+    return false;
+}
+static void pr_spawn(Expr *e) { /* the call e (checked), kept as a promise */
+    Expr *c = xs_alloc(sizeof *c);
+    *c = *e;
+    memset(e, 0, sizeof *e);
+    e->kind = E_SPAWN; e->pos = c->pos; e->field = -1; e->lhs = c;
+    e->type = ty_promise_of(c->type);
+    prog->uses_gen = true;
+    if (getenv("XISTO_SPAWN_LOG")) fprintf(stderr, "spawn: %s:%d:%d\n", xs_file_name ? xs_file_name : "?", c->pos.line, c->pos.col);
+}
+static void pr_resolved(Expr *e) { /* a value already computed, as a fulfilled promise */
+    Type *t = e->type;
+    wrap_call(e, xs_sprintf("xs_promise_resolved_%s", pr_sfx(pr_kind(t))), ty_promise_of(t));
+    prog->uses_gen = true;
+}
+static void pr_await(Expr *e) { /* await p, p a promise: its value (or its rejection thrown) */
+    Type *t = e->type->elem;
+    wrap_call(e, xs_sprintf("xs_promise_await_%s", pr_sfx(pr_kind(t))), t->kind == TY_NULL ? ty_void : t);
+}
+/* pr_awaited: await x: x, while it is checked (Promise.resolve(v) there is v itself) */
+
+/* the kind a then/catch/finally callback returns, for the runtime (5: a promise, awaited before the next one) */
+static int pr_cb_kind(Type **rt) {
+    if ((*rt)->kind == TY_PROMISE) { *rt = (*rt)->elem; return 5; }
+    return pr_kind(*rt);
+}
+static bool pr_null_body(Expr *a) { /* () => undefined / () => null */
+    if (a->kind != E_ARROW || !a->arrow->expr_body) return false;
+    Stmt *b = a->arrow->fn->body;
+    Expr *x = b && b->stmts.len ? b->stmts.items[b->stmts.len - 1]->expr : NULL;
+    if (x && x->kind == E_IDENT && strcmp(x->str, "undefined") == 0 && !lookup("undefined")) x->kind = E_NULL; /* (as null) */
+    return x && x->kind == E_NULL;
+}
+static Type *pr_err_type(Expr *a) { /* what a rejection handler takes: Error (or the unknown/any it declares) */
+    if (a->kind == E_ARROW && a->arrow->fn->nparams >= 1 && a->arrow->fn->params[0].type) {
+        Type *t = resolve(a->arrow->fn->params[0].type, a->pos);
+        a->arrow->fn->params[0].type = t;
+        if (t->kind == TY_UNKNOWN) return t;
+    }
+    return ty_object_of(find_class("Error"));
+}
+static Expr *pr_null_fn(Pos pos) {
+    Expr *n = xs_alloc(sizeof *n);
+    n->kind = E_NULL; n->pos = pos; n->field = -1;
+    n->type = ty_nullable_of(ty_func(NULL, 0, ty_void));
+    return n;
+}
+/* p.then(ok, err?) / p.catch(err) / p.finally(fn): a new promise (runtime/xisto_net.h, xs_promise_then) */
+static void check_pr_member(Expr *e, Type *expected) {
+    (void)expected;
+    Type *T = e->lhs->type->elem;
+    const char *m = e->str;
+    int how = strcmp(m, "finally") == 0 ? 1 : 0;
+    Expr *ok = NULL, *err = NULL;
+    if (strcmp(m, "then") == 0) {
+        if (e->args.len < 1 || e->args.len > 2) xs_error(XS8062, e->pos, NULL, "then takes one or two functions");
+        ok = e->args.items[0];
+        err = e->args.len > 1 ? e->args.items[1] : NULL;
+    } else {
+        if (e->args.len != 1) xs_error(XS8062, e->pos, NULL, "%s takes one function", m);
+        if (how) ok = e->args.items[0]; else err = e->args.items[0];
+    }
+    Type *R = T, *okr = NULL, *errr = NULL;
+    int okk = 4, errk = 4;
+    if (ok) {
+        Type **ps = xs_alloc(sizeof(Type *));
+        ps[0] = T;
+        int np = how || T->kind == TY_VOID ? 0 : 1;
+        check_expr(ok, ty_func(ps, np, NULL));
+        if (ok->type->kind != TY_FUNC) xs_error(XS8018, ok->pos, NULL, "the argument of %s must be a function, but this is %s", m, ty_name(ok->type));
+        okr = ok->type->ret;
+        okk = pr_cb_kind(&okr);
+        if (!how) R = okr;
+    }
+    if (err) {
+        Type **ps = xs_alloc(sizeof(Type *));
+        ps[0] = pr_err_type(err);
+        Type *want_r = NULL;
+        if (pr_null_body(err)) want_r = R->kind == TY_VOID ? ty_void : nullable_ok(ty_strip_null(R)) ? ty_nullable_of(ty_strip_null(R)) : NULL;
+        check_expr(err, ty_func(ps, 1, want_r));
+        if (err->type->kind != TY_FUNC) xs_error(XS8018, err->pos, NULL, "the argument of %s must be a function, but this is %s", m, ty_name(err->type));
+        errr = err->type->ret;
+        errk = pr_cb_kind(&errr);
+        if (!ty_equal(errr, R)) {
+            if (R->kind == TY_VOID || errr->kind == TY_VOID) {
+                if (R->kind != TY_VOID || errr->kind != TY_VOID) xs_error(XS8134, err->pos, "give both one type", "the promise gives %s, and its rejection handler %s", ty_name(R), ty_name(errr));
+            } else if (errr->kind == TY_NULLABLE && ty_equal(errr->elem, R)) R = errr;
+            else if (R->kind == TY_NULLABLE && ty_equal(R->elem, errr)) {}
+            else xs_error(XS8134, err->pos, "give both one type (an interface or a union)", "the promise gives %s, and its rejection handler %s", ty_name(R), ty_name(errr));
+        }
+    }
+    Expr *p = e->lhs;
+    e->kind = E_CALL;
+    e->lhs = NULL;
+    e->is_call = false;
+    e->str = NULL;
+    e->func = NULL;
+    e->builtin.cfn = "xs_promise_then";
+    e->args = (ExprList){0};
+    expr_list_push(&e->args, p);
+    expr_list_push(&e->args, num_lit(e->pos, how, true));
+    expr_list_push(&e->args, ok ? ok : pr_null_fn(e->pos));
+    expr_list_push(&e->args, num_lit(e->pos, okk, true));
+    expr_list_push(&e->args, err ? err : pr_null_fn(e->pos));
+    expr_list_push(&e->args, num_lit(e->pos, errk, true));
+    expr_list_push(&e->args, num_lit(e->pos, pr_kind(R), true));
+    e->type = ty_promise_of(R);
+    prog->uses_gen = true;
+}
+/* new Promise<T>((resolve, reject) => ...) */
+static void check_pr_new(Expr *e, Type *expected) {
+    Type *T = NULL;
+    if (e->ntargs == 1) T = resolve(e->targs[0], e->pos);
+    else if (expected && ty_strip_null(expected)->kind == TY_PROMISE) T = ty_strip_null(expected)->elem;
+    else if (expected && expected->kind != TY_UNKNOWN) T = expected; /* return new Promise(...) where the function gives T */
+    else T = ty_void;
+    if (e->args.len != 1) xs_error(XS8062, e->pos, NULL, "new Promise takes one function: (resolve, reject) => { ... }");
+    Type **rp = xs_alloc(sizeof(Type *)), **jp = xs_alloc(sizeof(Type *)), **ep = xs_alloc(sizeof(Type *) * 2);
+    rp[0] = T;
+    jp[0] = ty_object_of(find_class("Error"));
+    ep[0] = ty_func(rp, T->kind == TY_VOID ? 0 : 1, ty_void);
+    ep[1] = ty_func(jp, 1, ty_void);
+    Expr *x = e->args.items[0];
+    check_expr(x, ty_func(ep, 2, ty_void));
+    if (x->type->kind != TY_FUNC) xs_error(XS8018, x->pos, NULL, "new Promise takes a function, not %s", ty_name(x->type));
+    e->kind = E_CALL;
+    e->str = NULL;
+    e->cls = NULL;
+    e->ntargs = 0;
+    e->builtin.cfn = "xs_promise_new";
+    e->args = (ExprList){0};
+    expr_list_push(&e->args, num_lit(e->pos, pr_kind(T), true));
+    expr_list_push(&e->args, x);
+    e->type = ty_promise_of(T);
+    prog->uses_gen = true;
+}
 static void expect_type(Expr *e, Type *want, const char *what) {
+    if (want->kind == TY_PROMISE || (want->kind == TY_NULLABLE && want->elem->kind == TY_PROMISE)) { /* a promise kept (XB-106) */
+        Type *pw = want->kind == TY_PROMISE ? want : want->elem;
+        if (ty_equal(e->type, want)) return;
+        if (e->type->kind == TY_NULLABLE && e->type->elem->kind == TY_PROMISE && want->kind == TY_NULLABLE) {
+            if (ty_equal(e->type->elem->elem, pw->elem) || pw->elem->kind == TY_VOID) return;
+            xs_error(XS8018, e->pos, NULL, "%s must be %s, but this is %s", what, ty_name(want), ty_name(e->type));
+        }
+        if (e->type->kind == TY_PROMISE) {
+            if (ty_equal(e->type->elem, pw->elem) || pw->elem->kind == TY_VOID) return;
+            xs_error(XS8018, e->pos, NULL, "%s must be %s, but this is %s", what, ty_name(want), ty_name(e->type));
+        }
+        if (e->type->kind == TY_NULL && want->kind == TY_NULLABLE) { e->type = want; return; }
+        if (pr_is_call(e) && (ty_equal(e->type, pw->elem) || pw->elem->kind == TY_VOID)) { pr_spawn(e); return; }
+        if (pw->elem->kind == TY_VOID && e->type->kind == TY_VOID)
+            xs_error(XS8018, e->pos, "make it a call to an async function", "%s must be %s", what, ty_name(want));
+        expect_type(e, pw->elem, what);
+        if (pr_is_call(e)) pr_spawn(e); else pr_resolved(e);
+        return;
+    }
     if (is_numkey(want) && e->type->kind == TY_NUMBER) { wrap_call(e, "xs_num_key", ty_int); return; } /* m.set(id, v), id: number */
     if (want->kind == TY_ARRAY && is_numkey(want->elem) && e->type->kind == TY_ARRAY && e->type->elem->kind == TY_NUMBER) {
         wrap_call(e, "xs_num_keys", want); /* new Set<number>(ids) */
@@ -2577,7 +2815,7 @@ static bool has_tparam(Type *t) {
     if (!t) return false;
     switch (t->kind) {
     case TY_TPARAM: return true;
-    case TY_ARRAY: case TY_NULLABLE: case TY_SET: case TY_STREAM: case TY_CHAN: return has_tparam(t->elem);
+    case TY_ARRAY: case TY_NULLABLE: case TY_SET: case TY_STREAM: case TY_CHAN: case TY_PROMISE: return has_tparam(t->elem);
     case TY_MAP: return has_tparam(t->key) || has_tparam(t->elem);
     case TY_FUNC:
         for (int i = 0; i < t->nparams; i++) if (has_tparam(t->params[i])) return true;
@@ -2599,6 +2837,7 @@ static void unify(Type *pat, Type *got, Func *tmpl, Type **bind) {
         return;
     }
     if (pat->kind == TY_NULLABLE) { unify(pat->elem, got->kind == TY_NULLABLE ? got->elem : got, tmpl, bind); return; }
+    if (pat->kind == TY_PROMISE && got->kind != TY_PROMISE) { unify(pat->elem, got, tmpl, bind); return; } /* () => Promise<T> against an async function's R */
     if (pat->kind == TY_OBJECT && pat->ntargs && got->kind == TY_UNION) { /* Item<T> (a generic alias) against Item<number>: its
                                                                             members carry the alias's arguments */
         for (int m = 0; m < got->nparams; m++) {
@@ -2610,7 +2849,7 @@ static void unify(Type *pat, Type *got, Func *tmpl, Type **bind) {
     }
     if (pat->kind != got->kind) return;
     switch (pat->kind) {
-    case TY_ARRAY: case TY_SET: case TY_STREAM: case TY_CHAN: unify(pat->elem, got->elem, tmpl, bind); return;
+    case TY_ARRAY: case TY_SET: case TY_STREAM: case TY_CHAN: case TY_PROMISE: unify(pat->elem, got->elem, tmpl, bind); return;
     case TY_MAP: unify(pat->key, got->key, tmpl, bind); unify(pat->elem, got->elem, tmpl, bind); return;
     case TY_FUNC:
         if (pat->nparams != got->nparams) return;
@@ -3311,6 +3550,7 @@ static void check_expr(Expr *e, Type *expected) {
 }
 static void check_expr_in(Expr *e, Type *expected) {
     switch (e->kind) {
+    case E_SPAWN: return; /* (made by the checker, already checked) */
     case E_NUMBER:
         e->type = e->is_int_lit ? ty_litint : ty_number;
         if (expected && is_numeric(expected)) coerce_lit(e, expected);
@@ -3325,10 +3565,21 @@ static void check_expr_in(Expr *e, Type *expected) {
         e->type = ty_object_of(cur_class);
         e->cname = (char *)this_cname();
         return;
-    case E_AWAIT:
+    case E_AWAIT: {
+        Expr *was = pr_awaited;
+        pr_awaited = e->lhs;
         check_expr(e->lhs, expected);
+        pr_awaited = was;
+        if (e->lhs->type->kind == TY_PROMISE) pr_await(e->lhs); /* a promise kept: its value */
+        else if (e->lhs->type->kind == TY_NULLABLE && e->lhs->type->elem->kind == TY_PROMISE) { /* await of a Promise<T> | null: null gives null */
+            Type *t = e->lhs->type->elem->elem;
+            int k = pr_kind(t);
+            if (k != 3 && k != 4) xs_error(XS2006, e->pos, "check it first: if (p !== null) await p;", "awaiting a %s that may be null", ty_name(e->lhs->type));
+            wrap_call(e->lhs, k == 4 ? "xs_promise_await_v" : "xs_promise_await_p", k == 4 ? ty_void : ty_nullable_of(ty_strip_null(t)));
+        }
         e->type = e->lhs->type;
         return;
+    }
     case E_IDENT: {
         Binding *b = lookup(e->str);
         if (!b) {
@@ -3342,6 +3593,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->cname = f->cname;
                 e->type = ty_func(ps, f->nparams, fret(f, e->pos));
                 e->type->rest = f->nparams && f->params[f->nparams - 1].rest;
+                e->type->async_ret = f->ret_promise || f->is_async;
                 return;
             }
             Class *cv = find_class(e->str);
@@ -3956,6 +4208,7 @@ static void check_expr_in(Expr *e, Type *expected) {
     case E_CALL: {
         if (e->builtin.cfn && strncmp(e->builtin.cfn, "__reflect_", 10) == 0) { /* generated reflection code */
             Type *t = resolve(e->elem_type, e->pos);
+            if (t->kind == TY_PROMISE) t = t->elem; /* a method's Promise<T>: what it gives is T (XB-106) */
             e->elem_type = t;
             const char *which = e->builtin.cfn + 10;
             if (strcmp(which, "kind") == 0 || strcmp(which, "typeid") == 0 || strcmp(which, "schema") == 0) {
@@ -4731,6 +4984,15 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (!done) check_expr(e->lhs, NULL);
         }
         e->lhs = rec_get_nn(e->lhs);
+        if (e->is_call && e->str && (strcmp(e->str, "then") == 0 || strcmp(e->str, "catch") == 0 || strcmp(e->str, "finally") == 0)) {
+            Type *lt = e->lhs->type;
+            Class *lc = lt->kind == TY_OBJECT ? lt->cls : NULL;
+            if (lt->kind == TY_PROMISE || (pr_is_call(e->lhs) && lt->kind != TY_NULLABLE && !(lc && find_method(lc, e->str)))) { /* XB-106 */
+                if (lt->kind != TY_PROMISE) pr_spawn(e->lhs);
+                check_pr_member(e, expected);
+                return;
+            }
+        }
         if (ty_is_any(e->lhs->type)) { /* x.f on an any: by name, through the object's class (or a Record's key) */
             if (e->is_call) xs_error(XS2017, e->pos, "give the value its type (as SomeClass) to call its methods", "cannot call '%s' on an any: its methods are not looked up by name", e->str);
             dyn_call(e, e->op == TK_QDOT ? "xs_dyn_get_opt" : "xs_dyn_get", ty_any, e->lhs, dyn_key(e->pos, e->str), NULL);
@@ -5269,6 +5531,8 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         if (f->ret) f->ret = resolve(f->ret, e->pos);
         else if (want) f->ret = want->ret;
+        if (f->ret && f->ret->kind == TY_PROMISE) { f->ret = f->ret->elem; f->ret_promise = true; }
+        if (f->is_async || (want && want->async_ret)) f->ret_promise = true;
         /* (x): int => ... where a function returning unknown is expected: TypeScript accepts it (the return type
            is covariant); the arrow returns unknown and its returns are converted (boxed) */
         if (want && want->ret && want->ret->kind == TY_UNKNOWN && f->ret && f->ret->kind != TY_UNKNOWN && f->ret->kind != TY_VOID) f->ret = ty_unknown;
@@ -5293,6 +5557,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 for (int i = 0; i + 1 < f->body->stmts.len; i++) check_stmt(f->body->stmts.items[i]);
                 Stmt *r = f->body->stmts.items[f->body->stmts.len - 1];
                 check_expr(r->expr, NULL);
+                if (f->ret_promise && r->expr->type->kind == TY_PROMISE) pr_await(r->expr);
                 settle(r->expr);
                 f->ret = r->expr->type;
                 if (f->ret->kind == TY_VOID) { r->kind = S_EXPR; }
@@ -5326,6 +5591,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         for (int i = 0; i < f->nparams; i++) ps[i] = f->params[i].type;
         e->type = ty_func(ps, f->nparams, f->ret);
         e->type->rest = f->nparams && f->params[f->nparams - 1].rest;
+        e->type->async_ret = f->ret_promise;
         return;
     }
     case E_NEW_MAP:
@@ -5353,6 +5619,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         return;
     case E_NEW_OBJ: {
+        if (e->str && strcmp(e->str, "Promise") == 0 && !find_class("Promise")) { check_pr_new(e, expected); return; }
         Class *c = find_class(e->str);
         if (!c) {
             int n; const char **cands = class_names(&n);
@@ -5705,6 +5972,7 @@ static void check_var(Stmt *s, bool global) {
         check_type_supported(s->pos, s->decl_type);
     }
     check_expr(s->init, s->decl_type);
+    if (!s->decl_type && pr_async_call(s->init)) pr_spawn(s->init); /* const p = f(): the promise (XB-106) */
     if (s->init->type->kind == TY_VOID) xs_error(XS8102, s->init->pos, NULL, "cannot store a void value");
     if (s->init->type->kind == TY_NULL && !s->decl_type) xs_error(XS2013, s->init->pos, "write the type: let x: Todo | null = null;", "cannot infer the type of '%s' from null", s->name);
     if (s->decl_type) expect_type(s->init, s->decl_type, xs_sprintf("initializer of '%s' (declared as %s)", s->name, ty_name(s->decl_type)));
@@ -6465,6 +6733,7 @@ static void check_stmt(Stmt *s) {
                 /* return f(); where f is void too (TypeScript allows it; a generic run<R> instantiated with void):
                    the call, then return; */
                 check_expr(s->expr, NULL);
+                if (cur_func->ret_promise && s->expr->type && s->expr->type->kind == TY_PROMISE) pr_await(s->expr); /* return p: its settling */
                 if (!s->expr->type || s->expr->type->kind != TY_VOID)
                     xs_error(XS8057, s->expr->pos, NULL, "'%s' is void and cannot return a value", cur_func->name);
                 settle(s->expr);
@@ -6499,6 +6768,7 @@ static void check_stmt(Stmt *s) {
                 return;
             }
             check_expr(s->expr, cur_func->ret);
+            if (cur_func->ret_promise && s->expr->type->kind == TY_PROMISE && cur_func->ret->kind != TY_PROMISE) pr_await(s->expr);
             expect_type(s->expr, cur_func->ret, xs_sprintf("return value of '%s'", cur_func->name));
         } else if (cur_func->ret->kind != TY_VOID && !cur_func->is_gen) {
             xs_error(XS8059, s->pos, NULL, "'%s' must return a value of type %s", cur_func->name, ty_name(cur_func->ret));
@@ -6552,6 +6822,8 @@ static void resolve_signature(Func *f) {
     }
     if (f->ret) f->ret = resolve(f->ret, f->pos);
     else if (!f->ret_infer) f->ret_infer = 1; /* left out: inferred from the body (fret) */
+    if (f->ret && f->ret->kind == TY_PROMISE) { f->ret = f->ret->elem; f->ret_promise = true; } /* (): Promise<T>: T, and async (XB-106) */
+    if (f->is_async) f->ret_promise = true;
 }
 
 /* ---- XB-034: `for (let i = 0; i < a.length; i++)` ----
@@ -6950,6 +7222,7 @@ static void ret_infer_stmt(Stmt *s) {
     Expr *e = s->expr;
     if (e->kind == E_ARRAY_LIT && e->args.len == 0) { expr_list_push(&f->ret_late, e); return; }
     check_expr(e, f->ret_acc && f->ret_acc->kind != TY_VOID ? f->ret_acc : NULL);
+    if (f->ret_promise && e->type->kind == TY_PROMISE) pr_await(e); /* an async function returning a promise: its value */
     Type *t = e->type;
     if (t->kind == TY_VOID) { /* return f(); where f is void: the call, then return; */
         if (f->ret_acc && f->ret_acc->kind != TY_VOID)

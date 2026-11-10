@@ -63,7 +63,7 @@ static void push_alloc(RNode *n, Class *c) {
 static bool bad_type(Type *t) {
     if (!t) return false;
     switch (t->kind) {
-    case TY_UNKNOWN: case TY_UNION: case TY_JSON: case TY_FUNC: case TY_STREAM: case TY_CHAN: case TY_TPARAM: return true;
+    case TY_UNKNOWN: case TY_UNION: case TY_JSON: case TY_FUNC: case TY_STREAM: case TY_CHAN: case TY_PROMISE: case TY_TPARAM: return true;
     case TY_ARRAY: case TY_NULLABLE: case TY_SET: return bad_type(t->elem);
     case TY_MAP: return bad_type(t->key) || bad_type(t->elem);
     default: return false;

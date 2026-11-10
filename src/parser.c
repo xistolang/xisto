@@ -210,8 +210,17 @@ static Type *parse_inline_object_type(Parser *p) {
     free(key.data);
     const char *name = xs_sprintf("__Obj_%016llx", (unsigned long long)h);
     Program *prog = p->prog;
+    /* fields of primitive types only ({ inicio: string; fim: string }): the text means the same in every file, so
+       the interface is one for the program (an interface's method and the class's method that implements it, in
+       two files, take the same type) */
+    bool prim = !nsubst;
+    for (int i = 0; prim && i < c->nfields; i++) {
+        Type *t = c->fields[i].type;
+        while (t && (t->kind == TY_ARRAY || t->kind == TY_NULLABLE)) t = t->elem;
+        prim = t && (t->kind == TY_STRING || t->kind == TY_NUMBER || t->kind == TY_INT || t->kind == TY_BOOLEAN);
+    }
     for (int i = 0; i < prog->nclasses; i++)
-        if (prog->classes[i]->mod == p->mod && strcmp(prog->classes[i]->name, name) == 0) return ty_object_of(prog->classes[i]);
+        if ((prim || prog->classes[i]->mod == p->mod) && strcmp(prog->classes[i]->name, name) == 0) return ty_object_of(prog->classes[i]);
     c->name = name;
     c->mod = p->mod;
     c->exported = true; /* (a parameter's type: the caller's module names it too) */
@@ -518,11 +527,14 @@ static Type *parse_type(Parser *p) {
         t->elem = parse_type(p);
         expect(p, TK_GT, NULL);
     }
-    else if (strcmp(n, "Promise") == 0) { /* Promise<T> is T: async is syntax only */
+    else if (strcmp(n, "Promise") == 0 || strcmp(n, "PromiseLike") == 0) { /* Promise<T>: as a return type the function is async and
+                                                                             gives T; elsewhere a promise kept as a value (XB-106) */
         expect(p, TK_LT, "write Promise<T>");
-        t = parse_type(p);
+        t = ty_promise_of(parse_type(p));
         expect(p, TK_GT, NULL);
-    } else if (strcmp(n, "Generator") == 0 || strcmp(n, "Iterable") == 0 || strcmp(n, "IterableIterator") == 0 || strcmp(n, "Iterator") == 0) {
+    } else if (strcmp(n, "Generator") == 0 || strcmp(n, "Iterable") == 0 || strcmp(n, "IterableIterator") == 0 || strcmp(n, "Iterator") == 0 ||
+               strcmp(n, "AsyncGenerator") == 0 || strcmp(n, "AsyncIterable") == 0 || strcmp(n, "AsyncIterableIterator") == 0) {
+        /* (async ones too: an async generator's waits park its consumer, so for await reads it as for...of) */
         /* what a generator returns: a Stream<T> (for...of, map, filter, take...); Generator<T, R, N>'s R, N are ignored */
         expect(p, TK_LT, xs_sprintf("write %s<T>", n));
         t = ty_stream_of(parse_type(p));

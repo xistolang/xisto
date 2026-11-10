@@ -322,6 +322,14 @@ Type *ty_chan_of(Type *elem) {
     return t;
 }
 
+Type *ty_promise_of(Type *elem) {
+    if (elem && elem->kind == TY_PROMISE) return elem;
+    Type *t = xs_alloc(sizeof *t);
+    t->kind = TY_PROMISE;
+    t->elem = elem;
+    return t;
+}
+
 Type *ty_stream_of(Type *elem) {
     Type *t = xs_alloc(sizeof *t);
     t->kind = TY_STREAM;
@@ -370,7 +378,7 @@ bool ty_equal(Type *a, Type *b) {
     if (a == b) return true;
     if (!a || !b || a->kind != b->kind) return false;
     switch (a->kind) {
-    case TY_ARRAY: case TY_NULLABLE: case TY_SET: case TY_STREAM: case TY_CHAN: return ty_equal(a->elem, b->elem);
+    case TY_ARRAY: case TY_NULLABLE: case TY_SET: case TY_STREAM: case TY_CHAN: case TY_PROMISE: return ty_equal(a->elem, b->elem);
     case TY_MAP: return ty_equal(a->key, b->key) && ty_equal(a->elem, b->elem);
     case TY_OBJECT: return a->cls == b->cls;
     case TY_UNION: { /* the same members, in any order */
@@ -393,7 +401,7 @@ bool ty_equal(Type *a, Type *b) {
 }
 
 bool ty_is_heap(Type *t) {
-    return t->kind == TY_STRING || t->kind == TY_JSON || t->kind == TY_UNKNOWN || t->kind == TY_UNION || t->kind == TY_ARRAY || t->kind == TY_OBJECT || t->kind == TY_MAP || t->kind == TY_SET || t->kind == TY_STREAM || t->kind == TY_CHAN ||
+    return t->kind == TY_STRING || t->kind == TY_JSON || t->kind == TY_UNKNOWN || t->kind == TY_UNION || t->kind == TY_ARRAY || t->kind == TY_OBJECT || t->kind == TY_MAP || t->kind == TY_SET || t->kind == TY_STREAM || t->kind == TY_CHAN || t->kind == TY_PROMISE ||
            t->kind == TY_FUNC || (t->kind == TY_NULLABLE && ty_is_heap(t->elem));
 }
 
@@ -427,11 +435,12 @@ const char *ty_name(Type *t) {
     case TY_SET: return xs_sprintf("Set<%s>", ty_name(t->elem));
     case TY_STREAM: return xs_sprintf("Stream<%s>", ty_name(t->elem));
     case TY_CHAN: return xs_sprintf("Channel<%s>", ty_name(t->elem));
+    case TY_PROMISE: return xs_sprintf("Promise<%s>", ty_name(t->elem));
     case TY_FUNC: {
         Buf b = {0};
         buf_puts(&b, "(");
         for (int i = 0; i < t->nparams; i++) buf_printf(&b, "%s%s", i ? ", " : "", ty_name(t->params[i]));
-        buf_printf(&b, ") => %s", ty_name(t->ret));
+        buf_printf(&b, t->async_ret ? ") => Promise<%s>" : ") => %s", ty_name(t->ret));
         return b.data;
     }
     }
