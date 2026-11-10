@@ -26,6 +26,17 @@ ts = [threading.Thread(target=go) for _ in range(20)]
 dt = time.time() - t0
 print("20 concurrent sleeps of 300 ms:", "overlapped" if dt < 1.5 else "SERIALIZED", "(%d ok)" % sum(r == "slept 300" for r in res))
 PY
+# node:async_hooks: 30 concurrent requests, each with its own AsyncLocalStorage store across its awaits
+python3 - <<'PY'
+import threading, urllib.request
+res = {}
+def go(i):
+    res[i] = urllib.request.urlopen("http://127.0.0.1:8080/ctx?id=r%d&ms=%d" % (i, (i * 37) % 200)).read().decode()
+ts = [threading.Thread(target=go, args=(i,)) for i in range(30)]
+[t.start() for t in ts]; [t.join() for t in ts]
+bad = [v for i, v in res.items() if v != "r%d=r%d/r%d" % (i, i, i)]
+print("async local storage per request:", "isolated (%d ok)" % len(res) if not bad and len(res) == 30 else "MIXED %s" % bad[:3])
+PY
 # channels: 5 handlers park on receive(); 5 publishes wake them one each
 python3 - <<'PY'
 import threading, time, urllib.request
