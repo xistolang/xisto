@@ -274,6 +274,7 @@ typedef struct {
     char *message;
     int64_t row_count;
     int cursor;
+    int64_t pos;            /* where in the SQL the error is (node-oracledb's error.offset) */
     bool end;               /* the response is complete */
 } xs_ora_status;
 
@@ -282,7 +283,7 @@ static void xs_ora_error_info(xs_ora_conn *c, xs_ora_status *st) {
     xs_ora_rub(c); xs_ora_rub(c); xs_ora_rub(c); xs_ora_rub(c); xs_ora_rub(c); /* seq, row, error, array elem x2 */
     int cursor = (int)xs_ora_rub(c);
     if (cursor) st->cursor = cursor;
-    xs_ora_rub(c);                  /* error position */
+    st->pos = xs_ora_rub(c);        /* error position */
     xs_ora_rraw(c, 5);              /* sql type, fatal, flags, user cursor options, UPI parameter */
     xs_ora_r8(c);                   /* warning flag */
     xs_ora_rub(c); xs_ora_rub(c); xs_ora_r8(c); xs_ora_rub(c); xs_ora_rub(c); /* rowid */
@@ -1422,8 +1423,10 @@ static void xs_ora_read_result(xs_ora_conn *c, xs_ora_rs *r, xs_ora_status *st, 
     free(bitvec);
     if (st->num == 1403) { st->num = 0; r->more = false; free(st->message); st->message = NULL; }
 }
+static XS_TLS int64_t xs_ora_last_offset; /* the offset of the last database error (error.offset) */
 static void xs_ora_throw_status(xs_ora_status *st) {
     static XS_TLS char msg[1100];
+    xs_ora_last_offset = st->pos;
     snprintf(msg, sizeof msg, "%s", st->message ? st->message : "ORA-00000: unknown error");
     free(st->message);
     st->message = NULL;
@@ -1781,3 +1784,4 @@ static void xs_ora_simple(xn_oracledb_NativePool *p, int64_t h, unsigned code) {
 XS_NOINLINE void xn_oracledb_NativePool_commit(xn_oracledb_NativePool *p, int64_t h) { xs_ora_simple(p, h, 14); }
 XS_NOINLINE void xn_oracledb_NativePool_rollback(xn_oracledb_NativePool *p, int64_t h) { xs_ora_simple(p, h, 15); }
 XS_NOINLINE void xn_oracledb_NativePool_ping(xn_oracledb_NativePool *p, int64_t h) { xs_ora_simple(p, h, 147); }
+XS_NOINLINE int64_t xn_oracledb_NativePool_lastOffset(xn_oracledb_NativePool *p) { (void)p; int64_t o = xs_ora_last_offset; xs_ora_last_offset = 0; return o; }

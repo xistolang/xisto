@@ -10,7 +10,7 @@
 // OFFSET/FETCH, quoted identifiers as TypeORM quotes them.
 import { ClassInfo, FieldInfo } from "xisto:reflect";
 import { Pool } from "pg";
-import { Connection, OUT_FORMAT_OBJECT, createPool } from "oracledb";
+import { Connection, OUT_FORMAT_OBJECT, OracleError, createPool } from "oracledb";
 
 declare function remap(rows: object, spec: string): object;
 declare function get(json: object, key: string): object;
@@ -149,12 +149,23 @@ export class QueryFailedError extends Error {
   readonly parameters: unknown[];
   /** the driver's own error ("ORA-00942: ...", "relation ... does not exist") */
   readonly driverError: Error;
+  /** the driver error's fields, as TypeORM copies them: Oracle's errorNum (20001 for ORA-20001; 0 otherwise),
+      code ("ORA-20001") and offset */
+  errorNum: int = 0;
+  code: string = "";
+  offset: int = 0;
   constructor(query: string, parameters: unknown[], driverError: Error) {
     super(driverError.message);
     this.name = "QueryFailedError";
     this.query = query;
     this.parameters = parameters;
     this.driverError = driverError;
+    if (driverError instanceof OracleError) {
+      const o = driverError as OracleError;
+      this.errorNum = o.errorNum;
+      this.code = o.code;
+      this.offset = o.offset;
+    }
   }
 }
 
