@@ -15,6 +15,14 @@ export interface SwaggerConfig {
   bearer: boolean;
 }
 
+export interface BearerAuthOptions {
+  type?: string;
+  scheme?: string;
+  bearerFormat?: string;
+  name?: string;
+  description?: string;
+  in?: string;
+}
 export class DocumentBuilder {
   private title: string = "";
   private description: string = "";
@@ -33,7 +41,8 @@ export class DocumentBuilder {
     this.version = version;
     return this;
   }
-  addBearerAuth(): DocumentBuilder {
+  /** the bearer scheme; the options and the scheme's name are accepted (the document says "bearer") */
+  addBearerAuth(options: BearerAuthOptions | null = null, name: string = ""): DocumentBuilder {
     this.bearer = true;
     return this;
   }
