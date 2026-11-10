@@ -1374,6 +1374,7 @@ static bool json_ok(Type *t, int depth) {
     case TY_NUMBER: case TY_INT: case TY_BOOLEAN: case TY_STRING: case TY_ENUM: return true;
     case TY_JSON: return true; /* embedded as it is */
     case TY_ARRAY: case TY_NULLABLE: return json_ok(t->elem, depth + 1);
+    case TY_MAP: return t->record && t->key->kind == TY_STRING && json_ok(t->elem, depth + 1); /* a Record: an object */
     case TY_OBJECT:
         if (t->cls->builtin) return strcmp(t->cls->name, "Date") == 0; /* as its ISO text */
         for (int i = 0; i < t->cls->nfields; i++)
@@ -1410,6 +1411,18 @@ static Expr *copy_target(Expr *x);
 static void check_loose_eq(Expr *e);
 static bool rereadable(Expr *e);
 static Expr *expr_copy(Expr *e);
+/* rec[k] / rec.k (a Record's get, V | null) read as an object: as in JavaScript, a missing entry is a TypeError */
+static Expr *rec_get_nn(Expr *x) {
+    if (!(x->type && x->type->kind == TY_NULLABLE && x->kind == E_MEMBER && x->is_call && strcmp(x->str, "get") == 0 &&
+          x->lhs->type && x->lhs->type->kind == TY_MAP && x->lhs->type->record)) return x;
+    Expr *nn = xs_alloc(sizeof *nn);
+    nn->kind = E_AS; nn->op = TK_NOT; nn->pos = x->pos; nn->field = -1;
+    nn->lhs = x;
+    nn->type = x->type->elem;
+    return nn;
+}
+/* x, this, x.a.b before checking: a path with no call in it, safe to check twice */
+static bool plain_path(Expr *e) { return e->kind == E_IDENT || e->kind == E_THIS || (e->kind == E_MEMBER && !e->is_call && e->op != TK_QDOT && plain_path(e->lhs)); }
 static const char **member_names(Class *c, int *n);
 static bool always_returns(Stmt *s);
 static void check_block(Stmt *b);
@@ -2040,6 +2053,16 @@ static void check_map_member(Expr *e) {
     Type *k = is_map ? t->key : t->elem;
     Type *v = t->elem;
     const char *m = e->str;
+    if (!e->is_call && is_map && t->record) { /* m.k on a Record: m.get("k") */
+        Expr *key = xs_alloc(sizeof *key);
+        key->kind = E_STRING; key->pos = e->pos; key->field = -1; key->str = (char *)m;
+        key->type = ty_string; key->lit_id = intern(m);
+        e->str = "get";
+        e->is_call = true;
+        e->args = (ExprList){0};
+        expr_list_push(&e->args, key);
+        m = e->str;
+    }
     if (!e->is_call) {
         if (strcmp(m, "size") == 0) { e->type = ty_int; e->builtin.cfn = "size"; return; }
         xs_error(XS8015, e->pos, is_map ? "Map has: size, get, set, has, delete, clear, keys, values, entries" : "Set has: size, add, has, delete, clear, values", "%s has no property '%s'", ty_name(t), m);
@@ -2741,6 +2764,44 @@ static void check_expr(Expr *e, Type *expected) {
         return;
     case E_BINARY:
         if (e->op == TK_QQ) { check_nullish(e, expected); return; }
+        if (e->op == TK_IN) { /* "k" in m: m.has(k) on a Record; on an object, whether the field is there */
+            check_expr(e->rhs, NULL);
+            Type *rt = e->rhs->type;
+            if (rt->kind == TY_MAP && rt->record) {
+                Expr *key = e->lhs;
+                e->kind = E_MEMBER;
+                e->lhs = e->rhs;
+                e->rhs = NULL;
+                e->str = "has";
+                e->is_call = true;
+                e->args = (ExprList){0};
+                expr_list_push(&e->args, key);
+                check_expr(e, expected);
+                return;
+            }
+            Type *ot = ty_strip_null(rt);
+            if (ot->kind == TY_OBJECT && !ot->cls->builtin && e->lhs->kind == E_STRING) {
+                Field *fd = find_field(ot->cls, e->lhs->str, NULL);
+                if (fd && fd->optional) { /* "f" in o: o.f is there (an optional field left out is not) */
+                    Expr *mem = xs_alloc(sizeof *mem);
+                    mem->kind = E_MEMBER; mem->pos = e->pos; mem->field = -1; mem->lhs = e->rhs; mem->str = e->lhs->str;
+                    Expr *nul = xs_alloc(sizeof *nul);
+                    nul->kind = E_NULL; nul->pos = e->pos; nul->field = -1;
+                    e->op = TK_NEQ;
+                    e->lhs = mem;
+                    e->rhs = nul;
+                    check_expr(e, expected);
+                    return;
+                }
+                bool has = fd != NULL || find_method(ot->cls, e->lhs->str) != NULL;
+                e->kind = E_BOOL;
+                e->boolean = has;
+                e->lhs = e->rhs = NULL;
+                e->type = ty_boolean;
+                return;
+            }
+            xs_error(XS8015, e->pos, "use it on a Record<string, V> or an object with a string literal key: \"name\" in obj", "'in' needs a Record or an object and a key written in place");
+        }
         if ((e->op == TK_STARSTAR || tk_bitop(e->op)) && fold_lit_int(e)) { /* 2 ** 53, 1 << 4: a literal, typed by its use */
             check_expr(e, expected);
             return;
@@ -2956,6 +3017,40 @@ static void check_expr(Expr *e, Type *expected) {
             e->rhs = qq;
         }
         Expr *target = e->lhs;
+        if (e->kind == E_ASSIGN && ((target->kind == E_INDEX) || (target->kind == E_MEMBER && !target->is_call && target->str)) &&
+            target->lhs && plain_path(target->lhs) && !(target->lhs->kind == E_IDENT && !lookup(target->lhs->str))) {
+            check_expr(target->lhs, NULL); /* a variable or a field path: checking it twice is harmless */
+            target->lhs = rec_get_nn(target->lhs);
+            if (target->lhs->type && target->lhs->type->kind == TY_MAP && target->lhs->type->record) { /* m[k] = v: m.set(k, v) */
+                Expr *key;
+                if (target->kind == E_INDEX) key = target->rhs;
+                else {
+                    key = xs_alloc(sizeof *key);
+                    key->kind = E_STRING; key->pos = target->pos; key->field = -1; key->str = target->str;
+                }
+                Expr *val = e->rhs;
+                if (e->op != TK_ASSIGN) { /* m[k] += v: m.set(k, m.get(k) + v) */
+                    TokKind op = e->op == TK_PLUS_ASSIGN ? TK_PLUS : e->op == TK_MINUS_ASSIGN ? TK_MINUS : e->op == TK_STAR_ASSIGN ? TK_STAR : TK_SLASH;
+                    Expr *get = xs_alloc(sizeof *get);
+                    get->kind = E_MEMBER; get->pos = target->pos; get->field = -1; get->lhs = target->lhs; get->str = "get"; get->is_call = true;
+                    expr_list_push(&get->args, key);
+                    Expr *bin = xs_alloc(sizeof *bin);
+                    bin->kind = E_BINARY; bin->pos = e->pos; bin->field = -1; bin->op = op; bin->lhs = get; bin->rhs = val;
+                    val = bin;
+                }
+                Expr *map = target->lhs;
+                e->kind = E_MEMBER;
+                e->lhs = map;
+                e->rhs = NULL;
+                e->str = "set";
+                e->is_call = true;
+                e->args = (ExprList){0};
+                expr_list_push(&e->args, key);
+                expr_list_push(&e->args, val);
+                check_expr(e, NULL);
+                return;
+            }
+        }
         const char *path_assigned = NULL; /* o.f = v: the field path, narrowed or not by what v is */
         if (e->kind == E_ASSIGN && target->kind == E_MEMBER && !target->is_call && rereadable(target->lhs) &&
             !(target->lhs->kind == E_IDENT && !lookup(target->lhs->str))) { /* obj.x = v with set x(v) (not Class.static) */
@@ -3393,6 +3488,17 @@ static void check_expr(Expr *e, Type *expected) {
     }
     case E_INDEX:
         check_expr(e->lhs, NULL);
+        if (e->lhs->type->kind == TY_MAP && e->lhs->type->record) { /* m[k] on a Record: m.get(k) */
+            Expr *key = e->rhs;
+            e->kind = E_MEMBER;
+            e->str = "get";
+            e->is_call = true;
+            e->rhs = NULL;
+            e->args = (ExprList){0};
+            expr_list_push(&e->args, key);
+            check_expr(e, expected);
+            return;
+        }
         if (e->lhs->type->kind == TY_NULLABLE) xs_error(XS2015, e->pos, "check it first: if (x !== null) { ... }", "indexed value may be null");
         check_expr(e->rhs, ty_int);
         if (e->lhs->type->kind == TY_OBJECT && e->lhs->type->cls->is_tuple) { /* t[0]: its field (the index is a constant) */
@@ -3437,6 +3543,39 @@ static void check_expr(Expr *e, Type *expected) {
         e->type = e->lhs->type->elem;
         return;
     case E_MEMBER:
+        if (e->is_call && e->str && e->lhs && e->lhs->kind == E_IDENT && strcmp(e->lhs->str, "Object") == 0 && !lookup("Object") &&
+            (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")) && e->args.len == 1) {
+            /* Object.keys(m) / values / entries: of a Record, its entries' (m.keys()...); of an object, its fields' names */
+            Expr *o = e->args.items[0];
+            check_expr(o, NULL);
+            Type *ot = o->type;
+            if (ot->kind == TY_MAP && ot->record) {
+                e->lhs = o;
+                e->args = (ExprList){0};
+                check_expr(e, expected);
+                return;
+            }
+            Type *st = ty_strip_null(ot);
+            if (!strcmp(e->str, "keys") && st->kind == TY_OBJECT && !st->cls->builtin) {
+                Class *c = st->cls;
+                bool opt = false;
+                for (int i = 0; i < c->nfields; i++) if (c->fields[i].optional) opt = true;
+                if (opt) xs_error(XS8015, e->pos, "keep the keys in a Record<string, V>, or list the fields you need", "Object.keys of %s, which has optional fields, is not supported yet", c->name);
+                e->kind = E_ARRAY_LIT;
+                e->lhs = NULL;
+                e->str = NULL;
+                e->is_call = false;
+                e->args = (ExprList){0};
+                for (int i = 0; i < c->nfields; i++) {
+                    Expr *k = xs_alloc(sizeof *k);
+                    k->kind = E_STRING; k->pos = e->pos; k->field = -1; k->str = (char *)c->fields[i].name;
+                    expr_list_push(&e->args, k);
+                }
+                check_expr(e, ty_array_of(ty_string));
+                return;
+            }
+            xs_error(XS8015, e->pos, "Object.keys, values and entries take a Record<string, V> (and keys, an object)", "Object.%s of %s is not supported", e->str, ty_name(ot));
+        }
         if (e->is_call && e->str && strcmp(e->str, "write") == 0 && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->str &&
             (strcmp(e->lhs->str, "stdout") == 0 || strcmp(e->lhs->str, "stderr") == 0) && e->lhs->lhs->kind == E_IDENT &&
             strcmp(e->lhs->lhs->str, "process") == 0 && !lookup("process")) { /* process.stdout.write(text or bytes) */
@@ -3708,6 +3847,7 @@ static void check_expr(Expr *e, Type *expected) {
             return;
         }
         check_expr(e->lhs, NULL);
+        e->lhs = rec_get_nn(e->lhs);
         if (e->lhs->type->kind == TY_NULLABLE) {
             if (xs_check_mode && after_optional_dot(e->pos)) xs_error_quiet(); /* x?.name: the '?.' was counted where it is */
             xs_error(XS2006, e->pos, "check it first: if (x !== null) { ... }  (fields need a local copy: const v = this.f;)", "'%s' may be null", e->str);
@@ -4148,6 +4288,27 @@ static void check_expr(Expr *e, Type *expected) {
             t = pick;
         }
         if (t && t->kind == TY_JSON) { anon_objlit(e); return; }
+        if (t && t->kind == TY_MAP && t->record) { /* a Record<K, V> written as { a: 1, b: 2 }: new Map([["a", 1], ["b", 2]]) */
+            Expr *arr = xs_alloc(sizeof *arr);
+            arr->kind = E_ARRAY_LIT; arr->pos = e->pos; arr->field = -1;
+            for (int i = 0; i < e->args.len; i++) {
+                Expr *pair = xs_alloc(sizeof *pair);
+                pair->kind = E_ARRAY_LIT; pair->pos = e->args.items[i]->pos; pair->field = -1;
+                Expr *k = xs_alloc(sizeof *k);
+                k->kind = E_STRING; k->pos = pair->pos; k->field = -1; k->str = e->keys[i];
+                expr_list_push(&pair->args, k);
+                expr_list_push(&pair->args, e->args.items[i]);
+                expr_list_push(&arr->args, pair);
+            }
+            e->kind = E_NEW_MAP;
+            e->elem_type = t;
+            e->args = (ExprList){0};
+            e->keys = NULL;
+            if (arr->args.len) expr_list_push(&e->args, arr);
+            check_expr(e, t);
+            e->type = t;
+            return;
+        }
         if (!t || t->kind != TY_OBJECT)
             xs_error(XS3006, e->pos, "give it a type: const t: Todo = { ... };  (declare Todo with interface or class)", "an object literal needs a declared type here");
         Class *c = t->cls;
