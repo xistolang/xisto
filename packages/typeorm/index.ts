@@ -840,6 +840,20 @@ export interface InsertResult {
   identifiers: object;
 }
 
+/**
+ * Wraps every statement a DataSource runs (repositories, query builders, query runners, dataSource.query):
+ * what Node code does by patching QueryRunner.prototype.query. `next()` runs the statement (or the next wrapper).
+ */
+export type QueryWrapper = (sql: string, params: unknown[], next: () => Promise<object>) => Promise<object>;
+
+// the wrappers from the last added (outermost) to the first, then the statement itself
+function runWrapped(ws: QueryWrapper[], i: int, sql: string, params: unknown[], last: () => Promise<object>): Promise<object> {
+  if (i < 0) {
+    return last();
+  }
+  return ws[i](sql, params, (): Promise<object> => runWrapped(ws, i - 1, sql, params, last));
+}
+
 /** Statements reach the database through a DataSource (its pool) or a QueryRunner (its pinned connection). */
 export class Executor {
   dataSource: DataSource;
@@ -861,14 +875,22 @@ export class Executor {
       console.log("query: " + sql);
     }
     const s = this.session;
-    try {
-      if (s !== null) {
-        return await s.run(sql, params);
+    const ds = this.dataSource;
+    const direct = async (): Promise<object> => {
+      try {
+        if (s !== null) {
+          return await s.run(sql, params);
+        }
+        return await ds.driver().run(sql, params);
+      } catch (e) {
+        throw new QueryFailedError(sql, params, e);
       }
-      return await this.dataSource.driver().run(sql, params);
-    } catch (e) {
-      throw new QueryFailedError(sql, params, e);
+    };
+    const ws = ds.queryWrappers;
+    if (ws.length === 0) {
+      return await direct();
     }
+    return await runWrapped(ws, ws.length - 1, sql, params, direct);
   }
   async rows(sql: string, params: unknown[]): Promise<object> {
     return get(await this.run(sql, params), "rows");
@@ -1745,6 +1767,7 @@ export class DataSource {
   readonly options: DataSourceOptions;
   driverOf: Driver | null = null; // (set by withDriver)
   isInitialized: boolean = false;
+  queryWrappers: QueryWrapper[] = [];
   manager: EntityManager;
 
   constructor(options: DataSourceOptions) {
@@ -1807,6 +1830,11 @@ export class DataSource {
 
   createQueryRunner(): QueryRunner {
     return new QueryRunner(this);
+  }
+
+  /** xisto: wraps every statement this DataSource runs (the last added runs first); see QueryWrapper */
+  wrapQueries(w: QueryWrapper): void {
+    this.queryWrappers.push(w);
   }
 
   /** runs fn in a transaction: committed when it returns, rolled back when it throws (the error goes on) */
