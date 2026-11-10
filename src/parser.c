@@ -167,7 +167,7 @@ static void add_statics(Program *prog, Module *m, Class *c);
 static bool looks_like_fn_type(Parser *p) {
     Parser save = *p;
     next(p);
-    bool fn = at(p, TK_RPAREN);
+    bool fn = at(p, TK_RPAREN) || at(p, TK_ELLIPSIS);
     if (!fn && at(p, TK_IDENT)) {
         next(p);
         fn = at(p, TK_COLON) || at(p, TK_QUESTION) || at(p, TK_COMMA);
@@ -299,7 +299,7 @@ static Type *parse_type(Parser *p) {
         skip_type_term(p);
         if (at(p, TK_AMP)) { Parser look = *p; next(&look); if (at_ident(&look, "string")) { *p = look; next(p); } }
         t = ty_string;
-        if (at(p, TK_PIPE)) { t = union_rest(p, t); }
+        if (at(p, TK_PIPE)) { next(p); t = union_rest(p, t); }
         return t;
     }
     if (at_ident(p, "Exclude") && peek_is(p, TK_LT)) { /* Exclude<A, B>: A (the values left out are TypeScript's check) */
@@ -366,9 +366,16 @@ static Type *parse_type(Parser *p) {
     if (at(p, TK_NUMBER) || at(p, TK_TRUE) || at(p, TK_FALSE) || (at(p, TK_MINUS) && peek_is(p, TK_NUMBER))) {
         /* 1 | 2 | 3, true, false: a number or boolean literal type is checked as number / boolean */
         bool num = !at(p, TK_TRUE) && !at(p, TK_FALSE);
+        bool is_true = at(p, TK_TRUE);
         if (at(p, TK_MINUS)) next(p);
         next(p);
         t = num ? ty_number : ty_boolean;
+        if (!num && !(at(p, TK_PIPE) && (peek_is(p, TK_TRUE) || peek_is(p, TK_FALSE)))) { /* true / false alone: its value, for narrowing */
+            Type *bt = xs_alloc(sizeof *bt);
+            *bt = *ty_boolean;
+            bt->tname = is_true ? "true" : "false";
+            t = bt;
+        }
         while (at(p, TK_PIPE) && (peek_is(p, TK_NUMBER) || peek_is(p, TK_TRUE) || peek_is(p, TK_FALSE) || peek_is(p, TK_MINUS))) {
             next(p);
             if (at(p, TK_MINUS)) next(p);
@@ -418,7 +425,9 @@ static Type *parse_type(Parser *p) {
         next(p);
         Type **params = NULL;
         int n = 0, cap = 0;
+        bool rest = false;
         while (!at(p, TK_RPAREN)) {
+            rest = accept(p, TK_ELLIPSIS); /* (...args: T[]) => R */
             expect(p, TK_IDENT, NULL);
             bool opt = accept(p, TK_QUESTION); /* (sql: string, binds?: B) => R: B | null */
             expect(p, TK_COLON, "function types name their parameters: (req: HttpRequest) => HttpResponse");
@@ -432,7 +441,9 @@ static Type *parse_type(Parser *p) {
         }
         expect(p, TK_RPAREN, NULL);
         expect(p, TK_ARROW, NULL);
-        return ty_func(params, n, parse_type(p));
+        Type *ft = ty_func(params, n, parse_type(p));
+        ft->rest = rest;
+        return ft;
     }
     if (at_ident(p, "typeof") && peek_is(p, TK_IDENT)) { /* typeof x: the type of the variable x (the checker reads it) */
         next(p);
@@ -757,6 +768,9 @@ static Expr *parse_arrow(Parser *p) {
     f->pos = pos;
     f->name = "arrow";
     int cap = 0;
+    bool is_fn = accept(p, TK_FUNCTION); /* function (a: A): R { ... }: an arrow (no `this` of its own) */
+    if (is_fn && at(p, TK_IDENT)) next(p);
+    if (is_fn && !at(p, TK_LPAREN)) expect(p, TK_LPAREN, NULL);
     if (at(p, TK_IDENT)) { /* x => ... */
         Token name = p->tok;
         next(p);
@@ -771,6 +785,9 @@ static Expr *parse_arrow(Parser *p) {
                 f->params = realloc(f->params, sizeof(Param) * (size_t)cap);
             }
             Token name;
+            if (is_fn && at(p, TK_THIS))
+                xs_error(XS6025, p->tok.pos, "use an arrow function and pass the object as a parameter", "a function expression that declares 'this' is not supported");
+            bool rest = accept(p, TK_ELLIPSIS); /* (...xs: T[]) => ... */
             if (at(p, TK_LBRACKET) || at(p, TK_LBRACE)) { /* ([k, v]) => ... / ({ id }) => ...: a hidden parameter */
                 StmtList saved = p->pending;
                 p->pending = (StmtList){0};
@@ -787,13 +804,18 @@ static Expr *parse_arrow(Parser *p) {
             else if (!prm.type && at(p, TK_ASSIGN) && !default_literal_type(p, &prm))
                 xs_error(XS3013, p->tok.pos, "give the parameter a type: (w: number = 2)", "parameter '%s' has no type", name.str);
             if (accept(p, TK_ASSIGN)) prm.dflt = parse_assign(p); /* (n: number, w = 2) => ... */
+            if (rest) { /* none given: an empty array */
+                prm.rest = true;
+                if (!prm.dflt) prm.dflt = new_expr(E_ARRAY_LIT, name.pos);
+            }
             f->params[f->nparams++] = prm;
             if (!accept(p, TK_COMMA)) break;
         }
         expect(p, TK_RPAREN, NULL);
         if (accept(p, TK_COLON)) f->ret = parse_type(p);
     }
-    expect(p, TK_ARROW, NULL);
+    if (is_fn) { if (!at(p, TK_LBRACE)) expect(p, TK_LBRACE, NULL); }
+    else expect(p, TK_ARROW, NULL);
     if (at(p, TK_LBRACE)) {
         f->body = parse_block(p);
     } else {
@@ -1149,9 +1171,8 @@ static Expr *parse_primary(Parser *p) {
         parse_args(p, &e->args);
         return e;
     }
-    case TK_FUNCTION:
-        xs_error(XS6025, pos, "declare the function at the top level and pass its name", "function expressions are not supported");
-        return NULL;
+    case TK_FUNCTION: /* function (a: A): R { ... }: read as an arrow function */
+        return parse_arrow(p);
     default:
         xs_error(XS1021, pos, NULL, "expected an expression but found %s", found(p));
         return NULL;
@@ -2438,7 +2459,11 @@ static Class *parse_interface(Parser *p) {
         next(p);
         do {
             c->tparams = realloc(c->tparams, sizeof(char *) * (size_t)(c->ntparams + 1));
+            c->ctdefaults = realloc(c->ctdefaults, sizeof(Type *) * (size_t)(c->ntparams + 1));
+            c->ctdefaults[c->ntparams] = NULL;
             c->tparams[c->ntparams++] = expect(p, TK_IDENT, NULL).str;
+            if (at_ident(p, "extends")) { next(p); parse_type(p); }
+            if (accept(p, TK_ASSIGN)) c->ctdefaults[c->ntparams - 1] = parse_type(p); /* <T = unknown> */
         } while (accept(p, TK_COMMA));
         expect(p, TK_GT, NULL);
     }
@@ -2466,6 +2491,29 @@ static Class *parse_interface(Parser *p) {
         }
         if (!at(p, TK_LBRACE) || composite) { /* type Shape = Circle | Rect; type Id = string | number; */
             c->alias = parse_type(p);
+            if (c->ntparams) { /* type Item<T> = { ok: true; valor: T } | { ok: false; erro: unknown }: each object member a
+                                  template over T, instantiated with the alias (checker: resolve) */
+                Type *u = c->alias;
+                int nm = u->kind == TY_UNION ? u->nparams : 1;
+                for (int i = 0; i < nm; i++) {
+                    Type *mt = u->kind == TY_UNION ? u->params[i] : u;
+                    if (mt->kind != TY_OBJECT || !mt->cls || strncmp(mt->cls->name, "__Obj_", 6) != 0 || mt->ntargs) continue;
+                    Class *oc = mt->cls;
+                    oc->tparams = c->tparams;
+                    oc->ntparams = c->ntparams;
+                    Type *nt = xs_alloc(sizeof *nt);
+                    *nt = *mt;
+                    nt->targs = xs_alloc(sizeof(Type *) * (size_t)c->ntparams);
+                    nt->ntargs = c->ntparams;
+                    for (int k = 0; k < c->ntparams; k++) {
+                        Token tk = {0};
+                        tk.str = c->tparams[k];
+                        tk.pos = oc->pos;
+                        nt->targs[k] = named_type(p, tk);
+                    }
+                    if (u->kind == TY_UNION) u->params[i] = nt; else c->alias = nt;
+                }
+            }
             if (at_ident(p, "extends")) { /* type Ok = A extends B ? true : never: a conditional type, read as its true branch */
                 next(p);
                 parse_type(p);
@@ -2500,8 +2548,11 @@ static Class *parse_class_ex(Parser *p, bool abstract) {
         next(p);
         do {
             c->tparams = realloc(c->tparams, sizeof(char *) * (size_t)(c->ntparams + 1));
+            c->ctdefaults = realloc(c->ctdefaults, sizeof(Type *) * (size_t)(c->ntparams + 1));
+            c->ctdefaults[c->ntparams] = NULL;
             c->tparams[c->ntparams++] = expect(p, TK_IDENT, NULL).str;
             if (at_ident(p, "extends")) { next(p); parse_type(p); }
+            if (accept(p, TK_ASSIGN)) c->ctdefaults[c->ntparams - 1] = parse_type(p); /* <T = unknown> */
         } while (accept(p, TK_COMMA));
         expect(p, TK_GT, "close the type parameters: class Name<T, U>");
         if (at_ident(p, "extends")) xs_error(XS6015, p->tok.pos, NULL, "a generic class cannot extend another class yet");
@@ -2543,7 +2594,8 @@ static Class *parse_class_ex(Parser *p, bool abstract) {
         parse_fields_body(p, c);
         tp_names = saved;
         ntp = saved_n;
-        if (c->nsfields || c->nsmethods) xs_error(XS6016, c->pos, NULL, "a generic class has no static members yet");
+        /* static members belong to the class, not to an instance of it: they are the template's (TypeScript does
+           not let them read the class's type parameters; a static method declares its own, static of<T>()) */
         return c;
     }
     parse_fields_body(p, c);
@@ -2604,7 +2656,8 @@ static void parse_fields_body(Parser *p, Class *c) {
         int mods = skip_modifiers(p);
         if ((mods & MOD_ABSTRACT) && !c->is_abstract) xs_error(XS8080, pos, "write abstract class Name", "an abstract member needs an abstract class");
         if ((mods & MOD_STATIC) && c->is_interface) xs_error(XS8109, pos, NULL, "interfaces have no static members");
-        bool is_async = accept(p, TK_ASYNC);
+        bool is_async = at(p, TK_ASYNC) && !peek_is(p, TK_QUESTION) && !peek_is(p, TK_COLON) && !peek_is(p, TK_SEMI) &&
+                        !peek_is(p, TK_ASSIGN) && accept(p, TK_ASYNC); /* (async?: boolean: a field named async) */
         bool gen_method = !c->is_interface && accept(p, TK_STAR); /* *values(): a generator method */
         if (gen_method && at(p, TK_LBRACKET)) { /* *[Symbol.iterator](): what for...of uses on the object */
             next(p);
@@ -2957,6 +3010,112 @@ static bool generic_arrow_ahead(Parser *p) {
     if (!accept(&look, TK_LT) || !at(&look, TK_IDENT)) return false;
     next(&look);
     return at(&look, TK_GT) || at(&look, TK_COMMA) || at(&look, TK_ASSIGN) || at_ident(&look, "extends");
+}
+
+/* const X = { run<T>(fn: () => T): T { ... }, n: 1 }: an object with methods (a namespace of functions) is read as
+   a class with one instance, so its methods may be generic and `this` is the object. Returns false, consuming
+   nothing, when the object has no method, a spread, a computed or string key, or a shorthand { a }. */
+static bool method_object(Parser *p, Program *prog, Module *m, bool exported) {
+    Parser look = *p;
+    Pos cpos = look.tok.pos;
+    next(&look);
+    if (!at(&look, TK_IDENT)) return false;
+    Token nm = look.tok;
+    next(&look);
+    if (!at(&look, TK_ASSIGN)) return false;
+    next(&look);
+    if (!at(&look, TK_LBRACE)) return false;
+    const char *ob = look.tok.start;
+    Pos opos = look.tok.pos;
+    /* edits, as offsets from ob: ':' of a property -> '=', ',' after a property -> ';', ',' after a method -> ' ' */
+    int nedit = 0, cap = 0;
+    int *eoff = NULL;
+    char *ech = NULL;
+    int depth = 0;
+    bool at_member = false, any_method = false, member_is_method = false, last_was_prop = false;
+    TokKind prev = TK_LBRACE;
+    const char *end = NULL;
+    for (;;) {
+        if (at(&look, TK_EOF)) { free(eoff); free(ech); return false; }
+        TokKind k = look.tok.kind;
+        if (depth == 1 && at_member) {
+            at_member = false;
+            if (k == TK_RBRACE) { end = look.tok.start + 1; break; } /* after a trailing comma */
+            if (k != TK_IDENT && !(tok_keyword_text(k) && k != TK_THIS)) { free(eoff); free(ech); return false; }
+            Parser l2 = look;
+            bool lead = (k == TK_ASYNC || at_ident(&l2, "get") || at_ident(&l2, "set"));
+            next(&l2);
+            if (lead && (at(&l2, TK_IDENT) || tok_keyword_text(l2.tok.kind))) next(&l2);
+            if (at(&l2, TK_LPAREN) || at(&l2, TK_LT)) { member_is_method = true; any_method = true; last_was_prop = false; }
+            else if (at(&l2, TK_COLON)) {
+                member_is_method = false;
+                last_was_prop = true;
+                if (nedit + 1 > cap) { cap = cap ? cap * 2 : 16; eoff = realloc(eoff, sizeof(int) * (size_t)cap); ech = realloc(ech, (size_t)cap); }
+                eoff[nedit] = (int)(l2.tok.start - ob); ech[nedit++] = '=';
+            } else { free(eoff); free(ech); return false; }
+        }
+        if (k == TK_LBRACE || k == TK_LPAREN || k == TK_LBRACKET) depth++;
+        else if (k == TK_RBRACE || k == TK_RPAREN || k == TK_RBRACKET) {
+            if (--depth == 0) { end = look.tok.start + 1; break; }
+        } else if (k == TK_COMMA && depth == 1) {
+            if (nedit + 1 > cap) { cap = cap ? cap * 2 : 16; eoff = realloc(eoff, sizeof(int) * (size_t)cap); ech = realloc(ech, (size_t)cap); }
+            eoff[nedit] = (int)(look.tok.start - ob); ech[nedit++] = member_is_method ? ' ' : ';';
+            at_member = true;
+            last_was_prop = false;
+        } else if ((k == TK_SLASH || k == TK_SLASH_ASSIGN) && prev != TK_IDENT && prev != TK_NUMBER && prev != TK_STRING &&
+                   prev != TK_RPAREN && prev != TK_RBRACKET && prev != TK_TEMPLATE) { /* a regex in a method: read as one */
+            char *pat, *fl;
+            look.lx.pos = (size_t)(look.tok.start - look.lx.src);
+            look.lx.col = look.tok.pos.col;
+            if (!lexer_regex(&look.lx, look.tok.start, &pat, &fl)) { free(eoff); free(ech); return false; }
+        }
+        bool opened = look.tok.start == ob;
+        prev = k;
+        next(&look);
+        if (opened) at_member = true;
+    }
+    if (!any_method) { free(eoff); free(ech); return false; }
+    /* the class text: the object's own text, edited in place (lines and columns stay where they were) */
+    size_t n = (size_t)(end - ob);
+    const char *cname = xs_sprintf("__obj_%s", nm.str);
+    Buf g = {0};
+    buf_printf(&g, "class %s\n", cname);
+    size_t body_at = g.len;
+    for (size_t i = 0; i < n; i++) buf_putc(&g, ob[i]);
+    for (int i = 0; i < nedit; i++) g.data[body_at + (size_t)eoff[i]] = ech[i];
+    if (last_was_prop) { g.data[g.len - 1] = ';'; buf_putc(&g, '}'); }
+    buf_puts(&g, "\n\n\n\n");
+    free(eoff);
+    free(ech);
+    /* the main parser goes past the object (and its ';') */
+    *p = look;
+    next(p);
+    accept(p, TK_SEMI);
+    Parser sub = {0};
+    lexer_init(&sub.lx, g.data);
+    sub.lx.line = opos.line - 1;
+    sub.lx.col = 1;
+    sub.prog = prog;
+    sub.mod = m;
+    next(&sub);
+    Class *c = parse_class_ex(&sub, false);
+    c->mod = m;
+    c->exported = exported;
+    add_class(prog, c);
+    add_statics(prog, m, c);
+    char *vs = xs_sprintf("const %s = new %s();\n\n\n", nm.str, cname);
+    Parser vp = {0};
+    lexer_init(&vp.lx, vs);
+    vp.lx.line = cpos.line;
+    vp.lx.col = cpos.col;
+    vp.prog = prog;
+    vp.mod = m;
+    next(&vp);
+    Stmt *st = parse_stmt(&vp);
+    st->mod = m;
+    st->exported = exported;
+    stmt_list_push(&prog->top, st);
+    return true;
 }
 
 /* the rest of the module declares `name` at its top level: a line that starts (after export / declare / abstract)
@@ -3702,6 +3861,8 @@ static void parse_module(Program *prog, Module *m) {
                 prog->enums = realloc(prog->enums, sizeof(Enum *) * (size_t)prog->cap_enums);
             }
             prog->enums[prog->nenums++] = en;
+        } else if (at(&p, TK_CONST) && method_object(&p, prog, m, exported)) {
+            /* (an object with methods: read as a one-instance class, above) */
         } else if (at(&p, TK_CONST) && generic_arrow_ahead(&p)) {
             /* const pick = <T>(xs: T[]): T => xs[0];  a generic function, written as an arrow */
             Pos pos = p.tok.pos;
@@ -3884,6 +4045,17 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->loading = false;
         return m;
     }
+    if (strcmp(name, "path") == 0) { /* Node's path (POSIX), written in xisto: runtime/node/path.ts */
+        extern const unsigned char xs_node_path_ts[];
+        m->builtin = false;
+        m->file = "xisto:path";
+        m->src = (char *)xs_node_path_ts;
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
+    if (strcmp(name, "perf_hooks") == 0) return m; /* performance is built in (performance.now()) */
     if (strcmp(name, "worker_threads") == 0 || strcmp(name, "os") == 0) { /* written in xisto over runtime functions */
         bool wt = strcmp(name, "worker_threads") == 0;
         m->builtin = false;
@@ -3903,7 +4075,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         add_func(prog, f);
         return m;
     }
-    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:sqlite, xisto:timers/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
     return NULL;
 }
 
