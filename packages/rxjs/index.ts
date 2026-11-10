@@ -103,8 +103,13 @@ export function from(p: Promise<unknown>): Observable<unknown> {
 }
 
 /** The value the Observable gives, as a promise. */
-export async function lastValueFrom(o: Observable<unknown>): Promise<unknown> {
+export async function lastValueFrom(o: Observable<unknown>, config: LastValueFromConfig | null = null): Promise<unknown> {
+  void config; // (an Observable here always gives its one value: the default is never needed)
   return o.run();
+}
+/** lastValueFrom(o, { defaultValue }): what an empty Observable would give */
+export interface LastValueFromConfig {
+  defaultValue?: unknown;
 }
 
 /** The first value the Observable gives (the only one here), as a promise. */

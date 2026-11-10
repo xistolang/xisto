@@ -205,4 +205,14 @@ export class LoggerModule {
     state.contextKey = params.renameContext ?? "context";
     return { module: LoggerModule, providers: [Logger, PinoLogger], exports: [Logger, PinoLogger], global: true };
   }
+  /** LoggerModule.forRootAsync({ useFactory: () => params }): the same, with the params computed at import */
+  static forRootAsync(options: LoggerModuleAsyncParams): DynamicModule {
+    return LoggerModule.forRoot(options.useFactory());
+  }
+}
+/** forRootAsync's options (inject and imports are accepted; the factory takes no arguments in xisto) */
+export interface LoggerModuleAsyncParams {
+  imports?: unknown[];
+  inject?: unknown[];
+  useFactory: () => LoggerModuleParams;
 }
