@@ -1390,6 +1390,7 @@ static void json_emit_value(Buf *b, Type *t, const char *expr) { /* appends into
     case TY_STRING: buf_printf(b, "xs_sb_str(sb, %s);", expr); break;
     case TY_JSON: buf_printf(b, "{ xs_str *j_ = %s; xs_sb_put(sb, j_->data, (size_t)j_->len); }", expr); break; /* embedded as is */
     case TY_ENUM: buf_printf(b, t->en->is_string ? "xs_sb_str(sb, %s);" : "xs_sb_int(sb, %s);", expr); break;
+    case TY_UNION: /* (primitives only): held as an unknown is */
     case TY_UNKNOWN: json_unknown_used = true; buf_printf(b, "xs_json_unknown(sb, %s);", expr); break; /* by its type at run time */
     case TY_OBJECT:
         if (t->cls->builtin && strcmp(t->cls->name, "Date") == 0) { buf_printf(b, "xs_sb_date(sb, %s);", expr); break; }
@@ -1412,6 +1413,7 @@ static void json_emit_read(Buf *b, Type *t, const char *jv, const char *where) {
     case TY_BOOLEAN: buf_printf(b, "xs_json_bool(%s, \"%s\")", jv, where); break;
     case TY_STRING: buf_printf(b, "xs_json_str(%s, \"%s\")", jv, where); break;
     case TY_JSON: buf_printf(b, "xs_json_text(%s)", jv); break; /* any value, kept as its JSON text (an object[] read back) */
+    case TY_UNION: /* (primitives only, json_ok): held as an unknown is */
     case TY_UNKNOWN: buf_printf(b, "xs_jv_any(%s)", jv); (void)where; break; /* a value of its own kind: number, string, boolean, null, unknown[] or Record */
     case TY_OBJECT:
         if (t->cls->builtin && strcmp(t->cls->name, "Date") == 0) { buf_printf(b, "xs_json_date(%s, \"%s\")", jv, where); break; }
@@ -2461,7 +2463,7 @@ static Class *json_capable_stack[64];
 static int json_capable_depth;
 static bool json_capable(Type *t) {
     switch (t->kind) {
-    case TY_NUMBER: case TY_INT: case TY_BOOLEAN: case TY_STRING: case TY_ENUM: case TY_JSON: case TY_UNKNOWN: return true;
+    case TY_NUMBER: case TY_INT: case TY_BOOLEAN: case TY_STRING: case TY_ENUM: case TY_JSON: case TY_UNKNOWN: case TY_UNION: return true;
     case TY_ARRAY: case TY_NULLABLE: return json_capable(t->elem);
     case TY_OBJECT: {
         if (t->cls->builtin) return false;

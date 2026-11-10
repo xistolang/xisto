@@ -6912,6 +6912,7 @@ XS_NOINLINE int xs_buf_enc(xs_str *e) { /* 0 utf8, 1 base64, 2 base64url, 3 hex,
     if (!strcmp(t, "hex")) return 3;
     if (!strcmp(t, "latin1") || !strcmp(t, "binary")) return 4;
     if (!strcmp(t, "ascii")) return 5;
+    if (!strcmp(t, "xisto:raw")) return 6; /* the bytes as they are, in a string (packages: a Buffer body over http) */
     xs_panicf("TypeError: Unknown encoding: %s", e->data);
     return 0;
 }
@@ -6987,6 +6988,7 @@ XS_NOINLINE xs_str *xs_buf_to_string(xs_Uint8Array *b, xs_str *enc, int64_t star
     case 1: return xs_b64_enc_(p, n, false, true);
     case 2: return xs_b64_enc_(p, n, true, false);
     case 3: return xs_hex_encode(p, n);
+    case 6: return xs_str_new((const char *)p, (size_t)n);
     default: { /* latin1 / ascii: each byte a code point (ascii drops the high bit) */
         bool ascii = xs_buf_enc(enc) == 5;
         xs_sb sb = {0};

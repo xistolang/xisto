@@ -291,6 +291,8 @@ struct Expr {
     void *ctx;         /* checker: where its names resolve when that is not where it is checked (a parameter's default) */
     bool unset;        /* E_NULL: the start of `let x: Cls;` (assigned before any read, TypeScript checks it) */
     bool boolean;      /* E_BOOL */
+    bool prechecked;   /* checked already (its type is final): check_expr leaves it as it is */
+    bool want_tuple;   /* E_ARRAY_LIT: [k, v] returned to new Map(xs.map(...)): a tuple, as TypeScript reads it there */
     char *str;         /* E_STRING literal, E_IDENT name, E_MEMBER member name, E_NEW_OBJ class name */
     TokKind op;
     Expr *lhs, *rhs;
