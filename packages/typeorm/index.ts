@@ -466,6 +466,23 @@ export class PostgresDriver extends Driver {
 }
 
 // oracle: any pool with node-oracledb's shape, given as functions (the oracledb package builds them)
+const NO_BINDS: unknown[] = [];
+/** Binds by name (Oracle's :name), carried through the params array as its one element: query(sql, { id: 7 }) */
+export class NamedBinds {
+  binds: Record<string, unknown>;
+  constructor(binds: Record<string, unknown>) {
+    this.binds = binds;
+  }
+}
+/** query(sql, [a, b]) by position, query(sql, { a, b }) by name (Oracle) */
+export function bindsArg(params: Record<string, unknown> | unknown[]): unknown[] {
+  if (Array.isArray(params)) {
+    return params;
+  }
+  const named: unknown[] = [new NamedBinds(params)];
+  return named;
+}
+
 export interface OracleConnectionFunctions {
   execute: (sql: string, binds: unknown[]) => Promise<object>; // {"rows":[{COLUMN: value}],"rowsAffected":n,"outBinds":...}
   commit: () => Promise<void>;
@@ -564,7 +581,15 @@ export class OracleDriver extends Driver {
 // connectString from options.connectString, or host:port/serviceName (database or sid as the service otherwise)
 function oracleConnection(c: Connection): OracleConnectionFunctions {
   return {
-    execute: async (sql: string, binds: unknown[]): Promise<object> => c.execute(sql, binds, { outFormat: OUT_FORMAT_OBJECT }),
+    execute: async (sql: string, binds: unknown[]): Promise<object> => {
+      if (binds.length === 1) {
+        const first = binds[0];
+        if (first instanceof NamedBinds) {
+          return c.executeNamed(sql, first.binds, { outFormat: OUT_FORMAT_OBJECT });
+        }
+      }
+      return c.execute(sql, binds, { outFormat: OUT_FORMAT_OBJECT });
+    },
     commit: async (): Promise<void> => {
       await c.commit();
     },
@@ -1170,8 +1195,8 @@ export class Repository<T> {
     return entity;
   }
 
-  async query<T = any>(sql: string, params: unknown[] = []): Promise<T> {
-    const raw: object = await this.executor.rows(sql, params);
+  async query<T = any>(sql: string, params: Record<string, unknown> | unknown[] = NO_BINDS): Promise<T> {
+    const raw: object = await this.executor.rows(sql, bindsArg(params));
     const rows: T = raw; // query<Row[]>(...) decodes the rows as Row[], like TypeORM's query<T>
     return rows;
   }
@@ -1728,8 +1753,8 @@ export class EntityManager {
   get connection(): DataSource {
     return this.executor.dataSource;
   }
-  async query<T = any>(sql: string, params: unknown[] = []): Promise<T> {
-    const raw: object = await this.executor.rows(sql, params);
+  async query<T = any>(sql: string, params: Record<string, unknown> | unknown[] = NO_BINDS): Promise<T> {
+    const raw: object = await this.executor.rows(sql, bindsArg(params));
     const rows: T = raw; // query<Row[]>(...) decodes the rows as Row[], like TypeORM's query<T>
     return rows;
   }
@@ -1737,8 +1762,8 @@ export class EntityManager {
    * TypeORM's QueryResult ({ records, affected, raw }), what queryRunner.query(sql, params, true) returns: for
    * Oracle the rows of a query, rowsAffected of DML, or a PL/SQL block's outBinds (records when by position)
    */
-  async queryResult<T = object>(sql: string, params: unknown[] = []): Promise<T> {
-    const r = await this.executor.run(sql, params);
+  async queryResult<T = object>(sql: string, params: Record<string, unknown> | unknown[] = NO_BINDS): Promise<T> {
+    const r = await this.executor.run(sql, bindsArg(params));
     const rows = get(r, "rows");
     const out = get(r, "outBinds");
     const ra = get(r, "rowsAffected");
@@ -1835,7 +1860,7 @@ export class QueryRunner {
   }
 
   /** raw SQL on this runner's connection; useStructuredResult: TypeORM's QueryResult (see EntityManager.queryResult) */
-  async query<T = any>(sql: string, params: unknown[] = [], useStructuredResult: boolean = false): Promise<T> {
+  async query<T = any>(sql: string, params: Record<string, unknown> | unknown[] = NO_BINDS, useStructuredResult: boolean = false): Promise<T> {
     await this.connect();
     if (useStructuredResult) {
       return this.manager.queryResult<T>(sql, params);
@@ -1896,7 +1921,7 @@ export class DataSource {
   }
 
   /** raw SQL with the dialect's binds ($1 for postgres, :1 for oracle); the rows as an object to decode */
-  async query<T = any>(sql: string, params: unknown[] = []): Promise<T> {
+  async query<T = any>(sql: string, params: Record<string, unknown> | unknown[] = NO_BINDS): Promise<T> {
     return this.manager.query<T>(sql, params);
   }
 

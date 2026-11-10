@@ -79,3 +79,12 @@ const worker = (): number => ++calls;
 console.log(Array.from({ length: 2 }, worker), Array.from([1, 2, 3], (x) => x * 10));
 function idString(id: number): string { return typeof id === 'object' && id !== null ? Object.values(id).join('/') : String(id); }
 console.log(idString(42));
+const order = (a: number, b: number): number => a - b;
+interface NS { n: number; s: string }
+const byName = (x: NS, y: NS): number => order(x.n, y.n) || x.s.localeCompare(y.s);
+const nss: NS[] = [{ n: 1, s: 'b' }, { n: 1, s: 'a' }, { n: 0, s: 'z' }];
+console.log(nss.sort(byName).map((v) => v.s).join(''));
+const pct = 12.345;
+console.log(+pct.toFixed(2), [...new Set([3, 1, 3, 2])].join(','));
+function when(v: Date | string): string { return new Date(v).toISOString(); }
+console.log(when('2024-01-02T03:04:05Z'), when(new Date(0)));
