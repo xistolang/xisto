@@ -1367,6 +1367,7 @@ static char *type_tag(Type *t) {
     case TY_ENUM: return t->en->is_string ? "str" : "int";
     case TY_ARRAY: return xs_sprintf("arr_%s", type_tag(t->elem));
     case TY_OBJECT: return xs_sprintf("obj_%s", t->cls->cname);
+    case TY_MAP: return xs_sprintf("rec_%s_%s", type_tag(t->key), type_tag(t->elem));
     default: return "x";
     }
 }
@@ -1433,7 +1434,23 @@ static void ensure_json(Type *t) {
     Buf local = {0};
     Buf *b = &local;
     char *tag = type_tag(t);
-    if (t->kind == TY_ARRAY) {
+    if (t->kind == TY_MAP) { /* a Record<string, V>: an object, its keys in insertion order */
+        int vk = val_kind(t->elem);
+        const char *vexpr = vk == 3 ? xs_sprintf("((%s)e->val.p)", ctype(t->elem)) : vk == 0 ? "e->val.d" : vk == 1 ? "e->val.i" : "(bool)e->val.i";
+        buf_printf(b, "static void json_put_%s(xs_sb *sb, xs_map *m);\nstatic xs_map *json_get_%s(xs_jv *v, const char *where);\n", tag, tag);
+        buf_printf(b, "static void json_put_%s(xs_sb *sb, xs_map *m) {\n    xs_sb_put(sb, \"{\", 1);\n    bool first = true;\n    xs_map_entry *e;\n"
+                      "    XS_MAP_EACH(m, e) {\n        if (!first) xs_sb_put(sb, \",\", 1);\n        first = false;\n        xs_sb_str(sb, e->skey);\n        xs_sb_put(sb, \":\", 1);\n        ", tag);
+        json_emit_value(b, t->elem, vexpr);
+        buf_puts(b, "\n    }\n    xs_sb_put(sb, \"}\", 1);\n}\n");
+        buf_printf(b, "static xs_map *json_get_%s(xs_jv *v, const char *where) {\n    if (v->kind != XJ_OBJ) xs_json_obj(v, where);\n"
+                      "    xs_map *m = xs_map_rec(xs_map_new(1, 1, %d, xs_print_str_quoted_, %s));\n    for (size_t i = 0; i < v->n; i++) {\n        xs_str *k_ = xs_str_new(v->keys[i], strlen(v->keys[i]));\n        xs_map_set_s(m, k_, ",
+                   tag, vk, map_val_printer(t->elem));
+        buf_puts(b, vk == 3 ? "XS_VPTR(" : vk == 0 ? "XS_VNUM(" : vk == 1 ? "XS_VINT(" : "XS_VBOOL(");
+        json_emit_read(b, t->elem, "v->items[i]", "object value");
+        buf_puts(b, "));\n        xs_release(k_); /* the map keeps its own reference */\n    }\n    return m;\n}\n");
+        buf_puts(&json_fns, local.data);
+        return;
+    } else if (t->kind == TY_ARRAY) {
         const char *st = arr_struct(t);
         buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *a);\nstatic %s *json_get_%s(xs_jv *v, const char *where);\n", tag, st, st, tag);
         buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *a) {\n    xs_sb_put(sb, \"[\", 1);\n    for (size_t i = 0; i < a->len; i++) {\n        if (i) xs_sb_put(sb, \",\", 1);\n        ", tag, st);
@@ -2489,6 +2506,12 @@ static void emit_expr_raw(Expr *e) {
         }
         if (e->op == TK_DOT) { /* a union narrowed to one member: the test already proved it */
             Type *t = e->type;
+            Type *lt = e->lhs->type;
+            if (t->kind == TY_OBJECT && is_error_class(t->cls) && lt && lt->kind == TY_OBJECT && lt->cls->builtin && strcmp(lt->cls->name, "Error") == 0) {
+                buf_printf(out, "((%s)xs_Error_thrown(%s))", ctype(t), b.data); /* catch (e) { if (e instanceof X) e.code } */
+                free(b.data);
+                return;
+            }
             if (t->kind == TY_NUMBER) buf_printf(out, "xs_as_num(%s)", b.data);
             else if (t->kind == TY_INT || (t->kind == TY_ENUM && !t->en->is_string)) buf_printf(out, "xs_as_int(%s)", b.data);
             else if (t->kind == TY_BOOLEAN) buf_printf(out, "xs_as_bool(%s)", b.data);
@@ -2623,6 +2646,7 @@ static void emit_expr_raw(Expr *e) {
         }
         bool is_map = t->kind == TY_MAP;
         Type *k = is_map ? t->key : t->elem;
+        if (is_map && t->record) buf_puts(out, "xs_map_rec(");
         if (e->args.len == 1) buf_puts(out, "({ xs_map *nm_ = ");
         buf_printf(out, "xs_map_new(%d, %d, %d, %s, %s)", is_map ? 1 : 0, k->kind == TY_STRING ? 1 : 0, is_map ? val_kind(t->elem) : 1,
                    k->kind == TY_STRING ? "xs_print_str_quoted_" : "xs_print_int_v", is_map ? map_val_printer(t->elem) : "0");
@@ -2643,6 +2667,7 @@ static void emit_expr_raw(Expr *e) {
             }
             buf_puts(out, "} nm_; })");
         }
+        if (is_map && t->record) buf_puts(out, ")");
         return;
     }
     case E_ENUM_VAL:
@@ -2907,6 +2932,22 @@ static void emit_expr_raw(Expr *e) {
         }
         if (e->op == TK_IDENT) { /* instanceof: the same identity test as `as` */
             Class *c = e->rhs->cls;
+            Type *lt = e->lhs->type;
+            bool l_err = lt->kind == TY_OBJECT && lt->cls->builtin && strcmp(lt->cls->name, "Error") == 0;
+            if (lt->kind == TY_OBJECT && is_error_class(lt->cls) && strcmp(c->name, "Error") == 0 && c->builtin) {
+                buf_puts(out, "((void *)("); /* an object of a class that extends Error is an Error */
+                emit_expr(e->lhs);
+                buf_puts(out, ") != NULL)");
+                return;
+            }
+            if (l_err && is_error_class(c)) { /* a caught Error: the class of the object it was thrown as */
+                if (in_hierarchy(c)) buf_printf(out, "%s(xs_Error_thrown((void *)(", isa_fn(c));
+                else buf_printf(out, "xs_is_a(xs_Error_thrown((void *)(");
+                emit_expr(e->lhs);
+                if (in_hierarchy(c)) buf_puts(out, ")))");
+                else buf_printf(out, ")), %s_free)", c->cname);
+                return;
+            }
             if (in_hierarchy(c)) {
                 buf_printf(out, "%s((void *)(", isa_fn(c));
                 emit_expr(e->lhs);

@@ -110,6 +110,7 @@ typedef enum {
     TK_AMP_ASSIGN, TK_PIPE_ASSIGN, TK_CARET_ASSIGN, TK_SHL_ASSIGN, TK_SHR_ASSIGN, TK_USHR_ASSIGN,
     /* null: a ?? b, a ??= b, a?.b (xisto's only empty value is null; see MANIFESTO, "null, não undefined") */
     TK_QQ, TK_QQ_ASSIGN, TK_QDOT,
+    TK_IN, /* (an operator only: "key" in obj; the lexer reads in as a name) */
 } TokKind;
 
 typedef struct {
@@ -192,6 +193,8 @@ typedef struct Type {
     bool absent;          /* TY_NULLABLE of an optional field or parameter (x?: T): its null is JavaScript's undefined, so it
                              prints as undefined (JSON leaves the field out); the same type as T | null otherwise */
     struct Type *key;     /* TY_MAP */
+    bool record;          /* TY_MAP written Record<K, V> (or an object used as a dictionary): read and written as an object
+                             (m[k], m.k, Object.keys, k in m; JSON and console.log print it as an object) */
     Class *cls;           /* TY_OBJECT */
     Enum *en;             /* TY_ENUM */
     struct Type **params; /* TY_FUNC */
@@ -520,7 +523,25 @@ struct Class {
     struct Func **smethods;
     int nsmethods;
     Type *alias;       /* type Name = A | B: a name for another type (not an object shape) */
+    bool extends_error; /* class X extends Error: fields message and name first, laid out as the runtime's Error */
+    struct Mixin *mixin; /* class X extends PartialType(Y) (OmitType, PickType, IntersectionType): Y's fields copied in */
+    bool mixin_done;
 };
+/* PartialType(Y), OmitType(Y, ["a"] as const), PickType(Y, ["a"]), IntersectionType(A, B): the mapped types of
+   @nestjs/swagger (and @nestjs/mapped-types), a class or another mapped type as each argument */
+typedef struct Mixin {
+    const char *kind;  /* "PartialType", ...; NULL: just the class */
+    const char *cls;
+    Pos pos;
+    struct Mixin *a, *b;
+    char **keys;
+    int nkeys;
+} Mixin;
+/* a class that extends Error, directly or through its bases */
+static inline bool is_error_class(struct Class *c) {
+    for (; c; c = c->base) if (c->extends_error) return true;
+    return false;
+}
 
 typedef struct {
     char *name;
