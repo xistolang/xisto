@@ -1,6 +1,7 @@
 // nestjs-pino for xisto: LoggerModule.forRoot() provides a Logger that writes pino's JSON lines, and once it is
 // built every Nest Logger line goes through it too (what app.useLogger(app.get(Logger)) does in Nest).
-import { DynamicModule, Injectable, Logger as NestLogger, LoggerService, Module } from "@nestjs/common";
+import { __overrideLogger, DynamicModule, Injectable, LoggerService, Module } from "@nestjs/common";
+import { hostname } from "xisto:os";
 
 /** pino's numeric levels. */
 const LEVELS: Map<string, int> = new Map<string, int>([
@@ -14,17 +15,40 @@ const LEVELS: Map<string, int> = new Map<string, int>([
   ["trace", 10],
 ]);
 
-/** Options of LoggerModule.forRoot (pinoHttp.level is honored; the rest is accepted). */
+/** pino's level labels, as ECS lines name them (Nest's log is info, verbose is trace). */
+const LABELS: Map<string, string> = new Map<string, string>([
+  ["fatal", "fatal"],
+  ["error", "error"],
+  ["warn", "warn"],
+  ["log", "info"],
+  ["info", "info"],
+  ["debug", "debug"],
+  ["verbose", "trace"],
+  ["trace", "trace"],
+]);
+
+/**
+ * Options of LoggerModule.forRoot: pinoHttp.level is honored, and @elastic/ecs-pino-format's ecsFormat() fills
+ * the ECS ones (messageKey, ecsVersion, serviceName); the rest is accepted.
+ */
 export class PinoHttpOptions {
   level?: string;
+  messageKey?: string;
+  ecsVersion?: string;
+  serviceName?: string;
 }
+/** renameContext: the key the context goes under ("log.logger" with ECS). */
 export class LoggerModuleParams {
   pinoHttp?: PinoHttpOptions;
+  renameContext?: string;
 }
 
-const state: PinoState = { min: 30 };
+const state: PinoState = { min: 30, ecsVersion: "", serviceName: "", contextKey: "context" };
 interface PinoState {
   min: int;
+  ecsVersion: string; // "" : pino's own lines
+  serviceName: string;
+  contextKey: string;
 }
 
 class PinoLine {
@@ -36,9 +60,27 @@ class PinoLine {
   msg: string;
 }
 
+// @elastic/ecs-pino-format's line: {"log.level","@timestamp","process.pid","host.hostname","ecs.version",
+// "service.name","event.dataset", the context, "message"}
+function ecsLine(level: string, message: string, context: string): string {
+  let line = `{"log.level":${JSON.stringify(LABELS.get(level) ?? "info")},"@timestamp":${JSON.stringify(new Date().toISOString())}`;
+  line += `,"process.pid":${process.pid},"host.hostname":${JSON.stringify(hostname())},"ecs.version":${JSON.stringify(state.ecsVersion)}`;
+  if (state.serviceName.length > 0) {
+    line += `,"service.name":${JSON.stringify(state.serviceName)},"event.dataset":${JSON.stringify(state.serviceName)}`;
+  }
+  if (context.length > 0) {
+    line += `,${JSON.stringify(state.contextKey)}:${JSON.stringify(context)}`;
+  }
+  return line + `,"message":${JSON.stringify(message)}}`;
+}
+
 function write(level: string, message: string, context: string): void {
-  const n = LEVELS.get(level) || 30;
+  const n = LEVELS.has(level) ? LEVELS.get(level) : 30;
   if (n < state.min) {
+    return;
+  }
+  if (state.ecsVersion.length > 0) {
+    console.log(ecsLine(level, message, context));
     return;
   }
   const line: PinoLine = { level: n, time: Date.now(), pid: process.pid, hostname: process.env.get("HOSTNAME") ?? "localhost", msg: message };
@@ -62,7 +104,7 @@ export class Logger {
       debug: (m: string, c: string): void => write("debug", m, c),
       verbose: (m: string, c: string): void => write("verbose", m, c),
     };
-    NestLogger.overrideLogger(target);
+    __overrideLogger(target);
   }
   log(message: string, context: string = ""): void {
     write("log", message, context);
@@ -89,9 +131,12 @@ export class LoggerModule {
     if (http !== null) {
       const lv = http.level;
       if (lv !== null) {
-        state.min = LEVELS.get(lv) || 30;
+        state.min = LEVELS.has(lv) ? LEVELS.get(lv) : 30;
       }
+      state.ecsVersion = http.ecsVersion ?? "";
+      state.serviceName = http.serviceName ?? "";
     }
+    state.contextKey = params.renameContext ?? "context";
     return { module: LoggerModule, providers: [Logger], exports: [Logger], global: true };
   }
 }
