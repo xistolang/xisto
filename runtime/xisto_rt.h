@@ -272,6 +272,7 @@ static __attribute__((noinline)) void xs_insp_end(xs_insp *fr, const char *open,
 #define XS_NULL_INT INT64_MIN
 #define XS_NULL_BOOL ((int8_t)2)
 #define XS_NULL_NUM_BITS 0x7FF4000000000001ull
+static inline double xs_bool_to_number(bool b) { return b ? 1.0 : 0.0; } /* Number(true) */
 static inline double xs_null_num(void) { union { uint64_t u; double d; } x = { XS_NULL_NUM_BITS }; return x.d; }
 static inline bool xs_isnull_num(double d) { union { double d; uint64_t u; } x = { d }; return x.u == XS_NULL_NUM_BITS; }
 /* user functions: one source frame = one machine frame, for stack traces (see "stack traces") */
@@ -3170,9 +3171,21 @@ XS_MAP_ALL_TO(xs_arr_num, double, num)
 XS_MAP_ALL_TO(xs_arr_int, int64_t, int)
 XS_MAP_ALL_TO(xs_arr_bool, bool, bool)
 XS_MAP_ALL_TO(xs_arr_ref, void *, ref)
+/* (`bool` is a macro of <stdbool.h>: the names pasted with it came out as _Bool; the emitter writes bool) */
+#define xs_arr_map_bool_num xs_arr_map__Bool_num
+#define xs_arr_map_bool_int xs_arr_map__Bool_int
+#define xs_arr_map_bool_bool xs_arr_map__Bool_bool
+#define xs_arr_map_bool_ref xs_arr_map__Bool_ref
 
 /* indexOf / join by value */
-static int64_t xs_arr_index_of_num(xs_arr_num *a, double v) { for (size_t i = 0; i < a->len; i++) if (a->data[i] == v) return (int64_t)i; return -1; }
+static int64_t xs_arr_index_of_num(xs_arr_num *a, double v) {
+    if (xs_isnull_num(v)) { /* null in a (number | null)[]: the sentinel, by its bits */
+        for (size_t i = 0; i < a->len; i++) if (xs_isnull_num(a->data[i])) return (int64_t)i;
+        return -1;
+    }
+    for (size_t i = 0; i < a->len; i++) if (a->data[i] == v) return (int64_t)i;
+    return -1;
+}
 static int64_t xs_arr_index_of_int(xs_arr_int *a, int64_t v) { for (size_t i = 0; i < a->len; i++) if (a->data[i] == v) return (int64_t)i; return -1; }
 static int64_t xs_arr_index_of_bool(xs_arr_bool *a, bool v) { for (size_t i = 0; i < a->len; i++) if (a->data[i] == v) return (int64_t)i; return -1; }
 /* strings by content; in a (string | null)[] null matches null */
@@ -3328,6 +3341,7 @@ static inline int64_t xs_to_int(double x) { return xs_to_int_s(x, NULL); }
 static inline int64_t xs_floor_int(double x) { return xs_to_int(floor(x)); }
 static inline int64_t xs_ceil_int(double x) { return xs_to_int(ceil(x)); }
 static inline int64_t xs_trunc_int(double x) { return xs_to_int(trunc(x)); }
+static int64_t xs_trunc_int_or_null(double d) { return xs_isnull_num(d) ? XS_NULL_INT : xs_trunc_int(d); } /* number | null where int | null goes */
 static inline int64_t xs_round_int(double x) {
     double r = floor(x);
     if (x - r >= 0.5) r += 1;
@@ -4142,6 +4156,23 @@ XS_PRINT_ARRAY(xs_arr_bool, xs_print_bool, false)
 #define xs_print_arr_num xs_print_xs_arr_num
 #define xs_print_arr_int xs_print_xs_arr_int
 #define xs_print_arr_bool xs_print_xs_arr_bool
+/* (number | null)[] / (int | null)[]: the null sentinel prints as null */
+static void xs_print_num_or_null_(double d) { if (xs_isnull_num(d)) fputs("null", XS_OUT); else xs_print_num(d); }
+static void xs_print_int_or_null_(int64_t v) { if (v == XS_NULL_INT) fputs("null", XS_OUT); else xs_print_int(v); }
+#define XS_PRINT_ARRAY_N(fname, st, printer)                          \
+    static void fname(void *p) {                                      \
+        st *a = p;                                                    \
+        xs_insp fr;                                                   \
+        if (!xs_insp_begin(&fr, p, "Array", a->len ? NULL : "[]")) return; \
+        for (size_t i = 0; i < a->len && i < 100; i++) {              \
+            xs_insp_entry(&fr);                                       \
+            printer(a->data[i]);                                      \
+        }                                                             \
+        if (a->len > 100) { xs_insp_entry(&fr); fprintf(XS_OUT, "... %zu more item%s", a->len - 100, a->len - 101 ? "s" : ""); } \
+        xs_insp_end(&fr, "[", "]", true, true, a->len > 100);         \
+    }
+XS_PRINT_ARRAY_N(xs_print_arr_num_n, xs_arr_num, xs_print_num_or_null_)
+XS_PRINT_ARRAY_N(xs_print_arr_int_n, xs_arr_int, xs_print_int_or_null_)
 
 /* ---- internal indicators ----
    Built with --profile, every function counts calls and time; the table goes to stderr at exit.
@@ -5006,6 +5037,8 @@ static xs_str *xs_process_cwd(void) { /* process.cwd() */
     return xs_str_new(b, strlen(b));
 }
 static void xs_process_exit(int64_t code) { fflush(stdout); exit((int)code); }
+static int xs_exit_code_; /* process.exitCode: the status when the program ends on its own */
+static int64_t xs_process_set_exit_code(int64_t code) { xs_exit_code_ = (int)code; return code; }
 /* process.stdout.write / process.stderr.write: through the same FILE as console.log, so the order is kept */
 static inline void xs_out_drain(void);
 static bool xs_stdout_write_str(xs_str *s) { xs_out_drain(); fwrite(s->data, 1, (size_t)s->len, XS_OUT); return true; }
@@ -8040,6 +8073,38 @@ XS_NOINLINE xs_big *xs_big_from_str(xs_str *s) {
     if (!ok) xs_panicf("SyntaxError: Cannot convert %s to a BigInt", s->data);
     return r;
 }
+/* JSON into a bigint (a row's NUMBER column typed bigint): the number, or its digits as text */
+XS_NOINLINE xs_big *xs_json_big(xs_jv *v, const char *where) {
+    if (v->kind == XJ_NUM) return xs_big_from_num(v->num);
+    if (v->kind != XJ_STR) xs_panicf("JSON: '%s' must be a bigint (a number or its digits)", where);
+    xs_str *s = xs_str_new(v->str, v->slen);
+    xs_big *r = xs_big_from_str(s);
+    xs_release(s);
+    return r;
+}
+/* JSON into a Buffer: the hex text a BLOB column comes as, or what JSON.stringify writes for one,
+   {"type":"Buffer","data":[1,2,3]} */
+XS_NOINLINE xs_Uint8Array *xs_json_buf(xs_jv *v, const char *where) {
+    if (v->kind == XJ_STR) {
+        xs_str *s = xs_str_new(v->str, v->slen), *enc = xs_str_new("hex", 3);
+        xs_Uint8Array *b = xs_buf_from_str(s, enc);
+        xs_release(s);
+        xs_release(enc);
+        return b;
+    }
+    xs_jv *d = NULL;
+    if (v->kind == XJ_OBJ)
+        for (size_t i = 0; i < v->n; i++) if (strcmp(v->keys[i], "data") == 0) d = v->items[i];
+    if (!d || d->kind != XJ_ARR) xs_panicf("JSON: '%s' must be bytes (hex text or {\"type\":\"Buffer\",\"data\":[...]})", where);
+    xs_Uint8Array *b = xs_u8_raw((int64_t)d->n, true, false);
+    for (size_t i = 0; i < d->n; i++) b->data[i] = d->items[i]->kind == XJ_NUM ? (uint8_t)(int64_t)d->items[i]->num : 0;
+    return b;
+}
+static void xs_sb_buf(xs_sb *sb, xs_Uint8Array *b) { /* JSON.stringify of a Buffer, as Node writes it */
+    xs_sb_put(sb, "{\"type\":\"Buffer\",\"data\":[", 25);
+    for (int64_t i = 0; i < b->f_length; i++) { if (i) xs_sb_put(sb, ",", 1); xs_sb_int(sb, b->data[i]); }
+    xs_sb_put(sb, "]}", 2);
+}
 
 /* ---- program start / end ---- */
 
@@ -8449,6 +8514,7 @@ static void xs_exit(void) {
         if (xs_gc_runs) fprintf(stderr, "xisto: cycle collector: %lld objects in cycles freed, %lld runs\n", (long long)xs_gc_freed, (long long)xs_gc_runs);
     }
     xs_prof_report();
+    if (xs_exit_code_) exit(xs_exit_code_);
 }
 
 /* ---- xisto:parallel: a pool of threads for the calls of fn (emit.c emit_par_variant) ----

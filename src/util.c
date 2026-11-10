@@ -257,11 +257,17 @@ void xs_warn_rule_summary(void) {
     fprintf(stderr, "): --warnings lists them, xisto check --details shows where\n");
 }
 
-/* a use of any: compiles (the dynamic path), so it is no change to make; xisto check lists it apart */
+/* a use of any: it compiles (the dynamic path) with warning XS2007, which says what it costs (measured: a field read
+   through any ~7 ns against ~0.6 ns typed; a class instance seen as any keeps its struct, no extra memory; an object
+   made as any is a Record, more memory than a struct) */
 void xs_note_dynamic(Pos pos) {
-    if (!xs_check_mode || !xs_json_errors) return;
-    report(XS2007, "note", pos, "a declared type (an interface, a class, Record<string, T>) takes the typed path, with no check at run time",
-           "'any' takes the dynamic path: read and written by name, checked at run time (slower than a typed value)");
+    xs_warn_rule(XS2007, pos, "declare a type (an interface, a class, Record<string, T>) to take the typed path",
+                 "'any' takes the dynamic path: each access is looked up by name and checked at run time (about 10x slower than a typed access)");
+}
+void xs_note_dynamic_record(Pos pos) {
+    xs_warn_rule(XS2007, pos, "declare a type (an interface, a class, Record<string, T>) to take the typed path",
+                 "'any' takes the dynamic path: each access is looked up by name and checked at run time (about 10x slower than a typed access), "
+                 "and it is stored as a Record, which uses more memory than a typed object");
 }
 
 static int edit_distance(const char *a, const char *b) {

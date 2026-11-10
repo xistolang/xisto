@@ -47,6 +47,12 @@ static char *not_null(Type *t, const char *expr) {
     }
 }
 static bool int_like(Type *t) { return t->kind == TY_INT || (t->kind == TY_ENUM && !t->en->is_string); }
+/* the element type that picks an array's C struct: (number | null)[] and (int | null)[] are number[] and int[]
+   holding the null sentinel (xs_null_num / XS_NULL_INT), as a T | null variable does */
+static Type *arr_ek(Type *elem) {
+    if (elem->kind == TY_NULLABLE && (elem->elem->kind == TY_NUMBER || int_like(elem->elem))) return elem->elem;
+    return elem;
+}
 
 bool xs_profile;
 bool xs_debug;
@@ -797,7 +803,7 @@ static const char *ctype(Type *t) {
     case TY_BOOLEAN: return "bool";
     case TY_STRING: return "xs_str *";
     case TY_VOID: return "void";
-    case TY_ARRAY: return t->elem->kind == TY_NUMBER ? "xs_arr_num *" : int_like(t->elem) ? "xs_arr_int *" : t->elem->kind == TY_BOOLEAN ? "xs_arr_bool *" : "xs_arr_ref *";
+    case TY_ARRAY: return arr_ek(t->elem)->kind == TY_NUMBER ? "xs_arr_num *" : int_like(arr_ek(t->elem)) ? "xs_arr_int *" : t->elem->kind == TY_BOOLEAN ? "xs_arr_bool *" : "xs_arr_ref *";
     case TY_OBJECT: return xs_sprintf("%s *", t->cls->cname);
     case TY_FUNC: return "xs_closure *";
     case TY_ENUM: return t->en->is_string ? "xs_str *" : "int64_t";
@@ -842,8 +848,13 @@ static Buf tramp_fns;     /* trampolines turning top-level functions into closur
 static int ntramps;
 static char **tramp_names;
 
-static const char *arr_suffix(Type *arr) { return arr->elem->kind == TY_NUMBER ? "num" : int_like(arr->elem) ? "int" : arr->elem->kind == TY_BOOLEAN ? "bool" : "ref"; }
+static const char *arr_suffix(Type *arr) { return arr_ek(arr->elem)->kind == TY_NUMBER ? "num" : int_like(arr_ek(arr->elem)) ? "int" : arr->elem->kind == TY_BOOLEAN ? "bool" : "ref"; }
 static bool arr_is_ref(Type *arr) { return cref(arr->elem); }
+/* console.log of an array: (number | null)[] and (int | null)[] print their nulls as null */
+static const char *arr_print_suffix(Type *arr) {
+    if (arr->elem->kind == TY_NULLABLE && arr_ek(arr->elem) != arr->elem) return arr_ek(arr->elem)->kind == TY_NUMBER ? "num_n" : "int_n";
+    return arr_suffix(arr);
+}
 /* a heap cell holding one variable that a closure shares (captured and reassigned): xs_cell_<C type> */
 static Buf cell_fns;
 static char **cell_made;
@@ -871,7 +882,7 @@ static const char *cell_struct(Type *t) {
     buf_printf(&cell_fns, "static %s *%s_new(void) { return xs_obj_alloc_t(sizeof(%s), &%s_type); }\n", n.data, n.data, n.data, n.data);
     return n.data;
 }
-static const char *arr_struct(Type *arr) { return arr_is_ref(arr) ? "xs_arr_ref" : arr->elem->kind == TY_NUMBER ? "xs_arr_num" : int_like(arr->elem) ? "xs_arr_int" : "xs_arr_bool"; }
+static const char *arr_struct(Type *arr) { return arr_is_ref(arr) ? "xs_arr_ref" : arr_ek(arr->elem)->kind == TY_NUMBER ? "xs_arr_num" : int_like(arr_ek(arr->elem)) ? "xs_arr_int" : "xs_arr_bool"; }
 static const char *elem_printer(Type *elem) {
     if (elem->kind == TY_NULLABLE) /* (T | null)[]: null prints as null */
         return elem->elem->kind == TY_STRING || (elem->elem->kind == TY_ENUM && elem->elem->en->is_string) ? "xs_print_str_quoted_or_null_" : "xs_print_obj_or_null";
@@ -879,7 +890,7 @@ static const char *elem_printer(Type *elem) {
     case TY_STRING: return "xs_print_str_quoted_";
     case TY_ENUM: return elem->en->is_string ? "xs_print_str_quoted_" : "0";
     case TY_OBJECT: return "xs_print_obj";
-    case TY_ARRAY: return xs_sprintf("xs_print_%s", arr_struct(elem));
+    case TY_ARRAY: return xs_sprintf("xs_print_arr_%s", arr_print_suffix(elem));
     case TY_MAP: case TY_SET: return "xs_print_map";
     case TY_FUNC: return "xs_print_obj"; /* a closure prints itself */
     case TY_UNION: case TY_UNKNOWN: return "xs_print_any_quoted"; /* strings quoted inside arrays, as Node */
@@ -1281,7 +1292,7 @@ static const char *printer_for(Type *t) {
     case TY_INT: case TY_LITINT: return "xs_print_int";
     case TY_BOOLEAN: return "xs_print_bool";
     case TY_STRING: case TY_JSON: return "xs_print_str";
-    case TY_ARRAY: return xs_sprintf("xs_print_arr_%s", arr_suffix(t));
+    case TY_ARRAY: return xs_sprintf("xs_print_arr_%s", arr_print_suffix(t));
     case TY_OBJECT: return "xs_print_obj";
     case TY_ENUM: return t->en->is_string ? "xs_print_str" : "xs_print_int";
     case TY_MAP: case TY_SET: return "xs_print_map";
@@ -1342,7 +1353,7 @@ static void emit_print_arg(Expr *a) {
     case TY_INT: case TY_LITINT: buf_puts(out, "xs_print_int("); break;
     case TY_BOOLEAN: buf_puts(out, "xs_print_bool("); break;
     case TY_STRING: buf_puts(out, "xs_print_str("); break;
-    case TY_ARRAY: buf_printf(out, "xs_print_arr_%s(", arr_suffix(a->type)); break;
+    case TY_ARRAY: buf_printf(out, "xs_print_arr_%s(", arr_print_suffix(a->type)); break;
     case TY_OBJECT: buf_puts(out, "xs_print_obj("); break;
     case TY_ENUM: buf_puts(out, a->type->en->is_string ? "xs_print_str(" : "xs_print_int("); break;
     case TY_UNION: case TY_UNKNOWN: buf_puts(out, "xs_print_obj_or_null("); break;
@@ -1394,6 +1405,8 @@ static void json_emit_value(Buf *b, Type *t, const char *expr) { /* appends into
     case TY_UNKNOWN: json_unknown_used = true; buf_printf(b, "xs_json_unknown(sb, %s);", expr); break; /* by its type at run time */
     case TY_OBJECT:
         if (t->cls->builtin && strcmp(t->cls->name, "Date") == 0) { buf_printf(b, "xs_sb_date(sb, %s);", expr); break; }
+        if (t->cls->builtin && strcmp(t->cls->name, "Buffer") == 0) { buf_printf(b, "xs_sb_buf(sb, %s);", expr); break; }
+        if (t->cls->builtin && strcmp(t->cls->name, "bigint") == 0) { buf_printf(b, "(void)(%s); xs_panic(\"TypeError: Do not know how to serialize a BigInt\");", expr); break; }
         ensure_json(t);
         buf_printf(b, "json_put_%s(sb, %s);", type_tag(t), expr);
         break;
@@ -1417,6 +1430,8 @@ static void json_emit_read(Buf *b, Type *t, const char *jv, const char *where) {
     case TY_UNKNOWN: buf_printf(b, "xs_jv_any(%s)", jv); (void)where; break; /* a value of its own kind: number, string, boolean, null, unknown[] or Record */
     case TY_OBJECT:
         if (t->cls->builtin && strcmp(t->cls->name, "Date") == 0) { buf_printf(b, "xs_json_date(%s, \"%s\")", jv, where); break; }
+        if (t->cls->builtin && strcmp(t->cls->name, "Buffer") == 0) { buf_printf(b, "xs_json_buf(%s, \"%s\")", jv, where); break; }
+        if (t->cls->builtin && strcmp(t->cls->name, "bigint") == 0) { buf_printf(b, "xs_json_big(%s, \"%s\")", jv, where); break; }
         ensure_json(t);
         buf_printf(b, "json_get_%s(%s, \"%s\")", type_tag(t), jv, where);
         break;
@@ -3511,7 +3526,8 @@ static void emit_expr_raw(Expr *e) {
         buf_puts(out, "(");
         for (int i = 0; i < e->args.len; i++) {
             if (i) buf_puts(out, ", ");
-            buf_puts(out, "(void)(");
+            bool val = i == e->args.len - 1 && e->type && e->type->kind != TY_VOID; /* (const r = <void call>: then null) */
+            buf_puts(out, val ? "(" : "(void)(");
             emit_expr(e->args.items[i]);
             buf_puts(out, ")");
         }
@@ -3567,7 +3583,7 @@ static void emit_expr_raw(Expr *e) {
             return;
         }
         buf_printf(out, "%s_lit(%d, (%s[]){", arr_struct(e->type), e->args.len,
-                   e->type->elem->kind == TY_NUMBER ? "double" : int_like(e->type->elem) ? "int64_t" : "bool");
+                   arr_ek(e->type->elem)->kind == TY_NUMBER ? "double" : int_like(arr_ek(e->type->elem)) ? "int64_t" : "bool");
         if (e->args.len == 0) buf_puts(out, "0");
         for (int i = 0; i < e->args.len; i++) {
             if (i) buf_puts(out, ", ");
@@ -8900,7 +8916,7 @@ static void emit_class(Class *c) {
         case TY_INT: buf_printf(out, "xs_print_int(self->%s);", fd->cname); break;
         case TY_BOOLEAN: buf_printf(out, "xs_print_bool(self->%s);", fd->cname); break;
         case TY_STRING: buf_printf(out, "xs_print_str_quoted(self->%s);", fd->cname); break;
-        case TY_ARRAY: buf_printf(out, "xs_print_arr_%s(self->%s);", arr_suffix(fd->type), fd->cname); break;
+        case TY_ARRAY: buf_printf(out, "xs_print_arr_%s(self->%s);", arr_print_suffix(fd->type), fd->cname); break;
         case TY_OBJECT: buf_printf(out, "xs_print_obj(self->%s);", fd->cname); break;
         case TY_ENUM: buf_printf(out, fd->type->en->is_string ? "xs_print_str_quoted(self->%s);" : "xs_print_int(self->%s);", fd->cname); break;
         case TY_NULLABLE:

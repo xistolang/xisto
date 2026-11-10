@@ -77,7 +77,8 @@ extern bool xs_check_mode; /* xisto check: report every error (no limit of 20) a
 extern int xs_quiet_count;   /* follow-on errors kept quiet (a use of a declaration that failed) */
 void xs_error_continue(DiagCode code, Pos pos, const char *help, const char *fmt, ...); /* report, count, go on */
 void xs_warn(Pos pos, const char *help, const char *fmt, ...);
-void xs_note_dynamic(Pos pos); /* xisto check: a use of any (the dynamic path), counted apart */
+void xs_note_dynamic(Pos pos); /* a use of any (the dynamic path): warning XS2007 with its cost */
+void xs_note_dynamic_record(Pos pos); /* an object made as any (a Record): XS2007 with the memory cost too */
 void xs_warn_rule(DiagCode code, Pos pos, const char *help, const char *fmt, ...); /* XB-118: compiles, with a warning */
 void xs_warn_rule_summary(void);
 extern bool xs_show_warnings, xs_deny_warnings;
@@ -431,6 +432,7 @@ struct Func {
     bool is_async;
     bool ret_promise;  /* declared to return Promise<T> (ret is T): async whether or not it is written async */
     Class *cls;        /* owning class for methods, else NULL */
+    Class *static_of;  /* a static method (lowered to Class__s_name): its class, which reaches its private members */
     bool is_ctor;
     char *cname;
     DecoList decos;

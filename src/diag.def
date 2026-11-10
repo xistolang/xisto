@@ -47,7 +47,7 @@ DIAG(XS2003, DC_DYNAMIC, "'%s | null' is not supported")
 DIAG(XS2004, DC_DYNAMIC, "'%s' cannot be part of a union")
 DIAG(XS2005, DC_DYNAMIC, "'%s' does not exist")
 DIAG(XS2006, DC_DYNAMIC, "'%s' may be null")
-DIAG(XS2007, DC_DYNPATH, "'any' takes the dynamic path: read and written by name, checked at run time (slower than a typed value)") /* until 11/11/2026: "'any' is not supported" (MANIFESTO, "Ponto importante: any") */
+DIAG(XS2007, DC_DYNPATH, "'any' takes the dynamic path: each access is looked up by name and checked at run time (about 10x slower than a typed access)") /* until 11/11/2026: "'any' is not supported" (MANIFESTO, "Ponto importante: any") */
 DIAG(XS2008, DC_DYNAMIC, "'null' alone is not a type")
 DIAG(XS2009, DC_DYNAMIC, "'undefined' is not a type")
 DIAG(XS2010, DC_DYNAMIC, "cannot check %s at run time")
