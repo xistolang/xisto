@@ -16,6 +16,8 @@ export class Request {
   headers: IncomingHttpHeaders = {};
   body: string = "";
   ip: string = "";
+  /** What an authentication guard put on the request (@nestjs/passport: validate()'s value). */
+  user: unknown = null;
   private readonly all: Map<string, string> = new Map<string, string>();
   private readonly queries: Map<string, string> = new Map<string, string>();
 

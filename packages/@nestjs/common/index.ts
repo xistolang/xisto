@@ -2,6 +2,7 @@
 // compiler builds for decorated classes (xisto:reflect). @nestjs/core reads it to build the application.
 import { ClassInfo, MethodInfo } from "xisto:reflect";
 import { Request, Response } from "express";
+import { Observable } from "rxjs";
 
 // ---- what the decorators record (first: decorated classes below register as soon as they are declared) ----
 export const __classes: Map<string, ClassInfo> = new Map<string, ClassInfo>();
@@ -15,6 +16,8 @@ export const __validated: Map<string, int[]> = new Map<string, int[]>();
 export const __settings: Map<string, MethodSetting[]> = new Map<string, MethodSetting[]>();
 export const __injects: Map<string, InjectDef[]> = new Map<string, InjectDef[]>();
 export const __catches: Map<string, string[]> = new Map<string, string[]>();
+// SetMetadata(key, value): "<class id>#<method index, -1 for the class>#<key>" -> value (what Reflector reads)
+export const __metadata: Map<string, unknown> = new Map<string, unknown>();
 export const __custom: CustomParam[] = [];
 // values a constructor parameter receives without a provider class: by token (@InjectRepository) or by the
 // parameter's type id (a DataSource TypeOrmModule.forRoot made). __values holds ready instances; __jsonValues the
@@ -270,12 +273,28 @@ export class GatewayTimeoutException extends HttpException {
 }
 
 /**
- * What a guard, a filter or a custom parameter decorator sees of the current request.
+ * The route method a request runs, as ExecutionContext.getHandler() gives it (Reflector reads its metadata).
+ * Node: the method's function; here its class, its index among the class's methods and its name.
+ */
+export class RouteHandler {
+  readonly cls: ClassInfo;
+  readonly index: int;
+  readonly name: string;
+  constructor(cls: ClassInfo, index: int, name: string) {
+    this.cls = cls;
+    this.index = index;
+    this.name = name;
+  }
+}
+
+/**
+ * What a guard, an interceptor, a filter or a custom parameter decorator sees of the current request.
  * @example ctx.switchToHttp().getRequest().headers.authorization
  */
 export class ExecutionContext {
   private readonly request: Request;
   private readonly response: Response;
+  private handler: RouteHandler | null = null;
   constructor(request: Request, response: Response) {
     this.request = request;
     this.response = response;
@@ -289,11 +308,46 @@ export class ExecutionContext {
   getResponse<T = Response>(): T {
     return this.response as unknown as T;
   }
+  /** "http": the kind of request (Nest also has "rpc" and "ws"). */
+  getType(): string {
+    return "http";
+  }
+  /** The route method that handles the request. */
+  getHandler(): RouteHandler {
+    const h = this.handler;
+    if (h === null) {
+      throw new Error("ExecutionContext.getHandler(): no route handler");
+    }
+    return h;
+  }
+  /** The controller class of the route. */
+  getClass(): ClassInfo {
+    return this.getHandler().cls;
+  }
+  // @nestjs/core: the route this context belongs to
+  setHandler(handler: RouteHandler): void {
+    this.handler = handler;
+  }
 }
 /** Nest's name for the context an exception filter receives. */
 export type ArgumentsHost = ExecutionContext;
 
 export interface CanActivate {}
+export interface NestInterceptor {}
+
+/**
+ * What an interceptor's intercept(context, next) calls to run the route: next.handle() is an Observable of the
+ * route's result, which the interceptor can pipe through map, tap, catchError...
+ */
+export class CallHandler {
+  private readonly next: () => unknown;
+  constructor(next: () => unknown) {
+    this.next = next;
+  }
+  handle(): Observable<unknown> {
+    return new Observable<unknown>(this.next);
+  }
+}
 export interface PipeTransform {}
 export interface ExceptionFilter {}
 export interface NestMiddleware {}
@@ -521,11 +575,74 @@ export function UseFilters(filter: ClassInfo): (c: ClassInfo, m: MethodInfo | nu
   };
 }
 
-/** Interceptors for a route (FileInterceptor("file") reads a multipart upload). */
-export function UseInterceptors(interceptor: unknown): (c: ClassInfo, m: MethodInfo | null) => void {
-  return (c: ClassInfo, m: MethodInfo | null): void => {
-    setting(c.id, { method: m === null ? -1 : methodIndex(c, m), kind: "interceptor", text: "", code: 0, cls: null, value: interceptor });
+/**
+ * Interceptors for a route, or for every route of the controller: classes with intercept(context, next), run in
+ * order around the route (FileInterceptor("file") reads a multipart upload).
+ * Node: up to three per decorator (xisto has no rest parameters).
+ */
+export function UseInterceptors(a: unknown, b: unknown = null, c: unknown = null): (c: ClassInfo, m: MethodInfo | null) => void {
+  return (ci: ClassInfo, m: MethodInfo | null): void => {
+    for (const x of [a, b, c]) {
+      if (x !== null) {
+        setting(ci.id, { method: m === null ? -1 : methodIndex(ci, m), kind: "interceptor", text: "", code: 0, cls: null, value: x });
+      }
+    }
   };
+}
+
+/**
+ * Metadata on a route or a controller, which a guard or an interceptor reads with Reflector.
+ * @example export const Public = () => SetMetadata("isPublic", true);
+ */
+export function SetMetadata(key: string, value: unknown): (c: ClassInfo, m: MethodInfo | null) => void {
+  return (c: ClassInfo, m: MethodInfo | null): void => {
+    __metadata.set(c.id + "#" + String(m === null ? -1 : methodIndex(c, m)) + "#" + key, value);
+  };
+}
+
+/**
+ * Reads what SetMetadata recorded on a route (context.getHandler()) or a controller (context.getClass()).
+ * @example this.reflector.getAllAndOverride<boolean>("isPublic", [ctx.getHandler(), ctx.getClass()])
+ * Node: an absent key gives null (Nest gives undefined).
+ */
+@Injectable()
+export class Reflector {
+  /** The value under key on one target (a RouteHandler or a controller's ClassInfo), or null. */
+  get<T>(key: string, target: unknown): T | null {
+    const v = __metadata.get(Reflector.keyOf(key, target));
+    if (v === null) {
+      return null;
+    }
+    return v as T;
+  }
+  /** The first target's value that is there (the route's before the controller's), or null. */
+  getAllAndOverride<T>(key: string, targets: unknown[]): T | null {
+    for (const t of targets) {
+      const v = __metadata.get(Reflector.keyOf(key, t));
+      if (v !== null) {
+        return v as T;
+      }
+    }
+    return null;
+  }
+  /** Every target's value that is there, arrays flattened, in order. */
+  getAllAndMerge<T>(key: string, targets: unknown[]): T[] {
+    const out: T[] = [];
+    for (const t of targets) {
+      const v = __metadata.get(Reflector.keyOf(key, t));
+      if (v !== null) {
+        out.push(v as T);
+      }
+    }
+    return out;
+  }
+  private static keyOf(key: string, target: unknown): string {
+    if (target instanceof RouteHandler) {
+      const h = target as RouteHandler;
+      return h.cls.id + "#" + String(h.index) + "#" + key;
+    }
+    return (target as ClassInfo).id + "#-1#" + key;
+  }
 }
 
 /** The exceptions an exception filter handles (none: every exception). */
@@ -629,14 +746,25 @@ export function Optional(): (c: ClassInfo, m: MethodInfo | null, index: int) => 
   };
 }
 
-export function UseGuards(guard: ClassInfo): (c: ClassInfo, m: MethodInfo) => void {
-  return (c: ClassInfo, m: MethodInfo): void => {
-    const d: GuardDef = { method: methodIndex(c, m), guard: guard };
-    const list = __guards.get(c.id);
-    if (list === null) {
-      __guards.set(c.id, [d]);
-    } else {
-      list.push(d);
+/**
+ * Guards for a route, or for every route of the controller: classes with canActivate(context), run in order;
+ * false answers 403, an exception its own status.
+ * Node: up to three per decorator (xisto has no rest parameters).
+ */
+export function UseGuards(a: ClassInfo, b: ClassInfo | null = null, c: ClassInfo | null = null): (c: ClassInfo, m: MethodInfo | null) => void {
+  return (ci: ClassInfo, m: MethodInfo | null): void => {
+    const all: (ClassInfo | null)[] = [a, b, c];
+    for (const g of all) {
+      if (g === null) {
+        continue;
+      }
+      const d: GuardDef = { method: m === null ? -1 : methodIndex(ci, m), guard: g };
+      const list = __guards.get(ci.id);
+      if (list === null) {
+        __guards.set(ci.id, [d]);
+      } else {
+        list.push(d);
+      }
     }
   };
 }
@@ -761,6 +889,12 @@ export class Logger {
   static overrideLogger(target: LoggerService): void {
     logState.target = target;
   }
+}
+
+// Logger.overrideLogger for a package that has a Logger class of its own (nestjs-pino): xisto's import aliases
+// rename tokens, so `import { Logger as NestLogger }` there would read its own Logger
+export function __overrideLogger(target: LoggerService): void {
+  logState.target = target;
 }
 
 // the JSON of one field of a JSON body ("" when absent)

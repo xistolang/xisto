@@ -1,8 +1,11 @@
 // @nestjs/core for xisto: NestFactory.create(AppModule) walks the modules @Module recorded (static and dynamic),
 // builds every provider and controller once (constructor parameters by type or by @Inject token, like Nest's
-// injector), and registers each route on xisto's HTTP server with versioning, guards, pipes, exception filters,
-// parameter decorators, the ValidationPipe and Nest's error bodies.
+// injector), and registers each route on xisto's HTTP server with versioning, guards, interceptors, pipes,
+// exception filters, parameter decorators, the ValidationPipe and Nest's error bodies. A request runs as in Nest:
+// middleware, guards (global, controller, route), interceptors around the route (same order), then the pipes
+// and the handler; an exception anywhere goes to the exception filters.
 import { ClassInfo, MethodInfo } from "xisto:reflect";
+import { Observable } from "rxjs";
 import { Request, RequestHandler, Response } from "express";
 import { validationMessages } from "class-validator";
 import {
@@ -22,6 +25,7 @@ import {
   __tokens,
   __values,
   bodyField,
+  CallHandler,
   ClassProvider,
   DynamicModule,
   ExecutionContext,
@@ -36,6 +40,8 @@ import {
   ModuleMetadata,
   ParamDef,
   Provider,
+  Reflector,
+  RouteHandler,
   RouteDef,
   ValidationPipe,
   ValueProvider,
@@ -44,6 +50,7 @@ import {
 import { FileInterceptorSpec, readUpload, UploadedFileData, uploadField } from "./upload";
 
 export { FileInterceptorSpec, UploadedFileData } from "./upload";
+export { Reflector } from "@nestjs/common"; // (Nest exports it from @nestjs/core)
 
 /** Options of NestFactory.create. */
 export class NestApplicationOptions {
@@ -70,6 +77,9 @@ interface Route {
   path: string;
   instance: unknown;
   method: MethodInfo;
+  handler: RouteHandler;
+  interceptors: unknown[];
+  interceptorMethods: MethodInfo[];
   params: ParamDef[];
   guards: unknown[];
   guardMethods: MethodInfo[];
@@ -156,6 +166,7 @@ function ensureCollected(root: ClassInfo): void {
     return;
   }
   container.collected = true;
+  addEntry(Reflector, Reflector); // (Nest provides it to every module)
   collect(root, new Map<string, boolean>());
 }
 
@@ -525,6 +536,7 @@ function handle(r: Route, req: HttpRequest): HttpResponse {
   }
   const response = new Response();
   const ctx = new ExecutionContext(request, response);
+  ctx.setHandler(r.handler);
   try {
     for (const mw of r.middleware) {
       let passed = false;
@@ -536,83 +548,45 @@ function handle(r: Route, req: HttpRequest): HttpResponse {
       }
     }
     for (let g: int = 0; g < r.guards.length; g++) {
-      const ok = r.guardMethods[g].invoke(r.guards[g], [ctx]) as boolean;
-      if (!ok) {
+      if (!settleBoolean(r.guardMethods[g].invoke(r.guards[g], [ctx]))) {
         return reply(r, response, 403, JSON_TYPE, `{"message":"Forbidden resource","error":"Forbidden","statusCode":403}`);
       }
     }
-    const args: unknown[] = [];
-    for (let i: int = 0; i < r.method.params.length; i++) {
-      args.push(null);
+    const run = new RouteRun();
+    // the pipes and the handler: what the innermost next.handle() runs
+    let chain = (): unknown => runHandler(r, req, request, response, ctx, run);
+    for (let i = r.interceptors.length - 1; i >= 0; i--) {
+      const next = chain;
+      const instance = r.interceptors[i];
+      const intercept = r.interceptorMethods[i];
+      chain = (): unknown => observed(intercept.invoke(instance, [ctx, new CallHandler(next)]));
     }
-    let usesRes = false;
-    for (const p of r.params) {
-      const type = r.method.params[p.index].type;
-      if (p.source === "body") {
-        let text = req.body;
-        if (p.key.length > 0) {
-          text = bodyField(req.body, p.key);
-        }
-        if (text.length === 0) {
-          text = "{}"; // Nest's ValidationPipe validates a missing body as an empty object
-        }
-        let value: unknown = null;
-        try {
-          value = type.decode(text);
-        } catch (je) {
-          return badRequestText(r, response, je.message);
-        }
-        if (r.validate && type.kind === "class") {
-          const messages = validationMessages(value, type.id, text);
-          if (messages.length > 0) {
-            return badRequest(r, response, messages);
-          }
-        }
-        args[p.index] = value;
-      } else if (p.source === "param" || p.source === "query") {
-        const raw = p.source === "param" ? req.param(p.key) : req.query(p.key);
-        if (p.pipe === "ParseIntPipe") {
-          if (!isInt(raw)) {
-            return badRequestText(r, response, "Validation failed (numeric string is expected)");
-          }
-          args[p.index] = parseInt(raw, 10);
-        } else if (p.pipe === "ParseFloatPipe") {
-          const n = Number(raw);
-          if (raw.length === 0 || isNaN(n)) {
-            return badRequestText(r, response, "Validation failed (numeric string is expected)");
-          }
-          args[p.index] = n;
-        } else if (p.pipe === "ParseBoolPipe") {
-          if (raw !== "true" && raw !== "false") {
-            return badRequestText(r, response, "Validation failed (boolean string is expected)");
-          }
-          args[p.index] = raw === "true";
-        } else if (raw.length === 0 && type.kind !== "string") {
-          args[p.index] = null; // (a value that is absent: Nest gives undefined)
-        } else {
-          args[p.index] = raw;
-        }
-      } else if (p.source === "headers") {
-        args[p.index] = req.header(p.key);
-      } else if (p.source === "req") {
-        args[p.index] = request;
-      } else if (p.source === "res") {
-        args[p.index] = response;
-        usesRes = true;
-      } else if (p.source === "file") {
-        const f = readUpload(req, r.upload);
-        if (f === null) {
-          args[p.index] = null;
-        } else {
-          args[p.index] = f;
-        }
-      } else {
-        args[p.index] = __custom[p.custom].fn(p.key, ctx);
-      }
+    // subscribed as Nest does: finalize() callbacks run once the outermost interceptor has the value
+    let result: unknown = null;
+    new Observable<unknown>(chain).subscribe((v: unknown): void => {
+      result = v;
+    });
+    const answered = run.early;
+    if (answered !== null) {
+      return answered;
     }
-    const result = r.method.invoke(r.instance, args);
-    if (usesRes) {
+    if (run.usesRes) {
       return fromResponse(r, response);
+    }
+    if (result !== run.result) {
+      // an interceptor gave another value: sent as Nest's Express adapter sends it (an object or an array as
+      // JSON, anything else as text)
+      if (result === null) {
+        return reply(r, response, r.status, "text/html; charset=utf-8", "");
+      }
+      const kind = typeof result;
+      if (kind === "string") {
+        return reply(r, response, r.status, "text/html; charset=utf-8", result as string);
+      }
+      if (kind === "number" || kind === "boolean") {
+        return reply(r, response, r.status, "text/html; charset=utf-8", JSON.stringify(result));
+      }
+      return reply(r, response, r.status, JSON_TYPE, JSON.stringify(result));
     }
     if (r.method.returns.kind === "void" || result === null) {
       return reply(r, response, r.status, "text/html; charset=utf-8", "");
@@ -624,6 +598,161 @@ function handle(r: Route, req: HttpRequest): HttpResponse {
   } catch (e) {
     return failure(r, e, ctx);
   }
+}
+
+// what one request's handler left: the value it returned, an answer the pipes gave instead, @Res() use
+class RouteRun {
+  result: unknown = null;
+  early: HttpResponse | null = null; // the answer (a body that is not JSON, a parameter a pipe refused)
+  usesRes: boolean = false;
+}
+
+// a guard's answer: a boolean, or an Observable / a promise of one
+function settleBoolean(v: unknown): boolean {
+  return observed(v) as boolean;
+}
+
+// an interceptor's or a guard's value: an Observable runs and gives its value
+function observed(v: unknown): unknown {
+  if (v instanceof Observable) {
+    return (v as Observable<unknown>).run();
+  }
+  return v;
+}
+
+function early(run: RouteRun, res: HttpResponse): unknown {
+  run.early = res;
+  return null;
+}
+
+// the parameters (pipes) and the call of the route's method
+function runHandler(r: Route, req: HttpRequest, request: Request, response: Response, ctx: ExecutionContext, run: RouteRun): unknown {
+  const args: unknown[] = [];
+  for (let i: int = 0; i < r.method.params.length; i++) {
+    args.push(null);
+  }
+  for (const p of r.params) {
+    const type = r.method.params[p.index].type;
+    if (p.source === "body") {
+      let text = req.body;
+      if (p.key.length > 0) {
+        text = bodyField(req.body, p.key);
+      }
+      if (text.length === 0) {
+        text = "{}"; // Nest's ValidationPipe validates a missing body as an empty object
+      }
+      let value: unknown = null;
+      try {
+        value = type.decode(text);
+      } catch (je) {
+        return early(run, badRequestText(r, response, je.message));
+      }
+      if (r.validate && type.kind === "class") {
+        const messages = validationMessages(value, type.id, text);
+        if (messages.length > 0) {
+          return early(run, badRequest(r, response, messages));
+        }
+      }
+      args[p.index] = value;
+    } else if (p.source === "param" || p.source === "query") {
+      const raw = p.source === "param" ? req.param(p.key) : req.query(p.key);
+      if (p.pipe === "ParseIntPipe") {
+        if (!isInt(raw)) {
+          return early(run, badRequestText(r, response, "Validation failed (numeric string is expected)"));
+        }
+        args[p.index] = parseInt(raw, 10);
+      } else if (p.pipe === "ParseFloatPipe") {
+        const n = Number(raw);
+        if (raw.length === 0 || isNaN(n)) {
+          return early(run, badRequestText(r, response, "Validation failed (numeric string is expected)"));
+        }
+        args[p.index] = n;
+      } else if (p.pipe === "ParseBoolPipe") {
+        if (raw !== "true" && raw !== "false") {
+          return early(run, badRequestText(r, response, "Validation failed (boolean string is expected)"));
+        }
+        args[p.index] = raw === "true";
+      } else if (raw.length === 0 && type.kind !== "string") {
+        args[p.index] = null; // (a value that is absent: Nest gives undefined)
+      } else {
+        args[p.index] = raw;
+      }
+    } else if (p.source === "headers") {
+      args[p.index] = req.header(p.key);
+    } else if (p.source === "req") {
+      args[p.index] = request;
+    } else if (p.source === "res") {
+      args[p.index] = response;
+      run.usesRes = true;
+    } else if (p.source === "file") {
+      const f = readUpload(req, r.upload);
+      if (f === null) {
+        args[p.index] = null;
+      } else {
+        args[p.index] = f;
+      }
+    } else {
+      args[p.index] = __custom[p.custom].fn(p.key, ctx);
+    }
+  }
+  const result = r.method.invoke(r.instance, args);
+  run.result = result;
+  return result;
+}
+
+// guards or interceptors of one route, in the order they run
+class Stage {
+  instances: unknown[] = [];
+  methods: MethodInfo[] = [];
+  add(instance: unknown, c: ClassInfo, method: string): void {
+    const m = findMethod(c, method);
+    if (m === null) {
+      throw new Error(`${c.name} has no ${method}()`);
+    }
+    this.instances.push(instance);
+    this.methods.push(m);
+  }
+  copy(): Stage {
+    const s = new Stage();
+    s.instances = this.instances.slice(0);
+    s.methods = this.methods.slice(0);
+    return s;
+  }
+}
+
+// a method of the class or one it inherits (from a base class with a ClassInfo: AuthGuard's canActivate)
+export function findMethod(c: ClassInfo, name: string): MethodInfo | null {
+  let k: ClassInfo | null = c;
+  while (k !== null) {
+    const m = k.methods.find((x: MethodInfo): boolean => x.name === name);
+    if (m !== null) {
+      return m;
+    }
+    k = k.base;
+  }
+  return null;
+}
+
+function hasMethod(c: ClassInfo, name: string): boolean {
+  return findMethod(c, name) !== null;
+}
+
+// the class a provider builds: the class itself, or { useClass }
+function providerClass(p: unknown): ClassInfo | null {
+  if (p instanceof ClassProvider) {
+    return (p as ClassProvider).useClass;
+  }
+  return asClass(p);
+}
+
+// a guard's or an interceptor's instance: the provider's when the class is one (one instance, as in Nest's
+// injector), built with its dependencies otherwise
+function instanceOf(c: ClassInfo): unknown {
+  const key = tokenKey(c);
+  if (container.entries.has(key)) {
+    return resolveToken(c, false, c.name, 0, 0);
+  }
+  return construct(c, 0);
 }
 
 function lifecycle(name: string): void {
@@ -739,11 +868,20 @@ export class NestApplication {
     const server = new Server();
     const filterInstances: unknown[] = [];
     const filterInfos: ClassInfo[] = [];
+    const globalGuards = new Stage();
+    const globalInterceptors = new Stage();
     for (const g of container.globals) {
-      const c = asClass(g);
-      if (c !== null && __catches.has(c.id)) {
-        filterInstances.push(build(c, 0));
+      const c = providerClass(g);
+      if (c === null) {
+        continue;
+      }
+      if (__catches.has(c.id)) {
+        filterInstances.push(build(g, 0));
         filterInfos.push(c);
+      } else if (hasMethod(c, "canActivate")) {
+        globalGuards.add(build(g, 0), c, "canActivate");
+      } else if (hasMethod(c, "intercept")) {
+        globalInterceptors.add(build(g, 0), c, "intercept");
       }
     }
     for (const c of container.controllers) {
@@ -761,18 +899,30 @@ export class NestApplication {
       const validated: int[] = validated0 || [];
       for (const rd of routes) {
         const mine: ParamDef[] = params.filter((p: ParamDef): boolean => p.method === rd.method);
-        const gs: unknown[] = [];
-        const gms: MethodInfo[] = [];
-        for (const g of guards) {
-          if (g.method !== rd.method) {
-            continue;
+        // guards and interceptors: the global ones, the controller's, the route's (each in the decorator's order)
+        const gs = globalGuards.copy();
+        for (const level of [-1, rd.method]) {
+          for (const g of guards) {
+            if (g.method === level) {
+              gs.add(instanceOf(g.guard), g.guard, "canActivate");
+            }
           }
-          gs.push(construct(g.guard, 0));
-          const m = g.guard.methods.find((x: MethodInfo): boolean => x.name === "canActivate");
-          if (m === null) {
-            throw new Error(`${g.guard.name} has no canActivate()`);
+        }
+        const ins = globalInterceptors.copy();
+        let upload = "";
+        for (const level of [-1, rd.method]) {
+          for (const s of settingsOf(c, rd.method, "interceptor")) {
+            if (s.method !== level) {
+              continue;
+            }
+            const f = uploadField(s.value);
+            if (f.length > 0) {
+              upload = f;
+            } else {
+              const ic = s.value as ClassInfo;
+              ins.add(instanceOf(ic), ic, "intercept");
+            }
           }
-          gms.push(m);
         }
         let status: int = rd.verb === "POST" ? 201 : 200;
         for (const s of settingsOf(c, rd.method, "code")) {
@@ -802,22 +952,18 @@ export class NestApplication {
           fis.push(filterInstances[i]);
           finfo.push(filterInfos[i]);
         }
-        let upload = "";
-        for (const s of settingsOf(c, rd.method, "interceptor")) {
-          const f = uploadField(s.value);
-          if (f.length > 0) {
-            upload = f;
-          }
-        }
         const v = this.versioning && version.length > 0 ? this.versionPrefix + version : "";
         const r: Route = {
           verb: rd.verb,
           path: joinPath([this.prefix, v, base, rd.path]),
           instance: instance,
           method: c.methods[rd.method],
+          handler: new RouteHandler(c, rd.method, c.methods[rd.method].name),
+          interceptors: ins.instances,
+          interceptorMethods: ins.methods,
           params: mine,
-          guards: gs,
-          guardMethods: gms,
+          guards: gs.instances,
+          guardMethods: gs.methods,
           validate: this.validateAll || validated.includes(rd.method),
           status: status,
           cors: this.cors,
