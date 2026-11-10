@@ -10,6 +10,7 @@
 // OFFSET/FETCH, quoted identifiers as TypeORM quotes them.
 import { ClassInfo, FieldInfo } from "xisto:reflect";
 import { Pool } from "pg";
+import { Connection, OUT_FORMAT_OBJECT, createPool } from "oracledb";
 
 declare function remap(rows: object, spec: string): object;
 declare function get(json: object, key: string): object;
@@ -97,7 +98,7 @@ export class EntityMetadata {
   spec(): string {
     let s = "";
     for (const c of this.columns) {
-      s = s + c.databaseName + "\t" + c.propertyName + "\t" + c.kind + "\n";
+      s = s + c.databaseName + "\t" + c.propertyName + "\t" + columnKind(c) + "\n";
     }
     return s;
   }
@@ -179,6 +180,12 @@ function kindOf(f: FieldInfo): string {
     return "date";
   }
   return "other";
+}
+
+/** a column's kind for binds and rows: a `type: "date"` column (a day, no time) gets ":day", as TypeORM writes it
+    with TO_DATE('YYYY-MM-DD') and reads back the local calendar day */
+function columnKind(c: ColumnMetadata): string {
+  return c.type === "date" ? c.kind + ":day" : c.kind;
 }
 
 function addColumn(c: ClassInfo, f: FieldInfo, o: ColumnOptions, primary: boolean, generated: boolean): void {
@@ -529,6 +536,47 @@ export class OracleDriver extends Driver {
   }
 }
 
+// oracle through the oracledb package, as TypeORM loads node-oracledb for type "oracle" (no registerDriver needed):
+// connectString from options.connectString, or host:port/serviceName (database or sid as the service otherwise)
+function oracleConnection(c: Connection): OracleConnectionFunctions {
+  return {
+    execute: async (sql: string, binds: unknown[]): Promise<object> => c.execute(sql, binds, { outFormat: OUT_FORMAT_OBJECT }),
+    commit: async (): Promise<void> => {
+      await c.commit();
+    },
+    rollback: async (): Promise<void> => {
+      await c.rollback();
+    },
+    close: async (): Promise<void> => {
+      await c.close();
+    },
+  };
+}
+
+function oracleConnectString(o: DataSourceOptions): string {
+  const given = o.connectString ?? "";
+  if (given.length > 0) {
+    return given;
+  }
+  const service = o.serviceName ?? o.database ?? o.sid ?? "";
+  return (o.host ?? "localhost") + ":" + String(o.port ?? 1521) + (service.length > 0 ? "/" + service : "");
+}
+
+async function oraclePool(o: DataSourceOptions): Promise<OraclePoolFunctions> {
+  const p = await createPool({
+    user: o.username ?? "",
+    password: o.password ?? "",
+    connectString: oracleConnectString(o),
+    poolMax: o.poolSize ?? 10,
+  });
+  return {
+    getConnection: async (): Promise<OracleConnectionFunctions> => oracleConnection(await p.getConnection()),
+    close: async (): Promise<void> => {
+      await p.close();
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // SQL helpers
 
@@ -578,6 +626,30 @@ class Binds {
   addJson(v: object): string {
     return this.add(toParam(v));
   }
+  /** a value of a column: on Oracle a Date column's value (an ISO string once it went through JSON) binds as a Date,
+      so it reaches the database as DATE/TIMESTAMP, as node-oracledb binds a JS Date for TypeORM */
+  addColumnJson(v: object, columnKind: string): string {
+    if (this.dialect === "oracle" && columnKind.endsWith(":day") && kind(v) === "string") {
+      // the local calendar day, as TypeORM's TO_DATE('YYYY-MM-DD', 'YYYY-MM-DD') (a bind here, not a literal)
+      const text: string = JSON.parse(JSON.stringify(v));
+      let dayText = text;
+      if (text.length > 10) {
+        const d = new Date(text);
+        if (!Number.isNaN(d.getTime())) {
+          dayText = String(d.getFullYear()).padStart(4, "0") + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+        }
+      }
+      return "TO_DATE(" + this.add(dayText.slice(0, 10)) + ", 'YYYY-MM-DD')";
+    }
+    if (this.dialect === "oracle" && columnKind === "date" && kind(v) === "string") {
+      const iso: string = JSON.parse(JSON.stringify(v));
+      const d = new Date(iso);
+      if (!Number.isNaN(d.getTime())) {
+        return this.add(d);
+      }
+    }
+    return this.addJson(v);
+  }
 }
 
 function quote(name: string): string {
@@ -606,13 +678,13 @@ function opName(v: object): string {
 }
 
 /** The SQL of one property condition: "col" = $1, "col" IS NULL, "col" IN ($1, $2), ... */
-function conditionSql(column: string, value: object, binds: Binds): string {
+function conditionSql(column: string, value: object, binds: Binds, columnKind: string = ""): string {
   const k = kind(value);
   if (k === "null") {
     return column + " IS NULL";
   }
   if (!isOperator(value)) {
-    return column + " = " + binds.addJson(value);
+    return column + " = " + binds.addColumnJson(value, columnKind);
   }
   const op = opName(value);
   const v = get(value, "value");
@@ -623,13 +695,13 @@ function conditionSql(column: string, value: object, binds: Binds): string {
     return column + " IS NOT NULL";
   }
   if (op === "<>" && isOperator(v)) {
-    return "NOT(" + conditionSql(column, v, binds) + ")";
+    return "NOT(" + conditionSql(column, v, binds, columnKind) + ")";
   }
   if (op === "in") {
     const parts: string[] = [];
     const n = len(v);
     for (let i = 0; i < n; i++) {
-      parts.push(binds.addJson(at(v, i)));
+      parts.push(binds.addColumnJson(at(v, i), columnKind));
     }
     if (parts.length === 0) {
       return "0=1";
@@ -637,7 +709,7 @@ function conditionSql(column: string, value: object, binds: Binds): string {
     return column + " IN (" + parts.join(", ") + ")";
   }
   if (op === "between") {
-    return column + " BETWEEN " + binds.addJson(v) + " AND " + binds.addJson(get(value, "to"));
+    return column + " BETWEEN " + binds.addColumnJson(v, columnKind) + " AND " + binds.addColumnJson(get(value, "to"), columnKind);
   }
   if (op === "like") {
     return column + " LIKE " + binds.addJson(v);
@@ -648,7 +720,7 @@ function conditionSql(column: string, value: object, binds: Binds): string {
     }
     return "UPPER(" + column + ") LIKE UPPER(" + binds.addJson(v) + ")";
   }
-  return column + " " + op + " " + binds.addJson(v);
+  return column + " " + op + " " + binds.addColumnJson(v, columnKind);
 }
 
 /** where: { prop: value, ... } (AND) or [{...}, {...}] (OR of ANDs), properties as columns of alias */
@@ -672,7 +744,8 @@ function whereSql(m: EntityMetadata, where: object, alias: string, binds: Binds)
   const ands: string[] = [];
   for (const p of props) {
     const col = (alias.length > 0 ? quote(alias) + "." : "") + quote(columnName(m, p));
-    ands.push(conditionSql(col, get(where, p), binds));
+    const meta = m.findColumn(p);
+    ands.push(conditionSql(col, get(where, p), binds, meta === null ? "" : columnKind(meta)));
   }
   return ands.join(" AND ");
 }
@@ -942,7 +1015,7 @@ export class Repository<T> {
         continue;
       }
       cols.push(quote(c.databaseName));
-      vals.push(binds.addJson(get(values, p)));
+      vals.push(binds.addColumnJson(get(values, p), columnKind(c)));
     }
     return [cols, vals];
   }
@@ -1458,7 +1531,8 @@ export class SelectQueryBuilder<T> {
       const sets: string[] = [];
       for (const p of props) {
         const col = m === null ? p : columnName(m, p);
-        sets.push(quote(col) + " = " + binds.addJson(get(vals, p)));
+        const meta = m === null ? null : m.findColumn(p);
+        sets.push(quote(col) + " = " + binds.addColumnJson(get(vals, p), meta === null ? "" : columnKind(meta)));
       }
       return "UPDATE " + this.table + " SET " + sets.join(", ") + this.wherePart(binds);
     }
@@ -1679,6 +1753,9 @@ export class DataSource {
     let made: Driver = new PostgresDriver(this.options);
     if (f !== null) {
       made = f.create(this.options);
+    } else if (this.options.type === "oracle") {
+      const o = this.options;
+      made = new OracleDriver(async (): Promise<OraclePoolFunctions> => oraclePool(o));
     } else if (this.options.type !== "postgres") {
       throw new Error(`DataSource: no driver for type "${this.options.type}" (install the package that registers it, e.g. oracledb)`);
     }

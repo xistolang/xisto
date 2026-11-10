@@ -287,11 +287,17 @@ static xs_pg_conn *xs_pg_acquire(xn_pg_NativePool *p) {
         }
         return c;
     }
-    xs_pg_waiter w = {xs_cur_coro, NULL, NULL};
-    if (l->tail) l->tail->next = &w; else l->head = &w;
-    l->tail = &w;
+    /* on the heap: tasks share one stack, and a parked task's stack is not where it was while others run (a waiter on
+       it was overwritten with Promise.all over more queries than the pool has connections) */
+    xs_pg_waiter *w = calloc(1, sizeof *w);
+    w->co = xs_cur_coro;
+    if (l->tail) l->tail->next = w; else l->head = w;
+    l->tail = w;
     xs_coro_yield(); /* resumed by xs_pg_release with a connection */
-    return w.got;
+    xs_pg_conn *got = w->got;
+    free(w);
+    if (!got) return xs_pg_acquire(p); /* (the release could not open one in its place: try again) */
+    return got;
 }
 static void xs_pg_release(xn_pg_NativePool *p, xs_pg_conn *c) {
     xs_pg_local *l = &xs_pg_locals[p->id];
