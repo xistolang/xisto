@@ -1,4 +1,4 @@
-xisto check: 2 files, 7 changes needed in 2 files
+xisto check: 2 files, 6 changes needed in 2 files
 
   kind of change                                 changes  files  fix
   syntax xisto does not read                           1      1  manual
@@ -6,15 +6,16 @@ xisto check: 2 files, 7 changes needed in 2 files
   missing type annotation                              1      1  manual
   Node module import (node:x -> xisto:x)               1      1  automatic
   module or package not available                      1      1  package
-  type error under xisto's rules                       2      2  manual
+  type error under xisto's rules                       1      1  manual
   (3 follow-on errors of these hidden)
 
   most changes:
         5  main.ts
-        2  lib/helper.ts
+        1  lib/helper.ts
 
   warnings (compile; to review)                   uses  files
     XS2101   deprecated                                  1      1
+    XS2106   implicit                                    1      1
   (xisto check --details shows each place; --deny-warnings counts them as changes)
 
   dynamic path (any): runs, slower                     1      1  optional
