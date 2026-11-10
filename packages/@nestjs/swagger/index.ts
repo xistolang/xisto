@@ -46,6 +46,10 @@ export class DocumentBuilder {
     this.bearer = true;
     return this;
   }
+  /** a tag with its description (accepted: routes are grouped by @ApiTags) */
+  addTag(name: string, description: string = ""): DocumentBuilder {
+    return this;
+  }
   build(): SwaggerConfig {
     return { title: this.title, description: this.description, version: this.version, bearer: this.bearer };
   }
