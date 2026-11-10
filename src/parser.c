@@ -28,6 +28,7 @@ typedef struct {
 } Parser;
 
 /* generics: the type parameters in scope while a template is parsed, or their types while an instance is */
+static int no_dyn_note; /* inside generated code: its anys are not the program's uses */
 static char **tp_names;
 static int ntp;
 static char **subst_names;
@@ -467,6 +468,12 @@ static Type *parse_type(Parser *p) {
     } else if (strcmp(n, "NodeJS") == 0 && at(p, TK_DOT)) { /* NodeJS.Timeout: what setTimeout/setInterval return, an int id here */
         next(p);
         Token k = expect(p, TK_IDENT, NULL);
+        if (strcmp(k.str, "ProcessEnv") == 0) { /* the type of process.env: env.NAME reads a variable (null when unset) */
+            t = xs_alloc(sizeof *t);
+            *t = *ty_map_of(ty_string, ty_string);
+            t->record = true;
+            goto suffix;
+        }
         if (strcmp(k.str, "Timeout") != 0 && strcmp(k.str, "Timer") != 0 && strcmp(k.str, "Immediate") != 0)
             xs_error(XS1019, k.pos, "NodeJS.Timeout is the one NodeJS type xisto knows", "unsupported type NodeJS.%s", k.str);
         t = ty_int;
@@ -489,7 +496,7 @@ static Type *parse_type(Parser *p) {
 
     else if (strcmp(n, "any") == 0) { /* the dynamic path: an unknown read and written by name, checked at run time */
         t = ty_any;
-        xs_note_dynamic(name.pos);
+        if (!no_dyn_note) xs_note_dynamic(name.pos);
     }
     else if (strcmp(n, "Promise") == 0) { /* Promise<T> is T: async is syntax only */
         expect(p, TK_LT, "write Promise<T>");
@@ -812,7 +819,9 @@ static Expr *parse_primary(Parser *p) {
         e->str = p->tok.str;
         next(p);
         expect(p, TK_LPAREN, NULL);
+        no_dyn_note++; /* (the reflection's own mention of an any: the program's is noted where it is written) */
         e->elem_type = parse_type(p);
+        no_dyn_note--;
         expect(p, TK_RPAREN, NULL);
         return e;
     }
@@ -1660,6 +1669,7 @@ static Expr *unset_value(Type *t, Pos pos) {
     case TY_OBJECT: e = new_expr(E_NULL, pos); e->unset = true; return e; /* (the checker picks the empty value) */
     case TY_ARRAY: return new_expr(E_ARRAY_LIT, pos);
     case TY_MAP: case TY_SET: if (t->record) return new_expr(E_OBJLIT, pos); e = new_expr(E_NEW_MAP, pos); e->elem_type = t; return e;
+    case TY_UNKNOWN: return new_expr(E_NULL, pos); /* let x: any; / unknown: null until assigned */
     default: return NULL;
     }
 }
@@ -3049,6 +3059,11 @@ static void parse_import(Parser *p, Module *m) {
         im.positions[0] = name.pos;
         im.n = 1;
         goto from;
+    }
+    if (at(p, TK_STRING)) { /* import "reflect-metadata": for its effects on Node; xisto loads nothing for it */
+        next(p);
+        expect_semi(p);
+        return;
     }
     if (at(p, TK_STAR)) { /* import * as ns from "m" */
         next(p);

@@ -11,4 +11,9 @@ async function main(): Promise<void> {
   const c: Ctx = { a: "x" };
   console.log(await s.query("q"), c.a, f("a"), f("b", 2));
 }
+let tracer: any;
+function lvl(env: NodeJS.ProcessEnv = process.env): string {
+  return env.LOG_LEVEL ?? "info";
+}
+console.log(tracer == null, lvl());
 main();
