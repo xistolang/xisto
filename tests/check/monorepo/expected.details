@@ -12,17 +12,25 @@ apps/api/src/main.ts (3)
          | ^
     help: import files with a relative path ("./file"), or add the package: xisto add <git url> --name some-orm
 
-xisto check: 6 files, 3 changes needed in 1 file
+libs/util/src/index.ts (1)
+  1:1  XS5003  cannot resolve 'tiny-format'
+       1 | import { format } from 'tiny-format';
+         | ^
+    help: import files with a relative path ("./file"), or add the package: xisto add <git url> --name tiny-format
+
+xisto check: 6 files, 4 changes needed in 2 files
 
   kind of change                                 changes  files  fix
   Node module import (node:x -> xisto:x)               1      1  automatic
-  module or package not available                      2      1  package
-  (2 follow-on errors of these hidden)
+  module or package not available                      3      2  package
+  (4 follow-on errors of these hidden)
 
   most changes:
         3  apps/api/src/main.ts
+        1  libs/util/src/index.ts
 
   tests: 1 change in 1 of 1 test file, not counted above (--tests counts them)
 
   packages:
     some-orm                         not installed            1 file  (xisto add <git url> --name some-orm)
+    tiny-format                      not installed            1 file  (xisto add <git url> --name tiny-format)

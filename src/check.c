@@ -366,6 +366,21 @@ int cmd_check(int argc, char **argv) {
         check_entry(self, entries.items[i], &covered, cwd, root_real);
     }
     for (int i = 0; i < files.len; i++) scan_imports(root_real, files.items[i]);
+    /* the project's code the entries reach outside the files above (a lib through a tsconfig "paths" name, the
+       modules of a .ts entry): its packages count too, as the build needs them; a package's own imports do not */
+    const char *extra = getenv("XISTO_PKGS");
+    char extra_real[PATH_MAX] = "";
+    if (extra && *extra && !xs_real_path(extra, extra_real)) snprintf(extra_real, sizeof extra_real, "%s", extra);
+    for (int i = 0; i < covered.len; i++) {
+        const char *m = covered.items[i];
+        if (strstr(m, "/.xisto/") || strstr(m, "/node_modules/") || (extra_real[0] && strncmp(m, extra_real, strlen(extra_real)) == 0) || !ts_file(m)) continue;
+        bool listed = false;
+        for (int k = 0; k < files.len && !listed; k++) {
+            char real[PATH_MAX];
+            listed = xs_real_path(files.items[k], real) && strcmp(real, m) == 0;
+        }
+        if (!listed) scan_imports(root_real, m);
+    }
     qsort(diags, (size_t)ndiags, sizeof(Diag), cmp_diag);
 
     bool tty = isatty(1);
