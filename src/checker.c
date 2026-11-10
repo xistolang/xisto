@@ -1368,9 +1368,11 @@ static void check_type_supported(Pos pos, Type *t) {
 }
 
 /* JSON.stringify / JSON.parse cover primitives, strings, classes whose fields are all serializable, and arrays of those. */
+static bool json_ok_unknown; /* JSON.stringify: an unknown is written by its type at run time */
 static bool json_ok(Type *t, int depth) {
     if (depth > 8) return false;
     switch (t->kind) {
+    case TY_UNKNOWN: return json_ok_unknown;
     case TY_NUMBER: case TY_INT: case TY_BOOLEAN: case TY_STRING: case TY_ENUM: return true;
     case TY_JSON: return true; /* embedded as it is */
     case TY_ARRAY: case TY_NULLABLE: return json_ok(t->elem, depth + 1);
@@ -1560,8 +1562,9 @@ static void to_unknown(Expr *e) {
     const char *fn = b->kind == TY_NUMBER ? "xs_box_num" : b->kind == TY_BOOLEAN ? "xs_box_bool"
                    : (b->kind == TY_INT || (b->kind == TY_ENUM && !b->en->is_string)) ? "xs_box_int" : NULL;
     if (!fn) { /* a reference: the same pointer */
-        if (e->kind == E_ARRAY_LIT || e->kind == E_OBJLIT || e->kind == E_NEW_MAP) {
-            /* a literal is emitted from its own type: keep it under a cast ([...] where a union or unknown goes) */
+        if (e->kind == E_ARRAY_LIT || e->kind == E_OBJLIT || e->kind == E_NEW_MAP || e->kind == E_BINARY) {
+            /* a literal is emitted from its own type, and so is a + b (a string concatenation): keep it under a
+               cast ([...] or s + "!" where a union or unknown goes) */
             Expr *v = expr_copy(e);
             memset(e, 0, sizeof *e);
             e->kind = E_UPCAST;
@@ -3541,6 +3544,12 @@ static void check_expr(Expr *e, Type *expected) {
                 Type *ft = b->type;
                 e->lhs->type = ft;
                 e->lhs->cname = b->cname;
+                if (strncmp(name, "__deco", 6) == 0) /* a decorator for members also used on a class ((c, m: MethodInfo | null) => void, @SetMetadata on a controller): null for what a class has not */
+                    while (e->args.len < ft->nparams && (ft->params[e->args.len]->kind == TY_NULLABLE || ft->params[e->args.len]->kind == TY_UNKNOWN)) {
+                        Expr *nul = xs_alloc(sizeof *nul);
+                        nul->kind = E_NULL; nul->pos = e->pos; nul->field = -1;
+                        expr_list_push(&e->args, nul);
+                    }
                 if (e->args.len != ft->nparams) xs_error(XS8062, e->pos, NULL, "'%s' takes %d argument(s), got %d", name, ft->nparams, e->args.len);
                 for (int i = 0; i < e->args.len; i++) {
                     check_expr(e->args.items[i], ft->params[i]);
@@ -3900,7 +3909,10 @@ static void check_expr(Expr *e, Type *expected) {
                     settle(e->args.items[0]);
                     Type *t = e->args.items[0]->type;
                     if (t->kind == TY_JSON) { Expr *v = e->args.items[0]; *e = *v; e->type = ty_string; return; } /* already JSON */
-                    if (!json_ok(t, 0)) xs_error(XS8100, e->args.items[0]->pos, "JSON covers number, int, boolean, string, arrays and classes made of those", "cannot serialize %s to JSON", ty_name(t));
+                    json_ok_unknown = true;
+                    bool ok = json_ok(t, 0);
+                    json_ok_unknown = false;
+                    if (!ok) xs_error(XS8100, e->args.items[0]->pos, "JSON covers number, int, boolean, string, arrays and classes made of those", "cannot serialize %s to JSON", ty_name(t));
                     e->type = ty_string;
                     e->builtin.cfn = "json_stringify"; /* resolved by the emitter per type */
                     return;

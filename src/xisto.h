@@ -525,6 +525,8 @@ struct Class {
     Type *alias;       /* type Name = A | B: a name for another type (not an object shape) */
     bool extends_error; /* class X extends Error: fields message and name first, laid out as the runtime's Error */
     struct Mixin *mixin; /* class X extends PartialType(Y) (OmitType, PickType, IntersectionType): Y's fields copied in */
+    char *mixin_call;    /* class X extends F(args) (F a class with a static __mixin, e.g. PassportStrategy(Strategy, "jwt")):
+                            X extends F, and F.__mixin(args) runs as a class decorator on X */
     bool mixin_done;
 };
 /* PartialType(Y), OmitType(Y, ["a"] as const), PickType(Y, ["a"]), IntersectionType(A, B): the mapped types of
