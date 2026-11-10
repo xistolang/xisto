@@ -2290,6 +2290,21 @@ static Type *unify_numeric(Expr *e, const char *what) {
     if (b->type->kind == TY_LITINT) coerce_lit(b, a->type);
     if (a->type->kind == TY_INT && b->type->kind == TY_NUMBER) widen_inferred(a);
     else if (a->type->kind == TY_NUMBER && b->type->kind == TY_INT) widen_inferred(b);
+    /* xs.length >= limit, Math.round(x) / 1e8: an int where a number is met is that number (exact within
+       ±(2^53−1)), as TypeScript has only number */
+    if ((a->type->kind == TY_INT && b->type->kind == TY_NUMBER) || (a->type->kind == TY_NUMBER && b->type->kind == TY_INT)) {
+        Expr **slot = a->type->kind == TY_INT ? &e->lhs : &e->rhs;
+        Expr *x = *slot;
+        Expr *c = xs_alloc(sizeof *c);
+        c->kind = E_CALL; c->pos = x->pos; c->field = -1; c->type = ty_number;
+        c->builtin.cfn = "xs_to_number";
+        expr_list_push(&c->args, x);
+        Expr *callee = xs_alloc(sizeof *callee);
+        callee->kind = E_IDENT; callee->pos = x->pos; callee->str = "Number"; callee->field = -1;
+        c->lhs = callee;
+        *slot = c;
+        a = e->lhs; b = e->rhs;
+    }
     if (!ty_equal(a->type, b->type))
         xs_error(XS8084, e->pos, "int and number do not mix; convert with Number(i) or Math.trunc(x)",
                  "cannot apply %s to %s and %s", what, ty_name(a->type), ty_name(b->type));
@@ -4009,6 +4024,12 @@ static void check_expr_in(Expr *e, Type *expected) {
         } else if (e->op == TK_OR && truthy_type(e->lhs->type)) { /* value || default */
             Type *want = e->lhs->type->kind == TY_NULLABLE ? e->lhs->type->elem : e->lhs->type;
             check_expr(e->rhs, want);
+            if ((e->rhs->type->kind == TY_NULL || (e->rhs->type->kind == TY_NULLABLE && ty_equal(e->rhs->type->elem, want))) && nullable_ok(want)) {
+                /* a || b || 'x' (b may be null too): a when truthy, else b, which may be null */
+                Type *nw = ty_nullable_of(want);
+                expect_type(e->rhs, nw, "default after '||'");
+                want = nw;
+            } else
             expect_type(e->rhs, want, "default after '||'");
             if (!rereadable(e->lhs)) { /* f() || d: the left side is evaluated once (the emitter keeps it in a temporary) */
                 Expr *dflt = e->rhs;
@@ -4025,7 +4046,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             Expr *test = expr_copy(e->lhs);
             make_truthy(test, "left operand of '||'");
             Expr *dflt = e->rhs;
-            val->type = want; /* read only when the test passed */
+            val->type = want->kind == TY_NULLABLE ? want->elem : want; /* read only when the test passed */
             e->kind = E_COND;
             e->op = 0;
             e->lhs = test;
@@ -5051,6 +5072,12 @@ static void check_expr_in(Expr *e, Type *expected) {
                 Expr *src = e->args.items[0];
                 check_expr(src, expected && strcmp(e->str, "from") == 0 ? expected : NULL);
                 Type *st = src->type;
+                if (e->str[0] == 'i' && (st->kind == TY_UNKNOWN || st->kind == TY_UNION || (st->kind == TY_NULLABLE && st->elem->kind == TY_UNION))) {
+                    /* Array.isArray(v) with v: unknown (or any, or a union): what v holds, at run time */
+                    e->kind = E_CALL; e->lhs = NULL; e->field = -1; e->type = ty_boolean;
+                    e->builtin.cfn = "xs_is_array";
+                    return;
+                }
                 if (e->str[0] == 'i') { /* the type says it */
                     bool arr = st->kind == TY_ARRAY;
                     e->kind = E_BOOL; e->boolean = arr; e->type = ty_boolean; e->lhs = NULL; e->args.len = 0; e->field = -1;
@@ -5412,6 +5439,30 @@ static void check_expr_in(Expr *e, Type *expected) {
                     return;
                 }
                 if (strcmp(m, "sort") == 0) {
+                    if (e->args.len == 0 && (elem->kind == TY_STRING || (elem->kind == TY_ENUM && elem->en->is_string))) {
+                        /* names.sort(): strings in their default order (by their characters), as JavaScript sorts */
+                        Pos at = e->pos;
+                        #define ID_(n_) ({ Expr *x_ = xs_alloc(sizeof *x_); x_->kind = E_IDENT; x_->pos = at; x_->field = -1; x_->str = n_; x_; })
+                        #define NUM_(v_) ({ Expr *x_ = xs_alloc(sizeof *x_); x_->kind = E_NUMBER; x_->pos = at; x_->field = -1; x_->is_int_lit = true; x_->ival = v_; x_->num = v_; x_; })
+                        #define BIN_(op_, l_, r_) ({ Expr *x_ = xs_alloc(sizeof *x_); x_->kind = E_BINARY; x_->pos = at; x_->field = -1; x_->op = op_; x_->lhs = l_; x_->rhs = r_; x_; })
+                        #define COND_(c_, y_, n_) ({ Expr *x_ = xs_alloc(sizeof *x_); x_->kind = E_COND; x_->pos = at; x_->field = -1; x_->lhs = c_; expr_list_push(&x_->args, y_); expr_list_push(&x_->args, n_); x_; })
+                        Expr *neg = xs_alloc(sizeof *neg);
+                        neg->kind = E_UNARY; neg->op = TK_MINUS; neg->pos = at; neg->field = -1; neg->lhs = NUM_(1);
+                        Expr *body = COND_(BIN_(TK_LT, ID_("__sa"), ID_("__sb")), neg, COND_(BIN_(TK_GT, ID_("__sa"), ID_("__sb")), NUM_(1), NUM_(0)));
+                        #undef ID_
+                        #undef NUM_
+                        #undef BIN_
+                        #undef COND_
+                        Expr *arrow = thunk_of(body);
+                        Func *f = arrow->arrow->fn;
+                        f->params = xs_alloc(sizeof(Param) * 2);
+                        memset(f->params, 0, sizeof(Param) * 2);
+                        f->params[0].name = "__sa"; f->params[1].name = "__sb";
+                        f->params[0].type = elem; f->params[1].type = elem;
+                        f->nparams = 2;
+                        f->ret = ty_int;
+                        expr_list_push(&e->args, arrow);
+                    }
                     if (e->args.len != 1) xs_error(XS7089, e->pos, "JavaScript's default sort compares as strings; xisto requires a comparator: sort((a, b) => a - b)", "sort takes a comparator function");
                     Type **ps = xs_alloc(sizeof(Type *) * 2); ps[0] = elem; ps[1] = elem;
                     Type *cbt = ty_func(ps, 2, NULL);

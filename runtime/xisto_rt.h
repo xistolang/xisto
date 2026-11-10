@@ -3731,6 +3731,12 @@ XS_NOINLINE bool xs_json_bool(xs_jv *v, const char *where) {
 XS_NOINLINE xs_str *xs_json_str(xs_jv *v, const char *where) { if (v->kind != XJ_STR) xs_panicf("JSON: '%s' must be a string", where); return xs_str_new(v->str, v->slen); }
 XS_NOINLINE xs_jv *xs_json_arr(xs_jv *v, const char *where) { if (v->kind != XJ_ARR) xs_panicf("JSON: '%s' must be an array", where); return v; }
 XS_NOINLINE xs_jv *xs_json_obj(xs_jv *v, const char *where) { if (v->kind != XJ_OBJ) xs_panicf("JSON: '%s' must be an object", where); return v; }
+/* Array.isArray(v) on an unknown: whether it holds an array (of any element type) */
+XS_NOINLINE bool xs_is_array(void *v) {
+    if (!v) return false;
+    void (*f)(void *) = xs_type_of(v)->free;
+    return f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free;
+}
 /* a < b on strings: by their characters (UTF-8 bytes order as code points do) */
 XS_NOINLINE int64_t xs_str_order(xs_str *a, xs_str *b) {
     size_t n = a->len < b->len ? (size_t)a->len : (size_t)b->len;

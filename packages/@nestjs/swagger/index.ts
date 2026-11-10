@@ -105,7 +105,7 @@ export function ApiTags(tag: string): (c: ClassInfo) => void {
 }
 
 // every route of the class is documented as needing the token (routes behind a guard already are)
-export function ApiBearerAuth(): (c: ClassInfo) => void {
+export function ApiBearerAuth(name: string = ""): (c: ClassInfo) => void { // (the scheme's name is accepted)
   return (c: ClassInfo): void => {
     bearerOf.set(c.id, true);
   };
