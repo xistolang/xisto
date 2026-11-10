@@ -29,7 +29,7 @@ char *xs_sprintf(const char *fmt, ...) {
     va_copy(ap2, ap);
     int n = vsnprintf(NULL, 0, fmt, ap);
     va_end(ap);
-    char *s = xs_alloc((size_t)n + 1);
+    char *s = xs_alloc((size_t)n + 2); /* (two zero bytes: the lexer peeks one past the last character) */
     vsnprintf(s, (size_t)n + 1, fmt, ap2);
     va_end(ap2);
     return s;
@@ -435,7 +435,7 @@ char *xs_read_file(const char *path) {
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    char *s = xs_alloc((size_t)n + 1);
+    char *s = xs_alloc((size_t)n + 2); /* (two zero bytes: the lexer peeks one past the last character) */
     if (n > 0 && fread(s, 1, (size_t)n, f) != (size_t)n) {
         fclose(f);
         return NULL;
