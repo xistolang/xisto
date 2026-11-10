@@ -1238,6 +1238,7 @@ static int parse_type_args(Parser *p, Type ***out) {
    `a !== null ? rest : null`. Every ?. in one postfix chain nests inside the one before it, so a?.b?.c stops
    at the first null */
 static int noptc;
+static bool wants_arrays; /* a .reduce( / .flatMap( / .flat( call was parsed: xisto:arrays is loaded */
 static Expr *ident_expr(Pos pos, const char *name);
 static Expr *ns_member(Parser *p, Expr *e, Token name);
 static Expr *parse_postfix(Parser *p) {
@@ -1271,6 +1272,7 @@ static Expr *parse_postfix(Parser *p) {
             Expr *m = new_expr(E_MEMBER, name.pos);
             m->lhs = e;
             m->str = name.str;
+            if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat")) wants_arrays = true;
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs);
             if (at(p, TK_LPAREN)) {
                 m->is_call = true;
@@ -1303,6 +1305,7 @@ static Expr *parse_postfix(Parser *p) {
             Expr *m = new_expr(E_MEMBER, name.pos);
             m->lhs = e;
             m->str = name.str;
+            if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat")) wants_arrays = true;
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs); /* obj.m<T>(x) */
             if (at(p, TK_LPAREN)) {
                 m->is_call = true;
@@ -3992,6 +3995,30 @@ static Func *builtin_func(Module *m, const char *name, const char *cfn, Type *re
 }
 
 /* Built-in modules implemented by the runtime. Signatures follow Node's, restricted to strings. */
+/* xisto:arrays: array methods written in xisto (reduce, flatMap, flat): the checker turns xs.reduce(f, a) into
+   __xs_reduce(xs, f, a), the same loop JavaScript runs */
+static const char xs_arrays_src[] =
+    "export function __xs_reduce<A, T>(xs: T[], f: (acc: A, x: T, i: int) => A, init: A): A {\n"
+    "  let acc: A = init;\n"
+    "  for (let i = 0; i < xs.length; i++) acc = f(acc, xs[i], i);\n"
+    "  return acc;\n"
+    "}\n"
+    "export function __xs_reduce1<T>(xs: T[], f: (acc: T, x: T, i: int) => T): T {\n"
+    "  if (xs.length === 0) throw new Error(\"TypeError: Reduce of empty array with no initial value\");\n"
+    "  let acc: T = xs[0];\n"
+    "  for (let i = 1; i < xs.length; i++) acc = f(acc, xs[i], i);\n"
+    "  return acc;\n"
+    "}\n"
+    "export function __xs_flatMap<U, T>(xs: T[], f: (x: T, i: int) => U[]): U[] {\n"
+    "  const out: U[] = [];\n"
+    "  for (let i = 0; i < xs.length; i++) { const ys = f(xs[i], i); for (const y of ys) out.push(y); }\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_flat<U>(xs: U[][]): U[] {\n"
+    "  const out: U[] = [];\n"
+    "  for (const ys of xs) for (const y of ys) out.push(y);\n"
+    "  return out;\n"
+    "}\n";
 /* xisto:reflect: the descriptors the compiler builds for decorated classes (see "static reflection") */
 static const char xs_reflect_src[] =
     "// What a type is, and how to read and write a value of it as JSON.\n"
@@ -4091,6 +4118,15 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         Func *f = builtin_func(m, "setTimeout", "xs_sleep_ms", ty_void, 1, ty_int, NULL);
         f->params[0].name = "ms";
         add_func(prog, f);
+        return m;
+    }
+    if (strcmp(name, "arrays") == 0) { /* xisto:arrays: reduce, flatMap, flat (see xs_arrays_src) */
+        m->builtin = false;
+        m->file = "xisto:arrays";
+        m->src = (char *)xs_arrays_src;
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
         return m;
     }
     if (strcmp(name, "reflect") == 0) { /* xisto:reflect: written in xisto, parsed like any module */
@@ -4300,6 +4336,7 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
 Program *parse_program(const char *entry_file) {
     Program *prog = xs_alloc(sizeof *prog);
     load_module(prog, entry_file, (Pos){0, 0}, NULL);
+    if (wants_arrays) load_module(prog, "xisto:arrays", (Pos){1, 1}, entry_file);
     /* top-level statements were appended in parse order (entry first); reorder by module order */
     StmtList ordered = {0};
     for (int mi = 0; mi < prog->nmodules; mi++)
