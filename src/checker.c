@@ -79,6 +79,19 @@ static void sym_add(SymTable *t, const char *name, void *decl) {
 
 #define SYM_EACH(t, key_, var) for (SymEntry *var = (t).buckets ? (t).buckets[sym_hash(key_) % (t).nb] : NULL; var; var = var->next) if (strcmp(var->name, (key_)) == 0)
 
+/* a field's C name: f_<name>, with what C does not allow in a name spelled out ('@timestamp' is f__x40timestamp) */
+static char *field_cname(const char *name) {
+    bool plain = true;
+    for (const char *q = name; *q; q++) if (!isalnum((unsigned char)*q) && *q != '_' && *q != '$') plain = false;
+    if (plain) return xs_sprintf("f_%s", name);
+    Buf b = {0};
+    buf_puts(&b, "f_");
+    for (const char *q = name; *q; q++) {
+        if (isalnum((unsigned char)*q) || *q == '_') buf_putc(&b, *q);
+        else buf_printf(&b, "_x%02x", (unsigned char)*q);
+    }
+    return b.data;
+}
 static void enter_module(Module *m) {
     cur_mod = m;
     scope = mod_scopes[m->id];
@@ -144,7 +157,7 @@ static void bi_field(Class *c, const char *name, Type *type) {
     Field f = {0};
     f.name = (char *)name;
     f.type = type;
-    f.cname = xs_sprintf("f_%s", name);
+    f.cname = field_cname(name);
     c->fields[c->nfields++] = f;
 }
 
@@ -892,7 +905,7 @@ static Class *instantiate(Class *tmpl, Type **args, Pos pos) {
     for (int i = 0; i < tmpl->nfields; i++) {
         c->fields[i] = tmpl->fields[i];
         c->fields[i].type = resolve(subst(tmpl->fields[i].type, tmpl, args), pos);
-        c->fields[i].cname = xs_sprintf("f_%s", tmpl->fields[i].name);
+        c->fields[i].cname = field_cname(tmpl->fields[i].name);
     }
     c->nfields = c->cap_fields = tmpl->nfields;
     cur_mod = saved_mod;
@@ -959,7 +972,7 @@ static Class *instantiate_class(Class *tmpl, Type **args, Pos pos) {
             if (strcmp(fd->name, c->fields[j].name) == 0) xs_error(XS9023, fd->pos, NULL, "field '%s' is declared twice", fd->name);
         fd->type = resolve(fd->type, fd->pos);
         check_type_supported(fd->pos, fd->type);
-        fd->cname = xs_sprintf("f_%s", fd->name);
+        fd->cname = field_cname(fd->name);
     }
     for (int k = 0; k < c->nmethods; k++) {
         Func *m = c->methods[k];
@@ -1739,8 +1752,27 @@ static Type *unify_numeric(Expr *e, const char *what) {
    caller calls a; each becomes a copy of that argument when it can be read twice without a difference (a name, a
    field, a literal), and otherwise the call must give the argument. */
 static Expr *dflt_subst(Expr *d, Func *f, Expr **args, int nargs, Pos at);
+/* where an expression's names resolve: a default reads the names of the function's module (not the caller's), and
+   the arguments it reads are the caller's own expressions */
+typedef struct { Scope *scope; Module *mod; Class *cls; } CheckCtx;
+static CheckCtx *dflt_caller;
+static Expr *dflt_recv; /* obj in obj.m(...): what `this` reads in m's defaults */
+static CheckCtx *ctx_here(void) {
+    CheckCtx *c = xs_alloc(sizeof *c);
+    c->scope = scope; c->mod = cur_mod; c->cls = cur_class;
+    return c;
+}
 static Expr *dflt_arg(Func *f, int i, Expr **args, int nargs, Pos at) {
-    return dflt_subst(f->params[i].dflt, f, args, nargs, at);
+    CheckCtx *was = dflt_caller;
+    dflt_caller = ctx_here();
+    Expr *e = dflt_subst(f->params[i].dflt, f, args, nargs, at);
+    dflt_caller = was;
+    if (e && f->mod && f->mod != cur_mod && e->kind != E_NUMBER && e->kind != E_STRING && e->kind != E_BOOL && e->kind != E_NULL) {
+        CheckCtx *c = xs_alloc(sizeof *c);
+        c->scope = mod_scopes[f->mod->id]; c->mod = f->mod; c->cls = cur_class;
+        e->ctx = c;
+    }
+    return e;
 }
 static Expr *dflt_subst(Expr *d, Func *f, Expr **args, int nargs, Pos at) {
     if (!d) return NULL;
@@ -1756,8 +1788,19 @@ static Expr *dflt_subst(Expr *d, Func *f, Expr **args, int nargs, Pos at) {
                 if (!simple)
                     xs_error(XS8132, at, xs_sprintf("put the argument for '%s' in a const first, or give every argument", f->params[k].name),
                              "the default of a later parameter reads '%s', and the argument given for it cannot be read twice", d->str);
-                return dflt_subst(a, f, NULL, 0, at); /* (a copy of the argument as written) */
+                Expr *cp = dflt_subst(a, f, NULL, 0, at); /* (a copy of the argument as written) */
+                if (dflt_caller) cp->ctx = dflt_caller;
+                return cp;
             }
+    if (d->kind == E_THIS && dflt_recv && dflt_recv->kind != E_THIS) { /* m(k = this.size): the receiver of this call */
+        Expr *p = dflt_recv;
+        while (p->kind == E_MEMBER && !p->is_call) p = p->lhs;
+        if (p->kind != E_IDENT && p->kind != E_THIS)
+            xs_error(XS8132, at, "put the object in a const first, or give every argument", "a default reads 'this', and the object the method is called on cannot be read twice");
+        Expr *cp = dflt_subst(dflt_recv, f, NULL, 0, at);
+        if (dflt_caller) cp->ctx = dflt_caller;
+        return cp;
+    }
     if (d->kind == E_ARROW) return c; /* (an arrow's own names are its own) */
     c->lhs = dflt_subst(d->lhs, f, args, nargs, at);
     c->rhs = dflt_subst(d->rhs, f, args, nargs, at);
@@ -2217,8 +2260,10 @@ static void fs_add(FieldSet *out, Field f) {
     out->f = realloc(out->f, sizeof(Field) * (size_t)(out->n + 1));
     out->f[out->n++] = f;
 }
+static void flatten_fields(Class *c, int depth);
 static void class_fields_all(Class *k, FieldSet *out) {
     if (k->mixin && !k->mixin_done) { Module *was = cur_mod; apply_mixin(k); enter_module(was); }
+    if (k->niface_bases && !k->flattened) { Module *was = cur_mod; flatten_fields(k, 0); enter_module(was); }
     if (k->base_name) {
         Module *was = cur_mod;
         enter_module(k->mod);
@@ -2539,7 +2584,10 @@ static void check_object_member(Expr *e, Class *c) {
         return;
     }
     if (e->ntargs) xs_error(XS6003, e->pos, NULL, "%s.%s is not generic", c->name, m->name);
+    Expr *recv0 = dflt_recv;
+    dflt_recv = e->lhs;
     check_args(e, m, xs_sprintf("%s.%s", c->name, m->name));
+    dflt_recv = recv0;
     e->func = m;
     e->type = fret(m, e->pos);
     if (!c->builtin && !e->super_call && (m->is_abstract || overridden_below(c, m))) { /* dispatched by the object's class */
@@ -2603,7 +2651,7 @@ static void infer_objlit(Expr *e) {
         c->used = true;
         c->fields = xs_alloc(sizeof(Field) * (size_t)(e->args.len ? e->args.len : 1));
         for (int i = 0; i < e->args.len; i++)
-            c->fields[i] = (Field){.name = e->keys[i], .pos = e->args.items[i]->pos, .type = ts[i], .cname = xs_sprintf("f_%s", e->keys[i]), .owner = c};
+            c->fields[i] = (Field){.name = e->keys[i], .pos = e->args.items[i]->pos, .type = ts[i], .cname = field_cname(e->keys[i]), .owner = c};
         c->nfields = c->cap_fields = e->args.len;
         c->flattened = true;
         prog->classes = realloc(prog->classes, sizeof(Class *) * (size_t)(prog->nclasses + 1));
@@ -2632,7 +2680,7 @@ static void anon_objlit(Expr *e) {
         settle(v);
         if (v->type->kind == TY_NULL) xs_error(XS3009, v->pos, "give the object a declared type", "cannot infer the type of null here");
         if (!json_ok(v->type, 0)) xs_error(XS8004, v->pos, NULL, "%s cannot be part of a JSON value", ty_name(v->type));
-        c->fields[i] = (Field){.name = e->keys[i], .pos = v->pos, .type = v->type, .cname = xs_sprintf("f_%s", e->keys[i])};
+        c->fields[i] = (Field){.name = e->keys[i], .pos = v->pos, .type = v->type, .cname = field_cname(e->keys[i])};
     }
     c->nfields = c->cap_fields = e->args.len;
     prog->classes = realloc(prog->classes, sizeof(Class *) * (size_t)(prog->nclasses + 1));
@@ -3000,7 +3048,21 @@ static bool objlit_expand(Expr *e, Type *expected) {
     return false;
 }
 
+static void check_expr_in(Expr *e, Type *expected);
 static void check_expr(Expr *e, Type *expected) {
+    if (!e->ctx) { check_expr_in(e, expected); return; }
+    CheckCtx *c = e->ctx;
+    e->ctx = NULL;
+    Scope *s0 = scope; Module *m0 = cur_mod; Class *k0 = cur_class;
+    const char *fn0 = xs_file_name, *src0 = xs_source;
+    if (c->mod) enter_module(c->mod);
+    scope = c->scope;
+    cur_class = c->cls;
+    check_expr_in(e, expected);
+    scope = s0; cur_mod = m0; cur_class = k0;
+    xs_file_name = fn0; xs_source = src0;
+}
+static void check_expr_in(Expr *e, Type *expected) {
     switch (e->kind) {
     case E_NUMBER:
         e->type = e->is_int_lit ? ty_litint : ty_number;
@@ -3885,7 +3947,7 @@ static void check_expr(Expr *e, Type *expected) {
                 return;
             }
         }
-        check_args(e, f, xs_sprintf("'%s'", f->name));
+        { Expr *r0 = dflt_recv; dflt_recv = NULL; check_args(e, f, xs_sprintf("'%s'", f->name)); dflt_recv = r0; }
         e->func = f;
         e->type = fret(f, e->pos);
         if (f->mod && f->mod->builtin && strcmp(f->cname, "xs_sleep_ms") == 0) prog->uses_net = true; /* timers live with the event loop */
@@ -3901,6 +3963,14 @@ static void check_expr(Expr *e, Type *expected) {
             e->rhs = NULL;
             e->args = (ExprList){0};
             expr_list_push(&e->args, key);
+            check_expr(e, expected);
+            return;
+        }
+        if (e->lhs->type->kind == TY_OBJECT && !e->lhs->type->cls->is_tuple && !e->lhs->type->cls->builtin && e->rhs->kind == E_STRING) {
+            e->kind = E_MEMBER; /* o['@timestamp']: the field of that name */
+            e->str = e->rhs->str;
+            e->rhs = NULL;
+            e->is_call = false;
             check_expr(e, expected);
             return;
         }
@@ -4602,6 +4672,15 @@ static void check_expr(Expr *e, Type *expected) {
         return;
     }
     case E_NULL:
+        if (e->unset && expected && expected->kind != TY_NULLABLE) { /* let x: T; */
+            switch (expected->kind) {
+            case TY_OBJECT: case TY_UNION: case TY_FUNC: case TY_UNKNOWN: e->type = expected; return; /* (NULL until assigned) */
+            case TY_ENUM: case TY_INT: case TY_NUMBER: e->kind = E_NUMBER; e->num = 0; e->is_int_lit = true; check_expr(e, expected); return;
+            case TY_STRING: e->kind = E_STRING; e->str = ""; check_expr(e, expected); return;
+            case TY_BOOLEAN: e->kind = E_BOOL; e->boolean = false; check_expr(e, expected); return;
+            default: xs_error(XS8146, e->pos, "xisto has no 'undefined', so every variable starts with a value", "variable of type %s must be initialized", ty_name(expected));
+            }
+        }
         e->type = ty_null;
         if (expected && expected->kind == TY_NULLABLE) e->type = expected;
         return;
@@ -6677,6 +6756,7 @@ static Type *fret(Func *f, Pos pos) {
     for_init_decl = fid; decl_no_cell = dnc; checking_generated = cg; failed_ = fl;
     ii_body = iib; ii_depth = iid;
     II_BACK(sev, nsev, ScanEv)
+    if (nsev_s) cap_sev = nsev_s; /* (the array was cut to that size: its capacity too, or the next event writes past it) */
     II_BACK(ii_tnames, ii_tn, const char *)
     II_BACK(ii_anames, ii_an, const char *)
     II_BACK(ii_lnames, ii_ln, const char *)
@@ -6756,7 +6836,6 @@ static void infer_field_type(Class *c, Field *fd) {
 void check_program(Program *p) {
     prog = p;
     init_builtins();
-    if (nsev_s) cap_sev = nsev_s; /* (the array was cut to that size: its capacity too, or the next event writes past it) */
     for (int i = 0; i < p->nfuncs; i++) sym_add(&funcs_by_name, p->funcs[i]->name, p->funcs[i]);
     for (int i = 0; i < p->nclasses; i++) sym_add(&classes_by_name, p->classes[i]->name, p->classes[i]);
     for (int i = 0; i < p->nenums; i++) sym_add(&enums_by_name, p->enums[i]->name, p->enums[i]);
@@ -6902,7 +6981,7 @@ void check_program(Program *p) {
             if (!fd->type) infer_field_type(c, fd);
             fd->type = resolve(fd->type, fd->pos);
             check_type_supported(fd->pos, fd->type);
-            fd->cname = xs_sprintf("f_%s", fd->name);
+            fd->cname = field_cname(fd->name);
         }
         for (int k = 0; k < c->nmethods; k++) {
             Func *m = c->methods[k];
