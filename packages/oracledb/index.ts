@@ -21,6 +21,19 @@ export const DB_TYPE_BLOB: int = 2019;
 export const DB_TYPE_BOOLEAN: int = 2022;
 export const DB_TYPE_JSON: int = 2027;
 
+/** Bind directions and the type aliases node-oracledb exports (for { dir, type } bind descriptors). */
+export const BIND_IN: int = 3001;
+export const BIND_INOUT: int = 3002;
+export const BIND_OUT: int = 3003;
+export const STRING: int = 2001;
+export const NUMBER: int = 2010;
+export const DATE: int = 2011;
+export const CURSOR: int = 2021;
+export const BUFFER: int = 2006;
+export const CLOB: int = 2017;
+export const BLOB: int = 2019;
+export const DB_TYPE_CURSOR: int = 2021;
+
 /**
  * The column types fetched as text. xisto always fetches CLOB as text (what TypeORM asks with
  * `fetchAsString = [DB_TYPE_CLOB]`), so the setting is accepted and has no other effect.

@@ -806,6 +806,11 @@ function selectList(m: EntityMetadata, alias: string, only: string[]): string {
 // ---------------------------------------------------------------------------------------------------------------
 // find options and results
 
+/** TypeORM's where / partial entity types: an object of the entity's columns (read as JSON by the query builder) */
+export type FindOptionsWhere<T> = object;
+export type DeepPartial<T> = object;
+export type ObjectLiteral = object;
+
 export interface FindManyOptions {
   where?: object;
   order?: object;
