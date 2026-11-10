@@ -326,6 +326,8 @@ export interface DriverResult {
 
 /** A pinned connection: the statements of a transaction run on it. */
 export abstract class DriverSession {
+  /** the driver's own connection (an oracledb Connection for "oracle"; null when the driver has none to give) */
+  raw: unknown = null;
   abstract run(sql: string, params: unknown[]): Promise<object>;
   abstract begin(): Promise<void>;
   abstract commit(): Promise<void>;
@@ -454,10 +456,12 @@ export class PostgresDriver extends Driver {
 
 // oracle: any pool with node-oracledb's shape, given as functions (the oracledb package builds them)
 export interface OracleConnectionFunctions {
-  execute: (sql: string, binds: unknown[]) => Promise<object>; // {"rows":[{COLUMN: value}],"rowsAffected":n}
+  execute: (sql: string, binds: unknown[]) => Promise<object>; // {"rows":[{COLUMN: value}],"rowsAffected":n,"outBinds":...}
   commit: () => Promise<void>;
   rollback: () => Promise<void>;
   close: () => Promise<void>;
+  /** the driver's connection itself (QueryRunner.connect() returns it, as TypeORM does), or null */
+  raw?: unknown;
 }
 export interface OraclePoolFunctions {
   getConnection: () => Promise<OracleConnectionFunctions>;
@@ -467,17 +471,22 @@ export interface OraclePoolFunctions {
 function oracleResult(r: object): object {
   const rows = get(r, "rows");
   const affected = get(r, "rowsAffected");
+  const outBinds = get(r, "outBinds");
   const n = kind(affected) === "number" ? jsonInt(affected) : kind(rows) === "array" ? len(rows) : 0;
-  const text = '{"rows":' + (kind(rows) === "array" ? JSON.stringify(rows) : "[]") + ',"rowCount":' + String(n) + "}";
+  // a PL/SQL block's OUT binds go with the result: query() returns them, as TypeORM returns raw.outBinds
+  const out = kind(outBinds) === "null" ? "" : ',"outBinds":' + JSON.stringify(outBinds);
+  const ra = kind(affected) === "number" ? ',"rowsAffected":' + String(n) : "";
+  const text = '{"rows":' + (kind(rows) === "array" ? JSON.stringify(rows) : "[]") + ',"rowCount":' + String(n) + ra + out + "}";
   const o: object = JSON.parse(text);
   return o;
 }
 
 class OracleSession extends DriverSession {
   private conn: OracleConnectionFunctions;
-  constructor(conn: OracleConnectionFunctions) {
+  constructor(conn: OracleConnectionFunctions, raw: unknown) {
     super();
     this.conn = conn;
+    this.raw = raw;
   }
   async run(sql: string, params: unknown[]): Promise<object> {
     return oracleResult(await this.conn.execute(sql, params));
@@ -535,7 +544,8 @@ export class OracleDriver extends Driver {
     if (p === null) {
       throw new Error("the DataSource is not initialized: call initialize() first");
     }
-    return new OracleSession(await p.getConnection());
+    const c = await p.getConnection();
+    return new OracleSession(c, c.raw ?? null);
   }
 }
 
@@ -553,6 +563,7 @@ function oracleConnection(c: Connection): OracleConnectionFunctions {
     close: async (): Promise<void> => {
       await c.close();
     },
+    raw: c,
   };
 }
 
@@ -893,7 +904,9 @@ export class Executor {
     return await runWrapped(ws, ws.length - 1, sql, params, direct);
   }
   async rows(sql: string, params: unknown[]): Promise<object> {
-    return get(await this.run(sql, params), "rows");
+    const r = await this.run(sql, params);
+    const out = get(r, "outBinds");
+    return kind(out) === "null" ? get(r, "rows") : out; // (TypeORM: raw.rows || raw.outBinds)
   }
 }
 
@@ -1684,6 +1697,28 @@ export class EntityManager {
     const rows: T = raw; // query<Row[]>(...) decodes the rows as Row[], like TypeORM's query<T>
     return rows;
   }
+  /**
+   * TypeORM's QueryResult ({ records, affected, raw }), what queryRunner.query(sql, params, true) returns: for
+   * Oracle the rows of a query, rowsAffected of DML, or a PL/SQL block's outBinds (records when by position)
+   */
+  async queryResult<T = object>(sql: string, params: unknown[] = []): Promise<T> {
+    const r = await this.executor.run(sql, params);
+    const rows = get(r, "rows");
+    const out = get(r, "outBinds");
+    const ra = get(r, "rowsAffected");
+    let text = "";
+    if (this.executor.dialect() !== "oracle") {
+      text = '{"records":' + JSON.stringify(rows) + ',"affected":' + JSON.stringify(get(r, "rowCount")) + ',"raw":' + JSON.stringify(rows) + "}";
+    } else if (kind(out) !== "null") {
+      text = '{"records":' + (kind(out) === "array" ? JSON.stringify(out) : "[]") + ',"raw":' + JSON.stringify(out) + "}";
+    } else if (kind(ra) === "number") {
+      text = '{"records":[],"affected":' + JSON.stringify(ra) + ',"raw":' + JSON.stringify(ra) + "}";
+    } else {
+      text = '{"records":' + JSON.stringify(rows) + ',"raw":' + JSON.stringify(rows) + "}";
+    }
+    const o: T = JSON.parse(text);
+    return o;
+  }
   /** getRepository<User>(User): the class gives its metadata, the type argument the entities' type */
   getRepository<T>(entity: ClassInfo): Repository<T> {
     return new Repository<T>(this.executor.dataSource.options.name ?? "default", this.executor.sessionId);
@@ -1708,8 +1743,11 @@ export class QueryRunner {
   }
 
   private sessionId: int = -1;
+  /** the driver's connection once connected (an oracledb Connection for "oracle"), as in TypeORM */
+  databaseConnection: unknown = null;
 
-  async connect(): Promise<void> {
+  /** takes a connection for this runner (once); returns the driver's connection, as TypeORM does */
+  async connect(): Promise<unknown> {
     if (!this.dataSource.isInitialized) {
       await this.dataSource.initialize();
     }
@@ -1720,7 +1758,9 @@ export class QueryRunner {
       nextSession = nextSession + 1;
       sessions.set(this.sessionId, s);
       this.manager = new EntityManager(new Executor(this.dataSource, s, this.sessionId));
+      this.databaseConnection = s.raw;
     }
+    return this.databaseConnection;
   }
 
   private session(): DriverSession {
@@ -1754,11 +1794,16 @@ export class QueryRunner {
       sessions.delete(this.sessionId);
     }
     this.sessionOf = null;
+    this.databaseConnection = null;
     this.isReleased = true;
   }
 
-  async query<T = object>(sql: string, params: unknown[] = []): Promise<T> {
+  /** raw SQL on this runner's connection; useStructuredResult: TypeORM's QueryResult (see EntityManager.queryResult) */
+  async query<T = object>(sql: string, params: unknown[] = [], useStructuredResult: boolean = false): Promise<T> {
     await this.connect();
+    if (useStructuredResult) {
+      return this.manager.queryResult<T>(sql, params);
+    }
     return this.manager.query<T>(sql, params);
   }
 }

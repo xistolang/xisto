@@ -15,3 +15,7 @@ transaction rolled back: abort
 3 is cheese
 deleted 2, left 1
 error: ORA-00942: table or view "XISTO"."XISTO_TO_NO_SUCH_TABLE" does not exist
+outBinds [42]
+structured update affected 1 records []
+structured plsql records ["pl 5"]
+raw connection olá typeorm
