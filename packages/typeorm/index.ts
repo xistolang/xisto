@@ -355,6 +355,16 @@ export abstract class Driver {
   abstract session(): Promise<DriverSession>;
 }
 
+/** The driver's pool settings TypeORM passes on (extra: { poolMax, stmtCacheSize, ... }); accepted, the xisto pool
+    keeps its own sizes for now */
+export interface DataSourceExtra {
+  poolMin?: number;
+  poolMax?: number;
+  poolIncrement?: number;
+  stmtCacheSize?: number;
+  queueTimeout?: number;
+  callTimeout?: number;
+}
 export interface DataSourceOptions {
   type: string;
   host?: string;
@@ -368,8 +378,9 @@ export interface DataSourceOptions {
   serviceName?: string;
   entities?: ClassInfo[];
   synchronize?: boolean;
-  logging?: boolean;
+  logging?: boolean | string[]; // true logs every query; a list of levels (["error"]) logs no queries
   poolSize?: int;
+  extra?: DataSourceExtra;
   name?: string;
 }
 
@@ -918,7 +929,8 @@ export class Executor {
     if (!this.dataSource.isInitialized) {
       await this.dataSource.initialize(); // a DataSource from TypeOrmModule connects on its first query
     }
-    if (this.dataSource.options.logging ?? false) {
+    const lg = this.dataSource.options.logging ?? false;
+    if (typeof lg === "boolean" && lg) {
       console.log("query: " + sql);
     }
     const s = this.session;
@@ -1376,8 +1388,14 @@ export class SelectQueryBuilder<T> {
     return this.join("LEFT JOIN", target, alias, condition, params);
   }
 
-  orderBy(sort: string, order: string = "ASC"): SelectQueryBuilder<T> {
-    this.orders = [sort + " " + (order.toUpperCase() === "DESC" ? "DESC" : "ASC")];
+  /** orderBy("u.name", "DESC"), or orderBy({ "u.name": "ASC", "u.id": "DESC" }): the columns in order */
+  orderBy(sort: string | Record<string, string>, order: string = "ASC"): SelectQueryBuilder<T> {
+    if (typeof sort === "string") {
+      this.orders = [sort + " " + (order.toUpperCase() === "DESC" ? "DESC" : "ASC")];
+      return this;
+    }
+    this.orders = [];
+    for (const [k, v] of Object.entries(sort)) this.orders.push(k + " " + (v.toUpperCase() === "DESC" ? "DESC" : "ASC"));
     return this;
   }
 
