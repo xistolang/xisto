@@ -53,6 +53,17 @@ export { FileInterceptorSpec, UploadedFileData } from "./upload";
 export { Reflector } from "@nestjs/common"; // (Nest exports it from @nestjs/core)
 
 /** Options of NestFactory.create. */
+/** app.enableCors(options): what Nest takes (origin list, methods, credentials, headers) */
+export interface CorsOptions {
+  origin?: string[];
+  methods?: string[];
+  credentials?: boolean;
+  allowedHeaders?: string[];
+}
+/** app.enableShutdownHooks(signals, { useProcessExit }) */
+export interface ShutdownHooksOptions {
+  useProcessExit?: boolean;
+}
 export class NestApplicationOptions {
   cors?: boolean;
   bufferLogs?: boolean;
@@ -778,6 +789,7 @@ function lifecycle(name: string): void {
 export class NestApplication {
   private readonly root: ClassInfo;
   private cors: boolean;
+  private corsOptions: CorsOptions | null = null;
   private prefix: string = "";
   private readonly extras: ExtraRoute[] = [];
   private versioning: boolean = false;
@@ -815,8 +827,10 @@ export class NestApplication {
     return this;
   }
 
-  enableCors(): void {
+  /** CORS on every route; the options are accepted (the answer allows any origin, as before) */
+  enableCors(options: CorsOptions | null = null): void {
     this.cors = true;
+    this.corsOptions = options;
   }
 
   /** A middleware for every request (helmet(), compression()). */
@@ -841,7 +855,7 @@ export class NestApplication {
   useLogger(logger: unknown): void {}
 
   /** Runs onModuleDestroy and onApplicationShutdown on exit (accepted; xisto runs them on close()). */
-  enableShutdownHooks(): NestApplication {
+  enableShutdownHooks(signals: string[] = [], options: ShutdownHooksOptions | null = null): NestApplication {
     return this;
   }
 

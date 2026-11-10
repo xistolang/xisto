@@ -362,6 +362,10 @@ export class ValidationPipeOptions {
   whitelist?: boolean;
   transform?: boolean;
   forbidNonWhitelisted?: boolean;
+  transformOptions?: ValidationTransformOptions; // (accepted: bodies are decoded by their declared types)
+}
+export interface ValidationTransformOptions {
+  enableImplicitConversion?: boolean;
 }
 
 /** Validates class bodies with class-validator: 400 with the messages when a rule fails. */
