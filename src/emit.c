@@ -1375,6 +1375,10 @@ static char *type_tag(Type *t) {
 static void ensure_json(Type *t);
 static const char *where_elem(int i) { return xs_sprintf("[%d]", i); }
 
+/* JSON.stringify of an unknown (a field of that type too): xs_json_unknown, generated after the program, looks at
+   the value's type at run time: a string, a boxed number or boolean, an array, or an object of one of the
+   program's classes (each class JSON can write gets its json_put_ function then) */
+static bool json_unknown_used;
 static void json_emit_value(Buf *b, Type *t, const char *expr) { /* appends into xs_sb *sb */
     switch (t->kind) {
     case TY_NUMBER: buf_printf(b, "xs_sb_num(sb, %s);", expr); break;
@@ -1383,6 +1387,7 @@ static void json_emit_value(Buf *b, Type *t, const char *expr) { /* appends into
     case TY_STRING: buf_printf(b, "xs_sb_str(sb, %s);", expr); break;
     case TY_JSON: buf_printf(b, "{ xs_str *j_ = %s; xs_sb_put(sb, j_->data, (size_t)j_->len); }", expr); break; /* embedded as is */
     case TY_ENUM: buf_printf(b, t->en->is_string ? "xs_sb_str(sb, %s);" : "xs_sb_int(sb, %s);", expr); break;
+    case TY_UNKNOWN: json_unknown_used = true; buf_printf(b, "xs_json_unknown(sb, %s);", expr); break; /* by its type at run time */
     case TY_OBJECT:
         if (t->cls->builtin && strcmp(t->cls->name, "Date") == 0) { buf_printf(b, "xs_sb_date(sb, %s);", expr); break; }
         ensure_json(t);
@@ -1404,6 +1409,7 @@ static void json_emit_read(Buf *b, Type *t, const char *jv, const char *where) {
     case TY_BOOLEAN: buf_printf(b, "xs_json_bool(%s, \"%s\")", jv, where); break;
     case TY_STRING: buf_printf(b, "xs_json_str(%s, \"%s\")", jv, where); break;
     case TY_JSON: buf_printf(b, "xs_json_text(%s)", jv); break; /* any value, kept as its JSON text (an object[] read back) */
+    case TY_UNKNOWN: buf_printf(b, "((void)(%s), xs_panicf(\"JSON: '%%s' is unknown, which JSON cannot be read into\", \"%s\"), (void *)NULL)", jv, where); break;
     case TY_OBJECT:
         if (t->cls->builtin && strcmp(t->cls->name, "Date") == 0) { buf_printf(b, "xs_json_date(%s, \"%s\")", jv, where); break; }
         ensure_json(t);
@@ -2291,7 +2297,7 @@ static Class *json_capable_stack[64];
 static int json_capable_depth;
 static bool json_capable(Type *t) {
     switch (t->kind) {
-    case TY_NUMBER: case TY_INT: case TY_BOOLEAN: case TY_STRING: case TY_ENUM: case TY_JSON: return true;
+    case TY_NUMBER: case TY_INT: case TY_BOOLEAN: case TY_STRING: case TY_ENUM: case TY_JSON: case TY_UNKNOWN: return true;
     case TY_ARRAY: case TY_NULLABLE: return json_capable(t->elem);
     case TY_OBJECT: {
         if (t->cls->builtin) return false;
@@ -2946,6 +2952,17 @@ static void emit_expr_raw(Expr *e) {
                 emit_expr(e->lhs);
                 if (in_hierarchy(c)) buf_puts(out, ")))");
                 else buf_printf(out, ")), %s_free)", c->cname);
+                return;
+            }
+            if (c->ntparams && !c->generic_of) { /* x instanceof Box (generic): an object of any of its instances */
+                static int ngi;
+                int id = ngi++;
+                buf_printf(out, "({ void *gi%d_ = (void *)(", id);
+                emit_expr(e->lhs);
+                buf_printf(out, "); void (*gf%d_)(void *) = gi%d_ ? xs_type_of(gi%d_)->free : NULL; (false", id, id, id);
+                for (int i = 0; i < prog->nclasses; i++)
+                    if (prog->classes[i]->generic_of == c && prog->classes[i]->used) buf_printf(out, " || gf%d_ == %s_free", id, prog->classes[i]->cname);
+                buf_puts(out, "); })");
                 return;
             }
             if (in_hierarchy(c)) {
@@ -9532,7 +9549,41 @@ void emit_program(Program *p, Buf *o) {
         *out = joined;
     }
     if (cell_fns.data) { buf_puts(out, cell_fns.data); cell_fns.len = 0; cell_fns.data[0] = 0; ncell = 0; }
-    if (json_fns.data) buf_puts(out, json_fns.data);
+    if (json_unknown_used) {
+        /* every class JSON can write, for the values an unknown holds */
+        int ncls = 0;
+        Class **cls = xs_alloc(sizeof(Class *) * (size_t)(p->nclasses + 1));
+        for (int i = 0; i < p->nclasses; i++) {
+            Class *c = p->classes[i];
+            if (!c->used || c->builtin || c->is_tuple) continue;
+            Type *t = ty_object_of(c);
+            if (!json_capable(t)) continue;
+            ensure_json(t);
+            cls[ncls++] = c;
+        }
+        Buf u = {0};
+        buf_puts(&u, "static void xs_json_unknown(xs_sb *sb, void *v) {\n"
+                     "    if (!v) { xs_sb_put(sb, \"null\", 4); return; }\n"
+                     "    void (*f_)(void *) = xs_type_of(v)->free;\n"
+                     "    if (f_ == xs_str_free) { xs_sb_str(sb, (xs_str *)v); return; }\n"
+                     "    if (f_ == xs_box_int_free) { xs_sb_int(sb, ((xs_box_i *)v)->v); return; }\n"
+                     "    if (f_ == xs_box_num_free) { xs_sb_num(sb, ((xs_box_d *)v)->v); return; }\n"
+                     "    if (f_ == xs_box_bool_free) { xs_sb_bool(sb, ((xs_box_i *)v)->v != 0); return; }\n"
+                     "#define XS_JU_ARR_(T, put) if (f_ == T##_free) { T *a_ = v; xs_sb_put(sb, \"[\", 1); for (size_t i_ = 0; i_ < a_->len; i_++) { if (i_) xs_sb_put(sb, \",\", 1); put(sb, a_->data[i_]); } xs_sb_put(sb, \"]\", 1); return; }\n"
+                     "    XS_JU_ARR_(xs_arr_num, xs_sb_num)\n"
+                     "    XS_JU_ARR_(xs_arr_int, xs_sb_int)\n"
+                     "    XS_JU_ARR_(xs_arr_bool, xs_sb_bool)\n"
+                     "    XS_JU_ARR_(xs_arr_ref, xs_json_unknown)\n"
+                     "#undef XS_JU_ARR_\n");
+        for (int i = 0; i < ncls; i++)
+            buf_printf(&u, "    if (f_ == %s_free) { json_put_%s(sb, (%s *)v); return; }\n", cls[i]->cname, type_tag(ty_object_of(cls[i])), cls[i]->cname);
+        buf_puts(&u, "    xs_panic(\"TypeError: this value cannot be written as JSON\");\n}\n");
+        buf_puts(out, "static void xs_json_unknown(xs_sb *sb, void *v);\n");
+        if (json_fns.data) buf_puts(out, json_fns.data);
+        buf_puts(out, u.data);
+        free(u.data);
+        json_unknown_used = false;
+    } else if (json_fns.data) buf_puts(out, json_fns.data);
     if (isa_fns.data) { buf_puts(out, isa_fns.data); isa_fns.len = 0; isa_fns.data[0] = 0; nisa = 0; }
     if (disp_fns.data) { buf_puts(out, disp_fns.data); disp_fns.len = 0; disp_fns.data[0] = 0; ndisp = 0; }
     if (xs_debug) {
