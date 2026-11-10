@@ -874,13 +874,31 @@ export interface FindManyOptions {
   order?: object;
   skip?: number;
   take?: number;
-  select?: string[];
+  select?: string[] | Record<string, boolean>; // (TypeORM: the column names, or { column: true })
 }
 
 export interface FindOneOptions {
   where?: object;
   order?: object;
-  select?: string[];
+  select?: string[] | Record<string, boolean>; // (TypeORM: the column names, or { column: true })
+}
+
+// find's select as TypeORM takes it: ["a", "b"] or { a: true, b: true } (a false column is left out)
+function findSelect(s: string[] | Record<string, boolean> | null): string[] {
+  if (s === null) {
+    return [];
+  }
+  if (Array.isArray(s)) {
+    return s as string[];
+  }
+  const out: string[] = [];
+  const r = s as Record<string, boolean>;
+  for (const k of Object.keys(r)) {
+    if (r[k]) {
+      out.push(k);
+    }
+  }
+  return out;
 }
 
 export interface UpdateResult {
@@ -1033,12 +1051,12 @@ export class Repository<T> {
   /** The SELECT a find runs (with its parameters), for tests and logging. */
   findSql(options: FindManyOptions = {}): string {
     const binds = new Binds(this.executor.dialect());
-    return this.selectSql(options.where ?? null, options.order ?? null, Math.trunc(options.skip ?? 0), Math.trunc(options.take ?? 0), options.select ?? [], binds);
+    return this.selectSql(options.where ?? null, options.order ?? null, Math.trunc(options.skip ?? 0), Math.trunc(options.take ?? 0), findSelect(options.select ?? null), binds);
   }
 
   async find(options: FindManyOptions = {}): Promise<T[]> {
     const binds = new Binds(this.executor.dialect());
-    const sql = this.selectSql(options.where ?? null, options.order ?? null, Math.trunc(options.skip ?? 0), Math.trunc(options.take ?? 0), options.select ?? [], binds);
+    const sql = this.selectSql(options.where ?? null, options.order ?? null, Math.trunc(options.skip ?? 0), Math.trunc(options.take ?? 0), findSelect(options.select ?? null), binds);
     return this.entities(await this.executor.rows(sql, binds.values));
   }
 
@@ -1055,7 +1073,7 @@ export class Repository<T> {
 
   async findOne(options: FindOneOptions): Promise<T | null> {
     const binds = new Binds(this.executor.dialect());
-    const sql = this.selectSql(options.where ?? null, options.order ?? null, 0, 1, options.select ?? [], binds);
+    const sql = this.selectSql(options.where ?? null, options.order ?? null, 0, 1, findSelect(options.select ?? null), binds);
     const found = this.entities(await this.executor.rows(sql, binds.values));
     return found.length > 0 ? found[0] : null;
   }

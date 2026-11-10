@@ -113,11 +113,17 @@ interface ExtraRoute {
 }
 
 /** What DiscoveryService gives for one provider or controller. */
+/** The module a provider was declared in (InstanceWrapper.host, as Nest's Module: its metatype is the module class). */
+export class ModuleHost {
+  metatype: ClassInfo | null = null;
+}
+
 export class InstanceWrapper {
   name: string = "";
   token: unknown = null;
   instance: unknown = null;
   metatype: ClassInfo | null = null;
+  host: ModuleHost | null = null; // (null for controllers and the application's own globals)
 }
 
 /** The providers and controllers the application built (import DiscoveryModule to inject it). */
@@ -159,7 +165,10 @@ interface Entry {
   key: string;
   token: unknown;
   provider: unknown; // a ClassInfo, or one of the provider objects
+  host: ModuleHost | null; // the module that declared it
 }
+
+let declaringModule: ModuleHost | null = null; // the module whose providers register() is reading
 
 class Container {
   entries: Map<string, Entry> = new Map<string, Entry>();
@@ -248,7 +257,7 @@ function addEntry(token: unknown, provider: unknown): void {
     container.globals.push(provider);
     return;
   }
-  container.entries.set(key, { key: key, token: token, provider: provider });
+  container.entries.set(key, { key: key, token: token, provider: provider, host: declaringModule });
 }
 
 // the modules the root reaches through its imports (static and dynamic), in Nest's order
@@ -264,9 +273,13 @@ function collect(m: unknown, seen: Map<string, boolean>): void {
     for (const i of d.imports || []) {
       collect(i, seen);
     }
+    const hd = new ModuleHost();
+    hd.metatype = d.module;
     for (const p of d.providers || []) {
+      declaringModule = hd;
       register(p);
     }
+    declaringModule = null;
     for (const c of d.controllers || []) {
       container.controllers.push(c);
     }
@@ -290,9 +303,13 @@ function collectMeta(c: ClassInfo, seen: Map<string, boolean>): void {
   for (const i of meta.imports || []) {
     collect(i, seen);
   }
+  const hm = new ModuleHost();
+  hm.metatype = c;
   for (const p of meta.providers || []) {
+    declaringModule = hm;
     register(p);
   }
+  declaringModule = null;
   for (const ctl of meta.controllers || []) {
     container.controllers.push(ctl);
   }
@@ -320,7 +337,7 @@ function resolveToken(token: unknown, optional: boolean, who: string, index: int
 
 function addWrapper(e: Entry, instance: unknown): void {
   const cls = asClass(e.provider);
-  container.wrappers.push({ name: tokenName(e.token), token: e.token, instance: instance, metatype: cls });
+  container.wrappers.push({ name: tokenName(e.token), token: e.token, instance: instance, metatype: cls, host: e.host });
 }
 
 function build(provider: unknown, depth: int): unknown {
@@ -906,7 +923,7 @@ export class NestApplication {
     }
     for (const c of container.controllers) {
       const instance = construct(c, 0);
-      container.wrappers.push({ name: c.name, token: c, instance: instance, metatype: c });
+      container.wrappers.push({ name: c.name, token: c, instance: instance, metatype: c, host: null });
       const base0 = __controllers.get(c.id);
       const routes0 = __routes.get(c.id);
       const params0 = __params.get(c.id);
