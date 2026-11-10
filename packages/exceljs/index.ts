@@ -7,9 +7,8 @@
 // Compatibility with npm's exceljs:
 // - xisto has no namespaces: import WorkbookWriter directly (`new WorkbookWriter(...)` in place of
 //   `new stream.xlsx.WorkbookWriter(...)`).
-// - addRow takes an array of values (strings, numbers, booleans, Dates, null); the object form
-//   (`addRow({ key: value })`) needs a parameter that is an array or an object, which xisto does not have yet:
-//   build the array in column order (`ws.columns` gives the keys) or use addRowByKey.
+// - addRow takes an array of values (strings, numbers, booleans, Dates, null) or an object by column key
+//   (`addRow({ key: value })`, as exceljs).
 // - Styles cover what reports use: numFmt, font (bold, italic, size, name), alignment (horizontal, vertical,
 //   wrapText), column widths, frozen panes (views) and autoFilter.
 
@@ -196,7 +195,10 @@ export class Worksheet {
   }
 
   /** Add a row of values in column order: strings, numbers, booleans, Dates or null (an empty cell). */
-  addRow(values: unknown[]): Row {
+  addRow(values: Record<string, unknown> | unknown[]): Row {
+    if (!Array.isArray(values)) {
+      return this.addRowByKey(Object.keys(values), Object.values(values)); // addRow({ key: value }): by column key
+    }
     if (this.done) throw new Error(`exceljs: worksheet '${this.name}' is already committed`);
     const r = new Row(this, this.next, values);
     this.next++;
@@ -220,7 +222,8 @@ export class Worksheet {
   getRow(n: int): Row {
     for (const r of this.open) if (r.number === n) return r;
     if (n >= this.next) {
-      while (this.next <= n) this.addRow([]);
+      const none: unknown[] = [];
+      while (this.next <= n) this.addRow(none);
       return this.getRow(n);
     }
     throw new Error(`exceljs: row ${n} is already committed`);

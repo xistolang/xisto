@@ -3809,8 +3809,11 @@ static void infer_new_collection(Expr *e, Type *expected) {
     check_expr(a, ints ? ty_array_of(ty_int) : NULL);
     settle(a);
     Type *t = a->type;
-    if (!is_map && t->kind == TY_ARRAY && t->elem->kind == TY_NUMBER)
-        xs_error(XS6037, a->pos, "write new Set<int>(...) for whole numbers, or keep strings", "a Set holds strings or ints in xisto, and these are numbers");
+    if (!is_map && t->kind == TY_ARRAY && t->elem->kind == TY_NUMBER) { /* new Set(ids) with ids: number[]: whole numbers as a Set<number>'s
+                                                                             keys (checked: a fraction is a TypeError), as new Set<number>(ids) */
+        wrap_call(a, "xs_num_keys", ty_array_of(ty_numkey()));
+        t = a->type;
+    }
     if (t->kind != TY_ARRAY && t->kind != TY_SET) xs_error(XS3006, a->pos, hint, "cannot infer the type of this %s", is_map ? "Map" : "Set");
     if (!is_map) { e->elem_type = ty_set_of(t->elem); return; }
     Type *el = t->elem;
@@ -4267,9 +4270,18 @@ static void check_expr_in(Expr *e, Type *expected) {
         } else if (is_big(e->lhs->type)) { /* -b */
             if (e->op != TK_MINUS) xs_error(XS6034, e->pos, NULL, "unary '+' is not allowed on bigint (as in JS)");
             big_call(e, "xs_big_neg", e->lhs, NULL, ty_big());
+        } else if (e->op == TK_PLUS && e->lhs->type->kind == TY_STRING) { /* +s: Number(s), as in JS (+x.toFixed(2)) */
+            Expr *v = e->lhs;
+            e->kind = E_CALL; e->op = 0; e->lhs = NULL; e->args = (ExprList){0}; e->field = -1;
+            e->builtin.cfn = "xs_str_to_number";
+            expr_list_push(&e->args, v);
+            Expr *callee = xs_alloc(sizeof *callee);
+            callee->kind = E_IDENT; callee->pos = v->pos; callee->str = "Number"; callee->field = -1;
+            e->lhs = callee;
+            e->type = ty_number;
         } else {
             if (!is_numeric(e->lhs->type) && e->lhs->type->kind != TY_LITINT)
-                xs_error(XS8119, e->lhs->pos, NULL, "operand of unary '-' must be int or number, but this is %s", ty_name(e->lhs->type));
+                xs_error(XS8119, e->lhs->pos, NULL, "operand of unary '%s' must be int or number, but this is %s", e->op == TK_PLUS ? "+" : "-", ty_name(e->lhs->type));
             e->type = e->lhs->type;
         }
         return;
@@ -4404,8 +4416,17 @@ static void check_expr_in(Expr *e, Type *expected) {
             check_expr(e->rhs, nt);
             if (e->rhs->type->kind == TY_LITINT) coerce_lit(e->rhs, nt);
             expect_type(e->rhs, nt, "default after '||'");
-            if (!(e->rhs->kind == E_NUMBER || rereadable(e->rhs)))
-                xs_error(XS8021, e->rhs->pos, "store the default in a const first", "the default after '||' of a number must be a literal or a name");
+            if (!(e->rhs->kind == E_NUMBER || rereadable(e->rhs))) { /* a - b || c.localeCompare(d): a once, the default only when it is 0 or NaN */
+                Expr *dflt = e->rhs;
+                e->kind = E_COND;
+                e->op = 0;
+                e->rhs = NULL;
+                e->args = (ExprList){0};
+                expr_list_push(&e->args, dflt);
+                e->builtin.cfn = "or_once";
+                e->type = nt;
+                return;
+            }
             Expr *a = e->lhs, *b = e->rhs;
             e->kind = E_CALL; e->op = 0; e->lhs = NULL; e->rhs = NULL; e->args = (ExprList){0};
             e->builtin.cfn = nt->kind == TY_INT ? "xs_int_or" : "xs_num_or";
@@ -6694,6 +6715,12 @@ static void check_expr_in(Expr *e, Type *expected) {
                     check_expr(a, NULL);
                     if (a->type->kind == TY_STRING) { e->builtin.cfn = "xs_Date_new_str"; return; }
                     if (ty_is_any(a->type)) { e->builtin.cfn = "xs_Date_new_dyn"; return; } /* (a Date, a string or a number, at run time) */
+                    if (a->type->kind == TY_UNION || a->type->kind == TY_UNKNOWN || (a->type->kind == TY_NULLABLE && a->type->elem->kind != TY_NUMBER)) {
+                        /* new Date(v) with v: Date | string (or null: new Date(null) is the epoch, as in JS): by what v holds */
+                        to_any(a);
+                        e->builtin.cfn = "xs_Date_new_dyn";
+                        return;
+                    }
                     if (a->type->kind == TY_OBJECT && a->type->cls == c) { e->builtin.cfn = "xs_Date_new_copy"; return; }
                     date_num_arg(&e->args.items[0], "the time value of new Date");
                     e->builtin.cfn = "xs_Date_new_ms";

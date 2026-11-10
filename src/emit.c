@@ -2926,6 +2926,7 @@ static void emit_expr_raw(Expr *e) {
             if (ref) emit_owned(e->lhs); else emit_expr(e->lhs);
             const char *v = xs_sprintf("oo%d_", id);
             const char *test = qq ? not_null(lt, v) : ty_is_any(lt) ? xs_sprintf("xs_dyn_truthy(%s)", v) : lt->kind == TY_STRING ? xs_sprintf("xs_str_truthy(%s)", v)
+                             : lt->kind == TY_INT ? xs_sprintf("(%s != 0)", v) : lt->kind == TY_NUMBER ? xs_sprintf("(%s != 0 && %s == %s)", v, v, v) /* (0 and NaN take the default) */
                              : lt->elem->kind == TY_STRING ? xs_sprintf("(%s && xs_str_truthy(%s))", v, v) : not_null(lt, v);
             buf_printf(out, "; %s or%d_; if (%s) or%d_ = oo%d_; else { %sor%d_ = ", ctype(e->type), id, test, id, id, ref ? xs_sprintf("xs_release(oo%d_); ", id) : "", id);
             if (ref) emit_owned(e->args.items[0]); else emit_expr(e->args.items[0]);
