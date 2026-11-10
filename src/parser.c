@@ -1309,6 +1309,7 @@ static Expr *parse_postfix(Parser *p) {
             m->str = name.str;
             if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from")) wants_arrays = true;
             if (!strcmp(name.str, "length") && at(p, TK_ASSIGN)) wants_arrays = true; /* xs.length = 0 */
+            if (!strcmp(name.str, "filter") && e->kind == E_MEMBER && e->is_call && e->str && !strcmp(e->str, "map")) wants_arrays = true; /* xs.map(f).filter(p): maybe __xs_mapFilterNum */
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs); /* obj.m<T>(x) */
             if (at(p, TK_LPAREN)) {
                 m->is_call = true;
@@ -1810,11 +1811,16 @@ static void drain_pending(Parser *p, StmtList *l, Module *m, bool exported) {
 static Stmt *parse_block(Parser *p) {
     Stmt *b = new_stmt(S_BLOCK, p->tok.pos);
     expect(p, TK_LBRACE, NULL);
+    /* a block inside an initializer (const [a] = await f(async () => { ... })): the reads the outer
+       destructuring queued stay for the outer scope, not this body */
+    StmtList outer = p->pending;
+    p->pending = (StmtList){0};
     while (!at(p, TK_RBRACE)) {
         if (at(p, TK_EOF)) xs_error(XS1031, p->tok.pos, NULL, "unexpected end of file inside a block");
         stmt_list_push(&b->stmts, parse_stmt(p));
         drain_pending(p, &b->stmts, NULL, false);
     }
+    p->pending = outer;
     next(p);
     return b;
 }
@@ -4070,6 +4076,11 @@ static const char xs_arrays_src[] =
     "  if (n > xs.length) throw new Error(\"RangeError: xisto cannot make an array longer by setting its length\");\n"
     "  while (xs.length > n) xs.pop();\n"
     "  return n;\n"
+    "}\n"
+    "export function __xs_mapFilterNum<T>(xs: T[], f: (x: T) => number | null, p: (v: number | null) => boolean): number[] {\n"
+    "  const out: number[] = [];\n"
+    "  for (let i = 0; i < xs.length; i++) { const v = f(xs[i]); if (p(v)) out.push(v!); }\n"
+    "  return out;\n"
     "}\n"
     "export function __xs_flat<U>(xs: U[][]): U[] {\n"
     "  const out: U[] = [];\n"

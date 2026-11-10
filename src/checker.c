@@ -790,6 +790,7 @@ static Expr *thunk_of(Expr *x) {
 /* Promise.all([a(), b()]) / Promise.all(xs.map(f)) / Promise.race(...) / Promise.resolve(v). async is syntax in
    xisto (Promise<T> is T), so a call has its value when it returns; here the elements become tasks that run
    concurrently on the event loop (runtime/xisto_net.h, xs_par_run): their I/O waits overlap. */
+static int mapnull_ok; /* checking the xs.map(f) of xs.map(f).filter(p): f may give number | null */
 static void check_promise(Expr *e, Type *expected) {
     const char *m = e->str;
     if (!e->is_call) xs_error(XS7030, e->pos, NULL, "Promise.%s is not a value", m);
@@ -1686,6 +1687,14 @@ static bool cond_truthy_type(Type *t);
 static void make_truthy(Expr *e, const char *what);
 static void check_optchain(Expr *e, Type *expected);
 static void check_nullish(Expr *e, Type *expected);
+/* a primitive, an enum, or a union of them: boxed as an unknown, compared by what it holds */
+static bool prim_like(Type *t) {
+    if (t->kind == TY_NULLABLE) t = t->elem;
+    if (t->kind == TY_NUMBER || t->kind == TY_INT || t->kind == TY_STRING || t->kind == TY_BOOLEAN || t->kind == TY_ENUM) return true;
+    if (t->kind != TY_UNION) return false;
+    for (int i = 0; i < t->nparams; i++) if (!prim_like(t->params[i])) return false;
+    return true;
+}
 static bool missing_get(Expr *l);
 static Expr *copy_target(Expr *x);
 static void check_loose_eq(Expr *e);
@@ -2466,6 +2475,9 @@ static void expect_type(Expr *e, Type *want, const char *what) {
     if (e->type->kind == TY_INT && want->kind == TY_INT) return;
     /* T[] of references is laid out like unknown[]: string[] where unknown[] goes */
     if (want->kind == TY_ARRAY && want->elem->kind == TY_UNKNOWN && e->type->kind == TY_ARRAY && ty_is_heap(e->type->elem)) return;
+    /* string[] where (string | null)[] goes: the same references (TypeScript accepts it) */
+    if (want->kind == TY_ARRAY && want->elem->kind == TY_NULLABLE && ty_is_heap(want->elem->elem) && e->type->kind == TY_ARRAY &&
+        ty_equal(e->type->elem, want->elem->elem)) return;
     { /* int[] where number[] goes, number[] where unknown[] goes, string[] where (string | number)[] goes: a copy */
         Type *w = want->kind == TY_NULLABLE ? want->elem : want;
         if (w->kind == TY_ARRAY && e->type->kind == TY_ARRAY && e->kind == E_ARRAY_LIT && !e->spread && elem_widens(e->type->elem, w->elem)) {
@@ -3619,7 +3631,8 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
                 if (has_tparam(ps[k])) params_known = false;
             }
             if (params_known) {
-                Type *rt = subst_bound(pt->ret, tmpl, bind);
+                bool pt_async = pt->async_ret;
+                Type *rt = subst_bound(ret_unpromise(pt->ret, &pt_async), tmpl, bind); /* (fn: () => Promise<T>): async, R = T */
                 /* the template's types are as written (names not yet looked up): resolved where it is written, so
                    the arrow's (c) is the same Conn its body passes on */
                 Module *dm = tmpl->cls ? tmpl->cls->mod : tmpl->mod;
@@ -3631,6 +3644,7 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
                 if (rt && !has_tparam(rt)) rt = resolve(rt, e->pos);
                 cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
                 ctx = ty_func(ps, pt->nparams, has_tparam(rt) ? NULL : rt);
+                ctx->async_ret = pt_async; /* (fn: () => Promise<T>) with () => c ? f() : Promise.resolve(x): async */
             }
         }
         check_expr(e->args.items[i], ctx);
@@ -4988,7 +5002,9 @@ static void check_expr_in(Expr *e, Type *expected) {
                 { /* a === b with both T | null (T a primitive): equal when both are null or both hold the same value */
                     Type *lt = ty_strip_null(e->lhs->type), *rt = ty_strip_null(e->rhs->type);
                     bool prim = (is_numeric(lt) && is_numeric(rt)) || (lt->kind == TY_STRING && rt->kind == TY_STRING) ||
-                                (lt->kind == TY_BOOLEAN && rt->kind == TY_BOOLEAN);
+                                (lt->kind == TY_BOOLEAN && rt->kind == TY_BOOLEAN) ||
+                                /* a column read as string | number | null against a string: by what each holds, as === does */
+                                (prim_like(lt) && prim_like(rt) && (lt->kind == TY_UNION || rt->kind == TY_UNION || lt->kind == TY_ENUM || rt->kind == TY_ENUM));
                     if (prim) {
                         bool neq = e->op == TK_NEQ;
                         Expr *l = e->lhs, *r = e->rhs;
@@ -6209,6 +6225,11 @@ static void check_expr_in(Expr *e, Type *expected) {
             na->type = e->type = ty_array_of(na->elem_type);
             return;
         }
+        /* xs.map(f).filter(p) where f gives number | null (an array xisto cannot hold): one loop that keeps the
+           values p accepts, __xs_mapFilterNum(xs, f, p) (xisto:arrays) */
+        bool mapfilter = e->is_call && e->str && !strcmp(e->str, "filter") && e->args.len == 1 && e->lhs->kind == E_MEMBER &&
+                         e->lhs->is_call && e->lhs->str && !strcmp(e->lhs->str, "map") && e->lhs->args.len == 1 && lookup_func("__xs_mapFilterNum");
+        if (mapfilter) mapnull_ok++;
         { /* (x as any).f with x of a class that has f: the typed path (the cast only quiets TypeScript) */
             Expr *as = e->lhs;
             bool done = false;
@@ -6223,6 +6244,26 @@ static void check_expr_in(Expr *e, Type *expected) {
                 done = true;
             }
             if (!done) check_expr(e->lhs, NULL);
+        }
+        if (mapfilter) {
+            mapnull_ok--;
+            Type *lt = e->lhs->type;
+            if (lt->kind == TY_ARRAY && lt->elem->kind == TY_NULLABLE && !ty_is_heap(lt->elem->elem) && is_numeric(lt->elem->elem)) {
+                Expr *mp = e->lhs;
+                Expr *callee = xs_alloc(sizeof *callee);
+                callee->kind = E_IDENT; callee->pos = e->pos; callee->str = "__xs_mapFilterNum"; callee->field = -1;
+                Expr *c = xs_alloc(sizeof *c);
+                c->kind = E_CALL; c->pos = e->pos; c->field = -1;
+                c->lhs = callee;
+                mp->lhs->prechecked = true;
+                mp->args.items[0]->prechecked = true;
+                expr_list_push(&c->args, mp->lhs);
+                expr_list_push(&c->args, mp->args.items[0]);
+                expr_list_push(&c->args, e->args.items[0]);
+                *e = *c;
+                check_expr(e, expected);
+                return;
+            }
         }
         e->lhs = rec_get_nn(e->lhs);
         if (e->is_call && e->str && (strcmp(e->str, "then") == 0 || strcmp(e->str, "catch") == 0 || strcmp(e->str, "finally") == 0)) {
@@ -6403,7 +6444,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                             cbt->ret = expected && expected->kind == TY_ARRAY && expected->elem->kind == TY_OBJECT ? expected->elem : NULL;
                             check_expr(cb, cbt);
                         } else {
-                            check_expr(cb, NULL);
+                            /* xs.map(([c]): [string, V] => ...): the return type written, the parameters from the elements */
+                            check_expr(cb, cb->kind == E_ARROW ? CB(np, NULL) : NULL);
                             /* the parameters must still match the elements: the runtime calls it with them */
                             if (cb->type->kind == TY_FUNC) expect_type(cb, CB(np, cb->type->ret), xs_sprintf("callback of %s", m));
                         }
@@ -6414,10 +6456,14 @@ static void check_expr_in(Expr *e, Type *expected) {
                     if (cb->type->kind != TY_FUNC) xs_error(XS8023, cb->pos, NULL, "%s needs a function", m);
                     if (is_map) {
                         Type *rt = cb->type->ret;
-                        if (rt->kind == TY_VOID || rt->kind == TY_FUNC || (rt->kind == TY_NULLABLE && !ty_is_heap(rt->elem)))
-                            xs_error(XS7064, cb->pos, NULL, "map cannot produce arrays of %s", ty_name(rt));
-                        e->type = ty_array_of(rt);
-                        check_type_supported(e->pos, e->type);
+                        bool nullnum = rt->kind == TY_NULLABLE && !ty_is_heap(rt->elem) && is_numeric(rt->elem);
+                        if (nullnum && mapnull_ok) e->type = ty_array_of(rt); /* (.filter right after: __xs_mapFilterNum) */
+                        else {
+                            if (rt->kind == TY_VOID || rt->kind == TY_FUNC || (rt->kind == TY_NULLABLE && !ty_is_heap(rt->elem)))
+                                xs_error(XS7064, cb->pos, NULL, "map cannot produce arrays of %s", ty_name(rt));
+                            e->type = ty_array_of(rt);
+                            check_type_supported(e->pos, e->type);
+                        }
                     } else if (strcmp(m, "filter") == 0) {
                         e->type = e->lhs->type;
                         Type *pr = cb->kind == E_ARROW && cb->arrow->fn->ret && cb->arrow->fn->ret->kind == TY_BOOLEAN ? cb->arrow->fn->ret->elem : NULL;
@@ -6830,6 +6876,20 @@ static void check_expr_in(Expr *e, Type *expected) {
             bool ok = v->type->kind != TY_NULLABLE && json_ok(v->type, 0);
             json_ok_unknown = ju;
             if (ok && (json_target(want) || (want->kind == TY_MAP && want->record && json_ok(want, 0)))) { *e = *v; to_json(e); from_json(e, want); return; }
+        }
+        { /* an upcast TypeScript writes with 'as': 0 as number | null, n as number | string | null, Enum.A as string */
+            Type *w = want->kind == TY_NULLABLE ? want->elem : want;
+            bool lit = v->type->kind == TY_LITINT;
+            if (v->type->kind == TY_ENUM && v->type->en->is_string && want->kind == TY_STRING) { *e = *v; e->type = ty_string; return; }
+            bool up = (want->kind == TY_NULLABLE && (ty_equal(v->type, w) || (lit && is_numeric(w)))) ||
+                      (w->kind == TY_UNION && v->type->kind != TY_UNION && v->type->kind != TY_NULLABLE &&
+                       union_member_for(w, lit ? ty_number : v->type, NULL));
+            if (up) {
+                *e = *v;
+                expect_type(e, want, "the value of 'as'");
+                if (want->kind == TY_NULLABLE && e->type->kind != TY_NULLABLE && e->type->kind != TY_NULL) upcast(e, want); /* (the field it fills is T | null) */
+                return;
+            }
         }
         xs_error(XS8090, e->pos, "xisto checks types statically: 'as' converts an object (JSON) value or restates the same type", "cannot convert %s to %s", ty_name(v->type), ty_name(want));
         return;
@@ -7566,6 +7626,7 @@ static void check_stmt_recover(Stmt *s) {
         switch_depth = sd;
         finally_depth = fd;
         xs_error_recover = outer;
+        mapnull_ok = 0; /* (an error inside a map(f).filter(p) left it up) */
         declare_poisoned(s, false);
     }
     xs_error_recover = outer;
@@ -8708,9 +8769,24 @@ static bool always_exits(Stmt *s) {
     }
 }
 
+/* a break that leaves this loop (one inside a nested loop or switch leaves that one; a labelled one may leave this) */
+static bool breaks_out(Stmt *s, int depth) {
+    if (!s) return false;
+    switch (s->kind) {
+    case S_BREAK: return depth == 0 || s->name != NULL;
+    case S_BLOCK: for (int i = 0; i < s->stmts.len; i++) if (breaks_out(s->stmts.items[i], depth)) return true; return false;
+    case S_IF: return breaks_out(s->body, depth) || breaks_out(s->else_body, depth);
+    case S_TRY: return breaks_out(s->body, depth) || breaks_out(s->else_body, depth) || breaks_out(s->for_init, depth);
+    case S_WHILE: case S_FOR: case S_FOROF: return breaks_out(s->body, depth + 1);
+    case S_SWITCH: for (int i = 0; i < s->ncases; i++) if (breaks_out(s->cases[i].body, depth + 1)) return true; return false;
+    default: return false;
+    }
+}
 static bool always_returns(Stmt *s) {
     switch (s->kind) {
     case S_RETURN: return true;
+    case S_WHILE: case S_FOR: /* for (;;) / while (true) with no break out: it never ends but by a return or a throw */
+        return (!s->cond || (s->cond->kind == E_BOOL && s->cond->boolean)) && !breaks_out(s->body, 0);
     case S_BLOCK:
         for (int i = 0; i < s->stmts.len; i++)
             if (always_returns(s->stmts.items[i])) return true;
@@ -9456,7 +9532,7 @@ static void check_field_init(Class *c) {
     xs_error_recover = &rb_; \
     if (_setjmp(rb_) == 0) {
 #define RECOVER_END } else { \
-        failed_ = true; scope = sc_; cur_func = cf_; cur_class = cc_; loop_depth = ld_; switch_depth = sd_; finally_depth = fd_; \
+        failed_ = true; scope = sc_; cur_func = cf_; cur_class = cc_; loop_depth = ld_; switch_depth = sd_; finally_depth = fd_; mapnull_ok = 0; \
         if (cm_) enter_module(cm_); \
     } \
     xs_error_recover = NULL; }
@@ -9761,7 +9837,9 @@ void check_program(Program *p) {
                     Module *via = im->from;
                     for (int depth = 0; depth < 32 && via; depth++) {
                         bool has = false;
-                        for (Binding *b = mod_scopes[via->id]->head; b && !has; b = b->next) has = strcmp(b->name, im->names[k]) == 0;
+                        size_t inl = strlen(im->names[k]);
+                        for (Binding *b = mod_scopes[via->id]->head; b && !has; b = b->next) /* the name, or a static of the class it names (Class__s_x) */
+                            has = strcmp(b->name, im->names[k]) == 0 || (strncmp(b->name, im->names[k], inl) == 0 && strncmp(b->name + inl, "__s_", 4) == 0);
                         if (has) { src = mod_scopes[via->id]; break; }
                         Module *next_via = NULL;
                         for (int q = 0; q < via->nimports && !next_via; q++)
@@ -9867,7 +9945,9 @@ static int reexports_name(Program *p, Module *via, const char *name, int depth) 
 /* module m's scope has `name`, or a module it re-exports with export * from does (at any depth) */
 static bool reexports_or_has(Module *m, const char *name) {
     for (int depth = 0; depth < 32 && m; depth++) {
-        for (Binding *b = mod_scopes[m->id]->head; b; b = b->next) if (strcmp(b->name, name) == 0) return true;
+        size_t nl = strlen(name);
+        for (Binding *b = mod_scopes[m->id]->head; b; b = b->next)
+            if (strcmp(b->name, name) == 0 || (strncmp(b->name, name, nl) == 0 && strncmp(b->name + nl, "__s_", 4) == 0)) return true; /* or a static of the class it names */
         Module *next = NULL;
         for (int q = 0; q < m->nimports && !next; q++)
             if (m->imports[q].star && m->imports[q].from && !m->imports[q].from->missing && reexports_or_has(m->imports[q].from, name)) next = m->imports[q].from;
