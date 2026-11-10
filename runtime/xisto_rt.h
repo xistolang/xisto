@@ -2602,6 +2602,12 @@ XS_NOINLINE xs_str *xs_typeof(void *v) {
 }
 static void xs_print_closure(void *p) { (void)p; fputs("[Function]", XS_OUT); }
 
+/* Math.max(...xs) / Math.min(...xs): -Infinity / Infinity for an empty array, NaN when an element is */
+XS_NOINLINE double xs_math_max_nums(xs_arr_num *a) { double m = -INFINITY; for (size_t i = 0; i < a->len; i++) { if (a->data[i] != a->data[i]) return NAN; if (a->data[i] > m) m = a->data[i]; } return m; }
+XS_NOINLINE double xs_math_min_nums(xs_arr_num *a) { double m = INFINITY; for (size_t i = 0; i < a->len; i++) { if (a->data[i] != a->data[i]) return NAN; if (a->data[i] < m) m = a->data[i]; } return m; }
+XS_NOINLINE double xs_math_max_ints(xs_arr_int *a) { double m = -INFINITY; for (size_t i = 0; i < a->len; i++) if ((double)a->data[i] > m) m = (double)a->data[i]; return m; }
+XS_NOINLINE double xs_math_min_ints(xs_arr_int *a) { double m = INFINITY; for (size_t i = 0; i < a->len; i++) if ((double)a->data[i] < m) m = (double)a->data[i]; return m; }
+
 /* ---- any: the dynamic path (MANIFESTO, "Ponto importante: any"). An any is an unknown (a reference, primitives
    boxed) the program reads and writes by name. An object of a class keeps its struct: x.f and x[k] go through
    the class's field table (xs_dyn_cls, generated per class when the program uses any), so it takes no memory
