@@ -421,7 +421,15 @@ window.ui = SwaggerUIBundle({ url: ${quote(jsonPath)}, dom_id: "#swagger-ui", pe
 
 // SwaggerModule.setup("docs", app, document): the UI at /docs and the document at /docs-json, outside the global
 // prefix, as in Nest
-function setup(path: string, app: NestApplication, document: OpenAPIObject): void {
+/** setup's fourth argument (Nest's SwaggerCustomOptions): accepted; the page here has no options yet */
+export interface SwaggerCustomOptions {
+  customSiteTitle?: string;
+  swaggerOptions?: Record<string, unknown>;
+  jsonDocumentUrl?: string;
+  useGlobalPrefix?: boolean;
+}
+function setup(path: string, app: NestApplication, document: OpenAPIObject, options?: SwaggerCustomOptions): void {
+  void options;
   const base = joinPath([path]);
   const json = document.json;
   const html = page("Swagger UI", base + "-json");
@@ -429,7 +437,12 @@ function setup(path: string, app: NestApplication, document: OpenAPIObject): voi
   app.addGetRoute(base + "-json", (req: HttpRequest): HttpResponse => HttpResponse.of(200, JSON_TYPE, json));
 }
 
-export const SwaggerModule: SwaggerModuleStatic = {
-  createDocument: createDocument,
-  setup: setup,
-};
+/** SwaggerModule.createDocument(app, config) and SwaggerModule.setup(path, app, document, options?) */
+export class SwaggerModule {
+  static createDocument(app: NestApplication, config: SwaggerConfig): OpenAPIObject {
+    return createDocument(app, config);
+  }
+  static setup(path: string, app: NestApplication, document: OpenAPIObject, options?: SwaggerCustomOptions): void {
+    setup(path, app, document, options);
+  }
+}

@@ -1230,6 +1230,11 @@ function countOf(rows: object): int {
 // query builder: one class for SELECT, UPDATE, INSERT and DELETE (TypeORM's names: createQueryBuilder(...).select,
 // .update().set().where().execute(), .insert().into().values().execute(), .delete().from().where().execute())
 
+export interface RawAndEntities<T, R> {
+  raw: R[];
+  entities: T[];
+}
+
 interface Join {
   kind: string;
   target: string;
@@ -1674,6 +1679,40 @@ export class SelectQueryBuilder<T> {
     const binds = new Binds(this.executor.dialect());
     const sql = this.build(binds);
     return this.executor.rows(sql, binds.values);
+  }
+
+  /** a copy of the builder, to add conditions to without changing this one (TypeORM's clone) */
+  clone(): SelectQueryBuilder<T> {
+    const c = new SelectQueryBuilder<T>(this.executor);
+    c.mode = this.mode;
+    c.mainMeta = this.mainMeta;
+    c.mainAlias = this.mainAlias;
+    c.table = this.table;
+    c.selects = this.selects.slice();
+    c.wheres = this.wheres.slice();
+    c.joins = this.joins.slice();
+    c.orders = this.orders.slice();
+    c.groups = this.groups.slice();
+    c.skipN = this.skipN;
+    c.takeN = this.takeN;
+    c.params = this.params;
+    c.setValues = this.setValues;
+    c.insertValues = this.insertValues;
+    for (const [k, v] of this.aliases) c.aliases.set(k, v);
+    return c;
+  }
+
+  /** the raw rows and the entities made of them, from one query (TypeORM's getRawAndEntities) */
+  async getRawAndEntities<R = any>(): Promise<RawAndEntities<T, R>> {
+    const m = this.mainMeta;
+    if (m === null) {
+      throw new Error("getRawAndEntities() needs an entity: createQueryBuilder(Entity, alias) or repository.createQueryBuilder(alias)");
+    }
+    const rows = await this.rawRows();
+    const raw: R[] = rows;
+    const mapped = remap(rows, m.spec());
+    const entities: T[] = JSON.parse(JSON.stringify(mapped));
+    return { raw, entities };
   }
 
   /** the rows as TypeORM gives them: getRawMany<Row>() decodes each row as Row; without a type, rows read by name */

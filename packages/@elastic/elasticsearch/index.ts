@@ -272,6 +272,14 @@ export class Indices {
     return (await this.t.request("DELETE", `/${segment(p, "index", "indices.delete")}${queryString(p, "timeout,master_timeout,ignore_unavailable,allow_no_indices,expand_wildcards")}`, "", false, options ?? null)).json();
   }
 
+  /** GET /{index}/_settings[/{name}] */
+  async getSettings(params: object, options?: TransportRequestOptions): Promise<object> {
+    const p = JSON.stringify(params);
+    const keys = "flat_settings,include_defaults,local,master_timeout,ignore_unavailable,allow_no_indices,expand_wildcards";
+    const path = `/${segment(p, "index", "indices.getSettings")}/_settings${optSegment(p, "name")}${queryString(p, keys)}`;
+    return (await this.t.request("GET", path, "", false, options ?? null)).json();
+  }
+
   /** PUT /{index}/_mapping */
   async putMapping(params: object, options?: TransportRequestOptions): Promise<object> {
     const p = JSON.stringify(params);
@@ -320,6 +328,14 @@ export class Client {
     const p = JSON.stringify(params);
     const path = `${optSegment(p, "index")}/_search${queryString(p, SEARCH_QUERY)}`;
     return (await this.t.request("POST", path, without(p, "index," + SEARCH_QUERY), false, options ?? null)).json();
+  }
+
+  /** POST /{index}/_delete_by_query: the query in the body; conflicts, refresh... in the query string */
+  async deleteByQuery(params: object, options?: TransportRequestOptions): Promise<object> {
+    const p = JSON.stringify(params);
+    const keys = "conflicts,refresh,routing,timeout,wait_for_completion,ignore_unavailable,allow_no_indices,expand_wildcards,slices,scroll_size,max_docs,q,df,analyzer,default_operator,lenient";
+    const path = `/${segment(p, "index", "deleteByQuery")}/_delete_by_query${queryString(p, keys)}`;
+    return (await this.t.request("POST", path, without(p, "index," + keys), false, options ?? null)).json();
   }
 
   /** POST /{index}/_count */

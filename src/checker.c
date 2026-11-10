@@ -1637,9 +1637,11 @@ static void check_type_supported(Pos pos, Type *t) {
 }
 
 /* JSON.stringify / JSON.parse cover primitives, strings, classes whose fields are all serializable, and arrays of those. */
+static bool elem_widens(Type *x, Type *u);
+static void arr_convert(Expr *e, Type *to);
 static bool json_ok_unknown; /* JSON.stringify: an unknown is written by its type at run time */
 static bool json_ok(Type *t, int depth) {
-    if (depth > 8) return false;
+    if (depth > 24) return false; /* (a type that holds itself: no JSON) */
     switch (t->kind) {
     case TY_UNKNOWN: return json_ok_unknown;
     case TY_UNION: /* number | string (a row's column): held as an unknown is, read and written by what it holds */
@@ -1764,6 +1766,18 @@ static void check_spread_lit(Expr *e, Type *elem) {
         else xs_error(XS8101, a->lhs->pos, "spread an array, a string, a Set, a Map, a Uint8Array or a Float64Array", "cannot spread %s", ty_name(st));
         a->type = st;
     }
+    if (!elem && e->args.len > 1) { /* [{ term: .. }, ...(c ? [{ range: .. }] : [])]: objects of several shapes, as JSON */
+        bool objs = true, differ = false;
+        bool ju = json_ok_unknown;
+        json_ok_unknown = true;
+        for (int i = 0; i < e->args.len && objs; i++) {
+            Type *t = ets[i];
+            if (t->kind != TY_OBJECT || t->cls->builtin || t->cls->is_tuple || !json_ok(t, 0)) objs = false;
+            else if (i && !ty_equal(t, ets[0])) differ = true;
+        }
+        json_ok_unknown = ju;
+        if (objs && differ) elem = ty_json;
+    }
     if (!elem) { /* as TypeScript: numbers win over ints; else the first element's type */
         for (int i = 0; i < e->args.len && !elem; i++) if (ets[i]->kind == TY_NUMBER) elem = ty_number;
         for (int i = 0; i < e->args.len && !elem; i++) if (ets[i]->kind == TY_INT) elem = ty_int;
@@ -1777,6 +1791,11 @@ static void check_spread_lit(Expr *e, Type *elem) {
         Expr *a = e->args.items[i];
         if (a->kind == E_UNARY && a->op == TK_ELLIPSIS) {
             bool ok = ty_equal(ets[i], elem) || (ets[i]->kind == TY_INT && elem->kind == TY_NUMBER && (is_bytes(a->type) || is_f64(a->type)));
+            if (!ok && a->lhs->type->kind == TY_ARRAY && (elem_widens(ets[i], elem) || (elem->kind == TY_JSON && ets[i]->kind == TY_OBJECT))) {
+                arr_convert(a->lhs, elem); /* ...names where (string | number)[] goes: a copy of the wider type */
+                a->type = a->lhs->type;
+                ok = true;
+            }
             if (!ok) xs_error(XS8141, a->pos, NULL, "the spread elements are %s, but the array holds %s", ty_name(ets[i]), ty_name(elem));
         } else expect_type(a, elem, "array element");
     }
@@ -1972,8 +1991,6 @@ static Type *union_member_for(Type *u, Type *t, Expr *e) {
     return NULL;
 }
 /* a value goes into a union: boxed like an unknown (a union of fewer members is already one) */
-static bool elem_widens(Type *x, Type *u);
-static void arr_convert(Expr *e, Type *to);
 static bool enter_union(Expr *e, Type *want) {
     Type *u = want->kind == TY_NULLABLE ? want->elem : want;
     Type *g = e->type;
@@ -2451,6 +2468,17 @@ static void expect_type(Expr *e, Type *want, const char *what) {
     if (want->kind == TY_ARRAY && want->elem->kind == TY_UNKNOWN && e->type->kind == TY_ARRAY && ty_is_heap(e->type->elem)) return;
     { /* int[] where number[] goes, number[] where unknown[] goes, string[] where (string | number)[] goes: a copy */
         Type *w = want->kind == TY_NULLABLE ? want->elem : want;
+        if (w->kind == TY_ARRAY && e->type->kind == TY_ARRAY && e->kind == E_ARRAY_LIT && !e->spread && elem_widens(e->type->elem, w->elem)) {
+            for (int i = 0; i < e->args.len; i++) expect_type(e->args.items[i], w->elem, what); /* [1, 2] where unknown[] goes: the literal retyped */
+            e->type = ty_array_of(w->elem);
+            if (want->kind == TY_NULLABLE) {
+                Expr *v = expr_copy(e);
+                memset(e, 0, sizeof *e);
+                e->kind = E_UPCAST; e->pos = v->pos; e->lhs = v; e->field = -1;
+                e->type = want;
+            }
+            return;
+        }
         if (w->kind == TY_ARRAY && e->type->kind == TY_ARRAY && e->kind != E_ARRAY_LIT && elem_widens(e->type->elem, w->elem)) {
             arr_convert(e, w->elem);
             if (want->kind == TY_NULLABLE) { /* (the map call is emitted from its own type: under a cast) */
@@ -4600,6 +4628,18 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
             Type *ot = ty_strip_null(rt);
+            if (ot->kind == TY_UNION && e->lhs->kind == E_STRING) { /* 'erro' in r with r: A | B: which member it holds, at run time
+                                                                    (the union is held as an unknown is); if/else narrow it */
+                bool objs = true;
+                for (int i = 0; i < ot->nparams; i++) if (ot->params[i]->kind != TY_OBJECT) objs = false;
+                if (objs) {
+                    Expr *key = e->lhs, *v = e->rhs;
+                    check_expr(key, ty_string);
+                    v->type = ty_unknown;
+                    dyn_call(e, "xs_union_has", ty_boolean, v, key, NULL);
+                    return;
+                }
+            }
             if (ot->kind == TY_OBJECT && !ot->cls->builtin && e->lhs->kind == E_STRING) {
                 Field *fd = find_field(ot->cls, e->lhs->str, NULL);
                 if (fd && fd->optional) { /* "f" in o: o.f is there (an optional field left out is not) */
@@ -6090,7 +6130,12 @@ static void check_expr_in(Expr *e, Type *expected) {
                     *e = *t;
                     return;
                 }
-                if (!json_ok(expected, 0)) xs_error(XS8096, e->pos, "JSON covers number, int, boolean, string, arrays and classes made of those", "cannot parse JSON into %s", ty_name(expected));
+                if (!json_ok(expected, 0)) { /* unknown values (any[], Record<string, unknown>, { x?: unknown }): decoded by what they hold */
+                    json_ok_unknown = true;
+                    bool ok = json_ok(expected, 0);
+                    json_ok_unknown = false;
+                    if (!ok) xs_error(XS8096, e->pos, "JSON covers number, int, boolean, string, arrays and classes made of those", "cannot parse JSON into %s", ty_name(expected));
+                }
                 e->type = expected;
                 e->builtin.cfn = "json_parse";
                 return;
@@ -6599,6 +6644,53 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->type = ty_string;
                 return;
             }
+            if (e->is_call && strcmp(e->str, "toPrecision") == 0 && e->args.len == 1) { /* n.toPrecision(p) */
+                if (e->lhs->type->kind == TY_LITINT) coerce_lit(e->lhs, ty_number);
+                if (e->lhs->type->kind == TY_INT) wrap_call(e->lhs, "(double)", ty_number);
+                check_expr(e->args.items[0], ty_int);
+                expect_type(e->args.items[0], ty_int, "precision");
+                e->builtin.cfn = "xs_num_to_precision";
+                e->type = ty_string;
+                return;
+            }
+            if (e->is_call && strcmp(e->str, "toLocaleString") == 0 && e->args.len <= 2) {
+                /* n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL', minimumFractionDigits: 2 }): the
+                   options written in place (read here); pt-BR and en-US separators (runtime/xisto_rt.h) */
+                if (e->lhs->type->kind == TY_LITINT) coerce_lit(e->lhs, ty_number);
+                if (e->lhs->type->kind == TY_INT) wrap_call(e->lhs, "(double)", ty_number);
+                Expr *loc = e->args.len >= 1 ? e->args.items[0] : NULL;
+                Expr *opt = e->args.len == 2 ? e->args.items[1] : NULL;
+                if (loc) { check_expr(loc, ty_string); expect_type(loc, ty_string, "locale"); }
+                const char *cur = NULL;
+                bool currency = false;
+                long long minfd = -1, maxfd = -1;
+                if (opt) {
+                    if (opt->kind != E_OBJLIT) xs_error(XS7053, opt->pos, "write the options in place: { style: 'currency', currency: 'BRL' }", "toLocaleString options must be an object literal");
+                    for (int k = 0; k < opt->args.len; k++) {
+                        const char *key = opt->keys[k];
+                        Expr *v = opt->args.items[k];
+                        if (strcmp(key, "style") == 0 && v->kind == E_STRING) currency = strcmp(v->str, "currency") == 0;
+                        else if (strcmp(key, "currency") == 0 && v->kind == E_STRING) cur = v->str;
+                        else if (strcmp(key, "minimumFractionDigits") == 0 && v->kind == E_NUMBER) minfd = (long long)v->num;
+                        else if (strcmp(key, "maximumFractionDigits") == 0 && v->kind == E_NUMBER) maxfd = (long long)v->num;
+                        else xs_error(XS7053, v->pos, "supported: style, currency, minimumFractionDigits, maximumFractionDigits, written as literals", "toLocaleString option '%s' is not supported", key);
+                    }
+                }
+                if (currency && !cur) xs_error(XS7053, opt->pos, NULL, "toLocaleString with style 'currency' needs a currency");
+                if (minfd < 0) minfd = currency ? 2 : 0;
+                if (maxfd < 0) maxfd = currency ? (minfd > 2 ? minfd : 2) : (minfd > 3 ? minfd : 3);
+                e->args = (ExprList){0};
+                Expr *nl = xs_alloc(sizeof *nl);
+                nl->kind = E_NULL; nl->pos = e->pos; nl->field = -1; nl->type = ty_nullable_of(ty_string);
+                expr_list_push(&e->args, loc ? loc : nl);
+                if (currency) expr_list_push(&e->args, str_lit(e->pos, cur));
+                else { Expr *n2 = xs_alloc(sizeof *n2); *n2 = *nl; expr_list_push(&e->args, n2); }
+                expr_list_push(&e->args, num_lit(e->pos, (double)minfd, true));
+                expr_list_push(&e->args, num_lit(e->pos, (double)maxfd, true));
+                e->builtin.cfn = "xs_num_to_locale";
+                e->type = ty_string;
+                return;
+            }
             if (e->is_call && e->args.len == 0 && e->lhs->type->kind == TY_INT && (!strcmp(e->str, "unref") || !strcmp(e->str, "ref"))) {
                 /* timer.unref?.() on a setTimeout / setInterval handle (an int here): accepted, it changes nothing
                    (a server keeps running; XB-123) */
@@ -6693,6 +6785,8 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         if (want->kind == TY_UNKNOWN) { *e = *v; to_unknown(e); return; }
         if (v->type->kind == TY_JSON && (json_target(want) || json_target_u(want))) { *e = *v; from_json(e, want); return; }
+        if ((v->type->kind == TY_JSON || (v->type->kind == TY_NULLABLE && v->type->elem->kind == TY_JSON)) && want->kind == TY_NULLABLE &&
+            ty_is_heap(want->elem) && (json_target(want->elem) || json_target_u(want->elem))) { *e = *v; from_json(e, want); return; } /* (o as T | null) with o: object | null */
         if (want->kind == TY_JSON) { /* x as object: written as JSON text (an unknown inside by its type at run time) */
             bool ju = json_ok_unknown;
             json_ok_unknown = true;
@@ -7230,7 +7324,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         for (int i = 0; i < e->args.len; i++) check_expr(e->args.items[i], elem);
         if (!elem) { /* [id, 'x', 3]: values of several kinds, an unknown[] (TypeScript: (string | number)[]) */
-            int ks = 0, kn = 0, kb = 0, ko = 0;
+            int ks = 0, kn = 0, kb = 0, ko = 0, ku = 0;
             for (int i = 0; i < e->args.len; i++) {
                 Type *t = e->args.items[i]->type;
                 if (t->kind == TY_NULL) continue;
@@ -7238,9 +7332,10 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (t->kind == TY_STRING) ks = 1;
                 else if (is_numeric(t) || t->kind == TY_LITINT) kn = 1;
                 else if (t->kind == TY_BOOLEAN) kb = 1;
+                else if (t->kind == TY_UNKNOWN && !ty_is_any(t)) ku = 1;
                 else ko = 1;
             }
-            if (ks + kn + kb > 1 && !ko) {
+            if ((ks + kn + kb > 1 || (ku && ks + kn + kb > 0)) && !ko) {
                 static Type *arr_unknown2;
                 if (!arr_unknown2) arr_unknown2 = ty_array_of(ty_unknown);
                 for (int i = 0; i < e->args.len; i++) expect_type(e->args.items[i], ty_unknown, "array element");
@@ -7251,11 +7346,14 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (!elem) { /* [{ term: {...} }, { range: {...} }]: objects of different shapes (a search query's clauses): an
                         object[], each element as JSON (TypeScript: a union of the shapes) */
             bool objs = e->args.len > 1, differ = false;
+            bool ju = json_ok_unknown;
+            json_ok_unknown = true;
             for (int i = 0; i < e->args.len && objs; i++) {
                 Type *t = e->args.items[i]->type;
                 if (t->kind != TY_OBJECT || t->cls->builtin || t->cls->is_tuple || !json_ok(t, 0)) objs = false;
                 else if (i && !ty_equal(t, e->args.items[0]->type)) differ = true;
             }
+            json_ok_unknown = ju;
             if (objs && differ) {
                 for (int i = 0; i < e->args.len; i++) expect_type(e->args.items[i], ty_json, "array element");
                 e->type = ty_array_of(ty_json);
@@ -8079,6 +8177,26 @@ static UNarrow union_narrow(Expr *c) {
         if (u->kind != TY_UNION) return r;
         bool *keep = xs_alloc(sizeof(bool) * (size_t)u->nparams), *other = xs_alloc(sizeof(bool) * (size_t)u->nparams);
         for (int i = 0; i < u->nparams; i++) { keep[i] = u->params[i]->kind == TY_ARRAY; other[i] = !keep[i]; }
+        r.b = b;
+        r.then_t = union_subset(u, keep);
+        r.else_t = union_subset(u, other);
+        return r;
+    }
+    if (c->kind == E_CALL && c->builtin.cfn && strcmp(c->builtin.cfn, "xs_union_has") == 0 && c->args.len == 2 && c->args.items[1]->kind == E_STRING) {
+        /* 'k' in x: the members that have k, and on the other side those without it (or with it optional) */
+        Expr *id = union_ident(c->args.items[0]);
+        Binding *b = id ? lookup(id->str) : NULL;
+        if (!b) return r;
+        Type *u = b->type;
+        if (u->kind == TY_NULLABLE) u = u->elem;
+        if (u->kind != TY_UNION) return r;
+        const char *k = c->args.items[1]->str;
+        bool *keep = xs_alloc(sizeof(bool) * (size_t)u->nparams), *other = xs_alloc(sizeof(bool) * (size_t)u->nparams);
+        for (int i = 0; i < u->nparams; i++) {
+            Field *fd = u->params[i]->kind == TY_OBJECT ? find_field(u->params[i]->cls, k, NULL) : NULL;
+            keep[i] = fd != NULL;
+            other[i] = !fd || fd->optional;
+        }
         r.b = b;
         r.then_t = union_subset(u, keep);
         r.else_t = union_subset(u, other);
