@@ -37,6 +37,8 @@ typedef struct xs_ora_conn {
     uint8_t seq;
     uint32_t *close_cursors; /* cursors to close on the next request */
     int nclose, close_cap;
+    uint8_t *free_lobs;     /* locators of temporary LOBs (OUT binds) to free on the next request */
+    size_t free_len, free_cap;
     struct xs_ora_conn *next;
 } xs_ora_conn;
 
@@ -379,6 +381,18 @@ static void xs_ora_func(xs_ora_conn *c, xs_ora_w *w, unsigned code) {
         for (int i = 0; i < c->nclose; i++) xs_ora_ub(w, c->close_cursors[i]);
         c->nclose = 0;
     }
+    if (c->free_len > 0) { /* free the temporary LOBs OUT binds returned (as node-oracledb does when a Lob closes) */
+        xs_ora_u8(w, 17); xs_ora_u8(w, 96); xs_ora_u8(w, c->seq); c->seq = (uint8_t)(c->seq + 1);
+        if (c->ttcfv >= 18) xs_ora_ub(w, 0);
+        xs_ora_u8(w, 1); xs_ora_ub(w, c->free_len);
+        xs_ora_u8(w, 0); xs_ora_ub(w, 0); xs_ora_ub(w, 0); xs_ora_ub(w, 0); /* dest locator, source locator */
+        xs_ora_u8(w, 0); xs_ora_u8(w, 0); xs_ora_u8(w, 0);                    /* offsets, charset */
+        xs_ora_ub(w, 0x111 | 0x80000);                                       /* free temporary, as an array */
+        xs_ora_u8(w, 0); xs_ora_ub(w, 0); xs_ora_ub(w, 0); xs_ora_ub(w, 0); xs_ora_u8(w, 0); /* scn */
+        xs_ora_u8(w, 0); xs_ora_ub(w, 0); xs_ora_u8(w, 0); xs_ora_ub(w, 0); xs_ora_u8(w, 0); xs_ora_ub(w, 0);
+        xs_ora_put(w, c->free_lobs, c->free_len);
+        c->free_len = 0;
+    }
     xs_ora_u8(w, 3); xs_ora_u8(w, code); xs_ora_u8(w, c->seq); c->seq = (uint8_t)(c->seq + 1);
     if (c->ttcfv >= 18) xs_ora_ub(w, 0);
 }
@@ -633,6 +647,7 @@ static void xs_ora_close(xs_ora_conn *c) {
     }
     free(c->in);
     free(c->close_cursors);
+    free(c->free_lobs);
     free(c);
 }
 static void xs_ora_login(xs_ora_conn *c, xn_oracledb_NativePool *p);
@@ -705,7 +720,7 @@ accepted:;
         void *e = xs_caught();
         c->broken = true;
         if (c->fd >= 0) close(c->fd);
-        free(c->in); free(c->close_cursors); free(c);
+        free(c->in); free(c->close_cursors); free(c->free_lobs); free(c);
         xs_throw(e);
     }
     xs_ora_login(c, p);
@@ -1007,7 +1022,20 @@ static void xs_ora_hex_json(xs_sb *sb, const uint8_t *b, size_t n) {
 }
 
 /* ---- binds ---- */
-typedef struct { int kind; int64_t i; double d; xs_str *s; double t; const uint8_t *bytes; size_t nbytes; } xs_ora_val;
+typedef struct {
+    int kind; int64_t i; double d; xs_str *s; double t; const uint8_t *bytes; size_t nbytes;
+    /* the bind parameter object's dir, type and maxSize (node-oracledb's numbers; 0 / -1 when not given) */
+    int dir, dbtype; int64_t maxsize;
+    const char *name;       /* the bind's name as the caller wrote it (NULL by position) */
+    int bind;               /* which of the caller's binds (a name may be used twice in SQL) */
+    /* OUT and IN OUT: the type and size sent, what the server said the direction is, and the value read */
+    int otype; uint32_t omax; uint32_t cont; bool lobtext; int srvdir;
+    char *out;              /* the value as JSON */
+    uint8_t *loc; size_t loclen; uint64_t loblen; /* a CLOB/BLOB's locator, read after the call */
+} xs_ora_val;
+#define XS_ORA_BIND_IN 3001
+#define XS_ORA_BIND_INOUT 3002
+#define XS_ORA_BIND_OUT 3003
 enum { XS_ORA_NULL, XS_ORA_INT, XS_ORA_NUM, XS_ORA_STR, XS_ORA_BOOL, XS_ORA_DATE, XS_ORA_BYTES };
 /* the bind placeholders of a statement, in order: ":name" or ":1" outside quotes and comments */
 typedef struct { char name[64]; } xs_ora_ph;
@@ -1056,27 +1084,56 @@ static xs_ora_kind xs_ora_classify(const char *sql, size_t n) {
     for (int q = 0; ddl[q]; q++) if (!strcmp(w, ddl[q])) return XS_ORA_DDL;
     return XS_ORA_DML;
 }
-static void xs_ora_bind_meta(xs_ora_w *w, int type, uint32_t maxsize, int ttcfv) {
+static void xs_ora_bind_meta(xs_ora_w *w, int type, uint32_t maxsize, int ttcfv, uint32_t cont) {
     xs_ora_u8(w, (unsigned)type); xs_ora_u8(w, 1); xs_ora_u8(w, 0); xs_ora_u8(w, 0);
     xs_ora_ub(w, maxsize);
-    xs_ora_ub(w, 0); xs_ora_ub(w, 0);       /* max elements, cont flags */
+    xs_ora_ub(w, 0); xs_ora_ub(w, cont);    /* max elements, cont flags (LOB prefetch for CLOB/BLOB) */
     xs_ora_ub(w, 0); xs_ora_ub(w, 0);       /* OID, version */
-    bool chars = type == 1 || type == 96 || type == 8;
+    bool chars = type == 1 || type == 96 || type == 8 || type == 112;
     xs_ora_ub(w, chars ? 873 : 0);
     xs_ora_u8(w, chars ? 1 : 0);
     xs_ora_ub(w, 0);                        /* LOB prefetch */
     if (ttcfv >= 8) xs_ora_ub(w, 0);        /* oaccolid */
 }
-static int xs_ora_bind_type(const xs_ora_val *v, uint32_t *maxsize, uint32_t max_str) {
+static int xs_ora_bind_type(const xs_ora_val *v, uint32_t *maxsize, uint32_t max_str, bool plsql) {
+    uint32_t lim = plsql ? 32767 : max_str; /* PL/SQL takes VARCHAR2/RAW binds up to 32767 bytes */
     switch (v->kind) {
     case XS_ORA_INT: case XS_ORA_NUM: case XS_ORA_BOOL: *maxsize = 22; return 2;
     case XS_ORA_DATE: *maxsize = 11; return 180;
-    case XS_ORA_BYTES: *maxsize = v->nbytes ? (uint32_t)v->nbytes : 1; return v->nbytes > max_str ? 24 : 23;
-    case XS_ORA_STR: { uint32_t n = v->s ? (uint32_t)v->s->len : 0; *maxsize = n ? n : 1; return n > max_str ? 8 : 1; }
+    case XS_ORA_BYTES: *maxsize = v->nbytes ? (uint32_t)v->nbytes : 1; return v->nbytes > lim ? 24 : 23;
+    case XS_ORA_STR: { uint32_t n = v->s ? (uint32_t)v->s->len : 0; *maxsize = n ? n : 1; return n > lim ? 8 : 1; }
     default: *maxsize = 1; return 1;
     }
 }
-static void xs_ora_bind_value(xs_ora_w *w, const xs_ora_val *v) {
+/* an OUT or IN OUT bind: the type and buffer size to send, as node-oracledb picks them (STRING when no type is
+   given; maxSize 200 for strings and bytes when not given; a PL/SQL string or bytes bind over 32767 bytes is a
+   CLOB / BLOB, read back whole) */
+static void xs_ora_out_type(xs_ora_val *v, bool plsql) {
+    int64_t mx = v->maxsize;
+    v->cont = 0;
+    v->lobtext = false;
+    switch (v->dbtype) {
+    case 0: case 2001: case 2002: case 2003: case 2004: /* VARCHAR, NVARCHAR, CHAR, NCHAR */
+        if (mx <= 0) mx = 200;
+        if (v->dir == XS_ORA_BIND_INOUT && v->kind == XS_ORA_STR && v->s && v->s->len > mx) mx = v->s->len;
+        if (plsql && mx > 32767) { v->otype = 112; v->omax = 112; v->cont = 0x2000000; v->lobtext = true; return; }
+        v->otype = 1; v->omax = (uint32_t)mx; return;
+    case 2006: case 2007: /* RAW, LONG RAW (BUFFER) */
+        if (mx <= 0) mx = 200;
+        if (v->dir == XS_ORA_BIND_INOUT && v->kind == XS_ORA_BYTES && (int64_t)v->nbytes > mx) mx = (int64_t)v->nbytes;
+        if (plsql && mx > 32767) { v->otype = 113; v->omax = 112; v->cont = 0x2000000; return; }
+        v->otype = 23; v->omax = (uint32_t)mx; return;
+    case 2010: case 2008: case 2009: v->otype = 2; v->omax = 22; return; /* NUMBER (and BINARY_FLOAT/DOUBLE as NUMBER) */
+    case 2011: v->otype = 12; v->omax = 7; return;
+    case 2012: case 2013: case 2014: v->otype = 180; v->omax = 11; return;
+    case 2017: case 2018: v->otype = 112; v->omax = 112; v->cont = 0x2000000; return;
+    case 2019: v->otype = 113; v->omax = 112; v->cont = 0x2000000; return;
+    case 2022: v->otype = 252; v->omax = 4; return;
+    case 2021: xs_ora_fail("NJS-010: REF CURSOR binds are not supported yet in xisto's oracledb");
+    default: xs_ora_fail("NJS-011: unsupported bind type %d for an OUT bind", v->dbtype);
+    }
+}
+static void xs_ora_bind_value(xs_ora_w *w, const xs_ora_val *v, bool date7) {
     char num[64];
     switch (v->kind) {
     case XS_ORA_NULL: xs_ora_u8(w, 0); return;
@@ -1103,7 +1160,7 @@ static void xs_ora_bind_value(xs_ora_w *w, const xs_ora_val *v) {
                          (uint8_t)(secs / 3600 + 1), (uint8_t)(secs / 60 % 60 + 1), (uint8_t)(secs % 60 + 1)};
         uint32_t fs = (uint32_t)(frac * 1000000);
         b[7] = (uint8_t)(fs >> 24); b[8] = (uint8_t)(fs >> 16); b[9] = (uint8_t)(fs >> 8); b[10] = (uint8_t)fs;
-        xs_ora_bwl(w, b, frac ? 11 : 7);
+        xs_ora_bwl(w, b, frac && !date7 ? 11 : 7);
         return;
     }
     default: xs_ora_u8(w, 0);
@@ -1120,8 +1177,14 @@ typedef struct {
     bool more;              /* rows remain (no ORA-01403 yet) */
     bool objects;           /* outFormat: objects (else arrays) */
     char **last;            /* the previous row's values as JSON, for columns the server sends only when they change */
+    xs_ora_val *binds;      /* a PL/SQL block's binds: the row the server sends holds its OUT values */
+    int nbinds;
+    bool iov;               /* the server said the binds' directions (an IO vector) */
+    bool flush;             /* the server asks the client to flush the OUT binds */
+    char *deferred;         /* an error to throw once the response is read (NJS-016) */
 } xs_ora_rs;
 static void xs_ora_rs_free(xs_ora_rs *r) {
+    free(r->deferred);
     for (int i = 0; i < r->ncols; i++) { free(r->cols[i].name); if (r->last) free(r->last[i]); }
     free(r->cols);
     free(r->last);
@@ -1247,6 +1310,48 @@ static void xs_ora_row(xs_ora_conn *c, xs_ora_rs *r, const uint8_t *bitvec, bool
     xs_sb_put(&r->rows, r->objects ? "}" : "]", 1);
     r->nrows++;
 }
+/* one OUT bind value in a PL/SQL response, as JSON in v->out; a CLOB/BLOB leaves its locator to read after the
+   call. Each value ends with its actual length: not 0 when the value did not fit maxSize (NJS-016). */
+static void xs_ora_out_value(xs_ora_conn *c, xs_ora_rs *r, xs_ora_val *v) {
+    xs_sb sb = {0};
+    uint8_t *b = NULL;
+    size_t n = 0;
+    bool isnull = false;
+    free(v->out); v->out = NULL;
+    free(v->loc); v->loc = NULL; v->loclen = 0;
+    switch (v->otype) {
+    case 1:
+        if (xs_ora_rbwl(c, &b, &n)) { xs_str *s = xs_str_new((char *)b, n); xs_sb_str(&sb, s); xs_release(s); } else isnull = true;
+        break;
+    case 23: if (xs_ora_rbwl(c, &b, &n)) xs_ora_hex_json(&sb, b, n); else isnull = true; break;
+    case 2: if (xs_ora_rbwl(c, &b, &n)) { char num[100]; xs_ora_number_text(b, n, num); xs_sb_put(&sb, num, strlen(num)); } else isnull = true; break;
+    case 12: case 180: if (xs_ora_rbwl(c, &b, &n)) xs_ora_date_json(&sb, b, n, true); else isnull = true; break;
+    case 252: if (xs_ora_rbwl(c, &b, &n)) xs_sb_put(&sb, n && b[n - 1] == 1 ? "true" : "false", n && b[n - 1] == 1 ? 4 : 5); else isnull = true; break;
+    case 112: case 113: {
+        int64_t has = xs_ora_rub(c);
+        if (has > 0) {
+            v->loblen = (uint64_t)xs_ora_rub(c);
+            xs_ora_rub(c); /* chunk size */
+            if (xs_ora_rbwl(c, &b, &n)) { v->loc = b; v->loclen = n; b = NULL; }
+            else isnull = true;
+        } else isnull = true;
+        break;
+    }
+    default: xs_ora_fail("oracledb: OUT bind of type %d", v->otype);
+    }
+    free(b);
+    int64_t actual = xs_ora_rub(c);
+    if (v->otype == 252 && actual < 0) isnull = true;
+    else if (actual != 0 && !isnull && !r->deferred) r->deferred = strdup("NJS-016: buffer is too small for OUT binds");
+    if (isnull) { free(sb.data); free(v->loc); v->loc = NULL; v->loclen = 0; v->out = strdup("null"); return; }
+    if (v->loc) { free(sb.data); return; }
+    xs_sb_put(&sb, "", 0);
+    v->out = malloc(sb.len + 1);
+    if (!v->out) xs_panic("out of memory");
+    memcpy(v->out, sb.data ? sb.data : "", sb.len);
+    v->out[sb.len] = 0;
+    free(sb.data);
+}
 /* an execute or fetch response: describe info, rows, return parameters, errors */
 static void xs_ora_read_result(xs_ora_conn *c, xs_ora_rs *r, xs_ora_status *st, bool fetch) {
     uint8_t *bitvec = NULL;
@@ -1270,7 +1375,12 @@ static void xs_ora_read_result(xs_ora_conn *c, xs_ora_rs *r, xs_ora_status *st, 
             bvlen = nb;
             break;
         }
-        case 7: xs_ora_row(c, r, bvlen ? bitvec : NULL, fetch); free(bitvec); bitvec = NULL; bvlen = 0; break;
+        case 7:
+            if (r->binds && r->iov) { /* a PL/SQL block's OUT values, in bind order */
+                for (int i = 0; i < r->nbinds; i++) if (r->binds[i].srvdir != 32) xs_ora_out_value(c, r, &r->binds[i]);
+                break;
+            }
+            xs_ora_row(c, r, bvlen ? bitvec : NULL, fetch); free(bitvec); bitvec = NULL; bvlen = 0; break;
         case 8: { /* return parameters */
             int64_t n = xs_ora_rub(c);
             for (int64_t i = 0; i < n; i++) xs_ora_rub(c);
@@ -1295,10 +1405,15 @@ static void xs_ora_read_result(xs_ora_conn *c, xs_ora_rs *r, xs_ora_status *st, 
             k = xs_ora_rub(c);
             if (k > 0) xs_ora_rraw(c, (size_t)k);
             int64_t nb = hi * 256 + lo;
-            for (int64_t i = 0; i < nb; i++) if (xs_ora_r8(c) != 32) xs_ora_fail("oracledb: OUT binds are not supported yet");
+            for (int64_t i = 0; i < nb; i++) {
+                unsigned d = xs_ora_r8(c); /* 32 IN, 16 OUT, 48 IN OUT */
+                if (r->binds && i < r->nbinds) r->binds[i].srvdir = (int)d;
+                else if (d != 32) xs_ora_fail("oracledb: the server returns an OUT bind the call did not declare");
+            }
+            r->iov = r->binds != NULL;
             break;
         }
-        case 19: st->end = true; break; /* flush out binds */
+        case 19: r->flush = true; st->end = true; break; /* flush out binds: the client asks for them */
         case 27: xs_ora_fail("oracledb: implicit result sets are not supported yet");
         default:
             if (!xs_ora_common(c, t, st)) xs_ora_fail("oracledb: unexpected message %u in a result", t);
@@ -1316,7 +1431,7 @@ static void xs_ora_throw_status(xs_ora_status *st) {
 }
 /* one execute: parse, bind, execute and (queries) prefetch; define: the LOB-as-LONG re-request */
 static void xs_ora_send_execute(xs_ora_conn *c, const char *sql, size_t sqln, xs_ora_kind kind, int cursor, bool define,
-                                const xs_ora_rs *r, int nb, const xs_ora_val *vals, bool autocommit) {
+                                const xs_ora_rs *r, int nb, xs_ora_val *vals, bool autocommit) {
     xs_ora_w w = {0};
     unsigned options = 0, dml = 0;
     bool query = kind == XS_ORA_QUERY, plsql = kind == XS_ORA_PLSQL;
@@ -1376,30 +1491,135 @@ static void xs_ora_send_execute(xs_ora_conn *c, const char *sql, size_t sqln, xs
         int *types = calloc((size_t)nparams, sizeof(int));
         bool anylong = false;
         for (int i = 0; i < nparams; i++) {
-            uint32_t mx;
-            types[i] = xs_ora_bind_type(&vals[i], &mx, c->max_str);
+            uint32_t mx, cont = 0;
+            xs_ora_val *v = &vals[i];
+            v->srvdir = 32;
+            if (v->dir == XS_ORA_BIND_OUT || v->dir == XS_ORA_BIND_INOUT) {
+                if (!plsql) xs_ora_fail("NJS-007: OUT binds are supported in PL/SQL blocks only (RETURNING INTO is not supported yet)");
+                xs_ora_out_type(v, plsql);
+                types[i] = v->otype; mx = v->omax; cont = v->cont;
+            } else types[i] = xs_ora_bind_type(v, &mx, c->max_str, plsql);
             if (types[i] == 8 || types[i] == 24) anylong = true;
-            xs_ora_bind_meta(&w, types[i], mx, c->ttcfv);
+            xs_ora_bind_meta(&w, types[i], mx, c->ttcfv, cont);
         }
         xs_ora_u8(&w, 7); /* the row of values: LONG values after the others */
-        for (int i = 0; i < nparams; i++) if (!(anylong && (types[i] == 8 || types[i] == 24))) xs_ora_bind_value(&w, &vals[i]);
-        if (anylong) for (int i = 0; i < nparams; i++) if (types[i] == 8 || types[i] == 24) xs_ora_bind_value(&w, &vals[i]);
+        for (int i = 0; i < nparams; i++) {
+            const xs_ora_val *v = &vals[i];
+            if (anylong && (types[i] == 8 || types[i] == 24)) continue;
+            if (v->dir == XS_ORA_BIND_OUT || ((v->dir == XS_ORA_BIND_INOUT) && v->kind == XS_ORA_NULL)) {
+                if (types[i] == 252) { xs_ora_u8(&w, 253); xs_ora_u8(&w, 1); } else xs_ora_u8(&w, 0);
+            } else if (v->dir == XS_ORA_BIND_INOUT && (types[i] == 112 || types[i] == 113))
+                xs_ora_fail("NJS-011: IN OUT CLOB/BLOB binds are not supported yet in xisto's oracledb");
+            else xs_ora_bind_value(&w, v, types[i] == 12);
+        }
+        if (anylong) for (int i = 0; i < nparams; i++) if (types[i] == 8 || types[i] == 24) xs_ora_bind_value(&w, &vals[i], false);
         free(types);
     }
     bool ok = xs_ora_send(c, &w);
     free(w.p);
     if (!ok) xs_ora_fail("NJS-500: connection to the Oracle Database was broken");
 }
-static xs_str *xs_ora_execute(xs_ora_conn *c, xs_str *sql, int nb, const xs_ora_val *vals, bool objects, bool autocommit, size_t maxrows) {
+/* UTF-16BE (a CLOB in a variable-width database character set) to UTF-8, into sb */
+static void xs_ora_utf16be(xs_sb *sb, const uint8_t *p, size_t n) {
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        uint32_t u = (uint32_t)p[i] << 8 | p[i + 1];
+        if (u >= 0xd800 && u < 0xdc00 && i + 3 < n) {
+            uint32_t lo = (uint32_t)p[i + 2] << 8 | p[i + 3];
+            if (lo >= 0xdc00 && lo < 0xe000) { u = 0x10000 + ((u - 0xd800) << 10) + (lo - 0xdc00); i += 2; }
+        }
+        char o[4];
+        size_t k;
+        if (u < 0x80) { o[0] = (char)u; k = 1; }
+        else if (u < 0x800) { o[0] = (char)(0xc0 | u >> 6); o[1] = (char)(0x80 | (u & 63)); k = 2; }
+        else if (u < 0x10000) { o[0] = (char)(0xe0 | u >> 12); o[1] = (char)(0x80 | (u >> 6 & 63)); o[2] = (char)(0x80 | (u & 63)); k = 3; }
+        else { o[0] = (char)(0xf0 | u >> 18); o[1] = (char)(0x80 | (u >> 12 & 63)); o[2] = (char)(0x80 | (u >> 6 & 63)); o[3] = (char)(0x80 | (u & 63)); k = 4; }
+        xs_sb_put(sb, o, k);
+    }
+}
+/* an OUT CLOB/BLOB: its whole value with one LOB read (as node-oracledb's lob.getData()), as JSON text (CLOB) or
+   lowercase hex (BLOB) in v->out; a temporary LOB is freed with the connection's next request */
+static void xs_ora_lob_read(xs_ora_conn *c, xs_ora_val *v) {
+    bool blob = v->otype == 113;
+    xs_sb data = {0};
+    if (v->loblen > 0) {
+        xs_ora_w w = {0};
+        xs_ora_func(c, &w, 96);
+        xs_ora_u8(&w, 1); xs_ora_ub(&w, v->loclen);  /* source locator */
+        xs_ora_u8(&w, 0); xs_ora_ub(&w, 0);          /* dest locator */
+        xs_ora_ub(&w, 0); xs_ora_ub(&w, 0);
+        xs_ora_u8(&w, 0); xs_ora_u8(&w, 0); xs_ora_u8(&w, 0);
+        xs_ora_ub(&w, 2);                            /* read */
+        xs_ora_u8(&w, 0); xs_ora_u8(&w, 0);
+        xs_ora_ub(&w, 1); xs_ora_ub(&w, 0);          /* source offset 1, dest offset */
+        xs_ora_u8(&w, 1);                            /* the amount is sent */
+        uint8_t z[6] = {0};
+        xs_ora_put(&w, z, 6);
+        xs_ora_put(&w, v->loc, v->loclen);
+        xs_ora_ub(&w, v->loblen);
+        bool ok = xs_ora_send(c, &w);
+        free(w.p);
+        if (!ok) xs_ora_fail("NJS-500: connection to the Oracle Database was broken");
+        xs_ora_status st = {0};
+        xs_ora_start_response(c);
+        while (!st.end) {
+            unsigned t = xs_ora_r8(c);
+            if (t == 14) { uint8_t *b; size_t n; if (xs_ora_rbwl(c, &b, &n)) { xs_sb_put(&data, (char *)b, n); free(b); } }
+            else if (t == 8) { memcpy(v->loc, xs_ora_rraw(c, v->loclen), v->loclen); xs_ora_rub(c); }
+            else if (!xs_ora_common(c, t, &st)) xs_ora_fail("oracledb: unexpected message %u in a LOB read", t);
+        }
+        if (st.num != 0) { free(data.data); xs_ora_throw_status(&st); }
+        free(st.message);
+    }
+    xs_sb sb = {0};
+    if (blob) xs_ora_hex_json(&sb, (const uint8_t *)(data.data ? data.data : ""), data.len);
+    else {
+        xs_sb text = {0};
+        if (v->loclen > 6 && (v->loc[6] & 0x80)) xs_ora_utf16be(&text, (const uint8_t *)data.data, data.len);
+        else xs_sb_put(&text, data.data ? data.data : "", data.len);
+        xs_str *s = xs_str_new(text.data ? text.data : "", text.len);
+        xs_sb_str(&sb, s);
+        xs_release(s);
+        free(text.data);
+    }
+    free(data.data);
+    v->out = malloc(sb.len + 1);
+    if (!v->out) xs_panic("out of memory");
+    memcpy(v->out, sb.data, sb.len);
+    v->out[sb.len] = 0;
+    free(sb.data);
+    if (v->loclen > 7 && ((v->loc[7] & 0x01) || (v->loc[4] & 0x40))) { /* temporary: free it */
+        if (c->free_len + v->loclen > c->free_cap) {
+            c->free_cap = (c->free_len + v->loclen) * 2;
+            c->free_lobs = realloc(c->free_lobs, c->free_cap);
+            if (!c->free_lobs) xs_panic("out of memory");
+        }
+        memcpy(c->free_lobs + c->free_len, v->loc, v->loclen);
+        c->free_len += v->loclen;
+    }
+    free(v->loc); v->loc = NULL; v->loclen = 0;
+}
+static xs_str *xs_ora_execute(xs_ora_conn *c, xs_str *sql, int nb, xs_ora_val *vals, bool objects, bool autocommit, size_t maxrows) {
     xs_ora_kind kind = xs_ora_classify(sql->data, (size_t)sql->len);
     xs_ora_rs r = {0};
     r.objects = objects;
     r.more = true;
     r.maxrows = maxrows;
     xs_ora_status st = {0};
+    if (kind == XS_ORA_PLSQL && nb > 0) { r.binds = vals; r.nbinds = nb; }
     xs_ora_send_execute(c, sql->data, (size_t)sql->len, kind, 0, false, &r, nb, vals, autocommit);
     xs_ora_start_response(c);
     xs_ora_read_result(c, &r, &st, false);
+    while (r.flush && st.num == 0) { /* the server holds the OUT values until the client asks for them */
+        r.flush = false;
+        xs_ora_w w = {0};
+        xs_ora_u8(&w, 19);
+        bool ok = xs_ora_send(c, &w);
+        free(w.p);
+        if (!ok) { xs_ora_rs_free(&r); xs_ora_fail("NJS-500: connection to the Oracle Database was broken"); }
+        st.end = false;
+        xs_ora_start_response(c);
+        xs_ora_read_result(c, &r, &st, false);
+    }
     int cursor = st.cursor;
     if (st.num != 0) { xs_ora_close_later(c, cursor); xs_ora_rs_free(&r); xs_ora_throw_status(&st); }
     int64_t affected = st.row_count;
@@ -1457,8 +1677,29 @@ static xs_str *xs_ora_execute(xs_ora_conn *c, xs_str *sql, int nb, const xs_ora_
         xs_sb_put(&sb, "]}", 2);
     } else {
         char tail[64];
-        int n = snprintf(tail, sizeof tail, "{\"rows\":[],\"metaData\":[],\"rowsAffected\":%lld}", (long long)affected);
+        int n;
+        if (kind == XS_ORA_PLSQL) n = snprintf(tail, sizeof tail, "{\"rows\":[],\"metaData\":[]"); /* (no rowsAffected, as node-oracledb) */
+        else n = snprintf(tail, sizeof tail, "{\"rows\":[],\"metaData\":[],\"rowsAffected\":%lld", (long long)affected);
         xs_sb_put(&sb, tail, (size_t)n);
+        if (r.binds) { /* outBinds: by name (the caller's spelling) or by position, in the binds' order */
+            if (r.deferred) { static XS_TLS char msg[200]; snprintf(msg, sizeof msg, "%s", r.deferred); free(sb.data); xs_ora_rs_free(&r); free(st.message); xs_throw(xs_Error_from(msg)); }
+            bool named = vals[0].name != NULL, any = false;
+            for (int i = 0; i < nb; i++) {
+                xs_ora_val *v = &vals[i];
+                if (v->dir != XS_ORA_BIND_OUT && v->dir != XS_ORA_BIND_INOUT) continue;
+                bool dup = false;
+                for (int q = 0; q < i; q++) if (vals[q].bind == v->bind) dup = true;
+                if (dup) continue;
+                if (v->loc) xs_ora_lob_read(c, v);
+                xs_sb_put(&sb, any ? "," : named ? ",\"outBinds\":{" : ",\"outBinds\":[", any ? 1 : 13);
+                any = true;
+                if (named) { xs_str *nm = xs_str_new(v->name, strlen(v->name)); xs_sb_str(&sb, nm); xs_release(nm); xs_sb_put(&sb, ":", 1); }
+                const char *o = v->out ? v->out : "null";
+                xs_sb_put(&sb, o, strlen(o));
+            }
+            if (any) xs_sb_put(&sb, named ? "}" : "]", 1);
+        }
+        xs_sb_put(&sb, "}", 1);
     }
     xs_ora_rs_free(&r);
     free(st.message);
@@ -1478,37 +1719,50 @@ static void xs_ora_value_of(void *v, xs_ora_val *out) {
     else if (f == xs_u8_free) { out->kind = XS_ORA_BYTES; out->bytes = ((xs_Uint8Array *)v)->data; out->nbytes = (size_t)((xs_Uint8Array *)v)->f_length; }
     else xs_ora_fail("NJS-044: bind value must be a string, number, boolean, Date, Uint8Array or null");
 }
-XS_NOINLINE xs_str *xn_oracledb_NativePool_execute(xn_oracledb_NativePool *p, int64_t h, xs_str *sql, xs_arr_ref *values, xs_str *named, bool objects, bool autocommit, int64_t maxrows) {
+/* the binds, by position (names empty) or by name (each :name placeholder takes the bind of that name, in any
+   case); dirs, types and sizes: each bind's bind parameter object (0 / -1 when not given) */
+XS_NOINLINE xs_str *xn_oracledb_NativePool_execute(xn_oracledb_NativePool *p, int64_t h, xs_str *sql, xs_arr_ref *values, xs_arr_ref *names,
+                                                    xs_arr_int *dirs, xs_arr_int *types, xs_arr_int *sizes, bool objects, bool autocommit, int64_t maxrows) {
     xs_ora_conn *c = xs_ora_held(p, h);
     xs_ora_kind kind = xs_ora_classify(sql->data, (size_t)sql->len);
     xs_ora_ph ph[512];
     int nph = xs_ora_placeholders(sql->data, (size_t)sql->len, ph, 512, kind == XS_ORA_PLSQL);
-    xs_ora_val *vals = calloc((size_t)(nph ? nph : 1), sizeof *vals);
-    xs_str **owned = calloc((size_t)(nph ? nph : 1), sizeof *owned);
-    if (!vals || !owned) xs_panic("out of memory");
-    if (named && named->len > 2) {
-        xs_jarena_reset();
-        xs_jv *o = xs_json_parse(named);
-        for (int i = 0; i < nph; i++) {
-            xs_jv *v = NULL;
-            if (o && o->kind == XJ_OBJ)
-                for (size_t k = 0; k < o->n; k++) if (strcasecmp(o->keys[k], ph[i].name) == 0) { v = o->items[k]; break; }
-            if (!v) { xs_jv_free(o); free(vals); for (int q = 0; q < i; q++) if (owned[q]) xs_release(owned[q]); free(owned); xs_ora_fail("NJS-097: no bind placeholder named: :%s", ph[i].name); }
-            if (v->kind == XJ_NULL) vals[i].kind = XS_ORA_NULL;
-            else if (v->kind == XJ_BOOL) { vals[i].kind = XS_ORA_BOOL; vals[i].i = v->b; }
-            else if (v->kind == XJ_NUM) { vals[i].kind = XS_ORA_NUM; vals[i].d = v->num; }
-            else if (v->kind == XJ_STR) { vals[i].kind = XS_ORA_STR; owned[i] = xs_str_new(v->str, v->slen); vals[i].s = owned[i]; }
-            else { xs_jv_free(o); xs_ora_fail("NJS-044: named bind %s must be a string, number, boolean or null", ph[i].name); }
+    int nv = values ? (int)values->len : 0;
+    bool named = names && names->len > 0;
+    if (!named && nv != nph) xs_ora_fail("NJS-098: %d positional bind values are required but %d were provided", nph, nv);
+    int map[512];
+    char *nm[512];
+    for (int i = 0; i < nph; i++) {
+        nm[i] = NULL;
+        map[i] = i;
+        if (!named) continue;
+        map[i] = -1;
+        for (int k = 0; k < (int)names->len; k++) {
+            xs_str *n = names->data[k];
+            if ((size_t)n->len == strlen(ph[i].name) && strncasecmp(n->data, ph[i].name, (size_t)n->len) == 0) { map[i] = k; break; }
         }
-        xs_jv_free(o);
-    } else {
-        int nv = values ? (int)values->len : 0;
-        if (nv != nph) { free(vals); free(owned); xs_ora_fail("NJS-098: %d positional bind values are required but %d were provided", nph, nv); }
-        for (int i = 0; i < nph; i++) xs_ora_value_of(values->data[i], &vals[i]);
+        if (map[i] < 0) xs_ora_fail("NJS-097: no bind placeholder named: :%s", ph[i].name);
+    }
+    xs_ora_val *vals = calloc((size_t)(nph ? nph : 1), sizeof *vals);
+    if (!vals) xs_panic("out of memory");
+    for (int i = 0; i < nph; i++) {
+        int k = map[i];
+        xs_ora_value_of(values->data[k], &vals[i]);
+        vals[i].bind = k;
+        vals[i].dir = dirs && k < (int)dirs->len && dirs->data[k] ? (int)dirs->data[k] : XS_ORA_BIND_IN;
+        vals[i].dbtype = types && k < (int)types->len ? (int)types->data[k] : 0;
+        vals[i].maxsize = sizes && k < (int)sizes->len ? sizes->data[k] : -1;
+        if (named) {
+            xs_str *n = names->data[k];
+            nm[i] = malloc((size_t)n->len + 1);
+            if (!nm[i]) xs_panic("out of memory");
+            memcpy(nm[i], n->data, (size_t)n->len);
+            nm[i][n->len] = 0;
+            vals[i].name = nm[i];
+        }
     }
     xs_str *json = xs_ora_execute(c, sql, nph, vals, objects, autocommit, maxrows > 0 ? (size_t)maxrows : 0);
-    for (int i = 0; i < nph; i++) if (owned[i]) xs_release(owned[i]);
-    free(owned);
+    for (int i = 0; i < nph; i++) { free(nm[i]); free(vals[i].out); free(vals[i].loc); }
     free(vals);
     return json;
 }
