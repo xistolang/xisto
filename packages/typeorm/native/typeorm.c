@@ -1,3 +1,4 @@
+#include <time.h>
 /* typeorm for xisto: the JSON work the ORM does on query results and parameters, in C because xisto code holds a
    JSON value (`object`) as text it cannot walk. Each function parses one document at a time (the runtime's JSON
    arena is per parse) and returns new text.
@@ -10,9 +11,40 @@
 
 static void xn_typeorm_put(xs_sb *b, xs_jv *v) { xs_jv_write(b, v); }
 
+/* a `type: "date"` column (kind "...:day"): the local calendar day of the instant the driver read, as TypeORM's
+   mixedDateToDateString does; "YYYY-MM-DD" for a string property, new Date("YYYY-MM-DD") (UTC midnight) for a Date */
+static bool xn_typeorm_day(xs_sb *b, xs_jv *v, const char *kind) {
+    size_t kl = strlen(kind);
+    if (kl < 4 || strcmp(kind + kl - 4, ":day") != 0) return false;
+    if (v->kind != XJ_STR || v->slen < 10) { xn_typeorm_put(b, v); return true; }
+    char tmp[40];
+    size_t n = v->slen < sizeof tmp - 1 ? v->slen : sizeof tmp - 1;
+    memcpy(tmp, v->str, n);
+    tmp[n] = 0;
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
+    struct tm lt = {0};
+    if (sscanf(tmp, "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &se) == 6) { /* an instant (UTC, from the driver's Date) */
+        struct tm ut = {0};
+        ut.tm_year = y - 1900; ut.tm_mon = mo - 1; ut.tm_mday = d; ut.tm_hour = h; ut.tm_min = mi; ut.tm_sec = se;
+        time_t t = timegm(&ut);
+        localtime_r(&t, &lt);
+    } else if (sscanf(tmp, "%d-%d-%d", &y, &mo, &d) == 3) {
+        lt.tm_year = y - 1900; lt.tm_mon = mo - 1; lt.tm_mday = d;
+    } else { xn_typeorm_put(b, v); return true; }
+    char out[40];
+    if (strncmp(kind, "date", 4) == 0) { /* TypeORM hands the property "YYYY-MM-DD": as a Date, new Date of it (UTC midnight) */
+        snprintf(out, sizeof out, "%04d-%02d-%02dT00:00:00.000Z", lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday);
+    } else {
+        snprintf(out, sizeof out, "%04d-%02d-%02d", lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday);
+    }
+    xs_sb_jstr(b, out, strlen(out));
+    return true;
+}
+
 /* the value as the property's kind reads it: string, int, number, boolean, date or other (as it is) */
 static void xn_typeorm_coerce(xs_sb *b, xs_jv *v, const char *kind) {
     if (v->kind == XJ_NULL) { xs_sb_puts(b, "null"); return; }
+    if (xn_typeorm_day(b, v, kind)) return;
     if (strcmp(kind, "string") == 0) {
         if (v->kind == XJ_NUM) { char buf[32]; xs_num_to_str(v->num, buf); if (v->num == 0) { buf[0] = '0'; buf[1] = 0; } xs_sb_jstr(b, buf, strlen(buf)); return; }
         if (v->kind == XJ_BOOL) { xs_sb_jstr(b, v->b ? "true" : "false", v->b ? 4 : 5); return; }

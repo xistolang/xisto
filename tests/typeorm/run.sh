@@ -6,12 +6,26 @@ X=../../build/xisto
 mkdir -p .xisto/pkgs # (the packages from this repository, as examples/conduit/setup.sh links them)
 ln -sfn ../../../../packages/typeorm .xisto/pkgs/typeorm
 ln -sfn ../../../../packages/pg .xisto/pkgs/pg
+ln -sfn ../../../../packages/oracledb .xisto/pkgs/oracledb
 for p in express class-validator class-transformer; do ln -sfn "../../../../packages/$p" ".xisto/pkgs/$p"; done
 mkdir -p .xisto/pkgs/@nestjs
 for p in common core typeorm; do ln -sfn "../../../../../packages/@nestjs/$p" ".xisto/pkgs/@nestjs/$p"; done
 fail=0
 if $X run --no-warnings src/sql.ts > /tmp/xisto-typeorm-sql.out 2>&1 && cmp -s /tmp/xisto-typeorm-sql.out sql.expected; then echo "ok typeorm sql"; else echo "FAIL typeorm sql"; diff sql.expected /tmp/xisto-typeorm-sql.out | head; fail=1; fi
 if $X run --no-warnings src/oracle.ts > /tmp/xisto-typeorm-oracle.out 2>&1 && cmp -s /tmp/xisto-typeorm-oracle.out oracle.expected; then echo "ok typeorm oracle driver"; else echo "FAIL typeorm oracle driver"; diff oracle.expected /tmp/xisto-typeorm-oracle.out | head; fail=1; fi
+# type "oracle" against a live Oracle Database (XISTO_ORACLE_URL=oracle://user:password@host:port/service, as
+# tests/oracledb/run.sh); oracle-live.expected is what TypeORM 0.3 + node-oracledb 6 print for the same steps
+if [ -n "$XISTO_ORACLE_URL" ]; then
+    if $X build --no-warnings -o /tmp/xisto-typeorm-oracle-live src/oracle-live.ts > /tmp/xisto-typeorm-oracle-live.build 2>&1 \
+        && TZ=America/Sao_Paulo XISTO_RC_STATS=1 /tmp/xisto-typeorm-oracle-live > /tmp/xisto-typeorm-oracle-live.out 2> /tmp/xisto-typeorm-oracle-live.stats \
+        && cmp -s /tmp/xisto-typeorm-oracle-live.out oracle-live.expected && grep -q ' 0 still alive' /tmp/xisto-typeorm-oracle-live.stats; then
+        echo "ok typeorm oracle (live)"
+    else
+        echo "FAIL typeorm oracle (live)"; head -5 /tmp/xisto-typeorm-oracle-live.build; diff oracle-live.expected /tmp/xisto-typeorm-oracle-live.out | head; tail -1 /tmp/xisto-typeorm-oracle-live.stats; fail=1
+    fi
+else
+    echo "ok typeorm oracle live (skipped: XISTO_ORACLE_URL is not set)"
+fi
 if nc -z 127.0.0.1 "${PGPORT_TEST:-55432}" 2>/dev/null; then
     if $X run --no-warnings src/pg.ts > /tmp/xisto-typeorm-pg.out 2>&1 && cmp -s /tmp/xisto-typeorm-pg.out pg.expected; then echo "ok typeorm postgres"; else echo "FAIL typeorm postgres"; diff pg.expected /tmp/xisto-typeorm-pg.out | head; fail=1; fi
     # @nestjs/typeorm: a Nest application on the same server, its routes asked over HTTP

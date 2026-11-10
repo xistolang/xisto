@@ -179,6 +179,8 @@ if python3 tools/noinline-scan.py --check runtime/xisto_rt.h runtime/xisto_net.h
 if sh tests/tlsgate/run.sh > "$OUT/tlsgate.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL tlsgate:"; cat "$OUT/tlsgate.txt"; fail=$((fail+1)); fi
 fi
 
+# pg: a pool asked for more queries at once than it has connections, against a live PostgreSQL when one is up
+if sh tests/pg/run.sh > "$OUT/pg-pool.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL pg pool:"; cat "$OUT/pg-pool.txt"; fail=$((fail+1)); fi
 # typeorm: generated SQL for postgres and oracle; a live PostgreSQL when one is up (tests/typeorm/run.sh)
 if sh tests/typeorm/run.sh > "$OUT/typeorm.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL typeorm:"; cat "$OUT/typeorm.txt"; fail=$((fail+1)); fi
 # packages: xisto add / install from a local git repository
