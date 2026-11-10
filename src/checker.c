@@ -2293,6 +2293,12 @@ static void unify(Type *pat, Type *got, Func *tmpl, Type **bind) {
     case TY_FUNC:
         if (pat->nparams != got->nparams) return;
         for (int i = 0; i < pat->nparams; i++) unify(pat->params[i], got->params[i], tmpl, bind);
+        if (pat->ret && pat->ret->kind == TY_TPARAM && got->ret && got->ret->kind == TY_VOID) {
+            /* run<R>(fn: () => R) with a void callback: R is void (only here: a void value is never an argument) */
+            for (int i = 0; i < tmpl->ntparams; i++)
+                if (strcmp(tmpl->tparams[i], pat->ret->tname) == 0 && !bind[i]) bind[i] = got->ret;
+            return;
+        }
         unify(pat->ret, got->ret, tmpl, bind);
         return;
     case TY_OBJECT: /* Box<T> against an instance of Box */
@@ -5650,8 +5656,26 @@ static void check_stmt(Stmt *s) {
         if (!cur_func) xs_error(XS8068, s->pos, NULL, "'return' outside of a function");
         if (cur_func->is_gen && s->expr) xs_error(XS8074, s->expr->pos, "yield it, then return;", "a generator returns no value");
         if (s->expr) {
-            if (cur_func->ret->kind == TY_VOID)
-                xs_error(XS8057, s->expr->pos, NULL, "'%s' is void and cannot return a value", cur_func->name);
+            if (cur_func->ret->kind == TY_VOID) {
+                /* return f(); where f is void too (TypeScript allows it; a generic run<R> instantiated with void):
+                   the call, then return; */
+                check_expr(s->expr, NULL);
+                if (!s->expr->type || s->expr->type->kind != TY_VOID)
+                    xs_error(XS8057, s->expr->pos, NULL, "'%s' is void and cannot return a value", cur_func->name);
+                settle(s->expr);
+                Stmt *call = xs_alloc(sizeof *call), *ret = xs_alloc(sizeof *ret);
+                call->kind = S_EXPR;
+                call->pos = s->pos;
+                call->expr = s->expr;
+                ret->kind = S_RETURN;
+                ret->pos = s->pos;
+                s->kind = S_BLOCK;
+                s->expr = NULL;
+                s->stmts = (StmtList){0};
+                stmt_list_push(&s->stmts, call);
+                stmt_list_push(&s->stmts, ret);
+                return;
+            }
             check_expr(s->expr, cur_func->ret);
             expect_type(s->expr, cur_func->ret, xs_sprintf("return value of '%s'", cur_func->name));
         } else if (cur_func->ret->kind != TY_VOID && !cur_func->is_gen) {

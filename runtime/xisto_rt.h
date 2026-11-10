@@ -298,6 +298,10 @@ static XS_TLS const char *xs_recover_msg;
 static XS_TLS jmp_buf **xs_try_stack; /* 256 slots; each coroutine has its own */
 static XS_TLS int xs_try_depth;
 static XS_TLS void *xs_thrown;
+/* node:async_hooks: the context AsyncLocalStorage reads, an owned reference to the innermost frame (a class of the
+   xisto:async_hooks module, or NULL). A coroutine takes the context it was created in and swaps it in and out as it
+   runs (xisto_net.h, xs_coro_resume): awaits, Promise.all tasks and timers keep their caller's context */
+static XS_TLS void *xs_als_cur;
 static void *xs_Error_new(void *msg);
 static void xs_throw(void *err);
 #ifdef XS_DEBUG
@@ -792,6 +796,13 @@ static inline void xs_release_(void *p) {
               else if (__builtin_expect((h_->cls & (XS_CYC | XS_BUF)) == XS_CYC, 0)) xs_gc_suspect(h_); } } while (0)
 #define xs_retain(x) ((__typeof__(x))xs_retain_((void *)(x)))
 #define xs_release(x) xs_release_((void *)(x))
+/* node:async_hooks: read and replace the current context (xs_als_cur, above) */
+XS_NOINLINE void *xs_als_current(void) { return xs_als_cur ? xs_retain_(xs_als_cur) : NULL; }
+XS_NOINLINE void xs_als_set(void *frame) {
+    void *old = xs_als_cur;
+    xs_als_cur = frame ? xs_retain_(frame) : NULL;
+    if (old) xs_release_(old);
+}
 
 /* Stores an owned reference into a slot, releasing the previous value. */
 static inline void *xs_assign_(void **slot, void *val) {

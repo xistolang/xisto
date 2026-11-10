@@ -2799,7 +2799,19 @@ static const char xs_os_src[] =
     "declare function os_parallelism(): int;\n"
     "export function availableParallelism(): int {\n  return os_parallelism();\n}\n"
     "export class CpuInfo {\n  model: string = \"\";\n  speed: int = 0;\n}\n"
-    "export function cpus(): CpuInfo[] {\n  const r: CpuInfo[] = [];\n  for (let i = 0; i < os_parallelism(); i++) r.push(new CpuInfo());\n  return r;\n}\n";
+    "export function cpus(): CpuInfo[] {\n  const r: CpuInfo[] = [];\n  for (let i = 0; i < os_parallelism(); i++) r.push(new CpuInfo());\n  return r;\n}\n"
+    "declare function os_host_name(): string;\n"
+    "declare function os_platform_name(): string;\n"
+    "declare function os_arch_name(): string;\n"
+    "declare function os_tmp_dir(): string;\n"
+    "declare function os_home_dir(): string;\n"
+    "export function hostname(): string {\n  return os_host_name();\n}\n"
+    "export function platform(): string {\n  return os_platform_name();\n}\n"
+    "export function type(): string {\n  return os_platform_name() === \"darwin\" ? \"Darwin\" : \"Linux\";\n}\n"
+    "export function arch(): string {\n  return os_arch_name();\n}\n"
+    "export function tmpdir(): string {\n  return os_tmp_dir();\n}\n"
+    "export function homedir(): string {\n  return os_home_dir();\n}\n"
+    "export const EOL: string = \"\\n\";\n";
 static void parse_module(Program *prog, Module *m);
 
 /* xisto:fs is the canonical name of a built-in module; node:fs (and the bare fs, sqlite) only in Node
@@ -2873,6 +2885,20 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->loading = false;
         return m;
     }
+    if (strcmp(name, "async_hooks") == 0 || strcmp(name, "crypto") == 0 || strcmp(name, "stream") == 0) {
+        /* written in xisto over runtime functions: runtime/node/<name>.ts, embedded in the compiler */
+        extern const unsigned char xs_node_async_hooks_ts[], xs_node_crypto_ts[], xs_node_stream_ts[];
+        bool ah = strcmp(name, "async_hooks") == 0, cr = strcmp(name, "crypto") == 0;
+        m->builtin = false;
+        m->file = ah ? "xisto:async_hooks" : cr ? "xisto:crypto" : "xisto:stream";
+        m->src = (char *)(ah ? xs_node_async_hooks_ts : cr ? xs_node_crypto_ts : xs_node_stream_ts);
+        m->native_prefix = "xs_";
+        if (cr) prog->uses_crypto = true;
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
     if (strcmp(name, "worker_threads") == 0 || strcmp(name, "os") == 0) { /* written in xisto over runtime functions */
         bool wt = strcmp(name, "worker_threads") == 0;
         m->builtin = false;
@@ -2883,6 +2909,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         parse_module(prog, m);
         m->loading = false;
         if (wt) prog->uses_workers = true;
+        else prog->uses_net = true; /* (xisto:os: its functions live in xisto_net.h) */
         return m;
     }
     if (strcmp(name, "child_process") == 0) {
