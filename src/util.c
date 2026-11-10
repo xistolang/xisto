@@ -138,6 +138,8 @@ static const struct { const char *id, *title, *fix; } cat_table[DC_COUNT] = {
     [DC_INTERNAL] = {"internal", "internal compiler error", "report"},
     [DC_SEMANTIC] = {"semantic", "may behave differently from Node", "review"},
     [DC_DYNPATH] = {"dynamic-path", "dynamic path (any): runs, slower", "optional"},
+    [DC_DEPRECATED] = {"deprecated", "deprecated form: compiles, with a warning", "optional"},
+    [DC_IMPLICIT] = {"implicit", "implicit conversion: compiles, with a warning", "review"},
 };
 const char *xs_diag_cat_title(DiagCat c) { return c < DC_COUNT ? cat_table[c].title : ""; }
 const char *xs_diag_cat_fix(DiagCat c) { return c < DC_COUNT ? cat_table[c].fix : ""; }
@@ -215,6 +217,44 @@ void xs_warn(Pos pos, const char *help, const char *fmt, ...) {
     va_end(ap);
     report(XS0000, "warning", pos, help, msg);
     xs_warning_count++;
+}
+
+/* A rule warning (XB-118): the code compiles under a rule that differs from strict xisto (undefined read as null,
+   int mixed with number...). Each has its code in diag.def. xisto check lists them in their own section; a build
+   prints one line with the count (--warnings prints each); --deny-warnings makes them errors (CI). The packages'
+   own code is not warned about. */
+bool xs_show_warnings;
+bool xs_deny_warnings;
+static int rule_warn_counts[XS_DIAG_COUNT];
+static bool in_package_file(void) {
+    const char *f = xs_file_name;
+    if (!f) return false;
+    if (strncmp(f, "xisto:", 6) == 0 || strncmp(f, "builtin:", 8) == 0 || strstr(f, "/.xisto/pkgs/")) return true;
+    const char *pk = getenv("XISTO_PKGS");
+    return pk && *pk && strncmp(f, pk, strlen(pk)) == 0;
+}
+void xs_warn_rule(DiagCode code, Pos pos, const char *help, const char *fmt, ...) {
+    if (in_package_file()) return;
+    va_list ap;
+    va_start(ap, fmt);
+    char *msg = vformat(fmt, ap);
+    va_end(ap);
+    if (xs_deny_warnings) { report(code, "error", pos, help, msg); xs_error_count++; return; } /* (checking goes on) */
+    rule_warn_counts[code]++;
+    if (xs_check_mode) { if (xs_json_errors) report(code, "warning", pos, help, msg); return; }
+    if (xs_show_warnings || xs_json_errors) report(code, "warning", pos, help, msg);
+}
+/* the build's one line: how many rule warnings, by code */
+void xs_warn_rule_summary(void) {
+    if (xs_check_mode || xs_show_warnings || xs_json_errors) return;
+    int total = 0;
+    for (int c = 0; c < XS_DIAG_COUNT; c++) total += rule_warn_counts[c];
+    if (!total) return;
+    fprintf(stderr, "xisto: %d warning%s (", total, total == 1 ? "" : "s");
+    bool first = true;
+    for (int c = 0; c < XS_DIAG_COUNT; c++)
+        if (rule_warn_counts[c]) { fprintf(stderr, "%s%s %d", first ? "" : ", ", xs_diag_name((DiagCode)c), rule_warn_counts[c]); first = false; }
+    fprintf(stderr, "): --warnings lists them, xisto check --details shows where\n");
 }
 
 /* a use of any: compiles (the dynamic path), so it is no change to make; xisto check lists it apart */

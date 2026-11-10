@@ -19,7 +19,9 @@ typedef struct {
     int line, col;
     bool test; /* in a test file (*.spec.ts, *.test.ts, __tests__/, __mocks__/) */
     bool note; /* a use of any (the dynamic path): compiles, so it is listed apart, not as a change */
+    bool warning; /* a rule warning (XB-118): compiles, listed in its own section (a change with --deny-warnings) */
 } Diag;
+static bool deny_warnings;
 
 typedef struct {
     char **items;
@@ -81,7 +83,12 @@ static bool parse_diag(const char *line, Diag *d) {
         if (*p == '"') sval = json_string(&p);
         else if (strncmp(p, "null", 4) == 0) p += 4;
         else { ival = strtol(p, (char **)&p, 10); }
-        if (strcmp(key, "severity") == 0) { error = sval && (strcmp(sval, "error") == 0 || strcmp(sval, "note") == 0); d->note = sval && strcmp(sval, "note") == 0; }
+        if (strcmp(key, "severity") == 0) {
+            bool warn = sval && strcmp(sval, "warning") == 0;
+            error = sval && (strcmp(sval, "error") == 0 || strcmp(sval, "note") == 0 || warn);
+            d->note = sval && strcmp(sval, "note") == 0;
+            d->warning = warn && !deny_warnings;
+        }
         else if (strcmp(key, "code") == 0) d->code = sval, sval = NULL;
         else if (strcmp(key, "category") == 0) d->category = sval, sval = NULL;
         else if (strcmp(key, "file") == 0) d->file = sval, sval = NULL;
@@ -303,7 +310,7 @@ static void count_table(bool want_test, bool all) {
         int n = 0;
         Strs fs = {0};
         for (int i = 0; i < ndiags; i++)
-            if (!diags[i].note && (all || diags[i].test == want_test) && diags[i].category && strcmp(diags[i].category, xs_diag_cat_id((DiagCat)c)) == 0) {
+            if (!diags[i].note && !diags[i].warning && (all || diags[i].test == want_test) && diags[i].category && strcmp(diags[i].category, xs_diag_cat_id((DiagCat)c)) == 0) {
                 n++;
                 if (!strs_has(&fs, diags[i].file)) strs_push(&fs, diags[i].file);
             }
@@ -318,8 +325,9 @@ int cmd_check(int argc, char **argv) {
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--details") == 0) details = true;
         else if (strcmp(argv[i], "--tests") == 0) with_tests = true;
+        else if (strcmp(argv[i], "--deny-warnings") == 0) deny_warnings = true;
         else if (strcmp(argv[i], "--pkgs") == 0 && i + 1 < argc) { if (!xs_use_pkgs_dir(argv[++i])) return 2; }
-        else if (argv[i][0] == '-') { fprintf(stderr, "xisto check: unknown option '%s' (--details, --tests, --pkgs DIR)\n", argv[i]); return 2; }
+        else if (argv[i][0] == '-') { fprintf(stderr, "xisto check: unknown option '%s' (--details, --tests, --deny-warnings, --pkgs DIR)\n", argv[i]); return 2; }
         else {
             char *p = xs_sprintf("%s", argv[i]);
             for (size_t n = strlen(p); n > 1 && p[n - 1] == '/'; n--) p[n - 1] = 0; /* "dir/" as "dir" */
@@ -390,9 +398,15 @@ int cmd_check(int argc, char **argv) {
     for (int i = 0; i < files.len; i++) { if (test_file(display(files.items[i], cwd, root_real))) test_files_n++; else app_files++; }
     Strs affected = {0}, test_affected = {0};
     int app_n = 0, test_n = 0;
-    int notes_n = 0;
-    Strs note_files = {0};
+    int notes_n = 0, warns_n = 0;
+    Strs note_files = {0}, warn_files = {0};
     for (int i = 0; i < ndiags; i++) {
+        if (diags[i].warning) {
+            if (diags[i].test && !with_tests) continue;
+            warns_n++;
+            if (!strs_has(&warn_files, diags[i].file)) strs_push(&warn_files, diags[i].file);
+            continue;
+        }
         if (diags[i].note) {
             if (diags[i].test && !with_tests) continue;
             notes_n++;
@@ -411,13 +425,16 @@ int cmd_check(int argc, char **argv) {
             int j = i;
             while (j < ndiags && strcmp(diags[j].file, diags[i].file) == 0) j++;
             if (diags[i].test && !with_tests) { i = j; continue; }
-            int nchanges = 0;
-            for (int k = i; k < j; k++) if (!diags[k].note) nchanges++;
-            if (nchanges == j - i) printf("%s%s%s (%d)\n", B, diags[i].file, R, j - i);
-            else printf("%s%s%s (%d, %d dynamic path)\n", B, diags[i].file, R, nchanges, j - i - nchanges);
+            int nchanges = 0, nwarn = 0;
+            for (int k = i; k < j; k++) { if (diags[k].warning) nwarn++; else if (!diags[k].note) nchanges++; }
+            int ndyn = j - i - nchanges - nwarn;
+            printf("%s%s%s (%d", B, diags[i].file, R, nchanges);
+            if (ndyn) printf(", %d dynamic path", ndyn);
+            if (nwarn) printf(", %d warning%s", nwarn, nwarn == 1 ? "" : "s");
+            printf(")\n");
             for (int k = i; k < j; k++) {
                 Diag *d = &diags[k];
-                printf("  %d:%d  %s  %s%s\n", d->line, d->col, d->code ? d->code : "", d->note ? "note: " : "", d->message);
+                printf("  %d:%d  %s  %s%s\n", d->line, d->col, d->code ? d->code : "", d->note ? "note: " : d->warning ? "warning: " : "", d->message);
                 if (d->source && *d->source) {
                     printf("    %s%4d |%s %s\n", D, d->line, R, d->source);
                     printf("    %s     |%s %*s^\n", D, R, d->col > 0 ? d->col - 1 : 0, "");
@@ -441,7 +458,7 @@ int cmd_check(int argc, char **argv) {
         if (with_tests) { for (int k = 0; k < affected.len; k++) strs_push(&both, affected.items[k]); for (int k = 0; k < test_affected.len; k++) strs_push(&both, test_affected.items[k]); af = &both; }
         int *counts = calloc((size_t)af->len + 1, sizeof(int));
         for (int i = 0; i < ndiags; i++)
-            for (int k = 0; !diags[i].note && k < af->len; k++) if (strcmp(diags[i].file, af->items[k]) == 0) { counts[k]++; break; }
+            for (int k = 0; !diags[i].note && !diags[i].warning && k < af->len; k++) if (strcmp(diags[i].file, af->items[k]) == 0) { counts[k]++; break; }
         printf("\n  most changes:\n");
         for (int shown = 0; shown < 5 && shown < af->len; shown++) {
             int best = -1;
@@ -450,6 +467,29 @@ int cmd_check(int argc, char **argv) {
             counts[best] = -1;
         }
         free(counts);
+    }
+    if (warns_n) { /* the rule warnings (XB-118), by code: they compile; --deny-warnings makes them changes */
+        printf("\n  %swarnings%s (compile; to review)                %7s  %5s\n", B, R, "uses", "files");
+        Strs codes = {0};
+        for (int i = 0; i < ndiags; i++)
+            if (diags[i].warning && (with_tests || !diags[i].test) && diags[i].code && !strs_has(&codes, diags[i].code)) strs_push(&codes, diags[i].code);
+        for (int i = 0; i < codes.len; i++) /* (sorted by code) */
+            for (int j = i + 1; j < codes.len; j++)
+                if (strcmp(codes.items[j], codes.items[i]) < 0) { char *t = codes.items[i]; codes.items[i] = codes.items[j]; codes.items[j] = t; }
+        for (int c = 0; c < codes.len; c++) {
+            int n = 0;
+            Strs fs = {0};
+            const char *cat = "";
+            for (int i = 0; i < ndiags; i++)
+                if (diags[i].warning && (with_tests || !diags[i].test) && diags[i].code && strcmp(diags[i].code, codes.items[c]) == 0) {
+                    n++;
+                    if (diags[i].category) cat = diags[i].category;
+                    if (!strs_has(&fs, diags[i].file)) strs_push(&fs, diags[i].file);
+                }
+            printf("    %-8s %-37s %7d  %5d\n", codes.items[c], cat, n, fs.len);
+            free(fs.items);
+        }
+        printf("  %s(xisto check --details shows each place; --deny-warnings counts them as changes)%s\n", D, R);
     }
     if (notes_n)
         printf("\n  %-46s %7d  %5d  %s\n  %s(compiles: each use is read and written by name and checked at run time; a declared type is faster)%s\n",

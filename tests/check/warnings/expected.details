@@ -1,0 +1,31 @@
+main.ts (0, 5 warnings)
+  13:21  XS2103  warning: int mixed with number in arithmetic: the result is number
+      13 | const mixed = count * total; // rule 1: int mixed with number
+         |                     ^
+    help: declare the type you mean: Number(i) for a number, Math.trunc(x) for an int
+  14:29  XS2101  warning: 'undefined' is deprecated in xisto: it is read as null
+      14 | const none: string | null = undefined; // rule 2: undefined read as null
+         |                             ^
+    help: write null: xisto has one empty value
+  15:12  XS2104  warning: type parameter 'T' of 'empty' could not be inferred: it is unknown
+      15 | const xs = empty(); // rule 3: T not inferred
+         |            ^
+    help: pass it explicitly: empty<Type>(...)
+  17:7  XS2102  warning: number is never null: this comparison is always false (deprecated)
+      17 | if (n === null) console.log('never'); // rule 4: never null
+         |       ^
+    help: remove the test, or declare the value as T | null if it can be null
+  18:12  XS2105  warning: an int as a condition: read as '!== 0'
+      18 | if (!items.length) console.log('empty'); // rule 5: int as a condition
+         |            ^
+    help: compare explicitly: x !== 0 (or x > 0)
+
+xisto check: 1 file, no changes needed
+
+  warnings (compile; to review)                   uses  files
+    XS2101   deprecated                                  1      1
+    XS2102   deprecated                                  1      1
+    XS2103   implicit                                    1      1
+    XS2104   implicit                                    1      1
+    XS2105   implicit                                    1      1
+  (xisto check --details shows each place; --deny-warnings counts them as changes)

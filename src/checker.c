@@ -355,7 +355,7 @@ static void infer_ints_fn(Stmt *body);
 /* an int or number argument of the Date API, as a number (ints converted) */
 static void date_num_arg(Expr **slot, const char *what) {
     Expr *a = *slot;
-    check_expr(a, ty_number);
+    if (!a->type) check_expr(a, ty_number); /* (new Date(x) checked x already: a lowered node is not checked twice) */
     if (a->type->kind == TY_LITINT) coerce_lit(a, ty_number);
     if (a->type->kind == TY_INT) {
         Expr *c = xs_alloc(sizeof *c);
@@ -981,6 +981,7 @@ static Class *instantiate(Class *tmpl, Type **args, Pos pos) {
     scope = saved_scope;
     if (cur_mod) { xs_file_name = cur_mod->file; xs_source = cur_mod->src; }
     prog->classes = realloc(prog->classes, sizeof(Class *) * (size_t)(prog->nclasses + 1));
+    prog->cap_classes = prog->nclasses + 1; /* keep the parser's add_class in step */
     prog->classes[prog->nclasses++] = c;
     return c;
 }
@@ -1023,8 +1024,8 @@ static Class *instantiate_class(Class *tmpl, Type **args, Pos pos) {
     made_args[nmade] = args;
     int my = nmade++; /* (resolving its signatures can make more instances) */
     prog->classes = realloc(prog->classes, sizeof(Class *) * (size_t)(prog->nclasses + 1));
+    prog->cap_classes = prog->nclasses + 1; /* keep the parser's add_class in step */
     prog->classes[prog->nclasses++] = c;
-    prog->cap_classes = prog->nclasses;
     /* the class pipeline, in the template's module (the caller's scope is put back) */
     Module *saved_mod = cur_mod;
     Scope *saved_scope = scope;
@@ -1117,6 +1118,7 @@ static Class *tuple_class(Type **ps, int n, Pos pos) {
     made = realloc(made, sizeof(Class *) * (size_t)(nmade + 1));
     made[nmade++] = c;
     prog->classes = realloc(prog->classes, sizeof(Class *) * (size_t)(prog->nclasses + 1));
+    prog->cap_classes = prog->nclasses + 1; /* keep the parser's add_class in step */
     prog->classes[prog->nclasses++] = c;
     return c;
 }
@@ -1642,6 +1644,7 @@ static Expr *str_lit(Pos pos, const char *str) {
 
 static void check_expr(Expr *e, Type *expected);
 static bool truthy_type(Type *t);
+static bool cond_truthy_type(Type *t);
 static void make_truthy(Expr *e, const char *what);
 static void check_optchain(Expr *e, Type *expected);
 static void check_nullish(Expr *e, Type *expected);
@@ -1982,7 +1985,10 @@ static bool pr_null_body(Expr *a) { /* () => undefined / () => null */
     if (a->kind != E_ARROW || !a->arrow->expr_body) return false;
     Stmt *b = a->arrow->fn->body;
     Expr *x = b && b->stmts.len ? b->stmts.items[b->stmts.len - 1]->expr : NULL;
-    if (x && x->kind == E_IDENT && strcmp(x->str, "undefined") == 0 && !lookup("undefined")) x->kind = E_NULL; /* (as null) */
+    if (x && x->kind == E_IDENT && strcmp(x->str, "undefined") == 0 && !lookup("undefined")) { /* (as null: XB-118 rule 2) */
+        xs_warn_rule(XS2101, x->pos, "write null: xisto has one empty value", "'undefined' is deprecated in xisto: it is read as null");
+        x->kind = E_NULL;
+    }
     return x && x->kind == E_NULL;
 }
 static Type *pr_err_type(Expr *a) { /* what a rejection handler takes: Error (or the unknown/any it declares) */
@@ -2304,6 +2310,8 @@ static Type *unify_numeric(Expr *e, const char *what) {
     /* xs.length >= limit, Math.round(x) / 1e8: an int where a number is met is that number (exact within
        ±(2^53−1)), as TypeScript has only number */
     if ((a->type->kind == TY_INT && b->type->kind == TY_NUMBER) || (a->type->kind == TY_NUMBER && b->type->kind == TY_INT)) {
+        xs_warn_rule(XS2103, e->pos, "declare the type you mean: Number(i) for a number, Math.trunc(x) for an int", /* XB-118 rule 1 */
+                     "int mixed with number in %s: the result is number", what);
         Expr **slot = a->type->kind == TY_INT ? &e->lhs : &e->rhs;
         Expr *x = *slot;
         Expr *c = xs_alloc(sizeof *c);
@@ -2342,9 +2350,10 @@ static Expr *dflt_arg(Func *f, int i, Expr **args, int nargs, Pos at) {
     dflt_caller = ctx_here();
     Expr *e = dflt_subst(f->params[i].dflt, f, args, nargs, at);
     dflt_caller = was;
-    if (e && f->mod && f->mod != cur_mod && e->kind != E_NUMBER && e->kind != E_STRING && e->kind != E_BOOL && e->kind != E_NULL) {
+    Module *fm = f->mod ? f->mod : f->cls ? f->cls->mod : NULL; /* (a method's default: its class's module) */
+    if (e && fm && fm != cur_mod && e->kind != E_NUMBER && e->kind != E_STRING && e->kind != E_BOOL && e->kind != E_NULL) {
         CheckCtx *c = xs_alloc(sizeof *c);
-        c->scope = mod_scopes[f->mod->id]; c->mod = f->mod; c->cls = cur_class;
+        c->scope = mod_scopes[fm->id]; c->mod = fm; c->cls = cur_class;
         e->ctx = c;
     }
     return e;
@@ -3102,6 +3111,7 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
     while (required > 0 && tmpl->params[required - 1].dflt) required--;
     if (e->args.len < required || e->args.len > tmpl->nparams)
         xs_error(XS8029, e->pos, NULL, "%s takes %d%s argument(s), got %d", what, required, required == tmpl->nparams ? "" : xs_sprintf(" to %d", tmpl->nparams), e->args.len);
+    int ndone = e->args.len;
     bool *done = xs_alloc(sizeof(bool) * (size_t)(e->args.len + 1));
     /* two passes: the arguments that are not arrows first (they bind T from their own types), then the arrows,
        whose untyped parameters take the types bound so far: parallelMap(items: T[], fn: (item: T) => R) with
@@ -3141,14 +3151,18 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
             cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
         }
     for (int i = 0; i < tmpl->ntparams; i++) /* T that nothing gives (only in the result, as executeQuery<T>(sql)): unknown, as TypeScript infers it */
-        if (!bind[i] && !has_tparam_in_params(tmpl, tmpl->tparams[i])) bind[i] = ty_unknown;
+        if (!bind[i] && !has_tparam_in_params(tmpl, tmpl->tparams[i])) { /* XB-118 rule 3 */
+            xs_warn_rule(XS2104, e->pos, xs_sprintf("pass it explicitly: %s<Type>(...)", tmpl->name),
+                         "type parameter '%s' of %s could not be inferred: it is unknown", tmpl->tparams[i], what);
+            bind[i] = ty_unknown;
+        }
     for (int i = 0; i < tmpl->ntparams; i++)
         if (!bind[i]) xs_error(XS3010, e->pos, xs_sprintf("give it: %s<Type>(...)", tmpl->name), "cannot infer type parameter %s of %s", tmpl->tparams[i], what);
     Func *inst = instantiate_func(tmpl, bind);
     for (int i = e->args.len, given = e->args.len; i < inst->nparams; i++) /* defaults, as written for this instance */
         expr_list_push(&e->args, dflt_arg(inst, i, e->args.items, given, e->pos));
     for (int i = 0; i < e->args.len; i++) {
-        if (!done[i]) check_expr(e->args.items[i], inst->params[i].type);
+        if (i >= ndone || !done[i]) check_expr(e->args.items[i], inst->params[i].type); /* (defaults come after the given ones) */
         expect_type(e->args.items[i], inst->params[i].type, xs_sprintf("argument '%s' of %s", inst->params[i].name, what));
     }
     return inst;
@@ -3335,6 +3349,7 @@ static void infer_objlit(Expr *e) {
         c->nfields = c->cap_fields = e->args.len;
         c->flattened = true;
         prog->classes = realloc(prog->classes, sizeof(Class *) * (size_t)(prog->nclasses + 1));
+        prog->cap_classes = prog->nclasses + 1; /* keep the parser's add_class in step */
         prog->classes[prog->nclasses++] = c;
         made = realloc(made, sizeof(Class *) * (size_t)(nmade + 1));
         made[nmade++] = c;
@@ -3367,6 +3382,7 @@ static void anon_objlit(Expr *e) {
     }
     c->nfields = c->cap_fields = e->args.len;
     prog->classes = realloc(prog->classes, sizeof(Class *) * (size_t)(prog->nclasses + 1));
+    prog->cap_classes = prog->nclasses + 1; /* keep the parser's add_class in step */
     prog->classes[prog->nclasses++] = c;
     e->cls = c;
     e->type = ty_object_of(c);
@@ -3867,6 +3883,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
             if (strcmp(e->str, "undefined") == 0) { /* null is xisto's only empty value (MANIFESTO: null, não undefined): undefined reads as null */
+                xs_warn_rule(XS2101, e->pos, "write null: xisto has one empty value", "'undefined' is deprecated in xisto: it is read as null"); /* XB-118 rule 2 */
                 e->kind = E_NULL;
                 e->str = NULL;
                 check_expr(e, expected);
@@ -3928,7 +3945,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         check_expr(e->lhs, expected);
         if (e->op == TK_NOT) {
-            if (e->lhs->type->kind != TY_BOOLEAN && truthy_type(e->lhs->type)) make_truthy(e->lhs, "operand of '!'");
+            if (e->lhs->type->kind != TY_BOOLEAN && cond_truthy_type(e->lhs->type)) make_truthy(e->lhs, "operand of '!'");
             expect_type(e->lhs, ty_boolean, "operand of '!'");
             e->type = ty_boolean;
         } else if (is_big(e->lhs->type)) { /* -b */
@@ -4227,6 +4244,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                     if (!rereadable(other))
                         xs_error(XS2001, e->pos, "only values declared as T | null can be null", "%s can never be null", ty_name(other->type));
                     bool neq = e->op == TK_NEQ;
+                    xs_warn_rule(XS2102, e->pos, "remove the test, or declare the value as T | null if it can be null", /* XB-118 rule 4 */
+                                 "%s is never null: this comparison is always %s (deprecated)", ty_name(other->type), neq ? "true" : "false");
                     Pos at = e->pos;
                     memset(e, 0, sizeof *e);
                     e->kind = E_BOOL; e->boolean = neq; e->type = ty_boolean; e->field = -1; e->pos = at;
@@ -4273,8 +4292,8 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->type = ty_boolean;
             return;
         case TK_AND: case TK_OR:
-            if (e->lhs->type->kind != TY_BOOLEAN && truthy_type(e->lhs->type)) make_truthy(e->lhs, "left operand of logical operator");
-            if (e->rhs->type->kind != TY_BOOLEAN && truthy_type(e->rhs->type)) make_truthy(e->rhs, "right operand of logical operator");
+            if (e->lhs->type->kind != TY_BOOLEAN && cond_truthy_type(e->lhs->type)) make_truthy(e->lhs, "left operand of logical operator");
+            if (e->rhs->type->kind != TY_BOOLEAN && cond_truthy_type(e->rhs->type)) make_truthy(e->rhs, "right operand of logical operator");
             expect_type(e->lhs, ty_boolean, "left operand of logical operator");
             expect_type(e->rhs, ty_boolean, "right operand of logical operator");
             e->type = ty_boolean;
@@ -6137,6 +6156,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     Expr *a = e->args.items[0];
                     check_expr(a, NULL);
                     if (a->type->kind == TY_STRING) { e->builtin.cfn = "xs_Date_new_str"; return; }
+                    if (ty_is_any(a->type)) { e->builtin.cfn = "xs_Date_new_dyn"; return; } /* (a Date, a string or a number, at run time) */
                     if (a->type->kind == TY_OBJECT && a->type->cls == c) { e->builtin.cfn = "xs_Date_new_copy"; return; }
                     date_num_arg(&e->args.items[0], "the time value of new Date");
                     e->builtin.cfn = "xs_Date_new_ms";
@@ -6270,7 +6290,7 @@ static void check_expr_in(Expr *e, Type *expected) {
     case E_COND: {
         if (e->builtin.cfn && strcmp(e->builtin.cfn, "optchain") == 0) { check_optchain(e, expected); return; }
         check_expr(e->lhs, NULL);
-        if (e->lhs->type->kind != TY_BOOLEAN && truthy_type(e->lhs->type)) make_truthy(e->lhs, "condition of '?:'");
+        if (e->lhs->type->kind != TY_BOOLEAN && cond_truthy_type(e->lhs->type)) make_truthy(e->lhs, "condition of '?:'");
         if (e->lhs->type->kind != TY_BOOLEAN)
             xs_error(XS8105, e->lhs->pos, "there is no truthiness in xisto; compare explicitly", "condition of '?:' must be boolean, but this is %s", ty_name(e->lhs->type));
         Expr *a = e->args.items[0], *b = e->args.items[1];
@@ -6353,6 +6373,7 @@ static void check_stmt_recover(Stmt *s) {
     xs_error_recover = &rb;
     if (_setjmp(rb) == 0) check_stmt(s);
     else {
+        if (cm && cm != cur_mod) enter_module(cm); /* first: it sets the module's scope, put back below */
         scope = sc;
         scope->head = head;
         cur_func = cf;
@@ -6360,7 +6381,6 @@ static void check_stmt_recover(Stmt *s) {
         loop_depth = ld;
         switch_depth = sd;
         finally_depth = fd;
-        if (cm && cm != cur_mod) enter_module(cm);
         xs_error_recover = outer;
         declare_poisoned(s, false);
     }
@@ -6409,6 +6429,9 @@ static bool truthy_type(Type *t) {
     return t->kind == TY_STRING || t->kind == TY_NULLABLE || t->kind == TY_UNKNOWN ||
            t->kind == TY_OBJECT || t->kind == TY_ARRAY || t->kind == TY_MAP || t->kind == TY_SET || t->kind == TY_FUNC;
 }
+/* XB-118 rule 5 (proposed, awaiting Isa's review): an int in a condition (if, !, &&, ||, ?:) is JavaScript's
+   truthiness, x !== 0 (`if (!rows.length)`). The only spot: take TY_INT out here to make it an error again. */
+static bool cond_truthy_type(Type *t) { return truthy_type(t) || t->kind == TY_INT; }
 static bool rereadable(Expr *e) {
     if (e->kind == E_IDENT || e->kind == E_THIS) return true;
     return e->kind == E_MEMBER && !e->is_call && e->field >= 0 && rereadable(e->lhs);
@@ -6461,7 +6484,7 @@ static void check_optchain(Expr *e, Type *expected) {
     pop_scope();
     e->cname = b->cname;
     Type *rt = rest->type;
-    if (ty_is_any(rt)) e->type = rt; /* (an any may be null already) */
+    if (ty_is_any(rt) || rt->kind == TY_UNKNOWN) e->type = rt; /* (an any or an unknown may be null already) */
     else if (rt->kind == TY_VOID) e->type = ty_void;
     else if (rt->kind == TY_NULLABLE || rt->kind == TY_NULL) e->type = rt;
     else { /* a null a gives JavaScript's undefined: absent (a rest that is itself T | null keeps its null) */
@@ -6581,6 +6604,16 @@ static void check_loose_eq(Expr *e) {
 }
 
 static void make_truthy(Expr *e, const char *what) {
+    if (e->type->kind == TY_INT) { /* XB-118 rule 5: x !== 0 */
+        xs_warn_rule(XS2105, e->pos, "compare explicitly: x !== 0 (or x > 0)", "an int as a condition: read as '!== 0'");
+        Expr *v = expr_copy(e);
+        Expr *z = xs_alloc(sizeof *z);
+        z->kind = E_NUMBER; z->pos = e->pos; z->field = -1; z->type = ty_int; z->is_int_lit = true; z->ival = 0; z->num = 0;
+        memset(e, 0, sizeof *e);
+        e->kind = E_BINARY; e->op = TK_NEQ; e->pos = v->pos; e->field = -1; e->type = ty_boolean;
+        e->lhs = v; e->rhs = z;
+        return;
+    }
     if (e->type->kind == TY_UNKNOWN) { dyn_wrap(e, "xs_dyn_truthy", ty_boolean); return; } /* JavaScript's truthiness, at run time (any and unknown) */
     if (e->type->kind == TY_OBJECT || e->type->kind == TY_ARRAY || e->type->kind == TY_MAP || e->type->kind == TY_SET || e->type->kind == TY_FUNC) {
         /* if (this.dataSource): a value that is never null is an object, always truthy */
@@ -6679,7 +6712,7 @@ static void make_truthy(Expr *e, const char *what) {
 }
 static void check_cond(Expr *c, const char *what) {
     check_expr(c, NULL);
-    if (c->type->kind != TY_BOOLEAN && truthy_type(c->type)) make_truthy(c, what);
+    if (c->type->kind != TY_BOOLEAN && cond_truthy_type(c->type)) make_truthy(c, what);
     if (c->type->kind != TY_BOOLEAN)
         xs_error(XS8022, c->pos, "there is no truthiness for numbers in xisto; compare explicitly, e.g. 'x !== 0'", "%s must be boolean, but this is %s", what, ty_name(c->type));
 }
@@ -8254,7 +8287,10 @@ void check_program(Program *p) {
             for (int j = 0; j < k; j++)
                 if (strcmp(fd->name, c->fields[j].name) == 0) xs_error(XS9023, fd->pos, NULL, "field '%s' is declared twice", fd->name);
             if (!fd->type) infer_field_type(c, fd);
+            Module *fmod = fd->owner && fd->owner->mod ? fd->owner->mod : c->mod; /* an inherited field: its type reads where it is written */
+            if (fmod != cur_mod) enter_module(fmod);
             fd->type = resolve(fd->type, fd->pos);
+            if (fmod != c->mod) enter_module(c->mod);
             check_type_supported(fd->pos, fd->type);
             fd->cname = field_cname(fd->name);
         }
@@ -8355,6 +8391,7 @@ void check_program(Program *p) {
         }
     }
     xs_error_recover = NULL;
+    xs_warn_rule_summary(); /* (one line: the rule warnings, XB-118) */
     if (xs_error_count) {
         if (!xs_json_errors) fprintf(stderr, "xisto: %d error%s\n", xs_error_count, xs_error_count == 1 ? "" : "s");
         exit(1);
