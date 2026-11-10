@@ -210,15 +210,10 @@ static Type *parse_inline_object_type(Parser *p) {
     free(key.data);
     const char *name = xs_sprintf("__Obj_%016llx", (unsigned long long)h);
     Program *prog = p->prog;
-    /* fields of primitive types only ({ inicio: string; fim: string }): the text means the same in every file, so
-       the interface is one for the program (an interface's method and the class's method that implements it, in
-       two files, take the same type) */
+    /* the same text in two files is one interface for the program (an interface's method and the class's method that
+       implements it, in two files, take the same type); a type named in it is taken to mean the same in both (two
+       files that name different types alike in the same text would share it: xisto check says nothing of that yet) */
     bool prim = !nsubst;
-    for (int i = 0; prim && i < c->nfields; i++) {
-        Type *t = c->fields[i].type;
-        while (t && (t->kind == TY_ARRAY || t->kind == TY_NULLABLE)) t = t->elem;
-        prim = t && (t->kind == TY_STRING || t->kind == TY_NUMBER || t->kind == TY_INT || t->kind == TY_BOOLEAN);
-    }
     for (int i = 0; i < prog->nclasses; i++)
         if ((prim || prog->classes[i]->mod == p->mod) && strcmp(prog->classes[i]->name, name) == 0) return ty_object_of(prog->classes[i]);
     c->name = name;

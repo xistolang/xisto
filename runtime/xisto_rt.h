@@ -2469,6 +2469,8 @@ static void xs_num_to_str(double v, char *out);
 
 typedef struct xs_closure { xs_hdr hdr; void *fn; } xs_closure;
 typedef struct xs_promise xs_promise; /* (runtime/xisto_net.h: a field may hold one in a program that never makes one) */
+static inline double xs_num_or(double a, double b) { return a != 0 && a == a ? a : b; } /* a || b on numbers: a unless 0 or NaN */
+static inline int64_t xs_int_or(int64_t a, int64_t b) { return a ? a : b; }
 /* a top-level function taken as a value: its static closure (the compiler declares it {XS_IMMORTAL, 0}) gets
    the anchor type the first time it is taken (every thread writes the same bits) */
 static inline __attribute__((always_inline)) xs_closure *xs_cl_static(xs_closure *c) {
