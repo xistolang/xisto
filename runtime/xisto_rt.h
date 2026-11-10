@@ -4758,6 +4758,20 @@ static xs_map *xs_env;
 static xs_arr_ref *xs_process_argv(void) { return xs_argv; }
 static xs_map *xs_process_env(void) { return xs_env; }
 static int64_t xs_process_pid(void) { return (int64_t)getpid(); } /* process.pid */
+/* a key of a Map<number, V> / an element of a Set<number>: held as an int, so it must be a whole number */
+XS_NOINLINE int64_t xs_num_key(double d) {
+    if (d != d || d != trunc(d) || fabs(d) > 9007199254740991.0) {
+        char b[40];
+        snprintf(b, sizeof b, "%.17g", d);
+        xs_panicf("a Map<number> key or Set<number> element must be a whole number (xisto), got %s", b);
+    }
+    return (int64_t)d;
+}
+XS_NOINLINE xs_arr_int *xs_num_keys(xs_arr_num *a) { /* new Set<number>(xs): the numbers as keys (the argument is borrowed) */
+    xs_arr_int *r = xs_arr_int_new(0, 0);
+    for (size_t i = 0; i < a->len; i++) xs_arr_int_push(r, xs_num_key(a->data[i]));
+    return r;
+}
 static xs_str *xs_process_cwd(void) { /* process.cwd() */
     char b[4096];
 #if defined(_WIN32)
