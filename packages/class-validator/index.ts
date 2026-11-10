@@ -158,8 +158,10 @@ export function ArrayMinSize(min: int, o: ValidationOptions = {}): (c: ClassInfo
   return rule("arrayMinSize", min);
 }
 /** One of the given values. */
-export function IsIn(values: string[], o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
-  return rule("isIn", 0, values);
+export function IsIn(values: (string | number)[], o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  const texts: string[] = [];
+  for (const v of values) texts.push(String(v)); // (numbers by their text: inList compares a number value that way)
+  return rule("isIn", 0, texts);
 }
 /** One of an enum's values: pass Object.values(MyEnum) (a string array), as the values to accept. */
 export function IsEnum(values: string[], o: ValidationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
