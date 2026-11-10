@@ -1,8 +1,18 @@
 // typeorm against a live Oracle Database through the oracledb package (tests/typeorm/run.sh runs it when
 // XISTO_ORACLE_URL is set): type "oracle" with no registerDriver, entities and a view, raw queries with binds,
 // the repository, the query builder's OFFSET/FETCH paging, Date columns bound as DATE, transactions on a
-// QueryRunner and an ORA error with its message. Tables of its own, dropped at the end.
+// QueryRunner, PL/SQL OUT binds (query, query(.., true), connect()'s connection) and an ORA error with its
+// message. Tables of its own, dropped at the end.
 import { Column, DataSource, Entity, In, LessThanOrEqual, MoreThan, PrimaryColumn, ViewColumn, ViewEntity } from "typeorm";
+import { BIND_OUT, NUMBER, STRING, BindParameter, Connection, Result } from "oracledb";
+
+interface Structured {
+  records: object;
+  affected?: int;
+}
+interface Said {
+  msg: string;
+}
 
 @Entity("XISTO_TO_ITEM")
 class Item {
@@ -126,6 +136,20 @@ async function main(): Promise<void> {
   } catch (e) {
     console.log("error: " + e.message.split("\n")[0]);
   }
+  // PL/SQL OUT binds: query() returns outBinds, query(sql, binds, true) a QueryResult, connect() the oracledb connection
+  const ret: BindParameter = { dir: BIND_OUT, type: NUMBER };
+  const viaDs: number[] = await ds.query("BEGIN :1 := :2 * 3; END;", [ret, 14]);
+  console.log("outBinds " + JSON.stringify(viaDs));
+  const qr2 = ds.createQueryRunner();
+  const upd2: Structured = await qr2.query("UPDATE XISTO_TO_ITEM SET NOME = NOME WHERE ID = :1", [3], true);
+  console.log("structured update affected " + String(upd2.affected ?? -1) + " records " + JSON.stringify(upd2.records));
+  const pl: Structured = await qr2.query("BEGIN :1 := 'pl ' || :2; END;", [{ dir: BIND_OUT, type: STRING, maxSize: 20 } as BindParameter, 5], true);
+  console.log("structured plsql records " + JSON.stringify(pl.records));
+  const conn = (await qr2.connect()) as Connection;
+  const msg: BindParameter = { dir: BIND_OUT, type: STRING, maxSize: 100 };
+  const said: Result<object, Said> = await conn.executeNamed("BEGIN :msg := 'olá ' || :who; END;", { who: "typeorm", msg });
+  console.log("raw connection " + (said.outBinds === null ? "none" : said.outBinds.msg));
+  await qr2.release();
   await ds.query("DROP VIEW XISTO_TO_ATIVOS", []);
   await ds.query("DROP TABLE XISTO_TO_ITEM", []);
   await ds.destroy();
