@@ -35,6 +35,7 @@ typedef struct Binding {
     bool union_narrow; /* a union variable seen as one of its members (or fewer of them): read through a conversion */
     bool poisoned;   /* its declaration failed (already reported): a use stops checking that statement quietly */
     bool inferred_int; /* `let i = 0` taken as an int (XB-034): becomes a number by itself where a number goes */
+    struct Func *arrow_fn; /* const p = (n: number, w = 2) => ...: the arrow, so p(7) fills w with its literal default */
     bool lit_number; /* `let s = 0` (or 0.5, or any number) with no type written: s += i takes an int i as Number(i), as
                         JavaScript adds it (XB-094); the type the dev never wrote does not ask for a conversion */
     struct Binding *next;
@@ -906,6 +907,11 @@ static Class *instantiate(Class *tmpl, Type **args, Pos pos) {
 static void flatten_fields(Class *c, int depth);
 static void flatten_methods(Class *c);
 static void resolve_signature(Func *f);
+static Type *fret(Func *f, Pos pos);
+static Func *lookup_func(const char *name);
+static void ret_infer_stmt(Stmt *s);
+static void ret_infer_begin(Func *f);
+static void ret_infer_end(Func *f, Pos pos);
 static void check_type_supported(Pos pos, Type *t);
 static Func *eff_ctor(Class *c);
 static Field *find_field(Class *c, const char *name, int *index);
@@ -1040,6 +1046,31 @@ static Type *tuple_type(Type **ps, int n, Pos pos) {
 }
 
 static Type *resolve(Type *t, Pos pos) {
+    if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__ret_of:", 9) == 0) { /* (generated reflection) */
+        const char *dot = strchr(t->tname + 9, '.');
+        Class *c = find_class(xs_strndup(t->tname + 9, (size_t)(dot - (t->tname + 9))));
+        Func *m = NULL;
+        for (int i = 0; c && i < c->nmethods; i++) if (strcmp(c->methods[i]->name, dot + 1) == 0) m = c->methods[i];
+        if (!m) xs_error(XS9031, pos, NULL, "no method %s", t->tname + 9);
+        return fret(m, pos);
+    }
+    if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__ret_of_fn:", 12) == 0) { /* ReturnType<typeof f> */
+        Func *f = lookup_func(t->tname + 12);
+        if (!f || f->ntparams) xs_error(XS1019, pos, "write the type itself", "ReturnType<typeof %s>: no function '%s' here", t->tname + 12, t->tname + 12);
+        Type *r = fret(f, pos);
+        *t = *r; /* (in place: whoever holds it now holds the function's type) */
+        return t;
+    }
+    if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__field_of:", 11) == 0) { /* T['k'] */
+        const char *k = t->tname + 11;
+        Type *o = resolve(t->elem, pos);
+        Type *b = o->kind == TY_NULLABLE ? o->elem : o;
+        Field *fd = b->kind == TY_OBJECT && !b->cls->builtin ? find_field(b->cls, k, NULL) : NULL;
+        if (!fd) xs_error(XS1019, pos, "write the type itself", "%s has no field '%s'", ty_name(o), k);
+        if (!fd->type) xs_error(XS1019, pos, "write the field's type", "the type of %s.%s is not known yet here", b->cls->name, k);
+        *t = *resolve(fd->type, pos);
+        return t;
+    }
     switch (t->kind) {
     case TY_TUPLE: { /* in place: whoever holds this type now holds the tuple's object type */
         for (int i = 0; i < t->nparams; i++) t->params[i] = resolve(t->params[i], pos);
@@ -2387,7 +2418,7 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
         done[i] = true;
         unify(tmpl->params[i].type, e->args.items[i]->type, tmpl, bind);
     }
-    if (expected && has_tparam(tmpl->ret)) unify(tmpl->ret, expected, tmpl, bind);
+    if (expected && tmpl->ret && has_tparam(tmpl->ret)) unify(tmpl->ret, expected, tmpl, bind);
     for (int i = 0; i < tmpl->ntparams; i++) /* <T = string>: what nothing bound takes its default */
         if (!bind[i] && tmpl->tdefaults && tmpl->tdefaults[i]) bind[i] = resolve(tmpl->tdefaults[i], e->pos);
     for (int i = 0; i < tmpl->ntparams; i++)
@@ -2504,13 +2535,13 @@ static void check_object_member(Expr *e, Class *c) {
     if (m->ntparams) { /* a generic method: its instance for these types */
         Func *inst = check_generic_call(e, m, NULL, xs_sprintf("%s.%s", c->name, m->name));
         e->func = inst;
-        e->type = inst->ret;
+        e->type = fret(inst, e->pos);
         return;
     }
     if (e->ntargs) xs_error(XS6003, e->pos, NULL, "%s.%s is not generic", c->name, m->name);
     check_args(e, m, xs_sprintf("%s.%s", c->name, m->name));
     e->func = m;
-    e->type = m->ret;
+    e->type = fret(m, e->pos);
     if (!c->builtin && !e->super_call && (m->is_abstract || overridden_below(c, m))) { /* dispatched by the object's class */
         e->virt = true;
         m->virt_target = true;
@@ -2534,6 +2565,56 @@ static int url_scheme(Expr *u) {
 }
 
 /* { a: 1, b: { c: "x" } } where an object is expected: an interface made from the literal's shape */
+/* { a: 1, b: 'x' } where no type is expected (const p = { ... }, return { ... } with the return type left out): an
+   interface of the values' types, the same one for every literal of the same shape (so two such literals have one type) */
+static void infer_objlit(Expr *e) {
+    static Class **made;
+    static int nmade;
+    Type **ts = xs_alloc(sizeof(Type *) * (size_t)(e->args.len ? e->args.len : 1));
+    for (int i = 0; i < e->args.len; i++) {
+        Expr *v = e->args.items[i];
+        for (int k = 0; k < i; k++) if (strcmp(e->keys[k], e->keys[i]) == 0) xs_error(XS9024, v->pos, NULL, "field '%s' is given twice", e->keys[i]);
+        check_expr(v, NULL);
+        settle(v);
+        if (v->type->kind == TY_NULL) xs_error(XS3009, v->pos, "give the object a declared type", "cannot infer the type of null here");
+        if (v->type->kind == TY_VOID) xs_error(XS8102, v->pos, NULL, "cannot store a void value");
+        ts[i] = v->type->kind == TY_INT && v->kind != E_NUMBER ? ty_number : v->type; /* (TypeScript: a number) */
+        if (ts[i] != v->type) expect_type(v, ts[i], xs_sprintf("field '%s'", e->keys[i]));
+    }
+    Class *c = NULL;
+    for (int m = 0; m < nmade && !c; m++) {
+        Class *o = made[m];
+        if (o->nfields != e->args.len) continue;
+        bool same = true;
+        for (int i = 0; i < e->args.len && same; i++) same = strcmp(o->fields[i].name, e->keys[i]) == 0 && ty_equal(o->fields[i].type, ts[i]);
+        if (same) c = o;
+    }
+    if (!c) {
+        c = xs_alloc(sizeof *c);
+        Buf name = {0};
+        buf_puts(&name, "{ ");
+        for (int i = 0; i < e->args.len; i++) buf_printf(&name, "%s%s: %s", i ? "; " : "", e->keys[i], ty_name(ts[i]));
+        buf_puts(&name, " }");
+        c->name = name.data;
+        c->pos = e->pos;
+        c->is_interface = true;
+        c->mod = cur_mod;
+        c->cname = xs_sprintf("lit%d", nmade);
+        c->used = true;
+        c->fields = xs_alloc(sizeof(Field) * (size_t)(e->args.len ? e->args.len : 1));
+        for (int i = 0; i < e->args.len; i++)
+            c->fields[i] = (Field){.name = e->keys[i], .pos = e->args.items[i]->pos, .type = ts[i], .cname = xs_sprintf("f_%s", e->keys[i]), .owner = c};
+        c->nfields = c->cap_fields = e->args.len;
+        c->flattened = true;
+        prog->classes = realloc(prog->classes, sizeof(Class *) * (size_t)(prog->nclasses + 1));
+        prog->classes[prog->nclasses++] = c;
+        made = realloc(made, sizeof(Class *) * (size_t)(nmade + 1));
+        made[nmade++] = c;
+    }
+    e->cls = c;
+    e->type = ty_object_of(c);
+}
+
 static void anon_objlit(Expr *e) {
     Class *c = xs_alloc(sizeof *c);
     static int nanon;
@@ -2751,6 +2832,174 @@ static bool big_binary(Expr *e) {
     return true;
 }
 
+/* a literal or a name: checking a copy of it has no effect elsewhere */
+static bool pure_leaf(Expr *x) {
+    return x->kind == E_NUMBER || x->kind == E_STRING || x->kind == E_BOOL || x->kind == E_IDENT
+        || (x->kind == E_MEMBER && !x->is_call && pure_leaf(x->lhs)) || x->kind == E_THIS;
+}
+
+/* new Set(values) / new Map(entries) / new Map() with no type arguments: the type the context declares
+   (a field, variable, parameter or return type), else the one the values have */
+static void infer_new_collection(Expr *e, Type *expected) {
+    bool is_map = e->str && e->str[0] == 'M';
+    Type *want = expected && expected->kind == TY_NULLABLE ? expected->elem : expected;
+    if (want && want->kind == (is_map ? TY_MAP : TY_SET) && !want->record) { e->elem_type = want; return; }
+    const char *hint = is_map ? "write the types: new Map<string, number>()" : "write the type: new Set<string>()";
+    if (e->args.len != 1) xs_error(XS3006, e->pos, hint, "cannot infer the type of an empty %s here", is_map ? "Map" : "Set");
+    Expr *a = e->args.items[0];
+    if (is_map && a->kind == E_ARRAY_LIT && a->args.len && a->args.items[0]->kind == E_ARRAY_LIT && a->args.items[0]->args.len == 2) {
+        /* new Map([["a", 1], ["b", 2]]): the first entry gives the key and value types */
+        Expr *k = expr_copy(a->args.items[0]->args.items[0]), *v = expr_copy(a->args.items[0]->args.items[1]);
+        if (!pure_leaf(k) || !pure_leaf(v)) xs_error(XS3006, a->pos, hint, "cannot infer the types of this Map's entries");
+        check_expr(k, NULL); /* copies: the entries are checked again against the type found */
+        check_expr(v, NULL);
+        Type *kt = k->type->kind == TY_LITINT ? ty_int : k->type, *vt = v->type->kind == TY_LITINT ? ty_number : v->type;
+        if (kt->kind == TY_NULL || vt->kind == TY_NULL) xs_error(XS3006, a->pos, hint, "cannot infer the type of null here");
+        e->elem_type = ty_map_of(kt, vt);
+        return;
+    }
+    bool ints = !is_map && a->kind == E_ARRAY_LIT && a->args.len; /* new Set([1, 2]): a Set of int, as xisto keeps numbers in one */
+    for (int i = 0; ints && i < a->args.len; i++) ints = a->args.items[i]->kind == E_NUMBER && a->args.items[i]->is_int_lit;
+    check_expr(a, ints ? ty_array_of(ty_int) : NULL);
+    settle(a);
+    Type *t = a->type;
+    if (!is_map && t->kind == TY_ARRAY && t->elem->kind == TY_NUMBER)
+        xs_error(XS6037, a->pos, "write new Set<int>(...) for whole numbers, or keep strings", "a Set holds strings or ints in xisto, and these are numbers");
+    if (t->kind != TY_ARRAY && t->kind != TY_SET) xs_error(XS3006, a->pos, hint, "cannot infer the type of this %s", is_map ? "Map" : "Set");
+    if (!is_map) { e->elem_type = ty_set_of(t->elem); return; }
+    Type *el = t->elem;
+    if (el->kind != TY_OBJECT || !el->cls->is_tuple || el->cls->nfields != 2) xs_error(XS3006, a->pos, hint, "the entries of a Map are [key, value] pairs");
+    e->elem_type = ty_map_of(el->cls->fields[0].type, el->cls->fields[1].type);
+}
+
+/* a copy of x that can be checked on its own (to learn its type) without touching x: literals, names, fields, and
+   object and array literals of them; NULL for anything else (a call runs, so it is checked once, where it is) */
+static Expr *pure_copy(Expr *x) {
+    if (!x) return NULL;
+    Expr *c = xs_alloc(sizeof *c);
+    *c = *x;
+    switch (x->kind) {
+    case E_NUMBER: case E_STRING: case E_BOOL: case E_NULL: case E_IDENT: case E_THIS: return c;
+    case E_MEMBER:
+        if (x->is_call) return NULL;
+        return (c->lhs = pure_copy(x->lhs)) ? c : NULL;
+    case E_UNARY:
+        if (x->lhs && !(c->lhs = pure_copy(x->lhs))) return NULL;
+        if (x->rhs && !(c->rhs = pure_copy(x->rhs))) return NULL;
+        return c;
+    case E_OBJLIT: case E_ARRAY_LIT: case E_TEMPLATE:
+        c->args = (ExprList){0};
+        for (int i = 0; i < x->args.len; i++) {
+            Expr *a = pure_copy(x->args.items[i]);
+            if (!a) return NULL;
+            expr_list_push(&c->args, a);
+        }
+        return c;
+    default: return NULL;
+    }
+}
+static Type *pure_type(Expr *x) {
+    Expr *c = pure_copy(x);
+    if (!c) return NULL;
+    check_expr(c, NULL);
+    settle(c);
+    return c->type;
+}
+static Expr *member_of(Expr *obj, const char *name, Pos pos) {
+    Expr *m = xs_alloc(sizeof *m);
+    m->kind = E_MEMBER; m->pos = pos; m->lhs = obj; m->str = (char *)name; m->field = -1;
+    return m;
+}
+
+/* { ...base, x: 1 } and { [key]: value } (parsed as entries "..." and "[]"): spreads become the fields they copy,
+   base.f each (where a type is expected, the ones it has), a later key replacing an earlier one in its place, as
+   JavaScript does; computed keys make the object a Record<string, V> (built like one written { a: 1 }).
+   True when e is checked already (a Record). */
+static bool objlit_expand(Expr *e, Type *expected) {
+    Type *t = expected && expected->kind == TY_NULLABLE ? expected->elem : expected;
+    bool computed = false;
+    for (int i = 0; i < e->args.len; i++) if (strcmp(e->keys[i], "[]") == 0) computed = true;
+    if (computed) {
+        Type *rec = t && t->kind == TY_MAP && t->record ? t : NULL;
+        const char *hint = "declare it as a Record: const m: Record<string, number> = { [key]: 1 };";
+        if (!rec) {
+            if (t && t->kind != TY_UNKNOWN && t->kind != TY_JSON) xs_error(XS3006, e->pos, hint, "an object with computed keys is a Record<string, V>, not %s", ty_name(t));
+            Type *v = NULL;
+            for (int i = 0; i < e->args.len; i++) {
+                Expr *a = e->args.items[i];
+                if (strcmp(e->keys[i], "...") == 0) xs_error(XS1018, a->pos, hint, "a spread and computed keys in one object literal are not supported");
+                Expr *val = strcmp(e->keys[i], "[]") == 0 ? a->rhs : a;
+                Type *vt = pure_type(val);
+                if (!vt) xs_error(XS3006, val->pos, hint, "cannot infer the type of this value without a declared type");
+                if (vt->kind == TY_INT) vt = ty_number;
+                if (vt->kind == TY_NULL) xs_error(XS3009, val->pos, hint, "cannot infer the type of null here");
+                if (!v) v = vt;
+                else if (!ty_equal(v, vt)) xs_error(XS3006, val->pos, hint, "the values are %s and %s: declare the type", ty_name(v), ty_name(vt));
+            }
+            rec = xs_alloc(sizeof *rec);
+            *rec = *ty_map_of(ty_string, v);
+            rec->record = true;
+        }
+        Expr *arr = xs_alloc(sizeof *arr);
+        arr->kind = E_ARRAY_LIT; arr->pos = e->pos; arr->field = -1;
+        for (int i = 0; i < e->args.len; i++) {
+            Expr *a = e->args.items[i];
+            if (strcmp(e->keys[i], "...") == 0) xs_error(XS1018, a->pos, hint, "a spread and computed keys in one object literal are not supported");
+            Expr *pair = xs_alloc(sizeof *pair);
+            pair->kind = E_ARRAY_LIT; pair->pos = a->pos; pair->field = -1;
+            Expr *k, *val;
+            if (strcmp(e->keys[i], "[]") == 0) { k = a->lhs; val = a->rhs; }
+            else {
+                k = xs_alloc(sizeof *k);
+                k->kind = E_STRING; k->pos = a->pos; k->field = -1; k->str = e->keys[i];
+                val = a;
+            }
+            expr_list_push(&pair->args, k);
+            expr_list_push(&pair->args, val);
+            expr_list_push(&arr->args, pair);
+        }
+        e->kind = E_NEW_MAP;
+        e->elem_type = rec;
+        e->args = (ExprList){0};
+        e->keys = NULL;
+        e->spread = false;
+        if (arr->args.len) expr_list_push(&e->args, arr);
+        check_expr(e, rec);
+        e->type = rec;
+        return true;
+    }
+    Class *target = t && t->kind == TY_OBJECT && !t->cls->builtin ? t->cls : NULL;
+    char **keys = xs_alloc(sizeof(char *) * 8);
+    int cap = 8;
+    ExprList vals = {0};
+    #define SET_KEY(name_, val_) do { \
+        int at_ = -1; \
+        for (int q_ = 0; q_ < vals.len; q_++) if (strcmp(keys[q_], name_) == 0) at_ = q_; \
+        if (at_ >= 0) vals.items[at_] = (val_); \
+        else { if (vals.len == cap) { cap *= 2; keys = realloc(keys, sizeof(char *) * (size_t)cap); } keys[vals.len] = (char *)(name_); expr_list_push(&vals, (val_)); } \
+    } while (0)
+    for (int i = 0; i < e->args.len; i++) {
+        Expr *a = e->args.items[i];
+        if (strcmp(e->keys[i], "...") != 0) { SET_KEY(e->keys[i], a); continue; }
+        Expr *src = a->lhs;
+        Type *st = pure_type(src);
+        if (!st) xs_error(XS1018, src->pos, "spread a variable: const base = load(); const o = { ...base, x: 1 };", "spread a name or a field here, not a computed value");
+        if (st->kind != TY_OBJECT || st->cls->builtin)
+            xs_error(XS8002, src->pos, NULL, "%s cannot be spread into an object literal", ty_name(st));
+        Class *sc = st->cls;
+        for (int k = 0; k < sc->nfields; k++) {
+            const char *fname = sc->fields[k].name;
+            if (target && !find_field(target, fname, NULL)) continue; /* (TypeScript allows extra fields from a spread) */
+            SET_KEY(fname, member_of(pure_copy(src), fname, a->pos));
+        }
+    }
+    #undef SET_KEY
+    e->keys = keys;
+    e->args = vals;
+    e->spread = false;
+    return false;
+}
+
 static void check_expr(Expr *e, Type *expected) {
     switch (e->kind) {
     case E_NUMBER:
@@ -2782,7 +3031,7 @@ static void check_expr(Expr *e, Type *expected) {
                 e->kind = E_FUNC_REF;
                 e->func = f;
                 e->cname = f->cname;
-                e->type = ty_func(ps, f->nparams, f->ret);
+                e->type = ty_func(ps, f->nparams, fret(f, e->pos));
                 return;
             }
             Class *cv = find_class(e->str);
@@ -3550,6 +3799,16 @@ static void check_expr(Expr *e, Type *expected) {
                         nul->kind = E_NULL; nul->pos = e->pos; nul->field = -1;
                         expr_list_push(&e->args, nul);
                     }
+                Func *af = b->origin && b->origin->arrow_fn ? b->origin->arrow_fn : b->arrow_fn;
+                if (af && af->nparams == ft->nparams) /* a const arrow's literal defaults fill the arguments left out */
+                    while (e->args.len < ft->nparams) {
+                        Expr *d = af->params[e->args.len].dflt;
+                        if (!d || !(d->kind == E_NUMBER || d->kind == E_STRING || d->kind == E_BOOL || d->kind == E_NULL)) break;
+                        Expr *c = xs_alloc(sizeof *c);
+                        *c = *d;
+                        c->pos = e->pos;
+                        expr_list_push(&e->args, c);
+                    }
                 if (e->args.len != ft->nparams) xs_error(XS8062, e->pos, NULL, "'%s' takes %d argument(s), got %d", name, ft->nparams, e->args.len);
                 for (int i = 0; i < e->args.len; i++) {
                     check_expr(e->args.items[i], ft->params[i]);
@@ -3611,7 +3870,7 @@ static void check_expr(Expr *e, Type *expected) {
         if (f->ntparams) { /* a generic function: its instance for these types */
             Func *inst = check_generic_call(e, f, expected, xs_sprintf("'%s'", f->name));
             e->func = inst;
-            e->type = inst->ret;
+            e->type = fret(inst, e->pos);
             return;
         }
         if (e->ntargs) xs_error(XS6005, e->pos, NULL, "'%s' is not generic", f->name);
@@ -3628,7 +3887,7 @@ static void check_expr(Expr *e, Type *expected) {
         }
         check_args(e, f, xs_sprintf("'%s'", f->name));
         e->func = f;
-        e->type = f->ret;
+        e->type = fret(f, e->pos);
         if (f->mod && f->mod->builtin && strcmp(f->cname, "xs_sleep_ms") == 0) prog->uses_net = true; /* timers live with the event loop */
         return;
     }
@@ -3973,7 +4232,7 @@ static void check_expr(Expr *e, Type *expected) {
                 check_args(e, m, xs_sprintf("%s.%s", c->name, m->name));
                 e->func = m;
                 e->cls = c;
-                e->type = m->ret;
+                e->type = fret(m, e->pos);
                 e->builtin.cfn = m->cname;
                 prog->uses_net = true;
                 return;
@@ -4381,6 +4640,7 @@ static void check_expr(Expr *e, Type *expected) {
         return;
     }
     case E_OBJLIT: {
+        if (e->spread && objlit_expand(e, expected)) return;
         Type *t = expected && expected->kind == TY_NULLABLE ? expected->elem : expected;
         if (t && t->kind == TY_UNION) { /* which member: the one whose literal field (kind: "circle") the object gives */
             Type *pick = NULL;
@@ -4458,7 +4718,8 @@ static void check_expr(Expr *e, Type *expected) {
             e->type = t;
             return;
         }
-        if (!t || t->kind != TY_OBJECT)
+        if (!t) { infer_objlit(e); return; }
+        if (t->kind != TY_OBJECT)
             xs_error(XS3006, e->pos, "give it a type: const t: Todo = { ... };  (declare Todo with interface or class)", "an object literal needs a declared type here");
         Class *c = t->cls;
         if (c->builtin) xs_error(XS8002, e->pos, NULL, "%s cannot be built from an object literal", c->name);
@@ -4539,11 +4800,12 @@ static void check_expr(Expr *e, Type *expected) {
                 f->ret = r->expr->type;
                 if (f->ret->kind == TY_VOID) { r->kind = S_EXPR; }
                 else if (f->ret->kind == TY_NULL) xs_error(XS2012, r->expr->pos, "write the return type: (x): Todo | null => ...", "cannot infer the return type from null");
-            } else {
-                f->ret = ty_void;
+            } else { /* a block: the type its returns agree on (void when none returns a value) */
+                ret_infer_begin(f);
                 check_block(f->body);
-                for (int i = 0; i < f->body->stmts.len; i++) if (f->body->stmts.items[i]->kind == S_RETURN && f->body->stmts.items[i]->expr)
-                    xs_error(XS3004, f->body->stmts.items[i]->pos, "write the return type: (x): number => { ... }", "an arrow function with a block body needs a return type to return a value");
+                ret_infer_end(f, e->pos);
+                if (f->ret->kind != TY_VOID && !always_returns(f->body))
+                    xs_error(XS8144, e->pos, "add a return at the end", "this arrow function may reach its end without returning a %s", ty_name(f->ret));
             }
         } else {
             if (a->expr_body && f->ret->kind == TY_VOID) {
@@ -4569,6 +4831,7 @@ static void check_expr(Expr *e, Type *expected) {
         return;
     }
     case E_NEW_MAP:
+        if (!e->elem_type) infer_new_collection(e, expected);
         e->type = resolve(e->elem_type, e->pos);
         check_type_supported(e->pos, e->type);
         if (e->type->kind == TY_CHAN) {
@@ -4587,7 +4850,7 @@ static void check_expr(Expr *e, Type *expected) {
                 ps[1] = e->type->elem;
                 want = ty_array_of(tuple_type(ps, 2, e->pos));
             } else want = ty_array_of(e->type->elem);
-            check_expr(e->args.items[0], want);
+            if (!e->args.items[0]->type) check_expr(e->args.items[0], want); /* (checked already when it gave the type) */
             expect_type(e->args.items[0], want, is_map ? "the entries of new Map" : "the values of new Set");
         }
         return;
@@ -4950,6 +5213,7 @@ static void check_var(Stmt *s, bool global) {
     s->type = s->decl_type ? s->decl_type : s->init->type;
     Binding *b = declare(s->pos, s->name, s->type, s->is_const, global, false);
     if (!s->decl_type && !s->is_const && s->type->kind == TY_NUMBER) b->lit_number = true;
+    if (s->is_const && s->init->kind == E_ARROW) b->arrow_fn = s->init->arrow->fn;
     s->cname = b->cname;
     s->cell = b->cell;
 }
@@ -5667,6 +5931,7 @@ static void check_stmt(Stmt *s) {
     case S_RETURN:
         if (!cur_func) xs_error(XS8068, s->pos, NULL, "'return' outside of a function");
         if (cur_func->is_gen && s->expr) xs_error(XS8074, s->expr->pos, "yield it, then return;", "a generator returns no value");
+        if (!cur_func->ret) { ret_infer_stmt(s); return; } /* the return type is inferred: this return is part of it */
         if (s->expr) {
             if (cur_func->ret->kind == TY_VOID) {
                 /* return f(); where f is void too (TypeScript allows it; a generic run<R> instantiated with void):
@@ -5686,6 +5951,23 @@ static void check_stmt(Stmt *s) {
                 s->stmts = (StmtList){0};
                 stmt_list_push(&s->stmts, call);
                 stmt_list_push(&s->stmts, ret);
+                return;
+            }
+            if (checking_generated && cur_func->ret->kind == TY_UNKNOWN) { /* reflection's invoke of a method whose return
+                                                                              type was inferred: void gives null */
+                check_expr(s->expr, NULL);
+                if (s->expr->type->kind == TY_VOID) {
+                    Stmt *call = xs_alloc(sizeof *call), *ret = xs_alloc(sizeof *ret);
+                    call->kind = S_EXPR; call->pos = s->pos; call->expr = s->expr;
+                    ret->kind = S_RETURN; ret->pos = s->pos; ret->expr = xs_alloc(sizeof *ret->expr);
+                    ret->expr->kind = E_NULL; ret->expr->pos = s->pos; ret->expr->field = -1;
+                    s->kind = S_BLOCK; s->expr = NULL; s->stmts = (StmtList){0};
+                    stmt_list_push(&s->stmts, call);
+                    stmt_list_push(&s->stmts, ret);
+                    check_stmt(ret);
+                    return;
+                }
+                expect_type(s->expr, cur_func->ret, xs_sprintf("return value of '%s'", cur_func->name));
                 return;
             }
             check_expr(s->expr, cur_func->ret);
@@ -5740,7 +6022,8 @@ static void resolve_signature(Func *f) {
         f->params[i].type = resolve(f->params[i].type, f->pos);
         check_type_supported(f->pos, f->params[i].type);
     }
-    f->ret = resolve(f->ret, f->pos);
+    if (f->ret) f->ret = resolve(f->ret, f->pos);
+    else if (!f->ret_infer) f->ret_infer = 1; /* left out: inferred from the body (fret) */
 }
 
 /* ---- XB-034: `for (let i = 0; i < a.length; i++)` ----
@@ -6122,8 +6405,78 @@ static bool widen_inferred(Expr *e) {
     return true;
 }
 
+/* ---- a return type left out (function f(a: number) { return a * 2; }): the type its returns agree on ----
+   Each `return e;` is checked with no expected type; the types merge (T and null: T | null; an int is a number, as
+   TypeScript has it); `return [];` waits for the others. At the end every returned value is converted to the type
+   found, as if it had been written. */
+static void ret_infer_begin(Func *f) {
+    f->ret_infer = 2;
+    f->ret_acc = NULL;
+    f->ret_null = f->ret_bare = false;
+    f->ret_exprs.len = f->ret_late.len = 0;
+}
+static void ret_infer_stmt(Stmt *s) {
+    Func *f = cur_func;
+    const char *hint = "write the return type: f(): Todo { ... }";
+    if (!s->expr) { f->ret_bare = true; return; }
+    Expr *e = s->expr;
+    if (e->kind == E_ARRAY_LIT && e->args.len == 0) { expr_list_push(&f->ret_late, e); return; }
+    check_expr(e, f->ret_acc && f->ret_acc->kind != TY_VOID ? f->ret_acc : NULL);
+    Type *t = e->type;
+    if (t->kind == TY_VOID) { /* return f(); where f is void: the call, then return; */
+        if (f->ret_acc && f->ret_acc->kind != TY_VOID)
+            xs_error(XS8057, e->pos, hint, "'%s' returns %s elsewhere, and nothing here", f->name, ty_name(f->ret_acc));
+        f->ret_acc = ty_void;
+        Stmt *call = xs_alloc(sizeof *call), *ret = xs_alloc(sizeof *ret);
+        call->kind = S_EXPR; call->pos = s->pos; call->expr = e;
+        ret->kind = S_RETURN; ret->pos = s->pos;
+        s->kind = S_BLOCK; s->expr = NULL; s->stmts = (StmtList){0};
+        stmt_list_push(&s->stmts, call);
+        stmt_list_push(&s->stmts, ret);
+        return;
+    }
+    expr_list_push(&f->ret_exprs, e);
+    if (t->kind == TY_NULL) { f->ret_null = true; return; }
+    if (t->kind == TY_NULLABLE) { f->ret_null = true; t = t->elem; }
+    if (t->kind == TY_LITINT || t->kind == TY_INT) t = ty_number;
+    if (!f->ret_acc) f->ret_acc = t;
+    else if (f->ret_acc->kind == TY_VOID)
+        xs_error(XS8057, e->pos, hint, "'%s' returns nothing elsewhere, and %s here", f->name, ty_name(t));
+    else if (!ty_equal(f->ret_acc, t))
+        xs_error(XS3001, e->pos, hint, "'%s' returns %s and %s: write the return type", f->name, ty_name(f->ret_acc), ty_name(t));
+}
+static void ret_infer_end(Func *f, Pos pos) {
+    const char *hint = "write the return type: f(): Todo | null { ... }";
+    Type *t = f->ret_acc;
+    f->ret_infer = 3;
+    f->ret = ty_unknown; /* (until the end: an error below leaves uses of it quiet) */
+    f->ret_failed = true;
+    if (!t) {
+        if (f->ret_null || f->ret_late.len) xs_error(XS2012, pos, hint, "cannot infer the return type of '%s' from %s alone", f->name, f->ret_null ? "null" : "[]");
+        t = ty_void;
+    }
+    if (f->ret_null && t->kind != TY_NULLABLE) {
+        if (!nullable_ok(t)) xs_error(XS2012, pos, hint, "'%s' returns %s or null: write the return type", f->name, ty_name(t));
+        t = ty_nullable_of(t);
+    }
+    if (t->kind != TY_VOID && f->ret_bare) xs_error(XS8059, pos, hint, "'%s' returns %s, and nothing on some paths", f->name, ty_name(t));
+    f->ret = t;
+    f->ret_failed = false; /* (an error in a returned value below is its own) */
+    for (int i = 0; i < f->ret_exprs.len; i++)
+        expect_type(f->ret_exprs.items[i], t, xs_sprintf("return value of '%s'", f->name));
+    for (int i = 0; i < f->ret_late.len; i++) {
+        check_expr(f->ret_late.items[i], t);
+        expect_type(f->ret_late.items[i], t, xs_sprintf("return value of '%s'", f->name));
+    }
+    f->ret_failed = false;
+}
+
 static void check_func(Func *f) {
     if (f->is_native) return; /* `declare`: the package's C */
+    if (f->ret_infer >= 2) return; /* checked already, when its return type was needed */
+    bool inferring = !f->ret;
+    int errs = xs_error_count;
+    if (inferring) ret_infer_begin(f);
     if (f->body) { ii_enter(f, true); infer_ints_fn(f->body); } /* XB-034 */
     enter_module(f->cls ? f->cls->mod : f->mod);
     /* C names of locals are numbered per function: an edit in one function leaves every other function's C
@@ -6150,6 +6503,7 @@ static void check_func(Func *f) {
     }
     check_block(f->body);
     pop_scope();
+    if (inferring) { ret_infer_end(f, f->pos); if (xs_error_count > errs) f->ret_failed = true; }
     if (f->ret->kind != TY_VOID && !f->is_gen && !always_returns(f->body))
         xs_error(XS8058, f->pos, "add a return at the end of the function", "'%s' may reach its end without returning a %s", f->name, ty_name(f->ret));
     tmp_counter = saved_tmp;
@@ -6224,7 +6578,9 @@ static void flatten_methods(Class *c) {
             c->methods[c->nmethods++] = bm;
             continue;
         }
-        bool same = own->nparams == bm->nparams && ty_equal(own->ret, bm->ret);
+        if (!own->ret && bm->ret && own->ret_infer == 1) { own->ret = bm->ret; own->ret_infer = 0; } /* an override that
+                                                                         leaves out its return type returns what it overrides */
+        bool same = own->nparams == bm->nparams && (!own->ret || !bm->ret || ty_equal(own->ret, bm->ret));
         for (int k = 0; same && k < own->nparams; k++) same = ty_equal(own->params[k].type, bm->params[k].type);
         if (!same) {
             Buf sig = {0};
@@ -6285,6 +6641,56 @@ static void check_field_init(Class *c) {
 
 static bool failed_;
 
+/* the return type of f, inferred now when it was left out and f's body is not checked yet: f is checked here, in
+   its own context, and whatever was being checked carries on as it was */
+static void check_func(Func *f);
+#define II_SAVE(arr, n, T) T *arr##_s = n ? xs_alloc(sizeof(T) * (size_t)n) : NULL; if (n) memcpy(arr##_s, arr, sizeof(T) * (size_t)n); int n##_s = n;
+#define II_BACK(arr, n, T) if (n##_s) { arr = realloc(arr, sizeof(T) * (size_t)n##_s); memcpy(arr, arr##_s, sizeof(T) * (size_t)n##_s); } n = n##_s;
+static Type *fret(Func *f, Pos pos) {
+    if (f->ret) { if (f->ret_failed) xs_error_quiet(); return f->ret; }
+    if (f->ret_infer == 2)
+        xs_error(XS3001, pos, "write its return type: f(n: number): number { ... }", "'%s' is used before its return type is known (it calls itself): write the return type", f->name);
+    if (f->ret_infer != 1 || !f->body) xs_error(XS3001, pos, "write the return type", "'%s' has no return type", f->name);
+    Scope *sc = scope; Func *cf = cur_func; Class *cc = cur_class; Module *cm = cur_mod;
+    const char *fname = xs_file_name, *fsrc = xs_source;
+    int ld = loop_depth, sd = switch_depth, fd = finally_depth, tc = tmp_counter, scl = super_calls;
+    bool fid = for_init_decl, dnc = decl_no_cell, cg = checking_generated, fl = failed_;
+    Stmt *iib = ii_body; int iid = ii_depth;
+    II_SAVE(sev, nsev, ScanEv)
+    II_SAVE(ii_tnames, ii_tn, const char *)
+    II_SAVE(ii_anames, ii_an, const char *)
+    II_SAVE(ii_lnames, ii_ln, const char *)
+    II_SAVE(ii_cnames, ii_cn, const char *)
+    Expr **cinit_s = ii_cn_s ? xs_alloc(sizeof(Expr *) * (size_t)ii_cn_s) : NULL; if (ii_cn_s) memcpy(cinit_s, ii_cinit, sizeof(Expr *) * (size_t)ii_cn_s);
+    Expr **linit_s = ii_ln_s ? xs_alloc(sizeof(Expr *) * (size_t)ii_ln_s) : NULL; if (ii_ln_s) memcpy(linit_s, ii_linit, sizeof(Expr *) * (size_t)ii_ln_s);
+    jmp_buf *outer = xs_error_recover;
+    jmp_buf rb;
+    bool ok = true;
+    checking_generated = false;
+    loop_depth = switch_depth = finally_depth = 0;
+    xs_error_recover = outer ? &rb : NULL;
+    if (!outer || _setjmp(rb) == 0) check_func(f);
+    else ok = false;
+    xs_error_recover = outer;
+    scope = sc; cur_func = cf; cur_class = cc; cur_mod = cm; xs_file_name = fname; xs_source = fsrc;
+    loop_depth = ld; switch_depth = sd; finally_depth = fd; tmp_counter = tc; super_calls = scl;
+    for_init_decl = fid; decl_no_cell = dnc; checking_generated = cg; failed_ = fl;
+    ii_body = iib; ii_depth = iid;
+    II_BACK(sev, nsev, ScanEv)
+    II_BACK(ii_tnames, ii_tn, const char *)
+    II_BACK(ii_anames, ii_an, const char *)
+    II_BACK(ii_lnames, ii_ln, const char *)
+    II_BACK(ii_cnames, ii_cn, const char *)
+    if (ii_cn_s) { ii_cinit = realloc(ii_cinit, sizeof(Expr *) * (size_t)ii_cn_s); memcpy(ii_cinit, cinit_s, sizeof(Expr *) * (size_t)ii_cn_s); }
+    if (ii_ln_s) { ii_linit = realloc(ii_linit, sizeof(Expr *) * (size_t)ii_ln_s); memcpy(ii_linit, linit_s, sizeof(Expr *) * (size_t)ii_ln_s); }
+    if (!ok || !f->ret || f->ret_failed) { /* its body had an error (reported there): what uses it stops quietly */
+        f->ret_infer = 3;
+        if (!f->ret) f->ret = ty_unknown;
+        xs_error_quiet();
+    }
+    return f->ret;
+}
+
 /* a class's field initializers, constructor and methods */
 static void check_class_bodies(Class *c) {
     enter_module(c->mod);
@@ -6293,7 +6699,7 @@ static void check_class_bodies(Class *c) {
         if (!fd->init) continue;
         cur_class = c;
         RECOVER_BEGIN
-            check_expr(fd->init, fd->type);
+            if (!fd->init->type) check_expr(fd->init, fd->type); /* (an inferred field's value gave its type: checked) */
             expect_type(fd->init, fd->type, xs_sprintf("initializer of field '%s'", fd->name));
         RECOVER_END
     }
@@ -6301,7 +6707,8 @@ static void check_class_bodies(Class *c) {
     if (c->ctor) {
         RECOVER_BEGIN
             super_calls = 0;
-            if (c->base) {
+            bool needs_super = c->base && !c->base->iface_methods; /* (an implemented interface has no constructor) */
+            if (needs_super) {
                 StmtList *l = &c->ctor->body->stmts;
                 Stmt *s0 = l->len ? l->items[0] : NULL;
                 if (!s0 || s0->kind != S_EXPR || s0->expr->kind != E_CALL || !s0->expr->lhs || s0->expr->lhs->kind != E_IDENT || strcmp(s0->expr->lhs->str, "super") != 0)
@@ -6309,7 +6716,7 @@ static void check_class_bodies(Class *c) {
                              "the constructor of %s must call super(...) first", c->name);
             }
             check_func(c->ctor);
-            if (c->base && super_calls != 1) xs_error(XS8126, c->ctor->pos, NULL, "super(...) is called once, as the first statement of the constructor");
+            if (needs_super && super_calls != 1) xs_error(XS8126, c->ctor->pos, NULL, "super(...) is called once, as the first statement of the constructor");
         RECOVER_END
     }
     RECOVER_BEGIN check_field_init(c); RECOVER_END
@@ -6317,6 +6724,33 @@ static void check_class_bodies(Class *c) {
         if (c->methods[k]->cls != c || c->methods[k]->is_abstract || c->methods[k]->ntparams) continue; /* inherited, or a template */
         RECOVER_BEGIN check_func(c->methods[k]); RECOVER_END
     }
+}
+
+/* items = ['a', 'b'], seen = new Set([1]), limits = { min: 1 }: a field without a written type has its value's */
+static void infer_field_type(Class *c, Field *fd) {
+    if (!fd->init) xs_error(XS3011, fd->pos, "fields need an explicit type: base: string;", "field '%s' has no type", fd->name);
+    if (fd->init->kind == E_IDENT && !fd->init->type) {
+        /* rotina = ROTINA_X: a const of this module (the module's code is checked later): its written type, or its literal's */
+        for (int i = 0; i < prog->top.len; i++) {
+            Stmt *st = prog->top.items[i];
+            if (st->kind != S_VAR || st->mod != c->mod || !st->name || strcmp(st->name, fd->init->str) != 0 || !st->is_const) continue;
+            Type *t = st->decl_type ? resolve(st->decl_type, st->pos)
+                    : st->init->kind == E_STRING ? ty_string : st->init->kind == E_BOOL ? ty_boolean : st->init->kind == E_NUMBER ? ty_number : NULL;
+            if (t) { fd->type = t; return; }
+        }
+        xs_error(XS3011, fd->pos, xs_sprintf("write the type: %s: T = %s;", fd->name, fd->init->str), "field '%s' has no type", fd->name);
+    }
+    if (!fd->init->type) {
+        Class *cc = cur_class;
+        cur_class = c;
+        check_expr(fd->init, NULL);
+        settle(fd->init);
+        cur_class = cc;
+    }
+    Type *t = fd->init->type;
+    if (t->kind == TY_NULL || t->kind == TY_VOID)
+        xs_error(XS3011, fd->pos, "write the type: x: Todo | null = null;", "cannot infer the type of field '%s' from its value", fd->name);
+    fd->type = t;
 }
 
 void check_program(Program *p) {
@@ -6411,6 +6845,27 @@ void check_program(Program *p) {
         enter_module(p->funcs[i]->mod);
         if (!p->funcs[i]->ntparams) resolve_signature(p->funcs[i]); /* a template resolves per instance */
     }
+    /* interface Contract { execute(x: In): Out; }: an abstract class, the base of the class that implements it (when
+       that class extends nothing else), so a Contract variable calls the implementation's method */
+    for (int i = 0; i < p->nclasses; i++) {
+        Class *c = p->classes[i];
+        if (!c->iface_methods || !c->is_interface) continue;
+        enter_module(c->mod);
+        if (c->nfields || c->ntparams || c->niface_bases)
+            xs_error(XS8113, c->pos, "keep the methods in an interface of their own (or use an abstract class)",
+                     "interface '%s' has methods and %s", c->name, c->ntparams ? "type parameters" : c->nfields ? "fields" : "bases");
+        c->is_interface = false;
+        c->is_abstract = true;
+    }
+    for (int i = 0; i < p->nclasses; i++) {
+        Class *c = p->classes[i];
+        if (c->base_name || c->mixin || c->is_interface) continue;
+        enter_module(c->mod);
+        for (int k = 0; k < c->nimplements; k++) {
+            Class *b = find_class(c->implements[k]);
+            if (b && b->iface_methods && !b->is_interface) { c->base_name = c->implements[k]; c->base_pos = c->pos; break; }
+        }
+    }
     /* inheritance: bases first, so a class sees its base's fields (and later its methods) */
     for (int i = 0; i < p->nclasses; i++) {
         Class *c = p->classes[i];
@@ -6443,6 +6898,7 @@ void check_program(Program *p) {
             Field *fd = &c->fields[k];
             for (int j = 0; j < k; j++)
                 if (strcmp(fd->name, c->fields[j].name) == 0) xs_error(XS9023, fd->pos, NULL, "field '%s' is declared twice", fd->name);
+            if (!fd->type) infer_field_type(c, fd);
             fd->type = resolve(fd->type, fd->pos);
             check_type_supported(fd->pos, fd->type);
             fd->cname = xs_sprintf("f_%s", fd->name);
