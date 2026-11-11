@@ -6052,6 +6052,29 @@ static void check_expr_in(Expr *e, Type *expected) {
         e->type = e->lhs->type->elem;
         return;
     case E_MEMBER:
+        if (!e->is_call && e->str && e->lhs && e->lhs->kind == E_AS && e->lhs->elem_type && e->lhs->op != TK_NOT &&
+            e->lhs->lhs && e->lhs->lhs->kind == E_IDENT && e->lhs->lhs->str) {
+            /* (data as { toJSON?: unknown }).toJSON with data unknown or any: a probe of the shape (TypeScript's as checks
+               nothing; the code asks whether data has the field). Read by name, as an any does (undefined when data has
+               no such field), then as the type the shape gives it: ((data as any).toJSON as unknown) */
+            Binding *ub = lookup(e->lhs->lhs->str);
+            Type *want = ub && ub->type && ub->type->kind == TY_UNKNOWN ? resolve(e->lhs->elem_type, e->pos) : NULL;
+            Type *w = want && want->kind == TY_NULLABLE ? want->elem : want;
+            int fi = -1;
+            if (w && w->kind == TY_OBJECT && made_shape(w->cls))
+                for (int k = 0; k < w->cls->nfields; k++) if (strcmp(w->cls->fields[k].name, e->str) == 0) fi = k;
+            if (fi >= 0) {
+                Expr *m = xs_alloc(sizeof *m);
+                *m = *e;
+                m->lhs->elem_type = ty_any;
+                Pos at = e->pos;
+                memset(e, 0, sizeof *e);
+                e->kind = E_AS; e->pos = at; e->field = -1; e->lhs = m;
+                e->elem_type = w->cls->fields[fi].type;
+                check_expr(e, expected);
+                return;
+            }
+        }
         if (e->is_call && e->str && e->lhs && e->lhs->kind == E_IDENT && strcmp(e->lhs->str, "Object") == 0 && !lookup("Object") &&
             !strcmp(e->str, "fromEntries") && e->args.len == 1) {
             /* Object.fromEntries(pairs): a Record<string, V> of the [key, value] pairs, as new Map(pairs) read as an object */
