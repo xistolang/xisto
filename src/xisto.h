@@ -137,6 +137,7 @@ typedef struct {
     const char *src;
     size_t pos;
     int line, col;
+    Pos fixed;         /* set: every token takes this position (code the compiler writes: its errors point at the source it came from) */
 } Lexer;
 
 /* os.c: the operating system under the compiler (macOS, Linux, Windows) */

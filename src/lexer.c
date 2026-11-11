@@ -111,6 +111,7 @@ void lexer_init(Lexer *lx, const char *src) {
     lx->pos = 0;
     lx->line = 1;
     lx->col = 1;
+    lx->fixed = (Pos){0, 0};
 }
 
 static char peek(Lexer *lx, size_t ahead) { return lx->src[lx->pos + ahead]; }
@@ -214,7 +215,7 @@ static void skip_space_and_comments(Lexer *lx) {
 static Token make(Lexer *lx, TokKind kind, Pos pos, size_t start) {
     Token t = {0};
     t.kind = kind;
-    t.pos = pos;
+    t.pos = lx->fixed.line ? lx->fixed : pos;
     t.start = lx->src + start;
     t.len = (int)(lx->pos - start);
     return t;

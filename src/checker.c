@@ -7221,6 +7221,41 @@ static void check_expr_in(Expr *e, Type *expected) {
         Func *f = a->fn;
         Type *want = expected && expected->kind == TY_FUNC ? expected :
                      expected && expected->kind == TY_NULLABLE && expected->elem->kind == TY_FUNC ? expected->elem : NULL; /* onX?: (t: T) => void */
+        if (want && want->rest && want->nparams == 1 && f->nparams >= 1 && !f->params[f->nparams - 1].rest &&
+            !f->param_decls.len && f->body && f->body->kind == S_BLOCK) {
+            /* (a: A, b: B) => ... where (...args: T[]) => R is expected (Nest's useFactory with inject, a variadic
+               callback): TypeScript accepts it. The arrow takes the one array the callers pass, and its named
+               parameters become locals read from it on entry (a checked conversion when the element type is
+               any or unknown) */
+            Type *elem = want->params[0] && want->params[0]->kind == TY_ARRAY ? want->params[0]->elem : ty_unknown;
+            StmtList nl = {0};
+            char *arr = xs_sprintf("__args%d", ++prog->narrows);
+            for (int i = 0; i < f->nparams; i++) {
+                Param *pp = &f->params[i];
+                Type *pt = pp->type ? resolve(pp->type, e->pos) : elem;
+                Expr *ai = xs_alloc(sizeof *ai);
+                ai->kind = E_IDENT; ai->pos = e->pos; ai->field = -1; ai->str = arr;
+                Expr *ix = xs_alloc(sizeof *ix);
+                ix->kind = E_NUMBER; ix->pos = e->pos; ix->field = -1; ix->num = i; ix->ival = i; ix->is_int_lit = true;
+                Expr *rd = xs_alloc(sizeof *rd);
+                rd->kind = E_INDEX; rd->pos = e->pos; rd->field = -1; rd->lhs = ai; rd->rhs = ix;
+                Expr *init = rd;
+                if (!ty_equal(pt, elem)) {
+                    init = xs_alloc(sizeof *init);
+                    init->kind = E_AS; init->pos = e->pos; init->field = -1; init->lhs = rd; init->elem_type = pt;
+                }
+                Stmt *v = xs_alloc(sizeof *v);
+                v->kind = S_VAR; v->pos = e->pos; v->name = pp->name; v->decl_type = pt; v->init = init;
+                stmt_list_push(&nl, v);
+            }
+            for (int k = 0; k < f->body->stmts.len; k++) stmt_list_push(&nl, f->body->stmts.items[k]);
+            f->body->stmts = nl;
+            Param *ps = xs_alloc(sizeof(Param));
+            memset(ps, 0, sizeof(Param));
+            ps->name = arr; ps->type = want->params[0]; ps->rest = true;
+            f->params = ps;
+            f->nparams = 1;
+        }
         if (want && want->nparams > f->nparams && !f->param_decls.len) { /* (item) => ... where (item, index) is expected:
                                                                               JavaScript drops the extra arguments; here the
                                                                               arrow takes them, unnamed, so the call matches */
