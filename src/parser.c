@@ -3819,6 +3819,7 @@ static void apply_local_exports(Program *prog, Module *m, int top_start) {
             if (prog->funcs[i]->mod == m && strcmp(prog->funcs[i]->name, m->default_name) == 0) { prog->funcs[i]->exported = prog->funcs[i]->is_default = true; found = true; }
         for (int i = 0; i < prog->nclasses; i++)
             if (prog->classes[i]->mod == m && strcmp(prog->classes[i]->name, m->default_name) == 0) { prog->classes[i]->exported = prog->classes[i]->is_default = true; found = true; }
+        for (int i = 0; i < xs_nfailed_decls && !found; i++) found = strcmp(xs_failed_decls[i], m->default_name) == 0; /* (reported there) */
         if (!found) xs_error(XS6009, (Pos){1, 1}, "export default names a function or class declared in the same file", "'export default %s': no function or class '%s' here", m->default_name, m->default_name);
     }
     for (int k = 0; k < m->nlocal_exports; k++) {
