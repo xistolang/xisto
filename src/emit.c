@@ -2850,6 +2850,7 @@ static void emit_expr_raw(Expr *e) {
     }
     case E_NEW_MAP: {
         Type *t = e->type;
+        if (t->kind == TY_NULLABLE) t = t->elem; /* (a Record literal where Record | null goes keeps the slot's type) */
         if (t->kind == TY_CHAN) {
             buf_printf(out, "xs_chan_new(%d, ", val_kind(t->elem));
             if (e->args.len) emit_expr(e->args.items[0]); else buf_puts(out, "0");
