@@ -1,0 +1,6 @@
+salvo apagado
+Grupos.salvar politica=admin
+Grupos.nome campo=Nome
+Grupos.- escopo=local
+Pontos.apagar politica=it
+Pontos.- escopo=ponto
