@@ -156,6 +156,10 @@ const char *xs_home(void);
 char *xs_real_path(const char *path, char *out);
 bool xs_use_pkgs_dir(const char *dir);
 int xs_ncpus(void);
+/* runs C compiler command lines, at most `jobs` at a time, watching the memory they use together (the driver and
+   its cc1 child): over the limit (half the RAM, or XISTO_CC_MEM_MB) they are all stopped and the result is false,
+   with the message written. rcs[i] gets each command's exit code. */
+bool xs_cc_run(char **cmds, int n, int jobs, int *rcs);
 int xs_pid(void);
 void xs_list_files(const char *dir, const char *suf1, const char *suf2, char ***out, int *n);
 void xs_rmtree(const char *path);
