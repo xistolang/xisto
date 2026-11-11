@@ -344,6 +344,8 @@ struct Arrow {
     Capture *captures;
     int ncaptures, cap_captures;
     bool expr_body;    /* `=> expr`: body is a block with one return (or one expression statement when void) */
+    bool emitted;      /* its definition is out: a finally block is emitted twice (normal and throw paths) */
+    bool synthetic;    /* made by the checker (a Promise.all/race task, a truthy test): not a callback in the source */
 };
 
 typedef enum { S_VAR, S_EXPR, S_IF, S_WHILE, S_FOR, S_RETURN, S_BLOCK, S_SWITCH, S_BREAK, S_CONTINUE, S_FOROF, S_TRY, S_THROW, S_YIELD } StmtKind;

@@ -1141,6 +1141,7 @@ static inline xs_promise *xs_promise_resolved_i(int64_t v) { return xs_promise_r
 static inline xs_promise *xs_promise_resolved_b(bool v) { return xs_promise_resolved(2, (xs_val){.i = v}); }
 static inline xs_promise *xs_promise_resolved_p(void *v) { return xs_promise_resolved(3, (xs_val){.p = v}); }
 static inline xs_promise *xs_promise_resolved_v(void) { return xs_promise_resolved(4, (xs_val){0}); }
+#define xs_promise_resolved_vx(x) ((void)(x), xs_promise_resolved_v()) /* Promise.resolve(null), Promise.resolve(f()) with f void */
 XS_NOINLINE xs_promise *xs_promise_rejected(int kind, void *err) {
     xs_promise *p = xs_promise_make(kind);
     xs_exit_hook = xs_tasks_drain;

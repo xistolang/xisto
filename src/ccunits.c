@@ -52,6 +52,7 @@ static void put_head(Buf *b, const char *s, size_t at, size_t end, bool keep_use
         /* the runtime's storage macros, which say `static` too */
         if (word_at(s, i, end, "XS_NOINLINE") || word_at(s, i, end, "XS_FN")) { buf_puts(b, "__attribute__((noinline))"); i += s[i + 3] == 'N' ? 11 : 5; continue; }
         if (word_at(s, i, end, "XS_FI") || word_at(s, i, end, "XS_FA") || word_at(s, i, end, "XS_AI")) { i += 5; while (i < end && s[i] == ' ') i++; continue; }
+        if (word_at(s, i, end, "XS_FII")) { i += 6; while (i < end && s[i] == ' ') i++; continue; } /* (small constructors) */
         if (strncmp(s + i, "__attribute__((used))", 21) == 0 && !keep_used) { i += 21; while (i < end && s[i] == ' ') i++; continue; }
         buf_putc(b, s[i++]);
     }
@@ -239,8 +240,8 @@ static bool native_rewrite(const char *s, size_t at, size_t end, Buf *pre, Buf *
             continue;
         }
         bool internal = false; /* `static`, or the runtime's macros for it */
-        static const char *const words[] = {"static", "XS_NOINLINE", "XS_FN", "XS_FI", "XS_FA", "XS_AI"};
-        for (int w = 0; w < 6 && !internal; w++) internal = has_word(s, it.at, it.body, words[w]);
+        static const char *const words[] = {"static", "XS_NOINLINE", "XS_FN", "XS_FI", "XS_FA", "XS_AI", "XS_FII"};
+        for (int w = 0; w < 7 && !internal; w++) internal = has_word(s, it.at, it.body, words[w]);
         if (!internal) return why(s, it, "an external function");
         { /* defined once, in the package unit; the others see a declaration */
             put_text(pre, s, done, it.at);
@@ -331,7 +332,7 @@ int cc_split_units(const char *s, size_t n, int want, Buf *units) {
 
     buf_puts(&pre, "/* ---- codegen unit: the program's functions are external, defined in one unit each ---- */\n"
                    "#undef XS_FN\n#define XS_FN __attribute__((noinline))\n#undef XS_FI\n#define XS_FI\n#undef XS_FA\n#define XS_FA\n"
-                   "#undef XS_AI\n#define XS_AI\n#undef XS_NOINLINE\n#define XS_NOINLINE __attribute__((noinline))\n");
+                   "#undef XS_AI\n#define XS_AI\n#undef XS_FII\n#define XS_FII\n#undef XS_NOINLINE\n#define XS_NOINLINE __attribute__((noinline))\n");
     /* Stable units, so that an edit recompiles little: a function goes to the unit its name hashes to; the data
        (globals, type descriptors, the literals and their initializer, the call-site table with its line numbers)
        to a unit of its own; and each unit declares only the program names its code uses. */
