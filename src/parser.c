@@ -3543,6 +3543,8 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
         if (c->ctor->params[k].type_src && strcmp(c->ctor->params[k].type_src, "object") == 0) data_only = true;
     if (data_only) {
         buf_printf(g, ",\n  construct: (args: unknown[]): unknown => { throw new Error(\"%s is filled from JSON, not constructed\"); },\n  methods: [", c->name);
+    } else if (c->is_abstract) { /* an abstract base (a parameter's type, a base the injector meets): only its subclasses are built */
+        buf_printf(g, ",\n  construct: (args: unknown[]): unknown => { throw new Error(\"Cannot create an instance of an abstract class %s\"); },\n  methods: [", c->name);
     } else {
         buf_printf(g, ",\n  construct: (args: unknown[]): unknown => new %s(", c->name);
         call_args(g, c->ctor);
@@ -3559,6 +3561,13 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
         params_info(g, f);
         buf_puts(g, ", returns: ");
         if (is_void) tinfo(g, "void"); else tinfo(g, rs);
+        bool promise_param = false; /* m(p: Promise<T>): a promise cannot be checked out of unknown; no route or hook passes one */
+        for (int i = 0; i < f->nparams; i++)
+            if (f->params[i].type_src && strncmp(f->params[i].type_src, "Promise<", 8) == 0) promise_param = true;
+        if (promise_param) {
+            buf_printf(g, ",\n      invoke: (self: unknown, args: unknown[]): unknown => { throw new Error(\"%s.%s takes a promise: not invoked by reflection\"); } }", c->name, f->name);
+            continue;
+        }
         buf_printf(g, ",\n      invoke: (self: unknown, args: unknown[]): unknown => { %s(self as %s).%s(", is_void ? "" : "return ", c->name, f->name);
         call_args(g, f);
         buf_printf(g, ");%s } }", is_void ? " return null;" : "");
@@ -3619,6 +3628,7 @@ static void reflect_module(Program *prog, Module *m, int top_start) {
         xs_source = g.data;
         Parser gp = {0};
         lexer_init(&gp.lx, g.data);
+        gp.lx.fixed = c->pos; /* the decorator arguments copied in point at the class, not at a line of this text */
         gp.prog = prog;
         gp.mod = m;
         next(&gp);
