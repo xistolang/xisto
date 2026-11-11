@@ -11,6 +11,7 @@
 //   (`addRow({ key: value })`, as exceljs).
 // - Styles cover what reports use: numFmt, font (bold, italic, size, name), alignment (horizontal, vertical,
 //   wrapText), column widths, frozen panes (views) and autoFilter.
+import { Writable } from "node:stream";
 
 declare class NativeZip {
   constructor(path: string);
@@ -27,6 +28,19 @@ declare class NativeZip {
 export abstract class WritableSink {
   abstract write(chunk: Uint8Array): void;
   abstract end(): void;
+}
+
+/** A Node stream (a PassThrough, a file stream) given as `stream`: each piece is written to it, end() at the end. */
+class NodeStreamSink extends WritableSink {
+  constructor(private readonly w: Writable) {
+    super();
+  }
+  write(chunk: Uint8Array): void {
+    this.w.write(chunk);
+  }
+  end(): void {
+    this.w.end();
+  }
 }
 
 /** A sink that keeps the bytes in memory: toBuffer() gives the whole workbook once it is committed. */
@@ -56,8 +70,8 @@ export class MemorySink extends WritableSink {
 export interface WorkbookWriterOptions {
   /** Write the workbook to this file. */
   filename?: string;
-  /** Or send the bytes to this sink (write for each piece, end at the end). */
-  stream?: WritableSink;
+  /** Or send the bytes to this sink or Node stream (write for each piece, end at the end). */
+  stream?: WritableSink | Writable;
   /** Write the styles (number formats, fonts, alignment); without it every cell is unstyled, as in exceljs. */
   useStyles?: boolean;
   /** Accepted for compatibility: strings are always written inline in their cells, so memory stays constant. */
@@ -400,7 +414,8 @@ export class WorkbookWriter {
 
   constructor(options: WorkbookWriterOptions) {
     const file: string = options.filename ?? "";
-    this.sink = options.stream ?? null;
+    const st = options.stream ?? null;
+    this.sink = st instanceof Writable ? new NodeStreamSink(st) : st;
     if (file === "" && this.sink === null) throw new Error("exceljs: give a filename or a stream");
     this.styled = options.useStyles ?? false;
     this.zip = new NativeZip(file);

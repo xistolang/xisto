@@ -1477,7 +1477,7 @@ static xs_tls *xs_tls_server_new(xs_tls_cred_t *cr);
 
 /* ---- objects visible to the program ---- */
 
-typedef struct xs_Response { xs_hdr hdr; int64_t f_status; bool f_ok; xs_str *body; } xs_Response;
+typedef struct xs_Response { xs_hdr hdr; int64_t f_status; bool f_ok; xs_map *f_headers; xs_str *body; } xs_Response;
 typedef struct xs_HttpRequest {
     xs_hdr hdr;
     xs_str *f_method, *f_path, *f_body;
@@ -1503,7 +1503,7 @@ typedef struct {
 typedef struct { char method[8]; xs_str *path; xs_handler fn; xs_route_metrics m; } xs_route;
 typedef struct xs_Server { xs_hdr hdr; xs_route *routes; int nroutes, cap; void *cred; } xs_Server;
 
-static void xs_Response_free(void *p) { xs_release(((xs_Response *)p)->body); xs_obj_free(p); }
+static void xs_Response_free(void *p) { xs_release(((xs_Response *)p)->body); if (((xs_Response *)p)->f_headers) xs_release(((xs_Response *)p)->f_headers); xs_obj_free(p); }
 static void xs_Response_print(void *p) { fprintf(XS_OUT, "Response { status: %lld, ok: %s }", (long long)((xs_Response *)p)->f_status, ((xs_Response *)p)->f_ok ? "true" : "false"); }
 static xs_str *xs_Response_text(xs_Response *r) { return xs_retain(r->body); }
 
@@ -1918,6 +1918,16 @@ static bool xs_write_all(int fd, const char *p, size_t n) {
 
 static xs_Response *xs_fetch_full(xs_str *url, xs_str *method, xs_str *body, int nh, xs_str **hdrs, int64_t timeout_ms);
 XS_NOINLINE xs_Response *xs_fetch(xs_str *url) { return xs_fetch_full(url, NULL, NULL, 0, NULL, -1); }
+/* fetch(url, { headers: h }) with h a Record<string, string> built before the call: its entries, in insertion order */
+XS_NOINLINE xs_Response *xs_fetch_hmap(xs_str *url, xs_str *method, xs_str *body, xs_map *h, int64_t timeout_ms) {
+    size_t n = 0;
+    xs_str **hd = (xs_str **)malloc(sizeof(xs_str *) * (h ? h->count * 2 : 0) + sizeof(xs_str *));
+    xs_map_entry *e;
+    if (h) XS_MAP_EACH(h, e) { hd[n++] = e->skey; hd[n++] = (xs_str *)e->val.p; }
+    xs_Response *r = xs_fetch_full(url, method, body, (int)n, hd, timeout_ms);
+    free(hd);
+    return r;
+}
 
 static bool xs_has_ctl(const char *p, size_t n) { /* control bytes other than tab */
     for (size_t i = 0; i < n; i++) { unsigned char ch = (unsigned char)p[i]; if ((ch < 0x20 && ch != '\t') || ch == 0x7f) return true; }
@@ -2047,6 +2057,27 @@ XS_NOINLINE xs_Response *xs_fetch_full(xs_str *url, xs_str *method, xs_str *body
         resp->f_status = status;
         resp->f_ok = status >= 200 && status < 300;
         resp->body = is_chunked ? xs_str_new(chunked.data ? chunked.data : "", chunked.len) : xs_str_new(buf.data + hdr_len, body_len);
+        { /* response.headers: names in lower case (what Headers.get and forEach give), in the order received */
+            xs_map *hm = xs_map_new(1, 1, 3, xs_print_str_quoted_, xs_print_str_quoted_);
+            const char *p = memchr(buf.data, '\n', hdr_len), *end = buf.data + hdr_len;
+            while (p && p < end) {
+                p++;
+                const char *eol = memchr(p, '\n', (size_t)(end - p));
+                if (!eol) eol = end;
+                const char *colon = memchr(p, ':', (size_t)(eol - p));
+                if (colon && colon > p) {
+                    xs_str *k = xs_str_new(p, (size_t)(colon - p));
+                    for (int64_t i = 0; i < k->len; i++) k->data[i] = (char)tolower((unsigned char)k->data[i]);
+                    const char *hv = colon + 1, *he = eol;
+                    while (hv < he && (*hv == ' ' || *hv == '\t')) hv++;
+                    while (he > hv && (he[-1] == '\r' || he[-1] == ' ')) he--;
+                    hm = xs_map_set_s(hm, k, (xs_val){.p = xs_str_new(hv, (size_t)(he - hv))});
+                    xs_release(k);
+                }
+                p = eol;
+            }
+            resp->f_headers = hm;
+        }
         const char *v;
         size_t vlen;
         if (xs_find_header(buf.data, hdr_len, "Connection", &v, &vlen) && xs_ieq(v, vlen, "close")) xs_conn_drop(c);
