@@ -9,9 +9,12 @@ ln -sfn ../../../../packages/pg .xisto/pkgs/pg
 ln -sfn ../../../../packages/oracledb .xisto/pkgs/oracledb
 for p in express class-validator class-transformer rxjs; do ln -sfn "../../../../packages/$p" ".xisto/pkgs/$p"; done
 mkdir -p .xisto/pkgs/@nestjs
-for p in common core typeorm; do ln -sfn "../../../../../packages/@nestjs/$p" ".xisto/pkgs/@nestjs/$p"; done
+for p in common core typeorm config; do ln -sfn "../../../../../packages/@nestjs/$p" ".xisto/pkgs/@nestjs/$p"; done
 fail=0
 if $X run --no-warnings src/sql.ts > /tmp/xisto-typeorm-sql.out 2>&1 && cmp -s /tmp/xisto-typeorm-sql.out sql.expected; then echo "ok typeorm sql"; else echo "FAIL typeorm sql"; diff sql.expected /tmp/xisto-typeorm-sql.out | head; fail=1; fi
+if $X run --no-warnings src/nest-inject.ts > /tmp/xisto-typeorm-inject.out 2>&1 && cmp -s /tmp/xisto-typeorm-inject.out nest-inject.expected; then echo "ok typeorm forRootAsync inject"; else echo "FAIL typeorm forRootAsync inject"; diff nest-inject.expected /tmp/xisto-typeorm-inject.out | head; fail=1; fi
+if $X run --no-warnings src/nest-optional.ts > /tmp/xisto-typeorm-optional.out 2>&1 && cmp -s /tmp/xisto-typeorm-optional.out nest-optional.expected; then echo "ok nest optional provider"; else echo "FAIL nest optional provider"; diff nest-optional.expected /tmp/xisto-typeorm-optional.out | head; fail=1; fi
+if $X run --no-warnings src/nest-datasource-dep.ts > /tmp/xisto-typeorm-dsdep.out 2>&1 && cmp -s /tmp/xisto-typeorm-dsdep.out nest-datasource-dep.expected; then echo "ok nest provider over the DataSource"; else echo "FAIL nest provider over the DataSource"; diff nest-datasource-dep.expected /tmp/xisto-typeorm-dsdep.out | head; fail=1; fi
 if $X run --no-warnings src/oracle.ts > /tmp/xisto-typeorm-oracle.out 2>&1 && cmp -s /tmp/xisto-typeorm-oracle.out oracle.expected; then echo "ok typeorm oracle driver"; else echo "FAIL typeorm oracle driver"; diff oracle.expected /tmp/xisto-typeorm-oracle.out | head; fail=1; fi
 # type "oracle" against a live Oracle Database (XISTO_ORACLE_URL=oracle://user:password@host:port/service, as
 # tests/oracledb/run.sh); oracle-live.expected is what TypeORM 0.3 + node-oracledb 6 print for the same steps

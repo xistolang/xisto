@@ -141,25 +141,22 @@ async function getText(uri: string, timeout: int): Promise<string> {
   return await r.text();
 }
 
-class JwksKeyProvider extends SecretOrKeyProvider {
-  private readonly client: JwksClient;
-  constructor(options: ExpressJwtOptions) {
-    super();
-    this.client = new JwksClient(options);
-  }
-  override keyFor(req: Request, rawJwt: string): string {
-    const alg = headerField(rawJwt, "alg");
-    if (alg !== "RS256" && alg !== "RS384" && alg !== "RS512" && alg !== "PS256" && alg !== "PS384" && alg !== "PS512" && alg !== "ES256" && alg !== "ES384" && alg !== "ES512") {
-      throw new Error("secret or public key must be provided");
-    }
-    return this.client.getSigningKey(headerField(rawJwt, "kid")).getPublicKey();
-  }
-}
-
 /**
  * The key provider for passport-jwt's secretOrKeyProvider: each token's key from the JWKS, by its "kid".
  * @example secretOrKeyProvider: passportJwtSecret({ cache: true, rateLimit: true, jwksUri: "https://idp/certs" })
  */
 export function passportJwtSecret(options: ExpressJwtOptions): SecretOrKeyProvider {
-  return new JwksKeyProvider(options);
+  const client = new JwksClient(options);
+  return (req: Request, rawJwt: string, done: (err: any, secretOrKey?: any) => void): void => {
+    const alg = headerField(rawJwt, "alg");
+    if (alg !== "RS256" && alg !== "RS384" && alg !== "RS512" && alg !== "PS256" && alg !== "PS384" && alg !== "PS512" && alg !== "ES256" && alg !== "ES384" && alg !== "ES512") {
+      done(null, null); // (jwks-rsa: an algorithm it does not serve gives no key)
+      return;
+    }
+    try {
+      done(null, client.getSigningKey(headerField(rawJwt, "kid")).getPublicKey());
+    } catch (e) {
+      done(e, null);
+    }
+  };
 }

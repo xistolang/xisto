@@ -21,15 +21,11 @@ export class Strategy {
 }
 
 /**
- * Gives the key a token is checked with: jwks-rsa's passportJwtSecret() is one.
- * Node: a function (req, rawJwt, done) => void; here an object with keyFor(req, rawJwt), which throws when there is
- * no key (the strategy then fails).
+ * Gives the key a token is checked with, as in Node: a function (request, rawJwtToken, done) that calls
+ * done(err) or done(null, key). jwks-rsa's passportJwtSecret() is one; done(null, false) means "no key" (the
+ * strategy fails with "secret or public key must be provided", as jsonwebtoken does).
  */
-export class SecretOrKeyProvider {
-  keyFor(req: Request, rawJwt: string): string {
-    throw new Error("SecretOrKeyProvider.keyFor is not implemented");
-  }
-}
+export type SecretOrKeyProvider = (request: Request, rawJwtToken: string, done: (err: any, secretOrKey?: any) => void) => void;
 
 /** jsonwebtoken's verify options passport-jwt passes on (clockTolerance, in seconds). */
 export interface VerifyOptions {
@@ -111,11 +107,24 @@ export function checkRequest(options: StrategyOptions, req: Request): JwtCheck {
   let key = options.secretOrKey ?? "";
   const provider = options.secretOrKeyProvider;
   if (provider !== null) {
-    try {
-      key = provider.keyFor(req, token);
-    } catch (e) {
-      return failed(e.message);
+    let got: string | null = null;
+    let why: string | null = null;
+    provider(req, token, (err: any, secretOrKey?: any): void => {
+      if (err !== null) {
+        why = err instanceof Error ? err.message : String(err);
+      } else if (typeof secretOrKey === "string") {
+        got = secretOrKey;
+      } else if (Buffer.isBuffer(secretOrKey)) {
+        got = (secretOrKey as Buffer).toString();
+      }
+    });
+    if (why !== null) {
+      return failed(why);
     }
+    if (got === null) {
+      return failed("secret or public key must be provided");
+    }
+    key = got;
   }
   const algs = options.algorithms;
   const tolerance = options.jsonWebTokenOptions;

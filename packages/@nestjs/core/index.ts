@@ -24,6 +24,7 @@ import {
   __jsonValues,
   __tokens,
   __values,
+  __appFactories,
   bodyField,
   CallHandler,
   ClassProvider,
@@ -324,6 +325,12 @@ function resolveToken(token: unknown, optional: boolean, who: string, index: int
   }
   const e = container.entries.get(key);
   if (e === null) {
+    // a value a package registered without a provider (TypeOrmModule's DataSource), asked by inject: [DataSource]
+    // or by its token string, as construct() finds it for a constructor parameter
+    const v = __values.get(typeof token === "string" ? (token as string) : typeof token === "symbol" ? "" : (token as ClassInfo).id);
+    if (v !== null) {
+      return v;
+    }
     if (optional) {
       return null;
     }
@@ -904,6 +911,9 @@ export class NestApplication {
     }
     this.initialized = true;
     ensureCollected(this.root);
+    for (const f of __appFactories) {
+      __values.set(f.provide as string, build(f, 0)); // (forRootAsync with inject: its factory sees the providers)
+    }
     for (const e of container.entries.values()) {
       resolveToken(e.token, false, "application", 0, 0);
     }

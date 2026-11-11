@@ -6,7 +6,7 @@
 // A Repository<Entity> is made from its parameter's own type (its state is the DataSource's name), so the
 // constructor gets the exact Repository<User> it declares.
 import { ClassInfo, MethodInfo } from "xisto:reflect";
-import { Module, __jsonValues, __tokens, __values } from "@nestjs/common";
+import { FactoryProvider, Module, __appFactories, __jsonValues, __tokens, __values } from "@nestjs/common";
 import { DataSource, DataSourceOptions } from "typeorm";
 
 /** forRoot's options: a DataSource's, plus Nest's own (autoLoadEntities, retryAttempts... are accepted) */
@@ -17,11 +17,12 @@ export interface TypeOrmModuleOptions extends DataSourceOptions {
   keepConnectionAlive?: boolean;
 }
 
-/** forRootAsync's options: a factory that returns the options (it runs when the module is imported) */
+/** forRootAsync's options: a factory that returns the options (at import; with inject, when the application starts) */
 export interface TypeOrmModuleAsyncOptions {
   name?: string;
   imports?: ClassInfo[];
-  useFactory: () => TypeOrmModuleOptions;
+  inject?: unknown[];
+  useFactory: (...args: any[]) => TypeOrmModuleOptions;
 }
 
 @Module({})
@@ -77,8 +78,25 @@ export class TypeOrmModule {
 
   /** TypeOrmModule.forRootAsync({ useFactory: () => ({ ... }) }): the same, with options computed at import */
   static forRootAsync(options: TypeOrmModuleAsyncOptions): ClassInfo {
-    const made = options.useFactory();
     const name = options.name ?? "";
+    const inject = options.inject ?? [];
+    if (inject.length > 0) {
+      // the factory needs providers (inject: [ConfigService]): it runs when the application starts, as in Nest
+      const fp: FactoryProvider = {
+        provide: getDataSourceToken(name.length > 0 ? name : "default"),
+        inject: inject,
+        useFactory: (...args: any[]): unknown => {
+          const made = options.useFactory(...args);
+          if (name.length > 0 && (made.name ?? "").length === 0) {
+            made.name = name;
+          }
+          return provideDataSource(made);
+        },
+      };
+      __appFactories.push(fp);
+      return TypeOrmCoreModule;
+    }
+    const made = options.useFactory();
     if (name.length > 0 && (made.name ?? "").length === 0) {
       made.name = name;
     }
