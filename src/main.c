@@ -632,7 +632,9 @@ static char *compile_units(const char *cc, const char *flags, const char *cfile)
         which[fresh++] = u;
     }
     int rcs[12];
-    if (!xs_cc_run(cmds, fresh, want, rcs)) exit(1);
+    const char *jenv = getenv("XISTO_CC_JOBS"); /* units compiled at once (default: all; a heavy build, like one with sanitizers, wants fewer) */
+    int jobs = jenv && atoi(jenv) > 0 ? atoi(jenv) : want;
+    if (!xs_cc_run(cmds, fresh, jobs, rcs)) exit(1);
     bool ok = true;
     for (int i = 0; i < fresh; i++)
         if (rcs[i] != 0 || rename(tmps[which[i]], outs[which[i]]) != 0) ok = false;
