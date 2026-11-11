@@ -604,13 +604,13 @@ static char *compile_units(const char *cc, const char *flags, const char *cfile)
         if (!pch) pre_len = 0;
     }
     char *objs = "";
-    pid_t pids[12];
+    char *cmds[12];
+    int which[12];
     char *outs[12], *tmps[12];
     int fresh = 0;
     for (int u = 0; u < nu; u++) {
         uint64_t h = fnv(units[u].data, units[u].len) ^ (fnv(cc, strlen(cc)) * 31) ^ (fnv(flags, strlen(flags)) * 131) ^ (fnv(XS_HOST, strlen(XS_HOST)) * 3);
         outs[u] = xs_sprintf("%s/%016llx.o", cache, (unsigned long long)h);
-        pids[u] = 0;
         bool twin = false; /* units with no functions of their own (a small program) are the same text */
         for (int v = 0; v < u; v++) twin = twin || strcmp(outs[v], outs[u]) == 0;
         if (twin) { free(units[u].data); continue; }
@@ -628,20 +628,14 @@ static char *compile_units(const char *cc, const char *flags, const char *cfile)
                                cc, flags, XS_LINK_FLAGS, xisto_dir, pch ? xs_sprintf(" -include-pch '%s'", pch) : "", tmps[u], ufile);
         if (link_tls && tls_awslc()) cmd = xs_sprintf("%s -I'%s/include'", cmd, awslc_dir());
         else if (link_tls) cmd = xs_sprintf("%s -I'%s/bearssl-inc'", cmd, xisto_dir);
-        pid_t pid = fork();
-        if (pid == 0) {
-            execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
-            _exit(127);
-        }
-        pids[u] = pid;
-        fresh++;
+        cmds[fresh] = cmd;
+        which[fresh++] = u;
     }
+    int rcs[12];
+    if (!xs_cc_run(cmds, fresh, want, rcs)) exit(1);
     bool ok = true;
-    for (int u = 0; u < nu; u++) {
-        if (!pids[u]) continue;
-        int st = 0;
-        if (waitpid(pids[u], &st, 0) < 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0 || rename(tmps[u], outs[u]) != 0) ok = false;
-    }
+    for (int i = 0; i < fresh; i++)
+        if (rcs[i] != 0 || rename(tmps[which[i]], outs[which[i]]) != 0) ok = false;
     if (!ok) {
         fprintf(stderr, "xisto: a codegen unit did not compile (this is a bug in xisto; units kept next to %s; XISTO_UNITS=1 builds it whole)\n", cfile);
         exit(1);
@@ -776,7 +770,8 @@ static void run_cc_raw(const char *cfile, const char *outfile, bool dev) {
         cmd = xs_sprintf("%s -I'%s/bearssl-inc' '%s/libbearssl.a'", cmd, xisto_dir, xisto_dir);
     if (link_sqlite) /* SQLite: the header and the object compiled from source live next to the xisto executable */
         cmd = xs_sprintf("%s -I'%s' '%s/sqlite3.o' -lpthread", cmd, xisto_dir, xisto_dir);
-    int rc = system(cmd);
+    int rc = 0;
+    if (!xs_cc_run(&cmd, 1, 1, &rc)) exit(1);
     if (rc != 0) {
         fprintf(stderr, "xisto: the C compiler failed (this is a bug in xisto; generated file kept at %s)\n", cfile);
         exit(1);

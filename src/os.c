@@ -204,6 +204,139 @@ int xs_ncpus(void) {
 #endif
 }
 
+/* ---- the C compiler under a memory watch ----
+   One big generated unit can make clang's cc1 take ~10 GB; several at once (the --dev units) pushed a 16 GB Mac
+   into swap until the window server stopped answering and the kernel restarted the machine (10/11). Each command
+   runs in its own process group; the group's memory (footprint on macOS, RSS on Linux) is summed every 50 ms. */
+#if !defined(_WIN32)
+#include <signal.h>
+#include <sys/wait.h>
+#include <time.h>
+#if defined(__APPLE__)
+#include <libproc.h>
+#include <sys/sysctl.h>
+#endif
+
+static unsigned long long phys_mem(void) {
+#if defined(__APPLE__)
+    unsigned long long m = 0;
+    size_t len = sizeof m;
+    if (sysctlbyname("hw.memsize", &m, &len, NULL, 0) != 0) m = 0;
+    return m;
+#else
+    long pages = sysconf(_SC_PHYS_PAGES), ps = sysconf(_SC_PAGESIZE);
+    return pages > 0 && ps > 0 ? (unsigned long long)pages * (unsigned long long)ps : 0;
+#endif
+}
+
+/* the memory of the processes in group pg, in bytes */
+static unsigned long long group_mem(pid_t pg) {
+    unsigned long long sum = 0;
+#if defined(__APPLE__)
+    pid_t pids[256];
+    int n = proc_listpgrppids(pg, pids, (int)sizeof pids); /* (a count of pids, unlike proc_listpids' bytes) */
+    for (int i = 0; i < n && i < 256; i++) {
+        struct rusage_info_v2 ri;
+        if (pids[i] > 0 && proc_pid_rusage(pids[i], RUSAGE_INFO_V2, (rusage_info_t *)&ri) == 0) sum += ri.ri_phys_footprint;
+    }
+#else
+    DIR *d = opendir("/proc");
+    if (!d) return 0;
+    long ps = sysconf(_SC_PAGESIZE);
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        char path[64], line[1024];
+        snprintf(path, sizeof path, "/proc/%s/stat", e->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        size_t k = fread(line, 1, sizeof line - 1, f);
+        fclose(f);
+        line[k] = 0;
+        char *rp = strrchr(line, ')'); /* (the name can hold spaces) */
+        if (!rp) continue;
+        char st;
+        int ppid, pgrp;
+        if (sscanf(rp + 2, "%c %d %d", &st, &ppid, &pgrp) != 3 || pgrp != pg) continue;
+        /* field 24 (rss, pages): the 22nd after the state */
+        char *q = rp + 2;
+        for (int i = 0; i < 21 && q; i++) { q = strchr(q, ' '); if (q) q++; }
+        if (q) sum += (unsigned long long)strtoull(q, NULL, 10) * (unsigned long long)ps;
+    }
+    closedir(d);
+#endif
+    return sum;
+}
+#endif
+
+bool xs_cc_run(char **cmds, int n, int jobs, int *rcs) {
+#if defined(_WIN32)
+    (void)jobs;
+    for (int i = 0; i < n; i++) rcs[i] = xs_sh(cmds[i]);
+    return true;
+#else
+    unsigned long long limit = phys_mem() / 2;
+    const char *env = getenv("XISTO_CC_MEM_MB");
+    if (env && atoll(env) > 0) limit = (unsigned long long)atoll(env) << 20;
+    if (jobs < 1) jobs = 1;
+    pid_t *pids = calloc((size_t)n, sizeof(pid_t));
+    unsigned long long peak_one = 0, peak_all = 0;
+    int next = 0, running = 0;
+    bool over = false;
+    for (int i = 0; i < n; i++) rcs[i] = -1;
+    while ((!over && next < n) || running > 0) {
+        /* another job starts only while the ones running, plus the most one has used so far, fit */
+        while (!over && next < n && running < jobs) {
+            unsigned long long now = 0;
+            for (int i = 0; i < next; i++) if (pids[i] > 0) now += group_mem(pids[i]);
+            if (running > 0 && now + peak_one > limit) break;
+            pid_t pid = fork();
+            if (pid == 0) {
+                setpgid(0, 0);
+                execl("/bin/sh", "sh", "-c", cmds[next], (char *)NULL);
+                _exit(127);
+            }
+            if (pid < 0) { rcs[next++] = -1; continue; }
+            setpgid(pid, pid); /* (both sides: no race with the first sample) */
+            pids[next++] = pid;
+            running++;
+        }
+        unsigned long long all = 0;
+        for (int i = 0; i < next; i++) {
+            if (pids[i] <= 0) continue;
+            unsigned long long m = group_mem(pids[i]);
+            if (m > peak_one) peak_one = m;
+            all += m;
+        }
+        if (all > peak_all) peak_all = all;
+        if (all > limit && !over) {
+            over = true;
+            for (int i = 0; i < next; i++) if (pids[i] > 0) kill(-pids[i], SIGKILL);
+            fprintf(stderr, "xisto: the C compiler went over the memory limit (%.2f GB of %.2f GB, %s) and was stopped before the "
+                            "machine started to swap; XISTO_CC_MEM_MB sets the limit, XISTO_UNITS=1 compiles one unit at a time\n",
+                    all / 1073741824.0, limit / 1073741824.0, env && atoll(env) > 0 ? "XISTO_CC_MEM_MB" : "half of this machine's RAM");
+        }
+        for (int i = 0; i < next; i++) {
+            if (pids[i] <= 0) continue;
+            int st = 0;
+            pid_t r = waitpid(pids[i], &st, WNOHANG);
+            if (r == pids[i]) {
+                rcs[i] = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+                pids[i] = 0;
+                running--;
+            }
+        }
+        if (running > 0 || (!over && next < n)) {
+            struct timespec ts = {0, 50 * 1000 * 1000};
+            nanosleep(&ts, NULL);
+        }
+    }
+    free(pids);
+    if (getenv("XISTO_CC_MEM_SHOW")) fprintf(stderr, "xisto: C compiler memory: %.2f GB at most together, %.2f GB in one job\n", peak_all / 1073741824.0, peak_one / 1073741824.0);
+    return !over;
+#endif
+}
+
 int xs_pid(void) {
 #if defined(_WIN32)
     return (int)GetCurrentProcessId();
