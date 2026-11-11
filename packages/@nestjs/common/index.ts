@@ -24,6 +24,8 @@ export const __custom: CustomParam[] = [];
 // JSON the parameter's own type decodes into the exact instance it asks for (a Repository<User> from forFeature).
 export const __values: Map<string, unknown> = new Map<string, unknown>();
 export const __jsonValues: Map<string, string> = new Map<string, string>();
+/** providers a package registers for the whole application (TypeOrmModule.forRootAsync with inject): built at init, before the rest, into __values */
+export const __appFactories: FactoryProvider[] = [];
 export const __tokens: Map<string, string> = new Map<string, string>(); // "<class id>#<parameter index>" -> token
 
 /** HTTP status codes, as @nestjs/common names them. */
