@@ -408,6 +408,11 @@ static Buf compile_to_c(const char *path) {
             buf_puts(&b, src);
             buf_puts(&b, "\n");
         }
+        if (p->nnative) { /* the program's own code: C diagnostics point back at the generated file, not the last package */
+            size_t nl = 1;
+            for (size_t i = 0; i < b.len; i++) nl += b.data[i] == '\n';
+            buf_printf(&b, "#line %zu \"generated.c\"\n", nl + 1);
+        }
         emit_program(p, &b);
     }
     if (show_time && !use_qbe) fprintf(stderr, "xisto: tls %s\n", !p->uses_tls ? "not linked" : tls_awslc() ? "AWS-LC" : "BearSSL");

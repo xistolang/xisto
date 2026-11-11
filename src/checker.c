@@ -1703,9 +1703,18 @@ static bool json_ok(Type *t, int depth) {
         if (t->cls->builtin) /* a Date as its ISO text; a bigint (read from a number or its digits; writing one throws, as in
                                 JavaScript); a Buffer as hex text or {"type":"Buffer","data":[...]} */
             return strcmp(t->cls->name, "Date") == 0 || strcmp(t->cls->name, "bigint") == 0 || strcmp(t->cls->name, "Buffer") == 0;
-        for (int i = 0; i < t->cls->nfields; i++)
-            if (!json_ok(t->cls->fields[i].type, depth + 1)) return false;
-        return true;
+        { /* a type that holds itself (a tree: children?: Item[]) is fine: its helpers call themselves */
+            static Class *open[32];
+            static int nopen;
+            for (int i = 0; i < nopen; i++) if (open[i] == t->cls) return true;
+            if (nopen == 32) return false;
+            open[nopen++] = t->cls;
+            bool ok = true;
+            for (int i = 0; i < t->cls->nfields && ok; i++)
+                if (!json_ok(t->cls->fields[i].type, depth + 1)) ok = false;
+            nopen--;
+            return ok;
+        }
     default: return false;
     }
 }
