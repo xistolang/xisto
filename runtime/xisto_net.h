@@ -240,6 +240,7 @@ static int kevent(int kq, const struct kevent *ch, int nch, struct kevent *out, 
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <dlfcn.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
@@ -2575,7 +2576,25 @@ XS_NOINLINE void xs_Server_listen_tls(xs_Server *s, int64_t port, xs_str *cert, 
     xs_Server_listen(s, port);
 }
 #endif
+/* The first DNS lookup of a process loads the resolver's libraries (macOS: libnetwork, whose initializers run Swift
+   and Foundation; Linux: the NSS modules) on the stack of whoever makes it. A request runs on a 64 KB task stack,
+   and a NestJS app's first query from a request (connect -> getaddrinfo of the database's name) overflowed it
+   (SIGBUS). Loaded here once, on the thread's own stack, before any request, and without a lookup on the network
+   (a name in /etc/hosts or a number does not load libnetwork: it is opened directly, 1.5 ms). */
+static void xs_resolver_warm(void) {
+    static XS_TLS bool warm;
+    if (warm) return;
+    warm = true;
+#if defined(__APPLE__)
+    (void)dlopen("/usr/lib/libnetwork.dylib", RTLD_LAZY | RTLD_LOCAL);
+#else
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo("localhost", NULL, &hints, &res) == 0 && res) freeaddrinfo(res);
+#endif
+}
 XS_NOINLINE void xs_Server_listen(xs_Server *s, int64_t port) {
+    xs_resolver_warm();
     signal(SIGPIPE, SIG_IGN);
     const char *w = getenv("XISTO_WORKERS");
     if (w && atoi(w) > 1) xs_workers = atoi(w) > 64 ? 64 : atoi(w);
