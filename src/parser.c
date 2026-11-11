@@ -3500,7 +3500,12 @@ static void params_info(Buf *b, Func *f) {
     buf_puts(b, "]");
 }
 static void call_args(Buf *b, Func *f) {
-    for (int i = 0; f && i < f->nparams; i++) buf_printf(b, "%sargs[%d] as %s", i ? ", " : "", i, f->params[i].type_src);
+    for (int i = 0; f && i < f->nparams; i++) {
+        Param *pr = &f->params[i];
+        bool opt = pr->dflt && pr->dflt->kind == E_NULL; /* x?: T: an @Optional() provider that is missing comes as null */
+        if (opt) buf_printf(b, "%sargs[%d] as (%s) | null", i ? ", " : "", i, pr->type_src);
+        else buf_printf(b, "%sargs[%d] as %s", i ? ", " : "", i, pr->type_src);
+    }
 }
 static int ndeco;
 static void apply(Buf *b, Decorator *d, const char *target) {

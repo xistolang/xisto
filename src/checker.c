@@ -784,6 +784,7 @@ static Expr *thunk_of(Expr *x) {
     Arrow *a = xs_alloc(sizeof *a);
     a->pos = x->pos;
     a->expr_body = true;
+    a->synthetic = true;
     Func *f = xs_alloc(sizeof *f);
     f->pos = x->pos;
     f->name = "arrow";
@@ -1453,7 +1454,21 @@ static void mark_used(Binding *b) {
     for (; b; b = b->origin) b->used = true;
 }
 
+/* a capture's name as a C identifier: a narrowed path is held under a key like "this.1.Service" (this.client after a
+   null test), which an arrow can capture */
+static const char *cap_cid(const char *name) {
+    bool plain = true;
+    for (const char *q = name; *q; q++) if (!(isalnum((unsigned char)*q) || *q == '_')) plain = false;
+    if (plain) return name;
+    Buf b = {0};
+    buf_puts(&b, "np_");
+    for (const char *q = name; *q; q++)
+        if (isalnum((unsigned char)*q) || *q == '_') buf_putc(&b, *q);
+        else if (*q == '.') buf_putc(&b, '_');
+    return b.data;
+}
 static Capture *add_capture(Arrow *a, const char *name, const char *outer_cname, Type *type, bool is_this) {
+    name = cap_cid(name);
     for (int i = 0; i < a->ncaptures; i++)
         if (strcmp(a->captures[i].name, name) == 0) return &a->captures[i];
     if (a->ncaptures == a->cap_captures) {
@@ -1478,6 +1493,17 @@ static Binding *lookup(const char *name) {
         for (Binding *b = s->head; b; b = b->next) {
             if (strcmp(b->name, name) != 0) continue;
             bool global = strncmp(b->cname, "g", 1) == 0 && b->cname[1] >= '0' && b->cname[1] <= '9';
+            if (nb > 0 && name[0] == '\x01') {
+                /* a narrowed path (this.client after a null test): it is read through the captured `this` or
+                   variable, so there is nothing to copy. In a task the checker made (Promise.race([this.c.close()]))
+                   the narrowing still holds, as in the source; a callback written in the source does not see it,
+                   as in TypeScript (the field may change before it runs) */
+                bool all_synthetic = true;
+                for (int i = 0; i < nb; i++) if (!boundaries[i]->arrow->synthetic) all_synthetic = false;
+                if (!all_synthetic) return NULL;
+                mark_used(b);
+                return b;
+            }
             mark_used(b);
             if (nb == 0 || global) return b;
             /* capture into each arrow from the outermost boundary inward */
@@ -1492,11 +1518,11 @@ static Binding *lookup(const char *name) {
                 nbind->orig = NULL;
                 if (cur->cell) { /* shared with the enclosing function through the cell: reads and writes see each other */
                     c->boxed = true;
-                    nbind->cell = xs_sprintf("env->c_%s", name);
-                    nbind->cname = xs_sprintf("(env->c_%s->v)", name);
+                    nbind->cell = xs_sprintf("env->c_%s", cap_cid(name));
+                    nbind->cname = xs_sprintf("(env->c_%s->v)", cap_cid(name));
                 } else {
                     nbind->is_const = true;
-                    nbind->cname = xs_sprintf("env->c_%s", name);
+                    nbind->cname = xs_sprintf("env->c_%s", cap_cid(name));
                 }
                 nbind->next = boundaries[i]->head;
                 boundaries[i]->head = nbind;
@@ -2183,7 +2209,9 @@ static void pr_spawn(Expr *e) { /* the call e (checked), kept as a promise */
 }
 static void pr_resolved(Expr *e) { /* a value already computed, as a fulfilled promise */
     Type *t = e->type;
-    wrap_call(e, xs_sprintf("xs_promise_resolved_%s", pr_sfx(pr_kind(t))), ty_promise_of(t));
+    const char *sfx = pr_sfx(pr_kind(t));
+    /* (a void or null value: xs_promise_resolved_v takes none; _vx evaluates it and drops it) */
+    wrap_call(e, xs_sprintf("xs_promise_resolved_%s", strcmp(sfx, "v") == 0 ? "vx" : sfx), ty_promise_of(t));
     prog->uses_gen = true;
 }
 static void pr_await(Expr *e) { /* await p, p a promise: its value (or its rejection thrown) */
@@ -7354,6 +7382,22 @@ static void check_expr_in(Expr *e, Type *expected) {
                    passed, and the body sees a local of the written type, converted on entry. */
                 bool wider = (dt->kind == TY_UNKNOWN || ty_is_any(dt) || (dt->kind == TY_NULLABLE && ty_equal(dt->elem, wt)))
                              && wt->kind != TY_VOID && f->body && f->body->kind == S_BLOCK && !f->params[i].rest && !f->params[i].is_prop;
+                if (!wider && dt->kind == TY_FUNC && wt->kind == TY_FUNC && dt->nparams == wt->nparams && ty_equal(dt->ret, wt->ret)) {
+                    /* (done: (err: Error | null, key?: any) => void) where (err: any, key?: any) => void is passed
+                       (passport's callbacks): the body calls done with a reference where the function takes any;
+                       a reference held as unknown is the same pointer, so the one closure serves both */
+                    bool same = true;
+                    for (int k = 0; k < dt->nparams && same; k++) {
+                        Type *a = dt->params[k], *b = wt->params[k];
+                        if (ty_equal(a, b)) continue;
+                        if ((ty_is_any(b) || b->kind == TY_UNKNOWN) && (ty_is_heap(a) || ty_is_any(a) || a->kind == TY_UNKNOWN)) continue;
+                        same = false;
+                    }
+                    if (same) {
+                        f->params[i].type = wt;
+                        continue;
+                    }
+                }
                 if (!wider && wt->kind == TY_NULLABLE && ty_equal(wt->elem, dt) && ty_is_heap(dt)) {
                     /* (data: string) where string | null is passed (Nest's param decorators: data is undefined without
                        an argument): TypeScript's parameter bivariance; a reference is laid out the same either way */
@@ -7393,7 +7437,14 @@ static void check_expr_in(Expr *e, Type *expected) {
         scope->arrow = a;
         if (f->body) { ii_enter(f, false); infer_ints_fn(f->body); } /* XB-034 */
         for (int i = 0; i < f->nparams; i++) {
+            const char *prev = f->params[i].cname; /* checked before (a retry with another expected type): the body
+                                                      already reads the parameter by that name */
             Binding *pb = declare(e->pos, f->params[i].name, f->params[i].type, false, false, true);
+            if (prev && pb->plain) {
+                pb->plain = (char *)prev;
+                pb->cell = xs_sprintf("%s_c", prev);
+                pb->cname = xs_sprintf("(%s->v)", pb->cell);
+            } else if (prev) pb->cname = (char *)prev;
             f->params[i].cname = pb->plain ? pb->plain : pb->cname;
             f->params[i].cell = pb->cell;
         }

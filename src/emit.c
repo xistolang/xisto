@@ -2468,6 +2468,8 @@ static char *from_unknown(Type *t, const char *expr) {
     case TY_OBJECT: {
         if (in_hierarchy(b->cls)) return xs_sprintf("((%s)xs_as_isa((void *)(%s), %s, %d, \"%s\"))", ctype(b), expr, isa_fn(b->cls), nul, what);
         const char *fr = strcmp(b->cls->name, "Error") == 0 ? "xs_Error_free" : xs_sprintf("%s_free", b->cls->cname);
+        if (strcmp(b->cls->cname, "xs_Uint8Array") == 0) fr = "xs_u8_free"; /* (Buffer too: the same free, another print) */
+        else if (strcmp(b->cls->cname, "xs_Float64Array") == 0) fr = "xs_f64_free";
         return xs_sprintf("((%s)xs_as_ref(%s, %s, %d, \"%s\"))", ctype(b), expr, fr, nul, what);
     }
     case TY_ARRAY: {
@@ -2725,6 +2727,9 @@ static void emit_expr_raw(Expr *e) {
             if (t->kind == TY_NUMBER) buf_printf(out, "xs_as_num(%s)", b.data);
             else if (t->kind == TY_INT || (t->kind == TY_ENUM && !t->en->is_string)) buf_printf(out, "xs_as_int(%s)", b.data);
             else if (t->kind == TY_BOOLEAN) buf_printf(out, "xs_as_bool(%s)", b.data);
+            else if (null_prim(t) && t->elem->kind == TY_NUMBER) buf_printf(out, "xs_as_num_or_null(%s)", b.data); /* number | null left of a union */
+            else if (null_prim(t) && (t->elem->kind == TY_INT || (t->elem->kind == TY_ENUM && !t->elem->en->is_string))) buf_printf(out, "xs_as_int_or_null(%s)", b.data);
+            else if (null_prim(t) && t->elem->kind == TY_BOOLEAN) buf_printf(out, "xs_as_bool_or_null(%s)", b.data);
             else buf_printf(out, "((%s)(%s))", ctype(t), b.data);
             free(b.data);
             return;
@@ -2826,7 +2831,8 @@ static void emit_expr_raw(Expr *e) {
         indent--;
         nl();
         buf_puts(out, "}\n");
-        buf_puts(&arrow_fns, body.data);
+        if (!a->emitted) buf_puts(&arrow_fns, body.data); /* (once: the same arrow can be reached twice, as in a finally) */
+        a->emitted = true;
         free(body.data);
         jam_try(a);
         out = saved_out;
