@@ -2690,9 +2690,9 @@ XS_NOINLINE double xs_as_num_or_null(void *v) { return v ? xs_as_num(v) : xs_nul
 XS_NOINLINE int8_t xs_as_bool_or_null(void *v) { return v ? (int8_t)xs_as_bool(v) : XS_NULL_BOOL; }
 /* typeof: immortal strings, so the result needs no release */
 static xs_str *xs_typeof_lit(const char *s) {
-    static xs_str *made[7];
-    static const char *names[7] = {"string", "number", "boolean", "object", "function", "undefined", "symbol"};
-    for (int i = 0; i < 7; i++)
+    static xs_str *made[8];
+    static const char *names[8] = {"string", "number", "boolean", "object", "function", "undefined", "symbol", "bigint"};
+    for (int i = 0; i < 8; i++)
         if (strcmp(s, names[i]) == 0) {
             if (!made[i]) made[i] = xs_str_immortal(names[i], strlen(names[i]));
             return made[i];
@@ -2732,6 +2732,8 @@ XS_NOINLINE xs_str *xs_Symbol_to_string(xs_Symbol *y) {
     xs_release(close);
     return out;
 }
+static void xs_big_free(void *p);
+static void (*const xs_big_free_fn)(void *) = xs_big_free;
 XS_NOINLINE xs_str *xs_typeof(void *v) {
     if (!v) return xs_typeof_lit("object"); /* typeof null */
     void (*f)(void *) = xs_type_of(v)->free;
@@ -2739,6 +2741,7 @@ XS_NOINLINE xs_str *xs_typeof(void *v) {
     if (f == xs_box_int_free || f == xs_box_num_free) return xs_typeof_lit("number");
     if (f == xs_box_bool_free) return xs_typeof_lit("boolean");
     if (f == xs_Symbol_free) return xs_typeof_lit("symbol");
+    if (f == xs_big_free_fn) return xs_typeof_lit("bigint");
     if (xs_type_of(v)->print == xs_print_closure) return xs_typeof_lit("function");
     return xs_typeof_lit("object");
 }

@@ -4240,6 +4240,7 @@ static void infer_new_collection(Expr *e, Type *expected) {
         wrap_call(a, "xs_num_keys", ty_array_of(ty_numkey()));
         t = a->type;
     }
+    if (is_map && t->kind == TY_MAP && !t->record) { e->elem_type = ty_map_of(t->key, t->elem); return; } /* new Map(other): its types */
     if (t->kind != TY_ARRAY && t->kind != TY_SET) xs_error(XS3006, a->pos, hint, "cannot infer the type of this %s", is_map ? "Map" : "Set");
     if (!is_map) { e->elem_type = ty_set_of(t->elem); return; }
     Type *el = t->elem;
@@ -4830,6 +4831,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             UNarrow un = union_narrow(e->lhs);
             if (un.b) {
                 push_scope();
+                shadow_set(&ts);
                 shadow_union(un.b, un.then_t);
                 check_expr(e->rhs, NULL);
                 pop_scope();
@@ -4847,8 +4849,8 @@ static void check_expr_in(Expr *e, Type *expected) {
             narrow_set(e->lhs, false, &fs);
             UNarrow un = union_narrow(e->lhs); /* !(e instanceof X) || e.code: X on the right */
             push_scope();
+            shadow_set(&fs);
             if (un.b && un.else_t) shadow_union(un.b, un.else_t);
-            else shadow_set(&fs);
             check_expr(e->rhs, NULL);
             pop_scope();
         } else if (e->op == TK_IDENT) { /* instanceof: the right side is a class name, checked below */
@@ -5957,6 +5959,11 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (!rec) {
                 check_expr(pairs, NULL);
                 Type *pt = pairs->type;
+                if (pt->kind == TY_MAP && !pt->record && pt->key->kind == TY_STRING) { /* Object.fromEntries(map): its entries */
+                    Type **ps = xs_alloc(sizeof(Type *) * 2);
+                    ps[0] = ty_string; ps[1] = pt->elem;
+                    pt = ty_array_of(tuple_type(ps, 2, e->pos));
+                }
                 Type *el = pt->kind == TY_ARRAY ? pt->elem : NULL;
                 if (!(el && el->kind == TY_OBJECT && el->cls->is_tuple && el->cls->nfields == 2 && el->cls->fields[0].type->kind == TY_STRING))
                     xs_error(XS8015, e->pos, "Object.fromEntries takes [string, V] pairs: Object.fromEntries(xs.map((x) => [x.k, x.v] as [string, V]))",
@@ -7317,6 +7324,18 @@ static void check_expr_in(Expr *e, Type *expected) {
                 want = ty_array_of(tuple_type(ps, 2, e->pos));
             } else want = ty_array_of(e->type->elem);
             if (!e->args.items[0]->type) check_expr(e->args.items[0], want); /* (checked already when it gave the type) */
+            Expr *src = e->args.items[0];
+            if ((is_map && src->type->kind == TY_MAP && !src->type->record) || (!is_map && src->type->kind == TY_SET)) {
+                /* new Map(otherMap) / new Set(otherSet) (and Object.fromEntries(map)): a copy, [...other] */
+                Expr *sp = xs_alloc(sizeof *sp);
+                sp->kind = E_UNARY; sp->op = TK_ELLIPSIS; sp->pos = src->pos; sp->field = -1; sp->lhs = src;
+                src->prechecked = true;
+                Expr *lit = xs_alloc(sizeof *lit);
+                lit->kind = E_ARRAY_LIT; lit->pos = src->pos; lit->field = -1; lit->spread = true;
+                expr_list_push(&lit->args, sp);
+                e->args.items[0] = lit;
+                check_expr(lit, want);
+            }
             expect_type(e->args.items[0], want, is_map ? "the entries of new Map" : "the values of new Set");
         }
         return;
@@ -8398,6 +8417,8 @@ static const char *typeof_name(Type *m) {
     if (is_numeric(m) || m->kind == TY_ENUM) return "number";
     if (m->kind == TY_BOOLEAN) return "boolean";
     if (m->kind == TY_FUNC) return "function";
+    if (m->kind == TY_OBJECT && m->cls && m->cls->builtin && strcmp(m->cls->name, "bigint") == 0) return "bigint";
+    if (m->kind == TY_OBJECT && m->cls && m->cls->builtin && strcmp(m->cls->name, "symbol") == 0) return "symbol";
     return "object";
 }
 static Type *union_subset(Type *u, bool *keep) {
@@ -8427,9 +8448,10 @@ static UNarrow union_narrow(Expr *c) {
     }
     if (c->kind == E_BINARY && (c->op == TK_AND || c->op == TK_OR)) {
         /* a caught Error narrowed on one side: (e instanceof X && ...) true, (!(e instanceof X) || ...) false */
+        /* (and any union or unknown narrowed by the left side: !Array.isArray(v) || v.length !== 1 || ...: v an array
+           after the whole condition is false) */
         UNarrow a = union_narrow(c->lhs);
-        bool err = a.b && a.b->type->kind == TY_OBJECT && a.b->type->cls->builtin && strcmp(a.b->type->cls->name, "Error") == 0;
-        if (!err) return r;
+        if (!a.b) return r;
         r.b = a.b;
         if (c->op == TK_AND) r.then_t = a.then_t;
         else r.else_t = a.else_t;
@@ -8507,6 +8529,7 @@ static UNarrow union_narrow(Expr *c) {
         else if (how == 1 && strcmp(lit->str, "number") == 0) t = ty_number;
         else if (how == 1 && strcmp(lit->str, "boolean") == 0) t = ty_boolean;
         else if (how == 1 && strcmp(lit->str, "symbol") == 0 && find_class("symbol")) t = ty_object_of(find_class("symbol"));
+        else if (how == 1 && strcmp(lit->str, "bigint") == 0) t = ty_big();
         if (!t) return r;
         r.b = b;
         if (neg) r.else_t = t; else r.then_t = t;
@@ -8631,11 +8654,20 @@ static void check_stmt(Stmt *s) {
         check_cond(s->cond, "condition");
         UNarrow un = union_narrow(s->cond);
         if (un.b) { /* a union narrowed in each branch; after `if (...) return;` the rest sees the other members */
+            NSet uts = {0}, ufs = {0}; /* (and the names the condition shows not null, as below) */
+            narrow_set(s->cond, true, &uts);
+            narrow_set(s->cond, false, &ufs);
+            push_scope();
+            shadow_set(&uts);
             check_block_union(s->body, un.b, un.then_t);
+            pop_scope();
             if (s->else_body) {
+                push_scope();
+                shadow_set(&ufs);
                 if (s->else_body->kind == S_BLOCK) check_block_union(s->else_body, un.b, un.else_t);
                 else { push_scope(); shadow_union(un.b, un.else_t); check_stmt(s->else_body); pop_scope(); }
-            } else if (always_exits(s->body)) shadow_union(un.b, un.else_t);
+                pop_scope();
+            } else if (always_exits(s->body)) { shadow_set(&ufs); shadow_union(un.b, un.else_t); }
             return;
         }
         NSet ts = {0}, fs = {0};
