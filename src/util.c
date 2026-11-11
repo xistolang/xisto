@@ -270,7 +270,7 @@ void xs_warn_rule(DiagCode code, Pos pos, const char *help, const char *fmt, ...
 }
 /* the build's one line: how many rule warnings, by code */
 void xs_warn_rule_summary(void) {
-    if (xs_check_mode || xs_show_warnings || xs_json_errors) return;
+    if (xs_check_mode || xs_show_warnings || xs_json_errors || !xs_warnings) return; /* (--no-warnings: not even the count) */
     int total = 0;
     for (int c = 0; c < XS_DIAG_COUNT; c++) total += rule_warn_counts[c];
     if (!total) return;
