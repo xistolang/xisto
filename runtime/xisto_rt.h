@@ -3229,6 +3229,15 @@ static xs_str *xs_arr_join_num(xs_arr_num *a, xs_str *sep) { return xs_arr_join_
 static xs_str *xs_arr_join_int(xs_arr_int *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_int, a); }
 static xs_str *xs_arr_join_bool(xs_arr_bool *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_bool, a); }
 static xs_str *xs_arr_join_str(xs_arr_ref *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_str, a); }
+/* an unknown[] / any[] (or another array of references): each value as String(x), null as "" (JavaScript's join) */
+static void xs_join_ref(xs_sb *b, void *ctx, size_t i) {
+    void *v = ((xs_arr_ref *)ctx)->data[i];
+    if (!v) return;
+    xs_str *s = xs_dyn_str(v);
+    xs_sb_put(b, s->data, (size_t)s->len);
+    xs_release(s);
+}
+static xs_str *xs_arr_join_ref(xs_arr_ref *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_ref, a); }
 /* (number | null)[] and (int | null)[]: a null slot joins as "", as in JavaScript */
 static void xs_join_num_n(xs_sb *b, void *ctx, size_t i) { if (!xs_isnull_num(((xs_arr_num *)ctx)->data[i])) xs_join_num(b, ctx, i); }
 static void xs_join_int_n(xs_sb *b, void *ctx, size_t i) { if (((xs_arr_int *)ctx)->data[i] != XS_NULL_INT) xs_join_int(b, ctx, i); }

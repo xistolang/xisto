@@ -1374,6 +1374,7 @@ static void emit_print_arg(Expr *a) {
 /* ---------- JSON: per-type serializer and parser, generated on demand ---------- */
 
 static Buf json_fns;          /* generated helper functions, placed before the program */
+static Buf json_protos;       /* their prototypes, placed before all of them (a helper may call one made later) */
 static Type **json_types;     /* types that already have helpers */
 static int njson, cap_json;
 
@@ -1462,6 +1463,10 @@ static void json_emit_read(Buf *b, Type *t, const char *jv, const char *where) {
 
 static void ensure_json(Type *t) {
     for (int i = 0; i < njson; i++) if (ty_equal(json_types[i], t)) return;
+    { /* two types the checker keeps apart can share a tag (and so a C function name): one set of helpers */
+        char *tg = type_tag(t);
+        for (int i = 0; i < njson; i++) if (strcmp(type_tag(json_types[i]), tg) == 0) return;
+    }
     if (njson == cap_json) { cap_json = cap_json ? cap_json * 2 : 8; json_types = realloc(json_types, sizeof(Type *) * (size_t)cap_json); }
     json_types[njson++] = t;
     Buf local = {0};
@@ -1470,7 +1475,7 @@ static void ensure_json(Type *t) {
     if (t->kind == TY_MAP) { /* a Record<string, V>: an object, its keys in insertion order */
         int vk = val_kind(t->elem);
         const char *vexpr = vk == 3 ? xs_sprintf("((%s)e->val.p)", ctype(t->elem)) : vk == 0 ? "e->val.d" : vk == 1 ? "e->val.i" : "(bool)e->val.i";
-        buf_printf(b, "static void json_put_%s(xs_sb *sb, xs_map *m);\nstatic xs_map *json_get_%s(xs_jv *v, const char *where);\n", tag, tag);
+        buf_printf(&json_protos, "static void json_put_%s(xs_sb *sb, xs_map *m);\nstatic xs_map *json_get_%s(xs_jv *v, const char *where);\n", tag, tag);
         buf_printf(b, "static void json_put_%s(xs_sb *sb, xs_map *m) {\n    xs_sb_put(sb, \"{\", 1);\n    bool first = true;\n    xs_map_entry *e;\n"
                       "    XS_MAP_EACH(m, e) {\n        if (!first) xs_sb_put(sb, \",\", 1);\n        first = false;\n        xs_sb_str(sb, e->skey);\n        xs_sb_put(sb, \":\", 1);\n        ", tag);
         json_emit_value(b, t->elem, vexpr);
@@ -1485,7 +1490,7 @@ static void ensure_json(Type *t) {
         return;
     } else if (t->kind == TY_ARRAY) {
         const char *st = arr_struct(t);
-        buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *a);\nstatic %s *json_get_%s(xs_jv *v, const char *where);\n", tag, st, st, tag);
+        buf_printf(&json_protos, "static void json_put_%s(xs_sb *sb, %s *a);\nstatic %s *json_get_%s(xs_jv *v, const char *where);\n", tag, st, st, tag);
         buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *a) {\n    xs_sb_put(sb, \"[\", 1);\n    for (size_t i = 0; i < a->len; i++) {\n        if (i) xs_sb_put(sb, \",\", 1);\n        ", tag, st);
         json_emit_value(b, t->elem, arr_is_ref(t) ? xs_sprintf("((%s)a->data[i])", ctype(t->elem)) : "a->data[i]");
         buf_puts(b, "\n    }\n    xs_sb_put(sb, \"]\", 1);\n}\n");
@@ -1499,7 +1504,7 @@ static void ensure_json(Type *t) {
     }
     Class *c = t->cls;
     if (c->is_tuple) { /* [A, B]: a JSON array of exactly that many elements */
-        buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *o);\nstatic %s *json_get_%s(xs_jv *v, const char *where);\n", tag, c->cname, c->cname, tag);
+        buf_printf(&json_protos, "static void json_put_%s(xs_sb *sb, %s *o);\nstatic %s *json_get_%s(xs_jv *v, const char *where);\n", tag, c->cname, c->cname, tag);
         buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *o) {\n    xs_sb_put(sb, \"[\", 1);\n", tag, c->cname);
         for (int i = 0; i < c->nfields; i++) {
             if (i) buf_puts(b, "    xs_sb_put(sb, \",\", 1);\n");
@@ -1520,7 +1525,7 @@ static void ensure_json(Type *t) {
         buf_puts(&json_fns, local.data);
         return;
     }
-    buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *o);\nstatic %s *json_get_%s(xs_jv *v, const char *where);\n", tag, c->cname, c->cname, tag);
+    buf_printf(&json_protos, "static void json_put_%s(xs_sb *sb, %s *o);\nstatic %s *json_get_%s(xs_jv *v, const char *where);\n", tag, c->cname, c->cname, tag);
     buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *o) {\n    xs_sb_put(sb, \"{\", 1);\n    bool first_ = true; (void)first_;\n", tag, c->cname);
     for (int i = 0; i < c->nfields; i++) {
         Field *f = &c->fields[i];
@@ -9651,6 +9656,8 @@ void emit_program(Program *p, Buf *o) {
     out = &body;
     json_fns.len = 0;
     if (json_fns.data) json_fns.data[0] = 0;
+    json_protos.len = 0;
+    if (json_protos.data) json_protos.data[0] = 0;
     njson = 0;
     arrow_fns.len = 0;
     if (arrow_fns.data) arrow_fns.data[0] = 0;
@@ -9853,11 +9860,15 @@ void emit_program(Program *p, Buf *o) {
             buf_printf(&u, "    if (f_ == %s_free) { json_put_%s(sb, (%s *)v); return; }\n", cls[i]->cname, type_tag(ty_object_of(cls[i])), cls[i]->cname);
         buf_puts(&u, "    xs_panic(\"TypeError: this value cannot be written as JSON\");\n}\n");
         buf_puts(out, "static void xs_json_unknown(xs_sb *sb, void *v);\n");
+        if (json_protos.data) buf_puts(out, json_protos.data);
         if (json_fns.data) buf_puts(out, json_fns.data);
         buf_puts(out, u.data);
         free(u.data);
         json_unknown_used = false;
-    } else if (json_fns.data) buf_puts(out, json_fns.data);
+    } else if (json_fns.data) {
+        if (json_protos.data) buf_puts(out, json_protos.data);
+        buf_puts(out, json_fns.data);
+    }
     if (isa_fns.data) { buf_puts(out, isa_fns.data); isa_fns.len = 0; isa_fns.data[0] = 0; nisa = 0; }
     if (disp_fns.data) { buf_puts(out, disp_fns.data); disp_fns.len = 0; disp_fns.data[0] = 0; ndisp = 0; }
     if (xs_debug) {
