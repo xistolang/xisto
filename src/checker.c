@@ -201,6 +201,7 @@ static void init_builtins(void) {
     Class *resp = bi_class("Response", "xs_Response");
     bi_field(resp, "status", ty_int);
     bi_field(resp, "ok", ty_boolean);
+    bi_field(resp, "headers", ty_map_of(ty_string, ty_string)); /* a Map: get(name) and forEach((v, k) => ...), names in lower case */
     bi_method(resp, "text", "xs_Response_text", ty_string, 0);
 
     Class *req = bi_class("HttpRequest", "xs_HttpRequest");
@@ -1211,6 +1212,35 @@ static Type *ret_unpromise(Type *t, bool *async) {
     if (n > 1) { r = xs_alloc(sizeof *r); *r = *u; r->params = m; r->nparams = n; }
     return nul ? ty_nullable_of(r) : r;
 }
+static Type *resolve(Type *t, Pos pos);
+/* { a: T } written in a generic class's or function's text: each instance parses it again with T bound, and that
+   makes its interface while the checker runs (after the program's classes were registered): registered here, the
+   first time a type names it, with its fields resolved where it was written */
+static void flatten_fields(Class *c, int depth);
+static bool late_inline_class(Class *c) {
+    bool in_prog = false;
+    for (int i = prog->nclasses - 1; i >= 0 && !in_prog; i--) in_prog = prog->classes[i] == c;
+    if (!in_prog || c->builtin) return false;
+    sym_add(&classes_by_name, c->name, c);
+    c->cname = xs_sprintf("c%d_%s", c->mod->id, c->name);
+    c->used = true;
+    Module *saved_mod = cur_mod;
+    Scope *saved_scope = scope;
+    const char *sfn = xs_file_name, *ssrc = xs_source;
+    enter_module(c->mod);
+    flatten_fields(c, 0);
+    for (int k = 0; k < c->nfields; k++) {
+        Field *fd = &c->fields[k];
+        fd->type = resolve(fd->type, fd->pos);
+        fd->cname = field_cname(fd->name);
+    }
+    cur_mod = saved_mod;
+    scope = saved_scope;
+    xs_file_name = sfn;
+    xs_source = ssrc;
+    return true;
+}
+
 static Type *resolve(Type *t, Pos pos) {
     if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__ret_of:", 9) == 0) { /* (generated reflection) */
         const char *dot = strchr(t->tname + 9, '.');
@@ -1339,6 +1369,7 @@ static Type *resolve(Type *t, Pos pos) {
     }
     case TY_OBJECT:
         if (t->cls->cname) return t;
+        if (t->cls->name && strncmp(t->cls->name, "__Obj_", 6) == 0 && t->cls->mod && late_inline_class(t->cls)) return t;
         {
             Enum *en = find_enum(t->cls->name);
             if (en) return ty_enum_of(en);
@@ -1672,9 +1703,18 @@ static bool json_ok(Type *t, int depth) {
         if (t->cls->builtin) /* a Date as its ISO text; a bigint (read from a number or its digits; writing one throws, as in
                                 JavaScript); a Buffer as hex text or {"type":"Buffer","data":[...]} */
             return strcmp(t->cls->name, "Date") == 0 || strcmp(t->cls->name, "bigint") == 0 || strcmp(t->cls->name, "Buffer") == 0;
-        for (int i = 0; i < t->cls->nfields; i++)
-            if (!json_ok(t->cls->fields[i].type, depth + 1)) return false;
-        return true;
+        { /* a type that holds itself (a tree: children?: Item[]) is fine: its helpers call themselves */
+            static Class *open[32];
+            static int nopen;
+            for (int i = 0; i < nopen; i++) if (open[i] == t->cls) return true;
+            if (nopen == 32) return false;
+            open[nopen++] = t->cls;
+            bool ok = true;
+            for (int i = 0; i < t->cls->nfields && ok; i++)
+                if (!json_ok(t->cls->fields[i].type, depth + 1)) ok = false;
+            nopen--;
+            return ok;
+        }
     default: return false;
     }
 }
@@ -4561,6 +4601,7 @@ static void check_expr_in(Expr *e, Type *expected) {
     if (e->kind == E_CALL && !e->lhs && e->builtin.cfn && e->type) return; /* a runtime call the checker made (wrap_call): checked */
     switch (e->kind) {
     case E_SPAWN: return; /* (made by the checker, already checked) */
+    case E_UPCAST: case E_SUPER_CALL: return; /* (made by the checker with their types: a walk that checks again leaves them) */
     case E_NUMBER:
         e->type = e->is_int_lit ? ty_litint : ty_number;
         if (expected && is_numeric(expected)) coerce_lit(e, expected);
@@ -4911,7 +4952,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 expect_type(e->rhs, nw, "default after '||'");
                 want = nw;
             } else
-            expect_type(e->rhs, want, "default after '||'");
+                expect_type(e->rhs, want, "default after '||'");
             if (!rereadable(e->lhs)) { /* f() || d: the left side is evaluated once (the emitter keeps it in a temporary) */
                 Expr *dflt = e->rhs;
                 e->kind = E_COND;
@@ -5717,8 +5758,13 @@ static void check_expr_in(Expr *e, Type *expected) {
                         if (strcmp(k, "method") == 0 || strcmp(k, "body") == 0) {
                             check_expr(v, ty_string);
                             expect_type(v, ty_string, xs_sprintf("fetch option '%s'", k));
+                        } else if (strcmp(k, "headers") == 0 && v->kind != E_OBJLIT) {
+                            /* headers built before the call: a Record<string, string> (sent in insertion order) */
+                            check_expr(v, NULL);
+                            Type *ht = v->type;
+                            if (!(ht && ht->kind == TY_MAP && ht->key && ht->key->kind == TY_STRING && ht->elem && ht->elem->kind == TY_STRING))
+                                xs_error(XS7058, v->pos, "headers: { \"Content-Type\": \"application/json\" }, or a Record<string, string>", "headers must be an object literal");
                         } else if (strcmp(k, "headers") == 0) {
-                            if (v->kind != E_OBJLIT) xs_error(XS7058, v->pos, "headers: { \"Content-Type\": \"application/json\" }", "headers must be an object literal");
                             for (int h = 0; h < v->args.len; h++) {
                                 check_expr(v->args.items[h], ty_string);
                                 expect_type(v->args.items[h], ty_string, xs_sprintf("header '%s'", v->keys[h]));
@@ -6170,9 +6216,21 @@ static void check_expr_in(Expr *e, Type *expected) {
                     if (src->kind == E_OBJLIT && src->args.len == 1 && strcmp(src->keys[0], "length") == 0) {
                         /* Array.from({ length: n }, (_, i) => ...): n results of the function, as JavaScript makes them */
                         int np = 2;
-                        if (fn->kind == E_ARROW) np = fn->arrow->fn->nparams;
-                        else if (fn->kind == E_IDENT) { check_expr(fn, NULL); if (fn->type->kind == TY_FUNC) np = fn->type->nparams; } /* (a name: checked twice, harmless) */
-                        callee->str = np == 0 ? "__xs_fromLength0" : "__xs_fromLength";
+                        bool async_fn = false; /* Array.from({ length: n }, worker) with an async worker: n promises (Promise.all of them) */
+                        if (fn->kind == E_ARROW) {
+                            np = fn->arrow->fn->nparams;
+                            Func *af = fn->arrow->fn;
+                            if (af->is_async) async_fn = true;
+                            else if (fn->arrow->expr_body && af->body && af->body->stmts.len) {
+                                Expr *r = af->body->stmts.items[af->body->stmts.len - 1]->expr;
+                                if (r && r->kind == E_CALL && r->lhs && r->lhs->kind == E_IDENT) {
+                                    Func *cf = lookup_func(r->lhs->str);
+                                    Binding *cb = cf ? NULL : lookup(r->lhs->str);
+                                    if ((cf && (cf->is_async || cf->ret_promise)) || (cb && cb->type && cb->type->kind == TY_FUNC && cb->type->async_ret)) async_fn = true;
+                                }
+                            }
+                        } else if (fn->kind == E_IDENT) { check_expr(fn, NULL); if (fn->type->kind == TY_FUNC) { np = fn->type->nparams; async_fn = fn->type->async_ret; } } /* (a name: checked twice, harmless) */
+                        callee->str = async_fn ? (np == 0 ? "__xs_fromLengthP0" : "__xs_fromLengthP") : np == 0 ? "__xs_fromLength0" : "__xs_fromLength";
                         expr_list_push(&c->args, src->args.items[0]); /* (checked as the call's int argument) */
                         expr_list_push(&c->args, fn);
                         *e = *c;
@@ -6480,6 +6538,21 @@ static void check_expr_in(Expr *e, Type *expected) {
             }
             static const char *cm[] = {"send", "receive", "close", "size"};
             xs_error(XS7008, e->pos, xs_help_suggest(m, cm, 4, "Channel has send(value), receive(), close() and size"), "Channel has no member '%s'", m);
+        }
+        if (e->is_call && e->args.len == 0 && e->str && strcmp(e->str, "json") == 0 && e->lhs->type->kind == TY_OBJECT &&
+            e->lhs->type->cls->builtin && strcmp(e->lhs->type->cls->name, "Response") == 0) {
+            /* response.json(): JSON.parse(response.text()), typed where it goes (any where nothing says) */
+            Pos at = e->pos;
+            Expr *recv = e->lhs;
+            Expr *txt = xs_alloc(sizeof *txt);
+            txt->kind = E_MEMBER; txt->pos = at; txt->field = -1; txt->lhs = recv; txt->str = "text"; txt->is_call = true;
+            Expr *js = xs_alloc(sizeof *js);
+            js->kind = E_IDENT; js->pos = at; js->field = -1; js->str = "JSON";
+            memset(e, 0, sizeof *e);
+            e->kind = E_MEMBER; e->pos = at; e->field = -1; e->lhs = js; e->str = "parse"; e->is_call = true;
+            expr_list_push(&e->args, txt);
+            check_expr(e, expected && expected->kind != TY_UNKNOWN ? expected : ty_any);
+            return;
         }
         if (e->lhs->type->kind == TY_UNION) { /* s.kind: a field every member has, read by the object's class */
             Type *u = e->lhs->type;
@@ -7221,6 +7294,41 @@ static void check_expr_in(Expr *e, Type *expected) {
         Func *f = a->fn;
         Type *want = expected && expected->kind == TY_FUNC ? expected :
                      expected && expected->kind == TY_NULLABLE && expected->elem->kind == TY_FUNC ? expected->elem : NULL; /* onX?: (t: T) => void */
+        if (want && want->rest && want->nparams == 1 && f->nparams >= 1 && !f->params[f->nparams - 1].rest &&
+            !f->param_decls.len && f->body && f->body->kind == S_BLOCK) {
+            /* (a: A, b: B) => ... where (...args: T[]) => R is expected (Nest's useFactory with inject, a variadic
+               callback): TypeScript accepts it. The arrow takes the one array the callers pass, and its named
+               parameters become locals read from it on entry (a checked conversion when the element type is
+               any or unknown) */
+            Type *elem = want->params[0] && want->params[0]->kind == TY_ARRAY ? want->params[0]->elem : ty_unknown;
+            StmtList nl = {0};
+            char *arr = xs_sprintf("__args%d", ++prog->narrows);
+            for (int i = 0; i < f->nparams; i++) {
+                Param *pp = &f->params[i];
+                Type *pt = pp->type ? resolve(pp->type, e->pos) : elem;
+                Expr *ai = xs_alloc(sizeof *ai);
+                ai->kind = E_IDENT; ai->pos = e->pos; ai->field = -1; ai->str = arr;
+                Expr *ix = xs_alloc(sizeof *ix);
+                ix->kind = E_NUMBER; ix->pos = e->pos; ix->field = -1; ix->num = i; ix->ival = i; ix->is_int_lit = true;
+                Expr *rd = xs_alloc(sizeof *rd);
+                rd->kind = E_INDEX; rd->pos = e->pos; rd->field = -1; rd->lhs = ai; rd->rhs = ix;
+                Expr *init = rd;
+                if (!ty_equal(pt, elem)) {
+                    init = xs_alloc(sizeof *init);
+                    init->kind = E_AS; init->pos = e->pos; init->field = -1; init->lhs = rd; init->elem_type = pt;
+                }
+                Stmt *v = xs_alloc(sizeof *v);
+                v->kind = S_VAR; v->pos = e->pos; v->name = pp->name; v->decl_type = pt; v->init = init;
+                stmt_list_push(&nl, v);
+            }
+            for (int k = 0; k < f->body->stmts.len; k++) stmt_list_push(&nl, f->body->stmts.items[k]);
+            f->body->stmts = nl;
+            Param *ps = xs_alloc(sizeof(Param));
+            memset(ps, 0, sizeof(Param));
+            ps->name = arr; ps->type = want->params[0]; ps->rest = true;
+            f->params = ps;
+            f->nparams = 1;
+        }
         if (want && want->nparams > f->nparams && !f->param_decls.len) { /* (item) => ... where (item, index) is expected:
                                                                               JavaScript drops the extra arguments; here the
                                                                               arrow takes them, unnamed, so the call matches */
@@ -7929,7 +8037,9 @@ static void check_var(Stmt *s, bool global) {
         s->init = seq;
         if (s->decl_type && s->decl_type->kind == TY_VOID) s->decl_type = ty_unknown;
     }
-    if (s->init->type->kind == TY_VOID) xs_error(XS8102, s->init->pos, NULL, "cannot store a void value");
+    bool keeps_promise = s->decl_type && (s->decl_type->kind == TY_PROMISE || (s->decl_type->kind == TY_NULLABLE && s->decl_type->elem->kind == TY_PROMISE));
+    if (s->init->type->kind == TY_VOID && !(keeps_promise && pr_is_call(s->init))) /* (const p: Promise<void> = f(): the promise, made below) */
+        xs_error(XS8102, s->init->pos, NULL, "cannot store a void value");
     if (s->init->type->kind == TY_NULL && !s->decl_type) xs_error(XS2013, s->init->pos, "write the type: let x: Todo | null = null;", "cannot infer the type of '%s' from null", s->name);
     if (s->decl_type) expect_type(s->init, s->decl_type, xs_sprintf("initializer of '%s' (declared as %s)", s->name, ty_name(s->decl_type)));
     settle(s->init);

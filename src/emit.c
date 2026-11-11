@@ -29,6 +29,13 @@ static bool rcnt(Type *t) {
 }
 /* T | null of a primitive holds a sentinel (runtime: XS_NULL_INT, XS_NULL_BOOL, xs_null_num) */
 static bool null_prim(Type *t) { return t->kind == TY_NULLABLE && !cref(t->elem); }
+static bool type_has_tparam(Type *t) {
+    if (!t) return false;
+    if (t->kind == TY_TPARAM) return true;
+    if (type_has_tparam(t->elem) || type_has_tparam(t->key) || (t->kind == TY_FUNC && type_has_tparam(t->ret))) return true;
+    for (int i = 0; i < t->nparams; i++) if (type_has_tparam(t->params[i])) return true;
+    return false;
+}
 static const char *null_value(Type *t) {
     if (!null_prim(t)) return "NULL";
     switch (t->elem->kind) {
@@ -1367,6 +1374,7 @@ static void emit_print_arg(Expr *a) {
 /* ---------- JSON: per-type serializer and parser, generated on demand ---------- */
 
 static Buf json_fns;          /* generated helper functions, placed before the program */
+static Buf json_protos;       /* their prototypes, placed before all of them (a helper may call one made later) */
 static Type **json_types;     /* types that already have helpers */
 static int njson, cap_json;
 
@@ -1455,6 +1463,10 @@ static void json_emit_read(Buf *b, Type *t, const char *jv, const char *where) {
 
 static void ensure_json(Type *t) {
     for (int i = 0; i < njson; i++) if (ty_equal(json_types[i], t)) return;
+    { /* two types the checker keeps apart can share a tag (and so a C function name): one set of helpers */
+        char *tg = type_tag(t);
+        for (int i = 0; i < njson; i++) if (strcmp(type_tag(json_types[i]), tg) == 0) return;
+    }
     if (njson == cap_json) { cap_json = cap_json ? cap_json * 2 : 8; json_types = realloc(json_types, sizeof(Type *) * (size_t)cap_json); }
     json_types[njson++] = t;
     Buf local = {0};
@@ -1463,7 +1475,7 @@ static void ensure_json(Type *t) {
     if (t->kind == TY_MAP) { /* a Record<string, V>: an object, its keys in insertion order */
         int vk = val_kind(t->elem);
         const char *vexpr = vk == 3 ? xs_sprintf("((%s)e->val.p)", ctype(t->elem)) : vk == 0 ? "e->val.d" : vk == 1 ? "e->val.i" : "(bool)e->val.i";
-        buf_printf(b, "static void json_put_%s(xs_sb *sb, xs_map *m);\nstatic xs_map *json_get_%s(xs_jv *v, const char *where);\n", tag, tag);
+        buf_printf(&json_protos, "static void json_put_%s(xs_sb *sb, xs_map *m);\nstatic xs_map *json_get_%s(xs_jv *v, const char *where);\n", tag, tag);
         buf_printf(b, "static void json_put_%s(xs_sb *sb, xs_map *m) {\n    xs_sb_put(sb, \"{\", 1);\n    bool first = true;\n    xs_map_entry *e;\n"
                       "    XS_MAP_EACH(m, e) {\n        if (!first) xs_sb_put(sb, \",\", 1);\n        first = false;\n        xs_sb_str(sb, e->skey);\n        xs_sb_put(sb, \":\", 1);\n        ", tag);
         json_emit_value(b, t->elem, vexpr);
@@ -1478,7 +1490,7 @@ static void ensure_json(Type *t) {
         return;
     } else if (t->kind == TY_ARRAY) {
         const char *st = arr_struct(t);
-        buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *a);\nstatic %s *json_get_%s(xs_jv *v, const char *where);\n", tag, st, st, tag);
+        buf_printf(&json_protos, "static void json_put_%s(xs_sb *sb, %s *a);\nstatic %s *json_get_%s(xs_jv *v, const char *where);\n", tag, st, st, tag);
         buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *a) {\n    xs_sb_put(sb, \"[\", 1);\n    for (size_t i = 0; i < a->len; i++) {\n        if (i) xs_sb_put(sb, \",\", 1);\n        ", tag, st);
         json_emit_value(b, t->elem, arr_is_ref(t) ? xs_sprintf("((%s)a->data[i])", ctype(t->elem)) : "a->data[i]");
         buf_puts(b, "\n    }\n    xs_sb_put(sb, \"]\", 1);\n}\n");
@@ -1492,7 +1504,7 @@ static void ensure_json(Type *t) {
     }
     Class *c = t->cls;
     if (c->is_tuple) { /* [A, B]: a JSON array of exactly that many elements */
-        buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *o);\nstatic %s *json_get_%s(xs_jv *v, const char *where);\n", tag, c->cname, c->cname, tag);
+        buf_printf(&json_protos, "static void json_put_%s(xs_sb *sb, %s *o);\nstatic %s *json_get_%s(xs_jv *v, const char *where);\n", tag, c->cname, c->cname, tag);
         buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *o) {\n    xs_sb_put(sb, \"[\", 1);\n", tag, c->cname);
         for (int i = 0; i < c->nfields; i++) {
             if (i) buf_puts(b, "    xs_sb_put(sb, \",\", 1);\n");
@@ -1513,14 +1525,16 @@ static void ensure_json(Type *t) {
         buf_puts(&json_fns, local.data);
         return;
     }
-    buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *o);\nstatic %s *json_get_%s(xs_jv *v, const char *where);\n", tag, c->cname, c->cname, tag);
+    buf_printf(&json_protos, "static void json_put_%s(xs_sb *sb, %s *o);\nstatic %s *json_get_%s(xs_jv *v, const char *where);\n", tag, c->cname, c->cname, tag);
     buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *o) {\n    xs_sb_put(sb, \"{\", 1);\n    bool first_ = true; (void)first_;\n", tag, c->cname);
     for (int i = 0; i < c->nfields; i++) {
         Field *f = &c->fields[i];
         /* optional fields that are null are left out, like undefined in JSON.stringify */
         if (f->optional) buf_printf(b, "    if (%s) {\n", not_null(f->type, xs_sprintf("o->%s", f->cname)));
         buf_printf(b, "    if (!first_) xs_sb_put(sb, \",\", 1);\n    first_ = false;\n    xs_sb_put(sb, \"\\\"%s\\\":\", %zu);\n    ", f->name, strlen(f->name) + 3);
-        json_emit_value(b, f->optional ? f->type->elem : f->type, f->optional && f->type->elem->kind == TY_BOOLEAN ? xs_sprintf("(bool)o->%s", f->cname) : xs_sprintf("o->%s", f->cname));
+        /* (x?: unknown is unknown, which holds null already: no nullable wrapper around it) */
+        Type *ft = f->optional && f->type->kind == TY_NULLABLE ? f->type->elem : f->type;
+        json_emit_value(b, ft, f->optional && ft->kind == TY_BOOLEAN && f->type->kind == TY_NULLABLE ? xs_sprintf("(bool)o->%s", f->cname) : xs_sprintf("o->%s", f->cname));
         buf_puts(b, "\n");
         if (f->optional) buf_puts(b, "    }\n");
     }
@@ -1532,7 +1546,7 @@ static void ensure_json(Type *t) {
         buf_printf(b, "    o->%s = ", f->cname);
         if (f->optional) { /* absent or null: null */
             buf_printf(b, "({ xs_jv *fv_ = xs_json_field_opt(v, \"%s\"); fv_ && fv_->kind != XJ_NULL ? ", f->name);
-            json_emit_read(b, f->type->elem, "fv_", f->name);
+            json_emit_read(b, f->type->kind == TY_NULLABLE ? f->type->elem : f->type, "fv_", f->name);
             buf_printf(b, " : %s; })", null_value(f->type));
         } else if (c->data_only && (f->type->kind == TY_STRING || f->type->kind == TY_INT || f->type->kind == TY_NUMBER || f->type->kind == TY_BOOLEAN || f->type->kind == TY_ARRAY)) {
             /* a DTO (filled from JSON, checked by its validators): an absent field reads as empty, as class-validator
@@ -2234,6 +2248,8 @@ static void emit_promise(Expr *e) {
     buf_printf(out, "({ xs_tgroup *pg%d_; ", id);
     if (map) {
         Expr *call = e->args.items[0]; /* xs.map(f) */
+        if (!call->lhs || call->kind != E_MEMBER) /* XB-171: Promise.all(xs.map(f)) kept as a promise (.then on it): the spawn evaluated the map already */
+            xs_error(XS9902, e->pos, "keep Promise.all(xs.map(f)) inside an async function and keep that function's promise", "internal: Promise.all(xs.map(f)) kept as a promise is not supported yet");
         Type *src = call->lhs->type;
         int ak = val_kind(src->elem);
         buf_printf(out, "%s *ps%d_ = ", arr_struct(src), id);
@@ -2421,8 +2437,10 @@ static void emit_dyn_tables(Program *p) {
             else if (b->kind == TY_STRING || b->kind == TY_ENUM) kind = "XD_STR";
             else if (b->kind == TY_UNKNOWN || b->kind == TY_UNION) kind = "XD_ANY";
             else { kind = "XD_REF"; isa = dyn_isa(p, b, &fns); }
-            buf_printf(&tabs, "    {\"%s\", %zu, (uint32_t)offsetof(%s, %s), %s, %d, %d, %s, \"%s\"},\n", f->name, strlen(f->name), c->cname, f->cname, kind,
-                       nul || f->optional, f->optional, isa ? isa : "NULL", ty_name(b));
+            buf_printf(&tabs, "    {\"%s\", %zu, (uint32_t)offsetof(%s, %s), %s, %d, %d, %s, ", f->name, strlen(f->name), c->cname, f->cname, kind,
+                       nul || f->optional, f->optional, isa ? isa : "NULL");
+            { Buf *so = out; out = &tabs; emit_c_string(ty_name(b)); out = so; } /* (a literal type's name has its quotes: 'A' is "A") */
+            buf_puts(&tabs, "},\n");
         }
         if (c->nfields) buf_puts(&tabs, "};\n");
         buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s};\n", c->cname, c->name, c->nfields, c->nfields ? xs_sprintf("%s_dynf", c->cname) : "NULL");
@@ -2832,6 +2850,7 @@ static void emit_expr_raw(Expr *e) {
     }
     case E_NEW_MAP: {
         Type *t = e->type;
+        if (t->kind == TY_NULLABLE) t = t->elem; /* (a Record literal where Record | null goes keeps the slot's type) */
         if (t->kind == TY_CHAN) {
             buf_printf(out, "xs_chan_new(%d, ", val_kind(t->elem));
             if (e->args.len) emit_expr(e->args.items[0]); else buf_puts(out, "0");
@@ -3406,6 +3425,20 @@ static void emit_expr_raw(Expr *e) {
                 else if (strcmp(k, "body") == 0) body = init->args.items[i];
                 else if (strcmp(k, "headers") == 0) headers = init->args.items[i];
                 else timeout = init->args.items[i]->args.items[0];
+            }
+            if (headers && headers->kind != E_OBJLIT) { /* headers from a Record<string, string> */
+                buf_puts(out, "xs_fetch_hmap(");
+                emit_borrowed(e->args.items[0]);
+                buf_puts(out, ", ");
+                if (method) emit_borrowed(method); else buf_puts(out, "NULL");
+                buf_puts(out, ", ");
+                if (body) emit_borrowed(body); else buf_puts(out, "NULL");
+                buf_puts(out, ", ");
+                emit_borrowed(headers);
+                buf_puts(out, ", ");
+                if (timeout) emit_expr(timeout); else buf_puts(out, "-1");
+                buf_puts(out, ")");
+                return;
             }
             buf_puts(out, "xs_fetch_full(");
             emit_borrowed(e->args.items[0]);
@@ -9498,6 +9531,13 @@ void emit_program(Program *p, Buf *o) {
     lit_used = xs_alloc(sizeof(bool) * (size_t)(p->nlits ? p->nlits : 1));
     size_t lits_at = out->len; /* declarations are inserted here once the body says which literals it uses */
 
+    /* an inline type written in a generic's own text ({ data: T | null } in a template's constructor): each instance
+       has its copy with T bound; the template's copy is never made and has no C type for T */
+    for (int i = 0; i < p->nclasses; i++) {
+        Class *c = p->classes[i];
+        if (!c->used || c->builtin || !c->name || strncmp(c->name, "__Obj_", 6) != 0) continue;
+        for (int k = 0; k < c->nfields; k++) if (type_has_tparam(c->fields[k].type)) { c->used = false; break; }
+    }
     /* native (declared) classes: their struct, free and print come from the package's C */
     for (int i = 0; i < p->nclasses; i++) if (p->classes[i]->used && !p->classes[i]->builtin) buf_printf(out, "typedef struct %s %s;\n", p->classes[i]->cname, p->classes[i]->cname);
     for (int i = 0; i < p->nclasses; i++) {
@@ -9617,6 +9657,8 @@ void emit_program(Program *p, Buf *o) {
     out = &body;
     json_fns.len = 0;
     if (json_fns.data) json_fns.data[0] = 0;
+    json_protos.len = 0;
+    if (json_protos.data) json_protos.data[0] = 0;
     njson = 0;
     arrow_fns.len = 0;
     if (arrow_fns.data) arrow_fns.data[0] = 0;
@@ -9819,11 +9861,15 @@ void emit_program(Program *p, Buf *o) {
             buf_printf(&u, "    if (f_ == %s_free) { json_put_%s(sb, (%s *)v); return; }\n", cls[i]->cname, type_tag(ty_object_of(cls[i])), cls[i]->cname);
         buf_puts(&u, "    xs_panic(\"TypeError: this value cannot be written as JSON\");\n}\n");
         buf_puts(out, "static void xs_json_unknown(xs_sb *sb, void *v);\n");
+        if (json_protos.data) buf_puts(out, json_protos.data);
         if (json_fns.data) buf_puts(out, json_fns.data);
         buf_puts(out, u.data);
         free(u.data);
         json_unknown_used = false;
-    } else if (json_fns.data) buf_puts(out, json_fns.data);
+    } else if (json_fns.data) {
+        if (json_protos.data) buf_puts(out, json_protos.data);
+        buf_puts(out, json_fns.data);
+    }
     if (isa_fns.data) { buf_puts(out, isa_fns.data); isa_fns.len = 0; isa_fns.data[0] = 0; nisa = 0; }
     if (disp_fns.data) { buf_puts(out, disp_fns.data); disp_fns.len = 0; disp_fns.data[0] = 0; ndisp = 0; }
     if (xs_debug) {

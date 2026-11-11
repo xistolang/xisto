@@ -348,7 +348,17 @@ function build(provider: unknown, depth: int): unknown {
     return (provider as ValueProvider).useValue;
   }
   if (provider instanceof FactoryProvider) {
-    return (provider as FactoryProvider).useFactory();
+    const fp = provider as FactoryProvider;
+    const args: unknown[] = [];
+    const inject = fp.inject;
+    if (inject !== null) {
+      let i = 0;
+      for (const t of inject) {
+        args.push(resolveToken(t, false, tokenName(fp.provide), i, depth + 1));
+        i++;
+      }
+    }
+    return fp.useFactory(...args);
   }
   if (provider instanceof ExistingProvider) {
     return resolveToken((provider as ExistingProvider).useExisting, false, "alias", 0, depth);

@@ -402,10 +402,11 @@ export class ExistingProvider {
   provide: unknown;
   useExisting: unknown;
 }
-/** { provide: TOKEN, useFactory: () => value } (factories with injected arguments are not supported yet) */
+/** { provide: TOKEN, useFactory: (a: A, b: B) => value, inject: [A, B] }: the factory gets the providers inject names, in order */
 export class FactoryProvider {
   provide: unknown;
-  useFactory: () => unknown;
+  useFactory: (...args: any[]) => unknown;
+  inject?: unknown[];
 }
 /** A provider: a class, or an object naming its token. */
 export type Provider = ClassInfo | ValueProvider | ClassProvider | ExistingProvider | FactoryProvider;

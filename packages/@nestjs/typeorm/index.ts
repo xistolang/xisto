@@ -66,6 +66,8 @@ function provideDataSource(options: TypeOrmModuleOptions): DataSource {
   return ds;
 }
 
+/** a module class too: `exports: [TypeOrmModule]` re-exports what forRoot / forFeature registered (they are global here) */
+@Module({})
 export class TypeOrmModule {
   /** TypeOrmModule.forRoot({ type: "oracle", ... }): the DataSource the application's repositories use */
   static forRoot(options: TypeOrmModuleOptions): ClassInfo {
