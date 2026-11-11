@@ -52,6 +52,7 @@ static void vt_push(Parser *p, const char *name, Type *t) {
 }
 
 static bool wants_intl;
+static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
 /* generics: the type parameters in scope while a template is parsed, or their types while an instance is */
 static int no_dyn_note; /* inside generated code: its anys are not the program's uses */
 static char **tp_names;
@@ -760,6 +761,9 @@ static Type *parse_type(Parser *p) {
             expect(p, TK_GT, NULL);
             t = anon_iface(p, open, name.pos, m);
         }
+    } else if (!strcmp(n, "ClassDecorator") || !strcmp(n, "MethodDecorator") || !strcmp(n, "PropertyDecorator") || !strcmp(n, "ParameterDecorator")) {
+        wants_reflect = true; /* (xisto:reflect's, global) */
+        t = named_type(p, name);
     } else if (strcmp(n, "Intl") == 0 && at(p, TK_DOT) && peek_is_ident(p)) { /* Intl.DateTimeFormatOptions: xisto:intl's */
         next(p);
         Token k = p->tok;
@@ -4845,6 +4849,11 @@ static const char xs_reflect_src[] =
     "export interface ClassInfo {\n  id: string;\n  name: string;\n  params: ParamInfo[];\n"
     "  construct: (args: unknown[]) => unknown;\n  methods: MethodInfo[];\n  fields: FieldInfo[];\n"
     "  isInstance: (value: unknown) => boolean;\n  base: ClassInfo | null;\n}\n"
+    "// TypeScript's decorator types, as xisto's decorators are (global names, like Error)\n"
+    "export type ClassDecorator = (c: ClassInfo, m: MethodInfo | null) => void;\n"
+    "export type MethodDecorator = (c: ClassInfo, m: MethodInfo | null) => void;\n"
+    "export type PropertyDecorator = (c: ClassInfo, f: FieldInfo) => void;\n"
+    "export type ParameterDecorator = (c: ClassInfo, m: MethodInfo | null, index: int) => void;\n"
     "// Number, String, Boolean and Date where a class goes as a value (type: Number, @Type(() => Date)): what they describe\n"
     "export const __ci_Number: ClassInfo = { id: \"Number\", name: \"Number\", params: [], construct: (args: unknown[]): unknown => 0, methods: [], fields: [], isInstance: (v: unknown): boolean => typeof v === \"number\", base: null };\n"
     "export const __ci_String: ClassInfo = { id: \"String\", name: \"String\", params: [], construct: (args: unknown[]): unknown => \"\", methods: [], fields: [], isInstance: (v: unknown): boolean => typeof v === \"string\", base: null };\n"
@@ -5199,6 +5208,7 @@ Program *parse_program(const char *entry_file) {
     if (wants_arrays) load_module(prog, "xisto:arrays", (Pos){1, 1}, entry_file);
     if (wants_errors) load_module(prog, "xisto:errors", (Pos){1, 1}, entry_file);
     if (wants_intl) load_module(prog, "xisto:intl", (Pos){1, 1}, entry_file);
+    if (wants_reflect) load_module(prog, "xisto:reflect", (Pos){1, 1}, entry_file);
     /* top-level statements were appended in parse order (entry first); reorder by module order */
     StmtList ordered = {0};
     for (int mi = 0; mi < prog->nmodules; mi++)

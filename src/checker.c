@@ -345,6 +345,8 @@ static Class *find_class(const char *name) {
         if (c->mod == cur_mod || (c->exported && imports_name(cur_mod, c->mod, name))) return c;
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:errors") == 0) return c; /* (TypeError & co: global, like Error) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:intl") == 0 && strncmp(name, "Intl_", 5) == 0) return c; /* (Intl.X: global) */
+        if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:reflect") == 0 && strlen(name) > 9 && !strcmp(name + strlen(name) - 9, "Decorator"))
+            return c; /* (MethodDecorator & co: global, as in TypeScript) */
     }
     if (strcmp(name, "RegExpMatchArray") == 0) name = "RegExpExecArray"; /* TypeScript's two names for a match */
     bool wt = strcmp(name, "Worker") == 0 || strcmp(name, "MessagePort") == 0;
