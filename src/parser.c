@@ -4321,6 +4321,16 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->loading = false;
         return m;
     }
+    if (strcmp(name, "fs/promises") == 0) { /* Node's fs/promises for text files, written in xisto: runtime/node/fs_promises.ts */
+        extern const unsigned char xs_node_fs_promises_ts[];
+        m->builtin = false;
+        m->file = "xisto:fs/promises";
+        m->src = (char *)xs_node_fs_promises_ts;
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
     if (strcmp(name, "perf_hooks") == 0) return m; /* performance is built in (performance.now()) */
     if (strcmp(name, "worker_threads") == 0 || strcmp(name, "os") == 0) { /* written in xisto over runtime functions */
         bool wt = strcmp(name, "worker_threads") == 0;
@@ -4341,7 +4351,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         add_func(prog, f);
         return m;
     }
-    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
     return NULL;
 }
 
@@ -4362,7 +4372,19 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
     } else if (alias) {
         snprintf(path, sizeof path, "%s", alias);
     } else if (from_file) {
-        /* a package: <project>/.xisto/pkgs/<name>/, entry from its xisto.json "main", else index.ts or src/index.ts */
+        /* a package: <project>/.xisto/pkgs/<name>/, entry from its xisto.json "main", else index.ts or src/index.ts.
+           A deep import ("rxjs/operators", "@scope/pkg/sub/file") is the file <package>/<sub>(.ts, or its index.ts),
+           as Node resolves a subpath of a package without "exports" */
+        const char *full = file;
+        const char *sub = NULL;
+        {
+            const char *slash = strchr(file, '/');
+            if (slash && file[0] == '@') slash = strchr(slash + 1, '/');
+            if (slash && slash[1]) {
+                sub = slash + 1;
+                file = xs_strndup(file, (size_t)(slash - file));
+            }
+        }
         char dir[PATH_MAX];
         strncpy(dir, from_file, sizeof dir - 1);
         dir[sizeof dir - 1] = 0;
@@ -4397,10 +4419,17 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
             }
         }
         if (!found && has_project) xs_error(XS5005, from_pos, xs_sprintf("install it: xisto add <git url or path> --name %s", file), "package '%s' is not installed", file);
-        if (!found) xs_error(XS5003, from_pos, xs_sprintf("import files with a relative path (\"./file\"), or add the package: xisto add <git url> --name %s", file), "cannot resolve '%s'", file);
+        if (!found) xs_error(XS5003, from_pos, xs_sprintf("import files with a relative path (\"./file\"), or add the package: xisto add <git url> --name %s", file), "cannot resolve '%s'", full);
         char *entry = NULL;
         char *meta = xs_read_file(xs_sprintf("%s/xisto.json", found));
-        if (meta) {
+        if (sub) {
+            char *probe = xs_sprintf("%s/%s", found, sub);
+            struct stat sst;
+            if (access(xs_sprintf("%s.ts", probe), R_OK) != 0 && !(stat(probe, &sst) == 0 && S_ISDIR(sst.st_mode)) && access(probe, R_OK) != 0)
+                xs_error(XS5003, from_pos, xs_sprintf("the package '%s' has no file '%s' (a subpath is a file of the package: %s.ts or %s/index.ts)", file, sub, sub, sub),
+                         "cannot resolve '%s'", full);
+            entry = probe;
+        } else if (meta) {
             char *m = strstr(meta, "\"main\"");
             if (m && (m = strchr(m + 6, '"'))) {
                 char *e = strchr(m + 1, '"');
