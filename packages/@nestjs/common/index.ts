@@ -513,11 +513,39 @@ function setting(id: string, s: MethodSetting): void {
   }
 }
 
-/** Marks a class as a controller of routes under `prefix`. */
-export function Controller(prefix: string = ""): (c: ClassInfo) => void {
+/** A route version that is not one: with URI versioning the route is served without a /v<n> part (Nest's symbol). */
+export const VERSION_NEUTRAL: string = "\u0000VERSION_NEUTRAL";
+/** @Controller({ path, version }): the routes' prefix and the version(s) of all of them. */
+export interface ControllerOptions {
+  path?: string;
+  version?: string | string[];
+  host?: string;
+}
+
+/** Marks a class as a controller of routes under `prefix` (or the path and versions of its options). */
+export function Controller(prefix: string | ControllerOptions = ""): (c: ClassInfo) => void {
+  let path = "";
+  const versions: string[] = [];
+  if (typeof prefix === "string") {
+    path = prefix;
+  } else {
+    const o = prefix as ControllerOptions;
+    path = o.path ?? "";
+    const v = o.version ?? null;
+    if (typeof v === "string") {
+      versions.push(v as string);
+    } else if (v !== null) {
+      for (const x of v as string[]) {
+        versions.push(x);
+      }
+    }
+  }
   return (c: ClassInfo): void => {
     __classes.set(c.id, c);
-    __controllers.set(c.id, prefix);
+    __controllers.set(c.id, path);
+    for (const v of versions) {
+      setting(c.id, { method: -1, kind: "version", text: v, code: 0, cls: null, value: null });
+    }
   };
 }
 
@@ -574,9 +602,12 @@ export function Delete(path: string = ""): (c: ClassInfo, m: MethodInfo) => void
  * The route's version: with URI versioning, @Version("1") serves the route at /v1/...
  * Works on a method or on the whole controller.
  */
-export function Version(version: string): (c: ClassInfo, m: MethodInfo | null) => void {
+export function Version(version: string | string[]): (c: ClassInfo, m: MethodInfo | null) => void {
+  const versions: string[] = typeof version === "string" ? [version as string] : (version as string[]);
   return (c: ClassInfo, m: MethodInfo | null): void => {
-    setting(c.id, { method: m === null ? -1 : methodIndex(c, m), kind: "version", text: version, code: 0, cls: null, value: null });
+    for (const v of versions) {
+      setting(c.id, { method: m === null ? -1 : methodIndex(c, m), kind: "version", text: v, code: 0, cls: null, value: null });
+    }
   };
 }
 
