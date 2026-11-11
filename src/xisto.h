@@ -522,6 +522,7 @@ struct Class {
     Pos pos;
     Module *mod;
     bool exported;
+    bool is_default;   /* export default class X, or export default X; of a class declared here */
     bool used;
     Field *fields;
     int nfields, cap_fields;

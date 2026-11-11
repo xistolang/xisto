@@ -21,13 +21,23 @@ export interface SetOptions {
   XX?: boolean;
 }
 
-declare class NativeRedis {
+/**
+ * The connection the clients of this package and of ioredis share (native/redis.c): RESP2 over TCP, pipelined, one
+ * connection per worker thread. The config is the options object, read as JSON (url, host, port, db/database,
+ * username, password, connectTimeout, commandTimeout, socket: { host, port, connectTimeout }). Every command
+ * throws: a server error with the server's text, a refused or lost connection, or "Command timed out".
+ */
+export declare class NativeRedis {
   constructor(config: object);
   connect(): void;
   str(args: string[]): string | null;
   int(args: string[]): int;
   strs(args: string[]): string[];
   strsn(args: string[]): (string | null)[];
+  /** any reply as JSON text: integers as numbers, nil as null, arrays as arrays */
+  json(args: string[]): string;
+  /** whether the connection is open (a failed connection or a lost one leaves it closed) */
+  isOpen(): boolean;
   close(): void;
 }
 

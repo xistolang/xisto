@@ -10860,6 +10860,7 @@ void check_program(Program *p) {
                 if (found && im->is_default) { /* import x from "m": x must be m's default export */
                     bool ok = im->from->default_name && strcmp(im->from->default_name, name) == 0;
                     SYM_EACH(funcs_by_name, name, e) if (((Func *)e->decl)->mod == im->from && ((Func *)e->decl)->is_default) ok = true;
+                    SYM_EACH(classes_by_name, name, e) if (((Class *)e->decl)->mod == im->from && ((Class *)e->decl)->is_default) ok = true;
                     if (!ok) { enter_module(m); xs_error(XS9013, im->positions[k], "import it by name: import { x } from \"m\"", "'%s' is not the default export of '%s'", name, im->path); }
                 }
                 for (int j = 0; j < p->top.len && !found; j++) {
