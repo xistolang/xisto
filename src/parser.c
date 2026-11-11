@@ -3813,6 +3813,14 @@ static void parse_reexport(Parser *p, Module *m, Program *prog, bool load_now) {
 
 /* export { a, b };: the listed declarations of this module are exported */
 static void apply_local_exports(Program *prog, Module *m, int top_start) {
+    if (m->default_name) { /* export default X; */
+        bool found = false;
+        for (int i = 0; i < prog->nfuncs; i++)
+            if (prog->funcs[i]->mod == m && strcmp(prog->funcs[i]->name, m->default_name) == 0) { prog->funcs[i]->exported = prog->funcs[i]->is_default = true; found = true; }
+        for (int i = 0; i < prog->nclasses; i++)
+            if (prog->classes[i]->mod == m && strcmp(prog->classes[i]->name, m->default_name) == 0) { prog->classes[i]->exported = prog->classes[i]->is_default = true; found = true; }
+        if (!found) xs_error(XS6009, (Pos){1, 1}, "export default names a function or class declared in the same file", "'export default %s': no function or class '%s' here", m->default_name, m->default_name);
+    }
     for (int k = 0; k < m->nlocal_exports; k++) {
         const char *n = m->local_exports[k];
         /* export { A } / export type { A } of an imported name: re-exported from where it came */
@@ -3949,7 +3957,14 @@ static void parse_module(Program *prog, Module *m) {
             continue;
         }
         if (decos.len && !at(&p, TK_CLASS)) xs_error(XS6020, decos.items[0].pos, NULL, "decorators apply to classes, their members and parameters");
-        if (is_default && !at(&p, TK_FUNCTION) && !at(&p, TK_ASYNC)) xs_error(XS6009, p.tok.pos, NULL, "'export default' applies to functions only");
+        if (is_default && at(&p, TK_IDENT) && peek_is(&p, TK_SEMI)) { /* export default X;: a function or class of this module */
+            m->default_name = p.tok.str;
+            next(&p);
+            expect_semi(&p);
+            continue;
+        }
+        if (is_default && !at(&p, TK_FUNCTION) && !at(&p, TK_ASYNC) && !at(&p, TK_CLASS))
+            xs_error(XS6009, p.tok.pos, NULL, "'export default' applies to functions and classes");
         if (at(&p, TK_IMPORT) || require_ahead(&p)) { /* an import after declarations (ES hoists it): read and loaded here; names resolve in the
                                     checker, after the whole file, so declarations above may use them */
             int n0 = m->nimports;
@@ -3985,6 +4000,7 @@ static void parse_module(Program *prog, Module *m) {
             if (abstract) next(&p);
             Class *c = parse_class_ex(&p, abstract);
             c->decos = decos;
+            c->is_default = is_default;
             if (c->mixin_call) { /* (see Class.mixin_call) */
                 Decorator d = {0};
                 d.pos = c->base_pos;

@@ -512,6 +512,7 @@ struct Class {
     Pos pos;
     Module *mod;
     bool exported;
+    bool is_default;   /* export default class X, or export default X; of a class declared here */
     bool used;
     Field *fields;
     int nfields, cap_fields;
@@ -629,6 +630,7 @@ struct Module {
     int nimports;
     char **local_exports; /* export { a, b }; (no "from"): names declared here, exported by a list */
     int nlocal_exports;
+    char *default_name; /* export default X; (a function or class declared here) */
     bool loading, loaded;
     bool builtin;      /* "node:fs" and friends: functions provided by the runtime */
     bool missing;      /* xisto check: a module that could not be loaded (reported); its imported names are not reported again */
