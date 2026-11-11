@@ -36,10 +36,14 @@ typedef struct Binding {
     bool poisoned;   /* its declaration failed (already reported): a use stops checking that statement quietly */
     bool inferred_int; /* `let i = 0` taken as an int (XB-034): becomes a number by itself where a number goes */
     struct Func *arrow_fn; /* const p = (n: number, w = 2) => ...: the arrow, so p(7) fills w with its literal default */
+    Stmt *auto_var;  /* let x; (no type, no value): typed by the first assignment checked (type is ty_auto until then) */
     bool lit_number; /* `let s = 0` (or 0.5, or any number) with no type written: s += i takes an int i as Number(i), as
                         JavaScript adds it (XB-094); the type the dev never wrote does not ask for a conversion */
     struct Binding *next;
 } Binding;
+
+static Type t_auto_ = {.kind = TY_UNKNOWN};
+static Type *ty_auto = &t_auto_; /* the type of a `let x;` until its first assignment (read as an unknown before it) */
 
 typedef struct Scope {
     Binding *head;
@@ -1263,6 +1267,16 @@ static Type *resolve(Type *t, Pos pos) {
         *t = *r;
         return t;
     }
+    if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__typeofw:", 10) == 0) { /* (n = CONST): typeof CONST, int as number */
+        Type *u = xs_alloc(sizeof *u);
+        u->kind = TY_TPARAM;
+        u->tname = xs_sprintf("__typeof:%s", t->tname + 10);
+        u = resolve(u, pos);
+        if (u->kind == TY_INT || u->kind == TY_LITINT) u = ty_number;
+        if (u->kind == TY_STRING && u->tname) u = ty_string; /* (a const string's literal type: any string) */
+        *t = *u;
+        return t;
+    }
     if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__typeof:", 9) == 0) { /* typeof x */
         Binding *b = lookup(t->tname + 9);
         if (!b || !b->type) { /* a module constant not checked yet: the type its literal has (const X = ['a', 'b'] as const) */
@@ -1347,7 +1361,10 @@ static Type *resolve(Type *t, Pos pos) {
         Type **m = NULL;
         int n = 0;
         bool nul = false;
+        bool has_promise = false; /* Promise<void> | void (a callback that may be async): the promise */
+        for (int i = 0; i < t->nparams; i++) if (t->params[i]->kind == TY_PROMISE || (t->params[i]->kind == TY_OBJECT && t->params[i]->cls && t->params[i]->cls->name && !strcmp(t->params[i]->cls->name, "Promise"))) has_promise = true;
         for (int i = 0; i < t->nparams; i++) {
+            if (has_promise && t->params[i]->kind == TY_VOID) continue;
             Type *x = resolve(t->params[i], pos);
             if (x->kind == TY_NULLABLE) { nul = true; x = x->elem; }
             Type **xs = x->kind == TY_UNION ? x->params : &x;
@@ -5308,6 +5325,25 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->rhs = one;
             }
         }
+        if (e->kind == E_ASSIGN && e->op == TK_ASSIGN && e->lhs->kind == E_IDENT) { /* the first assignment of a `let x;` gives it its type */
+            Binding *b = lookup(e->lhs->str);
+            Binding *root = b;
+            while (root && root->origin) root = root->origin;
+            if (root && root->auto_var && root->type == ty_auto) {
+                check_expr(e->rhs, NULL);
+                settle(e->rhs);
+                Type *t = e->rhs->type;
+                if (t->kind == TY_LITINT) { coerce_lit(e->rhs, ty_number); t = ty_number; }
+                if (t->kind == TY_NULL) xs_error(XS2013, e->rhs->pos, "write the type: let x: Todo | null;", "cannot infer the type of '%s' from null", root->name);
+                if (t->kind == TY_VOID) xs_error(XS8102, e->rhs->pos, NULL, "cannot store a void value");
+                e->rhs->prechecked = true;
+                for (Binding *q = b; q; q = q->origin) if (q->type == ty_auto) q->type = t;
+                Stmt *st = root->auto_var;
+                st->type = t;
+                check_expr(st->init, t);
+                if (st->init->kind == E_NULL) st->init->type = t->kind == TY_NULLABLE ? t : st->init->type;
+            }
+        }
         Expr *target = e->lhs;
         bool dyn_target = false;
         if (e->kind == E_ASSIGN && ((target->kind == E_INDEX) || (target->kind == E_MEMBER && !target->is_call && target->str)) && target->lhs &&
@@ -6116,6 +6152,20 @@ static void check_expr_in(Expr *e, Type *expected) {
             Type *ot = o->type;
             if (ot->kind == TY_MAP && ot->record) {
                 e->lhs = o;
+                e->args = (ExprList){0};
+                check_expr(e, expected);
+                return;
+            }
+            if (ot->kind == TY_UNKNOWN && !ot->tname) { /* Object.keys(v) of an unknown (an object, tested by typeof): v as Record<string,
+                                                         unknown>, its fields read by name (as `as` of an unknown makes it) */
+                Expr *as = xs_alloc(sizeof *as);
+                as->kind = E_AS; as->pos = o->pos; as->field = -1; as->lhs = o;
+                Type *rec = xs_alloc(sizeof *rec);
+                *rec = *ty_map_of(ty_string, ty_unknown);
+                rec->record = true;
+                as->elem_type = rec;
+                check_expr(as, NULL);
+                e->lhs = as;
                 e->args = (ExprList){0};
                 check_expr(e, expected);
                 return;
@@ -7088,7 +7138,7 @@ static void check_expr_in(Expr *e, Type *expected) {
     case E_NULL:
         if (e->unset && expected && expected->kind != TY_NULLABLE) { /* let x: T; */
             switch (expected->kind) {
-            case TY_OBJECT: case TY_UNION: case TY_FUNC: case TY_UNKNOWN: case TY_PROMISE: case TY_ARRAY: case TY_MAP: case TY_SET: e->type = expected; return; /* (NULL until assigned) */
+            case TY_OBJECT: case TY_UNION: case TY_FUNC: case TY_UNKNOWN: case TY_PROMISE: case TY_ARRAY: case TY_MAP: case TY_SET: case TY_JSON: e->type = expected; return; /* (NULL until assigned) */
             case TY_ENUM: case TY_INT: case TY_NUMBER: e->kind = E_NUMBER; e->num = 0; e->is_int_lit = true; check_expr(e, expected); return;
             case TY_STRING: e->kind = E_STRING; e->str = ""; check_expr(e, expected); return;
             case TY_BOOLEAN: e->kind = E_BOOL; e->boolean = false; check_expr(e, expected); return;
@@ -8109,6 +8159,14 @@ static void check_var(Stmt *s, bool global) {
     if (s->decl_type) {
         s->decl_type = resolve(s->decl_type, s->pos);
         check_type_supported(s->pos, s->decl_type);
+    }
+    if (!s->decl_type && s->init && s->init->kind == E_NULL && s->init->unset) { /* let x; */
+        s->type = ty_auto;
+        Binding *b = declare(s->pos, s->name, s->type, false, global, false);
+        b->auto_var = s;
+        s->cname = b->cname;
+        s->cell = b->cell;
+        return;
     }
     check_expr(s->init, s->decl_type);
     if (!s->decl_type && pr_async_call(s->init)) pr_spawn(s->init); /* const p = f(): the promise (XB-106) */
@@ -10490,6 +10548,9 @@ static void check_class_bodies(Class *c) {
 }
 
 /* items = ['a', 'b'], seen = new Set([1]), limits = { min: 1 }: a field without a written type has its value's */
+static struct { Class *c; const char *name; } *late_fields; /* fields typed by a value that calls code (infer_field_type) */
+static int nlate_fields;
+static bool field_infer_late;
 static void infer_field_type(Class *c, Field *fd) {
     if (!fd->init) xs_error(XS3011, fd->pos, "fields need an explicit type: base: string;", "field '%s' has no type", fd->name);
     if (fd->init->kind == E_IDENT && !fd->init->type) {
@@ -10502,6 +10563,29 @@ static void infer_field_type(Class *c, Field *fd) {
             if (t) { fd->type = t; return; }
         }
         xs_error(XS3011, fd->pos, xs_sprintf("write the type: %s: T = %s;", fd->name, fd->init->str), "field '%s' has no type", fd->name);
+    }
+    if (fd->init->kind == E_ARROW && !fd->init->type && fd->init->arrow && fd->init->arrow->fn->ret) {
+        /* q = (sql: string, binds: unknown[]): Promise<R> => ...: the function type its signature writes (the body is
+           checked with the class, where `this` is known) */
+        Func *af = fd->init->arrow->fn;
+        bool typed = true;
+        for (int i = 0; i < af->nparams; i++) if (!af->params[i].type) typed = false;
+        if (typed) {
+            Type **ps = xs_alloc(sizeof(Type *) * (size_t)(af->nparams ? af->nparams : 1));
+            for (int i = 0; i < af->nparams; i++) ps[i] = af->params[i].type;
+            Type *ft = ty_func(ps, af->nparams, af->is_async && af->ret->kind != TY_PROMISE ? ty_promise_of(af->ret) : af->ret);
+            ft->rest = af->nparams && af->params[af->nparams - 1].rest;
+            fd->type = ft;
+            return;
+        }
+    }
+    if (!fd->init->type && !field_infer_late && (fd->init->kind == E_CALL || fd->init->kind == E_MEMBER || fd->init->kind == E_ARROW ||
+                                                 fd->init->kind == E_AWAIT || fd->init->kind == E_COND || fd->init->kind == E_BINARY)) {
+        /* travaHabilitada = flagLigada(...), SQL = sql('hap'): checked once every class's methods are known (late_fields) */
+        late_fields = realloc(late_fields, sizeof(*late_fields) * (size_t)(nlate_fields + 1));
+        late_fields[nlate_fields].c = c;
+        late_fields[nlate_fields++].name = fd->name;
+        return;
     }
     if (!fd->init->type) {
         Class *cc = cur_class;
@@ -10665,6 +10749,7 @@ void check_program(Program *p) {
             for (int j = 0; j < k; j++)
                 if (strcmp(fd->name, c->fields[j].name) == 0) xs_error(XS9023, fd->pos, NULL, "field '%s' is declared twice", fd->name);
             if (!fd->type) infer_field_type(c, fd);
+            if (!fd->type) { fd->cname = field_cname(fd->name); continue; } /* (typed later, late_fields) */
             Module *fmod = fd->owner && fd->owner->mod ? fd->owner->mod : c->mod; /* an inherited field: its type reads where it is written */
             if (fmod != cur_mod) enter_module(fmod);
             fd->type = resolve(fd->type, fd->pos);
@@ -10686,6 +10771,28 @@ void check_program(Program *p) {
         }
     }
     for (int i = 0; i < p->nclasses; i++) { enter_module(p->classes[i]->mod); flatten_methods(p->classes[i]); }
+    /* fields typed by a value that calls a function or a method: now that every signature is known */
+    field_infer_late = true;
+    for (int i = 0; i < nlate_fields; i++) {
+        Class *c = late_fields[i].c;
+        Field *fd = find_field(c, late_fields[i].name, NULL);
+        if (!fd || fd->type) continue;
+        enter_module(c->mod);
+        RECOVER_BEGIN
+            infer_field_type(c, fd);
+            fd->type = resolve(fd->type, fd->pos);
+            check_type_supported(fd->pos, fd->type);
+        RECOVER_END
+        if (!fd->type) fd->type = ty_unknown;
+        for (int j = 0; j < p->nclasses; j++) /* the copies its subclasses hold */
+            for (Class *b = p->classes[j]->base; b; b = b->base)
+                if (b == c) {
+                    Field *sf = find_field(p->classes[j], fd->name, NULL);
+                    if (sf && !sf->type) sf->type = fd->type;
+                    break;
+                }
+    }
+    cur_class = NULL;
 
     /* Top-level statements, module by module, dependencies first. Imported variables become
        read-only aliases in the importing module's scope. */

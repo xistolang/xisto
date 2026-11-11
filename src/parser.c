@@ -25,7 +25,23 @@ typedef struct {
     char **ns_alias;
     int *ns_import;
     int nns;
+    /* the parameters and local variables read so far in the functions around, with the type written for each (NULL:
+       none): `typeof dto.exames` in a type there is that type, not a lookup (an object type in place resolves at the
+       module's level, where dto does not exist) */
+    char **vt_names;
+    Type **vt_types;
+    int nvt;
 } Parser;
+static void vt_push(Parser *p, const char *name, Type *t) {
+    char **n = xs_alloc(sizeof(char *) * (size_t)(p->nvt + 1)); /* (new arrays: copies of the parser may hold the old ones) */
+    Type **ty = xs_alloc(sizeof(Type *) * (size_t)(p->nvt + 1));
+    if (p->nvt) { memcpy(n, p->vt_names, sizeof(char *) * (size_t)p->nvt); memcpy(ty, p->vt_types, sizeof(Type *) * (size_t)p->nvt); }
+    n[p->nvt] = (char *)name;
+    ty[p->nvt] = t;
+    p->vt_names = n;
+    p->vt_types = ty;
+    p->nvt++;
+}
 
 /* generics: the type parameters in scope while a template is parsed, or their types while an instance is */
 static int no_dyn_note; /* inside generated code: its anys are not the program's uses */
@@ -457,7 +473,17 @@ static Type *parse_type(Parser *p) {
         t = xs_alloc(sizeof *t);
         t->kind = TY_TPARAM;
         t->tname = xs_sprintf("__typeof:%s", v.str);
-        if (at(p, TK_DOT)) xs_error(XS1019, p->tok.pos, "write the type itself", "typeof takes a variable's name (typeof a.b is not supported)");
+        for (int i = p->nvt - 1; i >= 0; i--) /* a parameter or local of the function around: the type written for it */
+            if (strcmp(p->vt_names[i], v.str) == 0) { if (p->vt_types[i]) t = p->vt_types[i]; break; }
+        while (at(p, TK_DOT)) { /* typeof dto.exames: the type of that field of the variable's type */
+            next(p);
+            Token f = expect_prop_name(p, NULL);
+            Type *ix = xs_alloc(sizeof *ix);
+            ix->kind = TY_TPARAM;
+            ix->tname = xs_sprintf("__field_of:%s", f.str);
+            ix->elem = t;
+            t = ix;
+        }
         goto suffix;
     }
     if (!at(p, TK_IDENT))
@@ -587,8 +613,9 @@ static Type *parse_type(Parser *p) {
         t = ty_unknown; /* attachBlob: null (a field that is only ever null): an unknown, which null fits */
     } else if (strcmp(n, "null") == 0) {
         xs_error(XS2008, name.pos, "write the nullable type as T | null", "'null' alone is not a type");
-    } else if (strcmp(n, "undefined") == 0) {
-        xs_error(XS2009, name.pos, "xisto has no undefined; use T | null", "'undefined' is not a type");
+    } else if (strcmp(n, "undefined") == 0) { /* f(): undefined, _q?: undefined: a value that is only ever empty, an unknown
+                                                 (which null fits; the value undefined is read as null) */
+        t = ty_unknown;
     } else if (nsubst && ({ int k_ = -1; for (int i_ = 0; i_ < nsubst; i_++) if (strcmp(subst_names[i_], n) == 0) k_ = i_; k_ >= 0 ? (t = subst_types[k_], 1) : 0; })) {
         /* an instance: T is the type it was made for */
     } else if (({ bool tp_ = false; for (int i_ = 0; i_ < ntp; i_++) if (strcmp(tp_names[i_], n) == 0) tp_ = true; tp_; })) {
@@ -1279,7 +1306,13 @@ static Expr *parse_postfix(Parser *p) {
             e = ident_expr(pos, otmp[nopt]);
             nopt++;
             if (at(p, TK_LBRACKET)) continue; /* a?.[i]: the index below */
-            if (at(p, TK_LPAREN)) xs_error(XS6043, pos, "call it when it is not null: if (f !== null) f(x)", "'?.(' (calling a value that may be null) is not supported");
+            if (at(p, TK_LPAREN)) { /* f?.(x): a function that may be null, called when it is not */
+                Expr *c = new_expr(E_CALL, pos);
+                c->lhs = e;
+                parse_args(p, &c->args);
+                e = c;
+                continue;
+            }
             Token name = expect_prop_name(p, NULL);
             Expr *m = new_expr(E_MEMBER, name.pos);
             m->lhs = e;
@@ -1732,7 +1765,9 @@ static Expr *unset_value(Type *t, Pos pos) {
     case TY_ARRAY: return new_expr(E_ARRAY_LIT, pos);
     case TY_MAP: case TY_SET: if (t->record) return new_expr(E_OBJLIT, pos); e = new_expr(E_NEW_MAP, pos); e->elem_type = t; return e;
     case TY_UNKNOWN: return new_expr(E_NULL, pos); /* let x: any; / unknown: null until assigned */
-    case TY_TPARAM: if (t->tname && !strncmp(t->tname, "__ret_of_fn:", 12)) { e = new_expr(E_NULL, pos); e->unset = true; return e; } return NULL; /* let r: ReturnType<typeof f>; */
+    case TY_TPARAM: /* let r: ReturnType<typeof f>; let img: Dedo['imagem']; let x: T; (the checker picks once it is resolved) */
+    case TY_FUNC: case TY_UNION: case TY_TUPLE: case TY_ENUM: case TY_PROMISE: case TY_JSON:
+        e = new_expr(E_NULL, pos); e->unset = true; return e;
     default: return NULL;
     }
 }
@@ -1788,8 +1823,13 @@ static Stmt *parse_var(Parser *p) {
     Token name = expect(p, TK_IDENT, NULL);
     s->name = name.str;
     if (accept(p, TK_COLON)) s->decl_type = parse_type(p);
+    vt_push(p, s->name, s->decl_type);
     if (!at(p, TK_ASSIGN) && !s->is_const && s->decl_type && (s->init = unset_value(s->decl_type, p->tok.pos))) {
         /* let rows: Row[]; assigned on every path before a read (TypeScript checks it): it starts as the type's empty value */
+    } else if (!at(p, TK_ASSIGN) && !s->is_const && !s->decl_type) {
+        /* let x;: TypeScript types it by what is assigned to it; here by the first assignment the checker meets */
+        s->init = new_expr(E_NULL, p->tok.pos);
+        s->init->unset = true;
     } else {
         if (!at(p, TK_ASSIGN))
             xs_error(XS8146, p->tok.pos, "xisto has no 'undefined', so every variable starts with a value", "variable '%s' must be initialized", s->name);
@@ -1805,6 +1845,9 @@ static Stmt *parse_var(Parser *p) {
         d->name = nm.str;
         if (accept(p, TK_COLON)) d->decl_type = parse_type(p);
         if (!at(p, TK_ASSIGN) && !d->is_const && d->decl_type && (d->init = unset_value(d->decl_type, p->tok.pos))) {
+        } else if (!at(p, TK_ASSIGN) && !d->is_const && !d->decl_type) { /* let a, b; (see above) */
+            d->init = new_expr(E_NULL, p->tok.pos);
+            d->init->unset = true;
         } else {
             if (!at(p, TK_ASSIGN))
                 xs_error(XS8146, p->tok.pos, "xisto has no 'undefined', so every variable starts with a value", "variable '%s' must be initialized", d->name);
@@ -1832,12 +1875,15 @@ static Stmt *parse_block(Parser *p) {
        destructuring queued stay for the outer scope, not this body */
     StmtList outer = p->pending;
     p->pending = (StmtList){0};
+    int nalias = p->nalias, nvt = p->nvt;
     while (!at(p, TK_RBRACE)) {
         if (at(p, TK_EOF)) xs_error(XS1031, p->tok.pos, NULL, "unexpected end of file inside a block");
         stmt_list_push(&b->stmts, parse_stmt(p));
         drain_pending(p, &b->stmts, NULL, false);
     }
     p->pending = outer;
+    p->nalias = nalias; /* (the names of the types declared in it end with it) */
+    p->nvt = nvt;
     next(p);
     return b;
 }
@@ -1951,8 +1997,24 @@ static Stmt *lower_label(Pos pos, const char *label, Stmt *loop) {
     return k;
 }
 
+static void add_alias(Parser *p, const char *from, const char *to);
+static bool peek_is_ident(Parser *p);
+static Class *parse_interface(Parser *p);
+static void add_class(Program *prog, Class *c);
 static Stmt *parse_stmt(Parser *p) {
     Pos pos = p->tok.pos;
+    if ((at_ident(p, "interface") || at_ident(p, "type")) && peek_is_ident(p) && p->mod) {
+        /* type X = ... / interface X { ... } inside a function: a type of the module under a name of its own, which X
+           reads as until the end of the block */
+        Parser look = *p;
+        next(&look);
+        static int nlocal_types;
+        add_alias(p, look.tok.str, xs_sprintf("%s__t%d", look.tok.str, ++nlocal_types));
+        Class *c = parse_interface(p);
+        c->mod = p->mod;
+        add_class(p->prog, c);
+        return new_stmt(S_BLOCK, pos);
+    }
     if (!p->in_gen && at_ident(p, "yield") && !peek_is(p, TK_ASSIGN) && !peek_is(p, TK_LPAREN) && !peek_is(p, TK_DOT) && !peek_is(p, TK_SEMI))
         xs_error(XS8070, pos, "make it a generator: function* name(): Generator<T> { ... }", "'yield' is used inside a generator");
     if (p->in_gen && at_ident(p, "yield")) { /* yield v;  yield* other;  (statements, in a generator) */
@@ -2345,6 +2407,15 @@ static bool default_literal_type(Parser *p, Param *prm) {
     if (at(&look, TK_NUMBER)) { prm->type = ty_number; prm->type_src = "number"; }
     else if (!neg && (at(&look, TK_STRING) || at(&look, TK_TEMPLATE))) { prm->type = ty_string; prm->type_src = "string"; }
     else if (!neg && (at(&look, TK_TRUE) || at(&look, TK_FALSE))) { prm->type = ty_boolean; prm->type_src = "boolean"; }
+    else if (!neg && at(&look, TK_IDENT) && (peek_is(&look, TK_COMMA) || peek_is(&look, TK_RPAREN))) {
+        /* (timeoutMs = FETCH_TIMEOUT_MS): the type of that constant (an integer one widened to number, as TypeScript
+           types the parameter) */
+        Type *t = xs_alloc(sizeof *t);
+        t->kind = TY_TPARAM;
+        t->tname = xs_sprintf("__typeofw:%s", look.tok.str);
+        prm->type = t;
+        prm->type_src = "number";
+    }
     else if (!neg && at(&look, TK_NEW)) { /* (agora = new Date()): the class it makes */
         next(&look);
         if (!at(&look, TK_IDENT)) return false;
@@ -2415,6 +2486,7 @@ static void parse_params_ex(Parser *p, Func *f, bool is_ctor) {
         if (!prm.dflt && f->nparams > 0 && f->params[f->nparams - 1].dflt)
             xs_error(XS9029, name.pos, "give it a default too, or move it before the optional ones", "parameter '%s' follows an optional parameter", name.str);
         f->params[f->nparams++] = prm;
+        vt_push(p, prm.name, prm.type);
         if (!accept(p, TK_COMMA)) break;
     }
     expect(p, TK_RPAREN, NULL);
@@ -2930,6 +3002,10 @@ static void parse_fields_body(Parser *p, Class *c) {
                 else if (at(&look, TK_LBRACKET) || at(&look, TK_LBRACE) || at(&look, TK_MINUS) || at(&look, TK_SLASH)
                          || (at(&look, TK_IDENT) && (peek_is(&look, TK_SEMI) || peek_is(&look, TK_RBRACE)))) {
                     /* items = ['a'], limits = { min: 1 }, re = /x/: typed by the value, which the checker checks first */
+                    fd.type = NULL; fd.type_src = NULL; inferred = true;
+                } else if (!c->is_interface) {
+                    /* travaHabilitada = flagLigada(env), q = (sql: string): R => ...: typed by the value too (the checker
+                       checks it in the class, before the methods that read the field) */
                     fd.type = NULL; fd.type_src = NULL; inferred = true;
                 }
             }
@@ -3776,10 +3852,14 @@ static const char *export_orig(Module *m, const char *name, Module **via, int de
     return name;
 }
 static void add_alias(Parser *p, const char *from, const char *to) {
-    p->alias_from = realloc(p->alias_from, sizeof(char *) * (size_t)(p->nalias + 1));
-    p->alias_to = realloc(p->alias_to, sizeof(char *) * (size_t)(p->nalias + 1));
-    p->alias_from[p->nalias] = (char *)from;
-    p->alias_to[p->nalias++] = (char *)to;
+    /* (new arrays: a copy of the parser, a generic's saved state, may hold the old ones) */
+    char **f = xs_alloc(sizeof(char *) * (size_t)(p->nalias + 1)), **t = xs_alloc(sizeof(char *) * (size_t)(p->nalias + 1));
+    if (p->nalias) { memcpy(f, p->alias_from, sizeof(char *) * (size_t)p->nalias); memcpy(t, p->alias_to, sizeof(char *) * (size_t)p->nalias); }
+    f[p->nalias] = (char *)from;
+    t[p->nalias] = (char *)to;
+    p->alias_from = f;
+    p->alias_to = t;
+    p->nalias++;
 }
 static bool declares_top(Parser *p, const char *name);
 /* after the imports from i0 on are loaded: a name their module exports under another name (export { a as b },
