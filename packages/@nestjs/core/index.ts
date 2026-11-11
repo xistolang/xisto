@@ -12,6 +12,7 @@ import {
   __catches,
   __classes,
   __controllers,
+  VERSION_NEUTRAL,
   __custom,
   __global,
   __guards,
@@ -980,12 +981,17 @@ export class NestApplication {
         for (const s of settingsOf(c, rd.method, "code")) {
           status = s.code;
         }
-        let version = this.defaultVersion;
+        // the route's versions: the method's own, else the controller's, else the default (one route per version)
+        const mine_v: string[] = [];
+        const cls_v: string[] = [];
         for (const s of settingsOf(c, rd.method, "version")) {
-          if (s.method === rd.method || version === this.defaultVersion) {
-            version = s.text;
+          if (s.method === rd.method) {
+            mine_v.push(s.text);
+          } else {
+            cls_v.push(s.text);
           }
         }
+        const versions: string[] = mine_v.length > 0 ? mine_v : cls_v.length > 0 ? cls_v : [this.defaultVersion];
         const headers: string[] = [];
         for (const s of settingsOf(c, rd.method, "header")) {
           headers.push(s.text);
@@ -1004,7 +1010,8 @@ export class NestApplication {
           fis.push(filterInstances[i]);
           finfo.push(filterInfos[i]);
         }
-        const v = this.versioning && version.length > 0 ? this.versionPrefix + version : "";
+        for (const version of versions) {
+        const v = this.versioning && version.length > 0 && version !== VERSION_NEUTRAL ? this.versionPrefix + version : "";
         const r: Route = {
           verb: rd.verb,
           path: joinPath([this.prefix, v, base, rd.path]),
@@ -1034,6 +1041,7 @@ export class NestApplication {
           server.put(r.path, h);
         } else {
           server.delete(r.path, h);
+        }
         }
       }
     }
