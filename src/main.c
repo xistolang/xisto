@@ -1105,6 +1105,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--profile") == 0) xs_profile = true;
         else if (strcmp(argv[i], "--time") == 0) show_time = true;
         else if (strcmp(argv[i], "--no-warnings") == 0) xs_warnings = false;
+        else if (strcmp(argv[i], "--split-init") == 0) setenv("XISTO_MOD_INIT_MIN", "0", 1); /* each imported module's top level in its own C function, however small the program (XB-176) */
         else if (strcmp(argv[i], "--warnings") == 0) xs_show_warnings = true;
         else if (strcmp(argv[i], "--deny-warnings") == 0) xs_deny_warnings = true;
         else if (strncmp(argv[i], "--cpu=", 6) == 0) xs_cpu = argv[i] + 6;
