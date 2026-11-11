@@ -495,6 +495,7 @@ static bool check_fs_fd_call(Expr *e, Func *f) {
 static bool is_f64(Type *t) { return t && t->kind == TY_OBJECT && t->cls->builtin && strcmp(t->cls->name, "Float64Array") == 0; }
 static bool is_sab(Type *t) { return t && t->kind == TY_OBJECT && t->cls->builtin && strcmp(t->cls->name, "SharedArrayBuffer") == 0; }
 static Expr *str_lit(Pos pos, const char *s);
+static bool boolish(Expr *r);
 static Expr *null_str(Pos pos) { /* a missing optional string argument: NULL in C */
     Expr *n = xs_alloc(sizeof *n);
     n->kind = E_NULL; n->pos = pos; n->field = -1; n->type = ty_nullable_of(ty_string);
@@ -4500,7 +4501,11 @@ static bool objlit_hoist_spreads(Expr *e, Type *expected) {
         if (strcmp(e->keys[i], "...") == 0 && !pure_copy(e->args.items[i]->lhs) &&
             !(e->args.items[i]->lhs->kind == E_COND && !e->args.items[i]->lhs->builtin.cfn)) n++;
     if (!n) return false;
-    for (int i = 0; i < e->args.len; i++) if (has_await(e->args.items[i])) return false; /* (an await cannot move into an arrow) */
+    for (int i = 0; i < e->args.len; i++) { /* (an await cannot move into an arrow; a hoisted spread's value is the call's argument, outside) */
+        Expr *a = e->args.items[i];
+        bool hoisted = strcmp(e->keys[i], "...") == 0 && !pure_copy(a->lhs) && !(a->lhs->kind == E_COND && !a->lhs->builtin.cfn);
+        if (!hoisted && has_await(a)) return false;
+    }
     static int nsp;
     Expr *inner = xs_alloc(sizeof *inner);
     *inner = *e;
@@ -5045,6 +5050,9 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
+        if (e->op == TK_OR && e->lhs->type->kind != TY_BOOLEAN && !is_numeric(e->lhs->type) && e->lhs->type->kind != TY_STRING &&
+            truthy_type(e->lhs->type) && rereadable(e->lhs) && boolish(e->rhs))
+            make_truthy(e->lhs, "left operand of '||'"); /* err || !Array.isArray(v): a test (err !== null), not a default */
         if (e->op == TK_AND) { /* x !== null && x.f : the right side sees x narrowed */
             if (e->lhs->type->kind != TY_BOOLEAN && truthy_type(e->lhs->type) && rereadable(e->lhs))
                 make_truthy(e->lhs, "left operand of '&&'"); /* raw && raw.f: becomes raw !== null && ..., which narrows */
@@ -7306,6 +7314,11 @@ static void check_expr_in(Expr *e, Type *expected) {
             return;
         }
         Type *want = resolve(e->elem_type, e->pos);
+        { /* x as Record<string, unknown> (of an unknown, at run time): an object of a class is read through its field
+             table, which the program then needs (xs_as_record) */
+            Type *w = ty_strip_null(want);
+            if (w->kind == TY_MAP && w->record && w->key->kind == TY_STRING && w->elem->kind == TY_UNKNOWN) xs_any_used = true;
+        }
         { /* undefined as unknown as T / null as unknown as T: a placeholder assigned before it is read (TypeScript
              trusts it): the reference type's null */
             Expr *n = e->lhs;
@@ -7922,6 +7935,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     e->args.len = 1;
                 }
                 if (e->args.len > 1) xs_error(XS7069, e->pos, NULL, "new Error() takes a message and an options object ({ cause })");
+                if (e->args.len == 0) expr_list_push(&e->args, str_lit(e->pos, "")); /* new Error(): message "" */
                 if (e->args.len == 1) { check_expr(e->args.items[0], ty_string); expect_type(e->args.items[0], ty_string, "the Error message"); }
                 if (cause) {
                     check_expr(cause, ty_unknown);
@@ -7941,7 +7955,10 @@ static void check_expr_in(Expr *e, Type *expected) {
             return;
         }
         if (c->is_interface) xs_error(XS9005, e->pos, xs_sprintf("write an object literal: const x: %s = { ... };", c->name), "'%s' is an interface; it has no constructor", c->name);
-        if (c->data_only) xs_error(XS8009, e->pos, "give its fields initializers (or a constructor that sets them) to build it with new", "%s has fields without a value: it is filled from JSON, not constructed", c->name);
+        bool all_definite = c->data_only && c->nmethods > 0; /* client!: Redis; set later (by init(), a framework hook): new is allowed */
+        for (int k = 0; k < c->nfields && all_definite; k++)
+            if (!c->fields[k].init && !c->fields[k].optional && !c->fields[k].definite) all_definite = false;
+        if (c->data_only && !all_definite) xs_error(XS8009, e->pos, "give its fields initializers (or a constructor that sets them) to build it with new", "%s has fields without a value: it is filled from JSON, not constructed", c->name);
         if (c->is_abstract) xs_error(XS8017, e->pos, "make an instance of a class that extends it", "%s is abstract", c->name);
         if (eff_ctor(c)) {
             check_args(e, eff_ctor(c), xs_sprintf("the constructor of %s", c->name));
@@ -8394,6 +8411,18 @@ static bool pure_read(Expr *e) {
     }
 }
 static Expr *expr_copy(Expr *e) { Expr *c = xs_alloc(sizeof *c); *c = *e; return c; }
+/* an expression whose value is a boolean by its form (!x, a === b, x instanceof C, a && b): not a default value */
+static bool boolish(Expr *r) {
+    if (!r) return false;
+    if (r->kind == E_BOOL) return true;
+    if (r->kind == E_UNARY && r->op == TK_NOT) return true;
+    if (r->kind == E_BINARY) {
+        TokKind o = r->op;
+        if (o == TK_EQ || o == TK_NEQ || o == TK_LT || o == TK_LE || o == TK_GT || o == TK_GE || o == TK_IDENT || o == TK_IN) return true;
+        if (o == TK_AND || o == TK_OR) return boolish(r->lhs) && boolish(r->rhs);
+    }
+    return false;
+}
 static Expr *str_truthy_call(Expr *v) {
     Expr *c = xs_alloc(sizeof *c);
     c->kind = E_CALL;
@@ -8906,6 +8935,7 @@ static UNarrow union_narrow(Expr *c) {
         /* (and any union or unknown narrowed by the left side: !Array.isArray(v) || v.length !== 1 || ...: v an array
            after the whole condition is false) */
         UNarrow a = union_narrow(c->lhs);
+        if (!a.b) a = union_narrow(c->rhs); /* err || !Array.isArray(v): v an array once the whole is false, too */
         if (!a.b) return r;
         r.b = a.b;
         if (c->op == TK_AND) r.then_t = a.then_t;

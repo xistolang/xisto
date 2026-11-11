@@ -2991,6 +2991,28 @@ XS_NOINLINE void *xs_as_record(void *v, int nullable, const char *what) {
     }
     return xs_ar_(m);
 }
+/* x as number[] (int[], boolean[]) from an unknown: an array of that kind is itself; an array of unknowns (JSON.parse,
+   an any) is copied with each element checked. Borrowed, as a cast's value is (the copy lives until the arena drains). */
+XS_NOINLINE void *xs_as_arr_prim(void *v, int kind, int nullable, const char *what) {
+    if (!v) { if (nullable) return NULL; xs_as_fail(what); }
+    void (*f)(void *) = xs_type_of(v)->free;
+    if ((kind == 0 && f == xs_arr_num_free) || (kind == 1 && f == xs_arr_int_free) || (kind == 2 && f == xs_arr_bool_free)) return v;
+    if (f != xs_arr_ref_free) xs_as_fail(what);
+    xs_arr_ref *a = v;
+    if (kind == 0) {
+        xs_arr_num *r = xs_arr_num_new(0, 0);
+        for (size_t i = 0; i < a->len; i++) xs_arr_num_push(r, xs_as_num(a->data[i]));
+        return xs_ar_(r);
+    }
+    if (kind == 1) {
+        xs_arr_int *r = xs_arr_int_new(0, 0);
+        for (size_t i = 0; i < a->len; i++) xs_arr_int_push(r, xs_dyn_as_int(a->data[i]));
+        return xs_ar_(r);
+    }
+    xs_arr_bool *r = xs_arr_bool_new(0, false);
+    for (size_t i = 0; i < a->len; i++) xs_arr_bool_push(r, xs_as_bool(a->data[i]));
+    return xs_ar_(r);
+}
 XS_NOINLINE void xs_dyn_set_any(void *o, void *k, void *v) {
     if (k && xs_type_of(k)->free == xs_str_free) { xs_dyn_set(o, k, v); return; }
     int64_t i = xs_dyn_as_int(k);
