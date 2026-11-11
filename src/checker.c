@@ -7156,6 +7156,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (is_subclass(w->cls, g->cls)) { e->type = want; e->elem_type = want; e->op = TK_CLASS; return; } /* op marks a downcast */
             }
         }
+        if (iface_adapt(v, want, "the value of 'as'")) { *e = *v; return; } /* c as I: I's shape (XB-126) */
         { /* (dto as { nuTitular?: number }).nuTitular: TypeScript reads the same object through another shape; here a
              copy of it in that shape (through its JSON: the fields both have), read-only in effect */
             Type *w = want->kind == TY_NULLABLE ? want->elem : want;
