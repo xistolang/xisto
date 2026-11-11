@@ -29,6 +29,13 @@ static bool rcnt(Type *t) {
 }
 /* T | null of a primitive holds a sentinel (runtime: XS_NULL_INT, XS_NULL_BOOL, xs_null_num) */
 static bool null_prim(Type *t) { return t->kind == TY_NULLABLE && !cref(t->elem); }
+static bool type_has_tparam(Type *t) {
+    if (!t) return false;
+    if (t->kind == TY_TPARAM) return true;
+    if (type_has_tparam(t->elem) || type_has_tparam(t->key) || (t->kind == TY_FUNC && type_has_tparam(t->ret))) return true;
+    for (int i = 0; i < t->nparams; i++) if (type_has_tparam(t->params[i])) return true;
+    return false;
+}
 static const char *null_value(Type *t) {
     if (!null_prim(t)) return "NULL";
     switch (t->elem->kind) {
@@ -9516,6 +9523,13 @@ void emit_program(Program *p, Buf *o) {
     lit_used = xs_alloc(sizeof(bool) * (size_t)(p->nlits ? p->nlits : 1));
     size_t lits_at = out->len; /* declarations are inserted here once the body says which literals it uses */
 
+    /* an inline type written in a generic's own text ({ data: T | null } in a template's constructor): each instance
+       has its copy with T bound; the template's copy is never made and has no C type for T */
+    for (int i = 0; i < p->nclasses; i++) {
+        Class *c = p->classes[i];
+        if (!c->used || c->builtin || !c->name || strncmp(c->name, "__Obj_", 6) != 0) continue;
+        for (int k = 0; k < c->nfields; k++) if (type_has_tparam(c->fields[k].type)) { c->used = false; break; }
+    }
     /* native (declared) classes: their struct, free and print come from the package's C */
     for (int i = 0; i < p->nclasses; i++) if (p->classes[i]->used && !p->classes[i]->builtin) buf_printf(out, "typedef struct %s %s;\n", p->classes[i]->cname, p->classes[i]->cname);
     for (int i = 0; i < p->nclasses; i++) {
