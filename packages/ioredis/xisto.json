@@ -1,0 +1,8 @@
+{
+  "name": "ioredis",
+  "version": "0.1.0",
+  "license": "MIT",
+  "implements": { "ioredis": "^5" },
+  "main": "index.ts",
+  "dependencies": { "redis": "0.1.0" }
+}

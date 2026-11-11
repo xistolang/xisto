@@ -206,8 +206,14 @@ if sh tests/pkg/run.sh > "$OUT/pkg.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg.txt
 if sh examples/nest-features/test/run.sh > "$OUT/nest-features.txt" 2>&1 && grep -q '^ok: nest-features' "$OUT/nest-features.txt"; then pass=$((pass+1)); else echo "FAIL nest-features:"; cat "$OUT/nest-features.txt"; fail=$((fail+1)); fi
 if sh examples/nest-auth/test/run.sh > "$OUT/nest-auth.txt" 2>&1 && grep -q '^ok: nest-auth' "$OUT/nest-auth.txt"; then pass=$((pass+1)); else echo "FAIL nest-auth:"; cat "$OUT/nest-auth.txt"; fail=$((fail+1)); fi
 
+# package subpaths (deep imports such as rxjs/operators), against the output of the real packages on Node
+if sh tests/subpaths/run.sh > "$OUT/subpaths.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/subpaths.txt"; else echo "FAIL subpaths:"; cat "$OUT/subpaths.txt"; fail=$((fail+1)); fi
 # redis package against a live server (skipped without one)
 if sh tests/redis/run.sh > "$OUT/redis.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/redis.txt"; else echo "FAIL redis:"; cat "$OUT/redis.txt"; fail=$((fail+1)); fi
+# jose package: RS256 tokens byte for byte as Node's jose, claim errors, a generated key checked by OpenSSL
+if sh tests/jose/run.sh > "$OUT/jose.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/jose.txt"; else echo "FAIL jose:"; cat "$OUT/jose.txt"; fail=$((fail+1)); fi
+# ioredis package against a live server (skipped without one)
+if sh tests/ioredis/run.sh > "$OUT/ioredis.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/ioredis.txt"; else echo "FAIL ioredis:"; cat "$OUT/ioredis.txt"; fail=$((fail+1)); fi
 # exceljs package: streaming XLSX (ZIP + deflate), checked as XML, by LibreOffice when installed, constant memory
 if sh tests/exceljs/run.sh > "$OUT/exceljs.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/exceljs.txt"; else echo "FAIL exceljs:"; cat "$OUT/exceljs.txt"; fail=$((fail+1)); fi
 # @elastic/elasticsearch package against a fake cluster (Node)

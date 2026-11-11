@@ -4295,6 +4295,21 @@ static void parse_reexport(Parser *p, Module *m, Program *prog, bool load_now) {
 
 /* export { a, b };: the listed declarations of this module are exported */
 static void apply_local_exports(Program *prog, Module *m, int top_start) {
+    if (m->default_name) { /* export default X; */
+        bool found = false;
+        for (int i = 0; i < prog->nfuncs; i++)
+            if (prog->funcs[i]->mod == m && strcmp(prog->funcs[i]->name, m->default_name) == 0) { prog->funcs[i]->exported = prog->funcs[i]->is_default = true; found = true; }
+        for (int i = 0; i < prog->nclasses; i++)
+            if (prog->classes[i]->mod == m && strcmp(prog->classes[i]->name, m->default_name) == 0) { prog->classes[i]->exported = prog->classes[i]->is_default = true; found = true; }
+        for (int i = top_start; i < prog->top.len && !found; i++) { /* export default <expression> / a const: the module's variable */
+            Stmt *st = prog->top.items[i];
+            if (st->mod == m && st->kind == S_VAR && st->name && strcmp(st->name, m->default_name) == 0) { st->exported = true; found = true; }
+        }
+        for (int i = 0; i < m->nimports && !found; i++) /* (an imported name: exported from where it came, see below) */
+            for (int q = 0; q < m->imports[i].n && !found; q++) found = strcmp(m->imports[i].names[q], m->default_name) == 0;
+        for (int i = 0; i < xs_nfailed_decls && !found; i++) found = strcmp(xs_failed_decls[i], m->default_name) == 0; /* (reported there) */
+        if (!found) xs_error(XS6009, (Pos){1, 1}, "export default names a function or class declared in the same file", "'export default %s': no function or class '%s' here", m->default_name, m->default_name);
+    }
     for (int k = 0; k < m->nlocal_exports; k++) {
         const char *n = m->local_exports[k];
         /* export { A } / export type { A } of an imported name: re-exported from where it came */
@@ -4492,6 +4507,7 @@ static void parse_module(Program *prog, Module *m) {
             if (abstract) next(&p);
             Class *c = parse_class_ex(&p, abstract);
             c->decos = decos;
+            c->is_default = is_default;
             if (c->mixin_call) { /* (see Class.mixin_call) */
                 Decorator d = {0};
                 d.pos = c->base_pos;
@@ -4986,6 +5002,16 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->loading = false;
         return m;
     }
+    if (strcmp(name, "fs/promises") == 0) { /* Node's fs/promises for text files, written in xisto: runtime/node/fs_promises.ts */
+        extern const unsigned char xs_node_fs_promises_ts[];
+        m->builtin = false;
+        m->file = "xisto:fs/promises";
+        m->src = (char *)xs_node_fs_promises_ts;
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
     if (strcmp(name, "perf_hooks") == 0) return m; /* performance is built in (performance.now()) */
     if (strcmp(name, "worker_threads") == 0 || strcmp(name, "os") == 0) { /* written in xisto over runtime functions */
         bool wt = strcmp(name, "worker_threads") == 0;
@@ -5006,7 +5032,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         add_func(prog, f);
         return m;
     }
-    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
     return NULL;
 }
 
@@ -5027,7 +5053,19 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
     } else if (alias) {
         snprintf(path, sizeof path, "%s", alias);
     } else if (from_file) {
-        /* a package: <project>/.xisto/pkgs/<name>/, entry from its xisto.json "main", else index.ts or src/index.ts */
+        /* a package: <project>/.xisto/pkgs/<name>/, entry from its xisto.json "main", else index.ts or src/index.ts.
+           A deep import ("rxjs/operators", "@scope/pkg/sub/file") is the file <package>/<sub>(.ts, or its index.ts),
+           as Node resolves a subpath of a package without "exports" */
+        const char *full = file;
+        const char *sub = NULL;
+        {
+            const char *slash = strchr(file, '/');
+            if (slash && file[0] == '@') slash = strchr(slash + 1, '/');
+            if (slash && slash[1]) {
+                sub = slash + 1;
+                file = xs_strndup(file, (size_t)(slash - file));
+            }
+        }
         char dir[PATH_MAX];
         strncpy(dir, from_file, sizeof dir - 1);
         dir[sizeof dir - 1] = 0;
@@ -5062,10 +5100,17 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
             }
         }
         if (!found && has_project) xs_error(XS5005, from_pos, xs_sprintf("install it: xisto add <git url or path> --name %s", file), "package '%s' is not installed", file);
-        if (!found) xs_error(XS5003, from_pos, xs_sprintf("import files with a relative path (\"./file\"), or add the package: xisto add <git url> --name %s", file), "cannot resolve '%s'", file);
+        if (!found) xs_error(XS5003, from_pos, xs_sprintf("import files with a relative path (\"./file\"), or add the package: xisto add <git url> --name %s", file), "cannot resolve '%s'", full);
         char *entry = NULL;
         char *meta = xs_read_file(xs_sprintf("%s/xisto.json", found));
-        if (meta) {
+        if (sub) {
+            char *probe = xs_sprintf("%s/%s", found, sub);
+            struct stat sst;
+            if (access(xs_sprintf("%s.ts", probe), R_OK) != 0 && !(stat(probe, &sst) == 0 && S_ISDIR(sst.st_mode)) && access(probe, R_OK) != 0)
+                xs_error(XS5003, from_pos, xs_sprintf("the package '%s' has no file '%s' (a subpath is a file of the package: %s.ts or %s/index.ts)", file, sub, sub, sub),
+                         "cannot resolve '%s'", full);
+            entry = probe;
+        } else if (meta) {
             char *m = strstr(meta, "\"main\"");
             if (m && (m = strchr(m + 6, '"'))) {
                 char *e = strchr(m + 1, '"');
