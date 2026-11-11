@@ -659,6 +659,11 @@ static XS_TLS int64_t xs_allocs; /* total allocations */
 #define XS_OBJ_STEP ((size_t)1 << XS_OBJ_SHIFT)
 #define XS_SMALL_CLASSES ((256 >> XS_OBJ_SHIFT) - 1)
 #define XS_SMALL_MAX (XS_SMALL_CLASSES << XS_OBJ_SHIFT)
+#ifdef XS_HEAP_CHECK /* every object from malloc: a guarded malloc (DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib) sees each one */
+#define XS_SMALL_LIMIT 0
+#else
+#define XS_SMALL_LIMIT XS_SMALL_MAX
+#endif
 typedef struct xs_free_blk { struct xs_free_blk *next; } xs_free_blk;
 static XS_TLS xs_free_blk *xs_small[XS_SMALL_CLASSES + 1];
 static XS_TLS int xs_small_n[XS_SMALL_CLASSES + 1];
@@ -702,7 +707,7 @@ static void xs_gc_step(void);
 static inline __attribute__((always_inline)) void *xs_obj_alloc_tz(size_t size, const xs_type *type, bool zero) {
     if (__builtin_expect(xs_gc_due, 0)) xs_gc_step();
     xs_hdr *h;
-    int k = size <= XS_SMALL_MAX ? (int)((size + XS_OBJ_STEP - 1) >> XS_OBJ_SHIFT) : 0;
+    int k = size <= XS_SMALL_LIMIT ? (int)((size + XS_OBJ_STEP - 1) >> XS_OBJ_SHIFT) : 0;
     if (k && xs_small[k]) {
         h = (xs_hdr *)xs_small[k];
         xs_small[k] = xs_small[k]->next;
@@ -734,7 +739,7 @@ static inline __attribute__((always_inline)) void *xs_obj_on_stack(void *mem, si
 /* the same without clearing: for objects whose every byte is written next (string data) */
 static inline __attribute__((always_inline)) void *xs_obj_alloc_raw(size_t size, const xs_type *type) {
     xs_hdr *h;
-    int k = size <= XS_SMALL_MAX ? (int)((size + XS_OBJ_STEP - 1) >> XS_OBJ_SHIFT) : 0;
+    int k = size <= XS_SMALL_LIMIT ? (int)((size + XS_OBJ_STEP - 1) >> XS_OBJ_SHIFT) : 0;
     if (k && xs_small[k]) {
         h = (xs_hdr *)xs_small[k];
         xs_small[k] = xs_small[k]->next;
@@ -768,7 +773,21 @@ static inline __attribute__((always_inline)) void xs_obj_free(void *p) {
     xs_obj_free_block(p, k);
 }
 /* a block back where it came from (k: its size class) */
+/* -DXS_HEAP_CHECK (debugging the runtime or a package's C, never in a normal build): a freed block is marked and
+   kept out of reuse, and the first retain or release of it stops the program with the xisto stack, where the
+   bad reference is (a use after free otherwise shows up later, as a broken free list in another allocation) */
+#define XS_FREED_RC ((int32_t)-0x5EADBEEF)
+/* (a trap, not xs_panic: it stops inside the function with the bad reference, where a debugger shows it, and keeps
+   retain/release free of failing calls for tools/noinline-scan.py) */
+#define XS_HEAP_TRAP(what) (fprintf(stderr, "xisto heap check: %s\n", what), __builtin_trap())
 static inline __attribute__((always_inline)) void xs_obj_free_block(void *p, uint32_t k) {
+#ifdef XS_HEAP_CHECK
+    if (((xs_hdr *)p)->rc == XS_FREED_RC) XS_HEAP_TRAP("an object freed twice");
+    ((xs_hdr *)p)->rc = XS_FREED_RC;
+    (void)k;
+    if (getenv("XISTO_HEAP_CHECK_FREE")) free(p); /* (with guard malloc: the freed page faults at the bad access) */
+    return;
+#endif
     k &= XS_CLS_MASK;
     if (k) { /* from a slab: back on its class's list */
         xs_free_blk *b = p;
@@ -781,6 +800,9 @@ static inline __attribute__((always_inline)) void xs_obj_free_block(void *p, uin
 }
 
 static inline void *xs_retain_(void *p) {
+#ifdef XS_HEAP_CHECK
+    if (p && ((xs_hdr *)p)->rc == XS_FREED_RC) XS_HEAP_TRAP("retain of an object that was freed");
+#endif
     if (p) ((xs_hdr *)p)->rc++;
     return p;
 }
@@ -789,14 +811,22 @@ static void xs_gc_suspect(void *p);
 static inline void xs_release_(void *p) {
     if (!p) return;
     xs_hdr *h = p;
+#ifdef XS_HEAP_CHECK
+    if (h->rc == XS_FREED_RC) XS_HEAP_TRAP("release of an object that was freed");
+#endif
     if (--h->rc == 0) xs_type_of(h)->free(p);
     else if (__builtin_expect((h->cls & (XS_CYC | XS_BUF)) == XS_CYC, 0)) xs_gc_suspect(p); /* may now hang on a cycle only */
 }
 
 /* a release whose type the compiler knows (a field of a class without subclasses): the free function is
    called directly, not through the type, so freeing a tree is a direct recursion the C compiler can work on */
+#ifdef XS_HEAP_CHECK
+#define XS_HEAP_CHECK_REL(h_) if ((h_)->rc == XS_FREED_RC) XS_HEAP_TRAP("release of an object that was freed");
+#else
+#define XS_HEAP_CHECK_REL(h_)
+#endif
 #define xs_release_as(x, free_fn) do { xs_hdr *h_ = (xs_hdr *)(x); \
-    if (h_) { if (--h_->rc == 0) free_fn(h_); \
+    if (h_) { XS_HEAP_CHECK_REL(h_) if (--h_->rc == 0) free_fn(h_); \
               else if (__builtin_expect((h_->cls & (XS_CYC | XS_BUF)) == XS_CYC, 0)) xs_gc_suspect(h_); } } while (0)
 /* the argument appears once in the expansion: a chain of calls nests these macros, and a copy for __typeof__ doubled
    the text at every level (a 20-call query builder chain became ~1M copies and took clang past 10 GB, 11/11) */
