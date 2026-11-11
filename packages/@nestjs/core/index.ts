@@ -28,6 +28,7 @@ import {
   bodyField,
   CallHandler,
   ClassProvider,
+  CorsOptions,
   DynamicModule,
   ExecutionContext,
   ExistingProvider,
@@ -52,15 +53,9 @@ import { FileInterceptorSpec, readUpload, UploadedFileData, uploadField } from "
 
 export { FileInterceptorSpec, UploadedFileData } from "./upload";
 export { Reflector } from "@nestjs/common"; // (Nest exports it from @nestjs/core)
+export { CorsOptions } from "@nestjs/common";
 
 /** Options of NestFactory.create. */
-/** app.enableCors(options): what Nest takes (origin list, methods, credentials, headers) */
-export interface CorsOptions {
-  origin?: string[];
-  methods?: string[];
-  credentials?: boolean;
-  allowedHeaders?: string[];
-}
 /** app.enableShutdownHooks(signals, { useProcessExit }) */
 export interface ShutdownHooksOptions {
   useProcessExit?: boolean;

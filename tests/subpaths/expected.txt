@@ -1,0 +1,3 @@
+21 tap 21, tap without the value, finalize
+2
+{"origin":["https://a.example","https://b.example"],"methods":["GET","POST"],"credentials":true,"allowedHeaders":["Content-Type","Authorization"],"maxAge":600}

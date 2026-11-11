@@ -410,6 +410,25 @@ export class FactoryProvider {
   useFactory: (...args: any[]) => unknown;
   inject?: unknown[];
 }
+/**
+ * A class as a value (Nest's Type<T>, "a constructor of T"): in xisto a class named as a value is its ClassInfo.
+ * @example const providers: Type<unknown>[] = [UsersService];
+ */
+export type Type<T = unknown> = ClassInfo;
+
+/**
+ * app.enableCors(options) (Nest: interfaces/external/cors-options.interface, re-exported by @nestjs/common).
+ * @example app.enableCors({ origin: ["https://a.example"], credentials: true, maxAge: 600 })
+ */
+export interface CorsOptions {
+  origin?: string[];
+  methods?: string[];
+  credentials?: boolean;
+  allowedHeaders?: string[];
+  exposedHeaders?: string[];
+  maxAge?: number;
+}
+
 /** A provider: a class, or an object naming its token. */
 export type Provider = ClassInfo | ValueProvider | ClassProvider | ExistingProvider | FactoryProvider;
 
