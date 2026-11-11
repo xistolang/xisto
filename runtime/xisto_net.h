@@ -633,6 +633,29 @@ static void xs_coro_flush_dead(void) {
     }
 }
 
+/* a parked task's stack bytes, copied out and back: under AddressSanitizer the copy carries the stack's poisoned
+   redzones, which an instrumented memcpy reports; this copy is not instrumented (a normal build uses memcpy) */
+#ifdef XS_ASAN
+#include <sanitizer/asan_interface.h>
+__attribute__((no_sanitize("address"))) static void xs_stack_copy(void *dst, const void *src, size_t n) {
+    volatile char *d = dst;
+    const volatile char *s = src;
+    for (size_t i = 0; i < n; i++) d[i] = s[i];
+    /* the shadow of a task stack put back is the last task's: clear it (the heap is what this build checks) */
+    if ((char *)dst >= xs_shstack && (char *)dst < xs_shstack + XS_SHSTACK) __asan_unpoison_memory_region(xs_shstack, XS_SHSTACK);
+}
+/* after a catch on a task's stack: the frames the longjmp skipped, below this one, lose their poison */
+__attribute__((no_sanitize("address"))) static void xs_asan_clear_below(void) {
+    char *sp = (char *)__builtin_frame_address(0);
+    xs_coro *co = xs_cur_coro;
+    if (!co) return; /* (the thread's own stack: the sanitizer's longjmp handling clears it) */
+    char *lo = co->shared ? xs_shstack : co->stack ? co->stack + XS_PAGE : NULL;
+    if (lo && sp > lo) __asan_unpoison_memory_region(lo, (size_t)(sp - lo));
+}
+__attribute__((constructor)) static void xs_asan_hook(void) { xs_asan_after_jump = xs_asan_clear_below; }
+#else
+#define xs_stack_copy memcpy
+#endif
 /* Runs or continues a coroutine until it yields or finishes. */
 static void xs_coro_resume(xs_coro *co) {
     /* park the scheduler's runtime state, install the coroutine's */
@@ -647,13 +670,16 @@ static void xs_coro_resume(xs_coro *co) {
     xs_req_t0 = co->req_t0;
     xs_main_als = xs_als_cur; xs_als_cur = co->als; co->als = NULL;
     xs_cur_coro = co;
-    if (co->shared) memcpy(co->copy_base, co->copy, co->copy_len); /* its stack back where it was */
+    if (co->shared) xs_stack_copy(co->copy_base, co->copy, co->copy_len); /* its stack back where it was */
+#ifdef XS_ASAN
+    else if (co->stack) __asan_unpoison_memory_region(co->stack + XS_PAGE, XS_CORO_STACK - XS_PAGE); /* (a reused stack keeps another run's shadow) */
+#endif
     xs_ctx_swap(&xs_sched_sp, co->sp);
     if (co->shared && !co->done) { /* parked: keep the part of the task stack it uses */
         char *lo = xs_shstack_low(co);
         size_t n = (size_t)(xs_shstack + XS_SHSTACK - lo);
         if (n > co->copy_cap) { co->copy_cap = n + 256; co->copy = realloc(co->copy, co->copy_cap); }
-        memcpy(co->copy, lo, n);
+        xs_stack_copy(co->copy, lo, n);
         co->copy_base = lo;
         co->copy_len = n;
     }
@@ -1162,6 +1188,10 @@ static bool xs_promise_stop(void *p) {
     return false;
 }
 XS_NOINLINE xs_val xs_promise_await(xs_promise *p) {
+    /* the awaiting task holds the promise while it waits, as in Node: the one who handed it over (a field, the cell of
+       a variable a reaction captures) may let it go meanwhile (a .catch that clears the cache it lived in freed it,
+       and the task woke up reading freed memory) */
+    xs_retain_(p);
     p->handled = true;
     xs_unh_drop(p);
     if (xs_cur_coro && xs_kq >= 0) {
@@ -1179,9 +1209,14 @@ XS_NOINLINE xs_val xs_promise_await(xs_promise *p) {
         if (xs_kq < 0) xs_kq = kqueue();
         xs_loop_run(xs_promise_stop, p, -1);
     }
-    if (p->state == 2) xs_throw(xs_retain_(p->err));
+    if (p->state == 2) {
+        void *e = xs_retain_(p->err);
+        xs_release_(p);
+        xs_throw(e);
+    }
     xs_val v = p->val;
     if (p->kind == 3) xs_retain_(v.p);
+    xs_release_(p);
     return v;
 }
 XS_NOINLINE double xs_promise_await_d(xs_promise *p) { return xs_promise_await(p).d; }

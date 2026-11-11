@@ -356,7 +356,17 @@ static inline void xs_try_push(jmp_buf *b) {
     xs_try_depth++;
 }
 static inline void xs_try_pop(void) { xs_try_depth--; }
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define XS_ASAN 1
+#endif
+#endif
+#ifdef XS_ASAN /* a throw is a longjmp: on a task's own stack AddressSanitizer does not clear the frames it skipped */
+static void (*xs_asan_after_jump)(void);
+static void *xs_caught(void) { if (xs_asan_after_jump) xs_asan_after_jump(); void *e = xs_thrown; xs_thrown = NULL; return e; }
+#else
 static void *xs_caught(void) { void *e = xs_thrown; xs_thrown = NULL; return e; } /* owned by the catch block */
+#endif
 
 /* ---- stack traces, free until an error happens ----
    The compiler describes every call site with an xs_site (function, file, line, column) and puts a label
