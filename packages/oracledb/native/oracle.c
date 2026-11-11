@@ -509,7 +509,9 @@ static void xs_ora_auth_two(xs_ora_conn *c, const char *user, const char *passwo
     const char *sder = xs_ora_kget(kv, "AUTH_PBKDF2_SDER_COUNT", NULL);
     if (!vfr || !skey) xs_ora_fail("oracledb: the server sent no session key (ORA-01017?)");
     if (vtype != 0x4815 || !vgen || !csalt || !sder)
-        xs_ora_fail("oracledb: the account's password verifier is 11g (0x%x); xisto supports the 12c verifier (ALTER USER ... IDENTIFIED BY ... with SQLNET.ALLOWED_LOGON_VERSION_SERVER=12)", vtype);
+        xs_ora_fail("oracledb: the account has only the %s password verifier (0x%x); xisto supports the 12c verifier, like node-oracledb thin "
+                    "(a DBA regenerates it with ALTER USER ... IDENTIFIED BY <same password> while SQLNET.ALLOWED_LOGON_VERSION_SERVER allows 12)",
+                    vtype == 0x939 ? "10g" : vtype == 0xb152 || vtype == 0x1b25 ? "11g" : "unknown", vtype);
     uint8_t vfr_b[64], skey_b[64], salt[128], pkey[64], phash[64], parta[64], partb[64], enc[64], combo[32];
     size_t vfr_n = xs_ora_unhex(vfr, vfr_b, sizeof vfr_b), skey_n = xs_ora_unhex(skey, skey_b, sizeof skey_b);
     if (skey_n != 32 && skey_n != 48) xs_ora_fail("oracledb: unexpected session key length %zu", skey_n);
