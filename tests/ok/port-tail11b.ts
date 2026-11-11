@@ -26,3 +26,11 @@ function both(x: unknown, y: string | null): string {
   return `${x.length} ${y.length}`;
 }
 console.log(both([1, 2], "abc"), both([1], null), both(3, "a"));
+// spreads of T | null and of optional fields: a null or a left-out field keeps the key's earlier value
+interface Imp { frequencia?: string; volume?: string; umAUm?: string }
+interface Item { id: string; impacto?: Imp; estado: string }
+function mk(id: string, extra: Partial<Item> = {}): Item {
+  return { id, estado: "virado", ...extra, impacto: { frequencia: "por autorização", umAUm: "igual", ...extra.impacto } };
+}
+for (const it of [mk("a"), mk("b", { estado: "novo", impacto: { volume: "10" } }), mk("c", { impacto: { frequencia: "mensal" } })])
+  console.log(it.id, it.estado, it.impacto?.frequencia, it.impacto?.volume ?? "-", it.impacto?.umAUm);

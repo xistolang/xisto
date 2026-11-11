@@ -4500,13 +4500,38 @@ static bool objlit_expand(Expr *e, Type *expected) {
         }
         Type *st = pure_type(src);
         if (!st) xs_error(XS1018, src->pos, "spread a variable: const base = load(); const o = { ...base, x: 1 };", "spread a name or a field here, not a computed value");
+        bool nsrc = st->kind == TY_NULLABLE && st->elem->kind == TY_OBJECT && !st->elem->cls->builtin; /* ...x with x: T | null */
+        if (nsrc) st = st->elem;
         if (st->kind != TY_OBJECT || st->cls->builtin)
             xs_error(XS8002, src->pos, NULL, "%s cannot be spread into an object literal", ty_name(st));
         Class *sc = st->cls;
         for (int k = 0; k < sc->nfields; k++) {
             const char *fname = sc->fields[k].name;
             if (target && !find_field(target, fname, NULL)) continue; /* (TypeScript allows extra fields from a spread) */
-            SET_KEY(fname, member_of(pure_copy(src), fname, a->pos));
+            Expr *m = member_of(pure_copy(src), fname, a->pos);
+            if (nsrc) { /* (spreading null adds nothing: x === null ? null : x.f) */
+                Expr *z = xs_alloc(sizeof *z);
+                z->kind = E_NULL; z->pos = a->pos; z->field = -1;
+                Expr *t = xs_alloc(sizeof *t);
+                t->kind = E_BINARY; t->op = TK_EQ; t->pos = a->pos; t->field = -1; t->lhs = pure_copy(src); t->rhs = z;
+                Expr *z2 = xs_alloc(sizeof *z2);
+                z2->kind = E_NULL; z2->pos = a->pos; z2->field = -1;
+                Expr *c = xs_alloc(sizeof *c);
+                c->kind = E_COND; c->pos = a->pos; c->field = -1; c->lhs = t;
+                expr_list_push(&c->args, z2);
+                expr_list_push(&c->args, m);
+                m = c;
+            }
+            if (nsrc || sc->fields[k].optional) { /* null, or an optional field left out: the earlier value of the key stays */
+                Expr *prev = NULL;
+                for (int q = 0; q < vals.len; q++) if (strcmp(keys[q], fname) == 0) prev = vals.items[q];
+                if (prev) {
+                    Expr *qq = xs_alloc(sizeof *qq);
+                    qq->kind = E_BINARY; qq->op = TK_QQ; qq->pos = a->pos; qq->field = -1; qq->lhs = m; qq->rhs = prev;
+                    m = qq;
+                }
+            }
+            SET_KEY(fname, m);
         }
     }
     #undef SET_KEY
