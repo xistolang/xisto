@@ -1520,7 +1520,9 @@ static void ensure_json(Type *t) {
         /* optional fields that are null are left out, like undefined in JSON.stringify */
         if (f->optional) buf_printf(b, "    if (%s) {\n", not_null(f->type, xs_sprintf("o->%s", f->cname)));
         buf_printf(b, "    if (!first_) xs_sb_put(sb, \",\", 1);\n    first_ = false;\n    xs_sb_put(sb, \"\\\"%s\\\":\", %zu);\n    ", f->name, strlen(f->name) + 3);
-        json_emit_value(b, f->optional ? f->type->elem : f->type, f->optional && f->type->elem->kind == TY_BOOLEAN ? xs_sprintf("(bool)o->%s", f->cname) : xs_sprintf("o->%s", f->cname));
+        /* (x?: unknown is unknown, which holds null already: no nullable wrapper around it) */
+        Type *ft = f->optional && f->type->kind == TY_NULLABLE ? f->type->elem : f->type;
+        json_emit_value(b, ft, f->optional && ft->kind == TY_BOOLEAN && f->type->kind == TY_NULLABLE ? xs_sprintf("(bool)o->%s", f->cname) : xs_sprintf("o->%s", f->cname));
         buf_puts(b, "\n");
         if (f->optional) buf_puts(b, "    }\n");
     }
@@ -1532,7 +1534,7 @@ static void ensure_json(Type *t) {
         buf_printf(b, "    o->%s = ", f->cname);
         if (f->optional) { /* absent or null: null */
             buf_printf(b, "({ xs_jv *fv_ = xs_json_field_opt(v, \"%s\"); fv_ && fv_->kind != XJ_NULL ? ", f->name);
-            json_emit_read(b, f->type->elem, "fv_", f->name);
+            json_emit_read(b, f->type->kind == TY_NULLABLE ? f->type->elem : f->type, "fv_", f->name);
             buf_printf(b, " : %s; })", null_value(f->type));
         } else if (c->data_only && (f->type->kind == TY_STRING || f->type->kind == TY_INT || f->type->kind == TY_NUMBER || f->type->kind == TY_BOOLEAN || f->type->kind == TY_ARRAY)) {
             /* a DTO (filled from JSON, checked by its validators): an absent field reads as empty, as class-validator
