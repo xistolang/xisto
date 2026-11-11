@@ -1340,8 +1340,15 @@ static void check_supported(Program *p) {
                      !ty_is_heap(p->funcs[i]->params[k].type))
                 unsupported(p->funcs[i]->pos, "a nullable number or boolean parameter"); /* (was invalid IL: XB-111) */
     }
-    for (int i = 0; i < p->nclasses; i++)
-        if (p->classes[i]->used && (p->classes[i]->base || p->classes[i]->nsubs)) unsupported(p->classes[i]->pos, "inheritance");
+    for (int i = 0; i < p->nclasses; i++) {
+        Class *c = p->classes[i];
+        if (c->used && (c->base || c->nsubs)) unsupported(c->pos, "inheritance");
+        for (int k = 0; c->used && !c->builtin && k < c->nfields; k++) {
+            Type *t = c->fields[k].type;
+            if (t && t->kind == TY_NULLABLE && t->elem->kind != TY_STRING && !ty_is_heap(t))
+                unsupported(c->pos, "a nullable number or boolean field"); /* (a number stored into it was invalid IL, like XB-111) */
+        }
+    }
     if (p->uses_net) unsupported((Pos){1, 1}, "networking");
     if (p->uses_sqlite) unsupported((Pos){1, 1}, "node:sqlite");
     if (p->uses_regex) unsupported((Pos){1, 1}, "RegExp");
