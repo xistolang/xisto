@@ -3910,7 +3910,10 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
         Field *fd = &c->fields[k];
         buf_printf(g, "%s\n    { name: \"%s\", optional: %s, type: ", k ? "," : "", fd->name, fd->optional ? "true" : "false");
         tinfo(g, fd->type_src ? fd->type_src : "unknown");
-        buf_printf(g, ", get: (o: unknown): unknown => (o as %s).%s }", c->name, fd->name);
+        bool ident = isalpha((unsigned char)fd->name[0]) || fd->name[0] == '_' || fd->name[0] == '$';
+        for (const char *q = fd->name; *q && ident; q++) ident = isalnum((unsigned char)*q) || *q == '_' || *q == '$';
+        if (ident) buf_printf(g, ", get: (o: unknown): unknown => (o as %s).%s }", c->name, fd->name);
+        else buf_printf(g, ", get: (o: unknown): unknown => (o as %s)[\"%s\"] }", c->name, fd->name); /* ('j_idt100:xmlSaida': a quoted name) */
     }
     Class *base = reflected_base(prog, c);
     buf_printf(g, "],\n  isInstance: (value: unknown): boolean => value instanceof %s,\n  base: %s,\n};\n", c->name, base ? base->name : "null");
