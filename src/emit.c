@@ -989,6 +989,36 @@ static const char *isa_fn(Class *c) {
     buf_puts(&isa_fns, "); }\n");
     return name;
 }
+/* unknown as I, I an interface with methods (XB-126): the object itself when it is an I, else an object of a class
+   that has an adapter for I (or of a subclass of that class) wrapped in a new adapter; always an owned reference */
+static char **asif_made;
+static int nasif;
+static const char *asif_fn(Class *ifc, bool nullable) {
+    char *name = xs_sprintf("%s_asif%s", ifc->cname, nullable ? "_n" : "");
+    for (int i = 0; i < nasif; i++) if (strcmp(asif_made[i], name) == 0) return name;
+    asif_made = realloc(asif_made, sizeof(char *) * (size_t)(nasif + 1));
+    asif_made[nasif++] = name;
+    const char *isa = isa_fn(ifc);
+    Buf b = {0};
+    buf_printf(&b, "static %s *%s(void *v) {\n    if (!v) { %s }\n    if (%s(v)) return xs_retain(v);\n    void (*f)(void *) = xs_type_of(v)->free;\n",
+               ifc->cname, name, nullable ? "return NULL;" : xs_sprintf("xs_as_fail(\"%s\"); return NULL;", ifc->name), isa);
+    for (int i = 0; i < ifc->nadapters; i++) {
+        Class *a = ifc->adapters[i], *src = a->adapter_of;
+        if (!a->used) continue;
+        bool consumed = a->ctor && a->ctor->nparams && a->ctor->params[0].consumed;
+        for (int k = 0; k < prog->nclasses; k++) {
+            Class *c = prog->classes[k];
+            if (!c->used || c->builtin || c->is_abstract || !is_sub(c, src)) continue;
+            buf_printf(&b, "    if (f == %s_free) return (%s *)%s_new(%s(%s *)v%s);\n", c->cname, ifc->cname, a->cname,
+                       consumed ? "xs_retain(" : "", src->cname, consumed ? ")" : "");
+        }
+    }
+    buf_printf(&b, "    xs_as_fail(\"%s\");\n    return NULL;\n}\n", ifc->name);
+    buf_puts(&isa_fns, b.data);
+    free(b.data);
+    return name;
+}
+
 /* a method that some subclass overrides, called through its class: chooses by the object's class */
 static Buf disp_fns;
 static char **disp_made;
@@ -3418,6 +3448,13 @@ static void emit_expr_raw(Expr *e) {
         return;
     case E_CALL:
         if (!nz_mute && e->builtin.cfn && strcmp(e->builtin.cfn, "xs_to_number") == 0 && e->args.len == 1 && may_nz(e->args.items[0])) { emit_nzd(e->args.items[0]); return; } /* XB-087 */
+        if (e->builtin.cfn && strcmp(e->builtin.cfn, "__iface_as") == 0) { /* XB-126 */
+            Type *t = e->type->kind == TY_NULLABLE ? e->type->elem : e->type;
+            buf_printf(out, "%s(", asif_fn(t->cls, e->type->kind == TY_NULLABLE));
+            emit_borrowed(e->args.items[0]);
+            buf_puts(out, ")");
+            return;
+        }
         if (e->builtin.cfn && (strcmp(e->builtin.cfn, "__reflect_decoder") == 0 || strcmp(e->builtin.cfn, "__reflect_encoder") == 0)) {
             emit_reflect_codec(e->elem_type, e->builtin.cfn[10] == 'd');
             return;
@@ -9876,7 +9913,7 @@ void emit_program(Program *p, Buf *o) {
         if (json_protos.data) buf_puts(out, json_protos.data);
         buf_puts(out, json_fns.data);
     }
-    if (isa_fns.data) { buf_puts(out, isa_fns.data); isa_fns.len = 0; isa_fns.data[0] = 0; nisa = 0; }
+    if (isa_fns.data) { buf_puts(out, isa_fns.data); isa_fns.len = 0; isa_fns.data[0] = 0; nisa = 0; nasif = 0; }
     if (disp_fns.data) { buf_puts(out, disp_fns.data); disp_fns.len = 0; disp_fns.data[0] = 0; ndisp = 0; }
     if (xs_debug) {
         if (dbg_decls.data) buf_puts(out, dbg_decls.data);

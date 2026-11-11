@@ -2489,6 +2489,8 @@ static bool shape_ok(Type *g, Type *want);
 static void pr_convert(Expr *e, Type *to);
 static bool pr_convertible(Type *from, Type *to);
 static bool tsc_checked(void);
+static bool iface_adapt(Expr *e, Type *want, const char *what);
+static bool iface_runtime(Class *ifc, Pos pos);
 static void expect_type(Expr *e, Type *want, const char *what) {
     if (want->kind == TY_PROMISE || (want->kind == TY_NULLABLE && want->elem->kind == TY_PROMISE)) { /* a promise kept (XB-106) */
         Type *pw = want->kind == TY_PROMISE ? want : want->elem;
@@ -2655,6 +2657,7 @@ static void expect_type(Expr *e, Type *want, const char *what) {
     if (e->type->kind == TY_NULL)
         xs_error(XS2002, e->pos, xs_sprintf("declare it as %s | null", ty_name(want)), "%s must be %s, but this is null", what, ty_name(want));
     if (shape_copy(e, want)) return;
+    if (iface_adapt(e, want, what)) return; /* a class where an interface with methods goes (XB-126) */
     if (want->kind == TY_NULLABLE && shape_copy(e, want->elem)) return;
     if (shape_copy_array(e, want)) { if (want->kind == TY_NULLABLE) e->type = want; return; }
     Type *wu = want->kind == TY_NULLABLE ? want->elem : want;
@@ -7119,6 +7122,15 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         if (v->type->kind == TY_UNKNOWN) { /* checked at run time: the emitter compares the object's type */
             if (!unknown_target(want)) xs_error(XS2010, e->pos, NULL, "cannot check %s at run time", ty_name(want));
+            Type *wi = want->kind == TY_NULLABLE ? want->elem : want;
+            if (wi->kind == TY_OBJECT && wi->cls->iface_base && iface_runtime(wi->cls, e->pos)) {
+                /* unknown as I, I an interface with methods some classes fit without being its subclasses (XB-126): an
+                   object of one of them is wrapped in its adapter (the emitter's __iface_as: always an owned reference) */
+                *e = *v;
+                wrap_call(e, "__iface_as", want);
+                e->elem_type = want;
+                return;
+            }
             e->type = want;
             e->elem_type = want;
             return;
@@ -7533,7 +7545,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     case E_NEW_OBJ: {
         if (e->str && strcmp(e->str, "Promise") == 0 && !find_class("Promise")) { check_pr_new(e, expected); return; }
-        Class *c = find_class(e->str);
+        Class *c = e->cls && e->cls->adapter_of ? e->cls : find_class(e->str); /* (an adapter has no name to find) */
         if (!c) {
             int n; const char **cands = class_names(&n);
             if (missing_name(e->str)) xs_error_quiet();
@@ -9875,11 +9887,13 @@ static Type *inline_same(Type *a, Type *b) {
     }
     return b;
 }
+static bool implements_by_shape(Class *c);
 static void flatten_methods(Class *c) {
     if (!c->base || c->nbase_fields < 0) return;
     if (c->base->base && !c->base->methods_flat) flatten_methods(c->base);
     if (c->methods_flat) return;
     c->methods_flat = true;
+    if (implements_by_shape(c)) return; /* (XB-126: out of the interface's hierarchy, adapted where it goes) */
     Class *b = c->base;
     for (int i = 0; i < b->nmethods; i++) {
         Func *bm = b->methods[i];
@@ -9937,6 +9951,371 @@ static void flatten_methods(Class *c) {
             if (c->methods[k]->is_abstract)
                 xs_error(XS8007, c->pos, xs_sprintf("implement %s(...) in %s, or declare %s abstract", c->methods[k]->name, c->name, c->name),
                          "%s does not implement the abstract method %s.%s", c->name, c->methods[k]->cls->name, c->methods[k]->name);
+}
+
+/* ---- XB-126: structural interfaces ----
+   TypeScript compares an interface with methods by its shape: a class that has each method, with a signature that
+   fits, is one, whether or not it says `implements`. Here such an interface is an abstract class (a call through it
+   picks the implementation by the object's class), so a class outside its hierarchy gets an ADAPTER: a subclass of
+   the interface that holds the object (field __t) and whose methods call the object's, converting the arguments
+   (the interface's types into the class's) and the result (back) with the conversions expect_type already makes
+   (data shapes copied field by field, T into T | null, int into number, ...). One adapter class per (class,
+   interface); the exact `implements` path stays a plain subclass with no adapter (the fast one).
+   Identity: each conversion makes a new adapter object, so two conversions of one object give two objects (=== is
+   false between them; TypeScript has the one object). Callers such as Nest only call methods through them. */
+static bool iface_fits(Class *src, Class *ifc, bool infer, Pos pos, int depth, char **why);
+/* a value of type `from` goes where `to` goes through expect_type's conversions (a conservative mirror of them,
+   with no error reported: the adapter is only made when every one of its calls will check) */
+static bool conv_ok(Type *from, Type *to, int depth);
+static bool shape_pair_ok(Class *src, Class *dst, int depth) { /* the conditions of shape_copy, and each field converts */
+    if (!plain_data(src)) return false;
+    bool data_cls = !dst->builtin && !dst->is_interface && !dst->is_abstract && dst->nsubs == 0 && !dst->tparams &&
+                    (!dst->ctor || dst->ctor->nparams == 0) && dst->nfields > 0 && !dst->base_name &&
+                    (src->is_interface || made_shape(src));
+    if (!(dst->is_interface || made_shape(dst) || data_cls) || dst->nmethods != 0 || dst->iface_methods) return false;
+    if (!made_shape(src) && !src->is_interface && src->nmethods == 0 && !src->nfields) return false;
+    for (int i = 0; i < dst->nfields; i++) {
+        Field *s = find_field(src, dst->fields[i].name, NULL);
+        if (!s) { if (!dst->fields[i].optional) return false; continue; }
+        if (!s->type || !dst->fields[i].type || !conv_ok(s->type, dst->fields[i].type, depth + 1)) return false;
+    }
+    return true;
+}
+static bool conv_obj_ok(Class *f, Class *t, int depth) {
+    if (f == t) return true;
+    if (!t->is_interface && is_subclass(f, t)) return true;
+    if (t->iface_base && !f->builtin) return iface_fits(f, t, false, (Pos){0, 0}, depth + 1, NULL);
+    return shape_pair_ok(f, t, depth);
+}
+static bool conv_ok(Type *from, Type *to, int depth) {
+    if (!from || !to || depth > 8) return false;
+    if (ty_equal(from, to)) return true;
+    if (from->kind == TY_VOID || to->kind == TY_VOID) return false;
+    if (ty_is_any(to) || to->kind == TY_UNKNOWN) return true;
+    if (from->kind == TY_LITINT && is_numeric(to)) return true;
+    if (from->kind == TY_INT && to->kind == TY_NUMBER) return true;
+    if (to->kind == TY_NULLABLE) {
+        if (from->kind == TY_NULL) return true;
+        if (from->kind == TY_NULLABLE) /* (a primitive's null is its own: only objects convert inside T | null) */
+            return from->elem->kind == TY_OBJECT && to->elem->kind == TY_OBJECT && conv_obj_ok(from->elem->cls, to->elem->cls, depth);
+        return conv_ok(from, to->elem, depth);
+    }
+    if (from->kind == TY_NULLABLE) return false;
+    if (from->kind == TY_OBJECT && to->kind == TY_OBJECT) return conv_obj_ok(from->cls, to->cls, depth);
+    if (from->kind == TY_ARRAY && to->kind == TY_ARRAY) {
+        if (to->elem->kind == TY_UNKNOWN && ty_is_heap(from->elem)) return true;
+        if (to->elem->kind == TY_NULLABLE && ty_is_heap(to->elem->elem) && ty_equal(from->elem, to->elem->elem)) return true;
+        if (from->elem->kind == TY_INT && to->elem->kind == TY_NUMBER) return true;
+        Type *fe = ty_strip_null(from->elem), *te = ty_strip_null(to->elem);
+        if (from->elem->kind == TY_NULLABLE && to->elem->kind != TY_NULLABLE) return false;
+        return fe->kind == TY_OBJECT && te->kind == TY_OBJECT && shape_ok(from->elem, to->elem) && shape_pair_ok(fe->cls, te->cls, depth);
+    }
+    return false;
+}
+/* a type as the message shows it: an object type written in place by its fields (its class name is a hash) */
+static const char *ad_tname(Type *t) {
+    if (t && t->kind == TY_NULLABLE && t->elem->kind == TY_OBJECT && made_shape(t->elem->cls)) return xs_sprintf("%s | null", ad_tname(t->elem));
+    if (!t || t->kind != TY_OBJECT || !made_shape(t->cls) || t->cls->name[0] == '{') return ty_name(t);
+    Buf b = {0};
+    buf_puts(&b, "{ ");
+    for (int i = 0; i < t->cls->nfields; i++) {
+        Field *f = &t->cls->fields[i];
+        bool opt = f->optional && f->type && f->type->kind == TY_NULLABLE;
+        buf_printf(&b, "%s%s: %s", f->name, opt ? "?" : "", ad_tname(opt ? f->type->elem : f->type));
+        buf_puts(&b, i + 1 < t->cls->nfields ? "; " : " ");
+    }
+    buf_puts(&b, "}");
+    return b.data;
+}
+static int fn_required(Func *f) {
+    int n = 0;
+    for (int k = 0; k < f->nparams; k++) if (!f->params[k].dflt && !f->params[k].rest) n = k + 1;
+    return n;
+}
+/* the method `cm` of a class serves where the interface's `im` is called: its parameters take what im's callers pass,
+   its result is what they get (ret NULL, not inferred yet: `infer` infers it, otherwise it is left to the adapter's
+   check) */
+static bool method_fits(Func *cm, Func *im, Class *src, Class *ifc, bool infer, Pos pos, int depth, char **why) {
+    const char *iname = ifc->name, *cn = src->name, *mn = im->name;
+    if (!cm || cm->is_getter || cm->is_setter || cm->is_gen) {
+        if (why) *why = xs_sprintf("%s has no method '%s', which %s declares", cn, mn, iname);
+        return false;
+    }
+    if (cm->access) {
+        if (why) *why = xs_sprintf("%s.%s is %s; %s.%s is public", cn, mn, cm->access == 2 ? "private" : "protected", iname, mn);
+        return false;
+    }
+    if (cm->ntparams || im->ntparams) {
+        if (why) *why = xs_sprintf("%s.%s is generic: write the same signature as %s.%s, or implement %s", cn, mn, iname, mn, iname);
+        return false;
+    }
+    int req = fn_required(cm);
+    if (req > im->nparams) {
+        if (why) *why = xs_sprintf("%s.%s needs %d argument(s), but %s.%s passes %d", cn, mn, req, iname, mn, im->nparams);
+        return false;
+    }
+    int n = cm->nparams < im->nparams ? cm->nparams : im->nparams;
+    for (int k = 0; k < n; k++) {
+        Param *cp = &cm->params[k], *ip = &im->params[k];
+        bool ok = (cp->rest || ip->rest) ? cp->rest == ip->rest && ty_equal(cp->type, ip->type) : conv_ok(ip->type, cp->type, depth);
+        if (!ok) {
+            if (why) *why = xs_sprintf("parameter '%s' of %s.%s is %s, but %s.%s passes %s", cp->name, cn, mn, ad_tname(cp->type), iname, mn, ad_tname(ip->type));
+            return false;
+        }
+    }
+    if (im->ret && im->ret->kind == TY_VOID) return true; /* (the result is dropped: any will do) */
+    if (cm->ret_promise && !im->ret_promise) {
+        if (why) *why = xs_sprintf("%s.%s is async; %s.%s returns %s", cn, mn, iname, mn, ty_name(im->ret));
+        return false;
+    }
+    Type *cr = cm->ret;
+    if (!cr && infer && cm->ret_infer && !cm->ret_failed) cr = fret(cm, pos);
+    if (!cr) return true;
+    if (!im->ret || !conv_ok(cr, im->ret, depth)) {
+        if (why) *why = xs_sprintf("%s.%s returns %s, but %s.%s must return %s", cn, mn, ad_tname(cr), iname, mn, im->ret ? ad_tname(im->ret) : "?");
+        return false;
+    }
+    return true;
+}
+static bool iface_fits(Class *src, Class *ifc, bool infer, Pos pos, int depth, char **why) {
+    if (depth > 4 || src == ifc || src->builtin || src->gen_state) return false;
+    for (int k = 0; k < ifc->nmethods; k++) {
+        Func *im = ifc->methods[k];
+        if (!im->is_abstract) continue;
+        if (!method_fits(find_method(src, im->name), im, src, ifc, infer, pos, depth, why)) return false;
+    }
+    return true;
+}
+typedef struct { Class *src, *ifc, *ad; } IfaceAd;
+static IfaceAd *iface_ads;
+static int niface_ads;
+static Expr *ad_ident(Pos pos, const char *name) {
+    Expr *x = xs_alloc(sizeof *x);
+    x->kind = E_IDENT; x->pos = pos; x->field = -1; x->str = (char *)name;
+    return x;
+}
+static Expr *ad_this_t(Pos pos) { /* this.__t */
+    Expr *self = xs_alloc(sizeof *self);
+    self->kind = E_THIS; self->pos = pos; self->field = -1;
+    Expr *m = xs_alloc(sizeof *m);
+    m->kind = E_MEMBER; m->pos = pos; m->field = -1; m->lhs = self; m->str = "__t";
+    return m;
+}
+static Stmt *ad_block(Pos pos, Stmt *one) {
+    Stmt *b = xs_alloc(sizeof *b);
+    b->kind = S_BLOCK; b->pos = pos;
+    stmt_list_push(&b->stmts, one);
+    return b;
+}
+/* class <src> as <ifc> extends ifc { constructor(__t: src) { this.__t = __t; } m(__a0: A): R { return this.__t.m(__a0); } ... }
+   built as checked-to-be declarations (types already resolved) and checked with the generic instances */
+static Class *make_adapter(Class *src, Class *ifc) {
+    Pos pos = src->pos;
+    Class *a = xs_alloc(sizeof *a);
+    a->name = xs_sprintf("%s as %s", src->name, ifc->name);
+    a->pos = pos;
+    a->mod = src->mod;
+    a->cname = xs_sprintf("%s__as_%s", src->cname, ifc->cname);
+    a->adapter_of = src;
+    a->base_name = ifc->name;
+    a->base_pos = pos;
+    a->base = ifc;
+    ifc->subs = realloc(ifc->subs, sizeof(Class *) * (size_t)(ifc->nsubs + 1));
+    ifc->subs[ifc->nsubs++] = a;
+    Type *st = ty_object_of(src);
+    a->fields = xs_alloc(sizeof(Field));
+    a->fields[0].name = "__t";
+    a->fields[0].pos = pos;
+    a->fields[0].type = st;
+    a->fields[0].cname = field_cname("__t");
+    a->fields[0].readonly = true;
+    a->fields[0].owner = a;
+    a->nfields = a->cap_fields = 1;
+    a->nbase_fields = 0; /* (an interface with methods has no fields) */
+    a->flattened = true;
+    Func *ct = xs_alloc(sizeof *ct);
+    ct->name = "constructor"; ct->pos = pos; ct->mod = src->mod; ct->cls = a; ct->is_ctor = true; ct->ret = ty_void;
+    ct->params = xs_alloc(sizeof(Param));
+    ct->params[0].name = "__t";
+    ct->params[0].type = st;
+    ct->nparams = 1;
+    ct->cname = xs_sprintf("%s_new", a->cname);
+    {
+        Expr *as = xs_alloc(sizeof *as);
+        as->kind = E_ASSIGN; as->op = TK_ASSIGN; as->pos = pos; as->field = -1; as->lhs = ad_this_t(pos); as->rhs = ad_ident(pos, "__t");
+        Stmt *s = xs_alloc(sizeof *s);
+        s->kind = S_EXPR; s->pos = pos; s->expr = as;
+        ct->body = ad_block(pos, s);
+    }
+    a->ctor = ct;
+    for (int k = 0; k < ifc->nmethods; k++) {
+        Func *im = ifc->methods[k];
+        if (!im->is_abstract) continue;
+        Func *cm = find_method(src, im->name);
+        Func *f = xs_alloc(sizeof *f);
+        f->name = im->name; f->pos = cm && cm->pos.line ? cm->pos : pos; f->mod = src->mod; f->cls = a;
+        f->params = xs_alloc(sizeof(Param) * (size_t)(im->nparams ? im->nparams : 1));
+        for (int i = 0; i < im->nparams; i++) {
+            f->params[i].name = xs_sprintf("__a%d", i);
+            f->params[i].type = im->params[i].type;
+            f->params[i].dflt = im->params[i].dflt;
+            f->params[i].rest = im->params[i].rest;
+        }
+        f->nparams = im->nparams;
+        f->ret = im->ret;
+        f->ret_promise = im->ret_promise;
+        f->is_async = im->ret_promise;
+        f->cname = xs_sprintf("%s_m_%s", a->cname, im->name);
+        Expr *call = xs_alloc(sizeof *call); /* this.__t.m(__a0, ...): the class's parameters take what it declares */
+        call->kind = E_MEMBER; call->pos = f->pos; call->field = -1; call->is_call = true; call->lhs = ad_this_t(f->pos); call->str = im->name;
+        int n = cm && cm->nparams < im->nparams ? cm->nparams : im->nparams;
+        for (int i = 0; i < n; i++) {
+            Expr *x = ad_ident(f->pos, f->params[i].name);
+            if (im->params[i].rest) { /* ...xs passed on spread */
+                Expr *sp = xs_alloc(sizeof *sp);
+                sp->kind = E_UNARY; sp->op = TK_ELLIPSIS; sp->pos = f->pos; sp->field = -1; sp->lhs = x;
+                x = sp;
+            }
+            expr_list_push(&call->args, x);
+        }
+        Stmt *s = xs_alloc(sizeof *s);
+        s->pos = f->pos;
+        if (f->ret && f->ret->kind == TY_VOID) { s->kind = S_EXPR; s->expr = call; }
+        else { s->kind = S_RETURN; s->expr = call; }
+        f->body = ad_block(f->pos, s);
+        a->methods = realloc(a->methods, sizeof(Func *) * (size_t)(a->nmethods + 1));
+        a->methods[a->nmethods++] = f;
+    }
+    a->cap_methods = a->nmethods;
+    flatten_methods(a); /* (registers each method as the override of the interface's: the call through it lands here) */
+    prog->classes = realloc(prog->classes, sizeof(Class *) * (size_t)(prog->nclasses + 1));
+    prog->cap_classes = prog->nclasses + 1; /* keep the parser's add_class in step */
+    prog->classes[prog->nclasses++] = a;
+    class_work = realloc(class_work, sizeof(Class *) * (size_t)(nclass_work + 1));
+    class_work[nclass_work++] = a;
+    ifc->adapters = realloc(ifc->adapters, sizeof(Class *) * (size_t)(ifc->nadapters + 1));
+    ifc->adapters[ifc->nadapters++] = a;
+    return a;
+}
+/* the adapter of src for ifc, made the first time (NULL when src does not fit: why says the first thing that does
+   not; a failure is remembered too) */
+static Class *iface_adapter(Class *src, Class *ifc, Pos pos, char **why) {
+    for (int i = 0; i < niface_ads; i++)
+        if (iface_ads[i].src == src && iface_ads[i].ifc == ifc) {
+            if (!iface_ads[i].ad && why) iface_fits(src, ifc, false, pos, 0, why);
+            return iface_ads[i].ad;
+        }
+    Module *was = cur_mod;
+    bool fits = iface_fits(src, ifc, true, pos, 0, why);
+    if (was && cur_mod != was) enter_module(was); /* (inferring a result type checks a body in its module) */
+    Class *a = NULL;
+    if (fits) {
+        Scope *sc = scope; Class *cc = cur_class; Func *cf = cur_func;
+        a = make_adapter(src, ifc);
+        scope = sc; cur_class = cc; cur_func = cf;
+        if (was && cur_mod != was) enter_module(was);
+    }
+    iface_ads = realloc(iface_ads, sizeof(IfaceAd) * (size_t)(niface_ads + 1));
+    iface_ads[niface_ads++] = (IfaceAd){src, ifc, a};
+    return a;
+}
+/* expect_type: an object of a class where an interface with methods goes, the class not one of its subclasses:
+   new <adapter>(value) (x === null ? null : new <adapter>(x) inside T | null) */
+static bool iface_adapt(Expr *e, Type *want, const char *what) {
+    Type *w = want->kind == TY_NULLABLE ? want->elem : want, *g = e->type && e->type->kind == TY_NULLABLE ? e->type->elem : e->type;
+    if (!g || w->kind != TY_OBJECT || !w->cls->iface_base || g->kind != TY_OBJECT || g->cls == w->cls || g->cls->builtin ||
+        g->cls->adapter_of || is_subclass(g->cls, w->cls))
+        return false;
+    if (e->type->kind == TY_NULLABLE && want->kind != TY_NULLABLE) return false;
+    char *why = NULL;
+    Class *a = iface_adapter(g->cls, w->cls, e->pos, &why);
+    if (!a) xs_error(XS8149, e->pos, why, "%s must be %s, but %s does not fit it", what, w->cls->name, g->cls->name);
+    Pos pos = e->pos;
+    Expr *inner = xs_alloc(sizeof *inner);
+    *inner = *e;
+    Expr *nw = xs_alloc(sizeof *nw);
+    nw->kind = E_NEW_OBJ; nw->pos = pos; nw->field = -1; nw->str = a->name; nw->cls = a;
+    if (e->type->kind != TY_NULLABLE) {
+        inner->prechecked = true;
+        expr_list_push(&nw->args, inner);
+        check_expr(nw, NULL);
+        *e = *nw;
+        upcast(e, want);
+        return true;
+    }
+    /* ((__ad: C | null): I | null => __ad === null ? null : new <adapter>(__ad))(value) */
+    expr_list_push(&nw->args, ad_ident(pos, "__ad"));
+    Expr *z = xs_alloc(sizeof *z);
+    z->kind = E_NULL; z->pos = pos; z->field = -1;
+    Expr *t = xs_alloc(sizeof *t);
+    t->kind = E_BINARY; t->op = TK_EQ; t->pos = pos; t->field = -1; t->lhs = ad_ident(pos, "__ad"); t->rhs = z;
+    Expr *z2 = xs_alloc(sizeof *z2);
+    z2->kind = E_NULL; z2->pos = pos; z2->field = -1;
+    Expr *c = xs_alloc(sizeof *c);
+    c->kind = E_COND; c->pos = pos; c->field = -1; c->lhs = t;
+    expr_list_push(&c->args, z2);
+    expr_list_push(&c->args, nw);
+    Expr *arrow = thunk_of(c);
+    Func *f = arrow->arrow->fn;
+    f->params = xs_alloc(sizeof(Param));
+    memset(f->params, 0, sizeof(Param));
+    f->params[0].name = "__ad";
+    f->params[0].type = e->type;
+    f->nparams = 1;
+    f->ret = want;
+    memset(e, 0, sizeof *e);
+    e->kind = E_CALL; e->pos = pos; e->field = -1; e->is_call = true;
+    e->lhs = arrow;
+    expr_list_push(&e->args, inner);
+    check_expr(arrow, NULL);
+    e->type = want;
+    return true;
+}
+/* `x as I` from unknown (an injector's construct(args)): the decorated classes that fit I get their adapters now, so
+   that the cast can wrap an object of one of them (the emitter's table: class -> adapter); true when there is any */
+static bool iface_runtime(Class *ifc, Pos pos) {
+    for (int i = 0; i < prog->nclasses; i++) {
+        Class *c = prog->classes[i];
+        if (!c->decos.len || c->builtin || c->is_interface || c->iface_base || c->gen_state || c->adapter_of || is_subclass(c, ifc)) continue;
+        bool named = true; /* (cheap first: every method name is there) */
+        for (int k = 0; k < ifc->nmethods && named; k++)
+            if (ifc->methods[k]->is_abstract && !find_method(c, ifc->methods[k]->name)) named = false;
+        if (named) iface_adapter(c, ifc, pos, NULL);
+    }
+    return ifc->nadapters > 0;
+}
+/* class C implements I with a method whose signature is not I's but fits it (wider parameters, a narrower result,
+   one more optional parameter): TypeScript accepts it. C then stays out of I's hierarchy, and an adapter makes it
+   an I where one goes (an exact signature keeps the plain subclass: the direct path) */
+static bool override_same(Func *own, Func *bm) {
+    if (own->ntparams) return true; /* (left to the override rule) */
+    if (own->nparams > bm->nparams || (own->nparams < bm->nparams && !own->body)) return false;
+    for (int k = 0; k < own->nparams; k++)
+        if (!ty_equal(own->params[k].type, bm->params[k].type) && inline_same(own->params[k].type, bm->params[k].type) != bm->params[k].type) return false;
+    if (own->ret && bm->ret && !ty_equal(own->ret, bm->ret) && inline_same(own->ret, bm->ret) != bm->ret) return false;
+    return true;
+}
+static bool implements_by_shape(Class *c) {
+    Class *b = c->base;
+    if (!b || !b->iface_base || c->adapter_of) return false;
+    bool differs = false;
+    for (int i = 0; i < b->nmethods; i++) {
+        Func *bm = b->methods[i], *own = NULL;
+        if (!bm->is_abstract) continue;
+        for (int k = 0; k < c->nmethods; k++) if (c->methods[k]->cls == c && strcmp(c->methods[k]->name, bm->name) == 0) own = c->methods[k];
+        if (!own) return false; /* (not implemented: the abstract-method error says so) */
+        if (override_same(own, bm)) continue;
+        if (!method_fits(own, bm, c, b, false, c->pos, 0, NULL)) return false; /* (the override error says which) */
+        differs = true;
+    }
+    if (!differs) return false;
+    int k = 0;
+    for (int i = 0; i < b->nsubs; i++) if (b->subs[i] != c) b->subs[k++] = b->subs[i];
+    b->nsubs = k;
+    c->base = NULL;
+    c->base_name = NULL;
+    c->nbase_fields = 0;
+    return true;
 }
 
 /* `this.f = v` on every path through s (if/else both, a block, a try's body) */
@@ -10340,7 +10719,7 @@ void check_program(Program *p) {
     }
     for (int i = 0; i < p->nclasses; i++) {
         Class *c = p->classes[i];
-        if (c->gen_state || c->generic_of) continue; /* a generic class's template; instances are checked below */
+        if (c->gen_state || c->generic_of || c->adapter_of) continue; /* a generic class's template; instances (and adapters) are checked below */
         check_class_bodies(c);
     }
     for (int i = 0; i < p->nfuncs; i++)
