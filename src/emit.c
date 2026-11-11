@@ -2432,8 +2432,10 @@ static void emit_dyn_tables(Program *p) {
             else if (b->kind == TY_STRING || b->kind == TY_ENUM) kind = "XD_STR";
             else if (b->kind == TY_UNKNOWN || b->kind == TY_UNION) kind = "XD_ANY";
             else { kind = "XD_REF"; isa = dyn_isa(p, b, &fns); }
-            buf_printf(&tabs, "    {\"%s\", %zu, (uint32_t)offsetof(%s, %s), %s, %d, %d, %s, \"%s\"},\n", f->name, strlen(f->name), c->cname, f->cname, kind,
-                       nul || f->optional, f->optional, isa ? isa : "NULL", ty_name(b));
+            buf_printf(&tabs, "    {\"%s\", %zu, (uint32_t)offsetof(%s, %s), %s, %d, %d, %s, ", f->name, strlen(f->name), c->cname, f->cname, kind,
+                       nul || f->optional, f->optional, isa ? isa : "NULL");
+            { Buf *so = out; out = &tabs; emit_c_string(ty_name(b)); out = so; } /* (a literal type's name has its quotes: 'A' is "A") */
+            buf_puts(&tabs, "},\n");
         }
         if (c->nfields) buf_puts(&tabs, "};\n");
         buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s};\n", c->cname, c->name, c->nfields, c->nfields ? xs_sprintf("%s_dynf", c->cname) : "NULL");
