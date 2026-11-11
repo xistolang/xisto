@@ -4443,6 +4443,31 @@ static void infer_new_collection(Expr *e, Type *expected) {
 
 /* a copy of x that can be checked on its own (to learn its type) without touching x: literals, names, fields, and
    object and array literals of them; NULL for anything else (a call runs, so it is checked once, where it is) */
+/* a copy of an unchecked expression for another branch that runs instead of it (x.m(args) on a union: one class's call
+   or the other's): any form but a function written in place (its body is its own); NULL when it has one */
+static Expr *branch_copy(Expr *x) {
+    if (!x) return NULL;
+    switch (x->kind) {
+    case E_ARROW: case E_SPAWN: case E_FUNC_REF: return NULL;
+    default: break;
+    }
+    if (x->prechecked || x->type) return NULL; /* (checked already: not copied) */
+    Expr *c = xs_alloc(sizeof *c);
+    *c = *x;
+    if (x->lhs && !(c->lhs = branch_copy(x->lhs))) return NULL;
+    if (x->rhs && !(c->rhs = branch_copy(x->rhs))) return NULL;
+    c->args = (ExprList){0};
+    for (int i = 0; i < x->args.len; i++) {
+        Expr *a = branch_copy(x->args.items[i]);
+        if (!a) return NULL;
+        expr_list_push(&c->args, a);
+    }
+    if (x->keys) {
+        c->keys = xs_alloc(sizeof(char *) * (size_t)(x->args.len + 1));
+        memcpy(c->keys, x->keys, sizeof(char *) * (size_t)x->args.len);
+    }
+    return c;
+}
 static Expr *pure_copy(Expr *x) {
     if (!x) return NULL;
     Expr *c = xs_alloc(sizeof *c);
@@ -6229,6 +6254,18 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
+        if (e->is_call && e->str && !strcmp(e->str, "call") && e->args.len == 2 && e->lhs && e->lhs->kind == E_MEMBER && !e->lhs->is_call &&
+            e->lhs->str && !strcmp(e->lhs->str, "hasOwnProperty") && e->lhs->lhs && e->lhs->lhs->kind == E_MEMBER && e->lhs->lhs->str &&
+            !strcmp(e->lhs->lhs->str, "prototype") && e->lhs->lhs->lhs && e->lhs->lhs->lhs->kind == E_IDENT &&
+            !strcmp(e->lhs->lhs->lhs->str, "Object") && !lookup("Object")) {
+            /* Object.prototype.hasOwnProperty.call(o, k): k in o (a Record's key, a field an object has) */
+            Expr *o = e->args.items[0], *k = e->args.items[1];
+            Pos at = e->pos;
+            memset(e, 0, sizeof *e);
+            e->kind = E_BINARY; e->op = TK_IN; e->pos = at; e->field = -1; e->lhs = k; e->rhs = o;
+            check_expr(e, expected);
+            return;
+        }
         if (e->is_call && e->str && e->lhs && e->lhs->kind == E_IDENT && strcmp(e->lhs->str, "Object") == 0 && !lookup("Object") &&
             !strcmp(e->str, "fromEntries") && e->args.len == 1) {
             /* Object.fromEntries(pairs): a Record<string, V> of the [key, value] pairs, as new Map(pairs) read as an object */
@@ -6786,7 +6823,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 Class *c = u->params[i]->kind == TY_OBJECT ? u->params[i]->cls : NULL;
                 all = c && !c->builtin && !c->is_interface && find_method(c, e->str);
             }
-            for (int i = 0; i < e->args.len && all; i++) all = pure_copy(e->args.items[i]) != NULL;
+            for (int i = 0; i < e->args.len && all; i++) all = branch_copy(e->args.items[i]) != NULL;
             if (all) {
                 bool awaited = pr_awaited == e;
                 Expr *chain = NULL;
@@ -6797,7 +6834,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     Expr *call = xs_alloc(sizeof *call);
                     call->kind = E_MEMBER; call->pos = e->pos; call->field = -1; call->is_call = true; call->str = e->str; call->lhs = as;
                     call->targs = e->targs; call->ntargs = e->ntargs;
-                    for (int k = 0; k < e->args.len; k++) expr_list_push(&call->args, i == 0 ? e->args.items[k] : pure_copy(e->args.items[k]));
+                    for (int k = 0; k < e->args.len; k++) expr_list_push(&call->args, i == 0 ? e->args.items[k] : branch_copy(e->args.items[k]));
                     Expr *br = call;
                     if (awaited) { br = xs_alloc(sizeof *br); br->kind = E_AWAIT; br->pos = e->pos; br->field = -1; br->lhs = call; }
                     if (!chain) { chain = br; continue; }

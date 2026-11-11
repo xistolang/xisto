@@ -3976,7 +3976,7 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
 }
 /* Each decorated class's ClassInfo and decorator calls run where the class is declared, as in TypeScript:
    just before the first top-level statement that follows it. */
-static void reflect_module(Program *prog, Module *m, int top_start) {
+static void reflect_module(Program *prog, Module *m, int top_start, Parser *mp) {
     bool any = false;
     for (int ci = 0; ci < prog->nclasses && !any; ci++) {
         Class *c = prog->classes[ci];
@@ -4007,6 +4007,12 @@ static void reflect_module(Program *prog, Module *m, int top_start) {
         gp.lx.fixed = c->pos; /* the decorator arguments copied in point at the class, not at a line of this text */
         gp.prog = prog;
         gp.mod = m;
+        if (mp) { /* the module's import aliases (import x from "m" read as m's declaration, import { a as b }) apply to the
+                     decorator arguments copied in */
+            gp.alias_from = mp->alias_from;
+            gp.alias_to = mp->alias_to;
+            gp.nalias = mp->nalias;
+        }
         next(&gp);
         int before = prog->top.len;
         while (!at(&gp, TK_EOF)) {
@@ -4394,7 +4400,7 @@ static void parse_module(Program *prog, Module *m) {
         if (++recoveries > 500 || (p.tok.pos.line == last_line && p.tok.pos.col == last_col && !at(&p, TK_EOF))) {
             xs_error_recover = outer_recover; /* no progress: the rest of this file is not read */
             apply_local_exports(prog, m, top_start);
-            reflect_module(prog, m, top_start);
+            reflect_module(prog, m, top_start, &p);
             return;
         }
         last_line = p.tok.pos.line;
@@ -4585,7 +4591,7 @@ static void parse_module(Program *prog, Module *m) {
     }
     if (xs_check_mode) xs_error_recover = outer_recover;
     apply_local_exports(prog, m, top_start);
-    reflect_module(prog, m, top_start);
+    reflect_module(prog, m, top_start, &p);
 }
 
 static Func *builtin_func(Module *m, const char *name, const char *cfn, Type *ret, int nparams, Type *p1, Type *p2) {
