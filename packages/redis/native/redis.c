@@ -6,7 +6,10 @@
    - url: redis://[[user]:password@]host[:port][/db]; AUTH and SELECT run once per connection.
    - A command is one write of a RESP array of bulk strings; the reply is read whole before it is returned.
    - Server errors (-ERR ...) become thrown Errors with the server's text; a broken connection is closed and the
-     next command opens a new one. rediss:// (TLS) is not supported yet: it is refused, never downgraded. */
+     next command opens a new one. rediss:// (TLS) is not supported yet: it is refused, never downgraded.
+   - connectTimeout (ms): a connection not made in time fails with "connect ETIMEDOUT". commandTimeout (ms): a
+     command whose reply has not started to arrive in time fails with "Command timed out" (ioredis); the
+     connection stays open and the late reply is read and dropped, so the replies after it stay in step. */
 
 typedef struct xs_rd_conn {
     int fd;
@@ -22,6 +25,7 @@ typedef struct xs_rd_wait {
     xs_coro *co;
     bool parked;                /* in xs_coro_yield on our account: may be woken (once) */
     bool done, failed;
+    bool abandoned;             /* its command timed out: the reply is dropped when it comes (heap entry) */
     struct xs_rd_reply *reply;
     struct xs_rd_wait *next;
 } xs_rd_wait;
@@ -35,6 +39,8 @@ typedef struct xn_redis_NativeRedis {
     xs_hdr hdr;
     char *host, *user, *password;
     int port, db, id;
+    int64_t connect_timeout, command_timeout; /* ms, -1: none */
+    bool warn_unneeded_password; /* ioredis: a password the server does not ask for is a warning, not an error */
 } xn_redis_NativeRedis;
 static XS_TLS xs_rd_local xs_rd_locals[XS_RD_MAX_CLIENTS];
 static int xs_rd_nclients;
@@ -102,11 +108,21 @@ XS_NOINLINE xn_redis_NativeRedis *xn_redis_NativeRedis_new(xs_str *config) {
     r->port = 6379;
     char *url = xs_rd_cfg_str(cfg, "url");
     if (url) { xs_rd_parse_url(r, url); free(url); }
+    r->connect_timeout = r->command_timeout = -1;
+    /* ioredis: host, port, db, connectTimeout, commandTimeout at the top; node-redis: socket.{host,port,connectTimeout} */
+    char *th = xs_rd_cfg_str(cfg, "host");
+    if (th) { free(r->host); r->host = th; }
+    r->port = (int)xs_rd_cfg_int(cfg, "port", r->port);
+    r->db = (int)xs_rd_cfg_int(cfg, "db", r->db);
+    r->connect_timeout = xs_rd_cfg_int(cfg, "connectTimeout", -1);
+    r->command_timeout = xs_rd_cfg_int(cfg, "commandTimeout", -1);
+    { xs_jv *w = cfg ? xs_json_field_opt(cfg, "warnUnneededPassword") : NULL; r->warn_unneeded_password = w && w->kind == XJ_BOOL && w->b; }
     xs_jv *sock = cfg ? xs_json_field_opt(cfg, "socket") : NULL;
     if (sock && sock->kind == XJ_OBJ) {
         char *h = xs_rd_cfg_str(sock, "host");
         if (h) { free(r->host); r->host = h; }
         r->port = (int)xs_rd_cfg_int(sock, "port", r->port);
+        r->connect_timeout = xs_rd_cfg_int(sock, "connectTimeout", r->connect_timeout);
     }
     char *pw = xs_rd_cfg_str(cfg, "password");
     if (pw) { free(r->password); r->password = pw; }
@@ -251,15 +267,73 @@ static void xs_rd_close(xs_rd_conn *c) {
     free(c->in);
     free(c);
 }
+static const char *xs_rd_errname(int e) {
+    switch (e) {
+    case ECONNREFUSED: return "ECONNREFUSED";
+    case ETIMEDOUT: return "ETIMEDOUT";
+    case EHOSTUNREACH: return "EHOSTUNREACH";
+    case ENETUNREACH: return "ENETUNREACH";
+    case ECONNRESET: return "ECONNRESET";
+    default: return "ECONNREFUSED";
+    }
+}
+/* a TCP connection to host:port, waiting at most timeout_ms (-1: no limit); on failure -1 and Node's message
+   ("connect ECONNREFUSED 127.0.0.1:6379", "connect ETIMEDOUT", "getaddrinfo ENOTFOUND host") */
+static int xs_rd_connect(const char *host, int port, int64_t timeout_ms, char *err, size_t errcap) {
+    struct addrinfo hints = {0}, *res;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char ports[16];
+    snprintf(ports, sizeof ports, "%d", port);
+    if (getaddrinfo(host, ports, &hints, &res) != 0) { snprintf(err, errcap, "getaddrinfo ENOTFOUND %s", host); return -1; }
+    uint64_t deadline = timeout_ms >= 0 ? xs_now() + (uint64_t)timeout_ms * 1000000ull : 0;
+    int fd = -1, last = ECONNREFUSED;
+    char addr[INET6_ADDRSTRLEN + 1] = "";
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        if (getnameinfo(ai->ai_addr, ai->ai_addrlen, addr, sizeof addr, NULL, 0, NI_NUMERICHOST) != 0) snprintf(addr, sizeof addr, "%s", host);
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        fcntl(fd, F_SETFL, O_NONBLOCK);
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        last = errno;
+        if (errno == EINPROGRESS) {
+            int64_t left = -1;
+            if (deadline) { uint64_t now = xs_now(); left = now >= deadline ? 0 : (int64_t)((deadline - now) / 1000000ull); }
+            if (!xs_wait_fd_ms(fd, EVFILT_WRITE, left)) {
+                close(fd);
+                freeaddrinfo(res);
+                snprintf(err, errcap, "connect ETIMEDOUT");
+                return -1;
+            }
+            int e = 0;
+            socklen_t len = sizeof e;
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &e, &len);
+            if (e == 0) break;
+            last = e;
+        }
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) snprintf(err, errcap, "connect %s %s:%d", xs_rd_errname(last), addr, port);
+    return fd;
+}
 static xs_rd_conn *xs_rd_open(xn_redis_NativeRedis *r, char *err, size_t errcap) {
     xs_rd_conn *c = calloc(1, sizeof *c);
     if (!c) xs_panic("out of memory");
-    c->fd = xs_connect(r->host, r->port);
-    if (c->fd < 0) { snprintf(err, errcap, "connect ECONNREFUSED %s:%d", r->host, r->port); free(c); return NULL; }
+    c->fd = xs_rd_connect(r->host, r->port, r->connect_timeout, err, errcap);
+    if (c->fd < 0) { free(c); return NULL; }
     if (r->password) {
         const char *av[3] = {"AUTH", r->user ? r->user : r->password, r->password};
         size_t al[3] = {4, strlen(av[1]), strlen(r->password)};
         xs_rd_reply *rep = xs_rd_call(c, r->user ? 3 : 2, av, al);
+        if (rep && rep->type == '-' && r->warn_unneeded_password && rep->s &&
+            (strstr(rep->s, "no password is set") || strstr(rep->s, "without any password configured"))) {
+            fputs("[WARN] This Redis server's `default` user does not require a password, but a password was supplied\n", stderr);
+            rep->type = '+';
+        }
         if (!rep || rep->type == '-') {
             snprintf(err, errcap, "%s", rep && rep->s ? rep->s : "connection lost during AUTH");
             xs_rd_reply_free(rep);
@@ -290,12 +364,31 @@ static void xs_rd_throw(const char *msg) {
     xs_throw(xs_Error_from(buf));
 }
 static void xs_rd_wake(xs_rd_wait *w) {
-    if (w->parked) { w->parked = false; xs_ready_push(w->co); }
+    if (w->parked) {
+        w->parked = false;
+        xs_timer_disarm(&w->co->tmw); /* (a command timeout armed by xs_rd_park_until must not resume it again) */
+        xs_ready_push(w->co);
+    }
 }
 static void xs_rd_park(xs_rd_wait *w) {
     w->parked = true;
     xs_coro_yield();
     w->parked = false;
+}
+/* parked until woken or the deadline (0: none) passes */
+static void xs_rd_park_until(xs_rd_wait *w, uint64_t deadline) {
+    if (!deadline) { xs_rd_park(w); return; }
+    uint64_t now = xs_now();
+    if (now >= deadline) return;
+    xs_timer_arm(&xs_cur_coro->tmw, (int64_t)((deadline - now + 999999ull) / 1000000ull));
+    xs_rd_park(w);
+    xs_timer_disarm(&xs_cur_coro->tmw);
+}
+/* the first command still waiting for its reply (not one that timed out) */
+static xs_rd_wait *xs_rd_first_live(xs_rd_local *l) {
+    xs_rd_wait *w = l->head;
+    while (w && w->abandoned) w = w->next;
+    return w;
 }
 /* the writing turn: one coroutine writes (and opens the connection) at a time, so commands never interleave */
 static void xs_rd_write_begin(xs_rd_local *l) {
@@ -320,13 +413,17 @@ static void xs_rd_fail_all(xs_rd_local *l) {
     l->head = l->tail = NULL;
     while (w) {
         xs_rd_wait *n = w->next;
-        w->failed = w->done = true;
-        xs_rd_wake(w);
+        if (w->abandoned) free(w);
+        else {
+            w->failed = w->done = true;
+            xs_rd_wake(w);
+        }
         w = n;
     }
 }
 static void xs_rd_throw(const char *msg);
-/* one command: written in turn, its reply read by whoever holds the reading turn */
+/* one command: written in turn, its reply read by whoever holds the reading turn. With a command timeout the
+   wait for the reply ends at the deadline: the entry stays in the queue, abandoned, and its reply is dropped. */
 static xs_rd_reply *xs_rd_pipelined(xn_redis_NativeRedis *r, int argc, const char **argv, const size_t *argl) {
     xs_rd_local *l = &xs_rd_locals[r->id];
     xs_rd_write_begin(l);
@@ -336,30 +433,51 @@ static xs_rd_reply *xs_rd_pipelined(xn_redis_NativeRedis *r, int argc, const cha
         l->c = xs_rd_open(r, err, sizeof err);
         if (!l->c) { xs_rd_write_end(l); xs_rd_throw(err); }
     }
-    xs_rd_wait p = {xs_cur_coro, false, false, false, NULL, NULL};
-    if (l->tail) l->tail->next = &p; else l->head = &p;
-    l->tail = &p;
+    xs_rd_wait *p = calloc(1, sizeof *p);
+    if (!p) xs_panic("out of memory");
+    p->co = xs_cur_coro;
+    if (l->tail) l->tail->next = p; else l->head = p;
+    l->tail = p;
     bool sent = xs_rd_send(l->c, argc, argv, argl);
     xs_rd_write_end(l);
     if (!sent) xs_rd_fail_all(l);
-    while (!p.done) {
-        if (l->reading) { xs_rd_park(&p); continue; }
+    uint64_t deadline = r->command_timeout >= 0 ? xs_now() + (uint64_t)r->command_timeout * 1000000ull : 0;
+    bool timed_out = false;
+    while (!p->done) {
+        if (deadline && xs_now() >= deadline) { timed_out = true; break; }
+        if (l->reading) { xs_rd_park_until(p, deadline); continue; }
         l->reading = true;
-        while (!p.done) {
-            xs_rd_reply *rep = l->c ? xs_rd_read(l->c, 0) : NULL;
+        while (!p->done) {
+            xs_rd_conn *c = l->c;
+            if (c && deadline && c->in_off == c->in_len) { /* nothing buffered: wait for the reply to start, until the deadline */
+                uint64_t now = xs_now();
+                if (now >= deadline || !xs_wait_fd_ms(c->fd, EVFILT_READ, (int64_t)((deadline - now + 999999ull) / 1000000ull))) { timed_out = true; break; }
+            }
+            xs_rd_reply *rep = c ? xs_rd_read(c, 0) : NULL;
             if (!rep) { xs_rd_fail_all(l); break; }
             xs_rd_wait *h = l->head;
             l->head = h->next;
             if (!l->head) l->tail = NULL;
+            if (h->abandoned) { xs_rd_reply_free(rep); free(h); continue; }
             h->reply = rep;
             h->done = true;
-            if (h != &p) xs_rd_wake(h);
+            if (h != p) xs_rd_wake(h);
         }
         l->reading = false;
-        if (l->head) xs_rd_wake(l->head); /* the next in line reads now */
+        xs_rd_wait *next = xs_rd_first_live(l);
+        if (next && next != p) xs_rd_wake(next); /* the next in line reads now */
+        if (timed_out) break;
     }
-    if (p.failed) { xs_rd_reply_free(p.reply); xs_rd_throw("redis: the connection was lost"); }
-    return p.reply;
+    if (timed_out && !p->done) {
+        p->abandoned = true; /* freed by the reader that gets its reply, or when the connection fails */
+        p->co = NULL;
+        xs_rd_throw("Command timed out");
+    }
+    xs_rd_reply *rep = p->reply;
+    bool failed = p->failed;
+    free(p);
+    if (failed) { xs_rd_reply_free(rep); xs_rd_throw("redis: the connection was lost"); }
+    return rep;
 }
 /* a command from xisto: the arguments are strings; the reply, or a thrown Error */
 static xs_rd_reply *xs_rd_command(xn_redis_NativeRedis *r, xs_arr_ref *args) {
@@ -433,6 +551,29 @@ XS_NOINLINE xs_arr_ref *xn_redis_NativeRedis_strsn(xn_redis_NativeRedis *r, xs_a
     }
     xs_rd_reply_free(rep);
     return a;
+}
+/* whether this thread's connection is open (a command that failed on a broken or refused connection leaves it closed) */
+XS_NOINLINE bool xn_redis_NativeRedis_isOpen(xn_redis_NativeRedis *r) { return xs_rd_locals[r->id].c != NULL; }
+/* any reply as JSON: integers as numbers, nil as null, arrays as arrays (ioredis's call() and pipelines) */
+static void xs_rd_json(xs_sb *sb, xs_rd_reply *rep) {
+    if (rep->type == ':') { char b[24]; snprintf(b, sizeof b, "%lld", rep->n); xs_sb_puts(sb, b); }
+    else if (rep->type == '_') xs_sb_puts(sb, "null");
+    else if (rep->type == '*') {
+        xs_sb_put(sb, "[", 1);
+        for (long long i = 0; i < rep->n; i++) { if (i) xs_sb_put(sb, ",", 1); xs_rd_json(sb, rep->el[i]); }
+        xs_sb_put(sb, "]", 1);
+    } else {
+        xs_sb_jstr(sb, rep->s ? rep->s : "", rep->len);
+    }
+}
+XS_NOINLINE xs_str *xn_redis_NativeRedis_json(xn_redis_NativeRedis *r, xs_arr_ref *args) {
+    xs_rd_reply *rep = xs_rd_command(r, args);
+    xs_sb sb = {0};
+    xs_rd_json(&sb, rep);
+    xs_rd_reply_free(rep);
+    xs_str *out = xs_str_new(sb.data ? sb.data : "", sb.len);
+    free(sb.data);
+    return out;
 }
 /* quit(): closes this thread's connection once nothing is pending on it */
 XS_NOINLINE void xn_redis_NativeRedis_close(xn_redis_NativeRedis *r) {

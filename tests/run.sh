@@ -210,6 +210,8 @@ if sh examples/nest-auth/test/run.sh > "$OUT/nest-auth.txt" 2>&1 && grep -q '^ok
 if sh tests/subpaths/run.sh > "$OUT/subpaths.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/subpaths.txt"; else echo "FAIL subpaths:"; cat "$OUT/subpaths.txt"; fail=$((fail+1)); fi
 # redis package against a live server (skipped without one)
 if sh tests/redis/run.sh > "$OUT/redis.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/redis.txt"; else echo "FAIL redis:"; cat "$OUT/redis.txt"; fail=$((fail+1)); fi
+# ioredis package against a live server (skipped without one)
+if sh tests/ioredis/run.sh > "$OUT/ioredis.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/ioredis.txt"; else echo "FAIL ioredis:"; cat "$OUT/ioredis.txt"; fail=$((fail+1)); fi
 # exceljs package: streaming XLSX (ZIP + deflate), checked as XML, by LibreOffice when installed, constant memory
 if sh tests/exceljs/run.sh > "$OUT/exceljs.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/exceljs.txt"; else echo "FAIL exceljs:"; cat "$OUT/exceljs.txt"; fail=$((fail+1)); fi
 # @elastic/elasticsearch package against a fake cluster (Node)
