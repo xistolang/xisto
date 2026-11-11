@@ -2726,12 +2726,23 @@ static void expect_type(Expr *e, Type *want, const char *what) {
             e->type = want;
             return;
         }
+        /* Record<string, string> where Record<string, string | undefined> or Record<string, unknown> goes (process.env passed as
+           an env): values held by reference either way, the same map (TypeScript lets the wider type read it) */
+        if (w->kind == TY_MAP && e->type->kind == TY_MAP && ty_equal(w->key, e->type->key) && ty_is_heap(e->type->elem) &&
+            ((w->elem->kind == TY_UNKNOWN && !ty_is_any(w->elem)) || (w->elem->kind == TY_NULLABLE && ty_equal(w->elem->elem, e->type->elem)))) {
+            e->type = want;
+            return;
+        }
         if (w->kind == TY_ARRAY && w->elem->kind == TY_MAP && e->type->kind == TY_ARRAY && e->type->elem->kind == TY_MAP &&
             ty_equal(w->elem->key, e->type->elem->key) && w->elem->elem->kind == TY_UNKNOWN && !ty_is_any(w->elem->elem) &&
             ty_strip_null(e->type->elem->elem)->kind == TY_UNION) {
             e->type = want; /* Map<string, A | B>[] where Map<string, unknown>[] goes: the same */
             return;
         }
+    }
+    if (e->type->kind == TY_ENUM && e->type->en->is_string && ty_strip_null(want)->kind == TY_STRING && !ty_strip_null(want)->tname) {
+        e->type = want; /* a string enum's value where a string goes: its text (TypeScript widens it) */
+        return;
     }
     if (want->kind == TY_UNKNOWN && e->type->kind != TY_UNKNOWN && e->type->kind != TY_VOID) { to_unknown(e); return; }
     if (want->kind == TY_JSON && e->type->kind != TY_JSON && e->type->kind != TY_NULL) { /* unknown members: written by what they hold, as JSON.stringify does */
@@ -4627,7 +4638,14 @@ static bool objlit_expand(Expr *e, Type *expected) {
             Expr *pair = xs_alloc(sizeof *pair);
             pair->kind = E_ARRAY_LIT; pair->pos = a->pos; pair->field = -1;
             Expr *k, *val;
-            if (strcmp(e->keys[i], "[]") == 0) { k = a->lhs; val = a->rhs; }
+            if (strcmp(e->keys[i], "[]") == 0) {
+                k = a->lhs; val = a->rhs;
+                if (k->kind == E_NUMBER && k->is_int_lit && rec->key->kind == TY_STRING) { /* { 1: x } where Record<string, V> goes: the key "1" */
+                    Expr *ks = xs_alloc(sizeof *ks);
+                    ks->kind = E_STRING; ks->pos = k->pos; ks->field = -1; ks->str = xs_sprintf("%lld", k->ival);
+                    k = ks;
+                }
+            }
             else {
                 k = xs_alloc(sizeof *k);
                 k->kind = E_STRING; k->pos = a->pos; k->field = -1; k->str = e->keys[i];

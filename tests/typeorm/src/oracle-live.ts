@@ -128,6 +128,11 @@ async function main(): Promise<void> {
   }
   const three = await repo.findOneBy({ id: 3 });
   console.log("3 is " + (three === null ? "gone" : three.name));
+  const counted = await ds.transaction(async (m) => {
+    const rows: { N: number }[] = await m.query("SELECT COUNT(*) AS N FROM XISTO_TO_ITEM WHERE ID = :1", [3]);
+    return rows[0].N + 6;
+  });
+  console.log("transaction returned " + String(counted));
 
   const del = await repo.delete({ id: In([1, 2]) });
   console.log("deleted " + String(del.affected) + ", left " + String(await repo.count()));

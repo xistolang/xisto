@@ -2034,17 +2034,22 @@ export class DataSource {
     this.queryWrappers.push(w);
   }
 
-  /** runs fn in a transaction: committed when it returns, rolled back when it throws (the error goes on) */
-  async transaction(fn: (manager: EntityManager) => Promise<void>): Promise<void> {
+  /** runs fn in a transaction: committed when it returns (its value is the transaction's, as TypeORM's), rolled back
+      when it throws (the error goes on) */
+  async transaction<T>(fn: (manager: EntityManager) => Promise<T>): Promise<T> {
     const qr = this.createQueryRunner();
     await qr.startTransaction();
+    let rolledBack = false;
     try {
-      await fn(qr.manager);
-      await qr.commitTransaction();
+      return await fn(qr.manager);
     } catch (e) {
+      rolledBack = true;
       await qr.rollbackTransaction();
       throw e;
     } finally {
+      if (!rolledBack) {
+        await qr.commitTransaction();
+      }
       await qr.release();
     }
   }
