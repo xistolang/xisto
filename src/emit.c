@@ -2236,6 +2236,8 @@ static void emit_promise(Expr *e) {
     buf_printf(out, "({ xs_tgroup *pg%d_; ", id);
     if (map) {
         Expr *call = e->args.items[0]; /* xs.map(f) */
+        if (!call->lhs || call->kind != E_MEMBER) /* XB-171: Promise.all(xs.map(f)) kept as a promise (.then on it): the spawn evaluated the map already */
+            xs_error(XS9902, e->pos, "keep Promise.all(xs.map(f)) inside an async function and keep that function's promise", "internal: Promise.all(xs.map(f)) kept as a promise is not supported yet");
         Type *src = call->lhs->type;
         int ak = val_kind(src->elem);
         buf_printf(out, "%s *ps%d_ = ", arr_struct(src), id);
