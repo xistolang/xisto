@@ -32,7 +32,7 @@ console.log(montar([{ cd: 1, inadimplente: true }, { cd: 2, inadimplente: false 
 type QueryOne = <T>(sql: string, binds: unknown[]) => Promise<T | null | undefined>;
 interface Row { CD_USUARIO: string; N: number }
 class Base {
-  rows: Row[] = [{ CD_USUARIO: 'abc', N: 3 }];
+  rows: Record<string, unknown>[] = [{ CD_USUARIO: 'abc', N: 3 }];
   protected async executeQueryOne<T>(sql: string, params: unknown[] = []): Promise<T | null> {
     if (sql === 'vazio') return null;
     return (this.rows[0] as unknown as T) ?? null;
@@ -51,7 +51,7 @@ class Base {
   }
 }
 async function resolver(queryOne: QueryOne, sql: string): Promise<string | null> {
-  const row = await queryOne<Row>(sql, [1]);
+  const row = await queryOne<{ CD_USUARIO: string }>(sql, [1]);
   if (row?.CD_USUARIO != null) return String(row.CD_USUARIO).toUpperCase();
   return null;
 }

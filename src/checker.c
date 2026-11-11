@@ -1260,6 +1260,15 @@ static void gen_convert(Expr *e) {
     Expr *in = xs_alloc(sizeof *in);
     *in = *e;
     in->prechecked = true;
+    Type *b = ty_strip_null(t);
+    if (e->type->kind == TY_UNKNOWN && (b->kind == TY_ARRAY || (b->kind == TY_MAP && b->record) ||
+                                        (b->kind == TY_OBJECT && !b->cls->builtin && b->cls->nmethods == 0 && !b->cls->iface_methods))) {
+        /* data (rows of a query, decoded per T in a generic instance): read as its JSON and decoded into T, as the
+           instance for T would have decoded it (an object of T itself comes back equal, a copy) */
+        Expr *js = xs_alloc(sizeof *js);
+        js->kind = E_AS; js->pos = in->pos; js->field = -1; js->lhs = in; js->elem_type = ty_json;
+        in = js;
+    }
     memset(e, 0, sizeof *e);
     e->kind = E_AS;
     e->pos = in->pos;
