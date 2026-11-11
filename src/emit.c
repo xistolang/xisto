@@ -8958,6 +8958,9 @@ static void emit_class(Class *c) {
     }
     }
 
+    if (c->adapter_of) { /* an adapter (XB-126) prints as the object it holds: TypeScript has only that object */
+        buf_printf(out, "static void %s_print(void *p) { xs_print_obj(((%s *)p)->%s); }\n", c->cname, c->cname, c->fields[0].cname);
+    } else {
     /* Node-style printing: Name { a: 1, s: 'x' } */
     buf_printf(out, "static void %s_print(void *p) {", c->cname);
     indent++;
@@ -9012,6 +9015,7 @@ static void emit_class(Class *c) {
     indent--;
     nl();
     buf_puts(out, "}\n");
+    }
 
     if (in_hierarchy(c)) { emit_hier_ctor(c); goto methods; }
     /* constructor */

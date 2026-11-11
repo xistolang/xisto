@@ -1,7 +1,7 @@
 // An interface with methods is structural (XB-126): a class that has its methods with signatures that fit is one,
 // without `implements`. Wider parameters (a class of data with more, optional, fields), a narrower result (more
 // fields), one more optional parameter, a plain result where the interface returns a promise, async methods, T | null,
-// arrays and fields of the interface. xisto wraps the object in an adapter that calls its methods.
+// arrays and fields of the interface, `c as I` and console.log of an adapted value. xisto wraps the object in an adapter that calls its methods.
 interface Pedido {
   empresa: string;
   quantidade: number;
@@ -81,5 +81,8 @@ async function main(): Promise<void> {
   const lista: Motor[] = [real, new MotorReal()];
   for (const x of lista) console.log(x.executa({ empresa: "D", quantidade: 2 }, 1).id);
   console.log(p.motores.length, real.outro());
+  const comoMotor = new Sincrono() as MotorAsync; // c as I: the same adapter
+  console.log((await comoMotor.roda({ empresa: "E", quantidade: 1 }, { runId: "as" })).id);
+  console.log(comoMotor, p.motores); // an adapter prints as the object it holds
 }
 main();
