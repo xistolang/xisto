@@ -618,6 +618,7 @@ typedef struct {
     Pos pos;
     bool reexport;     /* export { a, b } from "m" / export * from "m": the names are this module's exports too */
     bool star;         /* export * from "m": every name m exports (names is empty) */
+    char **as_names;   /* export { a as b } from "m": the name each entry is exported under here (NULL: its own name) */
 } Import;
 
 struct Module {
@@ -629,6 +630,10 @@ struct Module {
     int nimports;
     char **local_exports; /* export { a, b }; (no "from"): names declared here, exported by a list */
     int nlocal_exports;
+    char **exp_from, **exp_to; /* export { a as b };: the local (or imported) a is exported as b */
+    int nexp;
+    char *default_name;   /* export default f / export default function f / export default <expr> (a const of its own):
+                             the declaration `import x from "m"` reads as x */
     bool loading, loaded;
     bool builtin;      /* "node:fs" and friends: functions provided by the runtime */
     bool missing;      /* xisto check: a module that could not be loaded (reported); its imported names are not reported again */
