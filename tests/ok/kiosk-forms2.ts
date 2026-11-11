@@ -1,6 +1,9 @@
 // forms of a NestJS port (kiosk): object rest in destructuring, Types.ObjectId (a type through an imported name),
 // Parameters<typeof f>[i], optional interface methods m?(x): R, generic function types <T>(x) => R and generic
-// arrows inside functions (held with T as unknown; f<Row>(x) converts the result to Row)
+// arrows inside functions (held with T as unknown; f<Row>(x) converts the result to Row, with warning XS2110)
+// build: --warnings
+// warns: the result of the generic function value 'queryOne' is a copy of Row | null made through JSON
+// warns: is a copy of the object type given made through JSON
 import { Types } from './lib/kiosk/ids.ts';
 import * as Ids from './lib/kiosk/ids.ts';
 class Rollout { grupoId: Types.ObjectId | null = null; outro: Ids.ObjectId | null = null; }

@@ -1269,6 +1269,18 @@ static void gen_convert(Expr *e) {
            instance for T would have decoded it (an object of T itself comes back equal, a copy) */
         Expr *js = xs_alloc(sizeof *js);
         js->kind = E_AS; js->pos = in->pos; js->field = -1; js->lhs = in; js->elem_type = ty_json;
+        /* XS2110: accepted (Isa, 11/11), with its cost said: a copy, not the object the function returned */
+        Expr *callee = in->kind == E_AWAIT ? in->lhs : in;
+        if (callee && callee->kind == E_SPAWN) callee = callee->lhs;
+        const char *fname = "f";
+        if (callee && callee->kind == E_CALL && callee->lhs && callee->lhs->kind == E_IDENT && callee->lhs->str) fname = callee->lhs->str;
+        else if (callee && callee->kind == E_CALL && callee->lhs && callee->lhs->kind == E_MEMBER && callee->lhs->str) fname = callee->lhs->str;
+        xs_warn_rule(XS2110, in->pos,
+                     "its type parameter is read as unknown, so the value is written to JSON and decoded as the type given (no identity "
+                     "with the object returned; a cost per call that grows with its size): give the function a concrete return type, "
+                     "or make it a generic function or method instead of a value",
+                     "the result of the generic function value '%s' is a copy of %s made through JSON", fname,
+                     strstr(ty_name(t), "__Obj_") ? "the object type given" : ty_name(t));
         in = js;
     }
     memset(e, 0, sizeof *e);
