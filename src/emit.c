@@ -929,6 +929,20 @@ static const char *map_val_printer(Type *v) {
 
 /* ---------- ownership ---------- */
 
+/* a literal's element that may throw (a call in it): the elements made before it must not leak then */
+static bool lit_may_throw(Expr *e) {
+    if (!e) return false;
+    switch (e->kind) {
+    case E_ARROW: case E_FUNC_REF: return false;
+    case E_CALL: case E_NEW_OBJ: case E_AWAIT: case E_SPAWN: return true;
+    case E_MEMBER: if (e->is_call) return true; break;
+    default: break;
+    }
+    if (lit_may_throw(e->lhs) || lit_may_throw(e->rhs)) return true;
+    for (int i = 0; i < e->args.len; i++) if (lit_may_throw(e->args.items[i])) return true;
+    return false;
+}
+
 static bool is_fresh(Expr *e) {
     if (!rcnt(e->type)) return false;
     switch (e->kind) {
@@ -2515,6 +2529,8 @@ static char *from_unknown(Type *t, const char *expr) {
         Type *el = b->elem->kind == TY_NULLABLE ? b->elem->elem : b->elem;
         if (el->kind == TY_OBJECT && !in_hierarchy(el->cls) && !el->cls->builtin) /* each element checked too */
             return xs_sprintf("((%s)xs_as_arr_of(%s, %s_free, %d, %d, \"%s\"))", ctype(b), expr, el->cls->cname, b->elem->kind == TY_NULLABLE, nul, what);
+        if (!arr_is_ref(b) && (b->elem->kind == TY_NUMBER || b->elem->kind == TY_INT || b->elem->kind == TY_BOOLEAN)) /* (from JSON: unknowns, copied) */
+            return xs_sprintf("((%s)xs_as_arr_prim(%s, %d, %d, \"%s\"))", ctype(b), expr, b->elem->kind == TY_NUMBER ? 0 : b->elem->kind == TY_INT ? 1 : 2, nul, what);
         const char *fr = arr_is_ref(b) ? "xs_arr_ref_free" : xs_sprintf("%s_free", arr_struct(b));
         return xs_sprintf("((%s)xs_as_ref(%s, %s, %d, \"%s\"))", ctype(b), expr, fr, nul, what);
     }
@@ -3662,14 +3678,44 @@ static void emit_expr_raw(Expr *e) {
             }
             if (e->region) /* an array of region objects made during an iteration lives in the region too */
                 buf_printf(out, "xs_arr_ref_rlit(&xs_rg_%d, %s, %d", e->region, elem_printer(e->type->elem), e->args.len);
-            else
-            buf_printf(out, "xs_arr_ref_lit(%s, %d", elem_printer(e->type->elem), e->args.len);
+            {
+            int last_call = -1; /* [new P(), f()]: when a later element throws, the ones made before it are held by the arena
+                                   (freed by the catch), and the array takes them once every element is there */
+            for (int i = 0; i < e->args.len && !e->region; i++) if (lit_may_throw(e->args.items[i])) last_call = i;
+            bool held = false;
+            static int nlt;
+            int base = nlt;
+            for (int i = 0; i < last_call && !held; i++) held = is_fresh(e->args.items[i]) || (rcnt(e->args.items[i]->type) && e->args.items[i]->kind != E_NULL);
+            for (int i = 0; held && i <= last_call; i++) { /* (in order, each into its own temporary: C does not order arguments) */
+                if (i == 0) buf_puts(out, "({ ");
+                Expr *x = e->args.items[i];
+                if (i < last_call && is_fresh(x)) {
+                    buf_printf(out, "__auto_type lt%d_ = xs_ar(", base + i);
+                    emit_owned(x);
+                    buf_puts(out, "); ");
+                } else if (i < last_call && rcnt(x->type) && x->kind != E_NULL) { /* (borrowed now, retained by the array below) */
+                    buf_printf(out, "__auto_type lt%d_ = ", base + i);
+                    emit_expr(x);
+                    buf_puts(out, "; ");
+                } else {
+                    buf_printf(out, "__auto_type lt%d_ = ", base + i);
+                    emit_owned(e->args.items[i]);
+                    buf_puts(out, "; ");
+                }
+            }
+            if (held) nlt += e->args.len;
+            if (!e->region) buf_printf(out, "xs_arr_ref_lit(%s, %d", elem_printer(e->type->elem), e->args.len);
             for (int i = 0; i < e->args.len; i++) {
                 buf_puts(out, ", ");
-                emit_owned(e->args.items[i]);
+                if (held && i < last_call && (is_fresh(e->args.items[i]) || (rcnt(e->args.items[i]->type) && e->args.items[i]->kind != E_NULL)))
+                    buf_printf(out, "xs_retain(lt%d_)", base + i);
+                else if (held && i <= last_call) buf_printf(out, "lt%d_", base + i);
+                else emit_owned(e->args.items[i]);
             }
             buf_puts(out, ")");
+            if (held) buf_puts(out, "; })");
             return;
+            }
         }
         buf_printf(out, "%s_lit(%d, (%s[]){", arr_struct(e->type), e->args.len,
                    arr_ek(e->type->elem)->kind == TY_NUMBER ? "double" : int_like(arr_ek(e->type->elem)) ? "int64_t" : "bool");
