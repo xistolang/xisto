@@ -2863,12 +2863,21 @@ XS_NOINLINE void *xs_dyn_get(void *o, xs_str *k) {
     const xs_type *t = xs_type_of(o);
     if (t->dyn) {
         const xs_dyn_field *f = xs_dyn_field_of(t->dyn, k);
-        if (!f) xs_dyn_fail_read(o, k);
+        if (!f) return NULL; /* a field the class does not declare reads as undefined, as in JavaScript (err?.status || 500);
+                                writing one is still an error: no field is made */
         return xs_dyn_load(f, o);
+    }
+    if (t->free == xs_Error_free) { /* an Error seen as any: its own fields, then the object it was thrown as (err.status) */
+        xs_Error *e = o;
+        if (k->len == 7 && memcmp(k->data, "message", 7) == 0) return xs_retain_(e->f_message);
+        if (k->len == 4 && memcmp(k->data, "name", 4) == 0) return xs_retain_(e->f_name);
+        if (k->len == 5 && memcmp(k->data, "stack", 5) == 0) return xs_retain_(xs_Error_stack(e));
+        if (k->len == 5 && memcmp(k->data, "cause", 5) == 0) return xs_retain_(e->f_cause);
+        return e->f___thrown ? xs_dyn_get(e->f___thrown, k) : NULL;
     }
     if (t->free == xs_map_free) {
         xs_map *m = o;
-        if (!m->str_keys) xs_dyn_fail_read(o, k);
+        if (!m->str_keys) return NULL;
         xs_map_entry *e = xs_map_lookup(m, k, 0);
         return e ? xs_dyn_map_val(m, e->val) : NULL;
     }
@@ -2879,8 +2888,7 @@ XS_NOINLINE void *xs_dyn_get(void *o, xs_str *k) {
         if (t->free == xs_arr_int_free) return xs_box_int((int64_t)((xs_arr_int *)o)->len);
         if (t->free == xs_arr_bool_free) return xs_box_int((int64_t)((xs_arr_bool *)o)->len);
     }
-    xs_dyn_fail_read(o, k);
-    return NULL;
+    return NULL; /* (undefined, as above) */
 }
 /* o?.k: null when o is */
 XS_NOINLINE void *xs_dyn_get_opt(void *o, xs_str *k) { return o ? xs_dyn_get(o, k) : NULL; }
