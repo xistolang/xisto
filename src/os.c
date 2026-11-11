@@ -229,6 +229,27 @@ static unsigned long long phys_mem(void) {
 #endif
 }
 
+/* the memory the whole machine still has free, in percent (other builds, other programs): -1 when unknown */
+static int machine_free_pct(void) {
+#if defined(__APPLE__)
+    int lvl = -1;
+    size_t len = sizeof lvl;
+    if (sysctlbyname("kern.memorystatus_level", &lvl, &len, NULL, 0) != 0) return -1;
+    return lvl;
+#else
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char line[256];
+    unsigned long long total = 0, avail = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (sscanf(line, "MemTotal: %llu kB", &total) == 1) continue;
+        sscanf(line, "MemAvailable: %llu kB", &avail);
+    }
+    fclose(f);
+    return total ? (int)(avail * 100 / total) : -1;
+#endif
+}
+
 /* the memory of the processes in group pg, in bytes */
 static unsigned long long group_mem(pid_t pg) {
     unsigned long long sum = 0;
@@ -309,6 +330,15 @@ bool xs_cc_run(char **cmds, int n, int jobs, int *rcs) {
             all += m;
         }
         if (all > peak_all) peak_all = all;
+        /* the machine as a whole: several builds at once (each under its own limit) can still fill it */
+        int free_pct = all > (1ULL << 30) ? machine_free_pct() : -1;
+        if (!over && free_pct >= 0 && free_pct < 10) {
+            over = true;
+            for (int i = 0; i < next; i++) if (pids[i] > 0) kill(-pids[i], SIGKILL);
+            fprintf(stderr, "xisto: the machine is almost out of memory (%d%% free) while the C compiler holds %.2f GB; it was stopped "
+                            "before the machine started to swap (another build running at the same time?)\n",
+                    free_pct, all / 1073741824.0);
+        }
         if (all > limit && !over) {
             over = true;
             for (int i = 0; i < next; i++) if (pids[i] > 0) kill(-pids[i], SIGKILL);
