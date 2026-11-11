@@ -31,7 +31,15 @@ typedef struct {
     char **vt_names;
     Type **vt_types;
     int nvt;
+    /* const { a, b, ...rest } = e: the rest's name, the destructured value's variable and the keys taken before it
+       (the declaration is made once e's type is known: rest_decl) */
+    Token rest_name;
+    char *rest_tmp;
+    char **rest_keys;
+    int nrest_keys;
 } Parser;
+
+static void rest_param(Parser *p, Func *f, Type *t);
 static void vt_push(Parser *p, const char *name, Type *t) {
     char **n = xs_alloc(sizeof(char *) * (size_t)(p->nvt + 1)); /* (new arrays: copies of the parser may hold the old ones) */
     Type **ty = xs_alloc(sizeof(Type *) * (size_t)(p->nvt + 1));
@@ -157,7 +165,12 @@ static Mixin *parse_mixin_rest(Parser *p, Token name) {
     next(p);
     m->a = parse_mixin_rest(p, expect(p, TK_IDENT, NULL));
     if (accept(p, TK_COMMA) && !at(p, TK_RPAREN)) {
-        if (strcmp(m->kind, "IntersectionType") == 0) m->b = parse_mixin_rest(p, expect(p, TK_IDENT, NULL));
+        if (at(p, TK_LBRACE)) { /* PartialType(A, { skipNullProperties: false }): swagger's options, for its validation (whose
+                                   rules xisto does not inherit yet); skipped */
+            int d = 0;
+            do { if (at(p, TK_LBRACE)) d++; else if (at(p, TK_RBRACE)) d--; next(p); } while (d > 0 && !at(p, TK_EOF));
+        }
+        else if (strcmp(m->kind, "IntersectionType") == 0) m->b = parse_mixin_rest(p, expect(p, TK_IDENT, NULL));
         else {
             expect(p, TK_LBRACKET, "the keys as an array: OmitType(A, [\"id\"] as const)");
             while (!at(p, TK_RBRACKET)) {
@@ -168,6 +181,10 @@ static Mixin *parse_mixin_rest(Parser *p, Token name) {
             }
             expect(p, TK_RBRACKET, NULL);
             if (at_ident(p, "as")) { next(p); next(p); } /* as const */
+            if (accept(p, TK_COMMA) && at(p, TK_LBRACE)) { /* (the options, as above) */
+                int d = 0;
+                do { if (at(p, TK_LBRACE)) d++; else if (at(p, TK_RBRACE)) d--; next(p); } while (d > 0 && !at(p, TK_EOF));
+            }
         }
     }
     accept(p, TK_COMMA);
@@ -176,6 +193,8 @@ static Mixin *parse_mixin_rest(Parser *p, Token name) {
 }
 static Type *union_of(Type *a, Type *b);
 static bool peek_is(Parser *p, TokKind k);
+static bool peek_is_ident(Parser *p);
+static void import_add_name(Import *im, Token name);
 static bool looks_like_type_args(Parser *p);
 static int parse_type_args(Parser *p, Type ***out);
 static void add_statics(Program *prog, Module *m, Class *c);
@@ -312,8 +331,71 @@ static void skip_type_term(Parser *p) {
     if (at(p, TK_LT)) { int d = 0; do { if (at(p, TK_LT)) d++; else if (at(p, TK_GT)) d--; next(p); } while (d > 0 && !at(p, TK_EOF)); }
     while (at(p, TK_LBRACKET)) { int d = 0; do { if (at(p, TK_LBRACKET)) d++; else if (at(p, TK_RBRACKET)) d--; next(p); } while (d > 0 && !at(p, TK_EOF)); }
 }
+/* a copy of t with each type parameter named in `names` read as unknown (a generic function value: see Type.gen_sig) */
+static Type *erase_tparams(Type *t, char **names, int n) {
+    if (!t) return t;
+    if (t->kind == TY_TPARAM && t->tname) {
+        for (int i = 0; i < n; i++) if (strcmp(t->tname, names[i]) == 0) return ty_unknown;
+        if (!t->elem) return t;
+    }
+    Type *c = xs_alloc(sizeof *c);
+    *c = *t;
+    c->elem = erase_tparams(t->elem, names, n);
+    c->key = erase_tparams(t->key, names, n);
+    c->ret = erase_tparams(t->ret, names, n);
+    if (t->nparams) {
+        c->params = xs_alloc(sizeof(Type *) * (size_t)t->nparams);
+        for (int i = 0; i < t->nparams; i++) c->params[i] = erase_tparams(t->params[i], names, n);
+    }
+    if (t->ntargs) {
+        c->targs = xs_alloc(sizeof(Type *) * (size_t)t->ntargs);
+        for (int i = 0; i < t->ntargs; i++) c->targs[i] = erase_tparams(t->targs[i], names, n);
+    }
+    if (c->kind == TY_NULLABLE && c->elem == ty_unknown) return ty_unknown; /* (T | null: unknown holds null already) */
+    return c;
+}
+/* <T, U extends X = D>: the names of a generic function value's type parameters (constraints and defaults skipped) */
+static int parse_tparam_names(Parser *p, char ***out) {
+    expect(p, TK_LT, NULL);
+    char **names = NULL;
+    int n = 0;
+    while (!at(p, TK_GT)) {
+        Token nm = expect(p, TK_IDENT, "a type parameter's name");
+        names = realloc(names, sizeof(char *) * (size_t)(n + 1));
+        names[n++] = nm.str;
+        if (at_ident(p, "extends") || at(p, TK_ASSIGN)) { /* (a constraint or a default: skipped up to , or >) */
+            int d = 0;
+            next(p);
+            while (!at(p, TK_EOF) && !(d == 0 && (at(p, TK_COMMA) || at(p, TK_GT)))) {
+                if (at(p, TK_LT) || at(p, TK_LPAREN) || at(p, TK_LBRACE) || at(p, TK_LBRACKET)) d++;
+                else if (at(p, TK_GT) || at(p, TK_RPAREN) || at(p, TK_RBRACE) || at(p, TK_RBRACKET)) d--;
+                next(p);
+            }
+        }
+        if (!accept(p, TK_COMMA)) break;
+    }
+    expect(p, TK_GT, NULL);
+    *out = names;
+    return n;
+}
 static Type *parse_type(Parser *p) {
     Type *t;
+    if (at(p, TK_LT)) { /* <T>(sql: string, binds: unknown[]) => Promise<T | null>: a generic function type */
+        char **names;
+        int n = parse_tparam_names(p, &names);
+        char **saved = tp_names;
+        int saved_n = ntp;
+        tp_push(names, n);
+        Type *ft = parse_type(p);
+        tp_names = saved;
+        ntp = saved_n;
+        if (ft->kind != TY_FUNC) xs_error(XS1019, p->tok.pos, "write <T>(x: T) => R", "type parameters go on a function type");
+        ft->ftparams = names;
+        ft->nftparams = n;
+        Type *er = erase_tparams(ft, names, n);
+        er->gen_sig = ft;
+        return er;
+    }
     if (at_ident(p, "keyof") && peek_is(p, TK_IDENT)) { /* keyof T (& string): the names of T's fields, a string */
         next(p);
         skip_type_term(p);
@@ -524,6 +606,20 @@ static Type *parse_type(Parser *p) {
         next(p);
         t = parse_type(p);
         expect(p, TK_GT, "close Awaited<T> with '>'");
+    } else if (strcmp(n, "Parameters") == 0 && at(p, TK_LT) && peek_is_ident(p)) { /* Parameters<typeof f>[0]: the type of f's first parameter */
+        next(p);
+        if (!at_ident(p, "typeof")) xs_error(XS1019, name.pos, "write the type itself", "Parameters<...> takes typeof a function");
+        next(p);
+        Token fn = expect(p, TK_IDENT, NULL);
+        expect(p, TK_GT, NULL);
+        if (!at(p, TK_LBRACKET) || !peek_is(p, TK_NUMBER)) xs_error(XS1019, name.pos, "write the type itself", "Parameters<typeof %s> is read as one of them: Parameters<typeof %s>[0]", fn.str, fn.str);
+        next(p);
+        int ix = (int)p->tok.ival;
+        next(p);
+        expect(p, TK_RBRACKET, NULL);
+        t = xs_alloc(sizeof *t);
+        t->kind = TY_TPARAM;
+        t->tname = xs_sprintf("__param_of:%s:%d", fn.str, ix);
     } else if (strcmp(n, "ReturnType") == 0 && at(p, TK_LT)) { /* ReturnType<typeof setTimeout>: a timer id */
         Parser look = *p;
         next(&look);
@@ -641,6 +737,22 @@ static Type *parse_type(Parser *p) {
             t = anon_iface(p, open, name.pos, m);
         }
     } else {
+        if (at(p, TK_DOT) && peek_is_ident(p) && p->mod) { /* Types.ObjectId (or ns.Type): the type Types's module exports as
+                                                              ObjectId, imported from there with it */
+            Import *im = NULL;
+            for (int i = 0; i < p->nns && !im; i++) if (strcmp(p->ns_alias[i], name.str) == 0) im = &p->mod->imports[p->ns_import[i]];
+            for (int i = 0; i < p->mod->nimports && !im; i++) {
+                Import *q = &p->mod->imports[i];
+                if (q->reexport || q->star) continue;
+                for (int k = 0; k < q->n; k++) if (strcmp(q->names[k], name.str) == 0) { im = q; break; }
+            }
+            if (im) {
+                next(p);
+                name = p->tok;
+                next(p);
+                import_add_name(im, name);
+            }
+        }
         t = named_type(p, name);
         if (at(p, TK_LT)) { /* Name<A, B>: a generic interface */
             next(p);
@@ -760,6 +872,14 @@ static void parse_args(Parser *p, ExprList *out) {
 static bool looks_like_arrow(Parser *p) {
     Parser save = *p;
     bool ok = false;
+    if (at(p, TK_LT)) { /* <T>(x: T) => ...: a generic arrow (type parameters first) */
+        next(p);
+        if (!at(p, TK_IDENT)) { *p = save; return false; }
+        int d = 1;
+        while (!at(p, TK_EOF) && d > 0) { next(p); if (at(p, TK_LT)) d++; else if (at(p, TK_GT)) d--; }
+        next(p);
+        if (!at(p, TK_LPAREN)) { *p = save; return false; }
+    }
     if (at(p, TK_IDENT)) {
         next(p);
         ok = at(p, TK_ARROW);
@@ -820,6 +940,16 @@ static Expr *parse_arrow(Parser *p) {
     int cap = 0;
     bool is_fn = accept(p, TK_FUNCTION); /* function (a: A): R { ... }: an arrow (no `this` of its own) */
     if (is_fn && at(p, TK_IDENT)) next(p);
+    /* <T>(sql: string): Promise<T | null> => ...: a generic arrow, held as a function of unknowns (T erased) whose
+       signature as written stays with it (Arrow.gen_sig): a call queryOne<Row>(...) converts the result to Row */
+    char **gtp = NULL;
+    int ngtp = 0;
+    char **gsaved = tp_names;
+    int gsaved_n = ntp;
+    if (at(p, TK_LT)) {
+        ngtp = parse_tparam_names(p, &gtp);
+        tp_push(gtp, ngtp);
+    }
     if (is_fn && !at(p, TK_LPAREN)) expect(p, TK_LPAREN, NULL);
     if (at(p, TK_IDENT)) { /* x => ... */
         Token name = p->tok;
@@ -850,6 +980,7 @@ static Expr *parse_arrow(Parser *p) {
             Param prm = {.name = name.str};
             bool opt = accept(p, TK_QUESTION); /* (x?: T) => ...: T | null, null when left out */
             if (accept(p, TK_COLON)) prm.type = parse_type(p); /* untyped parameters take their type from the context */
+            if (p->rest_tmp) rest_param(p, f, prm.type); /* ({ a, ...rest }: T) => ... */
             if (opt && prm.type) { prm.type = ty_optional_of(prm.type); prm.dflt = new_expr(E_NULL, name.pos); }
             else if (!prm.type && at(p, TK_ASSIGN) && !default_literal_type(p, &prm))
                 xs_error(XS3013, p->tok.pos, "give the parameter a type: (w: number = 2)", "parameter '%s' has no type", name.str);
@@ -864,6 +995,28 @@ static Expr *parse_arrow(Parser *p) {
         expect(p, TK_RPAREN, NULL);
         if (accept(p, TK_COLON)) f->ret = parse_type(p);
     }
+    char **ssn = subst_names;
+    Type **sst = subst_types;
+    int ssk = nsubst;
+    if (ngtp) {
+        tp_names = gsaved;
+        ntp = gsaved_n;
+        Type **ps = xs_alloc(sizeof(Type *) * (size_t)(f->nparams ? f->nparams : 1));
+        bool typed = f->ret != NULL;
+        for (int i = 0; i < f->nparams; i++) { ps[i] = f->params[i].type; if (!ps[i]) typed = false; }
+        if (typed) {
+            Type *ft = ty_func(ps, f->nparams, f->ret);
+            ft->rest = f->nparams && f->params[f->nparams - 1].rest;
+            ft->ftparams = gtp;
+            ft->nftparams = ngtp;
+            a->gen_sig = ft;
+        }
+        for (int i = 0; i < f->nparams; i++) f->params[i].type = erase_tparams(f->params[i].type, gtp, ngtp);
+        f->ret = erase_tparams(f->ret, gtp, ngtp);
+        Type **us = xs_alloc(sizeof(Type *) * (size_t)ngtp); /* the body: T is unknown */
+        for (int i = 0; i < ngtp; i++) us[i] = ty_unknown;
+        subst_push(subst_save(), gtp, us, ngtp);
+    }
     if (is_fn) { if (!at(p, TK_LBRACE)) expect(p, TK_LBRACE, NULL); }
     else expect(p, TK_ARROW, NULL);
     if (at(p, TK_LBRACE)) {
@@ -876,6 +1029,7 @@ static Expr *parse_arrow(Parser *p) {
         stmt_list_push(&b->stmts, r);
         f->body = b;
     }
+    if (ngtp) { subst_names = ssn; subst_types = sst; nsubst = ssk; }
     prepend_param_decls(f);
     a->fn = f;
     e->arrow = a;
@@ -901,7 +1055,7 @@ static Expr *parse_primary(Parser *p) {
         expect(p, TK_RPAREN, NULL);
         return e;
     }
-    if ((at(p, TK_LPAREN) || at(p, TK_IDENT)) && looks_like_arrow(p)) return parse_arrow(p);
+    if ((at(p, TK_LPAREN) || at(p, TK_IDENT) || at(p, TK_LT)) && looks_like_arrow(p)) return parse_arrow(p);
     if (at(p, TK_SLASH) || at(p, TK_SLASH_ASSIGN)) { /* /pattern/flags */
         Expr *e = new_expr(E_REGEX, pos);
         p->lx.pos = (size_t)(p->tok.start - p->lx.src);
@@ -1672,6 +1826,23 @@ static void destructure(Parser *p, Stmt *holder, bool is_const, bool array) {
             if (!at(p, TK_RBRACKET)) xs_error(XS8140, p->tok.pos, NULL, "the rest element must be the last one");
             break;
         }
+        if (!array && at(p, TK_ELLIPSIS) && !p->rest_tmp) { /* const { a, ...rest } = e: rest is e without a (rest_decl) */
+            next(p);
+            p->rest_name = expect(p, TK_IDENT, "a name for the other fields");
+            p->rest_tmp = tmp;
+            p->rest_keys = xs_alloc(sizeof(char *) * (size_t)(idx + 1));
+            p->nrest_keys = 0;
+            /* the keys: the pending reads of this pattern so far */
+            for (int i = 0; i < p->pending.len; i++) {
+                Stmt *d = p->pending.items[i];
+                Expr *r = d->init;
+                if (r && r->kind == E_COND) r = r->args.items[0];
+                if (r && r->kind == E_MEMBER && r->lhs && r->lhs->kind == E_IDENT && strcmp(r->lhs->str, tmp) == 0)
+                    p->rest_keys[p->nrest_keys++] = r->str;
+            }
+            if (!at(p, TK_RBRACE)) xs_error(XS8140, p->tok.pos, NULL, "the rest element must be the last one");
+            break;
+        }
         if (at(p, TK_DOT) || at(p, TK_ELLIPSIS)) xs_error(XS6006, p->tok.pos, "name the fields one by one", "'...rest' in an object destructuring is not supported");
         if (array && (at(p, TK_LBRACKET) || at(p, TK_LBRACE))) { /* const [a, { b }] = e: the element into a const, then its pattern */
             Pos ep = p->tok.pos;
@@ -1809,6 +1980,49 @@ static void self_ref_split(Parser *p, Stmt *s) {
     a->expr = as;
     stmt_list_push(&p->pending, a);
 }
+/* the `...rest` of an object destructuring whose value has type `src`: const rest: Omit<Src, 'a' | 'b'> = tmp (a copy
+   of the fields not taken, as JavaScript makes a new object of them) */
+static void rest_decl(Parser *p, Type *src, bool is_const) {
+    if (!p->rest_tmp) return;
+    Token rn = p->rest_name;
+    char *tmp = p->rest_tmp;
+    p->rest_tmp = NULL;
+    while (src && src->kind == TY_NULLABLE) src = src->elem;
+    if (!src || src->kind != TY_OBJECT || src->ntargs)
+        xs_error(XS6006, rn.pos, "give the destructured value a type (an interface or class), or name the fields one by one",
+                 "'...%s' needs the type of the value it comes from", rn.str);
+    static int nrest;
+    Mixin *m = xs_alloc(sizeof *m);
+    m->pos = rn.pos;
+    m->kind = "OmitType";
+    m->a = xs_alloc(sizeof *m->a);
+    m->a->pos = rn.pos;
+    m->a->cls = src->cls->name;
+    m->keys = p->rest_keys;
+    m->nkeys = p->nrest_keys;
+    Class *c = xs_alloc(sizeof *c);
+    c->pos = rn.pos;
+    c->is_interface = true;
+    c->name = xs_sprintf("__Rest_%d", ++nrest);
+    c->mod = p->mod;
+    c->exported = true;
+    c->mixin = m;
+    add_class(p->prog, c);
+    Stmt *d = new_stmt(S_VAR, rn.pos);
+    d->name = rn.str;
+    d->is_const = is_const;
+    d->decl_type = ty_object_of(c);
+    d->init = ident_expr(rn.pos, tmp);
+    stmt_list_push(&p->pending, d);
+    vt_push(p, rn.str, d->decl_type);
+}
+static void rest_param(Parser *p, Func *f, Type *t) {
+    StmtList saved = p->pending;
+    p->pending = (StmtList){0};
+    rest_decl(p, t, true);
+    for (int i = 0; i < p->pending.len; i++) stmt_list_push(&f->param_decls, p->pending.items[i]);
+    p->pending = saved;
+}
 static Stmt *parse_var(Parser *p) {
     Stmt *s = new_stmt(S_VAR, p->tok.pos);
     s->is_const = at(p, TK_CONST);
@@ -1818,6 +2032,12 @@ static Stmt *parse_var(Parser *p) {
         if (accept(p, TK_COLON)) s->decl_type = parse_type(p);
         expect(p, TK_ASSIGN, "a destructuring takes its value: const [a, b] = pair;");
         s->init = parse_expr(p);
+        if (p->rest_tmp) { /* (the type of the value: written, or the one its variable was declared with) */
+            Type *src = s->decl_type;
+            if (!src && s->init->kind == E_IDENT)
+                for (int i = p->nvt - 1; i >= 0; i--) if (strcmp(p->vt_names[i], s->init->str) == 0) { src = p->vt_types[i]; break; }
+            rest_decl(p, src, s->is_const);
+        }
         return s;
     }
     Token name = expect(p, TK_IDENT, NULL);
@@ -1998,7 +2218,6 @@ static Stmt *lower_label(Pos pos, const char *label, Stmt *loop) {
 }
 
 static void add_alias(Parser *p, const char *from, const char *to);
-static bool peek_is_ident(Parser *p);
 static Class *parse_interface(Parser *p);
 static void add_class(Program *prog, Class *c);
 static Stmt *parse_stmt(Parser *p) {
@@ -2474,6 +2693,7 @@ static void parse_params_ex(Parser *p, Func *f, bool is_ctor) {
             prm.type = parse_type(p);
             prm.type_src = span(p, tfrom);
         }
+        if (p->rest_tmp) rest_param(p, f, prm.type); /* ({ a, ...rest }: T) */
         if (opt) { /* x?: T is T | null, null when left out (printed as undefined, like JavaScript) */
             prm.type = ty_optional_of(prm.type);
             prm.dflt = new_expr(E_NULL, name.pos);
@@ -2983,6 +3203,31 @@ static void parse_fields_body(Parser *p, Class *c) {
             else if (at(p, TK_NOT) && peek_is(p, TK_COLON)) { next(p); fd.definite = true; } /* total!: number: set before it is read (by the
                                                                          constructor, or by JSON for a DTO) */
             bool inferred = false;
+            if (fd.optional && (at(p, TK_LPAREN) || at(p, TK_LT))) { /* m?(x: T): R; an optional method: a function-typed field that may be absent */
+                const char *tfrom = p->tok.start;
+                Parser look = *p; /* (read as the function type (x: T) => R) */
+                int d = 0;
+                do { if (at(&look, TK_LPAREN)) d++; else if (at(&look, TK_RPAREN)) d--; next(&look); } while (d > 0 && !at(&look, TK_EOF));
+                if (at(&look, TK_COLON)) {
+                    const char *colon = look.tok.start;
+                    Buf g = {0};
+                    buf_printf(&g, "%.*s =>", (int)(colon - tfrom), tfrom);
+                    *p = look;
+                    next(p);
+                    const char *rfrom = p->tok.start;
+                    Type *rt = parse_type(p);
+                    buf_printf(&g, " %.*s", (int)(p->prev_end - rfrom), rfrom);
+                    Parser sub = *p;
+                    lexer_init(&sub.lx, g.data);
+                    sub.lx.line = pos.line;
+                    sub.lx.col = pos.col;
+                    next(&sub);
+                    fd.type = parse_type(&sub);
+                    fd.type_src = g.data;
+                    (void)rt;
+                    inferred = true;
+                }
+            }
             if (!at(p, TK_COLON) && at(p, TK_ASSIGN) && !fd.optional) { /* logger = new Logger(X.name), count = 0: the type the
                                                                           value has, when its syntax says it */
                 Parser look = *p;
@@ -3200,6 +3445,7 @@ static bool method_object(Parser *p, Program *prog, Module *m, bool exported) {
     char *ech = NULL;
     int depth = 0;
     bool at_member = false, any_method = false, member_is_method = false, last_was_prop = false;
+    int angle = 0;
     TokKind prev = TK_LBRACE;
     const char *end = NULL;
     for (;;) {
@@ -3221,10 +3467,12 @@ static bool method_object(Parser *p, Program *prog, Module *m, bool exported) {
                 eoff[nedit] = (int)(l2.tok.start - ob); ech[nedit++] = '=';
             } else { free(eoff); free(ech); return false; }
         }
+        if (depth == 1 && k == TK_LT) angle++; /* m<T extends Record<string, unknown>>(...): Map<K, V>: commas in type arguments */
+        else if (depth == 1 && k == TK_GT && angle > 0) angle--;
         if (k == TK_LBRACE || k == TK_LPAREN || k == TK_LBRACKET) depth++;
         else if (k == TK_RBRACE || k == TK_RPAREN || k == TK_RBRACKET) {
             if (--depth == 0) { end = look.tok.start + 1; break; }
-        } else if (k == TK_COMMA && depth == 1) {
+        } else if (k == TK_COMMA && depth == 1 && angle == 0) {
             if (nedit + 1 > cap) { cap = cap ? cap * 2 : 16; eoff = realloc(eoff, sizeof(int) * (size_t)cap); ech = realloc(ech, (size_t)cap); }
             eoff[nedit] = (int)(look.tok.start - ob); ech[nedit++] = member_is_method ? ' ' : ';';
             at_member = true;
@@ -3358,20 +3606,24 @@ static void parse_require(Parser *p, Module *m) {
     m->imports[m->nimports++] = im;
 }
 /* ns.name, with ns an `import * as`: the name, now listed by that import */
+/* one more name an import brings (ns.x of import * as ns; Types.ObjectId in a type) */
+static void import_add_name(Import *im, Token name) {
+    for (int i = 0; i < im->n; i++) if (strcmp(im->names[i], name.str) == 0) return;
+    im->names = realloc(im->names, sizeof(char *) * (size_t)(im->n + 1));
+    im->positions = realloc(im->positions, sizeof(Pos) * (size_t)(im->n + 1));
+    if (im->as_names) {
+        im->as_names = realloc(im->as_names, sizeof(char *) * (size_t)(im->n + 1));
+        im->as_names[im->n] = name.str;
+    }
+    im->names[im->n] = name.str;
+    im->positions[im->n++] = name.pos;
+}
 static Expr *ns_member(Parser *p, Expr *e, Token name) {
     if (e->kind != E_IDENT || !p->nns || !p->mod) return NULL;
     int k = -1;
     for (int i = 0; i < p->nns; i++) if (strcmp(p->ns_alias[i], e->str) == 0) k = i;
     if (k < 0) return NULL;
-    Import *im = &p->mod->imports[p->ns_import[k]];
-    bool listed = false;
-    for (int i = 0; i < im->n && !listed; i++) listed = strcmp(im->names[i], name.str) == 0;
-    if (!listed) {
-        im->names = realloc(im->names, sizeof(char *) * (size_t)(im->n + 1));
-        im->positions = realloc(im->positions, sizeof(Pos) * (size_t)(im->n + 1));
-        im->names[im->n] = name.str;
-        im->positions[im->n++] = name.pos;
-    }
+    import_add_name(&p->mod->imports[p->ns_import[k]], name);
     Expr *id = ident_expr(name.pos, name.str);
     id->boolean = true; /* (read through a namespace: ns.x = v writes the module's let, as a CommonJS module object allows) */
     return id;

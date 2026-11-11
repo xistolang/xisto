@@ -217,6 +217,11 @@ typedef struct Type {
     bool rest;            /* TY_FUNC: the last parameter is ...xs: T[] (the arguments from there on, one array) */
     bool async_ret;       /* TY_FUNC: written (..) => Promise<R> (ret is R): a call not awaited can be kept as a promise */
     const char *tname;    /* TY_TPARAM; TY_STRING: a string literal type ("circle"), the only value allowed */
+    struct Type *gen_sig; /* TY_FUNC of a generic function value (<T>(sql: string) => Promise<T | null>): held and called as this
+                             type with every T as unknown; gen_sig is the signature as written (T a TY_TPARAM, names in
+                             ftparams), from which a call f<Row>(sql) takes its result type (the unknown converted to it) */
+    char **ftparams;
+    int nftparams;
 } Type;
 
 extern Type *ty_number, *ty_int, *ty_litint, *ty_boolean, *ty_string, *ty_void, *ty_null, *ty_json, *ty_unknown, *ty_any;
@@ -327,6 +332,8 @@ struct Expr {
     bool rng_set;      /* E_IDENT: a range the pass that built it proved (distribute.c's pair slot counter) */
     bool loose;        /* E_BINARY: written == or != (the same as === / !== when no coercion could happen) */
     long long rng_lo, rng_hi;
+    Type *gen_ret;     /* E_CALL of a generic function value with type arguments (f<Row>(x)): the result type its
+                          signature gives; the unknown it returns is converted to it (here, or by the await around it) */
 };
 
 typedef struct {
@@ -346,6 +353,8 @@ struct Arrow {
     bool expr_body;    /* `=> expr`: body is a block with one return (or one expression statement when void) */
     bool emitted;      /* its definition is out: a finally block is emitted twice (normal and throw paths) */
     bool synthetic;    /* made by the checker (a Promise.all/race task, a truthy test): not a callback in the source */
+    Type *gen_sig;     /* async <T>(sql: string): Promise<T | null> => ...: its signature as written (Type.gen_sig); the body
+                          reads T as unknown */
 };
 
 typedef enum { S_VAR, S_EXPR, S_IF, S_WHILE, S_FOR, S_RETURN, S_BLOCK, S_SWITCH, S_BREAK, S_CONTINUE, S_FOROF, S_TRY, S_THROW, S_YIELD } StmtKind;

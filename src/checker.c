@@ -1218,6 +1218,56 @@ static Type *ret_unpromise(Type *t, bool *async) {
     return nul ? ty_nullable_of(r) : r;
 }
 static Type *resolve(Type *t, Pos pos);
+/* generic function values (Type.gen_sig): a copy of t with the type parameters `names` bound to `args` */
+static Type *subst_ftp(Type *t, char **names, Type **args, int n) {
+    if (!t) return t;
+    if (t->kind == TY_TPARAM && t->tname)
+        for (int i = 0; i < n; i++) if (strcmp(t->tname, names[i]) == 0) return args[i];
+    Type *c = xs_alloc(sizeof *c);
+    *c = *t;
+    c->elem = subst_ftp(t->elem, names, args, n);
+    c->key = subst_ftp(t->key, names, args, n);
+    c->ret = subst_ftp(t->ret, names, args, n);
+    if (t->nparams) {
+        c->params = xs_alloc(sizeof(Type *) * (size_t)t->nparams);
+        for (int i = 0; i < t->nparams; i++) c->params[i] = subst_ftp(t->params[i], names, args, n);
+    }
+    if (t->ntargs) {
+        c->targs = xs_alloc(sizeof(Type *) * (size_t)t->ntargs);
+        for (int i = 0; i < t->ntargs; i++) c->targs[i] = subst_ftp(t->targs[i], names, args, n);
+    }
+    return c;
+}
+/* f<Row>(x) where f holds a generic function (ft->gen_sig): the result type the signature gives with these type
+   arguments (what the call's unknown is converted to); NULL without type arguments (the unknown stays) */
+static Type *gen_call_ret(Type *ft, Expr *call) {
+    Type *g = ft ? ft->gen_sig : NULL;
+    if (!g || !call->ntargs) return NULL;
+    if (call->ntargs != g->nftparams)
+        xs_error(XS8062, call->pos, NULL, "the function takes %d type argument(s), got %d", g->nftparams, call->ntargs);
+    Type **args = xs_alloc(sizeof(Type *) * (size_t)call->ntargs);
+    for (int i = 0; i < call->ntargs; i++) args[i] = resolve(call->targs[i], call->pos);
+    Type *r = resolve(subst_ftp(g->ret, g->ftparams, args, g->nftparams), call->pos);
+    bool as = false;
+    return ret_unpromise(r, &as);
+}
+static void check_expr(Expr *e, Type *expected);
+/* e (checked, of the erased result type) becomes `e as T` with T = e->gen_ret */
+static void gen_convert(Expr *e) {
+    Type *t = e->gen_ret;
+    e->gen_ret = NULL;
+    if (!t || ty_equal(t, e->type) || t->kind == TY_UNKNOWN) return;
+    Expr *in = xs_alloc(sizeof *in);
+    *in = *e;
+    in->prechecked = true;
+    memset(e, 0, sizeof *e);
+    e->kind = E_AS;
+    e->pos = in->pos;
+    e->field = -1;
+    e->lhs = in;
+    e->elem_type = t;
+    check_expr(e, NULL);
+}
 /* { a: T } written in a generic class's or function's text: each instance parses it again with T bound, and that
    makes its interface while the checker runs (after the program's classes were registered): registered here, the
    first time a type names it, with its fields resolved where it was written */
@@ -1261,6 +1311,16 @@ static Type *resolve(Type *t, Pos pos) {
         Type *r = fret(f, pos);
         *t = *r; /* (in place: whoever holds it now holds the function's type) */
         return t;
+    }
+    if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__param_of:", 11) == 0) { /* Parameters<typeof f>[i] */
+        const char *spec = t->tname + 11, *colon = strrchr(spec, ':');
+        char *fname = xs_strndup(spec, (size_t)(colon - spec));
+        int i = atoi(colon + 1);
+        Func *f = lookup_func(fname);
+        Binding *b = f ? NULL : lookup(fname);
+        if (f && !f->ntparams && i < f->nparams) { resolve_signature(f); *t = *f->params[i].type; return t; }
+        if (b && b->type->kind == TY_FUNC && i < b->type->nparams) { *t = *b->type->params[i]; return t; }
+        xs_error(XS1019, pos, "write the type itself", "Parameters<typeof %s>[%d]: no such parameter of a function '%s' here", fname, i, fname);
     }
     if (t->kind == TY_TPARAM && t->tname && strcmp(t->tname, "__nonnull") == 0) { /* NonNullable<T> */
         Type *r = ty_strip_null(resolve(t->elem, pos));
@@ -3926,6 +3986,10 @@ static void check_object_member(Expr *e, Class *c) {
         e->type = ft->ret;
         if (null_fn && ft->ret->kind != TY_VOID) e->type = ty_nullable_of(ft->ret);
         e->opt_call = null_fn;
+        if (!null_fn) { /* deps.queryOne<Row>(sql): see gen_call_ret */
+            e->gen_ret = gen_call_ret(ft, e);
+            if (e->gen_ret && !ft->async_ret) gen_convert(e);
+        }
         return;
     }
     if (c->is_tuple && !e->is_call && strcmp(e->str, "length") == 0) { /* t.length: a constant */
@@ -4677,6 +4741,10 @@ static void check_expr_in(Expr *e, Type *expected) {
             wrap_call(e->lhs, k == 4 ? "xs_promise_await_v" : "xs_promise_await_p", k == 4 ? ty_void : ty_nullable_of(ty_strip_null(t)));
         }
         e->type = e->lhs->type;
+        { /* await queryOne<Row>(sql): what the await gives, as a Row */
+            Expr *c = e->lhs->kind == E_SPAWN ? e->lhs->lhs : e->lhs;
+            if (c && c->gen_ret) { e->gen_ret = c->gen_ret; c->gen_ret = NULL; gen_convert(e); }
+        }
         return;
     }
     case E_IDENT: {
@@ -5902,6 +5970,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                     expect_type(e->args.items[i], ft->params[i], xs_sprintf("argument %d of '%s'", i + 1, name));
                 }
                 e->type = ft->ret;
+                e->gen_ret = gen_call_ret(ft, e); /* queryOne<Row>(sql): the unknown as a Row (an await around it converts what it gives) */
+                if (e->gen_ret && !ft->async_ret) gen_convert(e);
                 return;
             }
             if (b && missing_name(name)) xs_error_quiet();
@@ -7579,6 +7649,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         e->type = ty_func(ps, f->nparams, f->ret);
         e->type->rest = f->nparams && f->params[f->nparams - 1].rest;
         e->type->async_ret = f->ret_promise;
+        e->type->gen_sig = a->gen_sig; /* <T>(..) => ...: its signature as written (calls with type arguments read it) */
         return;
     }
     case E_NEW_MAP:
@@ -10560,6 +10631,7 @@ static void infer_field_type(Class *c, Field *fd) {
             if (st->kind != S_VAR || st->mod != c->mod || !st->name || strcmp(st->name, fd->init->str) != 0 || !st->is_const) continue;
             Type *t = st->decl_type ? resolve(st->decl_type, st->pos)
                     : st->init->kind == E_STRING ? ty_string : st->init->kind == E_BOOL ? ty_boolean : st->init->kind == E_NUMBER ? ty_number : NULL;
+            if (!t) t = literal_type(st->init); /* (a const object or array: the shape of its literal) */
             if (t) { fd->type = t; return; }
         }
         xs_error(XS3011, fd->pos, xs_sprintf("write the type: %s: T = %s;", fd->name, fd->init->str), "field '%s' has no type", fd->name);
