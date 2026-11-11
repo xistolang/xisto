@@ -281,6 +281,13 @@ static xs_pg_conn *xs_pg_acquire(xn_pg_NativePool *p) {
         xs_pg_conn *c = xs_pg_open(p, err, sizeof err);
         if (!c) {
             l->open--;
+            if (l->head) { /* the slot is free again: the first one waiting opens its own (or fails the same way) */
+                xs_pg_waiter *w = l->head;
+                l->head = w->next;
+                if (!l->head) l->tail = NULL;
+                w->got = NULL;
+                xs_ready_push(w->co);
+            }
             static XS_TLS char msg[300];
             snprintf(msg, sizeof msg, "%s", err);
             xs_throw(xs_Error_from(msg));
