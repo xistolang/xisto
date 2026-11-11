@@ -1573,6 +1573,7 @@ static void ensure_json(Type *t) {
     buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *o) {\n    xs_sb_put(sb, \"{\", 1);\n    bool first_ = true; (void)first_;\n", tag, c->cname);
     for (int i = 0; i < c->nfields; i++) {
         Field *f = &c->fields[i];
+        if (ty_is_undef(f->type)) continue; /* r: undefined: JSON.stringify leaves it out */
         /* optional fields that are null are left out, like undefined in JSON.stringify */
         if (f->optional) buf_printf(b, "    if (%s) {\n", not_null(f->type, xs_sprintf("o->%s", f->cname)));
         buf_printf(b, "    if (!first_) xs_sb_put(sb, \",\", 1);\n    first_ = false;\n    xs_sb_put(sb, \"\\\"%s\\\":\", %zu);\n    ", f->name, strlen(f->name) + 3);
@@ -9063,6 +9064,7 @@ static void emit_class(Class *c) {
             break;
         case TY_MAP: case TY_SET: buf_printf(out, "xs_print_map(self->%s);", fd->cname); break;
         case TY_UNION: buf_printf(out, "xs_print_any_quoted(self->%s);", fd->cname); break;
+        case TY_UNKNOWN: if (ty_is_undef(fd->type)) { buf_puts(out, "fputs(\"undefined\", XS_OUT);"); break; } /* fallthrough */
         default: break;
         }
         if (fd->optional) buf_puts(out, " }");

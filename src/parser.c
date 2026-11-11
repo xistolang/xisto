@@ -713,7 +713,7 @@ static Type *parse_type(Parser *p) {
         xs_error(XS2008, name.pos, "write the nullable type as T | null", "'null' alone is not a type");
     } else if (strcmp(n, "undefined") == 0) { /* f(): undefined, _q?: undefined: a value that is only ever empty, an unknown
                                                  (which null fits; the value undefined is read as null) */
-        t = ty_unknown;
+        t = ty_undef;
     } else if (nsubst && ({ int k_ = -1; for (int i_ = 0; i_ < nsubst; i_++) if (strcmp(subst_names[i_], n) == 0) k_ = i_; k_ >= 0 ? (t = subst_types[k_], 1) : 0; })) {
         /* an instance: T is the type it was made for */
     } else if (({ bool tp_ = false; for (int i_ = 0; i_ < ntp; i_++) if (strcmp(tp_names[i_], n) == 0) tp_ = true; tp_; })) {
