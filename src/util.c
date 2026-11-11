@@ -355,9 +355,11 @@ void stmt_list_push(StmtList *l, Stmt *s) {
 static Type t_number = {.kind = TY_NUMBER}, t_int = {.kind = TY_INT}, t_litint = {.kind = TY_LITINT},
             t_boolean = {.kind = TY_BOOLEAN}, t_string = {.kind = TY_STRING}, t_void = {.kind = TY_VOID}, t_null = {.kind = TY_NULL},
             t_json = {.kind = TY_JSON}, t_unknown = {.kind = TY_UNKNOWN},
-            t_any = {.kind = TY_UNKNOWN, .tname = "any"}; /* any: an unknown read and written by name (the dynamic path) */
+            t_any = {.kind = TY_UNKNOWN, .tname = "any"}, /* any: an unknown read and written by name (the dynamic path) */
+            t_undef = {.kind = TY_UNKNOWN, .absent = true}; /* the type undefined (f(): undefined): an unknown whose one value is
+                                                              JavaScript's undefined (null here, written "undefined") */
 Type *ty_number = &t_number, *ty_int = &t_int, *ty_litint = &t_litint, *ty_boolean = &t_boolean,
-     *ty_string = &t_string, *ty_void = &t_void, *ty_null = &t_null, *ty_json = &t_json, *ty_unknown = &t_unknown, *ty_any = &t_any;
+     *ty_string = &t_string, *ty_void = &t_void, *ty_null = &t_null, *ty_json = &t_json, *ty_unknown = &t_unknown, *ty_any = &t_any, *ty_undef = &t_undef;
 
 Type *ty_nullable_of(Type *inner) {
     if (inner->kind == TY_NULLABLE) return inner;
@@ -500,7 +502,7 @@ const char *ty_name(Type *t) {
         return b.data;
     }
     case TY_JSON: return "object";
-    case TY_UNKNOWN: return t->tname ? t->tname : "unknown";
+    case TY_UNKNOWN: return t->tname ? t->tname : t->absent ? "undefined" : "unknown";
     case TY_MAP: return xs_sprintf("Map<%s, %s>", ty_name(t->key), ty_name(t->elem));
     case TY_SET: return xs_sprintf("Set<%s>", ty_name(t->elem));
     case TY_STREAM: return xs_sprintf("Stream<%s>", ty_name(t->elem));

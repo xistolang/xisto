@@ -224,7 +224,8 @@ typedef struct Type {
     int nftparams;
 } Type;
 
-extern Type *ty_number, *ty_int, *ty_litint, *ty_boolean, *ty_string, *ty_void, *ty_null, *ty_json, *ty_unknown, *ty_any;
+extern Type *ty_number, *ty_int, *ty_litint, *ty_boolean, *ty_string, *ty_void, *ty_null, *ty_json, *ty_unknown, *ty_any, *ty_undef;
+static inline bool ty_is_undef(const Type *t) { return t && t->kind == TY_UNKNOWN && !t->tname && t->absent; } /* the type undefined */
 extern bool xs_any_used; /* checker.c: the program reads or writes an any by name */
 static inline bool ty_is_any(const Type *t) { return t && t->kind == TY_UNKNOWN && t->tname; } /* any: the dynamic path */
 Type *ty_nullable_of(Type *inner);
