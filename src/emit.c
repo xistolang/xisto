@@ -2518,7 +2518,10 @@ static char *from_unknown(Type *t, const char *expr) {
         const char *fr = arr_is_ref(b) ? "xs_arr_ref_free" : xs_sprintf("%s_free", arr_struct(b));
         return xs_sprintf("((%s)xs_as_ref(%s, %s, %d, \"%s\"))", ctype(b), expr, fr, nul, what);
     }
-    case TY_MAP: case TY_SET: return xs_sprintf("((xs_map *)xs_as_ref(%s, xs_map_free, %d, \"%s\"))", expr, nul, what);
+    case TY_MAP: case TY_SET:
+        if (b->kind == TY_MAP && b->record && b->key->kind == TY_STRING && b->elem->kind == TY_UNKNOWN) /* (an object of a class too: its fields) */
+            return xs_sprintf("((xs_map *)xs_as_record(%s, %d, \"%s\"))", expr, nul, what);
+        return xs_sprintf("((xs_map *)xs_as_ref(%s, xs_map_free, %d, \"%s\"))", expr, nul, what);
     case TY_FUNC: return xs_sprintf("((xs_closure *)xs_as_closure(%s, %d))", expr, nul);
     case TY_JSON: case TY_UNKNOWN: return xs_sprintf("(%s)", expr);
     default: return xs_sprintf("NULL");

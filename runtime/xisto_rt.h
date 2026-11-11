@@ -2972,6 +2972,25 @@ XS_NOINLINE void xs_dyn_set(void *o, xs_str *k, void *v) {
     }
     xs_dyn_fail_write(o, k, "it has no fields");
 }
+/* x as Record<string, V> from an unknown: a Record is itself; an object of a class becomes a Record of its fields (a copy:
+   Object.entries(data as Record<string, unknown>) reads it, as JavaScript reads any object's own properties; writing
+   to the copy does not change the object). Borrowed, as a cast's value is: the copy lives until the arena drains. */
+XS_NOINLINE void *xs_as_record(void *v, int nullable, const char *what) {
+    if (!v) { if (nullable) return NULL; xs_as_fail(what); }
+    const xs_type *t = xs_type_of(v);
+    if (t->free == xs_map_free && ((xs_map *)v)->str_keys) return v;
+    if (!t->dyn) xs_as_fail(what);
+    xs_map *m = xs_map_rec(xs_map_new(1, 1, 3, xs_print_str_quoted_, xs_print_any_quoted));
+    for (int32_t i = 0; i < t->dyn->n; i++) {
+        const xs_dyn_field *f = &t->dyn->f[i];
+        xs_str *k = xs_str_new(f->name, f->len);
+        xs_val x;
+        x.p = xs_dyn_load(f, v);
+        xs_map_set_s(m, k, x);
+        xs_release_(k);
+    }
+    return xs_ar_(m);
+}
 XS_NOINLINE void xs_dyn_set_any(void *o, void *k, void *v) {
     if (k && xs_type_of(k)->free == xs_str_free) { xs_dyn_set(o, k, v); return; }
     int64_t i = xs_dyn_as_int(k);
