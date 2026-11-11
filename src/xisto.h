@@ -544,6 +544,8 @@ struct Class {
     bool data_only;    /* fields without initializer and no constructor (a DTO): made from JSON, never with new */
     /* inheritance: the base's fields come first (prefix layout), its methods are listed too (their cls is the base) */
     char *base_name;
+    struct Type **base_targs; /* class X extends Base<A, B>: the base is that instance of the generic Base */
+    int nbase_targs;
     Pos base_pos;
     struct Class *base;
     struct Class **subs; /* direct subclasses */
@@ -588,6 +590,7 @@ struct Class {
 typedef struct Mixin {
     const char *kind;  /* "PartialType", ...; NULL: just the class */
     const char *cls;
+    struct Class *klass; /* the class itself, when the parser had it (T bound in a generic's instance): not looked up by name */
     Pos pos;
     struct Mixin *a, *b;
     char **keys;

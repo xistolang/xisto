@@ -1282,6 +1282,7 @@ static void gen_convert(Expr *e) {
    makes its interface while the checker runs (after the program's classes were registered): registered here, the
    first time a type names it, with its fields resolved where it was written */
 static void flatten_fields(Class *c, int depth);
+static void apply_mixin(Class *c);
 static bool late_inline_class(Class *c) {
     bool in_prog = false;
     for (int i = prog->nclasses - 1; i >= 0 && !in_prog; i--) in_prog = prog->classes[i] == c;
@@ -1293,6 +1294,7 @@ static bool late_inline_class(Class *c) {
     Scope *saved_scope = scope;
     const char *sfn = xs_file_name, *ssrc = xs_source;
     enter_module(c->mod);
+    if (c->mixin && !c->mixin_done) apply_mixin(c); /* Partial<T> in a generic's instance */
     flatten_fields(c, 0);
     for (int k = 0; k < c->nfields; k++) {
         Field *fd = &c->fields[k];
@@ -3617,7 +3619,7 @@ static void class_fields_all(Class *k, FieldSet *out) {
     if (k->base_name) {
         Module *was = cur_mod;
         enter_module(k->mod);
-        Class *b = find_class(k->base_name);
+        Class *b = k->base ? k->base : find_class(k->base_name);
         enter_module(was);
         if (b && !b->builtin) class_fields_all(b, out);
     }
@@ -3636,7 +3638,7 @@ static bool key_in(Mixin *m, const char *name) {
 }
 static void mixin_eval(Mixin *m, FieldSet *out) {
     if (!m->kind) {
-        Class *k = find_class(m->cls);
+        Class *k = m->klass ? m->klass : find_class(m->cls);
         if (!k || k->builtin) xs_error(XS9031, m->pos, NULL, "unknown class '%s'", m->cls);
         Module *was = cur_mod;
         enter_module(k->mod);
@@ -10822,6 +10824,14 @@ void check_program(Program *p) {
                 if (missing_name(c->base_name)) xs_error_quiet();
                 xs_error(XS9031, c->base_pos, xs_help_suggest(c->base_name, cands, n, NULL), "unknown class '%s'", c->base_name);
             }
+            if (c->nbase_targs && !c->ntparams) { /* class X extends Base<A>: the instance Base<A> is the base */
+                if (b->ntparams != c->nbase_targs)
+                    xs_error(XS8063, c->base_pos, NULL, "'%s' takes %d type argument(s), got %d", b->name, b->ntparams, c->nbase_targs);
+                Type **args = xs_alloc(sizeof(Type *) * (size_t)c->nbase_targs);
+                for (int k = 0; k < c->nbase_targs; k++) args[k] = resolve(c->base_targs[k], c->base_pos);
+                b = instantiate_class(b, args, c->base_pos);
+                enter_module(c->mod);
+            } else if (c->nbase_targs) xs_error(XS6022, c->base_pos, NULL, "a generic class extending a generic class is not supported yet");
             if (b->is_interface) xs_error(XS9004, c->base_pos, xs_sprintf("class %s implements %s", c->name, b->name), "'%s' is an interface; a class extends classes", b->name);
             if (b->builtin && strcmp(b->name, "Error") == 0) { error_class(c); continue; }
             if (b->builtin) xs_error(XS6024, c->base_pos, "wrap it in a field instead", "extending the built-in class %s is not supported", b->name);
