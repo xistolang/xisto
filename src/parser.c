@@ -288,6 +288,7 @@ static Mixin *mixin_of_type(Type *t, Pos pos) {
     Mixin *m = xs_alloc(sizeof *m);
     m->pos = pos;
     m->cls = t->cls->name;
+    if (t->cls->mod || t->cls->builtin) m->klass = t->cls; /* (a class already registered: T bound in an instance) */
     return m;
 }
 /* 'a' | 'b': the keys of Omit/Pick */
@@ -727,7 +728,12 @@ static Type *parse_type(Parser *p) {
         m->kind = n[0] == 'O' ? "OmitType" : n[1] == 'i' ? "PickType" : n[0] == 'R' ? "RequiredType" : "PartialType";
         bool one_arg = n[0] == 'R' || n[1] == 'a'; /* Partial<A>, Required<A> */
         Type *inner = parse_type(p);
-        if (inner->kind == TY_MAP) { /* Partial<Record<K, V>>: a Record's keys are already optional */
+        if (inner->kind == TY_TPARAM && ntp && !nsubst) { /* Partial<T> in a generic template's own text: each instance parses it
+                                                             again with T bound (the template itself is not checked) */
+            if (!one_arg) { expect(p, TK_COMMA, NULL); parse_type(p); }
+            expect(p, TK_GT, NULL);
+            t = inner;
+        } else if (inner->kind == TY_MAP) { /* Partial<Record<K, V>>: a Record's keys are already optional */
             if (!one_arg) { expect(p, TK_COMMA, NULL); parse_type(p); }
             expect(p, TK_GT, NULL);
             t = inner;
@@ -2966,7 +2972,8 @@ static Class *parse_class_ex(Parser *p, bool abstract) {
             c->base_name = bt.str;
             c->mixin_call = xs_sprintf("%s.__mixin%s", bt.str, span(p, from));
         } else c->base_name = bt.str;
-        if (at(p, TK_LT)) xs_error(XS6022, p->tok.pos, NULL, "extending a generic class is not supported yet");
+        if (at(p, TK_LT) && c->base_name && !c->mixin_call) c->nbase_targs = parse_type_args(p, &c->base_targs); /* extends Base<Profile> */
+        else if (at(p, TK_LT)) xs_error(XS6022, p->tok.pos, NULL, "extending a generic class is not supported yet");
     }
     if (at_ident(p, "implements")) { /* recorded; the methods are what the framework calls */
         next(p);
