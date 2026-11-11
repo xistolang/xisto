@@ -5,6 +5,17 @@
 # Without the variable the test is skipped, not failed. expected.txt is what node-oracledb 6 thin prints for the
 # same operations; the client runs in America/Sao_Paulo since DATE and TIMESTAMP are read in the local time zone.
 cd "$(dirname "$0")" || exit 1
+# without a database: a pool that cannot connect (closed port), more requests than poolMax at once
+X0=$(cd ../.. && pwd)/build/xisto
+OUT0=../../build/tests/oracledb
+mkdir -p "$OUT0/.xisto/pkgs"
+ln -sfn "$(cd ../../packages/oracledb && pwd)" "$OUT0/.xisto/pkgs/oracledb"
+cp pool-refused.ts "$OUT0/pool-refused.ts"
+XISTO_NODE_COMPAT=1 $X0 build --no-warnings -o "$OUT0/pool-refused" "$OUT0/pool-refused.ts" || exit 1
+if ! perl -e 'alarm 30; exec @ARGV' "$OUT0/pool-refused" > "$OUT0/pool-refused.txt" 2>&1 || ! cmp -s expected-pool-refused.txt "$OUT0/pool-refused.txt"; then
+    echo "FAIL: pool with a closed port"; diff expected-pool-refused.txt "$OUT0/pool-refused.txt"; exit 1
+fi
+echo "ok: pool with a closed port (no request waits forever)"
 if [ -z "$XISTO_ORACLE_URL" ]; then echo "skip: XISTO_ORACLE_URL is not set (oracle://user:password@127.0.0.1:1521/FREEPDB1)"; exit 0; fi
 X=$(cd ../.. && pwd)/build/xisto
 OUT=../../build/tests/oracledb

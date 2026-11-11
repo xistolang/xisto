@@ -802,6 +802,13 @@ static xs_ora_conn *xs_ora_acquire(xn_oracledb_NativePool *p) {
         }
         void *e = xs_caught();
         l->open--;
+        if (l->head) { /* the slot is free again: the first one waiting opens its own (or fails the same way) */
+            xs_ora_waiter *w = l->head;
+            l->head = w->next;
+            if (!l->head) l->tail = NULL;
+            w->got = NULL;
+            xs_ready_push(w->co);
+        }
         xs_throw(e);
     }
     /* on the heap: tasks share one stack, and a parked task's stack is not where it was while others run */
