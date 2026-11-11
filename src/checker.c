@@ -4592,6 +4592,7 @@ static void check_expr_in(Expr *e, Type *expected) {
     if (e->kind == E_CALL && !e->lhs && e->builtin.cfn && e->type) return; /* a runtime call the checker made (wrap_call): checked */
     switch (e->kind) {
     case E_SPAWN: return; /* (made by the checker, already checked) */
+    case E_UPCAST: case E_SUPER_CALL: return; /* (made by the checker with their types: a walk that checks again leaves them) */
     case E_NUMBER:
         e->type = e->is_int_lit ? ty_litint : ty_number;
         if (expected && is_numeric(expected)) coerce_lit(e, expected);
@@ -4942,7 +4943,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 expect_type(e->rhs, nw, "default after '||'");
                 want = nw;
             } else
-            expect_type(e->rhs, want, "default after '||'");
+                expect_type(e->rhs, want, "default after '||'");
             if (!rereadable(e->lhs)) { /* f() || d: the left side is evaluated once (the emitter keeps it in a temporary) */
                 Expr *dflt = e->rhs;
                 e->kind = E_COND;
