@@ -2473,7 +2473,16 @@ static void emit_dyn_tables(Program *p) {
             buf_puts(&tabs, "},\n");
         }
         if (c->nfields) buf_puts(&tabs, "};\n");
-        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s};\n", c->cname, c->name, c->nfields, c->nfields ? xs_sprintf("%s_dynf", c->cname) : "NULL");
+        int nm = 0; /* its methods' names, its bases' too (typeof x.toJSON === "function" through an any) */
+        for (Class *k = c; k; k = k->base)
+            for (int j = 0; j < k->nmethods; j++) {
+                if (!nm) buf_printf(&tabs, "static const char *const %s_dynm[] = {", c->cname);
+                buf_printf(&tabs, "%s\"%s\"", nm ? ", " : "", k->methods[j]->name);
+                nm++;
+            }
+        if (nm) buf_puts(&tabs, "};\n");
+        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s};\n", c->cname, c->name, c->nfields, c->nfields ? xs_sprintf("%s_dynf", c->cname) : "NULL",
+                   nm, nm ? xs_sprintf("%s_dynm", c->cname) : "NULL");
     }
     if (fns.data) buf_puts(out, fns.data);
     if (tabs.data) buf_puts(out, tabs.data);

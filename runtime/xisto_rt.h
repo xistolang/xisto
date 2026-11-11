@@ -2802,7 +2802,15 @@ XS_NOINLINE double xs_math_min_ints(xs_arr_int *a) { double m = INFINITY; for (s
    field). An object made as an any ({} or { a: 1 } typed any) is a Record<string, unknown>. ---- */
 enum { XD_NUM, XD_INT, XD_BOOL, XD_NNUM, XD_NINT, XD_NBOOL, XD_STR, XD_REF, XD_ANY };
 typedef struct { const char *name; uint32_t len, off; uint8_t kind, nullable, optional; bool (*isa)(void *); const char *tname; } xs_dyn_field;
-typedef struct xs_dyn_cls { const char *name; int32_t n; const xs_dyn_field *f; } xs_dyn_cls;
+typedef struct xs_dyn_cls { const char *name; int32_t n; const xs_dyn_field *f; int32_t nm; const char *const *m; } xs_dyn_cls; /* m: its methods' names */
+/* a method read by name through an any (typeof x.toJSON === "function"): a function whose call is not supported yet */
+XS_NOINLINE void xs_dyn_method_called(void) { xs_panic("TypeError: a method read through an any cannot be called (call it on a value of its class)"); }
+static xs_closure xs_dyn_method_cl = {{XS_IMMORTAL, 0}, (void *)xs_dyn_method_called};
+static void xs_Date_free(void *p);
+static bool xs_dyn_has_method(const xs_dyn_cls *c, xs_str *k) {
+    for (int32_t i = 0; i < c->nm; i++) if (strlen(c->m[i]) == (size_t)k->len && memcmp(c->m[i], k->data, (size_t)k->len) == 0) return true;
+    return false;
+}
 static double xs_str_to_number(xs_str *s);
 static xs_str *xs_str_from_int(int64_t v);
 static const xs_dyn_field *xs_dyn_field_of(const xs_dyn_cls *c, xs_str *k) {
@@ -2863,9 +2871,14 @@ XS_NOINLINE void *xs_dyn_get(void *o, xs_str *k) {
     const xs_type *t = xs_type_of(o);
     if (t->dyn) {
         const xs_dyn_field *f = xs_dyn_field_of(t->dyn, k);
-        if (!f) return NULL; /* a field the class does not declare reads as undefined, as in JavaScript (err?.status || 500);
-                                writing one is still an error: no field is made */
+        if (!f) return xs_dyn_has_method(t->dyn, k) ? xs_cl_static(&xs_dyn_method_cl) : NULL; /* a field the class does not
+                                declare reads as undefined, as in JavaScript (err?.status || 500); writing one is still an error */
         return xs_dyn_load(f, o);
+    }
+    if (t->free == xs_Date_free) { /* a Date's methods (typeof d.toJSON === "function"); it has no fields */
+        static const char *const dm[] = {"toJSON", "toISOString", "getTime", "valueOf", "toString"};
+        static const xs_dyn_cls dc = {"Date", 0, NULL, 5, dm};
+        return xs_dyn_has_method(&dc, k) ? xs_cl_static(&xs_dyn_method_cl) : NULL;
     }
     if (t->free == xs_Error_free) { /* an Error seen as any: its own fields, then the object it was thrown as (err.status) */
         xs_Error *e = o;
