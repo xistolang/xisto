@@ -344,6 +344,7 @@ static Class *find_class(const char *name) {
         Class *c = e->decl;
         if (c->mod == cur_mod || (c->exported && imports_name(cur_mod, c->mod, name))) return c;
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:errors") == 0) return c; /* (TypeError & co: global, like Error) */
+        if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:intl") == 0 && strncmp(name, "Intl_", 5) == 0) return c; /* (Intl.X: global) */
     }
     if (strcmp(name, "RegExpMatchArray") == 0) name = "RegExpExecArray"; /* TypeScript's two names for a match */
     bool wt = strcmp(name, "Worker") == 0 || strcmp(name, "MessagePort") == 0;
@@ -3892,6 +3893,18 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
                 cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
                 ctx = ty_func(ps, pt->nparams, has_tparam(rt) ? NULL : rt);
                 ctx->async_ret = pt_async; /* (fn: () => Promise<T>) with () => c ? f() : Promise.resolve(x): async */
+            }
+        }
+        if (!arrow && partial) { /* xs.reduce<Record<string, V>>(f, {}): the type given for A is the {}'s */
+            Type *sb = subst_bound(pt, tmpl, bind);
+            if (!has_tparam(sb)) {
+                Module *dm = tmpl->cls ? tmpl->cls->mod : tmpl->mod;
+                Module *was = cur_mod;
+                Scope *ss = scope;
+                const char *sfn = xs_file_name, *ssrc = xs_source;
+                if (dm && dm != cur_mod) enter_module(dm);
+                ctx = resolve(sb, e->pos);
+                cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
             }
         }
         check_expr(e->args.items[i], ctx);

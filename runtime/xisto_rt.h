@@ -4302,6 +4302,58 @@ static inline uint64_t xs_now(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+/* Intl.DateTimeFormat with a timeZone (xisto:intl): the wall clock of a zone of the system TZ database at an instant,
+   as [year, month 1-12, day, hour, minute, second, weekday]; a zone the system does not know is a RangeError, as in Node */
+XS_NOINLINE xs_arr_int *xs_tz_fields(double ms, xs_str *zone) {
+    char z[160];
+    size_t n = zone->len < sizeof z - 1 ? (size_t)zone->len : sizeof z - 1;
+    memcpy(z, zone->data, n);
+    z[n] = 0;
+    time_t t = (time_t)floor(ms / 1000.0);
+    struct tm tm;
+#if defined(_WIN32)
+    gmtime_s(&tm, &t); /* (no TZ database: UTC) */
+#else
+    bool utc = strcmp(z, "UTC") == 0 || strcmp(z, "Etc/UTC") == 0 || strcmp(z, "GMT") == 0;
+    if (!utc) {
+        char path[256];
+        bool known = strstr(z, "..") == NULL && z[0] != '/';
+        if (known) {
+            snprintf(path, sizeof path, "/usr/share/zoneinfo/%s", z);
+            known = access(path, R_OK) == 0;
+            if (!known) { snprintf(path, sizeof path, "/var/db/timezone/zoneinfo/%s", z); known = access(path, R_OK) == 0; }
+        }
+        if (!known) {
+            static XS_TLS char msg[220];
+            snprintf(msg, sizeof msg, "RangeError: Invalid time zone specified: %s", z);
+            xs_panic(msg);
+        }
+    }
+    if (utc) gmtime_r(&t, &tm);
+    else {
+        const char *old = getenv("TZ");
+        char *saved = old ? strdup(old) : NULL;
+        setenv("TZ", z, 1);
+        tzset();
+        localtime_r(&t, &tm);
+        if (saved) { setenv("TZ", saved, 1); free(saved); } else unsetenv("TZ");
+        tzset();
+    }
+#endif
+    xs_arr_int *a = xs_arr_int_new(0, 0);
+    xs_arr_int_push(a, tm.tm_year + 1900);
+    xs_arr_int_push(a, tm.tm_mon + 1);
+    xs_arr_int_push(a, tm.tm_mday);
+    xs_arr_int_push(a, tm.tm_hour);
+    xs_arr_int_push(a, tm.tm_min);
+    xs_arr_int_push(a, tm.tm_sec);
+    xs_arr_int_push(a, tm.tm_wday);
+    return a;
+}
+
 typedef struct xs_prof { const char *name; uint64_t calls, ns, self_ns; struct xs_prof *next; } xs_prof;
 static xs_prof *xs_prof_list;
 static uint64_t xs_prof_child_ns; /* time spent in callees of the running function, for self time */
