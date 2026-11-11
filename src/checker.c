@@ -1283,6 +1283,7 @@ static void gen_convert(Expr *e) {
    first time a type names it, with its fields resolved where it was written */
 static void flatten_fields(Class *c, int depth);
 static void apply_mixin(Class *c);
+static Func *find_method(Class *c, const char *name);
 static bool late_inline_class(Class *c) {
     bool in_prog = false;
     for (int i = prog->nclasses - 1; i >= 0 && !in_prog; i--) in_prog = prog->classes[i] == c;
@@ -1322,6 +1323,21 @@ static Type *resolve(Type *t, Pos pos) {
         if (!f || f->ntparams) xs_error(XS1019, pos, "write the type itself", "ReturnType<typeof %s>: no function '%s' here", t->tname + 12, t->tname + 12);
         Type *r = fret(f, pos);
         *t = *r; /* (in place: whoever holds it now holds the function's type) */
+        return t;
+    }
+    if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__pick:", 7) == 0) { /* Pick<A | B, 'k'>: the union (see parser) */
+        Type *u = resolve(t->elem, pos);
+        Type *b = ty_strip_null(u);
+        Type **ms = b->kind == TY_UNION ? b->params : &b;
+        int n = b->kind == TY_UNION ? b->nparams : 1;
+        char *keys = xs_sprintf("%s", t->tname + 7);
+        for (char *k = strtok(keys, "|"); k; k = strtok(NULL, "|"))
+            for (int i = 0; i < n; i++) {
+                Class *c = ms[i]->kind == TY_OBJECT ? ms[i]->cls : NULL;
+                if (!c || c->builtin || (!find_field(c, k, NULL) && !find_method(c, k)))
+                    xs_error(XS1019, pos, "pick from interfaces or classes that have the key", "Pick: %s has no '%s'", ty_name(ms[i]), k);
+            }
+        *t = *u;
         return t;
     }
     if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__param_of:", 11) == 0) { /* Parameters<typeof f>[i] */
@@ -6751,6 +6767,46 @@ static void check_expr_in(Expr *e, Type *expected) {
             expr_list_push(&e->args, txt);
             check_expr(e, expected && expected->kind != TY_UNKNOWN ? expected : ty_any);
             return;
+        }
+        if (e->lhs->type->kind == TY_UNION && e->is_call && e->str && rereadable(e->lhs)) {
+            /* exec.query(sql) with exec: DataSource | EntityManager (Pick<A | B, 'query'>), every member a class with the
+               method: called on the class the object has, exec instanceof A ? (exec as A).query(sql) : ... (one runs,
+               so the arguments, copies of plain expressions, are evaluated once) */
+            Type *u = e->lhs->type;
+            bool all = true;
+            for (int i = 0; i < u->nparams && all; i++) {
+                Class *c = u->params[i]->kind == TY_OBJECT ? u->params[i]->cls : NULL;
+                all = c && !c->builtin && !c->is_interface && find_method(c, e->str);
+            }
+            for (int i = 0; i < e->args.len && all; i++) all = pure_copy(e->args.items[i]) != NULL;
+            if (all) {
+                bool awaited = pr_awaited == e;
+                Expr *chain = NULL;
+                for (int i = u->nparams - 1; i >= 0; i--) {
+                    Class *c = u->params[i]->cls;
+                    Expr *as = xs_alloc(sizeof *as);
+                    as->kind = E_AS; as->pos = e->pos; as->field = -1; as->lhs = pure_copy(e->lhs); as->elem_type = u->params[i];
+                    Expr *call = xs_alloc(sizeof *call);
+                    call->kind = E_MEMBER; call->pos = e->pos; call->field = -1; call->is_call = true; call->str = e->str; call->lhs = as;
+                    call->targs = e->targs; call->ntargs = e->ntargs;
+                    for (int k = 0; k < e->args.len; k++) expr_list_push(&call->args, i == 0 ? e->args.items[k] : pure_copy(e->args.items[k]));
+                    Expr *br = call;
+                    if (awaited) { br = xs_alloc(sizeof *br); br->kind = E_AWAIT; br->pos = e->pos; br->field = -1; br->lhs = call; }
+                    if (!chain) { chain = br; continue; }
+                    Expr *cn = xs_alloc(sizeof *cn);
+                    cn->kind = E_IDENT; cn->pos = e->pos; cn->field = -1; cn->str = c->name;
+                    Expr *io = xs_alloc(sizeof *io);
+                    io->kind = E_BINARY; io->op = TK_IDENT; io->pos = e->pos; io->field = -1; io->lhs = pure_copy(e->lhs); io->rhs = cn;
+                    Expr *cond = xs_alloc(sizeof *cond);
+                    cond->kind = E_COND; cond->pos = e->pos; cond->field = -1; cond->lhs = io;
+                    expr_list_push(&cond->args, br);
+                    expr_list_push(&cond->args, chain);
+                    chain = cond;
+                }
+                *e = *chain;
+                check_expr(e, expected);
+                return;
+            }
         }
         if (e->lhs->type->kind == TY_UNION) { /* s.kind: a field every member has, read by the object's class */
             Type *u = e->lhs->type;

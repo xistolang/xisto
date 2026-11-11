@@ -733,6 +733,23 @@ static Type *parse_type(Parser *p) {
             if (!one_arg) { expect(p, TK_COMMA, NULL); parse_type(p); }
             expect(p, TK_GT, NULL);
             t = inner;
+        } else if (inner->kind == TY_UNION && !strcmp(m->kind, "PickType")) {
+            /* Pick<DataSource | EntityManager, 'query'>: what the members share by those keys; held as the union itself
+               (its values are one of them), each key checked to be in every member (resolve) */
+            expect(p, TK_COMMA, "write Pick<A, 'key'>");
+            Type *ks = parse_type(p);
+            expect(p, TK_GT, NULL);
+            Buf kb = {0};
+            Type **kv = ks->kind == TY_UNION ? ks->params : &ks;
+            int kn = ks->kind == TY_UNION ? ks->nparams : 1;
+            for (int i = 0; i < kn; i++) {
+                if (kv[i]->kind != TY_STRING || !kv[i]->tname) xs_error(XS1019, name.pos, "name the keys: Pick<A, 'id' | 'name'>", "the keys are string literals");
+                buf_printf(&kb, "%s%s", i ? "|" : "", kv[i]->tname);
+            }
+            t = xs_alloc(sizeof *t);
+            t->kind = TY_TPARAM;
+            t->tname = xs_sprintf("__pick:%s", kb.data);
+            t->elem = inner;
         } else if (inner->kind == TY_MAP) { /* Partial<Record<K, V>>: a Record's keys are already optional */
             if (!one_arg) { expect(p, TK_COMMA, NULL); parse_type(p); }
             expect(p, TK_GT, NULL);
