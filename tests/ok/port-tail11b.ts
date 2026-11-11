@@ -33,7 +33,7 @@ function mk(id: string, extra: Partial<Item> = {}): Item {
   return { id, estado: "virado", ...extra, impacto: { frequencia: "por autorização", umAUm: "igual", ...extra.impacto } };
 }
 for (const it of [mk("a"), mk("b", { estado: "novo", impacto: { volume: "10" } }), mk("c", { impacto: { frequencia: "mensal" } })])
-  console.log(it.id, it.estado, it.impacto?.frequencia, it.impacto?.volume ?? "-", it.impacto?.umAUm);
+console.log(it.id, it.estado, it.impacto?.frequencia, it.impacto?.volume ?? "-", it.impacto?.umAUm);
 // Array.isArray on an any keeps it any (any[]); a callback that takes no parameter
 function anoDe(rows: any): number {
   if (!Array.isArray(rows) || rows.length !== 1) return -1;
