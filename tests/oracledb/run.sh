@@ -5,6 +5,10 @@
 # Without the variable the test is skipped, not failed. expected.txt is what node-oracledb 6 thin prints for the
 # same operations; the client runs in America/Sao_Paulo since DATE and TIMESTAMP are read in the local time zone.
 cd "$(dirname "$0")" || exit 1
+# without a database: the login ciphers against known answers
+mkdir -p ../../build/tests/oracledb
+if ! cc -O1 -w -o ../../build/tests/oracledb/crypto-kat crypto-kat.c || ! ../../build/tests/oracledb/crypto-kat; then echo "FAIL: login ciphers"; exit 1; fi
+echo "ok: login ciphers (DES, AES-128/192/256, MD5, 10g verifier) match the known answers"
 # without a database: a pool that cannot connect (closed port), more requests than poolMax at once
 X0=$(cd ../.. && pwd)/build/xisto
 OUT0=../../build/tests/oracledb
@@ -36,4 +40,10 @@ for tz in America/Sao_Paulo; do
     if ! cmp -s expected-outbinds.txt "$OUT/outbinds.txt"; then echo "FAIL: OUT binds ($tz)"; diff expected-outbinds.txt "$OUT/outbinds.txt"; exit 1; fi
     if ! grep -q ' 0 still alive' "$OUT/outbinds-stats.txt"; then echo "FAIL: leak (OUT binds): $(cat "$OUT/outbinds-stats.txt")"; exit 1; fi
 done
+cp pool-txn.ts "$OUT/pool-txn.ts"
+XISTO_NODE_COMPAT=1 $X build --no-warnings -o "$OUT/pool-txn" "$OUT/pool-txn.ts" || exit 1
+if ! "$OUT/pool-txn" > "$OUT/pool-txn.txt" 2>&1 || ! cmp -s expected-pool-txn.txt "$OUT/pool-txn.txt"; then
+    echo "FAIL: pool release and open transactions"; diff expected-pool-txn.txt "$OUT/pool-txn.txt"; exit 1
+fi
+echo "ok: pool release rolls back only an open transaction (nothing uncommitted reaches the next borrower)"
 echo "ok: oracledb client (fast and classic login, types, DML, binds, transactions, ORA errors, 250 rows, CLOB/BLOB, 1500 statements, pool, 0 alive; OUT/IN OUT binds by name and position, NUMBER/STRING/DATE/BOOLEAN/CLOB/BLOB, NULL, 32767 bytes, CLOB/BLOB temporary LOBs)"

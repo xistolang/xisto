@@ -1,5 +1,5 @@
 // typeorm's OracleDriver over node-oracledb's shape, given as functions: results normalized from rows/rowsAffected,
-// a statement outside a transaction committed and its connection closed, a QueryRunner's commit/rollback/release
+// a statement outside a transaction committed with it (autocommit) and its connection closed, a QueryRunner's commit/rollback/release
 // on one pinned connection (no database: the functions record what they are asked)
 import { Column, DataSource, Entity, OracleConnectionFunctions, OracleDriver, OraclePoolFunctions, PrimaryColumn } from "typeorm";
 
@@ -18,8 +18,8 @@ function connection(): OracleConnectionFunctions {
   const n = opened;
   opened = opened + 1;
   return {
-    execute: async (sql: string, binds: unknown[]): Promise<object> => {
-      log.push("c" + String(n) + " execute " + sql + " [" + String(binds.length) + "]");
+    execute: async (sql: string, binds: unknown[], autoCommit: boolean): Promise<object> => {
+      log.push("c" + String(n) + " execute " + sql + " [" + String(binds.length) + "]" + (autoCommit ? " autocommit" : ""));
       if (sql.startsWith("SELECT COUNT")) {
         const r: object = JSON.parse('{"rows":[{"cnt":4}]}');
         return r;
