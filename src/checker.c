@@ -4856,8 +4856,8 @@ static void check_expr_in(Expr *e, Type *expected) {
             UNarrow un = union_narrow(e->lhs);
             if (un.b) {
                 push_scope();
-                shadow_set(&ts);
                 shadow_union(un.b, un.then_t);
+                shadow_set(&ts);
                 check_expr(e->rhs, NULL);
                 pop_scope();
             } else if (ts.n) {
@@ -4874,8 +4874,8 @@ static void check_expr_in(Expr *e, Type *expected) {
             narrow_set(e->lhs, false, &fs);
             UNarrow un = union_narrow(e->lhs); /* !(e instanceof X) || e.code: X on the right */
             push_scope();
-            shadow_set(&fs);
             if (un.b && un.else_t) shadow_union(un.b, un.else_t);
+            shadow_set(&fs);
             check_expr(e->rhs, NULL);
             pop_scope();
         } else if (e->op == TK_IDENT) { /* instanceof: the right side is a class name, checked below */
@@ -7645,6 +7645,21 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
+        if (!elem && e->args.len > 1) { /* [{ term: .. }, exato('runId', id)] with exato giving a Record<string, unknown>: the
+                                            Record, the objects copied in (as in a spread literal) */
+            Type *rec = NULL;
+            bool fits = true;
+            for (int i = 0; i < e->args.len; i++) {
+                Type *t = e->args.items[i]->type;
+                if (t->kind == TY_MAP && t->record && t->key->kind == TY_STRING && t->elem->kind == TY_UNKNOWN) { if (!rec) rec = t; }
+                else if (!(t->kind == TY_OBJECT && plain_data(t->cls))) fits = false;
+            }
+            if (rec && fits) {
+                for (int i = 0; i < e->args.len; i++) expect_type(e->args.items[i], rec, "array element");
+                e->type = ty_array_of(rec);
+                return;
+            }
+        }
         if (!elem && tsc_checked() && e->args.len > 2) { /* (two elements: a [key, value] pair, a tuple where one goes) */
             /* --tsc-checked: [date, 'x', n], [s, xs]: elements of kinds no one of them takes all the others (TypeScript:
                a union element type), an unknown[] (each element as what it is, checked where it is read) */
@@ -7743,19 +7758,19 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (ea && !eb) {
                 push_scope();
                 if (un.b) shadow_union(un.b, un.else_t);
-                else shadow_set(&fs);
+                shadow_set(&fs);
                 check_expr(b, NULL);
                 pop_scope();
                 check_expr(a, b->type->kind == TY_ARRAY ? b->type : NULL);
             } else {
                 push_scope();
                 if (un.b) shadow_union(un.b, un.then_t);
-                else shadow_set(&ts);
+                shadow_set(&ts);
                 check_expr(a, expected);
                 pop_scope();
                 push_scope();
                 if (un.b) shadow_union(un.b, un.else_t);
-                else shadow_set(&fs);
+                shadow_set(&fs);
                 check_expr(b, eb && a->type->kind == TY_ARRAY ? a->type : expected);
                 pop_scope();
             }
@@ -8333,6 +8348,7 @@ static const char *path_key(Expr *m) {
     return xs_sprintf("\x01%s.%d.%s", in, m->field, m->cls->name);
 }
 /* `x !== null` / `x === null` on a nullable local: returns the binding and whether the test is "not null". */
+static Expr *union_ident(Expr *e);
 static Binding *narrow_target(Expr *cond, bool *not_null) {
     if (cond->kind == E_BINARY && cond->op == TK_AND) {
         Binding *b = narrow_target(cond->lhs, not_null);
@@ -8346,7 +8362,7 @@ static Binding *narrow_target(Expr *cond, bool *not_null) {
         return b;
     }
     if (cond->kind != E_BINARY || (cond->op != TK_EQ && cond->op != TK_NEQ)) return NULL;
-    Expr *id = cond->lhs->kind == E_IDENT ? cond->lhs : cond->rhs->kind == E_IDENT ? cond->rhs : NULL;
+    Expr *id = union_ident(cond->lhs) ? union_ident(cond->lhs) : union_ident(cond->rhs); /* (x seen through a union narrowing too) */
     Expr *nul = cond->lhs->kind == E_NULL ? cond->lhs : cond->rhs->kind == E_NULL ? cond->rhs : NULL;
     if (!id && nul) { /* o.f !== null: the path o.f, as TypeScript narrows it */
         Expr *m = cond->lhs == nul ? cond->rhs : cond->lhs;
@@ -8691,16 +8707,18 @@ static void check_stmt(Stmt *s) {
             narrow_set(s->cond, true, &uts);
             narrow_set(s->cond, false, &ufs);
             push_scope();
+            shadow_union(un.b, un.then_t);
             shadow_set(&uts);
-            check_block_union(s->body, un.b, un.then_t);
+            check_block_union(s->body, NULL, NULL);
             pop_scope();
             if (s->else_body) {
                 push_scope();
+                shadow_union(un.b, un.else_t);
                 shadow_set(&ufs);
-                if (s->else_body->kind == S_BLOCK) check_block_union(s->else_body, un.b, un.else_t);
-                else { push_scope(); shadow_union(un.b, un.else_t); check_stmt(s->else_body); pop_scope(); }
+                if (s->else_body->kind == S_BLOCK) check_block_union(s->else_body, NULL, NULL);
+                else check_stmt(s->else_body);
                 pop_scope();
-            } else if (always_exits(s->body)) { shadow_set(&ufs); shadow_union(un.b, un.else_t); }
+            } else if (always_exits(s->body)) { shadow_union(un.b, un.else_t); shadow_set(&ufs); }
             return;
         }
         NSet ts = {0}, fs = {0};

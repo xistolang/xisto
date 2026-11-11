@@ -45,3 +45,14 @@ const nums = [1, 2, 3];
 const res: (Res | null)[] = nums.map((): Res | null => null);
 res[1] = { ok: 5 };
 console.log(res.map((r) => r?.ok ?? -1), nums.filter(() => true).length);
+// a null test on a name a typeof narrowed; [object, Record] as Record[]
+function lenOr(x: string | number | null, o: unknown): number {
+  return typeof x === "number" ? 1 : x === null || o === null ? 2 : x.length;
+}
+function same(x: string | number | null, o: unknown): boolean {
+  return typeof x === "number" ? true : x === null || o === null ? false : x === o;
+}
+console.log(lenOr("abc", 1), lenOr(null, 1), lenOr(3, 1), same("a", "a"), same("a", "b"));
+function exato(c: string, v: string): Record<string, unknown> { return { term: { [c]: v } }; }
+const filtro = [{ term: { doc: "d" } }, exato("runId", "r1")];
+console.log(JSON.stringify(filtro));
