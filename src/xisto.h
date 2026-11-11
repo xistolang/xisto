@@ -499,6 +499,7 @@ struct Func {
     int par_state;     /* parallel.c: 0 not analyzed, 1 being analyzed, 2 safe on a worker thread, 3 not (par_why) */
     const char *par_why;
     bool par_native;   /* an instance of a xisto:parallel function some call runs on the pool: emit its _par version */
+    bool sig_failed;   /* xisto check: its signature names what could not be loaded (reported): its body is not checked */
 };
 
 typedef struct {

@@ -10706,9 +10706,11 @@ static void infer_field_type(Class *c, Field *fd) {
     if (!fd->init) xs_error(XS3011, fd->pos, "fields need an explicit type: base: string;", "field '%s' has no type", fd->name);
     if (fd->init->kind == E_IDENT && !fd->init->type) {
         /* rotina = ROTINA_X: a const of this module (the module's code is checked later): its written type, or its literal's */
+        for (int pass = 0; pass < 2; pass++) /* (this module's, then an exported one: imported by name) */
         for (int i = 0; i < prog->top.len; i++) {
             Stmt *st = prog->top.items[i];
-            if (st->kind != S_VAR || st->mod != c->mod || !st->name || strcmp(st->name, fd->init->str) != 0 || !st->is_const) continue;
+            if (st->kind != S_VAR || !st->name || strcmp(st->name, fd->init->str) != 0 || !st->is_const) continue;
+            if (pass == 0 ? st->mod != c->mod : (st->mod == c->mod || !st->exported)) continue;
             Type *t = st->decl_type ? resolve(st->decl_type, st->pos)
                     : st->init->kind == E_STRING ? ty_string : st->init->kind == E_BOOL ? ty_boolean : st->init->kind == E_NUMBER ? ty_number : NULL;
             if (!t) t = literal_type(st->init); /* (a const object or array: the shape of its literal) */
@@ -10752,6 +10754,15 @@ static void infer_field_type(Class *c, Field *fd) {
     fd->type = t;
 }
 
+/* xisto check: a signature that names what could not be loaded (reported there): its types read as unknown, its
+   result too (uses stop quietly), and its body is not checked */
+static void sig_failed(Func *f) {
+    for (int k = 0; k < f->nparams; k++) if (f->params[k].type && f->params[k].type->kind == TY_OBJECT && !f->params[k].type->cls->cname) f->params[k].type = ty_unknown;
+    f->ret_failed = true;
+    if (!f->ret || (f->ret->kind == TY_OBJECT && !f->ret->cls->cname)) f->ret = ty_unknown;
+    f->ret_infer = 3;
+    f->sig_failed = true;
+}
 void check_program(Program *p) {
     prog = p;
     init_builtins();
@@ -10836,6 +10847,12 @@ void check_program(Program *p) {
                 }
                 if (!found) {
                     enter_module(m);
+                    if (xs_check_mode) { /* xisto check: reported, and checking goes on (its uses are quiet, as a missing module's) */
+                        xs_error_continue(XS9012, im->positions[k], xs_sprintf("add 'export' in front of its declaration in %s", im->from->file), "'%s' is not exported by '%s'", name, im->path);
+                        missing_names = realloc(missing_names, sizeof(char *) * (size_t)(nmissing_names + 1));
+                        missing_names[nmissing_names++] = (char *)name;
+                        continue;
+                    }
                     xs_error(XS9012, im->positions[k], xs_sprintf("add 'export' in front of its declaration in %s", im->from->file), "'%s' is not exported by '%s'", name, im->path);
                 }
             }
@@ -10844,7 +10861,10 @@ void check_program(Program *p) {
     for (int i = 0; i < p->nfuncs; i++) {
         if (p->funcs[i]->mod->builtin) continue;
         enter_module(p->funcs[i]->mod);
-        if (!p->funcs[i]->ntparams) resolve_signature(p->funcs[i]); /* a template resolves per instance */
+        if (p->funcs[i]->ntparams) continue; /* a template resolves per instance */
+        if (!xs_check_mode) { resolve_signature(p->funcs[i]); continue; }
+        RECOVER_BEGIN resolve_signature(p->funcs[i]); RECOVER_END /* xisto check: a type of a module that is not there (reported) costs this function */
+        if (failed_) sig_failed(p->funcs[i]);
     }
     /* interface Contract { execute(x: In): Out; }: an abstract class, the base of the class that implements it (when
        that class extends nothing else), so a Contract variable calls the implementation's method */
@@ -10852,9 +10872,20 @@ void check_program(Program *p) {
         Class *c = p->classes[i];
         if (!c->iface_methods || !c->is_interface) continue;
         enter_module(c->mod);
-        if (c->ntparams || c->niface_bases) /* (fields: the base's, which the implementation declares again) */
+        if (c->niface_bases == 1 && !c->ntparams) { /* interface B extends A { m(): R } with A an interface of methods too: B's
+                                                       abstract class extends A's */
+            Class *b = find_class(c->iface_bases[0]);
+            if (b && b->iface_methods && !b->ntparams) { c->base_name = c->iface_bases[0]; c->base_pos = c->pos; c->niface_bases = 0; }
+        }
+        if (c->ntparams || c->niface_bases) { /* (fields: the base's, which the implementation declares again) */
+            if (xs_check_mode) { /* xisto check: reported, and the rest of the program is still checked */
+                xs_error_continue(XS8113, c->pos, "keep the methods in an interface of their own (or use an abstract class)",
+                                  "interface '%s' has methods and %s", c->name, c->ntparams ? "type parameters" : c->nfields ? "fields" : "bases");
+                continue;
+            }
             xs_error(XS8113, c->pos, "keep the methods in an interface of their own (or use an abstract class)",
                      "interface '%s' has methods and %s", c->name, c->ntparams ? "type parameters" : c->nfields ? "fields" : "bases");
+        }
         c->is_interface = false;
         c->is_abstract = true;
         c->iface_base = true;
@@ -10885,7 +10916,13 @@ void check_program(Program *p) {
                     xs_error(XS8063, c->base_pos, NULL, "'%s' takes %d type argument(s), got %d", b->name, b->ntparams, c->nbase_targs);
                 Type **args = xs_alloc(sizeof(Type *) * (size_t)c->nbase_targs);
                 for (int k = 0; k < c->nbase_targs; k++) args[k] = resolve(c->base_targs[k], c->base_pos);
-                b = instantiate_class(b, args, c->base_pos);
+                if (xs_check_mode) { /* xisto check: an instance naming what could not be loaded costs this base only */
+                    Class *tb = b;
+                    b = NULL;
+                    RECOVER_BEGIN b = instantiate_class(tb, args, c->base_pos); RECOVER_END
+                    enter_module(c->mod);
+                    if (!b) { c->base_name = NULL; continue; }
+                } else b = instantiate_class(b, args, c->base_pos);
                 enter_module(c->mod);
             } else if (c->nbase_targs) xs_error(XS6022, c->base_pos, NULL, "a generic class extending a generic class is not supported yet");
             if (b->is_interface) xs_error(XS9004, c->base_pos, xs_sprintf("class %s implements %s", c->name, b->name), "'%s' is an interface; a class extends classes", b->name);
@@ -10908,12 +10945,24 @@ void check_program(Program *p) {
             Field *fd = &c->fields[k];
             for (int j = 0; j < k; j++)
                 if (strcmp(fd->name, c->fields[j].name) == 0) xs_error(XS9023, fd->pos, NULL, "field '%s' is declared twice", fd->name);
-            if (!fd->type) infer_field_type(c, fd);
+            if (!fd->type && xs_check_mode) { /* xisto check: a field whose value cannot type it reads as unknown */
+                bool ok = false;
+                RECOVER_BEGIN infer_field_type(c, fd); ok = true; RECOVER_END
+                enter_module(c->mod);
+                cur_class = NULL;
+                if (!ok) fd->type = ty_unknown;
+            } else if (!fd->type) infer_field_type(c, fd);
             if (!fd->type) { fd->cname = field_cname(fd->name); continue; } /* (typed later, late_fields) */
             Module *fmod = fd->owner && fd->owner->mod ? fd->owner->mod : c->mod; /* an inherited field: its type reads where it is written */
             if (fmod != cur_mod) enter_module(fmod);
-            fd->type = resolve(fd->type, fd->pos);
-            if (fmod != c->mod) enter_module(c->mod);
+            if (xs_check_mode) { /* xisto check: a field naming what could not be loaded reads as unknown */
+                Type *ft = fd->type;
+                bool ok = false;
+                RECOVER_BEGIN ft = resolve(ft, fd->pos); ok = true; RECOVER_END
+                cur_class = NULL;
+                fd->type = ok ? ft : ty_unknown;
+            } else fd->type = resolve(fd->type, fd->pos);
+            if (fmod != c->mod || cur_mod != c->mod) enter_module(c->mod);
             check_type_supported(fd->pos, fd->type);
             fd->cname = field_cname(fd->name);
         }
@@ -10923,14 +10972,24 @@ void check_program(Program *p) {
                 if (strcmp(m->name, c->methods[j]->name) == 0) xs_error(XS9027, m->pos, NULL, "method '%s' is declared twice", m->name);
             if (find_field(c, m->name, NULL)) xs_error(XS9007, m->pos, NULL, "'%s' is both a field and a method of %s", m->name, c->name);
             if (!m->is_native) m->cname = xs_sprintf("m%d_%s_%s", c->mod->id, c->name, m->name);
-            if (!m->ntparams) resolve_signature(m);
+            if (!m->ntparams && xs_check_mode) { RECOVER_BEGIN resolve_signature(m); RECOVER_END enter_module(c->mod); cur_class = NULL; if (failed_) sig_failed(m); }
+            else if (!m->ntparams) resolve_signature(m);
         }
         if (c->ctor) {
             if (!c->ctor->is_native) c->ctor->cname = xs_sprintf("c%d_%s_new", c->mod->id, c->name);
-            resolve_signature(c->ctor);
+            if (xs_check_mode) {
+                RECOVER_BEGIN resolve_signature(c->ctor); RECOVER_END
+                enter_module(c->mod);
+                cur_class = NULL;
+                if (failed_) sig_failed(c->ctor);
+            } else resolve_signature(c->ctor);
         }
     }
-    for (int i = 0; i < p->nclasses; i++) { enter_module(p->classes[i]->mod); flatten_methods(p->classes[i]); }
+    for (int i = 0; i < p->nclasses; i++) {
+        enter_module(p->classes[i]->mod);
+        if (xs_check_mode) { RECOVER_BEGIN flatten_methods(p->classes[i]); RECOVER_END cur_class = NULL; } /* (xisto check: reported, on to the next) */
+        else flatten_methods(p->classes[i]);
+    }
     /* fields typed by a value that calls a function or a method: now that every signature is known */
     field_infer_late = true;
     for (int i = 0; i < nlate_fields; i++) {
@@ -11014,7 +11073,7 @@ void check_program(Program *p) {
         check_class_bodies(c);
     }
     for (int i = 0; i < p->nfuncs; i++)
-        if (!p->funcs[i]->mod->builtin && !p->funcs[i]->ntparams) { RECOVER_BEGIN check_func(p->funcs[i]); RECOVER_END }
+        if (!p->funcs[i]->mod->builtin && !p->funcs[i]->ntparams && !p->funcs[i]->sig_failed) { RECOVER_BEGIN check_func(p->funcs[i]); RECOVER_END }
     /* generic instances, classes and functions (an instance can make more); then they join the program */
     for (int w = 0, cw = 0; w < ngen_work || cw < nclass_work;) {
         if (cw < nclass_work) { check_class_bodies(class_work[cw++]); continue; }
