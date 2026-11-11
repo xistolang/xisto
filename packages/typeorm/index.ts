@@ -495,7 +495,9 @@ export function bindsArg(params: Record<string, unknown> | unknown[]): unknown[]
 }
 
 export interface OracleConnectionFunctions {
-  execute: (sql: string, binds: unknown[]) => Promise<object>; // {"rows":[{COLUMN: value}],"rowsAffected":n,"outBinds":...}
+  // {"rows":[{COLUMN: value}],"rowsAffected":n,"outBinds":...}; autoCommit commits in the same round trip (a statement
+  // outside a transaction, as TypeORM's OracleQueryRunner asks node-oracledb)
+  execute: (sql: string, binds: unknown[], autoCommit: boolean) => Promise<object>;
   commit: () => Promise<void>;
   rollback: () => Promise<void>;
   close: () => Promise<void>;
@@ -528,7 +530,7 @@ class OracleSession extends DriverSession {
     this.raw = raw;
   }
   async run(sql: string, params: unknown[]): Promise<object> {
-    return oracleResult(await this.conn.execute(sql, params));
+    return oracleResult(await this.conn.execute(sql, params, false));
   }
   async begin(): Promise<void> {
     // Oracle starts a transaction with the first statement; autocommit is off on a pinned connection
@@ -571,9 +573,7 @@ export class OracleDriver extends Driver {
     }
     const conn = await p.getConnection();
     try {
-      const r = await conn.execute(sql, params);
-      await conn.commit();
-      return oracleResult(r);
+      return oracleResult(await conn.execute(sql, params, true));
     } finally {
       await conn.close();
     }
@@ -592,14 +592,14 @@ export class OracleDriver extends Driver {
 // connectString from options.connectString, or host:port/serviceName (database or sid as the service otherwise)
 function oracleConnection(c: Connection): OracleConnectionFunctions {
   return {
-    execute: async (sql: string, binds: unknown[]): Promise<object> => {
+    execute: async (sql: string, binds: unknown[], autoCommit: boolean): Promise<object> => {
       if (binds.length === 1) {
         const first = binds[0];
         if (first instanceof NamedBinds) {
-          return c.executeNamed(sql, first.binds, { outFormat: OUT_FORMAT_OBJECT });
+          return c.executeNamed(sql, first.binds, { outFormat: OUT_FORMAT_OBJECT, autoCommit: autoCommit });
         }
       }
-      return c.execute(sql, binds, { outFormat: OUT_FORMAT_OBJECT });
+      return c.execute(sql, binds, { outFormat: OUT_FORMAT_OBJECT, autoCommit: autoCommit });
     },
     commit: async (): Promise<void> => {
       await c.commit();

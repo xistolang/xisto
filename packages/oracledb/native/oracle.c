@@ -8,7 +8,9 @@
 
    - Connect: an Easy Connect string (host[:port][/service]) or a full (DESCRIPTION=...) descriptor; TCP only.
    - Login: O5LOGON with the 12c verifier (PBKDF2-SHA512, AES-256-CBC), as 12.2 and later servers require by
-     default. With the server's fast authentication (23ai) the protocol, data types and first login phase go in one
+     default; an account with only the old 10g verifier (DES hash, AES-128) logs in too, with a warning on stderr
+     (node-oracledb thin refuses it, thick accepts it; supported so apps move before their accounts do; the algorithm
+     follows go-ora, Apache 2.0). The 11g verifier is not supported. With the server's fast authentication (23ai) the protocol, data types and first login phase go in one
      request; otherwise (19c, 21c) as three. XISTO_ORACLE_NO_FAST_AUTH=1 takes the three-request path anyway.
    - Statements: SQL, DML, DDL and PL/SQL blocks; binds positional (an array, :1 :2 or any names in order) or by
      name (an object); rows fetched 100 at a time; CLOB and BLOB columns come whole (as TypeORM asks with
@@ -33,6 +35,8 @@ typedef struct xs_ora_conn {
     uint32_t sdu;
     uint16_t version;
     int ttcfv;              /* negotiated TTC field version */
+    uint8_t logon_caps;     /* the server's compile capability 4 (logon types): 32 = combo key by PBKDF2 */
+    bool txn;               /* the server's last end-of-call status said a transaction is open */
     uint32_t max_str;       /* 4000 or 32767 (MAX_STRING_SIZE=EXTENDED) */
     uint8_t seq;
     uint32_t *close_cursors; /* cursors to close on the next request */
@@ -279,7 +283,7 @@ typedef struct {
 } xs_ora_status;
 
 static void xs_ora_error_info(xs_ora_conn *c, xs_ora_status *st) {
-    xs_ora_rub(c);                  /* end of call status */
+    c->txn = (xs_ora_rub(c) & 2) != 0; /* end of call status: 2 = a transaction is in progress */
     xs_ora_rub(c); xs_ora_rub(c); xs_ora_rub(c); xs_ora_rub(c); xs_ora_rub(c); /* seq, row, error, array elem x2 */
     int cursor = (int)xs_ora_rub(c);
     if (cursor) st->cursor = cursor;
@@ -365,7 +369,7 @@ static void xs_ora_warning(xs_ora_conn *c) {
 static bool xs_ora_common(xs_ora_conn *c, unsigned type, xs_ora_status *st) {
     switch (type) {
     case 4: xs_ora_error_info(c, st); return true;
-    case 9: xs_ora_rub(c); xs_ora_rub(c); if (!c->eor) st->end = true; return true;
+    case 9: c->txn = (xs_ora_rub(c) & 2) != 0; xs_ora_rub(c); if (!c->eor) st->end = true; return true; /* call status, seq */
     case 15: xs_ora_warning(c); return true;
     case 23: xs_ora_piggyback(c); return true;
     case 29: st->end = true; return true;
@@ -451,6 +455,7 @@ static void xs_ora_read_login(xs_ora_conn *c, xs_ora_kvs *kv, xs_ora_status *st)
             xs_ora_rbwl(c, &cc, &ccn);
             xs_ora_rbwl(c, &rc, &rcn);
             if (cc && ccn > 7 && cc[7] < c->ttcfv) c->ttcfv = cc[7];
+            c->logon_caps = cc && ccn > 4 ? cc[4] : 0;
             if (c->ttcfv < 24 && c->eor) c->eor = false;     /* end of request needs 23.4 */
             c->max_str = rc && rcn > 6 && (rc[6] & 0x04) ? 32767 : 4000;
             free(cc); free(rc);
@@ -501,48 +506,89 @@ static void xs_ora_login_error(xs_ora_status *st) {
     st->message = NULL;
     xs_throw(xs_Error_from(msg));
 }
-/* the second login phase: O5LOGON with the 12c verifier */
+/* an account with only the 10g verifier logs in, with a warning (once per user): Oracle deprecated it, node-oracledb
+   thin refuses it (NJS-116), and thick mode accepts it; supported so apps move over before their accounts do */
+static void xs_ora_warn_10g(const char *user) {
+    static char seen[8][64];
+    static int nseen;
+    for (int i = 0; i < nseen; i++) if (strcmp(seen[i], user) == 0) return;
+    if (nseen < 8) snprintf(seen[nseen++], sizeof seen[0], "%s", user);
+    fprintf(stderr, "oracledb: warning: account %s logs in with the 10g password verifier (DES-based, deprecated by Oracle and "
+                    "refused by node-oracledb thin); a DBA can add the 12c verifier with ALTER USER %s IDENTIFIED BY <same password>\n",
+            user, user);
+}
+/* the second login phase: O5LOGON with the 12c verifier, or the old 10g one */
 static void xs_ora_auth_two(xs_ora_conn *c, const char *user, const char *password, xs_ora_kvs *kv) {
     unsigned vtype = 0;
     const char *vfr = xs_ora_kget(kv, "AUTH_VFR_DATA", &vtype), *skey = xs_ora_kget(kv, "AUTH_SESSKEY", NULL);
     const char *vgen = xs_ora_kget(kv, "AUTH_PBKDF2_VGEN_COUNT", NULL), *csalt = xs_ora_kget(kv, "AUTH_PBKDF2_CSK_SALT", NULL);
     const char *sder = xs_ora_kget(kv, "AUTH_PBKDF2_SDER_COUNT", NULL);
     if (!vfr || !skey) xs_ora_fail("oracledb: the server sent no session key (ORA-01017?)");
-    if (vtype != 0x4815 || !vgen || !csalt || !sder)
+    bool v10 = vtype == 0x939;
+    if (!v10 && (vtype != 0x4815 || !vgen || !csalt || !sder))
         xs_ora_fail("oracledb: the account has only the %s password verifier (0x%x); xisto supports the 12c verifier, like node-oracledb thin "
-                    "(a DBA regenerates it with ALTER USER ... IDENTIFIED BY <same password> while SQLNET.ALLOWED_LOGON_VERSION_SERVER allows 12)",
-                    vtype == 0x939 ? "10g" : vtype == 0xb152 || vtype == 0x1b25 ? "11g" : "unknown", vtype);
+                    "and the 10g one (a DBA regenerates it with ALTER USER ... IDENTIFIED BY <same password> while "
+                    "SQLNET.ALLOWED_LOGON_VERSION_SERVER allows 12)", vtype == 0xb152 || vtype == 0x1b25 ? "11g" : "unknown", vtype);
     uint8_t vfr_b[64], skey_b[64], salt[128], pkey[64], phash[64], parta[64], partb[64], enc[64], combo[32];
     size_t vfr_n = xs_ora_unhex(vfr, vfr_b, sizeof vfr_b), skey_n = xs_ora_unhex(skey, skey_b, sizeof skey_b);
     if (skey_n != 32 && skey_n != 48) xs_ora_fail("oracledb: unexpected session key length %zu", skey_n);
-    memcpy(salt, vfr_b, vfr_n);
-    memcpy(salt + vfr_n, "AUTH_PBKDF2_SPEEDY_KEY", 22);
-    xs_ora_pbkdf2_512((const uint8_t *)password, strlen(password), salt, vfr_n + 22, (uint32_t)atol(vgen), pkey, 64);
-    xs_ora_sha512 h;
-    xs_ora_sha512_init(&h); xs_ora_sha512_update(&h, pkey, 64); xs_ora_sha512_update(&h, vfr_b, vfr_n); xs_ora_sha512_final(&h, phash);
+    size_t klen = 32;                                          /* AES-256; the 10g keys are AES-128 */
+    memset(pkey, 0, sizeof pkey);
+    if (v10) {
+        klen = 16;
+        memset(phash, 0, sizeof phash);                        /* the 8-byte verifier and 8 zero bytes */
+        if (!xs_ora_10g_hash(user, password, phash))
+            xs_ora_fail("oracledb: the 10g verifier needs the user name and password in the Basic Multilingual Plane");
+        xs_ora_warn_10g(user);
+    } else {
+        memcpy(salt, vfr_b, vfr_n);
+        memcpy(salt + vfr_n, "AUTH_PBKDF2_SPEEDY_KEY", 22);
+        xs_ora_pbkdf2_512((const uint8_t *)password, strlen(password), salt, vfr_n + 22, (uint32_t)atol(vgen), pkey, 64);
+        xs_ora_sha512 h;
+        xs_ora_sha512_init(&h); xs_ora_sha512_update(&h, pkey, 64); xs_ora_sha512_update(&h, vfr_b, vfr_n); xs_ora_sha512_final(&h, phash);
+    }
     memcpy(parta, skey_b, skey_n);
-    xs_ora_cbc(phash, parta, skey_n, false);                  /* the server's half of the session key */
+    xs_ora_cbc(phash, klen, parta, skey_n, false);             /* the server's half of the session key */
+    if (getenv("XISTO_ORA_PROBE_10G")) { /* TEMP-PROBE */
+        fprintf(stderr, "probe: vtype=0x%x skey_n=%zu logon_caps=0x%x csalt=%d sder=%d tail=", vtype, skey_n, c->logon_caps, csalt != NULL, sder != NULL);
+        for (size_t i = skey_n - 16; i < skey_n; i++) fprintf(stderr, "%02X", parta[i]);
+        fprintf(stderr, "\n");
+        xs_ora_fail("probe stop (nothing sent)");
+    }
     xs_random_bytes(partb, skey_n);
     memcpy(enc, partb, skey_n);
-    xs_ora_cbc(phash, enc, skey_n, true);                     /* ours, encrypted for the server */
+    xs_ora_cbc(phash, klen, enc, skey_n, true);                /* ours, encrypted for the server */
     char sesskey[129];
-    xs_ora_hex(enc, 32, sesskey);
+    xs_ora_hex(enc, v10 ? skey_n : 32, sesskey);
+    /* the combo key: PBKDF2 over both halves (12c, and 10g when the server's logon caps say so), or for 10g on older
+       servers the MD5 of the halves' bytes 16..31 XORed */
     uint8_t ab[64];
-    memcpy(ab, partb, 32);
-    memcpy(ab + 32, parta, 32);
     char abhex[129];
-    xs_ora_hex(ab, 64, abhex);
-    uint8_t csalt_b[64];
-    size_t csalt_n = xs_ora_unhex(csalt, csalt_b, sizeof csalt_b);
-    xs_ora_pbkdf2_512((const uint8_t *)abhex, 128, csalt_b, csalt_n, (uint32_t)atol(sder), combo, 32);
-    /* the speedy key: 16 random bytes and the PBKDF2 key, encrypted with the combo key (80 bytes shown) */
+    size_t half = v10 ? skey_n / 2 : 32;
+    memcpy(ab, partb, half);
+    memcpy(ab + half, parta, half);
+    xs_ora_hex(ab, 2 * half, abhex);
+    if (!v10 || ((c->logon_caps & 32) && csalt && sder)) {
+        if (!csalt || !sder) xs_ora_fail("oracledb: the server sent no PBKDF2 salt for the combo key");
+        uint8_t csalt_b[64];
+        size_t csalt_n = xs_ora_unhex(csalt, csalt_b, sizeof csalt_b);
+        xs_ora_pbkdf2_512((const uint8_t *)abhex, 4 * half, csalt_b, csalt_n, (uint32_t)atol(sder), combo, klen);
+    } else {
+        uint8_t x[16];
+        for (int i = 0; i < 16; i++) x[i] = parta[16 + i] ^ partb[16 + i];
+        xs_ora_md5(x, 16, combo);
+        memset(x, 0, sizeof x);
+    }
+    /* the speedy key (12c only): 16 random bytes and the PBKDF2 key, encrypted with the combo key (80 bytes shown) */
     uint8_t sp[96];
-    xs_random_bytes(sp, 16);
-    memcpy(sp + 16, pkey, 64);
-    memset(sp + 80, 16, 16);                                   /* PKCS#7 padding of a full block */
-    xs_ora_cbc(combo, sp, 96, true);
-    char speedy[161];
-    xs_ora_hex(sp, 80, speedy);
+    char speedy[161] = {0};
+    if (!v10) {
+        xs_random_bytes(sp, 16);
+        memcpy(sp + 16, pkey, 64);
+        memset(sp + 80, 16, 16);                               /* PKCS#7 padding of a full block */
+        xs_ora_cbc(combo, klen, sp, 96, true);
+        xs_ora_hex(sp, 80, speedy);
+    }
     /* the password: 16 random bytes and the password, padded (PKCS#7), encrypted with the combo key */
     size_t pl = strlen(password), tl = 16 + pl, padn = 16 - tl % 16;
     uint8_t *pw = malloc(tl + padn);
@@ -551,7 +597,7 @@ static void xs_ora_auth_two(xs_ora_conn *c, const char *user, const char *passwo
     xs_random_bytes(pw, 16);
     memcpy(pw + 16, password, pl);
     memset(pw + tl, (int)padn, padn);
-    xs_ora_cbc(combo, pw, tl + padn, true);
+    xs_ora_cbc(combo, klen, pw, tl + padn, true);
     xs_ora_hex(pw, tl + padn, pwhex);
     /* the session's time zone: the client's, so DATE values read as local time agree with SYSDATE math */
     time_t now = time(NULL);
@@ -566,10 +612,10 @@ static void xs_ora_auth_two(xs_ora_conn *c, const char *user, const char *passwo
     size_t ul = strlen(user);
     xs_ora_func(c, &w, 115);
     xs_ora_u8(&w, ul ? 1 : 0); xs_ora_ub(&w, ul); xs_ora_ub(&w, 0x101);
-    xs_ora_u8(&w, 1); xs_ora_ub(&w, 7); xs_ora_u8(&w, 1); xs_ora_u8(&w, 1);
+    xs_ora_u8(&w, 1); xs_ora_ub(&w, v10 ? 6 : 7); xs_ora_u8(&w, 1); xs_ora_u8(&w, 1); /* 6 pairs for 10g: no speedy key */
     if (ul) xs_ora_bwl(&w, user, ul);
     xs_ora_kv(&w, "AUTH_SESSKEY", sesskey, 1);
-    xs_ora_kv(&w, "AUTH_PBKDF2_SPEEDY_KEY", speedy, 0);
+    if (!v10) xs_ora_kv(&w, "AUTH_PBKDF2_SPEEDY_KEY", speedy, 0);
     xs_ora_kv(&w, "SESSION_CLIENT_CHARSET", "873", 0);
     xs_ora_kv(&w, "SESSION_CLIENT_DRIVER_NAME", "xisto-oracledb", 0);
     xs_ora_kv(&w, "SESSION_CLIENT_VERSION", "1", 0);
@@ -598,7 +644,8 @@ static void xs_ora_auth_two(xs_ora_conn *c, const char *user, const char *passwo
     uint8_t rb[64];
     size_t rn = resp ? xs_ora_unhex(resp, rb, sizeof rb) : 0;
     bool good = rn >= 32 && rn % 16 == 0;
-    if (good) { xs_ora_cbc(combo, rb, rn, false); good = memcmp(rb + 16, "SERVER_TO_CLIENT", 16) == 0; }
+    if (!resp && v10) good = true;                             /* (older servers send no proof for 10g) */
+    else if (good) { xs_ora_cbc(combo, klen, rb, rn, false); good = memcmp(rb + 16, "SERVER_TO_CLIENT", 16) == 0; }
     memset(combo, 0, sizeof combo);
     xs_ora_kfree(&kv2);
     if (!good) xs_ora_fail("oracledb: the server's authentication response does not match (wrong verifier?)");
@@ -913,7 +960,7 @@ XS_NOINLINE int64_t xn_oracledb_NativePool_acquire(xn_oracledb_NativePool *p) { 
 XS_NOINLINE void xn_oracledb_NativePool_release(xn_oracledb_NativePool *p, int64_t h) {
     xs_ora_conn *c = xs_ora_held(p, h);
     xs_ora_locals[p->id].held[h - 1] = NULL;
-    if (!c->broken) { /* a connection back in the pool starts without an open transaction */
+    if (!c->broken && c->txn) { /* a connection back in the pool starts without an open transaction (a round trip only when one is open) */
         xs_ora_w w = {0};
         xs_ora_func(c, &w, 15);
         if (xs_ora_send(c, &w)) {
@@ -1800,13 +1847,16 @@ XS_NOINLINE xs_str *xn_oracledb_NativePool_execute(xn_oracledb_NativePool *p, in
                                                     xs_arr_int *dirs, xs_arr_int *types, xs_arr_int *sizes, bool objects, bool autocommit, int64_t maxrows) {
     xs_ora_conn *c = xs_ora_held(p, h);
     xs_ora_kind kind = xs_ora_classify(sql->data, (size_t)sql->len);
-    xs_ora_ph ph[512];
+    /* on the heap: this runs on a request's 64 KB stack, and 512 placeholder names alone are 32 KB */
+    xs_ora_ph *ph = malloc(512 * sizeof *ph);
+    if (!ph) xs_panic("out of memory");
     int nph = xs_ora_placeholders(sql->data, (size_t)sql->len, ph, 512, kind == XS_ORA_PLSQL);
     int nv = values ? (int)values->len : 0;
     bool named = names && names->len > 0;
-    if (!named && nv != nph) xs_ora_fail("NJS-098: %d positional bind values are required but %d were provided", nph, nv);
-    int map[512];
-    char *nm[512];
+    if (!named && nv != nph) { free(ph); xs_ora_fail("NJS-098: %d positional bind values are required but %d were provided", nph, nv); }
+    int *map = malloc((size_t)(nph ? nph : 1) * sizeof *map);
+    char **nm = calloc((size_t)(nph ? nph : 1), sizeof *nm);
+    if (!map || !nm) xs_panic("out of memory");
     for (int i = 0; i < nph; i++) {
         nm[i] = NULL;
         map[i] = i;
@@ -1816,8 +1866,14 @@ XS_NOINLINE xs_str *xn_oracledb_NativePool_execute(xn_oracledb_NativePool *p, in
             xs_str *n = names->data[k];
             if ((size_t)n->len == strlen(ph[i].name) && strncasecmp(n->data, ph[i].name, (size_t)n->len) == 0) { map[i] = k; break; }
         }
-        if (map[i] < 0) xs_ora_fail("NJS-097: no bind placeholder named: :%s", ph[i].name);
+        if (map[i] < 0) {
+            static XS_TLS char missing[64];
+            memcpy(missing, ph[i].name, sizeof missing);
+            free(ph); free(map); free(nm);
+            xs_ora_fail("NJS-097: no bind placeholder named: :%s", missing);
+        }
     }
+    free(ph);
     xs_ora_val *vals = calloc((size_t)(nph ? nph : 1), sizeof *vals);
     if (!vals) xs_panic("out of memory");
     for (int i = 0; i < nph; i++) {
@@ -1838,7 +1894,7 @@ XS_NOINLINE xs_str *xn_oracledb_NativePool_execute(xn_oracledb_NativePool *p, in
     }
     xs_str *json = xs_ora_execute(c, sql, nph, vals, objects, autocommit, maxrows > 0 ? (size_t)maxrows : 0);
     for (int i = 0; i < nph; i++) { free(nm[i]); free(vals[i].out); free(vals[i].loc); }
-    free(vals);
+    free(vals); free(nm); free(map);
     return json;
 }
 static void xs_ora_simple(xn_oracledb_NativePool *p, int64_t h, unsigned code) {

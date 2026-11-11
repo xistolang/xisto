@@ -1,6 +1,7 @@
-/* oracledb: the hashing and ciphers Oracle's O5LOGON (12c verifier) needs, in portable C: SHA-512, HMAC-SHA512,
-   PBKDF2-SHA512 (FIPS 180-4, RFC 2104, RFC 8018) and AES-256 in CBC mode with a zero IV (FIPS 197). The AES here
-   is the plain table-free byte form: not constant-time, used only on the login handshake's session keys. */
+/* oracledb: the hashing and ciphers Oracle's O5LOGON needs, in portable C: SHA-512, HMAC-SHA512, PBKDF2-SHA512
+   (FIPS 180-4, RFC 2104, RFC 8018) and AES-128/192/256 in CBC mode with a zero IV (FIPS 197) for the 12c verifier;
+   DES (FIPS 46-3) and MD5 (RFC 1321) for the old 10g verifier. The AES and DES here are the plain table forms:
+   not constant-time, used only on the login handshake's session keys. */
 
 typedef struct { uint64_t h[8]; uint8_t buf[128]; uint64_t total; size_t n; } xs_ora_sha512;
 static const uint64_t xs_ora_k512[80] = {
@@ -105,7 +106,7 @@ static void xs_ora_pbkdf2_512(const uint8_t *pw, size_t pwlen, const uint8_t *sa
     memset(k, 0, sizeof k); memset(pad, 0, sizeof pad);
 }
 
-/* ---- AES-256 ---- */
+/* ---- AES (128, 192 or 256-bit keys) ---- */
 static const uint8_t xs_ora_sbox[256] = {
     0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,
     0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
@@ -124,32 +125,34 @@ static uint8_t xs_ora_mul(uint8_t a, uint8_t b) {
     while (b) { if (b & 1) r ^= a; a = xs_ora_xt(a); b >>= 1; }
     return r;
 }
-typedef struct { uint8_t rk[240]; uint8_t inv[256]; } xs_ora_aes;
-static void xs_ora_aes_init(xs_ora_aes *a, const uint8_t key[32]) {
-    memcpy(a->rk, key, 32);
+typedef struct { uint8_t rk[240]; uint8_t inv[256]; int nr; } xs_ora_aes;
+static void xs_ora_aes_init(xs_ora_aes *a, const uint8_t *key, size_t klen) {
+    int nk = (int)(klen / 4);                                  /* 4, 6 or 8 words */
+    a->nr = nk + 6;
+    memcpy(a->rk, key, klen);
     uint8_t rcon = 1;
-    for (int i = 8; i < 60; i++) {
+    for (int i = nk; i < 4 * (a->nr + 1); i++) {
         uint8_t t[4];
         memcpy(t, a->rk + (i - 1) * 4, 4);
-        if (i % 8 == 0) {
+        if (i % nk == 0) {
             uint8_t x = t[0];
             t[0] = xs_ora_sbox[t[1]] ^ rcon; t[1] = xs_ora_sbox[t[2]]; t[2] = xs_ora_sbox[t[3]]; t[3] = xs_ora_sbox[x];
             rcon = xs_ora_xt(rcon);
-        } else if (i % 8 == 4) {
+        } else if (nk > 6 && i % nk == 4) {
             for (int k = 0; k < 4; k++) t[k] = xs_ora_sbox[t[k]];
         }
-        for (int k = 0; k < 4; k++) a->rk[i * 4 + k] = a->rk[(i - 8) * 4 + k] ^ t[k];
+        for (int k = 0; k < 4; k++) a->rk[i * 4 + k] = a->rk[(i - nk) * 4 + k] ^ t[k];
     }
     for (int i = 0; i < 256; i++) a->inv[xs_ora_sbox[i]] = (uint8_t)i;
 }
 static void xs_ora_aes_enc(const xs_ora_aes *a, uint8_t s[16]) {
     for (int k = 0; k < 16; k++) s[k] ^= a->rk[k];
-    for (int r = 1; r <= 14; r++) {
+    for (int r = 1; r <= a->nr; r++) {
         uint8_t t[16];
         for (int k = 0; k < 16; k++) t[k] = xs_ora_sbox[s[k]];
         for (int c = 0; c < 4; c++) /* shift rows: row i moves left by i */
             for (int i = 0; i < 4; i++) s[c * 4 + i] = t[((c + i) % 4) * 4 + i];
-        if (r < 14)
+        if (r < a->nr)
             for (int c = 0; c < 4; c++) {
                 uint8_t *m = s + c * 4, a0 = m[0], a1 = m[1], a2 = m[2], a3 = m[3];
                 m[0] = xs_ora_xt(a0) ^ (xs_ora_xt(a1) ^ a1) ^ a2 ^ a3;
@@ -161,9 +164,9 @@ static void xs_ora_aes_enc(const xs_ora_aes *a, uint8_t s[16]) {
     }
 }
 static void xs_ora_aes_dec(const xs_ora_aes *a, uint8_t s[16]) {
-    for (int r = 14; r >= 1; r--) {
+    for (int r = a->nr; r >= 1; r--) {
         for (int k = 0; k < 16; k++) s[k] ^= a->rk[r * 16 + k];
-        if (r < 14)
+        if (r < a->nr)
             for (int c = 0; c < 4; c++) {
                 uint8_t *m = s + c * 4, a0 = m[0], a1 = m[1], a2 = m[2], a3 = m[3];
                 m[0] = xs_ora_mul(a0, 14) ^ xs_ora_mul(a1, 11) ^ xs_ora_mul(a2, 13) ^ xs_ora_mul(a3, 9);
@@ -179,9 +182,9 @@ static void xs_ora_aes_dec(const xs_ora_aes *a, uint8_t s[16]) {
     for (int k = 0; k < 16; k++) s[k] ^= a->rk[k];
 }
 /* CBC with a zero IV over whole blocks (n a multiple of 16), in place */
-static void xs_ora_cbc(const uint8_t key[32], uint8_t *data, size_t n, bool encrypt) {
+static void xs_ora_cbc(const uint8_t *key, size_t klen, uint8_t *data, size_t n, bool encrypt) {
     xs_ora_aes a;
-    xs_ora_aes_init(&a, key);
+    xs_ora_aes_init(&a, key, klen);
     uint8_t prev[16] = {0}, cur[16];
     for (size_t off = 0; off + 16 <= n; off += 16) {
         uint8_t *b = data + off;
@@ -197,4 +200,130 @@ static void xs_ora_cbc(const uint8_t key[32], uint8_t *data, size_t n, bool encr
         }
     }
     memset(&a, 0, sizeof a);
+}
+
+/* ---- DES (one block, encryption only) ---- */
+static const uint8_t xs_ora_des_ip[64] = {58,50,42,34,26,18,10,2,60,52,44,36,28,20,12,4,62,54,46,38,30,22,14,6,64,56,48,40,32,24,16,8,
+    57,49,41,33,25,17,9,1,59,51,43,35,27,19,11,3,61,53,45,37,29,21,13,5,63,55,47,39,31,23,15,7};
+static const uint8_t xs_ora_des_fp[64] = {40,8,48,16,56,24,64,32,39,7,47,15,55,23,63,31,38,6,46,14,54,22,62,30,37,5,45,13,53,21,61,29,
+    36,4,44,12,52,20,60,28,35,3,43,11,51,19,59,27,34,2,42,10,50,18,58,26,33,1,41,9,49,17,57,25};
+static const uint8_t xs_ora_des_e[48] = {32,1,2,3,4,5,4,5,6,7,8,9,8,9,10,11,12,13,12,13,14,15,16,17,16,17,18,19,20,21,20,21,22,23,24,25,
+    24,25,26,27,28,29,28,29,30,31,32,1};
+static const uint8_t xs_ora_des_p[32] = {16,7,20,21,29,12,28,17,1,15,23,26,5,18,31,10,2,8,24,14,32,27,3,9,19,13,30,6,22,11,4,25};
+static const uint8_t xs_ora_des_pc1[56] = {57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,27,19,11,3,60,52,44,36,
+    63,55,47,39,31,23,15,7,62,54,46,38,30,22,14,6,61,53,45,37,29,21,13,5,28,20,12,4};
+static const uint8_t xs_ora_des_pc2[48] = {14,17,11,24,1,5,3,28,15,6,21,10,23,19,12,4,26,8,16,7,27,20,13,2,
+    41,52,31,37,47,55,30,40,51,45,33,48,44,49,39,56,34,53,46,42,50,36,29,32};
+static const uint8_t xs_ora_des_shift[16] = {1,1,2,2,2,2,2,2,1,2,2,2,2,2,2,1};
+static const uint8_t xs_ora_des_s[8][64] = {
+    {14,4,13,1,2,15,11,8,3,10,6,12,5,9,0,7,0,15,7,4,14,2,13,1,10,6,12,11,9,5,3,8,4,1,14,8,13,6,2,11,15,12,9,7,3,10,5,0,15,12,8,2,4,9,1,7,5,11,3,14,10,0,6,13},
+    {15,1,8,14,6,11,3,4,9,7,2,13,12,0,5,10,3,13,4,7,15,2,8,14,12,0,1,10,6,9,11,5,0,14,7,11,10,4,13,1,5,8,12,6,9,3,2,15,13,8,10,1,3,15,4,2,11,6,7,12,0,5,14,9},
+    {10,0,9,14,6,3,15,5,1,13,12,7,11,4,2,8,13,7,0,9,3,4,6,10,2,8,5,14,12,11,15,1,13,6,4,9,8,15,3,0,11,1,2,12,5,10,14,7,1,10,13,0,6,9,8,7,4,15,14,3,11,5,2,12},
+    {7,13,14,3,0,6,9,10,1,2,8,5,11,12,4,15,13,8,11,5,6,15,0,3,4,7,2,12,1,10,14,9,10,6,9,0,12,11,7,13,15,1,3,14,5,2,8,4,3,15,0,6,10,1,13,8,9,4,5,11,12,7,2,14},
+    {2,12,4,1,7,10,11,6,8,5,3,15,13,0,14,9,14,11,2,12,4,7,13,1,5,0,15,10,3,9,8,6,4,2,1,11,10,13,7,8,15,9,12,5,6,3,0,14,11,8,12,7,1,14,2,13,6,15,0,9,10,4,5,3},
+    {12,1,10,15,9,2,6,8,0,13,3,4,14,7,5,11,10,15,4,2,7,12,9,5,6,1,13,14,0,11,3,8,9,14,15,5,2,8,12,3,7,0,4,10,1,13,11,6,4,3,2,12,9,5,15,10,11,14,1,7,6,0,8,13},
+    {4,11,2,14,15,0,8,13,3,12,9,7,5,10,6,1,13,0,11,7,4,9,1,10,14,3,5,12,2,15,8,6,1,4,11,13,12,3,7,14,10,15,6,8,0,5,9,2,6,11,13,8,1,4,10,7,9,5,0,15,14,2,3,12},
+    {13,2,8,4,6,15,11,1,10,9,3,14,5,0,12,7,1,15,13,8,10,3,7,4,12,5,6,11,0,14,9,2,7,11,4,1,9,12,14,2,0,6,10,13,15,3,5,8,2,1,14,7,4,10,8,13,15,12,9,0,3,5,6,11}};
+/* bit i (1 = most significant) of an n-bit value, taken through a permutation table */
+static uint64_t xs_ora_des_perm(uint64_t in, int inbits, const uint8_t *t, int n) {
+    uint64_t out = 0;
+    for (int i = 0; i < n; i++) out = out << 1 | ((in >> (inbits - t[i])) & 1);
+    return out;
+}
+static void xs_ora_des_enc(const uint8_t key[8], const uint8_t in[8], uint8_t out[8]) {
+    uint64_t k = 0, b = 0;
+    for (int i = 0; i < 8; i++) { k = k << 8 | key[i]; b = b << 8 | in[i]; }
+    uint64_t cd = xs_ora_des_perm(k, 64, xs_ora_des_pc1, 56), sub[16];
+    uint32_t c = (uint32_t)(cd >> 28) & 0xfffffff, d = (uint32_t)cd & 0xfffffff;
+    for (int r = 0; r < 16; r++) {
+        int sh = xs_ora_des_shift[r];
+        c = ((c << sh) | (c >> (28 - sh))) & 0xfffffff;
+        d = ((d << sh) | (d >> (28 - sh))) & 0xfffffff;
+        sub[r] = xs_ora_des_perm((uint64_t)c << 28 | d, 56, xs_ora_des_pc2, 48);
+    }
+    b = xs_ora_des_perm(b, 64, xs_ora_des_ip, 64);
+    uint32_t l = (uint32_t)(b >> 32), r = (uint32_t)b;
+    for (int i = 0; i < 16; i++) {
+        uint64_t e = xs_ora_des_perm(r, 32, xs_ora_des_e, 48) ^ sub[i];
+        uint32_t f = 0;
+        for (int j = 0; j < 8; j++) {
+            unsigned six = (unsigned)(e >> (42 - 6 * j)) & 63;
+            f = f << 4 | xs_ora_des_s[j][((six & 32) | ((six & 1) << 4)) | ((six >> 1) & 15)];
+        }
+        f = (uint32_t)xs_ora_des_perm(f, 32, xs_ora_des_p, 32);
+        uint32_t t = l ^ f;
+        l = r; r = t;
+    }
+    b = xs_ora_des_perm((uint64_t)r << 32 | l, 64, xs_ora_des_fp, 64);
+    for (int i = 7; i >= 0; i--) { out[i] = (uint8_t)b; b >>= 8; }
+}
+
+/* ---- MD5 ---- */
+static void xs_ora_md5(const uint8_t *msg, size_t len, uint8_t out[16]) {
+    static const uint32_t K[64] = {
+        0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,0x698098d8,0x8b44f7af,0xffff5bb1,
+        0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,
+        0xd8a1e681,0xe7d3fbc8,0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,0xfffa3942,
+        0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,
+        0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,
+        0x85845dd1,0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391};
+    static const uint8_t R[64] = {7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+        4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21};
+    uint32_t h[4] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476};
+    size_t total = ((len + 8) / 64 + 1) * 64;
+    uint8_t blk[64];
+    for (size_t off = 0; off < total; off += 64) {
+        for (size_t i = 0; i < 64; i++) {
+            size_t at = off + i;
+            blk[i] = at < len ? msg[at] : at == len ? 0x80 : 0;
+        }
+        if (off + 64 == total) for (int i = 0; i < 8; i++) blk[56 + i] = (uint8_t)(((uint64_t)len * 8) >> (8 * i));
+        uint32_t w[16], a = h[0], b = h[1], c = h[2], d = h[3];
+        for (int i = 0; i < 16; i++) w[i] = (uint32_t)blk[4 * i] | (uint32_t)blk[4 * i + 1] << 8 | (uint32_t)blk[4 * i + 2] << 16 | (uint32_t)blk[4 * i + 3] << 24;
+        for (int i = 0; i < 64; i++) {
+            uint32_t f; int g;
+            if (i < 16) { f = (b & c) | (~b & d); g = i; }
+            else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
+            else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) % 16; }
+            else { f = c ^ (b | ~d); g = (7 * i) % 16; }
+            uint32_t t = d; d = c; c = b;
+            uint32_t x = a + f + K[i] + w[g];
+            b = b + (x << R[i] | x >> (32 - R[i]));
+            a = t;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+    }
+    for (int i = 0; i < 16; i++) out[i] = (uint8_t)(h[i / 4] >> (8 * (i % 4)));
+    memset(blk, 0, sizeof blk);
+}
+
+/* the 10g password verifier: USER||PASSWORD upper-cased in UTF-16BE, zero-padded to 8 bytes, DES-CBC (zero IV) with
+   key 0123456789ABCDEF; the last block is the key of a second pass, whose last block is the verifier (8 bytes) */
+static bool xs_ora_10g_hash(const char *user, const char *password, uint8_t out[8]) {
+    size_t ul = strlen(user), pl = strlen(password), cap = 2 * (ul + pl) + 8, n = 0;
+    uint8_t *buf = calloc(1, cap);
+    if (!buf) return false;
+    const char *parts[2] = {user, password};
+    for (int p = 0; p < 2; p++)
+        for (const unsigned char *s = (const unsigned char *)parts[p]; *s;) {
+            uint32_t cp = *s++;                                  /* UTF-8 to a UTF-16 code unit (BMP) */
+            if (cp >= 0xf0) { free(buf); return false; }
+            if (cp >= 0xe0) { cp = (cp & 15) << 12 | (s[0] & 63u) << 6 | (s[1] & 63u); s += 2; }
+            else if (cp >= 0xc0) { cp = (cp & 31) << 6 | (s[0] & 63u); s += 1; }
+            if (cp >= 'a' && cp <= 'z') cp -= 32;
+            buf[n++] = (uint8_t)(cp >> 8); buf[n++] = (uint8_t)cp;
+        }
+    n = (n + 7) / 8 * 8;
+    uint8_t key[8] = {0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}, x[8];
+    for (int pass = 0; pass < 2; pass++) {
+        memset(x, 0, 8);
+        for (size_t off = 0; off < n; off += 8) {
+            for (int i = 0; i < 8; i++) x[i] ^= buf[off + i];
+            xs_ora_des_enc(key, x, x);
+        }
+        memcpy(key, x, 8);
+    }
+    memcpy(out, x, 8);
+    memset(buf, 0, cap); free(buf); memset(key, 0, 8); memset(x, 0, 8);
+    return true;
 }
