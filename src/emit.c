@@ -9544,6 +9544,28 @@ static void garr_collect(Program *p) {
     }
 }
 
+/* one top-level statement, in main or in a module's xs_init_mN */
+static void emit_top_stmt(Program *p, Stmt *s) {
+    if (s->kind == S_VAR && const_lit_global(s) && !p->uses_workers && !ns_has(&main_locals, s->cname)) {
+        dbg_local(s->name, s->type, s->cname, s->is_const); /* (set where it is declared) */
+    } else if (s->kind == S_VAR) {
+        used_ar = false;
+        buf_printf(out, "%s = ", s->cname);
+        if (s->init && nzv_has(s->cname)) { buf_printf(out, "(int64_t)(%s_z = ", s->cname); emit_nzd(s->init); buf_puts(out, ")"); } else
+        emit_owned(s->init);
+        buf_puts(out, ";");
+        dbg_local(s->name, s->type, s->cname, s->is_const);
+        drain_if_needed();
+    } else {
+        emit_stmt(s);
+    }
+}
+/* the file name of a module, for a comment (no directories, no comment terminator) */
+static const char *path_base_name(const char *path) {
+    const char *b = strrchr(path, '/');
+    b = b ? b + 1 : path;
+    return strstr(b, "*/") ? "module" : b;
+}
 void emit_program(Program *p, Buf *o) {
     out = o;
     prog = p;
@@ -9728,6 +9750,36 @@ void emit_program(Program *p, Buf *o) {
     vol_locals = false;
     for (int i = 0; i < p->top.len; i++) if (stmt_has_try(p->top.items[i])) vol_locals = true;
     bool wbody = p->uses_workers && !xs_debug; /* (the debugger runs one thread) */
+    /* XB-176: the top level of each imported module in a function of its own (xs_init_mN), called by main in the
+       same order. One main with every module's decorators, reflection and constants was 16.6 MB of C in a NestJS
+       app (1 372 modules): clang went past 8 GB on it. The entry module stays in main (a one-file program, as the
+       benchmarks are, emits the same C). A module whose top level is not one contiguous run stays in main too. */
+    int *top_run = calloc((size_t)(p->top.len ? p->top.len : 1), sizeof(int)); /* run id at its first statement, -1 inside it, 0 in main */
+    int nmodfn = 0;
+    Module *entry = p->nmodules ? p->modules[p->nmodules - 1] : NULL;
+    int imported_top = 0; /* (a small program keeps one main: the split only pays for a big top level) */
+    for (int i = 0; i < p->top.len; i++) if (p->top.items[i]->mod != entry) imported_top++;
+    const char *mt = getenv("XISTO_MOD_INIT_MIN");
+    if (!xs_debug && !wbody && p->nmodules > 1 && imported_top >= (mt ? atoi(mt) : 200) && !getenv("XISTO_NO_MOD_INIT")) {
+        for (int i = 0; i < p->top.len;) {
+            Module *m = p->top.items[i]->mod;
+            int j = i;
+            while (j < p->top.len && p->top.items[j]->mod == m) j++;
+            bool ok = m && m != entry && !m->builtin && !(m->path && strncmp(m->path, "builtin:", 8) == 0);
+            for (int k = 0; k < p->top.len && ok; k++) if ((k < i || k >= j) && p->top.items[k]->mod == m) ok = false;
+            for (int k = i; k < j && ok; k++) {
+                Stmt *t = p->top.items[k];
+                if (t->kind == S_VAR && nzv_has(t->cname)) ok = false; /* (its _z shadow lives in main) */
+            }
+            if (ok) {
+                top_run[i] = ++nmodfn;
+                for (int k = i + 1; k < j; k++) top_run[k] = -1;
+            }
+            i = j;
+        }
+    }
+    Buf *main_buf = out;
+    size_t main_at = out->len; /* the module functions go here, before main */
     { /* a top level without loops (a server, an app: it wires things up and hands over) is not optimized */
         bool loops = false;
         for (int i = 0; i < p->top.len && !loops; i++) loops = stmt_has_loop(p->top.items[i]);
@@ -9745,6 +9797,7 @@ void emit_program(Program *p, Buf *o) {
     if (xs_debug) { nl(); buf_puts(out, "xs_dbg_init();"); }
     for (int i = 0; i < p->top.len; i++) { /* top-level variables only top-level code uses: locals */
         Stmt *s = p->top.items[i];
+        if (top_run[i]) continue; /* (a module function's: file statics, declared with it) */
         if (s->kind != S_VAR || !ns_has(&main_locals, s->cname)) continue;
         nl();
         emit_decl(s->type, s->cname);
@@ -9754,26 +9807,58 @@ void emit_program(Program *p, Buf *o) {
     rv_compute(NULL, p->top.items, p->top.len);
     nzv_compute(NULL, p->top.items, p->top.len);
     for (int i = 0; i < nnzv; i++) { nl(); buf_printf(out, "double %s_z = 0; (void)%s_z;", nzv[i], nzv[i]); } /* XB-087 (only main reads them) */
+    Buf modfns = {0};
+    if (nmodfn) { /* the module functions, with the analyses above (ranges, borrowed values) in place */
+        Buf *mo = out;
+        int mindent = indent;
+        bool mvol = vol_locals;
+        out = &modfns;
+        for (int i = 0; i < p->top.len; i++) {
+            if (top_run[i] <= 0) continue;
+            int j = i + 1;
+            while (j < p->top.len && top_run[j] == -1) j++;
+            for (int k = i; k < j; k++) { /* its top-level locals: file statics (main releases them at the end, as before) */
+                Stmt *t = p->top.items[k];
+                if (t->kind != S_VAR || !ns_has(&main_locals, t->cname)) continue;
+                buf_puts(out, "static ");
+                emit_decl(t->type, t->cname);
+                buf_puts(out, ";\n");
+            }
+            bool rloops = false, rtry = false;
+            for (int k = i; k < j; k++) { rloops = rloops || stmt_has_loop(p->top.items[k]); rtry = rtry || stmt_has_try(p->top.items[k]); }
+            buf_printf(out, "%s void xs_init_m%d(void) { /* %s */", rloops ? "XS_NOINLINE" : "XS_RUN_ONCE static", top_run[i], p->top.items[i]->mod->path ? path_base_name(p->top.items[i]->mod->path) : "module");
+            indent = 1;
+            vol_locals = rtry;
+            nl();
+            buf_puts(out, "size_t ar_mark = xs_ar_mark();");
+            nl();
+            buf_puts(out, "(void)ar_mark;");
+            epush(true);
+            for (int k = i; k < j; k++) {
+                Stmt *t = p->top.items[k];
+                cur_mod = t->mod;
+                nl();
+                emit_top_stmt(p, t);
+            }
+            emit_releases(escope);
+            epop();
+            buf_puts(out, "\n}\n");
+            i = j - 1;
+        }
+        out = mo;
+        indent = mindent;
+        vol_locals = mvol;
+    }
     emit_dbg_enter(NULL);
     epush(true);
     for (int i = 0; i < p->top.len; i++) {
         Stmt *s = p->top.items[i];
+        if (top_run[i] > 0) { nl(); buf_printf(out, "xs_init_m%d();", top_run[i]); continue; }
+        if (top_run[i] < 0) continue;
         cur_mod = s->mod;
         nl();
         emit_dbg_hook(s);
-        if (s->kind == S_VAR && const_lit_global(s) && !p->uses_workers && !ns_has(&main_locals, s->cname)) {
-            dbg_local(s->name, s->type, s->cname, s->is_const); /* (set where it is declared) */
-        } else if (s->kind == S_VAR) {
-            used_ar = false;
-            buf_printf(out, "%s = ", s->cname);
-            if (s->init && nzv_has(s->cname)) { buf_printf(out, "(int64_t)(%s_z = ", s->cname); emit_nzd(s->init); buf_puts(out, ")"); } else
-            emit_owned(s->init);
-            buf_puts(out, ";");
-            dbg_local(s->name, s->type, s->cname, s->is_const);
-            drain_if_needed();
-        } else {
-            emit_stmt(s);
-        }
+        emit_top_stmt(p, s);
     }
     emit_releases(escope);
     epop();
@@ -9819,6 +9904,8 @@ void emit_program(Program *p, Buf *o) {
     indent--;
     nl();
     buf_puts(out, "}\n");
+    if (modfns.len) buf_insert(main_buf, main_at, modfns.data);
+    free(modfns.data);
     out = main_out;
     if (xs_any_used) emit_dyn_tables(p); /* any: every class's fields by name (before the descriptors that point to them) */
     /* class free/print prototypes are needed by JSON parsers that allocate objects */
