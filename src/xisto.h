@@ -543,6 +543,10 @@ struct Class {
     bool is_abstract;
     bool iface_methods; /* an interface that declares methods: the base of the class that implements it (checker) */
     bool iface_base;    /* that interface, made the abstract base: an implementation declares its fields again */
+    struct Class *adapter_of; /* an adapter (XB-126): a subclass of an interface with methods made by the checker, holding
+                                 an object of this class (field __t) whose methods its own call */
+    struct Class **adapters;  /* an interface with methods: the adapters made for it (the run-time `as` looks them up) */
+    int nadapters;
     int region;        /* region.c: its objects live in that loop's region (allocated there, freed per iteration) */
     int rdual;         /* region.c: dual, made inside that loop and outside it too: in the region while an iteration
                           runs (xs_rg_on_N), on the heap otherwise; counted either way, and freed with the region */

@@ -404,6 +404,7 @@ DIAG(XS8145, DC_TYPE_RULE, "this arrow function takes %d parameter(s), but %d ar
 DIAG(XS8146, DC_TYPE_RULE, "variable '%s' must be initialized")
 DIAG(XS8147, DC_TYPE_RULE, "void is not a value type")
 DIAG(XS8148, DC_TYPE_RULE, "'%s' between %s and %s would convert one of them")
+DIAG(XS8149, DC_TYPE_RULE, "%s must be %s, but %s does not fit it")
 DIAG(XS9001, DC_DECLARATION, "'%s' extends itself")
 DIAG(XS9002, DC_DECLARATION, "'%s' is a built-in class")
 DIAG(XS9003, DC_DECLARATION, "'%s' is already declared in this scope")

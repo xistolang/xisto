@@ -19,6 +19,8 @@ static void push_func(Func *f) {
     work[nwork++] = f;
 }
 
+static Class **asif_reached; /* interfaces some `unknown as I` reaches (XB-126) */
+static int nasif_n;
 static void walk_expr(Expr *e);
 static void walk_stmt(Stmt *s);
 static void use_type(Type *t);
@@ -53,6 +55,12 @@ static void walk_expr(Expr *e) {
     switch (e->kind) {
     case E_CALL:
         if (e->builtin.cfn && strncmp(e->builtin.cfn, "__reflect_", 10) == 0) use_type(e->elem_type); /* decoder/encoder of T */
+        if (e->builtin.cfn && strcmp(e->builtin.cfn, "__iface_as") == 0) { /* unknown as I (XB-126): its adapters, below */
+            Type *t = e->type->kind == TY_NULLABLE ? e->type->elem : e->type;
+            if (!t->cls->used) use_class(t->cls);
+            asif_reached = realloc(asif_reached, sizeof(Class *) * (size_t)(nasif_n + 1));
+            asif_reached[nasif_n++] = t->cls;
+        }
         push_func(e->func);
         walk_expr(e->lhs);
         break;
@@ -110,11 +118,21 @@ void prune_program(Program *p) {
             for (int k = 0; k < c->nfields; k++) use_type(c->fields[k].type);
     }
     for (int i = 0; i < p->top.len; i++) walk_stmt(p->top.items[i]);
-    while (nwork > 0) {
-        Func *f = work[--nwork];
-        if (f->cls) use_class(f->cls);
-        for (int i = 0; i < f->nparams; i++) use_type(f->params[i].type);
-        use_type(f->ret);
-        if (f->body) walk_stmt(f->body);
+    for (bool more = true; more;) {
+        while (nwork > 0) {
+            Func *f = work[--nwork];
+            if (f->cls) use_class(f->cls);
+            for (int i = 0; i < f->nparams; i++) use_type(f->params[i].type);
+            use_type(f->ret);
+            if (f->body) walk_stmt(f->body);
+        }
+        /* an `unknown as I` wraps an object of a class that has an adapter for I: that adapter is needed when the
+           class is (its objects exist), not otherwise; a used adapter can make more classes used: until none */
+        more = false;
+        for (int i = 0; i < nasif_n; i++)
+            for (int k = 0; k < asif_reached[i]->nadapters; k++) {
+                Class *a = asif_reached[i]->adapters[k];
+                if (!a->used && a->adapter_of->used) { use_class(a); more = true; }
+            }
     }
 }
