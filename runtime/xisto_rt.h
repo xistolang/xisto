@@ -798,7 +798,9 @@ static inline void xs_release_(void *p) {
 #define xs_release_as(x, free_fn) do { xs_hdr *h_ = (xs_hdr *)(x); \
     if (h_) { if (--h_->rc == 0) free_fn(h_); \
               else if (__builtin_expect((h_->cls & (XS_CYC | XS_BUF)) == XS_CYC, 0)) xs_gc_suspect(h_); } } while (0)
-#define xs_retain(x) ((__typeof__(x))xs_retain_((void *)(x)))
+/* the argument appears once in the expansion: a chain of calls nests these macros, and a copy for __typeof__ doubled
+   the text at every level (a 20-call query builder chain became ~1M copies and took clang past 10 GB, 11/11) */
+#define xs_retain(x) ({ __auto_type xs_rtv_ = (x); (__typeof__(xs_rtv_))xs_retain_((void *)xs_rtv_); })
 #define xs_release(x) xs_release_((void *)(x))
 /* node:async_hooks: read and replace the current context (xs_als_cur, above) */
 XS_NOINLINE void *xs_als_current(void) { return xs_als_cur ? xs_retain_(xs_als_cur) : NULL; }
@@ -834,7 +836,7 @@ static void *xs_ar_(void *p) {
     xs_ar_pool[xs_ar_len++] = p;
     return p;
 }
-#define xs_ar(x) ((__typeof__(x))xs_ar_((void *)(x)))
+#define xs_ar(x) ({ __auto_type xs_arv_ = (x); (__typeof__(xs_arv_))xs_ar_((void *)xs_arv_); }) /* (once: see xs_retain) */
 
 static inline void xs_ar_drain(size_t mark) {
     while (xs_ar_len > mark) xs_release_(xs_ar_pool[--xs_ar_len]);
