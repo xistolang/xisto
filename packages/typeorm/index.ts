@@ -1016,6 +1016,22 @@ export class Repository<T> {
     return new EntityManager(executorFor(this.dataSourceName, this.sessionId));
   }
 
+  /** The entity it holds (TypeORM's repo.target): what manager.getRepository(target) and createQueryBuilder take */
+  get target(): ClassInfo {
+    return {
+      id: __reflect_typeid(T),
+      name: this.metadata.name,
+      params: [],
+      construct: (args: unknown[]): unknown => {
+        throw new Error("Repository.target is a description of the entity, not constructed");
+      },
+      methods: [],
+      fields: [],
+      isInstance: (v: unknown): boolean => false,
+      base: null,
+    };
+  }
+
   private get executor(): Executor {
     return executorFor(this.dataSourceName, this.sessionId);
   }

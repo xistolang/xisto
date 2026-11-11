@@ -180,6 +180,17 @@ export class Response {
     return this;
   }
 
+  /**
+   * destroy(err): Node closes the socket in the middle of the body. The body here is buffered, so nothing of it has
+   * gone out yet: it is dropped and the request ends with a 500 and no body (the client sees a failure either way).
+   */
+  destroy(err: Error | null = null): Response {
+    this.text = "";
+    this.statusCode = 500;
+    this.finished = true;
+    return this;
+  }
+
   /** Runs `fn` just before the headers go out, when the status and Content-Type are final (on-headers). */
   onHeaders(fn: (res: Response) => void): void {
     this.hooks.push(fn);
