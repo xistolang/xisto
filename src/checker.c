@@ -201,6 +201,7 @@ static void init_builtins(void) {
     Class *resp = bi_class("Response", "xs_Response");
     bi_field(resp, "status", ty_int);
     bi_field(resp, "ok", ty_boolean);
+    bi_field(resp, "headers", ty_map_of(ty_string, ty_string)); /* a Map: get(name) and forEach((v, k) => ...), names in lower case */
     bi_method(resp, "text", "xs_Response_text", ty_string, 0);
 
     Class *req = bi_class("HttpRequest", "xs_HttpRequest");
@@ -5717,8 +5718,13 @@ static void check_expr_in(Expr *e, Type *expected) {
                         if (strcmp(k, "method") == 0 || strcmp(k, "body") == 0) {
                             check_expr(v, ty_string);
                             expect_type(v, ty_string, xs_sprintf("fetch option '%s'", k));
+                        } else if (strcmp(k, "headers") == 0 && v->kind != E_OBJLIT) {
+                            /* headers built before the call: a Record<string, string> (sent in insertion order) */
+                            check_expr(v, NULL);
+                            Type *ht = v->type;
+                            if (!(ht && ht->kind == TY_MAP && ht->key && ht->key->kind == TY_STRING && ht->elem && ht->elem->kind == TY_STRING))
+                                xs_error(XS7058, v->pos, "headers: { \"Content-Type\": \"application/json\" }, or a Record<string, string>", "headers must be an object literal");
                         } else if (strcmp(k, "headers") == 0) {
-                            if (v->kind != E_OBJLIT) xs_error(XS7058, v->pos, "headers: { \"Content-Type\": \"application/json\" }", "headers must be an object literal");
                             for (int h = 0; h < v->args.len; h++) {
                                 check_expr(v->args.items[h], ty_string);
                                 expect_type(v->args.items[h], ty_string, xs_sprintf("header '%s'", v->keys[h]));
@@ -6170,9 +6176,21 @@ static void check_expr_in(Expr *e, Type *expected) {
                     if (src->kind == E_OBJLIT && src->args.len == 1 && strcmp(src->keys[0], "length") == 0) {
                         /* Array.from({ length: n }, (_, i) => ...): n results of the function, as JavaScript makes them */
                         int np = 2;
-                        if (fn->kind == E_ARROW) np = fn->arrow->fn->nparams;
-                        else if (fn->kind == E_IDENT) { check_expr(fn, NULL); if (fn->type->kind == TY_FUNC) np = fn->type->nparams; } /* (a name: checked twice, harmless) */
-                        callee->str = np == 0 ? "__xs_fromLength0" : "__xs_fromLength";
+                        bool async_fn = false; /* Array.from({ length: n }, worker) with an async worker: n promises (Promise.all of them) */
+                        if (fn->kind == E_ARROW) {
+                            np = fn->arrow->fn->nparams;
+                            Func *af = fn->arrow->fn;
+                            if (af->is_async) async_fn = true;
+                            else if (fn->arrow->expr_body && af->body && af->body->stmts.len) {
+                                Expr *r = af->body->stmts.items[af->body->stmts.len - 1]->expr;
+                                if (r && r->kind == E_CALL && r->lhs && r->lhs->kind == E_IDENT) {
+                                    Func *cf = lookup_func(r->lhs->str);
+                                    Binding *cb = cf ? NULL : lookup(r->lhs->str);
+                                    if ((cf && (cf->is_async || cf->ret_promise)) || (cb && cb->type && cb->type->kind == TY_FUNC && cb->type->async_ret)) async_fn = true;
+                                }
+                            }
+                        } else if (fn->kind == E_IDENT) { check_expr(fn, NULL); if (fn->type->kind == TY_FUNC) { np = fn->type->nparams; async_fn = fn->type->async_ret; } } /* (a name: checked twice, harmless) */
+                        callee->str = async_fn ? (np == 0 ? "__xs_fromLengthP0" : "__xs_fromLengthP") : np == 0 ? "__xs_fromLength0" : "__xs_fromLength";
                         expr_list_push(&c->args, src->args.items[0]); /* (checked as the call's int argument) */
                         expr_list_push(&c->args, fn);
                         *e = *c;
@@ -6480,6 +6498,21 @@ static void check_expr_in(Expr *e, Type *expected) {
             }
             static const char *cm[] = {"send", "receive", "close", "size"};
             xs_error(XS7008, e->pos, xs_help_suggest(m, cm, 4, "Channel has send(value), receive(), close() and size"), "Channel has no member '%s'", m);
+        }
+        if (e->is_call && e->args.len == 0 && e->str && strcmp(e->str, "json") == 0 && e->lhs->type->kind == TY_OBJECT &&
+            e->lhs->type->cls->builtin && strcmp(e->lhs->type->cls->name, "Response") == 0) {
+            /* response.json(): JSON.parse(response.text()), typed where it goes (any where nothing says) */
+            Pos at = e->pos;
+            Expr *recv = e->lhs;
+            Expr *txt = xs_alloc(sizeof *txt);
+            txt->kind = E_MEMBER; txt->pos = at; txt->field = -1; txt->lhs = recv; txt->str = "text"; txt->is_call = true;
+            Expr *js = xs_alloc(sizeof *js);
+            js->kind = E_IDENT; js->pos = at; js->field = -1; js->str = "JSON";
+            memset(e, 0, sizeof *e);
+            e->kind = E_MEMBER; e->pos = at; e->field = -1; e->lhs = js; e->str = "parse"; e->is_call = true;
+            expr_list_push(&e->args, txt);
+            check_expr(e, expected && expected->kind != TY_UNKNOWN ? expected : ty_any);
+            return;
         }
         if (e->lhs->type->kind == TY_UNION) { /* s.kind: a field every member has, read by the object's class */
             Type *u = e->lhs->type;
@@ -7964,7 +7997,9 @@ static void check_var(Stmt *s, bool global) {
         s->init = seq;
         if (s->decl_type && s->decl_type->kind == TY_VOID) s->decl_type = ty_unknown;
     }
-    if (s->init->type->kind == TY_VOID) xs_error(XS8102, s->init->pos, NULL, "cannot store a void value");
+    bool keeps_promise = s->decl_type && (s->decl_type->kind == TY_PROMISE || (s->decl_type->kind == TY_NULLABLE && s->decl_type->elem->kind == TY_PROMISE));
+    if (s->init->type->kind == TY_VOID && !(keeps_promise && pr_is_call(s->init))) /* (const p: Promise<void> = f(): the promise, made below) */
+        xs_error(XS8102, s->init->pos, NULL, "cannot store a void value");
     if (s->init->type->kind == TY_NULL && !s->decl_type) xs_error(XS2013, s->init->pos, "write the type: let x: Todo | null = null;", "cannot infer the type of '%s' from null", s->name);
     if (s->decl_type) expect_type(s->init, s->decl_type, xs_sprintf("initializer of '%s' (declared as %s)", s->name, ty_name(s->decl_type)));
     settle(s->init);

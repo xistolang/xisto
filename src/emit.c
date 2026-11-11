@@ -3407,6 +3407,20 @@ static void emit_expr_raw(Expr *e) {
                 else if (strcmp(k, "headers") == 0) headers = init->args.items[i];
                 else timeout = init->args.items[i]->args.items[0];
             }
+            if (headers && headers->kind != E_OBJLIT) { /* headers from a Record<string, string> */
+                buf_puts(out, "xs_fetch_hmap(");
+                emit_borrowed(e->args.items[0]);
+                buf_puts(out, ", ");
+                if (method) emit_borrowed(method); else buf_puts(out, "NULL");
+                buf_puts(out, ", ");
+                if (body) emit_borrowed(body); else buf_puts(out, "NULL");
+                buf_puts(out, ", ");
+                emit_borrowed(headers);
+                buf_puts(out, ", ");
+                if (timeout) emit_expr(timeout); else buf_puts(out, "-1");
+                buf_puts(out, ")");
+                return;
+            }
             buf_puts(out, "xs_fetch_full(");
             emit_borrowed(e->args.items[0]);
             buf_puts(out, ", ");
