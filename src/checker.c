@@ -6616,6 +6616,14 @@ static void check_expr_in(Expr *e, Type *expected) {
                     /* the callback takes (element) or (element, index); map infers its result type from the callback */
                     int np = 1;
                     if (cb->kind == E_ARROW) np = cb->arrow->fn->nparams;
+                    if (np == 0 && cb->kind == E_ARROW) { /* xs.map(() => null): the element, unused */
+                        Func *af = cb->arrow->fn;
+                        af->params = xs_alloc(sizeof(Param));
+                        memset(af->params, 0, sizeof(Param));
+                        af->params[0].name = "__el_unused";
+                        af->nparams = 1;
+                        np = 1;
+                    }
                     if (np < 1 || np > 2) xs_error(XS8129, cb->pos, NULL, "the callback of %s takes (element) or (element, index)", m);
                     Type *cbt = CB(np, is_map ? NULL : is_each ? ty_void : ty_boolean);
                     if (is_map) {
@@ -8488,7 +8496,7 @@ static UNarrow union_narrow(Expr *c) {
         Binding *b = id ? lookup(id->str) : NULL;
         if (!b) return r;
         Type *u = b->type;
-        if (u->kind == TY_UNKNOWN) { r.b = b; r.then_t = ty_array_of(ty_unknown); return r; } /* v: unknown, an array: unknown[] */
+        if (u->kind == TY_UNKNOWN) { r.b = b; r.then_t = ty_array_of(ty_is_any(u) ? ty_any : ty_unknown); return r; } /* v: unknown, an array: unknown[] (an any: any[]) */
         if (u->kind != TY_UNION) return r;
         bool *keep = xs_alloc(sizeof(bool) * (size_t)u->nparams), *other = xs_alloc(sizeof(bool) * (size_t)u->nparams);
         for (int i = 0; i < u->nparams; i++) { keep[i] = u->params[i]->kind == TY_ARRAY; other[i] = !keep[i]; }

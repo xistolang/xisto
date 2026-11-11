@@ -34,3 +34,14 @@ function mk(id: string, extra: Partial<Item> = {}): Item {
 }
 for (const it of [mk("a"), mk("b", { estado: "novo", impacto: { volume: "10" } }), mk("c", { impacto: { frequencia: "mensal" } })])
   console.log(it.id, it.estado, it.impacto?.frequencia, it.impacto?.volume ?? "-", it.impacto?.umAUm);
+// Array.isArray on an any keeps it any (any[]); a callback that takes no parameter
+function anoDe(rows: any): number {
+  if (!Array.isArray(rows) || rows.length !== 1) return -1;
+  return Number(rows[0]?.CD_ANO) || 0;
+}
+console.log(anoDe(JSON.parse('[{"CD_ANO": 2020}]')), anoDe(JSON.parse("[]")), anoDe(3));
+interface Res { ok: number }
+const nums = [1, 2, 3];
+const res: (Res | null)[] = nums.map((): Res | null => null);
+res[1] = { ok: 5 };
+console.log(res.map((r) => r?.ok ?? -1), nums.filter(() => true).length);
