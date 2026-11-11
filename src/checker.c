@@ -10581,7 +10581,7 @@ void check_program(Program *p) {
                     for (int j = 0; j < nbuiltins; j++)
                         if (strcmp(builtins[j]->name, name) == 0 && (strcmp(name, "DatabaseSync") == 0 || strcmp(name, "StatementSync") == 0)) found = true;
                 if (found && im->is_default) { /* import x from "m": x must be m's default export */
-                    bool ok = false;
+                    bool ok = im->from->default_name && strcmp(im->from->default_name, name) == 0;
                     SYM_EACH(funcs_by_name, name, e) if (((Func *)e->decl)->mod == im->from && ((Func *)e->decl)->is_default) ok = true;
                     if (!ok) { enter_module(m); xs_error(XS9013, im->positions[k], "import it by name: import { x } from \"m\"", "'%s' is not the default export of '%s'", name, im->path); }
                 }

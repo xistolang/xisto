@@ -3752,6 +3752,99 @@ static void load_import(Program *prog, Module *m, Import *im) {
     parsing_mod = pm;
 }
 
+/* the declaration a module's export `name` names when it is renamed on the way (export { a as b } here or in a module
+   it re-exports, export default): its name, and the module to import it from (*via); `name` itself when it is not */
+static const char *export_orig(Module *m, const char *name, Module **via, int depth) {
+    if (!m || depth > 32) return name;
+    if (strcmp(name, "default") == 0) { if (m->default_name) { *via = m; return m->default_name; } return name; }
+    for (int i = 0; i < m->nexp; i++) if (strcmp(m->exp_to[i], name) == 0) { *via = m; return m->exp_from[i]; }
+    for (int i = 0; i < m->nimports; i++) {
+        Import *im = &m->imports[i];
+        if (!im->reexport || !im->from || im->from->loading || im->from->missing) continue;
+        if (im->star) {
+            const char *o = export_orig(im->from, name, via, depth + 1);
+            if (o != name) return o;
+            continue;
+        }
+        if (im->as_names) for (int k = 0; k < im->n; k++)
+            if (strcmp(im->as_names[k], name) == 0 && strcmp(im->names[k], name) != 0) {
+                *via = im->from;
+                const char *o = export_orig(im->from, im->names[k], via, depth + 1);
+                return o;
+            }
+    }
+    return name;
+}
+static void add_alias(Parser *p, const char *from, const char *to) {
+    p->alias_from = realloc(p->alias_from, sizeof(char *) * (size_t)(p->nalias + 1));
+    p->alias_to = realloc(p->alias_to, sizeof(char *) * (size_t)(p->nalias + 1));
+    p->alias_from[p->nalias] = (char *)from;
+    p->alias_to[p->nalias++] = (char *)to;
+}
+static bool declares_top(Parser *p, const char *name);
+/* after the imports from i0 on are loaded: a name their module exports under another name (export { a as b },
+   export default) is imported by its declared name, from the module that declares it (an import of its own), and
+   read so in this module (as import { a as b } reads b as a) */
+static void fix_import_names(Parser *p, Module *m, int i0) {
+    int nim = m->nimports;
+    for (int i = i0; i < nim; i++) {
+        for (int k = 0; k < m->imports[i].n; k++) {
+            Import *im = &m->imports[i];
+            if (!im->from || im->from->missing || im->from->loading || im->star) break;
+            const char *n = im->names[k];
+            Module *via = im->from;
+            const char *o = im->is_default ? (im->from->default_name ? im->from->default_name : n) : export_orig(im->from, n, &via, 0);
+            if (o == n || strcmp(o, n) == 0) continue;
+            if (!im->reexport && !im->is_default)
+                for (int j = 0; j < m->nimports; j++) { /* two exports declared under one name (a barrel's PK_A_X and PK_B_X): names are
+                                                           resolved by their declared name, so one module cannot import both (XB-117) */
+                    Import *jm = &m->imports[j];
+                    if (jm->reexport || jm->is_default || jm == im) continue;
+                    for (int q = 0; q < jm->n; q++) {
+                        const char *as = jm->as_names ? jm->as_names[q] : jm->names[q];
+                        if (strcmp(jm->names[q], o) == 0 && strcmp(as, n) != 0 && jm->from != via)
+                            xs_error(XS1038, im->positions[k], "import one of them in a module of its own",
+                                     "'%s' and '%s' are both declared as '%s': one module cannot import both", n, as, o);
+                    }
+                }
+            /* its own import: { o as n } from the module that declares it */
+            Import ni = *im;
+            ni.names = xs_alloc(sizeof(char *));
+            ni.names[0] = (char *)o;
+            ni.positions = xs_alloc(sizeof(Pos));
+            ni.positions[0] = im->positions[k];
+            ni.as_names = xs_alloc(sizeof(char *));
+            ni.as_names[0] = im->reexport && im->as_names ? im->as_names[k] : (char *)n;
+            ni.n = 1;
+            ni.from = via;
+            ni.is_default = false;
+            for (int q = k; q + 1 < im->n; q++) {
+                im->names[q] = im->names[q + 1];
+                im->positions[q] = im->positions[q + 1];
+                if (im->as_names) im->as_names[q] = im->as_names[q + 1];
+            }
+            im->n--;
+            k--;
+            bool was_default = im->is_default, was_re = im->reexport;
+            m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+            m->imports[m->nimports++] = ni;
+            if (was_re) continue; /* export { b } from "m": this module re-exports o (of `via`), as b */
+            if (was_default) { /* import x from "m": x reads as m's default declaration */
+                add_alias(p, n, o);
+                if (declares_top(p, o)) add_alias(p, o, xs_sprintf("%s__local", o));
+                continue;
+            }
+            bool renamed = false; /* import { b as c }: c already reads as b, now as o */
+            for (int q = 0; q < p->nalias; q++) if (strcmp(p->alias_to[q], n) == 0) { p->alias_to[q] = (char *)o; renamed = true; }
+            if (!renamed) add_alias(p, n, o);
+            if (declares_top(p, o)) add_alias(p, o, xs_sprintf("%s__local", o));
+        }
+    }
+    if (p->nalias && p->tok.kind == TK_IDENT) /* (the token read already) */
+        for (int i = 0; i < p->nalias; i++)
+            if (strcmp(p->tok.str, p->alias_from[i]) == 0) { p->tok.str = p->alias_to[i]; break; }
+}
+
 /* export { a, b } from "m" and export * from "m" (a barrel's re-exports), and export { a, b }; of names declared here */
 static void parse_reexport(Parser *p, Module *m, Program *prog, bool load_now) {
     Pos pos = p->tok.pos;
@@ -3777,18 +3870,21 @@ static void parse_reexport(Parser *p, Module *m, Program *prog, bool load_now) {
                 next(p);
                 if (!at(p, TK_IDENT)) { p->lx = save; p->tok = t0; }
             }
-            Token name = expect(p, TK_IDENT, NULL);
-            if (at_ident(p, "as")) {
+            Token name = at(p, TK_DEFAULT) ? (Token){.kind = TK_IDENT, .pos = p->tok.pos, .str = "default"} : p->tok; /* export { default as X } from */
+            if (at(p, TK_DEFAULT)) next(p); else expect(p, TK_IDENT, NULL);
+            Token alias = name;
+            if (at_ident(p, "as")) { /* export { a as b }: a, known outside as b (importers read b as a) */
                 next(p);
-                Token alias = expect(p, TK_IDENT, NULL);
-                if (strcmp(alias.str, name.str) != 0)
-                    xs_error(XS1038, alias.pos, "re-export it under its own name", "renaming in a re-export ('%s as %s') is not supported", name.str, alias.str);
+                alias = at(p, TK_DEFAULT) ? (Token){.kind = TK_IDENT, .pos = p->tok.pos, .str = "default"} : p->tok;
+                if (at(p, TK_DEFAULT)) next(p); else expect(p, TK_IDENT, NULL);
             }
             if (im.n == cap) {
                 cap = cap ? cap * 2 : 4;
                 im.names = realloc(im.names, sizeof(char *) * (size_t)cap);
                 im.positions = realloc(im.positions, sizeof(Pos) * (size_t)cap);
+                im.as_names = realloc(im.as_names, sizeof(char *) * (size_t)cap);
             }
+            im.as_names[im.n] = alias.str;
             im.names[im.n] = name.str;
             im.positions[im.n++] = name.pos;
             if (!accept(p, TK_COMMA)) break;
@@ -3796,7 +3892,15 @@ static void parse_reexport(Parser *p, Module *m, Program *prog, bool load_now) {
         expect(p, TK_RBRACE, NULL);
         if (!at_ident(p, "from")) { /* export { a, b };: names declared in this module */
             m->local_exports = realloc(m->local_exports, sizeof(char *) * (size_t)(m->nlocal_exports + im.n));
-            for (int i = 0; i < im.n; i++) m->local_exports[m->nlocal_exports++] = im.names[i];
+            for (int i = 0; i < im.n; i++) {
+                m->local_exports[m->nlocal_exports++] = im.names[i];
+                if (strcmp(im.as_names[i], im.names[i]) == 0) continue;
+                if (strcmp(im.as_names[i], "default") == 0) { m->default_name = im.names[i]; continue; } /* export { f as default } */
+                m->exp_from = realloc(m->exp_from, sizeof(char *) * (size_t)(m->nexp + 1));
+                m->exp_to = realloc(m->exp_to, sizeof(char *) * (size_t)(m->nexp + 1));
+                m->exp_from[m->nexp] = im.names[i];
+                m->exp_to[m->nexp++] = im.as_names[i];
+            }
             expect_semi(p);
             return;
         }
@@ -3808,7 +3912,10 @@ static void parse_reexport(Parser *p, Module *m, Program *prog, bool load_now) {
     expect_semi(p);
     m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
     m->imports[m->nimports++] = im;
-    if (load_now) load_import(prog, m, &m->imports[m->nimports - 1]);
+    if (load_now) {
+        load_import(prog, m, &m->imports[m->nimports - 1]);
+        fix_import_names(p, m, m->nimports - 1);
+    }
 }
 
 /* export { a, b };: the listed declarations of this module are exported */
@@ -3883,6 +3990,7 @@ static void parse_module(Program *prog, Module *m) {
         xs_file_name = m->file;
         xs_source = m->src;
     }
+    fix_import_names(&p, m, 0);
     parsing_prog = prog;
     parsing_mod = m;
     int top_start = prog->top.len;
@@ -3949,7 +4057,29 @@ static void parse_module(Program *prog, Module *m) {
             continue;
         }
         if (decos.len && !at(&p, TK_CLASS)) xs_error(XS6020, decos.items[0].pos, NULL, "decorators apply to classes, their members and parameters");
-        if (is_default && !at(&p, TK_FUNCTION) && !at(&p, TK_ASYNC)) xs_error(XS6009, p.tok.pos, NULL, "'export default' applies to functions only");
+        if (is_default && at(&p, TK_IDENT) && (peek_is(&p, TK_SEMI) || peek_is(&p, TK_EOF))) { /* export default f;: f, declared here */
+            m->default_name = p.tok.str;
+            m->local_exports = realloc(m->local_exports, sizeof(char *) * (size_t)(m->nlocal_exports + 1));
+            m->local_exports[m->nlocal_exports++] = p.tok.str;
+            next(&p);
+            expect_semi(&p);
+            continue;
+        }
+        if (is_default && !at(&p, TK_FUNCTION) && !at(&p, TK_ASYNC) && !at(&p, TK_CLASS)) {
+            /* export default <expression>: a const of the module's own (the default import reads it) */
+            Pos pos = p.tok.pos;
+            Stmt *st = new_stmt(S_VAR, pos);
+            st->name = xs_sprintf("__default_m%d", m->id);
+            st->is_const = true;
+            st->init = parse_expr(&p);
+            expect_semi(&p);
+            st->mod = m;
+            st->exported = true;
+            m->default_name = st->name;
+            stmt_list_push(&prog->top, st);
+            drain_pending(&p, &prog->top, m, true);
+            continue;
+        }
         if (at(&p, TK_IMPORT) || require_ahead(&p)) { /* an import after declarations (ES hoists it): read and loaded here; names resolve in the
                                     checker, after the whole file, so declarations above may use them */
             int n0 = m->nimports;
@@ -3969,6 +4099,7 @@ static void parse_module(Program *prog, Module *m) {
                 parsing_prog = prog;
                 parsing_mod = m;
             }
+            fix_import_names(&p, m, n0);
             continue;
         }
         if (at(&p, TK_FUNCTION) || at(&p, TK_ASYNC)) {
@@ -3979,6 +4110,7 @@ static void parse_module(Program *prog, Module *m) {
             f->mod = m;
             f->exported = exported;
             f->is_default = is_default;
+            if (is_default) m->default_name = f->name;
             add_func(prog, f);
         } else if (at(&p, TK_CLASS) || (at_ident(&p, "abstract") && peek_is(&p, TK_CLASS))) {
             bool abstract = at_ident(&p, "abstract");
@@ -3999,6 +4131,7 @@ static void parse_module(Program *prog, Module *m) {
             }
             c->mod = m;
             c->exported = exported;
+            if (is_default) m->default_name = c->name;
             add_class(prog, c);
             add_statics(prog, m, c);
         } else if (at_ident(&p, "interface") || (at_ident(&p, "type") && peek_is_ident(&p))) {
