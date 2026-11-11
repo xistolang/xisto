@@ -86,7 +86,7 @@ class Servico {
   private readonly travaHabilitada = flagLigada(process.env.TRAVA_TESTE_XYZ);
   readonly SQL_MARCADA = sqlMarcada('hap');
   private readonly q = (sql: string, binds: unknown[]): Promise<Record<string, unknown>[]> =>
-    this.banco.query(sql, binds);
+  this.banco.query(sql, binds);
   private readonly banco: Banco;
   constructor(banco: Banco) { this.banco = banco; }
   async rodar(): Promise<string> {
