@@ -1212,6 +1212,35 @@ static Type *ret_unpromise(Type *t, bool *async) {
     if (n > 1) { r = xs_alloc(sizeof *r); *r = *u; r->params = m; r->nparams = n; }
     return nul ? ty_nullable_of(r) : r;
 }
+static Type *resolve(Type *t, Pos pos);
+/* { a: T } written in a generic class's or function's text: each instance parses it again with T bound, and that
+   makes its interface while the checker runs (after the program's classes were registered): registered here, the
+   first time a type names it, with its fields resolved where it was written */
+static void flatten_fields(Class *c, int depth);
+static bool late_inline_class(Class *c) {
+    bool in_prog = false;
+    for (int i = prog->nclasses - 1; i >= 0 && !in_prog; i--) in_prog = prog->classes[i] == c;
+    if (!in_prog || c->builtin) return false;
+    sym_add(&classes_by_name, c->name, c);
+    c->cname = xs_sprintf("c%d_%s", c->mod->id, c->name);
+    c->used = true;
+    Module *saved_mod = cur_mod;
+    Scope *saved_scope = scope;
+    const char *sfn = xs_file_name, *ssrc = xs_source;
+    enter_module(c->mod);
+    flatten_fields(c, 0);
+    for (int k = 0; k < c->nfields; k++) {
+        Field *fd = &c->fields[k];
+        fd->type = resolve(fd->type, fd->pos);
+        fd->cname = field_cname(fd->name);
+    }
+    cur_mod = saved_mod;
+    scope = saved_scope;
+    xs_file_name = sfn;
+    xs_source = ssrc;
+    return true;
+}
+
 static Type *resolve(Type *t, Pos pos) {
     if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__ret_of:", 9) == 0) { /* (generated reflection) */
         const char *dot = strchr(t->tname + 9, '.');
@@ -1340,6 +1369,7 @@ static Type *resolve(Type *t, Pos pos) {
     }
     case TY_OBJECT:
         if (t->cls->cname) return t;
+        if (t->cls->name && strncmp(t->cls->name, "__Obj_", 6) == 0 && t->cls->mod && late_inline_class(t->cls)) return t;
         {
             Enum *en = find_enum(t->cls->name);
             if (en) return ty_enum_of(en);
