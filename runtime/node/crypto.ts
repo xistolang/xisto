@@ -211,7 +211,7 @@ function aesBlock(s: Uint8Array, w: Uint8Array, sbox: Uint8Array): void {
 }
 
 function concatBytes(parts: Uint8Array[]): Uint8Array {
-  let n = 0;
+  let n: int = 0;
   for (const p of parts) n += p.length;
   const out = new Uint8Array(n);
   let k = 0;

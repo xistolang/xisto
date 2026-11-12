@@ -424,6 +424,9 @@ export interface ParamDef {
   pipeClass: ClassInfo | null; // a pipe of the app's own (its transform(value, metadata) runs on the value)
 }
 
+/** Nest's RawBodyRequest<Request>: the request with rawBody (xisto's Request always has it). */
+export type RawBodyRequest<T> = T;
+
 /** What a pipe's transform(value, metadata) learns of the parameter. */
 export class ArgumentMetadata {
   type: string = "custom"; // "body", "query", "param" or "custom"

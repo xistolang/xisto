@@ -75,7 +75,7 @@ export class EntityMetadata {
   expression: string = "";
   columns: ColumnMetadata[] = [];
 
-  primaryColumns(): ColumnMetadata[] {
+  get primaryColumns(): ColumnMetadata[] {
     const out: ColumnMetadata[] = [];
     for (const c of this.columns) {
       if (c.isPrimary) {
@@ -1225,7 +1225,7 @@ export class Repository<T> {
   private primaryWhere(values: object): object {
     let text = "{";
     let first = true;
-    for (const c of this.metadata.primaryColumns()) {
+    for (const c of this.metadata.primaryColumns) {
       if (!first) {
         text = text + ",";
       }
@@ -1252,7 +1252,7 @@ export class Repository<T> {
   /** INSERT when no row has the entity's primary key, UPDATE of its other columns when one has */
   async save(entity: T): Promise<T> {
     const values: object = JSON.parse(JSON.stringify(entity));
-    const pks = this.metadata.primaryColumns();
+    const pks = this.metadata.primaryColumns;
     let present = pks.length > 0;
     for (const c of pks) {
       if (kind(get(values, c.propertyName)) === "null") {
@@ -1919,6 +1919,10 @@ export class EntityManager {
   private executor: Executor;
   constructor(executor: Executor) {
     this.executor = executor;
+  }
+  /** The QueryRunner of a transaction's manager (null outside one, as TypeORM's manager of a DataSource). */
+  get queryRunner(): QueryRunner | null {
+    return null;
   }
   get connection(): DataSource {
     return this.executor.dataSource;

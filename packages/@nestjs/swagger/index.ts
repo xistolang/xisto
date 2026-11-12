@@ -192,6 +192,8 @@ export class ApiParamOptions {
   enum: unknown = null;
   schema: unknown = null;
   isArray?: boolean;
+  deprecated?: boolean;
+  enumName?: string;
 }
 
 export function ApiBody(o: ApiParamOptions = {}): (c: ClassInfo, m: MethodInfo) => void {

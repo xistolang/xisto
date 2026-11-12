@@ -26,4 +26,4 @@ export function init(options: TracerOptions = {}): void {
 }
 
 /** tracer.use(plugin, options): instrumentation is off; accepted. */
-export function use(plugin: string): void {}
+export function use(plugin: string, options: unknown = null): void {}
