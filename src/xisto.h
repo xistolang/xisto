@@ -504,7 +504,9 @@ struct Func {
     const char *par_why;
     bool par_native;   /* an instance of a xisto:parallel function some call runs on the pool: emit its _par version */
     bool sig_failed;   /* xisto check: its signature names what could not be loaded (reported): its body is not checked */
-    bool shadow; /* a method with the name of a base method but another signature: its own, not called through the base */
+    bool shadow; /* a method with the name of a base method but another arity: what a call through the base runs is bridge */
+    struct Func *bridge;
+    Type *natural_ret; /* an arrow whose result goes where unknown goes: the type its return had (overload typing) */ /* (shadow) the base's signature, calling this method with the arguments converted (checker) */
     bool overload_sig; /* function f(a: A): R; (no body): an overload signature, kept with the implementation (overloads) */
     struct Func **overloads; /* the overload signatures written before this implementation: what its callers see */
     int noverloads;
@@ -596,6 +598,7 @@ struct Class {
     char *mixin_call;    /* class X extends F(args) (F a class with a static __mixin, e.g. PassportStrategy(Strategy, "jwt")):
                             X extends F, and F.__mixin(args) runs as a class decorator on X */
     bool mixin_done;
+    bool fake;           /* { m: () => ... } as C: an object literal standing for a class with methods (no super(...)) */
     bool as_value;       /* class { ... } written as an expression: a value (its ClassInfo), like a decorated class */
 };
 /* PartialType(Y), OmitType(Y, ["a"] as const), PickType(Y, ["a"]), IntersectionType(A, B): the mapped types of

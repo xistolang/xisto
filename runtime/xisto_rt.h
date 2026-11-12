@@ -1773,6 +1773,20 @@ __attribute__((noinline)) static void *xs_Error_new(void *msg) {
     if ((e->trace = malloc(sz))) memcpy(e->trace, src, sz);
     return e;
 }
+/* a method an object literal standing for a class does not give, called: TypeError "<name> is not a function" */
+XS_NOINLINE void *xs_type_error_not_fn(xs_str *name) {
+    xs_Error *e = xs_Error_new(NULL);
+    xs_release(e->f_name);
+    e->f_name = xs_str_new("TypeError", 9);
+    xs_release(e->f_message);
+    size_t n = (size_t)name->len;
+    char *b = malloc(n + 20);
+    memcpy(b, name->data, n);
+    memcpy(b + n, " is not a function", 18);
+    e->f_message = xs_str_new(b, n + 18);
+    free(b);
+    return e;
+}
 /* new Error(message, { cause }): the cause is kept as err.cause (both arguments borrowed) */
 XS_NOINLINE void *xs_Error_new_cause(void *msg, void *cause) {
     xs_Error *e = xs_Error_new(msg);
@@ -3381,6 +3395,11 @@ static int64_t xs_arr_index_of_num(xs_arr_num *a, double v) {
 static int64_t xs_arr_index_of_int(xs_arr_int *a, int64_t v) { for (size_t i = 0; i < a->len; i++) if (a->data[i] == v) return (int64_t)i; return -1; }
 static int64_t xs_arr_index_of_bool(xs_arr_bool *a, bool v) { for (size_t i = 0; i < a->len; i++) if (a->data[i] == v) return (int64_t)i; return -1; }
 /* strings by content; in a (string | null)[] null matches null */
+/* (unknown[]).includes(v) / indexOf(v): === as JavaScript's (strings and boxed numbers by value, objects by identity) */
+XS_NOINLINE int64_t xs_arr_index_of_ref(xs_arr_ref *a, void *v) {
+    for (size_t i = 0; i < a->len; i++) if (a->data[i] == v || xs_dyn_eq(a->data[i], v)) return (int64_t)i;
+    return -1;
+}
 static int64_t xs_arr_index_of_str(xs_arr_ref *a, xs_str *v) {
     for (size_t i = 0; i < a->len; i++) {
         xs_str *x = a->data[i];
