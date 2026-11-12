@@ -2476,7 +2476,7 @@ static Func *lookup_func(const char *name) {
         if (f->mod == cur_mod || (f->exported && imports_name(cur_mod, f->mod, name))) return f;
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:arrays") == 0) return f; /* (reduce & co) */
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:settled") == 0) return f; /* (Promise.allSettled) */
-        if ((!strcmp(name, "__xs_construct") || !strcmp(name, "__xs_ci_params") || !strcmp(name, "__xs_apply") || !strcmp(name, "__xs_use_desc") || !strcmp(name, "__xs_desc_enter") || !strcmp(name, "__xs_desc_leave")) &&
+        if ((!strcmp(name, "__xs_construct") || !strcmp(name, "__xs_ci_params") || !strcmp(name, "__xs_apply") || !strcmp(name, "__xs_use_desc") || !strcmp(name, "__xs_desc_enter") || !strcmp(name, "__xs_desc_leave") || !strcmp(name, "__xs_deco_target") || !strcmp(name, "__xs_target_ctor")) &&
             f->mod && f->mod->file && !strcmp(f->mod->file, "xisto:reflect")) return f; /* (new (c)(); XB-107's f.apply and descriptors) */
         if (f->exported && (strstr(name, "__s_") || !strcmp(name, "__xs_fetch")) && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:url") == 0) return f; /* (URL.canParse, AbortSignal.timeout: statics of globals; fetch with its options in a value) */
         if (!strncmp(name, "__xs_slot_get_", 14) || !strncmp(name, "__xs_slot_set_", 14) || !strncmp(name, "__xs_proto_get_", 15) ||
