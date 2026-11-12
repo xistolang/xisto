@@ -197,6 +197,20 @@ export function ApiParam(o: ApiParamOptions = {}): (c: ClassInfo, m: MethodInfo)
 export function ApiQuery(o: ApiParamOptions = {}): (c: ClassInfo, m: MethodInfo) => void {
   return (c: ClassInfo, m: MethodInfo): void => {};
 }
+/** Options of @ApiHeader: the header a route (or every route of a controller) reads. */
+export class ApiHeaderOptions {
+  name: string;
+  description?: string;
+  required?: boolean;
+  enum: unknown = null;
+  schema: unknown = null;
+  example: unknown = null;
+  deprecated?: boolean;
+}
+/** Documents a request header (accepted: the document lists the routes' parameters and bodies). */
+export function ApiHeader(o: ApiHeaderOptions): (c: ClassInfo, m: MethodInfo | null) => void {
+  return (c: ClassInfo, m: MethodInfo | null): void => {};
+}
 /** The media types a route accepts (accepted). */
 export function ApiConsumes(mime: string): (c: ClassInfo, m: MethodInfo) => void {
   return (c: ClassInfo, m: MethodInfo): void => {};

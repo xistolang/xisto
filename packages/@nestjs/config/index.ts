@@ -1,28 +1,58 @@
 // @nestjs/config for xisto: ConfigModule.forRoot() reads a .env file into process.env (without overriding what
 // the environment already has, as dotenv does) and provides ConfigService, which reads process.env.
 import { readFileSync, existsSync } from "xisto:fs";
-import { DynamicModule, Injectable, Module } from "@nestjs/common";
+import { DynamicModule, Injectable, Module, FactoryProvider } from "@nestjs/common";
 
 /**
  * A namespace of configuration: registerAs("database", () => ({ ... })) gives one, which ConfigModule.forRoot
- * loads ({ load: [databaseConfig] }); then config.get("database.host") reads it.
+ * loads ({ load: [databaseConfig] }) or ConfigModule.forFeature provides; then config.get("database.host") reads
+ * it, and @Inject(databaseConfig.KEY) private cfg: ConfigType<typeof databaseConfig> receives the object.
  * Compatibility: Nest's registerAs returns the factory function itself (with a KEY); here it is this object,
- * which forRoot's load and get() use the same way.
+ * which forRoot's load, forFeature and get() use the same way.
  */
-export class ConfigFactory {
+export class ConfigFactory<T = any> {
   KEY: string;
   namespace: string;
-  build: () => any;
-  constructor(namespace: string, build: () => any) {
+  /** (the factory's type, which ConfigType<typeof f> names; never set) */
+  __type: T | null = null;
+  constructor(namespace: string) {
     this.KEY = `CONFIGURATION(${namespace})`;
     this.namespace = namespace;
-    this.build = build;
   }
 }
 
-/** A configuration namespace from a factory, read when ConfigModule.forRoot loads it. */
-export function registerAs<T>(token: string, factory: () => T): ConfigFactory {
-  return new ConfigFactory(token, (): any => factory() as any);
+// each namespace's factory (a ConfigFactory<T> of any T is read through its namespace)
+class FactoryFn {
+  fn: () => any;
+  constructor(fn: () => any) {
+    this.fn = fn;
+  }
+}
+const factories: Map<string, FactoryFn> = new Map<string, FactoryFn>();
+
+function namespaceOf(f: unknown): string {
+  const x: any = f;
+  return x.namespace as string;
+}
+
+function build(f: unknown): any {
+  const ns = namespaceOf(f);
+  const fn = factories.get(ns);
+  if (fn === null) {
+    throw new Error(`Configuration namespace "${ns}" was not registered`);
+  }
+  const value: any = fn.fn();
+  loaded[ns] = value;
+  return value;
+}
+
+/** The object a configuration namespace gives: ConfigType<typeof databaseConfig>. */
+export type ConfigType<F> = NonNullable<F["__type"]>;
+
+/** A configuration namespace from a factory, read when ConfigModule.forRoot (or forFeature) loads it. */
+export function registerAs<T>(token: string, factory: () => T): ConfigFactory<T> {
+  factories.set(token, new FactoryFn((): any => factory() as any));
+  return new ConfigFactory<T>(token);
 }
 
 /** Options of ConfigModule.forRoot. envFilePath: a file, or a list (the first that exists wins each key). */
@@ -32,7 +62,7 @@ export class ConfigModuleOptions {
   ignoreEnvFile?: boolean;
   cache?: boolean;
   expandVariables?: boolean;
-  load?: ConfigFactory[];
+  load?: unknown[]; // registerAs's factories
 }
 
 /** The namespaces forRoot loaded, by name (their factories' values). */
@@ -142,8 +172,21 @@ export class ConfigModule {
       }
     }
     for (const f of options.load ?? []) {
-      loaded[f.namespace] = f.build();
+      build(f);
     }
     return { module: ConfigModule, providers: [ConfigService], exports: [ConfigService], global: options.isGlobal || false };
+  }
+
+  /**
+   * Provides one configuration namespace under its KEY, for @Inject(cfg.KEY), and loads it for get("ns.key").
+   * @example imports: [ConfigModule.forFeature(redisConfig)]
+   */
+  static forFeature(config: unknown): DynamicModule {
+    // built when first injected, as Nest's factory runs once the modules are imported (the .env is read by then)
+    const p: FactoryProvider = {
+      provide: `CONFIGURATION(${namespaceOf(config)})`,
+      useFactory: (): unknown => build(config),
+    };
+    return { module: ConfigModule, providers: [p, ConfigService], exports: [p, ConfigService] };
   }
 }

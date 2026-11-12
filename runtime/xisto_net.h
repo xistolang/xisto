@@ -1629,6 +1629,13 @@ static void xs_Server_post(xs_Server *s, xs_str *path, xs_handler fn) { xs_Serve
 static xs_str *xs_url_decode(const char *s, size_t len);
 static void xs_Server_put(xs_Server *s, xs_str *path, xs_handler fn) { xs_Server_route(s, "PUT", path, fn); }
 static void xs_Server_delete(xs_Server *s, xs_str *path, xs_handler fn) { xs_Server_route(s, "DELETE", path, fn); }
+/* server.fallback(fn): what answers a request no route takes (an unknown path, or a known one with another method),
+   in place of the plain 404/405: a framework's own not-found answer (Nest: 404 "Cannot GET /x") */
+static void xs_Server_fallback(xs_Server *s, xs_handler fn) {
+    xs_str *any = xs_str_new("*", 1);
+    xs_Server_route(s, "*", any, fn);
+    xs_release(any);
+}
 
 /* Matches "/todos/:id" against "/todos/42", filling the request's parameters. */
 static bool xs_route_match(xs_str *pattern, const char *path, size_t plen, xs_HttpRequest *req) {
@@ -1778,6 +1785,15 @@ static xs_str *xs_url_decode(const char *s, size_t len) {
     return r;
 }
 
+/* req.search(): the query string as the URL had it, with its "?" ("" when there is none), as URL.search */
+static xs_str *xs_HttpRequest_search(xs_HttpRequest *r) {
+    if (!r->query_len) return xs_str_new("", 0);
+    xs_str *s = xs_str_alloc((int64_t)r->query_len + 1);
+    s->data[0] = '?';
+    memcpy(s->data + 1, r->query, r->query_len);
+    s->data[r->query_len + 1] = 0;
+    return s;
+}
 static xs_str *xs_HttpRequest_query(xs_HttpRequest *r, xs_str *name) {
     const char *p = r->query, *end = r->query + r->query_len;
     while (p < end) {
@@ -2434,13 +2450,16 @@ XS_NOINLINE bool xs_server_process(xs_Server *s, xs_client *c) {
         xs_HttpRequest *req = xs_obj_alloc(sizeof *req, xs_HttpRequest_free, xs_HttpRequest_print);
         xs_route *route = NULL;
         bool path_known = false;
+        xs_route *fallback = NULL;
         for (int i = 0; i < s->nroutes; i++) {
             xs_route *r = &s->routes[i];
+            if (r->method[0] == '*') { fallback = r; continue; }
             if (xs_route_match(r->path, target, plen, req)) {
                 path_known = true;
                 if (strlen(r->method) == mlen && memcmp(line, r->method, mlen) == 0) { route = r; break; }
             }
         }
+        if (!route && fallback) route = fallback;
         if (!route) {
             if (path_known) xs_server_respond(c, 405, "text/plain", "method not allowed", 18, keep_alive);
             else xs_server_respond(c, 404, "text/plain", "not found", 9, keep_alive);

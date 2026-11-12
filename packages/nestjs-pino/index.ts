@@ -1,6 +1,6 @@
 // nestjs-pino for xisto: LoggerModule.forRoot() provides a Logger that writes pino's JSON lines, and once it is
 // built every Nest Logger line goes through it too (what app.useLogger(app.get(Logger)) does in Nest).
-import { __overrideLogger, DynamicModule, Injectable, LoggerService, Module } from "@nestjs/common";
+import { __overrideLogger, __overrideLoggerFields, DynamicModule, Injectable, LoggerFieldsSink, LoggerService, Module } from "@nestjs/common";
 import { hostname } from "xisto:os";
 
 /** pino's numeric levels. */
@@ -83,7 +83,16 @@ function fieldsText(fields: Record<string, unknown> | null): string {
   return out;
 }
 
-function ecsLine(level: string, message: string, context: string, fields: Record<string, unknown> | null = null): string {
+// an object's JSON as the ',"k":v' pairs pino merges into the line
+function jsonFields(json: string): string {
+  const t = json.trim();
+  if (t.length <= 2 || !t.startsWith("{")) {
+    return "";
+  }
+  return "," + t.slice(1, t.length - 1);
+}
+
+function ecsLine(level: string, message: string | null, context: string, extra: string): string {
   let line = `{"log.level":${JSON.stringify(LABELS.get(level) ?? "info")},"@timestamp":${JSON.stringify(new Date().toISOString())}`;
   line += `,"process.pid":${process.pid},"host.hostname":${JSON.stringify(hostname())},"ecs.version":${JSON.stringify(state.ecsVersion)}`;
   if (state.serviceName.length > 0) {
@@ -92,24 +101,30 @@ function ecsLine(level: string, message: string, context: string, fields: Record
   if (context.length > 0) {
     line += `,${JSON.stringify(state.contextKey)}:${JSON.stringify(context)}`;
   }
-  return line + fieldsText(fields) + `,"message":${JSON.stringify(message)}}`;
+  return line + extra + (message === null ? "}" : `,"message":${JSON.stringify(message)}}`);
 }
 
 function write(level: string, message: string, context: string, fields: Record<string, unknown> | null = null): void {
+  writeLine(level, message, context, fieldsText(fields), fields !== null);
+}
+
+// one line: extra is the call's own fields as ',"k":v' pairs (pino puts them after the context, before msg);
+// message null: a line with no msg (logger.warn({ ... }) has none)
+function writeLine(level: string, message: string | null, context: string, extra: string, withFields: boolean): void {
   const n = LEVELS.has(level) ? LEVELS.get(level) : 30;
   if (n < state.min) {
     return;
   }
   if (state.ecsVersion.length > 0) {
-    console.log(ecsLine(level, message, context, fields));
+    console.log(ecsLine(level, message, context, extra));
     return;
   }
-  if (fields !== null) { // pino's line with the call's fields before msg
+  if (withFields || message === null) { // pino's line with the call's fields before msg
     let text = `{"level":${n},"time":${Date.now()},"pid":${process.pid},"hostname":${JSON.stringify(process.env.get("HOSTNAME") ?? "localhost")}`;
     if (context.length > 0) {
       text += `,"context":${JSON.stringify(context)}`;
     }
-    console.log(text + fieldsText(fields) + `,"msg":${JSON.stringify(message)}}`);
+    console.log(text + extra + (message === null ? "}" : `,"msg":${JSON.stringify(message)}}`));
     return;
   }
   const line: PinoLine = { level: n, time: Date.now(), pid: process.pid, hostname: process.env.get("HOSTNAME") ?? "localhost", msg: message };
@@ -134,6 +149,10 @@ export class Logger {
       verbose: (m: string, c: string): void => write("verbose", m, c),
     };
     __overrideLogger(target);
+    const sink: LoggerFieldsSink = {
+      write: (level: string, fields: string, message: string | null, context: string): void => writeLine(level, message, context, jsonFields(fields), true),
+    };
+    __overrideLoggerFields(sink);
   }
   log(message: string, context: string = ""): void {
     write("log", message, context);
