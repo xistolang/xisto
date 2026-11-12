@@ -29,7 +29,8 @@ for b in ['{}', '{"ip":"1.2.3.4","company":5}', '{"ip":"  ","company":"abc"}', '
     call("POST", "/api/forms/tablet", b)
 for b in ['{}', '{"name":""}', '{"printer":2}', '{"printer":"1"}', '{"ticket":"X","printer":1}', '{"active":"x"}',
           '{"name":"a","printer":0,"ticket":"S","active":3}', '{"ticket":"S","note":"x"}', '{"ticket":"N"}',
-          '{"printer":1,"printerModel":"zebra"}', '{"printer":1,"printerModel":""}', '{"printer":0}']:
+          '{"printer":1,"printerModel":"zebra"}', '{"printer":1,"printerModel":""}', '{"printer":0}',
+          '{"kiosk":1}', '{"kiosk":7}']:
     call("POST", "/api/forms/kiosk", b)
 for b in ['{"name":"a","sortOrder":"DESC"}', '{"name":"a","sortOrder":"up"}', '{"name":"a"}']:
     call("POST", "/api/forms/sort", b)

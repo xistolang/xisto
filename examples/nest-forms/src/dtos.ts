@@ -29,6 +29,13 @@ export class UpdateKioskDto {
   @IsNumber()
   active?: number;
 
+  // a message made by a function of the ValidationArguments (its parameter typed by the option)
+  @ValidateIf((_object, value) => value !== undefined)
+  @IsIn([0, 1], {
+    message: ({ value }) => (value === null ? "Kiosk is required." : `Kiosk: ${String(value)} is not valid, use 0 or 1.`),
+  })
+  kiosk?: number;
+
   // required only for a printing kiosk (the condition reads the DTO through a shape of its own)
   @ValidateIf((o: { printer?: number }) => o.printer === 1)
   @IsString()

@@ -15,6 +15,8 @@ POST /api/forms/kiosk {"ticket":"N"} -> 200 {"name": null, "printer": null, "tic
 POST /api/forms/kiosk {"printer":1,"printerModel":"zebra"} -> 200 {"name": null, "printer": 1, "ticket": null}
 POST /api/forms/kiosk {"printer":1,"printerModel":""} -> 400 {"error": "Bad Request", "message": ["printerModel should not be empty"], "statusCode": 400}
 POST /api/forms/kiosk {"printer":0} -> 200 {"name": null, "printer": 0, "ticket": null}
+POST /api/forms/kiosk {"kiosk":1} -> 200 {"name": null, "printer": null, "ticket": null}
+POST /api/forms/kiosk {"kiosk":7} -> 400 {"error": "Bad Request", "message": ["Kiosk: 7 is not valid, use 0 or 1."], "statusCode": 400}
 POST /api/forms/sort {"name":"a","sortOrder":"DESC"} -> 200 {"name": "a", "sortOrder": "desc"}
 POST /api/forms/sort {"name":"a","sortOrder":"up"} -> 400 {"error": "Bad Request", "message": ["sortOrder must be one of the following values: asc, desc"], "statusCode": 400}
 POST /api/forms/sort {"name":"a"} -> 200 {"name": "a", "sortOrder": null}
