@@ -1544,7 +1544,7 @@ static void xs_Response_free(void *p) { xs_release(((xs_Response *)p)->body); xs
 static void xs_Response_print(void *p) { fprintf(XS_OUT, "Response { status: %lld, ok: %s }", (long long)((xs_Response *)p)->f_status, ((xs_Response *)p)->f_ok ? "true" : "false"); }
 static xs_str *xs_Response_text(xs_Response *r) { return xs_retain(r->body); }
 /* res.arrayBuffer(): the body's bytes (a Buffer.from(...) of it is what code does with it) */
-static xs_Uint8Array *xs_Response_arrayBuffer(xs_Response *r) {
+XS_NOINLINE xs_Uint8Array *xs_Response_arrayBuffer(xs_Response *r) {
     xs_Uint8Array *a = xs_u8_new(r->body->len);
     if (r->body->len) memcpy(a->data, r->body->data, (size_t)r->body->len);
     return a;
