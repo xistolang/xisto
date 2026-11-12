@@ -2652,6 +2652,7 @@ Type *union_json_obj(Type *t) {
     }
     return o;
 }
+static bool json_ok_union_objs; /* a value only written (an object literal where JSON goes): a union of objects, each by its class */
 static bool json_ok(Type *t, int depth) {
     if (depth > 24) return false; /* (a type that holds itself: no JSON) */
     switch (t->kind) {
@@ -2663,6 +2664,8 @@ static bool json_ok(Type *t, int depth) {
                 row's date column, read from JSON as the text it is: what the value holds says which) */
             if (k == TY_OBJECT && !t->params[i]->cls->builtin && union_json_obj(t) == t->params[i] && json_ok(t->params[i], depth + 1))
                 continue; /* total?: SearchTotalHits | number: a JSON object read as the one object member, the rest by kind */
+            if (k == TY_OBJECT && json_ok_union_objs && !t->params[i]->cls->builtin && json_ok(t->params[i], depth + 1))
+                continue; /* (written: DocRollout | DocGlobal, each object by its class at run time, as an unknown is) */
             if (k != TY_NUMBER && k != TY_INT && k != TY_STRING && k != TY_BOOLEAN) return false;
         }
         return true;
@@ -2681,8 +2684,11 @@ static bool json_ok(Type *t, int depth) {
             if (nopen == 32) return false;
             open[nopen++] = t->cls;
             bool ok = true;
+            bool wu = json_ok_union_objs;
+            if (t->cls->json_written) json_ok_union_objs = true;
             for (int i = 0; i < t->cls->nfields && ok; i++)
                 if (!json_ok(t->cls->fields[i].type, depth + 1)) ok = false;
+            json_ok_union_objs = wu;
             nopen--;
             return ok;
         }
@@ -3805,6 +3811,17 @@ static void expect_type(Expr *e, Type *want, const char *what) {
             e->kind = E_UPCAST; e->pos = v->pos; e->field = -1; e->lhs = v; e->type = want;
             return;
         }
+    }
+    if (tsc_checked() && e->type && e->type->kind == TY_ARRAY && ty_is_any(e->type->elem) && !(e->type->elem->tname && !strcmp(e->type->elem->tname, "never")) &&
+        want->kind == TY_ARRAY && ty_strip_null(want->elem)->kind == TY_OBJECT && json_target(want)) {
+        /* fatores = await qb.getRawMany() (an any[]) where { pc?: number | null; ... }[] goes: decoded and checked, as `as T[]` */
+        Expr *v = xs_alloc(sizeof *v);
+        *v = *e;
+        v->prechecked = true;
+        memset(e, 0, sizeof *e);
+        e->kind = E_AS; e->pos = v->pos; e->field = -1; e->lhs = v; e->elem_type = want;
+        check_expr(e, want);
+        return;
     }
     if (e->type && e->type->kind == TY_ARRAY && ty_strip_null(want)->kind == TY_STREAM && lookup_func("__xs_iter")) {
         /* lotes: [linhas] where AsyncIterable<T[]> | Iterable<T[]> goes: __xs_iter(xs), a generator of its elements (xisto:arrays) */
@@ -6140,7 +6157,10 @@ static void anon_objlit(Expr *e) {
         settle(v);
         if (v->type->kind == TY_NULL) v->type = ty_unknown; /* (an unknown that holds null) */
         json_ok_unknown = true; /* (an unknown member is written by what it holds) */
+        json_ok_union_objs = tsc_checked();
+        if (tsc_checked()) c->json_written = true;
         bool jok = json_ok(v->type, 0);
+        json_ok_union_objs = false;
         json_ok_unknown = false;
         if (!jok) xs_error(XS8004, v->pos, NULL, "%s cannot be part of a JSON value", ty_name(v->type));
         bool ab = absent_value(v) && v->type->kind == TY_NULLABLE;
@@ -7310,6 +7330,51 @@ static Expr *lk_op(Expr *f, void *ctx) { /* (the assignment or ++/-- e, its targ
     c->lhs = f;
     if (e->rhs) c->rhs = pr_copy(e->rhs) ? pr_copy(e->rhs) : e->rhs;
     return c;
+}
+/* f().catch(() => ({ porEmpresa: new Map() })) with f giving { porEmpresa; disponivel }: TypeScript's T | U, read by the fields
+   both have; here f().then((v) => ({ porEmpresa: v.porEmpresa })).catch(...): both sides the object of the handler's fields */
+static bool catch_subset(Expr *e) {
+    if (!tsc_checked() || strcmp(e->str, "catch") != 0 || e->args.len != 1 || e->args.items[0]->kind != E_ARROW) return false;
+    Type *lt = e->lhs->type;
+    Type *t = lt->kind == TY_PROMISE ? lt->elem : lt;
+    if (!t || t->kind != TY_OBJECT || !t->cls || t->cls->builtin) return false;
+    Arrow *ar = e->args.items[0]->arrow;
+    Stmt *b = ar->fn->body;
+    if (!ar->expr_body || !b || b->kind != S_BLOCK || b->stmts.len != 1 || b->stmts.items[0]->kind != S_RETURN) return false;
+    Expr *o = b->stmts.items[0]->expr;
+    if (!o || o->kind != E_OBJLIT || o->spread || o->args.len == 0) return false;
+    FieldSet fs = {0};
+    fields_here(t->cls, &fs);
+    if (o->args.len >= fs.n) return false;
+    for (int i = 0; i < o->args.len; i++) {
+        if (!strcmp(o->keys[i], "...") || !strcmp(o->keys[i], "[]") || !find_field(t->cls, o->keys[i], NULL)) return false;
+    }
+    Pos pos = e->pos;
+    static int ncs;
+    const char *vn = xs_sprintf("__cv%d", ncs++);
+    Expr *lit = xs_alloc(sizeof *lit);
+    lit->kind = E_OBJLIT; lit->pos = pos; lit->field = -1;
+    lit->keys = xs_alloc(sizeof(char *) * (size_t)o->args.len);
+    for (int i = 0; i < o->args.len; i++) {
+        Expr *id = xs_alloc(sizeof *id); id->kind = E_IDENT; id->pos = pos; id->field = -1; id->str = (char *)vn;
+        Expr *m = xs_alloc(sizeof *m); m->kind = E_MEMBER; m->pos = pos; m->field = -1; m->lhs = id; m->str = o->keys[i];
+        lit->keys[i] = o->keys[i];
+        expr_list_push(&lit->args, m);
+    }
+    Func *f = xs_alloc(sizeof *f); f->pos = pos; f->name = "arrow";
+    f->params = xs_alloc(sizeof(Param)); memset(f->params, 0, sizeof(Param)); f->params[0].name = (char *)vn; f->nparams = 1;
+    Stmt *r = xs_alloc(sizeof *r); r->kind = S_RETURN; r->pos = pos; r->expr = lit;
+    Stmt *bb = xs_alloc(sizeof *bb); bb->kind = S_BLOCK; bb->pos = pos; stmt_list_push(&bb->stmts, r);
+    f->body = bb;
+    Arrow *a = xs_alloc(sizeof *a); a->pos = pos; a->fn = f; a->expr_body = true;
+    Expr *ae = xs_alloc(sizeof *ae); ae->kind = E_ARROW; ae->pos = pos; ae->field = -1; ae->arrow = a;
+    Expr *in = e->lhs;
+    in->prechecked = true;
+    Expr *th = xs_alloc(sizeof *th);
+    th->kind = E_MEMBER; th->pos = pos; th->field = -1; th->lhs = in; th->str = "then"; th->is_call = true;
+    expr_list_push(&th->args, ae);
+    e->lhs = th;
+    return true;
 }
 static void check_expr_in(Expr *e, Type *expected) {
     if (e->prechecked) return;
@@ -8673,6 +8738,20 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->builtin.cfn = pi ? "xs_parse_int" : "xs_parse_float";
                 return;
             }
+            if (strcmp(name, "structuredClone") == 0 && e->args.len == 1) {
+                /* structuredClone(v): a deep copy made by what v holds at run time (each class's own copy, a Date a Date,
+                   arrays, Maps, Sets and Records copied through; a function in it: DataCloneError) */
+                Expr *a = e->args.items[0];
+                check_expr(a, expected);
+                settle(a);
+                Type *t = a->type;
+                if (t->kind == TY_LITINT) coerce_lit(a, ty_number);
+                if (!ty_is_heap(t)) { *e = *a; return; } /* (a number, a boolean: the value itself) */
+                prog->uses_clone = true;
+                e->builtin.cfn = "xs_structured_clone";
+                e->type = t;
+                return;
+            }
             if (strcmp(name, "BigInt") == 0) { /* BigInt(int | number | string); 123n is BigInt(123) */
                 if (e->args.len != 1) xs_error(XS7003, e->pos, NULL, "BigInt() takes exactly one argument");
                 Expr *a = e->args.items[0];
@@ -9569,6 +9648,63 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
+        if (tsc_checked() && e->is_call && e->str && e->lhs && e->lhs->kind == E_IDENT && strcmp(e->lhs->str, "Object") == 0 && !lookup("Object") &&
+            !strcmp(e->str, "assign") && e->args.len == 2) {
+            /* Object.assign(new QueryResult(), clone) with clone an unknown: ((t, s) => { if (s !== null && 'f' in s) t.f = s.f; ...;
+               return t; })(target, source), each field of the target's class the source has, read by name (checked) */
+            Expr *tg = e->args.items[0], *src = e->args.items[1];
+            check_expr(tg, NULL);
+            check_expr(src, NULL);
+            Type *tt = tg->type, *st = src->type;
+            if (tt->kind == TY_OBJECT && !tt->cls->builtin && !tt->cls->is_tuple && (st->kind == TY_UNKNOWN || ty_is_any(st))) {
+                tg->prechecked = true; src->prechecked = true;
+                Pos pos = e->pos;
+                static int noa;
+                const char *tn = xs_sprintf("__oat%d", noa), *sn = xs_sprintf("__oas%d", noa);
+                noa++;
+                #define OA_ID(nm) ({ Expr *x_ = xs_alloc(sizeof *x_); x_->kind = E_IDENT; x_->pos = pos; x_->field = -1; x_->str = (char *)(nm); x_; })
+                #define OA_ANY() ({ Expr *a_ = xs_alloc(sizeof *a_); a_->kind = E_AS; a_->pos = pos; a_->field = -1; a_->lhs = OA_ID(sn); a_->elem_type = ty_any; a_; })
+                Stmt *body = xs_alloc(sizeof *body); body->kind = S_BLOCK; body->pos = pos;
+                FieldSet fs = {0};
+                fields_here(tt->cls, &fs);
+                for (int i = 0; i < fs.n; i++) {
+                    const char *fn = fs.f[i].name;
+                    Expr *nn = xs_alloc(sizeof *nn); nn->kind = E_BINARY; nn->op = TK_NEQ; nn->pos = pos; nn->field = -1; nn->lhs = OA_ANY();
+                    Expr *nul = xs_alloc(sizeof *nul); nul->kind = E_NULL; nul->pos = pos; nul->field = -1; nn->rhs = nul;
+                    Expr *k = xs_alloc(sizeof *k); k->kind = E_STRING; k->pos = pos; k->field = -1; k->str = (char *)fn;
+                    Expr *in = xs_alloc(sizeof *in); in->kind = E_BINARY; in->op = TK_IN; in->pos = pos; in->field = -1; in->lhs = k; in->rhs = OA_ANY();
+                    Expr *c = xs_alloc(sizeof *c); c->kind = E_BINARY; c->op = TK_AND; c->pos = pos; c->field = -1; c->lhs = nn; c->rhs = in;
+                    Expr *lm = xs_alloc(sizeof *lm); lm->kind = E_MEMBER; lm->pos = pos; lm->field = -1; lm->lhs = OA_ID(tn); lm->str = (char *)fn;
+                    Expr *rm = xs_alloc(sizeof *rm); rm->kind = E_MEMBER; rm->pos = pos; rm->field = -1; rm->lhs = OA_ANY(); rm->str = (char *)fn;
+                    Expr *as = xs_alloc(sizeof *as); as->kind = E_ASSIGN; as->op = TK_ASSIGN; as->pos = pos; as->field = -1; as->lhs = lm; as->rhs = rm;
+                    Stmt *sx = xs_alloc(sizeof *sx); sx->kind = S_EXPR; sx->pos = pos; sx->expr = as;
+                    Stmt *blk = xs_alloc(sizeof *blk); blk->kind = S_BLOCK; blk->pos = pos; stmt_list_push(&blk->stmts, sx);
+                    Stmt *si = xs_alloc(sizeof *si); si->kind = S_IF; si->pos = pos; si->cond = c; si->body = blk;
+                    stmt_list_push(&body->stmts, si);
+                }
+                Stmt *r = xs_alloc(sizeof *r); r->kind = S_RETURN; r->pos = pos; r->expr = OA_ID(tn);
+                stmt_list_push(&body->stmts, r);
+                #undef OA_ANY
+                #undef OA_ID
+                Func *f = xs_alloc(sizeof *f); f->pos = pos; f->name = "arrow"; f->ret = tt;
+                f->params = xs_alloc(sizeof(Param) * 2); memset(f->params, 0, sizeof(Param) * 2);
+                f->params[0].name = (char *)tn; f->params[0].type = tt;
+                f->params[1].name = (char *)sn; f->params[1].type = ty_unknown;
+                f->nparams = 2;
+                f->body = body;
+                Arrow *a = xs_alloc(sizeof *a); a->pos = pos; a->fn = f;
+                Expr *ae = xs_alloc(sizeof *ae); ae->kind = E_ARROW; ae->pos = pos; ae->field = -1; ae->arrow = a;
+                Expr *u = src;
+                if (ty_is_any(st)) { u = xs_alloc(sizeof *u); u->kind = E_AS; u->pos = pos; u->field = -1; u->lhs = src; u->elem_type = ty_unknown; }
+                memset(e, 0, sizeof *e);
+                e->kind = E_CALL; e->pos = pos; e->field = -1; e->lhs = ae;
+                expr_list_push(&e->args, tg);
+                expr_list_push(&e->args, u);
+                check_expr(e, expected);
+                return;
+            }
+            tg->prechecked = false; /* (not this form: the forms below check them) */
+        }
         if (e->is_call && e->str && e->lhs && e->lhs->kind == E_IDENT && strcmp(e->lhs->str, "Object") == 0 && !lookup("Object") &&
             !strcmp(e->str, "fromEntries") && e->args.len == 1) {
             /* Object.fromEntries(pairs): a Record<string, V> of the [key, value] pairs, as new Map(pairs) read as an object */
@@ -10150,6 +10286,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             Class *lc = ls->kind == TY_OBJECT ? ls->cls : NULL;
             /* (f().catch(...) with f async and giving T | null: the promise's method, not the value's; x?.then stays the value's) */
             if (lt->kind == TY_PROMISE || (pr_is_call(e->lhs) && (lt->kind != TY_NULLABLE || e->op != TK_QDOT) && !(lc && find_method(lc, e->str)))) { /* XB-106 */
+                if (catch_subset(e)) { check_expr(e, expected); return; }
                 if (lt->kind != TY_PROMISE) pr_spawn(e->lhs);
                 check_pr_member(e, expected);
                 return;
