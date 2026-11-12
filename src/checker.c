@@ -2393,7 +2393,7 @@ static Func *lookup_func(const char *name) {
         Func *f = e->decl;
         if (f->mod == cur_mod || (f->exported && imports_name(cur_mod, f->mod, name))) return f;
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:arrays") == 0) return f; /* (reduce & co) */
-        if ((!strcmp(name, "__xs_construct") || !strcmp(name, "__xs_ci_params") || !strcmp(name, "__xs_apply") || !strcmp(name, "__xs_use_desc")) &&
+        if ((!strcmp(name, "__xs_construct") || !strcmp(name, "__xs_ci_params") || !strcmp(name, "__xs_apply") || !strcmp(name, "__xs_use_desc") || !strcmp(name, "__xs_desc_enter") || !strcmp(name, "__xs_desc_leave")) &&
             f->mod && f->mod->file && !strcmp(f->mod->file, "xisto:reflect")) return f; /* (new (c)(); XB-107's f.apply and descriptors) */
         if (f->exported && (strstr(name, "__s_") || !strcmp(name, "__xs_fetch")) && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:url") == 0) return f; /* (URL.canParse, AbortSignal.timeout: statics of globals; fetch with its options in a value) */
         if (!strncmp(name, "Reflect__s_", 11) && f->exported && f->mod && f->mod->file && strstr(f->mod->file, "/reflect-metadata/"))
@@ -7478,6 +7478,18 @@ static void check_expr_in(Expr *e, Type *expected) {
             Type *ft = e->lhs->type;
             if (ft->kind != TY_FUNC) xs_error(XS6030, e->pos, NULL, "only named functions can be called");
             pack_rest(e, ft);
+            if (e->args.len > ft->nparams && !ft->rest && tsc_checked()) {
+                /* SetMetadata(k, v)(target, key, descriptor) where the function takes (target, key): JavaScript passes the
+                   extra arguments and the function does not read them; names and literals (nothing to run), left out */
+                bool plain = true;
+                for (int i = ft->nparams; i < e->args.len && plain; i++) plain = pure_copy(e->args.items[i]) != NULL;
+                if (plain) e->args.len = ft->nparams;
+            }
+            while (e->args.len < ft->nparams && ft->params[e->args.len]->kind == TY_NULLABLE) { /* (an optional one left out: null) */
+                Expr *nul = xs_alloc(sizeof *nul);
+                nul->kind = E_NULL; nul->pos = e->pos; nul->field = -1;
+                expr_list_push(&e->args, nul);
+            }
             if (e->args.len != ft->nparams) xs_error(XS8062, e->pos, NULL, "'%s' takes %d argument(s), got %d", "the function", ft->nparams, e->args.len);
             for (int i = 0; i < e->args.len; i++) {
                 check_expr(e->args.items[i], ft->params[i]);
@@ -9908,6 +9920,11 @@ static void check_expr_in(Expr *e, Type *expected) {
             bool ok = json_ok(v->type, 0);
             json_ok_unknown = ju;
             if (ok) { *e = *v; to_json(e); return; }
+            if (v->type->kind == TY_FUNC) { /* descriptor.value as object (a target of Reflect.getMetadata): the function itself, as an unknown (JSON has no functions) */
+                *e = *v;
+                to_unknown(e);
+                return;
+            }
         }
         if (want->kind == TY_NULLABLE && want->elem->kind == TY_JSON && v->type->kind != TY_NULL && v->type->kind != TY_NULLABLE && json_ok(v->type, 0)) { *e = *v; to_json(e); return; }
         if (want->kind == TY_NULLABLE && ty_equal(v->type, want->elem)) { *e = *v; e->type = want; return; }
@@ -14074,6 +14091,14 @@ static int returned_arity(Func *f) {
     }
     return -1;
 }
+/* a decorator's second parameter that takes a MethodInfo (xisto's (c, m, descriptor?) form: a framework's decorator that
+   may also be called as TypeScript's, see @nestjs/common's SetMetadata) */
+static bool takes_method_info(Type *t) {
+    if (!t) return false;
+    if (t->kind == TY_NULLABLE) return takes_method_info(t->elem);
+    if (t->kind == TY_UNION) { for (int i = 0; i < t->nparams; i++) if (takes_method_info(t->params[i])) return true; return false; }
+    return t->kind == TY_OBJECT && t->cls && t->cls->name && !strcmp(t->cls->name, "MethodInfo");
+}
 static bool deco_is_ts(Expr *src) {
     Type *t = NULL;
     if (src->kind == E_CALL && src->lhs && src->lhs->kind == E_IDENT) {
@@ -14094,7 +14119,7 @@ static bool deco_is_ts(Expr *src) {
         if (b && b->type) t = b->type;
     }
     t = t ? ty_strip_null(t) : NULL;
-    return t && t->kind == TY_FUNC && t->nparams == 3;
+    return t && t->kind == TY_FUNC && t->nparams == 3 && !takes_method_info(t->params[1]);
 }
 static const char *param_text(Param *pr) {
     bool opt = pr->dflt && pr->dflt->kind == E_NULL;

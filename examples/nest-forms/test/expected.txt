@@ -30,6 +30,7 @@ GET /api/forms/url?a=1&b=two  -> 200 {"a": "1", "originalUrl": "/api/forms/url?a
 GET /api/forms/url-alias  -> 200 {"a": null, "originalUrl": "/api/forms/url-alias", "path": "/api/forms/url-alias", "query": {}}
 GET /api/forms/url?a=1&a=2&z=x%20y  -> 200 {"a": ["1", "2"], "originalUrl": "/api/forms/url?a=1&a=2&z=x%20y", "path": "/api/forms/url", "query": {"a": ["1", "2"], "z": "x y"}}
 GET /api/forms/bytes  -> 200 'olá, bytes'
+GET /api/triggers  -> 200 {"body": "ok", "screen": "T2200", "triggers": ["TRG_B", "TRG_A"]}
 POST /api/forms/stream olá, corpo cru {"Content-Type": "text/plain"}-> 200 {"size": 15, "text": "olá, corpo cru"}
 POST /api/forms/stream {"a":1} -> 200 {"size": 0, "text": ""}
 GET /api/forms/me  {"x-user": "ana:t1"}-> 200 {"sub": "ana", "tenant": "t1"}
