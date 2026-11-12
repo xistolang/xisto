@@ -879,6 +879,7 @@ static bool tostring_call(Expr *e) {
    xisto (Promise<T> is T), so a call has its value when it returns; here the elements become tasks that run
    concurrently on the event loop (runtime/xisto_net.h, xs_par_run): their I/O waits overlap. */
 static int mapnull_ok; /* checking the xs.map(f) of xs.map(f).filter(p): f may give number | null */
+static bool nullable_ok(Type *t);
 static void check_promise(Expr *e, Type *expected) {
     const char *m = e->str;
     if (!e->is_call) xs_error(XS7030, e->pos, NULL, "Promise.%s is not a value", m);
@@ -947,6 +948,29 @@ static void check_promise(Expr *e, Type *expected) {
                 pr_await(r->expr);
                 th->arrow->fn->ret = r->expr->type;
                 th->type->ret = r->expr->type;
+            }
+            if (th->arrow->fn->ret->kind == TY_NULLABLE && th->arrow->fn->ret->elem->kind == TY_PROMISE) {
+                /* Promise.all([c ? p : null, ...]): p's value, or null (JavaScript's all takes a value as it is) */
+                Stmt *r = th->arrow->fn->body->stmts.items[th->arrow->fn->body->stmts.len - 1];
+                Expr *c = r->expr;
+                if (c && c->kind == E_COND && !c->builtin.cfn && c->args.len == 2) {
+                    Expr *pa = c->args.items[0], *pb = c->args.items[1];
+                    Expr *pp = pa->type && pa->type->kind == TY_PROMISE ? pa : pb->type && pb->type->kind == TY_PROMISE ? pb : NULL;
+                    Expr *pn = pp == pa ? pb : pa;
+                    if (pp && pn->kind == E_NULL) {
+                        pr_await(pp);
+                        Type *vt = pp->type;
+                        Type *u = vt->kind == TY_NULLABLE ? vt : vt->kind != TY_VOID && nullable_ok(vt) ? ty_nullable_of(vt) : NULL;
+                        if (u) {
+                            pn->type = ty_null; /* (it took the promise's type with the ?:) */
+                            expect_type(pp, u, "first branch of '?:'");
+                            expect_type(pn, u, "second branch of '?:'");
+                            c->type = u;
+                            th->arrow->fn->ret = u;
+                            th->type->ret = u;
+                        }
+                    }
+                }
             }
             Type *rt = th->arrow->fn->ret;
             if (rt->kind == TY_VOID) xs_error(XS8081, a->args.items[i]->pos, NULL, "an element of Promise.%s gives no value", m);
@@ -8019,6 +8043,20 @@ static void check_expr_in(Expr *e, Type *expected) {
                         af->nparams = 1;
                         np = 1;
                     }
+                    if (np == 3 && cb->kind == E_ARROW) { /* xs.filter((x, i, arr) => ...): __xs_filter3(xs, f), the array passed too */
+                        Expr *callee = xs_alloc(sizeof *callee);
+                        callee->kind = E_IDENT; callee->pos = e->pos; callee->field = -1; callee->str = xs_sprintf("__xs_%s3", m);
+                        if (lookup_func(callee->str)) {
+                            Expr *c = xs_alloc(sizeof *c);
+                            c->kind = E_CALL; c->pos = e->pos; c->field = -1; c->lhs = callee;
+                            e->lhs->prechecked = true; /* (checked above: not again) */
+                            expr_list_push(&c->args, e->lhs);
+                            expr_list_push(&c->args, cb);
+                            *e = *c;
+                            check_expr(e, expected);
+                            return;
+                        }
+                    }
                     if (np < 1 || np > 2) xs_error(XS8129, cb->pos, NULL, "the callback of %s takes (element) or (element, index)", m);
                     Type *cbt = CB(np, is_map ? NULL : is_each ? ty_void : ty_boolean);
                     if (is_map) {
@@ -8394,9 +8432,27 @@ static void check_expr_in(Expr *e, Type *expected) {
             xs_error(XS8013, e->pos, NULL, "%s has no member '%s'", ty_name(e->lhs->type), e->str);
         }
         return;
-    case E_NEW_ARRAY:
+    case E_NEW_ARRAY: {
+        Type *et = e->elem_type ? resolve(e->elem_type, e->pos) : NULL;
+        if (et && ty_is_heap(et) && et->kind != TY_NULLABLE && et->kind != TY_UNKNOWN) {
+            /* new Array<R>(n) of objects or strings, filled by index later (results[i] = ...): its holes are null, as
+               JavaScript's read undefined; new Array<R | null>(n).fill(null), held as R[] (the same layout) */
+            Expr *na = xs_alloc(sizeof *na);
+            *na = *e;
+            na->elem_type = ty_nullable_of(et);
+            Expr *nul = xs_alloc(sizeof *nul);
+            nul->kind = E_NULL; nul->pos = e->pos; nul->field = -1;
+            Expr *fill = xs_alloc(sizeof *fill);
+            fill->kind = E_MEMBER; fill->pos = e->pos; fill->field = -1; fill->is_call = true; fill->str = "fill"; fill->lhs = na;
+            expr_list_push(&fill->args, nul);
+            check_expr(fill, NULL);
+            *e = *fill;
+            e->type = ty_array_of(et);
+            return;
+        }
         xs_error(XS6017, e->pos, "write: new Array<T>(n).fill(x)", "a new array must be filled before use");
         return;
+    }
     case E_SEQ: /* i++, j-- in a for loop's update */
         for (int i = 0; i < e->args.len; i++) check_expr(e->args.items[i], NULL);
         e->type = ty_void;
@@ -8842,6 +8898,12 @@ static void check_expr_in(Expr *e, Type *expected) {
                         f->params[i].type = wt;
                         continue;
                     }
+                }
+                if (!wider && ty_is_any(wt) && dt->kind == TY_OBJECT && (dt->cls->is_interface || made_shape(dt->cls)) && !f->params[i].is_prop) {
+                    /* (o: { tipo?: string }) => o.tipo === 'X' where an any is passed (class-validator's ValidateIf: the
+                       DTO): the parameter is that any, its fields read by name as JavaScript reads them */
+                    f->params[i].type = wt;
+                    continue;
                 }
                 if (!wider && wt->kind == TY_NULLABLE && ty_equal(wt->elem, dt) && ty_is_heap(dt)) {
                     /* (data: string) where string | null is passed (Nest's param decorators: data is undefined without

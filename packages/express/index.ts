@@ -19,6 +19,8 @@ export class Request {
   method: string = "GET";
   url: string = "/";
   path: string = "/";
+  /** The URL as it arrived: the path and its query string (/a/b?x=1). */
+  originalUrl: string = "/";
   headers: IncomingHttpHeaders = new IncomingHttpHeaders();
   /** The body as Express's json parser gives it: the parsed JSON, or {} when there is none (rawBody has the bytes). */
   body: any = {};
@@ -208,8 +210,8 @@ export class Response {
     return this;
   }
 
-  end(chunk: string = ""): Response {
-    this.text = this.text + chunk;
+  end(chunk: string | Buffer = ""): Response {
+    this.text = this.text + (typeof chunk === "string" ? chunk : chunk.toString("xisto:raw")); // (a Buffer: its bytes as they are)
     this.finished = true;
     return this;
   }

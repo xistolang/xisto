@@ -28,7 +28,8 @@ for b in ['{}', '{"ip":"1.2.3.4","company":5}', '{"ip":"  ","company":"abc"}', '
           '{"ip":"10.0.0.1","company":null}']:
     call("POST", "/api/forms/tablet", b)
 for b in ['{}', '{"name":""}', '{"printer":2}', '{"printer":"1"}', '{"ticket":"X","printer":1}', '{"active":"x"}',
-          '{"name":"a","printer":0,"ticket":"S","active":3}', '{"ticket":"S","note":"x"}', '{"ticket":"N"}']:
+          '{"name":"a","printer":0,"ticket":"S","active":3}', '{"ticket":"S","note":"x"}', '{"ticket":"N"}',
+          '{"printer":1,"printerModel":"zebra"}', '{"printer":1,"printerModel":""}', '{"printer":0}']:
     call("POST", "/api/forms/kiosk", b)
 for b in ['{"name":"a","sortOrder":"DESC"}', '{"name":"a","sortOrder":"up"}', '{"name":"a"}']:
     call("POST", "/api/forms/sort", b)
@@ -38,6 +39,9 @@ call("GET", "/api/forms/settings")
 call("GET", "/api/forms/issued", headers={"x-issuer": "forms-app"})
 call("GET", "/api/forms/issued", headers={"x-issuer": "other"})
 call("GET", "/api/forms/issued", headers={"x-dev": "1"})
+call("GET", "/api/forms/url?a=1&b=two")
+call("GET", "/api/forms/url-alias")
+call("GET", "/api/forms/bytes")
 call("GET", "/api/forms/me", headers={"x-user": "ana:t1"})
 call("GET", "/api/forms/me", headers={"x-user": "bia"})
 call("GET", "/api/forms/me")

@@ -7,11 +7,14 @@ POST /api/forms/kiosk {} -> 200 {"name": null, "printer": null, "ticket": null}
 POST /api/forms/kiosk {"name":""} -> 400 {"error": "Bad Request", "message": ["name should not be empty"], "statusCode": 400}
 POST /api/forms/kiosk {"printer":2} -> 400 {"error": "Bad Request", "message": ["Printer: use 0 or 1 (printer, 2)."], "statusCode": 400}
 POST /api/forms/kiosk {"printer":"1"} -> 400 {"error": "Bad Request", "message": ["Printer: use 0 or 1 (printer, 1)."], "statusCode": 400}
-POST /api/forms/kiosk {"ticket":"X","printer":1} -> 400 {"error": "Bad Request", "message": ["Ticket: use S or N."], "statusCode": 400}
+POST /api/forms/kiosk {"ticket":"X","printer":1} -> 400 {"error": "Bad Request", "message": ["Ticket: use S or N.", "printerModel should not be empty", "printerModel must be a string"], "statusCode": 400}
 POST /api/forms/kiosk {"active":"x"} -> 400 {"error": "Bad Request", "message": ["active must be a number conforming to the specified constraints"], "statusCode": 400}
 POST /api/forms/kiosk {"name":"a","printer":0,"ticket":"S","active":3} -> 400 {"error": "Bad Request", "message": ["note is required when UpdateKioskDto.ticket is S"], "statusCode": 400}
 POST /api/forms/kiosk {"ticket":"S","note":"x"} -> 200 {"name": null, "printer": null, "ticket": "S"}
 POST /api/forms/kiosk {"ticket":"N"} -> 200 {"name": null, "printer": null, "ticket": "N"}
+POST /api/forms/kiosk {"printer":1,"printerModel":"zebra"} -> 200 {"name": null, "printer": 1, "ticket": null}
+POST /api/forms/kiosk {"printer":1,"printerModel":""} -> 400 {"error": "Bad Request", "message": ["printerModel should not be empty"], "statusCode": 400}
+POST /api/forms/kiosk {"printer":0} -> 200 {"name": null, "printer": 0, "ticket": null}
 POST /api/forms/sort {"name":"a","sortOrder":"DESC"} -> 200 {"name": "a", "sortOrder": "desc"}
 POST /api/forms/sort {"name":"a","sortOrder":"up"} -> 400 {"error": "Bad Request", "message": ["sortOrder must be one of the following values: asc, desc"], "statusCode": 400}
 POST /api/forms/sort {"name":"a"} -> 200 {"name": "a", "sortOrder": null}
@@ -21,6 +24,9 @@ GET /api/forms/settings  -> 200 {"hasKid": false, "issuer": "forms-app", "ttlSec
 GET /api/forms/issued  {"x-issuer": "forms-app"}-> 200 {"issued": true}
 GET /api/forms/issued  {"x-issuer": "other"}-> 403 {"error": "Forbidden", "message": "issuer forms-app required", "statusCode": 403}
 GET /api/forms/issued  {"x-dev": "1"}-> 200 {"issued": true}
+GET /api/forms/url?a=1&b=two  -> 200 {"originalUrl": "/api/forms/url?a=1&b=two", "path": "/api/forms/url"}
+GET /api/forms/url-alias  -> 200 {"originalUrl": "/api/forms/url-alias", "path": "/api/forms/url-alias"}
+GET /api/forms/bytes  -> 200 'olá, bytes'
 GET /api/forms/me  {"x-user": "ana:t1"}-> 200 {"sub": "ana", "tenant": "t1"}
 GET /api/forms/me  {"x-user": "bia"}-> 200 {"sub": "bia", "tenant": "none"}
 GET /api/forms/me  -> 401 {"message": "Unauthorized", "statusCode": 401}

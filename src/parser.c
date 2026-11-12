@@ -1607,6 +1607,8 @@ static Expr *parse_postfix(Parser *p) {
                 at_push_call = false;
                 if (!strcmp(m->str, "splice") && m->args.len == 1) wants_arrays = true; /* xs.splice(i): __xs_spliceFrom */
                 if (!strcmp(m->str, "entries") && m->args.len == 0) wants_arrays = true; /* xs.entries(): __xs_entries */
+                if (m->args.len == 1 && m->args.items[0]->kind == E_ARROW && m->args.items[0]->arrow->fn->nparams == 3)
+                    wants_arrays = true; /* xs.filter((x, i, arr) => ...): __xs_filter3 */
             }
             e = m;
         } else if (at(p, TK_LBRACKET)) {
@@ -1647,6 +1649,8 @@ static Expr *parse_postfix(Parser *p) {
                 at_push_call = false;
                 if (!strcmp(m->str, "splice") && m->args.len == 1) wants_arrays = true; /* xs.splice(i): __xs_spliceFrom */
                 if (!strcmp(m->str, "entries") && m->args.len == 0) wants_arrays = true; /* xs.entries(): __xs_entries */
+                if (m->args.len == 1 && m->args.items[0]->kind == E_ARROW && m->args.items[0]->arrow->fn->nparams == 3)
+                    wants_arrays = true; /* xs.filter((x, i, arr) => ...): __xs_filter3 */
             }
             e = m;
         } else if (at(p, TK_TEMPLATE) && e->kind == E_MEMBER && !e->is_call && e->lhs->kind == E_IDENT && strcmp(e->lhs->str, "String") == 0 &&
@@ -4886,6 +4890,36 @@ static const char xs_arrays_src[] =
     "export function __xs_first<T>(xs: T[]): T | undefined {\n"
     "  for (const x of xs) return x;\n"
     "  return undefined;\n"
+    "}\n"
+// xs.filter((x, i, arr) => ...) and the others whose callback takes the array too (the compiler calls these)\n"
+    "export function __xs_filter3<T>(xs: T[], f: (x: T, i: int, a: T[]) => boolean): T[] {\n"
+    "  const out: T[] = [];\n"
+    "  for (let i = 0; i < xs.length; i++) if (f(xs[i], i, xs)) out.push(xs[i]);\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_map3<U, T>(xs: T[], f: (x: T, i: int, a: T[]) => U): U[] {\n"
+    "  const out: U[] = [];\n"
+    "  for (let i = 0; i < xs.length; i++) out.push(f(xs[i], i, xs));\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_forEach3<T>(xs: T[], f: (x: T, i: int, a: T[]) => void): void {\n"
+    "  for (let i = 0; i < xs.length; i++) f(xs[i], i, xs);\n"
+    "}\n"
+    "export function __xs_some3<T>(xs: T[], f: (x: T, i: int, a: T[]) => boolean): boolean {\n"
+    "  for (let i = 0; i < xs.length; i++) if (f(xs[i], i, xs)) return true;\n"
+    "  return false;\n"
+    "}\n"
+    "export function __xs_every3<T>(xs: T[], f: (x: T, i: int, a: T[]) => boolean): boolean {\n"
+    "  for (let i = 0; i < xs.length; i++) if (!f(xs[i], i, xs)) return false;\n"
+    "  return true;\n"
+    "}\n"
+    "export function __xs_find3<T>(xs: T[], f: (x: T, i: int, a: T[]) => boolean): T | undefined {\n"
+    "  for (let i = 0; i < xs.length; i++) if (f(xs[i], i, xs)) return xs[i];\n"
+    "  return undefined;\n"
+    "}\n"
+    "export function __xs_findIndex3<T>(xs: T[], f: (x: T, i: int, a: T[]) => boolean): int {\n"
+    "  for (let i = 0; i < xs.length; i++) if (f(xs[i], i, xs)) return i;\n"
+    "  return -1;\n"
     "}\n"
     "export function __xs_reduce<A, T>(xs: T[], f: (acc: A, x: T, i: int) => A, init: A): A {\n"
     "  let acc: A = init;\n"
