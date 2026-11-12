@@ -145,6 +145,7 @@ static Stmt *new_stmt(StmtKind kind, Pos pos) {
 static Expr *parse_expr(Parser *p);
 static Expr *parse_assign(Parser *p);
 static bool default_literal_type(Parser *p, Param *prm);
+static Stmt *push_spreads(Parser *p, Expr *c, Pos pos);
 static Stmt *parse_stmt(Parser *p);
 static Type *parse_type(Parser *p);
 
@@ -287,25 +288,42 @@ static Type *anon_iface(Parser *p, const char *open, Pos pos, Mixin *m) {
     add_class(prog, c);
     return ty_object_of(c);
 }
-/* one side of an intersection or the argument of Omit/Pick/Partial: an interface or class, by name */
-static Mixin *mixin_of_type(Type *t, Pos pos) {
-    if (t->kind != TY_OBJECT || t->ntargs)
-        xs_error(XS1019, pos, "intersect interfaces or object types: A & { extra: T }", "unsupported type in an intersection or mapped type");
+/* one side of an intersection or the argument of Omit/Pick/Partial: an interface or class, by name; a type the parser
+   cannot name yet (a generic instance Dto<T>, R['xs'][number]) is resolved by the checker when it copies the fields */
+static Mixin *mixin_of_type(Parser *p, Type *t, Pos pos) {
     Mixin *m = xs_alloc(sizeof *m);
     m->pos = pos;
+    if (t->kind == TY_NULLABLE) t = t->elem;
+    if (t->kind != TY_OBJECT || t->ntargs) {
+        if (t->kind != TY_OBJECT && t->kind != TY_TPARAM)
+            xs_error(XS1019, pos, "intersect interfaces or object types: A & { extra: T }", "unsupported type in an intersection or mapped type");
+        m->ty = t;
+        m->mod = p->mod;
+        m->cls = "(type)";
+        return m;
+    }
     m->cls = t->cls->name;
     if (t->cls->mod || t->cls->builtin) m->klass = t->cls; /* (a class already registered: T bound in an instance) */
     return m;
 }
 /* 'a' | 'b': the keys of Omit/Pick */
-static void mixin_keys(Mixin *m, Type *k, Pos pos) {
+static void mixin_keys(Parser *p, Mixin *m, Type *k, Pos pos) {
     Type **ks = k->kind == TY_UNION ? k->params : &k;
     int n = k->kind == TY_UNION ? k->nparams : 1;
+    for (int i = 0; i < n; i++)
+        if (ks[i]->kind != TY_STRING || !ks[i]->tname) { /* Pick<G, Campo> with Campo = 'a' | 'b': the checker reads the alias */
+            m->keyty = k;
+            m->mod = p->mod;
+            return;
+        }
     for (int i = 0; i < n; i++) {
-        if (ks[i]->kind != TY_STRING || !ks[i]->tname) xs_error(XS1019, pos, "name the keys: Omit<A, 'id' | 'name'>", "the keys are string literals");
         m->keys = realloc(m->keys, sizeof(char *) * (size_t)(m->nkeys + 1));
         m->keys[m->nkeys++] = (char *)ks[i]->tname;
     }
+}
+/* a side of A & B that only the checker can read: a type parameter (or typeof x, T['k']), a Record, a generic instance */
+static bool lazy_side(Type *t) {
+    return t->kind != TY_OBJECT || t->ntargs; /* (an instance's R bound to what the call gave: the checker says if it fits) */
 }
 /* A & B (& C ...): '&' binds tighter than '|' (A & B | null is (A & B) | null) */
 static Type *inter_rest(Parser *p, Type *t, const char *open, Pos pos) {
@@ -322,9 +340,19 @@ static Type *inter_rest(Parser *p, Type *t, const char *open, Pos pos) {
         Mixin *m = xs_alloc(sizeof *m);
         m->pos = pos;
         m->kind = "IntersectionType";
-        m->a = mixin_of_type(t, pos);
-        m->b = mixin_of_type(r, pos);
-        t = anon_iface(p, open, pos, m);
+        if (lazy_side(t) || lazy_side(r)) { /* R & { extra: T } with R a type parameter, typeof s & {...}, {...} & Record<K, V>:
+                                                the checker makes it where it is used (see __inter in resolve) */
+            Type *ix = xs_alloc(sizeof *ix);
+            ix->kind = TY_TPARAM;
+            ix->tname = "__inter";
+            ix->elem = t;
+            ix->key = r;
+            t = ix;
+        } else {
+            m->a = mixin_of_type(p, t, pos);
+            m->b = mixin_of_type(p, r, pos);
+            t = anon_iface(p, open, pos, m);
+        }
         if (tail) t = union_of(t, tail);
         if (nul) t = ty_nullable_of(t);
     }
@@ -386,6 +414,83 @@ static int parse_tparam_names(Parser *p, char ***out) {
     *out = names;
     return n;
 }
+static Type *tp_index(Type *o, const char *tname, Type *key) {
+    Type *ix = xs_alloc(sizeof *ix);
+    ix->kind = TY_TPARAM;
+    ix->tname = tname;
+    ix->elem = o;
+    ix->key = key;
+    return ix;
+}
+/* after '[' of T[...]: T[number], T['k'], T[] (an array), T[keyof T] (its values), T[K] with K a type (a key or keys
+   the checker reads: a union alias, a mapped type's key) */
+static Type *index_suffix(Parser *p, Type *t) {
+    if (at_ident(p, "number") && peek_is(p, TK_RBRACKET)) { /* T[number]: the element type of the array type T */
+        next(p);
+        next(p);
+        return tp_index(t, "__elem_of", NULL);
+    }
+    if (at(p, TK_STRING) && peek_is(p, TK_RBRACKET)) { /* Input['campo']: the type of that field (the checker reads it) */
+        Type *ix = tp_index(t, xs_sprintf("__field_of:%s", p->tok.str), NULL);
+        next(p);
+        next(p);
+        return ix;
+    }
+    if (accept(p, TK_RBRACKET)) return ty_array_of(t);
+    if (at_ident(p, "keyof")) { /* T[keyof T]: the types of T's values */
+        next(p);
+        Type *of = parse_type(p);
+        expect(p, TK_RBRACKET, NULL);
+        return tp_index(t, "__index", tp_index(of, "__keyof", NULL));
+    }
+    Type *k = parse_type(p);
+    expect(p, TK_RBRACKET, NULL);
+    return tp_index(t, "__index", k);
+}
+/* { [K in keyof T]: V } (or [K in 'a' | 'b']): a mapped type; the checker makes it from what T is (a tuple, an
+   array, an object, a Record), V read with K as each key */
+static Type *parse_mapped_type(Parser *p) {
+    expect(p, TK_LBRACE, NULL);
+    if (at(p, TK_MINUS) || at(p, TK_PLUS)) next(p);
+    if (at_ident(p, "readonly")) next(p);
+    expect(p, TK_LBRACKET, NULL);
+    Token k = expect(p, TK_IDENT, "a mapped type's key: { [K in keyof T]: V }");
+    next(p); /* in */
+    Type *src = NULL, *keys = NULL;
+    if (at_ident(p, "keyof")) { next(p); src = parse_type(p); }
+    else keys = parse_type(p);
+    expect(p, TK_RBRACKET, NULL);
+    bool opt = false;
+    if (at(p, TK_MINUS) || at(p, TK_PLUS)) { next(p); expect(p, TK_QUESTION, NULL); }
+    else opt = accept(p, TK_QUESTION);
+    expect(p, TK_COLON, "{ [K in keyof T]: V }");
+    char **names = xs_alloc(sizeof(char *));
+    names[0] = k.str;
+    char **saved = tp_names;
+    int saved_n = ntp;
+    tp_push(names, 1);
+    Type *v = parse_type(p);
+    tp_names = saved;
+    ntp = saved_n;
+    accept(p, TK_SEMI);
+    accept(p, TK_COMMA);
+    expect(p, TK_RBRACE, "a mapped type has one member: { [K in keyof T]: V }");
+    Type *t = tp_index(src, xs_sprintf("__mapped%s:%s", opt ? "?" : "", k.str), keys);
+    t->ret = v;
+    return t;
+}
+static bool at_mapped_type(Parser *p) {
+    if (!at(p, TK_LBRACE)) return false;
+    Parser look = *p;
+    next(&look);
+    if (at(&look, TK_MINUS) || at(&look, TK_PLUS)) next(&look);
+    if (at_ident(&look, "readonly")) next(&look);
+    if (!at(&look, TK_LBRACKET)) return false;
+    next(&look);
+    if (!at(&look, TK_IDENT)) return false;
+    next(&look);
+    return at_ident(&look, "in") || at(&look, TK_IN);
+}
 static Type *parse_type(Parser *p) {
     Type *t;
     if (at(p, TK_LT)) { /* <T>(sql: string, binds: unknown[]) => Promise<T | null>: a generic function type */
@@ -443,6 +548,10 @@ static Type *parse_type(Parser *p) {
         t = ty_unknown;
         if (at(p, TK_PIPE)) { next(p); Type *r = parse_type(p); (void)r; } /* ({ new (): T } | { name?: string }: unknown too) */
         return t;
+    }
+    if (at_mapped_type(p)) {
+        t = parse_mapped_type(p);
+        goto suffix;
     }
     if (at(p, TK_LBRACE)) { /* { a: T; b?: U }: an object type in place */
         t = parse_inline_object_type(p);
@@ -519,20 +628,9 @@ static Type *parse_type(Parser *p) {
         next(p);
         t = parse_type(p);
         expect(p, TK_RPAREN, NULL);
-        while (at(p, TK_LBRACKET)) {
+        while (at(p, TK_LBRACKET)) { /* (typeof XS)[number], (typeof m)[K] */
             next(p);
-            if (at_ident(p, "number")) { /* (typeof XS)[number] */
-                next(p);
-                expect(p, TK_RBRACKET, NULL);
-                Type *ix = xs_alloc(sizeof *ix);
-                ix->kind = TY_TPARAM;
-                ix->tname = "__elem_of";
-                ix->elem = t;
-                t = ix;
-                continue;
-            }
-            expect(p, TK_RBRACKET, NULL);
-            t = ty_array_of(t);
+            t = index_suffix(p, t);
         }
         if (at(p, TK_PIPE)) {
             next(p);
@@ -621,6 +719,8 @@ static Type *parse_type(Parser *p) {
         next(p);
         t = parse_type(p);
         expect(p, TK_GT, "close Awaited<T> with '>'");
+        if (t->kind == TY_TPARAM && t->tname && !strncmp(t->tname, "__", 2)) t = tp_index(t, "__awaited", NULL); /* (Awaited<ReturnType<..>>,
+            Awaited<(typeof m)[K]>: what the checker reads, a promise's value) */
     } else if (strcmp(n, "Parameters") == 0 && at(p, TK_LT) && peek_is_ident(p)) { /* Parameters<typeof f>[0]: the type of f's first parameter */
         next(p);
         if (!at_ident(p, "typeof")) xs_error(XS1019, name.pos, "write the type itself", "Parameters<...> takes typeof a function");
@@ -635,10 +735,31 @@ static Type *parse_type(Parser *p) {
         t = xs_alloc(sizeof *t);
         t->kind = TY_TPARAM;
         t->tname = xs_sprintf("__param_of:%s:%d", fn.str, ix);
+    } else if (strcmp(n, "ConstructorParameters") == 0 && at(p, TK_LT) && peek_is_ident(p)) { /* ConstructorParameters<typeof C>[0]:
+                                                                                              the type of C's constructor's first parameter */
+        next(p);
+        if (!at_ident(p, "typeof")) xs_error(XS1019, name.pos, "write the type itself", "ConstructorParameters<...> takes typeof a class");
+        next(p);
+        Token cn = expect(p, TK_IDENT, NULL);
+        expect(p, TK_GT, NULL);
+        if (!at(p, TK_LBRACKET) || !peek_is(p, TK_NUMBER)) xs_error(XS1019, name.pos, "write the type itself", "ConstructorParameters<typeof %s> is read as one of them: ConstructorParameters<typeof %s>[0]", cn.str, cn.str);
+        next(p);
+        int ix = (int)p->tok.ival;
+        next(p);
+        expect(p, TK_RBRACKET, NULL);
+        t = xs_alloc(sizeof *t);
+        t->kind = TY_TPARAM;
+        t->tname = xs_sprintf("__ctor_param_of:%s:%d", cn.str, ix);
     } else if (strcmp(n, "ReturnType") == 0 && at(p, TK_LT)) { /* ReturnType<typeof setTimeout>: a timer id */
         Parser look = *p;
         next(&look);
-        if (!at_ident(&look, "typeof")) xs_error(XS1019, name.pos, "write the type itself", "ReturnType<...> takes typeof a function");
+        if (!at_ident(&look, "typeof")) { /* ReturnType<C['m']>: what the method m of C returns (the checker reads it) */
+            next(p);
+            Type *of = parse_type(p);
+            expect(p, TK_GT, "close ReturnType<T> with '>'");
+            t = tp_index(of, "__ret_of_t", NULL);
+            goto suffix;
+        }
         next(&look);
         Token fn = expect(&look, TK_IDENT, NULL);
         if (!at(&look, TK_GT)) xs_error(XS1019, name.pos, "write the type itself", "ReturnType<typeof f> takes a function's name");
@@ -773,8 +894,8 @@ static Type *parse_type(Parser *p) {
             expect(p, TK_GT, NULL);
             t = inner;
         } else {
-            m->a = mixin_of_type(inner, name.pos);
-            if (!one_arg) { expect(p, TK_COMMA, xs_sprintf("write %s<A, 'key'>", n)); mixin_keys(m, parse_type(p), name.pos); }
+            m->a = mixin_of_type(p, inner, name.pos);
+            if (!one_arg) { expect(p, TK_COMMA, xs_sprintf("write %s<A, 'key'>", n)); mixin_keys(p, m, parse_type(p), name.pos); }
             expect(p, TK_GT, NULL);
             t = anon_iface(p, open, name.pos, m);
         }
@@ -799,10 +920,12 @@ static Type *parse_type(Parser *p) {
                 if (q->reexport || q->star) continue;
                 for (int k = 0; k < q->n; k++) if (strcmp(q->names[k], name.str) == 0) { im = q; break; }
             }
-            if (im) {
-                next(p);
-                name = p->tok;
-                next(p);
+            if (im) { /* (stream.xlsx.WorkbookWriter: the last name, the type the module exports) */
+                while (at(p, TK_DOT) && peek_is_ident(p)) {
+                    next(p);
+                    name = p->tok;
+                    next(p);
+                }
                 import_add_name(im, name);
             }
         }
@@ -820,29 +943,9 @@ static Type *parse_type(Parser *p) {
 suffix:
     while (at(p, TK_LBRACKET)) {
         next(p);
-        if (at_ident(p, "number")) { /* T[number]: the element type of the array type T */
-            next(p);
-            expect(p, TK_RBRACKET, NULL);
-            Type *ix = xs_alloc(sizeof *ix);
-            ix->kind = TY_TPARAM;
-            ix->tname = "__elem_of";
-            ix->elem = t;
-            t = ix;
-            continue;
-        }
-        if (at(p, TK_STRING)) { /* Input['campo']: the type of that field (the checker reads it) */
-            Type *ix = xs_alloc(sizeof *ix);
-            ix->kind = TY_TPARAM;
-            ix->tname = xs_sprintf("__field_of:%s", p->tok.str);
-            ix->elem = t;
-            next(p);
-            expect(p, TK_RBRACKET, NULL);
-            t = ix;
-            continue;
-        }
-        expect(p, TK_RBRACKET, NULL);
-        t = ty_array_of(t);
+        t = index_suffix(p, t);
     }
+    if (at(p, TK_AMP)) t = inter_rest(p, t, open, tpos); /* (typeof s & { motivo: M }, T['k'] & {...}) */
     if (at(p, TK_PIPE)) { /* T | null, or a union A | B | ... */
         next(p);
         if (at_ident(p, "null") || at_ident(p, "undefined")) { /* T | undefined: the same nullable type (xisto has one
@@ -1268,7 +1371,8 @@ static Expr *parse_primary(Parser *p) {
     }
     case TK_ASYNC: {
         next(p);
-        if (!looks_like_arrow(p)) xs_error(XS1020, pos, NULL, "expected an arrow function after 'async'");
+        if (!at(p, TK_FUNCTION) && !looks_like_arrow(p)) xs_error(XS1020, pos, NULL, "expected an arrow function after 'async'");
+        /* (async function name(...) { ... }: a function expression, read as an async arrow, as function (...) is) */
         Expr *e = parse_arrow(p);
         e->arrow->fn->is_async = true;
         return e;
@@ -1439,18 +1543,21 @@ static Expr *parse_primary(Parser *p) {
                 if (q->reexport || q->star) continue;
                 for (int k = 0; k < q->n; k++) if (strcmp(q->names[k], name.str) == 0) { im = q; break; }
             }
-            if (im) {
-                next(p);
-                name = p->tok;
-                next(p);
+            if (im) { /* (new stream.xlsx.WorkbookWriter(o): the last name, the class the module exports) */
+                while (at(p, TK_DOT) && peek_is_ident(p)) {
+                    next(p);
+                    name = p->tok;
+                    next(p);
+                }
                 import_add_name(im, name);
             }
         }
         if (strcmp(name.str, "Array") == 0) {
             Expr *e = new_expr(E_NEW_ARRAY, pos);
-            expect(p, TK_LT, "write the element type: new Array<number>(n).fill(0)");
-            e->elem_type = parse_type(p);
-            expect(p, TK_GT, NULL);
+            if (accept(p, TK_LT)) { /* (new Array(n) where a T[] is declared: the checker takes T from there) */
+                e->elem_type = parse_type(p);
+                expect(p, TK_GT, NULL);
+            }
             expect(p, TK_LPAREN, NULL);
             e->lhs = parse_expr(p);
             expect(p, TK_RPAREN, NULL);
@@ -2757,6 +2864,8 @@ static Stmt *parse_stmt(Parser *p) {
         }
         Expr *spread = p->spread_arg;
         p->spread_ok = so; p->spread_arg = sa;
+        Stmt *many = push_spreads(p, s->expr, pos);
+        if (many) { expect_semi(p); return many; }
         if (spread) { /* xs.push(...ys);: for (const __sp of ys) xs.push(__sp); */
             Expr *c = s->expr, *t = c->kind == E_MEMBER ? c->lhs : NULL;
             while (t && t->kind == E_MEMBER && !t->is_call) t = t->lhs;
@@ -2784,6 +2893,67 @@ static Stmt *parse_stmt(Parser *p) {
     }
 }
 
+/* a place read again as written: x, this.xs, a.b.c */
+static bool push_path(Expr *e) {
+    if (!e) return false;
+    if (e->kind == E_IDENT || e->kind == E_THIS) return true;
+    return e->kind == E_MEMBER && !e->is_call && push_path(e->lhs);
+}
+static Expr *push_path_copy(Expr *e) {
+    Expr *c = xs_alloc(sizeof *c);
+    *c = *e;
+    if (e->kind == E_MEMBER) c->lhs = push_path_copy(e->lhs);
+    return c;
+}
+/* xs.push(...a, ...b), xs.push(x, ...a), (o.xs ??= []).push(...a): each argument pushed in order, a spread one by one
+   (for (const v of a) xs.push(v)); NULL when the statement is not such a push (or is the one-spread form below) */
+static Stmt *push_spreads(Parser *p, Expr *c, Pos pos) {
+    (void)p;
+    if (!c || c->kind != E_MEMBER || !c->is_call || !c->str || strcmp(c->str, "push") != 0) return NULL;
+    int nsp = 0;
+    for (int i = 0; i < c->args.len; i++) if (c->args.items[i]->kind == E_UNARY && c->args.items[i]->op == TK_ELLIPSIS) nsp++;
+    if (!nsp) return NULL;
+    Expr *tgt = c->lhs;
+    Stmt *pre = NULL;
+    if (tgt && tgt->kind == E_ASSIGN && push_path(tgt->lhs)) { /* (o.xs ??= []).push(...): the assignment, then o.xs */
+        pre = new_stmt(S_EXPR, pos);
+        pre->expr = tgt;
+        tgt = tgt->lhs;
+    }
+    if (c->args.len == 1 && !pre && push_path(tgt)) return NULL; /* (xs.push(...ys): the form below) */
+    if (!push_path(tgt))
+        xs_error(XS6032, c->pos, "push onto a variable or field: xs.push(...ys)", "spreading arguments into a call is not supported (xisto has no rest parameters)");
+    Stmt *blk = new_stmt(S_BLOCK, pos);
+    if (pre) stmt_list_push(&blk->stmts, pre);
+    static int nps;
+    for (int i = 0; i < c->args.len; i++) {
+        Expr *a = c->args.items[i];
+        Expr *call = new_expr(E_MEMBER, a->pos);
+        call->is_call = true;
+        call->str = "push";
+        call->lhs = push_path_copy(tgt);
+        Stmt *st = new_stmt(S_EXPR, a->pos);
+        st->expr = call;
+        if (a->kind == E_UNARY && a->op == TK_ELLIPSIS) {
+            char *v = xs_sprintf("__ps%d", ++nps);
+            Expr *ref = new_expr(E_IDENT, a->pos);
+            ref->str = v;
+            expr_list_push(&call->args, ref);
+            Stmt *fo = new_stmt(S_FOROF, a->pos);
+            fo->name = v;
+            fo->is_const = true;
+            fo->expr = a->lhs;
+            Stmt *body = new_stmt(S_BLOCK, a->pos);
+            stmt_list_push(&body->stmts, st);
+            fo->body = body;
+            stmt_list_push(&blk->stmts, fo);
+        } else {
+            expr_list_push(&call->args, a);
+            stmt_list_push(&blk->stmts, st);
+        }
+    }
+    return blk;
+}
 /* zero or more `@Name` / `@Name(args)` */
 static void parse_decorators(Parser *p, DecoList *dl) {
     while (at(p, TK_AT)) {
@@ -2818,6 +2988,36 @@ static bool default_literal_type(Parser *p, Param *prm) {
         t->tname = xs_sprintf("__typeofw:%s", look.tok.str);
         prm->type = t;
         prm->type_src = "number";
+    }
+    else if (!neg && at(&look, TK_IDENT) && (peek_is(&look, TK_DOT) || peek_is(&look, TK_LPAREN))) {
+        /* (ilm = opts.ilm), (n = config().limite): the type of that field of the variable (or of what the function
+           returns), as TypeScript infers the parameter's */
+        Token v = look.tok;
+        next(&look);
+        Type *t = xs_alloc(sizeof *t);
+        t->kind = TY_TPARAM;
+        if (accept(&look, TK_LPAREN)) {
+            if (!accept(&look, TK_RPAREN)) return false;
+            t->tname = xs_sprintf("__ret_of_fn:%s", v.str);
+        } else {
+            t->tname = xs_sprintf("__typeof:%s", v.str);
+            for (int i = p->nvt - 1; i >= 0; i--)
+                if (strcmp(p->vt_names[i], v.str) == 0) { if (p->vt_types[i]) t = p->vt_types[i]; break; }
+        }
+        int nf = 0;
+        while (at(&look, TK_DOT) && peek_is_ident(&look)) {
+            next(&look);
+            Type *ix = xs_alloc(sizeof *ix);
+            ix->kind = TY_TPARAM;
+            ix->tname = xs_sprintf("__field_of:%s", look.tok.str);
+            ix->elem = t;
+            t = ix;
+            next(&look);
+            nf++;
+        }
+        if (!nf || !(at(&look, TK_COMMA) || at(&look, TK_RPAREN))) return false;
+        prm->type = t;
+        prm->type_src = "unknown";
     }
     else if (!neg && at(&look, TK_NEW)) { /* (agora = new Date()): the class it makes */
         next(&look);
@@ -3058,7 +3258,8 @@ static Class *parse_interface(Parser *p) {
             } while (d > 0 && !at(&look, TK_EOF));
             composite = at(&look, TK_PIPE) || at(&look, TK_AMP) || at(&look, TK_LBRACKET);
         }
-        if (!at(p, TK_LBRACE) || composite) { /* type Shape = Circle | Rect; type Id = string | number; */
+        if (!at(p, TK_LBRACE) || composite || at_mapped_type(p)) { /* type Shape = Circle | Rect; type Id = string | number;
+                                                                       type F = { [K in Campo]: boolean } */
             c->alias = parse_type(p);
             if (c->ntparams) { /* type Item<T> = { ok: true; valor: T } | { ok: false; erro: unknown }: each object member a
                                   template over T, instantiated with the alias (checker: resolve) */
@@ -3777,8 +3978,32 @@ static bool thunk_arrow_ahead(Parser *p) {
     next(&look);
     if (!accept(&look, TK_ASSIGN)) return false;
     accept(&look, TK_ASYNC);
-    if (!accept(&look, TK_LPAREN) || !accept(&look, TK_RPAREN)) return false;
-    return at(&look, TK_COLON); /* () : R => ...: with its return type written (one inferred would be read too early) */
+    if (!at(&look, TK_LPAREN)) return false;
+    if (!peek_is(&look, TK_RPAREN)) {
+        /* const liga = (nome: string, padrao: boolean): boolean => ...: a function too (a function declared above it
+           calls it, as JavaScript's hoisting allows), when every parameter has its type written */
+        if (!looks_like_arrow(&look)) return false;
+        next(&look);
+        int d = 0;
+        bool typed = false;
+        while (!at(&look, TK_EOF)) {
+            if (at(&look, TK_LPAREN) || at(&look, TK_LBRACE) || at(&look, TK_LBRACKET) || at(&look, TK_LT)) d++;
+            else if (at(&look, TK_RBRACE) || at(&look, TK_RBRACKET) || at(&look, TK_GT)) d--;
+            else if (at(&look, TK_RPAREN)) { if (d == 0) break; d--; }
+            else if (d == 0 && at(&look, TK_COLON)) typed = true;
+            else if (d == 0 && at(&look, TK_COMMA)) { if (!typed) return false; typed = false; }
+            next(&look);
+        }
+        return typed;
+    }
+    next(&look);
+    next(&look);
+    if (at(&look, TK_COLON)) return true; /* () : R => ...: with its return type written */
+    /* () => ({ ... }), () => { ...; return {...}; }: a config factory whose type is ReturnType<typeof cfg>, inferred from
+       its body (a function, as function cfg() { ... } is) */
+    if (!accept(&look, TK_ARROW)) return false;
+    if (at(&look, TK_LBRACE)) return true;
+    return accept(&look, TK_LPAREN) && at(&look, TK_LBRACE);
 }
 
 /* the rest of the module declares `name` at its top level: a line that starts (after export / declare / abstract)

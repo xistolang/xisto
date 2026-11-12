@@ -614,6 +614,10 @@ typedef struct Mixin {
     struct Mixin *a, *b;
     char **keys;
     int nkeys;
+    struct Type *ty;     /* a side the parser could not name (Partial<Dto<T>>, Omit<R['xs'][number], 'k'>): resolved when the
+                            fields are copied, in mod */
+    struct Module *mod;
+    struct Type *keyty;  /* the keys of Pick/Omit as a type the checker reads (an alias of a union of literals) */
 } Mixin;
 /* a class that extends Error, directly or through its bases */
 static inline bool is_error_class(struct Class *c) {
