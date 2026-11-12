@@ -15,5 +15,15 @@ node_modules/
 examples/conduit/dist/
 examples/conduit/conduit
 third_party/qbe/qbe
-.claude/
 __pycache__/
+
+# the old internal notes (local only); the documentation site lives in docs/
+/docs_bkp/
+# Claude Code: agents and skills are versioned; worktrees and local settings are not
+/.claude/*
+!/.claude/agents/
+!/.claude/skills/
+# the documentation site's build output
+/docs/node_modules/
+/docs/build/
+/docs/.docusaurus/
