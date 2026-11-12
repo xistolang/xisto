@@ -26,6 +26,10 @@ async function main(): Promise<void> {
   console.log(JSON.stringify((p as { outBinds: unknown }).outBinds));
   const q = await conn.execute("select :1 as one from dual", [7], { outFormat: OUT_FORMAT_OBJECT });
   console.log(JSON.stringify((q as { rows: unknown[] }).rows));
+  // the result with no declared row type: its rows read by position (node-oracledb's Result<any>)
+  const u = await conn.execute("SELECT USER FROM DUAL");
+  const who = u?.rows?.[0]?.[0] as string;
+  console.log(typeof who, who, u.rows?.length);
   await conn.close();
 }
 main();

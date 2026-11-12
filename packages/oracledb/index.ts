@@ -273,9 +273,16 @@ export class Connection {
    * Compatibility: as node-oracledb thin, except that CLOB/BLOB always come whole (also as OUT binds), and that
    * RETURNING INTO and REF CURSOR binds are not supported yet.
    */
-  async execute(sql: string, binds: unknown[] | Record<string, unknown> = [], options: ExecuteOptions = {}): Promise<object> {
+  async execute<T = any, O = any>(sql: string, binds: unknown[] | Record<string, unknown> = [], options: ExecuteOptions = {}): Promise<Result<T, O>> {
+    // (T and O from the target, `const r: Result<Row> = await conn.execute(...)`, or any: result.rows[0][0])
+    const r: Result<T, O> = await this.executeRaw(sql, binds, options);
+    return r;
+  }
+
+  /** execute's result as the driver gives it (JSON): what a library that reads it generically takes (typeorm). */
+  async executeRaw(sql: string, binds: unknown[] | Record<string, unknown> = [], options: ExecuteOptions = {}): Promise<object> {
     if (!Array.isArray(binds)) {
-      return this.executeNamed(sql, binds, options); // binds by name, as node-oracledb takes them
+      return this.executeNamedRaw(sql, binds, options); // binds by name, as node-oracledb takes them
     }
     this.check();
     const b = bindsByPosition(binds);
@@ -302,7 +309,13 @@ export class Connection {
    *   const r: Result<object, { msg: string | null }> = await conn.executeNamed("begin pkg.p(:id, :msg); end;", { id: 7, msg });
    * Compatibility: node-oracledb takes the object as execute's second argument.
    */
-  async executeNamed(sql: string, binds: Record<string, unknown>, options: ExecuteOptions = {}): Promise<object> {
+  async executeNamed<T = any, O = any>(sql: string, binds: Record<string, unknown>, options: ExecuteOptions = {}): Promise<Result<T, O>> {
+    const r: Result<T, O> = await this.executeNamedRaw(sql, binds, options);
+    return r;
+  }
+
+  /** executeNamed's result as the driver gives it (JSON). */
+  async executeNamedRaw(sql: string, binds: Record<string, unknown>, options: ExecuteOptions = {}): Promise<object> {
     this.check();
     const b = bindsByName(binds);
     try {
