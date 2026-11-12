@@ -1857,6 +1857,9 @@ function isWord(ch: string): boolean {
 // ---------------------------------------------------------------------------------------------------------------
 // EntityManager, QueryRunner, DataSource
 
+/** an entity class where TypeORM takes EntityTarget<Entity>: T is that class (the checker binds it from the class given) */
+export type EntityTarget<T> = ClassInfo;
+
 export class EntityManager {
   private executor: Executor;
   constructor(executor: Executor) {
@@ -1895,6 +1898,40 @@ export class EntityManager {
   /** getRepository<User>(User): the class gives its metadata, the type argument the entities' type */
   getRepository<T>(entity: ClassInfo): Repository<T> {
     return new Repository<T>(this.executor.dataSource.options.name ?? "default", this.executor.sessionId);
+  }
+  // TypeORM's EntityManager calls on an entity class (manager.findOne(User, {...})): its repository's, in this
+  // manager's session (a transaction's statements stay in it); T is the class given (EntityTarget<T>)
+  async find<T>(entity: EntityTarget<T>, options: FindManyOptions = {}): Promise<T[]> {
+    return this.getRepository<T>(entity).find(options);
+  }
+  async findBy<T>(entity: EntityTarget<T>, where: object): Promise<T[]> {
+    return this.getRepository<T>(entity).findBy(where);
+  }
+  async findOne<T>(entity: EntityTarget<T>, options: FindOneOptions): Promise<T | null> {
+    return this.getRepository<T>(entity).findOne(options);
+  }
+  async findOneBy<T>(entity: EntityTarget<T>, where: object): Promise<T | null> {
+    return this.getRepository<T>(entity).findOneBy(where);
+  }
+  async count<T>(entity: EntityTarget<T>, options: FindManyOptions = {}): Promise<int> {
+    return this.getRepository<T>(entity).count(options);
+  }
+  async insert<T>(entity: EntityTarget<T>, values: Record<string, unknown>): Promise<InsertResult> {
+    return this.getRepository<T>(entity).insert(values);
+  }
+  async update<T>(entity: EntityTarget<T>, criteria: object, values: Record<string, unknown>): Promise<UpdateResult> {
+    return this.getRepository<T>(entity).update(criteria, values);
+  }
+  async delete<T>(entity: EntityTarget<T>, criteria: object): Promise<DeleteResult> {
+    return this.getRepository<T>(entity).delete(criteria);
+  }
+  /** manager.transaction(fn): inside a transaction already (TypeORM runs fn on this manager when its runner is in one);
+      otherwise one of the DataSource's own */
+  async transaction<T>(fn: (manager: EntityManager) => Promise<T>): Promise<T> {
+    if (this.executor.sessionId >= 0) {
+      return await fn(this);
+    }
+    return await this.executor.dataSource.transaction<T>(fn);
   }
   createQueryBuilder<T>(entity: ClassInfo, alias: string): SelectQueryBuilder<T> {
     const qb = new SelectQueryBuilder<T>(this.executor);
