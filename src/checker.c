@@ -8736,6 +8736,19 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->type = ty_array_of(et);
             return;
         }
+        if (et && tsc_checked() && (is_numeric(et) || et->kind == TY_BOOLEAN)) { /* new Array<number>(n) set by index later: 0 / false
+                                                                                    in its holes (JavaScript reads undefined there) */
+            Expr *na = xs_alloc(sizeof *na);
+            *na = *e;
+            Expr *z = et->kind == TY_BOOLEAN ? xs_alloc(sizeof *z) : num_lit(e->pos, 0, et->kind == TY_INT);
+            if (et->kind == TY_BOOLEAN) { z->kind = E_BOOL; z->pos = e->pos; z->field = -1; }
+            Expr *fill = xs_alloc(sizeof *fill);
+            fill->kind = E_MEMBER; fill->pos = e->pos; fill->field = -1; fill->is_call = true; fill->str = "fill"; fill->lhs = na;
+            expr_list_push(&fill->args, z);
+            check_expr(fill, NULL);
+            *e = *fill;
+            return;
+        }
         xs_error(XS6017, e->pos, "write: new Array<T>(n).fill(x)", "a new array must be filled before use");
         return;
     }
