@@ -322,6 +322,20 @@ export function Between(from: object, to: object): object {
   const o: object = JSON.parse('{"__op":"between","value":' + JSON.stringify(from) + ',"to":' + JSON.stringify(to) + "}");
   return o;
 }
+// the column a Raw condition is written for, until the SQL builder knows it
+const RAW_ALIAS = "\u0001column\u0001";
+
+/**
+ * A condition written in SQL: the function gets the column's path ("Alias"."COLUMN") and returns the SQL; its
+ * :name parameters come from `parameters`.
+ * @example where: { dtGeracao: Raw((alias) => `${alias} >= TRUNC(SYSDATE)`) }
+ * Compatibility: the function runs once, when Raw is called (TypeORM calls it while it builds the query).
+ */
+export function Raw(sql: (columnAlias: string) => string, parameters: object = {}): object {
+  const o: object = JSON.parse('{"__op":"raw","value":' + JSON.stringify(sql(RAW_ALIAS)) + ',"params":' + JSON.stringify(parameters) + "}");
+  return o;
+}
+
 export function IsNull(): object {
   return operatorNoValue("isnull");
 }
@@ -768,6 +782,30 @@ function conditionSql(column: string, value: object, binds: Binds, columnKind: s
       return "0=1";
     }
     return column + " IN (" + parts.join(", ") + ")";
+  }
+  if (op === "raw") {
+    // the column's path in place of the alias, and each :name of the parameters as a bind, as TypeORM does
+    let sql: string = JSON.parse(JSON.stringify(v));
+    sql = sql.split(RAW_ALIAS).join(column);
+    const params = get(value, "params");
+    if (kind(params) === "object") {
+      const names: string[] = JSON.parse(JSON.stringify(keys(params)));
+      sql = sql.replace(/:(\.\.\.)?([A-Za-z0-9_.]+)/g, (whole: string, spread: string, name: string): string => {
+        if (!names.includes(name)) {
+          return whole;
+        }
+        const pv = get(params, name);
+        if (kind(pv) === "array") {
+          const parts: string[] = [];
+          for (let i = 0; i < len(pv); i++) {
+            parts.push(binds.addJson(at(pv, i)));
+          }
+          return parts.join(", ");
+        }
+        return binds.addJson(pv);
+      });
+    }
+    return "(" + sql + ")";
   }
   if (op === "between") {
     return column + " BETWEEN " + binds.addColumnJson(v, columnKind) + " AND " + binds.addColumnJson(get(value, "to"), columnKind);
