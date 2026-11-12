@@ -226,6 +226,8 @@ typedef struct Type {
                              ftparams), from which a call f<Row>(sql) takes its result type (the unknown converted to it) */
     char **ftparams;
     int nftparams;
+    struct Type *gen_in;  /* TY_FUNC of a generic arrow value (<T>(m: Map<string, T[]>) => ...): its parameters as written (T a
+                             TY_TPARAM, names in ftparams; ret may be missing), from which a call infers T (gen_args) */
 } Type;
 
 extern Type *ty_number, *ty_int, *ty_litint, *ty_boolean, *ty_string, *ty_void, *ty_null, *ty_json, *ty_unknown, *ty_any, *ty_undef;
@@ -362,6 +364,7 @@ struct Arrow {
     bool expr_body;    /* `=> expr`: body is a block with one return (or one expression statement when void) */
     bool emitted;      /* its definition is out: a finally block is emitted twice (normal and throw paths) */
     bool synthetic;    /* made by the checker (a Promise.all/race task, a truthy test): not a callback in the source */
+    Type *gen_in;      /* <T>(xs: T[], ...) => ...: its parameters as written (Type.gen_in) */
     Type *gen_sig;     /* async <T>(sql: string): Promise<T | null> => ...: its signature as written (Type.gen_sig); the body
                           reads T as unknown */
 };
