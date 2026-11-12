@@ -40,11 +40,20 @@ interface Bucket {
   count: number;
 }
 
-async function raw(conn: Connection, coll: string): Promise<void> {
+// (sorted: the fields an upsert takes from its filter come in an order the server chooses, which varies)
+async function raw(conn: Connection, coll: string, sorted: boolean = false): Promise<void> {
   const db = conn.db;
   if (db == null) return;
   const docs = await db.collection(coll).find({}).sort({ _id: 1 }).toArray();
-  for (const d of docs) show('  raw ' + coll, d);
+  for (const d of docs) {
+    if (!sorted) {
+      show('  raw ' + coll, d);
+      continue;
+    }
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(d).sort()) out[k] = d[k];
+    show('  raw ' + coll + ' (sorted)', out);
+  }
 }
 
 async function main(): Promise<void> {
@@ -91,7 +100,7 @@ async function main(): Promise<void> {
   console.log('update', again?.classe);
   const old = await profiles.findOneAndUpdate({ operador: 'OP1', base: 'BASE' }, { $set: { classe: 4 } }).exec();
   console.log('old', old?.classe);
-  await raw(conn, 'profiles');
+  await raw(conn, 'profiles', true);
   show('updateOne', await profiles.updateOne({ operador: 'OP2', base: 'X' }, { $set: { classe: 1 } }, { upsert: true }).exec());
   show('updateMany', await profiles.updateMany({}, { $inc: { classe: 10 } }).exec());
   try {
