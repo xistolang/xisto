@@ -578,11 +578,25 @@ function isInt(s: string): boolean {
   return true;
 }
 
+// the headers as Node's req.headers: one key per header, lower case
+function headersJson(request: Request): string {
+  const h = request.headers;
+  const all: Record<string, unknown> = {};
+  const auth = h.authorization;
+  if (auth != null) {
+    all["authorization"] = auth;
+  }
+  for (const k of Object.keys(h.__expando)) {
+    all[k] = h.__expando[k];
+  }
+  return JSON.stringify(all);
+}
+
 // the request's data as JSON (what a parameter declared as an object type reads: user, params, ip...)
 function requestJson(request: Request): string {
   const user: any = request.user;
   return `{"method":${JSON.stringify(request.method)},"url":${JSON.stringify(request.url)},"path":${JSON.stringify(request.path)},` +
-    `"ip":${JSON.stringify(request.ip)},"params":${JSON.stringify(request.params)},"headers":${JSON.stringify(request.headers)},` +
+    `"ip":${JSON.stringify(request.ip)},"params":${JSON.stringify(request.params)},"headers":${headersJson(request)},` +
     `"user":${user === null ? "null" : JSON.stringify(user)}}`;
 }
 

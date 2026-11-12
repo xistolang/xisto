@@ -646,6 +646,11 @@ static Type *parse_type(Parser *p) {
     else if (strcmp(n, "any") == 0 || strcmp(n, "never") == 0) { /* the dynamic path: an unknown read and written by name, checked
                                                                      at run time (x as never: TypeScript's cast to anything, the same) */
         t = ty_any;
+        if (strcmp(n, "never") == 0) { /* (x as never: any, which takes the type expected where it goes, as TypeScript) */
+            t = xs_alloc(sizeof *t);
+            *t = *ty_any;
+            t->tname = "never";
+        }
         if (!no_dyn_note) xs_note_dynamic(name.pos);
     }
     else if (strcmp(n, "NonNullable") == 0) { /* NonNullable<T>: T without null (the checker strips it) */

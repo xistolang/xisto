@@ -128,6 +128,16 @@ export function getMetadata(entity: ClassInfo): EntityMetadata {
   return m;
 }
 
+// an entity named by its class name or its table, as TypeORM's EntityTarget given as a string
+function metadataByName(name: string): EntityMetadata {
+  for (const [id, m] of entityMetadata) {
+    if (m.name === name || m.tableName === name) {
+      return m;
+    }
+  }
+  throw new EntityMetadataNotFoundError(name);
+}
+
 function metadataById(id: string, name: string): EntityMetadata {
   const m = entityMetadata.get(id);
   if (m === null) {
@@ -1046,7 +1056,14 @@ export class Repository<T> {
     this.sessionId = sessionId;
   }
 
+  // (an entity given by name, manager.update("TB_X", ...): its metadata, not T's)
+  __fixed: EntityMetadata | null = null;
+
   get metadata(): EntityMetadata {
+    const f = this.__fixed;
+    if (f !== null) {
+      return f;
+    }
     return metadataById(__reflect_typeid(T), __reflect_typeid(T));
   }
 
@@ -1896,7 +1913,7 @@ function isWord(ch: string): boolean {
 // EntityManager, QueryRunner, DataSource
 
 /** an entity class where TypeORM takes EntityTarget<Entity>: T is that class (the checker binds it from the class given) */
-export type EntityTarget<T> = ClassInfo;
+export type EntityTarget<T> = unknown;
 
 export class EntityManager {
   private executor: Executor;
@@ -1934,8 +1951,12 @@ export class EntityManager {
     return o;
   }
   /** getRepository<User>(User): the class gives its metadata, the type argument the entities' type */
-  getRepository<T>(entity: ClassInfo): Repository<T> {
-    return new Repository<T>(this.executor.dataSource.options.name ?? "default", this.executor.sessionId);
+  getRepository<T>(entity: EntityTarget<T>): Repository<T> {
+    const repo = new Repository<T>(this.executor.dataSource.options.name ?? "default", this.executor.sessionId);
+    if (typeof entity === "string") {
+      repo.__fixed = metadataByName(entity as string); // (an entity given by its name or its table)
+    }
+    return repo;
   }
   // TypeORM's EntityManager calls on an entity class (manager.findOne(User, {...})): its repository's, in this
   // manager's session (a transaction's statements stay in it); T is the class given (EntityTarget<T>)
@@ -1957,6 +1978,7 @@ export class EntityManager {
   async insert<T>(entity: EntityTarget<T>, values: Record<string, unknown>): Promise<InsertResult> {
     return this.getRepository<T>(entity).insert(values);
   }
+  /** manager.update(Entity, where, values), or with the entity's name or table: manager.update("TB_X", ...) */
   async update<T>(entity: EntityTarget<T>, criteria: object, values: Record<string, unknown>): Promise<UpdateResult> {
     return this.getRepository<T>(entity).update(criteria, values);
   }
