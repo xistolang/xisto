@@ -6532,6 +6532,10 @@ static void check_expr_in(Expr *e, Type *expected) {
                     for (int i = 0; !generic && i < init0->args.len; i++)
                         if (!strcmp(init0->keys[i], "...") || !strcmp(init0->keys[i], "redirect")) generic = true;
                     if (generic) { /* options in a value or with spreads: xisto:url's __xs_fetch(url, init: RequestInit) */
+                        int gscheme = url_scheme(e->args.items[0]); /* (TLS by this URL: __xs_fetch's own fetch does not decide it) */
+                        if (gscheme == 1 && xs_tls_off) xs_error(XS7059, e->args.items[0]->pos, "remove --tls=off, or call the service over http://", "https URL, but the program is built with --tls=off");
+                        if (gscheme == 1 || (gscheme == -1 && !xs_tls_off)) prog->uses_tls = true;
+                        prog->uses_net = true;
                         Expr *callee = xs_alloc(sizeof *callee);
                         callee->kind = E_IDENT; callee->pos = e->pos; callee->field = -1; callee->str = "__xs_fetch";
                         e->lhs = callee;
@@ -6607,6 +6611,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 prog->uses_net = true;
                 /* TLS is linked only when https can happen: an http:// URL (TLS ends at the load balancer) costs nothing */
                 int scheme = url_scheme(e->args.items[0]);
+                if (cur_mod && cur_mod->file && !strcmp(cur_mod->file, "xisto:url")) return; /* (__xs_fetch: its caller's URL decides TLS) */
                 if (scheme == 1 && xs_tls_off) xs_error(XS7059, e->args.items[0]->pos, "remove --tls=off, or call the service over http://", "https URL, but the program is built with --tls=off");
                 if (scheme == 1 || (scheme == -1 && !xs_tls_off)) prog->uses_tls = true;
                 return;
