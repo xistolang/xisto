@@ -1,0 +1,8 @@
+{
+  "name": "mongoose",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "mongoose 8 API without a MongoDB driver yet (stage 1): ObjectId, Schema, Model and Query objects, Connection and createConnection compile and work where no server is needed; any operation that needs the server, and opening a connection, rejects with 'mongoose: no MongoDB driver in xisto yet (stage 2)'. The driver plugs in behind Connection.runCommand (setMongoDriver).",
+  "implements": { "mongoose": "^8" },
+  "main": "index.ts"
+}

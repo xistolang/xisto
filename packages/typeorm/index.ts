@@ -42,7 +42,7 @@ export interface ColumnOptions {
   length?: int;
   precision?: int;
   scale?: int;
-  default?: string | number | boolean;
+  default?: unknown; // (a value, or () => "SYSDATE": raw SQL, as TypeORM takes it; the database keeps its own default)
   primary?: boolean;
   select?: boolean;
   unique?: boolean;
@@ -1135,7 +1135,7 @@ export class Repository<T> {
     return e;
   }
 
-  private writable(values: object, withPrimary: boolean, binds: Binds): string[][] {
+  private writable(values: object, withPrimary: boolean, binds: Binds, raw: Map<string, string> = new Map<string, string>()): string[][] {
     const cols: string[] = [];
     const vals: string[] = [];
     const props: string[] = JSON.parse(JSON.stringify(keys(values)));
@@ -1145,9 +1145,26 @@ export class Repository<T> {
         continue;
       }
       cols.push(quote(c.databaseName));
-      vals.push(binds.addColumnJson(get(values, p), columnKind(c)));
+      const sql = raw.get(p);
+      vals.push(sql !== undefined ? sql : binds.addColumnJson(get(values, p), columnKind(c)));
     }
     return [cols, vals];
+  }
+
+  /** the values of an insert or update: a function's result is raw SQL (dtAtualizacao: () => "SYSDATE"), as TypeORM
+      writes it; the rest are bound */
+  private splitRaw(entity: Record<string, unknown>, raw: Map<string, string>): object {
+    const plain: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(entity)) {
+      if (typeof v === "function") {
+        raw.set(k, (v as () => string)());
+        plain[k] = null; // (its place among the columns, in the order given)
+      } else {
+        plain[k] = v;
+      }
+    }
+    const values: object = JSON.parse(JSON.stringify(plain));
+    return values;
   }
 
   private primaryWhere(values: object): object {
@@ -1164,12 +1181,14 @@ export class Repository<T> {
     return w;
   }
 
-  async insert(entity: object): Promise<InsertResult> {
+  async insert(values: Record<string, unknown>): Promise<InsertResult> {
     if (this.metadata.isView) {
       throw new Error(`${this.metadata.name} is a view entity: it cannot be inserted`);
     }
     const binds = new Binds(this.executor.dialect());
-    const cv = this.writable(entity, true, binds);
+    const raw = new Map<string, string>();
+    const entity = this.splitRaw(values, raw);
+    const cv = this.writable(entity, true, binds, raw);
     const sql = "INSERT INTO " + tablePath(this.metadata) + " (" + cv[0].join(", ") + ") VALUES (" + cv[1].join(", ") + ")";
     const r = await this.executor.run(sql, binds.values);
     return { raw: r, identifiers: this.primaryWhere(entity) };
@@ -1186,7 +1205,7 @@ export class Repository<T> {
       }
     }
     if (present && (await this.count({ where: this.primaryWhere(values) })) > 0) {
-      await this.update(this.primaryWhere(values), values);
+      await this.update(this.primaryWhere(values), values as Record<string, unknown>);
       return entity;
     }
     const binds = new Binds(this.executor.dialect());
@@ -1208,12 +1227,14 @@ export class Repository<T> {
     return entity;
   }
 
-  async update(criteria: object, partial: object): Promise<UpdateResult> {
+  async update(criteria: object, values: Record<string, unknown>): Promise<UpdateResult> {
     if (this.metadata.isView) {
       throw new Error(`${this.metadata.name} is a view entity: it cannot be updated`);
     }
     const binds = new Binds(this.executor.dialect());
-    const cv = this.writable(partial, false, binds);
+    const raw = new Map<string, string>();
+    const partial = this.splitRaw(values, raw);
+    const cv = this.writable(partial, false, binds, raw);
     const sets: string[] = [];
     for (let i = 0; i < cv[0].length; i++) {
       sets.push(cv[0][i] + " = " + cv[1][i]);
@@ -1836,6 +1857,9 @@ function isWord(ch: string): boolean {
 // ---------------------------------------------------------------------------------------------------------------
 // EntityManager, QueryRunner, DataSource
 
+/** an entity class where TypeORM takes EntityTarget<Entity>: T is that class (the checker binds it from the class given) */
+export type EntityTarget<T> = ClassInfo;
+
 export class EntityManager {
   private executor: Executor;
   constructor(executor: Executor) {
@@ -1874,6 +1898,40 @@ export class EntityManager {
   /** getRepository<User>(User): the class gives its metadata, the type argument the entities' type */
   getRepository<T>(entity: ClassInfo): Repository<T> {
     return new Repository<T>(this.executor.dataSource.options.name ?? "default", this.executor.sessionId);
+  }
+  // TypeORM's EntityManager calls on an entity class (manager.findOne(User, {...})): its repository's, in this
+  // manager's session (a transaction's statements stay in it); T is the class given (EntityTarget<T>)
+  async find<T>(entity: EntityTarget<T>, options: FindManyOptions = {}): Promise<T[]> {
+    return this.getRepository<T>(entity).find(options);
+  }
+  async findBy<T>(entity: EntityTarget<T>, where: object): Promise<T[]> {
+    return this.getRepository<T>(entity).findBy(where);
+  }
+  async findOne<T>(entity: EntityTarget<T>, options: FindOneOptions): Promise<T | null> {
+    return this.getRepository<T>(entity).findOne(options);
+  }
+  async findOneBy<T>(entity: EntityTarget<T>, where: object): Promise<T | null> {
+    return this.getRepository<T>(entity).findOneBy(where);
+  }
+  async count<T>(entity: EntityTarget<T>, options: FindManyOptions = {}): Promise<int> {
+    return this.getRepository<T>(entity).count(options);
+  }
+  async insert<T>(entity: EntityTarget<T>, values: Record<string, unknown>): Promise<InsertResult> {
+    return this.getRepository<T>(entity).insert(values);
+  }
+  async update<T>(entity: EntityTarget<T>, criteria: object, values: Record<string, unknown>): Promise<UpdateResult> {
+    return this.getRepository<T>(entity).update(criteria, values);
+  }
+  async delete<T>(entity: EntityTarget<T>, criteria: object): Promise<DeleteResult> {
+    return this.getRepository<T>(entity).delete(criteria);
+  }
+  /** manager.transaction(fn): inside a transaction already (TypeORM runs fn on this manager when its runner is in one);
+      otherwise one of the DataSource's own */
+  async transaction<T>(fn: (manager: EntityManager) => Promise<T>): Promise<T> {
+    if (this.executor.sessionId >= 0) {
+      return await fn(this);
+    }
+    return await this.executor.dataSource.transaction<T>(fn);
   }
   createQueryBuilder<T>(entity: ClassInfo, alias: string): SelectQueryBuilder<T> {
     const qb = new SelectQueryBuilder<T>(this.executor);

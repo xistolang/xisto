@@ -67,8 +67,10 @@ async function dialect(name: string): Promise<void> {
   console.log("count " + String(await repo.count({ where: { ativo: true } })));
 
   await repo.update({ id: 7 }, { nome: "Bia", limite: 3.5 });
+  await repo.update({ id: 7 }, { nascimento: () => "SYSDATE", nome: "Bia" });
   await repo.delete({ id: 7 });
   await repo.insert({ id: 8, nome: "Caio", limite: 0, ativo: false });
+  await repo.insert({ id: 9, nascimento: () => "CURRENT_DATE", nome: "Dani", ativo: true });
 
   const qb = repo.createQueryBuilder("b")
     .select(["b.nome", "b.id"])

@@ -218,6 +218,8 @@ if sh tests/subpaths/run.sh > "$OUT/subpaths.txt" 2>&1; then pass=$((pass+1)); c
 if sh tests/redis/run.sh > "$OUT/redis.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/redis.txt"; else echo "FAIL redis:"; cat "$OUT/redis.txt"; fail=$((fail+1)); fi
 # jose package: RS256 tokens byte for byte as Node's jose, claim errors, a generated key checked by OpenSSL
 if sh tests/jose/run.sh > "$OUT/jose.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/jose.txt"; else echo "FAIL jose:"; cat "$OUT/jose.txt"; fail=$((fail+1)); fi
+# mongoose + @nestjs/mongoose without a driver (stage 1): as Node's mongoose 8 for what needs no server
+if sh tests/mongoose/run.sh > "$OUT/mongoose.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/mongoose.txt"; else echo "FAIL mongoose:"; cat "$OUT/mongoose.txt"; fail=$((fail+1)); fi
 # ioredis package against a live server (skipped without one)
 if sh tests/ioredis/run.sh > "$OUT/ioredis.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/ioredis.txt"; else echo "FAIL ioredis:"; cat "$OUT/ioredis.txt"; fail=$((fail+1)); fi
 # exceljs package: streaming XLSX (ZIP + deflate), checked as XML, by LibreOffice when installed, constant memory

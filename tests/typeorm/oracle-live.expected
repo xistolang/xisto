@@ -14,6 +14,7 @@ after tx kept,bread,cheese
 transaction rolled back: abort
 3 is cheese
 transaction returned 7
+manager brie 1
 deleted 2, left 1
 error: ORA-00942: table or view "XISTO"."XISTO_TO_NO_SUCH_TABLE" does not exist
 error fields QueryFailedError ORA-00942 942 14
