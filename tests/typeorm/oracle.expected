@@ -3,6 +3,7 @@ count 4
 affected 2
 direct 2
 rows 10=Ouro 11=Prata
+driver.oracle BIND_OUT 3003 STRING given true NUMBER given true
 c0 execute SELECT "Plano"."CD_PLANO" AS "CD_PLANO", "Plano"."DS_PLANO" AS "DS_PLANO" FROM "TB_PLANO" "Plano" OFFSET 0 ROWS FETCH NEXT 2 ROWS ONLY [0] autocommit
 c0 close
 c1 execute SELECT COUNT(*) AS "cnt" FROM "TB_PLANO" "Plano" [0] autocommit
