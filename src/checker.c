@@ -1442,6 +1442,92 @@ static bool late_inline_class(Class *c) {
 static bool fake_target(Class *t, Expr *lit);
 static void fake_object(Expr *e, Class *t);
 static bool objlit_has_spread(Expr *e);
+
+/* ---- views of an open class: interface AuditableRequest { __audit?: T; user?: U; ip?: string } read through
+   ctx.switchToHttp().getRequest<AuditableRequest>() or a @Req() parameter is the request itself (Express's Request,
+   whose undeclared properties live in its __expando): the same object, its known fields read directly, the others by
+   name, as `Request & { x?: T }` is. Found before any type is resolved, so every use of the interface is the class. ---- */
+static Class *view_candidate(Type *t, Module *m) {
+    if (!t || t->kind != TY_OBJECT || !t->cls || t->ntargs) return NULL;
+    Class *w = t->cls;
+    if (!w->name) return NULL;
+    if (strncmp(w->name, "__Obj_", 6) != 0) {
+        Module *was = cur_mod;
+        enter_module(m);
+        Class *k = find_class(w->name);
+        if (was) enter_module(was);
+        w = k;
+    }
+    if (!w || !w->is_interface || w->nmethods || w->iface_methods || w->ntparams || w->niface_bases || w->mixin) return NULL;
+    return w;
+}
+static void view_mark(Class *w, const char *target, Module *m) {
+    if (!w || w->view_of) return;
+    Module *was = cur_mod;
+    enter_module(m);
+    Class *r = find_class(target);
+    if (was) enter_module(was);
+    if (!r || r->is_interface || r->builtin) /* (Request not named in that module: Express's, which getRequest gives) */
+        for (int i = 0; i < prog->nclasses && (!r || r->is_interface || r->builtin); i++) {
+            Class *k = prog->classes[i];
+            if (k->name && !strcmp(k->name, target) && k->mod && k->mod->path && strstr(k->mod->path, "express")) r = k;
+        }
+    if (!r || r->is_interface || r->builtin) return;
+    bool open = find_field(r, "__expando", NULL) != NULL;
+    bool extra = false; /* (a property the class does not declare: kept on the object, so the view must be the object) */
+    for (int i = 0; i < w->nfields; i++) {
+        Field *rf = find_field(r, w->fields[i].name, NULL);
+        if (!rf && !(open && w->fields[i].optional)) return; /* (a field the class has not, in a class that is not open) */
+        if (!rf) extra = true;
+    }
+    if (!extra) return; /* ({ user?: JwtPayload }: its fields read from the object, typed as the view says: xs_as of a shape) */
+    w->view_of = r;
+}
+static void view_scan_stmt(Stmt *s, Module *m);
+static void view_scan_expr(Expr *e, Module *m) {
+    if (!e) return;
+    if (e->kind == E_MEMBER && e->is_call && e->str && e->ntargs == 1 && (!strcmp(e->str, "getRequest") || !strcmp(e->str, "getResponse")))
+        view_mark(view_candidate(e->targs[0], m), !strcmp(e->str, "getRequest") ? "Request" : "Response", m);
+    view_scan_expr(e->lhs, m);
+    view_scan_expr(e->rhs, m);
+    for (int i = 0; i < e->args.len; i++) view_scan_expr(e->args.items[i], m);
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) {
+        Func *f = e->arrow->fn;
+        if (f->body) view_scan_stmt(f->body, m);
+    }
+}
+static void view_scan_stmt(Stmt *s, Module *m) {
+    if (!s) return;
+    view_scan_expr(s->init, m);
+    view_scan_expr(s->expr, m);
+    view_scan_expr(s->cond, m);
+    view_scan_expr(s->for_update, m);
+    view_scan_stmt(s->for_init, m);
+    view_scan_stmt(s->body, m);
+    view_scan_stmt(s->else_body, m);
+    for (int i = 0; i < s->stmts.len; i++) view_scan_stmt(s->stmts.items[i], m);
+    for (int i = 0; i < s->ncases; i++) { view_scan_expr(s->cases[i].value, m); view_scan_stmt(s->cases[i].body, m); }
+}
+static void view_scan_func(Func *f, Module *m) {
+    if (!f) return;
+    for (int i = 0; i < f->nparams; i++)
+        for (int d = 0; d < f->params[i].decos.len; d++) {
+            const char *dn = f->params[i].decos.items[d].name;
+            if (dn && (!strcmp(dn, "Req") || !strcmp(dn, "Request"))) view_mark(view_candidate(f->params[i].type, m), "Request", m);
+            if (dn && (!strcmp(dn, "Res") || !strcmp(dn, "Response"))) view_mark(view_candidate(f->params[i].type, m), "Response", m);
+        }
+    if (f->body) view_scan_stmt(f->body, m);
+}
+static void find_views(Program *p) {
+    for (int i = 0; i < p->nfuncs; i++) if (p->funcs[i]->mod && !p->funcs[i]->mod->builtin) view_scan_func(p->funcs[i], p->funcs[i]->mod);
+    for (int i = 0; i < p->nclasses; i++) {
+        Class *c = p->classes[i];
+        if (!c->mod || c->mod->builtin) continue;
+        for (int k = 0; k < c->nmethods; k++) view_scan_func(c->methods[k], c->mod);
+        view_scan_func(c->ctor, c->mod);
+    }
+    for (int i = 0; i < p->top.len; i++) view_scan_stmt(p->top.items[i], p->top.items[i]->mod);
+}
 static Type *resolve(Type *t, Pos pos) {
     if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__ret_of:", 9) == 0) { /* (generated reflection) */
         const char *dot = strchr(t->tname + 9, '.');
@@ -1696,6 +1782,7 @@ static Type *resolve(Type *t, Pos pos) {
             int xi;
             if (src && !src->is_interface && !src->builtin && find_field(src, "__expando", &xi)) { *t = *ty_object_of(src); return t; }
         }
+        if (t->cls->view_of) { *t = *ty_object_of(t->cls->view_of); return t; } /* (a view of an open class: the class) */
         if (t->cls->cname) return t;
         if (t->cls->name && strncmp(t->cls->name, "__Obj_", 6) == 0 && t->cls->mod && late_inline_class(t->cls)) return t;
         {
@@ -1707,6 +1794,7 @@ static Type *resolve(Type *t, Pos pos) {
                 if (missing_name(t->cls->name)) xs_error_quiet();
                 xs_error(XS9033, t->cls->pos.line ? t->cls->pos : pos, xs_help_suggest(t->cls->name, cands, n, "declare the class above, or use number, int, boolean, string or T[]"), "unknown type '%s'", t->cls->name);
             }
+            if (c && c->view_of) { *t = *ty_object_of(c->view_of); return t; } /* (a view of an open class: the class) */
             if (c->alias && c->ntparams) { /* type Item<T> = A<T> | B<T>: the alias with these arguments, resolved per use */
                 Type **ta = xs_alloc(sizeof(Type *) * (size_t)c->ntparams);
                 int n = 0;
@@ -2955,6 +3043,10 @@ static Expr *fresh_path(Expr *x) {
     return NULL;
 }
 static void expect_type(Expr *e, Type *want, const char *what) {
+    if (e->type && e->type->kind == TY_NULLABLE && e->type->elem->kind == TY_INT && want->kind == TY_NULLABLE && want->elem->kind == TY_NUMBER) {
+        wrap_call(e, "xs_num_of_int_or_null", want); /* status: res.statusCode ?? null (int | null) where number | null goes */
+        return;
+    }
     bool widen_ret = want->kind == TY_FUNC && e->type->kind == TY_FUNC && want->nparams == e->type->nparams && !want->rest && !e->type->rest &&
         want->ret && want->ret->kind == TY_UNKNOWN && !ty_is_any(want->ret) && e->type->ret && e->type->ret->kind != TY_UNKNOWN &&
         e->type->ret->kind != TY_VOID && want->async_ret == e->type->async_ret && e->kind != E_ARROW;
@@ -5107,6 +5199,8 @@ static Expr *pure_copy(Expr *x) {
     case E_MEMBER:
         if (x->is_call) return NULL;
         return (c->lhs = pure_copy(x->lhs)) ? c : NULL;
+    case E_AS: /* (x as any: the same value) */
+        return x->lhs && (c->lhs = pure_copy(x->lhs)) ? c : NULL;
     case E_UNARY:
         if (x->lhs && !(c->lhs = pure_copy(x->lhs))) return NULL;
         if (x->rhs && !(c->rhs = pure_copy(x->rhs))) return NULL;
@@ -5599,6 +5693,87 @@ static bool overload_typed(Expr *e, Func *f, ExprList *written) {
     expr_list_push(&e->args, inner);
     check_expr(e, NULL);
     return true;
+}
+/* the shape reads of a cast (see the cases inside); true when e became one */
+static bool shape_probe(Expr *e, Expr *v, Type *want) {
+    { /* (e as { cause?: unknown } | null)?.cause with e an Error: the shape read from the object by name (undefined where
+         it has no such field); (s as { valueOf(): string }).valueOf() with s a string: the string itself (null: TypeError
+         where JavaScript's call on null throws one) */
+        Type *vb = ty_strip_null(v->type), *wb = ty_strip_null(want);
+        bool verr = vb->kind == TY_OBJECT && (is_error_class(vb->cls) || (vb->cls->builtin && !strcmp(vb->cls->name, "Error")));
+        bool vunk = v->type->kind == TY_UNKNOWN && !ty_is_any(v->type) && tsc_checked();
+        if (vunk && wb->kind == TY_OBJECT && (wb->cls->is_interface || made_shape(wb->cls)) && wb->cls->nfields > 0) {
+            /* request as unknown as { user?: JwtPayload } (getRequest<T>()): a view of fields that are all optional, read
+               from the object by name (undefined where it has none), each as the view types it */
+            bool allopt = true;
+            for (int k = 0; k < wb->cls->nfields && allopt; k++) allopt = wb->cls->fields[k].optional;
+            if (allopt) verr = true;
+        }
+        if (ty_is_any(v->type) && tsc_checked() && wb->kind == TY_OBJECT && (wb->cls->is_interface || made_shape(wb->cls)) &&
+            wb->cls->nfields > 0 && !wb->cls->nmethods && !wb->cls->iface_methods && !pure_copy(v)) {
+            /* (a computed any, f().user: held once) ((__vp: any) => __vp as T)(f().user) */
+            static int nvp;
+            Pos pos = e->pos;
+            const char *pn = xs_sprintf("__vp%d", nvp++);
+            Func *f = xs_alloc(sizeof *f); f->pos = pos; f->name = "arrow"; f->ret = want;
+            f->params = xs_alloc(sizeof(Param)); memset(f->params, 0, sizeof(Param)); f->params[0].name = (char *)pn; f->params[0].type = v->type; f->nparams = 1;
+            Expr *as = xs_alloc(sizeof *as); as->kind = E_AS; as->pos = pos; as->field = -1; as->lhs = ad_ident(pos, pn); as->elem_type = want;
+            Stmt *r = xs_alloc(sizeof *r); r->kind = S_RETURN; r->pos = pos; r->expr = as;
+            f->body = ad_block(pos, r);
+            Arrow *a = xs_alloc(sizeof *a); a->pos = pos; a->fn = f; a->expr_body = true;
+            Expr *ae = xs_alloc(sizeof *ae); ae->kind = E_ARROW; ae->pos = pos; ae->field = -1; ae->arrow = a;
+            Expr *in = xs_alloc(sizeof *in); *in = *v; in->prechecked = true;
+            memset(e, 0, sizeof *e);
+            e->kind = E_CALL; e->pos = pos; e->field = -1; e->lhs = ae;
+            expr_list_push(&e->args, in);
+            check_expr(e, want);
+            return true;
+        }
+        if (ty_is_any(v->type) && tsc_checked() && wb->kind == TY_OBJECT && (wb->cls->is_interface || made_shape(wb->cls)) &&
+            wb->cls->nfields > 0 && !wb->cls->nmethods && !wb->cls->iface_methods && pure_copy(v)) {
+            /* req.user (an any: what a guard put there) as JwtPayload: an interface of data read from the object by name */
+            vunk = true;
+            verr = true;
+        }
+        if (verr && wb->kind == TY_OBJECT && (made_shape(wb->cls) || (vunk && wb->cls->is_interface)) && wb->cls->nmethods == 0 && !wb->cls->iface_methods && rereadable(v)) {
+            Pos pos = e->pos;
+            Expr *lit = xs_alloc(sizeof *lit);
+            lit->kind = E_OBJLIT; lit->pos = pos; lit->field = -1;
+            lit->keys = xs_alloc(sizeof(char *) * (size_t)(wb->cls->nfields + 1));
+            for (int k = 0; k < wb->cls->nfields; k++) {
+                Expr *anyv = xs_alloc(sizeof *anyv);
+                anyv->kind = E_AS; anyv->pos = pos; anyv->field = -1; anyv->lhs = pure_copy(v); anyv->elem_type = ty_any;
+                if (v->type->kind == TY_NULLABLE) { Expr *nn = xs_alloc(sizeof *nn); nn->kind = E_AS; nn->op = TK_NOT; nn->pos = pos; nn->field = -1; nn->lhs = anyv->lhs; anyv->lhs = nn; }
+                Expr *rd = xs_alloc(sizeof *rd);
+                rd->kind = E_MEMBER; rd->pos = pos; rd->field = -1; rd->lhs = anyv; rd->str = wb->cls->fields[k].name;
+                if (v->type->kind == TY_UNKNOWN || ty_is_any(v->type)) rd->op = TK_QDOT; /* (an unknown may be null: each field undefined then) */
+                Expr *cv = xs_alloc(sizeof *cv);
+                cv->kind = E_AS; cv->pos = pos; cv->field = -1; cv->lhs = rd; cv->elem_type = wb->cls->fields[k].type;
+                lit->keys[lit->args.len] = wb->cls->fields[k].name;
+                expr_list_push(&lit->args, cv);
+            }
+            Expr *res = lit;
+            if (v->type->kind == TY_NULLABLE || (ty_is_any(v->type) && want->kind == TY_NULLABLE)) { /* (an any may be null: null then) */
+                Expr *z = xs_alloc(sizeof *z); z->kind = E_NULL; z->pos = pos; z->field = -1;
+                Expr *t = xs_alloc(sizeof *t); t->kind = E_BINARY; t->op = TK_EQ; t->pos = pos; t->field = -1; t->lhs = pure_copy(v); t->rhs = z;
+                Expr *z2 = xs_alloc(sizeof *z2); z2->kind = E_NULL; z2->pos = pos; z2->field = -1;
+                Expr *c = xs_alloc(sizeof *c); c->kind = E_COND; c->pos = pos; c->field = -1; c->lhs = t;
+                expr_list_push(&c->args, z2);
+                expr_list_push(&c->args, lit);
+                res = c;
+            }
+            *e = *res;
+            check_expr(e, want->kind == TY_NULLABLE ? want : wb);
+            return true;
+        }
+        if ((vb->kind == TY_STRING || is_numeric(vb) || vb->kind == TY_BOOLEAN) && wb->kind == TY_OBJECT && wb->cls->iface_methods &&
+            wb->cls->nfields == 0) {
+            *e = *v;
+            if (e->type->kind == TY_NULLABLE) nonnull_checked(e, "the value of 'as'");
+            return true;
+        }
+    }
+    return false;
 }
 static bool cond_prim(Type *t) { return t->kind == TY_STRING || t->kind == TY_NUMBER || t->kind == TY_INT || t->kind == TY_BOOLEAN; }
 static void check_expr_in(Expr *e, Type *expected) {
@@ -6363,6 +6538,20 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         Expr *target = e->lhs;
         bool dyn_target = false;
+        if (target->kind == E_INDEX && target->lhs && target->rhs && rereadable(target->lhs) &&
+            (target->rhs->kind == E_STRING || (target->rhs->kind == E_IDENT && const_string_of(target->rhs->str)))) {
+            /* req[AUDIT_CONTEXT_KEY] = v with a key known when compiling: the property of that name (an open class's
+               __expando below when the class has no such field) */
+            Expr *probe = pure_copy(target->lhs);
+            if (probe) {
+                check_expr(probe, NULL);
+                Type *pt = probe->type;
+                if (pt && pt->kind == TY_OBJECT && !pt->cls->builtin && find_field(pt->cls, "__expando", NULL)) {
+                    const char *k = target->rhs->kind == E_STRING ? target->rhs->str : const_string_of(target->rhs->str);
+                    target->kind = E_MEMBER; target->str = (char *)k; target->rhs = NULL; target->is_call = false; target->field = -1;
+                }
+            }
+        }
         if (target->kind == E_MEMBER && !target->is_call && target->str && target->lhs && rereadable(target->lhs) &&
             !(target->lhs->kind == E_IDENT && !lookup(target->lhs->str))) {
             /* request.terminal = t on an open class (a field __expando: Express's Request): the property goes there */
@@ -8877,6 +9066,13 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (want->kind == TY_NULLABLE) e->type = want;
             return;
         }
+        if (want->kind == TY_NULLABLE && is_numeric(want->elem) && is_numeric(v->type)) { /* n as number | null with n an int */
+            *e = *v;
+            if (e->type->kind == TY_INT && want->elem->kind == TY_NUMBER) wrap_call(e, "xs_to_number", ty_number);
+            e->type = want;
+            return;
+        }
+        if (v->type->kind == TY_UNKNOWN && shape_probe(e, v, want)) return;
         if (v->type->kind == TY_UNKNOWN) { /* checked at run time: the emitter compares the object's type */
             if (!unknown_target(want)) xs_error(XS2010, e->pos, NULL, "cannot check %s at run time", ty_name(want));
             Type *wi = want->kind == TY_NULLABLE ? want->elem : want;
@@ -8975,48 +9171,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
-        { /* (e as { cause?: unknown } | null)?.cause with e an Error: the shape read from the object by name (undefined where
-             it has no such field); (s as { valueOf(): string }).valueOf() with s a string: the string itself (null: TypeError
-             where JavaScript's call on null throws one) */
-            Type *vb = ty_strip_null(v->type), *wb = ty_strip_null(want);
-            bool verr = vb->kind == TY_OBJECT && (is_error_class(vb->cls) || (vb->cls->builtin && !strcmp(vb->cls->name, "Error")));
-            if (verr && wb->kind == TY_OBJECT && made_shape(wb->cls) && wb->cls->nmethods == 0 && !wb->cls->iface_methods && rereadable(v)) {
-                Pos pos = e->pos;
-                Expr *lit = xs_alloc(sizeof *lit);
-                lit->kind = E_OBJLIT; lit->pos = pos; lit->field = -1;
-                lit->keys = xs_alloc(sizeof(char *) * (size_t)(wb->cls->nfields + 1));
-                for (int k = 0; k < wb->cls->nfields; k++) {
-                    Expr *anyv = xs_alloc(sizeof *anyv);
-                    anyv->kind = E_AS; anyv->pos = pos; anyv->field = -1; anyv->lhs = pure_copy(v); anyv->elem_type = ty_any;
-                    if (v->type->kind == TY_NULLABLE) { Expr *nn = xs_alloc(sizeof *nn); nn->kind = E_AS; nn->op = TK_NOT; nn->pos = pos; nn->field = -1; nn->lhs = anyv->lhs; anyv->lhs = nn; }
-                    Expr *rd = xs_alloc(sizeof *rd);
-                    rd->kind = E_MEMBER; rd->pos = pos; rd->field = -1; rd->lhs = anyv; rd->str = wb->cls->fields[k].name;
-                    Expr *cv = xs_alloc(sizeof *cv);
-                    cv->kind = E_AS; cv->pos = pos; cv->field = -1; cv->lhs = rd; cv->elem_type = wb->cls->fields[k].type;
-                    lit->keys[lit->args.len] = wb->cls->fields[k].name;
-                    expr_list_push(&lit->args, cv);
-                }
-                Expr *res = lit;
-                if (v->type->kind == TY_NULLABLE) {
-                    Expr *z = xs_alloc(sizeof *z); z->kind = E_NULL; z->pos = pos; z->field = -1;
-                    Expr *t = xs_alloc(sizeof *t); t->kind = E_BINARY; t->op = TK_EQ; t->pos = pos; t->field = -1; t->lhs = pure_copy(v); t->rhs = z;
-                    Expr *z2 = xs_alloc(sizeof *z2); z2->kind = E_NULL; z2->pos = pos; z2->field = -1;
-                    Expr *c = xs_alloc(sizeof *c); c->kind = E_COND; c->pos = pos; c->field = -1; c->lhs = t;
-                    expr_list_push(&c->args, z2);
-                    expr_list_push(&c->args, lit);
-                    res = c;
-                }
-                *e = *res;
-                check_expr(e, want->kind == TY_NULLABLE ? want : wb);
-                return;
-            }
-            if ((vb->kind == TY_STRING || is_numeric(vb) || vb->kind == TY_BOOLEAN) && wb->kind == TY_OBJECT && wb->cls->iface_methods &&
-                wb->cls->nfields == 0) {
-                *e = *v;
-                if (e->type->kind == TY_NULLABLE) nonnull_checked(e, "the value of 'as'");
-                return;
-            }
-        }
+        if (shape_probe(e, v, want)) return;
         if (want->kind == TY_PROMISE && v->type->kind != TY_PROMISE && pr_is_call(v)) {
             /* f() as Promise<X> with f async (its value here, awaited where it goes): the value as X */
             Expr *in = xs_alloc(sizeof *in);
@@ -13283,6 +13438,7 @@ void check_program(Program *p) {
             if (b && b->iface_methods && !b->is_interface) { c->base_name = c->implements[k]; c->base_pos = c->pos; break; }
         }
     }
+    find_views(p);
     /* inheritance: bases first, so a class sees its base's fields (and later its methods) */
     for (int i = 0; i < p->nclasses; i++) {
         Class *c = p->classes[i];

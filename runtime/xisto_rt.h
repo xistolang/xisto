@@ -2619,6 +2619,7 @@ static void *xs_box_int(int64_t v) { xs_box_i *b = xs_obj_alloc(sizeof *b, xs_bo
 static void *xs_box_num(double v) { xs_box_d *b = xs_obj_alloc(sizeof *b, xs_box_num_free, xs_box_num_print); b->v = v; return b; }
 static void *xs_box_bool(bool v) { xs_box_i *b = xs_obj_alloc(sizeof *b, xs_box_bool_free, xs_box_bool_print); b->v = v; return b; }
 static void *xs_box_int_or_null(int64_t v) { return v == XS_NULL_INT ? NULL : xs_box_int(v); }
+static inline double xs_num_of_int_or_null(int64_t v) { return v == XS_NULL_INT ? xs_null_num() : (double)v; }
 static void *xs_box_num_or_null(double v) { return xs_isnull_num(v) ? NULL : xs_box_num(v); }
 static void *xs_box_bool_or_null(int8_t v) { return v == XS_NULL_BOOL ? NULL : xs_box_bool(v != 0); }
 /* Set<unknown>: JavaScript's SameValueZero as a string key: strings and numbers by value (an int and a number of one
