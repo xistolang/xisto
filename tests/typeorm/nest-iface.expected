@@ -1,3 +1,4 @@
 r1 ok=1 msg=A1 2026-01-01 plan 1 dry true count=1
 r2 ok=2 msg=- count=2
 adm B2 2026-02-01 plan 9 dry false purge threw
+status 1 m5
