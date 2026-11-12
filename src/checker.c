@@ -809,6 +809,42 @@ static Expr *thunk_of(Expr *x) {
     e->arrow = a;
     return e;
 }
+/* a thenable: an object of a class with a then() that takes no argument it must be given (mongoose's Query, which
+   runs when awaited). `await q` and an element q of Promise.all([...]) are q.then() */
+static Func *find_method(Class *c, const char *name);
+static bool thenable(Type *t) {
+    if (!t || t->kind != TY_OBJECT || !t->cls || t->cls->builtin || t->cls->is_interface) return false;
+    for (Class *c = t->cls; c; c = c->base) {
+        Func *f = find_method(c, "then");
+        if (!f) continue;
+        for (int i = 0; i < f->nparams; i++) if (!f->params[i].dflt && !f->params[i].rest) return false;
+        return true;
+    }
+    return false;
+}
+/* e (checked) becomes e.<m>(), to be checked */
+static void method_call0(Expr *e, const char *m) {
+    Expr *in = xs_alloc(sizeof *in);
+    *in = *e;
+    in->prechecked = true;
+    memset(e, 0, sizeof *e);
+    e->kind = E_MEMBER; e->pos = in->pos; e->field = -1; e->lhs = in; e->str = (char *)m; e->is_call = true;
+}
+static void then_call(Expr *e) { method_call0(e, "then"); }
+/* String(x) and `${x}` of an object whose class has toString(): string (bson's ObjectId): x.toString() */
+static bool tostring_call(Expr *e) {
+    Type *t = e->type;
+    if (!t || t->kind != TY_OBJECT || !t->cls || t->cls->builtin || t->cls->is_interface) return false;
+    for (Class *c = t->cls; c; c = c->base) {
+        Func *f = find_method(c, "toString");
+        if (!f) continue;
+        if (f->nparams > 0 && !f->params[0].dflt) return false;
+        method_call0(e, "toString");
+        check_expr(e, NULL);
+        return e->type && e->type->kind == TY_STRING;
+    }
+    return false;
+}
 /* Promise.all([a(), b()]) / Promise.all(xs.map(f)) / Promise.race(...) / Promise.resolve(v). async is syntax in
    xisto (Promise<T> is T), so a call has its value when it returns; here the elements become tasks that run
    concurrently on the event loop (runtime/xisto_net.h, xs_par_run): their I/O waits overlap. */
@@ -866,6 +902,16 @@ static void check_promise(Expr *e, Type *expected) {
         for (int i = 0; i < a->args.len; i++) {
             Expr *th = thunk_of(a->args.items[i]);
             check_expr(th, NULL);
+            if (thenable(th->arrow->fn->ret)) { /* Promise.all([model.find(f).lean(), ...]): each query run */
+                Stmt *r = th->arrow->fn->body->stmts.items[th->arrow->fn->body->stmts.len - 1];
+                then_call(r->expr);
+                Func *sf = cur_func;
+                cur_func = th->arrow->fn;
+                check_expr(r->expr, NULL);
+                cur_func = sf;
+                th->arrow->fn->ret = r->expr->type;
+                th->type->ret = r->expr->type;
+            }
             if (th->arrow->fn->ret->kind == TY_PROMISE) { /* a promise kept (XB-106): the task waits for it */
                 Stmt *r = th->arrow->fn->body->stmts.items[th->arrow->fn->body->stmts.len - 1];
                 pr_await(r->expr);
@@ -977,7 +1023,11 @@ static Type *subst(Type *t, Class *tmpl, Type **args) {
     case TY_NULLABLE: return ty_nullable_of(subst(t->elem, tmpl, args));
     case TY_SET: return ty_set_of(subst(t->elem, tmpl, args));
     case TY_PROMISE: return ty_promise_of(subst(t->elem, tmpl, args));
-    case TY_MAP: return ty_map_of(subst(t->key, tmpl, args), subst(t->elem, tmpl, args));
+    case TY_MAP: { /* (type F<T> = Record<string, unknown>: still a Record) */
+        Type *m = ty_map_of(subst(t->key, tmpl, args), subst(t->elem, tmpl, args));
+        if (t->record && !m->record) { Type *r = xs_alloc(sizeof *r); *r = *m; r->record = true; m = r; }
+        return m;
+    }
     case TY_FUNC: {
         Type **ps = xs_alloc(sizeof(Type *) * (size_t)(t->nparams ? t->nparams : 1));
         for (int i = 0; i < t->nparams; i++) ps[i] = subst(t->params[i], tmpl, args);
@@ -4910,6 +4960,11 @@ static void check_expr_in(Expr *e, Type *expected) {
         Expr *was = pr_awaited;
         pr_awaited = e->lhs;
         check_expr(e->lhs, expected);
+        if (thenable(e->lhs->type)) { /* await q of a thenable (mongoose's Query): await q.then() */
+            then_call(e->lhs);
+            pr_awaited = e->lhs;
+            check_expr(e->lhs, expected);
+        }
         pr_awaited = was;
         if (e->lhs->type->kind == TY_PROMISE) pr_await(e->lhs); /* a promise kept: its value */
         else if (e->lhs->type->kind == TY_NULLABLE && e->lhs->type->elem->kind == TY_PROMISE) { /* await of a Promise<T> | null: null gives null */
@@ -6051,6 +6106,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     e->builtin.cfn = "xs_dyn_str"; xs_any_used = true;
                 }
                 else if (a->type->kind == TY_OBJECT && a->type->cls->builtin && strcmp(a->type->cls->name, "symbol") == 0) e->builtin.cfn = "xs_Symbol_to_string";
+                else if (tostring_call(a)) { *e = *a; return; }
                 else xs_error(XS7040, a->pos, NULL, "String() converts int, number or boolean, but this is %s", ty_name(a->type));
                 e->type = ty_string;
                 return;
@@ -8315,6 +8371,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     continue;
                 }
             }
+            if (k == TY_OBJECT && tostring_call(part)) continue;
             if (k != TY_STRING && k != TY_INT && k != TY_NUMBER && k != TY_BOOLEAN && k != TY_ENUM)
                 xs_error(XS8098, part->pos, "template literals take strings, numbers, ints, booleans and enums; call a method that returns a string for the rest", "cannot put a %s inside a template literal", ty_name(part->type));
         }
