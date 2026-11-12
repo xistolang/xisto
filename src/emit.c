@@ -8675,9 +8675,15 @@ static void emit_own_field_inits(Class *c) {
         if (i < c->nbase_fields && fd->owner != c) continue; /* (an interface's field the class gives a value: its own) */
         used_ar = false;
         nl();
-        buf_printf(out, "self->%s = ", fd->cname);
-        emit_owned(fd->init);
-        buf_puts(out, ";");
+        if (i < c->nbase_fields && cref(fd->type) && c->base && !c->base->iface_base) { /* (a field the base's constructor set: replaced) */
+            buf_printf(out, "xs_assign(self->%s, ", fd->cname);
+            emit_owned(fd->init);
+            buf_puts(out, ");");
+        } else {
+            buf_printf(out, "self->%s = ", fd->cname);
+            emit_owned(fd->init);
+            buf_puts(out, ";");
+        }
         drain_if_needed();
     }
 }

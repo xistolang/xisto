@@ -2715,6 +2715,21 @@ static bool tsc_checked(void);
 static bool iface_adapt(Expr *e, Type *want, const char *what);
 static bool iface_runtime(Class *ifc, Pos pos);
 static Expr *ad_ident(Pos pos, const char *name);
+static Binding *lookup(const char *name);
+/* the text of a top-level `const NAME = 'text'` (as const) this module sees, when name is one and no local hides it */
+static const char *const_string_of(const char *name) {
+    Binding *b = lookup(name);
+    if (b && !b->is_const) return NULL;
+    for (int i = 0; i < prog->top.len; i++) {
+        Stmt *st = prog->top.items[i];
+        if (st->kind != S_VAR || !st->is_const || !st->name || strcmp(st->name, name) != 0 || !st->init) continue;
+        if (st->mod != cur_mod && !st->exported) continue;
+        Expr *x = st->init;
+        while (x->kind == E_AS && x->lhs) x = x->lhs;
+        if (x->kind == E_STRING) return x->str;
+    }
+    return NULL;
+}
 static bool objlit_has_spread(Expr *o) { for (int i = 0; i < o->args.len; i++) if (!strcmp(o->keys[i], "...")) return true; return false; }
 /* a fresh, unchecked copy of a path of names (f, this.f, a.b.c): read again inside an arrow, where its names are captured */
 static Expr *fresh_path(Expr *x) {
@@ -5189,7 +5204,9 @@ static void check_expr_in(Expr *e, Type *expected) {
             }
             Type *b = t->kind == TY_NULLABLE ? t->elem : t;
             const char *v = is_big(b) ? "bigint" : b->kind == TY_OBJECT && b->cls->builtin && strcmp(b->cls->name, "symbol") == 0 ? "symbol" : b->kind == TY_STRING || (b->kind == TY_ENUM && b->en->is_string) ? "string"
-                          : is_numeric(b) || b->kind == TY_ENUM ? "number" : b->kind == TY_BOOLEAN ? "boolean" : b->kind == TY_FUNC ? "function" : "object";
+                          : is_numeric(b) || b->kind == TY_ENUM ? "number" : b->kind == TY_BOOLEAN ? "boolean" : b->kind == TY_FUNC ? "function"
+                          : b->kind == TY_OBJECT && b->cls->mod && b->cls->mod->file && !strcmp(b->cls->mod->file, "xisto:reflect") && !strcmp(b->cls->name, "ClassInfo")
+                          ? "function" /* (a class as a value: JavaScript's class is a function) */ : "object";
             if (t->kind == TY_NULLABLE && b->kind != TY_OBJECT) { e->builtin.cfn = "xs_typeof_nullable"; e->str = (char *)v; e->type = ty_string; return; }
             e->kind = E_STRING;
             e->str = (char *)v;
@@ -5791,6 +5808,11 @@ static void check_expr_in(Expr *e, Type *expected) {
             target->lhs && plain_path(target->lhs) && !(target->lhs->kind == E_IDENT && !lookup(target->lhs->str))) {
             check_expr(target->lhs, NULL); /* a variable or a field path: checking it twice is harmless */
             target->lhs = rec_get_nn(target->lhs);
+            if (target->kind == E_INDEX && target->lhs->type && target->lhs->type->kind == TY_OBJECT && !target->lhs->type->cls->builtin &&
+                target->rhs->kind == E_IDENT) { /* req[AUDIT_CONTEXT_KEY] = v: the field the constant names */
+                const char *val = const_string_of(target->rhs->str);
+                if (val && find_field(target->lhs->type->cls, val, NULL)) { target->kind = E_MEMBER; target->str = (char *)val; target->rhs = NULL; }
+            }
             if (target->kind == E_INDEX && target->lhs->type && target->lhs->type->kind == TY_OBJECT && !target->lhs->type->cls->builtin &&
                 !target->lhs->type->cls->is_tuple && target->rhs->kind != E_STRING && target->rhs->kind != E_NUMBER) {
                 check_expr(target->rhs, NULL);
@@ -6461,6 +6483,18 @@ static void check_expr_in(Expr *e, Type *expected) {
             expr_list_push(&e->args, key);
             check_expr(e, expected);
             return;
+        }
+        if (ty_strip_null(e->lhs->type)->kind == TY_OBJECT && !ty_strip_null(e->lhs->type)->cls->builtin && e->rhs->kind == E_IDENT) {
+            /* req[AUDIT_CONTEXT_KEY] with const AUDIT_CONTEXT_KEY = '__audit': the field of that name */
+            const char *val = const_string_of(e->rhs->str);
+            Class *oc = ty_strip_null(e->lhs->type)->cls;
+            if (val && find_field(oc, val, NULL)) {
+                e->kind = E_MEMBER;
+                e->str = (char *)val;
+                e->rhs = NULL;
+                check_expr(e, expected);
+                return;
+            }
         }
         if (e->lhs->type->kind == TY_OBJECT && !e->lhs->type->cls->is_tuple && !e->lhs->type->cls->builtin && e != dyn_lvalue &&
             (e->rhs->kind == E_IDENT || (e->rhs->kind == E_MEMBER && !e->rhs->is_call))) {
@@ -10625,6 +10659,17 @@ static void flatten_fields(Class *c, int depth) {
                 f.init = c->fields[k].init;
                 f.pos = c->fields[k].pos;
                 f.readonly = c->fields[k].readonly; /* (the implementation's own: it assigns it) */
+                f.owner = c;
+                all[j] = f;
+                again = true;
+            }
+        if (again) continue;
+        for (int j = 0; j < inherited && c->base && c->fields[k].init; j++)
+            if (strcmp(all[j].name, c->fields[k].name) == 0) { /* protected readonly logger = new Logger(X.name) over the base's
+                logger: the same field, the subclass's value set after the base's constructor ran, as in JavaScript */
+                Field f = all[j];
+                f.init = c->fields[k].init;
+                f.pos = c->fields[k].pos;
                 f.owner = c;
                 all[j] = f;
                 again = true;
