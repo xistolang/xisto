@@ -8095,6 +8095,59 @@ static void check_expr_in(Expr *e, Type *expected) {
                         af->nparams = 1;
                         np = 1;
                     }
+                    if (np == 3 && cb->kind == E_ARROW && cb->arrow->fn->body && !cb->arrow->fn->param_decls.len) {
+                        /* xs.filter((d, i, arr) => ...): arr is the array the call runs on; the call as
+                           ((__arr) => __arr.filter((d, i) => { const arr = __arr; ... }))(xs), the array evaluated once */
+                        static int narr3;
+                        Pos pos = e->pos;
+                        const char *an = xs_sprintf("__arr3_%d", narr3++);
+                        Func *af = cb->arrow->fn;
+                        Stmt *decl = xs_alloc(sizeof *decl);
+                        decl->kind = S_VAR; decl->pos = pos; decl->name = af->params[2].name; decl->is_const = true;
+                        decl->init = ad_ident(pos, an);
+                        if (af->params[2].type) decl->decl_type = af->params[2].type;
+                        af->nparams = 2;
+                        if (cb->arrow->expr_body) { /* (the expression's return keeps its body form) */
+                            Stmt *ret = af->body->stmts.items[0];
+                            StmtList nl = {0};
+                            stmt_list_push(&nl, decl);
+                            stmt_list_push(&nl, ret);
+                            af->body->stmts = nl;
+                            cb->arrow->expr_body = false;
+                        } else {
+                            StmtList nl = {0};
+                            stmt_list_push(&nl, decl);
+                            for (int k = 0; k < af->body->stmts.len; k++) stmt_list_push(&nl, af->body->stmts.items[k]);
+                            af->body->stmts = nl;
+                        }
+                        Expr *recv = e->lhs;
+                        recv->prechecked = true;
+                        Func *f = xs_alloc(sizeof *f);
+                        f->pos = pos; f->name = "arrow";
+                        f->params = xs_alloc(sizeof(Param));
+                        memset(f->params, 0, sizeof(Param));
+                        f->params[0].name = (char *)an;
+                        f->params[0].type = recv->type;
+                        f->nparams = 1;
+                        Expr *call = xs_alloc(sizeof *call);
+                        *call = *e;
+                        call->lhs = ad_ident(pos, an);
+                        Stmt *b = xs_alloc(sizeof *b);
+                        b->kind = S_BLOCK; b->pos = pos;
+                        Stmt *r = xs_alloc(sizeof *r);
+                        r->kind = S_RETURN; r->pos = pos; r->expr = call;
+                        stmt_list_push(&b->stmts, r);
+                        f->body = b;
+                        Arrow *ar = xs_alloc(sizeof *ar);
+                        ar->pos = pos; ar->fn = f; ar->expr_body = true;
+                        Expr *are = xs_alloc(sizeof *are);
+                        are->kind = E_ARROW; are->pos = pos; are->field = -1; are->arrow = ar;
+                        memset(e, 0, sizeof *e);
+                        e->kind = E_CALL; e->pos = pos; e->field = -1; e->lhs = are;
+                        expr_list_push(&e->args, recv);
+                        check_expr(e, expected);
+                        return;
+                    }
                     if (np < 1 || np > 2) xs_error(XS8129, cb->pos, NULL, "the callback of %s takes (element) or (element, index)", m);
                     Type *cbt = CB(np, is_map ? NULL : is_each ? ty_void : ty_boolean);
                     if (is_map) {
