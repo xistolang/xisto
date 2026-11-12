@@ -8420,6 +8420,19 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
+        { /* doc as T with doc a T & Document (| null): its fields, copied (null stays null; where T alone goes, checked) */
+            Type *vb = ty_strip_null(v->type), *wb = ty_strip_null(want);
+            if (vb->kind == TY_OBJECT && vb->cls->synth && wb->kind == TY_OBJECT && !wb->cls->synth) {
+                Expr *x = xs_alloc(sizeof *x);
+                *x = *v;
+                bool vn = v->type->kind == TY_NULLABLE;
+                if (shape_copy(x, vn ? ty_nullable_of(wb) : wb)) {
+                    if (vn && want->kind != TY_NULLABLE) nonnull_checked(x, "the value of 'as'");
+                    *e = *x;
+                    return;
+                }
+            }
+        }
         xs_error(XS8090, e->pos, "xisto checks types statically: 'as' converts an object (JSON) value or restates the same type", "cannot convert %s to %s", ty_name(v->type), ty_name(want));
         return;
     }
