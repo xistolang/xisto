@@ -1575,6 +1575,30 @@ static Expr *parse_postfix(Parser *p) {
             parse_args(p, &e->args);
             continue;
         }
+        if (at(p, TK_QDOT) && e->kind == E_IDENT && p->nns && p->mod) { /* tracer?.scope with tracer a namespace: never null, ns.scope */
+            bool isns = false;
+            for (int i = 0; i < p->nns; i++) if (strcmp(p->ns_alias[i], e->str) == 0) isns = true;
+            if (isns) {
+                Parser look = *p;
+                next(&look);
+                if (at(&look, TK_IDENT)) {
+                    next(p);
+                    Token name = expect_prop_name(p, NULL);
+                    Expr *nsx = ns_member(p, e, name);
+                    if (nsx) {
+                        e = nsx;
+                        if (at(p, TK_QDOT) && peek_is(p, TK_LPAREN)) { /* ns.f?.(): an exported function is never null */
+                            next(p);
+                            Expr *c = new_expr(E_CALL, p->tok.pos);
+                            c->lhs = e;
+                            parse_args(p, &c->args);
+                            e = c;
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
         if (at(p, TK_QDOT)) {
             next(p);
             if (nopt == 32) xs_error(XS1040, pos, "split the chain in two", "too many '?.' in one chain");
@@ -3802,6 +3826,62 @@ static bool require_ahead(Parser *p) {
     next(&look);
     return at(&look, TK_STRING);
 }
+/* let tracer: any; try { tracer = require("dd-trace"); } catch { tracer = null; }  (an optional package, loaded if it is
+   there): the package is always there in a build, so this is const tracer = require("dd-trace") (import * as tracer),
+   its typed exports, not an any. Returns the token count of the pattern, 0 when it is not this */
+static bool tok_ident_is(Parser *q, const char *s) { return at(q, TK_IDENT) && q->tok.str && strcmp(q->tok.str, s) == 0; }
+static bool try_require_ahead(Parser *p, char **name, char **path) {
+    Parser q = *p;
+    if (!at(&q, TK_LET)) return false;
+    next(&q);
+    if (!at(&q, TK_IDENT)) return false;
+    char *n = q.tok.str;
+    next(&q);
+    if (!at(&q, TK_COLON)) return false;
+    next(&q);
+    if (!tok_ident_is(&q, "any")) return false;
+    next(&q);
+    if (!at(&q, TK_SEMI)) return false;
+    next(&q);
+    if (!at(&q, TK_TRY)) return false;
+    next(&q);
+    if (!at(&q, TK_LBRACE)) return false;
+    next(&q);
+    if (!tok_ident_is(&q, n)) return false;
+    next(&q);
+    if (!at(&q, TK_ASSIGN)) return false;
+    next(&q);
+    if (!tok_ident_is(&q, "require")) return false;
+    next(&q);
+    if (!at(&q, TK_LPAREN)) return false;
+    next(&q);
+    if (!at(&q, TK_STRING)) return false;
+    char *pa = q.tok.str;
+    next(&q);
+    if (!at(&q, TK_RPAREN)) return false;
+    next(&q);
+    if (at(&q, TK_SEMI)) next(&q);
+    if (!at(&q, TK_RBRACE)) return false;
+    next(&q);
+    if (!at(&q, TK_CATCH)) return false;
+    next(&q);
+    if (at(&q, TK_LPAREN)) { next(&q); if (!at(&q, TK_IDENT)) return false; next(&q); if (!at(&q, TK_RPAREN)) return false; next(&q); }
+    if (!at(&q, TK_LBRACE)) return false;
+    next(&q);
+    if (!tok_ident_is(&q, n)) return false;
+    next(&q);
+    if (!at(&q, TK_ASSIGN)) return false;
+    next(&q);
+    if (!tok_ident_is(&q, "null")) return false;
+    next(&q);
+    if (at(&q, TK_SEMI)) next(&q);
+    if (!at(&q, TK_RBRACE)) return false;
+    next(&q);
+    *name = n;
+    *path = pa;
+    *p = q;
+    return true;
+}
 static void parse_require(Parser *p, Module *m) {
     Import im = {0};
     im.pos = p->tok.pos;
@@ -4726,10 +4806,20 @@ static void parse_module(Program *prog, Module *m) {
             drain_pending(&p, &prog->top, m, true);
             continue;
         }
-        if (at(&p, TK_IMPORT) || require_ahead(&p)) { /* an import after declarations (ES hoists it): read and loaded here; names resolve in the
+        char *treq_name = NULL, *treq_path = NULL;
+        Pos treq_pos = p.tok.pos;
+        bool treq = at(&p, TK_LET) && try_require_ahead(&p, &treq_name, &treq_path);
+        if (treq || at(&p, TK_IMPORT) || require_ahead(&p)) { /* an import after declarations (ES hoists it): read and loaded here; names resolve in the
                                     checker, after the whole file, so declarations above may use them */
             int n0 = m->nimports;
-            if (at(&p, TK_IMPORT)) parse_import(&p, m); else parse_require(&p, m);
+            if (treq) {
+                Import im = {0};
+                im.pos = treq_pos;
+                im.path = treq_path;
+                ns_register(&p, m, treq_name);
+                m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+                m->imports[m->nimports++] = im;
+            } else if (at(&p, TK_IMPORT)) parse_import(&p, m); else parse_require(&p, m);
             for (int i = n0; i < m->nimports; i++) {
                 Import *im = &m->imports[i];
                 if (xs_check_mode) {

@@ -27,3 +27,16 @@ export function init(options: TracerOptions = {}): void {
 
 /** tracer.use(plugin, options): instrumentation is off; accepted. */
 export function use(plugin: string, options: unknown = null): void {}
+
+/** The active span (tracing is off in xisto: none). */
+export class Scope {
+  /** the span of the current request: null (no spans are made) */
+  active(): unknown {
+    return null;
+  }
+}
+
+/** tracer.scope(): the scope manager (its active() is always null here). */
+export function scope(): Scope {
+  return new Scope();
+}

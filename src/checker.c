@@ -2923,6 +2923,7 @@ static bool tsc_checked(void);
 static bool iface_adapt(Expr *e, Type *want, const char *what);
 static bool iface_runtime(Class *ifc, Pos pos);
 static Expr *ad_ident(Pos pos, const char *name);
+static Stmt *ad_block(Pos pos, Stmt *one);
 static Binding *lookup(const char *name);
 /* the text of a top-level `const NAME = 'text'` (as const) this module sees, when name is one and no local hides it */
 static const char *const_string_of(const char *name) {
@@ -8089,6 +8090,12 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
+        if (e->is_call && e->str && !e->args.len && !strcmp(e->str, "valueOf") &&
+            (e->lhs->type->kind == TY_STRING || is_numeric(e->lhs->type) || e->lhs->type->kind == TY_BOOLEAN)) {
+            Expr *v = e->lhs; /* s.valueOf(), n.valueOf(): the value itself */
+            *e = *v;
+            return;
+        }
         if (ty_is_any(e->lhs->type) && e->is_call && e->str && e->args.len >= 1 && e->args.items[0]->kind == E_ARROW &&
             (!strcmp(e->str, "map") || !strcmp(e->str, "filter") || !strcmp(e->str, "forEach") || !strcmp(e->str, "find") ||
              !strcmp(e->str, "some") || !strcmp(e->str, "every") || !strcmp(e->str, "findIndex") || !strcmp(e->str, "flatMap"))) {
@@ -8775,6 +8782,19 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->type = ty_array_of(et);
             return;
         }
+        if (et && tsc_checked() && (is_numeric(et) || et->kind == TY_BOOLEAN)) { /* new Array<number>(n) set by index later: 0 / false
+                                                                                    in its holes (JavaScript reads undefined there) */
+            Expr *na = xs_alloc(sizeof *na);
+            *na = *e;
+            Expr *z = et->kind == TY_BOOLEAN ? xs_alloc(sizeof *z) : num_lit(e->pos, 0, et->kind == TY_INT);
+            if (et->kind == TY_BOOLEAN) { z->kind = E_BOOL; z->pos = e->pos; z->field = -1; }
+            Expr *fill = xs_alloc(sizeof *fill);
+            fill->kind = E_MEMBER; fill->pos = e->pos; fill->field = -1; fill->is_call = true; fill->str = "fill"; fill->lhs = na;
+            expr_list_push(&fill->args, z);
+            check_expr(fill, NULL);
+            *e = *fill;
+            return;
+        }
         xs_error(XS6017, e->pos, "write: new Array<T>(n).fill(x)", "a new array must be filled before use");
         return;
     }
@@ -9050,6 +9070,48 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
+        { /* (e as { cause?: unknown } | null)?.cause with e an Error: the shape read from the object by name (undefined where
+             it has no such field); (s as { valueOf(): string }).valueOf() with s a string: the string itself (null: TypeError
+             where JavaScript's call on null throws one) */
+            Type *vb = ty_strip_null(v->type), *wb = ty_strip_null(want);
+            bool verr = vb->kind == TY_OBJECT && (is_error_class(vb->cls) || (vb->cls->builtin && !strcmp(vb->cls->name, "Error")));
+            if (verr && wb->kind == TY_OBJECT && made_shape(wb->cls) && wb->cls->nmethods == 0 && !wb->cls->iface_methods && rereadable(v)) {
+                Pos pos = e->pos;
+                Expr *lit = xs_alloc(sizeof *lit);
+                lit->kind = E_OBJLIT; lit->pos = pos; lit->field = -1;
+                lit->keys = xs_alloc(sizeof(char *) * (size_t)(wb->cls->nfields + 1));
+                for (int k = 0; k < wb->cls->nfields; k++) {
+                    Expr *anyv = xs_alloc(sizeof *anyv);
+                    anyv->kind = E_AS; anyv->pos = pos; anyv->field = -1; anyv->lhs = pure_copy(v); anyv->elem_type = ty_any;
+                    if (v->type->kind == TY_NULLABLE) { Expr *nn = xs_alloc(sizeof *nn); nn->kind = E_AS; nn->op = TK_NOT; nn->pos = pos; nn->field = -1; nn->lhs = anyv->lhs; anyv->lhs = nn; }
+                    Expr *rd = xs_alloc(sizeof *rd);
+                    rd->kind = E_MEMBER; rd->pos = pos; rd->field = -1; rd->lhs = anyv; rd->str = wb->cls->fields[k].name;
+                    Expr *cv = xs_alloc(sizeof *cv);
+                    cv->kind = E_AS; cv->pos = pos; cv->field = -1; cv->lhs = rd; cv->elem_type = wb->cls->fields[k].type;
+                    lit->keys[lit->args.len] = wb->cls->fields[k].name;
+                    expr_list_push(&lit->args, cv);
+                }
+                Expr *res = lit;
+                if (v->type->kind == TY_NULLABLE) {
+                    Expr *z = xs_alloc(sizeof *z); z->kind = E_NULL; z->pos = pos; z->field = -1;
+                    Expr *t = xs_alloc(sizeof *t); t->kind = E_BINARY; t->op = TK_EQ; t->pos = pos; t->field = -1; t->lhs = pure_copy(v); t->rhs = z;
+                    Expr *z2 = xs_alloc(sizeof *z2); z2->kind = E_NULL; z2->pos = pos; z2->field = -1;
+                    Expr *c = xs_alloc(sizeof *c); c->kind = E_COND; c->pos = pos; c->field = -1; c->lhs = t;
+                    expr_list_push(&c->args, z2);
+                    expr_list_push(&c->args, lit);
+                    res = c;
+                }
+                *e = *res;
+                check_expr(e, want->kind == TY_NULLABLE ? want : wb);
+                return;
+            }
+            if ((vb->kind == TY_STRING || is_numeric(vb) || vb->kind == TY_BOOLEAN) && wb->kind == TY_OBJECT && wb->cls->iface_methods &&
+                wb->cls->nfields == 0) {
+                *e = *v;
+                if (e->type->kind == TY_NULLABLE) nonnull_checked(e, "the value of 'as'");
+                return;
+            }
+        }
         if (want->kind == TY_PROMISE && v->type->kind != TY_PROMISE && pr_is_call(v)) {
             /* f() as Promise<X> with f async (its value here, awaited where it goes): the value as X */
             Expr *in = xs_alloc(sizeof *in);
@@ -9074,6 +9136,55 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     }
     case E_OBJLIT: {
+        if (e->keys && e->args.len >= 2 && !strcmp(e->keys[e->args.len - 1], "...")) {
+            /* { ...entity, ...Object.fromEntries(pairs) }: entity's copy, then each pair written into it by key (as
+               JavaScript's spread does: the values as they are, a Date stays a Date):
+               ((__o) => { pairs.forEach((__p) => { (__o as any)[__p[0] as string] = __p[1]; }); return __o; })({ ...entity }) */
+            Expr *last = e->args.items[e->args.len - 1];
+            Expr *fe = last->kind == E_UNARY && last->op == TK_ELLIPSIS ? last->lhs : last;
+            if (fe && fe->kind == E_MEMBER && fe->is_call && fe->str && !strcmp(fe->str, "fromEntries") && fe->args.len == 1 &&
+                fe->lhs && fe->lhs->kind == E_IDENT && !strcmp(fe->lhs->str, "Object") && !lookup("Object")) {
+                static int nfe;
+                Pos pos = e->pos;
+                const char *on = xs_sprintf("__fe_o%d", nfe), *pn = xs_sprintf("__fe_p%d", nfe);
+                nfe++;
+                Expr *pairs = fe->args.items[0];
+                e->args.len--;
+                Expr *base = xs_alloc(sizeof *base);
+                *base = *e;
+                check_expr(base, expected);
+                base->prechecked = true;
+                /* (__o as any)[__p[0] as string] = __p[1] */
+                Expr *oa = xs_alloc(sizeof *oa); oa->kind = E_AS; oa->pos = pos; oa->field = -1; oa->lhs = ad_ident(pos, on); oa->elem_type = ty_any;
+                Expr *k0 = xs_alloc(sizeof *k0); k0->kind = E_INDEX; k0->pos = pos; k0->field = -1; k0->lhs = ad_ident(pos, pn); k0->rhs = num_lit(pos, 0, true);
+                Expr *ks = xs_alloc(sizeof *ks); ks->kind = E_AS; ks->pos = pos; ks->field = -1; ks->lhs = k0; ks->elem_type = ty_string;
+                Expr *lv = xs_alloc(sizeof *lv); lv->kind = E_INDEX; lv->pos = pos; lv->field = -1; lv->lhs = oa; lv->rhs = ks;
+                Expr *v1 = xs_alloc(sizeof *v1); v1->kind = E_INDEX; v1->pos = pos; v1->field = -1; v1->lhs = ad_ident(pos, pn); v1->rhs = num_lit(pos, 1, true);
+                Expr *as = xs_alloc(sizeof *as); as->kind = E_ASSIGN; as->op = TK_ASSIGN; as->pos = pos; as->field = -1; as->lhs = lv; as->rhs = v1;
+                Stmt *st = xs_alloc(sizeof *st); st->kind = S_EXPR; st->pos = pos; st->expr = as;
+                Func *cf = xs_alloc(sizeof *cf); cf->pos = pos; cf->name = "arrow"; cf->ret = ty_void;
+                cf->params = xs_alloc(sizeof(Param)); memset(cf->params, 0, sizeof(Param)); cf->params[0].name = (char *)pn; cf->nparams = 1;
+                cf->body = ad_block(pos, st);
+                Arrow *ca = xs_alloc(sizeof *ca); ca->pos = pos; ca->fn = cf;
+                Expr *cae = xs_alloc(sizeof *cae); cae->kind = E_ARROW; cae->pos = pos; cae->field = -1; cae->arrow = ca;
+                Expr *each = xs_alloc(sizeof *each); each->kind = E_MEMBER; each->pos = pos; each->field = -1; each->lhs = pairs; each->str = "forEach"; each->is_call = true;
+                expr_list_push(&each->args, cae);
+                Stmt *s1 = xs_alloc(sizeof *s1); s1->kind = S_EXPR; s1->pos = pos; s1->expr = each;
+                Stmt *s2 = xs_alloc(sizeof *s2); s2->kind = S_RETURN; s2->pos = pos; s2->expr = ad_ident(pos, on);
+                Stmt *b = ad_block(pos, s1);
+                stmt_list_push(&b->stmts, s2);
+                Func *f = xs_alloc(sizeof *f); f->pos = pos; f->name = "arrow"; f->ret = base->type;
+                f->params = xs_alloc(sizeof(Param)); memset(f->params, 0, sizeof(Param)); f->params[0].name = (char *)on; f->params[0].type = base->type; f->nparams = 1;
+                f->body = b;
+                Arrow *a = xs_alloc(sizeof *a); a->pos = pos; a->fn = f;
+                Expr *ae = xs_alloc(sizeof *ae); ae->kind = E_ARROW; ae->pos = pos; ae->field = -1; ae->arrow = a;
+                memset(e, 0, sizeof *e);
+                e->kind = E_CALL; e->pos = pos; e->field = -1; e->lhs = ae;
+                expr_list_push(&e->args, base);
+                check_expr(e, expected);
+                return;
+            }
+        }
         if (expected && ty_strip_null(expected)->kind == TY_OBJECT && fake_target(ty_strip_null(expected)->cls, e) &&
             !ty_strip_null(expected)->cls->is_interface) { /* const handler: CallHandler = { handle: () => of(value) } */
             fake_object(e, ty_strip_null(expected)->cls);
@@ -9806,6 +9917,17 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (!elem) {
                 settle(e->args.items[0]);
                 elem = e->args.items[0]->type;
+            }
+            if (tsc_checked() && elem->kind == TY_OBJECT && e->args.len > 1) { /* [ctx.getHandler(), ctx.getClass()]: objects of
+                classes that share no base (TypeScript: a union of them), an unknown[] (each one as it is) */
+                bool fits = true;
+                for (int i = 1; i < e->args.len && fits; i++) {
+                    Type *t = ty_strip_null(e->args.items[i]->type);
+                    fits = t->kind == TY_NULL || ty_equal(t, elem) || (t->kind == TY_OBJECT && is_subclass(t->cls, elem->cls)) || shape_ok(t, elem);
+                }
+                bool objs = true;
+                for (int i = 0; i < e->args.len && objs; i++) objs = ty_is_heap(e->args.items[i]->type) || e->args.items[i]->type->kind == TY_NULL;
+                if (!fits && objs) elem = ty_unknown;
             }
             if (elem->kind != TY_NULLABLE && ty_is_heap(elem) && nullable_ok(elem)) { /* [`a=${x}`, c ? `b=${y}` : undefined]:
                                                 (string | undefined)[], as TypeScript types it (no null check on each element) */
