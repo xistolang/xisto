@@ -3750,7 +3750,102 @@ static Expr *fresh_path(Expr *x) {
     return NULL;
 }
 static bool pure_read(Expr *e);
+/* ---- ItemDaOnda<A> where ItemDaOnda<B> goes (two instances of one union of object types, told apart by a literal field):
+   a new value of the wanted member, each field converted (checked where it narrows: unknown to T), the field values themselves
+   kept (references: an object in it stays the same object) ---- */
+static Expr *mk_ident(Pos pos, const char *n) { Expr *x = xs_alloc(sizeof *x); x->kind = E_IDENT; x->pos = pos; x->field = -1; x->str = (char *)n; return x; }
+static Field *lit_disc(Type *u, const char **name) { /* a field every member has, a different literal in each */
+    Class *c0 = u->params[0]->cls;
+    for (int f = 0; f < c0->nfields; f++) {
+        const char *fn = c0->fields[f].name;
+        bool ok = true;
+        for (int i = 0; i < u->nparams && ok; i++) {
+            Field *fd = find_field(u->params[i]->cls, fn, NULL);
+            if (!fd || !fd->type || !fd->type->tname || (fd->type->kind != TY_BOOLEAN && fd->type->kind != TY_STRING)) ok = false;
+            for (int k = 0; ok && k < i; k++) {
+                Field *fk = find_field(u->params[k]->cls, fn, NULL);
+                if (!strcmp(fk->type->tname, fd->type->tname)) ok = false;
+            }
+        }
+        if (ok) { *name = fn; return &c0->fields[f]; }
+    }
+    return NULL;
+}
+static bool union_convert(Expr *e, Type *want) {
+    Type *g = e->type, *w = want;
+    if (!tsc_checked() || !g || g->kind != TY_UNION || w->kind != TY_UNION || g->nparams != w->nparams || ty_equal(g, w)) return false;
+    for (int i = 0; i < g->nparams; i++) {
+        Type *a = g->params[i], *b = w->params[i];
+        if (a->kind != TY_OBJECT || b->kind != TY_OBJECT || a->cls->builtin || b->cls->builtin || a->cls->nfields != b->cls->nfields) return false;
+        for (int f = 0; f < b->cls->nfields; f++) if (!find_field(a->cls, b->cls->fields[f].name, NULL)) return false;
+    }
+    const char *dn = NULL;
+    if (!lit_disc(g, &dn) || !lit_disc(w, &dn)) return false;
+    for (int i = 0; i < g->nparams; i++) /* (the members pair up by their literal) */
+        if (strcmp(find_field(g->params[i]->cls, dn, NULL)->type->tname, find_field(w->params[i]->cls, dn, NULL)->type->tname)) return false;
+    Pos pos = e->pos;
+    static int nuc;
+    const char *vn = xs_sprintf("__uc%d", nuc++);
+    Expr *chain = NULL;
+    for (int i = w->nparams - 1; i >= 0; i--) {
+        Class *bc = w->params[i]->cls;
+        Expr *lit = xs_alloc(sizeof *lit);
+        lit->kind = E_OBJLIT; lit->pos = pos; lit->field = -1;
+        lit->keys = xs_alloc(sizeof(char *) * (size_t)bc->nfields);
+        Type *dt = NULL;
+        for (int f = 0; f < bc->nfields; f++) {
+            Field *bf = &bc->fields[f];
+            lit->keys[f] = bf->name;
+            Expr *v;
+            if (!strcmp(bf->name, dn)) {
+                dt = bf->type;
+                v = xs_alloc(sizeof *v); v->pos = pos; v->field = -1;
+                if (dt->kind == TY_BOOLEAN) { v->kind = E_BOOL; v->boolean = !strcmp(dt->tname, "true"); }
+                else { v->kind = E_STRING; v->str = (char *)dt->tname; }
+            } else {
+                Expr *m = xs_alloc(sizeof *m); m->kind = E_MEMBER; m->pos = pos; m->field = -1; m->lhs = mk_ident(pos, vn); m->str = bf->name;
+                v = xs_alloc(sizeof *v); v->kind = E_AS; v->pos = pos; v->field = -1; v->lhs = m; v->elem_type = bf->type;
+            }
+            expr_list_push(&lit->args, v);
+        }
+        if (!chain) { chain = lit; continue; }
+        Expr *dm = xs_alloc(sizeof *dm); dm->kind = E_MEMBER; dm->pos = pos; dm->field = -1; dm->lhs = mk_ident(pos, vn); dm->str = (char *)dn;
+        Expr *test;
+        if (dt->kind == TY_BOOLEAN) {
+            if (!strcmp(dt->tname, "true")) test = dm;
+            else { test = xs_alloc(sizeof *test); test->kind = E_UNARY; test->op = TK_NOT; test->pos = pos; test->field = -1; test->lhs = dm; }
+        } else {
+            Expr *sl = xs_alloc(sizeof *sl); sl->kind = E_STRING; sl->pos = pos; sl->field = -1; sl->str = (char *)dt->tname;
+            test = xs_alloc(sizeof *test); test->kind = E_BINARY; test->op = TK_EQ; test->pos = pos; test->field = -1; test->lhs = dm; test->rhs = sl;
+        }
+        Expr *c = xs_alloc(sizeof *c); c->kind = E_COND; c->pos = pos; c->field = -1; c->lhs = test;
+        expr_list_push(&c->args, lit);
+        expr_list_push(&c->args, chain);
+        chain = c;
+    }
+    Func *f = xs_alloc(sizeof *f); f->pos = pos; f->name = "arrow"; f->ret = w;
+    f->params = xs_alloc(sizeof(Param)); memset(f->params, 0, sizeof(Param)); f->params[0].name = (char *)vn; f->params[0].type = g; f->nparams = 1;
+    Stmt *r = xs_alloc(sizeof *r); r->kind = S_RETURN; r->pos = pos; r->expr = chain;
+    Stmt *b = xs_alloc(sizeof *b); b->kind = S_BLOCK; b->pos = pos; stmt_list_push(&b->stmts, r);
+    f->body = b;
+    Arrow *a = xs_alloc(sizeof *a); a->pos = pos; a->fn = f; a->expr_body = true;
+    Expr *ae = xs_alloc(sizeof *ae); ae->kind = E_ARROW; ae->pos = pos; ae->field = -1; ae->arrow = a;
+    Expr *in = xs_alloc(sizeof *in); *in = *e; in->prechecked = true;
+    memset(e, 0, sizeof *e);
+    e->kind = E_CALL; e->pos = pos; e->field = -1; e->lhs = ae;
+    expr_list_push(&e->args, in);
+    check_expr(e, want);
+    return true;
+}
 static void expect_type(Expr *e, Type *want, const char *what) {
+    if (union_convert(e, want)) return;
+    if (tsc_checked() && e->type && e->type->kind == TY_ARRAY && want->kind == TY_ARRAY && e->type->elem->kind == TY_FUNC &&
+        want->elem->kind == TY_FUNC && !ty_equal(e->type, want) && (e->kind == E_CALL || (e->kind == E_MEMBER && e->is_call))) {
+        /* janelas.map((j) => () => ok(j)) (a new array of () => boolean) where (() => Promise<unknown>)[] goes: a new array of
+           each function adapted (the array was just made: nothing else holds it) */
+        arr_convert(e, want->elem);
+        return;
+    }
     if (e->type && e->type->kind == TY_ARRAY && ty_is_any(e->type->elem) && e->type->elem->tname && !strcmp(e->type->elem->tname, "never") &&
         ty_strip_null(want)->kind == TY_ARRAY && (e->kind == E_ARRAY_LIT || pure_read(e))) {
         /* a never[] ([] with nothing to type it: TypeScript lets nothing in) where a T[] goes: an empty T[] */
@@ -5673,6 +5768,8 @@ static bool has_tparam_in_params(Func *tmpl, const char *n) {
     return false;
 }
 /* a call of a generic function or method: T from the explicit types, the arguments, or the expected result */
+static Type **tuple_erased; /* (check_generic_call: the type arguments as given, where a tuple's T was erased) */
+static void tuple_view(Expr *e, Func *tmpl, Type **orig);
 static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char *what) {
     Type **bind = xs_alloc(sizeof(Type *) * (size_t)tmpl->ntparams);
     bool partial = false;
@@ -5780,6 +5877,22 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
         }
     for (int i = 0; i < tmpl->ntparams; i++)
         if (!bind[i]) xs_error(XS3010, e->pos, xs_sprintf("give it: %s<Type>(...)", tmpl->name), "cannot infer type parameter %s of %s", tmpl->tparams[i], what);
+    tuple_erased = NULL;
+    if (tsc_checked() && tmpl->ttuple && e->ntargs && !partial) {
+        /* emOndaSettled<[number | null, string, V]>(fns) with <T extends readonly unknown[]>: T erased inside (unknown[]: one
+           instance, closures giving unknown, results as unknown), the tuple's types kept for the call's result (tuple_view) */
+        static Type *arr_u;
+        if (!arr_u) arr_u = ty_array_of(ty_unknown);
+        for (int i = 0; i < tmpl->ntparams; i++) {
+            if (!tmpl->ttuple[i] || !bind[i]) continue;
+            Type *b = ty_strip_null(bind[i]);
+            bool tup = b->kind == TY_OBJECT && b->cls && b->cls->is_tuple, arr = b->kind == TY_ARRAY && b->elem->kind != TY_UNKNOWN;
+            if (!tup && !arr) continue;
+            if (!tuple_erased) { tuple_erased = xs_alloc(sizeof(Type *) * (size_t)tmpl->ntparams); memcpy(tuple_erased, bind, sizeof(Type *) * (size_t)tmpl->ntparams); }
+            bind[i] = arr_u;
+        }
+    }
+    Type **erased = tuple_erased; /* (kept here: a generic call inside an argument sets it again) */
     Func *inst = instantiate_func(tmpl, bind);
     for (int i = e->args.len, given = e->args.len; i < inst->nparams; i++) /* defaults, as written for this instance */
         expr_list_push(&e->args, dflt_arg(inst, i, e->args.items, given, e->pos));
@@ -5787,9 +5900,66 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
         if (i >= ndone || !done[i]) check_expr(e->args.items[i], inst->params[i].type); /* (defaults come after the given ones) */
         expect_type(e->args.items[i], inst->params[i].type, xs_sprintf("argument '%s' of %s", inst->params[i].name, what));
     }
+    tuple_erased = erased;
     return inst;
 }
 
+/* the call of a function whose tuple T was erased: its result (an unknown[], an ItemDaOnda<unknown>[]) seen as the type the
+   tuple gives (T, { [K in keyof T]: ItemDaOnda<T[K]> }): a tuple of each element converted (checked), or an array of them;
+   the elements are the same values (an object an item gave is the same object) */
+static void tuple_view(Expr *e, Func *tmpl, Type **orig) {
+    Module *dm = tmpl->cls ? tmpl->cls->mod : tmpl->mod;
+    Module *was = cur_mod;
+    Scope *ss = scope;
+    const char *sfn = xs_file_name, *ssrc = xs_source;
+    if (dm && dm != cur_mod) enter_module(dm);
+    Type *vt = resolve(subst_ftp(tmpl->ret, tmpl->tparams, orig, tmpl->ntparams), e->pos);
+    cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
+    bool as = false;
+    vt = ret_unpromise(vt, &as);
+    Type *et = e->type; /* (the erased instance's result, its value: an async call's) */
+    if (!vt || ty_equal(vt, et) || et->kind != TY_ARRAY) return;
+    Pos pos = e->pos;
+    static int ntv;
+    const char *vn = xs_sprintf("__tv%d", ntv++);
+    Expr *body;
+    if (vt->kind == TY_OBJECT && vt->cls->is_tuple) {
+        body = xs_alloc(sizeof *body); body->kind = E_ARRAY_LIT; body->pos = pos; body->field = -1;
+        for (int i = 0; i < vt->cls->nfields; i++) {
+            Expr *ix = xs_alloc(sizeof *ix); ix->kind = E_INDEX; ix->pos = pos; ix->field = -1; ix->lhs = mk_ident(pos, vn); ix->rhs = num_lit(pos, i, true);
+            Expr *v = ix;
+            if (et->elem->kind == TY_UNKNOWN) { v = xs_alloc(sizeof *v); v->kind = E_AS; v->pos = pos; v->field = -1; v->lhs = ix; v->elem_type = vt->cls->fields[i].type; }
+            expr_list_push(&body->args, v);
+        }
+    } else if (vt->kind == TY_ARRAY) {
+        /* (an array: each element as the wanted element type, in a new array) */
+        const char *en = xs_sprintf("__te%d", ntv++);
+        Expr *id = mk_ident(pos, en);
+        Expr *v = id;
+        if (et->elem->kind == TY_UNKNOWN) { v = xs_alloc(sizeof *v); v->kind = E_AS; v->pos = pos; v->field = -1; v->lhs = id; v->elem_type = vt->elem; }
+        Func *mf = xs_alloc(sizeof *mf); mf->pos = pos; mf->name = "arrow"; mf->ret = vt->elem;
+        mf->params = xs_alloc(sizeof(Param)); memset(mf->params, 0, sizeof(Param)); mf->params[0].name = (char *)en; mf->params[0].type = et->elem; mf->nparams = 1;
+        Stmt *mr = xs_alloc(sizeof *mr); mr->kind = S_RETURN; mr->pos = pos; mr->expr = v;
+        Stmt *mb = xs_alloc(sizeof *mb); mb->kind = S_BLOCK; mb->pos = pos; stmt_list_push(&mb->stmts, mr);
+        mf->body = mb;
+        Arrow *ma = xs_alloc(sizeof *ma); ma->pos = pos; ma->fn = mf; ma->expr_body = true;
+        Expr *mae = xs_alloc(sizeof *mae); mae->kind = E_ARROW; mae->pos = pos; mae->field = -1; mae->arrow = ma;
+        body = xs_alloc(sizeof *body); body->kind = E_MEMBER; body->pos = pos; body->field = -1; body->lhs = mk_ident(pos, vn); body->str = "map"; body->is_call = true;
+        expr_list_push(&body->args, mae);
+    } else return;
+    Func *f = xs_alloc(sizeof *f); f->pos = pos; f->name = "arrow"; f->ret = vt;
+    f->params = xs_alloc(sizeof(Param)); memset(f->params, 0, sizeof(Param)); f->params[0].name = (char *)vn; f->params[0].type = et; f->nparams = 1;
+    Stmt *r = xs_alloc(sizeof *r); r->kind = S_RETURN; r->pos = pos; r->expr = body;
+    Stmt *b = xs_alloc(sizeof *b); b->kind = S_BLOCK; b->pos = pos; stmt_list_push(&b->stmts, r);
+    f->body = b;
+    Arrow *a = xs_alloc(sizeof *a); a->pos = pos; a->fn = f; a->expr_body = true;
+    Expr *ae = xs_alloc(sizeof *ae); ae->kind = E_ARROW; ae->pos = pos; ae->field = -1; ae->arrow = a;
+    Expr *in = xs_alloc(sizeof *in); *in = *e; in->prechecked = true;
+    memset(e, 0, sizeof *e);
+    e->kind = E_CALL; e->pos = pos; e->field = -1; e->lhs = ae;
+    expr_list_push(&e->args, in);
+    check_expr(e, NULL);
+}
 /* private: the declaring class only; protected: it and its subclasses (checked at compile time, as TypeScript) */
 static bool checking_generated; /* the compiler's own code (reflection adapters) reaches private members */
 static void check_access(int access, Class *owner, const char *name, Pos pos) {
@@ -9154,6 +9324,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             Func *inst = check_generic_call(e, f, expected, xs_sprintf("'%s'", f->name));
             e->func = inst;
             e->type = fret(inst, e->pos);
+            if (tuple_erased) { Type **o = tuple_erased; tuple_erased = NULL; tuple_view(e, f, o); }
             return;
         }
         if (e->ntargs) xs_error(XS6005, e->pos, NULL, "'%s' is not generic", f->name);
@@ -10438,6 +10609,23 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (e->lhs->type->kind == TY_UNION) { /* s.kind: a field every member has, read by the object's class */
             Type *u = e->lhs->type;
             if (e->is_call) xs_error(XS8088, e->pos, "narrow it first: if (x instanceof C) / if (typeof x === \"string\") / if (x.kind === \"...\")", "cannot call a method on %s", ty_name(u));
+            if (tsc_checked()) { /* if (!onda[0].ok) throw onda[0].erro: TypeScript narrowed onda[0] there; xisto's narrowing does not
+                                    follow an element: the one member that has the field, the value checked to be it at run time */
+                Type *only = NULL;
+                int nhas = 0;
+                for (int i = 0; i < u->nparams; i++) {
+                    Type *m = u->params[i];
+                    if (m->kind == TY_OBJECT && !m->cls->builtin && find_field(m->cls, e->str, NULL)) { only = m; nhas++; }
+                }
+                if (nhas == 1 && nhas < u->nparams) {
+                    Expr *as = xs_alloc(sizeof *as);
+                    as->kind = E_AS; as->pos = e->lhs->pos; as->field = -1; as->lhs = e->lhs; as->elem_type = only;
+                    e->lhs->prechecked = true;
+                    e->lhs = as;
+                    check_expr(e, expected);
+                    return;
+                }
+            }
             Type *ft = NULL;
             bool all_lit = true;
             for (int i = 0; i < u->nparams; i++) {
@@ -10671,7 +10859,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                         bool nullnum = rt->kind == TY_NULLABLE && !ty_is_heap(rt->elem) && is_numeric(rt->elem);
                         if (nullnum && mapnull_ok) e->type = ty_array_of(rt); /* (.filter right after: __xs_mapFilterNum) */
                         else {
-                            if (rt->kind == TY_VOID || rt->kind == TY_FUNC || (rt->kind == TY_NULLABLE && !ty_is_heap(rt->elem) && !nullnum_elem(rt)))
+                            if (rt->kind == TY_VOID || (rt->kind == TY_FUNC && !tsc_checked()) || (rt->kind == TY_NULLABLE && !ty_is_heap(rt->elem) && !nullnum_elem(rt)))
                                 xs_error(XS7064, cb->pos, NULL, "map cannot produce arrays of %s", ty_name(rt));
                             e->type = ty_array_of(rt);
                             check_type_supported(e->pos, e->type);
@@ -11087,6 +11275,31 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (expected && expected->kind == TY_NULLABLE) e->type = expected;
         return;
     case E_AS: {
+        if (tsc_checked() && e->elem_type && e->lhs && e->op != TK_NOT && !e->lhs->prechecked &&
+            (e->lhs->kind == E_IDENT || e->lhs->kind == E_INDEX || (e->lhs->kind == E_MEMBER && !e->lhs->is_call))) {
+            /* (i as { valor: unknown }).valor with i an ItemDaOnda<unknown>: the one member that has those fields (checked) */
+            Type *want = resolve(e->elem_type, e->pos);
+            if (want->kind == TY_OBJECT && want->cls && want->cls->name && !strncmp(want->cls->name, "__Obj_", 6) && want->cls->nfields) {
+                check_expr(e->lhs, NULL);
+                e->lhs->prechecked = true;
+                Type *u = e->lhs->type;
+                if (u && u->kind == TY_UNION) {
+                    Type *only = NULL;
+                    int nhas = 0;
+                    for (int i = 0; i < u->nparams; i++) {
+                        Type *m = u->params[i];
+                        if (m->kind != TY_OBJECT || m->cls->builtin) continue;
+                        bool all = true;
+                        for (int f = 0; f < want->cls->nfields && all; f++) {
+                            Field *fd = find_field(m->cls, want->cls->fields[f].name, NULL);
+                            all = fd && ty_equal(fd->type, want->cls->fields[f].type);
+                        }
+                        if (all) { only = m; nhas++; }
+                    }
+                    if (nhas == 1) e->elem_type = only;
+                }
+            }
+        }
         if (e->elem_type && e->lhs && e->op != TK_NOT && e->lhs->kind == E_AS && e->lhs->op != TK_NOT && e->lhs->elem_type &&
             e->lhs->elem_type->kind == TY_UNKNOWN && !ty_is_any(e->lhs->elem_type)) {
             /* XB-182: binds as unknown as unknown[] with binds a Record: JavaScript passes the object on as it is (TypeScript's
@@ -14094,6 +14307,8 @@ static void check_stmt(Stmt *s) {
                 cur_func->ret->kind == TY_UNKNOWN) { /* reflection's invoke of a method whose return
                                                                               type was inferred: void gives null */
                 check_expr(s->expr, NULL);
+                /* (() => Promise.resolve(null) where () => Promise<unknown> goes: the promise's value, as an async function's) */
+                if (cur_func->ret_promise && s->expr->type && s->expr->type->kind == TY_PROMISE) pr_await(s->expr);
                 if (!cur_func->natural_ret && s->expr->type) cur_func->natural_ret = s->expr->type; /* (overload typing) */
                 if (s->expr->type->kind == TY_VOID) {
                     Stmt *call = xs_alloc(sizeof *call), *ret = xs_alloc(sizeof *ret);
