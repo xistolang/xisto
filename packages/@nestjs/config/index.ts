@@ -1,7 +1,7 @@
 // @nestjs/config for xisto: ConfigModule.forRoot() reads a .env file into process.env (without overriding what
 // the environment already has, as dotenv does) and provides ConfigService, which reads process.env.
 import { readFileSync, existsSync } from "xisto:fs";
-import { DynamicModule, Injectable, Module, FactoryProvider } from "@nestjs/common";
+import { DynamicModule, Injectable, Module, FactoryProvider, Provider } from "@nestjs/common";
 
 /**
  * A namespace of configuration: registerAs("database", () => ({ ... })) gives one, which ConfigModule.forRoot
@@ -171,10 +171,19 @@ export class ConfigModule {
         }
       }
     }
+    // each loaded namespace is also a provider under its KEY (@Inject(databaseConfig.KEY)), as in Nest
+    const providers: Provider[] = [ConfigService];
+    const exported: unknown[] = [ConfigService];
     for (const f of options.load ?? []) {
-      build(f);
+      const value: any = build(f);
+      const fp: FactoryProvider = {
+        provide: `CONFIGURATION(${namespaceOf(f)})`,
+        useFactory: (): unknown => value,
+      };
+      providers.push(fp);
+      exported.push(fp.provide);
     }
-    return { module: ConfigModule, providers: [ConfigService], exports: [ConfigService], global: options.isGlobal || false };
+    return { module: ConfigModule, providers: providers, exports: exported, global: options.isGlobal || false };
   }
 
   /**
