@@ -1266,7 +1266,8 @@ static void gen_convert(Expr *e) {
     *in = *e;
     in->prechecked = true;
     Type *b = ty_strip_null(t);
-    if (e->type->kind == TY_UNKNOWN && (b->kind == TY_ARRAY || (b->kind == TY_MAP && b->record) ||
+    TypeKind sk = ty_strip_null(e->type)->kind;
+    if ((sk == TY_UNKNOWN || sk == TY_ARRAY || sk == TY_MAP || sk == TY_OBJECT) && (b->kind == TY_ARRAY || (b->kind == TY_MAP && b->record) ||
                                         (b->kind == TY_OBJECT && !b->cls->builtin && b->cls->nmethods == 0 && !b->cls->iface_methods))) {
         /* data (rows of a query, decoded per T in a generic instance): read as its JSON and decoded into T, as the
            instance for T would have decoded it (an object of T itself comes back equal, a copy) */
@@ -4112,6 +4113,12 @@ static void check_object_member(Expr *e, Class *c) {
         cast_to = resolve(e->targs[0], e->pos);
         e->ntargs = 0;
     }
+    Type *mgen = NULL; /* ds.query<Row>(sql) on an interface's query<T = D>(): the result as the signature gives it for Row */
+    if (e->ntargs && m->gen_sig) {
+        Type tmpf = *m->gen_sig;
+        mgen = gen_call_ret(&(Type){.kind = TY_FUNC, .gen_sig = &tmpf}, e);
+        e->ntargs = 0;
+    }
     if (e->ntargs) xs_error(XS6003, e->pos, NULL, "%s.%s is not generic", c->name, m->name);
     Expr *recv0 = dflt_recv;
     dflt_recv = e->lhs;
@@ -4119,6 +4126,10 @@ static void check_object_member(Expr *e, Class *c) {
     dflt_recv = recv0;
     e->func = m;
     e->type = fret(m, e->pos);
+    if (mgen) {
+        e->gen_ret = mgen;
+        if (!(m->is_async || m->ret_promise)) gen_convert(e);
+    }
     if (!c->builtin && !e->super_call && (m->is_abstract || overridden_below(c, m))) { /* dispatched by the object's class */
         e->virt = true;
         m->virt_target = true;
@@ -5839,6 +5850,26 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         const char *name = e->lhs->str;
         if (!lookup_func(name) && !lookup(name)) {
+            if (strcmp(name, "Boolean") == 0 && e->args.len == 1) { /* Boolean(x): x's truthiness, as !!x */
+                Expr *x = e->args.items[0];
+                Expr *n1 = xs_alloc(sizeof *n1);
+                n1->kind = E_UNARY; n1->op = TK_NOT; n1->pos = e->pos; n1->field = -1; n1->lhs = x;
+                Pos at = e->pos;
+                memset(e, 0, sizeof *e);
+                e->kind = E_UNARY; e->op = TK_NOT; e->pos = at; e->field = -1; e->lhs = n1;
+                check_expr(e, expected);
+                return;
+            }
+            if (!strcmp(name, "encodeURIComponent") || !strcmp(name, "encodeURI") || !strcmp(name, "decodeURIComponent") || !strcmp(name, "decodeURI")) {
+                /* the URI globals, on strings (UTF-8 bytes as %XX) */
+                if (e->args.len != 1) xs_error(XS8032, e->pos, NULL, "%s takes exactly one argument", name);
+                check_expr(e->args.items[0], ty_string);
+                expect_type(e->args.items[0], ty_string, xs_sprintf("argument of %s", name));
+                e->type = ty_string;
+                e->builtin.cfn = !strcmp(name, "encodeURIComponent") ? "xs_encode_uri_component" : !strcmp(name, "encodeURI") ? "xs_encode_uri"
+                               : !strcmp(name, "decodeURIComponent") ? "xs_decode_uri_component" : "xs_decode_uri";
+                return;
+            }
             if (strcmp(name, "isNaN") == 0 || strcmp(name, "isFinite") == 0) { /* the globals, on numbers */
                 if (e->args.len != 1) xs_error(XS8032, e->pos, NULL, "%s takes exactly one argument", name);
                 check_expr(e->args.items[0], ty_number);
@@ -10400,6 +10431,8 @@ static bool method_fits(Func *cm, Func *im, Class *src, Class *ifc, bool infer, 
         if (why) *why = xs_sprintf("%s.%s is %s; %s.%s is public", cn, mn, cm->access == 2 ? "private" : "protected", iname, mn);
         return false;
     }
+    if (cm->ntparams && !im->ntparams && fn_required(cm) <= im->nparams) return true; /* (query<T = any>(sql, ..): Promise<T> where
+        the interface's query(sql, binds?): R goes: the adapter calls it, its T taken from R; the call is checked there) */
     if (cm->ntparams || im->ntparams) {
         if (why) *why = xs_sprintf("%s.%s is generic: write the same signature as %s.%s, or implement %s", cn, mn, iname, mn, iname);
         return false;
@@ -10521,17 +10554,38 @@ static Class *make_adapter(Class *src, Class *ifc) {
         f->ret_promise = im->ret_promise;
         f->is_async = im->ret_promise;
         f->cname = xs_sprintf("%s_m_%s", a->cname, im->name);
-        Expr *call = xs_alloc(sizeof *call); /* this.__t.m(__a0, ...): the class's parameters take what it declares */
-        call->kind = E_MEMBER; call->pos = f->pos; call->field = -1; call->is_call = true; call->lhs = ad_this_t(f->pos); call->str = im->name;
         int n = cm && cm->nparams < im->nparams ? cm->nparams : im->nparams;
-        for (int i = 0; i < n; i++) {
-            Expr *x = ad_ident(f->pos, f->params[i].name);
-            if (im->params[i].rest) { /* ...xs passed on spread */
-                Expr *sp = xs_alloc(sizeof *sp);
-                sp->kind = E_UNARY; sp->op = TK_ELLIPSIS; sp->pos = f->pos; sp->field = -1; sp->lhs = x;
-                x = sp;
+        /* this.__t.m(__a0, ...): the class's parameters take what it declares; an optional one the interface may leave out
+           (binds?: T) where the class has a default (binds: T = []): left out when it is, so the default applies, as in
+           JavaScript (`__aK == null ? m(.., __aK-1) : m(.., __aK)`) */
+        Expr *call = NULL;
+        int cut = n;
+        while (cut > 0 && cm && cm->params[cut - 1].dflt && !cm->params[cut - 1].rest && im->params[cut - 1].type->kind == TY_NULLABLE &&
+               cm->params[cut - 1].type && cm->params[cut - 1].type->kind != TY_NULLABLE)
+            cut--;
+        for (int upto = cut; upto <= n; upto++) {
+            Expr *c1 = xs_alloc(sizeof *c1);
+            c1->kind = E_MEMBER; c1->pos = f->pos; c1->field = -1; c1->is_call = true; c1->lhs = ad_this_t(f->pos); c1->str = im->name;
+            for (int i = 0; i < upto; i++) {
+                Expr *x = ad_ident(f->pos, f->params[i].name);
+                if (im->params[i].rest) { /* ...xs passed on spread */
+                    Expr *sp = xs_alloc(sizeof *sp);
+                    sp->kind = E_UNARY; sp->op = TK_ELLIPSIS; sp->pos = f->pos; sp->field = -1; sp->lhs = x;
+                    x = sp;
+                }
+                expr_list_push(&c1->args, x);
             }
-            expr_list_push(&call->args, x);
+            if (!call) { call = c1; continue; }
+            Expr *nul = xs_alloc(sizeof *nul);
+            nul->kind = E_NULL; nul->pos = f->pos; nul->field = -1;
+            Expr *test = xs_alloc(sizeof *test);
+            test->kind = E_BINARY; test->op = TK_EQ; test->loose = true; test->pos = f->pos; test->field = -1;
+            test->lhs = ad_ident(f->pos, f->params[upto - 1].name); test->rhs = nul;
+            Expr *cond = xs_alloc(sizeof *cond);
+            cond->kind = E_COND; cond->pos = f->pos; cond->field = -1; cond->lhs = test;
+            expr_list_push(&cond->args, call);
+            expr_list_push(&cond->args, c1);
+            call = cond;
         }
         Stmt *s = xs_alloc(sizeof *s);
         s->pos = f->pos;
@@ -10854,6 +10908,23 @@ static void infer_field_type(Class *c, Field *fd) {
             fd->type = ft;
             return;
         }
+    }
+    if (fd->init->kind == E_CALL && !fd->init->type && fd->init->lhs && fd->init->lhs->kind == E_IDENT && !lookup_func(fd->init->lhs->str)) {
+        /* flag = flagLigada(env) with const flagLigada = (v: string): boolean => ...: the return type it writes (the
+           module's consts are checked after the classes' shapes; the call itself is checked with the class) */
+        for (int pass = 0; pass < 2; pass++)
+            for (int i = 0; i < prog->top.len; i++) {
+                Stmt *st = prog->top.items[i];
+                if (st->kind != S_VAR || !st->name || !st->is_const || strcmp(st->name, fd->init->lhs->str) != 0) continue;
+                if (pass == 0 ? st->mod != c->mod : (st->mod == c->mod || !st->exported)) continue;
+                if (!st->init || st->init->kind != E_ARROW || !st->init->arrow->fn->ret || st->init->arrow->fn->is_async) continue;
+                Module *was = cur_mod;
+                enter_module(st->mod);
+                Type *r = resolve(st->init->arrow->fn->ret, st->pos);
+                enter_module(was);
+                fd->type = r;
+                return;
+            }
     }
     if (!fd->init->type && !field_infer_late && (fd->init->kind == E_CALL || fd->init->kind == E_MEMBER || fd->init->kind == E_ARROW ||
                                                  fd->init->kind == E_AWAIT || fd->init->kind == E_COND || fd->init->kind == E_BINARY)) {
