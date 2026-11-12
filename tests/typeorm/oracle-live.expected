@@ -1,4 +1,7 @@
 count 3
+saved dates#4,eggs#5, count 5
+where 'EA' bread
+where '' apple,bread,cheese
 bread 8 true 2026-02-19 fresh
 apple 2.5 true 2026-01-09 -
 cheese active=false

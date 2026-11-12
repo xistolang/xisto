@@ -3,7 +3,7 @@
 // the repository, the query builder's OFFSET/FETCH paging, Date columns bound as DATE, transactions on a
 // QueryRunner, PL/SQL OUT binds (query, query(.., true), connect()'s connection) and an ORA error with its
 // message. Tables of its own, dropped at the end.
-import { Column, DataSource, Entity, In, LessThanOrEqual, MoreThan, PrimaryColumn, QueryFailedError, ViewColumn, ViewEntity } from "typeorm";
+import { Column, DataSource, Entity, FindOptionsWhere, ILike, In, LessThanOrEqual, MoreThan, PrimaryColumn, QueryFailedError, ViewColumn, ViewEntity } from "typeorm";
 import { BIND_OUT, NUMBER, STRING, BindParameter, Connection, Result } from "oracledb";
 
 interface Structured {
@@ -79,6 +79,19 @@ async function main(): Promise<void> {
   b.price = 8;
   await repo.save(b); // the row exists: UPDATE
   console.log("count " + String(await repo.count()));
+  // save(array): every entity in one transaction, the saved entities back in order
+  const more = await repo.save([
+    { id: 4, name: "dates", price: 12, active: true, created: new Date("2026-04-01T00:00:00Z"), note: null },
+    { id: 5, name: "eggs", price: 3, active: false, created: new Date("2026-05-01T00:00:00Z"), note: "dozen" },
+  ]);
+  console.log("saved " + more.map((i: Item): string => i.name + "#" + String(i.id)).join(",") + ", count " + String(await repo.count()));
+  await repo.delete({ id: In([4, 5]) });
+  // where from a variable that may be undefined (no filter)
+  for (const term of ["EA", ""]) {
+    const where: FindOptionsWhere<Item> | undefined = term ? { name: ILike(`%${term}%`) } : undefined;
+    const got = await repo.find({ where, order: { id: "ASC" } });
+    console.log("where '" + term + "' " + got.map((i: Item): string => i.name).join(","));
+  }
 
   const cheap = await repo.find({ where: { active: true, price: LessThanOrEqual(10) }, order: { name: "DESC" } });
   for (const i of cheap) {

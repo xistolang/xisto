@@ -85,6 +85,16 @@ export class Readable {
     return this;
   }
 
+  /** on('data', (chunk: Buffer) => ...): each chunk as a Buffer, as Node gives it (a view on the chunk's bytes, not a copy). */
+  __on_data__Buffer(fn: (chunk: Buffer) => void): Readable {
+    return this.on("data", (c: Uint8Array): void => fn(Buffer.from(c.buffer, c.byteOffset, c.byteLength)));
+  }
+
+  /** on('error', fn): as onError. */
+  __on_error(fn: (err: Error) => void): Readable {
+    return this.onError(fn);
+  }
+
   /** Sends every chunk to dest, then ends it; returns dest. */
   pipe<W extends Writable>(dest: W): W {
     this.targets.push(dest);
@@ -175,6 +185,11 @@ export class Writable {
     return this;
   }
 
+  /** on('error', fn): as onWriteError. */
+  __on_error(fn: (err: Error) => void): Writable {
+    return this.onWriteError(fn);
+  }
+
   protected reportError(err: Error): void {
     if (this.errorFns.length === 0) throw err;
     for (const fn of this.errorFns) fn(err);
@@ -228,6 +243,18 @@ export class Transform extends Writable {
   onError(fn: (err: Error) => void): Transform {
     this.readable.onError(fn);
     return this;
+  }
+
+  /** on('data', (chunk: Buffer) => ...): the output, each chunk as a Buffer. */
+  __on_data__Buffer(fn: (chunk: Buffer) => void): Writable {
+    this.readable.__on_data__Buffer(fn);
+    return this;
+  }
+
+  /** on('error', fn): a failure of either side (a transform's, or a write after end). */
+  override __on_error(fn: (err: Error) => void): Writable {
+    this.readable.onError(fn);
+    return this.onWriteError(fn);
   }
 
   /** Sends the output to dest, then ends it; returns dest. */

@@ -6,6 +6,7 @@
 import { ClassInfo, MethodInfo } from "xisto:reflect";
 import { DynamicModule, ExecutionContext, Injectable, Module, UnauthorizedException } from "@nestjs/common";
 import { Request } from "express";
+import { Observable } from "rxjs";
 import { checkRequest, StrategyOptions } from "passport-jwt";
 
 // name -> the strategy class; the instances the injector built (one per strategy class)
@@ -145,8 +146,10 @@ export class AuthGuard {
     };
   }
 
-  /** Runs the strategies; the user goes on request.user (true), or handleRequest throws (401 by default). */
-  canActivate(context: ExecutionContext): boolean {
+  /** Runs the strategies; the user goes on request.user (true), or handleRequest throws (401 by default).
+   *  Typed as Nest's CanActivate (boolean | Promise<boolean> | Observable<boolean>) less the promise, which a function
+   *  that is not async holds as the value it settles to: an override may declare any of the three. */
+  canActivate(context: ExecutionContext): boolean | Observable<boolean> {
     const request = this.getRequest(context);
     let user: unknown = null;
     let err: Error | null = null;

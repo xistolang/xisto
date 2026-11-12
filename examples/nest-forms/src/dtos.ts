@@ -1,7 +1,7 @@
 import { Transform } from "class-transformer";
 import { Allow, IsIn, IsInt, IsNotEmpty, IsNumber, IsOptional, IsString, Min, ValidateIf, ValidationArguments } from "class-validator";
 import { BadRequestException, Injectable, PipeTransform } from "@nestjs/common";
-import { Flag, RequiredInteger, RequiredText } from "./decorators";
+import { Flag, RequiredInteger, RequiredText, SingleSpaced } from "./decorators";
 
 export class CreateTabletDto {
   @RequiredText("Machine IP", "Machine IP is required.", 15)
@@ -59,6 +59,7 @@ export class SortDto {
 
 export class LegacyDto {
   @IsString()
+  @SingleSpaced()
   name: string;
 
   /** @deprecated accepted and ignored */

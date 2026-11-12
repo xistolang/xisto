@@ -44,7 +44,13 @@ int xs_sh(const char *cmd) {
 #else
     int rc = system(cmd);
     if (rc == -1) return -1;
-    return (rc >> 8) & 0xff;
+    if (WIFSIGNALED(rc)) { /* (the program died of a signal: said, and a non-zero status, never a silent 0) */
+        int sig = WTERMSIG(rc);
+        fflush(stdout);
+        fprintf(stderr, "xisto: the program was killed by signal %d (%s)\n", sig, strsignal(sig));
+        return 128 + sig;
+    }
+    return WIFEXITED(rc) ? WEXITSTATUS(rc) : 1;
 #endif
 }
 

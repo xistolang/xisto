@@ -1,6 +1,6 @@
 import { applyDecorators, SetMetadata, UseGuards } from "@nestjs/common";
 import { Transform } from "class-transformer";
-import { IsIn, ValidateBy, ValidationArguments } from "class-validator";
+import { IsIn, registerDecorator, ValidateBy, ValidationArguments, ValidationOptions, ValidatorConstraint, ValidatorConstraintInterface } from "class-validator";
 import { ScopeGuard } from "./scope.guard";
 
 const isBlank = (value: unknown): boolean =>
@@ -53,3 +53,28 @@ export const RESOURCE_KEY = "resource";
 
 export const Scoped = (resource: string = "local"): ClassDecorator =>
   applyDecorators(SetMetadata(RESOURCE_KEY, resource), UseGuards(ScopeGuard));
+
+// a rule written as class-validator documents a custom one: a constraint class, and a property decorator in
+// TypeScript's form (target, propertyName) that registers it on target.constructor
+@ValidatorConstraint({ name: "singleSpaced", async: false })
+export class SingleSpacedConstraint implements ValidatorConstraintInterface {
+  validate(value: unknown): boolean {
+    return typeof value !== "string" || !value.includes("  ");
+  }
+
+  defaultMessage(): string {
+    return "Text must not contain two spaces in a row";
+  }
+}
+
+export function SingleSpaced(validationOptions?: ValidationOptions) {
+  return function (object: object, propertyName: string) {
+    registerDecorator({
+      target: object.constructor,
+      propertyName,
+      options: validationOptions,
+      constraints: [],
+      validator: SingleSpacedConstraint,
+    });
+  };
+}

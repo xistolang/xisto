@@ -142,12 +142,40 @@ export function mergeMap(fn: (value: unknown) => Observable<unknown>): OperatorF
  * Calls next with each value, passing it on unchanged.
  * Node: no error callback (tap({ next, error })); catchError sees errors.
  */
-export function tap(next: (value: unknown) => void): OperatorFunction {
+/** tap's observer form: tap({ next, error, complete }), each optional (rxjs's TapObserver). */
+export interface TapObserver {
+  next?: (value: unknown) => void;
+  error?: (err: any) => void;
+  complete?: () => void;
+}
+
+/** Runs next on the value (or the observer's next, error when the source fails, complete after the value); the value goes on as it is. */
+export function tap(observer: ((value: unknown) => void) | TapObserver): OperatorFunction {
   return new OperatorFunction(
     (source: Observable<unknown>): Observable<unknown> =>
       new Observable<unknown>((): unknown => {
-        const v = source.run();
-        next(v);
+        if (typeof observer === "function") {
+          const v0 = source.run();
+          (observer as (value: unknown) => void)(v0);
+          return v0;
+        }
+        const o = observer as TapObserver;
+        let v: unknown = null;
+        try {
+          v = source.run();
+        } catch (e) {
+          const onError = o.error;
+          if (onError) onError(e);
+          throw e;
+        }
+        const onNext = o.next;
+        if (onNext) onNext(v);
+        const onComplete = o.complete;
+        if (onComplete) {
+          // (complete comes after the subscriber has the value, as rxjs's: deferred as finalize is)
+          if (teardown.deferring) teardown.fns.push(onComplete);
+          else onComplete();
+        }
         return v;
       }),
   );
