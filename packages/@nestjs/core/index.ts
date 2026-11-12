@@ -29,6 +29,7 @@ import {
   __appFactories,
   bodyField,
   CallHandler,
+  __callHandler,
   ClassProvider,
   CorsOptions,
   DynamicModule,
@@ -670,7 +671,7 @@ function handle(r: Route, req: HttpRequest): HttpResponse {
       const next = chain;
       const instance = r.interceptors[i];
       const intercept = r.interceptorMethods[i];
-      chain = (): unknown => observed(intercept.invoke(instance, [ctx, new CallHandler(next)]));
+      chain = (): unknown => observed(intercept.invoke(instance, [ctx, __callHandler(next)]));
     }
     // subscribed as Nest does: finalize() callbacks run once the outermost interceptor has the value
     let result: unknown = null;
