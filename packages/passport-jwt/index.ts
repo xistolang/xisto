@@ -72,6 +72,18 @@ export class ExtractJwt {
       return m.slice(space + 1, m.length).trim();
     };
   }
+  /** A field of the JSON body ({ "refreshToken": "..." }). */
+  static fromBodyField(field: string): (req: Request) => string | null {
+    return (req: Request): string | null => {
+      try {
+        const body: any = JSON.parse(req.body);
+        const v: any = body === null || typeof body !== "object" ? null : body[field];
+        return typeof v === "string" ? (v as string) : null;
+      } catch (e) {
+        return null;
+      }
+    };
+  }
   /** A header holding the token itself. */
   static fromHeader(name: string): (req: Request) => string | null {
     return (req: Request): string | null => req.header(name);

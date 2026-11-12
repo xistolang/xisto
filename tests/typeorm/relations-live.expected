@@ -1,0 +1,7 @@
+a -> req 10 empresa 7
+none
+1:7 2:7 3:8
+1:no req 2:no req 3:no req
+10 7 a,b
+20 8 c
+30 9 (none)

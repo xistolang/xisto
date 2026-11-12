@@ -1,5 +1,6 @@
 import { Transform } from "class-transformer";
-import { Allow, IsIn, IsNotEmpty, IsNumber, IsOptional, IsString, ValidateIf, ValidationArguments } from "class-validator";
+import { Allow, IsIn, IsInt, IsNotEmpty, IsNumber, IsOptional, IsString, Min, ValidateIf, ValidationArguments } from "class-validator";
+import { BadRequestException, Injectable, PipeTransform } from "@nestjs/common";
 import { Flag, RequiredInteger, RequiredText } from "./decorators";
 
 export class CreateTabletDto {
@@ -50,4 +51,32 @@ export class LegacyDto {
   /** @deprecated accepted and ignored */
   @Allow()
   userId?: unknown;
+}
+
+export class SearchQueryDto {
+  @IsOptional()
+  @Transform(({ value }) => (typeof value === "string" ? value.toLowerCase() : value))
+  @IsIn(["asc", "desc"])
+  sortOrder?: "asc" | "desc";
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  page?: number;
+
+  @IsString()
+  @IsNotEmpty()
+  term: string;
+}
+
+// a route that takes no query: any key is refused, as the app's own pipe does
+@Injectable()
+export class NoQueryPipe implements PipeTransform {
+  transform(value: unknown): unknown {
+    const keys = value && typeof value === "object" ? Object.keys(value as Record<string, unknown>) : [];
+    if (keys.length > 0) {
+      throw new BadRequestException(keys.map((k: string) => `property ${k} should not exist`));
+    }
+    return null;
+  }
 }

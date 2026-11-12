@@ -16,6 +16,11 @@ const r: Response = await fetch("http://127.0.0.1:8080/echo", {
 });
 const e: Echo = JSON.parse(await r.text());
 console.log(r.status, e.method, e.token, e.body.id, e.body.name);
+// a body of bytes (a Buffer or Uint8Array), sent as they are; the answer's bytes and URL
+const rb: Response = await fetch("http://127.0.0.1:8080/echo", { method: "POST", headers: { "X-Token": "bytes" }, body: Buffer.from(JSON.stringify(item)) });
+const eb: Echo = JSON.parse(Buffer.from(await rb.arrayBuffer()).toString("utf8"));
+console.log("bytes body:", rb.status, eb.token, eb.body.name, rb.url);
+await rb.body?.cancel(); // (read whole already: nothing to cancel)
 try {
   const late: Response = await fetch("http://127.0.0.1:8080/slow?ms=600", { signal: AbortSignal.timeout(100) });
   console.log("no timeout?", late.status);

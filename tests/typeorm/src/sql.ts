@@ -71,6 +71,13 @@ async function dialect(name: string): Promise<void> {
   await repo.find({ where: [{ id: Raw((alias) => `TO_CHAR(${alias}) LIKE :code AND ${alias} IN (SELECT X FROM T WHERE O = :op)`, { code: "%4%", op: "ADM" }) }, { ativo: true }] });
   await repo.update({ nascimento: Raw((alias) => `${alias} >= TRUNC(SYSDATE) AND ${alias} < TRUNC(SYSDATE) + 1`), id: In([0, 1]) }, { ativo: true });
   await repo.update({ id: 7 }, { nome: "Bia", limite: 3.5 });
+  // the manager with the entity given by its table's name (TypeORM's EntityTarget as a string) and by its class
+  await ds.manager.update("TB_BENEFICIARIO" as never, { id: 7 }, { nome: "Cris" });
+  await ds.manager.update(Beneficiario, { id: 8 }, { nome: "Duda" });
+  const byName = await ds.manager.findOne("TB_BENEFICIARIO" as never, { where: { id: 7 } } as never);
+  console.log(byName ? "found by name" : "none");
+  console.log("count by name " + String(await ds.manager.count("TB_BENEFICIARIO" as never, { where: { ativo: true } } as never)));
+  await ds.manager.insert("TB_BENEFICIARIO" as never, { id: 10, nome: "Eva" } as never);
   await repo.update({ id: 7 }, { nascimento: () => "SYSDATE", nome: "Bia" });
   await repo.delete({ id: 7 });
   await repo.insert({ id: 8, nome: "Caio", limite: 0, ativo: false });

@@ -24,6 +24,14 @@ GET /api/forms/me  -> 401 {"message": "Unauthorized", "statusCode": 401}
 GET /api/forms/item/7  {"x-user": "caio"}-> 200 {"by": "caio", "id": "7"}
 GET /api/local  {"x-scope": "local"}-> 200 {"scope": "local"}
 GET /api/local  {"x-scope": "other"}-> 403 {"error": "Forbidden", "message": "scope local required", "statusCode": 403}
+GET /api/forms/search?term=x&page=2&sortOrder=DESC  -> 200 {"page": 2, "sortOrder": "desc", "term": "x"}
+GET /api/forms/search?term=x  -> 200 {"page": 1, "sortOrder": "asc", "term": "x"}
+GET /api/forms/search?page=0&sortOrder=up  -> 400 {"error": "Bad Request", "message": ["sortOrder must be one of the following values: asc, desc", "page must not be less than 1", "term should not be empty", "term must be a string"], "statusCode": 400}
+GET /api/forms/search?term=&page=abc  -> 400 {"error": "Bad Request", "message": ["page must not be less than 1", "page must be an integer number", "term should not be empty"], "statusCode": 400}
+GET /api/forms/search  -> 400 {"error": "Bad Request", "message": ["term should not be empty", "term must be a string"], "statusCode": 400}
+GET /api/forms/plain  -> 200 {"plain": true}
+GET /api/forms/plain?a=1&b=2  -> 400 {"error": "Bad Request", "message": ["property a should not exist", "property b should not exist"], "statusCode": 400}
+GET /api/forms/whoami  {"x-user": "ana:t1"}-> 200 {"sub": "ana", "tenant": "t1"}
 GET /api/forms/denied/object  -> 403 {"message": "menu hidden", "statusCode": 403}
 GET /api/forms/denied/list  -> 400 {"error": "Bad Request", "message": ["first problem", "second problem"], "statusCode": 400}
 GET /api/forms/denied/plain  -> 403 {"message": "Forbidden", "statusCode": 403}
