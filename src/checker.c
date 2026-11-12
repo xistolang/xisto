@@ -1939,6 +1939,8 @@ static bool json_ok(Type *t, int depth) {
     case TY_UNION: /* number | string (a row's column): held as an unknown is, read and written by what it holds */
         for (int i = 0; i < t->nparams; i++) {
             TypeKind k = t->params[i]->kind;
+            if (k == TY_OBJECT && t->params[i]->cls->builtin && !strcmp(t->params[i]->cls->name, "Date")) continue; /* Date | string (a
+                row's date column, read from JSON as the text it is: what the value holds says which) */
             if (k != TY_NUMBER && k != TY_INT && k != TY_STRING && k != TY_BOOLEAN) return false;
         }
         return true;
@@ -2928,6 +2930,9 @@ static void expect_type(Expr *e, Type *want, const char *what) {
         (e->type->kind == TY_LITINT || json_ok(e->type, 0))) { to_json(e); return; } /* into object | null */
     if (e->type->kind == TY_JSON && json_target(want)) { from_json(e, want); return; }
     if (e->type->kind == TY_JSON && json_target_u(want)) { from_json(e, want); return; } /* rows with unknown values: decoded by what they hold */
+    if (e->type->kind == TY_JSON && (want->kind == TY_NUMBER || want->kind == TY_INT || want->kind == TY_STRING || want->kind == TY_BOOLEAN) && !want->tname) {
+        from_json(e, want); return; /* query<number>(sql): the value decoded as one */
+    }
     if (e->type->kind == TY_JSON && want->kind == TY_NULLABLE && (json_target(want->elem) || json_target_u(want->elem))) { from_json(e, want); return; } /* into T | null: JSON null is null */
     if (e->type->kind == TY_LITINT && is_numeric(want)) coerce_lit(e, want);
     if (e->type->kind == TY_LITINT && want->kind == TY_NULLABLE && is_numeric(want->elem)) coerce_lit(e, want->elem);
@@ -7815,7 +7820,10 @@ static void check_expr_in(Expr *e, Type *expected) {
             return;
         }
         if (want->kind == TY_UNKNOWN) { *e = *v; to_unknown(e); return; }
-        if (v->type->kind == TY_JSON && (json_target(want) || json_target_u(want))) { *e = *v; from_json(e, want); return; }
+        if (v->type->kind == TY_JSON && (json_target(want) || json_target_u(want) ||
+                                         ((want->kind == TY_NUMBER || want->kind == TY_INT || want->kind == TY_STRING || want->kind == TY_BOOLEAN) && !want->tname))) {
+            *e = *v; from_json(e, want); return;
+        }
         if ((v->type->kind == TY_JSON || (v->type->kind == TY_NULLABLE && v->type->elem->kind == TY_JSON)) && want->kind == TY_NULLABLE &&
             ty_is_heap(want->elem) && (json_target(want->elem) || json_target_u(want->elem))) { *e = *v; from_json(e, want); return; } /* (o as T | null) with o: object | null */
         if (want->kind == TY_JSON) { /* x as object: written as JSON text (an unknown inside by its type at run time) */
@@ -7855,6 +7863,13 @@ static void check_expr_in(Expr *e, Type *expected) {
                 *e = *v; e->type = want; return;
             }
         }
+        { /* Record<string, string> as Record<string, unknown>: values held by reference either way, the same map */
+            Type *g = ty_strip_null(v->type), *w = ty_strip_null(want);
+            if (g->kind == TY_MAP && w->kind == TY_MAP && w->record && g->key->kind == w->key->kind && w->elem->kind == TY_UNKNOWN &&
+                !ty_is_any(w->elem) && ty_is_heap(g->elem) && (v->type->kind != TY_NULLABLE || want->kind == TY_NULLABLE)) {
+                *e = *v; e->type = want; return;
+            }
+        }
         { /* Record<string, unknown> as Record<string, A | B>: a union is held as unknown is (boxed), so the same map */
             Type *g = v->type;
             if (g->kind == TY_MAP && want->kind == TY_MAP && g->key->kind == want->key->kind && g->elem->kind == TY_UNKNOWN &&
@@ -7869,7 +7884,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             json_ok_unknown = true;
             bool ok = (v->type->kind != TY_NULLABLE || want->kind == TY_NULLABLE) && json_ok(ty_strip_null(v->type), 0);
             json_ok_unknown = ju;
-            if (ok && (json_target(want) || (want->kind == TY_NULLABLE && json_target(want->elem)) || (want->kind == TY_MAP && want->record && json_ok(want, 0)))) {
+            if (ok && (json_target_u(want) || (want->kind == TY_NULLABLE && json_target_u(want->elem)) || (want->kind == TY_MAP && want->record && json_ok(want, 0)))) {
                 *e = *v; to_json(e); from_json(e, want); return; /* (rows[0] as { R?: number } | undefined: a shape, or null) */
             }
         }
