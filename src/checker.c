@@ -1537,7 +1537,286 @@ static void find_views(Program *p) {
     }
     for (int i = 0; i < p->top.len; i++) view_scan_stmt(p->top.items[i], p->top.items[i]->mod);
 }
+typedef struct { Field *f; int n; } FieldSet;
+static bool is_numeric(Type *t);
+static void class_fields_all(Class *k, FieldSet *out);
+/* ---- type operators the parser leaves to the checker (T[K], T[keyof T], { [K in keyof T]: V }, A & B with a side it
+   cannot name, ReturnType<C['m']>, Awaited<...>, ConstructorParameters<typeof C>[i]) */
+static Type *ty_union2(Type *a, Type *b) {
+    if (!a) return b;
+    if (ty_equal(a, b)) return a;
+    bool nul = a->kind == TY_NULLABLE || b->kind == TY_NULLABLE;
+    a = ty_strip_null(a);
+    b = ty_strip_null(b);
+    Type *u;
+    if (ty_equal(a, b)) u = a;
+    else {
+        Type **ps = NULL;
+        int n = 0;
+        Type *two[2] = {a, b};
+        for (int s_ = 0; s_ < 2; s_++) {
+            Type **xs = two[s_]->kind == TY_UNION ? two[s_]->params : &two[s_];
+            int nx = two[s_]->kind == TY_UNION ? two[s_]->nparams : 1;
+            for (int i = 0; i < nx; i++) {
+                bool dup = false;
+                for (int k = 0; k < n && !dup; k++) dup = ty_equal(ps[k], xs[i]);
+                if (!dup) { ps = realloc(ps, sizeof(Type *) * (size_t)(n + 1)); ps[n++] = xs[i]; }
+            }
+        }
+        if (n == 1) u = ps[0];
+        else { u = xs_alloc(sizeof *u); u->kind = TY_UNION; u->params = ps; u->nparams = n; }
+    }
+    return nul ? ty_nullable_of(u) : u;
+}
+/* class_fields_all where a function's locals are in scope (it enters the class's module: the scope comes back after) */
+static void fields_here(Class *c, FieldSet *out) {
+    Module *was = cur_mod;
+    Scope *ss = scope;
+    const char *sfn = xs_file_name, *ssrc = xs_source;
+    class_fields_all(c, out);
+    cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
+}
+static bool free_tparam(Type *t) { /* a type parameter of a template's own text (checked per instance) */
+    return t && t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__", 2) != 0;
+}
+/* the types of o's values: T[keyof T] */
+static Type *values_of(Type *o, Pos pos) {
+    Type *b = ty_strip_null(o);
+    if (b->kind == TY_MAP || b->kind == TY_ARRAY) return b->elem;
+    if (b->kind == TY_OBJECT && !b->cls->builtin) {
+        Type *u = NULL;
+        FieldSet fs = {0};
+        fields_here(b->cls, &fs);
+        for (int i = 0; i < fs.n; i++) u = ty_union2(u, resolve(fs.f[i].type, pos));
+        if (u) return u;
+    }
+    xs_error(XS1019, pos, "write the type itself", "%s[keyof %s]: %s has no values to read", ty_name(o), ty_name(o), ty_name(o));
+    return NULL;
+}
+/* o[k] with k a resolved key type: a field ('a'), some fields ('a' | 'b'), a Record's or array's element */
+static Type *index_of(Type *o, Type *k, Pos pos) {
+    Type *b = ty_strip_null(o);
+    if (k->kind == TY_TPARAM && k->tname && !strncmp(k->tname, "__idx:", 6)) { /* a mapped type over a tuple: its i-th */
+        int i = atoi(k->tname + 6);
+        if (b->kind == TY_OBJECT && b->cls->is_tuple && i < b->cls->nfields) return b->cls->fields[i].type;
+        if (b->kind == TY_ARRAY) return b->elem;
+    }
+    if (b->kind == TY_MAP) return b->elem;
+    if (b->kind == TY_ARRAY && (is_numeric(k) || k->kind == TY_LITINT)) return b->elem;
+    const char **names = NULL;
+    int n = 0;
+    const char *one = NULL;
+    if (k->kind == TY_STRING && k->tname) { one = k->tname; names = &one; n = 1; }
+    else if (k->kind == TY_STRING && k->nslits) { names = k->slits; n = k->nslits; }
+    else if (k->kind == TY_UNION) {
+        names = xs_alloc(sizeof(char *) * (size_t)k->nparams);
+        for (int i = 0; i < k->nparams; i++) {
+            if (k->params[i]->kind != TY_STRING || !k->params[i]->tname) { n = 0; names = NULL; break; }
+            names[n++] = k->params[i]->tname;
+        }
+    }
+    if (n && b->kind == TY_OBJECT && !b->cls->builtin) {
+        Type *u = NULL;
+        for (int i = 0; i < n; i++) {
+            Field *fd = find_field(b->cls, names[i], NULL);
+            if (!fd || !fd->type) xs_error(XS1019, pos, "write the type itself", "%s has no field '%s'", ty_name(o), names[i]);
+            u = ty_union2(u, resolve(fd->type, pos));
+        }
+        return u;
+    }
+    xs_error(XS1019, pos, "write the type itself", "%s[%s]: xisto reads a field ('k'), fields ('a' | 'b'), a Record's or an array's element", ty_name(o), ty_name(k));
+    return NULL;
+}
+/* an interface made while checking (a mapped type over an object, A & B made where it is used): registered as a type
+   written in a generic's instance is (late_inline_class) */
+static Class *made_iface(const char *what, Pos pos) {
+    static int nmade;
+    Class *c = xs_alloc(sizeof *c);
+    c->name = xs_sprintf("__Obj_%s%d", what, nmade++);
+    c->pos = pos;
+    c->mod = cur_mod ? cur_mod : prog->modules[0];
+    c->is_interface = true;
+    c->exported = true;
+    prog->classes = realloc(prog->classes, sizeof(Class *) * (size_t)(prog->nclasses + 1));
+    prog->cap_classes = prog->nclasses + 1;
+    prog->classes[prog->nclasses++] = c;
+    return c;
+}
+static void made_field(Class *c, const char *name, Type *t, bool opt, Pos pos) {
+    c->fields = realloc(c->fields, sizeof(Field) * (size_t)(c->nfields + 1));
+    Field *f = &c->fields[c->nfields++];
+    memset(f, 0, sizeof *f);
+    f->name = (char *)name;
+    f->type = opt && t->kind != TY_NULLABLE && t->kind != TY_UNKNOWN ? ty_optional_of(t) : t;
+    f->optional = opt;
+    f->pos = pos;
+    f->owner = c;
+    c->cap_fields = c->nfields;
+}
+static Type *mapped_type(Type *t, Pos pos) {
+    bool opt = t->tname[8] == '?';
+    const char *kn = strchr(t->tname, ':') + 1;
+    char *knames[1] = {(char *)kn};
+    Type *v = t->ret;
+    if (t->key) { /* [K in 'a' | 'b'] */
+        Type *k = resolve(t->key, pos);
+        Type *one = k;
+        Type **ks = k->kind == TY_UNION ? k->params : &one;
+        int n = k->kind == TY_UNION ? k->nparams : 1;
+        if (k->kind == TY_STRING && k->nslits) { /* (a resolved union of literals) */
+            ks = xs_alloc(sizeof(Type *) * (size_t)k->nslits);
+            for (int i = 0; i < k->nslits; i++) { Type *l = xs_alloc(sizeof *l); *l = *ty_string; l->tname = k->slits[i]; ks[i] = l; }
+            n = k->nslits;
+        }
+        if (k->kind == TY_STRING && !k->tname && !k->nslits) { /* [K in string]: a Record */
+            Type *r = ty_map_of(ty_string, resolve(subst_ftp(v, knames, &k, 1), pos));
+            r->record = true;
+            return r;
+        }
+        Class *c = made_iface("map", pos);
+        for (int i = 0; i < n; i++) {
+            if (ks[i]->kind != TY_STRING || !ks[i]->tname) xs_error(XS1019, pos, "write the type itself", "a mapped type's keys are string literals or keyof T");
+            made_field(c, ks[i]->tname, resolve(subst_ftp(v, knames, &ks[i], 1), pos), opt, pos);
+        }
+        late_inline_class(c);
+        return ty_object_of(c);
+    }
+    Type *src = resolve(t->elem, pos);
+    Type *b = ty_strip_null(src);
+    if (free_tparam(b)) return t; /* (a template's own text: per instance) */
+    if (b->kind == TY_OBJECT && b->cls->is_tuple) { /* { [K in keyof T]: F<T[K]> } with T a tuple: a tuple of F<each> */
+        int n = b->cls->nfields;
+        Type **ps = xs_alloc(sizeof(Type *) * (size_t)n);
+        for (int i = 0; i < n; i++) {
+            Type *ix = xs_alloc(sizeof *ix);
+            ix->kind = TY_TPARAM;
+            ix->tname = xs_sprintf("__idx:%d", i);
+            ps[i] = resolve(subst_ftp(v, knames, &ix, 1), pos);
+        }
+        return tuple_type(ps, n, pos);
+    }
+    if (b->kind == TY_ARRAY) return ty_array_of(resolve(subst_ftp(v, knames, &ty_int, 1), pos));
+    if (b->kind == TY_MAP) {
+        Type *r = ty_map_of(b->key, resolve(subst_ftp(v, knames, &b->key, 1), pos));
+        r->record = b->record;
+        return r;
+    }
+    if (b->kind == TY_OBJECT && !b->cls->builtin) {
+        FieldSet fs = {0};
+        fields_here(b->cls, &fs);
+        Class *c = made_iface("map", pos);
+        for (int i = 0; i < fs.n; i++) {
+            Type *l = xs_alloc(sizeof *l);
+            *l = *ty_string;
+            l->tname = fs.f[i].name;
+            made_field(c, fs.f[i].name, resolve(subst_ftp(v, knames, &l, 1), pos), opt || fs.f[i].optional, pos);
+        }
+        late_inline_class(c);
+        return ty_object_of(c);
+    }
+    xs_error(XS1019, pos, "write the type itself", "{ [%s in keyof %s]: ... }: xisto maps the keys of a tuple, an array, an object or a Record", kn, ty_name(src));
+    return NULL;
+}
+/* A & B where a side only resolves here (R & {...} in a generic's instance, typeof s & {...}): an interface of both's fields;
+   {...} & Record<string, V>: an object whose other keys are read by name, held as any (what the program reads of it is
+   checked as it is read) */
+static Type *inter_type(Type *t, Pos pos) {
+    static Class **ls, **rs, **made;
+    static int nmade;
+    Type *l = resolve(t->elem, pos), *r = resolve(t->key, pos);
+    Type *lb = ty_strip_null(l), *rb = ty_strip_null(r);
+    if (free_tparam(lb) || free_tparam(rb)) return t;
+    if ((lb->kind == TY_MAP && lb->record) || (rb->kind == TY_MAP && rb->record)) return ty_any;
+    if (lb->kind != TY_OBJECT || rb->kind != TY_OBJECT || lb->cls->builtin || rb->cls->builtin)
+        xs_error(XS1019, pos, "intersect interfaces or object types: A & { extra: T }", "unsupported type in an intersection: %s & %s", ty_name(l), ty_name(r));
+    for (int i = 0; i < nmade; i++) if (ls[i] == lb->cls && rs[i] == rb->cls) return ty_object_of(made[i]);
+    Class *c = made_iface("and", pos);
+    Mixin *m = xs_alloc(sizeof *m);
+    m->pos = pos;
+    m->kind = "IntersectionType";
+    m->a = xs_alloc(sizeof *m->a); m->a->pos = pos; m->a->cls = lb->cls->name; m->a->klass = lb->cls;
+    m->b = xs_alloc(sizeof *m->b); m->b->pos = pos; m->b->cls = rb->cls->name; m->b->klass = rb->cls;
+    c->mixin = m;
+    late_inline_class(c);
+    ls = realloc(ls, sizeof(Class *) * (size_t)(nmade + 1)); ls[nmade] = lb->cls;
+    rs = realloc(rs, sizeof(Class *) * (size_t)(nmade + 1)); rs[nmade] = rb->cls;
+    made = realloc(made, sizeof(Class *) * (size_t)(nmade + 1)); made[nmade++] = c;
+    return ty_object_of(c);
+}
 static Type *resolve(Type *t, Pos pos) {
+    if (t->kind == TY_TPARAM && t->tname && !strcmp(t->tname, "__index")) { /* T[K], T[keyof T] */
+        Type *o = resolve(t->elem, pos);
+        if (free_tparam(ty_strip_null(o))) return t;
+        Type *r;
+        if (t->key->kind == TY_TPARAM && t->key->tname && !strcmp(t->key->tname, "__keyof")) r = values_of(o, pos);
+        else {
+            Type *k = t->key->kind == TY_TPARAM && t->key->tname && !strncmp(t->key->tname, "__idx:", 6) ? t->key : resolve(t->key, pos);
+            if (free_tparam(k)) return t;
+            r = index_of(o, k, pos);
+        }
+        *t = *r;
+        return t;
+    }
+    if (t->kind == TY_TPARAM && t->tname && !strncmp(t->tname, "__mapped", 8)) {
+        Type *r = mapped_type(t, pos);
+        if (r != t) *t = *r;
+        return t;
+    }
+    if (t->kind == TY_TPARAM && t->tname && !strcmp(t->tname, "__inter")) {
+        Type *r = inter_type(t, pos);
+        if (r != t) *t = *r;
+        return t;
+    }
+    if (t->kind == TY_TPARAM && t->tname && !strcmp(t->tname, "__awaited")) { /* Awaited<...>: a promise's value */
+        Type *r = resolve(t->elem, pos);
+        if (r->kind == TY_PROMISE) r = r->elem;
+        *t = *r;
+        return t;
+    }
+    if (t->kind == TY_TPARAM && t->tname && !strcmp(t->tname, "__ret_of_t")) { /* ReturnType<C['m']>: what C's m returns */
+        Type *of = t->elem, *r = NULL;
+        if (of->kind == TY_TPARAM && of->tname && !strncmp(of->tname, "__field_of:", 11)) {
+            const char *mn = of->tname + 11;
+            Type *o = ty_strip_null(resolve(of->elem, pos));
+            if (o->kind == TY_OBJECT) {
+                Func *m = find_method(o->cls, mn);
+                if (m) {
+                    Module *was = cur_mod;
+                    Scope *ss = scope;
+                    const char *sfn = xs_file_name, *ssrc = xs_source;
+                    if (o->cls->mod && o->cls->mod != cur_mod) enter_module(o->cls->mod);
+                    r = fret(m, pos);
+                    cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
+                }
+            }
+        }
+        if (!r) {
+            Type *f = resolve(of, pos);
+            if (f->kind == TY_FUNC) r = f->ret;
+        }
+        if (!r) xs_error(XS1019, pos, "write the type itself", "ReturnType<%s>: not a function or method", ty_name(of));
+        *t = *r;
+        return t;
+    }
+    if (t->kind == TY_TPARAM && t->tname && !strncmp(t->tname, "__ctor_param_of:", 16)) { /* ConstructorParameters<typeof C>[i] */
+        const char *spec = t->tname + 16, *colon = strrchr(spec, ':');
+        char *cn = xs_strndup(spec, (size_t)(colon - spec));
+        int i = atoi(colon + 1);
+        Class *c = find_class(cn);
+        Func *f = c ? eff_ctor(c) : NULL;
+        if (!c) xs_error(XS1019, pos, "write the type itself", "ConstructorParameters<typeof %s>: no class '%s' here", cn, cn);
+        Type *r = ty_unknown;
+        if (f && i < f->nparams) {
+            Module *was = cur_mod;
+            Scope *ss = scope;
+            const char *sfn = xs_file_name, *ssrc = xs_source;
+            if (c->mod && c->mod != cur_mod) enter_module(c->mod);
+            r = resolve(f->params[i].type, pos);
+            cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
+        }
+        *t = *r;
+        return t;
+    }
     if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__ret_of:", 9) == 0) { /* (generated reflection) */
         const char *dot = strchr(t->tname + 9, '.');
         Class *c = find_class(xs_strndup(t->tname + 9, (size_t)(dot - (t->tname + 9))));
@@ -1548,6 +1827,8 @@ static Type *resolve(Type *t, Pos pos) {
     }
     if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__ret_of_fn:", 12) == 0) { /* ReturnType<typeof f> */
         Func *f = lookup_func(t->tname + 12);
+        Binding *fb = f ? NULL : lookup(t->tname + 12);
+        if (fb && fb->type && fb->type->kind == TY_FUNC && fb->type->ret) { *t = *fb->type->ret; return t; } /* (a const holding an arrow) */
         if (!f || f->ntparams) xs_error(XS1019, pos, "write the type itself", "ReturnType<typeof %s>: no function '%s' here", t->tname + 12, t->tname + 12);
         Type *r = fret(f, pos);
         *t = *r; /* (in place: whoever holds it now holds the function's type) */
@@ -4263,7 +4544,6 @@ static void error_class(Class *c) {
 }
 /* class X extends PartialType(Y): Y's fields (its bases' first) copied into X, optional for PartialType, without
    the keys OmitType leaves out or with only those PickType keeps; X extends nothing (as in Nest, a new class) */
-typedef struct { Field *f; int n; } FieldSet;
 static void mixin_eval(Mixin *m, FieldSet *out);
 static void apply_mixin(Class *c);
 static void fs_add(FieldSet *out, Field f) {
@@ -4300,6 +4580,20 @@ static bool key_in(Mixin *m, const char *name) {
     return false;
 }
 static void mixin_eval(Mixin *m, FieldSet *out) {
+    if (!m->kind && m->ty) { /* a side the parser could not name: resolved where it was written */
+        Module *was = cur_mod;
+        Scope *ss = scope;
+        const char *sfn = xs_file_name, *ssrc = xs_source;
+        if (m->mod && m->mod != cur_mod) enter_module(m->mod);
+        bool open = false; /* (Dto<T> in the generic's own text: per instance) */
+        for (int i = 0; m->ty->kind == TY_OBJECT && i < m->ty->ntargs; i++) open = open || free_tparam(ty_strip_null(m->ty->targs[i]));
+        Type *r = ty_strip_null(free_tparam(m->ty) || open ? m->ty : resolve(m->ty, m->pos));
+        if (r->kind == TY_OBJECT && !r->cls->builtin && !open) class_fields_all(r->cls, out);
+        else if (!free_tparam(r) && !open)
+            xs_error(XS1019, m->pos, "intersect interfaces or object types: A & { extra: T }", "unsupported type in an intersection or mapped type: %s", ty_name(r));
+        cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
+        return;
+    }
     if (!m->kind) {
         Class *k = m->klass ? m->klass : find_class(m->cls);
         if (!k || k->builtin) xs_error(XS9031, m->pos, NULL, "unknown class '%s'", m->cls);
@@ -4308,6 +4602,24 @@ static void mixin_eval(Mixin *m, FieldSet *out) {
         class_fields_all(k, out);
         enter_module(was);
         return;
+    }
+    if (m->keyty) { /* Pick<G, Campo>: the literals the alias names */
+        Module *was = cur_mod;
+        Scope *ss = scope;
+        const char *sfn = xs_file_name, *ssrc = xs_source;
+        if (m->mod && m->mod != cur_mod) enter_module(m->mod);
+        Type *k = resolve(m->keyty, m->pos);
+        cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
+        m->keyty = NULL;
+        if (k->kind == TY_STRING && k->nslits) { m->keys = (char **)k->slits; m->nkeys = k->nslits; }
+        else if (k->kind == TY_STRING && k->tname) { m->keys = xs_alloc(sizeof(char *)); m->keys[0] = (char *)k->tname; m->nkeys = 1; }
+        else if (k->kind == TY_UNION) {
+            m->keys = xs_alloc(sizeof(char *) * (size_t)k->nparams);
+            for (int i = 0; i < k->nparams; i++) {
+                if (k->params[i]->kind != TY_STRING || !k->params[i]->tname) xs_error(XS1019, m->pos, "name the keys: Omit<A, 'id' | 'name'>", "the keys are string literals");
+                m->keys[m->nkeys++] = (char *)k->params[i]->tname;
+            }
+        } else xs_error(XS1019, m->pos, "name the keys: Omit<A, 'id' | 'name'>", "the keys are string literals");
     }
     FieldSet a = {0};
     mixin_eval(m->a, &a);
@@ -4386,6 +4698,17 @@ static bool has_tparam(Type *t) {
 /* binds the type parameters of pat from got (the type of an argument, or the expected result) */
 static void unify(Type *pat, Type *got, Func *tmpl, Type **bind) {
     if (!pat || !got) return;
+    if (pat->kind == TY_TPARAM && pat->tname && !strcmp(pat->tname, "__inter")) { /* R & { fam: F[] } against an object: R is
+                                                                                    the object, F from its field fam */
+        unify(pat->elem, got, tmpl, bind);
+        Type *k = pat->key, *g = ty_strip_null(got);
+        if (k && k->kind == TY_OBJECT && k->cls && g->kind == TY_OBJECT && g->cls)
+            for (int i = 0; i < k->cls->nfields; i++) {
+                Field *gf = find_field(g->cls, k->cls->fields[i].name, NULL);
+                if (gf) unify(k->cls->fields[i].type, gf->type, tmpl, bind);
+            }
+        return;
+    }
     if (pat->kind == TY_TPARAM) {
         if (got->kind == TY_NULL || got->kind == TY_VOID) return;
         if (got->kind == TY_LITINT) got = ty_number; /* as TypeScript infers it */
@@ -7276,30 +7599,35 @@ static void check_expr_in(Expr *e, Type *expected) {
                 Type *ft = b->type;
                 e->lhs->type = ft;
                 e->lhs->cname = b->cname;
-                if (1) /* (any function value: an argument left out where the parameter can be null, as an optional one, e.g. createParamDecorator(...)() with data?) a decorator for members also used on a class ((c, m: MethodInfo | null) => void, @SetMetadata on a controller): null for what a class has not */
-                    while (e->args.len < ft->nparams && (ft->params[e->args.len]->kind == TY_NULLABLE || ft->params[e->args.len]->kind == TY_UNKNOWN)) {
-                        Expr *nul = xs_alloc(sizeof *nul);
-                        nul->kind = E_NULL; nul->pos = e->pos; nul->field = -1;
-                        expr_list_push(&e->args, nul);
-                    }
-                pack_rest(e, ft);
                 Func *af = b->origin && b->origin->arrow_fn ? b->origin->arrow_fn : b->arrow_fn;
-                if (af && af->nparams == ft->nparams) /* a const arrow's literal defaults fill the arguments left out */
-                    while (e->args.len < ft->nparams) {
-                        Expr *d = af->params[e->args.len].dflt;
-                        bool lit = d && (d->kind == E_NUMBER || d->kind == E_STRING || d->kind == E_BOOL || d->kind == E_NULL);
-                        bool made = d && (d->kind == E_NEW_OBJ || ((d->kind == E_OBJLIT || d->kind == E_ARRAY_LIT) && d->args.len == 0)); /* (agora = new Date(), binds = {}): made again at each call, as in JS */
-                        for (int k = 0; made && k < d->args.len; k++) {
-                            Expr *a = d->args.items[k];
-                            made = a->kind == E_NUMBER || a->kind == E_STRING || a->kind == E_BOOL || (a->kind == E_UNARY && a->lhs && a->lhs->kind == E_NUMBER);
-                        }
-                        /* (ilm = opts.ilm): a name or a field of one, read at the call (the arrow's own scope there) */
-                        bool read = d && (d->kind == E_IDENT || (d->kind == E_MEMBER && !d->is_call && d->lhs && d->lhs->kind == E_IDENT));
-                        if (!lit && !made && !read) break;
+                if (af && af->nparams != ft->nparams) af = NULL;
+                /* each argument left out: a const arrow's default (a literal, a new object, a name or a field of one:
+                   read at the call, the arrow's own scope there), else null where the parameter can be null (any
+                   function value, as an optional one: createParamDecorator(...)() with data?; a decorator for members
+                   also used on a class, (c, m: MethodInfo | null) => void: null for what a class has not) */
+                while (e->args.len < ft->nparams) {
+                    if (ft->rest && e->args.len == ft->nparams - 1) break; /* (the rest array: pack_rest) */
+                    Expr *d = af ? af->params[e->args.len].dflt : NULL;
+                    bool lit = d && (d->kind == E_NUMBER || d->kind == E_STRING || d->kind == E_BOOL || d->kind == E_NULL);
+                    bool made = d && (d->kind == E_NEW_OBJ || ((d->kind == E_OBJLIT || d->kind == E_ARRAY_LIT) && d->args.len == 0)); /* (agora = new Date(), binds = {}): made again at each call, as in JS */
+                    for (int k = 0; made && k < d->args.len; k++) {
+                        Expr *a = d->args.items[k];
+                        made = a->kind == E_NUMBER || a->kind == E_STRING || a->kind == E_BOOL || (a->kind == E_UNARY && a->lhs && a->lhs->kind == E_NUMBER);
+                    }
+                    bool read = d && (d->kind == E_IDENT || (d->kind == E_MEMBER && !d->is_call && d->lhs && d->lhs->kind == E_IDENT));
+                    if (lit || made || read) {
                         Expr *c = dflt_subst(d, af, NULL, 0, e->pos);
                         c->pos = e->pos;
                         expr_list_push(&e->args, c);
+                        continue;
                     }
+                    Type *pt = ft->params[e->args.len];
+                    if (pt->kind != TY_NULLABLE && pt->kind != TY_UNKNOWN) break;
+                    Expr *nul = xs_alloc(sizeof *nul);
+                    nul->kind = E_NULL; nul->pos = e->pos; nul->field = -1;
+                    expr_list_push(&e->args, nul);
+                }
+                pack_rest(e, ft);
                 if (e->args.len != ft->nparams) xs_error(XS8062, e->pos, NULL, "'%s' takes %d argument(s), got %d", name, ft->nparams, e->args.len);
                 for (int i = 0; i < e->args.len; i++) {
                     check_expr(e->args.items[i], ft->params[i]);
@@ -9023,6 +9351,11 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         return;
     case E_NEW_ARRAY: {
+        if (!e->elem_type) { /* new Array(n) where T[] goes: T */
+            Type *x = expected ? ty_strip_null(expected) : NULL;
+            if (!x || x->kind != TY_ARRAY) xs_error(XS1019, e->pos, "write the element type: new Array<number>(n)", "new Array(n) needs its element type here");
+            e->elem_type = x->elem;
+        }
         Type *et = e->elem_type ? resolve(e->elem_type, e->pos) : NULL;
         if (et && ty_is_heap(et) && et->kind != TY_NULLABLE && et->kind != TY_UNKNOWN) {
             /* new Array<R>(n) of objects or strings, filled by index later (results[i] = ...): its holes are null, as
