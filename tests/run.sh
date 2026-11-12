@@ -11,6 +11,9 @@ pass=0
 fail=0
 qbe=0
 
+# a program that does not end (an event loop that waits on nothing) fails instead of hanging the run
+LIMIT_S=120
+LIMIT=; command -v perl > /dev/null 2>&1 && LIMIT="perl -e alarm(shift);exec(@ARGV) $LIMIT_S"
 for f in tests/ok/*.ts; do
     name=$(basename "$f" .ts)
     in=/dev/null; [ -f "${f%.ts}.stdin" ] && in="${f%.ts}.stdin"   # NAME.stdin next to the program: its standard input, for Node and for xisto
@@ -38,7 +41,8 @@ for f in tests/ok/*.ts; do
 $(sed -n 's|^// warns: ||p' "$f")
 EOF_WARNS
     if [ -n "$wfail" ]; then echo "FAIL $f: $wfail"; fail=$((fail+1)); continue; fi
-    XISTO_RC_STATS=1 "$OUT/$name" < "$in" > "$OUT/$name.xisto" 2> "$OUT/$name.stats"
+    XISTO_RC_STATS=1 $LIMIT "$OUT/$name" < "$in" > "$OUT/$name.xisto" 2> "$OUT/$name.stats"
+    if [ $? -eq 142 ]; then echo "FAIL $f: still running after ${LIMIT_S}s (killed)"; fail=$((fail+1)); continue; fi
     if ! grep -q ' 0 still alive' "$OUT/$name.stats"; then
         echo "FAIL $f: leak: $(cat "$OUT/$name.stats")"; fail=$((fail+1)); continue
     fi
@@ -51,7 +55,7 @@ EOF_WARNS
     fi
     # the same program through the QBE backend, when it is inside the subset that backend covers
     if $XISTO build $bflags --backend=qbe -o "$OUT/$name-qbe" "$f" > "$OUT/$name.qbe.build" 2>&1; then
-        XISTO_RC_STATS=1 "$OUT/$name-qbe" < "$in" > "$OUT/$name.qbe" 2> "$OUT/$name.qbe.stats"
+        XISTO_RC_STATS=1 $LIMIT "$OUT/$name-qbe" < "$in" > "$OUT/$name.qbe" 2> "$OUT/$name.qbe.stats"
         if ! grep -q ' 0 still alive' "$OUT/$name.qbe.stats"; then
             echo "FAIL $f (qbe): leak: $(cat "$OUT/$name.qbe.stats")"; fail=$((fail+1))
         elif cmp -s "$OUT/$name.node" "$OUT/$name.qbe"; then
