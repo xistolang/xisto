@@ -1850,6 +1850,7 @@ static Func *lookup_func(const char *name) {
         Func *f = e->decl;
         if (f->mod == cur_mod || (f->exported && imports_name(cur_mod, f->mod, name))) return f;
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:arrays") == 0) return f; /* (reduce & co) */
+        if (!strcmp(name, "__xs_construct") && f->mod && f->mod->file && !strcmp(f->mod->file, "xisto:reflect")) return f; /* (new (c)()) */
         if (f->exported && (strstr(name, "__s_") || !strcmp(name, "__xs_fetch")) && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:url") == 0) return f; /* (URL.canParse, AbortSignal.timeout: statics of globals; fetch with its options in a value) */
         const char *st = strstr(name, "__s_"); /* a static method: visible where its class is imported */
         if (st && f->exported) {
@@ -11819,6 +11820,29 @@ static void infer_field_type(Class *c, Field *fd) {
             Type *t = st->decl_type ? resolve(st->decl_type, st->pos)
                     : st->init->kind == E_STRING ? ty_string : st->init->kind == E_BOOL ? ty_boolean : st->init->kind == E_NUMBER ? ty_number : NULL;
             if (!t) t = literal_type(st->init); /* (a const object or array: the shape of its literal) */
+            if (!t) { /* M: CONST with CONST = { A: 'x', B: 'y' } as const: the shape of a copy of its literal, checked there */
+                Expr *lit = st->init;
+                while (lit && lit->kind == E_AS && lit->elem_type) lit = lit->lhs;
+                bool leaves = lit && lit->kind == E_OBJLIT;
+                for (int k = 0; leaves && k < lit->args.len; k++) {
+                    Expr *a = lit->args.items[k];
+                    leaves = a->kind == E_STRING || a->kind == E_NUMBER || a->kind == E_BOOL || a->kind == E_NULL;
+                }
+                if (leaves) { /* (values of literals only: the copy shares nothing that checking changes) */
+                    Expr *cp = expr_copy(lit);
+                    cp->args = (ExprList){0};
+                    for (int k = 0; k < lit->args.len; k++) expr_list_push(&cp->args, expr_copy(lit->args.items[k]));
+                    Module *was = cur_mod;
+                    Class *cc = cur_class;
+                    enter_module(st->mod);
+                    cur_class = NULL;
+                    check_expr(cp, NULL);
+                    settle(cp);
+                    cur_class = cc;
+                    enter_module(was);
+                    t = cp->type;
+                }
+            }
             if (t) { fd->type = t; return; }
         }
         xs_error(XS3011, fd->pos, xs_sprintf("write the type: %s: T = %s;", fd->name, fd->init->str), "field '%s' has no type", fd->name);

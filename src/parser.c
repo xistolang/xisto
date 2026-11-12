@@ -437,6 +437,13 @@ static Type *parse_type(Parser *p) {
     accept(p, TK_PIPE); /* type T =\n  | "a"\n  | "b": a union may open with '|' */
     const char *open = p->tok.start;
     Pos tpos = p->tok.pos;
+    if (at(p, TK_LBRACE) && peek_is(p, TK_NEW)) { /* { new (): T }: a constructor, a class given as a value (its ClassInfo) */
+        int d = 0;
+        do { if (at(p, TK_LBRACE)) d++; else if (at(p, TK_RBRACE)) d--; next(p); } while (d > 0 && !at(p, TK_EOF));
+        t = ty_unknown;
+        if (at(p, TK_PIPE)) { next(p); Type *r = parse_type(p); (void)r; } /* ({ new (): T } | { name?: string }: unknown too) */
+        return t;
+    }
     if (at(p, TK_LBRACE)) { /* { a: T; b?: U }: an object type in place */
         t = parse_inline_object_type(p);
         if (at(p, TK_AMP)) t = inter_rest(p, t, open, tpos);
@@ -1393,6 +1400,20 @@ static Expr *parse_primary(Parser *p) {
     }
     case TK_NEW: {
         next(p);
+        if (at(p, TK_LPAREN)) { /* new (clazz as { new (): T })(): a class given as a value: its ClassInfo's construct(args) */
+            next(p);
+            Expr *cls = parse_expr(p);
+            expect(p, TK_RPAREN, NULL);
+            Expr *arr = new_expr(E_ARRAY_LIT, pos);
+            if (at(p, TK_LPAREN)) parse_args(p, &arr->args);
+            Expr *c = new_expr(E_CALL, pos);
+            c->lhs = new_expr(E_IDENT, pos);
+            c->lhs->str = "__xs_construct";
+            expr_list_push(&c->args, cls);
+            expr_list_push(&c->args, arr);
+            wants_reflect = true;
+            return c;
+        }
         Token name = expect(p, TK_IDENT, NULL);
         if (strcmp(name.str, "Intl") == 0 && at(p, TK_DOT)) { /* new Intl.DateTimeFormat(...): xisto:intl's Intl_DateTimeFormat */
             next(p);
@@ -5044,6 +5065,8 @@ static const char xs_reflect_src[] =
     "export interface ClassInfo {\n  id: string;\n  name: string;\n  params: ParamInfo[];\n"
     "  construct: (args: unknown[]) => unknown;\n  methods: MethodInfo[];\n  fields: FieldInfo[];\n"
     "  isInstance: (value: unknown) => boolean;\n  base: ClassInfo | null;\n}\n"
+    "// new (c)(...args) with c a class given as a value (the compiler calls this)\n"
+    "export function __xs_construct(c: unknown, args: unknown[]): unknown {\n  return (c as ClassInfo).construct(args);\n}\n"
     "// TypeScript's decorator types, as xisto's decorators are (global names, like Error)\n"
     "export type ClassDecorator = (c: ClassInfo, m: MethodInfo | null) => void;\n"
     "export type MethodDecorator = (c: ClassInfo, m: MethodInfo | null) => void;\n"
