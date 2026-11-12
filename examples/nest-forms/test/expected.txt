@@ -24,6 +24,9 @@ GET /api/forms/me  -> 401 {"message": "Unauthorized", "statusCode": 401}
 GET /api/forms/item/7  {"x-user": "caio"}-> 200 {"by": "caio", "id": "7"}
 GET /api/local  {"x-scope": "local"}-> 200 {"scope": "local"}
 GET /api/local  {"x-scope": "other"}-> 403 {"error": "Forbidden", "message": "scope local required", "statusCode": 403}
+GET /api/forms/denied/object  -> 403 {"message": "menu hidden", "statusCode": 403}
+GET /api/forms/denied/list  -> 400 {"error": "Bad Request", "message": ["first problem", "second problem"], "statusCode": 400}
+GET /api/forms/denied/plain  -> 403 {"message": "Forbidden", "statusCode": 403}
 GET /api/nope  -> 404 {"error": "Not Found", "message": "Cannot GET /api/nope", "statusCode": 404}
 GET /api/forms/nope?x=1  -> 404 {"error": "Not Found", "message": "Cannot GET /api/forms/nope?x=1", "statusCode": 404}
 POST /api/forms/settings {} -> 404 {"error": "Not Found", "message": "Cannot POST /api/forms/settings", "statusCode": 404}
