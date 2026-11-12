@@ -59,6 +59,9 @@ export { FileInterceptorSpec, UploadedFileData } from "./upload";
 export { Reflector } from "@nestjs/common"; // (Nest exports it from @nestjs/core)
 export { CorsOptions } from "@nestjs/common";
 
+/** A provider's class (which types what app.get gives) or its token. */
+export type TypeOrToken<T> = unknown;
+
 /** Options of NestFactory.create. */
 /** app.enableShutdownHooks(signals, { useProcessExit }) */
 export interface ShutdownHooksOptions {
@@ -1034,10 +1037,10 @@ export class NestApplication {
     return this;
   }
 
-  /** The instance of a provider. */
-  get(token: unknown): unknown {
+  /** The instance of a provider: app.get(ConfigService) is a ConfigService (a class given binds T), or by token. */
+  get<T = unknown>(token: TypeOrToken<T>): T {
     this.init();
-    return getInstance(token);
+    return getInstance(token) as T;
   }
 
   // xisto: a GET route served next to the controllers' (what Nest does through getHttpAdapter())

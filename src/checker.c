@@ -4155,8 +4155,9 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
     for (int i = 0; i < e->args.len && i < tmpl->nparams; i++) { /* manager.findOne(User, ...) with entity: EntityTarget<T>: T is User */
         Type *pt = tmpl->params[i].type;
         Expr *a = e->args.items[i];
-        if (!pt || pt->kind != TY_OBJECT || !pt->cls || !pt->cls->name || strcmp(pt->cls->name, "EntityTarget") != 0 || pt->ntargs != 1 ||
-            pt->targs[0]->kind != TY_TPARAM) continue;
+        if (!pt || pt->kind != TY_OBJECT || !pt->cls || !pt->cls->name || pt->ntargs != 1 || pt->targs[0]->kind != TY_TPARAM ||
+            (strcmp(pt->cls->name, "EntityTarget") != 0 && strcmp(pt->cls->name, "TypeOrToken") != 0)) continue;
+        /* (TypeOrToken<T>: app.get(ConfigService) gives a ConfigService, as Nest's get<T>(type: Type<T>): T) */
         if (a->kind == E_AS) { /* manager.findOne("TB_X" as never, ...): an entity by name; T is any (TypeORM's ObjectLiteral) */
             for (int k = 0; k < tmpl->ntparams; k++)
                 if (!bind[k] && strcmp(tmpl->tparams[k], pt->targs[0]->tname) == 0) bind[k] = ty_any;

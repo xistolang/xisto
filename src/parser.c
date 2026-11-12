@@ -2529,12 +2529,38 @@ static Stmt *parse_stmt(Parser *p) {
         if (accept(p, TK_CATCH)) {
             if (accept(p, TK_LPAREN)) {
                 s->name = expect(p, TK_IDENT, NULL).str;
-                if (accept(p, TK_COLON)) expect(p, TK_IDENT, NULL); /* catch (e: unknown): e is always an Error */
+                bool as_any = false;
+                if (accept(p, TK_COLON)) as_any = !strcmp(expect(p, TK_IDENT, NULL).str, "any"); /* catch (e: unknown): e is always an Error */
                 expect(p, TK_RPAREN, NULL);
+                s->else_body = parse_body(p);
+                if (as_any) {
+                    /* catch (e: any): e is what was thrown, read by name (e.code of a driver's error class; a field
+                       it lacks reads as undefined): const e: any = __caught.__thrown ?? __caught; */
+                    static int ncaught;
+                    const char *user = s->name;
+                    s->name = xs_sprintf("__caught%d", ncaught++);
+                    /* let e: any = __caught.__thrown; if (e === null) e = __caught; */
+                    Expr *h1 = new_expr(E_IDENT, pos); h1->str = s->name;
+                    Expr *h2 = new_expr(E_IDENT, pos); h2->str = s->name;
+                    Expr *th = new_expr(E_MEMBER, pos); th->lhs = h1; th->str = "__thrown";
+                    Stmt *v = new_stmt(S_VAR, pos); v->name = (char *)user; v->decl_type = ty_any; v->init = th;
+                    Expr *u1 = new_expr(E_IDENT, pos); u1->str = (char *)user;
+                    Expr *u2 = new_expr(E_IDENT, pos); u2->str = (char *)user;
+                    Expr *nul = new_expr(E_NULL, pos);
+                    Expr *test = new_expr(E_BINARY, pos); test->op = TK_EQ; test->lhs = u1; test->rhs = nul;
+                    Expr *as = new_expr(E_ASSIGN, pos); as->op = TK_ASSIGN; as->lhs = u2; as->rhs = h2;
+                    Stmt *se = new_stmt(S_EXPR, pos); se->expr = as;
+                    Stmt *iff = new_stmt(S_IF, pos); iff->cond = test; iff->body = block2(pos, se, NULL);
+                    StmtList nl = {0};
+                    stmt_list_push(&nl, v);
+                    stmt_list_push(&nl, iff);
+                    for (int i = 0; i < s->else_body->stmts.len; i++) stmt_list_push(&nl, s->else_body->stmts.items[i]);
+                    s->else_body->stmts = nl;
+                }
             } else {
                 s->name = "_err"; /* catch { } without a binding */
+                s->else_body = parse_body(p);
             }
-            s->else_body = parse_body(p);
         }
         if (at_ident(p, "finally")) {
             next(p);
