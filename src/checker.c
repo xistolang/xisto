@@ -1122,6 +1122,7 @@ static bool nullable_ok(Type *inner) {
 static Type *resolve(Type *t, Pos pos);
 static bool is_deco_type(Type *t);
 static bool early_global(const char *name);
+static Expr *pr_copy(Expr *e);
 static Type *ty_numkey(void);
 static Type *subst(Type *t, Class *tmpl, Type **args) {
     switch (t->kind) {
@@ -4351,7 +4352,20 @@ static void variance_arg_t(Expr *a, Func *f, int i, Type *ptype) {
         /* chaveGuia, (g: Guia) => string, where (x: unknown) => string goes: an adapter that reads each unknown as the
            function takes it (checked), when the callee only calls it */
         bool fits = true;
-        for (int k = 0; k < at->nparams && fits; k++) fits = ty_equal(at->params[k], pt->params[k]) || pt->params[k]->kind == TY_UNKNOWN;
+        Func *argf = NULL; /* (the function given, when its body is known: its parameters' reads prove a copy is safe) */
+        if (a->kind == E_IDENT || a->kind == E_FUNC_REF) {
+            argf = lookup_func(a->str);
+            if (!argf) { Binding *ab = lookup(a->str); if (ab) argf = ab->origin && ab->origin->arrow_fn ? ab->origin->arrow_fn : ab->arrow_fn; }
+        }
+        for (int k = 0; k < at->nparams && fits; k++) {
+            if (ty_equal(at->params[k], pt->params[k]) || pt->params[k]->kind == TY_UNKNOWN) continue;
+            /* (o: Partial<Omit<Item, 'a'>>) where (o?: Partial<Item>) goes: each object the callee passes copied to the shape
+               the function takes, when the function provably only reads that parameter (a copy it cannot tell apart) */
+            Type *pa = ty_strip_null(at->params[k]), *pp = ty_strip_null(pt->params[k]);
+            fits = pa->kind == TY_OBJECT && pp->kind == TY_OBJECT && !pa->cls->builtin && !pp->cls->builtin && argf && k < argf->nparams &&
+                   (at->params[k]->kind == TY_NULLABLE || pt->params[k]->kind != TY_NULLABLE || argf->params[k].dflt) &&
+                   ro_param(argf, argf->params[k].name, 0);
+        }
         Expr *ref = NULL;
         if (fits && (a->kind == E_IDENT || a->kind == E_FUNC_REF) && a->str) { ref = xs_alloc(sizeof *ref); ref->kind = E_IDENT; ref->pos = a->pos; ref->field = -1; ref->str = a->str; }
         else if (fits) ref = pure_copy(a);
@@ -4366,16 +4380,56 @@ static void variance_arg_t(Expr *a, Func *f, int i, Type *ptype) {
         af->params = xs_alloc(sizeof(Param) * (size_t)(pt->nparams ? pt->nparams : 1));
         af->nparams = pt->nparams;
         Expr *call = xs_alloc(sizeof *call); call->kind = E_CALL; call->pos = a->pos; call->field = -1; call->lhs = ref;
+        Expr *omit_call = NULL; const char *omit_id = NULL; /* (the last argument left out when the callee gives none: its default) */
         for (int k = 0; k < pt->nparams; k++) {
             memset(&af->params[k], 0, sizeof(Param));
             af->params[k].name = xs_sprintf("__ad%d_%d", nad, k);
             af->params[k].type = pt->params[k];
             Expr *id = xs_alloc(sizeof *id); id->kind = E_IDENT; id->pos = a->pos; id->field = -1; id->str = af->params[k].name;
             Expr *arg = id;
-            if (!ty_equal(at->params[k], pt->params[k])) {
+            Type *pa = ty_strip_null(at->params[k]), *pp = ty_strip_null(pt->params[k]);
+            if (!ty_equal(at->params[k], pt->params[k]) && pa->kind == TY_OBJECT && pp->kind == TY_OBJECT) {
+                /* a copy in the function's shape: its fields that the given object has */
+                FieldSet tf = {0};
+                fields_here(pa->cls, &tf);
+                Expr *o = xs_alloc(sizeof *o); o->kind = E_OBJLIT; o->pos = a->pos; o->field = -1;
+                o->keys = xs_alloc(sizeof(char *) * (size_t)(tf.n ? tf.n : 1));
+                for (int q = 0; q < tf.n; q++) {
+                    if (!find_field(pp->cls, tf.f[q].name, NULL)) continue;
+                    Expr *rd = xs_alloc(sizeof *rd); rd->kind = E_MEMBER; rd->pos = a->pos; rd->field = -1; rd->str = tf.f[q].name;
+                    rd->lhs = xs_alloc(sizeof *rd->lhs); rd->lhs->kind = E_IDENT; rd->lhs->pos = a->pos; rd->lhs->field = -1; rd->lhs->str = af->params[k].name;
+                    o->keys[o->args.len] = tf.f[q].name;
+                    expr_list_push(&o->args, rd);
+                }
+                arg = o;
+                if (pt->params[k]->kind == TY_NULLABLE) {
+                    if (k == pt->nparams - 1 && argf && argf->params[k].dflt) { omit_call = xs_alloc(sizeof *omit_call); *omit_call = *call; omit_call->args = (ExprList){0};
+                        for (int q = 0; q < call->args.len; q++) expr_list_push(&omit_call->args, call->args.items[q]);
+                        omit_id = af->params[k].name; }
+                    else {
+                        Expr *z = xs_alloc(sizeof *z); z->kind = E_NULL; z->pos = a->pos; z->field = -1;
+                        Expr *t = xs_alloc(sizeof *t); t->kind = E_BINARY; t->op = TK_EQ; t->pos = a->pos; t->field = -1; t->lhs = pr_copy(id);
+                        t->rhs = xs_alloc(sizeof *t->rhs); t->rhs->kind = E_NULL; t->rhs->pos = a->pos; t->rhs->field = -1;
+                        Expr *c = xs_alloc(sizeof *c); c->kind = E_COND; c->pos = a->pos; c->field = -1; c->lhs = t;
+                        expr_list_push(&c->args, z);
+                        expr_list_push(&c->args, o);
+                        arg = c;
+                    }
+                }
+            } else if (!ty_equal(at->params[k], pt->params[k])) {
                 arg = xs_alloc(sizeof *arg); arg->kind = E_AS; arg->pos = a->pos; arg->field = -1; arg->lhs = id; arg->elem_type = at->params[k];
             }
             expr_list_push(&call->args, arg);
+        }
+        if (omit_call) { /* x == null ? f(a) : f(a, copy) */
+            Expr *t = xs_alloc(sizeof *t); t->kind = E_BINARY; t->op = TK_EQ; t->pos = a->pos; t->field = -1;
+            t->lhs = xs_alloc(sizeof *t->lhs); t->lhs->kind = E_IDENT; t->lhs->pos = a->pos; t->lhs->field = -1; t->lhs->str = (char *)omit_id;
+            t->rhs = xs_alloc(sizeof *t->rhs); t->rhs->kind = E_NULL; t->rhs->pos = a->pos; t->rhs->field = -1;
+            omit_call->lhs = pr_copy(call->lhs) ? pr_copy(call->lhs) : call->lhs;
+            Expr *c = xs_alloc(sizeof *c); c->kind = E_COND; c->pos = a->pos; c->field = -1; c->lhs = t;
+            expr_list_push(&c->args, omit_call);
+            expr_list_push(&c->args, call);
+            call = c;
         }
         nad++;
         Stmt *r = xs_alloc(sizeof *r); r->pos = a->pos;
@@ -6740,6 +6794,67 @@ static bool early_global(const char *name) {
     }
     return false;
 }
+/* a fresh, unchecked copy of a pure read (x, o.f, xs[i], m[k], literals) */
+static Expr *pr_copy(Expr *e) {
+    if (!e) return NULL;
+    switch (e->kind) {
+    case E_IDENT: case E_THIS: case E_STRING: case E_NUMBER: case E_BOOL: case E_NULL: {
+        Expr *c = xs_alloc(sizeof *c);
+        c->kind = e->kind; c->pos = e->pos; c->field = -1; c->str = e->str; c->num = e->num; c->ival = e->ival; c->is_int_lit = e->is_int_lit; c->boolean = e->boolean;
+        if (e->kind == E_STRING) c->lit_id = e->lit_id;
+        return c;
+    }
+    case E_MEMBER: case E_INDEX: {
+        if (e->is_call) return NULL;
+        Expr *l = pr_copy(e->lhs), *r = e->kind == E_INDEX ? pr_copy(e->rhs) : NULL;
+        if (!l || (e->kind == E_INDEX && !r)) return NULL;
+        Expr *c = xs_alloc(sizeof *c);
+        c->kind = e->kind; c->pos = e->pos; c->field = -1; c->str = e->str; c->lhs = l; c->rhs = r;
+        return c;
+    }
+    default: return NULL;
+    }
+}
+/* o[k] with o an object of a class and k a union of literals that are all its fields (k: keyof-like): the field
+   the key names, one of them (a ?: on k), read or written as that field */
+static bool lit_key_fields(Expr *idx, const char ***names, int *n) {
+    if (!tsc_checked() || !idx || idx->kind != E_INDEX || !pure_read(idx->lhs) || !pure_read(idx->rhs)) return false;
+    Expr *o = pr_copy(idx->lhs), *k = pr_copy(idx->rhs);
+    if (!o || !k) return false;
+    check_expr(o, NULL);
+    check_expr(k, NULL);
+    Type *ot = ty_strip_null(o->type), *kt = k->type;
+    if (ot->kind != TY_OBJECT || ot->cls->builtin || ot->cls->is_tuple || !kt || kt->kind != TY_STRING || !kt->nslits) return false;
+    for (int i = 0; i < kt->nslits; i++) if (!find_field(ot->cls, kt->slits[i], NULL)) return false;
+    *names = kt->slits;
+    *n = kt->nslits;
+    return true;
+}
+/* e (built around a target field name): k === 'a' ? E(a) : k === 'b' ? E(b) : E(last) */
+static Expr *lit_key_chain(Expr *idx, const char **names, int n, Expr *(*make)(Expr *field, void *ctx), void *ctx) {
+    Expr *out = NULL;
+    for (int i = n - 1; i >= 0; i--) {
+        Expr *f = xs_alloc(sizeof *f); f->kind = E_MEMBER; f->pos = idx->pos; f->field = -1; f->lhs = pr_copy(idx->lhs); f->str = (char *)names[i];
+        Expr *x = make(f, ctx);
+        if (!out) { out = x; continue; }
+        Expr *lit = xs_alloc(sizeof *lit); lit->kind = E_STRING; lit->pos = idx->pos; lit->field = -1; lit->str = (char *)names[i];
+        Expr *eq = xs_alloc(sizeof *eq); eq->kind = E_BINARY; eq->op = TK_EQ; eq->pos = idx->pos; eq->field = -1; eq->lhs = pr_copy(idx->rhs); eq->rhs = lit;
+        Expr *c = xs_alloc(sizeof *c); c->kind = E_COND; c->pos = idx->pos; c->field = -1; c->lhs = eq;
+        expr_list_push(&c->args, x);
+        expr_list_push(&c->args, out);
+        out = c;
+    }
+    return out;
+}
+static Expr *lk_same(Expr *f, void *ctx) { (void)ctx; return f; }
+static Expr *lk_op(Expr *f, void *ctx) { /* (the assignment or ++/-- e, its target the field) */
+    Expr *e = ctx;
+    Expr *c = xs_alloc(sizeof *c);
+    *c = *e;
+    c->lhs = f;
+    if (e->rhs) c->rhs = pr_copy(e->rhs) ? pr_copy(e->rhs) : e->rhs;
+    return c;
+}
 static void check_expr_in(Expr *e, Type *expected) {
     if (e->prechecked) return;
     if (e->kind == E_CALL && !e->lhs && e->builtin.cfn && e->type) return; /* a runtime call the checker made (wrap_call): checked */
@@ -7380,6 +7495,26 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (other->type->kind != TY_NULLABLE && other->type->kind != TY_NULL && other->type->kind != TY_UNKNOWN) {
                     /* x === null (or undefined) with x never null: always false, as TypeScript lets it be written
                        (a check kept from code where the value could be absent) */
+                    if (tsc_checked() && other->kind == E_INDEX && other->lhs && other->rhs && pure_read(other->lhs) && pure_read(other->rhs) &&
+                        other->lhs->type && other->lhs->type->kind == TY_ARRAY) {
+                        /* REGRA[i] != null with REGRA a number[]: JavaScript's undefined past its end; here 0 <= i < REGRA.length */
+                        bool neq = e->op == TK_NEQ;
+                        Pos at = e->pos;
+                        Expr *arr = expr_copy(other->lhs), *ix = expr_copy(other->rhs), *ix2 = expr_copy(other->rhs);
+                        arr->prechecked = false; ix->prechecked = false; ix2->prechecked = false;
+                        Expr *len = xs_alloc(sizeof *len); len->kind = E_MEMBER; len->pos = at; len->field = -1; len->lhs = arr; len->str = "length";
+                        Expr *lo = xs_alloc(sizeof *lo); lo->kind = E_BINARY; lo->op = TK_GE; lo->pos = at; lo->field = -1; lo->lhs = ix; lo->rhs = num_lit(at, 0, true);
+                        Expr *hi = xs_alloc(sizeof *hi); hi->kind = E_BINARY; hi->op = TK_LT; hi->pos = at; hi->field = -1; hi->lhs = ix2; hi->rhs = len;
+                        memset(e, 0, sizeof *e);
+                        e->kind = E_BINARY; e->op = TK_AND; e->pos = at; e->field = -1; e->lhs = lo; e->rhs = hi;
+                        if (!neq) {
+                            Expr *in = expr_copy(e);
+                            memset(e, 0, sizeof *e);
+                            e->kind = E_UNARY; e->op = TK_NOT; e->pos = at; e->field = -1; e->lhs = in;
+                        }
+                        check_expr(e, ty_boolean);
+                        return;
+                    }
                     if (!pure_read(other))
                         xs_error(XS2001, e->pos, "only values declared as T | null can be null", "%s can never be null", ty_name(other->type));
                     bool neq = e->op == TK_NEQ;
@@ -7407,6 +7542,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 { /* a === b with both T | null (T a primitive): equal when both are null or both hold the same value */
                     Type *lt = ty_strip_null(e->lhs->type), *rt = ty_strip_null(e->rhs->type);
                     bool prim = (is_numeric(lt) && is_numeric(rt)) || (lt->kind == TY_STRING && rt->kind == TY_STRING) ||
+                                (tsc_checked() && (lt->kind == TY_UNKNOWN || rt->kind == TY_UNKNOWN)) || /* ((v ?? null) === (o ?? null): by value) */
                                 (lt->kind == TY_BOOLEAN && rt->kind == TY_BOOLEAN) ||
                                 /* a column read as string | number | null against a string: by what each holds, as === does */
                                 (prim_like(lt) && prim_like(rt) && (lt->kind == TY_UNION || rt->kind == TY_UNION || lt->kind == TY_ENUM || rt->kind == TY_ENUM));
@@ -7480,6 +7616,16 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     case E_ASSIGN:
     case E_POSTFIX: {
+        {   /* d[CONTADOR[motivo]]++ with the key a union of d's field names: that field's ++ */
+            const char **names; int n;
+            if (e->lhs && e->lhs->kind == E_INDEX && (!e->rhs || pure_read(e->rhs)) && lit_key_fields(e->lhs, &names, &n)) {
+                Expr *op = expr_copy(e);
+                Expr *chain = lit_key_chain(e->lhs, names, n, lk_op, op);
+                *e = *chain;
+                check_expr(e, expected);
+                return;
+            }
+        }
         if (tsc_checked() && e->lhs->kind == E_INDEX && e->lhs->lhs && e->lhs->lhs->kind == E_AS && e->lhs->lhs->op != TK_NOT &&
             e->lhs->lhs->lhs && e->lhs->lhs->lhs->kind == E_AS && e->lhs->lhs->lhs->elem_type && e->lhs->lhs->lhs->elem_type->kind == TY_UNKNOWN) {
             /* (result as unknown as Record<string, unknown>)[k] = v with result an object of a class: its field named k
@@ -8426,6 +8572,15 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     }
     case E_INDEX:
+        {   /* o[k] read, k a union of o's field names: that field */
+            const char **names; int n;
+            if (e != dyn_lvalue && lit_key_fields(e, &names, &n)) {
+                Expr *chain = lit_key_chain(e, names, n, lk_same, NULL);
+                *e = *chain;
+                check_expr(e, expected);
+                return;
+            }
+        }
         if (e->lhs->kind == E_IDENT && e->lhs->str && !lookup(e->lhs->str) && find_enum(e->lhs->str) && !find_enum(e->lhs->str)->is_string) {
             /* TipoProtocolo[s as keyof typeof TipoProtocolo] with s a string: the member of that name's value, undefined
                when there is none (s === 'A' ? 1 : s === 'B' ? 2 : undefined) */
@@ -8622,6 +8777,20 @@ static void check_expr_in(Expr *e, Type *expected) {
         e->type = e->lhs->type->elem;
         return;
     case E_MEMBER:
+        if (e->is_call && e->str && !strcmp(e->str, "toString") && e->args.len == 0 && e->lhs && tsc_checked()) {
+            /* v.toString() with v an unknown (narrowed by typeof to a number or a bigint): String(v) */
+            check_expr(e->lhs, NULL);
+            e->lhs->prechecked = true;
+            if (e->lhs->type && e->lhs->type->kind == TY_UNKNOWN && !ty_is_any(e->lhs->type)) {
+                Expr *v = e->lhs;
+                memset(e, 0, sizeof *e);
+                e->kind = E_CALL; e->pos = v->pos; e->field = -1;
+                e->lhs = xs_alloc(sizeof *e->lhs); e->lhs->kind = E_IDENT; e->lhs->pos = v->pos; e->lhs->field = -1; e->lhs->str = "String";
+                expr_list_push(&e->args, v);
+                check_expr(e, expected);
+                return;
+            }
+        }
         if (e->is_call && e->str && !strcmp(e->str, "apply") && e->args.len == 2 && e->lhs && e->lhs->kind != E_IDENT ? false :
             e->is_call && e->str && !strcmp(e->str, "apply") && e->args.len == 2 && e->lhs && !lookup_func(e->lhs->str) && lookup(e->lhs->str) &&
             lookup(e->lhs->str)->type && ty_strip_null(lookup(e->lhs->str)->type)->kind == TY_FUNC && ty_strip_null(lookup(e->lhs->str)->type)->rest) {
@@ -11489,7 +11658,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                     Type *at = a->type, *ab = at->kind == TY_PROMISE ? at->elem : at;
                     TypeKind k = ty_strip_null(ab)->kind;
                     if (pres && (k == TY_OBJECT || k == TY_MAP || k == TY_ARRAY)) want_b = at->kind == TY_PROMISE ? at : ty_promise_of(at);
-                    else if (b->kind == E_OBJLIT && at->kind != TY_PROMISE && (k == TY_OBJECT || k == TY_MAP)) want_b = at;
+                    else if (b->kind == E_OBJLIT && a->kind != E_OBJLIT && at->kind != TY_PROMISE && (k == TY_OBJECT || k == TY_MAP)) want_b = at;
+                    else if (b->kind == E_NEW_MAP && !b->elem_type && (k == TY_MAP || k == TY_SET)) want_b = ty_strip_null(ab); /* (c ? await f() : new Map()) */
                 }
                 check_expr(b, want_b);
                 pop_scope();
@@ -11507,6 +11677,40 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (expected && is_numeric(expected)) { coerce_lit(a, expected); coerce_lit(b, expected); }
         } else if (a->type->kind == TY_LITINT) coerce_lit(a, is_numeric(ty_strip_null(b->type)) || b->type->kind == TY_ENUM ? b->type : ty_number);
         else if (b->type->kind == TY_LITINT) coerce_lit(b, is_numeric(ty_strip_null(a->type)) || a->type->kind == TY_ENUM ? a->type : ty_number);
+        if (tsc_checked() && a->kind == E_OBJLIT && b->kind == E_OBJLIT && a->cls && b->cls && a->cls != b->cls &&
+            a->cls->nfields == b->cls->nfields && a->args.len == a->cls->nfields && b->args.len == b->cls->nfields) {
+            /* c ? { cd: ctl.cd, tab: ctl.tab } : { cd: null, tab: 0 }: one object type, null where a branch gives null */
+            Class *A = a->cls, *B = b->cls;
+            bool same = true;
+            for (int i = 0; i < A->nfields && same; i++) same = !strcmp(A->fields[i].name, B->fields[i].name);
+            if (same) {
+                Class *M = made_iface("cond", e->pos);
+                bool ok = true;
+                for (int i = 0; i < A->nfields && ok; i++) {
+                    Type *ta = A->fields[i].type, *tb = B->fields[i].type, *t;
+                    if (ty_equal(ta, tb)) t = ta;
+                    else if ((tb->kind == TY_UNKNOWN || tb->kind == TY_NULL) && nullable_ok(ty_strip_null(ta))) t = ty_nullable_of(ty_strip_null(ta));
+                    else if ((ta->kind == TY_UNKNOWN || ta->kind == TY_NULL) && nullable_ok(ty_strip_null(tb))) t = ty_nullable_of(ty_strip_null(tb));
+                    else if (ty_equal(ty_strip_null(ta), ty_strip_null(tb))) t = ty_nullable_of(ty_strip_null(ta));
+                    else ok = false;
+                    if (ok) made_field(M, A->fields[i].name, t, A->fields[i].optional || B->fields[i].optional, e->pos);
+                }
+                if (ok) {
+                    late_inline_class(M);
+                    Expr *xs[2] = {a, b};
+                    for (int q = 0; q < 2; q++) {
+                        Expr *x = xs[q];
+                        for (int i = 0; i < x->args.len; i++) {
+                            int fi = -1;
+                            for (int f = 0; f < M->nfields; f++) if (!strcmp(M->fields[f].name, x->keys[i])) fi = f;
+                            if (fi >= 0) expect_type(x->args.items[i], M->fields[fi].type, xs_sprintf("field '%s'", x->keys[i]));
+                        }
+                        x->cls = M;
+                        x->type = ty_object_of(M);
+                    }
+                }
+            }
+        }
         if (!ty_equal(a->type, b->type)) { /* T and null make T | null; two classes make their nearest common base */
             Type *ta = a->type, *tb = b->type, *u = NULL;
             bool nul = ta->kind == TY_NULL || tb->kind == TY_NULL || ta->kind == TY_NULLABLE || tb->kind == TY_NULLABLE;
