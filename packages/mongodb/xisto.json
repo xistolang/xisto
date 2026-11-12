@@ -1,0 +1,10 @@
+{
+  "name": "mongodb",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "The MongoDB Node driver (v6) contract for what mongoose needs: MongoClient (connection strings, server selection with serverSelectionTimeoutMS, a pool per worker thread, SCRAM-SHA-256), OP_MSG commands with BSON written from xisto values and read back as JSON, Db.command, Collection find/insert/update/delete/count/aggregate, bson's ObjectId, MongoServerError/MongoServerSelectionError. No TLS or mongodb+srv:// yet.",
+  "implements": { "mongodb": "^6", "bson": "^6" },
+  "main": "index.ts",
+  "native": ["native/mongo.c"],
+  "needs": ["net", "crypto"]
+}

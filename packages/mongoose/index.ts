@@ -1,152 +1,27 @@
-// mongoose (v8) for xisto, stage 1: the API without a MongoDB driver.
+// mongoose (v8) for xisto, over the mongodb package (OP_MSG, BSON, pool, SCRAM-SHA-256: packages/mongodb).
 //
-// What works without a server, as mongoose does: ObjectId (12 bytes: a 4-byte timestamp, 5 random bytes per process
-// and a 3-byte counter, as the bson package makes them; hex, JSON, equals, getTimestamp, isValid), Schema (paths,
-// options, indexes, clone, set/get, virtuals), Model and Query objects (the chain sort/skip/limit/select/lean is
-// built and awaitable), Connection (readyState, name, models, useDb, model, events) and createConnection.
-//
-// What needs the server rejects with an Error whose message starts with NO_DRIVER: every Model/Query operation
-// (find, findOne, create, countDocuments, bulkWrite...), Connection.asPromise()/openUri() and a Nest
-// MongooseModule.forRoot connection. Only when it is used: a program that never opens a connection or runs an
-// operation compiles and runs (an app that registers its Mongo modules only when MONGO_URI is set boots without it).
-//
-// Stage 2 (the driver: OP_MSG, BSON, SCRAM, pool) plugs in behind one seam: every operation is turned into a
-// MongoDB command document (find, insert, update, delete, count, distinct, findAndModify, aggregate) and sent with
-// Connection.runCommand(command), which asks the driver set with setMongoDriver(). Without one it rejects.
-// Node: top-level `ObjectId` is the bson class here (in mongoose it is the SchemaType Schema.Types.ObjectId);
-// `new Types.ObjectId(x)` is written `new ObjectId(x)` (xisto has no namespaces as values yet; Types.ObjectId as a
-// type and Types.ObjectId.isValid/createFromHexString work).
+// ObjectId is bson's (from mongodb, re-exported). Schema: paths, options, indexes, clone, set/get, virtuals.
+// Connection (createConnection, MongooseModule's): openUri/asPromise select the server through the driver
+// (serverSelectionTimeoutMS; a failure is MongooseServerSelectionError with the driver's last error, and the
+// connection emits 'disconnected' then 'error'), readyState 0 -> 2 -> 1 and 3 -> 0 on close, 'connected'/'open'/
+// 'disconnected'/'close' events, db.command, useDb (the same client, another database), getClient().options.
+// A model made on an open connection is initialised as mongoose does: createCollection (autoCreate) and its indexes
+// (autoIndex: the schema's option, else the connection's, else true).
+// Model: find/findOne/findById (sort, skip, limit, select, lean), countDocuments, estimatedDocumentCount, exists,
+// distinct, create/insertMany (casting by the schema: defaults, lowercase/trim, ObjectId/Date/Number paths, _id,
+// timestamps, __v, strict), updateOne/updateMany (timestamps, $setOnInsert defaults on upsert), findOneAndUpdate/
+// findByIdAndUpdate/findOneAndDelete/findByIdAndDelete (findAndModify), deleteOne/deleteMany, aggregate, bulkWrite.
+// Filters are cast by the schema (a string where the path is an ObjectId or _id becomes an ObjectId, a string or
+// number where it is a Date becomes a Date). Results are decoded into what the query gives (T, T[], counts, the
+// result classes): documents are objects of T (or the lean type), plain data with the fields T declares.
+// Node: a document is T itself (no save(), toObject() or extra fields T does not declare: a field T declares as
+// required that the stored document lacks fails the decode); `new Types.ObjectId(x)` is written `new ObjectId(x)`
+// (Types.ObjectId as a type and Types.ObjectId.isValid/createFromHexString work); a default that is a bare function
+// value such as Date.now gives null (write () => Date.now()); a RegExp value in a filter is not supported (use
+// { $regex, $options }); populate is ignored; middleware (pre/post hooks) and validation are not run.
 import { ClassInfo } from "xisto:reflect";
-
-export const NO_DRIVER = "mongoose: no MongoDB driver in xisto yet (stage 2)";
-
-// ---------- ObjectId ----------
-
-const HEX_DIGITS = "0123456789abcdef";
-
-function hexByte(n: int): string {
-  return HEX_DIGITS.charAt((n >> 4) & 15) + HEX_DIGITS.charAt(n & 15);
-}
-
-function isHex24(s: string): boolean {
-  if (s.length !== 24) {
-    return false;
-  }
-  return /^[0-9a-fA-F]{24}$/.test(s);
-}
-
-let processUnique = "";
-let oidCounter: int = -1;
-
-function randomByte(): int {
-  return Math.floor(Math.random() * 256);
-}
-
-/** the 24 hex digits of a new id for `seconds` (bson: timestamp, process-unique random, counter) */
-function generateHex(seconds: number): string {
-  if (processUnique.length === 0) {
-    for (let i = 0; i < 5; i++) {
-      processUnique += hexByte(randomByte());
-    }
-    oidCounter = randomByte() * 65536 + randomByte() * 256 + randomByte();
-  }
-  oidCounter = (oidCounter + 1) % 16777216;
-  const t: int = Math.trunc(seconds) % 4294967296;
-  let out = "";
-  out += hexByte(Math.trunc(t / 16777216) % 256) + hexByte(Math.trunc(t / 65536) % 256) + hexByte(Math.trunc(t / 256) % 256) + hexByte(t % 256);
-  out += processUnique;
-  out += hexByte(Math.trunc(oidCounter / 65536) % 256) + hexByte(Math.trunc(oidCounter / 256) % 256) + hexByte(oidCounter % 256);
-  return out;
-}
-
-/** bson's ObjectId: a 12-byte id, written as 24 hex digits */
-export class ObjectId {
-  private readonly hex: string = "";
-
-  /** new ObjectId(): a new id; new ObjectId("24 hex digits"); new ObjectId(seconds): a new id for that time */
-  constructor(id: unknown = null) {
-    if (id === null) {
-      this.hex = generateHex(Date.now() / 1000);
-    } else if (typeof id === "string") {
-      const s = id as string;
-      if (!isHex24(s)) {
-        throw new BSONError("input must be a 24 character hex string, 12 byte Uint8Array, or an integer");
-      }
-      this.hex = s.toLowerCase();
-    } else if (typeof id === "number") {
-      this.hex = generateHex(id as number);
-    } else if (id instanceof ObjectId) {
-      this.hex = (id as ObjectId).toHexString();
-    } else {
-      throw new BSONError("input must be a 24 character hex string, 12 byte Uint8Array, or an integer");
-    }
-  }
-
-  toHexString(): string {
-    return this.hex;
-  }
-  toString(): string {
-    return this.hex;
-  }
-  toJSON(): string {
-    return this.hex;
-  }
-  /** the same id (another ObjectId, or its 24 hex digits in any case) */
-  equals(other: unknown): boolean {
-    if (other === null) {
-      return false;
-    }
-    if (other instanceof ObjectId) {
-      return (other as ObjectId).toHexString() === this.hex;
-    }
-    if (typeof other === "string") {
-      const s = other as string;
-      return isHex24(s) && s.toLowerCase() === this.hex;
-    }
-    return false;
-  }
-  /** the time in its first 4 bytes (seconds) */
-  getTimestamp(): Date {
-    return new Date(parseInt(this.hex.substring(0, 8), 16) * 1000);
-  }
-
-  static isValid(id: unknown): boolean {
-    return validObjectId(id);
-  }
-  static createFromHexString(hex: string): ObjectId {
-    return new ObjectId(hex);
-  }
-  /** an id whose timestamp is `seconds` and whose other 8 bytes are zero */
-  static createFromTime(seconds: number): ObjectId {
-    const t: int = Math.trunc(seconds) % 4294967296;
-    const h = hexByte(Math.trunc(t / 16777216) % 256) + hexByte(Math.trunc(t / 65536) % 256) + hexByte(Math.trunc(t / 256) % 256) + hexByte(t % 256);
-    return new ObjectId(h + "0000000000000000");
-  }
-}
-
-function validObjectId(id: unknown): boolean {
-  if (id === null) {
-    return false;
-  }
-  if (id instanceof ObjectId) {
-    return true;
-  }
-  if (typeof id === "string") {
-    return isHex24(id as string);
-  }
-  if (typeof id === "number") {
-    return Number.isInteger(id as number);
-  }
-  return false;
-}
-
-/** bson's error for an invalid id */
-export class BSONError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "BSONError";
-  }
-}
+import { Db, MongoBulkWriteError, MongoClient, MongoClientOptions, MongoServerError, MongoServerSelectionError, ObjectId, validObjectId, writeReply } from "mongodb";
+export { BSONError, MongoServerError, ObjectId } from "mongodb";
 
 /** mongoose.isValidObjectId(v): an ObjectId, 24 hex digits, or a number */
 export function isValidObjectId(v: unknown): boolean {
@@ -158,7 +33,7 @@ export function isObjectIdOrHexString(v: unknown): boolean {
   if (v instanceof ObjectId) {
     return true;
   }
-  return typeof v === "string" && isHex24(v as string);
+  return typeof v === "string" && /^[0-9a-fA-F]{24}$/.test(v as string);
 }
 
 // ---------- schema types ----------
@@ -349,7 +224,7 @@ export class Schema<T = unknown> {
   paths: Record<string, SchemaType> = {};
   /** virtual paths */
   virtuals: Record<string, VirtualType> = {};
-  private opts: Record<string, unknown> = {};
+  opts: Record<string, unknown> = {};
   private defs: Record<string, SchemaTypeOptions> = {};
   private own: SchemaIndex[] = [];
   private plugins: int = 0;
@@ -517,6 +392,395 @@ export class Schema<T = unknown> {
   }
 }
 
+// ---------- casting by the schema ----------
+
+/** the schema type at a path ("a", "a.b" through subdocuments), or null */
+function pathAt(schema: Schema, path: string): SchemaType | null {
+  const p = schema.path(path);
+  if (p !== null) {
+    return p;
+  }
+  const dot = path.indexOf(".");
+  if (dot > 0) {
+    const top = schema.paths[path.substring(0, dot)] ?? null;
+    if (top !== null) {
+      let sub = top.schema;
+      const c = top.caster;
+      if (sub === null && c !== null) sub = c.schema;
+      if (sub !== null) {
+        let rest = path.substring(dot + 1);
+        if (/^\d+\./.test(rest)) rest = rest.substring(rest.indexOf(".") + 1); /* arr.0.x */
+        return pathAt(sub, rest);
+      }
+    }
+  }
+  return null;
+}
+
+/** an object to walk (not an ObjectId, Date, array or bytes) */
+function isPlainObject(v: unknown): boolean {
+  if (v === null || typeof v !== "object") return false;
+  if (v instanceof ObjectId || v instanceof Date || v instanceof Uint8Array || Array.isArray(v)) return false;
+  return true;
+}
+
+/** the entries of an object, without the optional fields of a class that were never set (JSON.stringify leaves
+ *  them out, as undefined is left out in Node) */
+function entriesOf(v: unknown): [string, unknown][] {
+  const rec = v as Record<string, unknown>;
+  let present: Record<string, unknown> | null = null;
+  for (const x of Object.values(rec)) {
+    if (x === null) {
+      present = JSON.parse(JSON.stringify(v));
+      break;
+    }
+  }
+  const out: [string, unknown][] = [];
+  for (const [k, x] of Object.entries(rec)) {
+    if (typeof x === "function") continue;
+    if (x === null && present !== null && !(k in present)) continue;
+    out.push([k, x]);
+  }
+  return out;
+}
+
+/** an object as a Record (null: an empty one) */
+function recordOf(v: unknown): Record<string, unknown> {
+  if (v === null) {
+    const e: Record<string, unknown> = {};
+    return e;
+  }
+  return v as Record<string, unknown>;
+}
+
+function applyStringSetters(st: SchemaType, s: string): string {
+  let r = s;
+  if (st.options.trim === true) r = r.trim();
+  if (st.options.lowercase === true) r = r.toLowerCase();
+  if (st.options.uppercase === true) r = r.toUpperCase();
+  return r;
+}
+
+/** a single value cast to a path's type (ObjectId, Date, Number, String with its setters) */
+function castScalar(st: SchemaType | null, v: unknown): unknown {
+  if (st === null || v === null) {
+    return v;
+  }
+  const t = st.instance;
+  if (t === "ObjectId") {
+    if (typeof v === "string" && isObjectIdOrHexString(v)) return new ObjectId(v as string);
+    return v;
+  }
+  if (t === "Date") {
+    if (typeof v === "string") {
+      const d = new Date(v as string);
+      if (Number.isNaN(d.getTime())) return v;
+      return d;
+    }
+    if (typeof v === "number") return new Date(v as number);
+    return v;
+  }
+  if (t === "Number") {
+    if (typeof v === "string" && (v as string).trim().length > 0 && !Number.isNaN(Number(v as string))) return Number(v as string);
+    if (typeof v === "boolean") return (v as boolean) ? 1 : 0;
+    return v;
+  }
+  if (t === "String") {
+    if (typeof v === "number") return applyStringSetters(st, String(v as number));
+    if (typeof v === "boolean") return applyStringSetters(st, (v as boolean) ? "true" : "false");
+    if (typeof v === "string") return applyStringSetters(st, v as string);
+    return v;
+  }
+  if (t === "Boolean") {
+    if (v === "true" || v === 1) return true;
+    if (v === "false" || v === 0) return false;
+    return v;
+  }
+  return v;
+}
+
+/** a value stored at a path: subdocuments and arrays cast through their schema */
+function castForDoc(st: SchemaType | null, v: unknown, now: Date): unknown {
+  if (st === null || v === null) {
+    return v;
+  }
+  if (st.instance === "Embedded" && st.schema !== null && isPlainObject(v)) {
+    return buildDoc(st.schema as Schema, v, false, now, false);
+  }
+  if (st.instance === "Array") {
+    const c = st.caster;
+    if (!Array.isArray(v)) {
+      return [castForDoc(c, v, now)];
+    }
+    const out: unknown[] = [];
+    for (const x of v as unknown[]) {
+      if (c !== null && c.schema !== null && isPlainObject(x)) out.push(buildDoc(c.schema as Schema, x, false, now, false));
+      else out.push(castScalar(c, x));
+    }
+    return out;
+  }
+  return castScalar(st, v);
+}
+
+/** a path's default (called when it is a function), or null when it has none.
+ *  Node: `default: null` is the same as no default here (the option object cannot tell them apart), so such a path
+ *  is left out of a new document instead of being stored as null (a { path: null } filter matches both). */
+function defaultOf(st: SchemaType): unknown {
+  const d = st.options.default ?? null;
+  if (d !== null && typeof d === "function") {
+    const f = d as () => unknown;
+    return f();
+  }
+  return d;
+}
+/** an explicit default, or an array (arrays default to []) */
+function hasDefault(st: SchemaType): boolean {
+  return st.options.default != null || st.instance === "Array";
+}
+function explicitDefault(st: SchemaType): boolean {
+  return st.options.default != null;
+}
+
+function emptyList(): unknown {
+  const xs: unknown[] = [];
+  return xs;
+}
+
+function isEmptyObject(v: unknown): boolean {
+  return isPlainObject(v) && Object.keys(v as Record<string, unknown>).length === 0;
+}
+
+/** a document to insert, as mongoose builds it: the schema's paths in order (given values cast, then defaults),
+ *  _id, the defaults of document arrays, timestamps and __v (create: createdAt, updatedAt, __v; insertMany: __v
+ *  first); fields the schema does not have are left out (strict) */
+function buildDoc(schema: Schema, input: unknown, top: boolean, now: Date, many: boolean): Record<string, unknown> {
+  const given: Record<string, unknown> = {};
+  for (const [k, v] of entriesOf(input)) {
+    given[k] = v;
+  }
+  const out: Record<string, unknown> = {};
+  const later: string[] = [];
+  const stamps = schema.get("timestamps") === true;
+  const minimize = schema.get("minimize") !== false;
+  for (const [name, st] of Object.entries(schema.paths)) {
+    if (stamps && (name === "createdAt" || name === "updatedAt")) continue;
+    if (name in given) {
+      const v = castForDoc(st, given[name], now);
+      if (minimize && isEmptyObject(v)) continue;
+      out[name] = v;
+      continue;
+    }
+    if (name === "_id") {
+      out["_id"] = new ObjectId();
+      for (const l of later) out[l] = [];
+      continue;
+    }
+    if (!hasDefault(st)) continue;
+    const c = st.caster;
+    if (st.instance === "Array" && !explicitDefault(st) && c !== null && c.schema !== null) {
+      later.push(name); /* document arrays get theirs after _id */
+      continue;
+    }
+    const d = st.instance === "Array" && !explicitDefault(st) ? emptyList() : defaultOf(st);
+    if (d === null) continue;
+    const v = castForDoc(st, d, now);
+    if (minimize && isEmptyObject(v)) continue;
+    out[name] = v;
+  }
+  if (!("_id" in schema.paths)) {
+    for (const l of later) out[l] = [];
+  }
+  if (schema.get("strict") === false) {
+    for (const [k, v] of Object.entries(given)) {
+      if (!(k in out)) out[k] = v;
+    }
+  }
+  if (top) {
+    const vk = versionKeyOf(schema);
+    if (many && vk !== null) out[vk] = 0;
+    if (stamps) {
+      out["createdAt"] = "createdAt" in given ? castScalar(schema.paths["createdAt"] ?? null, given["createdAt"]) : now;
+      out["updatedAt"] = "updatedAt" in given ? castScalar(schema.paths["updatedAt"] ?? null, given["updatedAt"]) : now;
+    }
+    if (!many && vk !== null) out[vk] = 0;
+  }
+  return out;
+}
+
+function versionKeyOf(schema: Schema): string | null {
+  const vk = schema.get("versionKey");
+  if (vk === false || vk === null) return null;
+  if (typeof vk === "string") return vk as string;
+  return "__v";
+}
+
+const COMPARE_OPS = ["$eq", "$ne", "$gt", "$gte", "$lt", "$lte"];
+const LIST_OPS = ["$in", "$nin", "$all"];
+
+/** a condition on a path: a value, or { $op: value } with the values cast */
+function castCondition(st: SchemaType | null, v: unknown): unknown {
+  if (st === null || v === null) {
+    return v;
+  }
+  const elem = st.instance === "Array" ? st.caster : st;
+  if (isPlainObject(v)) {
+    const keys = Object.keys(v as Record<string, unknown>);
+    if (keys.length > 0 && keys[0].startsWith("$")) {
+      const out: Record<string, unknown> = {};
+      for (const [op, x] of Object.entries(v as Record<string, unknown>)) {
+        if (COMPARE_OPS.includes(op)) out[op] = castScalar(elem, x);
+        else if (LIST_OPS.includes(op) && Array.isArray(x)) {
+          const xs: unknown[] = [];
+          for (const e of x as unknown[]) xs.push(castScalar(elem, e));
+          out[op] = xs;
+        } else if (op === "$not") out[op] = castCondition(st, x);
+        else out[op] = x;
+      }
+      return out;
+    }
+    return v;
+  }
+  if (Array.isArray(v)) {
+    const xs: unknown[] = [];
+    for (const e of v as unknown[]) xs.push(castScalar(elem, e));
+    return xs;
+  }
+  return castScalar(elem, v);
+}
+
+/** a filter cast by the schema ($and/$or/$nor inside) */
+function castFilter(schema: Schema, f: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of entriesOf(f)) {
+    if ((k === "$and" || k === "$or" || k === "$nor") && Array.isArray(v)) {
+      const xs: unknown[] = [];
+      for (const e of v as unknown[]) xs.push(isPlainObject(e) ? castFilter(schema, e as Record<string, unknown>) : e);
+      out[k] = xs;
+    } else if (k.startsWith("$")) {
+      out[k] = v;
+    } else {
+      out[k] = castCondition(pathAt(schema, k), v);
+    }
+  }
+  return out;
+}
+
+/** the top-level keys a filter fixes by equality (they are not defaulted on an upsert) */
+function equalityKeys(f: Record<string, unknown>): string[] {
+  const keys: string[] = [];
+  for (const k of Object.keys(f)) {
+    if (!k.startsWith("$")) keys.push(k.indexOf(".") > 0 ? k.substring(0, k.indexOf(".")) : k);
+  }
+  return keys;
+}
+
+/** an update as mongoose sends it: fields without an operator go to $set, values cast, unknown paths left out
+ *  (strict), timestamps ($set updatedAt, $setOnInsert createdAt) and, on an upsert, __v and the defaults of the
+ *  paths neither the filter nor the update sets in $setOnInsert */
+function buildUpdate(schema: Schema, update: Record<string, unknown>, filter: Record<string, unknown>, upsert: boolean, now: Date): Record<string, unknown> {
+  const ops: Record<string, Record<string, unknown>> = {};
+  const strict = schema.get("strict") !== false;
+  const vkey = versionKeyOf(schema) ?? "";
+  const put = (op: string, path: string, value: unknown): void => {
+    const top = path.indexOf(".") > 0 ? path.substring(0, path.indexOf(".")) : path;
+    if (strict && !(top in schema.paths) && op !== "$unset" && top !== vkey) {
+      return;
+    }
+    const rec = ops[op] ?? null;
+    if (rec !== null) {
+      rec[path] = value;
+    } else {
+      const fresh: Record<string, unknown> = {};
+      fresh[path] = value;
+      ops[op] = fresh;
+    }
+  };
+  for (const [k, v] of entriesOf(update)) {
+    if (k.startsWith("$")) {
+      if (!isPlainObject(v)) continue;
+      for (const [path, x] of entriesOf(v)) {
+        const st = pathAt(schema, path);
+        if (k === "$set" || k === "$setOnInsert") put(k, path, castForDoc(st, x, now));
+        else if (k === "$inc" || k === "$mul" || k === "$min" || k === "$max") put(k, path, castScalar(st, x));
+        else if (k === "$push" || k === "$addToSet") {
+          const elem = st !== null && st.instance === "Array" ? st.caster : st;
+          if (isPlainObject(x) && "$each" in (x as Record<string, unknown>)) {
+            const each: unknown[] = [];
+            for (const e of ((x as Record<string, unknown>)["$each"] as unknown[])) each.push(castScalar(elem, e));
+            put(k, path, { $each: each });
+          } else {
+            put(k, path, castScalar(elem, x));
+          }
+        } else if (k === "$pull") put(k, path, castCondition(st, x));
+        else put(k, path, x);
+      }
+    } else {
+      put("$set", k, castForDoc(pathAt(schema, k), v, now));
+    }
+  }
+  const stamps = schema.get("timestamps") === true;
+  if (stamps) {
+    const set = ops["$set"] ?? null;
+    if (set === null || !("updatedAt" in set)) put("$set", "updatedAt", now);
+    put("$setOnInsert", "createdAt", now);
+  }
+  if (upsert) {
+    const vk = versionKeyOf(schema);
+    if (vk !== null) put("$setOnInsert", vk, 0);
+    const taken = equalityKeys(filter);
+    for (const rec of Object.values(ops)) {
+      for (const p of Object.keys(rec)) taken.push(p.indexOf(".") > 0 ? p.substring(0, p.indexOf(".")) : p);
+    }
+    for (const [name, st] of Object.entries(schema.paths)) {
+      if (name === "_id" || taken.includes(name) || (stamps && (name === "createdAt" || name === "updatedAt"))) continue;
+      if (!hasDefault(st)) continue;
+      const d = st.instance === "Array" && !explicitDefault(st) ? emptyList() : defaultOf(st);
+      if (d === null) continue;
+      const v = castForDoc(st, d, now);
+      if (isEmptyObject(v)) continue;
+      put("$setOnInsert", name, v);
+    }
+  }
+  const out: Record<string, unknown> = {};
+  for (const [op, rec] of Object.entries(ops)) {
+    out[op] = rec;
+  }
+  return out;
+}
+
+/** select("a b -c") / { a: 1 }: the projection document */
+function projectionOf(p: unknown): Record<string, unknown> {
+  if (typeof p === "string") {
+    const out: Record<string, unknown> = {};
+    for (const part of (p as string).split(" ")) {
+      if (part.length === 0 || part.startsWith("+")) continue;
+      if (part.startsWith("-")) out[part.substring(1)] = 0;
+      else out[part] = 1;
+    }
+    return out;
+  }
+  return p as Record<string, unknown>;
+}
+
+/** sort("-a b") / { a: -1, b: "asc" }: the sort document */
+function sortOf(s: unknown): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (typeof s === "string") {
+    for (const part of (s as string).split(" ")) {
+      if (part.length === 0) continue;
+      if (part.startsWith("-")) out[part.substring(1)] = -1;
+      else out[part] = 1;
+    }
+    return out;
+  }
+  for (const [k, v] of entriesOf(s)) {
+    if (v === "asc" || v === "ascending") out[k] = 1;
+    else if (v === "desc" || v === "descending") out[k] = -1;
+    else out[k] = v;
+  }
+  return out;
+}
+
 // ---------- queries and models ----------
 
 /** a filter: { field: value, field: { $in: [...] }, $or: [...] } */
@@ -570,18 +834,30 @@ export class DeleteResult {
   deletedCount: number = 0;
 }
 
-/** updateOne/updateMany's result */
+/** updateOne/updateMany's result (in the order mongoose writes it) */
 export class UpdateResult {
   acknowledged: boolean = true;
-  matchedCount: number = 0;
   modifiedCount: number = 0;
-  upsertedCount: number = 0;
   upsertedId: ObjectId | null = null;
+  upsertedCount: number = 0;
+  matchedCount: number = 0;
 }
 
 /** what exists() gives when a document matches */
 export interface ExistsResult {
   _id: ObjectId;
+}
+
+interface ValueReply {
+  value?: object | null;
+}
+
+interface ValuesReply {
+  values?: object;
+}
+
+interface CountReply {
+  n?: number;
 }
 
 /** A query: built by a Model (find, findOne, countDocuments...), refined by sort/skip/limit/select/lean, run by
@@ -591,10 +867,10 @@ export class Query<R, T = unknown> {
   readonly op: string;
   readonly model: Model<T>;
   private filter: Record<string, unknown>;
-  private update: Record<string, unknown> | null = null;
-  private opts: Record<string, unknown> = {};
-  private field: string = "";
-  private isLean: boolean = false;
+  update: Record<string, unknown> | null = null;
+  opts: Record<string, unknown> = {};
+  field: string = "";
+  isLean: boolean = false;
 
   constructor(model: Model<T>, op: string, filter: Record<string, unknown>) {
     this.model = model;
@@ -663,48 +939,132 @@ export class Query<R, T = unknown> {
     return this;
   }
 
-  /** the command this query sends (what the driver will run) */
+  /** the command this query sends (filter and update as given; exec() casts them by the schema first) */
   toCommand(): Record<string, unknown> {
+    return this.command(false, new Date());
+  }
+
+  private command(cast: boolean, now: Date): Record<string, unknown> {
     const cmd: Record<string, unknown> = {};
     const coll = this.model.collectionName;
+    const schema = this.model.schema;
+    const filter = cast ? castFilter(schema, this.filter) : this.filter;
     if (this.op === "find" || this.op === "findOne" || this.op === "findById" || this.op === "exists") {
       cmd["find"] = coll;
-      cmd["filter"] = this.filter;
-      if (this.opts["sort"] != null) cmd["sort"] = this.opts["sort"];
-      if (this.opts["projection"] != null) cmd["projection"] = this.opts["projection"];
+      cmd["filter"] = filter;
+      if (this.opts["sort"] != null) cmd["sort"] = cast ? sortOf(this.opts["sort"]) : this.opts["sort"];
+      if (this.opts["projection"] != null) cmd["projection"] = cast ? projectionOf(this.opts["projection"]) : this.opts["projection"];
       if (this.opts["skip"] != null) cmd["skip"] = this.opts["skip"];
-      if (this.op !== "find") cmd["limit"] = 1;
-      else if (this.opts["limit"] != null) cmd["limit"] = this.opts["limit"];
+      if (this.op !== "find") {
+        cmd["limit"] = 1;
+        if (cast) cmd["singleBatch"] = true;
+      } else if (this.opts["limit"] != null) cmd["limit"] = this.opts["limit"];
     } else if (this.op === "countDocuments") {
       cmd["aggregate"] = coll;
-      cmd["pipeline"] = [{ $match: this.filter }, { $group: { _id: 1, n: { $sum: 1 } } }];
+      cmd["pipeline"] = [{ $match: filter }, { $group: { _id: 1, n: { $sum: 1 } } }];
+      if (cast) cmd["cursor"] = {};
+    } else if (this.op === "estimatedDocumentCount") {
+      cmd["count"] = coll;
     } else if (this.op === "distinct") {
       cmd["distinct"] = coll;
       cmd["key"] = this.field;
-      cmd["query"] = this.filter;
+      cmd["query"] = filter;
     } else if (this.op === "deleteOne" || this.op === "deleteMany") {
       cmd["delete"] = coll;
-      cmd["deletes"] = [{ q: this.filter, limit: this.op === "deleteOne" ? 1 : 0 }];
+      cmd["deletes"] = [{ q: filter, limit: this.op === "deleteOne" ? 1 : 0 }];
+      if (cast) cmd["ordered"] = true;
     } else if (this.op === "updateOne" || this.op === "updateMany") {
+      const upsert = this.opts["upsert"] === true;
+      const u = this.update ?? {};
       cmd["update"] = coll;
-      cmd["updates"] = [{ q: this.filter, u: this.update, multi: this.op === "updateMany", upsert: this.opts["upsert"] === true }];
+      const one: Record<string, unknown> = { q: filter, u: cast ? buildUpdate(schema, u, this.filter, upsert, now) : u };
+      if (cast) {
+        if (this.opts["upsert"] != null) one["upsert"] = upsert;
+        if (this.op === "updateMany") one["multi"] = true;
+      } else {
+        one["multi"] = this.op === "updateMany";
+        one["upsert"] = upsert;
+      }
+      cmd["updates"] = [one];
+      if (cast) cmd["ordered"] = true;
     } else {
       // findOneAndUpdate, findOneAndDelete, findByIdAndDelete...
+      const upsert = this.opts["upsert"] === true;
       cmd["findAndModify"] = coll;
-      cmd["query"] = this.filter;
-      if (this.update !== null) cmd["update"] = this.update;
-      else cmd["remove"] = true;
-      if (this.opts["new"] === true) cmd["new"] = true;
-      if (this.opts["upsert"] === true) cmd["upsert"] = true;
-      if (this.opts["sort"] != null) cmd["sort"] = this.opts["sort"];
+      cmd["query"] = filter;
+      const u = this.update;
+      if (cast) {
+        cmd["remove"] = u === null;
+        cmd["new"] = this.opts["new"] === true || this.opts["returnDocument"] === "after";
+        cmd["upsert"] = upsert;
+        if (u !== null) cmd["update"] = buildUpdate(schema, u, this.filter, upsert, now);
+        if (this.opts["sort"] != null) cmd["sort"] = sortOf(this.opts["sort"]);
+        if (this.opts["projection"] != null) cmd["fields"] = projectionOf(this.opts["projection"]);
+      } else {
+        if (u !== null) cmd["update"] = u;
+        else cmd["remove"] = true;
+        if (this.opts["new"] === true) cmd["new"] = true;
+        if (upsert) cmd["upsert"] = true;
+        if (this.opts["sort"] != null) cmd["sort"] = this.opts["sort"];
+      }
     }
     return cmd;
   }
 
-  /** runs the query: without a driver, rejects (NO_DRIVER) */
+  /** the result as JSON text, in the shape R has */
+  private async run(): Promise<string> {
+    const conn = this.model.db;
+    await conn.__ready(this.model.collectionName, this.op);
+    const cmd = this.command(true, new Date());
+    const op = this.op;
+    if (op === "find") {
+      return conn.__cursor(cmd);
+    }
+    if (op === "findOne" || op === "findById" || op === "exists") {
+      const docs: object[] = JSON.parse(conn.__cursor(cmd));
+      const one = docs.length > 0 ? JSON.stringify(docs[0]) : "null";
+      if (op !== "exists" && !this.isLean) rememberDocuments(one, this.model.connectionKey + "/" + this.model.modelName);
+      return one;
+    }
+    if (op === "countDocuments") {
+      const docs: CountReply[] = JSON.parse(conn.__cursor(cmd));
+      return docs.length > 0 ? String(docs[0].n ?? 0) : "0";
+    }
+    if (op === "estimatedDocumentCount") {
+      const r: CountReply = JSON.parse(conn.__text(cmd));
+      return String(r.n ?? 0);
+    }
+    if (op === "distinct") {
+      const r: ValuesReply = JSON.parse(conn.__text(cmd));
+      const v = r.values;
+      return v != null ? JSON.stringify(v) : "[]";
+    }
+    if (op === "deleteOne" || op === "deleteMany") {
+      const w = writeReply(conn.__text(cmd));
+      const d = new DeleteResult();
+      d.deletedCount = w.n ?? 0;
+      return JSON.stringify(d);
+    }
+    if (op === "updateOne" || op === "updateMany") {
+      const w = writeReply(conn.__text(cmd));
+      const u = new UpdateResult();
+      const ups = w.upserted ?? [];
+      u.upsertedCount = ups.length;
+      u.matchedCount = (w.n ?? 0) - ups.length;
+      u.modifiedCount = w.nModified ?? 0;
+      if (ups.length > 0) u.upsertedId = ups[0]._id;
+      return JSON.stringify(u);
+    }
+    const r: ValueReply = JSON.parse(conn.__text(cmd));
+    const v = r.value ?? null;
+    return v !== null ? JSON.stringify(v) : "null";
+  }
+
+  /** runs the query */
   async exec(): Promise<R> {
-    await this.model.db.runCommand(this.toCommand());
-    throw new Error(NO_DRIVER + ": cannot decode the reply of " + this.op);
+    const text = await this.run();
+    const r: R = JSON.parse(text);
+    return r;
   }
 
   /** await query: the same as await query.exec() */
@@ -713,6 +1073,37 @@ export class Query<R, T = unknown> {
   }
 
   /** query.catch(fn): exec(), with fn on a failure */
+  async catch(fn: (err: Error) => R): Promise<R> {
+    try {
+      return await this.exec();
+    } catch (e) {
+      return fn(e as Error);
+    }
+  }
+}
+
+/** model.aggregate(pipeline): awaited or exec()'d, the documents (typed by aggregate<A>()) */
+export class Aggregate<R> {
+  private readonly conn: Connection;
+  private readonly cmd: Record<string, unknown>;
+  private readonly collectionName: string;
+  constructor(conn: Connection, collectionName: string, pipeline: unknown[]) {
+    this.conn = conn;
+    this.collectionName = collectionName;
+    this.cmd = { aggregate: collectionName, pipeline: pipeline, cursor: {} };
+  }
+  /** the pipeline */
+  pipeline(): unknown[] {
+    return this.cmd["pipeline"] as unknown[];
+  }
+  async exec(): Promise<R> {
+    await this.conn.__ready(this.collectionName, "aggregate");
+    const r: R = JSON.parse(this.conn.__cursor(this.cmd));
+    return r;
+  }
+  async then(): Promise<R> {
+    return await this.exec();
+  }
   async catch(fn: (err: Error) => R): Promise<R> {
     try {
       return await this.exec();
@@ -805,7 +1196,7 @@ export function pluralize(name: string): string {
   return s;
 }
 
-/** A model: the operations on one collection, documents of type T. Every operation needs the driver. */
+/** A model: the operations on one collection, documents of type T. */
 export class Model<T = unknown> {
   modelName: string = "";
   collectionName: string = "";
@@ -816,7 +1207,7 @@ export class Model<T = unknown> {
   get db(): Connection {
     const c = connectionsByKey.get(this.connectionKey);
     if (c === null) {
-      throw new MongooseError(NO_DRIVER + ": the connection of model " + this.modelName + " was not opened");
+      throw new MongooseError("the connection of model " + this.modelName + " was not opened");
     }
     return c;
   }
@@ -834,25 +1225,34 @@ export class Model<T = unknown> {
       if (options.sort != null) q.sort(options.sort);
       if (options.skip != null) q.skip(options.skip);
       if (options.limit != null) q.limit(options.limit);
+      if (options.projection != null) q.select(options.projection);
     }
     return q;
   }
-  findOne(filter: FilterQuery<T> = {}, projection: unknown = null): Query<T | null, T> {
+  findOne(filter: FilterQuery<T> = {}, projection: unknown = null, options: QueryOptions<T> | null = null): Query<T | null, T> {
     const q = new Query<T | null, T>(this, "findOne", filter);
     if (projection !== null) q.select(projection);
+    if (options !== null) {
+      if (options.sort != null) q.sort(options.sort);
+      if (options.skip != null) q.skip(options.skip);
+    }
     return q;
   }
-  findById(id: unknown): Query<T | null, T> {
+  findById(id: unknown, projection: unknown = null): Query<T | null, T> {
     const f: Record<string, unknown> = {};
     f["_id"] = id;
-    return new Query<T | null, T>(this, "findById", f);
+    const q = new Query<T | null, T>(this, "findById", f);
+    if (projection !== null) q.select(projection);
+    return q;
   }
   findOneAndUpdate(filter: FilterQuery<T>, update: UpdateQuery<T>, options: QueryOptions<T> | null = null): Query<T | null, T> {
     const q = new Query<T | null, T>(this, "findOneAndUpdate", filter).withUpdate(update);
     if (options !== null) {
       if (options.new != null) q.withOption("new", options.new);
+      if (options.returnDocument != null) q.withOption("returnDocument", options.returnDocument);
       if (options.upsert != null) q.withOption("upsert", options.upsert);
       if (options.sort != null) q.sort(options.sort);
+      if (options.projection != null) q.select(options.projection);
     }
     return q;
   }
@@ -861,8 +1261,10 @@ export class Model<T = unknown> {
     f["_id"] = id;
     return this.findOneAndUpdate(f, update, options);
   }
-  findOneAndDelete(filter: FilterQuery<T>): Query<T | null, T> {
-    return new Query<T | null, T>(this, "findOneAndDelete", filter);
+  findOneAndDelete(filter: FilterQuery<T>, options: QueryOptions<T> | null = null): Query<T | null, T> {
+    const q = new Query<T | null, T>(this, "findOneAndDelete", filter);
+    if (options !== null && options.sort != null) q.sort(options.sort);
+    return q;
   }
   findByIdAndDelete(id: unknown): Query<T | null, T> {
     const f: Record<string, unknown> = {};
@@ -871,6 +1273,9 @@ export class Model<T = unknown> {
   }
   countDocuments(filter: FilterQuery<T> = {}): Query<number, T> {
     return new Query<number, T>(this, "countDocuments", filter);
+  }
+  estimatedDocumentCount(): Query<number, T> {
+    return new Query<number, T>(this, "estimatedDocumentCount", {});
   }
   exists(filter: FilterQuery<T>): Query<ExistsResult | null, T> {
     return new Query<ExistsResult | null, T>(this, "exists", filter).select({ _id: 1 });
@@ -895,44 +1300,176 @@ export class Model<T = unknown> {
     return q;
   }
 
-  /** inserts a document (its fields, or a part of them): without a driver, rejects */
+  /** inserts a document (its fields, cast by the schema, with defaults, _id, timestamps and __v): the document */
   async create(doc: unknown): Promise<T> {
-    await this.db.runCommand(this.insertCommand([doc]));
-    throw new Error(NO_DRIVER + ": cannot decode the reply of insert");
+    const conn = this.db;
+    await conn.__ready(this.collectionName, "insertOne");
+    const built = buildDoc(this.schema, doc, true, new Date(), false);
+    writeReply(conn.__text({ insert: this.collectionName, documents: [built], ordered: true }));
+    const text = JSON.stringify(built);
+    rememberDocuments(text, this.connectionKey + "/" + this.modelName);
+    const r: T = JSON.parse(text);
+    return r;
   }
+  /** inserts the documents in one command (ordered): the documents */
   async insertMany(docs: unknown[]): Promise<T[]> {
-    await this.db.runCommand(this.insertCommand(docs));
-    throw new Error(NO_DRIVER + ": cannot decode the reply of insert");
+    const conn = this.db;
+    await conn.__ready(this.collectionName, "insertMany");
+    const now = new Date();
+    const built: Record<string, unknown>[] = [];
+    for (const d of docs) {
+      built.push(buildDoc(this.schema, d, true, now, true));
+    }
+    if (built.length > 0) {
+      const text = conn.__text({ insert: this.collectionName, documents: built, ordered: true });
+      try {
+        writeReply(text);
+      } catch (e) {
+        if (e instanceof MongoServerError) {
+          const b = new MongoBulkWriteError(e.message);
+          b.code = e.code;
+          b.errmsg = e.errmsg;
+          b.errorResponse = e.errorResponse;
+          b.keyPattern = e.keyPattern;
+          b.keyValue = e.keyValue;
+          b.index = e.index;
+          throw b;
+        }
+        throw e;
+      }
+    }
+    const r: T[] = JSON.parse(JSON.stringify(built));
+    return r;
   }
-  /** several writes in one command ({ updateOne: { filter, update, upsert } }...): without a driver, rejects */
+  /** several writes ({ insertOne: { document } }, { updateOne: { filter, update, upsert } }, { deleteMany: {
+   *  filter } }...), one command each, in order (ordered: false goes on after a failed one): the counts */
   async bulkWrite(ops: unknown[], options: BulkWriteOptions | null = null): Promise<BulkWriteResult> {
-    const cmd: Record<string, unknown> = {};
-    cmd["bulkWrite"] = this.collectionName;
-    cmd["ops"] = ops;
-    cmd["ordered"] = options === null || options.ordered !== false;
-    await this.db.runCommand(cmd);
-    return new BulkWriteResult();
+    const conn = this.db;
+    await conn.__ready(this.collectionName, "bulkWrite");
+    const ordered = options === null || options.ordered !== false;
+    const now = new Date();
+    const res = new BulkWriteResult();
+    const schema = this.schema;
+    let firstError: Error | null = null;
+    for (const raw of ops) {
+      for (const [kind, v] of entriesOf(raw)) {
+        const spec = recordOf(v);
+        try {
+          if (kind === "insertOne") {
+            const doc = buildDoc(schema, recordOf(spec["document"] ?? null), true, now, true);
+            const w = writeReply(conn.__text({ insert: this.collectionName, documents: [doc], ordered: true }));
+            res.insertedCount += w.n ?? 0;
+          } else if (kind === "updateOne" || kind === "updateMany" || kind === "replaceOne") {
+            const filter = recordOf(spec["filter"] ?? null);
+            const upsert = spec["upsert"] === true;
+            const u = kind === "replaceOne" ? buildDoc(schema, recordOf(spec["replacement"] ?? null), true, now, false)
+              : buildUpdate(schema, recordOf(spec["update"] ?? null), filter, upsert, now);
+            const one: Record<string, unknown> = { q: castFilter(schema, filter), u: u };
+            if (upsert) one["upsert"] = true;
+            if (kind === "updateMany") one["multi"] = true;
+            const w = writeReply(conn.__text({ update: this.collectionName, updates: [one], ordered: true }));
+            const ups = w.upserted ?? [];
+            res.upsertedCount += ups.length;
+            res.matchedCount += (w.n ?? 0) - ups.length;
+            res.modifiedCount += w.nModified ?? 0;
+          } else if (kind === "deleteOne" || kind === "deleteMany") {
+            const filter = recordOf(spec["filter"] ?? null);
+            const w = writeReply(conn.__text({ delete: this.collectionName, deletes: [{ q: castFilter(schema, filter), limit: kind === "deleteOne" ? 1 : 0 }], ordered: true }));
+            res.deletedCount += w.n ?? 0;
+          }
+        } catch (e) {
+          if (ordered) throw e;
+          if (firstError === null) firstError = e as Error;
+        }
+      }
+    }
+    const fe = firstError;
+    if (fe !== null) throw fe;
+    return res;
   }
-  /** an aggregation pipeline: without a driver, rejects */
-  async aggregate(pipeline: unknown[]): Promise<unknown[]> {
-    const cmd: Record<string, unknown> = {};
-    cmd["aggregate"] = this.collectionName;
-    cmd["pipeline"] = pipeline;
-    cmd["cursor"] = {};
-    await this.db.runCommand(cmd);
-    return [];
+  /** an aggregation pipeline (aggregate<A>() types the documents): awaited or exec()'d */
+  aggregate<A = unknown>(pipeline: unknown[]): Aggregate<A[]> {
+    return new Aggregate<A[]>(this.db, this.collectionName, pipeline);
   }
 
-  private insertCommand(docs: unknown[]): Record<string, unknown> {
-    const cmd: Record<string, unknown> = {};
-    cmd["insert"] = this.collectionName;
-    cmd["documents"] = docs;
-    return cmd;
+  /** createCollection (autoCreate) and the indexes (autoIndex), as when the model is made on an open connection */
+  async init(): Promise<void> {
+    this.db.__initModel(this.modelName, this.schema, this.collectionName);
+  }
+  /** creates the schema's indexes */
+  async createIndexes(): Promise<void> {
+    this.db.__createIndexes(this.schema, this.collectionName);
+  }
+  async ensureIndexes(): Promise<void> {
+    this.db.__createIndexes(this.schema, this.collectionName);
+  }
+  /** creates the collection (an existing one is not an error) */
+  async createCollection(): Promise<void> {
+    this.db.__createCollection(this.collectionName);
   }
 }
 
-/** A hydrated document: T itself (mongoose: T & Document, with _id, save() and toObject()) */
+/** A hydrated document: T itself for now (mongoose: T & Document; the compiler branch that gives intersections
+ *  with a class their members makes it T & Document) */
 export type HydratedDocument<T> = T;
+
+// the model (its connection key and name) of each document create/findOne/findById gave, by _id: what save() writes
+// through (a document decoded from JSON carries no link of its own, and a field for it would show in its JSON)
+const documentModels: Map<string, string> = new Map<string, string>();
+
+interface IdOnly {
+  _id?: ObjectId;
+}
+
+function rememberDocuments(text: string, modelKey: string): void {
+  if (text === "null") {
+    return;
+  }
+  const one: IdOnly = JSON.parse(text);
+  const id = one._id ?? null;
+  if (id !== null) {
+    if (documentModels.size > 10000) documentModels.clear();
+    documentModels.set(id.toHexString(), modelKey);
+  }
+}
+
+/** mongoose's Document members: _id, __v, toObject(), toJSON(), save() (what HydratedDocument<T> adds to T) */
+export class Document {
+  _id: ObjectId = new ObjectId();
+  __v?: number;
+
+  /** the document as a plain object (its fields, ObjectIds and Dates as they are) */
+  toObject(): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of entriesOf(this)) {
+      out[k] = v;
+    }
+    return out;
+  }
+
+  /** writes the document: its fields ($set) on its _id, upserted; the document */
+  async save(): Promise<Document> {
+    const key = documentModels.get(this._id.toHexString());
+    if (key === null) {
+      throw new MongooseError("save(): this document did not come from a model (create, findOne or findById)");
+    }
+    const slash = key.lastIndexOf("/");
+    const conn = connectionsByKey.get(key.substring(0, slash));
+    const schema = schemasByKey.get(key);
+    if (conn === null || schema === null) {
+      throw new MongooseError("save(): the model of this document is gone");
+    }
+    const st: Model<unknown> = JSON.parse(__modelState(key.substring(0, slash), key.substring(slash + 1), schema));
+    const set: Record<string, unknown> = {};
+    for (const [k, v] of entriesOf(this)) {
+      if (k !== "_id" && k !== "__v" && k !== "createdAt") set[k] = v;
+    }
+    const f: Record<string, unknown> = { _id: this._id };
+    const update = buildUpdate(schema, { $set: set }, f, true, new Date());
+    writeReply(conn.__text({ update: st.collectionName, updates: [{ q: f, u: update, upsert: true }], ordered: true }));
+    return this;
+  }
+}
 
 // ---------- connections ----------
 
@@ -945,7 +1482,7 @@ export enum ConnectionStates {
   uninitialized = 99,
 }
 
-/** createConnection / connect options (accepted; the driver reads them in stage 2) */
+/** createConnection / connect options */
 export interface ConnectOptions {
   dbName?: string;
   user?: string;
@@ -966,58 +1503,36 @@ export interface ConnectOptions {
   family?: number;
 }
 
-/** The transport stage 2 brings: opens the connection and runs one command (a document) on a database. */
-export interface MongoDriver {
-  connect(uri: string, options: ConnectOptions): Promise<void>;
-  command(dbName: string, command: Record<string, unknown>): Promise<Record<string, unknown>>;
-  close(): Promise<void>;
-}
-
-let mongoDriver: MongoDriver | null = null;
-
-/** Stage 2: the driver every connection uses (until then operations reject with NO_DRIVER) */
-export function setMongoDriver(driver: MongoDriver): void {
-  mongoDriver = driver;
-}
-
-/** the MongoClient behind a connection (getClient()): its options (hosts, credentials, dbName...) */
-export class MongoClient {
-  options: unknown = null;
-}
-
-/** the database of a connection (connection.db) */
-export class Db {
-  readonly databaseName: string;
-  private readonly conn: Connection;
-  constructor(conn: Connection, name: string) {
-    this.conn = conn;
-    this.databaseName = name;
-  }
-  /** db.command({ ping: 1 }): without a driver, rejects */
-  async command(cmd: Record<string, unknown>): Promise<Record<string, unknown>> {
-    return await this.conn.runCommand(cmd);
-  }
-}
-
 interface Listener {
   event: string;
   once: boolean;
   fn: (arg: unknown) => void;
 }
 
+interface PendingModel {
+  name: string;
+  schema: Schema;
+  collection: string;
+}
+
 /** A connection (createConnection, or MongooseModule's): models, state, events */
 export class Connection {
   /** the database name */
   name: string;
-  readonly host: string;
-  readyState: ConnectionStates = ConnectionStates.disconnected;
+  /** the host and port it connected to (the URI's first host before) */
+  host: string;
+  port: number = 0;
+  private state: ConnectionStates = ConnectionStates.disconnected;
   /** the models made on this connection: their state, by name */
   private modelStates: Record<string, string> = {};
   readonly uri: string;
   readonly options: ConnectOptions;
   private listeners: Listener[] = [];
-  private client: MongoClient = new MongoClient();
+  private client: MongoClient | null = null;
   private dbs: Record<string, Connection> = {};
+  private parent: Connection | null = null;
+  private pending: PendingModel[] = [];
+  private opening: boolean = false;
   /** its key in the registry of connections */
   readonly key: string;
 
@@ -1031,29 +1546,88 @@ export class Connection {
     this.host = hostOf(uri);
   }
 
+  /** 0 disconnected, 1 connected, 2 connecting, 3 disconnecting (a useDb connection: its parent's) */
+  get readyState(): ConnectionStates {
+    const p = this.parent;
+    return p !== null ? p.readyState : this.state;
+  }
+
+  /** @internal */
+  __setState(s: ConnectionStates): void {
+    this.state = s;
+  }
+
   /** connection.db: the database (null until connected) */
   get db(): Db | null {
-    return this.readyState === ConnectionStates.connected ? new Db(this, this.name) : null;
+    if (this.readyState !== ConnectionStates.connected) {
+      return null;
+    }
+    return this.getClient().db(this.name);
   }
 
+  /** the driver's MongoClient: options (hosts, credentials, dbName...) */
   getClient(): MongoClient {
-    return this.client;
+    const p = this.parent;
+    if (p !== null) {
+      return p.getClient();
+    }
+    const have = this.client;
+    if (have !== null) {
+      return have;
+    }
+    const c = new MongoClient(this.uri, clientOptions(this.options));
+    this.client = c;
+    return c;
   }
 
-  /** opens the connection: without a driver, rejects (and readyState goes back to disconnected) */
+  /** opens the connection: server selection through the driver (MongooseServerSelectionError when it fails) */
   async openUri(uri: string = "", options: ConnectOptions | null = null): Promise<Connection> {
     const target = uri.length > 0 ? uri : this.uri;
-    this.readyState = ConnectionStates.connecting;
-    const d = mongoDriver;
-    if (d === null) {
-      this.readyState = ConnectionStates.disconnected;
-      const err = new MongooseError(NO_DRIVER + ": cannot connect to " + redactUri(target));
-      this.emit("error", err);
-      throw err;
+    const opts = options ?? this.options;
+    this.state = ConnectionStates.connecting;
+    this.opening = true;
+    let client: MongoClient;
+    try {
+      client = new MongoClient(target, clientOptions(opts));
+    } catch (e) {
+      this.state = ConnectionStates.disconnected;
+      this.opening = false;
+      throw e;
     }
-    await d.connect(target, options ?? this.options);
-    this.readyState = ConnectionStates.connected;
+    this.client = client;
+    try {
+      await client.connect();
+    } catch (e) {
+      this.state = ConnectionStates.disconnected;
+      this.opening = false;
+      this.emit("disconnected", null);
+      this.emit("error", e);
+      if (e instanceof MongoServerSelectionError) {
+        throw new MongooseServerSelectionError(e.message);
+      }
+      throw e;
+    }
+    this.state = ConnectionStates.connected;
+    this.opening = false;
+    const hosts = client.options.hosts;
+    if (hosts.length > 0) {
+      this.host = hosts[0].host;
+      this.port = hosts[0].port;
+    }
     this.emit("connected", null);
+    this.emit("open", null);
+    const waiting = this.pending;
+    this.pending = [];
+    for (const m of waiting) {
+      this.__initModel(m.name, m.schema, m.collection);
+    }
+    for (const child of Object.values(this.dbs)) {
+      const w = child.pending;
+      child.pending = [];
+      for (const m of w) {
+        child.__initModel(m.name, m.schema, m.collection);
+      }
+    }
     return this;
   }
 
@@ -1066,34 +1640,118 @@ export class Connection {
   }
 
   async close(force: boolean = false): Promise<void> {
-    const d = mongoDriver;
-    if (d !== null && this.readyState === ConnectionStates.connected) {
-      this.readyState = ConnectionStates.disconnecting;
-      await d.close();
+    const was = this.state;
+    const c = this.client;
+    if (c !== null && was === ConnectionStates.connected) {
+      this.state = ConnectionStates.disconnecting;
+      await c.close(force);
     }
-    const was = this.readyState;
-    this.readyState = ConnectionStates.disconnected;
+    this.state = ConnectionStates.disconnected;
     if (was !== ConnectionStates.disconnected) {
       this.emit("disconnected", null);
     }
     this.emit("close", null);
   }
 
-  /** runs one command on this connection's database: the stage-2 seam. Without a driver, rejects. */
-  async runCommand(command: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const d = mongoDriver;
-    const first = Object.keys(command);
-    const what = first.length > 0 ? first[0] + (typeof command[first[0]] === "string" ? " on " + (command[first[0]] as string) : "") : "a command";
-    if (d === null) {
-      throw new MongooseError(NO_DRIVER + ": cannot run " + what);
-    }
+  /** the driver's client, open (the parent's for a useDb connection) */
+  private openClient(): MongoClient {
     if (this.readyState !== ConnectionStates.connected) {
-      throw new MongooseError("Connection " + this.name + " is not open: cannot run " + what);
+      throw new MongooseError("Connection " + this.name + " is not open");
     }
-    return await d.command(this.name, command);
+    return this.getClient();
   }
 
-  /** connection.model(name, schema, collection?): the model (made once per name) */
+  /** runs one command on this connection's database: the reply */
+  async runCommand(command: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const r: Record<string, unknown> = JSON.parse(this.__text(command));
+    return r;
+  }
+
+  /** @internal a command's reply as JSON text (MongoServerError when it failed) */
+  __text(command: Record<string, unknown>): string {
+    return this.openClient().commandText(this.name, command);
+  }
+  /** @internal a cursor command's documents as JSON text (an array) */
+  __cursor(command: Record<string, unknown>): string {
+    return this.openClient().cursorText(this.name, command);
+  }
+
+  /** @internal before an operation: an open connection; with bufferCommands (the default) it waits up to 10 s for
+   *  one being opened, as mongoose buffers the operation */
+  async __ready(collection: string, op: string): Promise<void> {
+    if (this.readyState === ConnectionStates.connected) {
+      return;
+    }
+    if (this.options.bufferCommands === false) {
+      throw new MongooseError("Cannot call `" + collection + "." + op + "()` before initial connection is complete if `bufferCommands = false`. Make sure you `await mongoose.connect()` if you have `bufferCommands = false`.");
+    }
+    const until = Date.now() + 10000;
+    const p = this.parent ?? this;
+    if (p.state === ConnectionStates.connecting && !p.opening) {
+      // createConnection(uri) opens in the background in Node: here, the first operation opens it
+      try {
+        await p.openUri();
+        return;
+      } catch (e) {
+        /* the operation waits out its buffering time, as in Node */
+      }
+    }
+    while (Date.now() < until) {
+      await new Promise<void>((r) => setTimeout(r, 20));
+      if (this.readyState === ConnectionStates.connected) {
+        return;
+      }
+    }
+    throw new MongooseError("Operation `" + collection + "." + op + "()` buffering timed out after 10000ms");
+  }
+
+  /** @internal createCollection (autoCreate) and the indexes (autoIndex) of a model; failures are left to the
+   *  operations (mongoose reports them as events, not as errors of the application) */
+  __initModel(name: string, schema: Schema, collection: string): void {
+    const ac = schema.get("autoCreate") ?? this.options.autoCreate ?? null;
+    if (ac !== false) {
+      this.__createCollection(collection);
+    }
+    const ai = schema.get("autoIndex") ?? this.options.autoIndex ?? null;
+    if (ai !== false) {
+      this.__createIndexes(schema, collection);
+    }
+  }
+
+  /** @internal */
+  __createCollection(collection: string): void {
+    try {
+      this.__text({ create: collection });
+    } catch (e) {
+      /* NamespaceExists (48): already there */
+    }
+  }
+
+  /** @internal one createIndexes command per index, as mongoose sends them */
+  __createIndexes(schema: Schema, collection: string): void {
+    for (const ix of schema.indexes()) {
+      const fields = ix[0] as Record<string, unknown>;
+      const opts = ix[1] as Record<string, unknown>;
+      const spec: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(opts)) {
+        spec[k] = v;
+      }
+      let nm = "";
+      for (const [k, v] of Object.entries(fields)) {
+        nm += (nm.length > 0 ? "_" : "") + k + "_" + String(v);
+      }
+      if (!("name" in spec)) spec["name"] = nm;
+      spec["key"] = fields;
+      try {
+        this.__text({ createIndexes: collection, indexes: [spec] });
+      } catch (e) {
+        /* (mongoose emits it as the model's 'index' event) */
+      }
+    }
+  }
+
+  /** connection.model(name, schema, collection?): the model (made once per name; initialised when the connection
+   *  is open, or once it opens) */
   model<T = unknown>(name: string, schema: Schema | null = null, collection: string = ""): Model<T> {
     const have = this.modelStates[name];
     if (have != null && schema === null) {
@@ -1103,9 +1761,17 @@ export class Connection {
     if (schema === null) {
       throw new MongooseError("Schema hasn't been registered for model \"" + name + "\".\nUse mongoose.model(name, schema)");
     }
+    const fresh = have == null;
     const state = __modelState(this.key, name, schema, collection);
     this.modelStates[name] = state;
     const m: Model<T> = JSON.parse(state);
+    if (fresh) {
+      if (this.readyState === ConnectionStates.connected) {
+        this.__initModel(name, schema, m.collectionName);
+      } else {
+        this.pending.push({ name: name, schema: schema, collection: m.collectionName });
+      }
+    }
     return m;
   }
 
@@ -1122,8 +1788,7 @@ export class Connection {
     }
     const c = new Connection(this.uri, this.options);
     c.name = name;
-    c.readyState = this.readyState;
-    c.client = this.client;
+    c.parent = this.parent ?? this;
     this.dbs[name] = c;
     return c;
   }
@@ -1158,11 +1823,35 @@ export class Connection {
   }
 }
 
+function clientOptions(o: ConnectOptions): MongoClientOptions {
+  const out: MongoClientOptions = {};
+  if (o.user != null) out.user = o.user;
+  if (o.pass != null) out.pass = o.pass;
+  if (o.authSource != null) out.authSource = o.authSource;
+  if (o.serverSelectionTimeoutMS != null) out.serverSelectionTimeoutMS = o.serverSelectionTimeoutMS;
+  if (o.connectTimeoutMS != null) out.connectTimeoutMS = o.connectTimeoutMS;
+  if (o.socketTimeoutMS != null) out.socketTimeoutMS = o.socketTimeoutMS;
+  if (o.maxPoolSize != null) out.maxPoolSize = o.maxPoolSize;
+  if (o.appName != null) out.appName = o.appName;
+  if (o.tls != null) out.tls = o.tls;
+  if (o.replicaSet != null) out.replicaSet = o.replicaSet;
+  if (o.directConnection != null) out.directConnection = o.directConnection;
+  return out;
+}
+
 /** mongoose's base error */
 export class MongooseError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "MongooseError";
+  }
+}
+
+/** the connection could not select a server: the driver's last error as the message */
+export class MongooseServerSelectionError extends MongooseError {
+  constructor(message: string) {
+    super(message);
+    this.name = "MongooseServerSelectionError";
   }
 }
 
@@ -1193,23 +1882,11 @@ function dbNameOf(uri: string): string {
   return db.length > 0 ? db : "test";
 }
 
-/** the URI without its password (for messages) */
-function redactUri(uri: string): string {
-  const start = uri.indexOf("://");
-  const at = uri.indexOf("@");
-  if (start < 0 || at < 0) {
-    return uri;
-  }
-  const cred = uri.substring(start + 3, at);
-  const colon = cred.indexOf(":");
-  return colon < 0 ? uri : uri.substring(0, start + 3) + cred.substring(0, colon) + ":****" + uri.substring(at);
-}
-
-/** mongoose.createConnection(uri, options): the connection, opening (asPromise() waits; without a driver it rejects) */
+/** mongoose.createConnection(uri, options): the connection, opening (asPromise() waits for it) */
 export function createConnection(uri: string = "", options: ConnectOptions = {}): Connection {
   const c = new Connection(uri, options);
   if (uri.length > 0) {
-    c.readyState = ConnectionStates.connecting;
+    c.__setState(ConnectionStates.connecting);
   }
   return c;
 }
