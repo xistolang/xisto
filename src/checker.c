@@ -2009,6 +2009,7 @@ static void check_type_supported(Pos pos, Type *t) {
 static bool elem_widens(Type *x, Type *u);
 static void arr_convert(Expr *e, Type *to);
 static bool tsc_checked(void);
+static bool shape_ok(Type *g, Type *want);
 static bool json_ok_unknown; /* JSON.stringify: an unknown is written by its type at run time */
 static bool json_ok(Type *t, int depth) {
     if (depth > 24) return false; /* (a type that holds itself: no JSON) */
@@ -2169,7 +2170,15 @@ static void check_spread_lit(Expr *e, Type *elem) {
             else if (i && !ty_equal(t, ets[0])) differ = true;
         }
         json_ok_unknown = ju;
-        if (objs && differ) elem = ty_json;
+        if (objs && differ) { /* [...seed (CreateScreenDto[]), ...page.items (ScreenResponseDto[])]: the one shape every element
+                                 copies into (the fields they share), else an object */
+            for (int c = 0; c < e->args.len && !elem; c++) {
+                bool all = true;
+                for (int i = 0; i < e->args.len && all; i++) all = ty_equal(ets[i], ets[c]) || shape_ok(ets[i], ets[c]);
+                if (all) elem = ets[c];
+            }
+            if (!elem) elem = ty_json;
+        }
     }
     if (!elem && e->args.len > 1) { /* [{ term: .. }, ...filtros] with filtros: Record<string, unknown>[]: the Record (objects copied in) */
         Type *rec = NULL;
@@ -8632,6 +8641,26 @@ static void check_expr_in(Expr *e, Type *expected) {
                 expect_type(e, want, "the value of 'as'");
                 if (want->kind == TY_NULLABLE && e->type->kind != TY_NULLABLE && e->type->kind != TY_NULL) upcast(e, want); /* (the field it fills is T | null) */
                 return;
+            }
+        }
+        if (want->kind == TY_PROMISE && v->type->kind != TY_PROMISE && pr_is_call(v)) {
+            /* f() as Promise<X> with f async (its value here, awaited where it goes): the value as X */
+            Expr *in = xs_alloc(sizeof *in);
+            *in = *v;
+            in->prechecked = true;
+            memset(e, 0, sizeof *e);
+            e->kind = E_AS; e->pos = in->pos; e->field = -1; e->lhs = in; e->elem_type = want->elem;
+            check_expr(e, NULL);
+            return;
+        }
+        { /* PageDto<OperatorIdentity> as PageDto<OperatorIdentityResponseDto>: two instances of one generic class, their
+             fields converted as data (a copy, as a structural cast between shapes is) */
+            Type *vb = ty_strip_null(v->type), *wb = ty_strip_null(want);
+            if (vb->kind == TY_OBJECT && wb->kind == TY_OBJECT && vb->cls != wb->cls && vb->cls->generic_of && vb->cls->generic_of == wb->cls->generic_of &&
+                (v->type->kind != TY_NULLABLE || want->kind == TY_NULLABLE)) {
+                Expr *x = xs_alloc(sizeof *x);
+                *x = *v;
+                if (shape_copy(x, want)) { *e = *x; return; }
             }
         }
         xs_error(XS8090, e->pos, "xisto checks types statically: 'as' converts an object (JSON) value or restates the same type", "cannot convert %s to %s", ty_name(v->type), ty_name(want));
