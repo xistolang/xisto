@@ -143,7 +143,7 @@ elif grep -q "assertion failed: math is broken" "$OUT/unit-fail.txt"; then pass=
 # HTTP: fetch options and timeout, non-blocking sleeps, graceful shutdown (SKIP_NET=1 skips: it needs port 8080)
 if [ -n "$SKIP_NET" ]; then :; else
 sh tests/http/run.sh > "$OUT/http.txt" 2>&1
-if grep -q "200 POST abc123 7 xisto" "$OUT/http.txt" && grep -q "bytes body: 200 bytes xisto http://127.0.0.1:8080/echo" "$OUT/http.txt" && grep -q "timeout: The operation was aborted due to timeout TimeoutError" "$OUT/http.txt" \
+if grep -q "200 POST abc123 7 xisto" "$OUT/http.txt" && grep -q "bytes body: 200 bytes xisto http://127.0.0.1:8080/echo" "$OUT/http.txt" && grep -q "init: 200 POST init 7 200 slept 1" "$OUT/http.txt" && grep -q "timeout: The operation was aborted due to timeout TimeoutError" "$OUT/http.txt" \
    && grep -q "abort: true AbortError This operation was aborted true" "$OUT/http.txt" && grep -q "aborted before: AbortError" "$OUT/http.txt" \
    && grep -q "not aborted: 200 slept 10 false" "$OUT/http.txt" && grep -q "200 slept 20" "$OUT/http.txt" && grep -q "redirected: 200 http://127.0.0.1:8080/slow?ms=1 7 slept 1" "$OUT/http.txt" \
    && grep -q "overlapped (20 ok)" "$OUT/http.txt" && grep -q "during SIGTERM: slept 700" "$OUT/http.txt" && grep -q "refused: True" "$OUT/http.txt" \
