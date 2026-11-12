@@ -453,6 +453,7 @@ struct Func {
     Type *ret;
     Stmt *body;        /* S_BLOCK; NULL for built-ins */
     bool is_async;
+    bool ret_maybe_sync; /* declared T | Promise<T> and not async: a call kept gives its value (JavaScript's T when it returns one) */
     bool ret_promise;  /* declared to return Promise<T> (ret is T): async whether or not it is written async */
     Class *cls;        /* owning class for methods, else NULL */
     Class *static_of;  /* a static method (lowered to Class__s_name): its class, which reaches its private members */

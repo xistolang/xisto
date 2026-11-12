@@ -814,6 +814,9 @@ static void check_bytes_static(Expr *e, const char *ns) {
 }
 static Type *tuple_type(Type **ps, int n, Pos pos);
 static void check_stmt(Stmt *s);
+static bool tsc_checked(void);
+static bool is_numkey(Type *t);
+static bool cond_as_if(Stmt *s);
 static void wrap_call(Expr *e, const char *cfn, Type *type);
 static void settle(Expr *e);
 static int pr_kind(Type *t);
@@ -986,7 +989,7 @@ static void check_promise(Expr *e, Type *expected) {
     if (e->args.len != 1) xs_error(XS7032, e->pos, NULL, "Promise.%s takes an array", m);
     Expr *a = e->args.items[0];
     prog->uses_gen = true; /* the coroutines and the event loop */
-    if (a->kind == E_ARRAY_LIT) { /* each element a task */
+    if (a->kind == E_ARRAY_LIT && !a->spread) { /* each element a task (with a spread, [p, ...ps.map(f)]: an array of promises, below) */
         if (a->args.len == 0) xs_error(XS7031, a->pos, NULL, "Promise.%s of an empty list", m);
         Type *t = NULL;
         bool mixed = false;
@@ -1898,6 +1901,25 @@ static Type *resolve(Type *t, Pos pos) {
         if (r != t) *t = *r;
         return t;
     }
+    if (t->kind == TY_TPARAM && t->tname && !strcmp(t->tname, "__keysof")) { /* keyof T: the names of T's fields, as literals */
+        Type *o = free_tparam(t->elem) ? NULL : ty_strip_null(resolve(t->elem, pos));
+        Type *r = ty_string;
+        if (o && o->kind == TY_OBJECT && !o->cls->builtin && !o->cls->is_tuple) {
+            FieldSet fs = {0};
+            fields_here(o->cls, &fs);
+            if (fs.n > 0) {
+                r = xs_alloc(sizeof *r);
+                *r = *ty_string;
+                r->slits = xs_alloc(sizeof(char *) * (size_t)fs.n);
+                for (int i = 0; i < fs.n; i++) r->slits[i] = fs.f[i].name;
+                r->nslits = fs.n;
+                if (fs.n == 1) { r->tname = fs.f[0].name; }
+            }
+        }
+        if (free_tparam(t->elem)) return t;
+        *t = *r;
+        return t;
+    }
     if (t->kind == TY_TPARAM && t->tname && !strcmp(t->tname, "__awaited")) { /* Awaited<...>: a promise's value */
         Type *r = resolve(t->elem, pos);
         if (r->kind == TY_PROMISE) r = r->elem;
@@ -2569,7 +2591,7 @@ static void check_type_supported(Pos pos, Type *t) {
         xs_error(XS6037, pos, "Set elements are string or int in xisto", "unsupported Set element type '%s'", ty_name(t));
     if (t->kind == TY_CHAN && (t->elem->kind == TY_VOID || t->elem->kind == TY_FUNC))
         xs_error(XS6040, pos, NULL, "unsupported channel element type '%s'", ty_name(t->elem));
-    if (t->kind == TY_MAP && (t->elem->kind == TY_VOID || t->elem->kind == TY_FUNC ||
+    if (t->kind == TY_MAP && (t->elem->kind == TY_VOID || (t->elem->kind == TY_FUNC && !(t->record && tsc_checked())) ||
                               (t->elem->kind == TY_NULLABLE && !ty_is_heap(t->elem) && t->elem->elem->kind != TY_NUMBER)))
         xs_error(XS6036, pos, NULL, "unsupported Map value type '%s'", ty_name(t->elem));
     if (t->kind == TY_STREAM && (t->elem->kind == TY_FUNC || t->elem->kind == TY_VOID || t->elem->kind == TY_NULLABLE || t->elem->kind == TY_STREAM))
@@ -2793,7 +2815,9 @@ static void check_spread_lit(Expr *e, Type *elem) {
                 ok = true;
             }
             if (!ok && a->lhs->type->kind == TY_ARRAY && ets[i]->kind == TY_UNKNOWN && !ty_is_any(ets[i]) && tsc_checked() &&
-                (elem->kind == TY_STRING || elem->kind == TY_NUMBER || elem->kind == TY_INT || elem->kind == TY_BOOLEAN)) {
+                (elem->kind == TY_STRING || elem->kind == TY_NUMBER || elem->kind == TY_INT || elem->kind == TY_BOOLEAN ||
+                 (elem->kind == TY_MAP && elem->record && elem->key->kind == TY_STRING && elem->elem->kind == TY_UNKNOWN))) {
+                /* (and ...filtroFichas(f), clauses of several shapes, where Record<string, unknown>[] goes: each one an object, checked) */
                 arr_convert(a->lhs, elem); /* ...screenScopes (a distinct() result, unknown[]) where string[] goes: each one checked */
                 a->type = a->lhs->type;
                 ok = true;
@@ -3078,7 +3102,7 @@ static bool elem_widens(Type *x, Type *u) {
     Type *xb = x->kind == TY_NULLABLE ? x->elem : x;
     if (x->kind == TY_NULLABLE && u->kind != TY_NULLABLE && ub->kind != TY_UNKNOWN) return false;
     if (ub->kind == TY_UNKNOWN && !ty_is_any(ub)) return true;
-    if (ub->kind == TY_NUMBER && xb->kind == TY_INT && !xb->tname) return true;
+    if (ub->kind == TY_NUMBER && xb->kind == TY_INT && (!xb->tname || is_numkey(xb))) return true; /* (a Set<number>'s keys too) */
     if (ub->kind == TY_UNION && xb->kind != TY_UNION && union_member_for(ub, xb, NULL)) return true;
     if (ub->kind == TY_ARRAY && xb->kind == TY_ARRAY) return elem_widens(xb->elem, ub->elem);
     return false;
@@ -3544,6 +3568,20 @@ static void expect_type(Expr *e, Type *want, const char *what) {
             return;
         }
     }
+    if (e->type && e->type->kind == TY_ARRAY && ty_strip_null(want)->kind == TY_STREAM && lookup_func("__xs_iter")) {
+        /* lotes: [linhas] where AsyncIterable<T[]> | Iterable<T[]> goes: __xs_iter(xs), a generator of its elements (xisto:arrays) */
+        Expr *callee = xs_alloc(sizeof *callee);
+        callee->kind = E_IDENT; callee->pos = e->pos; callee->str = "__xs_iter"; callee->field = -1;
+        Expr *a = xs_alloc(sizeof *a);
+        *a = *e;
+        a->prechecked = true;
+        memset(e, 0, sizeof *e);
+        e->kind = E_CALL; e->pos = a->pos; e->field = -1; e->lhs = callee;
+        expr_list_push(&e->args, a);
+        check_expr(e, ty_strip_null(want));
+        expect_type(e, want, what);
+        return;
+    }
     if (e->type && e->type->kind == TY_NULLABLE && e->type->elem->kind == TY_INT && want->kind == TY_NULLABLE && want->elem->kind == TY_NUMBER) {
         wrap_call(e, "xs_num_of_int_or_null", want); /* status: res.statusCode ?? null (int | null) where number | null goes */
         return;
@@ -3824,7 +3862,13 @@ static void expect_type(Expr *e, Type *want, const char *what) {
         /* work(s) where Promise<T> | ((s: S) => Promise<T>) goes: the call kept as its promise */
         Type *u = want->kind == TY_UNION ? want : want->elem;
         for (int i = 0; i < u->nparams; i++)
-            if (u->params[i]->kind == TY_PROMISE && ty_equal(u->params[i]->elem, e->type)) { pr_spawn(e); break; }
+            if (u->params[i]->kind == TY_PROMISE && ty_equal(u->params[i]->elem, e->type)) {
+                bool val = false; /* (canActivate(): boolean | Promise<boolean> not async, where boolean | Promise<boolean> goes: its value) */
+                if (e->func && e->func->ret_maybe_sync)
+                    for (int k = 0; k < u->nparams; k++) if (ty_equal(u->params[k], e->type)) val = true;
+                if (!val) pr_spawn(e);
+                break;
+            }
     }
     if ((want->kind == TY_UNION || (want->kind == TY_NULLABLE && want->elem->kind == TY_UNION)) && enter_union(e, want)) return;
     { /* a subclass where its base goes (also inside T | null, and arrays of them, laid out alike) */
@@ -5188,6 +5232,15 @@ static bool has_tparam(Type *t) {
     default: return false;
     }
 }
+/* has_tparam, also looking into the fields of an inline object type: o: { colunas: ColunaCsv<T>[] } takes part in inferring T */
+static bool has_tparam_inl(Type *t, int depth) {
+    if (has_tparam(t)) return true;
+    if (!t || depth > 3) return false;
+    if (t->kind == TY_NULLABLE) return has_tparam_inl(t->elem, depth + 1);
+    if (t->kind != TY_OBJECT || !t->cls || !t->cls->is_interface || !t->cls->name || strncmp(t->cls->name, "__Obj_", 6) != 0) return false;
+    for (int i = 0; i < t->cls->nfields; i++) if (has_tparam_inl(t->cls->fields[i].type, depth + 1)) return true;
+    return false;
+}
 /* binds the type parameters of pat from got (the type of an argument, or the expected result) */
 static void unify(Type *pat, Type *got, Func *tmpl, Type **bind) {
     if (!pat || !got) return;
@@ -5252,8 +5305,22 @@ static void unify(Type *pat, Type *got, Func *tmpl, Type **bind) {
         unify(pat->ret, got->ret, tmpl, bind);
         return;
     case TY_OBJECT: /* Box<T> against an instance of Box */
+        if (got->cls && got->cls->generic_of && pat->cls && pat->cls->generic_of == got->cls->generic_of && pat->cls != got->cls) {
+            /* Coluna<T> (the template's own instance) against Coluna<Linha>: T from the field types */
+            for (int i = 0; i < pat->cls->nfields && i < got->cls->nfields; i++) unify(pat->cls->fields[i].type, got->cls->fields[i].type, tmpl, bind);
+            return;
+        }
         if (got->cls && got->cls->generic_of && pat->cls && got->cls->generic_of->name && strcmp(got->cls->generic_of->name, pat->cls->name) == 0) {
             for (int i = 0; i < pat->ntargs && i < got->ntargs; i++) unify(pat->targs[i], got->targs[i], tmpl, bind);
+            return;
+        }
+        if (pat->cls && got->cls && pat->cls != got->cls && pat->cls->is_interface && pat->cls->name && !strncmp(pat->cls->name, "__Obj_", 6) &&
+            !got->cls->builtin) {
+            /* f(res, { colunas: COLUNAS, lotes }) with o: { colunas: ColunaCsv<T>[]; ... }: T from the fields of the same name */
+            for (int i = 0; i < pat->cls->nfields; i++) {
+                Field *gf = find_field(got->cls, pat->cls->fields[i].name, NULL);
+                if (gf && gf->type) unify(pat->cls->fields[i].type, gf->type, tmpl, bind);
+            }
         }
         return;
     default: return;
@@ -5364,7 +5431,7 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
        (s) => s.length gets s: string from items */
     for (int pass = 0; pass < 2; pass++)
     for (int i = 0; i < e->args.len; i++) {
-        if (!has_tparam(tmpl->params[i].type) || (e->ntargs && !partial)) continue;
+        if (!has_tparam_inl(tmpl->params[i].type, 0) || (e->ntargs && !partial)) continue;
         bool arrow = e->args.items[i]->kind == E_ARROW;
         if (arrow != (pass == 1)) continue;
         Type *pt = tmpl->params[i].type, *ctx = NULL;
@@ -5621,6 +5688,22 @@ static void check_object_member_in(Expr *e, Class *c) {
             e->str = NULL;
             e->field = -1;
             e->cls = NULL;
+            check_expr(e, NULL);
+            return;
+        }
+    }
+    if (!m && e->is_call && !strcmp(e->str, "delete") && !c->builtin && e->args.len == 1 && e->args.items[0]->kind == E_STRING && tsc_checked()) {
+        /* delete familia.nomes (the parser's familia.delete('nomes')) on an optional field: the field absent, as undefined
+           (xisto's absent and null are one; JSON leaves it out) */
+        Field *df = find_field(c, e->args.items[0]->str, NULL);
+        if (df && (df->optional || df->type->kind == TY_NULLABLE)) {
+            Expr *tgt = xs_alloc(sizeof *tgt);
+            tgt->kind = E_MEMBER; tgt->pos = e->pos; tgt->field = -1; tgt->lhs = e->lhs; tgt->str = e->args.items[0]->str;
+            Expr *u = xs_alloc(sizeof *u);
+            u->kind = E_IDENT; u->pos = e->pos; u->field = -1; u->str = "undefined";
+            Pos pos = e->pos;
+            memset(e, 0, sizeof *e);
+            e->kind = E_ASSIGN; e->op = TK_ASSIGN; e->pos = pos; e->field = -1; e->lhs = tgt; e->rhs = u;
             check_expr(e, NULL);
             return;
         }
@@ -6474,6 +6557,37 @@ static bool objlit_expand(Expr *e, Type *expected) {
                     }
                     continue;
                 }
+            }
+        }
+        if (src->kind == E_COND && !src->builtin.cfn && src->args.len == 2 && pure_read(src->lhs) && tsc_checked() &&
+            src->args.items[0]->kind == E_OBJLIT && src->args.items[1]->kind == E_OBJLIT && !src->args.items[0]->spread && !src->args.items[1]->spread) {
+            /* ...(versao ? { if_seq_no: .., if_primary_term: .. } : { op_type: 'create' }): each key the branch that holds
+               gives, absent (undefined) in the other (c is read once per key: a plain read) */
+            Expr *ya = src->args.items[0], *na = src->args.items[1];
+            bool ok = true;
+            for (int b = 0; b < 2 && ok; b++) {
+                Expr *o = src->args.items[b];
+                for (int k = 0; k < o->args.len; k++) if (!strcmp(o->keys[k], "...") || !strcmp(o->keys[k], "[]")) ok = false;
+            }
+            if (ok) {
+                for (int b = 0; b < 2; b++) {
+                    Expr *o = b ? na : ya, *other = b ? ya : na;
+                    for (int k = 0; k < o->args.len; k++) {
+                        int in_other = -1;
+                        for (int q = 0; q < other->args.len; q++) if (!strcmp(other->keys[q], o->keys[k])) in_other = q;
+                        if (b == 1 && in_other >= 0) continue; /* (a key both give: done with the first branch) */
+                        Expr *c = xs_alloc(sizeof *c);
+                        c->kind = E_COND; c->pos = o->args.items[k]->pos; c->field = -1;
+                        c->lhs = expr_copy(src->lhs);
+                        Expr *alt;
+                        if (in_other >= 0) alt = other->args.items[in_other];
+                        else { alt = xs_alloc(sizeof *alt); alt->kind = E_IDENT; alt->pos = c->pos; alt->field = -1; alt->str = "undefined"; }
+                        expr_list_push(&c->args, b ? alt : o->args.items[k]);
+                        expr_list_push(&c->args, b ? o->args.items[k] : alt);
+                        SET_KEY(o->keys[k], c);
+                    }
+                }
+                continue;
             }
         }
         Type *st = pure_type(src);
@@ -7495,12 +7609,15 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (other->type->kind != TY_NULLABLE && other->type->kind != TY_NULL && other->type->kind != TY_UNKNOWN) {
                     /* x === null (or undefined) with x never null: always false, as TypeScript lets it be written
                        (a check kept from code where the value could be absent) */
-                    if (tsc_checked() && other->kind == E_INDEX && other->lhs && other->rhs && pure_read(other->lhs) && pure_read(other->rhs) &&
+                    Expr *oix = other->kind == E_INDEX ? other->rhs : NULL; /* (R[i] with i a number: the i inside its whole-number check) */
+                    if (oix && oix->kind == E_CALL && !oix->lhs && oix->builtin.cfn && !strcmp(oix->builtin.cfn, "xs_num_key") && oix->args.len == 1)
+                        oix = oix->args.items[0];
+                    if (tsc_checked() && other->kind == E_INDEX && other->lhs && oix && pure_read(other->lhs) && pure_read(oix) &&
                         other->lhs->type && other->lhs->type->kind == TY_ARRAY) {
                         /* REGRA[i] != null with REGRA a number[]: JavaScript's undefined past its end; here 0 <= i < REGRA.length */
                         bool neq = e->op == TK_NEQ;
                         Pos at = e->pos;
-                        Expr *arr = expr_copy(other->lhs), *ix = expr_copy(other->rhs), *ix2 = expr_copy(other->rhs);
+                        Expr *arr = expr_copy(other->lhs), *ix = expr_copy(oix), *ix2 = expr_copy(oix);
                         arr->prechecked = false; ix->prechecked = false; ix2->prechecked = false;
                         Expr *len = xs_alloc(sizeof *len); len->kind = E_MEMBER; len->pos = at; len->field = -1; len->lhs = arr; len->str = "length";
                         Expr *lo = xs_alloc(sizeof *lo); lo->kind = E_BINARY; lo->op = TK_GE; lo->pos = at; lo->field = -1; lo->lhs = ix; lo->rhs = num_lit(at, 0, true);
@@ -8056,6 +8173,10 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (e->lhs->kind != E_IDENT) { /* (() => ...)(), f(a)(b): the function value an expression gives */
             check_expr(e->lhs, NULL);
             Type *ft = e->lhs->type;
+            if (ft->kind == TY_NULLABLE && ft->elem->kind == TY_FUNC && tsc_checked()) { /* F[k](v) with F a Record of functions */
+                nonnull_checked(e->lhs, "the called function");
+                ft = e->lhs->type;
+            }
             if (ft->kind != TY_FUNC) xs_error(XS6030, e->pos, NULL, "only named functions can be called");
             pack_rest(e, ft);
             if (e->args.len != ft->nparams) xs_error(XS8062, e->pos, NULL, "'%s' takes %d argument(s), got %d", "the function", ft->nparams, e->args.len);
@@ -8181,6 +8302,32 @@ static void check_expr_in(Expr *e, Type *expected) {
                 else if (a->type->kind == TY_NUMBER) e->builtin.cfn = "xs_big_from_num";
                 else if (a->type->kind == TY_STRING) e->builtin.cfn = "xs_big_from_str";
                 else if (is_big(a->type)) { *e = *a; return; }
+                else if (a->type->kind == TY_UNION && pure_read(a) && pr_copy(a)) {
+                    /* BigInt(v) with v: number | bigint: typeof v === 'bigint' ? v : BigInt(v) (each member converted as itself) */
+                    bool ok = true, has_big = false;
+                    for (int k = 0; k < a->type->nparams && ok; k++) {
+                        Type *m = a->type->params[k];
+                        if (is_big(m)) has_big = true;
+                        else if (!(m->kind == TY_INT || m->kind == TY_NUMBER || m->kind == TY_STRING)) ok = false;
+                    }
+                    if (ok && has_big) {
+                        Pos pos = e->pos;
+                        Expr *to = xs_alloc(sizeof *to); to->kind = E_UNARY; to->op = TK_IDENT; to->pos = pos; to->field = -1; to->lhs = pr_copy(a);
+                        Expr *lit = xs_alloc(sizeof *lit); lit->kind = E_STRING; lit->pos = pos; lit->field = -1; lit->str = "bigint";
+                        Expr *eq = xs_alloc(sizeof *eq); eq->kind = E_BINARY; eq->op = TK_EQ; eq->pos = pos; eq->field = -1; eq->lhs = to; eq->rhs = lit;
+                        Expr *conv = xs_alloc(sizeof *conv); *conv = *e;
+                        conv->args = (ExprList){0};
+                        expr_list_push(&conv->args, pr_copy(a));
+                        conv->type = NULL; conv->builtin.cfn = NULL;
+                        memset(e, 0, sizeof *e);
+                        e->kind = E_COND; e->pos = pos; e->field = -1; e->lhs = eq;
+                        expr_list_push(&e->args, pr_copy(a));
+                        expr_list_push(&e->args, conv);
+                        check_expr(e, NULL);
+                        return;
+                    }
+                    xs_error(XS7002, a->pos, NULL, "BigInt() converts int, number or string, but this is %s", ty_name(a->type));
+                }
                 else xs_error(XS7002, a->pos, NULL, "BigInt() converts int, number or string, but this is %s", ty_name(a->type));
                 e->type = ty_big();
                 return;
@@ -9047,6 +9194,15 @@ static void check_expr_in(Expr *e, Type *expected) {
             Type *rec = t && t->kind == TY_MAP && t->record && t->key->kind == TY_STRING ? t : NULL;
             Expr *pairs = e->args.items[0];
             if (!rec) {
+                if (pairs->kind == E_MEMBER && pairs->is_call && pairs->str && !strcmp(pairs->str, "map") && pairs->args.len == 1 &&
+                    pairs->args.items[0]->kind == E_ARROW) { /* Object.fromEntries(xs.map(([k, ms]) => [k, exato(ms)])): the pair a tuple */
+                    Arrow *ar = pairs->args.items[0]->arrow;
+                    Stmt *b = ar->fn->body;
+                    /* (an expression body: its return is the last statement, after the destructuring of ([k, ms])) */
+                    Stmt *r = b && b->kind == S_BLOCK && b->stmts.len && (b->stmts.len == 1 || ar->expr_body) ? b->stmts.items[b->stmts.len - 1] : NULL;
+                    if (r && r->kind == S_RETURN && r->expr && r->expr->kind == E_ARRAY_LIT && r->expr->args.len == 2 && !r->expr->spread)
+                        r->expr->want_tuple = true;
+                }
                 check_expr(pairs, NULL);
                 Type *pt = pairs->type;
                 if (pt->kind == TY_MAP && !pt->record && pt->key->kind == TY_STRING) { /* Object.fromEntries(map): its entries */
@@ -10514,7 +10670,13 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         if (ty_is_any(want)) { *e = *v; to_any(e); return; } /* x as any: the same value, read by name from here on */
         if (ty_is_any(v->type) && (want->kind == TY_UNION || (want->kind == TY_NULLABLE && want->elem->kind == TY_UNION))) { *e = *v; e->type = want; return; }
-        if (ty_equal(v->type, want)) { *e = *v; return; }
+        if (ty_equal(v->type, want)) {
+            *e = *v;
+            /* s as Campo, Object.keys(o) as Campo[]: the same string(s), now known to be those literals (COLUNA[c] a V) */
+            Type *ws = want->kind == TY_ARRAY ? want->elem : want;
+            if (tsc_checked() && ws->kind == TY_STRING && ws->nslits > 0) e->type = want;
+            return;
+        }
         if (v->type->kind == TY_PROMISE && want->kind == TY_PROMISE && pr_convertible(v->type->elem, want->elem)) { /* p as Promise<T>, p: Promise<unknown> */
             *e = *v;
             pr_convert(e, want->elem);
@@ -11073,6 +11235,10 @@ static void check_expr_in(Expr *e, Type *expected) {
             f->params[i].cname = pb->plain ? pb->plain : pb->cname;
             f->params[i].cell = pb->cell;
         }
+        if (!f->ret && a->expr_body && want && want->ret && want->ret->kind == TY_VOID && tsc_checked() && f->body->stmts.len &&
+            f->body->stmts.items[f->body->stmts.len - 1]->expr && f->body->stmts.items[f->body->stmts.len - 1]->expr->kind == E_COND &&
+            !f->body->stmts.items[f->body->stmts.len - 1]->expr->builtin.cfn)
+            f->ret = ty_void; /* (ok) => (c ? ok() : res.once('drain', ...)) where a void callback goes: its value dropped */
         if (!f->ret) {
             /* infer from the body: an expression body takes the expression's type; a block needs an annotation unless it never returns a value */
             if (a->expr_body) { /* ([k, v]) => ...: the reads of a destructured parameter come first */
@@ -11099,8 +11265,11 @@ static void check_expr_in(Expr *e, Type *expected) {
                 for (int i = 0; i + 1 < f->body->stmts.len; i++) check_stmt(f->body->stmts.items[i]);
                 Stmt *r = f->body->stmts.items[f->body->stmts.len - 1];
                 r->kind = S_EXPR;
-                check_expr(r->expr, NULL);
-                settle(r->expr);
+                if (cond_as_if(r)) check_stmt(r); /* (ok) => (c ? ok() : res.once(...)): if (c) ok(); else res.once(...); */
+                else {
+                    check_expr(r->expr, NULL);
+                    settle(r->expr);
+                }
             } else {
                 check_block(f->body);
                 if (f->ret->kind != TY_VOID && !always_returns(f->body))
@@ -11586,6 +11755,14 @@ static void check_expr_in(Expr *e, Type *expected) {
                 ty_to = !strcmp(c->rhs->str, "string") ? ty_string : !strcmp(c->rhs->str, "number") ? ty_number : !strcmp(c->rhs->str, "boolean") ? ty_boolean : NULL;
                 if (ty_to) ty_path = member_path_text(c->lhs->lhs);
             }
+            if (tsc_checked() && c && c->kind == E_MEMBER && c->is_call && c->str && !strcmp(c->str, "isArray") && c->args.len == 1 && c->lhs &&
+                c->lhs->kind == E_IDENT && !strcmp(c->lhs->str, "Array") && !lookup("Array")) {
+                /* Array.isArray(p?.xs) ? p.xs : [] with p.xs an unknown: the branch reads it as an unknown[] (checked) */
+                static Type *arr_u;
+                if (!arr_u) arr_u = ty_array_of(ty_unknown);
+                ty_to = arr_u;
+                ty_path = member_path_text(c->args.items[0]);
+            }
         }
         const char *then_path = ty_path && e->args.len == 2 ? member_path_text(e->args.items[0]) : NULL;
         check_expr(e->lhs, NULL);
@@ -11867,7 +12044,8 @@ static void check_var(Stmt *s, bool global) {
         return;
     }
     check_expr(s->init, s->decl_type);
-    if (!s->decl_type && pr_async_call(s->init)) pr_spawn(s->init); /* const p = f(): the promise (XB-106) */
+    if (!s->decl_type && pr_async_call(s->init) && !(s->init->func && s->init->func->ret_maybe_sync))
+        pr_spawn(s->init); /* const p = f(): the promise (XB-106); f(): T | Promise<T> not async: its value, as JavaScript's sync return */
     if (s->init->type->kind == TY_VOID && tsc_checked() && (!s->decl_type || s->decl_type->kind == TY_UNKNOWN || s->decl_type->kind == TY_VOID)) {
         /* const r = await fn() with fn's T = void (a generic instance): JavaScript stores undefined; here the call runs
            and r is an unknown that holds null */
@@ -12871,6 +13049,22 @@ static void instanceof_path_narrow(Stmt *s) {
     if (assigned) return;
     io_scan_s(s->body, c->lhs, ty_object_of(k), true, &assigned);
 }
+/* c ? f() : g(); with its value dropped (a statement, or the value of a void function): if (c) f(); else g(); (TypeScript lets
+   the two branches be of any types there: res.write(t) ? ok() : res.once('drain', ...)) */
+static bool cond_as_if(Stmt *s) {
+    Expr *x = s->expr;
+    if (!tsc_checked() || !x || x->kind != E_COND || x->builtin.cfn || x->args.len != 2 || !x->lhs) return false;
+    Stmt *a = xs_alloc(sizeof *a), *b = xs_alloc(sizeof *b);
+    a->kind = S_EXPR; a->pos = x->args.items[0]->pos; a->expr = x->args.items[0];
+    b->kind = S_EXPR; b->pos = x->args.items[1]->pos; b->expr = x->args.items[1];
+    Stmt *ba = xs_alloc(sizeof *ba), *bb = xs_alloc(sizeof *bb);
+    ba->kind = S_BLOCK; ba->pos = a->pos; stmt_list_push(&ba->stmts, a);
+    bb->kind = S_BLOCK; bb->pos = b->pos; stmt_list_push(&bb->stmts, b);
+    Expr *c = x->lhs;
+    memset(s, 0, sizeof *s);
+    s->kind = S_IF; s->pos = x->pos; s->cond = c; s->body = ba; s->else_body = bb;
+    return true;
+}
 static void check_stmt(Stmt *s) {
     switch (s->kind) {
     case S_VAR:
@@ -12911,6 +13105,7 @@ static void check_stmt(Stmt *s) {
                 return;
             }
         }
+        if (cond_as_if(s)) { check_stmt(s); return; }
         { /* p.catch(...); and await p.catch((err) => log(err)); (the value dropped: the handler need not give the promise's type) */
             Expr *x = s->expr->kind == E_AWAIT && s->expr->lhs ? s->expr->lhs : s->expr;
             pr_discard = x->kind == E_MEMBER && x->is_call && x->str && (strcmp(x->str, "then") == 0 || strcmp(x->str, "catch") == 0);
@@ -13197,6 +13392,34 @@ static void check_stmt(Stmt *s) {
                 expect_type(c->value, t, "case value");
             }
         }
+        if (tsc_checked() && t->kind == TY_STRING && t->nslits > 0) {
+            /* switch (input.subprogram) over 'a' | 'b' with a case for each and no default: TypeScript knows no value gets past
+               it; here a value outside the type (data not checked) throws there instead of falling off the function's end */
+            bool has_default = false, all = true;
+            for (int i = 0; i < s->ncases; i++) if (!s->cases[i].value) has_default = true;
+            for (int k = 0; k < t->nslits && all; k++) {
+                bool hit = false;
+                for (int i = 0; i < s->ncases && !hit; i++)
+                    hit = s->cases[i].value && s->cases[i].value->kind == E_STRING && !strcmp(s->cases[i].value->str, t->slits[k]);
+                all = hit;
+            }
+            if (!has_default && all) {
+                Expr *msg = str_lit(s->pos, "switch: a value no case of its type has");
+                Expr *nw = xs_alloc(sizeof *nw);
+                nw->kind = E_NEW_OBJ; nw->pos = s->pos; nw->field = -1; nw->str = "Error";
+                expr_list_push(&nw->args, msg);
+                Stmt *th = xs_alloc(sizeof *th);
+                th->kind = S_THROW; th->pos = s->pos; th->expr = nw;
+                Stmt *blk = xs_alloc(sizeof *blk);
+                blk->kind = S_BLOCK; blk->pos = s->pos;
+                stmt_list_push(&blk->stmts, th);
+                Case *cs = xs_alloc(sizeof(Case) * (size_t)(s->ncases + 1));
+                memcpy(cs, s->cases, sizeof(Case) * (size_t)s->ncases);
+                cs[s->ncases].value = NULL; cs[s->ncases].body = blk; cs[s->ncases].pos = s->pos;
+                s->cases = cs;
+                s->ncases++;
+            }
+        }
         switch_depth++;
         Expr *sx = s->expr;
         Expr *sid = sx->kind == E_MEMBER && sx->builtin.cfn && strcmp(sx->builtin.cfn, "union_field") == 0 ? union_ident(sx->lhs) : NULL;
@@ -13232,6 +13455,19 @@ static void check_stmt(Stmt *s) {
         if (cur_func->is_gen && s->expr) xs_error(XS8074, s->expr->pos, "yield it, then return;", "a generator returns no value");
         if (!cur_func->ret) { ret_infer_stmt(s); return; } /* the return type is inferred: this return is part of it */
         if (s->expr) {
+            if (cur_func->ret->kind == TY_VOID && s->expr->kind == E_COND) {
+                Stmt *c = xs_alloc(sizeof *c);
+                c->kind = S_EXPR; c->pos = s->pos; c->expr = s->expr;
+                if (cond_as_if(c)) { /* return c ? f() : g(); in a void function: the if, then return; */
+                    Stmt *ret = xs_alloc(sizeof *ret);
+                    ret->kind = S_RETURN; ret->pos = s->pos;
+                    s->kind = S_BLOCK; s->expr = NULL; s->stmts = (StmtList){0};
+                    stmt_list_push(&s->stmts, c);
+                    stmt_list_push(&s->stmts, ret);
+                    check_stmt(s);
+                    return;
+                }
+            }
             if (cur_func->ret->kind == TY_VOID) {
                 /* return f(); where f is void too (TypeScript allows it; a generic run<R> instantiated with void):
                    the call, then return; */
@@ -13400,7 +13636,13 @@ static void resolve_signature(Func *f) {
     }
     if (f->ret) f->ret = resolve(f->ret, f->pos);
     else if (!f->ret_infer) f->ret_infer = 1; /* left out: inferred from the body (fret) */
-    { bool as = false; f->ret = ret_unpromise(f->ret, &as); if (as) f->ret_promise = true; } /* (): Promise<T>: T, and async (XB-106) */
+    {
+        Type *decl = f->ret;
+        bool as = false;
+        f->ret = ret_unpromise(f->ret, &as);
+        if (as) f->ret_promise = true; /* (): Promise<T>: T, and async (XB-106) */
+        if (as && tsc_checked() && !f->is_async && decl && ty_strip_null(decl)->kind == TY_UNION) f->ret_maybe_sync = true;
+    }
     if (f->is_async) f->ret_promise = true;
 }
 
@@ -13793,12 +14035,65 @@ static void ret_infer_begin(Func *f) {
     f->ret_null = f->ret_bare = false;
     f->ret_exprs.len = f->ret_late.len = 0;
 }
+/* return { docs, oracle } and, elsewhere, return { docs, oracle: null }: one object type, T | null where a return gives
+   null (as the two branches of a ?: are merged); every literal returned so far takes it */
+static bool ret_objlit_merge(Func *f, Expr *e) {
+    Type *acc = f->ret_acc;
+    if (!tsc_checked() || e->kind != E_OBJLIT || !acc || acc->kind != TY_OBJECT || !acc->cls || f->ret_exprs.len == 0) return false;
+    Class *A = acc->cls;
+    for (int i = 0; i < f->ret_exprs.len; i++) {
+        Expr *x = f->ret_exprs.items[i];
+        if (x->kind != E_OBJLIT || x->cls != A || x->args.len != A->nfields) return false;
+    }
+    if (e->args.len != A->nfields) return false;
+    for (int i = 0; i < e->args.len; i++) {
+        int fi = -1;
+        for (int k = 0; k < A->nfields; k++) if (!strcmp(A->fields[k].name, e->keys[i])) fi = k;
+        if (fi < 0) return false;
+    }
+    bool nulls = false; /* (only when a field is null here and not in the type: else the plain check) */
+    for (int i = 0; i < e->args.len; i++) {
+        Field *af = find_field(A, e->keys[i], NULL);
+        if (e->args.items[i]->kind == E_NULL && af->type->kind != TY_NULLABLE && af->type->kind != TY_UNKNOWN && nullable_ok(af->type)) nulls = true;
+    }
+    if (!nulls) return false;
+    check_expr(e, NULL);
+    Class *B = e->cls;
+    if (!B || B == A || B->nfields != A->nfields) return false;
+    Class *M = made_iface("ret", e->pos);
+    for (int i = 0; i < A->nfields; i++) {
+        Field *bf = find_field(B, A->fields[i].name, NULL);
+        if (!bf) return false;
+        Type *ta = A->fields[i].type, *tb = bf->type, *t;
+        if (ty_equal(ta, tb)) t = ta;
+        else if ((tb->kind == TY_UNKNOWN || tb->kind == TY_NULL) && nullable_ok(ty_strip_null(ta))) t = ty_nullable_of(ty_strip_null(ta));
+        else if ((ta->kind == TY_UNKNOWN || ta->kind == TY_NULL) && nullable_ok(ty_strip_null(tb))) t = ty_nullable_of(ty_strip_null(tb));
+        else if (ty_equal(ty_strip_null(ta), ty_strip_null(tb))) t = ty_nullable_of(ty_strip_null(ta));
+        else return false;
+        made_field(M, A->fields[i].name, t, A->fields[i].optional || bf->optional, e->pos);
+    }
+    late_inline_class(M);
+    expr_list_push(&f->ret_exprs, e);
+    for (int q = 0; q < f->ret_exprs.len; q++) {
+        Expr *x = f->ret_exprs.items[q];
+        for (int i = 0; i < x->args.len; i++) {
+            int fi = -1;
+            for (int k = 0; k < M->nfields; k++) if (!strcmp(M->fields[k].name, x->keys[i])) fi = k;
+            if (fi >= 0) expect_type(x->args.items[i], M->fields[fi].type, xs_sprintf("field '%s'", x->keys[i]));
+        }
+        x->cls = M;
+        x->type = ty_object_of(M);
+    }
+    f->ret_acc = ty_object_of(M);
+    return true;
+}
 static void ret_infer_stmt(Stmt *s) {
     Func *f = cur_func;
     const char *hint = "write the return type: f(): Todo { ... }";
     if (!s->expr) { f->ret_bare = true; return; }
     Expr *e = s->expr;
     if (e->kind == E_ARRAY_LIT && e->args.len == 0) { expr_list_push(&f->ret_late, e); return; }
+    if (ret_objlit_merge(f, e)) return;
     check_expr(e, f->ret_acc && f->ret_acc->kind != TY_VOID ? f->ret_acc : NULL);
     if (f->ret_promise && e->type->kind == TY_PROMISE) pr_await(e); /* an async function returning a promise: its value */
     Type *t = e->type;
@@ -14073,7 +14368,9 @@ static void flatten_methods(Class *c) {
         }
         bool same = own->nparams == bm->nparams && (!own->ret || !bm->ret || ty_equal(own->ret, bm->ret));
         for (int k = 0; same && k < own->nparams; k++) same = ty_equal(own->params[k].type, bm->params[k].type);
-        if (!same && own->nparams != bm->nparams && tsc_checked() && !bm->is_abstract && !b->is_interface && !b->iface_methods && own->body) {
+        if (!same && tsc_checked() && !bm->is_abstract && !b->is_interface && !b->iface_methods && own->body) {
+            /* (the same count with other types too: canActivate(): boolean | Promise<boolean> | Observable<boolean> over a
+               base's canActivate(): boolean, handleRequest<TUser = JwtPayload>(...): TUser over one giving unknown) */
             /* upsert(input) over upsert(filter, set, setOnInsert?): TypeScript takes it, and JavaScript calls it by name: a call
                through the base (this.upsert(...) in the base's own code too) runs this one, with the arguments it was given
                (the extra ones dropped). Here a bridge with the base's signature does that: this.upsert(a0 as P0, ...),
@@ -14102,6 +14399,12 @@ static void flatten_methods(Class *c) {
             th->kind = E_THIS; th->pos = pos; th->field = -1;
             Expr *call = xs_alloc(sizeof *call);
             call->kind = E_MEMBER; call->pos = pos; call->field = -1; call->lhs = th; call->str = own->name; call->is_call = true;
+            if (own->ntparams) { /* handleRequest<TUser = JwtPayload>(...): TUser called through the base: no type given there
+                                    (JavaScript passes the value as it is): each one unknown */
+                call->ntargs = own->ntparams;
+                call->targs = xs_alloc(sizeof(Type *) * (size_t)own->ntparams);
+                for (int k = 0; k < own->ntparams; k++) call->targs[k] = ty_unknown;
+            }
             for (int k = 0; k < own->nparams && k < bm->nparams; k++) {
                 Expr *id = xs_alloc(sizeof *id);
                 id->kind = E_IDENT; id->pos = pos; id->field = -1; id->str = br->params[k].name;

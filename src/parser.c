@@ -55,6 +55,7 @@ static void vt_push(Parser *p, const char *name, Type *t) {
 static bool wants_intl;
 static Func **pending_overloads; /* function f(...): R; signatures waiting for their implementation */
 static int npending_overloads;
+static bool wants_arrays; /* a .reduce( / .flatMap( / .flat( call, or an Iterable<T> type, was parsed: xisto:arrays is loaded */
 static bool wants_settled; /* Promise.allSettled was named: xisto:settled is loaded */
 static bool wants_okmap; /* WeakMap, or Map<object, V>, was written: xisto:okmap is loaded */
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
@@ -514,9 +515,22 @@ static Type *parse_type(Parser *p) {
     }
     if (at_ident(p, "keyof") && peek_is(p, TK_IDENT)) { /* keyof T (& string): the names of T's fields, a string */
         next(p);
+        const char *from = p->tok.start;
+        Parser before = *p;
         skip_type_term(p);
-        if (at(p, TK_AMP)) { Parser look = *p; next(&look); if (at_ident(&look, "string")) { *p = look; next(p); } }
         t = ty_string;
+        { /* (the term again, on its own: the checker turns keyof of an object type into the union of its field names) */
+            size_t n = (size_t)(p->prev_end - from);
+            char *text = xs_strndup(from, n);
+            Parser sub = before;
+            lexer_init(&sub.lx, text);
+            sub.lx.line = before.tok.pos.line;
+            sub.lx.col = before.tok.pos.col;
+            next(&sub);
+            Type *of = parse_type(&sub);
+            if (at(&sub, TK_EOF)) t = tp_index(of, "__keysof", NULL);
+        }
+        if (at(p, TK_AMP)) { Parser look = *p; next(&look); if (at_ident(&look, "string")) { *p = look; next(p); } }
         if (at(p, TK_PIPE)) { next(p); t = union_rest(p, t); }
         return t;
     }
@@ -804,6 +818,7 @@ static Type *parse_type(Parser *p) {
         /* (async ones too: an async generator's waits park its consumer, so for await reads it as for...of) */
         /* what a generator returns: a Stream<T> (for...of, map, filter, take...); Generator<T, R, N>'s R, N are ignored */
         expect(p, TK_LT, xs_sprintf("write %s<T>", n));
+        if (!strcmp(n, "Iterable") || !strcmp(n, "AsyncIterable")) wants_arrays = true; /* (an array where it goes: __xs_iter) */
         t = ty_stream_of(parse_type(p));
         while (accept(p, TK_COMMA)) parse_type(p);
         expect(p, TK_GT, NULL);
@@ -1696,7 +1711,6 @@ static int parse_type_args(Parser *p, Type ***out) {
    `a !== null ? rest : null`. Every ?. in one postfix chain nests inside the one before it, so a?.b?.c stops
    at the first null */
 static int noptc;
-static bool wants_arrays; /* a .reduce( / .flatMap( / .flat( call was parsed: xisto:arrays is loaded */
 static Expr *ident_expr(Pos pos, const char *name);
 static Expr *ns_member(Parser *p, Expr *e, Token name);
 static Expr *parse_postfix(Parser *p) {
@@ -5511,6 +5525,10 @@ static const char xs_arrays_src[] =
     "    out[String(k)] = p.length > 1 ? p[1] : null;\n"
     "  }\n"
     "  return out;\n"
+    "}\n"
+    "// an array where an Iterable<T> goes (lotes: [linhas] for AsyncIterable<T[]> | Iterable<T[]>): its elements, in order\n"
+    "export function* __xs_iter<T>(xs: T[]): Generator<T> {\n"
+    "  for (const x of xs) yield x;\n"
     "}\n"
     "// m.keys().next().value: the first of them, undefined when there is none (the compiler calls this)\n"
     "export function __xs_first<T>(xs: T[]): T | undefined {\n"
