@@ -7440,6 +7440,12 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (lit_as) objlit_as_cast--;
         Expr *v = e->lhs;
         if (v->type->kind == TY_LITINT && is_numeric(want)) coerce_lit(v, want);
+        if (want->kind == TY_NULLABLE && v->kind == E_INDEX && !v->builtin.cfn && v->lhs->type && v->lhs->type->kind == TY_ARRAY &&
+            ty_is_heap(v->lhs->type->elem) && v->lhs->type->elem->kind != TY_NULLABLE && v->type->kind != TY_NULLABLE) {
+            /* rows[0] as Row | undefined: the cast says the element may be missing; null past the end, as JavaScript's undefined */
+            v->builtin.cfn = "xs_arr_ref_at_or_null";
+            if (v->type->kind != TY_UNKNOWN) v->type = ty_nullable_of(v->type); /* (an unknown holds null already) */
+        }
         if (ty_is_any(want)) { *e = *v; to_any(e); return; } /* x as any: the same value, read by name from here on */
         if (ty_is_any(v->type) && (want->kind == TY_UNION || (want->kind == TY_NULLABLE && want->elem->kind == TY_UNION))) { *e = *v; e->type = want; return; }
         if (ty_equal(v->type, want)) { *e = *v; return; }
@@ -7519,9 +7525,11 @@ static void check_expr_in(Expr *e, Type *expected) {
         { /* Record<string, unknown> as Record<string, string | number | null>: each value checked as it is decoded */
             bool ju = json_ok_unknown;
             json_ok_unknown = true;
-            bool ok = v->type->kind != TY_NULLABLE && json_ok(v->type, 0);
+            bool ok = (v->type->kind != TY_NULLABLE || want->kind == TY_NULLABLE) && json_ok(ty_strip_null(v->type), 0);
             json_ok_unknown = ju;
-            if (ok && (json_target(want) || (want->kind == TY_MAP && want->record && json_ok(want, 0)))) { *e = *v; to_json(e); from_json(e, want); return; }
+            if (ok && (json_target(want) || (want->kind == TY_NULLABLE && json_target(want->elem)) || (want->kind == TY_MAP && want->record && json_ok(want, 0)))) {
+                *e = *v; to_json(e); from_json(e, want); return; /* (rows[0] as { R?: number } | undefined: a shape, or null) */
+            }
         }
         { /* an upcast TypeScript writes with 'as': 0 as number | null, n as number | string | null, Enum.A as string */
             Type *w = want->kind == TY_NULLABLE ? want->elem : want;
