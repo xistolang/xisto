@@ -1241,11 +1241,12 @@ export class Repository<T> {
 
   // (an entity given by name, manager.update("TB_X", ...): its metadata, not T's; a name, so the repository stays
   // data the injector can decode)
-  fixedName: string = "";
+  fixedName?: string; // (optional: the injector's JSON of a repository has only its data source)
 
   get metadata(): EntityMetadata {
-    if (this.fixedName.length > 0) {
-      return metadataByName(this.fixedName);
+    const n = this.fixedName;
+    if (n != null && n.length > 0) {
+      return metadataByName(n);
     }
     return metadataById(__reflect_typeid(T), __reflect_typeid(T));
   }
