@@ -129,7 +129,7 @@ static void usage(void) {
             "    --target=linux-arm64|linux-x64|windows-x64             an executable for another system, from any host (needs zig)\n"
             "  xisto emit [--backend=c|qbe] FILE.ts                     print the generated C or QBE IL\n"
             "  xisto run [--dev] [--backend=c|qbe] FILE.ts [ARGS...]    compile to a temp file and run it\n"
-            "  xisto debug [--batch CMDS] FILE.ts [ARGS...]             run under the debugger (docs/debugger.md)\n"
+            "  xisto debug [--batch CMDS] FILE.ts [ARGS...]             run under the debugger\n"
             "  xisto dap                                                debug adapter for IDEs (DAP over stdin/stdout)\n"
             "  xisto clean [DIR]                                        remove the build cache (.xisto/cache) of a project\n"
             "  xisto fmt [--check] FILE.ts...                           format in place (--check: exit 1 if any file would change)\n"
@@ -169,11 +169,17 @@ static bool use_qbe;
 
 #if !defined(_WIN32)
 /* xisto run: the program as a direct child (no shell in between), so `kill <pid of xisto run>` reaches it:
-   SIGTERM and SIGHUP are passed on; SIGINT and SIGQUIT come from the terminal to the whole foreground group, so the
-   program already has them and xisto only waits (passing them on would deliver them twice). Its exit code, or
+   SIGTERM and SIGHUP are passed on. SIGINT and SIGQUIT typed at the terminal (Ctrl+C, Ctrl+\\) reach the whole
+   foreground group, so the program already has them: those (sent by the kernel, si_pid 0) are not passed on, or the
+   program would get them twice; the same signals sent by another process (kill -INT) are. Its exit code, or
    128 + the signal that ended it, as a shell reports it. */
 static volatile pid_t run_child;
-static void run_forward(int sig) { if (run_child > 0) kill(run_child, sig); }
+static void run_forward(int sig, siginfo_t *info, void *uc) {
+    (void)uc;
+    if (run_child <= 0) return;
+    if ((sig == SIGINT || sig == SIGQUIT) && info && info->si_pid == 0) return; /* from the terminal: the program has it */
+    kill(run_child, sig);
+}
 static int run_exe(const char *exe, int argc, char **argv, int rest) {
     char **av = malloc(sizeof(char *) * (size_t)(argc - rest + 2));
     int n = 0;
@@ -184,15 +190,14 @@ static int run_exe(const char *exe, int argc, char **argv, int rest) {
     if (pid < 0) { perror("xisto: fork"); free(av); return 1; }
     if (pid == 0) { execv(exe, av); perror("xisto: exec"); _exit(127); }
     run_child = pid;
-    struct sigaction fwd = {0}, ign = {0};
-    fwd.sa_handler = run_forward;
-    ign.sa_handler = SIG_IGN;
+    struct sigaction fwd = {0};
+    fwd.sa_sigaction = run_forward;
+    fwd.sa_flags = SA_SIGINFO;
     sigemptyset(&fwd.sa_mask);
-    sigemptyset(&ign.sa_mask);
     sigaction(SIGTERM, &fwd, NULL);
     sigaction(SIGHUP, &fwd, NULL);
-    sigaction(SIGINT, &ign, NULL);
-    sigaction(SIGQUIT, &ign, NULL);
+    sigaction(SIGINT, &fwd, NULL);
+    sigaction(SIGQUIT, &fwd, NULL);
     int st = 0;
     while (waitpid(pid, &st, 0) < 0) if (errno != EINTR) { st = 1 << 8; break; }
     free(av);
