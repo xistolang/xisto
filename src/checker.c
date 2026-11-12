@@ -12054,7 +12054,14 @@ static void fake_object(Expr *e, Class *t) {
         if (m) {
             Type **ps = xs_alloc(sizeof(Type *) * (size_t)(m->nparams + 1));
             for (int q = 0; q < m->nparams; q++) ps[q] = m->params[q].type;
-            ft = ty_func(ps, m->nparams, m->ret);
+            /* (its result held as unknown when it is a reference: getHandler: () => () => undefined gives a function where a
+               RouteHandler goes, as JavaScript allows; the method checks it where it gives it) */
+            Expr *fv = e->args.items[i];
+            Expr *body = fv->kind == E_ARROW && fv->arrow->expr_body && fv->arrow->fn->body && fv->arrow->fn->body->stmts.len == 1 ?
+                         fv->arrow->fn->body->stmts.items[0]->expr : NULL;
+            bool loose = m->ret && ty_is_heap(m->ret) && m->ret->kind != TY_UNKNOWN && !m->ret_promise &&
+                         !(body && (body->kind == E_OBJLIT || body->kind == E_ARRAY_LIT)); /* (a literal result takes the type) */
+            ft = ty_func(ps, m->nparams, loose ? ty_unknown : m->ret);
             ft->async_ret = m->ret_promise;
             Field *nf = &a->fields[a->nfields++];
             memset(nf, 0, sizeof *nf);
@@ -12114,7 +12121,17 @@ static void fake_object(Expr *e, Class *t) {
             call->kind = E_CALL; call->pos = pos; call->field = -1; call->lhs = mem;
             for (int q = 0; q < tm->nparams; q++) expr_list_push(&call->args, ad_ident(pos, f->params[q].name));
             if (!tm->ret || tm->ret->kind == TY_VOID) { s1->kind = S_EXPR; s1->expr = call; }
-            else { s1->kind = S_RETURN; s1->expr = call; }
+            else {
+                Expr *v = call;
+                Field *ff = NULL;
+                for (int q = 0; q < a->nfields; q++) if (!strcmp(a->fields[q].name, xs_sprintf("__fake_%s", tm->name))) ff = &a->fields[q];
+                if (ff && ff->type->kind == TY_FUNC && ff->type->ret && ff->type->ret->kind == TY_UNKNOWN && tm->ret->kind != TY_UNKNOWN) {
+                    Expr *as = xs_alloc(sizeof *as);
+                    as->kind = E_AS; as->pos = pos; as->field = -1; as->lhs = call; as->elem_type = tm->ret;
+                    v = as;
+                }
+                s1->kind = S_RETURN; s1->expr = v;
+            }
         } else {
             Expr *ne = xs_alloc(sizeof *ne);
             ne->kind = E_CALL; ne->pos = pos; ne->field = -1; ne->builtin.cfn = "xs_type_error_not_fn";
