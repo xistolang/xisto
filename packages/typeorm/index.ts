@@ -1572,6 +1572,7 @@ export class SelectQueryBuilder<T> {
   private setRaw: Map<string, string> = new Map<string, string>(); // (set({ dt: () => "SYSDATE" }): raw SQL by property)
   private insertRaw: Map<string, string> = new Map<string, string>(); // (values({ ... }) of one row: the same)
   private aliases: Map<string, EntityMetadata> = new Map<string, EntityMetadata>();
+  private isSub: boolean = false; // (made by subQuery(): its text goes into another query's condition)
 
   constructor(executor: Executor) {
     this.executor = executor;
@@ -1638,21 +1639,46 @@ export class SelectQueryBuilder<T> {
     return this;
   }
 
-  where(condition: string, params: object = {}): SelectQueryBuilder<T> {
-    this.wheres = ["(" + condition + ")"];
+  /**
+   * where("a.x = :x", { x }), or where((qb) => "a.id IN " + qb.subQuery()....getQuery(), params): the function's text is
+   * the condition (TypeORM's WhereExpression as a function of the builder)
+   */
+  where(condition: string | ((qb: SelectQueryBuilder<T>) => string), params: object = {}): SelectQueryBuilder<T> {
+    const c = typeof condition === "string" ? condition : condition(this);
+    this.wheres = ["(" + c + ")"];
     this.mergeParams(params);
     return this;
   }
 
-  andWhere(condition: string, params: object = {}): SelectQueryBuilder<T> {
-    this.wheres.push((this.wheres.length > 0 ? "AND " : "") + "(" + condition + ")");
+  andWhere(condition: string | ((qb: SelectQueryBuilder<T>) => string), params: object = {}): SelectQueryBuilder<T> {
+    const c = typeof condition === "string" ? condition : condition(this);
+    this.wheres.push((this.wheres.length > 0 ? "AND " : "") + "(" + c + ")");
     this.mergeParams(params);
     return this;
   }
 
-  orWhere(condition: string, params: object = {}): SelectQueryBuilder<T> {
-    this.wheres.push((this.wheres.length > 0 ? "OR " : "") + "(" + condition + ")");
+  orWhere(condition: string | ((qb: SelectQueryBuilder<T>) => string), params: object = {}): SelectQueryBuilder<T> {
+    const c = typeof condition === "string" ? condition : condition(this);
+    this.wheres.push((this.wheres.length > 0 ? "OR " : "") + "(" + c + ")");
     this.mergeParams(params);
+    return this;
+  }
+
+  /** A builder for a subquery: its getQuery() is "(SELECT ...)", its :names left for the query it goes into. */
+  subQuery(): SelectQueryBuilder<T> {
+    const q = new SelectQueryBuilder<T>(this.executor);
+    q.isSub = true;
+    return q;
+  }
+
+  /** The statement's text: a subquery's in parentheses, with its :names as written. */
+  getQuery(): string {
+    const sql = this.build(new Binds(this.executor.dialect()));
+    return this.isSub ? "(" + sql + ")" : sql;
+  }
+
+  /** updateEntity(false): TypeORM's reload of the entity after an insert; nothing is reloaded here, so it is accepted. */
+  updateEntity(enabled: boolean): SelectQueryBuilder<T> {
     return this;
   }
 
@@ -1886,6 +1912,9 @@ export class SelectQueryBuilder<T> {
 
   // :name and :...name (outside quotes and :: casts) -> the dialect's numbered binds
   private bindsIn(sql: string, binds: Binds): string {
+    if (this.isSub) {
+      return sql; // (a subquery's :names are bound by the query it is part of)
+    }
     const params: object = JSON.parse(this.params);
     let out = "";
     let i = 0;
