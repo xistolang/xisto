@@ -41,7 +41,7 @@ http.createServer((req, res) => {
           { _index: "orders", _id: "1", _score: 1, _source: { company: "Ação & Cia", amount: 10.5 } },
           { _index: "orders", _id: "2", _score: 1, _source: { company: "B", amount: 3 } },
         ] },
-        echo,
+        aggregations: { echo },
       });
     }
     if (p.endsWith("/_count")) return reply(res, 200, { count: 2, echo });
@@ -54,7 +54,10 @@ http.createServer((req, res) => {
         items.push({ [op]: { _index: action[op]._index, _id: action[op]._id ?? `auto${i}`, status: 201, result: "created" } });
         if (op !== "delete") i++;
       }
-      return reply(res, 200, { took: 1, errors: false, items, lines: lines.length, ends_with_newline: data.endsWith("\n"), echo });
+      // the request checked here (a response of the real cluster carries no echo): NDJSON, one line per action and
+      // document, a newline at the end; errors when it is not
+      const ok = data.endsWith("\n") && lines.length === 6 && req.headers["content-type"] === "application/x-ndjson" && req.method === "POST";
+      return reply(res, 200, { took: 1, errors: !ok, items });
     }
     const m = p.match(/^\/([^/]+)\/_doc\/([^/]+)$/);
     if (m && req.method === "GET") {

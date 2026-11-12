@@ -4385,6 +4385,25 @@ static void alias_collisions(Parser *p, Module *m, int first, Import *im) {
         }
     }
 }
+/* a package the program's packages have (XISTO_PKGS, or a .xisto/pkgs above the file), without loading it */
+static bool pkg_available(const char *from_file, const char *name) {
+    char probe[PATH_MAX];
+    const char *extra = getenv("XISTO_PKGS");
+    if (extra && *extra) {
+        snprintf(probe, sizeof probe, "%s/%s", extra, name);
+        if (access(probe, R_OK) == 0) return true;
+    }
+    if (!from_file) return false;
+    char dir[PATH_MAX];
+    strncpy(dir, from_file, sizeof dir - 1);
+    dir[sizeof dir - 1] = 0;
+    for (char *slash; (slash = strrchr(dir, '/')); ) {
+        *slash = 0;
+        snprintf(probe, sizeof probe, "%s/.xisto/pkgs/%s", dir, name);
+        if (access(probe, R_OK) == 0) return true;
+    }
+    return false;
+}
 static void parse_import(Parser *p, Module *m) {
     Pos pos = p->tok.pos;
     expect(p, TK_IMPORT, NULL);
@@ -4408,9 +4427,16 @@ static void parse_import(Parser *p, Module *m) {
         im.n = 1;
         goto from;
     }
-    if (at(p, TK_STRING)) { /* import "reflect-metadata": for its effects on Node; xisto loads nothing for it */
+    if (at(p, TK_STRING)) { /* import "x": for its effects on Node; xisto loads nothing for it, but "reflect-metadata", whose
+                               package gives the global Reflect (when the program's packages have it) */
+        const char *spec = p->tok.str;
         next(p);
         expect_semi(p);
+        if (!strcmp(spec, "reflect-metadata") && pkg_available(m->path, spec)) {
+            im.path = spec;
+            m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+            m->imports[m->nimports++] = im;
+        }
         return;
     }
     if (at(p, TK_STAR)) { /* import * as ns from "m" */

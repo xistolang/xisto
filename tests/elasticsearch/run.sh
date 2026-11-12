@@ -8,7 +8,7 @@ mkdir -p "$OUT/.xisto/pkgs/@elastic"
 ln -sfn "$(cd ../../packages/@elastic/elasticsearch && pwd)" "$OUT/.xisto/pkgs/@elastic/elasticsearch"
 cp client.ts "$OUT/client.ts"
 if ! command -v node > /dev/null 2>&1; then echo "skip: no node for the fake cluster"; exit 0; fi
-XISTO_NODE_COMPAT=1 $X build --no-warnings -o "$OUT/client" "$OUT/client.ts" || exit 1
+XISTO_NODE_COMPAT=1 XISTO_TSC_CHECKED=1 $X build --no-warnings -o "$OUT/client" "$OUT/client.ts" || exit 1
 port=$((20000 + $$ % 20000))
 node server.mjs $port > "$OUT/server.log" 2>&1 &
 srv=$!

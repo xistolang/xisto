@@ -310,6 +310,70 @@ export class Ilm {
 }
 
 /** The Elasticsearch client (version 8 API): each call returns the response body. */
+// The responses the client's typed calls give, as @elastic/elasticsearch 8 declares them (the fields programs read;
+// a field the cluster sends that is not here is not kept)
+export interface SearchTotalHits {
+  value: number;
+  relation: string;
+}
+export interface SearchHit<TDocument> {
+  _index: string;
+  _id?: string;
+  _score?: number | null;
+  _source?: TDocument;
+  sort?: unknown[];
+  fields?: Record<string, any>;
+}
+export interface SearchHitsMetadata<TDocument> {
+  // (@elastic's type is SearchTotalHits | number: the number only with rest_total_hits_as_int, a TypeError here)
+  total?: SearchTotalHits;
+  max_score?: number | null;
+  hits: SearchHit<TDocument>[];
+}
+export interface ShardStatistics {
+  total: number;
+  successful: number;
+  skipped?: number;
+  failed: number;
+}
+export interface SearchResponse<TDocument> {
+  took: number;
+  timed_out: boolean;
+  _shards?: ShardStatistics;
+  hits: SearchHitsMetadata<TDocument>;
+  aggregations?: Record<string, any>;
+}
+export interface BulkResponseItem {
+  _index: string;
+  _id?: string | null;
+  status: number;
+  result?: string;
+  _version?: number;
+  error?: Record<string, any>;
+}
+/** One item of a bulk response: under the name of its operation ({ index: {...} }). */
+export interface BulkResponseItemContainer {
+  index?: BulkResponseItem;
+  create?: BulkResponseItem;
+  update?: BulkResponseItem;
+  delete?: BulkResponseItem;
+}
+export interface BulkResponse {
+  took: number;
+  errors: boolean;
+  items: BulkResponseItemContainer[];
+}
+export interface DeleteByQueryResponse {
+  took?: number;
+  timed_out?: boolean;
+  total?: number;
+  deleted?: number;
+  batches?: number;
+  version_conflicts?: number;
+  noops?: number;
+  failures?: Record<string, any>[];
+}
+
 export class Client {
   readonly cluster: Cluster;
   readonly indices: Indices;
@@ -324,18 +388,20 @@ export class Client {
   }
 
   /** POST /{index}/_search: query, size, from, sort, _source, aggs... in the body. */
-  async search(params: object, options?: TransportRequestOptions): Promise<object> {
+  async search<TDocument = unknown>(params: object, options?: TransportRequestOptions): Promise<SearchResponse<TDocument>> {
     const p = JSON.stringify(params);
     const path = `${optSegment(p, "index")}/_search${queryString(p, SEARCH_QUERY)}`;
-    return (await this.t.request("POST", path, without(p, "index," + SEARCH_QUERY), false, options ?? null)).json();
+    const o: object = (await this.t.request("POST", path, without(p, "index," + SEARCH_QUERY), false, options ?? null)).json();
+    return o as SearchResponse<TDocument>;
   }
 
   /** POST /{index}/_delete_by_query: the query in the body; conflicts, refresh... in the query string */
-  async deleteByQuery(params: object, options?: TransportRequestOptions): Promise<object> {
+  async deleteByQuery(params: object, options?: TransportRequestOptions): Promise<DeleteByQueryResponse> {
     const p = JSON.stringify(params);
     const keys = "conflicts,refresh,routing,timeout,wait_for_completion,ignore_unavailable,allow_no_indices,expand_wildcards,slices,scroll_size,max_docs,q,df,analyzer,default_operator,lenient";
     const path = `/${segment(p, "index", "deleteByQuery")}/_delete_by_query${queryString(p, keys)}`;
-    return (await this.t.request("POST", path, without(p, "index," + keys), false, options ?? null)).json();
+    const o: object = (await this.t.request("POST", path, without(p, "index," + keys), false, options ?? null)).json();
+    return o as DeleteByQueryResponse;
   }
 
   /** POST /{index}/_count */
@@ -379,13 +445,14 @@ export class Client {
   }
 
   /** POST /[{index}/]_bulk: operations is the array of action and document lines, sent as NDJSON. */
-  async bulk(params: object, options?: TransportRequestOptions): Promise<object> {
+  async bulk(params: object, options?: TransportRequestOptions): Promise<BulkResponse> {
     const p = JSON.stringify(params);
     const keys = "refresh,routing,pipeline,timeout,wait_for_active_shards,require_alias,_source,_source_includes,_source_excludes";
     const ops = field(p, "operations");
     const body = ops !== "" ? ndjson(ops) : "";
     if (body === "") throw new Error("Missing required parameter: operations (bulk)");
-    return (await this.t.request("POST", `${optSegment(p, "index")}/_bulk${queryString(p, keys)}`, body, true, options ?? null)).json();
+    const o: object = (await this.t.request("POST", `${optSegment(p, "index")}/_bulk${queryString(p, keys)}`, body, true, options ?? null)).json();
+    return o as BulkResponse;
   }
 
   /** HEAD /: true when the cluster answers. */

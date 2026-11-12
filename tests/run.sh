@@ -211,6 +211,8 @@ if sh examples/nest-auth/test/run.sh > "$OUT/nest-auth.txt" 2>&1 && grep -q '^ok
 if sh examples/nest-forms/test/run.sh > "$OUT/nest-forms.txt" 2>&1 && grep -q '^ok: nest-forms' "$OUT/nest-forms.txt"; then pass=$((pass+1)); else echo "FAIL nest-forms:"; cat "$OUT/nest-forms.txt"; fail=$((fail+1)); fi
 # @nestjs/jwt's JwtService against @nestjs/jwt 11 + jsonwebtoken 9 (tests/nestjwt/run.sh)
 if sh tests/nestjwt/run.sh > "$OUT/nestjwt.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL nestjwt:"; cat "$OUT/nestjwt.txt"; fail=$((fail+1)); fi
+# reflect-metadata's global Reflect (tests/reflectmeta/run.sh)
+if sh tests/reflectmeta/run.sh > "$OUT/reflectmeta.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL reflectmeta:"; cat "$OUT/reflectmeta.txt"; fail=$((fail+1)); fi
 # Nest's Logger on the console: object messages as Nest 11's ConsoleLogger prints them (tests/nestlog/run.sh)
 if sh tests/nestlog/run.sh > "$OUT/nestlog.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL nestlog:"; cat "$OUT/nestlog.txt"; fail=$((fail+1)); fi
 

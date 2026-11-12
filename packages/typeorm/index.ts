@@ -1230,6 +1230,16 @@ async function loadRelations(executor: Executor, m: EntityMetadata, list: unknow
   }
 }
 
+/**
+ * TypeORM's QueryResult ({ records, raw, affected }). Compatibility: queryRunner.query(sql, params, true) gives its data
+ * (decoded into the type asked for), not an instance of this class (instanceof QueryResult is false for it).
+ */
+export class QueryResult {
+  records: any[] = [];
+  raw: any = null;
+  affected?: number;
+}
+
 export class Repository<T> {
   dataSourceName: string = "default";
   sessionId: int = -1;

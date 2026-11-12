@@ -133,6 +133,8 @@ export class InstanceWrapper {
   instance: unknown = null;
   metatype: ClassInfo | null = null;
   host: ModuleHost | null = null; // (null for controllers and the application's own globals)
+  /** A factory provider's inject list (useFactory's dependencies), null for the others, as Nest's wrapper has it. */
+  inject: unknown[] | null = null;
 }
 
 /** The providers and controllers the application built (import DiscoveryModule to inject it). */
@@ -357,7 +359,8 @@ function resolveToken(token: unknown, optional: boolean, who: string, index: int
 
 function addWrapper(e: Entry, instance: unknown): void {
   const cls = asClass(e.provider);
-  container.wrappers.push({ name: tokenName(e.token), token: e.token, instance: instance, metatype: cls, host: e.host });
+  const inject: unknown[] | null = e.provider instanceof FactoryProvider ? ((e.provider as FactoryProvider).inject ?? []) : null;
+  container.wrappers.push({ name: tokenName(e.token), token: e.token, instance: instance, metatype: cls, host: e.host, inject: inject });
 }
 
 function build(provider: unknown, depth: int): unknown {
@@ -1126,7 +1129,7 @@ export class NestApplication {
     }
     for (const c of container.controllers) {
       const instance = construct(c, 0);
-      container.wrappers.push({ name: c.name, token: c, instance: instance, metatype: c, host: null });
+      container.wrappers.push({ name: c.name, token: c, instance: instance, metatype: c, host: null, inject: null });
       const base0 = __controllers.get(c.id);
       const routes0 = __routes.get(c.id);
       const params0 = __params.get(c.id);
