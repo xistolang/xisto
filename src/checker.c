@@ -1164,6 +1164,7 @@ static Func *eff_ctor(Class *c);
 static Field *find_field(Class *c, const char *name, int *index);
 static bool ad_partial; /* (see fn_field_of) */
 static bool ad_partial_cls; /* (a class's missing methods too: see iface_runtime) */
+static bool ad_lenient; /* (a class's methods with other parameters too: see iface_runtime) */
 static Class **class_work; /* instances whose bodies the checker checks after the program's own */
 static int nclass_work;
 static Class *instantiate_class(Class *tmpl, Type **args, Pos pos) {
@@ -12509,6 +12510,12 @@ static Type *fn_field_of(Class *src, const char *name) {
 }
 static bool method_fits(Func *cm, Func *im, Class *src, Class *ifc, bool infer, Pos pos, int depth, char **why) {
     const char *iname = ifc->name, *cn = src->name, *mn = im->name;
+    if (cm && ad_lenient) { /* (a provider's method with other parameters: see iface_runtime; its adapter method throws) */
+        ad_lenient = false;
+        bool exact = method_fits(cm, im, src, ifc, infer, pos, depth, NULL);
+        ad_lenient = true;
+        if (!exact) return true;
+    }
     Type *ff = cm ? NULL : fn_field_of(src, mn);
     if (!cm && !ff && ad_partial && (src->is_interface || made_shape(src) || ad_partial_cls)) return true; /* (left out: see ad_partial) */
     if (ff && !im->ntparams) { /* { m: (x) => ... } where m(x): R goes: a field that holds the function */
@@ -12670,6 +12677,24 @@ static Class *make_adapter(Class *src, Class *ifc) {
         int n = cm && cm->nparams < im->nparams ? cm->nparams : im->nparams;
         Type *ff = cm ? NULL : fn_field_of(src, im->name);
         if (ff && ff->nparams < n) n = ff->nparams; /* (a field's function that takes fewer: the ones it takes) */
+        bool clash = false;
+        if (cm && ad_lenient) { /* (a method the provider has with parameters of its own: no call can be made of it) */
+            ad_lenient = false;
+            clash = !method_fits(cm, im, src, ifc, false, f->pos, 0, NULL);
+            ad_lenient = true;
+        }
+        if (clash) {
+            Expr *msg = str_lit(f->pos, xs_sprintf("%s.%s does not take the arguments of %s.%s", src->name, im->name, ifc->name, im->name));
+            Expr *nw = xs_alloc(sizeof *nw);
+            nw->kind = E_NEW_OBJ; nw->pos = f->pos; nw->field = -1; nw->str = "Error";
+            expr_list_push(&nw->args, msg);
+            Stmt *th = xs_alloc(sizeof *th);
+            th->kind = S_THROW; th->pos = f->pos; th->expr = nw;
+            f->body = ad_block(f->pos, th);
+            a->methods = realloc(a->methods, sizeof(Func *) * (size_t)(a->nmethods + 1));
+            a->methods[a->nmethods++] = f;
+            continue;
+        }
         if (!cm && !ff) { /* (left out of the object, see ad_partial): throw new Error("m is not a function") (JavaScript's is a
                              TypeError, a class xisto:errors has only when the program names it; TypeScript lets no call get here) */
             Expr *msg = str_lit(f->pos, xs_sprintf("%s is not a function", im->name));
@@ -12997,19 +13022,27 @@ static bool iface_runtime(Class *ifc, Pos pos) {
         if (named) iface_adapter(c, ifc, pos, NULL);
     }
     /* a provider injected where a structural interface goes (@Inject('X') x?: XLike with { provide: 'X', useExisting:
-       C }), C having only some of its methods: JavaScript takes the object as it is and a missing method throws when
-       called; an adapter whose missing methods throw (the ones C has must fit) */
+       C }), C having only some of its methods or some with other parameters (TypeScript checks nothing through a
+       token): JavaScript takes the object as it is; an adapter whose missing methods throw when called ("m is not a
+       function"), and those whose parameters differ throw too (JavaScript would call them with what it is given) */
     for (int i = 0; i < prog->nclasses; i++) {
         Class *c = prog->classes[i];
         if (!c->decos.len || c->builtin || c->is_interface || c->iface_base || c->gen_state || c->adapter_of || is_subclass(c, ifc)) continue;
         int have = 0, all = 0;
         for (int k = 0; k < ifc->nmethods; k++)
             if (ifc->methods[k]->is_abstract) { all++; if (find_method(c, ifc->methods[k]->name)) have++; }
-        if (have == 0 || have == all) continue;
-        bool was = ad_partial, was_cls = ad_partial_cls;
-        ad_partial = true; ad_partial_cls = true;
+        if (have == 0) continue;
+        if (have == all) { /* (all named: the first pass made its adapter, unless a method does not fit) */
+            bool made = false;
+            for (int a = 0; a < ifc->nadapters; a++) if (ifc->adapters[a]->adapter_of == c) made = true;
+            if (made) continue;
+            for (int a = 0; a < niface_ads; a++) /* (forget the failed exact try: tried again, lenient) */
+                if (iface_ads[a].src == c && iface_ads[a].ifc == ifc && !iface_ads[a].ad) iface_ads[a].src = NULL;
+        }
+        bool was = ad_partial, was_cls = ad_partial_cls, was_len = ad_lenient;
+        ad_partial = true; ad_partial_cls = true; ad_lenient = true;
         iface_adapter(c, ifc, pos, NULL);
-        ad_partial = was; ad_partial_cls = was_cls;
+        ad_partial = was; ad_partial_cls = was_cls; ad_lenient = was_len;
     }
     return ifc->nadapters > 0;
 }
