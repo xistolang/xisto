@@ -5794,7 +5794,7 @@ static const char xs_reflect_src[] =
     "export function __xs_target_ctor(o: object): ClassInfo {\n"
     "  const s = JSON.stringify(o);\n"
     "  const i: int = s.startsWith('{\"__xs_class\":') ? Math.trunc(parseInt(s.slice(14), 10)) : -1;\n"
-    "  if (i < 0 || i >= __xs_targets.length) throw new TypeError(\"the constructor of a plain object is not known: only a decorator's target has one\");\n"
+    "  if (i < 0 || i >= __xs_targets.length) throw new Error(\"the constructor of a plain object is not known here: only a decorator's target has one\");\n"
     "  return __xs_targets[i];\n"
     "}\n"
     "// the metadata reflect-metadata's Reflect keeps, by target (===) and property: here, so that a framework (Nest's\n"
