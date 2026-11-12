@@ -1535,6 +1535,7 @@ static void find_views(Program *p) {
     }
     for (int i = 0; i < p->top.len; i++) view_scan_stmt(p->top.items[i], p->top.items[i]->mod);
 }
+static Type *synth_inter(Class *ic, Type **targs, int ntargs, Pos pos);
 static Type *resolve(Type *t, Pos pos) {
     if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__ret_of:", 9) == 0) { /* (generated reflection) */
         const char *dot = strchr(t->tname + 9, '.');
@@ -1788,6 +1789,13 @@ static Type *resolve(Type *t, Pos pos) {
             cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
             int xi;
             if (src && !src->is_interface && !src->builtin && find_field(src, "__expando", &xi)) { *t = *ty_object_of(src); return t; }
+        }
+        if (t->cls->mixin && t->cls->mixin->kind && !strcmp(t->cls->mixin->kind, "IntersectionType") && t->cls->name &&
+            strncmp(t->cls->name, "__Obj_", 6) == 0) { /* T & Document: a class when one side has methods */
+            Type **ta = t->ntargs ? xs_alloc(sizeof(Type *) * (size_t)t->ntargs) : NULL;
+            for (int i = 0; i < t->ntargs; i++) ta[i] = resolve(t->targs[i], pos);
+            Type *st = synth_inter(t->cls, ta, t->ntargs, pos);
+            if (st) { *t = *st; return t; }
         }
         if (t->cls->cname) return t;
         if (t->cls->name && strncmp(t->cls->name, "__Obj_", 6) == 0 && t->cls->mod && late_inline_class(t->cls)) return t;
@@ -3438,7 +3446,7 @@ static bool shape_copy(Expr *e, Type *want) {
         g = g->elem; want = want->elem; nul = true;
     }
     else if (want->kind == TY_NULLABLE) want = want->elem;
-    if (g->kind != TY_OBJECT || !plain_data(g->cls)) return false;
+    if (g->kind != TY_OBJECT || (!plain_data(g->cls) && !g->cls->synth)) return false; /* (T & Document where T goes: its fields) */
     Class *src = g->cls;
     bool to_rec = want->kind == TY_MAP && want->record && want->key->kind == TY_STRING;
     if (!to_rec) {
@@ -3448,7 +3456,7 @@ static bool shape_copy(Expr *e, Type *want) {
         /* (a class of data too: a response DTO filled from a row, return row; TypeScript compares the fields) */
         bool data_cls = !dst->builtin && !dst->is_interface && !dst->is_abstract && dst->nsubs == 0 && !dst->tparams &&
                         (!dst->ctor || dst->ctor->nparams == 0) && dst->nfields > 0 && !dst->base_name &&
-                        (src->is_interface || made_shape(src) || data_class_src(src)); /* (from data; from another class only as
+                        (src->is_interface || made_shape(src) || data_class_src(src) || src->synth); /* (from data; from another class only as
                                                      tsc-checked code has it: a class of fields alone, copied, a new object) */
         if (!(dst->is_interface || made_shape(dst) || data_cls) || dst->nmethods != 0 || dst->iface_methods) return false;
         if (!made_shape(src) && !src->is_interface && src->nmethods == 0 && !src->nfields) return false;
@@ -3526,13 +3534,13 @@ static bool shape_ok(Type *g, Type *want) {
     memset(&probe, 0, sizeof probe);
     probe.kind = E_NULL; probe.field = -1; probe.type = g;
     Type *w = want->kind == TY_NULLABLE ? want->elem : want, *h = g->kind == TY_NULLABLE ? g->elem : g;
-    if (h->kind != TY_OBJECT || !plain_data(h->cls)) return false;
+    if (h->kind != TY_OBJECT || (!plain_data(h->cls) && !h->cls->synth)) return false;
     if (w->kind == TY_MAP && w->record && w->key->kind == TY_STRING) return true; /* rows where Record<string, unknown>[] goes: each one's fields */
     if (w->kind != TY_OBJECT || h->cls == w->cls) return false;
     Class *dst = w->cls, *src = h->cls;
     bool data_cls = !dst->builtin && !dst->is_interface && !dst->is_abstract && dst->nsubs == 0 && !dst->tparams &&
                     (!dst->ctor || dst->ctor->nparams == 0) && dst->nfields > 0 && !dst->base_name &&
-                    (src->is_interface || made_shape(src) || data_class_src(src));
+                    (src->is_interface || made_shape(src) || data_class_src(src) || src->synth);
     if (!(dst->is_interface || made_shape(dst) || data_cls) || dst->nmethods != 0 || dst->iface_methods) return false;
     for (int i = 0; i < dst->nfields; i++)
         if (!find_field(src, dst->fields[i].name, NULL) && !dst->fields[i].optional) return false;
@@ -4316,6 +4324,8 @@ static void mixin_eval(Mixin *m, FieldSet *out) {
 }
 static void apply_mixin(Class *c) {
     if (c->mixin_done) return;
+    if (c->ntparams && c->mixin && c->mixin->kind && !strcmp(c->mixin->kind, "IntersectionType")) return; /* T & Document in a
+                                                            generic alias: made per instance (synth_inter) */
     c->mixin_done = true;
     FieldSet fs = {0};
     mixin_eval(c->mixin, &fs);
@@ -4327,6 +4337,107 @@ static void apply_mixin(Class *c) {
 static Func *eff_ctor(Class *c) {
     for (; c; c = c->base) if (c->ctor) return c->ctor;
     return NULL;
+}
+/* ---- A & B where one side is a class with methods (mongoose's HydratedDocument<T> = T & Document): a class made while
+   compiling, that extends the side with methods (its fields, methods and dispatch: save(), toObject(), _id) and holds
+   the other side's fields. One class per pair; its layout comes from the declared types (nothing is made at run
+   time); no ClassInfo of its own (it is not decorated). docs/proposta-classes-derivadas.md, part 1 ---- */
+static bool class_with_methods(Class *k) {
+    if (!k || k->is_interface || k->builtin || k->iface_methods) return false;
+    for (Class *u = k; u; u = u->base) if (u->nmethods > 0) return true;
+    return false;
+}
+/* one side of the intersection: a class by name, or the type its alias was instantiated with (T of HydratedDocument<T>) */
+static Class *inter_side(Mixin *m, Class *owner, Type **targs, int ntargs) {
+    if (!m || m->kind) return NULL;
+    if (m->klass) return m->klass;
+    for (int i = 0; i < owner->ntparams && i < ntargs; i++)
+        if (strcmp(owner->tparams[i], m->cls) == 0) return targs[i] && targs[i]->kind == TY_OBJECT ? targs[i]->cls : NULL;
+    if (owner->ntparams && !ntargs)
+        for (int i = 0; i < owner->ntparams; i++) if (strcmp(owner->tparams[i], m->cls) == 0) return NULL; /* (the template) */
+    Module *was = cur_mod;
+    Scope *ss = scope;
+    const char *sfn = xs_file_name, *ssrc = xs_source;
+    if (owner->mod) enter_module(owner->mod);
+    Class *k = find_class(m->cls);
+    cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
+    return k;
+}
+static Class **synth_cls, **synth_base, **synth_data;
+static int nsynth;
+static Type *synth_inter(Class *ic, Type **targs, int ntargs, Pos pos) {
+    Mixin *m = ic->mixin;
+    if (!m || !m->kind || strcmp(m->kind, "IntersectionType") != 0) return NULL;
+    Class *a = inter_side(m->a, ic, targs, ntargs), *b = inter_side(m->b, ic, targs, ntargs);
+    if (!a || !b) return NULL;
+    if (is_subclass(a, b)) return ty_object_of(a); /* (X & Document & Document: Model<XDocument> of HydratedDocument<XDocument>) */
+    if (is_subclass(b, a)) return ty_object_of(b);
+    bool ma = class_with_methods(a), mb = class_with_methods(b);
+    if (!ma && !mb) return NULL; /* fields on both sides: the interface of their fields (as before) */
+    if (ma && mb)
+        xs_error(XS8150, pos, "make one of them an interface of fields", "'%s & %s' joins two classes with methods", a->name, b->name);
+    Class *base = ma ? a : b, *data = ma ? b : a;
+    for (int i = 0; i < nsynth; i++) if (synth_base[i] == base && synth_data[i] == data) return ty_object_of(synth_cls[i]);
+    Module *saved_mod = cur_mod;
+    Scope *saved_scope = scope;
+    Class *saved_class = cur_class;
+    const char *sfn = xs_file_name, *ssrc = xs_source;
+    Class *s = xs_alloc(sizeof *s);
+    s->pos = ic->pos;
+    s->mod = data->mod ? data->mod : base->mod;
+    s->name = xs_sprintf("%s & %s", ma ? base->name : data->name, ma ? data->name : base->name); /* (as written: T & Document) */
+    s->cname = xs_sprintf("c%d___Inter%d", s->mod->id, nsynth);
+    s->exported = true;
+    s->used = true;
+    s->synth = true;
+    s->base_name = base->name;
+    s->base = base;
+    for (Class *u = base; u; u = u->base) u->used = true;
+    base->subs = realloc(base->subs, sizeof(Class *) * (size_t)(base->nsubs + 1));
+    base->subs[base->nsubs++] = s;
+    { /* the data side's fields (its bases' first), less those the class side has (TypeScript merges them) */
+        FieldSet fs = {0};
+        enter_module(data->mod);
+        class_fields_all(data, &fs);
+        Field *own = xs_alloc(sizeof(Field) * (size_t)(fs.n + 1));
+        int n = 0;
+        for (int i = 0; i < fs.n; i++) {
+            if (find_field(base, fs.f[i].name, NULL)) continue;
+            own[n] = fs.f[i];
+            own[n].owner = s;
+            own[n].decos = (DecoList){0}; /* (the schema's decorators stay on the schema class: no reflection here) */
+            n++;
+        }
+        s->fields = own;
+        s->nfields = s->cap_fields = n;
+    }
+    synth_cls = realloc(synth_cls, sizeof(Class *) * (size_t)(nsynth + 1));
+    synth_base = realloc(synth_base, sizeof(Class *) * (size_t)(nsynth + 1));
+    synth_data = realloc(synth_data, sizeof(Class *) * (size_t)(nsynth + 1));
+    synth_cls[nsynth] = s; synth_base[nsynth] = base; synth_data[nsynth] = data;
+    nsynth++;
+    prog->classes = realloc(prog->classes, sizeof(Class *) * (size_t)(prog->nclasses + 1));
+    prog->cap_classes = prog->nclasses + 1;
+    prog->classes[prog->nclasses++] = s;
+    /* the class pipeline (as instantiate_class): fields laid out after the base's, typed where they were written */
+    enter_module(s->mod);
+    cur_class = NULL;
+    flatten_fields(s, 0);
+    if (!eff_ctor(s))
+        for (int k = 0; k < s->nfields; k++) if (!s->fields[k].init && !s->fields[k].optional) s->data_only = true;
+    for (int k = 0; k < s->nfields; k++) {
+        Field *fd = &s->fields[k];
+        if (!fd->cname) fd->cname = field_cname(fd->name);
+    }
+    flatten_methods(s);
+    cur_mod = saved_mod;
+    scope = saved_scope;
+    cur_class = saved_class;
+    xs_file_name = sfn;
+    xs_source = ssrc;
+    class_work = realloc(class_work, sizeof(Class *) * (size_t)(nclass_work + 1));
+    class_work[nclass_work++] = s;
+    return ty_object_of(s);
 }
 /* some class below c has its own m: a call through c must look at the object's class */
 static bool overridden_below(Class *c, Func *m) {
@@ -8293,6 +8404,18 @@ static void check_expr_in(Expr *e, Type *expected) {
             *e = *v;
             return;
         }
+        if (e->is_call && e->str && !e->args.len && (!strcmp(e->str, "toObject") || !strcmp(e->str, "toJSON"))) {
+            /* doc.toObject() of a T & Document: the document itself, read as data (Document's toObject() gives its object;
+               typed here as the T & Document it is called on) */
+            Type *lt = ty_strip_null(e->lhs->type);
+            Class *sc = lt->kind == TY_OBJECT ? lt->cls : NULL;
+            Func *tm = sc && sc->synth ? find_method(sc, e->str) : NULL;
+            if (tm && tm->cls == sc->base && e->lhs->type->kind != TY_NULLABLE) {
+                Expr *obj = e->lhs;
+                *e = *obj;
+                return;
+            }
+        }
         if (ty_is_any(e->lhs->type) && e->is_call && e->str && e->args.len >= 1 && e->args.items[0]->kind == E_ARROW &&
             (!strcmp(e->str, "map") || !strcmp(e->str, "filter") || !strcmp(e->str, "forEach") || !strcmp(e->str, "find") ||
              !strcmp(e->str, "some") || !strcmp(e->str, "every") || !strcmp(e->str, "findIndex") || !strcmp(e->str, "flatMap"))) {
@@ -9227,6 +9350,19 @@ static void check_expr_in(Expr *e, Type *expected) {
                 Expr *x = xs_alloc(sizeof *x);
                 *x = *v;
                 if (shape_copy(x, want)) { *e = *x; return; }
+            }
+        }
+        { /* doc as T with doc a T & Document (| null): its fields, copied (null stays null; where T alone goes, checked) */
+            Type *vb = ty_strip_null(v->type), *wb = ty_strip_null(want);
+            if (vb->kind == TY_OBJECT && vb->cls->synth && wb->kind == TY_OBJECT && !wb->cls->synth) {
+                Expr *x = xs_alloc(sizeof *x);
+                *x = *v;
+                bool vn = v->type->kind == TY_NULLABLE;
+                if (shape_copy(x, vn ? ty_nullable_of(wb) : wb)) {
+                    if (vn && want->kind != TY_NULLABLE) nonnull_checked(x, "the value of 'as'");
+                    *e = *x;
+                    return;
+                }
             }
         }
         xs_error(XS8090, e->pos, "xisto checks types statically: 'as' converts an object (JSON) value or restates the same type", "cannot convert %s to %s", ty_name(v->type), ty_name(want));
@@ -13479,6 +13615,7 @@ void check_program(Program *p) {
     /* inheritance: bases first, so a class sees its base's fields (and later its methods) */
     for (int i = 0; i < p->nclasses; i++) {
         Class *c = p->classes[i];
+        if (c->synth) continue; /* (linked when made) */
         enter_module(c->mod);
         if (c->mixin) apply_mixin(c);
         if (c->base_name) {
@@ -13513,7 +13650,7 @@ void check_program(Program *p) {
     for (int i = 0; i < p->nclasses; i++) flatten_fields(p->classes[i], 0);
     for (int i = 0; i < p->nclasses; i++) {
         Class *c = p->classes[i];
-        if (c->ntparams || c->generic_of) continue; /* templates resolve per instance; instances already did */
+        if (c->ntparams || c->generic_of || c->synth) continue; /* templates resolve per instance; instances (and A & B classes) already did */
         /* a DTO: no constructor and fields without a value, so JSON fills it and `new` is refused */
         if (!eff_ctor(c) && !c->is_interface && !c->builtin)
             for (int k = 0; k < c->nfields; k++) if (!c->fields[k].init && !c->fields[k].optional) c->data_only = true;
