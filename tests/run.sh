@@ -78,7 +78,8 @@ for f in tests/err/*.ts; do
         want=${want#runtime error: }
         ;;
     *)
-        if $XISTO build -o "$OUT/$name" "$f" > "$OUT/$name.err" 2>&1; then
+        ebflags=$(sed -n 's|^// build: ||p' "$f")   # "// build: --flag": the options this program is built with
+        if $XISTO build $ebflags -o "$OUT/$name" "$f" > "$OUT/$name.err" 2>&1; then
             echo "FAIL $f: compiled, but should have been rejected"; fail=$((fail+1)); continue
         fi
         ;;
