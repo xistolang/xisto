@@ -52,6 +52,8 @@ static void vt_push(Parser *p, const char *name, Type *t) {
 }
 
 static bool wants_intl;
+static Func **pending_overloads; /* function f(...): R; signatures waiting for their implementation */
+static int npending_overloads;
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
 static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... was named: xisto:url is loaded */
 static bool is_url_global_name(const char *n);
@@ -2823,6 +2825,13 @@ static void parse_generic_rest(Parser *p, Func *f, bool method) {
         f->ret = parse_type(p);
         f->ret_src = span(p, rfrom);
     }
+    if (!method && !f->gen_arrow && at(p, TK_SEMI)) { /* function f<A>(a: A): R;  an overload signature */
+        next(p);
+        f->overload_sig = true;
+        tp_names = saved;
+        ntp = saved_n;
+        return;
+    }
     bool saved_gen = p->in_gen;
     p->in_gen = f->is_gen;
     if (f->gen_arrow) { /* => { ... } or => expression; */
@@ -4563,6 +4572,19 @@ static void parse_module(Program *prog, Module *m) {
             f->mod = m;
             f->exported = exported;
             f->is_default = is_default;
+            if (f->overload_sig) { /* kept for the implementation that follows (its callers type by them) */
+                pending_overloads = realloc(pending_overloads, sizeof(Func *) * (size_t)(npending_overloads + 1));
+                pending_overloads[npending_overloads++] = f;
+                continue;
+            }
+            if (npending_overloads) {
+                for (int i = 0; i < npending_overloads; i++)
+                    if (strcmp(pending_overloads[i]->name, f->name) == 0) {
+                        f->overloads = realloc(f->overloads, sizeof(Func *) * (size_t)(f->noverloads + 1));
+                        f->overloads[f->noverloads++] = pending_overloads[i];
+                    }
+                npending_overloads = 0;
+            }
             if (is_default) m->default_name = f->name;
             add_func(prog, f);
         } else if (at(&p, TK_CLASS) || (at_ident(&p, "abstract") && peek_is(&p, TK_CLASS))) {
