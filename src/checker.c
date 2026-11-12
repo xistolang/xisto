@@ -4443,6 +4443,9 @@ static void check_object_member(Expr *e, Class *c) {
         if (!g && find_method(c, xs_sprintf("__set_%s", e->str))) xs_error(XS8060, e->pos, "add get %s(): T { ... }", "'%s' of %s has a setter but no getter", e->str, c->name);
         if (g) { e->str = g->name; e->is_call = true; }
     }
+    if (e->is_call && e->args.len == 0 && !strcmp(e->str, "digest") && c->mod && c->mod->file && !strcmp(c->mod->file, "xisto:crypto") &&
+        (!strcmp(c->name, "Hash") || !strcmp(c->name, "Hmac")))
+        e->str = "__digestBytes"; /* hash.digest(): a Buffer (with an encoding, text) */
     Func *m = find_method(c, e->str);
     if (!m && !e->is_call && !c->builtin) {
         /* an open class (a field `__expando: Record<string, any>`, as Express's Request): a property the class does

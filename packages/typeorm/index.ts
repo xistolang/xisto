@@ -96,6 +96,11 @@ export class EntityMetadata {
     return null;
   }
 
+  /** The table's path as TypeORM writes it in its own SQL: SCHEMA.TABLE, or TABLE (not quoted). */
+  get tablePath(): string {
+    return this.schema.length > 0 ? this.schema + "." + this.tableName : this.tableName;
+  }
+
   get primaryColumns(): ColumnMetadata[] {
     const out: ColumnMetadata[] = [];
     for (const c of this.columns) {

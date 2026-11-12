@@ -28,6 +28,10 @@ const ei: Echo = JSON.parse(await ri.text());
 const plainInit: RequestInit = {};
 const rp: Response = await fetch("http://127.0.0.1:8080/slow?ms=1", plainInit);
 console.log("init:", ri.status, ei.method, ei.token, ei.body.id, rp.status, await rp.text());
+// bytes and redirect in the options of a relay (written in place, with an option fetch takes in a value)
+const rr: Response = await fetch("http://127.0.0.1:8080/echo", { method: "POST", headers: { "X-Token": "relay" }, body: new Uint8Array(Buffer.from(JSON.stringify(item))), redirect: "error" });
+const er: Echo = JSON.parse(await rr.text());
+console.log("relay:", rr.status, er.token, er.body.name);
 try {
   const late: Response = await fetch("http://127.0.0.1:8080/slow?ms=600", { signal: AbortSignal.timeout(100) });
   console.log("no timeout?", late.status);
