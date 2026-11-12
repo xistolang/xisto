@@ -5141,6 +5141,18 @@ static void check_expr_in(Expr *e, Type *expected) {
                 char *ci = xs_sprintf("__ci_%s", cv->name);
                 for (Binding *mb = mod_scopes[cv->mod->id]->head; mb; mb = mb->next)
                     if (strcmp(mb->name, ci) == 0) { e->type = mb->type; e->cname = mb->cname; return; }
+                /* declared further down (() => Child in a decorator above Child, as a TypeORM relation): the global
+                   that will hold it, read when the arrow runs */
+                for (int i = 0; i < prog->top.len; i++) {
+                    Stmt *st = prog->top.items[i];
+                    if (st->kind != S_VAR || st->mod != cv->mod || !st->name || strcmp(st->name, ci) != 0) continue;
+                    Class *cic = NULL;
+                    SYM_EACH(classes_by_name, "ClassInfo", ce) { Class *k = ce->decl; if (k->mod && k->mod->file && !strcmp(k->mod->file, "xisto:reflect")) cic = k; }
+                    if (!cic) break;
+                    e->type = ty_object_of(cic);
+                    e->cname = xs_sprintf("g%d_%s", cv->mod->id, ci);
+                    return;
+                }
                 xs_error(XS9901, e->pos, "decorate the class (@Injectable(), @Controller(), ...) so the compiler describes it", "class '%s' is used as a value, but it has no ClassInfo", e->str);
             }
             if (builtin_ctor_value(e, expected)) return;
