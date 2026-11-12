@@ -1,5 +1,5 @@
 // forms of the kiosk (round 9): new Array<R>(n) set later, const x = null, (d): d is NonNullable<typeof d>, an array of
-// objects of unrelated classes, (e as { cause?: unknown } | null)?.cause on an Error, (s as { valueOf(): string }).valueOf()
+// objects of unrelated classes, (e as { cause?: unknown } | null)?.cause on an Error, (s as { valueOf(): string }).valueOf() (d, i, arr) callbacks,
 // build: --tsc-checked
 async function mapComLimite<T, R>(itens: readonly T[], fn: (item: T, i: number) => Promise<R>): Promise<R[]> {
   const resultado = new Array<R>(itens.length);
@@ -35,3 +35,8 @@ function norm(d: string | null): string {
 }
 console.log(norm('N'), norm('X'));
 try { norm(null); } catch (e) { console.log((e as Error).name); }
+const ds = [{ c: 2 }, { c: 1 }, { c: 2 }, { c: 3 }]
+  .map((d) => ({ c: d.c * 1 }))
+  .filter((d, i, arr) => arr.findIndex((x) => x.c === d.c) === i);
+console.log(ds.map((d) => d.c).join(','));
+console.log([5, 6, 5].filter((x, i, a) => a.indexOf(x) === i).join(','));
