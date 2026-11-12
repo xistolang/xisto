@@ -1603,7 +1603,11 @@ static void ensure_json(Type *t) {
     }
     buf_puts(b, tj ? "    xs_sb_put(sb, \"}\", 1);\n    }\n}\n" : "    xs_sb_put(sb, \"}\", 1);\n}\n");
     /* parse: allocate the object without running the constructor, then fill every field from the JSON */
-    buf_printf(b, "static %s *json_get_%s(xs_jv *v, const char *where) {\n    if (v->kind != XJ_OBJ) xs_panicf(\"JSON: '%%s' must be an object\", where);\n    %s *o = xs_obj_alloc_t(sizeof(%s), &%s_type);\n", c->cname, tag, c->cname, c->cname, c->cname);
+    buf_printf(b, "static %s *json_get_%s(xs_jv *v, const char *where) {\n", c->cname, tag);
+    if (tj && c->nfields == 1 && c->fields[0].type->kind == TY_STRING) /* a value written by its toJSON() as one string (ObjectId's hex) reads back from it */
+        buf_printf(b, "    if (v->kind == XJ_STR) { %s *s_ = xs_obj_alloc_t(sizeof(%s), &%s_type); s_->%s = xs_str_new(v->str, v->slen); return s_; }\n",
+                   c->cname, c->cname, c->cname, c->fields[0].cname);
+    buf_printf(b, "    if (v->kind != XJ_OBJ) xs_panicf(\"JSON: '%%s' must be an object\", where);\n    %s *o = xs_obj_alloc_t(sizeof(%s), &%s_type);\n", c->cname, c->cname, c->cname);
     for (int i = 0; i < c->nfields; i++) {
         Field *f = &c->fields[i];
         buf_printf(b, "    o->%s = ", f->cname);
