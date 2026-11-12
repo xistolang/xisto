@@ -7312,6 +7312,31 @@ static void check_expr_in(Expr *e, Type *expected) {
         e->type = e->lhs->type->elem;
         return;
     case E_MEMBER:
+        if (e->is_call && e->str && e->lhs && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->str && e->lhs->lhs &&
+            e->lhs->lhs->kind == E_THIS && cur_class) {
+            /* this.db.query(...) with `get db(): I { return this.dataSource as unknown as I; }`: the call on this.dataSource
+               itself (the cast only restates its type; JavaScript calls the same object's method), so a generic
+               method of its class takes the call's type arguments */
+            Func *g = find_method(cur_class, xs_sprintf("__get_%s", e->lhs->str));
+            Stmt *b = g && g->is_getter && g->body && g->body->kind == S_BLOCK && g->body->stmts.len == 1 ? g->body->stmts.items[0] : NULL;
+            Expr *x = b && b->kind == S_RETURN ? b->expr : NULL;
+            int layers = 0; /* (the casts, as written or as checked: an adapter around the object) */
+            bool checked_cast = false;
+            while (x && ((x->kind == E_AS && x->op != TK_NOT && x->lhs) || (x->kind == E_UPCAST && x->lhs) ||
+                         (x->kind == E_NEW_OBJ && x->cls && x->cls->adapter_of && x->args.len == 1) ||
+                         (x->kind == E_CALL && x->builtin.cfn && !strcmp(x->builtin.cfn, "__iface_as") && x->args.len == 1))) {
+                if (x->kind != E_AS) checked_cast = true;
+                x = x->kind == E_NEW_OBJ || x->kind == E_CALL ? x->args.items[0] : x->lhs;
+                layers++;
+            }
+            if (x && (layers >= 1 || checked_cast) && (x->kind == E_MEMBER || x->kind == E_IDENT)) {
+                Expr *path = fresh_path(x);
+                Type *pt = path ? pure_type(path) : NULL;
+                pt = pt ? ty_strip_null(pt) : NULL;
+                Func *m = pt && pt->kind == TY_OBJECT && !pt->cls->is_interface ? find_method(pt->cls, e->str) : NULL;
+                if (m && !m->is_getter && !m->is_setter) e->lhs = fresh_path(x);
+            }
+        }
         if (e->str && e->lhs && e->lhs->kind == E_AS && e->lhs->op != TK_NOT && e->lhs->elem_type && e->lhs->lhs && pure_copy(e->lhs->lhs)) {
             /* (x as { k?: T })?.k with x of a class: x's own k (a field, or a method called), or undefined (null) when its class
                has none, as JavaScript reads the object behind the cast */
@@ -8762,6 +8787,34 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (expected && expected->kind == TY_NULLABLE) e->type = expected;
         return;
     case E_AS: {
+        if (e->elem_type && e->lhs && e->op != TK_NOT) {
+            /* (await db.query(sql)) as T[] | T | null with query<T = Row>(): Promise<T> called without its type argument:
+               TypeScript's T defaults and the cast restates it; here the call takes the cast's type for T (its array
+               member, the rows a query gives), so the rows are decoded into it, checked */
+            Expr *call = e->lhs->kind == E_AWAIT && e->lhs->lhs ? e->lhs->lhs : e->lhs;
+            Expr *root = call->kind == E_MEMBER ? call->lhs : NULL;
+            while (root && root->kind == E_MEMBER && !root->is_call) root = root->lhs;
+            bool bound = root && (root->kind == E_THIS || (root->kind == E_IDENT && lookup(root->str))); /* (not JSON.parse: a namespace) */
+            if (bound && call->kind == E_MEMBER && call->is_call && call->ntargs == 0 && call->str && call->lhs && pure_copy(call->lhs)) {
+                Type *ot = pure_type(call->lhs);
+                ot = ot ? ty_strip_null(ot) : NULL;
+                Func *m = ot && ot->kind == TY_OBJECT ? find_method(ot->cls, call->str) : NULL;
+                Type *g = m ? m->gen_sig : NULL;
+                Type *gr = g && g->nftparams == 1 ? g->ret : NULL;
+                if (gr && gr->kind == TY_PROMISE) gr = gr->elem;
+                if (gr && gr->kind == TY_TPARAM && gr->tname && !strcmp(gr->tname, g->ftparams[0])) {
+                    Type *w = ty_strip_null(resolve(e->elem_type, e->pos));
+                    Type *pick = w;
+                    if (w->kind == TY_UNION)
+                        for (int i = 0; i < w->nparams; i++) if (w->params[i]->kind == TY_ARRAY) { pick = w->params[i]; break; }
+                    if (pick->kind != TY_UNION && pick->kind != TY_UNKNOWN) {
+                        call->ntargs = 1;
+                        call->targs = xs_alloc(sizeof(Type *));
+                        call->targs[0] = pick;
+                    }
+                }
+            }
+        }
         if (e->elem_type && e->lhs) { /* { m: () => ... } as C, or as unknown as C: a fake of C */
             Expr *lit = e->lhs->kind == E_AS && e->lhs->lhs && e->lhs->elem_type && e->lhs->elem_type->kind == TY_UNKNOWN ? e->lhs->lhs : e->lhs;
             if (lit->kind == E_OBJLIT) {
@@ -8830,7 +8883,45 @@ static void check_expr_in(Expr *e, Type *expected) {
             pr_convert(e, want->elem);
             return;
         }
-        if (v->type->kind == TY_UNKNOWN && (want->kind == TY_UNION || (want->kind == TY_NULLABLE && want->elem->kind == TY_UNION))) {
+        if (v->type->kind == TY_UNKNOWN && !ty_is_any(v->type) && (want->kind == TY_UNION || (want->kind == TY_NULLABLE && want->elem->kind == TY_UNION))) {
+            /* unknown as A[] | A (| null): each member checked as it is made (Array.isArray(v) ? v as A[] : v as A), since a
+               union's uses read their member unchecked; a value of neither is a TypeError here, not memory read wrong */
+            Type *u = want->kind == TY_NULLABLE ? want->elem : want;
+            Type *arr = NULL, *obj = NULL;
+            int others = 0;
+            for (int i = 0; i < u->nparams; i++) {
+                Type *m = u->params[i];
+                if (m->kind == TY_ARRAY && !arr) arr = m;
+                else if (m->kind == TY_OBJECT && !m->cls->builtin && !obj) obj = m;
+                else others++;
+            }
+            Expr *vp = arr && obj && !others ? pure_copy(v) : NULL;
+            if (vp) {
+                Expr *arrc = xs_alloc(sizeof *arrc);
+                arrc->kind = E_IDENT; arrc->pos = e->pos; arrc->field = -1; arrc->str = "Array";
+                Expr *test = xs_alloc(sizeof *test);
+                test->kind = E_MEMBER; test->pos = e->pos; test->field = -1; test->is_call = true; test->str = "isArray"; test->lhs = arrc;
+                expr_list_push(&test->args, vp);
+                Expr *ca = xs_alloc(sizeof *ca), *cb = xs_alloc(sizeof *cb);
+                ca->kind = E_AS; ca->pos = e->pos; ca->field = -1; ca->lhs = pure_copy(v); ca->elem_type = arr;
+                cb->kind = E_AS; cb->pos = e->pos; cb->field = -1; cb->lhs = pure_copy(v);
+                cb->elem_type = want->kind == TY_NULLABLE ? ty_nullable_of(obj) : obj;
+                Expr *c = xs_alloc(sizeof *c);
+                c->kind = E_COND; c->pos = e->pos; c->field = -1; c->lhs = test;
+                expr_list_push(&c->args, ca);
+                expr_list_push(&c->args, cb);
+                check_expr(test, ty_boolean);
+                check_expr(ca, NULL);
+                check_expr(cb, NULL);
+                for (int k = 0; k < 2; k++) { /* (a union is held as an unknown: each branch read as one, unchanged) */
+                    Expr *in = c->args.items[k], *w = xs_alloc(sizeof *w);
+                    w->kind = E_AS; w->pos = in->pos; w->field = -1; w->lhs = in; w->op = TK_DOT; w->type = ty_unknown; w->elem_type = ty_unknown;
+                    c->args.items[k] = w;
+                }
+                c->type = want;
+                *e = *c;
+                return;
+            }
             *e = *v; /* unknown as A | B: a union is held as unknown is (boxed); its uses narrow it */
             e->type = want;
             return;

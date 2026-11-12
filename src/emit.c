@@ -2598,7 +2598,7 @@ static bool json_capable(Type *t) {
     case TY_NUMBER: case TY_INT: case TY_BOOLEAN: case TY_STRING: case TY_ENUM: case TY_JSON: case TY_UNKNOWN: case TY_UNION: return true;
     case TY_ARRAY: case TY_NULLABLE: return json_capable(t->elem);
     case TY_OBJECT: {
-        if (t->cls->builtin) return false;
+        if (t->cls->builtin) return strcmp(t->cls->name, "Date") == 0; /* (a Date: its ISO text) */
         for (int i = 0; i < json_capable_depth; i++) if (json_capable_stack[i] == t->cls) return true;
         if (json_capable_depth == 64) return false;
         json_capable_stack[json_capable_depth++] = t->cls;
@@ -10093,7 +10093,7 @@ void emit_program(Program *p, Buf *o) {
         }
         Buf u = {0};
         buf_puts(&u, "static void xs_json_unknown(xs_sb *sb, void *v) {\n"
-                     "    if (!v) { xs_sb_put(sb, \"null\", 4); return; }\n"
+                     "    if (!v || xs_type_of(v)->print == xs_print_closure) { xs_sb_put(sb, \"null\", 4); return; } /* (a function: null, as in an array) */\n"
                      "    void (*f_)(void *) = xs_type_of(v)->free;\n"
                      "    if (f_ == xs_str_free) { xs_sb_str(sb, (xs_str *)v); return; }\n"
                      "    if (f_ == xs_box_int_free) { xs_sb_int(sb, ((xs_box_i *)v)->v); return; }\n"
@@ -10109,6 +10109,7 @@ void emit_program(Program *p, Buf *o) {
             buf_puts(&u, "    if (f_ == xs_map_free && ((xs_map *)v)->str_keys) {\n"
                          "        xs_map *m_ = v; xs_map_entry *e_; bool first_ = true; xs_sb_put(sb, \"{\", 1);\n"
                          "        XS_MAP_EACH(m_, e_) {\n"
+                         "            if (m_->val_kind > 2 && e_->val.p && xs_type_of(e_->val.p)->print == xs_print_closure) continue; /* (a function: left out, as JSON.stringify does) */\n"
                          "            if (!first_) xs_sb_put(sb, \",\", 1); first_ = false; xs_sb_str(sb, e_->skey); xs_sb_put(sb, \":\", 1);\n"
                          "            if (m_->val_kind == 0) xs_sb_num(sb, e_->val.d); else if (m_->val_kind == 1) xs_sb_int(sb, e_->val.i);\n"
                          "            else if (m_->val_kind == 2) xs_sb_bool(sb, e_->val.i != 0); else xs_json_unknown(sb, e_->val.p);\n"

@@ -8,7 +8,7 @@
 // Drivers: "postgres" through the pg package; "oracle" through a driver registered with registerDriver("oracle", ...)
 // (the oracledb package does it), so the SQL here is written for both dialects: $1 or :1 binds, LIMIT/OFFSET or
 // OFFSET/FETCH, quoted identifiers as TypeORM quotes them.
-import { ClassInfo, FieldInfo } from "xisto:reflect";
+import { ClassInfo, FieldInfo, MethodInfo } from "xisto:reflect";
 import { Pool } from "pg";
 import { Connection, OUT_FORMAT_OBJECT, OracleError, createPool } from "oracledb";
 
@@ -1569,6 +1569,8 @@ export class SelectQueryBuilder<T> {
   private params: string = "{}";
   private setValues: string = "{}";
   private insertValues: string = "[]";
+  private setRaw: Map<string, string> = new Map<string, string>(); // (set({ dt: () => "SYSDATE" }): raw SQL by property)
+  private insertRaw: Map<string, string> = new Map<string, string>(); // (values({ ... }) of one row: the same)
   private aliases: Map<string, EntityMetadata> = new Map<string, EntityMetadata>();
 
   constructor(executor: Executor) {
@@ -1800,8 +1802,9 @@ export class SelectQueryBuilder<T> {
     return this;
   }
 
-  set(values: object): SelectQueryBuilder<T> {
-    this.setValues = JSON.stringify(values);
+  set(values: unknown): SelectQueryBuilder<T> {
+    this.setRaw = new Map<string, string>();
+    this.setValues = splitRawValues(values, this.setRaw);
     return this;
   }
 
@@ -1822,8 +1825,9 @@ export class SelectQueryBuilder<T> {
     return this;
   }
 
-  values(values: object): SelectQueryBuilder<T> {
-    this.insertValues = kind(values) === "array" ? JSON.stringify(values) : "[" + JSON.stringify(values) + "]";
+  values(values: unknown): SelectQueryBuilder<T> {
+    this.insertRaw = new Map<string, string>();
+    this.insertValues = Array.isArray(values) ? JSON.stringify(values) : "[" + splitRawValues(values, this.insertRaw) + "]";
     return this;
   }
 
@@ -1998,7 +2002,8 @@ export class SelectQueryBuilder<T> {
       for (const p of props) {
         const col = m === null ? p : columnName(m, p);
         const meta = m === null ? null : m.findColumn(p);
-        sets.push(quote(col) + " = " + binds.addColumnJson(get(vals, p), meta === null ? "" : columnKind(meta)));
+        const rawSql = this.setRaw.get(p);
+        sets.push(quote(col) + " = " + (rawSql !== undefined ? rawSql : binds.addColumnJson(get(vals, p), meta === null ? "" : columnKind(meta))));
       }
       return "UPDATE " + this.table + " SET " + sets.join(", ") + this.wherePart(binds);
     }
@@ -2022,7 +2027,8 @@ export class SelectQueryBuilder<T> {
         const row = at(rows, r);
         const vs: string[] = [];
         for (const p of props) {
-          vs.push(binds.addJson(get(row, p)));
+          const rawSql = n === 1 ? this.insertRaw.get(p) : undefined;
+          vs.push(rawSql !== undefined ? rawSql : binds.addJson(get(row, p)));
         }
         tuples.push("(" + vs.join(", ") + ")");
       }
@@ -2069,6 +2075,8 @@ export class SelectQueryBuilder<T> {
     c.params = this.params;
     c.setValues = this.setValues;
     c.insertValues = this.insertValues;
+    c.setRaw = this.setRaw;
+    c.insertRaw = this.insertRaw;
     for (const [k, v] of this.aliases) c.aliases.set(k, v);
     return c;
   }
@@ -2325,6 +2333,28 @@ export class QueryRunner {
   }
 }
 
+// the values of qb.update().set(...) and qb.insert().values(...) as JSON: a property whose value is a function is
+// raw SQL (dtCadastro: () => "SYSDATE"), as TypeORM writes it; its place is kept (null) and its text goes to raw
+function splitRawValues(values: unknown, raw: Map<string, string>): string {
+  const plain: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(values as Record<string, unknown>)) {
+    if (typeof v === "function") {
+      raw.set(k, (v as () => string)());
+      plain[k] = null;
+    } else {
+      plain[k] = v;
+    }
+  }
+  return JSON.stringify(plain);
+}
+
+// a class decorated is described by the compiler (a ClassInfo): DataSource is a value too, as Nest's token in
+// @Inject(DataSource) (the injector finds it by the parameter's type)
+function described(): (c: ClassInfo, m: MethodInfo | null) => void {
+  return (c: ClassInfo, m: MethodInfo | null): void => {};
+}
+
+@described()
 export class DataSource {
   readonly options: DataSourceOptions;
   driverOf: Driver | null = null; // (set by withDriver)
