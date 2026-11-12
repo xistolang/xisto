@@ -701,10 +701,10 @@ function oracleConnection(c: Connection): OracleConnectionFunctions {
       if (binds.length === 1) {
         const first = binds[0];
         if (first instanceof NamedBinds) {
-          return c.executeNamed(sql, first.binds, { outFormat: OUT_FORMAT_OBJECT, autoCommit: autoCommit });
+          return c.executeNamedRaw(sql, first.binds, { outFormat: OUT_FORMAT_OBJECT, autoCommit: autoCommit });
         }
       }
-      return c.execute(sql, binds, { outFormat: OUT_FORMAT_OBJECT, autoCommit: autoCommit });
+      return c.executeRaw(sql, binds, { outFormat: OUT_FORMAT_OBJECT, autoCommit: autoCommit });
     },
     commit: async (): Promise<void> => {
       await c.commit();
