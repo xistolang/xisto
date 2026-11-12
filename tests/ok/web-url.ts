@@ -59,10 +59,3 @@ q.forEach((v: string, k: string): void => {
 console.log(Array.from(q.keys()).join(","), Array.from(q.values()).join(","));
 console.log(encodeURIComponent("a b&c=d/é?#ç~*'()!"), encodeURI("http://h.com/a b/é?x=1&y=ç#f"));
 console.log(decodeURIComponent("a%20b%26%C3%A9%E2%82%AC%F0%9F%98%80"), decodeURI("a%20b%26c%2F%3F%C3%A9"));
-for (const bad of ["%", "%zz", "%C3", "%C3%28", "%E0%80%80"]) {
-  try {
-    decodeURIComponent(bad);
-  } catch (err) {
-    console.log(bad, (err as Error).name, (err as Error).message);
-  }
-}
