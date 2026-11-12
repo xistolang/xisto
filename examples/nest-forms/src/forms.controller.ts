@@ -49,6 +49,19 @@ export class FormsController {
     return { originalUrl: req.originalUrl, path: req.path };
   }
 
+  @Post("stream")
+  @HttpCode(200)
+  async stream(@Req() req: ExpressRequest) {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of req) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+      size += buffer.byteLength;
+      chunks.push(buffer);
+    }
+    return { size, text: Buffer.concat(chunks).toString("utf8") };
+  }
+
   @Get("bytes")
   bytes(@Res() res: ExpressResponse): void {
     res.status(200);

@@ -7337,6 +7337,26 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (m && !m->is_getter && !m->is_setter) e->lhs = fresh_path(x);
             }
         }
+        if (e->is_call && e->str && e->lhs && e->lhs->kind == E_AS && e->lhs->op != TK_NOT && e->lhs->elem_type && e->lhs->lhs && pure_copy(e->lhs->lhs)) {
+            /* (densidade as { valueOf(): string }).valueOf(): the value's own method, called on it (null: a TypeError, as
+               JavaScript's call on null) */
+            Type *st = ty_strip_null(resolve(e->lhs->elem_type, e->pos));
+            Class *sc = st->kind == TY_OBJECT ? st->cls : NULL;
+            Func *sm = sc && !strncmp(sc->name, "__Obj_", 6) && sc->nfields == 0 ? find_method(sc, e->str) : NULL;
+            Type *it = sm ? pure_type(e->lhs->lhs) : NULL;
+            Type *ib = it ? ty_strip_null(it) : NULL;
+            bool own = ib && ((ib->kind == TY_STRING && (!strcmp(e->str, "valueOf") || !strcmp(e->str, "toString"))) ||
+                              (ib->kind == TY_OBJECT && !ib->cls->is_interface && !made_shape(ib->cls) && find_method(ib->cls, e->str)));
+            if (own) {
+                Expr *nn = xs_alloc(sizeof *nn);
+                nn->kind = E_AS; nn->pos = e->lhs->pos; nn->field = -1; nn->op = TK_NOT; nn->lhs = pure_copy(e->lhs->lhs);
+                Expr *recv = it->kind == TY_NULLABLE ? nn : pure_copy(e->lhs->lhs);
+                if (ib->kind == TY_STRING) *e = *recv; /* (a string's valueOf() / toString(): the string) */
+                else e->lhs = recv;
+                check_expr(e, expected);
+                return;
+            }
+        }
         if (e->str && e->lhs && e->lhs->kind == E_AS && e->lhs->op != TK_NOT && e->lhs->elem_type && e->lhs->lhs && pure_copy(e->lhs->lhs)) {
             /* (x as { k?: T })?.k with x of a class: x's own k (a field, or a method called), or undefined (null) when its class
                has none, as JavaScript reads the object behind the cast */
@@ -10229,6 +10249,46 @@ static bool optchain_shape_cast(Expr *e) {
     Type *it = pure_type(base->lhs);
     Type *ib = it ? ty_strip_null(it) : NULL;
     if (!ib || ib->kind != TY_OBJECT || ib->cls->is_interface || made_shape(ib->cls)) return false;
+    /* (x as { k?: () => R })?.k?.(args) read as tmp.k?.(args): x's own method k called (the class has it), or undefined
+       when it has none (the call not made) */
+    Expr *r1 = e->args.items[0];
+    if (r1->kind == E_MEMBER && r1->is_call && r1->str && r1->lhs && r1->lhs->kind == E_IDENT && r1->lhs->str &&
+        !strcmp(r1->lhs->str, e->str) && find_field(sc, r1->str, NULL)) {
+        if (find_method(ib->cls, r1->str)) {
+            r1->op = TK_DOT; /* (the method is there: a plain call) */
+            e->lhs = base->lhs;
+            return true;
+        }
+        if (!find_field(ib->cls, r1->str, NULL)) {
+            Expr *nul = xs_alloc(sizeof *nul);
+            nul->kind = E_NULL; nul->pos = r1->pos; nul->field = -1;
+            e->args.items[0] = nul;
+            e->lhs = base->lhs;
+            return true;
+        }
+    }
+    Expr *r2 = e->args.items[0];
+    if (is_optchain(r2) && r2->lhs && r2->lhs->kind == E_MEMBER && !r2->lhs->is_call && r2->lhs->lhs && r2->lhs->lhs->kind == E_IDENT &&
+        r2->lhs->lhs->str && !strcmp(r2->lhs->lhs->str, e->str) && r2->args.len == 1 && r2->args.items[0]->kind == E_CALL &&
+        r2->args.items[0]->lhs && r2->args.items[0]->lhs->kind == E_IDENT && r2->str && !strcmp(r2->args.items[0]->lhs->str, r2->str) &&
+        find_field(sc, r2->lhs->str, NULL)) {
+        const char *k = r2->lhs->str;
+        Expr *callx = r2->args.items[0];
+        if (find_method(ib->cls, k)) {
+            Expr *mc = xs_alloc(sizeof *mc);
+            mc->kind = E_MEMBER; mc->pos = r2->pos; mc->field = -1; mc->is_call = true; mc->str = (char *)k; mc->lhs = r2->lhs->lhs;
+            mc->args = callx->args;
+            e->args.items[0] = mc;
+            e->lhs = base->lhs;
+            return true;
+        }
+        if (!find_field(ib->cls, k, NULL)) { /* (no k at all: undefined, the call not made) */
+            Expr *nul = xs_alloc(sizeof *nul);
+            nul->kind = E_NULL; nul->pos = r2->pos; nul->field = -1;
+            *e = *nul;
+            return true;
+        }
+    }
     /* the read of the temporary at the bottom of the rest: tmp.k becomes (tmp as S).k */
     Expr *x = e->args.items[0];
     while (x) {

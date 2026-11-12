@@ -58,6 +58,24 @@ export class Request {
     }
   }
 
+  /**
+   * for await (const chunk of req): the body's bytes, in one chunk, as Node's request stream gives what no body parser
+   * read; a JSON or urlencoded body was read by Nest's parsers (the stream is spent), so it gives nothing, as on Node.
+   */
+  *[Symbol.iterator](): Generator<unknown> {
+    for (const chunk of this.unreadBody()) {
+      yield chunk;
+    }
+  }
+
+  /** The body as the stream still has it: its bytes, or nothing when a body parser read it (JSON, urlencoded). */
+  unreadBody(): Buffer[] {
+    const b = this.rawBody;
+    const type = (this.header("content-type") ?? "").toLowerCase();
+    const parsed = type.startsWith("application/json") || type.startsWith("application/x-www-form-urlencoded");
+    return b !== null && b.length > 0 && !parsed ? [b] : [];
+  }
+
   /** Sets a query string value (the framework calls this while building the request). */
   setQueryValue(name: string, value: string): void {
     this.queries.set(name, value);
