@@ -41,6 +41,11 @@ call("GET", "/api/forms/me")
 call("GET", "/api/forms/item/7", headers={"x-user": "caio"})
 call("GET", "/api/local", headers={"x-scope": "local"})
 call("GET", "/api/local", headers={"x-scope": "other"})
+for q in ["?term=x&page=2&sortOrder=DESC", "?term=x", "?page=0&sortOrder=up", "?term=&page=abc", ""]:
+    call("GET", "/api/forms/search" + q)
+call("GET", "/api/forms/plain")
+call("GET", "/api/forms/plain?a=1&b=2")
+call("GET", "/api/forms/whoami", headers={"x-user": "ana:t1"})
 for k in ["object", "list", "plain"]:
     call("GET", "/api/forms/denied/" + k)
 call("GET", "/api/nope")

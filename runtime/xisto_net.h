@@ -1514,7 +1514,10 @@ static xs_tls *xs_tls_server_new(xs_tls_cred_t *cr);
 
 /* ---- objects visible to the program ---- */
 
-typedef struct xs_Response { xs_hdr hdr; int64_t f_status; bool f_ok; xs_map *f_headers; xs_str *body; xs_str *f_url; } xs_Response;
+/* response.body: the body is read whole by fetch, so there is no stream left to read or cancel (always null) */
+typedef struct xs_ReadableStream { xs_hdr hdr; } xs_ReadableStream;
+XS_NOINLINE void xs_ReadableStream_cancel(xs_ReadableStream *s) { (void)s; }
+typedef struct xs_Response { xs_hdr hdr; int64_t f_status; bool f_ok; xs_map *f_headers; xs_str *body; xs_str *f_url; xs_ReadableStream *f_body; } xs_Response;
 typedef struct xs_HttpRequest {
     xs_hdr hdr;
     xs_str *f_method, *f_path, *f_body;
@@ -1814,6 +1817,54 @@ static xs_str *xs_HttpRequest_query(xs_HttpRequest *r, xs_str *name) {
     return xs_str_new("", 0);
 }
 
+/* req.queryNames(): the names in the query string, in order (repeated names repeat), decoded */
+static xs_arr_ref *xs_HttpRequest_queryNames(xs_HttpRequest *r) {
+    xs_arr_ref *a = xs_arr_ref_new(8, xs_print_str_quoted_);
+    const char *p = r->query, *end = r->query + r->query_len;
+    while (p && p < end) {
+        const char *amp = memchr(p, '&', (size_t)(end - p));
+        if (!amp) amp = end;
+        const char *eq = memchr(p, '=', (size_t)(amp - p));
+        size_t klen = eq ? (size_t)(eq - p) : (size_t)(amp - p);
+        if (klen) xs_arr_ref_push(a, xs_url_decode(p, klen));
+        p = amp + 1;
+    }
+    return a;
+}
+/* req.queryAll(name): every value of a name, in order */
+static xs_arr_ref *xs_HttpRequest_queryAll(xs_HttpRequest *r, xs_str *name) {
+    xs_arr_ref *a = xs_arr_ref_new(4, xs_print_str_quoted_);
+    const char *p = r->query, *end = r->query + r->query_len;
+    while (p && p < end) {
+        const char *amp = memchr(p, '&', (size_t)(end - p));
+        if (!amp) amp = end;
+        const char *eq = memchr(p, '=', (size_t)(amp - p));
+        size_t klen = eq ? (size_t)(eq - p) : (size_t)(amp - p);
+        xs_str *k = xs_url_decode(p, klen);
+        if (k->len == name->len && memcmp(k->data, name->data, (size_t)k->len) == 0)
+            xs_arr_ref_push(a, eq ? xs_url_decode(eq + 1, (size_t)(amp - eq - 1)) : xs_str_new("", 0));
+        xs_release(k);
+        p = amp + 1;
+    }
+    return a;
+}
+/* req.headerNames(): the names of the headers that came, lower case, in order (Express's req.headers keys) */
+static xs_arr_ref *xs_HttpRequest_headerNames(xs_HttpRequest *r) {
+    xs_arr_ref *a = xs_arr_ref_new(8, xs_print_str_quoted_);
+    const char *p = r->headers, *end = r->headers + r->headers_len;
+    while (p && p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        if (!eol) eol = end;
+        const char *colon = memchr(p, ':', (size_t)(eol - p));
+        if (colon && colon > p) {
+            xs_str *k = xs_str_new(p, (size_t)(colon - p));
+            for (int64_t i = 0; i < k->len; i++) k->data[i] = (char)tolower((unsigned char)k->data[i]);
+            xs_arr_ref_push(a, k);
+        }
+        p = eol + 1;
+    }
+    return a;
+}
 static xs_str *xs_HttpRequest_header(xs_HttpRequest *r, xs_str *name) {
     const char *v;
     size_t vlen;
@@ -1992,6 +2043,8 @@ static bool xs_has_ctl(const char *p, size_t n) { /* control bytes other than ta
     for (size_t i = 0; i < n; i++) { unsigned char ch = (unsigned char)p[i]; if ((ch < 0x20 && ch != '\t') || ch == 0x7f) return true; }
     return false;
 }
+/* fetch(url, { body: bytes }): the bytes as the body's text (sent as they are) */
+XS_NOINLINE xs_str *xs_fetch_body_bytes(xs_Uint8Array *a) { return xs_str_new((const char *)a->data, (size_t)a->f_length); }
 /* what an aborted fetch rejects with, as Node's (a DOMException): its name and message */
 XS_NOINLINE void xs_fetch_fail_named(const char *name, const char *msg) {
     xs_str *m = xs_str_new(msg, strlen(msg));

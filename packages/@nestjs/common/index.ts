@@ -421,6 +421,17 @@ export interface ParamDef {
   key: string;
   custom: int;
   pipe: string; // "" or the pipe's class name
+  pipeClass: ClassInfo | null; // a pipe of the app's own (its transform(value, metadata) runs on the value)
+}
+
+/** Nest's RawBodyRequest<Request>: the request with rawBody (xisto's Request always has it). */
+export type RawBodyRequest<T> = T;
+
+/** What a pipe's transform(value, metadata) learns of the parameter. */
+export class ArgumentMetadata {
+  type: string = "custom"; // "body", "query", "param" or "custom"
+  data: string | null = null; // the decorator's key (@Query("x"): "x")
+  metatype: ClassInfo | null = null;
 }
 export interface GuardDef {
   method: int;
@@ -683,7 +694,8 @@ function param(source: string, key: string, custom: int, pipe: ClassInfo | null)
     if (m === null) {
       return;
     }
-    const d: ParamDef = { method: methodIndex(c, m), index: index, source: source, key: key, custom: custom, pipe: pipe === null ? "" : pipe.name };
+    const builtinPipe = pipe !== null && (pipe.name === "ParseIntPipe" || pipe.name === "ParseFloatPipe" || pipe.name === "ParseBoolPipe" || pipe.name === "ValidationPipe");
+    const d: ParamDef = { method: methodIndex(c, m), index: index, source: source, key: key, custom: custom, pipe: pipe === null ? "" : pipe.name, pipeClass: pipe !== null && !builtinPipe ? pipe : null };
     const list = __params.get(c.id);
     if (list === null) {
       __params.set(c.id, [d]);
@@ -693,16 +705,29 @@ function param(source: string, key: string, custom: int, pipe: ClassInfo | null)
   };
 }
 /** The request body, or one of its fields. */
-export function Body(key: string = "", pipe: ClassInfo | null = null): (c: ClassInfo, m: MethodInfo | null, index: int) => void {
-  return param("body", key, -1, pipe);
+// @Query("x", Pipe) or @Query(Pipe): the key, or a pipe given in its place (Nest takes either first)
+function keyOf(a: unknown): string {
+  return typeof a === "string" ? (a as string) : "";
+}
+function pipeOf(a: unknown, pipe: ClassInfo | null): ClassInfo | null {
+  if (pipe !== null || a === null || typeof a === "string" || a instanceof ValidationPipe) {
+    return pipe;
+  }
+  return a as ClassInfo;
+}
+export function Body(key: unknown = "", pipe: ClassInfo | null = null): (c: ClassInfo, m: MethodInfo | null, index: int) => void {
+  return param("body", keyOf(key), -1, pipeOf(key, pipe));
 }
 /** A route parameter (:id); with ParseIntPipe, as an integer. */
-export function Param(key: string = "", pipe: ClassInfo | null = null): (c: ClassInfo, m: MethodInfo | null, index: int) => void {
-  return param("param", key, -1, pipe);
+export function Param(key: unknown = "", pipe: ClassInfo | null = null): (c: ClassInfo, m: MethodInfo | null, index: int) => void {
+  return param("param", keyOf(key), -1, pipeOf(key, pipe));
 }
-/** A query string value; with ParseIntPipe, as an integer. */
-export function Query(key: string = "", pipe: ClassInfo | null = null): (c: ClassInfo, m: MethodInfo | null, index: int) => void {
-  return param("query", key, -1, pipe);
+/**
+ * A query string value (with ParseIntPipe, as an integer), or with no key the whole query: a DTO filled and validated
+ * as Nest's ValidationPipe does, or the plain object a pipe of the app's own transforms.
+ */
+export function Query(key: unknown = "", pipe: ClassInfo | null = null): (c: ClassInfo, m: MethodInfo | null, index: int) => void {
+  return param("query", keyOf(key), -1, pipeOf(key, pipe));
 }
 /** A request header. */
 export function Headers(key: string = ""): (c: ClassInfo, m: MethodInfo | null, index: int) => void {
@@ -726,10 +751,10 @@ export function UploadedFile(): (c: ClassInfo, m: MethodInfo | null, index: int)
 }
 
 // const UserId = createParamDecorator((data, ctx) => ...); then @UserId() on a parameter
-export function createParamDecorator(fn: (data: string | null, ctx: ExecutionContext) => unknown): () => (c: ClassInfo, m: MethodInfo | null, index: int) => void {
+export function createParamDecorator(fn: (data: string | null, ctx: ExecutionContext) => unknown): (data?: string | null) => (c: ClassInfo, m: MethodInfo | null, index: int) => void {
   const id = __custom.length;
   __custom.push({ fn: fn });
-  return (): (c: ClassInfo, m: MethodInfo | null, index: int) => void => param("custom", "", id, null);
+  return (data: string | null = null): (c: ClassInfo, m: MethodInfo | null, index: int) => void => param("custom", data ?? "", id, null);
 }
 
 function injectDef(c: ClassInfo, index: int, token: unknown, optional: boolean): void {

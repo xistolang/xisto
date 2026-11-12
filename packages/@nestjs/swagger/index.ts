@@ -73,6 +73,7 @@ export class ApiResponseOptions {
   description?: string;
   type: unknown = null;
   isArray?: boolean;
+  schema: unknown = null; // (accepted: a schema written by hand)
 }
 interface OperationDoc {
   method: string;
@@ -106,8 +107,11 @@ export function IntersectionType(a: ClassInfo, b: ClassInfo): ClassInfo {
   return a;
 }
 
-export function ApiTags(tag: string): (c: ClassInfo) => void {
-  return (c: ClassInfo): void => {
+export function ApiTags(tag: string): (c: ClassInfo, m: MethodInfo | null) => void {
+  return (c: ClassInfo, m: MethodInfo | null): void => {
+    if (m !== null) {
+      return; // (on one route: accepted; the document groups by the controller's tags)
+    }
     const list = tagsOf.get(c.id);
     if (list === null) {
       tagsOf.set(c.id, [tag]);
@@ -118,8 +122,11 @@ export function ApiTags(tag: string): (c: ClassInfo) => void {
 }
 
 // every route of the class is documented as needing the token (routes behind a guard already are)
-export function ApiBearerAuth(name: string = ""): (c: ClassInfo) => void { // (the scheme's name is accepted)
-  return (c: ClassInfo): void => {
+export function ApiBearerAuth(name: string = ""): (c: ClassInfo, m: MethodInfo | null) => void { // (the scheme's name is accepted; on a method too)
+  return (c: ClassInfo, m: MethodInfo | null): void => {
+    if (m !== null) {
+      return; // (on one route: accepted; guarded routes already show the bearer scheme)
+    }
     bearerOf.set(c.id, true);
   };
 }
@@ -192,6 +199,8 @@ export class ApiParamOptions {
   enum: unknown = null;
   schema: unknown = null;
   isArray?: boolean;
+  deprecated?: boolean;
+  enumName?: string;
 }
 
 export function ApiBody(o: ApiParamOptions = {}): (c: ClassInfo, m: MethodInfo) => void {

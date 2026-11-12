@@ -65,6 +65,17 @@ export class ColumnMetadata {
   type: string = "";
 }
 
+/** A relation between two entities (@ManyToOne / @OneToMany): what find's `relations` loads. */
+export class RelationMetadata {
+  propertyName: string = "";
+  relationType: string = "many-to-one"; // or "one-to-many"
+  target: () => ClassInfo;
+  joinColumn: string = ""; // many-to-one: the column of this table that holds the other's key (@JoinColumn)
+  constructor(target: () => ClassInfo) {
+    this.target = target;
+  }
+}
+
 /** An entity or view: its table, its columns, the ClassInfo of its class. */
 export class EntityMetadata {
   id: string = "";
@@ -74,8 +85,18 @@ export class EntityMetadata {
   isView: boolean = false;
   expression: string = "";
   columns: ColumnMetadata[] = [];
+  relations: RelationMetadata[] = [];
 
-  primaryColumns(): ColumnMetadata[] {
+  findRelation(propertyName: string): RelationMetadata | null {
+    for (const r of this.relations) {
+      if (r.propertyName === propertyName) {
+        return r;
+      }
+    }
+    return null;
+  }
+
+  get primaryColumns(): ColumnMetadata[] {
     const out: ColumnMetadata[] = [];
     for (const c of this.columns) {
       if (c.isPrimary) {
@@ -126,6 +147,16 @@ export function getMetadata(entity: ClassInfo): EntityMetadata {
     throw new EntityMetadataNotFoundError(entity.name);
   }
   return m;
+}
+
+// an entity named by its class name or its table, as TypeORM's EntityTarget given as a string
+function metadataByName(name: string): EntityMetadata {
+  for (const [id, m] of entityMetadata) {
+    if (m.name === name || m.tableName === name) {
+      return m;
+    }
+  }
+  throw new EntityMetadataNotFoundError(name);
 }
 
 function metadataById(id: string, name: string): EntityMetadata {
@@ -214,6 +245,66 @@ function addColumn(c: ClassInfo, f: FieldInfo, o: ColumnOptions, primary: boolea
   col.isSelect = o.select ?? true;
   col.type = o.type ?? "";
   m.columns.push(col); // (field decorators run in declaration order)
+}
+
+/** What @ManyToOne / @OneToMany take after the type (accepted: no cascades, eager loading or onDelete here). */
+export interface RelationOptions {
+  eager?: boolean;
+  cascade?: boolean;
+  nullable?: boolean;
+  onDelete?: string;
+  lazy?: boolean;
+}
+
+function relationOf(c: ClassInfo, f: FieldInfo, target: () => ClassInfo, kind: string): RelationMetadata {
+  const m = metadataOf(c);
+  let r = m.findRelation(f.name);
+  if (r === null) {
+    const made = new RelationMetadata(target);
+    made.propertyName = f.name;
+    m.relations.push(made);
+    r = made;
+  }
+  r.target = target;
+  r.relationType = kind;
+  return r;
+}
+
+/** @ManyToOne(() => Parent, (p) => p.children): this row holds the parent's key (@JoinColumn names the column). */
+export function ManyToOne(target: () => ClassInfo, inverse: ((x: any) => unknown) | null = null, options: RelationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return (c: ClassInfo, f: FieldInfo): void => {
+    const r = relationOf(c, f, target, "many-to-one");
+    if (r.joinColumn.length === 0) {
+      r.joinColumn = f.name + "Id"; // (TypeORM's default name)
+    }
+  };
+}
+
+/** @OneToMany(() => Child, (c) => c.parent): the children whose @ManyToOne points at this entity. */
+export function OneToMany(target: () => ClassInfo, inverse: ((x: any) => unknown) | null = null, options: RelationOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return (c: ClassInfo, f: FieldInfo): void => {
+    relationOf(c, f, target, "one-to-many");
+  };
+}
+
+/** @JoinColumn({ name: "CD_PARENT" }): the column of a @ManyToOne. */
+export interface JoinColumnOptions {
+  name?: string;
+  referencedColumnName?: string;
+}
+export function JoinColumn(options: JoinColumnOptions = {}): (c: ClassInfo, f: FieldInfo) => void {
+  return (c: ClassInfo, f: FieldInfo): void => {
+    // (decorators run bottom up: @JoinColumn before @ManyToOne; the relation is made here and typed by it)
+    const m = metadataOf(c);
+    let r = m.findRelation(f.name);
+    if (r === null) {
+      const made = new RelationMetadata((): ClassInfo => c);
+      made.propertyName = f.name;
+      m.relations.push(made);
+      r = made;
+    }
+    r.joinColumn = options.name ?? f.name + "Id";
+  };
 }
 
 /** @Entity("TABLE") or @Entity({ name, schema }): the class maps to a table. */
@@ -912,12 +1003,14 @@ export interface FindManyOptions {
   order?: object;
   skip?: number;
   take?: number;
+  relations?: string[]; // (the relations loaded with each entity: @ManyToOne / @OneToMany properties)
   select?: string[] | Record<string, boolean>; // (TypeORM: the column names, or { column: true })
 }
 
 export interface FindOneOptions {
   where?: object;
   order?: object;
+  relations?: string[];
   select?: string[] | Record<string, boolean>; // (TypeORM: the column names, or { column: true })
 }
 
@@ -1037,6 +1130,129 @@ function executorFor(dataSourceName: string, sessionId: int): Executor {
  * Its state is two plain values (the DataSource's name, the session it runs on), so a dependency injector can make
  * the exact Repository<User> a constructor asks for from its parameter's type (TypeOrmModule.forFeature).
  */
+// the rows of an entity whose `property` is one of `values`, mapped to its properties (plain objects)
+async function mappedWhereIn(executor: Executor, m: EntityMetadata, property: string, values: unknown[]): Promise<unknown[]> {
+  if (values.length === 0) {
+    return [];
+  }
+  const binds = new Binds(executor.dialect());
+  const a = m.name;
+  const where: object = JSON.parse(`{${JSON.stringify(property)}:{"__op":"in","value":${JSON.stringify(values)}}}`);
+  const sql = "SELECT " + selectList(m, a, []) + " FROM " + tablePath(m) + " " + quote(a) + " WHERE " + whereSql(m, where, a, binds);
+  const rows = await executor.rows(sql, binds.values);
+  const out: any = JSON.parse(JSON.stringify(remap(rows, m.spec())));
+  return out as unknown[];
+}
+
+function propertyOfColumn(m: EntityMetadata, databaseName: string): string {
+  for (const c of m.columns) {
+    if (c.databaseName === databaseName) {
+      return c.propertyName;
+    }
+  }
+  return "";
+}
+
+// the relations not loaded: null for a @ManyToOne, [] for a @OneToMany (TypeORM leaves them undefined; the
+// entity's class has them as fields), also on the related entities loaded
+function fillUnloaded(m: EntityMetadata, list: unknown[]): void {
+  for (const e of list) {
+    const row = e as Record<string, unknown>;
+    for (const r of m.relations) {
+      if (!(r.propertyName in row)) {
+        if (r.relationType === "many-to-one") {
+          row[r.propertyName] = null;
+        } else {
+          row[r.propertyName] = [];
+        }
+        continue;
+      }
+      const v: any = row[r.propertyName];
+      const target = metadataOf(r.target());
+      if (v === null) {
+        continue;
+      }
+      if (Array.isArray(v)) {
+        fillUnloaded(target, v as unknown[]);
+      } else {
+        fillUnloaded(target, [v]);
+      }
+    }
+  }
+}
+
+/**
+ * find's `relations`: for each name, the related entities, one more query per relation (TypeORM joins; the
+ * entities come out the same): a @ManyToOne's parent by its key, a @OneToMany's children by theirs.
+ */
+async function loadRelations(executor: Executor, m: EntityMetadata, list: unknown[], relations: string[]): Promise<void> {
+  for (const name of relations) {
+    const r = m.findRelation(name);
+    if (r === null) {
+      throw new Error(`Relation with property path ${name} in entity was not found.`);
+    }
+    const target = metadataOf(r.target());
+    const pks = target.primaryColumns;
+    if (r.relationType === "many-to-one") {
+      const fkProp = propertyOfColumn(m, r.joinColumn);
+      if (fkProp.length === 0 || pks.length !== 1) {
+        throw new Error(`xisto: relation ${name} needs its @JoinColumn as a mapped column and one primary key on ${target.name}`);
+      }
+      const keys: unknown[] = [];
+      const seen = new Set<string>();
+      for (const e of list) {
+        const row = e as Record<string, unknown>;
+        const k: any = row[fkProp];
+        if (k !== null && !seen.has(String(k))) {
+          seen.add(String(k));
+          keys.push(k);
+        }
+      }
+      const found = await mappedWhereIn(executor, target, pks[0].propertyName, keys);
+      for (const e of list) {
+        const row = e as Record<string, unknown>;
+        const k: any = row[fkProp];
+        let hit: unknown = null;
+        for (const f of found) {
+          const fr = f as Record<string, unknown>;
+          const fk: any = fr[pks[0].propertyName];
+          if (k !== null && String(fk) === String(k)) hit = f;
+        }
+        row[name] = hit;
+      }
+    } else {
+      // the children's @ManyToOne back to this entity
+      let back: RelationMetadata | null = null;
+      for (const tr of target.relations) {
+        if (tr.relationType === "many-to-one" && metadataOf(tr.target()).id === m.id) back = tr;
+      }
+      const own = m.primaryColumns;
+      if (back === null || own.length !== 1) {
+        throw new Error(`xisto: relation ${name} needs a @ManyToOne on ${target.name} back to ${m.name}`);
+      }
+      const fkProp = propertyOfColumn(target, back.joinColumn);
+      const keys: unknown[] = [];
+      for (const e of list) {
+        const row = e as Record<string, unknown>;
+        const k: any = row[own[0].propertyName];
+        if (k !== null) keys.push(k);
+      }
+      const found = await mappedWhereIn(executor, target, fkProp, keys);
+      for (const e of list) {
+        const row = e as Record<string, unknown>;
+        const k: any = row[own[0].propertyName];
+        const kids: unknown[] = [];
+        for (const f of found) {
+          const fr = f as Record<string, unknown>;
+          const fk: any = fr[fkProp];
+          if (String(fk) === String(k)) kids.push(f);
+        }
+        row[name] = kids;
+      }
+    }
+  }
+}
+
 export class Repository<T> {
   dataSourceName: string = "default";
   sessionId: int = -1;
@@ -1046,7 +1262,14 @@ export class Repository<T> {
     this.sessionId = sessionId;
   }
 
+  // (an entity given by name, manager.update("TB_X", ...): its metadata, not T's)
+  __fixed: EntityMetadata | null = null;
+
   get metadata(): EntityMetadata {
+    const f = this.__fixed;
+    if (f !== null) {
+      return f;
+    }
     return metadataById(__reflect_typeid(T), __reflect_typeid(T));
   }
 
@@ -1078,9 +1301,16 @@ export class Repository<T> {
     return this.metadata.name;
   }
 
-  private entities(rows: object): T[] {
+  private async entities(rows: object, relations: string[] = []): Promise<T[]> {
     const mapped = remap(rows, this.metadata.spec());
-    const out: T[] = JSON.parse(JSON.stringify(mapped));
+    if (this.metadata.relations.length === 0) {
+      const out: T[] = JSON.parse(JSON.stringify(mapped));
+      return out;
+    }
+    const list: any = JSON.parse(JSON.stringify(mapped));
+    await loadRelations(this.executor, this.metadata, list as unknown[], relations);
+    fillUnloaded(this.metadata, list as unknown[]);
+    const out: T[] = JSON.parse(JSON.stringify(list));
     return out;
   }
 
@@ -1111,7 +1341,7 @@ export class Repository<T> {
   async find(options: FindManyOptions = {}): Promise<T[]> {
     const binds = new Binds(this.executor.dialect());
     const sql = this.selectSql(options.where ?? null, options.order ?? null, Math.trunc(options.skip ?? 0), Math.trunc(options.take ?? 0), findSelect(options.select ?? null), binds);
-    return this.entities(await this.executor.rows(sql, binds.values));
+    return await this.entities(await this.executor.rows(sql, binds.values), options.relations ?? []);
   }
 
   /** the page of entities and the count of all that match (TypeORM runs both queries the same way) */
@@ -1128,7 +1358,7 @@ export class Repository<T> {
   async findOne(options: FindOneOptions): Promise<T | null> {
     const binds = new Binds(this.executor.dialect());
     const sql = this.selectSql(options.where ?? null, options.order ?? null, 0, 1, findSelect(options.select ?? null), binds);
-    const found = this.entities(await this.executor.rows(sql, binds.values));
+    const found = await this.entities(await this.executor.rows(sql, binds.values), options.relations ?? []);
     return found.length > 0 ? found[0] : null;
   }
 
@@ -1208,7 +1438,7 @@ export class Repository<T> {
   private primaryWhere(values: object): object {
     let text = "{";
     let first = true;
-    for (const c of this.metadata.primaryColumns()) {
+    for (const c of this.metadata.primaryColumns) {
       if (!first) {
         text = text + ",";
       }
@@ -1235,7 +1465,7 @@ export class Repository<T> {
   /** INSERT when no row has the entity's primary key, UPDATE of its other columns when one has */
   async save(entity: T): Promise<T> {
     const values: object = JSON.parse(JSON.stringify(entity));
-    const pks = this.metadata.primaryColumns();
+    const pks = this.metadata.primaryColumns;
     let present = pks.length > 0;
     for (const c of pks) {
       if (kind(get(values, c.propertyName)) === "null") {
@@ -1258,7 +1488,7 @@ export class Repository<T> {
     if (generated && this.executor.dialect() === "postgres") {
       sql = sql + " RETURNING *";
       const rows = await this.executor.rows(sql, binds.values);
-      const made = this.entities(rows);
+      const made = await this.entities(rows);
       return made.length > 0 ? made[0] : entity;
     }
     await this.executor.run(sql, binds.values);
@@ -1896,12 +2126,16 @@ function isWord(ch: string): boolean {
 // EntityManager, QueryRunner, DataSource
 
 /** an entity class where TypeORM takes EntityTarget<Entity>: T is that class (the checker binds it from the class given) */
-export type EntityTarget<T> = ClassInfo;
+export type EntityTarget<T> = unknown;
 
 export class EntityManager {
   private executor: Executor;
   constructor(executor: Executor) {
     this.executor = executor;
+  }
+  /** The QueryRunner of a transaction's manager (null outside one, as TypeORM's manager of a DataSource). */
+  get queryRunner(): QueryRunner | null {
+    return null;
   }
   get connection(): DataSource {
     return this.executor.dataSource;
@@ -1934,8 +2168,12 @@ export class EntityManager {
     return o;
   }
   /** getRepository<User>(User): the class gives its metadata, the type argument the entities' type */
-  getRepository<T>(entity: ClassInfo): Repository<T> {
-    return new Repository<T>(this.executor.dataSource.options.name ?? "default", this.executor.sessionId);
+  getRepository<T>(entity: EntityTarget<T>): Repository<T> {
+    const repo = new Repository<T>(this.executor.dataSource.options.name ?? "default", this.executor.sessionId);
+    if (typeof entity === "string") {
+      repo.__fixed = metadataByName(entity as string); // (an entity given by its name or its table)
+    }
+    return repo;
   }
   // TypeORM's EntityManager calls on an entity class (manager.findOne(User, {...})): its repository's, in this
   // manager's session (a transaction's statements stay in it); T is the class given (EntityTarget<T>)
@@ -1957,6 +2195,7 @@ export class EntityManager {
   async insert<T>(entity: EntityTarget<T>, values: Record<string, unknown>): Promise<InsertResult> {
     return this.getRepository<T>(entity).insert(values);
   }
+  /** manager.update(Entity, where, values), or with the entity's name or table: manager.update("TB_X", ...) */
   async update<T>(entity: EntityTarget<T>, criteria: object, values: Record<string, unknown>): Promise<UpdateResult> {
     return this.getRepository<T>(entity).update(criteria, values);
   }

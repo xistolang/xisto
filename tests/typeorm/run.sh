@@ -27,6 +27,12 @@ if [ -n "$XISTO_ORACLE_URL" ]; then
     else
         echo "FAIL typeorm oracle (live)"; head -5 /tmp/xisto-typeorm-oracle-live.build; diff oracle-live.expected /tmp/xisto-typeorm-oracle-live.out | head; tail -1 /tmp/xisto-typeorm-oracle-live.stats; fail=1
     fi
+    # relations (@ManyToOne/@OneToMany, find's relations): relations-live.expected is TypeORM 0.3's output
+    if $X run --no-warnings src/relations-live.ts > /tmp/xisto-typeorm-relations.out 2>&1 && cmp -s /tmp/xisto-typeorm-relations.out relations-live.expected; then
+        echo "ok typeorm relations (live)"
+    else
+        echo "FAIL typeorm relations (live)"; diff relations-live.expected /tmp/xisto-typeorm-relations.out | head; fail=1
+    fi
 else
     echo "ok typeorm oracle live (skipped: XISTO_ORACLE_URL is not set)"
 fi

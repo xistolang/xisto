@@ -143,7 +143,7 @@ elif grep -q "assertion failed: math is broken" "$OUT/unit-fail.txt"; then pass=
 # HTTP: fetch options and timeout, non-blocking sleeps, graceful shutdown (SKIP_NET=1 skips: it needs port 8080)
 if [ -n "$SKIP_NET" ]; then :; else
 sh tests/http/run.sh > "$OUT/http.txt" 2>&1
-if grep -q "200 POST abc123 7 xisto" "$OUT/http.txt" && grep -q "timeout: The operation was aborted due to timeout TimeoutError" "$OUT/http.txt" \
+if grep -q "200 POST abc123 7 xisto" "$OUT/http.txt" && grep -q "bytes body: 200 bytes xisto http://127.0.0.1:8080/echo" "$OUT/http.txt" && grep -q "timeout: The operation was aborted due to timeout TimeoutError" "$OUT/http.txt" \
    && grep -q "abort: true AbortError This operation was aborted true" "$OUT/http.txt" && grep -q "aborted before: AbortError" "$OUT/http.txt" \
    && grep -q "not aborted: 200 slept 10 false" "$OUT/http.txt" && grep -q "200 slept 20" "$OUT/http.txt" && grep -q "redirected: 200 http://127.0.0.1:8080/slow?ms=1 7 slept 1" "$OUT/http.txt" \
    && grep -q "overlapped (20 ok)" "$OUT/http.txt" && grep -q "during SIGTERM: slept 700" "$OUT/http.txt" && grep -q "refused: True" "$OUT/http.txt" \
@@ -209,6 +209,8 @@ if sh examples/nest-features/test/run.sh > "$OUT/nest-features.txt" 2>&1 && grep
 if sh examples/nest-versions/test/run.sh > "$OUT/nest-versions.txt" 2>&1 && grep -q '^ok: nest-versions' "$OUT/nest-versions.txt"; then pass=$((pass+1)); else echo "FAIL nest-versions:"; cat "$OUT/nest-versions.txt"; fail=$((fail+1)); fi
 if sh examples/nest-auth/test/run.sh > "$OUT/nest-auth.txt" 2>&1 && grep -q '^ok: nest-auth' "$OUT/nest-auth.txt"; then pass=$((pass+1)); else echo "FAIL nest-auth:"; cat "$OUT/nest-auth.txt"; fail=$((fail+1)); fi
 if sh examples/nest-forms/test/run.sh > "$OUT/nest-forms.txt" 2>&1 && grep -q '^ok: nest-forms' "$OUT/nest-forms.txt"; then pass=$((pass+1)); else echo "FAIL nest-forms:"; cat "$OUT/nest-forms.txt"; fail=$((fail+1)); fi
+# @nestjs/jwt's JwtService against @nestjs/jwt 11 + jsonwebtoken 9 (tests/nestjwt/run.sh)
+if sh tests/nestjwt/run.sh > "$OUT/nestjwt.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL nestjwt:"; cat "$OUT/nestjwt.txt"; fail=$((fail+1)); fi
 # Nest's Logger on the console: object messages as Nest 11's ConsoleLogger prints them (tests/nestlog/run.sh)
 if sh tests/nestlog/run.sh > "$OUT/nestlog.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL nestlog:"; cat "$OUT/nestlog.txt"; fail=$((fail+1)); fi
 

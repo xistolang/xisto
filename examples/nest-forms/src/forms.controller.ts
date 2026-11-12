@@ -1,7 +1,8 @@
-import { BadRequestException, Body, Controller, ForbiddenException, Get, HttpCode, Logger, Param, Post, Request, UseGuards } from "@nestjs/common";
+import { BadRequestException, Body, Controller, ForbiddenException, Get, HttpCode, Logger, Param, Post, Query, Request, UseGuards } from "@nestjs/common";
 import { ApiHeader } from "@nestjs/swagger";
 import { Scoped } from "./decorators";
-import { CreateTabletDto, LegacyDto, SortDto, UpdateKioskDto } from "./dtos";
+import { CreateTabletDto, LegacyDto, NoQueryPipe, SearchQueryDto, SortDto, UpdateKioskDto } from "./dtos";
+import { CurrentUser } from "./user.decorator";
 import { FormsService } from "./forms.service";
 import { UserGuard } from "./user.guard";
 
@@ -46,6 +47,22 @@ export class FormsController {
   me(@Request() req: { user: { sub: string; tid?: string } }) {
     this.logger.warn({ event: "me", sub: req.user.sub, tid: req.user.tid ?? "none" });
     return { sub: req.user.sub, tenant: req.user.tid ?? "none" };
+  }
+
+  @Get("search")
+  search(@Query() q: SearchQueryDto) {
+    return { term: q.term, page: q.page ?? 1, sortOrder: q.sortOrder ?? "asc" };
+  }
+
+  @Get("plain")
+  plain(@Query(NoQueryPipe) _q: unknown) {
+    return { plain: true };
+  }
+
+  @Get("whoami")
+  @UseGuards(UserGuard)
+  whoami(@CurrentUser("sub") sub: string, @CurrentUser() user: { sub: string; tid?: string }) {
+    return { sub, tenant: user.tid ?? "none" };
   }
 
   @Get("denied/:kind")
