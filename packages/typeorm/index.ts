@@ -1292,6 +1292,13 @@ export class Repository<T> {
     return new EntityManager(executorFor(this.dataSourceName, this.sessionId));
   }
 
+  /** (xisto) this repository where a Repository<any> goes: the same data source and session, its entity kept by name */
+  __xs_any(): Repository<any> {
+    const r = new Repository<any>(this.dataSourceName, this.sessionId);
+    r.__fixedName = this.metadata.name;
+    return r;
+  }
+
   /** The entity it holds (TypeORM's repo.target): what manager.getRepository(target) and createQueryBuilder take */
   get target(): ClassInfo {
     return {

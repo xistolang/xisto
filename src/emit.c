@@ -2899,6 +2899,14 @@ static void emit_expr_raw(Expr *e) {
             buf_printf(out, "({ %s *o_ = xs_obj_alloc_t(sizeof(%s), &%s_type);", c->cname, c->cname, c->cname);
         else
         buf_printf(out, "({ %s *o_ = %s_new();", c->cname, c->cname);
+        bool guard = false; /* in a function with a try: a field's value that can throw ({ ok: true, valor: await fn() }) lets the
+                               half-made object go with the cleanup stack, not leak it */
+        if (vol_locals && !c->region && !c->rdual && !c->nohdr)
+            for (int i = 0; i < e->args.len && !guard; i++) {
+                Expr *a = e->args.items[i];
+                guard = a->kind == E_CALL || a->kind == E_AWAIT || a->kind == E_SPAWN || (a->kind == E_MEMBER && a->is_call) || a->kind == E_NEW_OBJ;
+            }
+        if (guard) buf_puts(out, " xs_cln_push((void **)&o_);");
         for (int i = 0; i < e->args.len; i++) {
             Field *fd = NULL;
             for (int k = 0; k < c->nfields; k++) if (strcmp(c->fields[k].name, e->keys[i]) == 0) fd = &c->fields[k];
@@ -2913,6 +2921,7 @@ static void emit_expr_raw(Expr *e) {
                 buf_puts(out, ";");
             }
         }
+        if (guard) buf_puts(out, " xs_cln_n -= 1;");
         buf_puts(out, " o_; })");
         return;
     }
@@ -9852,6 +9861,7 @@ void emit_program(Program *p, Buf *o) {
     prog = p;
     if (p->uses_this_reg) buf_puts(out, xs_this_reg_c);
     if (p->uses_clone) buf_puts(out, "static void *xs_structured_clone(void *v);\n");
+    if (p->uses_plain) buf_puts(out, "static bool xs_is_plain(void *v);\n");
     if (p->uses_v8) buf_puts(out, xs_v8_c);
     if (p->uses_unk_map) buf_puts(out, xs_unk_map_c);
     if (p->uses_symbol_for) buf_puts(out, xs_symbol_for_c);
@@ -10315,6 +10325,21 @@ void emit_program(Program *p, Buf *o) {
     } else if (json_fns.data) {
         if (json_protos.data) buf_puts(out, json_protos.data);
         buf_puts(out, json_fns.data);
+    }
+    if (p->uses_plain) { /* Object.getPrototypeOf(u) === Object.prototype: an object literal's (an interface's) or a Record's */
+        Buf u = {0};
+        buf_puts(&u, "static bool xs_is_plain(void *v) {\n"
+                     "    if (!v) xs_panic(\"TypeError: Cannot convert undefined or null to object\");\n"
+                     "    void (*f_)(void *) = xs_type_of(v)->free;\n"
+                     "    if (f_ == xs_map_free) return ((xs_map *)v)->record;\n");
+        for (int i = 0; i < p->nclasses; i++) {
+            Class *c = p->classes[i];
+            if (!c->used || c->builtin || c->nohdr || !c->is_interface) continue;
+            buf_printf(&u, "    if (f_ == %s_free) return true;\n", c->cname);
+        }
+        buf_puts(&u, "    return false;\n}\n");
+        buf_puts(out, u.data);
+        free(u.data);
     }
     if (p->uses_clone) { /* structuredClone: by the value's type at run time; a class's copy takes its fields, each one copied */
         Buf u = {0};
