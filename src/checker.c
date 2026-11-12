@@ -2792,6 +2792,20 @@ static void check_spread_lit(Expr *e, Type *elem) {
                 a->type = a->lhs->type;
                 ok = true;
             }
+            if (!ok && a->lhs->type->kind == TY_SET && elem_widens(ets[i], elem)) { /* ...new Set(ints) where number[] goes: [...set] as numbers */
+                Expr *in = xs_alloc(sizeof *in);
+                *in = *a->lhs;
+                in->prechecked = true;
+                Expr *u = xs_alloc(sizeof *u); u->kind = E_UNARY; u->op = TK_ELLIPSIS; u->pos = in->pos; u->field = -1; u->lhs = in;
+                Expr *arr = a->lhs;
+                memset(arr, 0, sizeof *arr);
+                arr->kind = E_ARRAY_LIT; arr->pos = in->pos; arr->field = -1; arr->spread = true;
+                expr_list_push(&arr->args, u);
+                check_expr(arr, NULL);
+                arr_convert(arr, elem);
+                a->type = arr->type;
+                ok = true;
+            }
             if (!ok && a->lhs->type->kind == TY_ARRAY && shape_copy_array(a->lhs, ty_array_of(elem))) { a->type = a->lhs->type; ok = true; } /* ...rows where shapes with their fields go: copies */
             if (!ok) xs_error(XS8141, a->pos, NULL, "the spread elements are %s, but the array holds %s", ty_name(ets[i]), ty_name(elem));
         } else expect_type(a, elem, "array element");
@@ -3480,7 +3494,16 @@ static Expr *fresh_path(Expr *x) {
     }
     return NULL;
 }
+static bool pure_read(Expr *e);
 static void expect_type(Expr *e, Type *want, const char *what) {
+    if (e->type && e->type->kind == TY_ARRAY && ty_is_any(e->type->elem) && e->type->elem->tname && !strcmp(e->type->elem->tname, "never") &&
+        ty_strip_null(want)->kind == TY_ARRAY && (e->kind == E_ARRAY_LIT || pure_read(e))) {
+        /* a never[] ([] with nothing to type it: TypeScript lets nothing in) where a T[] goes: an empty T[] */
+        memset(e, 0, sizeof *e);
+        e->kind = E_ARRAY_LIT; e->field = -1;
+        e->type = ty_strip_null(want);
+        return;
+    }
     if (e->type && e->type->kind == TY_ARRAY && e->type->elem->kind == TY_INT && want->kind == TY_ARRAY && want->elem->kind == TY_NUMBER &&
         (e->kind == E_CALL || (e->kind == E_MEMBER && e->is_call) || e->kind == E_ARRAY_LIT)) {
         /* xs.map(([s]) => s) (ints, as a Map<int, V>'s keys) where number[] goes: a fresh array, its values as numbers
@@ -4802,6 +4825,48 @@ static void check_map_member(Expr *e) {
     if (strcmp(m, "has") == 0 || strcmp(m, "delete") == 0) {
         ARGS(1); ARG(0, k, is_map ? "Map key" : "Set element");
         e->type = ty_boolean; e->builtin.cfn = m; return;
+    }
+    if (strcmp(m, "forEach") == 0 && e->args.len == 1 && !(is_map && t->nkey)) {
+        /* m.forEach((v, k) => ...): over [...m.entries()] (a copy of its entries, in order), each (value, key) to the callback */
+        static int nfe;
+        const char *pn = xs_sprintf("__fe%d", nfe++);
+        Expr *cb = e->args.items[0];
+        Expr *ent = xs_alloc(sizeof *ent);
+        ent->kind = E_MEMBER; ent->pos = e->pos; ent->field = -1; ent->lhs = e->lhs; ent->str = is_map ? "entries" : "values"; ent->is_call = true;
+        e->lhs->prechecked = true;
+        Expr *call = xs_alloc(sizeof *call);
+        call->kind = E_CALL; call->pos = e->pos; call->field = -1; call->lhs = cb;
+        Expr *id0 = xs_alloc(sizeof *id0); id0->kind = E_IDENT; id0->pos = e->pos; id0->field = -1; id0->str = (char *)pn;
+        if (is_map) {
+            for (int k = 1; k >= 0; k--) {
+                Expr *ix = xs_alloc(sizeof *ix); ix->kind = E_INDEX; ix->pos = e->pos; ix->field = -1;
+                ix->lhs = xs_alloc(sizeof *ix->lhs); *ix->lhs = *id0;
+                ix->rhs = num_lit(e->pos, k, true);
+                expr_list_push(&call->args, ix);
+            }
+        } else {
+            expr_list_push(&call->args, id0);
+            Expr *id1 = xs_alloc(sizeof *id1); *id1 = *id0;
+            expr_list_push(&call->args, id1);
+        }
+        if (cb->kind == E_ARROW) { /* (the callback's own parameters say how many it reads; untyped: the value's, the key's) */
+            while (call->args.len > cb->arrow->fn->nparams) call->args.len--;
+            Func *cf = cb->arrow->fn;
+            if (cf->nparams >= 1 && !cf->params[0].type) cf->params[0].type = v;
+            if (cf->nparams >= 2 && !cf->params[1].type) cf->params[1].type = k;
+        }
+        Func *af = xs_alloc(sizeof *af); af->pos = e->pos; af->name = "arrow"; af->ret = ty_void;
+        af->params = xs_alloc(sizeof(Param)); memset(af->params, 0, sizeof(Param)); af->params[0].name = (char *)pn; af->nparams = 1;
+        Stmt *st = xs_alloc(sizeof *st); st->kind = S_EXPR; st->pos = e->pos; st->expr = call;
+        Stmt *b = xs_alloc(sizeof *b); b->kind = S_BLOCK; b->pos = e->pos; stmt_list_push(&b->stmts, st);
+        af->body = b;
+        Arrow *ar = xs_alloc(sizeof *ar); ar->pos = e->pos; ar->fn = af;
+        Expr *ae = xs_alloc(sizeof *ae); ae->kind = E_ARROW; ae->pos = e->pos; ae->field = -1; ae->arrow = ar;
+        memset(e, 0, sizeof *e);
+        e->kind = E_MEMBER; e->pos = ent->pos; e->field = -1; e->lhs = ent; e->str = "forEach"; e->is_call = true;
+        expr_list_push(&e->args, ae);
+        check_expr(e, NULL);
+        return;
     }
     if (strcmp(m, "clear") == 0) { ARGS(0); e->type = ty_void; e->builtin.cfn = m; return; }
     if (strcmp(m, "values") == 0) { ARGS(0); e->type = ty_array_of(v); check_type_supported(e->pos, e->type); e->builtin.cfn = m; return; }
@@ -6433,6 +6498,11 @@ static const char *member_path_text(Expr *e) {
         const char *l = member_path_text(e->lhs);
         return l ? xs_sprintf("%s.%s", l, e->str) : NULL;
     }
+    if (e->kind == E_INDEX && e->rhs && (e->rhs->kind == E_NUMBER || e->rhs->kind == E_STRING)) { /* args[0], o['k'] */
+        const char *l = member_path_text(e->lhs);
+        if (!l) return NULL;
+        return e->rhs->kind == E_NUMBER ? xs_sprintf("%s[%.17g]", l, e->rhs->num) : xs_sprintf("%s['%s']", l, e->rhs->str);
+    }
     return NULL;
 }
 /* juntas(() => a(), () => b()) with juntas<A, B>(a: () => A | Promise<A>, b: () => B | Promise<B>): [Promise<A>, Promise<B>]
@@ -6602,11 +6672,26 @@ static bool failed_;
 static bool early_global(const char *name) {
     for (int i = 0; i < prog->top.len; i++) {
         Stmt *s = prog->top.items[i];
-        if (s->kind != S_VAR || !s->name || strcmp(s->name, name) != 0 || s->top_state != 0 || !s->mod) continue;
+        if (s->kind != S_VAR || !s->name || strcmp(s->name, name) != 0 || !s->mod) continue;
         bool here = s->mod == cur_mod;
         const char *st = strstr(name, "__s_"); /* (Dec.ZERO: Dec__s_ZERO, imported with Dec) */
         const char *iname = st ? xs_strndup(name, (size_t)(st - name)) : name;
         if (!here && !(cur_mod && imports_name(cur_mod, s->mod, iname) && (s->exported || st))) continue;
+        if (s->top_state != 0) { /* checked already (a module that imports this one in a cycle bound its imports first) */
+            if (here) continue;
+            for (Binding *b = mod_scopes[s->mod->id]->head; b; b = b->next)
+                if (b->name && !strcmp(b->name, name)) {
+                    Binding *alias = xs_alloc(sizeof *alias);
+                    *alias = *b;
+                    alias->origin = b;
+                    alias->is_const = true;
+                    Scope *ms = mod_scopes[cur_mod->id];
+                    alias->next = ms->head;
+                    ms->head = alias;
+                    return true;
+                }
+            continue;
+        }
         s->top_state = 1;
         Scope *sc = scope; Func *cf = cur_func; Class *cc = cur_class; Module *cm = cur_mod;
         const char *fname = xs_file_name, *fsrc = xs_source;
@@ -7382,6 +7467,20 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     case E_ASSIGN:
     case E_POSTFIX: {
+        if (tsc_checked() && e->lhs->kind == E_INDEX && e->lhs->lhs && e->lhs->lhs->kind == E_AS && e->lhs->lhs->op != TK_NOT &&
+            e->lhs->lhs->lhs && e->lhs->lhs->lhs->kind == E_AS && e->lhs->lhs->lhs->elem_type && e->lhs->lhs->lhs->elem_type->kind == TY_UNKNOWN) {
+            /* (result as unknown as Record<string, unknown>)[k] = v with result an object of a class: its field named k
+               written by name, as JavaScript writes the property (the dynamic path, checked against the field's type) */
+            Expr *obj = e->lhs->lhs->lhs->lhs;
+            check_expr(obj, NULL);
+            obj->prechecked = true;
+            Type *ot = obj->type ? ty_strip_null(obj->type) : NULL;
+            if (ot && ot->kind == TY_OBJECT && !ot->cls->builtin) {
+                Expr *as = xs_alloc(sizeof *as);
+                as->kind = E_AS; as->pos = obj->pos; as->field = -1; as->lhs = obj; as->elem_type = ty_any;
+                e->lhs->lhs = as;
+            }
+        }
         if (e->kind == E_ASSIGN && e->op == TK_ASSIGN && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->lhs &&
             e->lhs->lhs->kind == E_IDENT && !strcmp(e->lhs->lhs->str, "process") && e->lhs->str && !strcmp(e->lhs->str, "exitCode") &&
             !lookup("process")) { /* process.exitCode = n: the status the program ends with */
@@ -11091,6 +11190,13 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->type = ty_array_of(ty_unknown);
                 return;
             }
+            if (!elem && tsc_checked() && !(expected && expected->kind == TY_MAP)) { /* [] with nothing to say its type (an object's field,
+                                       a callback's result): TypeScript's never[], an empty unknown[] that goes where any T[] goes */
+                static Type *never_t;
+                if (!never_t) { never_t = xs_alloc(sizeof *never_t); *never_t = *ty_any; never_t->tname = "never"; }
+                e->type = ty_array_of(never_t);
+                return;
+            }
             if (!elem) xs_error(XS3008, e->pos, "give it a type: const xs: number[] = [];", "cannot infer the type of an empty array");
             e->type = expected;
             check_type_supported(e->pos, e->type);
@@ -11330,7 +11436,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 pop_scope();
             }
         }
-        if (ty_path && then_path && !strcmp(ty_path, then_path) && ty_is_any(a->type)) {
+        if (ty_path && then_path && !strcmp(ty_path, then_path) && (ty_is_any(a->type) || (a->type->kind == TY_UNKNOWN && tsc_checked()))) { /* (unknown too: args[0] of unknown[]) */
             Expr *in = xs_alloc(sizeof *in);
             *in = *a;
             memset(a, 0, sizeof *a);
