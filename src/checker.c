@@ -1550,6 +1550,111 @@ static Type *gen_call_ret(Type *ft, Expr *call) {
     bool as = false;
     return ret_unpromise(r, &as);
 }
+/* ---- a generic arrow value called without type arguments: its body reads T as unknown (one function for every
+   T). Where T is a type held by reference (a string, an object, an array, a Map or a Set), a value of T is held as
+   the unknown holds it (the same pointer), so an argument written with T (a Map<string, string[]> where the function
+   takes Map<string, T[]>) is that argument itself, read through the erased type, and the result written with T is
+   read as T: the same object, as in JavaScript. T is inferred from the arguments, as TypeScript infers it. ---- */
+static bool gen_ref_type(Type *t) {
+    return t && (t->kind == TY_STRING || t->kind == TY_ARRAY || t->kind == TY_SET || (t->kind == TY_MAP && !t->nkey) ||
+                 (t->kind == TY_OBJECT && t->cls && !t->cls->is_tuple));
+}
+/* binds[] (one per type parameter of g) from a written with T as the argument type a; false on a conflict */
+static bool gen_bind(Type *g, Type *a, char **names, Type **binds, int n) {
+    if (!g || !a) return true;
+    if (g->kind == TY_TPARAM && g->tname) {
+        for (int i = 0; i < n; i++)
+            if (strcmp(g->tname, names[i]) == 0) {
+                if (binds[i]) return ty_equal(binds[i], a);
+                if (!gen_ref_type(a)) return false;
+                binds[i] = a;
+                return true;
+            }
+        return true;
+    }
+    if (g->kind != a->kind) return true; /* (the comparison below decides) */
+    switch (g->kind) {
+    case TY_ARRAY: case TY_SET: case TY_NULLABLE: case TY_PROMISE: return gen_bind(g->elem, a->elem, names, binds, n);
+    case TY_MAP: return gen_bind(g->key, a->key, names, binds, n) && gen_bind(g->elem, a->elem, names, binds, n);
+    case TY_FUNC:
+        if (g->nparams != a->nparams) return true;
+        for (int i = 0; i < g->nparams; i++) if (!gen_bind(g->params[i], a->params[i], names, binds, n)) return false;
+        return gen_bind(g->ret, a->ret, names, binds, n);
+    default: return true;
+    }
+}
+static Type *resolve(Type *t, Pos pos);
+/* the argument a (checked) where the erased parameter i of the generic arrow value ft goes: a itself read through the
+   erased type when it is the parameter as written with T bound (binds) to a type held by reference */
+static bool gen_arg(Expr *a, Type *ft, int i, Type **binds) {
+    Type *g = ft->gen_in;
+    if (!g || i >= g->nparams || !a->type || ty_equal(a->type, ft->params[i])) return false;
+    Type **nb = xs_alloc(sizeof(Type *) * (size_t)g->nftparams);
+    memcpy(nb, binds, sizeof(Type *) * (size_t)g->nftparams);
+    if (!gen_bind(g->params[i], a->type, g->ftparams, nb, g->nftparams)) return false;
+    for (int k = 0; k < g->nftparams; k++) if (!nb[k]) nb[k] = ty_unknown;
+    Type *w = resolve(subst_ftp(g->params[i], g->ftparams, nb, g->nftparams), a->pos);
+    if (!ty_equal(w, a->type)) return false;
+    for (int k = 0; k < g->nftparams; k++) if (nb[k] != ty_unknown) binds[k] = nb[k];
+    Expr *in = xs_alloc(sizeof *in);
+    *in = *a;
+    memset(a, 0, sizeof *a);
+    a->kind = E_UPCAST; a->pos = in->pos; a->field = -1; a->lhs = in; a->type = ft->params[i];
+    return true;
+}
+/* <T extends E>(xs: T[] | null) => (xs == null ? xs : xs.filter(...)) with its result type left out: what it returns is
+   xs or a part of it (null, xs, xs.filter(..), xs.slice(..), a ?: of those), so its result as written with T is xs's
+   type (TypeScript infers T[] | null) */
+static int gen_keep_param(Expr *x, Func *f) {
+    if (!x) return -1;
+    if (x->kind == E_NULL) return -2;
+    if (x->kind == E_IDENT && x->str) {
+        for (int i = 0; i < f->nparams; i++) if (f->params[i].name && !strcmp(f->params[i].name, x->str)) return i;
+        return -1;
+    }
+    if (x->kind == E_MEMBER && x->is_call && x->str && (!strcmp(x->str, "filter") || !strcmp(x->str, "slice"))) {
+        int i = gen_keep_param(x->lhs, f);
+        return i >= 0 && f->params[i].type && ty_strip_null(f->params[i].type)->kind == TY_ARRAY ? i : -1;
+    }
+    if (x->kind == E_AS && x->op == TK_NOT && !x->elem_type) return gen_keep_param(x->lhs, f);
+    if (x->kind == E_COND && x->args.len == 2) {
+        int a = gen_keep_param(x->args.items[0], f), b = gen_keep_param(x->args.items[1], f);
+        if (a == -1 || b == -1) return -1;
+        if (a == -2) return b;
+        if (b == -2) return a;
+        return a == b ? a : -1;
+    }
+    return -1;
+}
+static void gen_ret_of_param(Type *g, Func *f) {
+    Stmt *b = f->body;
+    if (b->kind != S_BLOCK || b->stmts.len != 1 || b->stmts.items[0]->kind != S_RETURN || f->is_async || f->nparams != g->nparams) return;
+    int i = gen_keep_param(b->stmts.items[0]->expr, f);
+    if (i < 0) return;
+    if (g->params[i]) g->ret = g->params[i];
+}
+/* the call's result read as the result written with T, when the arguments bound every T */
+static void gen_result(Expr *e, Type *ft, Type **binds) {
+    Type *g = ft->gen_in;
+    if (!g || !g->ret || ft->async_ret || !e->type) return;
+    for (int k = 0; k < g->nftparams; k++) if (!binds[k]) return;
+    Type *r = resolve(subst_ftp(g->ret, g->ftparams, binds, g->nftparams), e->pos);
+    if (e->type->kind == TY_NULLABLE && r->kind != TY_NULLABLE) r = ty_nullable_of(r); /* (a null the body returns too) */
+    if (ty_equal(r, e->type) || !gen_ref_type(ty_strip_null(r))) return;
+    /* (read as an unknown, then as r: checked at run time, as `x as T` is: a value the body made from nothing, such
+       as JSON.parse(s) as T, fails as a TypeError instead of being read as what it is not) */
+    Expr *in = xs_alloc(sizeof *in);
+    *in = *e;
+    in->prechecked = true;
+    Expr *u = in;
+    if (in->type->kind != TY_UNKNOWN) {
+        u = xs_alloc(sizeof *u);
+        u->kind = E_UPCAST; u->pos = in->pos; u->field = -1; u->lhs = in; u->type = ty_unknown;
+    }
+    memset(e, 0, sizeof *e);
+    e->kind = E_AS; e->pos = in->pos; e->field = -1; e->lhs = u; e->elem_type = r;
+    check_expr(e, NULL);
+}
 static void check_expr(Expr *e, Type *expected);
 /* e (checked, of the erased result type) becomes `e as T` with T = e->gen_ret */
 static void gen_convert(Expr *e) {
@@ -4857,25 +4962,93 @@ static bool ro_param(Func *f, const char *name, int depth) {
 }
 /* the argument a of parameter i of f: a copy of it where the parameter's Record type differs only in unknown values */
 static void variance_arg_t(Expr *a, Func *f, int i, Type *ptype);
+/* the function given for an argument when its declaration is known (a function, a const arrow) */
+static Func *arg_func(Expr *a) {
+    if (a->kind != E_IDENT && a->kind != E_FUNC_REF) return NULL;
+    Func *argf = lookup_func(a->str);
+    if (!argf) { Binding *ab = lookup(a->str); if (ab) argf = ab->origin && ab->origin->arrow_fn ? ab->origin->arrow_fn : ab->arrow_fn; }
+    return argf;
+}
+/* (s: string, b: R = {}) where (s: string, b?: R) => ... goes: the function differs from the type only in parameters
+   that have a default where the type has them optional (TypeScript reads a default as b?: R) */
+static bool dflt_param_fits(Type *at, Type *pt, Func *argf, int k) {
+    return argf && k < argf->nparams && argf->params[k].dflt && argf->params[k].dflt->kind != E_NULL && !argf->params[k].rest &&
+           at->params[k]->kind != TY_NULLABLE && pt->params[k]->kind == TY_NULLABLE && ty_equal(at->params[k], pt->params[k]->elem);
+}
+/* async () => { ...; return { docs, oracle }; } (its result type left out: a shape the compiler made) where
+   () => Promise<BancoDoDia> goes, BancoDoDia an interface of the same fields and types: TypeScript compares the
+   fields. Every return of the function gives a new object literal, so the copy into the interface (shape_copy) that
+   an adapter makes of each result is an object no one else has seen: the program cannot tell it from the original. */
+static bool made_shape(Class *c);
+static bool ret_shape_fits(Type *ar, Type *pr, Func *argf) {
+    if (!ar || !pr || ar->kind != TY_OBJECT || pr->kind != TY_OBJECT || ar->cls == pr->cls || !argf || !argf->body) return false;
+    Class *src = ar->cls, *dst = pr->cls;
+    if (!made_shape(src) || !(dst->is_interface || made_shape(dst)) || dst->nmethods || dst->iface_methods || dst->tparams ||
+        src->nfields != dst->nfields)
+        return false;
+    ExprList one = {0};
+    const ExprList *rets = &argf->ret_exprs; /* (the returns its inference saw; an arrow's one expression: that one) */
+    if (argf->ret_infer != 3) {
+        Stmt *b = argf->body;
+        if (b->kind != S_BLOCK || b->stmts.len != 1 || b->stmts.items[0]->kind != S_RETURN || !b->stmts.items[0]->expr) return false;
+        expr_list_push(&one, b->stmts.items[0]->expr);
+        rets = &one;
+    }
+    if (!rets->len) return false;
+    for (int i = 0; i < rets->len; i++) {
+        Expr *x = rets->items[i];
+        if (x->kind != E_OBJLIT || x->cls != src || x->spread) return false;
+    }
+    for (int i = 0; i < dst->nfields; i++) {
+        Field *sf = find_field(src, dst->fields[i].name, NULL);
+        if (!sf || !sf->type || !dst->fields[i].type || !ty_equal(sf->type, dst->fields[i].type)) return false;
+    }
+    return true;
+}
+static bool dflt_only_diff(Expr *a, Type *ptype) {
+    if (!a->type) return false;
+    Type *at = ty_strip_null(a->type), *pt = ty_strip_null(ptype);
+    if (at->kind != TY_FUNC || pt->kind != TY_FUNC || at->nparams != pt->nparams || at->rest || pt->rest || !at->ret || !pt->ret ||
+        !ty_equal(at->ret, pt->ret) || ty_equal(at, pt))
+        return false;
+    Func *argf = arg_func(a);
+    if (!argf || argf->nparams != at->nparams) return false;
+    for (int k = 0; k < at->nparams; k++)
+        if (!ty_equal(at->params[k], pt->params[k]) && !dflt_param_fits(at, pt, argf, k)) return false;
+    return true;
+}
+/* the adapters of the function value given that TypeScript's own rules make (always on, also without --tsc-checked):
+   a default read as an optional parameter, a result of a made shape copied into the interface */
+static bool ts_rule_diff(Expr *a, Type *ptype) {
+    if (dflt_only_diff(a, ptype)) return true;
+    if (!a->type) return false;
+    Type *at = ty_strip_null(a->type), *pt = ty_strip_null(ptype);
+    if (at->kind != TY_FUNC || pt->kind != TY_FUNC || at->nparams != pt->nparams || at->rest || pt->rest || at->async_ret != pt->async_ret) return false;
+    Func *argf = arg_func(a);
+    if (!argf || argf->nparams != at->nparams || !ret_shape_fits(at->ret, pt->ret, argf)) return false;
+    for (int k = 0; k < at->nparams; k++)
+        if (!ty_equal(at->params[k], pt->params[k]) && !dflt_param_fits(at, pt, argf, k)) return false;
+    return true;
+}
 static void variance_arg(Expr *a, Func *f, int i) {
-    if (!tsc_checked() || !a->type || i >= f->nparams) return;
+    if (!a->type || i >= f->nparams) return;
+    if (!tsc_checked() && !ts_rule_diff(a, f->params[i].type)) return;
     variance_arg_t(a, f, i, f->params[i].type);
 }
 static void variance_arg_t(Expr *a, Func *f, int i, Type *ptype) {
     if (!f || i >= f->nparams || !a->type) return;
     Type *at = ty_strip_null(a->type), *pt = ty_strip_null(ptype);
+    bool ret_copy = at->kind == TY_FUNC && pt->kind == TY_FUNC && at->async_ret == pt->async_ret && ret_shape_fits(at->ret, pt->ret, arg_func(a));
     if (at->kind == TY_FUNC && pt->kind == TY_FUNC && at->nparams == pt->nparams && !at->rest && !pt->rest && at->ret && pt->ret &&
-        (ty_equal(at->ret, pt->ret) || pt->ret->kind == TY_UNKNOWN || pt->ret->kind == TY_VOID) && !ty_equal(at, pt)) {
+        (ty_equal(at->ret, pt->ret) || pt->ret->kind == TY_UNKNOWN || pt->ret->kind == TY_VOID || ret_copy) && !ty_equal(at, pt)) {
         /* chaveGuia, (g: Guia) => string, where (x: unknown) => string goes: an adapter that reads each unknown as the
            function takes it (checked), when the callee only calls it */
         bool fits = true;
-        Func *argf = NULL; /* (the function given, when its body is known: its parameters' reads prove a copy is safe) */
-        if (a->kind == E_IDENT || a->kind == E_FUNC_REF) {
-            argf = lookup_func(a->str);
-            if (!argf) { Binding *ab = lookup(a->str); if (ab) argf = ab->origin && ab->origin->arrow_fn ? ab->origin->arrow_fn : ab->arrow_fn; }
-        }
+        Func *argf = arg_func(a); /* (the function given, when its body is known: its parameters' reads prove a copy is safe) */
+        if (argf && argf->nparams != at->nparams) argf = NULL;
         for (int k = 0; k < at->nparams && fits; k++) {
             if (ty_equal(at->params[k], pt->params[k]) || pt->params[k]->kind == TY_UNKNOWN) continue;
+            if (dflt_param_fits(at, pt, argf, k)) continue; /* (left out or undefined: the function's default, below) */
             /* (o: Partial<Omit<Item, 'a'>>) where (o?: Partial<Item>) goes: each object the callee passes copied to the shape
                the function takes, when the function provably only reads that parameter (a copy it cannot tell apart) */
             Type *pa = ty_strip_null(at->params[k]), *pp = ty_strip_null(pt->params[k]);
@@ -4905,7 +5078,18 @@ static void variance_arg_t(Expr *a, Func *f, int i, Type *ptype) {
             Expr *id = xs_alloc(sizeof *id); id->kind = E_IDENT; id->pos = a->pos; id->field = -1; id->str = af->params[k].name;
             Expr *arg = id;
             Type *pa = ty_strip_null(at->params[k]), *pp = ty_strip_null(pt->params[k]);
-            if (!ty_equal(at->params[k], pt->params[k]) && pa->kind == TY_OBJECT && pp->kind == TY_OBJECT) {
+            if (!ty_equal(at->params[k], pt->params[k]) && dflt_param_fits(at, pt, argf, k)) {
+                /* b === undefined ? <the default, reading the arguments before it> : b, as JavaScript applies it */
+                Expr **ids = xs_alloc(sizeof(Expr *) * (size_t)(k ? k : 1));
+                for (int q = 0; q < k; q++) { ids[q] = xs_alloc(sizeof(Expr)); ids[q]->kind = E_IDENT; ids[q]->pos = a->pos; ids[q]->field = -1; ids[q]->str = af->params[q].name; }
+                Expr *d = dflt_subst(argf->params[k].dflt, argf, ids, k, a->pos);
+                Expr *t = xs_alloc(sizeof *t); t->kind = E_BINARY; t->op = TK_EQ; t->pos = a->pos; t->field = -1; t->lhs = pr_copy(id);
+                t->rhs = xs_alloc(sizeof *t->rhs); t->rhs->kind = E_NULL; t->rhs->pos = a->pos; t->rhs->field = -1;
+                Expr *c = xs_alloc(sizeof *c); c->kind = E_COND; c->pos = a->pos; c->field = -1; c->lhs = t;
+                expr_list_push(&c->args, d);
+                expr_list_push(&c->args, id);
+                arg = c;
+            } else if (!ty_equal(at->params[k], pt->params[k]) && pa->kind == TY_OBJECT && pp->kind == TY_OBJECT) {
                 /* a copy in the function's shape: its fields that the given object has */
                 FieldSet tf = {0};
                 fields_here(pa->cls, &tf);
@@ -4949,6 +5133,11 @@ static void variance_arg_t(Expr *a, Func *f, int i, Type *ptype) {
             call = c;
         }
         nad++;
+        if (ret_copy && pt->async_ret) { /* async (..) => (await f(..)), the result copied into the interface on its return */
+            af->is_async = af->ret_promise = true;
+            Expr *aw = xs_alloc(sizeof *aw); aw->kind = E_AWAIT; aw->pos = a->pos; aw->field = -1; aw->lhs = call;
+            call = aw;
+        }
         Stmt *r = xs_alloc(sizeof *r); r->pos = a->pos;
         if (af->ret->kind == TY_VOID) { r->kind = S_EXPR; r->expr = call; } else { r->kind = S_RETURN; r->expr = call; }
         Stmt *b = xs_alloc(sizeof *b); b->kind = S_BLOCK; b->pos = a->pos; stmt_list_push(&b->stmts, r);
@@ -6664,10 +6853,13 @@ static void infer_new_collection(Expr *e, Type *expected) {
     }
     if (is_map && a->kind == E_MEMBER && a->is_call && a->str && strcmp(a->str, "map") == 0 && a->args.len == 1 &&
         a->args.items[0]->kind == E_ARROW) { /* new Map(xs.map((x) => [k, v])): the pair a tuple */
-        Stmt *b = a->args.items[0]->arrow->fn->body;
-        if (b && b->kind == S_BLOCK && b->stmts.len == 1 && b->stmts.items[0]->kind == S_RETURN && b->stmts.items[0]->expr &&
-            b->stmts.items[0]->expr->kind == E_ARRAY_LIT && b->stmts.items[0]->expr->args.len == 2)
-            b->stmts.items[0]->expr->want_tuple = true;
+        Func *af = a->args.items[0]->arrow->fn;
+        Stmt *b = af->body;
+        int r = b && b->kind == S_BLOCK ? b->stmts.len - 1 : 0; /* (([k, l]) => [k, f(l)]: the parameter's declarations open the body) */
+        for (int i = 0; i < r; i++) if (b->stmts.items[i]->kind != S_VAR) r = -1;
+        if (r >= 0 && b && b->kind == S_BLOCK && b->stmts.len == r + 1 && b->stmts.items[r]->kind == S_RETURN && b->stmts.items[r]->expr &&
+            b->stmts.items[r]->expr->kind == E_ARRAY_LIT && b->stmts.items[r]->expr->args.len == 2)
+            b->stmts.items[r]->expr->want_tuple = true;
     }
     bool ints = !is_map && a->kind == E_ARRAY_LIT && a->args.len; /* new Set([1, 2]): a Set of int, as xisto keeps numbers in one */
     for (int i = 0; ints && i < a->args.len; i++) ints = a->args.items[i]->kind == E_NUMBER && a->args.items[i]->is_int_lit;
@@ -9445,14 +9637,27 @@ static void check_expr_in(Expr *e, Type *expected) {
                 }
                 pack_rest(e, ft);
                 if (e->args.len != ft->nparams) xs_error(XS8062, e->pos, NULL, "'%s' takes %d argument(s), got %d", name, ft->nparams, e->args.len);
+                Type **gbinds = ft->gen_in && !e->ntargs ? xs_alloc(sizeof(Type *) * (size_t)(ft->gen_in->nftparams + 1)) : NULL;
                 for (int i = 0; i < e->args.len; i++) {
-                    check_expr(e->args.items[i], ft->params[i]);
-                    if (tsc_checked() && af && i < af->nparams) variance_arg_t(e->args.items[i], af, i, ft->params[i]); /* (Isa, 12/11) */
+                    Type *want = ft->params[i];
+                    Expr *ai = e->args.items[i];
+                    if (gbinds && ai->kind == E_ARROW && i < ft->gen_in->nparams) {
+                        /* agrupa(xs, (c) => c.a) with T bound by xs: the arrow read with T as that type (its parameters) */
+                        Type *gp = ft->gen_in->params[i];
+                        bool all = true;
+                        for (int k = 0; k < ft->gen_in->nftparams; k++) if (!gbinds[k]) all = false;
+                        if (all && gp && gp->kind == TY_FUNC) want = resolve(subst_ftp(gp, ft->gen_in->ftparams, gbinds, ft->gen_in->nftparams), ai->pos);
+                    }
+                    bool lit = ai->kind == E_OBJLIT || ai->kind == E_ARRAY_LIT; /* (shaped by the erased type: T is not read from it) */
+                    check_expr(ai, want);
+                    if (gbinds && !lit) gen_arg(e->args.items[i], ft, i, gbinds);
+                    if ((tsc_checked() || ts_rule_diff(e->args.items[i], ft->params[i])) && af && i < af->nparams) variance_arg_t(e->args.items[i], af, i, ft->params[i]); /* (Isa, 12/11) */
                     expect_type(e->args.items[i], ft->params[i], xs_sprintf("argument %d of '%s'", i + 1, name));
                 }
                 e->type = ft->ret;
                 e->gen_ret = gen_call_ret(ft, e); /* queryOne<Row>(sql): the unknown as a Row (an await around it converts what it gives) */
                 if (e->gen_ret && !ft->async_ret) gen_convert(e);
+                else if (gbinds) gen_result(e, ft, gbinds);
                 return;
             }
             if (b && missing_name(name)) xs_error_quiet();
@@ -12057,6 +12262,7 @@ static void check_expr_in(Expr *e, Type *expected) {
     case E_ARROW: {
         Arrow *a = e->arrow;
         Func *f = a->fn;
+        if (a->gen_in && !a->gen_in->ret && !f->ret && f->body) gen_ret_of_param(a->gen_in, f);
         if (!expected && cur_func && cur_func->deco_ret && f->nparams == 3 && !f->params[0].type && !f->params[1].type && !f->params[2].type) {
             /* Deco(): MethodDecorator { return (target, key, descriptor) => ... }: TypeScript's method decorator's types (XB-107) */
             Class *pd = find_class("PropertyDescriptor");
@@ -12288,6 +12494,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         e->type->rest = f->nparams && f->params[f->nparams - 1].rest;
         e->type->async_ret = f->ret_promise;
         e->type->gen_sig = a->gen_sig; /* <T>(..) => ...: its signature as written (calls with type arguments read it) */
+        e->type->gen_in = a->gen_in;
         return;
     }
     case E_NEW_MAP:

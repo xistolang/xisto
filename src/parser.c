@@ -1194,6 +1194,14 @@ static Expr *parse_arrow(Parser *p) {
             ft->nftparams = ngtp;
             a->gen_sig = ft;
         }
+        bool ptyped = f->nparams > 0;
+        for (int i = 0; i < f->nparams; i++) if (!ps[i]) ptyped = false;
+        if (ptyped) { /* (the parameters alone, also without a written result type: a call infers T from its arguments) */
+            Type *ft = ty_func(ps, f->nparams, f->ret);
+            ft->ftparams = gtp;
+            ft->nftparams = ngtp;
+            a->gen_in = ft;
+        }
         for (int i = 0; i < f->nparams; i++) f->params[i].type = erase_tparams(f->params[i].type, gtp, ngtp);
         f->ret = erase_tparams(f->ret, gtp, ngtp);
         Type **us = xs_alloc(sizeof(Type *) * (size_t)ngtp); /* the body: T is unknown */
