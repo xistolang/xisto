@@ -632,3 +632,41 @@ export class AbortController {
     this.signal.__abort(reason ?? abortError(), 1);
   }
 }
+
+// ---- fetch with its options in a value: fetch(url, init), fetch(url, { ...init, headers }) ----
+
+/** fetch's options (the Fetch API's RequestInit): method, headers, body, signal; redirect is accepted (followed). */
+export interface RequestInit {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string | Uint8Array;
+  signal?: AbortSignal;
+  redirect?: string;
+}
+
+declare function fetch_body_bytes(b: Uint8Array): string;
+function __xs_bytes_text(b: Uint8Array): string {
+  return fetch_body_bytes(b);
+}
+
+/** Node's BufferEncoding: the name of an encoding ("utf8", "latin1", "base64", "hex"...). */
+export type BufferEncoding = string;
+
+/** The Fetch API's HeadersInit as xisto takes it: a Record of names and values. */
+export type HeadersInit = Record<string, string>;
+
+/** (the compiler calls this for fetch(url, init) when the options are not written in place) */
+export function __xs_fetch(url: string, init: RequestInit): Response {
+  const method = init.method ?? "GET";
+  const headers: Record<string, string> = init.headers ?? {};
+  const given = init.body ?? null;
+  // (bytes are sent as they are: their text here is only how the C side carries them)
+  const body: string | null = given === null ? null : typeof given === "string" ? (given as string) : __xs_bytes_text(given as Uint8Array);
+  const signal = init.signal ?? null;
+  if (signal !== null) {
+    if (body !== null) return fetch(url, { method: method, headers: headers, body: body, signal: signal });
+    return fetch(url, { method: method, headers: headers, signal: signal });
+  }
+  if (body !== null) return fetch(url, { method: method, headers: headers, body: body });
+  return fetch(url, { method: method, headers: headers });
+}

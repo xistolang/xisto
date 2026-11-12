@@ -121,9 +121,16 @@ static bool gives_name(Module *via, Module *from, const char *name, int depth) {
 /* True when `name` is imported by the current module from `from` (directly, or through a module that re-exports it). */
 static bool imports_name(Module *m, Module *from, const char *name) {
     if (!m) return false;
+    const char *q = strchr(name, '\x01'); /* "A\x01m": the A that the import from "m" gives (an alias, XB-117) */
+    size_t nl = q ? (size_t)(q - name) : strlen(name);
     for (int i = 0; i < m->nimports; i++)
-        for (int k = 0; k < m->imports[i].n; k++)
-            if (strcmp(m->imports[i].names[k], name) == 0 && gives_name(m->imports[i].from, from, name, 0)) return true;
+        for (int k = 0; k < m->imports[i].n; k++) {
+            Import *im = &m->imports[i];
+            if (strlen(im->names[k]) != nl || strncmp(im->names[k], name, nl) != 0) continue;
+            if (q ? (!im->path || strcmp(im->path, q + 1) != 0) : (im->qualified && im->qualified[k])) continue;
+            char *plain = q ? xs_strndup(name, nl) : (char *)name;
+            if (gives_name(im->from, from, plain, 0)) return true;
+        }
     return false;
 }
 
@@ -352,6 +359,15 @@ static bool wt_imports(Module *m, const char *name) {
 }
 /* Classes visible from the current module: its own, the ones it imports, and the built-ins. */
 static Class *find_class(const char *name) {
+    const char *q = strchr(name, '\x01'); /* "A\x01m": the class A of the import from "m" (an alias next to another A, XB-117) */
+    if (q) {
+        char *base = xs_strndup(name, (size_t)(q - name));
+        SYM_EACH(classes_by_name, base, e) {
+            Class *c = e->decl;
+            if (c->exported && imports_name(cur_mod, c->mod, name)) return c;
+        }
+        return NULL;
+    }
     SYM_EACH(classes_by_name, name, e) {
         Class *c = e->decl;
         if (c->mod == cur_mod || (c->exported && imports_name(cur_mod, c->mod, name))) return c;
@@ -1821,11 +1837,20 @@ static const char *this_cname(void) {
 }
 
 static Func *lookup_func(const char *name) {
+    const char *q = strchr(name, '\x01'); /* "f\x01m": the function f of the import from "m" (XB-117) */
+    if (q) {
+        char *base = xs_strndup(name, (size_t)(q - name));
+        SYM_EACH(funcs_by_name, base, e) {
+            Func *f = e->decl;
+            if (f->exported && imports_name(cur_mod, f->mod, name)) return f;
+        }
+        return NULL;
+    }
     SYM_EACH(funcs_by_name, name, e) {
         Func *f = e->decl;
         if (f->mod == cur_mod || (f->exported && imports_name(cur_mod, f->mod, name))) return f;
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:arrays") == 0) return f; /* (reduce & co) */
-        if (f->exported && strstr(name, "__s_") && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:url") == 0) return f; /* (URL.canParse, AbortSignal.timeout: statics of globals) */
+        if (f->exported && (strstr(name, "__s_") || !strcmp(name, "__xs_fetch")) && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:url") == 0) return f; /* (URL.canParse, AbortSignal.timeout: statics of globals; fetch with its options in a value) */
         const char *st = strstr(name, "__s_"); /* a static method: visible where its class is imported */
         if (st && f->exported) {
             char *cls = xs_strndup(name, (size_t)(st - name));
@@ -4523,6 +4548,9 @@ static void check_object_member(Expr *e, Class *c) {
         if (!g && find_method(c, xs_sprintf("__set_%s", e->str))) xs_error(XS8060, e->pos, "add get %s(): T { ... }", "'%s' of %s has a setter but no getter", e->str, c->name);
         if (g) { e->str = g->name; e->is_call = true; }
     }
+    if (e->is_call && e->args.len == 0 && !strcmp(e->str, "digest") && c->mod && c->mod->file && !strcmp(c->mod->file, "xisto:crypto") &&
+        (!strcmp(c->name, "Hash") || !strcmp(c->name, "Hmac")))
+        e->str = "__digestBytes"; /* hash.digest(): a Buffer (with an encoding, text) */
     Func *m = find_method(c, e->str);
     if (!m && !e->is_call && !c->builtin) {
         /* an open class (a field `__expando: Record<string, any>`, as Express's Request): a property the class does
@@ -5163,6 +5191,7 @@ static bool objlit_expand(Expr *e, Type *expected) {
         for (int i = 0; i < e->args.len && ok; i++) {
             if (strcmp(e->keys[i], "...") != 0) continue;
             Type *st = pure_type(e->args.items[i]->lhs);
+            if (st && st->kind == TY_NULLABLE) st = st->elem; /* (...opts.headers with headers?: a Record: nothing when absent) */
             if (st && st->kind == TY_MAP && st->record && st->key->kind == TY_STRING) {
                 any_rec = true;
                 if (!v) v = st->elem;
@@ -5181,8 +5210,17 @@ static bool objlit_expand(Expr *e, Type *expected) {
             for (int i = 0; i < e->args.len; i++) {
                 Expr *a = e->args.items[i];
                 if (strcmp(e->keys[i], "...") == 0) {
+                    Expr *srcx = a->lhs;
+                    Type *pt = pure_type(srcx);
+                    if (pt && pt->kind == TY_NULLABLE) { /* (x ?? {}): a null spreads nothing, as in JavaScript */
+                        Expr *empty = xs_alloc(sizeof *empty);
+                        empty->kind = E_OBJLIT; empty->pos = a->pos; empty->field = -1;
+                        Expr *qq = xs_alloc(sizeof *qq);
+                        qq->kind = E_BINARY; qq->op = TK_QQ; qq->pos = a->pos; qq->field = -1; qq->lhs = srcx; qq->rhs = empty;
+                        srcx = qq;
+                    }
                     Expr *ent = xs_alloc(sizeof *ent);
-                    ent->kind = E_MEMBER; ent->pos = a->pos; ent->field = -1; ent->lhs = a->lhs; ent->str = "entries"; ent->is_call = true;
+                    ent->kind = E_MEMBER; ent->pos = a->pos; ent->field = -1; ent->lhs = srcx; ent->str = "entries"; ent->is_call = true;
                     Expr *sp = xs_alloc(sizeof *sp);
                     sp->kind = E_UNARY; sp->op = TK_ELLIPSIS; sp->pos = a->pos; sp->field = -1; sp->lhs = ent;
                     expr_list_push(&arr->args, sp);
@@ -5376,6 +5414,23 @@ static bool overload_typed(Expr *e, Func *f, ExprList *written) {
     expr_list_push(&e->args, inner);
     check_expr(e, NULL);
     return true;
+}
+/* "x.a.b" of a name or a chain of member reads (?. or .), before checking; NULL for anything else */
+static const char *member_path_text(Expr *e) {
+    if (!e) return NULL;
+    if (e->kind == E_IDENT) return e->str;
+    if (e->kind == E_COND && e->builtin.cfn && !strcmp(e->builtin.cfn, "optchain") && e->str && e->args.len >= 1) {
+        /* a?.b: the rest is written on the temporary that holds a */
+        const char *base = member_path_text(e->lhs), *rest = member_path_text(e->args.items[0]);
+        size_t tl = strlen(e->str);
+        if (!base || !rest || strncmp(rest, e->str, tl) != 0) return NULL;
+        return xs_sprintf("%s%s", base, rest + tl);
+    }
+    if (e->kind == E_MEMBER && !e->is_call && e->str) {
+        const char *l = member_path_text(e->lhs);
+        return l ? xs_sprintf("%s.%s", l, e->str) : NULL;
+    }
+    return NULL;
 }
 static bool cond_prim(Type *t) { return t->kind == TY_STRING || t->kind == TY_NUMBER || t->kind == TY_INT || t->kind == TY_BOOLEAN; }
 static void check_expr_in(Expr *e, Type *expected) {
@@ -6669,6 +6724,23 @@ static void check_expr_in(Expr *e, Type *expected) {
                 check_expr(e->args.items[0], ty_string);
                 expect_type(e->args.items[0], ty_string, "argument of fetch");
                 if (e->args.len == 2) {
+                    Expr *init0 = e->args.items[1];
+                    bool generic = init0->kind != E_OBJLIT;
+                    for (int i = 0; !generic && i < init0->args.len; i++)
+                        if (!strcmp(init0->keys[i], "...") || !strcmp(init0->keys[i], "redirect")) generic = true;
+                    if (generic) { /* options in a value or with spreads: xisto:url's __xs_fetch(url, init: RequestInit) */
+                        int gscheme = url_scheme(e->args.items[0]); /* (TLS by this URL: __xs_fetch's own fetch does not decide it) */
+                        if (gscheme == 1 && xs_tls_off) xs_error(XS7059, e->args.items[0]->pos, "remove --tls=off, or call the service over http://", "https URL, but the program is built with --tls=off");
+                        if (gscheme == 1 || (gscheme == -1 && !xs_tls_off)) prog->uses_tls = true;
+                        prog->uses_net = true;
+                        Expr *callee = xs_alloc(sizeof *callee);
+                        callee->kind = E_IDENT; callee->pos = e->pos; callee->field = -1; callee->str = "__xs_fetch";
+                        e->lhs = callee;
+                        e->builtin.cfn = NULL;
+                        e->args.items[0]->prechecked = true;
+                        check_expr(e, expected);
+                        return;
+                    }
                     /* the options object of the Fetch API, checked by key: method, body, headers, signal */
                     Expr *init = e->args.items[1];
                     if (init->kind != E_OBJLIT) xs_error(XS7053, init->pos, "write the options inline: fetch(url, { method: \"POST\", body })", "fetch options must be an object literal");
@@ -6736,6 +6808,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 prog->uses_net = true;
                 /* TLS is linked only when https can happen: an http:// URL (TLS ends at the load balancer) costs nothing */
                 int scheme = url_scheme(e->args.items[0]);
+                if (cur_mod && cur_mod->file && !strcmp(cur_mod->file, "xisto:url")) return; /* (__xs_fetch: its caller's URL decides TLS) */
                 if (scheme == 1 && xs_tls_off) xs_error(XS7059, e->args.items[0]->pos, "remove --tls=off, or call the service over http://", "https URL, but the program is built with --tls=off");
                 if (scheme == 1 || (scheme == -1 && !xs_tls_off)) prog->uses_tls = true;
                 return;
@@ -7496,11 +7569,16 @@ static void check_expr_in(Expr *e, Type *expected) {
                     return;
                 }
                 /* a copy of an array; a Set's values or a Map's entries (already arrays of their own) */
-                const char *m = st->kind == TY_ARRAY ? "slice" : st->kind == TY_SET ? "values" : st->kind == TY_MAP ? "entries" : NULL;
-                if (!m) xs_error(XS8093, src->pos, "Array.from takes an array, a Set or a Map", "cannot make an array from %s", ty_name(st));
+                const char *m = st->kind == TY_ARRAY ? "slice" : st->kind == TY_SET ? "values" : st->kind == TY_MAP ? "entries" : st->kind == TY_STRING ? "split" : NULL;
+                if (!m) xs_error(XS8093, src->pos, "Array.from takes an array, a Set, a Map or a string", "cannot make an array from %s", ty_name(st));
                 e->lhs = src;
                 e->str = (char *)m;
                 e->args.len = 0;
+                if (st->kind == TY_STRING) { /* Array.from(s): its characters (code points), as s.split("") gives them in xisto */
+                    Expr *empty = xs_alloc(sizeof *empty);
+                    empty->kind = E_STRING; empty->pos = e->pos; empty->field = -1; empty->str = ""; empty->type = ty_string; empty->lit_id = intern("");
+                    expr_list_push(&e->args, empty);
+                }
                 e->field = -1;
                 check_expr(e, expected);
                 return;
@@ -7737,6 +7815,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
+        if (tsc_checked() && !e->is_call && e->lhs->type && e->lhs->type->kind == TY_UNKNOWN && !ty_is_any(e->lhs->type))
+            e->lhs->type = ty_any; /* body.link on an unknown that tsc narrowed ('link' in body): read by name, as an any */
         if (ty_is_any(e->lhs->type)) { /* x.f on an any: by name, through the object's class (or a Record's key) */
             if (e->is_call) xs_error(XS2017, e->pos, "give the value its type (as SomeClass) to call its methods", "cannot call '%s' on an any: its methods are not looked up by name", e->str);
             dyn_call(e, e->op == TK_QDOT ? "xs_dyn_get_opt" : "xs_dyn_get", ty_any, e->lhs, dyn_key(e->pos, e->str), NULL);
@@ -9288,6 +9368,19 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     case E_COND: {
         if (e->builtin.cfn && strcmp(e->builtin.cfn, "optchain") == 0) { check_optchain(e, expected); return; }
+        /* typeof x.m === "string" ? x.m : "" with x any: the branch reads x.m as a string (checked), as TypeScript
+           narrows it (then string methods can be called on the result) */
+        const char *ty_path = NULL;
+        Type *ty_to = NULL;
+        {
+            Expr *c = e->lhs;
+            if (c && c->kind == E_BINARY && c->op == TK_EQ && c->lhs && c->lhs->kind == E_UNARY && c->lhs->op == TK_IDENT &&
+                c->rhs && c->rhs->kind == E_STRING) {
+                ty_to = !strcmp(c->rhs->str, "string") ? ty_string : !strcmp(c->rhs->str, "number") ? ty_number : !strcmp(c->rhs->str, "boolean") ? ty_boolean : NULL;
+                if (ty_to) ty_path = member_path_text(c->lhs->lhs);
+            }
+        }
+        const char *then_path = ty_path && e->args.len == 2 ? member_path_text(e->args.items[0]) : NULL;
         check_expr(e->lhs, NULL);
         if (e->lhs->type->kind != TY_BOOLEAN && cond_truthy_type(e->lhs->type)) make_truthy(e->lhs, "condition of '?:'");
         if (e->lhs->type->kind != TY_BOOLEAN)
@@ -9352,6 +9445,14 @@ static void check_expr_in(Expr *e, Type *expected) {
                 check_expr(b, eb && a->type->kind == TY_ARRAY ? a->type : expected);
                 pop_scope();
             }
+        }
+        if (ty_path && then_path && !strcmp(ty_path, then_path) && ty_is_any(a->type)) {
+            Expr *in = xs_alloc(sizeof *in);
+            *in = *a;
+            memset(a, 0, sizeof *a);
+            a->kind = E_AS; a->pos = in->pos; a->field = -1; a->lhs = in; a->elem_type = ty_to;
+            in->prechecked = true;
+            check_expr(a, ty_to);
         }
         if (a->type->kind == TY_LITINT && b->type->kind == TY_LITINT) {
             if (expected && is_numeric(expected)) { coerce_lit(a, expected); coerce_lit(b, expected); }
@@ -9717,6 +9818,12 @@ static bool missing_get(Expr *l) {
 static void check_nullish(Expr *e, Type *expected) {
     check_expr(e->lhs, NULL);
     settle(e->lhs);
+    {   /* s.match(/x/g) ?? []: the matches as a string[] (the empty array takes that type) */
+        Type *m = e->lhs->type;
+        if (m && m->kind == TY_NULLABLE && m->elem->kind == TY_OBJECT && m->elem->cls->builtin && !strcmp(m->elem->cls->name, "RegExpExecArray") &&
+            e->rhs && e->rhs->kind == E_ARRAY_LIT && e->rhs->args.len == 0)
+            wrap_call(e->lhs, "xs_RegExpExecArray_strings", ty_nullable_of(ty_array_of(ty_string)));
+    }
     Type *lt = e->lhs->type;
     if (lt->kind == TY_NULL) {
         Expr *r = e->rhs;

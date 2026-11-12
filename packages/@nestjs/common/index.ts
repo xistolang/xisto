@@ -292,14 +292,14 @@ export interface NestInterceptor {}
  * What an interceptor's intercept(context, next) calls to run the route: next.handle() is an Observable of the
  * route's result, which the interceptor can pipe through map, tap, catchError...
  */
-export class CallHandler {
-  private readonly next: () => unknown;
-  constructor(next: () => unknown) {
-    this.next = next;
-  }
-  handle(): Observable<unknown> {
-    return new Observable<unknown>(this.next);
-  }
+export interface CallHandler {
+  handle: () => Observable<unknown>;
+}
+
+/** (@nestjs/core: the CallHandler of an interceptor, over what runs next) */
+export function __callHandler(next: () => unknown): CallHandler {
+  const h: CallHandler = { handle: (): Observable<unknown> => new Observable<unknown>(next) };
+  return h;
 }
 export interface PipeTransform {}
 export interface ExceptionFilter {}

@@ -343,6 +343,18 @@ XS_NOINLINE xs_str *xs_crypto_hmac(xs_str *alg, xs_str *key, xs_str *data, xs_st
     xs_digest_raw(alg->data, opad, (size_t)bl, inner, (size_t)dl, out);
     return xs_digest_encode(out, dl, enc->data);
 }
+/* HMAC with a key of bytes (createHmac(alg, buffer)), over UTF-8 data, as bytes */
+XS_NOINLINE xs_Uint8Array *xs_crypto_hmac_bytes(xs_str *alg, xs_Uint8Array *key, xs_str *data) {
+    int bl = xs_digest_block(alg->data), dl = xs_digest_len(alg->data);
+    uint8_t k[128] = {0}, ipad[128], opad[128], inner[64];
+    if ((int)key->f_length > bl) xs_digest_raw(alg->data, key->data, (size_t)key->f_length, "", 0, k);
+    else memcpy(k, key->data, (size_t)key->f_length);
+    for (int i = 0; i < bl; i++) { ipad[i] = k[i] ^ 0x36; opad[i] = k[i] ^ 0x5c; }
+    xs_digest_raw(alg->data, ipad, (size_t)bl, data->data, (size_t)data->len, inner);
+    xs_Uint8Array *r = xs_u8_new(dl);
+    xs_digest_raw(alg->data, opad, (size_t)bl, inner, (size_t)dl, r->data);
+    return r;
+}
 /* the digest of bytes, as bytes (RSA padding and signatures hash binary data) */
 XS_NOINLINE xs_Uint8Array *xs_crypto_digest_bytes(xs_str *alg, xs_Uint8Array *data) {
     int dl = xs_digest_len(alg->data);

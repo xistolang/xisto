@@ -1,14 +1,15 @@
 // xisto:crypto (node:crypto): randomUUID, createHash and createHmac over md5, sha1, sha256 and sha512,
 // timingSafeEqual, randomInt/randomBytes, createCipheriv (aes-128/192/256-cbc), publicEncrypt (RSA PKCS#1 v1.5 and
 // OAEP) and createSign (RSA PKCS#1 v1.5 with SHA-1/SHA-256/SHA-512). Hash data is text (UTF-8, Node's default for
-// update(string)); a digest is text in an encoding (hex, base64, base64url, latin1): digest() with no encoding,
-// which gives a Buffer in Node, is not here. RSA keys are PEM (SPKI or PKCS#1 public, PKCS#8 or PKCS#1 private).
+// update(string)); a digest is text in an encoding (hex, base64, base64url, latin1); digest() with no encoding
+// gives a Buffer (as Node), and createHmac takes a Buffer key. RSA keys are PEM (SPKI or PKCS#1 public, PKCS#8 or PKCS#1 private).
 
 declare function crypto_uuid(): string;
 declare function crypto_supported(algorithm: string): boolean;
 declare function crypto_digest(algorithm: string, data: string, encoding: string): string;
 declare function crypto_hmac(algorithm: string, key: string, data: string, encoding: string): string;
 declare function crypto_digest_bytes(algorithm: string, data: Uint8Array): Uint8Array;
+declare function crypto_hmac_bytes(algorithm: string, key: Uint8Array, data: string): Uint8Array;
 declare function crypto_random_bytes(n: int): Uint8Array;
 
 /** A random version 4 UUID, as 36 lowercase characters (8-4-4-4-12). */
@@ -41,17 +42,34 @@ export class Hash {
     this.finished = true;
     return crypto_digest(this.algorithm, this.parts.join(""), encoding);
   }
+  // digest() with no encoding: the bytes, a Buffer (the compiler calls this for it)
+  __digestBytes(): Buffer {
+    if (this.finished) throw new Error("Digest already called");
+    this.finished = true;
+    return Buffer.from(crypto_digest(this.algorithm, this.parts.join(""), "hex"), "hex");
+  }
 }
 
 /** An HMAC being fed: update() as many times as needed, then digest() once. */
 export class Hmac {
   private algorithm: string;
   private key: string;
+  private keyBytes: Uint8Array | null = null; // (a key given as bytes: a Buffer)
   private parts: string[] = [];
   private finished: boolean = false;
-  constructor(algorithm: string, key: string) {
+  constructor(algorithm: string, key: string | Uint8Array) {
     this.algorithm = algorithm;
-    this.key = key;
+    if (typeof key === "string") {
+      this.key = key as string;
+    } else {
+      this.key = "";
+      this.keyBytes = key as Uint8Array;
+    }
+  }
+  private bytes(): Uint8Array {
+    const kb = this.keyBytes;
+    if (kb !== null) return crypto_hmac_bytes(this.algorithm, kb, this.parts.join(""));
+    return crypto_hmac_bytes(this.algorithm, Buffer.from(this.key, "utf8"), this.parts.join(""));
   }
   /** Adds data (UTF-8 text; the encoding is accepted) to what is authenticated. */
   update(data: string, inputEncoding: string = "utf8"): Hmac {
@@ -63,7 +81,14 @@ export class Hmac {
   digest(encoding: string): string {
     if (this.finished) throw new Error("Digest already called");
     this.finished = true;
+    if (this.keyBytes !== null) return Buffer.from(this.bytes()).toString(encoding);
     return crypto_hmac(this.algorithm, this.key, this.parts.join(""), encoding);
+  }
+  // digest() with no encoding: the bytes, a Buffer (the compiler calls this for it)
+  __digestBytes(): Buffer {
+    if (this.finished) throw new Error("Digest already called");
+    this.finished = true;
+    return Buffer.from(this.bytes());
   }
 }
 
@@ -73,8 +98,8 @@ export function createHash(algorithm: string): Hash {
   return new Hash(algorithm);
 }
 
-/** An HMAC of the given algorithm with key (UTF-8 text). Throws for an algorithm other than the four. */
-export function createHmac(algorithm: string, key: string): Hmac {
+/** An HMAC of the given algorithm with key (UTF-8 text, or bytes). Throws for an algorithm other than the four. */
+export function createHmac(algorithm: string, key: string | Uint8Array): Hmac {
   if (!crypto_supported(algorithm)) throw new Error("Invalid digest: " + algorithm);
   return new Hmac(algorithm, key);
 }

@@ -643,6 +643,7 @@ typedef struct {
     bool reexport;     /* export { a, b } from "m" / export * from "m": the names are this module's exports too */
     bool star;         /* export * from "m": every name m exports (names is empty) */
     char **as_names;   /* export { a as b } from "m": the name each entry is exported under here (NULL: its own name) */
+    bool *qualified;   /* import { A as B } next to another import of A: B reads as "A\x01m", A is not visible plainly from here */
 } Import;
 
 struct Module {

@@ -21,6 +21,17 @@ const rb: Response = await fetch("http://127.0.0.1:8080/echo", { method: "POST",
 const eb: Echo = JSON.parse(Buffer.from(await rb.arrayBuffer()).toString("utf8"));
 console.log("bytes body:", rb.status, eb.token, eb.body.name, rb.url);
 await rb.body?.cancel(); // (read whole already: nothing to cancel)
+// the options in a value (RequestInit) and spread with headers of their own, as a service builds them
+const opts: RequestInit = { method: "POST", headers: { "X-Token": "init" }, body: JSON.stringify(item) };
+const ri: Response = await fetch("http://127.0.0.1:8080/echo", { ...opts, headers: { "Content-Type": "application/json", ...opts.headers } });
+const ei: Echo = JSON.parse(await ri.text());
+const plainInit: RequestInit = {};
+const rp: Response = await fetch("http://127.0.0.1:8080/slow?ms=1", plainInit);
+console.log("init:", ri.status, ei.method, ei.token, ei.body.id, rp.status, await rp.text());
+// bytes and redirect in the options of a relay (written in place, with an option fetch takes in a value)
+const rr: Response = await fetch("http://127.0.0.1:8080/echo", { method: "POST", headers: { "X-Token": "relay" }, body: new Uint8Array(Buffer.from(JSON.stringify(item))), redirect: "error" });
+const er: Echo = JSON.parse(await rr.text());
+console.log("relay:", rr.status, er.token, er.body.name);
 try {
   const late: Response = await fetch("http://127.0.0.1:8080/slow?ms=600", { signal: AbortSignal.timeout(100) });
   console.log("no timeout?", late.status);
