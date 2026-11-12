@@ -9791,7 +9791,22 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         bool lit_as = e->lhs->kind == E_OBJLIT && tsc_checked();
         if (lit_as) objlit_as_cast++; /* ({ ... } as Dto): TypeScript lets the cast leave fields out */
-        check_expr(e->lhs, want);
+        bool via_unknown = e->lhs->kind == E_AS && e->lhs->op != TK_NOT && e->lhs->elem_type && e->lhs->elem_type->kind == TY_UNKNOWN &&
+                           !ty_is_any(e->lhs->elem_type) && e->lhs->lhs && e->lhs->lhs->kind != E_OBJLIT;
+        if (via_unknown && tsc_checked()) {
+            /* driver as unknown as { oracle: X } with driver an object of a class: TypeScript's cast checks nothing, and
+               JavaScript reads the fields from the object by name; as `as any as`, the view read by name */
+            Type *wb = ty_strip_null(want);
+            Expr *x = e->lhs->lhs;
+            check_expr(x, NULL); /* (checked once here: its type decides) */
+            x->prechecked = true;
+            Type *st = x->type ? ty_strip_null(x->type) : NULL;
+            if (st && st->kind == TY_OBJECT && !st->cls->builtin && !st->cls->is_interface && !made_shape(st->cls) &&
+                wb->kind == TY_OBJECT && (wb->cls->is_interface || made_shape(wb->cls)) && wb->cls->nfields > 0 &&
+                !wb->cls->nmethods && !wb->cls->iface_methods && !is_subclass(st->cls, wb->cls))
+                e->lhs->elem_type = ty_any;
+        }
+        check_expr(e->lhs, via_unknown ? NULL : want); /* (x as unknown as I: the unknown first, then I from it, as with a variable) */
         if (lit_as) objlit_as_cast--;
         Expr *v = e->lhs;
         if (v->type->kind == TY_LITINT && is_numeric(want)) coerce_lit(v, want);

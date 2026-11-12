@@ -85,6 +85,9 @@ async function main(): Promise<void> {
   console.log("rows " + rs.map((r) => String(r.CD_PLANO) + "=" + r.DS_PLANO).join(" "));
 
   const qr = ds.createQueryRunner();
+  // node-oracledb's constants through TypeORM's driver, as an app reads them for OUT binds
+  const od = (qr.connection.driver as unknown as { oracle: { BIND_OUT: number; STRING: unknown; NUMBER: unknown } }).oracle;
+  console.log("driver.oracle BIND_OUT " + String(od.BIND_OUT) + " STRING given " + String(od.STRING != null) + " NUMBER given " + String(od.NUMBER != null));
   await qr.startTransaction();
   await qr.query("UPDATE TB_PLANO SET DS_PLANO = :1 WHERE CD_PLANO = :2", ["x", 10]);
   await qr.manager.getRepository<Plano>(Plano).delete({ id: 11 });
