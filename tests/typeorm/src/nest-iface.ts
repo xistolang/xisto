@@ -83,7 +83,34 @@ class Admin {
   }
 }
 
-@Module({ providers: [RealEngine, { provide: ENGINE, useExisting: RealEngine }, Worker, Admin] })
+// the same with a parameter optional in the contract and required in the method, and an enum where a number goes
+enum St {
+  OK = 0,
+  BAD = 1,
+}
+type InvoiceResult = { status: St; message: string | null };
+interface BoletoLike {
+  listar(beneficiario?: unknown): Promise<unknown[]>;
+  verifica(cd?: number): Promise<{ status: number; message?: string | null }>;
+}
+@Injectable()
+class BoletoReal {
+  async verifica(cd: number, ctx?: JobInput): Promise<InvoiceResult> {
+    return { status: St.BAD, message: "m" + String(cd) };
+  }
+}
+@Injectable()
+class Wizard {
+  constructor(@Inject("Boleto") private readonly boleto?: BoletoLike) {}
+  async run(): Promise<string> {
+    const b = this.boleto;
+    if (!b) return "none";
+    const r = await b.verifica(5);
+    return `status ${r.status} ${r.message ?? "-"}`;
+  }
+}
+
+@Module({ providers: [RealEngine, { provide: ENGINE, useExisting: RealEngine }, Worker, Admin, BoletoReal, { provide: "Boleto", useExisting: BoletoReal }, Wizard] })
 class AppModule {}
 
 async function main(): Promise<void> {
@@ -93,5 +120,6 @@ async function main(): Promise<void> {
   console.log(await w.tick(1));
   console.log(await w.tick(2));
   console.log(await (app.get(Admin) as Admin).run());
+  console.log(await (app.get(Wizard) as Wizard).run());
 }
 main();

@@ -12455,6 +12455,8 @@ static bool conv_ok(Type *from, Type *to, int depth) {
     if (ty_is_any(to) || to->kind == TY_UNKNOWN) return true;
     if (from->kind == TY_LITINT && is_numeric(to)) return true;
     if (from->kind == TY_INT && to->kind == TY_NUMBER) return true;
+    if (from->kind == TY_ENUM && from->en && ((!from->en->is_string && is_numeric(to)) || (from->en->is_string && to->kind == TY_STRING && !to->tname)))
+        return true; /* (status: St where a number goes: its value) */
     if (to->kind == TY_NULLABLE) {
         if (from->kind == TY_NULL) return true;
         if (from->kind == TY_NULLABLE) /* (a primitive's null is its own: only objects convert inside T | null) */
@@ -12554,6 +12556,9 @@ static bool method_fits(Func *cm, Func *im, Class *src, Class *ifc, bool infer, 
     for (int k = 0; k < n; k++) {
         Param *cp = &cm->params[k], *ip = &im->params[k];
         bool ok = (cp->rest || ip->rest) ? cp->rest == ip->rest && ty_equal(cp->type, ip->type) : conv_ok(ip->type, cp->type, depth);
+        if (!ok && ad_partial_cls && !cp->rest && !ip->rest && ip->type->kind == TY_NULLABLE && conv_ok(ip->type->elem, cp->type, depth))
+            ok = true; /* (x?: number where the method takes number: TypeScript's method bivariance; a null passed is a TypeError
+                          at the call, see make_adapter) */
         if (!ok) {
             if (why) *why = xs_sprintf("parameter '%s' of %s.%s is %s, but %s.%s passes %s", cp->name, cn, mn, ad_tname(cp->type), iname, mn, ad_tname(ip->type));
             return false;
@@ -12691,6 +12696,12 @@ static Class *make_adapter(Class *src, Class *ifc) {
             c1->kind = E_MEMBER; c1->pos = f->pos; c1->field = -1; c1->is_call = true; c1->lhs = ad_this_t(f->pos); c1->str = im->name;
             for (int i = 0; i < upto; i++) {
                 Expr *x = ad_ident(f->pos, f->params[i].name);
+                if (cm && i < cm->nparams && !im->params[i].rest && im->params[i].type->kind == TY_NULLABLE && cm->params[i].type &&
+                    cm->params[i].type->kind != TY_NULLABLE && cm->params[i].type->kind != TY_UNKNOWN && !cm->params[i].dflt) {
+                    Expr *nn = xs_alloc(sizeof *nn); /* (x!: the method takes no null; see method_fits) */
+                    nn->kind = E_AS; nn->op = TK_NOT; nn->pos = f->pos; nn->field = -1; nn->lhs = x;
+                    x = nn;
+                }
                 if (im->params[i].rest) { /* ...xs passed on spread */
                     Expr *sp = xs_alloc(sizeof *sp);
                     sp->kind = E_UNARY; sp->op = TK_ELLIPSIS; sp->pos = f->pos; sp->field = -1; sp->lhs = x;
