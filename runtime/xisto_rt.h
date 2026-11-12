@@ -2684,6 +2684,18 @@ XS_NOINLINE void xs_as_fail(const char *what) {
     snprintf(buf, sizeof buf, "TypeError: the value is not %s", what);
     xs_panic(buf);
 }
+/* v as C<B>: the object of C<B> or of another instance of C with the same layout (n free functions to compare) */
+XS_NOINLINE void *xs_as_ref_n(void *v, int nullable, const char *what, int n, ...) {
+    if (!v) { if (nullable) return NULL; xs_as_fail(what); }
+    void (*f)(void *) = xs_type_of(v)->free;
+    va_list ap;
+    va_start(ap, n);
+    bool ok = false;
+    for (int i = 0; i < n && !ok; i++) ok = va_arg(ap, void (*)(void *)) == f;
+    va_end(ap);
+    if (!ok) xs_as_fail(what);
+    return v;
+}
 XS_NOINLINE void *xs_as_ref(void *v, void (*free_fn)(void *), int nullable, const char *what) {
     if (!v) { if (nullable) return NULL; xs_as_fail(what); }
     if (xs_type_of(v)->free != free_fn) xs_as_fail(what);

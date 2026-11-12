@@ -1094,6 +1094,7 @@ static const char *dispatcher(Func *m) {
     return name;
 }
 
+bool same_layout_instances(Class *a, Class *b);
 static void emit_expr(Expr *e);
 
 /* The caller takes ownership of the result (+1). */
@@ -2577,6 +2578,15 @@ static char *from_unknown(Type *t, const char *expr) {
         const char *fr = strcmp(b->cls->name, "Error") == 0 ? "xs_Error_free" : xs_sprintf("%s_free", b->cls->cname);
         if (strcmp(b->cls->cname, "xs_Uint8Array") == 0) fr = "xs_u8_free"; /* (Buffer too: the same free, another print) */
         else if (strcmp(b->cls->cname, "xs_Float64Array") == 0) fr = "xs_f64_free";
+        if (b->cls->generic_of) { /* Repository<B> takes a Repository<A> of the same layout too (the same object) */
+            Buf alts = {0};
+            int na = 0;
+            for (int i = 0; i < prog->nclasses; i++) {
+                Class *k = prog->classes[i];
+                if (k != b->cls && k->used && k->cname && same_layout_instances(k, b->cls)) { buf_printf(&alts, ", %s_free", k->cname); na++; }
+            }
+            if (na) return xs_sprintf("((%s)xs_as_ref_n(%s, %d, \"%s\", %d, %s%s))", ctype(b), expr, nul, what, na + 1, fr, alts.data);
+        }
         return xs_sprintf("((%s)xs_as_ref(%s, %s, %d, \"%s\"))", ctype(b), expr, fr, nul, what);
     }
     case TY_ARRAY: {

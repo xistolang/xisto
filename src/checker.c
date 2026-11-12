@@ -5695,6 +5695,16 @@ static bool overload_typed(Expr *e, Func *f, ExprList *written) {
     return true;
 }
 /* the shape reads of a cast (see the cases inside); true when e became one */
+/* Repository<A> where Repository<B> goes: two instances of one generic class whose fields do not depend on the type
+   parameter (the same layout, field by field): the same object, no copy (the type parameter is TypeScript's only) */
+bool same_layout_instances(Class *a, Class *b) {
+    if (!a || !b || a == b || !a->generic_of || a->generic_of != b->generic_of || a->nfields != b->nfields) return false;
+    for (int i = 0; i < a->nfields; i++) {
+        if (strcmp(a->fields[i].name, b->fields[i].name) != 0) return false;
+        if (!a->fields[i].type || !b->fields[i].type || !ty_equal(a->fields[i].type, b->fields[i].type)) return false;
+    }
+    return true;
+}
 static bool shape_probe(Expr *e, Expr *v, Type *want) {
     { /* (e as { cause?: unknown } | null)?.cause with e an Error: the shape read from the object by name (undefined where
          it has no such field); (s as { valueOf(): string }).valueOf() with s a string: the string itself (null: TypeError
@@ -9065,6 +9075,15 @@ static void check_expr_in(Expr *e, Type *expected) {
             to_json(e);
             if (want->kind == TY_NULLABLE) e->type = want;
             return;
+        }
+        { /* repo as Repository<B> with repo a Repository<A> of the same layout: the same object */
+            Type *vb = ty_strip_null(v->type), *wb = ty_strip_null(want);
+            if (vb->kind == TY_OBJECT && wb->kind == TY_OBJECT && same_layout_instances(vb->cls, wb->cls) &&
+                (v->type->kind != TY_NULLABLE || want->kind == TY_NULLABLE)) {
+                *e = *v;
+                upcast(e, want);
+                return;
+            }
         }
         if (want->kind == TY_NULLABLE && is_numeric(want->elem) && is_numeric(v->type)) { /* n as number | null with n an int */
             *e = *v;

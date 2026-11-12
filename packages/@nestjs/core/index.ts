@@ -423,6 +423,13 @@ function construct(ci: ClassInfo, depth: int): unknown {
       args.push(value);
       continue;
     }
+    // a provider of that token (MongooseModule's model): its instance itself, a Model<X> of another instance of the
+    // generic class (the same layout) taken as the parameter's Model<Y>; the JSON decode only without one (TypeOrmModule's
+    // repositories have no provider)
+    if (typeof token === "string" && (container.instances.get(tokenKey(token)) !== null || container.entries.get(tokenKey(token)) !== null)) {
+      args.push(resolveToken(token, optional, ci.name, p.index, depth));
+      continue;
+    }
     const json = __jsonValues.get(key);
     if (json !== null) {
       args.push(p.type.decode(json));
