@@ -29,3 +29,8 @@ console.log(h.handle());
 const req: { url: string } = { url: '/x' };
 const ctx2 = { switchToHttp: () => ({ getRequest: () => req }) } as unknown as Ctx;
 console.log((ctx2.switchToHttp().getRequest() as { url: string }).url);
+function fmt(srv?: string, rs?: string): string {
+  const parts = [`hosts=a`, srv ? `srv=${srv}` : undefined, `rs=${rs ?? '-'}`].filter((p): p is string => Boolean(p));
+  return parts.join(' ');
+}
+console.log(fmt(), fmt('x', 'y'));

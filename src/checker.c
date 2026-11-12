@@ -2202,6 +2202,17 @@ static void check_spread_lit(Expr *e, Type *elem) {
             elem = ets[0];
         }
     }
+    if (elem && elem->kind != TY_NULLABLE && ty_is_heap(elem)) { /* [`a=${x}`, c ? `b=${y}` : undefined]: (string | undefined)[], as
+                                                                    TypeScript types it (not a null check on each element) */
+        bool nul = false;
+        for (int i = 0; i < e->args.len; i++) {
+            Expr *a = e->args.items[i];
+            if (a->kind == E_UNARY && a->op == TK_ELLIPSIS) continue;
+            Type *t = ets[i];
+            if (t && (t->kind == TY_NULL || ty_is_undef(t) || (t->kind == TY_NULLABLE && ty_equal(t->elem, elem)))) nul = true;
+        }
+        if (nul && nullable_ok(elem)) elem = ty_nullable_of(elem);
+    }
     for (int i = 0; i < e->args.len; i++) {
         Expr *a = e->args.items[i];
         if (a->kind == E_UNARY && a->op == TK_ELLIPSIS) {
@@ -9370,6 +9381,15 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (!elem) {
                 settle(e->args.items[0]);
                 elem = e->args.items[0]->type;
+            }
+            if (elem->kind != TY_NULLABLE && ty_is_heap(elem) && nullable_ok(elem)) { /* [`a=${x}`, c ? `b=${y}` : undefined]:
+                                                (string | undefined)[], as TypeScript types it (no null check on each element) */
+                bool nul = false;
+                for (int i = 0; i < e->args.len; i++) {
+                    Type *t = e->args.items[i]->type;
+                    if (t->kind == TY_NULL || (t->kind == TY_NULLABLE && ty_equal(t->elem, elem))) nul = true;
+                }
+                if (nul) elem = ty_nullable_of(elem);
             }
         }
         for (int i = 0; i < e->args.len; i++) expect_type(e->args.items[i], elem, "array element");
