@@ -598,6 +598,8 @@ struct Class {
     char *mixin_call;    /* class X extends F(args) (F a class with a static __mixin, e.g. PassportStrategy(Strategy, "jwt")):
                             X extends F, and F.__mixin(args) runs as a class decorator on X */
     bool mixin_done;
+    struct Class *view_of; /* an interface of optional fields used as a view of an open class (AuditableRequest of Express's
+                              Request): that class itself wherever the interface is named (checker) */
     bool fake;           /* { m: () => ... } as C: an object literal standing for a class with methods (no super(...)) */
     bool as_value;       /* class { ... } written as an expression: a value (its ClassInfo), like a decorated class */
 };

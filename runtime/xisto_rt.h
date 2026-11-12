@@ -1966,6 +1966,7 @@ typedef struct xs_map {
     bool compact; /* a Map<int, int> whose keys and values all fit in 32 bits so far: 8-byte slots (key low, value
                      high), read only by the counting idiom (xs_map_add_i) and put; anything else widens it first */
     int val_kind; /* 0 num, 1 int, 2 bool, 3 heap pointer */
+    bool ukeys;   /* a Set<unknown>: string keys made from the elements (SameValueZero), each entry's value the element */
     void (*print_key)(void *);
     void (*print_val)(void *);
     xs_str *lk;   /* the last string key hashed, held, and its hash: has(k), get(k), set(k, ...) in a row hash once */
@@ -2098,7 +2099,8 @@ static void xs_print_map(void *p) {
     XS_MAP_EACH(m, e) {
         xs_insp_entry(&fr);
         if (shown++ == 100) { fprintf(XS_OUT, "... %zu more item%s", m->count - 100, m->count - 100 == 1 ? "" : "s"); break; }
-        if (m->str_keys) m->print_key(e->skey); else m->print_key(&e->ikey);
+        if (m->ukeys) { if (e->val.p) m->print_val(e->val.p); else fputs("null", XS_OUT); }
+        else if (m->str_keys) m->print_key(e->skey); else m->print_key(&e->ikey);
         if (m->is_map) {
             fputs(" => ", XS_OUT);
             if (m->val_kind == 3) { if (e->val.p) m->print_val(e->val.p); else fputs("null", XS_OUT); }
@@ -2617,8 +2619,65 @@ static void *xs_box_int(int64_t v) { xs_box_i *b = xs_obj_alloc(sizeof *b, xs_bo
 static void *xs_box_num(double v) { xs_box_d *b = xs_obj_alloc(sizeof *b, xs_box_num_free, xs_box_num_print); b->v = v; return b; }
 static void *xs_box_bool(bool v) { xs_box_i *b = xs_obj_alloc(sizeof *b, xs_box_bool_free, xs_box_bool_print); b->v = v; return b; }
 static void *xs_box_int_or_null(int64_t v) { return v == XS_NULL_INT ? NULL : xs_box_int(v); }
+static inline double xs_num_of_int_or_null(int64_t v) { return v == XS_NULL_INT ? xs_null_num() : (double)v; }
 static void *xs_box_num_or_null(double v) { return xs_isnull_num(v) ? NULL : xs_box_num(v); }
 static void *xs_box_bool_or_null(int8_t v) { return v == XS_NULL_BOOL ? NULL : xs_box_bool(v != 0); }
+/* Set<unknown>: JavaScript's SameValueZero as a string key: strings and numbers by value (an int and a number of one
+   value are one; NaN equals NaN; -0 is 0), booleans, null, and any other object by identity */
+static void xs_str_free(void *p);
+XS_NOINLINE xs_str *xs_uset_key(void *v) {
+    char buf[64];
+    if (!v) return xs_str_new("z", 1);
+    void (*f)(void *) = xs_type_of(v)->free;
+    if (f == xs_str_free) {
+        xs_str *sv = v;
+        size_t n = (size_t)sv->len;
+        char *b = malloc(n + 2);
+        b[0] = 's';
+        memcpy(b + 1, sv->data, n);
+        xs_str *r = xs_str_new(b, n + 1);
+        free(b);
+        return r;
+    }
+    if (f == xs_box_int_free || f == xs_box_num_free) {
+        double d = f == xs_box_int_free ? (double)((xs_box_i *)v)->v : ((xs_box_d *)v)->v;
+        if (d != d) return xs_str_new("nNaN", 4);
+        if (d == 0) d = 0; /* (-0 is 0) */
+        int n = snprintf(buf, sizeof buf, "n%.17g", d);
+        return xs_str_new(buf, (size_t)n);
+    }
+    if (f == xs_box_bool_free) return xs_str_new(((xs_box_i *)v)->v ? "bt" : "bf", 2);
+    int n = snprintf(buf, sizeof buf, "p%p", v);
+    return xs_str_new(buf, (size_t)n);
+}
+static void xs_print_any_quoted(void *p);
+static xs_map *xs_map_new(int is_map, int str_keys, int val_kind, void (*print_key)(void *), void (*print_val)(void *));
+static xs_map *xs_map_put(xs_map *m, xs_str *skey, int64_t ikey, xs_val v);
+static xs_map_entry *xs_map_lookup(xs_map *m, xs_str *skey, int64_t ikey);
+static bool xs_map_delete_at(xs_map *m, xs_map_entry *e);
+XS_NOINLINE xs_map *xs_uset_new(void) {
+    xs_map *m = xs_map_new(0, 1, 3, xs_print_str_quoted_, xs_print_any_quoted);
+    m->ukeys = true;
+    return m;
+}
+XS_NOINLINE xs_map *xs_uset_add(xs_map *m, void *v) { /* (an element already there keeps its place, as JavaScript's) */
+    xs_str *k = xs_uset_key(v);
+    if (!xs_map_lookup(m, k, 0)) xs_map_put(m, k, 0, XS_VPTR(v ? xs_retain_(v) : NULL));
+    xs_release(k);
+    return m;
+}
+XS_NOINLINE bool xs_uset_has(xs_map *m, void *v) {
+    xs_str *k = xs_uset_key(v);
+    bool r = xs_map_lookup(m, k, 0) != NULL;
+    xs_release(k);
+    return r;
+}
+XS_NOINLINE bool xs_uset_delete(xs_map *m, void *v) {
+    xs_str *k = xs_uset_key(v);
+    bool r = xs_map_delete_at(m, xs_map_lookup(m, k, 0));
+    xs_release(k);
+    return r;
+}
 static void xs_print_closure(void *p);
 XS_NOINLINE void xs_as_fail(const char *what) {
     static XS_TLS char buf[160];

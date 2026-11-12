@@ -16,7 +16,7 @@ count 2 1
 upsert OP1 ana@x.com 2
 update 3
 old 3
-  raw profiles {"_id":"id3","operador":"OP1","base":"BASE","__v":0,"classe":4,"createdAt":"NOW","email":"ana@x.com","updatedAt":"NOW"}
+  raw profiles (sorted) {"__v":0,"_id":"id3","base":"BASE","classe":4,"createdAt":"NOW","email":"ana@x.com","operador":"OP1","updatedAt":"NOW"}
 updateOne {"acknowledged":true,"modifiedCount":0,"upsertedId":"id4","upsertedCount":1,"matchedCount":0}
 updateMany {"acknowledged":true,"modifiedCount":2,"upsertedId":null,"upsertedCount":0,"matchedCount":2}
 duplicate MongoServerError E11000 duplicate key error collection: xisto_live_test.profiles index: operador_1_base_1 dup key: { operador: "OP1", base: "BASE" }
