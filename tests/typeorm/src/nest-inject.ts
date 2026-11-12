@@ -1,7 +1,8 @@
 // TypeOrmModule.forRootAsync with inject: [ConfigService]: the factory runs when the application starts and sees the config (no database needed: the DataSource connects on its first query)
-import { Module } from "@nestjs/common";
+// A namespace ConfigModule.forRoot loads is also a provider under its KEY (@Inject(databaseConfig.KEY)), as in Nest.
+import { Inject, Injectable, Module } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
-import { ConfigModule, ConfigService, registerAs } from "@nestjs/config";
+import { ConfigModule, ConfigService, ConfigType, registerAs } from "@nestjs/config";
 import { TypeOrmModule, TypeOrmModuleOptions } from "@nestjs/typeorm";
 
 const databaseConfig = registerAs("database", (): TypeOrmModuleOptions => ({
@@ -13,7 +14,13 @@ const databaseConfig = registerAs("database", (): TypeOrmModuleOptions => ({
   serviceName: "FREEPDB1",
 }));
 
+@Injectable()
+class DbInfo {
+  constructor(@Inject(databaseConfig.KEY) readonly db: ConfigType<typeof databaseConfig>) {}
+}
+
 @Module({
+  providers: [DbInfo],
   imports: [
     ConfigModule.forRoot({ isGlobal: true, load: [databaseConfig] }),
     TypeOrmModule.forRootAsync({
@@ -32,3 +39,4 @@ class AppModule {}
 const app = NestFactory.create(AppModule);
 app.init();
 console.log("init done");
+console.log("by KEY", (app.get(DbInfo) as DbInfo).db.host);
