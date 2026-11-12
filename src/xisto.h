@@ -712,6 +712,7 @@ typedef struct {
     bool uses_gen;     /* generators: the coroutine runtime, without worker threads (plain globals, no TLS) */
     bool uses_sqlite;
     bool uses_regex;    /* RegExp: runtime/xisto_regex.h joins the program */
+    bool uses_rebt; /* a RegExp that needs backtracking (or one built from text at run time): runtime/xisto_regex_bt.h joins */
     bool uses_plain; /* Object.getPrototypeOf(u) of an unknown: xs_is_plain, by the value's class (emitted only then) */
     bool uses_clone; /* structuredClone: a copy by the value's class at run time (emitted only then) */
     bool uses_v8, uses_unk_map, uses_symbol_for, uses_nkey, uses_okmap; /* xisto:v8, x instanceof Map/Set of an unknown, Symbol.for: their runtime joins the program */
