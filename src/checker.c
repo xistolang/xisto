@@ -4274,6 +4274,8 @@ static bool checking_generated; /* the compiler's own code (reflection adapters)
 static void check_access(int access, Class *owner, const char *name, Pos pos) {
     if (!access || !owner || checking_generated) return;
     Class *in = cur_class ? cur_class : cur_func ? (cur_func->cls ? cur_func->cls : cur_func->static_of) : NULL;
+    if (in && in != owner && (in->generic_of ? in->generic_of : in) == (owner->generic_of ? owner->generic_of : owner))
+        in = owner; /* Query<L, T> written in Query<R, T>'s code (lean()): one class for TypeScript, two instances here */
     if (access == 2 && in != owner)
         xs_error(XS8055, pos, xs_sprintf("use it inside %s, or make it public", owner->name), "'%s' is private to %s", name, owner->name);
     if (access == 1 && !(in && is_subclass(in, owner)))
