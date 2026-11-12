@@ -121,9 +121,16 @@ static bool gives_name(Module *via, Module *from, const char *name, int depth) {
 /* True when `name` is imported by the current module from `from` (directly, or through a module that re-exports it). */
 static bool imports_name(Module *m, Module *from, const char *name) {
     if (!m) return false;
+    const char *q = strchr(name, '\x01'); /* "A\x01m": the A that the import from "m" gives (an alias, XB-117) */
+    size_t nl = q ? (size_t)(q - name) : strlen(name);
     for (int i = 0; i < m->nimports; i++)
-        for (int k = 0; k < m->imports[i].n; k++)
-            if (strcmp(m->imports[i].names[k], name) == 0 && gives_name(m->imports[i].from, from, name, 0)) return true;
+        for (int k = 0; k < m->imports[i].n; k++) {
+            Import *im = &m->imports[i];
+            if (strlen(im->names[k]) != nl || strncmp(im->names[k], name, nl) != 0) continue;
+            if (q ? (!im->path || strcmp(im->path, q + 1) != 0) : (im->qualified && im->qualified[k])) continue;
+            char *plain = q ? xs_strndup(name, nl) : (char *)name;
+            if (gives_name(im->from, from, plain, 0)) return true;
+        }
     return false;
 }
 
@@ -352,6 +359,15 @@ static bool wt_imports(Module *m, const char *name) {
 }
 /* Classes visible from the current module: its own, the ones it imports, and the built-ins. */
 static Class *find_class(const char *name) {
+    const char *q = strchr(name, '\x01'); /* "A\x01m": the class A of the import from "m" (an alias next to another A, XB-117) */
+    if (q) {
+        char *base = xs_strndup(name, (size_t)(q - name));
+        SYM_EACH(classes_by_name, base, e) {
+            Class *c = e->decl;
+            if (c->exported && imports_name(cur_mod, c->mod, name)) return c;
+        }
+        return NULL;
+    }
     SYM_EACH(classes_by_name, name, e) {
         Class *c = e->decl;
         if (c->mod == cur_mod || (c->exported && imports_name(cur_mod, c->mod, name))) return c;
@@ -1821,6 +1837,15 @@ static const char *this_cname(void) {
 }
 
 static Func *lookup_func(const char *name) {
+    const char *q = strchr(name, '\x01'); /* "f\x01m": the function f of the import from "m" (XB-117) */
+    if (q) {
+        char *base = xs_strndup(name, (size_t)(q - name));
+        SYM_EACH(funcs_by_name, base, e) {
+            Func *f = e->decl;
+            if (f->exported && imports_name(cur_mod, f->mod, name)) return f;
+        }
+        return NULL;
+    }
     SYM_EACH(funcs_by_name, name, e) {
         Func *f = e->decl;
         if (f->mod == cur_mod || (f->exported && imports_name(cur_mod, f->mod, name))) return f;
