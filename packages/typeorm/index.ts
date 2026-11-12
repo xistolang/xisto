@@ -1239,13 +1239,15 @@ export class Repository<T> {
     this.sessionId = sessionId;
   }
 
-  // (an entity given by name, manager.update("TB_X", ...): its metadata, not T's)
-  __fixed: EntityMetadata | null = null;
+  // (an entity given by name, manager.update("TB_X", ...): its metadata, not T's. Its name, not the metadata
+  // itself: a Repository<X> constructor parameter is decoded from the repository's JSON, and the metadata holds
+  // functions (a relation's target), which JSON cannot carry)
+  __fixedName?: string;
 
   get metadata(): EntityMetadata {
-    const f = this.__fixed;
-    if (f !== null) {
-      return f;
+    const fixed = this.__fixedName ?? "";
+    if (fixed.length > 0) {
+      return metadataByName(fixed);
     }
     return metadataById(__reflect_typeid(T), __reflect_typeid(T));
   }
@@ -2201,7 +2203,7 @@ export class EntityManager {
   getRepository<T>(entity: EntityTarget<T>): Repository<T> {
     const repo = new Repository<T>(this.executor.dataSource.options.name ?? "default", this.executor.sessionId);
     if (typeof entity === "string") {
-      repo.__fixed = metadataByName(entity as string); // (an entity given by its name or its table)
+      repo.__fixedName = metadataByName(entity as string).name; // (an entity given by its name or its table)
     }
     return repo;
   }
