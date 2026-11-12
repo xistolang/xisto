@@ -7,7 +7,7 @@
  */
 export class IncomingHttpHeaders {
   authorization?: string;
-  /** (the other headers: an open class, read by name) */
+  /** (every header by name, authorization too: an open class, read by name) */
   __expando: Record<string, any> = {};
 }
 
@@ -35,6 +35,7 @@ export class Request {
   /** Sets a header as it arrived (the framework calls this while building the request). */
   setHeaderValue(name: string, value: string): void {
     this.all.set(name.toLowerCase(), value);
+    this.headers.__expando[name.toLowerCase()] = value;
     if (name.toLowerCase() === "authorization") {
       this.headers.authorization = value;
     }
@@ -47,9 +48,8 @@ export class Request {
       const v = source.header(name);
       if (name === "authorization") {
         this.headers.authorization = v;
-      } else {
-        this.headers.__expando[name] = v;
       }
+      this.headers.__expando[name] = v; // (all of them: a copy into a Record reads this)
     }
   }
 
