@@ -43,6 +43,14 @@ async function ctx(req: HttpRequest): Promise<HttpResponse> {
   });
 }
 
+// redirects that fetch follows: to a path on the same host, and a 303 after a POST (goes on as a GET)
+function redir(req: HttpRequest): HttpResponse {
+  return HttpResponse.status(302, "").header("Location", "/slow?ms=1");
+}
+function seeOther(req: HttpRequest): HttpResponse {
+  return HttpResponse.status(303, "").header("Location", "http://127.0.0.1:8080/redir");
+}
+
 const app: Server = new Server();
 app.get("/wait", wait);
 app.post("/publish", publish);
@@ -50,4 +58,6 @@ app.post("/echo", echo);
 app.get("/slow", slow);
 app.get("/ctx", ctx);
 app.get("/abortfetch", abortFetch);
+app.get("/redir", redir);
+app.post("/seeother", seeOther);
 app.listen(8080);

@@ -1543,14 +1543,14 @@ typedef struct {
 typedef struct { char method[8]; xs_str *path; xs_handler fn; xs_route_metrics m; } xs_route;
 typedef struct xs_Server { xs_hdr hdr; xs_route *routes; int nroutes, cap; void *cred; } xs_Server;
 
-static void xs_Response_free(void *p) { xs_release(((xs_Response *)p)->body); xs_release(((xs_Response *)p)->f_url); if (((xs_Response *)p)->f_headers) xs_release(((xs_Response *)p)->f_headers); xs_obj_free(p); }
+static void xs_Response_free(void *p) { xs_release(((xs_Response *)p)->body); if (((xs_Response *)p)->f_url) xs_release(((xs_Response *)p)->f_url); if (((xs_Response *)p)->f_headers) xs_release(((xs_Response *)p)->f_headers); xs_obj_free(p); }
 static void xs_Response_print(void *p) { fprintf(XS_OUT, "Response { status: %lld, ok: %s }", (long long)((xs_Response *)p)->f_status, ((xs_Response *)p)->f_ok ? "true" : "false"); }
 static xs_str *xs_Response_text(xs_Response *r) { return xs_retain(r->body); }
-/* res.arrayBuffer(): the body's bytes (a Buffer.from(...) of it is what code does with it) */
+/* response.arrayBuffer(): the body's bytes (a Uint8Array: what Buffer.from and new Uint8Array take) */
 XS_NOINLINE xs_Uint8Array *xs_Response_arrayBuffer(xs_Response *r) {
-    xs_Uint8Array *a = xs_u8_new(r->body->len);
-    if (r->body->len) memcpy(a->data, r->body->data, (size_t)r->body->len);
-    return a;
+    xs_Uint8Array *b = xs_u8_raw(r->body->len, false, false);
+    if (r->body->len) memcpy(b->data, r->body->data, (size_t)r->body->len);
+    return b;
 }
 
 static void xs_HttpRequest_free(void *p) {
@@ -2061,7 +2061,53 @@ XS_NOINLINE void xs_fetch_aborted(int kind) {
     xs_fetch_fail_named("AbortError", "This operation was aborted");
 }
 
+XS_NOINLINE xs_Response *xs_fetch_once(xs_str *url, xs_str *method, xs_str *body, int nh, xs_str **hdrs, int64_t timeout_ms, xs_Uint8Array *abort);
+/* redirects are followed as fetch does (redirect: "follow", at most 20): 303, and 301/302 after a POST, go on as a GET
+   without a body; response.url is the URL of the last request */
 XS_NOINLINE xs_Response *xs_fetch_full(xs_str *url, xs_str *method, xs_str *body, int nh, xs_str **hdrs, int64_t timeout_ms, xs_Uint8Array *abort) {
+    /* (the URLs of the redirects go to the autorelease pool: a timeout or an abort thrown from a hop leaks nothing) */
+    xs_str *cur = url, *m = method, *b = body;
+    for (int hops = 0;; hops++) {
+        xs_Response *r = xs_fetch_once(cur, m, b, nh, hdrs, timeout_ms, abort);
+        int64_t st = r->f_status;
+        xs_map_entry *loc = NULL;
+        if ((st == 301 || st == 302 || st == 303 || st == 307 || st == 308) && r->f_headers) {
+            xs_str *lk = xs_str_new("location", 8);
+            loc = xs_map_lookup(r->f_headers, lk, 0);
+            xs_release(lk);
+        }
+        if (!loc || hops >= 20) {
+            if (loc) { xs_release(r); xs_panic("TypeError: fetch failed: redirect count exceeded"); }
+            r->f_url = xs_retain(cur);
+            return r;
+        }
+        xs_str *to = loc->val.p, *next;
+        if (strncmp(to->data, "http://", 7) == 0 || strncmp(to->data, "https://", 8) == 0) next = xs_str_new(to->data, (size_t)to->len);
+        else { /* /path (same origin) or a path relative to the current one */
+            const char *u = cur->data, *hs = strstr(u, "://");
+            const char *pathp = hs ? strchr(hs + 3, '/') : NULL;
+            size_t origin = pathp ? (size_t)(pathp - u) : (size_t)cur->len;
+            xs_buf nb = {0};
+            if (to->len && to->data[0] == '/') {
+                xs_buf_append(&nb, u, origin);
+            } else {
+                const char *q = pathp ? pathp : u + cur->len, *end = u + cur->len, *cut = q;
+                for (const char *x = q; x < end && *x != '?' && *x != '#'; x++) if (*x == '/') cut = x + 1;
+                if (cut == q) cut = end;
+                xs_buf_append(&nb, u, (size_t)(cut - u));
+                if (cut == end && !pathp) xs_buf_append(&nb, "/", 1);
+            }
+            xs_buf_append(&nb, to->data, (size_t)to->len);
+            next = xs_str_new(nb.data, nb.len);
+            free(nb.data);
+        }
+        bool post_like = m && strcmp(m->data, "GET") != 0 && strcmp(m->data, "HEAD") != 0;
+        if (st == 303 || ((st == 301 || st == 302) && post_like)) { m = NULL; b = NULL; }
+        xs_release(r);
+        cur = xs_ar(next);
+    }
+}
+XS_NOINLINE xs_Response *xs_fetch_once(xs_str *url, xs_str *method, xs_str *body, int nh, xs_str **hdrs, int64_t timeout_ms, xs_Uint8Array *abort) {
     /* with an AbortSignal the waits are cut in slices of 20 ms, and the signal's byte read between them */
     #define XS_ABORTED() (abort && abort->data[0])
     if (XS_ABORTED()) xs_fetch_aborted(abort->data[0]);
@@ -2202,7 +2248,6 @@ XS_NOINLINE xs_Response *xs_fetch_full(xs_str *url, xs_str *method, xs_str *body
         xs_Response *resp = xs_obj_alloc(sizeof *resp, xs_Response_free, xs_Response_print);
         resp->f_status = status;
         resp->f_ok = status >= 200 && status < 300;
-        resp->f_url = xs_retain(url); /* (redirects are not followed: the URL asked for) */
         resp->body = is_chunked ? xs_str_new(chunked.data ? chunked.data : "", chunked.len) : xs_str_new(buf.data + hdr_len, body_len);
         { /* response.headers: names in lower case (what Headers.get and forEach give), in the order received */
             xs_map *hm = xs_map_new(1, 1, 3, xs_print_str_quoted_, xs_print_str_quoted_);
