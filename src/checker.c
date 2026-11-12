@@ -1850,7 +1850,7 @@ static Func *lookup_func(const char *name) {
         Func *f = e->decl;
         if (f->mod == cur_mod || (f->exported && imports_name(cur_mod, f->mod, name))) return f;
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:arrays") == 0) return f; /* (reduce & co) */
-        if (f->exported && strstr(name, "__s_") && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:url") == 0) return f; /* (URL.canParse, AbortSignal.timeout: statics of globals) */
+        if (f->exported && (strstr(name, "__s_") || !strcmp(name, "__xs_fetch")) && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:url") == 0) return f; /* (URL.canParse, AbortSignal.timeout: statics of globals; fetch with its options in a value) */
         const char *st = strstr(name, "__s_"); /* a static method: visible where its class is imported */
         if (st && f->exported) {
             char *cls = xs_strndup(name, (size_t)(st - name));
@@ -5067,6 +5067,7 @@ static bool objlit_expand(Expr *e, Type *expected) {
         for (int i = 0; i < e->args.len && ok; i++) {
             if (strcmp(e->keys[i], "...") != 0) continue;
             Type *st = pure_type(e->args.items[i]->lhs);
+            if (st && st->kind == TY_NULLABLE) st = st->elem; /* (...opts.headers with headers?: a Record: nothing when absent) */
             if (st && st->kind == TY_MAP && st->record && st->key->kind == TY_STRING) {
                 any_rec = true;
                 if (!v) v = st->elem;
@@ -5085,8 +5086,17 @@ static bool objlit_expand(Expr *e, Type *expected) {
             for (int i = 0; i < e->args.len; i++) {
                 Expr *a = e->args.items[i];
                 if (strcmp(e->keys[i], "...") == 0) {
+                    Expr *srcx = a->lhs;
+                    Type *pt = pure_type(srcx);
+                    if (pt && pt->kind == TY_NULLABLE) { /* (x ?? {}): a null spreads nothing, as in JavaScript */
+                        Expr *empty = xs_alloc(sizeof *empty);
+                        empty->kind = E_OBJLIT; empty->pos = a->pos; empty->field = -1;
+                        Expr *qq = xs_alloc(sizeof *qq);
+                        qq->kind = E_BINARY; qq->op = TK_QQ; qq->pos = a->pos; qq->field = -1; qq->lhs = srcx; qq->rhs = empty;
+                        srcx = qq;
+                    }
                     Expr *ent = xs_alloc(sizeof *ent);
-                    ent->kind = E_MEMBER; ent->pos = a->pos; ent->field = -1; ent->lhs = a->lhs; ent->str = "entries"; ent->is_call = true;
+                    ent->kind = E_MEMBER; ent->pos = a->pos; ent->field = -1; ent->lhs = srcx; ent->str = "entries"; ent->is_call = true;
                     Expr *sp = xs_alloc(sizeof *sp);
                     sp->kind = E_UNARY; sp->op = TK_ELLIPSIS; sp->pos = a->pos; sp->field = -1; sp->lhs = ent;
                     expr_list_push(&arr->args, sp);
@@ -6514,6 +6524,19 @@ static void check_expr_in(Expr *e, Type *expected) {
                 check_expr(e->args.items[0], ty_string);
                 expect_type(e->args.items[0], ty_string, "argument of fetch");
                 if (e->args.len == 2) {
+                    Expr *init0 = e->args.items[1];
+                    bool generic = init0->kind != E_OBJLIT;
+                    for (int i = 0; !generic && i < init0->args.len; i++)
+                        if (!strcmp(init0->keys[i], "...") || !strcmp(init0->keys[i], "redirect")) generic = true;
+                    if (generic) { /* options in a value or with spreads: xisto:url's __xs_fetch(url, init: RequestInit) */
+                        Expr *callee = xs_alloc(sizeof *callee);
+                        callee->kind = E_IDENT; callee->pos = e->pos; callee->field = -1; callee->str = "__xs_fetch";
+                        e->lhs = callee;
+                        e->builtin.cfn = NULL;
+                        e->args.items[0]->prechecked = true;
+                        check_expr(e, expected);
+                        return;
+                    }
                     /* the options object of the Fetch API, checked by key: method, body, headers, signal */
                     Expr *init = e->args.items[1];
                     if (init->kind != E_OBJLIT) xs_error(XS7053, init->pos, "write the options inline: fetch(url, { method: \"POST\", body })", "fetch options must be an object literal");

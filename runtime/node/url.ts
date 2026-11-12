@@ -632,3 +632,31 @@ export class AbortController {
     this.signal.__abort(reason ?? abortError(), 1);
   }
 }
+
+// ---- fetch with its options in a value: fetch(url, init), fetch(url, { ...init, headers }) ----
+
+/** fetch's options (the Fetch API's RequestInit): method, headers, body, signal; redirect is accepted (followed). */
+export interface RequestInit {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  signal?: AbortSignal;
+  redirect?: string;
+}
+
+/** The Fetch API's HeadersInit as xisto takes it: a Record of names and values. */
+export type HeadersInit = Record<string, string>;
+
+/** (the compiler calls this for fetch(url, init) when the options are not written in place) */
+export function __xs_fetch(url: string, init: RequestInit): Response {
+  const method = init.method ?? "GET";
+  const headers: Record<string, string> = init.headers ?? {};
+  const body = init.body ?? null;
+  const signal = init.signal ?? null;
+  if (signal !== null) {
+    if (body !== null) return fetch(url, { method: method, headers: headers, body: body, signal: signal });
+    return fetch(url, { method: method, headers: headers, signal: signal });
+  }
+  if (body !== null) return fetch(url, { method: method, headers: headers, body: body });
+  return fetch(url, { method: method, headers: headers });
+}
