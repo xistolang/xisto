@@ -87,10 +87,11 @@ xisto add @nestjs/common @nestjs/core @nestjs/platform-express
 ```
 
 `xisto add` fetches the packages from [xistolang/packages](https://github.com/xistolang/packages) and their
-dependencies with them (here `express`, `rxjs`, `class-validator` and `class-transformer`). Then write the app in
-`src/main.ts`, as on Node:
+dependencies with them (here `express`, `rxjs`, `class-validator` and `class-transformer`). It does not touch your
+code: `src/main.ts` is still the hello world from `xisto init`. Replace it with the app, written as on Node:
 
-```ts
+```sh
+cat > src/main.ts <<'EOF'
 import { Controller, Get, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 
@@ -110,11 +111,12 @@ async function bootstrap(): Promise<void> {
   await app.listen(3123);
 }
 bootstrap();
+EOF
 ```
 
 ```sh
 xisto build                      # ./hello-nest, a native executable of about 1 MB
-./hello-nest &
+./hello-nest &                   # the server, on port 3123
 curl localhost:3123              # Hello from xisto
 
 rm -rf .xisto && xisto install   # a fresh checkout: restores the packages from xisto.lock
