@@ -5348,6 +5348,23 @@ static void check_expr(Expr *e, Type *expected) {
     scope = s0; cur_mod = m0; cur_class = k0;
     xs_file_name = fn0; xs_source = src0;
 }
+/* "x.a.b" of a name or a chain of member reads (?. or .), before checking; NULL for anything else */
+static const char *member_path_text(Expr *e) {
+    if (!e) return NULL;
+    if (e->kind == E_IDENT) return e->str;
+    if (e->kind == E_COND && e->builtin.cfn && !strcmp(e->builtin.cfn, "optchain") && e->str && e->args.len >= 1) {
+        /* a?.b: the rest is written on the temporary that holds a */
+        const char *base = member_path_text(e->lhs), *rest = member_path_text(e->args.items[0]);
+        size_t tl = strlen(e->str);
+        if (!base || !rest || strncmp(rest, e->str, tl) != 0) return NULL;
+        return xs_sprintf("%s%s", base, rest + tl);
+    }
+    if (e->kind == E_MEMBER && !e->is_call && e->str) {
+        const char *l = member_path_text(e->lhs);
+        return l ? xs_sprintf("%s.%s", l, e->str) : NULL;
+    }
+    return NULL;
+}
 /* juntas(() => a(), () => b()) with juntas<A, B>(a: () => A | Promise<A>, b: () => B | Promise<B>): [Promise<A>, Promise<B>]
    declared above its implementation juntas(...fns: Array<() => unknown>): Array<Promise<unknown>>: the call runs the
    implementation (its arguments checked against it) and is typed by the overload with as many parameters, its type
@@ -5423,23 +5440,6 @@ static bool overload_typed(Expr *e, Func *f, ExprList *written) {
     expr_list_push(&e->args, inner);
     check_expr(e, NULL);
     return true;
-}
-/* "x.a.b" of a name or a chain of member reads (?. or .), before checking; NULL for anything else */
-static const char *member_path_text(Expr *e) {
-    if (!e) return NULL;
-    if (e->kind == E_IDENT) return e->str;
-    if (e->kind == E_COND && e->builtin.cfn && !strcmp(e->builtin.cfn, "optchain") && e->str && e->args.len >= 1) {
-        /* a?.b: the rest is written on the temporary that holds a */
-        const char *base = member_path_text(e->lhs), *rest = member_path_text(e->args.items[0]);
-        size_t tl = strlen(e->str);
-        if (!base || !rest || strncmp(rest, e->str, tl) != 0) return NULL;
-        return xs_sprintf("%s%s", base, rest + tl);
-    }
-    if (e->kind == E_MEMBER && !e->is_call && e->str) {
-        const char *l = member_path_text(e->lhs);
-        return l ? xs_sprintf("%s.%s", l, e->str) : NULL;
-    }
-    return NULL;
 }
 static bool cond_prim(Type *t) { return t->kind == TY_STRING || t->kind == TY_NUMBER || t->kind == TY_INT || t->kind == TY_BOOLEAN; }
 static void check_expr_in(Expr *e, Type *expected) {
