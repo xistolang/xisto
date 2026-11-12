@@ -15,6 +15,8 @@ POST /api/forms/totem {"ticket":"N"} -> 200 {"name": null, "printer": null, "tic
 POST /api/forms/totem {"printer":1,"printerModel":"zebra"} -> 200 {"name": null, "printer": 1, "ticket": null}
 POST /api/forms/totem {"printer":1,"printerModel":""} -> 400 {"error": "Bad Request", "message": ["printerModel should not be empty"], "statusCode": 400}
 POST /api/forms/totem {"printer":0} -> 200 {"name": null, "printer": 0, "ticket": null}
+POST /api/forms/totem {"kiosk":1} -> 200 {"name": null, "printer": null, "ticket": null}
+POST /api/forms/totem {"kiosk":7} -> 400 {"error": "Bad Request", "message": ["Kiosk: 7 is not valid, use 0 or 1."], "statusCode": 400}
 POST /api/forms/sort {"name":"a","sortOrder":"DESC"} -> 200 {"name": "a", "sortOrder": "desc"}
 POST /api/forms/sort {"name":"a","sortOrder":"up"} -> 400 {"error": "Bad Request", "message": ["sortOrder must be one of the following values: asc, desc"], "statusCode": 400}
 POST /api/forms/sort {"name":"a"} -> 200 {"name": "a", "sortOrder": null}
@@ -27,6 +29,8 @@ GET /api/forms/issued  {"x-dev": "1"}-> 200 {"issued": true}
 GET /api/forms/url?a=1&b=two  -> 200 {"originalUrl": "/api/forms/url?a=1&b=two", "path": "/api/forms/url"}
 GET /api/forms/url-alias  -> 200 {"originalUrl": "/api/forms/url-alias", "path": "/api/forms/url-alias"}
 GET /api/forms/bytes  -> 200 'olá, bytes'
+POST /api/forms/stream olá, corpo cru {"Content-Type": "text/plain"}-> 200 {"size": 15, "text": "olá, corpo cru"}
+POST /api/forms/stream {"a":1} -> 200 {"size": 0, "text": ""}
 GET /api/forms/me  {"x-user": "ana:t1"}-> 200 {"sub": "ana", "tenant": "t1"}
 GET /api/forms/me  {"x-user": "bia"}-> 200 {"sub": "bia", "tenant": "none"}
 GET /api/forms/me  -> 401 {"message": "Unauthorized", "statusCode": 401}
