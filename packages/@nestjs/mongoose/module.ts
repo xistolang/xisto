@@ -1,4 +1,4 @@
-// MongooseModule, SchemaFactory, tokens and injection of @nestjs/mongoose (v10/11) for xisto, over the mongoose package (stage 1: no MongoDB driver yet).
+// MongooseModule, SchemaFactory, tokens and injection of @nestjs/mongoose (v10/11) for xisto, over the mongoose package.
 //
 // @Schema(options) and @Prop(options) record a class's paths; SchemaFactory.createForClass(C) makes the mongoose
 // Schema from them (a @Prop without `type` takes it from the field's TypeScript type, as Nest does from
@@ -8,13 +8,14 @@
 //
 // Nothing happens until a module is imported: an application that does not import MongooseModule (a Mongo that is
 // optional) gets null in an @Optional() @InjectModel(X.name) parameter, as Nest does. A forRoot connection is
-// opened when the application starts; without a driver that fails the start with an Error that begins with
-// "mongoose: no MongoDB driver in xisto yet (stage 2)" (Nest would retry 9 times first; there is nothing to retry).
+// opened when the application starts (unless lazyConnection): a failure is logged by the MongooseModule logger
+// ("Unable to connect to the database. Retrying (n)...") and tried again retryAttempts times (9) every retryDelay
+// ms (3000), then fails the start with the last error, as Nest does. connectionFactory(connection, name) runs on
+// the open connection and its result is the provider.
 // Node: a Model<X> constructor parameter is made from the model's state (its names) as the exact Model<X> it
-// declares; a model a provider of the application builds (connection.model(...) in a useFactory) reaches a
-// Model<X> parameter only once the driver exists (stage 2).
+// declares; a model a provider of the application builds (connection.model(...) in a useFactory) is a Model too.
 import { ClassInfo, MethodInfo } from "xisto:reflect";
-import { DynamicModule, FactoryProvider, Inject, Module, Provider, __jsonValues } from "@nestjs/common";
+import { DynamicModule, FactoryProvider, Inject, Injectable, Logger, Module, Provider, __jsonValues } from "@nestjs/common";
 import { Connection, ConnectOptions, ObjectIdStatic, Schema, SchemaTypeOptions, SchemaTypes, createConnection, __modelState, __registerConnection } from "mongoose";
 import { PropDef, __propsByClass, __schemaOptionsByClass } from "./decorators";
 
@@ -162,6 +163,46 @@ async function openConnection(uri: string, o: MongooseModuleFactoryOptions, conn
   return conn;
 }
 
+// the connections forRoot/forRootAsync opened: app.close() closes them (MongooseCoreModule.onApplicationShutdown)
+const openedConnections: Connection[] = [];
+
+/** closes the module's connections when the application shuts down */
+@Injectable()
+export class MongooseConnectionsCloser {
+  async onApplicationShutdown(): Promise<void> {
+    while (openedConnections.length > 0) {
+      const c = openedConnections.pop();
+      if (c != null) {
+        await c.close();
+      }
+    }
+  }
+}
+
+// openConnection with Nest's retries (handleRetry: retryAttempts 9, retryDelay 3000 ms)
+async function openWithRetry(uri: string, o: MongooseModuleFactoryOptions, connectionName: string): Promise<Connection> {
+  const attempts = o.retryAttempts ?? 9;
+  const delay = o.retryDelay ?? 3000;
+  let count = 0;
+  for (;;) {
+    try {
+      const c = await openConnection(uri, o, connectionName);
+      openedConnections.push(c);
+      return c;
+    } catch (e) {
+      const err = e as Error;
+      const verbose = o.verboseRetryLog === true ? " Message: " + err.message + "." : "";
+      const retry = attempts > 0 ? " Retrying (" + String(count + 1) + ")..." : "";
+      new Logger("MongooseModule").error("Unable to connect to the database." + verbose + retry, err.stack);
+      if (count + 1 >= attempts) {
+        throw err;
+      }
+      count++;
+      await new Promise<void>((r) => setTimeout(r, delay));
+    }
+  }
+}
+
 @Module({})
 export class MongooseModule {
   /** MongooseModule.forRoot(uri, options): the connection, opened when the application starts */
@@ -169,9 +210,9 @@ export class MongooseModule {
     const name = options.connectionName ?? "";
     const fp: FactoryProvider = {
       provide: getConnectionToken(name),
-      useFactory: async (): Promise<unknown> => await openConnection(uri, options, name),
+      useFactory: async (): Promise<unknown> => await openWithRetry(uri, options, name),
     };
-    const providers: Provider[] = [fp];
+    const providers: Provider[] = [fp, MongooseConnectionsCloser];
     return { module: MongooseModule, providers: providers, exports: [getConnectionToken(name)], global: true };
   }
 
@@ -187,10 +228,10 @@ export class MongooseModule {
           throw new Error("MongooseModule.forRootAsync: useFactory is required (useClass/useExisting are not supported)");
         }
         const o = await make(...args);
-        return await openConnection(o.uri ?? "", o, name);
+        return await openWithRetry(o.uri ?? "", o, name);
       },
     };
-    const providers: Provider[] = [fp];
+    const providers: Provider[] = [fp, MongooseConnectionsCloser];
     return { module: MongooseModule, imports: options.imports ?? [], providers: providers, exports: [getConnectionToken(name)], global: true };
   }
 

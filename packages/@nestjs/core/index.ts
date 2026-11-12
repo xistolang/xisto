@@ -67,6 +67,8 @@ export class NestApplicationOptions {
   cors?: boolean;
   bufferLogs?: boolean;
   logger?: boolean;
+  /** (accepted: a failed start rejects NestFactory.create here, as Nest does with abortOnError: false) */
+  abortOnError?: boolean;
 }
 
 /** app.enableVersioning({ type: VersioningType.URI, defaultVersion: "1" }) */
