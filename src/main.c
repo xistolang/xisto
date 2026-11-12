@@ -134,8 +134,13 @@ static void usage(void) {
             "  xisto check [--details] [--deny-warnings] [--tsc-checked] [--pkgs DIR] [PATH...]  what a project needs to change to compile with xisto\n"
             "                                                           (PATH: a folder, a tsconfig.json or .ts files; --details: every place)\n"
             "  xisto test [DIR]                                         build and run every *.test.ts under DIR\n"
-            "  xisto add SOURCE[@REF] [--name NAME]                     add a package from a git URL or path (source, locked by commit)\n"
-            "  xisto install                                            fetch every package at the commit in xisto.lock\n"
+            "  xisto init [DIR]                                         start a project: xisto.json, src/main.ts, .gitignore\n"
+            "  xisto add NAME[@REF]...                                  add packages of the registry (github.com/xistolang/packages;\n"
+            "                                                           XISTO_REGISTRY: another URL or path), and their dependencies\n"
+            "  xisto add SOURCE#FOLDER[@REF]...                         the package in FOLDER of a git repository (URL or path)\n"
+            "  xisto add SOURCE[@REF] [--name NAME]                     a whole git repository as one package (locked by commit)\n"
+            "  xisto install                                            restore every package at the commit in xisto.lock\n"
+            "  (build and run without FILE.ts: the \"main\" of the project's xisto.json)\n"
             "\n"
             "  --dev          fast compile, no optimization (release is the default)\n"
             "  --debug        a debuggable binary: -O0 -g, statement hooks and the debugger agent (never in release)\n"
@@ -955,122 +960,11 @@ static int cmd_test(int argc, char **argv) {
     return fail ? 1 : 0;
 }
 
-/* ---- packages: always source, locked by commit (docs/bibliotecas.md) ----
-   xisto.json  {"name": ..., "dependencies": {"name": "source@ref"}}
-   xisto.lock  {"name": {"source": ..., "commit": ...}}
-   Both files are written one dependency per line so they diff cleanly. Nothing from a package is ever run
-   at install time: a package is only source code. */
-typedef struct { char *name, *source, *ref, *commit; } Dep;
-
-static int read_deps(const char *path, Dep *deps, int max, bool lock) {
-    char *t = xs_read_file(path);
-    if (!t) return 0;
-    int n = 0;
-    char *sec = strstr(t, lock ? "{" : "\"dependencies\"");
-    if (!sec) return 0;
-    for (char *line = strchr(sec, '\n'); line && n < max; line = strchr(line + 1, '\n')) {
-        char name[256], a[1024], b[256];
-        if (lock) {
-            if (sscanf(line, " \"%255[^\"]\": {\"source\": \"%1023[^\"]\", \"commit\": \"%255[^\"]\"", name, a, b) == 3) {
-                deps[n].name = xs_strndup(name, strlen(name)); deps[n].source = xs_strndup(a, strlen(a)); deps[n].commit = xs_strndup(b, strlen(b)); n++;
-            }
-        } else if (sscanf(line, " \"%255[^\"]\": \"%1023[^\"]\"", name, a) == 2) {
-            deps[n].name = xs_strndup(name, strlen(name));
-            char *at = strrchr(a, '@');
-            deps[n].ref = at && at != a && !strstr(at, "/") ? xs_strndup(at + 1, strlen(at + 1)) : NULL;
-            if (at && deps[n].ref) *at = 0;
-            deps[n].source = xs_strndup(a, strlen(a));
-            n++;
-        }
-    }
-    return n;
-}
-
-static void write_deps(Dep *deps, int n) {
-    char cwd[1024];
-    if (!getcwd(cwd, sizeof cwd)) strcpy(cwd, "app");
-    const char *base = strrchr(cwd, '/') ? strrchr(cwd, '/') + 1 : cwd;
-    FILE *f = fopen("xisto.json", "w");
-    fprintf(f, "{\n  \"name\": \"%s\",\n  \"dependencies\": {\n", base);
-    for (int i = 0; i < n; i++) fprintf(f, "    \"%s\": \"%s%s%s\"%s\n", deps[i].name, deps[i].source, deps[i].ref ? "@" : "", deps[i].ref ? deps[i].ref : "", i + 1 < n ? "," : "");
-    fprintf(f, "  }\n}\n");
-    fclose(f);
-    f = fopen("xisto.lock", "w");
-    fprintf(f, "{\n");
-    for (int i = 0; i < n; i++) fprintf(f, "  \"%s\": {\"source\": \"%s\", \"commit\": \"%s\"}%s\n", deps[i].name, deps[i].source, deps[i].commit ? deps[i].commit : "", i + 1 < n ? "," : "");
-    fprintf(f, "}\n");
-    fclose(f);
-}
-
-static bool valid_name(const char *s) {
-    if (!*s) return false;
-    for (; *s; s++) if (!(isalnum((unsigned char)*s) || *s == '-' || *s == '_' || *s == '.')) return false;
-    return true;
-}
-
-/* clone (or reuse) .xisto/pkgs/NAME and check out REF or COMMIT; returns the commit */
-static char *fetch_pkg(const char *name, const char *source, const char *rev) {
-    char *dir = xs_sprintf(".xisto/pkgs/%s", name);
-    if (!xs_mkdirs(".xisto/pkgs")) return NULL;
-    if (!xs_exists(dir) && xs_sh(xs_sprintf("git clone --quiet %s %s 2>&1", xs_q(source), xs_q(dir))) != 0) {
-        fprintf(stderr, "xisto: cannot clone %s\n", source);
-        return NULL;
-    }
-    if (rev && *rev) {
-        if (xs_sh(xs_sprintf("git -C %s fetch --quiet origin 2>%s", xs_q(dir), xs_devnull())) != 0) { /* (a local checkout may have nothing to fetch) */ }
-        if (xs_sh(xs_sprintf("git -C %s -c advice.detachedHead=false checkout --quiet %s 2>&1", xs_q(dir), xs_q(rev))) != 0) {
-            fprintf(stderr, "xisto: %s has no revision '%s'\n", source, rev);
-            return NULL;
-        }
-    }
-    return shell_output(xs_sprintf("git -C %s rev-parse HEAD", xs_q(dir)));
-}
-
-static int cmd_add(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: xisto add SOURCE[@REF] [--name NAME]\n"); return 2; }
-    char *src = xs_strndup(argv[2], strlen(argv[2]));
-    char *ref = NULL;
-    char *at = strrchr(src, '@');
-    if (at && at != src && !strchr(at, '/') && !strchr(at, ':')) { *at = 0; ref = at + 1; }
-    const char *name = NULL;
-    for (int i = 3; i + 1 < argc; i++) if (strcmp(argv[i], "--name") == 0) name = argv[i + 1];
-    if (!name) {
-        const char *b = strrchr(src, '/') ? strrchr(src, '/') + 1 : src;
-        char *n = xs_strndup(b, strlen(b));
-        size_t l = strlen(n);
-        if (l > 4 && strcmp(n + l - 4, ".git") == 0) n[l - 4] = 0;
-        name = n;
-    }
-    if (!valid_name(name)) { fprintf(stderr, "xisto: invalid package name '%s'\n", name); return 2; }
-    Dep deps[256];
-    int n = read_deps("xisto.lock", deps, 256, true);
-    Dep refs[256];
-    int nr = read_deps("xisto.json", refs, 256, false);
-    for (int i = 0; i < n; i++) for (int k = 0; k < nr; k++) if (strcmp(deps[i].name, refs[k].name) == 0) deps[i].ref = refs[k].ref;
-    xs_rmtree(xs_sprintf(".xisto/pkgs/%s", name));
-    char *commit = fetch_pkg(name, src, ref);
-    if (!commit) return 1;
-    int idx = -1;
-    for (int i = 0; i < n; i++) if (strcmp(deps[i].name, name) == 0) idx = i;
-    if (idx < 0) idx = n++;
-    deps[idx].name = (char *)name; deps[idx].source = src; deps[idx].ref = ref; deps[idx].commit = commit;
-    write_deps(deps, n);
-    printf("xisto: added %s at %.12s (%s%s%s)\n", name, commit, src, ref ? "@" : "", ref ? ref : "");
-    return 0;
-}
-
-static int cmd_install(void) {
-    Dep deps[256];
-    int n = read_deps("xisto.lock", deps, 256, true);
-    if (n == 0) { printf("xisto: nothing to install (no xisto.lock)\n"); return 0; }
-    for (int i = 0; i < n; i++) {
-        char *c = fetch_pkg(deps[i].name, deps[i].source, deps[i].commit);
-        if (!c) return 1;
-        if (strcmp(c, deps[i].commit) != 0) { fprintf(stderr, "xisto: %s is at %s, lock says %s\n", deps[i].name, c, deps[i].commit); return 1; }
-        printf("xisto: %s at %.12s\n", deps[i].name, c);
-    }
-    return 0;
-}
+/* packages (pkg.c) */
+int xs_cmd_add(int argc, char **argv);
+int xs_cmd_install(void);
+int xs_cmd_init(int argc, char **argv);
+char *xs_project_main(char **exe);
 
 /* xisto debug: the program built with --debug into exe; false (and the errors printed) when it does not compile */
 bool xs_build_debug(const char *file, const char *exe) {
@@ -1125,8 +1019,9 @@ int main(int argc, char **argv) {
     }
 #endif
     if (argc >= 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "version") == 0)) { printf("xisto %s\n", XISTO_VERSION); return 0; }
-    if (argc >= 2 && strcmp(argv[1], "add") == 0) return cmd_add(argc, argv);
-    if (argc >= 2 && strcmp(argv[1], "install") == 0) return cmd_install();
+    if (argc >= 2 && strcmp(argv[1], "add") == 0) return xs_cmd_add(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "install") == 0) return xs_cmd_install();
+    if (argc >= 2 && strcmp(argv[1], "init") == 0) return xs_cmd_init(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "clean") == 0) return clean_cache(argc >= 3 ? argv[2] : ".");
     if (argc >= 2 && strcmp(argv[1], "fmt") == 0) return cmd_fmt(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "check") == 0) return cmd_check(argc, argv);
@@ -1134,7 +1029,7 @@ int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "test") == 0) { find_xisto_dir(argv[0]); return cmd_test(argc, argv); }
     if (argc >= 2 && strcmp(argv[1], "debug") == 0) { find_xisto_dir(argv[0]); return cmd_debug(argc, argv); }
     if (argc >= 2 && strcmp(argv[1], "dap") == 0) { find_xisto_dir(argv[0]); return cmd_debug(argc, argv); }
-    if (argc < 3) usage();
+    if (argc < 2 || (argc < 3 && strcmp(argv[1], "build") != 0 && strcmp(argv[1], "run") != 0)) usage();
     const char *cmd = argv[1];
     bool dev = false;
     const char *outname = NULL;
@@ -1171,6 +1066,8 @@ int main(int argc, char **argv) {
         else if (!file) file = argv[i];
         else { rest = i; break; }
     }
+    char *project_exe = NULL;
+    if (!file && (strcmp(cmd, "build") == 0 || strcmp(cmd, "run") == 0)) file = xs_project_main(&project_exe); /* xisto.json "main" */
     if (!file) usage();
     if (outname && xs_is_dir(outname)) { fprintf(stderr, "xisto: -o %s is a directory: give the executable's file name (-o %s/name)\n", outname, outname); return 2; }
     if (getenv("XISTO_NODE_COMPAT") && strcmp(getenv("XISTO_NODE_COMPAT"), "1") == 0) xs_node_compat = true;
@@ -1226,6 +1123,7 @@ int main(int argc, char **argv) {
 
     bool exe_suffix = xs_target && strstr(xs_target, "windows"); /* Windows runs only .exe files */
     if (strcmp(cmd, "build") == 0) {
+        if (!outname && project_exe) outname = exe_suffix ? xs_sprintf("%s.exe", project_exe) : project_exe;
         if (!outname) outname = exe_suffix ? xs_sprintf("%s.exe", strip_ts(file)) : strip_ts(file);
         if (use_qbe) { unlink(cfile); rmdir(dir); build_qbe_cached(last_program, file, outname); return 0; }
         else run_cc(cfile, outname, dev);

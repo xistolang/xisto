@@ -6,13 +6,13 @@ apps/api/src/main.ts (2)
   6:1  XS5003  cannot resolve 'some-orm'
        6 | import { connect } from 'some-orm';
          | ^
-    help: import files with a relative path ("./file"), or add the package: xisto add <git url> --name some-orm
+    help: import files with a relative path ("./file"), or add the package: xisto add some-orm
 
 libs/util/src/index.ts (1)
   1:1  XS5003  cannot resolve 'tiny-format'
        1 | import { format } from 'tiny-format';
          | ^
-    help: import files with a relative path ("./file"), or add the package: xisto add <git url> --name tiny-format
+    help: import files with a relative path ("./file"), or add the package: xisto add tiny-format
 
 xisto check: 6 files, 3 changes needed in 2 files
 
@@ -28,5 +28,5 @@ xisto check: 6 files, 3 changes needed in 2 files
   tests: 0 changes in 0 of 1 test file, not counted above (--tests counts them)
 
   packages:
-    some-orm                         not installed            1 file  (xisto add <git url> --name some-orm)
-    tiny-format                      not installed            1 file  (xisto add <git url> --name tiny-format)
+    some-orm                         not installed            1 file  (xisto add some-orm)
+    tiny-format                      not installed            1 file  (xisto add tiny-format)

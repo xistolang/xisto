@@ -504,7 +504,7 @@ int cmd_check(int argc, char **argv) {
             int nf = pkgs[k].files + (with_tests ? pkgs[k].test_files : 0);
             if (!with_tests && !pkgs[k].files) continue;
             printf("    %-32s %-24s %d file%s", pkgs[k].name, pkgs[k].status, nf, nf == 1 ? "" : "s");
-            if (strcmp(pkgs[k].status, "not installed") == 0) printf("  (xisto add <git url> --name %s)", pkgs[k].name);
+            if (strcmp(pkgs[k].status, "not installed") == 0) printf("  (xisto add %s)", pkgs[k].name);
             printf("\n");
         }
         int test_only = 0;

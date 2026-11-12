@@ -20,7 +20,7 @@ main.ts (5, 1 warning)
   3:1  XS5003  cannot resolve '@acme/missing'
        3 | import { Injectable } from "@acme/missing";
          | ^
-    help: import files with a relative path ("./file"), or add the package: xisto add <git url> --name @acme/missing
+    help: import files with a relative path ("./file"), or add the package: xisto add @acme/missing
   6:17  XS3013  parameter 'x' has no type
        6 | function twice(x) { return x * 2; }
          |                 ^
@@ -60,4 +60,4 @@ xisto check: 2 files, 6 changes needed in 2 files
   (xisto check --details shows each place; --deny-warnings counts them as changes)
 
   packages:
-    @acme/missing                    not installed            1 file  (xisto add <git url> --name @acme/missing)
+    @acme/missing                    not installed            1 file  (xisto add @acme/missing)

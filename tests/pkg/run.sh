@@ -4,6 +4,7 @@ export XISTO_NODE_COMPAT=1 # these programs also run on Node for comparison: nod
 set -e
 X=$(cd "$(dirname "$0")/../.." && pwd)/build/xisto
 W=$(mktemp -d)
+export XDG_CACHE_HOME="$W/cache" # the clones of repositories: never the user's own cache
 cd "$W"
 git init -q mathx && cd mathx
 cat > index.ts <<'TS'
@@ -36,4 +37,7 @@ $X build -o app main.ts && [ "$(./app)" = "42" ] && echo "ok: v1 builds and prin
 nm app | grep -q unusedHeavy && echo "FAIL: unused package function linked" || echo "ok: unused package function not in the binary"
 rm -rf .xisto && $X install > /dev/null && $X build -o app main.ts && [ "$(./app)" = "42" ] && echo "ok: install restores the locked commit (upstream has v2)"
 $X add "$W/mathx" --name mathx > /dev/null && $X build -o app main.ts && [ "$(./app)" = "63" ] && echo "ok: re-adding without a ref moves to v2"
+# a lock written before folders and refs ({"source", "commit"}): still installs
+printf '{\n  "mathx": {"source": "%s", "commit": "%s"}\n}\n' "$W/mathx" "$v1" > xisto.lock
+rm -rf .xisto && $X install > /dev/null && $X build -o app main.ts && [ "$(./app)" = "42" ] && echo "ok: an old xisto.lock still installs"
 rm -rf "$W"

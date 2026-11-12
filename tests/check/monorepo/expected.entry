@@ -9,7 +9,7 @@ xisto check: 1 file, 2 changes needed in 1 file
         2  main.ts
 
   packages:
-    some-orm                         not installed            1 file  (xisto add <git url> --name some-orm)
-    tiny-format                      not installed            1 file  (xisto add <git url> --name tiny-format)
+    some-orm                         not installed            1 file  (xisto add some-orm)
+    tiny-format                      not installed            1 file  (xisto add tiny-format)
 
   xisto check --details lists every place to change.
