@@ -1413,6 +1413,9 @@ static bool late_inline_class(Class *c) {
     return true;
 }
 
+static bool fake_target(Class *t, Expr *lit);
+static void fake_object(Expr *e, Class *t);
+static bool objlit_has_spread(Expr *e);
 static Type *resolve(Type *t, Pos pos) {
     if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__ret_of:", 9) == 0) { /* (generated reflection) */
         const char *dot = strchr(t->tname + 9, '.');
@@ -8478,6 +8481,18 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (expected && expected->kind == TY_NULLABLE) e->type = expected;
         return;
     case E_AS: {
+        if (e->elem_type && e->lhs) { /* { m: () => ... } as C, or as unknown as C: a fake of C */
+            Expr *lit = e->lhs->kind == E_AS && e->lhs->lhs && e->lhs->elem_type && e->lhs->elem_type->kind == TY_UNKNOWN ? e->lhs->lhs : e->lhs;
+            if (lit->kind == E_OBJLIT) {
+                Type *w = resolve(e->elem_type, e->pos);
+                Type *wb = ty_strip_null(w);
+                if (wb->kind == TY_OBJECT && fake_target(wb->cls, lit)) {
+                    *e = *lit;
+                    fake_object(e, wb->cls);
+                    return;
+                }
+            }
+        }
         if (!e->elem_type && e->op == TK_NOT) { /* x!: not null, checked at run time */
             check_expr(e->lhs, expected && expected->kind != TY_NULLABLE ? ty_nullable_of(expected) : expected);
             if (e->lhs->type->kind != TY_NULLABLE) { *e = *e->lhs; return; }
@@ -8667,6 +8682,11 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     }
     case E_OBJLIT: {
+        if (expected && ty_strip_null(expected)->kind == TY_OBJECT && fake_target(ty_strip_null(expected)->cls, e) &&
+            !ty_strip_null(expected)->cls->is_interface) { /* const handler: CallHandler = { handle: () => of(value) } */
+            fake_object(e, ty_strip_null(expected)->cls);
+            return;
+        }
         if (expected && (ty_is_any(expected) || (expected->kind == TY_NULLABLE && ty_is_any(expected->elem)))) {
             /* { a: 1 } where an any goes: a Record<string, any> (rule 2 of any) */
             xs_note_dynamic_record(e->pos);
@@ -11981,6 +12001,149 @@ static Class *make_adapter(Class *src, Class *ifc) {
     ifc->adapters[ifc->nadapters++] = a;
     return a;
 }
+
+/* NOOP_CONTEXT = { getHandler: () => () => undefined, getClass: () => class {} } as unknown as ExecutionContext: an
+   object literal standing for a class (or an interface) with methods, as fakes and mocks are written. A class made
+   for the literal extends the target: each method the literal gives calls the literal's function (held in a field);
+   a method it does not give throws TypeError "<name> is not a function" when called (JavaScript's), not at the cast;
+   a field of the target the literal gives is set, the others keep their initial values (null where none). */
+static int nfakes;
+static bool fake_target(Class *t, Expr *lit) {
+    if (!t || t->builtin || t->is_tuple || t->fake || lit->kind != E_OBJLIT || !lit->keys || objlit_has_spread(lit)) return false;
+    bool any_m = false;
+    for (int i = 0; i < lit->args.len; i++) {
+        Func *m = find_method(t, lit->keys[i]);
+        if (m && !m->is_getter && !m->is_setter) any_m = true;
+        else if (!m && !find_field(t, lit->keys[i], NULL)) { /* (an extra key: TypeScript's cast allows it; left out) */ }
+    }
+    return any_m;
+}
+static void fake_object(Expr *e, Class *t) {
+    Pos pos = e->pos;
+    Class *a = xs_alloc(sizeof *a);
+    int id = nfakes++;
+    a->name = xs_sprintf("{ fake %d } as %s", id, t->name);
+    a->pos = pos;
+    a->mod = cur_mod;
+    a->cname = xs_sprintf("fake%d_%s", id, t->cname ? t->cname : "c");
+    a->fake = true;
+    a->used = true;
+    a->exported = true;
+    a->base_name = t->name;
+    a->base_pos = pos;
+    a->base = t;
+    for (Class *u = t; u; u = u->base) u->used = true;
+    t->subs = realloc(t->subs, sizeof(Class *) * (size_t)(t->nsubs + 1));
+    t->subs[t->nsubs++] = a;
+    Func *ct = xs_alloc(sizeof *ct);
+    ct->name = "constructor"; ct->pos = pos; ct->mod = cur_mod; ct->cls = a; ct->is_ctor = true; ct->ret = ty_void;
+    ct->params = xs_alloc(sizeof(Param) * (size_t)(e->args.len + 1));
+    Stmt *body = xs_alloc(sizeof *body);
+    body->kind = S_BLOCK; body->pos = pos;
+    Expr *nw = xs_alloc(sizeof *nw);
+    nw->kind = E_NEW_OBJ; nw->pos = pos; nw->field = -1; nw->str = a->name; nw->cls = a;
+    a->fields = xs_alloc(sizeof(Field) * (size_t)(e->args.len + 1));
+    for (int i = 0; i < e->args.len; i++) {
+        const char *k = e->keys[i];
+        Func *m = find_method(t, k);
+        Field *tf = m ? NULL : find_field(t, k, NULL);
+        if (!m && !tf) continue;
+        if (m && (m->is_getter || m->is_setter)) continue;
+        const char *fname = m ? xs_sprintf("__fake_%s", k) : k;
+        Type *ft = NULL;
+        if (m) {
+            Type **ps = xs_alloc(sizeof(Type *) * (size_t)(m->nparams + 1));
+            for (int q = 0; q < m->nparams; q++) ps[q] = m->params[q].type;
+            ft = ty_func(ps, m->nparams, m->ret);
+            ft->async_ret = m->ret_promise;
+            Field *nf = &a->fields[a->nfields++];
+            memset(nf, 0, sizeof *nf);
+            nf->name = fname; nf->pos = pos; nf->type = ft; nf->cname = field_cname(fname); nf->owner = a;
+        } else ft = tf->type;
+        Param *pp = &ct->params[ct->nparams++];
+        memset(pp, 0, sizeof *pp);
+        pp->name = xs_sprintf("__fv%d", i);
+        pp->type = ft;
+        Expr *self = xs_alloc(sizeof *self);
+        self->kind = E_THIS; self->pos = pos; self->field = -1;
+        Expr *mem = xs_alloc(sizeof *mem);
+        mem->kind = E_MEMBER; mem->pos = pos; mem->field = -1; mem->lhs = self; mem->str = (char *)fname;
+        Expr *as = xs_alloc(sizeof *as);
+        as->kind = E_ASSIGN; as->op = TK_ASSIGN; as->pos = pos; as->field = -1; as->lhs = mem; as->rhs = ad_ident(pos, pp->name);
+        Stmt *st = xs_alloc(sizeof *st);
+        st->kind = S_EXPR; st->pos = pos; st->expr = as;
+        stmt_list_push(&body->stmts, st);
+        expr_list_push(&nw->args, e->args.items[i]);
+    }
+    a->cap_fields = a->nfields;
+    ct->body = body;
+    ct->cname = xs_sprintf("%s_new", a->cname);
+    a->ctor = ct;
+    /* every method of the target: the literal's function, or TypeError when called */
+    for (int k = 0; k < t->nmethods; k++) {
+        Func *tm = t->methods[k];
+        if (tm->is_getter || tm->is_setter || tm->is_ctor || tm->ntparams || tm->is_gen) continue;
+        bool dup = false;
+        for (int j = 0; j < a->nmethods; j++) if (!strcmp(a->methods[j]->name, tm->name)) dup = true;
+        if (dup) continue;
+        bool given = false;
+        for (int i = 0; i < e->args.len; i++) if (!strcmp(e->keys[i], tm->name)) given = true;
+        Func *f = xs_alloc(sizeof *f);
+        f->name = tm->name; f->pos = pos; f->mod = cur_mod; f->cls = a;
+        f->params = xs_alloc(sizeof(Param) * (size_t)(tm->nparams + 1));
+        for (int q = 0; q < tm->nparams; q++) {
+            memset(&f->params[q], 0, sizeof(Param));
+            f->params[q].name = xs_sprintf("__a%d", q);
+            f->params[q].type = tm->params[q].type;
+            f->params[q].dflt = tm->params[q].dflt;
+            f->params[q].rest = tm->params[q].rest;
+        }
+        f->nparams = tm->nparams;
+        f->ret = tm->ret;
+        f->ret_promise = tm->ret_promise;
+        f->is_async = tm->ret_promise;
+        f->cname = xs_sprintf("%s_m_%s", a->cname, tm->name);
+        Stmt *s1 = xs_alloc(sizeof *s1);
+        s1->pos = pos;
+        if (given) {
+            Expr *self = xs_alloc(sizeof *self);
+            self->kind = E_THIS; self->pos = pos; self->field = -1;
+            Expr *mem = xs_alloc(sizeof *mem);
+            mem->kind = E_MEMBER; mem->pos = pos; mem->field = -1; mem->lhs = self; mem->str = xs_sprintf("__fake_%s", tm->name);
+            Expr *call = xs_alloc(sizeof *call);
+            call->kind = E_CALL; call->pos = pos; call->field = -1; call->lhs = mem;
+            for (int q = 0; q < tm->nparams; q++) expr_list_push(&call->args, ad_ident(pos, f->params[q].name));
+            if (!tm->ret || tm->ret->kind == TY_VOID) { s1->kind = S_EXPR; s1->expr = call; }
+            else { s1->kind = S_RETURN; s1->expr = call; }
+        } else {
+            Expr *ne = xs_alloc(sizeof *ne);
+            ne->kind = E_CALL; ne->pos = pos; ne->field = -1; ne->builtin.cfn = "xs_type_error_not_fn";
+            ne->type = ty_object_of(find_class("Error"));
+            expr_list_push(&ne->args, str_lit(pos, tm->name));
+            s1->kind = S_THROW; s1->expr = ne;
+        }
+        f->body = ad_block(pos, s1);
+        a->methods = realloc(a->methods, sizeof(Func *) * (size_t)(a->nmethods + 1));
+        a->methods[a->nmethods++] = f;
+    }
+    a->cap_methods = a->nmethods;
+    prog->classes = realloc(prog->classes, sizeof(Class *) * (size_t)(prog->nclasses + 1));
+    prog->cap_classes = prog->nclasses + 1;
+    prog->classes[prog->nclasses++] = a;
+    sym_add(&classes_by_name, a->name, a);
+    Module *was = cur_mod;
+    flatten_fields(a, 0);
+    for (int k = 0; k < a->nfields; k++) if (!a->fields[k].cname) a->fields[k].cname = field_cname(a->fields[k].name);
+    for (int k = 0; k < a->nmethods; k++) if (a->methods[k]->cls == a) resolve_signature(a->methods[k]);
+    resolve_signature(ct);
+    flatten_methods(a);
+    if (cur_mod != was) enter_module(was);
+    class_work = realloc(class_work, sizeof(Class *) * (size_t)(nclass_work + 1));
+    class_work[nclass_work++] = a;
+    *e = *nw;
+    check_expr(e, NULL);
+    upcast(e, ty_object_of(t));
+}
 /* the adapter of src for ifc, made the first time (NULL when src does not fit: why says the first thing that does
    not; a failure is remembered too) */
 static Class *iface_adapter(Class *src, Class *ifc, Pos pos, char **why) {
@@ -12242,7 +12405,7 @@ static void check_class_bodies(Class *c) {
     if (c->ctor) {
         RECOVER_BEGIN
             super_calls = 0;
-            bool needs_super = c->base && !c->base->iface_methods; /* (an implemented interface has no constructor) */
+            bool needs_super = c->base && !c->base->iface_methods && !c->fake; /* (an implemented interface has no constructor) */
             if (needs_super) {
                 StmtList *l = &c->ctor->body->stmts;
                 Stmt *s0 = l->len ? l->items[0] : NULL;
