@@ -1,7 +1,6 @@
 // forms of the kiosk (round 6): an override with other parameters, filter by a predicate into an interface, o[k as keyof
 // typeof o], m?.['k'] then m['k'], e.constructor.name, h ^= c on a number, c.toString(16), rows.map((r: T) => ...) on an any
 // build: --tsc-checked
-// warns: 'upsert' takes other parameters than Repo.upsert
 class Repo {
   upsert(filter: string, set: number, setOnInsert: boolean): string {
     return `base ${filter} ${set} ${setOnInsert}`;
