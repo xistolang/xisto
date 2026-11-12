@@ -1239,13 +1239,13 @@ export class Repository<T> {
     this.sessionId = sessionId;
   }
 
-  // (an entity given by name, manager.update("TB_X", ...): its metadata, not T's)
-  __fixed: EntityMetadata | null = null;
+  // (an entity given by name, manager.update("TB_X", ...): its metadata, not T's; a name, so the repository stays
+  // data the injector can decode)
+  fixedName: string = "";
 
   get metadata(): EntityMetadata {
-    const f = this.__fixed;
-    if (f !== null) {
-      return f;
+    if (this.fixedName.length > 0) {
+      return metadataByName(this.fixedName);
     }
     return metadataById(__reflect_typeid(T), __reflect_typeid(T));
   }
@@ -2238,7 +2238,8 @@ export class EntityManager {
   getRepository<T>(entity: EntityTarget<T>): Repository<T> {
     const repo = new Repository<T>(this.executor.dataSource.options.name ?? "default", this.executor.sessionId);
     if (typeof entity === "string") {
-      repo.__fixed = metadataByName(entity as string); // (an entity given by its name or its table)
+      metadataByName(entity as string); // (an entity given by its name or its table: known, or the error now)
+      repo.fixedName = entity as string;
     }
     return repo;
   }
