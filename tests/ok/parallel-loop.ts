@@ -39,7 +39,7 @@ const d = parallelReduce(4, (i): number => {
 }, (t, x) => t + x, 0);
 console.log(d, cache.join(","));
 
-const twice = (x: int): int => x * 2;
+const twice: (x: int) => int = (x) => x * 2; // (a const of a function type stays a function value)
 console.log(parallelFrom(4, (i) => twice(i)).join(" "));
 
 const v: number[] = [1, 1, 1, 1, 1];
