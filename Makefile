@@ -1,5 +1,7 @@
 CC      ?= cc
 CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE
+# the version printed by xisto --version: the release tag (make VERSION=0.1.0), else git describe, else "dev"
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo dev)
 SRC     := $(wildcard src/*.c)
 OBJ     := $(patsubst src/%.c,build/%.o,$(SRC)) build/rt_embed.o
 
@@ -66,6 +68,13 @@ build/xisto: $(OBJ)
 build/%.o: src/%.c src/xisto.h src/diag.def | build
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# xisto --version: main.o is rebuilt when the version changes
+build/main.o: build/version.stamp
+build/main.o: CFLAGS += -DXISTO_VERSION='"$(VERSION)"'
+build/version.stamp: FORCE | build
+	@echo '$(VERSION)' | cmp -s - $@ || echo '$(VERSION)' > $@
+FORCE:
+
 build/checker.o: runtime/xisto_regex.h runtime/xisto_regex_bt.h
 
 build/rt_embed.c: tools/rtsplit.py runtime/node/async_hooks.ts runtime/node/crypto.ts runtime/node/stream.ts runtime/node/path.ts runtime/node/fs_promises.ts runtime/node/url.ts packages/xisto/io.ts packages/xisto/bytes.ts packages/xisto/parallel.ts packages/xisto/collections.ts packages/xisto/fractal.ts packages/xisto/random.ts runtime/xisto_regex.h runtime/xisto_regex_bt.h runtime/xisto_rt.h runtime/xisto_net.h runtime/xisto_sqlite.h runtime/xisto_tls.h runtime/xisto_tls_awslc.h runtime/xisto_crypto.h runtime/xisto_dbg_json.h runtime/xisto_dbg.h | build
@@ -111,4 +120,8 @@ bench-http: build/xisto
 clean:
 	rm -rf build
 
-.PHONY: all awslc test bench bench-http clean
+# a release archive in dist/ (tools/dist.sh): make dist VERSION=0.1.0
+dist: all
+	sh tools/dist.sh $(VERSION)
+
+.PHONY: all awslc test bench bench-http clean dist

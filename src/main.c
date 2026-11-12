@@ -3,6 +3,8 @@
 #include <mach-o/dyld.h>
 #endif
 #include <time.h>
+#include <limits.h>
+#include <stdlib.h>
 #include <ctype.h>
 #include <unistd.h>
 #if defined(_WIN32)
@@ -115,6 +117,9 @@ static bool tls_awslc(void) {
 static bool link_tls;
 static bool link_sqlite;
 
+#ifndef XISTO_VERSION
+#define XISTO_VERSION "dev"
+#endif
 static void usage(void) {
     fprintf(stderr,
             "usage:\n"
@@ -169,6 +174,12 @@ static void find_xisto_dir(const char *argv0) {
     ssize_t len = readlink("/proc/self/exe", buf, sizeof buf - 1);
     if (len > 0) buf[len] = 0; else strncpy(buf, argv0, sizeof buf - 1);
     (void)n;
+#endif
+#if !defined(_WIN32)
+    { /* through a symlink (bin/xisto -> build/xisto, Homebrew's links): the tools live next to the real file */
+        char real[PATH_MAX];
+        if (realpath(buf, real)) { strncpy(buf, real, sizeof buf - 1); buf[sizeof buf - 1] = 0; }
+    }
 #endif
     char *slash = strrchr(buf, '/');
     if (slash) *slash = 0;
@@ -1113,6 +1124,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 #endif
+    if (argc >= 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "version") == 0)) { printf("xisto %s\n", XISTO_VERSION); return 0; }
     if (argc >= 2 && strcmp(argv[1], "add") == 0) return cmd_add(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "install") == 0) return cmd_install();
     if (argc >= 2 && strcmp(argv[1], "clean") == 0) return clean_cache(argc >= 3 ? argv[2] : ".");

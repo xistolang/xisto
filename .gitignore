@@ -1,4 +1,5 @@
 build/
+/dist/
 *.o
 .DS_Store
 bench/out/
