@@ -377,6 +377,8 @@ static Class *find_class(const char *name) {
             return c; /* (Reflect.getMetadata & co: the global that import 'reflect-metadata' installs, the package's class) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:url") == 0 && c->exported) return c; /* (URL & co: web globals) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:intl") == 0 && strncmp(name, "Intl_", 5) == 0) return c; /* (Intl.X: global) */
+        if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:reflect") == 0 && !strcmp(name, "PropertyDescriptor"))
+            return c; /* (TypeScript's global, as a method decorator receives it: XB-107) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:reflect") == 0 && strlen(name) > 9 && !strcmp(name + strlen(name) - 9, "Decorator"))
             return c; /* (MethodDecorator & co: global, as in TypeScript) */
     }
@@ -1117,6 +1119,7 @@ static bool nullable_ok(Type *inner) {
 
 /* ---- generic interfaces: one concrete interface per list of type arguments ---- */
 static Type *resolve(Type *t, Pos pos);
+static bool is_deco_type(Type *t);
 static Type *ty_numkey(void);
 static Type *subst(Type *t, Class *tmpl, Type **args) {
     switch (t->kind) {
@@ -2390,7 +2393,8 @@ static Func *lookup_func(const char *name) {
         Func *f = e->decl;
         if (f->mod == cur_mod || (f->exported && imports_name(cur_mod, f->mod, name))) return f;
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:arrays") == 0) return f; /* (reduce & co) */
-        if ((!strcmp(name, "__xs_construct") || !strcmp(name, "__xs_ci_params")) && f->mod && f->mod->file && !strcmp(f->mod->file, "xisto:reflect")) return f; /* (new (c)()) */
+        if ((!strcmp(name, "__xs_construct") || !strcmp(name, "__xs_ci_params") || !strcmp(name, "__xs_apply") || !strcmp(name, "__xs_use_desc")) &&
+            f->mod && f->mod->file && !strcmp(f->mod->file, "xisto:reflect")) return f; /* (new (c)(); XB-107's f.apply and descriptors) */
         if (f->exported && (strstr(name, "__s_") || !strcmp(name, "__xs_fetch")) && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:url") == 0) return f; /* (URL.canParse, AbortSignal.timeout: statics of globals; fetch with its options in a value) */
         const char *st = strstr(name, "__s_"); /* a static method: visible where its class is imported */
         if (st && f->exported) {
@@ -5097,6 +5101,13 @@ static void check_object_member_in(Expr *e, Class *c);
    field, typed as the interface declares it where the class says any (checked as it is read); a field of the interface
    that is a method of the class is an error said as such */
 static void check_object_member(Expr *e, Class *c) {
+    if (e->is_call && e->str && !strncmp(e->str, "__xs_orig__", 11)) { /* (XB-107) m's own body, past its slot */
+        e->str += 11;
+        check_object_member_in(e, c);
+        e->deco_orig = true;
+        e->virt = false;
+        return;
+    }
     Field *vf = NULL;
     for (Class *k = c; k && !vf; k = k->base)
         for (int i = 0; k->view_of && i < k->nview_fields; i++) if (!strcmp(k->view_fields[i].name, e->str)) vf = &k->view_fields[i];
@@ -7558,6 +7569,40 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->type = ty_big();
                 return;
             }
+            if (!strcmp(name, "__xs_ret_unknown") && e->args.len == 1) { /* (XB-107) a method's result as unknown: null for void */
+                Expr *x = e->args.items[0];
+                check_expr(x, NULL);
+                if (x->type->kind == TY_VOID) { e->builtin.cfn = "xs_void_null"; e->type = ty_unknown; prog->uses_this_reg = true; return; }
+                to_unknown(x);
+                *e = *x;
+                return;
+            }
+            if (!strcmp(name, "__xs_this_take") && e->args.len == 0) { /* (XB-107) the object function (this: T) is called on */
+                e->builtin.cfn = "xs_this_take";
+                e->type = ty_unknown;
+                prog->uses_this_reg = true;
+                return;
+            }
+            if (!strcmp(name, "__xs_this_set") && e->args.len == 1) {
+                check_expr(e->args.items[0], NULL);
+                to_unknown(e->args.items[0]);
+                e->builtin.cfn = "xs_this_set";
+                e->type = ty_void;
+                prog->uses_this_reg = true;
+                return;
+            }
+            if (!strcmp(name, "__xs_ts_apply") && e->args.len == 2) { /* (XB-107) a TypeScript method decorator's call: what it
+                                                                          gives back (a descriptor) is the method's */
+                Expr *call = e->args.items[0], *d = e->args.items[1];
+                check_expr(call, NULL);
+                if (call->type->kind == TY_VOID || call->type->kind == TY_UNKNOWN) { *e = *call; return; }
+                Expr *f = xs_alloc(sizeof *f);
+                f->kind = E_IDENT; f->pos = e->pos; f->field = -1; f->str = "__xs_use_desc";
+                e->lhs = f;
+                e->args.items[0]->prechecked = true;
+                check_expr(e, NULL);
+                return;
+            }
             if (strcmp(name, "Symbol") == 0 && !lookup("Symbol")) { /* Symbol("desc"): a new symbol */
                 if (e->args.len > 1) xs_error(XS7123, e->pos, NULL, "Symbol() takes at most one argument (the description)");
                 if (e->args.len == 0) { Expr *nul = xs_alloc(sizeof *nul); nul->kind = E_NULL; nul->pos = e->pos; nul->field = -1; expr_list_push(&e->args, nul); }
@@ -8059,6 +8104,29 @@ static void check_expr_in(Expr *e, Type *expected) {
         e->type = e->lhs->type->elem;
         return;
     case E_MEMBER:
+        if (e->is_call && e->str && !strcmp(e->str, "apply") && e->args.len == 2 && e->lhs && e->lhs->kind != E_IDENT ? false :
+            e->is_call && e->str && !strcmp(e->str, "apply") && e->args.len == 2 && e->lhs && !lookup_func(e->lhs->str) && lookup(e->lhs->str) &&
+            lookup(e->lhs->str)->type && ty_strip_null(lookup(e->lhs->str)->type)->kind == TY_FUNC && ty_strip_null(lookup(e->lhs->str)->type)->rest) {
+            /* original.apply(this, args) of a function value of (...args): __xs_apply(original, this, args) (XB-107) */
+            Expr *f = e->lhs, *self = e->args.items[0], *args = e->args.items[1];
+            memset(e, 0, sizeof *e);
+            e->kind = E_CALL; e->pos = f->pos; e->field = -1;
+            e->lhs = xs_alloc(sizeof *e->lhs);
+            e->lhs->kind = E_IDENT; e->lhs->pos = f->pos; e->lhs->field = -1; e->lhs->str = "__xs_apply";
+            expr_list_push(&e->args, f);
+            expr_list_push(&e->args, self);
+            expr_list_push(&e->args, args);
+            check_expr(e, expected);
+            return;
+        }
+        if (e->is_call && e->str && !strcmp(e->str, "defineProperty") && e->lhs && e->lhs->kind == E_IDENT && !strcmp(e->lhs->str, "Object") &&
+            !lookup("Object") && e->args.len == 3 && (e->args.items[0]->kind == E_IDENT || e->args.items[0]->kind == E_MEMBER) &&
+            ({ check_expr(e->args.items[0], NULL); e->args.items[0]->prechecked = true; ty_strip_null(e->args.items[0]->type)->kind == TY_FUNC; })) {
+            /* Object.defineProperty(fn, 'name', ...) on a function value: its name is not kept (XB-107's wrappers) */
+            memset(e, 0, sizeof *e);
+            e->kind = E_NULL; e->field = -1; e->type = ty_null;
+            return;
+        }
         if (e->is_call && e->str && e->lhs && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->str && e->lhs->lhs &&
             e->lhs->lhs->kind == E_THIS && cur_class) {
             /* this.db.query(...) with `get db(): I { return this.dataSource as unknown as I; }`: the call on this.dataSource
@@ -9603,6 +9671,12 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (expected && expected->kind == TY_NULLABLE) e->type = expected;
         return;
     case E_AS: {
+        if (e->elem_type && e->lhs && e->op != TK_NOT && is_deco_type(e->elem_type)) { /* (t, k, d) => ... as MethodDecorator: the
+                                                                                         function as it is (XB-107) */
+            Expr *v = e->lhs;
+            check_expr(v, NULL);
+            if (v->type->kind == TY_FUNC) { *e = *v; return; }
+        }
         if (e->elem_type && e->lhs && e->op != TK_NOT) {
             /* (await db.query(sql)) as T[] | T | null with query<T = Row>(): Promise<T> called without its type argument:
                TypeScript's T defaults and the cast restates it; here the call takes the cast's type for T (its array
@@ -10095,6 +10169,15 @@ static void check_expr_in(Expr *e, Type *expected) {
     case E_ARROW: {
         Arrow *a = e->arrow;
         Func *f = a->fn;
+        if (!expected && cur_func && cur_func->deco_ret && f->nparams == 3 && !f->params[0].type && !f->params[1].type && !f->params[2].type) {
+            /* Deco(): MethodDecorator { return (target, key, descriptor) => ... }: TypeScript's method decorator's types (XB-107) */
+            Class *pd = find_class("PropertyDescriptor");
+            f->params[0].type = ty_any;
+            f->params[1].type = ty_string;
+            f->params[2].type = pd ? ty_object_of(pd) : ty_unknown;
+        }
+        if (!expected && cur_func && cur_func->deco_ret && f->nparams == 3 && f->params[0].type && f->params[0].type->kind == TY_JSON)
+            f->params[0].type = ty_any; /* ((target: object, key, descriptor) => ...): the target, the class, held as any (XB-107) */
         Type *want = expected && expected->kind == TY_FUNC ? expected :
                      expected && expected->kind == TY_NULLABLE && expected->elem->kind == TY_FUNC ? expected->elem : NULL; /* onX?: (t: T) => void */
         if (!want && expected && (expected->kind == TY_UNION || (expected->kind == TY_NULLABLE && expected->elem->kind == TY_UNION))) {
@@ -11674,6 +11757,17 @@ static UNarrow union_narrow(Expr *c) {
         else r.else_t = a.else_t;
         return r;
     }
+    if (c->kind == E_CALL && !c->builtin.cfn && c->args.len >= 1 && c->type && c->type->kind == TY_BOOLEAN && c->type->elem) {
+        /* if (isPromise(x)) with isPromise(v: unknown): v is Promise<T>: x is a T there (TypeScript takes the predicate's word) */
+        Expr *id = union_ident(c->args.items[0]);
+        Binding *b = id ? lookup(id->str) : NULL;
+        if (!b || !b->type || b->type->kind != TY_UNKNOWN) return r;
+        Type *t = resolve(c->type->elem, c->pos);
+        if (t->kind == TY_TPARAM) return r;
+        r.b = b;
+        r.then_t = t;
+        return r;
+    }
     if (c->kind == E_CALL && c->builtin.cfn && strcmp(c->builtin.cfn, "xs_is_array") == 0 && c->args.len == 1) {
         /* Array.isArray(x) with x: Record<string, V> | V[]: the array member, and the rest on the other side */
         Expr *id = union_ident(c->args.items[0]);
@@ -12355,7 +12449,25 @@ static bool always_returns(Stmt *s) {
     }
 }
 
+/* MethodDecorator, ClassDecorator, PropertyDecorator (or an intersection of them) as written, not resolved */
+static bool is_deco_type(Type *t) {
+    if (!t) return false;
+    if (t->kind == TY_TPARAM && t->tname && !strcmp(t->tname, "__inter")) return is_deco_type(t->elem) && is_deco_type(t->key);
+    if (t->kind != TY_OBJECT || !t->cls || !t->cls->name) return false;
+    Mixin *m = t->cls->mixin;
+    if (m && m->kind && !strcmp(m->kind, "IntersectionType") && m->a && m->b && !m->a->kind && !m->b->kind && m->a->cls && m->b->cls) {
+        /* (MethodDecorator & ClassDecorator: the parser's interface of both) */
+        const char *a = m->a->cls, *b = m->b->cls;
+        bool da = !strcmp(a, "MethodDecorator") || !strcmp(a, "ClassDecorator") || !strcmp(a, "PropertyDecorator");
+        bool db = !strcmp(b, "MethodDecorator") || !strcmp(b, "ClassDecorator") || !strcmp(b, "PropertyDecorator");
+        return da && db;
+    }
+    const char *n = t->cls->name;
+    return !strcmp(n, "MethodDecorator") || !strcmp(n, "ClassDecorator") || !strcmp(n, "PropertyDecorator");
+}
 static void resolve_signature(Func *f) {
+    if (f->ret && f->body && is_deco_type(f->ret)) { f->ret = NULL; f->ret_src = NULL; f->deco_ret = true; } /* (XB-107: Trace(): MethodDecorator { return
+        (target, key, descriptor) => ... }: the type of what it returns, TypeScript's three-argument form or xisto's) */
     for (int i = 0; i < f->nparams; i++) {
         f->params[i].type = resolve(f->params[i].type, f->pos);
         check_type_supported(f->pos, f->params[i].type);
@@ -12828,6 +12940,9 @@ static void check_func(Func *f) {
     tmp_counter = 0;
     cur_func = f;
     cur_class = f->cls;
+    bool cg_was = checking_generated;
+    if (f->name && (!strncmp(f->name, "__xs_orig_", 10) || !strncmp(f->name, "__xs_stub_", 10))) checking_generated = true; /* (XB-107:
+                                                                                         a slot reaches private methods) */
     nsev = 0; /* which variables closures share (cells) */
     for (int i = 0; i < f->nparams; i++) scan_ev(f->params[i].name, 0, 'd');
     scan_stmt(f->body, 0);
@@ -12882,6 +12997,7 @@ static void check_func(Func *f) {
     if (f->ret->kind != TY_VOID && !f->is_gen && !always_returns(f->body))
         xs_error(XS8058, f->pos, "add a return at the end of the function", "'%s' may reach its end without returning a %s", f->name, ty_name(f->ret));
     tmp_counter = saved_tmp;
+    checking_generated = cg_was;
     cur_func = NULL;
     cur_class = NULL;
 }
@@ -13886,6 +14002,175 @@ static bool failed_;
 static void check_func(Func *f);
 #define II_SAVE(arr, n, T) T *arr##_s = n ? xs_alloc(sizeof(T) * (size_t)n) : NULL; if (n) memcpy(arr##_s, arr, sizeof(T) * (size_t)n); int n##_s = n;
 #define II_BACK(arr, n, T) if (n##_s) { arr = realloc(arr, sizeof(T) * (size_t)n##_s); memcpy(arr, arr##_s, sizeof(T) * (size_t)n##_s); } n = n##_s;
+/* ---- XB-107: a method decorator written as TypeScript's, (target, key, descriptor) => ..., that may replace
+   descriptor.value. Reflection writes each method decorator's call twice (parser: reflect_class), under
+   if (__xs_ts_deco(__decoN, "C", "m")); here, before the module's code is checked, the branch the decorator's type
+   takes is kept. A TypeScript one gives the method a slot: __xs_slot_C_m, a function of (...args: unknown[]), first
+   __xs_orig_C_m (the method's own body, emitted as <cname>__orig); C.m's calls (direct, this.m(), dispatched,
+   reflection) go to __xs_stub_C_m, which sets the object (__xs_this_set) and calls the slot. Other methods keep
+   their direct calls. */
+/* the arrow a decorator factory returns, read from its body (its type is not inferred yet: the module's code is not
+   checked; a factory returns (target, key, descriptor) => ... or xisto's (c, m) => ...) */
+static int returned_arity(Func *f) {
+    if (!f->body) return -1;
+    for (int i = f->body->stmts.len - 1; i >= 0; i--) {
+        Stmt *st = f->body->stmts.items[i];
+        if (!st || st->kind != S_RETURN || !st->expr) continue;
+        Expr *x = st->expr;
+        while (x && x->kind == E_AS) x = x->lhs;
+        if (x && x->kind == E_ARROW) return x->arrow->fn->nparams;
+        return -1;
+    }
+    return -1;
+}
+static bool deco_is_ts(Expr *src) {
+    Type *t = NULL;
+    if (src->kind == E_CALL && src->lhs && src->lhs->kind == E_IDENT) {
+        Func *f = lookup_func(src->lhs->str);
+        if (f && !f->ntparams) {
+            resolve_signature(f);
+            if (!f->ret) return returned_arity(f) == 3;
+            t = f->ret;
+        }
+        else {
+            Binding *b = lookup(src->lhs->str);
+            if (b && b->type && b->type->kind == TY_FUNC) t = b->type->ret;
+        }
+    } else if (src->kind == E_IDENT) {
+        Func *f = lookup_func(src->str);
+        if (f && !f->ntparams) { resolve_signature(f); return f->nparams == 3; }
+        Binding *b = lookup(src->str);
+        if (b && b->type) t = b->type;
+    }
+    t = t ? ty_strip_null(t) : NULL;
+    return t && t->kind == TY_FUNC && t->nparams == 3;
+}
+static const char *param_text(Param *pr) {
+    bool opt = pr->dflt && pr->dflt->kind == E_NULL;
+    return opt ? xs_sprintf("(%s) | null", pr->type_src) : pr->type_src;
+}
+/* the slot of C.m (once per method: stacked decorators wrap what the previous one left) */
+/* the functions of a slot, parsed in module m: each named, kept (the emitter calls the stub), its signature resolved
+   unless it names an inferred return (later: deco_late_stubs) */
+static void deco_funcs(Program *p, Module *m, const char *text, Pos pos, Func *f, StmtList *decls) {
+    if (getenv("XISTO_SHOW_REFLECT")) fprintf(stderr, "/* XB-107 slot of %s.%s */\n%s\n", f->cls->name, f->name, text);
+    int nf0 = p->nfuncs;
+    StmtList d = xs_parse_decls(p, m, text, pos);
+    if (decls) *decls = d;
+    Module *was = cur_mod;
+    Scope *ss = scope;
+    for (int i = nf0; i < p->nfuncs; i++) {
+        Func *g = p->funcs[i];
+        g->cname = xs_sprintf("f%d_%s", g->mod->id, g->name);
+        g->used = true;
+        sym_add(&funcs_by_name, g->name, g);
+        resolve_signature(g);
+        if (!strncmp(g->name, "__xs_stub_", 10)) f->deco_stub = g;
+    }
+    cur_mod = was;
+    scope = ss;
+    if (cur_mod) { xs_file_name = cur_mod->file; xs_source = cur_mod->src; }
+}
+static void deco_stub_text(Buf *b, Func *f, const char *rs, const char *inner, bool async, bool is_void) {
+    const char *cn = f->cls->name, *mn = f->name;
+    buf_printf(b, "%sfunction __xs_stub_%s_%s(__self: %s", async ? "async " : "", cn, mn, cn);
+    for (int i = 0; i < f->nparams; i++) buf_printf(b, ", %s: %s", f->params[i].name, param_text(&f->params[i]));
+    buf_printf(b, "): %s {\n  __xs_this_set(__self);\n  %s__xs_slot_%s_%s(", rs, is_void ? "" : "return ", cn, mn);
+    for (int i = 0; i < f->nparams; i++) buf_printf(b, "%s%s", i ? ", " : "", f->params[i].name);
+    buf_printf(b, ")%s;\n}\n", is_void ? "" : xs_sprintf(" as %s", inner));
+}
+/* the slot of C.m (once per method: stacked decorators wrap what the previous one left) */
+static bool deco_slot(Program *p, Module *m, const char *cn, const char *mn, int at, int *added) {
+    *added = 0;
+    Class *c = find_class(cn);
+    Func *f = c ? find_method(c, mn) : NULL;
+    if (!f || f->cls != c || f->ntparams || f->is_abstract) return false;
+    if (f->deco_slotted) return true;
+    for (int i = 0; i < f->nparams; i++) if (!f->params[i].type_src || f->params[i].rest) return false;
+    f->deco_slotted = true;
+    Buf b = {0};
+    buf_printf(&b, "function __xs_orig_%s_%s(...args: unknown[]): unknown {\n  const __s = __xs_this_take() as %s;\n  return __xs_ret_unknown(__s.__xs_orig__%s(",
+               cn, mn, cn, mn);
+    for (int i = 0; i < f->nparams; i++) buf_printf(&b, "%sargs[%d] as %s", i ? ", " : "", i, param_text(&f->params[i]));
+    buf_puts(&b, "));\n}\n");
+    buf_printf(&b, "let __xs_slot_%s_%s: (...args: unknown[]) => unknown = __xs_orig_%s_%s;\n", cn, mn, cn, mn);
+    const char *rs = f->ret_src;
+    if (rs) { /* (written: the stub now; inferred: deco_late_stubs, once the class's bodies are checked) */
+        bool async = f->is_async || !strncmp(rs, "Promise<", 8);
+        const char *inner = !strncmp(rs, "Promise<", 8) ? xs_strndup(rs + 8, strlen(rs) - 9) : rs;
+        deco_stub_text(&b, f, rs, inner, async, !strcmp(inner, "void"));
+    } else f->deco_late = true;
+    StmtList decls = {0};
+    deco_funcs(p, m, b.data, f->pos, f, &decls);
+    for (int k = 0; k < decls.len; k++) { /* (before the decorator's statement) */
+        stmt_list_push(&p->top, NULL);
+        memmove(p->top.items + at + 1, p->top.items + at, sizeof(Stmt *) * (size_t)(p->top.len - 1 - at));
+        p->top.items[at] = decls.items[k];
+        at++;
+        (*added)++;
+    }
+    return true;
+}
+/* the stubs of slotted methods whose return type is inferred: written once the class bodies are checked */
+static void deco_late_stubs(Program *p) {
+    for (int ci = 0; ci < p->nclasses; ci++) {
+        Class *c = p->classes[ci];
+        for (int k = 0; k < c->nmethods; k++) {
+            Func *f = c->methods[k];
+            if (!f->deco_late || f->cls != c) continue;
+            f->deco_late = false;
+            enter_module(c->mod);
+            Type *rt = NULL;
+            RECOVER_BEGIN rt = fret(f, f->pos); RECOVER_END
+            if (!rt) continue;
+            bool async = f->is_async || f->ret_promise;
+            const char *inner = xs_sprintf("__ret_of<%s, %s>", c->name, f->name);
+            const char *rs = async ? xs_sprintf("Promise<%s>", inner) : inner;
+            Buf b = {0};
+            deco_stub_text(&b, f, rs, inner, async, rt->kind == TY_VOID);
+            RECOVER_BEGIN deco_funcs(p, c->mod, b.data, f->pos, f, NULL); RECOVER_END
+        }
+    }
+}
+static void deco_prepass(Program *p, Module *m) {
+    for (int i = 0; i < p->top.len; i++) {
+        Stmt *s = p->top.items[i];
+        if (s->mod != m || s->kind != S_IF || !s->generated || !s->cond || s->cond->kind != E_CALL || !s->cond->lhs ||
+            s->cond->lhs->kind != E_IDENT || !s->cond->lhs->str || strcmp(s->cond->lhs->str, "__xs_ts_deco") != 0 || s->cond->args.len != 3)
+            continue;
+        Expr *c = s->cond;
+        const char *dn = c->args.items[0]->str, *cn = c->args.items[1]->str, *mn = c->args.items[2]->str;
+        Expr *src = NULL;
+        for (int k = i - 1; k >= 0 && !src; k--) {
+            Stmt *d = p->top.items[k];
+            if (d->mod == m && d->kind == S_VAR && d->name && !strcmp(d->name, dn)) src = d->init;
+        }
+        bool ts = false;
+        if (src && !getenv("XISTO_NO_XB107")) { /* (XISTO_NO_XB107: measuring knob) */
+            jmp_buf *outer = xs_error_recover;
+            bool was_failed = failed_;
+            RECOVER_BEGIN ts = deco_is_ts(src); RECOVER_END
+            xs_error_recover = outer;
+            failed_ = was_failed;
+        }
+        enter_module(m);
+        int added = 0;
+        if (ts) {
+            int at = i;
+            for (int k = i - 1; k >= 0; k--) { Stmt *d = p->top.items[k]; if (d->mod == m && d->kind == S_VAR && d->name && !strcmp(d->name, dn)) { at = k; break; } }
+            ts = deco_slot(p, m, cn, mn, at, &added);
+            enter_module(m);
+        }
+        s = p->top.items[i + added];
+        Stmt *keep = ts ? s->body : s->else_body;
+        Stmt kept = *keep;
+        kept.mod = s->mod;
+        kept.pos = s->pos;
+        kept.generated = true;
+        *s = kept;
+        i += added;
+    }
+}
 static Type *fret(Func *f, Pos pos) {
     if (f->ret) { if (f->ret_failed) xs_error_quiet(); return f->ret; }
     if (f->ret_infer == 2)
@@ -14373,6 +14658,7 @@ void check_program(Program *p) {
                 }
             }
         }
+        deco_prepass(p, m); /* (XB-107: a TypeScript method decorator's branch, and its method's slot) */
         nsev = 0; /* the module's top-level code: which of its block variables closures share */
         for (int i = 0; i < p->top.len; i++) if (p->top.items[i]->mod == m) scan_stmt(p->top.items[i], 0);
         static bool ii_top_done;
@@ -14395,6 +14681,7 @@ void check_program(Program *p) {
         if (c->gen_state || c->generic_of || c->adapter_of) continue; /* a generic class's template; instances (and adapters) are checked below */
         check_class_bodies(c);
     }
+    deco_late_stubs(p); /* (XB-107: the slots of methods whose return type is inferred) */
     for (int i = 0; i < p->nfuncs; i++)
         if (!p->funcs[i]->mod->builtin && !p->funcs[i]->ntparams && !p->funcs[i]->sig_failed) { RECOVER_BEGIN check_func(p->funcs[i]); RECOVER_END }
     /* generic instances, classes and functions (an instance can make more); then they join the program */
