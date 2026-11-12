@@ -11,7 +11,7 @@ class Req {
   @Column({ name: "CD_EMPRESA", type: "number" })
   cdEmpresa: number;
   @OneToMany(() => Metodo, (m) => m.req)
-  metodos?: Metodo[];
+  metodos: Metodo[];
 }
 
 @Entity("XISTO_TO_METODO")
@@ -24,7 +24,7 @@ class Metodo {
   idMetodo: string;
   @ManyToOne(() => Req, (r) => r.metodos)
   @JoinColumn({ name: "CD_REQ" })
-  req?: Req;
+  req: Req;
 }
 
 async function main(): Promise<void> {
@@ -58,7 +58,7 @@ async function main(): Promise<void> {
   const all = await metodos.find({ relations: ["req"], order: { cdMetodo: "ASC" } });
   console.log(all.map((m: Metodo): string => `${m.cdMetodo}:${m.req?.cdEmpresa}`).join(" "));
   const plain = await metodos.find({ order: { cdMetodo: "ASC" } });
-  console.log(plain.map((m: Metodo): string => `${m.cdMetodo}:${m.req === undefined ? "no req" : "req"}`).join(" "));
+  console.log(plain.map((m: Metodo): string => `${m.cdMetodo}:${m.req?.cdEmpresa ?? "no req"}`).join(" "));
   const reqs = await ds.getRepository<Req>(Req).find({ relations: ["metodos"], order: { cdReq: "ASC" } });
   for (const r of reqs) {
     const ids = (r.metodos ?? []).map((m: Metodo): string => m.idMetodo).sort();
