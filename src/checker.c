@@ -1,6 +1,7 @@
 #include "xisto.h"
 #define XR_CORE_ONLY 1
 #include "../runtime/xisto_regex.h" /* patterns of /literals/ are compiled here once, to report their errors */
+#include "../runtime/xisto_regex_bt.h" /* (and those only backtracking can match) */
 #include <ctype.h>
 #include <math.h>
 #include <stdarg.h>
@@ -11446,6 +11447,11 @@ static void check_expr_in(Expr *e, Type *expected) {
         int fl = xr_parse_flags(e->rflags, strlen(e->rflags), &err);
         if (fl < 0) xs_error(XS8111, e->pos, "flags: d g i m s u v y, each at most once", "invalid regular expression flags '%s'", e->rflags);
         xr_re *re = xr_compile(e->str, strlen(e->str), fl, &err);
+        if (!re && err && strstr(err, "backtracking")) { /* (backreferences, lookaround: the backtracking engine, xisto_regex_bt.h) */
+            const char *e2 = NULL;
+            re = xrb_compile(e->str, strlen(e->str), fl, &e2);
+            if (re) prog->uses_rebt = true; else err = e2;
+        }
         if (!re) xs_error(XS8110, e->pos, NULL, "invalid regular expression /%s/: %s", e->str, err);
         xr_free(re);
         e->type = ty_object_of(find_class("RegExp"));
@@ -12475,6 +12481,17 @@ static void check_expr_in(Expr *e, Type *expected) {
                 }
                 e->builtin.cfn = "xs_RegExp_new";
                 prog->uses_regex = true;
+                { /* new RegExp(text): a pattern only backtracking can match, or one not known until it runs, brings that engine */
+                    Expr *src = e->args.items[0];
+                    if (src->kind != E_STRING) prog->uses_rebt = true;
+                    else {
+                        const char *err = NULL;
+                        int fl = e->args.len > 1 && e->args.items[1]->kind == E_STRING ? xr_parse_flags(e->args.items[1]->str, strlen(e->args.items[1]->str), &err) : 0;
+                        xr_re *re = fl >= 0 ? xr_compile(src->str, strlen(src->str), fl, &err) : NULL;
+                        if (!re && err && strstr(err, "backtracking")) prog->uses_rebt = true;
+                        xr_free(re);
+                    }
+                }
                 return;
             }
             if (strcmp(c->name, "Error") == 0) {

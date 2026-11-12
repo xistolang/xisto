@@ -1,3 +1,3 @@
-// expect: lookahead ((?= and (?!) of more than one character is not supported
-const r = /x(?=yz)/;
+// expect: nothing to repeat
+const r = /x(?<=x)*/;
 console.log(r.test("xyz"));

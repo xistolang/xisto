@@ -66,9 +66,9 @@ build/xisto: $(OBJ)
 build/%.o: src/%.c src/xisto.h src/diag.def | build
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-build/checker.o: runtime/xisto_regex.h
+build/checker.o: runtime/xisto_regex.h runtime/xisto_regex_bt.h
 
-build/rt_embed.c: tools/rtsplit.py runtime/node/async_hooks.ts runtime/node/crypto.ts runtime/node/stream.ts runtime/node/path.ts runtime/node/fs_promises.ts runtime/node/url.ts packages/xisto/io.ts packages/xisto/bytes.ts packages/xisto/parallel.ts packages/xisto/collections.ts packages/xisto/fractal.ts packages/xisto/random.ts runtime/xisto_regex.h runtime/xisto_rt.h runtime/xisto_net.h runtime/xisto_sqlite.h runtime/xisto_tls.h runtime/xisto_tls_awslc.h runtime/xisto_crypto.h runtime/xisto_dbg_json.h runtime/xisto_dbg.h | build
+build/rt_embed.c: tools/rtsplit.py runtime/node/async_hooks.ts runtime/node/crypto.ts runtime/node/stream.ts runtime/node/path.ts runtime/node/fs_promises.ts runtime/node/url.ts packages/xisto/io.ts packages/xisto/bytes.ts packages/xisto/parallel.ts packages/xisto/collections.ts packages/xisto/fractal.ts packages/xisto/random.ts runtime/xisto_regex.h runtime/xisto_regex_bt.h runtime/xisto_rt.h runtime/xisto_net.h runtime/xisto_sqlite.h runtime/xisto_tls.h runtime/xisto_tls_awslc.h runtime/xisto_crypto.h runtime/xisto_dbg_json.h runtime/xisto_dbg.h | build
 	{ echo 'const unsigned char xs_runtime_h[] = {'; xxd -i < runtime/xisto_rt.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_net_h[] = {'; xxd -i < runtime/xisto_net.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_sqlite_h[] = {'; xxd -i < runtime/xisto_sqlite.h; echo ', 0x00 };'; \
@@ -76,6 +76,7 @@ build/rt_embed.c: tools/rtsplit.py runtime/node/async_hooks.ts runtime/node/cryp
 	  echo 'const unsigned char xs_runtime_tls_awslc_h[] = {'; xxd -i < runtime/xisto_tls_awslc.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_crypto_h[] = {'; xxd -i < runtime/xisto_crypto.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_regex_h[] = {'; xxd -i < runtime/xisto_regex.h; echo ', 0x00 };'; \
+	  echo 'const unsigned char xs_runtime_regex_bt_h[] = {'; xxd -i < runtime/xisto_regex_bt.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_dbg_json_h[] = {'; xxd -i < runtime/xisto_dbg_json.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_dbg_h[] = {'; xxd -i < runtime/xisto_dbg.h; echo ', 0x00 };'; \
 	  for n in async_hooks crypto stream path fs_promises url; do echo "const unsigned char xs_node_$${n}_ts[] = {"; xxd -i < runtime/node/$$n.ts; echo ', 0x00 };'; done; \

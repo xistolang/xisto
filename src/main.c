@@ -65,6 +65,8 @@ extern const unsigned char xs_runtime_tls_h[];
 extern const unsigned char xs_runtime_tls_awslc_h[];
 extern const unsigned char xs_runtime_crypto_h[];
 extern const unsigned char xs_runtime_regex_h[];
+extern const unsigned char xs_runtime_regex_bt_h[];
+static void regex_with_bt(Buf *b);
 extern const unsigned char xs_runtime_dbg_json_h[];
 extern const unsigned char xs_runtime_dbg_h[];
 /* the runtime split in two (tools/rtsplit.py): what a program includes, and the library compiled once */
@@ -382,7 +384,7 @@ static Buf compile_to_c(const char *path) {
         if (p->uses_tls) { buf_puts(&b, "#define XS_WITH_TLS 1\n"); link_tls = true; }
         if (p->uses_regex) buf_puts(&b, "#define XS_RT_REGEX 1\n");
         rt_src.len = 0;
-        if (split_rt) { /* the same configuration for the library */
+        if (split_rt && !p->uses_rebt) { /* the same configuration for the library */
             buf_puts(&rt_src, b.data ? b.data : "");
 #define XS_RT_ADD(n) do { buf_puts(&b, (const char *)xs_runtime_##n##_h_decl); buf_puts(&rt_src, (const char *)xs_runtime_##n##_h_impl); } while (0)
             XS_RT_ADD(rt);
@@ -399,7 +401,8 @@ static Buf compile_to_c(const char *path) {
             if (p->uses_tls) buf_puts(&b, (const char *)(tls_awslc() ? xs_runtime_tls_awslc_h : xs_runtime_tls_h));
             if (p->uses_sqlite) { buf_puts(&b, (const char *)xs_runtime_sqlite_h); link_sqlite = true; }
             if (p->uses_crypto) buf_puts(&b, (const char *)xs_runtime_crypto_h);
-            if (p->uses_regex) buf_puts(&b, (const char *)xs_runtime_regex_h);
+            if (p->uses_regex && p->uses_rebt) regex_with_bt(&b);
+            else if (p->uses_regex) buf_puts(&b, (const char *)xs_runtime_regex_h);
         }
         for (int i = 0; i < p->nnative; i++) { /* native packages: their C joins the program, after the runtime it builds on */
             char *src = xs_read_file(p->native_files[i]);
@@ -420,6 +423,44 @@ static Buf compile_to_c(const char *path) {
     return b;
 }
 
+
+/* the linear RegExp engine with the backtracking one (runtime/xisto_regex_bt.h) beside it, for a program that has a
+   pattern only backtracking can match: four places of xisto_regex.h are joined to it as the text is copied (the header
+   itself stays as it is, so every other program's C is unchanged): the two compiles try the other engine for what the
+   linear one refuses as needing backtracking, and a search of a pattern compiled by it is its search */
+static void regex_rep(char **text, const char *from, const char *to) {
+    char *at = strstr(*text, from);
+    if (!at || strstr(at + strlen(from), from)) { fprintf(stderr, "xisto: internal error: runtime/xisto_regex.h changed (%.60s)\n", from); exit(70); }
+    size_t pre = (size_t)(at - *text), fl = strlen(from), tl = strlen(to), tot = strlen(*text);
+    char *o = malloc(tot - fl + tl + 1);
+    memcpy(o, *text, pre);
+    memcpy(o + pre, to, tl);
+    memcpy(o + pre + tl, at + fl, tot - pre - fl + 1);
+    free(*text);
+    *text = o;
+}
+static void regex_with_bt(Buf *b) {
+    char *t = strdup((const char *)xs_runtime_regex_h);
+    regex_rep(&t, "xr_re *re = xr_compile(src->data, (size_t)src->len, f, &err);", "xr_re *re = xr_compile_any(src->data, (size_t)src->len, f, &err);");
+    regex_rep(&t, "*slot = xr_compile(src, (size_t)n, f, &err);", "*slot = xr_compile_any(src, (size_t)n, f, &err);");
+    regex_rep(&t, "XS_NOINLINE xs_RegExp *xs_RegExp_new(xs_str *src, xs_str *flags) {",
+              "static xr_re *xr_compile_any(const char *src, size_t n, int f, const char **err);\nXS_NOINLINE xs_RegExp *xs_RegExp_new(xs_str *src, xs_str *flags) {");
+    regex_rep(&t, "static bool xr_match_at(xs_RegExp *r, xs_str *s, int64_t from, bool sticky, xr_m *m, bool want_caps) {\n    m->more = NULL;",
+              "static bool xrb_match_at(xs_RegExp *r, xs_str *s, int64_t from, bool sticky, xr_m *m, bool want_caps);\n"
+              "static bool xr_match_at(xs_RegExp *r, xs_str *s, int64_t from, bool sticky, xr_m *m, bool want_caps) {\n    m->more = NULL;\n"
+              "    if (r->re->fwd.n < 0) return xrb_match_at(r, s, from, sticky, m, want_caps);");
+    regex_rep(&t, "if (!lg) return xr_test(r->re, s->data, (size_t)s->len, 0, false);",
+              "if (!lg && r->re->fwd.n < 0) { xr_m m0_; bool ok_ = xr_match_at(r, s, 0, false, &m0_, false); free(m0_.more); return ok_; }\n"
+              "    if (!lg) return xr_test(r->re, s->data, (size_t)s->len, 0, false);");
+    /* (the backtracking engine goes inside the header's guard: before its last #endif) */
+    char *e = strstr(t, "#endif");
+    char *last = NULL;
+    for (char *q = e; q; q = strstr(q + 1, "#endif")) last = q;
+    buf_printf(b, "%.*s", (int)(last - t), t);
+    buf_puts(b, (const char *)xs_runtime_regex_bt_h);
+    buf_puts(b, last);
+    free(t);
+}
 static char *strip_ts(const char *path) {
     const char *base = strrchr(path, '/');
     base = base ? base + 1 : path;
