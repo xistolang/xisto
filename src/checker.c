@@ -3137,6 +3137,20 @@ static bool dyn_to(Expr *e, Type *want) {
     Expr *v = xs_alloc(sizeof *v);
     *v = *e;
     Pos pos = e->pos;
+    bool fresh = v->kind == E_AWAIT || v->kind == E_CALL || (v->kind == E_MEMBER && v->is_call); /* (a call's result: no one else holds it) */
+    if (fresh && w->kind == TY_OBJECT && (w->cls->is_interface || made_shape(w->cls)) && !w->cls->nmethods && !w->cls->iface_methods &&
+        !w->cls->view_of && json_ok(w, 0)) {
+        /* an any a call gives (a query's rows: JSON's objects) where an interface of data goes (const r: Structured = await
+           qr.query(...)): written as its JSON and decoded into it, checked field by field (a copy, as a typed query's
+           result is; a value a variable holds keeps the check of its type, so no object is copied behind the program) */
+        v->prechecked = true;
+        Expr *js = xs_alloc(sizeof *js);
+        js->kind = E_AS; js->pos = pos; js->field = -1; js->lhs = v; js->elem_type = ty_json;
+        memset(e, 0, sizeof *e);
+        e->kind = E_AS; e->pos = pos; e->field = -1; e->lhs = js; e->elem_type = want;
+        check_expr(e, want);
+        return true;
+    }
     memset(e, 0, sizeof *e);
     e->kind = E_AS; e->pos = pos; e->field = -1; e->lhs = v; e->elem_type = want; e->type = want;
     return true;
