@@ -345,6 +345,8 @@ static Class *find_class(const char *name) {
         if (c->mod == cur_mod || (c->exported && imports_name(cur_mod, c->mod, name))) return c;
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:errors") == 0) return c; /* (TypeError & co: global, like Error) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:intl") == 0 && strncmp(name, "Intl_", 5) == 0) return c; /* (Intl.X: global) */
+        if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:reflect") == 0 && strlen(name) > 9 && !strcmp(name + strlen(name) - 9, "Decorator"))
+            return c; /* (MethodDecorator & co: global, as in TypeScript) */
     }
     if (strcmp(name, "RegExpMatchArray") == 0) name = "RegExpExecArray"; /* TypeScript's two names for a match */
     bool wt = strcmp(name, "Worker") == 0 || strcmp(name, "MessagePort") == 0;
@@ -495,6 +497,7 @@ static bool check_fs_fd_call(Expr *e, Func *f) {
 static bool is_f64(Type *t) { return t && t->kind == TY_OBJECT && t->cls->builtin && strcmp(t->cls->name, "Float64Array") == 0; }
 static bool is_sab(Type *t) { return t && t->kind == TY_OBJECT && t->cls->builtin && strcmp(t->cls->name, "SharedArrayBuffer") == 0; }
 static Expr *str_lit(Pos pos, const char *s);
+static void undef_text(Expr *x);
 static bool boolish(Expr *r);
 static Expr *null_str(Pos pos) { /* a missing optional string argument: NULL in C */
     Expr *n = xs_alloc(sizeof *n);
@@ -1319,6 +1322,18 @@ static void gen_convert(Expr *e) {
            instance for T would have decoded it (an object of T itself comes back equal, a copy) */
         Expr *js = xs_alloc(sizeof *js);
         js->kind = E_AS; js->pos = in->pos; js->field = -1; js->lhs = in; js->elem_type = ty_json;
+        /* XS2110: accepted (Isa, 11/11), with its cost said: a copy, not the object the function returned */
+        Expr *callee = in->kind == E_AWAIT ? in->lhs : in;
+        if (callee && callee->kind == E_SPAWN) callee = callee->lhs;
+        const char *fname = "f";
+        if (callee && callee->kind == E_CALL && callee->lhs && callee->lhs->kind == E_IDENT && callee->lhs->str) fname = callee->lhs->str;
+        else if (callee && callee->kind == E_CALL && callee->lhs && callee->lhs->kind == E_MEMBER && callee->lhs->str) fname = callee->lhs->str;
+        xs_warn_rule(XS2110, in->pos,
+                     "its type parameter is read as unknown, so the value is written to JSON and decoded as the type given (no identity "
+                     "with the object returned; a cost per call that grows with its size): give the function a concrete return type, "
+                     "or make it a generic function or method instead of a value",
+                     "the result of the generic function value '%s' is a copy of %s made through JSON", fname,
+                     strstr(ty_name(t), "__Obj_") ? "the object type given" : ty_name(t));
         in = js;
     }
     memset(e, 0, sizeof *e);
@@ -2761,12 +2776,23 @@ static void expect_type(Expr *e, Type *want, const char *what) {
             e->type = want;
             return;
         }
+        /* Record<string, string> where Record<string, string | undefined> or Record<string, unknown> goes (process.env passed as
+           an env): values held by reference either way, the same map (TypeScript lets the wider type read it) */
+        if (w->kind == TY_MAP && e->type->kind == TY_MAP && ty_equal(w->key, e->type->key) && ty_is_heap(e->type->elem) &&
+            ((w->elem->kind == TY_UNKNOWN && !ty_is_any(w->elem)) || (w->elem->kind == TY_NULLABLE && ty_equal(w->elem->elem, e->type->elem)))) {
+            e->type = want;
+            return;
+        }
         if (w->kind == TY_ARRAY && w->elem->kind == TY_MAP && e->type->kind == TY_ARRAY && e->type->elem->kind == TY_MAP &&
             ty_equal(w->elem->key, e->type->elem->key) && w->elem->elem->kind == TY_UNKNOWN && !ty_is_any(w->elem->elem) &&
             ty_strip_null(e->type->elem->elem)->kind == TY_UNION) {
             e->type = want; /* Map<string, A | B>[] where Map<string, unknown>[] goes: the same */
             return;
         }
+    }
+    if (e->type->kind == TY_ENUM && e->type->en->is_string && ty_strip_null(want)->kind == TY_STRING && !ty_strip_null(want)->tname) {
+        e->type = want; /* a string enum's value where a string goes: its text (TypeScript widens it) */
+        return;
     }
     if (want->kind == TY_UNKNOWN && e->type->kind != TY_UNKNOWN && e->type->kind != TY_VOID) { to_unknown(e); return; }
     if (want->kind == TY_JSON && e->type->kind != TY_JSON && e->type->kind != TY_NULL) { /* unknown members: written by what they hold, as JSON.stringify does */
@@ -4662,7 +4688,14 @@ static bool objlit_expand(Expr *e, Type *expected) {
             Expr *pair = xs_alloc(sizeof *pair);
             pair->kind = E_ARRAY_LIT; pair->pos = a->pos; pair->field = -1;
             Expr *k, *val;
-            if (strcmp(e->keys[i], "[]") == 0) { k = a->lhs; val = a->rhs; }
+            if (strcmp(e->keys[i], "[]") == 0) {
+                k = a->lhs; val = a->rhs;
+                if (k->kind == E_NUMBER && k->is_int_lit && rec->key->kind == TY_STRING) { /* { 1: x } where Record<string, V> goes: the key "1" */
+                    Expr *ks = xs_alloc(sizeof *ks);
+                    ks->kind = E_STRING; ks->pos = k->pos; ks->field = -1; ks->str = xs_sprintf("%lld", k->ival);
+                    k = ks;
+                }
+            }
             else {
                 k = xs_alloc(sizeof *k);
                 k->kind = E_STRING; k->pos = a->pos; k->field = -1; k->str = e->keys[i];
@@ -5963,6 +5996,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 check_expr(e->args.items[0], NULL);
                 Expr *a = e->args.items[0];
                 settle(a);
+                if (ty_is_undef(a->type)) { undef_text(a); *e = *a; return; } /* String(f()) with f(): undefined */
                 if (a->type->kind == TY_INT) e->builtin.cfn = "xs_str_from_int";
                 else if (a->type->kind == TY_NUMBER) e->builtin.cfn = "xs_str_from_num";
                 else if (a->type->kind == TY_BOOLEAN) e->builtin.cfn = "xs_str_from_bool";
@@ -6691,6 +6725,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     check_expr(e->args.items[i], NULL);
                     settle(e->args.items[i]);
                     Type *t = e->args.items[i]->type;
+                    if (ty_is_undef(t)) { undef_text(e->args.items[i]); continue; } /* console.log(f()) with f(): undefined */
                     if (t->kind == TY_VOID || t->kind == TY_FUNC)
                         xs_error(XS8097, e->args.items[i]->pos, NULL, "cannot print a %s value", ty_name(t));
                 }
@@ -8217,6 +8252,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 big_call(t, "xs_big_to_string", part, NULL, ty_string);
                 e->args.items[i] = part = t;
             }
+            if (ty_is_undef(part->type)) { undef_text(part); continue; } /* ${x} with x: undefined */
             if (ty_is_any(part->type)) { dyn_wrap(part, "xs_dyn_str", ty_string); continue; } /* ${x}: String(x) */
             if (part->type->kind == TY_UNION || part->type->kind == TY_UNKNOWN ||
                 (part->type->kind == TY_NULLABLE && part->type->elem->kind == TY_UNION)) { /* ${x} with x: string | number: by what it holds */
@@ -8505,6 +8541,21 @@ static bool pure_read(Expr *e) {
     }
 }
 static Expr *expr_copy(Expr *e) { Expr *c = xs_alloc(sizeof *c); *c = *e; return c; }
+/* x (checked) of the type undefined, where JavaScript writes its text (console.log, String, a template): "undefined",
+   x still evaluated first when it does something */
+static void undef_text(Expr *x) {
+    Expr *str = xs_alloc(sizeof *str);
+    str->kind = E_STRING; str->pos = x->pos; str->field = -1; str->str = "undefined"; str->type = ty_string;
+    str->lit_id = intern("undefined");
+    if (pure_read(x)) { *x = *str; return; }
+    Expr *v = xs_alloc(sizeof *v);
+    *v = *x;
+    memset(x, 0, sizeof *x);
+    x->kind = E_SEQ; x->pos = v->pos; x->field = -1; x->type = ty_string;
+    expr_list_push(&x->args, v);
+    expr_list_push(&x->args, str);
+}
+
 /* an expression whose value is a boolean by its form (!x, a === b, x instanceof C, a && b): not a default value */
 static bool boolish(Expr *r) {
     if (!r) return false;
@@ -9556,6 +9607,10 @@ static void check_stmt(Stmt *s) {
                 s->expr->type->kind != TY_VOID && s->expr->type->kind != TY_LITINT) /* xs.filter((x) => x.items.length): a predicate's value, as a condition */
                 make_truthy(s->expr, "predicate");
             expect_type(s->expr, cur_func->ret, xs_sprintf("return value of '%s'", cur_func->name));
+        } else if (ty_is_undef(cur_func->ret)) { /* return; in f(): undefined: its one value */
+            s->expr = xs_alloc(sizeof *s->expr);
+            s->expr->kind = E_NULL; s->expr->pos = s->pos; s->expr->field = -1;
+            check_expr(s->expr, cur_func->ret);
         } else if (cur_func->ret->kind != TY_VOID && !cur_func->is_gen) {
             xs_error(XS8059, s->pos, NULL, "'%s' must return a value of type %s", cur_func->name, ty_name(cur_func->ret));
         }

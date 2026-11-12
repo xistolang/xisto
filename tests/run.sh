@@ -204,6 +204,7 @@ if sh tests/validator/run.sh > "$OUT/validator.txt" 2>&1; then pass=$((pass+1));
 # packages: xisto add / install from a local git repository
 if sh tests/pkg/run.sh > "$OUT/pkg.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg.txt")" -ge 7 ] && ! grep -q FAIL "$OUT/pkg.txt"; then pass=$((pass+1)); else echo "FAIL packages:"; cat "$OUT/pkg.txt"; fail=$((fail+1)); fi
 if sh examples/nest-features/test/run.sh > "$OUT/nest-features.txt" 2>&1 && grep -q '^ok: nest-features' "$OUT/nest-features.txt"; then pass=$((pass+1)); else echo "FAIL nest-features:"; cat "$OUT/nest-features.txt"; fail=$((fail+1)); fi
+if sh examples/nest-versions/test/run.sh > "$OUT/nest-versions.txt" 2>&1 && grep -q '^ok: nest-versions' "$OUT/nest-versions.txt"; then pass=$((pass+1)); else echo "FAIL nest-versions:"; cat "$OUT/nest-versions.txt"; fail=$((fail+1)); fi
 if sh examples/nest-auth/test/run.sh > "$OUT/nest-auth.txt" 2>&1 && grep -q '^ok: nest-auth' "$OUT/nest-auth.txt"; then pass=$((pass+1)); else echo "FAIL nest-auth:"; cat "$OUT/nest-auth.txt"; fail=$((fail+1)); fi
 
 # package subpaths (deep imports such as rxjs/operators), against the output of the real packages on Node
