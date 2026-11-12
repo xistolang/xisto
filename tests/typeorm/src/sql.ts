@@ -1,6 +1,6 @@
 // typeorm: the SQL a repository and a query builder write, for postgres and oracle, through a driver that records
 // each statement and its parameters instead of running it (no database needed)
-import { Column, DataSource, Driver, DriverSession, Entity, ILike, In, IsNull, LessThanOrEqual, Not, PrimaryColumn, ViewColumn, ViewEntity } from "typeorm";
+import { Column, DataSource, Driver, DriverSession, Entity, ILike, In, IsNull, LessThanOrEqual, Not, PrimaryColumn, Raw, ViewColumn, ViewEntity } from "typeorm";
 
 @Entity("TB_BENEFICIARIO")
 class Beneficiario {
@@ -66,6 +66,10 @@ async function dialect(name: string): Promise<void> {
   await repo.find({ where: { nome: Not("x") } });
   console.log("count " + String(await repo.count({ where: { ativo: true } })));
 
+  // Raw: the SQL TypeORM 0.3 writes (Oracle, checked with getQueryAndParameters on Node; parentheses aside)
+  await repo.find({ where: { nome: Raw((alias) => `UPPER(${alias}) LIKE UPPER(:term) ESCAPE '\\'`, { term: "%an%" }) } });
+  await repo.find({ where: [{ id: Raw((alias) => `TO_CHAR(${alias}) LIKE :code AND ${alias} IN (SELECT X FROM T WHERE O = :op)`, { code: "%4%", op: "ADM" }) }, { ativo: true }] });
+  await repo.update({ nascimento: Raw((alias) => `${alias} >= TRUNC(SYSDATE) AND ${alias} < TRUNC(SYSDATE) + 1`), id: In([0, 1]) }, { ativo: true });
   await repo.update({ id: 7 }, { nome: "Bia", limite: 3.5 });
   await repo.update({ id: 7 }, { nascimento: () => "SYSDATE", nome: "Bia" });
   await repo.delete({ id: 7 });
