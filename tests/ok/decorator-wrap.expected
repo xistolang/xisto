@@ -1,0 +1,21 @@
+103
+81
+x-100
+164
+106 109
+item7
+erro negativo
+L before soma(1,2)
+L after soma = 103
+outer before nome(x)
+inner before nome(x)
+inner after nome = x-100
+outer after nome = x-100
+L before soma(1,2)
+L after soma = 103
+contado triplo #1
+contado triplo #2
+A before carrega(7)
+A after carrega = item7
+A before carrega(-1)
+A failed carrega: negativo
