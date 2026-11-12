@@ -3827,6 +3827,11 @@ static void parse_import(Parser *p, Module *m) {
                 p->alias_to = realloc(p->alias_to, sizeof(char *) * (size_t)(p->nalias + 1));
                 p->alias_from[p->nalias] = name.str;
                 p->alias_to[p->nalias++] = xs_sprintf("%s__local", name.str);
+                /* (exported, the local A is still A to the modules that import it: XB-194) */
+                m->exp_from = realloc(m->exp_from, sizeof(char *) * (size_t)(m->nexp + 1));
+                m->exp_to = realloc(m->exp_to, sizeof(char *) * (size_t)(m->nexp + 1));
+                m->exp_from[m->nexp] = xs_sprintf("%s__local", name.str);
+                m->exp_to[m->nexp++] = name.str;
             }
         }
         if (im.n == cap) {
