@@ -1239,14 +1239,15 @@ export class Repository<T> {
     this.sessionId = sessionId;
   }
 
-  // (an entity given by name, manager.update("TB_X", ...): its metadata, not T's; a name, so the repository stays
-  // data the injector can decode)
-  fixedName?: string; // (optional: the injector's JSON of a repository has only its data source)
+  // (an entity given by name, manager.update("TB_X", ...): its metadata, not T's. Its name, not the metadata
+  // itself: a Repository<X> constructor parameter is decoded from the repository's JSON, and the metadata holds
+  // functions (a relation's target), which JSON cannot carry)
+  __fixedName?: string;
 
   get metadata(): EntityMetadata {
-    const n = this.fixedName;
-    if (n != null && n.length > 0) {
-      return metadataByName(n);
+    const fixed = this.__fixedName ?? "";
+    if (fixed.length > 0) {
+      return metadataByName(fixed);
     }
     return metadataById(__reflect_typeid(T), __reflect_typeid(T));
   }
@@ -2239,8 +2240,7 @@ export class EntityManager {
   getRepository<T>(entity: EntityTarget<T>): Repository<T> {
     const repo = new Repository<T>(this.executor.dataSource.options.name ?? "default", this.executor.sessionId);
     if (typeof entity === "string") {
-      metadataByName(entity as string); // (an entity given by its name or its table: known, or the error now)
-      repo.fixedName = entity as string;
+      repo.__fixedName = metadataByName(entity as string).name; // (an entity given by its name or its table)
     }
     return repo;
   }
