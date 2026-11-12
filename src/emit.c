@@ -502,7 +502,7 @@ static bool calls_failing_user(Stmt *s) {
 }
 static bool cloned_per_site(Func *f) {
     if (f->clone_state) return f->clone_state == 1;
-    bool ok = !getenv("XISTO_NO_TRACE") && f->body && !f->is_ctor && !f->is_async && !f->virt_target && !f->is_gen && f->ncalls >= 2 && func_fails(f)
+    bool ok = !getenv("XISTO_NO_TRACE") && f->body && !f->is_ctor && !f->is_async && !f->virt_target && !f->is_gen && !f->deco_stub && f->ncalls >= 2 && func_fails(f)
               && !stmt_has_try(f->body) && body_nodes(f->body) <= 80 && !calls_failing_user(f->body);
     f->clone_state = ok ? 1 : 2;
     return ok;
@@ -2275,14 +2275,16 @@ static void emit_member(Expr *e) {
         return;
     }
     if (!e->cls->builtin && e->func->cls && e->func->cls != e->cls) { /* inherited (or dispatched): the receiver as the method's class */
-        buf_printf(out, "%s((%s *)(", e->virt ? dispatcher(e->func) : e->func->cname, e->func->cls->cname);
+        buf_printf(out, "%s((%s *)(", e->virt ? dispatcher(e->func) : e->deco_orig && e->func->deco_stub ? xs_sprintf("%s__orig", e->func->cname) : e->func->cname,
+                   e->func->cls->cname);
         emit_borrowed(base);
         buf_puts(out, ")");
         emit_args_borrowed(&e->args, true);
         buf_puts(out, ")");
         return;
     }
-    buf_printf(out, "%s(", e->cls->builtin ? e->builtin.cfn : e->virt ? dispatcher(e->func) : e->func->cname);
+    buf_printf(out, "%s(", e->cls->builtin ? e->builtin.cfn : e->virt ? dispatcher(e->func)
+                          : e->deco_orig && e->func->deco_stub ? xs_sprintf("%s__orig", e->func->cname) : e->func->cname);
     emit_borrowed(base);
     emit_args_borrowed(&e->args, true);
     buf_puts(out, ")");
@@ -9248,8 +9250,22 @@ methods:
     for (int i = 0; i < c->nmethods; i++) {
         if (!c->methods[i]->used || c->methods[i]->cls != c || c->methods[i]->is_abstract) continue; /* inherited ones live in their class */
         buf_putc(out, '\n');
-        emit_signature(c->methods[i]);
-        emit_func_body(c->methods[i]);
+        Func *m = c->methods[i];
+        if (m->deco_stub) { /* XB-107: its own body as <cname>__orig; the method itself calls its slot through the stub */
+            char *cn = m->cname;
+            m->cname = xs_sprintf("%s__orig", cn);
+            emit_signature(m);
+            emit_func_body(m);
+            m->cname = cn;
+            buf_putc(out, '\n');
+            emit_signature(m);
+            buf_printf(out, " {\n    %s%s(self", m->ret->kind == TY_VOID ? "" : "return ", m->deco_stub->cname);
+            for (int k = 0; k < m->nparams; k++) buf_printf(out, ", %s", m->params[k].cname);
+            buf_puts(out, ");\n}\n");
+            continue;
+        }
+        emit_signature(m);
+        emit_func_body(m);
     }
     cur_class = NULL;
 }
@@ -9721,9 +9737,27 @@ static const char *path_base_name(const char *path) {
     b = b ? b + 1 : path;
     return strstr(b, "*/") ? "module" : b;
 }
+/* XB-107's this register (emitted only for a program that uses it: other programs' C is unchanged) */
+static const char xs_this_reg_c[] =
+    "/* XB-107: the object a function (this: T, ...) is called on: set by the caller just before the call (a method's slot,\n"
+    "   f.apply(obj, args)), taken in the function's prologue (owned from then on) */\n"
+    "static XS_TLS void *xs_this_reg;\n"
+    "static inline void xs_this_set(void *v) {\n"
+    "    void *old = xs_this_reg;\n"
+    "    xs_this_reg = v ? xs_retain_(v) : NULL;\n"
+    "    if (old) xs_release_(old);\n"
+    "}\n"
+    "#define xs_void_null(x) ((x), (void *)0)\n"
+    "static inline void *xs_this_take(void) {\n"
+    "    void *v = xs_this_reg;\n"
+    "    xs_this_reg = NULL;\n"
+    "    return v;\n"
+    "}\n"
+;
 void emit_program(Program *p, Buf *o) {
     out = o;
     prog = p;
+    if (p->uses_this_reg) buf_puts(out, xs_this_reg_c);
     indent = 0;
     site_tab.len = 0;
     if (site_tab.data) site_tab.data[0] = 0;
@@ -9836,6 +9870,14 @@ void emit_program(Program *p, Buf *o) {
         }
         for (int k = 0; k < c->nmethods; k++) {
             if (!c->methods[k]->used || c->methods[k]->cls != c || c->methods[k]->is_abstract) continue;
+            if (c->methods[k]->deco_stub) { /* (XB-107: its own body too) */
+                Func *m = c->methods[k];
+                char *cn = m->cname;
+                m->cname = xs_sprintf("%s__orig", cn);
+                emit_signature(m);
+                buf_puts(out, ";\n");
+                m->cname = cn;
+            }
             emit_signature(c->methods[k]);
             buf_puts(out, ";\n");
         }

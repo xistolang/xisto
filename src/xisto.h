@@ -327,6 +327,7 @@ struct Expr {
     Arrow *arrow;      /* E_ARROW */
     char **keys;       /* E_OBJLIT */
     bool virt;         /* E_MEMBER method call: overridden below the receiver's class, dispatched at run time */
+    bool deco_orig;    /* E_MEMBER call x.__xs_orig__m(...): m's own body (XB-107), not its slot */
     bool super_call;   /* E_MEMBER: super.m(...), the base's method, never dispatched */
     Type **targs;      /* E_CALL / E_MEMBER call: explicit type arguments f<int>(x) */
     char *rflags;      /* E_REGEX */
@@ -476,6 +477,11 @@ struct Func {
     struct Func **overrides; /* methods of subclasses that override this one (all levels) */
     int noverrides;
     bool virt_target;  /* called through a dispatcher: never inlined into one call site */
+    bool deco_slotted; /* XB-107: the method has its slot (decorators stacked on it reuse it) */
+    bool deco_late;    /* ... and its stub waits for its inferred return type (deco_late_stubs) */
+    bool deco_ret;     /* written to return MethodDecorator & co: returns what its body gives (XB-107) */
+    struct Func *deco_stub; /* a method a TypeScript decorator wraps (XB-107): its calls go through this function (its
+                               slot); its own body is emitted as <cname>__orig */
     bool run_once;     /* straight-line code called only from code that runs once: not optimized (build time) */
     bool escapes;      /* used as a value or dispatched: who calls it, and how often, is not known */
     /* generic functions and methods (function f<T>(x: T): T): a template, instantiated per list of types */
@@ -698,6 +704,7 @@ typedef struct {
     bool uses_gen;     /* generators: the coroutine runtime, without worker threads (plain globals, no TLS) */
     bool uses_sqlite;
     bool uses_regex;    /* RegExp: runtime/xisto_regex.h joins the program */
+    bool uses_this_reg; /* XB-107: function (this: T) / method slots: the this register's helpers join the program */
     bool uses_tls;
     bool uses_crypto;  /* node:crypto, or a native package that needs it */
     char **native_files; /* C sources of native packages (xisto.json "native"), compiled with the program */
@@ -737,4 +744,7 @@ void emit_program_qbe(Program *p, Buf *out);
 typedef struct { char *name; Buf text; } Unit;
 Unit *emit_program_qbe_units(Program *p, int *nunits);
 
+
+/* parser.c: declarations written as text by the checker (XB-107's method slots), parsed in module m */
+StmtList xs_parse_decls(Program *prog, Module *m, const char *src, Pos pos);
 #endif

@@ -37,6 +37,7 @@ typedef struct {
     char *rest_tmp;
     char **rest_keys;
     int nrest_keys;
+    const char *this_alias; /* inside function (this: T, ...) { }: `this` reads this local (its prologue takes it) */
 } Parser;
 
 static void rest_param(Parser *p, Func *f, Type *t);
@@ -1085,6 +1086,7 @@ static void prepend_param_decls(Func *f) {
     f->param_decls.len = 0;
 }
 
+static Expr *ident_expr(Pos pos, const char *name);
 static Expr *parse_arrow(Parser *p) {
     Pos pos = p->tok.pos;
     Expr *e = new_expr(E_ARROW, pos);
@@ -1095,6 +1097,7 @@ static Expr *parse_arrow(Parser *p) {
     f->name = "arrow";
     int cap = 0;
     bool is_fn = accept(p, TK_FUNCTION); /* function (a: A): R { ... }: an arrow (no `this` of its own) */
+    Type *this_t = NULL; /* function (this: T, ...): T */
     if (is_fn && at(p, TK_IDENT)) next(p);
     /* <T>(sql: string): Promise<T | null> => ...: a generic arrow, held as a function of unknowns (T erased) whose
        signature as written stays with it (Arrow.gen_sig): a call queryOne<Row>(...) converts the result to Row */
@@ -1121,8 +1124,14 @@ static Expr *parse_arrow(Parser *p) {
                 f->params = realloc(f->params, sizeof(Param) * (size_t)cap);
             }
             Token name;
-            if (is_fn && at(p, TK_THIS))
-                xs_error(XS6025, p->tok.pos, "use an arrow function and pass the object as a parameter", "a function expression that declares 'this' is not supported");
+            if (is_fn && at(p, TK_THIS) && f->nparams == 0 && !this_t) {
+                /* function (this: T, ...args) { }: not a parameter; the object it is called on (f.apply(obj, args), a
+                   method slot) is taken in its prologue (__xs_this_take) */
+                next(p);
+                this_t = accept(p, TK_COLON) ? parse_type(p) : ty_any;
+                if (!accept(p, TK_COMMA)) break;
+                continue;
+            }
             bool rest = accept(p, TK_ELLIPSIS); /* (...xs: T[]) => ... */
             if (at(p, TK_LBRACKET) || at(p, TK_LBRACE)) { /* ([k, v]) => ... / ({ id }) => ...: a hidden parameter */
                 StmtList saved = p->pending;
@@ -1175,7 +1184,28 @@ static Expr *parse_arrow(Parser *p) {
     }
     if (is_fn) { if (!at(p, TK_LBRACE)) expect(p, TK_LBRACE, NULL); }
     else expect(p, TK_ARROW, NULL);
-    if (at(p, TK_LBRACE)) {
+    if (at(p, TK_LBRACE) && this_t) { /* const __selfN: T = __xs_this_take() as T; then the body, its `this` that local */
+        static int nself;
+        const char *alias = xs_sprintf("__self%d", ++nself);
+        const char *was = p->this_alias;
+        p->this_alias = alias;
+        f->body = parse_block(p);
+        p->this_alias = was;
+        Stmt *d = new_stmt(S_VAR, f->pos);
+        d->name = (char *)alias;
+        d->is_const = true;
+        d->decl_type = this_t;
+        Expr *take = new_expr(E_CALL, f->pos);
+        take->lhs = ident_expr(f->pos, "__xs_this_take");
+        Expr *as = new_expr(E_AS, f->pos);
+        as->lhs = take;
+        as->elem_type = this_t;
+        d->init = as;
+        stmt_list_push(&f->body->stmts, NULL);
+        memmove(f->body->stmts.items + 1, f->body->stmts.items, sizeof(Stmt *) * (size_t)(f->body->stmts.len - 1));
+        f->body->stmts.items[0] = d;
+        wants_reflect = true;
+    } else if (at(p, TK_LBRACE)) {
         f->body = parse_block(p);
     } else {
         a->expr_body = true;
@@ -1277,6 +1307,7 @@ static Expr *parse_primary(Parser *p) {
     }
     case TK_THIS: {
         next(p);
+        if (p->this_alias) return ident_expr(pos, p->this_alias); /* (function (this: T) { this.x }) */
         return new_expr(E_THIS, pos);
     }
     case TK_TEMPLATE: {
@@ -2868,9 +2899,27 @@ static Stmt *parse_stmt(Parser *p) {
     case TK_LBRACE:
         return parse_block(p);
     case TK_FUNCTION:
-    case TK_ASYNC:
-        xs_error(XS6028, pos, "move it to the top level of the file", "nested functions are not supported");
-        return NULL;
+    case TK_ASYNC: { /* function name(...) { } in a block: const name = function name(...) { } (a closure; used after it) */
+        Parser look = *p;
+        if (at(&look, TK_ASYNC)) next(&look);
+        if (!at(&look, TK_FUNCTION)) { /* (async () => ...)(): an expression */
+            Stmt *es = new_stmt(S_EXPR, pos);
+            es->expr = parse_expr(p);
+            expect_semi(p);
+            return es;
+        }
+        next(&look);
+        if (!at(&look, TK_IDENT)) xs_error(XS6028, pos, "move it to the top level of the file", "nested functions are not supported");
+        Token nm = look.tok;
+        bool is_async = accept(p, TK_ASYNC);
+        Expr *fe = parse_arrow(p);
+        if (is_async) fe->arrow->fn->is_async = true;
+        Stmt *s = new_stmt(S_VAR, pos);
+        s->name = nm.str;
+        s->is_const = true;
+        s->init = fe;
+        return s;
+    }
     case TK_IMPORT:
     case TK_EXPORT:
         xs_error(XS6004, pos, "imports and exports go at the top level of the file", "'%s' is not allowed here", p->tok.kind == TK_IMPORT ? "import" : "export");
@@ -3460,6 +3509,47 @@ static Class *parse_class_ex(Parser *p, bool abstract) {
     return c;
 }
 
+/* declarations the checker writes as text (XB-107's method slots): each function added to the program, each other
+   statement returned (in order), parsed in module m */
+static Func *parse_function_rest(Parser *p, Pos pos, bool is_async);
+static void add_func(Program *prog, Func *f);
+StmtList xs_parse_decls(Program *prog, Module *m, const char *src, Pos pos) {
+    StmtList out = {0};
+    const char *saved_src = xs_source;
+    const char *saved_file = xs_file_name;
+    xs_source = src;
+    Parser gp = {0};
+    lexer_init(&gp.lx, src);
+    gp.lx.fixed = pos;
+    gp.prog = prog;
+    gp.mod = m;
+    Program *pp = parsing_prog;
+    Module *pm = parsing_mod;
+    parsing_prog = prog;
+    parsing_mod = m;
+    next(&gp);
+    while (!at(&gp, TK_EOF)) {
+        if (at(&gp, TK_FUNCTION) || (at(&gp, TK_ASYNC) && peek_is(&gp, TK_FUNCTION))) {
+            Pos fp = gp.tok.pos;
+            bool is_async = accept(&gp, TK_ASYNC);
+            expect(&gp, TK_FUNCTION, NULL);
+            Func *f = parse_function_rest(&gp, fp, is_async);
+            f->mod = m;
+            add_func(prog, f);
+            continue;
+        }
+        Stmt *st = parse_stmt(&gp);
+        st->mod = m;
+        st->pos = pos;
+        st->generated = true;
+        stmt_list_push(&out, st);
+    }
+    parsing_prog = pp;
+    parsing_mod = pm;
+    xs_source = saved_src;
+    xs_file_name = saved_file;
+    return out;
+}
 /* an instance of a generic class: its body parsed again with the type parameters bound (name: Stack<number>) */
 Class *xs_parse_class_instance(Class *tmpl, Type **args, const char *name) {
     Parser p = *(Parser *)tmpl->gen_state;
@@ -4635,7 +4725,17 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
         for (int i = f->nparams - 1; i >= 0; i--)
             for (int d = f->params[i].decos.len - 1; d >= 0; d--)
                 apply(g, &f->params[i].decos.items[d], xs_sprintf("%s, %s.methods[%d], %d", ci_name, ci_name, rk, i));
-        for (int d = f->decos.len - 1; d >= 0; d--) apply(g, &f->decos.items[d], xs_sprintf("%s, %s.methods[%d]", ci_name, ci_name, rk));
+        for (int d = f->decos.len - 1; d >= 0; d--) { /* (xisto's (c, m) or TypeScript's (target, key, descriptor): the checker
+                                                       keeps the branch the decorator's type takes, see deco_prepass) */
+            int n = ndeco++;
+            buf_printf(g, "const __deco%d = %s;\n", n, f->decos.items[d].src);
+            buf_printf(g, "if (__xs_ts_deco(__deco%d, \"%s\", \"%s\")) {\n"
+                          "  const __dd%d = new PropertyDescriptor(__xs_slot_%s_%s);\n"
+                          "  __xs_ts_apply(__deco%d(%s, \"%s\", __dd%d), __dd%d);\n"
+                          "  __xs_slot_%s_%s = __dd%d.value;\n"
+                          "} else {\n  __deco%d(%s, %s.methods[%d]);\n}\n",
+                       n, c->name, f->name, n, c->name, f->name, n, ci_name, f->name, n, n, c->name, f->name, n, n, ci_name, ci_name, rk);
+        }
         rk++;
     }
     for (int k = 0; k < c->nfields; k++)
@@ -5636,6 +5736,24 @@ static const char xs_reflect_src[] =
     "export function __xs_ci_params(c: ClassInfo): ParamInfo[] {\n  return c.params;\n}\n"
     "// new (c)(...args) with c a class given as a value (the compiler calls this)\n"
     "export function __xs_construct(c: unknown, args: unknown[]): unknown {\n  return (c as ClassInfo).construct(args);\n}\n"
+    "// what a method decorator written as TypeScript's (target, key, descriptor) receives: descriptor.value is the method,\n"
+    "// called as (...args) with its object taken by function (this: T, ...) (XB-107: the method's calls go through it)\n"
+    "export class PropertyDescriptor {\n"
+    "  value: (...args: unknown[]) => unknown;\n"
+    "  writable: boolean = true;\n"
+    "  enumerable: boolean = false;\n"
+    "  configurable: boolean = true;\n"
+    "  constructor(value: (...args: unknown[]) => unknown) {\n    this.value = value;\n  }\n"
+    "}\n"
+    "// a decorator that gave a descriptor back: its value is the method's (the compiler calls this)\n"
+    "export function __xs_use_desc(r: PropertyDescriptor | null | undefined, d: PropertyDescriptor): void {\n"
+    "  if (r !== null && r !== undefined) d.value = r.value;\n"
+    "}\n"
+    "// f.apply(self, args) of a function value (the compiler calls this): self is what function (this: T) takes\n"
+    "export function __xs_apply(f: (...a: unknown[]) => unknown, self: unknown, args: unknown[]): unknown {\n"
+    "  __xs_this_set(self);\n"
+    "  return f(...args);\n"
+    "}\n"
     "// TypeScript's decorator types, as xisto's decorators are (global names, like Error)\n"
     "export type ClassDecorator = (c: ClassInfo, m: MethodInfo | null) => void;\n"
     "export type MethodDecorator = (c: ClassInfo, m: MethodInfo | null) => void;\n"
