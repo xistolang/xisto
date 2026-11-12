@@ -7,8 +7,9 @@
 import { ClassInfo, MethodInfo } from "xisto:reflect";
 import { Observable } from "rxjs";
 import { Request, RequestHandler, Response } from "express";
-import { validationMessages } from "class-validator";
+import { BodyCheckOptions, checkBody } from "class-validator";
 import {
+  __loggerOff,
   __catches,
   __classes,
   __controllers,
@@ -36,6 +37,7 @@ import {
   FactoryProvider,
   GuardDef,
   HttpException,
+  NotFoundException,
   InjectDef,
   Logger,
   LoggerService,
@@ -92,6 +94,8 @@ interface Route {
   guards: unknown[];
   guardMethods: MethodInfo[];
   validate: boolean;
+  pipe: BodyCheckOptions; // the ValidationPipe's options (whitelist, forbidNonWhitelisted, implicit conversion)
+  transform: boolean; // the handler gets the transformed instance (ValidationPipe's transform)
   status: int;
   cors: boolean;
   headers: string[];
@@ -569,8 +573,45 @@ function isInt(s: string): boolean {
   return true;
 }
 
+// the request's data as JSON (what a parameter declared as an object type reads: user, params, ip...)
+function requestJson(request: Request): string {
+  const user: any = request.user;
+  return `{"method":${JSON.stringify(request.method)},"url":${JSON.stringify(request.url)},"path":${JSON.stringify(request.path)},` +
+    `"ip":${JSON.stringify(request.ip)},"params":${JSON.stringify(request.params)},"headers":${JSON.stringify(request.headers)},` +
+    `"user":${user === null ? "null" : JSON.stringify(user)}}`;
+}
+
+// Nest's answer to a request no route takes: NotFoundException("Cannot GET /x?y=1") after the middleware, through the
+// global exception filters ({"message":"Cannot GET /x","error":"Not Found","statusCode":404} without one)
+function notFound(r: Route, req: HttpRequest): HttpResponse {
+  const request = new Request();
+  request.setSource(req);
+  request.method = req.method;
+  request.url = req.path;
+  request.path = req.path;
+  request.body = req.body;
+  const response = new Response();
+  const ctx = new ExecutionContext(request, response);
+  ctx.setHandler(r.handler);
+  try {
+    for (const mw of r.middleware) {
+      let passed = false;
+      mw(request, response, (): void => {
+        passed = true;
+      });
+      if (!passed || response.finished) {
+        return fromResponse(r, response);
+      }
+    }
+    throw new NotFoundException(`Cannot ${req.method} ${req.path}${req.search()}`);
+  } catch (e) {
+    return failure(r, e, ctx);
+  }
+}
+
 function handle(r: Route, req: HttpRequest): HttpResponse {
   const request = new Request();
+  request.setSource(req);
   request.method = req.method;
   request.url = req.path;
   request.path = req.path;
@@ -688,17 +729,21 @@ function runHandler(r: Route, req: HttpRequest, request: Request, response: Resp
       if (text.length === 0) {
         text = "{}"; // Nest's ValidationPipe validates a missing body as an empty object
       }
+      if (r.validate && type.kind === "class") {
+        // as Nest's ValidationPipe: plainToInstance and validate, before the body becomes the declared class
+        const checked = checkBody(text, type.id, r.pipe, type);
+        if (checked.messages.length > 0) {
+          return early(run, badRequest(r, response, checked.messages));
+        }
+        if (r.transform) {
+          text = checked.json;
+        }
+      }
       let value: unknown = null;
       try {
         value = type.decode(text);
       } catch (je) {
         return early(run, badRequestText(r, response, je.message));
-      }
-      if (r.validate && type.kind === "class") {
-        const messages = validationMessages(value, type.id, text);
-        if (messages.length > 0) {
-          return early(run, badRequest(r, response, messages));
-        }
       }
       args[p.index] = value;
     } else if (p.source === "param" || p.source === "query") {
@@ -727,7 +772,12 @@ function runHandler(r: Route, req: HttpRequest, request: Request, response: Resp
     } else if (p.source === "headers") {
       args[p.index] = req.header(p.key);
     } else if (p.source === "req") {
-      args[p.index] = request;
+      if (type.kind === "interface") {
+        // @Request() req: { user: { sub: string } }: a copy of the request's data in the shape the parameter declares
+        args[p.index] = type.decode(requestJson(request));
+      } else {
+        args[p.index] = request;
+      }
     } else if (p.source === "res") {
       args[p.index] = response;
       run.usesRes = true;
@@ -826,6 +876,8 @@ export class NestApplication {
   private defaultVersion: string = "";
   private versionPrefix: string = "v";
   private validateAll: boolean = false;
+  private pipeOptions: BodyCheckOptions = {};
+  private pipeTransform: boolean = false;
   private readonly middleware: RequestHandler[] = [];
   private readonly globalFilters: unknown[] = [];
   private initialized: boolean = false;
@@ -872,6 +924,14 @@ export class NestApplication {
   /** new ValidationPipe() for every route: class bodies are validated. */
   useGlobalPipes(pipe: ValidationPipe): NestApplication {
     this.validateAll = true;
+    const o = pipe.options;
+    const t = o.transformOptions;
+    this.pipeOptions = {
+      whitelist: o.whitelist ?? false,
+      forbidNonWhitelisted: o.forbidNonWhitelisted ?? false,
+      enableImplicitConversion: t !== null && (t.enableImplicitConversion ?? false),
+    };
+    this.pipeTransform = o.transform ?? false;
     return this;
   }
 
@@ -919,6 +979,7 @@ export class NestApplication {
   async listen(port: number, host: string = ""): Promise<void> {
     this.init();
     const server = new Server();
+    const anyRoute: Route[] = []; // (the first route: what the not-found answer is built from)
     const filterInstances: unknown[] = [];
     const filterInfos: ClassInfo[] = [];
     const globalGuards = new Stage();
@@ -1024,6 +1085,8 @@ export class NestApplication {
           guards: gs.instances,
           guardMethods: gs.methods,
           validate: this.validateAll || validated.includes(rd.method),
+          pipe: this.pipeOptions,
+          transform: this.pipeTransform,
           status: status,
           cors: this.cors,
           headers: headers,
@@ -1032,6 +1095,9 @@ export class NestApplication {
           upload: upload,
           middleware: this.middleware,
         };
+        if (anyRoute.length === 0) {
+          anyRoute.push(r);
+        }
         const h = (req: HttpRequest): HttpResponse => handle(r, req);
         if (rd.verb === "GET") {
           server.get(r.path, h);
@@ -1047,6 +1113,33 @@ export class NestApplication {
     }
     for (const x of this.extras) {
       server.get(x.path, x.handler);
+    }
+    if (anyRoute.length > 0) {
+      // what no route takes: Nest's 404 through the middleware and the global exception filters
+      const base = anyRoute[0];
+      const nf: Route = {
+        verb: "*",
+        path: "*",
+        instance: null,
+        method: base.method,
+        handler: base.handler,
+        interceptors: [],
+        interceptorMethods: [],
+        params: [],
+        guards: [],
+        guardMethods: [],
+        validate: false,
+        pipe: {},
+        transform: false,
+        status: 404,
+        cors: this.cors,
+        headers: [],
+        filters: filterInstances,
+        filterInfos: filterInfos,
+        upload: "",
+        middleware: this.middleware,
+      };
+      server.fallback((req: HttpRequest): HttpResponse => notFound(nf, req));
     }
     lifecycle("onApplicationBootstrap");
     new Logger("NestApplication").log("Nest application successfully started");
@@ -1064,6 +1157,9 @@ export class NestApplication {
 /** NestFactory.create(AppModule, options?): the application, ready to configure and listen. */
 export class NestFactory {
   static create(module: ClassInfo, options: NestApplicationOptions = {}): NestApplication {
+    if (options.logger === false) {
+      __loggerOff(); // (Nest: Logger.overrideLogger(false) until app.useLogger)
+    }
     return new NestApplication(module, options.cors || false);
   }
 }

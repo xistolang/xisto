@@ -22,6 +22,7 @@ export class Request {
   params: Record<string, string> = {};
   private readonly all: Map<string, string> = new Map<string, string>();
   private readonly queries: Map<string, string> = new Map<string, string>();
+  private source: HttpRequest | null = null; // the server's request: every header it carries
 
   /** Sets a header as it arrived (the framework calls this while building the request). */
   setHeaderValue(name: string, value: string): void {
@@ -29,6 +30,11 @@ export class Request {
     if (name.toLowerCase() === "authorization") {
       this.headers.authorization = value;
     }
+  }
+
+  /** The server's request the other headers are read from (the framework calls this while building the request). */
+  setSource(source: HttpRequest): void {
+    this.source = source;
   }
 
   /** Sets a query string value (the framework calls this while building the request). */
@@ -41,7 +47,16 @@ export class Request {
    * @example req.header("content-type")
    */
   header(name: string): string | null {
-    return this.all.get(name.toLowerCase());
+    const v = this.all.get(name.toLowerCase());
+    if (v !== null) {
+      return v;
+    }
+    const src = this.source;
+    if (src !== null) {
+      const raw = src.header(name);
+      return raw.length > 0 ? raw : null;
+    }
+    return null;
   }
 
   /** Same as `header(name)`. */

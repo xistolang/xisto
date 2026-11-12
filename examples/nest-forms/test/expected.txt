@@ -1,0 +1,29 @@
+POST /api/forms/tablet {} -> 400 {"error": "Bad Request", "message": ["Machine IP is required.", "Company is required."], "statusCode": 400}
+POST /api/forms/tablet {"ip":"1.2.3.4","company":5} -> 200 {"company": 5, "ip": "1.2.3.4"}
+POST /api/forms/tablet {"ip":"  ","company":"abc"} -> 400 {"error": "Bad Request", "message": ["Machine IP is required.", "Company is not valid."], "statusCode": 400}
+POST /api/forms/tablet {"ip":"1234567890123456","company":1.5} -> 400 {"error": "Bad Request", "message": ["Machine IP must have at most 15 characters.", "Company is not valid."], "statusCode": 400}
+POST /api/forms/tablet {"ip":"10.0.0.1","company":null} -> 400 {"error": "Bad Request", "message": ["Company is required."], "statusCode": 400}
+POST /api/forms/kiosk {} -> 200 {"name": null, "printer": null, "ticket": null}
+POST /api/forms/kiosk {"name":""} -> 400 {"error": "Bad Request", "message": ["name should not be empty"], "statusCode": 400}
+POST /api/forms/kiosk {"printer":2} -> 400 {"error": "Bad Request", "message": ["Printer: use 0 or 1 (printer, 2)."], "statusCode": 400}
+POST /api/forms/kiosk {"printer":"1"} -> 400 {"error": "Bad Request", "message": ["Printer: use 0 or 1 (printer, 1)."], "statusCode": 400}
+POST /api/forms/kiosk {"ticket":"X","printer":1} -> 400 {"error": "Bad Request", "message": ["Ticket: use S or N."], "statusCode": 400}
+POST /api/forms/kiosk {"active":"x"} -> 400 {"error": "Bad Request", "message": ["active must be a number conforming to the specified constraints"], "statusCode": 400}
+POST /api/forms/kiosk {"name":"a","printer":0,"ticket":"S","active":3} -> 400 {"error": "Bad Request", "message": ["note is required when UpdateKioskDto.ticket is S"], "statusCode": 400}
+POST /api/forms/kiosk {"ticket":"S","note":"x"} -> 200 {"name": null, "printer": null, "ticket": "S"}
+POST /api/forms/kiosk {"ticket":"N"} -> 200 {"name": null, "printer": null, "ticket": "N"}
+POST /api/forms/sort {"name":"a","sortOrder":"DESC"} -> 200 {"name": "a", "sortOrder": "desc"}
+POST /api/forms/sort {"name":"a","sortOrder":"up"} -> 400 {"error": "Bad Request", "message": ["sortOrder must be one of the following values: asc, desc"], "statusCode": 400}
+POST /api/forms/sort {"name":"a"} -> 200 {"name": "a", "sortOrder": null}
+POST /api/forms/legacy {"name":"a","userId":5} -> 200 {"name": "a"}
+POST /api/forms/legacy {"name":"a"} -> 200 {"name": "a"}
+GET /api/forms/settings  -> 200 {"hasKid": false, "issuer": "forms-app", "ttlSec": 120}
+GET /api/forms/me  {"x-user": "ana:t1"}-> 200 {"sub": "ana", "tenant": "t1"}
+GET /api/forms/me  {"x-user": "bia"}-> 200 {"sub": "bia", "tenant": "none"}
+GET /api/forms/me  -> 401 {"message": "Unauthorized", "statusCode": 401}
+GET /api/forms/item/7  {"x-user": "caio"}-> 200 {"by": "caio", "id": "7"}
+GET /api/local  {"x-scope": "local"}-> 200 {"scope": "local"}
+GET /api/local  {"x-scope": "other"}-> 403 {"error": "Forbidden", "message": "scope local required", "statusCode": 403}
+GET /api/nope  -> 404 {"error": "Not Found", "message": "Cannot GET /api/nope", "statusCode": 404}
+GET /api/forms/nope?x=1  -> 404 {"error": "Not Found", "message": "Cannot GET /api/forms/nope?x=1", "statusCode": 404}
+POST /api/forms/settings {} -> 404 {"error": "Not Found", "message": "Cannot POST /api/forms/settings", "statusCode": 404}

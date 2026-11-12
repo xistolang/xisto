@@ -215,6 +215,7 @@ static void init_builtins(void) {
     bi_method(req, "query", "xs_HttpRequest_query", ty_string, 1, ty_string);
     bi_method(req, "param", "xs_HttpRequest_param", ty_string, 1, ty_string);
     bi_method(req, "header", "xs_HttpRequest_header", ty_string, 1, ty_string);
+    bi_method(req, "search", "xs_HttpRequest_search", ty_string, 0);
 
     Class *res = bi_class("HttpResponse", "xs_HttpResponse");
     bi_field(res, "status", ty_int);
@@ -316,6 +317,7 @@ static void init_builtins(void) {
     bi_method(srv, "post", "xs_Server_post", ty_void, 2, ty_string, handler);
     bi_method(srv, "put", "xs_Server_put", ty_void, 2, ty_string, handler);
     bi_method(srv, "delete", "xs_Server_delete", ty_void, 2, ty_string, handler);
+    bi_method(srv, "fallback", "xs_Server_fallback", ty_void, 1, handler);
     bi_method(srv, "listen", "xs_Server_listen", ty_void, 1, ty_int);
 }
 
@@ -987,6 +989,14 @@ static Type *subst(Type *t, Class *tmpl, Type **args) {
         if (ft->ret && ft->ret->kind == TY_PROMISE) { ft->ret = ft->ret->elem; ft->async_ret = true; }
         return ft;
     }
+    case TY_TPARAM:
+        if (t->elem) { /* F["key"], F[number], NonNullable<F> in a generic alias: over the type argument */
+            Type *n = xs_alloc(sizeof *n);
+            *n = *t;
+            n->elem = subst(t->elem, tmpl, args);
+            return n;
+        }
+        return t;
     default: return t;
     }
 }
@@ -1390,6 +1400,28 @@ static Type *resolve(Type *t, Pos pos) {
                     if (st->kind != S_VAR || !st->name || strcmp(st->name, t->tname + 9) != 0 || !st->init) continue;
                     if (pass == 0 ? st->mod != cur_mod : !st->exported) continue;
                     Type *lt = st->decl_type ? resolve(st->decl_type, pos) : literal_type(st->init);
+                    Expr *in = st->init;
+                    if (!lt && in->kind == E_CALL && in->ntargs && in->lhs && in->lhs->kind == E_IDENT) {
+                        /* export default registerAs<Cfg>(...): a generic function's written result with the call's
+                           type arguments (typeof cfg in ConfigType<typeof cfg>, before cfg is checked) */
+                        Module *sm = cur_mod;
+                        Scope *ss = scope;
+                        const char *sfn = xs_file_name, *ssrc = xs_source;
+                        enter_module(st->mod);
+                        Func *gf = lookup_func(in->lhs->str);
+                        if (gf && gf->ntparams == in->ntargs && gf->ret) {
+                            Type **args = xs_alloc(sizeof(Type *) * (size_t)in->ntargs);
+                            for (int k = 0; k < in->ntargs; k++) args[k] = resolve(in->targs[k], in->pos);
+                            Module *fsm = cur_mod;
+                            enter_module(gf->mod);
+                            lt = resolve(subst_ftp(gf->ret, gf->tparams, args, gf->ntparams), pos);
+                            cur_mod = fsm;
+                        }
+                        cur_mod = sm;
+                        scope = ss;
+                        xs_file_name = sfn;
+                        xs_source = ssrc;
+                    }
                     if (lt) { *t = *lt; return t; }
                 }
         }
@@ -2759,6 +2791,20 @@ static void expect_type(Expr *e, Type *want, const char *what) {
     if (e->type->kind == TY_LITINT && is_numeric(want)) coerce_lit(e, want);
     if (e->type->kind == TY_LITINT && want->kind == TY_NULLABLE && is_numeric(want->elem)) coerce_lit(e, want->elem);
     if (ty_equal(e->type, want) && !(want->kind == TY_STRING && want->tname)) return;
+    if (e->type->kind == TY_FUNC && want->kind == TY_FUNC && e->type->nparams == want->nparams && ty_equal(e->type->ret, want->ret) &&
+        !e->type->async_ret == !want->async_ret && !e->type->rest == !want->rest) {
+        /* a function value whose parameters differ only where one side takes any and the other a reference
+           (applyDecorators: (c: ClassInfo, member: any) => void where a PropertyDecorator goes, and the decorators
+           it takes): a reference held as any is the same pointer, so the one closure serves both */
+        bool same = true;
+        for (int k = 0; k < want->nparams && same; k++) {
+            Type *a = e->type->params[k], *b = want->params[k];
+            if (ty_equal(a, b)) continue;
+            if ((ty_is_any(a) && ty_is_heap(b)) || (ty_is_any(b) && ty_is_heap(a))) continue;
+            same = false;
+        }
+        if (same) { e->type = want; return; }
+    }
     if (want->kind == TY_STRING && want->tname && e->type->kind == TY_STRING) { /* a string literal type: that value only */
         if (e->kind != E_STRING || strcmp(e->str, want->tname) != 0)
             xs_error(XS8019, e->pos, NULL, "%s must be \"%s\"", what, want->tname);
@@ -7701,7 +7747,14 @@ static void check_expr_in(Expr *e, Type *expected) {
                 /* a parameter written wider than what callers pass ((data: string | null) or (_: unknown) where a
                    string comes): TypeScript accepts it (parameters are contravariant). The arrow takes what is
                    passed, and the body sees a local of the written type, converted on entry. */
-                bool wider = (dt->kind == TY_UNKNOWN || ty_is_any(dt) || (dt->kind == TY_NULLABLE && ty_equal(dt->elem, wt)))
+                /* (also a shape with fewer fields: ({ obj, key }: { obj: Record<string, unknown>; key: string }) => ...
+                   where class-transformer passes TransformFnParams: the local is a copy of those fields) */
+                bool wider = (dt->kind == TY_UNKNOWN || ty_is_any(dt) || (dt->kind == TY_NULLABLE && ty_equal(dt->elem, wt)) ||
+                              (dt->kind == TY_OBJECT && wt->kind == TY_OBJECT && shape_ok(wt, dt)) ||
+                              /* (o: MyDto) => ... where class-validator's ValidateIf passes any: converted on entry,
+                                 checked at run time (a class only: an any holding another class is not copied
+                                 into a shape yet) */
+                              (dt->kind == TY_OBJECT && ty_is_any(wt) && !dt->cls->is_interface && !made_shape(dt->cls)))
                              && wt->kind != TY_VOID && f->body && f->body->kind == S_BLOCK && !f->params[i].rest && !f->params[i].is_prop;
                 if (!wider && dt->kind == TY_FUNC && wt->kind == TY_FUNC && dt->nparams == wt->nparams && ty_equal(dt->ret, wt->ret)) {
                     /* (done: (err: Error | null, key?: any) => void) where (err: any, key?: any) => void is passed

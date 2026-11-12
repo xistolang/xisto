@@ -1,7 +1,6 @@
 // @nestjs/common for xisto: the decorators record what Nest keeps with reflect-metadata, from the ClassInfo the
 // compiler builds for decorated classes (xisto:reflect). @nestjs/core reads it to build the application.
-import { ClassInfo, MethodInfo } from "xisto:reflect";
-import { Request, Response } from "express";
+import { ClassInfo, FieldInfo, MethodInfo } from "xisto:reflect";
 import { Observable } from "rxjs";
 
 // ---- what the decorators record (first: decorated classes below register as soon as they are declared) ----
@@ -274,63 +273,8 @@ export class GatewayTimeoutException extends HttpException {
   }
 }
 
-/**
- * The route method a request runs, as ExecutionContext.getHandler() gives it (Reflector reads its metadata).
- * Node: the method's function; here its class, its index among the class's methods and its name.
- */
-export class RouteHandler {
-  readonly cls: ClassInfo;
-  readonly index: int;
-  readonly name: string;
-  constructor(cls: ClassInfo, index: int, name: string) {
-    this.cls = cls;
-    this.index = index;
-    this.name = name;
-  }
-}
-
-/**
- * What a guard, an interceptor, a filter or a custom parameter decorator sees of the current request.
- * @example ctx.switchToHttp().getRequest().headers.authorization
- */
-export class ExecutionContext {
-  private readonly request: Request;
-  private readonly response: Response;
-  private handler: RouteHandler | null = null;
-  constructor(request: Request, response: Response) {
-    this.request = request;
-    this.response = response;
-  }
-  switchToHttp(): ExecutionContext {
-    return this;
-  }
-  getRequest<T = Request>(): T {
-    return this.request as unknown as T;
-  }
-  getResponse<T = Response>(): T {
-    return this.response as unknown as T;
-  }
-  /** "http": the kind of request (Nest also has "rpc" and "ws"). */
-  getType(): string {
-    return "http";
-  }
-  /** The route method that handles the request. */
-  getHandler(): RouteHandler {
-    const h = this.handler;
-    if (h === null) {
-      throw new Error("ExecutionContext.getHandler(): no route handler");
-    }
-    return h;
-  }
-  /** The controller class of the route. */
-  getClass(): ClassInfo {
-    return this.getHandler().cls;
-  }
-  // @nestjs/core: the route this context belongs to
-  setHandler(handler: RouteHandler): void {
-    this.handler = handler;
-  }
-}
+export { ExecutionContext, RouteHandler } from "./context";
+import { ExecutionContext, RouteHandler } from "./context";
 /** Nest's name for the context an exception filter receives. */
 export type ArgumentsHost = ExecutionContext;
 
@@ -702,6 +646,19 @@ export class Reflector {
   }
 }
 
+/**
+ * One decorator made of several, applied in the order given (Nest's applyDecorators): class, method or property
+ * decorators.
+ * @example export const Scoped = (): ClassDecorator => applyDecorators(SetMetadata("scope", "x"), UseGuards(ScopeGuard));
+ */
+export function applyDecorators(...decorators: ((c: ClassInfo, member: any) => void)[]): (c: ClassInfo, member: any) => void {
+  return (c: ClassInfo, member: any): void => {
+    for (const d of decorators) {
+      d(c, member);
+    }
+  };
+}
+
 /** The exceptions an exception filter handles (none: every exception). */
 export function Catch(exception: ClassInfo | null = null): (c: ClassInfo) => void {
   return (c: ClassInfo): void => {
@@ -746,6 +703,10 @@ export function Headers(key: string = ""): (c: ClassInfo, m: MethodInfo | null, 
 }
 /** The Express request. */
 export function Req(): (c: ClassInfo, m: MethodInfo | null, index: int) => void {
+  return param("req", "", -1, null);
+}
+/** The Express request (Nest's other name for @Req()). */
+export function Request(): (c: ClassInfo, m: MethodInfo | null, index: int) => void {
   return param("req", "", -1, null);
 }
 /** The Express response: the route writes the answer itself (status, headers, send). */
@@ -851,10 +812,21 @@ export interface LoggerService {
   verbose: (message: string, context: string) => void;
 }
 
-const logState: LoggerState = { target: null, timestamp: 0 };
+const logState: LoggerState = { target: null, fields: null, timestamp: 0, off: false };
 interface LoggerState {
   target: LoggerService | null;
+  fields: LoggerFieldsSink | null;
   timestamp: number;
+  off: boolean; // NestFactory.create(.., { logger: false }) until a logger is set
+}
+
+/**
+ * Where a logger that writes structured lines (nestjs-pino) takes a call whose message is an object:
+ * this.logger.warn({ event: "x", id }) or this.logger.error({ ... }, "text").
+ */
+export interface LoggerFieldsSink {
+  /** fields: the object's JSON; message: the text after it, or null; context: "" when none */
+  write: (level: string, fields: string, message: string | null, context: string) => void;
 }
 
 function pad2(n: int): string {
@@ -882,6 +854,9 @@ function consoleLine(level: string, message: string, context: string): void {
 }
 
 function emit(level: string, message: string, context: string): void {
+  if (logState.off) {
+    return;
+  }
   const t = logState.target;
   if (t !== null) {
     if (level === "error" || level === "fatal") {
@@ -900,51 +875,188 @@ function emit(level: string, message: string, context: string): void {
   consoleLine(level, message, context);
 }
 
+// a message that is not text: JSON (Nest's ConsoleLogger prints plain objects as "Object:" and their JSON)
+function isObjectMessage(m: unknown): boolean {
+  return m !== null && typeof m === "object" && !(m instanceof Error);
+}
+
+// util.inspect's text of a JSON value as Nest's ConsoleLogger prints an object message (compact: false): each key
+// on its own line, strings in single quotes, "Object(n)" before the top-level object
+function inspectKey(k: string): string {
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : inspectString(k);
+}
+function inspectString(s: string): string {
+  if (s.includes("'") && !s.includes("\"")) {
+    return JSON.stringify(s);
+  }
+  return "'" + JSON.stringify(s).slice(1, -1).split("\\\"").join("\"").split("'").join("\\'") + "'";
+}
+function inspectValue(v: any, depth: int, top: boolean): string {
+  if (v === null) {
+    return "null";
+  }
+  if (typeof v === "string") {
+    return inspectString(v as string);
+  }
+  if (typeof v !== "object") {
+    return String(v);
+  }
+  const pad = "  ".repeat(depth + 1);
+  const end = "  ".repeat(depth);
+  if (Array.isArray(v)) {
+    const items = v as unknown[];
+    if (items.length === 0) {
+      return "[]";
+    }
+    const parts: string[] = [];
+    for (const it of items) {
+      const x: any = it;
+      parts.push(pad + inspectValue(x, depth + 1, false));
+    }
+    return "[\n" + parts.join(",\n") + "\n" + end + "]";
+  }
+  const rec = v as Record<string, unknown>;
+  const keys = Object.keys(rec);
+  if (keys.length === 0) {
+    return "{}";
+  }
+  const parts: string[] = [];
+  for (const k of keys) {
+    const x: any = rec[k];
+    parts.push(pad + inspectKey(k) + ": " + inspectValue(x, depth + 1, false));
+  }
+  return (top ? `Object(${keys.length}) ` : "") + "{\n" + parts.join(",\n") + "\n" + end + "}";
+}
+
+function messageText(m: unknown): string {
+  if (typeof m === "string") {
+    return m as string;
+  }
+  if (m instanceof Error) {
+    return (m as Error).message;
+  }
+  return String(m as any);
+}
+
 /**
- * Nest's logger: new Logger(MyService.name).log("started").
- * Compatibility: messages are strings; the line is Nest's ConsoleLogger format without colors.
+ * One Logger call as Nest's Logger passes it on: the instance's context goes last in the parameters (an error with
+ * no parameters gets an undefined first, here null). The console prints the parameters as Nest's ConsoleLogger
+ * (the last string is the context; for an error, the string before it the stack); a structured logger (nestjs-pino)
+ * gets an object message as fields with the text after it as its message.
+ */
+function call(level: string, message: unknown, params: unknown[], own: string, isError: boolean): void {
+  if (logState.off) {
+    return;
+  }
+  const ps: unknown[] = params.slice(0);
+  if (own.length > 0) {
+    if (isError && ps.length === 0) {
+      ps.push(null);
+    }
+    ps.push(own);
+  }
+  const sink = logState.fields;
+  if (logState.target !== null) {
+    // nestjs-pino: the last parameter is the context, the one before it the text of the line
+    let context = "";
+    let rest: unknown[] = ps;
+    if (ps.length > 0) {
+      const last: any = ps[ps.length - 1];
+      context = last === null ? "" : String(last);
+      rest = ps.slice(0, ps.length - 1);
+    }
+    if (isObjectMessage(message) && sink !== null) {
+      const first: any = rest.length > 0 ? rest[0] : null;
+      sink.write(level, JSON.stringify(message as any), typeof first === "string" ? (first as string) : null, context);
+      return;
+    }
+    emit(level, messageText(message), context);
+    return;
+  }
+  // Nest's ConsoleLogger
+  const all: unknown[] = [message];
+  for (const p of ps) {
+    all.push(p);
+  }
+  let context = "";
+  let stack: string | null = null;
+  let messages: unknown[] = all;
+  if (isError && all.length === 2) {
+    const second: any = all[1];
+    if (typeof second === "string" && /^(.)+\n\s+at .+:\d+:\d+/.test(second as string)) {
+      stack = second as string;
+    } else {
+      context = second === null ? "" : String(second);
+    }
+    messages = [all[0]];
+  } else if (all.length > 1 && typeof all[all.length - 1] === "string") {
+    context = all[all.length - 1] as string;
+    messages = all.slice(0, all.length - 1);
+    if (isError && messages.length > 1) {
+      const last: any = messages[messages.length - 1];
+      if (last === null || typeof last === "string") {
+        stack = last === null ? null : (last as string);
+        messages = messages.slice(0, messages.length - 1);
+      }
+    }
+  }
+  for (const m of messages) {
+    if (isObjectMessage(m)) {
+      const parsed: any = JSON.parse(JSON.stringify(m as any));
+      emit(level, inspectValue(parsed, 0, true), context);
+    } else {
+      emit(level, messageText(m), context);
+    }
+  }
+  if (stack !== null && logState.target === null) {
+    console.error(stack);
+  }
+}
+
+/**
+ * Nest's logger: new Logger(MyService.name).log("started"). A message may be an object (printed as its JSON; with
+ * nestjs-pino, its fields go into the line): this.logger.warn({ event: "auth_fail", ip }).
+ * Compatibility: the console line is Nest's ConsoleLogger format without colors.
  */
 export class Logger {
   private readonly context: string;
   constructor(context: string = "") {
     this.context = context;
   }
-  log(message: string, context: string = ""): void {
-    emit("log", message, context.length > 0 ? context : this.context);
+  log(message: unknown, ...optionalParams: unknown[]): void {
+    call("log", message, optionalParams, this.context, false);
   }
-  error(message: string, trace: string = "", context: string = ""): void {
-    emit("error", message, context.length > 0 ? context : this.context);
-    if (trace.length > 0 && logState.target === null) {
-      console.error(trace);
-    }
+  error(message: unknown, ...optionalParams: unknown[]): void {
+    call("error", message, optionalParams, this.context, true);
   }
-  warn(message: string, context: string = ""): void {
-    emit("warn", message, context.length > 0 ? context : this.context);
+  warn(message: unknown, ...optionalParams: unknown[]): void {
+    call("warn", message, optionalParams, this.context, false);
   }
-  debug(message: string, context: string = ""): void {
-    emit("debug", message, context.length > 0 ? context : this.context);
+  debug(message: unknown, ...optionalParams: unknown[]): void {
+    call("debug", message, optionalParams, this.context, false);
   }
-  verbose(message: string, context: string = ""): void {
-    emit("verbose", message, context.length > 0 ? context : this.context);
+  verbose(message: unknown, ...optionalParams: unknown[]): void {
+    call("verbose", message, optionalParams, this.context, false);
   }
-  fatal(message: string, context: string = ""): void {
-    emit("fatal", message, context.length > 0 ? context : this.context);
+  fatal(message: unknown, ...optionalParams: unknown[]): void {
+    call("fatal", message, optionalParams, this.context, false);
   }
-  static log(message: string, context: string = ""): void {
-    emit("log", message, context);
+  static log(message: unknown, ...optionalParams: unknown[]): void {
+    call("log", message, optionalParams, "", false);
   }
-  static error(message: string, trace: string = "", context: string = ""): void {
-    emit("error", message, context);
+  static error(message: unknown, ...optionalParams: unknown[]): void {
+    call("error", message, optionalParams, "", true);
   }
-  static warn(message: string, context: string = ""): void {
-    emit("warn", message, context);
+  static warn(message: unknown, ...optionalParams: unknown[]): void {
+    call("warn", message, optionalParams, "", false);
   }
-  static debug(message: string, context: string = ""): void {
-    emit("debug", message, context);
+  static debug(message: unknown, ...optionalParams: unknown[]): void {
+    call("debug", message, optionalParams, "", false);
   }
   /** Sends every Logger line to another logger (app.useLogger does this). */
   static overrideLogger(target: LoggerService): void {
     logState.target = target;
+    logState.off = false;
   }
 }
 
@@ -952,6 +1064,17 @@ export class Logger {
 // rename tokens, so `import { Logger as NestLogger }` there would read its own Logger
 export function __overrideLogger(target: LoggerService): void {
   logState.target = target;
+  logState.off = false;
+}
+
+// where object messages go once __overrideLogger's logger writes structured lines (nestjs-pino)
+export function __overrideLoggerFields(sink: LoggerFieldsSink): void {
+  logState.fields = sink;
+}
+
+// NestFactory.create(.., { logger: false }): nothing is printed until a logger is set
+export function __loggerOff(): void {
+  logState.off = true;
 }
 
 // the JSON of one field of a JSON body ("" when absent)

@@ -206,6 +206,9 @@ if sh tests/pkg/run.sh > "$OUT/pkg.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg.txt
 if sh examples/nest-features/test/run.sh > "$OUT/nest-features.txt" 2>&1 && grep -q '^ok: nest-features' "$OUT/nest-features.txt"; then pass=$((pass+1)); else echo "FAIL nest-features:"; cat "$OUT/nest-features.txt"; fail=$((fail+1)); fi
 if sh examples/nest-versions/test/run.sh > "$OUT/nest-versions.txt" 2>&1 && grep -q '^ok: nest-versions' "$OUT/nest-versions.txt"; then pass=$((pass+1)); else echo "FAIL nest-versions:"; cat "$OUT/nest-versions.txt"; fail=$((fail+1)); fi
 if sh examples/nest-auth/test/run.sh > "$OUT/nest-auth.txt" 2>&1 && grep -q '^ok: nest-auth' "$OUT/nest-auth.txt"; then pass=$((pass+1)); else echo "FAIL nest-auth:"; cat "$OUT/nest-auth.txt"; fail=$((fail+1)); fi
+if sh examples/nest-forms/test/run.sh > "$OUT/nest-forms.txt" 2>&1 && grep -q '^ok: nest-forms' "$OUT/nest-forms.txt"; then pass=$((pass+1)); else echo "FAIL nest-forms:"; cat "$OUT/nest-forms.txt"; fail=$((fail+1)); fi
+# Nest's Logger on the console: object messages as Nest 11's ConsoleLogger prints them (tests/nestlog/run.sh)
+if sh tests/nestlog/run.sh > "$OUT/nestlog.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL nestlog:"; cat "$OUT/nestlog.txt"; fail=$((fail+1)); fi
 
 # package subpaths (deep imports such as rxjs/operators), against the output of the real packages on Node
 if sh tests/subpaths/run.sh > "$OUT/subpaths.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/subpaths.txt"; else echo "FAIL subpaths:"; cat "$OUT/subpaths.txt"; fail=$((fail+1)); fi
