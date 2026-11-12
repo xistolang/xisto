@@ -2573,6 +2573,10 @@ static char *from_unknown(Type *t, const char *expr) {
     case TY_NUMBER: return xs_sprintf("xs_as_num%s(%s)", nul ? "_or_null" : "", expr);
     case TY_BOOLEAN: return xs_sprintf("xs_as_bool%s(%s)", nul ? "_or_null" : "", expr);
     case TY_OBJECT: {
+        if (b->cls->view_of) { /* a view of the request (getRequest<LocalRequest>()): the request itself, checked as one */
+            Type *r = ty_object_of(b->cls->view_of);
+            return xs_sprintf("((%s)%s)", ctype(b), from_unknown(nul ? ty_nullable_of(r) : r, expr));
+        }
         if (in_hierarchy(b->cls)) return xs_sprintf("((%s)xs_as_isa((void *)(%s), %s, %d, \"%s\"))", ctype(b), expr, isa_fn(b->cls), nul, what);
         const char *fr = strcmp(b->cls->name, "Error") == 0 ? "xs_Error_free" : xs_sprintf("%s_free", b->cls->cname);
         if (strcmp(b->cls->cname, "xs_Uint8Array") == 0) fr = "xs_u8_free"; /* (Buffer too: the same free, another print) */
