@@ -8,7 +8,7 @@
 // Drivers: "postgres" through the pg package; "oracle" through a driver registered with registerDriver("oracle", ...)
 // (the oracledb package does it), so the SQL here is written for both dialects: $1 or :1 binds, LIMIT/OFFSET or
 // OFFSET/FETCH, quoted identifiers as TypeORM quotes them.
-import { ClassInfo, FieldInfo } from "xisto:reflect";
+import { ClassInfo, FieldInfo, MethodInfo } from "xisto:reflect";
 import { Pool } from "pg";
 import { Connection, OUT_FORMAT_OBJECT, OracleError, createPool } from "oracledb";
 
@@ -1571,7 +1571,10 @@ export class SelectQueryBuilder<T> {
   private params: string = "{}";
   private setValues: string = "{}";
   private insertValues: string = "[]";
+  private setRaw: Map<string, string> = new Map<string, string>(); // (set({ dt: () => "SYSDATE" }): raw SQL by property)
+  private insertRaw: Map<string, string> = new Map<string, string>(); // (values({ ... }) of one row: the same)
   private aliases: Map<string, EntityMetadata> = new Map<string, EntityMetadata>();
+  private isSub: boolean = false; // (made by subQuery(): its text goes into another query's condition)
 
   constructor(executor: Executor) {
     this.executor = executor;
@@ -1638,21 +1641,46 @@ export class SelectQueryBuilder<T> {
     return this;
   }
 
-  where(condition: string, params: object = {}): SelectQueryBuilder<T> {
-    this.wheres = ["(" + condition + ")"];
+  /**
+   * where("a.x = :x", { x }), or where((qb) => "a.id IN " + qb.subQuery()....getQuery(), params): the function's text is
+   * the condition (TypeORM's WhereExpression as a function of the builder)
+   */
+  where(condition: string | ((qb: SelectQueryBuilder<T>) => string), params: object = {}): SelectQueryBuilder<T> {
+    const c = typeof condition === "string" ? condition : condition(this);
+    this.wheres = ["(" + c + ")"];
     this.mergeParams(params);
     return this;
   }
 
-  andWhere(condition: string, params: object = {}): SelectQueryBuilder<T> {
-    this.wheres.push((this.wheres.length > 0 ? "AND " : "") + "(" + condition + ")");
+  andWhere(condition: string | ((qb: SelectQueryBuilder<T>) => string), params: object = {}): SelectQueryBuilder<T> {
+    const c = typeof condition === "string" ? condition : condition(this);
+    this.wheres.push((this.wheres.length > 0 ? "AND " : "") + "(" + c + ")");
     this.mergeParams(params);
     return this;
   }
 
-  orWhere(condition: string, params: object = {}): SelectQueryBuilder<T> {
-    this.wheres.push((this.wheres.length > 0 ? "OR " : "") + "(" + condition + ")");
+  orWhere(condition: string | ((qb: SelectQueryBuilder<T>) => string), params: object = {}): SelectQueryBuilder<T> {
+    const c = typeof condition === "string" ? condition : condition(this);
+    this.wheres.push((this.wheres.length > 0 ? "OR " : "") + "(" + c + ")");
     this.mergeParams(params);
+    return this;
+  }
+
+  /** A builder for a subquery: its getQuery() is "(SELECT ...)", its :names left for the query it goes into. */
+  subQuery(): SelectQueryBuilder<T> {
+    const q = new SelectQueryBuilder<T>(this.executor);
+    q.isSub = true;
+    return q;
+  }
+
+  /** The statement's text: a subquery's in parentheses, with its :names as written. */
+  getQuery(): string {
+    const sql = this.build(new Binds(this.executor.dialect()));
+    return this.isSub ? "(" + sql + ")" : sql;
+  }
+
+  /** updateEntity(false): TypeORM's reload of the entity after an insert; nothing is reloaded here, so it is accepted. */
+  updateEntity(enabled: boolean): SelectQueryBuilder<T> {
     return this;
   }
 
@@ -1802,8 +1830,9 @@ export class SelectQueryBuilder<T> {
     return this;
   }
 
-  set(values: object): SelectQueryBuilder<T> {
-    this.setValues = JSON.stringify(values);
+  set(values: unknown): SelectQueryBuilder<T> {
+    this.setRaw = new Map<string, string>();
+    this.setValues = splitRawValues(values, this.setRaw);
     return this;
   }
 
@@ -1824,8 +1853,9 @@ export class SelectQueryBuilder<T> {
     return this;
   }
 
-  values(values: object): SelectQueryBuilder<T> {
-    this.insertValues = kind(values) === "array" ? JSON.stringify(values) : "[" + JSON.stringify(values) + "]";
+  values(values: unknown): SelectQueryBuilder<T> {
+    this.insertRaw = new Map<string, string>();
+    this.insertValues = Array.isArray(values) ? JSON.stringify(values) : "[" + splitRawValues(values, this.insertRaw) + "]";
     return this;
   }
 
@@ -1884,6 +1914,9 @@ export class SelectQueryBuilder<T> {
 
   // :name and :...name (outside quotes and :: casts) -> the dialect's numbered binds
   private bindsIn(sql: string, binds: Binds): string {
+    if (this.isSub) {
+      return sql; // (a subquery's :names are bound by the query it is part of)
+    }
     const params: object = JSON.parse(this.params);
     let out = "";
     let i = 0;
@@ -2000,7 +2033,8 @@ export class SelectQueryBuilder<T> {
       for (const p of props) {
         const col = m === null ? p : columnName(m, p);
         const meta = m === null ? null : m.findColumn(p);
-        sets.push(quote(col) + " = " + binds.addColumnJson(get(vals, p), meta === null ? "" : columnKind(meta)));
+        const rawSql = this.setRaw.get(p);
+        sets.push(quote(col) + " = " + (rawSql !== undefined ? rawSql : binds.addColumnJson(get(vals, p), meta === null ? "" : columnKind(meta))));
       }
       return "UPDATE " + this.table + " SET " + sets.join(", ") + this.wherePart(binds);
     }
@@ -2024,7 +2058,8 @@ export class SelectQueryBuilder<T> {
         const row = at(rows, r);
         const vs: string[] = [];
         for (const p of props) {
-          vs.push(binds.addJson(get(row, p)));
+          const rawSql = n === 1 ? this.insertRaw.get(p) : undefined;
+          vs.push(rawSql !== undefined ? rawSql : binds.addJson(get(row, p)));
         }
         tuples.push("(" + vs.join(", ") + ")");
       }
@@ -2071,6 +2106,8 @@ export class SelectQueryBuilder<T> {
     c.params = this.params;
     c.setValues = this.setValues;
     c.insertValues = this.insertValues;
+    c.setRaw = this.setRaw;
+    c.insertRaw = this.insertRaw;
     for (const [k, v] of this.aliases) c.aliases.set(k, v);
     return c;
   }
@@ -2327,6 +2364,28 @@ export class QueryRunner {
   }
 }
 
+// the values of qb.update().set(...) and qb.insert().values(...) as JSON: a property whose value is a function is
+// raw SQL (dtCadastro: () => "SYSDATE"), as TypeORM writes it; its place is kept (null) and its text goes to raw
+function splitRawValues(values: unknown, raw: Map<string, string>): string {
+  const plain: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(values as Record<string, unknown>)) {
+    if (typeof v === "function") {
+      raw.set(k, (v as () => string)());
+      plain[k] = null;
+    } else {
+      plain[k] = v;
+    }
+  }
+  return JSON.stringify(plain);
+}
+
+// a class decorated is described by the compiler (a ClassInfo): DataSource is a value too, as Nest's token in
+// @Inject(DataSource) (the injector finds it by the parameter's type)
+function described(): (c: ClassInfo, m: MethodInfo | null) => void {
+  return (c: ClassInfo, m: MethodInfo | null): void => {};
+}
+
+@described()
 export class DataSource {
   readonly options: DataSourceOptions;
   driverOf: Driver | null = null; // (set by withDriver)

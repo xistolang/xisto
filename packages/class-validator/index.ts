@@ -57,7 +57,7 @@ function rule(kind: string, o: ValidationOptions, n: number = 0, list: string[] 
  * are filled in) or a function of the ValidationArguments; `each` is accepted.
  */
 export class ValidationOptions {
-  message?: unknown;
+  message?: string | ((args: ValidationArguments) => string);
   each?: boolean;
 }
 
