@@ -2396,6 +2396,8 @@ static Func *lookup_func(const char *name) {
         if ((!strcmp(name, "__xs_construct") || !strcmp(name, "__xs_ci_params") || !strcmp(name, "__xs_apply") || !strcmp(name, "__xs_use_desc")) &&
             f->mod && f->mod->file && !strcmp(f->mod->file, "xisto:reflect")) return f; /* (new (c)(); XB-107's f.apply and descriptors) */
         if (f->exported && (strstr(name, "__s_") || !strcmp(name, "__xs_fetch")) && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:url") == 0) return f; /* (URL.canParse, AbortSignal.timeout: statics of globals; fetch with its options in a value) */
+        if (!strncmp(name, "Reflect__s_", 11) && f->exported && f->mod && f->mod->file && strstr(f->mod->file, "/reflect-metadata/"))
+            return f; /* (Reflect.defineMetadata & co: statics of the global Reflect, see find_class) */
         const char *st = strstr(name, "__s_"); /* a static method: visible where its class is imported */
         if (st && f->exported) {
             char *cls = xs_strndup(name, (size_t)(st - name));
@@ -2556,6 +2558,15 @@ static void arr_convert(Expr *e, Type *to);
 static bool tsc_checked(void);
 static bool shape_ok(Type *g, Type *want);
 static bool json_ok_unknown; /* JSON.stringify: an unknown is written by its type at run time */
+/* the one object member of a union of it and primitives (A | number), NULL when there are none or more */
+Type *union_json_obj(Type *t) {
+    Type *o = NULL;
+    for (int i = 0; i < t->nparams; i++) {
+        Type *m = t->params[i];
+        if (m->kind == TY_OBJECT && !m->cls->builtin) { if (o) return NULL; o = m; }
+    }
+    return o;
+}
 static bool json_ok(Type *t, int depth) {
     if (depth > 24) return false; /* (a type that holds itself: no JSON) */
     switch (t->kind) {
@@ -2565,6 +2576,8 @@ static bool json_ok(Type *t, int depth) {
             TypeKind k = t->params[i]->kind;
             if (k == TY_OBJECT && t->params[i]->cls->builtin && !strcmp(t->params[i]->cls->name, "Date")) continue; /* Date | string (a
                 row's date column, read from JSON as the text it is: what the value holds says which) */
+            if (k == TY_OBJECT && !t->params[i]->cls->builtin && union_json_obj(t) == t->params[i] && json_ok(t->params[i], depth + 1))
+                continue; /* total?: SearchTotalHits | number: a JSON object read as the one object member, the rest by kind */
             if (k != TY_NUMBER && k != TY_INT && k != TY_STRING && k != TY_BOOLEAN) return false;
         }
         return true;
@@ -3877,6 +3890,29 @@ static bool shape_copy(Expr *e, Type *want) {
         if (!made_shape(src) && !src->is_interface && src->nmethods == 0 && !src->nfields) return false;
         for (int i = 0; i < dst->nfields; i++)
             if (!find_field(src, dst->fields[i].name, NULL) && !dst->fields[i].optional) return false;
+        /* a field that does not convert as it is (total: SearchTotalHits | number where { value } | number goes, a
+           Record<string, any> where an object of data goes): the whole value through its JSON, decoded in that shape
+           (a copy, as the field by field one is), when both are data JSON can carry */
+        bool fields_ok = true;
+        for (int i = 0; i < dst->nfields && fields_ok; i++) {
+            Field *sf = find_field(src, dst->fields[i].name, NULL);
+            if (sf && !conv_ok(sf->type, dst->fields[i].type, 0)) fields_ok = false;
+        }
+        bool ju = json_ok_unknown;
+        json_ok_unknown = true;
+        bool via_json = !fields_ok && json_ok(g, 0) && json_ok(want, 0);
+        json_ok_unknown = ju;
+        if (via_json) {
+            Expr *in = xs_alloc(sizeof *in);
+            *in = *e;
+            in->prechecked = true;
+            Expr *js = xs_alloc(sizeof *js);
+            js->kind = E_AS; js->pos = e->pos; js->field = -1; js->lhs = in; js->elem_type = ty_json;
+            memset(e, 0, sizeof *e); /* (a null is written as null and read back as null in T | null) */
+            e->kind = E_AS; e->pos = js->pos; e->field = -1; e->lhs = js; e->elem_type = nul ? ty_nullable_of(want) : want;
+            check_expr(e, NULL);
+            return true;
+        }
     }
     Class *dst = to_rec ? src : want->cls; /* a Record gets every field of the value */
     /* an open class (Express's headers): into a Record what its __expando holds (it keeps every property, the

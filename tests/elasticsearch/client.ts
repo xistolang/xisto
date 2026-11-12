@@ -5,16 +5,9 @@ import { Client, ResponseError, TimeoutError } from "@elastic/elasticsearch";
 
 interface Echo { method: string; path: string; body: string; auth: string; type: string }
 interface Source { company: string; amount: number }
-interface Hit { _index: string; _id: string; _source: Source }
-interface Total { value: int; relation: string }
-interface Hits { total: Total; hits: Hit[] }
-interface SearchResult { took: int; hits: Hits; echo: Echo }
 interface WriteResult { _id: string; result: string; echo: Echo }
 interface GetResult { _id: string; found: boolean; _source: Source; echo: Echo }
 interface Missing { _id: string; found: boolean }
-interface BulkItem { _index: string; _id: string; status: int }
-interface BulkLine { index: BulkItem }
-interface BulkResult { errors: boolean; lines: int; ends_with_newline: boolean; echo: Echo }
 interface Health { status: string; echo: Echo }
 interface Ack { acknowledged: boolean; echo: Echo }
 interface Count { count: int; echo: Echo }
@@ -35,9 +28,10 @@ console.log("ping", await client.ping());
 const health: Health = await client.cluster.health({ wait_for_status: "yellow", timeout: "5s" }, { requestTimeout: 1000, maxRetries: 0 });
 show("health " + health.status, health.echo);
 
-const found: SearchResult = await client.search({ index: "orders", size: 10, from: 0, track_total_hits: true, routing: "r1", query: { term: { status: 2 } } });
-show("search", found.echo);
-console.log("hits", found.hits.total.value, found.hits.hits.length, found.hits.hits[0]._source.company, found.hits.hits[1]._source.amount);
+const found = await client.search<Source>({ index: "orders", size: 10, from: 0, track_total_hits: true, routing: "r1", query: { term: { status: 2 } } });
+show("search", found.aggregations?.echo as Echo);
+const total = found.hits.total;
+console.log("hits", typeof total === "number" ? total : (total?.value ?? 0), found.hits.hits.length, found.hits.hits[0]._source?.company, found.hits.hits[1]._source?.amount);
 
 const counted: Count = await client.count({ index: "orders,orders-2" });
 show("count " + String(counted.count), counted.echo);
@@ -69,8 +63,9 @@ for (let i: int = 0; i < 3; i++) {
   ops.push({ index: { _index: "orders", _id: `k${i}` } });
   ops.push({ company: `Company ${i}`, amount: Number(i) * 1.5 });
 }
-const bulk: BulkResult = await client.bulk({ operations: ops, refresh: false });
-show("bulk errors=" + String(bulk.errors) + " lines=" + String(bulk.lines) + " newline=" + String(bulk.ends_with_newline), bulk.echo);
+const { errors, items } = await client.bulk({ operations: ops, refresh: false });
+const failed = items.filter((item) => item.index?.error);
+console.log("bulk errors=" + String(errors), items.map((it) => `${it.index?._id ?? "-"}:${it.index?.status ?? 0}`).join(","), "failed", failed.length);
 
 const created: Ack = await client.indices.create({ index: "batch", mappings: { properties: { amount: { type: "double" } } } });
 show("indices.create " + String(created.acknowledged), created.echo);

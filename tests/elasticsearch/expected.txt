@@ -11,7 +11,7 @@ get missing: error ResponseError 404 404
 get missing with ignore: missing false
 update updated: POST /orders/_update/1?retry_on_conflict=3 {"doc":{"amount":11},"doc_as_upsert":true} [application/json]
 delete deleted: DELETE /orders/_doc/1?refresh=true
-bulk errors=false lines=6 newline=true: POST /_bulk?refresh=false {"index":{"_index":"orders","_id":"k0"}}\n{"company":"Company 0","amount":0}\n{"index":{"_index":"orders","_id":"k1"}}\n{"company":"Company 1","amount":1.5}\n{"index":{"_index":"orders","_id":"k2"}}\n{"company":"Company 2","amount":3}\n [application/x-ndjson]
+bulk errors=false k0:201,k1:201,k2:201 failed 0
 indices.create true: PUT /batch {"mappings":{"properties":{"amount":{"type":"double"}}}} [application/json]
 indices.exists true false
 indices.putMapping: PUT /batch/_mapping {"properties":{"note":{"type":"keyword"}}} [application/json]
