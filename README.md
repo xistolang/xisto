@@ -77,13 +77,48 @@ npm packages are ported as source packages with the same API, in
 `ioredis`, `express`, `class-validator`, `class-transformer`, `rxjs`, `jsonwebtoken`, `jose`, `passport-jwt`,
 `jwks-rsa`, `exceljs`, `@elastic/elasticsearch`, `nestjs-pino`, `helmet`, `argon2` and others.
 
-## A project
+## A project: NestJS in a few commands
 
 ```sh
-xisto init myapp && cd myapp      # xisto.json, src/main.ts, .gitignore
-xisto run                         # runs "main" from xisto.json
-xisto add @nestjs/common @nestjs/core @nestjs/platform-express   # by npm name, with their dependencies
-xisto build                       # ./myapp
+brew install xistolang/tap/xisto
+xisto init hello-nest && cd hello-nest     # xisto.json, src/main.ts, .gitignore
+xisto run                                  # Hello, world!
+xisto add @nestjs/common @nestjs/core @nestjs/platform-express
+```
+
+`xisto add` fetches the packages from [xistolang/packages](https://github.com/xistolang/packages) and their
+dependencies with them (here `express`, `rxjs`, `class-validator` and `class-transformer`). Then write the app in
+`src/main.ts`, as on Node:
+
+```ts
+import { Controller, Get, Module } from '@nestjs/common';
+import { NestFactory } from '@nestjs/core';
+
+@Controller()
+class AppController {
+  @Get()
+  hello(): string {
+    return 'Hello from xisto';
+  }
+}
+
+@Module({ controllers: [AppController] })
+class AppModule {}
+
+async function bootstrap(): Promise<void> {
+  const app = await NestFactory.create(AppModule);
+  await app.listen(3123);
+}
+bootstrap();
+```
+
+```sh
+xisto build                      # ./hello-nest, a native executable of about 1 MB
+./hello-nest &
+curl localhost:3123              # Hello from xisto
+
+rm -rf .xisto && xisto install   # a fresh checkout: restores the packages from xisto.lock
+xisto build
 ```
 
 `xisto add` copies each package into `.xisto/pkgs/` and pins it in `xisto.lock` (source, folder, commit);
