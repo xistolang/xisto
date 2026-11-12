@@ -42,3 +42,6 @@ const r3: Response = await fetch("http://127.0.0.1:8080/slow?ms=10", { signal: c
 console.log("not aborted:", r3.status, await r3.text(), calm.signal.aborted);
 const ok: Response = await fetch("http://127.0.0.1:8080/slow?ms=20", { signal: AbortSignal.timeout(2000) });
 console.log(ok.status, await ok.text());
+const rd: Response = await fetch("http://127.0.0.1:8080/seeother", { method: "POST", body: "x" });
+const bytes = await rd.arrayBuffer();
+console.log("redirected:", rd.status, rd.url, bytes.length, Buffer.from(bytes).toString());
