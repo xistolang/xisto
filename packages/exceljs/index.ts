@@ -5,8 +5,8 @@
 // strings table to keep). The bytes go to a file (options.filename) or to a sink (options.stream).
 //
 // Compatibility with npm's exceljs:
-// - xisto has no namespaces: import WorkbookWriter directly (`new WorkbookWriter(...)` in place of
-//   `new stream.xlsx.WorkbookWriter(...)`).
+// - `import { stream } from "exceljs"` and `stream.xlsx.WorkbookWriter` (in a type and after new) name the
+//   WorkbookWriter below, as in exceljs; it can also be imported directly.
 // - addRow takes an array of values (strings, numbers, booleans, Dates, null) or an object by column key
 //   (`addRow({ key: value })`, as exceljs).
 // - Styles cover what reports use: numFmt, font (bold, italic, size, name), alignment (horizontal, vertical,
@@ -610,4 +610,12 @@ export class WorkbookWriter {
     const s = this.sink;
     if (s !== null) s.end();
   }
+}
+
+class StreamXlsx {}
+
+/** exceljs's `stream` namespace: stream.xlsx.WorkbookWriter, in a type or after new, is the WorkbookWriter above (the
+ *  compiler reads the path to the class the module exports). */
+export class stream {
+  static readonly xlsx: StreamXlsx = new StreamXlsx();
 }
