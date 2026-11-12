@@ -4856,25 +4856,93 @@ static bool ro_param(Func *f, const char *name, int depth) {
 }
 /* the argument a of parameter i of f: a copy of it where the parameter's Record type differs only in unknown values */
 static void variance_arg_t(Expr *a, Func *f, int i, Type *ptype);
+/* the function given for an argument when its declaration is known (a function, a const arrow) */
+static Func *arg_func(Expr *a) {
+    if (a->kind != E_IDENT && a->kind != E_FUNC_REF) return NULL;
+    Func *argf = lookup_func(a->str);
+    if (!argf) { Binding *ab = lookup(a->str); if (ab) argf = ab->origin && ab->origin->arrow_fn ? ab->origin->arrow_fn : ab->arrow_fn; }
+    return argf;
+}
+/* (s: string, b: R = {}) where (s: string, b?: R) => ... goes: the function differs from the type only in parameters
+   that have a default where the type has them optional (TypeScript reads a default as b?: R) */
+static bool dflt_param_fits(Type *at, Type *pt, Func *argf, int k) {
+    return argf && k < argf->nparams && argf->params[k].dflt && argf->params[k].dflt->kind != E_NULL && !argf->params[k].rest &&
+           at->params[k]->kind != TY_NULLABLE && pt->params[k]->kind == TY_NULLABLE && ty_equal(at->params[k], pt->params[k]->elem);
+}
+/* async () => { ...; return { docs, oracle }; } (its result type left out: a shape the compiler made) where
+   () => Promise<BancoDoDia> goes, BancoDoDia an interface of the same fields and types: TypeScript compares the
+   fields. Every return of the function gives a new object literal, so the copy into the interface (shape_copy) that
+   an adapter makes of each result is an object no one else has seen: the program cannot tell it from the original. */
+static bool made_shape(Class *c);
+static bool ret_shape_fits(Type *ar, Type *pr, Func *argf) {
+    if (!ar || !pr || ar->kind != TY_OBJECT || pr->kind != TY_OBJECT || ar->cls == pr->cls || !argf || !argf->body) return false;
+    Class *src = ar->cls, *dst = pr->cls;
+    if (!made_shape(src) || !(dst->is_interface || made_shape(dst)) || dst->nmethods || dst->iface_methods || dst->tparams ||
+        src->nfields != dst->nfields)
+        return false;
+    ExprList one = {0};
+    const ExprList *rets = &argf->ret_exprs; /* (the returns its inference saw; an arrow's one expression: that one) */
+    if (argf->ret_infer != 3) {
+        Stmt *b = argf->body;
+        if (b->kind != S_BLOCK || b->stmts.len != 1 || b->stmts.items[0]->kind != S_RETURN || !b->stmts.items[0]->expr) return false;
+        expr_list_push(&one, b->stmts.items[0]->expr);
+        rets = &one;
+    }
+    if (!rets->len) return false;
+    for (int i = 0; i < rets->len; i++) {
+        Expr *x = rets->items[i];
+        if (x->kind != E_OBJLIT || x->cls != src || x->spread) return false;
+    }
+    for (int i = 0; i < dst->nfields; i++) {
+        Field *sf = find_field(src, dst->fields[i].name, NULL);
+        if (!sf || !sf->type || !dst->fields[i].type || !ty_equal(sf->type, dst->fields[i].type)) return false;
+    }
+    return true;
+}
+static bool dflt_only_diff(Expr *a, Type *ptype) {
+    if (!a->type) return false;
+    Type *at = ty_strip_null(a->type), *pt = ty_strip_null(ptype);
+    if (at->kind != TY_FUNC || pt->kind != TY_FUNC || at->nparams != pt->nparams || at->rest || pt->rest || !at->ret || !pt->ret ||
+        !ty_equal(at->ret, pt->ret) || ty_equal(at, pt))
+        return false;
+    Func *argf = arg_func(a);
+    if (!argf || argf->nparams != at->nparams) return false;
+    for (int k = 0; k < at->nparams; k++)
+        if (!ty_equal(at->params[k], pt->params[k]) && !dflt_param_fits(at, pt, argf, k)) return false;
+    return true;
+}
+/* the adapters of the function value given that TypeScript's own rules make (always on, also without --tsc-checked):
+   a default read as an optional parameter, a result of a made shape copied into the interface */
+static bool ts_rule_diff(Expr *a, Type *ptype) {
+    if (dflt_only_diff(a, ptype)) return true;
+    if (!a->type) return false;
+    Type *at = ty_strip_null(a->type), *pt = ty_strip_null(ptype);
+    if (at->kind != TY_FUNC || pt->kind != TY_FUNC || at->nparams != pt->nparams || at->rest || pt->rest || at->async_ret != pt->async_ret) return false;
+    Func *argf = arg_func(a);
+    if (!argf || argf->nparams != at->nparams || !ret_shape_fits(at->ret, pt->ret, argf)) return false;
+    for (int k = 0; k < at->nparams; k++)
+        if (!ty_equal(at->params[k], pt->params[k]) && !dflt_param_fits(at, pt, argf, k)) return false;
+    return true;
+}
 static void variance_arg(Expr *a, Func *f, int i) {
-    if (!tsc_checked() || !a->type || i >= f->nparams) return;
+    if (!a->type || i >= f->nparams) return;
+    if (!tsc_checked() && !ts_rule_diff(a, f->params[i].type)) return;
     variance_arg_t(a, f, i, f->params[i].type);
 }
 static void variance_arg_t(Expr *a, Func *f, int i, Type *ptype) {
     if (!f || i >= f->nparams || !a->type) return;
     Type *at = ty_strip_null(a->type), *pt = ty_strip_null(ptype);
+    bool ret_copy = at->kind == TY_FUNC && pt->kind == TY_FUNC && at->async_ret == pt->async_ret && ret_shape_fits(at->ret, pt->ret, arg_func(a));
     if (at->kind == TY_FUNC && pt->kind == TY_FUNC && at->nparams == pt->nparams && !at->rest && !pt->rest && at->ret && pt->ret &&
-        (ty_equal(at->ret, pt->ret) || pt->ret->kind == TY_UNKNOWN || pt->ret->kind == TY_VOID) && !ty_equal(at, pt)) {
+        (ty_equal(at->ret, pt->ret) || pt->ret->kind == TY_UNKNOWN || pt->ret->kind == TY_VOID || ret_copy) && !ty_equal(at, pt)) {
         /* chaveGuia, (g: Guia) => string, where (x: unknown) => string goes: an adapter that reads each unknown as the
            function takes it (checked), when the callee only calls it */
         bool fits = true;
-        Func *argf = NULL; /* (the function given, when its body is known: its parameters' reads prove a copy is safe) */
-        if (a->kind == E_IDENT || a->kind == E_FUNC_REF) {
-            argf = lookup_func(a->str);
-            if (!argf) { Binding *ab = lookup(a->str); if (ab) argf = ab->origin && ab->origin->arrow_fn ? ab->origin->arrow_fn : ab->arrow_fn; }
-        }
+        Func *argf = arg_func(a); /* (the function given, when its body is known: its parameters' reads prove a copy is safe) */
+        if (argf && argf->nparams != at->nparams) argf = NULL;
         for (int k = 0; k < at->nparams && fits; k++) {
             if (ty_equal(at->params[k], pt->params[k]) || pt->params[k]->kind == TY_UNKNOWN) continue;
+            if (dflt_param_fits(at, pt, argf, k)) continue; /* (left out or undefined: the function's default, below) */
             /* (o: Partial<Omit<Item, 'a'>>) where (o?: Partial<Item>) goes: each object the callee passes copied to the shape
                the function takes, when the function provably only reads that parameter (a copy it cannot tell apart) */
             Type *pa = ty_strip_null(at->params[k]), *pp = ty_strip_null(pt->params[k]);
@@ -4904,7 +4972,18 @@ static void variance_arg_t(Expr *a, Func *f, int i, Type *ptype) {
             Expr *id = xs_alloc(sizeof *id); id->kind = E_IDENT; id->pos = a->pos; id->field = -1; id->str = af->params[k].name;
             Expr *arg = id;
             Type *pa = ty_strip_null(at->params[k]), *pp = ty_strip_null(pt->params[k]);
-            if (!ty_equal(at->params[k], pt->params[k]) && pa->kind == TY_OBJECT && pp->kind == TY_OBJECT) {
+            if (!ty_equal(at->params[k], pt->params[k]) && dflt_param_fits(at, pt, argf, k)) {
+                /* b === undefined ? <the default, reading the arguments before it> : b, as JavaScript applies it */
+                Expr **ids = xs_alloc(sizeof(Expr *) * (size_t)(k ? k : 1));
+                for (int q = 0; q < k; q++) { ids[q] = xs_alloc(sizeof(Expr)); ids[q]->kind = E_IDENT; ids[q]->pos = a->pos; ids[q]->field = -1; ids[q]->str = af->params[q].name; }
+                Expr *d = dflt_subst(argf->params[k].dflt, argf, ids, k, a->pos);
+                Expr *t = xs_alloc(sizeof *t); t->kind = E_BINARY; t->op = TK_EQ; t->pos = a->pos; t->field = -1; t->lhs = pr_copy(id);
+                t->rhs = xs_alloc(sizeof *t->rhs); t->rhs->kind = E_NULL; t->rhs->pos = a->pos; t->rhs->field = -1;
+                Expr *c = xs_alloc(sizeof *c); c->kind = E_COND; c->pos = a->pos; c->field = -1; c->lhs = t;
+                expr_list_push(&c->args, d);
+                expr_list_push(&c->args, id);
+                arg = c;
+            } else if (!ty_equal(at->params[k], pt->params[k]) && pa->kind == TY_OBJECT && pp->kind == TY_OBJECT) {
                 /* a copy in the function's shape: its fields that the given object has */
                 FieldSet tf = {0};
                 fields_here(pa->cls, &tf);
@@ -4948,6 +5027,11 @@ static void variance_arg_t(Expr *a, Func *f, int i, Type *ptype) {
             call = c;
         }
         nad++;
+        if (ret_copy && pt->async_ret) { /* async (..) => (await f(..)), the result copied into the interface on its return */
+            af->is_async = af->ret_promise = true;
+            Expr *aw = xs_alloc(sizeof *aw); aw->kind = E_AWAIT; aw->pos = a->pos; aw->field = -1; aw->lhs = call;
+            call = aw;
+        }
         Stmt *r = xs_alloc(sizeof *r); r->pos = a->pos;
         if (af->ret->kind == TY_VOID) { r->kind = S_EXPR; r->expr = call; } else { r->kind = S_RETURN; r->expr = call; }
         Stmt *b = xs_alloc(sizeof *b); b->kind = S_BLOCK; b->pos = a->pos; stmt_list_push(&b->stmts, r);
@@ -9446,7 +9530,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (e->args.len != ft->nparams) xs_error(XS8062, e->pos, NULL, "'%s' takes %d argument(s), got %d", name, ft->nparams, e->args.len);
                 for (int i = 0; i < e->args.len; i++) {
                     check_expr(e->args.items[i], ft->params[i]);
-                    if (tsc_checked() && af && i < af->nparams) variance_arg_t(e->args.items[i], af, i, ft->params[i]); /* (Isa, 12/11) */
+                    if ((tsc_checked() || ts_rule_diff(e->args.items[i], ft->params[i])) && af && i < af->nparams) variance_arg_t(e->args.items[i], af, i, ft->params[i]); /* (Isa, 12/11) */
                     expect_type(e->args.items[i], ft->params[i], xs_sprintf("argument %d of '%s'", i + 1, name));
                 }
                 e->type = ft->ret;
