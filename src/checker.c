@@ -11870,13 +11870,15 @@ static Class *iface_adapter(Class *src, Class *ifc, Pos pos, char **why) {
 /* expect_type: an object of a class where an interface with methods goes, the class not one of its subclasses:
    new <adapter>(value) (x === null ? null : new <adapter>(x) inside T | null) */
 static bool iface_adapt(Expr *e, Type *want, const char *what) {
-    if (e->type && e->type->kind == TY_ARRAY && want->kind == TY_ARRAY && e->type->elem->kind == TY_OBJECT && want->elem->kind == TY_OBJECT &&
-        want->elem->cls->iface_base && !e->type->elem->cls->builtin && !e->type->elem->cls->adapter_of &&
-        e->type->elem->cls != want->elem->cls && !is_subclass(e->type->elem->cls, want->elem->cls)) {
+    Type *wa = want->kind == TY_NULLABLE ? want->elem : want; /* (hosts?: { toString(): string }[] | null too) */
+    if (e->type && e->type->kind == TY_ARRAY && wa->kind == TY_ARRAY && e->type->elem->kind == TY_OBJECT && wa->elem->kind == TY_OBJECT &&
+        wa->elem->cls->iface_base && !e->type->elem->cls->builtin && !e->type->elem->cls->adapter_of &&
+        e->type->elem->cls != wa->elem->cls && !is_subclass(e->type->elem->cls, wa->elem->cls)) {
         /* hosts: HostAddress[] where { toString(): string }[] goes: a new array of each one's adapter (xs.map) */
         char *why = NULL;
-        if (!iface_adapter(e->type->elem->cls, want->elem->cls, e->pos, &why)) return false;
-        arr_convert(e, want->elem);
+        if (!iface_adapter(e->type->elem->cls, wa->elem->cls, e->pos, &why)) return false;
+        arr_convert(e, wa->elem);
+        if (want != wa) e->type = want;
         return true;
     }
     Type *w = want->kind == TY_NULLABLE ? want->elem : want, *g = e->type && e->type->kind == TY_NULLABLE ? e->type->elem : e->type;

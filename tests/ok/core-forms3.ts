@@ -35,3 +35,7 @@ async function main(): Promise<void> {
   console.log(await forRootAsync({ useFactory: () => ({ uri: 'z' }) }));
 }
 await main();
+interface OptsLike { hosts?: { toString(): string }[] | null; }
+class ClientOpts { hosts: HostAddress[] = [new HostAddress('c', 3)]; }
+function readOpts(o: ClientOpts): OptsLike { return { hosts: o.hosts }; }
+console.log(readOpts(new ClientOpts()).hosts?.map((h) => h.toString()).join(','));
