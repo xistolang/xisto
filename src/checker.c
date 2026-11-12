@@ -2539,6 +2539,7 @@ static const char *cap_cid(const char *name) {
         else if (*q == '.') buf_putc(&b, '_');
     return b.data;
 }
+static bool cell_narrowed(Binding *b);
 static Capture *add_capture(Arrow *a, const char *name, const char *outer_cname, Type *type, bool is_this) {
     name = cap_cid(name);
     for (int i = 0; i < a->ncaptures; i++)
@@ -2582,9 +2583,13 @@ static Binding *lookup(const char *name) {
             Binding *cur = b;
             for (int i = nb - 1; i >= 0; i--) {
                 Arrow *a = boundaries[i]->arrow;
-                Capture *c = add_capture(a, name, cur->cell ? cur->cell : cur->cname, cur->type, false);
+                /* (a variable in a cell narrowed here: a callback sees it as declared, as in TypeScript, since it
+                   may run after the variable was set to null again) */
+                Type *ctype_ = cell_narrowed(cur) ? cur->orig : cur->type;
+                Capture *c = add_capture(a, name, cur->cell ? cur->cell : cur->cname, ctype_, false);
                 Binding *nbind = xs_alloc(sizeof *nbind);
                 *nbind = *cur;
+                nbind->type = ctype_;
                 nbind->origin = cur;
                 nbind->is_param = false;
                 nbind->orig = NULL;
@@ -8086,6 +8091,20 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (o->poisoned) xs_error_quiet(); /* the error was its declaration's: no cascade */
         e->type = b->type;
         e->cname = b->cname;
+        if (cell_narrowed(b)) {
+            /* a variable a closure reassigns (it lives in a cell), narrowed here to not null: a call may have set it
+               to null since (TypeScript keeps the narrowing), so each read is checked, a TypeError when it is null; a
+               test against null reads it as declared */
+            if (e->cell_raw) { e->type = b->orig; return; }
+            if (e == dyn_lvalue) return;
+            Expr *v = expr_copy(e);
+            v->type = b->orig;
+            memset(e, 0, sizeof *e);
+            e->kind = E_AS; e->op = TK_NOT; e->pos = v->pos; e->lhs = v; e->field = -1;
+            e->type = b->type;
+            e->str = v->str; /* (the variable, named in the TypeError) */
+            return;
+        }
         if (b->union_narrow && b->type->kind != TY_UNION) { /* seen as one member: read through an (unchecked) conversion */
             Expr *v = expr_copy(e);
             v->type = b->orig;
@@ -8155,6 +8174,13 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         return;
     case E_BINARY:
+        if (e->op == TK_QQ && e->lhs->kind == E_IDENT) e->lhs->cell_raw = true;
+        if ((e->op == TK_EQ || e->op == TK_NEQ) && e->lhs && e->rhs) {
+            bool ln = e->lhs->kind == E_NULL || (e->lhs->kind == E_IDENT && e->lhs->str && !strcmp(e->lhs->str, "undefined"));
+            bool rn = e->rhs->kind == E_NULL || (e->rhs->kind == E_IDENT && e->rhs->str && !strcmp(e->rhs->str, "undefined"));
+            if (rn && e->lhs->kind == E_IDENT) e->lhs->cell_raw = true;
+            if (ln && e->rhs->kind == E_IDENT) e->rhs->cell_raw = true;
+        }
         if (e->op == TK_QQ) { check_nullish(e, expected); return; }
         if (e->op == TK_IN) { /* "k" in m: m.has(k) on a Record; on an object, whether the field is there */
             check_expr(e->rhs, NULL);
@@ -9068,7 +9094,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->rhs->kind != E_NULL && !ty_is_any(e->rhs->type) && e->rhs->type->kind != TY_UNKNOWN) {
             /* as TypeScript: after x = <not null>, x is not null (until it is assigned again) */
             Binding *b = lookup(target->str);
-            if (b && b->type->kind == TY_NULLABLE && !b->cell && strncmp(b->cname, "env->", 5) != 0) shadow_narrowed(b);
+            if (b && b->type->kind == TY_NULLABLE && strncmp(b->cname, "env->", 5) != 0) shadow_narrowed(b); /* (in a cell too: its reads checked) */
         }
         if (path_assigned) { /* as TypeScript: after o.f = <not null>, o.f is not null; after o.f = <maybe null>, it may be */
             Binding *pb = lookup(path_assigned);
@@ -14001,6 +14027,11 @@ static void narrow_set(Expr *c, bool when, NSet *out) {
 static void shadow_narrowed(Binding *b);
 static void shadow_set(NSet *s) { for (int i = 0; i < s->n; i++) shadow_narrowed(s->b[i]); }
 
+/* a binding narrowed to not null (by a test or an assignment) of a variable that lives in a cell */
+static bool cell_narrowed(Binding *b) {
+    return b && b->cell && b->orig && b->origin && !b->union_narrow && b->orig->kind == TY_NULLABLE && b->type != b->orig &&
+           b->type->kind != TY_NULLABLE;
+}
 static void shadow_narrowed(Binding *b) {
     Binding *n = xs_alloc(sizeof *n);
     *n = *b;

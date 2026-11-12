@@ -2869,7 +2869,11 @@ static void emit_expr_raw(Expr *e) {
         }
         if (e->op == TK_NOT && !e->elem_type) { /* x! or (T | null) as T: a TypeError when it is null */
             Type *nt = e->lhs->type;
-            buf_printf(out, "({ %s nn_ = %s; if (!%s) xs_panic(\"TypeError: the value is null\"); nn_; })", ctype(nt), b.data, not_null(nt, "nn_"));
+            if (e->str) /* a narrowed variable a closure set back to null (checker: cell_narrowed) */
+                buf_printf(out, "({ %s nn_ = %s; if (!%s) xs_panic(\"TypeError: '%s' is null here: a call made since it was checked set it back to null\"); nn_; })",
+                           ctype(nt), b.data, not_null(nt, "nn_"), e->str);
+            else
+                buf_printf(out, "({ %s nn_ = %s; if (!%s) xs_panic(\"TypeError: the value is null\"); nn_; })", ctype(nt), b.data, not_null(nt, "nn_"));
             free(b.data);
             return;
         }
