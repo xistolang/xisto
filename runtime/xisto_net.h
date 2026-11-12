@@ -773,6 +773,7 @@ static void xs_tmr_fire(void (*after)(xs_coro *)) {
     }
 }
 
+static XS_TLS int64_t xs_fd_waits; /* coroutines parked on a socket (what, besides a timer, can wake a parked task) */
 /* Waits until fd is readable/writable or the timeout (ms, -1 = none) passes. Yields inside a coroutine,
    polls from plain code. Returns false on timeout. */
 static bool xs_wait_fd_ms(int fd, int16_t filter, int64_t timeout_ms) {
@@ -785,7 +786,9 @@ static bool xs_wait_fd_ms(int fd, int16_t filter, int64_t timeout_ms) {
         EV_SET(&ev, fd, filter, EV_ADD | EV_ONESHOT, 0, 0, &co->fdw);
         kevent(xs_kq, &ev, 1, NULL, 0, NULL);
         if (timeout_ms >= 0) xs_timer_arm(&co->tmw, timeout_ms);
+        xs_fd_waits++;
         xs_coro_yield();
+        xs_fd_waits--;
         bool ready = co->fdw.fired;
         if (co->fdw.armed) { /* the timer won: stop watching the socket */
             co->fdw.armed = false;
@@ -804,6 +807,7 @@ static void xs_wait_fd(int fd, int16_t filter) { xs_wait_fd_ms(fd, filter, -1); 
 
 static XS_TLS int64_t xs_tasks_live; /* Promise.all/race tasks not finished yet */
 static void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_ms);
+static void xs_preg_drop(void);
 static void xs_unh_check(void); /* (Promise values, below) */
 /* setTimeout from node:timers/promises: inside a handler the coroutine sleeps and the server keeps going */
 XS_NOINLINE void xs_sleep_ms(int64_t ms) {
@@ -935,6 +939,10 @@ XS_NOINLINE void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_m
         if (deadline_ms >= 0) { wait = deadline_ms - (int64_t)xs_date_now(); if (wait <= 0) return; }
         if (!stop && xs_tasks_live == 0 && deadline_ms < 0) return;
         struct timespec ts = {wait / 1000, (wait % 1000) * 1000000}, tt;
+        if (!stop && deadline_ms < 0 && !xs_ready_head && xs_fd_waits == 0 && !xs_tmr_timeout(&tt)) {
+            xs_preg_drop(); /* (the program's end: reactions left on promises nothing can settle any more, as Node exits with them) */
+            return;
+        }
         bool has_w = wait >= 0;
         if (xs_tmr_timeout(&tt) && (!has_w || tt.tv_sec < ts.tv_sec || (tt.tv_sec == ts.tv_sec && tt.tv_nsec < ts.tv_nsec))) { ts = tt; has_w = true; }
         int n = kevent(xs_kq, NULL, 0, evs, 64, xs_ready_head ? &(struct timespec){0, 0} : has_w ? &ts : NULL);
@@ -1023,7 +1031,25 @@ struct xs_promise {
     xs_pwait *waiters;
     xs_preact *reacts, *reacts_tail;
     xs_promise *unh_next;
+    int32_t reg_ix;         /* + 1: its place in xs_preg while it is pending with reactions */
 };
+/* the pending promises that have reactions: at the program's end, those nothing can settle any more let them go */
+static XS_TLS xs_promise **xs_preg;
+static XS_TLS int32_t xs_npreg, xs_cpreg;
+static void xs_preg_add(xs_promise *p) {
+    if (p->reg_ix) return;
+    if (xs_npreg == xs_cpreg) { xs_cpreg = xs_cpreg ? xs_cpreg * 2 : 16; xs_preg = realloc(xs_preg, sizeof(xs_promise *) * (size_t)xs_cpreg); }
+    xs_preg[xs_npreg++] = p;
+    p->reg_ix = xs_npreg;
+}
+static void xs_preg_del(xs_promise *p) {
+    if (!p->reg_ix) return;
+    int32_t i = p->reg_ix - 1;
+    xs_promise *last = xs_preg[--xs_npreg];
+    xs_preg[i] = last;
+    last->reg_ix = i + 1;
+    p->reg_ix = 0;
+}
 static XS_TLS xs_promise *xs_unh; /* rejected, no handler yet */
 static void xs_promise_free(void *p) {
     xs_promise *q = p;
@@ -1064,6 +1090,7 @@ XS_NOINLINE void xs_promise_settled(xs_promise *p) {
     p->waiters = NULL;
     xs_preact *r = p->reacts;
     p->reacts = p->reacts_tail = NULL;
+    xs_preg_del(p);
     if (r) p->handled = true;
     for (xs_preact *n; r; r = n) { n = r->next; xs_preact_sched(r); }
     if (p->state == 2 && !p->handled) { p->in_unh = true; p->unh_next = xs_unh; xs_unh = xs_retain_(p); }
@@ -1325,8 +1352,28 @@ XS_NOINLINE xs_promise *xs_promise_then(xs_promise *p, int how, xs_closure *ok, 
     else {
         if (p->reacts_tail) p->reacts_tail->next = r; else p->reacts = r;
         p->reacts_tail = r;
+        xs_preg_add(p);
     }
     return d;
+}
+/* the program's end with reactions left on promises nothing can settle any more (a timer cleared, a race's loser):
+   they are dropped, as Node exits with them */
+static void xs_preg_drop(void) {
+    while (xs_npreg > 0) {
+        xs_promise *p = xs_preg[xs_npreg - 1];
+        xs_preg_del(p);
+        xs_preact *r = p->reacts;
+        p->reacts = p->reacts_tail = NULL;
+        for (xs_preact *n; r; r = n) {
+            n = r->next;
+            xs_tasks_live--;
+            if (r->ok) xs_release_(r->ok);
+            if (r->err) xs_release_(r->err);
+            xs_release_(r->dst);
+            xs_release_(r->src);
+            free(r);
+        }
+    }
 }
 
 /* Promise.race(ps): a promise that settles as the first of them does */
@@ -3292,12 +3339,13 @@ XS_NOINLINE void xs_wt_listen_start(xs_wq *q, xs_closure **cb, uint8_t *kind, xs
 /* ---- setTimeout / setInterval (Node's globals): each timer is a coroutine on the event loop. It starts when the
    loop runs (a server's, or the one the program's exit waits on), sleeps, then calls its callback; an interval goes
    on until clearInterval. Like Node, a pending timer keeps the program alive. */
-typedef struct xs_ttask { xs_closure *cb; int64_t ms; bool repeat, cancelled; int64_t id; struct xs_ttask *next; } xs_ttask;
+typedef struct xs_ttask { xs_closure *cb; int64_t ms; bool repeat, cancelled; int64_t id; struct xs_ttask *next; xs_coro *co; } xs_ttask;
 static xs_ttask *xs_ttasks;
 static int64_t xs_tnext = 1;
 XS_NOINLINE void xs_ttask_run(void *p) {
     xs_ttask *t = p;
     for (;;) {
+        if (t->cancelled) return; /* (cleared before it started) */
         xs_sleep_ms(t->ms);
         if (t->cancelled) return;
         size_t mark = xs_ar_mark();
@@ -3325,6 +3373,7 @@ XS_NOINLINE int64_t xs_timer_start(xs_closure *cb, double ms, bool repeat) {
     t->next = xs_ttasks;
     xs_ttasks = t;
     xs_coro *co = xs_coro_new_shared(xs_ttask_run, t);
+    t->co = co;
     co->on_done = xs_ttask_done;
     xs_tasks_live++;
     xs_exit_hook = xs_tasks_drain;
@@ -3336,7 +3385,11 @@ XS_NOINLINE int64_t xs_set_interval(xs_closure *cb, double ms) { return xs_timer
 XS_NOINLINE void xs_clear_timer(double idn) { /* the timer's coroutine ends when it next wakes */
     int64_t id = (int64_t)idn;
     for (xs_ttask *t = xs_ttasks; t; t = t->next)
-        if (t->id == id) t->cancelled = true;
+        if (t->id == id) {
+            t->cancelled = true;
+            /* (asleep: woken now, so it ends at once and keeps nothing alive, as a cleared timer in Node) */
+            if (t->co && t->co->tmw.armed && t->co != xs_cur_coro) { xs_timer_disarm(&t->co->tmw); xs_ready_push(t->co); }
+        }
 }
 XS_NOINLINE void xs_wt_check_event(xs_str *ev, const char *who) {
     if (ev->len != 7 || memcmp(ev->data, "message", 7) != 0)
