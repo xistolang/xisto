@@ -2950,6 +2950,150 @@ static void to_any(Expr *e) {
     if (e->type->kind != TY_UNKNOWN) to_unknown(e);
     e->type = ty_any;
 }
+/* x.m(args) on an any (Isa, 12/11): the checked dynamic path, as a field read is. The method is looked up among the
+   classes that declare it (the topmost of each hierarchy: a call through it dispatches to an override, and through an
+   XB-107 slot), and a string's or number's own methods, at run time:
+     ((__dm: any, __a0: any, ...): any => { if (__dm == null) <null>; if (__dm instanceof C) return (__dm as C).m(__a0, ...);
+       ...; if (typeof __dm === "string") return (__dm as string).m(...); <not a function> })(x, args...)
+   async when the methods are (awaited inside: the value of the promise), a TypeError when no class has it, as in
+   JavaScript ("m is not a function"); null (undefined) instead when the call is optional (x?.m?.()). Each candidate's
+   arguments are converted from the anys as a typed call's would be (checked). Arguments that are functions keep the
+   error (a closure's signature cannot be checked at run time). */
+static bool made_shape(Class *c);
+static int fn_required(Func *f);
+static Expr *ad_ident(Pos pos, const char *name);
+static Stmt *ad_block(Pos pos, Stmt *one);
+static const char *const any_str_methods[] = {"startsWith", "endsWith", "includes", "indexOf", "lastIndexOf", "slice", "substring",
+    "trim", "trimStart", "trimEnd", "toUpperCase", "toLowerCase", "split", "replace", "replaceAll", "padStart", "padEnd", "repeat",
+    "charAt", "charCodeAt", "toString", "localeCompare", "concat", "normalize", "at", NULL};
+static const char *const any_num_methods[] = {"toFixed", "toString", "toPrecision", NULL};
+static bool in_list(const char *const *l, const char *m) { for (int i = 0; l[i]; i++) if (!strcmp(l[i], m)) return true; return false; }
+/* the text JavaScript names a callee by in "x.m is not a function": a path of names, else (intermediate value) */
+static const char *callee_text(Expr *x) {
+    if (!x) return "(intermediate value)";
+    if (x->kind == E_IDENT && x->str) return x->str;
+    if (x->kind == E_THIS) return "this";
+    if (x->kind == E_MEMBER && !x->is_call && x->str && x->lhs) {
+        const char *l = callee_text(x->lhs);
+        return strcmp(l, "(intermediate value)") ? xs_sprintf("%s.%s", l, x->str) : l;
+    }
+    return "(intermediate value)";
+}
+static int any_call_n;
+static bool any_method_call(Expr *e, Type *expected, bool missing_ok) {
+    const char *m = e->str;
+    int na = e->args.len;
+    for (int i = 0; i < na; i++) {
+        Expr *a = e->args.items[i];
+        if (a->kind == E_ARROW || a->kind == E_FUNC_REF || (a->kind == E_UNARY && a->op == TK_ELLIPSIS)) return false;
+    }
+    Class *roots[64];
+    Func *rf[64];
+    int nr = 0, nasync = 0;
+    for (int i = 0; i < prog->nclasses && nr < 64; i++) {
+        Class *c = prog->classes[i];
+        if (c->builtin || c->is_interface || c->gen_state || c->ntparams || c->adapter_of || made_shape(c) || !c->cname) continue;
+        Func *f = NULL;
+        for (int k = 0; k < c->nmethods; k++) {
+            Func *g = c->methods[k];
+            if (g->cls == c && g->name && !strcmp(g->name, m) && !g->is_getter && !g->is_setter && !g->is_gen && !g->ntparams &&
+                !g->access && !(g->nparams && g->params[g->nparams - 1].rest)) f = g;
+        }
+        if (!f) continue;
+        bool anc = false;
+        for (Class *b = c->base; b && !anc; b = b->base) if (find_method(b, m)) anc = true;
+        if (anc || na < fn_required(f) || na > f->nparams) continue;
+        roots[nr] = c; rf[nr] = f; nr++;
+        if (f->is_async || f->ret_promise) nasync++;
+    }
+    bool str = in_list(any_str_methods, m), num = in_list(any_num_methods, m);
+    if (nasync && (nasync != nr || str || num)) return false; /* (async in some classes, not in others: no one shape) */
+    bool async_ = nasync > 0;
+    Pos pos = e->pos;
+    int id = any_call_n++;
+    const char *dm = xs_sprintf("__dm%d", id);
+    Func *f = xs_alloc(sizeof *f);
+    f->pos = pos; f->name = "arrow"; f->ret = ty_any; f->is_async = async_; f->ret_promise = async_;
+    f->params = xs_alloc(sizeof(Param) * (size_t)(na + 1));
+    memset(f->params, 0, sizeof(Param) * (size_t)(na + 1));
+    f->params[0].name = (char *)dm; f->params[0].type = ty_any;
+    for (int i = 0; i < na; i++) { f->params[i + 1].name = xs_sprintf("__dm%d_a%d", id, i); f->params[i + 1].type = ty_any; }
+    f->nparams = na + 1;
+    Stmt *body = xs_alloc(sizeof *body);
+    body->kind = S_BLOCK; body->pos = pos;
+    #define RET(x_) ({ Stmt *r_ = xs_alloc(sizeof *r_); r_->kind = S_RETURN; r_->pos = pos; r_->expr = (x_); r_; })
+    #define NUL() ({ Expr *z_ = xs_alloc(sizeof *z_); z_->kind = E_NULL; z_->pos = pos; z_->field = -1; z_; })
+    #define IFS(c_, b_) ({ Stmt *i_ = xs_alloc(sizeof *i_); i_->kind = S_IF; i_->pos = pos; i_->cond = (c_); i_->body = (b_); i_; })
+    { /* null receiver: undefined for x?.m(), a TypeError otherwise (as JavaScript reads m of null) */
+        Expr *t = xs_alloc(sizeof *t);
+        t->kind = E_BINARY; t->op = TK_EQ; t->loose = true; t->pos = pos; t->field = -1; t->lhs = ad_ident(pos, dm); t->rhs = NUL();
+        Stmt *b;
+        if (e->op == TK_QDOT) b = ad_block(pos, RET(NUL()));
+        else {
+            Expr *x = xs_alloc(sizeof *x); x->pos = pos;
+            dyn_call(x, "xs_dyn_null_call", ty_void, dyn_key(pos, m), NULL, NULL);
+            x->prechecked = true;
+            Stmt *s1 = xs_alloc(sizeof *s1); s1->kind = S_EXPR; s1->pos = pos; s1->expr = x;
+            b = ad_block(pos, s1);
+            stmt_list_push(&b->stmts, RET(NUL()));
+        }
+        stmt_list_push(&body->stmts, IFS(t, b));
+    }
+    for (int r = 0; r < nr + 2; r++) {
+        Type *as_t; Expr *test = NULL;
+        if (r < nr) {
+            as_t = ty_object_of(roots[r]);
+            Expr *cn = xs_alloc(sizeof *cn); cn->kind = E_IDENT; cn->pos = pos; cn->field = -1; cn->str = roots[r]->name; cn->cls = roots[r];
+            test = xs_alloc(sizeof *test); test->kind = E_BINARY; test->op = TK_IDENT; test->pos = pos; test->field = -1;
+            test->lhs = ad_ident(pos, dm); test->rhs = cn;
+        } else {
+            if ((r == nr && !str) || (r == nr + 1 && !num)) continue;
+            as_t = r == nr ? ty_string : ty_number;
+            Expr *to = xs_alloc(sizeof *to); to->kind = E_UNARY; to->op = TK_IDENT; to->pos = pos; to->field = -1; to->lhs = ad_ident(pos, dm);
+            test = xs_alloc(sizeof *test); test->kind = E_BINARY; test->op = TK_EQ; test->pos = pos; test->field = -1;
+            test->lhs = to; test->rhs = str_lit(pos, r == nr ? "string" : "number");
+        }
+        Expr *cast = xs_alloc(sizeof *cast); cast->kind = E_AS; cast->pos = pos; cast->field = -1; cast->lhs = ad_ident(pos, dm); cast->elem_type = as_t;
+        Expr *call = xs_alloc(sizeof *call); call->kind = E_MEMBER; call->pos = pos; call->field = -1; call->is_call = true; call->str = (char *)m; call->lhs = cast;
+        for (int i = 0; i < na; i++) expr_list_push(&call->args, ad_ident(pos, f->params[i + 1].name));
+        Stmt *b;
+        bool is_void = r < nr && fret(rf[r], pos)->kind == TY_VOID;
+        Expr *v = call;
+        if (async_) { Expr *aw = xs_alloc(sizeof *aw); aw->kind = E_AWAIT; aw->pos = pos; aw->field = -1; aw->lhs = call; v = aw; }
+        if (is_void) {
+            Stmt *s1 = xs_alloc(sizeof *s1); s1->kind = S_EXPR; s1->pos = pos; s1->expr = v;
+            b = ad_block(pos, s1);
+            stmt_list_push(&b->stmts, RET(NUL()));
+        } else b = ad_block(pos, RET(v));
+        stmt_list_push(&body->stmts, IFS(test, b));
+    }
+    if (missing_ok) stmt_list_push(&body->stmts, RET(NUL()));
+    else {
+        Expr *x = xs_alloc(sizeof *x); x->pos = pos;
+        dyn_call(x, "xs_dyn_not_function", ty_void, dyn_key(pos, xs_sprintf("%s.%s", callee_text(e->lhs), m)), NULL, NULL);
+        x->prechecked = true;
+        Stmt *s1 = xs_alloc(sizeof *s1); s1->kind = S_EXPR; s1->pos = pos; s1->expr = x;
+        stmt_list_push(&body->stmts, s1);
+        stmt_list_push(&body->stmts, RET(NUL()));
+    }
+    #undef RET
+    #undef NUL
+    #undef IFS
+    f->body = body;
+    Arrow *a = xs_alloc(sizeof *a); a->pos = pos; a->fn = f; a->expr_body = false;
+    Expr *ae = xs_alloc(sizeof *ae); ae->kind = E_ARROW; ae->pos = pos; ae->field = -1; ae->arrow = a;
+    Expr *recv = e->lhs;
+    recv->prechecked = true;
+    ExprList args = e->args;
+    xs_warn_rule(XS2007, pos, "give the value its type (as SomeClass) to take the typed path",
+                 "'%s' called on an any is looked up by name at run time among the classes that have it (about 10x slower than a typed call)", m);
+    memset(e, 0, sizeof *e);
+    e->kind = E_CALL; e->pos = pos; e->field = -1; e->lhs = ae;
+    expr_list_push(&e->args, recv);
+    for (int i = 0; i < args.len; i++) expr_list_push(&e->args, args.items[i]);
+    check_expr(e, expected);
+    return true;
+}
 static bool is_big(Type *t);
 /* s + x with x not a string: String(x), as JavaScript's + does (null prints "null"); false if x has no such text */
 static bool concat_operand(Expr *x) {
@@ -6805,7 +6949,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             return;
         }
         if (e->op == TK_IDENT) { /* x instanceof C */
-            Class *c = find_class(e->rhs->str);
+            Class *c = e->rhs->cls ? e->rhs->cls : find_class(e->rhs->str); /* (a class given: see any_method_call) */
             if (!c || c->is_interface) xs_error(XS9010, e->rhs->pos, "instanceof tests classes (interfaces have no run-time identity)", "'%s' is not a class", e->rhs->str);
             if (!ty_is_heap(e->lhs->type)) xs_error(XS8108, e->lhs->pos, NULL, "instanceof needs an object, but this is %s", ty_name(e->lhs->type));
             e->rhs->cls = c;
@@ -9014,6 +9158,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (tsc_checked() && !e->is_call && e->lhs->type && e->lhs->type->kind == TY_UNKNOWN && !ty_is_any(e->lhs->type))
             e->lhs->type = ty_any; /* body.link on an unknown that tsc narrowed ('link' in body): read by name, as an any */
         if (ty_is_any(e->lhs->type)) { /* x.f on an any: by name, through the object's class (or a Record's key) */
+            if (e->is_call && any_method_call(e, expected, e->opt_call)) return; /* (x.m?.(): undefined when m is not there) */
             if (e->is_call) xs_error(XS2017, e->pos, "give the value its type (as SomeClass) to call its methods", "cannot call '%s' on an any: its methods are not looked up by name", e->str);
             dyn_call(e, e->op == TK_QDOT ? "xs_dyn_get_opt" : "xs_dyn_get", ty_any, e->lhs, dyn_key(e->pos, e->str), NULL);
             return;
