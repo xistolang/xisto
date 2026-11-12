@@ -637,6 +637,7 @@ function notFound(r: Route, req: HttpRequest): HttpResponse {
   request.method = req.method;
   request.url = req.path;
   request.path = req.path;
+  request.originalUrl = req.path + req.search();
   request.body = parsedBody(req.body);
   const response = new Response();
   const ctx = new ExecutionContext(request, response);
@@ -663,6 +664,7 @@ function handle(r: Route, req: HttpRequest): HttpResponse {
   request.method = req.method;
   request.url = req.path;
   request.path = req.path;
+  request.originalUrl = req.path + req.search();
   request.body = parsedBody(req.body);
   request.rawBody = Buffer.from(req.body);
   for (const h of ["authorization", "content-type", "accept", "user-agent", "accept-encoding", "x-request-id"]) {
