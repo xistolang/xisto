@@ -1802,6 +1802,8 @@ XS_NOINLINE void *xs_Error_wrap_err(void *cause) {
 }
 /* String(err): "name: message", or the one that is not empty (an Error, or an object of a class that extends Error:
    both start with message and name) */
+/* rows[i] as T | undefined: the element, or null past the end (JavaScript reads undefined there); borrowed */
+static inline void *xs_arr_ref_at_or_null(xs_arr_ref *a, int64_t i) { return a && i >= 0 && (size_t)i < a->len ? a->data[i] : NULL; }
 /* encodeURIComponent / encodeURI: the UTF-8 bytes of what is not kept, as %XX (uppercase), as JavaScript writes them */
 static xs_str *xs_uri_encode(xs_str *s, const char *keep) {
     static const char hex[] = "0123456789ABCDEF";
