@@ -4654,7 +4654,8 @@ static void check_object_member(Expr *e, Class *c) {
         xs_error(XS8049, e->pos, xs_sprintf("rename the field of %s, or call %s.%s(...)", c->name, c->view_of->name, e->str),
                  "'%s' of %s is a method of %s, which %s is a view of", e->str, c->name, c->view_of->name, c->name);
     check_object_member_in(e, c);
-    if (vf && !e->is_call && e != dyn_lvalue && e->type && vf->type) {
+    if (vf && !e->is_call && e != dyn_lvalue && e->type && vf->type && tsc_checked()) { /* (the view's types are what tsc
+                                                                                         checked: without it the class's) */
         Class *vc = NULL;
         for (Class *k = c; k && !vc; k = k->base) if (k->view_of) vc = k;
         Module *was = cur_mod;
