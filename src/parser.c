@@ -437,6 +437,13 @@ static Type *parse_type(Parser *p) {
     accept(p, TK_PIPE); /* type T =\n  | "a"\n  | "b": a union may open with '|' */
     const char *open = p->tok.start;
     Pos tpos = p->tok.pos;
+    if (at(p, TK_LBRACE) && peek_is(p, TK_NEW)) { /* { new (): T }: a constructor, a class given as a value (its ClassInfo) */
+        int d = 0;
+        do { if (at(p, TK_LBRACE)) d++; else if (at(p, TK_RBRACE)) d--; next(p); } while (d > 0 && !at(p, TK_EOF));
+        t = ty_unknown;
+        if (at(p, TK_PIPE)) { next(p); Type *r = parse_type(p); (void)r; } /* ({ new (): T } | { name?: string }: unknown too) */
+        return t;
+    }
     if (at(p, TK_LBRACE)) { /* { a: T; b?: U }: an object type in place */
         t = parse_inline_object_type(p);
         if (at(p, TK_AMP)) t = inter_rest(p, t, open, tpos);
@@ -1321,8 +1328,18 @@ static Expr *parse_primary(Parser *p) {
                 next(p);
                 Expr *u = new_expr(E_UNARY, kp);
                 u->op = spread ? TK_ELLIPSIS : TK_LBRACKET;
-                if (spread) u->lhs = parse_assign(p);
-                else {
+                if (spread) {
+                    u->lhs = parse_assign(p);
+                    Expr *x = u->lhs;
+                    if (x->kind == E_BINARY && x->op == TK_AND && x->rhs && x->rhs->kind == E_OBJLIT) {
+                        /* ...(c && { k: v }): ...(c ? { k: v } : {}) (a falsy c spreads nothing) */
+                        Expr *c = new_expr(E_COND, x->pos);
+                        c->lhs = x->lhs;
+                        expr_list_push(&c->args, x->rhs);
+                        expr_list_push(&c->args, new_expr(E_OBJLIT, x->pos));
+                        u->lhs = c;
+                    }
+                } else {
                     u->lhs = parse_assign(p);
                     expect(p, TK_RBRACKET, NULL);
                     expect(p, TK_COLON, "a computed key takes a value: { [key]: value }");
@@ -1393,6 +1410,20 @@ static Expr *parse_primary(Parser *p) {
     }
     case TK_NEW: {
         next(p);
+        if (at(p, TK_LPAREN)) { /* new (clazz as { new (): T })(): a class given as a value: its ClassInfo's construct(args) */
+            next(p);
+            Expr *cls = parse_expr(p);
+            expect(p, TK_RPAREN, NULL);
+            Expr *arr = new_expr(E_ARRAY_LIT, pos);
+            if (at(p, TK_LPAREN)) parse_args(p, &arr->args);
+            Expr *c = new_expr(E_CALL, pos);
+            c->lhs = new_expr(E_IDENT, pos);
+            c->lhs->str = "__xs_construct";
+            expr_list_push(&c->args, cls);
+            expr_list_push(&c->args, arr);
+            wants_reflect = true;
+            return c;
+        }
         Token name = expect(p, TK_IDENT, NULL);
         if (strcmp(name.str, "Intl") == 0 && at(p, TK_DOT)) { /* new Intl.DateTimeFormat(...): xisto:intl's Intl_DateTimeFormat */
             next(p);
@@ -1544,6 +1575,30 @@ static Expr *parse_postfix(Parser *p) {
             parse_args(p, &e->args);
             continue;
         }
+        if (at(p, TK_QDOT) && e->kind == E_IDENT && p->nns && p->mod) { /* tracer?.scope with tracer a namespace: never null, ns.scope */
+            bool isns = false;
+            for (int i = 0; i < p->nns; i++) if (strcmp(p->ns_alias[i], e->str) == 0) isns = true;
+            if (isns) {
+                Parser look = *p;
+                next(&look);
+                if (at(&look, TK_IDENT)) {
+                    next(p);
+                    Token name = expect_prop_name(p, NULL);
+                    Expr *nsx = ns_member(p, e, name);
+                    if (nsx) {
+                        e = nsx;
+                        if (at(p, TK_QDOT) && peek_is(p, TK_LPAREN)) { /* ns.f?.(): an exported function is never null */
+                            next(p);
+                            Expr *c = new_expr(E_CALL, p->tok.pos);
+                            c->lhs = e;
+                            parse_args(p, &c->args);
+                            e = c;
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
         if (at(p, TK_QDOT)) {
             next(p);
             if (nopt == 32) xs_error(XS1040, pos, "split the chain in two", "too many '?.' in one chain");
@@ -1564,7 +1619,10 @@ static Expr *parse_postfix(Parser *p) {
             Expr *m = new_expr(E_MEMBER, name.pos);
             m->lhs = e;
             m->str = name.str;
-            if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from")) wants_arrays = true;
+            if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from") ||
+                !strcmp(name.str, "fromEntries")) wants_arrays = true;
+            if (!strcmp(name.str, "next") && e->kind == E_MEMBER && e->str && (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")))
+                wants_arrays = true; /* m.keys().next().value: __xs_first */
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs);
             if (at(p, TK_LPAREN)) {
                 m->is_call = true;
@@ -1573,6 +1631,8 @@ static Expr *parse_postfix(Parser *p) {
                 at_push_call = false;
                 if (!strcmp(m->str, "splice") && m->args.len == 1) wants_arrays = true; /* xs.splice(i): __xs_spliceFrom */
                 if (!strcmp(m->str, "entries") && m->args.len == 0) wants_arrays = true; /* xs.entries(): __xs_entries */
+                if (m->args.len == 1 && m->args.items[0]->kind == E_ARROW && m->args.items[0]->arrow->fn->nparams == 3)
+                    wants_arrays = true; /* xs.filter((x, i, arr) => ...): __xs_filter3 */
             }
             e = m;
         } else if (at(p, TK_LBRACKET)) {
@@ -1599,7 +1659,10 @@ static Expr *parse_postfix(Parser *p) {
             Expr *m = new_expr(E_MEMBER, name.pos);
             m->lhs = e;
             m->str = name.str;
-            if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from")) wants_arrays = true;
+            if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from") ||
+                !strcmp(name.str, "fromEntries")) wants_arrays = true;
+            if (!strcmp(name.str, "next") && e->kind == E_MEMBER && e->str && (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")))
+                wants_arrays = true; /* m.keys().next().value: __xs_first */
             if (!strcmp(name.str, "length") && at(p, TK_ASSIGN)) wants_arrays = true; /* xs.length = 0 */
             if (!strcmp(name.str, "filter") && e->kind == E_MEMBER && e->is_call && e->str && !strcmp(e->str, "map")) wants_arrays = true; /* xs.map(f).filter(p): maybe __xs_mapFilterNum */
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs); /* obj.m<T>(x) */
@@ -1610,6 +1673,8 @@ static Expr *parse_postfix(Parser *p) {
                 at_push_call = false;
                 if (!strcmp(m->str, "splice") && m->args.len == 1) wants_arrays = true; /* xs.splice(i): __xs_spliceFrom */
                 if (!strcmp(m->str, "entries") && m->args.len == 0) wants_arrays = true; /* xs.entries(): __xs_entries */
+                if (m->args.len == 1 && m->args.items[0]->kind == E_ARROW && m->args.items[0]->arrow->fn->nparams == 3)
+                    wants_arrays = true; /* xs.filter((x, i, arr) => ...): __xs_filter3 */
             }
             e = m;
         } else if (at(p, TK_TEMPLATE) && e->kind == E_MEMBER && !e->is_call && e->lhs->kind == E_IDENT && strcmp(e->lhs->str, "String") == 0 &&
@@ -3761,6 +3826,62 @@ static bool require_ahead(Parser *p) {
     next(&look);
     return at(&look, TK_STRING);
 }
+/* let tracer: any; try { tracer = require("dd-trace"); } catch { tracer = null; }  (an optional package, loaded if it is
+   there): the package is always there in a build, so this is const tracer = require("dd-trace") (import * as tracer),
+   its typed exports, not an any. Returns the token count of the pattern, 0 when it is not this */
+static bool tok_ident_is(Parser *q, const char *s) { return at(q, TK_IDENT) && q->tok.str && strcmp(q->tok.str, s) == 0; }
+static bool try_require_ahead(Parser *p, char **name, char **path) {
+    Parser q = *p;
+    if (!at(&q, TK_LET)) return false;
+    next(&q);
+    if (!at(&q, TK_IDENT)) return false;
+    char *n = q.tok.str;
+    next(&q);
+    if (!at(&q, TK_COLON)) return false;
+    next(&q);
+    if (!tok_ident_is(&q, "any")) return false;
+    next(&q);
+    if (!at(&q, TK_SEMI)) return false;
+    next(&q);
+    if (!at(&q, TK_TRY)) return false;
+    next(&q);
+    if (!at(&q, TK_LBRACE)) return false;
+    next(&q);
+    if (!tok_ident_is(&q, n)) return false;
+    next(&q);
+    if (!at(&q, TK_ASSIGN)) return false;
+    next(&q);
+    if (!tok_ident_is(&q, "require")) return false;
+    next(&q);
+    if (!at(&q, TK_LPAREN)) return false;
+    next(&q);
+    if (!at(&q, TK_STRING)) return false;
+    char *pa = q.tok.str;
+    next(&q);
+    if (!at(&q, TK_RPAREN)) return false;
+    next(&q);
+    if (at(&q, TK_SEMI)) next(&q);
+    if (!at(&q, TK_RBRACE)) return false;
+    next(&q);
+    if (!at(&q, TK_CATCH)) return false;
+    next(&q);
+    if (at(&q, TK_LPAREN)) { next(&q); if (!at(&q, TK_IDENT)) return false; next(&q); if (!at(&q, TK_RPAREN)) return false; next(&q); }
+    if (!at(&q, TK_LBRACE)) return false;
+    next(&q);
+    if (!tok_ident_is(&q, n)) return false;
+    next(&q);
+    if (!at(&q, TK_ASSIGN)) return false;
+    next(&q);
+    if (!tok_ident_is(&q, "null")) return false;
+    next(&q);
+    if (at(&q, TK_SEMI)) next(&q);
+    if (!at(&q, TK_RBRACE)) return false;
+    next(&q);
+    *name = n;
+    *path = pa;
+    *p = q;
+    return true;
+}
 static void parse_require(Parser *p, Module *m) {
     Import im = {0};
     im.pos = p->tok.pos;
@@ -4091,9 +4212,32 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
         return;
     }
     buf_printf(g, "const %s: ClassInfo = {\n  id: \"%s#%s\",\n  name: \"%s\",\n  params: ", ci_name, xs_display_path(m->file), c->name, c->name);
-    params_info(g, c->ctor);
+    /* class B extends A {} without a constructor of its own: A's (JavaScript passes B's arguments on to it), described by
+       A's ClassInfo (its types are names of A's module) */
+    Func *inh = NULL;
+    Class *rb = c->ctor ? NULL : reflected_base(prog, c);
+    for (Class *b = c, *nb = NULL; rb && !inh && b && b->base_name; b = nb) {
+        nb = NULL;
+        for (int i = 0; i < prog->nclasses && !nb; i++) {
+            Class *k = prog->classes[i];
+            if (k != b && !k->builtin && !k->is_interface && k->name && !strcmp(k->name, b->base_name)) nb = k;
+        }
+        if (nb && nb->ctor) inh = nb->ctor;
+    }
+    if (inh) buf_printf(g, "__xs_ci_params(%s)", rb->name);
+    else params_info(g, c->ctor);
     bool data_only = false; /* a DTO (fields without values, no constructor): no `new`, JSON makes it */
     for (int k = 0; k < c->nfields && !c->ctor; k++) if (!c->fields[k].init && !c->fields[k].optional) data_only = true;
+    /* (also through the classes it extends: class B extends A {} with A's fields required, and no constructor) */
+    for (Class *b = c, *nb = NULL; !data_only && b && !b->ctor && b->base_name; b = nb) {
+        nb = NULL;
+        for (int i = 0; i < prog->nclasses && !nb; i++) {
+            Class *k = prog->classes[i];
+            if (k != b && !k->builtin && !k->is_interface && k->name && !strcmp(k->name, b->base_name)) nb = k;
+        }
+        if (!nb || nb->ctor) break;
+        for (int k = 0; k < nb->nfields; k++) if (!nb->fields[k].init && !nb->fields[k].optional) data_only = true;
+    }
     for (int k = 0; c->ctor && k < c->ctor->nparams; k++) /* new X(response: object): not built by an injector */
         if (c->ctor->params[k].type_src && strcmp(c->ctor->params[k].type_src, "object") == 0) data_only = true;
     if (data_only) {
@@ -4102,7 +4246,8 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
         buf_printf(g, ",\n  construct: (args: unknown[]): unknown => { throw new Error(\"Cannot create an instance of an abstract class %s\"); },\n  methods: [", c->name);
     } else {
         buf_printf(g, ",\n  construct: (args: unknown[]): unknown => new %s(", c->name);
-        call_args(g, c->ctor);
+        if (inh) for (int i = 0; i < inh->nparams; i++) buf_printf(g, "%sargs[%d] as never", i ? ", " : "", i); /* (each as the parameter takes it) */
+        else call_args(g, c->ctor);
         buf_puts(g, "),\n  methods: [");
     }
     bool first_m = true;
@@ -4661,10 +4806,20 @@ static void parse_module(Program *prog, Module *m) {
             drain_pending(&p, &prog->top, m, true);
             continue;
         }
-        if (at(&p, TK_IMPORT) || require_ahead(&p)) { /* an import after declarations (ES hoists it): read and loaded here; names resolve in the
+        char *treq_name = NULL, *treq_path = NULL;
+        Pos treq_pos = p.tok.pos;
+        bool treq = at(&p, TK_LET) && try_require_ahead(&p, &treq_name, &treq_path);
+        if (treq || at(&p, TK_IMPORT) || require_ahead(&p)) { /* an import after declarations (ES hoists it): read and loaded here; names resolve in the
                                     checker, after the whole file, so declarations above may use them */
             int n0 = m->nimports;
-            if (at(&p, TK_IMPORT)) parse_import(&p, m); else parse_require(&p, m);
+            if (treq) {
+                Import im = {0};
+                im.pos = treq_pos;
+                im.path = treq_path;
+                ns_register(&p, m, treq_name);
+                m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+                m->imports[m->nimports++] = im;
+            } else if (at(&p, TK_IMPORT)) parse_import(&p, m); else parse_require(&p, m);
             for (int i = n0; i < m->nimports; i++) {
                 Import *im = &m->imports[i];
                 if (xs_check_mode) {
@@ -4812,6 +4967,50 @@ static Func *builtin_func(Module *m, const char *name, const char *cfn, Type *re
 /* xisto:arrays: array methods written in xisto (reduce, flatMap, flat): the checker turns xs.reduce(f, a) into
    __xs_reduce(xs, f, a), the same loop JavaScript runs */
 static const char xs_arrays_src[] =
+    "// Object.fromEntries of pairs held as unknown[] ([k, v] where v is of any type): a Record of them (the compiler calls this)\n"
+    "export function __xs_from_pairs(pairs: unknown[][]): Record<string, unknown> {\n"
+    "  const out: Record<string, unknown> = {};\n"
+    "  for (const p of pairs) {\n"
+    "    const k: any = p.length > 0 ? p[0] : null;\n"
+    "    out[String(k)] = p.length > 1 ? p[1] : null;\n"
+    "  }\n"
+    "  return out;\n"
+    "}\n"
+    "// m.keys().next().value: the first of them, undefined when there is none (the compiler calls this)\n"
+    "export function __xs_first<T>(xs: T[]): T | undefined {\n"
+    "  for (const x of xs) return x;\n"
+    "  return undefined;\n"
+    "}\n"
+// xs.filter((x, i, arr) => ...) and the others whose callback takes the array too (the compiler calls these)\n"
+    "export function __xs_filter3<T>(xs: T[], f: (x: T, i: int, a: T[]) => boolean): T[] {\n"
+    "  const out: T[] = [];\n"
+    "  for (let i = 0; i < xs.length; i++) if (f(xs[i], i, xs)) out.push(xs[i]);\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_map3<U, T>(xs: T[], f: (x: T, i: int, a: T[]) => U): U[] {\n"
+    "  const out: U[] = [];\n"
+    "  for (let i = 0; i < xs.length; i++) out.push(f(xs[i], i, xs));\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_forEach3<T>(xs: T[], f: (x: T, i: int, a: T[]) => void): void {\n"
+    "  for (let i = 0; i < xs.length; i++) f(xs[i], i, xs);\n"
+    "}\n"
+    "export function __xs_some3<T>(xs: T[], f: (x: T, i: int, a: T[]) => boolean): boolean {\n"
+    "  for (let i = 0; i < xs.length; i++) if (f(xs[i], i, xs)) return true;\n"
+    "  return false;\n"
+    "}\n"
+    "export function __xs_every3<T>(xs: T[], f: (x: T, i: int, a: T[]) => boolean): boolean {\n"
+    "  for (let i = 0; i < xs.length; i++) if (!f(xs[i], i, xs)) return false;\n"
+    "  return true;\n"
+    "}\n"
+    "export function __xs_find3<T>(xs: T[], f: (x: T, i: int, a: T[]) => boolean): T | undefined {\n"
+    "  for (let i = 0; i < xs.length; i++) if (f(xs[i], i, xs)) return xs[i];\n"
+    "  return undefined;\n"
+    "}\n"
+    "export function __xs_findIndex3<T>(xs: T[], f: (x: T, i: int, a: T[]) => boolean): int {\n"
+    "  for (let i = 0; i < xs.length; i++) if (f(xs[i], i, xs)) return i;\n"
+    "  return -1;\n"
+    "}\n"
     "export function __xs_reduce<A, T>(xs: T[], f: (acc: A, x: T, i: int) => A, init: A): A {\n"
     "  let acc: A = init;\n"
     "  for (let i = 0; i < xs.length; i++) acc = f(acc, xs[i], i);\n"
@@ -5044,6 +5243,10 @@ static const char xs_reflect_src[] =
     "export interface ClassInfo {\n  id: string;\n  name: string;\n  params: ParamInfo[];\n"
     "  construct: (args: unknown[]) => unknown;\n  methods: MethodInfo[];\n  fields: FieldInfo[];\n"
     "  isInstance: (value: unknown) => boolean;\n  base: ClassInfo | null;\n}\n"
+    "// the parameters of the constructor a class inherits (class B extends A {}: A's; the compiler calls this)\n"
+    "export function __xs_ci_params(c: ClassInfo): ParamInfo[] {\n  return c.params;\n}\n"
+    "// new (c)(...args) with c a class given as a value (the compiler calls this)\n"
+    "export function __xs_construct(c: unknown, args: unknown[]): unknown {\n  return (c as ClassInfo).construct(args);\n}\n"
     "// TypeScript's decorator types, as xisto's decorators are (global names, like Error)\n"
     "export type ClassDecorator = (c: ClassInfo, m: MethodInfo | null) => void;\n"
     "export type MethodDecorator = (c: ClassInfo, m: MethodInfo | null) => void;\n"
