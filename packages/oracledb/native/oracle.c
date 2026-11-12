@@ -43,6 +43,8 @@ typedef struct xs_ora_conn {
     int nclose, close_cap;
     uint8_t *free_lobs;     /* locators of temporary LOBs (OUT binds) to free on the next request */
     size_t free_len, free_cap;
+    bool fresh;             /* a new physical connection, not handed out yet (sessionCallback runs on it) */
+    int64_t call_timeout;   /* the connection's callTimeout attribute (ms; kept across checkouts, as node-oracledb) */
     struct xs_ora_conn *next;
 } xs_ora_conn;
 
@@ -775,6 +777,7 @@ accepted:;
     }
     xs_ora_login(c, p);
     xs_try_pop();
+    c->fresh = true;
     return c;
 }
 static void xs_ora_login(xs_ora_conn *c, xn_oracledb_NativePool *p) {
@@ -1913,3 +1916,12 @@ XS_NOINLINE void xn_oracledb_NativePool_commit(xn_oracledb_NativePool *p, int64_
 XS_NOINLINE void xn_oracledb_NativePool_rollback(xn_oracledb_NativePool *p, int64_t h) { xs_ora_simple(p, h, 15); }
 XS_NOINLINE void xn_oracledb_NativePool_ping(xn_oracledb_NativePool *p, int64_t h) { xs_ora_simple(p, h, 147); }
 XS_NOINLINE int64_t xn_oracledb_NativePool_lastOffset(xn_oracledb_NativePool *p) { (void)p; int64_t o = xs_ora_last_offset; xs_ora_last_offset = 0; return o; }
+/* the first checkout of a physical connection (true once): node-oracledb's sessionCallback runs then */
+XS_NOINLINE bool xn_oracledb_NativePool_takeFresh(xn_oracledb_NativePool *p, int64_t h) {
+    xs_ora_conn *c = xs_ora_held(p, h);
+    bool f = c->fresh;
+    c->fresh = false;
+    return f;
+}
+XS_NOINLINE int64_t xn_oracledb_NativePool_callTimeout(xn_oracledb_NativePool *p, int64_t h) { return xs_ora_held(p, h)->call_timeout; }
+XS_NOINLINE void xn_oracledb_NativePool_setCallTimeout(xn_oracledb_NativePool *p, int64_t h, int64_t ms) { xs_ora_held(p, h)->call_timeout = ms; }

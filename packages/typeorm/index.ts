@@ -10,7 +10,7 @@
 // OFFSET/FETCH, quoted identifiers as TypeORM quotes them.
 import { ClassInfo, FieldInfo, MethodInfo } from "xisto:reflect";
 import { Pool } from "pg";
-import { Connection, OUT_FORMAT_OBJECT, OracleError, createPool } from "oracledb";
+import { Connection, OUT_FORMAT_OBJECT, OracleError, SessionConnection, createPool } from "oracledb";
 
 declare function remap(rows: object, spec: string): object;
 declare function get(json: object, key: string): object;
@@ -465,8 +465,8 @@ export abstract class Driver {
   abstract session(): Promise<DriverSession>;
 }
 
-/** The driver's pool settings TypeORM passes on (extra: { poolMax, stmtCacheSize, ... }); accepted, the xisto pool
-    keeps its own sizes for now */
+/** The driver's pool settings TypeORM passes on to createPool (extra: { poolMax, sessionCallback, ... }): poolMax and
+    sessionCallback are used; the others are accepted, the xisto pool keeps its own */
 export interface DataSourceExtra {
   poolMin?: number;
   poolMax?: number;
@@ -474,6 +474,8 @@ export interface DataSourceExtra {
   stmtCacheSize?: number;
   queueTimeout?: number;
   callTimeout?: number;
+  /** node-oracledb's: runs once on each new physical connection (passed on to createPool, as TypeORM does). */
+  sessionCallback?: (connection: SessionConnection, requestedTag: string, callback: (err?: Error) => void) => void;
 }
 export interface DataSourceOptions {
   type: string;
@@ -764,7 +766,8 @@ async function oraclePool(o: DataSourceOptions): Promise<OraclePoolFunctions> {
     user: o.username ?? "",
     password: o.password ?? "",
     connectString: oracleConnectString(o),
-    poolMax: o.poolSize ?? 10,
+    poolMax: Math.trunc(o.extra?.poolMax ?? o.poolSize ?? 10), // (extra goes over TypeORM's own pool options)
+    sessionCallback: o.extra?.sessionCallback,
   });
   return {
     getConnection: async (): Promise<OracleConnectionFunctions> => oracleConnection(await p.getConnection()),

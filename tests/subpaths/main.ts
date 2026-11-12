@@ -20,6 +20,34 @@ function corsFor(origins: string): CorsOptions {
   };
 }
 
+// dd-trace loaded as an optional package (require in a try), its trace tested before use and called with a callback
+interface SpanLite {
+  setTag(key: string, value: unknown): void;
+}
+interface TracerLite {
+  trace?: <T>(name: string, opts: { resource: string; type: string; tags: Record<string, unknown> }, fn: (span: SpanLite) => T) => T;
+}
+let tracer: TracerLite | null;
+try {
+  tracer = require("dd-trace") as TracerLite;
+} catch {
+  tracer = null;
+}
+let anyTracer: any;
+try {
+  anyTracer = require("dd-trace");
+} catch {
+  anyTracer = null;
+}
+function withSpan<T>(name: string, fn: (span: SpanLite | null) => Promise<T>): Promise<T> {
+  if (!tracer?.trace) return fn(null);
+  return tracer.trace(name, { resource: "job", type: "worker", tags: { n: 1 } }, (span) => fn(span));
+}
+function traced(n: number): number {
+  if (!anyTracer?.trace) return -1;
+  return anyTracer.trace("double", { type: "app", tags: {} }, () => n * 2);
+}
+
 async function main(): Promise<void> {
   const seen: string[] = [];
   const v = await lastValueFrom(
@@ -52,6 +80,11 @@ async function main(): Promise<void> {
     ),
   );
   console.log(w, z, log.join(" | "));
+  const spanned = await withSpan("job", async (span: SpanLite | null): Promise<string> => {
+    span?.setTag("k", 1);
+    return span === null ? "no span" : "in a span";
+  });
+  console.log(spanned, traced(21));
   const services: Type<unknown>[] = [UsersService, OrdersService];
   console.log(services.length);
   const c = corsFor("https://a.example, https://b.example");
