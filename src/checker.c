@@ -4201,6 +4201,172 @@ static void pack_rest(Expr *e, Type *ft) {
     e->args.len = r;
     expr_list_push(&e->args, arr);
 }
+/* ---- variance (Isa, 12/11): a Record<string, number> where a Record<string, unknown> goes is passed as a copy only when
+   the callee provably only reads that parameter (its entries read, iterated, spread, compared, handed to a function
+   that only reads it too); when it may write it (or it escapes where that cannot be told), an error asks for the type */
+static bool ro_param(Func *f, const char *name, int depth);
+static bool ro_ok;
+static const char *ro_name;
+static int ro_depth;
+static void ro_e(Expr *e, Expr *parent, bool assigned);
+static void ro_s(Stmt *s) {
+    if (!s || !ro_ok) return;
+    if (s->kind == S_VAR && s->name && !strcmp(s->name, ro_name)) { ro_ok = false; return; } /* (shadowed: not told apart) */
+    if (s->kind == S_FOROF && s->expr && s->expr->kind == E_IDENT && s->expr->str && !strcmp(s->expr->str, ro_name)) { /* for (... of p) */ }
+    else ro_e(s->expr, NULL, false);
+    ro_e(s->init, NULL, false);
+    ro_e(s->cond, NULL, false);
+    ro_e(s->for_update, NULL, false);
+    ro_s(s->for_init);
+    ro_s(s->body);
+    ro_s(s->else_body);
+    for (int i = 0; i < s->stmts.len; i++) ro_s(s->stmts.items[i]);
+    for (int i = 0; i < s->ncases; i++) { ro_e(s->cases[i].value, NULL, false); ro_s(s->cases[i].body); }
+    if (s->kind == S_RETURN && s->expr && s->expr->kind == E_IDENT && s->expr->str && !strcmp(s->expr->str, ro_name)) ro_ok = false; /* (returned) */
+}
+static bool ro_reader_call(Expr *call, int argi) {
+    /* Object.keys(p), JSON.stringify(p), String(p), console.log(p): readers; f(p) of a function that only reads it */
+    if (call->kind == E_MEMBER && call->is_call && call->lhs && call->lhs->kind == E_IDENT && call->lhs->str &&
+        (!strcmp(call->lhs->str, "Object") || !strcmp(call->lhs->str, "JSON") || !strcmp(call->lhs->str, "console")) && !lookup(call->lhs->str))
+        return call->str && strcmp(call->str, "assign") != 0 && strcmp(call->str, "defineProperty") != 0;
+    if (call->kind == E_CALL && call->lhs && call->lhs->kind == E_IDENT && call->lhs->str) {
+        if (!strcmp(call->lhs->str, "String")) return true;
+        Func *g = lookup_func(call->lhs->str);
+        if (g && argi < g->nparams && ro_depth < 8) {
+            const char *sn = ro_name; bool so = ro_ok; int sd = ro_depth;
+            bool r = ro_param(g, g->params[argi].name, ro_depth + 1);
+            ro_name = sn; ro_ok = so; ro_depth = sd;
+            return r;
+        }
+    }
+    return false;
+}
+static void ro_e(Expr *e, Expr *parent, bool assigned) {
+    if (!e || !ro_ok) return;
+    if (e->kind == E_IDENT && e->str && !strcmp(e->str, ro_name)) {
+        if (assigned) { ro_ok = false; return; }
+        if (!parent) { ro_ok = false; return; } /* (const q = p, a statement of its own: held elsewhere) */
+        switch (parent->kind) {
+        case E_MEMBER:
+            if (parent->lhs == e) {
+                if (parent->is_call) {
+                    const char *m = parent->str;
+                    if (!m || !(!strcmp(m, "get") || !strcmp(m, "has") || !strcmp(m, "keys") || !strcmp(m, "values") || !strcmp(m, "entries") ||
+                                !strcmp(m, "forEach") || !strcmp(m, "hasOwnProperty"))) ro_ok = false;
+                }
+                return; /* (p.k, p.size: a read) */
+            }
+            for (int i = 0; i < parent->args.len; i++) if (parent->args.items[i] == e && !ro_reader_call(parent, i)) ro_ok = false;
+            return;
+        case E_CALL:
+            for (int i = 0; i < parent->args.len; i++) if (parent->args.items[i] == e && !ro_reader_call(parent, i)) ro_ok = false;
+            return;
+        case E_INDEX: if (parent->lhs != e) ro_ok = false; return; /* p[k]: a read (writes are seen as assigned) */
+        case E_BINARY: if (parent->op == TK_EQ || parent->op == TK_NEQ || parent->op == TK_IN) return; ro_ok = false; return;
+        case E_UNARY: if (parent->op == TK_ELLIPSIS || parent->op == TK_NOT || parent->op == TK_IDENT) return; ro_ok = false; return; /* ({ ...p }, !p, typeof p) */
+        case E_TEMPLATE: return;
+        default: ro_ok = false; return;
+        }
+    }
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) {
+        Func *f = e->arrow->fn;
+        for (int i = 0; i < f->nparams; i++) if (f->params[i].name && !strcmp(f->params[i].name, ro_name)) return;
+        ro_s(f->body);
+        return;
+    }
+    if (e->kind == E_ASSIGN) { /* p[k] = v, p.k = v, p = q: written */
+        Expr *t = e->lhs;
+        while (t && (t->kind == E_INDEX || (t->kind == E_MEMBER && !t->is_call))) {
+            if (t->lhs && t->lhs->kind == E_IDENT && t->lhs->str && !strcmp(t->lhs->str, ro_name)) { ro_ok = false; return; }
+            t = t->lhs;
+        }
+        ro_e(e->lhs, e, true);
+        ro_e(e->rhs, e, false);
+        return;
+    }
+    if ((e->kind == E_UNARY || e->kind == E_POSTFIX) && (e->op == TK_PLUSPLUS || e->op == TK_MINUSMINUS)) { ro_e(e->lhs, e, true); return; }
+    ro_e(e->lhs, e, false);
+    ro_e(e->rhs, e, false);
+    for (int i = 0; i < e->args.len; i++) ro_e(e->args.items[i], e, false);
+}
+static bool ro_param(Func *f, const char *name, int depth) {
+    if (!f || !f->body) return false;
+    ro_ok = true;
+    ro_name = name;
+    ro_depth = depth;
+    ro_s(f->body);
+    return ro_ok;
+}
+/* the argument a of parameter i of f: a copy of it where the parameter's Record type differs only in unknown values */
+static void variance_arg_t(Expr *a, Func *f, int i, Type *ptype);
+static void variance_arg(Expr *a, Func *f, int i) {
+    if (!tsc_checked() || !a->type || i >= f->nparams) return;
+    variance_arg_t(a, f, i, f->params[i].type);
+}
+static void variance_arg_t(Expr *a, Func *f, int i, Type *ptype) {
+    if (!f || i >= f->nparams || !a->type) return;
+    Type *at = ty_strip_null(a->type), *pt = ty_strip_null(ptype);
+    if (at->kind == TY_FUNC && pt->kind == TY_FUNC && at->nparams == pt->nparams && !at->rest && !pt->rest && at->ret && pt->ret &&
+        (ty_equal(at->ret, pt->ret) || pt->ret->kind == TY_UNKNOWN || pt->ret->kind == TY_VOID) && !ty_equal(at, pt)) {
+        /* chaveGuia, (g: Guia) => string, where (x: unknown) => string goes: an adapter that reads each unknown as the
+           function takes it (checked), when the callee only calls it */
+        bool fits = true;
+        for (int k = 0; k < at->nparams && fits; k++) fits = ty_equal(at->params[k], pt->params[k]) || pt->params[k]->kind == TY_UNKNOWN;
+        Expr *ref = NULL;
+        if (fits && (a->kind == E_IDENT || a->kind == E_FUNC_REF) && a->str) { ref = xs_alloc(sizeof *ref); ref->kind = E_IDENT; ref->pos = a->pos; ref->field = -1; ref->str = a->str; }
+        else if (fits) ref = pure_copy(a);
+        if (!ref) return;
+        if (!ro_param(f, f->params[i].name, 0))
+            xs_error(XS8018, a->pos, xs_sprintf("give '%s' of %s the type %s", f->params[i].name, f->name, ty_name(a->type)),
+                     "%s goes where %s goes, and '%s' of %s lets it out: an adapter would not be the same function", ty_name(a->type),
+                     ty_name(ptype), f->params[i].name, f->name);
+        static int nad;
+        Func *af = xs_alloc(sizeof *af); af->pos = a->pos; af->name = "arrow";
+        af->ret = pt->ret->kind == TY_UNKNOWN ? ty_unknown : pt->ret;
+        af->params = xs_alloc(sizeof(Param) * (size_t)(pt->nparams ? pt->nparams : 1));
+        af->nparams = pt->nparams;
+        Expr *call = xs_alloc(sizeof *call); call->kind = E_CALL; call->pos = a->pos; call->field = -1; call->lhs = ref;
+        for (int k = 0; k < pt->nparams; k++) {
+            memset(&af->params[k], 0, sizeof(Param));
+            af->params[k].name = xs_sprintf("__ad%d_%d", nad, k);
+            af->params[k].type = pt->params[k];
+            Expr *id = xs_alloc(sizeof *id); id->kind = E_IDENT; id->pos = a->pos; id->field = -1; id->str = af->params[k].name;
+            Expr *arg = id;
+            if (!ty_equal(at->params[k], pt->params[k])) {
+                arg = xs_alloc(sizeof *arg); arg->kind = E_AS; arg->pos = a->pos; arg->field = -1; arg->lhs = id; arg->elem_type = at->params[k];
+            }
+            expr_list_push(&call->args, arg);
+        }
+        nad++;
+        Stmt *r = xs_alloc(sizeof *r); r->pos = a->pos;
+        if (af->ret->kind == TY_VOID) { r->kind = S_EXPR; r->expr = call; } else { r->kind = S_RETURN; r->expr = call; }
+        Stmt *b = xs_alloc(sizeof *b); b->kind = S_BLOCK; b->pos = a->pos; stmt_list_push(&b->stmts, r);
+        af->body = b;
+        Arrow *ar = xs_alloc(sizeof *ar); ar->pos = a->pos; ar->fn = af; ar->expr_body = af->ret->kind != TY_VOID;
+        memset(a, 0, sizeof *a);
+        a->kind = E_ARROW; a->pos = ar->pos; a->field = -1; a->arrow = ar;
+        check_expr(a, ptype);
+        return;
+    }
+    if (at->kind != TY_MAP || pt->kind != TY_MAP || !at->record || !pt->record || pt->elem->kind != TY_UNKNOWN || at->elem->kind == TY_UNKNOWN ||
+        !ty_equal(at->key, pt->key) || at->nkey || pt->nkey)
+        return;
+    if (!ro_param(f, f->params[i].name, 0))
+        xs_error(XS8018, a->pos, xs_sprintf("declare it as %s, or give '%s' of %s the type %s", ty_name(ptype), f->params[i].name, f->name, ty_name(a->type)),
+                 "%s goes where %s goes, and '%s' of %s may write it (or let it out): a copy would not see those writes", ty_name(a->type),
+                 ty_name(ptype), f->params[i].name, f->name);
+    Expr *v = xs_alloc(sizeof *v);
+    *v = *a;
+    v->prechecked = true;
+    Expr *u = xs_alloc(sizeof *u);
+    u->kind = E_UNARY; u->op = TK_ELLIPSIS; u->pos = a->pos; u->field = -1; u->lhs = v;
+    memset(a, 0, sizeof *a);
+    a->kind = E_OBJLIT; a->pos = v->pos; a->field = -1; a->spread = true;
+    a->keys = xs_alloc(sizeof(char *));
+    a->keys[0] = "...";
+    expr_list_push(&a->args, u);
+    check_expr(a, ptype);
+}
 static void check_args(Expr *e, Func *f, const char *what) {
     if (f->nparams && f->params[f->nparams - 1].rest) { /* ...xs: T[]: the arguments from there on, one array (or f(...ys): ys) */
         int r = f->nparams - 1;
@@ -4228,6 +4394,7 @@ static void check_args(Expr *e, Func *f, const char *what) {
     for (int i = e->args.len, given = e->args.len; i < f->nparams; i++) expr_list_push(&e->args, dflt_arg(f, i, e->args.items, given, e->pos));
     for (int i = 0; i < e->args.len; i++) {
         check_expr(e->args.items[i], f->params[i].type);
+        variance_arg(e->args.items[i], f, i);
         expect_type(e->args.items[i], f->params[i].type, xs_sprintf("argument '%s' of %s", f->params[i].name, what));
     }
 }
@@ -8022,6 +8189,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (e->args.len != ft->nparams) xs_error(XS8062, e->pos, NULL, "'%s' takes %d argument(s), got %d", name, ft->nparams, e->args.len);
                 for (int i = 0; i < e->args.len; i++) {
                     check_expr(e->args.items[i], ft->params[i]);
+                    if (tsc_checked() && af && i < af->nparams) variance_arg_t(e->args.items[i], af, i, ft->params[i]); /* (Isa, 12/11) */
                     expect_type(e->args.items[i], ft->params[i], xs_sprintf("argument %d of '%s'", i + 1, name));
                 }
                 e->type = ft->ret;
