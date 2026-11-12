@@ -533,30 +533,34 @@ export function Global(): (c: ClassInfo) => void {
   };
 }
 
-function route(verb: string, path: string): (c: ClassInfo, m: MethodInfo) => void {
+// @Post("x") or @Post(["x", "y"]): one route per path, as Nest maps each of them to the method
+function route(verb: string, path: string | string[]): (c: ClassInfo, m: MethodInfo) => void {
+  const paths: string[] = typeof path === "string" ? [path] : path;
   return (c: ClassInfo, m: MethodInfo): void => {
-    const list = __routes.get(c.id);
-    const r: RouteDef = { verb: verb, path: path, method: methodIndex(c, m) };
-    if (list === null) {
-      __routes.set(c.id, [r]);
-    } else {
-      list.push(r);
+    for (const p of paths) {
+      const list = __routes.get(c.id);
+      const r: RouteDef = { verb: verb, path: p, method: methodIndex(c, m) };
+      if (list === null) {
+        __routes.set(c.id, [r]);
+      } else {
+        list.push(r);
+      }
     }
   };
 }
-export function Get(path: string = ""): (c: ClassInfo, m: MethodInfo) => void {
+export function Get(path: string | string[] = ""): (c: ClassInfo, m: MethodInfo) => void {
   return route("GET", path);
 }
-export function Post(path: string = ""): (c: ClassInfo, m: MethodInfo) => void {
+export function Post(path: string | string[] = ""): (c: ClassInfo, m: MethodInfo) => void {
   return route("POST", path);
 }
-export function Put(path: string = ""): (c: ClassInfo, m: MethodInfo) => void {
+export function Put(path: string | string[] = ""): (c: ClassInfo, m: MethodInfo) => void {
   return route("PUT", path);
 }
-export function Patch(path: string = ""): (c: ClassInfo, m: MethodInfo) => void {
+export function Patch(path: string | string[] = ""): (c: ClassInfo, m: MethodInfo) => void {
   return route("PATCH", path);
 }
-export function Delete(path: string = ""): (c: ClassInfo, m: MethodInfo) => void {
+export function Delete(path: string | string[] = ""): (c: ClassInfo, m: MethodInfo) => void {
   return route("DELETE", path);
 }
 
