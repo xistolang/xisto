@@ -1328,8 +1328,18 @@ static Expr *parse_primary(Parser *p) {
                 next(p);
                 Expr *u = new_expr(E_UNARY, kp);
                 u->op = spread ? TK_ELLIPSIS : TK_LBRACKET;
-                if (spread) u->lhs = parse_assign(p);
-                else {
+                if (spread) {
+                    u->lhs = parse_assign(p);
+                    Expr *x = u->lhs;
+                    if (x->kind == E_BINARY && x->op == TK_AND && x->rhs && x->rhs->kind == E_OBJLIT) {
+                        /* ...(c && { k: v }): ...(c ? { k: v } : {}) (a falsy c spreads nothing) */
+                        Expr *c = new_expr(E_COND, x->pos);
+                        c->lhs = x->lhs;
+                        expr_list_push(&c->args, x->rhs);
+                        expr_list_push(&c->args, new_expr(E_OBJLIT, x->pos));
+                        u->lhs = c;
+                    }
+                } else {
                     u->lhs = parse_assign(p);
                     expect(p, TK_RBRACKET, NULL);
                     expect(p, TK_COLON, "a computed key takes a value: { [key]: value }");
@@ -1587,6 +1597,8 @@ static Expr *parse_postfix(Parser *p) {
             m->str = name.str;
             if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from") ||
                 !strcmp(name.str, "fromEntries")) wants_arrays = true;
+            if (!strcmp(name.str, "next") && e->kind == E_MEMBER && e->str && (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")))
+                wants_arrays = true; /* m.keys().next().value: __xs_first */
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs);
             if (at(p, TK_LPAREN)) {
                 m->is_call = true;
@@ -1623,6 +1635,8 @@ static Expr *parse_postfix(Parser *p) {
             m->str = name.str;
             if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from") ||
                 !strcmp(name.str, "fromEntries")) wants_arrays = true;
+            if (!strcmp(name.str, "next") && e->kind == E_MEMBER && e->str && (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")))
+                wants_arrays = true; /* m.keys().next().value: __xs_first */
             if (!strcmp(name.str, "length") && at(p, TK_ASSIGN)) wants_arrays = true; /* xs.length = 0 */
             if (!strcmp(name.str, "filter") && e->kind == E_MEMBER && e->is_call && e->str && !strcmp(e->str, "map")) wants_arrays = true; /* xs.map(f).filter(p): maybe __xs_mapFilterNum */
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs); /* obj.m<T>(x) */
@@ -4114,7 +4128,20 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
         return;
     }
     buf_printf(g, "const %s: ClassInfo = {\n  id: \"%s#%s\",\n  name: \"%s\",\n  params: ", ci_name, xs_display_path(m->file), c->name, c->name);
-    params_info(g, c->ctor);
+    /* class B extends A {} without a constructor of its own: A's (JavaScript passes B's arguments on to it), described by
+       A's ClassInfo (its types are names of A's module) */
+    Func *inh = NULL;
+    Class *rb = c->ctor ? NULL : reflected_base(prog, c);
+    for (Class *b = c, *nb = NULL; rb && !inh && b && b->base_name; b = nb) {
+        nb = NULL;
+        for (int i = 0; i < prog->nclasses && !nb; i++) {
+            Class *k = prog->classes[i];
+            if (k != b && !k->builtin && !k->is_interface && k->name && !strcmp(k->name, b->base_name)) nb = k;
+        }
+        if (nb && nb->ctor) inh = nb->ctor;
+    }
+    if (inh) buf_printf(g, "__xs_ci_params(%s)", rb->name);
+    else params_info(g, c->ctor);
     bool data_only = false; /* a DTO (fields without values, no constructor): no `new`, JSON makes it */
     for (int k = 0; k < c->nfields && !c->ctor; k++) if (!c->fields[k].init && !c->fields[k].optional) data_only = true;
     /* (also through the classes it extends: class B extends A {} with A's fields required, and no constructor) */
@@ -4135,7 +4162,8 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
         buf_printf(g, ",\n  construct: (args: unknown[]): unknown => { throw new Error(\"Cannot create an instance of an abstract class %s\"); },\n  methods: [", c->name);
     } else {
         buf_printf(g, ",\n  construct: (args: unknown[]): unknown => new %s(", c->name);
-        call_args(g, c->ctor);
+        if (inh) for (int i = 0; i < inh->nparams; i++) buf_printf(g, "%sargs[%d] as never", i ? ", " : "", i); /* (each as the parameter takes it) */
+        else call_args(g, c->ctor);
         buf_puts(g, "),\n  methods: [");
     }
     bool first_m = true;
@@ -4854,6 +4882,11 @@ static const char xs_arrays_src[] =
     "  }\n"
     "  return out;\n"
     "}\n"
+    "// m.keys().next().value: the first of them, undefined when there is none (the compiler calls this)\n"
+    "export function __xs_first<T>(xs: T[]): T | undefined {\n"
+    "  for (const x of xs) return x;\n"
+    "  return undefined;\n"
+    "}\n"
     "export function __xs_reduce<A, T>(xs: T[], f: (acc: A, x: T, i: int) => A, init: A): A {\n"
     "  let acc: A = init;\n"
     "  for (let i = 0; i < xs.length; i++) acc = f(acc, xs[i], i);\n"
@@ -5086,6 +5119,8 @@ static const char xs_reflect_src[] =
     "export interface ClassInfo {\n  id: string;\n  name: string;\n  params: ParamInfo[];\n"
     "  construct: (args: unknown[]) => unknown;\n  methods: MethodInfo[];\n  fields: FieldInfo[];\n"
     "  isInstance: (value: unknown) => boolean;\n  base: ClassInfo | null;\n}\n"
+    "// the parameters of the constructor a class inherits (class B extends A {}: A's; the compiler calls this)\n"
+    "export function __xs_ci_params(c: ClassInfo): ParamInfo[] {\n  return c.params;\n}\n"
     "// new (c)(...args) with c a class given as a value (the compiler calls this)\n"
     "export function __xs_construct(c: unknown, args: unknown[]): unknown {\n  return (c as ClassInfo).construct(args);\n}\n"
     "// TypeScript's decorator types, as xisto's decorators are (global names, like Error)\n"

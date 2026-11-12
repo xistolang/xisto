@@ -392,8 +392,18 @@ function build(provider: unknown, depth: int): unknown {
 
 /** Builds a class with its constructor parameters resolved (by @Inject token, or by type). */
 function construct(ci: ClassInfo, depth: int): unknown {
-  const injects0 = __injects.get(ci.id);
+  // @Inject() tokens are read as Nest reads its metadata (Reflect.getMetadata, which walks the prototype chain): a
+  // class's own, else those of the class it extends (class B extends A {} built with A's constructor)
+  let owner: ClassInfo = ci;
+  let injects0 = __injects.get(ci.id);
+  while (injects0 === null) {
+    const up = owner.base;
+    if (up === null) break;
+    owner = up;
+    injects0 = __injects.get(owner.id);
+  }
   const injects: InjectDef[] = injects0 || [];
+  const tokenOwner: ClassInfo = owner;
   const args: unknown[] = [];
   for (const p of ci.params) {
     let token: unknown = null;
@@ -407,7 +417,7 @@ function construct(ci: ClassInfo, depth: int): unknown {
     // a value registered without a provider class (TypeOrmModule): by token (@InjectRepository) or by the
     // parameter's type id (a DataSource). __values holds ready instances; __jsonValues the JSON the parameter's own
     // type decodes into the exact instance it asks for (a Repository<User>).
-    const key = __tokens.get(ci.id + "#" + String(p.index)) ?? (typeof token === "string" ? (token as string) : p.type.id);
+    const key = __tokens.get(ci.id + "#" + String(p.index)) ?? __tokens.get(tokenOwner.id + "#" + String(p.index)) ?? (typeof token === "string" ? (token as string) : p.type.id);
     const value = __values.get(key);
     if (value !== null) {
       args.push(value);

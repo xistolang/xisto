@@ -5,6 +5,7 @@ import { CreateTabletDto, LegacyDto, NoQueryPipe, SearchQueryDto, SortDto, Updat
 import { CurrentUser } from "./user.decorator";
 import { FormsService } from "./forms.service";
 import { UserGuard } from "./user.guard";
+import { DevIssuerGuard } from "./issuer.guard";
 
 @Controller("forms")
 export class FormsController {
@@ -34,6 +35,12 @@ export class FormsController {
   @HttpCode(200)
   legacy(@Body() dto: LegacyDto) {
     return { name: dto.name };
+  }
+
+  @Get("issued")
+  @UseGuards(DevIssuerGuard)
+  issued() {
+    return { issued: true };
   }
 
   @Get("settings")
