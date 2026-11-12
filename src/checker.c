@@ -1476,14 +1476,21 @@ static void view_mark(Class *w, const char *target, Module *m) {
         }
     if (!r || r->is_interface || r->builtin) return;
     bool open = find_field(r, "__expando", NULL) != NULL;
-    bool extra = false; /* (a property the class does not declare: kept on the object, so the view must be the object) */
     for (int i = 0; i < w->nfields; i++) {
         Field *rf = find_field(r, w->fields[i].name, NULL);
         if (!rf && !(open && w->fields[i].optional)) return; /* (a field the class has not, in a class that is not open) */
-        if (!rf) extra = true;
     }
-    if (!extra) return; /* ({ user?: JwtPayload }: its fields read from the object, typed as the view says: xs_as of a shape) */
+    /* the interface becomes a class over the request: it extends it (the same object, the same layout) with no fields
+       of its own; what the interface declares types the reads (check_object_member) */
     w->view_of = r;
+    w->view_fields = w->fields;
+    w->nview_fields = w->nfields;
+    w->fields = NULL;
+    w->nfields = w->cap_fields = 0;
+    w->is_interface = false;
+    w->base = r;
+    r->subs = realloc(r->subs, sizeof(Class *) * (size_t)(r->nsubs + 1));
+    r->subs[r->nsubs++] = w;
 }
 static void view_scan_stmt(Stmt *s, Module *m);
 static void view_scan_expr(Expr *e, Module *m) {
@@ -1784,7 +1791,6 @@ static Type *resolve(Type *t, Pos pos) {
             int xi;
             if (src && !src->is_interface && !src->builtin && find_field(src, "__expando", &xi)) { *t = *ty_object_of(src); return t; }
         }
-        if (t->cls->view_of) { *t = *ty_object_of(t->cls->view_of); return t; } /* (a view of an open class: the class) */
         if (t->cls->cname) return t;
         if (t->cls->name && strncmp(t->cls->name, "__Obj_", 6) == 0 && t->cls->mod && late_inline_class(t->cls)) return t;
         {
@@ -1796,7 +1802,6 @@ static Type *resolve(Type *t, Pos pos) {
                 if (missing_name(t->cls->name)) xs_error_quiet();
                 xs_error(XS9033, t->cls->pos.line ? t->cls->pos : pos, xs_help_suggest(t->cls->name, cands, n, "declare the class above, or use number, int, boolean, string or T[]"), "unknown type '%s'", t->cls->name);
             }
-            if (c && c->view_of) { *t = *ty_object_of(c->view_of); return t; } /* (a view of an open class: the class) */
             if (c->alias && c->ntparams) { /* type Item<T> = A<T> | B<T>: the alias with these arguments, resolved per use */
                 Type **ta = xs_alloc(sizeof(Type *) * (size_t)c->ntparams);
                 int n = 0;
@@ -3045,6 +3050,17 @@ static Expr *fresh_path(Expr *x) {
     return NULL;
 }
 static void expect_type(Expr *e, Type *want, const char *what) {
+    { /* req (a view of the request) where another view of it goes (this.realizar(req, dto)): the same object */
+        Type *g = e->type ? ty_strip_null(e->type) : NULL, *w = ty_strip_null(want);
+        if (g && g->kind == TY_OBJECT && w->kind == TY_OBJECT && g->cls != w->cls && w->cls->view_of &&
+            (g->cls->view_of == w->cls->view_of || g->cls == w->cls->view_of) && (e->type->kind != TY_NULLABLE || want->kind == TY_NULLABLE)) {
+            Expr *v = xs_alloc(sizeof *v);
+            *v = *e;
+            memset(e, 0, sizeof *e);
+            e->kind = E_UPCAST; e->pos = v->pos; e->field = -1; e->lhs = v; e->type = want;
+            return;
+        }
+    }
     if (e->type && e->type->kind == TY_NULLABLE && e->type->elem->kind == TY_INT && want->kind == TY_NULLABLE && want->elem->kind == TY_NUMBER) {
         wrap_call(e, "xs_num_of_int_or_null", want); /* status: res.statusCode ?? null (int | null) where number | null goes */
         return;
@@ -4628,7 +4644,42 @@ static void check_access(int access, Class *owner, const char *name, Pos pos) {
 static const char *prop_name(const char *m) { return strncmp(m, "__get_", 6) == 0 || strncmp(m, "__set_", 6) == 0 ? m + 6 : m; }
 
 static Type *member_expected; /* the type the caller expects of o.m(...) (a generic method's T from its result, as TypeScript) */
+static void check_object_member_in(Expr *e, Class *c);
+/* a read through a view (interface LocalRequest { user?: { usuario?: string } } over Express's Request): the request's
+   field, typed as the interface declares it where the class says any (checked as it is read); a field of the interface
+   that is a method of the class is an error said as such */
 static void check_object_member(Expr *e, Class *c) {
+    Field *vf = NULL;
+    for (Class *k = c; k && !vf; k = k->base)
+        for (int i = 0; k->view_of && i < k->nview_fields; i++) if (!strcmp(k->view_fields[i].name, e->str)) vf = &k->view_fields[i];
+    if (vf && !e->is_call && c->view_of && find_method(c->view_of, e->str))
+        xs_error(XS8049, e->pos, xs_sprintf("rename the field of %s, or call %s.%s(...)", c->name, c->view_of->name, e->str),
+                 "'%s' of %s is a method of %s, which %s is a view of", e->str, c->name, c->view_of->name, c->name);
+    check_object_member_in(e, c);
+    if (vf && !e->is_call && e != dyn_lvalue && e->type && vf->type && tsc_checked()) { /* (the view's types are what tsc
+                                                                                         checked: without it the class's) */
+        Class *vc = NULL;
+        for (Class *k = c; k && !vc; k = k->base) if (k->view_of) vc = k;
+        Module *was = cur_mod;
+        Scope *ss = scope;
+        const char *sfn = xs_file_name, *ssrc = xs_source;
+        if (vc && vc->mod && vc->mod != cur_mod) enter_module(vc->mod);
+        Type *vt = resolve(vf->type, e->pos);
+        cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
+        if (vf->optional && vt->kind != TY_NULLABLE && ty_is_heap(vt)) vt = ty_nullable_of(vt);
+        bool differs = !ty_equal(e->type, vt) && !ty_equal(e->type, ty_strip_null(vt)); /* (headers: IncomingHttpHeaders read as
+                                                                                       the Record<string, string | string[]> the view says) */
+        if (!ty_is_any(vt) && vt->kind != TY_UNKNOWN && (ty_is_any(e->type) || e->type->kind == TY_UNKNOWN || differs)) {
+            Expr *in = xs_alloc(sizeof *in);
+            *in = *e;
+            in->prechecked = true;
+            memset(e, 0, sizeof *e);
+            e->kind = E_AS; e->pos = in->pos; e->field = -1; e->lhs = in; e->elem_type = vt;
+            check_expr(e, NULL);
+        }
+    }
+}
+static void check_object_member_in(Expr *e, Class *c) {
     Type *mexp = member_expected;
     member_expected = NULL;
     e->cls = c;
