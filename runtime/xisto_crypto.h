@@ -343,6 +343,20 @@ XS_NOINLINE xs_str *xs_crypto_hmac(xs_str *alg, xs_str *key, xs_str *data, xs_st
     xs_digest_raw(alg->data, opad, (size_t)bl, inner, (size_t)dl, out);
     return xs_digest_encode(out, dl, enc->data);
 }
+/* the digest of bytes, as bytes (RSA padding and signatures hash binary data) */
+XS_NOINLINE xs_Uint8Array *xs_crypto_digest_bytes(xs_str *alg, xs_Uint8Array *data) {
+    int dl = xs_digest_len(alg->data);
+    xs_Uint8Array *r = xs_u8_new(dl);
+    xs_digest_raw(alg->data, data->data, (size_t)data->f_length, "", 0, r->data);
+    return r;
+}
+/* n random bytes from the system's entropy (randomBytes, randomInt, RSA padding) */
+XS_NOINLINE xs_Uint8Array *xs_crypto_random_bytes(int64_t n) {
+    if (n < 0) n = 0;
+    xs_Uint8Array *r = xs_u8_new(n);
+    if (n) xs_random_bytes(r->data, (size_t)n);
+    return r;
+}
 /* randomUUID: version 4, variant 10 (RFC 9562), from the system's entropy as Node's */
 XS_NOINLINE xs_str *xs_crypto_uuid(void) {
     uint8_t b[16];
