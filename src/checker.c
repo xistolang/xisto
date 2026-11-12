@@ -7550,6 +7550,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
+        if (tsc_checked() && !e->is_call && e->lhs->type && e->lhs->type->kind == TY_UNKNOWN && !ty_is_any(e->lhs->type))
+            e->lhs->type = ty_any; /* body.link on an unknown that tsc narrowed ('link' in body): read by name, as an any */
         if (ty_is_any(e->lhs->type)) { /* x.f on an any: by name, through the object's class (or a Record's key) */
             if (e->is_call) xs_error(XS2017, e->pos, "give the value its type (as SomeClass) to call its methods", "cannot call '%s' on an any: its methods are not looked up by name", e->str);
             dyn_call(e, e->op == TK_QDOT ? "xs_dyn_get_opt" : "xs_dyn_get", ty_any, e->lhs, dyn_key(e->pos, e->str), NULL);
