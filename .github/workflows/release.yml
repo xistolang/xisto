@@ -1,0 +1,114 @@
+# Release: builds xisto on macOS arm64, packs it (tools/dist.sh), publishes a GitHub release with the archive and
+# updates the Homebrew formula in xistolang/homebrew-tap (brew install xistolang/tap/xisto).
+#
+# Start it by pushing a tag (git tag v0.1.1 && git push origin v0.1.1) or by hand (Actions > release > Run workflow,
+# with the version; the tag is then created on the chosen commit).
+# The tap update needs the secret HOMEBREW_TAP_TOKEN: a fine-grained token with "Contents: read and write" on
+# xistolang/homebrew-tap only. Without it the release is still published and the step says what to do.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "version without the v (e.g. 0.1.1)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  macos-arm64:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          V="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
+          echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' || { echo "bad version: $V"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Cache AWS-LC source
+        uses: actions/cache@v4
+        with:
+          path: third_party/aws-lc
+          key: awslc-${{ hashFiles('tools/build-awslc.sh') }}
+
+      - name: Build
+        run: make -j"$(sysctl -n hw.ncpu)" VERSION=${{ steps.v.outputs.version }}
+
+      - name: Smoke test
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/smoke" && cd "$RUNNER_TEMP/smoke"
+          cat > smoke.ts <<'EOF'
+          import { DatabaseSync } from 'node:sqlite';
+          interface R { y: number }
+          const db = new DatabaseSync(':memory:');
+          db.exec('create table t (x integer)');
+          db.exec('insert into t values (41)');
+          const row: R | null = db.prepare('select x + 1 as y from t').get();
+          console.log('ok', row?.y, /^(\d)\1{10}$/.test('11111111111'), [1, 2, 3].map((x) => x * 2).join(','));
+          EOF
+          "$GITHUB_WORKSPACE/build/xisto" build --node-compat -o smoke smoke.ts
+          test "$(./smoke)" = "ok 42 true 2,4,6"
+          "$GITHUB_WORKSPACE/build/xisto" run --dev --node-compat smoke.ts | grep -qx "ok 42 true 2,4,6"
+
+      - name: Package
+        id: pkg
+        run: |
+          sh tools/dist.sh ${{ steps.v.outputs.version }}
+          echo "sha256=$(cat dist/*.tar.gz.sha256)" >> "$GITHUB_OUTPUT"
+
+      - name: Test the package through a link
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/inst" && tar -C "$RUNNER_TEMP/inst" -xzf dist/xisto-*.tar.gz
+          X="$RUNNER_TEMP/inst/xisto-${{ steps.v.outputs.version }}/bin/xisto"
+          "$X" --version | grep -qx "xisto ${{ steps.v.outputs.version }}"
+          cd "$RUNNER_TEMP/smoke" && "$X" build --node-compat -o smoke2 smoke.ts && test "$(./smoke2)" = "ok 42 true 2,4,6"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          if gh release view "v$V" >/dev/null 2>&1; then
+            gh release upload "v$V" dist/xisto-*.tar.gz dist/xisto-*.tar.gz.sha256 --clobber
+          else
+            gh release create "v$V" dist/xisto-*.tar.gz dist/xisto-*.tar.gz.sha256 \
+              --target "$GITHUB_SHA" --title "xisto $V" --generate-notes
+          fi
+
+      - name: Update the Homebrew tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          V: ${{ steps.v.outputs.version }}
+          SHA: ${{ steps.pkg.outputs.sha256 }}
+        run: |
+          set -eu
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set: the formula in xistolang/homebrew-tap was not updated (version $V, sha256 $SHA)"
+            exit 0
+          fi
+          git clone -q "https://x-access-token:${TAP_TOKEN}@github.com/xistolang/homebrew-tap.git" "$RUNNER_TEMP/tap"
+          mkdir -p "$RUNNER_TEMP/tap/Formula"
+          sed -e "s/@VERSION@/$V/g" -e "s/@SHA256@/$SHA/g" packaging/homebrew/xisto.rb.in > "$RUNNER_TEMP/tap/Formula/xisto.rb"
+          cd "$RUNNER_TEMP/tap"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/xisto.rb
+          git diff --cached --quiet && { echo "formula already at $V"; exit 0; }
+          git commit -qm "xisto $V"
+          git push -q origin HEAD
