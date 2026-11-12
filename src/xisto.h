@@ -314,6 +314,7 @@ struct Expr {
     bool boolean;      /* E_BOOL */
     bool prechecked;   /* checked already (its type is final): check_expr leaves it as it is */
     bool want_tuple;   /* E_ARRAY_LIT: [k, v] returned to new Map(xs.map(...)): a tuple, as TypeScript reads it there */
+    bool cell_raw;     /* E_IDENT tested against null (x === null, x ?? d): a narrowed variable in a cell read as declared (T | null) */
     char *str;         /* E_STRING literal, E_IDENT name, E_MEMBER member name, E_NEW_OBJ class name */
     TokKind op;
     Expr *lhs, *rhs;
