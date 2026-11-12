@@ -14,6 +14,8 @@
 
 #if defined(__APPLE__)
 #include <dlfcn.h>
+#include <signal.h>
+#include <unistd.h>
 #include <libkern/OSCacheControl.h>
 #include <mach-o/fixup-chains.h>
 #include <mach-o/loader.h>
@@ -35,6 +37,13 @@ static uint64_t lsym(void *lib, const char *name, bool weak) {
     return (uint64_t)(uintptr_t)p;
 }
 
+static void xs_inproc_fault(int sig) {
+    static const char m1[] = "xisto: the program was killed by signal ";
+    char num[4] = {(char)('0' + sig / 10), (char)('0' + sig % 10), '\n', 0};
+    (void)!write(2, m1, sizeof m1 - 1);
+    (void)!write(2, sig >= 10 ? num : num + 1, sig >= 10 ? 3 : 2);
+    _exit(128 + sig);
+}
 int xs_run_in_process(const char *path, int argc, char **argv) {
     FILE *f = fopen(path, "rb");
     if (!f) DECLINE("case 1");
@@ -178,6 +187,13 @@ int xs_run_in_process(const char *path, int argc, char **argv) {
     }
     free(file);
     fflush(stdout);
+    { /* the program dying of a fault in this process: said, with a shell's status, never a silent end */
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = xs_inproc_fault;
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGBUS, &sa, NULL);
+    }
     exit(entry(argc, argv, environ));
 }
 #else

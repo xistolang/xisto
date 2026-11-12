@@ -3073,14 +3073,6 @@ XS_NOINLINE void *xs_dyn_get(void *o, xs_str *k) {
     }
     return NULL; /* (undefined, as above) */
 }
-/* x.m() on an any, no class having m: JavaScript's TypeError (the name only: the expression's text is not kept) */
-XS_NOINLINE void xs_dyn_not_function(xs_str *k) {
-    static XS_TLS char buf[200];
-    snprintf(buf, sizeof buf, "TypeError: %.*s is not a function", (int)(k->len > 100 ? 100 : k->len), k->data);
-    xs_panic(buf);
-}
-/* x.m() on an any that is null */
-XS_NOINLINE void xs_dyn_null_call(xs_str *k) { xs_dyn_fail_read(NULL, k); }
 /* o?.k: null when o is */
 XS_NOINLINE void *xs_dyn_get_opt(void *o, xs_str *k) { return o ? xs_dyn_get(o, k) : NULL; }
 /* o[i] on an any: an array's element (null past its end, as undefined), or a Record's key i */
