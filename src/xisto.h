@@ -567,6 +567,7 @@ struct Class {
     struct Class *generic_of; /* an instance: its template */
     void *gen_state;   /* class Name<T> { ... }: the parser where the body starts; each instance parses it again with T bound */
     void *gen_subst;   /* the substitution in force where the template was written (a generic class inside an instance) */
+    bool json_written; /* an object literal where JSON goes (anon_objlit): only written, a union of objects in it by each one's class */
     bool data_only;    /* fields without initializer and no constructor (a DTO): made from JSON, never with new */
     /* inheritance: the base's fields come first (prefix layout), its methods are listed too (their cls is the base) */
     char *base_name;
@@ -710,6 +711,7 @@ typedef struct {
     bool uses_gen;     /* generators: the coroutine runtime, without worker threads (plain globals, no TLS) */
     bool uses_sqlite;
     bool uses_regex;    /* RegExp: runtime/xisto_regex.h joins the program */
+    bool uses_clone; /* structuredClone: a copy by the value's class at run time (emitted only then) */
     bool uses_v8, uses_unk_map, uses_symbol_for, uses_nkey, uses_okmap; /* xisto:v8, x instanceof Map/Set of an unknown, Symbol.for: their runtime joins the program */
     bool uses_this_reg; /* XB-107: function (this: T) / method slots: the this register's helpers join the program */
     bool uses_tls;

@@ -9851,6 +9851,7 @@ void emit_program(Program *p, Buf *o) {
     out = o;
     prog = p;
     if (p->uses_this_reg) buf_puts(out, xs_this_reg_c);
+    if (p->uses_clone) buf_puts(out, "static void *xs_structured_clone(void *v);\n");
     if (p->uses_v8) buf_puts(out, xs_v8_c);
     if (p->uses_unk_map) buf_puts(out, xs_unk_map_c);
     if (p->uses_symbol_for) buf_puts(out, xs_symbol_for_c);
@@ -10314,6 +10315,73 @@ void emit_program(Program *p, Buf *o) {
     } else if (json_fns.data) {
         if (json_protos.data) buf_puts(out, json_protos.data);
         buf_puts(out, json_fns.data);
+    }
+    if (p->uses_clone) { /* structuredClone: by the value's type at run time; a class's copy takes its fields, each one copied */
+        Buf u = {0};
+        buf_puts(&u, "static void *xs_clone_in(void *v);\n");
+        /* first a walk that only checks (a function, a value of no known kind: DataCloneError before anything is made) */
+        buf_puts(&u, "static void xs_clone_check(void *v, int depth) {\n"
+                     "    if (!v) return;\n"
+                     "    if (depth > 10000) xs_panic(\"DataCloneError: the value holds itself (a cycle) or is too deep\");\n"
+                     "    const xs_type *t_ = xs_type_of(v);\n"
+                     "    if (t_->print == xs_print_closure) xs_panic(\"DataCloneError: a function could not be cloned\");\n"
+                     "    void (*f_)(void *) = t_->free;\n"
+                     "    if (f_ == xs_str_free || f_ == xs_box_int_free || f_ == xs_box_num_free || f_ == xs_box_bool_free || f_ == xs_Date_free ||\n"
+                     "        f_ == xs_arr_num_free || f_ == xs_arr_int_free || f_ == xs_arr_bool_free) return;\n"
+                     "    if (f_ == xs_arr_ref_free) { xs_arr_ref *a_ = v; for (size_t i_ = 0; i_ < a_->len; i_++) xs_clone_check(a_->data[i_], depth + 1); return; }\n"
+                     "    if (f_ == xs_map_free) { xs_map *m_ = v; xs_map_entry *e_; if (m_->val_kind == 3) XS_MAP_EACH(m_, e_) xs_clone_check(e_->val.p, depth + 1); return; }\n");
+        for (int i = 0; i < p->nclasses; i++) {
+            Class *c = p->classes[i];
+            if (!c->used || c->builtin || c->nohdr || c->region || c->rdual) continue;
+            buf_printf(&u, "    if (f_ == %s_free) {", c->cname);
+            for (int k = 0; k < c->nfields; k++)
+                if (cref(c->fields[k].type)) buf_printf(&u, " xs_clone_check(((%s *)v)->%s, depth + 1);", c->cname, c->fields[k].cname);
+            buf_puts(&u, " return; }\n");
+        }
+        buf_puts(&u, "    xs_panic(\"DataCloneError: this value could not be cloned\");\n}\n");
+        for (int i = 0; i < p->nclasses; i++) {
+            Class *c = p->classes[i];
+            if (!c->used || c->builtin || c->nohdr || c->region || c->rdual) continue;
+            buf_printf(&u, "static void *xs_clone_%s(%s *o) {\n    %s *n = xs_obj_alloc_t(sizeof(%s), xs_type_of(o));\n"
+                           "    memcpy((char *)n + sizeof(xs_hdr), (char *)o + sizeof(xs_hdr), sizeof(%s) - sizeof(xs_hdr));\n",
+                       c->cname, c->cname, c->cname, c->cname, c->cname);
+            for (int k = 0; k < c->nfields; k++)
+                if (cref(c->fields[k].type)) buf_printf(&u, "    if (n->%s) n->%s = xs_clone_in(n->%s);\n", c->fields[k].cname, c->fields[k].cname, c->fields[k].cname);
+            buf_puts(&u, "    return n;\n}\n");
+        }
+        buf_puts(&u, "static void *xs_clone_in(void *v) {\n"
+                     "    if (!v) return NULL;\n"
+                     "    const xs_type *t_ = xs_type_of(v);\n"
+                     "    if (t_->print == xs_print_closure) xs_panic(\"DataCloneError: a function could not be cloned\");\n"
+                     "    void (*f_)(void *) = t_->free;\n"
+                     "    if (f_ == xs_str_free || f_ == xs_box_int_free || f_ == xs_box_num_free || f_ == xs_box_bool_free) return xs_retain(v); /* (immutable) */\n"
+                     "    if (f_ == xs_Date_free) return xs_date_make(((xs_Date *)v)->t);\n"
+                     "#define XS_CL_ARR_(T, E) if (f_ == T##_free) { T *a_ = v; T *n_ = T##_new((int64_t)a_->len, (E)0); if (a_->len) memcpy(n_->data, a_->data, a_->len * sizeof(E)); return n_; }\n"
+                     "    XS_CL_ARR_(xs_arr_num, double)\n"
+                     "    XS_CL_ARR_(xs_arr_int, int64_t)\n"
+                     "    XS_CL_ARR_(xs_arr_bool, bool)\n"
+                     "#undef XS_CL_ARR_\n"
+                     "    if (f_ == xs_arr_ref_free) { xs_arr_ref *a_ = v; xs_arr_ref *n_ = xs_arr_ref_new(a_->len, a_->print_elem); for (size_t i_ = 0; i_ < a_->len; i_++) xs_arr_ref_push(n_, xs_clone_in(a_->data[i_])); return n_; }\n"
+                     "    if (f_ == xs_map_free) {\n"
+                     "        xs_map *m_ = v; xs_map_entry *e_;\n"
+                     "        xs_map *n_ = xs_map_new(m_->is_map, m_->str_keys, m_->val_kind, m_->print_key, m_->print_val);\n"
+                     "        n_->record = m_->record; n_->ukeys = m_->ukeys;\n"
+                     "        XS_MAP_EACH(m_, e_) {\n"
+                     "            xs_val x_ = e_->val;\n"
+                     "            if (m_->val_kind == 3) x_.p = xs_clone_in(x_.p);\n"
+                     "            xs_map_put(n_, m_->str_keys ? e_->skey : NULL, m_->str_keys ? 0 : e_->ikey, x_);\n"
+                     "        }\n"
+                     "        return n_;\n"
+                     "    }\n");
+        for (int i = 0; i < p->nclasses; i++) {
+            Class *c = p->classes[i];
+            if (!c->used || c->builtin || c->nohdr || c->region || c->rdual) continue;
+            buf_printf(&u, "    if (f_ == %s_free) return xs_clone_%s(v);\n", c->cname, c->cname);
+        }
+        buf_puts(&u, "    xs_panic(\"DataCloneError: this value could not be cloned\");\n    return NULL;\n}\n");
+        buf_puts(&u, "static void *xs_structured_clone(void *v) { xs_clone_check(v, 0); return xs_clone_in(v); }\n");
+        buf_puts(out, u.data);
+        free(u.data);
     }
     if (isa_fns.data) { buf_puts(out, isa_fns.data); isa_fns.len = 0; isa_fns.data[0] = 0; nisa = 0; nasif = 0; }
     if (disp_fns.data) { buf_puts(out, disp_fns.data); disp_fns.len = 0; disp_fns.data[0] = 0; ndisp = 0; }
