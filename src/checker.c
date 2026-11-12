@@ -6330,6 +6330,10 @@ static void check_expr_in(Expr *e, Type *expected) {
                                 check_expr(ts, ty_string);
                                 init->args.items[i] = v = ts;
                             }
+                            if (strcmp(k, "body") == 0 && v->type && v->type->kind == TY_OBJECT && v->type->cls && v->type->cls->builtin &&
+                                (strcmp(v->type->cls->name, "Uint8Array") == 0 || strcmp(v->type->cls->name, "Buffer") == 0)) {
+                                wrap_call(v, "xs_fetch_body_bytes", ty_string); /* body: bytes, sent as they are */
+                            }
                             expect_type(v, ty_string, xs_sprintf("fetch option '%s'", k));
                         } else if (strcmp(k, "headers") == 0 && v->kind != E_OBJLIT) {
                             /* headers built before the call: a Record<string, string> (sent in insertion order) */
