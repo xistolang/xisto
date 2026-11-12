@@ -260,7 +260,7 @@ export class Connection {
    * Runs one SQL statement or PL/SQL block.
    * @param sql the statement, with bind placeholders such as `:1` or `:name`
    * @param binds the values for the placeholders, in the order they appear (strings, numbers, booleans as 1/0,
-   *   Dates, Uint8Arrays, null or BindParameter objects); binds by name go through executeNamed
+   *   Dates, Uint8Arrays, null or BindParameter objects), or an object of names and values for binds by name
    * @param options outFormat, autoCommit, maxRows
    * @returns the rows and columns of a query, rowsAffected for DML, outBinds for a PL/SQL block with OUT binds
    * @throws Error with the database's message ("ORA-00942: table or view does not exist ...") or a driver one
@@ -273,7 +273,10 @@ export class Connection {
    * Compatibility: as node-oracledb thin, except that CLOB/BLOB always come whole (also as OUT binds), and that
    * RETURNING INTO and REF CURSOR binds are not supported yet.
    */
-  async execute(sql: string, binds: unknown[] = [], options: ExecuteOptions = {}): Promise<object> {
+  async execute(sql: string, binds: unknown[] | Record<string, unknown> = [], options: ExecuteOptions = {}): Promise<object> {
+    if (!Array.isArray(binds)) {
+      return this.executeNamed(sql, binds, options); // binds by name, as node-oracledb takes them
+    }
     this.check();
     const b = bindsByPosition(binds);
     try {
