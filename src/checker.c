@@ -7810,6 +7810,12 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
+        if (e->is_call && e->str && !e->args.len && !strcmp(e->str, "valueOf") &&
+            (e->lhs->type->kind == TY_STRING || is_numeric(e->lhs->type) || e->lhs->type->kind == TY_BOOLEAN)) {
+            Expr *v = e->lhs; /* s.valueOf(), n.valueOf(): the value itself */
+            *e = *v;
+            return;
+        }
         if (ty_is_any(e->lhs->type) && e->is_call && e->str && e->args.len >= 1 && e->args.items[0]->kind == E_ARROW &&
             (!strcmp(e->str, "map") || !strcmp(e->str, "filter") || !strcmp(e->str, "forEach") || !strcmp(e->str, "find") ||
              !strcmp(e->str, "some") || !strcmp(e->str, "every") || !strcmp(e->str, "findIndex") || !strcmp(e->str, "flatMap"))) {
@@ -8124,6 +8130,10 @@ static void check_expr_in(Expr *e, Type *expected) {
                     } else if (strcmp(m, "filter") == 0) {
                         e->type = e->lhs->type;
                         Type *pr = cb->kind == E_ARROW && cb->arrow->fn->ret && cb->arrow->fn->ret->kind == TY_BOOLEAN ? cb->arrow->fn->ret->elem : NULL;
+                        if (pr && pr->kind == TY_TPARAM && pr->tname && !strcmp(pr->tname, "__nonnull") && pr->elem && pr->elem->kind == TY_TPARAM &&
+                            pr->elem->tname && !strncmp(pr->elem->tname, "__typeof:", 9) && cb->arrow->fn->nparams >= 1 &&
+                            !strcmp(pr->elem->tname + 9, cb->arrow->fn->params[0].name) && cb->arrow->fn->params[0].type)
+                            pr = ty_strip_null(cb->arrow->fn->params[0].type); /* (d): d is NonNullable<typeof d>: the element without null */
                         if (pr && elem->kind == TY_NULLABLE && ty_is_heap(elem->elem)) { /* xs.filter((x): x is string => x != null): string[] */
                             Type *pt = resolve(pr, cb->pos);
                             if (ty_equal(pt, elem->elem)) e->type = ty_array_of(pt); /* (laid out alike: the nulls are left out) */
@@ -8461,6 +8471,26 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         return;
     case E_NEW_ARRAY:
+        if (tsc_checked()) { /* new Array<R>(n), its elements set later (resultado[i] = ...): n empty slots, as JavaScript's (a
+                                reference type's null; 0, false for the others: what a slot holds until it is set) */
+            Type *et = resolve(e->elem_type, e->pos);
+            Expr *z = xs_alloc(sizeof *z);
+            z->pos = e->pos; z->field = -1;
+            if (is_numeric(et)) z = num_lit(e->pos, 0, et->kind == TY_INT);
+            else if (et->kind == TY_BOOLEAN) { z->kind = E_BOOL; }
+            else if (ty_is_heap(et)) { z->kind = E_NULL; z->type = et; z->prechecked = true; }
+            else z = NULL;
+            if (z) {
+                Expr *na = xs_alloc(sizeof *na);
+                *na = *e;
+                memset(e, 0, sizeof *e);
+                e->kind = E_MEMBER; e->pos = na->pos; e->field = -1; e->lhs = na; e->str = "fill"; e->is_call = true;
+                expr_list_push(&e->args, z);
+                xs_warn_rule(XS2107, na->pos, "fill it: new Array<T>(n).fill(x)", "a new array's empty slots: null until set (JavaScript reads undefined)");
+                check_expr(e, expected);
+                return;
+            }
+        }
         xs_error(XS6017, e->pos, "write: new Array<T>(n).fill(x)", "a new array must be filled before use");
         return;
     case E_SEQ: /* i++, j-- in a for loop's update */
@@ -8666,6 +8696,48 @@ static void check_expr_in(Expr *e, Type *expected) {
                 *e = *v;
                 expect_type(e, want, "the value of 'as'");
                 if (want->kind == TY_NULLABLE && e->type->kind != TY_NULLABLE && e->type->kind != TY_NULL) upcast(e, want); /* (the field it fills is T | null) */
+                return;
+            }
+        }
+        { /* (e as { cause?: unknown } | null)?.cause with e an Error: the shape read from the object by name (undefined where
+             it has no such field); (s as { valueOf(): string }).valueOf() with s a string: the string itself (null: TypeError
+             where JavaScript's call on null throws one) */
+            Type *vb = ty_strip_null(v->type), *wb = ty_strip_null(want);
+            bool verr = vb->kind == TY_OBJECT && (is_error_class(vb->cls) || (vb->cls->builtin && !strcmp(vb->cls->name, "Error")));
+            if (verr && wb->kind == TY_OBJECT && made_shape(wb->cls) && wb->cls->nmethods == 0 && !wb->cls->iface_methods && rereadable(v)) {
+                Pos pos = e->pos;
+                Expr *lit = xs_alloc(sizeof *lit);
+                lit->kind = E_OBJLIT; lit->pos = pos; lit->field = -1;
+                lit->keys = xs_alloc(sizeof(char *) * (size_t)(wb->cls->nfields + 1));
+                for (int k = 0; k < wb->cls->nfields; k++) {
+                    Expr *anyv = xs_alloc(sizeof *anyv);
+                    anyv->kind = E_AS; anyv->pos = pos; anyv->field = -1; anyv->lhs = pure_copy(v); anyv->elem_type = ty_any;
+                    if (v->type->kind == TY_NULLABLE) { Expr *nn = xs_alloc(sizeof *nn); nn->kind = E_AS; nn->op = TK_NOT; nn->pos = pos; nn->field = -1; nn->lhs = anyv->lhs; anyv->lhs = nn; }
+                    Expr *rd = xs_alloc(sizeof *rd);
+                    rd->kind = E_MEMBER; rd->pos = pos; rd->field = -1; rd->lhs = anyv; rd->str = wb->cls->fields[k].name;
+                    Expr *cv = xs_alloc(sizeof *cv);
+                    cv->kind = E_AS; cv->pos = pos; cv->field = -1; cv->lhs = rd; cv->elem_type = wb->cls->fields[k].type;
+                    lit->keys[lit->args.len] = wb->cls->fields[k].name;
+                    expr_list_push(&lit->args, cv);
+                }
+                Expr *res = lit;
+                if (v->type->kind == TY_NULLABLE) {
+                    Expr *z = xs_alloc(sizeof *z); z->kind = E_NULL; z->pos = pos; z->field = -1;
+                    Expr *t = xs_alloc(sizeof *t); t->kind = E_BINARY; t->op = TK_EQ; t->pos = pos; t->field = -1; t->lhs = pure_copy(v); t->rhs = z;
+                    Expr *z2 = xs_alloc(sizeof *z2); z2->kind = E_NULL; z2->pos = pos; z2->field = -1;
+                    Expr *c = xs_alloc(sizeof *c); c->kind = E_COND; c->pos = pos; c->field = -1; c->lhs = t;
+                    expr_list_push(&c->args, z2);
+                    expr_list_push(&c->args, lit);
+                    res = c;
+                }
+                *e = *res;
+                check_expr(e, want->kind == TY_NULLABLE ? want : wb);
+                return;
+            }
+            if ((vb->kind == TY_STRING || is_numeric(vb) || vb->kind == TY_BOOLEAN) && wb->kind == TY_OBJECT && wb->cls->iface_methods &&
+                wb->cls->nfields == 0) {
+                *e = *v;
+                if (e->type->kind == TY_NULLABLE) nonnull_checked(e, "the value of 'as'");
                 return;
             }
         }
@@ -9382,6 +9454,17 @@ static void check_expr_in(Expr *e, Type *expected) {
                 settle(e->args.items[0]);
                 elem = e->args.items[0]->type;
             }
+            if (tsc_checked() && elem->kind == TY_OBJECT && e->args.len > 1) { /* [ctx.getHandler(), ctx.getClass()]: objects of
+                classes that share no base (TypeScript: a union of them), an unknown[] (each one as it is) */
+                bool fits = true;
+                for (int i = 1; i < e->args.len && fits; i++) {
+                    Type *t = ty_strip_null(e->args.items[i]->type);
+                    fits = t->kind == TY_NULL || ty_equal(t, elem) || (t->kind == TY_OBJECT && is_subclass(t->cls, elem->cls)) || shape_ok(t, elem);
+                }
+                bool objs = true;
+                for (int i = 0; i < e->args.len && objs; i++) objs = ty_is_heap(e->args.items[i]->type) || e->args.items[i]->type->kind == TY_NULL;
+                if (!fits && objs) elem = ty_unknown;
+            }
             if (elem->kind != TY_NULLABLE && ty_is_heap(elem) && nullable_ok(elem)) { /* [`a=${x}`, c ? `b=${y}` : undefined]:
                                                 (string | undefined)[], as TypeScript types it (no null check on each element) */
                 bool nul = false;
@@ -9689,6 +9772,8 @@ static void check_var(Stmt *s, bool global) {
     bool keeps_promise = s->decl_type && (s->decl_type->kind == TY_PROMISE || (s->decl_type->kind == TY_NULLABLE && s->decl_type->elem->kind == TY_PROMISE));
     if (s->init->type->kind == TY_VOID && !(keeps_promise && pr_is_call(s->init))) /* (const p: Promise<void> = f(): the promise, made below) */
         xs_error(XS8102, s->init->pos, NULL, "cannot store a void value");
+    if (s->init->type->kind == TY_NULL && !s->decl_type && s->is_const && tsc_checked()) s->init->type = ty_unknown; /* const cdFil = null:
+                                                         TypeScript's type null; an unknown that holds null (it only ever is null) */
     if (s->init->type->kind == TY_NULL && !s->decl_type) xs_error(XS2013, s->init->pos, "write the type: let x: Todo | null = null;", "cannot infer the type of '%s' from null", s->name);
     if (s->decl_type) expect_type(s->init, s->decl_type, xs_sprintf("initializer of '%s' (declared as %s)", s->name, ty_name(s->decl_type)));
     settle(s->init);
