@@ -4245,7 +4245,22 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
     } else if (c->is_abstract) { /* an abstract base (a parameter's type, a base the injector meets): only its subclasses are built */
         buf_printf(g, ",\n  construct: (args: unknown[]): unknown => { throw new Error(\"Cannot create an instance of an abstract class %s\"); },\n  methods: [", c->name);
     } else {
-        buf_printf(g, ",\n  construct: (args: unknown[]): unknown => new %s(", c->name);
+        buf_printf(g, ",\n  construct: (args: unknown[]): unknown => ");
+        /* @Optional() now: () => number = Date.now, its provider missing (null): left out, so the default applies as in
+           JavaScript (undefined there); the trailing parameters with a default, cut where the rest are all null */
+        Func *cf = inh ? NULL : c->ctor;
+        int first_d = cf ? cf->nparams : 0;
+        while (cf && first_d > 0 && cf->params[first_d - 1].dflt && cf->params[first_d - 1].dflt->kind != E_NULL && !cf->params[first_d - 1].rest) first_d--;
+        for (int k = first_d; cf && k < cf->nparams; k++) {
+            buf_puts(g, "(");
+            for (int j = k; j < cf->nparams; j++) buf_printf(g, "%sargs.length <= %d || args[%d] === null", j > k ? " && " : "", j, j);
+            buf_printf(g, ") ? new %s(", c->name);
+            Func cut = *cf;
+            cut.nparams = k;
+            call_args(g, &cut);
+            buf_puts(g, ") : ");
+        }
+        buf_printf(g, "new %s(", c->name);
         if (inh) for (int i = 0; i < inh->nparams; i++) buf_printf(g, "%sargs[%d] as never", i ? ", " : "", i); /* (each as the parameter takes it) */
         else call_args(g, c->ctor);
         buf_puts(g, "),\n  methods: [");
