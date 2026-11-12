@@ -15,6 +15,8 @@ $ xisto build -o hello hello.ts && ./hello
 hello 6
 ```
 
+Documentation: **[xisto-lang.org](https://xisto-lang.org)**.
+
 **Status: early (0.x).** The language and the standard library are usable for real services, and the test suite
 compares every program's output with Node's byte for byte, but expect gaps and breaking changes between versions.
 
