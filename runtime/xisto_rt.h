@@ -3170,6 +3170,18 @@ XS_NOINLINE xs_str *xs_dyn_str(void *v) {
     if (t->free == xs_box_int_free) return xs_str_from_int(((xs_box_i *)v)->v);
     if (t->free == xs_box_bool_free) return xs_dyn_lit(((xs_box_i *)v)->v ? "true" : "false");
     if (t->free == xs_Symbol_free) return xs_Symbol_to_string(v);
+    if (t->free == xs_Error_free) { /* Error.prototype.toString: "name: message" (the name alone when the message is empty) */
+        xs_Error *e = v;
+        int64_t nl = e->f_name ? e->f_name->len : 0, ml = e->f_message ? e->f_message->len : 0;
+        if (ml == 0) return e->f_name ? xs_retain_(e->f_name) : xs_dyn_lit("");
+        if (nl == 0) return xs_retain_(e->f_message);
+        char *buf = malloc((size_t)(nl + ml + 2));
+        memcpy(buf, e->f_name->data, (size_t)nl); buf[nl] = ':'; buf[nl + 1] = ' ';
+        memcpy(buf + nl + 2, e->f_message->data, (size_t)ml);
+        xs_str *r = xs_str_new(buf, (size_t)(nl + ml + 2));
+        free(buf);
+        return r;
+    }
     return xs_dyn_lit("[object Object]");
 }
 /* a + b with an any on one side (borrowed): a string when either is one, else a number */

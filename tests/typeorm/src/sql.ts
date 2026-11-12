@@ -1,6 +1,6 @@
 // typeorm: the SQL a repository and a query builder write, for postgres and oracle, through a driver that records
 // each statement and its parameters instead of running it (no database needed)
-import { Column, DataSource, Driver, DriverSession, Entity, ILike, In, IsNull, LessThanOrEqual, Not, PrimaryColumn, Raw, ViewColumn, ViewEntity } from "typeorm";
+import { Column, DataSource, Driver, DriverSession, Entity, FindOptionsWhere, ILike, In, IsNull, LessThanOrEqual, Not, PrimaryColumn, Raw, ViewColumn, ViewEntity } from "typeorm";
 
 @Entity("TB_BENEFICIARIO")
 class Beneficiario {
@@ -83,6 +83,15 @@ async function dialect(name: string): Promise<void> {
   await repo.insert({ id: 8, nome: "Caio", limite: 0, ativo: false });
   await repo.insert({ id: 9, nascimento: () => "CURRENT_DATE", nome: "Dani", ativo: true });
 
+  // where conditions built by property name, then given to a query builder (setFindOptions), as a service does
+  // (the same SQL as TypeORM 0.3 getQueryAndParameters, up to parentheses; TypeORM writes the boolean as 1)
+  const where: FindOptionsWhere<Beneficiario>[] = [{ nome: Raw((alias) => `UPPER(${alias}) LIKE :t`, { t: "%A%" }) }, {}];
+  where[0].ativo = true;
+  where[1].id = In([4, 5]);
+  const fq = repo.createQueryBuilder("b").setFindOptions({ where });
+  const fa = fq.escape(fq.alias);
+  const [fl, ft] = await fq.orderBy(`${fa}.NM_BENEFICIARIO`, "DESC").offset(10).limit(5).getManyAndCount();
+  console.log("setFindOptions: " + String(fl.length) + " " + String(ft));
   const qb = repo.createQueryBuilder("b")
     .select(["b.nome", "b.id"])
     .innerJoin(Resumo, "r", "r.grupo = b.id")

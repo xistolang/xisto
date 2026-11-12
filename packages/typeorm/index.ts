@@ -999,7 +999,7 @@ function selectList(m: EntityMetadata, alias: string, only: string[]): string {
 // find options and results
 
 /** TypeORM's where / partial entity types: an object of the entity's columns (read as JSON by the query builder) */
-export type FindOptionsWhere<T> = object;
+export type FindOptionsWhere<T> = Record<string, object>; // (by property name: where[0].cdStatus = x; values as JSON, operators too)
 export type DeepPartial<T> = object;
 export type ObjectLiteral = object;
 
@@ -1651,6 +1651,60 @@ export class SelectQueryBuilder<T> {
   orWhere(condition: string, params: object = {}): SelectQueryBuilder<T> {
     this.wheres.push((this.wheres.length > 0 ? "OR " : "") + "(" + condition + ")");
     this.mergeParams(params);
+    return this;
+  }
+
+  /** The alias of the entity selected (TypeORM's qb.alias). */
+  get alias(): string {
+    return this.mainAlias;
+  }
+
+  /** A name quoted for the dialect (qb.escape("l") is "l" with double quotes). */
+  escape(name: string): string {
+    return quote(name);
+  }
+
+  /**
+   * find's options on the builder: where (an object, or a list of them for OR, with the find operators), order, skip
+   * and take, written as find writes them (TypeORM's setFindOptions).
+   */
+  setFindOptions(options: FindManyOptions): SelectQueryBuilder<T> {
+    const m = this.mainMeta;
+    if (m === null) {
+      throw new Error("setFindOptions needs the builder of an entity (repository.createQueryBuilder)");
+    }
+    const where = options.where ?? null;
+    if (where !== null) {
+      const dialect = this.executor.dialect();
+      const binds = new Binds(dialect);
+      let w = whereSql(m, where, this.mainAlias, binds);
+      // the positional placeholders as named parameters of the builder (:fo1...), from the last so :1 is not in :10
+      let text = "{";
+      for (let i = binds.values.length; i >= 1; i--) {
+        w = w.split((dialect === "oracle" ? ":" : "$") + String(i)).join(":__fo" + String(i));
+      }
+      for (let i = 0; i < binds.values.length; i++) {
+        const v: any = binds.values[i];
+        text += (i > 0 ? "," : "") + JSON.stringify("__fo" + String(i + 1)) + ":" + JSON.stringify(v);
+      }
+      const named: object = JSON.parse(text + "}");
+      if (w.length > 0) {
+        this.andWhere(w, named);
+      }
+    }
+    const order = options.order ?? null;
+    if (order !== null) {
+      const o = orderSql(m, order, this.mainAlias);
+      if (o.length > 0) {
+        this.orders.push(o);
+      }
+    }
+    if (options.skip != null) {
+      this.skipN = Math.trunc(options.skip ?? 0);
+    }
+    if (options.take != null) {
+      this.takeN = Math.trunc(options.take ?? 0);
+    }
     return this;
   }
 
