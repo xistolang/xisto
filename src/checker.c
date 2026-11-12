@@ -5205,6 +5205,23 @@ static void check_expr(Expr *e, Type *expected) {
     scope = s0; cur_mod = m0; cur_class = k0;
     xs_file_name = fn0; xs_source = src0;
 }
+/* "x.a.b" of a name or a chain of member reads (?. or .), before checking; NULL for anything else */
+static const char *member_path_text(Expr *e) {
+    if (!e) return NULL;
+    if (e->kind == E_IDENT) return e->str;
+    if (e->kind == E_COND && e->builtin.cfn && !strcmp(e->builtin.cfn, "optchain") && e->str && e->args.len >= 1) {
+        /* a?.b: the rest is written on the temporary that holds a */
+        const char *base = member_path_text(e->lhs), *rest = member_path_text(e->args.items[0]);
+        size_t tl = strlen(e->str);
+        if (!base || !rest || strncmp(rest, e->str, tl) != 0) return NULL;
+        return xs_sprintf("%s%s", base, rest + tl);
+    }
+    if (e->kind == E_MEMBER && !e->is_call && e->str) {
+        const char *l = member_path_text(e->lhs);
+        return l ? xs_sprintf("%s.%s", l, e->str) : NULL;
+    }
+    return NULL;
+}
 static bool cond_prim(Type *t) { return t->kind == TY_STRING || t->kind == TY_NUMBER || t->kind == TY_INT || t->kind == TY_BOOLEAN; }
 static void check_expr_in(Expr *e, Type *expected) {
     if (e->prechecked) return;
@@ -9053,6 +9070,19 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     case E_COND: {
         if (e->builtin.cfn && strcmp(e->builtin.cfn, "optchain") == 0) { check_optchain(e, expected); return; }
+        /* typeof x.m === "string" ? x.m : "" with x any: the branch reads x.m as a string (checked), as TypeScript
+           narrows it (then string methods can be called on the result) */
+        const char *ty_path = NULL;
+        Type *ty_to = NULL;
+        {
+            Expr *c = e->lhs;
+            if (c && c->kind == E_BINARY && c->op == TK_EQ && c->lhs && c->lhs->kind == E_UNARY && c->lhs->op == TK_IDENT &&
+                c->rhs && c->rhs->kind == E_STRING) {
+                ty_to = !strcmp(c->rhs->str, "string") ? ty_string : !strcmp(c->rhs->str, "number") ? ty_number : !strcmp(c->rhs->str, "boolean") ? ty_boolean : NULL;
+                if (ty_to) ty_path = member_path_text(c->lhs->lhs);
+            }
+        }
+        const char *then_path = ty_path && e->args.len == 2 ? member_path_text(e->args.items[0]) : NULL;
         check_expr(e->lhs, NULL);
         if (e->lhs->type->kind != TY_BOOLEAN && cond_truthy_type(e->lhs->type)) make_truthy(e->lhs, "condition of '?:'");
         if (e->lhs->type->kind != TY_BOOLEAN)
@@ -9094,6 +9124,14 @@ static void check_expr_in(Expr *e, Type *expected) {
                 check_expr(b, eb && a->type->kind == TY_ARRAY ? a->type : expected);
                 pop_scope();
             }
+        }
+        if (ty_path && then_path && !strcmp(ty_path, then_path) && ty_is_any(a->type)) {
+            Expr *in = xs_alloc(sizeof *in);
+            *in = *a;
+            memset(a, 0, sizeof *a);
+            a->kind = E_AS; a->pos = in->pos; a->field = -1; a->lhs = in; a->elem_type = ty_to;
+            in->prechecked = true;
+            check_expr(a, ty_to);
         }
         if (a->type->kind == TY_LITINT && b->type->kind == TY_LITINT) {
             if (expected && is_numeric(expected)) { coerce_lit(a, expected); coerce_lit(b, expected); }
