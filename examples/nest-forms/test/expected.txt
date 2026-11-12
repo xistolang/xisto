@@ -26,8 +26,9 @@ GET /api/forms/settings  -> 200 {"hasKid": false, "issuer": "forms-app", "ttlSec
 GET /api/forms/issued  {"x-issuer": "forms-app"}-> 200 {"issued": true}
 GET /api/forms/issued  {"x-issuer": "other"}-> 403 {"error": "Forbidden", "message": "issuer forms-app required", "statusCode": 403}
 GET /api/forms/issued  {"x-dev": "1"}-> 200 {"issued": true}
-GET /api/forms/url?a=1&b=two  -> 200 {"originalUrl": "/api/forms/url?a=1&b=two", "path": "/api/forms/url"}
-GET /api/forms/url-alias  -> 200 {"originalUrl": "/api/forms/url-alias", "path": "/api/forms/url-alias"}
+GET /api/forms/url?a=1&b=two  -> 200 {"a": "1", "originalUrl": "/api/forms/url?a=1&b=two", "path": "/api/forms/url", "query": {"a": "1", "b": "two"}}
+GET /api/forms/url-alias  -> 200 {"a": null, "originalUrl": "/api/forms/url-alias", "path": "/api/forms/url-alias", "query": {}}
+GET /api/forms/url?a=1&a=2&z=x%20y  -> 200 {"a": ["1", "2"], "originalUrl": "/api/forms/url?a=1&a=2&z=x%20y", "path": "/api/forms/url", "query": {"a": ["1", "2"], "z": "x y"}}
 GET /api/forms/bytes  -> 200 'olá, bytes'
 POST /api/forms/stream olá, corpo cru {"Content-Type": "text/plain"}-> 200 {"size": 15, "text": "olá, corpo cru"}
 POST /api/forms/stream {"a":1} -> 200 {"size": 0, "text": ""}

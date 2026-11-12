@@ -29,6 +29,8 @@ export class Request {
   ip: string = "";
   /** What an authentication guard put on the request (@nestjs/passport: validate()'s value). */
   user: any = null;
+  /** The query string parsed, as Express's req.query: each name's value, an array of them when it repeats (?a=1&a=2). */
+  query: Record<string, unknown> = {};
   /** The route's parameters (/:id), by name. */
   params: Record<string, string> = {};
   /** (what middleware, guards and interceptors add: request.terminal = t; an open class, read by name) */
@@ -56,6 +58,15 @@ export class Request {
       }
       this.headers.__expando[name] = v; // (all of them: a copy into a Record reads this)
     }
+    for (const name of source.queryNames()) {
+      const all = source.queryAll(name);
+      this.queries.set(name, all.length > 0 ? all[0] : "");
+      if (all.length > 1) {
+        this.query[name] = all;
+      } else {
+        this.query[name] = all.length > 0 ? all[0] : "";
+      }
+    }
   }
 
   /**
@@ -79,6 +90,7 @@ export class Request {
   /** Sets a query string value (the framework calls this while building the request). */
   setQueryValue(name: string, value: string): void {
     this.queries.set(name, value);
+    this.query[name] = value;
   }
 
   /**
@@ -103,8 +115,8 @@ export class Request {
     return this.header(name);
   }
 
-  /** A query string value, or null when it is absent. */
-  query(name: string): string | null {
+  /** A query string value, or null when it is absent (xisto's accessor; req.query is the object, as in Express). */
+  queryValue(name: string): string | null {
     return this.queries.get(name);
   }
 }

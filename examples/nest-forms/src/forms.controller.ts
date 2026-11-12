@@ -46,7 +46,8 @@ export class FormsController {
 
   @Get(["url", "url-alias"])
   url(@Req() req: ExpressRequest) {
-    return { originalUrl: req.originalUrl, path: req.path };
+    const q = req.query as Record<string, unknown>;
+    return { originalUrl: req.originalUrl, path: req.path, query: q, a: q.a ?? null };
   }
 
   @Post("stream")
