@@ -7239,11 +7239,16 @@ static void check_expr_in(Expr *e, Type *expected) {
                     return;
                 }
                 /* a copy of an array; a Set's values or a Map's entries (already arrays of their own) */
-                const char *m = st->kind == TY_ARRAY ? "slice" : st->kind == TY_SET ? "values" : st->kind == TY_MAP ? "entries" : NULL;
-                if (!m) xs_error(XS8093, src->pos, "Array.from takes an array, a Set or a Map", "cannot make an array from %s", ty_name(st));
+                const char *m = st->kind == TY_ARRAY ? "slice" : st->kind == TY_SET ? "values" : st->kind == TY_MAP ? "entries" : st->kind == TY_STRING ? "split" : NULL;
+                if (!m) xs_error(XS8093, src->pos, "Array.from takes an array, a Set, a Map or a string", "cannot make an array from %s", ty_name(st));
                 e->lhs = src;
                 e->str = (char *)m;
                 e->args.len = 0;
+                if (st->kind == TY_STRING) { /* Array.from(s): its characters (code points), as s.split("") gives them in xisto */
+                    Expr *empty = xs_alloc(sizeof *empty);
+                    empty->kind = E_STRING; empty->pos = e->pos; empty->field = -1; empty->str = ""; empty->type = ty_string; empty->lit_id = intern("");
+                    expr_list_push(&e->args, empty);
+                }
                 e->field = -1;
                 check_expr(e, expected);
                 return;
