@@ -5010,7 +5010,10 @@ static bool objlit_expand(Expr *e, Type *expected) {
             Type *v = NULL;
             for (int i = 0; i < e->args.len; i++) {
                 Expr *a = e->args.items[i];
-                if (strcmp(e->keys[i], "...") == 0) xs_error(XS1018, a->pos, hint, "a spread and computed keys in one object literal are not supported");
+                if (strcmp(e->keys[i], "...") == 0) {
+                    if (t) { v = ty_unknown; break; } /* (...(c ? { k: v } : {}) where an object goes: unknown values) */
+                    xs_error(XS1018, a->pos, hint, "a spread and computed keys in one object literal are not supported");
+                }
                 Expr *val = strcmp(e->keys[i], "[]") == 0 ? a->rhs : a;
                 Type *vt = pure_type(val);
                 if (t && (vt == NULL || (v && !ty_equal(v, vt->kind == TY_INT ? ty_number : vt)))) {
@@ -5033,7 +5036,40 @@ static bool objlit_expand(Expr *e, Type *expected) {
         arr->kind = E_ARRAY_LIT; arr->pos = e->pos; arr->field = -1;
         for (int i = 0; i < e->args.len; i++) {
             Expr *a = e->args.items[i];
-            if (strcmp(e->keys[i], "...") == 0) xs_error(XS1018, a->pos, hint, "a spread and computed keys in one object literal are not supported");
+            if (strcmp(e->keys[i], "...") == 0) {
+                /* { [k]: v, ...(c ? {} : { x: 'ASC' }) }: the pairs of the branch that holds, spread into the entries */
+                Expr *c = a->lhs;
+                bool ok = c && c->kind == E_COND && !c->builtin.cfn && c->args.len == 2;
+                for (int b = 0; ok && b < 2; b++) {
+                    Expr *o = c->args.items[b];
+                    ok = o->kind == E_OBJLIT;
+                    for (int k = 0; ok && k < o->args.len; k++) ok = strcmp(o->keys[k], "...") && strcmp(o->keys[k], "[]");
+                }
+                if (!ok) xs_error(XS1018, a->pos, hint, "a spread and computed keys in one object literal are not supported (only ...(c ? { k: v } : {}))");
+                Expr *cond = xs_alloc(sizeof *cond);
+                *cond = *c;
+                cond->args = (ExprList){0};
+                for (int b = 0; b < 2; b++) {
+                    Expr *o = c->args.items[b];
+                    Expr *pairs = xs_alloc(sizeof *pairs);
+                    pairs->kind = E_ARRAY_LIT; pairs->pos = o->pos; pairs->field = -1;
+                    for (int k = 0; k < o->args.len; k++) {
+                        Expr *pr = xs_alloc(sizeof *pr);
+                        pr->kind = E_ARRAY_LIT; pr->pos = o->pos; pr->field = -1;
+                        Expr *ks = xs_alloc(sizeof *ks);
+                        ks->kind = E_STRING; ks->pos = o->pos; ks->field = -1; ks->str = o->keys[k];
+                        expr_list_push(&pr->args, ks);
+                        expr_list_push(&pr->args, o->args.items[k]);
+                        expr_list_push(&pairs->args, pr);
+                    }
+                    expr_list_push(&cond->args, pairs);
+                }
+                Expr *sp = xs_alloc(sizeof *sp);
+                sp->kind = E_UNARY; sp->op = TK_ELLIPSIS; sp->pos = a->pos; sp->field = -1; sp->lhs = cond;
+                expr_list_push(&arr->args, sp);
+                arr->spread = true;
+                continue;
+            }
             Expr *pair = xs_alloc(sizeof *pair);
             pair->kind = E_ARRAY_LIT; pair->pos = a->pos; pair->field = -1;
             Expr *k, *val;
