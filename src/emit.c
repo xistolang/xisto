@@ -1074,6 +1074,7 @@ static const char *dispatcher(Func *m) {
         Func *impl = emit_find_method(k, m->name);
         /* (a method of the same name with other parameters, or one overriding such a method, is not m's: the nearest that is) */
         for (Class *u = k->base; impl && impl != m && u; u = u->base) {
+            if (impl->shadow && impl->bridge) { impl = impl->bridge; break; } /* (other parameters: through its bridge) */
             bool mine = false;
             for (int j = 0; j < m->noverrides && !mine; j++) mine = m->overrides[j] == impl;
             if (mine) break;
@@ -3087,7 +3088,7 @@ static void emit_expr_raw(Expr *e) {
     }
     case E_UNARY:
         if (e->op == TK_IDENT) { /* typeof on an unknown or a nullable primitive */
-            if (strcmp(e->builtin.cfn, "xs_typeof") == 0) { buf_puts(out, "xs_typeof("); emit_expr(e->lhs); buf_puts(out, ")"); return; }
+            if (strcmp(e->builtin.cfn, "xs_typeof") == 0) { buf_puts(out, "xs_typeof("); emit_borrowed(e->lhs); buf_puts(out, ")"); return; /* (typeof g(): the fresh value released) */ }
             Buf b = {0};
             Buf *saved = out;
             out = &b;
@@ -3515,6 +3516,19 @@ static void emit_expr_raw(Expr *e) {
         buf_puts(out, e->op == TK_PLUSPLUS ? "++)" : "--)");
         return;
     case E_CALL:
+        if (e->builtin.cfn && !e->lhs && strcmp(e->builtin.cfn, "xs_promise_await_p") == 0 && e->type && ty_is_heap(e->type) && !e->func) {
+            /* (await p).length: the awaited object as its type (the runtime gives a void *) */
+            static Expr *await_cast;
+            if (await_cast != e) {
+                Expr *was = await_cast;
+                await_cast = e;
+                buf_printf(out, "((%s)", ctype(e->type));
+                emit_expr(e);
+                buf_puts(out, ")");
+                await_cast = was;
+                return;
+            }
+        }
         if (!nz_mute && e->builtin.cfn && strcmp(e->builtin.cfn, "xs_to_number") == 0 && e->args.len == 1 && may_nz(e->args.items[0])) { emit_nzd(e->args.items[0]); return; } /* XB-087 */
         if (e->builtin.cfn && strcmp(e->builtin.cfn, "__iface_as") == 0) { /* XB-126 */
             Type *t = e->type->kind == TY_NULLABLE ? e->type->elem : e->type;
