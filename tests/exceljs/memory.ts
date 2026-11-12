@@ -1,10 +1,11 @@
 // exceljs (packages/exceljs): N rows of five cells written to a file. The peak memory must not grow with N
-// (tests/exceljs/run.sh compares 100 000 and 1 000 000 rows).
-import { WorkbookWriter } from "exceljs";
+// (tests/exceljs/run.sh compares 100 000 and 1 000 000 rows). The writer is named as npm's exceljs names it:
+// stream.xlsx.WorkbookWriter, in a type and after new.
+import { stream } from "exceljs";
 
 const out = process.argv[2];
 const rows: int = Math.trunc(Number(process.argv[3]));
-const wb = new WorkbookWriter({ filename: out, useStyles: true });
+const wb: stream.xlsx.WorkbookWriter = new stream.xlsx.WorkbookWriter({ filename: out, useStyles: true });
 const ws = wb.addWorksheet("Rows", { views: [{ state: "frozen", ySplit: 1 }] });
 ws.columns = [
   { header: "Id", key: "id", width: 10 },

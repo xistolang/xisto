@@ -1,3 +1,4 @@
 21 tap 21, tap without the value, finalize
+12 caught boom next 6 | complete | error boom
 2
 {"origin":["https://a.example","https://b.example"],"methods":["GET","POST"],"credentials":true,"allowedHeaders":["Content-Type","Authorization"],"maxAge":600}

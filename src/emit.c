@@ -2629,7 +2629,10 @@ static Class *json_capable_stack[64];
 static int json_capable_depth;
 static bool json_capable(Type *t) {
     switch (t->kind) {
-    case TY_NUMBER: case TY_INT: case TY_BOOLEAN: case TY_STRING: case TY_ENUM: case TY_JSON: case TY_UNKNOWN: case TY_UNION: return true;
+    case TY_NUMBER: case TY_INT: case TY_BOOLEAN: case TY_STRING: case TY_ENUM: case TY_JSON: case TY_UNKNOWN: return true;
+    case TY_UNION: /* (boolean | Observable<boolean>: a member that holds a function is not read from JSON) */
+        for (int i = 0; i < t->nparams; i++) if (!json_capable(t->params[i])) return false;
+        return true;
     case TY_ARRAY: case TY_NULLABLE: return json_capable(t->elem);
     case TY_MAP: return t->record && t->key && t->key->kind == TY_STRING && json_capable(t->elem); /* (a Record<string, V>: an object) */
     case TY_OBJECT: {
@@ -10122,6 +10125,15 @@ void emit_program(Program *p, Buf *o) {
                       "    snprintf(buf, sizeof buf, \"TypeError: %.*s is not a function\", (int)(k->len > 100 ? 100 : k->len), k->data);\n"
                       "    xs_panic(buf);\n}\n"
                       "XS_NOINLINE void xs_dyn_null_call(xs_str *k) { xs_dyn_fail_read(NULL, k); }\n");
+    if (xs_buf_view_used) /* Buffer.from(b.buffer, offset, length): a Buffer on the memory under b (only in a program that does it) */
+        buf_puts(out, "XS_NOINLINE xs_Uint8Array *xs_buf_view_of(xs_Uint8Array *b, int64_t off, int64_t len) {\n"
+                      "    if (xs_u8_shared(b)) xs_panic(\"TypeError: Buffer.from(view.buffer, ...) of a SharedArrayBuffer is not supported\");\n"
+                      "    xs_Uint8Array *root = b->owner ? (xs_Uint8Array *)b->owner : b;\n"
+                      "    if (off < 0 || off > root->f_length) xs_panic(\"RangeError: \\\"offset\\\" is outside of buffer bounds\");\n"
+                      "    if (len < 0) len = root->f_length - off;\n"
+                      "    else if (len > root->f_length - off) xs_panic(\"RangeError: \\\"length\\\" is outside of buffer bounds\");\n"
+                      "    xs_Uint8Array *v = xs_obj_alloc(sizeof *v, xs_u8_free, xs_buf_print);\n"
+                      "    v->f_length = len;\n    v->data = root->data + off;\n    v->owner = xs_retain(root);\n    return v;\n}\n");
     /* class free/print prototypes are needed by JSON parsers that allocate objects */
     for (int i = 0; i < p->nclasses; i++)
         if (p->classes[i]->used && !p->classes[i]->builtin) {
