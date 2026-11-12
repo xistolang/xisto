@@ -35,6 +35,9 @@ for b in ['{"name":"a","sortOrder":"DESC"}', '{"name":"a","sortOrder":"up"}', '{
 for b in ['{"name":"a","userId":5}', '{"name":"a"}']:
     call("POST", "/api/forms/legacy", b)
 call("GET", "/api/forms/settings")
+call("GET", "/api/forms/issued", headers={"x-issuer": "forms-app"})
+call("GET", "/api/forms/issued", headers={"x-issuer": "other"})
+call("GET", "/api/forms/issued", headers={"x-dev": "1"})
 call("GET", "/api/forms/me", headers={"x-user": "ana:t1"})
 call("GET", "/api/forms/me", headers={"x-user": "bia"})
 call("GET", "/api/forms/me")
