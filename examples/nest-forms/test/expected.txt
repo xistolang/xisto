@@ -27,6 +27,8 @@ GET /api/forms/issued  {"x-dev": "1"}-> 200 {"issued": true}
 GET /api/forms/url?a=1&b=two  -> 200 {"originalUrl": "/api/forms/url?a=1&b=two", "path": "/api/forms/url"}
 GET /api/forms/url-alias  -> 200 {"originalUrl": "/api/forms/url-alias", "path": "/api/forms/url-alias"}
 GET /api/forms/bytes  -> 200 'olá, bytes'
+POST /api/forms/stream olá, corpo cru {"Content-Type": "text/plain"}-> 200 {"size": 15, "text": "olá, corpo cru"}
+POST /api/forms/stream {"a":1} -> 200 {"size": 0, "text": ""}
 GET /api/forms/me  {"x-user": "ana:t1"}-> 200 {"sub": "ana", "tenant": "t1"}
 GET /api/forms/me  {"x-user": "bia"}-> 200 {"sub": "bia", "tenant": "none"}
 GET /api/forms/me  -> 401 {"message": "Unauthorized", "statusCode": 401}

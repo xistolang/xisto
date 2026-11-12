@@ -10,7 +10,7 @@ BASE = sys.argv[1].rstrip("/")
 def call(method, path, body=None, headers=None):
     data = None if body is None else body.encode()
     h = dict(headers or {})
-    if body is not None:
+    if body is not None and "Content-Type" not in h:
         h["Content-Type"] = "application/json"
     req = urllib.request.Request(BASE + path, data=data, method=method, headers=h)
     try:
@@ -42,6 +42,8 @@ call("GET", "/api/forms/issued", headers={"x-dev": "1"})
 call("GET", "/api/forms/url?a=1&b=two")
 call("GET", "/api/forms/url-alias")
 call("GET", "/api/forms/bytes")
+call("POST", "/api/forms/stream", "olá, corpo cru", headers={"Content-Type": "text/plain"})
+call("POST", "/api/forms/stream", '{"a":1}')
 call("GET", "/api/forms/me", headers={"x-user": "ana:t1"})
 call("GET", "/api/forms/me", headers={"x-user": "bia"})
 call("GET", "/api/forms/me")
