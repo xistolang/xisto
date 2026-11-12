@@ -377,6 +377,7 @@ static Class *find_class(const char *name) {
             return c; /* (Reflect.getMetadata & co: the global that import 'reflect-metadata' installs, the package's class) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:url") == 0 && c->exported) return c; /* (URL & co: web globals) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:intl") == 0 && strncmp(name, "Intl_", 5) == 0) return c; /* (Intl.X: global) */
+        if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:okmap") == 0 && !strcmp(name, "OkMap")) return c; /* (Map<object, V>) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:reflect") == 0 && !strcmp(name, "PropertyDescriptor"))
             return c; /* (TypeScript's global, as a method decorator receives it: XB-107) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:reflect") == 0 && strlen(name) > 9 && !strcmp(name + strlen(name) - 9, "Decorator"))
@@ -2117,6 +2118,17 @@ static Type *resolve(Type *t, Pos pos) {
                with get/set/has/delete (its keys are not listed back: keys(), entries() and for...of are refused) */
             t->key = ty_string;
             t->nkey = true;
+        }
+        if (prog->uses_okmap && !t->record && (t->key->kind == TY_JSON || (t->key->kind == TY_OBJECT && !t->key->cls->builtin))) {
+            /* Map<object, V>, WeakMap<K, V>: keys by identity, kept while they are keys (xisto:okmap's OkMap<V>) */
+            Class *ok = find_class("OkMap");
+            if (ok) {
+                Type **args = xs_alloc(sizeof(Type *));
+                args[0] = t->elem;
+                Class *inst = instantiate_class(ok, args, pos);
+                *t = *ty_object_of(inst);
+                return t;
+            }
         }
         if (t->key->kind == TY_NUMBER) t->key = ty_numkey(); /* Map<number, V>: keys are whole numbers (ids), checked when one goes in */
         if (t->key->kind == TY_ENUM) t->key = t->key->en->is_string ? ty_string : ty_int; /* Record<Enum, V>: by the enum's values */
@@ -7913,6 +7925,31 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->type = ty_big();
                 return;
             }
+            if (!strcmp(name, "__xs_omit") && e->args.len >= 1) { /* for (const { k, ...rest } of xs): rest, the element's other fields */
+                Expr *src = e->args.items[0];
+                check_expr(src, NULL);
+                Type *st = ty_strip_null(src->type);
+                if (st->kind != TY_OBJECT || st->cls->builtin)
+                    xs_error(XS6006, e->pos, "give the array a type (an interface or class), or name the fields one by one", "'...rest' needs the type of the value it comes from");
+                FieldSet fs = {0};
+                fields_here(st->cls, &fs);
+                Expr *o = xs_alloc(sizeof *o);
+                o->kind = E_OBJLIT; o->pos = e->pos; o->field = -1;
+                o->keys = xs_alloc(sizeof(char *) * (size_t)(fs.n ? fs.n : 1));
+                for (int i = 0; i < fs.n; i++) {
+                    bool omitted = false;
+                    for (int k = 1; k < e->args.len; k++) omitted = omitted || !strcmp(e->args.items[k]->str, fs.f[i].name);
+                    if (omitted) continue;
+                    Expr *rd = xs_alloc(sizeof *rd);
+                    rd->kind = E_MEMBER; rd->pos = e->pos; rd->field = -1; rd->str = fs.f[i].name;
+                    rd->lhs = xs_alloc(sizeof *rd->lhs); rd->lhs->kind = E_IDENT; rd->lhs->pos = e->pos; rd->lhs->field = -1; rd->lhs->str = src->str;
+                    o->keys[o->args.len] = fs.f[i].name;
+                    expr_list_push(&o->args, rd);
+                }
+                *e = *o;
+                check_expr(e, expected);
+                return;
+            }
             if (!strcmp(name, "__xs_ret_unknown") && e->args.len == 1) { /* (XB-107) a method's result as unknown: null for void */
                 Expr *x = e->args.items[0];
                 check_expr(x, NULL);
@@ -10045,6 +10082,26 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (expected && expected->kind == TY_NULLABLE) e->type = expected;
         return;
     case E_AS: {
+        if (e->elem_type && e->lhs && e->op != TK_NOT && e->lhs->kind == E_AS && e->lhs->op != TK_NOT && e->lhs->elem_type &&
+            e->lhs->elem_type->kind == TY_UNKNOWN && !ty_is_any(e->lhs->elem_type)) {
+            /* XB-182: binds as unknown as unknown[] with binds a Record: JavaScript passes the object on as it is (TypeScript's
+               cast checks nothing); here the value stays an unknown, which a place that takes Record | unknown[] (TypeORM's
+               query) reads as what it is, and an array place checks when it reads it */
+            Type *want = resolve(e->elem_type, e->pos);
+            Type *wb = ty_strip_null(want);
+            if (wb->kind == TY_ARRAY) {
+                Expr *inner = e->lhs->lhs;
+                check_expr(inner, NULL);
+                inner->prechecked = true;
+                Type *it = inner->type ? ty_strip_null(inner->type) : NULL;
+                if (it && (it->kind == TY_MAP || (it->kind == TY_OBJECT && !it->cls->is_tuple))) {
+                    Expr *u = e->lhs;
+                    *e = *u;
+                    check_expr(e, expected && ty_strip_null(expected)->kind == TY_ARRAY ? NULL : expected);
+                    return;
+                }
+            }
+        }
         if (e->elem_type && e->lhs && e->op != TK_NOT && is_deco_type(e->elem_type)) { /* (t, k, d) => ... as MethodDecorator: the
                                                                                          function as it is (XB-107) */
             Expr *v = e->lhs;
@@ -10754,6 +10811,18 @@ static void check_expr_in(Expr *e, Type *expected) {
     case E_NEW_MAP:
         if (!e->elem_type) infer_new_collection(e, expected);
         e->type = resolve(e->elem_type, e->pos);
+        if (e->type->kind == TY_OBJECT && e->type->cls->generic_of && !strcmp(e->type->cls->generic_of->name, "OkMap")) {
+            /* new Map<object, V>() / new WeakMap<K, V>(): an OkMap<V> */
+            if (e->args.len) xs_error(XS7072, e->pos, "add the entries with set()", "a map keyed by objects starts empty in xisto");
+            Class *inst = e->type->cls;
+            memset(e, 0, sizeof *e);
+            e->kind = E_NEW_OBJ; e->field = -1; e->str = "OkMap"; e->cls = inst;
+            e->targs = xs_alloc(sizeof(Type *));
+            e->targs[0] = ty_object_of(inst)->cls->fields[0].type->elem; /* (vals: Map<string, V>: V) */
+            e->ntargs = 1;
+            check_expr(e, NULL);
+            return;
+        }
         check_type_supported(e->pos, e->type);
         if (e->type->kind == TY_CHAN) {
             if (e->args.len > 1) xs_error(XS7067, e->pos, NULL, "new Channel<T>(capacity) takes at most one argument");

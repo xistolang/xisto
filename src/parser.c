@@ -56,6 +56,7 @@ static bool wants_intl;
 static Func **pending_overloads; /* function f(...): R; signatures waiting for their implementation */
 static int npending_overloads;
 static bool wants_settled; /* Promise.allSettled was named: xisto:settled is loaded */
+static bool wants_okmap; /* WeakMap, or Map<object, V>, was written: xisto:okmap is loaded */
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
 static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... was named: xisto:url is loaded */
 static bool is_url_global_name(const char *n);
@@ -816,9 +817,10 @@ static Type *parse_type(Parser *p) {
         expect(p, TK_LT, "write Array<T> or T[]");
         t = ty_array_of(parse_type(p));
         expect(p, TK_GT, NULL);
-    } else if (strcmp(n, "Map") == 0 || strcmp(n, "ReadonlyMap") == 0) {
+    } else if (strcmp(n, "Map") == 0 || strcmp(n, "ReadonlyMap") == 0 || strcmp(n, "WeakMap") == 0) {
         expect(p, TK_LT, "write Map<K, V>");
         Type *k = parse_type(p);
+        if (n[0] == 'W' || k->kind == TY_JSON) wants_okmap = true; /* (keys by identity: xisto:okmap) */
         expect(p, TK_COMMA, "write Map<K, V>");
         Type *v = parse_type(p);
         expect(p, TK_GT, NULL);
@@ -1603,12 +1605,14 @@ static Expr *parse_primary(Parser *p) {
             parse_args(p, &e->args);
             return e;
         }
-        if (strcmp(name.str, "Map") == 0 || strcmp(name.str, "Set") == 0) {
+        if (strcmp(name.str, "Map") == 0 || strcmp(name.str, "Set") == 0 || strcmp(name.str, "WeakMap") == 0) {
             Expr *e = new_expr(E_NEW_MAP, pos);
-            bool is_map = name.str[0] == 'M';
+            bool is_map = name.str[0] != 'S';
+            if (name.str[0] == 'W') wants_okmap = true; /* (keys by identity: xisto:okmap) */
             if (at(p, TK_LT)) {
                 next(p);
                 Type *k = parse_type(p);
+                if (is_map && k->kind == TY_JSON) wants_okmap = true;
                 if (is_map) {
                     expect(p, TK_COMMA, "write new Map<K, V>()");
                     Type *v = parse_type(p);
@@ -2770,6 +2774,30 @@ static Stmt *parse_stmt(Parser *p) {
                     s->is_const = true;
                     s->expr = parse_expr(p);
                     expect(p, TK_RPAREN, NULL);
+                    if (p->rest_tmp) { /* for (const { name, ...body } of xs): body the element without name (xs's type written) */
+                        Type *src = NULL;
+                        if (s->expr->kind == E_IDENT)
+                            for (int i = p->nvt - 1; i >= 0; i--) if (strcmp(p->vt_names[i], s->expr->str) == 0) { src = p->vt_types[i]; break; }
+                        while (src && src->kind == TY_NULLABLE) src = src->elem;
+                        if (src && src->kind == TY_ARRAY) rest_decl(p, src->elem, true);
+                        else { /* (xs's type not written here: const body = __xs_omit(element, 'name', ...), made by the checker) */
+                            Token rn = p->rest_name;
+                            Stmt *d = new_stmt(S_VAR, rn.pos);
+                            d->name = rn.str;
+                            d->is_const = true;
+                            Expr *c = new_expr(E_CALL, rn.pos);
+                            c->lhs = ident_expr(rn.pos, "__xs_omit");
+                            expr_list_push(&c->args, ident_expr(rn.pos, p->rest_tmp));
+                            for (int i = 0; i < p->nrest_keys; i++) {
+                                Expr *k = new_expr(E_STRING, rn.pos);
+                                k->str = p->rest_keys[i];
+                                expr_list_push(&c->args, k);
+                            }
+                            d->init = c;
+                            stmt_list_push(&p->pending, d);
+                            p->rest_tmp = NULL;
+                        }
+                    }
                     StmtList decls = p->pending;
                     p->pending = (StmtList){0};
                     s->body = parse_loop_body(p);
@@ -5878,6 +5906,39 @@ static const char xs_v8_src[] =
     "export function serialize(value: unknown): Buffer {\n"
     "  return Buffer.from(JSON.stringify(value) ?? '');\n"
     "}\n";
+/* xisto:okmap: Map<object, V> and WeakMap<K, V>: keys by identity (the object kept while it is a key: a WeakMap's entries
+   are observed only through get/set/has/delete, as JavaScript allows) */
+static const char xs_okmap_src[] =
+    "declare function okey_text(k: unknown): string;\n"
+    "export class OkMap<V> {\n"
+    "  private readonly vals: Map<string, V> = new Map<string, V>();\n"
+    "  private readonly ks: Map<string, unknown> = new Map<string, unknown>();\n"
+    "  get(k: unknown): V | undefined {\n"
+    "    const t = okey_text(k);\n"
+    "    return this.vals.has(t) ? this.vals.get(t) : undefined;\n"
+    "  }\n"
+    "  set(k: unknown, v: V): OkMap<V> {\n"
+    "    const t = okey_text(k);\n"
+    "    this.vals.set(t, v);\n"
+    "    this.ks.set(t, k);\n"
+    "    return this;\n"
+    "  }\n"
+    "  has(k: unknown): boolean {\n"
+    "    return this.vals.has(okey_text(k));\n"
+    "  }\n"
+    "  delete(k: unknown): boolean {\n"
+    "    const t = okey_text(k);\n"
+    "    this.ks.delete(t);\n"
+    "    return this.vals.delete(t);\n"
+    "  }\n"
+    "  clear(): void {\n"
+    "    this.ks.clear();\n"
+    "    this.vals.clear();\n"
+    "  }\n"
+    "  get size(): int {\n"
+    "    return this.vals.size;\n"
+    "  }\n"
+    "}\n";
 static const char xs_os_src[] =
     "declare function os_parallelism(): int;\n"
     "export function availableParallelism(): int {\n  return os_parallelism();\n}\n"
@@ -6078,6 +6139,17 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->loading = false;
         return m;
     }
+    if (strcmp(name, "okmap") == 0) { /* xisto:okmap: identity-keyed maps (see xs_okmap_src) */
+        m->builtin = false;
+        m->file = "xisto:okmap";
+        m->src = (char *)xs_okmap_src;
+        m->native_prefix = "xs_";
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        prog->uses_okmap = true;
+        return m;
+    }
     if (strcmp(name, "child_process") == 0) {
         Func *f = builtin_func(m, "execSync", "xs_exec_sync", ty_string, 1, ty_string, NULL);
         f->params[0].name = "command";
@@ -6235,6 +6307,7 @@ Program *parse_program(const char *entry_file) {
     load_module(prog, entry_file, (Pos){0, 0}, NULL);
     if (wants_arrays) load_module(prog, "xisto:arrays", (Pos){1, 1}, entry_file);
     if (wants_settled) load_module(prog, "xisto:settled", (Pos){1, 1}, entry_file);
+    if (wants_okmap) load_module(prog, "xisto:okmap", (Pos){1, 1}, entry_file);
     if (wants_url) load_module(prog, "xisto:url", (Pos){1, 1}, entry_file); /* (before errors: its DOMException extends Error) */
     if (wants_errors) load_module(prog, "xisto:errors", (Pos){1, 1}, entry_file);
     if (wants_intl) load_module(prog, "xisto:intl", (Pos){1, 1}, entry_file);

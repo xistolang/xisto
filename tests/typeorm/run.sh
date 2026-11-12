@@ -33,6 +33,13 @@ if [ -n "$XISTO_ORACLE_URL" ]; then
     else
         echo "FAIL typeorm relations (live)"; diff relations-live.expected /tmp/xisto-typeorm-relations.out | head; fail=1
     fi
+    # XB-182: a Record of binds passed as `binds as unknown as unknown[]` (binds-record-live.expected: TypeORM 0.3)
+    if $X build --tsc-checked --no-warnings -o /tmp/xisto-typeorm-binds-rec src/binds-record-live.ts > /tmp/xisto-typeorm-binds-rec.build 2>&1 \
+        && /tmp/xisto-typeorm-binds-rec > /tmp/xisto-typeorm-binds-rec.out 2>&1 && cmp -s /tmp/xisto-typeorm-binds-rec.out binds-record-live.expected; then
+        echo "ok typeorm Record binds through unknown[] (live)"
+    else
+        echo "FAIL typeorm Record binds through unknown[] (live)"; head -5 /tmp/xisto-typeorm-binds-rec.build; diff binds-record-live.expected /tmp/xisto-typeorm-binds-rec.out | head; fail=1
+    fi
 else
     echo "ok typeorm oracle live (skipped: XISTO_ORACLE_URL is not set)"
 fi
