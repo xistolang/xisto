@@ -40,6 +40,7 @@ typedef struct Binding {
     bool lit_number; /* `let s = 0` (or 0.5, or any number) with no type written: s += i takes an int i as Number(i), as
                         JavaScript adds it (XB-094); the type the dev never wrote does not ask for a conversion */
     bool null_const;  /* const x = null (no type written): each read of x is null */
+    struct Class *proto_of; /* const p = Object.getPrototypeOf(x): the prototype of x's class (its methods' slots, an expando) */
     struct Binding *next;
 } Binding;
 
@@ -2396,6 +2397,8 @@ static Func *lookup_func(const char *name) {
         if ((!strcmp(name, "__xs_construct") || !strcmp(name, "__xs_ci_params") || !strcmp(name, "__xs_apply") || !strcmp(name, "__xs_use_desc") || !strcmp(name, "__xs_desc_enter") || !strcmp(name, "__xs_desc_leave")) &&
             f->mod && f->mod->file && !strcmp(f->mod->file, "xisto:reflect")) return f; /* (new (c)(); XB-107's f.apply and descriptors) */
         if (f->exported && (strstr(name, "__s_") || !strcmp(name, "__xs_fetch")) && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:url") == 0) return f; /* (URL.canParse, AbortSignal.timeout: statics of globals; fetch with its options in a value) */
+        if (!strncmp(name, "__xs_slot_get_", 14) || !strncmp(name, "__xs_slot_set_", 14) || !strncmp(name, "__xs_proto_get_", 15) ||
+            !strncmp(name, "__xs_proto_set_", 15)) return f; /* (a patched prototype's slot or expando) */
         if (!strncmp(name, "Reflect__s_", 11) && f->exported && f->mod && f->mod->file && strstr(f->mod->file, "/reflect-metadata/"))
             return f; /* (Reflect.defineMetadata & co: statics of the global Reflect, see find_class) */
         const char *st = strstr(name, "__s_"); /* a static method: visible where its class is imported */
@@ -6279,6 +6282,8 @@ static bool objlit_expand(Expr *e, Type *expected) {
     return false;
 }
 
+static bool proto_member(Expr *e, Expr *value, Type *expected);
+static Binding *proto_binding(Expr *x);
 static void check_expr_in(Expr *e, Type *expected);
 static void check_expr(Expr *e, Type *expected) {
     if (!e->ctx) { check_expr_in(e, expected); return; }
@@ -7206,6 +7211,11 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     case E_ASSIGN:
     case E_POSTFIX: {
+        if (e->kind == E_ASSIGN && e->op == TK_ASSIGN && e->lhs && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->lhs &&
+            e->lhs->lhs->kind == E_IDENT && proto_binding(e->lhs->lhs)) {
+            Expr *v = e->rhs;
+            if (proto_member(e, v, NULL)) return; /* (proto.m = f: the slot, or an expando) */
+        }
         if (e->kind == E_ASSIGN && e->op == TK_ASSIGN && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->lhs &&
             e->lhs->lhs->kind == E_IDENT && !strcmp(e->lhs->lhs->str, "process") && e->lhs->str && !strcmp(e->lhs->str, "exitCode") &&
             !lookup("process")) { /* process.exitCode = n: the status the program ends with */
@@ -8296,6 +8306,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         e->type = e->lhs->type->elem;
         return;
     case E_MEMBER:
+        if (!e->is_call && e->str && e->lhs && e->lhs->kind == E_IDENT && proto_member(e, NULL, expected)) return; /* (proto.m) */
         if (e->is_call && e->str && !strcmp(e->str, "apply") && e->args.len == 2 && e->lhs && e->lhs->kind != E_IDENT ? false :
             e->is_call && e->str && !strcmp(e->str, "apply") && e->args.len == 2 && e->lhs && !lookup_func(e->lhs->str) && lookup(e->lhs->str) &&
             lookup(e->lhs->str)->type && ty_strip_null(lookup(e->lhs->str)->type)->kind == TY_FUNC && ty_strip_null(lookup(e->lhs->str)->type)->rest) {
@@ -11238,7 +11249,30 @@ static void check_block(Stmt *b) {
     pop_scope();
 }
 
+static Expr *proto_call_of(Expr *x);
 static void check_var(Stmt *s, bool global) {
+    if (s->init && proto_call_of(s->init)) {
+        /* const proto = Object.getPrototypeOf(x) [as {...}]: the prototype of x's class, read and written by name: a method
+           with a slot (see proto_prepass) is its slot, another name an expando of the class (proto.__patched = true) */
+        Expr *pc = proto_call_of(s->init);
+        Expr *arg = pc->args.items[0];
+        check_expr(arg, NULL);
+        Type *at = ty_strip_null(arg->type);
+        if (at->kind != TY_OBJECT || at->cls->builtin || at->cls->is_interface)
+            xs_error(XS2017, pc->pos, "call getPrototypeOf on an object of a class", "Object.getPrototypeOf of %s: only an object of a class has a prototype here", ty_name(arg->type));
+        Expr *z = xs_alloc(sizeof *z);
+        z->kind = E_NULL; z->pos = s->init->pos; z->field = -1;
+        s->init = z;
+        s->decl_type = ty_any;
+        check_expr(s->init, ty_any);
+        s->type = ty_any;
+        Binding *b = declare(s->pos, s->name, s->type, s->is_const, global, false);
+        b->proto_of = at->cls;
+        b->used = true;
+        s->cname = b->cname;
+        s->cell = b->cell;
+        return;
+    }
     if (s->infer_int && !s->decl_type && !getenv("XISTO_NO_INFER_INT")) { /* XB-034 */
         check_expr(s->init, ty_int);
         if (s->init->type->kind == TY_LITINT) coerce_lit(s->init, ty_int);
@@ -13523,6 +13557,7 @@ static bool conv_ok(Type *from, Type *to, int depth) {
     if (ty_equal(from, to)) return true;
     if (from->kind == TY_VOID || to->kind == TY_VOID) return false;
     if (ty_is_any(to) || to->kind == TY_UNKNOWN) return true;
+    if (ty_is_any(from) && to->kind != TY_VOID) return true; /* (an any goes anywhere, checked at run time as it is converted) */
     if (from->kind == TY_LITINT && is_numeric(to)) return true;
     if (from->kind == TY_INT && to->kind == TY_NUMBER) return true;
     if (from->kind == TY_ENUM && from->en && ((!from->en->is_string && is_numeric(to)) || (from->en->is_string && to->kind == TY_STRING && !to->tname)))
@@ -14353,6 +14388,178 @@ static void deco_late_stubs(Program *p) {
         }
     }
 }
+/* Object.getPrototypeOf(x) (through casts), NULL when x is not that */
+static Expr *proto_call_of(Expr *x) {
+    while (x && x->kind == E_AS && x->op != TK_NOT && x->lhs) x = x->lhs;
+    if (x && x->kind == E_MEMBER && x->is_call && x->str && !strcmp(x->str, "getPrototypeOf") && x->args.len == 1 && x->lhs &&
+        x->lhs->kind == E_IDENT && x->lhs->str && !strcmp(x->lhs->str, "Object") && !lookup("Object")) return x;
+    return NULL;
+}
+/* the binding of a prototype (see check_var) */
+static Binding *proto_binding(Expr *x) {
+    if (!x || x->kind != E_IDENT || !x->str) return NULL;
+    Binding *b = lookup(x->str);
+    if (b && b->origin && b->origin->proto_of) return b->origin;
+    return b && b->proto_of ? b : NULL;
+}
+/* the accessors of C.m (made by proto_prepass): its slot's (a method), or its expando's (another name); NULL: none */
+static Func *proto_accessor_k(Class *c, const char *m, bool set, const char *kind) {
+    const char *n = xs_sprintf("__xs_%s_%s_%s_%s", kind, set ? "set" : "get", c->name, m);
+    SYM_EACH(funcs_by_name, n, e) { Func *f = e->decl; if (f->mod == c->mod) return f; }
+    return NULL;
+}
+static Func *proto_accessor(Class *c, const char *m, bool set) {
+    Func *f = proto_accessor_k(c, m, set, "slot");
+    return f ? f : proto_accessor_k(c, m, set, "proto");
+}
+/* proto.m (read) or proto.m = v: the slot of the class's method m through its accessors, else an expando of the class */
+static bool proto_member(Expr *e, Expr *value, Type *expected) {
+    Binding *b = proto_binding(e->kind == E_ASSIGN ? e->lhs->lhs : e->lhs);
+    if (!b) return false;
+    Class *c = b->proto_of;
+    Expr *mem = e->kind == E_ASSIGN ? e->lhs : e;
+    const char *m = mem->str;
+    Pos pos = e->pos;
+    Func *acc = proto_accessor(c, m, value != NULL);
+    Expr *callee = xs_alloc(sizeof *callee);
+    callee->kind = E_IDENT; callee->pos = pos; callee->field = -1;
+    ExprList args = {0};
+    if (!acc) {
+        if (value) xs_error(XS2017, pos, NULL, "'%s' set on the prototype of %s is not one the program's patching function sets", m, c->name);
+        memset(e, 0, sizeof *e); /* (a name nothing sets: undefined) */
+        e->kind = E_NULL; e->pos = pos; e->field = -1;
+        check_expr(e, expected);
+        return true;
+    }
+    callee->str = acc->name;
+    if (value) expr_list_push(&args, value);
+    memset(e, 0, sizeof *e);
+    e->kind = E_CALL; e->pos = pos; e->field = -1; e->lhs = callee; e->args = args;
+    check_expr(e, expected);
+    return true;
+}
+/* the statements of a function, walked for `const p = Object.getPrototypeOf(r)` and the names `p.m = ...` assigns */
+static void proto_walk(Stmt *s, Stmt **vars, int *nvars, Stmt **asg, int *nasg) {
+    if (!s) return;
+    if (s->kind == S_VAR && s->name && s->init && *nvars < 64) vars[(*nvars)++] = s;
+    if (s->kind == S_EXPR && s->expr && s->expr->kind == E_ASSIGN && s->expr->op == TK_ASSIGN && s->expr->lhs &&
+        s->expr->lhs->kind == E_MEMBER && !s->expr->lhs->is_call && s->expr->lhs->lhs && s->expr->lhs->lhs->kind == E_IDENT && *nasg < 64)
+        asg[(*nasg)++] = s;
+    proto_walk(s->body, vars, nvars, asg, nasg);
+    if (s->kind == S_IF || s->kind == S_TRY) proto_walk(s->else_body, vars, nvars, asg, nasg);
+    if (s->kind == S_TRY) proto_walk(s->for_init, vars, nvars, asg, nasg);
+    for (int i = 0; i < s->stmts.len; i++) proto_walk(s->stmts.items[i], vars, nvars, asg, nasg);
+    for (int i = 0; i < s->ncases; i++) proto_walk(s->cases[i].body, vars, nvars, asg, nasg);
+}
+static bool deco_slot(Program *p, Module *m, const char *cn, const char *mn, int at, int *added);
+static void deco_funcs(Program *p, Module *m, const char *text, Pos pos, Func *f, StmtList *decls);
+/* prototype patching (Isa, 12/11): `const proto = Object.getPrototypeOf(ds.createQueryRunner()...); proto.query = ...`.
+   Before any module's code is checked, each such function is read: the class its receiver is declared to give (a
+   parameter's type, a method's return type) has its methods that are assigned made into slots, as XB-107 does for
+   a decorator (their calls go through the slot), with accessors __xs_slot_get/set_C_m the patching code calls
+   (proto.query reads the slot, proto.query = f replaces it; original.apply(this, args) calls what it held). Only those
+   classes change: a program that patches nothing emits the same C. */
+/* where a class's module gets new statements: before its own (its variables set before any of its code runs) */
+static int proto_insert_at(Program *p, Module *m) {
+    int at = p->top.len, mod_ix = -1;
+    for (int q = 0; q < p->nmodules; q++) if (p->modules[q] == m) mod_ix = q;
+    for (int q = 0; q < p->top.len; q++) if (p->top.items[q]->mod == m) return q;
+    for (int q = 0; q < p->top.len && at == p->top.len; q++) {
+        int qi = -1;
+        for (int z = 0; z < p->nmodules; z++) if (p->modules[z] == p->top.items[q]->mod) qi = z;
+        if (qi > mod_ix) at = q;
+    }
+    return at;
+}
+static void proto_func(Program *p, Func *f) {
+    if (!f->body) return;
+    Stmt *vars[64], *asg[64];
+    int nv = 0, na = 0;
+    proto_walk(f->body, vars, &nv, asg, &na);
+    for (int i = 0; i < nv; i++) {
+        Expr *pc = NULL;
+        { Expr *x = vars[i]->init; while (x && x->kind == E_AS && x->op != TK_NOT && x->lhs) x = x->lhs;
+          if (x && x->kind == E_MEMBER && x->is_call && x->str && !strcmp(x->str, "getPrototypeOf") && x->args.len == 1 && x->lhs &&
+              x->lhs->kind == E_IDENT && x->lhs->str && !strcmp(x->lhs->str, "Object")) pc = x; }
+        if (!pc) continue;
+        /* the receiver: a name declared above as recv.method(), recv a parameter of f */
+        Expr *arg = pc->args.items[0];
+        Expr *init = NULL;
+        if (arg->kind == E_IDENT && arg->str)
+            for (int k = 0; k < nv; k++) if (vars[k] != vars[i] && !strcmp(vars[k]->name, arg->str)) init = vars[k]->init;
+        if (!init) init = arg;
+        while (init && init->kind == E_AS && init->op != TK_NOT && init->lhs) init = init->lhs;
+        Class *r = NULL;
+        if (init && init->kind == E_MEMBER && init->is_call && init->str && init->lhs && init->lhs->kind == E_IDENT && init->lhs->str) {
+            for (int k = 0; k < f->nparams; k++) {
+                if (!f->params[k].name || strcmp(f->params[k].name, init->lhs->str) != 0) continue;
+                Type *pt = f->params[k].type ? ty_strip_null(f->params[k].type) : NULL;
+                Func *mm = pt && pt->kind == TY_OBJECT ? find_method(pt->cls, init->str) : NULL;
+                if (mm) {
+                    Module *was = cur_mod;
+                    enter_module(mm->cls->mod);
+                    resolve_signature(mm);
+                    if (was) enter_module(was);
+                    Type *rt = mm->ret ? ty_strip_null(mm->ret) : NULL;
+                    if (rt && rt->kind == TY_OBJECT && !rt->cls->builtin && !rt->cls->is_interface) r = rt->cls;
+                }
+            }
+        }
+        if (!r) continue;
+        for (int k = 0; k < na; k++) {
+            Expr *l = asg[k]->expr->lhs;
+            if (strcmp(l->lhs->str, vars[i]->name) != 0) continue;
+            Func *mf = find_method(r, l->str);
+            if (!mf) { /* (an expando: proto.__patched = true) a variable of the class's module, with its accessors */
+                if (proto_accessor_k(r, l->str, false, "proto")) continue;
+                Module *was = cur_mod;
+                enter_module(r->mod);
+                Buf b = {0};
+                buf_printf(&b, "let __xs_proto_%s_%s: any = null;\n", r->name, l->str);
+                buf_printf(&b, "function __xs_proto_get_%s_%s(): any {\n  return __xs_proto_%s_%s;\n}\n", r->name, l->str, r->name, l->str);
+                buf_printf(&b, "function __xs_proto_set_%s_%s(v: any): void {\n  __xs_proto_%s_%s = v;\n}\n", r->name, l->str, r->name, l->str);
+                StmtList decls = {0};
+                Func dummy = {0};
+                dummy.cls = r; dummy.name = (char *)l->str;
+                deco_funcs(p, r->mod, b.data, l->pos, &dummy, &decls);
+                int at = proto_insert_at(p, r->mod);
+                for (int q = 0; q < decls.len; q++) {
+                    stmt_list_push(&p->top, NULL);
+                    memmove(p->top.items + at + 1, p->top.items + at, sizeof(Stmt *) * (size_t)(p->top.len - 1 - at));
+                    p->top.items[at++] = decls.items[q];
+                }
+                if (was) enter_module(was);
+                continue;
+            }
+            if (mf->cls != r) continue;
+            int at = proto_insert_at(p, r->mod);
+            Module *was = cur_mod;
+            enter_module(r->mod);
+            int added = 0;
+            bool already = mf->deco_slotted;
+            if (deco_slot(p, r->mod, r->name, mf->name, at, &added) && !proto_accessor(r, mf->name, false)) {
+                (void)already;
+                Buf b = {0};
+                buf_printf(&b, "function __xs_slot_get_%s_%s(): (...args: unknown[]) => unknown {\n  return __xs_slot_%s_%s;\n}\n", r->name, mf->name, r->name, mf->name);
+                buf_printf(&b, "function __xs_slot_set_%s_%s(f: (...args: unknown[]) => unknown): void {\n  __xs_slot_%s_%s = f;\n}\n", r->name, mf->name, r->name, mf->name);
+                deco_funcs(p, r->mod, b.data, mf->pos, mf, NULL);
+            }
+            if (was) enter_module(was);
+        }
+    }
+}
+static void proto_prepass(Program *p) {
+    int nf = p->nfuncs;
+    for (int i = 0; i < nf; i++) {
+        Func *f = p->funcs[i];
+        if (f->mod && !f->mod->builtin) { enter_module(f->mod); proto_func(p, f); }
+    }
+    for (int i = 0; i < p->nclasses; i++) {
+        Class *c = p->classes[i];
+        if (!c->mod || c->builtin) continue;
+        for (int k = 0; k < c->nmethods; k++) if (c->methods[k]->cls == c) { enter_module(c->mod); proto_func(p, c->methods[k]); }
+    }
+}
 static void deco_prepass(Program *p, Module *m) {
     for (int i = 0; i < p->top.len; i++) {
         Stmt *s = p->top.items[i];
@@ -14842,6 +15049,7 @@ void check_program(Program *p) {
     }
     cur_class = NULL;
 
+    proto_prepass(p); /* (Object.getPrototypeOf(r).m = f: the slots of the classes it reaches) */
     /* Top-level statements, module by module, dependencies first. Imported variables become
        read-only aliases in the importing module's scope. */
     for (int mi = 0; mi < p->nmodules; mi++) {

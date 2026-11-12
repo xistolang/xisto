@@ -2395,13 +2395,16 @@ export class QueryRunner {
     this.isReleased = true;
   }
 
-  /** raw SQL on this runner's connection; useStructuredResult: TypeORM's QueryResult (see EntityManager.queryResult) */
-  async query<T = any>(sql: string, params: Record<string, unknown> | unknown[] = NO_BINDS, useStructuredResult: boolean = false): Promise<T> {
+  /**
+   * raw SQL on this runner's connection; useStructuredResult: TypeORM's QueryResult (see EntityManager.queryResult).
+   * Not generic, as TypeORM's QueryRunner.query (Promise<any>): a program may patch it on the prototype.
+   */
+  async query(sql: string, params: Record<string, unknown> | unknown[] = NO_BINDS, useStructuredResult: boolean = false): Promise<any> {
     await this.connect();
     if (useStructuredResult) {
-      return this.manager.queryResult<T>(sql, params);
+      return this.manager.queryResult<any>(sql, params);
     }
-    return this.manager.query<T>(sql, params);
+    return this.manager.query<any>(sql, params);
   }
 }
 
