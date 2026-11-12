@@ -335,7 +335,8 @@ static bool inlined_once(Func *f) {
     if (getenv("XISTO_NO_TRACE")) return false;
     if (f->ncalls != 1 || !f->call1 || f->is_async || !f->body || stmt_has_try(f->body) || f->virt_target || f->is_gen) return false;
     /* not recursive, directly or through other functions inlined into their only caller */
-    for (Func *g = f->call1_in; g; g = g->ncalls == 1 ? g->call1_in : NULL) if (g == f) return false;
+    int steps = 0; /* (a cycle among its callers that does not reach f: two functions that only call each other) */
+    for (Func *g = f->call1_in; g; g = g->ncalls == 1 ? g->call1_in : NULL) if (g == f || ++steps > 256) return false;
     return true;
 }
 static int call1_site(Func *f) {
@@ -3490,12 +3491,13 @@ static void emit_expr_raw(Expr *e) {
         }
         if (e->builtin.cfn && strcmp(e->builtin.cfn, "xs_fetch") == 0 && e->args.len == 2) {
             Expr *init = e->args.items[1];
-            Expr *method = NULL, *body = NULL, *headers = NULL, *timeout = NULL;
+            Expr *method = NULL, *body = NULL, *headers = NULL, *timeout = NULL, *abort = NULL;
             for (int i = 0; i < init->args.len; i++) {
                 const char *k = init->keys[i];
                 if (strcmp(k, "method") == 0) method = init->args.items[i];
                 else if (strcmp(k, "body") == 0) body = init->args.items[i];
                 else if (strcmp(k, "headers") == 0) headers = init->args.items[i];
+                else if (init->args.items[i]->kind == E_MEMBER && !init->args.items[i]->is_call) abort = init->args.items[i]; /* signal.__flag */
                 else timeout = init->args.items[i]->args.items[0];
             }
             if (headers && headers->kind != E_OBJLIT) { /* headers from a Record<string, string> */
@@ -3509,6 +3511,8 @@ static void emit_expr_raw(Expr *e) {
                 emit_borrowed(headers);
                 buf_puts(out, ", ");
                 if (timeout) emit_expr(timeout); else buf_puts(out, "-1");
+                buf_puts(out, ", ");
+                if (abort) emit_borrowed(abort); else buf_puts(out, "NULL");
                 buf_puts(out, ")");
                 return;
             }
@@ -3528,6 +3532,8 @@ static void emit_expr_raw(Expr *e) {
             }
             buf_puts(out, "}, ");
             if (timeout) emit_expr(timeout); else buf_puts(out, "-1");
+            buf_puts(out, ", ");
+            if (abort) emit_borrowed(abort); else buf_puts(out, "NULL");
             buf_puts(out, ")");
             return;
         }

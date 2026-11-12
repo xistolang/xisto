@@ -53,6 +53,8 @@ static void vt_push(Parser *p, const char *name, Type *t) {
 
 static bool wants_intl;
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
+static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... was named: xisto:url is loaded */
+static bool is_url_global_name(const char *n);
 /* generics: the type parameters in scope while a template is parsed, or their types while an instance is */
 static int no_dyn_note; /* inside generated code: its anys are not the program's uses */
 static char **tp_names;
@@ -146,6 +148,7 @@ static Type *parse_type(Parser *p);
 
 /* Unresolved class names are stored as objects of a placeholder class; the checker resolves them. */
 static Type *named_type(Parser *p, Token name) {
+    if (is_url_global_name(name.str)) wants_url = true; /* (a URL or AbortSignal parameter) */
     Class *c = xs_alloc(sizeof *c);
     c->name = name.str;
     c->pos = name.pos;
@@ -1076,7 +1079,13 @@ static bool tmpl_raw; /* parsing the template of String.raw`...` */
 static bool wants_errors; /* TypeError, RangeError, SyntaxError or ReferenceError was named: xisto:errors is loaded */
 static bool wants_intl; /* Intl.X was named: xisto:intl is loaded (Intl.DateTimeFormat is its class Intl_DateTimeFormat) */
 static bool is_js_error_name(const char *n) {
-    return n && (!strcmp(n, "TypeError") || !strcmp(n, "RangeError") || !strcmp(n, "SyntaxError") || !strcmp(n, "ReferenceError"));
+    return n && (!strcmp(n, "TypeError") || !strcmp(n, "RangeError") || !strcmp(n, "SyntaxError") || !strcmp(n, "ReferenceError") ||
+                 !strcmp(n, "URIError"));
+}
+/* the web globals xisto:url declares (runtime/node/url.ts) */
+static bool is_url_global_name(const char *n) {
+    return n && (!strcmp(n, "URL") || !strcmp(n, "URLSearchParams") || !strcmp(n, "AbortController") || !strcmp(n, "AbortSignal") ||
+                 !strcmp(n, "DOMException"));
 }
 static Expr *parse_primary(Parser *p) {
     Pos pos = p->tok.pos;
@@ -1255,6 +1264,7 @@ static Expr *parse_primary(Parser *p) {
             next(p);
             return new_expr(E_NULL, pos);
         }
+        if (is_url_global_name(p->tok.str)) wants_url = true; /* (AbortSignal.timeout(n): a member read made here) */
         Expr *e = new_expr(E_IDENT, pos);
         e->str = p->tok.str;
         next(p);
@@ -1412,6 +1422,7 @@ static Expr *parse_primary(Parser *p) {
         Expr *e = new_expr(E_NEW_OBJ, pos);
         e->str = name.str;
         if (is_js_error_name(name.str)) wants_errors = true;
+        if (is_url_global_name(name.str)) wants_url = true;
         if (at(p, TK_LT)) { /* new Stack<number>(): a generic class's type arguments */
             next(p);
             do {
@@ -1479,6 +1490,7 @@ static Expr *ns_member(Parser *p, Expr *e, Token name);
 static Expr *parse_postfix(Parser *p) {
     Expr *e = parse_primary(p);
     if (e && e->kind == E_IDENT && is_js_error_name(e->str)) wants_errors = true;
+    if (e && e->kind == E_IDENT && is_url_global_name(e->str)) wants_url = true;
     Expr *obase[32];
     char *otmp[32];
     Pos opos[32];
@@ -4831,7 +4843,8 @@ static const char xs_errors_src[] =
     "export class TypeError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"TypeError\"; }\n}\n"
     "export class RangeError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"RangeError\"; }\n}\n"
     "export class SyntaxError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"SyntaxError\"; }\n}\n"
-    "export class ReferenceError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"ReferenceError\"; }\n}\n";
+    "export class ReferenceError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"ReferenceError\"; }\n}\n"
+    "export class URIError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"URIError\"; }\n}\n";
 /* xisto:reflect: the descriptors the compiler builds for decorated classes (see "static reflection") */
 static const char xs_reflect_src[] =
     "// What a type is, and how to read and write a value of it as JSON.\n"
@@ -5002,6 +5015,16 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->src = (char *)(ah ? xs_node_async_hooks_ts : cr ? xs_node_crypto_ts : xs_node_stream_ts);
         m->native_prefix = "xs_";
         if (cr) prog->uses_crypto = true;
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
+    if (strcmp(name, "url") == 0) { /* URL, URLSearchParams, AbortController, AbortSignal: runtime/node/url.ts */
+        extern const unsigned char xs_node_url_ts[];
+        m->builtin = false;
+        m->file = "xisto:url";
+        m->src = (char *)xs_node_url_ts;
         m->loading = true;
         parse_module(prog, m);
         m->loading = false;
@@ -5206,6 +5229,7 @@ Program *parse_program(const char *entry_file) {
     Program *prog = xs_alloc(sizeof *prog);
     load_module(prog, entry_file, (Pos){0, 0}, NULL);
     if (wants_arrays) load_module(prog, "xisto:arrays", (Pos){1, 1}, entry_file);
+    if (wants_url) load_module(prog, "xisto:url", (Pos){1, 1}, entry_file); /* (before errors: its DOMException extends Error) */
     if (wants_errors) load_module(prog, "xisto:errors", (Pos){1, 1}, entry_file);
     if (wants_intl) load_module(prog, "xisto:intl", (Pos){1, 1}, entry_file);
     if (wants_reflect) load_module(prog, "xisto:reflect", (Pos){1, 1}, entry_file);

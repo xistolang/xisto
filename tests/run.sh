@@ -143,7 +143,9 @@ elif grep -q "assertion failed: math is broken" "$OUT/unit-fail.txt"; then pass=
 # HTTP: fetch options and timeout, non-blocking sleeps, graceful shutdown (SKIP_NET=1 skips: it needs port 8080)
 if [ -n "$SKIP_NET" ]; then :; else
 sh tests/http/run.sh > "$OUT/http.txt" 2>&1
-if grep -q "200 POST abc123 7 xisto" "$OUT/http.txt" && grep -q "timeout: The operation was aborted due to timeout" "$OUT/http.txt" && grep -q "200 slept 20" "$OUT/http.txt" \
+if grep -q "200 POST abc123 7 xisto" "$OUT/http.txt" && grep -q "timeout: The operation was aborted due to timeout TimeoutError" "$OUT/http.txt" \
+   && grep -q "abort: true AbortError This operation was aborted true" "$OUT/http.txt" && grep -q "aborted before: AbortError" "$OUT/http.txt" \
+   && grep -q "not aborted: 200 slept 10 false" "$OUT/http.txt" && grep -q "200 slept 20" "$OUT/http.txt" \
    && grep -q "overlapped (20 ok)" "$OUT/http.txt" && grep -q "during SIGTERM: slept 700" "$OUT/http.txt" && grep -q "refused: True" "$OUT/http.txt" \
    && grep -q "server exit code: 0" "$OUT/http.txt" && grep -q "channel delivered: True" "$OUT/http.txt" \
    && grep -q "pipelined: 3 responses" "$OUT/http.txt" && grep -q "async local storage per request: isolated (30 ok)" "$OUT/http.txt" && grep -q "parked client left: idle cpu" "$OUT/http.txt"; then pass=$((pass+1)); else echo "FAIL http:"; cat "$OUT/http.txt"; fail=$((fail+1)); fi

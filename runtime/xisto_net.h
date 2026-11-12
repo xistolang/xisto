@@ -1969,15 +1969,15 @@ static bool xs_write_all(int fd, const char *p, size_t n) {
     return true;
 }
 
-static xs_Response *xs_fetch_full(xs_str *url, xs_str *method, xs_str *body, int nh, xs_str **hdrs, int64_t timeout_ms);
-XS_NOINLINE xs_Response *xs_fetch(xs_str *url) { return xs_fetch_full(url, NULL, NULL, 0, NULL, -1); }
+static xs_Response *xs_fetch_full(xs_str *url, xs_str *method, xs_str *body, int nh, xs_str **hdrs, int64_t timeout_ms, xs_Uint8Array *abort);
+XS_NOINLINE xs_Response *xs_fetch(xs_str *url) { return xs_fetch_full(url, NULL, NULL, 0, NULL, -1, NULL); }
 /* fetch(url, { headers: h }) with h a Record<string, string> built before the call: its entries, in insertion order */
-XS_NOINLINE xs_Response *xs_fetch_hmap(xs_str *url, xs_str *method, xs_str *body, xs_map *h, int64_t timeout_ms) {
+XS_NOINLINE xs_Response *xs_fetch_hmap(xs_str *url, xs_str *method, xs_str *body, xs_map *h, int64_t timeout_ms, xs_Uint8Array *abort) {
     size_t n = 0;
     xs_str **hd = (xs_str **)malloc(sizeof(xs_str *) * (h ? h->count * 2 : 0) + sizeof(xs_str *));
     xs_map_entry *e;
     if (h) XS_MAP_EACH(h, e) { hd[n++] = e->skey; hd[n++] = (xs_str *)e->val.p; }
-    xs_Response *r = xs_fetch_full(url, method, body, (int)n, hd, timeout_ms);
+    xs_Response *r = xs_fetch_full(url, method, body, (int)n, hd, timeout_ms, abort);
     free(hd);
     return r;
 }
@@ -1986,9 +1986,26 @@ static bool xs_has_ctl(const char *p, size_t n) { /* control bytes other than ta
     for (size_t i = 0; i < n; i++) { unsigned char ch = (unsigned char)p[i]; if ((ch < 0x20 && ch != '\t') || ch == 0x7f) return true; }
     return false;
 }
-XS_NOINLINE void xs_fetch_timeout(void) { xs_panic("The operation was aborted due to timeout"); }
+/* what an aborted fetch rejects with, as Node's (a DOMException): its name and message */
+XS_NOINLINE void xs_fetch_fail_named(const char *name, const char *msg) {
+    xs_str *m = xs_str_new(msg, strlen(msg));
+    xs_Error *e = xs_Error_new(m);
+    xs_release(m);
+    xs_release(e->f_name);
+    e->f_name = xs_str_new(name, strlen(name));
+    xs_throw(e);
+}
+XS_NOINLINE void xs_fetch_timeout(void) { xs_fetch_fail_named("TimeoutError", "The operation was aborted due to timeout"); }
+/* the signal's byte: 1 abort() (AbortError), 2 AbortSignal.timeout as a value (TimeoutError) */
+XS_NOINLINE void xs_fetch_aborted(int kind) {
+    if (kind == 2) xs_fetch_timeout();
+    xs_fetch_fail_named("AbortError", "This operation was aborted");
+}
 
-XS_NOINLINE xs_Response *xs_fetch_full(xs_str *url, xs_str *method, xs_str *body, int nh, xs_str **hdrs, int64_t timeout_ms) {
+XS_NOINLINE xs_Response *xs_fetch_full(xs_str *url, xs_str *method, xs_str *body, int nh, xs_str **hdrs, int64_t timeout_ms, xs_Uint8Array *abort) {
+    /* with an AbortSignal the waits are cut in slices of 20 ms, and the signal's byte read between them */
+    #define XS_ABORTED() (abort && abort->data[0])
+    if (XS_ABORTED()) xs_fetch_aborted(abort->data[0]);
     uint64_t deadline = timeout_ms >= 0 ? xs_now() + (uint64_t)timeout_ms * 1000000ull : 0;
     #define XS_LEFT_MS() (timeout_ms < 0 ? (int64_t)-1 : (int64_t)((deadline > xs_now() ? deadline - xs_now() : 0) / 1000000ull))
     const char *u = url->data;
@@ -2079,16 +2096,33 @@ XS_NOINLINE xs_Response *xs_fetch_full(xs_str *url, xs_str *method, xs_str *body
             ssize_t r;
 #ifdef XS_WITH_TLS
             if (c->tls) {
-                r = xs_tls_read_some(c->tls, c->fd, buf.data + buf.len, buf.cap - buf.len, timeout_ms, deadline);
+                uint64_t dl = deadline;
+                int64_t tm = timeout_ms;
+                if (abort) { /* a slice */
+                    uint64_t sl = xs_now() + 20000000ull;
+                    if (tm < 0 || sl < dl) { dl = sl; tm = 20; }
+                }
+                r = xs_tls_read_some(c->tls, c->fd, buf.data + buf.len, buf.cap - buf.len, tm, dl);
+                if (r <= 0 && XS_ABORTED()) { int k = abort->data[0]; free(buf.data); free(chunked.data); free(rq.data); xs_conn_drop(c); xs_fetch_aborted(k); }
                 if (r <= 0 && timeout_ms >= 0 && xs_now() >= deadline) { free(buf.data); free(chunked.data); free(rq.data); xs_conn_drop(c); xs_fetch_timeout(); }
                 if (r > 0) { buf.len += (size_t)r; continue; }
+                if (abort && dl != deadline && xs_now() >= dl) continue; /* (the slice ended: read again) */
                 break;
             }
 #endif
             r = read(c->fd, buf.data + buf.len, buf.cap - buf.len);
             if (r < 0 && errno == EINTR) continue;
             if (r < 0 && errno == EAGAIN) { /* inside a handler this yields to the event loop */
-                if (!xs_wait_fd_ms(c->fd, EVFILT_READ, XS_LEFT_MS()) || (timeout_ms >= 0 && xs_now() >= deadline)) {
+                int64_t left = XS_LEFT_MS();
+                bool sliced = abort && (left < 0 || left > 20);
+                bool ready = xs_wait_fd_ms(c->fd, EVFILT_READ, sliced ? 20 : left);
+                if (XS_ABORTED()) {
+                    int k = abort->data[0];
+                    free(buf.data); free(chunked.data); free(rq.data);
+                    xs_conn_drop(c);
+                    xs_fetch_aborted(k);
+                }
+                if ((!ready && !sliced) || (timeout_ms >= 0 && xs_now() >= deadline)) {
                     free(buf.data); free(chunked.data); free(rq.data);
                     xs_conn_drop(c); /* a late answer must not be read as the reply to the next request */
                     xs_fetch_timeout();
@@ -2145,6 +2179,7 @@ XS_NOINLINE xs_Response *xs_fetch_full(xs_str *url, xs_str *method, xs_str *body
     xs_panic("fetch: no response");
     return NULL;
     #undef XS_LEFT_MS
+    #undef XS_ABORTED
 }
 
 /* ---- server ---- */

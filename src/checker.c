@@ -346,6 +346,7 @@ static Class *find_class(const char *name) {
         Class *c = e->decl;
         if (c->mod == cur_mod || (c->exported && imports_name(cur_mod, c->mod, name))) return c;
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:errors") == 0) return c; /* (TypeError & co: global, like Error) */
+        if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:url") == 0 && c->exported) return c; /* (URL & co: web globals) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:intl") == 0 && strncmp(name, "Intl_", 5) == 0) return c; /* (Intl.X: global) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:reflect") == 0 && strlen(name) > 9 && !strcmp(name + strlen(name) - 9, "Decorator"))
             return c; /* (MethodDecorator & co: global, as in TypeScript) */
@@ -6045,6 +6046,13 @@ static void check_expr_in(Expr *e, Type *expected) {
                         Expr *v = init->args.items[i];
                         if (strcmp(k, "method") == 0 || strcmp(k, "body") == 0) {
                             check_expr(v, ty_string);
+                            if (strcmp(k, "body") == 0 && v->type && v->type->kind == TY_OBJECT && v->type->cls &&
+                                strcmp(v->type->cls->name, "URLSearchParams") == 0) { /* body: new URLSearchParams({...}): its text */
+                                Expr *ts = xs_alloc(sizeof *ts);
+                                ts->kind = E_MEMBER; ts->pos = v->pos; ts->field = -1; ts->is_call = true; ts->lhs = v; ts->str = "toString";
+                                check_expr(ts, ty_string);
+                                init->args.items[i] = v = ts;
+                            }
                             expect_type(v, ty_string, xs_sprintf("fetch option '%s'", k));
                         } else if (strcmp(k, "headers") == 0 && v->kind != E_OBJLIT) {
                             /* headers built before the call: a Record<string, string> (sent in insertion order) */
@@ -6060,8 +6068,20 @@ static void check_expr_in(Expr *e, Type *expected) {
                             }
                             v->type = ty_void;
                         } else if (strcmp(k, "signal") == 0) {
-                            if (!(v->kind == E_MEMBER && v->is_call && v->lhs->kind == E_IDENT && strcmp(v->lhs->str, "AbortSignal") == 0 && strcmp(v->str, "timeout") == 0 && v->args.len == 1))
-                                xs_error(XS7102, v->pos, "signal: AbortSignal.timeout(5000)", "the only supported signal is AbortSignal.timeout(ms)");
+                            if (!(v->kind == E_MEMBER && v->is_call && v->lhs->kind == E_IDENT && strcmp(v->lhs->str, "AbortSignal") == 0 && strcmp(v->str, "timeout") == 0 && v->args.len == 1)) {
+                                /* signal: controller.signal (an AbortSignal of xisto:url): fetch reads its __flag byte
+                                   while it waits, and rejects with an AbortError once abort() sets it */
+                                check_expr(v, NULL);
+                                Type *st = v->type && v->type->kind == TY_NULLABLE ? v->type->elem : v->type;
+                                if (!(st && st->kind == TY_OBJECT && st->cls && strcmp(st->cls->name, "AbortSignal") == 0 && st->cls->mod &&
+                                      st->cls->mod->file && strcmp(st->cls->mod->file, "xisto:url") == 0))
+                                    xs_error(XS7102, v->pos, "signal: AbortSignal.timeout(5000), or an AbortController's signal", "the signal must be an AbortSignal");
+                                Expr *fl = xs_alloc(sizeof *fl);
+                                fl->kind = E_MEMBER; fl->pos = v->pos; fl->field = -1; fl->lhs = v; fl->str = "__flag";
+                                check_expr(fl, NULL);
+                                init->args.items[i] = fl;
+                                continue;
+                            }
                             check_expr(v->args.items[0], ty_int);
                             expect_type(v->args.items[0], ty_int, "timeout in milliseconds");
                             v->type = ty_int;
