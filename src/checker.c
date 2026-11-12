@@ -373,6 +373,8 @@ static Class *find_class(const char *name) {
         Class *c = e->decl;
         if (c->mod == cur_mod || (c->exported && imports_name(cur_mod, c->mod, name))) return c;
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:errors") == 0) return c; /* (TypeError & co: global, like Error) */
+        if (!strcmp(name, "Reflect") && c->exported && c->mod && c->mod->file && strstr(c->mod->file, "/reflect-metadata/"))
+            return c; /* (Reflect.getMetadata & co: the global that import 'reflect-metadata' installs, the package's class) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:url") == 0 && c->exported) return c; /* (URL & co: web globals) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:intl") == 0 && strncmp(name, "Intl_", 5) == 0) return c; /* (Intl.X: global) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:reflect") == 0 && strlen(name) > 9 && !strcmp(name + strlen(name) - 9, "Decorator"))
@@ -880,6 +882,7 @@ static bool tostring_call(Expr *e) {
    concurrently on the event loop (runtime/xisto_net.h, xs_par_run): their I/O waits overlap. */
 static int mapnull_ok; /* checking the xs.map(f) of xs.map(f).filter(p): f may give number | null */
 static bool nullable_ok(Type *t);
+static Func *lookup_func(const char *name);
 static void check_promise(Expr *e, Type *expected) {
     const char *m = e->str;
     if (!e->is_call) xs_error(XS7030, e->pos, NULL, "Promise.%s is not a value", m);
@@ -917,6 +920,62 @@ static void check_promise(Expr *e, Type *expected) {
         expr_list_push(&e->args, x);
         e->type = ty_promise_of(T);
         prog->uses_gen = true;
+        return;
+    }
+    if (strcmp(m, "allSettled") == 0 && lookup_func("__xs_allSettled")) { /* the outcome of each promise: xisto:arrays */
+        if (e->args.len != 1) xs_error(XS7032, e->pos, NULL, "Promise.%s takes an array", m);
+        Expr *a = e->args.items[0];
+        if (a->kind == E_MEMBER && a->is_call && a->str && !strcmp(a->str, "map") && a->args.len == 1 && a->args.items[0]->kind == E_ARROW &&
+            a->args.items[0]->arrow->fn->nparams == 1) {
+            /* Promise.allSettled(xs.map(cb)): Promise.all(xs.map((x) => __xs_settle(() => cb's value))), each a task that
+               cannot fail (its outcome is the element); cb as try { return X; } catch (e) { return Promise.reject(e); }
+               (a synchronous throw made a rejection) is X: a call that fails throws where it is awaited in xisto */
+            Func *cf = a->args.items[0]->arrow->fn;
+            Expr *val = NULL;
+            Stmt *b = cf->body && cf->body->stmts.len == 1 ? cf->body->stmts.items[0] : NULL;
+            if (b && b->kind == S_RETURN) val = b->expr;
+            if (b && b->kind == S_TRY && !b->for_init && b->body && b->body->stmts.len == 1 && b->body->stmts.items[0]->kind == S_RETURN &&
+                b->else_body && b->else_body->stmts.len == 1 && b->else_body->stmts.items[0]->kind == S_RETURN) {
+                Expr *rj = b->else_body->stmts.items[0]->expr;
+                if (rj && rj->kind == E_MEMBER && rj->is_call && rj->str && !strcmp(rj->str, "reject") && rj->lhs && rj->lhs->kind == E_IDENT &&
+                    !strcmp(rj->lhs->str, "Promise") && rj->args.len == 1 && rj->args.items[0]->kind == E_IDENT && b->name &&
+                    !strcmp(rj->args.items[0]->str, b->name))
+                    val = b->body->stmts.items[0]->expr;
+            }
+            if (val) {
+                Expr *settle = xs_alloc(sizeof *settle);
+                settle->kind = E_CALL; settle->pos = val->pos; settle->field = -1;
+                settle->lhs = xs_alloc(sizeof *settle->lhs);
+                settle->lhs->kind = E_IDENT; settle->lhs->pos = val->pos; settle->lhs->field = -1; settle->lhs->str = "__xs_settle";
+                expr_list_push(&settle->args, thunk_of(val));
+                Stmt *r = xs_alloc(sizeof *r);
+                r->kind = S_RETURN; r->pos = val->pos; r->expr = settle;
+                Stmt *nb = xs_alloc(sizeof *nb);
+                nb->kind = S_BLOCK; nb->pos = val->pos;
+                stmt_list_push(&nb->stmts, r);
+                cf->body = nb;
+                cf->ret = NULL;
+                a->args.items[0]->arrow->expr_body = true;
+                e->str = "all";
+                check_promise(e, expected);
+                return;
+            }
+        }
+        check_expr(a, NULL);
+        Type *at = ty_strip_null(a->type);
+        memset(e, 0, sizeof *e);
+        e->kind = E_CALL; e->pos = a->pos; e->field = -1;
+        e->lhs = xs_alloc(sizeof *e->lhs);
+        e->lhs->kind = E_IDENT; e->lhs->pos = a->pos; e->lhs->field = -1; e->lhs->str = "__xs_allSettled";
+        if (at->kind == TY_ARRAY && at->elem->kind == TY_PROMISE && at->elem->elem->kind == TY_VOID)
+            e->lhs->str = "__xs_allSettledVoid"; /* (no value: each outcome's value is undefined) */
+        else if (at->kind == TY_ARRAY && at->elem->kind == TY_PROMISE) {
+            e->targs = xs_alloc(sizeof(Type *));
+            e->targs[0] = at->elem->elem;
+            e->ntargs = 1;
+        }
+        expr_list_push(&e->args, a);
+        check_expr(e, expected);
         return;
     }
     bool race = strcmp(m, "race") == 0 || strcmp(m, "any") == 0;
@@ -973,6 +1032,24 @@ static void check_promise(Expr *e, Type *expected) {
                 }
             }
             Type *rt = th->arrow->fn->ret;
+            if (rt->kind == TY_VOID && race) { /* Promise.race([work, timer]) with a Promise<void>: it settles with undefined */
+                Func *tf = th->arrow->fn;
+                Stmt *r = tf->body->stmts.items[tf->body->stmts.len - 1];
+                if (r->kind == S_RETURN && r->expr) {
+                    Stmt *ex = xs_alloc(sizeof *ex);
+                    ex->kind = S_EXPR; ex->pos = r->pos; ex->expr = r->expr;
+                    tf->body->stmts.items[tf->body->stmts.len - 1] = ex;
+                }
+                Expr *nul = xs_alloc(sizeof *nul);
+                nul->kind = E_NULL; nul->pos = th->pos; nul->field = -1; nul->type = ty_unknown;
+                Stmt *rn = xs_alloc(sizeof *rn);
+                rn->kind = S_RETURN; rn->pos = th->pos; rn->expr = nul;
+                stmt_list_push(&tf->body->stmts, rn);
+                tf->ret = ty_unknown;
+                th->type->ret = ty_unknown;
+                th->arrow->expr_body = false;
+                rt = ty_unknown;
+            }
             if (rt->kind == TY_VOID) xs_error(XS8081, a->args.items[i]->pos, NULL, "an element of Promise.%s gives no value", m);
             rts[i] = rt;
             if (!t) t = rt;
@@ -1184,6 +1261,11 @@ static Class *instantiate_class(Class *tmpl, Type **args, Pos pos) {
     for (int k = 0; k < tmpl->ntparams; k++) buf_printf(&name, "%s%s", k ? ", " : "", ty_name(args[k]));
     buf_puts(&name, ">");
     Class *c = xs_parse_class_instance(tmpl, args, name.data);
+    if (c->is_interface) { /* Contract<In, Out> of a generic interface of methods: the abstract class its implementations extend */
+        c->is_interface = false;
+        c->is_abstract = true;
+        c->iface_base = true;
+    }
     c->cname = xs_sprintf("c%d_%s_g%d", tmpl->mod->id, tmpl->name, nmade);
     made = realloc(made, sizeof(Class *) * (size_t)(nmade + 1));
     made_args = realloc(made_args, sizeof(Type **) * (size_t)(nmade + 1));
@@ -1527,6 +1609,18 @@ static void view_scan_func(Func *f, Module *m) {
         }
     if (f->body) view_scan_stmt(f->body, m);
 }
+/* type XContract = Contract<In, Out> (& { more(): void }): the class the alias names, when it is one of methods */
+static Class *alias_base(Class *b, Pos pos) {
+    if (!b || !b->alias) return b;
+    Module *sm = cur_mod;
+    Scope *ss = scope;
+    const char *sfn = xs_file_name, *ssrc = xs_source;
+    enter_module(b->mod);
+    Type *t = b->ntparams ? NULL : resolve(b->alias, pos);
+    b->alias = t ? t : b->alias;
+    cur_mod = sm; scope = ss; xs_file_name = sfn; xs_source = ssrc;
+    return t && t->kind == TY_OBJECT && t->cls->iface_methods ? t->cls : NULL;
+}
 static void find_views(Program *p) {
     for (int i = 0; i < p->nfuncs; i++) if (p->funcs[i]->mod && !p->funcs[i]->mod->builtin) view_scan_func(p->funcs[i], p->funcs[i]->mod);
     for (int i = 0; i < p->nclasses; i++) {
@@ -1730,6 +1824,37 @@ static Type *inter_type(Type *t, Pos pos) {
     if (lb->kind != TY_OBJECT || rb->kind != TY_OBJECT || lb->cls->builtin || rb->cls->builtin)
         xs_error(XS1019, pos, "intersect interfaces or object types: A & { extra: T }", "unsupported type in an intersection: %s & %s", ty_name(l), ty_name(r));
     for (int i = 0; i < nmade; i++) if (ls[i] == lb->cls && rs[i] == rb->cls) return ty_object_of(made[i]);
+    if ((lb->cls->iface_methods && !lb->cls->is_interface) || (rb->cls->iface_methods && !rb->cls->is_interface)) {
+        /* Contract<In, Out> & { begin(): void; end(): void }: an abstract class over the left one (its implementations'
+           base) that declares the right one's methods too */
+        Class *l = lb->cls, *r = rb->cls;
+        if (!(l->iface_methods && !l->is_interface)) { Class *x = l; l = r; r = x; }
+        if (r->nfields || (!r->iface_methods && r->nmethods == 0 && r->nfields == 0))
+            xs_error(XS1019, pos, "intersect a contract with an interface of methods: C & { m(): void }", "unsupported type in an intersection: %s & %s", l->name, r->name);
+        Class *c = made_iface("and", pos);
+        c->mod = r->mod;
+        c->is_interface = false;
+        c->is_abstract = true;
+        c->iface_base = true;
+        c->iface_methods = true;
+        c->base_name = NULL;
+        c->base = l;
+        l->subs = realloc(l->subs, sizeof(Class *) * (size_t)(l->nsubs + 1));
+        l->subs[l->nsubs++] = c;
+        c->methods = xs_alloc(sizeof(Func *) * (size_t)(r->nmethods ? r->nmethods : 1));
+        for (int i = 0; i < r->nmethods; i++) {
+            Func *m = xs_alloc(sizeof *m);
+            *m = *r->methods[i];
+            m->cls = c;
+            m->cname = NULL;
+            c->methods[c->nmethods++] = m;
+        }
+        c->cap_methods = c->nmethods;
+        ls = realloc(ls, sizeof(Class *) * (size_t)(nmade + 1)); ls[nmade] = lb->cls;
+        rs = realloc(rs, sizeof(Class *) * (size_t)(nmade + 1)); rs[nmade] = rb->cls;
+        made = realloc(made, sizeof(Class *) * (size_t)(nmade + 1)); made[nmade++] = c;
+        return ty_object_of(c);
+    }
     Class *c = made_iface("and", pos);
     Mixin *m = xs_alloc(sizeof *m);
     m->pos = pos;
@@ -6597,6 +6722,41 @@ static void check_expr_in(Expr *e, Type *expected) {
         } else {
             check_expr(e->rhs, NULL);
         }
+        if (e->op == TK_IDENT && e->rhs->kind == E_IDENT && e->rhs->str && (!strcmp(e->rhs->str, "Map") || !strcmp(e->rhs->str, "Set")) &&
+            !find_class(e->rhs->str)) { /* x instanceof Map / Set: a Map (Set) of the program, not a Record */
+            bool want_map = e->rhs->str[0] == 'M';
+            Type *lt = ty_strip_null(e->lhs->type);
+            if (lt->kind == TY_MAP && lt->record) lt = ty_json; /* (a Record: a plain object, neither) */
+            if (lt->kind == TY_MAP || lt->kind == TY_SET) {
+                bool yes = (lt->kind == TY_MAP) == want_map;
+                Expr *v = e->lhs;
+                if (e->lhs->type->kind == TY_NULLABLE && yes) { /* (null is neither) */
+                    Expr *z = xs_alloc(sizeof *z); z->kind = E_NULL; z->pos = e->pos; z->field = -1;
+                    e->op = TK_NEQ; e->rhs = z;
+                    check_expr(e->rhs, NULL);
+                    e->type = ty_boolean;
+                    return;
+                }
+                (void)v;
+                memset(e, 0, sizeof *e);
+                e->kind = E_BOOL; e->boolean = yes; e->type = ty_boolean; e->field = -1;
+                return;
+            }
+            if (lt->kind == TY_UNKNOWN || lt->kind == TY_JSON || lt->kind == TY_UNION) {
+                Expr *v = e->lhs;
+                to_unknown(v);
+                memset(e, 0, sizeof *e);
+                e->kind = E_CALL; e->pos = v->pos; e->field = -1;
+                e->builtin.cfn = "xs_unk_is_map";
+                expr_list_push(&e->args, v);
+                expr_list_push(&e->args, num_lit(v->pos, want_map ? 1 : 0, true));
+                e->type = ty_boolean;
+                return;
+            }
+            memset(e, 0, sizeof *e);
+            e->kind = E_BOOL; e->boolean = false; e->type = ty_boolean; e->field = -1;
+            return;
+        }
         if (e->op == TK_IDENT) { /* x instanceof C */
             Class *c = find_class(e->rhs->str);
             if (!c || c->is_interface) xs_error(XS9010, e->rhs->pos, "instanceof tests classes (interfaces have no run-time identity)", "'%s' is not a class", e->rhs->str);
@@ -8367,6 +8527,31 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (!e->is_call || strcmp(e->str, "now") != 0 || e->args.len != 0) xs_error(XS7106, e->pos, "supported: Date.now(), Date.parse(text), Date.UTC(y, m, ...)", "unknown Date member '%s'", e->str);
                 e->type = ty_number;
                 e->builtin.cfn = "xs_date_now";
+                return;
+            }
+            if (strcmp(ns, "Symbol") == 0 && e->is_call && strcmp(e->str, "for") == 0 && e->args.len == 1) { /* Symbol.for(key): the
+                                                                                                         program's one symbol of that key */
+                check_expr(e->args.items[0], ty_string);
+                expect_type(e->args.items[0], ty_string, "the key of Symbol.for");
+                e->builtin.cfn = "xs_Symbol_for";
+                e->type = ty_object_of(find_class("symbol"));
+                return;
+            }
+            if (strcmp(ns, "ArrayBuffer") == 0 && e->is_call && strcmp(e->str, "isView") == 0 && e->args.len == 1) {
+                /* ArrayBuffer.isView(v): v is a typed array (Uint8Array, Buffer, Float64Array) */
+                Expr *v = e->args.items[0];
+                Expr *c1 = xs_alloc(sizeof *c1);
+                c1->kind = E_IDENT; c1->pos = e->pos; c1->str = "Uint8Array"; c1->field = -1;
+                Expr *t1 = xs_alloc(sizeof *t1);
+                t1->kind = E_BINARY; t1->op = TK_IDENT; t1->pos = v->pos; t1->field = -1; t1->lhs = v; t1->rhs = c1;
+                Expr *c2 = xs_alloc(sizeof *c2);
+                c2->kind = E_IDENT; c2->pos = e->pos; c2->str = "Float64Array"; c2->field = -1;
+                Expr *t2 = xs_alloc(sizeof *t2);
+                t2->kind = E_BINARY; t2->op = TK_IDENT; t2->pos = v->pos; t2->field = -1; t2->lhs = pure_copy(v) ? pure_copy(v) : v; t2->rhs = c2;
+                memset(e, 0, sizeof *e);
+                if (pure_copy(v)) { e->kind = E_BINARY; e->op = TK_OR; e->pos = v->pos; e->field = -1; e->lhs = t1; e->rhs = t2; }
+                else *e = *t1;
+                check_expr(e, ty_boolean);
                 return;
             }
             if (strcmp(ns, "process") == 0) {
@@ -14005,6 +14190,8 @@ void check_program(Program *p) {
     for (int i = 0; i < p->nclasses; i++) {
         Class *c = p->classes[i];
         if (!c->iface_methods || !c->is_interface) continue;
+        if (c->ntparams && c->gen_state && !c->niface_bases) continue; /* interface Contract<I, O> { m(i: I): O }: a template,
+                                                                          each instance an abstract class (instantiate_class) */
         enter_module(c->mod);
         if (c->niface_bases == 1 && !c->ntparams) { /* interface B extends A { m(): R } with A an interface of methods too: B's
                                                        abstract class extends A's */
@@ -14029,7 +14216,7 @@ void check_program(Program *p) {
         if (c->base_name || c->mixin || c->is_interface) continue;
         enter_module(c->mod);
         for (int k = 0; k < c->nimplements; k++) {
-            Class *b = find_class(c->implements[k]);
+            Class *b = alias_base(find_class(c->implements[k]), c->pos);
             if (b && b->iface_methods && !b->is_interface) { c->base_name = c->implements[k]; c->base_pos = c->pos; break; }
         }
     }
@@ -14041,6 +14228,7 @@ void check_program(Program *p) {
         if (c->mixin) apply_mixin(c);
         if (c->base_name) {
             Class *b = find_class(c->base_name);
+            if (b && b->alias) b = alias_base(b, c->base_pos); /* (implements XContract = Contract<In, Out>: that instance) */
             if (!b) {
                 int n; const char **cands = class_names(&n);
                 if (missing_name(c->base_name)) xs_error_quiet();
