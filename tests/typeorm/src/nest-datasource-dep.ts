@@ -16,6 +16,15 @@ export class FnValor {
   }
 }
 
+// the DataSource named as the token, as an app writes it: @Inject(DataSource)
+@Injectable()
+export class FnTipo {
+  constructor(@Inject(DataSource) private readonly dataSource: DataSource) {}
+  tipo(): string {
+    return `tipo ${this.dataSource.options.type}`;
+  }
+}
+
 @Injectable()
 class Calc {
   constructor(@Inject(FN_VALOR) private readonly fn: FnValor) {}
@@ -33,10 +42,11 @@ class Calc {
       useFactory: (config: ConfigService): TypeOrmModuleOptions => ({ ...config.getOrThrow<TypeOrmModuleOptions>("database") }),
     }),
   ],
-  providers: [{ provide: FN_VALOR, useClass: FnValor }, Calc],
+  providers: [{ provide: FN_VALOR, useClass: FnValor }, Calc, FnTipo],
 })
 class AppModule {}
 
 const app = NestFactory.create(AppModule);
 app.init();
 console.log((app.get(Calc) as Calc).run());
+console.log((app.get(FnTipo) as FnTipo).tipo());
