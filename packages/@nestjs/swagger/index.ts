@@ -164,6 +164,12 @@ export class ApiPropertyOptions {
   maxLength?: int;
   minLength?: int;
   deprecated?: boolean;
+  name?: string;
+  pattern?: string;
+  title?: string;
+  readOnly?: boolean;
+  writeOnly?: boolean;
+  examples: unknown = null;
 }
 
 /** Documents a DTO field (its schema is the field's TypeScript type). */

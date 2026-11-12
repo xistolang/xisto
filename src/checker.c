@@ -3905,6 +3905,16 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
     while (required > 0 && tmpl->params[required - 1].dflt) required--;
     if (e->args.len < required || e->args.len > tmpl->nparams)
         xs_error(XS8029, e->pos, NULL, "%s takes %d%s argument(s), got %d", what, required, required == tmpl->nparams ? "" : xs_sprintf(" to %d", tmpl->nparams), e->args.len);
+    for (int i = 0; i < e->args.len && i < tmpl->nparams; i++) { /* manager.findOne(User, ...) with entity: EntityTarget<T>: T is User */
+        Type *pt = tmpl->params[i].type;
+        Expr *a = e->args.items[i];
+        if (!pt || pt->kind != TY_OBJECT || !pt->cls || !pt->cls->name || strcmp(pt->cls->name, "EntityTarget") != 0 || pt->ntargs != 1 ||
+            pt->targs[0]->kind != TY_TPARAM || a->kind != E_IDENT || lookup(a->str)) continue;
+        Class *ac = find_class(a->str);
+        if (!ac || ac->builtin) continue;
+        for (int k = 0; k < tmpl->ntparams; k++)
+            if (!bind[k] && strcmp(tmpl->tparams[k], pt->targs[0]->tname) == 0) bind[k] = ty_object_of(ac);
+    }
     int ndone = e->args.len;
     bool *done = xs_alloc(sizeof(bool) * (size_t)(e->args.len + 1));
     /* two passes: the arguments that are not arrows first (they bind T from their own types), then the arrows,

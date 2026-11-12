@@ -133,6 +133,15 @@ async function main(): Promise<void> {
     return rows[0].N + 6;
   });
   console.log("transaction returned " + String(counted));
+  const viaManager = await ds.transaction(async (m) => {
+    await m.update(Item, { id: 3 }, { name: "brie" });
+    const it = await m.findOne(Item, { where: { id: 3 } });
+    const n = await m.count(Item, { where: { id: 3 } });
+    const back = await m.findOneBy(Item, { id: 3 });
+    await m.update(Item, { id: 3 }, { name: back === null ? "?" : "cheese" });
+    return (it === null ? "none" : it.name) + " " + String(n);
+  });
+  console.log("manager " + viaManager);
 
   const del = await repo.delete({ id: In([1, 2]) });
   console.log("deleted " + String(del.affected) + ", left " + String(await repo.count()));
