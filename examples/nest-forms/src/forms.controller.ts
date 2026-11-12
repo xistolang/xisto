@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, Logger, Param, Post, Request, UseGuards } from "@nestjs/common";
+import { BadRequestException, Body, Controller, ForbiddenException, Get, HttpCode, Logger, Param, Post, Request, UseGuards } from "@nestjs/common";
 import { ApiHeader } from "@nestjs/swagger";
 import { Scoped } from "./decorators";
 import { CreateTabletDto, LegacyDto, SortDto, UpdateKioskDto } from "./dtos";
@@ -46,6 +46,17 @@ export class FormsController {
   me(@Request() req: { user: { sub: string; tid?: string } }) {
     this.logger.warn({ event: "me", sub: req.user.sub, tid: req.user.tid ?? "none" });
     return { sub: req.user.sub, tenant: req.user.tid ?? "none" };
+  }
+
+  @Get("denied/:kind")
+  denied(@Param("kind") kind: string) {
+    if (kind === "object") {
+      throw new ForbiddenException({ statusCode: 403, message: "menu hidden" });
+    }
+    if (kind === "list") {
+      throw new BadRequestException(["first problem", "second problem"]);
+    }
+    throw new ForbiddenException();
   }
 
   @Get("item/:id")

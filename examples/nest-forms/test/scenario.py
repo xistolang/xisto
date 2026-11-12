@@ -41,6 +41,8 @@ call("GET", "/api/forms/me")
 call("GET", "/api/forms/item/7", headers={"x-user": "caio"})
 call("GET", "/api/local", headers={"x-scope": "local"})
 call("GET", "/api/local", headers={"x-scope": "other"})
+for k in ["object", "list", "plain"]:
+    call("GET", "/api/forms/denied/" + k)
 call("GET", "/api/nope")
 call("GET", "/api/forms/nope?x=1")
 call("POST", "/api/forms/settings", '{}')
