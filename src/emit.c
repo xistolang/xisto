@@ -2513,8 +2513,8 @@ static void emit_dyn_tables(Program *p) {
                 nm++;
             }
         if (nm) buf_puts(&tabs, "};\n");
-        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s};\n", c->cname, c->name, c->nfields, c->nfields ? xs_sprintf("%s_dynf", c->cname) : "NULL",
-                   nm, nm ? xs_sprintf("%s_dynm", c->cname) : "NULL");
+        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s, %d};\n", c->cname, c->name, c->nfields, c->nfields ? xs_sprintf("%s_dynf", c->cname) : "NULL",
+                   nm, nm ? xs_sprintf("%s_dynm", c->cname) : "NULL", c->is_interface ? 1 : 0);
     }
     if (fns.data) buf_puts(out, fns.data);
     if (tabs.data) buf_puts(out, tabs.data);
@@ -2824,6 +2824,10 @@ static void emit_expr_raw(Expr *e) {
     }
     case E_OBJLIT: {
         Class *c = e->cls;
+        if (c->ctor && !c->region && !c->rdual && !c->nohdr) /* (a class with a constructor taking a value of its own type, built
+                                                                 from a literal: the object without running it) */
+            buf_printf(out, "({ %s *o_ = xs_obj_alloc_t(sizeof(%s), &%s_type);", c->cname, c->cname, c->cname);
+        else
         buf_printf(out, "({ %s *o_ = %s_new();", c->cname, c->cname);
         for (int i = 0; i < e->args.len; i++) {
             Field *fd = NULL;

@@ -1805,7 +1805,7 @@ XS_NOINLINE void *xs_Error_wrap_err(void *cause) {
 /* rows[i] as T | undefined: the element, or null past the end (JavaScript reads undefined there); borrowed */
 static inline void *xs_arr_ref_at_or_null(xs_arr_ref *a, int64_t i) { return a && i >= 0 && (size_t)i < a->len ? a->data[i] : NULL; }
 /* encodeURIComponent / encodeURI: the UTF-8 bytes of what is not kept, as %XX (uppercase), as JavaScript writes them */
-static xs_str *xs_uri_encode(xs_str *s, const char *keep) {
+XS_NOINLINE xs_str *xs_uri_encode(xs_str *s, const char *keep) {
     static const char hex[] = "0123456789ABCDEF";
     char *out = malloc((size_t)s->len * 3 + 1);
     size_t n = 0;
@@ -1822,7 +1822,7 @@ XS_NOINLINE xs_str *xs_encode_uri_component(xs_str *s) { return xs_uri_encode(s,
 XS_NOINLINE xs_str *xs_encode_uri(xs_str *s) { return xs_uri_encode(s, "-_.!~*'();/?:@&=+$,#"); }
 /* decodeURIComponent / decodeURI: %XX sequences back to bytes (decodeURI keeps the escapes of ; / ? : @ & = + $ , #);
    a malformed one is URIError: URI malformed, as in JavaScript */
-static xs_str *xs_uri_decode(xs_str *s, const char *reserved) {
+XS_NOINLINE xs_str *xs_uri_decode(xs_str *s, const char *reserved) {
     char *out = malloc((size_t)s->len + 1);
     size_t n = 0;
     for (int64_t i = 0; i < s->len; i++) {
@@ -2846,7 +2846,7 @@ XS_NOINLINE double xs_math_min_ints(xs_arr_int *a) { double m = INFINITY; for (s
    field). An object made as an any ({} or { a: 1 } typed any) is a Record<string, unknown>. ---- */
 enum { XD_NUM, XD_INT, XD_BOOL, XD_NNUM, XD_NINT, XD_NBOOL, XD_STR, XD_REF, XD_ANY };
 typedef struct { const char *name; uint32_t len, off; uint8_t kind, nullable, optional; bool (*isa)(void *); const char *tname; } xs_dyn_field;
-typedef struct xs_dyn_cls { const char *name; int32_t n; const xs_dyn_field *f; int32_t nm; const char *const *m; } xs_dyn_cls; /* m: its methods' names */
+typedef struct xs_dyn_cls { const char *name; int32_t n; const xs_dyn_field *f; int32_t nm; const char *const *m; int32_t shape; } xs_dyn_cls; /* m: its methods' names; shape: an interface's (made from literals: an optional field left out is not there) */
 /* a method read by name through an any (typeof x.toJSON === "function"): a function whose call is not supported yet */
 XS_NOINLINE void xs_dyn_method_called(void) { xs_panic("TypeError: a method read through an any cannot be called (call it on a value of its class)"); }
 static xs_closure xs_dyn_method_cl = {{XS_IMMORTAL, 0}, (void *)xs_dyn_method_called};
@@ -3030,6 +3030,7 @@ XS_NOINLINE void *xs_as_record(void *v, int nullable, const char *what) {
         xs_str *k = xs_str_new(f->name, f->len);
         xs_val x;
         x.p = xs_dyn_load(f, v);
+        if (t->dyn->shape && f->optional && !x.p) { xs_release_(k); continue; } /* (no key of the literal it was made from) */
         xs_map_set_s(m, k, x);
         xs_release_(k);
     }
