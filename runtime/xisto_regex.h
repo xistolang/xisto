@@ -32,8 +32,10 @@
 #define XR_TEDDY_SSSE3 1
 #endif
 
-enum { XR_CHAR, XR_CLASS, XR_ANY, XR_ANYNL, XR_SPLIT, XR_JMP, XR_SAVE, XR_ASSERT, XR_MATCH, XR_RESET /* slots x..y back to -1 */ };
-enum { XA_BOT, XA_EOT, XA_BOL, XA_EOL, XA_WB, XA_NWB };
+enum { XR_CHAR, XR_CLASS, XR_ANY, XR_ANYNL, XR_SPLIT, XR_JMP, XR_SAVE, XR_ASSERT, XR_MATCH, XR_RESET /* slots x..y back to -1 */,
+       XR_PEEK /* (?=c) (?!c): the next character is (not) c (x: the char or class, y: XP_* flags); consumes nothing */ };
+enum { XP_NEG = 1, XP_CLASS = 2, XP_ANY = 4, XP_ANYNL = 8 };
+enum { XA_BOT, XA_EOT, XA_BOL, XA_EOL, XA_WB, XA_NWB, XA_PEEK, XA_NPEEK /* (?= (?! of one character: node a */ };
 enum { XF_G = 1, XF_I = 2, XF_M = 4, XF_S = 8, XF_U = 16, XF_Y = 32, XF_D = 64 };
 enum { XC_WORD = 1, XC_NL = 2, XC_EDGE = 4 }; /* the context of a position's neighbour, for assertions */
 
@@ -48,6 +50,7 @@ typedef struct { uint8_t op; int32_t x, y; } xr_inst;
 typedef struct {
     xr_inst *ins;
     int n, cap;
+    bool peek; /* (compiling) a one-character lookahead was met */
 } xr_code;
 
 /* the lazy DFA over one program: states are ordered lists of instruction indices plus the previous context */
@@ -87,6 +90,7 @@ typedef struct xr_re {
     bool anchored_start;  /* begins with ^ (not multiline): only position 0 can match */
     bool nullable;
     bool uses_ctx;        /* has ^ $ \b \B: DFA states depend on the previous character's kind */
+    bool has_peek;        /* has (?=c) or (?!c) of one character: found forward only (no backward search, no fast paths) */
     /* prefilter for patterns that begin with C+ followed by a literal byte L not in C (\d+\. \w+@ [a-z]+:):
        memchr finds L, the run of C before it is the only possible start */
     int lit;              /* L, or -1 */
@@ -500,7 +504,22 @@ XS_NOINLINE int xr_atom(xr_parser *p) {
         if (xr_peek(p) == '?') {
             int c2 = p->i + 1 < p->n ? p->s[p->i + 1] : -1;
             if (c2 == ':') p->i += 2;
-            else if (c2 == '=' || c2 == '!') return xr_fail(p, "lookahead ((?= and (?!) is not supported: it needs backtracking, and xisto's RegExp runs in linear time");
+            else if (c2 == '=' || c2 == '!') {
+                /* (?=c) (?!c) of one character (a char, a class, .): a test of the next character, which a linear-time
+                   engine can make; a longer lookahead needs backtracking */
+                p->i += 2;
+                int in = xr_alt(p);
+                if (in < 0) return -1;
+                if (xr_peek(p) != ')') return xr_fail(p, "unterminated group");
+                p->i++;
+                int k = p->nd[in].kind;
+                if (k != XN_CHAR && k != XN_CLASS && k != XN_ANY)
+                    return xr_fail(p, "lookahead ((?= and (?!) of more than one character is not supported: it needs backtracking, and xisto's RegExp runs in linear time");
+                int n = xr_node_new(p, XN_ASSERT);
+                p->nd[n].v = c2 == '=' ? XA_PEEK : XA_NPEEK;
+                p->nd[n].a = in;
+                return n;
+            }
             else if (c2 == '<' && p->i + 2 < p->n && (p->s[p->i + 2] == '=' || p->s[p->i + 2] == '!'))
                 return xr_fail(p, "lookbehind ((?<= and (?<!) is not supported: it needs backtracking, and xisto's RegExp runs in linear time");
             else if (c2 == '<') {
@@ -759,6 +778,14 @@ static bool xr_comp(xr_parser *p, xr_code *c, int ni, bool rev) {
     case XN_ANY: xr_emit(c, n->v ? XR_ANY : XR_ANYNL, 0, 0); return true;
     case XN_ASSERT: {
         int k = n->v;
+        if (k == XA_PEEK || k == XA_NPEEK) {
+            c->peek = true;
+            if (rev) return true; /* (patterns with it are not searched backward: xr_find) */
+            xr_node *t = &p->nd[n->a];
+            int fl = (k == XA_NPEEK ? XP_NEG : 0) | (t->kind == XN_CLASS ? XP_CLASS : 0) | (t->kind == XN_ANY ? (t->v ? XP_ANY : XP_ANYNL) : 0);
+            xr_emit(c, XR_PEEK, t->kind == XN_ANY ? 0 : t->v, fl);
+            return true;
+        }
         if (rev) k = k == XA_BOT ? XA_EOT : k == XA_EOT ? XA_BOT : k == XA_BOL ? XA_EOL : k == XA_EOL ? XA_BOL : k;
         xr_emit(c, XR_ASSERT, k, 0);
         return true;
@@ -1170,14 +1197,16 @@ static xr_re *xr_compile(const char *pat, size_t n, int flags, const char **err)
         }
     }
     for (int k = 0; k < c->n; k++) if (c->ins[k].op == XR_ASSERT) re->uses_ctx = true;
+    for (int k = 0; k < c->n; k++) if (c->ins[k].op == XR_PEEK) re->has_peek = true;
+    if (re->has_peek) { re->run = false; re->lit = -1; re->op_tried = true; } /* (the fast paths read no lookahead) */
     re->join = calloc((size_t)c->n + 1, 1);
     for (int k = 0; k < c->n; k++) {
         if (c->ins[k].op == XR_JMP) re->join[c->ins[k].x] = 1;
         if (c->ins[k].op == XR_SPLIT) { re->join[c->ins[k].x] = 1; re->join[c->ins[k].y] = 1; }
     }
-    if (!re->run && re->lit < 0 && !re->anchored_start) xr_pf_build(re, &p, root);
-    if (!re->run && re->lit < 0 && !re->anchored_start && !re->nullable) xr_fx_build(re, &p, root);
-    if (!re->run && re->lit < 0 && !re->anchored_start && !re->fx_n) xr_dl_build(re, &p, root);
+    if (!re->run && re->lit < 0 && !re->anchored_start && !re->has_peek) xr_pf_build(re, &p, root);
+    if (!re->run && re->lit < 0 && !re->anchored_start && !re->nullable && !re->has_peek) xr_fx_build(re, &p, root);
+    if (!re->run && re->lit < 0 && !re->anchored_start && !re->fx_n && !re->has_peek) xr_dl_build(re, &p, root);
     re->drev.longest = true;
     free(p.nd);
     return re;
@@ -1273,6 +1302,17 @@ static inline bool xr_consumes(const xr_re *re, const xr_inst *in, uint32_t c) {
     }
 }
 
+/* XR_PEEK: the next character c (-1 at the end of the text) is (not) its char or class */
+static inline bool xr_peek_ok(const xr_re *re, const xr_inst *in, int64_t c) {
+    bool has;
+    if (c < 0) has = false;
+    else if (in->y & XP_ANY) has = true;
+    else if (in->y & XP_ANYNL) has = !(c == '\n' || c == '\r' || c == 0x2028 || c == 0x2029);
+    else if (in->y & XP_CLASS) has = xr_class_has(&re->cls[in->x], (uint32_t)c);
+    else has = (uint32_t)in->x == (uint32_t)c;
+    return (in->y & XP_NEG) ? !has : has;
+}
+
 typedef struct {
     int32_t *list, *stack, *next;
     uint32_t *mark;
@@ -1318,6 +1358,7 @@ static int32_t xr_dfa_step(xr_re *re, xr_code *code, xr_dfa *d, int si, uint32_t
         case XR_SPLIT: xr_w.stack[sp++] = in->y; xr_w.stack[sp++] = in->x; break;
         case XR_SAVE: case XR_RESET: xr_w.stack[sp++] = pc + 1; break;
         case XR_ASSERT: if (xr_assert_ok(in->x, prev, nextctx)) xr_w.stack[sp++] = pc + 1; break;
+        case XR_PEEK: if (xr_peek_ok(re, in, eof ? -1 : (int64_t)c)) xr_w.stack[sp++] = pc + 1; break;
         case XR_MATCH:
             matched = true;
             if (!d->longest) sp = 0; /* lower-priority threads lose to this match */
@@ -1573,7 +1614,7 @@ static int64_t xr_search_start(xr_re *re, const unsigned char *s, size_t n, size
 
 typedef struct { int32_t pc; int32_t caps; } xr_thr;
 static void xr_pike_add(xr_re *re, xr_thr *list, int *nl, int32_t *capbuf, int *ncap, int nsave, int pc, int32_t *caps, size_t pos,
-                        int prev, int next, uint32_t *mark, uint32_t g, int32_t *stack) {
+                        int prev, int next, int64_t nextc, uint32_t *mark, uint32_t g, int32_t *stack) {
     /* explicit stack of (pc, restore slot, restore value) */
     int sp = 0;
     stack[sp++] = pc; stack[sp++] = -1; stack[sp++] = 0;
@@ -1596,6 +1637,9 @@ static void xr_pike_add(xr_re *re, xr_thr *list, int *nl, int32_t *capbuf, int *
             break;
         case XR_ASSERT:
             if (xr_assert_ok(in->x, prev, next)) { stack[sp++] = p + 1; stack[sp++] = -1; stack[sp++] = 0; }
+            break;
+        case XR_PEEK:
+            if (xr_peek_ok(re, in, nextc)) { stack[sp++] = p + 1; stack[sp++] = -1; stack[sp++] = 0; }
             break;
         case XR_RESET:
             for (int k = in->x; k <= in->y; k++) { stack[sp++] = -1; stack[sp++] = k; stack[sp++] = caps[k]; caps[k] = -1; }
@@ -1643,7 +1687,7 @@ static bool xr_captures(xr_re *re, const unsigned char *s, size_t n, size_t star
     size_t len = 0;
     uint32_t c = 0;
     int next = i < n ? xr_ctx(c = xr_utf8(s + i, n - i, &len)) : XC_EDGE;
-    xr_pike_add(re, cl, &ncl, cb, &ncb, nsave, re->entry_a, caps, i, prev, next, mark, g, stack);
+    xr_pike_add(re, cl, &ncl, cb, &ncb, nsave, re->entry_a, caps, i, prev, next, i < n ? (int64_t)c : -1, mark, g, stack);
     for (;;) {
         int nnl = 0, nnb = 0;
         g = ++w.g;
@@ -1662,7 +1706,7 @@ static bool xr_captures(xr_re *re, const unsigned char *s, size_t n, size_t star
             }
             if (i < n && i < end && xr_consumes(re, in, c)) {
                 memcpy(caps, tc, sizeof(int32_t) * (size_t)nsave);
-                xr_pike_add(re, nlst, &nnl, nb, &nnb, nsave, cl[t].pc + 1, caps, ni, nprev, nnext, mark, g, stack);
+                xr_pike_add(re, nlst, &nnl, nb, &nnb, nsave, cl[t].pc + 1, caps, ni, nprev, nnext, ni < n ? (int64_t)nc : -1, mark, g, stack);
             }
         }
         if (i >= end || nnl == 0) break;
@@ -1938,6 +1982,11 @@ static bool xr_bitstate(xr_re *re, const unsigned char *s, size_t n, size_t star
                 if (xr_assert_ok(in->x, prev, next)) { pc++; go = true; }
                 break;
             }
+            case XR_PEEK: {
+                size_t l;
+                if (xr_peek_ok(re, in, (size_t)pos < n ? (int64_t)xr_utf8(s + pos, n - (size_t)pos, &l) : -1)) { pc++; go = true; }
+                break;
+            }
             case XR_MATCH:
                 memcpy(out, cp, sizeof(int32_t) * (size_t)nsave);
                 found = true;
@@ -2153,7 +2202,16 @@ static bool xr_find(xr_re *re, const char *str, size_t n, size_t from, bool stic
     int64_t end = xr_search_end(re, s, n, from, anchored, false, &idle);
     if (end < 0) return false;
     if (idle < from || idle > (size_t)end) idle = from; /* (cannot happen; keep the bound sound) */
-    int64_t start = anchored ? (int64_t)from : xr_search_start(re, s, n, idle, (size_t)end);
+    int64_t start;
+    if (anchored) start = (int64_t)from;
+    else if (re->has_peek) { /* the leftmost position an anchored match starts at (its end the one found: leftmost-first) */
+        start = -1;
+        for (size_t i = idle; i <= (size_t)end && start < 0; i++) {
+            if (i < n && (s[i] & 0xC0) == 0x80) continue;
+            int64_t e2 = xr_search_end(re, s, n, i, true, false, NULL);
+            if (e2 >= 0) { start = (int64_t)i; end = e2; }
+        }
+    } else start = xr_search_start(re, s, n, idle, (size_t)end);
     if (start < 0) start = (int64_t)from; /* cannot happen; keep the result well formed */
     *ms = start;
     *me = end;
