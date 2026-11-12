@@ -1370,6 +1370,22 @@ static Expr *parse_primary(Parser *p) {
         expect(p, TK_RBRACKET, NULL);
         return e;
     }
+    case TK_CLASS: { /* () => class {}: a class written in place, declared in the module under a name of its own */
+        static int nanon;
+        Class *c = xs_alloc(sizeof *c);
+        c->pos = pos;
+        c->name = xs_sprintf("__AnonClass%d", ++nanon);
+        next(p);
+        if (at(p, TK_IDENT)) next(p); /* (class Name { }: its own name, kept local to the expression in JavaScript) */
+        parse_fields_body(p, c);
+        c->mod = p->mod;
+        c->as_value = true;
+        add_class(p->prog, c);
+        add_statics(p->prog, p->mod, c);
+        Expr *e = new_expr(E_IDENT, pos);
+        e->str = c->name;
+        return e;
+    }
     case TK_NEW: {
         next(p);
         Token name = expect(p, TK_IDENT, NULL);
@@ -3134,6 +3150,24 @@ static void parse_fields_body(Parser *p, Class *c) {
         Token name;
         if (sym_iter) { name = p->tok; name.kind = TK_IDENT; name.str = "__iterator"; name.pos = pos; }
         else if (at(p, TK_STRING)) { name = p->tok; name.kind = TK_IDENT; next(p); } /* '@timestamp': string */
+        else if (at(p, TK_LBRACKET) && ({ Parser l_ = *p; next(&l_); bool ok_ = at(&l_, TK_IDENT); if (ok_) { next(&l_); ok_ = at(&l_, TK_RBRACKET); } ok_; })) {
+            /* [AUDIT_CONTEXT_KEY]?: T with const AUDIT_CONTEXT_KEY = '__audit': the field named by the constant's text */
+            next(p);
+            Token k = p->tok;
+            next(p);
+            next(p);
+            const char *val = NULL;
+            for (int i = 0; i < p->prog->top.len && !val; i++) {
+                Stmt *st = p->prog->top.items[i];
+                if (st->kind != S_VAR || !st->is_const || !st->name || strcmp(st->name, k.str) != 0 || !st->init) continue;
+                Expr *x = st->init;
+                while (x->kind == E_AS && x->lhs) x = x->lhs;
+                if (x->kind == E_STRING) val = x->str;
+            }
+            if (!val) xs_error(XS1018, k.pos, "name the field, or declare the key as a const string above: const KEY = 'name';", "the key [%s] is not a string constant declared above", k.str);
+            name = k;
+            name.str = (char *)val;
+        }
         else name = expect_prop_name(p, NULL);
         if (gen_method && !at(p, TK_LPAREN) && !at(p, TK_LT)) xs_error(XS8064, name.pos, NULL, "'*' marks a generator method: *%s(): Generator<T> { ... }", name.str);
         if (accessor) {
@@ -3906,7 +3940,7 @@ static Enum *parse_enum(Parser *p) {
    ahead of its top-level statements. TypeScript's legacy decorator order: per member, parameters (last
    first) then the member's decorators (bottom up); constructor parameters; then the class (bottom up). */
 static bool class_decorated(Class *c) {
-    if (c->decos.len) return true;
+    if (c->decos.len || c->as_value) return true;
     if (c->base_name && strcmp(c->base_name, "Error") == 0) return true; /* an error class: a value too (@Catch(MyError)) */
     if (c->mixin) return true; /* class UpdateDto extends PartialType(CreateDto) {}: a value too (@Body() dto: UpdateDto) */
     for (int i = 0; i < c->nfields; i++) if (c->fields[i].decos.len) return true;
@@ -4093,6 +4127,9 @@ static void reflect_module(Program *prog, Module *m, int top_start, Parser *mp) 
         int at_i = before;
         for (int k = top_start; k < before; k++)
             if (prog->top.items[k]->mod == m && prog->top.items[k]->pos.line > c->pos.line) { at_i = k; break; }
+        if (c->as_value) /* (a class written inside a statement: its descriptor before that statement) */
+            for (int k = top_start; k < before; k++)
+                if (prog->top.items[k]->mod == m && !prog->top.items[k]->generated && prog->top.items[k]->pos.line <= c->pos.line) at_i = k;
         Stmt **gen = xs_alloc(sizeof(Stmt *) * (size_t)(ng ? ng : 1));
         memcpy(gen, prog->top.items + before, sizeof(Stmt *) * (size_t)ng);
         memmove(prog->top.items + at_i + ng, prog->top.items + at_i, sizeof(Stmt *) * (size_t)(before - at_i));
@@ -5247,17 +5284,8 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
     for (int i = 0; i < prog->nmodules; i++) {
         Module *m = prog->modules[i];
         if (strcmp(m->path, real) == 0) {
-            if (m->loading) { /* every module still loading, from the one that closes the cycle to this one, is part of it */
-                Buf chain = {0};
-                bool in = false;
-                for (int k = 0; k < prog->nmodules; k++) {
-                    Module *x = prog->modules[k];
-                    if (x == m) in = true;
-                    if (in && x->loading) { const char *b = strrchr(x->file, '/'); buf_printf(&chain, "%s -> ", b ? b + 1 : x->file); }
-                }
-                { const char *b = strrchr(m->file, '/'); buf_puts(&chain, b ? b + 1 : m->file); }
-                xs_error(XS5004, from_pos, xs_sprintf("the cycle is %s; move the shared code into a third file that both import", chain.data), "circular import of '%s'", file);
-            }
+            /* m->loading: a cycle (entities that name each other, as TypeORM's relations do): the module is the one being
+               read; its names resolve once the whole program is read, as Node binds them lazily */
             return m;
         }
     }
