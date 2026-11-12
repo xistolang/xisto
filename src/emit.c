@@ -1939,6 +1939,23 @@ static void emit_member(Expr *e) {
         (void)ek;
         return;
     }
+    if (base->type->kind == TY_SET && base->type->elem->kind == TY_UNKNOWN) { /* Set<unknown> (xs_uset_*: SameValueZero) */
+        const char *op = e->builtin.cfn;
+        if (strcmp(op, "size") == 0) { buf_puts(out, "((int64_t)("); emit_borrowed(base); buf_puts(out, ")->count)"); return; }
+        if (strcmp(op, "clear") == 0) { buf_puts(out, "xs_map_clear("); emit_borrowed(base); buf_puts(out, ")"); return; }
+        if (strcmp(op, "values") == 0) {
+            buf_puts(out, "(xs_arr_ref *)xs_map_values(");
+            emit_borrowed(base);
+            buf_printf(out, ", %s)", elem_printer(ty_unknown));
+            return;
+        }
+        buf_printf(out, "xs_uset_%s(", strcmp(op, "has") == 0 ? "has" : strcmp(op, "delete") == 0 ? "delete" : "add");
+        emit_borrowed(base);
+        buf_puts(out, ", ");
+        emit_borrowed(e->args.items[0]);
+        buf_puts(out, ")");
+        return;
+    }
     if (base->type->kind == TY_MAP || base->type->kind == TY_SET) {
         Type *t = base->type;
         bool is_map = t->kind == TY_MAP;
@@ -2965,6 +2982,14 @@ static void emit_expr_raw(Expr *e) {
         }
         bool is_map = t->kind == TY_MAP;
         Type *k = is_map ? t->key : t->elem;
+        if (!is_map && k->kind == TY_UNKNOWN) { /* new Set<unknown>(xs) */
+            if (!e->args.len) { buf_puts(out, "xs_uset_new()"); return; }
+            Type *at = e->args.items[0]->type;
+            buf_printf(out, "({ xs_map *nm_ = xs_uset_new(); %s *na_ = ", arr_struct(at));
+            emit_borrowed(e->args.items[0]);
+            buf_puts(out, "; for (size_t ni_ = 0; ni_ < na_->len; ni_++) xs_uset_add(nm_, na_->data[ni_]); nm_; })");
+            return;
+        }
         if (is_map && t->record) buf_puts(out, "xs_map_rec(");
         if (e->args.len == 1) buf_puts(out, "({ xs_map *nm_ = ");
         buf_printf(out, "xs_map_new(%d, %d, %d, %s, %s)", is_map ? 1 : 0, k->kind == TY_STRING ? 1 : 0, is_map ? val_kind(t->elem) : 1,
