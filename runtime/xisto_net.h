@@ -1814,6 +1814,37 @@ static xs_str *xs_HttpRequest_query(xs_HttpRequest *r, xs_str *name) {
     return xs_str_new("", 0);
 }
 
+/* req.queryNames(): the names in the query string, in order (repeated names repeat), decoded */
+static xs_arr_ref *xs_HttpRequest_queryNames(xs_HttpRequest *r) {
+    xs_arr_ref *a = xs_arr_ref_new(8, xs_print_str_quoted_);
+    const char *p = r->query, *end = r->query + r->query_len;
+    while (p && p < end) {
+        const char *amp = memchr(p, '&', (size_t)(end - p));
+        if (!amp) amp = end;
+        const char *eq = memchr(p, '=', (size_t)(amp - p));
+        size_t klen = eq ? (size_t)(eq - p) : (size_t)(amp - p);
+        if (klen) xs_arr_ref_push(a, xs_url_decode(p, klen));
+        p = amp + 1;
+    }
+    return a;
+}
+/* req.queryAll(name): every value of a name, in order */
+static xs_arr_ref *xs_HttpRequest_queryAll(xs_HttpRequest *r, xs_str *name) {
+    xs_arr_ref *a = xs_arr_ref_new(4, xs_print_str_quoted_);
+    const char *p = r->query, *end = r->query + r->query_len;
+    while (p && p < end) {
+        const char *amp = memchr(p, '&', (size_t)(end - p));
+        if (!amp) amp = end;
+        const char *eq = memchr(p, '=', (size_t)(amp - p));
+        size_t klen = eq ? (size_t)(eq - p) : (size_t)(amp - p);
+        xs_str *k = xs_url_decode(p, klen);
+        if (k->len == name->len && memcmp(k->data, name->data, (size_t)k->len) == 0)
+            xs_arr_ref_push(a, eq ? xs_url_decode(eq + 1, (size_t)(amp - eq - 1)) : xs_str_new("", 0));
+        xs_release(k);
+        p = amp + 1;
+    }
+    return a;
+}
 /* req.headerNames(): the names of the headers that came, lower case, in order (Express's req.headers keys) */
 static xs_arr_ref *xs_HttpRequest_headerNames(xs_HttpRequest *r) {
     xs_arr_ref *a = xs_arr_ref_new(8, xs_print_str_quoted_);

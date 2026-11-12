@@ -330,9 +330,9 @@ function check(r: Rule, v: any): string {
       return `$property must be longer than or equal to ${numberText(r.n)} characters`;
     }
     return `$property must be shorter than or equal to ${numberText(r.m)} characters`;
-  } else if (k === "min" && (typeof v !== "number" || (v as number) < r.n)) {
+  } else if (k === "min" && (typeof v !== "number" || !((v as number) >= r.n))) { // (NaN fails, as min() does)
     return `$property must not be less than ${numberText(r.n)}`;
-  } else if (k === "max" && (typeof v !== "number" || (v as number) > r.n)) {
+  } else if (k === "max" && (typeof v !== "number" || !((v as number) <= r.n))) {
     return `$property must not be greater than ${numberText(r.n)}`;
   } else if (k === "arrayMaxSize" && (!isArr || Number((v as unknown[]).length) > r.n)) {
     return `$property must contain no more than ${numberText(r.n)} elements`;

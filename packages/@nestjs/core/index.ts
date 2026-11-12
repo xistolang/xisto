@@ -38,6 +38,7 @@ import {
   GuardDef,
   HttpException,
   NotFoundException,
+  ArgumentMetadata,
   InjectDef,
   Logger,
   LoggerService,
@@ -582,10 +583,6 @@ function isInt(s: string): boolean {
 function headersJson(request: Request): string {
   const h = request.headers;
   const all: Record<string, unknown> = {};
-  const auth = h.authorization;
-  if (auth != null) {
-    all["authorization"] = auth;
-  }
   for (const k of Object.keys(h.__expando)) {
     all[k] = h.__expando[k];
   }
@@ -765,6 +762,47 @@ function runHandler(r: Route, req: HttpRequest, request: Request, response: Resp
         return early(run, badRequestText(r, response, je.message));
       }
       args[p.index] = value;
+    } else if (p.source === "query" && p.key.length === 0) {
+      // @Query() dto: the whole query as Express parses it (a repeated name gives a list), then as a body: the
+      // ValidationPipe's plainToInstance and validate for a class, the app's pipe for anything else
+      const plain: Record<string, unknown> = {};
+      for (const name of req.queryNames()) {
+        if (name in plain) {
+          continue;
+        }
+        const all = req.queryAll(name);
+        if (all.length === 1) {
+          plain[name] = all[0];
+        } else {
+          plain[name] = all;
+        }
+      }
+      let text = JSON.stringify(plain);
+      if (p.pipeClass !== null) {
+        const parsed: any = JSON.parse(text);
+        const out = runPipe(p, parsed, "query");
+        args[p.index] = out;
+        continue;
+      }
+      if (type.kind === "class") {
+        if (r.validate) {
+          const checked = checkBody(text, type.id, r.pipe, type);
+          if (checked.messages.length > 0) {
+            return early(run, badRequest(r, response, checked.messages));
+          }
+          if (r.transform) {
+            text = checked.json;
+          }
+        }
+        try {
+          args[p.index] = type.decode(text);
+        } catch (je) {
+          return early(run, badRequestText(r, response, je.message));
+        }
+      } else {
+        const parsed: any = JSON.parse(text);
+        args[p.index] = parsed;
+      }
     } else if (p.source === "param" || p.source === "query") {
       const raw = p.source === "param" ? req.param(p.key) : req.query(p.key);
       if (p.pipe === "ParseIntPipe") {
@@ -808,12 +846,38 @@ function runHandler(r: Route, req: HttpRequest, request: Request, response: Resp
         args[p.index] = f;
       }
     } else {
-      args[p.index] = __custom[p.custom].fn(p.key === "" ? null : p.key, ctx); // @Dec(): data is undefined in Nest
+      const v = __custom[p.custom].fn(p.key === "" ? null : p.key, ctx); // @Dec(): data is undefined in Nest
+      // (a parameter declared as an object type gets the value's data in that shape: what a decorator returns from
+      // request.user is read by name)
+      args[p.index] = type.kind === "interface" && v !== null ? type.decode(JSON.stringify(v as any)) : v;
+    }
+    if (p.pipeClass !== null && !(p.source === "query" && p.key.length === 0)) {
+      args[p.index] = runPipe(p, args[p.index], p.source);
     }
   }
   const result = r.method.invoke(r.instance, args);
   run.result = result;
   return result;
+}
+
+// a pipe of the app's own on a parameter: transform(value, { type, data }) of its instance (built with its dependencies)
+function runPipe(p: ParamDef, value: unknown, kind: string): unknown {
+  const pc = p.pipeClass;
+  if (pc === null) {
+    return value;
+  }
+  const m = findMethod(pc, "transform");
+  if (m === null) {
+    throw new Error(`${pc.name} has no transform()`);
+  }
+  const meta = new ArgumentMetadata();
+  meta.type = kind;
+  meta.data = p.key.length > 0 ? p.key : null;
+  const args: unknown[] = [value];
+  if (m.params.length > 1) {
+    args.push(meta);
+  }
+  return m.invoke(instanceOf(pc), args);
 }
 
 // guards or interceptors of one route, in the order they run

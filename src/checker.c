@@ -218,6 +218,8 @@ static void init_builtins(void) {
     bi_method(req, "header", "xs_HttpRequest_header", ty_string, 1, ty_string);
     bi_method(req, "search", "xs_HttpRequest_search", ty_string, 0);
     bi_method(req, "headerNames", "xs_HttpRequest_headerNames", ty_array_of(ty_string), 0);
+    bi_method(req, "queryNames", "xs_HttpRequest_queryNames", ty_array_of(ty_string), 0);
+    bi_method(req, "queryAll", "xs_HttpRequest_queryAll", ty_array_of(ty_string), 1, ty_string);
 
     Class *res = bi_class("HttpResponse", "xs_HttpResponse");
     bi_field(res, "status", ty_int);
@@ -3088,6 +3090,9 @@ static bool shape_copy(Expr *e, Type *want) {
             if (!find_field(src, dst->fields[i].name, NULL) && !dst->fields[i].optional) return false;
     }
     Class *dst = to_rec ? src : want->cls; /* a Record gets every field of the value */
+    /* an open class (Express's headers): into a Record what its __expando holds (it keeps every property, the
+       declared ones too) */
+    bool open_rec = to_rec && find_field(src, "__expando", NULL);
     int n = 0;
     for (int i = 0; i < dst->nfields; i++) if (find_field(src, dst->fields[i].name, NULL)) n++;
     Expr *inner = xs_alloc(sizeof *inner);
@@ -3098,6 +3103,7 @@ static bool shape_copy(Expr *e, Type *want) {
     int k = 0;
     for (int i = 0; i < dst->nfields; i++) {
         if (!find_field(src, dst->fields[i].name, NULL)) continue;
+        if (open_rec) continue;
         Expr *sv = xs_alloc(sizeof *sv);
         sv->kind = E_IDENT; sv->pos = e->pos; sv->field = -1; sv->str = "__shape";
         Expr *m = xs_alloc(sizeof *m);
@@ -3106,6 +3112,15 @@ static bool shape_copy(Expr *e, Type *want) {
         expr_list_push(&obj->args, m);
     }
     Expr *body = obj;
+    if (open_rec) { /* __shape.__expando as the Record wanted (its values checked as they are read) */
+        Expr *sv = xs_alloc(sizeof *sv);
+        sv->kind = E_IDENT; sv->pos = e->pos; sv->field = -1; sv->str = "__shape";
+        Expr *m = xs_alloc(sizeof *m);
+        m->kind = E_MEMBER; m->pos = e->pos; m->field = -1; m->lhs = sv; m->str = "__expando";
+        Expr *as = xs_alloc(sizeof *as);
+        as->kind = E_AS; as->pos = e->pos; as->field = -1; as->lhs = m; as->elem_type = want;
+        body = obj = as;
+    }
     if (nul) { /* __shape === null ? null : { ... } */
         Expr *sv = xs_alloc(sizeof *sv);
         sv->kind = E_IDENT; sv->pos = e->pos; sv->field = -1; sv->str = "__shape";
@@ -6363,7 +6378,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 Type *ft = b->type;
                 e->lhs->type = ft;
                 e->lhs->cname = b->cname;
-                if (strncmp(name, "__deco", 6) == 0) /* a decorator for members also used on a class ((c, m: MethodInfo | null) => void, @SetMetadata on a controller): null for what a class has not */
+                if (1) /* (any function value: an argument left out where the parameter can be null, as an optional one, e.g. createParamDecorator(...)() with data?) a decorator for members also used on a class ((c, m: MethodInfo | null) => void, @SetMetadata on a controller): null for what a class has not */
                     while (e->args.len < ft->nparams && (ft->params[e->args.len]->kind == TY_NULLABLE || ft->params[e->args.len]->kind == TY_UNKNOWN)) {
                         Expr *nul = xs_alloc(sizeof *nul);
                         nul->kind = E_NULL; nul->pos = e->pos; nul->field = -1;
