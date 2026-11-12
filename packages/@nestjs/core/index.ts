@@ -68,6 +68,7 @@ export class NestApplicationOptions {
   cors?: boolean;
   bufferLogs?: boolean;
   logger?: boolean;
+  rawBody?: boolean; // (accepted: request.rawBody always holds the body)
 }
 
 /** app.enableVersioning({ type: VersioningType.URI, defaultVersion: "1" }) */
@@ -632,6 +633,7 @@ function handle(r: Route, req: HttpRequest): HttpResponse {
   request.url = req.path;
   request.path = req.path;
   request.body = req.body;
+  request.rawBody = Buffer.from(req.body);
   for (const h of ["authorization", "content-type", "accept", "user-agent", "accept-encoding", "x-request-id"]) {
     const v = req.header(h);
     if (v.length > 0) {

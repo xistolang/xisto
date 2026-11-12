@@ -21,6 +21,8 @@ export class Request {
   path: string = "/";
   headers: IncomingHttpHeaders = new IncomingHttpHeaders();
   body: string = "";
+  /** The body's bytes (Nest's rawBody: true). */
+  rawBody: Buffer | null = null;
   ip: string = "";
   /** What an authentication guard put on the request (@nestjs/passport: validate()'s value). */
   user: any = null;
