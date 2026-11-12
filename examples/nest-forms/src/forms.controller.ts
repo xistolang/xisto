@@ -1,10 +1,12 @@
-import { BadRequestException, Body, Controller, ForbiddenException, Get, HttpCode, Logger, Param, Post, Query, Request, UseGuards } from "@nestjs/common";
+import { BadRequestException, Body, Controller, ForbiddenException, Get, HttpCode, Logger, Param, Post, Query, Req, Request, Res, UseGuards } from "@nestjs/common";
+import { Request as ExpressRequest, Response as ExpressResponse } from "express";
 import { ApiHeader } from "@nestjs/swagger";
 import { Scoped } from "./decorators";
 import { CreateTabletDto, LegacyDto, NoQueryPipe, SearchQueryDto, SortDto, UpdateKioskDto } from "./dtos";
 import { CurrentUser } from "./user.decorator";
 import { FormsService } from "./forms.service";
 import { UserGuard } from "./user.guard";
+import { DevIssuerGuard } from "./issuer.guard";
 
 @Controller("forms")
 export class FormsController {
@@ -34,6 +36,24 @@ export class FormsController {
   @HttpCode(200)
   legacy(@Body() dto: LegacyDto) {
     return { name: dto.name };
+  }
+
+  @Get("issued")
+  @UseGuards(DevIssuerGuard)
+  issued() {
+    return { issued: true };
+  }
+
+  @Get(["url", "url-alias"])
+  url(@Req() req: ExpressRequest) {
+    return { originalUrl: req.originalUrl, path: req.path };
+  }
+
+  @Get("bytes")
+  bytes(@Res() res: ExpressResponse): void {
+    res.status(200);
+    res.setHeader("content-type", "text/plain; charset=utf-8");
+    res.end(Buffer.from("olá, bytes"));
   }
 
   @Get("settings")

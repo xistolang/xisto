@@ -217,6 +217,9 @@ typedef struct Type {
     bool rest;            /* TY_FUNC: the last parameter is ...xs: T[] (the arguments from there on, one array) */
     bool async_ret;       /* TY_FUNC: written (..) => Promise<R> (ret is R): a call not awaited can be kept as a promise */
     const char *tname;    /* TY_TPARAM; TY_STRING: a string literal type ("circle"), the only value allowed */
+    const char **slits;   /* TY_STRING of a union of string literals ('error' | 'warn'): the values it was written with (any
+                             string is allowed; they let obj[nivel](m) call one of those methods) */
+    int nslits;
     struct Type *gen_sig; /* TY_FUNC of a generic function value (<T>(sql: string) => Promise<T | null>): held and called as this
                              type with every T as unknown; gen_sig is the signature as written (T a TY_TPARAM, names in
                              ftparams), from which a call f<Row>(sql) takes its result type (the unknown converted to it) */
