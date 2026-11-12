@@ -478,7 +478,7 @@ export interface DataSourceExtra {
 export interface DataSourceOptions {
   type: string;
   host?: string;
-  port?: int;
+  port?: number; // (a number, as TypeORM types it: parseInt(...) || 1521)
   username?: string;
   password?: string;
   database?: string;
@@ -547,7 +547,7 @@ export class PostgresDriver extends Driver {
   private makePool(max: int): Pool {
     return new Pool({
       host: this.options.host ?? "localhost",
-      port: this.options.port ?? 5432,
+      port: Math.trunc(this.options.port ?? 5432),
       user: this.options.username ?? "postgres",
       password: this.options.password ?? "",
       database: this.options.database ?? "postgres",
@@ -1477,6 +1477,26 @@ export class Repository<T> {
   }
 
   /** INSERT when no row has the entity's primary key, UPDATE of its other columns when one has */
+  /**
+   * repo.save(entities) (TypeORM's save(entities: T[]): Promise<T[]>, the array form of save: a call with an array
+   * comes here): each one saved, all in one transaction (in the caller's when there is one), as TypeORM does.
+   */
+  async __save_array(entities: T[]): Promise<T[]> {
+    if (entities.length === 0) {
+      return [];
+    }
+    const fixed = this.__fixedName ?? "";
+    const target: ClassInfo = this.target;
+    return await this.manager.transaction<T[]>(async (m: EntityManager): Promise<T[]> => {
+      const repo: Repository<T> = fixed.length > 0 ? m.getRepository<T>(fixed) : m.getRepository<T>(target);
+      const out: T[] = [];
+      for (const e of entities) {
+        out.push(await repo.save(e));
+      }
+      return out;
+    });
+  }
+
   async save(entity: T): Promise<T> {
     const values: object = JSON.parse(JSON.stringify(entity));
     const pks = this.metadata.primaryColumns;

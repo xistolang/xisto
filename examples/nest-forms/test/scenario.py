@@ -34,7 +34,7 @@ for b in ['{}', '{"name":""}', '{"printer":2}', '{"printer":"1"}', '{"ticket":"X
     call("POST", "/api/forms/kiosk", b)
 for b in ['{"name":"a","sortOrder":"DESC"}', '{"name":"a","sortOrder":"up"}', '{"name":"a"}']:
     call("POST", "/api/forms/sort", b)
-for b in ['{"name":"a","userId":5}', '{"name":"a"}']:
+for b in ['{"name":"a","userId":5}', '{"name":"a"}', '{"name":"a  b"}', '{"name":"a b"}']:
     call("POST", "/api/forms/legacy", b)
 call("GET", "/api/forms/settings")
 call("GET", "/api/forms/issued", headers={"x-issuer": "forms-app"})

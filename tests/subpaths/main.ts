@@ -1,5 +1,5 @@
 // deep imports of packages: rxjs/operators and @nestjs/common/interfaces/external/cors-options.interface; Type<T>
-import { lastValueFrom, of } from "rxjs";
+import { catchError, lastValueFrom, of, throwError } from "rxjs";
 import { finalize, map, tap } from "rxjs/operators";
 import { Injectable, Type } from "@nestjs/common";
 import type { CorsOptions } from "@nestjs/common/interfaces/external/cors-options.interface";
@@ -37,6 +37,21 @@ async function main(): Promise<void> {
     ),
   );
   console.log(v, seen.join(", "));
+  // tap with an observer: next, error and complete, in rxjs's order
+  const log: string[] = [];
+  const w = await lastValueFrom(
+    of(6).pipe(
+      tap({ next: (x: unknown) => log.push("next " + String(x)), error: (e: Error) => log.push("error " + e.message), complete: () => log.push("complete") }),
+      map((x: unknown) => (x as number) * 2),
+    ),
+  );
+  const z = await lastValueFrom(
+    throwError(() => new Error("boom")).pipe(
+      tap({ next: () => log.push("never"), error: (e: Error) => log.push("error " + e.message) }),
+      catchError((e: Error) => of("caught " + e.message)),
+    ),
+  );
+  console.log(w, z, log.join(" | "));
   const services: Type<unknown>[] = [UsersService, OrdersService];
   console.log(services.length);
   const c = corsFor("https://a.example, https://b.example");

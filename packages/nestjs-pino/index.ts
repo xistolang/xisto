@@ -2,6 +2,7 @@
 // built every Nest Logger line goes through it too (what app.useLogger(app.get(Logger)) does in Nest).
 import { __overrideLogger, __overrideLoggerFields, DynamicModule, Injectable, LoggerFieldsSink, LoggerService, Module } from "@nestjs/common";
 import { hostname } from "xisto:os";
+import { ClassInfo } from "xisto:reflect";
 
 /** pino's numeric levels. */
 const LEVELS: Map<string, int> = new Map<string, int>([
@@ -224,14 +225,27 @@ export class LoggerModule {
     state.contextKey = params.renameContext ?? "context";
     return { module: LoggerModule, providers: [Logger, PinoLogger], exports: [Logger, PinoLogger], global: true };
   }
-  /** LoggerModule.forRootAsync({ useFactory: () => params }): the same, with the params computed at import */
+  /**
+   * LoggerModule.forRootAsync({ inject: [ConfigService], useFactory: (config) => params }): the same, with the params
+   * computed at import. Compatibility: each injected class that takes nothing to build (ConfigService) is made for the
+   * factory; another token gives it null (Nest builds the module later, from its injector).
+   */
   static forRootAsync(options: LoggerModuleAsyncParams): DynamicModule {
-    return LoggerModule.forRoot(options.useFactory());
+    const args: unknown[] = [];
+    for (const t of options.inject ?? []) {
+      if (typeof t !== "object" || t === null) {
+        args.push(null);
+        continue;
+      }
+      const c = t as ClassInfo;
+      args.push(c.params.length === 0 ? c.construct([]) : null);
+    }
+    return LoggerModule.forRoot(options.useFactory(...args));
   }
 }
-/** forRootAsync's options (inject and imports are accepted; the factory takes no arguments in xisto) */
+/** forRootAsync's options (imports are accepted) */
 export interface LoggerModuleAsyncParams {
   imports?: unknown[];
   inject?: unknown[];
-  useFactory: () => LoggerModuleParams;
+  useFactory: (...args: any[]) => LoggerModuleParams;
 }
