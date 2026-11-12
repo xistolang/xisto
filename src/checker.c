@@ -2112,6 +2112,12 @@ static Type *resolve(Type *t, Pos pos) {
     case TY_MAP:
         t->key = resolve(t->key, pos);
         t->elem = resolve(t->elem, pos);
+        if (!t->record && t->key->kind == TY_NULLABLE && (t->key->elem->kind == TY_NUMBER || t->key->elem->kind == TY_INT)) {
+            /* Map<number | null, V>: its keys as SameValueZero texts (null one key, 1 and 1.0 one key), read and written
+               with get/set/has/delete (its keys are not listed back: keys(), entries() and for...of are refused) */
+            t->key = ty_string;
+            t->nkey = true;
+        }
         if (t->key->kind == TY_NUMBER) t->key = ty_numkey(); /* Map<number, V>: keys are whole numbers (ids), checked when one goes in */
         if (t->key->kind == TY_ENUM) t->key = t->key->en->is_string ? ty_string : ty_int; /* Record<Enum, V>: by the enum's values */
         if (t->key->kind == TY_STRING && t->key->tname) t->key = ty_string; /* Map<'a' | 'b', V>: string keys */
@@ -4562,6 +4568,27 @@ static void check_map_member(Expr *e) {
     }
     #define ARGS(n) do { if (e->args.len != (n)) xs_error(XS8038, e->pos, NULL, "%s.%s takes %d argument(s), got %d", is_map ? "Map" : "Set", m, (n), e->args.len); } while (0)
     bool k_done = false; /* the key argument is already checked (below) */
+    if (is_map && t->nkey) { /* (Map<number | null, V>: the key's text) */
+        if (!strcmp(m, "keys") || !strcmp(m, "entries") || !strcmp(m, "forEach"))
+            xs_error(XS6035, e->pos, "keep the keys apart, or key the map by text", "the keys of a Map<number | null, V> are not listed back in xisto yet");
+        if (e->args.len >= 1 && (!strcmp(m, "get") || !strcmp(m, "has") || !strcmp(m, "delete") || !strcmp(m, "set")) &&
+            !(e->args.items[0]->kind == E_CALL && e->args.items[0]->builtin.cfn && !strcmp(e->args.items[0]->builtin.cfn, "xs_nkey"))) {
+            Expr *a0 = e->args.items[0];
+            check_expr(a0, NULL);
+            Type *at = a0->type;
+            if (at->kind == TY_LITINT) { coerce_lit(a0, ty_number); at = a0->type; }
+            if (at->kind == TY_INT) wrap_call(a0, "(double)", ty_number);
+            else if (at->kind == TY_NULLABLE && at->elem->kind == TY_INT) wrap_call(a0, "xs_num_of_int_or_null", ty_nullable_of(ty_number));
+            else if (at->kind == TY_NULL) { memset(a0, 0, sizeof *a0); a0->kind = E_NULL; a0->type = ty_nullable_of(ty_number); }
+            else expect_type(a0, ty_nullable_of(ty_number), "Map key");
+            wrap_call(a0, "xs_nkey", ty_string);
+            prog->uses_nkey = true;
+            k_done = true;
+        } else if (e->args.len >= 1 && e->args.items[0]->kind == E_CALL && e->args.items[0]->builtin.cfn && !strcmp(e->args.items[0]->builtin.cfn, "xs_nkey")) {
+            e->args.items[0]->type = ty_string; /* (made already: m.has(k) of m.get(k) ?? d) */
+            k_done = true;
+        }
+    }
     #define ARG(i, ty, what) do { if (!((i) == 0 && k_done)) { check_expr(e->args.items[i], ty); expect_type(e->args.items[i], ty, what); } } while (0)
     /* m.get(n) / m.has(n) on int keys with n: number (Record<number, V>, a literal-union key): a number that is not whole is
        a key no entry has, as in JavaScript (only set() requires a whole number) */
@@ -6005,7 +6032,29 @@ static bool objlit_expand(Expr *e, Type *expected) {
         for (int i = 0; i < e->args.len && ok; i++) {
             if (strcmp(e->keys[i], "...") != 0) continue;
             Type *st = pure_type(e->args.items[i]->lhs);
+            if (!st && tsc_checked()) { /* (...this.idDe(req): a call that gives a Record, checked here once) */
+                Expr *sx = e->args.items[i]->lhs;
+                if (sx->kind == E_CALL || (sx->kind == E_MEMBER && sx->is_call)) {
+                    check_expr(sx, NULL);
+                    sx->prechecked = true;
+                    st = sx->type;
+                }
+            }
             if (st && st->kind == TY_NULLABLE) st = st->elem; /* (...opts.headers with headers?: a Record: nothing when absent) */
+            {   /* ...(c ? { k: v } : {}) next to a Record: a Record of its own (made where the Record's values are known) */
+                Expr *sx = e->args.items[i]->lhs;
+                if (!st && tsc_checked() && sx->kind == E_COND && !sx->builtin.cfn && sx->args.len == 2 && sx->args.items[0]->kind == E_OBJLIT &&
+                    sx->args.items[1]->kind == E_OBJLIT && !sx->args.items[0]->spread && !sx->args.items[1]->spread) {
+                    for (int b = 0; b < 2; b++)
+                        for (int k = 0; k < sx->args.items[b]->args.len; k++) {
+                            Expr *fv = sx->args.items[b]->args.items[k];
+                            check_expr(fv, NULL);
+                            fv->prechecked = true;
+                            if (!v) v = fv->type; else if (!ty_equal(v, fv->type)) v = ty_unknown;
+                        }
+                    continue;
+                }
+            }
             if (st && st->kind == TY_MAP && st->record && st->key->kind == TY_STRING) {
                 any_rec = true;
                 if (!v) v = st->elem;
@@ -6015,10 +6064,30 @@ static bool objlit_expand(Expr *e, Type *expected) {
         if (any_rec && ok) {
             for (int i = 0; i < e->args.len; i++) if (strcmp(e->keys[i], "[]") == 0) ok = false;
         }
+        if (any_rec && ok && tsc_checked() && !(t && t->kind == TY_MAP && t->record) && v && v->kind != TY_UNKNOWN) {
+            /* { 'event.duration': ms, ...rotulos } with rotulos a Record<string, string>: the other values of other types
+               make it a Record of unknowns */
+            for (int i = 0; i < e->args.len && v->kind != TY_UNKNOWN; i++) {
+                if (!strcmp(e->keys[i], "...")) continue;
+                Expr *a = e->args.items[i];
+                if (a->kind == E_UNARY) continue;
+                check_expr(a, NULL);
+                a->prechecked = true;
+                if (!ty_equal(a->type, v)) v = ty_unknown;
+            }
+        }
         if (any_rec && ok) {
             Type *rec = xs_alloc(sizeof *rec);
             *rec = *ty_map_of(ty_string, v);
             rec->record = true;
+            for (int i = 0; i < e->args.len; i++) { /* (the ...(c ? {..} : {}) ones: Records of these values) */
+                if (strcmp(e->keys[i], "...") != 0) continue;
+                Expr *sx = e->args.items[i]->lhs;
+                if (sx->kind == E_COND && !sx->prechecked && sx->args.len == 2 && sx->args.items[0]->kind == E_OBJLIT && sx->args.items[1]->kind == E_OBJLIT) {
+                    check_expr(sx, rec);
+                    sx->prechecked = true;
+                }
+            }
             Expr *arr = xs_alloc(sizeof *arr);
             arr->kind = E_ARRAY_LIT; arr->pos = e->pos; arr->field = -1; arr->spread = true;
             for (int i = 0; i < e->args.len; i++) {
@@ -6098,6 +6167,23 @@ static bool objlit_expand(Expr *e, Type *expected) {
         }
         Type *st = pure_type(src);
         if (!st) xs_error(XS1018, src->pos, "spread a variable: const base = load(); const o = { ...base, x: 1 };", "spread a name or a field here, not a computed value");
+        if (ty_is_any(st) && tsc_checked() && vals.len) {
+            /* { ...this.map(row), ...(dto as any) }: each field taken so far from the any where it has a value for that key
+               (by name, checked as read), as JavaScript's later spread wins (a key the any holds as null: xisto's absent and
+               null are one, so the earlier value stays) */
+            for (int q = 0; q < vals.len; q++) {
+                Expr *z = xs_alloc(sizeof *z); z->kind = E_NULL; z->pos = src->pos; z->field = -1;
+                Expr *probe = xs_alloc(sizeof *probe); probe->kind = E_MEMBER; probe->pos = src->pos; probe->field = -1; probe->lhs = pure_copy(src); probe->str = keys[q];
+                Expr *has = xs_alloc(sizeof *has); has->kind = E_BINARY; has->op = TK_NEQ; has->pos = src->pos; has->field = -1; has->loose = true;
+                has->lhs = probe; has->rhs = z;
+                Expr *rd = xs_alloc(sizeof *rd); rd->kind = E_MEMBER; rd->pos = src->pos; rd->field = -1; rd->lhs = pure_copy(src); rd->str = keys[q];
+                Expr *c = xs_alloc(sizeof *c); c->kind = E_COND; c->pos = src->pos; c->field = -1; c->lhs = has;
+                expr_list_push(&c->args, rd);
+                expr_list_push(&c->args, vals.items[q]);
+                vals.items[q] = c;
+            }
+            continue;
+        }
         bool nsrc = st->kind == TY_NULLABLE && st->elem->kind == TY_OBJECT && !st->elem->cls->builtin; /* ...x with x: T | null */
         if (nsrc) st = st->elem;
         if (st->kind != TY_OBJECT || st->cls->builtin)
@@ -8100,12 +8186,25 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (e->lhs->type->kind == TY_MAP && (e->lhs->type->record || e->lhs->type->key->kind == TY_STRING)) { /* m[k] on a Record: m.get(k)
             (a string-keyed map read with [] is a Record TypeScript passed along: row?.['NOME']) */
             Expr *key = e->rhs;
+            bool total = false;
+            if (tsc_checked() && e != dyn_lvalue && e->lhs->type->record) { /* COLUNA[c] with COLUNA: Record<Campo, V> and c a Campo
+                                                                               (a union of literals): a V, as TypeScript types it */
+                check_expr(key, NULL);
+                key->prechecked = true;
+                total = key->type && key->type->kind == TY_STRING && (key->type->nslits > 0 || key->type->tname);
+            }
             e->kind = E_MEMBER;
             e->str = "get";
             e->is_call = true;
             e->rhs = NULL;
             e->args = (ExprList){0};
             expr_list_push(&e->args, key);
+            if (total) {
+                Expr *g = xs_alloc(sizeof *g);
+                *g = *e;
+                memset(e, 0, sizeof *e);
+                e->kind = E_AS; e->op = TK_NOT; e->pos = g->pos; e->field = -1; e->lhs = g;
+            }
             check_expr(e, expected);
             return;
         }
@@ -9326,6 +9425,12 @@ static void check_expr_in(Expr *e, Type *expected) {
                             expr_list_push(&c->args, cb);
                             *e = *c;
                             check_expr(e, expected);
+                            Type *pr = !strcmp(m, "filter") && cb->arrow->fn->ret && cb->arrow->fn->ret->kind == TY_BOOLEAN ? cb->arrow->fn->ret->elem : NULL;
+                            Type *et = e->type && e->type->kind == TY_ARRAY ? e->type->elem : NULL;
+                            if (pr && et && et->kind == TY_NULLABLE && ty_is_heap(et->elem)) { /* (o, i, xs): o is string => ...: string[] */
+                                Type *pt = resolve(pr, cb->pos);
+                                if (ty_equal(pt, et->elem)) e->type = ty_array_of(pt);
+                            }
                             return;
                         }
                     }
@@ -11410,7 +11515,9 @@ static bool missing_get(Expr *l) {
           l->lhs->type->kind == TY_MAP && l->type && l->type->kind != TY_NULLABLE && l->type->kind != TY_UNKNOWN && rereadable(l->lhs) && l->args.len == 1))
         return false;
     Expr *k = l->args.items[0];
-    if (k->kind != E_IDENT && k->kind != E_STRING && k->kind != E_NUMBER) return false;
+    bool nk = k->kind == E_CALL && k->builtin.cfn && !strcmp(k->builtin.cfn, "xs_nkey") && k->args.len == 1 &&
+              (k->args.items[0]->kind == E_IDENT || k->args.items[0]->kind == E_NUMBER || k->args.items[0]->kind == E_NULL); /* (Map<number | null, V>) */
+    if (k->kind != E_IDENT && k->kind != E_STRING && k->kind != E_NUMBER && !nk) return false;
     Expr *get = expr_copy(l);
     Expr *has = xs_alloc(sizeof *has);
     has->kind = E_MEMBER;
@@ -12081,6 +12188,61 @@ static bool md_stmt(Stmt *s) {
     return true;
 }
 
+/* if (this.coletor instanceof X) { this.coletor.flush(); }: the field path read as an X in the block, as TypeScript
+   narrows it (a checked downcast; not done when the block assigns the path) */
+static bool same_path(Expr *a, Expr *b) {
+    if (!a || !b || a->kind != b->kind) return false;
+    if (a->kind == E_THIS) return true;
+    if (a->kind == E_IDENT) return a->str && b->str && !strcmp(a->str, b->str);
+    if (a->kind == E_MEMBER) return !a->is_call && !b->is_call && a->str && b->str && !strcmp(a->str, b->str) && same_path(a->lhs, b->lhs);
+    return false;
+}
+static bool path_expr(Expr *e) {
+    if (!e) return false;
+    if (e->kind == E_THIS || e->kind == E_IDENT) return true;
+    return e->kind == E_MEMBER && !e->is_call && path_expr(e->lhs);
+}
+static void io_scan_s(Stmt *s, Expr *path, Type *t, bool replace, bool *assigned);
+static void io_scan_e(Expr **pe, Expr *path, Type *t, bool replace, bool *assigned) {
+    Expr *e = *pe;
+    if (!e) return;
+    if (e->kind == E_ASSIGN && same_path(e->lhs, path)) *assigned = true;
+    if (replace && same_path(e, path)) {
+        Expr *v = xs_alloc(sizeof *v);
+        *v = *e;
+        Expr *as = xs_alloc(sizeof *as);
+        as->kind = E_AS; as->pos = e->pos; as->field = -1; as->lhs = v; as->elem_type = t;
+        *pe = as;
+        return;
+    }
+    if (e->kind == E_ARROW) return; /* (a closure may run after the field changed) */
+    if (!(e->kind == E_ASSIGN && same_path(e->lhs, path))) io_scan_e(&e->lhs, path, t, replace, assigned);
+    io_scan_e(&e->rhs, path, t, replace, assigned);
+    for (int i = 0; i < e->args.len; i++) io_scan_e(&e->args.items[i], path, t, replace, assigned);
+}
+static void io_scan_s(Stmt *s, Expr *path, Type *t, bool replace, bool *assigned) {
+    if (!s) return;
+    io_scan_e(&s->init, path, t, replace, assigned);
+    io_scan_e(&s->expr, path, t, replace, assigned);
+    io_scan_e(&s->cond, path, t, replace, assigned);
+    io_scan_e(&s->for_update, path, t, replace, assigned);
+    io_scan_s(s->for_init, path, t, replace, assigned);
+    io_scan_s(s->body, path, t, replace, assigned);
+    io_scan_s(s->else_body, path, t, replace, assigned);
+    for (int i = 0; i < s->stmts.len; i++) io_scan_s(s->stmts.items[i], path, t, replace, assigned);
+    for (int i = 0; i < s->ncases; i++) io_scan_s(s->cases[i].body, path, t, replace, assigned);
+}
+static void instanceof_path_narrow(Stmt *s) {
+    Expr *c = s->cond;
+    if (!c || c->kind != E_BINARY || c->op != TK_IDENT || !c->lhs || c->lhs->kind != E_MEMBER || !path_expr(c->lhs) ||
+        !c->rhs || c->rhs->kind != E_IDENT || !c->rhs->str) return;
+    Class *k = find_class(c->rhs->str);
+    if (!k || k->is_interface) return;
+    bool assigned = false;
+    io_scan_s(s->body, c->lhs, NULL, false, &assigned);
+    if (assigned) return;
+    io_scan_s(s->body, c->lhs, ty_object_of(k), true, &assigned);
+}
 static void check_stmt(Stmt *s) {
     switch (s->kind) {
     case S_VAR:
@@ -12130,6 +12292,7 @@ static void check_stmt(Stmt *s) {
         settle(s->expr);
         return;
     case S_IF: {
+        instanceof_path_narrow(s);
         check_cond(s->cond, "condition");
         UNarrow un = union_narrow(s->cond);
         if (un.b) { /* a union narrowed in each branch; after `if (...) return;` the rest sees the other members */

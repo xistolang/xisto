@@ -2353,6 +2353,65 @@ static void rest_param(Parser *p, Func *f, Type *t) {
     for (int i = 0; i < p->pending.len; i++) stmt_list_push(&f->param_decls, p->pending.items[i]);
     p->pending = saved;
 }
+/* const valor = p.catch(() => { if (x === valor) ... }): closures inside the initializer that read the name being
+   declared (they run later, when JavaScript has set it). They read a hidden unknown set right after:
+   let __tdzN: unknown = null; const valor = <init with valor read as __tdzN in those closures>; __tdzN = valor; */
+static void tdz_rename_s(Stmt *s, const char *from, const char *to, int depth, bool *hit);
+static void tdz_rename_e(Expr *e, const char *from, const char *to, int depth, bool *hit) {
+    if (!e) return;
+    if (e->kind == E_IDENT && depth > 0 && e->str && !strcmp(e->str, from)) { e->str = (char *)to; *hit = true; }
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) {
+        Func *f = e->arrow->fn;
+        for (int i = 0; i < f->nparams; i++) if (f->params[i].name && !strcmp(f->params[i].name, from)) return; /* (shadowed) */
+        tdz_rename_s(f->body, from, to, depth + 1, hit);
+        for (int i = 0; i < f->param_decls.len; i++) tdz_rename_s(f->param_decls.items[i], from, to, depth + 1, hit);
+        return;
+    }
+    tdz_rename_e(e->lhs, from, to, depth, hit);
+    tdz_rename_e(e->rhs, from, to, depth, hit);
+    for (int i = 0; i < e->args.len; i++) tdz_rename_e(e->args.items[i], from, to, depth, hit);
+}
+static void tdz_rename_s(Stmt *s, const char *from, const char *to, int depth, bool *hit) {
+    if (!s) return;
+    if (s->kind == S_VAR && s->name && !strcmp(s->name, from)) return; /* (a local of that name from here: crude, stops) */
+    tdz_rename_e(s->init, from, to, depth, hit);
+    tdz_rename_e(s->expr, from, to, depth, hit);
+    tdz_rename_e(s->cond, from, to, depth, hit);
+    tdz_rename_e(s->for_update, from, to, depth, hit);
+    tdz_rename_s(s->for_init, from, to, depth, hit);
+    tdz_rename_s(s->body, from, to, depth, hit);
+    tdz_rename_s(s->else_body, from, to, depth, hit);
+    for (int i = 0; i < s->stmts.len; i++) tdz_rename_s(s->stmts.items[i], from, to, depth, hit);
+    for (int i = 0; i < s->ncases; i++) { tdz_rename_e(s->cases[i].value, from, to, depth, hit); tdz_rename_s(s->cases[i].body, from, to, depth, hit); }
+}
+static Stmt *tdz_split(Parser *p, Stmt *s) {
+    if (!s->name || !s->init) return s;
+    static int ntdz;
+    const char *hid = xs_sprintf("__tdz%d", ++ntdz);
+    bool hit = false;
+    tdz_rename_e(s->init, s->name, hid, 0, &hit);
+    if (!hit) return s;
+    Stmt *h = new_stmt(S_VAR, s->pos);
+    h->name = (char *)hid;
+    h->decl_type = ty_any; /* (an any: compared by JavaScript's rules with whatever the closure holds next to it) */
+    h->init = new_expr(E_NULL, s->pos);
+    Stmt *set = new_stmt(S_EXPR, s->pos);
+    Expr *a = new_expr(E_ASSIGN, s->pos);
+    a->op = TK_ASSIGN;
+    a->lhs = ident_expr(s->pos, hid);
+    Expr *as = new_expr(E_AS, s->pos);
+    as->lhs = ident_expr(s->pos, s->name);
+    as->elem_type = ty_any;
+    a->rhs = as;
+    set->expr = a;
+    /* (the declaration itself after the hidden one: pending statements follow the one returned) */
+    StmtList rest = p->pending;
+    p->pending = (StmtList){0};
+    stmt_list_push(&p->pending, s);
+    stmt_list_push(&p->pending, set);
+    for (int i = 0; i < rest.len; i++) stmt_list_push(&p->pending, rest.items[i]);
+    return h;
+}
 static bool tok_ident_is(Parser *q, const char *s);
 static void fix_import_names(Parser *p, Module *m, int i0);
 static void ns_register(Parser *p, Module *m, const char *alias);
@@ -2668,6 +2727,7 @@ static Stmt *parse_stmt(Parser *p) {
     case TK_CONST: {
         Stmt *s = parse_var(p);
         expect_semi(p);
+        if (s->kind == S_VAR) s = tdz_split(p, s); /* (closures in the initializer that read the name: see tdz_split) */
         return s;
     }
     case TK_IF: {

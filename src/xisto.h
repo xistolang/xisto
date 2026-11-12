@@ -207,6 +207,7 @@ typedef struct Type {
     bool absent;          /* TY_NULLABLE of an optional field or parameter (x?: T): its null is JavaScript's undefined, so it
                              prints as undefined (JSON leaves the field out); the same type as T | null otherwise */
     struct Type *key;     /* TY_MAP */
+    bool nkey;            /* TY_MAP written Map<number | null, V>: its keys held as SameValueZero texts (get/set/has/delete) */
     bool record;          /* TY_MAP written Record<K, V> (or an object used as a dictionary): read and written as an object
                              (m[k], m.k, Object.keys, k in m; JSON and console.log print it as an object) */
     Class *cls;           /* TY_OBJECT */
@@ -705,7 +706,7 @@ typedef struct {
     bool uses_gen;     /* generators: the coroutine runtime, without worker threads (plain globals, no TLS) */
     bool uses_sqlite;
     bool uses_regex;    /* RegExp: runtime/xisto_regex.h joins the program */
-    bool uses_v8, uses_unk_map, uses_symbol_for; /* xisto:v8, x instanceof Map/Set of an unknown, Symbol.for: their runtime joins the program */
+    bool uses_v8, uses_unk_map, uses_symbol_for, uses_nkey; /* xisto:v8, x instanceof Map/Set of an unknown, Symbol.for: their runtime joins the program */
     bool uses_this_reg; /* XB-107: function (this: T) / method slots: the this register's helpers join the program */
     bool uses_tls;
     bool uses_crypto;  /* node:crypto, or a native package that needs it */
