@@ -1163,6 +1163,7 @@ static void check_type_supported(Pos pos, Type *t);
 static Func *eff_ctor(Class *c);
 static Field *find_field(Class *c, const char *name, int *index);
 static bool ad_partial; /* (see fn_field_of) */
+static bool ad_partial_cls; /* (a class's missing methods too: see iface_runtime) */
 static Class **class_work; /* instances whose bodies the checker checks after the program's own */
 static int nclass_work;
 static Class *instantiate_class(Class *tmpl, Type **args, Pos pos) {
@@ -12507,7 +12508,7 @@ static Type *fn_field_of(Class *src, const char *name) {
 static bool method_fits(Func *cm, Func *im, Class *src, Class *ifc, bool infer, Pos pos, int depth, char **why) {
     const char *iname = ifc->name, *cn = src->name, *mn = im->name;
     Type *ff = cm ? NULL : fn_field_of(src, mn);
-    if (!cm && !ff && ad_partial && (src->is_interface || made_shape(src))) return true; /* (left out: see ad_partial) */
+    if (!cm && !ff && ad_partial && (src->is_interface || made_shape(src) || ad_partial_cls)) return true; /* (left out: see ad_partial) */
     if (ff && !im->ntparams) { /* { m: (x) => ... } where m(x): R goes: a field that holds the function */
         int n = ff->nparams < im->nparams ? ff->nparams : im->nparams;
         if (ff->nparams > im->nparams || ff->rest) {
@@ -12983,6 +12984,21 @@ static bool iface_runtime(Class *ifc, Pos pos) {
         for (int k = 0; k < ifc->nmethods && named; k++)
             if (ifc->methods[k]->is_abstract && !find_method(c, ifc->methods[k]->name)) named = false;
         if (named) iface_adapter(c, ifc, pos, NULL);
+    }
+    /* a provider injected where a structural interface goes (@Inject('X') x?: XLike with { provide: 'X', useExisting:
+       C }), C having only some of its methods: JavaScript takes the object as it is and a missing method throws when
+       called; an adapter whose missing methods throw (the ones C has must fit) */
+    for (int i = 0; i < prog->nclasses; i++) {
+        Class *c = prog->classes[i];
+        if (!c->decos.len || c->builtin || c->is_interface || c->iface_base || c->gen_state || c->adapter_of || is_subclass(c, ifc)) continue;
+        int have = 0, all = 0;
+        for (int k = 0; k < ifc->nmethods; k++)
+            if (ifc->methods[k]->is_abstract) { all++; if (find_method(c, ifc->methods[k]->name)) have++; }
+        if (have == 0 || have == all) continue;
+        bool was = ad_partial, was_cls = ad_partial_cls;
+        ad_partial = true; ad_partial_cls = true;
+        iface_adapter(c, ifc, pos, NULL);
+        ad_partial = was; ad_partial_cls = was_cls;
     }
     return ifc->nadapters > 0;
 }
