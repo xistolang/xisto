@@ -7006,6 +7006,17 @@ static void check_expr_in(Expr *e, Type *expected) {
                     pt = ty_array_of(tuple_type(ps, 2, e->pos));
                 }
                 Type *el = pt->kind == TY_ARRAY ? pt->elem : NULL;
+                if (el && el->kind == TY_ARRAY && el->elem->kind == TY_UNKNOWN) {
+                    /* Object.fromEntries(xs.map((x) => [x, row[x]])): pairs read as unknown[] (a key and a value of any type) */
+                    Expr *callee = xs_alloc(sizeof *callee);
+                    callee->kind = E_IDENT; callee->pos = e->pos; callee->field = -1; callee->str = "__xs_from_pairs";
+                    memset(&e->args, 0, sizeof e->args);
+                    pairs->prechecked = true;
+                    expr_list_push(&e->args, pairs);
+                    e->kind = E_CALL; e->lhs = callee; e->str = NULL; e->is_call = false; e->builtin.cfn = NULL;
+                    check_expr(e, expected);
+                    return;
+                }
                 if (!(el && el->kind == TY_OBJECT && el->cls->is_tuple && el->cls->nfields == 2 && el->cls->fields[0].type->kind == TY_STRING))
                     xs_error(XS8015, e->pos, "Object.fromEntries takes [string, V] pairs: Object.fromEntries(xs.map((x) => [x.k, x.v] as [string, V]))",
                              "Object.fromEntries of %s is not supported", ty_name(pt));

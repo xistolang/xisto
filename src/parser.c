@@ -1585,7 +1585,8 @@ static Expr *parse_postfix(Parser *p) {
             Expr *m = new_expr(E_MEMBER, name.pos);
             m->lhs = e;
             m->str = name.str;
-            if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from")) wants_arrays = true;
+            if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from") ||
+                !strcmp(name.str, "fromEntries")) wants_arrays = true;
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs);
             if (at(p, TK_LPAREN)) {
                 m->is_call = true;
@@ -1620,7 +1621,8 @@ static Expr *parse_postfix(Parser *p) {
             Expr *m = new_expr(E_MEMBER, name.pos);
             m->lhs = e;
             m->str = name.str;
-            if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from")) wants_arrays = true;
+            if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from") ||
+                !strcmp(name.str, "fromEntries")) wants_arrays = true;
             if (!strcmp(name.str, "length") && at(p, TK_ASSIGN)) wants_arrays = true; /* xs.length = 0 */
             if (!strcmp(name.str, "filter") && e->kind == E_MEMBER && e->is_call && e->str && !strcmp(e->str, "map")) wants_arrays = true; /* xs.map(f).filter(p): maybe __xs_mapFilterNum */
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs); /* obj.m<T>(x) */
@@ -4833,6 +4835,15 @@ static Func *builtin_func(Module *m, const char *name, const char *cfn, Type *re
 /* xisto:arrays: array methods written in xisto (reduce, flatMap, flat): the checker turns xs.reduce(f, a) into
    __xs_reduce(xs, f, a), the same loop JavaScript runs */
 static const char xs_arrays_src[] =
+    "// Object.fromEntries of pairs held as unknown[] ([k, v] where v is of any type): a Record of them (the compiler calls this)\n"
+    "export function __xs_from_pairs(pairs: unknown[][]): Record<string, unknown> {\n"
+    "  const out: Record<string, unknown> = {};\n"
+    "  for (const p of pairs) {\n"
+    "    const k: any = p.length > 0 ? p[0] : null;\n"
+    "    out[String(k)] = p.length > 1 ? p[1] : null;\n"
+    "  }\n"
+    "  return out;\n"
+    "}\n"
     "export function __xs_reduce<A, T>(xs: T[], f: (acc: A, x: T, i: int) => A, init: A): A {\n"
     "  let acc: A = init;\n"
     "  for (let i = 0; i < xs.length; i++) acc = f(acc, xs[i], i);\n"
