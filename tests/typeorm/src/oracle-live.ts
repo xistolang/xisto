@@ -54,7 +54,18 @@ async function main(): Promise<void> {
   const cred = rest.slice(0, at);
   const where = rest.slice(at + 1);
   const colon = cred.indexOf(":");
-  const ds = new DataSource({ type: "oracle", username: cred.slice(0, colon), password: cred.slice(colon + 1), connectString: where });
+  let sessions = 0;
+  const ds = new DataSource({
+    type: "oracle", username: cred.slice(0, colon), password: cred.slice(colon + 1), connectString: where,
+    // node-oracledb's sessionCallback, passed on by TypeORM: once per new physical connection
+    extra: {
+      sessionCallback: (connection: { callTimeout: number }, _requestedTag: string, cb: (err?: Error) => void) => {
+        sessions++;
+        connection.callTimeout = 0;
+        cb();
+      },
+    },
+  });
   await ds.initialize();
   try {
     await ds.query("DROP VIEW XISTO_TO_ATIVOS", []);
@@ -180,6 +191,7 @@ async function main(): Promise<void> {
   await qr2.release();
   await ds.query("DROP VIEW XISTO_TO_ATIVOS", []);
   await ds.query("DROP TABLE XISTO_TO_ITEM", []);
+  console.log("session callbacks ran: " + String(sessions > 0));
   await ds.destroy();
 }
 main();
