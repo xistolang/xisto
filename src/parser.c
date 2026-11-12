@@ -4490,6 +4490,25 @@ static void alias_collisions(Parser *p, Module *m, int first, Import *im) {
         }
     }
 }
+/* a package the program's packages have (XISTO_PKGS, or a .xisto/pkgs above the file), without loading it */
+static bool pkg_available(const char *from_file, const char *name) {
+    char probe[PATH_MAX];
+    const char *extra = getenv("XISTO_PKGS");
+    if (extra && *extra) {
+        snprintf(probe, sizeof probe, "%s/%s", extra, name);
+        if (access(probe, R_OK) == 0) return true;
+    }
+    if (!from_file) return false;
+    char dir[PATH_MAX];
+    strncpy(dir, from_file, sizeof dir - 1);
+    dir[sizeof dir - 1] = 0;
+    for (char *slash; (slash = strrchr(dir, '/')); ) {
+        *slash = 0;
+        snprintf(probe, sizeof probe, "%s/.xisto/pkgs/%s", dir, name);
+        if (access(probe, R_OK) == 0) return true;
+    }
+    return false;
+}
 static void parse_import(Parser *p, Module *m) {
     Pos pos = p->tok.pos;
     expect(p, TK_IMPORT, NULL);
@@ -4513,9 +4532,16 @@ static void parse_import(Parser *p, Module *m) {
         im.n = 1;
         goto from;
     }
-    if (at(p, TK_STRING)) { /* import "reflect-metadata": for its effects on Node; xisto loads nothing for it */
+    if (at(p, TK_STRING)) { /* import "x": for its effects on Node; xisto loads nothing for it, but "reflect-metadata", whose
+                               package gives the global Reflect (when the program's packages have it) */
+        const char *spec = p->tok.str;
         next(p);
         expect_semi(p);
+        if (!strcmp(spec, "reflect-metadata") && pkg_available(m->path, spec)) {
+            im.path = spec;
+            m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+            m->imports[m->nimports++] = im;
+        }
         return;
     }
     if (at(p, TK_STAR)) { /* import * as ns from "m" */
@@ -4836,10 +4862,12 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
             buf_printf(g, "const __deco%d = %s;\n", n, f->decos.items[d].src);
             buf_printf(g, "if (__xs_ts_deco(__deco%d, \"%s\", \"%s\")) {\n"
                           "  const __dd%d = new PropertyDescriptor(__xs_slot_%s_%s);\n"
+                          "  __xs_desc_enter(%s, \"%s\", __dd%d);\n"
                           "  __xs_ts_apply(__deco%d(%s, \"%s\", __dd%d), __dd%d);\n"
+                          "  __xs_desc_leave();\n"
                           "  __xs_slot_%s_%s = __dd%d.value;\n"
                           "} else {\n  __deco%d(%s, %s.methods[%d]);\n}\n",
-                       n, c->name, f->name, n, c->name, f->name, n, ci_name, f->name, n, n, c->name, f->name, n, n, ci_name, ci_name, rk);
+                       n, c->name, f->name, n, c->name, f->name, ci_name, f->name, n, n, ci_name, f->name, n, n, c->name, f->name, n, n, ci_name, ci_name, rk);
         }
         rk++;
     }
@@ -5865,6 +5893,36 @@ static const char xs_reflect_src[] =
     "  __xs_this_set(self);\n"
     "  return f(...args);\n"
     "}\n"
+    "// the metadata reflect-metadata's Reflect keeps, by target (===) and property: here, so that a framework (Nest's\n"
+    "// SetMetadata) writes it where Reflect.getMetadata reads it, as both share Node's Reflect\n"
+    "class __XsMeta {\n  target: unknown;\n  prop: unknown;\n  key: unknown;\n  value: unknown;\n"
+    "  constructor(target: unknown, prop: unknown, key: unknown, value: unknown) {\n"
+    "    this.target = target;\n    this.prop = prop;\n    this.key = key;\n    this.value = value;\n  }\n}\n"
+    "const __xs_metas: __XsMeta[] = [];\n"
+    "// the descriptor of the TypeScript-style method decorator running now (its class and method), null outside one\n"
+    "let __xs_desc_c: ClassInfo | null = null;\nlet __xs_desc_m: string = \"\";\nlet __xs_desc_d: PropertyDescriptor | null = null;\n"
+    "export function __xs_desc_enter(c: ClassInfo, m: string, d: PropertyDescriptor): void {\n"
+    "  __xs_desc_c = c;\n  __xs_desc_m = m;\n  __xs_desc_d = d;\n}\n"
+    "export function __xs_desc_leave(): void {\n  __xs_desc_c = null;\n  __xs_desc_d = null;\n}\n"
+    "export function __xs_desc_current(c: ClassInfo, m: string): PropertyDescriptor | null {\n"
+    "  const cc = __xs_desc_c;\n"
+    "  return cc !== null && cc.id === c.id && __xs_desc_m === m ? __xs_desc_d : null;\n}\n"
+    "export function __xs_meta_find(key: unknown, target: unknown, prop: unknown): int {\n"
+    "  for (let i = 0; i < __xs_metas.length; i++) {\n"
+    "    const e = __xs_metas[i];\n"
+    "    if (e.target === target && e.prop === prop && e.key === key) return i;\n"
+    "  }\n  return -1;\n}\n"
+    "export function __xs_meta_define(key: unknown, value: unknown, target: unknown, prop: unknown): void {\n"
+    "  const i = __xs_meta_find(key, target, prop);\n"
+    "  if (i >= 0) { __xs_metas[i].value = value; return; }\n"
+    "  __xs_metas.push(new __XsMeta(target, prop, key, value));\n}\n"
+    "export function __xs_meta_get(key: unknown, target: unknown, prop: unknown): unknown {\n"
+    "  const i = __xs_meta_find(key, target, prop);\n  return i >= 0 ? __xs_metas[i].value : null;\n}\n"
+    "export function __xs_meta_keys(target: unknown, prop: unknown): unknown[] {\n"
+    "  const keys: unknown[] = [];\n"
+    "  for (const e of __xs_metas) if (e.target === target && e.prop === prop) keys.push(e.key);\n  return keys;\n}\n"
+    "export function __xs_meta_delete(key: unknown, target: unknown, prop: unknown): boolean {\n"
+    "  const i = __xs_meta_find(key, target, prop);\n  if (i < 0) return false;\n  __xs_metas.splice(i, 1);\n  return true;\n}\n"
     "// TypeScript's decorator types, as xisto's decorators are (global names, like Error)\n"
     "export type ClassDecorator = (c: ClassInfo, m: MethodInfo | null) => void;\n"
     "export type MethodDecorator = (c: ClassInfo, m: MethodInfo | null) => void;\n"

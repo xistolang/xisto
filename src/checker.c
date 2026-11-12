@@ -2442,9 +2442,11 @@ static Func *lookup_func(const char *name) {
         if (f->mod == cur_mod || (f->exported && imports_name(cur_mod, f->mod, name))) return f;
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:arrays") == 0) return f; /* (reduce & co) */
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:settled") == 0) return f; /* (Promise.allSettled) */
-        if ((!strcmp(name, "__xs_construct") || !strcmp(name, "__xs_ci_params") || !strcmp(name, "__xs_apply") || !strcmp(name, "__xs_use_desc")) &&
+        if ((!strcmp(name, "__xs_construct") || !strcmp(name, "__xs_ci_params") || !strcmp(name, "__xs_apply") || !strcmp(name, "__xs_use_desc") || !strcmp(name, "__xs_desc_enter") || !strcmp(name, "__xs_desc_leave")) &&
             f->mod && f->mod->file && !strcmp(f->mod->file, "xisto:reflect")) return f; /* (new (c)(); XB-107's f.apply and descriptors) */
         if (f->exported && (strstr(name, "__s_") || !strcmp(name, "__xs_fetch")) && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:url") == 0) return f; /* (URL.canParse, AbortSignal.timeout: statics of globals; fetch with its options in a value) */
+        if (!strncmp(name, "Reflect__s_", 11) && f->exported && f->mod && f->mod->file && strstr(f->mod->file, "/reflect-metadata/"))
+            return f; /* (Reflect.defineMetadata & co: statics of the global Reflect, see find_class) */
         const char *st = strstr(name, "__s_"); /* a static method: visible where its class is imported */
         if (st && f->exported) {
             char *cls = xs_strndup(name, (size_t)(st - name));
@@ -2605,6 +2607,15 @@ static void arr_convert(Expr *e, Type *to);
 static bool tsc_checked(void);
 static bool shape_ok(Type *g, Type *want);
 static bool json_ok_unknown; /* JSON.stringify: an unknown is written by its type at run time */
+/* the one object member of a union of it and primitives (A | number), NULL when there are none or more */
+Type *union_json_obj(Type *t) {
+    Type *o = NULL;
+    for (int i = 0; i < t->nparams; i++) {
+        Type *m = t->params[i];
+        if (m->kind == TY_OBJECT && !m->cls->builtin) { if (o) return NULL; o = m; }
+    }
+    return o;
+}
 static bool json_ok(Type *t, int depth) {
     if (depth > 24) return false; /* (a type that holds itself: no JSON) */
     switch (t->kind) {
@@ -2614,6 +2625,8 @@ static bool json_ok(Type *t, int depth) {
             TypeKind k = t->params[i]->kind;
             if (k == TY_OBJECT && t->params[i]->cls->builtin && !strcmp(t->params[i]->cls->name, "Date")) continue; /* Date | string (a
                 row's date column, read from JSON as the text it is: what the value holds says which) */
+            if (k == TY_OBJECT && !t->params[i]->cls->builtin && union_json_obj(t) == t->params[i] && json_ok(t->params[i], depth + 1))
+                continue; /* total?: SearchTotalHits | number: a JSON object read as the one object member, the rest by kind */
             if (k != TY_NUMBER && k != TY_INT && k != TY_STRING && k != TY_BOOLEAN) return false;
         }
         return true;
@@ -3994,6 +4007,29 @@ static bool shape_copy(Expr *e, Type *want) {
         if (!made_shape(src) && !src->is_interface && src->nmethods == 0 && !src->nfields) return false;
         for (int i = 0; i < dst->nfields; i++)
             if (!find_field(src, dst->fields[i].name, NULL) && !dst->fields[i].optional) return false;
+        /* a field that does not convert as it is (total: SearchTotalHits | number where { value } | number goes, a
+           Record<string, any> where an object of data goes): the whole value through its JSON, decoded in that shape
+           (a copy, as the field by field one is), when both are data JSON can carry */
+        bool fields_ok = true;
+        for (int i = 0; i < dst->nfields && fields_ok; i++) {
+            Field *sf = find_field(src, dst->fields[i].name, NULL);
+            if (sf && !conv_ok(sf->type, dst->fields[i].type, 0)) fields_ok = false;
+        }
+        bool ju = json_ok_unknown;
+        json_ok_unknown = true;
+        bool via_json = !fields_ok && json_ok(g, 0) && json_ok(want, 0);
+        json_ok_unknown = ju;
+        if (via_json) {
+            Expr *in = xs_alloc(sizeof *in);
+            *in = *e;
+            in->prechecked = true;
+            Expr *js = xs_alloc(sizeof *js);
+            js->kind = E_AS; js->pos = e->pos; js->field = -1; js->lhs = in; js->elem_type = ty_json;
+            memset(e, 0, sizeof *e); /* (a null is written as null and read back as null in T | null) */
+            e->kind = E_AS; e->pos = js->pos; e->field = -1; e->lhs = js; e->elem_type = nul ? ty_nullable_of(want) : want;
+            check_expr(e, NULL);
+            return true;
+        }
     }
     Class *dst = to_rec ? src : want->cls; /* a Record gets every field of the value */
     /* an open class (Express's headers): into a Record what its __expando holds (it keeps every property, the
@@ -8179,6 +8215,18 @@ static void check_expr_in(Expr *e, Type *expected) {
             }
             if (ft->kind != TY_FUNC) xs_error(XS6030, e->pos, NULL, "only named functions can be called");
             pack_rest(e, ft);
+            if (e->args.len > ft->nparams && !ft->rest && tsc_checked()) {
+                /* SetMetadata(k, v)(target, key, descriptor) where the function takes (target, key): JavaScript passes the
+                   extra arguments and the function does not read them; names and literals (nothing to run), left out */
+                bool plain = true;
+                for (int i = ft->nparams; i < e->args.len && plain; i++) plain = pure_copy(e->args.items[i]) != NULL;
+                if (plain) e->args.len = ft->nparams;
+            }
+            while (e->args.len < ft->nparams && ft->params[e->args.len]->kind == TY_NULLABLE) { /* (an optional one left out: null) */
+                Expr *nul = xs_alloc(sizeof *nul);
+                nul->kind = E_NULL; nul->pos = e->pos; nul->field = -1;
+                expr_list_push(&e->args, nul);
+            }
             if (e->args.len != ft->nparams) xs_error(XS8062, e->pos, NULL, "'%s' takes %d argument(s), got %d", "the function", ft->nparams, e->args.len);
             for (int i = 0; i < e->args.len; i++) {
                 check_expr(e->args.items[i], ft->params[i]);
@@ -10658,7 +10706,22 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         bool lit_as = e->lhs->kind == E_OBJLIT && tsc_checked();
         if (lit_as) objlit_as_cast++; /* ({ ... } as Dto): TypeScript lets the cast leave fields out */
-        check_expr(e->lhs, want);
+        bool via_unknown = e->lhs->kind == E_AS && e->lhs->op != TK_NOT && e->lhs->elem_type && e->lhs->elem_type->kind == TY_UNKNOWN &&
+                           !ty_is_any(e->lhs->elem_type) && e->lhs->lhs && e->lhs->lhs->kind != E_OBJLIT;
+        if (via_unknown && tsc_checked()) {
+            /* driver as unknown as { oracle: X } with driver an object of a class: TypeScript's cast checks nothing, and
+               JavaScript reads the fields from the object by name; as `as any as`, the view read by name */
+            Type *wb = ty_strip_null(want);
+            Expr *x = e->lhs->lhs;
+            check_expr(x, NULL); /* (checked once here: its type decides) */
+            x->prechecked = true;
+            Type *st = x->type ? ty_strip_null(x->type) : NULL;
+            if (st && st->kind == TY_OBJECT && !st->cls->builtin && !st->cls->is_interface && !made_shape(st->cls) &&
+                wb->kind == TY_OBJECT && (wb->cls->is_interface || made_shape(wb->cls)) && wb->cls->nfields > 0 &&
+                !wb->cls->nmethods && !wb->cls->iface_methods && !is_subclass(st->cls, wb->cls))
+                e->lhs->elem_type = ty_any;
+        }
+        check_expr(e->lhs, via_unknown ? NULL : want); /* (x as unknown as I: the unknown first, then I from it, as with a variable) */
         if (lit_as) objlit_as_cast--;
         Expr *v = e->lhs;
         if (v->type->kind == TY_LITINT && is_numeric(want)) coerce_lit(v, want);
@@ -10766,6 +10829,11 @@ static void check_expr_in(Expr *e, Type *expected) {
             bool ok = json_ok(v->type, 0);
             json_ok_unknown = ju;
             if (ok) { *e = *v; to_json(e); return; }
+            if (v->type->kind == TY_FUNC) { /* descriptor.value as object (a target of Reflect.getMetadata): the function itself, as an unknown (JSON has no functions) */
+                *e = *v;
+                to_unknown(e);
+                return;
+            }
         }
         if (want->kind == TY_NULLABLE && want->elem->kind == TY_JSON && v->type->kind != TY_NULL && v->type->kind != TY_NULLABLE && json_ok(v->type, 0)) { *e = *v; to_json(e); return; }
         if (want->kind == TY_NULLABLE && ty_equal(v->type, want->elem)) { *e = *v; e->type = want; return; }
@@ -15251,6 +15319,14 @@ static int returned_arity(Func *f) {
     }
     return -1;
 }
+/* a decorator's second parameter that takes a MethodInfo (xisto's (c, m, descriptor?) form: a framework's decorator that
+   may also be called as TypeScript's, see @nestjs/common's SetMetadata) */
+static bool takes_method_info(Type *t) {
+    if (!t) return false;
+    if (t->kind == TY_NULLABLE) return takes_method_info(t->elem);
+    if (t->kind == TY_UNION) { for (int i = 0; i < t->nparams; i++) if (takes_method_info(t->params[i])) return true; return false; }
+    return t->kind == TY_OBJECT && t->cls && t->cls->name && !strcmp(t->cls->name, "MethodInfo");
+}
 static bool deco_is_ts(Expr *src) {
     Type *t = NULL;
     if (src->kind == E_CALL && src->lhs && src->lhs->kind == E_IDENT) {
@@ -15271,7 +15347,7 @@ static bool deco_is_ts(Expr *src) {
         if (b && b->type) t = b->type;
     }
     t = t ? ty_strip_null(t) : NULL;
-    return t && t->kind == TY_FUNC && t->nparams == 3;
+    return t && t->kind == TY_FUNC && t->nparams == 3 && !takes_method_info(t->params[1]);
 }
 static const char *param_text(Param *pr) {
     bool opt = pr->dflt && pr->dflt->kind == E_NULL;

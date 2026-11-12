@@ -5,6 +5,7 @@ import { LoggerModule, Params } from "nestjs-pino";
 import formsConfig from "./forms.config";
 import { FormsController, LocalController } from "./forms.controller";
 import { FormsService } from "./forms.service";
+import { TriggerInterceptor, TriggersController } from "./triggers.controller";
 
 // pino's own lines, or ECS lines (LOG_FORMAT=ecs) with the context as log.logger
 function loggerParams(): Params {
@@ -16,7 +17,7 @@ function loggerParams(): Params {
 
 @Module({
   imports: [ConfigModule.forFeature(formsConfig), LoggerModule.forRoot(loggerParams())],
-  controllers: [FormsController, LocalController],
-  providers: [FormsService],
+  controllers: [FormsController, LocalController, TriggersController],
+  providers: [FormsService, TriggerInterceptor],
 })
 export class AppModule {}
