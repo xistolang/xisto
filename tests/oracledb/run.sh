@@ -40,6 +40,12 @@ for tz in America/Sao_Paulo; do
     if ! cmp -s expected-outbinds.txt "$OUT/outbinds.txt"; then echo "FAIL: OUT binds ($tz)"; diff expected-outbinds.txt "$OUT/outbinds.txt"; exit 1; fi
     if ! grep -q ' 0 still alive' "$OUT/outbinds-stats.txt"; then echo "FAIL: leak (OUT binds): $(cat "$OUT/outbinds-stats.txt")"; exit 1; fi
 done
+cp named.ts "$OUT/named.ts"
+XISTO_NODE_COMPAT=1 $X build --no-warnings -o "$OUT/named" "$OUT/named.ts" || exit 1
+if ! "$OUT/named" > "$OUT/named.txt" 2>&1 || ! cmp -s expected-named.txt "$OUT/named.txt"; then
+    echo "FAIL: execute with binds by name (object)"; diff expected-named.txt "$OUT/named.txt"; exit 1
+fi
+echo "ok: execute takes binds by name as an object, like node-oracledb"
 cp pool-txn.ts "$OUT/pool-txn.ts"
 XISTO_NODE_COMPAT=1 $X build --no-warnings -o "$OUT/pool-txn" "$OUT/pool-txn.ts" || exit 1
 if ! "$OUT/pool-txn" > "$OUT/pool-txn.txt" 2>&1 || ! cmp -s expected-pool-txn.txt "$OUT/pool-txn.txt"; then
