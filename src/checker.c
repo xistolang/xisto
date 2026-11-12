@@ -2033,7 +2033,7 @@ static void check_type_supported(Pos pos, Type *t) {
     if (t->kind == TY_ARRAY && (t->elem->kind == TY_VOID || (t->elem->kind == TY_NULLABLE && !ty_is_heap(t->elem) && !nullnum_elem(t->elem))))
         xs_error(XS6039, pos, "arrays hold number, int, boolean, string, enums, objects, functions, arrays, Map and Set, and (T | null) of strings, objects and arrays; not nullable numbers",
                  "unsupported array type '%s'", ty_name(t));
-    if (t->kind == TY_SET && t->elem->kind != TY_STRING && t->elem->kind != TY_INT)
+    if (t->kind == TY_SET && t->elem->kind != TY_STRING && t->elem->kind != TY_INT && !(t->elem->kind == TY_UNKNOWN && !ty_is_any(t->elem)))
         xs_error(XS6037, pos, "Set elements are string or int in xisto", "unsupported Set element type '%s'", ty_name(t));
     if (t->kind == TY_CHAN && (t->elem->kind == TY_VOID || t->elem->kind == TY_FUNC))
         xs_error(XS6040, pos, NULL, "unsupported channel element type '%s'", ty_name(t->elem));
