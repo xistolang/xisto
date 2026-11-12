@@ -9826,6 +9826,13 @@ static const char xs_nkey_c[] =
     "    int n = snprintf(b, sizeof b, \"n%.17g\", d);\n"
     "    return xs_str_new(b, (size_t)n);\n"
     "}\n";
+/* xisto:okmap's key: the object's identity as text (the map keeps the object: its address is not reused meanwhile) */
+static const char xs_okey_c[] =
+    "static xs_str *xs_okey_text(void *k) {\n"
+    "    char b[40];\n"
+    "    int n = k ? snprintf(b, sizeof b, \"p%p\", k) : snprintf(b, sizeof b, \"z\");\n"
+    "    return xs_str_new(b, (size_t)n);\n"
+    "}\n";
 void emit_program(Program *p, Buf *o) {
     out = o;
     prog = p;
@@ -9834,6 +9841,7 @@ void emit_program(Program *p, Buf *o) {
     if (p->uses_unk_map) buf_puts(out, xs_unk_map_c);
     if (p->uses_symbol_for) buf_puts(out, xs_symbol_for_c);
     if (p->uses_nkey) buf_puts(out, xs_nkey_c);
+    if (p->uses_okmap) buf_puts(out, xs_okey_c);
     indent = 0;
     site_tab.len = 0;
     if (site_tab.data) site_tab.data[0] = 0;
