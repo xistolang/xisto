@@ -1746,15 +1746,25 @@ static void xs_print_any_quoted(void *p);
 /* console.log(err): its first line; a cause as Node prints it below the stack ("{\n  [cause]: ...\n}") */
 static void xs_Error_print(void *p) {
     xs_Error *e = p;
-    fputs("Error: ", XS_OUT); xs_print_str(e->f_message);
+    xs_print_str(e->f_name); fputs(": ", XS_OUT); xs_print_str(e->f_message);
     if (e->f_cause) { fputs(" {\n  [cause]: ", XS_OUT); xs_print_any_quoted(e->f_cause); fputs("\n}", XS_OUT); }
 }
 __attribute__((noinline)) static void *xs_Error_new(void *msg) {
     xs_Error *e = xs_obj_alloc(sizeof *e, xs_Error_free, xs_Error_print);
+    const char *nm = "Error";
+    size_t nml = 5;
     if (msg) e->f_message = xs_retain((xs_str *)msg);
-    else if (xs_panic_pending) e->f_message = xs_str_new(xs_panic_msg_pending, strlen(xs_panic_msg_pending));
+    else if (xs_panic_pending) { /* "URIError: URI malformed" from the runtime: an Error of that name with that message, as JavaScript's */
+        const char *m = xs_panic_msg_pending;
+        static const char *const names[] = {"TypeError", "RangeError", "URIError", "SyntaxError", "ReferenceError", "EvalError"};
+        for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
+            size_t n = strlen(names[i]);
+            if (strncmp(m, names[i], n) == 0 && m[n] == ':' && m[n + 1] == ' ') { nm = names[i]; nml = n; m += n + 2; break; }
+        }
+        e->f_message = xs_str_new(m, strlen(m));
+    }
     else e->f_message = xs_str_new("", 0);
-    e->f_name = xs_str_new("Error", 5);
+    e->f_name = xs_str_new(nm, nml);
     /* like V8, the stack is captured where the Error is created; it is turned into text only if read */
     xs_trace t, *src = &t;
     if (xs_panic_pending) { src = &xs_panic_trace; xs_panic_pending = false; }
@@ -3087,6 +3097,10 @@ XS_NOINLINE bool xs_dyn_has(void *o, xs_str *k) {
         return has;
     }
     if (t->free == xs_map_free) return ((xs_map *)o)->str_keys && xs_map_lookup(o, k, 0) != NULL;
+    if (t->free == xs_Error_free) { /* 'cause' in err: an Error has message and stack; cause when it was given */
+        if (k->len == 5 && memcmp(k->data, "cause", 5) == 0) return ((xs_Error *)o)->f_cause != NULL;
+        return (k->len == 7 && memcmp(k->data, "message", 7) == 0) || (k->len == 5 && memcmp(k->data, "stack", 5) == 0);
+    }
     return false;
 }
 /* 'k' in u, u a union of objects (held as an unknown): the member it holds has k */

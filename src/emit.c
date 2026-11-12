@@ -1072,6 +1072,13 @@ static const char *dispatcher(Func *m) {
         Class *k = prog->classes[i];
         if (!k->used || k->builtin || k->is_abstract || !is_sub(k, m->cls)) continue;
         Func *impl = emit_find_method(k, m->name);
+        /* (a method of the same name with other parameters, or one overriding such a method, is not m's: the nearest that is) */
+        for (Class *u = k->base; impl && impl != m && u; u = u->base) {
+            bool mine = false;
+            for (int j = 0; j < m->noverrides && !mine; j++) mine = m->overrides[j] == impl;
+            if (mine) break;
+            impl = emit_find_method(u, m->name);
+        }
         if (!impl || impl == m || impl->is_abstract || !impl->used) continue;
         if (is_void) buf_printf(out, "    if (f_ == %s_free) { %s((%s *)self%s); return; }\n", k->cname, impl->cname, impl->cls->cname, args.data ? args.data : "");
         else buf_printf(out, "    if (f_ == %s_free) return %s((%s *)self%s);\n", k->cname, impl->cname, impl->cls->cname, args.data ? args.data : "");
@@ -8679,9 +8686,15 @@ static void emit_own_field_inits(Class *c) {
         if (i < c->nbase_fields && fd->owner != c) continue; /* (an interface's field the class gives a value: its own) */
         used_ar = false;
         nl();
-        buf_printf(out, "self->%s = ", fd->cname);
-        emit_owned(fd->init);
-        buf_puts(out, ";");
+        if (i < c->nbase_fields && cref(fd->type) && c->base && !c->base->iface_base) { /* (a field the base's constructor set: replaced) */
+            buf_printf(out, "xs_assign(self->%s, ", fd->cname);
+            emit_owned(fd->init);
+            buf_puts(out, ");");
+        } else {
+            buf_printf(out, "self->%s = ", fd->cname);
+            emit_owned(fd->init);
+            buf_puts(out, ";");
+        }
         drain_if_needed();
     }
 }

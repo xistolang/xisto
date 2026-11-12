@@ -183,7 +183,11 @@ static TsConfig *config_for(const char *from_file) {
         if (!slash) return NULL;
         *slash = 0;
         char *probe = xs_sprintf("%s/tsconfig.json", dir[0] ? dir : "");
-        if (access(probe, R_OK) != 0) continue;
+        if (access(probe, R_OK) != 0) { /* an Nx project: tsconfig.app.json (or .lib.json) is the project's own */
+            probe = xs_sprintf("%s/tsconfig.app.json", dir[0] ? dir : "");
+            if (access(probe, R_OK) != 0) probe = xs_sprintf("%s/tsconfig.lib.json", dir[0] ? dir : "");
+            if (access(probe, R_OK) != 0) continue;
+        }
         for (int i = 0; i < nconfigs; i++) if (strcmp(configs[i].file, probe) == 0) return &configs[i];
         configs = realloc(configs, sizeof(TsConfig) * (size_t)(nconfigs + 1));
         TsConfig *c = &configs[nconfigs++];
