@@ -69,4 +69,3 @@ export class FleetEvent {
   em: Date;
 }
 export const FleetEventSchema = SchemaFactory.createForClass(FleetEvent);
-
