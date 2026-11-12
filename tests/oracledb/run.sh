@@ -1,6 +1,7 @@
 #!/bin/sh
 # packages/oracledb against a live Oracle Database: XISTO_ORACLE_URL=oracle://user:password@host:port/service
 # (docker: gvenzl/oracle-free on 127.0.0.1:1521, service FREEPDB1). The test creates and drops table XISTO_ITEMS.
+# session.ts: sessionCallback (expected-session.txt from the same file on node-oracledb 6 thin).
 # outbinds.ts: PL/SQL OUT and IN OUT binds (expected-outbinds.txt from tests/oracledb/outbinds.js on node-oracledb 6.10 thin).
 # Without the variable the test is skipped, not failed. expected.txt is what node-oracledb 6 thin prints for the
 # same operations; the client runs in America/Sao_Paulo since DATE and TIMESTAMP are read in the local time zone.
@@ -52,4 +53,11 @@ if ! "$OUT/pool-txn" > "$OUT/pool-txn.txt" 2>&1 || ! cmp -s expected-pool-txn.tx
     echo "FAIL: pool release and open transactions"; diff expected-pool-txn.txt "$OUT/pool-txn.txt"; exit 1
 fi
 echo "ok: pool release rolls back only an open transaction (nothing uncommitted reaches the next borrower)"
+cp session.ts "$OUT/session.ts"
+XISTO_NODE_COMPAT=1 $X build --no-warnings -o "$OUT/session" "$OUT/session.ts" || exit 1
+if ! XISTO_RC_STATS=1 "$OUT/session" > "$OUT/session.txt" 2> "$OUT/session-stats.txt" || ! cmp -s expected-session.txt "$OUT/session.txt"; then
+    echo "FAIL: pool sessionCallback"; diff expected-session.txt "$OUT/session.txt"; exit 1
+fi
+if ! grep -q ' 0 still alive' "$OUT/session-stats.txt"; then echo "FAIL: leak (sessionCallback): $(cat "$OUT/session-stats.txt")"; exit 1; fi
+echo "ok: pool sessionCallback once per physical connection, its callTimeout kept, its error fails getConnection"
 echo "ok: oracledb client (fast and classic login, types, DML, binds, transactions, ORA errors, 250 rows, CLOB/BLOB, 1500 statements, pool, 0 alive; OUT/IN OUT binds by name and position, NUMBER/STRING/DATE/BOOLEAN/CLOB/BLOB, NULL, 32767 bytes, CLOB/BLOB temporary LOBs)"

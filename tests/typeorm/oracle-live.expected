@@ -25,3 +25,4 @@ outBinds [42]
 structured update affected 1 records []
 structured plsql records ["pl 5"]
 raw connection olá typeorm
+session callbacks ran: true

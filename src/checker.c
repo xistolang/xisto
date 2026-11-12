@@ -4405,6 +4405,7 @@ static void expect_type(Expr *e, Type *want, const char *what) {
    ... }) gives a value that is an OracleRuleRef. Here each is its own struct: the value is copied into the interface,
    field by field, through ((s) => ({ a: s.a, ... }))(value). */
 static bool inline_cls(Type *t);
+static Type *inline_same(Type *a, Type *b);
 static bool conv_ok(Type *from, Type *to, int depth);
 static bool made_shape(Class *c) {
     return c && c->name && (strncmp(c->name, "__Obj_", 6) == 0 || strncmp(c->name, "{ ", 2) == 0) && c->nmethods == 0;
@@ -7211,6 +7212,16 @@ static Binding *proto_binding(Expr *x);
    save(entities: T[]): Promise<T[]> written as a second method (a package's way to declare the array form); the
    call is renamed when its first argument is an array (checked here, once) */
 static Func *find_method(Class *c, const char *name);
+/* if (!tracer?.trace) with tracer = require("dd-trace") (a namespace): a function the module declares is always there, so
+   the test is true; a generic one (trace<T>) has no value to test otherwise */
+static void fn_truthy(Expr *x) {
+    if (!x || x->kind != E_IDENT || !x->str || lookup(x->str)) return;
+    Func *f = lookup_func(x->str);
+    if (!f) return;
+    Pos at = x->pos; /* (the function is not used by this: a generic one is never instantiated for it) */
+    memset(x, 0, sizeof *x);
+    x->kind = E_BOOL; x->boolean = true; x->field = -1; x->pos = at;
+}
 static bool array_overload(Expr *e) {
     static const char **names;
     static int nnames = -1;
@@ -7926,6 +7937,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->type = ty_int;
             return;
         }
+        if (e->op == TK_NOT) fn_truthy(e->lhs);
         check_expr(e->lhs, expected);
         if (e->op == TK_NOT) {
             if (e->lhs->type->kind != TY_BOOLEAN && cond_truthy_type(e->lhs->type)) make_truthy(e->lhs, "operand of '!'");
@@ -8058,6 +8070,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->type = ty_int;
             return;
         }
+        if (e->op == TK_AND || e->op == TK_OR) fn_truthy(e->lhs);
         check_expr(e->lhs, NULL);
         if (e->op == TK_AND) {
             bool sv;
@@ -12056,6 +12069,24 @@ static void check_expr_in(Expr *e, Type *expected) {
             for (int i = 0; i < u->nparams; i++) if (u->params[i]->kind == TY_FUNC) { want = u->params[i]; nf++; }
             if (nf != 1) want = NULL;
         }
+        for (int k = 0; want && k < f->nparams && k < want->nparams; k++) {
+            /* (c: { callTimeout: number }) => ... where (c: SessionConnection) => ... goes, the interface having just those
+               fields: one type in TypeScript, so the parameter is the caller's object itself (a copy would lose what
+               the arrow writes into it) */
+            if (!f->params[k].type || !want->params[k]) continue;
+            Type *a = resolve(f->params[k].type, e->pos), *b = want->params[k];
+            Type *x = ty_strip_null(a), *y = ty_strip_null(b);
+            if ((a->kind == TY_NULLABLE) != (b->kind == TY_NULLABLE) || !inline_cls(x) || y->kind != TY_OBJECT || x->cls == y->cls) continue;
+            Class *yc = y->cls;
+            if (!(yc->is_interface || inline_cls(y)) || yc->nmethods || yc->iface_methods || yc->tparams || yc->base_name || x->cls->nfields != yc->nfields) continue;
+            bool same = true;
+            for (int i = 0; same && i < x->cls->nfields; i++) {
+                Field *fx = &x->cls->fields[i];
+                Field *g = find_field(yc, fx->name, NULL);
+                same = g && fx->type && g->type && fx->optional == g->optional && (ty_equal(fx->type, g->type) || inline_same(fx->type, g->type) == g->type);
+            }
+            if (same) f->params[k].type = b;
+        }
         if (want && want->rest && want->nparams == 1 && f->nparams >= 1 && !f->params[f->nparams - 1].rest &&
             !f->param_decls.len && f->body && f->body->kind == S_BLOCK) {
             /* (a: A, b: B) => ... where (...args: T[]) => R is expected (Nest's useFactory with inject, a variadic
@@ -13625,6 +13656,7 @@ static void make_truthy(Expr *e, const char *what) {
     e->rhs = str_truthy_call(v2);
 }
 static void check_cond(Expr *c, const char *what) {
+    fn_truthy(c);
     check_expr(c, NULL);
     if (c->type->kind != TY_BOOLEAN && cond_truthy_type(c->type)) make_truthy(c, what);
     if (c->type->kind != TY_BOOLEAN)

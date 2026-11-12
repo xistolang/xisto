@@ -85,6 +85,19 @@ export interface PoolAttributes extends ConnectionAttributes {
   poolMin?: int;
   /** Accepted for compatibility: connections open one at a time. */
   poolIncrement?: int;
+  /**
+   * Runs once on each new physical connection, before its first use: what it sets on the connection
+   * (callTimeout) stays for every later checkout of it. callback() when done, callback(err) to fail getConnection.
+   * Compatibility: the connection it receives has callTimeout (node-oracledb's whole Connection otherwise); a
+   * string naming a PL/SQL procedure is not supported.
+   */
+  sessionCallback?: (connection: SessionConnection, requestedTag: string, callback: (err?: Error) => void) => void;
+}
+
+/** What a sessionCallback sets on a new connection. */
+export interface SessionConnection {
+  /** The most milliseconds a round trip may take (0: no limit). */
+  callTimeout: number;
 }
 
 /** Options of one execute. */
@@ -155,6 +168,9 @@ declare class NativePool {
   ping(handle: int): void;
   close(): void;
   lastOffset(): int;
+  takeFresh(handle: int): boolean;
+  callTimeout(handle: int): int;
+  setCallTimeout(handle: int, ms: int): void;
 }
 
 /**
@@ -285,6 +301,7 @@ export class Connection {
       return this.executeNamedRaw(sql, binds, options); // binds by name, as node-oracledb takes them
     }
     this.check();
+    this.checkCallTimeout();
     const b = bindsByPosition(binds);
     try {
       return this.native.execute(this.handle, sql, b.values, b.names, b.dirs, b.types, b.sizes, (options.outFormat ?? OUT_FORMAT_ARRAY) === OUT_FORMAT_OBJECT, options.autoCommit ?? false, options.maxRows ?? 0);
@@ -317,6 +334,7 @@ export class Connection {
   /** executeNamed's result as the driver gives it (JSON). */
   async executeNamedRaw(sql: string, binds: Record<string, unknown>, options: ExecuteOptions = {}): Promise<object> {
     this.check();
+    this.checkCallTimeout();
     const b = bindsByName(binds);
     try {
       return this.native.execute(this.handle, sql, b.values, b.names, b.dirs, b.types, b.sizes, (options.outFormat ?? OUT_FORMAT_ARRAY) === OUT_FORMAT_OBJECT, options.autoCommit ?? false, options.maxRows ?? 0);
@@ -378,14 +396,39 @@ export class Connection {
   private check(): void {
     if (!this.open) throw new Error("NJS-003: invalid or closed connection");
   }
+
+  /**
+   * The most milliseconds a round trip may take (0, the default: no limit); it stays with the physical connection
+   * across checkouts. Compatibility: a limit above 0 is not enforced yet, so a statement on such a connection
+   * fails (never runs past a limit silently).
+   */
+  get callTimeout(): number {
+    return this.native.callTimeout(this.handle);
+  }
+
+  set callTimeout(ms: number) {
+    this.native.setCallTimeout(this.handle, Math.trunc(ms));
+  }
+
+  private checkCallTimeout(): void {
+    const ms = this.native.callTimeout(this.handle);
+    if (ms > 0) throw new Error(`NJS-123: callTimeout of ${ms} ms is not supported by xisto's oracledb yet: set it to 0`);
+  }
+
+  /** (the pool's) true once: the first checkout of a new physical connection. */
+  takeFresh(): boolean {
+    return this.native.takeFresh(this.handle);
+  }
 }
 
 /** A set of open sessions that connections are taken from and given back to. */
 export class Pool {
   private native: NativePool;
+  private sessionCallback: ((connection: SessionConnection, requestedTag: string, callback: (err?: Error) => void) => void) | null;
 
   constructor(attrs: PoolAttributes) {
-    this.native = new NativePool(attrs);
+    this.native = new NativePool({ user: attrs.user, password: attrs.password, connectString: attrs.connectString ?? attrs.connectionString, poolMax: attrs.poolMax });
+    this.sessionCallback = attrs.sessionCallback ?? null;
   }
 
   /**
@@ -401,7 +444,25 @@ export class Pool {
       rethrow(e, this.native);
       throw e;
     }
-    return new Connection(this.native, handle, false);
+    const conn = new Connection(this.native, handle, false);
+    const fn = this.sessionCallback;
+    if (fn !== null && conn.takeFresh()) {
+      // node-oracledb's sessionCallback: once per new physical connection, before it is handed out
+      const view: SessionConnection = { callTimeout: conn.callTimeout };
+      try {
+        await new Promise<void>((resolve, reject) => {
+          fn(view, "", (err?: Error): void => {
+            if (err) reject(err);
+            else resolve();
+          });
+        });
+      } catch (e) {
+        await conn.close();
+        throw e;
+      }
+      conn.callTimeout = view.callTimeout;
+    }
+    return conn;
   }
 
   /** Logs off the pool's idle connections. */
