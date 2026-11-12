@@ -656,7 +656,33 @@ class OracleSession extends DriverSession {
   }
 }
 
+/**
+ * The node-oracledb constants a program reads from TypeORM's driver (driver.oracle.BIND_OUT, .STRING ...), with
+ * node-oracledb's values (the oracledb package's, which its binds take).
+ */
+export class OracledbConstants {
+  BIND_IN: int = 3001;
+  BIND_INOUT: int = 3002;
+  BIND_OUT: int = 3003;
+  STRING: int = 2001;
+  NUMBER: int = 2010;
+  DATE: int = 2011;
+  CURSOR: int = 2021;
+  BUFFER: int = 2006;
+  CLOB: int = 2017;
+  BLOB: int = 2019;
+  DB_TYPE_VARCHAR: int = 2001;
+  DB_TYPE_NUMBER: int = 2010;
+  DB_TYPE_DATE: int = 2011;
+  DB_TYPE_TIMESTAMP: int = 2012;
+  DB_TYPE_CLOB: int = 2017;
+  DB_TYPE_BLOB: int = 2019;
+  DB_TYPE_CURSOR: int = 2021;
+}
+
 export class OracleDriver extends Driver {
+  /** the node-oracledb module's constants, as TypeORM's OracleDriver.oracle (the module it loaded) */
+  oracle: OracledbConstants = new OracledbConstants();
   private makePool: () => Promise<OraclePoolFunctions>;
   private pool: OraclePoolFunctions | null = null;
   constructor(makePool: () => Promise<OraclePoolFunctions>) {
@@ -1077,7 +1103,7 @@ export class Executor {
     this.sessionId = sessionId;
   }
   dialect(): string {
-    return this.dataSource.driver().dialect();
+    return this.dataSource.driver.dialect();
   }
   async run(sql: string, params: unknown[]): Promise<object> {
     if (!this.dataSource.isInitialized) {
@@ -1094,7 +1120,7 @@ export class Executor {
         if (s !== null) {
           return await s.run(sql, params);
         }
-        return await ds.driver().run(sql, params);
+        return await ds.driver.run(sql, params);
       } catch (e) {
         throw new QueryFailedError(sql, params, e);
       }
@@ -1228,6 +1254,16 @@ async function loadRelations(executor: Executor, m: EntityMetadata, list: unknow
       }
     }
   }
+}
+
+/**
+ * TypeORM's QueryResult ({ records, raw, affected }). Compatibility: queryRunner.query(sql, params, true) gives its data
+ * (decoded into the type asked for), not an instance of this class (instanceof QueryResult is false for it).
+ */
+export class QueryResult {
+  records: any[] = [];
+  raw: any = null;
+  affected?: number;
 }
 
 export class Repository<T> {
@@ -2298,6 +2334,11 @@ export class QueryRunner {
     this.manager = new EntityManager(new Executor(dataSource, null));
   }
 
+  /** The DataSource it runs on (TypeORM's queryRunner.connection). */
+  get connection(): DataSource {
+    return this.dataSource;
+  }
+
   private sessionId: int = -1;
   /** the driver's connection once connected (an oracledb Connection for "oracle"), as in TypeORM */
   databaseConnection: unknown = null;
@@ -2308,7 +2349,7 @@ export class QueryRunner {
       await this.dataSource.initialize();
     }
     if (this.sessionOf === null) {
-      const s = await this.dataSource.driver().session();
+      const s = await this.dataSource.driver.session();
       this.sessionOf = s;
       this.sessionId = nextSession;
       nextSession = nextSession + 1;
@@ -2399,8 +2440,8 @@ export class DataSource {
     registerDataSource(this);
   }
 
-  /** the driver of options.type (postgres built in; others from registerDriver) */
-  driver(): Driver {
+  /** the driver of options.type (postgres built in; others from registerDriver): a property, as TypeORM's ds.driver */
+  get driver(): Driver {
     const have = this.driverOf;
     if (have !== null) {
       return have;
@@ -2427,13 +2468,13 @@ export class DataSource {
   }
 
   async initialize(): Promise<DataSource> {
-    await this.driver().connect();
+    await this.driver.connect();
     this.isInitialized = true;
     return this;
   }
 
   async destroy(): Promise<void> {
-    await this.driver().close();
+    await this.driver.close();
     this.isInitialized = false;
   }
 

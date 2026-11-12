@@ -1,6 +1,6 @@
 // @nestjs/common for xisto: the decorators record what Nest keeps with reflect-metadata, from the ClassInfo the
 // compiler builds for decorated classes (xisto:reflect). @nestjs/core reads it to build the application.
-import { ClassInfo, FieldInfo, MethodInfo } from "xisto:reflect";
+import { ClassInfo, FieldInfo, MethodInfo, __xs_meta_define, __xs_desc_current } from "xisto:reflect";
 import { Observable } from "rxjs";
 
 // ---- what the decorators record (first: decorated classes below register as soon as they are declared) ----
@@ -617,9 +617,33 @@ export function UseInterceptors(a: unknown, b: unknown = null, c: unknown = null
  * Metadata on a route or a controller, which a guard or an interceptor reads with Reflector.
  * @example export const Public = () => SetMetadata("isPublic", true);
  */
-export function SetMetadata(key: string, value: unknown): (c: ClassInfo, m: MethodInfo | null) => void {
-  return (c: ClassInfo, m: MethodInfo | null): void => {
-    __metadata.set(c.id + "#" + String(m === null ? -1 : methodIndex(c, m)) + "#" + key, value);
+/**
+ * @SetMetadata(key, value) on a controller or a route, or called by a TypeScript-style method decorator
+ * (SetMetadata(k, v)(target, propertyKey, ...)): recorded for the Reflector and, as Nest does through
+ * reflect-metadata, on its target: the class, or (inside such a decorator) the method's function, descriptor.value,
+ * where Reflect.getMetadata(key, descriptor.value) reads it.
+ */
+export function SetMetadata(key: string, value: unknown): (c: ClassInfo, m: MethodInfo | string | null) => void {
+  return (c: ClassInfo, m: MethodInfo | string | null): void => {
+    let mi: MethodInfo | null = null;
+    if (typeof m === "string") {
+      for (const x of c.methods) {
+        if (x.name === m) {
+          mi = x;
+        }
+      }
+    } else if (m !== null) {
+      mi = m as MethodInfo;
+    }
+    __metadata.set(c.id + "#" + String(mi === null ? -1 : methodIndex(c, mi)) + "#" + key, value);
+    if (mi === null) {
+      __xs_meta_define(key, value, c, null);
+      return;
+    }
+    const d = __xs_desc_current(c, mi.name); // (the descriptor of the TypeScript-style decorator running on that method)
+    if (d !== null) {
+      __xs_meta_define(key, value, d.value, null);
+    }
   };
 }
 

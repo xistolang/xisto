@@ -249,6 +249,7 @@ Type *ty_object_of(Class *cls);
 Type *ty_enum_of(Enum *en);
 Type *ty_func(Type **params, int nparams, Type *ret);
 bool ty_equal(Type *a, Type *b);
+Type *union_json_obj(Type *t); /* the one object member of a union of it and primitives (checker) */
 bool ty_is_heap(Type *t); /* string, array, object: reference counted */
 const char *ty_name(Type *t);
 
