@@ -1514,7 +1514,10 @@ static xs_tls *xs_tls_server_new(xs_tls_cred_t *cr);
 
 /* ---- objects visible to the program ---- */
 
-typedef struct xs_Response { xs_hdr hdr; int64_t f_status; bool f_ok; xs_map *f_headers; xs_str *body; xs_str *f_url; } xs_Response;
+/* response.body: the body is read whole by fetch, so there is no stream left to read or cancel (always null) */
+typedef struct xs_ReadableStream { xs_hdr hdr; } xs_ReadableStream;
+XS_NOINLINE void xs_ReadableStream_cancel(xs_ReadableStream *s) { (void)s; }
+typedef struct xs_Response { xs_hdr hdr; int64_t f_status; bool f_ok; xs_map *f_headers; xs_str *body; xs_str *f_url; xs_ReadableStream *f_body; } xs_Response;
 typedef struct xs_HttpRequest {
     xs_hdr hdr;
     xs_str *f_method, *f_path, *f_body;
