@@ -1,7 +1,0 @@
-{
-  "name": "dd-trace",
-  "version": "0.1.0",
-  "license": "MIT",
-  "implements": { "dd-trace": "^5" },
-  "main": "index.ts"
-}

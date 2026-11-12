@@ -1,7 +1,0 @@
-{
-  "name": "slug",
-  "version": "0.1.0",
-  "license": "MIT",
-  "implements": { "slug": "^1" },
-  "main": "index.ts"
-}

@@ -1,9 +1,0 @@
-{
-  "name": "pg",
-  "version": "0.1.0",
-  "license": "MIT",
-  "implements": { "pg": "^8" },
-  "main": "index.ts",
-  "native": ["native/pg.c"],
-  "needs": ["net", "crypto"]
-}

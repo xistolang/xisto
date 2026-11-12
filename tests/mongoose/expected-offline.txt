@@ -1,6 +1,0 @@
-connection 2
-asPromise rejected MongooseServerSelectionError connect ECONNREFUSED 127.0.0.1:1 true
-state after 0 db true events disconnected | error MongoServerSelectionError: connect ECONNREFUSED 127.0.0.1:1
-find rejected MongooseError Cannot call `rollouts.find()` before initial connection is complete if `bufferCommands = false`. Make sure you `await mongoose.connect()` if you have `bufferCommands = false`.
-create rejected MongooseError Cannot call `rollouts.insertOne()` before initial connection is complete if `bufferCommands = false`. Make sure you `await mongoose.connect()` if you have `bufferCommands = false`.
-forRoot app rejected MongooseServerSelectionError connect ECONNREFUSED 127.0.0.1:1

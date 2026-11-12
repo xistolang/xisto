@@ -1,7 +1,0 @@
-{
-  "name": "express",
-  "version": "0.1.0",
-  "license": "MIT",
-  "implements": { "@types/express": "^4" },
-  "main": "index.ts"
-}

@@ -1,9 +1,0 @@
-{
-  "name": "jsonwebtoken",
-  "version": "0.1.0",
-  "license": "MIT",
-  "implements": { "jsonwebtoken": "^9" },
-  "main": "index.ts",
-  "native": ["native/jwt.c"],
-  "needs": ["crypto"]
-}

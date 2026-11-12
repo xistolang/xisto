@@ -8,7 +8,7 @@ description: Port a TypeScript/Node project (NestJS, TypeORM, Express, Mongoose.
 Install: copy `skills/xisto-port` from the xisto repository to `~/.claude/skills/` (all your projects) or to a
 project's `.claude/skills/`.
 
-Paths like `packages/…`, `tests/…`, `src/…` and `examples/…` are relative to your own checkout of
+Paths like `tests/…`, `src/…` and `examples/…` are relative to your own checkout of
 [xistolang/xisto](https://github.com/xistolang/xisto).
 
 ## Ground rules
@@ -16,7 +16,7 @@ Paths like `packages/…`, `tests/…`, `src/…` and `examples/…` are relativ
 - **Never edit the project's working copy.** Clone it (`git clone --local <repo> <dir>/<name>-xisto`, outside `/tmp`:
   a reboot wipes it) and work on a branch such as `xisto/<app>`. The owner reviews the diff and decides what goes back.
   Code from a private project never goes into the xisto repository: tests there use synthetic code.
-- **Order of fixes:** 1) the compiler (a rule that makes natural code work for everyone), 2) a package in `packages/`
+- **Order of fixes:** 1) the compiler (a rule that makes natural code work for everyone), 2) a package in xistolang/packages
   (the npm API, same output as Node), 3) only then the project's code, in small commits that say why. The less a team
   must change in its app, the easier adoption is: every idiomatic TS form an app uses is a compiler task; rewriting
   the app is the last resort, with the reason written down.
@@ -51,7 +51,7 @@ xisto check --details [--pkgs DIR] <path>                                       
 Kinds of change and what usually fixes them:
 | kind | typical cause | fix |
 |---|---|---|
-| module or package not available | npm package / `node:` module not ported | port the package (`packages/`) or the module (runtime) |
+| module or package not available | npm package / `node:` module not ported | port the package (xistolang/packages) or the module (runtime) |
 | Node module import | `node:x` / bare `fs`, `path`… | automatic: `xisto:x` (or `--node-compat`) |
 | syntax xisto does not read | language gap (see §3) | compiler |
 | missing type annotation | field/param/return without type | annotate, or compiler inference |
@@ -74,11 +74,14 @@ Kinds of change and what usually fixes them:
 
 ## 2. Packages
 
-- Live in `packages/<name>` (`packages/@scope/<name>`): `xisto.json` (`name`, `version`, `implements:
+- Live in [xistolang/packages](https://github.com/xistolang/packages) as `<name>` (`@scope/<name>`): `xisto.json` (`name`, `version`, `implements:
   {"<npm name>": "^x"}`, `main`, optional `native: ["native/x.c"]`, `needs`, `dependencies`), `index.ts`, optional
   `native/*.c`. The header comment of each `index.ts` says what it implements and what it does not.
 - A project finds packages in `.xisto/pkgs/` (in an ancestor dir) or in `--pkgs DIR` for `build`/`check`.
-  `xisto add <git url | path>[@ref] [--name NAME]` adds one locked by commit (`xisto.lock`); `xisto install` fetches them.
+  `xisto add @nestjs/common typeorm` installs ports by npm name from [xistolang/packages](https://github.com/xistolang/packages)
+  (a monorepo: `<root>/<name>`), with their dependencies, locked by commit in `xisto.lock`; `xisto install` restores them.
+  Other sources: `xisto add <git url | ./path>#<folder>[@ref]`, or a whole repo `xisto add <git url | ./path>[@ref] [--name NAME]`.
+  `XISTO_REGISTRY` points the default source to another URL or local checkout (e.g. while developing a package).
 - Ported (check each header for the exact subset):
   - Nest: `@nestjs/{common,core,config,swagger,schedule,platform-express,typeorm,passport,throttler,jwt,mongoose}`.
     common/core include guards (APP_GUARD, `@UseGuards`), interceptors (APP_INTERCEPTOR, `@UseInterceptors`, Nest
@@ -234,7 +237,7 @@ xisto run --dev <entry.ts>                      # fast edit loop
 
 - **Silent run-time gaps are the costliest.** A decorator that compiles but does nothing (e.g. a query DTO never
   filled nor validated) does not show in any error count. Before calling an app "ported", run its main routes and
-  compare with Node; an end-to-end example on Node with the real framework (`examples/nest-forms`) catches these.
+  compare with Node; an end-to-end example on Node with the real framework (`examples/nest-forms` in xistolang/packages) catches these.
 - **A variance message (XS8018) does not prove it is variance.** Read the two types in the message: often it is a
   compiler gap with the same message (a defaulted param not optional in the function type, a `new Map(xs.map(...))`
   inferred as `unknown`, an inferred anonymous return vs an interface with the same fields). If the app's code is
@@ -253,7 +256,7 @@ xisto run --dev <entry.ts>                      # fast edit loop
   - A crash only in -O2 is memory: build once with ASan (§1). A header change (`src/xisto.h`) needs a full rebuild.
   - A C macro that repeats its argument (`__typeof__(x)` + `x`) explodes on nested chains; `xisto emit` +
     `clang -fsyntax-only` under a memory watch bisects a heavy C file to the line.
-  - Don't rebuild `build/xisto`, edit `packages/` or edit `tests/run.sh` while the suite runs (it reads all of them
+  - Don't rebuild `build/xisto`, or edit `tests/run.sh` while the suite runs (it reads all of them
     as it goes, and the tests compile packages through symlinks). Run suites one at a time: two at once fight over
     the http test's port. Compile a side binary into `build/` (e.g. `cc -std=c11 -O1 -D_GNU_SOURCE -w -o
     build/xisto-dev src/*.c build/rt_embed.o -lm`) to count while the suite runs.
@@ -263,13 +266,12 @@ xisto run --dev <entry.ts>                      # fast edit loop
 
 ## Scripts
 
-Packages dir for `--pkgs` (symlinks, nothing copied), run from the xisto checkout:
+Packages dir for `--pkgs`: a checkout of xistolang/packages is one as it is (`<root>/<name>`, `<root>/@scope/<name>`):
 ```
-R=<scratch>/pkgs; mkdir -p $R/@nestjs $R/@elastic
-for p in packages/*; do n=$(basename $p); case $n in @*|xisto) continue;; esac; ln -s $PWD/$p $R/$n; done
-for s in @nestjs @elastic; do for p in packages/$s/*; do ln -s $PWD/$p $R/$s/$(basename $p); done; done
+git clone https://github.com/xistolang/packages <scratch>/packages
+xisto check --pkgs <scratch>/packages <project>
 ```
-After a new package lands, re-run the loops, or the check keeps reporting it as missing.
+`git pull` there after a new package lands, or the check keeps reporting it as missing.
 
 Group `__check1` errors by cause:
 ```

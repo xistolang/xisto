@@ -1,8 +1,0 @@
-{
-  "name": "exceljs",
-  "version": "0.1.0",
-  "license": "MIT",
-  "implements": { "exceljs": "^4" },
-  "main": "index.ts",
-  "native": ["native/xlsx.c"]
-}

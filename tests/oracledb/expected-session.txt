@@ -1,8 +1,0 @@
-checkout 0: callbacks 1, callTimeout 4001
-  query 1
-checkout 1: callbacks 1, callTimeout 4001
-  query 2
-checkout 2: callbacks 1, callTimeout 4001
-  query 3
-two at once: callbacks 2, callTimeouts 4001 4002
-getConnection failed: session setup refused

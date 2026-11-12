@@ -1,9 +1,0 @@
-GET /api/v1/multi 200 {"from": "multi"}
-GET /api/v2/multi 200 {"from": "multi"}
-GET /api/multi 404 
-GET /api/v3/multi/only3 200 {"from": "only3"}
-GET /api/v1/multi/only3 404 
-GET /api/neutral 200 {"from": "neutral"}
-GET /api/v1/neutral 404 
-GET /api/v2/two 200 {"from": "two"}
-GET /api/two 404 

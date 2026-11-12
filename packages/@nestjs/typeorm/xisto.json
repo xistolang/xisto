@@ -1,8 +1,0 @@
-{
-  "name": "@nestjs/typeorm",
-  "version": "0.1.0",
-  "license": "MIT",
-  "implements": { "@nestjs/typeorm": "^10" },
-  "main": "index.ts",
-  "dependencies": { "@nestjs/common": "0.1.0", "typeorm": "0.1.0" }
-}

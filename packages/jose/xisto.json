@@ -1,9 +1,0 @@
-{
-  "name": "jose",
-  "version": "0.1.0",
-  "license": "MIT",
-  "implements": { "jose": "^5" },
-  "main": "index.ts",
-  "native": ["native/rsa.c"],
-  "needs": ["crypto"]
-}

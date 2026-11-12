@@ -1,7 +1,0 @@
-{
-  "name": "reflect-metadata",
-  "version": "0.1.0",
-  "license": "MIT",
-  "implements": { "reflect-metadata": "^0.2" },
-  "main": "index.ts"
-}

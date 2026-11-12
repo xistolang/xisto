@@ -1,3 +1,0 @@
-{"level": 40, "context": "FormsController", "event": "me", "sub": "ana", "tid": "t1"}
-{"level": 40, "context": "FormsController", "event": "me", "sub": "bia", "tid": "none"}
-{"level": 50, "context": "FormsController", "event": "item", "id": "7", "sub": "caio", "msg": "item read"}

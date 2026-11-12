@@ -1,7 +1,0 @@
-empty: 0 rows, v=null
-insert, no commit, released: 0 rows, v=null
-insert, commit, released: 1 rows, v=a
-update, no commit, released: 1 rows, v=a
-update, autoCommit, released: 1 rows, v=c
-error: ORA-00001
-update, failed insert, released: 1 rows, v=c

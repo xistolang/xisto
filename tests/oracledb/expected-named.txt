@@ -1,4 +1,0 @@
-[{"S":42,"A":2}]
-{"total":42,"txt":"n=21"}
-[{"ONE":7}]
-string XISTO 1

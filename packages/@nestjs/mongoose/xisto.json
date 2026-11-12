@@ -1,9 +1,0 @@
-{
-  "name": "@nestjs/mongoose",
-  "version": "0.1.0",
-  "license": "MIT",
-  "description": "@nestjs/mongoose 10/11 over xisto's mongoose: @Schema/@Prop/SchemaFactory, MongooseModule.forRoot/forRootAsync (connectionFactory, lazyConnection, Nest's retries and log)/forFeature/forFeatureAsync, @InjectModel/@InjectConnection, getModelToken/getConnectionToken. A module that is never imported registers nothing (an @Optional() model is null).",
-  "implements": { "@nestjs/mongoose": "^11" },
-  "main": "index.ts",
-  "dependencies": { "@nestjs/common": "0.1.0", "mongoose": "0.1.0" }
-}

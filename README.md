@@ -39,7 +39,8 @@ xisto check <dir|tsconfig.json> # what a project needs to compile with xisto, by
 xisto test [dir]                # runs *.test.ts (asserts, zero leaked objects, .expected output)
 xisto fmt [--check] file.ts     # formats without changing tokens
 xisto emit file.ts              # prints the generated C
-xisto add <git-url>[@ref]       # adds a package from source, locked by commit; `xisto install` restores
+xisto init [dir]                # a new project (xisto.json, src/main.ts, .gitignore)
+xisto add <npm-name>...         # packages from xistolang/packages, locked by commit; `xisto install` restores
 xisto --version
 ```
 
@@ -69,12 +70,25 @@ Node's modules are available as `xisto:*` (`import { readFile } from 'xisto:fs'`
 `async_hooks`, `os`, `url`, `sqlite`, timers, and more. Output, formatting of `console.log` and error messages follow
 Node's.
 
-npm packages are ported as source packages with the same API (`packages/`), each tested against the real package on
-Node: NestJS (`@nestjs/common`, `core`, `config`, `swagger`, `schedule`, `passport`, `throttler`, `typeorm`,
-`platform-express`), TypeORM (Postgres and Oracle), `oracledb` (thin protocol), `pg`, `mongoose`/`mongodb`, `redis`,
-`express`, `class-validator`, `class-transformer`, `rxjs`, `jsonwebtoken`, `passport-jwt`, `jwks-rsa`, `exceljs`,
-`@elastic/elasticsearch`, `nestjs-pino`, `helmet`, `argon2` and others. A build points to them with `--pkgs DIR`
-or a `.xisto/pkgs` folder.
+npm packages are ported as source packages with the same API, in
+[xistolang/packages](https://github.com/xistolang/packages), each tested against the real package on Node: NestJS
+(`@nestjs/common`, `core`, `config`, `swagger`, `schedule`, `passport`, `jwt`, `throttler`, `typeorm`, `mongoose`,
+`platform-express`), TypeORM (Postgres and Oracle), `oracledb` (thin protocol), `pg`, `mongodb`/`mongoose`, `redis`,
+`ioredis`, `express`, `class-validator`, `class-transformer`, `rxjs`, `jsonwebtoken`, `jose`, `passport-jwt`,
+`jwks-rsa`, `exceljs`, `@elastic/elasticsearch`, `nestjs-pino`, `helmet`, `argon2` and others.
+
+## A project
+
+```sh
+xisto init myapp && cd myapp      # xisto.json, src/main.ts, .gitignore
+xisto run                         # runs "main" from xisto.json
+xisto add @nestjs/common @nestjs/core @nestjs/platform-express   # by npm name, with their dependencies
+xisto build                       # ./myapp
+```
+
+`xisto add` copies each package into `.xisto/pkgs/` and pins it in `xisto.lock` (source, folder, commit);
+`xisto install` restores exactly that, like `npm ci`. Other sources: `xisto add <git-url>#<folder>[@ref]` or a whole
+repository with `xisto add <git-url>[@ref]`. A build can also point to a folder of packages with `--pkgs DIR`.
 
 Porting an existing project: start with `xisto check`, then see [skills/xisto-port](skills/xisto-port/SKILL.md),
 a guide (also usable as a Claude Code skill) with the method, the language rules and the known gaps.
@@ -99,10 +113,10 @@ Docker.
 ```
 src/          the compiler: lexer → parser → checker → C emitter (and the QBE emitter)
 runtime/      the runtime embedded in every generated program (memory, strings, event loop, net, TLS, regex)
-packages/     xisto:* standard packages and the npm ports
+packages/     the xisto:* standard packages (npm ports live in xistolang/packages)
 tests/        ok/ (output compared with Node), err/ (expected diagnostics)
 bench/        benchmark programs, scripts and versioned results (bench/results/)
-examples/     larger programs (NestJS apps, a REST API)
+examples/     a larger program (a REST API); NestJS examples live in xistolang/packages
 editors/      VS Code extension
 third_party/  BearSSL, QBE, SQLite (and AWS-LC, downloaded)
 ```

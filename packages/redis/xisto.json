@@ -1,9 +1,0 @@
-{
-  "name": "redis",
-  "version": "0.1.0",
-  "license": "MIT",
-  "implements": { "redis": "^4" },
-  "main": "index.ts",
-  "native": ["native/redis.c"],
-  "needs": ["net"]
-}

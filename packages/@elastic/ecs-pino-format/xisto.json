@@ -1,8 +1,0 @@
-{
-  "name": "@elastic/ecs-pino-format",
-  "version": "0.1.0",
-  "license": "Apache-2.0",
-  "implements": { "@elastic/ecs-pino-format": "^1" },
-  "main": "index.ts",
-  "dependencies": { "nestjs-pino": "0.1.0" }
-}

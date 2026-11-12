@@ -1,6 +1,0 @@
-GET /items/setup -> ready [200]
-GET /items -> [{"id":1,"name":"one"},{"id":2,"name":"two"}] [200]
-GET /items/2 -> {"id":2,"name":"two"} [200]
-GET /items/9 ->  [200]
-GET /items/count -> 2 [200]
-GET /items/teardown -> dropped [200]

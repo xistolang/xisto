@@ -1,9 +1,0 @@
-{
-  "name": "mongoose",
-  "version": "0.2.0",
-  "license": "MIT",
-  "description": "mongoose 8 over xisto's mongodb driver: ObjectId, Schema (paths, indexes, options), Connection (createConnection, server selection, readyState, events, useDb, db.command), models with find/findOne/findById/countDocuments/exists/distinct/create/insertMany/updateOne/updateMany/findOneAndUpdate/findOneAndDelete/deleteOne/deleteMany/aggregate/bulkWrite, filters and documents cast by the schema (defaults, timestamps, __v), autoCreate/autoIndex. Documents are objects of T with the fields T declares.",
-  "implements": { "mongoose": "^8" },
-  "main": "index.ts",
-  "dependencies": { "mongodb": "0.1.0" }
-}

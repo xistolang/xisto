@@ -1,8 +1,0 @@
-{
-  "name": "@nestjs/throttler",
-  "version": "0.1.0",
-  "license": "MIT",
-  "implements": { "@nestjs/throttler": "^6" },
-  "main": "index.ts",
-  "dependencies": { "@nestjs/common": "0.1.0", "express": "0.1.0" }
-}

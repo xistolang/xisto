@@ -1,8 +1,0 @@
-{
-  "name": "helmet",
-  "version": "0.1.0",
-  "license": "MIT",
-  "implements": { "helmet": "^7" },
-  "main": "index.ts",
-  "dependencies": { "express": "0.1.0" }
-}

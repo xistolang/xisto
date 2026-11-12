@@ -1,3 +1,0 @@
-{"log.level": "warn", "ecs.version": "8.10.0", "log.logger": "FormsController", "event": "me", "sub": "ana", "tid": "t1"}
-{"log.level": "warn", "ecs.version": "8.10.0", "log.logger": "FormsController", "event": "me", "sub": "bia", "tid": "none"}
-{"log.level": "error", "ecs.version": "8.10.0", "log.logger": "FormsController", "event": "item", "id": "7", "sub": "caio", "message": "item read"}

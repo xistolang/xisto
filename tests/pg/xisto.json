@@ -1,4 +1,0 @@
-{
-  "name": "pg-tests",
-  "main": "src/pool.ts"
-}

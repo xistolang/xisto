@@ -202,46 +202,12 @@ if python3 tools/noinline-scan.py --check runtime/xisto_rt.h runtime/xisto_net.h
 if sh tests/tlsgate/run.sh > "$OUT/tlsgate.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL tlsgate:"; cat "$OUT/tlsgate.txt"; fail=$((fail+1)); fi
 fi
 
-# pg: a pool asked for more queries at once than it has connections, against a live PostgreSQL when one is up
-if sh tests/pg/run.sh > "$OUT/pg-pool.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL pg pool:"; cat "$OUT/pg-pool.txt"; fail=$((fail+1)); fi
-# typeorm: generated SQL for postgres and oracle; a live PostgreSQL when one is up (tests/typeorm/run.sh)
-if sh tests/typeorm/run.sh > "$OUT/typeorm.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL typeorm:"; cat "$OUT/typeorm.txt"; fail=$((fail+1)); fi
-# class-validator: rule semantics against class-validator 0.14 (tests/validator/run.sh)
-if sh tests/validator/run.sh > "$OUT/validator.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL validator:"; cat "$OUT/validator.txt"; fail=$((fail+1)); fi
 # packages: xisto add / install from a local git repository
 if sh tests/pkg/run.sh > "$OUT/pkg.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg.txt")" -ge 8 ] && ! grep -q FAIL "$OUT/pkg.txt"; then pass=$((pass+1)); else echo "FAIL packages:"; cat "$OUT/pkg.txt"; fail=$((fail+1)); fi
 # packages: xisto init / add NAME / install against a local monorepo registry (tests/pkg/registry.sh)
 if sh tests/pkg/registry.sh > "$OUT/pkg-registry.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg-registry.txt")" -ge 32 ] && ! grep -q FAIL "$OUT/pkg-registry.txt"; then pass=$((pass+1)); else echo "FAIL package registry:"; cat "$OUT/pkg-registry.txt"; fail=$((fail+1)); fi
-if sh examples/nest-features/test/run.sh > "$OUT/nest-features.txt" 2>&1 && grep -q '^ok: nest-features' "$OUT/nest-features.txt"; then pass=$((pass+1)); else echo "FAIL nest-features:"; cat "$OUT/nest-features.txt"; fail=$((fail+1)); fi
-if sh examples/nest-versions/test/run.sh > "$OUT/nest-versions.txt" 2>&1 && grep -q '^ok: nest-versions' "$OUT/nest-versions.txt"; then pass=$((pass+1)); else echo "FAIL nest-versions:"; cat "$OUT/nest-versions.txt"; fail=$((fail+1)); fi
-if sh examples/nest-auth/test/run.sh > "$OUT/nest-auth.txt" 2>&1 && grep -q '^ok: nest-auth' "$OUT/nest-auth.txt"; then pass=$((pass+1)); else echo "FAIL nest-auth:"; cat "$OUT/nest-auth.txt"; fail=$((fail+1)); fi
-if sh examples/nest-forms/test/run.sh > "$OUT/nest-forms.txt" 2>&1 && grep -q '^ok: nest-forms' "$OUT/nest-forms.txt"; then pass=$((pass+1)); else echo "FAIL nest-forms:"; cat "$OUT/nest-forms.txt"; fail=$((fail+1)); fi
-# @nestjs/jwt's JwtService against @nestjs/jwt 11 + jsonwebtoken 9 (tests/nestjwt/run.sh)
-if sh tests/nestjwt/run.sh > "$OUT/nestjwt.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL nestjwt:"; cat "$OUT/nestjwt.txt"; fail=$((fail+1)); fi
-# reflect-metadata's global Reflect (tests/reflectmeta/run.sh)
-if sh tests/reflectmeta/run.sh > "$OUT/reflectmeta.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL reflectmeta:"; cat "$OUT/reflectmeta.txt"; fail=$((fail+1)); fi
-# Nest's Logger on the console: object messages as Nest 11's ConsoleLogger prints them (tests/nestlog/run.sh)
-if sh tests/nestlog/run.sh > "$OUT/nestlog.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL nestlog:"; cat "$OUT/nestlog.txt"; fail=$((fail+1)); fi
 
-# package subpaths (deep imports such as rxjs/operators), against the output of the real packages on Node
-if sh tests/subpaths/run.sh > "$OUT/subpaths.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/subpaths.txt"; else echo "FAIL subpaths:"; cat "$OUT/subpaths.txt"; fail=$((fail+1)); fi
-# redis package against a live server (skipped without one)
-if sh tests/redis/run.sh > "$OUT/redis.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/redis.txt"; else echo "FAIL redis:"; cat "$OUT/redis.txt"; fail=$((fail+1)); fi
-# jose package: RS256 tokens byte for byte as Node's jose, claim errors, a generated key checked by OpenSSL
-if sh tests/jose/run.sh > "$OUT/jose.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/jose.txt"; else echo "FAIL jose:"; cat "$OUT/jose.txt"; fail=$((fail+1)); fi
-# mongodb's BSON with no server (as js-bson 6); mongoose + @nestjs/mongoose as Node's mongoose 8 (a live MongoDB
-# when XISTO_MONGO_URL is set)
-if sh tests/mongodb/run.sh > "$OUT/mongodb.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/mongodb.txt"; else echo "FAIL mongodb:"; cat "$OUT/mongodb.txt"; fail=$((fail+1)); fi
-if sh tests/mongoose/run.sh > "$OUT/mongoose.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/mongoose.txt"; else echo "FAIL mongoose:"; cat "$OUT/mongoose.txt"; fail=$((fail+1)); fi
-# ioredis package against a live server (skipped without one)
-if sh tests/ioredis/run.sh > "$OUT/ioredis.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/ioredis.txt"; else echo "FAIL ioredis:"; cat "$OUT/ioredis.txt"; fail=$((fail+1)); fi
-# exceljs package: streaming XLSX (ZIP + deflate), checked as XML, by LibreOffice when installed, constant memory
-if sh tests/exceljs/run.sh > "$OUT/exceljs.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/exceljs.txt"; else echo "FAIL exceljs:"; cat "$OUT/exceljs.txt"; fail=$((fail+1)); fi
-# @elastic/elasticsearch package against a fake cluster (Node)
-if sh tests/elasticsearch/run.sh > "$OUT/elasticsearch.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/elasticsearch.txt"; else echo "FAIL elasticsearch:"; cat "$OUT/elasticsearch.txt"; fail=$((fail+1)); fi
 
-# oracledb package against a live database (skipped without XISTO_ORACLE_URL)
-if sh tests/oracledb/run.sh > "$OUT/oracledb.txt" 2>&1; then pass=$((pass+1)); cat "$OUT/oracledb.txt"; else echo "FAIL oracledb:"; cat "$OUT/oracledb.txt"; fail=$((fail+1)); fi
 
 # debugger: CLI transcripts and the agent driven over DAP (docs/debugger.md)
 if sh tests/debug/run.sh > "$OUT/debug.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL debugger:"; cat "$OUT/debug.txt"; fail=$((fail+1)); fi
