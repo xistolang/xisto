@@ -208,6 +208,11 @@ static void init_builtins(void) {
     bi_field(resp, "headers", ty_map_of(ty_string, ty_string)); /* a Map: get(name) and forEach((v, k) => ...), names in lower case */
     bi_method(resp, "text", "xs_Response_text", ty_string, 0);
     bi_field(resp, "url", ty_string);
+    {
+        Class *rs = bi_class("ReadableStream", "xs_ReadableStream");
+        bi_method(rs, "cancel", "xs_ReadableStream_cancel", ty_void, 0);
+        bi_field(resp, "body", ty_nullable_of(ty_object_of(rs))); /* (always null: fetch reads the body whole) */
+    }
 
     Class *req = bi_class("HttpRequest", "xs_HttpRequest");
     bi_field(req, "method", ty_string);
