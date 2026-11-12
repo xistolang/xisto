@@ -3104,9 +3104,12 @@ static void parse_fields_body(Parser *p, Class *c) {
             if (!at(p, TK_LPAREN)) xs_error(XS1037, p->tok.pos, NULL, "write %s %s(...) { ... }", accessor == 1 ? "get" : "set", name.str);
             name.str = xs_sprintf("__%s_%s", accessor == 1 ? "get" : "set", name.str);
         }
+        Parser gsig_at = *p; /* (an interface's generic method: where its signature starts, read again with T as T) */
+        Func gsig_tp = {0};
         if (at(p, TK_LT) && c->is_interface) { /* query<T = any>(...): T: the method with its type parameters' defaults */
             Func tmp = {0};
             parse_tparams(p, &tmp);
+            gsig_tp = tmp;
             for (int i = 0; i < tmp.ntparams; i++)
                 if (!tmp.tdefaults[i]) xs_error(XS8113, name.pos, "write the method's signature with its types: name(x: T): R;", "method '%s' in interface '%s'", name.str, c->name);
             subst_push(subst_save(), tmp.tparams, tmp.tdefaults, tmp.ntparams);
@@ -3173,6 +3176,29 @@ static void parse_fields_body(Parser *p, Class *c) {
                     f->cls = NULL;
                 } else {
                     c->methods[c->nmethods++] = f;
+                }
+            }
+            if (gsig_tp.ntparams && f->ret) { /* the signature with its type parameters (gen_sig): parsed again, T a TY_TPARAM */
+                Parser q = gsig_at;
+                Func tmp2 = {0};
+                char **sn1 = subst_names; Type **st1 = subst_types; int sk1 = nsubst;
+                subst_names = sn0; subst_types = st0; nsubst = sk0;
+                parse_tparams(&q, &tmp2);
+                char **saved = tp_names; int saved_n = ntp;
+                tp_push(tmp2.tparams, tmp2.ntparams);
+                Func g = {0};
+                parse_params_ex(&q, &g, false);
+                Type *gr = NULL;
+                if (accept(&q, TK_COLON)) gr = parse_type(&q);
+                tp_names = saved; ntp = saved_n;
+                subst_names = sn1; subst_types = st1; nsubst = sk1;
+                if (gr) {
+                    Type **ps = xs_alloc(sizeof(Type *) * (size_t)(g.nparams ? g.nparams : 1));
+                    for (int i = 0; i < g.nparams; i++) ps[i] = g.params[i].type;
+                    Type *ft = ty_func(ps, g.nparams, gr);
+                    ft->ftparams = tmp2.tparams;
+                    ft->nftparams = tmp2.ntparams;
+                    f->gen_sig = ft;
                 }
             }
             if (mods & MOD_ABSTRACT) { /* abstract m(): T; */
