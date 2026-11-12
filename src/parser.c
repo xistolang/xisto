@@ -1092,7 +1092,7 @@ static bool is_js_error_name(const char *n) {
 /* the web globals xisto:url declares (runtime/node/url.ts) */
 static bool is_url_global_name(const char *n) {
     return n && (!strcmp(n, "URL") || !strcmp(n, "URLSearchParams") || !strcmp(n, "AbortController") || !strcmp(n, "AbortSignal") ||
-                 !strcmp(n, "DOMException") || !strcmp(n, "RequestInit") || !strcmp(n, "HeadersInit") || !strcmp(n, "fetch"));
+                 !strcmp(n, "DOMException") || !strcmp(n, "RequestInit") || !strcmp(n, "HeadersInit") || !strcmp(n, "fetch") || !strcmp(n, "BufferEncoding"));
 }
 static Expr *parse_primary(Parser *p) {
     Pos pos = p->tok.pos;
@@ -5207,6 +5207,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->builtin = false;
         m->file = "xisto:url";
         m->src = (char *)xs_node_url_ts;
+        m->native_prefix = "xs_"; /* (declare function fetch_body_bytes: xs_fetch_body_bytes) */
         m->loading = true;
         parse_module(prog, m);
         m->loading = false;
