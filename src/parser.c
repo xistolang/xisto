@@ -1727,7 +1727,7 @@ static Expr *parse_postfix(Parser *p) {
             m->lhs = e;
             m->str = name.str;
             if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from") ||
-                !strcmp(name.str, "fromEntries")) wants_arrays = true;
+                !strcmp(name.str, "fromEntries") || !strcmp(name.str, "allSettled")) wants_arrays = true;
             if (!strcmp(name.str, "next") && e->kind == E_MEMBER && e->str && (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")))
                 wants_arrays = true; /* m.keys().next().value: __xs_first */
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs);
@@ -1767,7 +1767,7 @@ static Expr *parse_postfix(Parser *p) {
             m->lhs = e;
             m->str = name.str;
             if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from") ||
-                !strcmp(name.str, "fromEntries")) wants_arrays = true;
+                !strcmp(name.str, "fromEntries") || !strcmp(name.str, "allSettled")) wants_arrays = true;
             if (!strcmp(name.str, "next") && e->kind == E_MEMBER && e->str && (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")))
                 wants_arrays = true; /* m.keys().next().value: __xs_first */
             if (!strcmp(name.str, "length") && at(p, TK_ASSIGN)) wants_arrays = true; /* xs.length = 0 */
@@ -2253,6 +2253,37 @@ static void rest_decl(Parser *p, Type *src, bool is_const) {
     char *tmp = p->rest_tmp;
     p->rest_tmp = NULL;
     while (src && src->kind == TY_NULLABLE) src = src->elem;
+    if (src && src->kind == TY_MAP && src->record) { /* const { a: _x, ...base } = rec with rec a Record: a copy without those
+                                                       keys (const base: R = { ...rec }; delete base['a']) */
+        Stmt *d = new_stmt(S_VAR, rn.pos);
+        d->name = rn.str;
+        d->is_const = is_const;
+        d->decl_type = src;
+        Expr *o = new_expr(E_OBJLIT, rn.pos);
+        o->keys = xs_alloc(sizeof(char *));
+        o->keys[0] = "...";
+        Expr *u = new_expr(E_UNARY, rn.pos);
+        u->op = TK_ELLIPSIS;
+        u->lhs = ident_expr(rn.pos, tmp);
+        expr_list_push(&o->args, u);
+        o->spread = true;
+        d->init = o;
+        stmt_list_push(&p->pending, d);
+        for (int i = 0; i < p->nrest_keys; i++) {
+            Expr *call = new_expr(E_MEMBER, rn.pos);
+            call->lhs = ident_expr(rn.pos, rn.str);
+            call->str = "delete";
+            call->is_call = true;
+            Expr *k = new_expr(E_STRING, rn.pos);
+            k->str = p->rest_keys[i];
+            expr_list_push(&call->args, k);
+            Stmt *st = new_stmt(S_EXPR, rn.pos);
+            st->expr = call;
+            stmt_list_push(&p->pending, st);
+        }
+        vt_push(p, rn.str, src);
+        return;
+    }
     if (!src || src->kind != TY_OBJECT || src->ntargs)
         xs_error(XS6006, rn.pos, "give the destructured value a type (an interface or class), or name the fields one by one",
                  "'...%s' needs the type of the value it comes from", rn.str);
@@ -2288,6 +2319,10 @@ static void rest_param(Parser *p, Func *f, Type *t) {
     for (int i = 0; i < p->pending.len; i++) stmt_list_push(&f->param_decls, p->pending.items[i]);
     p->pending = saved;
 }
+static bool tok_ident_is(Parser *q, const char *s);
+static void fix_import_names(Parser *p, Module *m, int i0);
+static void ns_register(Parser *p, Module *m, const char *alias);
+static Module *load_module(Program *prog, const char *file, Pos from_pos, const char *from_file);
 static Stmt *parse_var(Parser *p) {
     Stmt *s = new_stmt(S_VAR, p->tok.pos);
     s->is_const = at(p, TK_CONST);
@@ -2304,6 +2339,46 @@ static Stmt *parse_var(Parser *p) {
             rest_decl(p, src, s->is_const);
         }
         return s;
+    }
+    if (at(p, TK_IDENT) && p->mod && parsing_prog) { /* const oracledb = require("oracledb"); in a function: import * as oracledb */
+        Parser look = *p;
+        next(&look);
+        if (at(&look, TK_ASSIGN)) {
+            next(&look);
+            if (tok_ident_is(&look, "require")) {
+                next(&look);
+                if (at(&look, TK_LPAREN)) {
+                    next(&look);
+                    if (at(&look, TK_STRING)) {
+                        char *pa = look.tok.str;
+                        next(&look);
+                        if (at(&look, TK_RPAREN)) {
+                            next(&look);
+                            Token nm = p->tok;
+                            *p = look; /* (the ';' is the caller's) */
+                            Module *m = p->mod;
+                            Program *prog = parsing_prog;
+                            int n0 = m->nimports;
+                            Import im = {0};
+                            im.pos = nm.pos;
+                            im.path = pa;
+                            ns_register(p, m, nm.str);
+                            m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+                            m->imports[m->nimports++] = im;
+                            m->imports[n0].from = load_module(prog, pa, nm.pos, m->path);
+                            xs_file_name = m->file;
+                            xs_source = m->src;
+                            parsing_prog = prog;
+                            parsing_mod = m;
+                            fix_import_names(p, m, n0);
+                            s->kind = S_BLOCK;
+                            s->name = NULL;
+                            return s;
+                        }
+                    }
+                }
+            }
+        }
     }
     Token name = expect(p, TK_IDENT, NULL);
     s->name = name.str;
@@ -3301,7 +3376,19 @@ static Class *parse_interface(Parser *p) {
             return c;
         }
     }
+    Parser *gst = NULL;
+    void *gsub = NULL;
+    if (c->ntparams) { /* interface Contract<I, O> { execute(i: I): Promise<O>; }: kept for its instances (below) */
+        gst = xs_alloc(sizeof *gst);
+        *gst = *p;
+        gsub = subst_save();
+    }
     parse_fields_body(p, c);
+    if (gst && c->iface_methods) { /* one abstract class per list of type arguments, parsed again with them bound (checker:
+                                     instantiate_class), the base of the classes that implement it */
+        c->gen_state = gst;
+        c->gen_subst = gsub;
+    }
     if (is_type) accept(p, TK_SEMI);
     return c;
 }
@@ -3384,6 +3471,7 @@ Class *xs_parse_class_instance(Class *tmpl, Type **args, const char *name) {
     c->pos = tmpl->pos;
     c->name = (char *)name;
     c->is_abstract = tmpl->is_abstract;
+    c->is_interface = tmpl->is_interface && tmpl->iface_methods; /* (a generic interface of methods: read as one) */
     c->implements = tmpl->implements;
     c->nimplements = tmpl->nimplements;
     c->decos = tmpl->decos;
@@ -4064,8 +4152,12 @@ static bool try_require_ahead(Parser *p, char **name, char **path) {
     next(&q);
     if (!at(&q, TK_COLON)) return false;
     next(&q);
-    if (!tok_ident_is(&q, "any")) return false;
-    next(&q);
+    /* (let tracer: any; or let tracer: TracerMinimo | null = null;: the type the program gave it is the package's own) */
+    for (int d = 0; !at(&q, TK_EOF) && !(d == 0 && (at(&q, TK_SEMI) || at(&q, TK_ASSIGN))); next(&q)) {
+        if (at(&q, TK_LBRACE) || at(&q, TK_LPAREN) || at(&q, TK_LBRACKET) || at(&q, TK_LT)) d++;
+        else if (at(&q, TK_RBRACE) || at(&q, TK_RPAREN) || at(&q, TK_RBRACKET) || at(&q, TK_GT)) d--;
+    }
+    if (at(&q, TK_ASSIGN)) { next(&q); if (!tok_ident_is(&q, "null")) return false; next(&q); }
     if (!at(&q, TK_SEMI)) return false;
     next(&q);
     if (!at(&q, TK_TRY)) return false;
@@ -4085,11 +4177,24 @@ static bool try_require_ahead(Parser *p, char **name, char **path) {
     next(&q);
     if (!at(&q, TK_RPAREN)) return false;
     next(&q);
+    if (tok_ident_is(&q, "as")) /* (require("dd-trace") as TracerMinimo) */
+        for (int d = 0; !at(&q, TK_EOF) && !(d == 0 && (at(&q, TK_SEMI) || at(&q, TK_RBRACE))); next(&q)) {
+            if (at(&q, TK_LBRACE) || at(&q, TK_LPAREN) || at(&q, TK_LBRACKET) || at(&q, TK_LT)) d++;
+            else if (at(&q, TK_RBRACE) || at(&q, TK_RPAREN) || at(&q, TK_RBRACKET) || at(&q, TK_GT)) d--;
+        }
     if (at(&q, TK_SEMI)) next(&q);
     if (!at(&q, TK_RBRACE)) return false;
     next(&q);
     if (!at(&q, TK_CATCH)) return false;
     next(&q);
+    if (at(&q, TK_LBRACE) && peek_is(&q, TK_RBRACE)) { /* catch {} */
+        next(&q);
+        next(&q);
+        *name = n;
+        *path = pa;
+        *p = q;
+        return true;
+    }
     if (at(&q, TK_LPAREN)) { next(&q); if (!at(&q, TK_IDENT)) return false; next(&q); if (!at(&q, TK_RPAREN)) return false; next(&q); }
     if (!at(&q, TK_LBRACE)) return false;
     next(&q);
@@ -5314,6 +5419,50 @@ static const char xs_arrays_src[] =
     "  const out: U[] = [];\n"
     "  for (const ys of xs) for (const y of ys) out.push(y);\n"
     "  return out;\n"
+    "}\n"
+    "// Promise.allSettled(ps): each promise's outcome, in order ({ status, value } or { status, reason }); the promises run\n"
+    "// already, so waiting for them one after the other waits as long as for all of them\n"
+    "export class PromiseSettledResult<T> {\n"
+    "  status: string;\n"
+    "  value?: T;\n"
+    "  reason?: unknown;\n"
+    "  constructor(status: string, value: T | undefined, reason: unknown) {\n"
+    "    this.status = status;\n"
+    "    if (value !== undefined) this.value = value;\n"
+    "    if (status === 'rejected') this.reason = reason;\n"
+    "  }\n"
+    "}\n"
+    "export async function __xs_settle<T>(f: () => Promise<T>): Promise<PromiseSettledResult<T>> {\n"
+    "  try {\n"
+    "    const v = await f();\n"
+    "    return new PromiseSettledResult<T>('fulfilled', v, undefined);\n"
+    "  } catch (e) {\n"
+    "    return new PromiseSettledResult<T>('rejected', undefined, e);\n"
+    "  }\n"
+    "}\n"
+    "export async function __xs_allSettledVoid(ps: Promise<void>[]): Promise<PromiseSettledResult<unknown>[]> {\n"
+    "  const out: PromiseSettledResult<unknown>[] = [];\n"
+    "  for (const p of ps) {\n"
+    "    try {\n"
+    "      await p;\n"
+    "      out.push(new PromiseSettledResult<unknown>('fulfilled', undefined, undefined));\n"
+    "    } catch (e) {\n"
+    "      out.push(new PromiseSettledResult<unknown>('rejected', undefined, e));\n"
+    "    }\n"
+    "  }\n"
+    "  return out;\n"
+    "}\n"
+    "export async function __xs_allSettled<T>(ps: Promise<T>[]): Promise<PromiseSettledResult<T>[]> {\n"
+    "  const out: PromiseSettledResult<T>[] = [];\n"
+    "  for (const p of ps) {\n"
+    "    try {\n"
+    "      const v = await p;\n"
+    "      out.push(new PromiseSettledResult<T>('fulfilled', v, undefined));\n"
+    "    } catch (e) {\n"
+    "      out.push(new PromiseSettledResult<T>('rejected', undefined, e));\n"
+    "    }\n"
+    "  }\n"
+    "  return out;\n"
     "}\n";
 /* xisto:errors: JavaScript's Error subclasses, visible in every module like Error itself */
 /* xisto:intl: Intl.DateTimeFormat (en-US, en-GB, pt-BR; numeric and 2-digit fields; a timeZone of the system TZ
@@ -5510,6 +5659,42 @@ static const char xs_worker_threads_src[] =
     "export const parentPort: MessagePort = wt_port();\n"
     "export const threadId: int = wt_id();\n";
 /* xisto:os: what a program needs to size its workers */
+/* xisto:v8 (node:v8): the heap's figures and serialize's size, as far as a program reads them (a cache's budget):
+   heap_size_limit as V8 sets it by default on 64 bits (a quarter of the memory, at most 4 GiB); serialize gives the
+   value's JSON bytes, an estimate of its size (V8's own format is not written) */
+static const char xs_v8_src[] =
+    "declare function v8_heap_limit(): number;\n"
+    "declare function v8_heap_used(): number;\n"
+    "export class HeapInfo {\n"
+    "  total_heap_size: number = 0;\n"
+    "  total_heap_size_executable: number = 0;\n"
+    "  total_physical_size: number = 0;\n"
+    "  total_available_size: number = 0;\n"
+    "  used_heap_size: number = 0;\n"
+    "  heap_size_limit: number = 0;\n"
+    "  malloced_memory: number = 0;\n"
+    "  peak_malloced_memory: number = 0;\n"
+    "  does_zap_garbage: number = 0;\n"
+    "  number_of_native_contexts: number = 1;\n"
+    "  number_of_detached_contexts: number = 0;\n"
+    "  total_global_handles_size: number = 0;\n"
+    "  used_global_handles_size: number = 0;\n"
+    "  external_memory: number = 0;\n"
+    "  total_allocated_bytes: number = 0;\n"
+    "}\n"
+    "export function getHeapStatistics(): HeapInfo {\n"
+    "  const h = new HeapInfo();\n"
+    "  const used = v8_heap_used();\n"
+    "  h.heap_size_limit = v8_heap_limit();\n"
+    "  h.used_heap_size = used;\n"
+    "  h.total_heap_size = used;\n"
+    "  h.total_physical_size = used;\n"
+    "  h.total_available_size = h.heap_size_limit - used;\n"
+    "  return h;\n"
+    "}\n"
+    "export function serialize(value: unknown): Buffer {\n"
+    "  return Buffer.from(JSON.stringify(value) ?? '');\n"
+    "}\n";
 static const char xs_os_src[] =
     "declare function os_parallelism(): int;\n"
     "export function availableParallelism(): int {\n  return os_parallelism();\n}\n"
@@ -5690,13 +5875,23 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         else prog->uses_net = true; /* (xisto:os: its functions live in xisto_net.h) */
         return m;
     }
+    if (strcmp(name, "v8") == 0) { /* written in xisto over runtime functions (see xs_v8_src) */
+        m->builtin = false;
+        m->file = "xisto:v8";
+        m->src = (char *)xs_v8_src;
+        m->native_prefix = "xs_";
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
     if (strcmp(name, "child_process") == 0) {
         Func *f = builtin_func(m, "execSync", "xs_exec_sync", ty_string, 1, ty_string, NULL);
         f->params[0].name = "command";
         add_func(prog, f);
         return m;
     }
-    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
     return NULL;
 }
 
