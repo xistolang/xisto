@@ -2859,6 +2859,19 @@ static void emit_expr_raw(Expr *e) {
             free(b.data);
             return;
         }
+        {   /* new X() as unknown as Record<string, unknown>: the fresh object's fields copied into a Record that is owned in
+               its place (the object let go), as a fresh value passes its ownership on through a cast */
+            Type *t = e->elem_type, *tb = t && t->kind == TY_NULLABLE ? t->elem : t;
+            if (e->op == 0 && tb && tb->kind == TY_MAP && tb->record && tb->key->kind == TY_STRING && tb->elem->kind == TY_UNKNOWN &&
+                e->lhs->type && e->lhs->type->kind == TY_UNKNOWN && is_fresh(e->lhs)) {
+                static int nro;
+                int id = nro++;
+                buf_printf(out, "({ void *rv%d_ = %s; void *rr%d_ = xs_as_record(rv%d_, %d, \"%s\"); if (rr%d_ != rv%d_) { xs_retain_(rr%d_); xs_release_(rv%d_); } "
+                                "(xs_map *)rr%d_; })", id, b.data, id, id, t->kind == TY_NULLABLE, ty_name(t), id, id, id, id, id);
+                free(b.data);
+                return;
+            }
+        }
         fu_dyn = e->lhs->type && ty_is_any(e->lhs->type);
         buf_puts(out, from_unknown(e->elem_type, b.data));
         fu_dyn = false;
@@ -9803,6 +9816,16 @@ static const char xs_symbol_for_c[] =
     "    return y;\n"
     "}\n"
 ;
+/* Map<number | null, V>'s key: SameValueZero as text (null, NaN, -0 is 0, 1 and 1.0 one key) */
+static const char xs_nkey_c[] =
+    "static xs_str *xs_nkey(double d) {\n"
+    "    char b[40];\n"
+    "    if (xs_isnull_num(d)) return xs_str_new(\"z\", 1);\n"
+    "    if (d != d) return xs_str_new(\"nNaN\", 4);\n"
+    "    if (d == 0) d = 0;\n"
+    "    int n = snprintf(b, sizeof b, \"n%.17g\", d);\n"
+    "    return xs_str_new(b, (size_t)n);\n"
+    "}\n";
 void emit_program(Program *p, Buf *o) {
     out = o;
     prog = p;
@@ -9810,6 +9833,7 @@ void emit_program(Program *p, Buf *o) {
     if (p->uses_v8) buf_puts(out, xs_v8_c);
     if (p->uses_unk_map) buf_puts(out, xs_unk_map_c);
     if (p->uses_symbol_for) buf_puts(out, xs_symbol_for_c);
+    if (p->uses_nkey) buf_puts(out, xs_nkey_c);
     indent = 0;
     site_tab.len = 0;
     if (site_tab.data) site_tab.data[0] = 0;
