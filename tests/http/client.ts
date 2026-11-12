@@ -20,7 +20,20 @@ try {
   const late: Response = await fetch("http://127.0.0.1:8080/slow?ms=600", { signal: AbortSignal.timeout(100) });
   console.log("no timeout?", late.status);
 } catch (err) {
-  console.log("timeout:", err.message);
+  console.log("timeout:", err.message, err.name);
 }
+// an AbortController aborted by a timer inside a handler (tests/http/abort.ts)
+const ab: Response = await fetch("http://127.0.0.1:8080/abortfetch");
+console.log(await ab.text());
+const early = new AbortController();
+early.abort();
+try {
+  await fetch("http://127.0.0.1:8080/slow?ms=1", { signal: early.signal });
+} catch (err) {
+  console.log("aborted before:", err.name);
+}
+const calm = new AbortController();
+const r3: Response = await fetch("http://127.0.0.1:8080/slow?ms=10", { signal: calm.signal });
+console.log("not aborted:", r3.status, await r3.text(), calm.signal.aborted);
 const ok: Response = await fetch("http://127.0.0.1:8080/slow?ms=20", { signal: AbortSignal.timeout(2000) });
 console.log(ok.status, await ok.text());

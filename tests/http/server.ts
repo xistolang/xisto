@@ -1,5 +1,6 @@
 import { setTimeout } from "node:timers/promises";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { abortFetch } from "./abort";
 
 function echo(req: HttpRequest): HttpResponse {
   return HttpResponse.json(`{"method":"${req.method}","token":"${req.header("X-Token")}","body":${req.body}}`);
@@ -48,4 +49,5 @@ app.post("/publish", publish);
 app.post("/echo", echo);
 app.get("/slow", slow);
 app.get("/ctx", ctx);
+app.get("/abortfetch", abortFetch);
 app.listen(8080);
