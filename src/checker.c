@@ -5716,6 +5716,22 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->field = -1;
                 return;
             }
+            if (strcmp(e->str, "__dirname") == 0 && !lookup("__dirname")) { /* the module's directory, absolute (Node's CommonJS
+                                                                                __dirname: where its files sit next to it) */
+                char rp[4096];
+                const char *f = cur_mod && cur_mod->file ? cur_mod->file : "";
+#if defined(_WIN32)
+                const char *abs = _fullpath(rp, f, sizeof rp) ? rp : f;
+#else
+                const char *abs = realpath(f, rp) ? rp : f;
+#endif
+                const char *sl = strrchr(abs, '/');
+                e->kind = E_STRING;
+                e->str = sl ? xs_strndup(abs, (size_t)(sl - abs)) : xs_strndup(".", 1);
+                e->type = ty_string;
+                check_expr(e, ty_string);
+                return;
+            }
             if (strcmp(e->str, "__filename") == 0) { /* the module's file, absolute (Node's CommonJS __filename) */
                 char rp[4096];
                 const char *f = cur_mod && cur_mod->file ? cur_mod->file : "";
