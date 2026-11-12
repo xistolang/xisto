@@ -4396,6 +4396,11 @@ static void check_object_member(Expr *e, Class *c) {
         e->lhs = fld;
         e->func = NULL;
         e->cls = NULL;
+        while (e->args.len < ft->nparams && ft->params[e->args.len]->kind == TY_NULLABLE && !ft->rest) { /* o.expression() with (alias?: string): null for what is left out */
+            Expr *nul = xs_alloc(sizeof *nul);
+            nul->kind = E_NULL; nul->pos = e->pos; nul->field = -1;
+            expr_list_push(&e->args, nul);
+        }
         pack_rest(e, ft);
         if (e->args.len != ft->nparams) xs_error(XS8062, e->pos, NULL, "'%s' takes %d argument(s), got %d", f->name, ft->nparams, e->args.len);
         for (int i = 0; i < e->args.len; i++) {
@@ -9271,6 +9276,10 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (!u && ba->kind == TY_ARRAY && bb->kind == TY_ARRAY) { /* c ? [x, 'y'] : [1, 2]: the wider array (unknown[]) */
                 if (elem_widens(bb->elem, ba->elem)) u = ta;
                 else if (elem_widens(ba->elem, bb->elem)) u = tb;
+                if (!u && ba->elem->kind == TY_OBJECT && bb->elem->kind == TY_OBJECT) { /* Array.isArray(x) ? x : [x]: two shapes of the same fields, the first */
+                    if (shape_ok(bb->elem, ba->elem)) u = ba;
+                    else if (shape_ok(ba->elem, bb->elem)) u = bb;
+                }
                 if (u && nul && u->kind != TY_NULLABLE) u = ty_nullable_of(u);
             }
             if (!u && tsc_checked() && ta->kind != TY_VOID && tb->kind != TY_VOID && ta->kind != TY_PROMISE && tb->kind != TY_PROMISE) {
