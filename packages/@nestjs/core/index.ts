@@ -439,7 +439,15 @@ function construct(ci: ClassInfo, depth: int): unknown {
       }
       token = byType;
     }
-    args.push(resolveToken(token, optional, ci.name, p.index, depth));
+    const resolved = resolveToken(token, optional, ci.name, p.index, depth);
+    // a provider whose factory registers the JSON state of its value as it runs (MongooseModule.forFeature's
+    // Model<X>): the parameter is decoded from that state, the exact instance its own type asks for
+    const late = __jsonValues.get(key);
+    if (late !== null && resolved !== null) {
+      args.push(p.type.decode(late));
+      continue;
+    }
+    args.push(resolved);
   }
   return ci.construct(args);
 }
