@@ -2558,6 +2558,13 @@ XS_NOINLINE xs_RegExpExecArray *xs_str_match_re(xs_str *s, xs_RegExp *r) {
     return a;
 }
 static void xs_print_RegExpExecArray_(void *p) { xs_RegExpExecArray_print(p); }
+/* s.match(re) ?? []: the match as the string[] it is in JavaScript (null stays null) */
+XS_NOINLINE xs_arr_ref *xs_RegExpExecArray_strings(xs_RegExpExecArray *a) {
+    if (!a) return NULL;
+    xs_arr_ref *out = xs_arr_ref_new((size_t)(a->f_length ? a->f_length : 1), xs_print_str_quoted_);
+    for (int64_t i = 0; i < a->f_length; i++) xs_arr_ref_push(out, a->items[i] ? xs_retain(a->items[i]) : xs_str_new("", 0));
+    return out;
+}
 /* s.matchAll(re): every match, with groups and index (the flag g is required, as in JS) */
 XS_NOINLINE xs_arr_ref *xs_str_match_all_re(xs_str *s, xs_RegExp *r) {
     if (!(r->re->flags & XF_G)) xr_throw("TypeError", "String.prototype.matchAll called with a non-global RegExp argument");

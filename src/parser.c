@@ -1092,7 +1092,7 @@ static bool is_js_error_name(const char *n) {
 /* the web globals xisto:url declares (runtime/node/url.ts) */
 static bool is_url_global_name(const char *n) {
     return n && (!strcmp(n, "URL") || !strcmp(n, "URLSearchParams") || !strcmp(n, "AbortController") || !strcmp(n, "AbortSignal") ||
-                 !strcmp(n, "DOMException"));
+                 !strcmp(n, "DOMException") || !strcmp(n, "RequestInit") || !strcmp(n, "HeadersInit") || !strcmp(n, "fetch") || !strcmp(n, "BufferEncoding"));
 }
 static Expr *parse_primary(Parser *p) {
     Pos pos = p->tok.pos;
@@ -3800,6 +3800,50 @@ static Expr *ns_member(Parser *p, Expr *e, Token name) {
     return id;
 }
 
+/* XB-117: import { Logger as PinoLogger } from "nestjs-pino" next to import { Logger } from "@nestjs/common": both
+   would read as Logger. The alias then reads as "Logger\x01nestjs-pino" (its name and the module it comes from), which
+   the checker resolves in that module only (find_class, lookup_func); the plain Logger stays the other one's. */
+typedef struct { Module *m; int idx; char *exported; const char *spec; } AliasRec;
+static AliasRec *alias_recs;
+static int nalias_recs;
+static void mark_qualified(Module *m, const char *spec, const char *name) {
+    for (int k = 0; k < m->nimports; k++) {
+        Import *x = &m->imports[k];
+        if (!x->path || strcmp(x->path, spec) != 0) continue;
+        for (int j = 0; j < x->n; j++)
+            if (strcmp(x->names[j], name) == 0) {
+                if (!x->qualified) x->qualified = xs_alloc(sizeof(bool) * (size_t)(x->n ? x->n : 1));
+                x->qualified[j] = true;
+            }
+    }
+}
+static void alias_collisions(Parser *p, Module *m, int first, Import *im) {
+    /* this import's aliases: remembered with their module, and qualified when another import already gives the name */
+    for (int i = first; i < p->nalias; i++) {
+        if (strstr(p->alias_to[i], "__local")) continue;
+        alias_recs = realloc(alias_recs, sizeof(AliasRec) * (size_t)(nalias_recs + 1));
+        alias_recs[nalias_recs++] = (AliasRec){m, i, p->alias_to[i], im->path};
+        for (int k = 0; k + 1 < m->nimports; k++)
+            for (int j = 0; j < m->imports[k].n; j++)
+                if (strcmp(m->imports[k].names[j], p->alias_to[i]) == 0 && m->imports[k].path && strcmp(m->imports[k].path, im->path) != 0) {
+                    mark_qualified(m, im->path, p->alias_to[i]);
+                    p->alias_to[i] = xs_sprintf("%s\x01%s", p->alias_to[i], im->path);
+                }
+    }
+    /* this import's plain names: an earlier alias of another module to the same name gets qualified */
+    for (int j = 0; j < im->n; j++) {
+        bool aliased_here = false; /* (the name is this import's own alias target, not a plain import) */
+        for (int i = first; i < p->nalias; i++) if (strcmp(p->alias_to[i], im->names[j]) == 0 || strncmp(p->alias_to[i], im->names[j], strlen(im->names[j])) == 0) aliased_here = true;
+        if (aliased_here) continue;
+        for (int r = 0; r < nalias_recs; r++) {
+            AliasRec *a = &alias_recs[r];
+            if (a->m != m || a->idx >= first || a->idx >= p->nalias || strcmp(a->spec, im->path) == 0) continue;
+            if (strcmp(a->exported, im->names[j]) != 0 || strcmp(p->alias_to[a->idx], a->exported) != 0) continue;
+            mark_qualified(m, a->spec, a->exported);
+            p->alias_to[a->idx] = xs_sprintf("%s\x01%s", a->exported, a->spec);
+        }
+    }
+}
 static void parse_import(Parser *p, Module *m) {
     Pos pos = p->tok.pos;
     expect(p, TK_IMPORT, NULL);
@@ -3839,6 +3883,7 @@ static void parse_import(Parser *p, Module *m) {
     if (!at(p, TK_LBRACE))
         xs_error(XS1016, p->tok.pos, "xisto supports named imports only: import { a, b } from \"./file\";", "expected '{' after import");
     next(p);
+    int alias_first = p->nalias; /* (the aliases this import adds: alias_first..) */
     while (!at(p, TK_RBRACE)) {
         if (at_ident(p, "type")) { /* import { type A, b }: A is imported like any other name ({ type as t } imports `type`) */
             Parser look = *p; next(&look);
@@ -3883,6 +3928,7 @@ from:
     expect_semi(p);
     m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
     m->imports[m->nimports++] = im;
+    if (im.n) alias_collisions(p, m, alias_first, &m->imports[m->nimports - 1]);
 }
 
 static Module *load_module(Program *prog, const char *file, Pos from_pos, const char *from_file);
@@ -5161,6 +5207,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->builtin = false;
         m->file = "xisto:url";
         m->src = (char *)xs_node_url_ts;
+        m->native_prefix = "xs_"; /* (declare function fetch_body_bytes: xs_fetch_body_bytes) */
         m->loading = true;
         parse_module(prog, m);
         m->loading = false;

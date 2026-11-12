@@ -20,7 +20,8 @@ export class Request {
   url: string = "/";
   path: string = "/";
   headers: IncomingHttpHeaders = new IncomingHttpHeaders();
-  body: string = "";
+  /** The body as Express's json parser gives it: the parsed JSON, or {} when there is none (rawBody has the bytes). */
+  body: any = {};
   /** The body's bytes (Nest's rawBody: true). */
   rawBody: Buffer | null = null;
   ip: string = "";

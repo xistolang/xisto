@@ -29,6 +29,7 @@ import {
   __appFactories,
   bodyField,
   CallHandler,
+  __callHandler,
   ClassProvider,
   CorsOptions,
   DynamicModule,
@@ -595,6 +596,21 @@ function headersJson(request: Request): string {
   return JSON.stringify(all);
 }
 
+// req.body as Express's json parser leaves it: the parsed JSON, or {} (no body, or not JSON)
+function parsedBody(text: string): any {
+  if (text.length === 0) {
+    const empty: any = {};
+    return empty;
+  }
+  try {
+    const v: any = JSON.parse(text);
+    return v;
+  } catch (e) {
+    const empty: any = {};
+    return empty;
+  }
+}
+
 // the request's data as JSON (what a parameter declared as an object type reads: user, params, ip...)
 function requestJson(request: Request): string {
   const user: any = request.user;
@@ -611,7 +627,7 @@ function notFound(r: Route, req: HttpRequest): HttpResponse {
   request.method = req.method;
   request.url = req.path;
   request.path = req.path;
-  request.body = req.body;
+  request.body = parsedBody(req.body);
   const response = new Response();
   const ctx = new ExecutionContext(request, response);
   ctx.setHandler(r.handler);
@@ -637,7 +653,7 @@ function handle(r: Route, req: HttpRequest): HttpResponse {
   request.method = req.method;
   request.url = req.path;
   request.path = req.path;
-  request.body = req.body;
+  request.body = parsedBody(req.body);
   request.rawBody = Buffer.from(req.body);
   for (const h of ["authorization", "content-type", "accept", "user-agent", "accept-encoding", "x-request-id"]) {
     const v = req.header(h);
@@ -670,7 +686,7 @@ function handle(r: Route, req: HttpRequest): HttpResponse {
       const next = chain;
       const instance = r.interceptors[i];
       const intercept = r.interceptorMethods[i];
-      chain = (): unknown => observed(intercept.invoke(instance, [ctx, new CallHandler(next)]));
+      chain = (): unknown => observed(intercept.invoke(instance, [ctx, __callHandler(next)]));
     }
     // subscribed as Nest does: finalize() callbacks run once the outermost interceptor has the value
     let result: unknown = null;
