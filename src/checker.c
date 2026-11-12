@@ -6027,7 +6027,10 @@ static void check_expr_in(Expr *e, Type *expected) {
             }
         }
         if (e->kind == E_ASSIGN && ((target->kind == E_INDEX) || (target->kind == E_MEMBER && !target->is_call && target->str)) &&
-            target->lhs && plain_path(target->lhs) && !(target->lhs->kind == E_IDENT && !lookup(target->lhs->str))) {
+            target->lhs && (plain_path(target->lhs) || /* (or xs[i].f = v: where[0].cdStatus = x) */
+                            (target->kind == E_MEMBER && target->lhs->kind == E_INDEX && plain_path(target->lhs->lhs) &&
+                             (target->lhs->rhs->kind == E_NUMBER || target->lhs->rhs->kind == E_IDENT))) &&
+            !(target->lhs->kind == E_IDENT && !lookup(target->lhs->str))) {
             check_expr(target->lhs, NULL); /* a variable or a field path: checking it twice is harmless */
             target->lhs = rec_get_nn(target->lhs);
             if (target->kind == E_INDEX && target->lhs->type && target->lhs->type->kind == TY_OBJECT && !target->lhs->type->cls->builtin &&
