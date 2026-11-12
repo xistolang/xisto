@@ -11,6 +11,8 @@
 #include <windows.h>
 #else
 #include <sys/wait.h>
+#include <signal.h>
+#include <errno.h>
 #endif
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -164,6 +166,41 @@ static void usage(void) {
 }
 
 static bool use_qbe;
+
+#if !defined(_WIN32)
+/* xisto run: the program as a direct child (no shell in between), so `kill <pid of xisto run>` reaches it:
+   SIGTERM and SIGHUP are passed on; SIGINT and SIGQUIT come from the terminal to the whole foreground group, so the
+   program already has them and xisto only waits (passing them on would deliver them twice). Its exit code, or
+   128 + the signal that ended it, as a shell reports it. */
+static volatile pid_t run_child;
+static void run_forward(int sig) { if (run_child > 0) kill(run_child, sig); }
+static int run_exe(const char *exe, int argc, char **argv, int rest) {
+    char **av = malloc(sizeof(char *) * (size_t)(argc - rest + 2));
+    int n = 0;
+    av[n++] = (char *)exe;
+    for (int i = rest; i < argc; i++) av[n++] = argv[i];
+    av[n] = NULL;
+    pid_t pid = fork();
+    if (pid < 0) { perror("xisto: fork"); free(av); return 1; }
+    if (pid == 0) { execv(exe, av); perror("xisto: exec"); _exit(127); }
+    run_child = pid;
+    struct sigaction fwd = {0}, ign = {0};
+    fwd.sa_handler = run_forward;
+    ign.sa_handler = SIG_IGN;
+    sigemptyset(&fwd.sa_mask);
+    sigemptyset(&ign.sa_mask);
+    sigaction(SIGTERM, &fwd, NULL);
+    sigaction(SIGHUP, &fwd, NULL);
+    sigaction(SIGINT, &ign, NULL);
+    sigaction(SIGQUIT, &ign, NULL);
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0) if (errno != EINTR) { st = 1 << 8; break; }
+    free(av);
+    if (WIFEXITED(st)) return WEXITSTATUS(st);
+    if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
+    return 1;
+}
+#endif
 
 static void find_xisto_dir(const char *argv0) {
     char buf[1024];
@@ -1154,11 +1191,15 @@ int main(int argc, char **argv) {
 #endif
     if (use_qbe) build_qbe_cached(last_program, file, exe);
     else run_cc(cfile, exe, dev);
+    fflush(stdout);
+#if defined(_WIN32)
     Buf cmdline = {0};
     buf_puts(&cmdline, xs_q(exe));
     for (int i = rest; i < argc; i++) buf_printf(&cmdline, " %s", xs_q(argv[i]));
-    fflush(stdout);
     int rc = xs_sh(cmdline.data);
+#else
+    int rc = run_exe(exe, argc, argv, rest);
+#endif
     unlink(cfile);
     unlink(exe);
     rmdir(dir);

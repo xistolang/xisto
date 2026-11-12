@@ -114,10 +114,22 @@ bootstrap();
 EOF
 ```
 
+Run it in one of two ways. While developing, `xisto run` compiles to a temporary file and starts it, with no build
+step:
+
 ```sh
-xisto build                      # ./hello-nest, a native executable of about 1 MB
+xisto run &                      # the server, on port 3123
+curl localhost:3123              # Hello from xisto
+kill $!                          # stops it
+```
+
+For the server, `xisto build` makes an optimised executable (`-O2`) that runs on its own, with nothing installed:
+
+```sh
+xisto build                      # ./hello-nest, a native executable of about 1 MB (it only compiles)
 ./hello-nest &                   # the server, on port 3123
 curl localhost:3123              # Hello from xisto
+kill $!                          # stops it
 
 rm -rf .xisto && xisto install   # a fresh checkout: restores the packages from xisto.lock
 xisto build
