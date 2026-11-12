@@ -3087,6 +3087,10 @@ XS_NOINLINE bool xs_dyn_has(void *o, xs_str *k) {
         return has;
     }
     if (t->free == xs_map_free) return ((xs_map *)o)->str_keys && xs_map_lookup(o, k, 0) != NULL;
+    if (t->free == xs_Error_free) { /* 'cause' in err: an Error has message and stack; cause when it was given */
+        if (k->len == 5 && memcmp(k->data, "cause", 5) == 0) return ((xs_Error *)o)->f_cause != NULL;
+        return (k->len == 7 && memcmp(k->data, "message", 7) == 0) || (k->len == 5 && memcmp(k->data, "stack", 5) == 0);
+    }
     return false;
 }
 /* 'k' in u, u a union of objects (held as an unknown): the member it holds has k */
