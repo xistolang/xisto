@@ -1,0 +1,31 @@
+/* xisto colours (the logo's slate and green) */
+:root {
+  --ifm-color-primary: #1f8a7c;
+  --ifm-color-primary-dark: #1c7c70;
+  --ifm-color-primary-darker: #1a7569;
+  --ifm-color-primary-darkest: #156157;
+  --ifm-color-primary-light: #229888;
+  --ifm-color-primary-lighter: #239f8f;
+  --ifm-color-primary-lightest: #27b3a1;
+  --ifm-code-font-size: 95%;
+  --ifm-font-family-base: Inter, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+[data-theme='dark'] {
+  --ifm-color-primary: #4fc7b4;
+  --ifm-color-primary-dark: #3bbfab;
+  --ifm-color-primary-darker: #38b4a1;
+  --ifm-color-primary-darkest: #2e9485;
+  --ifm-color-primary-light: #66cebe;
+  --ifm-color-primary-lighter: #71d2c3;
+  --ifm-color-primary-lightest: #93ddd1;
+  --ifm-background-color: #15191b;
+  --ifm-navbar-background-color: #111416;
+  --ifm-footer-background-color: #111416;
+  --ifm-background-surface-color: #1a1f22;
+}
+.hero--xisto { padding: 4rem 0 3rem; text-align: center; }
+.hero--xisto img.hero-logo { width: 96px; height: 96px; }
+.hero--xisto .buttons { display: flex; gap: 0.75rem; justify-content: center; flex-wrap: wrap; margin-top: 1.5rem; }
+.install { max-width: 36rem; margin: 1.5rem auto 0; text-align: left; }
+.features { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1.5rem; padding: 2rem 0 3rem; }
+.features h3 { margin-bottom: 0.4rem; }
