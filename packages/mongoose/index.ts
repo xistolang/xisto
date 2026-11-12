@@ -1218,8 +1218,8 @@ export class Model<T = unknown> {
     return new Collection(this.db, this.collectionName);
   }
 
-  find(filter: FilterQuery<T> = {}, projection: unknown = null, options: QueryOptions<T> | null = null): Query<T[], T> {
-    const q = new Query<T[], T>(this, "find", filter);
+  find(filter: FilterQuery<T> = {}, projection: unknown = null, options: QueryOptions<T> | null = null): Query<HydratedDocument<T>[], T> {
+    const q = new Query<HydratedDocument<T>[], T>(this, "find", filter);
     if (projection !== null) q.select(projection);
     if (options !== null) {
       if (options.sort != null) q.sort(options.sort);
@@ -1229,8 +1229,8 @@ export class Model<T = unknown> {
     }
     return q;
   }
-  findOne(filter: FilterQuery<T> = {}, projection: unknown = null, options: QueryOptions<T> | null = null): Query<T | null, T> {
-    const q = new Query<T | null, T>(this, "findOne", filter);
+  findOne(filter: FilterQuery<T> = {}, projection: unknown = null, options: QueryOptions<T> | null = null): Query<HydratedDocument<T> | null, T> {
+    const q = new Query<HydratedDocument<T> | null, T>(this, "findOne", filter);
     if (projection !== null) q.select(projection);
     if (options !== null) {
       if (options.sort != null) q.sort(options.sort);
@@ -1238,15 +1238,15 @@ export class Model<T = unknown> {
     }
     return q;
   }
-  findById(id: unknown, projection: unknown = null): Query<T | null, T> {
+  findById(id: unknown, projection: unknown = null): Query<HydratedDocument<T> | null, T> {
     const f: Record<string, unknown> = {};
     f["_id"] = id;
-    const q = new Query<T | null, T>(this, "findById", f);
+    const q = new Query<HydratedDocument<T> | null, T>(this, "findById", f);
     if (projection !== null) q.select(projection);
     return q;
   }
-  findOneAndUpdate(filter: FilterQuery<T>, update: UpdateQuery<T>, options: QueryOptions<T> | null = null): Query<T | null, T> {
-    const q = new Query<T | null, T>(this, "findOneAndUpdate", filter).withUpdate(update);
+  findOneAndUpdate(filter: FilterQuery<T>, update: UpdateQuery<T>, options: QueryOptions<T> | null = null): Query<HydratedDocument<T> | null, T> {
+    const q = new Query<HydratedDocument<T> | null, T>(this, "findOneAndUpdate", filter).withUpdate(update);
     if (options !== null) {
       if (options.new != null) q.withOption("new", options.new);
       if (options.returnDocument != null) q.withOption("returnDocument", options.returnDocument);
@@ -1256,20 +1256,20 @@ export class Model<T = unknown> {
     }
     return q;
   }
-  findByIdAndUpdate(id: unknown, update: UpdateQuery<T>, options: QueryOptions<T> | null = null): Query<T | null, T> {
+  findByIdAndUpdate(id: unknown, update: UpdateQuery<T>, options: QueryOptions<T> | null = null): Query<HydratedDocument<T> | null, T> {
     const f: Record<string, unknown> = {};
     f["_id"] = id;
     return this.findOneAndUpdate(f, update, options);
   }
-  findOneAndDelete(filter: FilterQuery<T>, options: QueryOptions<T> | null = null): Query<T | null, T> {
-    const q = new Query<T | null, T>(this, "findOneAndDelete", filter);
+  findOneAndDelete(filter: FilterQuery<T>, options: QueryOptions<T> | null = null): Query<HydratedDocument<T> | null, T> {
+    const q = new Query<HydratedDocument<T> | null, T>(this, "findOneAndDelete", filter);
     if (options !== null && options.sort != null) q.sort(options.sort);
     return q;
   }
-  findByIdAndDelete(id: unknown): Query<T | null, T> {
+  findByIdAndDelete(id: unknown): Query<HydratedDocument<T> | null, T> {
     const f: Record<string, unknown> = {};
     f["_id"] = id;
-    return new Query<T | null, T>(this, "findByIdAndDelete", f);
+    return new Query<HydratedDocument<T> | null, T>(this, "findByIdAndDelete", f);
   }
   countDocuments(filter: FilterQuery<T> = {}): Query<number, T> {
     return new Query<number, T>(this, "countDocuments", filter);
@@ -1301,18 +1301,18 @@ export class Model<T = unknown> {
   }
 
   /** inserts a document (its fields, cast by the schema, with defaults, _id, timestamps and __v): the document */
-  async create(doc: unknown): Promise<T> {
+  async create(doc: unknown): Promise<HydratedDocument<T>> {
     const conn = this.db;
     await conn.__ready(this.collectionName, "insertOne");
     const built = buildDoc(this.schema, doc, true, new Date(), false);
     writeReply(conn.__text({ insert: this.collectionName, documents: [built], ordered: true }));
     const text = JSON.stringify(built);
     rememberDocuments(text, this.connectionKey + "/" + this.modelName);
-    const r: T = JSON.parse(text);
+    const r: HydratedDocument<T> = JSON.parse(text);
     return r;
   }
   /** inserts the documents in one command (ordered): the documents */
-  async insertMany(docs: unknown[]): Promise<T[]> {
+  async insertMany(docs: unknown[]): Promise<HydratedDocument<T>[]> {
     const conn = this.db;
     await conn.__ready(this.collectionName, "insertMany");
     const now = new Date();
@@ -1338,7 +1338,7 @@ export class Model<T = unknown> {
         throw e;
       }
     }
-    const r: T[] = JSON.parse(JSON.stringify(built));
+    const r: HydratedDocument<T>[] = JSON.parse(JSON.stringify(built));
     return r;
   }
   /** several writes ({ insertOne: { document } }, { updateOne: { filter, update, upsert } }, { deleteMany: {
@@ -1409,9 +1409,9 @@ export class Model<T = unknown> {
   }
 }
 
-/** A hydrated document: T itself for now (mongoose: T & Document; the compiler branch that gives intersections
- *  with a class their members makes it T & Document) */
-export type HydratedDocument<T> = T;
+/** A hydrated document: T & Document (T's fields with _id, __v, toObject(), save()): a class the compiler makes per
+ *  schema class T (docs/proposta-classes-derivadas.md) */
+export type HydratedDocument<T> = T & Document;
 
 // the model (its connection key and name) of each document create/findOne/findById gave, by _id: what save() writes
 // through (a document decoded from JSON carries no link of its own, and a field for it would show in its JSON)
