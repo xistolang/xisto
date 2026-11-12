@@ -208,6 +208,15 @@ static void count_calls_stmt(Stmt *s, Func *in, Module *m) {
     for (int i = 0; i < s->stmts.len; i++) count_calls_stmt(s->stmts.items[i], in, m);
     for (int i = 0; i < s->ncases; i++) { count_calls_expr(s->cases[i].value, in, m); count_calls_stmt(s->cases[i].body, in, m); }
 }
+/* a class's toJSON(): string (bson's ObjectId): JSON.stringify writes what it returns, as a string */
+static Func *json_tojson(Class *c) {
+    for (Class *k = c; k; k = k->base)
+        for (int i = 0; i < k->nmethods; i++) {
+            Func *f = k->methods[i];
+            if (strcmp(f->name, "toJSON") == 0 && f->nparams == 0 && f->ret && f->ret->kind == TY_STRING && f->used && f->body) return f;
+        }
+    return NULL;
+}
 static void count_calls(Program *p) {
     for (int i = 0; i < p->nfuncs; i++) { p->funcs[i]->ncalls = 0; p->funcs[i]->call1 = NULL; p->funcs[i]->call1_site = 0; p->funcs[i]->fail_state = 0; p->funcs[i]->clone_state = 0; }
     for (int i = 0; i < p->nclasses; i++) {
@@ -224,6 +233,10 @@ static void count_calls(Program *p) {
         for (int k = 0; k < c->nmethods; k++) if (c->methods[k]->used && c->methods[k]->cls == c) count_calls_stmt(c->methods[k]->body, c->methods[k], c->mod);
     }
     for (int i = 0; i < p->top.len; i++) count_calls_stmt(p->top.items[i], NULL, p->top.items[i]->mod);
+    for (int i = 0; i < p->nclasses; i++) { /* toJSON(): also called by the JSON writer of its class */
+        Func *tj = p->classes[i]->used ? json_tojson(p->classes[i]) : NULL;
+        if (tj) tj->ncalls = -1;
+    }
 }
 
 /* ---- typed-array parameters of a fixed length ----
@@ -1570,7 +1583,11 @@ static void ensure_json(Type *t) {
         return;
     }
     buf_printf(&json_protos, "static void json_put_%s(xs_sb *sb, %s *o);\nstatic %s *json_get_%s(xs_jv *v, const char *where);\n", tag, c->cname, c->cname, tag);
-    buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *o) {\n    xs_sb_put(sb, \"{\", 1);\n    bool first_ = true; (void)first_;\n", tag, c->cname);
+    Func *tj = json_tojson(c);
+    if (tj) /* toJSON(): string: its result, as a JSON string */
+        buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *o) {\n    xs_str *t_ = %s((%s *)o);\n    xs_sb_str(sb, t_);\n    xs_release(t_);\n    if (0) {\n",
+                   tag, c->cname, tj->cname, tj->cls->cname);
+    buf_printf(b, tj ? "    xs_sb_put(sb, \"{\", 1);\n    bool first_ = true; (void)first_;\n" : "static void json_put_%s(xs_sb *sb, %s *o) {\n    xs_sb_put(sb, \"{\", 1);\n    bool first_ = true; (void)first_;\n", tag, c->cname);
     for (int i = 0; i < c->nfields; i++) {
         Field *f = &c->fields[i];
         if (ty_is_undef(f->type)) continue; /* r: undefined: JSON.stringify leaves it out */
@@ -1583,7 +1600,7 @@ static void ensure_json(Type *t) {
         buf_puts(b, "\n");
         if (f->optional) buf_puts(b, "    }\n");
     }
-    buf_puts(b, "    xs_sb_put(sb, \"}\", 1);\n}\n");
+    buf_puts(b, tj ? "    xs_sb_put(sb, \"}\", 1);\n    }\n}\n" : "    xs_sb_put(sb, \"}\", 1);\n}\n");
     /* parse: allocate the object without running the constructor, then fill every field from the JSON */
     buf_printf(b, "static %s *json_get_%s(xs_jv *v, const char *where) {\n    if (v->kind != XJ_OBJ) xs_panicf(\"JSON: '%%s' must be an object\", where);\n    %s *o = xs_obj_alloc_t(sizeof(%s), &%s_type);\n", c->cname, tag, c->cname, c->cname, c->cname);
     for (int i = 0; i < c->nfields; i++) {

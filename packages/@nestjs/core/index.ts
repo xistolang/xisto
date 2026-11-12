@@ -257,16 +257,21 @@ function addEntry(token: unknown, provider: unknown): void {
   container.entries.set(key, { key: key, token: token, provider: provider, host: declaringModule });
 }
 
+const seenDynamic: DynamicModule[] = [];
+
 // the modules the root reaches through its imports (static and dynamic), in Nest's order
 function collect(m: unknown, seen: Map<string, boolean>): void {
   if (m instanceof DynamicModule) {
     const d = m as DynamicModule;
-    const key = "dyn:" + d.module.id;
     collectMeta(d.module, seen);
-    if (seen.has(key)) {
-      return;
+    // each dynamic module object once: two calls of one module (MongooseModule.forRoot and forFeature, forFeature
+    // in two modules) are two modules, as in Nest
+    for (const x of seenDynamic) {
+      if (x === d) {
+        return;
+      }
     }
-    seen.set(key, true);
+    seenDynamic.push(d);
     for (const i of d.imports || []) {
       collect(i, seen);
     }
