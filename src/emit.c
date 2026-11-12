@@ -10116,6 +10116,12 @@ void emit_program(Program *p, Buf *o) {
     free(modfns.data);
     out = main_out;
     if (xs_any_used) emit_dyn_tables(p); /* any: every class's fields by name (before the descriptors that point to them) */
+    if (xs_any_call_used) /* x.m() on an any: its failures, as JavaScript's TypeErrors (only in a program that does it) */
+        buf_puts(out, "XS_NOINLINE void xs_dyn_not_function(xs_str *k) {\n"
+                      "    static XS_TLS char buf[200];\n"
+                      "    snprintf(buf, sizeof buf, \"TypeError: %.*s is not a function\", (int)(k->len > 100 ? 100 : k->len), k->data);\n"
+                      "    xs_panic(buf);\n}\n"
+                      "XS_NOINLINE void xs_dyn_null_call(xs_str *k) { xs_dyn_fail_read(NULL, k); }\n");
     /* class free/print prototypes are needed by JSON parsers that allocate objects */
     for (int i = 0; i < p->nclasses; i++)
         if (p->classes[i]->used && !p->classes[i]->builtin) {

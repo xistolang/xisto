@@ -2927,6 +2927,7 @@ static void to_unknown(Expr *e) {
    is any. */
 static Expr *dyn_lvalue; /* the target of the assignment being checked: xs[i] = v of an any[] stays an element */
 bool xs_any_used; /* the program reads or writes an any by name: the emitter gives every class its field table */
+bool xs_any_call_used; /* x.m() on an any: the emitter writes its two failures (xs_dyn_not_function, xs_dyn_null_call) */
 static Field *find_field(Class *c, const char *name, int *index);
 static Func *find_method(Class *c, const char *name);
 static Expr *dyn_key(Pos pos, const char *s) {
@@ -3088,6 +3089,7 @@ static bool any_method_call(Expr *e, Type *expected, bool missing_ok) {
     Expr *recv = e->lhs;
     recv->prechecked = true;
     ExprList args = e->args;
+    xs_any_call_used = true;
     xs_warn_rule(XS2007, pos, "give the value its type (as SomeClass) to take the typed path",
                  "'%s' called on an any is looked up by name at run time among the classes that have it (about 10x slower than a typed call)", m);
     memset(e, 0, sizeof *e);
@@ -3144,6 +3146,15 @@ static bool dyn_to(Expr *e, Type *want) {
            qr.query(...)): written as its JSON and decoded into it, checked field by field (a copy, as a typed query's
            result is; a value a variable holds keeps the check of its type, so no object is copied behind the program) */
         v->prechecked = true;
+        { /* (the copy said where it is made: no identity with the object the call returned) */
+            Expr *c = v->kind == E_AWAIT && v->lhs ? v->lhs : v;
+            const char *name = "the call";
+            if (c->kind == E_MEMBER && c->str) name = xs_sprintf("%s.%s", callee_text(c->lhs), c->str);
+            else if (c->kind == E_CALL && c->lhs && c->lhs->kind == E_IDENT && c->lhs->str) name = c->lhs->str;
+            else if (c->kind == E_CALL && c->lhs && c->lhs->kind == E_MEMBER && c->lhs->str) name = xs_sprintf("%s.%s", callee_text(c->lhs->lhs), c->lhs->str);
+            xs_warn_rule(XS2110, pos, "give the call its type to avoid it",
+                         "the result of '%s' is a copy made through JSON (no identity with the object it returned)", name);
+        }
         Expr *js = xs_alloc(sizeof *js);
         js->kind = E_AS; js->pos = pos; js->field = -1; js->lhs = v; js->elem_type = ty_json;
         memset(e, 0, sizeof *e);
