@@ -10,7 +10,7 @@ BASE = sys.argv[1].rstrip("/")
 def call(method, path, body=None, headers=None):
     data = None if body is None else body.encode()
     h = dict(headers or {})
-    if body is not None:
+    if body is not None and "Content-Type" not in h:
         h["Content-Type"] = "application/json"
     req = urllib.request.Request(BASE + path, data=data, method=method, headers=h)
     try:
@@ -29,7 +29,8 @@ for b in ['{}', '{"ip":"1.2.3.4","company":5}', '{"ip":"  ","company":"abc"}', '
     call("POST", "/api/forms/tablet", b)
 for b in ['{}', '{"name":""}', '{"printer":2}', '{"printer":"1"}', '{"ticket":"X","printer":1}', '{"active":"x"}',
           '{"name":"a","printer":0,"ticket":"S","active":3}', '{"ticket":"S","note":"x"}', '{"ticket":"N"}',
-          '{"printer":1,"printerModel":"zebra"}', '{"printer":1,"printerModel":""}', '{"printer":0}']:
+          '{"printer":1,"printerModel":"zebra"}', '{"printer":1,"printerModel":""}', '{"printer":0}',
+          '{"kiosk":1}', '{"kiosk":7}']:
     call("POST", "/api/forms/kiosk", b)
 for b in ['{"name":"a","sortOrder":"DESC"}', '{"name":"a","sortOrder":"up"}', '{"name":"a"}']:
     call("POST", "/api/forms/sort", b)
@@ -41,7 +42,10 @@ call("GET", "/api/forms/issued", headers={"x-issuer": "other"})
 call("GET", "/api/forms/issued", headers={"x-dev": "1"})
 call("GET", "/api/forms/url?a=1&b=two")
 call("GET", "/api/forms/url-alias")
+call("GET", "/api/forms/url?a=1&a=2&z=x%20y")
 call("GET", "/api/forms/bytes")
+call("POST", "/api/forms/stream", "olá, corpo cru", headers={"Content-Type": "text/plain"})
+call("POST", "/api/forms/stream", '{"a":1}')
 call("GET", "/api/forms/me", headers={"x-user": "ana:t1"})
 call("GET", "/api/forms/me", headers={"x-user": "bia"})
 call("GET", "/api/forms/me")

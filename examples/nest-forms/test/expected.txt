@@ -15,6 +15,8 @@ POST /api/forms/kiosk {"ticket":"N"} -> 200 {"name": null, "printer": null, "tic
 POST /api/forms/kiosk {"printer":1,"printerModel":"zebra"} -> 200 {"name": null, "printer": 1, "ticket": null}
 POST /api/forms/kiosk {"printer":1,"printerModel":""} -> 400 {"error": "Bad Request", "message": ["printerModel should not be empty"], "statusCode": 400}
 POST /api/forms/kiosk {"printer":0} -> 200 {"name": null, "printer": 0, "ticket": null}
+POST /api/forms/kiosk {"kiosk":1} -> 200 {"name": null, "printer": null, "ticket": null}
+POST /api/forms/kiosk {"kiosk":7} -> 400 {"error": "Bad Request", "message": ["Kiosk: 7 is not valid, use 0 or 1."], "statusCode": 400}
 POST /api/forms/sort {"name":"a","sortOrder":"DESC"} -> 200 {"name": "a", "sortOrder": "desc"}
 POST /api/forms/sort {"name":"a","sortOrder":"up"} -> 400 {"error": "Bad Request", "message": ["sortOrder must be one of the following values: asc, desc"], "statusCode": 400}
 POST /api/forms/sort {"name":"a"} -> 200 {"name": "a", "sortOrder": null}
@@ -24,9 +26,12 @@ GET /api/forms/settings  -> 200 {"hasKid": false, "issuer": "forms-app", "ttlSec
 GET /api/forms/issued  {"x-issuer": "forms-app"}-> 200 {"issued": true}
 GET /api/forms/issued  {"x-issuer": "other"}-> 403 {"error": "Forbidden", "message": "issuer forms-app required", "statusCode": 403}
 GET /api/forms/issued  {"x-dev": "1"}-> 200 {"issued": true}
-GET /api/forms/url?a=1&b=two  -> 200 {"originalUrl": "/api/forms/url?a=1&b=two", "path": "/api/forms/url"}
-GET /api/forms/url-alias  -> 200 {"originalUrl": "/api/forms/url-alias", "path": "/api/forms/url-alias"}
+GET /api/forms/url?a=1&b=two  -> 200 {"a": "1", "originalUrl": "/api/forms/url?a=1&b=two", "path": "/api/forms/url", "query": {"a": "1", "b": "two"}}
+GET /api/forms/url-alias  -> 200 {"a": null, "originalUrl": "/api/forms/url-alias", "path": "/api/forms/url-alias", "query": {}}
+GET /api/forms/url?a=1&a=2&z=x%20y  -> 200 {"a": ["1", "2"], "originalUrl": "/api/forms/url?a=1&a=2&z=x%20y", "path": "/api/forms/url", "query": {"a": ["1", "2"], "z": "x y"}}
 GET /api/forms/bytes  -> 200 'olá, bytes'
+POST /api/forms/stream olá, corpo cru {"Content-Type": "text/plain"}-> 200 {"size": 15, "text": "olá, corpo cru"}
+POST /api/forms/stream {"a":1} -> 200 {"size": 0, "text": ""}
 GET /api/forms/me  {"x-user": "ana:t1"}-> 200 {"sub": "ana", "tenant": "t1"}
 GET /api/forms/me  {"x-user": "bia"}-> 200 {"sub": "bia", "tenant": "none"}
 GET /api/forms/me  -> 401 {"message": "Unauthorized", "statusCode": 401}

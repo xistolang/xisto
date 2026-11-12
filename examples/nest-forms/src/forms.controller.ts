@@ -46,7 +46,21 @@ export class FormsController {
 
   @Get(["url", "url-alias"])
   url(@Req() req: ExpressRequest) {
-    return { originalUrl: req.originalUrl, path: req.path };
+    const q = req.query as Record<string, unknown>;
+    return { originalUrl: req.originalUrl, path: req.path, query: q, a: q.a ?? null };
+  }
+
+  @Post("stream")
+  @HttpCode(200)
+  async stream(@Req() req: ExpressRequest) {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of req) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+      size += buffer.byteLength;
+      chunks.push(buffer);
+    }
+    return { size, text: Buffer.concat(chunks).toString("utf8") };
   }
 
   @Get("bytes")

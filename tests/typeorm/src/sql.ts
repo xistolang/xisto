@@ -107,6 +107,18 @@ async function dialect(name: string): Promise<void> {
   console.log("  update: " + upd.getSql());
   const ins = ds.createQueryBuilder<Beneficiario>(Beneficiario, "b").insert().into(Beneficiario).values([{ id: 1, nome: "A" }, { id: 2, nome: "B" }]);
   console.log("  insert: " + ins.getSql());
+  // a function's result is raw SQL, in its place among the columns (TypeORM 0.3: SET "NM_BENEFICIARIO" = USER, ...;
+  // VALUES (:orm_param_0, USER, :orm_param_1))
+  const updRaw = ds.createQueryBuilder<Beneficiario>(Beneficiario, "b").update(Beneficiario).set({ nome: () => "USER", ativo: false }).where("CD_BENEFICIARIO = :id", { id: 9 });
+  console.log("  update raw: " + updRaw.getSql());
+  const insRaw = ds.createQueryBuilder<Beneficiario>(Beneficiario, "b").insert().into(Beneficiario).values({ id: 1, nome: () => "USER", ativo: true });
+  console.log("  insert raw: " + insRaw.getSql());
+  // where((sub) => ... sub.subQuery()...getQuery()): TypeORM 0.3 writes WHERE "b"."CD_BENEFICIARIO" IN (SELECT
+  // o.CD_BENEFICIARIO FROM "TB_OUTRA" "o" WHERE o.CD_LOCAL = :1 AND o.FL_TIPO = 0) [7] (here with parentheses around each condition)
+  const sq = ds.createQueryBuilder<Beneficiario>(Beneficiario, "b").orderBy("b.nome", "ASC").skip(0).take(5);
+  sq.where((sub) => "b.id IN " + sub.subQuery().select("o.CD_BENEFICIARIO").from("TB_OUTRA", "o").where("o.CD_LOCAL = :cdLocal AND o.FL_TIPO = 0").getQuery(), { cdLocal: 7 });
+  console.log("  subquery: " + sq.getSql());
+  console.log("  updateEntity: " + ds.createQueryBuilder<Beneficiario>(Beneficiario, "b").insert().into(Beneficiario).values({ id: 2, nome: "N", ativo: true }).updateEntity(false).getSql());
   const del = ds.createQueryBuilder<Beneficiario>(Beneficiario, "b").delete().from(Beneficiario, "b").where("b.id = :id", { id: 3 });
   console.log("  delete: " + del.getSql());
 

@@ -1,14 +1,20 @@
 10:Ouro 11:Prata
 count 4
 affected 2
+direct 2
+rows 10=Ouro 11=Prata
 c0 execute SELECT "Plano"."CD_PLANO" AS "CD_PLANO", "Plano"."DS_PLANO" AS "DS_PLANO" FROM "TB_PLANO" "Plano" OFFSET 0 ROWS FETCH NEXT 2 ROWS ONLY [0] autocommit
 c0 close
 c1 execute SELECT COUNT(*) AS "cnt" FROM "TB_PLANO" "Plano" [0] autocommit
 c1 close
 c2 execute UPDATE "TB_PLANO" SET "DS_PLANO" = :1 WHERE "CD_PLANO" = :2 [2] autocommit
 c2 close
-c3 execute UPDATE TB_PLANO SET DS_PLANO = :1 WHERE CD_PLANO = :2 [2]
-c3 execute DELETE FROM "TB_PLANO" WHERE "CD_PLANO" = :1 [1]
-c3 rollback
+c3 execute SELECT CD_PLANO, DS_PLANO FROM TB_PLANO [0] autocommit
 c3 close
+c4 execute SELECT CD_PLANO, DS_PLANO FROM TB_PLANO WHERE CD_PLANO > :1 [1] autocommit
+c4 close
+c5 execute UPDATE TB_PLANO SET DS_PLANO = :1 WHERE CD_PLANO = :2 [2]
+c5 execute DELETE FROM "TB_PLANO" WHERE "CD_PLANO" = :1 [1]
+c5 rollback
+c5 close
 pool close

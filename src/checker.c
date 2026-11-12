@@ -1163,6 +1163,8 @@ static void check_type_supported(Pos pos, Type *t);
 static Func *eff_ctor(Class *c);
 static Field *find_field(Class *c, const char *name, int *index);
 static bool ad_partial; /* (see fn_field_of) */
+static bool ad_partial_cls; /* (a class's missing methods too: see iface_runtime) */
+static bool ad_lenient; /* (a class's methods with other parameters too: see iface_runtime) */
 static Class **class_work; /* instances whose bodies the checker checks after the program's own */
 static int nclass_work;
 static Class *instantiate_class(Class *tmpl, Type **args, Pos pos) {
@@ -7518,6 +7520,51 @@ static void check_expr_in(Expr *e, Type *expected) {
         e->type = e->lhs->type->elem;
         return;
     case E_MEMBER:
+        if (e->is_call && e->str && e->lhs && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->str && e->lhs->lhs &&
+            e->lhs->lhs->kind == E_THIS && cur_class) {
+            /* this.db.query(...) with `get db(): I { return this.dataSource as unknown as I; }`: the call on this.dataSource
+               itself (the cast only restates its type; JavaScript calls the same object's method), so a generic
+               method of its class takes the call's type arguments */
+            Func *g = find_method(cur_class, xs_sprintf("__get_%s", e->lhs->str));
+            Stmt *b = g && g->is_getter && g->body && g->body->kind == S_BLOCK && g->body->stmts.len == 1 ? g->body->stmts.items[0] : NULL;
+            Expr *x = b && b->kind == S_RETURN ? b->expr : NULL;
+            int layers = 0; /* (the casts, as written or as checked: an adapter around the object) */
+            bool checked_cast = false;
+            while (x && ((x->kind == E_AS && x->op != TK_NOT && x->lhs) || (x->kind == E_UPCAST && x->lhs) ||
+                         (x->kind == E_NEW_OBJ && x->cls && x->cls->adapter_of && x->args.len == 1) ||
+                         (x->kind == E_CALL && x->builtin.cfn && !strcmp(x->builtin.cfn, "__iface_as") && x->args.len == 1))) {
+                if (x->kind != E_AS) checked_cast = true;
+                x = x->kind == E_NEW_OBJ || x->kind == E_CALL ? x->args.items[0] : x->lhs;
+                layers++;
+            }
+            if (x && (layers >= 1 || checked_cast) && (x->kind == E_MEMBER || x->kind == E_IDENT)) {
+                Expr *path = fresh_path(x);
+                Type *pt = path ? pure_type(path) : NULL;
+                pt = pt ? ty_strip_null(pt) : NULL;
+                Func *m = pt && pt->kind == TY_OBJECT && !pt->cls->is_interface ? find_method(pt->cls, e->str) : NULL;
+                if (m && !m->is_getter && !m->is_setter) e->lhs = fresh_path(x);
+            }
+        }
+        if (e->is_call && e->str && e->lhs && e->lhs->kind == E_AS && e->lhs->op != TK_NOT && e->lhs->elem_type && e->lhs->lhs && pure_copy(e->lhs->lhs)) {
+            /* (densidade as { valueOf(): string }).valueOf(): the value's own method, called on it (null: a TypeError, as
+               JavaScript's call on null) */
+            Type *st = ty_strip_null(resolve(e->lhs->elem_type, e->pos));
+            Class *sc = st->kind == TY_OBJECT ? st->cls : NULL;
+            Func *sm = sc && !strncmp(sc->name, "__Obj_", 6) && sc->nfields == 0 ? find_method(sc, e->str) : NULL;
+            Type *it = sm ? pure_type(e->lhs->lhs) : NULL;
+            Type *ib = it ? ty_strip_null(it) : NULL;
+            bool own = ib && ((ib->kind == TY_STRING && (!strcmp(e->str, "valueOf") || !strcmp(e->str, "toString"))) ||
+                              (ib->kind == TY_OBJECT && !ib->cls->is_interface && !made_shape(ib->cls) && find_method(ib->cls, e->str)));
+            if (own) {
+                Expr *nn = xs_alloc(sizeof *nn);
+                nn->kind = E_AS; nn->pos = e->lhs->pos; nn->field = -1; nn->op = TK_NOT; nn->lhs = pure_copy(e->lhs->lhs);
+                Expr *recv = it->kind == TY_NULLABLE ? nn : pure_copy(e->lhs->lhs);
+                if (ib->kind == TY_STRING) *e = *recv; /* (a string's valueOf() / toString(): the string) */
+                else e->lhs = recv;
+                check_expr(e, expected);
+                return;
+            }
+        }
         if (e->str && e->lhs && e->lhs->kind == E_AS && e->lhs->op != TK_NOT && e->lhs->elem_type && e->lhs->lhs && pure_copy(e->lhs->lhs)) {
             /* (x as { k?: T })?.k with x of a class: x's own k (a field, or a method called), or undefined (null) when its class
                has none, as JavaScript reads the object behind the cast */
@@ -8987,6 +9034,34 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (expected && expected->kind == TY_NULLABLE) e->type = expected;
         return;
     case E_AS: {
+        if (e->elem_type && e->lhs && e->op != TK_NOT) {
+            /* (await db.query(sql)) as T[] | T | null with query<T = Row>(): Promise<T> called without its type argument:
+               TypeScript's T defaults and the cast restates it; here the call takes the cast's type for T (its array
+               member, the rows a query gives), so the rows are decoded into it, checked */
+            Expr *call = e->lhs->kind == E_AWAIT && e->lhs->lhs ? e->lhs->lhs : e->lhs;
+            Expr *root = call->kind == E_MEMBER ? call->lhs : NULL;
+            while (root && root->kind == E_MEMBER && !root->is_call) root = root->lhs;
+            bool bound = root && (root->kind == E_THIS || (root->kind == E_IDENT && lookup(root->str))); /* (not JSON.parse: a namespace) */
+            if (bound && call->kind == E_MEMBER && call->is_call && call->ntargs == 0 && call->str && call->lhs && pure_copy(call->lhs)) {
+                Type *ot = pure_type(call->lhs);
+                ot = ot ? ty_strip_null(ot) : NULL;
+                Func *m = ot && ot->kind == TY_OBJECT ? find_method(ot->cls, call->str) : NULL;
+                Type *g = m ? m->gen_sig : NULL;
+                Type *gr = g && g->nftparams == 1 ? g->ret : NULL;
+                if (gr && gr->kind == TY_PROMISE) gr = gr->elem;
+                if (gr && gr->kind == TY_TPARAM && gr->tname && !strcmp(gr->tname, g->ftparams[0])) {
+                    Type *w = ty_strip_null(resolve(e->elem_type, e->pos));
+                    Type *pick = w;
+                    if (w->kind == TY_UNION)
+                        for (int i = 0; i < w->nparams; i++) if (w->params[i]->kind == TY_ARRAY) { pick = w->params[i]; break; }
+                    if (pick->kind != TY_UNION && pick->kind != TY_UNKNOWN) {
+                        call->ntargs = 1;
+                        call->targs = xs_alloc(sizeof(Type *));
+                        call->targs[0] = pick;
+                    }
+                }
+            }
+        }
         if (e->elem_type && e->lhs) { /* { m: () => ... } as C, or as unknown as C: a fake of C */
             Expr *lit = e->lhs->kind == E_AS && e->lhs->lhs && e->lhs->elem_type && e->lhs->elem_type->kind == TY_UNKNOWN ? e->lhs->lhs : e->lhs;
             if (lit->kind == E_OBJLIT) {
@@ -9055,7 +9130,45 @@ static void check_expr_in(Expr *e, Type *expected) {
             pr_convert(e, want->elem);
             return;
         }
-        if (v->type->kind == TY_UNKNOWN && (want->kind == TY_UNION || (want->kind == TY_NULLABLE && want->elem->kind == TY_UNION))) {
+        if (v->type->kind == TY_UNKNOWN && !ty_is_any(v->type) && (want->kind == TY_UNION || (want->kind == TY_NULLABLE && want->elem->kind == TY_UNION))) {
+            /* unknown as A[] | A (| null): each member checked as it is made (Array.isArray(v) ? v as A[] : v as A), since a
+               union's uses read their member unchecked; a value of neither is a TypeError here, not memory read wrong */
+            Type *u = want->kind == TY_NULLABLE ? want->elem : want;
+            Type *arr = NULL, *obj = NULL;
+            int others = 0;
+            for (int i = 0; i < u->nparams; i++) {
+                Type *m = u->params[i];
+                if (m->kind == TY_ARRAY && !arr) arr = m;
+                else if (m->kind == TY_OBJECT && !m->cls->builtin && !obj) obj = m;
+                else others++;
+            }
+            Expr *vp = arr && obj && !others ? pure_copy(v) : NULL;
+            if (vp) {
+                Expr *arrc = xs_alloc(sizeof *arrc);
+                arrc->kind = E_IDENT; arrc->pos = e->pos; arrc->field = -1; arrc->str = "Array";
+                Expr *test = xs_alloc(sizeof *test);
+                test->kind = E_MEMBER; test->pos = e->pos; test->field = -1; test->is_call = true; test->str = "isArray"; test->lhs = arrc;
+                expr_list_push(&test->args, vp);
+                Expr *ca = xs_alloc(sizeof *ca), *cb = xs_alloc(sizeof *cb);
+                ca->kind = E_AS; ca->pos = e->pos; ca->field = -1; ca->lhs = pure_copy(v); ca->elem_type = arr;
+                cb->kind = E_AS; cb->pos = e->pos; cb->field = -1; cb->lhs = pure_copy(v);
+                cb->elem_type = want->kind == TY_NULLABLE ? ty_nullable_of(obj) : obj;
+                Expr *c = xs_alloc(sizeof *c);
+                c->kind = E_COND; c->pos = e->pos; c->field = -1; c->lhs = test;
+                expr_list_push(&c->args, ca);
+                expr_list_push(&c->args, cb);
+                check_expr(test, ty_boolean);
+                check_expr(ca, NULL);
+                check_expr(cb, NULL);
+                for (int k = 0; k < 2; k++) { /* (a union is held as an unknown: each branch read as one, unchanged) */
+                    Expr *in = c->args.items[k], *w = xs_alloc(sizeof *w);
+                    w->kind = E_AS; w->pos = in->pos; w->field = -1; w->lhs = in; w->op = TK_DOT; w->type = ty_unknown; w->elem_type = ty_unknown;
+                    c->args.items[k] = w;
+                }
+                c->type = want;
+                *e = *c;
+                return;
+            }
             *e = *v; /* unknown as A | B: a union is held as unknown is (boxed); its uses narrow it */
             e->type = want;
             return;
@@ -10431,6 +10544,46 @@ static bool optchain_shape_cast(Expr *e) {
     Type *it = pure_type(base->lhs);
     Type *ib = it ? ty_strip_null(it) : NULL;
     if (!ib || ib->kind != TY_OBJECT || ib->cls->is_interface || made_shape(ib->cls)) return false;
+    /* (x as { k?: () => R })?.k?.(args) read as tmp.k?.(args): x's own method k called (the class has it), or undefined
+       when it has none (the call not made) */
+    Expr *r1 = e->args.items[0];
+    if (r1->kind == E_MEMBER && r1->is_call && r1->str && r1->lhs && r1->lhs->kind == E_IDENT && r1->lhs->str &&
+        !strcmp(r1->lhs->str, e->str) && find_field(sc, r1->str, NULL)) {
+        if (find_method(ib->cls, r1->str)) {
+            r1->op = TK_DOT; /* (the method is there: a plain call) */
+            e->lhs = base->lhs;
+            return true;
+        }
+        if (!find_field(ib->cls, r1->str, NULL)) {
+            Expr *nul = xs_alloc(sizeof *nul);
+            nul->kind = E_NULL; nul->pos = r1->pos; nul->field = -1;
+            e->args.items[0] = nul;
+            e->lhs = base->lhs;
+            return true;
+        }
+    }
+    Expr *r2 = e->args.items[0];
+    if (is_optchain(r2) && r2->lhs && r2->lhs->kind == E_MEMBER && !r2->lhs->is_call && r2->lhs->lhs && r2->lhs->lhs->kind == E_IDENT &&
+        r2->lhs->lhs->str && !strcmp(r2->lhs->lhs->str, e->str) && r2->args.len == 1 && r2->args.items[0]->kind == E_CALL &&
+        r2->args.items[0]->lhs && r2->args.items[0]->lhs->kind == E_IDENT && r2->str && !strcmp(r2->args.items[0]->lhs->str, r2->str) &&
+        find_field(sc, r2->lhs->str, NULL)) {
+        const char *k = r2->lhs->str;
+        Expr *callx = r2->args.items[0];
+        if (find_method(ib->cls, k)) {
+            Expr *mc = xs_alloc(sizeof *mc);
+            mc->kind = E_MEMBER; mc->pos = r2->pos; mc->field = -1; mc->is_call = true; mc->str = (char *)k; mc->lhs = r2->lhs->lhs;
+            mc->args = callx->args;
+            e->args.items[0] = mc;
+            e->lhs = base->lhs;
+            return true;
+        }
+        if (!find_field(ib->cls, k, NULL)) { /* (no k at all: undefined, the call not made) */
+            Expr *nul = xs_alloc(sizeof *nul);
+            nul->kind = E_NULL; nul->pos = r2->pos; nul->field = -1;
+            *e = *nul;
+            return true;
+        }
+    }
     /* the read of the temporary at the bottom of the rest: tmp.k becomes (tmp as S).k */
     Expr *x = e->args.items[0];
     while (x) {
@@ -12474,6 +12627,8 @@ static bool conv_ok(Type *from, Type *to, int depth) {
     if (ty_is_any(to) || to->kind == TY_UNKNOWN) return true;
     if (from->kind == TY_LITINT && is_numeric(to)) return true;
     if (from->kind == TY_INT && to->kind == TY_NUMBER) return true;
+    if (from->kind == TY_ENUM && from->en && ((!from->en->is_string && is_numeric(to)) || (from->en->is_string && to->kind == TY_STRING && !to->tname)))
+        return true; /* (status: St where a number goes: its value) */
     if (to->kind == TY_NULLABLE) {
         if (from->kind == TY_NULL) return true;
         if (from->kind == TY_NULLABLE) /* (a primitive's null is its own: only objects convert inside T | null) */
@@ -12526,8 +12681,14 @@ static Type *fn_field_of(Class *src, const char *name) {
 }
 static bool method_fits(Func *cm, Func *im, Class *src, Class *ifc, bool infer, Pos pos, int depth, char **why) {
     const char *iname = ifc->name, *cn = src->name, *mn = im->name;
+    if (cm && ad_lenient) { /* (a provider's method with other parameters: see iface_runtime; its adapter method throws) */
+        ad_lenient = false;
+        bool exact = method_fits(cm, im, src, ifc, infer, pos, depth, NULL);
+        ad_lenient = true;
+        if (!exact) return true;
+    }
     Type *ff = cm ? NULL : fn_field_of(src, mn);
-    if (!cm && !ff && ad_partial && (src->is_interface || made_shape(src))) return true; /* (left out: see ad_partial) */
+    if (!cm && !ff && ad_partial && (src->is_interface || made_shape(src) || ad_partial_cls)) return true; /* (left out: see ad_partial) */
     if (ff && !im->ntparams) { /* { m: (x) => ... } where m(x): R goes: a field that holds the function */
         int n = ff->nparams < im->nparams ? ff->nparams : im->nparams;
         if (ff->nparams > im->nparams || ff->rest) {
@@ -12573,6 +12734,9 @@ static bool method_fits(Func *cm, Func *im, Class *src, Class *ifc, bool infer, 
     for (int k = 0; k < n; k++) {
         Param *cp = &cm->params[k], *ip = &im->params[k];
         bool ok = (cp->rest || ip->rest) ? cp->rest == ip->rest && ty_equal(cp->type, ip->type) : conv_ok(ip->type, cp->type, depth);
+        if (!ok && ad_partial_cls && !cp->rest && !ip->rest && ip->type->kind == TY_NULLABLE && conv_ok(ip->type->elem, cp->type, depth))
+            ok = true; /* (x?: number where the method takes number: TypeScript's method bivariance; a null passed is a TypeError
+                          at the call, see make_adapter) */
         if (!ok) {
             if (why) *why = xs_sprintf("parameter '%s' of %s.%s is %s, but %s.%s passes %s", cp->name, cn, mn, ad_tname(cp->type), iname, mn, ad_tname(ip->type));
             return false;
@@ -12684,6 +12848,24 @@ static Class *make_adapter(Class *src, Class *ifc) {
         int n = cm && cm->nparams < im->nparams ? cm->nparams : im->nparams;
         Type *ff = cm ? NULL : fn_field_of(src, im->name);
         if (ff && ff->nparams < n) n = ff->nparams; /* (a field's function that takes fewer: the ones it takes) */
+        bool clash = false;
+        if (cm && ad_lenient) { /* (a method the provider has with parameters of its own: no call can be made of it) */
+            ad_lenient = false;
+            clash = !method_fits(cm, im, src, ifc, false, f->pos, 0, NULL);
+            ad_lenient = true;
+        }
+        if (clash) {
+            Expr *msg = str_lit(f->pos, xs_sprintf("%s.%s does not take the arguments of %s.%s", src->name, im->name, ifc->name, im->name));
+            Expr *nw = xs_alloc(sizeof *nw);
+            nw->kind = E_NEW_OBJ; nw->pos = f->pos; nw->field = -1; nw->str = "Error";
+            expr_list_push(&nw->args, msg);
+            Stmt *th = xs_alloc(sizeof *th);
+            th->kind = S_THROW; th->pos = f->pos; th->expr = nw;
+            f->body = ad_block(f->pos, th);
+            a->methods = realloc(a->methods, sizeof(Func *) * (size_t)(a->nmethods + 1));
+            a->methods[a->nmethods++] = f;
+            continue;
+        }
         if (!cm && !ff) { /* (left out of the object, see ad_partial): throw new Error("m is not a function") (JavaScript's is a
                              TypeError, a class xisto:errors has only when the program names it; TypeScript lets no call get here) */
             Expr *msg = str_lit(f->pos, xs_sprintf("%s is not a function", im->name));
@@ -12710,6 +12892,12 @@ static Class *make_adapter(Class *src, Class *ifc) {
             c1->kind = E_MEMBER; c1->pos = f->pos; c1->field = -1; c1->is_call = true; c1->lhs = ad_this_t(f->pos); c1->str = im->name;
             for (int i = 0; i < upto; i++) {
                 Expr *x = ad_ident(f->pos, f->params[i].name);
+                if (cm && i < cm->nparams && !im->params[i].rest && im->params[i].type->kind == TY_NULLABLE && cm->params[i].type &&
+                    cm->params[i].type->kind != TY_NULLABLE && cm->params[i].type->kind != TY_UNKNOWN && !cm->params[i].dflt) {
+                    Expr *nn = xs_alloc(sizeof *nn); /* (x!: the method takes no null; see method_fits) */
+                    nn->kind = E_AS; nn->op = TK_NOT; nn->pos = f->pos; nn->field = -1; nn->lhs = x;
+                    x = nn;
+                }
                 if (im->params[i].rest) { /* ...xs passed on spread */
                     Expr *sp = xs_alloc(sizeof *sp);
                     sp->kind = E_UNARY; sp->op = TK_ELLIPSIS; sp->pos = f->pos; sp->field = -1; sp->lhs = x;
@@ -13003,6 +13191,29 @@ static bool iface_runtime(Class *ifc, Pos pos) {
         for (int k = 0; k < ifc->nmethods && named; k++)
             if (ifc->methods[k]->is_abstract && !find_method(c, ifc->methods[k]->name)) named = false;
         if (named) iface_adapter(c, ifc, pos, NULL);
+    }
+    /* a provider injected where a structural interface goes (@Inject('X') x?: XLike with { provide: 'X', useExisting:
+       C }), C having only some of its methods or some with other parameters (TypeScript checks nothing through a
+       token): JavaScript takes the object as it is; an adapter whose missing methods throw when called ("m is not a
+       function"), and those whose parameters differ throw too (JavaScript would call them with what it is given) */
+    for (int i = 0; i < prog->nclasses; i++) {
+        Class *c = prog->classes[i];
+        if (!c->decos.len || c->builtin || c->is_interface || c->iface_base || c->gen_state || c->adapter_of || is_subclass(c, ifc)) continue;
+        int have = 0, all = 0;
+        for (int k = 0; k < ifc->nmethods; k++)
+            if (ifc->methods[k]->is_abstract) { all++; if (find_method(c, ifc->methods[k]->name)) have++; }
+        if (have == 0) continue;
+        if (have == all) { /* (all named: the first pass made its adapter, unless a method does not fit) */
+            bool made = false;
+            for (int a = 0; a < ifc->nadapters; a++) if (ifc->adapters[a]->adapter_of == c) made = true;
+            if (made) continue;
+            for (int a = 0; a < niface_ads; a++) /* (forget the failed exact try: tried again, lenient) */
+                if (iface_ads[a].src == c && iface_ads[a].ifc == ifc && !iface_ads[a].ad) iface_ads[a].src = NULL;
+        }
+        bool was = ad_partial, was_cls = ad_partial_cls, was_len = ad_lenient;
+        ad_partial = true; ad_partial_cls = true; ad_lenient = true;
+        iface_adapter(c, ifc, pos, NULL);
+        ad_partial = was; ad_partial_cls = was_cls; ad_lenient = was_len;
     }
     return ifc->nadapters > 0;
 }

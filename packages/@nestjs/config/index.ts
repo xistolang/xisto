@@ -93,13 +93,30 @@ function lookupPath(path: string): any {
  * convert it yourself: Number(config.get("PORT")).
  * @example const host = this.config.get<string>("DB_HOST", "localhost")
  */
+// an environment variable read as get<T>(key): its text; get<number>("PORT") its number when the text is one.
+// Compatibility: Nest gives the text whatever T says (T is only TypeScript's); a number where the program asked for
+// one reads the same in listen(port) and arithmetic, and a text that is not a number is the TypeError here
+function envAs<T>(v: string): T {
+  const k = __reflect_kind(T);
+  if (k === "number" || k === "int") {
+    const n = Number(v);
+    if (!Number.isNaN(n) && v.trim().length > 0) {
+      return n as unknown as T;
+    }
+  }
+  if (k === "boolean" && (v === "true" || v === "false")) {
+    return (v === "true") as unknown as T;
+  }
+  return v as unknown as T;
+}
+
 @Injectable()
 export class ConfigService {
   /** The value of `key`, or `defaultValue` (null when not given) when it is not set. */
   get<T = string>(key: string, defaultValue: T | null = null): T | null {
     const v = process.env.get(key);
     if (v !== null) {
-      return v as unknown as T;
+      return envAs<T>(v);
     }
     const found: any = lookupPath(key); /* a loaded namespace: "database", "app.port" */
     if (found == null) {
@@ -112,7 +129,7 @@ export class ConfigService {
   getOrThrow<T = string>(key: string): T {
     const v = process.env.get(key);
     if (v !== null) {
-      return v as unknown as T;
+      return envAs<T>(v);
     }
     const found: any = lookupPath(key);
     if (found == null) {
