@@ -595,6 +595,7 @@ struct Class {
     char *mixin_call;    /* class X extends F(args) (F a class with a static __mixin, e.g. PassportStrategy(Strategy, "jwt")):
                             X extends F, and F.__mixin(args) runs as a class decorator on X */
     bool mixin_done;
+    bool fake;           /* { m: () => ... } as C: an object literal standing for a class with methods (no super(...)) */
     bool as_value;       /* class { ... } written as an expression: a value (its ClassInfo), like a decorated class */
 };
 /* PartialType(Y), OmitType(Y, ["a"] as const), PickType(Y, ["a"]), IntersectionType(A, B): the mapped types of
