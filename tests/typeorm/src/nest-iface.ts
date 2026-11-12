@@ -60,7 +60,30 @@ class Worker {
   }
 }
 
-@Module({ providers: [RealEngine, { provide: ENGINE, useExisting: RealEngine }, Worker] })
+// a contract the engine meets only in part (purge it does not have): JavaScript takes the object as it is, and the
+// missing method throws when called
+interface EngineAdmin {
+  execute(input: JobInput, plan: number, opts: { runId: string; quiet?: boolean }): Promise<JobResult>;
+  purge(): Promise<void>;
+}
+@Injectable()
+class Admin {
+  constructor(@Inject(ENGINE) private readonly engine?: EngineAdmin) {}
+  async run(): Promise<string> {
+    const e = this.engine;
+    if (!e) return "none";
+    const r = await e.execute({ company: "B2", from: "2026-02-01", dryRun: false }, 9, { runId: "adm" });
+    let purged = "purged";
+    try {
+      await e.purge();
+    } catch (err) {
+      purged = "purge threw";
+    }
+    return `${r.runId} ${r.message ?? "-"} ${purged}`;
+  }
+}
+
+@Module({ providers: [RealEngine, { provide: ENGINE, useExisting: RealEngine }, Worker, Admin] })
 class AppModule {}
 
 async function main(): Promise<void> {
@@ -69,5 +92,6 @@ async function main(): Promise<void> {
   const w = app.get(Worker) as Worker;
   console.log(await w.tick(1));
   console.log(await w.tick(2));
+  console.log(await (app.get(Admin) as Admin).run());
 }
 main();
