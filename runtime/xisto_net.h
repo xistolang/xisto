@@ -2040,6 +2040,8 @@ static bool xs_has_ctl(const char *p, size_t n) { /* control bytes other than ta
     for (size_t i = 0; i < n; i++) { unsigned char ch = (unsigned char)p[i]; if ((ch < 0x20 && ch != '\t') || ch == 0x7f) return true; }
     return false;
 }
+/* fetch(url, { body: bytes }): the bytes as the body's text (sent as they are) */
+XS_NOINLINE xs_str *xs_fetch_body_bytes(xs_Uint8Array *a) { return xs_str_new((const char *)a->data, (size_t)a->f_length); }
 /* what an aborted fetch rejects with, as Node's (a DOMException): its name and message */
 XS_NOINLINE void xs_fetch_fail_named(const char *name, const char *msg) {
     xs_str *m = xs_str_new(msg, strlen(msg));
