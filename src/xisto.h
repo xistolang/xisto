@@ -501,6 +501,10 @@ struct Func {
     const char *par_why;
     bool par_native;   /* an instance of a xisto:parallel function some call runs on the pool: emit its _par version */
     bool sig_failed;   /* xisto check: its signature names what could not be loaded (reported): its body is not checked */
+    bool shadow; /* a method with the name of a base method but another signature: its own, not called through the base */
+    bool overload_sig; /* function f(a: A): R; (no body): an overload signature, kept with the implementation (overloads) */
+    struct Func **overloads; /* the overload signatures written before this implementation: what its callers see */
+    int noverloads;
     struct Type *gen_sig; /* an interface's query<T = D>(sql): R<T> (held with T as D): the signature as written, from which
                              a call q.query<Row>(sql) takes its result type (the value converted to it, see Type.gen_sig) */
 };
@@ -589,6 +593,7 @@ struct Class {
     char *mixin_call;    /* class X extends F(args) (F a class with a static __mixin, e.g. PassportStrategy(Strategy, "jwt")):
                             X extends F, and F.__mixin(args) runs as a class decorator on X */
     bool mixin_done;
+    bool as_value;       /* class { ... } written as an expression: a value (its ClassInfo), like a decorated class */
 };
 /* PartialType(Y), OmitType(Y, ["a"] as const), PickType(Y, ["a"]), IntersectionType(A, B): the mapped types of
    @nestjs/swagger (and @nestjs/mapped-types), a class or another mapped type as each argument */
