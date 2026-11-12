@@ -86,7 +86,7 @@ export class ExtractJwt {
   }
   /** A query string parameter. */
   static fromUrlQueryParameter(name: string): (req: Request) => string | null {
-    return (req: Request): string | null => req.query(name);
+    return (req: Request): string | null => req.queryValue(name);
   }
 }
 

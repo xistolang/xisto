@@ -2597,6 +2597,7 @@ static bool json_capable(Type *t) {
     switch (t->kind) {
     case TY_NUMBER: case TY_INT: case TY_BOOLEAN: case TY_STRING: case TY_ENUM: case TY_JSON: case TY_UNKNOWN: case TY_UNION: return true;
     case TY_ARRAY: case TY_NULLABLE: return json_capable(t->elem);
+    case TY_MAP: return t->record && t->key && t->key->kind == TY_STRING && json_capable(t->elem); /* (a Record<string, V>: an object) */
     case TY_OBJECT: {
         if (t->cls->builtin) return strcmp(t->cls->name, "Date") == 0; /* (a Date: its ISO text) */
         for (int i = 0; i < json_capable_depth; i++) if (json_capable_stack[i] == t->cls) return true;
