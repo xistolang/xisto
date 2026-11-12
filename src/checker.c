@@ -3048,6 +3048,17 @@ static Expr *fresh_path(Expr *x) {
     return NULL;
 }
 static void expect_type(Expr *e, Type *want, const char *what) {
+    { /* req (a view of the request) where another view of it goes (this.realizar(req, dto)): the same object */
+        Type *g = e->type ? ty_strip_null(e->type) : NULL, *w = ty_strip_null(want);
+        if (g && g->kind == TY_OBJECT && w->kind == TY_OBJECT && g->cls != w->cls && w->cls->view_of &&
+            (g->cls->view_of == w->cls->view_of || g->cls == w->cls->view_of) && (e->type->kind != TY_NULLABLE || want->kind == TY_NULLABLE)) {
+            Expr *v = xs_alloc(sizeof *v);
+            *v = *e;
+            memset(e, 0, sizeof *e);
+            e->kind = E_UPCAST; e->pos = v->pos; e->field = -1; e->lhs = v; e->type = want;
+            return;
+        }
+    }
     if (e->type && e->type->kind == TY_NULLABLE && e->type->elem->kind == TY_INT && want->kind == TY_NULLABLE && want->elem->kind == TY_NUMBER) {
         wrap_call(e, "xs_num_of_int_or_null", want); /* status: res.statusCode ?? null (int | null) where number | null goes */
         return;
@@ -4643,7 +4654,7 @@ static void check_object_member(Expr *e, Class *c) {
         xs_error(XS8049, e->pos, xs_sprintf("rename the field of %s, or call %s.%s(...)", c->name, c->view_of->name, e->str),
                  "'%s' of %s is a method of %s, which %s is a view of", e->str, c->name, c->view_of->name, c->name);
     check_object_member_in(e, c);
-    if (vf && !e->is_call && e != dyn_lvalue && e->type && (ty_is_any(e->type) || e->type->kind == TY_UNKNOWN) && vf->type) {
+    if (vf && !e->is_call && e != dyn_lvalue && e->type && vf->type) {
         Class *vc = NULL;
         for (Class *k = c; k && !vc; k = k->base) if (k->view_of) vc = k;
         Module *was = cur_mod;
@@ -4653,7 +4664,9 @@ static void check_object_member(Expr *e, Class *c) {
         Type *vt = resolve(vf->type, e->pos);
         cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
         if (vf->optional && vt->kind != TY_NULLABLE && ty_is_heap(vt)) vt = ty_nullable_of(vt);
-        if (!ty_is_any(vt) && vt->kind != TY_UNKNOWN) {
+        bool differs = !ty_equal(e->type, vt) && !ty_equal(e->type, ty_strip_null(vt)); /* (headers: IncomingHttpHeaders read as
+                                                                                       the Record<string, string | string[]> the view says) */
+        if (!ty_is_any(vt) && vt->kind != TY_UNKNOWN && (ty_is_any(e->type) || e->type->kind == TY_UNKNOWN || differs)) {
             Expr *in = xs_alloc(sizeof *in);
             *in = *e;
             in->prechecked = true;
