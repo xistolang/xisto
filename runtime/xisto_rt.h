@@ -3369,6 +3369,11 @@ static int64_t xs_arr_index_of_num(xs_arr_num *a, double v) {
 static int64_t xs_arr_index_of_int(xs_arr_int *a, int64_t v) { for (size_t i = 0; i < a->len; i++) if (a->data[i] == v) return (int64_t)i; return -1; }
 static int64_t xs_arr_index_of_bool(xs_arr_bool *a, bool v) { for (size_t i = 0; i < a->len; i++) if (a->data[i] == v) return (int64_t)i; return -1; }
 /* strings by content; in a (string | null)[] null matches null */
+/* (unknown[]).includes(v) / indexOf(v): === as JavaScript's (strings and boxed numbers by value, objects by identity) */
+XS_NOINLINE int64_t xs_arr_index_of_ref(xs_arr_ref *a, void *v) {
+    for (size_t i = 0; i < a->len; i++) if (a->data[i] == v || xs_dyn_eq(a->data[i], v)) return (int64_t)i;
+    return -1;
+}
 static int64_t xs_arr_index_of_str(xs_arr_ref *a, xs_str *v) {
     for (size_t i = 0; i < a->len; i++) {
         xs_str *x = a->data[i];
