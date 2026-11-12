@@ -4117,6 +4117,16 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
     params_info(g, c->ctor);
     bool data_only = false; /* a DTO (fields without values, no constructor): no `new`, JSON makes it */
     for (int k = 0; k < c->nfields && !c->ctor; k++) if (!c->fields[k].init && !c->fields[k].optional) data_only = true;
+    /* (also through the classes it extends: class B extends A {} with A's fields required, and no constructor) */
+    for (Class *b = c, *nb = NULL; !data_only && b && !b->ctor && b->base_name; b = nb) {
+        nb = NULL;
+        for (int i = 0; i < prog->nclasses && !nb; i++) {
+            Class *k = prog->classes[i];
+            if (k != b && !k->builtin && !k->is_interface && k->name && !strcmp(k->name, b->base_name)) nb = k;
+        }
+        if (!nb || nb->ctor) break;
+        for (int k = 0; k < nb->nfields; k++) if (!nb->fields[k].init && !nb->fields[k].optional) data_only = true;
+    }
     for (int k = 0; c->ctor && k < c->ctor->nparams; k++) /* new X(response: object): not built by an injector */
         if (c->ctor->params[k].type_src && strcmp(c->ctor->params[k].type_src, "object") == 0) data_only = true;
     if (data_only) {
