@@ -6328,8 +6328,8 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
                 if (access(probe, R_OK) == 0) { found = xs_strndup(probe, strlen(probe)); break; }
             }
         }
-        if (!found && has_project) xs_error(XS5005, from_pos, xs_sprintf("install it: xisto add <git url or path> --name %s", file), "package '%s' is not installed", file);
-        if (!found) xs_error(XS5003, from_pos, xs_sprintf("import files with a relative path (\"./file\"), or add the package: xisto add <git url> --name %s", file), "cannot resolve '%s'", full);
+        if (!found && has_project) xs_error(XS5005, from_pos, xs_sprintf("install it: xisto add %s (or xisto add <git url> --name %s)", file, file), "package '%s' is not installed", file);
+        if (!found) xs_error(XS5003, from_pos, xs_sprintf("import files with a relative path (\"./file\"), or add the package: xisto add %s", file), "cannot resolve '%s'", full);
         char *entry = NULL;
         char *meta = xs_read_file(xs_sprintf("%s/xisto.json", found));
         if (sub) {

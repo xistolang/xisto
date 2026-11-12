@@ -20,6 +20,6 @@ xisto check: 2 files, 6 changes needed in 2 files
   (xisto check --details shows each place; --deny-warnings counts them as changes)
 
   packages:
-    @acme/missing                    not installed            1 file  (xisto add <git url> --name @acme/missing)
+    @acme/missing                    not installed            1 file  (xisto add @acme/missing)
 
   xisto check --details lists every place to change.
