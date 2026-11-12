@@ -1,0 +1,31 @@
+open 1 xisto_live_test connected
+indexes _id_ operador_1 operador_1_base_1! email_1?
+create Primeiro info 0 a+b OP1 true
+insertMany 2 Terceiro 1970-01-02T00:00:00.000Z
+  raw notices {"_id":"id0","title":"Primeiro","kind":"info","views":0,"tags":["a","b"],"target":{"operador":"OP1","base":"BASE"},"createdAt":"NOW","updatedAt":"NOW","__v":0}
+  raw notices {"_id":"id1","title":"Segundo","kind":"warning","views":3,"tags":[],"__v":0,"createdAt":"NOW","updatedAt":"NOW"}
+  raw notices {"_id":"id2","title":"Terceiro","kind":"info","views":7,"tags":[],"expiresAt":"1970-01-02T00:00:00.000Z","__v":0,"createdAt":"NOW","updatedAt":"NOW"}
+page Segundo:3 Primeiro:0
+all 3 Primeiro,Segundo,Terceiro
+findOne warning 3
+findById Segundo
+none null
+exists true null
+distinct ["info","warning"]
+count 2 1
+upsert OP1 ana@x.com 2
+update 3
+old 3
+  raw profiles {"_id":"id3","operador":"OP1","base":"BASE","__v":0,"classe":4,"createdAt":"NOW","email":"ana@x.com","updatedAt":"NOW"}
+updateOne {"acknowledged":true,"modifiedCount":0,"upsertedId":"id4","upsertedCount":1,"matchedCount":0}
+updateMany {"acknowledged":true,"modifiedCount":2,"upsertedId":null,"upsertedCount":0,"matchedCount":2}
+duplicate MongoServerError E11000 duplicate key error collection: xisto_live_test.profiles index: operador_1_base_1 dup key: { operador: "OP1", base: "BASE" }
+read OP1 true
+  raw reads {"_id":"id5","noticeId":"id0","operador":"OP1","readAt":"NOW","__v":0}
+aggregate info=2 warning=1
+bulkWrite 1 1 1
+deleteOne {"acknowledged":true,"deletedCount":1}
+deleteMany {"acknowledged":true,"deletedCount":2}
+findOneAndDelete Terceiro 0
+batches 230
+closed 0 connected,disconnected

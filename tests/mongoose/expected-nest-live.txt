@@ -1,0 +1,8 @@
+health {"api":"up","mongo":"up"}
+seeded 5
+page 5 Aviso 5,Aviso 4 | 2 Aviso 4,Aviso 2
+upsert OP9 x@y.com 5 x@y.com
+after close {"api":"up","mongo":"down"}
+connected [DatabaseConnection] hosts=127.0.0.1:27017 db=xisto_nest_test
+connectionStatus ok=1
+disconnected [DatabaseConnection]
