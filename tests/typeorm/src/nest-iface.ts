@@ -110,7 +110,24 @@ class Wizard {
   }
 }
 
-@Module({ providers: [RealEngine, { provide: ENGINE, useExisting: RealEngine }, Worker, Admin, BoletoReal, { provide: "Boleto", useExisting: BoletoReal }, Wizard] })
+// a provider whose method takes other parameters than the contract's (nothing checks it through a token): built,
+// and the call is what fails
+interface AuditLike {
+  registrar(aplicacao: string, terminal: unknown): void | Promise<void>;
+}
+@Injectable()
+class AuditReal {
+  async registrar(cdUsuario: string, aplicacao: string, sessao: string | null, maquina: string | null): Promise<void> {}
+}
+@Injectable()
+class Panel {
+  constructor(@Inject("Audit") private readonly audit?: AuditLike) {}
+  built(): string {
+    return this.audit ? "audit given" : "no audit";
+  }
+}
+
+@Module({ providers: [RealEngine, { provide: ENGINE, useExisting: RealEngine }, Worker, Admin, BoletoReal, { provide: "Boleto", useExisting: BoletoReal }, Wizard, AuditReal, { provide: "Audit", useExisting: AuditReal }, Panel] })
 class AppModule {}
 
 async function main(): Promise<void> {
@@ -121,5 +138,6 @@ async function main(): Promise<void> {
   console.log(await w.tick(2));
   console.log(await (app.get(Admin) as Admin).run());
   console.log(await (app.get(Wizard) as Wizard).run());
+  console.log((app.get(Panel) as Panel).built());
 }
 main();
