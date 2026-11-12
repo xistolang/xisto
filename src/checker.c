@@ -2923,6 +2923,7 @@ static bool tsc_checked(void);
 static bool iface_adapt(Expr *e, Type *want, const char *what);
 static bool iface_runtime(Class *ifc, Pos pos);
 static Expr *ad_ident(Pos pos, const char *name);
+static Stmt *ad_block(Pos pos, Stmt *one);
 static Binding *lookup(const char *name);
 /* the text of a top-level `const NAME = 'text'` (as const) this module sees, when name is one and no local hides it */
 static const char *const_string_of(const char *name) {
@@ -9024,6 +9025,55 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     }
     case E_OBJLIT: {
+        if (e->keys && e->args.len >= 2 && !strcmp(e->keys[e->args.len - 1], "...")) {
+            /* { ...entity, ...Object.fromEntries(pairs) }: entity's copy, then each pair written into it by key (as
+               JavaScript's spread does: the values as they are, a Date stays a Date):
+               ((__o) => { pairs.forEach((__p) => { (__o as any)[__p[0] as string] = __p[1]; }); return __o; })({ ...entity }) */
+            Expr *last = e->args.items[e->args.len - 1];
+            Expr *fe = last->kind == E_UNARY && last->op == TK_ELLIPSIS ? last->lhs : last;
+            if (fe && fe->kind == E_MEMBER && fe->is_call && fe->str && !strcmp(fe->str, "fromEntries") && fe->args.len == 1 &&
+                fe->lhs && fe->lhs->kind == E_IDENT && !strcmp(fe->lhs->str, "Object") && !lookup("Object")) {
+                static int nfe;
+                Pos pos = e->pos;
+                const char *on = xs_sprintf("__fe_o%d", nfe), *pn = xs_sprintf("__fe_p%d", nfe);
+                nfe++;
+                Expr *pairs = fe->args.items[0];
+                e->args.len--;
+                Expr *base = xs_alloc(sizeof *base);
+                *base = *e;
+                check_expr(base, expected);
+                base->prechecked = true;
+                /* (__o as any)[__p[0] as string] = __p[1] */
+                Expr *oa = xs_alloc(sizeof *oa); oa->kind = E_AS; oa->pos = pos; oa->field = -1; oa->lhs = ad_ident(pos, on); oa->elem_type = ty_any;
+                Expr *k0 = xs_alloc(sizeof *k0); k0->kind = E_INDEX; k0->pos = pos; k0->field = -1; k0->lhs = ad_ident(pos, pn); k0->rhs = num_lit(pos, 0, true);
+                Expr *ks = xs_alloc(sizeof *ks); ks->kind = E_AS; ks->pos = pos; ks->field = -1; ks->lhs = k0; ks->elem_type = ty_string;
+                Expr *lv = xs_alloc(sizeof *lv); lv->kind = E_INDEX; lv->pos = pos; lv->field = -1; lv->lhs = oa; lv->rhs = ks;
+                Expr *v1 = xs_alloc(sizeof *v1); v1->kind = E_INDEX; v1->pos = pos; v1->field = -1; v1->lhs = ad_ident(pos, pn); v1->rhs = num_lit(pos, 1, true);
+                Expr *as = xs_alloc(sizeof *as); as->kind = E_ASSIGN; as->op = TK_ASSIGN; as->pos = pos; as->field = -1; as->lhs = lv; as->rhs = v1;
+                Stmt *st = xs_alloc(sizeof *st); st->kind = S_EXPR; st->pos = pos; st->expr = as;
+                Func *cf = xs_alloc(sizeof *cf); cf->pos = pos; cf->name = "arrow"; cf->ret = ty_void;
+                cf->params = xs_alloc(sizeof(Param)); memset(cf->params, 0, sizeof(Param)); cf->params[0].name = (char *)pn; cf->nparams = 1;
+                cf->body = ad_block(pos, st);
+                Arrow *ca = xs_alloc(sizeof *ca); ca->pos = pos; ca->fn = cf;
+                Expr *cae = xs_alloc(sizeof *cae); cae->kind = E_ARROW; cae->pos = pos; cae->field = -1; cae->arrow = ca;
+                Expr *each = xs_alloc(sizeof *each); each->kind = E_MEMBER; each->pos = pos; each->field = -1; each->lhs = pairs; each->str = "forEach"; each->is_call = true;
+                expr_list_push(&each->args, cae);
+                Stmt *s1 = xs_alloc(sizeof *s1); s1->kind = S_EXPR; s1->pos = pos; s1->expr = each;
+                Stmt *s2 = xs_alloc(sizeof *s2); s2->kind = S_RETURN; s2->pos = pos; s2->expr = ad_ident(pos, on);
+                Stmt *b = ad_block(pos, s1);
+                stmt_list_push(&b->stmts, s2);
+                Func *f = xs_alloc(sizeof *f); f->pos = pos; f->name = "arrow"; f->ret = base->type;
+                f->params = xs_alloc(sizeof(Param)); memset(f->params, 0, sizeof(Param)); f->params[0].name = (char *)on; f->params[0].type = base->type; f->nparams = 1;
+                f->body = b;
+                Arrow *a = xs_alloc(sizeof *a); a->pos = pos; a->fn = f;
+                Expr *ae = xs_alloc(sizeof *ae); ae->kind = E_ARROW; ae->pos = pos; ae->field = -1; ae->arrow = a;
+                memset(e, 0, sizeof *e);
+                e->kind = E_CALL; e->pos = pos; e->field = -1; e->lhs = ae;
+                expr_list_push(&e->args, base);
+                check_expr(e, expected);
+                return;
+            }
+        }
         if (expected && ty_strip_null(expected)->kind == TY_OBJECT && fake_target(ty_strip_null(expected)->cls, e) &&
             !ty_strip_null(expected)->cls->is_interface) { /* const handler: CallHandler = { handle: () => of(value) } */
             fake_object(e, ty_strip_null(expected)->cls);
