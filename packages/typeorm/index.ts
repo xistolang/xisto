@@ -1153,34 +1153,6 @@ function propertyOfColumn(m: EntityMetadata, databaseName: string): string {
   return "";
 }
 
-// the relations not loaded: null for a @ManyToOne, [] for a @OneToMany (TypeORM leaves them undefined; the
-// entity's class has them as fields), also on the related entities loaded
-function fillUnloaded(m: EntityMetadata, list: unknown[]): void {
-  for (const e of list) {
-    const row = e as Record<string, unknown>;
-    for (const r of m.relations) {
-      if (!(r.propertyName in row)) {
-        if (r.relationType === "many-to-one") {
-          row[r.propertyName] = null;
-        } else {
-          row[r.propertyName] = [];
-        }
-        continue;
-      }
-      const v: any = row[r.propertyName];
-      const target = metadataOf(r.target());
-      if (v === null) {
-        continue;
-      }
-      if (Array.isArray(v)) {
-        fillUnloaded(target, v as unknown[]);
-      } else {
-        fillUnloaded(target, [v]);
-      }
-    }
-  }
-}
-
 /**
  * find's `relations`: for each name, the related entities, one more query per relation (TypeORM joins; the
  * entities come out the same): a @ManyToOne's parent by its key, a @OneToMany's children by theirs.
@@ -1308,8 +1280,7 @@ export class Repository<T> {
       return out;
     }
     const list: any = JSON.parse(JSON.stringify(mapped));
-    await loadRelations(this.executor, this.metadata, list as unknown[], relations);
-    fillUnloaded(this.metadata, list as unknown[]);
+    await loadRelations(this.executor, this.metadata, list as unknown[], relations); // (a relation not loaded stays absent)
     const out: T[] = JSON.parse(JSON.stringify(list));
     return out;
   }

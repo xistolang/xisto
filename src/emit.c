@@ -1630,6 +1630,12 @@ static void ensure_json(Type *t) {
             buf_printf(b, "({ xs_jv *fv_ = xs_json_field_opt(v, \"%s\"); fv_ && fv_->kind != XJ_NULL ? ", f->name);
             json_emit_read(b, f->type, "fv_", f->name);
             buf_printf(b, " : %s; })", zero);
+        } else if (c->data_only && f->type->kind == TY_OBJECT && !f->type->cls->builtin) {
+            /* an object of a class in a data class (a TypeORM entity's relation not loaded): absent reads as null,
+               as the field is undefined in JavaScript */
+            buf_printf(b, "({ xs_jv *fv_ = xs_json_field_opt(v, \"%s\"); fv_ && fv_->kind != XJ_NULL ? ", f->name);
+            json_emit_read(b, f->type, "fv_", f->name);
+            buf_puts(b, " : NULL; })");
         } else {
             json_emit_read(b, f->type, xs_sprintf("xs_json_field(v, \"%s\")", f->name), f->name);
         }
