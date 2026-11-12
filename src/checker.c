@@ -2613,7 +2613,61 @@ static bool pr_convertible(Type *from, Type *to);
 static bool tsc_checked(void);
 static bool iface_adapt(Expr *e, Type *want, const char *what);
 static bool iface_runtime(Class *ifc, Pos pos);
+static Expr *ad_ident(Pos pos, const char *name);
+/* a fresh, unchecked copy of a path of names (f, this.f, a.b.c): read again inside an arrow, where its names are captured */
+static Expr *fresh_path(Expr *x) {
+    if (!x) return NULL;
+    Expr *c = xs_alloc(sizeof *c);
+    c->pos = x->pos; c->field = -1;
+    if (x->kind == E_THIS) { c->kind = E_THIS; return c; }
+    if (x->kind == E_IDENT && x->str) { c->kind = E_IDENT; c->str = x->str; return c; }
+    if (x->kind == E_MEMBER && !x->is_call && x->str && x->lhs) {
+        c->kind = E_MEMBER; c->str = x->str;
+        c->lhs = fresh_path(x->lhs);
+        return c->lhs ? c : NULL;
+    }
+    return NULL;
+}
 static void expect_type(Expr *e, Type *want, const char *what) {
+    if (want->kind == TY_FUNC && e->type->kind == TY_FUNC && want->nparams == e->type->nparams && !want->rest && !e->type->rest &&
+        want->ret && want->ret->kind == TY_UNKNOWN && !ty_is_any(want->ret) && e->type->ret && e->type->ret->kind != TY_UNKNOWN &&
+        e->type->ret->kind != TY_VOID && want->async_ret == e->type->async_ret && e->kind != E_ARROW) {
+        /* this.q where (sql: string, binds: unknown[]) => Promise<unknown> goes: TypeScript reads a function whose result
+           is wider; here an arrow that calls it, its result held as unknown: (a0, a1) => this.q(a0, a1) */
+        bool same = true;
+        for (int i = 0; i < want->nparams && same; i++) same = ty_equal(want->params[i], e->type->params[i]);
+        Expr *callee = same ? fresh_path(e) : NULL;
+        if (callee) {
+            Expr *call = xs_alloc(sizeof *call);
+            call->kind = E_CALL; call->pos = e->pos; call->field = -1; call->lhs = callee;
+            Func *f = xs_alloc(sizeof *f);
+            f->pos = e->pos; f->name = "arrow";
+            f->params = xs_alloc(sizeof(Param) * (size_t)(want->nparams ? want->nparams : 1));
+            f->nparams = want->nparams;
+            for (int i = 0; i < want->nparams; i++) {
+                f->params[i].name = xs_sprintf("__w%d_%d", ++tmp_counter, i);
+                f->params[i].type = want->params[i];
+                expr_list_push(&call->args, ad_ident(e->pos, f->params[i].name));
+            }
+            if (callee->kind == E_MEMBER) { /* (this.q(...) is a member call: the field read, then called) */
+                Expr *m = callee;
+                m->is_call = true;
+                m->args = call->args;
+                call = m;
+            }
+            Expr *ar = thunk_of(call);
+            ar->arrow->synthetic = false;
+            Func *af = ar->arrow->fn;
+            af->params = f->params;
+            af->nparams = f->nparams;
+            af->ret = ty_unknown;
+            af->is_async = want->async_ret;
+            af->ret_promise = want->async_ret;
+            *e = *ar;
+            check_expr(e, want);
+            return;
+        }
+    }
     if (want->kind == TY_PROMISE || (want->kind == TY_NULLABLE && want->elem->kind == TY_PROMISE)) { /* a promise kept (XB-106) */
         Type *pw = want->kind == TY_PROMISE ? want : want->elem;
         if (ty_equal(e->type, want)) return;
