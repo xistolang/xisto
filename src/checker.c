@@ -9519,6 +9519,12 @@ static bool missing_get(Expr *l) {
 static void check_nullish(Expr *e, Type *expected) {
     check_expr(e->lhs, NULL);
     settle(e->lhs);
+    {   /* s.match(/x/g) ?? []: the matches as a string[] (the empty array takes that type) */
+        Type *m = e->lhs->type;
+        if (m && m->kind == TY_NULLABLE && m->elem->kind == TY_OBJECT && m->elem->cls->builtin && !strcmp(m->elem->cls->name, "RegExpExecArray") &&
+            e->rhs && e->rhs->kind == E_ARRAY_LIT && e->rhs->args.len == 0)
+            wrap_call(e->lhs, "xs_RegExpExecArray_strings", ty_nullable_of(ty_array_of(ty_string)));
+    }
     Type *lt = e->lhs->type;
     if (lt->kind == TY_NULL) {
         Expr *r = e->rhs;
