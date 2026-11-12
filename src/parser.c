@@ -3334,8 +3334,14 @@ static void parse_tparams(Parser *p, Func *f) {
         f->tparams = realloc(f->tparams, sizeof(char *) * (size_t)(f->ntparams + 1));
         f->tdefaults = realloc(f->tdefaults, sizeof(Type *) * (size_t)(f->ntparams + 1));
         f->tdefaults[f->ntparams] = NULL;
+        f->ttuple = realloc(f->ttuple, sizeof(bool) * (size_t)(f->ntparams + 1));
+        f->ttuple[f->ntparams] = false;
         f->tparams[f->ntparams++] = expect(p, TK_IDENT, NULL).str;
-        if (at_ident(p, "extends")) { next(p); parse_type(p); }
+        if (at_ident(p, "extends")) {
+            next(p);
+            Type *ct = parse_type(p);
+            if (ct && ct->kind == TY_ARRAY && ct->elem && ct->elem->kind == TY_UNKNOWN) f->ttuple[f->ntparams - 1] = true;
+        }
         if (accept(p, TK_ASSIGN)) f->tdefaults[f->ntparams - 1] = parse_type(p); /* <T = string> */
     } while (accept(p, TK_COMMA) && !at(p, TK_GT)); /* (<T,>: the comma .tsx files need) */
     expect(p, TK_GT, "close the type parameters: <T, U>");

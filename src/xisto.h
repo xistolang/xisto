@@ -494,6 +494,7 @@ struct Func {
     char **tparams;
     int ntparams;
     Type **tdefaults;  /* <T = string>: the type a parameter takes when nothing binds it (NULL: none) */
+    bool *ttuple;      /* <T extends readonly unknown[]>: a tuple's types, erased inside (unknown[]) and converted at the call */
     void *gen_state;   /* the parser where the parameters start: each instance is parsed again with T bound */
     void *gen_subst;   /* the substitution in force where it was written (a generic method of a generic class's instance) */
     bool gen_method;
