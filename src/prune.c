@@ -35,6 +35,9 @@ static void use_class(Class *c) {
         if (c->fields[i].init) walk_expr(c->fields[i].init);
     }
     /* JSON parsing can build any used class without its constructor; printing needs nothing extra */
+    for (int i = 0; i < c->nmethods; i++) /* toJSON(): string, which JSON.stringify calls (bson's ObjectId) */
+        if (strcmp(c->methods[i]->name, "toJSON") == 0 && c->methods[i]->nparams == 0 && c->methods[i]->ret && c->methods[i]->ret->kind == TY_STRING)
+            push_func(c->methods[i]);
 }
 
 static void use_type(Type *t) {
