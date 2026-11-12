@@ -1362,6 +1362,21 @@ static Expr *parse_primary(Parser *p) {
             Token k = expect(p, TK_IDENT, NULL);
             name.str = xs_sprintf("Intl_%s", k.str);
             wants_intl = true;
+        } else if (at(p, TK_DOT) && peek_is_ident(p) && p->mod) { /* new Types.ObjectId(x) (or new ns.C(x)): the class Types's
+                                                                     module exports as ObjectId, as Types.ObjectId in a type */
+            Import *im = NULL;
+            for (int i = 0; i < p->nns && !im; i++) if (strcmp(p->ns_alias[i], name.str) == 0) im = &p->mod->imports[p->ns_import[i]];
+            for (int i = 0; i < p->mod->nimports && !im; i++) {
+                Import *q = &p->mod->imports[i];
+                if (q->reexport || q->star) continue;
+                for (int k = 0; k < q->n; k++) if (strcmp(q->names[k], name.str) == 0) { im = q; break; }
+            }
+            if (im) {
+                next(p);
+                name = p->tok;
+                next(p);
+                import_add_name(im, name);
+            }
         }
         if (strcmp(name.str, "Array") == 0) {
             Expr *e = new_expr(E_NEW_ARRAY, pos);
