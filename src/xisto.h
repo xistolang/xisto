@@ -599,6 +599,8 @@ struct Class {
                             X extends F, and F.__mixin(args) runs as a class decorator on X */
     bool mixin_done;
     bool synth;          /* A & B made a class (one side has methods): set up when made (checker, synth_inter) */
+    struct Class *view_of; /* an interface of optional fields used as a view of an open class (AuditableRequest of Express's
+                              Request): that class itself wherever the interface is named (checker) */
     bool fake;           /* { m: () => ... } as C: an object literal standing for a class with methods (no super(...)) */
     bool as_value;       /* class { ... } written as an expression: a value (its ClassInfo), like a decorated class */
 };
