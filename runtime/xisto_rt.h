@@ -2879,49 +2879,6 @@ static void xs_Symbol_print(void *p) {
     fputs(")", XS_OUT);
 }
 static int64_t xs_symbol_ids;
-#include <sys/resource.h>
-#include <unistd.h>
-/* xisto:v8: V8's default heap limit on 64 bits (a quarter of the memory, at most 4 GiB) and the memory in use */
-static inline double xs_v8_heap_limit(void) {
-    double mem = (double)sysconf(_SC_PHYS_PAGES) * (double)sysconf(_SC_PAGESIZE);
-    double lim = mem / 4;
-    return lim > 4294967296.0 ? 4294967296.0 : lim;
-}
-static inline double xs_v8_heap_used(void) {
-    struct rusage ru;
-    if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
-#ifdef __APPLE__
-    return (double)ru.ru_maxrss;
-#else
-    return (double)ru.ru_maxrss * 1024.0;
-#endif
-}
-#include <pthread.h>
-/* x instanceof Map (want_map) / Set with x an unknown: one of the program's maps (sets), not a Record */
-static inline bool xs_unk_is_map(void *v, int64_t want_map) {
-    return xs_is_a(v, xs_map_free) && ((xs_map *)v)->is_map == (want_map != 0) && !((xs_map *)v)->record;
-}
-XS_NOINLINE xs_Symbol *xs_Symbol_new(xs_str *description);
-/* Symbol.for(key): the symbol of that key, the same one each time (the registry lives as long as the program) */
-XS_NOINLINE xs_Symbol *xs_Symbol_for(xs_str *key) {
-    static struct xs_symreg { xs_str *k; xs_Symbol *y; struct xs_symreg *next; } *reg;
-    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
-    pthread_mutex_lock(&mu);
-    for (struct xs_symreg *r = reg; r; r = r->next)
-        if (r->k->len == key->len && memcmp(r->k->data, key->data, (size_t)key->len) == 0) { pthread_mutex_unlock(&mu); return xs_retain(r->y); }
-    struct xs_symreg *r = malloc(sizeof *r);
-    if (!r) xs_panic("out of memory");
-    r->k = xs_str_immortal(key->data, (size_t)key->len); /* (the registry's: process-lifetime, not counted as a leak) */
-    r->y = xs_Symbol_new(r->k);
-    r->y->hdr.rc = XS_IMMORTAL;
-    xs_live--;
-    xs_allocs--;
-    r->next = reg;
-    reg = r;
-    xs_Symbol *y = xs_retain(r->y);
-    pthread_mutex_unlock(&mu);
-    return y;
-}
 XS_NOINLINE xs_Symbol *xs_Symbol_new(xs_str *description) {
     xs_Symbol *y = xs_obj_alloc(sizeof *y, xs_Symbol_free, xs_Symbol_print);
     y->f_description = xs_retain(description);
@@ -4507,7 +4464,6 @@ XS_PRINT_ARRAY_N(xs_print_arr_int_n, xs_arr_int, xs_print_int_or_null_)
 
 #if !defined(_WIN32)
 #include <sys/resource.h>
-#include <unistd.h>
 #endif
 #include <time.h>
 

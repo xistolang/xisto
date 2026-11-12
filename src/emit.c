@@ -9754,10 +9754,62 @@ static const char xs_this_reg_c[] =
     "    return v;\n"
     "}\n"
 ;
+/* runtime pieces only some programs use, emitted only for them (every other program's C is unchanged) */
+static const char xs_v8_c[] =
+    "#include <sys/resource.h>\n"
+    "#include <unistd.h>\n"
+    "/* xisto:v8: V8's default heap limit on 64 bits (a quarter of the memory, at most 4 GiB) and the memory in use */\n"
+    "static inline double xs_v8_heap_limit(void) {\n"
+    "    double mem = (double)sysconf(_SC_PHYS_PAGES) * (double)sysconf(_SC_PAGESIZE);\n"
+    "    double lim = mem / 4;\n"
+    "    return lim > 4294967296.0 ? 4294967296.0 : lim;\n"
+    "}\n"
+    "static inline double xs_v8_heap_used(void) {\n"
+    "    struct rusage ru;\n"
+    "    if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;\n"
+    "#ifdef __APPLE__\n"
+    "    return (double)ru.ru_maxrss;\n"
+    "#else\n"
+    "    return (double)ru.ru_maxrss * 1024.0;\n"
+    "#endif\n"
+    "}\n"
+;
+static const char xs_unk_map_c[] =
+    "/* x instanceof Map (want_map) / Set with x an unknown: one of the program's maps (sets), not a Record */\n"
+    "static inline bool xs_unk_is_map(void *v, int64_t want_map) {\n"
+    "    return xs_is_a(v, xs_map_free) && ((xs_map *)v)->is_map == (want_map != 0) && !((xs_map *)v)->record;\n"
+    "}\n"
+;
+static const char xs_symbol_for_c[] =
+    "#include <pthread.h>\n"
+    "/* Symbol.for(key): the symbol of that key, the same one each time (the registry lives as long as the program) */\n"
+    "XS_NOINLINE xs_Symbol *xs_Symbol_for(xs_str *key) {\n"
+    "    static struct xs_symreg { xs_str *k; xs_Symbol *y; struct xs_symreg *next; } *reg;\n"
+    "    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;\n"
+    "    pthread_mutex_lock(&mu);\n"
+    "    for (struct xs_symreg *r = reg; r; r = r->next)\n"
+    "        if (r->k->len == key->len && memcmp(r->k->data, key->data, (size_t)key->len) == 0) { pthread_mutex_unlock(&mu); return xs_retain(r->y); }\n"
+    "    struct xs_symreg *r = malloc(sizeof *r);\n"
+    "    if (!r) xs_panic(\"out of memory\");\n"
+    "    r->k = xs_str_immortal(key->data, (size_t)key->len); /* (the registry's: process-lifetime, not counted as a leak) */\n"
+    "    r->y = xs_Symbol_new(r->k);\n"
+    "    r->y->hdr.rc = XS_IMMORTAL;\n"
+    "    xs_live--;\n"
+    "    xs_allocs--;\n"
+    "    r->next = reg;\n"
+    "    reg = r;\n"
+    "    xs_Symbol *y = xs_retain(r->y);\n"
+    "    pthread_mutex_unlock(&mu);\n"
+    "    return y;\n"
+    "}\n"
+;
 void emit_program(Program *p, Buf *o) {
     out = o;
     prog = p;
     if (p->uses_this_reg) buf_puts(out, xs_this_reg_c);
+    if (p->uses_v8) buf_puts(out, xs_v8_c);
+    if (p->uses_unk_map) buf_puts(out, xs_unk_map_c);
+    if (p->uses_symbol_for) buf_puts(out, xs_symbol_for_c);
     indent = 0;
     site_tab.len = 0;
     if (site_tab.data) site_tab.data[0] = 0;

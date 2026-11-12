@@ -55,6 +55,7 @@ static void vt_push(Parser *p, const char *name, Type *t) {
 static bool wants_intl;
 static Func **pending_overloads; /* function f(...): R; signatures waiting for their implementation */
 static int npending_overloads;
+static bool wants_settled; /* Promise.allSettled was named: xisto:settled is loaded */
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
 static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... was named: xisto:url is loaded */
 static bool is_url_global_name(const char *n);
@@ -1758,7 +1759,8 @@ static Expr *parse_postfix(Parser *p) {
             m->lhs = e;
             m->str = name.str;
             if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from") ||
-                !strcmp(name.str, "fromEntries") || !strcmp(name.str, "allSettled")) wants_arrays = true;
+                !strcmp(name.str, "fromEntries")) wants_arrays = true;
+            if (!strcmp(name.str, "allSettled")) wants_settled = true;
             if (!strcmp(name.str, "next") && e->kind == E_MEMBER && e->str && (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")))
                 wants_arrays = true; /* m.keys().next().value: __xs_first */
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs);
@@ -1798,7 +1800,8 @@ static Expr *parse_postfix(Parser *p) {
             m->lhs = e;
             m->str = name.str;
             if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from") ||
-                !strcmp(name.str, "fromEntries") || !strcmp(name.str, "allSettled")) wants_arrays = true;
+                !strcmp(name.str, "fromEntries")) wants_arrays = true;
+            if (!strcmp(name.str, "allSettled")) wants_settled = true;
             if (!strcmp(name.str, "next") && e->kind == E_MEMBER && e->str && (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")))
                 wants_arrays = true; /* m.keys().next().value: __xs_first */
             if (!strcmp(name.str, "length") && at(p, TK_ASSIGN)) wants_arrays = true; /* xs.length = 0 */
@@ -5519,7 +5522,9 @@ static const char xs_arrays_src[] =
     "  const out: U[] = [];\n"
     "  for (const ys of xs) for (const y of ys) out.push(y);\n"
     "  return out;\n"
-    "}\n"
+    "}\n";
+/* xisto:settled: Promise.allSettled (loaded only by a program that names it: its try blocks stay out of the others) */
+static const char xs_settled_src[] =
     "// Promise.allSettled(ps): each promise's outcome, in order ({ status, value } or { status, reason }); the promises run\n"
     "// already, so waiting for them one after the other waits as long as for all of them\n"
     "export class PromiseSettledResult<T> {\n"
@@ -5879,6 +5884,15 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         add_func(prog, f);
         return m;
     }
+    if (strcmp(name, "settled") == 0) { /* xisto:settled: Promise.allSettled (see xs_settled_src) */
+        m->builtin = false;
+        m->file = "xisto:settled";
+        m->src = (char *)xs_settled_src;
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
     if (strcmp(name, "arrays") == 0) { /* xisto:arrays: reduce, flatMap, flat (see xs_arrays_src) */
         m->builtin = false;
         m->file = "xisto:arrays";
@@ -5997,6 +6011,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->builtin = false;
         m->file = "xisto:v8";
         m->src = (char *)xs_v8_src;
+        prog->uses_v8 = true;
         m->native_prefix = "xs_";
         m->loading = true;
         parse_module(prog, m);
@@ -6159,6 +6174,7 @@ Program *parse_program(const char *entry_file) {
     Program *prog = xs_alloc(sizeof *prog);
     load_module(prog, entry_file, (Pos){0, 0}, NULL);
     if (wants_arrays) load_module(prog, "xisto:arrays", (Pos){1, 1}, entry_file);
+    if (wants_settled) load_module(prog, "xisto:settled", (Pos){1, 1}, entry_file);
     if (wants_url) load_module(prog, "xisto:url", (Pos){1, 1}, entry_file); /* (before errors: its DOMException extends Error) */
     if (wants_errors) load_module(prog, "xisto:errors", (Pos){1, 1}, entry_file);
     if (wants_intl) load_module(prog, "xisto:intl", (Pos){1, 1}, entry_file);

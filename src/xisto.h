@@ -388,6 +388,7 @@ struct Stmt {
     char *cname;
     char *cell;        /* S_VAR captured by a closure and reassigned: the heap cell holding it (cname reads cell->v) */
     bool generated;    /* made by the compiler (reflection of decorated classes): may reach private members */
+    char top_state;    /* top-level S_VAR: 1 being checked, 2 checked (early, from a body that read it first: early_global) */
     Expr *init;
     Expr *expr;        /* S_EXPR, S_RETURN (may be NULL) */
     Expr *cond;        /* S_IF / S_WHILE / S_FOR */
@@ -704,6 +705,7 @@ typedef struct {
     bool uses_gen;     /* generators: the coroutine runtime, without worker threads (plain globals, no TLS) */
     bool uses_sqlite;
     bool uses_regex;    /* RegExp: runtime/xisto_regex.h joins the program */
+    bool uses_v8, uses_unk_map, uses_symbol_for; /* xisto:v8, x instanceof Map/Set of an unknown, Symbol.for: their runtime joins the program */
     bool uses_this_reg; /* XB-107: function (this: T) / method slots: the this register's helpers join the program */
     bool uses_tls;
     bool uses_crypto;  /* node:crypto, or a native package that needs it */

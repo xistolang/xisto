@@ -1120,6 +1120,7 @@ static bool nullable_ok(Type *inner) {
 /* ---- generic interfaces: one concrete interface per list of type arguments ---- */
 static Type *resolve(Type *t, Pos pos);
 static bool is_deco_type(Type *t);
+static bool early_global(const char *name);
 static Type *ty_numkey(void);
 static Type *subst(Type *t, Class *tmpl, Type **args) {
     switch (t->kind) {
@@ -2004,6 +2005,7 @@ static Type *resolve(Type *t, Pos pos) {
     }
     if (t->kind == TY_TPARAM && t->tname && strncmp(t->tname, "__typeof:", 9) == 0) { /* typeof x */
         Binding *b = lookup(t->tname + 9);
+        if ((!b || !b->type) && early_global(t->tname + 9)) b = lookup(t->tname + 9); /* (a module constant not checked yet: now) */
         if (!b || !b->type) { /* a module constant not checked yet: the type its literal has (const X = ['a', 'b'] as const) */
             for (int pass = 0; pass < 2; pass++) /* this module's, then an exported one (imported by name) */
                 for (int i = 0; i < prog->top.len; i++) {
@@ -2393,6 +2395,7 @@ static Func *lookup_func(const char *name) {
         Func *f = e->decl;
         if (f->mod == cur_mod || (f->exported && imports_name(cur_mod, f->mod, name))) return f;
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:arrays") == 0) return f; /* (reduce & co) */
+        if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:settled") == 0) return f; /* (Promise.allSettled) */
         if ((!strcmp(name, "__xs_construct") || !strcmp(name, "__xs_ci_params") || !strcmp(name, "__xs_apply") || !strcmp(name, "__xs_use_desc")) &&
             f->mod && f->mod->file && !strcmp(f->mod->file, "xisto:reflect")) return f; /* (new (c)(); XB-107's f.apply and descriptors) */
         if (f->exported && (strstr(name, "__s_") || !strcmp(name, "__xs_fetch")) && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:url") == 0) return f; /* (URL.canParse, AbortSignal.timeout: statics of globals; fetch with its options in a value) */
@@ -3460,6 +3463,29 @@ static Expr *fresh_path(Expr *x) {
     return NULL;
 }
 static void expect_type(Expr *e, Type *want, const char *what) {
+    if (e->type && e->type->kind == TY_ARRAY && e->type->elem->kind == TY_INT && want->kind == TY_ARRAY && want->elem->kind == TY_NUMBER &&
+        (e->kind == E_CALL || (e->kind == E_MEMBER && e->is_call) || e->kind == E_ARRAY_LIT)) {
+        /* xs.map(([s]) => s) (ints, as a Map<int, V>'s keys) where number[] goes: a fresh array, its values as numbers
+           (TypeScript's numbers; the copy is the array just made) */
+        Expr *v = xs_alloc(sizeof *v);
+        *v = *e;
+        v->prechecked = true;
+        static int nin;
+        const char *pn = xs_sprintf("__in%d", nin++);
+        Func *f = xs_alloc(sizeof *f); f->pos = e->pos; f->name = "arrow"; f->ret = ty_number;
+        f->params = xs_alloc(sizeof(Param)); memset(f->params, 0, sizeof(Param)); f->params[0].name = (char *)pn; f->params[0].type = ty_int; f->nparams = 1;
+        Expr *id = xs_alloc(sizeof *id); id->kind = E_IDENT; id->pos = e->pos; id->field = -1; id->str = (char *)pn;
+        Stmt *r = xs_alloc(sizeof *r); r->kind = S_RETURN; r->pos = e->pos; r->expr = id;
+        Stmt *b = xs_alloc(sizeof *b); b->kind = S_BLOCK; b->pos = e->pos; stmt_list_push(&b->stmts, r);
+        f->body = b;
+        Arrow *a = xs_alloc(sizeof *a); a->pos = e->pos; a->fn = f; a->expr_body = true;
+        Expr *ae = xs_alloc(sizeof *ae); ae->kind = E_ARROW; ae->pos = e->pos; ae->field = -1; ae->arrow = a;
+        memset(e, 0, sizeof *e);
+        e->kind = E_MEMBER; e->pos = v->pos; e->field = -1; e->lhs = v; e->str = "map"; e->is_call = true;
+        expr_list_push(&e->args, ae);
+        check_expr(e, want);
+        return;
+    }
     { /* req (a view of the request) where another view of it goes (this.realizar(req, dto)): the same object */
         Type *g = e->type ? ty_strip_null(e->type) : NULL, *w = ty_strip_null(want);
         if (g && g->kind == TY_OBJECT && w->kind == TY_OBJECT && g->cls != w->cls && w->cls->view_of &&
@@ -5373,6 +5399,20 @@ static void infer_objlit(Expr *e) {
                    o->fields[i].optional == (opt[i] || (ts[i]->kind == TY_NULLABLE && ts[i]->absent));
         if (same) c = o;
     }
+    for (int m = 0; m < prog->nclasses && !c && e->args.len; m++) {
+        /* const entrada = { em: Date.now(), pronto: false } and a Map<string, { em: number; pronto: boolean }> it goes into:
+           an object type written in place with these fields, in this order, is the literal's (the same object, not a copy,
+           as JavaScript keeps it: entrada === map.get(k)) */
+        Class *o = prog->classes[m];
+        if (!o->is_interface || !o->cname || o->nmethods || o->iface_methods || o->mixin || o->ntparams || o->generic_of || o->base ||
+            !o->name || strncmp(o->name, "__Obj_", 6) != 0 || o->nfields != e->args.len)
+            continue;
+        bool same = true;
+        for (int i = 0; i < e->args.len && same; i++)
+            same = o->fields[i].type && strcmp(o->fields[i].name, e->keys[i]) == 0 && ty_equal(o->fields[i].type, ts[i]) &&
+                   o->fields[i].optional == (opt[i] || (ts[i]->kind == TY_NULLABLE && ts[i]->absent));
+        if (same) c = o;
+    }
     if (!c) {
         c = xs_alloc(sizeof *c);
         Buf name = {0};
@@ -5969,7 +6009,7 @@ static bool objlit_expand(Expr *e, Type *expected) {
             if (st && st->kind == TY_MAP && st->record && st->key->kind == TY_STRING) {
                 any_rec = true;
                 if (!v) v = st->elem;
-                else if (!ty_equal(v, st->elem)) ok = false;
+                else if (!ty_equal(v, st->elem)) v = ty_unknown; /* ({ ...nums, ...texts }: a Record of unknowns) */
             } else ok = false; /* (a Record and an object spread together: not this) */
         }
         if (any_rec && ok) {
@@ -6288,6 +6328,55 @@ static bool shape_probe(Expr *e, Expr *v, Type *want) {
     return false;
 }
 static bool cond_prim(Type *t) { return t->kind == TY_STRING || t->kind == TY_NUMBER || t->kind == TY_INT || t->kind == TY_BOOLEAN; }
+/* a module's top-level variable read by a body checked before the module's code (a method whose return type a
+   signature needs, const CONFIG = () => ({ ... X ... }) as a function): the variable checked now, in its module, as
+   the module's code would check it (JavaScript reads it when the body runs, after the module's code set it) */
+static void check_var(Stmt *s, bool global);
+static void declare_poisoned(Stmt *s, bool global);
+static bool failed_;
+static bool early_global(const char *name) {
+    for (int i = 0; i < prog->top.len; i++) {
+        Stmt *s = prog->top.items[i];
+        if (s->kind != S_VAR || !s->name || strcmp(s->name, name) != 0 || s->top_state != 0 || !s->mod) continue;
+        bool here = s->mod == cur_mod;
+        const char *st = strstr(name, "__s_"); /* (Dec.ZERO: Dec__s_ZERO, imported with Dec) */
+        const char *iname = st ? xs_strndup(name, (size_t)(st - name)) : name;
+        if (!here && !(cur_mod && imports_name(cur_mod, s->mod, iname) && (s->exported || st))) continue;
+        s->top_state = 1;
+        Scope *sc = scope; Func *cf = cur_func; Class *cc = cur_class; Module *cm = cur_mod;
+        const char *fname = xs_file_name, *fsrc = xs_source;
+        int ld = loop_depth, sd = switch_depth, fd = finally_depth;
+        bool cg = checking_generated, fl = failed_;
+        jmp_buf *outer = xs_error_recover;
+        jmp_buf rb;
+        bool ok = true;
+        enter_module(s->mod);
+        cur_func = NULL;
+        cur_class = NULL;
+        loop_depth = switch_depth = finally_depth = 0;
+        checking_generated = s->generated;
+        xs_error_recover = &rb;
+        if (_setjmp(rb) == 0) check_var(s, true);
+        else ok = false;
+        xs_error_recover = outer;
+        s->top_state = 2;
+        Binding *b = ok ? lookup(name) : NULL; /* (in its module's scope) */
+        scope = sc; cur_func = cf; cur_class = cc; cur_mod = cm; xs_file_name = fname; xs_source = fsrc;
+        loop_depth = ld; switch_depth = sd; finally_depth = fd; checking_generated = cg; failed_ = fl;
+        if (!ok) { declare_poisoned(s, true); return false; }
+        if (!here && b) { /* (imported: the alias in this module, as its imports were bound) */
+            Binding *alias = xs_alloc(sizeof *alias);
+            *alias = *b;
+            alias->origin = b;
+            alias->is_const = true;
+            Scope *ms = mod_scopes[cur_mod->id];
+            alias->next = ms->head;
+            ms->head = alias;
+        }
+        return lookup(name) != NULL;
+    }
+    return false;
+}
 static void check_expr_in(Expr *e, Type *expected) {
     if (e->prechecked) return;
     if (e->kind == E_CALL && !e->lhs && e->builtin.cfn && e->type) return; /* a runtime call the checker made (wrap_call): checked */
@@ -6442,6 +6531,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             }
             if (strcmp(e->str, "null") == 0)
                 xs_error(XS2005, e->pos, "every value in xisto has a concrete type; there is no 'undefined' or 'null'", "'%s' does not exist", e->str);
+            if (early_global(e->str)) { check_expr(e, expected); return; }
             {
                 int n; const char **cands = visible_names(&n);
                 if (missing_name(e->str)) xs_error_quiet();
@@ -6759,6 +6849,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 memset(e, 0, sizeof *e);
                 e->kind = E_CALL; e->pos = v->pos; e->field = -1;
                 e->builtin.cfn = "xs_unk_is_map";
+                prog->uses_unk_map = true;
                 expr_list_push(&e->args, v);
                 expr_list_push(&e->args, num_lit(v->pos, want_map ? 1 : 0, true));
                 e->type = ty_boolean;
@@ -7653,6 +7744,15 @@ static void check_expr_in(Expr *e, Type *expected) {
             }
             if (strcmp(name, "String") == 0) {
                 if (e->args.len != 1) xs_error(XS7041, e->pos, NULL, "String() takes exactly one argument");
+                if (e->args.items[0]->kind == E_AS && e->args.items[0]->elem_type && e->args.items[0]->op != TK_NOT &&
+                    e->args.items[0]->elem_type->kind == TY_STRING) { /* String(v as string): the text of v as it is (the cast
+                                                                         only tells TypeScript; String() reads any value) */
+                    Expr *in = e->args.items[0]->lhs;
+                    check_expr(in, NULL);
+                    Type *it = ty_strip_null(in->type);
+                    if (it->kind == TY_UNION || it->kind == TY_UNKNOWN) e->args.items[0] = in;
+                    else in->prechecked = true;
+                }
                 check_expr(e->args.items[0], NULL);
                 Expr *a = e->args.items[0];
                 settle(a);
@@ -8602,6 +8702,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 check_expr(e->args.items[0], ty_string);
                 expect_type(e->args.items[0], ty_string, "the key of Symbol.for");
                 e->builtin.cfn = "xs_Symbol_for";
+                prog->uses_symbol_for = true;
                 e->type = ty_object_of(find_class("symbol"));
                 return;
             }
@@ -11360,6 +11461,40 @@ static void check_nullish(Expr *e, Type *expected) {
         return;
     }
     Type *want = lt->elem;
+    {   /* this.svc?.saude() ?? { ligado: false } where SaudeX | { ligado: false } goes: the left one a member of that union, the
+           default another (both read as the union) */
+        Type *xu = expected ? ty_strip_null(expected) : NULL;
+        bool member = false;
+        for (int i = 0; xu && xu->kind == TY_UNION && i < xu->nparams; i++) member = member || ty_equal(xu->params[i], want);
+        if (member) {
+            expect_type(l, ty_nullable_of(xu), "left operand of '??'");
+            lt = l->type;
+            want = xu;
+        }
+    }
+    if (want->kind == TY_OBJECT && !want->cls->builtin && e->rhs->kind == E_OBJLIT && e->rhs->args.len == 0 &&
+        (!expected || expected->kind == TY_UNKNOWN)) {
+        /* (entity ?? {}) as unknown as Record<string, any>: the object, or an empty Record, as an unknown (the cast reads it) */
+        bool required = false;
+        for (int i = 0; i < want->cls->nfields; i++) required = required || !want->cls->fields[i].optional;
+        if (required) { /* (the object read as a Record of its fields, where it is: a borrowed cast) */
+            Type *rec = xs_alloc(sizeof *rec);
+            *rec = *ty_map_of(ty_string, ty_unknown);
+            rec->record = true;
+            Expr *v = xs_alloc(sizeof *v);
+            *v = *l;
+            v->prechecked = true;
+            Expr *u = xs_alloc(sizeof *u);
+            u->kind = E_AS; u->pos = l->pos; u->field = -1; u->lhs = v; u->elem_type = ty_unknown;
+            memset(l, 0, sizeof *l);
+            l->kind = E_AS; l->pos = u->pos; l->field = -1; l->lhs = u; l->elem_type = ty_nullable_of(rec);
+            check_expr(l, NULL);
+            check_expr(e->rhs, rec);
+            e->rhs->prechecked = true;
+            lt = l->type;
+            want = rec;
+        }
+    }
     if ((want->kind == TY_NUMBER || want->kind == TY_INT) && e->rhs->kind == E_STRING) {
         /* n ?? '' (n a number | null): JavaScript gives number | string, used as text: String(n) ?? '' */
         Expr *v = expr_copy(l);
@@ -13995,7 +14130,6 @@ static void check_field_init(Class *c) {
     } \
     xs_error_recover = NULL; }
 
-static bool failed_;
 
 /* the return type of f, inferred now when it was left out and f's body is not checked yet: f is checked here, in
    its own context, and whatever was being checked carries on as it was */
@@ -14666,6 +14800,8 @@ void check_program(Program *p) {
         for (int i = 0; i < p->top.len; i++) {
             Stmt *s = p->top.items[i];
             if (s->mod != m) continue;
+            if (s->kind == S_VAR && s->top_state == 2) continue; /* (checked already: early_global) */
+            if (s->kind == S_VAR) s->top_state = 1;
             checking_generated = s->generated;
             RECOVER_BEGIN
                 if (s->kind == S_VAR) check_var(s, true);
