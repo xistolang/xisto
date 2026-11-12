@@ -207,6 +207,7 @@ static void init_builtins(void) {
     bi_field(resp, "ok", ty_boolean);
     bi_field(resp, "headers", ty_map_of(ty_string, ty_string)); /* a Map: get(name) and forEach((v, k) => ...), names in lower case */
     bi_method(resp, "text", "xs_Response_text", ty_string, 0);
+    bi_field(resp, "url", ty_string);
 
     Class *req = bi_class("HttpRequest", "xs_HttpRequest");
     bi_field(req, "method", ty_string);
@@ -216,6 +217,7 @@ static void init_builtins(void) {
     bi_method(req, "param", "xs_HttpRequest_param", ty_string, 1, ty_string);
     bi_method(req, "header", "xs_HttpRequest_header", ty_string, 1, ty_string);
     bi_method(req, "search", "xs_HttpRequest_search", ty_string, 0);
+    bi_method(req, "headerNames", "xs_HttpRequest_headerNames", ty_array_of(ty_string), 0);
 
     Class *res = bi_class("HttpResponse", "xs_HttpResponse");
     bi_field(res, "status", ty_int);
@@ -252,6 +254,7 @@ static void init_builtins(void) {
     bi_method(bigc, "toString", "xs_big_to_string", ty_string, 0);
     /* bytes (runtime/xisto_rt.h): Uint8Array, and Buffer, the same object printed the Node way; members: check_bytes_member */
     Class *u8 = bi_class("Uint8Array", "xs_Uint8Array");
+    bi_method(resp, "arrayBuffer", "xs_Response_arrayBuffer", ty_object_of(u8), 0); /* (fetch's Response: the body's bytes) */
     bi_field(u8, "length", ty_int);
     Class *buf = bi_class("Buffer", "xs_Uint8Array");
     bi_field(buf, "length", ty_int);
@@ -1587,6 +1590,19 @@ static Type *resolve(Type *t, Pos pos) {
             bool methods = src && !src->is_interface && !src->builtin && m->nkeys > 0;
             for (int i = 0; i < m->nkeys && methods; i++) methods = find_method(src, m->keys[i]) != NULL;
             if (methods) { *t = *ty_object_of(src); return t; }
+        }
+        if (t->cls->mixin && t->cls->mixin->kind && !strcmp(t->cls->mixin->kind, "IntersectionType") && t->cls->mixin->a && !t->cls->mixin->a->kind) {
+            /* Request & { terminal?: T } with an open class (a field __expando: Express's Request): the class itself,
+               whose undeclared properties live in its __expando (a shape copy would lose them) */
+            Mixin *m = t->cls->mixin;
+            Module *was = cur_mod;
+            Scope *ss = scope;
+            const char *sfn = xs_file_name, *ssrc = xs_source;
+            if (t->cls->mod && t->cls->mod != cur_mod) enter_module(t->cls->mod);
+            Class *src = m->a->klass ? m->a->klass : find_class(m->a->cls);
+            cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
+            int xi;
+            if (src && !src->is_interface && !src->builtin && find_field(src, "__expando", &xi)) { *t = *ty_object_of(src); return t; }
         }
         if (t->cls->cname) return t;
         if (t->cls->name && strncmp(t->cls->name, "__Obj_", 6) == 0 && t->cls->mod && late_inline_class(t->cls)) return t;
@@ -4092,7 +4108,13 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
         Type *pt = tmpl->params[i].type;
         Expr *a = e->args.items[i];
         if (!pt || pt->kind != TY_OBJECT || !pt->cls || !pt->cls->name || strcmp(pt->cls->name, "EntityTarget") != 0 || pt->ntargs != 1 ||
-            pt->targs[0]->kind != TY_TPARAM || a->kind != E_IDENT || lookup(a->str)) continue;
+            pt->targs[0]->kind != TY_TPARAM) continue;
+        if (a->kind == E_AS) { /* manager.findOne("TB_X" as never, ...): an entity by name; T is any (TypeORM's ObjectLiteral) */
+            for (int k = 0; k < tmpl->ntparams; k++)
+                if (!bind[k] && strcmp(tmpl->tparams[k], pt->targs[0]->tname) == 0) bind[k] = ty_any;
+            continue;
+        }
+        if (a->kind != E_IDENT || lookup(a->str)) continue;
         Class *ac = find_class(a->str);
         if (!ac || ac->builtin) continue;
         for (int k = 0; k < tmpl->ntparams; k++)
@@ -4185,7 +4207,10 @@ static bool checking_generated; /* the compiler's own code (reflection adapters)
 static void check_access(int access, Class *owner, const char *name, Pos pos) {
     if (!access || !owner || checking_generated) return;
     Class *in = cur_class ? cur_class : cur_func ? (cur_func->cls ? cur_func->cls : cur_func->static_of) : NULL;
-    if (access == 2 && in != owner)
+    /* (two instances of one generic class are one class for TypeScript: Query<R, T>.lean() sets the private fields of
+       the Query<L, T> it makes) */
+    bool same_template = in && owner && in != owner && (in->generic_of ? in->generic_of : in) == (owner->generic_of ? owner->generic_of : owner);
+    if (access == 2 && in != owner && !same_template)
         xs_error(XS8055, pos, xs_sprintf("use it inside %s, or make it public", owner->name), "'%s' is private to %s", name, owner->name);
     if (access == 1 && !(in && is_subclass(in, owner)))
         xs_error(XS8056, pos, xs_sprintf("use it inside %s or a class that extends it", owner->name), "'%s' is protected in %s", name, owner->name);
@@ -4287,6 +4312,27 @@ static void check_object_member(Expr *e, Class *c) {
         if (g) { e->str = g->name; e->is_call = true; }
     }
     Func *m = find_method(c, e->str);
+    if (!m && !e->is_call && !c->builtin) {
+        /* an open class (a field `__expando: Record<string, any>`, as Express's Request): a property the class does
+           not declare lives there, as JavaScript adds it to the object (request.terminal = t; req.headers['x-y']) */
+        int xi;
+        Field *xf = find_field(c, "__expando", &xi);
+        if (xf && xf->type->kind == TY_MAP && xf->type->record) {
+            Expr *holder = xs_alloc(sizeof *holder);
+            holder->kind = E_MEMBER; holder->pos = e->pos; holder->field = -1; holder->lhs = e->lhs; holder->str = "__expando";
+            e->lhs->prechecked = true; /* (checked: its type is the open class) */
+            Expr *key = xs_alloc(sizeof *key);
+            key->kind = E_STRING; key->pos = e->pos; key->field = -1; key->str = e->str; key->type = ty_string; key->lit_id = intern(e->str);
+            e->kind = E_INDEX;
+            e->lhs = holder;
+            e->rhs = key;
+            e->str = NULL;
+            e->field = -1;
+            e->cls = NULL;
+            check_expr(e, NULL);
+            return;
+        }
+    }
     if (!m) {
         int n; const char **cands = member_names(c, &n);
         if (c->builtin && strcmp(c->name, "Error") == 0) { cands = (const char *[]){"message", "name", "stack"}; n = 3; }
@@ -5729,6 +5775,27 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         Expr *target = e->lhs;
         bool dyn_target = false;
+        if (target->kind == E_MEMBER && !target->is_call && target->str && target->lhs && rereadable(target->lhs) &&
+            !(target->lhs->kind == E_IDENT && !lookup(target->lhs->str))) {
+            /* request.terminal = t on an open class (a field __expando: Express's Request): the property goes there */
+            check_expr(target->lhs, NULL);
+            Type *rt = target->lhs->type;
+            Class *rc = rt && rt->kind == TY_OBJECT && !rt->cls->builtin ? rt->cls : NULL;
+            int xi;
+            Field *xf = rc ? find_field(rc, "__expando", &xi) : NULL;
+            if (xf && xf->type->kind == TY_MAP && xf->type->record && !find_field(rc, target->str, NULL) &&
+                !find_method(rc, xs_sprintf("__set_%s", target->str)) && !find_method(rc, target->str)) {
+                Expr *holder = xs_alloc(sizeof *holder);
+                holder->kind = E_MEMBER; holder->pos = target->pos; holder->field = -1; holder->lhs = target->lhs; holder->str = "__expando";
+                target->lhs->prechecked = true;
+                Expr *key = xs_alloc(sizeof *key);
+                key->kind = E_STRING; key->pos = target->pos; key->field = -1; key->str = target->str; key->type = ty_string; key->lit_id = intern(target->str);
+                target->kind = E_INDEX;
+                target->lhs = holder;
+                target->rhs = key;
+                target->str = NULL;
+            }
+        }
         if (e->kind == E_ASSIGN && ((target->kind == E_INDEX) || (target->kind == E_MEMBER && !target->is_call && target->str)) && target->lhs &&
             target->lhs->kind == E_AS && target->lhs->elem_type && ty_is_any(target->lhs->elem_type) && target->lhs->lhs->kind != E_OBJLIT) {
             /* (o as any).f = v: o's own field when its class has it (the cast only quiets TypeScript), else by name */
@@ -7700,6 +7767,18 @@ static void check_expr_in(Expr *e, Type *expected) {
             return;
         }
         Type *want = resolve(e->elem_type, e->pos);
+        if (want->kind == TY_UNKNOWN && want->tname && !strcmp(want->tname, "never") && expected && expected->kind != TY_UNKNOWN &&
+            expected->kind != TY_VOID && !has_tparam(expected)) {
+            /* { where: { ... } } as never where FindOneOptions goes: never is assignable to anything, so the value is
+               checked as the type expected there (an object literal gets its class, not a Record read by name) */
+            e->elem_type = want = expected;
+            if (e->lhs->kind == E_OBJLIT || e->lhs->kind == E_ARRAY_LIT) {
+                Expr *inner = e->lhs;
+                *e = *inner;
+                check_expr(e, expected);
+                return;
+            }
+        }
         { /* x as Record<string, unknown> (of an unknown, at run time): an object of a class is read through its field
              table, which the program then needs (xs_as_record) */
             Type *w = ty_strip_null(want);

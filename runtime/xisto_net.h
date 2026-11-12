@@ -1514,7 +1514,7 @@ static xs_tls *xs_tls_server_new(xs_tls_cred_t *cr);
 
 /* ---- objects visible to the program ---- */
 
-typedef struct xs_Response { xs_hdr hdr; int64_t f_status; bool f_ok; xs_map *f_headers; xs_str *body; } xs_Response;
+typedef struct xs_Response { xs_hdr hdr; int64_t f_status; bool f_ok; xs_map *f_headers; xs_str *body; xs_str *f_url; } xs_Response;
 typedef struct xs_HttpRequest {
     xs_hdr hdr;
     xs_str *f_method, *f_path, *f_body;
@@ -1540,9 +1540,15 @@ typedef struct {
 typedef struct { char method[8]; xs_str *path; xs_handler fn; xs_route_metrics m; } xs_route;
 typedef struct xs_Server { xs_hdr hdr; xs_route *routes; int nroutes, cap; void *cred; } xs_Server;
 
-static void xs_Response_free(void *p) { xs_release(((xs_Response *)p)->body); if (((xs_Response *)p)->f_headers) xs_release(((xs_Response *)p)->f_headers); xs_obj_free(p); }
+static void xs_Response_free(void *p) { xs_release(((xs_Response *)p)->body); xs_release(((xs_Response *)p)->f_url); if (((xs_Response *)p)->f_headers) xs_release(((xs_Response *)p)->f_headers); xs_obj_free(p); }
 static void xs_Response_print(void *p) { fprintf(XS_OUT, "Response { status: %lld, ok: %s }", (long long)((xs_Response *)p)->f_status, ((xs_Response *)p)->f_ok ? "true" : "false"); }
 static xs_str *xs_Response_text(xs_Response *r) { return xs_retain(r->body); }
+/* res.arrayBuffer(): the body's bytes (a Buffer.from(...) of it is what code does with it) */
+static xs_Uint8Array *xs_Response_arrayBuffer(xs_Response *r) {
+    xs_Uint8Array *a = xs_u8_new(r->body->len);
+    if (r->body->len) memcpy(a->data, r->body->data, (size_t)r->body->len);
+    return a;
+}
 
 static void xs_HttpRequest_free(void *p) {
     xs_HttpRequest *r = p;
@@ -1808,6 +1814,23 @@ static xs_str *xs_HttpRequest_query(xs_HttpRequest *r, xs_str *name) {
     return xs_str_new("", 0);
 }
 
+/* req.headerNames(): the names of the headers that came, lower case, in order (Express's req.headers keys) */
+static xs_arr_ref *xs_HttpRequest_headerNames(xs_HttpRequest *r) {
+    xs_arr_ref *a = xs_arr_ref_new(8, xs_print_str_quoted_);
+    const char *p = r->headers, *end = r->headers + r->headers_len;
+    while (p && p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        if (!eol) eol = end;
+        const char *colon = memchr(p, ':', (size_t)(eol - p));
+        if (colon && colon > p) {
+            xs_str *k = xs_str_new(p, (size_t)(colon - p));
+            for (int64_t i = 0; i < k->len; i++) k->data[i] = (char)tolower((unsigned char)k->data[i]);
+            xs_arr_ref_push(a, k);
+        }
+        p = eol + 1;
+    }
+    return a;
+}
 static xs_str *xs_HttpRequest_header(xs_HttpRequest *r, xs_str *name) {
     const char *v;
     size_t vlen;
@@ -2143,6 +2166,7 @@ XS_NOINLINE xs_Response *xs_fetch_full(xs_str *url, xs_str *method, xs_str *body
         xs_Response *resp = xs_obj_alloc(sizeof *resp, xs_Response_free, xs_Response_print);
         resp->f_status = status;
         resp->f_ok = status >= 200 && status < 300;
+        resp->f_url = xs_retain(url); /* (redirects are not followed: the URL asked for) */
         resp->body = is_chunked ? xs_str_new(chunked.data ? chunked.data : "", chunked.len) : xs_str_new(buf.data + hdr_len, body_len);
         { /* response.headers: names in lower case (what Headers.get and forEach give), in the order received */
             xs_map *hm = xs_map_new(1, 1, 3, xs_print_str_quoted_, xs_print_str_quoted_);

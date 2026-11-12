@@ -1,25 +1,33 @@
 // The part of Express that request handlers, exception filters and middleware read and write. A framework (Nest)
 // builds the Request from xisto's HttpRequest and turns the Response, once the handler is done, into the
 // HttpResponse the server sends.
-export interface IncomingHttpHeaders {
+/**
+ * The request's headers by lower-case name: headers.authorization, headers["x-forwarded-for"].
+ * Compatibility: each value is the header's text (Node gives an array for set-cookie).
+ */
+export class IncomingHttpHeaders {
   authorization?: string;
+  /** (the other headers: an open class, read by name) */
+  __expando: Record<string, any> = {};
 }
 
 /**
  * The incoming request, as Express gives it to handlers.
- * Compatibility: `headers` carries the authorization header only; `header(name)` reads any of them.
+ * Compatibility: what middleware and guards add to it (request.terminal = t) is kept by name, as in JavaScript.
  */
 export class Request {
   method: string = "GET";
   url: string = "/";
   path: string = "/";
-  headers: IncomingHttpHeaders = {};
+  headers: IncomingHttpHeaders = new IncomingHttpHeaders();
   body: string = "";
   ip: string = "";
   /** What an authentication guard put on the request (@nestjs/passport: validate()'s value). */
   user: any = null;
   /** The route's parameters (/:id), by name. */
   params: Record<string, string> = {};
+  /** (what middleware, guards and interceptors add: request.terminal = t; an open class, read by name) */
+  __expando: Record<string, any> = {};
   private readonly all: Map<string, string> = new Map<string, string>();
   private readonly queries: Map<string, string> = new Map<string, string>();
   private source: HttpRequest | null = null; // the server's request: every header it carries
@@ -35,6 +43,14 @@ export class Request {
   /** The server's request the other headers are read from (the framework calls this while building the request). */
   setSource(source: HttpRequest): void {
     this.source = source;
+    for (const name of source.headerNames()) {
+      const v = source.header(name);
+      if (name === "authorization") {
+        this.headers.authorization = v;
+      } else {
+        this.headers.__expando[name] = v;
+      }
+    }
   }
 
   /** Sets a query string value (the framework calls this while building the request). */
