@@ -7,8 +7,55 @@ title: Porting an existing project
 An existing TypeScript/Node project (NestJS, TypeORM, Express...) usually needs some changes before it compiles
 with xisto. Start by measuring how many, and of which kind.
 
-The repository also has [skills/xisto-port](https://github.com/xistolang/xisto/blob/main/skills/xisto-port/SKILL.md),
-a longer guide to the method (also usable as a Claude Code skill).
+You can follow the steps on this page yourself, or hand them to an AI coding agent with the port skill below.
+
+## Porting with an AI agent: the `xisto-port` skill
+
+[`skills/xisto-port/SKILL.md`](https://github.com/xistolang/xisto/blob/main/skills/xisto-port/SKILL.md) is the
+method on this page written for an agent, plus what the ports so far have taught: the ported packages and their
+limits, the language rules and known gaps, how to read a `xisto check` count, how to compare with Node, and the
+pitfalls. It is a [Claude Code skill](https://code.claude.com/docs/en/skills), and plain Markdown that
+any agent can read.
+
+**Install it** for all your projects, or only for one:
+
+```sh
+mkdir -p ~/.claude/skills/xisto-port
+curl -fsSL https://raw.githubusercontent.com/xistolang/xisto/main/skills/xisto-port/SKILL.md \
+  -o ~/.claude/skills/xisto-port/SKILL.md
+```
+
+For one project, use `.claude/skills/xisto-port/SKILL.md` inside it instead. Run the same command again to update.
+
+**Use it.** In Claude Code, call it by name with the goal, or just ask in your own words; the skill's description
+makes the agent load it when the task is a port:
+
+```text
+/xisto-port port apps/api to xisto: it must compile and answer /health like it does on Node
+```
+
+```text
+what is missing for this project to compile with xisto?
+```
+
+With another agent, point it at the file: "read skills/xisto-port/SKILL.md and follow it to port this project".
+
+**What the agent does with it:**
+
+1. Clones the project and works on a branch (`xisto/<app>`); it never edits your working copy, so you review the
+   diff and decide what goes back.
+2. Runs `xisto check` from a scratch directory, groups the errors by cause and attacks the biggest group first,
+   recounting after each fix. It distrusts a count that drops too fast: that is usually a crash, not progress.
+3. Fixes in the order below: the compiler, then a package, and only then your code, in small commits that say why.
+4. Builds a release binary, runs it against a local or development database you provide, and compares the main
+   routes with the same app on Node, original code, same Node version.
+
+**What it is told never to do:** invent credentials, print a secret (it masks keys named like PASS, SECRET, KEY,
+TOKEN), try more than one login at a time against a real database (a wrong attempt can lock a real person's
+account), run a load test while a build runs, or put code from your project into the xisto repository.
+
+You stay in charge of the decisions: what to change in the app, which database to use, and what goes back to your
+repository.
 
 ## Ground rules
 
