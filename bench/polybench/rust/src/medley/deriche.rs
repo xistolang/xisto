@@ -1,7 +1,6 @@
 use crate::config::medley::deriche::DataType;
 use crate::ndarray::{Array2D, ArrayAlloc};
 use crate::util;
-use std::time::Duration;
 
 unsafe fn init_array<const H: usize, const W: usize>(
     w: usize,
@@ -117,27 +116,41 @@ unsafe fn kernel_deriche<const H: usize, const W: usize>(
     }
 }
 
-pub fn bench<const H: usize, const W: usize>() -> Duration {
+fn print_array<const P0: usize, const P1: usize>(w: usize, h: usize, img_out: &Array2D<DataType, P0, P1>) {
+    let mut d = util::Dump::start();
+    d.begin("imgOut");
+    for i in 0..w {
+        for j in 0..h {
+            if (i * h + j) % 20 == 0 {
+                d.nl();
+            }
+            d.f32(img_out[i][j]);
+        }
+    }
+    d.end("imgOut");
+    d.finish();
+}
+
+pub fn run<const H: usize, const W: usize>() {
     let w = W;
     let h = H;
 
     let mut alpha = 0.0;
-    let mut img_in = Array2D::<DataType, W, H>::uninit();
-    let mut img_out = Array2D::<DataType, W, H>::uninit();
-    let mut y1 = Array2D::<DataType, W, H>::uninit();
-    let mut y2 = Array2D::<DataType, W, H>::uninit();
+    let mut img_in = Array2D::<DataType, W, H>::zeroed();
+    let mut img_out = Array2D::<DataType, W, H>::zeroed();
+    let mut y1 = Array2D::<DataType, W, H>::zeroed();
+    let mut y2 = Array2D::<DataType, W, H>::zeroed();
 
     unsafe {
         init_array(w, h, &mut alpha, &mut img_in);
-        let elapsed = util::time_function(|| {
-            kernel_deriche(w, h, alpha, &img_in, &mut img_out, &mut y1, &mut y2)
-        });
-        util::consume(img_out);
-        elapsed
+        let t = util::Timer::start();
+        kernel_deriche(w, h, alpha, &img_in, &mut img_out, &mut y1, &mut y2);
+        t.stop_and_print();
+        print_array(w, h, &img_out);
     }
 }
 
 #[test]
 fn check() {
-    bench::<16, 9>();
+    run::<16, 9>();
 }

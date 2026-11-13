@@ -1,15 +1,13 @@
-#![feature(min_const_generics)]
-
-use polybench_rs::linear_algebra::blas::gemver::bench;
-
-fn bench_and_print<const N: usize>() {
-    let dims = format!("{:?}", (N));
-    let elapsed = bench::<N>().as_secs_f64();
-    println!("{:<14} | {:<30} | {:.7} s", "gemver", dims, elapsed);
-}
+// gemver: the dataset from the command line (linear-algebra/blas/gemver/gemver.h), then the kernel, its time and the dump.
+use polybench_rs::linear_algebra::blas::gemver::run;
 
 fn main() {
-    bench_and_print::<5000>();
-    bench_and_print::<10000>();
-    bench_and_print::<20000>();
+    match polybench_rs::util::dataset() {
+        0 => run::<40>(), // MINI_DATASET: N = 40
+        1 => run::<120>(), // SMALL_DATASET: N = 120
+        2 => run::<400>(), // MEDIUM_DATASET: N = 400
+        3 => run::<2000>(), // LARGE_DATASET: N = 2000
+        4 => run::<4000>(), // EXTRALARGE_DATASET: N = 4000
+        _ => unreachable!(),
+    }
 }

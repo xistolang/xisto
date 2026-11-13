@@ -1,15 +1,13 @@
-#![feature(min_const_generics)]
-
-use polybench_rs::medley::floyd_warshall::bench;
-
-fn bench_and_print<const N: usize>() {
-    let dims = format!("{:?}", (N));
-    let elapsed = bench::<N>().as_secs_f64();
-    println!("{:<14} | {:<30} | {:.7} s", "floyd_warshall", dims, elapsed);
-}
+// floyd-warshall: the dataset from the command line (medley/floyd-warshall/floyd-warshall.h), then the kernel, its time and the dump.
+use polybench_rs::medley::floyd_warshall::run;
 
 fn main() {
-    bench_and_print::<500>();
-    bench_and_print::<1000>();
-    bench_and_print::<2000>();
+    match polybench_rs::util::dataset() {
+        0 => run::<60>(), // MINI_DATASET: N = 60
+        1 => run::<180>(), // SMALL_DATASET: N = 180
+        2 => run::<500>(), // MEDIUM_DATASET: N = 500
+        3 => run::<2800>(), // LARGE_DATASET: N = 2800
+        4 => run::<5600>(), // EXTRALARGE_DATASET: N = 5600
+        _ => unreachable!(),
+    }
 }

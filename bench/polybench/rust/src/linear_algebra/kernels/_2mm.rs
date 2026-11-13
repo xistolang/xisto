@@ -3,7 +3,6 @@
 use crate::config::linear_algebra::kernels::_2mm::DataType;
 use crate::ndarray::{Array2D, ArrayAlloc};
 use crate::util;
-use std::time::Duration;
 
 unsafe fn init_array<const NI: usize, const NJ: usize, const NK: usize, const NL: usize>(
     ni: usize,
@@ -72,7 +71,22 @@ unsafe fn kernel_2mm<const NI: usize, const NJ: usize, const NK: usize, const NL
     }
 }
 
-pub fn bench<const NI: usize, const NJ: usize, const NK: usize, const NL: usize>() -> Duration {
+fn print_array<const P0: usize, const P1: usize>(ni: usize, nl: usize, D: &Array2D<DataType, P0, P1>) {
+    let mut d = util::Dump::start();
+    d.begin("D");
+    for i in 0..ni {
+        for j in 0..nl {
+            if (i * ni + j) % 20 == 0 {
+                d.nl();
+            }
+            d.f64(D[i][j]);
+        }
+    }
+    d.end("D");
+    d.finish();
+}
+
+pub fn run<const NI: usize, const NJ: usize, const NK: usize, const NL: usize>() {
     let ni = NI;
     let nj = NJ;
     let nk = NK;
@@ -80,25 +94,24 @@ pub fn bench<const NI: usize, const NJ: usize, const NK: usize, const NL: usize>
 
     let mut alpha = 0.0;
     let mut beta = 0.0;
-    let mut tmp = Array2D::<DataType, NI, NJ>::uninit();
-    let mut A = Array2D::<DataType, NI, NK>::uninit();
-    let mut B = Array2D::<DataType, NK, NJ>::uninit();
-    let mut C = Array2D::<DataType, NJ, NL>::uninit();
-    let mut D = Array2D::<DataType, NI, NL>::uninit();
+    let mut tmp = Array2D::<DataType, NI, NJ>::zeroed();
+    let mut A = Array2D::<DataType, NI, NK>::zeroed();
+    let mut B = Array2D::<DataType, NK, NJ>::zeroed();
+    let mut C = Array2D::<DataType, NJ, NL>::zeroed();
+    let mut D = Array2D::<DataType, NI, NL>::zeroed();
 
     unsafe {
         init_array(
             ni, nj, nk, nl, &mut alpha, &mut beta, &mut A, &mut B, &mut C, &mut D,
         );
-        let elapsed = util::time_function(|| {
-            kernel_2mm(ni, nj, nk, nl, alpha, beta, &mut tmp, &A, &B, &C, &mut D)
-        });
-        util::consume(D);
-        elapsed
+        let t = util::Timer::start();
+        kernel_2mm(ni, nj, nk, nl, alpha, beta, &mut tmp, &A, &B, &C, &mut D);
+        t.stop_and_print();
+        print_array(ni, nl, &D);
     }
 }
 
 #[test]
 fn check() {
-    bench::<8, 9, 11, 12>();
+    run::<8, 9, 11, 12>();
 }

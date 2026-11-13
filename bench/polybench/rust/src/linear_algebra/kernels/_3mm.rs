@@ -3,7 +3,6 @@
 use crate::config::linear_algebra::kernels::_3mm::DataType;
 use crate::ndarray::{Array2D, ArrayAlloc};
 use crate::util;
-use std::time::Duration;
 
 unsafe fn init_array<
     const NI: usize,
@@ -90,38 +89,52 @@ unsafe fn kernel_3mm<
     }
 }
 
-pub fn bench<
+fn print_array<const P0: usize, const P1: usize>(ni: usize, nl: usize, G: &Array2D<DataType, P0, P1>) {
+    let mut d = util::Dump::start();
+    d.begin("G");
+    for i in 0..ni {
+        for j in 0..nl {
+            if (i * ni + j) % 20 == 0 {
+                d.nl();
+            }
+            d.f64(G[i][j]);
+        }
+    }
+    d.end("G");
+    d.finish();
+}
+
+pub fn run<
     const NI: usize,
     const NJ: usize,
     const NK: usize,
     const NL: usize,
     const NM: usize,
->() -> Duration {
+>() {
     let ni = NI;
     let nj = NJ;
     let nk = NK;
     let nl = NL;
     let nm = NM;
 
-    let mut E = Array2D::<DataType, NI, NJ>::uninit();
-    let mut A = Array2D::<DataType, NI, NK>::uninit();
-    let mut B = Array2D::<DataType, NK, NJ>::uninit();
-    let mut F = Array2D::<DataType, NJ, NL>::uninit();
-    let mut C = Array2D::<DataType, NJ, NM>::uninit();
-    let mut D = Array2D::<DataType, NM, NL>::uninit();
-    let mut G = Array2D::<DataType, NI, NL>::uninit();
+    let mut E = Array2D::<DataType, NI, NJ>::zeroed();
+    let mut A = Array2D::<DataType, NI, NK>::zeroed();
+    let mut B = Array2D::<DataType, NK, NJ>::zeroed();
+    let mut F = Array2D::<DataType, NJ, NL>::zeroed();
+    let mut C = Array2D::<DataType, NJ, NM>::zeroed();
+    let mut D = Array2D::<DataType, NM, NL>::zeroed();
+    let mut G = Array2D::<DataType, NI, NL>::zeroed();
 
     unsafe {
         init_array(ni, nj, nk, nl, nm, &mut A, &mut B, &mut C, &mut D);
-        let elapsed = util::time_function(|| {
-            kernel_3mm(ni, nj, nk, nl, nm, &mut E, &A, &B, &mut F, &C, &D, &mut G)
-        });
-        util::consume(G);
-        elapsed
+        let t = util::Timer::start();
+        kernel_3mm(ni, nj, nk, nl, nm, &mut E, &A, &B, &mut F, &C, &D, &mut G);
+        t.stop_and_print();
+        print_array(ni, nl, &G);
     }
 }
 
 #[test]
 fn check() {
-    bench::<8, 9, 10, 11, 12>();
+    run::<8, 9, 10, 11, 12>();
 }

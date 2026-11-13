@@ -1,15 +1,13 @@
-#![feature(min_const_generics)]
-
-use polybench_rs::stencils::jacobi_1d::bench;
-
-fn bench_and_print<const N: usize, const TSTEPS: usize>() {
-    let dims = format!("{:?}", (N, TSTEPS));
-    let elapsed = bench::<N, TSTEPS>().as_secs_f64();
-    println!("{:<14} | {:<30} | {:.7} s", "jacobi_1d", dims, elapsed);
-}
+// jacobi-1d: the dataset from the command line (stencils/jacobi-1d/jacobi-1d.h), then the kernel, its time and the dump.
+use polybench_rs::stencils::jacobi_1d::run;
 
 fn main() {
-    bench_and_print::<5000, 125>();
-    bench_and_print::<10000, 250>();
-    bench_and_print::<20000, 500>();
+    match polybench_rs::util::dataset() {
+        0 => run::<30, 20>(), // MINI_DATASET: N = 30, TSTEPS = 20
+        1 => run::<120, 40>(), // SMALL_DATASET: N = 120, TSTEPS = 40
+        2 => run::<400, 100>(), // MEDIUM_DATASET: N = 400, TSTEPS = 100
+        3 => run::<2000, 500>(), // LARGE_DATASET: N = 2000, TSTEPS = 500
+        4 => run::<4000, 1000>(), // EXTRALARGE_DATASET: N = 4000, TSTEPS = 1000
+        _ => unreachable!(),
+    }
 }

@@ -1,15 +1,13 @@
-#![feature(min_const_generics)]
-
-use polybench_rs::stencils::fdtd_2d::bench;
-
-fn bench_and_print<const NX: usize, const NY: usize, const TMAX: usize>() {
-    let dims = format!("{:?}", (NX, NY, TMAX));
-    let elapsed = bench::<NX, NY, TMAX>().as_secs_f64();
-    println!("{:<14} | {:<30} | {:.7} s", "fdtd_2d", dims, elapsed);
-}
+// fdtd-2d: the dataset from the command line (stencils/fdtd-2d/fdtd-2d.h), then the kernel, its time and the dump.
+use polybench_rs::stencils::fdtd_2d::run;
 
 fn main() {
-    bench_and_print::<250, 300, 125>();
-    bench_and_print::<500, 600, 250>();
-    bench_and_print::<1000, 1200, 500>();
+    match polybench_rs::util::dataset() {
+        0 => run::<20, 30, 20>(), // MINI_DATASET: NX = 20, NY = 30, TMAX = 20
+        1 => run::<60, 80, 40>(), // SMALL_DATASET: NX = 60, NY = 80, TMAX = 40
+        2 => run::<200, 240, 100>(), // MEDIUM_DATASET: NX = 200, NY = 240, TMAX = 100
+        3 => run::<1000, 1200, 500>(), // LARGE_DATASET: NX = 1000, NY = 1200, TMAX = 500
+        4 => run::<2000, 2600, 1000>(), // EXTRALARGE_DATASET: NX = 2000, NY = 2600, TMAX = 1000
+        _ => unreachable!(),
+    }
 }

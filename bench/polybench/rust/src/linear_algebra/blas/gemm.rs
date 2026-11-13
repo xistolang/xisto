@@ -3,7 +3,6 @@
 use crate::config::linear_algebra::blas::gemm::DataType;
 use crate::ndarray::{Array2D, ArrayAlloc};
 use crate::util;
-use std::time::Duration;
 
 unsafe fn init_array<const NI: usize, const NJ: usize, const NK: usize>(
     ni: usize,
@@ -47,33 +46,51 @@ unsafe fn kernel_gemm<const NI: usize, const NJ: usize, const NK: usize>(
     for i in 0..ni {
         for j in 0..nj {
             C[i][j] *= beta;
-            for k in 0..nk {
+        }
+        for k in 0..nk {
+            for j in 0..nj {
                 C[i][j] += alpha * A[i][k] * B[k][j];
             }
         }
     }
 }
 
-pub fn bench<const NI: usize, const NJ: usize, const NK: usize>() -> Duration {
+fn print_array<const P0: usize, const P1: usize>(ni: usize, nj: usize, C: &Array2D<DataType, P0, P1>) {
+    let mut d = util::Dump::start();
+    d.begin("C");
+    for i in 0..ni {
+        for j in 0..nj {
+            if (i * ni + j) % 20 == 0 {
+                d.nl();
+            }
+            d.f64(C[i][j]);
+        }
+    }
+    d.end("C");
+    d.finish();
+}
+
+pub fn run<const NI: usize, const NJ: usize, const NK: usize>() {
     let ni = NI;
     let nj = NJ;
     let nk = NK;
 
     let mut alpha = 0.0;
     let mut beta = 0.0;
-    let mut C = Array2D::<DataType, NI, NJ>::uninit();
-    let mut A = Array2D::<DataType, NI, NK>::uninit();
-    let mut B = Array2D::<DataType, NK, NJ>::uninit();
+    let mut C = Array2D::<DataType, NI, NJ>::zeroed();
+    let mut A = Array2D::<DataType, NI, NK>::zeroed();
+    let mut B = Array2D::<DataType, NK, NJ>::zeroed();
 
     unsafe {
         init_array(ni, nj, nk, &mut alpha, &mut beta, &mut C, &mut A, &mut B);
-        let elapsed = util::time_function(|| kernel_gemm(ni, nj, nk, alpha, beta, &mut C, &A, &B));
-        util::consume(C);
-        elapsed
+        let t = util::Timer::start();
+        kernel_gemm(ni, nj, nk, alpha, beta, &mut C, &A, &B);
+        t.stop_and_print();
+        print_array(ni, nj, &C);
     }
 }
 
 #[test]
 fn check() {
-    bench::<10, 11, 12>();
+    run::<10, 11, 12>();
 }

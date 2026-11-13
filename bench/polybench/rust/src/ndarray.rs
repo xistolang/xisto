@@ -100,6 +100,9 @@ pub trait ArrayAlloc: Sized {
         let layout = std::alloc::Layout::new::<Self>();
         unsafe {
             let raw = std::alloc::alloc_zeroed(layout) as *mut Self;
+            if raw.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
             Box::from_raw(raw)
         }
     }

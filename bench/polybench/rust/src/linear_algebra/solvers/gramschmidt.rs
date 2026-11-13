@@ -3,7 +3,6 @@
 use crate::config::linear_algebra::solvers::gramschmidt::DataType;
 use crate::ndarray::{Array2D, ArrayAlloc};
 use crate::util;
-use std::time::Duration;
 
 unsafe fn init_array<const M: usize, const N: usize>(
     m: usize,
@@ -53,25 +52,49 @@ unsafe fn kernel_gramschmidt<const M: usize, const N: usize>(
     }
 }
 
-pub fn bench<const M: usize, const N: usize>() -> Duration {
+fn print_array<const P0: usize, const P1: usize, const P2: usize, const P3: usize>(n: usize, m: usize, R: &Array2D<DataType, P0, P1>, Q: &Array2D<DataType, P2, P3>) {
+    let mut d = util::Dump::start();
+    d.begin("R");
+    for i in 0..n {
+        for j in 0..n {
+            if (i * n + j) % 20 == 0 {
+                d.nl();
+            }
+            d.f64(R[i][j]);
+        }
+    }
+    d.end("R");
+    d.begin("Q");
+    for i in 0..m {
+        for j in 0..n {
+            if (i * n + j) % 20 == 0 {
+                d.nl();
+            }
+            d.f64(Q[i][j]);
+        }
+    }
+    d.end("Q");
+    d.finish();
+}
+
+pub fn run<const M: usize, const N: usize>() {
     let m = M;
     let n = N;
 
-    let mut A = Array2D::<DataType, M, N>::uninit();
-    let mut R = Array2D::<DataType, N, N>::uninit();
-    let mut Q = Array2D::<DataType, M, N>::uninit();
+    let mut A = Array2D::<DataType, M, N>::zeroed();
+    let mut R = Array2D::<DataType, N, N>::zeroed();
+    let mut Q = Array2D::<DataType, M, N>::zeroed();
 
     unsafe {
         init_array(m, n, &mut A, &mut R, &mut Q);
-        let elapsed = util::time_function(|| kernel_gramschmidt(m, n, &mut A, &mut R, &mut Q));
-        util::consume(A);
-        util::consume(R);
-        util::consume(Q);
-        elapsed
+        let t = util::Timer::start();
+        kernel_gramschmidt(m, n, &mut A, &mut R, &mut Q);
+        t.stop_and_print();
+        print_array(n, m, &R, &Q);
     }
 }
 
 #[test]
 fn check() {
-    bench::<10, 12>();
+    run::<10, 12>();
 }

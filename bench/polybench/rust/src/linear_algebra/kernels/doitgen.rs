@@ -3,7 +3,6 @@
 use crate::config::linear_algebra::kernels::doitgen::DataType;
 use crate::ndarray::{Array1D, Array2D, Array3D, ArrayAlloc};
 use crate::util;
-use std::time::Duration;
 
 unsafe fn init_array<const NP: usize, const NQ: usize, const NR: usize>(
     nr: usize,
@@ -49,24 +48,42 @@ unsafe fn kernel_doitgen<const NP: usize, const NQ: usize, const NR: usize>(
     }
 }
 
-pub fn bench<const NP: usize, const NQ: usize, const NR: usize>() -> Duration {
+fn print_array<const P0: usize, const P1: usize, const P2: usize>(nr: usize, nq: usize, np: usize, A: &Array3D<DataType, P0, P1, P2>) {
+    let mut d = util::Dump::start();
+    d.begin("A");
+    for i in 0..nr {
+        for j in 0..nq {
+            for k in 0..np {
+                if (i * nq * np + j * np + k) % 20 == 0 {
+                    d.nl();
+                }
+                d.f64(A[i][j][k]);
+            }
+        }
+    }
+    d.end("A");
+    d.finish();
+}
+
+pub fn run<const NP: usize, const NQ: usize, const NR: usize>() {
     let nr = NR;
     let nq = NQ;
     let np = NP;
 
-    let mut A = Array3D::<DataType, NR, NQ, NP>::uninit();
-    let mut sum = Array1D::<DataType, NP>::uninit();
-    let mut C4 = Array2D::<DataType, NP, NP>::uninit();
+    let mut A = Array3D::<DataType, NR, NQ, NP>::zeroed();
+    let mut sum = Array1D::<DataType, NP>::zeroed();
+    let mut C4 = Array2D::<DataType, NP, NP>::zeroed();
 
     unsafe {
         init_array(nr, nq, np, &mut A, &mut C4);
-        let elapsed = util::time_function(|| kernel_doitgen(nr, nq, np, &mut A, &C4, &mut sum));
-        util::consume(A);
-        elapsed
+        let t = util::Timer::start();
+        kernel_doitgen(nr, nq, np, &mut A, &C4, &mut sum);
+        t.stop_and_print();
+        print_array(nr, nq, np, &A);
     }
 }
 
 #[test]
 fn check() {
-    bench::<6, 4, 5>();
+    run::<6, 4, 5>();
 }

@@ -1,7 +1,6 @@
 use crate::config::medley::nussinov::DataType;
 use crate::ndarray::{Array1D, Array2D, ArrayAlloc};
 use crate::util;
-use std::time::Duration;
 
 type Base = i8;
 
@@ -72,21 +71,39 @@ unsafe fn kernel_nussinov<const N: usize>(
     }
 }
 
-pub fn bench<const N: usize>() -> Duration {
+fn print_array<const P0: usize, const P1: usize>(n: usize, table: &Array2D<DataType, P0, P1>) {
+    let mut d = util::Dump::start();
+    d.begin("table");
+    let mut t = 0;
+    for i in 0..n {
+        for j in i..n {
+            if t % 20 == 0 {
+                d.nl();
+            }
+            d.i32(table[i][j]);
+            t += 1;
+        }
+    }
+    d.end("table");
+    d.finish();
+}
+
+pub fn run<const N: usize>() {
     let n = N;
 
-    let mut seq = Array1D::uninit();
-    let mut table = Array2D::<DataType, N, N>::uninit();
+    let mut seq = Array1D::zeroed();
+    let mut table = Array2D::<DataType, N, N>::zeroed();
 
     unsafe {
         init_array(n, &mut seq, &mut table);
-        let elapsed = util::time_function(|| kernel_nussinov(n, &seq, &mut table));
-        util::consume(table);
-        elapsed
+        let t = util::Timer::start();
+        kernel_nussinov(n, &seq, &mut table);
+        t.stop_and_print();
+        print_array(n, &table);
     }
 }
 
 #[test]
 fn check() {
-    bench::<25>();
+    run::<25>();
 }

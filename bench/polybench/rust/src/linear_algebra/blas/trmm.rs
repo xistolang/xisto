@@ -3,7 +3,6 @@
 use crate::config::linear_algebra::blas::trmm::DataType;
 use crate::ndarray::{Array2D, ArrayAlloc};
 use crate::util;
-use std::time::Duration;
 
 unsafe fn init_array<const M: usize, const N: usize>(
     m: usize,
@@ -41,23 +40,39 @@ unsafe fn kernel_trmm<const M: usize, const N: usize>(
     }
 }
 
-pub fn bench<const M: usize, const N: usize>() -> Duration {
+fn print_array<const P0: usize, const P1: usize>(m: usize, n: usize, B: &Array2D<DataType, P0, P1>) {
+    let mut d = util::Dump::start();
+    d.begin("B");
+    for i in 0..m {
+        for j in 0..n {
+            if (i * m + j) % 20 == 0 {
+                d.nl();
+            }
+            d.f64(B[i][j]);
+        }
+    }
+    d.end("B");
+    d.finish();
+}
+
+pub fn run<const M: usize, const N: usize>() {
     let m = M;
     let n = N;
 
     let mut alpha = 0.0;
-    let mut A = Array2D::<DataType, M, M>::uninit();
-    let mut B = Array2D::<DataType, M, N>::uninit();
+    let mut A = Array2D::<DataType, M, M>::zeroed();
+    let mut B = Array2D::<DataType, M, N>::zeroed();
 
     unsafe {
         init_array(m, n, &mut alpha, &mut A, &mut B);
-        let elapsed = util::time_function(|| kernel_trmm(m, n, alpha, &A, &mut B));
-        util::consume(B);
-        elapsed
+        let t = util::Timer::start();
+        kernel_trmm(m, n, alpha, &A, &mut B);
+        t.stop_and_print();
+        print_array(m, n, &B);
     }
 }
 
 #[test]
 fn check() {
-    bench::<10, 12>();
+    run::<10, 12>();
 }

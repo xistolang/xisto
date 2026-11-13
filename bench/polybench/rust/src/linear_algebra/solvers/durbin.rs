@@ -1,7 +1,6 @@
 use crate::config::linear_algebra::solvers::durbin::DataType;
 use crate::ndarray::{Array1D, ArrayAlloc};
 use crate::util;
-use std::time::Duration;
 
 unsafe fn init_array<const N: usize>(n: usize, r: &mut Array1D<DataType, N>) {
     for i in 0..n {
@@ -14,7 +13,7 @@ unsafe fn kernel_durbin<const N: usize>(
     r: &Array1D<DataType, N>,
     y: &mut Array1D<DataType, N>,
 ) {
-    let mut z: [DataType; N] = std::mem::MaybeUninit::uninit().assume_init();
+    let mut z: [DataType; N] = [0.0; N];
 
     y[0] = -r[0];
     let mut beta = 1.0;
@@ -37,21 +36,35 @@ unsafe fn kernel_durbin<const N: usize>(
     }
 }
 
-pub fn bench<const N: usize>() -> Duration {
+fn print_array<const P0: usize>(n: usize, y: &Array1D<DataType, P0>) {
+    let mut d = util::Dump::start();
+    d.begin("y");
+    for i in 0..n {
+        if i % 20 == 0 {
+            d.nl();
+        }
+        d.f64(y[i]);
+    }
+    d.end("y");
+    d.finish();
+}
+
+pub fn run<const N: usize>() {
     let n = N;
 
-    let mut r = Array1D::<DataType, N>::uninit();
-    let mut y = Array1D::<DataType, N>::uninit();
+    let mut r = Array1D::<DataType, N>::zeroed();
+    let mut y = Array1D::<DataType, N>::zeroed();
 
     unsafe {
         init_array(n, &mut r);
-        let elapsed = util::time_function(|| kernel_durbin(n, &r, &mut y));
-        util::consume(y);
-        elapsed
+        let t = util::Timer::start();
+        kernel_durbin(n, &r, &mut y);
+        t.stop_and_print();
+        print_array(n, &y);
     }
 }
 
 #[test]
 fn check() {
-    bench::<20>();
+    run::<20>();
 }

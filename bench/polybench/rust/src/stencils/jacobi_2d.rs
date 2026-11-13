@@ -3,7 +3,6 @@
 use crate::config::stencils::jacobi_2d::DataType;
 use crate::ndarray::{Array2D, ArrayAlloc};
 use crate::util;
-use std::time::Duration;
 
 unsafe fn init_array<const N: usize, const TSTEPS: usize>(
     n: usize,
@@ -38,23 +37,38 @@ unsafe fn kernel_jacobi_2d<const N: usize, const TSTEPS: usize>(
     }
 }
 
-pub fn bench<const N: usize, const TSTEPS: usize>() -> Duration {
+fn print_array<const P0: usize, const P1: usize>(n: usize, A: &Array2D<DataType, P0, P1>) {
+    let mut d = util::Dump::start();
+    d.begin("A");
+    for i in 0..n {
+        for j in 0..n {
+            if (i * n + j) % 20 == 0 {
+                d.nl();
+            }
+            d.f64(A[i][j]);
+        }
+    }
+    d.end("A");
+    d.finish();
+}
+
+pub fn run<const N: usize, const TSTEPS: usize>() {
     let n = N;
     let tsteps = TSTEPS;
 
-    let mut A = Array2D::<DataType, N, N>::uninit();
-    let mut B = Array2D::<DataType, N, N>::uninit();
+    let mut A = Array2D::<DataType, N, N>::zeroed();
+    let mut B = Array2D::<DataType, N, N>::zeroed();
 
     unsafe {
         init_array::<N, TSTEPS>(n, &mut A, &mut B);
-        let elapsed =
-            util::time_function(|| kernel_jacobi_2d::<N, TSTEPS>(tsteps, n, &mut A, &mut B));
-        util::consume(A);
-        elapsed
+        let t = util::Timer::start();
+        kernel_jacobi_2d::<N, TSTEPS>(tsteps, n, &mut A, &mut B);
+        t.stop_and_print();
+        print_array(n, &A);
     }
 }
 
 #[test]
 fn check() {
-    bench::<13, 5>();
+    run::<13, 5>();
 }

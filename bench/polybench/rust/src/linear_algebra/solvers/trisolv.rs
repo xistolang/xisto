@@ -3,7 +3,6 @@
 use crate::config::linear_algebra::solvers::trisolv::DataType;
 use crate::ndarray::{Array1D, Array2D, ArrayAlloc};
 use crate::util;
-use std::time::Duration;
 
 unsafe fn init_array<const N: usize>(
     n: usize,
@@ -35,22 +34,37 @@ unsafe fn kernel_trisolv<const N: usize>(
     }
 }
 
-pub fn bench<const N: usize>() -> Duration {
+fn print_array<const P0: usize>(n: usize, x: &Array1D<DataType, P0>) {
+    let mut d = util::Dump::start();
+    d.begin("x");
+    for i in 0..n {
+        // as trisolv.c: the element, then the line break
+        d.f64(x[i]);
+        if i % 20 == 0 {
+            d.nl();
+        }
+    }
+    d.end("x");
+    d.finish();
+}
+
+pub fn run<const N: usize>() {
     let n = N;
 
-    let mut L = Array2D::<DataType, N, N>::uninit();
-    let mut x = Array1D::<DataType, N>::uninit();
-    let mut b = Array1D::<DataType, N>::uninit();
+    let mut L = Array2D::<DataType, N, N>::zeroed();
+    let mut x = Array1D::<DataType, N>::zeroed();
+    let mut b = Array1D::<DataType, N>::zeroed();
 
     unsafe {
         init_array(n, &mut L, &mut x, &mut b);
-        let elapsed = util::time_function(|| kernel_trisolv(n, &L, &mut x, &b));
-        util::consume(x);
-        elapsed
+        let t = util::Timer::start();
+        kernel_trisolv(n, &L, &mut x, &b);
+        t.stop_and_print();
+        print_array(n, &x);
     }
 }
 
 #[test]
 fn check() {
-    bench::<20>();
+    run::<20>();
 }

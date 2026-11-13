@@ -3,7 +3,6 @@
 use crate::config::linear_algebra::kernels::mvt::DataType;
 use crate::ndarray::{Array1D, Array2D, ArrayAlloc};
 use crate::util;
-use std::time::Duration;
 
 unsafe fn init_array<const N: usize>(
     n: usize,
@@ -44,25 +43,46 @@ unsafe fn kernel_mvt<const N: usize>(
     }
 }
 
-pub fn bench<const N: usize>() -> Duration {
+fn print_array<const P0: usize, const P1: usize>(n: usize, x1: &Array1D<DataType, P0>, x2: &Array1D<DataType, P1>) {
+    let mut d = util::Dump::start();
+    d.begin("x1");
+    for i in 0..n {
+        if i % 20 == 0 {
+            d.nl();
+        }
+        d.f64(x1[i]);
+    }
+    d.end("x1");
+    d.begin("x2");
+    for i in 0..n {
+        if i % 20 == 0 {
+            d.nl();
+        }
+        d.f64(x2[i]);
+    }
+    d.end("x2");
+    d.finish();
+}
+
+pub fn run<const N: usize>() {
     let n = N;
 
-    let mut A = Array2D::<DataType, N, N>::uninit();
-    let mut x1 = Array1D::<DataType, N>::uninit();
-    let mut x2 = Array1D::<DataType, N>::uninit();
-    let mut y_1 = Array1D::<DataType, N>::uninit();
-    let mut y_2 = Array1D::<DataType, N>::uninit();
+    let mut A = Array2D::<DataType, N, N>::zeroed();
+    let mut x1 = Array1D::<DataType, N>::zeroed();
+    let mut x2 = Array1D::<DataType, N>::zeroed();
+    let mut y_1 = Array1D::<DataType, N>::zeroed();
+    let mut y_2 = Array1D::<DataType, N>::zeroed();
 
     unsafe {
         init_array(n, &mut x1, &mut x2, &mut y_1, &mut y_2, &mut A);
-        let elapsed = util::time_function(|| kernel_mvt(n, &mut x1, &mut x2, &y_1, &y_2, &A));
-        util::consume(x1);
-        util::consume(x2);
-        elapsed
+        let t = util::Timer::start();
+        kernel_mvt(n, &mut x1, &mut x2, &y_1, &y_2, &A);
+        t.stop_and_print();
+        print_array(n, &x1, &x2);
     }
 }
 
 #[test]
 fn check() {
-    bench::<20>();
+    run::<20>();
 }

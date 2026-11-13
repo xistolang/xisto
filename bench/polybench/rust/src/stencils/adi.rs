@@ -3,7 +3,6 @@
 use crate::config::stencils::adi::DataType;
 use crate::ndarray::{Array2D, ArrayAlloc};
 use crate::util;
-use std::time::Duration;
 
 unsafe fn init_array<const N: usize, const TSTEPS: usize>(
     n: usize,
@@ -39,7 +38,7 @@ unsafe fn kernel_adi<const N: usize, const TSTEPS: usize>(
     let e = 1.0 + mul2;
     let f = d;
 
-    for _ in 1..tsteps {
+    for _ in 1..=tsteps {
         for i in 1..(n - 1) {
             v[0][i] = 1.0;
             p[i][0] = 0.0;
@@ -77,26 +76,40 @@ unsafe fn kernel_adi<const N: usize, const TSTEPS: usize>(
     }
 }
 
-pub fn bench<const N: usize, const TSTEPS: usize>() -> Duration {
+fn print_array<const P0: usize, const P1: usize>(n: usize, u: &Array2D<DataType, P0, P1>) {
+    let mut d = util::Dump::start();
+    d.begin("u");
+    for i in 0..n {
+        for j in 0..n {
+            if (i * n + j) % 20 == 0 {
+                d.nl();
+            }
+            d.f64(u[i][j]);
+        }
+    }
+    d.end("u");
+    d.finish();
+}
+
+pub fn run<const N: usize, const TSTEPS: usize>() {
     let n = N;
     let tsteps = TSTEPS;
 
-    let mut u = Array2D::<DataType, N, N>::uninit();
-    let mut v = Array2D::<DataType, N, N>::uninit();
-    let mut p = Array2D::<DataType, N, N>::uninit();
-    let mut q = Array2D::<DataType, N, N>::uninit();
+    let mut u = Array2D::<DataType, N, N>::zeroed();
+    let mut v = Array2D::<DataType, N, N>::zeroed();
+    let mut p = Array2D::<DataType, N, N>::zeroed();
+    let mut q = Array2D::<DataType, N, N>::zeroed();
 
     unsafe {
         init_array::<N, TSTEPS>(n, &mut u);
-        let elapsed = util::time_function(|| {
-            kernel_adi::<N, TSTEPS>(tsteps, n, &mut u, &mut v, &mut p, &mut q)
-        });
-        util::consume(u);
-        elapsed
+        let t = util::Timer::start();
+        kernel_adi::<N, TSTEPS>(tsteps, n, &mut u, &mut v, &mut p, &mut q);
+        t.stop_and_print();
+        print_array(n, &u);
     }
 }
 
 #[test]
 fn check() {
-    bench::<10, 5>();
+    run::<10, 5>();
 }
