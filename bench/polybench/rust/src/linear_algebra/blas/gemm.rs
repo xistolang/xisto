@@ -86,7 +86,7 @@ pub fn run<const NI: usize, const NJ: usize, const NK: usize>() {
         let t = util::Timer::start();
         kernel_gemm(ni, nj, nk, alpha, beta, &mut C, &A, &B);
         t.stop_and_print();
-        print_array(ni, nj, &C);
+        if util::dump_arrays() { print_array(ni, nj, &C); }
     }
 }
 

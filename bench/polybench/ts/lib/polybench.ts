@@ -36,6 +36,12 @@ export function timerPrint(): void {
   if (timing) console.log(((stop - start) / 1000).toFixed(6));
 }
 
+// "nodump" on the command line: the timing run, as C built without -DPOLYBENCH_DUMP_ARRAYS (the call stays, so
+// the kernel's results stay live)
+export function dumpArrays(): boolean {
+  return !process.argv.includes("nodump");
+}
+
 // stderr through a buffer, as a FILE*: one write per 64 KB instead of one per number
 let buf = "";
 

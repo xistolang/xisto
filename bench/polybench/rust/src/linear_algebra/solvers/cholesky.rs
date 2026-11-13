@@ -58,7 +58,7 @@ pub fn run<const N: usize>() {
         let t = util::Timer::start();
         kernel_cholesky(n, &mut A);
         t.stop_and_print();
-        print_array(n, &A);
+        if util::dump_arrays() { print_array(n, &A); }
     }
 }
 

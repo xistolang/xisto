@@ -83,7 +83,7 @@ pub fn run<const M: usize, const N: usize>() {
         let t = util::Timer::start();
         kernel_symm(m, n, alpha, beta, &mut C, &A, &B);
         t.stop_and_print();
-        print_array(m, n, &C);
+        if util::dump_arrays() { print_array(m, n, &C); }
     }
 }
 

@@ -60,7 +60,7 @@ pub fn run<const N: usize>() {
         let t = util::Timer::start();
         kernel_durbin(n, &r, &mut y);
         t.stop_and_print();
-        print_array(n, &y);
+        if util::dump_arrays() { print_array(n, &y); }
     }
 }
 

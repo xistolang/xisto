@@ -99,7 +99,7 @@ pub fn run<const N: usize>() {
         let t = util::Timer::start();
         kernel_nussinov(n, &seq, &mut table);
         t.stop_and_print();
-        print_array(n, &table);
+        if util::dump_arrays() { print_array(n, &table); }
     }
 }
 

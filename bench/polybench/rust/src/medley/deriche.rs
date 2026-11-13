@@ -146,7 +146,7 @@ pub fn run<const H: usize, const W: usize>() {
         let t = util::Timer::start();
         kernel_deriche(w, h, alpha, &img_in, &mut img_out, &mut y1, &mut y2);
         t.stop_and_print();
-        print_array(w, h, &img_out);
+        if util::dump_arrays() { print_array(w, h, &img_out); }
     }
 }
 

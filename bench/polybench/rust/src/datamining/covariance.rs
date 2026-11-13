@@ -79,7 +79,7 @@ pub fn run<const N: usize, const M: usize>() {
         let t = util::Timer::start();
         kernel_covariance(n, m, float_n, &mut data, &mut cov, &mut mean);
         t.stop_and_print();
-        print_array(m, &cov);
+        if util::dump_arrays() { print_array(m, &cov); }
     }
 }
 

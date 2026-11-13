@@ -52,7 +52,7 @@ pub fn run<const N: usize>() {
         let t = util::Timer::start();
         kernel_floyd_warshall(n, &mut path);
         t.stop_and_print();
-        print_array(n, &path);
+        if util::dump_arrays() { print_array(n, &path); }
     }
 }
 

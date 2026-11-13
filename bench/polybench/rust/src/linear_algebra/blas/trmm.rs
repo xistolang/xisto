@@ -68,7 +68,7 @@ pub fn run<const M: usize, const N: usize>() {
         let t = util::Timer::start();
         kernel_trmm(m, n, alpha, &A, &mut B);
         t.stop_and_print();
-        print_array(m, n, &B);
+        if util::dump_arrays() { print_array(m, n, &B); }
     }
 }
 

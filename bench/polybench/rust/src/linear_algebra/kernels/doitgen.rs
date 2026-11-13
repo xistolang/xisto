@@ -79,7 +79,7 @@ pub fn run<const NP: usize, const NQ: usize, const NR: usize>() {
         let t = util::Timer::start();
         kernel_doitgen(nr, nq, np, &mut A, &C4, &mut sum);
         t.stop_and_print();
-        print_array(nr, nq, np, &A);
+        if util::dump_arrays() { print_array(nr, nq, np, &A); }
     }
 }
 

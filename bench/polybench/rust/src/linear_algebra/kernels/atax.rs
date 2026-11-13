@@ -70,7 +70,7 @@ pub fn run<const M: usize, const N: usize>() {
         let t = util::Timer::start();
         kernel_atax(m, n, &A, &x, &mut y, &mut tmp);
         t.stop_and_print();
-        print_array(n, &y);
+        if util::dump_arrays() { print_array(n, &y); }
     }
 }
 

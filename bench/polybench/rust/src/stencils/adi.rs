@@ -105,7 +105,7 @@ pub fn run<const N: usize, const TSTEPS: usize>() {
         let t = util::Timer::start();
         kernel_adi::<N, TSTEPS>(tsteps, n, &mut u, &mut v, &mut p, &mut q);
         t.stop_and_print();
-        print_array(n, &u);
+        if util::dump_arrays() { print_array(n, &u); }
     }
 }
 

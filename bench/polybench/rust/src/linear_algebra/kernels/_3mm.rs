@@ -130,7 +130,7 @@ pub fn run<
         let t = util::Timer::start();
         kernel_3mm(ni, nj, nk, nl, nm, &mut E, &A, &B, &mut F, &C, &D, &mut G);
         t.stop_and_print();
-        print_array(ni, nl, &G);
+        if util::dump_arrays() { print_array(ni, nl, &G); }
     }
 }
 

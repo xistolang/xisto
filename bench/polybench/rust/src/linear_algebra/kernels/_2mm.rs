@@ -107,7 +107,7 @@ pub fn run<const NI: usize, const NJ: usize, const NK: usize, const NL: usize>()
         let t = util::Timer::start();
         kernel_2mm(ni, nj, nk, nl, alpha, beta, &mut tmp, &A, &B, &C, &mut D);
         t.stop_and_print();
-        print_array(ni, nl, &D);
+        if util::dump_arrays() { print_array(ni, nl, &D); }
     }
 }
 

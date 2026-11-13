@@ -60,7 +60,7 @@ pub fn run<const N: usize>() {
         let t = util::Timer::start();
         kernel_trisolv(n, &L, &mut x, &b);
         t.stop_and_print();
-        print_array(n, &x);
+        if util::dump_arrays() { print_array(n, &x); }
     }
 }
 

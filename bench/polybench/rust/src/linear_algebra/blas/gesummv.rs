@@ -73,7 +73,7 @@ pub fn run<const N: usize>() {
         let t = util::Timer::start();
         kernel_gesummv(n, alpha, beta, &A, &B, &mut tmp, &x, &mut y);
         t.stop_and_print();
-        print_array(n, &y);
+        if util::dump_arrays() { print_array(n, &y); }
     }
 }
 

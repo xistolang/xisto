@@ -95,7 +95,7 @@ pub fn run<const N: usize, const M: usize>() {
         let t = util::Timer::start();
         kernel_correlation(n, m, float_n, &mut data, &mut corr, &mut mean, &mut stddev);
         t.stop_and_print();
-        print_array(m, &corr);
+        if util::dump_arrays() { print_array(m, &corr); }
     }
 }
 

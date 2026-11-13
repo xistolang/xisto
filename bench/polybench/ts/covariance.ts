@@ -2,7 +2,7 @@
 // Copyright (c) 2010-2016, Ohio State University. All rights reserved.
 // Derived from PolyBench/C under the Ohio State University Software Distribution License: the conditions and
 // the disclaimer are in bench/polybench/LICENSE-PolyBench.txt.
-import { dataset, dumpBegin, dumpEnd, dumpFinish, dumpStart, dumpWrite, fmt2, timerPrint, timerStart, timerStop } from "./lib/polybench.ts";
+import { dataset, dumpArrays, dumpBegin, dumpEnd, dumpFinish, dumpStart, dumpWrite, fmt2, timerPrint, timerStart, timerStop } from "./lib/polybench.ts";
 
 // MINI, SMALL, MEDIUM, LARGE, EXTRALARGE (covariance.h); LARGE unless the command line names another
 const M: int[] = [28, 80, 240, 1200, 2600];
@@ -66,7 +66,7 @@ function main(): void {
   timerStop();
   timerPrint();
 
-  print_array(m, cov);
+  if (dumpArrays()) print_array(m, cov);
 }
 
 main();

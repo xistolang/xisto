@@ -2,7 +2,7 @@
 // Copyright (c) 2010-2016, Ohio State University. All rights reserved.
 // Derived from PolyBench/C under the Ohio State University Software Distribution License: the conditions and
 // the disclaimer are in bench/polybench/LICENSE-PolyBench.txt.
-import { dataset, dumpBegin, dumpEnd, dumpFinish, dumpStart, dumpWrite, fmt2, timerPrint, timerStart, timerStop } from "./lib/polybench.ts";
+import { dataset, dumpArrays, dumpBegin, dumpEnd, dumpFinish, dumpStart, dumpWrite, fmt2, timerPrint, timerStart, timerStop } from "./lib/polybench.ts";
 
 // MINI, SMALL, MEDIUM, LARGE, EXTRALARGE (cholesky.h); LARGE unless the command line names another
 const N: int[] = [40, 120, 400, 2000, 4000];
@@ -71,7 +71,7 @@ function main(): void {
   timerStop();
   timerPrint();
 
-  print_array(n, A);
+  if (dumpArrays()) print_array(n, A);
 }
 
 main();

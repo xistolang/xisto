@@ -113,7 +113,7 @@ pub fn run<const N: usize>() {
                 n, alpha, beta, &mut A, &u1, &v1, &u2, &v2, &mut w, &mut x, &y, &z,
             );
         t.stop_and_print();
-        print_array(n, &w);
+        if util::dump_arrays() { print_array(n, &w); }
     }
 }
 

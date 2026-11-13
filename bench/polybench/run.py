@@ -2,8 +2,10 @@
 """PolyBench/C 4.2.1: the C reference against the ports (xisto, and Rust, Go, Node, Bun when they are there), one
 program per kernel and per side, measured as bench/benchmarksgame/langs.py measures (bench/measure.py: wall time,
 CPU time, peak RSS; 1 warm-up and RUNS runs, the median of time and CPU, the peak of RSS).
-The output that counts is the dump of the arrays (POLYBENCH_DUMP_ARRAYS), which PolyBench writes on stderr: its
-hash must be the C reference's, or the line ends in DIFFERS. The kernel alone (the polybench_timer, -DPOLYBENCH_TIME,
+The output that counts is the dump of the arrays (POLYBENCH_DUMP_ARRAYS), which PolyBench writes on stderr: one run
+per program with the dump, whose hash must be the C reference's, or the line ends in DIFFERS. The timed runs (one
+warm-up, then RUNS) are without the dump, as PolyBench is timed: the dump formats every element of the arrays and
+would weigh more than some kernels. The kernel alone (the polybench_timer, -DPOLYBENCH_TIME,
 "time" on the ports' command line: one line on stdout) goes in a column of its own, "kern".
 
 Usage: python3 bench/polybench/run.py RUNS [SIDE...] [--dataset NAME] [-- KERNEL...]
@@ -38,15 +40,15 @@ def c_source(k):
     return hits[0]
 
 
-def build_c(k, ds, cc, label):
-    exe = f"{OUT}/{label}/{k}"
+def build_c(k, ds, cc, label, dump=True):
+    exe = f"{OUT}/{label}{'' if dump else '-nodump'}/{k}"
     os.makedirs(os.path.dirname(exe), exist_ok=True)
     src = c_source(k)
     flags = ["-O3", NATIVE]
     # -ffp-contract=off: no fused multiply-add, the same doubles as xisto, Rust and Go; the timer without the
     # cache flush (POLYBENCH_NO_FLUSH_CACHE: a 32 MB array touched before the kernel, which would count in the
     # process's time and memory and the ports do not do)
-    subprocess.run([cc, *flags, "-ffp-contract=off", f"-D{ds}_DATASET", "-DPOLYBENCH_DUMP_ARRAYS", "-DPOLYBENCH_TIME",
+    subprocess.run([cc, *flags, "-ffp-contract=off", f"-D{ds}_DATASET", *(["-DPOLYBENCH_DUMP_ARRAYS"] if dump else []), "-DPOLYBENCH_TIME",
                     "-DPOLYBENCH_NO_FLUSH_CACHE", f"-I{SRC}/utilities", f"-I{os.path.dirname(src)}",
                     f"{SRC}/utilities/polybench.c", src, "-lm", "-o", exe], check=True)
     return [exe], os.path.basename(src)
@@ -75,33 +77,41 @@ def build_rust(k, ds):
     return ([exe, ds, "time"], f"{k}.rs") if os.path.exists(exe) else None
 
 
-def build_go(k, ds):
+def build_go(k, ds, dump=True):
     mod = f"{HERE}/go"
     if not os.path.exists(f"{mod}/cmd/{k}/main.go"):
         return None
-    exe = f"{OUT}/go/{ds}/{k}"
+    exe = f"{OUT}/go/{ds}{'' if dump else '-nodump'}/{k}"
     os.makedirs(os.path.dirname(exe), exist_ok=True)
     env = dict(os.environ, GOAMD64="v3") if not ARM else dict(os.environ)
-    tags = [] if ds == "LARGE" else ["-tags", ds.lower()]  # the sizes are build tags (large by default, mini)
+    tg = ([] if ds == "LARGE" else [ds.lower()]) + ([] if dump else ["nodump"])  # sizes and the dump: build tags
+    tags = ["-tags", ",".join(tg)] if tg else []
     subprocess.run(["go", "build", *tags, "-o", exe, f"./cmd/{k}"], cwd=mod, check=True, env=env)
     return [exe, ds, "time"], f"{k}.go"
 
 
-def build(side, k, ds):
-    """(command, program name) of the side's program for the kernel, or None when the side has no port of it"""
+def build(side, k, ds, dump=True):
+    """(command, program name) of the side's program for the kernel, or None when the side has no port of it.
+    dump=False: the timing build, as PolyBench is timed: C without -DPOLYBENCH_DUMP_ARRAYS, Go with -tags nodump,
+    the others with "nodump" on the command line (each still prints the arrays when told to, so the kernel's
+    results stay live, like the C's argc > 42 test)"""
     if side == "c":
-        return build_c(k, ds, os.environ.get("CC", "clang"), "c")
+        return build_c(k, ds, os.environ.get("CC", "clang"), "c", dump)
     if side == "gcc":
-        return build_c(k, ds, os.environ.get("GCC", "gcc"), "gcc")
-    if side == "xisto":
-        return build_xisto(k, ds)
-    if side in ("node", "bun"):
-        return [side, f"{HERE}/ts/{k}.ts", ds, "time"], f"{k}.ts"
-    if side == "rust":
-        return build_rust(k, ds)
+        return build_c(k, ds, os.environ.get("GCC", "gcc"), "gcc", dump)
     if side == "go":
-        return build_go(k, ds)
-    sys.exit(f"run.py: unknown side {side}")
+        return build_go(k, ds, dump)
+    if side == "xisto":
+        b = build_xisto(k, ds)
+    elif side in ("node", "bun"):
+        b = [side, f"{HERE}/ts/{k}.ts", ds, "time"], f"{k}.ts"
+    elif side == "rust":
+        b = build_rust(k, ds)
+    else:
+        sys.exit(f"run.py: unknown side {side}")
+    if b is None or dump:
+        return b
+    return b[0] + ["nodump"], b[1]
 
 
 def timed(cmd):
@@ -158,13 +168,15 @@ def main():
                 print(f"# {k}: no {side} port", flush=True)
                 continue
             cmd, name = b
-            timed(cmd)  # warm-up
-            rs = [timed(cmd) for _ in range(runs)]
+            check = timed(cmd)  # the output, with the dump: its hash against the C reference's
+            tcmd, _ = build(side, k, ds, dump=False)
+            timed(tcmd)  # warm-up
+            rs = [timed(tcmd) for _ in range(runs)]  # timed without the dump, as PolyBench times
             ok = [r for r in rs if r]
-            if not ok:
+            if not ok or check is None:
                 print(f"{k:<14} {side:<6} {name:<20} failed", flush=True)
                 continue
-            same = "same" if all(r[3] == ref[3] for r in ok) and len(ok) == len(rs) else "DIFFERS"
+            same = "same" if check[3] == ref[3] and len(ok) == len(rs) else "DIFFERS"
             w = statistics.median(r[0] for r in ok)
             c = statistics.median(r[1] for r in ok)
             m = max(r[2] for r in ok)

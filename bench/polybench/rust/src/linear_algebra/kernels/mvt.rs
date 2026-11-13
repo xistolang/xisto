@@ -78,7 +78,7 @@ pub fn run<const N: usize>() {
         let t = util::Timer::start();
         kernel_mvt(n, &mut x1, &mut x2, &y_1, &y_2, &A);
         t.stop_and_print();
-        print_array(n, &x1, &x2);
+        if util::dump_arrays() { print_array(n, &x1, &x2); }
     }
 }
 

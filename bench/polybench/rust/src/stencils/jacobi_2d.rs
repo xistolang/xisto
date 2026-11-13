@@ -64,7 +64,7 @@ pub fn run<const N: usize, const TSTEPS: usize>() {
         let t = util::Timer::start();
         kernel_jacobi_2d::<N, TSTEPS>(tsteps, n, &mut A, &mut B);
         t.stop_and_print();
-        print_array(n, &A);
+        if util::dump_arrays() { print_array(n, &A); }
     }
 }
 

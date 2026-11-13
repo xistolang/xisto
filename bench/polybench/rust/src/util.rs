@@ -106,3 +106,9 @@ impl Dump {
         write!(self.0, "{} ", x).unwrap();
     }
 }
+
+/// "nodump" on the command line: the timing run, as C built without -DPOLYBENCH_DUMP_ARRAYS (the call stays,
+/// so the kernel's results stay live)
+pub fn dump_arrays() -> bool {
+    !std::env::args().skip(1).any(|a| a == "nodump")
+}

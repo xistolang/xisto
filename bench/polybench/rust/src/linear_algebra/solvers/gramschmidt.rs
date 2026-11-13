@@ -90,7 +90,7 @@ pub fn run<const M: usize, const N: usize>() {
         let t = util::Timer::start();
         kernel_gramschmidt(m, n, &mut A, &mut R, &mut Q);
         t.stop_and_print();
-        print_array(n, m, &R, &Q);
+        if util::dump_arrays() { print_array(n, m, &R, &Q); }
     }
 }
 

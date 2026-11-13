@@ -106,7 +106,7 @@ pub fn run<const NX: usize, const NY: usize, const TMAX: usize>() {
         let t = util::Timer::start();
         kernel_fdtd_2d(tmax, nx, ny, &mut ex, &mut ey, &mut hz, &fict);
         t.stop_and_print();
-        print_array(nx, ny, &ex, &ey, &hz);
+        if util::dump_arrays() { print_array(nx, ny, &ex, &ey, &hz); }
     }
 }
 

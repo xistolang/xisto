@@ -79,7 +79,7 @@ pub fn run<const N: usize, const M: usize>() {
         let t = util::Timer::start();
         kernel_bicg(n, m, &A, &mut s, &mut q, &p, &r);
         t.stop_and_print();
-        print_array(m, n, &s, &q);
+        if util::dump_arrays() { print_array(m, n, &s, &q); }
     }
 }
 
