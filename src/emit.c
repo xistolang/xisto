@@ -8201,7 +8201,7 @@ static void emit_stmt_for_inner_(Stmt *s);
    apart: lu's A[i][k], k < i <= j), and that nothing read outside the lane's own column j falls on the span of Y's rows
    at an index of [J0, JL); the rows read by a counter go to a table of their data. When the guard fails, or for the
    j's left over, the loop runs as it was. XISTO_NO_UJAM turns it off; XISTO_UJAM_U sets U (8). */
-typedef struct { Expr *e, *base, *idx; bool krow, self; int grp; } UjLd;
+typedef struct { Expr *e, *base, *idx; bool krow, self; int grp, yp; } UjLd; /* yp: a self load's post (Y table) */
 static UjLd uj_ld[24];
 static int nuj_ld, uj_ids;
 static const char *uj_j, *uj_k;
@@ -8210,8 +8210,13 @@ static Expr *uj_t;
 static int uj_grp; /* the loop the expression being matched or emitted belongs to: 0 the reduction (and e0), 1.. a post loop */
 static Expr *uj_ylhs; /* matching a post loop: its Y[i][j] */
 static int uj_cur, uj_lane;
-typedef struct { Stmt *loop; const char *ctr; Expr *lo, *hi, *lhs, *rhs; } UjPost;
-static UjPost uj_post[2];
+typedef struct { Stmt *loop; const char *ctr; Expr *lo, *hi, *lhs, *rhs; bool inner; int op; } UjPost;
+static UjPost uj_post[4];
+/* symm: the k loop's statements in order, the sum (-1) and the column writes Y[k][j] op= g (their post index) */
+static int uj_kord[4], nuj_kord;
+static const char *uj_wread; /* w, read in g2 or in a column write (the lane's sum) */
+static Expr *uj_fin2; /* symm's `T = g2` after a sum in a local: g2 of w and of T (from memory) */
+static int uj_ypost = -1; /* matching a column write: its post index (its self loads' table) */
 static int nuj_post;
 static bool uj_mentions(Expr *e, const char *n) {
     if (!e) return false;
@@ -8246,6 +8251,7 @@ static bool uj_expr(Expr *e, bool k_ok) { /* f, g (k_ok) or e0: registers its lo
     switch (e->kind) {
     case E_NUMBER: return true;
     case E_IDENT:
+        if (uj_wread && e->cname && strcmp(e->cname, uj_wread) == 0) return true; /* (the lane's sum) */
         return e->type->kind == TY_NUMBER && e->cname && bce_plain_local(e->cname) && !uj_mentions_ctr(e) &&
                !bce_writes(uj_nest, e->cname) && !bce_declares(uj_nest, e->cname);
     case E_BINARY:
@@ -8255,8 +8261,11 @@ static bool uj_expr(Expr *e, bool k_ok) { /* f, g (k_ok) or e0: registers its lo
     case E_INDEX: {
         if (e->builtin.cfn || e->type->kind != TY_NUMBER || !uj_num_arr(e->lhs->type) || nuj_ld == 24) return false;
         if (uj_is_t(e)) return uj_grp > 0; /* (T in a post loop: the lane's sum) */
-        UjLd l = {e, e->lhs, e->rhs, false, false, uj_grp};
-        if (uj_ylhs && e->kind == E_INDEX && bce_same_bx(e->lhs, uj_ylhs->lhs) && bce_same(e->rhs, uj_ylhs->rhs)) l.self = true;
+        UjLd l = {e, e->lhs, e->rhs, false, false, uj_grp, -1};
+        if (uj_ylhs && e->kind == E_INDEX && bce_same_bx(e->lhs, uj_ylhs->lhs) && bce_same(e->rhs, uj_ylhs->rhs)) {
+            l.self = true;
+            l.yp = uj_ypost >= 0 ? uj_ypost : uj_grp - 1;
+        }
         int ix = uj_idx(e->rhs);
         if (!ix || (ix == 'k' && !k_ok)) return false;
         Expr *b = e->lhs;
@@ -8321,19 +8330,53 @@ static bool uj_match(Stmt *s) {
     }
     if (!uj_bound_ok(uj_JL) || !uj_bound_ok(uj_K0) || !uj_bound_ok(uj_KL) || bce_writes(uj_kloop->body, k)) return false;
     Stmt *ks = uj_only(uj_kloop->body);
+    nuj_kord = 0;
+    uj_wread = NULL; uj_fin2 = NULL; uj_ypost = -1;
+    Stmt *kb = uj_kloop->body;
+    while (kb && kb->kind == S_BLOCK && kb->stmts.len == 1) kb = kb->stmts.items[0];
+    if (kb && kb->kind == S_BLOCK && kb->stmts.len >= 2 && kb->stmts.len <= 3) { /* (symm) a sum in a local w and column writes */
+        ks = NULL;
+        for (int q = 0; q < kb->stmts.len; q++) {
+            Stmt *x = kb->stmts.items[q];
+            Expr *a = x->kind == S_EXPR ? x->expr : NULL;
+            if (!a || a->kind != E_ASSIGN) return false;
+            if (a->lhs && a->lhs->kind == E_IDENT) {
+                if (ks || (a->op != TK_PLUS_ASSIGN && a->op != TK_MINUS_ASSIGN)) return false;
+                ks = x; uj_kord[nuj_kord++] = -1;
+                continue;
+            }
+            if (nuj_post == 4) return false;
+            UjPost *c = &uj_post[nuj_post];
+            memset(c, 0, sizeof *c);
+            c->loop = x; c->inner = true; c->ctr = k; c->lo = uj_K0; c->hi = uj_KL; c->lhs = a->lhs; c->rhs = a->rhs; c->op = a->op;
+            uj_kord[nuj_kord++] = nuj_post++;
+        }
+        if (!ks) return false;
+    }
     if (!ks || ks->kind != S_EXPR || !ks->expr || ks->expr->kind != E_ASSIGN || (ks->expr->op != TK_PLUS_ASSIGN && ks->expr->op != TK_MINUS_ASSIGN)) return false;
     Expr *t = ks->expr->lhs;
     uj_w = NULL;
-    if (t && t->kind == E_IDENT) { /* the sum in a local w: `w = T (or e0); for k w op= f; T = w` and nothing else */
-        Expr *p = uj_pre ? uj_pre->expr : NULL, *last = nuj_post == 1 && uj_post[0].loop->kind == S_EXPR ? uj_post[0].loop->expr : NULL;
+    int ninner = nuj_kord ? nuj_post - (ns - at) : 0; /* (the column writes come after the statements after the k loop) */
+    if (nuj_kord) { /* move the column writes first: uj_post = [inner..., after...] */
+        UjPost tmp[4];
+        int m = 0;
+        for (int p = 0; p < nuj_post; p++) if (uj_post[p].inner) tmp[m++] = uj_post[p];
+        for (int p = 0; p < nuj_post; p++) if (!uj_post[p].inner) tmp[m++] = uj_post[p];
+        int remap[4];
+        for (int p = 0, q = 0; p < nuj_post; p++) if (uj_post[p].inner) remap[p] = q++;
+        for (int z = 0; z < nuj_kord; z++) if (uj_kord[z] >= 0) uj_kord[z] = remap[uj_kord[z]];
+        memcpy(uj_post, tmp, sizeof tmp);
+    }
+    if (t && t->kind == E_IDENT) { /* the sum in a local w: `w = T (or e0); for k { w op= f; [Y[k][j] op= g;] } T = w (or g2 of w, T)` */
+        Expr *p = uj_pre ? uj_pre->expr : NULL, *last = nuj_post - ninner == 1 && uj_post[ninner].loop->kind == S_EXPR ? uj_post[ninner].loop->expr : NULL;
         if (!p || p->kind != E_ASSIGN || p->op != TK_ASSIGN || !p->lhs || p->lhs->kind != E_IDENT || !t->cname || !p->lhs->cname ||
             strcmp(p->lhs->cname, t->cname) != 0 || !t->type || t->type->kind != TY_NUMBER || !bce_plain_local(t->cname)) return false;
-        if (!last || last->kind != E_ASSIGN || last->op != TK_ASSIGN || !last->rhs || last->rhs->kind != E_IDENT || !last->rhs->cname ||
-            strcmp(last->rhs->cname, t->cname) != 0) return false;
+        if (!last || last->kind != E_ASSIGN || last->op != TK_ASSIGN || !last->rhs) return false;
         uj_w = t->cname;
+        if (!(last->rhs->kind == E_IDENT && last->rhs->cname && strcmp(last->rhs->cname, t->cname) == 0)) uj_fin2 = last->rhs;
         t = last->lhs;
-        nuj_post = 0;
-    }
+        nuj_post = ninner;
+    } else if (nuj_kord) return false; /* (column writes only with the sum in a local) */
     if (!t || t->kind != E_INDEX || t->builtin.cfn || !t->type || t->type->kind != TY_NUMBER || !t->rhs || t->rhs->kind != E_IDENT || !t->rhs->cname ||
         strcmp(t->rhs->cname, j) != 0 || !uj_num_arr(t->lhs->type) || !uj_inv_base(t->lhs)) return false;
     uj_t = t;
@@ -8341,8 +8384,8 @@ static bool uj_match(Stmt *s) {
     uj_e0 = NULL;
     uj_fin = NULL;
     uj_mir = NULL;
-    for (int p = 0; p < nuj_post; p++) if ((uj_post[p].loop->kind == S_EXPR) != (uj_post[0].loop->kind == S_EXPR)) return false; /* (not mixed) */
-    if (nuj_post && uj_post[0].loop->kind == S_EXPR) { /* [T = g | T *= g | T /= g;] [Z[j][c] = T;] after the sum */
+    for (int p = 0; p < nuj_post && !uj_w; p++) if ((uj_post[p].loop->kind == S_EXPR) != (uj_post[0].loop->kind == S_EXPR)) return false; /* (not mixed) */
+    if (!uj_w && nuj_post && uj_post[0].loop->kind == S_EXPR) { /* [T = g | T *= g | T /= g;] [Z[j][c] = T;] after the sum */
         int q = 0;
         Expr *f = uj_post[q].loop->expr;
         if (f && f->kind == E_ASSIGN && (f->op == TK_ASSIGN || f->op == TK_STAR_ASSIGN || f->op == TK_SLASH_ASSIGN) && uj_is_t(f->lhs)) {
@@ -8375,8 +8418,27 @@ static bool uj_match(Stmt *s) {
         }
     }
     if (!uj_expr(ks->expr->rhs, true)) return false;
-    for (int p = 0; p < nuj_post; p++) { /* for (i = I0; i < IL; i++) Y[i][j] = g */
+    if (uj_fin2) { /* g2: w the lane's sum, T from memory (the k loop does not write it) */
+        uj_grp = UJ_FIN_GRP; uj_wread = uj_w;
+        bool ok = uj_expr(uj_fin2, false);
+        uj_grp = 0; uj_wread = NULL;
+        if (!ok) return false;
+    }
+    for (int p = 0; p < nuj_post; p++) {
         UjPost *q = &uj_post[p];
+        if (q->inner) { /* Y[k][j] op= g in the k loop: g's loads by k (the sum's group), w the lane's sum */
+            Expr *y = q->lhs;
+            if (q->op != TK_ASSIGN && q->op != TK_PLUS_ASSIGN && q->op != TK_MINUS_ASSIGN && q->op != TK_STAR_ASSIGN) return false;
+            if (!y || y->kind != E_INDEX || y->builtin.cfn || !y->type || y->type->kind != TY_NUMBER || !y->rhs || y->rhs->kind != E_IDENT ||
+                !y->rhs->cname || strcmp(y->rhs->cname, j) != 0 || !uj_num_arr(y->lhs->type)) return false;
+            Expr *yr = y->lhs;
+            if (yr->kind != E_INDEX || yr->builtin.cfn || !yr->rhs || yr->rhs->kind != E_IDENT || !yr->rhs->cname || strcmp(yr->rhs->cname, k) != 0) return false;
+            uj_ylhs = y; uj_ypost = p; uj_wread = uj_w;
+            bool ok = uj_inv_base(yr->lhs) && uj_expr(q->rhs, true);
+            uj_ylhs = NULL; uj_ypost = -1; uj_wread = NULL;
+            if (!ok) return false;
+            continue;
+        }
         if (!uj_bound_ok(q->lo) || !uj_bound_ok(q->hi) || bce_writes(q->loop->body, q->ctr)) return false;
         Stmt *ps = uj_only(q->loop->body);
         if (!ps || ps->kind != S_EXPR || !ps->expr || ps->expr->kind != E_ASSIGN || ps->expr->op != TK_ASSIGN) return false;
@@ -8432,8 +8494,14 @@ static char *uj_raw_idx(Expr *x) { /* an index of the jammed loop, lane uj_lane,
     if (ix == 'j') return xs_sprintf("(jj%d_ + %d)", uj_cur, uj_lane);
     return bce_raw(x);
 }
+static const char *uj_emit_w; /* emitting: w is the lane's sum */
+static bool uj_t_mem; /* emitting g2: T is read from memory */
 static void uj_emit(Expr *e) {
     switch (e->kind) {
+    case E_IDENT:
+        if (uj_emit_w && e->cname && strcmp(e->cname, uj_emit_w) == 0) { buf_printf(out, "a%d_", uj_lane); return; }
+        emit_expr(e);
+        return;
     case E_BINARY:
         buf_puts(out, "(");
         uj_emit(e->lhs);
@@ -8443,6 +8511,7 @@ static void uj_emit(Expr *e) {
         return;
     case E_UNARY: buf_puts(out, "(-"); uj_emit(e->lhs); buf_puts(out, ")"); return;
     case E_INDEX:
+        if (uj_t_mem && uj_is_t(e)) { buf_printf(out, "td%d_[jj%d_ + %d]", uj_cur, uj_cur, uj_lane); return; }
         if (uj_grp > 0 && uj_is_t(e)) { buf_printf(out, "a%d_", uj_lane); return; }
         for (int i = 0; i < nuj_ld; i++)
             if (uj_ld[i].e == e) {
@@ -8492,7 +8561,9 @@ static bool uj_emit_loop(Stmt *s) {
     Expr *t = uj_t;
     const char *kname = uj_kname;
     Stmt *kloop = uj_kloop;
-    Expr *fin = uj_fin, *mir = uj_mir;
+    Expr *fin = uj_fin, *mir = uj_mir, *fin2 = uj_fin2;
+    int kord[4], nkord = nuj_kord;
+    memcpy(kord, uj_kord, sizeof kord);
     int prekind = uj_prekind;
     Expr *e0 = uj_e0;
     const char *w = uj_w;
@@ -8547,7 +8618,7 @@ static bool uj_emit_loop(Stmt *s) {
         char *cs = xs_sprintf("cs%d_%d_", id, ld[i].grp), *ce = xs_sprintf("ce%d_%d_", id, ld[i].grp);
         buf_printf(out, "double *jd%d_%d_ = NULL; double **jt%d_%d_ = NULL; (void)jd%d_%d_; (void)jt%d_%d_; ", id, i, id, i, id, i, id, i);
         if (ld[i].self) { /* Y[i][j] in its own post loop: the table of Y's rows */
-            buf_printf(out, "jt%d_%d_ = yt%d_%d_; ", id, i, id, ld[i].grp - 1);
+            buf_printf(out, "jt%d_%d_ = yt%d_%d_; ", id, i, id, ld[i].yp);
             continue;
         }
         if (!ld[i].krow) {
@@ -8587,7 +8658,7 @@ static bool uj_emit_loop(Stmt *s) {
     }
     /* the jammed loop */
     Stmt *ks = uj_only(kloop->body);
-    bool minus = ks->expr->op == TK_MINUS_ASSIGN;
+    bool minus = ks->kind == S_EXPR && ks->expr && ks->expr->op == TK_MINUS_ASSIGN; /* (symm's block: set below) */
     uj_cur = id;
     if (kmode) { /* each j: its element in a local, the lanes' k's one after the other */
         uj_grp = 0; uj_k = kname;
@@ -8622,12 +8693,36 @@ static bool uj_emit_loop(Stmt *s) {
         else { buf_printf(out, "td%d_[jj%d_ + %d] * ", id, id, u); uj_emit(e0); buf_puts(out, "; "); }
     }
     buf_printf(out, "for (int64_t kk%d_0_ = cs%d_0_; kk%d_0_ < ce%d_0_; kk%d_0_++) { ", id, id, id, id, id);
-    for (int u = 0; u < U; u++) {
-        uj_lane = u;
-        buf_printf(out, "a%d_ = a%d_ %s ", u, u, minus ? "-" : "+");
-        uj_emit(ks->expr->rhs);
-        buf_puts(out, "; ");
+    int one[1] = {-1};
+    int *ord = nkord ? kord : one, nord = nkord ? nkord : 1;
+    if (nkord) { /* (symm: the k loop's own statements) */
+        Stmt *kb = kloop->body;
+        while (kb->kind == S_BLOCK && kb->stmts.len == 1) kb = kb->stmts.items[0];
+        for (int z = 0; z < kb->stmts.len; z++) if (kb->stmts.items[z]->expr->lhs->kind == E_IDENT) ks = kb->stmts.items[z];
+        minus = ks->expr->op == TK_MINUS_ASSIGN;
     }
+    uj_emit_w = w;
+    for (int z = 0; z < nord; z++) {
+        if (ord[z] < 0) {
+            for (int u = 0; u < U; u++) {
+                uj_lane = u;
+                buf_printf(out, "a%d_ = a%d_ %s ", u, u, minus ? "-" : "+");
+                uj_emit(ks->expr->rhs);
+                buf_puts(out, "; ");
+            }
+            continue;
+        }
+        UjPost *q = &post[ord[z]];
+        const char *op = q->op == TK_PLUS_ASSIGN ? "+" : q->op == TK_MINUS_ASSIGN ? "-" : q->op == TK_STAR_ASSIGN ? "*" : NULL;
+        for (int u = 0; u < U; u++) {
+            uj_lane = u;
+            buf_printf(out, "yt%d_%d_[kk%d_0_][jj%d_ + %d] = ", id, ord[z], id, id, u);
+            if (op) buf_printf(out, "yt%d_%d_[kk%d_0_][jj%d_ + %d] %s (", id, ord[z], id, id, u, op);
+            uj_emit(q->rhs);
+            buf_puts(out, op ? "); " : "; ");
+        }
+    }
+    uj_emit_w = NULL;
     buf_puts(out, "} ");
     if (fin) { /* T = g (T *= g) on each lane's sum, T in g that sum */
         uj_grp = UJ_FIN_GRP;
@@ -8639,10 +8734,20 @@ static bool uj_emit_loop(Stmt *s) {
         }
         uj_grp = 0;
     }
-    for (int u = 0; u < U; u++) buf_printf(out, "td%d_[jj%d_ + %d] = a%d_; ", id, id, u, u);
+    if (fin2) { /* T = g2 of w (the lane's sum) and T (from memory) */
+        uj_grp = UJ_FIN_GRP; uj_emit_w = w; uj_t_mem = true;
+        for (int u = 0; u < U; u++) {
+            uj_lane = u;
+            buf_printf(out, "td%d_[jj%d_ + %d] = ", id, id, u);
+            uj_emit(fin2);
+            buf_puts(out, "; ");
+        }
+        uj_grp = 0; uj_emit_w = NULL; uj_t_mem = false;
+    } else for (int u = 0; u < U; u++) buf_printf(out, "td%d_[jj%d_ + %d] = a%d_; ", id, id, u, u);
     if (w) buf_printf(out, "%s = a%d_; ", ren(w), U - 1); /* (w as the last j left it) */
     if (mir) for (int u = 0; u < U; u++) buf_printf(out, "zt%d_[jj%d_ + %d][%s] = a%d_; ", id, id, u, bce_raw(mir->rhs), u);
     for (int p = 0; p < np; p++) { /* each lane's column of Y, after its sum (T is that sum) */
+        if (post[p].inner) continue;
         uj_grp = p + 1; uj_k = post[p].ctr;
         buf_printf(out, "for (int64_t kk%d_%d_ = cs%d_%d_; kk%d_%d_ < ce%d_%d_; kk%d_%d_++) { ", id, p + 1, id, p + 1, id, p + 1, id, p + 1, id, p + 1);
         for (int u = 0; u < U; u++) {

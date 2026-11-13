@@ -170,3 +170,26 @@ console.log("cov", show(CC), CM.map((x) => x.toFixed(6)).join(","));
 const CC2 = grid(14, 14, (i, j) => ((i + j) % 3) / 2);
 cov(14, 11, 11, CC2, CC2, new Array<number>(14).fill(0));
 console.log("cov shared", show(CC2));
+
+// column writes in the k loop and a sum in a local (symm): C[k][j] += ..., temp2 += ..., then C[i][j] = g(C[i][j], temp2)
+function symm(m: int, n: int, alpha: number, beta: number, C: number[][], A: number[][], B: number[][]): void {
+  let temp2: number;
+  for (let i = 0; i < m; i++)
+  for (let j = 0; j < n; j++) {
+    temp2 = 0;
+    for (let k = 0; k < i; k++) {
+      C[k][j] += alpha * B[i][j] * A[i][k];
+      temp2 += B[k][j] * A[i][k];
+    }
+    C[i][j] = beta * C[i][j] + alpha * B[i][j] * A[i][i] + alpha * temp2;
+  }
+}
+const YA = grid(7, 7, (i, j) => ((i * 2 + j) % 5) / 3);
+const YB = grid(7, 18, (i, j) => ((i + j * 3) % 7) / 5);
+const YC = grid(7, 18, (i, j) => ((i * j) % 4) / 2);
+symm(7, 18, 1.5, 1.2, YC, YA, YB);
+console.log("symm", show(YC));
+// B is C: the column read is the column written, in the same order per lane
+const YC2 = grid(7, 18, (i, j) => ((i + 2 * j) % 6) / 4);
+symm(7, 18, 0.5, 0.75, YC2, YA, YC2);
+console.log("symm B = C", show(YC2));
