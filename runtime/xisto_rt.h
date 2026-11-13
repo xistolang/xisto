@@ -7194,6 +7194,161 @@ XS_NOINLINE xs_str *xs_f64_to_string(xs_Float64Array *a) {
     return r;
 }
 
+/* ---- Float32Array (as in Node) ----
+   4 bytes per element, a float of C. An element read is the float as a double (exact); a write rounds the double to
+   the nearest float, ties to even (C's conversion in the default rounding mode, as JavaScript's), so a value too large
+   becomes an Infinity, a tiny one a subnormal or a zero of its sign, and NaN, the Infinities and -0 stay. The program's
+   arithmetic stays in double: only the reads and the writes convert (no fused operations: -ffp-contract=off). */
+static inline __attribute__((always_inline)) double xs_f32_num(float x) { return (double)x; } /* an element read: exact */
+typedef struct xs_Float32Array { xs_hdr hdr; union { int64_t f_length; int64_t len; }; float *data; xs_shblk *blk; bool shared; } xs_Float32Array;
+static void xs_f32_free(void *p) { xs_shblk_unref(((xs_Float32Array *)p)->blk); xs_obj_free(p); }
+static void xs_f32_print(void *p) {
+    xs_Float32Array *a = p;
+    xs_insp fr;
+    if (!xs_insp_begin(&fr, p, "Float32Array", a->f_length ? NULL : "Float32Array(0) []")) return;
+    int64_t n = a->f_length < 100 ? a->f_length : 100;
+    for (int64_t i = 0; i < n; i++) { xs_insp_entry(&fr); xs_print_num((double)a->data[i]); }
+    if (a->f_length > 100) { xs_insp_entry(&fr); fprintf(XS_OUT, "... %lld more item%s", (long long)(a->f_length - 100), a->f_length - 100 == 1 ? "" : "s"); }
+    char open[48];
+    snprintf(open, sizeof open, "Float32Array(%lld) [", (long long)a->f_length);
+    xs_insp_end(&fr, open, "]", true, true, a->f_length > 100);
+}
+/* a view of n floats from the off-th one of blk, whose reference it takes over */
+XS_NOINLINE xs_Float32Array *xs_f32_wrap(xs_shblk *blk, int64_t off, int64_t n, bool shared) {
+    xs_Float32Array *a = xs_obj_alloc(sizeof *a, xs_f32_free, xs_f32_print);
+    a->f_length = n;
+    a->data = (float *)xs_shblk_data(blk) + off;
+    a->blk = blk;
+    a->shared = shared;
+    return a;
+}
+XS_NOINLINE xs_Float32Array *xs_f32_new(int64_t n) {
+    if (n < 0 || n > ((int64_t)1 << 38)) xs_panic("RangeError: Invalid typed array length");
+    return xs_f32_wrap(xs_shblk_new(n * 4, true), 0, n, false);
+}
+XS_NOINLINE xs_Float32Array *xs_f32_from_nums(xs_arr_num *s) {
+    xs_Float32Array *a = xs_f32_wrap(xs_shblk_new((int64_t)s->len * 4, false), 0, (int64_t)s->len, false);
+    for (size_t i = 0; i < s->len; i++) a->data[i] = (float)s->data[i];
+    return a;
+}
+XS_NOINLINE xs_Float32Array *xs_f32_from_ints(xs_arr_int *s) {
+    xs_Float32Array *a = xs_f32_wrap(xs_shblk_new((int64_t)s->len * 4, false), 0, (int64_t)s->len, false);
+    for (size_t i = 0; i < s->len; i++) a->data[i] = (float)(double)s->data[i]; /* (through the double the int is as a number) */
+    return a;
+}
+XS_NOINLINE xs_Float32Array *xs_f32_copy(xs_Float32Array *s) {
+    xs_Float32Array *a = xs_f32_wrap(xs_shblk_new(s->f_length * 4, false), 0, s->f_length, false);
+    if (s->f_length) memcpy(a->data, s->data, (size_t)s->f_length * sizeof(float));
+    return a;
+}
+XS_NOINLINE xs_Float32Array *xs_f32_from_f64(xs_Float64Array *s) {
+    xs_Float32Array *a = xs_f32_wrap(xs_shblk_new(s->f_length * 4, false), 0, s->f_length, false);
+    for (int64_t i = 0; i < s->f_length; i++) a->data[i] = (float)s->data[i];
+    return a;
+}
+XS_NOINLINE xs_Float64Array *xs_f64_from_f32(xs_Float32Array *s) {
+    xs_Float64Array *a = xs_f64_wrap(xs_shblk_new(s->f_length * 8, false), 0, s->f_length, false);
+    for (int64_t i = 0; i < s->f_length; i++) a->data[i] = (double)s->data[i];
+    return a;
+}
+/* new Float32Array(sab, byteOffset?, length?): a view on the buffer (INT64_MIN: not given) */
+XS_NOINLINE xs_Float32Array *xs_f32_on(xs_SharedArrayBuffer *s, int64_t off, int64_t n) {
+    if (off == INT64_MIN) off = 0;
+    if (off < 0 || off % 4) xs_panic("RangeError: start offset of Float32Array should be a multiple of 4");
+    if (off > s->f_byteLength) xs_panic("RangeError: start offset is outside the bounds of the buffer");
+    if (n == INT64_MIN) {
+        if ((s->f_byteLength - off) % 4) xs_panic("RangeError: byte length of Float32Array should be a multiple of 4");
+        n = (s->f_byteLength - off) / 4;
+    } else if (n < 0 || n > (s->f_byteLength - off) / 4) xs_panic("RangeError: Invalid typed array length");
+    xs_shblk_ref(s->blk);
+    return xs_f32_wrap(s->blk, off / 4, n, true);
+}
+/* the length, with the bound every Float32Array has (as xs_f64_len) */
+static inline int64_t xs_f32_len(xs_Float32Array *a) {
+    int64_t n = a->f_length;
+#if defined(__clang__)
+    __builtin_assume(n >= 0 && n <= ((int64_t)1 << 38));
+#else
+    if (n < 0 || n > ((int64_t)1 << 38)) __builtin_unreachable();
+#endif
+    return n;
+}
+static inline float *xs_f32_at_s(xs_Float32Array *a, int64_t i, const xs_site *s) {
+    if ((uint64_t)i >= (uint64_t)a->f_length) XS_FAIL("index out of bounds", s);
+    return &a->data[i];
+}
+static inline int64_t xs_f32_byte_length(xs_Float32Array *a) { return a->f_length * 4; }
+static inline int64_t xs_f32_byte_offset(xs_Float32Array *a) { return (int64_t)((char *)a->data - xs_shblk_data(a->blk)); }
+XS_NOINLINE xs_Float32Array *xs_f32_fill(xs_Float32Array *a, double v, int64_t start, int64_t end) {
+    int64_t s = xs_u8_rel(start, a->f_length, 0), e = xs_u8_rel(end, a->f_length, a->f_length);
+    float f = (float)v;
+    for (int64_t i = s; i < e; i++) a->data[i] = f;
+    return xs_retain(a);
+}
+XS_NOINLINE void xs_f32_set_from(xs_Float32Array *d, xs_Float32Array *s, int64_t off) {
+    xs_f64_set_check(s->f_length, off, d->f_length);
+    if (s->f_length) memmove(d->data + off, s->data, (size_t)s->f_length * sizeof(float)); /* (views on one block may overlap) */
+}
+XS_NOINLINE void xs_f32_set_nums(xs_Float32Array *d, xs_arr_num *s, int64_t off) {
+    xs_f64_set_check((int64_t)s->len, off, d->f_length);
+    for (size_t i = 0; i < s->len; i++) d->data[off + (int64_t)i] = (float)s->data[i];
+}
+XS_NOINLINE void xs_f32_set_f64(xs_Float32Array *d, xs_Float64Array *s, int64_t off) {
+    xs_f64_set_check(s->f_length, off, d->f_length);
+    if (!s->f_length) return;
+    if (s->blk == d->blk) { /* (views on one block: the source read whole before any write, as the spec's clone) */
+        float *t = malloc((size_t)s->f_length * sizeof(float));
+        if (!t) xs_panic("out of memory");
+        for (int64_t i = 0; i < s->f_length; i++) t[i] = (float)s->data[i];
+        memcpy(d->data + off, t, (size_t)s->f_length * sizeof(float));
+        free(t);
+        return;
+    }
+    for (int64_t i = 0; i < s->f_length; i++) d->data[off + i] = (float)s->data[i];
+}
+XS_NOINLINE void xs_f64_set_f32(xs_Float64Array *d, xs_Float32Array *s, int64_t off) {
+    xs_f64_set_check(s->f_length, off, d->f_length);
+    if (!s->f_length) return;
+    if (s->blk == d->blk) {
+        double *t = malloc((size_t)s->f_length * sizeof(double));
+        if (!t) xs_panic("out of memory");
+        for (int64_t i = 0; i < s->f_length; i++) t[i] = (double)s->data[i];
+        memcpy(d->data + off, t, (size_t)s->f_length * sizeof(double));
+        free(t);
+        return;
+    }
+    for (int64_t i = 0; i < s->f_length; i++) d->data[off + i] = (double)s->data[i];
+}
+XS_NOINLINE xs_Float32Array *xs_f32_subarray(xs_Float32Array *a, int64_t start, int64_t end) { /* a view on the same block */
+    int64_t s = xs_u8_rel(start, a->f_length, 0), e = xs_u8_rel(end, a->f_length, a->f_length);
+    xs_shblk_ref(a->blk);
+    return xs_f32_wrap(a->blk, (a->data - (float *)xs_shblk_data(a->blk)) + s, e > s ? e - s : 0, a->shared);
+}
+XS_NOINLINE xs_Float32Array *xs_f32_slice(xs_Float32Array *a, int64_t start, int64_t end) { /* a copy, of its own */
+    int64_t s = xs_u8_rel(start, a->f_length, 0), e = xs_u8_rel(end, a->f_length, a->f_length), n = e > s ? e - s : 0;
+    xs_Float32Array *r = xs_f32_wrap(xs_shblk_new(n * 4, false), 0, n, false);
+    if (n) memcpy(r->data, a->data + s, (size_t)n * sizeof(float));
+    return r;
+}
+XS_NOINLINE xs_str *xs_f32_join(xs_Float32Array *a, xs_str *sep) {
+    xs_sb sb = {0};
+    char t[32];
+    for (int64_t i = 0; i < a->f_length; i++) {
+        if (i) xs_sb_put(&sb, sep->data, (size_t)sep->len);
+        double v = (double)a->data[i];
+        if (v == 0) xs_sb_put(&sb, "0", 1); /* (-0 joins as 0) */
+        else { xs_num_to_str(v, t); xs_sb_put(&sb, t, strlen(t)); }
+    }
+    xs_str *r = xs_str_new(sb.data ? sb.data : "", sb.len);
+    free(sb.data);
+    return r;
+}
+XS_NOINLINE xs_str *xs_f32_to_string(xs_Float32Array *a) {
+    xs_str *c = xs_str_new(",", 1), *r = xs_f32_join(a, c);
+    xs_release(c);
+    return r;
+}
+
 /* ---- text ---- */
 XS_NOINLINE xs_Uint8Array *xs_text_encode(xs_str *s) { /* new TextEncoder().encode(s): the UTF-8 bytes */
     xs_Uint8Array *b = xs_u8_raw(s->len, false, false);
