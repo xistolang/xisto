@@ -68,3 +68,32 @@ console.log("vecmat", sum.map((x) => x.toFixed(6)).join(","));
 const M = grid(10, 10, (i, j) => (i * 10 + j) / 50);
 vecmat(10, [1, 1, 1, 1, 1, 1, 1, 1, 1, 1], M, M[3]);
 console.log("vecmat shared", show(M));
+
+// a post loop that writes the lane's column after the sum (gramschmidt): Q and A apart, Q the same as A, R's row a
+// row of A
+function gs(m: int, n: int, A: number[][], R: number[][], Q: number[][]): void {
+  for (let k = 0; k < n; k++) {
+    let nrm = 0.0;
+    for (let i = 0; i < m; i++) nrm += A[i][k] * A[i][k];
+    R[k][k] = Math.sqrt(nrm);
+    for (let i = 0; i < m; i++) Q[i][k] = A[i][k] / R[k][k];
+    for (let j = k + 1; j < n; j++) {
+      R[k][j] = 0.0;
+      for (let i = 0; i < m; i++) R[k][j] += Q[i][k] * A[i][j];
+      for (let i = 0; i < m; i++) A[i][j] = A[i][j] - Q[i][k] * R[k][j];
+    }
+  }
+}
+const GA = grid(9, 13, (i, j) => (((i * j) % 9) + 1) / 9);
+const GR = grid(13, 13, (i, j) => 0);
+const GQ = grid(9, 13, (i, j) => 0);
+gs(9, 13, GA, GR, GQ);
+console.log("gs", show(GA), show(GR), show(GQ));
+const SA = grid(9, 13, (i, j) => (((i + 2 * j) % 7) + 1) / 7);
+gs(9, 13, SA, grid(13, 13, (i, j) => 0), SA);
+console.log("gs Q = A", show(SA));
+const TA = grid(9, 13, (i, j) => (((i * 3 + j) % 5) + 1) / 5);
+const TR = grid(13, 13, (i, j) => 0);
+TR[2] = TA[4];
+gs(9, 13, TA, TR, grid(9, 13, (i, j) => 0));
+console.log("gs R row = A row", show(TA), show(TR));
