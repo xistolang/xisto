@@ -8590,7 +8590,13 @@ static char *bce_sel_plan(Stmt *s, const char *i) {
    index on its ranges, every row reached, that no block read overlaps T's (the same row is allowed with its indexes
    apart: lu's A[i][k], k < i <= j), and that nothing read outside the lane's own column j falls on the span of Y's rows
    at an index of [J0, JL); the rows read by a counter go to a table of their data. When the guard fails, or for the
-   j's left over, the loop runs as it was. XISTO_NO_UJAM turns it off; XISTO_UJAM_U sets U (8). */
+   j's left over, the loop runs as it was. XISTO_NO_UJAM turns it off; XISTO_UJAM_U sets U (xs_jam_uj, xs_jam_uk). */
+/* U by target (kernel LARGE, 2026-11-14): the jam of j (and its forms: gramschmidt's, symm's, covariance's...) best at
+   16 on the M4, the Xeon E5-2686 v4 (Broadwell) and the Graviton2 (Neoverse-N1), 16 better than 8 in every such kernel
+   on the three; the jam of k (syrk, syr2k: U values of k into one element) 12 on x86 with AVX2 and 8 on ARM (16 made
+   syr2k slower on all three). main.c sets xs_jam_uk to 12 when the code is for an AVX2 x86 (--cpu=native there, or a
+   named Haswell-or-later); any other target keeps 16 and 8. The init's jam in t (uj_emit_km) stays at 8. */
+int xs_jam_uj = 16, xs_jam_uk = 8;
 typedef struct { Expr *e, *base, *idx; bool krow, self, lrow, mrow; int grp, yp; } UjLd; /* yp: a self load's post (Y table); lrow: X[j][c],
    the lane's own row (mvt: A[i][j] in a loop over j, i the lane), from a table by the lane */
 static UjLd uj_ld[24];
@@ -9084,7 +9090,7 @@ static bool uj_emit_loop(Stmt *s) {
     uj_kmode = false;
     if (!uj_match(s)) { if (!uj_match_k(s)) return false; uj_kmode = true; }
     bool kmode = uj_kmode;
-    int id = uj_cur = uj_ids++, U = 8;
+    int id = uj_cur = uj_ids++, U = kmode ? xs_jam_uk : xs_jam_uj;
     const char *ue = getenv("XISTO_UJAM_U");
     if (ue && atoi(ue) >= 2 && atoi(ue) <= 16) U = atoi(ue);
     bool ar = false;

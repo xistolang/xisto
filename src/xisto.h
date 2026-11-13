@@ -743,6 +743,7 @@ void distribute_program(Program *p); /* distribute.c: a pair loop over columns, 
 void inplace_program(Program *p); /* inplace.c: for-of over readStdinParts whose part stays in its iteration reads in place */
 extern bool xs_pad4; /* columns.c: x y z fields as one column of 4 lanes (x86 with AVX2) */
 void pad4_program(Program *p); /* pad4.c */
+extern int xs_jam_uj, xs_jam_uk; /* emit.c: U of the jam of j and of k (main.c: by target) */
 extern bool xs_wide_f64; /* distribute.c: the target has 4-lane double vectors (AVX2): the slow consts that read no column go in a flat loop */
 void prune_program(Program *p); /* marks what main reaches; emitters skip the rest */
 Func *xs_parse_instance(Func *tmpl, Type **args);

@@ -400,6 +400,7 @@ static Buf compile_to_c(const char *path) {
         columns_program(p); /* (the qbe backend takes no typed-array parameter yet) */
         pad4_program(p);
     }
+    xs_jam_uk = cpu_avx2_target() ? 12 : 8; /* (emit.c: U of the jam of k by target) */
     if (!use_qbe) {
         xs_wide_f64 = cpu_wide_f64();
         distribute_program(p); /* (after columns: it only touches loops over columns) */
