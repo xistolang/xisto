@@ -44,6 +44,28 @@ for (let t = 0; t < counts.length; t++) {
 console.log("picks", total, "same", same);
 console.log(JSON.stringify(iub.pick(25, { lineLength: 10 })));
 
+// two sets of characters drawn from one generator, and the generator moved by hand between draws: each draw
+// goes on where the generator is, as the plain loop does
+const shared = new LinearCongruential({ seed: 42, multiplier: A, increment: C, modulus: M });
+const iub2 = new WeightedCharacters(shared, "acgtBDHKMNRSVWY", probs);
+const hsProbs = [0.3029549426680, 0.1979883004921, 0.1975473066391, 0.3015094502008];
+const hs = new WeightedCharacters(shared, "acgt", hsProbs);
+let at: int = 42, agree = 0;
+const plan: int[] = [0, 500, 60, 1, 700, 60, 2, 3, 0, 0, 300, 60, 1, 130, 0, 2, 139967, 0, 1, 61, 7, 0, 200000, 60];
+for (let t = 0; t < plan.length; t += 3) {
+  const which = plan[t], count = plan[t + 1], width = plan[t + 2];
+  if (which === 2) { // moved by hand
+    for (let i = 0; i < count; i++) shared.next();
+    for (let i = 0; i < count; i++) at = (at * A + C) % M;
+    continue;
+  }
+  const got = which === 0 ? iub2.pick(count, { lineLength: width }) : hs.pick(count, { lineLength: width });
+  if (got === plain(at, which === 0 ? "acgtBDHKMNRSVWY" : "acgt", which === 0 ? probs : hsProbs, count, width)) agree++;
+  for (let i = 0; i < count; i++) at = (at * A + C) % M;
+  if (shared.last !== at) console.log("shared generator off after", count);
+}
+console.log("shared draws agree", agree);
+
 // a generator whose multiplier shares a factor with the modulus: values that lead into the cycle and never return
 const odd = new LinearCongruential({ seed: 5, multiplier: 6, increment: 1, modulus: 36 });
 const oddText = new WeightedCharacters(odd, "xy", [0.5, 0.5]);
