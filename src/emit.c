@@ -5282,6 +5282,15 @@ static bool writes_name(Expr *e, const char *c) {
 }
 static void mark_counted_inc(Stmt *s) {
     Expr *u = s->for_update, *c = s->cond;
+    /* ++i and i += 1 (how ++i arrives here): the update's value is dropped, so it is i++ (PolyBench's inits:
+       `for (let s = 0; s < n; ++s)`) */
+    if (u && c && u->type && u->type->kind == TY_INT && !u->builtin.cfn && u->lhs && u->lhs->kind == E_IDENT && !getenv("XISTO_NO_PREINC") &&
+        ((u->kind == E_UNARY && u->op == TK_PLUSPLUS) ||
+         (u->kind == E_ASSIGN && u->op == TK_PLUS_ASSIGN && u->rhs && u->rhs->kind == E_NUMBER && u->rhs->is_int_lit && u->rhs->ival == 1))) {
+        u->kind = E_POSTFIX;
+        u->op = TK_PLUSPLUS;
+        u->rhs = NULL;
+    }
     if (!u || !c || u->kind != E_POSTFIX || u->op != TK_PLUSPLUS || !u->type || u->type->kind != TY_INT) return;
     if (!u->lhs || u->lhs->kind != E_IDENT || !u->lhs->cname || u->builtin.cfn) return;
     if (c->kind != E_BINARY || c->op != TK_LT || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, u->lhs->cname) != 0) return;
