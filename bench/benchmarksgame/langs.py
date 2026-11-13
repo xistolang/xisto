@@ -6,8 +6,9 @@ checked against xisto's (which is checked against Node's by run.py).
 Usage: python3 bench/benchmarksgame/langs.py RUNS NAME=COMMAND... [-- PROGRAM...]
   NAME=COMMAND: a label and a command with {p} for the problem (spectralnorm...) and {v} for each variant file
   found by the glob in the label's directory; simpler: LABEL=DIR, every executable DIR/{p}* is a variant.
+  LABEL=js:RUNTIME (node, bun): the official Node programs bench/benchmarksgame/node/{p}-node-*.js under RUNTIME.
 One line per variant: problem, variant, median wall, median CPU, peak RSS, output same/differs."""
-import glob, hashlib, os, statistics, subprocess, sys, time
+import glob, hashlib, os, shutil, statistics, subprocess, sys, time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import measure
@@ -60,6 +61,14 @@ def main():
             subprocess.run(["build/xisto", "build", "-o", vexe, v], check=True, stdout=subprocess.DEVNULL)
             variants.append(("xisto", os.path.basename(v)[:-3], [os.path.abspath(vexe), arg]))
         for label, d in groups:
+            if d.startswith("js:"):  # a JS runtime: the official Node programs in bench/benchmarksgame/node
+                for v in sorted(glob.glob(f"{B}/node/{p}-node-*.js")):
+                    src = v
+                    if os.path.basename(d[3:]).startswith("bun"):  # Bun runs a .cjs copy (as run.py)
+                        src = f"{OUT}/{os.path.basename(v)[:-3]}.cjs"
+                        shutil.copyfile(v, src)
+                    variants.append((label, os.path.basename(v)[:-3], [d[3:], src, arg]))
+                continue
             for v in sorted(glob.glob(f"{d}/{p}") + glob.glob(f"{d}/{p}_*")):
                 if os.access(v, os.X_OK) and not v.endswith((".d", ".rlib")):
                     variants.append((label, os.path.basename(v), [v, arg]))

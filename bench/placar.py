@@ -39,10 +39,11 @@ def pair(a, b, unit):
     elif b < a: sb = f"**{sb}**"
     return sa, sb
 
+OTHER = sys.argv[2] if len(sys.argv) > 2 else "rust"  # the other side's label (rust, node, bun)
 rows = {}
 for line in open(sys.argv[1]):
     p = line.split()
-    if len(p) < 6 or p[1] not in ("xisto", "rust") or p[-1] != "same":
+    if len(p) < 6 or p[1] not in ("xisto", OTHER) or p[-1] != "same":
         continue
     try:
         t, c, m = float(p[3].rstrip("s")), float(p[4].rstrip("cpu")), float(p[5].rstrip("MB"))
@@ -54,9 +55,9 @@ for line in open(sys.argv[1]):
 
 out = []
 for prob, sides in rows.items():
-    if "xisto" not in sides or "rust" not in sides:
+    if "xisto" not in sides or OTHER not in sides:
         continue
-    (x, xm), (r, rm) = pick(sides["xisto"]), pick(sides["rust"])
+    (x, xm), (r, rm) = pick(sides["xisto"]), pick(sides[OTHER])
     ratio = x[0] / r[0]
     res = "ganha" if ratio < 0.95 else "empata" if ratio <= 1.05 else f"perde {ratio:.2f}x".replace(".", ",")
     cells = [*pair(x[0], r[0], "s"), *pair(x[1], r[1], "u"), *pair(x[2], r[2], "MB")]
