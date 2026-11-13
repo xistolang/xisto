@@ -13,6 +13,7 @@ print-result = []
 
 [dependencies]
 [profile.release]
+strip = false
 opt-level = 3
 codegen-units = 1
 

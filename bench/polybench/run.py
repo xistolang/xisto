@@ -66,18 +66,24 @@ def build_rust(k, ds):
     if not os.path.exists(f"{crate}/Cargo.toml"):
         return None
     env = dict(os.environ, RUSTFLAGS="-C target-cpu=native")  # opt-level=3, codegen-units=1 in Cargo.toml
-    subprocess.run(["cargo", "build", "--release", "--quiet", "--manifest-path", f"{crate}/Cargo.toml"], check=True, env=env)
-    exe = f"{crate}/target/release/{k.replace('-', '_')}"
+    cargo = shutil.which("cargo") or "cargo"
+    if not shutil.which("cargo") and shutil.which("rustup"):  # macOS with rustup: cargo is not on PATH
+        cargo = subprocess.run(["rustup", "which", "cargo"], capture_output=True, text=True).stdout.strip() or "cargo"
+        env["PATH"] = os.path.dirname(cargo) + os.pathsep + env.get("PATH", "")
+    subprocess.run([cargo, "build", "--release", "--quiet", "--manifest-path", f"{crate}/Cargo.toml"], check=True, env=env)
+    exe = f"{crate}/target/release/{k}"  # binaries carry the C kernel names (jacobi-2d, floyd-warshall)
     return ([exe, ds, "time"], f"{k}.rs") if os.path.exists(exe) else None
 
 
 def build_go(k, ds):
-    src = f"{HERE}/go/{k}"
-    if not os.path.exists(f"{src}/main.go"):
+    mod = f"{HERE}/go"
+    if not os.path.exists(f"{mod}/cmd/{k}/main.go"):
         return None
-    exe = f"{OUT}/go/{k}"
+    exe = f"{OUT}/go/{ds}/{k}"
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
     env = dict(os.environ, GOAMD64="v3") if not ARM else dict(os.environ)
-    subprocess.run(["go", "build", "-o", exe, "."], cwd=src, check=True, env=env)
+    tags = [] if ds == "LARGE" else ["-tags", ds.lower()]  # the sizes are build tags (large by default, mini)
+    subprocess.run(["go", "build", *tags, "-o", exe, f"./cmd/{k}"], cwd=mod, check=True, env=env)
     return [exe, ds, "time"], f"{k}.go"
 
 
