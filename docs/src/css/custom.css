@@ -252,6 +252,8 @@ pre code, .prism-code code { border: 0; padding: 0; }
   font-size: 0.875rem; /* 14 px */
 }
 .prism-code { font-size: 0.8125rem; line-height: 1.6; } /* 13 px */
+/* no ligatures in code: a reader must see the characters they type (=== not ≡, !== not ≢, => not ⇒) */
+code, pre, kbd, .prism-code { font-variant-ligatures: none; font-feature-settings: "liga" 0, "calt" 0; }
 
 /* ---------- cards, tables, admonitions ---------- */
 .card {
@@ -260,7 +262,18 @@ pre code, .prism-code code { border: 0; padding: 0; }
   box-shadow: 0 1px 2px rgba(11, 16, 32, 0.04);
   background: var(--xisto-surface);
 }
-.markdown table { border-radius: 10px; overflow: hidden; display: table; width: 100%; }
+/* a wide table scrolls inside its own box; it never widens the page (and pushes the TOC and sidebar) */
+.markdown table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  border-radius: 10px;
+  font-size: 0.9375rem;
+}
+.markdown table th { white-space: nowrap; }
+/* data tables (7+ columns: benchmarks) keep each value on one line ("1.097 s", "155.9 MB") */
+.markdown table:has(th:nth-child(7)) td { white-space: nowrap; }
 .markdown table thead tr { background: var(--xisto-surface); }
 .markdown table tr:nth-child(2n) { background: transparent; }
 .alert { border-radius: 12px; }

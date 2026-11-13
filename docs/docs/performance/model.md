@@ -98,8 +98,8 @@ with a certificate; `--tls=off` removes it. Measured on the M4 (5 Nov 2026, desi
 - **Closures** are refcounted objects whose first field is the code pointer. Captured variables are copied by
   value. A captured variable that is reassigned moves to a heap cell: one allocation and counting on every access.
 - **Promises.** `await f()` and a bare `f();` call the function directly; no promise exists. A promise is built
-  only when the program keeps one. `await` on a direct call costs 2 ns; a stored promise costs 97 ns (Node: 28
-  ns); `then` plus `await` costs 155 ns (Node: 50 ns) (M4, 10 Nov 2026, design notes).
+  only when the program keeps one. `await` on a direct call costs 0.7–0.9 ns; a kept promise costs about 73 ns
+  (Node: about 20 ns for both) (2 million calls, Apple M4, 12 Nov 2026).
 - **Event loop.** One thread runs coroutines on kqueue (macOS), an epoll equivalent (Linux) or WSAPoll (Windows).
   A parked coroutine on the shared stack keeps only the bytes it used: 10,000 waiting tasks took 15 MB against
   Bun's 35 MB (M4, 6 Nov 2026, design notes).

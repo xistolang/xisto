@@ -14,7 +14,7 @@ mechanisms behind each row.
 
 | pattern | what happens | do this instead |
 |---|---|---|
-| `any`, `as any`, `(x as any)[k]` | Dynamic path, warning XS2007. A field read costs ~7 ns against ~0.6 ns typed (M4, 11 Nov 2026, design notes). An object created as `any` is a `Record`, larger than a struct. | Declare an interface, a class or `Record<string, T>`. See [`any`](/docs/language/any). |
+| `any`, `as any`, `(x as any)[k]` | Dynamic path, warning XS2007. A field read costs about 9 ns against 0.4 ns typed (10 million reads, Apple M4, 12 Nov 2026). An object created as `any` is a `Record`, larger than a struct. | Declare an interface, a class or `Record<string, T>`. See [`any`](/docs/language/any). |
 | `undefined` | Read as `null`, warning XS2101. A comparison of a never-null value with `null` is always the same: XS2102. | Write `null`; test with `x == null`. |
 | `a == b` where JavaScript would convert (int and string, say) | Error XS8148. | Convert explicitly: `Number(s) === n` or `String(n) === s`. |
 | `if (n)` with an `int` | Read as `n !== 0`, warning XS2105. A `number` as a condition is accepted only with `--tsc-checked`. | Compare explicitly: `n !== 0`, `n > 0`. |
@@ -38,7 +38,7 @@ mechanisms behind each row.
 
 | pattern | what happens | do this instead |
 |---|---|---|
-| Storing a promise, or `.then` chains | A coroutine and a promise: 97 ns per stored promise against 2 ns for `await f()`; `then` + `await` 155 ns (M4, 10 Nov 2026, design notes). | `await` the call directly when you do not need the promise. |
+| Storing a promise, or `.then` chains | A coroutine and a promise: about 73 ns per kept promise against 0.7–0.9 ns for `await f()` (2 million calls, Apple M4, 12 Nov 2026; Node: about 20 ns for both). | `await` the call directly when you do not need the promise. |
 | A bare `f();` of an async function, as fire-and-forget | It is a direct call: `f` runs to completion before the next line, unlike Node. | Keep the promise (`const p = f();`) when it must run in the background. |
 | `readFileSync` of a large file | The whole file in memory: 977.8 MB peak RSS for a 1 GB log against 1.3 MB streaming (M4, 5 Nov 2026, `bench/results/2026-11-05-Apple-M4-streams.csv`). | Read it as a stream, or by parts with `readStdinParts` from `xisto:io`. |
 | An allocation loop with `await`, `yield`, closures, unions, casts or `unknown` inside | No region: every object is counted and freed one by one. A `try` anywhere in the program rules out dual regions; a `try` in a function rules out stack allocation there. | Keep allocation-heavy loops plain; move the `await` or the closure out. Check with `XISTO_REGION_WHY=1`. |
