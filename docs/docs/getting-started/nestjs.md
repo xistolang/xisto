@@ -90,7 +90,7 @@ is in `.gitignore`, so the packages come back from `xisto.lock`.
 ## Next
 
 - [Projects and packages](../guides/projects-and-packages.md): `xisto add`, `xisto.lock`, other sources.
-- [The language](../language.md): the rules xisto adds to TypeScript.
+- [The language](../language/index.md): the rules xisto adds to TypeScript.
 - The NestJS packages available (and the exact subset each one implements) are listed in
   [xistolang/packages](https://github.com/xistolang/packages); the header comment of each package's `index.ts` says
   what it implements and what it does not.

@@ -1,1 +1,60 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64"><rect x="4" y="4" width="56" height="56" rx="12" fill="#1f3a44"/><path d="M12 40 L52 26 L52 32 L12 46 Z" fill="#3fb8a6"/><path d="M12 30 L52 16 L52 21 L12 35 Z" fill="#6fd3c2"/><path d="M12 50 L52 36 L52 40 L18 52 L12 52 Z" fill="#2a8c80"/><path d="M12 20 L44 9 L52 9 L52 11 L12 25 Z" fill="#a4e6da"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="47 405 415 451" role="img" aria-labelledby="xisto-title xisto-desc">
+<title id="xisto-title">Xisto</title>
+<desc id="xisto-desc">Logo Xisto: X em azul e violeta dentro de emblema hexagonal, três linhas de velocidade, lettering Xisto em azul-marinho.</desc>
+<defs>
+  <linearGradient id="xisto-hex" x1="65" y1="800" x2="437" y2="454" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#8050FA"/>
+    <stop offset="0.31" stop-color="#6152FE"/>
+    <stop offset="0.67" stop-color="#268DFC"/>
+    <stop offset="1" stop-color="#08D2F0"/>
+  </linearGradient>
+  <linearGradient id="xisto-badge" x1="100" y1="516" x2="407" y2="777" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#183048"/>
+    <stop offset="0.54" stop-color="#10243E"/>
+    <stop offset="1" stop-color="#08172D"/>
+  </linearGradient>
+  <linearGradient id="xisto-speed" x1="100" y1="687" x2="211" y2="602" gradientUnits="userSpaceOnUse">
+    <stop stop-color="#8149F6"/>
+    <stop offset="1" stop-color="#388BFA"/>
+  </linearGradient>
+  <linearGradient id="xisto-blue-ribbon" x1="153" y1="725" x2="398" y2="532" gradientUnits="userSpaceOnUse">
+    <stop stop-color="#8C47F7"/>
+    <stop offset="0.44" stop-color="#536CFC"/>
+    <stop offset="1" stop-color="#16C0FB"/>
+  </linearGradient>
+  <linearGradient id="xisto-white-ribbon" x1="184" y1="541" x2="362" y2="714" gradientUnits="userSpaceOnUse">
+    <stop stop-color="#FFFFFF"/>
+    <stop offset="0.45" stop-color="#FCFCFF"/>
+    <stop offset="0.72" stop-color="#F2F5FB"/>
+    <stop offset="1" stop-color="#B7C8E3"/>
+  </linearGradient>
+  <linearGradient id="xisto-cross-shade" x1="277" y1="667" x2="348" y2="729" gradientUnits="userSpaceOnUse">
+    <stop stop-color="#92A7CA" stop-opacity="0.94"/>
+    <stop offset="0.55" stop-color="#E6EBF7" stop-opacity="0.66"/>
+    <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+  </linearGradient>
+  <linearGradient id="xisto-letters" x1="530" y1="535" x2="1170" y2="721" gradientUnits="userSpaceOnUse">
+    <stop stop-color="#0A1B35"/>
+    <stop offset="1" stop-color="#0B1730"/>
+  </linearGradient>
+</defs>
+<g id="xisto-symbol">
+  <!-- Rounded hexagon: continuous shapes, no intersecting border strokes. -->
+  <path fill="url(#xisto-hex)" d="M236 420 Q254 410 272 420 L424 508 Q447 522 447 547 L447 710 Q447 732 427 744 L275 833 Q255 845 234 833 L79 744 Q59 732 59 710 L59 547 Q59 526 79 514 Z"/>
+  <path fill="url(#xisto-badge)" d="M243 439 Q255 432 267 439 L412 523 Q428 533 428 551 L428 709 Q428 725 412 735 L266 817 Q255 825 244 818 L94 734 Q78 725 78 709 L78 551 Q78 537 94 527 Z"/>
+
+  <!-- Continuous blue ribbon, built before white foreground ribbon. -->
+  <path fill="url(#xisto-blue-ribbon)" d="M338 533 L405 533 L238 716 Q228 727 215 727 L150 727 L326 542 Q332 533 338 533 Z"/>
+
+  <!-- Three individually closed, simplified motion streaks. -->
+  <path fill="url(#xisto-speed)" d="M122 605 L196 605 L210 619 L119 619 Q115 619 116 615 L119 609 Q120 605 122 605 Z"/>
+  <path fill="url(#xisto-speed)" d="M113 638 L211 638 L198 652 L109 652 Q106 652 107 648 L110 642 Q111 638 113 638 Z"/>
+  <path fill="url(#xisto-speed)" d="M104 672 L179 672 L166 685 L99 685 Q96 685 98 680 L101 675 Q102 672 104 672 Z"/>
+
+  <!-- White ribbon crossing the blue ribbon. One continuous silhouette avoids tiny edge slivers. -->
+  <path fill="url(#xisto-white-ribbon)" d="M149 533 L217 533 Q228 533 235 542 L405 727 L340 727 Q332 727 325 720 Z"/>
+  <!-- Localized shading on the crossover; fully clipped to the white band's bottom half. -->
+  <clipPath id="xisto-white-clip"><path d="M149 533 L217 533 Q228 533 235 542 L405 727 L340 727 Q332 727 325 720 Z"/></clipPath>
+  <path clip-path="url(#xisto-white-clip)" fill="url(#xisto-cross-shade)" d="M272 675 L322 625 L415 734 L336 744 Z"/>
+</g>
+</svg>

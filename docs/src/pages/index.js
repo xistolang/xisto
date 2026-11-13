@@ -1,36 +1,70 @@
 import Link from '@docusaurus/Link';
 import useBaseUrl from '@docusaurus/useBaseUrl';
 import Layout from '@theme/Layout';
-import CodeBlock from '@theme/CodeBlock';
+import ThemedImage from '@theme/ThemedImage';
+import styles from './index.module.css';
 
-const features = [
-  {title: 'Native executables', text: 'xisto compiles typed TypeScript ahead of time, through C, into one executable that needs nothing installed to run.'},
-  {title: 'Small and quick to start', text: 'No JavaScript runtime to load: a program starts in milliseconds and uses a fraction of the memory of one.'},
-  {title: 'TypeScript as you write it', text: 'Classes, generics, async/await, decorators and Node-style modules, under a few stricter rules that keep the types real.'},
-  {title: 'Same output as Node', text: 'The test suite compares every program’s output with Node’s byte for byte; npm packages are ported with the same API.'},
+const points = [
+  {
+    title: 'Native executables',
+    text: 'Your .ts files are compiled ahead of time into one executable that needs no runtime installed to run.',
+  },
+  {
+    title: 'Low memory, fast startup',
+    text: 'No engine to load and no JIT to warm up: the program starts doing its work at once and keeps only its own data in memory.',
+  },
+  {
+    title: 'Runs your TypeScript',
+    text: 'Classes, generics, async/await, decorators and modules, under a few stricter rules. The same source still runs on Node.',
+  },
 ];
 
 export default function Home() {
   return (
-    <Layout title="xisto" description="An ahead-of-time compiler for typed TypeScript to native executables">
-      <header className="hero hero--xisto">
-        <div className="container">
-          <img className="hero-logo" src={useBaseUrl('/img/logo.svg')} alt="" />
-          <h1 className="hero__title">xisto</h1>
-          <p className="hero__subtitle">Software that respects the hardware it runs on.</p>
-          <p>An ahead-of-time compiler for typed TypeScript: your <code>.ts</code> files become a small, fast-starting native executable.</p>
-          <div className="install">
-            <CodeBlock language="sh">brew install xistolang/tap/xisto</CodeBlock>
+    <Layout
+      title="Familiar syntax. Native performance."
+      description="Xisto: a strict subset of TypeScript, compiled to small native executables.">
+      <header className={styles.hero}>
+        <div className={styles.heroInner}>
+          <ThemedImage
+            className={styles.heroLogo}
+            alt="Xisto"
+            sources={{light: useBaseUrl('/img/logo-full.svg'), dark: useBaseUrl('/img/logo-full-dark.svg')}}
+          />
+          <h1 className={styles.title}>Familiar syntax. Native performance.</h1>
+          <p className={styles.subtitle}>
+            A strict subset of TypeScript, compiled to small native executables.
+          </p>
+          <div className={styles.terminal} role="img" aria-label="Terminal: xisto build server.ts, then ./server">
+            <div className={styles.terminalBar} aria-hidden="true">
+              <span /><span /><span />
+            </div>
+            <pre className={styles.terminalBody}>
+              <code>
+                <span className={styles.prompt}>$</span> xisto build server.ts{'\n'}
+                <span className={styles.prompt}>$</span> ./server
+              </code>
+            </pre>
           </div>
-          <div className="buttons">
-            <Link className="button button--primary button--lg" to="/docs/getting-started/install">Get started</Link>
-            <Link className="button button--secondary button--lg" href="https://github.com/xistolang/xisto">GitHub</Link>
+          <div className={styles.buttons}>
+            <Link className="button button--primary button--lg" to="/docs/getting-started/install">
+              Get started
+            </Link>
+            <Link className="button button--secondary button--lg" to="/docs/benchmarks">
+              View benchmarks
+            </Link>
           </div>
+          <p className={styles.manifesto}>Software that respects the hardware it runs on.</p>
         </div>
       </header>
-      <main className="container">
-        <div className="features">
-          {features.map((f) => (<div key={f.title}><h3>{f.title}</h3><p>{f.text}</p></div>))}
+      <main className={styles.strip}>
+        <div className={styles.grid}>
+          {points.map((p) => (
+            <section key={p.title} className={styles.card}>
+              <h2 className={styles.cardTitle}>{p.title}</h2>
+              <p className={styles.cardText}>{p.text}</p>
+            </section>
+          ))}
         </div>
       </main>
     </Layout>

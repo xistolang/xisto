@@ -4,12 +4,16 @@
 import {themes as prismThemes} from 'prism-react-renderer';
 import fs from 'node:fs';
 
+// code blocks: high contrast on the site's surfaces (light: white, dark: #0F1526)
+const lightCode = {...prismThemes.github, plain: {...prismThemes.github.plain, color: '#151B2A', backgroundColor: '#FFFFFF'}};
+const darkCode = {...prismThemes.oneDark, plain: {color: '#E6EAF2', backgroundColor: '#0F1526'}};
+
 // released versions (newest first), written by `docusaurus docs:version` in the release workflow
 const released = fs.existsSync('./versions.json') ? JSON.parse(fs.readFileSync('./versions.json', 'utf8')) : [];
 
 /** @type {import('@docusaurus/types').Config} */
 const config = {
-  title: 'xisto',
+  title: 'Xisto',
   tagline: 'Software that respects the hardware it runs on.',
   favicon: 'img/favicon.svg',
   future: {v4: true},
@@ -54,24 +58,26 @@ const config = {
     ({
       colorMode: {defaultMode: 'dark', respectPrefersColorScheme: true},
       navbar: {
-        title: 'xisto',
-        logo: {alt: 'xisto', src: 'img/logo.svg'},
+        title: 'Xisto',
+        logo: {alt: 'Xisto', src: 'img/logo.svg', srcDark: 'img/logo.svg', width: 32, height: 32},
         items: [
           {type: 'docSidebar', sidebarId: 'docs', position: 'left', label: 'Docs'},
+          {to: '/docs/benchmarks', label: 'Benchmarks', position: 'left'},
           {type: 'docsVersionDropdown', position: 'right'},
           {href: 'https://github.com/xistolang/xisto', label: 'GitHub', position: 'right'},
           {href: 'https://github.com/xistolang/xisto/releases', label: 'Releases', position: 'right'},
         ],
       },
       footer: {
-        style: 'dark',
+        style: 'light',
         links: [
-          {title: 'Docs', items: [{label: 'Getting started', to: '/docs/getting-started/install'}, {label: 'The language', to: '/docs/language'}, {label: 'CLI reference', to: '/docs/reference/cli'}]},
+          {title: 'Docs', items: [{label: 'Getting started', to: '/docs/getting-started/install'}, {label: 'The language', to: '/docs/language'}, {label: 'Benchmarks', to: '/docs/benchmarks'}, {label: 'CLI reference', to: '/docs/reference/cli'}]},
+          {title: 'About', items: [{label: 'Why Xisto', to: '/docs/why'}, {label: 'Divergences from TypeScript', to: '/docs/language/divergences'}, {label: 'Contributing', to: '/docs/contributing'}]},
           {title: 'Project', items: [{label: 'GitHub', href: 'https://github.com/xistolang/xisto'}, {label: 'Releases', href: 'https://github.com/xistolang/xisto/releases'}, {label: 'Packages', href: 'https://github.com/xistolang/packages'}, {label: 'Report an issue', href: 'https://github.com/xistolang/xisto/issues'}]},
         ],
-        copyright: `Copyright © 2026 The Xisto Authors. xisto is licensed under Apache-2.0 WITH LLVM-exception.`,
+        copyright: `Copyright © 2026 The Xisto Authors. Xisto is licensed under Apache-2.0 WITH LLVM-exception.`,
       },
-      prism: {theme: prismThemes.github, darkTheme: prismThemes.dracula, additionalLanguages: ['bash', 'json']},
+      prism: {theme: lightCode, darkTheme: darkCode, additionalLanguages: ['bash', 'json']},
     }),
 };
 

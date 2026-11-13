@@ -1,31 +1,279 @@
-/* xisto colours (the logo's slate and green) */
+/*
+ * Xisto visual identity.
+ * Fonts are self-hosted from /fonts (SIL Open Font License 1.1, see the LICENSE next to each family):
+ * nothing is loaded from a font service or a CDN.
+ */
+
+@font-face {
+  font-family: 'Space Grotesk';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 300 700;
+  src: url('/fonts/space-grotesk/space-grotesk-latin-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Space Grotesk';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 300 700;
+  src: url('/fonts/space-grotesk/space-grotesk-latin-ext-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url('/fonts/inter/inter-latin-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url('/fonts/inter/inter-latin-ext-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 800;
+  src: url('/fonts/jetbrains-mono/jetbrains-mono-latin-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 800;
+  src: url('/fonts/jetbrains-mono/jetbrains-mono-latin-ext-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+/* ---------- tokens: light ---------- */
 :root {
-  --ifm-color-primary: #1f8a7c;
-  --ifm-color-primary-dark: #1c7c70;
-  --ifm-color-primary-darker: #1a7569;
-  --ifm-color-primary-darkest: #156157;
-  --ifm-color-primary-light: #229888;
-  --ifm-color-primary-lighter: #239f8f;
-  --ifm-color-primary-lightest: #27b3a1;
-  --ifm-code-font-size: 95%;
-  --ifm-font-family-base: Inter, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  /* palette */
+  --xisto-graphite: #151b2a;
+  --xisto-purple: #6537d6;
+  --xisto-purple-hover: #5128b8;
+  --xisto-violet: #a78bfa;
+  --xisto-slate: #64748b;
+  --xisto-cloud: #f6f7fb;
+  --xisto-midnight: #0b1020;
+
+  --xisto-bg: var(--xisto-cloud);
+  --xisto-surface: #ffffff;
+  --xisto-border: #e2e6ef;
+  --xisto-text: var(--xisto-graphite);
+  --xisto-text-2: var(--xisto-slate);
+  --xisto-accent: var(--xisto-purple);
+  --xisto-terminal-bg: #151b2a;
+  --xisto-terminal-text: #f8fafc;
+  --xisto-terminal-dim: #a4aec4;
+
+  --xisto-font-heading: 'Space Grotesk', Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+  --xisto-ease: 160ms ease;
+
+  /* Infima */
+  --ifm-color-primary: #6537d6;
+  --ifm-color-primary-dark: #5b2fc9;
+  --ifm-color-primary-darker: #5128b8;
+  --ifm-color-primary-darkest: #43219a;
+  --ifm-color-primary-light: #744cdb;
+  --ifm-color-primary-lighter: #7c56de;
+  --ifm-color-primary-lightest: #9375e4;
+
+  --ifm-background-color: var(--xisto-bg);
+  --ifm-background-surface-color: var(--xisto-surface);
+  --ifm-font-color-base: var(--xisto-text);
+  --ifm-font-color-secondary: var(--xisto-text-2);
+  --ifm-heading-color: var(--xisto-graphite);
+  --ifm-link-color: var(--xisto-purple);
+  --ifm-link-hover-color: var(--xisto-purple-hover);
+  --ifm-toc-border-color: var(--xisto-border);
+  --ifm-hr-border-color: var(--xisto-border);
+  --ifm-table-border-color: var(--xisto-border);
+  --ifm-color-emphasis-300: var(--xisto-border);
+
+  --ifm-font-family-base: Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+  --ifm-heading-font-family: var(--xisto-font-heading);
+  --ifm-font-family-monospace: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --ifm-font-size-base: 16px;
+  --ifm-line-height-base: 1.65;
+  --ifm-heading-font-weight: 600;
+  --ifm-h1-font-size: 3rem;      /* 48 px */
+  --ifm-h2-font-size: 2.25rem;   /* 36 px */
+  --ifm-h3-font-size: 1.5rem;    /* 24 px */
+  --ifm-code-font-size: 0.875em;
+  --ifm-container-width-xl: 1200px;
+  --ifm-spacing-horizontal: 1.5rem;
+
+  --ifm-navbar-background-color: rgba(246, 247, 251, 0.92);
+  --ifm-navbar-shadow: none;
+  --ifm-navbar-link-color: var(--xisto-graphite);
+  --ifm-footer-background-color: var(--xisto-surface);
+  --ifm-footer-color: var(--xisto-text-2);
+  --ifm-footer-link-color: var(--xisto-text-2);
+  --ifm-footer-link-hover-color: var(--xisto-purple);
+  --ifm-footer-title-color: var(--xisto-graphite);
+
+  --ifm-code-background: #eceef5;
+  --prism-background-color: #ffffff;
+  --docusaurus-highlighted-code-line-bg: rgba(101, 55, 214, 0.1);
+
+  --ifm-button-border-radius: 10px;
+  --ifm-card-border-radius: 14px;
+  --ifm-global-radius: 10px;
+  --ifm-transition-fast: 160ms;
+  --ifm-transition-slow: 200ms;
 }
+
+/* ---------- tokens: dark (the default theme) ---------- */
 [data-theme='dark'] {
-  --ifm-color-primary: #4fc7b4;
-  --ifm-color-primary-dark: #3bbfab;
-  --ifm-color-primary-darker: #38b4a1;
-  --ifm-color-primary-darkest: #2e9485;
-  --ifm-color-primary-light: #66cebe;
-  --ifm-color-primary-lighter: #71d2c3;
-  --ifm-color-primary-lightest: #93ddd1;
-  --ifm-background-color: #15191b;
-  --ifm-navbar-background-color: #111416;
-  --ifm-footer-background-color: #111416;
-  --ifm-background-surface-color: #1a1f22;
+  --xisto-bg: var(--xisto-midnight);
+  --xisto-surface: #141b2b;
+  --xisto-border: #293046;
+  --xisto-text: #f8fafc;
+  --xisto-text-2: #a4aec4;
+  --xisto-accent: var(--xisto-violet);
+  --xisto-terminal-bg: #141b2b;
+
+  --ifm-color-primary: #a78bfa;
+  --ifm-color-primary-dark: #9672f9;
+  --ifm-color-primary-darker: #8d66f8;
+  --ifm-color-primary-darkest: #7240f7;
+  --ifm-color-primary-light: #b8a4fb;
+  --ifm-color-primary-lighter: #c1b0fc;
+  --ifm-color-primary-lightest: #dcd2fd;
+  --ifm-color-primary-contrast-foreground: #0b1020;
+
+  --ifm-background-color: var(--xisto-bg);
+  --ifm-background-surface-color: var(--xisto-surface);
+  --ifm-font-color-base: var(--xisto-text);
+  --ifm-font-color-secondary: var(--xisto-text-2);
+  --ifm-heading-color: #f8fafc;
+  --ifm-link-color: #c4b5fd;
+  --ifm-link-hover-color: #ddd6fe;
+  --ifm-toc-border-color: var(--xisto-border);
+  --ifm-hr-border-color: var(--xisto-border);
+  --ifm-table-border-color: var(--xisto-border);
+  --ifm-color-emphasis-300: var(--xisto-border);
+
+  --ifm-navbar-background-color: rgba(11, 16, 32, 0.92);
+  --ifm-navbar-link-color: #f8fafc;
+  --ifm-footer-background-color: #0b1020;
+  --ifm-footer-color: var(--xisto-text-2);
+  --ifm-footer-link-color: var(--xisto-text-2);
+  --ifm-footer-link-hover-color: #c4b5fd;
+  --ifm-footer-title-color: #f8fafc;
+
+  --ifm-code-background: #1b2337;
+  --prism-background-color: #0f1526;
+  --docusaurus-highlighted-code-line-bg: rgba(167, 139, 250, 0.14);
 }
-.hero--xisto { padding: 4rem 0 3rem; text-align: center; }
-.hero--xisto img.hero-logo { width: 96px; height: 96px; }
-.hero--xisto .buttons { display: flex; gap: 0.75rem; justify-content: center; flex-wrap: wrap; margin-top: 1.5rem; }
-.install { max-width: 36rem; margin: 1.5rem auto 0; text-align: left; }
-.features { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1.5rem; padding: 2rem 0 3rem; }
-.features h3 { margin-bottom: 0.4rem; }
+
+/* ---------- base ---------- */
+body {
+  background: var(--ifm-background-color);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+h1, h2, h3, h4, h5, h6,
+.navbar__title,
+.hero__title,
+.footer__title {
+  font-family: var(--xisto-font-heading);
+  letter-spacing: -0.035em;
+}
+h1 { font-weight: 700; }
+h2, h3 { font-weight: 600; }
+h4, h5, h6 { font-weight: 500; }
+@media (min-width: 997px) {
+  :root { --ifm-h2-font-size: 2.5rem; } /* 40 px */
+}
+@media (max-width: 996px) {
+  :root { --ifm-h1-font-size: 2.25rem; --ifm-h2-font-size: 1.75rem; }
+}
+.markdown { font-size: 1.0625rem; } /* 17 px */
+.markdown > h2 { margin-top: 3rem; }
+
+/* links */
+a { transition: color var(--xisto-ease); }
+
+/* ---------- navbar ---------- */
+.navbar {
+  border-bottom: 1px solid var(--xisto-border);
+  backdrop-filter: saturate(140%) blur(8px);
+}
+.navbar__title { font-weight: 700; font-size: 1.25rem; color: var(--ifm-heading-color); }
+.navbar__logo { height: 2rem; margin-right: 0.625rem; }
+.navbar__link { font-weight: 500; }
+
+/* ---------- footer ---------- */
+.footer { border-top: 1px solid var(--xisto-border); padding: 4rem 0 3rem; }
+.footer__copyright { color: var(--xisto-text-2); font-size: 0.875rem; }
+
+/* ---------- buttons: 48 px, radius 10, flat ---------- */
+.button {
+  border-radius: 10px;
+  font-weight: 600;
+  transition: background-color var(--xisto-ease), border-color var(--xisto-ease), color var(--xisto-ease);
+}
+.button--lg {
+  min-height: 48px;
+  padding: 0 1.5rem;
+  display: inline-flex;
+  align-items: center;
+  font-size: 1rem;
+}
+.button--primary { --ifm-button-background-color: var(--xisto-purple); --ifm-button-border-color: var(--xisto-purple); color: #fff; }
+.button--primary:hover { --ifm-button-background-color: var(--xisto-purple-hover); --ifm-button-border-color: var(--xisto-purple-hover); color: #fff; }
+[data-theme='dark'] .button--primary { --ifm-button-background-color: var(--xisto-violet); --ifm-button-border-color: var(--xisto-violet); color: var(--xisto-midnight); }
+[data-theme='dark'] .button--primary:hover { --ifm-button-background-color: #c4b5fd; --ifm-button-border-color: #c4b5fd; color: var(--xisto-midnight); }
+.button--outline.button--secondary,
+.button--secondary {
+  --ifm-button-background-color: transparent;
+  --ifm-button-border-color: var(--xisto-border);
+  --ifm-button-color: var(--ifm-font-color-base);
+  color: var(--ifm-font-color-base);
+}
+.button--secondary:hover { --ifm-button-border-color: var(--xisto-accent); color: var(--ifm-font-color-base); }
+
+/* ---------- code ---------- */
+code { border: 1px solid var(--xisto-border); border-radius: 6px; padding: 0.1em 0.35em; }
+pre code, .prism-code code { border: 0; padding: 0; }
+.theme-code-block {
+  border: 1px solid var(--xisto-border);
+  border-radius: 12px;
+  box-shadow: none;
+  font-size: 0.875rem; /* 14 px */
+}
+.prism-code { font-size: 0.8125rem; line-height: 1.6; } /* 13 px */
+
+/* ---------- cards, tables, admonitions ---------- */
+.card {
+  border: 1px solid var(--xisto-border);
+  border-radius: 14px;
+  box-shadow: 0 1px 2px rgba(11, 16, 32, 0.04);
+  background: var(--xisto-surface);
+}
+.markdown table { border-radius: 10px; overflow: hidden; display: table; width: 100%; }
+.markdown table thead tr { background: var(--xisto-surface); }
+.markdown table tr:nth-child(2n) { background: transparent; }
+.alert { border-radius: 12px; }
+
+/* sidebar */
+.menu__link { border-radius: 8px; font-size: 0.9375rem; }
+.menu__link--active:not(.menu__link--sublist) { font-weight: 600; }
+
+/* ---------- motion ---------- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition-duration: 0ms !important;
+    animation-duration: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+}
