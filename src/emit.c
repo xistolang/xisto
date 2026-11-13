@@ -4515,10 +4515,9 @@ static bool ln_plan_n(Func *f, int n) {
     for (int r = 0; r < ln_nr && !work; r++) for (int j = 0; j < ln_r[r].ncls; j++) if (ln_has_op(ln_rhs(ln_r[r].cls[j][0]))) work = true;
     return work;
 }
-/* The lanes' order in the vector is free (each copy computes the same thing in any lane). Bits packed one per
-   copy with the first copy in the highest bit (if (tr0 + ti0 <= 4) b |= 128; ... b |= 1: a PBM row) come out of
-   a vector comparison in one instruction (movmskpd, the lowest bit from the first element) when the first copy is
-   the last element: then the copies go in the vector last to first. */
+/* (The lanes go in the vector in the order of the copies, the memory order of what they load: the copies put
+   last to first, so that bits packed with the first copy highest come out of one movmskpd on x86, cost a reversal
+   of every load on the Graviton2, 2,5% of mandelbrot's CPU there, and gained nothing measurable on the Xeon.) */
 static int ln_lane_of_cond(Expr *e) { /* the one lane the names of e read (-1: none, -2: several) */
     if (!e) return -1;
     if (e->kind == E_IDENT) { int k; return e->cname && ln_find_g(e->cname, &k) >= 0 ? k : -1; }
@@ -4528,23 +4527,6 @@ static int ln_lane_of_cond(Expr *e) { /* the one lane the names of e read (-1: n
     if (a == -1) return b;
     if (b == -1) return a;
     return a == b ? a : -2;
-}
-static void ln_bits_vote(Stmt *s, int *fwd, int *rev) {
-    if (!s) return;
-    if (s->kind == S_IF && !s->else_body && s->body) {
-        Stmt *b = s->body;
-        if (b->kind == S_BLOCK && b->stmts.len == 1) b = b->stmts.items[0];
-        Expr *a = b->kind == S_EXPR ? b->expr : NULL;
-        int k = ln_lane_of_cond(s->cond);
-        if (a && k >= 0 && a->kind == E_ASSIGN && a->op == TK_PIPE_ASSIGN && a->rhs && a->rhs->kind == E_NUMBER && a->rhs->is_int_lit) {
-            long long v = a->rhs->ival;
-            if (v == 1LL << k) (*fwd)++;
-            else if (v == 1LL << (ln_n - 1 - k)) (*rev)++;
-        }
-    }
-    ln_bits_vote(s->for_init, fwd, rev); ln_bits_vote(s->body, fwd, rev); ln_bits_vote(s->else_body, fwd, rev);
-    for (int i = 0; i < s->stmts.len; i++) ln_bits_vote(s->stmts.items[i], fwd, rev);
-    for (int i = 0; i < s->ncases; i++) ln_bits_vote(s->cases[i].body, fwd, rev);
 }
 /* decides the lanes of f (ln_on), before its body is emitted */
 static void ln_plan(Func *f) {
@@ -4556,11 +4538,6 @@ static void ln_plan(Func *f) {
     if (!ln_on) return;
     ln_fn = f;
     for (int g = 0; g < ln_ng; g++) ln_g[g].vname = xs_sprintf("lv_%s", ln_g[g].m[0]);
-    int fwd = 0, rev = 0;
-    ln_bits_vote(f->body, &fwd, &rev);
-    if (rev > fwd && !getenv("XISTO_LANES_FWD")) /* (the run statements keep their lane-0 copy: only the order of the elements changes) */
-        for (int g = 0; g < ln_ng; g++)
-            for (int k = 0; k < ln_n / 2; k++) { const char *t = ln_g[g].m[k]; ln_g[g].m[k] = ln_g[g].m[ln_n - 1 - k]; ln_g[g].m[ln_n - 1 - k] = t; }
     LnState *keep = malloc(sizeof *keep);
     *keep = ln_scratch;
     ln_cur = keep;
