@@ -145,3 +145,28 @@ const TB2 = grid(6, 17, (i, j) => ((i + 3 * j) % 5) / 4);
 TB2[4] = TB2[1];
 trmm(6, 17, 0.75, grid(6, 6, (i, j) => (i * j + 1) / 7), TB2);
 console.log("trmm shared rows", show(TB2));
+
+// T /= g after the sum, and the mirror Z[j][c] = T (covariance); the mean's loop: mean[j] /= n
+function cov(m: int, n: int, fn: number, data: number[][], C: number[][], mean: number[]): void {
+  for (let j = 0; j < m; j++) {
+    mean[j] = 0.0;
+    for (let i = 0; i < n; i++) mean[j] += data[i][j];
+    mean[j] /= fn;
+  }
+  for (let i = 0; i < m; i++)
+  for (let j = i; j < m; j++) {
+    C[i][j] = 0.0;
+    for (let k = 0; k < n; k++) C[i][j] += data[k][i] * data[k][j];
+    C[i][j] /= fn - 1.0;
+    C[j][i] = C[i][j];
+  }
+}
+const CD = grid(11, 14, (i, j) => ((i * 3 + j * 7) % 10) / 4);
+const CC = grid(14, 14, (i, j) => 0);
+const CM: number[] = new Array<number>(14).fill(0);
+cov(14, 11, 11, CD, CC, CM);
+console.log("cov", show(CC), CM.map((x) => x.toFixed(6)).join(","));
+// the data's rows are the matrix's: the old loop
+const CC2 = grid(14, 14, (i, j) => ((i + j) % 3) / 2);
+cov(14, 11, 11, CC2, CC2, new Array<number>(14).fill(0));
+console.log("cov shared", show(CC2));

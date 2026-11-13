@@ -8282,7 +8282,8 @@ static Expr *uj_J0, *uj_JL, *uj_K0, *uj_KL, *uj_e0;
 static const char *uj_kname;
 static int uj_prekind; /* the lanes' first values: 0 T, 1 e0, 2 T * e0 */
 static const char *uj_w; /* ludcmp's form: `w = T (or e0); for k w op= f; T = w`, w a local number (NULL: T itself) */
-static Expr *uj_fin; /* trmm's `T = g` (or T *= g) after the sum: g of T (the lane's sum) and loads without the counter */
+static Expr *uj_fin; /* trmm's `T = g` (or T *= g, T /= g) after the sum: g of T (the lane's sum) and loads without the counter */
+static Expr *uj_mir; /* covariance's mirror `Z[j][c] = T` after it: Z's rows by j, c invariant (one table of them) */
 #define UJ_FIN_GRP 9 /* (the group of its loads) */
 static bool uj_match(Stmt *s) {
     if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_UJAM")) return false;
@@ -8306,7 +8307,7 @@ static bool uj_match(Stmt *s) {
         UjPost *q = &uj_post[nuj_post++];
         memset(q, 0, sizeof *q);
         q->loop = st[p];
-        if (st[p]->kind == S_EXPR && ns - at == 1) continue; /* (maybe the T = w of the sum in a local) */
+        if (st[p]->kind == S_EXPR) continue; /* (T = w of the sum in a local, a statement on T, its mirror: below) */
         if (!uj_counted(st[p], &q->ctr, &q->lo, &q->hi)) return false;
     }
     if (!uj_bound_ok(uj_JL) || !uj_bound_ok(uj_K0) || !uj_bound_ok(uj_KL) || bce_writes(uj_kloop->body, k)) return false;
@@ -8330,14 +8331,28 @@ static bool uj_match(Stmt *s) {
     uj_prekind = 0;
     uj_e0 = NULL;
     uj_fin = NULL;
-    if (nuj_post && uj_post[0].loop->kind == S_EXPR) { /* T = g, or T *= g, after the sum */
-        Expr *f = uj_post[0].loop->expr;
-        if (!f || f->kind != E_ASSIGN || (f->op != TK_ASSIGN && f->op != TK_STAR_ASSIGN) || !uj_is_t(f->lhs)) return false;
-        uj_grp = UJ_FIN_GRP;
-        bool ok = uj_expr(f->rhs, false);
-        uj_grp = 0;
-        if (!ok) return false;
-        uj_fin = f;
+    uj_mir = NULL;
+    for (int p = 0; p < nuj_post; p++) if ((uj_post[p].loop->kind == S_EXPR) != (uj_post[0].loop->kind == S_EXPR)) return false; /* (not mixed) */
+    if (nuj_post && uj_post[0].loop->kind == S_EXPR) { /* [T = g | T *= g | T /= g;] [Z[j][c] = T;] after the sum */
+        int q = 0;
+        Expr *f = uj_post[q].loop->expr;
+        if (f && f->kind == E_ASSIGN && (f->op == TK_ASSIGN || f->op == TK_STAR_ASSIGN || f->op == TK_SLASH_ASSIGN) && uj_is_t(f->lhs)) {
+            uj_grp = UJ_FIN_GRP;
+            bool ok = uj_expr(f->rhs, false);
+            uj_grp = 0;
+            if (!ok) return false;
+            uj_fin = f;
+            q++;
+        }
+        if (q < nuj_post) { /* the mirror */
+            Expr *m = uj_post[q].loop->expr, *z = m && m->kind == E_ASSIGN && m->op == TK_ASSIGN ? m->lhs : NULL;
+            if (!z || z->kind != E_INDEX || z->builtin.cfn || !z->type || z->type->kind != TY_NUMBER || !uj_is_t(m->rhs) || !z->lhs ||
+                z->lhs->kind != E_INDEX || z->lhs->builtin.cfn || !z->lhs->rhs || z->lhs->rhs->kind != E_IDENT || !z->lhs->rhs->cname ||
+                strcmp(z->lhs->rhs->cname, j) != 0 || !uj_inv_base(z->lhs->lhs) || uj_idx(z->rhs) != 'i' || !uj_num_arr(z->lhs->type)) return false;
+            uj_mir = z;
+            q++;
+        }
+        if (q != nuj_post) return false;
         nuj_post = 0;
     }
     if (uj_pre) {
@@ -8468,7 +8483,7 @@ static bool uj_emit_loop(Stmt *s) {
     Expr *t = uj_t;
     const char *kname = uj_kname;
     Stmt *kloop = uj_kloop;
-    Expr *fin = uj_fin;
+    Expr *fin = uj_fin, *mir = uj_mir;
     int prekind = uj_prekind;
     Expr *e0 = uj_e0;
     const char *w = uj_w;
@@ -8496,6 +8511,24 @@ static bool uj_emit_loop(Stmt *s) {
                         "if ((char *)d_ < ys%d_) ys%d_ = (char *)d_; if ((char *)(d_ + l_) > ye%d_) ye%d_ = (char *)(d_ + l_); yt%d_%d_[r_] = d_; } } } ",
                    id, p + 1, id, p + 1, id, p, id, p + 1, id, p, id, id, p + 1, id, p + 1, id, id, id, id, id, id, id, id, id, p);
     }
+    /* the mirror's rows Z[j] for j in [jj, jl): a table; a row on T's block only where it writes T's own element (j = c,
+       covariance's cov[i][i]); the span of them, against every block read below */
+    buf_printf(out, "double **zt%d_ = NULL; char *zs%d_ = (char *)-1, *ze%d_ = NULL; (void)zt%d_; (void)zs%d_; (void)ze%d_; ", id, id, id, id, id, id);
+    if (mir) {
+        Expr *Z = mir->lhs->lhs;
+        char *c = bce_raw(mir->rhs);
+        buf_puts(out, "if (jok_) { xs_arr_ref *q_ = NULL; ");
+        if (Z->kind == E_IDENT) buf_printf(out, "q_ = (xs_arr_ref *)(%s); ", ren(Z->cname));
+        else { uj_row_of(Z, "p_"); buf_puts(out, "q_ = (xs_arr_ref *)p_; "); }
+        buf_printf(out, "if (!jok_ || !q_ || jl%d_ - 1 >= (int64_t)q_->len) jok_ = false; "
+                        "else { zt%d_ = malloc((size_t)jl%d_ * sizeof(double *)); if (!zt%d_) xs_panic(\"out of memory\"); "
+                        "for (int64_t r_ = jj%d_; r_ < jl%d_ && jok_; r_++) { xs_arr_num *w_ = (xs_arr_num *)q_->data[r_]; "
+                        "if (!w_) { jok_ = false; break; } double *d_ = w_->data; int64_t l_ = (int64_t)w_->len; "
+                        "if ((%s) < 0 || (%s) >= l_) jok_ = false; "
+                        "if (d_ < td%d_ + tl%d_ && td%d_ < d_ + l_ && !(d_ == td%d_ && r_ == (%s))) jok_ = false; "
+                        "if ((char *)d_ < zs%d_) zs%d_ = (char *)d_; if ((char *)(d_ + l_) > ze%d_) ze%d_ = (char *)(d_ + l_); zt%d_[r_] = d_; } } } ",
+                   id, id, id, id, id, id, c, c, id, id, id, id, c, id, id, id, id, id);
+    }
     /* T's row against the span of Y's rows */
     buf_printf(out, "if (jok_ && nyr%d_ && (char *)td%d_ < ye%d_ && ys%d_ < (char *)(td%d_ + tl%d_)) jok_ = false; ", id, id, id, id, id, id);
     for (int i = 0; i < n; i++) {
@@ -8516,6 +8549,7 @@ static bool uj_emit_loop(Stmt *s) {
             else if (ix == 'j') buf_printf(out, "if (jl%d_ - 1 >= l_) jok_ = false; ", id);
             else { char *c = bce_raw(e->rhs); buf_printf(out, "if ((%s) < 0 || (%s) >= l_) jok_ = false; ", c, c); }
             /* the same block as T: only with the indexes apart */
+            if (mir) buf_printf(out, "if ((char *)d_ < ze%d_ && zs%d_ < (char *)(d_ + l_)) jok_ = false; ", id, id);
             buf_printf(out, "if (d_ < td%d_ + tl%d_ && td%d_ < d_ + l_) { ", id, id, id);
             if (ix == 'k') buf_printf(out, "if (d_ != td%d_ || !(%s <= %s || %s <= %s || %s <= %s)) jok_ = false; ", id, ce, cs, ce, W0, W1, cs);
             else if (ix == 'i') { char *c = bce_raw(e->rhs); buf_printf(out, "if (d_ != td%d_ || ((%s) >= %s && (%s) < %s)) jok_ = false; ", id, c, W0, c, W1); }
@@ -8538,6 +8572,7 @@ static bool uj_emit_loop(Stmt *s) {
                        cs, ce, id, i, ce, id, i, cs, ce);
             if (ix == 'j') buf_printf(out, "if (jl%d_ - 1 >= l_) jok_ = false; ", id);
             else { char *c = bce_raw(e->rhs); buf_printf(out, "if ((%s) < 0 || (%s) >= l_) jok_ = false; ", c, c); uj_span_test(id, c, xs_sprintf("(%s) + 1", c)); }
+            if (mir) buf_printf(out, "if ((char *)d_ < ze%d_ && zs%d_ < (char *)(d_ + l_)) jok_ = false; ", id, id);
             buf_printf(out, "if (d_ < td%d_ + tl%d_ && td%d_ < d_ + l_) jok_ = false; jt%d_%d_[r_] = d_; } } } ", id, id, id, id, i);
         }
     }
@@ -8589,14 +8624,15 @@ static bool uj_emit_loop(Stmt *s) {
         uj_grp = UJ_FIN_GRP;
         for (int u = 0; u < U; u++) {
             uj_lane = u;
-            buf_printf(out, "a%d_ = %s", u, fin->op == TK_STAR_ASSIGN ? xs_sprintf("a%d_ * ", u) : "");
+            buf_printf(out, "a%d_ = %s(", u, fin->op == TK_STAR_ASSIGN ? xs_sprintf("a%d_ * ", u) : fin->op == TK_SLASH_ASSIGN ? xs_sprintf("a%d_ / ", u) : "");
             uj_emit(fin->rhs);
-            buf_puts(out, "; ");
+            buf_puts(out, "); ");
         }
         uj_grp = 0;
     }
     for (int u = 0; u < U; u++) buf_printf(out, "td%d_[jj%d_ + %d] = a%d_; ", id, id, u, u);
     if (w) buf_printf(out, "%s = a%d_; ", ren(w), U - 1); /* (w as the last j left it) */
+    if (mir) for (int u = 0; u < U; u++) buf_printf(out, "zt%d_[jj%d_ + %d][%s] = a%d_; ", id, id, u, bce_raw(mir->rhs), u);
     for (int p = 0; p < np; p++) { /* each lane's column of Y, after its sum (T is that sum) */
         uj_grp = p + 1; uj_k = post[p].ctr;
         buf_printf(out, "for (int64_t kk%d_%d_ = cs%d_%d_; kk%d_%d_ < ce%d_%d_; kk%d_%d_++) { ", id, p + 1, id, p + 1, id, p + 1, id, p + 1, id, p + 1);
@@ -8612,6 +8648,7 @@ static bool uj_emit_loop(Stmt *s) {
     buf_puts(out, "} ");
     for (int i = 0; i < n; i++) if (ld[i].krow && !ld[i].self) buf_printf(out, "free(jt%d_%d_); ", id, i);
     for (int p = 0; p < np; p++) buf_printf(out, "free(yt%d_%d_); ", id, p);
+    if (mir) buf_printf(out, "free(zt%d_); ", id);
     /* the rest, and everything when the guard failed: the loop as it was, from jj */
     Stmt *fi = s->for_init;
     Stmt fi2 = *fi;
