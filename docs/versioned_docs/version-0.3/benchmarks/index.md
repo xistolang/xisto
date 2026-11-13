@@ -28,7 +28,7 @@ Fastest matching variant on each side, median of 3, 13 Nov 2026, `XISTO_CPU=nati
 | Xeon E5-2686 v4 (2 vCPUs) | 9 | 1 (spectral-norm) | none | at or below Rust on all 10 |
 | Graviton2 (2 vCPUs) | 8 | 2 (spectral-norm, mandelbrot) | none | below Rust on all 10 |
 
-The per-problem tables are on [xisto vs Rust](./benchmarks-game/vs-rust.md).
+The per-problem tables are on [Xisto vs Rust](./benchmarks-game/vs-rust.md).
 
 ## Benchmarks Game against Node and Bun
 
@@ -37,7 +37,7 @@ Bun 1.4.4, median of 3, on the Apple M4, the Xeon and the Graviton2. xisto wins 
 time and on memory: from 1.3× (regex-redux against Bun on the M4) to 200× (k-nucleotide against Node on the M4).
 Most xisto variants use every core while the Node programs use one, so the CPU columns are the fairer comparison;
 xisto uses less CPU on every row but regex-redux against Bun on the M4 (0.37 s against 0.34 s). The tables are on
-[xisto vs Node](./benchmarks-game/vs-node.md) and [xisto vs Bun](./benchmarks-game/vs-bun.md).
+[Xisto vs Node](./benchmarks-game/vs-node.md) and [Xisto vs Bun](./benchmarks-game/vs-bun.md).
 
 ## Servers
 

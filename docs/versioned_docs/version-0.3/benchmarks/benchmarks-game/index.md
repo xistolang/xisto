@@ -14,9 +14,9 @@ through `xisto:parallel` or `worker_threads`. Every output is checked bit for bi
 
 | comparison | Apple M4 | Xeon E5-2686 v4 | Graviton2 | page |
 |---|---|---|---|---|
-| xisto vs Rust | — | 9 wins, 1 tie | 8 wins, 2 ties | [xisto vs Rust](./vs-rust.md) |
-| xisto vs Node 26 | 10 wins | 9 wins (fasta not scored) | 9 wins (fasta not scored) | [xisto vs Node](./vs-node.md) |
-| xisto vs Bun 1.4 | 10 wins | 9 wins (reverse-complement not scored) | 10 wins | [xisto vs Bun](./vs-bun.md) |
+| Xisto vs Rust | — | 9 wins, 1 tie | 8 wins, 2 ties | [Xisto vs Rust](./vs-rust.md) |
+| Xisto vs Node 26 | 10 wins | 9 wins (fasta not scored) | 9 wins (fasta not scored) | [Xisto vs Node](./vs-node.md) |
+| Xisto vs Bun 1.4 | 10 wins | 9 wins (reverse-complement not scored) | 10 wins | [Xisto vs Bun](./vs-bun.md) |
 
 No problem is lost anywhere, and xisto's peak memory is at or below the other side's on every scored row. Each page
 has the setup of its test, the tables per machine and the notes on each problem.

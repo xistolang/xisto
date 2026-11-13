@@ -1,9 +1,9 @@
 ---
-title: xisto vs Rust
+title: Xisto vs Rust
 sidebar_position: 1
 ---
 
-# xisto vs Rust
+# Xisto vs Rust
 
 13 Nov 2026, main `e5fb066`, on the two AWS VMs. Rust is the language the Benchmarks Game's fastest programs are
 usually written in, so this is the comparison that says whether xisto's generated C keeps up with a systems

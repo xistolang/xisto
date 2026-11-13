@@ -1,9 +1,9 @@
 ---
-title: xisto vs Bun
+title: Xisto vs Bun
 sidebar_position: 3
 ---
 
-# xisto vs Bun
+# Xisto vs Bun
 
 13 Nov 2026, the same xisto variants as the [Rust round](./vs-rust.md) (main `e5fb066`), on the Apple M4 and the
 two AWS VMs.
@@ -17,7 +17,7 @@ two AWS VMs.
 - **Runtime**: Bun 1.4.4 on all three machines (the official release zips on the VMs, checked against
   `SHASUMS256.txt`). Bun runs a `.cjs` copy of each program, because some originals assign undeclared names
   (`f = 0`), which an ES module refuses.
-- **xisto**: the same variants as the Rust round, built with `XISTO_CPU=native`. The xisto variants and what each does are listed on [xisto vs Rust](./vs-rust.md#the-xisto-programs).
+- **xisto**: the same variants as the Rust round, built with `XISTO_CPU=native`. The xisto variants and what each does are listed on [Xisto vs Rust](./vs-rust.md#the-xisto-programs).
 - **Command**: `python3 bench/benchmarksgame/langs.py 3 node=js:NODE bun=js:BUN` runs both runtimes in one round,
   scored with `python3 bench/placar.py RESULTS bun` (see
   [How every run is measured](./index.md#how-every-run-is-measured)).

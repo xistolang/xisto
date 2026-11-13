@@ -1,9 +1,9 @@
 ---
-title: xisto vs Node
+title: Xisto vs Node
 sidebar_position: 2
 ---
 
-# xisto vs Node
+# Xisto vs Node
 
 13 Nov 2026, the same xisto variants as the [Rust round](./vs-rust.md) (main `e5fb066`), on the Apple M4 and the
 two AWS VMs.
@@ -16,7 +16,7 @@ two AWS VMs.
   They run on one thread.
 - **Runtime**: Node v26.12.0 on all three machines (the official Linux tarballs on the VMs, checked against
   `SHASUMS256.txt`), run as `node PROGRAM.js ARG` with no flags.
-- **xisto**: the same variants as the Rust round, built with `XISTO_CPU=native`. The xisto variants and what each does are listed on [xisto vs Rust](./vs-rust.md#the-xisto-programs).
+- **xisto**: the same variants as the Rust round, built with `XISTO_CPU=native`. The xisto variants and what each does are listed on [Xisto vs Rust](./vs-rust.md#the-xisto-programs).
 - **Command**: `python3 bench/benchmarksgame/langs.py 3 node=js:NODE bun=js:BUN` runs both runtimes in one round,
   scored with `python3 bench/placar.py RESULTS node` (see
   [How every run is measured](./index.md#how-every-run-is-measured)).

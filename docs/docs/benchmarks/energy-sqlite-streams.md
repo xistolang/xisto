@@ -72,7 +72,7 @@ backend (`--backend=qbe`) ran fib in 0.04 s and nbody in 1.16 s, with a 0.04 s c
 `bench/vm.py` runs one suite of small programs on any machine; this is the M4 run, median of 3. Source:
 `bench/results/vm-mac-2026-11-07-final.txt`. The ratio is against the better of Node and Bun.
 
-| program | what it exercises | xisto | Node | Bun | xisto vs best |
+| program | what it exercises | xisto | Node | Bun | Xisto vs best |
 |---|---|---:|---:|---:|---:|
 | fib | recursion, `int` | 0.022 s | 0.120 s | 0.040 s | 1.83× |
 | sieve | arrays of booleans | 0.095 s | 0.358 s | 0.246 s | 2.59× |
