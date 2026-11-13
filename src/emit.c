@@ -8282,6 +8282,8 @@ static Expr *uj_J0, *uj_JL, *uj_K0, *uj_KL, *uj_e0;
 static const char *uj_kname;
 static int uj_prekind; /* the lanes' first values: 0 T, 1 e0, 2 T * e0 */
 static const char *uj_w; /* ludcmp's form: `w = T (or e0); for k w op= f; T = w`, w a local number (NULL: T itself) */
+static Expr *uj_fin; /* trmm's `T = g` (or T *= g) after the sum: g of T (the lane's sum) and loads without the counter */
+#define UJ_FIN_GRP 9 /* (the group of its loads) */
 static bool uj_match(Stmt *s) {
     if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_UJAM")) return false;
     const char *j, *k;
@@ -8327,7 +8329,17 @@ static bool uj_match(Stmt *s) {
     uj_t = t;
     uj_prekind = 0;
     uj_e0 = NULL;
-    if (nuj_post && uj_post[0].loop->kind == S_EXPR) return false; /* (a statement after the sum that is not T = w) */
+    uj_fin = NULL;
+    if (nuj_post && uj_post[0].loop->kind == S_EXPR) { /* T = g, or T *= g, after the sum */
+        Expr *f = uj_post[0].loop->expr;
+        if (!f || f->kind != E_ASSIGN || (f->op != TK_ASSIGN && f->op != TK_STAR_ASSIGN) || !uj_is_t(f->lhs)) return false;
+        uj_grp = UJ_FIN_GRP;
+        bool ok = uj_expr(f->rhs, false);
+        uj_grp = 0;
+        if (!ok) return false;
+        uj_fin = f;
+        nuj_post = 0;
+    }
     if (uj_pre) {
         Expr *p = uj_pre->expr;
         if (uj_w) { /* w = T, or w = e0 */
@@ -8456,6 +8468,7 @@ static bool uj_emit_loop(Stmt *s) {
     Expr *t = uj_t;
     const char *kname = uj_kname;
     Stmt *kloop = uj_kloop;
+    Expr *fin = uj_fin;
     int prekind = uj_prekind;
     Expr *e0 = uj_e0;
     const char *w = uj_w;
@@ -8487,7 +8500,7 @@ static bool uj_emit_loop(Stmt *s) {
     buf_printf(out, "if (jok_ && nyr%d_ && (char *)td%d_ < ye%d_ && ys%d_ < (char *)(td%d_ + tl%d_)) jok_ = false; ", id, id, id, id, id, id);
     for (int i = 0; i < n; i++) {
         Expr *e = ld[i].e;
-        uj_cur = id; uj_grp = ld[i].grp; uj_k = ld[i].grp ? post[ld[i].grp - 1].ctr : kname;
+        uj_cur = id; uj_grp = ld[i].grp; uj_k = ld[i].grp > 0 && ld[i].grp <= np ? post[ld[i].grp - 1].ctr : kname;
         int ix = uj_idx(e->rhs);
         char *cs = xs_sprintf("cs%d_%d_", id, ld[i].grp), *ce = xs_sprintf("ce%d_%d_", id, ld[i].grp);
         buf_printf(out, "double *jd%d_%d_ = NULL; double **jt%d_%d_ = NULL; (void)jd%d_%d_; (void)jt%d_%d_; ", id, i, id, i, id, i, id, i);
@@ -8572,6 +8585,16 @@ static bool uj_emit_loop(Stmt *s) {
         buf_puts(out, "; ");
     }
     buf_puts(out, "} ");
+    if (fin) { /* T = g (T *= g) on each lane's sum, T in g that sum */
+        uj_grp = UJ_FIN_GRP;
+        for (int u = 0; u < U; u++) {
+            uj_lane = u;
+            buf_printf(out, "a%d_ = %s", u, fin->op == TK_STAR_ASSIGN ? xs_sprintf("a%d_ * ", u) : "");
+            uj_emit(fin->rhs);
+            buf_puts(out, "; ");
+        }
+        uj_grp = 0;
+    }
     for (int u = 0; u < U; u++) buf_printf(out, "td%d_[jj%d_ + %d] = a%d_; ", id, id, u, u);
     if (w) buf_printf(out, "%s = a%d_; ", ren(w), U - 1); /* (w as the last j left it) */
     for (int p = 0; p < np; p++) { /* each lane's column of Y, after its sum (T is that sum) */

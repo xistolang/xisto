@@ -129,3 +129,19 @@ SA2[3] = SC2[5];
 for (let r = 0; r < 7; r++) if (SA2[r].length < 19) for (let c = SA2[r].length; c < 19; c++) SA2[r].push(c / 19);
 syrk(7, 19, 0.5, 2, SC2, SA2);
 console.log("syrk shared row", show(SC2));
+
+// a statement on T after the sum (trmm): B[i][j] = alpha * B[i][j]
+function trmm(m: int, n: int, alpha: number, A: number[][], B: number[][]): void {
+  for (let i = 0; i < m; i++)
+  for (let j = 0; j < n; j++) {
+    for (let k = i + 1; k < m; k++) B[i][j] += A[k][i] * B[k][j];
+    B[i][j] = alpha * B[i][j];
+  }
+}
+const TB = grid(6, 17, (i, j) => ((i * 5 + j) % 7) / 3);
+trmm(6, 17, 1.25, grid(6, 6, (i, j) => ((i + j) % 4) / 2), TB);
+console.log("trmm", show(TB));
+const TB2 = grid(6, 17, (i, j) => ((i + 3 * j) % 5) / 4);
+TB2[4] = TB2[1];
+trmm(6, 17, 0.75, grid(6, 6, (i, j) => (i * j + 1) / 7), TB2);
+console.log("trmm shared rows", show(TB2));
