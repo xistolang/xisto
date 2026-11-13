@@ -4578,7 +4578,17 @@ static void ln_plan(Func *f) {
     ln_cur = &ln_scratch;
     ln_fn = NULL;
     if (!f->body || f->is_gen || f->is_async || xs_debug || sm_mode || ictx || getenv("XISTO_NO_LANES") || stmt_has_arrow(f->body)) return;
-    for (int n = 16; n >= 4 && !ln_on; n /= 2) if (ln_plan_n(f, n)) ln_on = true;
+    /* N: the one whose runs take the most statements (12 copies: three runs of 4, where 8 leaves 4 of them
+       scalar), the larger on a tie */
+    int best = 0, bestn = 0;
+    for (int n = 16; n >= 4; n /= 2) {
+        if (!ln_plan_n(f, n)) continue;
+        int got = 0;
+        for (int r = 0; r < ln_nr; r++) got += ln_r[r].ncls * n;
+        if (got > best) { best = got; bestn = n; }
+    }
+    if (!bestn) return;
+    ln_on = ln_plan_n(f, bestn);
     if (!ln_on) return;
     ln_fn = f;
     for (int g = 0; g < ln_ng; g++) ln_g[g].vname = xs_sprintf("lv_%s", ln_g[g].m[0]);
