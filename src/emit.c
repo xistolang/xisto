@@ -6036,6 +6036,55 @@ static int nbce;
    cannot change.) */
 static bool bce_fixed_len;
 static bool bce_bytes(Type *t) { return t && t->kind == TY_OBJECT && t->cls && t->cls->builtin && t->cls->cname && strcmp(t->cls->cname, "xs_Uint8Array") == 0; }
+/* a call the loop checks can ignore: a function of numbers that reads only its parameters and its own locals and
+   computes with them (nussinov's max_score, match: `return s1 >= s2 ? s1 : s2`). It cannot reach an array, a
+   length or a name of the caller; it can still fail (an int overflow), as the loop's own arithmetic can.
+   Opt-in (XISTO_BCE_LEAF=1): on the M4, nussinov's k loop without its checks ran 20-30% slower than with them (the
+   loop waits on table[i][j] through memory and on the column's misses; the checks were free), and no other
+   program measured has such calls in a hot loop. */
+static bool bce_leaf_scalar(Type *t) { return t && (t->kind == TY_INT || t->kind == TY_NUMBER || t->kind == TY_LITINT || t->kind == TY_BOOLEAN); }
+static bool bce_declares(Stmt *s, const char *n);
+static bool bce_leaf_name(Func *f, Stmt *body, const char *c);
+static bool bce_leaf_e(Func *f, Expr *e) {
+    if (!e) return true;
+    switch (e->kind) {
+    case E_NUMBER: return true;
+    case E_IDENT: return e->cname && bce_leaf_scalar(e->type) && bce_leaf_name(f, f->body, e->cname);
+    case E_BINARY: case E_UNARY: break;
+    case E_COND: break;
+    case E_ASSIGN: if (!e->lhs || e->lhs->kind != E_IDENT) return false; break;
+    default: return false;
+    }
+    if (!bce_leaf_scalar(e->type)) return false;
+    if (!bce_leaf_e(f, e->lhs) || !bce_leaf_e(f, e->rhs)) return false;
+    for (int k = 0; k < e->args.len; k++) if (!bce_leaf_e(f, e->args.items[k])) return false;
+    return true;
+}
+static bool bce_leaf_s(Func *f, Stmt *s, int *n) {
+    if (!s) return true;
+    if (++*n > 24) return false;
+    switch (s->kind) {
+    case S_BLOCK:
+        for (int k = 0; k < s->stmts.len; k++) if (!bce_leaf_s(f, s->stmts.items[k], n)) return false;
+        return true;
+    case S_RETURN: case S_EXPR: return s->expr && bce_leaf_e(f, s->expr);
+    case S_VAR: return s->cname && bce_leaf_scalar(s->type) && bce_leaf_e(f, s->init);
+    case S_IF: return bce_leaf_e(f, s->cond) && bce_leaf_s(f, s->body, n) && bce_leaf_s(f, s->else_body, n);
+    default: return false;
+    }
+}
+static bool bce_leaf_name(Func *f, Stmt *body, const char *c) { /* a parameter, or a local of the body */
+    if (body == f->body)
+        for (int k = 0; k < f->nparams; k++) if (f->params[k].cname && !f->params[k].cell && strcmp(f->params[k].cname, c) == 0) return true;
+    return bce_declares(body, c);
+}
+static bool bce_leaf_pure(Func *f) {
+    if (!f || !f->body || f->is_async || f->is_gen || f->cls || f->is_native || f->decos.len || f->deco_stub || !bce_leaf_scalar(f->ret) ||
+        !getenv("XISTO_BCE_LEAF")) return false;
+    for (int k = 0; k < f->nparams; k++) if (!bce_leaf_scalar(f->params[k].type) || f->params[k].cell || f->params[k].rest || f->params[k].dflt) return false;
+    int n = 0;
+    return bce_leaf_s(f, f->body, &n);
+}
 static bool bce_body_ok(Expr *e, Expr *parent, const char *a);
 static bool bce_stmt_ok(Stmt *s, const char *a) {
     if (!s) return true;
@@ -6052,7 +6101,8 @@ static bool bce_body_ok(Expr *e, Expr *parent, const char *a) {
     switch (e->kind) {
     case E_ARROW: case E_AWAIT: return false;
     case E_CALL: /* user code: a function, or a closure value (which may change a captured limit, or the array) */
-        if ((e->func || (e->lhs && e->lhs->type && e->lhs->type->kind == TY_FUNC && !e->builtin.cfn)) && !bce_fixed_len) return false;
+        if ((e->func || (e->lhs && e->lhs->type && e->lhs->type->kind == TY_FUNC && !e->builtin.cfn)) && !bce_fixed_len &&
+            !(e->func && bce_leaf_pure(e->func))) return false;
         break;
     case E_NEW_OBJ: if (e->cls && !e->cls->builtin && !bce_fixed_len) return false; break;
     case E_MEMBER:
@@ -6312,6 +6362,23 @@ static char *bce_col_test(BceRect *r, const char *c, const char *st, const char 
 typedef struct { Expr *e, *base, *idx, *E; int kind, sign; bool ok; } BceCand;
 static BceCand bce_cand[32];
 static int nbce_cand;
+/* the row index of a column: the counter, or i + E, E + i, i - E (E an invariant atom; the rows the loop reaches are
+   then [st + E, last + E]) */
+static bool bce_col_row(Expr *r, Stmt *body, const char *i) {
+    if (!r) return false;
+    if (r->kind == E_IDENT) return r->cname && strcmp(r->cname, i) == 0;
+    if (r->kind != E_BINARY || (r->op != TK_PLUS && r->op != TK_MINUS) || !r->type || r->type->kind != TY_INT || getenv("XISTO_NO_BCE_COLS_AFF")) return false;
+    bool li = r->lhs && r->lhs->kind == E_IDENT && r->lhs->cname && strcmp(r->lhs->cname, i) == 0;
+    bool ri = r->rhs && r->rhs->kind == E_IDENT && r->rhs->cname && strcmp(r->rhs->cname, i) == 0;
+    if (li && !ri) return bce_inv_atom(r->rhs, body, i);
+    return ri && !li && r->op == TK_PLUS && bce_inv_atom(r->lhs, body, i);
+}
+static char *bce_col_off(Expr *r, const char *i) { /* those rows minus the counter, as C (i + E, E + i: E; i - E: -E) */
+    if (r->kind == E_IDENT) return "0";
+    bool li = r->lhs->kind == E_IDENT && r->lhs->cname && strcmp(r->lhs->cname, i) == 0;
+    char *E = bce_raw(li ? r->rhs : r->lhs);
+    return r->op == TK_MINUS ? xs_sprintf("(-(%s))", E) : xs_sprintf("(%s)", E);
+}
 static void bce_cands_e(Expr *e, Stmt *body, const char *i) {
     if (!e) return;
     if (e->kind == E_INDEX && e->rhs && nbce_cand < 32 && bce_base(e->lhs, body, i)) {
@@ -6331,8 +6398,8 @@ static void bce_cands_e(Expr *e, Stmt *body, const char *i) {
         if (c.kind >= 0 && !dup) bce_cand[nbce_cand++] = c;
     } else if (e->kind == E_INDEX && e->rhs && nbce_cand < 32 && !e->builtin.cfn && e->lhs && e->lhs->kind == E_INDEX &&
                !e->lhs->builtin.cfn && e->lhs->lhs && e->lhs->lhs->kind == E_IDENT && e->lhs->lhs->cname &&
-               bce_rect_find(e->lhs->lhs->cname) && e->lhs->rhs && e->lhs->rhs->kind == E_IDENT && e->lhs->rhs->cname &&
-               strcmp(e->lhs->rhs->cname, i) == 0 && bce_indexable(e->lhs->type) && bce_inv(e->rhs, body, i)) {
+               bce_rect_find(e->lhs->lhs->cname) && bce_col_row(e->lhs->rhs, body, i) && bce_indexable(e->lhs->type) &&
+               bce_inv(e->rhs, body, i)) {
         bool dup = false; /* a column: X[i][c] */
         for (int k = 0; k < nbce_cand && !dup; k++)
             dup = bce_cand[k].kind == 3 && bce_same_base(bce_cand[k].base, e->lhs) && bce_same(bce_cand[k].idx, e->rhs);
@@ -6379,8 +6446,9 @@ static char *bce_version_guard(Stmt *s) {
             if (cd->kind == 3) { /* a column: its rows X[i] proved by this guard (bce_rect_open proved the rest) */
                 bool proved = false;
                 for (int j = 0; j < nbce_cand && !proved; j++)
-                    proved = bce_cand[j].ok && bce_cand[j].kind == 0 && bce_cand[j].base->kind == E_IDENT &&
-                             strcmp(bce_cand[j].base->cname, cd->base->lhs->cname) == 0;
+                    proved = bce_cand[j].ok && (bce_cand[j].kind == 0 || bce_cand[j].kind == 1) && bce_cand[j].base->kind == E_IDENT &&
+                             strcmp(bce_cand[j].base->cname, cd->base->lhs->cname) == 0 &&
+                             (bce_cand[j].kind == 0 ? cd->base->rhs->kind == E_IDENT : bce_same(bce_cand[j].idx, cd->base->rhs));
                 if (proved) { cd->ok = true; moving = true; }
                 continue;
             }
@@ -6419,7 +6487,13 @@ static char *bce_version_guard(Stmt *s) {
             char *A = bce_len_of(cd->base);
             if (cd->kind == 0) { buf_printf(&g, " && %s < %s", last, A); continue; }
             if (cd->kind == 2) { char *x = bce_raw(cd->idx); buf_printf(&g, " && %s >= 0 && %s < %s", x, x, A); continue; }
-            if (cd->kind == 3) { buf_printf(&g, " && %s", bce_col_test(bce_rect_find(cd->base->lhs->cname), bce_raw(cd->idx), st, last)); continue; }
+            if (cd->kind == 3) {
+                char *off = bce_col_off(cd->base->rhs, i);
+                bool z = strcmp(off, "0") == 0;
+                buf_printf(&g, " && %s", bce_col_test(bce_rect_find(cd->base->lhs->cname), bce_raw(cd->idx), z ? st : xs_sprintf("(%s) + %s", st, off),
+                                                      z ? last : xs_sprintf("%s + %s", last, off)));
+                continue;
+            }
             bool ar3 = false;
             char *E = emit_expr_to_str(cd->E, &ar3);
             if (cd->sign == 1) buf_printf(&g, " && (%s) + (%s) >= 0 && %s + (%s) < %s", st, E, last, E, A);        /* i + E */
