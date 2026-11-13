@@ -3089,7 +3089,9 @@ XS_NOINLINE xs_stream *xs_gen_stream(void (*body)(void *), void *args, void (*ar
    as Node waits for its workers. */
 #ifdef XS_THREADS
 enum { XS_WM_TEXT, XS_WM_BYTES, XS_WM_SAB, XS_WM_F64 }; /* what a message is, and what a listener takes */
-typedef struct xs_wmsg { struct xs_wmsg *next; size_t n; uint8_t kind; bool shared; char *p; xs_shblk *blk; int64_t off; char s[]; } xs_wmsg;
+typedef struct xs_wmsg { struct xs_wmsg *next; size_t n; uint8_t kind; bool shared; char *p; xs_shblk *blk; int64_t off; xs_str *str; char s[]; } xs_wmsg;
+/* str: XS_WM_TEXT of a big string sent as itself (xs_str_share; the message holds one of its counts) */
+static void xs_wmsg_free(xs_wmsg *m) { free(m->p); xs_shblk_unref(m->blk); if (m->str) xs_shared_release(&m->str->hdr); free(m); }
 /* XS_WM_BYTES: a Uint8Array, its bytes in p (malloc'd: the receiver's Uint8Array takes them over, no second copy);
    XS_WM_TEXT: text in s; XS_WM_SAB, XS_WM_F64: the block (a reference of the message's own), and for a
    Float64Array its first element (off) and its length (n); shared: a view on a SharedArrayBuffer (else a copy) */
@@ -3117,7 +3119,7 @@ static void xs_wq_push(xs_wq *q, xs_wmsg *m) {
     bool closed = q->closed;
     if (!closed) { if (q->tail) q->tail->next = m; else q->head = m; q->tail = m; }
     pthread_mutex_unlock(&q->mu);
-    if (closed) { free(m->p); xs_shblk_unref(m->blk); free(m); return; } /* (the receiver is gone, as a message to an ended worker in Node) */
+    if (closed) { xs_wmsg_free(m); return; } /* (the receiver is gone, as a message to an ended worker in Node) */
     xs_wq_wake(q);
 }
 static void xs_wq_put(xs_wq *q, const char *s, size_t n, bool bytes) {
@@ -3128,6 +3130,7 @@ static void xs_wq_put(xs_wq *q, const char *s, size_t n, bool bytes) {
     m->kind = bytes ? XS_WM_BYTES : XS_WM_TEXT;
     m->p = NULL;
     m->blk = NULL;
+    m->str = NULL;
     if (bytes) {
         m->p = malloc(n ? n : 1);
         if (!m->p) xs_panic("out of memory");
@@ -3147,6 +3150,7 @@ static void xs_wq_put_blk(xs_wq *q, uint8_t kind, xs_shblk *blk, int64_t off, in
     m->kind = kind;
     m->shared = shared;
     m->p = NULL;
+    m->str = NULL;
     m->blk = blk;
     m->off = off;
     xs_wq_push(q, m);
@@ -3176,6 +3180,19 @@ static void xs_wq_put_f64(xs_wq *q, xs_Float64Array *a) {
     if (a->f_length) memcpy(xs_shblk_data(b), a->data, (size_t)a->f_length * sizeof(double));
     xs_wq_put_blk(q, XS_WM_F64, b, 0, a->f_length, false);
 }
+/* a string: as itself when it can be shared (xs_str_share), else its bytes copied */
+static void xs_wq_put_str(xs_wq *q, xs_str *s) {
+    if (!xs_str_share(s)) { xs_wq_put(q, s->data, (size_t)s->len, false); return; }
+    xs_wmsg *m = malloc(sizeof *m + 1);
+    if (!m) xs_panic("out of memory");
+    m->next = NULL;
+    m->n = (size_t)s->len;
+    m->kind = XS_WM_TEXT;
+    m->p = NULL;
+    m->blk = NULL;
+    m->str = s;
+    xs_wq_push(q, m);
+}
 static void xs_wq_close(xs_wq *q) {
     pthread_mutex_lock(&q->mu);
     q->closed = true;
@@ -3192,7 +3209,7 @@ static xs_wmsg *xs_wq_take(xs_wq *q, bool *closed) {
 }
 static void xs_wq_unref(xs_wq *q) {
     if (__atomic_sub_fetch(&q->refs, 1, __ATOMIC_ACQ_REL) != 0) return;
-    for (xs_wmsg *m = q->head, *n; m; m = n) { n = m->next; free(m->p); xs_shblk_unref(m->blk); free(m); }
+    for (xs_wmsg *m = q->head, *n; m; m = n) { n = m->next; xs_wmsg_free(m); }
     close(q->fd[0]);
     close(q->fd[1]);
     pthread_mutex_destroy(&q->mu);
@@ -3296,14 +3313,13 @@ XS_NOINLINE void xs_wt_listen(void *p) {
                     else { b->data = (uint8_t *)m->p; b->owner = NULL; m->p = NULL; }
                     v = b;
                 }
+                else if (m->str) { v = m->str; m->str = NULL; } /* (the message's count becomes the listener's) */
                 else v = xs_str_new(m->s, m->n);
                 ((void (*)(void *, void *))cl->fn)(cl, v);
                 xs_release(v);
                 xs_ar_drain(mark);
             }
-            free(m->p);
-            xs_shblk_unref(m->blk);
-            free(m);
+            xs_wmsg_free(m);
         }
         if (closed) return;
         xs_wait_fd(L->q->fd[0], EVFILT_READ);
@@ -3448,7 +3464,7 @@ XS_NOINLINE xs_Worker *xs_Worker_on(xs_Worker *w, xs_str *ev, xs_closure *cb) { 
 XS_NOINLINE xs_Worker *xs_Worker_on_bytes(xs_Worker *w, xs_str *ev, xs_closure *cb) { return xs_Worker_on_k(w, ev, cb, XS_WM_BYTES); }
 XS_NOINLINE xs_Worker *xs_Worker_on_sab(xs_Worker *w, xs_str *ev, xs_closure *cb) { return xs_Worker_on_k(w, ev, cb, XS_WM_SAB); }
 XS_NOINLINE xs_Worker *xs_Worker_on_f64(xs_Worker *w, xs_str *ev, xs_closure *cb) { return xs_Worker_on_k(w, ev, cb, XS_WM_F64); }
-XS_NOINLINE void xs_Worker_postMessage(xs_Worker *w, xs_str *m) { xs_wq_put(w->to_worker, m->data, (size_t)m->len, false); }
+XS_NOINLINE void xs_Worker_postMessage(xs_Worker *w, xs_str *m) { xs_wq_put_str(w->to_worker, m); }
 XS_NOINLINE void xs_Worker_postBytes(xs_Worker *w, xs_Uint8Array *b) { xs_wq_put_u8(w->to_worker, b); }
 XS_NOINLINE void xs_Worker_postSab(xs_Worker *w, xs_SharedArrayBuffer *s) { xs_wq_put_sab(w->to_worker, s); }
 XS_NOINLINE void xs_Worker_postF64(xs_Worker *w, xs_Float64Array *a) { xs_wq_put_f64(w->to_worker, a); }
@@ -3468,7 +3484,7 @@ XS_NOINLINE xs_MessagePort *xs_MessagePort_on_sab(xs_MessagePort *p, xs_str *ev,
 XS_NOINLINE xs_MessagePort *xs_MessagePort_on_f64(xs_MessagePort *p, xs_str *ev, xs_closure *cb) { return xs_MessagePort_on_k(p, ev, cb, XS_WM_F64); }
 XS_NOINLINE void xs_MessagePort_postMessage(xs_MessagePort *p, xs_str *m) {
     if (!p->out) xs_panic("parentPort is null on the main thread");
-    xs_wq_put(p->out, m->data, (size_t)m->len, false);
+    xs_wq_put_str(p->out, m);
 }
 XS_NOINLINE void xs_MessagePort_postBytes(xs_MessagePort *p, xs_Uint8Array *b) {
     if (!p->out) xs_panic("parentPort is null on the main thread");

@@ -10,9 +10,9 @@
    multi thread by Andrey Filatkin
    sequential by Isaac Gouy
    (xisto #2: as #1, with the nine counts in a worker (node:worker_threads) while the main thread makes the
-   replacements: the two halves of the work at the same time, as the multi-threaded originals do. Graviton2,
-   9 runs: 0,815 s / 1,29 u / 244 MB, against #1 1,211 / 1,24 / 148 and Rust #6 1,286 / 1,57 / 150: the
-   worker has its own copy of the 50 MB of cleaned input)
+   replacements: the two halves of the work at the same time, as the multi-threaded originals do. The worker
+   gets the 50 MB of cleaned input as the same string, not a copy (runtime: xs_str_share). Graviton2, 9 runs:
+   0,801 s / 1,26 u / 148,5 MB, against #1 1,211 / 1,24 / 148 and Rust #6 1,287 / 1,58 / 150)
 */
 
 import { readFileSync } from "node:fs";

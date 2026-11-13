@@ -809,11 +809,20 @@ static inline __attribute__((always_inline)) void xs_obj_free_block(void *p, uin
     free(p);
 }
 
+/* An object several threads hold (a string a worker was sent, xs_str_share): its count lives above
+   XS_SHARED_RC (XS_SHARED_RC + the holders) and changes atomically; every other count is a thread's own and
+   changes with plain arithmetic. The test is one compare on the count the operation loads anyway. */
+#define XS_SHARED_RC 0x60000000
+XS_NOINLINE void xs_shared_release(xs_hdr *h);
 static inline void *xs_retain_(void *p) {
 #ifdef XS_HEAP_CHECK
     if (p && ((xs_hdr *)p)->rc == XS_FREED_RC) XS_HEAP_TRAP("retain of an object that was freed");
 #endif
-    if (p) ((xs_hdr *)p)->rc++;
+    if (p) {
+        xs_hdr *h = p;
+        if (__builtin_expect(h->rc >= XS_SHARED_RC, 0)) __atomic_add_fetch(&h->rc, 1, __ATOMIC_RELAXED);
+        else h->rc++;
+    }
     return p;
 }
 
@@ -824,19 +833,27 @@ static inline void xs_release_(void *p) {
 #ifdef XS_HEAP_CHECK
     if (h->rc == XS_FREED_RC) XS_HEAP_TRAP("release of an object that was freed");
 #endif
+    if (__builtin_expect(h->rc >= XS_SHARED_RC, 0)) { xs_shared_release(h); return; }
     if (--h->rc == 0) xs_type_of(h)->free(p);
     else if (__builtin_expect((h->cls & (XS_CYC | XS_BUF)) == XS_CYC, 0)) xs_gc_suspect(p); /* may now hang on a cycle only */
 }
 
-/* a release whose type the compiler knows (a field of a class without subclasses): the free function is
+/* the last holder of a shared object frees it: only strings of malloc's own are shared (xs_str_share), which hold
+   nothing and which no thread counts among its allocations */
+XS_NOINLINE void xs_shared_release(xs_hdr *h) {
+    if (__atomic_sub_fetch(&h->rc, 1, __ATOMIC_ACQ_REL) == XS_SHARED_RC) free(h);
+}
+/* a release whose type the compiler knows (a field of a class without subclasses); only strings are ever
+   shared, so only a string's release looks for a shared count (the test of the free function folds away): the free function is
    called directly, not through the type, so freeing a tree is a direct recursion the C compiler can work on */
 #ifdef XS_HEAP_CHECK
 #define XS_HEAP_CHECK_REL(h_) if ((h_)->rc == XS_FREED_RC) XS_HEAP_TRAP("release of an object that was freed");
 #else
 #define XS_HEAP_CHECK_REL(h_)
 #endif
+static void xs_str_free(void *p);
 #define xs_release_as(x, free_fn) do { xs_hdr *h_ = (xs_hdr *)(x); \
-    if (h_) { XS_HEAP_CHECK_REL(h_) if (--h_->rc == 0) free_fn(h_); \
+    if (h_) { XS_HEAP_CHECK_REL(h_) if ((void *)(free_fn) == (void *)xs_str_free && __builtin_expect(h_->rc >= XS_SHARED_RC, 0)) xs_shared_release(h_); else if (--h_->rc == 0) free_fn(h_); \
               else if (__builtin_expect((h_->cls & (XS_CYC | XS_BUF)) == XS_CYC, 0)) xs_gc_suspect(h_); } } while (0)
 /* the argument appears once in the expansion: a chain of calls nests these macros, and a copy for __typeof__ doubled
    the text at every level (a 20-call query builder chain became ~1M copies and took clang past 10 GB, 11/11) */
@@ -945,6 +962,20 @@ typedef struct xs_str {
 } xs_str;
 
 static void xs_str_free(void *p) { xs_obj_free(p); }
+/* A string another thread is sent (postMessage) goes as itself, not as a copy, when it is big (64 KB or more) and a
+   block of malloc's own: strings never change, so the threads can read the same bytes. From then on its count is
+   shared (XS_SHARED_RC + the holders, changed atomically by both threads, xs_retain_/xs_release_) and no thread
+   counts it among its allocations; the last release frees it. Below 64 KB, from a slab, a region or a frame,
+   or a literal: false, and the caller copies as before. The thread calling this is the only one that holds s. */
+static bool xs_str_share(xs_str *s) {
+    if (s->len < ((int64_t)64 << 10) || s->hdr.rc < 1) return false;
+    if (s->hdr.rc >= XS_SHARED_RC) { __atomic_add_fetch(&s->hdr.rc, 1, __ATOMIC_RELAXED); return true; } /* (the message's own) */
+    if (s->hdr.rc >= XS_IMMORTAL / 2 || (s->hdr.cls & (XS_CLS_MASK | XS_STACK | XS_RGN | XS_CYC | XS_BUF | XS_DEAD))) return false;
+    if (xs_type_of(s)->free != xs_str_free || getenv("XISTO_NO_STR_SHARE")) return false;
+    xs_live--; /* (no thread's allocation any more) */
+    __atomic_store_n(&s->hdr.rc, XS_SHARED_RC + s->hdr.rc + 1, __ATOMIC_RELEASE); /* this thread's holds, and the message's */
+    return true;
+}
 static void xs_print_str(xs_str *s);
 static void xs_str_print_(void *p) { xs_print_str(p); }
 
