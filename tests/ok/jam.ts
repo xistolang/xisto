@@ -209,3 +209,21 @@ console.log("mvt", mx1.map((x) => x.toFixed(6)).join(","), mx2.map((x) => x.toFi
 // x is a row of A: the old loop
 mvt(13, MA[2], MA[5], my, MA[2], MA);
 console.log("mvt shared", show(MA));
+
+// the init's form (lu, cholesky): for t { for r { for s { B[r][s] += A[r][t] * A[s][t] } } }, U values of t into each element
+function aatInit(n: int, A: number[][], B: number[][]): void {
+  for (let t = 0; t < n; ++t) for (let r = 0; r < n; ++r) for (let s = 0; s < n; ++s) B[r][s] += A[r][t] * A[s][t];
+}
+const IA = grid(13, 13, (i, j) => ((i * 7 + j * 3) % 11) / 6);
+const IB = grid(13, 13, (i, j) => 0);
+aatInit(13, IA, IB);
+console.log("aat init", show(IB));
+// two rows of B one array: the old loop (the order of each element's sums would change)
+const IB2 = grid(13, 13, (i, j) => 0);
+IB2[7] = IB2[2];
+aatInit(13, IA, IB2);
+console.log("aat shared row", show(IB2));
+// B is A: the old loop
+const IC = grid(13, 13, (i, j) => ((i + j) % 5) / 4);
+aatInit(13, IC, IC);
+console.log("aat B = A", show(IC));

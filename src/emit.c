@@ -6543,14 +6543,15 @@ static char *bce_col_test(BceRect *r, const char *c, const char *st, const char 
     const char *f = bce_bytes(rt) ? "f_length" : "len";
     const char *X = ren(r->x);
     if (r->rdt) /* with the table of data pointers: built (with the least length) when a range reaches 1/64 of X (at
-                   most 64 times a short loop's work, once per nest; lu's first ranges are short); a shorter range
-                   before that runs the checked copy */
+                   most 64 times a short loop's work, once per nest; lu's first ranges are short), or X has at most 4096
+                   rows (the leftover j's of a jammed loop: ranges shorter than U); a shorter range before that runs the
+                   checked copy */
         return xs_sprintf("({ int64_t c_ = (%s), s_ = (%s), e_ = (%s); "
-                          "if (c_ >= 0 && ml%d_ < 0 && (e_ - s_ + 1) * 64 >= (int64_t)(%s)->len) { int64_t m_ = INT64_MAX, n_ = (int64_t)(%s)->len; "
+                          "if (c_ >= 0 && ml%d_ < 0 && ((e_ - s_ + 1) * 64 >= (int64_t)(%s)->len || (int64_t)(%s)->len <= 4096)) { int64_t m_ = INT64_MAX, n_ = (int64_t)(%s)->len; "
                           "rd%d_ = malloc((size_t)(n_ ? n_ : 1) * sizeof(%s *)); if (!rd%d_) xs_panic(\"out of memory\"); "
                           "for (int64_t r_ = 0; r_ < n_; r_++) { %s *p_ = (%s *)(%s)->data[r_]; int64_t l_ = p_ ? (int64_t)p_->%s : 0; rd%d_[r_] = p_ ? p_->data : NULL; if (l_ < m_) m_ = l_; } ml%d_ = m_; } "
                           "c_ >= 0 && ml%d_ >= 0 && c_ < ml%d_; })",
-                          c, st, last, r->id, X, X, r->id, r->rdt, r->id, rs, rs, X, f, r->id, r->id, r->id, r->id);
+                          c, st, last, r->id, X, X, X, r->id, r->rdt, r->id, rs, rs, X, f, r->id, r->id, r->id, r->id);
     return xs_sprintf("({ int64_t c_ = (%s), s_ = (%s), e_ = (%s); bool ok_ = c_ >= 0; "
                       "if (ok_ && ml%d_ < 0 && (e_ - s_ + 1) * 4 >= (int64_t)(%s)->len) { int64_t m_ = INT64_MAX; "
                       "for (int64_t r_ = 0; r_ < (int64_t)(%s)->len; r_++) { %s *p_ = (%s *)(%s)->data[r_]; int64_t l_ = p_ ? (int64_t)p_->%s : 0; if (l_ < m_) m_ = l_; } ml%d_ = m_; } "
@@ -8273,12 +8274,13 @@ static void emit_stmt_for_inner_(Stmt *s);
    apart: lu's A[i][k], k < i <= j), and that nothing read outside the lane's own column j falls on the span of Y's rows
    at an index of [J0, JL); the rows read by a counter go to a table of their data. When the guard fails, or for the
    j's left over, the loop runs as it was. XISTO_NO_UJAM turns it off; XISTO_UJAM_U sets U (8). */
-typedef struct { Expr *e, *base, *idx; bool krow, self, lrow; int grp, yp; } UjLd; /* yp: a self load's post (Y table); lrow: X[j][c],
+typedef struct { Expr *e, *base, *idx; bool krow, self, lrow, mrow; int grp, yp; } UjLd; /* yp: a self load's post (Y table); lrow: X[j][c],
    the lane's own row (mvt: A[i][j] in a loop over j, i the lane), from a table by the lane */
 static UjLd uj_ld[24];
 static bool uj_kmode_match; /* (matching the k form: no lane rows there) */
 static int nuj_ld, uj_ids;
 static const char *uj_j, *uj_k;
+static const char *uj_m; /* the init's form (for t { for r { for s } }): the middle counter r (NULL elsewhere) */
 static Stmt *uj_nest;
 static Expr *uj_t;
 static int uj_grp; /* the loop the expression being matched or emitted belongs to: 0 the reduction (and e0), 1.. a post loop */
@@ -8300,7 +8302,7 @@ static bool uj_mentions(Expr *e, const char *n) {
     return false;
 }
 static bool uj_mentions_ctr(Expr *e) { /* any counter of the nest: j, k, a post loop's */
-    if (uj_mentions(e, uj_j) || uj_mentions(e, uj_k)) return true;
+    if (uj_mentions(e, uj_j) || uj_mentions(e, uj_k) || (uj_m && uj_mentions(e, uj_m))) return true;
     for (int p = 0; p < nuj_post; p++) if (uj_post[p].ctr && uj_mentions(e, uj_post[p].ctr)) return true;
     return false;
 }
@@ -8309,6 +8311,7 @@ static int uj_idx(Expr *x) {
     if (!x || !x->type || x->type->kind != TY_INT) return 0;
     if (x->kind == E_IDENT && x->cname && strcmp(x->cname, uj_k) == 0) return 'k';
     if (x->kind == E_IDENT && x->cname && strcmp(x->cname, uj_j) == 0) return 'j';
+    if (uj_m && x->kind == E_IDENT && x->cname && strcmp(x->cname, uj_m) == 0) return 'm';
     if (uj_mentions_ctr(x) || !bce_inv(x, uj_nest, uj_j) || !bce_names_plain(x)) return 0;
     return 'i';
 }
@@ -8335,7 +8338,7 @@ static bool uj_expr(Expr *e, bool k_ok) { /* f, g (k_ok) or e0: registers its lo
     case E_INDEX: {
         if (e->builtin.cfn || e->type->kind != TY_NUMBER || !uj_num_arr(e->lhs->type) || nuj_ld == 24) return false;
         if (uj_is_t(e)) return uj_grp > 0; /* (T in a post loop: the lane's sum) */
-        UjLd l = {e, e->lhs, e->rhs, false, false, false, uj_grp, -1};
+        UjLd l = {e, e->lhs, e->rhs, false, false, false, false, uj_grp, -1};
         if (uj_ylhs && e->kind == E_INDEX && bce_same_bx(e->lhs, uj_ylhs->lhs) && bce_same(e->rhs, uj_ylhs->rhs)) {
             l.self = true;
             l.yp = uj_ypost >= 0 ? uj_ypost : uj_grp - 1;
@@ -8343,8 +8346,10 @@ static bool uj_expr(Expr *e, bool k_ok) { /* f, g (k_ok) or e0: registers its lo
         int ix = uj_idx(e->rhs);
         if (!ix || (ix == 'k' && !k_ok)) return false;
         Expr *b = e->lhs;
+        if (ix == 'm' && !uj_m) return false;
         if (!uj_inv_base(b)) {
-            if (b->kind == E_INDEX && !b->builtin.cfn && uj_idx(b->rhs) == 'j' && ix != 'j' && uj_inv_base(b->lhs) && !uj_kmode_match) l.lrow = true; /* X[j][c] */
+            if (uj_m && b->kind == E_INDEX && !b->builtin.cfn && uj_idx(b->rhs) == 'm' && ix != 'm' && ix != 'k' && uj_inv_base(b->lhs)) l.mrow = true; /* X[r][c] */
+            else if (b->kind == E_INDEX && !b->builtin.cfn && uj_idx(b->rhs) == 'j' && ix != 'j' && uj_inv_base(b->lhs) && !uj_kmode_match) l.lrow = true; /* X[j][c] */
             else { /* a column: X[k][c], X invariant */
                 if (!k_ok || b->kind != E_INDEX || b->builtin.cfn || uj_idx(b->rhs) != 'k' || ix == 'k' || !uj_inv_base(b->lhs)) return false;
                 l.krow = true;
@@ -8589,6 +8594,7 @@ static char *uj_raw_idx(Expr *x) { /* an index of the jammed loop, lane uj_lane,
     int ix = uj_idx(x);
     if (ix == 'k') return xs_sprintf("kk%d_%d_", uj_cur, uj_grp);
     if (ix == 'j') return xs_sprintf("(jj%d_ + %d)", uj_cur, uj_lane);
+    if (ix == 'm') return xs_sprintf("mm%d_", uj_cur);
     return bce_raw(x);
 }
 static const char *uj_emit_w; /* emitting: w is the lane's sum */
@@ -8612,7 +8618,8 @@ static void uj_emit(Expr *e) {
         if (uj_grp > 0 && uj_is_t(e)) { buf_printf(out, "a%d_", uj_lane); return; }
         for (int i = 0; i < nuj_ld; i++)
             if (uj_ld[i].e == e) {
-                if (uj_ld[i].lrow) buf_printf(out, "jt%d_%d_[jj%d_ + %d][%s]", uj_cur, i, uj_cur, uj_lane, uj_raw_idx(e->rhs));
+                if (uj_ld[i].mrow) buf_printf(out, "jt%d_%d_[mm%d_][%s]", uj_cur, i, uj_cur, uj_raw_idx(e->rhs));
+                else if (uj_ld[i].lrow) buf_printf(out, "jt%d_%d_[jj%d_ + %d][%s]", uj_cur, i, uj_cur, uj_lane, uj_raw_idx(e->rhs));
                 else if (uj_ld[i].krow) buf_printf(out, "jt%d_%d_[kk%d_%d_][%s]", uj_cur, i, uj_cur, uj_grp, uj_raw_idx(e->rhs));
                 else buf_printf(out, "jd%d_%d_[%s]", uj_cur, i, uj_raw_idx(e->rhs));
                 return;
@@ -8635,6 +8642,126 @@ static void uj_row_of(Expr *b, const char *p) {
    rows meets [jj, jl) (the columns the lanes write) */
 static void uj_span_test(int id, const char *lo, const char *hi) {
     buf_printf(out, "if (nyr%d_ && (char *)d_ < ye%d_ && ys%d_ < (char *)(d_ + l_) && (%s) < jl%d_ && jj%d_ < (%s)) jok_ = false; ", id, id, id, lo, id, id, hi);
+}
+/* the init's form (lu, ludcmp, cholesky: B = A * A^T): for (t) { for (r) { for (s) B[r][s] op= f } }, the lanes U values of t one
+   after the other into each B[r][s] (each element's sums still in the order of t). B's rows must be distinct: their
+   blocks in increasing order, none overlapping (or the loop as it was); nothing read lies on them */
+static bool uj_match_km(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_UJAM") || getenv("XISTO_NO_UJAM_KM")) return false;
+    const char *t, *r, *c;
+    Expr *R0, *R1;
+    if (!uj_counted(s, &t, &uj_J0, &uj_JL)) return false;
+    Stmt *mid = uj_only(s->body);
+    if (!mid || !uj_counted(mid, &r, &R0, &R1)) return false;
+    Stmt *in = uj_only(mid->body);
+    if (!in || !uj_counted(in, &c, &uj_K0, &uj_KL)) return false;
+    uj_j = t; uj_k = c; uj_m = r; uj_kname = c; uj_nest = s->body; nuj_ld = 0; nuj_post = 0; uj_ylhs = NULL; uj_grp = 0;
+    uj_pre = NULL; uj_kloop = in; uj_w = NULL; uj_prekind = 0; uj_e0 = NULL; uj_fin = NULL; uj_mir = NULL; uj_fin2 = NULL; nuj_kord = 0;
+    uj_norm_ops(in->body);
+    bool ok = false;
+    do {
+        if (!uj_bound_ok(uj_JL) || !uj_bound_ok(R0) || !uj_bound_ok(R1) || !uj_bound_ok(uj_K0) || !uj_bound_ok(uj_KL)) break;
+        if (bce_writes(in->body, c) || bce_writes(mid->body, r) || bce_writes(s->body, t)) break;
+        Stmt *ks = uj_only(in->body);
+        if (!ks || ks->kind != S_EXPR || !ks->expr || ks->expr->kind != E_ASSIGN || (ks->expr->op != TK_PLUS_ASSIGN && ks->expr->op != TK_MINUS_ASSIGN)) break;
+        Expr *T = ks->expr->lhs;
+        if (!T || T->kind != E_INDEX || T->builtin.cfn || !T->type || T->type->kind != TY_NUMBER || !T->rhs || T->rhs->kind != E_IDENT ||
+            !T->rhs->cname || strcmp(T->rhs->cname, c) != 0 || !T->lhs || T->lhs->kind != E_INDEX || T->lhs->builtin.cfn || !T->lhs->rhs ||
+            T->lhs->rhs->kind != E_IDENT || !T->lhs->rhs->cname || strcmp(T->lhs->rhs->cname, r) != 0 || !uj_inv_base(T->lhs->lhs) ||
+            !uj_num_arr(T->lhs->type)) break;
+        uj_t = T;
+        uj_kmode_match = true;
+        ok = uj_expr(ks->expr->rhs, true);
+        uj_kmode_match = false;
+        for (int i = 0; ok && i < nuj_ld; i++) if (uj_ld[i].krow && uj_idx(uj_ld[i].e->rhs) == 'm') ok = false; /* (a column by r: not here) */
+        uj_post[0].lo = R0; uj_post[0].hi = R1; uj_post[0].loop = mid;
+    } while (0);
+    if (!ok) uj_m = NULL;
+    return ok;
+}
+static bool uj_emit_km(Stmt *s) {
+    if (!uj_match_km(s)) return false;
+    int id = uj_cur = uj_ids++, U = 8;
+    const char *ue = getenv("XISTO_UJAM_U");
+    if (ue && atoi(ue) >= 2 && atoi(ue) <= 16) U = atoi(ue);
+    bool ar = false;
+    char *J0 = emit_expr_to_str(uj_J0, &ar), *JL = emit_expr_to_str(uj_JL, &ar), *K0 = emit_expr_to_str(uj_K0, &ar), *KL = emit_expr_to_str(uj_KL, &ar);
+    char *R0 = emit_expr_to_str(uj_post[0].lo, &ar), *R1 = emit_expr_to_str(uj_post[0].hi, &ar);
+    if (ar) { uj_m = NULL; return false; }
+    int n = nuj_ld;
+    UjLd ld[24];
+    memcpy(ld, uj_ld, sizeof ld);
+    Expr *T = uj_t, *X = uj_t->lhs->lhs;
+    Stmt *ks = uj_only(uj_kloop->body);
+    bool minus = ks->expr->op == TK_MINUS_ASSIGN;
+    buf_printf(out, "{ int64_t jj%d_ = (%s); const int64_t jl%d_ = (%s), cs%d_0_ = (%s), ce%d_0_ = (%s), rs%d_ = (%s), re%d_ = (%s); ",
+               id, J0, id, JL, id, K0, id, KL, id, R0, id, R1);
+    buf_printf(out, "bool jok_ = jl%d_ - jj%d_ >= %d && jj%d_ >= 0 && re%d_ > rs%d_ && rs%d_ >= 0; xs_arr_num *p_ = NULL; (void)p_; "
+                    "double **tt%d_ = NULL; char *ts%d_ = (char *)-1, *te%d_ = NULL; ", id, id, U, id, id, id, id, id, id, id);
+    /* B's rows r in [rs, re): non-null, long enough for s, increasing and apart (distinct), their span */
+    buf_puts(out, "if (jok_) { xs_arr_ref *q_ = NULL; ");
+    if (X->kind == E_IDENT) buf_printf(out, "q_ = (xs_arr_ref *)(%s); ", ren(X->cname));
+    else { uj_row_of(X, "p_"); buf_puts(out, "q_ = (xs_arr_ref *)p_; "); }
+    buf_printf(out, "if (!jok_ || !q_ || re%d_ - 1 >= (int64_t)q_->len) jok_ = false; "
+                    "else { tt%d_ = malloc((size_t)re%d_ * sizeof(double *)); if (!tt%d_) xs_panic(\"out of memory\"); char *prev_ = NULL; "
+                    "for (int64_t r_ = rs%d_; r_ < re%d_ && jok_; r_++) { xs_arr_num *w_ = (xs_arr_num *)q_->data[r_]; "
+                    "if (!w_) { jok_ = false; break; } double *d_ = w_->data; int64_t l_ = (int64_t)w_->len; "
+                    "if (ce%d_0_ > cs%d_0_ && (cs%d_0_ < 0 || ce%d_0_ - 1 >= l_)) jok_ = false; "
+                    "if ((char *)d_ < prev_) jok_ = false; prev_ = (char *)(d_ + l_); "
+                    "if ((char *)d_ < ts%d_) ts%d_ = (char *)d_; if ((char *)(d_ + l_) > te%d_) te%d_ = (char *)(d_ + l_); tt%d_[r_] = d_; } } } ",
+               id, id, id, id, id, id, id, id, id, id, id, id, id, id, id);
+    for (int i = 0; i < n; i++) {
+        Expr *e = ld[i].e;
+        int ix = uj_idx(e->rhs);
+        buf_printf(out, "double *jd%d_%d_ = NULL; double **jt%d_%d_ = NULL; (void)jd%d_%d_; (void)jt%d_%d_; ", id, i, id, i, id, i, id, i);
+        char *col = ix == 'j' ? xs_sprintf("jl%d_ - 1", id) : ix == 'i' ? bce_raw(e->rhs) : ix == 'k' ? xs_sprintf("ce%d_0_ - 1", id) : xs_sprintf("re%d_ - 1", id);
+        char *colo = ix == 'j' ? xs_sprintf("jj%d_", id) : ix == 'i' ? bce_raw(e->rhs) : ix == 'k' ? xs_sprintf("cs%d_0_", id) : xs_sprintf("rs%d_", id);
+        if (ld[i].krow || ld[i].mrow) { /* rows by s (krow) or by r (mrow): a table by that counter */
+            const char *lo = ld[i].krow ? xs_sprintf("cs%d_0_", id) : xs_sprintf("rs%d_", id), *hi = ld[i].krow ? xs_sprintf("ce%d_0_", id) : xs_sprintf("re%d_", id);
+            Expr *Y = ld[i].base->lhs;
+            buf_printf(out, "if (jok_ && %s > %s) { xs_arr_ref *q_ = NULL; ", hi, lo);
+            if (Y->kind == E_IDENT) buf_printf(out, "q_ = (xs_arr_ref *)(%s); ", ren(Y->cname));
+            else { uj_row_of(Y, "p_"); buf_puts(out, "q_ = (xs_arr_ref *)p_; "); }
+            buf_printf(out, "if (!jok_ || !q_ || %s < 0 || %s - 1 >= (int64_t)q_->len) jok_ = false; "
+                            "else { jt%d_%d_ = malloc((size_t)%s * sizeof(double *)); if (!jt%d_%d_) xs_panic(\"out of memory\"); "
+                            "for (int64_t r_ = %s; r_ < %s && jok_; r_++) { xs_arr_num *w_ = (xs_arr_num *)q_->data[r_]; "
+                            "if (!w_) { jok_ = false; break; } double *d_ = w_->data; int64_t l_ = (int64_t)w_->len; "
+                            "if ((%s) < 0 || (%s) >= l_ || ((char *)d_ < te%d_ && ts%d_ < (char *)(d_ + l_))) jok_ = false; jt%d_%d_[r_] = d_; } } } ",
+                       lo, hi, id, i, hi, id, i, lo, hi, colo, col, id, id, id, i);
+        } else { /* an invariant row or a name */
+            buf_puts(out, "if (jok_) { ");
+            uj_row_of(ld[i].base, "p_");
+            buf_printf(out, "if (jok_) { double *d_ = p_->data; int64_t l_ = (int64_t)p_->len; jd%d_%d_ = d_; "
+                            "if ((%s) < 0 || (%s) >= l_ || ((char *)d_ < te%d_ && ts%d_ < (char *)(d_ + l_))) jok_ = false; } } ",
+                       id, i, colo, col, id, id);
+        }
+    }
+    /* the jammed loops: for each block of t's, each element, U sums in the order of t */
+    buf_printf(out, "if (jok_) for (; jl%d_ - jj%d_ >= %d; jj%d_ += %d) for (int64_t mm%d_ = rs%d_; mm%d_ < re%d_; mm%d_++) { double *tr_ = tt%d_[mm%d_]; "
+                    "for (int64_t kk%d_0_ = cs%d_0_; kk%d_0_ < ce%d_0_; kk%d_0_++) { double a_ = tr_[kk%d_0_]; ",
+               id, id, U, id, U, id, id, id, id, id, id, id, id, id, id, id, id, id);
+    uj_grp = 0;
+    for (int u = 0; u < U; u++) {
+        uj_lane = u;
+        buf_printf(out, "a_ = a_ %s ", minus ? "-" : "+");
+        uj_emit(ks->expr->rhs);
+        buf_puts(out, "; ");
+    }
+    buf_printf(out, "tr_[kk%d_0_] = a_; } } ", id);
+    for (int i = 0; i < n; i++) if (ld[i].krow || ld[i].mrow) buf_printf(out, "free(jt%d_%d_); ", id, i);
+    buf_printf(out, "free(tt%d_); ", id);
+    uj_m = NULL;
+    (void)T;
+    Stmt *fi = s->for_init;
+    Stmt fi2 = *fi;
+    Expr from = {0};
+    from.kind = E_IDENT; from.cname = xs_sprintf("jj%d_", id); from.str = from.cname; from.type = uj_J0->type; from.pos = uj_J0->pos; from.field = -1;
+    fi2.init = &from;
+    s->for_init = &fi2;
+    emit_stmt_for_inner_(s);
+    s->for_init = fi;
+    buf_puts(out, " }");
+    return true;
 }
 static bool uj_emit_loop(Stmt *s) {
     uj_kmode = false;
@@ -8891,7 +9018,7 @@ static bool uj_emit_loop(Stmt *s) {
 }
 static void emit_stmt_for_inner(Stmt *s) { /* the columns' least row lengths around the outermost loop that keeps them */
     int opened = bce_rect_open(s);
-    if (!uj_emit_loop(s)) emit_stmt_for_inner_(s);
+    if (!uj_emit_km(s) && !uj_emit_loop(s)) emit_stmt_for_inner_(s);
     bce_rect_close(opened);
 }
 static void emit_stmt_for_inner_(Stmt *s) { /* a for: bounds checks proved by the loop, or a versioned copy */
