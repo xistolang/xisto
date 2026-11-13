@@ -1336,7 +1336,9 @@ static void check_supported(Program *p) {
     for (int i = 0; i < p->nfuncs; i++) {
         if (p->funcs[i]->used && p->funcs[i]->is_gen) unsupported(p->funcs[i]->pos, "generators");
         for (int k = 0; p->funcs[i]->used && k < p->funcs[i]->nparams; k++)
-            if (qtyped(p->funcs[i]->params[k].type)) unsupported(p->funcs[i]->pos, "a typed-array parameter");
+            if (qtyped(p->funcs[i]->params[k].type) || (p->funcs[i]->params[k].type && p->funcs[i]->params[k].type->kind == TY_ARRAY &&
+                                                         qtyped(p->funcs[i]->params[k].type->elem))) /* (Float64Array[] crashed it too) */
+                unsupported(p->funcs[i]->pos, "a typed-array parameter");
             else if (p->funcs[i]->used && p->funcs[i]->params[k].type->kind == TY_NULLABLE && p->funcs[i]->params[k].type->elem->kind != TY_STRING &&
                      !ty_is_heap(p->funcs[i]->params[k].type))
                 unsupported(p->funcs[i]->pos, "a nullable number or boolean parameter"); /* (was invalid IL: XB-111) */
