@@ -3,12 +3,13 @@ https://salsa.debian.org/benchmarksgame-team/benchmarksgame/
 
 spectral-norm, xisto #5: as #3 (rows of each product over a pool of workers sharing one SharedArrayBuffer, four
 rows at a time, each with its own sum in the sequential program's order), with the denominator of A carried
-along the row by additions instead of computed again for every element, and the rows handed out in pieces that
-shrink as the product nears its end (half of what is left over each worker's share, at least 16), so that the
-workers finish each of the 40 products together. Every denominator is an exact integer below 2^53, so 1 / d and
-the result are the same doubles as #3's. What is left is one division per element: the divider sets the pace
-(Graviton2: a loop of nothing but the same 1,21 billion divisions takes 2,41 s of CPU; this program 2,45).
-Graviton2 (5500, 2 threads): 1,231 s / 2,45 u (#3 1,284 / 2,51; Rust #5 1,228 / 2,45).
+along the row by additions instead of computed again for every element, and each product split once, in equal
+shares (a multiple of four rows each): every row costs the same n divisions, so equal shares finish together, and
+each of the 40 products takes one order per worker instead of a stream of pieces (each one a message to the main
+thread and back: 2,45 -> 2,43 s of CPU). Every denominator is an exact integer below 2^53, so 1 / d and the result
+are the same doubles as #3's. What is left is one division per element: the divider sets the pace (Graviton2: a
+loop of nothing but the same 1,21 billion divisions, with their multiplications and sums, takes 2,42 s of CPU).
+Graviton2 (5500, 2 threads): 1,219 s / 2,43 u (#3 1,284 / 2,51; Rust #5 1,228 / 2,45).
  */
 
 import { availableParallelism } from "node:os";
@@ -77,11 +78,12 @@ function mainThread(n: int): void {
   // 40 products: for each of 10 rounds, v = AᵗA·u, then u = AᵗA·v; each AᵗA is A (into w), then Aᵗ
   let phase = 0, next = 0, busy = 0;
   const workers: Worker[] = [];
+  const share = ((Math.trunc((n + nw - 1) / nw) + 3) >> 2) << 2; // each worker's rows of a product
   const give = (k: int): boolean => { // the next rows of this product to worker k, if any are left
     if (next >= n) return false;
     orders[k * SLOT] = phase % 4;
     orders[k * SLOT + 1] = next;
-    next = Math.min(n, next + Math.max(16, Math.trunc((n - next) / (nw * 2)))); // big first, small at the end: the workers finish together
+    next = Math.min(n, next + share);
     orders[k * SLOT + 2] = next;
     workers[k].postMessage(buf);
     busy++;

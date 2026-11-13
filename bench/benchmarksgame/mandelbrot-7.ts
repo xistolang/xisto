@@ -7,8 +7,11 @@ test: 0 at once), with the two kinds of byte apart. After a byte with a pixel in
 49 iterations run in a loop of their own, with no test of prev in it. After a byte all outside, the test comes
 early and often (every 3 iterations up to the 12th, then every 4 up to the 28th, then every 8), when most of the
 pixels that escape at all do. Only z is kept between iterations (its squares computed at the start of each), and
-the row's last real part is read first (the seven before it then need no check).
-Graviton2 (16000, 2 threads): 2,73 s / 5,46 u (#5 2,83 / 5,66; Rust #4 2,74 / 5,47).
+the row's last real part is read first (the seven before it then need no check). The row goes by its bytes (k++,
+the last one masked inside the loop: the stores need no check and no overflow test per byte, 5,45 -> 5,41 s of
+CPU), and the rows go out in pieces of 64 that shrink near the end (a quarter of what is left per worker, at least
+4), so that the two workers finish together.
+Graviton2 (16000, 2 threads, 9 runs): 2,783 s / 5,46 u (#5 2,891 / 5,67; Rust #4 2,801 / 5,49).
  */
 
 import { availableParallelism } from "node:os";
@@ -108,53 +111,59 @@ function byte8(r0: number, r1: number, r2: number, r3: number, r4: number, r5: n
   return b;
 }
 
-// the bits of one row, eight pixels per byte, into out from at
+// the bits of one row, eight pixels per byte, into out from at (cr: the real parts, padded to whole bytes)
 function row(y: int, w: int, h: int, out: Uint8Array, at: int, cr: Float64Array): void {
   const ci = 2 * y / h - 1;
+  const bytes = (w + 7) >> 3, past = bytes * 8 - w; // past: the last byte's pixels beyond the row's end
   let prev = 0;
-  for (let x = 0; x < w; x += 8) {
+  for (let k = 0; k < bytes; k++) {
+    const x = k << 3;
     const last = cr[x + 7]; // the last first: the seven before it are then known to be within cr
     let b = byte8(cr[x], cr[x + 1], cr[x + 2], cr[x + 3], cr[x + 4], cr[x + 5], cr[x + 6], last, ci, prev);
-    const past = x + 8 - w; // pixels beyond the row's end (its last byte): zero bits, as the original pads
-    if (past > 0) b &= (0xff << past) & 0xff;
-    out[at + (x >> 3)] = b;
+    if (k === bytes - 1) b &= (0xff << past) & 0xff; // zero bits there, as the original pads
+    out[at + k] = b;
     prev = b;
   }
+}
+
+// an order for a worker: its first row and how many, four bytes each
+function order(y0: int, rows: int): Uint8Array {
+  const t = new Uint8Array(8);
+  for (let k = 0; k < 4; k++) {
+    t[k] = (y0 >> (8 * k)) & 0xff;
+    t[4 + k] = (rows >> (8 * k)) & 0xff;
+  }
+  return t;
 }
 
 function mainThread(n: int): void {
   const w = n, h = n;
   const bpr = (w + 7) >> 3;
   const image = new Uint8Array(new SharedArrayBuffer(bpr * h));
-  const chunks = Math.trunc((h + ROWS - 1) / ROWS);
-  let next = 0, left = chunks;
-  const nworkers = Math.max(1, Math.min(availableParallelism(), chunks));
+  const nworkers = Math.max(1, Math.min(availableParallelism(), h));
+  let next: int = 0, out: int = 0; // the next row to hand out; the orders not back yet
+  // pieces of at most ROWS rows that shrink near the end (a quarter of what is left per worker, at least 4), so the
+  // workers finish together
+  const give = (wk: Worker): boolean => {
+    if (next >= h) return false;
+    const rows: int = Math.min(h - next, Math.max(4, Math.min(ROWS, Math.trunc((h - next) / (4 * nworkers)))));
+    wk.postMessage(order(next, rows));
+    next += rows;
+    out++;
+    return true;
+  };
   for (let k = 0; k < nworkers; k++) {
     const wk = new Worker(__filename, { workerData: `${n}` });
     wk.on("message", (m: Uint8Array) => {
-      left--;
-      if (next < chunks) {
-        const t = new Uint8Array(4);
-        t[0] = next & 0xff;
-        t[1] = (next >> 8) & 0xff;
-        t[2] = (next >> 16) & 0xff;
-        t[3] = (next >> 24) & 0xff;
-        wk.postMessage(t);
-        next++;
-      } else wk.terminate();
-      if (left === 0) {
+      out--;
+      if (!give(wk)) wk.terminate();
+      if (out === 0 && next >= h) {
         process.stdout.write(`P4\n${w} ${h}\n`);
         process.stdout.write(image);
       }
     });
-    wk.postMessage(image); // the shared image first, then one chunk at a time
-    const t = new Uint8Array(4);
-    t[0] = next & 0xff;
-    t[1] = (next >> 8) & 0xff;
-    t[2] = (next >> 16) & 0xff;
-    t[3] = (next >> 24) & 0xff;
-    wk.postMessage(t);
-    next++;
+    wk.postMessage(image); // the shared image first, then one order at a time
+    if (!give(wk)) wk.terminate(); // (more workers than pieces)
   }
 }
 
@@ -170,9 +179,8 @@ function workerThread(): void {
       shared.push(m);
       return;
     }
-    const c: int = m[0] | (m[1] << 8) | (m[2] << 16) | (m[3] << 24);
-    const y0 = c * ROWS;
-    const rows = Math.min(ROWS, n - y0);
+    const y0: int = m[0] | (m[1] << 8) | (m[2] << 16) | (m[3] << 24);
+    const rows: int = m[4] | (m[5] << 8) | (m[6] << 16) | (m[7] << 24);
     const image = shared[0];
     for (let r = 0; r < rows; r++) row(y0 + r, n, n, image, (y0 + r) * bpr, cr);
     parentPort.postMessage(m);

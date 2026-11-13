@@ -4321,7 +4321,7 @@ typedef struct { const char *m[16]; Type *t; int n; bool param, decl, used_vec; 
 typedef struct { Stmt *blk; int i0, i1, ncls; Stmt *cls[LN_MAXC][16]; } LnRun;
 /* the plan of the function being emitted (a heap copy: a clone emitted in the middle of another function's
    body plans its own, in ln_scratch, and emit_func_body puts the outer one back) */
-typedef struct { LnGroup g[LN_MAXG]; int ng, n; LnRun r[LN_MAXR]; int nr; Func *fn; } LnState;
+typedef struct { LnGroup g[LN_MAXG]; int ng, n; LnRun r[LN_MAXR]; int nr; Func *fn; bool rev; } LnState;
 static LnState ln_scratch, *ln_cur = &ln_scratch;
 #define ln_g (ln_cur->g)
 #define ln_ng (ln_cur->ng)
@@ -4329,6 +4329,7 @@ static LnState ln_scratch, *ln_cur = &ln_scratch;
 #define ln_r (ln_cur->r)
 #define ln_nr (ln_cur->nr)
 #define ln_fn (ln_cur->fn)
+#define ln_rev (ln_cur->rev)
 static bool ln_fail;
 static bool ln_arith(Expr *e) {
     if (!e || !e->type || e->type->kind != TY_NUMBER) return false;
@@ -4515,9 +4516,13 @@ static bool ln_plan_n(Func *f, int n) {
     for (int r = 0; r < ln_nr && !work; r++) for (int j = 0; j < ln_r[r].ncls; j++) if (ln_has_op(ln_rhs(ln_r[r].cls[j][0]))) work = true;
     return work;
 }
-/* (The lanes go in the vector in the order of the copies, the memory order of what they load: the copies put
-   last to first, so that bits packed with the first copy highest come out of one movmskpd on x86, cost a reversal
-   of every load on the Graviton2, 2,5% of mandelbrot's CPU there, and gained nothing measurable on the Xeon.) */
+/* The lanes' order in the vector is free (each copy computes the same thing in any lane), and the best one depends
+   on the processor. Bits packed one per copy with the first copy in the highest bit (if (tr0 + ti0 <= 4) b |= 128;
+   ... b |= 1: a PBM row) come out of a vector comparison in one instruction on x86 (movmskpd, the lowest bit from
+   the first element) when the first copy is the last element (mandelbrot-6 on the Xeon: 2% of CPU); on ARM there
+   is no such instruction, and the reversed order costs a reversal of every load instead (mandelbrot-7 on the
+   Graviton2: 2,5%). So such a function's C has both: XS_LANE_REV (1 on x86-64) picks the order at compile time,
+   in the vectors of parameters and in every element read. */
 static int ln_lane_of_cond(Expr *e) { /* the one lane the names of e read (-1: none, -2: several) */
     if (!e) return -1;
     if (e->kind == E_IDENT) { int k; return e->cname && ln_find_g(e->cname, &k) >= 0 ? k : -1; }
@@ -4527,6 +4532,23 @@ static int ln_lane_of_cond(Expr *e) { /* the one lane the names of e read (-1: n
     if (a == -1) return b;
     if (b == -1) return a;
     return a == b ? a : -2;
+}
+static void ln_bits_vote(Stmt *s, int *fwd, int *rev) {
+    if (!s) return;
+    if (s->kind == S_IF && !s->else_body && s->body) {
+        Stmt *b = s->body;
+        if (b->kind == S_BLOCK && b->stmts.len == 1) b = b->stmts.items[0];
+        Expr *a = b->kind == S_EXPR ? b->expr : NULL;
+        int k = ln_lane_of_cond(s->cond);
+        if (a && k >= 0 && a->kind == E_ASSIGN && a->op == TK_PIPE_ASSIGN && a->rhs && a->rhs->kind == E_NUMBER && a->rhs->is_int_lit) {
+            long long v = a->rhs->ival;
+            if (v == 1LL << k) (*fwd)++;
+            else if (v == 1LL << (ln_n - 1 - k)) (*rev)++;
+        }
+    }
+    ln_bits_vote(s->for_init, fwd, rev); ln_bits_vote(s->body, fwd, rev); ln_bits_vote(s->else_body, fwd, rev);
+    for (int i = 0; i < s->stmts.len; i++) ln_bits_vote(s->stmts.items[i], fwd, rev);
+    for (int i = 0; i < s->ncases; i++) ln_bits_vote(s->cases[i].body, fwd, rev);
 }
 /* decides the lanes of f (ln_on), before its body is emitted */
 static void ln_plan(Func *f) {
@@ -4538,6 +4560,9 @@ static void ln_plan(Func *f) {
     if (!ln_on) return;
     ln_fn = f;
     for (int g = 0; g < ln_ng; g++) ln_g[g].vname = xs_sprintf("lv_%s", ln_g[g].m[0]);
+    int fwd = 0, rev = 0;
+    ln_bits_vote(f->body, &fwd, &rev);
+    ln_rev = rev > fwd;
     LnState *keep = malloc(sizeof *keep);
     *keep = ln_scratch;
     ln_cur = keep;
@@ -4546,12 +4571,17 @@ static void ln_plan(Func *f) {
 static void ln_prologue(void) {
     nl();
     buf_printf(out, "typedef double xs_lane%d __attribute__((vector_size(%d)));", ln_n, ln_n * 8);
+    if (ln_rev) buf_puts(out, "\n#ifndef XS_LANE_REV\n#if defined(__x86_64__)\n#define XS_LANE_REV 1\n#else\n#define XS_LANE_REV 0\n#endif\n#endif");
     for (int g = 0; g < ln_ng; g++) {
         if (!ln_g[g].param) continue;
-        nl();
-        buf_printf(out, "xs_lane%d %s = {", ln_n, ln_g[g].vname);
-        for (int k = 0; k < ln_n; k++) buf_printf(out, "%s%s", k ? ", " : "", ln_g[g].m[k]);
-        buf_puts(out, "};");
+        for (int v = ln_rev ? 0 : 1; v < 2; v++) { /* v 0: last to first (x86), 1: in order */
+            if (ln_rev) buf_puts(out, v == 0 ? "\n#if XS_LANE_REV" : "\n#else");
+            nl();
+            buf_printf(out, "xs_lane%d %s = {", ln_n, ln_g[g].vname);
+            for (int k = 0; k < ln_n; k++) buf_printf(out, "%s%s", k ? ", " : "", ln_g[g].m[v == 0 ? ln_n - 1 - k : k]);
+            buf_puts(out, "};");
+        }
+        if (ln_rev) buf_puts(out, "\n#endif");
     }
 }
 static bool ln_ident(Expr *e) {
@@ -4560,6 +4590,7 @@ static bool ln_ident(Expr *e) {
     int g = ln_find_g(e->cname, &k);
     if (g < 0) return false;
     if (ln_vec) buf_puts(out, ln_g[g].vname);
+    else if (ln_rev) buf_printf(out, "%s[XS_LANE_REV ? %d : %d]", ln_g[g].vname, ln_n - 1 - k, k);
     else buf_printf(out, "%s[%d]", ln_g[g].vname, k);
     return true;
 }
