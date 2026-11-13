@@ -1,0 +1,107 @@
+# xisto main 937cb49, 2026-11-13T05:25Z, Linux aarch64, cc (GCC) 11.5.0 20240719 (Red Hat 11.5.0-5)
+make rc 0
+XISTO_CPU=native
+rust rustc 1.99.1 (58cf8f9c3 2026-10-13)
+steal before 4932
+# Linux aarch64, 2 cpu; median of 3
+spectralnorm   xisto  spectralnorm            1.334s     2.60cpu      1.6MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-2          2.380s     4.59cpu      1.9MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-3          1.281s     2.51cpu      1.9MB  par  2.0  same
+spectralnorm   xisto  spectralnorm-4          1.356s     2.58cpu      1.9MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-5          1.221s     2.43cpu      1.9MB  par  2.0  same
+spectralnorm   rust   spectralnorm            1.246s     2.44cpu      2.1MB  par  2.0  same
+spectralnorm   rust   spectralnorm_2          1.243s     2.44cpu      2.1MB  par  2.0  same
+spectralnorm   rust   spectralnorm_3          1.243s     2.44cpu      2.0MB  par  2.0  same
+spectralnorm   rust   spectralnorm_4          1.242s     2.48cpu      2.0MB  par  2.0  same
+spectralnorm   rust   spectralnorm_5          1.229s     2.45cpu      2.0MB  par  2.0  same
+spectralnorm   rust   spectralnorm_6       failed
+spectralnorm   rust   spectralnorm_7          1.427s     2.85cpu      2.0MB  par  2.0  same
+nbody          xisto  nbody                   4.609s     4.61cpu      1.6MB  par  1.0  same
+nbody          xisto  nbody-2                 7.766s     7.76cpu      1.6MB  par  1.0  same
+nbody          xisto  nbody-3                 6.584s     6.57cpu      1.6MB  par  1.0  same
+nbody          xisto  nbody-4                 5.107s     5.08cpu      1.6MB  par  1.0  same
+nbody          xisto  nbody-5                 4.819s     4.82cpu      1.5MB  par  1.0  same
+nbody          rust   nbody                   6.733s     6.73cpu      1.7MB  par  1.0  same
+nbody          rust   nbody_2                 4.998s     4.99cpu      1.8MB  par  1.0  same
+nbody          rust   nbody_3                 5.117s     5.11cpu      1.7MB  par  1.0  same
+nbody          rust   nbody_4                 6.111s     6.10cpu      1.7MB  par  1.0  same
+nbody          rust   nbody_6                 5.149s     5.15cpu      1.8MB  par  1.0  same
+fannkuchredux  xisto  fannkuchredux           9.782s    19.49cpu      1.5MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-2        11.411s    22.79cpu      1.8MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-3        11.760s    23.49cpu      1.8MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-4         9.854s    19.68cpu      1.8MB  par  2.0  same
+fannkuchredux  rust   fannkuchredux_2        18.824s    37.58cpu      1.9MB  par  2.0  same
+fannkuchredux  rust   fannkuchredux_4        14.251s    27.92cpu      1.9MB  par  2.0  same
+fannkuchredux  rust   fannkuchredux_5        15.016s    29.47cpu      1.9MB  par  2.0  same
+binarytrees    xisto  binarytrees             1.947s     3.73cpu     69.5MB  par  1.9  same
+binarytrees    xisto  binarytrees-2           1.903s     3.73cpu    119.3MB  par  2.0  same
+binarytrees    xisto  binarytrees-3           1.826s     3.58cpu    113.7MB  par  2.0  same
+binarytrees    xisto  binarytrees-4           3.480s     3.48cpu     65.1MB  par  1.0  same
+binarytrees    rust   binarytrees             3.524s     6.79cpu    129.8MB  par  1.9  same
+binarytrees    rust   binarytrees_2           2.130s     4.08cpu    129.9MB  par  1.9  same
+binarytrees    rust   binarytrees_3           3.001s     5.67cpu    130.0MB  par  1.9  same
+binarytrees    rust   binarytrees_4           3.385s     6.41cpu    129.8MB  par  1.9  same
+binarytrees    rust   binarytrees_5           3.044s     5.87cpu    129.9MB  par  1.9  same
+mandelbrot     xisto  mandelbrot              2.969s     5.87cpu     33.1MB  par  2.0  same
+mandelbrot     xisto  mandelbrot-2            4.427s     8.73cpu     32.2MB  par  2.0  same
+mandelbrot     xisto  mandelbrot-3            3.192s     6.28cpu     32.4MB  par  2.0  same
+mandelbrot     xisto  mandelbrot-4            3.000s     5.90cpu     32.5MB  par  2.0  same
+mandelbrot     xisto  mandelbrot-5            2.885s     5.67cpu     32.6MB  par  2.0  same
+mandelbrot     xisto  mandelbrot-6            2.897s     5.70cpu     32.4MB  par  2.0  same
+mandelbrot     xisto  mandelbrot-7            2.785s     5.46cpu     32.6MB  par  2.0  same
+mandelbrot     rust   mandelbrot              3.865s     7.65cpu     38.2MB  par  2.0  same
+mandelbrot     rust   mandelbrot_2            3.060s     6.02cpu     32.5MB  par  2.0  same
+mandelbrot     rust   mandelbrot_3            3.206s     6.30cpu     11.5MB  par  2.0  same
+mandelbrot     rust   mandelbrot_4            2.792s     5.49cpu     32.5MB  par  2.0  same
+mandelbrot     rust   mandelbrot_5            3.083s     6.09cpu     33.0MB  par  2.0  same
+mandelbrot     rust   mandelbrot_6            2.919s     5.76cpu     33.2MB  par  2.0  same
+mandelbrot     rust   mandelbrot_7            3.059s     6.02cpu     32.4MB  par  2.0  same
+fasta          xisto  fasta                   0.551s     0.39cpu      1.9MB  par  0.7  same
+fasta          xisto  fasta-2                 1.063s     0.94cpu      1.7MB  par  0.9  same
+fasta          rust   fasta                   5.444s     5.38cpu      1.6MB  par  1.0  same
+fasta          rust   fasta_2                 1.829s     3.05cpu      2.5MB  par  1.7  same
+fasta          rust   fasta_3                 2.068s     1.99cpu      1.8MB  par  1.0  same
+fasta          rust   fasta_4                 3.742s     3.58cpu    120.9MB  par  1.0  same
+fasta          rust   fasta_5                 1.968s     3.22cpu      2.6MB  par  1.6  same
+fasta          rust   fasta_6                 3.770s     3.61cpu    120.7MB  par  1.0  same
+fasta          rust   fasta_7                 1.470s     2.48cpu      2.4MB  par  1.7  same
+fasta          rust   fasta_9                 1.897s     3.17cpu      2.5MB  par  1.7  same
+knucleotide    xisto  knucleotide             3.223s     6.29cpu    364.5MB  par  2.0  same
+knucleotide    xisto  knucleotide-2           8.545s    15.81cpu    370.0MB  par  1.9  same
+knucleotide    xisto  knucleotide-3           8.647s    16.62cpu    363.9MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           4.888s     8.91cpu    156.1MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           4.118s     8.08cpu    150.2MB  par  2.0  same
+knucleotide    xisto  knucleotide-6           3.535s     6.79cpu    152.9MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           2.989s     5.85cpu     62.5MB  par  2.0  same
+knucleotide    rust   knucleotide            43.970s    86.78cpu    153.0MB  par  2.0  same
+knucleotide    rust   knucleotide_2          10.364s    19.52cpu    134.5MB  par  1.9  same
+knucleotide    rust   knucleotide_3           6.939s    13.45cpu    134.3MB  par  1.9  same
+knucleotide    rust   knucleotide_4           9.282s    17.63cpu    132.9MB  par  1.9  same
+knucleotide    rust   knucleotide_5           5.033s     9.47cpu    133.9MB  par  1.9  same
+knucleotide    rust   knucleotide_6           3.886s     7.44cpu    138.2MB  par  1.9  same
+knucleotide    rust   knucleotide_7           6.373s    11.72cpu    130.8MB  par  1.8  same
+knucleotide    rust   knucleotide_9           7.811s    14.80cpu    133.1MB  par  1.9  same
+revcomp        xisto  revcomp                 0.283s     0.26cpu    243.9MB  par  0.9  same
+revcomp        xisto  revcomp-2               0.594s     0.33cpu    243.8MB  par  0.5  same
+revcomp        xisto  revcomp-3               0.434s     0.26cpu    486.3MB  par  0.6  same
+revcomp        xisto  revcomp-4               0.432s     0.21cpu    244.2MB  par  0.5  same
+revcomp        xisto  revcomp-5               0.416s     0.28cpu    308.2MB  par  0.7  same
+revcomp        xisto  revcomp-6               0.350s     0.25cpu    188.6MB  par  0.7  same
+revcomp        xisto  revcomp-7               0.421s     0.25cpu    188.7MB  par  0.6  same
+revcomp        xisto  revcomp-8               0.355s     0.33cpu     68.3MB  par  0.9  same
+revcomp        rust   revcomp                 0.552s     0.36cpu    123.1MB  par  0.7  same
+revcomp        rust   revcomp_2               0.585s     0.45cpu    244.4MB  par  0.8  same
+revcomp        rust   revcomp_3               0.598s     0.49cpu    244.4MB  par  0.8  same
+regexredux     xisto  regexredux              1.208s     1.24cpu    148.4MB  par  1.0  same
+regexredux     rust   regexredux              1.573s     1.75cpu    150.1MB  par  1.1  same
+regexredux     rust   regexredux_2            1.526s     1.69cpu    150.0MB  par  1.1  same
+regexredux     rust   regexredux_3            1.447s     1.68cpu    197.8MB  par  1.2  same
+regexredux     rust   regexredux_4            1.439s     1.74cpu    194.7MB  par  1.2  same
+regexredux     rust   regexredux_5            1.385s     1.67cpu    197.8MB  par  1.2  same
+regexredux     rust   regexredux_6            1.287s     1.58cpu    149.7MB  par  1.2  same
+pidigits       xisto  pidigits                2.043s     2.04cpu      2.1MB  par  1.0  same
+pidigits       rust   pidigits                2.222s     2.22cpu      2.9MB  par  1.0  same
+pidigits       rust   pidigits_2              2.224s     2.22cpu      2.9MB  par  1.0  same
+pidigits       rust   pidigits_3              2.217s     2.21cpu      3.0MB  par  1.0  same
+steal after 5490
+DONE
