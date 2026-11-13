@@ -52,7 +52,8 @@ console.log("after bare"); // Node:  start bare, after bare, … end bare later
 ```
 
 Cost, measured on an Apple M4 (12 Nov 2026), 2 million calls: `await f()` 0.7–0.9 ns per call; a kept promise
-(`const p = f(); await p`) about 73 ns. Node: about 20 ns for both. Await directly where you can.
+(`const p = f(); await p`) about 73 ns. Node: about 20 ns for both. Await directly where you can. How waiting
+works underneath, and why: [Why coroutines](../performance/coroutines.md).
 
 ## Promise.all, race, allSettled
 

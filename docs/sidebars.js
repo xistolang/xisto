@@ -33,7 +33,7 @@ const sidebars = {
     {
       type: 'category',
       label: 'Performance',
-      items: ['performance/model', 'performance/best-practices', 'performance/measuring', 'performance/methodology'],
+      items: ['performance/model', 'performance/coroutines', 'performance/best-practices', 'performance/measuring', 'performance/methodology'],
     },
     {
       type: 'category',

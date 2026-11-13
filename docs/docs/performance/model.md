@@ -102,7 +102,7 @@ with a certificate; `--tls=off` removes it. Measured on the M4 (5 Nov 2026, desi
   (Node: about 20 ns for both) (2 million calls, Apple M4, 12 Nov 2026).
 - **Event loop.** One thread runs coroutines on kqueue (macOS), an epoll equivalent (Linux) or WSAPoll (Windows).
   A parked coroutine on the shared stack keeps only the bytes it used: 10,000 waiting tasks took 15 MB against
-  Bun's 35 MB (M4, 6 Nov 2026, design notes).
+  Bun's 35 MB (M4, 6 Nov 2026, design notes). Why coroutines and not continuations: [Why coroutines](./coroutines.md).
 - **Threads are for CPU work.** `worker_threads` runs the same program on another thread. `xisto:parallel`
   (`parallelMap`, `parallelFrom`, `parallelFill`, `parallelReduce`) runs only when the compiler proves the
   callback independent: it reads shared numbers and numeric arrays, writes nothing outside itself and prints

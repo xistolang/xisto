@@ -41,6 +41,7 @@
       "label": "Performance",
       "items": [
         "performance/model",
+        "performance/coroutines",
         "performance/best-practices",
         "performance/measuring",
         "performance/methodology"
