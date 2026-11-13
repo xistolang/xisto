@@ -256,7 +256,8 @@ static void count_calls(Program *p) {
 static int64_t bce_fixed_of(Stmt *s);
 static bool fixp_typed(Type *t) {
     return t && t->kind == TY_OBJECT && t->cls && t->cls->builtin &&
-           (strcmp(t->cls->cname, "xs_Float64Array") == 0 || strcmp(t->cls->cname, "xs_Float32Array") == 0 || strcmp(t->cls->cname, "xs_Uint8Array") == 0);
+           (strcmp(t->cls->cname, "xs_Float64Array") == 0 || strcmp(t->cls->cname, "xs_Float32Array") == 0 || strcmp(t->cls->cname, "xs_Int32Array") == 0 ||
+            strcmp(t->cls->cname, "xs_Uint8Array") == 0);
 }
 static int64_t fixp_local(Stmt *s, const char *c) {
     if (!s) return 0;
@@ -1291,6 +1292,9 @@ static bool is_f64_type(Type *t) { return t && t->kind == TY_OBJECT && t->cls &&
 /* a Float32Array: its data are floats (4 bytes each); a read is the float as a double, a write rounds to a float */
 static bool is_f32_type(Type *t) { return t && t->kind == TY_OBJECT && t->cls && t->cls->builtin && strcmp(t->cls->cname, "xs_Float32Array") == 0; }
 static bool is_f32_index(Expr *e) { return e && e->kind == E_INDEX && !e->builtin.cfn && e->lhs && is_f32_type(e->lhs->type); }
+/* an Int32Array: its data are int32_t; a read is the int, a write wraps the value to 32 bits (ToInt32) */
+static bool is_i32_type(Type *t) { return t && t->kind == TY_OBJECT && t->cls && t->cls->builtin && strcmp(t->cls->cname, "xs_Int32Array") == 0; }
+static bool is_i32_index(Expr *e) { return e && e->kind == E_INDEX && !e->builtin.cfn && e->lhs && is_i32_type(e->lhs->type); }
 /* computing e cannot run user code (a function, a method, a closure, a constructor, a callback passed to a builtin) */
 static bool no_user_code(Expr *e) {
     if (!e) return true;
@@ -1322,10 +1326,10 @@ static void emit_lvalue_ptr(Expr *e) {
         buf_printf(out, ")->%s", e->cls->fields[e->field].cname);
         return;
     default: /* E_INDEX */
-        if (is_f64_type(e->lhs->type) || is_f32_type(e->lhs->type)) { /* f[i] on a Float64Array: its data, as a number[]'s
-                                                                         (a float * on a Float32Array's) */
+        if (is_f64_type(e->lhs->type) || is_f32_type(e->lhs->type) || is_i32_type(e->lhs->type)) { /* f[i] on a Float64Array: its data, as a number[]'s
+                                                                         (a float * on a Float32Array's, an int32_t * on an Int32Array's) */
             bool safe = bce_safe(e);
-            buf_puts(out, safe ? "(&(" : is_f32_type(e->lhs->type) ? "xs_f32_at_s(" : "xs_f64_at_s(");
+            buf_puts(out, safe ? "(&(" : is_f32_type(e->lhs->type) ? "xs_f32_at_s(" : is_i32_type(e->lhs->type) ? "xs_i32_at_s(" : "xs_f64_at_s(");
             emit_borrowed(e->lhs);
             buf_puts(out, safe ? ")->data[" : ", ");
             if (safe && e->rhs->kind == E_BINARY && (e->rhs->op == TK_PLUS || e->rhs->op == TK_MINUS)) {
@@ -2312,8 +2316,8 @@ static void emit_member(Expr *e) {
     }
     /* object */
     if (e->field >= 0 && e->cls->builtin && (strcmp(e->cls->cname, "xs_Uint8Array") == 0 || strcmp(e->cls->cname, "xs_Float64Array") == 0 ||
-                                             strcmp(e->cls->cname, "xs_Float32Array") == 0)) {
-        buf_puts(out, e->cls->cname[3] == 'U' ? "xs_u8_len(" : e->cls->cname[8] == '3' ? "xs_f32_len(" : "xs_f64_len("); /* bytes.length: with its bound told to the compiler */
+                                             strcmp(e->cls->cname, "xs_Float32Array") == 0 || strcmp(e->cls->cname, "xs_Int32Array") == 0)) {
+        buf_puts(out, e->cls->cname[3] == 'U' ? "xs_u8_len(" : e->cls->cname[3] == 'I' ? "xs_i32_len(" : e->cls->cname[8] == '3' ? "xs_f32_len(" : "xs_f64_len("); /* bytes.length: with its bound told to the compiler */
         emit_borrowed(base);
         buf_puts(out, ")");
         return;
@@ -2640,6 +2644,7 @@ static char *from_unknown(Type *t, const char *expr) {
         if (strcmp(b->cls->cname, "xs_Uint8Array") == 0) fr = "xs_u8_free"; /* (Buffer too: the same free, another print) */
         else if (strcmp(b->cls->cname, "xs_Float64Array") == 0) fr = "xs_f64_free";
         else if (strcmp(b->cls->cname, "xs_Float32Array") == 0) fr = "xs_f32_free";
+        else if (strcmp(b->cls->cname, "xs_Int32Array") == 0) fr = "xs_i32_free";
         return xs_sprintf("((%s)xs_as_ref(%s, %s, %d, \"%s\"))", ctype(b), expr, fr, nul, what);
     }
     case TY_ARRAY: {
@@ -3409,6 +3414,7 @@ static void emit_expr_raw(Expr *e) {
                        c->builtin && (strcmp(c->name, "Uint8Array") == 0 || strcmp(c->name, "Buffer") == 0) ? "xs_u8_free" :
                        c->builtin && strcmp(c->name, "Float64Array") == 0 ? "xs_f64_free" :
                        c->builtin && strcmp(c->name, "Float32Array") == 0 ? "xs_f32_free" :
+                       c->builtin && strcmp(c->name, "Int32Array") == 0 ? "xs_i32_free" :
                        c->builtin ? "NULL" : xs_sprintf("%s_free", c->cname));
             return;
         }
@@ -3460,6 +3466,34 @@ static void emit_expr_raw(Expr *e) {
         buf_puts(out, ")");
         return;
     case E_ASSIGN:
+        if (is_i32_index(e->lhs) && (e->op == TK_ASSIGN || e->op == TK_PLUS_ASSIGN || e->op == TK_MINUS_ASSIGN || e->op == TK_STAR_ASSIGN ||
+                                     e->op == TK_SLASH_ASSIGN)) {
+            /* i[k] = v, i[k] op= v on an Int32Array: the value computed (an int, or a number), stored through ToInt32; the
+               expression's value is that value, as JavaScript's (the old element read before the right side runs) */
+            bool num = e->type && e->type->kind == TY_NUMBER;
+            const char *T = num ? "double" : "int64_t";
+            buf_puts(out, "({ int32_t *ip_ = ");
+            emit_lvalue_ptr(e->lhs);
+            if (e->op == TK_ASSIGN) {
+                buf_printf(out, "; %s iv_ = (%s)(", T, T);
+                emit_expr(e->rhs);
+                buf_puts(out, ")");
+            } else if (num) {
+                const char *op = e->op == TK_PLUS_ASSIGN ? "+" : e->op == TK_MINUS_ASSIGN ? "-" : e->op == TK_STAR_ASSIGN ? "*" : "/";
+                buf_printf(out, "; double ov_ = (double)*ip_; double iv_ = ov_ %s (double)(", op);
+                emit_expr(e->rhs);
+                buf_puts(out, ")");
+            } else {
+                const char *fn = e->op == TK_PLUS_ASSIGN ? "xs_iadd_s" : e->op == TK_MINUS_ASSIGN ? "xs_isub_s" : "xs_imul_s";
+                buf_printf(out, "; int64_t ov_ = (int64_t)*ip_; int64_t iv_ = %s(ov_, (int64_t)(", fn);
+                emit_expr(e->rhs);
+                buf_puts(out, ")");
+                site_arg(e->pos);
+                buf_puts(out, ")");
+            }
+            buf_printf(out, "; *ip_ = %s(iv_); iv_; })", num ? "xs_toint32_d" : "xs_toint32_i");
+            return;
+        }
         if (is_f32_index(e->lhs)) { /* f[i] = x, f[i] op= x on a Float32Array: computed in double, stored rounded to a float;
                                        the expression's value is the double (as JavaScript's) */
             const char *op = e->op == TK_ASSIGN ? NULL : e->op == TK_PLUS_ASSIGN ? "+" : e->op == TK_MINUS_ASSIGN ? "-" :
@@ -3641,6 +3675,12 @@ static void emit_expr_raw(Expr *e) {
         buf_puts(out, ")");
         return;
     case E_POSTFIX:
+        if (is_i32_index(e->lhs)) { /* i[k]++ on an Int32Array: the old value, the new one wrapped to 32 bits */
+            buf_puts(out, "({ int32_t *ip_ = ");
+            emit_lvalue_ptr(e->lhs);
+            buf_printf(out, "; int64_t iv_ = (int64_t)*ip_; *ip_ = xs_toint32_i(iv_ %s 1); iv_; })", e->op == TK_PLUSPLUS ? "+" : "-");
+            return;
+        }
         if (is_f32_index(e->lhs)) { /* f[i]++ on a Float32Array: the old value, the new one rounded to a float */
             buf_puts(out, "({ float *fp_ = ");
             emit_lvalue_ptr(e->lhs);
@@ -3851,6 +3891,12 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, ", ");
             emit_expr(e->rhs);
             if (strcmp(e->builtin.cfn, "xs_u8_get") == 0) site_arg(e->pos);
+            buf_puts(out, ")");
+            return;
+        }
+        if (is_i32_index(e)) { /* an Int32Array element: the int it is */
+            buf_puts(out, "((int64_t)");
+            emit_lvalue(e);
             buf_puts(out, ")");
             return;
         }
@@ -5475,7 +5521,8 @@ static int fx_find(const char *c) {
 static int64_t bce_fixed_of(Stmt *s) {
     if (s->kind != S_VAR || !s->is_const || !s->cname || s->cell || !s->init) return 0;
     Expr *e = s->init;
-    if (e->kind != E_NEW_OBJ || !e->builtin.cfn || (strcmp(e->builtin.cfn, "xs_u8_new") != 0 && strcmp(e->builtin.cfn, "xs_f64_new") != 0 && strcmp(e->builtin.cfn, "xs_f32_new") != 0) || e->args.len != 1) return 0;
+    if (e->kind != E_NEW_OBJ || !e->builtin.cfn || (strcmp(e->builtin.cfn, "xs_u8_new") != 0 && strcmp(e->builtin.cfn, "xs_f64_new") != 0 && strcmp(e->builtin.cfn, "xs_f32_new") != 0 &&
+                                                strcmp(e->builtin.cfn, "xs_i32_new") != 0) || e->args.len != 1) return 0;
     Expr *n = e->args.items[0];
     int64_t v;
     if (n->kind == E_IDENT && n->cname && cig_find(n->cname, &v)) return v > 0 ? v : 0; /* new Float64Array(N), N a top-level const int */
@@ -6128,10 +6175,10 @@ static bool bce_body_ok(Expr *e, Expr *parent, const char *a) {
 }
 /* the indexable types the checks are dropped for: arrays, Float64Array (the same ->len and ->data) and
    Uint8Array (bytes: ->f_length, xs_u8_at_nc) */
-static bool bce_indexable(Type *t) { return t && (t->kind == TY_ARRAY || is_f64_type(t) || is_f32_type(t) || bce_bytes(t)); }
+static bool bce_indexable(Type *t) { return t && (t->kind == TY_ARRAY || is_f64_type(t) || is_f32_type(t) || is_i32_type(t) || bce_bytes(t)); }
 static bool bce_plain_local(const char *cname) { return cname && strncmp(cname, "v_", 2) == 0; } /* (not a global, nor a cell) */
 static bool bce_ok(Stmt *body, const char *a, Type *t, bool calls_ok) {
-    bce_fixed_len = calls_ok && (is_f64_type(t) || is_f32_type(t) || bce_bytes(t)) && bce_plain_local(a);
+    bce_fixed_len = calls_ok && (is_f64_type(t) || is_f32_type(t) || is_i32_type(t) || bce_bytes(t)) && bce_plain_local(a);
     bool ok = bce_stmt_ok(body, a);
     bce_fixed_len = false;
     return ok;
@@ -8230,7 +8277,7 @@ static void emit_stmt_(Stmt *s) {
     }
     case S_FOROF: {
         Type *at = s->expr->type;
-        if (at->kind == TY_OBJECT && at->cls->builtin && (strcmp(at->cls->cname, "xs_Uint8Array") == 0 || is_f64_type(at) || is_f32_type(at))) { /* for (const b of bytes) */
+        if (at->kind == TY_OBJECT && at->cls->builtin && (strcmp(at->cls->cname, "xs_Uint8Array") == 0 || is_f64_type(at) || is_f32_type(at) || is_i32_type(at))) { /* for (const b of bytes) */
             buf_puts(out, "{");
             indent++;
             epush(false);

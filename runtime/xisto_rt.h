@@ -7446,6 +7446,94 @@ XS_NOINLINE xs_str *xs_f32_to_string(xs_Float32Array *a) {
     return r;
 }
 
+/* ---- Int32Array elements (as in Node): i[k] is an int; a write is ToInt32 of the value (an int wrapped modulo 2^32,
+   a number truncated first, NaN and the Infinities 0) ---- */
+static inline __attribute__((always_inline)) int32_t xs_toint32_i(int64_t v) { return (int32_t)(uint32_t)(uint64_t)v; }
+static inline int32_t xs_toint32_d(double d) {
+    if (d > -9.2e18 && d < 9.2e18) return (int32_t)(uint32_t)(uint64_t)(int64_t)d; /* (truncates toward 0; NaN fails both tests) */
+    if (!isfinite(d)) return 0;
+    double m = fmod(trunc(d), 4294967296.0); /* exact: |d| >= 2^63 is an integer */
+    if (m < 0) m += 4294967296.0;
+    return (int32_t)(uint32_t)m;
+}
+/* the length, with the bound every Int32Array has (as xs_f64_len) */
+static inline int64_t xs_i32_len(xs_Int32Array *a) {
+    int64_t n = a->f_length;
+#if defined(__clang__)
+    __builtin_assume(n >= 0 && n <= ((int64_t)1 << 38));
+#else
+    if (n < 0 || n > ((int64_t)1 << 38)) __builtin_unreachable();
+#endif
+    return n;
+}
+static inline int32_t *xs_i32_at_s(xs_Int32Array *a, int64_t i, const xs_site *s) {
+    if ((uint64_t)i >= (uint64_t)a->f_length) XS_FAIL("index out of bounds", s);
+    return &a->data[i];
+}
+static inline int64_t xs_i32_byte_length(xs_Int32Array *a) { return a->f_length * 4; }
+static inline int64_t xs_i32_byte_offset(xs_Int32Array *a) { return (int64_t)((char *)a->data - xs_shblk_data(a->blk)); }
+XS_NOINLINE xs_Int32Array *xs_i32_from_ints(xs_arr_int *s) {
+    xs_Int32Array *a = xs_i32_wrap(xs_shblk_new((int64_t)s->len * 4, false), 0, (int64_t)s->len, false);
+    for (size_t i = 0; i < s->len; i++) a->data[i] = xs_toint32_i(s->data[i]);
+    return a;
+}
+XS_NOINLINE xs_Int32Array *xs_i32_from_nums(xs_arr_num *s) {
+    xs_Int32Array *a = xs_i32_wrap(xs_shblk_new((int64_t)s->len * 4, false), 0, (int64_t)s->len, false);
+    for (size_t i = 0; i < s->len; i++) a->data[i] = xs_toint32_d(s->data[i]);
+    return a;
+}
+XS_NOINLINE xs_Int32Array *xs_i32_copy(xs_Int32Array *s) {
+    xs_Int32Array *a = xs_i32_wrap(xs_shblk_new(s->f_length * 4, false), 0, s->f_length, false);
+    if (s->f_length) memcpy(a->data, s->data, (size_t)s->f_length * sizeof(int32_t));
+    return a;
+}
+XS_NOINLINE xs_Int32Array *xs_i32_fill(xs_Int32Array *a, double v, int64_t start, int64_t end) {
+    int64_t s = xs_u8_rel(start, a->f_length, 0), e = xs_u8_rel(end, a->f_length, a->f_length);
+    int32_t x = xs_toint32_d(v);
+    for (int64_t i = s; i < e; i++) a->data[i] = x;
+    return xs_retain(a);
+}
+XS_NOINLINE void xs_i32_set_from(xs_Int32Array *d, xs_Int32Array *s, int64_t off) {
+    xs_f64_set_check(s->f_length, off, d->f_length);
+    if (s->f_length) memmove(d->data + off, s->data, (size_t)s->f_length * sizeof(int32_t)); /* (views on one block may overlap) */
+}
+XS_NOINLINE void xs_i32_set_ints(xs_Int32Array *d, xs_arr_int *s, int64_t off) {
+    xs_f64_set_check((int64_t)s->len, off, d->f_length);
+    for (size_t i = 0; i < s->len; i++) d->data[off + (int64_t)i] = xs_toint32_i(s->data[i]);
+}
+XS_NOINLINE void xs_i32_set_nums(xs_Int32Array *d, xs_arr_num *s, int64_t off) {
+    xs_f64_set_check((int64_t)s->len, off, d->f_length);
+    for (size_t i = 0; i < s->len; i++) d->data[off + (int64_t)i] = xs_toint32_d(s->data[i]);
+}
+XS_NOINLINE xs_Int32Array *xs_i32_subarray(xs_Int32Array *a, int64_t start, int64_t end) { /* a view on the same block */
+    int64_t s = xs_u8_rel(start, a->f_length, 0), e = xs_u8_rel(end, a->f_length, a->f_length);
+    xs_shblk_ref(a->blk);
+    return xs_i32_wrap(a->blk, (a->data - (int32_t *)xs_shblk_data(a->blk)) + s, e > s ? e - s : 0, a->shared);
+}
+XS_NOINLINE xs_Int32Array *xs_i32_slice(xs_Int32Array *a, int64_t start, int64_t end) { /* a copy, of its own */
+    int64_t s = xs_u8_rel(start, a->f_length, 0), e = xs_u8_rel(end, a->f_length, a->f_length), n = e > s ? e - s : 0;
+    xs_Int32Array *r = xs_i32_wrap(xs_shblk_new(n * 4, false), 0, n, false);
+    if (n) memcpy(r->data, a->data + s, (size_t)n * sizeof(int32_t));
+    return r;
+}
+XS_NOINLINE xs_str *xs_i32_join(xs_Int32Array *a, xs_str *sep) {
+    xs_sb sb = {0};
+    char t[16];
+    for (int64_t i = 0; i < a->f_length; i++) {
+        if (i) xs_sb_put(&sb, sep->data, (size_t)sep->len);
+        int k = snprintf(t, sizeof t, "%d", a->data[i]);
+        xs_sb_put(&sb, t, (size_t)k);
+    }
+    xs_str *r = xs_str_new(sb.data ? sb.data : "", sb.len);
+    free(sb.data);
+    return r;
+}
+XS_NOINLINE xs_str *xs_i32_to_string(xs_Int32Array *a) {
+    xs_str *c = xs_str_new(",", 1), *r = xs_i32_join(a, c);
+    xs_release(c);
+    return r;
+}
+
 /* ---- text ---- */
 XS_NOINLINE xs_Uint8Array *xs_text_encode(xs_str *s) { /* new TextEncoder().encode(s): the UTF-8 bytes */
     xs_Uint8Array *b = xs_u8_raw(s->len, false, false);

@@ -1329,7 +1329,8 @@ static void emit_main_unit(Program *p) {
 }
 
 static bool qtyped(Type *t) { /* Float64Array/Uint8Array: the qbe backend has no lowering for them (a parameter of one crashed it) */
-    return t && t->kind == TY_OBJECT && t->cls && t->cls->builtin && (strcmp(t->cls->cname, "xs_Float64Array") == 0 || strcmp(t->cls->cname, "xs_Float32Array") == 0 || strcmp(t->cls->cname, "xs_Uint8Array") == 0);
+    return t && t->kind == TY_OBJECT && t->cls && t->cls->builtin && (strcmp(t->cls->cname, "xs_Float64Array") == 0 || strcmp(t->cls->cname, "xs_Float32Array") == 0 ||
+                                                                         strcmp(t->cls->cname, "xs_Int32Array") == 0 || strcmp(t->cls->cname, "xs_Uint8Array") == 0);
 }
 static void check_supported(Program *p) {
     for (int i = 0; i < p->nfuncs; i++) {
