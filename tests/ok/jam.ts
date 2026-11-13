@@ -1,62 +1,70 @@
-// parallelFill with a callback shaped like one row of a matrix-vector product: the compiler also makes a version
-// that does eight rows at once (jam, XB-083); the sums must be the same doubles as one row at a time
-import { parallelFill } from "xisto:parallel";
-
-function A(i: int, j: int): number {
-  return 1 / (Number((i + j) * (i + j + 1)) / 2 + Number(i) + 1);
+// unroll-and-jam of j (emit.c, uj_emit_loop): U columns of a product at once, each sum in the order of k; the
+// guard falls back to the loop as it was when a row read is the row written, or an index leaves a row. Every case
+// here must print what Node prints.
+function grid(r: int, c: int, f: (i: int, j: int) => number): number[][] {
+  const g: number[][] = [];
+  for (let i = 0; i < r; i++) {
+    const row: number[] = [];
+    for (let j = 0; j < c; j++) row.push(f(i, j));
+    g.push(row);
+  }
+  return g;
+}
+function show(g: number[][]): string {
+  return g.map((r) => r.map((x) => x.toFixed(6)).join(",")).join(" ");
+}
+function mm(ni: int, nj: int, nk: int, alpha: number, C: number[][], A: number[][], B: number[][]): void {
+  for (let i = 0; i < ni; i++)
+  for (let j = 0; j < nj; j++) {
+    C[i][j] = 0.0;
+    for (let k = 0; k < nk; ++k) C[i][j] += alpha * A[i][k] * B[k][j];
+  }
+}
+function scaleAdd(ni: int, nj: int, nk: int, beta: number, D: number[][], T: number[][], C: number[][]): void {
+  for (let i = 0; i < ni; i++)
+  for (let j = 0; j < nj; j++) {
+    D[i][j] *= beta;
+    for (let k = 0; k < nk; ++k) D[i][j] += T[i][k] * C[k][j];
+  }
+}
+function luRest(n: int, A: number[][]): void {
+  for (let i = 0; i < n; i++)
+  for (let j = i; j < n; j++) for (let k = 0; k < i; k++) A[i][j] -= A[i][k] * A[k][j];
+}
+function vecmat(np: int, a: number[], C4: number[][], sum: number[]): void {
+  for (let p = 0; p < np; p++) {
+    sum[p] = 0.0;
+    for (let s = 0; s < np; s++) sum[p] += a[s] * C4[s][p];
+  }
 }
 
-function B(i: int, j: int): number {
-  return Number((i - j) * (j - 2 * i)) / 7 - Number(j) * 0.5; // negative integers, subtraction
-}
-
-function show(name: string, v: number[]): void {
-  let s = 0;
-  for (let i = 0; i < v.length; i++) s += v[i] * (i + 1);
-  console.log(name, v.length, v[0], v[v.length - 1], s);
-}
-
-const sizes: int[] = [1, 7, 8, 13, 100, 1003];
-for (const n of sizes) {
-  const u: number[] = [];
-  for (let i = 0; i < n; i++) u.push(1 + (i % 5) / 3);
-  const f = new Float64Array(n);
-  for (let i = 0; i < n; i++) f[i] = u[i] * 0.25 - 0.1;
-  const scale = 1.5;
-  const k: int = 3;
-
-  const a: number[] = new Array<number>(n).fill(0);
-  parallelFill(a, (i) => {
-    let t = 0;
-    for (let j = 0; j < u.length; ++j) t += A(i, j) * u[j];
-    return t;
-  });
-  show("A u", a);
-
-  const b: number[] = new Array<number>(n).fill(0);
-  parallelFill(b, (i) => {
-    let t = 0.5;
-    for (let j = 0; j < f.length; j++) t += B(j, i + k) * f[j] * scale;
-    return t;
-  });
-  show("B f", b);
-
-  const c: number[] = new Array<number>(n).fill(0);
-  parallelFill(c, (i) => {
-    let t = 0;
-    for (let j = 0; j < u.length; j += 1) t += Number(-(i * j)) / (j + 1) + u[j];
-    return t;
-  });
-  show("neg", c);
-
-  const d: number[] = new Array<number>(n).fill(0);
-  parallelFill(d, (i) => { // not the shape (two statements in the loop): the callback as written
-    let t = 0;
-    for (let j = 0; j < u.length; j++) {
-      const x = A(j, i);
-      t += x * u[j];
-    }
-    return t;
-  });
-  show("At u", d);
-}
+const A = grid(5, 7, (i, j) => ((i * 3 + j) % 5) / 4);
+const B = grid(7, 19, (i, j) => ((i + 2 * j) % 7) / 3);
+const C = grid(5, 19, (i, j) => 0);
+mm(5, 19, 7, 1.5, C, A, B);
+console.log("mm", show(C));
+// the row written is a row read: C[1] is B[2]
+const B2 = grid(7, 19, (i, j) => ((i * j) % 5) / 2);
+const C2 = grid(5, 19, (i, j) => 1);
+C2[1] = B2[2];
+mm(5, 19, 7, 0.5, C2, A, B2);
+console.log("mm row shared", show(C2), show(B2));
+// D *= beta, then the sums
+const D = grid(4, 11, (i, j) => (i + j) / 5);
+scaleAdd(4, 11, 7, 1.25, D, grid(4, 7, (i, j) => (i * j + 1) / 6), B);
+console.log("scale add", show(D));
+// lu's second half: A[i][k] on the row written, with k < i <= j
+const L = grid(12, 12, (i, j) => ((i * 5 + j * 3) % 11) / 7 + (i === j ? 2 : 0));
+luRest(12, L);
+console.log("lu rest", show(L));
+// an empty k loop, and fewer columns than U
+mm(3, 5, 0, 2.0, C, A, B);
+console.log("empty k", show(C));
+// a 1D result
+const sum = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+vecmat(10, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], grid(10, 10, (i, j) => ((i + j) % 4) / 3), sum);
+console.log("vecmat", sum.map((x) => x.toFixed(6)).join(","));
+// the 1D result is a row of the matrix read
+const M = grid(10, 10, (i, j) => (i * 10 + j) / 50);
+vecmat(10, [1, 1, 1, 1, 1, 1, 1, 1, 1, 1], M, M[3]);
+console.log("vecmat shared", show(M));

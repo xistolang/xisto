@@ -1626,6 +1626,8 @@ XS_NOINLINE xs_str *xs_tpl(int n, ...) {
 /* ---- arrays: fixed length, bounds-checked ---- */
 
 #define XS_INLINE_ELEMS 4 /* small arrays keep their elements inside the object */
+/* the table of a loop nest's row data pointers (emit.c, bce_rd_type), freed when the nest's block ends */
+static inline void xs_rd_free(void *p) { free(*(void **)p); }
 #define XS_ARRAY(T, name)                                                              \
     typedef struct name { xs_hdr hdr; size_t len; T *data; size_t cap; } name;        \
     static void name##_free(void *p) { name *a_ = p; if ((void *)a_->data != (void *)(a_ + 1)) free(a_->data); xs_obj_free(p); } \
