@@ -5381,7 +5381,16 @@ static void mark_counted_inc(Stmt *s) {
     }
     if (!u || !c || u->kind != E_POSTFIX || u->op != TK_PLUSPLUS || !u->type || u->type->kind != TY_INT) return;
     if (!u->lhs || u->lhs->kind != E_IDENT || !u->lhs->cname || u->builtin.cfn) return;
-    if (c->kind != E_BINARY || c->op != TK_LT || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, u->lhs->cname) != 0) return;
+    if (c->kind != E_BINARY || (c->op != TK_LT && c->op != TK_LE) || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, u->lhs->cname) != 0) return;
+    if (c->op == TK_LE) { /* i <= E - c (c >= 1), or i <= L (a literal below 2^53 - 1): i + 1 is still a safe integer
+                             (seidel-2d, syrk: `for (let j = 1; j <= n - 2; j++)`); the passes that read the bound as
+                             exclusive test the operator (rv_def_rng, bce_enter, ctr_counted) */
+        Expr *r = c->rhs;
+        bool ok = (r && r->kind == E_BINARY && r->op == TK_MINUS && r->type && r->type->kind == TY_INT && r->rhs && r->rhs->kind == E_NUMBER &&
+                   r->rhs->is_int_lit && r->rhs->ival >= 1) ||
+                  (r && r->kind == E_NUMBER && r->is_int_lit && r->ival < INT64_C(9007199254740991));
+        if (!ok || getenv("XISTO_NO_LE_COUNTED")) return;
+    }
     if (stmt_writes_name(s->body, u->lhs->cname) || writes_name(c->rhs, u->lhs->cname)) return;
     u->builtin.cfn = "counted_inc";
 }
@@ -6079,7 +6088,7 @@ static Rng rv_def_rng(int d, int k) {
     Rng x;
     if (rv_defs[d].loop) { /* i from its start below the bound: [start, bound - 1] */
         Rng b = rng_of(rv_defs[d].loop->cond->rhs);
-        x = b.ok ? (Rng){true, -RNG_SAFE, b.hi - 1} : rng_none();
+        x = b.ok ? (Rng){true, -RNG_SAFE, b.hi - (rv_defs[d].loop->cond->op == TK_LE ? 0 : 1)} : rng_none(); /* (i <= bound: up to it) */
         /* a counter declared by the loop itself is only read inside it, where it is below the bound: its
            start does not widen the top (j = i + 1 in `for (let j = i + 1; j < N; j++)` stays under N) */
         Stmt *fi = rv_defs[d].loop->for_init;
@@ -6305,7 +6314,7 @@ static bool bce_ok(Stmt *body, const char *a, Type *t, bool calls_ok) {
 static void bce_enter(Stmt *s) {
     Expr *u = s->for_update, *c = s->cond;
     if (nbce == 64 || xs_debug || sm_mode || getenv("XISTO_NO_BCE")) return; /* (a generator: the consumer runs between yields) */
-    if (!u || !u->builtin.cfn || strcmp(u->builtin.cfn, "counted_inc") != 0) return;
+    if (!u || !u->builtin.cfn || strcmp(u->builtin.cfn, "counted_inc") != 0 || c->op != TK_LT) return;
     Expr *len = c->rhs;
     if (!len || len->kind != E_MEMBER || len->is_call || !len->str || strcmp(len->str, "length") != 0) return;
     if (!len->lhs || len->lhs->kind != E_IDENT || !len->lhs->cname || !bce_indexable(len->lhs->type)) return;
