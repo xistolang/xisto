@@ -57,6 +57,12 @@ export function dumpFinish(): void {
   buf = "";
 }
 
+// what is still in the buffer (fdtd-2d dumps two arrays after POLYBENCH_DUMP_FINISH)
+export function dumpFlush(): void {
+  process.stderr.write(buf);
+  buf = "";
+}
+
 export function dumpBegin(name: string): void {
   dumpWrite("begin dump: " + name);
 }
