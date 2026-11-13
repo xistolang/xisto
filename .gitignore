@@ -10,6 +10,7 @@ tools/t0comp/obj/
 tools/t0comp/bin/
 third_party/aws-lc/
 bench/benchmarksgame/out/
+bench/polybench/out/
 node_modules/
 *.bun-build
 examples/conduit/dist/

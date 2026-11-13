@@ -134,6 +134,21 @@ for f in tests/stderr/*.ts; do
     else echo "FAIL $f: stdout or stderr differs from node"; diff "${f%.ts}.stdout" "$OUT/$name.out" | head; diff "${f%.ts}.stderr" "$OUT/$name.err" | head; fail=$((fail+1)); fi
 done
 
+# PolyBench ports (bench/polybench/ts): the MINI dataset, stdout and stderr (where the dump of the arrays goes)
+# byte for byte as Node's (Bun's when Node cannot run the file; XISTO_ORACLE_DIR as in tests/ok)
+for f in bench/polybench/ts/*.ts; do
+    name=polybench-$(basename "$f" .ts)
+    if [ -n "$XISTO_ORACLE_DIR" ] && [ -f "$XISTO_ORACLE_DIR/$name.node.err" ]; then
+        cp "$XISTO_ORACLE_DIR/$name.node.out" "$OUT/$name.node.out"; cp "$XISTO_ORACLE_DIR/$name.node.err" "$OUT/$name.node.err"
+    elif ! node "$f" MINI > "$OUT/$name.node.out" 2> "$OUT/$name.node.err" < /dev/null && ! bun "$f" MINI > "$OUT/$name.node.out" 2> "$OUT/$name.node.err" < /dev/null; then
+        echo "FAIL $f: neither node nor bun can run the program"; head -5 "$OUT/$name.node.err"; fail=$((fail+1)); continue
+    fi
+    if ! $XISTO build -o "$OUT/$name" "$f" > "$OUT/$name.build" 2>&1; then echo "FAIL $f: xisto build failed"; cat "$OUT/$name.build"; fail=$((fail+1)); continue; fi
+    "$OUT/$name" MINI > "$OUT/$name.out" 2> "$OUT/$name.err" < /dev/null
+    if cmp -s "$OUT/$name.out" "$OUT/$name.node.out" && cmp -s "$OUT/$name.err" "$OUT/$name.node.err"; then pass=$((pass+1));
+    else echo "FAIL $f: stdout or stderr differs from node"; diff "$OUT/$name.node.out" "$OUT/$name.out" | head; diff "$OUT/$name.node.err" "$OUT/$name.err" | head; fail=$((fail+1)); fi
+done
+
 # xisto fmt: the messy file formats to the gabarito, and the whole tree is already formatted
 cp tests/fmt/messy.input "$OUT/messy.ts"
 $XISTO fmt "$OUT/messy.ts" > /dev/null 2>&1
