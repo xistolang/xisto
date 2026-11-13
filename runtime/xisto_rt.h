@@ -7030,6 +7030,108 @@ static inline int64_t xs_f64_len(xs_Float64Array *a) {
 #endif
     return n;
 }
+/* ---- Int32Array and Atomics (as in Node) ----
+   An Int32Array is a view of 32-bit integers on a SharedArrayBuffer (or on memory of its own); the program reaches
+   its elements through Atomics, which is what it is for here: threads that meet in shared memory without a message
+   (a barrier between a thread and a worker). Atomics.wait sleeps until Atomics.notify on the same element (or the
+   timeout), as Node's: "ok", "not-equal" (the element was not the value) or "timed-out". The waiters sit in one list
+   under one lock (a wait is a sleep, so the lock is not where the time goes), each with its element's address. */
+typedef struct xs_Int32Array { xs_hdr hdr; union { int64_t f_length; int64_t len; }; int32_t *data; xs_shblk *blk; bool shared; } xs_Int32Array;
+static void xs_i32_free(void *p) { xs_shblk_unref(((xs_Int32Array *)p)->blk); xs_obj_free(p); }
+static void xs_i32_print(void *p) {
+    xs_Int32Array *a = p;
+    xs_insp fr;
+    if (!xs_insp_begin(&fr, p, "Int32Array", a->f_length ? NULL : "Int32Array(0) []")) return;
+    int64_t n = a->f_length < 100 ? a->f_length : 100;
+    for (int64_t i = 0; i < n; i++) { xs_insp_entry(&fr); fprintf(XS_OUT, "%d", __atomic_load_n(&a->data[i], __ATOMIC_RELAXED)); }
+    if (a->f_length > 100) { xs_insp_entry(&fr); fprintf(XS_OUT, "... %lld more item%s", (long long)(a->f_length - 100), a->f_length - 100 == 1 ? "" : "s"); }
+    char open[48];
+    snprintf(open, sizeof open, "Int32Array(%lld) [", (long long)a->f_length);
+    xs_insp_end(&fr, open, "]", true, true, a->f_length > 100);
+}
+static xs_Int32Array *xs_i32_wrap(xs_shblk *blk, int64_t off, int64_t n, bool shared) {
+    xs_Int32Array *a = xs_obj_alloc(sizeof *a, xs_i32_free, xs_i32_print);
+    a->f_length = n;
+    a->data = (int32_t *)xs_shblk_data(blk) + off;
+    a->blk = blk;
+    a->shared = shared;
+    return a;
+}
+XS_NOINLINE xs_Int32Array *xs_i32_new(int64_t n) {
+    if (n < 0 || n > ((int64_t)1 << 37)) xs_panic("RangeError: Invalid typed array length");
+    return xs_i32_wrap(xs_shblk_new(n * 4, true), 0, n, false);
+}
+/* new Int32Array(sab, byteOffset?, length?): a view on the buffer (INT64_MIN: not given) */
+XS_NOINLINE xs_Int32Array *xs_i32_on(xs_SharedArrayBuffer *s, int64_t off, int64_t n) {
+    if (off == INT64_MIN) off = 0;
+    if (off < 0 || off % 4) xs_panic("RangeError: start offset of Int32Array should be a multiple of 4");
+    if (off > s->f_byteLength) xs_panic("RangeError: start offset is outside the bounds of the buffer");
+    if (n == INT64_MIN) {
+        if ((s->f_byteLength - off) % 4) xs_panic("RangeError: byte length of Int32Array should be a multiple of 4");
+        n = (s->f_byteLength - off) / 4;
+    } else if (n < 0 || n > (s->f_byteLength - off) / 4) xs_panic("RangeError: Invalid typed array length");
+    xs_shblk_ref(s->blk);
+    return xs_i32_wrap(s->blk, off / 4, n, true);
+}
+XS_NOINLINE int32_t *xs_atomics_at(xs_Int32Array *a, int64_t i) {
+    if ((uint64_t)i >= (uint64_t)a->f_length) xs_panic("RangeError: Invalid atomic access index");
+    return &a->data[i];
+}
+XS_NOINLINE int64_t xs_atomics_load(xs_Int32Array *a, int64_t i) { return __atomic_load_n(xs_atomics_at(a, i), __ATOMIC_SEQ_CST); }
+XS_NOINLINE int64_t xs_atomics_store(xs_Int32Array *a, int64_t i, int64_t v) { __atomic_store_n(xs_atomics_at(a, i), (int32_t)(uint32_t)v, __ATOMIC_SEQ_CST); return v; }
+XS_NOINLINE int64_t xs_atomics_add(xs_Int32Array *a, int64_t i, int64_t v) { return (int32_t)__atomic_fetch_add((uint32_t *)xs_atomics_at(a, i), (uint32_t)v, __ATOMIC_SEQ_CST); }
+XS_NOINLINE int64_t xs_atomics_sub(xs_Int32Array *a, int64_t i, int64_t v) { return (int32_t)__atomic_fetch_sub((uint32_t *)xs_atomics_at(a, i), (uint32_t)v, __ATOMIC_SEQ_CST); }
+XS_NOINLINE int64_t xs_atomics_exchange(xs_Int32Array *a, int64_t i, int64_t v) { return __atomic_exchange_n(xs_atomics_at(a, i), (int32_t)(uint32_t)v, __ATOMIC_SEQ_CST); }
+XS_NOINLINE int64_t xs_atomics_cmpxchg(xs_Int32Array *a, int64_t i, int64_t expected, int64_t v) {
+    int32_t e = (int32_t)(uint32_t)expected;
+    __atomic_compare_exchange_n(xs_atomics_at(a, i), &e, (int32_t)(uint32_t)v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return e; /* (the element as it was: the expected value when the exchange happened) */
+}
+#if !defined(_WIN32)
+#include <pthread.h>
+typedef struct xs_awaiter { struct xs_awaiter *next; int32_t *addr; bool woken; } xs_awaiter;
+static pthread_mutex_t xs_aw_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t xs_aw_cv = PTHREAD_COND_INITIALIZER;
+static xs_awaiter *xs_aw_list;
+/* Atomics.wait(a, i, value, timeout ms = Infinity) */
+XS_NOINLINE xs_str *xs_atomics_wait(xs_Int32Array *a, int64_t i, int64_t value, double timeout) {
+    int32_t *p = xs_atomics_at(a, i);
+    if (!a->shared) xs_panic("TypeError: Atomics.wait needs an Int32Array on a SharedArrayBuffer");
+    pthread_mutex_lock(&xs_aw_mu);
+    if (__atomic_load_n(p, __ATOMIC_SEQ_CST) != (int32_t)(uint32_t)value) { pthread_mutex_unlock(&xs_aw_mu); return xs_str_new("not-equal", 9); }
+    xs_awaiter me = {xs_aw_list, p, false};
+    xs_aw_list = &me;
+    bool forever = !(timeout < INFINITY), timed = false;
+    struct timespec until;
+    if (!forever) {
+        if (!(timeout > 0)) timeout = 0; /* (NaN, negative: no wait) */
+        clock_gettime(CLOCK_REALTIME, &until);
+        double s = (double)until.tv_sec + until.tv_nsec / 1e9 + timeout / 1000.0;
+        until.tv_sec = (time_t)s;
+        until.tv_nsec = (long)((s - (double)until.tv_sec) * 1e9);
+    }
+    while (!me.woken) {
+        if (forever) pthread_cond_wait(&xs_aw_cv, &xs_aw_mu);
+        else if (pthread_cond_timedwait(&xs_aw_cv, &xs_aw_mu, &until) != 0 && !me.woken) { timed = true; break; }
+    }
+    for (xs_awaiter **w = &xs_aw_list; *w; w = &(*w)->next) if (*w == &me) { *w = me.next; break; }
+    pthread_mutex_unlock(&xs_aw_mu);
+    return timed ? xs_str_new("timed-out", 9) : xs_str_new("ok", 2);
+}
+/* Atomics.notify(a, i, count = all): how many waiters it woke, the longest waiting first (as Node) */
+XS_NOINLINE int64_t xs_atomics_notify(xs_Int32Array *a, int64_t i, double count) {
+    int32_t *p = xs_atomics_at(a, i);
+    if (!a->shared) return 0;
+    int64_t want = !(count < INFINITY) ? INT64_MAX : count > 0 ? (int64_t)count : 0, n = 0;
+    pthread_mutex_lock(&xs_aw_mu);
+    xs_awaiter *order[64]; int no = 0; /* (the list is newest first: the oldest are at its end) */
+    for (xs_awaiter *w = xs_aw_list; w; w = w->next) if (w->addr == p && !w->woken && no < 64) order[no++] = w;
+    for (int k = no - 1; k >= 0 && n < want; k--) { order[k]->woken = true; n++; }
+    if (n) pthread_cond_broadcast(&xs_aw_cv);
+    pthread_mutex_unlock(&xs_aw_mu);
+    return n;
+}
+#endif
 /* a Float64Array that lives in its function's frame (emit.c f64_local_n: fixed small length, only ever indexed, never
    escaping): no heap, no count; the C compiler sees a plain double[N] and keeps it in registers (n-body) */
 static inline __attribute__((always_inline)) xs_Float64Array *xs_f64_on_frame(xs_Float64Array *a, double *data, int64_t n) {

@@ -283,6 +283,8 @@ static void init_builtins(void) {
     bi_field(sab, "byteLength", ty_int);
     Class *f64 = bi_class("Float64Array", "xs_Float64Array");
     bi_field(f64, "length", ty_int);
+    Class *i32 = bi_class("Int32Array", "xs_Int32Array"); /* (its elements through Atomics: check_atomics) */
+    bi_field(i32, "length", ty_int);
     /* fs.fstatSync (runtime/xisto_rt.h, xs_fs_fstat): the size and the kind of what a descriptor is open on */
     Class *stc = bi_class("Stats", "xs_Stats");
     bi_field(stc, "size", ty_int);
@@ -665,6 +667,33 @@ static void check_bytes_member(Expr *e, Class *c) {
     xs_error(XS8014, e->pos, "supported: length, slice, subarray, set, fill, indexOf, lastIndexOf, includes, reverse, join, toString, toBase64, toHex (and Buffer: equals, toString(encoding))", "%s has no method '%s'", c->name, m);
     #undef ARGS
     #undef PAD_INT
+}
+/* Atomics.load / store / add / sub / exchange / compareExchange / wait / notify on an Int32Array (runtime xs_atomics_*):
+   the element as an int; wait's answer as Node's ("ok", "not-equal", "timed-out"), notify's the waiters it woke */
+static void check_atomics(Expr *e) {
+    const char *m = e->str;
+    static const struct { const char *name, *cfn; int lo, hi; } ops[] = {
+        {"load", "xs_atomics_load", 2, 2}, {"store", "xs_atomics_store", 3, 3}, {"add", "xs_atomics_add", 3, 3},
+        {"sub", "xs_atomics_sub", 3, 3}, {"exchange", "xs_atomics_exchange", 3, 3},
+        {"compareExchange", "xs_atomics_cmpxchg", 4, 4}, {"wait", "xs_atomics_wait", 3, 4}, {"notify", "xs_atomics_notify", 2, 3},
+    };
+    int k = -1;
+    for (int j = 0; j < (int)(sizeof ops / sizeof ops[0]); j++) if (strcmp(ops[j].name, m) == 0) k = j;
+    if (k < 0 || !e->is_call) xs_error(XS7125, e->pos, "supported: Atomics.load, store, add, sub, exchange, compareExchange, wait, notify", "unknown Atomics member '%s'", m);
+    int n = e->args.len;
+    if (n < ops[k].lo || n > ops[k].hi) xs_error(XS7126, e->pos, NULL, "Atomics.%s takes %d to %d arguments, got %d", m, ops[k].lo, ops[k].hi, n);
+    check_expr(e->args.items[0], NULL);
+    Type *at = e->args.items[0]->type;
+    if (!(at && at->kind == TY_OBJECT && at->cls->builtin && strcmp(at->cls->name, "Int32Array") == 0))
+        xs_error(XS7127, e->args.items[0]->pos, "new Int32Array(sharedBuffer)", "Atomics.%s works on an Int32Array, not %s", m, ty_name(at));
+    bool wait = strcmp(m, "wait") == 0, notify = strcmp(m, "notify") == 0;
+    for (int j = 1; j < n; j++) {
+        if ((wait && j == 3) || (notify && j == 2)) date_num_arg(&e->args.items[j], wait ? "the timeout of Atomics.wait" : "the count of Atomics.notify");
+        else int_arg(&e->args.items[j], xs_sprintf("argument %d of Atomics.%s", j + 1, m));
+    }
+    if ((wait && n == 3) || (notify && n == 2)) expr_list_push(&e->args, num_lit(e->pos, INFINITY, false)); /* (no timeout; all the waiters) */
+    e->builtin.cfn = (char *)ops[k].cfn;
+    e->type = wait ? ty_string : ty_int;
 }
 /* f.length, f.fill(0.5), f.set(src, 4), f.subarray(lo, hi) ... on a Float64Array */
 static void check_f64_member(Expr *e, Class *c) {
@@ -2657,7 +2686,7 @@ static Func *lookup_func(const char *name) {
 }
 
 static bool is_builtin_name(const char *n) {
-    return strcmp(n, "Math") == 0 || strcmp(n, "console") == 0 || strcmp(n, "Number") == 0 || strcmp(n, "process") == 0 || strcmp(n, "Date") == 0 || strcmp(n, "performance") == 0 || strcmp(n, "lines") == 0 || strcmp(n, "chunks") == 0 || strcmp(n, "assert") == 0 ||
+    return strcmp(n, "Math") == 0 || strcmp(n, "console") == 0 || strcmp(n, "Number") == 0 || strcmp(n, "process") == 0 || strcmp(n, "Date") == 0 || strcmp(n, "performance") == 0 || strcmp(n, "Atomics") == 0 || strcmp(n, "lines") == 0 || strcmp(n, "chunks") == 0 || strcmp(n, "assert") == 0 ||
            strcmp(n, "String") == 0 || strcmp(n, "Array") == 0 || strcmp(n, "fetch") == 0 || strcmp(n, "Promise") == 0 || find_class(n) != NULL || find_enum(n) != NULL;
 }
 
@@ -10511,6 +10540,10 @@ static void check_expr_in(Expr *e, Type *expected) {
                 check_promise(e, expected);
                 return;
             }
+            if (strcmp(ns, "Atomics") == 0) {
+                check_atomics(e);
+                return;
+            }
             if (strcmp(ns, "performance") == 0) {
                 if (!e->is_call || strcmp(e->str, "now") != 0 || e->args.len != 0) xs_error(XS7114, e->pos, "supported: performance.now()", "unknown performance member '%s'", e->str);
                 e->type = ty_number;
@@ -12666,6 +12699,20 @@ static void check_expr_in(Expr *e, Type *expected) {
                 else if (st->kind == TY_ARRAY && st->elem->kind == TY_NUMBER) e->builtin.cfn = "xs_f64_from_nums";
                 else if (st->kind == TY_ARRAY && (st->elem->kind == TY_INT || st->elem->kind == TY_LITINT)) e->builtin.cfn = "xs_f64_from_ints";
                 else xs_error(XS7070, e->args.items[0]->pos, hint, "new Float64Array takes a length, a number[], a Float64Array or a SharedArrayBuffer, not %s", ty_name(st));
+                return;
+            }
+            if (strcmp(c->name, "Int32Array") == 0) { /* new Int32Array(length | sab, offset?, length?) */
+                const char *hint = "new Int32Array(n), new Int32Array(sharedBuffer)";
+                if (e->args.len < 1 || e->args.len > 3) xs_error(XS7124, e->pos, hint, "new Int32Array takes a length or a SharedArrayBuffer (with an offset and a length), not %s", "that");
+                check_expr(e->args.items[0], NULL);
+                Type *st = e->args.items[0]->type;
+                if ((st->kind == TY_INT || st->kind == TY_LITINT) && e->args.len == 1) { if (st->kind == TY_LITINT) coerce_lit(e->args.items[0], ty_int); e->builtin.cfn = "xs_i32_new"; }
+                else if (is_sab(st)) {
+                    for (int k = 1; k < e->args.len; k++) int_arg(&e->args.items[k], k == 1 ? "the byte offset" : "the length");
+                    for (int k = e->args.len; k < 3; k++) expr_list_push(&e->args, num_lit(e->pos, (double)XS_NOT_GIVEN, true));
+                    e->builtin.cfn = "xs_i32_on";
+                }
+                else xs_error(XS7124, e->args.items[0]->pos, hint, "new Int32Array takes a length or a SharedArrayBuffer (with an offset and a length), not %s", ty_name(st));
                 return;
             }
             if (strcmp(c->name, "TextEncoder") == 0 || strcmp(c->name, "TextDecoder") == 0) {
