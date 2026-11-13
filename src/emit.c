@@ -9649,9 +9649,139 @@ static bool lj_emit(Stmt *s) {
     buf_puts(out, " }");
     return true;
 }
+/* ---- Gauss-Seidel rows skewed (seidel-2d: H "jam de R linhas com desvio de 2 colunas") ----
+   for (let i = L; i <= H; i++) for (let j = L2; j <= H2; j++) X[i][j] = f;   (< as well)
+   f number arithmetic of numbers, invariant names and X[i + di][j + dj], |di|, |dj| <= 1: each element reads the new
+   values of row i - 1 and of X[i][j - 1], the old ones of row i + 1 and of X[i][j + 1]. R rows run together, row
+   i + r at column J - 2r in step J (r in order): the row above is two columns ahead, so it already wrote j + 1 (a
+   new value, as in the program) and this step's j - 1, j, j + 1 do not depend on it; the row below is two behind and
+   has not reached j - 1 (an old value, as in the program). Every element is the same sum of the same values in the
+   same order, so the same bits, and the R division chains are independent instead of one. The guard, once per entry:
+   the rows L - 1 .. H + 1 within X, each long enough for H2 + 1, L2 - 1 >= 0, and X's rows apart from each other
+   (xs_blocks_apart_: a row twice would change which values are old). The rows left (fewer than R), and the loop when
+   the guard fails, as written. XISTO_NO_SKEW turns it off; XISTO_SKEW_R sets R (xs_skew_r: main.c gives 16 for code
+   built for the ARM machine it runs on, 8 elsewhere; seidel-2d LARGE on the M4, kernel: 10,8 s as written, R = 4 4,3,
+   8 3,3, 12 2,5, 16 2,08; x86 has half the integer registers for the rows). */
+int xs_skew_r = 8;
+static const char *sk_i, *sk_j, *sk_x;
+static bool sk_carried;
+static int sk_id;
+static bool sk_le(Stmt *f, const char **ctr, Expr **lo, Expr **hi, bool *le) { /* for (let c = lo; c < hi | c <= hi; c++) */
+    Expr *u = f->for_update, *c = f->cond;
+    Stmt *fi = f->for_init;
+    if (!f || f->kind != S_FOR || !u || !u->builtin.cfn || strcmp(u->builtin.cfn, "counted_inc") != 0 || !u->lhs || !u->lhs->cname) return false;
+    if (!c || c->kind != E_BINARY || (c->op != TK_LT && c->op != TK_LE) || !lj_is(c->lhs, u->lhs->cname)) return false;
+    if (!fi || fi->kind != S_VAR || !fi->cname || strcmp(fi->cname, u->lhs->cname) != 0 || !fi->init || !bce_pure(fi->init)) return false;
+    *ctr = u->lhs->cname; *lo = fi->init; *hi = c->rhs; *le = c->op == TK_LE;
+    return true;
+}
+static int sk_off(Expr *x, const char *c) { /* c, c + 1, c - 1: the offset (9: not that) */
+    if (lj_is(x, c)) return 0;
+    if (x && x->kind == E_BINARY && (x->op == TK_PLUS || x->op == TK_MINUS) && lj_is(x->lhs, c) && x->rhs && x->rhs->kind == E_NUMBER &&
+        x->rhs->is_int_lit && x->rhs->ival == 1) return x->op == TK_PLUS ? 1 : -1;
+    return 9;
+}
+static bool sk_expr(Expr *e, Stmt *nest) {
+    if (!e || !e->type || e->type->kind != TY_NUMBER) return false;
+    switch (e->kind) {
+    case E_NUMBER: return true;
+    case E_IDENT: return e->cname && bce_plain_local(e->cname) && !bce_writes(nest, e->cname) && !bce_declares(nest, e->cname);
+    case E_BINARY: return (e->op == TK_PLUS || e->op == TK_MINUS || e->op == TK_STAR || e->op == TK_SLASH) && sk_expr(e->lhs, nest) && sk_expr(e->rhs, nest);
+    case E_UNARY: return e->op == TK_MINUS && sk_expr(e->lhs, nest);
+    case E_INDEX: {
+        if (e->builtin.cfn || !e->lhs || e->lhs->kind != E_INDEX || e->lhs->builtin.cfn || !lj_is(e->lhs->lhs, sk_x)) return false;
+        int di = sk_off(e->lhs->rhs, sk_i), dj = sk_off(e->rhs, sk_j);
+        if (di == 9 || dj == 9) return false;
+        if (di < 0 || (di == 0 && dj < 0)) sk_carried = true; /* (a value this loop wrote: Gauss-Seidel) */
+        return true;
+    }
+    default: return false;
+    }
+}
+static void sk_emit(Expr *e, int r, const char *J) {
+    switch (e->kind) {
+    case E_BINARY:
+        buf_puts(out, "(");
+        sk_emit(e->lhs, r, J);
+        buf_printf(out, " %s ", e->op == TK_PLUS ? "+" : e->op == TK_MINUS ? "-" : e->op == TK_STAR ? "*" : "/");
+        sk_emit(e->rhs, r, J);
+        buf_puts(out, ")");
+        return;
+    case E_UNARY: buf_puts(out, "(-"); sk_emit(e->lhs, r, J); buf_puts(out, ")"); return;
+    case E_INDEX: {
+        int di = sk_off(e->lhs->rhs, sk_i), dj = sk_off(e->rhs, sk_j);
+        buf_printf(out, "skp%d_[%d][%s - %d%s]", sk_id, r + 1 + di, J, 2 * r, dj > 0 ? " + 1" : dj < 0 ? " - 1" : "");
+        return;
+    }
+    default: emit_expr(e); return;
+    }
+}
+static bool sk_emit_loop(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_SKEW") || bce_promo_t || bce_fw_loop) return false;
+    Expr *L, *H, *L2, *H2;
+    bool le, le2;
+    if (!sk_le(s, &sk_i, &L, &H, &le)) return false;
+    Stmt *in = uj_only(s->body);
+    if (!in || !sk_le(in, &sk_j, &L2, &H2, &le2)) return false;
+    Stmt *b = uj_only(in->body);
+    if (!b || b->kind != S_EXPR || !b->expr || b->expr->kind != E_ASSIGN || b->expr->op != TK_ASSIGN) return false;
+    Expr *w = b->expr->lhs;
+    if (!w || w->kind != E_INDEX || w->builtin.cfn || !w->lhs || w->lhs->kind != E_INDEX || w->lhs->builtin.cfn || !w->lhs->lhs ||
+        w->lhs->lhs->kind != E_IDENT || !w->lhs->lhs->cname || !lj_is(w->lhs->rhs, sk_i) || !lj_is(w->rhs, sk_j)) return false;
+    sk_x = w->lhs->lhs->cname;
+    Type *xt = w->lhs->lhs->type;
+    if (!xt || xt->kind != TY_ARRAY || !xt->elem || !((xt->elem->kind == TY_ARRAY && xt->elem->elem && xt->elem->elem->kind == TY_NUMBER) || is_f64_type(xt->elem)) ||
+        !bce_plain_local(sk_x) || bce_writes(s, sk_x) || bce_declares(s, sk_x) || !w->type || w->type->kind != TY_NUMBER) return false;
+    if (!bce_inv(L, s, sk_i) || !bce_inv(H, s, sk_i) || !bce_names_plain(H) || !bce_names_plain(L) || !bce_inv(L2, s, sk_i) || !bce_inv(H2, s, sk_i) ||
+        !bce_names_plain(L2) || !bce_names_plain(H2) || uj_mentions(L2, sk_i) || uj_mentions(H2, sk_i) || uj_mentions(H2, sk_j) || uj_mentions(L2, sk_j)) return false;
+    sk_carried = false;
+    if (!sk_expr(b->expr->rhs, s) || !sk_carried) return false; /* (no value carried: the loop vectorizes as it is) */
+    int R = xs_skew_r;
+    const char *re = getenv("XISTO_SKEW_R");
+    if (re && atoi(re) >= 2 && atoi(re) <= 16) R = atoi(re);
+    int id = sk_id = lj_ids++;
+    const char *X = ren(sk_x), *rs = lj_rs(xt->elem);
+    char *lo = bce_raw(L), *hi = le ? xs_sprintf("(%s)", bce_raw(H)) : xs_sprintf("((%s) - 1)", bce_raw(H));
+    char *lo2 = bce_raw(L2), *hi2 = le2 ? xs_sprintf("(%s)", bce_raw(H2)) : xs_sprintf("((%s) - 1)", bce_raw(H2));
+    bce_blocks_helper_emit();
+    buf_printf(out, "{ int64_t sk%d_ = %s; { int64_t lo_ = %s, hi_ = %s, lo2_ = %s, hi2_ = %s, n_ = (int64_t)(%s)->len; ", id, lo, lo, hi, lo2, hi2, X);
+    buf_printf(out, "bool ok_ = lo_ + %d <= hi_ && lo2_ <= hi2_ && lo_ - 1 >= 0 && hi_ + 1 < n_ && lo2_ - 1 >= 0; ", R - 1);
+    buf_printf(out, "if (ok_) { char **pp_ = malloc((size_t)(n_ ? n_ : 1) * 3 * sizeof(char *)); int64_t k_ = 0; if (!pp_) xs_panic(\"out of memory\"); "
+                    "for (int64_t r_ = 0; r_ < n_; r_++) { %s *p_ = (%s *)(%s)->data[r_]; int64_t l_ = p_ ? (int64_t)p_->len : 0; "
+                    "if (r_ >= lo_ - 1 && r_ <= hi_ + 1 && l_ <= hi2_ + 1) ok_ = false; "
+                    "if (l_ > 0) { pp_[3 * k_] = (char *)p_->data; pp_[3 * k_ + 1] = (char *)(p_->data + l_); pp_[3 * k_ + 2] = (char *)1; k_++; } } "
+                    "if (ok_) ok_ = xs_blocks_apart_(pp_, k_) > 0; free(pp_); } ", rs, rs, X);
+    buf_printf(out, "if (ok_) for (; sk%d_ + %d <= hi_; sk%d_ += %d) { double *skp%d_[%d]; ", id, R - 1, id, R, id, R + 2);
+    buf_printf(out, "for (int r_ = 0; r_ < %d; r_++) skp%d_[r_] = ((%s *)(%s)->data[sk%d_ - 1 + r_])->data; ", R + 2, id, rs, X, id);
+    Expr *f = b->expr->rhs;
+    /* prologue (the lower rows not started), body (all busy, no test), epilogue (the upper rows done) */
+    for (int part = 0; part < 3; part++) {
+        if (part == 0) buf_printf(out, "for (int64_t J_ = lo2_; J_ < lo2_ + %d; J_++) { ", 2 * (R - 1));
+        else if (part == 1) buf_printf(out, "for (int64_t J_ = lo2_ + %d; J_ <= hi2_; J_++) { ", 2 * (R - 1));
+        else buf_printf(out, "for (int64_t J_ = (lo2_ + %d > hi2_ + 1 ? lo2_ + %d : hi2_ + 1); J_ <= hi2_ + %d; J_++) { ", 2 * (R - 1), 2 * (R - 1), 2 * (R - 1));
+        for (int r = 0; r < R; r++) {
+            if (part != 1) buf_printf(out, "if (J_ - %d >= lo2_ && J_ - %d <= hi2_) ", 2 * r, 2 * r);
+            buf_printf(out, "skp%d_[%d][J_ - %d] = ", id, r + 1, 2 * r);
+            sk_emit(f, r, "J_");
+            buf_puts(out, "; ");
+        }
+        buf_puts(out, "} ");
+    }
+    buf_puts(out, "} } ");
+    Stmt *fi = s->for_init;
+    Stmt fi2 = *fi;
+    Expr from = {0};
+    from.kind = E_IDENT; from.cname = xs_sprintf("sk%d_", id); from.str = from.cname; from.type = L->type; from.pos = L->pos; from.field = -1;
+    fi2.init = &from;
+    s->for_init = &fi2;
+    emit_stmt_for_inner_(s);
+    s->for_init = fi;
+    buf_puts(out, " }");
+    return true;
+}
 static void emit_stmt_for_inner(Stmt *s) { /* the columns' least row lengths around the outermost loop that keeps them */
     int opened = bce_rect_open(s);
-    if (!uj_emit_km(s) && !uj_emit_loop(s) && !lj_emit(s)) emit_stmt_for_inner_(s);
+    if (!uj_emit_km(s) && !uj_emit_loop(s) && !lj_emit(s) && !sk_emit_loop(s)) emit_stmt_for_inner_(s);
     bce_rect_close(opened);
 }
 static void emit_stmt_for_inner_(Stmt *s) { /* a for: bounds checks proved by the loop, or a versioned copy */
