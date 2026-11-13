@@ -193,3 +193,19 @@ console.log("symm", show(YC));
 const YC2 = grid(7, 18, (i, j) => ((i + 2 * j) % 6) / 4);
 symm(7, 18, 0.5, 0.75, YC2, YA, YC2);
 console.log("symm B = C", show(YC2));
+
+// x[i] = x[i] + A[i][j] * y[j]: the lane's own row (mvt), and x[i] = x[i] + A[j][i] * y[j]: a column
+function mvt(n: int, x1: number[], x2: number[], y1: number[], y2: number[], A: number[][]): void {
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) x1[i] = x1[i] + A[i][j] * y1[j];
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) x2[i] = x2[i] + A[j][i] * y2[j];
+}
+const MA = grid(13, 13, (i, j) => ((i * 5 + j) % 9) / 7);
+const mx1: number[] = new Array<number>(13).fill(0.5);
+const mx2: number[] = new Array<number>(13).fill(0.25);
+const my: number[] = [];
+for (let j = 0; j < 13; j++) my.push((j % 4) / 3);
+mvt(13, mx1, mx2, my, my, MA);
+console.log("mvt", mx1.map((x) => x.toFixed(6)).join(","), mx2.map((x) => x.toFixed(6)).join(","));
+// x is a row of A: the old loop
+mvt(13, MA[2], MA[5], my, MA[2], MA);
+console.log("mvt shared", show(MA));
