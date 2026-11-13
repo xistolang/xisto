@@ -10,7 +10,7 @@ title: CLI
 
 | Command | What it does |
 |---|---|
-| `xisto build [--dev] [--backend=c\|qbe] [-o OUT] FILE.ts` | compile to a native executable (release, `-O2`, by default). Only compiles: it does not run the program. |
+| `xisto build [--dev] [--backend=c\|qbe] [-o OUT] FILE.ts` | compile to a native executable (release, `-O3`, portable, by default; `--cpu=native` for the host's processor). Only compiles: it does not run the program. |
 | `xisto run [--dev] [--backend=c\|qbe] FILE.ts [ARGS...]` | compile to a temporary file and run it, passing `ARGS` |
 | `xisto emit [--backend=c\|qbe] FILE.ts` | print the generated C (or QBE IL) |
 | `xisto check [--details] [--deny-warnings] [--tsc-checked] [--pkgs DIR] [PATH...]` | what a project needs to change to compile with xisto. `PATH`: a folder, a `tsconfig.json` or `.ts` files; `--details`: every place |

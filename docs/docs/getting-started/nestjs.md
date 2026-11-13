@@ -53,8 +53,6 @@ EOF
 
 ## 3. Run it while developing
 
-`xisto run` compiles to a temporary file and starts it, with no build step:
-
 Run it in one of two ways. While developing, `xisto run` compiles to a temporary file and starts it, with no build
 step (the first compile of a Nest app takes a few seconds; wait for `Nest application successfully started`):
 
@@ -62,7 +60,7 @@ step (the first compile of a Nest app takes a few seconds; wait for `Nest applic
 xisto run                        # the server, on port 3123; Ctrl+C stops it
 ```
 
-For the server, `xisto build` makes an optimised executable (`-O2`) that runs on its own, with nothing installed.
+For the server, `xisto build` makes an optimised executable (`-O3`, portable) that runs on its own, with nothing installed.
 It only compiles; the executable is what you start:
 
 ```sh

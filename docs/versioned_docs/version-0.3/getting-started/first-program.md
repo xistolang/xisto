@@ -22,7 +22,8 @@ hello 6
 ```
 
 `xisto build` only compiles: it writes the executable (`-o hello`; without `-o`, the file's name without `.ts`)
-and does not run it. The default is a release build (`-O2`).
+and does not run it. The default is a release build (`-O3`) for any machine of the architecture; `--cpu=native` uses the host
+processor's instructions too (AVX2...), as the benchmarks do.
 
 ## Run without a build step
 
