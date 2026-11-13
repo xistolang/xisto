@@ -96,56 +96,113 @@ machines (`bench/results/placar-final-2026-11-10.md`):
 | k-nucleotide | 1.08 | 0.95 |
 | fannkuch-redux | 1.09 | 1.00 |
 
-## Against Node v24 on the VMs (9 Nov 2026)
+## Against Node and Bun (13 Nov 2026)
 
-The fastest xisto program against the Node program from the Benchmarks Game, median of 3, Node v24.22.2. Sources:
-`bench/results/vm-2026-11-07/xisto-node-ubuntu-xeon-2026-11-09.txt` and
-`bench/results/vm-2026-11-07/xisto-node-arm-graviton2-2026-11-09.txt`.
+The same xisto variants as the Rust round (main `e5fb066`, `XISTO_CPU=native`) against the official Node programs of
+the Benchmarks Game (`bench/benchmarksgame/node/`) under Node v26.12.0 and Bun 1.4.4, on the same three machines,
+median of 3. Each side's fastest variant whose output matched, chosen by `bench/placar.py` with the same memory
+rule; the ratio in the result column is the other side's time divided by xisto's.
 
-Many xisto programs here run on both cores (`par` ≈ 1.9) while the Node programs run on one. The wall-time ratio
-therefore mixes a faster program with a second core. The CPU ratio (Node CPU ÷ xisto CPU) is the fairer measure of
-work done; both are shown.
+Most xisto variants here run on every core, while the official Node programs run on one (the M4 has 10 cores, the
+VMs 2). The wall-time ratio therefore mixes a faster program with more cores; the CPU columns compare the work
+done.
 
-| problem | Xeon wall | Xeon CPU | Xeon ratio (wall / CPU) | Graviton2 wall | Graviton2 CPU | Graviton2 ratio (wall / CPU) |
-|---|---|---|---:|---|---|---:|
-| spectral-norm | 0.46 vs 3.70 s | 0.89 vs 3.71 s | 8.0× / 4.2× | 1.27 vs 4.90 s | 2.51 vs 4.92 s | 3.9× / 2.0× |
-| n-body | 2.46 vs 6.30 s | 2.46 vs 6.30 s | 2.6× / 2.6× | 4.61 vs 10.33 s | 4.61 vs 10.33 s | 2.2× / 2.2× |
-| fannkuch-redux | 7.64 vs 54.86 s | 15.13 vs 54.86 s | 7.2× / 3.6× | 9.80 vs 68.92 s | 19.56 vs 68.90 s | 7.0× / 3.5× |
-| binary-trees | 1.77 vs 33.57 s | 3.37 vs 50.05 s | 19.0× / 14.9× | 1.94 vs 57.28 s | 3.77 vs 84.12 s | 29.6× / 22.3× |
-| mandelbrot | 2.07 vs 82.84 s | 3.85 vs 82.81 s | 40.1× / 21.5× | 3.00 vs 90.61 s | 5.90 vs 90.54 s | 30.2× / 15.3× |
-| k-nucleotide | 1.32 vs 104.73 s | 2.48 vs 105.28 s | 79.1× / 42.5× | 3.19 vs 168.17 s | 6.15 vs 168.86 s | 52.6× / 27.5× |
-| reverse-complement | 0.97 vs 5.46 s | 0.29 vs 4.91 s | 5.6× / 16.9× | 0.34 vs 4.35 s | 0.27 vs 4.41 s | 12.6× / 16.3× |
-| regex-redux | 0.95 vs 4.74 s | 0.95 vs 4.91 s | 5.0× / 5.2× | 1.20 vs 5.62 s | 1.17 vs 5.92 s | 4.7× / 5.1× |
-| pidigits | 0.63 vs 10.79 s | 0.63 vs 10.81 s | 17.1× / 17.2× | 2.05 vs 12.95 s | 2.05 vs 12.98 s | 6.3× / 6.3× |
+### Apple M4 (10 cores)
 
-fasta has no row: the output of Node's official program differed from the expected output on both machines.
-Memory follows the same pattern, for example n-body at 1.9 MB against 53 MB on the Xeon.
+Source: `bench/results/node-bun-mac-m4-2026-11-13-e5fb066.txt`.
 
-The same `NAME.ts`, compiled by xisto and run directly on Node, gives these wall-time ratios (Xeon / Graviton2):
-spectral-norm 11.1× / 5.9×, n-body 21.0× / 13.8×, fannkuch-redux 5.6× / 5.7×, binary-trees 8.6× / 11.1×,
-mandelbrot 6.8× / 6.8×, fasta 2.8× / 5.7×, k-nucleotide 16.0× / 15.7×, reverse-complement 1.9× / 4.1×,
-regex-redux 4.9× / 4.4×, pidigits 16.4× / 6.2×.
+| problem | xisto | Node | xisto time | Node time | xisto CPU | Node CPU | xisto mem | Node mem | result |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| spectral-norm | spectralnorm-6 | spectralnorm-1 | 0.069 s | 1.102 s | 0.53 s | 1.11 s | 2.7 MB | 46 MB | win, 16.0× |
+| n-body | nbody | nbody-8 | 1.124 s | 2.341 s | 1.12 s | 2.34 s | 1.2 MB | 45 MB | win, 2.1× |
+| fannkuch-redux | fannkuchredux-5 | fannkuchredux-8 | 1.627 s | 24.913 s | 15.53 s | 24.91 s | 3.6 MB | 43 MB | win, 15.3× |
+| binary-trees | binarytrees-2 † | binarytrees-7 | 0.246 s | 5.194 s | 1.87 s | 7.00 s | 120 MB | 1,058 MB | win, 21.1× |
+| mandelbrot | mandelbrot-6 | mandelbrot-1 | 0.258 s | 24.489 s | 2.42 s | 24.31 s | 9.4 MB | 50 MB | win, 94.9× |
+| fasta | fasta | fasta-1 | 0.232 s | 9.926 s | 0.16 s | 9.93 s | 2.3 MB | 50 MB | win, 42.8× |
+| k-nucleotide | knucleotide-7 | knucleotide-8 | 0.224 s | 45.366 s | 1.62 s | 45.68 s | 127 MB | 704 MB | win, 202.5× |
+| reverse-complement | revcomp-9 | revcomp-2 | 0.124 s | 1.989 s | 0.10 s | 2.04 s | 12 MB | 700 MB | win, 16.0× |
+| regex-redux | regexredux-2 | regexredux-4 | 0.259 s | 1.168 s | 0.37 s | 1.23 s | 242 MB | 963 MB | win, 4.5× |
+| pidigits | pidigits | pidigits-2 | 0.252 s | 5.571 s | 0.25 s | 5.58 s | 1.9 MB | 112 MB | win, 22.1× |
 
-## Against Node 26 and Bun on the M4 (7 Nov 2026)
+| problem | xisto | Bun | xisto time | Bun time | xisto CPU | Bun CPU | xisto mem | Bun mem | result |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| spectral-norm | spectralnorm-6 | spectralnorm-1 | 0.069 s | 1.312 s | 0.53 s | 1.32 s | 2.7 MB | 20 MB | win, 19.0× |
+| n-body | nbody | nbody-8 | 1.124 s | 2.487 s | 1.12 s | 2.49 s | 1.2 MB | 19 MB | win, 2.2× |
+| fannkuch-redux | fannkuchredux-5 | fannkuchredux-8 | 1.627 s | 25.868 s | 15.53 s | 25.86 s | 3.6 MB | 19 MB | win, 15.9× |
+| binary-trees | binarytrees-2 † | binarytrees-7 | 0.246 s | 3.450 s | 1.87 s | 4.27 s | 120 MB | 1,194 MB | win, 14.0× |
+| mandelbrot | mandelbrot-6 | mandelbrot-1 | 0.258 s | 22.357 s | 2.42 s | 22.20 s | 9.4 MB | 25 MB | win, 86.7× |
+| fasta | fasta | fasta-1 | 0.232 s | 5.518 s | 0.16 s | 5.50 s | 2.3 MB | 85 MB | win, 23.8× |
+| k-nucleotide | knucleotide-7 | knucleotide-8 | 0.224 s | 26.613 s | 1.62 s | 26.67 s | 127 MB | 1,957 MB | win, 118.8× |
+| reverse-complement | revcomp-9 | revcomp-2 | 0.124 s | 1.708 s | 0.10 s | 1.74 s | 12 MB | 282 MB | win, 13.8× |
+| regex-redux | regexredux-2 | regexredux-4 | 0.259 s | 0.344 s | 0.37 s | 0.34 s | 242 MB | 364 MB | win, 1.3× |
+| pidigits | pidigits | pidigits-3 | 0.252 s | 0.727 s | 0.25 s | 0.88 s | 1.9 MB | 99 MB | win, 2.9× |
 
-Apple M4, Node v26.12.0, Bun 1.4.4, median of 3, `bench/results/benchmarksgame-2026-11-07-mac-5.txt`. Every
-xisto program here is single-threaded: these runs predate the parallel ports. The ratio is against the better
-of Node and Bun.
+### Xeon E5-2686 v4 (2 vCPUs)
 
-| problem | xisto | Node | Bun | xisto vs best |
-|---|---|---|---|---:|
-| spectral-norm | 0.851 s, 1.6 MB | 1.102 s, 45.9 MB | 1.313 s, 20.1 MB | 1.29× faster |
-| n-body | 1.604 s, 1.2 MB | 2.344 s, 45.5 MB | 2.486 s, 18.8 MB | 1.46× faster |
-| fannkuch-redux | 21.475 s, 1.4 MB | 24.883 s, 43.3 MB | 25.797 s, 19.1 MB | 1.16× faster |
-| binary-trees | 2.842 s, 325.5 MB | 5.167 s, 1,023.8 MB | 3.466 s, 1,197.5 MB | 1.22× faster |
-| mandelbrot | 8.781 s, 1.4 MB | 24.235 s, 48.8 MB | 22.086 s, 26.6 MB | 2.52× faster |
-| fasta | 4.262 s, 1.6 MB | 9.899 s, 50.2 MB | 5.476 s, 84.9 MB | 1.29× faster |
-| k-nucleotide | 22.410 s, 717.5 MB | 44.651 s, 704.4 MB | 27.480 s, 1,824.0 MB | 1.23× faster |
-| reverse-complement | 0.670 s, 245.2 MB | 1.994 s, 689.8 MB | 1.720 s, 286.2 MB | 2.57× faster |
-| regex-redux | 0.358 s, 289.1 MB | 1.239 s, 853.8 MB | 0.354 s, 364.5 MB | 1.01× slower |
-| pidigits | 0.650 s, 2.9 MB | 5.652 s, 114.0 MB | 0.728 s, 99.1 MB | 1.12× faster |
+Source: `bench/results/vm-2026-11-13/node-bun-ubuntu-xeon-2026-11-13-e5fb066.txt`.
 
-On binary-trees, Node and Bun use more CPU than wall time (garbage-collector threads): 7.15 and 4.26 s of CPU.
+| problem | xisto | Node | xisto time | Node time | xisto CPU | Node CPU | xisto mem | Node mem | result |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| spectral-norm | spectralnorm-6 | spectralnorm-1 | 0.459 s | 3.107 s | 0.89 s | 3.13 s | 2.3 MB | 57 MB | win, 6.8× |
+| n-body | nbody | nbody-8 | 2.456 s | 6.228 s | 2.45 s | 6.23 s | 2.0 MB | 56 MB | win, 2.5× |
+| fannkuch-redux | fannkuchredux-5 | fannkuchredux-8 | 6.596 s | 54.671 s | 13.11 s | 54.67 s | 2.3 MB | 54 MB | win, 8.3× |
+| binary-trees | binarytrees † | binarytrees-7 | 1.624 s | 34.939 s | 3.05 s | 51.56 s | 70 MB | 687 MB | win, 21.5× |
+| mandelbrot | mandelbrot-6 | mandelbrot-1 | 1.327 s | 83.686 s | 2.53 s | 83.51 s | 7.3 MB | 59 MB | win, 63.1× |
+| fasta | | | | | | | | | no row: Node's output differed |
+| k-nucleotide | knucleotide-7 † | knucleotide-8 | 1.384 s | 135.189 s | 2.68 s | 135.81 s | 69 MB | 674 MB | win, 97.7× |
+| reverse-complement | revcomp-9 | revcomp-2 | 0.842 s | 5.301 s | 0.26 s | 4.73 s | 11 MB | 677 MB | win, 6.3× |
+| regex-redux | regexredux-2 | regexredux-4 | 0.690 s | 3.967 s | 0.97 s | 4.12 s | 149 MB | 635 MB | win, 5.7× |
+| pidigits | pidigits | pidigits-3 | 0.625 s | 10.891 s | 0.62 s | 10.93 s | 2.6 MB | 121 MB | win, 17.4× |
+
+| problem | xisto | Bun | xisto time | Bun time | xisto CPU | Bun CPU | xisto mem | Bun mem | result |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| spectral-norm | spectralnorm-6 | spectralnorm-1 | 0.459 s | 4.164 s | 0.89 s | 4.19 s | 2.3 MB | 34 MB | win, 9.1× |
+| n-body | nbody | nbody-8 | 2.456 s | 8.155 s | 2.45 s | 8.16 s | 2.0 MB | 36 MB | win, 3.3× |
+| fannkuch-redux | fannkuchredux-5 | fannkuchredux-8 | 6.596 s | 55.129 s | 13.11 s | 55.13 s | 2.3 MB | 34 MB | win, 8.4× |
+| binary-trees | binarytrees † | binarytrees-7 | 1.624 s | 13.236 s | 3.05 s | 16.76 s | 70 MB | 1,067 MB | win, 8.2× |
+| mandelbrot | mandelbrot-6 | mandelbrot-1 | 1.327 s | 72.575 s | 2.53 s | 72.33 s | 7.3 MB | 42 MB | win, 54.7× |
+| fasta | fasta | fasta-1 | 1.074 s | 15.463 s | 0.29 s | 15.34 s | 2.4 MB | 101 MB | win, 14.4× |
+| k-nucleotide | knucleotide-7 † | knucleotide-8 | 1.384 s | 96.810 s | 2.68 s | 97.45 s | 69 MB | 1,690 MB | win, 69.9× |
+| reverse-complement | | | | | | | | | no row: Bun's output differed |
+| regex-redux | regexredux-2 | regexredux-4 | 0.690 s | 1.146 s | 0.97 s | 1.16 s | 149 MB | 327 MB | win, 1.7× |
+| pidigits | pidigits | pidigits-3 | 0.625 s | 2.340 s | 0.62 s | 2.37 s | 2.6 MB | 109 MB | win, 3.7× |
+
+### Graviton2 (2 vCPUs)
+
+Source: `bench/results/vm-2026-11-13/node-bun-arm-graviton2-2026-11-13-e5fb066.txt`. The steal counter rose by
+2,566 during this round, mostly in the long Node and Bun runs.
+
+| problem | xisto | Node | xisto time | Node time | xisto CPU | Node CPU | xisto mem | Node mem | result |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| spectral-norm | spectralnorm-7 | spectralnorm-1 | 1.217 s | 4.037 s | 2.43 s | 4.06 s | 1.8 MB | 54 MB | win, 3.3× |
+| n-body | nbody | nbody-8 | 4.610 s | 10.207 s | 4.60 s | 10.21 s | 1.6 MB | 54 MB | win, 2.2× |
+| fannkuch-redux | fannkuchredux-5 | fannkuchredux-8 | 8.575 s | 67.627 s | 17.13 s | 67.57 s | 1.8 MB | 52 MB | win, 7.9× |
+| binary-trees | binarytrees-3 | binarytrees-7 | 1.832 s | 27.839 s | 3.60 s | 40.02 s | 114 MB | 596 MB | win, 15.2× |
+| mandelbrot | mandelbrot-7 | mandelbrot-1 | 2.744 s | 71.269 s | 5.45 s | 71.21 s | 6.8 MB | 49 MB | win, 26.0× |
+| fasta | | | | | | | | | no row: Node's output differed |
+| k-nucleotide | knucleotide-7 | knucleotide-8 | 3.011 s | 220.184 s | 5.90 s | 220.99 s | 64 MB | 617 MB | win, 73.1× |
+| reverse-complement | revcomp-6 † | revcomp-2 | 0.282 s | 4.305 s | 0.24 s | 4.36 s | 188 MB | 448 MB | win, 15.3× |
+| regex-redux | regexredux-2 | regexredux-4 | 0.799 s | 4.746 s | 1.25 s | 4.95 s | 149 MB | 556 MB | win, 5.9× |
+| pidigits | pidigits | pidigits-2 | 2.039 s | 12.987 s | 2.04 s | 13.04 s | 2.1 MB | 85 MB | win, 6.4× |
+
+| problem | xisto | Bun | xisto time | Bun time | xisto CPU | Bun CPU | xisto mem | Bun mem | result |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| spectral-norm | spectralnorm-7 | spectralnorm-1 | 1.217 s | 4.777 s | 2.43 s | 4.81 s | 1.8 MB | 22 MB | win, 3.9× |
+| n-body | nbody | nbody-8 | 4.610 s | 14.418 s | 4.60 s | 14.43 s | 1.6 MB | 22 MB | win, 3.1× |
+| fannkuch-redux | fannkuchredux-5 | fannkuchredux-8 | 8.575 s | 64.664 s | 17.13 s | 64.63 s | 1.8 MB | 23 MB | win, 7.5× |
+| binary-trees | binarytrees-3 | binarytrees-7 | 1.832 s | 13.141 s | 3.60 s | 16.97 s | 114 MB | 1,127 MB | win, 7.2× |
+| mandelbrot | mandelbrot-7 | mandelbrot-1 | 2.744 s | 59.308 s | 5.45 s | 58.59 s | 6.8 MB | 32 MB | win, 21.6× |
+| fasta | fasta | fasta-1 | 0.544 s | 16.264 s | 0.38 s | 16.23 s | 1.9 MB | 92 MB | win, 29.9× |
+| k-nucleotide | knucleotide-7 | knucleotide-8 | 3.011 s | 149.910 s | 5.90 s | 150.17 s | 64 MB | 1,329 MB | win, 49.8× |
+| reverse-complement | revcomp-6 † | revcomp-2 | 0.282 s | 3.810 s | 0.24 s | 3.90 s | 188 MB | 293 MB | win, 13.5× |
+| regex-redux | regexredux-2 | regexredux-4 | 0.799 s | 1.411 s | 1.25 s | 1.42 s | 149 MB | 311 MB | win, 1.8× |
+| pidigits | pidigits | pidigits-2 | 2.039 s | 3.207 s | 2.04 s | 3.27 s | 2.1 MB | 88 MB | win, 1.6× |
+
+xisto wins every row on all three machines, on time and on memory; on CPU it uses less on every row except
+regex-redux against Bun on the M4 (0.37 s against 0.34 s). Missing rows: the official Node fasta program gave a
+different output on both VMs (its stdout writes are asynchronous when stdout is a pipe), and Bun's
+reverse-complement did on the Xeon. On the Graviton2 the placar picks `revcomp-6` (188 MB), not `revcomp-9` (10 MB),
+by the memory rule's 5% limit.
 
 ## See also
 
