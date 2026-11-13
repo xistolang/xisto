@@ -98,37 +98,83 @@ export class LinearCongruential {
     return this.last;
   }
 
-  /** @internal The values of the cycle the sequence runs in, in order; empty until {@link LinearCongruential.findCycle}. */
-  cycleValues: int[] = [];
-  /** @internal Where each value sits in {@link LinearCongruential.cycleValues}; −1 off the cycle. */
+  /** @internal The length of the cycle the sequence runs in; 0 until {@link LinearCongruential.findCycle}. */
+  cycleLength: int = 0;
+  /** @internal The value at place 0 of the cycle: the first value of it the sequence reached. */
+  cycleStart: int = 0;
+  /** @internal The place on the cycle of the value after `last`, while `last` is still `placedLast`. */
+  nextPlace: int = 0;
+  /** @internal The `last` that {@link LinearCongruential.nextPlace} was worked out for (−1: none). */
+  placedLast: int = -1;
+  /** @internal Where each value sits on the cycle, −1 off it: made only when `last` moved where `nextPlace` does not follow. */
   cyclePlaces: int[] = [];
 
   /**
    * @internal The cycle of the values after `last`: a generator with a small modulus repeats itself, and once its
-   * values are known in order, many of them are a copy. Made once (the modulus at most 2^21).
-   * @returns Whether the next value is on the cycle found.
+   * values are known in order, many of them are a copy. Found once (the modulus at most 2^21), kept as its start
+   * and length only (a value at a place is worked out with {@link LinearCongruential.valueAt}): the table of
+   * places is made only if the sequence is moved somewhere the place cannot be followed.
+   * @returns Whether the next value is on the cycle found ({@link LinearCongruential.nextPlace} is then its place).
    */
   findCycle(): boolean {
     const m = this.modulus;
     if (m > 2097152) return false;
-    if (this.cycleValues.length === 0) {
-      const places: int[] = new Array<int>(m).fill(-1);
-      const order: int[] = new Array<int>(m).fill(0);
-      let v: int = (this.last * this.multiplier + this.increment) % m;
-      let k = 0;
-      while (places[v] < 0) {
-        places[v] = k;
-        order[k] = v;
+    const a: int = this.multiplier % m, c: int = this.increment % m;
+    const next: int = (this.last * this.multiplier + this.increment) % m;
+    if (this.cycleLength === 0) {
+      // the values from the next one on, marked until one comes back: that one starts the cycle (the values before
+      // it lead into the cycle and never come back)
+      const seen = new Uint8Array((m + 7) >> 3);
+      let v: int = next;
+      let k: int = 0;
+      while ((seen[v >> 3] & (1 << (v & 7))) === 0) {
+        seen[v >> 3] |= 1 << (v & 7);
+        v = (v * a + c) % m;
         k++;
-        v = (v * this.multiplier + this.increment) % m;
       }
-      const first = places[v]; // the values before it lead into the cycle and never come back
-      for (let j = 0; j < first; j++) places[order[j]] = -1;
-      for (let j = first; j < k; j++) places[order[j]] -= first;
-      this.cycleValues = order.slice(first, k);
+      let len: int = k;
+      if (v !== next) { // a lead-in: the cycle is shorter than the walk
+        len = 1;
+        for (let w: int = (v * a + c) % m; w !== v; w = (w * a + c) % m) len++;
+      }
+      this.cycleStart = v;
+      this.cycleLength = len;
+      if (v === next) {
+        this.placedLast = this.last;
+        this.nextPlace = 0;
+      }
+    }
+    if (this.last === this.placedLast) return true;
+    if (this.cyclePlaces.length === 0) {
+      const places: int[] = new Array<int>(m).fill(-1);
+      let v: int = this.cycleStart;
+      for (let k = 0; k < this.cycleLength; k++) {
+        places[v] = k;
+        v = (v * a + c) % m;
+      }
       this.cyclePlaces = places;
     }
-    return this.cyclePlaces[(this.last * this.multiplier + this.increment) % m] >= 0;
+    const at: int = this.cyclePlaces[next];
+    if (at < 0) return false;
+    this.placedLast = this.last;
+    this.nextPlace = at;
+    return true;
+  }
+
+  /** @internal The value at place `place` of the cycle found by {@link LinearCongruential.findCycle}: the start moved on that many steps at once (the steps composed by squaring). */
+  valueAt(place: int): int {
+    const m = this.modulus;
+    let mulAll: int = 1, addAll: int = 0; // the steps taken so far: x -> mulAll * x + addAll
+    let mul: int = this.multiplier % m, add: int = this.increment % m; // 2^j steps at once
+    for (let k = place; k > 0; k = k >> 1) {
+      if ((k & 1) === 1) {
+        mulAll = (mulAll * mul) % m;
+        addAll = (addAll * mul + add) % m;
+      }
+      add = (add * mul + add) % m;
+      mul = (mul * mul) % m;
+    }
+    return (this.cycleStart * mulAll + addAll) % m;
   }
 }
 
@@ -210,7 +256,7 @@ export class WeightedCharacters {
     const out = new Uint8Array(count + lines);
     const r = this.random;
     const m = r.modulus;
-    if (count > 0 && r.findCycle() && width < r.cycleValues.length) {
+    if (count > 0 && r.findCycle() && width < r.cycleLength) {
       this.copyFromCycle(out, count, width);
     } else {
       let at = 0, col = 0;
@@ -232,24 +278,25 @@ export class WeightedCharacters {
   }
 
   // the characters drawn, copied from the generator's cycle: the character of each value on it worked out once,
-  // and the cycle written twice so that a line never wraps around its end
+  // and the start of the cycle written again after its end so that a line never wraps around it
   private copyFromCycle(out: Uint8Array, count: int, width: int): void {
     const r = this.random;
-    const values = r.cycleValues;
-    const n = values.length;
-    if (this.cycleText.length !== 2 * n) {
+    const n = r.cycleLength;
+    const step: int = width > 0 ? width : n; // (width below n: pick checks)
+    if (this.cycleText.length < n + step) {
       const m = r.modulus;
-      const text = new Uint8Array(2 * n);
+      const a: int = r.multiplier % m, c: int = r.increment % m;
+      const text = new Uint8Array(n + step);
+      let v: int = r.cycleStart;
       for (let k = 0; k < n; k++) {
-        const code = this.codeOf(values[k] / m);
-        text[k] = code;
-        text[k + n] = code;
+        text[k] = this.codeOf(v / m);
+        v = (v * a + c) % m;
       }
+      for (let k = 0; k < step; k++) text[n + k] = text[k];
       this.cycleText = text;
     }
     const text = this.cycleText;
-    let p: int = r.cyclePlaces[(r.last * r.multiplier + r.increment) % r.modulus];
-    const step: int = width > 0 ? width : n; // (width below n: pick checks)
+    let p: int = r.nextPlace;
     let at: int = 0, left: int = count;
     while (left > 0) {
       const len = left < step ? left : step;
@@ -260,7 +307,9 @@ export class WeightedCharacters {
       p += len;
       if (p >= n) p -= n;
     }
-    r.last = values[p === 0 ? n - 1 : p - 1];
+    r.last = r.valueAt(p === 0 ? n - 1 : p - 1);
+    r.placedLast = r.last;
+    r.nextPlace = p;
   }
 }
 
