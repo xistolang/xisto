@@ -55,7 +55,7 @@ A tie is a difference within 5% either way.
 | Xeon E5-2686 v4 | AWS t2.medium, 2 vCPUs, AVX2, Ubuntu | Benchmarks Game vs Rust and Node |
 | Graviton2 | AWS t4g.small, 2 vCPUs, arm64 | Benchmarks Game vs Rust and Node |
 
-Runtimes: Node v26.12.0 and Bun 1.4.4 on the M4; Node v24.22.2 on the VMs (9 Nov 2026). Rust: stable,
+Runtimes: Node v26.12.0 and Bun 1.4.4 on the M4 and on both VMs (13 Nov 2026; Node v24.22.2 on the VMs until 9 Nov). Rust: stable,
 `opt-level = 3`, `codegen-units = 1`, `-C target-cpu=native`, GMP for pidigits, as `bench/benchmarksgame/langs.md`
 describes; rustc 1.99.1 in the 13 Nov round. xisto builds with `XISTO_CPU=native` for the same reason (the default
 binary is portable), and the round script records it in the result header. On arm64 the Rust programs written with x86 SIMD

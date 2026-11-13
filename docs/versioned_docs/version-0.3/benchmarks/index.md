@@ -10,11 +10,10 @@ How they were measured is in [Methodology](../performance/methodology.md).
 
 ## Read this first
 
-- The Benchmarks Game against Rust was re-run on 13 Nov 2026 (main `e5fb066`). The other tables are from 5–10 Nov.
-- Bun wins or ties some rows: the Todo API, energy per HTTP request, streaming time, SQLite time and regex-redux on
-  the M4. Those rows are shown, not dropped.
-- The M4 Benchmarks Game results (7 Nov) predate the parallel ports: every xisto program there is
-  single-threaded. The VM results (9–10 Nov) use the parallel versions.
+- The Benchmarks Game against Rust, Node and Bun was re-run on 13 Nov 2026 (main `e5fb066`). The other tables are
+  from 5–10 Nov.
+- Bun wins or ties some rows: the Todo API, energy per HTTP request, streaming time and SQLite time. Those rows are
+  shown, not dropped.
 - Against Rust no problem is lost on either VM, and xisto's peak memory is at or below Rust's on all ten. Three
   rows are ties within 5%: spectral-norm on both VMs and mandelbrot on the Graviton2.
 
@@ -33,9 +32,12 @@ The per-problem table is on [Benchmarks Game](./benchmarks-game.md).
 
 ## Benchmarks Game against Node and Bun
 
-Apple M4, 7 Nov 2026, median of 3, Node v26.12.0 and Bun 1.4.4, xisto single-threaded
-(`bench/results/benchmarksgame-2026-11-07-mac-5.txt`). xisto is faster than the better of Node and Bun on 9 of 10
-problems, by 1.12× (pidigits) to 2.57× (reverse-complement). On regex-redux Bun is 1% faster (0.354 s against 0.358 s).
+13 Nov 2026, the same xisto variants as the Rust round against the official Node programs under Node v26.12.0 and
+Bun 1.4.4, median of 3, on the Apple M4, the Xeon and the Graviton2. xisto wins every row on all three machines, on
+time and on memory: from 1.3× (regex-redux against Bun on the M4) to 200× (k-nucleotide against Node on the M4).
+Most xisto variants use every core while the Node programs use one, so the CPU columns are the fairer comparison;
+xisto uses less CPU on every row but regex-redux against Bun on the M4 (0.37 s against 0.34 s). The tables are on
+[Benchmarks Game](./benchmarks-game.md#against-node-and-bun-13-nov-2026).
 
 ## Servers
 
