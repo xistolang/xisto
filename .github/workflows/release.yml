@@ -146,12 +146,16 @@ jobs:
           git diff --cached --quiet || git commit -m "docs: freeze version $DV"
           git push origin HEAD:main
 
+  # the github-pages environment only deploys from main, and a push made with the workflow token starts no run:
+  # dispatch the docs workflow on main instead of calling it from the tag
   docs:
     name: Documentation
     needs: docs-version
     if: ${{ always() && needs.docs-version.result == 'success' }}
+    runs-on: ubuntu-latest
     permissions:
-      contents: read
-      pages: write
-      id-token: write
-    uses: ./.github/workflows/docs.yml
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run docs.yml --repo "$GITHUB_REPOSITORY" --ref main
