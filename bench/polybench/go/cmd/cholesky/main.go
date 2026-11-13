@@ -58,8 +58,10 @@
 package main
 
 import (
+	"fmt"
 	"math"
 	"os"
+	"time"
 
 	"polybench/dump"
 )
@@ -143,7 +145,17 @@ func main() {
 	initArray(n, A)
 
 	// Run kernel.
+	start := time.Now()
 	kernelCholesky(n, A)
+	elapsed := time.Since(start)
+
+	// Print timer: the kernel's seconds on stdout with the "time" argument (-DPOLYBENCH_TIME).
+	for _, a := range os.Args[1:] {
+		if a == "time" {
+			fmt.Printf("%0.6f\n", elapsed.Seconds())
+			break
+		}
+	}
 
 	// Prevent dead-code elimination. All live-out data must be printed.
 	if dump.Enabled || len(os.Args) > 42 && os.Args[0] == "" {
