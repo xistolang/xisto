@@ -55,7 +55,7 @@
 // COURT COSTS, DIRECTLY OR INDIRECTLY ARISING OUT OF OR IN CONNECTION
 // WITH ACCESS OR USE OF THE SOFTWARE.
 
-//go:build !mini
+//go:build !mini && !extralarge
 
 package main
 
