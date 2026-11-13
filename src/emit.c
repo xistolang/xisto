@@ -568,6 +568,10 @@ static bool rv_valid; /* (the range tables, below) */
 static Func *rv_owner;
 static bool nn_expr(Expr *e);
 static bool may_nz(Expr *e); /* XB-087: an int expression that may be JavaScript's -0 */
+/* lane copies (see ln_plan): the double locals of N isomorphic copies of the same arithmetic, held as one vector */
+static bool ln_on;   /* the function being emitted has lanes */
+static bool ln_vec;  /* emitting a lane statement's expression: a lane variable is its whole vector */
+static bool ln_ident(Expr *e); /* emits a lane variable (its element, or its vector in ln_vec); false: not one */
 static int nz_mute; /* emitting where a zero's sign cannot be seen (x + 1, x / 2 + Number(i)): no -0 work */
 static void emit_nzd(Expr *e); /* ... and its value as a double, -0 kept */
 static const char **nzv; /* int locals that keep their -0 in a double beside them (<cname>_z), of nzv_owner */
@@ -2800,7 +2804,7 @@ static void emit_expr_raw(Expr *e) {
         return;
     case E_STRING: buf_printf(out, "%s", lit_nm(e->lit_id)); return;
     case E_BOOL: buf_puts(out, e->boolean ? "true" : "false"); return;
-    case E_IDENT: buf_puts(out, ren(e->cname)); return;
+    case E_IDENT: if (ln_on && ln_ident(e)) return; buf_puts(out, ren(e->cname)); return;
     case E_FUNC_REF: {
         /* a static immortal closure whose code forwards to the function */
         Func *f = e->func;
@@ -4293,6 +4297,351 @@ static bool emit_u8_rot3(Stmt *b, int *i) {
     *i += 2;
     return true;
 }
+/* ---- lane copies (ln_) ----
+   (lane_loop runs a loop's iterations in vector lanes; this is the other way to get there, code written by hand as
+   copies.) Code written as N copies of the same double arithmetic on N sets of variables (mandelbrot's eight pixels at a
+   time: zi0 = 2 * zr0 * zi0 + ci; ... zi7 = 2 * zr7 * zi7 + ci;) is one vector of N doubles in C (the vector
+   extension of clang and gcc), one vector statement per statement of a copy. The C compiler was left to find the
+   vectors itself (its SLP vectorizer), and how it grouped the copies changed with the shape of the surrounding
+   code and between versions: lanes paired differently from the escape test, shuffles and spills (mandelbrot-5:
+   Graviton2 6,0 s of CPU, the same arithmetic as explicit vectors 5,5; Xeon 3,8 against 3,6).
+   A run of statements in a block, all of them `x = e` or `let x = e` on doubles with e made of + - * /, unary -,
+   names and numbers, splits into N lanes when it is N copies of a sequence of statements (the copies one after
+   the other, or each statement's N copies together) and in each statement each name is either the same in every
+   copy (an invariant: the run never writes it) or a different variable in each (a lane variable: a group of N,
+   one per copy, the same group wherever it appears). Each copy then reads and writes only its own lane, so the
+   copies are independent: the run is the vector statements in order, and every double is what the scalar code
+   computes (the same operations on each element, -ffp-contract=off as everywhere). Elsewhere a lane variable is
+   read as its element (v[k]); the function must write a lane variable only in such runs, a group of parameters
+   is only read, and no closure captures anything. N is 4, 8 or 16 for the whole function. */
+#define LN_MAXG 96
+#define LN_MAXR 64
+#define LN_MAXC 32
+typedef struct { const char *m[16]; Type *t; int n; bool param, decl, used_vec; const char *vname; } LnGroup;
+typedef struct { Stmt *blk; int i0, i1, ncls; Stmt *cls[LN_MAXC][16]; } LnRun;
+/* the plan of the function being emitted (a heap copy: a clone emitted in the middle of another function's
+   body plans its own, in ln_scratch, and emit_func_body puts the outer one back) */
+typedef struct { LnGroup g[LN_MAXG]; int ng, n; LnRun r[LN_MAXR]; int nr; Func *fn; } LnState;
+static LnState ln_scratch, *ln_cur = &ln_scratch;
+#define ln_g (ln_cur->g)
+#define ln_ng (ln_cur->ng)
+#define ln_n (ln_cur->n)
+#define ln_r (ln_cur->r)
+#define ln_nr (ln_cur->nr)
+#define ln_fn (ln_cur->fn)
+static bool ln_fail;
+static bool ln_arith(Expr *e) {
+    if (!e || !e->type || e->type->kind != TY_NUMBER) return false;
+    switch (e->kind) {
+    case E_NUMBER: return true;
+    case E_IDENT: return e->cname && !e->builtin.cfn && !e->cell_raw;
+    case E_UNARY: return e->op == TK_MINUS && !e->elem_type && ln_arith(e->lhs);
+    case E_BINARY: return !e->builtin.cfn && (e->op == TK_PLUS || e->op == TK_MINUS || e->op == TK_STAR || e->op == TK_SLASH) && ln_arith(e->lhs) && ln_arith(e->rhs);
+    default: return false;
+    }
+}
+/* the variable a candidate statement writes (its C name), or NULL when it is not one */
+static const char *ln_lhs(Stmt *s) {
+    if (s->kind == S_VAR) return s->type && s->type->kind == TY_NUMBER && !s->cell && s->cname && s->init && !s->init->unset && ln_arith(s->init) ? s->cname : NULL;
+    if (s->kind != S_EXPR || !s->expr || s->expr->kind != E_ASSIGN || s->expr->op != TK_ASSIGN) return NULL;
+    Expr *l = s->expr->lhs;
+    if (!l || l->kind != E_IDENT || !l->cname || !l->type || l->type->kind != TY_NUMBER || !ln_arith(s->expr->rhs)) return NULL;
+    return l->cname;
+}
+static Expr *ln_rhs(Stmt *s) { return s->kind == S_VAR ? s->init : s->expr->rhs; }
+/* the same shape: the same operations and numbers, names anywhere */
+static bool ln_shape(Expr *a, Expr *b) {
+    if (a->kind != b->kind) return false;
+    switch (a->kind) {
+    case E_NUMBER: return a->num == b->num && signbit(a->num) == signbit(b->num);
+    case E_IDENT: return true;
+    case E_UNARY: return ln_shape(a->lhs, b->lhs);
+    case E_BINARY: return a->op == b->op && ln_shape(a->lhs, b->lhs) && ln_shape(a->rhs, b->rhs);
+    default: return false;
+    }
+}
+static void ln_leaves(Expr *e, const char **o, int *n) {
+    if (e->kind == E_IDENT) { if (*n < 64) o[*n] = e->cname; (*n)++; return; }
+    if (e->kind == E_UNARY) { ln_leaves(e->lhs, o, n); return; }
+    if (e->kind == E_BINARY) { ln_leaves(e->lhs, o, n); ln_leaves(e->rhs, o, n); }
+}
+static int ln_find_g(const char *c, int *lane) {
+    for (int g = 0; g < ln_ng; g++)
+        for (int k = 0; k < ln_g[g].n; k++) if (strcmp(ln_g[g].m[k], c) == 0) { if (lane) *lane = k; return g; }
+    return -1;
+}
+/* a group of N variables, one per lane: the same as an existing one, or new (none of its variables in another) */
+static int ln_add_group(const char **m, int n, Type *t) {
+    int k0;
+    int g = ln_find_g(m[0], &k0);
+    if (g >= 0) {
+        if (k0 != 0 || ln_g[g].n != n) return -1;
+        for (int k = 0; k < n; k++) if (strcmp(ln_g[g].m[k], m[k]) != 0) return -1;
+        return g;
+    }
+    for (int k = 0; k < n; k++) if (ln_find_g(m[k], NULL) >= 0) return -1;
+    if (ln_ng == LN_MAXG) return -1;
+    LnGroup *G = &ln_g[ln_ng];
+    memset(G, 0, sizeof *G);
+    for (int k = 0; k < n; k++) G->m[k] = m[k];
+    G->n = n;
+    G->t = t;
+    return ln_ng++;
+}
+/* the run from i, M statements a copy, N copies (M = 1: each statement's copies together; M > 1: copy after copy):
+   true when the statements fit, with the groups they make added */
+static bool ln_try(Stmt **st, int len, int i, int M, int N, LnRun *r) {
+    if (i + M * N > len || M > LN_MAXC) return false;
+    for (int j = 0; j < M; j++) {
+        Stmt *s0 = st[i + j];
+        for (int l = 1; l < N; l++) {
+            Stmt *s = st[i + l * M + j];
+            if (s->kind != s0->kind || !ln_shape(ln_rhs(s0), ln_rhs(s))) return false;
+        }
+    }
+    /* the names: the written ones differ between copies; each leaf is the same in every copy or a different one */
+    const char *wr[LN_MAXC * 16];
+    int nw = 0;
+    for (int j = 0; j < M; j++) for (int l = 0; l < N; l++) wr[nw++] = ln_lhs(st[i + l * M + j]);
+    int ng0 = ln_ng;
+    for (int j = 0; j < M; j++) {
+        const char *lv[64][16];
+        int nlv = 0;
+        const char *lw[16];
+        for (int l = 0; l < N; l++) {
+            Stmt *s = st[i + l * M + j];
+            const char *o[64];
+            int n = 0;
+            ln_leaves(ln_rhs(s), o, &n);
+            if (n > 64) { ln_ng = ng0; return false; }
+            nlv = n;
+            for (int p = 0; p < n; p++) lv[p][l] = o[p];
+            lw[l] = ln_lhs(s);
+        }
+        for (int a = 0; a < N; a++) for (int b = a + 1; b < N; b++) if (strcmp(lw[a], lw[b]) == 0) { ln_ng = ng0; return false; }
+        Type *wt = st[i + j]->kind == S_VAR ? st[i + j]->type : st[i + j]->expr->lhs->type;
+        if (ln_add_group(lw, N, wt) < 0) { ln_ng = ng0; return false; }
+        for (int p = 0; p < nlv; p++) {
+            bool same = true, distinct = true;
+            for (int a = 1; a < N; a++) if (strcmp(lv[p][a], lv[p][0]) != 0) same = false;
+            for (int a = 0; a < N && distinct; a++) for (int b = a + 1; b < N; b++) if (strcmp(lv[p][a], lv[p][b]) == 0) { distinct = false; break; }
+            if (same) { /* an invariant: not written in the run */
+                for (int w = 0; w < nw; w++) if (strcmp(wr[w], lv[p][0]) == 0) { ln_ng = ng0; return false; }
+                continue;
+            }
+            if (!distinct || ln_add_group(lv[p], N, ty_number) < 0) { ln_ng = ng0; return false; }
+        }
+    }
+    r->i0 = i;
+    r->i1 = i + M * N;
+    r->ncls = M;
+    for (int j = 0; j < M; j++) for (int l = 0; l < N; l++) r->cls[j][l] = st[i + l * M + j];
+    return true;
+}
+static void ln_scan_block(Stmt *b) {
+    if (!b || ln_fail) return;
+    if (b->kind == S_BLOCK) {
+        Stmt **st = b->stmts.items;
+        int len = b->stmts.len;
+        for (int i = 0; i < len && !ln_fail;) {
+            if (!ln_lhs(st[i])) { i++; continue; }
+            int run = 0; /* the candidates from i */
+            while (i + run < len && ln_lhs(st[i + run])) run++;
+            bool got = false;
+            for (int M = run / ln_n; M >= 1 && !got; M--) {
+                if (ln_nr == LN_MAXR) { ln_fail = true; return; }
+                LnRun *r = &ln_r[ln_nr];
+                r->blk = b;
+                if (ln_try(st, i + run, i, M, ln_n, r)) { ln_nr++; i = r->i1; got = true; }
+            }
+            if (!got) i++;
+        }
+    }
+    for (int i = 0; i < b->stmts.len; i++) ln_scan_block(b->stmts.items[i]);
+    ln_scan_block(b->for_init);
+    ln_scan_block(b->body);
+    ln_scan_block(b->else_body);
+    for (int i = 0; i < b->ncases; i++) ln_scan_block(b->cases[i].body);
+}
+static bool ln_in_run(Stmt *s) {
+    for (int r = 0; r < ln_nr; r++)
+        for (int j = 0; j < ln_r[r].ncls; j++) for (int l = 0; l < ln_n; l++) if (ln_r[r].cls[j][l] == s) return true;
+    return false;
+}
+/* a lane variable written (or declared) outside the runs */
+static void ln_check_e(Expr *e) {
+    if (!e || ln_fail) return;
+    if ((e->kind == E_ASSIGN || e->kind == E_POSTFIX || (e->kind == E_UNARY && (e->op == TK_PLUSPLUS || e->op == TK_MINUSMINUS))) &&
+        e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname && ln_find_g(e->lhs->cname, NULL) >= 0) ln_fail = true;
+    ln_check_e(e->lhs);
+    ln_check_e(e->rhs);
+    for (int i = 0; i < e->args.len; i++) ln_check_e(e->args.items[i]);
+}
+static void ln_check_s(Stmt *s) {
+    if (!s || ln_fail) return;
+    if (ln_in_run(s)) { /* (its expression only reads; the write is the vector statement) */
+        if (s->kind == S_VAR) { int g = ln_find_g(s->cname, NULL); if (g >= 0) ln_g[g].decl = true; }
+        return;
+    }
+    if (s->kind == S_VAR && s->cname && ln_find_g(s->cname, NULL) >= 0) ln_fail = true;
+    if ((s->kind == S_FOROF || s->kind == S_TRY) && s->cname && ln_find_g(s->cname, NULL) >= 0) ln_fail = true;
+    ln_check_e(s->init); ln_check_e(s->expr); ln_check_e(s->cond); ln_check_e(s->for_update);
+    ln_check_s(s->for_init); ln_check_s(s->body); ln_check_s(s->else_body);
+    for (int i = 0; i < s->stmts.len; i++) ln_check_s(s->stmts.items[i]);
+    for (int i = 0; i < s->ncases; i++) { ln_check_e(s->cases[i].value); ln_check_s(s->cases[i].body); }
+}
+static bool ln_has_op(Expr *e) { return e && (e->kind == E_BINARY || e->kind == E_UNARY); }
+static bool stmt_has_arrow(Stmt *s);
+static bool ln_plan_n(Func *f, int n) {
+    ln_ng = 0; ln_nr = 0; ln_fail = false; ln_n = n;
+    ln_scan_block(f->body);
+    if (ln_fail || !ln_nr) return false;
+    for (int g = 0; g < ln_ng; g++) { /* each group: N parameters (only read) or N locals declared in runs */
+        int np = 0;
+        for (int k = 0; k < ln_g[g].n; k++)
+            for (int i = 0; i < f->nparams; i++)
+                if (f->params[i].cname && strcmp(f->params[i].cname, ln_g[g].m[k]) == 0) {
+                    if (f->params[i].cell || !f->params[i].type || f->params[i].type->kind != TY_NUMBER) return false;
+                    np++;
+                }
+        if (np && np != ln_g[g].n) return false;
+        ln_g[g].param = np > 0;
+        if (strncmp(ln_g[g].m[0], "v_", 2) != 0) return false; /* (a local or a parameter, not a global) */
+    }
+    ln_check_s(f->body);
+    if (ln_fail) return false;
+    for (int g = 0; g < ln_ng; g++) if (!ln_g[g].param && !ln_g[g].decl) return false;
+    bool work = false; /* some arithmetic in the vectors (not only copies of values) */
+    for (int r = 0; r < ln_nr && !work; r++) for (int j = 0; j < ln_r[r].ncls; j++) if (ln_has_op(ln_rhs(ln_r[r].cls[j][0]))) work = true;
+    return work;
+}
+/* The lanes' order in the vector is free (each copy computes the same thing in any lane). Bits packed one per
+   copy with the first copy in the highest bit (if (tr0 + ti0 <= 4) b |= 128; ... b |= 1: a PBM row) come out of
+   a vector comparison in one instruction (movmskpd, the lowest bit from the first element) when the first copy is
+   the last element: then the copies go in the vector last to first. */
+static int ln_lane_of_cond(Expr *e) { /* the one lane the names of e read (-1: none, -2: several) */
+    if (!e) return -1;
+    if (e->kind == E_IDENT) { int k; return e->cname && ln_find_g(e->cname, &k) >= 0 ? k : -1; }
+    int a = ln_lane_of_cond(e->lhs), b = ln_lane_of_cond(e->rhs);
+    for (int i = 0; i < e->args.len; i++) { int c = ln_lane_of_cond(e->args.items[i]); if (c != -1) { if (b == -1) b = c; else if (c != b) b = -2; } }
+    if (a == -2 || b == -2) return -2;
+    if (a == -1) return b;
+    if (b == -1) return a;
+    return a == b ? a : -2;
+}
+static void ln_bits_vote(Stmt *s, int *fwd, int *rev) {
+    if (!s) return;
+    if (s->kind == S_IF && !s->else_body && s->body) {
+        Stmt *b = s->body;
+        if (b->kind == S_BLOCK && b->stmts.len == 1) b = b->stmts.items[0];
+        Expr *a = b->kind == S_EXPR ? b->expr : NULL;
+        int k = ln_lane_of_cond(s->cond);
+        if (a && k >= 0 && a->kind == E_ASSIGN && a->op == TK_PIPE_ASSIGN && a->rhs && a->rhs->kind == E_NUMBER && a->rhs->is_int_lit) {
+            long long v = a->rhs->ival;
+            if (v == 1LL << k) (*fwd)++;
+            else if (v == 1LL << (ln_n - 1 - k)) (*rev)++;
+        }
+    }
+    ln_bits_vote(s->for_init, fwd, rev); ln_bits_vote(s->body, fwd, rev); ln_bits_vote(s->else_body, fwd, rev);
+    for (int i = 0; i < s->stmts.len; i++) ln_bits_vote(s->stmts.items[i], fwd, rev);
+    for (int i = 0; i < s->ncases; i++) ln_bits_vote(s->cases[i].body, fwd, rev);
+}
+/* decides the lanes of f (ln_on), before its body is emitted */
+static void ln_plan(Func *f) {
+    ln_on = false;
+    ln_cur = &ln_scratch;
+    ln_fn = NULL;
+    if (!f->body || f->is_gen || f->is_async || xs_debug || sm_mode || ictx || getenv("XISTO_NO_LANES") || stmt_has_arrow(f->body)) return;
+    for (int n = 16; n >= 4 && !ln_on; n /= 2) if (ln_plan_n(f, n)) ln_on = true;
+    if (!ln_on) return;
+    ln_fn = f;
+    for (int g = 0; g < ln_ng; g++) ln_g[g].vname = xs_sprintf("lv_%s", ln_g[g].m[0]);
+    int fwd = 0, rev = 0;
+    ln_bits_vote(f->body, &fwd, &rev);
+    if (rev > fwd && !getenv("XISTO_LANES_FWD")) /* (the run statements keep their lane-0 copy: only the order of the elements changes) */
+        for (int g = 0; g < ln_ng; g++)
+            for (int k = 0; k < ln_n / 2; k++) { const char *t = ln_g[g].m[k]; ln_g[g].m[k] = ln_g[g].m[ln_n - 1 - k]; ln_g[g].m[ln_n - 1 - k] = t; }
+    LnState *keep = malloc(sizeof *keep);
+    *keep = ln_scratch;
+    ln_cur = keep;
+}
+/* the vector type and the groups of parameters, at the function's entry */
+static void ln_prologue(void) {
+    nl();
+    buf_printf(out, "typedef double xs_lane%d __attribute__((vector_size(%d)));", ln_n, ln_n * 8);
+    for (int g = 0; g < ln_ng; g++) {
+        if (!ln_g[g].param) continue;
+        nl();
+        buf_printf(out, "xs_lane%d %s = {", ln_n, ln_g[g].vname);
+        for (int k = 0; k < ln_n; k++) buf_printf(out, "%s%s", k ? ", " : "", ln_g[g].m[k]);
+        buf_puts(out, "};");
+    }
+}
+static bool ln_ident(Expr *e) {
+    if (!e->cname || cur_func != ln_fn || ictx || sm_mode) return false;
+    int k;
+    int g = ln_find_g(e->cname, &k);
+    if (g < 0) return false;
+    if (ln_vec) buf_puts(out, ln_g[g].vname);
+    else buf_printf(out, "%s[%d]", ln_g[g].vname, k);
+    return true;
+}
+static bool ln_reads_lane(Expr *e) {
+    if (!e) return false;
+    if (e->kind == E_IDENT) return e->cname && ln_find_g(e->cname, NULL) >= 0;
+    return ln_reads_lane(e->lhs) || ln_reads_lane(e->rhs);
+}
+/* if (<a test of copy k>) b |= K; with b an int local and K a power of two: b |= (test ? K : 0), the test computed
+   either way (it has no effect: names, numbers, arithmetic and comparisons), so that the bits of a vector
+   comparison are one value the C compiler can move as a whole (movmskpd) instead of a chain of selects */
+static bool ln_emit_bits(Stmt *s) {
+    if (s->kind != S_IF || s->else_body || !s->body) return false;
+    Stmt *b = s->body;
+    if (b->kind == S_BLOCK && b->stmts.len == 1) b = b->stmts.items[0];
+    Expr *a = b->kind == S_EXPR ? b->expr : NULL;
+    if (!a || a->kind != E_ASSIGN || a->op != TK_PIPE_ASSIGN || !a->lhs || a->lhs->kind != E_IDENT || !a->lhs->cname || !a->lhs->type ||
+        a->lhs->type->kind != TY_INT || strncmp(a->lhs->cname, "v_", 2) != 0 || !a->rhs || a->rhs->kind != E_NUMBER || !a->rhs->is_int_lit ||
+        a->rhs->ival <= 0 || a->rhs->ival > 0x40000000 || (a->rhs->ival & (a->rhs->ival - 1))) return false;
+    int budget = 64;
+    if (ln_lane_of_cond(s->cond) < 0 || !flat_bool(s->cond, &budget)) return false;
+    const char *v = ren(a->lhs->cname);
+    nl();
+    buf_printf(out, "%s = ((int64_t)(int32_t)((uint32_t)(%s) | (uint32_t)((", v, v);
+    emit_expr(s->cond);
+    buf_printf(out, ") ? INT64_C(%lld) : INT64_C(0))));", a->rhs->ival);
+    return true;
+}
+/* the run that starts at statement *i of b: its vector statements */
+static bool ln_emit_at(Stmt *b, int *i) {
+    if (cur_func != ln_fn || ictx || sm_mode) return false;
+    if (ln_emit_bits(b->stmts.items[*i])) return true;
+    for (int r = 0; r < ln_nr; r++) {
+        LnRun *R = &ln_r[r];
+        if (R->blk != b || R->i0 != *i) continue;
+        for (int j = 0; j < R->ncls; j++) {
+            Stmt *s = R->cls[j][0];
+            int g = ln_find_g(ln_lhs(s), NULL);
+            nl();
+            if (s->kind == S_VAR) buf_printf(out, "xs_lane%d %s = ", ln_n, ln_g[g].vname);
+            else buf_printf(out, "%s = ", ln_g[g].vname);
+            bool splat = !ln_reads_lane(ln_rhs(s)); /* the same value in every lane: spelled out (C converts a scalar
+                                                       to a vector in arithmetic only) */
+            if (splat) buf_puts(out, "({ double ls_ = ");
+            ln_vec = !splat;
+            emit_expr(ln_rhs(s));
+            ln_vec = false;
+            if (splat) {
+                buf_printf(out, "; (xs_lane%d){", ln_n);
+                for (int k = 0; k < ln_n; k++) buf_puts(out, k ? ", ls_" : "ls_");
+                buf_puts(out, "}; })");
+            }
+            buf_puts(out, ";");
+        }
+        *i = R->i1 - 1;
+        return true;
+    }
+    return false;
+}
 static bool emit_u8_shl_put(Stmt *b, int *i) {
     if (emit_u8_rot3(b, i)) return true;
     if (*i + 1 >= b->stmts.len || xs_debug || sm_mode || ictx || getenv("XISTO_NO_U8_IDIOM")) return false;
@@ -4328,6 +4677,7 @@ static void emit_block_kind(Stmt *b, ScopeKind kind) {
         region_reset_pending = 0;
     }
     for (int i = 0; i < b->stmts.len; i++) {
+        if (ln_on && ln_emit_at(b, &i)) continue;
         if (emit_u8_shl_put(b, &i)) continue;
         nl();
         emit_dbg_hook(b->stmts.items[i]);
@@ -4356,6 +4706,7 @@ static void emit_block(Stmt *b, bool func_root) {
     Class *after_super = func_root ? inits_after_super : NULL;
     if (func_root) inits_after_super = NULL;
     for (int i = 0; i < b->stmts.len; i++) {
+        if (ln_on && ln_emit_at(b, &i)) continue;
         if (!after_super && emit_u8_shl_put(b, &i)) continue;
         nl();
         emit_dbg_hook(b->stmts.items[i]);
@@ -8733,6 +9084,10 @@ static void emit_func_body(Func *f) {
     buf_puts(out, "size_t ar_mark = xs_ar_mark();");
     nl();
     buf_puts(out, "(void)ar_mark;");
+    bool saved_ln_on = ln_on;
+    LnState *saved_ln = ln_cur;
+    ln_plan(f);
+    if (ln_on) ln_prologue();
     if (f->mod && f->mod->file && strcmp(f->mod->file, "xisto:bytes") == 0 && f->name) { /* a big range on several threads (xs_u8_rev_par) */
         if (strcmp(f->name, "reverseAround") == 0 && f->nparams == 5) {
             nl(); buf_printf(out, "if (xs_u8_rev_par(%s, %s, %s, %s, %s)) return;", f->params[0].cname, f->params[1].cname, f->params[2].cname, f->params[3].cname, f->params[4].cname);
@@ -8753,6 +9108,9 @@ static void emit_func_body(Func *f) {
     dbg_params(f, false, NULL);
     nl();
     emit_block(f->body, true);
+    if (ln_on) free(ln_cur);
+    ln_on = saved_ln_on;
+    ln_cur = saved_ln;
     emit_dbg_finish();
     emit_prof_leave();
     indent--;
