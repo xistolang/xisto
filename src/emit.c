@@ -1316,7 +1316,18 @@ static bool no_user_code(Expr *e) {
 /* Address of a variable, field or array slot. */
 static int bce_col_rd(Expr *e);
 static void emit_bce_index(Expr *i);
+/* the value a loop carries (adi: p[i][j] = -c / (a * p[i][j - 1] + b)): X[..][j - 1] read right after X[..][j] was written
+   (one iteration before) is that value, kept in a local instead of read back from memory (bce_fw_plan) */
+typedef struct { Expr *w, *r; int id; } BceFw;
+static BceFw bce_fw[4];
+static int nbce_fw;
+static Stmt *bce_fw_loop; /* the loop whose emission uses them (NULL: none) */
+static bool bce_same_bx(Expr *a, Expr *b);
+static bool bce_same(Expr *a, Expr *b);
+static bool bce_fw_is(Expr *e, Expr *slot) { return e && slot && e->kind == E_INDEX && bce_same_bx(e->lhs, slot->lhs) && bce_same(e->rhs, slot->rhs); }
 static void emit_lvalue_ptr(Expr *e) {
+    if (bce_fw_loop && e->kind == E_INDEX)
+        for (int k = 0; k < nbce_fw; k++) if (bce_fw_is(e, bce_fw[k].r)) { buf_printf(out, "&fm%d_", bce_fw[k].id); return; }
     if (e->kind == E_INDEX) { /* a column the guard proved, through the rows' data pointers (bce_rd_type) */
         int rd = bce_col_rd(e);
         if (rd >= 0) {
@@ -3508,6 +3519,19 @@ static void emit_expr_raw(Expr *e) {
         buf_puts(out, ")");
         return;
     case E_ASSIGN:
+        if (bce_fw_loop && e->op == TK_ASSIGN)
+            for (int k = 0; k < nbce_fw; k++)
+                if (bce_fw_is(e->lhs, bce_fw[k].w)) { /* the carried value: stored, and kept for the next iteration */
+                    buf_printf(out, "(fn%d_ = (", bce_fw[k].id);
+                    emit_expr(e->rhs);
+                    buf_puts(out, "), ");
+                    Stmt *saved = bce_fw_loop;
+                    bce_fw_loop = NULL;
+                    emit_lvalue(e->lhs);
+                    bce_fw_loop = saved;
+                    buf_printf(out, " = fn%d_)", bce_fw[k].id);
+                    return;
+                }
         if (is_i32_index(e->lhs) && (e->op == TK_ASSIGN || e->op == TK_PLUS_ASSIGN || e->op == TK_MINUS_ASSIGN || e->op == TK_STAR_ASSIGN ||
                                      e->op == TK_SLASH_ASSIGN)) {
             /* i[k] = v, i[k] op= v on an Int32Array: the value computed (an int, or a number), stored through ToInt32; the
@@ -6885,11 +6909,28 @@ static void emit_for_(Stmt *s) {
         drain_if_needed();
     }
     nl();
+    if (bce_fw_loop == s) { /* the carried values' first: X[..][j0 - 1], when the loop runs */
+        Stmt *saved = bce_fw_loop;
+        bce_fw_loop = NULL;
+        bool car = false;
+        char *c0 = emit_expr_to_str(s->cond, &car);
+        for (int k = 0; k < nbce_fw; k++) {
+            char *r0 = emit_expr_to_str(bce_fw[k].r, &car);
+            buf_printf(out, "if (%s) fm%d_ = %s; ", c0, bce_fw[k].id, r0);
+        }
+        bce_fw_loop = saved;
+        nl();
+    }
     {
         bool cond_ar = false, upd_ar = false;
         char *cond = for_hoisted_cond(s);
         if (!cond) cond = s->cond ? emit_expr_to_str(s->cond, &cond_ar) : "";
         char *upd = s->for_update ? emit_expr_to_str(s->for_update, &upd_ar) : "";
+        if (bce_fw_loop == s) { /* (each iteration's stored value, the next one's read) */
+            Buf u = {0};
+            for (int k = 0; k < nbce_fw; k++) buf_printf(&u, "fm%d_ = fn%d_, ", bce_fw[k].id, bce_fw[k].id);
+            upd = xs_sprintf("(%s%s)", u.data, upd);
+        }
         if (!cond_ar && !upd_ar) {
             buf_printf(out, "for (; %s; %s) ", cond, upd);
             emit_block_kind(s->body, SC_LOOP_BODY);
@@ -8259,6 +8300,85 @@ static char *bce_promo_plan(Stmt *s, const char *i) {
     return g.data;
 }
 static void emit_stmt_for_inner_(Stmt *s);
+/* the plan of the carried values (BceFw): a straight body of number assignments; a store X[R..][j] once (= only), read as
+   X[R..][j - 1] (j counting up, j + 1 counting down), X invariant rows of number[]; or a column X[j][c] read as X[j - 1][c]
+   with no other store at all. Any other store writes element j of a row-invariant array, tested apart from X's row (a
+   store there could replace the value read next). Every slot read and written proved by this loop. Returns the test (NULL:
+   none). XISTO_NO_FWD turns it off. */
+static int bce_fw_ids;
+static int bce_fw_stores(Stmt *b, Expr **st, int *n) { /* the assignments' targets, or -1 when the body is not straight */
+    if (!b) return 0;
+    if (b->kind == S_BLOCK) { for (int k = 0; k < b->stmts.len; k++) if (bce_fw_stores(b->stmts.items[k], st, n) < 0) return -1; return 0; }
+    if (b->kind != S_EXPR || !b->expr || b->expr->kind != E_ASSIGN || *n == 16) return -1;
+    Expr *a = b->expr;
+    if (a->lhs && a->lhs->kind == E_INDEX) st[(*n)++] = a;
+    else if (!a->lhs || a->lhs->kind != E_IDENT) return -1;
+    return 0;
+}
+static Expr *bce_fw_reads_found;
+static void bce_fw_find_read(Expr *e, Expr *want_base, Expr *want_idx, int *count) {
+    if (!e) return;
+    if (e->kind == E_INDEX && bce_same_bx(e->lhs, want_base) && bce_same(e->rhs, want_idx)) { (*count)++; bce_fw_reads_found = e; }
+    bce_fw_find_read(e->lhs, want_base, want_idx, count); bce_fw_find_read(e->rhs, want_base, want_idx, count);
+    for (int k = 0; k < e->args.len; k++) bce_fw_find_read(e->args.items[k], want_base, want_idx, count);
+}
+static void bce_fw_find_s(Stmt *b, Expr *base, Expr *idx, int *count) {
+    if (!b) return;
+    if (b->kind == S_BLOCK) { for (int k = 0; k < b->stmts.len; k++) bce_fw_find_s(b->stmts.items[k], base, idx, count); return; }
+    if (b->kind == S_EXPR && b->expr) { bce_fw_find_read(b->expr->rhs, base, idx, count); if (b->expr->lhs && b->expr->lhs->kind == E_INDEX) { bce_fw_find_read(b->expr->lhs->lhs, base, idx, count); bce_fw_find_read(b->expr->lhs->rhs, base, idx, count); } }
+}
+static char *bce_fw_plan(Stmt *s, const char *i) {
+    nbce_fw = 0;
+    if (getenv("XISTO_NO_FWD") || xs_debug || sm_mode || ictx) return NULL;
+    Expr *u = s->for_update;
+    bool down = u && (u->kind == E_POSTFIX || u->kind == E_UNARY) && u->op == TK_MINUSMINUS;
+    bool up = u && u->builtin.cfn && strcmp(u->builtin.cfn, "counted_inc") == 0;
+    if (!up && !down) return NULL;
+    Expr *st[16];
+    int n = 0;
+    if (bce_fw_stores(s->body, st, &n) < 0 || !n) return NULL;
+    Buf g = {0};
+    buf_puts(&g, "1");
+    for (int k = 0; k < n && nbce_fw < 4; k++) {
+        Expr *w = st[k]->lhs;
+        if (st[k]->op != TK_ASSIGN || !w->type || w->type->kind != TY_NUMBER || !w->lhs || !w->lhs->type || w->lhs->type->kind != TY_ARRAY || !bce_safe(w)) continue;
+        bool row = w->rhs && w->rhs->kind == E_IDENT && w->rhs->cname && strcmp(w->rhs->cname, i) == 0 && (w->lhs->kind == E_IDENT || bce_base(w->lhs, s->body, i));
+        bool col = !row && w->lhs->kind == E_INDEX && w->lhs->rhs && w->lhs->rhs->kind == E_IDENT && w->lhs->rhs->cname && strcmp(w->lhs->rhs->cname, i) == 0 &&
+                   w->lhs->lhs && w->lhs->lhs->kind == E_IDENT && bce_inv(w->rhs, s->body, i);
+        if (!row && !col) continue;
+        /* the read one iteration later: X[..][j - 1] (row), X[j - 1][c] (column); j + 1 counting down */
+        Expr *one = xs_alloc(sizeof *one), *jj = xs_alloc(sizeof *jj), *ix = xs_alloc(sizeof *ix);
+        one->kind = E_NUMBER; one->is_int_lit = true; one->ival = 1; one->num = 1; one->type = ty_int; one->field = -1;
+        jj->kind = E_IDENT; jj->cname = (char *)i; jj->str = (char *)i; jj->type = ty_int; jj->field = -1;
+        ix->kind = E_BINARY; ix->op = down ? TK_PLUS : TK_MINUS; ix->lhs = jj; ix->rhs = one; ix->type = ty_int; ix->field = -1;
+        int cnt = 0;
+        Expr *base, *idx;
+        if (row) { base = w->lhs; idx = ix; }
+        else {
+            Expr *rb = xs_alloc(sizeof *rb);
+            *rb = *w->lhs; rb->rhs = ix;
+            base = rb; idx = w->rhs;
+        }
+        bce_fw_reads_found = NULL;
+        bce_fw_find_s(s->body, base, idx, &cnt);
+        if (!cnt || !bce_safe(bce_fw_reads_found)) continue;
+        /* the other stores: element j of a row-invariant array apart from X's row (a row form only) */
+        int same = 0;
+        bool ok = true;
+        for (int m = 0; m < n && ok; m++) {
+            Expr *o = st[m]->lhs;
+            if (bce_fw_is(o, w)) { same++; continue; }
+            if (col) { ok = false; break; }
+            bool oj = o->rhs && o->rhs->kind == E_IDENT && o->rhs->cname && strcmp(o->rhs->cname, i) == 0 && (o->lhs->kind == E_IDENT || bce_base(o->lhs, s->body, i));
+            if (!oj || !bce_safe(o)) { ok = false; break; }
+            buf_printf(&g, " && (void *)%s != (void *)%s", bce_base_c(o->lhs), bce_base_c(w->lhs));
+        }
+        if (!ok || same != 1) continue;
+        bce_fw[nbce_fw++] = (BceFw){w, bce_fw_reads_found, bce_fw_ids++};
+    }
+    if (!nbce_fw) return NULL;
+    return g.data;
+}
 /* ---- unroll-and-jam of j (2mm, 3mm, doitgen, gramschmidt, the second half of lu: H3 in chat-arquiteto-cpu) ----
    for (let j = J0; j < JL; j++) {
      [T = e0; | T *= e0;]
@@ -9038,6 +9158,25 @@ static void emit_stmt_for_inner_(Stmt *s) { /* a for: bounds checks proved by th
                                               cd->hiB || cd->loB || cd->gate};
             }
             bce_versions++;
+            char *fg = bce_promo_t || bce_fw_loop ? NULL : bce_fw_plan(s, s->for_update->lhs->cname);
+            if (fg) { /* the carried values in locals when the stores cannot reach them, else the loop as it is */
+                buf_printf(out, "{ ");
+                for (int k = 0; k < nbce_fw; k++) buf_printf(out, "double fm%d_ = 0.0, fn%d_ = 0.0; (void)fm%d_; (void)fn%d_; ", bce_fw[k].id, bce_fw[k].id, bce_fw[k].id, bce_fw[k].id);
+                buf_printf(out, "if (%s) ", fg);
+                bce_fw_loop = s;
+                emit_for_(s);
+                bce_fw_loop = NULL;
+                buf_puts(out, " else ");
+                emit_for_(s);
+                buf_puts(out, " }");
+                nbce = saved_nbce;
+                buf_puts(out, " else ");
+                bce_slow++;
+                emit_for_(s);
+                bce_slow--;
+                bce_versions--;
+                return;
+            }
             char *pg = bce_promo_t ? NULL : bce_promo_plan(s, s->for_update->lhs->cname);
             if (pg) {
                 Expr *t = bce_promo_t;
