@@ -1,0 +1,16 @@
+# spectral-norm n=5500: the floor of the divisions the problem asks for (13 Nov 2026)
+# program: bench/floor/spectralnorm-divisions.c, clang -O3 -march=native -ffp-contract=off, one thread,
+# only the 40*n*n = 1.21e9 double divisions 1/d(i,j) with their real denominators. /usr/bin/time %U, 3 runs.
+Xeon E5-2686 v4 (clang 21):   0.88 0.88 0.88 s of CPU
+Graviton2 (clang 15):         2.42 2.42 2.42 s of CPU
+
+# the best wall time any program can reach on 2 cores, with no other work and no overhead: floor / 2
+Xeon:      0.88 / 2 = 0.440 s
+Graviton2: 2.42 / 2 = 1.210 s
+
+# a win needs more than 5% ahead of the fastest Rust (round 4a2f388, median of 3): time < 0.95 x Rust
+Xeon:      Rust spectralnorm_7 0.462 s -> a win needs < 0.439 s; the floor is 0.440 s -> impossible
+Graviton2: Rust spectralnorm_5 1.230 s -> a win needs < 1.169 s; the floor is 1.210 s -> impossible
+xisto today: 0.460 s (Xeon), 1.220 s (Graviton2): 4.5% and 0.8% above the floor.
+Only a program that does not do these divisions can be 5% ahead (spectralnorm-8: a float32 division refined to
+the same double; measured 0.422 / 0.874 s, left out of the scoreboard by Isa's rule of 13 Nov: the problem as asked).
