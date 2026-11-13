@@ -593,6 +593,8 @@ static bool nzv_has(const char *c) {
     return false;
 }
 static int byte_hoist_find(Expr *a);
+static bool f32v_has(const char *c); /* a number local kept as a C float (f32v_compute) */
+static bool f32_exact(Expr *e);
 static bool bce_safe(Expr *e); /* an index the loop already checks (see bce_enter) */
 static Expr *bce_promo_t; /* a slot kept in a C local while a loop is emitted (bce_promo_plan) */
 static int bce_promo_id;
@@ -863,6 +865,7 @@ static void emit_decl(Type *t, const char *name) {
 }
 
 static void emit_local_decl(Type *t, const char *name) {
+    if (!vol_locals && t && t->kind == TY_NUMBER && f32v_has(name)) { buf_printf(out, "float %s", ren(name)); return; }
     name = ren(name);
     if (!vol_locals) { emit_decl(t, name); return; }
     const char *c = ctype(t);
@@ -1311,7 +1314,20 @@ static bool no_user_code(Expr *e) {
     return true;
 }
 /* Address of a variable, field or array slot. */
+static int bce_col_rd(Expr *e);
+static void emit_bce_index(Expr *i);
 static void emit_lvalue_ptr(Expr *e) {
+    if (e->kind == E_INDEX) { /* a column the guard proved, through the rows' data pointers (bce_rd_type) */
+        int rd = bce_col_rd(e);
+        if (rd >= 0) {
+            buf_printf(out, "(&rd%d_[", rd);
+            emit_bce_index(e->lhs->rhs);
+            buf_puts(out, "][");
+            emit_bce_index(e->rhs);
+            buf_puts(out, "])");
+            return;
+        }
+    }
     if (bce_promo_t && e->kind == E_INDEX && bce_same_bx(e->lhs, bce_promo_t->lhs) && bce_same(e->rhs, bce_promo_t->rhs)) {
         buf_printf(out, "&pr%d_", bce_promo_id); /* the slot in a register (bce_promo_plan) */
         return;
@@ -1764,7 +1780,25 @@ static void emit_member(Expr *e) {
         }
         if (strcmp(fn, "sign") == 0) fn = "xs_sign";
         else if (strcmp(fn, "cbrt") == 0) fn = "xs_cbrt"; /* (V8's, not the C library's: glibc's is off by an ulp) */
-        else if (strcmp(fn, "fround") == 0) fn = "xs_fround";
+        else if (strcmp(fn, "fround") == 0) {
+            /* Math.fround(x) of a value that is a float already: x; of x op y with x and y floats: the operation in float
+               (exact: a double holds the exact sum, difference, product or quotient of two floats to more than
+               2 * 24 + 2 bits, so rounding it to a float gives the float operation's result) */
+            Expr *x = e->args.len == 1 ? e->args.items[0] : NULL;
+            if (x && !getenv("XISTO_NO_F32_OPS")) {
+                if (f32_exact(x)) { buf_puts(out, "((double)("); emit_expr(x); buf_puts(out, "))"); return; }
+                if (x->kind == E_BINARY && (x->op == TK_PLUS || x->op == TK_MINUS || x->op == TK_STAR || x->op == TK_SLASH) &&
+                    x->type && x->type->kind == TY_NUMBER && f32_exact(x->lhs) && f32_exact(x->rhs)) {
+                    buf_puts(out, "((double)((float)(");
+                    emit_expr(x->lhs);
+                    buf_printf(out, ") %s (float)(", binop(x->op));
+                    emit_expr(x->rhs);
+                    buf_puts(out, ")))");
+                    return;
+                }
+            }
+            fn = "xs_fround";
+        }
         bool int_args = e->args.len > 0 && e->args.items[0]->type->kind == TY_INT;
         if (strcmp(fn, "min") == 0 || strcmp(fn, "max") == 0) { /* left to right, then folded: NaN wins, -0 < 0 */
             bool mn = fn[1] == 'i';
@@ -2851,7 +2885,15 @@ static void emit_expr_raw(Expr *e) {
         return;
     case E_STRING: buf_printf(out, "%s", lit_nm(e->lit_id)); return;
     case E_BOOL: buf_puts(out, e->boolean ? "true" : "false"); return;
-    case E_IDENT: if (ln_on && ln_ident(e)) return; buf_puts(out, ren(e->cname)); return;
+    case E_IDENT:
+        if (ln_on && ln_ident(e)) return;
+        if (e->type && e->type->kind == TY_NUMBER && e->cname && f32v_has(e->cname)) { /* a float local, read as the number it is:
+            a double (two floats added in C would add in float) */
+            buf_printf(out, "((double)%s)", ren(e->cname));
+            return;
+        }
+        buf_puts(out, ren(e->cname));
+        return;
     case E_FUNC_REF: {
         /* a static immortal closure whose code forwards to the function */
         Func *f = e->func;
@@ -5800,6 +5842,83 @@ static void nzv_compute(Func *owner, Stmt **stmts, int n) {
     }
     cur_func = saved;
 }
+/* ---- number locals that only ever hold floats (Float32Array code: deriche's ym1 = y1[i][j], a2 = Math.fround(...)) ----
+   A local number every assignment of which is a float (Math.fround(...), a Float32Array element, a literal a float
+   holds exactly, another such local, -x or a ? x : y of them) is a C float: the operations around it then stay in
+   float (Math.fround(x op y) of floats is the float operation, see emit_member), not a double converted at each
+   step. Only `=` writes it; a closure that reassigns it (a cell), a debug build: never. XISTO_NO_F32_LOCALS. */
+typedef struct F32Set { Func *owner; const char **names; int n; struct F32Set *next; } F32Set;
+static F32Set *f32v_sets, *f32v_cur; /* (f32v_cur: the set being computed) */
+static bool f32v_has(const char *c) {
+    if (!c) return false;
+    F32Set *z = f32v_cur;
+    if (!z) for (F32Set *q = f32v_sets; q && !z; q = q->next) if (q->owner == cur_func) z = q;
+    for (int i = 0; z && i < z->n; i++) if (strcmp(z->names[i], c) == 0) return true;
+    return false;
+}
+static bool f32_fround_call(Expr *e) {
+    return e && e->kind == E_MEMBER && e->is_call && !e->func && e->lhs && e->lhs->kind == E_IDENT && !e->lhs->cname && e->lhs->str &&
+           strcmp(e->lhs->str, "Math") == 0 && e->str && strcmp(e->str, "fround") == 0 && e->args.len == 1;
+}
+static bool f32_exact(Expr *e) { /* a number that is a float exactly */
+    if (!e || !e->type || e->type->kind != TY_NUMBER) return false;
+    switch (e->kind) {
+    case E_NUMBER: return (double)(float)e->num == e->num || isnan(e->num);
+    case E_IDENT: return e->cname && f32v_has(e->cname);
+    case E_UNARY: return e->op == TK_MINUS && f32_exact(e->lhs);
+    case E_COND: return e->args.len == 2 && f32_exact(e->args.items[0]) && f32_exact(e->args.items[1]);
+    case E_MEMBER: return f32_fround_call(e);
+    case E_INDEX: return is_f32_index(e);
+    default: return false;
+    }
+}
+static void f32v_cands(Stmt *s, F32Set *z) { /* the number locals of the function (plain, not cells) */
+    if (!s) return;
+    if (s->kind == S_VAR && s->cname && !s->cell && s->type && s->type->kind == TY_NUMBER && strncmp(s->cname, "v_", 2) == 0) {
+        z->names = realloc(z->names, (size_t)(z->n + 1) * sizeof *z->names);
+        z->names[z->n++] = s->cname;
+    }
+    f32v_cands(s->for_init, z); f32v_cands(s->body, z); f32v_cands(s->else_body, z);
+    for (int i = 0; i < s->stmts.len; i++) f32v_cands(s->stmts.items[i], z);
+    for (int i = 0; i < s->ncases; i++) f32v_cands(s->cases[i].body, z);
+}
+static void f32v_drop(F32Set *z, const char *c) {
+    for (int i = 0; i < z->n; i++) if (strcmp(z->names[i], c) == 0) { z->names[i] = z->names[--z->n]; return; }
+}
+static bool f32v_changed;
+static void f32v_check_e(Expr *e, F32Set *z) { /* drop the locals a write that is not a float reaches */
+    if (!e) return;
+    if ((e->kind == E_ASSIGN || e->kind == E_POSTFIX || (e->kind == E_UNARY && (e->op == TK_PLUSPLUS || e->op == TK_MINUSMINUS))) &&
+        e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname && f32v_has(e->lhs->cname) &&
+        !(e->kind == E_ASSIGN && e->op == TK_ASSIGN && f32_exact(e->rhs))) { f32v_drop(z, e->lhs->cname); f32v_changed = true; }
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) { /* (a closure: its writes are the cells', excluded; its reads copy) */ }
+    f32v_check_e(e->lhs, z); f32v_check_e(e->rhs, z);
+    for (int i = 0; i < e->args.len; i++) f32v_check_e(e->args.items[i], z);
+}
+static void f32v_check(Stmt *s, F32Set *z) {
+    if (!s) return;
+    if (s->kind == S_VAR && s->cname && f32v_has(s->cname) && (!s->init || !f32_exact(s->init))) { f32v_drop(z, s->cname); f32v_changed = true; }
+    f32v_check_e(s->init, z); f32v_check_e(s->expr, z); f32v_check_e(s->cond, z); f32v_check_e(s->for_update, z);
+    for (int i = 0; i < s->ncases; i++) f32v_check_e(s->cases[i].value, z);
+    if (s->kind == S_FOROF || s->kind == S_TRY) { if (s->cname && f32v_has(s->cname)) { f32v_drop(z, s->cname); f32v_changed = true; } }
+    f32v_check(s->for_init, z); f32v_check(s->body, z); f32v_check(s->else_body, z);
+    for (int i = 0; i < s->stmts.len; i++) f32v_check(s->stmts.items[i], z);
+    for (int i = 0; i < s->ncases; i++) f32v_check(s->cases[i].body, z);
+}
+static void f32v_compute(Func *owner, Stmt **stmts, int n) {
+    F32Set *z = NULL;
+    for (F32Set *q = f32v_sets; q; q = q->next) if (q->owner == owner) z = q;
+    if (!z) { z = calloc(1, sizeof *z); z->owner = owner; z->next = f32v_sets; f32v_sets = z; }
+    z->n = 0;
+    if (xs_debug || getenv("XISTO_NO_F32_LOCALS") || (owner && (owner->is_gen || owner->is_async))) return;
+    for (int i = 0; i < n; i++) f32v_cands(stmts[i], z);
+    f32v_cur = z; /* (all of them floats at first; a write that is not one drops a local, until nothing changes) */
+    do {
+        f32v_changed = false;
+        for (int i = 0; i < n; i++) f32v_check(stmts[i], z);
+    } while (f32v_changed);
+    f32v_cur = NULL;
+}
 /* top-level code (main): only its own locals; a top-level variable functions also use is not one of them */
 static bool rv_main_only(const char *c);
 /* Counters in a local int[] (XB-089): `const X = new Array<int>(N).fill(K)` (K a literal >= 0) and, later in the
@@ -6073,7 +6192,7 @@ static void rv_compute(Func *owner, Stmt **stmts, int n) {
    starts at 0 or more and nothing in the body can change a's length: a appears only as a[...] or a.length, and
    the body calls no user code, makes no closure and calls no method that resizes an array (another name for
    the same array could otherwise shrink it). Such a[i] is read and written without the check. */
-typedef struct { const char *i, *a; bool guarded; Expr *idx, *row; } BceLoop; /* guarded: a versioned loop's guard proved i >= 0;
+typedef struct { const char *i, *a; bool guarded; Expr *idx, *row; bool col; } BceLoop; /* guarded: a versioned loop's guard proved i >= 0;
    idx: an index of that shape (a[i + E], a[E - i], an invariant) is within a; row: the base is that row of a (a[R],
    a[R][Q]) */
 static BceLoop bce_loops[64];
@@ -6339,7 +6458,20 @@ static char *bce_len_of(Expr *b) {
    length, computed at most once and only by a guard that needs it. A loop over k then proves X[k][c], c invariant:
    c >= 0, and c below that least length or, for a range much shorter than X (where scanning every row would cost
    more than the loop), below the length of each row in the range. A hole (a NULL row) counts as length 0. */
-typedef struct { const char *x; Type *t; int id; } BceRect;
+typedef struct { const char *x; Type *t; int id; const char *rdt; } BceRect; /* rdt: the C type of a row's element when
+   the nest keeps a table of the rows' data pointers (rd<id>_), NULL when it does not */
+/* the rows' data pointers (rd<id>_): built by the guard with the least length, once per nest, so a column X[k][c]
+   reads rd[k][c], one load less than X->data[k]->data[c] (the address of the element as a 2D array of C or Rust
+   gets it, from its row's start); 12-15% on B[r][s] += A[r][t] * A[s][t] at n = 2000 on the M4. Rows of number[],
+   int[], Float64Array, Float32Array, Int32Array. XISTO_NO_BCE_RD turns it off. */
+static const char *bce_rd_type(Type *rt) {
+    if (getenv("XISTO_NO_BCE_RD") || !rt) return NULL;
+    if (rt->kind == TY_ARRAY && rt->elem) return rt->elem->kind == TY_NUMBER ? "double" : rt->elem->kind == TY_INT ? "int64_t" : NULL;
+    if (is_f64_type(rt)) return "double";
+    if (is_f32_type(rt)) return "float";
+    if (is_i32_type(rt)) return "int32_t";
+    return NULL;
+}
 static BceRect bce_rect[16];
 static int nbce_rect, bce_rect_ids;
 static BceRect *bce_rect_find(const char *x) {
@@ -6381,8 +6513,10 @@ static int bce_rect_open(Stmt *s) {
            resized) and no array stored into an array's slot */
         if (bce_declares(s, u[k].x) || !bce_ok(s, u[k].x, u[k].t, false) || bce_row_store(s)) continue;
         int id = bce_rect_ids++;
-        bce_rect[nbce_rect++] = (BceRect){u[k].x, u[k].t, id};
+        const char *rdt = bce_rd_type(u[k].t->elem);
+        bce_rect[nbce_rect++] = (BceRect){u[k].x, u[k].t, id, rdt};
         buf_printf(out, "%sint64_t ml%d_ = -1; (void)ml%d_; ", opened ? "" : "{ ", id, id);
+        if (rdt) buf_printf(out, "%s **rd%d_ __attribute__((cleanup(xs_rd_free))) = NULL; (void)rd%d_; ", rdt, id, id);
         opened++;
     }
     return opened;
@@ -6398,6 +6532,15 @@ static char *bce_col_test(BceRect *r, const char *c, const char *st, const char 
     const char *rs = rt->kind == TY_ARRAY ? arr_struct(rt) : rt->cls->cname;
     const char *f = bce_bytes(rt) ? "f_length" : "len";
     const char *X = ren(r->x);
+    if (r->rdt) /* with the table of data pointers: built (with the least length) when a range reaches 1/64 of X (at
+                   most 64 times a short loop's work, once per nest; lu's first ranges are short); a shorter range
+                   before that runs the checked copy */
+        return xs_sprintf("({ int64_t c_ = (%s), s_ = (%s), e_ = (%s); "
+                          "if (c_ >= 0 && ml%d_ < 0 && (e_ - s_ + 1) * 64 >= (int64_t)(%s)->len) { int64_t m_ = INT64_MAX, n_ = (int64_t)(%s)->len; "
+                          "rd%d_ = malloc((size_t)(n_ ? n_ : 1) * sizeof(%s *)); if (!rd%d_) xs_panic(\"out of memory\"); "
+                          "for (int64_t r_ = 0; r_ < n_; r_++) { %s *p_ = (%s *)(%s)->data[r_]; int64_t l_ = p_ ? (int64_t)p_->%s : 0; rd%d_[r_] = p_ ? p_->data : NULL; if (l_ < m_) m_ = l_; } ml%d_ = m_; } "
+                          "c_ >= 0 && ml%d_ >= 0 && c_ < ml%d_; })",
+                          c, st, last, r->id, X, X, r->id, r->rdt, r->id, rs, rs, X, f, r->id, r->id, r->id, r->id);
     return xs_sprintf("({ int64_t c_ = (%s), s_ = (%s), e_ = (%s); bool ok_ = c_ >= 0; "
                       "if (ok_ && ml%d_ < 0 && (e_ - s_ + 1) * 4 >= (int64_t)(%s)->len) { int64_t m_ = INT64_MAX; "
                       "for (int64_t r_ = 0; r_ < (int64_t)(%s)->len; r_++) { %s *p_ = (%s *)(%s)->data[r_]; int64_t l_ = p_ ? (int64_t)p_->%s : 0; if (l_ < m_) m_ = l_; } ml%d_ = m_; } "
@@ -6597,6 +6740,16 @@ static bool bce_safe(Expr *e) {
     return false;
 }
 
+/* X[k][c] proved by a column entry of a versioned loop, X with a table of data pointers: that table's id (-1: no) */
+static int bce_col_rd(Expr *e) {
+    if (!e || e->kind != E_INDEX || e->builtin.cfn || !e->lhs || e->lhs->kind != E_INDEX || e->lhs->builtin.cfn || !e->lhs->lhs ||
+        e->lhs->lhs->kind != E_IDENT || !e->lhs->lhs->cname || ictx) return -1;
+    BceRect *r = bce_rect_find(e->lhs->lhs->cname);
+    if (!r || !r->rdt) return -1;
+    for (int k = nbce - 1; k >= 0; k--)
+        if (bce_loops[k].col && bce_loops[k].idx && bce_base_match(e->lhs, &bce_loops[k]) && bce_same(bce_loops[k].idx, e->rhs)) return r->id;
+    return -1;
+}
 /* the index of an a[i] bce_safe allows, unchecked */
 static void emit_bce_index(Expr *i) {
     if (i->kind == E_BINARY && (i->op == TK_PLUS || i->op == TK_MINUS) && i->type && i->type->kind == TY_INT) {
@@ -8042,7 +8195,7 @@ static void emit_stmt_for_inner_(Stmt *s) { /* a for: bounds checks proved by th
                 if (!cd->ok) continue;
                 bool row = cd->base->kind == E_INDEX;
                 bce_loops[nbce++] = (BceLoop){s->for_update->lhs->cname, bce_root(cd->base), true,
-                                              cd->kind == 0 ? NULL : cd->idx, row ? cd->base : NULL};
+                                              cd->kind == 0 ? NULL : cd->idx, row ? cd->base : NULL, cd->kind == 3};
             }
             bce_versions++;
             char *pg = bce_promo_t ? NULL : bce_promo_plan(s, s->for_update->lhs->cname);
@@ -9668,7 +9821,7 @@ static void emit_spine_num(Func *f, Spine *sp) {
 static void emit_func_body(Func *f) {
     cur_func = f;
     if (f->mod) cur_mod = f->mod;
-    if (f->body) { rv_compute(f, &f->body, 1); nzv_compute(f, &f->body, 1); }
+    if (f->body) { rv_compute(f, &f->body, 1); nzv_compute(f, &f->body, 1); f32v_compute(f, &f->body, 1); }
     if (f->is_gen) { emit_gen(f); cur_func = NULL; return; }
     vol_locals = stmt_has_try(f->body);
     { Spine sp_; if (spine_fn(f, &sp_)) { if (sp_.num) emit_spine_num(f, &sp_); else emit_spine(f, &sp_); cur_func = NULL; return; } }
@@ -11251,6 +11404,7 @@ void emit_program(Program *p, Buf *o) {
     cur_func = NULL;
     rv_compute(NULL, p->top.items, p->top.len);
     nzv_compute(NULL, p->top.items, p->top.len);
+    f32v_compute(NULL, p->top.items, p->top.len);
     for (int i = 0; i < nnzv; i++) { nl(); buf_printf(out, "double %s_z = 0; (void)%s_z;", nzv[i], nzv[i]); } /* XB-087 (only main reads them) */
     Buf modfns = {0};
     if (nmodfn) { /* the module functions, with the analyses above (ranges, borrowed values) in place */
