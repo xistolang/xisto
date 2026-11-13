@@ -11,6 +11,8 @@ The check of exact(), in C (-ffp-contract=off): for every d in 1..2^29, double q
 r = 1 - d*q, y = q*r, s = q + y, x = s + (((q - s) + y) + y*(r + r*r)); x == 1.0 / d bit for bit (0 differences;
 without the r*r term 267 differ). And (float)(1.0 / (double)(float)d) == 1.0f / (float)d for all of them (a double
 rounded to float: Node's Math.fround of the double quotient is the float quotient).
+ Not scored (bench/placar.py, XISTO_NOT_THE_SAME): the problem asks for the double division, and the
+scoreboard keeps the Benchmarks Game results as the problem states them. Kept as a measured experiment.
  */
 
 import { arch, availableParallelism } from "node:os";

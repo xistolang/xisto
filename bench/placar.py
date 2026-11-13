@@ -13,6 +13,10 @@ rsqrtps, an approximation, and so does nbody_7 (MANIFESTO.md, "A régua da compa
 import sys
 
 NOT_THE_SAME = {"nbody_7", "nbody_9"}  # (both take 1/sqrt from rsqrtps; nbody_5, _6 are SIMD with an exact sqrt and count)
+# xisto variants left out by the same rule (Isa, 13/11: the Benchmarks Game results as the problem asks, nothing
+# engineered around it): spectralnorm-8 takes 1/d from a float32 division refined to the same double, instead of
+# the double division the problem asks for.
+XISTO_NOT_THE_SAME = {"spectralnorm-8"}
 
 def pick(vs):
     """vs: [(time, cpu, mem, name)] of the variants whose output matched"""
@@ -50,6 +54,8 @@ for line in open(sys.argv[1]):
     except ValueError:
         continue
     if p[1] == "rust" and (p[2] in NOT_THE_SAME or p[2].endswith("t")):
+        continue
+    if p[1] == "xisto" and p[2] in XISTO_NOT_THE_SAME:
         continue
     rows.setdefault(p[0], {}).setdefault(p[1], []).append((t, c, m, p[2]))
 
