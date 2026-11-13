@@ -75,18 +75,20 @@ Source: `bench/results/vm-2026-11-13/rust-arm-graviton2-2026-11-13-e5fb066.txt`.
 
 ## The xisto programs
 
+Each name links to its source on GitHub; the original Node programs are in [`bench/benchmarksgame/node/`](https://github.com/xistolang/xisto/tree/main/bench/benchmarksgame/node).
+
 | problem | xisto variant | what it does |
 |---|---|---|
-| spectral-norm | `spectralnorm` (Xeon), `spectralnorm-6`/`-7` | the products split in equal shares of rows across threads; the denominator of A carried along each row by additions; #7 joins the 40 products through `Atomics` counters instead of messages. Same divisions, same order, same doubles as the plain program |
-| n-body | `nbody` | the plain program with types |
-| fannkuch-redux | `fannkuchredux-5` | 720 ranges to a pool of workers; the permutation as bytes in vector registers (a flip is one shuffle); two permutations' flip chains counted in the same loop |
-| binary-trees | `binarytrees`, `-2`, `-3` | trees built in parallel (`xisto:parallel` or a worker pool); nodes of 8 bytes (32-bit references), a statement's temporary trees freed right after it |
-| mandelbrot | `mandelbrot-6` (Xeon), `mandelbrot-7` (Graviton2) | chunks of rows to a pool of workers; 16 (#6) or 8 (#7) pixels per call as one SIMD vector; rows written out as they finish |
-| fasta | `fasta` | the plain program with types; the random sequences from `xisto:random` |
-| k-nucleotide | `knucleotide-7` | the sequence at two bits per nucleotide, packed in parallel; small frames counted in arrays indexed by key, the big ones in partitions |
-| reverse-complement | `revcomp-9` (or `-6`) | each sequence read backwards from the file one block at a time, blocks made by workers into a shared ring, written in order (10 MB); #6 holds one sequence at a time (188 MB) |
-| regex-redux | `regexredux-2` | the nine counts in a worker while the main thread does the replacements; the 50 MB string shared with the worker, not copied |
-| pidigits | `pidigits` | the plain program with types (`BigInt` on xisto's GMP-backed integers) |
+| spectral-norm | [`spectralnorm`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/spectralnorm.ts) (Xeon), [`spectralnorm-6`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/spectralnorm-6.ts), [`spectralnorm-7`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/spectralnorm-7.ts) | the products split in equal shares of rows across threads; the denominator of A carried along each row by additions; #7 joins the 40 products through `Atomics` counters instead of messages. Same divisions, same order, same doubles as the plain program |
+| n-body | [`nbody`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/nbody.ts) | the plain program with types |
+| fannkuch-redux | [`fannkuchredux-5`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/fannkuchredux-5.ts) | 720 ranges to a pool of workers; the permutation as bytes in vector registers (a flip is one shuffle); two permutations' flip chains counted in the same loop |
+| binary-trees | [`binarytrees`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/binarytrees.ts), [`binarytrees-2`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/binarytrees-2.ts), [`binarytrees-3`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/binarytrees-3.ts) | trees built in parallel (`xisto:parallel` or a worker pool); nodes of 8 bytes (32-bit references), a statement's temporary trees freed right after it |
+| mandelbrot | [`mandelbrot-6`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/mandelbrot-6.ts) (Xeon), [`mandelbrot-7`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/mandelbrot-7.ts) (Graviton2) | chunks of rows to a pool of workers; 16 (#6) or 8 (#7) pixels per call as one SIMD vector; rows written out as they finish |
+| fasta | [`fasta`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/fasta.ts) | the plain program with types; the random sequences from `xisto:random` |
+| k-nucleotide | [`knucleotide-7`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/knucleotide-7.ts) | the sequence at two bits per nucleotide, packed in parallel; small frames counted in arrays indexed by key, the big ones in partitions |
+| reverse-complement | [`revcomp-9`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/revcomp-9.ts) (or [`revcomp-6`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/revcomp-6.ts)) | each sequence read backwards from the file one block at a time, blocks made by workers into a shared ring, written in order (10 MB); #6 holds one sequence at a time (188 MB) |
+| regex-redux | [`regexredux-2`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/regexredux-2.ts) | the nine counts in a worker while the main thread does the replacements; the 50 MB string shared with the worker, not copied |
+| pidigits | [`pidigits`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/pidigits.ts) | the plain program with types (`BigInt` on xisto's GMP-backed integers) |
 
 ## What changed since 10 Nov
 
