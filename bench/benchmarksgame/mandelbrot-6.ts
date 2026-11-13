@@ -12,12 +12,26 @@ last z, and the row's last real part is read first, which tells the C compiler t
 the array too (their checks go). The sixteen copies of each statement are one vector in xisto's C (lanes, see
 src/emit.c), the same doubles as each pixel computed alone.
 Xeon E5-2686 v4: 3,83 -> 2,45 s of CPU (Rust #4 3,57); Graviton2: 5,71 (Rust #4 5,47, #5 6,07; #5 with lanes 5,65).
+The image goes out as it is made, in order, through a ring of 2560 rows (5 MB at 16000; a piece is handed out
+only when its rows are free) and in writes of 512 rows: the peak memory is the ring, not the 32 MB image.
  */
 
 import { availableParallelism } from "node:os";
 import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
 
 const ROWS: int = 64; // rows per chunk
+const RING: int = 2560; // rows held at once (5 MB at 16000 pixels a row)
+const BATCH: int = 512; // rows written at a time (1 MB at 16000: few big writes)
+
+function order(y0: int, rows: int, piece: int): Uint8Array {
+  const t = new Uint8Array(12);
+  for (let k = 0; k < 4; k++) {
+    t[k] = (y0 >> (8 * k)) & 0xff;
+    t[4 + k] = (rows >> (8 * k)) & 0xff;
+    t[8 + k] = (piece >> (8 * k)) & 0xff;
+  }
+  return t;
+}
 
 // the bits of sixteen pixels, the first in the highest bit: 1 = inside the set after 50 iterations
 // (prev: the pixels before them in the row, 0 = all sixteen were outside, so these may escape too)
@@ -119,36 +133,55 @@ function row(y: int, w: int, h: int, out: Uint8Array, at: int, cr: Float64Array)
 function mainThread(n: int): void {
   const w = n, h = n;
   const bpr = (w + 7) >> 3;
-  const image = new Uint8Array(new SharedArrayBuffer(bpr * h));
-  const chunks = Math.trunc((h + ROWS - 1) / ROWS);
-  let next = 0, left = chunks;
-  const nworkers = Math.max(1, Math.min(availableParallelism(), chunks));
+  // the rows go through a ring of RING rows (row y at y % RING): a piece is handed out only when its rows are free
+  // (the rows RING before them already written), and the rows done in order are written BATCH at a time
+  const ring = Math.min(RING, h);
+  const image = new Uint8Array(new SharedArrayBuffer(bpr * ring));
+  const nworkers = Math.max(1, Math.min(availableParallelism(), h));
+  process.stdout.write(`P4\n${w} ${h}\n`);
+  let next: int = 0, written: int = 0; // the next row to hand out; the rows written so far
+  const starts: int[] = [], ends: int[] = []; // the pieces handed out, in order
+  const done: boolean[] = [];
+  let first: int = 0; // the first piece not yet known done
+  let ready: int = 0; // the rows done in order (written, or to be in the next batch)
+  const idle: Worker[] = [];
+  // a piece for wk, when there is one and its rows are free
+  const give = (wk: Worker): boolean => {
+    if (next >= h) return false;
+    const rows: int = Math.min(ROWS, h - next);
+    if (next + rows - written > ring) { idle.push(wk); return true; }
+    wk.postMessage(order(next, rows, done.length));
+    starts.push(next);
+    ends.push(next + rows);
+    done.push(false);
+    next += rows;
+    return true;
+  };
+  const workers: Worker[] = [];
   for (let k = 0; k < nworkers; k++) {
     const wk = new Worker(__filename, { workerData: `${n}` });
+    workers.push(wk);
     wk.on("message", (m: Uint8Array) => {
-      left--;
-      if (next < chunks) {
-        const t = new Uint8Array(4);
-        t[0] = next & 0xff;
-        t[1] = (next >> 8) & 0xff;
-        t[2] = (next >> 16) & 0xff;
-        t[3] = (next >> 24) & 0xff;
-        wk.postMessage(t);
-        next++;
-      } else wk.terminate();
-      if (left === 0) {
-        process.stdout.write(`P4\n${w} ${h}\n`);
-        process.stdout.write(image);
+      done[m[8] | (m[9] << 8) | (m[10] << 16) | (m[11] << 24)] = true;
+      while (first < done.length && done[first]) { ready = ends[first]; first++; }
+      if (ready - written >= BATCH || ready >= h) { // out in order, a batch at a time: one or two runs of the ring
+        const a: int = written % ring, b: int = a + ready - written;
+        if (b <= ring) process.stdout.write(image.subarray(a * bpr, b * bpr));
+        else {
+          process.stdout.write(image.subarray(a * bpr, ring * bpr));
+          process.stdout.write(image.subarray(0, (b - ring) * bpr));
+        }
+        written = ready;
       }
+      if (!give(wk)) wk.terminate();
+      while (idle.length > 0 && next < h && next + Math.min(ROWS, h - next) - written <= ring) {
+        const v = idle.pop()!;
+        if (!give(v)) v.terminate();
+      }
+      if (written >= h) for (const v of idle) v.terminate();
     });
-    wk.postMessage(image); // the shared image first, then one chunk at a time
-    const t = new Uint8Array(4);
-    t[0] = next & 0xff;
-    t[1] = (next >> 8) & 0xff;
-    t[2] = (next >> 16) & 0xff;
-    t[3] = (next >> 24) & 0xff;
-    wk.postMessage(t);
-    next++;
+    wk.postMessage(image); // the shared rows first, then one order at a time
+    if (!give(wk)) wk.terminate(); // (more workers than pieces)
   }
 }
 
@@ -164,11 +197,11 @@ function workerThread(): void {
       shared.push(m);
       return;
     }
-    const c: int = m[0] | (m[1] << 8) | (m[2] << 16) | (m[3] << 24);
-    const y0 = c * ROWS;
-    const rows = Math.min(ROWS, n - y0);
+    const y0: int = m[0] | (m[1] << 8) | (m[2] << 16) | (m[3] << 24);
+    const rows: int = m[4] | (m[5] << 8) | (m[6] << 16) | (m[7] << 24);
+    const ring: int = Math.trunc(shared[0].length / bpr);
     const image = shared[0];
-    for (let r = 0; r < rows; r++) row(y0 + r, n, n, image, (y0 + r) * bpr, cr);
+    for (let r = 0; r < rows; r++) row(y0 + r, n, n, image, ((y0 + r) % ring) * bpr, cr);
     parentPort.postMessage(m);
   });
 }

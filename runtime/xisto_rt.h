@@ -5796,8 +5796,29 @@ static void xs_aw_put(const uint8_t *p, size_t n) {
         n -= k;
     }
 }
+/* Linux: stdout a pipe and a block of 256 KB or more for it: the pipe's buffer raised to 1 MB, once (F_SETPIPE_SZ, up
+   to /proc/sys/fs/pipe-max-size, 1 MB by default). With the default 64 KB a big write goes out 64 KB at a time,
+   each one waking the reader and then the writer again; with two cores busy computing, those switches cost more
+   than the bytes (revcomp-9 on the Graviton2: 0,57 -> 0,31 s). XISTO_NO_PIPE_GROW=1 leaves it. */
+#if defined(__linux__)
+#include <fcntl.h>
+#endif
+static void xs_out_pipe_grow(size_t n) {
+#if defined(__linux__) && defined(F_SETPIPE_SZ)
+    static int done = 0;
+    if (done || n < ((size_t)1 << 18)) return;
+    done = 1;
+    if (getenv("XISTO_NO_PIPE_GROW")) return;
+    struct stat st;
+    int fd = fileno(stdout);
+    if (fstat(fd, &st) == 0 && S_ISFIFO(st.st_mode) && fcntl(fd, F_GETPIPE_SZ) < (1 << 20)) fcntl(fd, F_SETPIPE_SZ, 1 << 20);
+#else
+    (void)n;
+#endif
+}
 static bool xs_stdout_write_bytes(xs_Uint8Array *b) {
     size_t n = (size_t)b->f_length;
+    xs_out_pipe_grow(n);
     if (n >= ((size_t)1 << 20) && (xs_stdin_reading || xs_aw_pending) && !xs_out_f && xs_aw_on()) { xs_aw_put(b->data, n); return true; } /* (behind a write still going out: its turn comes then anyway) */
     xs_out_drain();
     xs_write_big(XS_OUT, b->data, n);
@@ -5810,6 +5831,7 @@ static bool xs_stdout_write_lent(xs_Uint8Array *b) {
     static int off = -1;
     if (off < 0) { const char *e = getenv("XISTO_NO_LENT_WRITE"); off = e && *e && strcmp(e, "0") != 0; }
     size_t n = (size_t)b->f_length;
+    xs_out_pipe_grow(n);
     if (XS_LENT_BUSY()) { /* begun (writeStdoutLentBegin): now all of it is final */
         pthread_mutex_lock(&xs_aw.mu);
         xs_lent_slot *s = xs_lent.next.active && xs_lent.next.b == b ? &xs_lent.next : xs_lent.cur.active && xs_lent.cur.b == b ? &xs_lent.cur : NULL;
