@@ -58,7 +58,9 @@
 package main
 
 import (
+	"fmt"
 	"os"
+	"time"
 
 	"polybench/dump"
 )
@@ -172,7 +174,17 @@ func main() {
 	initArray(n, A, b, x, y)
 
 	// Run kernel.
+	start := time.Now()
 	kernelLudcmp(n, A, b, x, y)
+	elapsed := time.Since(start)
+
+	// Print timer: the kernel's seconds on stdout with the "time" argument (-DPOLYBENCH_TIME).
+	for _, a := range os.Args[1:] {
+		if a == "time" {
+			fmt.Printf("%0.6f\n", elapsed.Seconds())
+			break
+		}
+	}
 
 	// Prevent dead-code elimination. All live-out data must be printed.
 	if dump.Enabled || len(os.Args) > 42 && os.Args[0] == "" {
