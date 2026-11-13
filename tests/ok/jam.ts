@@ -97,3 +97,17 @@ const TR = grid(13, 13, (i, j) => 0);
 TR[2] = TA[4];
 gs(9, 13, TA, TR, grid(9, 13, (i, j) => 0));
 console.log("gs R row = A row", show(TA), show(TR));
+
+// the sum in a local (ludcmp): w = T; for k w -= f; T = w; w after the loop is the last j's
+function ludRest(n: int, A: number[][]): number {
+  let w: number = 0;
+  for (let i = 0; i < n; i++)
+  for (let j = i; j < n; j++) {
+    w = A[i][j];
+    for (let k = 0; k < i; k++) w -= A[i][k] * A[k][j];
+    A[i][j] = w;
+  }
+  return w;
+}
+const W = grid(12, 12, (i, j) => ((i * 7 + j * 5) % 13) / 9 + (i === j ? 3 : 0));
+console.log("ludcmp rest", ludRest(12, W).toFixed(9), show(W));

@@ -8278,8 +8278,10 @@ static bool uj_bound_ok(Expr *x) { /* a loop bound: invariant in the nest, no co
     return x && !uj_mentions_ctr(x) && bce_inv(x, uj_nest, uj_j) && bce_names_plain(x);
 }
 static Stmt *uj_pre, *uj_kloop;
-static Expr *uj_J0, *uj_JL, *uj_K0, *uj_KL;
+static Expr *uj_J0, *uj_JL, *uj_K0, *uj_KL, *uj_e0;
 static const char *uj_kname;
+static int uj_prekind; /* the lanes' first values: 0 T, 1 e0, 2 T * e0 */
+static const char *uj_w; /* ludcmp's form: `w = T (or e0); for k w op= f; T = w`, w a local number (NULL: T itself) */
 static bool uj_match(Stmt *s) {
     if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_UJAM")) return false;
     const char *j, *k;
@@ -8302,18 +8304,39 @@ static bool uj_match(Stmt *s) {
         UjPost *q = &uj_post[nuj_post++];
         memset(q, 0, sizeof *q);
         q->loop = st[p];
+        if (st[p]->kind == S_EXPR && ns - at == 1) continue; /* (maybe the T = w of the sum in a local) */
         if (!uj_counted(st[p], &q->ctr, &q->lo, &q->hi)) return false;
     }
     if (!uj_bound_ok(uj_JL) || !uj_bound_ok(uj_K0) || !uj_bound_ok(uj_KL) || bce_writes(uj_kloop->body, k)) return false;
     Stmt *ks = uj_only(uj_kloop->body);
     if (!ks || ks->kind != S_EXPR || !ks->expr || ks->expr->kind != E_ASSIGN || (ks->expr->op != TK_PLUS_ASSIGN && ks->expr->op != TK_MINUS_ASSIGN)) return false;
     Expr *t = ks->expr->lhs;
+    uj_w = NULL;
+    if (t && t->kind == E_IDENT) { /* the sum in a local w: `w = T (or e0); for k w op= f; T = w` and nothing else */
+        Expr *p = uj_pre ? uj_pre->expr : NULL, *last = nuj_post == 1 && uj_post[0].loop->kind == S_EXPR ? uj_post[0].loop->expr : NULL;
+        if (!p || p->kind != E_ASSIGN || p->op != TK_ASSIGN || !p->lhs || p->lhs->kind != E_IDENT || !t->cname || !p->lhs->cname ||
+            strcmp(p->lhs->cname, t->cname) != 0 || !t->type || t->type->kind != TY_NUMBER || !bce_plain_local(t->cname)) return false;
+        if (!last || last->kind != E_ASSIGN || last->op != TK_ASSIGN || !last->rhs || last->rhs->kind != E_IDENT || !last->rhs->cname ||
+            strcmp(last->rhs->cname, t->cname) != 0) return false;
+        uj_w = t->cname;
+        t = last->lhs;
+        nuj_post = 0;
+    }
     if (!t || t->kind != E_INDEX || t->builtin.cfn || !t->type || t->type->kind != TY_NUMBER || !t->rhs || t->rhs->kind != E_IDENT || !t->rhs->cname ||
         strcmp(t->rhs->cname, j) != 0 || !uj_num_arr(t->lhs->type) || !uj_inv_base(t->lhs)) return false;
     uj_t = t;
+    uj_prekind = 0;
+    uj_e0 = NULL;
+    if (nuj_post && uj_post[0].loop->kind == S_EXPR) return false; /* (a statement after the sum that is not T = w) */
     if (uj_pre) {
         Expr *p = uj_pre->expr;
-        if (!p || p->kind != E_ASSIGN || (p->op != TK_ASSIGN && p->op != TK_STAR_ASSIGN) || !uj_is_t(p->lhs) || !uj_expr(p->rhs, false)) return false;
+        if (uj_w) { /* w = T, or w = e0 */
+            if (!uj_is_t(p->rhs)) { if (!uj_expr(p->rhs, false)) return false; uj_prekind = 1; uj_e0 = p->rhs; }
+        } else {
+            if (!p || p->kind != E_ASSIGN || (p->op != TK_ASSIGN && p->op != TK_STAR_ASSIGN) || !uj_is_t(p->lhs) || !uj_expr(p->rhs, false)) return false;
+            uj_prekind = p->op == TK_ASSIGN ? 1 : 2;
+            uj_e0 = p->rhs;
+        }
     }
     if (!uj_expr(ks->expr->rhs, true)) return false;
     for (int p = 0; p < nuj_post; p++) { /* for (i = I0; i < IL; i++) Y[i][j] = g */
@@ -8394,7 +8417,10 @@ static bool uj_emit_loop(Stmt *s) {
     memcpy(post, uj_post, sizeof post);
     Expr *t = uj_t;
     const char *kname = uj_kname;
-    Stmt *pre = uj_pre, *kloop = uj_kloop;
+    Stmt *kloop = uj_kloop;
+    int prekind = uj_prekind;
+    Expr *e0 = uj_e0;
+    const char *w = uj_w;
     /* the ranges of the counters: group 0 the reduction's k, group p + 1 post loop p's */
     buf_printf(out, "{ int64_t jj%d_ = (%s); const int64_t jl%d_ = (%s), cs%d_0_ = (%s), ce%d_0_ = (%s); ", id, J0, id, JL, id, K0, id, KL);
     for (int p = 0; p < np; p++) buf_printf(out, "const int64_t cs%d_%d_ = (%s), ce%d_%d_ = (%s); ", id, p + 1, P0[p], id, p + 1, PL[p]);
@@ -8470,10 +8496,9 @@ static bool uj_emit_loop(Stmt *s) {
     for (int u = 0; u < U; u++) {
         uj_lane = u;
         buf_printf(out, "double a%d_ = ", u);
-        Expr *p = pre ? pre->expr : NULL;
-        if (!p) buf_printf(out, "td%d_[jj%d_ + %d]; ", id, id, u);
-        else if (p->op == TK_ASSIGN) { uj_emit(p->rhs); buf_puts(out, "; "); }
-        else { buf_printf(out, "td%d_[jj%d_ + %d] * ", id, id, u); uj_emit(p->rhs); buf_puts(out, "; "); }
+        if (prekind == 0) buf_printf(out, "td%d_[jj%d_ + %d]; ", id, id, u);
+        else if (prekind == 1) { uj_emit(e0); buf_puts(out, "; "); }
+        else { buf_printf(out, "td%d_[jj%d_ + %d] * ", id, id, u); uj_emit(e0); buf_puts(out, "; "); }
     }
     buf_printf(out, "for (int64_t kk%d_0_ = cs%d_0_; kk%d_0_ < ce%d_0_; kk%d_0_++) { ", id, id, id, id, id);
     for (int u = 0; u < U; u++) {
@@ -8484,6 +8509,7 @@ static bool uj_emit_loop(Stmt *s) {
     }
     buf_puts(out, "} ");
     for (int u = 0; u < U; u++) buf_printf(out, "td%d_[jj%d_ + %d] = a%d_; ", id, id, u, u);
+    if (w) buf_printf(out, "%s = a%d_; ", ren(w), U - 1); /* (w as the last j left it) */
     for (int p = 0; p < np; p++) { /* each lane's column of Y, after its sum (T is that sum) */
         uj_grp = p + 1; uj_k = post[p].ctr;
         buf_printf(out, "for (int64_t kk%d_%d_ = cs%d_%d_; kk%d_%d_ < ce%d_%d_; kk%d_%d_++) { ", id, p + 1, id, p + 1, id, p + 1, id, p + 1, id, p + 1);
