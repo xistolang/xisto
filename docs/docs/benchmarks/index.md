@@ -10,23 +10,24 @@ How they were measured is in [Methodology](../performance/methodology.md).
 
 ## Read this first
 
-- The Benchmarks Game against Rust, Node and Bun was re-run on 13 Nov 2026 (main `e5fb066`). The other tables are
-  from 5–10 Nov.
+- The Benchmarks Game against Rust was re-run on 13 Nov 2026 (main `e897e76`), against Node and Bun the same day
+  (main `e5fb066`). The other tables are from 5–10 Nov.
 - Bun wins or ties some rows: the Todo API, energy per HTTP request, streaming time and SQLite time. Those rows are
   shown, not dropped.
-- Against Rust no problem is lost on either VM, and xisto's peak memory is at or below Rust's on all ten. Three
-  rows are ties within 5%: spectral-norm on both VMs and mandelbrot on the Graviton2.
+- Against Rust no problem is lost on either VM. Two rows are ties within 5%: spectral-norm on both VMs, at the
+  floor of the divisions the problem asks for. xisto's peak memory is at or below Rust's on every row but
+  reverse-complement on the Graviton2 (188 MB against 123 MB).
 
 ## Benchmarks Game against Rust
 
-Fastest matching variant on each side, median of 3, 13 Nov 2026, `XISTO_CPU=native`. Sources:
-`bench/results/vm-2026-11-13/rust-ubuntu-xeon-2026-11-13-e5fb066.txt` and
-`bench/results/vm-2026-11-13/rust-arm-graviton2-2026-11-13-e5fb066.txt`, scored by `bench/placar.py`.
+Fastest matching variant on each side, median of 3, 13 Nov 2026, main `e897e76`, `XISTO_CPU=native`. Sources:
+`bench/results/vm-2026-11-13/rust-ubuntu-xeon-2026-11-13-e897e76.txt` and
+`bench/results/vm-2026-11-13/rust-arm-graviton2-2026-11-13-e897e76.txt`, scored by `bench/placar.py`.
 
 | machine | wins | ties (within 5%) | losses | memory |
 |---|---:|---:|---|---|
-| Xeon E5-2686 v4 (2 vCPUs) | 9 | 1 (spectral-norm) | none | at or below Rust on all 10 |
-| Graviton2 (2 vCPUs) | 8 | 2 (spectral-norm, mandelbrot) | none | below Rust on all 10 |
+| Xeon E5-2686 v4 (2 vCPUs) | 9 | 1 (spectral-norm) | none | below Rust on all 10 |
+| Graviton2 (2 vCPUs) | 9 | 1 (spectral-norm) | none | at or below Rust on 9; reverse-complement 188 MB against 123 MB |
 
 The per-problem tables are on [Xisto vs Rust](./benchmarks-game/vs-rust.md).
 

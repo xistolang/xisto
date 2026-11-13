@@ -5,7 +5,7 @@ sidebar_position: 2
 
 # Xisto vs Node
 
-13 Nov 2026, the same xisto variants as the [Rust round](./vs-rust.md) (main `e5fb066`), on the Apple M4 and the
+13 Nov 2026, the xisto variants of main `e5fb066` (before `mandelbrot-8`), on the Apple M4 and the
 two AWS VMs.
 
 ## Setup
