@@ -1,0 +1,68 @@
+---
+title: Benchmarks
+sidebar_position: 1
+---
+
+# Benchmarks
+
+These are the headline results. Each table names its machine, its date and the result file in `bench/results/`.
+How they were measured is in [Methodology](../performance/methodology.md).
+
+## Read this first
+
+- The Benchmarks Game against Rust was re-run on 13 Nov 2026 (main `e5fb066`). The other tables are from 5–10 Nov.
+- Bun wins or ties some rows: the Todo API, energy per HTTP request, streaming time, SQLite time and regex-redux on
+  the M4. Those rows are shown, not dropped.
+- The M4 Benchmarks Game results (7 Nov) predate the parallel ports: every xisto program there is
+  single-threaded. The VM results (9–10 Nov) use the parallel versions.
+- Against Rust no problem is lost on either VM, and xisto's peak memory is at or below Rust's on all ten. Three
+  rows are ties within 5%: spectral-norm on both VMs and mandelbrot on the Graviton2.
+
+## Benchmarks Game against Rust
+
+Fastest matching variant on each side, median of 3, 13 Nov 2026, `XISTO_CPU=native`. Sources:
+`bench/results/vm-2026-11-13/rust-ubuntu-xeon-2026-11-13-e5fb066.txt` and
+`bench/results/vm-2026-11-13/rust-arm-graviton2-2026-11-13-e5fb066.txt`, scored by `bench/placar.py`.
+
+| machine | wins | ties (within 5%) | losses | memory |
+|---|---:|---:|---|---|
+| Xeon E5-2686 v4 (2 vCPUs) | 9 | 1 (spectral-norm) | none | at or below Rust on all 10 |
+| Graviton2 (2 vCPUs) | 8 | 2 (spectral-norm, mandelbrot) | none | below Rust on all 10 |
+
+The per-problem table is on [Benchmarks Game](./benchmarks-game.md).
+
+## Benchmarks Game against Node and Bun
+
+Apple M4, 7 Nov 2026, median of 3, Node v26.12.0 and Bun 1.4.4, xisto single-threaded
+(`bench/results/benchmarksgame-2026-11-07-mac-5.txt`). xisto is faster than the better of Node and Bun on 9 of 10
+problems, by 1.12× (pidigits) to 2.57× (reverse-complement). On regex-redux Bun is 1% faster (0.354 s against 0.358 s).
+
+## Servers
+
+| | xisto | Node | Bun | source |
+|---|---:|---:|---:|---|
+| hello `/ping`, req/s | 231,097 | 136,913 | 198,223 | M4, 7 Nov, `2026-11-07-Apple-M4-http.csv` |
+| hello `/ping`, RSS after load | 4.20 MB | 100.72 MB | 34.47 MB | same |
+| Todo API list, req/s | 111,914 | 68,697 | 115,425 | M4, 5 Nov, `2026-11-05-Apple-M4-todo.csv` |
+| Conduit (NestJS) startup | 21 ms | 268 ms | — | M4, 8 Nov, `conduit-mac-2026-11-08.txt` |
+| Conduit RSS at rest | 2.6 MB | 136.0 MB | — | same |
+
+## What you ship
+
+| | xisto | Node | Bun |
+|---|---:|---:|---:|
+| `fib` program | 69,288 B | 61,220,224 B | 88,660,864 B |
+
+For Node and Bun the size is the runtime binary and its private libraries, which must be installed to run the
+program. Apple M4, 7 Nov 2026, `bench/results/2026-11-07-Apple-M4.csv`.
+
+## Pages
+
+- [Benchmarks Game](./benchmarks-game.md): against Rust, Node and Bun, per problem.
+- [HTTP](./http.md): hello, Todo API, the Conduit NestJS app, threads, resilience, slow dependencies.
+- [Energy, SQLite, streams and micro programs](./energy-sqlite-streams.md).
+
+## See also
+
+- [Methodology](../performance/methodology.md)
+- [The performance model](../performance/model.md)
