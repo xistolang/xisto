@@ -1,0 +1,13 @@
+mvt 3.0000 6.0000 7.0000 6.0000 7.0000
+trmm 2.250,2.786,3.321 3.536,4.125,4.714 3.696,4.179,4.661 1.929,2.143,2.357
+band before the short row 15
+band over all rows, column 0 751
+short row in a short range caught: array index out of bounds
+short row in the whole range caught: array index out of bounds
+negative column caught: array index out of bounds
+row past the array caught: array index out of bounds
+mvt short row caught: array index out of bounds 5,5,3,0,0
+holes, rows before them 14
+replaced 65
+grown 9
+aat 0.840,0.320,0.600,0.480 0.320,0.560,0.800,0.440 0.600,0.800,1.200,0.800 0.480,0.440,0.800,1.160

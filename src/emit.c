@@ -593,6 +593,10 @@ static bool nzv_has(const char *c) {
 }
 static int byte_hoist_find(Expr *a);
 static bool bce_safe(Expr *e); /* an index the loop already checks (see bce_enter) */
+static Expr *bce_promo_t; /* a slot kept in a C local while a loop is emitted (bce_promo_plan) */
+static int bce_promo_id;
+static bool bce_same_bx(Expr *a, Expr *b);
+static bool bce_same(Expr *a, Expr *b);
 /* u8reg: byte arrays a loop keeps in vector registers (see u8reg_loop) */
 typedef struct { int kind; Expr *a, *src, *lo, *hi, *ca, *cb; Stmt *loop; } U8Idiom; /* kind 1 copy a[j] = src[j], 2 reverse, 3 shift a[j] = a[j+1], 4 trade (a buf, src the table, ca/cb the cursors) */
 static bool match_u8_idiom(Stmt *s, U8Idiom *m);
@@ -1304,6 +1308,10 @@ static bool no_user_code(Expr *e) {
 }
 /* Address of a variable, field or array slot. */
 static void emit_lvalue_ptr(Expr *e) {
+    if (bce_promo_t && e->kind == E_INDEX && bce_same_bx(e->lhs, bce_promo_t->lhs) && bce_same(e->rhs, bce_promo_t->rhs)) {
+        buf_printf(out, "&pr%d_", bce_promo_id); /* the slot in a register (bce_promo_plan) */
+        return;
+    }
     switch (e->kind) {
     case E_IDENT:
         buf_printf(out, "&%s", ren(e->cname));
@@ -6219,6 +6227,79 @@ static char *bce_len_of(Expr *b) {
 }
 /* the indexes a versioned loop proves: on a base, the counter (kind 0), i + E, E + i, i - E, E - i (kind 1; sign
    as BceAff), or an invariant (kind 2) */
+/* ---- columns (A[k][c] in a loop over k, c invariant: mvt, trmm, gemver, gramschmidt, B[r][s] += A[r][t] * A[s][t]) ----
+   An array of arrays X whose rows keep their lengths through a whole loop nest (X only indexed, no row stored, no
+   length changed, no user code: bce_rect_ok) gets a C local before the outermost such loop, for its least row
+   length, computed at most once and only by a guard that needs it. A loop over k then proves X[k][c], c invariant:
+   c >= 0, and c below that least length or, for a range much shorter than X (where scanning every row would cost
+   more than the loop), below the length of each row in the range. A hole (a NULL row) counts as length 0. */
+typedef struct { const char *x; Type *t; int id; } BceRect;
+static BceRect bce_rect[16];
+static int nbce_rect, bce_rect_ids;
+static BceRect *bce_rect_find(const char *x) {
+    for (int k = nbce_rect - 1; k >= 0; k--) if (strcmp(bce_rect[k].x, x) == 0) return &bce_rect[k];
+    return NULL;
+}
+/* the arrays X of the X[k][c] in s, k a name (an array of indexable rows) */
+typedef struct { const char *x; Type *t; } BceRectUse;
+static void bce_rect_names_e(Expr *e, BceRectUse *u, int *n) {
+    if (!e) return;
+    if (e->kind == E_INDEX && !e->builtin.cfn && e->lhs && e->lhs->kind == E_INDEX && !e->lhs->builtin.cfn && e->lhs->rhs &&
+        e->lhs->rhs->kind == E_IDENT && e->lhs->lhs && e->lhs->lhs->kind == E_IDENT && e->lhs->lhs->cname &&
+        e->lhs->lhs->type && e->lhs->lhs->type->kind == TY_ARRAY && bce_indexable(e->lhs->type)) {
+        bool dup = false;
+        for (int k = 0; k < *n && !dup; k++) dup = strcmp(u[k].x, e->lhs->lhs->cname) == 0;
+        if (!dup && *n < 8) u[(*n)++] = (BceRectUse){e->lhs->lhs->cname, e->lhs->lhs->type};
+    }
+    bce_rect_names_e(e->lhs, u, n);
+    bce_rect_names_e(e->rhs, u, n);
+    for (int k = 0; k < e->args.len; k++) bce_rect_names_e(e->args.items[k], u, n);
+}
+static void bce_rect_names(Stmt *s, BceRectUse *u, int *n) {
+    if (!s) return;
+    bce_rect_names_e(s->init, u, n); bce_rect_names_e(s->expr, u, n); bce_rect_names_e(s->cond, u, n);
+    bce_rect_names_e(s->for_update, u, n);
+    bce_rect_names(s->for_init, u, n); bce_rect_names(s->body, u, n); bce_rect_names(s->else_body, u, n);
+    for (int k = 0; k < s->stmts.len; k++) bce_rect_names(s->stmts.items[k], u, n);
+    for (int k = 0; k < s->ncases; k++) { bce_rect_names_e(s->cases[k].value, u, n); bce_rect_names(s->cases[k].body, u, n); }
+}
+/* before the loop s: the least-length locals of the arrays whose columns its loops may read; how many it opened */
+static int bce_rect_open(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_BCE") || getenv("XISTO_NO_BCE_COLS")) return 0;
+    BceRectUse u[8];
+    int n = 0, opened = 0;
+    bce_rect_names(s, u, &n);
+    for (int k = 0; k < n && nbce_rect < 16; k++) {
+        if (bce_rect_find(u[k].x)) continue;
+        /* the rows keep their lengths through s: X only indexed (no other name for it, no user code, nothing
+           resized) and no array stored into an array's slot */
+        if (bce_declares(s, u[k].x) || !bce_ok(s, u[k].x, u[k].t, false) || bce_row_store(s)) continue;
+        int id = bce_rect_ids++;
+        bce_rect[nbce_rect++] = (BceRect){u[k].x, u[k].t, id};
+        buf_printf(out, "%sint64_t ml%d_ = -1; (void)ml%d_; ", opened ? "" : "{ ", id, id);
+        opened++;
+    }
+    return opened;
+}
+static void bce_rect_close(int opened) {
+    if (!opened) return;
+    nbce_rect -= opened;
+    buf_puts(out, " }");
+}
+/* the guard's test that c is within each row X[st..last] (X[st..last] within X tested before it) */
+static char *bce_col_test(BceRect *r, const char *c, const char *st, const char *last) {
+    Type *rt = r->t->elem;
+    const char *rs = rt->kind == TY_ARRAY ? arr_struct(rt) : rt->cls->cname;
+    const char *f = bce_bytes(rt) ? "f_length" : "len";
+    const char *X = ren(r->x);
+    return xs_sprintf("({ int64_t c_ = (%s), s_ = (%s), e_ = (%s); bool ok_ = c_ >= 0; "
+                      "if (ok_ && ml%d_ < 0 && (e_ - s_ + 1) * 4 >= (int64_t)(%s)->len) { int64_t m_ = INT64_MAX; "
+                      "for (int64_t r_ = 0; r_ < (int64_t)(%s)->len; r_++) { %s *p_ = (%s *)(%s)->data[r_]; int64_t l_ = p_ ? (int64_t)p_->%s : 0; if (l_ < m_) m_ = l_; } ml%d_ = m_; } "
+                      "if (ok_ && ml%d_ >= 0) ok_ = c_ < ml%d_; "
+                      "else if (ok_) for (int64_t r_ = s_; r_ <= e_; r_++) { %s *p_ = (%s *)(%s)->data[r_]; if (!p_ || (int64_t)p_->%s <= c_) { ok_ = false; break; } } "
+                      "ok_; })",
+                      c, st, last, r->id, X, X, rs, rs, X, f, r->id, r->id, r->id, rs, rs, X, f);
+}
 typedef struct { Expr *e, *base, *idx, *E; int kind, sign; bool ok; } BceCand;
 static BceCand bce_cand[32];
 static int nbce_cand;
@@ -6239,6 +6320,14 @@ static void bce_cands_e(Expr *e, Stmt *body, const char *i) {
         for (int k = 0; k < nbce_cand && !dup; k++)
             dup = bce_cand[k].kind == c.kind && bce_same_base(bce_cand[k].base, c.base) && (c.kind == 0 || bce_same(bce_cand[k].idx, c.idx));
         if (c.kind >= 0 && !dup) bce_cand[nbce_cand++] = c;
+    } else if (e->kind == E_INDEX && e->rhs && nbce_cand < 32 && !e->builtin.cfn && e->lhs && e->lhs->kind == E_INDEX &&
+               !e->lhs->builtin.cfn && e->lhs->lhs && e->lhs->lhs->kind == E_IDENT && e->lhs->lhs->cname &&
+               bce_rect_find(e->lhs->lhs->cname) && e->lhs->rhs && e->lhs->rhs->kind == E_IDENT && e->lhs->rhs->cname &&
+               strcmp(e->lhs->rhs->cname, i) == 0 && bce_indexable(e->lhs->type) && bce_inv(e->rhs, body, i)) {
+        bool dup = false; /* a column: X[i][c] */
+        for (int k = 0; k < nbce_cand && !dup; k++)
+            dup = bce_cand[k].kind == 3 && bce_same_base(bce_cand[k].base, e->lhs) && bce_same(bce_cand[k].idx, e->rhs);
+        if (!dup) bce_cand[nbce_cand++] = (BceCand){e, e->lhs, e->rhs, NULL, 3, 0, false};
     }
     bce_cands_e(e->lhs, body, i);
     bce_cands_e(e->rhs, body, i);
@@ -6252,6 +6341,7 @@ static void bce_cands(Stmt *s, Stmt *body, const char *i) {
     for (int k = 0; k < s->ncases; k++) { bce_cands_e(s->cases[k].value, body, i); bce_cands(s->cases[k].body, body, i); }
 }
 static bool bce_safe(Expr *e);
+static char *bce_g_st, *bce_g_last; /* the last guard's first and last counter values, as C */
 /* the guard of a versioned loop (NULL when the loop is not one); the indexes it proves in bce_cand (ok) */
 static char *bce_version_guard(Stmt *s) {
     Expr *u = s->for_update, *c = s->cond;
@@ -6277,6 +6367,14 @@ static char *bce_version_guard(Stmt *s) {
             if (bce_depth(cd->base) != pass) continue;
             if ((row || cd->kind == 2) && !rows) continue;
             if (bce_safe(cd->e)) continue; /* already proved (an outer loop's guard, a table of a known length) */
+            if (cd->kind == 3) { /* a column: its rows X[i] proved by this guard (bce_rect_open proved the rest) */
+                bool proved = false;
+                for (int j = 0; j < nbce_cand && !proved; j++)
+                    proved = bce_cand[j].ok && bce_cand[j].kind == 0 && bce_cand[j].base->kind == E_IDENT &&
+                             strcmp(bce_cand[j].base->cname, cd->base->lhs->cname) == 0;
+                if (proved) { cd->ok = true; moving = true; }
+                continue;
+            }
             const char *a = bce_root(cd->base);
             if (bce_declares(s->body, a)) continue;
             bool pl = plain && bce_names_plain(cd->idx) && (!row || bce_names_plain(cd->base->rhs));
@@ -6302,6 +6400,8 @@ static char *bce_version_guard(Stmt *s) {
     Buf g = {0};
     /* i runs over [st, last]: last = LIM - 1 (i < LIM) or LIM (i <= LIM); the loop runs only when st <= last */
     char *last = le ? xs_sprintf("(%s)", l) : xs_sprintf("((%s) - 1)", l);
+    bce_g_st = st;
+    bce_g_last = last;
     buf_printf(&g, "(%s) >= 0", st);
     for (int pass = 0; pass < 4; pass++)
         for (int k = 0; k < nbce_cand; k++) {
@@ -6310,6 +6410,7 @@ static char *bce_version_guard(Stmt *s) {
             char *A = bce_len_of(cd->base);
             if (cd->kind == 0) { buf_printf(&g, " && %s < %s", last, A); continue; }
             if (cd->kind == 2) { char *x = bce_raw(cd->idx); buf_printf(&g, " && %s >= 0 && %s < %s", x, x, A); continue; }
+            if (cd->kind == 3) { buf_printf(&g, " && %s", bce_col_test(bce_rect_find(cd->base->lhs->cname), bce_raw(cd->idx), st, last)); continue; }
             bool ar3 = false;
             char *E = emit_expr_to_str(cd->E, &ar3);
             if (cd->sign == 1) buf_printf(&g, " && (%s) + (%s) >= 0 && %s + (%s) < %s", st, E, last, E, A);        /* i + E */
@@ -7689,7 +7790,99 @@ static void ctr_emit_for(Stmt *s) {
     buf_puts(out, "); }");
 }
 
-static void emit_stmt_for_inner(Stmt *s) { /* a for: bounds checks proved by the loop, or a versioned copy */
+/* ---- an invariant slot in a register (lu: A[i][j] -= A[i][k] * A[k][j]; mvt: x[i] = x[i] + A[i][j] * y[j]) ----
+   In the copy of a versioned loop without checks, a number slot T = X[c] (X a name or an invariant row, c invariant)
+   that the body writes is kept in a C local for the whole loop: read once before it, written once after it. That
+   is the same program when nothing else in the body reaches T: every other number slot read or written there has
+   another index on the same array (the counter, with c outside the loop's range, or an invariant that differs
+   from c), or lies on another array (tested by its pointer). A column X[k] (one pointer per row of the range to
+   test) is not promoted: on the M4 that scan cost more than the register saved (lu, trmm, correlation 15-50%
+   slower), as the core forwards the store to the next load almost for free. The
+   body must not be able to stop half way (an error would leave T behind): only number arithmetic, names and
+   indexes the guard proved, in expression statements (bce_promo_ok). The tests run before the loop; when one
+   fails, the plain copy without checks runs. */
+static Expr *bce_promo_t;  /* the slot in a register while the loop is emitted (NULL: none) */
+static int bce_promo_id, bce_promo_ids;
+static bool bce_num_slot(Expr *e) {
+    return e && e->kind == E_INDEX && !e->builtin.cfn && e->type && e->type->kind == TY_NUMBER && e->lhs && e->lhs->type &&
+           e->lhs->type->kind == TY_ARRAY;
+}
+/* an expression that cannot fail or run user code: numbers, names, proved indexes, number arithmetic, assignments */
+static bool bce_promo_e(Expr *e, Expr **slots, int *ns) {
+    if (!e) return true;
+    switch (e->kind) {
+    case E_NUMBER: return true;
+    case E_IDENT: return e->type && (e->type->kind == TY_NUMBER || e->type->kind == TY_INT || e->type->kind == TY_ARRAY);
+    case E_INDEX:
+        if (e->builtin.cfn || !bce_safe(e)) return false;
+        if (bce_num_slot(e)) { if (*ns == 32) return false; slots[(*ns)++] = e; }
+        else if (!e->type || e->type->kind != TY_ARRAY) return false; /* (a row: X[R]) */
+        return bce_promo_e(e->lhs, slots, ns); /* (the index: proved, emitted without a check) */
+    case E_BINARY:
+        if (!e->type || e->type->kind != TY_NUMBER) return false;
+        if (e->op != TK_PLUS && e->op != TK_MINUS && e->op != TK_STAR && e->op != TK_SLASH) return false;
+        return bce_promo_e(e->lhs, slots, ns) && bce_promo_e(e->rhs, slots, ns);
+    case E_UNARY:
+        return e->op == TK_MINUS && e->type && e->type->kind == TY_NUMBER && bce_promo_e(e->lhs, slots, ns);
+    case E_ASSIGN:
+        if (!e->type || e->type->kind != TY_NUMBER || !e->lhs || (e->lhs->kind != E_IDENT && !bce_num_slot(e->lhs))) return false;
+        if (e->op != TK_ASSIGN && e->op != TK_PLUS_ASSIGN && e->op != TK_MINUS_ASSIGN && e->op != TK_STAR_ASSIGN && e->op != TK_SLASH_ASSIGN) return false;
+        return bce_promo_e(e->lhs, slots, ns) && bce_promo_e(e->rhs, slots, ns);
+    default: return false;
+    }
+}
+static bool bce_promo_ok(Stmt *s, Expr **slots, int *ns) {
+    if (!s) return true;
+    if (s->kind == S_EXPR) return bce_promo_e(s->expr, slots, ns);
+    if (s->kind != S_BLOCK) return false;
+    for (int k = 0; k < s->stmts.len; k++) if (!bce_promo_ok(s->stmts.items[k], slots, ns)) return false;
+    return true;
+}
+static Expr *bce_promo_target_e(Expr *e) { /* the first number slot the body assigns */
+    if (!e) return NULL;
+    if (e->kind == E_ASSIGN && bce_num_slot(e->lhs)) return e->lhs;
+    Expr *t = bce_promo_target_e(e->lhs);
+    return t ? t : bce_promo_target_e(e->rhs);
+}
+static Expr *bce_promo_target(Stmt *s) {
+    if (!s) return NULL;
+    if (s->kind == S_EXPR) return bce_promo_target_e(s->expr);
+    for (int k = 0; k < s->stmts.len; k++) { Expr *t = bce_promo_target(s->stmts.items[k]); if (t) return t; }
+    return NULL;
+}
+/* the tests that make the slot T the only way to its element (NULL: no promotion) */
+static char *bce_promo_plan(Stmt *s, const char *i) {
+    if (getenv("XISTO_NO_PROMOTE")) return NULL;
+    Expr *slots[32];
+    int ns = 0;
+    if (!bce_promo_ok(s->body, slots, &ns)) return NULL;
+    Expr *t = bce_promo_target(s->body);
+    if (!t || !bce_inv(t->rhs, s->body, i) || !(t->lhs->kind == E_IDENT || bce_base(t->lhs, s->body, i))) return NULL;
+    char *pt = bce_base_c(t->lhs), *c = bce_raw(t->rhs);
+    Buf g = {0};
+    buf_puts(&g, "1");
+    for (int k = 0; k < ns; k++) {
+        Expr *e = slots[k], *b = e->lhs;
+        if (bce_same_bx(b, t->lhs)) {
+            if (bce_same(e->rhs, t->rhs)) continue; /* T itself */
+            if (e->rhs->kind == E_IDENT && e->rhs->cname && strcmp(e->rhs->cname, i) == 0)
+                buf_printf(&g, " && ((%s) < (%s) || (%s) > %s)", c, bce_g_st, c, bce_g_last);
+            else if (bce_inv(e->rhs, s->body, i)) buf_printf(&g, " && (%s) != (%s)", bce_raw(e->rhs), c);
+            else return NULL;
+        } else if (b->kind == E_IDENT || bce_base(b, s->body, i)) {
+            buf_printf(&g, " && (void *)%s != (void *)%s", bce_base_c(b), pt);
+        } else return NULL;
+    }
+    bce_promo_t = t;
+    return g.data;
+}
+static void emit_stmt_for_inner_(Stmt *s);
+static void emit_stmt_for_inner(Stmt *s) { /* the columns' least row lengths around the outermost loop that keeps them */
+    int opened = bce_rect_open(s);
+    emit_stmt_for_inner_(s);
+    bce_rect_close(opened);
+}
+static void emit_stmt_for_inner_(Stmt *s) { /* a for: bounds checks proved by the loop, or a versioned copy */
     int saved_nbce = nbce;
     bce_enter(s);
     if (nbce == saved_nbce) { /* not a[i] < a.length: maybe a loop to version (bce_version_guard) */
@@ -7705,7 +7898,22 @@ static void emit_stmt_for_inner(Stmt *s) { /* a for: bounds checks proved by the
                                               cd->kind == 0 ? NULL : cd->idx, row ? cd->base : NULL};
             }
             bce_versions++;
-            emit_for_(s);
+            char *pg = bce_promo_t ? NULL : bce_promo_plan(s, s->for_update->lhs->cname);
+            if (pg) {
+                Expr *t = bce_promo_t;
+                bce_promo_t = NULL;
+                bool ar = false;
+                char *slot = emit_expr_to_str(t, &ar);
+                int id = bce_promo_ids++;
+                buf_printf(out, "{ if (%s) { double pr%d_ = %s; ", pg, id, slot);
+                bce_promo_t = t;
+                bce_promo_id = id;
+                emit_for_(s);
+                bce_promo_t = NULL;
+                buf_printf(out, " %s = pr%d_; } else ", slot, id);
+                emit_for_(s);
+                buf_puts(out, " }");
+            } else emit_for_(s);
             nbce = saved_nbce;
             buf_puts(out, " else ");
             bce_slow++;
