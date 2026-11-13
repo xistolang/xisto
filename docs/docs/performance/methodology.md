@@ -33,8 +33,8 @@ computes `1/Math.sqrt(x)` exactly. Two consequences show in the tables:
 
 - Rust programs that use `rsqrtps` (an approximate reciprocal square root refined by one Newton step) print the
   same nine digits but compute different doubles. `nbody_7` and `nbody_9` are therefore excluded.
-- Rust spectral-norm programs that sum four terms at a time are faster than xisto can be on some machines. That
-  is a decision, not an oversight.
+- Rust spectral-norm programs sum four terms at a time; xisto keeps every sum in the written order. That is a
+  decision, not an oversight. Since 13 Nov both sides sit at the same floor, the cost of the divisions themselves.
 
 ## Choosing a variant
 
@@ -57,7 +57,8 @@ A tie is a difference within 5% either way.
 
 Runtimes: Node v26.12.0 and Bun 1.4.4 on the M4; Node v24.22.2 on the VMs (9 Nov 2026). Rust: stable,
 `opt-level = 3`, `codegen-units = 1`, `-C target-cpu=native`, GMP for pidigits, as `bench/benchmarksgame/langs.md`
-describes; the Rust version is not recorded in the result files. On arm64 the Rust programs written with x86 SIMD
+describes; rustc 1.99.1 in the 13 Nov round. xisto builds with `XISTO_CPU=native` for the same reason (the default
+binary is portable), and the round script records it in the result header. On arm64 the Rust programs written with x86 SIMD
 do not compile.
 
 Both AWS instances are burstable. Under CPU-credit exhaustion the hypervisor steals time, and one round ran the

@@ -10,27 +10,24 @@ How they were measured is in [Methodology](../performance/methodology.md).
 
 ## Read this first
 
-- The numbers are from 5–10 Nov 2026. The compiler changed on 10–12 Nov (`any`, real promises, the backtracking
-  regex engine). Those three changes were checked to leave the generated C of the benchmark programs identical,
-  but a full re-run after all of the 10–12 Nov work is pending.
+- The Benchmarks Game against Rust was re-run on 13 Nov 2026 (main `e5fb066`). The other tables are from 5–10 Nov.
 - Bun wins or ties some rows: the Todo API, energy per HTTP request, streaming time, SQLite time and regex-redux on
   the M4. Those rows are shown, not dropped.
 - The M4 Benchmarks Game results (7 Nov) predate the parallel ports: every xisto program there is
   single-threaded. The VM results (9–10 Nov) use the parallel versions.
-- Rust is ahead on mandelbrot on both VMs and on spectral-norm on the Graviton2, and xisto's binary-trees uses more
-  memory than Rust's.
+- Against Rust no problem is lost on either VM, and xisto's peak memory is at or below Rust's on all ten. Three
+  rows are ties within 5%: spectral-norm on both VMs and mandelbrot on the Graviton2.
 
 ## Benchmarks Game against Rust
 
-Fastest matching variant on each side, median of 3, 10 Nov 2026. Sources:
-`bench/results/vm-2026-11-07/rust-ubuntu-xeon-2026-11-10t.txt`,
-`bench/results/vm-2026-11-07/rust-arm-graviton2-2026-11-10t.txt`, scored in
-`bench/results/placar-final-2026-11-10.md`.
+Fastest matching variant on each side, median of 3, 13 Nov 2026, `XISTO_CPU=native`. Sources:
+`bench/results/vm-2026-11-13/rust-ubuntu-xeon-2026-11-13-e5fb066.txt` and
+`bench/results/vm-2026-11-13/rust-arm-graviton2-2026-11-13-e5fb066.txt`, scored by `bench/placar.py`.
 
-| machine | wins | ties (within 5%) | losses |
-|---|---:|---:|---|
-| Xeon E5-2686 v4 (2 vCPUs) | 7 | 3 | none |
-| Graviton2 (2 vCPUs) | 8 | 1 | mandelbrot, 1.08× |
+| machine | wins | ties (within 5%) | losses | memory |
+|---|---:|---:|---|---|
+| Xeon E5-2686 v4 (2 vCPUs) | 9 | 1 (spectral-norm) | none | at or below Rust on all 10 |
+| Graviton2 (2 vCPUs) | 8 | 2 (spectral-norm, mandelbrot) | none | below Rust on all 10 |
 
 The per-problem table is on [Benchmarks Game](./benchmarks-game.md).
 
