@@ -1109,11 +1109,69 @@ static int64_t xs_str_cp_at_byte(xs_str *s, int64_t b) {
     return n;
 }
 
+/* the length of a + b when a's is known: b's is counted (b is copied anyway), so `s += t; s.length` does not count
+   the whole of s again after every append */
+static inline int32_t xs_str_ulen_sum(xs_str *a, xs_str *b) {
+    if (a->ulen < 0 || a->len + b->len > INT32_MAX) return -1;
+    return a->ulen + (int32_t)xs_str_len(b);
+}
 static xs_str *xs_str_concat(xs_str *a, xs_str *b) {
     xs_str *s = xs_str_alloc(a->len + b->len);
     memcpy(s->data, a->data, (size_t)a->len);
     memcpy(s->data + a->len, b->data, (size_t)b->len);
     s->data[s->len] = 0;
+    s->ulen = xs_str_ulen_sum(a, b);
+    return s;
+}
+/* the usable size of a malloc block (0: unknown, then a string is never grown in place) */
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#define xs_msize(p) malloc_size(p)
+#elif defined(__linux__) || defined(_WIN32)
+#include <malloc.h>
+#if defined(_WIN32)
+#define xs_msize(p) _msize(p)
+#else
+#define xs_msize(p) malloc_usable_size(p)
+#endif
+#else
+#define xs_msize(p) ((size_t)0)
+#endif
+/* s += t (the emitter, when computing t calls no user code): a string held only by the variable (count 1, a malloc
+   block of its own: not a literal, nor from a slab, a region or a frame) takes t at the end of its block, which grows
+   by half when full; one that cannot (shared, small) is copied into such a block once it is past the small sizes.
+   A buffer built from short pieces is then linear instead of a copy of the whole per piece (PolyBench's dump). With
+   count 1 no other reference holds the old value, so changing it in place is not seen (strings never change). */
+static xs_str *xs_str_append_to(xs_str **slot, xs_str *b) {
+    xs_str *a = *slot;
+    int64_t n = a->len + b->len;
+    size_t need = offsetof(xs_str, data) + (size_t)n + 1;
+    if (a != b && a->hdr.rc == 1 && !(a->hdr.cls & (XS_CLS_MASK | XS_STACK | XS_RGN | XS_CYC | XS_BUF | XS_DEAD)) &&
+        xs_type_of(a)->free == xs_str_free && need > XS_SMALL_MAX) {
+        size_t cap = xs_msize(a);
+        if (cap) {
+            if (need > cap) {
+                xs_str *r = realloc(a, need + need / 2);
+                if (!r) xs_panic("out of memory");
+                a = *slot = r;
+            }
+            a->ulen = xs_str_ulen_sum(a, b);
+            memcpy(a->data + a->len, b->data, (size_t)b->len);
+            a->len = n;
+            a->data[n] = 0;
+            return a;
+        }
+    }
+    xs_str *s;
+    if (need > XS_SMALL_MAX && a != b) { /* room for the next appends */
+        s = xs_obj_alloc_raw(need + need / 2, &xs_str_type);
+        s->len = n;
+        memcpy(s->data, a->data, (size_t)a->len);
+        memcpy(s->data + a->len, b->data, (size_t)b->len);
+        s->data[n] = 0;
+        s->ulen = xs_str_ulen_sum(a, b);
+    } else s = xs_str_concat(a, b);
+    xs_assign(*slot, s);
     return s;
 }
 
@@ -2842,6 +2900,45 @@ XS_NOINLINE xs_str *xs_num_to_fixed(double x, int64_t d) {
     if (d < 0 || d > 100) xs_panic("RangeError: toFixed() digits argument must be between 0 and 100");
     if (isnan(x)) return xs_str_new("NaN", 3);
     if (fabs(x) >= 1e21) return xs_str_from_num(x);
+    if (d <= 22 && fabs(x) < 9007199254740992.0) {
+        /* |x| = m * 2^e exactly (m < 2^53); N = |x| * 10^d rounded half up is (m * 10^d) / 2^-e rounded, in 128-bit
+           integers (m * 10^22 < 2^127): the same digits as the exact expansion below, without printing 1100 of them */
+        static const uint64_t p10[20] = {1ull, 10ull, 100ull, 1000ull, 10000ull, 100000ull, 1000000ull, 10000000ull,
+            100000000ull, 1000000000ull, 10000000000ull, 100000000000ull, 1000000000000ull, 10000000000000ull,
+            100000000000000ull, 1000000000000000ull, 10000000000000000ull, 100000000000000000ull,
+            1000000000000000000ull, 10000000000000000000ull};
+        uint64_t bits;
+        double ax = fabs(x);
+        memcpy(&bits, &ax, 8);
+        int be = (int)(bits >> 52);
+        uint64_t m = bits & ((UINT64_C(1) << 52) - 1);
+        int e = be ? be - 1075 : -1074;
+        if (be) m |= UINT64_C(1) << 52;
+        unsigned __int128 pd = d < 20 ? (unsigned __int128)p10[d] : (unsigned __int128)p10[19] * p10[d - 19];
+        unsigned __int128 N;
+        if (e >= 0) N = ((unsigned __int128)m << e) * pd; /* an integer below 2^53 */
+        else {
+            unsigned __int128 P = (unsigned __int128)m * pd;
+            int k = -e;
+            if (k >= 128) N = 0; /* P < 2^127 <= half of 2^k: below half */
+            else {
+                N = P >> k;
+                if (((P >> (k - 1)) & 1) != 0) N++; /* the remainder is half or more: up (a tie goes up, as toFixed) */
+            }
+        }
+        char dig[48];
+        int nd = 0;
+        do { dig[nd++] = (char)('0' + (int)(N % 10)); N /= 10; } while (N);
+        while (nd < d + 1) dig[nd++] = '0';
+        char out[64];
+        size_t n = 0;
+        if (x < 0) out[n++] = '-';
+        for (int i = nd - 1; i >= 0; i--) {
+            out[n++] = dig[i];
+            if (i == d && d > 0) out[n++] = '.';
+        }
+        return xs_str_new(out, n);
+    }
     static XS_TLS char exact[1200];
     snprintf(exact, sizeof exact, "%.1100f", fabs(x)); /* every digit of the double, exactly */
     char *dot = strchr(exact, '.');

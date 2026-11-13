@@ -1287,6 +1287,21 @@ static bool is_f64_type(Type *t) { return t && t->kind == TY_OBJECT && t->cls &&
 /* a Float32Array: its data are floats (4 bytes each); a read is the float as a double, a write rounds to a float */
 static bool is_f32_type(Type *t) { return t && t->kind == TY_OBJECT && t->cls && t->cls->builtin && strcmp(t->cls->cname, "xs_Float32Array") == 0; }
 static bool is_f32_index(Expr *e) { return e && e->kind == E_INDEX && !e->builtin.cfn && e->lhs && is_f32_type(e->lhs->type); }
+/* computing e cannot run user code (a function, a method, a closure, a constructor, a callback passed to a builtin) */
+static bool no_user_code(Expr *e) {
+    if (!e) return true;
+    switch (e->kind) {
+    case E_ARROW: case E_AWAIT: return false;
+    case E_CALL: if (e->func || !e->builtin.cfn) return false; break;
+    case E_NEW_OBJ: if (!e->cls || !e->cls->builtin) return false; break;
+    case E_MEMBER: if (e->func || (e->is_call && !e->builtin.cfn)) return false; break;
+    case E_IDENT: if (e->type && e->type->kind == TY_FUNC) return false; break;
+    default: break;
+    }
+    if (!no_user_code(e->lhs) || !no_user_code(e->rhs)) return false;
+    for (int i = 0; i < e->args.len; i++) if (!no_user_code(e->args.items[i])) return false;
+    return true;
+}
 /* Address of a variable, field or array slot. */
 static void emit_lvalue_ptr(Expr *e) {
     switch (e->kind) {
@@ -3545,6 +3560,28 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, ", ");
             emit_owned(e->rhs);
             buf_printf(out, ", %s)", known_free(e->lhs->type));
+            return;
+        }
+        if (rcnt(e->type) && e->op == TK_PLUS_ASSIGN && e->type->kind == TY_STRING && e->lhs->kind == E_IDENT && no_user_code(e->rhs) &&
+            !getenv("XISTO_NO_STR_APPEND")) {
+            /* s += t: in place when s is held only by the variable (xs_str_append_to); t first, which runs no user
+               code, so s is read after it as before */
+            buf_puts(out, "xs_str_append_to(");
+            emit_lvalue_ptr(e->lhs);
+            buf_puts(out, ", ");
+            emit_borrowed(e->rhs);
+            buf_puts(out, ")");
+            return;
+        }
+        if (rcnt(e->type) && e->op == TK_PLUS_ASSIGN && e->type->kind == TY_STRING && e->lhs->kind == E_IDENT) {
+            /* s += f(): s is read before the right side runs, which may assign s (and free the value read) */
+            buf_puts(out, "({ xs_str *old_ = xs_retain(");
+            emit_lvalue(e->lhs);
+            buf_puts(out, "); xs_str *rhs_ = ");
+            emit_borrowed(e->rhs);
+            buf_puts(out, "; xs_str *cat_ = xs_str_concat(old_, rhs_); xs_release(old_); xs_assign(");
+            emit_lvalue(e->lhs);
+            buf_puts(out, ", cat_); })");
             return;
         }
         if (rcnt(e->type)) {
@@ -5949,7 +5986,14 @@ static void rv_compute(Func *owner, Stmt **stmts, int n) {
             if (!rv_nn[k]) continue;
             bool any = false;
             for (int d = 0; d < rv_ndefs; d++) {
-                if (strcmp(rv_defs[d].name, rv_name[k]) != 0 || rv_defs[d].loop) continue;
+                if (strcmp(rv_defs[d].name, rv_name[k]) != 0) continue;
+                if (rv_defs[d].loop) { /* the loop's own counter: its start (its declaration's definition was folded into the loop's) */
+                    Stmt *fi = rv_defs[d].loop->for_init;
+                    if (!fi || fi->kind != S_VAR || !fi->cname || strcmp(fi->cname, rv_name[k]) != 0 || getenv("XISTO_NO_NN_CTR")) continue;
+                    if (!fi->init || !(fi->init->kind == E_NUMBER ? fi->init->is_int_lit && fi->init->ival >= 0 : nn_expr(fi->init))) { rv_nn[k] = false; moved = true; break; }
+                    any = true;
+                    continue;
+                }
                 if (!rv_defs[d].def || !nn_expr(rv_defs[d].def)) { rv_nn[k] = false; moved = true; break; }
                 any = true;
             }
@@ -5964,9 +6008,10 @@ static void rv_compute(Func *owner, Stmt **stmts, int n) {
    starts at 0 or more and nothing in the body can change a's length: a appears only as a[...] or a.length, and
    the body calls no user code, makes no closure and calls no method that resizes an array (another name for
    the same array could otherwise shrink it). Such a[i] is read and written without the check. */
-typedef struct { const char *i, *a; bool guarded; Expr *idx; } BceLoop; /* guarded: a versioned loop's guard proved i >= 0;
-   idx: that exact index expression (a[i + E], a[E - i]) is within a */
-static BceLoop bce_loops[16];
+typedef struct { const char *i, *a; bool guarded; Expr *idx, *row; } BceLoop; /* guarded: a versioned loop's guard proved i >= 0;
+   idx: an index of that shape (a[i + E], a[E - i], an invariant) is within a; row: the base is that row of a (a[R],
+   a[R][Q]) */
+static BceLoop bce_loops[64];
 static int nbce;
 /* a is a Float64Array or a Uint8Array in a local of its own: its length never changes, and nothing but an
    assignment to a in the body can make a name another array, so calls and other uses of a do not matter
@@ -6026,7 +6071,7 @@ static bool bce_ok(Stmt *body, const char *a, Type *t, bool calls_ok) {
 }
 static void bce_enter(Stmt *s) {
     Expr *u = s->for_update, *c = s->cond;
-    if (nbce == 16 || xs_debug || sm_mode || getenv("XISTO_NO_BCE")) return; /* (a generator: the consumer runs between yields) */
+    if (nbce == 64 || xs_debug || sm_mode || getenv("XISTO_NO_BCE")) return; /* (a generator: the consumer runs between yields) */
     if (!u || !u->builtin.cfn || strcmp(u->builtin.cfn, "counted_inc") != 0) return;
     Expr *len = c->rhs;
     if (!len || len->kind != E_MEMBER || len->is_call || !len->str || strcmp(len->str, "length") != 0) return;
@@ -6058,7 +6103,6 @@ static bool bce_writes(Stmt *s, const char *n) {
     return false;
 }
 /* the length of an array, a Float64Array or bytes (a Uint8Array: its length never changes), as C */
-static Type *bce_arr_t[8]; /* bce_version_guard: the types of the arrays in arrs */
 static const char *bce_len_c(const char *a, Type *t) { return xs_sprintf(bce_bytes(t) ? "(%s)->f_length" : "(int64_t)(%s)->len", ren(a)); }
 /* the same pure expression (bce_pure: names, numbers, + and -) */
 static bool bce_same(Expr *a, Expr *b) {
@@ -6067,57 +6111,6 @@ static bool bce_same(Expr *a, Expr *b) {
     if (a->kind == E_IDENT) return a->cname && b->cname && strcmp(a->cname, b->cname) == 0;
     if (a->kind == E_BINARY) return a->op == b->op && bce_same(a->lhs, b->lhs) && bce_same(a->rhs, b->rhs);
     return false;
-}
-/* a[i + E], a[E + i], a[i - E], a[E - i] with E pure and not written in the loop (bce_version_guard) */
-typedef struct { const char *a; Expr *idx, *E; int sign; Type *t; } BceAff; /* index = sign * i + E (sign -1 or 1, 2: i - E) */
-static BceAff bce_aff[16];
-static int nbce_aff;
-static bool bce_pure(Expr *e);
-static Stmt *bce_cur_body;
-static void bce_affine_e(Expr *e, const char *i) {
-    if (!e) return;
-    if (e->kind == E_INDEX && e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname && bce_indexable(e->lhs->type) &&
-        e->rhs && e->rhs->kind == E_BINARY && (e->rhs->op == TK_PLUS || e->rhs->op == TK_MINUS) && nbce_aff < 16) {
-        Expr *l = e->rhs->lhs, *r = e->rhs->rhs, *E = NULL;
-        int sign = 0;
-        bool li = l && l->kind == E_IDENT && l->cname && strcmp(l->cname, i) == 0;
-        bool ri = r && r->kind == E_IDENT && r->cname && strcmp(r->cname, i) == 0;
-        if (li && !ri) { E = r; sign = 1; }                                   /* i + E, i - E */
-        else if (ri && !li) { E = l; sign = e->rhs->op == TK_PLUS ? 1 : -1; } /* E + i, E - i */
-        bool inv = E && bce_pure(E);
-        if (inv && E->kind == E_IDENT) inv = !bce_writes(bce_cur_body, E->cname);
-        if (inv && E->kind == E_BINARY) inv = false; /* (names only, or numbers: what the guard reads) */
-        if (inv && strcmp(e->lhs->cname, i) != 0) bce_aff[nbce_aff++] = (BceAff){e->lhs->cname, e->rhs, E, li && e->rhs->op == TK_MINUS ? 2 : sign, e->lhs->type};
-    }
-    bce_affine_e(e->lhs, i);
-    bce_affine_e(e->rhs, i);
-    for (int k = 0; k < e->args.len; k++) bce_affine_e(e->args.items[k], i);
-}
-static void bce_affine(Stmt *s, const char *i) {
-    if (!s) return;
-    bce_affine_e(s->init, i); bce_affine_e(s->expr, i); bce_affine_e(s->cond, i); bce_affine_e(s->for_update, i);
-    bce_affine(s->for_init, i); bce_affine(s->body, i); bce_affine(s->else_body, i);
-    for (int k = 0; k < s->stmts.len; k++) bce_affine(s->stmts.items[k], i);
-    for (int k = 0; k < s->ncases; k++) bce_affine(s->cases[k].body, i);
-}
-static void bce_arrays_e(Expr *e, const char *i, const char **arrs, Type **ts, int *na) {
-    if (!e) return;
-    if (e->kind == E_INDEX && e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname && bce_indexable(e->lhs->type) &&
-        e->rhs && e->rhs->kind == E_IDENT && e->rhs->cname && strcmp(e->rhs->cname, i) == 0) {
-        bool seen = false;
-        for (int k = 0; k < *na; k++) if (strcmp(arrs[k], e->lhs->cname) == 0) seen = true;
-        if (!seen && *na < 8) { ts[*na] = e->lhs->type; arrs[(*na)++] = e->lhs->cname; }
-    }
-    bce_arrays_e(e->lhs, i, arrs, ts, na);
-    bce_arrays_e(e->rhs, i, arrs, ts, na);
-    for (int k = 0; k < e->args.len; k++) bce_arrays_e(e->args.items[k], i, arrs, ts, na);
-}
-static void bce_arrays(Stmt *s, const char *i, const char **arrs, Type **ts, int *na) {
-    if (!s) return;
-    bce_arrays_e(s->init, i, arrs, ts, na); bce_arrays_e(s->expr, i, arrs, ts, na); bce_arrays_e(s->cond, i, arrs, ts, na); bce_arrays_e(s->for_update, i, arrs, ts, na);
-    bce_arrays(s->for_init, i, arrs, ts, na); bce_arrays(s->body, i, arrs, ts, na); bce_arrays(s->else_body, i, arrs, ts, na);
-    for (int k = 0; k < s->stmts.len; k++) bce_arrays(s->stmts.items[k], i, arrs, ts, na);
-    for (int k = 0; k < s->ncases; k++) bce_arrays(s->cases[k].body, i, arrs, ts, na);
 }
 /* no calls, assignments or checks that could fail: numbers, names and + - * of them */
 static bool bce_pure(Expr *e) {
@@ -6137,46 +6130,171 @@ static bool bce_declares(Stmt *s, const char *n) {
     for (int k = 0; k < s->ncases; k++) if (bce_declares(s->cases[k].body, n)) return true;
     return false;
 }
-static int bce_versions; /* versioned loops around the one being emitted (two levels at most: 4 copies) */
-/* the guard of a versioned loop ("" when the loop is not one), and its arrays in arrs */
-static char *bce_version_guard(Stmt *s, const char **arrs, int *na) {
-    *na = 0;
+static int bce_versions; /* versioned loops around the one being emitted */
+static int bce_slow;     /* of those, the ones whose checked copy (the else) is being emitted */
+/* ---- rows and invariant indexes (the loops of number[][]: C[i][j] += A[i][k] * B[k][j]) ----
+   A versioned loop also proves indexes on rows: X[R][i], X[R][i + E], with X an array of arrays and R invariant in
+   the loop (an outer counter, i + 1), and indexes that do not move at all (A[i][k] in a loop over j). The guard
+   tests the row once (R within X, then the last i within X[R]), so the body reads both without a check. A row is
+   the same array in every iteration when nothing in the body can store into an array's slot an array (which
+   could replace it), change a length, or call user code (bce_row_ok). */
+/* an int literal, or an int name the body neither writes nor declares and that is not the counter */
+static bool bce_inv_atom(Expr *e, Stmt *body, const char *i) {
+    if (!e || !e->type) return false;
+    if (e->kind == E_NUMBER) return e->is_int_lit;
+    if (e->kind != E_IDENT || !e->cname || e->type->kind != TY_INT || (i && strcmp(e->cname, i) == 0)) return false;
+    return !bce_writes(body, e->cname) && !bce_declares(body, e->cname);
+}
+/* an invariant atom, or one + or - of two (two safe integers: the guard computes it exactly in 64 bits) */
+static bool bce_inv(Expr *e, Stmt *body, const char *i) {
+    if (e && e->kind == E_BINARY && (e->op == TK_PLUS || e->op == TK_MINUS) && e->type && e->type->kind == TY_INT)
+        return bce_inv_atom(e->lhs, body, i) && bce_inv_atom(e->rhs, body, i);
+    return bce_inv_atom(e, body, i);
+}
+static bool bce_names_plain(Expr *e) { /* every name in e a plain local: code called cannot change it */
+    if (!e) return true;
+    if (e->kind == E_IDENT) return bce_plain_local(e->cname);
+    if (e->kind == E_BINARY) return bce_names_plain(e->lhs) && bce_names_plain(e->rhs);
+    return true;
+}
+/* an invariant (bce_inv) as plain C: its names and numbers, + and - without the overflow check */
+static char *bce_raw(Expr *e) {
+    bool ar = false;
+    if (e->kind == E_BINARY) {
+        char *l = bce_raw(e->lhs), *r = bce_raw(e->rhs);
+        return xs_sprintf("((%s) %s (%s))", l, e->op == TK_PLUS ? "+" : "-", r);
+    }
+    return emit_expr_to_str(e, &ar);
+}
+/* a base the guard can test: an array name, or a row X[R] of an array of arrays (X a name or itself such a row:
+   A[r][q] of a number[][][]), R invariant; its depth (0 for a name) */
+static int bce_depth(Expr *b) { return b->kind == E_IDENT ? 0 : 1 + bce_depth(b->lhs); }
+static bool bce_base(Expr *b, Stmt *body, const char *i) {
+    if (!b || !bce_indexable(b->type)) return false;
+    if (b->kind == E_IDENT) return b->cname && strcmp(b->cname, i) != 0;
+    if (b->kind != E_INDEX || b->builtin.cfn || !b->lhs || !b->lhs->type || b->lhs->type->kind != TY_ARRAY || !bce_inv(b->rhs, body, i)) return false;
+    return bce_depth(b) <= 3 && bce_base(b->lhs, body, i);
+}
+static const char *bce_root(Expr *b) { return b->kind == E_IDENT ? b->cname : bce_root(b->lhs); } /* the array name under a row */
+static bool bce_same_base(Expr *a, Expr *b) {
+    if (a->kind == E_IDENT || b->kind == E_IDENT) return a->kind == b->kind && strcmp(a->cname, b->cname) == 0;
+    return a->kind == E_INDEX && b->kind == E_INDEX && bce_same_base(a->lhs, b->lhs) && bce_same(a->rhs, b->rhs);
+}
+/* a store that could replace a row or change a length (an array into an array's slot, `.length =`, a
+   destructuring) */
+static bool bce_row_store_e(Expr *e) {
+    if (!e) return false;
+    if (e->kind == E_ASSIGN && e->lhs) {
+        Expr *l = e->lhs;
+        if (l->kind == E_INDEX && l->type && (l->type->kind == TY_ARRAY || bce_indexable(l->type))) return true;
+        if (l->kind == E_MEMBER && l->str && strcmp(l->str, "length") == 0) return true;
+        if (l->kind != E_IDENT && l->kind != E_INDEX && l->kind != E_MEMBER) return true;
+    }
+    if (bce_row_store_e(e->lhs) || bce_row_store_e(e->rhs)) return true;
+    for (int k = 0; k < e->args.len; k++) if (bce_row_store_e(e->args.items[k])) return true;
+    return false;
+}
+static bool bce_row_store(Stmt *s) {
+    if (!s) return false;
+    if (bce_row_store_e(s->init) || bce_row_store_e(s->expr) || bce_row_store_e(s->cond) || bce_row_store_e(s->for_update)) return true;
+    if (bce_row_store(s->for_init) || bce_row_store(s->body) || bce_row_store(s->else_body)) return true;
+    for (int k = 0; k < s->stmts.len; k++) if (bce_row_store(s->stmts.items[k])) return true;
+    for (int k = 0; k < s->ncases; k++) if (bce_row_store_e(s->cases[k].value) || bce_row_store(s->cases[k].body)) return true;
+    return false;
+}
+/* the base as C (a row: its array, read without a check: the guard tested R first) and its length */
+static char *bce_base_c(Expr *b) {
+    if (b->kind == E_IDENT) return (char *)ren(b->cname);
+    Type *t = b->type;
+    const char *st = t->kind == TY_ARRAY ? arr_struct(t) : t->cls->cname;
+    return xs_sprintf("((%s *)(%s)->data[%s])", st, bce_base_c(b->lhs), bce_raw(b->rhs));
+}
+/* (a row may be a hole, NULL: its length 0, so a guard that would read it fails, or holds only for a loop that does
+   not run) */
+static char *bce_len_of(Expr *b) {
+    char *c = bce_base_c(b);
+    const char *f = bce_bytes(b->type) ? "f_length" : "len";
+    if (b->kind == E_IDENT) return xs_sprintf("(int64_t)(%s)->%s", c, f);
+    return xs_sprintf("(%s ? (int64_t)%s->%s : 0)", c, c, f);
+}
+/* the indexes a versioned loop proves: on a base, the counter (kind 0), i + E, E + i, i - E, E - i (kind 1; sign
+   as BceAff), or an invariant (kind 2) */
+typedef struct { Expr *e, *base, *idx, *E; int kind, sign; bool ok; } BceCand;
+static BceCand bce_cand[32];
+static int nbce_cand;
+static void bce_cands_e(Expr *e, Stmt *body, const char *i) {
+    if (!e) return;
+    if (e->kind == E_INDEX && e->rhs && nbce_cand < 32 && bce_base(e->lhs, body, i)) {
+        Expr *x = e->rhs;
+        BceCand c = {e, e->lhs, x, NULL, -1, 0, false};
+        bool li = false, ri = false;
+        if (x->kind == E_IDENT && x->cname && strcmp(x->cname, i) == 0) c.kind = 0;
+        else if (x->kind == E_BINARY && (x->op == TK_PLUS || x->op == TK_MINUS) && x->type && x->type->kind == TY_INT &&
+                 ((void)(li = x->lhs && x->lhs->kind == E_IDENT && x->lhs->cname && strcmp(x->lhs->cname, i) == 0),
+                  (void)(ri = x->rhs && x->rhs->kind == E_IDENT && x->rhs->cname && strcmp(x->rhs->cname, i) == 0), li || ri)) {
+            if (li && !ri && bce_inv_atom(x->rhs, body, i)) { c.kind = 1; c.E = x->rhs; c.sign = x->op == TK_MINUS ? 2 : 1; } /* i + E, i - E */
+            else if (ri && !li && bce_inv_atom(x->lhs, body, i)) { c.kind = 1; c.E = x->lhs; c.sign = x->op == TK_PLUS ? 1 : -1; } /* E + i, E - i */
+        } else if (bce_inv(x, body, i)) c.kind = 2;
+        bool dup = false;
+        for (int k = 0; k < nbce_cand && !dup; k++)
+            dup = bce_cand[k].kind == c.kind && bce_same_base(bce_cand[k].base, c.base) && (c.kind == 0 || bce_same(bce_cand[k].idx, c.idx));
+        if (c.kind >= 0 && !dup) bce_cand[nbce_cand++] = c;
+    }
+    bce_cands_e(e->lhs, body, i);
+    bce_cands_e(e->rhs, body, i);
+    for (int k = 0; k < e->args.len; k++) bce_cands_e(e->args.items[k], body, i);
+}
+static void bce_cands(Stmt *s, Stmt *body, const char *i) {
+    if (!s) return;
+    bce_cands_e(s->init, body, i); bce_cands_e(s->expr, body, i); bce_cands_e(s->cond, body, i); bce_cands_e(s->for_update, body, i);
+    bce_cands(s->for_init, body, i); bce_cands(s->body, body, i); bce_cands(s->else_body, body, i);
+    for (int k = 0; k < s->stmts.len; k++) bce_cands(s->stmts.items[k], body, i);
+    for (int k = 0; k < s->ncases; k++) { bce_cands_e(s->cases[k].value, body, i); bce_cands(s->cases[k].body, body, i); }
+}
+static bool bce_safe(Expr *e);
+/* the guard of a versioned loop (NULL when the loop is not one); the indexes it proves in bce_cand (ok) */
+static char *bce_version_guard(Stmt *s) {
     Expr *u = s->for_update, *c = s->cond;
-    if (nbce + 8 > 16 - 4 || bce_versions >= 2 || xs_debug || sm_mode || ictx || getenv("XISTO_NO_BCE")) return NULL;
+    nbce_cand = 0;
+    if (nbce + 32 > 64 || bce_versions >= (bce_slow ? 2 : 4) || xs_debug || sm_mode || ictx || getenv("XISTO_NO_BCE")) return NULL;
     if (!u || !u->builtin.cfn || strcmp(u->builtin.cfn, "counted_inc") != 0 || !u->lhs || !u->lhs->cname) return NULL;
     if (!c || c->kind != E_BINARY || (c->op != TK_LT && c->op != TK_LE) || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, u->lhs->cname) != 0) return NULL;
     bool le = c->op == TK_LE; /* i <= LIM: the last i is LIM */
     Expr *lim = c->rhs;
-    if (!lim || !lim->type || lim->type->kind != TY_INT) return NULL;
-    if (lim->kind == E_IDENT) { if (!lim->cname || bce_writes(s->body, lim->cname)) return NULL; }
-    else if (lim->kind != E_NUMBER) return NULL;
     const char *i = u->lhs->cname;
+    if (!lim || !lim->type || lim->type->kind != TY_INT || !bce_inv(lim, s->body, i)) return NULL;
+    if (getenv("XISTO_NO_BCE_ROWS") && lim->kind == E_BINARY) return NULL;
     /* the first value: a pure expression of names and numbers (checked >= 0 by the guard), from the declaration */
     Stmt *fi = s->for_init;
     if (!fi || fi->kind != S_VAR || !fi->cname || strcmp(fi->cname, i) != 0 || !fi->init || !bce_pure(fi->init)) return NULL;
-    const char *cand[8];
-    Type *ct[8];
-    int nc = 0;
-    bce_arrays(s->body, i, cand, ct, &nc);
-    bool plain = lim->kind == E_NUMBER || bce_plain_local(lim->cname);
-    Rng ir = rng_of(u->lhs); /* the counter's range: a[i] on an array of a known length within it needs no version (bce_safe) */
-    for (int k = 0; k < nc; k++) {
-        int64_t fixed = bce_fixed_n(cand[k]);
-        if (fixed > 0 && ir.ok && ir.lo >= 0 && ir.hi < fixed) continue;
-        if (bce_declares(s->body, cand[k])) continue;
-        if (bce_ok(s->body, cand[k], ct[k], plain) && strcmp(cand[k], i) != 0) { bce_arr_t[*na] = ct[k]; arrs[(*na)++] = cand[k]; }
-    }
-    nbce_aff = 0;
-    bce_cur_body = s->body;
-    bce_affine(s->body, i);
-    int keep = 0;
-    for (int k = 0; k < nbce_aff; k++) {
-        Expr *E = bce_aff[k].E;
-        if (bce_declares(s->body, bce_aff[k].a) || (E->kind == E_IDENT && bce_declares(s->body, E->cname))) continue;
-        if (bce_ok(s->body, bce_aff[k].a, bce_aff[k].t, plain && (E->kind == E_NUMBER || bce_plain_local(E->cname)))) bce_aff[keep++] = bce_aff[k];
-    }
-    nbce_aff = keep;
-    if (!*na && !nbce_aff) return NULL;
+    bool plain = bce_names_plain(lim);
+    bce_cands(s->body, s->body, i);
+    bool rows = !getenv("XISTO_NO_BCE_ROWS"), moving = false;
+    for (int pass = 0; pass < 4; pass++) /* the array names first: a row needs its X[R] proved */
+        for (int k = 0; k < nbce_cand; k++) {
+            BceCand *cd = &bce_cand[k];
+            bool row = cd->base->kind == E_INDEX;
+            if (bce_depth(cd->base) != pass) continue;
+            if ((row || cd->kind == 2) && !rows) continue;
+            if (bce_safe(cd->e)) continue; /* already proved (an outer loop's guard, a table of a known length) */
+            const char *a = bce_root(cd->base);
+            if (bce_declares(s->body, a)) continue;
+            bool pl = plain && bce_names_plain(cd->idx) && (!row || bce_names_plain(cd->base->rhs));
+            if (!row) { if (!bce_ok(s->body, a, cd->base->type, pl)) continue; }
+            else {
+                Expr *root = cd->base;
+                while (root->kind == E_INDEX) root = root->lhs;
+                if (!bce_ok(s->body, a, root->type, false) || bce_row_store(s->body)) continue;
+                bool proved = bce_safe(cd->base); /* the row itself: an outer guard, or this one (kind 2 one level up) */
+                for (int j = 0; j < nbce_cand && !proved; j++)
+                    proved = bce_cand[j].ok && bce_cand[j].kind == 2 && bce_same_base(bce_cand[j].base, cd->base->lhs) &&
+                             bce_same(bce_cand[j].idx, cd->base->rhs);
+                if (!proved) continue;
+            }
+            cd->ok = true;
+            if (cd->kind != 2) moving = true;
+        }
+    if (!moving) return NULL; /* (only invariant indexes: nothing the loop moves, no version) */
     bool ar = false, ar2 = false;
     char *l = emit_expr_to_str(lim, &ar);
     char *st = emit_expr_to_str(fi->init, &ar2);
@@ -6185,33 +6303,45 @@ static char *bce_version_guard(Stmt *s, const char **arrs, int *na) {
     /* i runs over [st, last]: last = LIM - 1 (i < LIM) or LIM (i <= LIM); the loop runs only when st <= last */
     char *last = le ? xs_sprintf("(%s)", l) : xs_sprintf("((%s) - 1)", l);
     buf_printf(&g, "(%s) >= 0", st);
-    for (int k = 0; k < *na; k++) buf_printf(&g, " && %s < %s", last, bce_len_c(arrs[k], bce_arr_t[k]));
-    for (int k = 0; k < nbce_aff; k++) {
-        bool dup = false; /* a[p0 - i] read and written: the same clause once */
-        for (int j = 0; j < k && !dup; j++) dup = strcmp(bce_aff[j].a, bce_aff[k].a) == 0 && bce_aff[j].sign == bce_aff[k].sign && bce_same(bce_aff[j].E, bce_aff[k].E);
-        if (dup) continue;
-        bool ar3 = false;
-        char *E = emit_expr_to_str(bce_aff[k].E, &ar3);
-        const char *A = bce_len_c(bce_aff[k].a, bce_aff[k].t);
-        if (bce_aff[k].sign == 1) buf_printf(&g, " && (%s) + (%s) >= 0 && %s + (%s) < %s", st, E, last, E, A);        /* i + E */
-        else if (bce_aff[k].sign == 2) buf_printf(&g, " && (%s) - (%s) >= 0 && %s - (%s) < %s", st, E, last, E, A); /* i - E */
-        else buf_printf(&g, " && (%s) - %s >= 0 && (%s) - (%s) < %s", E, last, E, st, A);                         /* E - i */
-    }
+    for (int pass = 0; pass < 4; pass++)
+        for (int k = 0; k < nbce_cand; k++) {
+            BceCand *cd = &bce_cand[k];
+            if (!cd->ok || bce_depth(cd->base) != pass) continue;
+            char *A = bce_len_of(cd->base);
+            if (cd->kind == 0) { buf_printf(&g, " && %s < %s", last, A); continue; }
+            if (cd->kind == 2) { char *x = bce_raw(cd->idx); buf_printf(&g, " && %s >= 0 && %s < %s", x, x, A); continue; }
+            bool ar3 = false;
+            char *E = emit_expr_to_str(cd->E, &ar3);
+            if (cd->sign == 1) buf_printf(&g, " && (%s) + (%s) >= 0 && %s + (%s) < %s", st, E, last, E, A);        /* i + E */
+            else if (cd->sign == 2) buf_printf(&g, " && (%s) - (%s) >= 0 && %s - (%s) < %s", st, E, last, E, A); /* i - E */
+            else buf_printf(&g, " && (%s) - %s >= 0 && (%s) - (%s) < %s", E, last, E, st, A);                     /* E - i */
+        }
     return g.data;
+}
+/* the base of an index matches a proved one (a name, or the same row) */
+static bool bce_same_bx(Expr *a, Expr *b) { /* bce_same_base on any expression */
+    if (!a || !b || a->kind != b->kind) return false;
+    if (a->kind == E_IDENT) return a->cname && b->cname && strcmp(a->cname, b->cname) == 0;
+    return a->kind == E_INDEX && !a->builtin.cfn && !b->builtin.cfn && bce_same_bx(a->lhs, b->lhs) && bce_same(a->rhs, b->rhs);
+}
+static bool bce_base_match(Expr *b, BceLoop *l) {
+    if (!l->row) return b->kind == E_IDENT && b->cname && strcmp(b->cname, l->a) == 0;
+    return bce_same_bx(b, l->row);
 }
 /* a[i] that needs no check: the index and the array of an enclosing safe counted loop, i >= 0 */
 static bool bce_safe(Expr *e) {
-    if (!e || e->kind != E_INDEX || !e->lhs || e->lhs->kind != E_IDENT || !e->rhs || ictx) return false;
-    if (e->lhs->cname && bce_indexable(e->lhs->type)) { /* an array of a known length, an index whose range is within it */
+    if (!e || e->kind != E_INDEX || !e->lhs || !e->rhs || ictx) return false;
+    if (e->lhs->kind == E_IDENT && e->lhs->cname && bce_indexable(e->lhs->type)) { /* an array of a known length, an index whose range is within it */
         int64_t n = bce_fixed_n(e->lhs->cname);
         Rng r = n > 0 ? rng_of(e->rhs) : rng_none();
         if (r.ok && r.lo >= 0 && r.hi < n) return true;
     }
-    for (int k = nbce - 1; k >= 0; k--) /* an affine index a versioned loop's guard proved within the array */
-        if (bce_loops[k].idx == e->rhs && strcmp(bce_loops[k].a, e->lhs->cname) == 0) return true;
+    if (e->lhs->kind != E_IDENT && e->lhs->kind != E_INDEX) return false;
+    for (int k = nbce - 1; k >= 0; k--) /* an index a versioned loop's guard proved within the array (i + E, an invariant) */
+        if (bce_loops[k].idx && bce_base_match(e->lhs, &bce_loops[k]) && bce_same(bce_loops[k].idx, e->rhs)) return true;
     if (e->rhs->kind != E_IDENT) return false;
     for (int k = nbce - 1; k >= 0; k--)
-        if (!bce_loops[k].idx && strcmp(bce_loops[k].i, e->rhs->cname) == 0 && strcmp(bce_loops[k].a, e->lhs->cname) == 0) {
+        if (!bce_loops[k].idx && strcmp(bce_loops[k].i, e->rhs->cname) == 0 && bce_base_match(e->lhs, &bce_loops[k])) {
             if (bce_loops[k].guarded) return true;
             Rng r = rng_of(e->rhs);
             return r.ok && r.lo >= 0;
@@ -6238,6 +6368,26 @@ static bool reuse_assign(Expr *e);
 static void emit_new_at_signature(Class *c);
 static char *emit_expr_to_str(Expr *e, bool *made_ar);
 static void drain_if_needed(void);
+/* `i < n - 1`: a limit of invariant names (plain locals neither the body nor the update writes, bce_inv) computed
+   once, after the initialization, where the condition first computes it: the same value at every test, and an
+   overflow fails at the same place (the first test) */
+static char *for_hoisted_cond(Stmt *s) {
+    static int nhl;
+    Expr *c = s->cond;
+    if (!c || c->kind != E_BINARY || (c->op != TK_LT && c->op != TK_LE && c->op != TK_GT && c->op != TK_GE) || xs_debug || sm_mode || ictx) return NULL;
+    Expr *l = c->lhs, *r = c->rhs;
+    if (!l || l->kind != E_IDENT || !l->cname || !l->type || l->type->kind != TY_INT) return NULL;
+    if (!r || r->kind != E_BINARY || !r->type || r->type->kind != TY_INT || !bce_inv(r, s->body, l->cname) || !bce_names_plain(r)) return NULL;
+    if ((r->lhs->kind == E_IDENT && bce_writes_e(s->for_update, r->lhs->cname)) || (r->rhs->kind == E_IDENT && bce_writes_e(s->for_update, r->rhs->cname))) return NULL;
+    if (getenv("XISTO_NO_LIM_HOIST")) return NULL;
+    bool ar = false;
+    char *lim = emit_expr_to_str(r, &ar), *lhs = emit_expr_to_str(l, &ar);
+    if (ar) return NULL;
+    int id = nhl++;
+    buf_printf(out, "const int64_t lim%d_ = %s;", id, lim);
+    nl();
+    return xs_sprintf("(%s %s lim%d_)", lhs, c->op == TK_LT ? "<" : c->op == TK_LE ? "<=" : c->op == TK_GT ? ">" : ">=", id);
+}
 static void emit_for_(Stmt *s) {
     buf_puts(out, "{");
     indent++;
@@ -6254,7 +6404,8 @@ static void emit_for_(Stmt *s) {
     nl();
     {
         bool cond_ar = false, upd_ar = false;
-        char *cond = s->cond ? emit_expr_to_str(s->cond, &cond_ar) : "";
+        char *cond = for_hoisted_cond(s);
+        if (!cond) cond = s->cond ? emit_expr_to_str(s->cond, &cond_ar) : "";
         char *upd = s->for_update ? emit_expr_to_str(s->for_update, &upd_ar) : "";
         if (!cond_ar && !upd_ar) {
             buf_printf(out, "for (; %s; %s) ", cond, upd);
@@ -7542,21 +7693,24 @@ static void emit_stmt_for_inner(Stmt *s) { /* a for: bounds checks proved by the
     int saved_nbce = nbce;
     bce_enter(s);
     if (nbce == saved_nbce) { /* not a[i] < a.length: maybe a loop to version (bce_version_guard) */
-        const char *arrs[8];
-        int na = 0;
-        char *g = bce_version_guard(s, arrs, &na);
+        char *g = bce_version_guard(s);
         if (g) {
             buf_printf(out, "if (%s) ", g);
-            for (int k = 0; k < na; k++) bce_loops[nbce++] = (BceLoop){s->for_update->lhs->cname, arrs[k], true, NULL};
-            int naff = nbce_aff;
-            BceAff aff[16];
-            memcpy(aff, bce_aff, sizeof aff);
-            for (int k = 0; k < naff && nbce < 16; k++) bce_loops[nbce++] = (BceLoop){s->for_update->lhs->cname, aff[k].a, true, aff[k].idx};
+            int nc = nbce_cand;
+            for (int k = 0; k < nc && nbce < 64; k++) {
+                BceCand *cd = &bce_cand[k];
+                if (!cd->ok) continue;
+                bool row = cd->base->kind == E_INDEX;
+                bce_loops[nbce++] = (BceLoop){s->for_update->lhs->cname, bce_root(cd->base), true,
+                                              cd->kind == 0 ? NULL : cd->idx, row ? cd->base : NULL};
+            }
             bce_versions++;
             emit_for_(s);
             nbce = saved_nbce;
             buf_puts(out, " else ");
+            bce_slow++;
             emit_for_(s);
+            bce_slow--;
             bce_versions--;
             return;
         }
@@ -7651,7 +7805,7 @@ static void emit_stmt_(Stmt *s) {
                 buf_printf(out, "if (%s) {", g);
                 indent++;
                 int saved = nbce;
-                for (int k = 0; k < wi_n && nbce < 16; k++) bce_loops[nbce++] = (BceLoop){wi_i, wi_a[k], true, NULL};
+                for (int k = 0; k < wi_n && nbce < 64; k++) bce_loops[nbce++] = (BceLoop){wi_i, wi_a[k], true, NULL, NULL};
                 bool rs = wi_e->rng_set; long long rl = wi_e->rng_lo, rh = wi_e->rng_hi;
                 if (wi_e->kind == E_BINARY) { wi_e->rng_set = true; wi_e->rng_lo = -RNG_SAFE; wi_e->rng_hi = RNG_LEN; } /* (the guard bounds it) */
                 wib_busy = true;
