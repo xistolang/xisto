@@ -79,8 +79,11 @@ Source: `bench/results/vm-2026-11-13/node-bun-arm-graviton2-2026-11-13-e5fb066.t
 
 ## Notes
 
-- **Not scored**: fasta on both VMs. The official Node fasta program gave a different output when its stdout is a
-  pipe (its writes are asynchronous and it used 1.4–1.7 GB); on the M4 it matched.
+- **Not scored**: fasta on both VMs. Written to a file, the official Node fasta program's output is identical to
+  xisto's. Written to a pipe, as the runner reads every program, it stops after about 1 MB (some 18,000 of 4.2
+  million lines) and exits with code 0 and no error; how much comes out varies from run to run, Node 24 does the
+  same, and it does not happen at a tenth of the size or under `strace`. On the M4 the pipe output matched. The
+  program writes one `console.log` per line; the cause inside Node is still being looked into.
 - **CPU**: xisto uses less CPU than Node on every row; the largest gaps are k-nucleotide (Node's `Map` of strings
   against xisto's packed counts) and mandelbrot (scalar doubles against SIMD vectors).
 - **Memory**: Node starts at ~45–60 MB before any work; binary-trees, k-nucleotide, reverse-complement and

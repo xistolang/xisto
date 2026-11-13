@@ -5,7 +5,7 @@ sidebar_position: 1
 
 # Xisto vs Rust
 
-13 Nov 2026, main `e897e76`, on the two AWS VMs. Rust is the language the Benchmarks Game's fastest programs are
+13 Nov 2026, main `4a2f388`, on the two AWS VMs. Rust is the language the Benchmarks Game's fastest programs are
 usually written in, so this is the comparison that says whether xisto's generated C keeps up with a systems
 language.
 
@@ -24,50 +24,50 @@ language.
 - **Excluded xisto variant**: `spectralnorm-8` takes `1/d` from a float32 division refined to the same double. It is
   measured (0.422 s on the Xeon, 0.874 s on the Graviton2) but not scored: the problem asks for the double
   division, and the scoreboard keeps the problem as stated.
-- **Steal** during the round: +214 on the Xeon, +748 on the Graviton2.
+- **Steal** during the round: +229 on the Xeon, +638 on the Graviton2.
 
 ## Xeon E5-2686 v4 (AWS t2.medium, 2 vCPUs, AVX2)
 
-Source: `bench/results/vm-2026-11-13/rust-ubuntu-xeon-2026-11-13-e897e76.txt`.
+Source: `bench/results/vm-2026-11-13/rust-ubuntu-xeon-2026-11-13-4a2f388.txt`.
 
 | problem | xisto | Rust | xisto time | Rust time | xisto CPU | Rust CPU | xisto mem | Rust mem | result |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
-| fasta | fasta | fasta_7 | 1.086 s | 1.988 s | 0.30 s | 2.66 s | 2.4 MB | 2.8 MB | win |
-| regex-redux | regexredux-2 | regexredux_6 | 0.685 s | 1.098 s | 0.96 s | 1.24 s | 149.2 MB | 150.5 MB | win |
-| k-nucleotide | knucleotide-7 † | knucleotide_6 | 1.366 s | 2.101 s | 2.65 s | 3.78 s | 70.5 MB | 138.5 MB | win |
-| mandelbrot | mandelbrot-6 | mandelbrot_3 † | 1.337 s | 1.998 s | 2.52 s | 3.85 s | 7.4 MB | 12.1 MB | win |
-| pidigits | pidigits | pidigits_3 | 0.626 s | 0.837 s | 0.62 s | 0.84 s | 2.6 MB | 3.0 MB | win |
-| reverse-complement | revcomp-9 | revcomp | 0.847 s | 1.102 s | 0.26 s | 0.24 s | 10.9 MB | 123.4 MB | win |
-| fannkuch-redux | fannkuchredux-5 | fannkuchredux_6 | 6.703 s | 7.885 s | 13.11 s | 15.64 s | 2.3 MB | 2.4 MB | win |
-| binary-trees | binarytrees † | binarytrees_2 | 1.625 s | 1.892 s | 3.05 s | 3.57 s | 70.1 MB | 130.2 MB | win |
-| n-body | nbody | nbody_6 | 2.451 s | 2.716 s | 2.45 s | 2.71 s | 2.0 MB | 2.1 MB | win |
-| spectral-norm | spectralnorm | spectralnorm_7 | 0.459 s | 0.468 s | 0.89 s | 0.90 s | 2.1 MB | 2.3 MB | tie |
+| fasta | fasta | fasta_7 | 1.124 s | 1.989 s | 0.34 s | 2.66 s | 2.4 MB | 2.9 MB | win |
+| regex-redux | regexredux-2 | regexredux_6 | 0.691 s | 1.106 s | 0.96 s | 1.24 s | 149.1 MB | 150.5 MB | win |
+| k-nucleotide | knucleotide-7 † | knucleotide_6 | 1.358 s | 2.106 s | 2.66 s | 3.82 s | 68.7 MB | 138.6 MB | win |
+| mandelbrot | mandelbrot-6 | mandelbrot_3 † | 1.339 s | 1.996 s | 2.53 s | 3.85 s | 7.3 MB | 12.1 MB | win |
+| pidigits | pidigits | pidigits_3 | 0.626 s | 0.839 s | 0.62 s | 0.84 s | 2.6 MB | 3.0 MB | win |
+| reverse-complement | revcomp-10 | revcomp | 0.836 s | 1.105 s | 0.24 s | 0.25 s | 10.9 MB | 123.4 MB | win |
+| fannkuch-redux | fannkuchredux-5 | fannkuchredux_6 | 6.621 s | 7.864 s | 13.08 s | 15.63 s | 2.3 MB | 2.2 MB | win |
+| binary-trees | binarytrees † | binarytrees_2 | 1.631 s | 1.897 s | 3.07 s | 3.57 s | 70.1 MB | 130.2 MB | win |
+| n-body | nbody | nbody_6 | 2.453 s | 2.703 s | 2.45 s | 2.70 s | 2.0 MB | 2.0 MB | win |
+| spectral-norm | spectralnorm | spectralnorm_7 | 0.460 s | 0.462 s | 0.89 s | 0.89 s | 2.2 MB | 2.4 MB | tie |
 
-9 wins, 1 tie, no losses; xisto's peak memory is below Rust's on every problem. † Chosen for memory (up to 2%
+9 wins, 1 tie, no losses. xisto's peak memory is at or below Rust's on every problem but fannkuch-redux, 2.3 MB
+against 2.2 MB in this round (2.3 against 2.3–2.4 MB in the other rounds of the day). † Chosen for memory (up to 2%
 slower with at least 10% less memory, or up to 5% slower with at least 25% less). `nbody_9` and `nbody_7` are
 excluded because they compute `1/√x` with the approximate `rsqrtps` instruction and give different doubles.
 
 ## Graviton2 (AWS t4g.small, 2 vCPUs, arm64)
 
-Source: `bench/results/vm-2026-11-13/rust-arm-graviton2-2026-11-13-e897e76.txt`.
+Source: `bench/results/vm-2026-11-13/rust-arm-graviton2-2026-11-13-4a2f388.txt`.
 
 | problem | xisto | Rust | xisto time | Rust time | xisto CPU | Rust CPU | xisto mem | Rust mem | result |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
-| fasta | fasta | fasta_2 | 0.540 s | 1.810 s | 0.38 s | 3.03 s | 1.9 MB | 2.4 MB | win |
-| reverse-complement | revcomp-6 † | revcomp | 0.279 s | 0.561 s | 0.24 s | 0.37 s | 188.2 MB | 123.2 MB | win |
-| fannkuch-redux | fannkuchredux-5 | fannkuchredux_4 | 8.577 s | 14.286 s | 17.13 s | 27.93 s | 1.8 MB | 1.8 MB | win |
-| regex-redux | regexredux-2 | regexredux_6 | 0.809 s | 1.289 s | 1.29 s | 1.58 s | 148.6 MB | 149.6 MB | win |
-| k-nucleotide | knucleotide-7 | knucleotide_6 | 2.899 s | 4.127 s | 5.74 s | 7.64 s | 65.3 MB | 138.2 MB | win |
-| binary-trees | binarytrees-3 | binarytrees_2 | 1.840 s | 2.120 s | 3.62 s | 4.07 s | 113.8 MB | 130.0 MB | win |
-| pidigits | pidigits | pidigits_3 | 2.039 s | 2.216 s | 2.04 s | 2.21 s | 2.1 MB | 2.9 MB | win |
-| n-body | nbody | nbody_2 | 4.611 s | 4.989 s | 4.61 s | 4.99 s | 1.6 MB | 1.6 MB | win |
-| mandelbrot | mandelbrot-8 | mandelbrot_4 | 2.627 s | 2.796 s | 5.21 s | 5.49 s | 6.8 MB | 32.5 MB | win |
-| spectral-norm | spectralnorm-7 | spectralnorm_5 | 1.216 s | 1.228 s | 2.43 s | 2.45 s | 1.8 MB | 2.1 MB | tie |
+| fasta | fasta | fasta_2 | 0.546 s | 1.839 s | 0.38 s | 3.06 s | 1.8 MB | 2.5 MB | win |
+| reverse-complement | revcomp-10 | revcomp | 0.282 s | 0.564 s | 0.28 s | 0.36 s | 10.1 MB | 123.2 MB | win |
+| fannkuch-redux | fannkuchredux-5 | fannkuchredux_4 | 8.586 s | 14.326 s | 17.14 s | 27.91 s | 1.8 MB | 1.9 MB | win |
+| regex-redux | regexredux-2 | regexredux_6 | 0.798 s | 1.291 s | 1.25 s | 1.58 s | 148.6 MB | 149.7 MB | win |
+| k-nucleotide | knucleotide-7 | knucleotide_6 | 2.986 s | 4.319 s | 5.89 s | 7.98 s | 64.6 MB | 138.3 MB | win |
+| binary-trees | binarytrees-3 | binarytrees_2 | 1.826 s | 2.190 s | 3.57 s | 4.20 s | 113.8 MB | 130.0 MB | win |
+| pidigits | pidigits | pidigits_3 | 2.042 s | 2.217 s | 2.04 s | 2.21 s | 2.1 MB | 2.8 MB | win |
+| n-body | nbody | nbody_2 | 4.602 s | 4.985 s | 4.60 s | 4.98 s | 1.5 MB | 1.6 MB | win |
+| mandelbrot | mandelbrot-8 | mandelbrot_4 | 2.627 s | 2.792 s | 5.21 s | 5.49 s | 6.9 MB | 32.4 MB | win |
+| spectral-norm | spectralnorm-7 | spectralnorm_5 | 1.220 s | 1.230 s | 2.43 s | 2.45 s | 1.8 MB | 2.1 MB | tie |
 
-9 wins, 1 tie, no losses. Memory is at or below Rust's everywhere except reverse-complement: there the scoreboard
-picks `revcomp-6` (188 MB), because `revcomp-9` (10 MB) came 6.5% behind the fastest xisto variant in this round,
-outside the memory rule's 5% (0.293 s; it was inside in the previous round, 2–9% behind depending on the run). Work
-on it is in progress.
+9 wins, 1 tie, no losses; xisto's peak memory is below Rust's on every problem. Reverse-complement is
+`revcomp-10`, the fastest xisto variant here with 10 MB: it reads each sequence backwards one block at a time and
+moves the newlines to their output places before the reverse, so each line is one run.
 
 ## The ties
 
@@ -96,7 +96,7 @@ Each name links to its source on GitHub; the original Node programs are in [`ben
 | mandelbrot | [`mandelbrot-6`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/mandelbrot-6.ts) (Xeon), [`mandelbrot-8`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/mandelbrot-8.ts) (Graviton2) | chunks of rows to a pool of workers; 16 (#6) or 8 and 12 (#8) pixels per call as SIMD vectors; rows written out as they finish |
 | fasta | [`fasta`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/fasta.ts) | the plain program with types; the random sequences from `xisto:random` |
 | k-nucleotide | [`knucleotide-7`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/knucleotide-7.ts) | the sequence at two bits per nucleotide, packed in parallel; small frames counted in arrays indexed by key, the big ones in partitions |
-| reverse-complement | [`revcomp-9`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/revcomp-9.ts) (or [`revcomp-6`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/revcomp-6.ts)) | each sequence read backwards from the file one block at a time, blocks made by workers into a shared ring, written in order (10 MB); #6 holds one sequence at a time (188 MB) |
+| reverse-complement | [`revcomp-10`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/revcomp-10.ts) | each sequence read backwards from the file one block at a time, blocks made by workers into a shared ring and written in order (10 MB); the newlines moved to their output places before the reverse, so each line is one run |
 | regex-redux | [`regexredux-2`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/regexredux-2.ts) | the nine counts in a worker while the main thread does the replacements; the 50 MB string shared with the worker, not copied |
 | pidigits | [`pidigits`](https://github.com/xistolang/xisto/blob/main/bench/benchmarksgame/pidigits.ts) | the plain program with types (`BigInt` on xisto's GMP-backed integers) |
 
@@ -112,11 +112,11 @@ using more memory than Rust on binary-trees, fasta, k-nucleotide and reverse-com
 - **New variants**: `mandelbrot-6`/`-7` (lane copies, output written as rows finish), `fannkuchredux-5` (two
   permutations' flips in one loop), `knucleotide-7` (2 bits per base), `revcomp-9` (each sequence read back to
   front, one block at a time), `regexredux-2` (counts in a worker), `spectralnorm-7` (an `Atomics` barrier),
-  `mandelbrot-8` (twelve pixels per run, with the lane planner above).
+  `mandelbrot-8` (twelve pixels per run, with the lane planner above), `revcomp-10` (one run per line).
 
 ## Result files
 
-- `bench/results/vm-2026-11-13/rust-ubuntu-xeon-2026-11-13-e897e76.txt`
-- `bench/results/vm-2026-11-13/rust-arm-graviton2-2026-11-13-e897e76.txt`
-- Earlier rounds of the same day (`*-937cb49`, `*-4a10af3`, `*-5296927`, `*-e5fb066`, `*-efd0fef`) show each step of
-  the work above.
+- `bench/results/vm-2026-11-13/rust-ubuntu-xeon-2026-11-13-4a2f388.txt`
+- `bench/results/vm-2026-11-13/rust-arm-graviton2-2026-11-13-4a2f388.txt`
+- Earlier rounds of the same day (`*-937cb49`, `*-4a10af3`, `*-5296927`, `*-e5fb066`, `*-efd0fef`, `*-e897e76`) show
+  each step of the work above.
