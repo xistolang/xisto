@@ -1,4 +1,4 @@
-// PolyBench/C 4.2.1, medley/nussinov (nussinov.c, nussinov.h), with types: the same loops in the same order, int as in C (DATA_TYPE_IS_INT; base, a char in C, is an int too).
+// PolyBench/C 4.2.1, medley/nussinov (nussinov.c, nussinov.h), with types: the same loops in the same order, int as in C (DATA_TYPE_IS_INT: each row of table an Int32Array, 32-bit ints as C's; base, a char in C, is an int).
 // Copyright (c) 2010-2016, Ohio State University. All rights reserved.
 // Derived from PolyBench/C under the Ohio State University Software Distribution License: the conditions and
 // the disclaimer are in bench/polybench/LICENSE-PolyBench.txt.
@@ -16,7 +16,7 @@ function max_score(s1: int, s2: int): int {
   return s1 >= s2 ? s1 : s2;
 }
 
-function init_array(n: int, seq: int[], table: int[][]): void {
+function init_array(n: int, seq: int[], table: Int32Array[]): void {
   // base is AGCT/0..3
   for (let i = 0; i < n; i++) {
     seq[i] = (i + 1) % 4;
@@ -26,7 +26,7 @@ function init_array(n: int, seq: int[], table: int[][]): void {
       table[i][j] = 0;
 }
 
-function print_array(n: int, table: int[][]): void {
+function print_array(n: int, table: Int32Array[]): void {
   let t = 0;
   dumpStart();
   dumpBegin("table");
@@ -43,7 +43,7 @@ function print_array(n: int, table: int[][]): void {
 
 // Original version by Dave Wonnacott at Haverford College <davew@cs.haverford.edu>, with help from Allison Lake,
 // Ting Zhou, and Tian Jin, based on algorithm by Nussinov, described in Allison Lake's senior thesis.
-function kernel_nussinov(n: int, seq: int[], table: int[][]): void {
+function kernel_nussinov(n: int, seq: int[], table: Int32Array[]): void {
   for (let i = n - 1; i >= 0; i--) {
     for (let j = i + 1; j < n; j++) {
       if (j - 1 >= 0)
@@ -68,7 +68,7 @@ function main(): void {
   const n = N[dataset()];
 
   const seq: int[] = new Array<int>(n).fill(0);
-  const table: int[][] = Array.from({ length: n }, () => new Array<int>(n).fill(0));
+  const table: Int32Array[] = Array.from({ length: n }, () => new Int32Array(n));
 
   init_array(n, seq, table);
 

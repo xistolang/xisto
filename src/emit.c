@@ -5390,6 +5390,7 @@ static Rng rng_of(Expr *e) {
         return rng_none();
     case E_INDEX:
         if (e->builtin.cfn && strcmp(e->builtin.cfn, "xs_u8_get") == 0) return (Rng){true, 0, 255};
+        if (is_i32_index(e) && !getenv("XISTO_NO_I32_RNG")) return (Rng){true, INT32_MIN, INT32_MAX}; /* an Int32Array element */
         if (!e->builtin.cfn && e->lhs && e->lhs->kind == E_IDENT && e->type->kind == TY_INT) { /* T[p]: the entries of a constant table */
             BceGArr *g = garr_find(e->lhs->cname);
             if (g && g->has_rng) return (Rng){true, g->lo, g->hi};
@@ -6086,9 +6087,8 @@ static bool bce_bytes(Type *t) { return t && t->kind == TY_OBJECT && t->cls && t
 /* a call the loop checks can ignore: a function of numbers that reads only its parameters and its own locals and
    computes with them (nussinov's max_score, match: `return s1 >= s2 ? s1 : s2`). It cannot reach an array, a
    length or a name of the caller; it can still fail (an int overflow), as the loop's own arithmetic can.
-   Opt-in (XISTO_BCE_LEAF=1): on the M4, nussinov's k loop without its checks ran 20-30% slower than with them (the
-   loop waits on table[i][j] through memory and on the column's misses; the checks were free), and no other
-   program measured has such calls in a hot loop. */
+   (With int[] rows, nussinov's k loop without its checks ran 20-30% slower on the M4; with Int32Array rows, as C's
+   int, 5.3 -> 2.1 s.) XISTO_NO_BCE_LEAF turns it off. */
 static bool bce_leaf_scalar(Type *t) { return t && (t->kind == TY_INT || t->kind == TY_NUMBER || t->kind == TY_LITINT || t->kind == TY_BOOLEAN); }
 static bool bce_declares(Stmt *s, const char *n);
 static bool bce_leaf_name(Func *f, Stmt *body, const char *c);
@@ -6127,7 +6127,7 @@ static bool bce_leaf_name(Func *f, Stmt *body, const char *c) { /* a parameter, 
 }
 static bool bce_leaf_pure(Func *f) {
     if (!f || !f->body || f->is_async || f->is_gen || f->cls || f->is_native || f->decos.len || f->deco_stub || !bce_leaf_scalar(f->ret) ||
-        !getenv("XISTO_BCE_LEAF")) return false;
+        getenv("XISTO_NO_BCE_LEAF")) return false;
     for (int k = 0; k < f->nparams; k++) if (!bce_leaf_scalar(f->params[k].type) || f->params[k].cell || f->params[k].rest || f->params[k].dflt) return false;
     int n = 0;
     return bce_leaf_s(f, f->body, &n);
@@ -6470,9 +6470,20 @@ static char *bce_version_guard(Stmt *s) {
     Expr *u = s->for_update, *c = s->cond;
     nbce_cand = 0;
     if (nbce + 32 > 64 || bce_versions >= (bce_slow ? 2 : 4) || xs_debug || sm_mode || ictx || getenv("XISTO_NO_BCE")) return NULL;
-    if (!u || !u->builtin.cfn || strcmp(u->builtin.cfn, "counted_inc") != 0 || !u->lhs || !u->lhs->cname) return NULL;
-    if (!c || c->kind != E_BINARY || (c->op != TK_LT && c->op != TK_LE) || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, u->lhs->cname) != 0) return NULL;
-    bool le = c->op == TK_LE; /* i <= LIM: the last i is LIM */
+    /* a loop that counts down (`for (let j = h - 1; j >= 0; j--)`, deriche's): i-- (or --i, i -= 1) the body never
+       writes, `i >= LIM` or `i > LIM`; i runs over [LIM (+ 1), start] */
+    bool dec = u && u->lhs && u->lhs->kind == E_IDENT && u->lhs->cname && u->type && u->type->kind == TY_INT && !u->builtin.cfn &&
+               (((u->kind == E_POSTFIX || u->kind == E_UNARY) && u->op == TK_MINUSMINUS) ||
+                (u->kind == E_ASSIGN && u->op == TK_MINUS_ASSIGN && u->rhs && u->rhs->kind == E_NUMBER && u->rhs->is_int_lit && u->rhs->ival == 1)) &&
+               !getenv("XISTO_NO_BCE_DOWN");
+    if (dec) {
+        if (!c || c->kind != E_BINARY || (c->op != TK_GE && c->op != TK_GT) || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname ||
+            strcmp(c->lhs->cname, u->lhs->cname) != 0 || stmt_writes_name(s->body, u->lhs->cname) || writes_name(c->rhs, u->lhs->cname)) return NULL;
+    } else {
+        if (!u || !u->builtin.cfn || strcmp(u->builtin.cfn, "counted_inc") != 0 || !u->lhs || !u->lhs->cname) return NULL;
+        if (!c || c->kind != E_BINARY || (c->op != TK_LT && c->op != TK_LE) || !c->lhs || c->lhs->kind != E_IDENT || !c->lhs->cname || strcmp(c->lhs->cname, u->lhs->cname) != 0) return NULL;
+    }
+    bool le = c->op == TK_LE || c->op == TK_GE; /* i <= LIM: the last i is LIM (i >= LIM counting down: the least) */
     Expr *lim = c->rhs;
     const char *i = u->lhs->cname;
     if (!lim || !lim->type || lim->type->kind != TY_INT || !bce_inv(lim, s->body, i)) return NULL;
@@ -6522,8 +6533,14 @@ static char *bce_version_guard(Stmt *s) {
     char *st = emit_expr_to_str(fi->init, &ar2);
     if (ar || ar2) return NULL;
     Buf g = {0};
-    /* i runs over [st, last]: last = LIM - 1 (i < LIM) or LIM (i <= LIM); the loop runs only when st <= last */
+    /* i runs over [st, last]: last = LIM - 1 (i < LIM) or LIM (i <= LIM); the loop runs only when st <= last. Counting
+       down, over [LIM (+ 1 for i > LIM), start]: st is then the least value and last the start (the guard reads only
+       the two ends) */
     char *last = le ? xs_sprintf("(%s)", l) : xs_sprintf("((%s) - 1)", l);
+    if (dec) {
+        last = xs_sprintf("(%s)", st);
+        st = le ? xs_sprintf("(%s)", l) : xs_sprintf("((%s) + 1)", l);
+    }
     bce_g_st = st;
     bce_g_last = last;
     buf_printf(&g, "(%s) >= 0", st);

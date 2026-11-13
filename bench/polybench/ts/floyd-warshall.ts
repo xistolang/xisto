@@ -1,5 +1,5 @@
 // PolyBench/C 4.2.1, medley/floyd-warshall (floyd-warshall.c, floyd-warshall.h), with types: the same loops in the
-// same order, int as in C (DATA_TYPE_IS_INT).
+// same order, int as in C (DATA_TYPE_IS_INT): each row an Int32Array, 32-bit ints as C's.
 // Copyright (c) 2010-2016, Ohio State University. All rights reserved.
 // Derived from PolyBench/C under the Ohio State University Software Distribution License: the conditions and
 // the disclaimer are in bench/polybench/LICENSE-PolyBench.txt.
@@ -8,7 +8,7 @@ import { dataset, dumpArrays, dumpBegin, dumpEnd, dumpFinish, dumpStart, dumpWri
 // MINI, SMALL, MEDIUM, LARGE, EXTRALARGE (floyd-warshall.h); LARGE unless the command line names another
 const N: int[] = [60, 180, 500, 2800, 5600];
 
-function init_array(n: int, path: int[][]): void {
+function init_array(n: int, path: Int32Array[]): void {
   for (let i = 0; i < n; i++)
     for (let j = 0; j < n; j++) {
       path[i][j] = i * j % 7 + 1;
@@ -17,7 +17,7 @@ function init_array(n: int, path: int[][]): void {
     }
 }
 
-function print_array(n: int, path: int[][]): void {
+function print_array(n: int, path: Int32Array[]): void {
   dumpStart();
   dumpBegin("path");
   for (let i = 0; i < n; i++)
@@ -29,7 +29,7 @@ function print_array(n: int, path: int[][]): void {
   dumpFinish();
 }
 
-function kernel_floyd_warshall(n: int, path: int[][]): void {
+function kernel_floyd_warshall(n: int, path: Int32Array[]): void {
   for (let k = 0; k < n; k++) {
     for (let i = 0; i < n; i++)
       for (let j = 0; j < n; j++)
@@ -41,7 +41,7 @@ function kernel_floyd_warshall(n: int, path: int[][]): void {
 function main(): void {
   const n = N[dataset()];
 
-  const path: int[][] = Array.from({ length: n }, () => new Array<int>(n).fill(0));
+  const path: Int32Array[] = Array.from({ length: n }, () => new Int32Array(n));
 
   init_array(n, path);
 
