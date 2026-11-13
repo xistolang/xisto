@@ -598,6 +598,7 @@ static bool f32_exact(Expr *e);
 static bool bce_safe(Expr *e); /* an index the loop already checks (see bce_enter) */
 static Expr *bce_promo_t; /* a slot kept in a C local while a loop is emitted (bce_promo_plan) */
 static int bce_promo_id;
+static bool bce_promo_w64; /* that local is the int64_t of a selection reduction on an Int32Array slot (bce_sel_plan) */
 static bool bce_same_bx(Expr *a, Expr *b);
 static bool bce_same(Expr *a, Expr *b);
 /* u8reg: byte arrays a loop keeps in vector registers (see u8reg_loop) */
@@ -1328,6 +1329,11 @@ static bool bce_fw_is(Expr *e, Expr *slot) { return e && slot && e->kind == E_IN
 static void emit_lvalue_ptr(Expr *e) {
     if (bce_fw_loop && e->kind == E_INDEX)
         for (int k = 0; k < nbce_fw; k++) if (bce_fw_is(e, bce_fw[k].r)) { buf_printf(out, "&fm%d_", bce_fw[k].id); return; }
+    if (bce_promo_t && e->kind == E_INDEX && bce_same_bx(e->lhs, bce_promo_t->lhs) && bce_same(e->rhs, bce_promo_t->rhs)) {
+        buf_printf(out, "&pr%d_", bce_promo_id); /* the slot in a register (bce_promo_plan, bce_sel_plan): before a column's
+                                                         table, which may reach it too */
+        return;
+    }
     if (e->kind == E_INDEX) { /* a column the guard proved, through the rows' data pointers (bce_rd_type) */
         int rd = bce_col_rd(e);
         if (rd >= 0) {
@@ -1338,10 +1344,6 @@ static void emit_lvalue_ptr(Expr *e) {
             buf_puts(out, "])");
             return;
         }
-    }
-    if (bce_promo_t && e->kind == E_INDEX && bce_same_bx(e->lhs, bce_promo_t->lhs) && bce_same(e->rhs, bce_promo_t->rhs)) {
-        buf_printf(out, "&pr%d_", bce_promo_id); /* the slot in a register (bce_promo_plan) */
-        return;
     }
     switch (e->kind) {
     case E_IDENT:
@@ -3532,6 +3534,12 @@ static void emit_expr_raw(Expr *e) {
                     buf_printf(out, " = fn%d_)", bce_fw[k].id);
                     return;
                 }
+        if (bce_promo_w64 && bce_promo_t && e->op == TK_ASSIGN && bce_fw_is(e->lhs, bce_promo_t)) { /* (bce_sel_plan: no ToInt32 on the way) */
+            buf_printf(out, "(pr%d_ = (int64_t)(", bce_promo_id);
+            emit_expr(e->rhs);
+            buf_puts(out, "))");
+            return;
+        }
         if (is_i32_index(e->lhs) && (e->op == TK_ASSIGN || e->op == TK_PLUS_ASSIGN || e->op == TK_MINUS_ASSIGN || e->op == TK_STAR_ASSIGN ||
                                      e->op == TK_SLASH_ASSIGN)) {
             /* i[k] = v, i[k] op= v on an Int32Array: the value computed (an int, or a number), stored through ToInt32; the
@@ -6497,7 +6505,10 @@ typedef struct { const char *x; Type *t; int id; const char *rdt; } BceRect; /* 
 /* the rows' data pointers (rd<id>_): built by the guard with the least length, once per nest, so a column X[k][c]
    reads rd[k][c], one load less than X->data[k]->data[c] (the address of the element as a 2D array of C or Rust
    gets it, from its row's start); 12-15% on B[r][s] += A[r][t] * A[s][t] at n = 2000 on the M4. Rows of number[],
-   int[], Float64Array, Float32Array, Int32Array. XISTO_NO_BCE_RD turns it off. */
+   int[], Float64Array, Float32Array, Int32Array. XISTO_NO_BCE_RD turns it off. Beside it, whether the rows' blocks
+   are apart (ad<id>_: 1 yes, -1 no, 0 not known yet; bce_rows_apart_c computes it the first time a guard asks) and
+   their span [ab<id>_, ae<id>_): with ad 1, rows of different indexes share no element, and an address outside the
+   span is in no row (bce_sel_plan). */
 static const char *bce_rd_type(Type *rt) {
     if (getenv("XISTO_NO_BCE_RD") || !rt) return NULL;
     if (rt->kind == TY_ARRAY && rt->elem) return rt->elem->kind == TY_NUMBER ? "double" : rt->elem->kind == TY_INT ? "int64_t" : NULL;
@@ -6550,7 +6561,8 @@ static int bce_rect_open(Stmt *s) {
         const char *rdt = bce_rd_type(u[k].t->elem);
         bce_rect[nbce_rect++] = (BceRect){u[k].x, u[k].t, id, rdt};
         buf_printf(out, "%sint64_t ml%d_ = -1; (void)ml%d_; ", opened ? "" : "{ ", id, id);
-        if (rdt) buf_printf(out, "%s **rd%d_ __attribute__((cleanup(xs_rd_free))) = NULL; (void)rd%d_; ", rdt, id, id);
+        if (rdt) buf_printf(out, "%s **rd%d_ __attribute__((cleanup(xs_rd_free))) = NULL; int ad%d_ = 0; char *ab%d_ = NULL, *ae%d_ = NULL; (void)rd%d_; (void)ad%d_; (void)ab%d_; (void)ae%d_; ",
+                            rdt, id, id, id, id, id, id, id, id);
         opened++;
     }
     return opened;
@@ -8379,6 +8391,158 @@ static char *bce_fw_plan(Stmt *s, const char *i) {
     if (!nbce_fw) return NULL;
     return g.data;
 }
+/* ---- a selection reduction on an Int32Array slot (nussinov: table[i][j] = max_score(table[i][j], table[i][k] + table[k + 1][j])) ----
+   In the copy of a versioned loop without checks, a body that is one `T = SEL(T, e)`, T an Int32Array element at an
+   invariant place and SEL one of its two operands chosen by comparing them (`a >= b ? a : b` written in place, a leaf
+   function whose body is that return, Math.max or Math.min of two ints: a max or a min), keeps T in a C int64_t for
+   the whole loop, without the ToInt32 of each store: the local starts at T and becomes SEL(local, e). That is the program's value as long as
+   no chosen e falls outside int32: the values a max (min) goes through are between the first T and the last one,
+   so when the last fits int32 (one test after the loop) every store the program made was exact and the last is the
+   value stored; otherwise the loop runs again as it was, from T, which nothing wrote. Without the ToInt32 between
+   steps the C compiler sees a max (min) reduction it can split across registers and vector lanes (an exact,
+   associative operation on integers). e cannot fail nor run user code: int names and numbers, + - * whose range
+   (rng_of) is bounded, comparisons, proved indexes of int slots, selections. T must be the only way to its element
+   among the slots e reads: the same row at another index (the counter, outside the loop's range; an invariant
+   that differs), a column X[k + E][c] with X's rows apart (ad 1, tested once per nest) and T's row of X outside the
+   rows the loop reaches, or T outside the span of X's rows, or another block with T's address outside it.
+   XISTO_NO_SEL turns it off. */
+static bool bce_rows_helper; /* xs_rows_apart_ placed among the program's helpers */
+/* the test that X's rows are apart, computed once per nest (ad<id>_), as C */
+static char *bce_rows_apart_c(int rd) {
+    BceRect *r = NULL;
+    for (int k = nbce_rect - 1; k >= 0 && !r; k--) if (bce_rect[k].id == rd) r = &bce_rect[k];
+    if (!r || !r->rdt) return NULL;
+    if (!bce_rows_helper) {
+        bce_rows_helper = true;
+        buf_puts(&json_fns, "static int xs_rows_cmp_(const void *a, const void *b) { const char *x = *(char *const *)a, *y = *(char *const *)b; return x < y ? -1 : x > y; }\n"
+                            "/* k blocks [pp[2i], pp[2i + 1]): 1 when no two share a byte, else -1; their span */\n"
+                            "static int xs_rows_apart_(char **pp, int64_t k, char **lo, char **hi) {\n"
+                            "    int64_t i = 1;\n"
+                            "    while (i < k && pp[2 * i] >= pp[2 * i - 1]) i++;\n"
+                            "    if (i < k) { qsort(pp, (size_t)k, 2 * sizeof(char *), xs_rows_cmp_); for (i = 1; i < k; i++) if (pp[2 * i] < pp[2 * i - 1]) return -1; }\n"
+                            "    *lo = k ? pp[0] : NULL; *hi = k ? pp[2 * k - 1] : NULL;\n"
+                            "    return 1;\n"
+                            "}\n");
+    }
+    Type *rt = r->t->elem;
+    const char *rs = rt->kind == TY_ARRAY ? arr_struct(rt) : rt->cls->cname, *X = ren(r->x);
+    return xs_sprintf("({ if (!ad%d_) { int64_t n_ = (int64_t)(%s)->len, k_ = 0; char **pp_ = malloc((size_t)(n_ ? n_ : 1) * 2 * sizeof(char *)); if (!pp_) xs_panic(\"out of memory\"); "
+                      "for (int64_t r_ = 0; r_ < n_; r_++) { %s *p_ = (%s *)(%s)->data[r_]; int64_t l_ = p_ ? (int64_t)p_->len : 0; "
+                      "if (l_ > 0) { pp_[2 * k_] = (char *)p_->data; pp_[2 * k_ + 1] = (char *)p_->data + l_ * (int64_t)sizeof(%s); k_++; } } "
+                      "ad%d_ = xs_rows_apart_(pp_, k_, &ab%d_, &ae%d_); free(pp_); } ad%d_ > 0; })",
+                      rd, X, rs, rs, X, r->rdt, rd, rd, rd, rd);
+}
+static bool sel_cmp(int op) { return op == TK_LT || op == TK_LE || op == TK_GT || op == TK_GE; }
+static bool sel_is_param(Expr *e, const char *p) { return e && e->kind == E_IDENT && e->cname && p && strcmp(e->cname, p) == 0; }
+/* f(a, b) { return a CMP b ? a : b } (either order in the test and in the arms): f's value is one of a and b */
+static bool sel_leaf_fn(Func *f) {
+    if (!f || f->nparams != 2 || !bce_leaf_pure(f) || !f->ret || f->ret->kind != TY_INT) return false;
+    if (!f->params[0].type || f->params[0].type->kind != TY_INT || !f->params[1].type || f->params[1].type->kind != TY_INT) return false;
+    Stmt *b = f->body;
+    while (b && b->kind == S_BLOCK && b->stmts.len == 1) b = b->stmts.items[0];
+    if (!b || b->kind != S_RETURN || !b->expr) return false;
+    Expr *c = b->expr;
+    if (c->kind != E_COND || c->builtin.cfn || c->args.len != 2 || !c->lhs || c->lhs->kind != E_BINARY || !sel_cmp(c->lhs->op)) return false;
+    const char *p0 = f->params[0].cname, *p1 = f->params[1].cname;
+    Expr *t0 = c->lhs->lhs, *t1 = c->lhs->rhs, *a0 = c->args.items[0], *a1 = c->args.items[1];
+    bool test = (sel_is_param(t0, p0) && sel_is_param(t1, p1)) || (sel_is_param(t0, p1) && sel_is_param(t1, p0));
+    bool arms = (sel_is_param(a0, p0) && sel_is_param(a1, p1)) || (sel_is_param(a0, p1) && sel_is_param(a1, p0));
+    return test && arms;
+}
+static bool sel_math(Expr *r) { /* Math.max(a, b) or Math.min(a, b) of two ints */
+    return r && r->kind == E_MEMBER && r->is_call && !r->func && r->lhs && r->lhs->kind == E_IDENT && !r->lhs->cname && r->lhs->str &&
+           strcmp(r->lhs->str, "Math") == 0 && r->str && (strcmp(r->str, "max") == 0 || strcmp(r->str, "min") == 0) && r->args.len == 2 &&
+           r->args.items[0]->type && r->args.items[0]->type->kind == TY_INT && r->args.items[1]->type && r->args.items[1]->type->kind == TY_INT;
+}
+static bool sel_eq(Expr *a, Expr *b) { /* the same pure expression (numbers, names, + - *, indexes) */
+    if (!a || !b || a->kind != b->kind) return false;
+    switch (a->kind) {
+    case E_NUMBER: return a->is_int_lit && b->is_int_lit && a->ival == b->ival;
+    case E_IDENT: return a->cname && b->cname && strcmp(a->cname, b->cname) == 0;
+    case E_BINARY: return a->op == b->op && sel_eq(a->lhs, b->lhs) && sel_eq(a->rhs, b->rhs);
+    case E_INDEX: return !a->builtin.cfn && !b->builtin.cfn && sel_eq(a->lhs, b->lhs) && sel_eq(a->rhs, b->rhs);
+    default: return false;
+    }
+}
+/* the operand of SEL(T, e) that is not T (NULL: r is not such a selection) */
+static Expr *sel_other(Expr *r, Expr *t) {
+    if (!r || !r->type || r->type->kind != TY_INT) return NULL;
+    Expr *a0, *a1;
+    if ((r->kind == E_CALL && r->func && r->args.len == 2 && sel_leaf_fn(r->func)) || sel_math(r)) { a0 = r->args.items[0]; a1 = r->args.items[1]; }
+    else if (r->kind == E_COND && !r->builtin.cfn && r->args.len == 2 && r->lhs && r->lhs->kind == E_BINARY && sel_cmp(r->lhs->op)) {
+        a0 = r->args.items[0]; a1 = r->args.items[1];
+        Expr *c0 = r->lhs->lhs, *c1 = r->lhs->rhs;
+        if (!((sel_eq(c0, a0) && sel_eq(c1, a1)) || (sel_eq(c0, a1) && sel_eq(c1, a0)))) return NULL;
+    } else return NULL;
+    Expr *x = bce_fw_is(a0, t) ? a1 : bce_fw_is(a1, t) ? a0 : NULL;
+    return x && x->type && x->type->kind == TY_INT ? x : NULL;
+}
+/* e cannot fail nor run user code and does not read T itself; the int slots it reads go into slots */
+static bool sel_e(Expr *e, Expr *t, Expr **slots, int *ns) {
+    if (!e || !e->type) return false;
+    switch (e->kind) {
+    case E_NUMBER: return e->is_int_lit;
+    case E_IDENT: return e->type->kind == TY_INT && e->cname;
+    case E_INDEX:
+        if (e->builtin.cfn || e->type->kind != TY_INT || bce_fw_is(e, t) || !bce_safe(e) || *ns == 16) return false;
+        slots[(*ns)++] = e;
+        return true; /* (its row and index: proved by the guard, read without a check) */
+    case E_UNARY: return e->op == TK_MINUS && e->type->kind == TY_INT && rng_of(e).ok && sel_e(e->lhs, t, slots, ns);
+    case E_BINARY:
+        if (e->type->kind == TY_INT && (e->op == TK_PLUS || e->op == TK_MINUS || e->op == TK_STAR))
+            return rng_of(e).ok && sel_e(e->lhs, t, slots, ns) && sel_e(e->rhs, t, slots, ns);
+        if (e->type->kind == TY_BOOLEAN && (sel_cmp(e->op) || e->op == TK_EQ || e->op == TK_NEQ) && e->lhs && e->lhs->type && e->lhs->type->kind == TY_INT)
+            return sel_e(e->lhs, t, slots, ns) && sel_e(e->rhs, t, slots, ns);
+        return false;
+    case E_COND:
+        if (e->builtin.cfn || e->args.len != 2 || !e->lhs || !e->lhs->type || e->lhs->type->kind != TY_BOOLEAN) return false;
+        return sel_e(e->lhs, t, slots, ns) && sel_e(e->args.items[0], t, slots, ns) && sel_e(e->args.items[1], t, slots, ns);
+    case E_CALL: case E_MEMBER:
+        if (!sel_math(e) && (e->kind != E_CALL || !e->func || e->args.len != 2 || !sel_leaf_fn(e->func))) return false;
+        return sel_e(e->args.items[0], t, slots, ns) && sel_e(e->args.items[1], t, slots, ns);
+    default: return false;
+    }
+}
+/* the tests that make T the only way to its element (NULL: not this form); sets bce_promo_t */
+static char *bce_sel_plan(Stmt *s, const char *i) {
+    if (getenv("XISTO_NO_SEL") || xs_debug || sm_mode || ictx) return NULL;
+    Stmt *b = s->body;
+    while (b && b->kind == S_BLOCK && b->stmts.len == 1) b = b->stmts.items[0];
+    if (!b || b->kind != S_EXPR || !b->expr || b->expr->kind != E_ASSIGN || b->expr->op != TK_ASSIGN) return NULL;
+    Expr *t = b->expr->lhs;
+    if (!is_i32_index(t) || !bce_safe(t) || !bce_inv(t->rhs, s->body, i) || !(t->lhs->kind == E_IDENT || bce_base(t->lhs, s->body, i))) return NULL;
+    Expr *x = sel_other(b->expr->rhs, t), *slots[16];
+    int ns = 0;
+    if (!x || !sel_e(x, t, slots, &ns)) return NULL;
+    char *c = bce_raw(t->rhs), *tb = bce_base_c(t->lhs);
+    char *ta = xs_sprintf("((char *)&%s->data[%s])", tb, c);
+    Buf g = {0};
+    buf_puts(&g, "1");
+    for (int k = 0; k < ns; k++) {
+        Expr *e = slots[k], *bb = e->lhs;
+        int rd = bce_col_rd(e);
+        if (rd >= 0) { /* a column X[k + E][c]: the rows in order and apart, T's row of X outside the rows reached, or T outside them all */
+            Expr *X = bb->lhs;
+            char *off = bce_col_off(bb->rhs, i);
+            char *ap = bce_rows_apart_c(rd);
+            if (!ap) return NULL;
+            if (t->lhs->kind == E_INDEX && t->lhs->lhs->kind == E_IDENT && t->lhs->lhs->cname && strcmp(t->lhs->lhs->cname, X->cname) == 0) {
+                char *R = bce_raw(t->lhs->rhs);
+                buf_printf(&g, " && %s && ((%s) < (%s) + %s || (%s) > %s + %s)", ap, R, bce_g_st, off, R, bce_g_last, off);
+            } else buf_printf(&g, " && %s && (%s < ab%d_ || %s >= ae%d_)", ap, ta, rd, ta, rd);
+        } else if (bce_same_bx(bb, t->lhs)) { /* T's own row at another index */
+            if (e->rhs->kind == E_IDENT && e->rhs->cname && strcmp(e->rhs->cname, i) == 0)
+                buf_printf(&g, " && ((%s) < (%s) || (%s) > %s)", c, bce_g_st, c, bce_g_last);
+            else if (bce_inv(e->rhs, s->body, i)) buf_printf(&g, " && (%s) != (%s)", bce_raw(e->rhs), c);
+            else return NULL;
+        } else if (bb->kind == E_IDENT || bce_base(bb, s->body, i)) { /* another block: T's address outside it */
+            char *B = bce_base_c(bb);
+            buf_printf(&g, " && (%s < (char *)%s->data || %s >= (char *)(%s->data + %s->len))", ta, B, ta, B, B);
+        } else return NULL;
+    }
+    bce_promo_t = t;
+    return g.data;
+}
 /* ---- unroll-and-jam of j (2mm, 3mm, doitgen, gramschmidt, the second half of lu: H3 in chat-arquiteto-cpu) ----
    for (let j = J0; j < JL; j++) {
      [T = e0; | T *= e0;]
@@ -9167,6 +9331,35 @@ static void emit_stmt_for_inner_(Stmt *s) { /* a for: bounds checks proved by th
                 emit_for_(s);
                 bce_fw_loop = NULL;
                 buf_puts(out, " else ");
+                emit_for_(s);
+                buf_puts(out, " }");
+                nbce = saved_nbce;
+                buf_puts(out, " else ");
+                bce_slow++;
+                emit_for_(s);
+                bce_slow--;
+                bce_versions--;
+                return;
+            }
+            char *sg = bce_promo_t ? NULL : bce_sel_plan(s, s->for_update->lhs->cname);
+            if (sg) { /* T in an int64_t, its last value stored when it fits int32, else the loop again */
+                Expr *t = bce_promo_t;
+                bce_promo_t = NULL;
+                Buf *so = out, sb = {0};
+                out = &sb;
+                emit_lvalue_ptr(t);
+                out = so;
+                int id = bce_promo_ids++;
+                buf_printf(out, "{ if (%s) { int32_t *sp%d_ = %s; int64_t pr%d_ = *sp%d_; ", sg, id, sb.data, id, id);
+                bce_promo_t = t;
+                bce_promo_id = id;
+                bce_promo_w64 = true;
+                emit_for_(s);
+                bce_promo_t = NULL;
+                bce_promo_w64 = false;
+                buf_printf(out, " if (pr%d_ == (int64_t)(int32_t)pr%d_) *sp%d_ = (int32_t)pr%d_; else ", id, id, id, id);
+                emit_for_(s);
+                buf_puts(out, " } else ");
                 emit_for_(s);
                 buf_puts(out, " }");
                 nbce = saved_nbce;
@@ -12302,6 +12495,7 @@ void emit_program(Program *p, Buf *o) {
     Buf *main_out = out;
     out = &body;
     json_fns.len = 0;
+    bce_rows_helper = false;
     if (json_fns.data) json_fns.data[0] = 0;
     json_protos.len = 0;
     if (json_protos.data) json_protos.data[0] = 0;
