@@ -97,3 +97,133 @@ const TR = grid(13, 13, (i, j) => 0);
 TR[2] = TA[4];
 gs(9, 13, TA, TR, grid(9, 13, (i, j) => 0));
 console.log("gs R row = A row", show(TA), show(TR));
+
+// the sum in a local (ludcmp): w = T; for k w -= f; T = w; w after the loop is the last j's
+function ludRest(n: int, A: number[][]): number {
+  let w: number = 0;
+  for (let i = 0; i < n; i++)
+  for (let j = i; j < n; j++) {
+    w = A[i][j];
+    for (let k = 0; k < i; k++) w -= A[i][k] * A[k][j];
+    A[i][j] = w;
+  }
+  return w;
+}
+const W = grid(12, 12, (i, j) => ((i * 7 + j * 5) % 13) / 9 + (i === j ? 3 : 0));
+console.log("ludcmp rest", ludRest(12, W).toFixed(9), show(W));
+
+// the k form (syrk): for k { for j <= i: C[i][j] += alpha * A[i][k] * A[j][k] }, U values of k into each C[i][j]
+function syrk(n: int, m: int, alpha: number, beta: number, C: number[][], A: number[][]): void {
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j <= i; j++) C[i][j] *= beta;
+    for (let k = 0; k < m; k++) for (let j = 0; j <= i; j++) C[i][j] += alpha * A[i][k] * A[j][k];
+  }
+}
+const SC = grid(7, 7, (i, j) => (i + j) / 10);
+syrk(7, 19, 1.5, 0.5, SC, grid(7, 19, (i, j) => ((i * 4 + j) % 9) / 8));
+console.log("syrk", show(SC));
+// a row of C is a row of A: the old loop
+const SA2 = grid(7, 19, (i, j) => ((i + j * 2) % 7) / 6);
+const SC2 = grid(7, 7, (i, j) => 1);
+SA2[3] = SC2[5];
+for (let r = 0; r < 7; r++) if (SA2[r].length < 19) for (let c = SA2[r].length; c < 19; c++) SA2[r].push(c / 19);
+syrk(7, 19, 0.5, 2, SC2, SA2);
+console.log("syrk shared row", show(SC2));
+
+// a statement on T after the sum (trmm): B[i][j] = alpha * B[i][j]
+function trmm(m: int, n: int, alpha: number, A: number[][], B: number[][]): void {
+  for (let i = 0; i < m; i++)
+  for (let j = 0; j < n; j++) {
+    for (let k = i + 1; k < m; k++) B[i][j] += A[k][i] * B[k][j];
+    B[i][j] = alpha * B[i][j];
+  }
+}
+const TB = grid(6, 17, (i, j) => ((i * 5 + j) % 7) / 3);
+trmm(6, 17, 1.25, grid(6, 6, (i, j) => ((i + j) % 4) / 2), TB);
+console.log("trmm", show(TB));
+const TB2 = grid(6, 17, (i, j) => ((i + 3 * j) % 5) / 4);
+TB2[4] = TB2[1];
+trmm(6, 17, 0.75, grid(6, 6, (i, j) => (i * j + 1) / 7), TB2);
+console.log("trmm shared rows", show(TB2));
+
+// T /= g after the sum, and the mirror Z[j][c] = T (covariance); the mean's loop: mean[j] /= n
+function cov(m: int, n: int, fn: number, data: number[][], C: number[][], mean: number[]): void {
+  for (let j = 0; j < m; j++) {
+    mean[j] = 0.0;
+    for (let i = 0; i < n; i++) mean[j] += data[i][j];
+    mean[j] /= fn;
+  }
+  for (let i = 0; i < m; i++)
+  for (let j = i; j < m; j++) {
+    C[i][j] = 0.0;
+    for (let k = 0; k < n; k++) C[i][j] += data[k][i] * data[k][j];
+    C[i][j] /= fn - 1.0;
+    C[j][i] = C[i][j];
+  }
+}
+const CD = grid(11, 14, (i, j) => ((i * 3 + j * 7) % 10) / 4);
+const CC = grid(14, 14, (i, j) => 0);
+const CM: number[] = new Array<number>(14).fill(0);
+cov(14, 11, 11, CD, CC, CM);
+console.log("cov", show(CC), CM.map((x) => x.toFixed(6)).join(","));
+// the data's rows are the matrix's: the old loop
+const CC2 = grid(14, 14, (i, j) => ((i + j) % 3) / 2);
+cov(14, 11, 11, CC2, CC2, new Array<number>(14).fill(0));
+console.log("cov shared", show(CC2));
+
+// column writes in the k loop and a sum in a local (symm): C[k][j] += ..., temp2 += ..., then C[i][j] = g(C[i][j], temp2)
+function symm(m: int, n: int, alpha: number, beta: number, C: number[][], A: number[][], B: number[][]): void {
+  let temp2: number;
+  for (let i = 0; i < m; i++)
+  for (let j = 0; j < n; j++) {
+    temp2 = 0;
+    for (let k = 0; k < i; k++) {
+      C[k][j] += alpha * B[i][j] * A[i][k];
+      temp2 += B[k][j] * A[i][k];
+    }
+    C[i][j] = beta * C[i][j] + alpha * B[i][j] * A[i][i] + alpha * temp2;
+  }
+}
+const YA = grid(7, 7, (i, j) => ((i * 2 + j) % 5) / 3);
+const YB = grid(7, 18, (i, j) => ((i + j * 3) % 7) / 5);
+const YC = grid(7, 18, (i, j) => ((i * j) % 4) / 2);
+symm(7, 18, 1.5, 1.2, YC, YA, YB);
+console.log("symm", show(YC));
+// B is C: the column read is the column written, in the same order per lane
+const YC2 = grid(7, 18, (i, j) => ((i + 2 * j) % 6) / 4);
+symm(7, 18, 0.5, 0.75, YC2, YA, YC2);
+console.log("symm B = C", show(YC2));
+
+// x[i] = x[i] + A[i][j] * y[j]: the lane's own row (mvt), and x[i] = x[i] + A[j][i] * y[j]: a column
+function mvt(n: int, x1: number[], x2: number[], y1: number[], y2: number[], A: number[][]): void {
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) x1[i] = x1[i] + A[i][j] * y1[j];
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) x2[i] = x2[i] + A[j][i] * y2[j];
+}
+const MA = grid(13, 13, (i, j) => ((i * 5 + j) % 9) / 7);
+const mx1: number[] = new Array<number>(13).fill(0.5);
+const mx2: number[] = new Array<number>(13).fill(0.25);
+const my: number[] = [];
+for (let j = 0; j < 13; j++) my.push((j % 4) / 3);
+mvt(13, mx1, mx2, my, my, MA);
+console.log("mvt", mx1.map((x) => x.toFixed(6)).join(","), mx2.map((x) => x.toFixed(6)).join(","));
+// x is a row of A: the old loop
+mvt(13, MA[2], MA[5], my, MA[2], MA);
+console.log("mvt shared", show(MA));
+
+// the init's form (lu, cholesky): for t { for r { for s { B[r][s] += A[r][t] * A[s][t] } } }, U values of t into each element
+function aatInit(n: int, A: number[][], B: number[][]): void {
+  for (let t = 0; t < n; ++t) for (let r = 0; r < n; ++r) for (let s = 0; s < n; ++s) B[r][s] += A[r][t] * A[s][t];
+}
+const IA = grid(13, 13, (i, j) => ((i * 7 + j * 3) % 11) / 6);
+const IB = grid(13, 13, (i, j) => 0);
+aatInit(13, IA, IB);
+console.log("aat init", show(IB));
+// two rows of B one array: the old loop (the order of each element's sums would change)
+const IB2 = grid(13, 13, (i, j) => 0);
+IB2[7] = IB2[2];
+aatInit(13, IA, IB2);
+console.log("aat shared row", show(IB2));
+// B is A: the old loop
+const IC = grid(13, 13, (i, j) => ((i + j) % 5) / 4);
+aatInit(13, IC, IC);
+console.log("aat B = A", show(IC));
