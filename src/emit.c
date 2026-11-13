@@ -17,6 +17,13 @@ static bool nohdr_ty(Type *t) {
 }
 /* a reference whose holder retains and releases it: every heap type but the header-less ones */
 static bool crc(Type *t) { return cref(t) && !nohdr_ty(t); }
+/* a field held as a 32-bit compressed reference (cptr_compute): a reference field of a cptr class */
+static bool cp_field(Class *c, int k) { return c && c->cptr && k >= 0 && k < c->nfields && nohdr_ty(c->fields[k].type); }
+static const char *cp_target(Class *c, int k) { /* the class a compressed field points to */
+    Type *t = c->fields[k].type;
+    if (t->kind == TY_NULLABLE) t = t->elem;
+    return t->cls->cname;
+}
 static bool rcnt(Type *t) {
     if (!cref(t)) return false;
     if (nohdr_ty(t)) return false;
@@ -2283,6 +2290,12 @@ static void emit_member(Expr *e) {
         buf_puts(out, ")");
         return;
     }
+    if (e->field >= 0 && cp_field(e->cls, e->field)) { /* a compressed reference: back to the pointer */
+        buf_printf(out, "XS_CP_DEC(%s, (", cp_target(e->cls, e->field));
+        emit_borrowed(base);
+        buf_printf(out, ")->%s)", e->cls->fields[e->field].cname);
+        return;
+    }
     if (e->field >= 0) {
         buf_puts(out, "(");
         emit_borrowed(base);
@@ -3416,6 +3429,15 @@ static void emit_expr_raw(Expr *e) {
         buf_puts(out, ")");
         return;
     case E_ASSIGN:
+        if (e->op == TK_ASSIGN && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->cls && cp_field(e->lhs->cls, e->lhs->field)) {
+            /* a compressed reference field (cptr_compute; only the constructor writes one): the pointer stored as 32 bits */
+            buf_printf(out, "({ %s *cv_ = ", cp_target(e->lhs->cls, e->lhs->field));
+            emit_expr(e->rhs);
+            buf_puts(out, "; (");
+            emit_borrowed(e->lhs->lhs);
+            buf_printf(out, ")->%s = XS_CP_ENC(cv_); cv_; })", e->lhs->cls->fields[e->lhs->field].cname);
+            return;
+        }
         if (e->lhs->kind == E_INDEX && !e->lhs->builtin.cfn && e->op == TK_ASSIGN && i64reg(e->lhs->lhs)) { /* an int[] in a register: a lane (the value is a byte, u8_int_proof) */
             U8Reg *rg = u8reg_find(e->lhs->lhs);
             bool nc = bce_safe(e->lhs);
@@ -6343,9 +6365,9 @@ static bool rg_inline_new(Expr *e) {
         if (ct->params[i].consumed) emit_owned(e->args.items[i]); else emit_borrowed(e->args.items[i]);
         buf_puts(out, "; ");
     }
-    if (c->nohdr) buf_printf(out, "%s *ro_ = xs_region_alloc_nh(&xs_rg_%d, sizeof(%s));", c->cname, c->rdual, c->cname);
+    if (c->nohdr) buf_printf(out, "%s *ro_ = xs_region_alloc_nh%s(&xs_rg_%d, sizeof(%s));", c->cname, c->cptr ? "_cp" : "", c->rdual, c->cname);
     else buf_printf(out, "%s *ro_ = xs_region_alloc_dual_nz(&xs_rg_%d, sizeof(%s), &%s_type);", c->cname, c->rdual, c->cname, c->cname);
-    for (int k = 0; k < c->nfields; k++) buf_printf(out, " ro_->%s = ra%d_;", c->fields[k].cname, src[k]);
+    for (int k = 0; k < c->nfields; k++) buf_printf(out, cp_field(c, k) ? " ro_->%s = XS_CP_ENC(ra%d_);" : " ro_->%s = ra%d_;", c->fields[k].cname, src[k]);
     buf_puts(out, " ro_; })");
     return true;
 }
@@ -6380,6 +6402,19 @@ static void emit_rg_clone(Func *f) {
 
 static void emit_stmt_(Stmt *s);
 static void emit_stmt(Stmt *s) {
+    if (s->once_rg && !ictx) { /* once_compute: the statement's objects of the region's classes, given back after it */
+        bool cp = false;
+        for (int i = 0; i < prog->nclasses; i++) if (prog->classes[i]->rdual == s->once_rg && prog->classes[i]->cptr) cp = true;
+        buf_printf(out, "xs_region_enter(&xs_rg_%d); xs_rg_on_%d = true;", s->once_rg, s->once_rg);
+        nl();
+        int saved = s->once_rg;
+        s->once_rg = 0;
+        emit_stmt(s);
+        s->once_rg = saved;
+        nl();
+        buf_printf(out, "xs_rg_on_%d = false; xs_region_give_back%s(&xs_rg_%d);", s->once_rg, cp ? "_cp" : "", s->once_rg);
+        return;
+    }
     if ((s->kind == S_FOR || s->kind == S_WHILE || s->kind == S_FOROF) && s->region) { /* region.c: the iterations' objects go in one step */
         buf_printf(out, "xs_region_enter(&xs_rg_%d);", s->region);
         nl();
@@ -9514,6 +9549,8 @@ static void emit_class(Class *c) {
 
     if (c->adapter_of) { /* an adapter (XB-126) prints as the object it holds: TypeScript has only that object */
         buf_printf(out, "static void %s_print(void *p) { xs_print_obj(((%s *)p)->%s); }\n", c->cname, c->cname, c->fields[0].cname);
+    } else if (c->cptr) { /* (header-less: never printed, nohdr_compute) */
+        buf_printf(out, "static void %s_print(void *p) { (void)p; }\n", c->cname);
     } else {
     /* Node-style printing: Name { a: 1, s: 'x' } */
     buf_printf(out, "static void %s_print(void *p) {", c->cname);
@@ -9597,8 +9634,9 @@ static void emit_class(Class *c) {
            so self is cleared (no field left to chance) and registered on the cleanup stack */
         bool cln_self = use_cln && !c->nohdr && !c->region && !c->rdual;
         const char *nz = ctor_sets_every_field(c) && !cln_self ? "_nz" : "";
-        if (c->nohdr && c->region) buf_printf(out, "%s *self = xs_region_alloc_nh(&xs_rg_%d, sizeof(%s));", c->cname, c->region, c->cname);
-        else if (c->nohdr) buf_printf(out, "%s *self = xs_rg_on_%d ? xs_region_alloc_nh(&xs_rg_%d, sizeof(%s)) : xs_nh_heap(sizeof(%s));", c->cname, c->rdual, c->rdual, c->cname, c->cname);
+        const char *cp = c->cptr ? "_cp" : ""; /* (cptr_compute: from memory below 32 GB) */
+        if (c->nohdr && c->region) buf_printf(out, "%s *self = xs_region_alloc_nh%s(&xs_rg_%d, sizeof(%s));", c->cname, cp, c->region, c->cname);
+        else if (c->nohdr) buf_printf(out, "%s *self = xs_rg_on_%d ? xs_region_alloc_nh%s(&xs_rg_%d, sizeof(%s)) : xs_nh_heap%s(sizeof(%s));", c->cname, c->rdual, cp, c->rdual, c->cname, cp, c->cname);
         else if (c->region) buf_printf(out, "%s *self = xs_region_alloc%s(&xs_rg_%d, sizeof(%s), &%s_type);", c->cname, nz, c->region, c->cname, c->cname);
         else if (c->rdual) /* region.c: in its loop's region while an iteration runs, on the heap otherwise */
             buf_printf(out, "%s *self = xs_rg_on_%d ? xs_region_alloc_dual%s(&xs_rg_%d, sizeof(%s), &%s_type) : xs_obj_alloc_t%s(sizeof(%s), &%s_type);",
@@ -10014,6 +10052,183 @@ static void nohdr_compute(Program *p) {
     }
 }
 
+/* ---- compressed references ----
+   A header-less class (nohdr_compute) holds references only to its own objects, and only its constructor writes
+   them; its objects come only from its region and the never-returned arena of xs_nh_heap. Those can come from
+   memory below 32 GB instead (xs_cp_alloc), 8-byte aligned, and then a reference fits in 32 bits: the address
+   shifted right by 3, 0 for null, decoded by a shift (XS_CP_DEC; no base to add). binary-trees' TreeNode is 8
+   bytes instead of 16: half the memory, and half the bytes written and walked. The emitted C chooses at compile
+   time (XS_CPREF in the runtime): a full pointer on Windows and under sanitizers, which own the low addresses.
+   The class qualifies when every class of its region is header-less too (the region's chunks all come from that
+   memory: one region, one source). XISTO_NO_CPTR=1 turns it off. */
+static void cptr_compute(Program *p) {
+    if (getenv("XISTO_NO_CPTR")) return;
+    for (int ci = 0; ci < p->nclasses; ci++) {
+        Class *c = p->classes[ci];
+        if (!c->used || c->builtin || !c->nohdr) continue;
+        int rg = c->region ? c->region : c->rdual;
+        bool ok = rg != 0;
+        for (int cj = 0; cj < p->nclasses && ok; cj++) {
+            Class *o = p->classes[cj];
+            if (o->used && !o->builtin && (o->region == rg || o->rdual == rg) && !o->nohdr) ok = false;
+        }
+        if (ok) c->cptr = true;
+    }
+}
+
+/* ---- statements whose objects die with them ----
+   `const check = itemCheck(bottomUpTree(stretchDepth));`: a statement outside loops, in code that runs a bounded
+   number of times (the top level, or a function only called from there: nh_cold), whose objects of a dual region's
+   header-less classes cannot outlive it. Those objects come from the region (on this thread: its flag is set for
+   the statement) instead of xs_nh_heap's arena, which never gives memory back, and the region's chunks are given
+   back to the system after the statement (binary-trees: the stretch tree, 64 MB, is gone before the long-lived
+   one is made). The proof, conservative: a header-less class's value only lives in variables, its own fields
+   (written by its constructor) and arguments and results of user functions (nohdr_compute); so it outlives the
+   statement only through the statement's own value or variable, or an assignment, in the statement or in a
+   function it reaches, to a variable that function did not declare. The reached functions have no closures,
+   await or yield, do not reach the statement's own code, and run no loop of that region (whose iterations would
+   rewind it); the program has no try (an exception that is caught would leave the region on). */
+static Class **oc_set; static int oc_n; /* the region's classes */
+static bool oc_mentions(Type *t) {
+    for (int i = 0; i < oc_n; i++) { nh_c = oc_set[i]; if (nh_mentions(t)) return true; }
+    return false;
+}
+static Func **oc_ext; static int oc_next, oc_cext;
+static bool oc_bad;
+static int oc_rg;
+static Func *oc_home;
+static bool oc_makes;
+static void oc_reach_stmt(Stmt *s, Func *f);
+static bool oc_declared(Func *f, const char *cname);
+static void oc_reach_expr(Expr *e, Func *f) {
+    if (!e || oc_bad) return;
+    switch (e->kind) {
+    case E_ARROW: case E_AWAIT: case E_FUNC_REF: oc_bad = true; return;
+    case E_NEW_OBJ:
+        for (int i = 0; i < oc_n; i++) if (e->cls == oc_set[i]) oc_makes = true;
+        if (e->cls && e->cls->ctor && e->cls->ctor->body) {
+            Func *g = e->cls->ctor;
+            bool seen = false;
+            for (int i = 0; i < oc_next; i++) if (oc_ext[i] == g) seen = true;
+            if (!seen) {
+                if (oc_next == oc_cext) { oc_cext = oc_cext ? oc_cext * 2 : 32; oc_ext = realloc(oc_ext, sizeof(Func *) * (size_t)oc_cext); }
+                oc_ext[oc_next++] = g;
+                oc_reach_stmt(g->body, g);
+            }
+        }
+        break;
+    case E_ASSIGN: /* a value of the region's classes into a variable the code does not own (a field of one of them: its own) */
+        if (e->type && oc_mentions(e->type)) {
+            bool own_field = false;
+            for (int i = 0; i < oc_n && e->lhs->kind == E_MEMBER && !e->lhs->is_call; i++) if (e->lhs->cls == oc_set[i]) own_field = true;
+            if (!own_field && (e->lhs->kind != E_IDENT || !e->lhs->cname || !oc_declared(f, e->lhs->cname))) oc_bad = true;
+        }
+        break;
+    case E_CALL: case E_MEMBER:
+        if (e->func && (e->kind == E_CALL || e->is_call)) {
+            Func *g = e->func;
+            if (e->kind == E_MEMBER && e->virt) { oc_bad = true; return; }
+            if (g == oc_home) { oc_bad = true; return; }
+            if (g->body && !g->is_native) {
+                bool seen = false;
+                for (int i = 0; i < oc_next; i++) if (oc_ext[i] == g) seen = true;
+                if (!seen) {
+                    if (g->is_async || g->is_gen) { oc_bad = true; return; }
+                    if (oc_next == oc_cext) { oc_cext = oc_cext ? oc_cext * 2 : 32; oc_ext = realloc(oc_ext, sizeof(Func *) * (size_t)oc_cext); }
+                    oc_ext[oc_next++] = g;
+                    oc_reach_stmt(g->body, g);
+                }
+            }
+        }
+        break;
+    default: break;
+    }
+    oc_reach_expr(e->lhs, f);
+    oc_reach_expr(e->rhs, f);
+    for (int i = 0; i < e->args.len; i++) oc_reach_expr(e->args.items[i], f);
+}
+static void oc_reach_stmt(Stmt *s, Func *f) {
+    if (!s || oc_bad) return;
+    if (s->kind == S_YIELD || s->kind == S_TRY) { oc_bad = true; return; }
+    if ((s->kind == S_FOR || s->kind == S_WHILE || s->kind == S_FOROF) && s->region == oc_rg) { oc_bad = true; return; }
+    oc_reach_expr(s->init, f);
+    oc_reach_expr(s->expr, f);
+    oc_reach_expr(s->cond, f);
+    oc_reach_expr(s->for_update, f);
+    oc_reach_stmt(s->for_init, f);
+    oc_reach_stmt(s->body, f);
+    oc_reach_stmt(s->else_body, f);
+    for (int i = 0; i < s->stmts.len; i++) oc_reach_stmt(s->stmts.items[i], f);
+    for (int i = 0; i < s->ncases; i++) { oc_reach_expr(s->cases[i].value, f); oc_reach_stmt(s->cases[i].body, f); }
+}
+static bool oc_decl_in(Stmt *s, const char *cname) {
+    if (!s) return false;
+    if ((s->kind == S_VAR || s->kind == S_FOROF) && s->cname && strcmp(s->cname, cname) == 0) return true;
+    if (oc_decl_in(s->for_init, cname) || oc_decl_in(s->body, cname) || oc_decl_in(s->else_body, cname)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (oc_decl_in(s->stmts.items[i], cname)) return true;
+    for (int i = 0; i < s->ncases; i++) if (oc_decl_in(s->cases[i].body, cname)) return true;
+    return false;
+}
+static Stmt *oc_stmt; /* the statement examined: its own code declares nothing (its variable is checked by type) */
+static bool oc_declared(Func *f, const char *cname) {
+    if (!f) return false; /* the statement's own code: an assignment there is to a variable from outside it */
+    for (int i = 0; i < f->nparams; i++) if (f->params[i].cname && strcmp(f->params[i].cname, cname) == 0) return true;
+    return oc_decl_in(f->body, cname);
+}
+static void once_try(Stmt *s, Func *home) {
+    if (s->kind != S_VAR && s->kind != S_EXPR) return;
+    Expr *e = s->kind == S_VAR ? s->init : s->expr;
+    if (!e) return;
+    for (int ci = 0; ci < prog->nclasses; ci++) {
+        Class *c = prog->classes[ci];
+        if (!c->used || c->builtin || !c->nohdr || !c->rdual) continue;
+        int rg = c->rdual;
+        bool done = false; /* (one try per region) */
+        for (int cj = 0; cj < ci; cj++) if (prog->classes[cj]->used && prog->classes[cj]->nohdr && prog->classes[cj]->rdual == rg) done = true;
+        if (done) continue;
+        oc_n = 0;
+        bool all_nh = true;
+        for (int cj = 0; cj < prog->nclasses; cj++) {
+            Class *o = prog->classes[cj];
+            if (!o->used || o->builtin || (o->rdual != rg && o->region != rg)) continue;
+            if (!o->nohdr) all_nh = false;
+            oc_set = realloc(oc_set, sizeof(Class *) * (size_t)(oc_n + 1));
+            oc_set[oc_n++] = o;
+        }
+        if (!all_nh) continue;
+        if (s->kind == S_VAR ? oc_mentions(s->type) : (e->type && oc_mentions(e->type))) continue;
+        oc_bad = false; oc_makes = false; oc_rg = rg; oc_home = home; oc_next = 0; oc_stmt = s;
+        oc_reach_expr(e, NULL);
+        if (!oc_bad && oc_makes) { s->once_rg = rg; return; }
+    }
+}
+static void once_walk(Stmt *s, Func *home) { /* the statements outside loops */
+    if (!s) return;
+    if (s->kind == S_FOR || s->kind == S_WHILE || s->kind == S_FOROF || s->kind == S_TRY) return;
+    if (s->kind == S_BLOCK) { for (int i = 0; i < s->stmts.len; i++) once_walk(s->stmts.items[i], home); return; }
+    if (s->kind == S_IF) { once_walk(s->body, home); once_walk(s->else_body, home); return; }
+    once_try(s, home);
+}
+static void once_compute(Program *p) {
+    if (getenv("XISTO_NO_ONCE_REGION")) return;
+    bool any = false;
+    for (int i = 0; i < p->nclasses; i++) if (p->classes[i]->used && p->classes[i]->nohdr && p->classes[i]->rdual) any = true;
+    if (!any) return;
+    for (int i = 0; i < p->top.len; i++) if (stmt_has_try(p->top.items[i])) return;
+    for (int i = 0; i < p->nfuncs; i++) if (p->funcs[i]->body && p->funcs[i]->used && stmt_has_try(p->funcs[i]->body)) return;
+    for (int i = 0; i < p->nclasses; i++) {
+        Class *c = p->classes[i];
+        if (!c->used || c->builtin) continue;
+        if (c->ctor && c->ctor->body && stmt_has_try(c->ctor->body)) return;
+        for (int k = 0; k < c->nmethods; k++) if (c->methods[k]->body && stmt_has_try(c->methods[k]->body)) return;
+    }
+    for (int i = 0; i < p->top.len; i++) once_walk(p->top.items[i], NULL);
+    for (int i = 0; i < p->nfuncs; i++) {
+        Func *f = p->funcs[i];
+        if (f->body && f->used && !f->mod->builtin && !f->is_native && nh_cold(f)) once_walk(f->body, f);
+    }
+}
+
 /* ---- consumed constructor parameters ----
    `constructor(l: Tree, r: Tree) { this.left = l; this.right = r; }`: the reference each argument brings is the
    one the field keeps. The caller hands over ownership (a new value moves in, a borrowed one is retained once)
@@ -10250,6 +10465,8 @@ void emit_program(Program *p, Buf *o) {
     find_consumed(p);
     find_run_once(p);
     nohdr_compute(p);
+    cptr_compute(p);
+    once_compute(p);
     count_calls(p);
     buf_puts(out, "\n/* ---- program ---- */\nextern const xs_site xs_sitetab[];\n");
     for (int r = 1; r <= region_count; r++) {
@@ -10275,7 +10492,8 @@ void emit_program(Program *p, Buf *o) {
         buf_printf(out, c->nohdr ? "struct %s { /* no header: nohdr_compute */" : "struct %s { xs_hdr hdr;", c->cname);
         for (int k = 0; k < c->nfields; k++) {
             buf_puts(out, " ");
-            emit_decl(c->fields[k].type, c->fields[k].cname);
+            if (cp_field(c, k)) buf_printf(out, "XS_CPREF(%s) %s", cp_target(c, k), c->fields[k].cname); /* 32 bits (cptr_compute) */
+            else emit_decl(c->fields[k].type, c->fields[k].cname);
             buf_puts(out, ";");
         }
         buf_puts(out, " };\n");

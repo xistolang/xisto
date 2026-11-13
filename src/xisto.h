@@ -412,6 +412,8 @@ struct Stmt {
        for_init (reused) = finally block (may be NULL) */
     /* S_THROW: expr */
     int region;        /* S_FOR / S_WHILE: its iterations' objects live in region N (region.c), 0: none */
+    int once_rg;       /* S_VAR / S_EXPR outside loops whose objects of region N's header-less classes die with it: made
+                          in that region (on this thread) and given back after the statement (emit.c once_compute) */
     bool on_stack;     /* S_VAR = new C(...): the object lives in the frame (stackalloc.c) */
     unsigned stack_str; /* ... and these constructor arguments (bits), fresh strings that die with it, too */
     bool infer_int;    /* S_VAR `let i = 0` whose every assignment is an integer: an int (checker, XB-034) */
@@ -595,6 +597,7 @@ struct Class {
                           runs (xs_rg_on_N), on the heap otherwise; counted either way, and freed with the region */
     bool stack_at;     /* stackalloc.c: some of its objects live in frames: Class_new_at(mem, ...) is emitted */
     bool nohdr;        /* emitter: objects without the 8-byte header (region objects that nothing counts, see nohdr_compute) */
+    bool cptr;         /* emitter: a header-less class whose references to its own objects are 32 bits (cptr_compute) */
     bool is_tuple;     /* [A, B]: a class the checker makes per list of element types, fields _0, _1, ... */
     bool flattened;
     bool methods_flat;

@@ -8772,6 +8772,136 @@ static void *xs_nh_heap(size_t size) {
     xs_nh_p += size;
     return p;
 }
+/* ---- compressed references (emit.c cptr_compute) ----
+   The objects of a header-less class whose fields refer only to its own objects come from memory below 32 GB,
+   8-byte aligned: a reference is then the address shifted right by 3, in 32 bits (0 is null), and decoding it is a
+   shift, no base to add. That memory is reserved with mmap at addresses asked for (from 16 GB up: macOS keeps the
+   first 4 GB unmapped and its shared cache below 12 GB), in segments that are never given back, as the regions'
+   chunks and xs_nh_heap's blocks never are. Windows and the sanitizers (which own the low addresses) keep full
+   pointers: XS_CPREF is then the pointer itself. */
+#if !defined(_WIN32) && UINTPTR_MAX > 0xffffffffu && !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_THREAD__) && !defined(XS_NO_CPTR)
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || __has_feature(memory_sanitizer)
+#define XS_CP_FULL 1
+#endif
+#endif
+#else
+#define XS_CP_FULL 1
+#endif
+#ifndef XS_CP_FULL
+#include <sys/mman.h>
+#include <pthread.h>
+#define XS_CPREF(T) uint32_t
+#define XS_CP_ENC(p) ((uint32_t)((uintptr_t)(p) >> 3))
+#define XS_CP_DEC(T, v) ((T *)(uintptr_t)((uint64_t)(v) << 3))
+#define XS_CP_LIMIT ((uintptr_t)32 << 30) /* what 32 bits of 8-byte steps reach */
+#define XS_CP_SEG ((size_t)64 << 20)
+static pthread_mutex_t xs_cp_mu = PTHREAD_MUTEX_INITIALIZER;
+static char *xs_cp_p, *xs_cp_end; /* the segment being carved */
+static uintptr_t xs_cp_hint = (uintptr_t)16 << 30;
+/* n bytes (a multiple of 16) below XS_CP_LIMIT, never given back; any thread */
+XS_NOINLINE void *xs_cp_alloc(size_t n) {
+    pthread_mutex_lock(&xs_cp_mu);
+    if (!xs_cp_p || (size_t)(xs_cp_end - xs_cp_p) < n) {
+        size_t seg = n > XS_CP_SEG ? (n + XS_CP_SEG - 1) / XS_CP_SEG * XS_CP_SEG : XS_CP_SEG;
+        char *got = NULL;
+        for (int tries = 0; !got && tries < 1024; tries++) {
+            if (xs_cp_hint + seg > XS_CP_LIMIT) xs_cp_hint = (uintptr_t)4 << 30; /* then from 4 GB up */
+            void *m = mmap((void *)xs_cp_hint, seg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+            if (m == MAP_FAILED) break;
+            if ((uintptr_t)m + seg <= XS_CP_LIMIT) got = m; /* (where asked, or anywhere else low enough) */
+            else munmap(m, seg);
+            xs_cp_hint = got ? (uintptr_t)got + seg : xs_cp_hint + seg;
+        }
+        if (!got) { pthread_mutex_unlock(&xs_cp_mu); xs_panic("out of memory (no room below 32 GB for compact objects; XISTO_NO_CPTR=1 builds without them)"); }
+        xs_cp_p = got;
+        xs_cp_end = got + seg;
+    }
+    void *r = xs_cp_p;
+    xs_cp_p += n;
+    pthread_mutex_unlock(&xs_cp_mu);
+    return r;
+}
+/* chunks given back (xs_region_give_back_cp): their pages returned to the system at once, their addresses kept
+   for the next chunks of the same size */
+static void **xs_cp_spare;
+static size_t xs_cp_nspare, xs_cp_cspare;
+static void xs_cp_free_chunk(void *p, size_t n) {
+#if defined(__linux__) && defined(MADV_DONTNEED)
+    madvise(p, n, MADV_DONTNEED);
+#else
+    mmap(p, n, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0); /* (fresh pages in place: the old ones go) */
+#endif
+    if (n != XS_RCHUNK) return;
+    pthread_mutex_lock(&xs_cp_mu);
+    if (xs_cp_nspare == xs_cp_cspare) {
+        size_t c = xs_cp_cspare ? xs_cp_cspare * 2 : 256;
+        void **a = realloc(xs_cp_spare, sizeof(void *) * c);
+        if (a) { xs_cp_spare = a; xs_cp_cspare = c; }
+    }
+    if (xs_cp_nspare < xs_cp_cspare) xs_cp_spare[xs_cp_nspare++] = p;
+    pthread_mutex_unlock(&xs_cp_mu);
+}
+static void *xs_cp_chunk(size_t n) {
+    if (n == XS_RCHUNK && xs_cp_nspare) {
+        void *r = NULL;
+        pthread_mutex_lock(&xs_cp_mu);
+        if (xs_cp_nspare) r = xs_cp_spare[--xs_cp_nspare];
+        pthread_mutex_unlock(&xs_cp_mu);
+        if (r) return r;
+    }
+    return xs_cp_alloc(n);
+}
+#else
+#define XS_CPREF(T) T *
+#define XS_CP_ENC(p) (p)
+#define XS_CP_DEC(T, v) ((T *)(v))
+static void *xs_cp_alloc(size_t n) {
+    void *r = malloc(n);
+    if (!r) xs_panic("out of memory");
+    return r;
+}
+#define xs_cp_chunk xs_cp_alloc
+static void xs_cp_free_chunk(void *p, size_t n) { (void)n; free(p); }
+#endif
+/* xs_region_more from xs_cp_alloc: a chunk of XS_RCHUNK bytes with its header (no malloc header past it: whole pages) */
+static __attribute__((noinline)) void *xs_region_more_cp(xs_region *r, size_t size) {
+    xs_rchunk *c = r->cur ? r->cur->next : r->first;
+    while (c && c->size < size) c = c->next;
+    if (!c) {
+        size_t sz = size + sizeof(xs_rchunk) > XS_RCHUNK ? (size + 15) & ~(size_t)15 : XS_RCHUNK - sizeof(xs_rchunk);
+        c = xs_cp_chunk(sizeof(xs_rchunk) + sz);
+        c->size = sz;
+        c->next = NULL;
+        if (!r->first) r->first = c;
+        else { xs_rchunk *t = r->cur ? r->cur : r->first; while (t->next) t = t->next; t->next = c; }
+    }
+    r->cur = c;
+    r->ptr = c->data;
+    r->end = c->data + c->size;
+    void *p = r->ptr;
+    r->ptr += size;
+    return p;
+}
+static inline __attribute__((always_inline)) void *xs_region_alloc_nh_cp(xs_region *r, size_t size) {
+    size = (size + XS_OBJ_STEP - 1) & ~(XS_OBJ_STEP - 1);
+    void *p;
+    if (__builtin_expect(r->ptr && (size_t)(r->end - r->ptr) >= size, 1)) { p = r->ptr; r->ptr += size; }
+    else p = xs_region_more_cp(r, size);
+    return p;
+}
+static XS_TLS char *xs_nhc_p, *xs_nhc_end;
+static void *xs_nh_heap_cp(size_t size) {
+    size = (size + XS_OBJ_STEP - 1) & ~(XS_OBJ_STEP - 1);
+    if (__builtin_expect(!xs_nhc_p || (size_t)(xs_nhc_end - xs_nhc_p) < size, 0)) {
+        size_t n = size > ((size_t)1 << 20) ? (size + 15) & ~(size_t)15 : ((size_t)1 << 20);
+        xs_nhc_p = xs_cp_alloc(n);
+        xs_nhc_end = xs_nhc_p + n;
+    }
+    void *p = xs_nhc_p;
+    xs_nhc_p += size;
+    return p;
+}
 #define xs_region_alloc_nz(r, size, type) xs_region_alloc_f((r), (size), (type), 0, false)
 /* a dual class's object (region.c: the class is made both inside the loop and outside it): in the region while
    one of its loop's iterations runs (on), on the heap otherwise */
@@ -8798,6 +8928,20 @@ static __attribute__((noinline)) void xs_region_reset(xs_region *r) {
     r->cur = r->first;
     r->ptr = r->first ? r->first->data : NULL;
     r->end = r->first ? r->first->data + r->first->size : NULL;
+}
+/* after a statement whose objects of the region's classes die with it (emit.c once_compute): the region rewound
+   and its chunks given back to the system (a later iteration of its loop on this thread makes new ones) */
+XS_NOINLINE void xs_region_give_back(xs_region *r) {
+    xs_region_reset(r);
+    for (xs_rchunk *c = r->first, *n; c; c = n) { n = c->next; free(c); }
+    r->first = r->cur = NULL;
+    r->ptr = r->end = NULL;
+}
+XS_NOINLINE void xs_region_give_back_cp(xs_region *r) {
+    xs_region_reset(r);
+    for (xs_rchunk *c = r->first, *n; c; c = n) { n = c->next; xs_cp_free_chunk(c, sizeof(xs_rchunk) + c->size); }
+    r->first = r->cur = NULL;
+    r->ptr = r->end = NULL;
 }
 static XS_TLS xs_region *xs_rg_cur; /* the region of the loop running (regions do not nest) */
 static void xs_region_enter(xs_region *r) {
