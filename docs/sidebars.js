@@ -39,7 +39,16 @@ const sidebars = {
       type: 'category',
       label: 'Benchmarks',
       link: {type: 'doc', id: 'benchmarks/index'},
-      items: ['benchmarks/benchmarks-game', 'benchmarks/http', 'benchmarks/energy-sqlite-streams'],
+      items: [
+        {
+          type: 'category',
+          label: 'Benchmarks Game',
+          link: {type: 'doc', id: 'benchmarks/benchmarks-game/index'},
+          items: ['benchmarks/benchmarks-game/vs-rust', 'benchmarks/benchmarks-game/vs-node', 'benchmarks/benchmarks-game/vs-bun'],
+        },
+        'benchmarks/http',
+        'benchmarks/energy-sqlite-streams',
+      ],
     },
     {type: 'category', label: 'Node compatibility', items: ['guides/node-compatibility']},
     {type: 'category', label: 'Porting', items: ['guides/porting']},

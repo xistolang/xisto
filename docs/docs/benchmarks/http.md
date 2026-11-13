@@ -96,7 +96,7 @@ loops on one port. Source: `bench/results/2026-11-05-Apple-M4-threads.csv` (5 No
 
 One event loop serves the most requests with the least CPU. More workers add CPU per request without adding
 throughput on this machine, where the load generator competes for the same cores. Threads pay off for CPU-bound
-work (see [Benchmarks Game](./benchmarks-game.md)), not for I/O.
+work (see [Benchmarks Game](./benchmarks-game/index.md)), not for I/O.
 
 ## Resilience
 
