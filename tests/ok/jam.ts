@@ -111,3 +111,21 @@ function ludRest(n: int, A: number[][]): number {
 }
 const W = grid(12, 12, (i, j) => ((i * 7 + j * 5) % 13) / 9 + (i === j ? 3 : 0));
 console.log("ludcmp rest", ludRest(12, W).toFixed(9), show(W));
+
+// the k form (syrk): for k { for j <= i: C[i][j] += alpha * A[i][k] * A[j][k] }, U values of k into each C[i][j]
+function syrk(n: int, m: int, alpha: number, beta: number, C: number[][], A: number[][]): void {
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j <= i; j++) C[i][j] *= beta;
+    for (let k = 0; k < m; k++) for (let j = 0; j <= i; j++) C[i][j] += alpha * A[i][k] * A[j][k];
+  }
+}
+const SC = grid(7, 7, (i, j) => (i + j) / 10);
+syrk(7, 19, 1.5, 0.5, SC, grid(7, 19, (i, j) => ((i * 4 + j) % 9) / 8));
+console.log("syrk", show(SC));
+// a row of C is a row of A: the old loop
+const SA2 = grid(7, 19, (i, j) => ((i + j * 2) % 7) / 6);
+const SC2 = grid(7, 7, (i, j) => 1);
+SA2[3] = SC2[5];
+for (let r = 0; r < 7; r++) if (SA2[r].length < 19) for (let c = SA2[r].length; c < 19; c++) SA2[r].push(c / 19);
+syrk(7, 19, 0.5, 2, SC2, SA2);
+console.log("syrk shared row", show(SC2));
