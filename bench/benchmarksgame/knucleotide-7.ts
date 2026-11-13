@@ -186,7 +186,7 @@ function specific(counts: Map<int, int>, code: string): string {
 // input); from a pipe it is read whole. seqLength: how many nucleotides it holds.
 let seqLength: int = 0;
 let npacked: int = 0; // whole bytes of seq written
-let pending: int = 0; // the nucleotides of a byte not yet whole (0 to 3 of them, the first highest)
+let carry: int = 0; // the nucleotides of a byte not yet whole (0 to 3 of them, the first highest)
 let npending: int = 0;
 // the nucleotides of input[from..lim-1] (a c g t, A C G T: (c >> 1) & 3 is 0 1 3 2), line by line (the newlines
 // found with indexOf), packed into seq
@@ -197,10 +197,10 @@ function addLines(seq: Uint8Array, input: Uint8Array, from: int, lim: int): void
     if (e < 0 || e > lim) e = lim;
     seqLength += e - t;
     while (npending > 0 && t < e) { // a byte begun before (a block's cut, a line not a multiple of 4): filled first
-      pending = (pending << 2) | ((input[t] >> 1) & 3);
+      carry = (carry << 2) | ((input[t] >> 1) & 3);
       npending++;
       t++;
-      if (npending === 4) { seq[npacked] = pending; npacked++; pending = 0; npending = 0; }
+      if (npending === 4) { seq[npacked] = carry; npacked++; carry = 0; npending = 0; }
     }
     const groups: int = (e - t) >> 2; // then whole bytes straight from the line
     const o: int = npacked;
@@ -210,7 +210,7 @@ function addLines(seq: Uint8Array, input: Uint8Array, from: int, lim: int): void
     }
     npacked += groups;
     for (t += groups << 2; t < e; t++) { // and what is left, pending
-      pending = (pending << 2) | ((input[t] >> 1) & 3);
+      carry = (carry << 2) | ((input[t] >> 1) & 3);
       npending++;
     }
     t = e + 1;
@@ -218,54 +218,98 @@ function addLines(seq: Uint8Array, input: Uint8Array, from: int, lim: int): void
 }
 // the last byte, when it is not whole
 function packRest(seq: Uint8Array): void {
-  if (npending > 0) { seq[npacked] = pending << ((4 - npending) << 1); npacked++; }
+  if (npending > 0) { seq[npacked] = carry << ((4 - npending) << 1); npacked++; }
   npending = 0;
 }
 
-function sequence(): Uint8Array {
-  const st = fstatSync(0);
-  if (!st.isFile() || st.size <= 0) return sequenceWhole(); // (a pipe's size is what it holds at the moment)
-  const size: int = st.size;
-  const seq = new Uint8Array(new SharedArrayBuffer((size >> 2) + 1));
+// len bytes of stdin (a file) from position pos into buf
+function readAt(buf: Uint8Array, len: int, pos: int): void {
+  let done: int = 0;
+  while (done < len) {
+    const got = readSync(0, buf, done, len - done, pos + done);
+    if (got <= 0) throw new Error("stdin ended early");
+    done += got;
+  }
+}
+
+// where the body of the third sequence starts in the file (the line after the one starting with ">TH"), or size
+function findThree(size: int): int {
   const block = new Uint8Array(1 << 20);
-  let state: int = 0; // 0: looking for the line ">TH..."; 1: the rest of that line; 2: in the sequence; 3: done
-  let lineStart = true; // the byte before the block's first one ended a line
-  let matched: int = 0; // of ">TH" at the start of a line
-  while (state < 3) {
-    const got = readSync(0, block, 0, block.length, null);
-    if (got <= 0) break;
+  const three = new Uint8Array(3);
+  let pos: int = 0;
+  let after: int = -1; // a ">TH" line found: its newline is looked for from here
+  while (pos < size) {
+    const got: int = Math.min(block.length, size - pos);
+    readAt(block, got, pos);
     const view = block.subarray(0, got);
     let i: int = 0;
-    while (i < got && state < 3) {
-      if (state === 2) {
-        // the sequence: every byte but the newlines, two bits each; a '>' ends it. Line by line: the newline
-        // found with indexOf, whole groups of four packed by a counted loop
-        const stop = view.indexOf(62, i);
-        const lim: int = stop < 0 ? got : stop;
-        addLines(seq, view, i, lim);
-        if (stop >= 0) state = 3;
-        i = got;
-      } else if (state === 1) {
+    while (i < got) {
+      if (after >= 0) {
         const nl = view.indexOf(10, i);
-        if (nl < 0) i = got;
-        else { state = 2; i = nl + 1; }
-      } else if (matched === 0) {
-        // the next '>' (the headers are the only ones), then ">TH" at a line start, byte by byte
-        const p = view.indexOf(62, i);
-        if (p < 0) { lineStart = block[got - 1] === 10; i = got; }
-        else { if (p > i) lineStart = block[p - 1] === 10; if (lineStart) matched = 1; lineStart = false; i = p + 1; }
+        if (nl >= 0) return pos + nl + 1;
+        i = got;
       } else {
-        const c = block[i];
-        if (matched === 1 && c === 84) matched = 2;
-        else if (matched === 2 && c === 72) { matched = 0; state = 1; }
-        else matched = 0;
-        lineStart = c === 10;
-        i++;
+        const p = view.indexOf(62, i);
+        if (p < 0) { i = got; continue; }
+        const at: int = pos + p;
+        let lineStart = at === 0;
+        if (!lineStart) {
+          if (p > 0) lineStart = block[p - 1] === 10;
+          else { readAt(three, 1, at - 1); lineStart = three[0] === 10; }
+        }
+        if (lineStart && at + 2 < size) {
+          readAt(three, 3, at);
+          if (three[1] === 84 && three[2] === 72) after = at + 3;
+        }
+        i = p + 1;
+        if (after >= 0) i = Math.max(i, after - pos);
       }
     }
+    pos += got;
+  }
+  return size;
+}
+
+// the sequence from the body at b on, packed by this thread: line by line, to a '>' or the end of the file
+function packFrom(seq: Uint8Array, b: int, size: int): void {
+  seqLength = 0; npacked = 0; carry = 0; npending = 0;
+  const block = new Uint8Array(1 << 20);
+  let pos: int = b;
+  while (pos < size) {
+    const got: int = Math.min(block.length, size - pos);
+    readAt(block, got, pos);
+    const view = block.subarray(0, got);
+    const stop = view.indexOf(62);
+    addLines(seq, view, 0, stop < 0 ? got : stop);
+    if (stop >= 0) break;
+    pos += got;
   }
   packRest(seq);
-  return seq.subarray(0, npacked);
+}
+
+// lines l0..l1-1 of the body at b, each 60 symbols and a newline, packed into seq by a worker (15 bytes a line);
+// false when a line is not that (a newline elsewhere, a '>': every symbol byte has bit 6, a newline and '>' do not)
+function packLines(seq: Uint8Array, b: int, l0: int, l1: int): boolean {
+  const per: int = 16384;
+  const buf = new Uint8Array(61 * per);
+  for (let l: int = l0; l < l1; l += per) {
+    const m: int = Math.min(per, l1 - l);
+    readAt(buf, 61 * m, b + 61 * l);
+    let all: int = 64;
+    const o: int = 15 * l;
+    for (let j = 0; j < m; j++) {
+      if (buf[61 * j + 60] !== 10) return false;
+      const c0: int = 61 * j, d: int = o + 15 * j;
+      for (let g = 0; g < 15; g++) {
+        const c: int = c0 + (g << 2);
+        const x0: int = buf[c], x1: int = buf[c + 1], x2: int = buf[c + 2], x3: int = buf[c + 3];
+        all = all & x0 & x1 & x2 & x3;
+        seq[d + g] = (((x0 >> 1) & 3) << 6) | (((x1 >> 1) & 3) << 4) | (((x2 >> 1) & 3) << 2) | ((x3 >> 1) & 3);
+      }
+    }
+    if ((all & 64) === 0) return false;
+  }
+  return true;
 }
 
 function sequenceWhole(): Uint8Array {
@@ -288,8 +332,16 @@ function sequenceWhole(): Uint8Array {
 }
 
 function mainThread(): void {
-  const seq = sequence();
-  const n: int = seqLength;
+  // From a file, the third sequence is packed by the workers, each its share of the lines, read at their places
+  // (only the packed sequence is ever held: ~30 MB); the last, short line here. If a line is not 60 symbols and a
+  // newline, this thread packs it all instead, line by line. From a pipe it is read whole first.
+  const st = fstatSync(0);
+  const file = st.isFile() && st.size > 0; // (a pipe's size is what it holds at the moment)
+  const size: int = file ? st.size : 0;
+  const body: int = file ? findThree(size) : 0;
+  const full: int = file ? Math.trunc((size - body) / 61) : 0; // whole lines (61 bytes) the workers may pack
+  const seq = file ? new Uint8Array(new SharedArrayBuffer(((size - body) >> 2) + 2)) : sequenceWhole();
+  let n: int = seqLength;
   const nworkers = Math.min(availableParallelism(), 32);
   // The frames with many keys (18 and 12: ~140 K each, a table of ~4 MB per partition) are counted by at most
   // BIG workers at a time, so that their tables share the caches with few others (on an M4, ten of them at once
@@ -315,6 +367,25 @@ function mainThread(): void {
   for (let f = 0; f < KS.length; f++) { merged.push(new Map<int, int>()); pending.push(parts[f]); }
   const answers: string[] = new Array<string>(2 + CODES.length).fill("");
   let nextBig = 0, nextSmall = 0, left = ntasks;
+  let packing: int = 0, packed = true; // packing tasks out; all of them succeeded
+  const starts: (() => boolean)[] = [];
+  // the packing done: the rest of the sequence here (or all of it, when a worker found a line it cannot pack),
+  // then the counting tasks
+  const counting = (): void => {
+    if (packed) {
+      seqLength = 60 * full; npacked = 15 * full; carry = 0; npending = 0;
+      const rest: int = size - body - 61 * full;
+      if (rest > 0) {
+        const tail = new Uint8Array(rest);
+        readAt(tail, rest, body + 61 * full);
+        const stop = tail.indexOf(62);
+        addLines(seq, tail, 0, stop < 0 ? rest : stop);
+      }
+      packRest(seq);
+    } else packFrom(seq, body, size);
+    n = seqLength;
+    for (const s of starts) s();
+  };
   for (let w = 0; w < nworkers; w++) {
     const wk = new Worker(__filename, { workerData: "" });
     let myK: int = -1;
@@ -338,6 +409,12 @@ function mainThread(): void {
       return true;
     };
     wk.on("message", (r: Float64Array) => {
+      if (r.length === 1) { // a packing task done (1: packed)
+        if (r[0] !== 1) packed = false;
+        packing--;
+        if (packing === 0) counting();
+        return;
+      }
       const k = myK;
       const f = KS.indexOf(k);
       const m = merged[f];
@@ -358,14 +435,43 @@ function mainThread(): void {
       if (left === 0) for (const s of answers) process.stdout.write(s);
     });
     wk.postMessage(seq); // the sequence first (shared memory), then one task at a time
-    give();
+    starts.push((): boolean => give());
+    if (file && full > 0) { // its share of the lines to pack: [0, l0, l1, body] (four bytes each)
+      const t = new Uint8Array(13);
+      put32(t, 1, Math.trunc(Number(full) * Number(w) / Number(nworkers)));
+      put32(t, 5, Math.trunc(Number(full) * Number(w + 1) / Number(nworkers)));
+      put32(t, 9, body);
+      packing++;
+      wk.postMessage(t);
+    }
   }
+  if (packing === 0) {
+    if (file) counting();
+    else for (const s of starts) s();
+  }
+}
+
+function put32(t: Uint8Array, at: int, v: int): void {
+  t[at] = v & 0xff;
+  t[at + 1] = (v >> 8) & 0xff;
+  t[at + 2] = (v >> 16) & 0xff;
+  t[at + 3] = (v >> 24) & 0xff;
+}
+function get32(t: Uint8Array, at: int): int {
+  return t[at] | (t[at + 1] << 8) | (t[at + 2] << 16) | (t[at + 3] << 24);
 }
 
 function workerThread(): void {
   let seq: Uint8Array | null = null;
   parentPort.on("message", (m: Uint8Array) => {
     if (seq === null) { seq = m; return; } // the first message is the sequence
+    if (m[0] === 0) { // lines to pack
+      const ok = packLines(seq, get32(m, 9), get32(m, 1), get32(m, 5));
+      const r = new Float64Array(1);
+      r[0] = ok ? 1 : 0;
+      parentPort.postMessage(r);
+      return;
+    }
     const k: int = m[0];
     const p: int = m[1];
     const parts: int = m[2];
