@@ -6615,7 +6615,7 @@ static char *bce_col_test(BceRect *r, const char *c, const char *st, const char 
                       "ok_; })",
                       c, st, last, r->id, X, X, rs, rs, X, f, r->id, r->id, r->id, rs, rs, X, f);
 }
-typedef struct { Expr *e, *base, *idx, *E; int kind, sign; bool ok; Expr *hiB, *loB; int hiadj, loadj; Expr *gate; } BceCand; /* gate: an
+typedef struct { Expr *e, *base, *idx, *E; int kind, sign; bool ok; Expr *hiB, *loB; int hiadj, loadj; Expr *gate; long long C; } BceCand; /* C: E - i - C (bce_cands_e) */ /* gate: an
    invariant condition every occurrence lies under (an if of the body): the guard's test of it holds when the gate does not */ /* hiB, loB: the
    bounds the ifs around every occurrence give the index (bce_facts): at most hiB - hiadj, at least loB + loadj */
 static BceCand bce_cand[32];
@@ -6684,6 +6684,7 @@ static void bce_cand_facts(BceCand *c, Expr *x, bool first) {
     if (c->hiB && !(hb && ha == c->hiadj && bce_same(hb, c->hiB))) c->hiB = NULL; /* (an occurrence without it: the loop's bound only) */
     if (c->loB && !(lb && la == c->loadj && bce_same(lb, c->loB))) c->loB = NULL;
 }
+static bool bce_rev_off(void) { static int off = -1; if (off < 0) off = getenv("XISTO_NO_BCE_REV") != NULL; return off; }
 static void bce_cands_e(Expr *e, Stmt *body, const char *i) {
     if (!e) return;
     if (e->kind == E_INDEX && e->rhs && nbce_cand < 32 && bce_base(e->lhs, body, i)) {
@@ -6696,6 +6697,13 @@ static void bce_cands_e(Expr *e, Stmt *body, const char *i) {
                   (void)(ri = x->rhs && x->rhs->kind == E_IDENT && x->rhs->cname && strcmp(x->rhs->cname, i) == 0), li || ri)) {
             if (li && !ri && bce_inv_atom(x->rhs, body, i)) { c.kind = 1; c.E = x->rhs; c.sign = x->op == TK_MINUS ? 2 : 1; } /* i + E, i - E */
             else if (ri && !li && bce_inv_atom(x->lhs, body, i)) { c.kind = 1; c.E = x->lhs; c.sign = x->op == TK_PLUS ? 1 : -1; } /* E + i, E - i */
+        } else if (x->kind == E_BINARY && (x->op == TK_PLUS || x->op == TK_MINUS) && x->type && x->type->kind == TY_INT && x->rhs &&
+                   x->rhs->kind == E_NUMBER && x->rhs->is_int_lit && x->rhs->ival > -(1LL << 31) && x->rhs->ival < (1LL << 31) &&
+                   x->lhs && x->lhs->kind == E_BINARY && x->lhs->op == TK_MINUS && x->lhs->type && x->lhs->type->kind == TY_INT &&
+                   x->lhs->rhs && x->lhs->rhs->kind == E_IDENT && x->lhs->rhs->cname && strcmp(x->lhs->rhs->cname, i) == 0 &&
+                   bce_inv_atom(x->lhs->lhs, body, i) && !bce_rev_off()) {
+            /* E - i - C, E - i + C (durbin: r[k - i - 1]): E - i shifted by a literal; the guard tests E - C (XISTO_NO_BCE_REV) */
+            c.kind = 1; c.E = x->lhs->lhs; c.sign = -1; c.C = x->op == TK_MINUS ? x->rhs->ival : -x->rhs->ival;
         } else if (bce_inv(x, body, i)) c.kind = 2;
         bool dup = false;
         for (int k = 0; k < nbce_cand && !dup; k++) {
@@ -6836,6 +6844,9 @@ static char *bce_version_guard(Stmt *s) {
             char *E = emit_expr_to_str(cd->E, &ar3);
             if (cd->sign == 1) buf_printf(&g, " && ((%s) + (%s) >= 0%s) && (%s + (%s) < %s%s)", st, E, lof, last, E, A, hif);        /* i + E */
             else if (cd->sign == 2) buf_printf(&g, " && ((%s) - (%s) >= 0%s) && (%s - (%s) < %s%s)", st, E, lof, last, E, A, hif); /* i - E */
+            else if (cd->C) /* E - i - C: E kept away from the int64 ends, so E - C cannot wrap */
+                buf_printf(&g, " && (%s) > INT64_MIN / 2 && (%s) < INT64_MAX / 2 && ((%s) - (%lld) - %s >= 0%s) && ((%s) - (%lld) - (%s) < %s%s)",
+                           E, E, E, cd->C, last, lof, E, cd->C, st, A, hif);
             else buf_printf(&g, " && ((%s) - %s >= 0%s) && ((%s) - (%s) < %s%s)", E, last, lof, E, st, A, hif);                     /* E - i */
         piece_done:
             if (cd->gate) {
