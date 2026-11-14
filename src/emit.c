@@ -3046,8 +3046,9 @@ static void emit_expr_raw(Expr *e) {
                 origin_fn = xs_sprintf("%s_origin", f->cname);
             }
         }
-        buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, xs_print_closure, %s, .origin = %s};\n", f->cname, f->cname,
-                   env_cyc ? xs_sprintf("%s_visit", f->cname) : "NULL", origin_fn);
+        buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, xs_print_closure, %s%s};\n", f->cname, f->cname,
+                   env_cyc ? xs_sprintf("%s_visit", f->cname) : "NULL",
+                   strcmp(origin_fn, "NULL") ? xs_sprintf(", .origin = %s", origin_fn) : ""); /* (no adapter: the C as before) */
         buf_printf(out, "XS_FN %s%s%s(%s_env *env", ctype(f->ret), ctype(f->ret)[strlen(ctype(f->ret)) - 1] == '*' ? "" : " ", f->cname, f->cname);
         for (int i = 0; i < f->nparams; i++) {
             buf_puts(out, ", ");

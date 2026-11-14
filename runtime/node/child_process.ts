@@ -300,5 +300,12 @@ export function execFileSync(file: string, args: string[] = [], options: SpawnOp
 /** Runs a shell command to its end and returns its output; a failure is thrown. */
 export function execSync(command: string, options: SpawnOptions | null = null): string {
   if (options === null) return exec_sync(command);
-  return execFileSync("/bin/sh", ["-c", command], options);
+  const r = spawnSync("/bin/sh", ["-c", command], options);
+  if (r.error !== null) throw r.error as Error;
+  if (r.status !== 0) {
+    const x = new ExecError(command, r.status, r.signal, r.stderr); // (Node: "Command failed: <command>")
+    x.stdout = r.stdout;
+    throw x;
+  }
+  return r.stdout;
 }

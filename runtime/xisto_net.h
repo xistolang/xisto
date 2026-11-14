@@ -2899,7 +2899,7 @@ XS_NOINLINE int64_t xs_http_bind(xs_Server *s, int64_t port) {
 #ifdef XS_WITH_TLS
 /* node:https: the certificate and key come as PEM text (Node's options); the TLS layer reads files, so they go
    through two private temporary files, removed once read */
-static char *xs_pem_tmp(xs_str *pem) {
+XS_NOINLINE char *xs_pem_tmp(xs_str *pem) {
     const char *dir = getenv("TMPDIR");
     char *path = malloc(4096);
     snprintf(path, 4096, "%s/xisto-pem-XXXXXX", dir && *dir ? dir : "/tmp");
