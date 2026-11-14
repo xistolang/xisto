@@ -13112,6 +13112,15 @@ static void check_expr_in(Expr *e, Type *expected) {
                 }
             } else {
                 check_block(f->body);
+                if (f->ret->kind == TY_UNKNOWN && f->body && f->body->kind == S_BLOCK && !always_returns(f->body)) {
+                    /* () => { ... } where () => any (or unknown) goes, with no value at its end: JavaScript's undefined,
+                       null here (a callback that an API runs and passes on, as tracer.trace(name, () => {...})) */
+                    Stmt *rn = xs_alloc(sizeof *rn); rn->pos = e->pos; rn->kind = S_RETURN;
+                    Expr *nul = xs_alloc(sizeof *nul); nul->kind = E_NULL; nul->pos = e->pos; nul->field = -1;
+                    rn->expr = nul;
+                    check_stmt(rn);
+                    stmt_list_push(&f->body->stmts, rn);
+                }
                 if (f->ret->kind != TY_VOID && !always_returns(f->body))
                     xs_error(XS8144, e->pos, "add a return at the end", "this arrow function may reach its end without returning a %s", ty_name(f->ret));
             }
