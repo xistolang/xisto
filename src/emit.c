@@ -8641,6 +8641,10 @@ static char *bce_sel_plan(Stmt *s, const char *i) {
    syr2k slower on all three). main.c sets xs_jam_uk to 12 when the code is for an AVX2 x86 (--cpu=native there, or a
    named Haswell-or-later); any other target keeps 16 and 8. The init's jam in t (uj_emit_km) stays at 8. */
 int xs_jam_uj = 16, xs_jam_uk = 8;
+/* symm's form (a sum and column writes in the k loop: each lane also writes its own column of C) on ARM other than
+   Apple's: 4 (Graviton2 kernel 5.05 -> 4.53 s, Rust 4.47; 8 is 5.26, 2 is 4.86); the M4 keeps 16 (U=4 0.31 -> 0.47 s),
+   x86 too (Xeon 1.14 s at 16, Rust 2.10). 0: as the other forms. */
+int xs_jam_ucol = 0;
 typedef struct { Expr *e, *base, *idx; bool krow, self, lrow, mrow; int grp, yp; } UjLd; /* yp: a self load's post (Y table); lrow: X[j][c],
    the lane's own row (mvt: A[i][j] in a loop over j, i the lane), from a table by the lane */
 static UjLd uj_ld[24];
@@ -9134,7 +9138,7 @@ static bool uj_emit_loop(Stmt *s) {
     uj_kmode = false;
     if (!uj_match(s)) { if (!uj_match_k(s)) return false; uj_kmode = true; }
     bool kmode = uj_kmode;
-    int id = uj_cur = uj_ids++, U = kmode ? xs_jam_uk : xs_jam_uj;
+    int id = uj_cur = uj_ids++, U = kmode ? xs_jam_uk : nuj_kord && xs_jam_ucol ? xs_jam_ucol : xs_jam_uj;
     const char *ue = getenv("XISTO_UJAM_U");
     if (ue && atoi(ue) >= 2 && atoi(ue) <= 16) U = atoi(ue);
     bool ar = false;
