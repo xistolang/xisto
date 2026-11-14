@@ -2856,7 +2856,19 @@ static bool nz_passes(Expr *e) {
     return false;
 }
 static void emit_expr_m(Expr *e);
+/* the program indexes an array of rows (number[][], int[][], Float64Array[]...): main.c then defines XS_ROWPAD (the
+   runtime's xs_rowpad, rows a whole odd number of cache lines apart). XISTO_NO_ROWPAD turns it off. */
+bool xs_rows_seen;
+static void rows_note(Expr *e) {
+    if (xs_rows_seen || e->kind != E_INDEX || !e->lhs || !e->lhs->type || e->lhs->type->kind != TY_ARRAY) return;
+    Type *t = e->lhs->type->elem;
+    if (!t) return;
+    if (t->kind == TY_ARRAY && t->elem && (t->elem->kind == TY_NUMBER || t->elem->kind == TY_INT)) xs_rows_seen = true;
+    else if (t->kind == TY_OBJECT && t->cls && t->cls->builtin && t->cls->cname && strncmp(t->cls->cname, "xs_", 3) == 0 &&
+             strstr(t->cls->cname, "Array")) xs_rows_seen = true;
+}
 static void emit_expr(Expr *e) {
+    if (e) rows_note(e);
     if (!nz_mute || nz_passes(e)) { emit_expr_m(e); return; }
     int saved = nz_mute;
     nz_mute = 0;

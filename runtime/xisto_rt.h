@@ -1626,6 +1626,22 @@ XS_NOINLINE xs_str *xs_tpl(int n, ...) {
 /* ---- arrays: fixed length, bounds-checked ---- */
 
 #define XS_INLINE_ELEMS 4 /* small arrays keep their elements inside the object */
+/* XS_ROWPAD (a program that indexes arrays of rows, Linux): a block of 1 KB or more asks malloc for a size that makes
+   its chunk (glibc: the request + 8, rounded to 16) a whole odd number of 64-byte lines, so rows allocated one after
+   the other are a fixed whole number of lines apart. A walk down a column (adi, nussinov) then steps a constant number
+   of lines, which the stride prefetcher follows; 8016 B rows (1000 doubles) step 125.25 lines and it does not
+   (Graviton2 adi 13.5 -> 10.2 s, syrk 1.61 -> 0.88, trmm 0.96 -> 0.57). At most 120 bytes more per block. Only on
+   ARM: on the Broadwell lu gains (2.15 -> 1.55) but doitgen, syr2k and trmm lose 11-18%. */
+#if defined(XS_ROWPAD) && defined(__linux__) && defined(__aarch64__)
+static inline size_t xs_rowpad(size_t n) {
+    if (n < 1024) return n;
+    size_t c = (n + 8 + 63) & ~(size_t)63;
+    if (!((c >> 6) & 1)) c += 64;
+    return c - 8;
+}
+#else
+#define xs_rowpad(n) (n)
+#endif
 /* the table of a loop nest's row data pointers (emit.c, bce_rd_type), freed when the nest's block ends */
 static inline void xs_rd_free(void *p) { free(*(void **)p); }
 #define XS_ARRAY(T, name)                                                              \
@@ -1640,7 +1656,7 @@ static inline void xs_rd_free(void *p) { free(*(void **)p); }
                       : xs_obj_alloc(sizeof(name), name##_free, xs_print_##name);      \
         a->len = (size_t)n;                                                            \
         a->cap = in_ ? XS_INLINE_ELEMS : (size_t)n;                                    \
-        a->data = in_ ? (T *)(a + 1) : malloc(a->cap * sizeof(T));                     \
+        a->data = in_ ? (T *)(a + 1) : malloc(xs_rowpad(a->cap * sizeof(T)));         \
         if (!a->data) xs_panic("out of memory");                                       \
         for (size_t i = 0; i < a->len; i++) a->data[i] = fill;                         \
         return a;                                                                      \
@@ -6999,7 +7015,7 @@ XS_NOINLINE xs_shblk *xs_shblk_new(int64_t n, bool zero) {
         return b;
     }
 #endif
-    b = zero ? calloc(1, sizeof *b + (size_t)n) : malloc(sizeof *b + (size_t)n);
+    b = zero ? calloc(1, xs_rowpad(sizeof *b + (size_t)n)) : malloc(xs_rowpad(sizeof *b + (size_t)n));
     if (!b) xs_panic("out of memory");
     b->refs = 1;
     b->n = n;

@@ -502,6 +502,13 @@ static Buf compile_to_c(const char *path) {
             buf_printf(&b, "#line %zu \"generated.c\"\n", nl + 1);
         }
         emit_program(p, &b);
+        if (xs_rows_seen && !getenv("XISTO_NO_ROWPAD")) { /* (emit.c: arrays of rows; the runtime pads their blocks) */
+            Buf nb = {0};
+            buf_puts(&nb, "#define XS_ROWPAD 1\n");
+            buf_puts(&nb, b.data);
+            b = nb;
+            if (rt_src.len) { Buf nr = {0}; buf_puts(&nr, "#define XS_ROWPAD 1\n"); buf_puts(&nr, rt_src.data); rt_src = nr; }
+        }
     }
     if (show_time && !use_qbe) fprintf(stderr, "xisto: tls %s\n", !p->uses_tls ? "not linked" : tls_awslc() ? "AWS-LC" : "BearSSL");
     if (show_time) fprintf(stderr, "xisto: emit %.1f ms (%zu KB of %s)\n", now_ms() - t4, b.len / 1024, use_qbe ? "QBE IL" : "C");
