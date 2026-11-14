@@ -319,6 +319,8 @@ export class ClientRequest extends EventEmitter {
   path: string;
   host: string;
   protocol: string;
+  /** the port, "" when the URL gives none (for node:diagnostics_channel's subscribers) */
+  port: string = "";
   /** for node:diagnostics_channel's subscribers (an APM agent's span for this request) */
   _diag: any = null;
   private url: string;
@@ -334,6 +336,7 @@ export class ClientRequest extends EventEmitter {
     this.path = u.pathname + u.search;
     this.host = u.hostname;
     this.protocol = u.protocol;
+    this.port = u.port;
     if (u.protocol !== this.expected()) throw new TypeError(`Protocol "${u.protocol}" not supported. Expected "${this.expected()}"`);
   }
   /** (internal) the protocol this module speaks (node:https: "https:"). */
