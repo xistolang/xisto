@@ -100,3 +100,25 @@ heat(2, 9, G, H);
 h = 0.0;
 for (const g of G) h = h * 0.5 + sum(g);
 console.log("heat wide", h);
+// heat's two sweeps fused one plane apart (emit.c, rs_fuse): A and B the same array (the guard fails: as written),
+// one interior plane (n = 3), none (n = 2), and a plane of B shared with A (a row in both: as written)
+let S = cube(7, 7);
+heat(2, 7, S, S);
+h = 0.0;
+for (const g of S) h = h * 0.5 + sum(g);
+console.log("heat same", h);
+for (let m = 2; m <= 4; m++) {
+  const P = cube(m, 8), Q = cube(m, 9);
+  heat(3, m, P, Q);
+  h = 0.0;
+  for (const g of P) h = h * 0.5 + sum(g);
+  for (const g of Q) h = h * 0.5 + sum(g);
+  console.log("heat n", m, h);
+}
+S = cube(8, 10);
+const U = cube(8, 11);
+U[4][3] = S[2][5];
+heat(2, 8, S, U);
+h = 0.0;
+for (const g of S) h = h * 0.5 + sum(g);
+console.log("heat shared row", h);
