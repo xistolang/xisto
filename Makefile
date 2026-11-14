@@ -10,7 +10,7 @@ OBJ     := $(patsubst src/%.c,build/%.o,$(SRC)) build/rt_embed.o
 # only when it can use https; plain-http programs (TLS at the load balancer) carry no TLS code.
 TLS ?= awslc
 
-all: build/xisto build/qbe build/xisto_rt.o build/xisto_rt_dbg.o build/sqlite3.o build/sqlite3.h build/libbearssl.a $(if $(filter awslc,$(TLS)),build/awslc/lib/libssl.a)
+all: build/xisto build/qbe build/xisto_rt.o build/xisto_rt_dbg.o build/sqlite3.o build/sqlite3.h build/libxszlib.a build/libbearssl.a $(if $(filter awslc,$(TLS)),build/awslc/lib/libssl.a)
 
 build/awslc/lib/libssl.a: tools/build-awslc.sh
 	sh tools/build-awslc.sh
@@ -45,6 +45,20 @@ build/sqlite3.o: third_party/sqlite/sqlite3.c | build
 build/sqlite3.h: third_party/sqlite/sqlite3.h | build
 	cp $< $@
 
+# zlib 1.3.1 from source (third_party/zlib, zlib license), compiled once into a static library; linked only when a
+# program imports node:zlib. Vendored rather than the system's -lz: the binaries then need no libz of a given
+# version on the machine that runs them, and --target builds (musl, Windows) get the same code. Z_PREFIX renames
+# its symbols (z_deflate...), so a system libz pulled in by something else cannot clash with it. ~50 KB of
+# object code, of which a program takes only what it calls (an inflate-only program carries no deflate).
+ZLIB_SRC := adler32 crc32 deflate inflate inffast inftrees trees zutil
+ZLIB_OBJ := $(ZLIB_SRC:%=build/zlib/%.o)
+build/zlib/%.o: third_party/zlib/%.c $(wildcard third_party/zlib/*.h)
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -DZ_PREFIX -w -c -o $@ $<
+build/libxszlib.a: $(ZLIB_OBJ)
+	rm -f $@ && ar rcs $@ $(ZLIB_OBJ)
+	rm -rf build/zlib-inc && mkdir -p build/zlib-inc && cp third_party/zlib/zlib.h third_party/zlib/zconf.h build/zlib-inc/
+
 # QBE backend (third_party/qbe, MIT) and the runtime as a linkable object
 build/qbe: $(wildcard third_party/qbe/*.c third_party/qbe/*/*.c) | build
 	@# config.h names QBE's default target and is generated for the machine that built it first: a tree copied
@@ -78,15 +92,16 @@ FORCE:
 build/checker.o: runtime/xisto_regex.h runtime/xisto_regex_bt.h
 
 # Node's modules written in xisto (runtime/node/NAME.ts), embedded in the compiler as xs_node_NAME_ts
-NODE_TS := async_hooks crypto stream path fs_promises url events
+NODE_TS := async_hooks crypto stream path fs_promises url events zlib
 
-build/rt_embed.c: tools/rtsplit.py $(NODE_TS:%=runtime/node/%.ts) packages/xisto/io.ts packages/xisto/bytes.ts packages/xisto/parallel.ts packages/xisto/collections.ts packages/xisto/fractal.ts packages/xisto/random.ts runtime/xisto_regex.h runtime/xisto_regex_bt.h runtime/xisto_rt.h runtime/xisto_net.h runtime/xisto_sqlite.h runtime/xisto_tls.h runtime/xisto_tls_awslc.h runtime/xisto_crypto.h runtime/xisto_dbg_json.h runtime/xisto_dbg.h | build
+build/rt_embed.c: tools/rtsplit.py $(NODE_TS:%=runtime/node/%.ts) packages/xisto/io.ts packages/xisto/bytes.ts packages/xisto/parallel.ts packages/xisto/collections.ts packages/xisto/fractal.ts packages/xisto/random.ts runtime/xisto_regex.h runtime/xisto_regex_bt.h runtime/xisto_rt.h runtime/xisto_net.h runtime/xisto_sqlite.h runtime/xisto_tls.h runtime/xisto_tls_awslc.h runtime/xisto_crypto.h runtime/xisto_zlib.h runtime/xisto_dbg_json.h runtime/xisto_dbg.h | build
 	{ echo 'const unsigned char xs_runtime_h[] = {'; xxd -i < runtime/xisto_rt.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_net_h[] = {'; xxd -i < runtime/xisto_net.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_sqlite_h[] = {'; xxd -i < runtime/xisto_sqlite.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_tls_h[] = {'; xxd -i < runtime/xisto_tls.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_tls_awslc_h[] = {'; xxd -i < runtime/xisto_tls_awslc.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_crypto_h[] = {'; xxd -i < runtime/xisto_crypto.h; echo ', 0x00 };'; \
+	  echo 'const unsigned char xs_runtime_zlib_h[] = {'; xxd -i < runtime/xisto_zlib.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_regex_h[] = {'; xxd -i < runtime/xisto_regex.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_regex_bt_h[] = {'; xxd -i < runtime/xisto_regex_bt.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_dbg_json_h[] = {'; xxd -i < runtime/xisto_dbg_json.h; echo ', 0x00 };'; \
@@ -98,7 +113,7 @@ build/rt_embed.c: tools/rtsplit.py $(NODE_TS:%=runtime/node/%.ts) packages/xisto
 	  echo 'const unsigned char xs_pkg_collections_ts[] = {'; xxd -i < packages/xisto/collections.ts; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_pkg_fractal_ts[] = {'; xxd -i < packages/xisto/fractal.ts; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_pkg_random_ts[] = {'; xxd -i < packages/xisto/random.ts; echo ', 0x00 };'; \
-	  for h in rt net sqlite tls tls_awslc crypto regex; do for m in decl impl; do \
+	  for h in rt net sqlite tls tls_awslc crypto zlib regex; do for m in decl impl; do \
 	    echo "const unsigned char xs_runtime_$${h}_h_$$m[] = {"; python3 tools/rtsplit.py $$m runtime/xisto_$$h.h | xxd -i; echo ', 0x00 };'; \
 	  done; done; } > $@
 

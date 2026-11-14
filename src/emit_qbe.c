@@ -1351,6 +1351,7 @@ static void check_supported(Program *p) {
     }
     if (p->uses_net) unsupported((Pos){1, 1}, "networking");
     if (p->uses_sqlite) unsupported((Pos){1, 1}, "node:sqlite");
+    if (p->uses_zlib) unsupported((Pos){1, 1}, "node:zlib");
     if (p->uses_regex) unsupported((Pos){1, 1}, "RegExp");
 }
 

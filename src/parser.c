@@ -6241,9 +6241,10 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         return m;
     }
     { /* Node's modules written in xisto over runtime functions (runtime/node/NAME.ts, NODE_TS in the Makefile) */
-        extern const unsigned char xs_node_events_ts[];
+        extern const unsigned char xs_node_events_ts[], xs_node_zlib_ts[];
         static const struct { const char *name; const unsigned char *src; } node_ts[] = {
             {"events", xs_node_events_ts},
+            {"zlib", xs_node_zlib_ts},
         };
         for (size_t i = 0; i < sizeof node_ts / sizeof node_ts[0]; i++) {
             if (strcmp(name, node_ts[i].name) != 0) continue;
@@ -6251,6 +6252,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
             m->file = xs_sprintf("xisto:%s", name);
             m->src = (char *)node_ts[i].src;
             m->native_prefix = "xs_";
+            if (strcmp(name, "zlib") == 0) prog->uses_zlib = true; /* (main.c: xisto_zlib.h and the zlib library) */
             m->loading = true;
             parse_module(prog, m);
             m->loading = false;

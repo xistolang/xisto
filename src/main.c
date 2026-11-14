@@ -68,6 +68,7 @@ extern const unsigned char xs_runtime_sqlite_h[];
 extern const unsigned char xs_runtime_tls_h[];
 extern const unsigned char xs_runtime_tls_awslc_h[];
 extern const unsigned char xs_runtime_crypto_h[];
+extern const unsigned char xs_runtime_zlib_h[];
 extern const unsigned char xs_runtime_regex_h[];
 extern const unsigned char xs_runtime_regex_bt_h[];
 static void regex_with_bt(Buf *b);
@@ -75,7 +76,7 @@ extern const unsigned char xs_runtime_dbg_json_h[];
 extern const unsigned char xs_runtime_dbg_h[];
 /* the runtime split in two (tools/rtsplit.py): what a program includes, and the library compiled once */
 #define XS_RT_PAIR(n) extern const unsigned char xs_runtime_##n##_h_decl[], xs_runtime_##n##_h_impl[];
-XS_RT_PAIR(rt) XS_RT_PAIR(net) XS_RT_PAIR(sqlite) XS_RT_PAIR(tls) XS_RT_PAIR(tls_awslc) XS_RT_PAIR(crypto) XS_RT_PAIR(regex)
+XS_RT_PAIR(rt) XS_RT_PAIR(net) XS_RT_PAIR(sqlite) XS_RT_PAIR(tls) XS_RT_PAIR(tls_awslc) XS_RT_PAIR(crypto) XS_RT_PAIR(zlib) XS_RT_PAIR(regex)
 static bool split_rt;     /* the runtime is a cached object, the program only includes its declarations */
 static Buf rt_src;        /* the runtime's translation unit for this program's configuration */
 int cmd_debug(int argc, char **argv); /* src/debug.c */
@@ -118,6 +119,7 @@ static bool tls_awslc(void) {
 
 static bool link_tls;
 static bool link_sqlite;
+static bool link_zlib; /* node:zlib: build/libxszlib.a (zlib from third_party/zlib) */
 
 #ifndef XISTO_VERSION
 #define XISTO_VERSION "dev"
@@ -450,6 +452,7 @@ static Buf compile_to_c(const char *path) {
             if (p->uses_tls) { if (tls_awslc()) XS_RT_ADD(tls_awslc); else XS_RT_ADD(tls); }
             if (p->uses_sqlite) { XS_RT_ADD(sqlite); link_sqlite = true; }
             if (p->uses_crypto) XS_RT_ADD(crypto);
+            if (p->uses_zlib) { XS_RT_ADD(zlib); link_zlib = true; }
             if (p->uses_regex) XS_RT_ADD(regex);
 #undef XS_RT_ADD
         } else {
@@ -459,6 +462,7 @@ static Buf compile_to_c(const char *path) {
             if (p->uses_tls) buf_puts(&b, (const char *)(tls_awslc() ? xs_runtime_tls_awslc_h : xs_runtime_tls_h));
             if (p->uses_sqlite) { buf_puts(&b, (const char *)xs_runtime_sqlite_h); link_sqlite = true; }
             if (p->uses_crypto) buf_puts(&b, (const char *)xs_runtime_crypto_h);
+            if (p->uses_zlib) { buf_puts(&b, (const char *)xs_runtime_zlib_h); link_zlib = true; }
             if (p->uses_regex && p->uses_rebt) regex_with_bt(&b);
             else if (p->uses_regex) buf_puts(&b, (const char *)xs_runtime_regex_h);
         }
@@ -576,7 +580,7 @@ static void run_cc(const char *cfile, const char *outfile, bool dev) {
     char *cache = xs_sprintf("%s/.xisto/cache/c", dir);
     const char *cc = host_cc();
     uint64_t h = fnv(cc_text, cc_len) ^ (fnv(cc, strlen(cc)) * 31) ^ (dev ? 0x9e3779b97f4a7c15ull : 0) ^ (fnv(XS_HOST, strlen(XS_HOST)) * 3) ^
-                 (xs_debug ? 0x51afd7ed558ccdull : 0) ^ (link_tls ? 0x2545f4914f6cdd1dull : 0) ^ (link_sqlite ? 0x27d4eb2f165667c5ull : 0) ^
+                 (xs_debug ? 0x51afd7ed558ccdull : 0) ^ (link_tls ? 0x2545f4914f6cdd1dull : 0) ^ (link_sqlite ? 0x27d4eb2f165667c5ull : 0) ^ (link_zlib ? 0x85ebca77c2b2ae63ull : 0) ^
                  (xs_target ? fnv(xs_target, strlen(xs_target)) * 7 : 0) ^ (build_dylib ? 0x165667b19e3779f9ull : 0) ^
                  fnv(XS_CC_KEY, strlen(XS_CC_KEY)) * 11 ^ /* the compiler flags this xisto passes: a new set rebuilds */
                  (xs_cpu ? fnv(xs_cpu, strlen(xs_cpu)) * 13 : 0);
@@ -822,6 +826,31 @@ static void run_cc_target(const char *cfile, const char *outfile, bool dev) {
         }
         extra = xs_sprintf("-I%s %s", xs_q(xisto_dir), xs_q(obj));
     }
+    if (link_zlib) { /* zlib from its source, once per target (its eight files, then an archive) */
+        char *lib = xs_sprintf("%s/libxszlib.a", tdir);
+        if (access(lib, R_OK) != 0) {
+            char *src = xs_sprintf("%s/../third_party/zlib", xisto_dir);
+            if (access(xs_sprintf("%s/zlib.h", src), R_OK) != 0) { fprintf(stderr, "xisto: --target with node:zlib needs zlib's source at %s\n", src); exit(1); }
+            static const char *const zf[] = {"adler32", "crc32", "deflate", "inflate", "inffast", "inftrees", "trees", "zutil"};
+            char *objs = "";
+            if (!xs_mkdirs(tdir)) { fprintf(stderr, "xisto: cannot create %s\n", tdir); exit(1); }
+            for (size_t k = 0; k < sizeof zf / sizeof *zf; k++) {
+                char *o = xs_sprintf("%s/zlib-%s.%d.o", tdir, zf[k], xs_pid());
+                if (xs_sh(xs_sprintf("%s -O2 -w -DZ_PREFIX -c -o %s %s", cc, xs_q(o), xs_q(xs_sprintf("%s/%s.c", src, zf[k])))) != 0) {
+                    fprintf(stderr, "xisto: zlib did not compile for %s (%s.c)\n", xs_target, zf[k]);
+                    exit(1);
+                }
+                objs = xs_sprintf("%s %s", objs, xs_q(o));
+            }
+            char *tmp = xs_sprintf("%s.%d.tmp", lib, xs_pid());
+            if (xs_sh(xs_sprintf("%s ar rcs %s%s", xs_q(zig), xs_q(tmp), objs)) != 0 || !xs_rename(tmp, lib)) {
+                fprintf(stderr, "xisto: zlib did not compile for %s\n", xs_target);
+                exit(1);
+            }
+            for (size_t k = 0; k < sizeof zf / sizeof *zf; k++) unlink(xs_sprintf("%s/zlib-%s.%d.o", tdir, zf[k], xs_pid()));
+        }
+        extra = xs_sprintf("%s -I%s %s", extra, xs_q(xisto_dir), xs_q(lib));
+    }
     bool win = strstr(xs_target, "windows") != NULL;
     char *cmd = xs_sprintf("%s -std=c11 %s -mllvm -hot-cold-split=false -ffp-contract=off -fno-omit-frame-pointer -ffunction-sections -fdata-sections "
                            "%s -static -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
@@ -871,6 +900,8 @@ static void run_cc_raw(const char *cfile, const char *outfile, bool dev) {
         cmd = xs_sprintf("%s -I'%s/bearssl-inc' '%s/libbearssl.a'", cmd, xisto_dir, xisto_dir);
     if (link_sqlite) /* SQLite: the header and the object compiled from source live next to the xisto executable */
         cmd = xs_sprintf("%s -I'%s' '%s/sqlite3.o' -lpthread", cmd, xisto_dir, xisto_dir);
+    if (link_zlib) /* zlib: build/zlib-inc and the static library next to the xisto executable (only what is called is linked) */
+        cmd = xs_sprintf("%s -I'%s' '%s/libxszlib.a'", cmd, xisto_dir, xisto_dir);
     int rc = 0;
     if (!xs_cc_run(&cmd, 1, 1, &rc)) exit(1);
     if (rc != 0) {
