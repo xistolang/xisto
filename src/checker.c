@@ -5393,8 +5393,15 @@ static bool rest_any_adapter(Expr *a, Type *ptype) {
         expr_list_push(&call->args, as);
     }
     Stmt *r = xs_alloc(sizeof *r); r->pos = a->pos;
-    if (af->ret->kind == TY_VOID) { r->kind = S_EXPR; r->expr = call; } else { r->kind = S_RETURN; r->expr = call; }
+    bool void_fn = at->ret && at->ret->kind == TY_VOID; /* (a void function where (...args: any[]) => any goes: null) */
+    if (af->ret->kind == TY_VOID || void_fn) { r->kind = S_EXPR; r->expr = call; } else { r->kind = S_RETURN; r->expr = call; }
     Stmt *b = xs_alloc(sizeof *b); b->kind = S_BLOCK; b->pos = a->pos; stmt_list_push(&b->stmts, r);
+    if (af->ret->kind != TY_VOID && void_fn) {
+        Stmt *rn = xs_alloc(sizeof *rn); rn->pos = a->pos; rn->kind = S_RETURN;
+        Expr *nul = xs_alloc(sizeof *nul); nul->kind = E_NULL; nul->pos = a->pos; nul->field = -1;
+        rn->expr = nul;
+        stmt_list_push(&b->stmts, rn);
+    }
     af->body = b;
     af->origin = call; /* (checked with the body: emit reads the function it calls, a capture, a global or a top-level function) */
     Arrow *ar = xs_alloc(sizeof *ar); ar->pos = a->pos; ar->fn = af; ar->expr_body = af->ret->kind != TY_VOID;
@@ -8540,6 +8547,11 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (!is_numeric(e->lhs->type) && e->lhs->type->kind != TY_LITINT)
                 xs_error(XS8119, e->lhs->pos, NULL, "operand of unary '%s' must be int or number, but this is %s", e->op == TK_PLUS ? "+" : "-", ty_name(e->lhs->type));
             e->type = e->lhs->type;
+            if (e->op == TK_MINUS && e->lhs->kind == E_NUMBER && e->lhs->type->kind == TY_LITINT && e->lhs->num == 0 &&
+                (!expected || expected->kind == TY_NUMBER || expected->kind == TY_UNKNOWN)) {
+                coerce_lit(e->lhs, ty_number); /* -0 where a number or an any goes: the float -0 (an int has no -0) */
+                e->type = ty_number;
+            }
         }
         return;
     case E_BINARY:
@@ -8803,6 +8815,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (e->op == TK_IDENT) { /* x instanceof C */
             Class *c = e->rhs->cls ? e->rhs->cls : find_class(e->rhs->str); /* (a class given: see any_method_call) */
             if (!c || c->is_interface) xs_error(XS9010, e->rhs->pos, "instanceof tests classes (interfaces have no run-time identity)", "'%s' is not a class", e->rhs->str);
+            if (c && c->builtin && strcmp(c->name, "RegExp") == 0) prog->uses_regex = true; /* (the test reads xs_RegExp_free) */
             if (!ty_is_heap(e->lhs->type)) xs_error(XS8108, e->lhs->pos, NULL, "instanceof needs an object, but this is %s", ty_name(e->lhs->type));
             e->rhs->cls = c;
             e->rhs->type = ty_object_of(c);
@@ -11327,9 +11340,10 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
-        if (e->is_call && e->str && !e->args.len && !strcmp(e->str, "valueOf") &&
-            (e->lhs->type->kind == TY_STRING || is_numeric(e->lhs->type) || e->lhs->type->kind == TY_BOOLEAN)) {
-            Expr *v = e->lhs; /* s.valueOf(), n.valueOf(): the value itself */
+        if (e->is_call && e->str && !e->args.len &&
+            ((!strcmp(e->str, "valueOf") && (e->lhs->type->kind == TY_STRING || is_numeric(e->lhs->type) || e->lhs->type->kind == TY_BOOLEAN)) ||
+             (!strcmp(e->str, "toString") && e->lhs->type->kind == TY_STRING))) {
+            Expr *v = e->lhs; /* s.valueOf(), n.valueOf(), s.toString(): the value itself */
             *e = *v;
             return;
         }
@@ -17609,6 +17623,8 @@ void check_program(Program *p) {
                     found = true; /* built-in classes */
                 if (!found && strcmp(im->from->file, "xisto:buffer") == 0 && strcmp(name, "Buffer") == 0)
                     found = true; /* the built-in Buffer (node:buffer exports it; it is a global too) */
+                if (!found && strcmp(im->from->file, "xisto:util") == 0 && (strcmp(name, "TextEncoder") == 0 || strcmp(name, "TextDecoder") == 0))
+                    found = true; /* built-in classes (node:util re-exports them) */
                 if (!found && im->from->builtin && strcmp(im->from->file, "perf_hooks") == 0 && strcmp(name, "performance") == 0)
                     found = true; /* the built-in performance */
                 if (!found && im->from->builtin && strcmp(im->from->file, "timers") == 0 && !im->is_default)
