@@ -45,12 +45,14 @@ Every `Server` answers `/__metrics` with JSON:
 
 ```json
 {"uptime_s":12.3,"requests":1600,"rss_mb":1.7,"allocations":9120,"live_objects":54,
- "routes":[{"method":"GET","path":"/todos/:id","count":800,"errors":2,"avg_us":2.7,"p50_us":2,"p99_us":4,"max_us":4}]}
+ "routes":[{"method":"GET","path":"/todos/:id","count":800,"errors":2,"timed":800,"avg_us":2.7,"p50_us":2,"p99_us":4,"max_us":4}]}
 ```
 
-Per route: count, errors (status ≥ 400), and the handler's latency (mean, p50, p99, max, in microseconds) over the
-last 2,048 requests. Per process: uptime, requests, peak RSS, allocations and live objects. It costs one clock read
-per request and a ring of 2,048 integers per route. It is always on.
+Per route: count, errors (status ≥ 400), and the latency (mean, p50, p99, max, in microseconds) from the moment the
+event loop saw the request to the end of the handler. The first 2,048 requests of a route are all timed; after that,
+one request in 16 of each worker is, and `timed` says how many went into the latency figures (count and errors stay
+exact). Per process: uptime, requests, peak RSS, allocations and live objects. It costs one clock read per turn of
+the event loop plus one per timed request, and a ring of 2,048 integers per route. It is always on.
 
 ## `--time`: where the build goes
 

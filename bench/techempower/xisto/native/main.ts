@@ -1,7 +1,8 @@
 // TechEmpower Framework Benchmarks: the xisto native server (the built-in Server, no framework).
 // Tests: /plaintext and /json (phase 1). Rules (TFB wiki, Framework Tests Overview): Server and Date headers on every
 // response, Content-Length, keep-alive, pipelining on /plaintext, and the JSON serialized per request from an
-// object (no cached response). PORT selects the port (default 9100); XISTO_WORKERS the number of event loops.
+// object (no cached response). The Date header comes from the server, rendered once a second, as TFB allows.
+// PORT selects the port (default 9100); XISTO_WORKERS the number of event loops.
 
 interface Message {
   message: string;
@@ -13,12 +14,12 @@ function port(): int {
 }
 
 function plaintext(req: HttpRequest): HttpResponse {
-  return HttpResponse.text("Hello, World!").header("Server", "xisto").header("Date", new Date().toUTCString());
+  return HttpResponse.text("Hello, World!").header("Server", "xisto");
 }
 
 function json(req: HttpRequest): HttpResponse {
   const body: Message = { message: "Hello, World!" };
-  return HttpResponse.json(JSON.stringify(body)).header("Server", "xisto").header("Date", new Date().toUTCString());
+  return HttpResponse.json(JSON.stringify(body)).header("Server", "xisto");
 }
 
 const app: Server = new Server();

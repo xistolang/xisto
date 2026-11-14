@@ -1628,12 +1628,13 @@ typedef struct xs_HttpRequest {
     char *raw;             /* private copy of the request head: query, headers and parameters point into it */
 } xs_HttpRequest;
 typedef struct xs_HttpResponse { xs_hdr hdr; int64_t f_status; xs_str *f_body; const char *content_type; xs_stream *stream;
-                                 xs_str *ctype_own; xs_str *extra; /* HttpResponse.of's content type; header() lines */ } xs_HttpResponse;
+                                 xs_str *ctype_own; xs_str *extra; /* HttpResponse.of's content type; header() lines */
+                                 bool has_date; /* header("Date", ..) given: the server sends no Date of its own */ } xs_HttpResponse;
 
 typedef xs_closure *xs_handler;
 #define XS_LAT_SAMPLES 2048
 typedef struct {
-    uint64_t count, errors, total_ns, max_ns;
+    uint64_t count, errors, total_ns, max_ns, timed; /* total_ns and max_ns over the timed requests */
     uint32_t samples[XS_LAT_SAMPLES]; /* ring of recent latencies in microseconds, for percentiles */
     uint32_t nsamples, next;
 } xs_route_metrics;
@@ -1696,6 +1697,7 @@ XS_NOINLINE xs_HttpResponse *xs_HttpResponse_header(xs_HttpResponse *r, xs_str *
     memcpy(q, ": ", 2); q += 2;
     memcpy(q, value->data, (size_t)value->len); q += value->len;
     memcpy(q, "\r\n", 2);
+    if (name->len == 4 && strncasecmp(name->data, "date", 4) == 0) r->has_date = true;
     xs_release(r->extra);
     r->extra = e;
     return xs_retain(r);
@@ -1783,15 +1785,25 @@ static int xs_workers = 1;
 
 static uint64_t xs_total_requests;
 
-static void xs_metrics_begin(void) { xs_req_t0 = xs_now(); }
+/* Latency without two clock reads per request: a request starts when its event loop saw it (xs_loop_ns, read once
+   per turn of the loop, so the time a request waits behind others of its batch counts too), and its end is timed for
+   the first XS_LAT_SAMPLES requests of a route and then for one in XS_LAT_EVERY of the worker's requests. count and
+   errors stay exact; avg, percentiles and max come from the timed ones ("timed" in /__metrics). A clock read is a
+   system call on some virtual machines (Xen's clocksource has no vDSO path), a third of a request's cost. */
+#define XS_LAT_EVERY 16
+static XS_TLS uint64_t xs_loop_ns;
+static XS_TLS uint32_t xs_lat_tick;
+static void xs_metrics_begin(void) { xs_req_t0 = xs_loop_ns ? xs_loop_ns : xs_now(); }
 
 /* counters are atomic so workers can share them; the latency ring is approximate under contention */
 static void xs_metrics_end(xs_route *r, int64_t status) {
-    uint64_t dt = xs_now() - xs_req_t0;
     xs_route_metrics *m = &r->m;
     __atomic_fetch_add(&m->count, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&xs_total_requests, 1, __ATOMIC_RELAXED);
     if (status >= 400) __atomic_fetch_add(&m->errors, 1, __ATOMIC_RELAXED);
+    if (++xs_lat_tick % XS_LAT_EVERY != 0 && m->nsamples >= XS_LAT_SAMPLES) return;
+    uint64_t dt = xs_now() - xs_req_t0;
+    __atomic_fetch_add(&m->timed, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&m->total_ns, dt, __ATOMIC_RELAXED);
     if (dt > m->max_ns) m->max_ns = dt;
     uint32_t slot = __atomic_fetch_add(&m->next, 1, __ATOMIC_RELAXED) % XS_LAT_SAMPLES;
@@ -1811,7 +1823,7 @@ static uint32_t xs_percentile(uint32_t *sorted, uint32_t n, double p) {
     return sorted[i];
 }
 
-/* GET /__metrics: JSON with process and per-route indicators. Always on; it costs one clock read per request. */
+/* GET /__metrics: JSON with process and per-route indicators. Always on; latency is timed on a sample under load. */
 static void xs_metrics_json(xs_Server *s, xs_sb *b) {
     char tmp[256];
     snprintf(tmp, sizeof tmp, "{\"uptime_s\":%.3f,\"requests\":%llu,\"rss_mb\":%.2f,\"allocations\":%lld,\"live_objects\":%lld,\"routes\":[",
@@ -1827,8 +1839,8 @@ static void xs_metrics_json(xs_Server *s, xs_sb *b) {
         snprintf(tmp, sizeof tmp, "%s{\"method\":\"%s\",\"path\":", i ? "," : "", r->method);
         xs_sb_puts(b, tmp);
         xs_sb_str(b, r->path);
-        snprintf(tmp, sizeof tmp, ",\"count\":%llu,\"errors\":%llu,\"avg_us\":%.1f,\"p50_us\":%u,\"p99_us\":%u,\"max_us\":%.0f}",
-                 (unsigned long long)m->count, (unsigned long long)m->errors, m->count ? m->total_ns / 1000.0 / (double)m->count : 0,
+        snprintf(tmp, sizeof tmp, ",\"count\":%llu,\"errors\":%llu,\"timed\":%llu,\"avg_us\":%.1f,\"p50_us\":%u,\"p99_us\":%u,\"max_us\":%.0f}",
+                 (unsigned long long)m->count, (unsigned long long)m->errors, (unsigned long long)m->timed, m->timed ? m->total_ns / 1000.0 / (double)m->timed : 0,
                  xs_percentile(sorted, m->nsamples, 0.5), xs_percentile(sorted, m->nsamples, 0.99), m->max_ns / 1000.0);
         xs_sb_puts(b, tmp);
     }
@@ -2524,6 +2536,35 @@ static void xs_server_respond(xs_client *c, int64_t status, const char *ctype, c
     xs_server_respond_x(c, status, ctype, body, body_len, keep_alive, NULL);
 }
 /* extra: header lines ("Name: value\r\n...") from HttpResponse.header */
+/* The Date header every response carries (RFC 9110 6.6.1, as Node's http and actix send it), rendered once per second per
+   worker: the second comes from the coarse clock, which the vDSO serves even where a precise clock read is a system call */
+static XS_TLS char xs_date_line[48];
+static XS_TLS bool xs_resp_has_date; /* the response being written brought its own Date */
+static XS_TLS int64_t xs_date_line_sec = -1;
+static const char *xs_http_date_line(void) {
+#if defined(CLOCK_REALTIME_COARSE)
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME_COARSE, &ts);
+    int64_t sec = (int64_t)ts.tv_sec;
+#else
+    int64_t sec = (int64_t)time(NULL);
+#endif
+    if (sec != xs_date_line_sec) {
+        xs_dfields f;
+        xs_date_fields_((double)sec * 1000.0, false, &f);
+        char *o = xs_date_line;
+        memcpy(o, "\r\nDate: ", 8); o += 8;
+        memcpy(o, xs_day_names[f.wd], 3); o += 3;
+        memcpy(o, ", ", 2); o += 2;
+        o = xs_dig(o, f.d, 2); *o++ = ' ';
+        memcpy(o, xs_month_names[f.mon], 3); o += 3; *o++ = ' ';
+        o = xs_dig(o, f.y, 4); *o++ = ' ';
+        o = xs_dig(o, f.h, 2); *o++ = ':'; o = xs_dig(o, f.mi, 2); *o++ = ':'; o = xs_dig(o, f.s, 2);
+        memcpy(o, " GMT", 5);
+        xs_date_line_sec = sec;
+    }
+    return xs_date_line;
+}
 static void xs_server_respond_x(xs_client *c, int64_t status, const char *ctype, const char *body, size_t body_len, bool keep_alive, const xs_str *extra) {
     /* the response head, assembled by hand: snprintf showed up in the profile */
     char head[320 + 2048];
@@ -2536,6 +2577,7 @@ static void xs_server_respond_x(xs_client *c, int64_t status, const char *ctype,
     if (ctl) { memcpy(h, "\r\nContent-Type: ", 16); h += 16; memcpy(h, ctype, ctl); h += ctl; } /* "" sends none */
     memcpy(h, "\r\nContent-Length: ", 18); h += 18;
     h += xs_itoa((int64_t)body_len, h);
+    if (!xs_resp_has_date) { memcpy(h, xs_http_date_line(), 37); h += 37; }
     if (extra && extra->len) { memcpy(h, "\r\n", 2); h += 2; memcpy(h, extra->data, (size_t)extra->len - 2); h += extra->len - 2; }
     if (keep_alive) { memcpy(h, "\r\nConnection: keep-alive\r\n\r\n", 28); h += 28; }
     else { memcpy(h, "\r\nConnection: close\r\n\r\n", 23); h += 23; }
@@ -2589,8 +2631,9 @@ static bool xs_client_write_all(xs_client *c, const char *p, size_t n) {
 static void xs_server_respond_stream(xs_client *c, xs_HttpResponse *res, bool keep_alive) {
     if (!xs_server_flush(c)) return; /* anything queued before */
     char head[256];
-    int n = snprintf(head, sizeof head, "HTTP/1.1 %lld %s\r\nContent-Type: %s\r\nTransfer-Encoding: chunked\r\nConnection: %s\r\n\r\n",
-                     (long long)res->f_status, xs_status_text(res->f_status), res->content_type, keep_alive ? "keep-alive" : "close");
+    int n = snprintf(head, sizeof head, "HTTP/1.1 %lld %s\r\nContent-Type: %s%s\r\nTransfer-Encoding: chunked\r\nConnection: %s\r\n\r\n",
+                     (long long)res->f_status, xs_status_text(res->f_status), res->content_type, res->has_date ? "" : xs_http_date_line(),
+                     keep_alive ? "keep-alive" : "close");
     if (!xs_client_write_all(c, head, (size_t)n)) return;
     /* lines are coalesced into 64 KB chunks: one write per chunk instead of three per line */
     xs_buf out = {0};
@@ -2638,7 +2681,11 @@ XS_NOINLINE void xs_request_run(void *arg) {
         if (xs_handler_lock) { xs_cur_coro->holds_lock = false; pthread_mutex_unlock(&xs_handler_mutex); }
         if (!c->closed) {
             if (res->stream) xs_server_respond_stream(c, res, job->keep_alive);
-            else xs_server_respond_x(c, res->f_status, res->content_type, res->f_body->data, (size_t)res->f_body->len, job->keep_alive, res->extra);
+            else {
+                xs_resp_has_date = res->has_date;
+                xs_server_respond_x(c, res->f_status, res->content_type, res->f_body->data, (size_t)res->f_body->len, job->keep_alive, res->extra);
+                xs_resp_has_date = false;
+            }
         }
         xs_release(res);
     } else {
@@ -3068,6 +3115,7 @@ XS_NOINLINE void *xs_server_worker(void *arg) {
         bool has_t = xs_tmr_timeout(&tt);
         if (xs_shutting_down && (!has_t || tt.tv_sec > 0 || tt.tv_nsec > tick.tv_nsec)) { tt = tick; has_t = true; }
         int n = kevent(kq, NULL, 0, events, 256, xs_ready_head ? &zero : has_t ? &tt : NULL);
+        xs_loop_ns = xs_now();
         xs_batch++;
         if (xs_shutting_down && xs_shutdown_t0 && xs_now() - xs_shutdown_t0 > 10000000000ull) { /* handlers parked forever: give up after 10 s */
             if (wa->index == 0) fprintf(stderr, "xisto: shutdown timed out with %lld request(s) in flight\n", (long long)xs_inflight_total);
@@ -3123,11 +3171,15 @@ XS_NOINLINE void *xs_server_worker(void *arg) {
                         continue;
                     }
 #endif
-                    ssize_t r = read(c->fd, c->in.data + c->in.len, c->in.cap - c->in.len);
+                    size_t avail = c->in.cap - c->in.len;
+                    ssize_t r = read(c->fd, c->in.data + c->in.len, avail);
                     if (r < 0 && errno == EINTR) continue;
                     if (r < 0 && errno == EAGAIN) break;
                     if (r <= 0) { alive = false; break; }
                     c->in.len += (size_t)r;
+                    /* a short read drained the socket: the poller is level-triggered, so more data (or the peer's FIN)
+                       raises a new event; reading again here would only return EAGAIN, one system call per request */
+                    if ((size_t)r < avail) break;
                 }
                 if (!alive && c->inflight > 0) { xs_client_close(kq, c); continue; } /* the peer left while its handler is parked */
                 if (alive) alive = xs_server_process(s, c);
