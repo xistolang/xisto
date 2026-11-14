@@ -2993,7 +2993,35 @@ static void emit_expr_raw(Expr *e) {
             }
             buf_puts(out, "}\n");
         }
-        buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, xs_print_closure, %s};\n", f->cname, f->cname, env_cyc ? xs_sprintf("%s_visit", f->cname) : "NULL");
+        /* an adapter around a function value (checker: rest_any_adapter): the function it wraps, for === */
+        const char *origin_fn = "NULL";
+        if (f->origin && f->origin->kind == E_CALL && f->origin->lhs) {
+            Expr *o = f->origin->lhs; /* (the call the adapter makes: o is the function value it wraps) */
+            Capture *oc = NULL;
+            for (int i = 0; i < a->ncaptures; i++)
+                if (!a->captures[i].is_this && o->str && strcmp(a->captures[i].name, o->str) == 0) oc = &a->captures[i];
+            if (oc && !oc->boxed) {
+                buf_printf(out, "static void *%s_origin(void *p) { return ((%s_env *)p)->c_%s; }\n", f->cname, f->cname, oc->name);
+                origin_fn = xs_sprintf("%s_origin", f->cname);
+            } else if (!oc && o->kind == E_IDENT && o->cname) { /* a top-level variable */
+                buf_printf(out, "static void *%s_origin(void *p) { (void)p; return (void *)%s; }\n", f->cname, o->cname);
+                origin_fn = xs_sprintf("%s_origin", f->cname);
+            } else if (!oc && (f->origin->func || o->func) && (o->kind == E_FUNC_REF || o->kind == E_IDENT)) {
+                /* a top-level function (or a const arrow compiled as one): its static closure, as the value reads elsewhere */
+                Expr fr = *o;
+                fr.kind = E_FUNC_REF;
+                fr.func = o->func ? o->func : f->origin->func;
+                Buf ob = {0};
+                Buf *keep = out;
+                out = &ob;
+                emit_expr(&fr);
+                out = keep;
+                buf_printf(out, "static void *%s_origin(void *p) { (void)p; return (void *)(%s); }\n", f->cname, ob.data ? ob.data : "NULL");
+                origin_fn = xs_sprintf("%s_origin", f->cname);
+            }
+        }
+        buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, xs_print_closure, %s, .origin = %s};\n", f->cname, f->cname,
+                   env_cyc ? xs_sprintf("%s_visit", f->cname) : "NULL", origin_fn);
         buf_printf(out, "XS_FN %s%s%s(%s_env *env", ctype(f->ret), ctype(f->ret)[strlen(ctype(f->ret)) - 1] == '*' ? "" : " ", f->cname, f->cname);
         for (int i = 0; i < f->nparams; i++) {
             buf_puts(out, ", ");
@@ -3317,6 +3345,16 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, eq ? " == " : " != ");
             emit_expr(v);
             buf_puts(out, ")");
+            return;
+        }
+        if ((e->op == TK_EQ || e->op == TK_NEQ) && e->lhs->type->kind != TY_NULL && e->rhs->type->kind != TY_NULL &&
+            ty_strip_null(e->lhs->type)->kind == TY_FUNC && ty_strip_null(e->rhs->type)->kind == TY_FUNC) {
+            /* two function values: the same function, through the adapters the checker made around it (xs_fn_origin) */
+            buf_puts(out, "(xs_fn_origin((void *)(");
+            emit_borrowed(e->lhs);
+            buf_printf(out, ")) %s xs_fn_origin((void *)(", e->op == TK_EQ ? "==" : "!=");
+            emit_borrowed(e->rhs);
+            buf_puts(out, ")))");
             return;
         }
         if ((e->op == TK_EQ || e->op == TK_NEQ) && e->builtin.cfn && strcmp(e->builtin.cfn, "ref_eq") == 0) { /* the same object */

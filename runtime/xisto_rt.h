@@ -588,6 +588,9 @@ typedef struct __attribute__((aligned(64))) xs_type {
     /* the program's classes when it uses `any` (src/checker.c, dynamic path): their fields by name, read and
        written through x.f / x[k] on an any; NULL otherwise */
     const struct xs_dyn_cls *dyn;
+    /* closures only: an adapter the compiler made around a function value (a typed listener given where
+       (...args: any[]) => void goes) returns the function it wraps, so === sees the same function (off(handler)) */
+    void *(*origin)(void *);
 } xs_type;
 /* hdr.cls: the size class in the low bits, then the flags */
 #define XS_CLS_MASK 31    /* size class of the block (8-byte steps), 0 = not pooled */
@@ -2626,6 +2629,11 @@ static void xs_num_to_str(double v, char *out);
 /* ---- closures: a refcounted object whose first field after the header is the code pointer; captures follow ---- */
 
 typedef struct xs_closure { xs_hdr hdr; void *fn; } xs_closure;
+/* the function a closure stands for: itself, or what the adapters around it wrap (=== of two function values) */
+static inline void *xs_fn_origin(void *c) {
+    while (c && xs_type_of(c)->origin) c = xs_type_of(c)->origin(c);
+    return c;
+}
 typedef struct xs_promise xs_promise; /* (runtime/xisto_net.h: a field may hold one in a program that never makes one) */
 static inline double xs_num_or(double a, double b) { return a != 0 && a == a ? a : b; } /* a || b on numbers: a unless 0 or NaN */
 static inline int64_t xs_int_or(int64_t a, int64_t b) { return a ? a : b; }

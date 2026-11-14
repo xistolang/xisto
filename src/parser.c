@@ -4535,7 +4535,15 @@ static void parse_import(Parser *p, Module *m) {
         next(p);
         if (!at(p, TK_LBRACE)) { p->lx = save; p->tok = t0; } /* (import type from "m": a default import named type) */
     }
-    if (at(p, TK_IDENT)) { /* import name from "m": m's default export, which must have this name */
+    Token dflt = {0}; /* import name, { a } from "m" / import name, * as ns from "m": the default import, then the rest */
+    bool has_dflt = false;
+    if (at(p, TK_IDENT) && peek_is(p, TK_COMMA)) {
+        dflt = p->tok;
+        has_dflt = true;
+        next(p);
+        next(p);
+    }
+    if (!has_dflt && at(p, TK_IDENT)) { /* import name from "m": m's default export, which must have this name */
         Token name = p->tok;
         next(p);
         im.is_default = true;
@@ -4615,6 +4623,19 @@ from:
     m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
     m->imports[m->nimports++] = im;
     if (im.n) alias_collisions(p, m, alias_first, &m->imports[m->nimports - 1]);
+    if (has_dflt) {
+        Import d = {0};
+        d.pos = pos;
+        d.is_default = true;
+        d.names = xs_alloc(sizeof(char *));
+        d.positions = xs_alloc(sizeof(Pos));
+        d.names[0] = dflt.str;
+        d.positions[0] = dflt.pos;
+        d.n = 1;
+        d.path = path.str;
+        m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+        m->imports[m->nimports++] = d;
+    }
 }
 
 static Module *load_module(Program *prog, const char *file, Pos from_pos, const char *from_file);
@@ -6219,6 +6240,23 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->loading = false;
         return m;
     }
+    { /* Node's modules written in xisto over runtime functions (runtime/node/NAME.ts, NODE_TS in the Makefile) */
+        extern const unsigned char xs_node_events_ts[];
+        static const struct { const char *name; const unsigned char *src; } node_ts[] = {
+            {"events", xs_node_events_ts},
+        };
+        for (size_t i = 0; i < sizeof node_ts / sizeof node_ts[0]; i++) {
+            if (strcmp(name, node_ts[i].name) != 0) continue;
+            m->builtin = false;
+            m->file = xs_sprintf("xisto:%s", name);
+            m->src = (char *)node_ts[i].src;
+            m->native_prefix = "xs_";
+            m->loading = true;
+            parse_module(prog, m);
+            m->loading = false;
+            return m;
+        }
+    }
     if (strcmp(name, "perf_hooks") == 0) return m; /* performance is built in (performance.now()) */
     if (strcmp(name, "worker_threads") == 0 || strcmp(name, "os") == 0) { /* written in xisto over runtime functions */
         bool wt = strcmp(name, "worker_threads") == 0;
@@ -6261,7 +6299,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         add_func(prog, f);
         return m;
     }
-    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
     return NULL;
 }
 

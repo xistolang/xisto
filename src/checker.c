@@ -5064,8 +5064,57 @@ static bool ts_rule_diff(Expr *a, Type *ptype) {
         if (!ty_equal(at->params[k], pt->params[k]) && !dflt_param_fits(at, pt, argf, k)) return false;
     return true;
 }
+/* a function value with its own parameters, given where (...args: any[]) => R goes (an EventEmitter listener:
+   emitter.on("data", onData)): an adapter (...a: any[]) => f(a[0] as A0, a[1] as A1, ...), each argument checked as the
+   function takes it and a missing one read as null. The adapter keeps the function it wraps (Func.origin), so === and
+   off(onData) see the same function, as in Node. Arrows written at the call are typed by the call and need none. */
+static bool rest_any_adapter(Expr *a, Type *ptype) {
+    if (!a->type || !ptype) return false;
+    Type *at = ty_strip_null(a->type), *pt = ty_strip_null(ptype);
+    if (pt->kind != TY_FUNC || !pt->rest || pt->nparams != 1 || at->kind != TY_FUNC || at->rest || a->kind == E_ARROW) return false;
+    Type *el = pt->params[0]->kind == TY_ARRAY ? pt->params[0]->elem : NULL;
+    if (!el || el->kind != TY_UNKNOWN || ty_equal(at, pt)) return false;
+    if (pt->ret && pt->ret->kind != TY_VOID && pt->ret->kind != TY_UNKNOWN) return false;
+    Expr *ref = NULL;
+    if ((a->kind == E_IDENT || a->kind == E_FUNC_REF) && a->str) ref = mk_ident(a->pos, a->str);
+    else ref = pure_copy(a);
+    if (!ref) return false;
+    static int nra;
+    const char *an = xs_sprintf("__ra%d", nra++);
+    Func *af = xs_alloc(sizeof *af); af->pos = a->pos; af->name = "arrow";
+    af->ret = pt->ret ? pt->ret : ty_void;
+    af->params = xs_alloc(sizeof(Param));
+    af->nparams = 1;
+    af->params[0].name = (char *)an;
+    af->params[0].type = pt->params[0];
+    af->params[0].rest = true;
+    Expr *call = xs_alloc(sizeof *call); call->kind = E_CALL; call->pos = a->pos; call->field = -1; call->lhs = ref;
+    for (int k = 0; k < at->nparams; k++) {
+        /* (k < a.length ? a[k] : null) as Ak */
+        Expr *len = xs_alloc(sizeof *len); len->kind = E_MEMBER; len->pos = a->pos; len->field = -1; len->str = "length"; len->lhs = mk_ident(a->pos, an);
+        Expr *lt = xs_alloc(sizeof *lt); lt->kind = E_BINARY; lt->op = TK_LT; lt->pos = a->pos; lt->field = -1; lt->lhs = num_lit(a->pos, k, true); lt->rhs = len;
+        Expr *ix = xs_alloc(sizeof *ix); ix->kind = E_INDEX; ix->pos = a->pos; ix->field = -1; ix->lhs = mk_ident(a->pos, an); ix->rhs = num_lit(a->pos, k, true);
+        Expr *nul = xs_alloc(sizeof *nul); nul->kind = E_NULL; nul->pos = a->pos; nul->field = -1;
+        Expr *c = xs_alloc(sizeof *c); c->kind = E_COND; c->pos = a->pos; c->field = -1; c->lhs = lt;
+        expr_list_push(&c->args, ix);
+        expr_list_push(&c->args, nul);
+        Expr *as = xs_alloc(sizeof *as); as->kind = E_AS; as->pos = a->pos; as->field = -1; as->lhs = c; as->elem_type = at->params[k];
+        expr_list_push(&call->args, as);
+    }
+    Stmt *r = xs_alloc(sizeof *r); r->pos = a->pos;
+    if (af->ret->kind == TY_VOID) { r->kind = S_EXPR; r->expr = call; } else { r->kind = S_RETURN; r->expr = call; }
+    Stmt *b = xs_alloc(sizeof *b); b->kind = S_BLOCK; b->pos = a->pos; stmt_list_push(&b->stmts, r);
+    af->body = b;
+    af->origin = call; /* (checked with the body: emit reads the function it calls, a capture, a global or a top-level function) */
+    Arrow *ar = xs_alloc(sizeof *ar); ar->pos = a->pos; ar->fn = af; ar->expr_body = af->ret->kind != TY_VOID;
+    memset(a, 0, sizeof *a);
+    a->kind = E_ARROW; a->pos = ar->pos; a->field = -1; a->arrow = ar;
+    check_expr(a, ptype);
+    return true;
+}
 static void variance_arg(Expr *a, Func *f, int i) {
     if (!a->type || i >= f->nparams) return;
+    if (rest_any_adapter(a, f->params[i].type)) return;
     if (!tsc_checked() && !ts_rule_diff(a, f->params[i].type)) return;
     variance_arg_t(a, f, i, f->params[i].type);
 }
@@ -8602,7 +8651,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             bool lref = lt->kind == TY_OBJECT || lt->kind == TY_ARRAY || lt->kind == TY_FUNC || lt->kind == TY_MAP || lt->kind == TY_SET;
             bool rref = rt->kind == TY_OBJECT || rt->kind == TY_ARRAY || rt->kind == TY_FUNC || rt->kind == TY_MAP || rt->kind == TY_SET;
             if (lref && rref) {
-                bool related = ty_equal(lt, rt);
+                bool related = ty_equal(lt, rt) || (lt->kind == TY_FUNC && rt->kind == TY_FUNC); /* (functions: emit compares origins) */
                 if (!related && lt->kind == TY_OBJECT && rt->kind == TY_OBJECT)
                     for (Class *k = lt->cls; k && !related; k = k->base) if (k == rt->cls) related = true;
                 if (!related && lt->kind == TY_OBJECT && rt->kind == TY_OBJECT)

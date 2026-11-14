@@ -452,6 +452,7 @@ typedef struct {
 } Param;
 
 struct Func {
+    Expr *origin;      /* an adapter arrow the checker made around a function value: that value (emit: the type's origin) */
     char *name;
     Pos pos;
     Module *mod;
