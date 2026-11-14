@@ -2748,7 +2748,7 @@ static const char **member_names(Class *c, int *n) {
    cell shared by the function and its closures; every other capture stays a copy (no cost). Found by name per
    function (or module): a use at a deeper arrow than the declaration, and an assignment anywhere. A `let` in a
    for header keeps JavaScript's copy per iteration unless a closure itself assigns it. ---- */
-typedef struct { const char *name; int depth; char kind; } ScanEv; /* d declared, u used, a assigned */
+typedef struct { const char *name; int depth; char kind; } ScanEv; /* d declared, u used, a assigned; b / e: a block or closure opens / closes (name "") */
 static ScanEv *sev;
 static int nsev, cap_sev;
 static bool for_init_decl;
@@ -2758,13 +2758,16 @@ static void scan_ev(const char *name, int depth, char kind) {
     sev[nsev++] = (ScanEv){name, depth, kind};
 }
 static void scan_stmt(Stmt *s, int depth);
+static void scan_stmt_inner(Stmt *s, int depth);
 static void scan_expr(Expr *e, int depth) {
     if (!e) return;
     if (e->kind == E_IDENT && e->str) scan_ev(e->str, depth, 'u');
     if ((e->kind == E_ASSIGN || e->kind == E_POSTFIX) && e->lhs && e->lhs->kind == E_IDENT) scan_ev(e->lhs->str, depth, 'a');
     if (e->kind == E_ARROW) {
+        scan_ev("", depth + 1, 'b');
         for (int i = 0; i < e->arrow->fn->nparams; i++) scan_ev(e->arrow->fn->params[i].name, depth + 1, 'd');
         scan_stmt(e->arrow->fn->body, depth + 1);
+        scan_ev("", depth + 1, 'e');
         return;
     }
     scan_expr(e->lhs, depth);
@@ -2773,6 +2776,15 @@ static void scan_expr(Expr *e, int depth) {
 }
 static void scan_stmt(Stmt *s, int depth) {
     if (!s) return;
+    if (s->kind != S_VAR) { /* (a variable lives to the end of its block: the block's own events, see boxed_name) */
+        scan_ev("", depth, 'b');
+        scan_stmt_inner(s, depth);
+        scan_ev("", depth, 'e');
+        return;
+    }
+    scan_stmt_inner(s, depth);
+}
+static void scan_stmt_inner(Stmt *s, int depth) {
     if ((s->kind == S_VAR || s->kind == S_FOROF) && s->name) scan_ev(s->name, depth, 'd');
     scan_expr(s->init, depth);
     scan_expr(s->expr, depth);
@@ -2786,8 +2798,13 @@ static void scan_stmt(Stmt *s, int depth) {
 }
 static bool boxed_name(const char *name, int decl_depth, bool for_init) {
     bool captured = false, assigned = false, assigned_inside = false;
+    int nest = 0, shadow = -1; /* a closure's own variable of this name (a loop's k inside a closure): its events are another variable's */
     for (int i = 0; i < nsev; i++) {
+        if (sev[i].kind == 'b') { nest++; continue; }
+        if (sev[i].kind == 'e') { nest--; if (shadow > nest) shadow = -1; continue; }
         if (strcmp(sev[i].name, name) != 0) continue;
+        if (sev[i].kind == 'd' && sev[i].depth > decl_depth && shadow < 0) shadow = nest;
+        if (shadow >= 0) continue;
         if (sev[i].kind == 'u' && sev[i].depth > decl_depth) captured = true;
         if (sev[i].kind == 'a') { assigned = true; if (sev[i].depth > decl_depth) assigned_inside = true; }
     }
