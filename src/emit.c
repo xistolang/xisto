@@ -8281,9 +8281,16 @@ static bool bce_promo_ok(Stmt *s, Expr **slots, int *ns) {
     for (int k = 0; k < s->stmts.len; k++) if (!bce_promo_ok(s->stmts.items[k], slots, ns)) return false;
     return true;
 }
-static Expr *bce_promo_target_e(Expr *e) { /* the first number slot the body assigns */
+/* the first number slot the body assigns; while bce_promo_body_ is set (bicg: s[j] = s[j] + r[i] * A[i][j]; q[i] = q[i] + ...),
+   the first one at an invariant place (XISTO_NO_PROMOTE_ANY: the first one only) */
+static Stmt *bce_promo_body_;
+static const char *bce_promo_i_;
+static bool bce_promo_fits_(Expr *t) {
+    return !bce_promo_body_ || (bce_inv(t->rhs, bce_promo_body_, bce_promo_i_) && (t->lhs->kind == E_IDENT || bce_base(t->lhs, bce_promo_body_, bce_promo_i_)));
+}
+static Expr *bce_promo_target_e(Expr *e) {
     if (!e) return NULL;
-    if (e->kind == E_ASSIGN && bce_num_slot(e->lhs)) return e->lhs;
+    if (e->kind == E_ASSIGN && bce_num_slot(e->lhs) && bce_promo_fits_(e->lhs)) return e->lhs;
     Expr *t = bce_promo_target_e(e->lhs);
     return t ? t : bce_promo_target_e(e->rhs);
 }
@@ -8299,7 +8306,12 @@ static char *bce_promo_plan(Stmt *s, const char *i) {
     Expr *slots[32];
     int ns = 0;
     if (!bce_promo_ok(s->body, slots, &ns)) return NULL;
+    static int any = -1;
+    if (any < 0) any = !getenv("XISTO_NO_PROMOTE_ANY");
+    bce_promo_body_ = any ? s->body : NULL;
+    bce_promo_i_ = i;
     Expr *t = bce_promo_target(s->body);
+    bce_promo_body_ = NULL;
     if (!t || !bce_inv(t->rhs, s->body, i) || !(t->lhs->kind == E_IDENT || bce_base(t->lhs, s->body, i))) return NULL;
     char *pt = bce_base_c(t->lhs), *c = bce_raw(t->rhs);
     Buf g = {0};
