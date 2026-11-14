@@ -1,0 +1,26 @@
+== ubuntu@3.80.225.71
+built main
+built branch
+bench/benchmarksgame/binarytrees.ts 21: main 1.636s  branch 1.635s  (1.00x)  same
+bench/benchmarksgame/fannkuchredux.ts 12: main 26.989s  branch 27.020s  (1.00x)  same
+bench/benchmarksgame/fasta.ts 25000000: main 0.536s  branch 0.539s  (0.99x)  same
+bench/benchmarksgame/knucleotide.ts 0: main 1.472s  branch 1.456s  (1.01x)  same
+bench/benchmarksgame/mandelbrot.ts 16000: main 2.699s  branch 2.680s  (1.01x)  same
+bench/benchmarksgame/nbody.ts 50000000: main 2.562s  branch 2.562s  (1.00x)  same
+bench/benchmarksgame/pidigits.ts 10000: main 0.707s  branch 0.707s  (1.00x)  same
+bench/benchmarksgame/regexredux.ts 0: main 1.004s  branch 0.993s  (1.01x)  same
+bench/benchmarksgame/revcomp.ts 0: main 0.626s  branch 0.574s  (1.09x)  same
+bench/benchmarksgame/spectralnorm.ts 5500: main 0.669s  branch 0.665s  (1.01x)  same
+== ec2-user@13.217.202.73
+built main
+built branch
+bench/benchmarksgame/binarytrees.ts 21: main 1.913s  branch 1.903s  (1.01x)  same
+bench/benchmarksgame/fannkuchredux.ts 12: main 10.391s  branch 10.385s  (1.00x)  same
+bench/benchmarksgame/fasta.ts 25000000: main 0.523s  branch 0.528s  (0.99x)  same
+bench/benchmarksgame/knucleotide.ts 0: main 0.841s  branch 0.799s  (1.05x)  same
+bench/benchmarksgame/mandelbrot.ts 16000: main 2.975s  branch 2.963s  (1.00x)  same
+bench/benchmarksgame/nbody.ts 50000000: main 4.278s  branch 4.275s  (1.00x)  same
+bench/benchmarksgame/pidigits.ts 10000: main 2.128s  branch 2.143s  (0.99x)  same
+bench/benchmarksgame/regexredux.ts 0: main 1.161s  branch 1.169s  (0.99x)  same
+bench/benchmarksgame/revcomp.ts 0: main 0.112s  branch 0.117s  (0.96x)  same
+bench/benchmarksgame/spectralnorm.ts 5500: main 1.301s  branch 1.300s  (1.00x)  same

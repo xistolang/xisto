@@ -83,6 +83,8 @@ Kernel time: Xisto **30 wins**, 0 ties, 0 losses (a tie is within 3%). The winne
 
 ## Notes
 
+- **floyd-warshall and heat-3d** were improved after this round (`b0c603b`): floyd-warshall 14.1 s on the Graviton2 and 10.6 s on the Xeon, heat-3d 1.83 s on the Xeon; Xisto now wins both on both machines. See [PolyBench](./index.md#the-last-two-fixed-after-the-round-b0c603b).
+
 - Go's compiler does not vectorize nor unroll-and-jam loops, and it keeps bounds checks it cannot prove away, which is most of the distance on the matrix kernels.
 - Go is not ahead of Xisto on any kernel here.
 

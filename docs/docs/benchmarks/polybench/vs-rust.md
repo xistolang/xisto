@@ -83,9 +83,10 @@ Kernel time: Xisto **20 wins**, 6 ties, 4 losses (a tie is within 3%). The winne
 
 ## Notes
 
+- **floyd-warshall and heat-3d** were improved after this round (`b0c603b`): floyd-warshall 14.1 s on the Graviton2 and 10.6 s on the Xeon, heat-3d 1.83 s on the Xeon; Xisto now wins both on both machines. See [PolyBench](./index.md#the-last-two-fixed-after-the-round-b0c603b).
+
 - **symm and gemm on the Graviton2** show as losses in this round and tie when re-measured with the sides interleaved in one invocation (symm 4.53 s vs 4.59 s, gemm 0.646 s vs 0.642 s; `paired-symm-gemm-durbin-graviton2.txt`).
 - **durbin** (5 ms vs 3–4 ms here) ties after `479973f`, which proves `r[k - i - 1]` in range once per loop: 3 ms on the Graviton2, 4 ms on the Xeon, at the timer's millisecond resolution.
-- **heat-3d on the Xeon** and **floyd-warshall on the Graviton2** are the two losses being worked on; see [PolyBench](./index.md#what-is-left).
 - Rust's arrays are one block per matrix; Xisto's `number[][]` rows are separate allocations, as in any TypeScript program. The kernels where Xisto wins by 3–7× (2mm, 3mm, correlation, covariance, seidel-2d...) are loop transformations of the compiler, not a different algorithm: the same operations in the same order per element.
 
 Raw output: [bench/results/polybench-2026-11-14](https://github.com/xistolang/xisto/tree/main/bench/results/polybench-2026-11-14).

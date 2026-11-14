@@ -5,7 +5,7 @@ sidebar_position: 2
 
 # PolyBench: Xisto vs Rust and Go
 
-14 Nov 2026, main `0c439b7` (results measured on `9a6c2d3`; `durbin` below re-measured on `479973f`), on the two
+14 Nov 2026, main `0c439b7` (results measured on `9a6c2d3`, floyd-warshall and heat-3d on `b0c603b`; `durbin` below re-measured on `479973f`), on the two
 AWS VMs. [PolyBench/C 4.2.1](https://github.com/MatthiasJReisinger/PolyBenchC-4.2.1) is 30 numerical kernels
 (linear algebra, solvers, stencils, data mining, dynamic programming) used by compiler researchers to test loop
 optimizations. The Benchmarks Game measures programs; PolyBench measures the **compiler**.
@@ -35,8 +35,8 @@ One page per contestant, with kernel time, CPU and memory per kernel and the C r
 
 | machine | Xisto wins | ties | losses |
 |---|---:|---:|---:|
-| Xeon (x86-64) | **21** | 8 | 1 |
-| Graviton2 (ARM) | **20** | 9 | 1 |
+| Xeon (x86-64) | **22** | 8 | 0 |
+| Graviton2 (ARM) | **21** | 9 | 0 |
 
 On the Graviton2, `symm` and `gemm` came out as losses in the full round and tie when re-measured interleaved
 (symm 4.53 s vs Rust 4.59 s; gemm 0.646 s vs 0.642 s); they are counted as ties.
@@ -44,12 +44,24 @@ On the Graviton2, `symm` and `gemm` came out as losses in the full round and tie
 Graviton2 kernel 3 ms, the same as C and Rust; Xeon 4 ms vs Rust 3–4 ms, at the timer's millisecond resolution):
 counted as a tie on both.
 
-### What is left
+### The last two, fixed after the round (`b0c603b`)
 
-- **heat-3d on the Xeon, 1.07× in the round** (1.02–1.06× interleaved with Rust on
-  `479973f`): about half is that C and Rust know `N` at compile time; the rest is `number[][][]` keeping each row apart in memory where Rust has one block.
-- **floyd-warshall on the Graviton2, 1.05×**: the same scalar loop as Rust's, comparing 64-bit integers where
-  Rust compares 32-bit ones. Using 32 bits would change the result on overflow, so it stays.
+Kernel time, interleaved with Rust and C in one invocation, hash identical:
+
+| kernel | machine | Xisto before | Xisto after | Rust | C (ref.) |
+|---|---|---:|---:|---:|---:|
+| floyd-warshall | Graviton2 | 25.1 s | **14.1 s** | 23.8 s | 23.0 s |
+| floyd-warshall | Xeon | 18.7 s | **10.6 s** | 18.9 s | 18.2 s |
+| heat-3d | Xeon | 2.10 s | **1.83 s** | 1.96 s | 1.99 s |
+
+- **floyd-warshall**: at j = k the loop writes `min(path[i][k], path[i][k] + path[k][k])`; when `path[k][k] >= 0`
+  that writes the same value, so `path[i][k]` is read once before the j loop (checked once per entry, with the rows
+  apart; otherwise the loop runs as written). The j loop then vectorizes.
+- **heat-3d** (x86 only): the two sweeps of each time step fused one plane and one row apart: row (i, j) of B, then
+  row (i-1, j-1) of A, whose inputs are all ready. Each element keeps its expression and operands, so the bits are
+  the same; the rows in use stay in the L2 cache.
+
+**Xisto loses no kernel on either machine.**
 
 ## Why Xisto wins most of them
 
@@ -63,7 +75,7 @@ apart, so the Neoverse N1's stride prefetcher can follow a column (adi 13.5 → 
 
 ## Results (kernel time)
 
-The fastest of Xisto, Rust and Go in bold.
+The fastest of Xisto, Rust and Go in bold. ¹ after `b0c603b` (see above); the rest from the round on `9a6c2d3`.
 
 ### Xeon E5-2686 v4 (x86-64)
 
@@ -81,12 +93,12 @@ The fastest of Xisto, Rust and Go in bold.
 | doitgen | 739 ms | **91 ms** | 526 ms | 1.66 s | **win** |
 | durbin | 4 ms | 5 ms | **4 ms** | 5 ms | loss 1.25× |
 | fdtd-2d | 1.60 s | **1.61 s** | 1.82 s | 4.08 s | **win** |
-| floyd-warshall | 18.39 s | **18.83 s** | 18.93 s | 37.21 s | tie |
+| floyd-warshall | 18.39 s | **10.6 s**¹ | 18.93 s | 37.21 s | **win**¹ |
 | gemm | 421 ms | **419 ms** | 436 ms | 1.16 s | **win** |
 | gemver | 30 ms | **11 ms** | 29 ms | 44 ms | **win** |
 | gesummv | 6 ms | **3 ms** | 3 ms | 6 ms | tie |
 | gramschmidt | 7.71 s | **1.40 s** | 6.96 s | 6.82 s | **win** |
-| heat-3d | 2.12 s | 2.17 s | **2.03 s** | 6.78 s | loss 1.07× |
+| heat-3d | 2.12 s | **1.83 s**¹ | 2.03 s | 6.78 s | **win**¹ |
 | jacobi-1d | 0 ms | **1 ms** | 1 ms | 3 ms | tie |
 | jacobi-2d | 1.42 s | 1.51 s | **1.48 s** | 3.97 s | tie |
 | lu | 6.17 s | **2.27 s** | 5.89 s | 10.53 s | **win** |
@@ -116,7 +128,7 @@ The fastest of Xisto, Rust and Go in bold.
 | doitgen | 628 ms | **209 ms** | 526 ms | 1.61 s | **win** |
 | durbin | 3 ms | 5 ms | **3 ms** | 6 ms | loss 1.67× |
 | fdtd-2d | 1.88 s | **1.88 s** | 1.97 s | 4.78 s | **win** |
-| floyd-warshall | 23.11 s | 25.02 s | **23.87 s** | 60.85 s | loss 1.05× |
+| floyd-warshall | 23.11 s | **14.1 s**¹ | 23.87 s | 60.85 s | **win**¹ |
 | gemm | 618 ms | 657 ms | **619 ms** | 4.81 s | loss 1.06× |
 | gemver | 39 ms | **19 ms** | 37 ms | 51 ms | **win** |
 | gesummv | 6 ms | **2 ms** | 2 ms | 6 ms | tie |
