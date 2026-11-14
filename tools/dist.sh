@@ -12,15 +12,15 @@ NAME=xisto-$VERSION
 OUT=$ROOT/dist
 STAGE=$OUT/$NAME
 cd "$ROOT"
-for f in build/xisto build/qbe build/xisto_rt.o build/xisto_rt_dbg.o build/sqlite3.o build/sqlite3.h build/libbearssl.a build/bearssl-inc; do
+for f in build/xisto build/qbe build/xisto_rt.o build/xisto_rt_dbg.o build/sqlite3.o build/sqlite3.h build/libxszlib.a build/libxsbrotli.a build/zlib-inc build/libbearssl.a build/bearssl-inc; do
     [ -e "$f" ] || { echo "dist: $f is missing: run make first" >&2; exit 1; }
 done
 got=$(build/xisto --version)
 [ "$got" = "xisto $VERSION" ] || { echo "dist: build/xisto says '$got', expected 'xisto $VERSION' (make VERSION=$VERSION)" >&2; exit 1; }
 
 rm -rf "$STAGE" && mkdir -p "$STAGE/build" "$STAGE/bin"
-cp build/xisto build/qbe build/xisto_rt.o build/xisto_rt_dbg.o build/sqlite3.o build/sqlite3.h build/libbearssl.a "$STAGE/build/"
-cp -R build/bearssl-inc "$STAGE/build/"
+cp build/xisto build/qbe build/xisto_rt.o build/xisto_rt_dbg.o build/sqlite3.o build/sqlite3.h build/libxszlib.a build/libxsbrotli.a build/libbearssl.a "$STAGE/build/"
+cp -R build/bearssl-inc build/zlib-inc "$STAGE/build/"
 if [ -f build/awslc/lib/libssl.a ]; then
     mkdir -p "$STAGE/build/awslc"
     cp -R build/awslc/lib build/awslc/include "$STAGE/build/awslc/"

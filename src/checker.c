@@ -2976,6 +2976,38 @@ static Func *lookup_func(const char *name) {
     return NULL;
 }
 
+/* node:crypto's methods and functions whose result type depends on the arguments, as @types/node's overloads:
+   m(args, encoding) gives text and m(args) a Buffer: the call without the encoding goes to __m_bytes, a method
+   with one parameter less (hash.digest(), cipher.update(data, inEnc), cipher.final(), sign.sign(key));
+   key.export({ format: "der" | "jwk" }) goes to __export_der / __export_jwk (a Buffer, a JsonWebKey; "pem" is
+   text). Read at the call: the options must be an object literal there. */
+static const char *objlit_str(Expr *o, const char *key) {
+    if (!o || o->kind != E_OBJLIT) return NULL;
+    for (int i = 0; i < o->args.len; i++)
+        if (o->keys[i] && !strcmp(o->keys[i], key)) return o->args.items[i] && o->args.items[i]->kind == E_STRING ? o->args.items[i]->str : "";
+    return NULL;
+}
+static Func *find_method(Class *c, const char *name);
+static void crypto_method_overload(Expr *e, Class *c) {
+    Func *bm = find_method(c, xs_sprintf("__%s_bytes", e->str));
+    if (bm && find_method(c, e->str) && e->args.len <= bm->nparams) { e->str = bm->name; return; }
+    if (!strcmp(e->str, "export") && e->args.len == 0 && find_method(c, "__export_der")) { e->str = "__export_der"; return; } /* (a secret key's bytes) */
+    if (!strcmp(e->str, "export") && e->args.len == 1) {
+        const char *fmt = objlit_str(e->args.items[0], "format");
+        if (fmt && (!strcmp(fmt, "der") || !strcmp(fmt, "jwk")) && find_method(c, xs_sprintf("__export_%s", fmt))) e->str = xs_sprintf("__export_%s", fmt);
+    }
+}
+/* generateKeyPairSync(type, { publicKeyEncoding, privateKeyEncoding }): the keys as text (PEM), not KeyObjects */
+static Func *crypto_func_overload(Expr *e, Func *f) {
+    if (!f || !f->mod || !f->mod->file || strcmp(f->mod->file, "xisto:crypto") != 0 || strcmp(f->name, "generateKeyPairSync") != 0) return f;
+    if (e->args.len < 2 || (!objlit_str(e->args.items[1], "publicKeyEncoding") && !objlit_str(e->args.items[1], "privateKeyEncoding"))) return f;
+    SYM_EACH(funcs_by_name, "__generateKeyPairSync_pem", fe) {
+        Func *g = fe->decl;
+        if (g->mod == f->mod) return g;
+    }
+    return f;
+}
+
 static bool is_builtin_name(const char *n) {
     return strcmp(n, "Math") == 0 || strcmp(n, "console") == 0 || strcmp(n, "Number") == 0 || strcmp(n, "process") == 0 || strcmp(n, "Date") == 0 || strcmp(n, "performance") == 0 || strcmp(n, "Atomics") == 0 || strcmp(n, "lines") == 0 || strcmp(n, "chunks") == 0 || strcmp(n, "assert") == 0 ||
            strcmp(n, "String") == 0 || strcmp(n, "Array") == 0 || strcmp(n, "fetch") == 0 || strcmp(n, "Promise") == 0 || find_class(n) != NULL || find_enum(n) != NULL;
@@ -6785,9 +6817,7 @@ static void check_object_member_in(Expr *e, Class *c) {
         if (!g && find_method(c, xs_sprintf("__set_%s", e->str))) xs_error(XS8060, e->pos, "add get %s(): T { ... }", "'%s' of %s has a setter but no getter", e->str, c->name);
         if (g) { e->str = g->name; e->is_call = true; }
     }
-    if (e->is_call && e->args.len == 0 && !strcmp(e->str, "digest") && c->mod && c->mod->file && !strcmp(c->mod->file, "xisto:crypto") &&
-        (!strcmp(c->name, "Hash") || !strcmp(c->name, "Hmac")))
-        e->str = "__digestBytes"; /* hash.digest(): a Buffer (with an encoding, text) */
+    if (e->is_call && c->mod && c->mod->file && !strcmp(c->mod->file, "xisto:crypto")) crypto_method_overload(e, c);
     Func *m = find_method(c, e->str);
     if (!m && !e->is_call && !c->builtin) {
         /* an open class (a field `__expando: Record<string, any>`, as Express's Request): a property the class does
@@ -10052,7 +10082,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
-        Func *f = lookup_func(name);
+        Func *f = crypto_func_overload(e, lookup_func(name));
         if (!f) {
             Binding *b = lookup(name);
             if (b && b->type->kind == TY_FUNC) { /* calling a function value */

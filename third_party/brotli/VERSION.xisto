@@ -1,0 +1,4 @@
+Brotli 1.2.1 (the version Node 26 links), unmodified: https://github.com/google/brotli/archive/refs/tags/v1.2.1.tar.gz
+(sha256 98d35d11a78dc453aebb7d10c3748f3f73ff78c8267c0dc697b8631f67bf7e8f). Only c/common, c/dec, c/enc and
+c/include are kept (no tools, bindings or tests; enc/static_init_lazy.cc left out). Built by the Makefile into
+build/libxsbrotli.a, linked only into programs that import node:zlib, and only the parts they call.

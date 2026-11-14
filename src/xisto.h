@@ -727,6 +727,7 @@ typedef struct {
     bool uses_this_reg; /* XB-107: function (this: T) / method slots: the this register's helpers join the program */
     bool uses_tls;
     bool uses_crypto;  /* node:crypto, or a native package that needs it */
+    bool uses_zlib;    /* node:zlib: runtime/xisto_zlib.h joins the program, zlib (build/libxszlib.a) is linked */
     char **native_files; /* C sources of native packages (xisto.json "native"), compiled with the program */
     int nnative;
 } Program;

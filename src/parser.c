@@ -4797,7 +4797,9 @@ static Enum *parse_enum(Parser *p) {
    first) then the member's decorators (bottom up); constructor parameters; then the class (bottom up). */
 static bool class_decorated(Class *c) {
     if (c->decos.len || c->as_value) return true;
-    if (c->base_name && strcmp(c->base_name, "Error") == 0) return true; /* an error class: a value too (@Catch(MyError)) */
+    if (c->base_name && strcmp(c->base_name, "Error") == 0 && !(c->mod && c->mod->file && (!strcmp(c->mod->file, "xisto:crypto") || !strcmp(c->mod->file, "xisto:zlib"))))
+        return true; /* an error class: a value too (@Catch(MyError)); not node:crypto's and node:zlib's errors with a code, which
+                        would make every program that imports them carry xisto:reflect (~40 KB) */
     if (c->mixin) return true; /* class UpdateDto extends PartialType(CreateDto) {}: a value too (@Body() dto: UpdateDto) */
     for (int i = 0; i < c->nfields; i++) if (c->fields[i].decos.len) return true;
     for (int i = 0; i < c->nmethods; i++) {
@@ -6308,7 +6310,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         return m;
     }
     { /* Node's modules written in xisto over runtime functions (runtime/node/NAME.ts, NODE_TS in the Makefile) */
-        extern const unsigned char xs_node_events_ts[], xs_node_process_ts[], xs_node_http_ts[], xs_node_net_ts[], xs_node_dns_ts[], xs_node_child_process_ts[], xs_node_https_ts[], xs_node_buffer_ts[], xs_node_util_ts[], xs_node_querystring_ts[], xs_node_string_decoder_ts[];
+        extern const unsigned char xs_node_events_ts[], xs_node_process_ts[], xs_node_http_ts[], xs_node_net_ts[], xs_node_dns_ts[], xs_node_child_process_ts[], xs_node_https_ts[], xs_node_buffer_ts[], xs_node_util_ts[], xs_node_querystring_ts[], xs_node_string_decoder_ts[], xs_node_zlib_ts[];
         static const struct { const char *name; const unsigned char *src; bool net; bool tls; } node_ts[] = {
             {"events", xs_node_events_ts, false},
             {"process", xs_node_process_ts, true}, /* (signals and the exit hook live with the event loop) */
@@ -6321,6 +6323,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
             {"util", xs_node_util_ts, false},
             {"querystring", xs_node_querystring_ts, false},
             {"string_decoder", xs_node_string_decoder_ts, false},
+            {"zlib", xs_node_zlib_ts, false},
         };
         for (size_t i = 0; i < sizeof node_ts / sizeof node_ts[0]; i++) {
             if (strcmp(name, node_ts[i].name) != 0) continue;
@@ -6330,6 +6333,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
             m->native_prefix = "xs_";
             if (node_ts[i].net) prog->uses_net = true;
             if (node_ts[i].tls) prog->uses_tls = true; /* (node:https: a TLS server and https:// requests) */
+            if (strcmp(name, "zlib") == 0) prog->uses_zlib = true; /* (main.c: xisto_zlib.h and the zlib library) */
             m->loading = true;
             parse_module(prog, m);
             m->loading = false;
@@ -6373,7 +6377,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         prog->uses_okmap = true;
         return m;
     }
-    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:buffer, xisto:util, xisto:querystring, xisto:string_decoder, xisto:timers, xisto:http, xisto:https, xisto:net, xisto:dns, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:buffer, xisto:util, xisto:querystring, xisto:string_decoder, xisto:zlib, xisto:timers, xisto:http, xisto:https, xisto:net, xisto:dns, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
     return NULL;
 }
 
