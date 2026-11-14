@@ -12,11 +12,11 @@ How they were measured is in [Methodology](../performance/methodology.md).
 
 - The Benchmarks Game against Rust was re-run on 13 Nov 2026 (main `4a2f388`), against Node and Bun the same day
   (main `e5fb066`), PolyBench against Rust and Go on 14 Nov (main `40cdc16`). The other tables are from 5–10 Nov.
-- Bun wins or ties some rows: the Todo API, energy per HTTP request, streaming time and SQLite time. Those rows are
+- Bun wins or ties some rows: the Todo API, energy per HTTP request, streaming energy and SQLite time. Those rows are
   shown, not dropped.
 - Against Rust no Benchmarks Game problem is lost on either VM, and no PolyBench kernel against Rust or Go. Two rows are ties within 5%: spectral-norm on both VMs, at the
-  floor of the divisions the problem asks for. xisto's peak memory is at or below Rust's on every row (fannkuch-redux
-  on the Xeon within 0.1 MB).
+  floor of the divisions the problem asks for. xisto's peak memory is below Rust's on 9 of 10 rows on the Xeon (fannkuch-redux: 2.3 against
+  2.2 MB) and on all 10 on the Graviton2.
 
 ## Benchmarks Game against Rust
 
@@ -26,7 +26,7 @@ Fastest matching variant on each side, median of 3, 13 Nov 2026, main `4a2f388`,
 
 | machine | wins | ties (within 5%) | losses | memory |
 |---|---:|---:|---|---|
-| Xeon E5-2686 v4 (2 vCPUs) | 9 | 1 (spectral-norm) | none | at or below Rust (fannkuch-redux 2.3 against 2.2 MB) |
+| Xeon E5-2686 v4 (2 vCPUs) | 9 | 1 (spectral-norm) | none | below Rust on 9 of 10 (fannkuch-redux 2.3 against 2.2 MB) |
 | Graviton2 (2 vCPUs) | 9 | 1 (spectral-norm) | none | below Rust on all 10 |
 
 The per-problem tables are on [Xisto vs Rust](./benchmarks-game/vs-rust.md).
@@ -47,7 +47,7 @@ The per-kernel tables, with the C reference beside them, are on [PolyBench](./po
 
 ## Benchmarks Game against Node and Bun
 
-13 Nov 2026, the same xisto variants as the Rust round against the official Node programs under Node v26.12.0 and
+13 Nov 2026, the xisto variants of main `e5fb066` against the official Node programs under Node v26.12.0 and
 Bun 1.4.4, median of 3, on the Apple M4, the Xeon and the Graviton2. xisto wins every row on all three machines, on
 time and on memory: from 1.3× (regex-redux against Bun on the M4) to 200× (k-nucleotide against Node on the M4).
 Most xisto variants use every core while the Node programs use one, so the CPU columns are the fairer comparison;

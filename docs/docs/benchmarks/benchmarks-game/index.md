@@ -18,8 +18,8 @@ through `xisto:parallel` or `worker_threads`. Every output is checked bit for bi
 | Xisto vs Node 26 (main `e5fb066`) | 10 wins | 9 wins (fasta not scored) | 9 wins (fasta not scored) | [Xisto vs Node](./vs-node.md) |
 | Xisto vs Bun 1.4 (main `e5fb066`) | 10 wins | 9 wins (reverse-complement not scored) | 10 wins | [Xisto vs Bun](./vs-bun.md) |
 
-No problem is lost anywhere, and xisto's peak memory is at or below the other side's on every scored row (within
-0.1 MB on fannkuch-redux against Rust on the Xeon; see [Xisto vs Rust](./vs-rust.md)). Each page
+No problem is lost anywhere, and xisto's peak memory is below the other side's on every scored row but one:
+fannkuch-redux against Rust on the Xeon, 2.3 against 2.2 MB (see [Xisto vs Rust](./vs-rust.md)). Each page
 has the setup of its test, the tables per machine and the notes on each problem.
 
 ## The ten problems
@@ -51,8 +51,8 @@ has the setup of its test, the tables per machine and the notes on each problem.
 - **Inputs**: the stdin files are made once with xisto's fasta (`bench/benchmarksgame/out/fasta-25000000.txt` and
   `fasta-5000000.txt`) and read from the page cache.
 - **Scoring**: `bench/placar.py RESULTS [rust|node|bun]` picks each side's fastest variant whose output matched, or
-  a lighter one when it is close: up to 2% slower with at least 10% less memory, or 2–5% slower with at least 25%
-  less (marked †). A row is a tie when the times are within 5%.
+  a lighter one when it is close (marked †): up to 2% slower with at least 10% less memory, or 2–5% slower with at
+  least 25% less. A row is a tie when the times are within 5%.
 - **Builds**: xisto with `XISTO_CPU=native` (the default binary is portable; Rust builds with `target-cpu=native`).
 - **VMs**: AWS t2.medium (Xeon E5-2686 v4, 2 vCPUs, AVX2, Ubuntu, clang 21) and t4g.small (Graviton2, Neoverse-N1,
   2 vCPUs, Amazon Linux, clang 15). Both are burstable: each result file logs the `steal` counter before and after
@@ -60,8 +60,8 @@ has the setup of its test, the tables per machine and the notes on each problem.
 
 ## The plain program against the optimized one (10 Nov 2026)
 
-The plain `NAME.ts` stays within 1.10× of the best optimized xisto variant on all 8 problems that have one, on both
-machines (`bench/results/placar-final-2026-11-10.md`):
+The plain `NAME.ts` stays within 1.12× of the fastest optimized xisto variant on all 8 problems that have one, on both
+machines (`bench/results/vm-2026-11-07/rust-ubuntu-xeon-2026-11-10t.txt` and `rust-arm-graviton2-2026-11-10t.txt`):
 
 | problem | Xeon: plain ÷ optimized | Graviton2: plain ÷ optimized |
 |---|---:|---:|
@@ -70,8 +70,8 @@ machines (`bench/results/placar-final-2026-11-10.md`):
 | spectral-norm | 0.99 | 1.07 |
 | reverse-complement | 1.01 | 0.90 |
 | mandelbrot | 1.04 | 1.01 |
-| binary-trees | 1.06 | 1.05 |
-| k-nucleotide | 1.08 | 0.95 |
+| binary-trees | 1.12 | 1.05 |
+| k-nucleotide | 1.08 | 1.10 |
 | fannkuch-redux | 1.09 | 1.00 |
 
 

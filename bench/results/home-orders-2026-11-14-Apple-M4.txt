@@ -1,0 +1,20 @@
+# The homepage example (docs/src/pages/index.js, orders.ts), 14 Nov 2026, Apple M4, macOS; xisto main 4576cb2, Node v26.12.0
+# 11 runs each, xisto and Node alternating; wall time and peak RSS from /usr/bin/time -l; median
+# binary: 71240 bytes
+xisto: median 17 ms, peak RSS median 76 MB, output: 309270 orders over 100, revenue 37808257.5
+node: median 108 ms, peak RSS median 208 MB, output: 309270 orders over 100, revenue 37808257.5
+# program:
+  interface Order {
+    id: number;
+    customer: string;
+    total: number;
+  }
+  
+  const orders: Order[] = [];
+  for (let i = 0; i < 1_000_000; i++) {
+    orders.push({ id: i, customer: `c${i % 1000}`, total: (i % 97) * 1.5 });
+  }
+  
+  const big = orders.filter((o) => o.total > 100);
+  const revenue = big.reduce((sum, o) => sum + o.total, 0);
+  console.log(`${big.length} orders over 100, revenue ${revenue}`);

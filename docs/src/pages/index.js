@@ -9,7 +9,7 @@ const results = [
   {
     value: '0 losses',
     label: 'against Rust',
-    text: 'On a Xeon and a Graviton2: Benchmarks Game, 9 wins and 1 tie on each, with peak memory at or below Rust\'s; PolyBench, 30 kernels, 21 wins on each, no loss to Rust or Go.',
+    text: 'On a Xeon and a Graviton2: Benchmarks Game, 9 wins and 1 tie on each, with peak memory below Rust\'s on 19 of 20 rows; PolyBench, 30 kernels, 21 wins on each, no loss to Rust or Go.',
     to: '/docs/benchmarks/benchmarks-game/vs-rust',
   },
   {
@@ -135,7 +135,7 @@ export default function Home() {
               ))}
             </div>
             <p className={styles.note}>
-              Results of specific tests on stated machines (13 Nov 2026), not a promise for every program. Every number
+              Results of specific tests on stated machines (7–14 Nov 2026), not a promise for every program. Every number
               links to its table, its raw result file and the <Link to="/docs/performance/methodology">methodology</Link>;
               the cases where Xisto ties or loses are shown there too.
             </p>
@@ -156,7 +156,7 @@ export default function Home() {
                     <code>
                       <span className={styles.prompt}>$</span> xisto build orders.ts{'\n'}
                       <span className={styles.prompt}>$</span> ls -lh orders{'\n'}
-                      <span className={styles.dim}>-rwxr-xr-x  69K  orders</span>{'\n'}
+                      <span className={styles.dim}>-rwxr-xr-x  70K  orders</span>{'\n'}
                       <span className={styles.prompt}>$</span> ./orders{'\n'}
                       309270 orders over 100, revenue 37808257.5
                     </code>
@@ -164,10 +164,10 @@ export default function Home() {
                 </div>
                 <dl className={styles.facts}>
                   <div><dt>Xisto</dt><dd>17 ms, 76 MB peak</dd></div>
-                  <div><dt>The same file on Node 26</dt><dd>116 ms, 208 MB peak</dd></div>
+                  <div><dt>The same file on Node 26</dt><dd>108 ms, 208 MB peak</dd></div>
                 </dl>
                 <p className={styles.factsNote}>
-                  Apple M4, xisto 0.3.0, median of 11 runs. Same output on both, byte for byte.
+                  Apple M4, 14 Nov 2026, median of 11 runs (bench/results/home-orders-2026-11-14-Apple-M4.txt). Same output on both, byte for byte.
                 </p>
               </div>
             </div>

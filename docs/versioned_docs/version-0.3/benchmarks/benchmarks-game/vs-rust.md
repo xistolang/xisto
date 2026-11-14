@@ -22,7 +22,7 @@ language.
 - **Command**: `python3 bench/benchmarksgame/langs.py 3 rust=~/rustbg/target/release`, scored with
   `python3 bench/placar.py RESULTS` (see [How every run is measured](./index.md#how-every-run-is-measured)).
 - **Excluded xisto variant**: `spectralnorm-8` takes `1/d` from a float32 division refined to the same double. It is
-  measured (0.422 s on the Xeon, 0.874 s on the Graviton2) but not scored: the problem asks for the double
+  measured (0.436 s on the Xeon, 0.873 s on the Graviton2) but not scored: the problem asks for the double
   division, and the scoreboard keeps the problem as stated.
 - **Steal** during the round: +229 on the Xeon, +638 on the Graviton2.
 
@@ -44,7 +44,7 @@ Source: `bench/results/vm-2026-11-13/rust-ubuntu-xeon-2026-11-13-4a2f388.txt`.
 | spectral-norm | spectralnorm | spectralnorm_7 | 0.460 s | 0.462 s | 0.89 s | 0.89 s | 2.2 MB | 2.4 MB | tie |
 
 9 wins, 1 tie, no losses. xisto's peak memory is at or below Rust's on every problem but fannkuch-redux, 2.3 MB
-against 2.2 MB in this round (2.3 against 2.3–2.4 MB in the other rounds of the day). † Chosen for memory (up to 2%
+against 2.2 MB in this round. † Chosen for memory (up to 2%
 slower with at least 10% less memory, or up to 5% slower with at least 25% less). `nbody_9` and `nbody_7` are
 excluded because they compute `1/√x` with the approximate `rsqrtps` instruction and give different doubles.
 
@@ -74,7 +74,7 @@ moves the newlines to their output places before the reverse, so each line is on
 **spectral-norm**, both machines: the time is the 1.21 billion double divisions `1/d` the problem asks for. A C
 loop doing only those divisions takes the same CPU as both programs (0.88 s on the Xeon, 2.42 s on the Graviton2),
 so no program can be 5% ahead without caching the matrix (~240 MB) or computing `1/d` another way, which the
-problem does not allow. xisto is ahead by 1–2% on both.
+problem does not allow. xisto is ahead by less than 1% on both (0.460 against 0.462 s, 1.220 against 1.230 s).
 
 **mandelbrot on the Graviton2**, a tie until `e897e76`, is now a win (6% ahead). Two changes:
 - `mandelbrot-8` runs twelve pixels at a time after a byte with a pixel inside the set, and writes `2·zr·zi` as

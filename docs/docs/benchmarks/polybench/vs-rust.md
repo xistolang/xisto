@@ -84,7 +84,7 @@ Kernel time: Xisto **21 wins**, 9 ties, 0 losses (a tie is within 3%). The winne
 ## Notes
 
 - **atax, durbin, gesummv, jacobi-1d, trisolv** run in a few milliseconds; at the timer's millisecond resolution a difference of 1 ms is 15–30%, so they were re-measured interleaved where the round put them apart.
-- **jacobi-2d on the Xeon** now runs its two sweeps fused one row apart (as heat-3d), and **symm on the Graviton2** allocates its rows on 64-byte lines and jams two columns instead of sixteen; both were losses before `40cdc16`.
-- Rust's arrays are one block per matrix; Xisto's `number[][]` rows are separate allocations, as in any TypeScript program. The kernels where Xisto wins by 3–7× (2mm, 3mm, correlation, covariance, seidel-2d...) are loop transformations of the compiler, not a different algorithm: the same operations in the same order per element.
+- **jacobi-2d on the Xeon** now runs its two sweeps fused one row apart (as heat-3d), and **symm on the Graviton2** allocates its rows on 64-byte lines and jams two columns instead of sixteen; both were behind Rust in the round before (main `02c991f`: jacobi-2d 1.45 s against 1.40 s, symm 5.05 s against 4.52 s).
+- Rust's arrays are one block per matrix; Xisto's `number[][]` rows are separate allocations, as in any TypeScript program. The kernels where Xisto wins by 2–10× (2mm, 3mm, correlation, covariance, seidel-2d...) are loop transformations of the compiler, not a different algorithm: the same operations in the same order per element.
 
 Raw output: [bench/results/polybench-2026-11-14](https://github.com/xistolang/xisto/tree/main/bench/results/polybench-2026-11-14).

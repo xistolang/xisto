@@ -57,7 +57,8 @@ did not change.
 ## The numbers
 
 The same benchmark after the change, one thread, 64 connections, 5 Nov 2026: requests per second, p99 and CPU
-per 100,000 requests (`bench/results/*-deps.md`).
+per 100,000 requests. The raw output of this run (all three runtimes) was not kept; the xisto-only run of the same day
+kept in `bench/results/2026-11-05-Apple-M4-deps.csv` gives 55,557, 11,224, 2,942 and 633 req/s at 1, 5, 20 and 100 ms.
 
 | latency | ceiling | xisto | Bun | Node |
 |---:|---:|---|---|---|
@@ -68,7 +69,7 @@ per 100,000 requests (`bench/results/*-deps.md`).
 | 1 s | 64 | 64.0, 1.004 s, **4.93 s** | 64.0, 1.005 s, 15.6 s | 64.0, 1.020 s, 28.0 s |
 | 5 s | 12.8 | 12.8, 5.006 s, **10.4 s** | 12.8, 5.004 s, 20.8 s | 12.8, 5.014 s, 67.7 s |
 
-xisto reaches the ceiling at every latency, and waiting costs 2 to 7 times less CPU than on Bun and 5 to 9 times
+xisto reaches the ceiling at every latency, and waiting costs 2 to 3.5 times less CPU than on Bun and 4 to 9 times
 less than on Node: a parked coroutine costs nothing, only the `kevent` and the switch do. Memory during the run:
 10–24 MB for xisto, 22–44 MB for Bun, 114–255 MB for Node. With 16 worker threads the throughput stayed at the
 ceiling and the CPU per request went up 2 to 7 times, so one thread stayed the default.

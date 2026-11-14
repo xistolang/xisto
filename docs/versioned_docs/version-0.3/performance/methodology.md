@@ -14,7 +14,8 @@ Every number on the [Benchmarks](../benchmarks/index.md) pages comes from a scri
   session. Numbers from the Benchmarks Game site (measured on another machine) are never mixed in.
 - **Interleaved runs.** The runners alternate runtimes (xisto, Node, Bun, xisto, ...) instead of running each one
   in a block, so a change in machine load hits all of them.
-- **Median of at least 3.** Tables report the median of 3 interleaved runs. Close results are confirmed with 9.
+- **Median of at least 3.** Tables report the median of 3 interleaved runs. Close results are confirmed with 9 (PolyBench: 3 × 10 runs, the
+  four sides interleaved in one invocation).
   One early "17% gain" turned out to be code alignment: the same loop varied ~30% with a different layout. Since
   then every hypothesis is measured against the current compiler, rebuilt, in interleaved runs.
 - **Time, CPU and memory together.** Next to wall time: CPU time (user + system) and `par` (CPU ÷ wall, roughly the
@@ -45,15 +46,15 @@ fastest variant whose output matched, unless a lighter one is close (rule of 8 N
 - 2% to 5% slower and at least 25% less memory: the lighter one is chosen;
 - more than 5% slower: never.
 
-A tie is a difference within 5% either way.
+A tie is a difference within 5% either way in the Benchmarks Game, and within 3% in PolyBench (kernel time).
 
 ## Machines and versions
 
 | machine | details | used for |
 |---|---|---|
 | Apple M4 | macOS 15.5, 10 cores (4 performance) | micro programs, HTTP, energy, SQLite, streams, Benchmarks Game vs Node/Bun |
-| Xeon E5-2686 v4 | AWS t2.medium, 2 vCPUs, AVX2, Ubuntu | Benchmarks Game vs Rust and Node |
-| Graviton2 | AWS t4g.small, 2 vCPUs, arm64 | Benchmarks Game vs Rust and Node |
+| Xeon E5-2686 v4 | AWS t2.medium, 2 vCPUs, AVX2, Ubuntu | Benchmarks Game vs Rust, Node and Bun; PolyBench |
+| Graviton2 | AWS t4g.small, 2 vCPUs, arm64 | Benchmarks Game vs Rust, Node and Bun; PolyBench |
 
 Runtimes: Node v26.12.0 and Bun 1.4.4 on the M4 and on both VMs (13 Nov 2026; Node v24.22.2 on the VMs until 9 Nov). Rust: stable,
 `opt-level = 3`, `codegen-units = 1`, `-C target-cpu=native`, GMP for pidigits, as `bench/benchmarksgame/langs.md`

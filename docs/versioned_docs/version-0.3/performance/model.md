@@ -46,7 +46,8 @@ that work:
   time whether an iteration is running. Dual regions need a program without `try` anywhere, because an exception
   leaving the loop would leave the arena on. Binary-trees: 3.88 → 2.93 s (M4, 7 Nov 2026, design notes).
 - **Objects without a header.** A region class that is never printed, serialized or counted drops its header:
-  binary-trees' node is 16 bytes, not 24 (Xeon: −14% CPU, 350 → 300 MB; `src/emit.c`).
+  binary-trees' node went from 24 to 16 bytes (Xeon: −14% CPU, 350 → 300 MB; `src/emit.c`), and later to 8 (see
+  [Xisto vs Rust](../benchmarks/benchmarks-game/vs-rust.md)).
 - **Borrowed fields.** `const x = base.field` borrows instead of retaining when `base` outlives the scope
   (binarytrees-2: 0.65 → 0.42 s on the M4, 4.90 → 3.17 s on the Graviton2; `src/emit.c`).
 - **In-place update.** `x = x.with(v)`, where `with` only returns `new C(...)` of the same class, rewrites the old

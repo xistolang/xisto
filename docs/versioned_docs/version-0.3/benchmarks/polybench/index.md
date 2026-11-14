@@ -40,18 +40,20 @@ One page per contestant, with kernel time, CPU and memory per kernel and the C r
 
 Four kernels came out close in the round and were re-measured with the four sides interleaved in one invocation
 (marked ² in the tables, which show the interleaved times): on the Xeon fdtd-2d (1.62 s vs Rust 1.64 s), atax and
-durbin (8 ms and 4 ms on every side, at the timer's millisecond resolution); on the Graviton2 gemm (633 ms vs Rust
+durbin (8 ms and 4 ms on Xisto and Rust, at the timer's millisecond resolution); on the Graviton2 gemm (633 ms vs Rust
 630 ms). All four are ties.
 
 ### Since the previous round
 
-| kernel | machine | before | now | Rust | what changed |
+| kernel | machine | before¹ | now | Rust | what changed |
 |---|---|---:|---:|---:|---|
-| floyd-warshall | Graviton2 | 25.1 s | **14.0 s** | 23.7 s | `path[i][k]` read once before the j loop, which then vectorizes |
-| floyd-warshall | Xeon | 18.7 s | **10.5 s** | 18.8 s | the same |
-| heat-3d | Xeon | 2.10 s | **1.79 s** | 2.00 s | the two sweeps of a time step fused one plane and one row apart |
+| floyd-warshall | Graviton2 | 25.0 s | **14.0 s** | 23.7 s | `path[i][k]` read once before the j loop, which then vectorizes |
+| floyd-warshall | Xeon | 18.8 s | **10.5 s** | 18.8 s | the same |
+| heat-3d | Xeon | 2.17 s | **1.79 s** | 2.00 s | the two sweeps of a time step fused one plane and one row apart |
 | jacobi-2d | Xeon | 1.51 s | **1.24 s** | 1.41 s | the same fusion for two-dimensional stencils, one row apart |
 | symm | Graviton2 | 5.08 s | **4.25 s** | 4.52 s | rows on 64-byte lines and two columns jammed instead of sixteen |
+
+¹ The round of main `9a6c2d3` (`bench/results/polybench-2026-11-14/*-9a6c2d3.txt`).
 
 - **floyd-warshall**: at j = k the loop writes `min(path[i][k], path[i][k] + path[k][k])`; when `path[k][k] >= 0`
   that writes the same value, so `path[i][k]` is read once before the j loop (checked once per entry, with the rows
@@ -73,7 +75,7 @@ then applies loop transformations that a C compiler does not do on its own: unro
 recurrences (adi, deriche), selection reductions with several chains (nussinov), and a stencil nest with the row
 pointers in a table. Every transformation keeps the order of every floating-point operation, which is why the
 hashes match the C's bit for bit. On ARM Linux the runtime also places matrix rows an odd number of cache lines
-apart, so the Neoverse N1's stride prefetcher can follow a column (adi 13.5 → 10.2 s).
+apart, so the Neoverse N1's stride prefetcher can follow a column (adi 13.5 s before it, 10.35 s in this round).
 
 ## Results (kernel time)
 
