@@ -745,7 +745,7 @@ void distribute_program(Program *p); /* distribute.c: a pair loop over columns, 
 void inplace_program(Program *p); /* inplace.c: for-of over readStdinParts whose part stays in its iteration reads in place */
 extern bool xs_pad4; /* columns.c: x y z fields as one column of 4 lanes (x86 with AVX2) */
 void pad4_program(Program *p); /* pad4.c */
-extern int xs_jam_uj, xs_jam_uk, xs_skew_r;
+extern int xs_jam_uj, xs_jam_uk, xs_jam_ucol, xs_skew_r;
 extern bool xs_rows_seen; /* emit.c: the program indexes arrays of rows (main.c: XS_ROWPAD) */
 extern bool xs_sel_ic; /* emit.c: 8 chains in a selection reduction (main.c: non-Apple ARM) */
 extern bool xs_fuse; /* emit.c: two 3D stencil sweeps fused (main.c: x86) */

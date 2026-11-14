@@ -8735,6 +8735,10 @@ static char *bce_sel_plan(Stmt *s, const char *i) {
    syr2k slower on all three). main.c sets xs_jam_uk to 12 when the code is for an AVX2 x86 (--cpu=native there, or a
    named Haswell-or-later); any other target keeps 16 and 8. The init's jam in t (uj_emit_km) stays at 8. */
 int xs_jam_uj = 16, xs_jam_uk = 8;
+/* symm's form (a sum and column writes in the k loop: each lane also writes its own column of C) on ARM other than
+   Apple's: 4 (Graviton2 kernel 5.05 -> 4.53 s, Rust 4.47; 8 is 5.26, 2 is 4.86); the M4 keeps 16 (U=4 0.31 -> 0.47 s),
+   x86 too (Xeon 1.14 s at 16, Rust 2.10). 0: as the other forms. */
+int xs_jam_ucol = 0;
 typedef struct { Expr *e, *base, *idx; bool krow, self, lrow, mrow; int grp, yp; } UjLd; /* yp: a self load's post (Y table); lrow: X[j][c],
    the lane's own row (mvt: A[i][j] in a loop over j, i the lane), from a table by the lane */
 static UjLd uj_ld[24];
@@ -9228,7 +9232,7 @@ static bool uj_emit_loop(Stmt *s) {
     uj_kmode = false;
     if (!uj_match(s)) { if (!uj_match_k(s)) return false; uj_kmode = true; }
     bool kmode = uj_kmode;
-    int id = uj_cur = uj_ids++, U = kmode ? xs_jam_uk : xs_jam_uj;
+    int id = uj_cur = uj_ids++, U = kmode ? xs_jam_uk : nuj_kord && xs_jam_ucol ? xs_jam_ucol : xs_jam_uj;
     const char *ue = getenv("XISTO_UJAM_U");
     if (ue && atoi(ue) >= 2 && atoi(ue) <= 16) U = atoi(ue);
     bool ar = false;
@@ -10020,6 +10024,7 @@ static Expr *rs_lo[3], *rs_hi[3];
 static Stmt *rs_x;
 static bool rs_le[3];
 static int rs_op;
+static bool rs_pair2; /* (rs_fuse: a 2D nest of a fused pair, on x86 too) */
 static bool rs_match(Stmt *s) {
     if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_RSTEN") || bce_promo_t || bce_fw_loop) return false;
     bool forced = getenv("XISTO_RSTEN") && strcmp(getenv("XISTO_RSTEN"), "1") == 0;
@@ -10035,7 +10040,7 @@ static bool rs_match(Stmt *s) {
     }
     if (rs_D < 2 || !x || x->kind != S_EXPR || !x->expr || x->expr->kind != E_ASSIGN) return false;
     /* (x86: 2D off, 3D on, see above) */
-    if (!xs_rsten && !forced && (rs_D < 3 || getenv("XISTO_NO_RSTEN3"))) return false;
+    if (!xs_rsten && !forced && (rs_D < 3 ? !rs_pair2 : getenv("XISTO_NO_RSTEN3") != NULL)) return false;
     int op = rs_op = x->expr->op; /* (=, or op= as x = x op f became: fdtd-2d) */
     if (op != TK_ASSIGN && op != TK_PLUS_ASSIGN && op != TK_MINUS_ASSIGN && op != TK_STAR_ASSIGN && op != TK_SLASH_ASSIGN) return false;
     rs_nest = s;
@@ -10064,10 +10069,12 @@ static bool rs_match(Stmt *s) {
 typedef struct { Stmt *nest; int id, D, na; } RsMemo; /* (D, na: the nest's depth and arrays, for its row tables) */
 static RsMemo rs_memo[16];
 static int nrs_memo, rs_memo_ids;
+static int rs_memo_find_(Stmt *s) { for (int k = 0; k < nrs_memo; k++) if (rs_memo[k].nest == s) return rs_memo[k].id; return -1; }
 static Stmt *rs_memo_owner;
+static bool rs_fuse_pair(Stmt *s1, Stmt *s2);
 static void rs_memo_scan(Stmt *t, Stmt *outer, const char *oc) {
     if (!t || nrs_memo == 16) return;
-    if (t->kind == S_FOR && rs_match(t)) {
+    if (t->kind == S_FOR && rs_memo_find_(t) < 0 && rs_match(t)) {
         bool ok = !bce_row_store(outer);
         for (int b = 0; b < nrs_arr && ok; b++)
             ok = !bce_writes(outer, rs_arr[b].x) && !bce_declares(outer, rs_arr[b].x) && bce_ok(outer, rs_arr[b].x, rs_arr[b].t, false);
@@ -10076,7 +10083,19 @@ static void rs_memo_scan(Stmt *t, Stmt *outer, const char *oc) {
         return;
     }
     rs_memo_scan(t->body, outer, oc); rs_memo_scan(t->else_body, outer, oc); rs_memo_scan(t->for_init, outer, oc);
-    for (int k = 0; k < t->stmts.len; k++) rs_memo_scan(t->stmts.items[k], outer, oc);
+    for (int k = 0; k < t->stmts.len; k++) {
+        Stmt *a = t->stmts.items[k], *b = k + 1 < t->stmts.len ? t->stmts.items[k + 1] : NULL;
+        if (!rs_pair2 && a && b && a->kind == S_FOR && b->kind == S_FOR && nrs_memo <= 14 && rs_fuse_pair(a, b)) {
+            /* (two sweeps rs_fuse runs together: their memos, the 2D ones on x86 too) */
+            rs_pair2 = true;
+            rs_memo_scan(a, outer, oc);
+            rs_memo_scan(b, outer, oc);
+            rs_pair2 = false;
+            k++;
+            continue;
+        }
+        rs_memo_scan(a, outer, oc);
+    }
 }
 /* 3D: the leaf rows' data pointers in one table per array (rt: X[c1][c2].data at [c1 * W + c2]), filled by the guard's
    walk over the rows, so a row of the innermost loop is one load instead of a chain of four (Broadwell heat-3d
@@ -10135,35 +10154,54 @@ static void rs_plane(int id, const char *c1, char **L, char **Hh, char **RT, cha
    element is computed by the same expression from the same values, and the planes being reused are still in the
    cache. Rows one apart as well (S2's row j - 1 of plane i - 1 right after S1's row j of plane i): Xeon E5-2686 v4
    kernel 2.10 -> 1.83 s (Rust 1.96); x86 only (xs_fuse): Graviton2 3.66 -> 3.72, M4 0.734 -> 0.777. Guard: the two nests' own guards (ranges, every leaf row of both arrays apart), kept for the outer loop;
-   else the two nests as written. XISTO_NO_FUSE turns it off. */
+   else the two nests as written. The same for two 2D sweeps, one row apart (jacobi-2d: S1's row i, then S2's row
+   i - 1): Xeon kernel 1.43 -> 1.26 s (Rust 1.39); on x86 those nests take this path only as a pair (rs_pair2: a 2D
+   nest alone keeps the loop as written there). XISTO_NO_FUSE turns it off. */
 bool xs_fuse = true; /* main.c: x86 only */
 static bool fz_busy;
 static bool rs_emit_loop(Stmt *s);
-static bool rs_fuse(Stmt *s1) {
+static const char *fz_Ls[2][3], *fz_Hs[2][3];
+static bool fz_le[2][3];
+static int fz_D;
+/* s1 then s2 two sweeps rs_fuse can run together (both 2D or both 3D); the bounds of s1 in fz_Ls / fz_Hs / fz_le */
+static bool rs_fuse_pair(Stmt *s1, Stmt *s2) {
     static int off = -1;
     if (off < 0) off = getenv("XISTO_NO_FUSE") != NULL || !(xs_fuse || getenv("XISTO_FUSE")); /* (XISTO_FUSE: on anywhere) */
-    if (off || fz_busy || rs_mode || !blk_cur || blk_cur->kind != S_BLOCK || blk_cur_i + 1 >= blk_cur->stmts.len || blk_cur->stmts.items[blk_cur_i] != s1) return false;
-    Stmt *s2 = blk_cur->stmts.items[blk_cur_i + 1];
-    if (!s2 || s2->kind != S_FOR || rs_memo_find(s1) < 0 || rs_memo_find(s2) < 0) return false;
-    const char *W[2], *R[2], *Ls[2][3], *Hs[2][3];
-    bool le[2][3];
+    if (off || !s1 || !s2 || s1->kind != S_FOR || s2->kind != S_FOR) return false;
+    const char *W[2], *R[2];
     Stmt *ss[2] = {s1, s2};
-    for (int n = 0; n < 2; n++) {
-        if (!rs_match(ss[n]) || rs_D != 3 || rs_op != TK_ASSIGN || nrs_arr != 2) return false;
+    bool p0 = rs_pair2, ok = true;
+    rs_pair2 = true;
+    for (int n = 0; n < 2 && ok; n++) {
+        if (!rs_match(ss[n]) || (rs_D != 2 && rs_D != 3) || (n && rs_D != fz_D) || rs_op != TK_ASSIGN || nrs_arr != 2) { ok = false; break; }
+        fz_D = rs_D;
         int w = rs_w, o = 1 - rs_w;
-        for (int d = 0; d < 3; d++) {
-            if (rs_kmin[w][d] || rs_kmax[w][d]) return false; /* (its own element only) */
-            Ls[n][d] = bce_raw(rs_lo[d]); Hs[n][d] = bce_raw(rs_hi[d]); le[n][d] = rs_le[d];
+        for (int d = 0; d < rs_D; d++) {
+            if (rs_kmin[w][d] || rs_kmax[w][d]) ok = false; /* (its own element only) */
+            fz_Ls[n][d] = bce_raw(rs_lo[d]); fz_Hs[n][d] = bce_raw(rs_hi[d]); fz_le[n][d] = rs_le[d];
         }
-        if (rs_kmin[o][0] < -1 || rs_kmax[o][0] > 1) return false;
-        /* one row apart too: S1's row (i, j) reads S2's plane i - 1 at rows j - 1 and up (S2 writes row j - 1 after
+        if (rs_kmin[o][0] < -1 || rs_kmax[o][0] > 1) ok = false;
+        /* 3D, one row apart too: S1's row (i, j) reads S2's plane i - 1 at rows j - 1 and up (S2 writes row j - 1 after
            it), S2's row (i - 1, j - 1) reads S1's plane i at rows j and down */
-        for (int r = 0; r < nrs_row; r++)
-            if (rs_row[r].arr == o && rs_row[r].K[0] == (n ? 1 : -1) && (n ? rs_row[r].K[1] > 1 : rs_row[r].K[1] < -1)) return false;
+        if (rs_D == 3)
+            for (int r = 0; r < nrs_row; r++)
+                if (rs_row[r].arr == o && rs_row[r].K[0] == (n ? 1 : -1) && (n ? rs_row[r].K[1] > 1 : rs_row[r].K[1] < -1)) ok = false;
         W[n] = rs_arr[w].x; R[n] = rs_arr[o].x;
     }
-    if (strcmp(W[0], R[1]) || strcmp(W[1], R[0]) || !strcmp(W[0], W[1])) return false;
-    for (int d = 0; d < 3; d++) if (strcmp(Ls[0][d], Ls[1][d]) || strcmp(Hs[0][d], Hs[1][d]) || le[0][d] != le[1][d]) return false;
+    rs_pair2 = p0;
+    if (!ok || strcmp(W[0], R[1]) || strcmp(W[1], R[0]) || !strcmp(W[0], W[1])) return false;
+    for (int d = 0; d < fz_D; d++) if (strcmp(fz_Ls[0][d], fz_Ls[1][d]) || strcmp(fz_Hs[0][d], fz_Hs[1][d]) || fz_le[0][d] != fz_le[1][d]) return false;
+    return true;
+}
+static bool rs_fuse(Stmt *s1) {
+    if (fz_busy || rs_mode || !blk_cur || blk_cur->kind != S_BLOCK || blk_cur_i + 1 >= blk_cur->stmts.len || blk_cur->stmts.items[blk_cur_i] != s1) return false;
+    Stmt *s2 = blk_cur->stmts.items[blk_cur_i + 1];
+    if (!s2 || s2->kind != S_FOR || rs_memo_find(s1) < 0 || rs_memo_find(s2) < 0 || !rs_fuse_pair(s1, s2)) return false;
+    const char *(*Ls)[3] = fz_Ls, *(*Hs)[3] = fz_Hs;
+    bool (*le)[3] = fz_le;
+    int D = fz_D;
+    bool p0 = rs_pair2;
+    rs_pair2 = true; /* (the 2D nests' rs_match below, on x86 too) */
     static int ids;
     int id = ids++;
     const char *ok = xs_sprintf("fz%d_", id), *c = xs_sprintf("fi%d_", id);
@@ -10171,6 +10209,25 @@ static bool rs_fuse(Stmt *s1) {
     buf_printf(out, "{ bool %s = 1; ", ok);
     rs_fz_ok = ok;
     rs_mode = 1; rs_emit_loop(s1); rs_emit_loop(s2);
+    if (D == 2) { /* rows: S1(1), S1(2) S2(1), ..., S2(last) */
+        const char *cm2 = xs_sprintf("(%s - 1)", c);
+        buf_printf(out, "if (%s) { for (int64_t %s = %s; %s <= %s; %s++) { { ", ok, c, L0, c, H0, c);
+        rs_mode = 2;
+        rs_plane_c1 = c; rs_emit_loop(s1);
+        buf_printf(out, "} if (%s - 1 >= %s) { ", c, L0);
+        rs_plane_c1 = cm2; rs_emit_loop(s2);
+        buf_printf(out, "} } if (%s >= %s) { ", H0, L0);
+        rs_plane_c1 = H0; rs_emit_loop(s2);
+        buf_puts(out, "} } else { ");
+        rs_mode = 0;
+        rs_pair2 = p0;
+        fz_busy = true;
+        emit_stmt(s1); emit_stmt(s2);
+        fz_busy = false;
+        buf_puts(out, " } }");
+        fz_skip = s2;
+        return true;
+    }
     char *L1 = (char *)Ls[0][1], *H1 = le[0][1] ? xs_sprintf("(%s)", Hs[0][1]) : xs_sprintf("((%s) - 1)", Hs[0][1]);
     const char *cj = xs_sprintf("fj%d_", id), *cm = xs_sprintf("(%s - 1)", c);
     buf_printf(out, "if (%s) { int64_t %s = %s; for (; %s <= %s; %s++) { bool lag_ = %s - 1 >= %s; for (int64_t %s = %s; %s <= %s; %s++) { ", ok, c, L0, c, H0, c,
@@ -10186,6 +10243,7 @@ static bool rs_fuse(Stmt *s1) {
     rs_plane_c1 = H0; rs_emit_loop(s2);
     buf_puts(out, "} } else { ");
     rs_mode = 0;
+    rs_pair2 = p0;
     fz_busy = true;
     emit_stmt(s1); emit_stmt(s2);
     fz_busy = false;

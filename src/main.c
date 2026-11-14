@@ -431,6 +431,7 @@ static Buf compile_to_c(const char *path) {
                              false;
 #endif
     xs_skew_r = arm && apple ? 16 : arm || x86 ? 12 : 8;
+    xs_jam_ucol = arm && !apple ? 4 : 0; /* (emit.c: symm's jam on the Neoverse) */
     xs_rsten = !x86;
     xs_fuse = x86; /* (emit.c, rs_fuse: heat-3d Xeon 2.10 -> 1.83 s; Graviton2 and M4 slower) */
     xs_sel_ic = arm && !apple; /* (emit.c: 8 chains in a max/min reduction; on the Graviton2 nussinov gains, on the M4 (malloc steps rows by 10240 B) 1,63 -> 2,98 s, on the Broadwell 4,04 -> 5,48) */
