@@ -6,6 +6,7 @@
 // one server per program. IncomingMessage is a stream.Readable (data, end, pipe, for await).
 import { EventEmitter, Listener } from "xisto:events";
 import { Readable } from "xisto:stream";
+import { channel, _skipNextFetch } from "xisto:diagnostics_channel";
 
 declare function http_bind(s: Server, port: int): int;
 declare function http_close(): void;
@@ -194,6 +195,17 @@ export type RequestListener = (req: IncomingMessage, res: ServerResponse) => voi
 
 let current: HttpServer | null = null;
 
+/** The message of node:diagnostics_channel's http.server.* and http.client.* channels (as Node's). */
+export class HttpChannelMessage {
+  request: any;
+  response: any = null;
+  server: HttpServer | null = null;
+  error: Error | null = null;
+  constructor(request: any) {
+    this.request = request;
+  }
+}
+
 async function answer(req: HttpRequest): Promise<HttpResponse> {
   const srv = current;
   const msg = new IncomingMessage();
@@ -213,8 +225,22 @@ async function answer(req: HttpRequest): Promise<HttpResponse> {
     res._onDone(resolve);
   });
   msg._flow(); // (the body waits in the stream's buffer: an async listener that reads it runs within the emit)
+  const startCh = channel("http.server.request.start");
+  if (startCh.hasSubscribers) {
+    const m = new HttpChannelMessage(msg);
+    m.response = res;
+    m.server = srv;
+    startCh.publish(m);
+  }
   if (srv !== null) srv.emit("request", msg, res);
   await finished;
+  const finCh = channel("http.server.response.finish");
+  if (finCh.hasSubscribers) {
+    const m = new HttpChannelMessage(msg);
+    m.response = res;
+    m.server = srv;
+    finCh.publish(m);
+  }
   res.writableFinished = true;
   setImmediate(() => {
     res.emit("finish");
@@ -339,11 +365,14 @@ export class ClientRequest extends EventEmitter {
     return this;
   }
   private async send(): Promise<void> {
+    const startCh = channel("http.client.request.start");
+    if (startCh.hasSubscribers) startCh.publish(new HttpChannelMessage(this)); // (a subscriber may setHeader())
     const h: Record<string, string> = {};
     for (const k of this.headers.keys()) h[k] = this.headers.get(k) ?? "";
     const body = this.chunks.join("");
     try {
       const rest = this.url.slice(this.expected().length + 2);
+      _skipNextFetch();
       const r = await this.fetchRest(rest, !(this.method === "GET" || this.method === "HEAD"), h, body);
       const msg = new IncomingMessage();
       msg.statusCode = r.status;
@@ -354,9 +383,21 @@ export class ClientRequest extends EventEmitter {
         msg.rawHeaders.push(v);
       });
       msg._setBody(r.text());
+      const finCh = channel("http.client.response.finish");
+      if (finCh.hasSubscribers) {
+        const m = new HttpChannelMessage(this);
+        m.response = msg;
+        finCh.publish(m);
+      }
       this.emit("response", msg);
       msg._flow();
     } catch (err) {
+      const errCh = channel("http.client.request.error");
+      if (errCh.hasSubscribers) {
+        const m = new HttpChannelMessage(this);
+        m.error = err as Error;
+        errCh.publish(m);
+      }
       this.emit("error", err as Error);
     }
   }

@@ -427,6 +427,23 @@ Strings inside objects are quoted as Node quotes them: `'...'`, or `"..."` when 
 when it has both; `\`, tabs, `\r` and other control characters are escaped (`\x1B`). A long string with line
 breaks inside an object is printed one line per piece, joined by `+`, as Node does.
 
+## diagnostics_channel
+
+`node:diagnostics_channel` has `channel(name)` (`subscribe`, `unsubscribe`, `publish`, `hasSubscribers`),
+`subscribe`, `unsubscribe` and `hasSubscribers`. `node:http` and `fetch` publish to Node's channels, with Node's
+message shapes:
+
+- `http.server.request.start` / `http.server.response.finish` (`request`, `response`, `server`);
+- `http.client.request.start` / `http.client.response.finish` / `http.client.request.error`;
+- `undici:request:create` / `undici:request:headers` / `undici:request:error` for `fetch`. The request has
+  `origin`, `method`, `path` and `addHeader(name, value)`, which adds a header before the request is sent.
+
+APM agents use these channels to trace incoming and outgoing HTTP; the xisto-apm package subscribes to them. A
+channel nobody listens to costs one test of a boolean.
+
+Differences from Node: the class is `DiagnosticsChannel`, because `Channel` is xisto's channel between tasks.
+`TracingChannel` is not available yet.
+
 ## https and tls
 
 `https.createServer({ key, cert }, listener)` is `http.createServer` over TLS. `key` and `cert` are PEM text or

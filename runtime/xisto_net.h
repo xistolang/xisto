@@ -2161,7 +2161,61 @@ XS_NOINLINE void xs_fetch_aborted(int kind) {
 XS_NOINLINE xs_Response *xs_fetch_once(xs_str *url, xs_str *method, xs_str *body, int nh, xs_str **hdrs, int64_t timeout_ms, xs_Uint8Array *abort);
 /* redirects are followed as fetch does (redirect: "follow", at most 20): 303, and 301/302 after a POST, go on as a GET
    without a body; response.url is the URL of the last request */
+/* node:diagnostics_channel's undici:request:* (runtime/node/diagnostics_channel.ts): once something subscribes, each fetch
+   calls start(url, method) before it is sent, which gives back an id and the headers to add ("id\nname\nvalue\n..."),
+   and end(id, status, error) once it is answered or failed. Borrowed: the module's globals hold them. */
+static XS_TLS xs_closure *xs_fetch_hook_start, *xs_fetch_hook_end;
+XS_NOINLINE void xs_fetch_hooks(xs_closure *start, xs_closure *end) { xs_fetch_hook_start = start; xs_fetch_hook_end = end; }
+XS_NOINLINE xs_Response *xs_fetch_full_raw(xs_str *url, xs_str *method, xs_str *body, int nh, xs_str **hdrs, int64_t timeout_ms, xs_Uint8Array *abort);
 XS_NOINLINE xs_Response *xs_fetch_full(xs_str *url, xs_str *method, xs_str *body, int nh, xs_str **hdrs, int64_t timeout_ms, xs_Uint8Array *abort) {
+    if (!xs_fetch_hook_start) return xs_fetch_full_raw(url, method, body, nh, hdrs, timeout_ms, abort);
+    xs_str *get = xs_str_new("GET", 3);
+    xs_str *spec = ((xs_str *(*)(void *, xs_str *, xs_str *))xs_fetch_hook_start->fn)(xs_fetch_hook_start, url, method ? method : get);
+    xs_release(get);
+    /* the id, then name/value lines: the headers the subscribers added, after the program's own */
+    int cap = nh + 64, n = nh;
+    xs_str **all = malloc(sizeof(xs_str *) * (size_t)cap);
+    for (int i = 0; i < nh; i++) all[i] = hdrs[i];
+    const char *p = spec->data, *end = spec->data + spec->len;
+    const char *nl = memchr(p, '\n', (size_t)(end - p));
+    xs_str *id = xs_str_new(p, nl ? (size_t)(nl - p) : (size_t)(end - p));
+    p = nl ? nl + 1 : end;
+    int made0 = n;
+    while (p < end && n + 2 <= cap) {
+        const char *a = memchr(p, '\n', (size_t)(end - p));
+        if (!a) break;
+        const char *b = memchr(a + 1, '\n', (size_t)(end - a - 1));
+        if (!b) b = end;
+        all[n++] = xs_str_new(p, (size_t)(a - p));
+        all[n++] = xs_str_new(a + 1, (size_t)(b - a - 1));
+        p = b < end ? b + 1 : end;
+    }
+    xs_release(spec);
+    xs_Response *r = NULL;
+    jmp_buf jb;
+    xs_try_push(&jb);
+    if (_setjmp(jb) == 0) {
+        r = xs_fetch_full_raw(url, method, body, n, all, timeout_ms, abort);
+        xs_try_pop();
+    } else {
+        void *err = xs_caught();
+        for (int i = made0; i < n; i++) xs_release(all[i]);
+        free(all);
+        xs_Error *ew = xs_Error_of_unknown(err);
+        ((void (*)(void *, xs_str *, int64_t, xs_str *))xs_fetch_hook_end->fn)(xs_fetch_hook_end, id, 0, ew->f_message);
+        xs_release(ew);
+        xs_release(id);
+        xs_throw(err);
+    }
+    for (int i = made0; i < n; i++) xs_release(all[i]);
+    free(all);
+    xs_str *none = xs_str_new("", 0);
+    ((void (*)(void *, xs_str *, int64_t, xs_str *))xs_fetch_hook_end->fn)(xs_fetch_hook_end, id, (int64_t)r->f_status, none);
+    xs_release(none);
+    xs_release(id);
+    return r;
+}
+XS_NOINLINE xs_Response *xs_fetch_full_raw(xs_str *url, xs_str *method, xs_str *body, int nh, xs_str **hdrs, int64_t timeout_ms, xs_Uint8Array *abort) {
     /* (the URLs of the redirects go to the autorelease pool: a timeout or an abort thrown from a hop leaks nothing) */
     xs_str *cur = url, *m = method, *b = body;
     for (int hops = 0;; hops++) {
