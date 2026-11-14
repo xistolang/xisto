@@ -5411,8 +5411,26 @@ static xs_str *xs_process_cwd(void) { /* process.cwd() */
 #endif
     return xs_str_new(b, strlen(b));
 }
-static void xs_process_exit(int64_t code) { fflush(stdout); exit((int)code); }
 static int xs_exit_code_; /* process.exitCode: the status when the program ends on its own */
+/* process.on('exit' | 'beforeExit'): runtime/node/process.ts's dispatcher, called with (code, before) */
+static xs_closure *xs_pexit_cb;
+static void (*xs_rt_cleanup)(void); /* (process.ts's signal dispatcher, let go at the end) */
+XS_NOINLINE void xs_process_on_exit(xs_closure *cb) { if (!xs_pexit_cb) xs_pexit_cb = xs_retain(cb); }
+static void xs_pexit_call(xs_closure *cb, int64_t code, bool before) {
+    size_t mark = xs_ar_mark();
+    ((void (*)(void *, int64_t, bool))cb->fn)(cb, code, before);
+    xs_ar_drain(mark);
+}
+static void xs_process_exit(int64_t code) {
+    xs_exit_code_ = (int)code;
+    if (xs_pexit_cb) { /* 'exit' (not 'beforeExit'), as Node does for process.exit() */
+        xs_closure *cb = xs_pexit_cb;
+        xs_pexit_cb = NULL;
+        xs_pexit_call(cb, code, false);
+    }
+    fflush(stdout);
+    exit((int)code);
+}
 static int64_t xs_process_set_exit_code(int64_t code) { xs_exit_code_ = (int)code; return code; }
 /* process.stdout.write / process.stderr.write: through the same FILE as console.log, so the order is kept */
 static inline void xs_out_drain(void);
@@ -8840,6 +8858,21 @@ static void xs_before_exit(void) {
     void (*h)(void) = xs_exit_hook;
     xs_exit_hook = NULL;
     if (h) h();
+    if (xs_pexit_cb) {
+        /* 'beforeExit' each time the work runs out (its listeners may start more), then 'exit' */
+        for (;;) {
+            xs_pexit_call(xs_pexit_cb, xs_exit_code_, true);
+            void (*more)(void) = xs_exit_hook;
+            xs_exit_hook = NULL;
+            if (!more) break;
+            more();
+        }
+        xs_closure *cb = xs_pexit_cb;
+        xs_pexit_cb = NULL;
+        xs_pexit_call(cb, xs_exit_code_, false);
+        xs_release(cb);
+    }
+    if (xs_rt_cleanup) { void (*c)(void) = xs_rt_cleanup; xs_rt_cleanup = NULL; c(); }
 }
 /* ---- regions (the compiler's region.c) ----
    The objects of a region class are made in one loop and cannot outlive an iteration of it: they come from an

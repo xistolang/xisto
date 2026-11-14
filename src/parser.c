@@ -59,6 +59,7 @@ static bool wants_arrays; /* a .reduce( / .flatMap( / .flat( call, or an Iterabl
 static bool wants_settled; /* Promise.allSettled was named: xisto:settled is loaded */
 static bool wants_okmap; /* WeakMap, or Map<object, V>, was written: xisto:okmap is loaded */
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
+static void import_process(Program *prog, Module *m);
 static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... was named: xisto:url is loaded */
 static bool is_url_global_name(const char *n);
 /* generics: the type parameters in scope while a template is parsed, or their types while an instance is */
@@ -1440,6 +1441,17 @@ static Expr *parse_primary(Parser *p) {
             return new_expr(E_NULL, pos);
         }
         if (is_url_global_name(p->tok.str)) wants_url = true; /* (AbortSignal.timeout(n): a member read made here) */
+        if (strcmp(p->tok.str, "process") == 0) { /* process.on(...), process.platform...: xisto:process */
+            Parser look = *p;
+            next(&look);
+            if (at(&look, TK_DOT)) {
+                next(&look);
+                static const char *const core[] = {"argv", "env", "pid", "cwd", "exit", "stdout", "stderr", NULL};
+                bool is_core = false;
+                for (int i = 0; core[i]; i++) if (look.tok.str && strcmp(look.tok.str, core[i]) == 0) is_core = true;
+                if (!is_core) import_process(p->prog, p->mod);
+            }
+        }
         Expr *e = new_expr(E_IDENT, pos);
         e->str = p->tok.str;
         next(p);
@@ -4523,6 +4535,30 @@ static bool pkg_available(const char *from_file, const char *name) {
     }
     return false;
 }
+static Module *load_module(Program *prog, const char *file, Pos from_pos, const char *from_file);
+/* process.X beyond the members the compiler builds in: the module reads XistoProcess.X (checker), so it imports
+   XistoProcess from xisto:process (runtime/node/process.ts), once */
+static void import_process(Program *prog, Module *m) {
+    if (!m) return;
+    for (int i = 0; i < m->nimports; i++)
+        if (m->imports[i].path && strcmp(m->imports[i].path, "xisto:process") == 0) return;
+    Import im = {0};
+    im.pos = (Pos){1, 1};
+    im.names = xs_alloc(sizeof(char *));
+    im.positions = xs_alloc(sizeof(Pos));
+    im.names[0] = "XistoProcess";
+    im.positions[0] = im.pos;
+    im.n = 1;
+    im.path = "xisto:process";
+    /* (loaded now: the module's own imports were loaded before its body, where process.X usually is) */
+    const char *sf = xs_file_name, *ss = xs_source;
+    Program *spp = parsing_prog;
+    Module *spm = parsing_mod;
+    im.from = load_module(prog, "xisto:process", im.pos, m->path);
+    xs_file_name = sf; xs_source = ss; parsing_prog = spp; parsing_mod = spm;
+    m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+    m->imports[m->nimports++] = im;
+}
 static void parse_import(Parser *p, Module *m) {
     Pos pos = p->tok.pos;
     expect(p, TK_IMPORT, NULL);
@@ -4542,6 +4578,24 @@ static void parse_import(Parser *p, Module *m) {
         has_dflt = true;
         next(p);
         next(p);
+    }
+    { /* import process from "node:process" (or * as process): the global process, nothing to bind */
+        Parser look = *p;
+        bool star = at(&look, TK_STAR);
+        if (star) { next(&look); if (at_ident(&look, "as")) next(&look); }
+        if (at(&look, TK_IDENT) && strcmp(look.tok.str, "process") == 0) {
+            next(&look);
+            if (at_ident(&look, "from")) {
+                next(&look);
+                if (at(&look, TK_STRING) && (!strcmp(look.tok.str, "node:process") || !strcmp(look.tok.str, "process") || !strcmp(look.tok.str, "xisto:process"))) {
+                    next(&look);
+                    *p = look;
+                    expect_semi(p);
+                    import_process(p->prog, m);
+                    return;
+                }
+            }
+        }
     }
     if (!has_dflt && at(p, TK_IDENT)) { /* import name from "m": m's default export, which must have this name */
         Token name = p->tok;
@@ -6241,9 +6295,10 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         return m;
     }
     { /* Node's modules written in xisto over runtime functions (runtime/node/NAME.ts, NODE_TS in the Makefile) */
-        extern const unsigned char xs_node_events_ts[];
-        static const struct { const char *name; const unsigned char *src; } node_ts[] = {
-            {"events", xs_node_events_ts},
+        extern const unsigned char xs_node_events_ts[], xs_node_process_ts[];
+        static const struct { const char *name; const unsigned char *src; bool net; } node_ts[] = {
+            {"events", xs_node_events_ts, false},
+            {"process", xs_node_process_ts, true}, /* (signals and the exit hook live with the event loop) */
         };
         for (size_t i = 0; i < sizeof node_ts / sizeof node_ts[0]; i++) {
             if (strcmp(name, node_ts[i].name) != 0) continue;
@@ -6251,6 +6306,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
             m->file = xs_sprintf("xisto:%s", name);
             m->src = (char *)node_ts[i].src;
             m->native_prefix = "xs_";
+            if (node_ts[i].net) prog->uses_net = true;
             m->loading = true;
             parse_module(prog, m);
             m->loading = false;
@@ -6258,6 +6314,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         }
     }
     if (strcmp(name, "perf_hooks") == 0) return m; /* performance is built in (performance.now()) */
+    if (strcmp(name, "timers") == 0) return m; /* setTimeout & co are the built-in globals (checker: import check) */
     if (strcmp(name, "worker_threads") == 0 || strcmp(name, "os") == 0) { /* written in xisto over runtime functions */
         bool wt = strcmp(name, "worker_threads") == 0;
         m->builtin = false;
@@ -6268,7 +6325,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         parse_module(prog, m);
         m->loading = false;
         if (wt) prog->uses_workers = true;
-        else prog->uses_net = true; /* (xisto:os: its functions live in xisto_net.h) */
+        prog->uses_net = true; /* (xisto:os: its functions live in xisto_net.h; worker_threads: MessagePort, also for an import alone) */
         return m;
     }
     if (strcmp(name, "v8") == 0) { /* written in xisto over runtime functions (see xs_v8_src) */
@@ -6299,7 +6356,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         add_func(prog, f);
         return m;
     }
-    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:timers, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
     return NULL;
 }
 

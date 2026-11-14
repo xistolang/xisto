@@ -759,6 +759,7 @@ static bool xs_tmr_timeout(struct timespec *ts) {
     return true;
 }
 /* resumes the coroutines whose timers are due; after(co) runs once each is back on the loop */
+static void xs_run_ready(void);
 static void xs_tmr_fire(void (*after)(xs_coro *)) {
     uint64_t now = xs_now();
     while (xs_ntmr && xs_tmrs[0].at <= now) {
@@ -768,7 +769,10 @@ static void xs_tmr_fire(void (*after)(xs_coro *)) {
         t.w->fired = true;
         xs_coro *co = t.w->co;
         xs_coro_resume(co);
-        if (after) after(co);
+        if (after) {
+            after(co);
+            xs_run_ready(); /* (its microtasks and nextTick callbacks before the next timer's, as in Node) */
+        }
         now = xs_now();
     }
 }
@@ -807,6 +811,10 @@ static void xs_wait_fd(int fd, int16_t filter) { xs_wait_fd_ms(fd, filter, -1); 
 
 static XS_TLS int64_t xs_tasks_live; /* Promise.all/race tasks not finished yet */
 static void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_ms);
+static XS_TLS xs_coro *xs_tick_head, *xs_tick_tail, *xs_imm_head, *xs_imm_tail; /* process.nextTick, setImmediate (below) */
+/* Node runs a .ts program as an ES module, whose body is itself a microtask: the microtasks the body queues run
+   before its nextTick callbacks. Afterwards (in callbacks), the nextTick queue comes first. */
+static XS_TLS bool xs_esm_first = true;
 static void xs_preg_drop(void);
 static void xs_unh_check(void); /* (Promise values, below) */
 /* setTimeout from node:timers/promises: inside a handler the coroutine sleeps and the server keeps going */
@@ -921,16 +929,36 @@ static void xs_task_done(xs_coro *co) {
 static void xs_task_after(xs_coro *co) { if (co->done && co->on_done) co->on_done(co); }
 static bool xs_par_settled(xs_tgroup *g) { return g->mode == 1 ? g->winner >= 0 : g->pending == 0; }
 /* runs the loop from plain code until stop() (or nothing more can happen) */
+/* runs the ready coroutines (microtasks, woken tasks), the nextTick callbacks first, until none is left */
+static void xs_run_ready(void) {
+    while (xs_ready_head || xs_tick_head) {
+        xs_coro *co;
+        if (xs_esm_first && !xs_ready_head) xs_esm_first = false;
+        if (xs_tick_head && !xs_esm_first) { /* process.nextTick first */
+            co = xs_tick_head;
+            xs_tick_head = co->next;
+            if (!xs_tick_head) xs_tick_tail = NULL;
+        } else {
+            co = xs_ready_head;
+            xs_ready_head = co->next;
+            if (!xs_ready_head) xs_ready_tail = NULL;
+        }
+        xs_coro_resume(co);
+        if (co->done && co->on_done) co->on_done(co);
+    }
+}
 XS_NOINLINE void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_ms) {
     if (xs_kq < 0) xs_kq = kqueue();
     struct kevent evs[64];
     for (;;) {
-        while (xs_ready_head) {
-            xs_coro *co = xs_ready_head;
-            xs_ready_head = co->next;
-            if (!xs_ready_head) xs_ready_tail = NULL;
-            xs_coro_resume(co);
-            if (co->done && co->on_done) co->on_done(co);
+        xs_run_ready();
+        xs_esm_first = false;
+        if (xs_imm_head) { /* the check phase: the immediates queued so far (those they queue wait for the next one) */
+            xs_coro *first = xs_imm_head, *last = xs_imm_tail;
+            xs_imm_head = xs_imm_tail = NULL;
+            if (xs_ready_tail) xs_ready_tail->next = first; else xs_ready_head = first;
+            xs_ready_tail = last;
+            continue;
         }
         xs_coro_flush_dead();
         xs_unh_check();
@@ -1002,7 +1030,8 @@ XS_NOINLINE void xs_par_check(xs_tgroup *g) {
 }
 static inline xs_val xs_par_take(xs_tgroup *g, int i) { g->t[i].taken = true; return g->t[i].out; }
 /* the program ends when the background tasks (race losers) do, as in Node */
-XS_NOINLINE void xs_tasks_drain(void) { if (xs_tasks_live > 0 && !xs_cur_coro) xs_loop_run(NULL, NULL, -1); xs_unh_check(); }
+static void xs_ttasks_unref_drop(void);
+XS_NOINLINE void xs_tasks_drain(void) { if (xs_tasks_live > 0 && !xs_cur_coro) xs_loop_run(NULL, NULL, -1); xs_unh_check(); xs_ttasks_unref_drop(); }
 
 /* ---- Promise values (XB-106) ----
    await f() and a statement f() call the async function directly (its I/O parks the caller): no promise is made.
@@ -2706,6 +2735,7 @@ typedef struct { xs_Server *s; int64_t port; int index; int lfd; } xs_worker_arg
 
 /* ---- graceful shutdown: SIGTERM/SIGINT stop accepting, in-flight requests finish, then the process exits ---- */
 static volatile sig_atomic_t xs_shutting_down;
+static uint64_t xs_psig_mask; /* the signals process.on watches (runtime/node/process.ts): the server leaves them to it */
 static uint64_t xs_shutdown_t0;
 static int xs_sig_pipe[2] = {-1, -1};
 static int xs_wake_tag = 3; /* udata kind 3 */
@@ -2725,12 +2755,12 @@ static void xs_server_signals(int kq) {
         if (pipe(xs_sig_pipe) == 0) { fcntl(xs_sig_pipe[0], F_SETFL, O_NONBLOCK); fcntl(xs_sig_pipe[1], F_SETFL, O_NONBLOCK); }
         struct sigaction sa = {0};
         sa.sa_handler = xs_on_signal;
-        sigaction(SIGTERM, &sa, NULL);
+        if (!(xs_psig_mask & (1ull << SIGTERM))) sigaction(SIGTERM, &sa, NULL); /* (process.on('SIGTERM') comes first) */
 #ifdef XS_DEBUG
         if (xs_dbg.fd < 0) sigaction(SIGINT, &sa, NULL); /* under the debugger Ctrl-C is a pause, not a shutdown */
         xs_dbg_waker = xs_dbg_net_wake;
 #else
-        sigaction(SIGINT, &sa, NULL);
+        if (!(xs_psig_mask & (1ull << SIGINT))) sigaction(SIGINT, &sa, NULL);
 #endif
     }
     struct kevent ev;
@@ -3286,6 +3316,166 @@ static int64_t xs_os_parallelism(void) {
     return n > 0 ? n : 1;
 }
 
+/* ---- node:process beyond argv/env/pid/cwd/exit (runtime/node/process.ts) ---- */
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach-o/dyld.h>
+#endif
+XS_NOINLINE xs_arr_int *xs_process_hrtime(void) { /* [seconds, nanoseconds] of a monotonic clock */
+    int64_t t = (int64_t)xs_now();
+    xs_arr_int *a = xs_arr_int_new(0, 0);
+    xs_arr_int_push(a, t / 1000000000);
+    xs_arr_int_push(a, t % 1000000000);
+    return a;
+}
+XS_NOINLINE double xs_process_uptime(void) { return (double)(xs_now() - xs_started) / 1e9; }
+XS_NOINLINE double xs_process_rss(void) { /* the resident set now (Node: process.memoryUsage().rss) */
+#if defined(__APPLE__)
+    struct mach_task_basic_info info;
+    mach_msg_type_number_t n = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &n) == KERN_SUCCESS) return (double)info.resident_size;
+    return (double)xs_max_rss_bytes();
+#elif defined(_WIN32)
+    return 0;
+#else
+    FILE *f = fopen("/proc/self/statm", "r");
+    long pages = 0, rss = 0;
+    if (f) { if (fscanf(f, "%ld %ld", &pages, &rss) != 2) rss = 0; fclose(f); }
+    return (double)rss * (double)sysconf(_SC_PAGESIZE);
+#endif
+}
+XS_NOINLINE xs_arr_num *xs_process_cpu_times(void) { /* [user, system] in microseconds */
+    xs_arr_num *a = xs_arr_num_new(0, 0);
+#if defined(_WIN32)
+    xs_arr_num_push(a, 0); xs_arr_num_push(a, 0);
+#else
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    xs_arr_num_push(a, (double)ru.ru_utime.tv_sec * 1e6 + (double)ru.ru_utime.tv_usec);
+    xs_arr_num_push(a, (double)ru.ru_stime.tv_sec * 1e6 + (double)ru.ru_stime.tv_usec);
+#endif
+    return a;
+}
+XS_NOINLINE xs_arr_num *xs_process_rusage(void) { /* maxRSS (KiB), minor/major faults, voluntary/involuntary switches */
+    xs_arr_num *a = xs_arr_num_new(0, 0);
+#if defined(_WIN32)
+    for (int i = 0; i < 5; i++) xs_arr_num_push(a, 0);
+#else
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    xs_arr_num_push(a, (double)xs_max_rss_bytes() / 1024);
+    xs_arr_num_push(a, (double)ru.ru_minflt);
+    xs_arr_num_push(a, (double)ru.ru_majflt);
+    xs_arr_num_push(a, (double)ru.ru_nvcsw);
+    xs_arr_num_push(a, (double)ru.ru_nivcsw);
+#endif
+    return a;
+}
+XS_NOINLINE double xs_process_heap_used(void) { return (double)xs_live * 32; } /* (an estimate: objects alive x 32 bytes) */
+XS_NOINLINE int64_t xs_process_ppid(void) {
+#if defined(_WIN32)
+    return 0;
+#else
+    return (int64_t)getppid();
+#endif
+}
+XS_NOINLINE xs_str *xs_process_exec_path(void) {
+    char b[4096];
+    b[0] = 0;
+#if defined(__APPLE__)
+    uint32_t n = sizeof b;
+    if (_NSGetExecutablePath(b, &n) != 0) b[0] = 0;
+    char r[4096];
+    if (b[0] && realpath(b, r)) return xs_str_new(r, strlen(r));
+#elif defined(_WIN32)
+    GetModuleFileNameA(NULL, b, sizeof b);
+#else
+    ssize_t n = readlink("/proc/self/exe", b, sizeof b - 1);
+    b[n > 0 ? n : 0] = 0;
+#endif
+    return xs_str_new(b, strlen(b));
+}
+XS_NOINLINE xs_str *xs_process_title(void) {
+    const char *t = xs_argv && xs_argv->len ? ((xs_str *)xs_argv->data[0])->data : "";
+    const char *slash = strrchr(t, '/');
+    return xs_str_new(slash ? slash + 1 : t, strlen(slash ? slash + 1 : t));
+}
+XS_NOINLINE xs_str *xs_process_chdir(xs_str *dir) { /* "" when done, else the error's code (ENOENT...) */
+    int r = chdir(dir->data);
+    int e = errno;
+    if (r == 0) return xs_str_new("", 0);
+    const char *c = e == ENOENT ? "ENOENT" : e == ENOTDIR ? "ENOTDIR" : e == EACCES ? "EACCES" : "EIO";
+    return xs_str_new(c, strlen(c));
+}
+XS_NOINLINE int64_t xs_process_kill(int64_t pid, int64_t sig) { /* 0, or the errno (ESRCH, EPERM) */
+#if defined(_WIN32)
+    return ESRCH;
+#else
+    return kill((pid_t)pid, (int)sig) == 0 ? 0 : errno;
+#endif
+}
+XS_NOINLINE int64_t xs_process_umask(int64_t mask) { /* the old mask; mask < 0 reads it */
+#if defined(_WIN32)
+    return 0;
+#else
+    if (mask < 0) { mode_t m = umask(0); umask(m); return (int64_t)m; }
+    return (int64_t)umask((mode_t)mask);
+#endif
+}
+XS_NOINLINE int64_t xs_process_ids(int64_t which) { /* 0 uid, 1 gid, 2 euid, 3 egid */
+#if defined(_WIN32)
+    return 0;
+#else
+    return which == 0 ? (int64_t)getuid() : which == 1 ? (int64_t)getgid() : which == 2 ? (int64_t)geteuid() : (int64_t)getegid();
+#endif
+}
+XS_NOINLINE int64_t xs_process_get_exit_code(void) { return xs_exit_code_; }
+/* process.on('SIGINT' | 'SIGTERM' | ...): the handler writes the signal's number to a pipe; a coroutine on the event
+   loop reads it and calls the dispatcher (process.ts), which emits the event. It does not keep the program alive. */
+static int xs_psig_pipe[2] = {-1, -1};
+static xs_closure *xs_psig_cb;
+static void xs_psig_on(int sig) {
+    unsigned char b = (unsigned char)sig;
+    if (xs_psig_pipe[1] >= 0) { ssize_t w = write(xs_psig_pipe[1], &b, 1); (void)w; }
+}
+XS_NOINLINE void xs_psig_run(void *p) {
+    (void)p;
+    for (;;) {
+        xs_wait_fd(xs_psig_pipe[0], EVFILT_READ);
+        unsigned char b[64];
+        ssize_t n;
+        while ((n = read(xs_psig_pipe[0], b, sizeof b)) > 0)
+            for (ssize_t i = 0; i < n; i++)
+                if (xs_psig_cb) {
+                    size_t mark = xs_ar_mark();
+                    ((void (*)(void *, int64_t))xs_psig_cb->fn)(xs_psig_cb, (int64_t)b[i]);
+                    xs_ar_drain(mark);
+                }
+    }
+}
+static void xs_psig_release(void) { xs_closure *c = xs_psig_cb; xs_psig_cb = NULL; if (c) xs_release(c); }
+XS_NOINLINE void xs_process_signal_watch(int64_t sig, xs_closure *cb) {
+    if (xs_psig_pipe[0] < 0) {
+        if (pipe(xs_psig_pipe) != 0) return;
+        fcntl(xs_psig_pipe[0], F_SETFL, O_NONBLOCK);
+        fcntl(xs_psig_pipe[1], F_SETFL, O_NONBLOCK);
+        if (xs_kq < 0) xs_kq = kqueue();
+        xs_coro *co = xs_coro_new_shared(xs_psig_run, NULL); /* (not counted in xs_tasks_live: it keeps nothing alive) */
+        xs_ready_push(co);
+    }
+    if (!xs_psig_cb) { xs_psig_cb = xs_retain(cb); xs_rt_cleanup = xs_psig_release; }
+    xs_psig_mask |= 1ull << (sig & 63);
+    struct sigaction sa = {0};
+    sa.sa_handler = xs_psig_on;
+    sigaction((int)sig, &sa, NULL);
+}
+XS_NOINLINE void xs_process_signal_unwatch(int64_t sig) {
+    xs_psig_mask &= ~(1ull << (sig & 63));
+    struct sigaction sa = {0};
+    sa.sa_handler = SIG_DFL;
+    sigaction((int)sig, &sa, NULL);
+}
+
 /* the listener's coroutine: each message, in order, to the closure; ends when the sender is done */
 typedef struct { xs_wq *q; xs_closure **cb; uint8_t *kind; xs_hdr *owner; } xs_wlisten; /* kind: what the listener takes (XS_WM_...) */
 XS_NOINLINE void xs_wt_listen(void *p) {
@@ -3355,14 +3545,20 @@ XS_NOINLINE void xs_wt_listen_start(xs_wq *q, xs_closure **cb, uint8_t *kind, xs
 /* ---- setTimeout / setInterval (Node's globals): each timer is a coroutine on the event loop. It starts when the
    loop runs (a server's, or the one the program's exit waits on), sleeps, then calls its callback; an interval goes
    on until clearInterval. Like Node, a pending timer keeps the program alive. */
-typedef struct xs_ttask { xs_closure *cb; int64_t ms; bool repeat, cancelled; int64_t id; struct xs_ttask *next; xs_coro *co; } xs_ttask;
+typedef struct xs_ttask { xs_closure *cb; int64_t ms; bool repeat, cancelled; int64_t id; struct xs_ttask *next; xs_coro *co;
+                          bool unref;      /* timer.unref(): it does not keep the program alive (not counted in xs_tasks_live) */
+                          bool immediate;  /* setImmediate: no sleep; started from the check queue, after the microtasks */
+                          int64_t due;     /* timer.refresh(): the start again counts from now */ } xs_ttask;
 static xs_ttask *xs_ttasks;
 static int64_t xs_tnext = 1;
 XS_NOINLINE void xs_ttask_run(void *p) {
     xs_ttask *t = p;
     for (;;) {
         if (t->cancelled) return; /* (cleared before it started) */
-        xs_sleep_ms(t->ms);
+        if (!t->immediate) {
+            xs_sleep_ms(t->ms);
+            while (!t->cancelled && t->due > (int64_t)xs_date_now()) xs_sleep_ms(t->due - (int64_t)xs_date_now()); /* (refreshed while asleep) */
+        }
         if (t->cancelled) return;
         size_t mark = xs_ar_mark();
         ((void (*)(void *))t->cb->fn)(t->cb);
@@ -3372,11 +3568,11 @@ XS_NOINLINE void xs_ttask_run(void *p) {
 }
 static void xs_ttask_done(xs_coro *co) {
     xs_ttask *t = co->arg;
-    xs_tasks_live--;
+    if (!t->unref) xs_tasks_live--;
     xs_coro_recycle(co);
     for (xs_ttask **pp = &xs_ttasks; *pp; pp = &(*pp)->next)
         if (*pp == t) { *pp = t->next; break; }
-    xs_release(t->cb);
+    if (t->cb) xs_release(t->cb);
     free(t);
 }
 XS_NOINLINE int64_t xs_timer_start(xs_closure *cb, double ms, bool repeat) {
@@ -3396,6 +3592,75 @@ XS_NOINLINE int64_t xs_timer_start(xs_closure *cb, double ms, bool repeat) {
     xs_ready_push(co);
     return t->id;
 }
+/* ---- setImmediate, process.nextTick, queueMicrotask (Node's order) ----
+   Node runs, after each piece of work: every process.nextTick callback, then every microtask (promise reactions,
+   queueMicrotask), and the setImmediate callbacks only once both are empty (its "check" phase), all those queued
+   by then. Here microtasks are coroutines on the ready list; ticks have a list of their own that the loop empties
+   first, and immediates wait on another one that the loop moves to the ready list when nothing else is ready. */
+static void xs_coro_fifo_push(xs_coro **head, xs_coro **tail, xs_coro *co) {
+    co->next = NULL;
+    if (*tail) (*tail)->next = co; else *head = co;
+    *tail = co;
+}
+static xs_ttask *xs_ttask_new(xs_closure *cb) {
+    if (xs_kq < 0) xs_kq = kqueue();
+    xs_ttask *t = calloc(1, sizeof *t);
+    t->cb = xs_retain(cb);
+    t->id = xs_tnext++;
+    t->next = xs_ttasks;
+    xs_ttasks = t;
+    xs_coro *co = xs_coro_new_shared(xs_ttask_run, t);
+    t->co = co;
+    co->on_done = xs_ttask_done;
+    xs_tasks_live++;
+    xs_exit_hook = xs_tasks_drain;
+    return t;
+}
+XS_NOINLINE int64_t xs_set_immediate(xs_closure *cb) {
+    xs_ttask *t = xs_ttask_new(cb);
+    t->immediate = true;
+    xs_coro_fifo_push(&xs_imm_head, &xs_imm_tail, t->co);
+    return t->id;
+}
+XS_NOINLINE void xs_next_tick(xs_closure *cb) {
+    xs_ttask *t = xs_ttask_new(cb);
+    t->immediate = true;
+    xs_coro_fifo_push(&xs_tick_head, &xs_tick_tail, t->co);
+}
+XS_NOINLINE void xs_queue_microtask(xs_closure *cb) {
+    xs_ttask *t = xs_ttask_new(cb);
+    t->immediate = true;
+    xs_ready_push(t->co);
+}
+static xs_ttask *xs_ttask_find(int64_t id) {
+    for (xs_ttask *t = xs_ttasks; t; t = t->next) if (t->id == id) return t;
+    return NULL;
+}
+/* timer.unref() / ref() / hasRef() / refresh() on the id setTimeout gave (Node: methods of its Timeout object) */
+XS_NOINLINE int64_t xs_timer_unref(int64_t id) {
+    xs_ttask *t = xs_ttask_find(id);
+    if (t && !t->unref && !t->cancelled) { t->unref = true; xs_tasks_live--; }
+    return id;
+}
+XS_NOINLINE int64_t xs_timer_ref(int64_t id) {
+    xs_ttask *t = xs_ttask_find(id);
+    if (t && t->unref && !t->cancelled) { t->unref = false; xs_tasks_live++; xs_exit_hook = xs_tasks_drain; }
+    return id;
+}
+XS_NOINLINE bool xs_timer_has_ref(int64_t id) {
+    xs_ttask *t = xs_ttask_find(id);
+    return t && !t->unref && !t->cancelled;
+}
+XS_NOINLINE int64_t xs_timer_refresh(int64_t id) {
+    xs_ttask *t = xs_ttask_find(id);
+    if (t && !t->cancelled && !t->immediate) t->due = (int64_t)xs_date_now() + t->ms;
+    return id;
+}
+/* at the end: timers that were unref'd and never fired let go of their callbacks (Node exits with them pending) */
+static void xs_ttasks_unref_drop(void) {
+    for (xs_ttask *t = xs_ttasks; t; t = t->next)
+        if (t->unref && t->cb) { t->cancelled = true; xs_closure *cb = t->cb; t->cb = NULL; xs_release(cb); }
+}
 XS_NOINLINE int64_t xs_set_timeout(xs_closure *cb, double ms) { return xs_timer_start(cb, ms, false); }
 XS_NOINLINE int64_t xs_set_interval(xs_closure *cb, double ms) { return xs_timer_start(cb, ms, true); }
 XS_NOINLINE void xs_clear_timer(double idn) { /* the timer's coroutine ends when it next wakes */
@@ -3407,6 +3672,7 @@ XS_NOINLINE void xs_clear_timer(double idn) { /* the timer's coroutine ends when
             if (t->co && t->co->tmw.armed && t->co != xs_cur_coro) { xs_timer_disarm(&t->co->tmw); xs_ready_push(t->co); }
         }
 }
+XS_NOINLINE void xs_timer_close(int64_t id) { xs_clear_timer((double)id); } /* timer.close() */
 XS_NOINLINE void xs_wt_check_event(xs_str *ev, const char *who) {
     if (ev->len != 7 || memcmp(ev->data, "message", 7) != 0)
         xs_panicf("%s.on: only \"message\" is supported (messages are text)", who);

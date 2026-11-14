@@ -9312,6 +9312,10 @@ static void check_expr_in(Expr *e, Type *expected) {
             return;
         }
         const char *name = e->lhs->str;
+        if (name && strchr(name, '\x01')) { /* import { setTimeout as t } next to another setTimeout: "setTimeout\x01node:timers" */
+            const char *q = strchr(name, '\x01') + 1;
+            if (!strcmp(q, "node:timers") || !strcmp(q, "timers") || !strcmp(q, "xisto:timers")) name = e->lhs->str = xs_strndup(name, (size_t)(q - 1 - name));
+        }
         if (!lookup_func(name) && !lookup(name)) {
             if (strcmp(name, "Boolean") == 0 && e->args.len == 1) { /* Boolean(x): x's truthiness, as !!x */
                 Expr *x = e->args.items[0];
@@ -9341,6 +9345,45 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->builtin.cfn = name[2] == 'N' ? "xs_is_nan" : "xs_is_finite";
                 return;
             }
+            if ((strcmp(name, "setTimeout") == 0 || strcmp(name, "setInterval") == 0 || strcmp(name, "setImmediate") == 0) && e->args.len >= 1) {
+                /* setTimeout(cb) / setTimeout(cb, ms, ...args): the delay defaults to 0 (Node: 1 ms), the extra arguments are
+                   given to the callback (they are read when it runs, not when the timer is set) */
+                bool imm = strcmp(name, "setImmediate") == 0;
+                int first = imm ? 1 : 2;
+                if (!imm && e->args.len == 1) expr_list_push(&e->args, num_lit(e->pos, 0, false));
+                if (e->args.len > first) {
+                    Func *af = xs_alloc(sizeof *af); af->pos = e->pos; af->name = "arrow"; af->ret = ty_void;
+                    Expr *call = xs_alloc(sizeof *call); call->kind = E_CALL; call->pos = e->pos; call->field = -1; call->lhs = e->args.items[0];
+                    for (int i = first; i < e->args.len; i++) expr_list_push(&call->args, e->args.items[i]);
+                    Stmt *r = xs_alloc(sizeof *r); r->pos = e->pos; r->kind = S_EXPR; r->expr = call;
+                    Stmt *b = xs_alloc(sizeof *b); b->kind = S_BLOCK; b->pos = e->pos; stmt_list_push(&b->stmts, r);
+                    af->body = b;
+                    Arrow *ar = xs_alloc(sizeof *ar); ar->pos = e->pos; ar->fn = af;
+                    Expr *w = xs_alloc(sizeof *w); w->kind = E_ARROW; w->pos = e->pos; w->field = -1; w->arrow = ar;
+                    e->args.items[0] = w;
+                    e->args.len = first;
+                }
+                if (imm) {
+                    Type *cbt = ty_func(NULL, 0, ty_void);
+                    check_expr(e->args.items[0], cbt);
+                    expect_type(e->args.items[0], cbt, "callback of setImmediate");
+                    e->type = ty_int;
+                    e->builtin.cfn = "xs_set_immediate";
+                    prog->uses_net = true;
+                    return;
+                }
+            }
+            if ((strcmp(name, "queueMicrotask") == 0 || strcmp(name, "__xs_next_tick") == 0) && e->args.len == 1) {
+                /* queueMicrotask(cb): after the current work, with the promise reactions; (process.nextTick: before them) */
+                Type *cbt = ty_func(NULL, 0, ty_void);
+                check_expr(e->args.items[0], cbt);
+                expect_type(e->args.items[0], cbt, xs_sprintf("callback of %s", name));
+                e->type = ty_void;
+                e->builtin.cfn = name[0] == 'q' ? "xs_queue_microtask" : "xs_next_tick";
+                prog->uses_net = true;
+                return;
+            }
+            if (strcmp(name, "clearImmediate") == 0) name = "clearTimeout";
             if (strcmp(name, "setTimeout") == 0 || strcmp(name, "setInterval") == 0) { /* Node's timers: a callback later, on the event loop */
                 if (e->args.len != 2) xs_error(XS8035, e->pos, xs_sprintf("%s(() => { ... }, ms)", name), "%s takes a callback and a delay in milliseconds", name);
                 Type *cbt = ty_func(NULL, 0, ty_void);
@@ -10518,6 +10561,25 @@ static void check_expr_in(Expr *e, Type *expected) {
             }
             xs_error(XS8015, e->pos, "Object.keys, values and entries take a Record<string, V> (and keys, an object)", "Object.%s of %s is not supported", e->str, ty_name(ot));
         }
+        if (e->str && find_class("XistoProcess") && !lookup("process")) {
+            /* process.X beyond the members built in below (argv, env, pid, cwd, exit, stdout/stderr.write): XistoProcess.X,
+               from xisto:process (runtime/node/process.ts); process.hrtime.bigint() and process.memoryUsage.rss() too */
+            if (e->is_call && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->str && e->lhs->lhs && e->lhs->lhs->kind == E_IDENT &&
+                strcmp(e->lhs->lhs->str, "process") == 0 &&
+                ((!strcmp(e->lhs->str, "hrtime") && !strcmp(e->str, "bigint")) || (!strcmp(e->lhs->str, "memoryUsage") && !strcmp(e->str, "rss")))) {
+                e->str = e->lhs->str[0] == 'h' ? "hrtimeBigint" : "memoryUsageRss";
+                e->lhs = mk_ident(e->lhs->pos, "XistoProcess");
+            } else if (e->lhs->kind == E_IDENT && strcmp(e->lhs->str, "process") == 0) {
+                static const char *const core[] = {"argv", "env", "pid", "cwd", "exit", "stdout", "stderr", NULL};
+                bool is_core = false;
+                for (int i = 0; core[i]; i++) if (strcmp(e->str, core[i]) == 0) is_core = true;
+                if (!is_core && !e->is_call && strcmp(e->str, "exitCode") == 0) { /* (a read: process.exitCode = n is an assignment) */
+                    e->is_call = true;
+                    e->str = "getExitCode";
+                }
+                if (!is_core) e->lhs = mk_ident(e->lhs->pos, "XistoProcess");
+            }
+        }
         if (e->is_call && e->str && strcmp(e->str, "write") == 0 && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->str &&
             (strcmp(e->lhs->str, "stdout") == 0 || strcmp(e->lhs->str, "stderr") == 0) && e->lhs->lhs->kind == E_IDENT &&
             strcmp(e->lhs->lhs->str, "process") == 0 && !lookup("process")) { /* process.stdout.write(text or bytes) */
@@ -11630,6 +11692,17 @@ static void check_expr_in(Expr *e, Type *expected) {
             return;
         }
         case TY_INT: case TY_NUMBER: case TY_LITINT:
+            if (e->is_call && e->args.len == 0 && e->lhs->type->kind != TY_NUMBER &&
+                (!strcmp(e->str, "unref") || !strcmp(e->str, "ref") || !strcmp(e->str, "hasRef") || !strcmp(e->str, "refresh") || !strcmp(e->str, "close"))) {
+                /* setTimeout(...).unref(): a timer is its id here (NodeJS.Timeout is int); these are its Timeout methods */
+                if (e->lhs->type->kind == TY_LITINT) coerce_lit(e->lhs, ty_int);
+                bool has = !strcmp(e->str, "hasRef"), close = !strcmp(e->str, "close");
+                e->builtin.cfn = has ? "xs_timer_has_ref" : close ? "xs_timer_close" : !strcmp(e->str, "unref") ? "xs_timer_unref" :
+                                 !strcmp(e->str, "ref") ? "xs_timer_ref" : "xs_timer_refresh";
+                e->type = has ? ty_boolean : close ? ty_void : ty_int;
+                prog->uses_net = true;
+                return;
+            }
             if (e->is_call && strcmp(e->str, "toString") == 0 && e->args.len <= 1) { /* n.toString(), n.toString(radix) */
                 if (e->lhs->type->kind == TY_LITINT) coerce_lit(e->lhs, ty_int);
                 if (e->args.len == 1) {
@@ -17238,6 +17311,10 @@ void check_program(Program *p) {
                     found = true; /* built-in classes */
                 if (!found && im->from->builtin && strcmp(im->from->file, "perf_hooks") == 0 && strcmp(name, "performance") == 0)
                     found = true; /* the built-in performance */
+                if (!found && im->from->builtin && strcmp(im->from->file, "timers") == 0 && !im->is_default)
+                    for (const char *const *t = (const char *const[]){"setTimeout", "setInterval", "setImmediate", "clearTimeout", "clearInterval",
+                                                                       "clearImmediate", "queueMicrotask", NULL}; *t; t++)
+                        if (strcmp(name, *t) == 0) found = true; /* the built-in timers */
                 if (!found && im->from->builtin && strcmp(im->from->file, "sqlite") == 0)
                     for (int j = 0; j < nbuiltins; j++)
                         if (strcmp(builtins[j]->name, name) == 0 && (strcmp(name, "DatabaseSync") == 0 || strcmp(name, "StatementSync") == 0)) found = true;
