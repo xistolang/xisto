@@ -3283,10 +3283,13 @@ XS_NOINLINE double xs_dyn_num(void *v) {
 }
 /* String(x) / `${x}` on an any (owned) */
 static xs_str *xs_dyn_lit(const char *s) { return xs_str_new(s, strlen(s)); }
+static void xs_u8_free(void *p);
+XS_NOINLINE xs_str *xs_dyn_str_bytes(void *v); /* (below, with the bytes) */
 XS_NOINLINE xs_str *xs_dyn_str(void *v) {
     if (!v) return xs_dyn_lit("null");
     const xs_type *t = xs_type_of(v);
     if (t->free == xs_str_free) return xs_retain_(v);
+    if (t->free == xs_u8_free) return xs_dyn_str_bytes(v); /* String(buf): its text; String(u8): "1,2,3" */
     if (t->free == xs_box_num_free) return xs_str_from_num(((xs_box_d *)v)->v);
     if (t->free == xs_box_int_free) return xs_str_from_int(((xs_box_i *)v)->v);
     if (t->free == xs_box_bool_free) return xs_dyn_lit(((xs_box_i *)v)->v ? "true" : "false");
@@ -6053,6 +6056,23 @@ static void xs_buf_print(void *p) {
     fputc('>', XS_OUT);
 }
 static inline bool xs_is_buffer(xs_Uint8Array *b) { return xs_type_of(b)->print == xs_buf_print; }
+XS_NOINLINE xs_str *xs_buf_to_string(xs_Uint8Array *b, xs_str *enc, int64_t start, int64_t end);
+XS_NOINLINE xs_str *xs_dyn_str_bytes(void *v) {
+    xs_Uint8Array *b = v;
+    if (xs_is_buffer(b)) {
+        xs_str *enc = xs_str_new("utf8", 4);
+        xs_str *r = xs_buf_to_string(b, enc, 0, b->f_length);
+        xs_release(enc);
+        return r;
+    }
+    xs_sb sb = {0};
+    char num[8];
+    for (int64_t i = 0; i < b->f_length; i++) {
+        int n = snprintf(num, sizeof num, i ? ",%u" : "%u", (unsigned)b->data[i]);
+        xs_sb_put(&sb, num, (size_t)n);
+    }
+    return xs_sb_finish(&sb);
+}
 #if defined(__linux__)
 #include <sys/mman.h>
 #endif

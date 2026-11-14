@@ -3,9 +3,9 @@
 // listen() binds at once and returns; the server answers once the program's own code is done (its event loop), as
 // in Node. Differences from Node (docs/docs/guides/node-compatibility.md): bodies are text (binary request and
 // response bodies are read and written as UTF-8); a response is sent when end() is called (write() buffers);
-// one server per program; IncomingMessage is an EventEmitter ('data' with a Buffer, then 'end'), not yet a
-// stream.Readable (no pipe(), no for await).
+// one server per program. IncomingMessage is a stream.Readable (data, end, pipe, for await).
 import { EventEmitter, Listener } from "xisto:events";
+import { Readable } from "xisto:stream";
 
 declare function http_bind(s: Server, port: int): int;
 declare function http_close(): void;
@@ -44,7 +44,7 @@ function reason(code: int): string {
 }
 
 /** A request the server received, or a response the client got: status/method, headers and the body as events. */
-export class IncomingMessage extends EventEmitter {
+export class IncomingMessage extends Readable {
   method: string = "";
   url: string = "";
   statusCode: int = 0;
@@ -58,36 +58,23 @@ export class IncomingMessage extends EventEmitter {
   rawHeaders: string[] = [];
   complete: boolean = false;
   private body: string = "";
-  private encoding: string = "";
-  private flowing: boolean = false;
+  private fed: boolean = false;
 
-  /** 'data' gives strings in that encoding instead of Buffers ("utf8"). */
-  setEncoding(encoding: string): IncomingMessage {
-    this.encoding = encoding;
-    return this;
-  }
-  /** (internal) the body, given once; its events come after the current code. */
+  /** (the body is pushed from outside: nothing to read on demand) */
+  _read(size: number): void {}
+  /** (internal) the body, given once. */
   _setBody(body: string): void {
     this.body = body;
   }
-  /** (internal) emits the body: one 'data' when there is any, then 'end'. */
+  /** (internal) pushes the body, then its end: a stream.Readable as Node's (data, end, pipe, for await). */
   _flow(): void {
-    if (this.flowing) return;
-    this.flowing = true;
-    setImmediate(() => {
-      if (this.body.length > 0) {
-        if (this.encoding.length > 0) this.emit("data", this.body);
-        else this.emit("data", Buffer.from(this.body));
-      }
+    if (this.fed) return;
+    this.fed = true;
+    if (this.body.length > 0) this.push(Buffer.from(this.body));
+    this.push(null);
+    this.once("end", () => {
       this.complete = true;
-      this.emit("end");
-      this.emit("close");
     });
-  }
-  /** Lets the body flow without reading it. */
-  resume(): IncomingMessage {
-    this._flow();
-    return this;
   }
 }
 
@@ -225,8 +212,8 @@ async function answer(req: HttpRequest): Promise<HttpResponse> {
   const finished = new Promise<int>((resolve) => {
     res._onDone(resolve);
   });
+  msg._flow(); // (the body waits in the stream's buffer: an async listener that reads it runs within the emit)
   if (srv !== null) srv.emit("request", msg, res);
-  msg._flow();
   await finished;
   res.writableFinished = true;
   setImmediate(() => {

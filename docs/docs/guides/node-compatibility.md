@@ -228,8 +228,9 @@ server.listen(3000, () => console.log("listening"));
 
 `createServer(listener)` gives a server whose listener receives an `IncomingMessage` and a `ServerResponse`:
 
-- **Request:** `method`, `url` (path and query), `headers` (lower-case names), `rawHeaders`, `httpVersion`, the
-  body as `'data'` then `'end'` (with `setEncoding`).
+- **Request:** `method`, `url` (path and query), `headers` (lower-case names), `rawHeaders`, `httpVersion`. The
+  request (and the client's response) is a `stream.Readable`: `'data'`/`'end'`, `setEncoding`, `pipe()` and
+  `for await (const chunk of req)`.
 - **Response:** `statusCode`, `setHeader`/`appendHeader`/`getHeader`/`getHeaders`/`hasHeader`/`removeHeader`,
   `writeHead(status, headers)`, `write`, `end`, and `'finish'`.
 - **Server:** `listen(port, cb)`, with port 0 choosing a free port, `address()`, `close(cb)`, and the
@@ -248,7 +249,6 @@ Differences from Node:
 - A response is sent when `end()` is called. `write()` buffers, so there is no chunked streaming yet. For
   streaming, use xisto's `HttpResponse.stream`.
 - One server per program.
-- `IncomingMessage` is an `EventEmitter`, not a `stream.Readable` yet: no `pipe()`, no `for await`.
 - The server class is `HttpServer`. The name `Server` is xisto's built-in server, so `import { Server } from
   "node:http"` does not work; `http.createServer` does.
 - `https.createServer` and `Agent` are not there yet.
