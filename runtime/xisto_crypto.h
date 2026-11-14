@@ -295,20 +295,59 @@ static void xs_sha512_final(xs_sha512 *c, uint8_t out[64]) {
     for (int i = 0; i < 8; i++) for (int j = 0; j < 8; j++) out[8 * i + j] = (uint8_t)(c->h[i] >> (56 - 8 * j));
 }
 
-/* one digest of any of the four, by Node's name: the length (0: not a digest xisto has) */
+/* one digest of any of the six, by Node's name: the length (0: not a digest xisto has) */
 static int xs_digest_len(const char *alg) {
     if (strcmp(alg, "md5") == 0) return 16;
     if (strcmp(alg, "sha1") == 0) return 20;
+    if (strcmp(alg, "sha224") == 0) return 28;
     if (strcmp(alg, "sha256") == 0) return 32;
+    if (strcmp(alg, "sha384") == 0) return 48;
     if (strcmp(alg, "sha512") == 0) return 64;
     return 0;
 }
-static int xs_digest_block(const char *alg) { return strcmp(alg, "sha512") == 0 ? 128 : 64; }
+static int xs_digest_block(const char *alg) { return strcmp(alg, "sha512") == 0 || strcmp(alg, "sha384") == 0 ? 128 : 64; }
+/* SHA-224 and SHA-384 (FIPS 180-4): SHA-256 and SHA-512 from other initial values, cut */
 static void xs_digest_raw(const char *alg, const void *a, size_t an, const void *b, size_t bn, uint8_t *out) {
     if (strcmp(alg, "md5") == 0) { xs_md5 c; xs_md5_init(&c); xs_md5_update(&c, a, an); xs_md5_update(&c, b, bn); xs_md5_final(&c, out); }
     else if (strcmp(alg, "sha1") == 0) { xs_sha1 c; xs_sha1_init(&c); xs_sha1_update(&c, a, an); xs_sha1_update(&c, b, bn); xs_sha1_final(&c, out); }
-    else if (strcmp(alg, "sha256") == 0) { xs_sha256 c; xs_sha256_init(&c); xs_sha256_update(&c, a, an); xs_sha256_update(&c, b, bn); xs_sha256_final(&c, out); }
-    else { xs_sha512 c; xs_sha512_init(&c); xs_sha512_update(&c, a, an); xs_sha512_update(&c, b, bn); xs_sha512_final(&c, out); }
+    else if (strcmp(alg, "sha256") == 0 || strcmp(alg, "sha224") == 0) {
+        static const uint32_t iv224[8] = {0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4};
+        xs_sha256 c;
+        uint8_t full[32];
+        xs_sha256_init(&c);
+        bool short_ = alg[3] == '2' && alg[4] == '2';
+        if (short_) memcpy(c.h, iv224, sizeof iv224);
+        xs_sha256_update(&c, a, an); xs_sha256_update(&c, b, bn); xs_sha256_final(&c, full);
+        memcpy(out, full, short_ ? 28 : 32);
+    } else {
+        static const uint64_t iv384[8] = {0xcbbb9d5dc1059ed8ULL, 0x629a292a367cd507ULL, 0x9159015a3070dd17ULL, 0x152fecd8f70e5939ULL,
+                                          0x67332667ffc00b31ULL, 0x8eb44a8768581511ULL, 0xdb0c2e0d64f98fa7ULL, 0x47b5481dbefa4fa4ULL};
+        xs_sha512 c;
+        uint8_t full[64];
+        xs_sha512_init(&c);
+        bool short_ = strcmp(alg, "sha384") == 0;
+        if (short_) memcpy(c.h, iv384, sizeof iv384);
+        xs_sha512_update(&c, a, an); xs_sha512_update(&c, b, bn); xs_sha512_final(&c, full);
+        memcpy(out, full, short_ ? 48 : 64);
+    }
+}
+/* HMAC (RFC 2104) of a || b over any of the six, into out (the digest's length) */
+static void xs_hmac_raw(const char *alg, const uint8_t *key, size_t klen, const void *a, size_t an, const void *b, size_t bn, uint8_t *out) {
+    int bl = xs_digest_block(alg), dl = xs_digest_len(alg);
+    uint8_t k[128] = {0}, ipad[128], opad[128], inner[64];
+    if ((int)klen > bl) xs_digest_raw(alg, key, klen, "", 0, k);
+    else if (klen) memcpy(k, key, klen);
+    for (int i = 0; i < bl; i++) { ipad[i] = k[i] ^ 0x36; opad[i] = k[i] ^ 0x5c; }
+    /* H(ipad || a || b): a and b joined when both are given (the digests take two pieces) */
+    if (bn) {
+        uint8_t *ab = malloc(an + bn);
+        if (!ab) xs_panic("out of memory");
+        memcpy(ab, a, an);
+        memcpy(ab + an, b, bn);
+        xs_digest_raw(alg, ipad, (size_t)bl, ab, an + bn, inner);
+        free(ab);
+    } else xs_digest_raw(alg, ipad, (size_t)bl, a, an, inner);
+    xs_digest_raw(alg, opad, (size_t)bl, inner, (size_t)dl, out);
 }
 /* bytes -> text in Node's digest encodings: hex, base64, base64url, latin1 (binary) */
 static xs_str *xs_digest_encode(const uint8_t *d, int n, const char *enc) {
@@ -327,6 +366,23 @@ static xs_str *xs_digest_encode(const uint8_t *d, int n, const char *enc) {
     return xs_str_new(buf, k);
 }
 XS_NOINLINE bool xs_crypto_supported(xs_str *alg) { return xs_digest_len(alg->data) > 0; }
+/* Node's (OpenSSL's) other names of the six: SHA256, RSA-SHA256, sha-256, SHA2-256, ecdsa-with-SHA256: the name
+   xisto uses, or "" when it is none of them */
+XS_NOINLINE xs_str *xs_crypto_digest_name(xs_str *alg) {
+    char b[32];
+    size_t n = (size_t)alg->len, k = 0;
+    if (n >= sizeof b) return xs_str_new("", 0);
+    for (size_t i = 0; i < n; i++) b[i] = (char)tolower((unsigned char)alg->data[i]);
+    b[n] = 0;
+    const char *p = b;
+    if (!strncmp(p, "rsa-", 4)) p += 4;
+    else if (!strncmp(p, "ecdsa-with-", 11)) p += 11;
+    char out[32];
+    if (!strncmp(p, "sha-", 4) || !strncmp(p, "sha2-", 5)) { snprintf(out, sizeof out, "sha%s", p + (p[3] == '-' ? 4 : 5)); p = out; }
+    if (!strcmp(p, "sha2-1")) p = "";
+    k = strlen(p);
+    return xs_digest_len(p) ? xs_str_new(p, k) : xs_str_new("", 0);
+}
 XS_NOINLINE xs_str *xs_crypto_digest(xs_str *alg, xs_str *data, xs_str *enc) {
     uint8_t out[64];
     xs_digest_raw(alg->data, data->data, (size_t)data->len, "", 0, out);
@@ -383,4 +439,449 @@ XS_NOINLINE xs_str *xs_crypto_uuid(void) {
         s[k++] = hx[b[i] >> 4]; s[k++] = hx[b[i] & 15];
     }
     return xs_str_new(s, k);
+}
+
+/* ---- BearSSL (build/libbearssl.a, linked with node:crypto): ciphers, KDFs, RSA/ECDSA signatures and key
+   generation. The functions below are only referenced by the parts of xisto:crypto that use them, so a
+   program that only hashes takes nothing from the library. ---- */
+#include <bearssl.h>
+
+/* a digest by Node's name: BearSSL's hash class (for its RSA and ECDSA code), its PKCS#1 OID (NULL for md5),
+   or NULL when unknown */
+static const br_hash_class *xs_br_hash(const char *alg, const unsigned char **oid) {
+    const unsigned char *o = NULL;
+    const br_hash_class *h = NULL;
+    if (strcmp(alg, "sha1") == 0) { h = &br_sha1_vtable; o = BR_HASH_OID_SHA1; }
+    else if (strcmp(alg, "sha224") == 0) { h = &br_sha224_vtable; o = BR_HASH_OID_SHA224; }
+    else if (strcmp(alg, "sha256") == 0) { h = &br_sha256_vtable; o = BR_HASH_OID_SHA256; }
+    else if (strcmp(alg, "sha384") == 0) { h = &br_sha384_vtable; o = BR_HASH_OID_SHA384; }
+    else if (strcmp(alg, "sha512") == 0) { h = &br_sha512_vtable; o = BR_HASH_OID_SHA512; }
+    if (oid) *oid = o;
+    return h;
+}
+static xs_Uint8Array *xs_buffer_of(const void *p, size_t n) {
+    xs_Uint8Array *r = xs_u8_raw((int64_t)n, true, false);
+    if (n) memcpy(r->data, p, n);
+    return r;
+}
+
+/* (hashes, HMACs and the KDFs are xisto's own C above: a program that only hashes takes nothing from BearSSL) */
+/* the digest of bytes by any of md5, sha1, sha224, sha256, sha384, sha512 (null: an unknown algorithm) */
+XS_NOINLINE xs_Uint8Array *xs_crypto_hash2(xs_str *alg, xs_Uint8Array *data) {
+    int dl = xs_digest_len(alg->data);
+    if (!dl) return NULL;
+    uint8_t out[64];
+    xs_digest_raw(alg->data, data->data, (size_t)data->f_length, "", 0, out);
+    return xs_buffer_of(out, (size_t)dl);
+}
+/* the same digest as text in an encoding (hex, base64, base64url, latin1) */
+XS_NOINLINE xs_str *xs_crypto_hash2_text(xs_str *alg, xs_Uint8Array *data, xs_str *enc) {
+    uint8_t out[64];
+    xs_digest_raw(alg->data, data->data, (size_t)data->f_length, "", 0, out);
+    return xs_digest_encode(out, xs_digest_len(alg->data), enc->data);
+}
+/* HMAC of bytes with a key of bytes, as text in an encoding */
+XS_NOINLINE xs_str *xs_crypto_hmac2_text(xs_str *alg, xs_Uint8Array *key, xs_Uint8Array *data, xs_str *enc) {
+    uint8_t out[64];
+    xs_hmac_raw(alg->data, key->data, (size_t)key->f_length, data->data, (size_t)data->f_length, "", 0, out);
+    return xs_digest_encode(out, xs_digest_len(alg->data), enc->data);
+}
+/* HMAC of bytes with a key of bytes, by any of those digests (null: an unknown algorithm) */
+XS_NOINLINE xs_Uint8Array *xs_crypto_hmac2(xs_str *alg, xs_Uint8Array *key, xs_Uint8Array *data) {
+    int dl = xs_digest_len(alg->data);
+    if (!dl) return NULL;
+    uint8_t out[64];
+    xs_hmac_raw(alg->data, key->data, (size_t)key->f_length, data->data, (size_t)data->f_length, "", 0, out);
+    return xs_buffer_of(out, (size_t)dl);
+}
+
+/* ---- PBKDF2 (RFC 8018) over HMAC with any of the digests ---- */
+XS_NOINLINE xs_Uint8Array *xs_crypto_pbkdf2(xs_Uint8Array *pw, xs_Uint8Array *salt, int64_t iters, int64_t keylen, xs_str *alg) {
+    const char *a = alg->data;
+    size_t hl = (size_t)xs_digest_len(a);
+    if (!hl) return NULL;
+    xs_Uint8Array *r = xs_u8_raw(keylen, true, true);
+    uint8_t u[64], t[64];
+    for (uint32_t block = 1; (int64_t)(block - 1) * (int64_t)hl < keylen; block++) {
+        uint8_t be[4] = {(uint8_t)(block >> 24), (uint8_t)(block >> 16), (uint8_t)(block >> 8), (uint8_t)block};
+        xs_hmac_raw(a, pw->data, (size_t)pw->f_length, salt->data, (size_t)salt->f_length, be, 4, u);
+        memcpy(t, u, hl);
+        for (int64_t i = 1; i < iters; i++) {
+            xs_hmac_raw(a, pw->data, (size_t)pw->f_length, u, hl, "", 0, u);
+            for (size_t k = 0; k < hl; k++) t[k] ^= u[k];
+        }
+        size_t off = (size_t)(block - 1) * hl, n = (size_t)keylen - off < hl ? (size_t)keylen - off : hl;
+        memcpy(r->data + off, t, n);
+    }
+    return r;
+}
+
+/* ---- scrypt (RFC 7914) ---- */
+static void xs_salsa8(uint32_t b[16]) {
+    uint32_t x[16];
+    memcpy(x, b, 64);
+    for (int i = 0; i < 8; i += 2) {
+#define XS_R(a, n) (((a) << (n)) | ((a) >> (32 - (n))))
+        x[4] ^= XS_R(x[0] + x[12], 7); x[8] ^= XS_R(x[4] + x[0], 9); x[12] ^= XS_R(x[8] + x[4], 13); x[0] ^= XS_R(x[12] + x[8], 18);
+        x[9] ^= XS_R(x[5] + x[1], 7); x[13] ^= XS_R(x[9] + x[5], 9); x[1] ^= XS_R(x[13] + x[9], 13); x[5] ^= XS_R(x[1] + x[13], 18);
+        x[14] ^= XS_R(x[10] + x[6], 7); x[2] ^= XS_R(x[14] + x[10], 9); x[6] ^= XS_R(x[2] + x[14], 13); x[10] ^= XS_R(x[6] + x[2], 18);
+        x[3] ^= XS_R(x[15] + x[11], 7); x[7] ^= XS_R(x[3] + x[15], 9); x[11] ^= XS_R(x[7] + x[3], 13); x[15] ^= XS_R(x[11] + x[7], 18);
+        x[1] ^= XS_R(x[0] + x[3], 7); x[2] ^= XS_R(x[1] + x[0], 9); x[3] ^= XS_R(x[2] + x[1], 13); x[0] ^= XS_R(x[3] + x[2], 18);
+        x[6] ^= XS_R(x[5] + x[4], 7); x[7] ^= XS_R(x[6] + x[5], 9); x[4] ^= XS_R(x[7] + x[6], 13); x[5] ^= XS_R(x[4] + x[7], 18);
+        x[11] ^= XS_R(x[10] + x[9], 7); x[8] ^= XS_R(x[11] + x[10], 9); x[9] ^= XS_R(x[8] + x[11], 13); x[10] ^= XS_R(x[9] + x[8], 18);
+        x[12] ^= XS_R(x[15] + x[14], 7); x[13] ^= XS_R(x[12] + x[15], 9); x[14] ^= XS_R(x[13] + x[12], 13); x[15] ^= XS_R(x[14] + x[13], 18);
+#undef XS_R
+    }
+    for (int i = 0; i < 16; i++) b[i] += x[i];
+}
+/* BlockMix: B (2r blocks of 16 words) through Salsa20/8 into Y, then back in the even-odd order */
+static void xs_blockmix(uint32_t *b, uint32_t *y, size_t r) {
+    uint32_t x[16];
+    memcpy(x, &b[(2 * r - 1) * 16], 64);
+    for (size_t i = 0; i < 2 * r; i++) {
+        for (int k = 0; k < 16; k++) x[k] ^= b[i * 16 + k];
+        xs_salsa8(x);
+        memcpy(&y[i * 16], x, 64);
+    }
+    for (size_t i = 0; i < r; i++) memcpy(&b[i * 16], &y[(2 * i) * 16], 64);
+    for (size_t i = 0; i < r; i++) memcpy(&b[(r + i) * 16], &y[(2 * i + 1) * 16], 64);
+}
+/* null when N, r and p ask for more memory than maxmem (or N is not a power of two above 1) */
+XS_NOINLINE xs_Uint8Array *xs_crypto_scrypt(xs_Uint8Array *pw, xs_Uint8Array *salt, int64_t N, int64_t r, int64_t p, int64_t keylen, int64_t maxmem) {
+    if (N < 2 || (N & (N - 1)) != 0 || r < 1 || p < 1) return NULL;
+    uint64_t need = 128ull * (uint64_t)r * ((uint64_t)N + (uint64_t)p + 2);
+    if (need > (uint64_t)maxmem) return NULL;
+    size_t blen = 128 * (size_t)r * (size_t)p;
+    xs_Uint8Array *bs = xs_u8_raw((int64_t)blen, false, false);
+    xs_str *alg = xs_str_new("sha256", 6);
+    xs_Uint8Array *b0 = xs_crypto_pbkdf2(pw, salt, 1, (int64_t)blen, alg);
+    memcpy(bs->data, b0->data, blen);
+    xs_release(b0);
+    size_t words = 32 * (size_t)r;
+    uint32_t *x = malloc(words * 4), *y = malloc(words * 4), *v = malloc(words * 4 * (size_t)N);
+    if (!x || !y || !v) xs_panic("out of memory");
+    for (int64_t k = 0; k < p; k++) {
+        uint8_t *blk = bs->data + (size_t)k * 128 * (size_t)r;
+        for (size_t i = 0; i < words; i++) x[i] = (uint32_t)blk[4 * i] | (uint32_t)blk[4 * i + 1] << 8 | (uint32_t)blk[4 * i + 2] << 16 | (uint32_t)blk[4 * i + 3] << 24;
+        for (int64_t i = 0; i < N; i++) {
+            memcpy(&v[(size_t)i * words], x, words * 4);
+            xs_blockmix(x, y, (size_t)r);
+        }
+        for (int64_t i = 0; i < N; i++) {
+            uint64_t j = x[(2 * (size_t)r - 1) * 16] & (uint64_t)(N - 1);
+            for (size_t w = 0; w < words; w++) x[w] ^= v[j * words + w];
+            xs_blockmix(x, y, (size_t)r);
+        }
+        for (size_t i = 0; i < words; i++) { blk[4 * i] = (uint8_t)x[i]; blk[4 * i + 1] = (uint8_t)(x[i] >> 8); blk[4 * i + 2] = (uint8_t)(x[i] >> 16); blk[4 * i + 3] = (uint8_t)(x[i] >> 24); }
+    }
+    free(x); free(y); free(v);
+    xs_Uint8Array *out = xs_crypto_pbkdf2(pw, bs, 1, keylen, alg);
+    xs_release(bs);
+    xs_release(alg);
+    return out;
+}
+
+/* ---- HKDF (RFC 5869) ---- */
+XS_NOINLINE xs_Uint8Array *xs_crypto_hkdf(xs_str *alg, xs_Uint8Array *ikm, xs_Uint8Array *salt, xs_Uint8Array *info, int64_t keylen) {
+    const char *a = alg->data;
+    size_t hl = (size_t)xs_digest_len(a);
+    if (!hl) return NULL;
+    uint8_t prk[64], t[64];
+    xs_hmac_raw(a, salt->data, (size_t)salt->f_length, ikm->data, (size_t)ikm->f_length, "", 0, prk); /* (no salt: HMAC's zero key) */
+    xs_Uint8Array *r = xs_u8_raw(keylen, true, false);
+    size_t ilen = (size_t)info->f_length, tl = 0;
+    uint8_t *msg = malloc(hl + ilen + 1);
+    if (!msg) xs_panic("out of memory");
+    for (size_t off = 0, i = 1; off < (size_t)keylen; i++) {
+        memcpy(msg, t, tl);
+        memcpy(msg + tl, info->data, ilen);
+        msg[tl + ilen] = (uint8_t)i;
+        xs_hmac_raw(a, prk, hl, msg, tl + ilen + 1, "", 0, t);
+        tl = hl;
+        size_t n = (size_t)keylen - off < hl ? (size_t)keylen - off : hl;
+        memcpy(r->data + off, t, n);
+        off += n;
+    }
+    free(msg);
+    return r;
+}
+
+/* ---- AES: CBC (PKCS#7 padding), CTR (128-bit counter, as OpenSSL), GCM, ECB ----
+   The state lives in the bytes of a Uint8Array the Cipher object holds (freed with it); the pointers BearSSL
+   keeps inside it point into those same bytes, which never move. */
+enum { XS_AES_CBC = 1, XS_AES_CTR, XS_AES_GCM, XS_AES_ECB };
+typedef struct {
+    int kind, decrypt, padding, finished, error, tag_set, aad_done;
+    union { br_aes_ct64_cbcenc_keys ce; br_aes_ct64_cbcdec_keys cd; br_aes_ct64_ctr_keys ctr; } k;
+    br_gcm_context gcm;
+    uint8_t iv[16];      /* CBC: the chaining value; CTR: the counter block */
+    uint8_t buf[32];     /* CBC/ECB: the bytes of a block not yet complete (and, decrypting, the last block held back);
+                            CTR: the keystream block in use */
+    size_t nbuf;         /* CTR: bytes of buf's keystream used */
+    uint8_t tag[16];
+    size_t taglen;
+} xs_aes_state;
+static xs_aes_state *xs_aes_of(xs_Uint8Array *st) { return (xs_aes_state *)(void *)st->data; }
+
+XS_NOINLINE xs_Uint8Array *xs_crypto_cipher_new(int64_t kind, xs_Uint8Array *key, xs_Uint8Array *iv, bool decrypt) {
+    xs_Uint8Array *st = xs_u8_raw((int64_t)sizeof(xs_aes_state), false, true);
+    xs_aes_state *s = xs_aes_of(st);
+    s->kind = (int)kind;
+    s->decrypt = decrypt;
+    s->padding = 1;
+    s->taglen = 16;
+    size_t kl = (size_t)key->f_length;
+    if (kind == XS_AES_CBC || kind == XS_AES_ECB) {
+        if (decrypt) br_aes_ct64_cbcdec_init(&s->k.cd, key->data, kl);
+        else br_aes_ct64_cbcenc_init(&s->k.ce, key->data, kl);
+        if (kind == XS_AES_CBC) memcpy(s->iv, iv->data, 16);
+    } else {
+        br_aes_ct64_ctr_init(&s->k.ctr, key->data, kl);
+        if (kind == XS_AES_CTR) { memcpy(s->iv, iv->data, 16); s->nbuf = 16; }
+        else {
+            br_gcm_init(&s->gcm, &s->k.ctr.vtable, br_ghash_ctmul64);
+            br_gcm_reset(&s->gcm, iv->data, (size_t)iv->f_length);
+        }
+    }
+    return st;
+}
+/* one AES block, encrypted (ECB): CBC with a zero chaining value */
+static void xs_aes_ecb1(xs_aes_state *s, uint8_t *blk) {
+    uint8_t zero[16] = {0};
+    if (s->decrypt) br_aes_ct64_cbcdec_run(&s->k.cd, zero, blk, 16);
+    else br_aes_ct64_cbcenc_run(&s->k.ce, zero, blk, 16);
+}
+static void xs_ctr_next(xs_aes_state *s) {
+    uint8_t zero[16] = {0};
+    /* the keystream block: AES(counter), by CTR mode over 16 zero bytes from the counter's 32 low bits */
+    memcpy(s->buf, zero, 16);
+    uint32_t cc = (uint32_t)s->iv[12] << 24 | (uint32_t)s->iv[13] << 16 | (uint32_t)s->iv[14] << 8 | s->iv[15];
+    br_aes_ct64_ctr_run(&s->k.ctr, s->iv, cc, s->buf, 16);
+    for (int i = 15; i >= 0; i--) if (++s->iv[i] != 0) break; /* the whole 128-bit counter, big-endian */
+    s->nbuf = 0;
+}
+/* CBC/ECB blocks of data, in place */
+static void xs_aes_blocks(xs_aes_state *s, uint8_t *p, size_t n) {
+    if (s->kind == XS_AES_ECB) { for (size_t i = 0; i < n; i += 16) xs_aes_ecb1(s, p + i); return; }
+    if (s->decrypt) br_aes_ct64_cbcdec_run(&s->k.cd, s->iv, p, n);
+    else br_aes_ct64_cbcenc_run(&s->k.ce, s->iv, p, n);
+}
+XS_NOINLINE xs_Uint8Array *xs_crypto_cipher_update(xs_Uint8Array *st, xs_Uint8Array *data) {
+    xs_aes_state *s = xs_aes_of(st);
+    size_t n = (size_t)data->f_length;
+    if (s->kind == XS_AES_CTR || s->kind == XS_AES_GCM) {
+        xs_Uint8Array *r = xs_buffer_of(data->data, n);
+        if (s->kind == XS_AES_GCM) {
+            if (!s->aad_done) { br_gcm_flip(&s->gcm); s->aad_done = 1; }
+            br_gcm_run(&s->gcm, !s->decrypt, r->data, n);
+            return r;
+        }
+        for (size_t i = 0; i < n; i++) {
+            if (s->nbuf == 16) xs_ctr_next(s);
+            r->data[i] ^= s->buf[s->nbuf++];
+        }
+        return r;
+    }
+    /* CBC/ECB: whole blocks out; decrypting with padding, the last whole block is held back for final() */
+    size_t have = s->nbuf + n;
+    size_t keep = have % 16;
+    if (s->decrypt && s->padding && keep == 0 && have > 0) keep = 16;
+    size_t outn = have - keep;
+    xs_Uint8Array *r = xs_u8_raw((int64_t)outn, true, false);
+    size_t from_buf = s->nbuf < outn ? s->nbuf : outn;
+    memcpy(r->data, s->buf, from_buf);
+    memcpy(r->data + from_buf, data->data, outn - from_buf);
+    /* what stays: the rest of buf, then the rest of data */
+    uint8_t tmp[32];
+    size_t t = 0;
+    for (size_t i = from_buf; i < s->nbuf; i++) tmp[t++] = s->buf[i];
+    for (size_t i = outn - from_buf; i < n; i++) tmp[t++] = data->data[i];
+    memcpy(s->buf, tmp, t);
+    s->nbuf = t;
+    if (outn) xs_aes_blocks(s, r->data, outn);
+    return r;
+}
+/* final(): the last block (CBC/ECB), the tag computed (GCM encrypting) or checked (decrypting); null on an
+   error, then xs_crypto_cipher_error says which: 1 bad decrypt, 2 wrong final block length, 3 tag not set */
+XS_NOINLINE xs_Uint8Array *xs_crypto_cipher_final(xs_Uint8Array *st) {
+    xs_aes_state *s = xs_aes_of(st);
+    s->finished = 1;
+    if (s->kind == XS_AES_CTR) return xs_u8_raw(0, true, false);
+    if (s->kind == XS_AES_GCM) {
+        if (!s->aad_done) { br_gcm_flip(&s->gcm); s->aad_done = 1; }
+        if (!s->decrypt) { br_gcm_get_tag_trunc(&s->gcm, s->tag, s->taglen); return xs_u8_raw(0, true, false); }
+        if (!s->tag_set) { s->error = 3; return NULL; }
+        if (!br_gcm_check_tag_trunc(&s->gcm, s->tag, s->taglen)) { s->error = 1; return NULL; }
+        return xs_u8_raw(0, true, false);
+    }
+    if (!s->padding) {
+        if (s->nbuf) { s->error = 2; return NULL; }
+        return xs_u8_raw(0, true, false);
+    }
+    if (!s->decrypt) {
+        uint8_t pad = (uint8_t)(16 - s->nbuf);
+        for (size_t i = s->nbuf; i < 16; i++) s->buf[i] = pad;
+        xs_aes_blocks(s, s->buf, 16);
+        return xs_buffer_of(s->buf, 16);
+    }
+    if (s->nbuf != 16) { s->error = 2; return NULL; }
+    xs_aes_blocks(s, s->buf, 16);
+    uint8_t pad = s->buf[15];
+    if (pad == 0 || pad > 16) { s->error = 1; return NULL; }
+    for (int i = 16 - pad; i < 16; i++) if (s->buf[i] != pad) { s->error = 1; return NULL; }
+    return xs_buffer_of(s->buf, (size_t)(16 - pad));
+}
+XS_NOINLINE int64_t xs_crypto_cipher_error(xs_Uint8Array *st) { return xs_aes_of(st)->error; }
+XS_NOINLINE void xs_crypto_cipher_padding(xs_Uint8Array *st, bool on) { xs_aes_of(st)->padding = on; }
+XS_NOINLINE void xs_crypto_cipher_aad(xs_Uint8Array *st, xs_Uint8Array *aad) {
+    xs_aes_state *s = xs_aes_of(st);
+    br_gcm_aad_inject(&s->gcm, aad->data, (size_t)aad->f_length);
+}
+XS_NOINLINE void xs_crypto_cipher_set_tag(xs_Uint8Array *st, xs_Uint8Array *tag) {
+    xs_aes_state *s = xs_aes_of(st);
+    s->taglen = (size_t)tag->f_length;
+    memcpy(s->tag, tag->data, s->taglen);
+    s->tag_set = 1;
+}
+XS_NOINLINE void xs_crypto_cipher_tag_length(xs_Uint8Array *st, int64_t n) { xs_aes_of(st)->taglen = (size_t)n; }
+XS_NOINLINE xs_Uint8Array *xs_crypto_cipher_tag(xs_Uint8Array *st) {
+    xs_aes_state *s = xs_aes_of(st);
+    return xs_buffer_of(s->tag, s->taglen);
+}
+
+/* ---- RSA and EC keys: the numbers of a key travel packed, each as a 4-byte big-endian length and its bytes
+   (RSA private: n e d p q dp dq qi; RSA public: n e; EC: the curve's id, then d or the public point) ---- */
+static const uint8_t *xs_pk_field(const xs_Uint8Array *k, int idx, size_t *len) {
+    size_t at = 0, n = (size_t)k->f_length;
+    for (int i = 0;; i++) {
+        if (at + 4 > n) { *len = 0; return NULL; }
+        size_t l = (size_t)k->data[at] << 24 | (size_t)k->data[at + 1] << 16 | (size_t)k->data[at + 2] << 8 | k->data[at + 3];
+        at += 4;
+        if (at + l > n) { *len = 0; return NULL; }
+        if (i == idx) { *len = l; return k->data + at; }
+        at += l;
+    }
+}
+static void xs_pk_put(uint8_t **p, const uint8_t *v, size_t n) {
+    while (n > 1 && *v == 0) { v++; n--; } /* minimal unsigned big-endian */
+    (*p)[0] = (uint8_t)(n >> 24); (*p)[1] = (uint8_t)(n >> 16); (*p)[2] = (uint8_t)(n >> 8); (*p)[3] = (uint8_t)n;
+    memcpy(*p + 4, v, n);
+    *p += 4 + n;
+}
+static bool xs_rsa_priv(const xs_Uint8Array *k, br_rsa_private_key *sk) {
+    size_t nl;
+    const uint8_t *n = xs_pk_field(k, 0, &nl);
+    if (!n) return false;
+    while (nl > 0 && *n == 0) { n++; nl--; }
+    if (!nl) return false;
+    unsigned bits = (unsigned)nl * 8;
+    for (uint8_t top = n[0]; !(top & 0x80); top <<= 1) bits--;
+    sk->n_bitlen = bits;
+    sk->p = (unsigned char *)xs_pk_field(k, 3, &sk->plen);
+    sk->q = (unsigned char *)xs_pk_field(k, 4, &sk->qlen);
+    sk->dp = (unsigned char *)xs_pk_field(k, 5, &sk->dplen);
+    sk->dq = (unsigned char *)xs_pk_field(k, 6, &sk->dqlen);
+    sk->iq = (unsigned char *)xs_pk_field(k, 7, &sk->iqlen);
+    return sk->p && sk->q && sk->dp && sk->dq && sk->iq;
+}
+static bool xs_rsa_pub(const xs_Uint8Array *k, br_rsa_public_key *pk) {
+    pk->n = (unsigned char *)xs_pk_field(k, 0, &pk->nlen);
+    pk->e = (unsigned char *)xs_pk_field(k, 1, &pk->elen);
+    while (pk->n && pk->nlen > 0 && *pk->n == 0) { pk->n++; pk->nlen--; }
+    return pk->n && pk->e && pk->nlen;
+}
+static void xs_br_rng(br_hmac_drbg_context *rng) {
+    uint8_t seed[48];
+    xs_random_bytes(seed, sizeof seed);
+    br_hmac_drbg_init(rng, &br_sha256_vtable, seed, sizeof seed);
+}
+
+/* RSA signature of a hash: PKCS#1 v1.5 (salt < 0) or PSS with that salt length; null on a failure */
+XS_NOINLINE xs_Uint8Array *xs_crypto_rsa_sign(xs_str *alg, xs_Uint8Array *hash, xs_Uint8Array *key, int64_t salt) {
+    const unsigned char *oid;
+    const br_hash_class *h = xs_br_hash(alg->data, &oid);
+    br_rsa_private_key sk;
+    if (!h || !xs_rsa_priv(key, &sk)) return NULL;
+    size_t len = (sk.n_bitlen + 7) / 8;
+    xs_Uint8Array *r = xs_u8_raw((int64_t)len, true, true);
+    uint32_t ok;
+    if (salt < 0) ok = oid ? br_rsa_i31_pkcs1_sign(oid, hash->data, (size_t)hash->f_length, &sk, r->data) : 0;
+    else {
+        br_hmac_drbg_context rng;
+        xs_br_rng(&rng);
+        ok = br_rsa_i31_pss_sign(&rng.vtable, h, h, hash->data, (size_t)salt, &sk, r->data);
+    }
+    if (!ok) { xs_release(r); return NULL; }
+    return r;
+}
+/* RSA signature check (PKCS#1 v1.5 when salt < 0, else PSS) */
+XS_NOINLINE bool xs_crypto_rsa_verify(xs_str *alg, xs_Uint8Array *hash, xs_Uint8Array *key, xs_Uint8Array *sig, int64_t salt) {
+    const unsigned char *oid;
+    const br_hash_class *h = xs_br_hash(alg->data, &oid);
+    br_rsa_public_key pk;
+    if (!h || !xs_rsa_pub(key, &pk) || (size_t)sig->f_length != pk.nlen) return false;
+    if (salt < 0) {
+        uint8_t out[64];
+        if (!oid || !br_rsa_i31_pkcs1_vrfy(sig->data, (size_t)sig->f_length, oid, (size_t)hash->f_length, &pk, out)) return false;
+        return xs_ct_equal(out, hash->data, (size_t)hash->f_length);
+    }
+    return br_rsa_i31_pss_vrfy(sig->data, (size_t)sig->f_length, h, h, hash->data, (size_t)salt, &pk) == 1;
+}
+/* RSA key generation: bits (BearSSL's i31 engine: up to 4096) and the public exponent; the key packed (n e d p q dp dq qi) */
+#define XS_RSA_MAX_BITS 4096
+XS_NOINLINE xs_Uint8Array *xs_crypto_rsa_keygen(int64_t bits, int64_t e) {
+    br_hmac_drbg_context rng;
+    xs_br_rng(&rng);
+    br_rsa_private_key sk;
+    br_rsa_public_key pk;
+    size_t kp = BR_RSA_KBUF_PRIV_SIZE(XS_RSA_MAX_BITS), kb = BR_RSA_KBUF_PUB_SIZE(XS_RSA_MAX_BITS);
+    uint8_t *privbuf = malloc(kp), *pubbuf = malloc(kb), *d = malloc(XS_RSA_MAX_BITS / 8 + 1);
+    if (!privbuf || !pubbuf || !d) xs_panic("out of memory");
+    if (!br_rsa_i31_keygen(&rng.vtable, &sk, privbuf, &pk, pubbuf, (unsigned)bits, (uint32_t)e)) { free(privbuf); free(pubbuf); free(d); return NULL; }
+    size_t dl = br_rsa_i31_compute_privexp(d, &sk, (uint32_t)e);
+    size_t total = 32 + pk.nlen + pk.elen + dl + sk.plen + sk.qlen + sk.dplen + sk.dqlen + sk.iqlen;
+    xs_Uint8Array *r = xs_u8_raw((int64_t)total, false, false);
+    uint8_t *p = r->data;
+    xs_pk_put(&p, pk.n, pk.nlen); xs_pk_put(&p, pk.e, pk.elen); xs_pk_put(&p, d, dl);
+    xs_pk_put(&p, sk.p, sk.plen); xs_pk_put(&p, sk.q, sk.qlen); xs_pk_put(&p, sk.dp, sk.dplen); xs_pk_put(&p, sk.dq, sk.dqlen); xs_pk_put(&p, sk.iq, sk.iqlen);
+    r->f_length = p - r->data;
+    free(privbuf); free(pubbuf); free(d);
+    return r;
+}
+/* EC (P-256, P-384, P-521): a new private scalar; the public point from it; ECDSA. P-256 on its own fast code,
+   the other two on the generic one (not br_ec_get_default(), which also brings Curve25519) */
+static const br_ec_impl *xs_ec_impl(int curve) {
+    if (curve == BR_EC_secp256r1) {
+        const br_ec_impl *m = br_ec_p256_m64_get(); /* (NULL without 64x64 multiplications: the generic code) */
+        if (m) return m;
+    }
+    return &br_ec_prime_i31;
+}
+XS_NOINLINE xs_Uint8Array *xs_crypto_ec_keygen(int64_t curve) {
+    br_hmac_drbg_context rng;
+    xs_br_rng(&rng);
+    br_ec_private_key sk;
+    uint8_t kbuf[BR_EC_KBUF_PRIV_MAX_SIZE];
+    size_t n = br_ec_keygen(&rng.vtable, xs_ec_impl((int)curve), &sk, kbuf, (int)curve);
+    return n ? xs_buffer_of(kbuf, n) : NULL;
+}
+XS_NOINLINE xs_Uint8Array *xs_crypto_ec_public(int64_t curve, xs_Uint8Array *d) {
+    br_ec_private_key sk = {(int)curve, d->data, (size_t)d->f_length};
+    uint8_t kbuf[BR_EC_KBUF_PUB_MAX_SIZE];
+    size_t n = br_ec_compute_pub(xs_ec_impl((int)curve), NULL, kbuf, &sk);
+    return n ? xs_buffer_of(kbuf, n) : NULL;
+}
+/* ECDSA of a hash with the private scalar d; DER (raw false) or r||s (IEEE P1363) */
+XS_NOINLINE xs_Uint8Array *xs_crypto_ec_sign(xs_str *alg, xs_Uint8Array *hash, int64_t curve, xs_Uint8Array *d, bool raw) {
+    const br_hash_class *h = xs_br_hash(alg->data, NULL);
+    if (!h) return NULL;
+    br_ec_private_key sk = {(int)curve, d->data, (size_t)d->f_length};
+    uint8_t sig[160];
+    size_t n = raw ? br_ecdsa_i31_sign_raw(xs_ec_impl((int)curve), h, hash->data, &sk, sig) : br_ecdsa_i31_sign_asn1(xs_ec_impl((int)curve), h, hash->data, &sk, sig);
+    return n ? xs_buffer_of(sig, n) : NULL;
+}
+XS_NOINLINE bool xs_crypto_ec_verify(xs_Uint8Array *hash, int64_t curve, xs_Uint8Array *q, xs_Uint8Array *sig, bool raw) {
+    br_ec_public_key pk = {(int)curve, q->data, (size_t)q->f_length};
+    if (raw) return br_ecdsa_i31_vrfy_raw(xs_ec_impl((int)curve), hash->data, (size_t)hash->f_length, &pk, sig->data, (size_t)sig->f_length) == 1;
+    return br_ecdsa_i31_vrfy_asn1(xs_ec_impl((int)curve), hash->data, (size_t)hash->f_length, &pk, sig->data, (size_t)sig->f_length) == 1;
 }

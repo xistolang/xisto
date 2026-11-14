@@ -4730,7 +4730,9 @@ static Enum *parse_enum(Parser *p) {
    first) then the member's decorators (bottom up); constructor parameters; then the class (bottom up). */
 static bool class_decorated(Class *c) {
     if (c->decos.len || c->as_value) return true;
-    if (c->base_name && strcmp(c->base_name, "Error") == 0) return true; /* an error class: a value too (@Catch(MyError)) */
+    if (c->base_name && strcmp(c->base_name, "Error") == 0 && !(c->mod && c->mod->file && (!strcmp(c->mod->file, "xisto:crypto") || !strcmp(c->mod->file, "xisto:zlib"))))
+        return true; /* an error class: a value too (@Catch(MyError)); not node:crypto's and node:zlib's errors with a code, which
+                        would make every program that imports them carry xisto:reflect (~40 KB) */
     if (c->mixin) return true; /* class UpdateDto extends PartialType(CreateDto) {}: a value too (@Body() dto: UpdateDto) */
     for (int i = 0; i < c->nfields; i++) if (c->fields[i].decos.len) return true;
     for (int i = 0; i < c->nmethods; i++) {
