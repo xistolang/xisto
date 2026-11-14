@@ -206,8 +206,14 @@ a { transition: color var(--xisto-ease); }
 /* ---------- navbar ---------- */
 .navbar {
   border-bottom: 1px solid var(--xisto-border);
-  backdrop-filter: saturate(140%) blur(8px);
 }
+/* the blur only where the docs menu is not a drawer: a backdrop-filter makes the navbar the containing block of its
+   fixed children, and the phone menu (.navbar-sidebar, inside the navbar) was clipped to the bar's height */
+@media (min-width: 997px) {
+  .navbar { backdrop-filter: saturate(140%) blur(8px); }
+}
+/* the phone drawer is opaque: the navbar's colour is translucent (for the blur), and the page showed through */
+.navbar-sidebar { background-color: var(--xisto-bg); }
 .navbar__title { font-weight: 700; font-size: 1.25rem; color: var(--ifm-heading-color); }
 .navbar__logo { height: 2rem; margin-right: 0.625rem; }
 .navbar__link { font-weight: 500; }

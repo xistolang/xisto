@@ -55,8 +55,8 @@ const paths = [
     cta: 'Follow the tutorial',
   },
   {
-    title: 'Measure your project',
-    text: 'xisto check reads your tsconfig and counts what has to change before your code compiles, by kind of change.',
+    title: 'Already have a TypeScript project?',
+    text: 'xisto check reads your tsconfig and shows what it takes to run it with Xisto, counted by kind of change.',
     to: '/docs/guides/porting#1-measure-with-xisto-check',
     cta: 'Run xisto check',
   },
@@ -79,7 +79,7 @@ const points = [
   },
   {
     title: 'Runs your TypeScript',
-    text: 'Classes, generics, async/await, decorators and modules, under a few stricter rules. The same source still runs on Node.',
+    text: 'Classes, generics, async/await, decorators and modules, under a few stricter rules. Code within that subset also runs on Node; the Node compatibility guide lists where the semantics differ.',
   },
 ];
 
