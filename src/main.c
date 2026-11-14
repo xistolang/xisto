@@ -401,11 +401,24 @@ static Buf compile_to_c(const char *path) {
         pad4_program(p);
     }
     xs_jam_uk = cpu_avx2_target() ? 12 : 8; /* (emit.c: U of the jam of k by target) */
-#if defined(__aarch64__)
-    xs_skew_r = xs_target ? 8 : 16; /* (emit.c: rows of a skewed Gauss-Seidel; 31 integer registers here) */
+    /* the target's processor family: the host's, or --target's */
+    bool x86 = xs_target ? strstr(xs_target, "x86_64") != NULL :
+#if defined(__x86_64__)
+                           true;
 #else
-    xs_skew_r = 8;
+                           false;
 #endif
+    bool arm = xs_target ? strstr(xs_target, "aarch64") != NULL :
+#if defined(__aarch64__)
+                           true;
+#else
+                           false;
+#endif
+    /* (emit.c) rows of a skewed Gauss-Seidel: 16 on ARM (31 integer registers), 12 on x86 (Xeon E5-2686 v4, seidel-2d
+       LARGE: R = 8 4,90 s, 12 4,87, 16 4,99), 8 elsewhere; the stencil nest without per-row tests only off x86
+       (Broadwell: fdtd-2d 1,665 -> 1,83 s with it, jacobi-2d and heat-3d equal; the Graviton2 gains) */
+    xs_skew_r = arm ? 16 : x86 ? 12 : 8;
+    xs_rsten = !x86;
     if (!use_qbe) {
         xs_wide_f64 = cpu_wide_f64();
         distribute_program(p); /* (after columns: it only touches loops over columns) */
