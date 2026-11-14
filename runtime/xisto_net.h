@@ -1780,6 +1780,7 @@ static xs_str *xs_HttpRequest_param(xs_HttpRequest *r, xs_str *name) {
    XISTO_LOCK=1 (the default when N > 1) runs handlers one at a time under a mutex, so handlers that
    touch globals stay correct; XISTO_LOCK=0 removes the lock for stateless handlers. */
 static int xs_workers = 1;
+static bool xs_lfd_per_worker; /* each worker listens on its own socket (Linux, SO_REUSEPORT) */
 
 /* ---- metrics ---- */
 
@@ -2920,14 +2921,13 @@ static void xs_server_wake(xs_Server *s, int lfd) {
         EV_SET(&ev, lfd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
         kevent(xs_kq, &ev, 1, NULL, 0, NULL);
         static int closed;
-        if (__atomic_exchange_n(&closed, 1, __ATOMIC_SEQ_CST) == 0) { /* refuse new connections, once for all workers */
-            close(lfd);
-            fprintf(stderr, "xisto: shutting down, %lld request(s) in flight\n", (long long)xs_inflight_total);
-        }
+        bool first = __atomic_exchange_n(&closed, 1, __ATOMIC_SEQ_CST) == 0;
+        if (first || xs_lfd_per_worker) close(lfd); /* refuse new connections: the shared socket once, or each worker's own */
+        if (first) fprintf(stderr, "xisto: shutting down, %lld request(s) in flight\n", (long long)xs_inflight_total);
     }
 }
 
-XS_NOINLINE int xs_listen_socket(int64_t port) {
+XS_NOINLINE int xs_listen_socket_x(int64_t port, bool reuseport) {
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0) xs_panic("listen: socket failed");
     int one = 1;
@@ -2935,7 +2935,9 @@ XS_NOINLINE int xs_listen_socket(int64_t port) {
 #ifdef SO_REUSEPORT
     /* XISTO_REUSEPORT=1: several processes of the program on one port, the kernel spreading the connections between
        them (as Node's cluster or Bun's reusePort): each process with its own state, no lock between them */
-    { const char *rp = getenv("XISTO_REUSEPORT"); if (rp && atoi(rp) != 0) setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one); }
+    { const char *rp = getenv("XISTO_REUSEPORT"); if (reuseport || (rp && atoi(rp) != 0)) setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one); }
+#else
+    (void)reuseport;
 #endif
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
@@ -2946,6 +2948,7 @@ XS_NOINLINE int xs_listen_socket(int64_t port) {
     fcntl(lfd, F_SETFL, O_NONBLOCK);
     return lfd;
 }
+XS_NOINLINE int xs_listen_socket(int64_t port) { return xs_listen_socket_x(port, false); }
 
 static void *xs_server_worker(void *arg);
 
@@ -2987,16 +2990,26 @@ XS_NOINLINE void xs_Server_listen(xs_Server *s, int64_t port) {
 #endif
     const char *l = getenv("XISTO_LOCK");
     xs_handler_lock = xs_workers > 1 && (!l || atoi(l) != 0);
-    /* one listening socket shared by every worker: each worker watches it in its own kqueue and
-       accepts what it can (on macOS SO_REUSEPORT would not spread connections between sockets) */
     if (xs_workers > 1 && xs_channels_used) xs_panic("channels connect handlers of one event loop; run with one worker (XISTO_WORKERS=1)");
-    int lfd = xs_listen_socket(port);
+    /* Linux: one listening socket per worker on the same port (SO_REUSEPORT), so the kernel spreads new connections
+       evenly; with one shared socket every worker's epoll wakes for it and whoever accepts first takes the burst
+       (at 64 connections the server used one core of two). Elsewhere (macOS does
+       not spread connections between such sockets) the workers share one socket. */
+#if defined(__linux__) && defined(SO_REUSEPORT)
+    xs_lfd_per_worker = xs_workers > 1;
+#endif
+    int lfd = xs_listen_socket_x(port, xs_lfd_per_worker);
+    if (xs_lfd_per_worker && port == 0) { /* the others take the port the first one got */
+        struct sockaddr_in sa;
+        socklen_t sl = sizeof sa;
+        if (getsockname(lfd, (struct sockaddr *)&sa, &sl) == 0) port = ntohs(sa.sin_port);
+    }
     if (xs_workers > 1) {
         fprintf(stderr, "xisto: %d workers, handlers %s\n", xs_workers, xs_handler_lock ? "serialized by a lock" : "running in parallel (handlers must not touch shared state)");
         pthread_t *threads = malloc(sizeof(pthread_t) * (size_t)xs_workers);
         for (int i = 0; i < xs_workers; i++) {
             xs_worker_args *a = malloc(sizeof *a);
-            a->s = s; a->port = port; a->index = i; a->lfd = lfd;
+            a->s = s; a->port = port; a->index = i; a->lfd = i > 0 && xs_lfd_per_worker ? xs_listen_socket_x(port, true) : lfd;
             pthread_create(&threads[i], NULL, xs_server_worker, a);
         }
         for (int i = 0; i < xs_workers; i++) pthread_join(threads[i], NULL);
