@@ -414,10 +414,17 @@ static Buf compile_to_c(const char *path) {
 #else
                            false;
 #endif
-    /* (emit.c) rows of a skewed Gauss-Seidel: 16 on ARM (31 integer registers), 12 on x86 (Xeon E5-2686 v4, seidel-2d
-       LARGE: R = 8 4,90 s, 12 4,87, 16 4,99), 8 elsewhere; the stencil nest without per-row tests only off x86
+    /* (emit.c) rows of a skewed Gauss-Seidel: 16 on Apple ARM (M4 kernel: 12 2,5 s, 16 2,08), 12 on other ARM and on
+       x86 (seidel-2d LARGE, Xeon E5-2686 v4: R = 8 4,90 s, 12 4,87, 16 4,99; Graviton2: 8 6,89, 12 6,82, 16 10,38),
+       8 elsewhere; the stencil nest without per-row tests only off x86
        (Broadwell: fdtd-2d 1,665 -> 1,83 s with it, jacobi-2d and heat-3d equal; the Graviton2 gains) */
-    xs_skew_r = arm ? 16 : x86 ? 12 : 8;
+    bool apple = xs_target ? (strstr(xs_target, "apple") || strstr(xs_target, "darwin")) :
+#if defined(__APPLE__)
+                             true;
+#else
+                             false;
+#endif
+    xs_skew_r = arm && apple ? 16 : arm || x86 ? 12 : 8;
     xs_rsten = !x86;
     if (!use_qbe) {
         xs_wide_f64 = cpu_wide_f64();

@@ -9662,7 +9662,7 @@ static bool lj_emit(Stmt *s) {
    same order, so the same bits, and the R division chains are independent instead of one. The guard, once per entry:
    the rows L - 1 .. H + 1 within X, each long enough for H2 + 1, L2 - 1 >= 0, and X's rows apart from each other
    (xs_blocks_apart_: a row twice would change which values are old). The rows left (fewer than R), and the loop when
-   the guard fails, as written. XISTO_NO_SKEW turns it off; XISTO_SKEW_R sets R (xs_skew_r: main.c gives 16 for ARM, 12
+   the guard fails, as written. XISTO_NO_SKEW turns it off; XISTO_SKEW_R sets R (xs_skew_r: main.c gives 16 for Apple ARM, 12 for other ARM and
    for x86, 8 elsewhere; seidel-2d LARGE on the M4, kernel: 10,8 s as written, R = 4 4,3, 8 3,3, 12 2,5, 16 2,08; on the
    Xeon E5-2686 v4, process: 8 4,90, 12 4,87, 16 4,99). */
 int xs_skew_r = 8;
