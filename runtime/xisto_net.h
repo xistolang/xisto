@@ -2050,7 +2050,11 @@ typedef struct xs_conn { char host[256]; int port; int fd; bool https; xs_tls *t
 static XS_TLS xs_conn *xs_idle_conns;
 static XS_TLS int xs_idle_count;
 
-static int xs_connect(const char *host, int port) {
+XS_NOINLINE void xs_fetch_timeout(void);
+XS_NOINLINE void xs_fetch_aborted(int kind);
+/* the connection, waited for within the fetch's time limit (deadline, 0: none) and its AbortSignal (abort: its byte,
+   read every 20 ms): an address that never answers (a collector behind a firewall) must not hold the fetch past them */
+XS_NOINLINE int xs_connect_until(const char *host, int port, uint64_t deadline, xs_Uint8Array *abort) {
     struct addrinfo hints = {0}, *res;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -2067,7 +2071,17 @@ static int xs_connect(const char *host, int port) {
         int r = connect(fd, ai->ai_addr, ai->ai_addrlen);
         if (r == 0) break;
         if (errno == EINPROGRESS) {
-            xs_wait_fd(fd, EVFILT_WRITE);
+            for (;;) {
+                int64_t slice = -1;
+                if (deadline) {
+                    uint64_t now = xs_now();
+                    if (now >= deadline) { close(fd); freeaddrinfo(res); xs_fetch_timeout(); }
+                    slice = (int64_t)((deadline - now) / 1000000ull) + 1;
+                }
+                if (abort && (slice < 0 || slice > 20)) slice = 20;
+                if (xs_wait_fd_ms(fd, EVFILT_WRITE, slice)) break;
+                if (abort && abort->data[0]) { int k = abort->data[0]; close(fd); freeaddrinfo(res); xs_fetch_aborted(k); }
+            }
             int err = 0; socklen_t len = sizeof err;
             getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
             if (err == 0) break;
@@ -2079,7 +2093,10 @@ static int xs_connect(const char *host, int port) {
     return fd;
 }
 
-XS_NOINLINE xs_conn *xs_conn_take(const char *host, int port, bool https) {
+/* without a limit (the native code of packages: pg, oracledb, redis...) */
+XS_NOINLINE int xs_connect(const char *host, int port) { return xs_connect_until(host, port, 0, NULL); }
+
+XS_NOINLINE xs_conn *xs_conn_take(const char *host, int port, bool https, uint64_t deadline, xs_Uint8Array *abort) {
     for (xs_conn **pp = &xs_idle_conns; *pp; pp = &(*pp)->next) {
         xs_conn *c = *pp;
         if (c->port == port && c->https == https && strcmp(c->host, host) == 0) {
@@ -2091,7 +2108,7 @@ XS_NOINLINE xs_conn *xs_conn_take(const char *host, int port, bool https) {
     xs_conn *c = calloc(1, sizeof *c);
     strncpy(c->host, host, sizeof c->host - 1);
     c->port = port;
-    c->fd = xs_connect(host, port);
+    c->fd = xs_connect_until(host, port, deadline, abort);
     if (c->fd < 0) { free(c); xs_panic("fetch: connection failed"); }
     c->https = https;
 #ifdef XS_WITH_TLS
@@ -2297,7 +2314,7 @@ XS_NOINLINE xs_Response *xs_fetch_once(xs_str *url, xs_str *method, xs_str *body
         if (xs_has_ctl(hdrs[i + 1]->data, (size_t)hdrs[i + 1]->len)) xs_panicf("fetch: invalid value for header '%s'", hdrs[i]->data);
     }
 
-    xs_conn *c = xs_conn_take(host, port, https);
+    xs_conn *c = xs_conn_take(host, port, https, deadline, abort);
 
     xs_buf rq = {0};
     char line[1400];
@@ -2339,7 +2356,7 @@ XS_NOINLINE xs_Response *xs_fetch_once(xs_str *url, xs_str *method, xs_str *body
 #endif
             if (timeout_ms >= 0 && xs_now() >= deadline) { free(rq.data); xs_conn_drop(c); xs_fetch_timeout(); }
             xs_conn_drop(c);
-            c = xs_conn_take(host, port, https);
+            c = xs_conn_take(host, port, https, deadline, abort);
             continue;
         }
         xs_buf buf = {0}, chunked = {0};
@@ -2392,7 +2409,7 @@ XS_NOINLINE xs_Response *xs_fetch_once(xs_str *url, xs_str *method, xs_str *body
             free(buf.data);
             free(chunked.data);
             xs_conn_drop(c);
-            c = xs_conn_take(host, port, https);
+            c = xs_conn_take(host, port, https, deadline, abort);
             continue;
         }
         int status = atoi(buf.data + 9);
