@@ -1,0 +1,25 @@
+.figure { margin: 1.5rem 0 2rem; }
+.title { font-family: var(--xisto-font-heading); font-weight: 600; font-size: 1rem; margin-bottom: 0.5rem; color: var(--chart-text); }
+.plot { position: relative; width: 100%; background: var(--chart-surface); border: 1px solid var(--xisto-border); border-radius: 8px; padding: 8px 4px 4px; outline: none; touch-action: pan-y; }
+.plot:focus-visible { box-shadow: 0 0 0 2px var(--ifm-color-primary); }
+.plot svg { display: block; overflow: visible; }
+.grid { stroke: var(--chart-grid); stroke-width: 1; shape-rendering: crispEdges; }
+.crosshair { stroke: var(--chart-text-2); stroke-width: 1; }
+.axis { fill: var(--chart-text-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+.label { fill: var(--chart-text-2); font-size: 13px; }
+.labelStrong { fill: var(--chart-text); font-size: 13px; font-weight: 600; }
+.value { fill: var(--chart-text); font-size: 12px; font-variant-numeric: tabular-nums; }
+.hit { cursor: default; outline: none; }
+.hit:focus-visible path { stroke: var(--chart-text); stroke-width: 1.5; }
+.caption { font-size: 0.85rem; color: var(--chart-text-2); margin: 0.5rem 0 0; }
+.legend { list-style: none; display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 0; margin: 0 0 8px; font-size: 0.85rem; color: var(--chart-text); }
+.legend li { display: flex; align-items: center; gap: 6px; margin: 0; }
+.lineKey { display: inline-block; width: 16px; height: 3px; border-radius: 2px; }
+.key { display: inline-block; width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.tooltip { position: absolute; pointer-events: none; z-index: 2; min-width: 170px; max-width: 250px; background: var(--chart-surface); color: var(--chart-text);
+  border: 1px solid var(--xisto-border); border-radius: 6px; padding: 6px 10px; font-size: 12.5px; box-shadow: 0 4px 16px rgb(0 0 0 / 0.18); }
+.tipTitle { font-weight: 600; margin-bottom: 4px; }
+.tipRow { white-space: nowrap; display: flex; align-items: center; gap: 6px; line-height: 1.6; font-variant-numeric: tabular-nums; }
+.tipRow span:last-child { color: var(--chart-text-2); }
+.tooltipDocked { margin: 6px 4px 2px; padding: 6px 8px; border-top: 1px solid var(--xisto-border); color: var(--chart-text); font-size: 12.5px; }
+.tooltipDocked .tipRow { white-space: normal; }

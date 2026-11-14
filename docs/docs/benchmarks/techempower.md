@@ -3,6 +3,8 @@ title: TechEmpower
 sidebar_position: 3
 ---
 
+import {BestBars, LevelLines} from '@site/src/components/Charts/TechEmpower';
+
 # TechEmpower: HTTP servers
 
 14 Nov 2026. The [TechEmpower Framework Benchmarks](https://www.techempower.com/benchmarks/) (TFB) measure web
@@ -35,6 +37,10 @@ TFB's rules, on the two AWS VMs. The database tests come next.
 
 ### json
 
+<BestBars test="json" />
+
+<LevelLines test="json" />
+
 | server | best req/s | p99 there | CPU ms per 1k requests | peak RSS |
 |---|---:|---:|---:|---:|
 | actix-web (Rust) | **65,068** | 16.9 ms | 29.8 | 12.3 MB |
@@ -62,6 +68,10 @@ Requests per second at each concurrency level (connections):
 | fastify (Node) | 18,602 | 22,799 | 22,962 | 22,684 | 22,079 | 21,600 |
 
 ### plaintext
+
+<BestBars test="plaintext" />
+
+<LevelLines test="plaintext" />
 
 | server | best req/s | p99 there | CPU ms per 1k requests | peak RSS |
 |---|---:|---:|---:|---:|

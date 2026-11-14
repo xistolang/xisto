@@ -296,3 +296,33 @@ code, pre, kbd, .prism-code { font-variant-ligatures: none; font-feature-setting
     scroll-behavior: auto !important;
   }
 }
+
+/* ---------- charts (src/components/Charts): categorical slots validated with the dataviz validator, both modes ---------- */
+:root {
+  --chart-surface: #ffffff;
+  --chart-text: var(--xisto-graphite);
+  --chart-text-2: #52607a;
+  --chart-grid: #e6e9f0;
+  --chart-accent: #6537d6;
+  --chart-muted: #9aa3b5;
+  --chart-s1: #6537d6;
+  --chart-s2: #eb6834;
+  --chart-s3: #1baf7a;
+  --chart-s4: #eda100;
+  --chart-s5: #2a78d6;
+  --chart-s6: #e87ba4;
+}
+[data-theme='dark'] {
+  --chart-surface: #141b2b;
+  --chart-text: #f8fafc;
+  --chart-text-2: #a4aec4;
+  --chart-grid: #263049;
+  --chart-accent: #9085e9;
+  --chart-muted: #56607a;
+  --chart-s1: #9085e9;
+  --chart-s2: #d95926;
+  --chart-s3: #199e70;
+  --chart-s4: #c98500;
+  --chart-s5: #3987e5;
+  --chart-s6: #d55181;
+}
