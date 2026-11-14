@@ -885,3 +885,206 @@ XS_NOINLINE bool xs_crypto_ec_verify(xs_Uint8Array *hash, int64_t curve, xs_Uint
     if (raw) return br_ecdsa_i31_vrfy_raw(xs_ec_impl((int)curve), hash->data, (size_t)hash->f_length, &pk, sig->data, (size_t)sig->f_length) == 1;
     return br_ecdsa_i31_vrfy_asn1(xs_ec_impl((int)curve), hash->data, (size_t)hash->f_length, &pk, sig->data, (size_t)sig->f_length) == 1;
 }
+
+/* ---- Ed25519 (RFC 8032), after TweetNaCl (public domain): field elements in 16 limbs of 16 bits, constant-time
+   ladder; the SHA-512 above. Small and not fast (~0.2 ms a signature), which is what a JWT or SSH key needs. ---- */
+typedef int64_t xs_gf[16];
+static const xs_gf xs_gf0 = {0}, xs_gf1 = {1},
+    xs_ed_D = {0x78a3, 0x1359, 0x4dca, 0x75eb, 0xd8ab, 0x4141, 0x0a4d, 0x0070, 0xe898, 0x7779, 0x4079, 0x8cc7, 0xfe73, 0x2b6f, 0x6cee, 0x5203},
+    xs_ed_D2 = {0xf159, 0x26b2, 0x9b94, 0xebd6, 0xb156, 0x8283, 0x149a, 0x00e0, 0xd130, 0xeef3, 0x80f2, 0x198e, 0xfce7, 0x56df, 0xd9dc, 0x2406},
+    xs_ed_X = {0xd51a, 0x8f25, 0x2d60, 0xc956, 0xa7b2, 0x9525, 0xc760, 0x692c, 0xdc5c, 0xfdd6, 0xe231, 0xc0a4, 0x53fe, 0xcd6e, 0x36d3, 0x2169},
+    xs_ed_Y = {0x6658, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666},
+    xs_ed_I = {0xa0b0, 0x4a0e, 0x1b27, 0xc4ee, 0xe478, 0xad2f, 0x1806, 0x2f43, 0xd7a7, 0x3dfb, 0x0099, 0x2b4d, 0xdf0b, 0x4fc1, 0x2480, 0x2b83};
+static void xs_gf_set(xs_gf r, const xs_gf a) { for (int i = 0; i < 16; i++) r[i] = a[i]; }
+static void xs_gf_car(xs_gf o) {
+    for (int i = 0; i < 16; i++) {
+        o[i] += (int64_t)1 << 16;
+        int64_t c = o[i] >> 16;
+        o[(i + 1) * (i < 15)] += c - 1 + 37 * (c - 1) * (i == 15);
+        o[i] -= c * 65536;
+    }
+}
+static void xs_gf_sel(xs_gf p, xs_gf q, int b) {
+    int64_t c = ~(int64_t)(b - 1);
+    for (int i = 0; i < 16; i++) { int64_t t = c & (p[i] ^ q[i]); p[i] ^= t; q[i] ^= t; }
+}
+static void xs_gf_pack(uint8_t *o, const xs_gf n) {
+    xs_gf m, t;
+    xs_gf_set(t, n);
+    xs_gf_car(t); xs_gf_car(t); xs_gf_car(t);
+    for (int j = 0; j < 2; j++) {
+        m[0] = t[0] - 0xffed;
+        for (int i = 1; i < 15; i++) { m[i] = t[i] - 0xffff - ((m[i - 1] >> 16) & 1); m[i - 1] &= 0xffff; }
+        m[15] = t[15] - 0x7fff - ((m[14] >> 16) & 1);
+        int b = (int)((m[15] >> 16) & 1);
+        m[14] &= 0xffff;
+        xs_gf_sel(t, m, 1 - b);
+    }
+    for (int i = 0; i < 16; i++) { o[2 * i] = (uint8_t)(t[i] & 0xff); o[2 * i + 1] = (uint8_t)(t[i] >> 8); }
+}
+static bool xs_gf_neq(const xs_gf a, const xs_gf b) {
+    uint8_t c[32], d[32];
+    xs_gf_pack(c, a);
+    xs_gf_pack(d, b);
+    return !xs_ct_equal(c, d, 32);
+}
+static uint8_t xs_gf_par(const xs_gf a) { uint8_t d[32]; xs_gf_pack(d, a); return d[0] & 1; }
+static void xs_gf_unpack(xs_gf o, const uint8_t *n) {
+    for (int i = 0; i < 16; i++) o[i] = n[2 * i] + ((int64_t)n[2 * i + 1] << 8);
+    o[15] &= 0x7fff;
+}
+static void xs_gf_A(xs_gf o, const xs_gf a, const xs_gf b) { for (int i = 0; i < 16; i++) o[i] = a[i] + b[i]; }
+static void xs_gf_Z(xs_gf o, const xs_gf a, const xs_gf b) { for (int i = 0; i < 16; i++) o[i] = a[i] - b[i]; }
+static void xs_gf_M(xs_gf o, const xs_gf a, const xs_gf b) {
+    int64_t t[31] = {0};
+    for (int i = 0; i < 16; i++) for (int j = 0; j < 16; j++) t[i + j] += a[i] * b[j];
+    for (int i = 0; i < 15; i++) t[i] += 38 * t[i + 16];
+    for (int i = 0; i < 16; i++) o[i] = t[i];
+    xs_gf_car(o);
+    xs_gf_car(o);
+}
+static void xs_gf_S(xs_gf o, const xs_gf a) { xs_gf_M(o, a, a); }
+static void xs_gf_inv(xs_gf o, const xs_gf i) {
+    xs_gf c;
+    xs_gf_set(c, i);
+    for (int a = 253; a >= 0; a--) { xs_gf_S(c, c); if (a != 2 && a != 4) xs_gf_M(c, c, i); }
+    xs_gf_set(o, c);
+}
+static void xs_gf_pow2523(xs_gf o, const xs_gf i) {
+    xs_gf c;
+    xs_gf_set(c, i);
+    for (int a = 250; a >= 0; a--) { xs_gf_S(c, c); if (a != 1) xs_gf_M(c, c, i); }
+    xs_gf_set(o, c);
+}
+static void xs_ed_add(xs_gf p[4], xs_gf q[4]) {
+    xs_gf a, b, c, d, t, e, f, g, h;
+    xs_gf_Z(a, p[1], p[0]); xs_gf_Z(t, q[1], q[0]); xs_gf_M(a, a, t);
+    xs_gf_A(b, p[0], p[1]); xs_gf_A(t, q[0], q[1]); xs_gf_M(b, b, t);
+    xs_gf_M(c, p[3], q[3]); xs_gf_M(c, c, xs_ed_D2);
+    xs_gf_M(d, p[2], q[2]); xs_gf_A(d, d, d);
+    xs_gf_Z(e, b, a); xs_gf_Z(f, d, c); xs_gf_A(g, d, c); xs_gf_A(h, b, a);
+    xs_gf_M(p[0], e, f); xs_gf_M(p[1], h, g); xs_gf_M(p[2], g, f); xs_gf_M(p[3], e, h);
+}
+static void xs_ed_cswap(xs_gf p[4], xs_gf q[4], uint8_t b) { for (int i = 0; i < 4; i++) xs_gf_sel(p[i], q[i], b); }
+static void xs_ed_pack(uint8_t *r, xs_gf p[4]) {
+    xs_gf tx, ty, zi;
+    xs_gf_inv(zi, p[2]);
+    xs_gf_M(tx, p[0], zi);
+    xs_gf_M(ty, p[1], zi);
+    xs_gf_pack(r, ty);
+    r[31] ^= (uint8_t)(xs_gf_par(tx) << 7);
+}
+static void xs_ed_scalarmult(xs_gf p[4], xs_gf q[4], const uint8_t *s) {
+    xs_gf_set(p[0], xs_gf0); xs_gf_set(p[1], xs_gf1); xs_gf_set(p[2], xs_gf1); xs_gf_set(p[3], xs_gf0);
+    for (int i = 255; i >= 0; --i) {
+        uint8_t b = (s[i / 8] >> (i & 7)) & 1;
+        xs_ed_cswap(p, q, b);
+        xs_ed_add(q, p);
+        xs_ed_add(p, p);
+        xs_ed_cswap(p, q, b);
+    }
+}
+static void xs_ed_scalarbase(xs_gf p[4], const uint8_t *s) {
+    xs_gf q[4];
+    xs_gf_set(q[0], xs_ed_X); xs_gf_set(q[1], xs_ed_Y); xs_gf_set(q[2], xs_gf1); xs_gf_M(q[3], xs_ed_X, xs_ed_Y);
+    xs_ed_scalarmult(p, q, s);
+}
+static const int64_t xs_ed_L[32] = {0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+                                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10};
+static void xs_ed_modL(uint8_t *r, int64_t x[64]) {
+    int64_t carry;
+    int i, j;
+    for (i = 63; i >= 32; --i) {
+        carry = 0;
+        for (j = i - 32; j < i - 12; ++j) {
+            x[j] += carry - 16 * x[i] * xs_ed_L[j - (i - 32)];
+            carry = (x[j] + 128) >> 8;
+            x[j] -= carry * 256;
+        }
+        x[j] += carry;
+        x[i] = 0;
+    }
+    carry = 0;
+    for (j = 0; j < 32; j++) { x[j] += carry - (x[31] >> 4) * xs_ed_L[j]; carry = x[j] >> 8; x[j] &= 255; }
+    for (j = 0; j < 32; j++) x[j] -= carry * xs_ed_L[j];
+    for (i = 0; i < 32; i++) { x[i + 1] += x[i] >> 8; r[i] = (uint8_t)(x[i] & 255); }
+}
+static void xs_ed_reduce(uint8_t *r) {
+    int64_t x[64];
+    for (int i = 0; i < 64; i++) x[i] = r[i];
+    for (int i = 0; i < 64; i++) r[i] = 0;
+    xs_ed_modL(r, x);
+}
+static void xs_sha512_3(const void *a, size_t an, const void *b, size_t bn, const void *c, size_t cn, uint8_t out[64]) {
+    xs_sha512 h;
+    xs_sha512_init(&h);
+    xs_sha512_update(&h, a, an);
+    xs_sha512_update(&h, b, bn);
+    xs_sha512_update(&h, c, cn);
+    xs_sha512_final(&h, out);
+}
+/* the public key of a 32-byte private key (the seed) */
+static void xs_ed_public(const uint8_t seed[32], uint8_t pk[32]) {
+    uint8_t d[64];
+    xs_gf p[4];
+    xs_sha512_3(seed, 32, "", 0, "", 0, d);
+    d[0] &= 248; d[31] &= 127; d[31] |= 64;
+    xs_ed_scalarbase(p, d);
+    xs_ed_pack(pk, p);
+}
+XS_NOINLINE xs_Uint8Array *xs_crypto_ed25519_public(xs_Uint8Array *seed) {
+    xs_Uint8Array *r = xs_u8_raw(32, true, false);
+    xs_ed_public(seed->data, r->data);
+    return r;
+}
+XS_NOINLINE xs_Uint8Array *xs_crypto_ed25519_sign(xs_Uint8Array *seed, xs_Uint8Array *msg) {
+    uint8_t d[64], rr[64], h[64], pk[32];
+    int64_t x[64] = {0};
+    xs_gf p[4];
+    xs_ed_public(seed->data, pk);
+    xs_sha512_3(seed->data, 32, "", 0, "", 0, d);
+    d[0] &= 248; d[31] &= 127; d[31] |= 64;
+    xs_sha512_3(d + 32, 32, msg->data, (size_t)msg->f_length, "", 0, rr);
+    xs_ed_reduce(rr);
+    xs_ed_scalarbase(p, rr);
+    xs_Uint8Array *sig = xs_u8_raw(64, true, false);
+    xs_ed_pack(sig->data, p);
+    xs_sha512_3(sig->data, 32, pk, 32, msg->data, (size_t)msg->f_length, h);
+    xs_ed_reduce(h);
+    for (int i = 0; i < 32; i++) x[i] = rr[i];
+    for (int i = 0; i < 32; i++) for (int j = 0; j < 32; j++) x[i + j] += (int64_t)h[i] * d[j];
+    xs_ed_modL(sig->data + 32, x);
+    return sig;
+}
+static int xs_ed_unpackneg(xs_gf r[4], const uint8_t p[32]) {
+    xs_gf t, chk, num, den, den2, den4, den6;
+    xs_gf_set(r[2], xs_gf1);
+    xs_gf_unpack(r[1], p);
+    xs_gf_S(num, r[1]);
+    xs_gf_M(den, num, xs_ed_D);
+    xs_gf_Z(num, num, r[2]);
+    xs_gf_A(den, r[2], den);
+    xs_gf_S(den2, den); xs_gf_S(den4, den2); xs_gf_M(den6, den4, den2); xs_gf_M(t, den6, num); xs_gf_M(t, t, den);
+    xs_gf_pow2523(t, t); xs_gf_M(t, t, num); xs_gf_M(t, t, den); xs_gf_M(t, t, den); xs_gf_M(r[0], t, den);
+    xs_gf_S(chk, r[0]); xs_gf_M(chk, chk, den);
+    if (xs_gf_neq(chk, num)) xs_gf_M(r[0], r[0], xs_ed_I);
+    xs_gf_S(chk, r[0]); xs_gf_M(chk, chk, den);
+    if (xs_gf_neq(chk, num)) return -1;
+    if (xs_gf_par(r[0]) == (p[31] >> 7)) xs_gf_Z(r[0], xs_gf0, r[0]);
+    xs_gf_M(r[3], r[0], r[1]);
+    return 0;
+}
+XS_NOINLINE bool xs_crypto_ed25519_verify(xs_Uint8Array *pk, xs_Uint8Array *msg, xs_Uint8Array *sig) {
+    if (sig->f_length != 64 || pk->f_length != 32) return false;
+    if ((sig->data[63] & 0xe0) != 0) return false; /* S must be below 2^253 (and below L: checked by the equation) */
+    xs_gf p[4], q[4];
+    uint8_t h[64], t[32];
+    if (xs_ed_unpackneg(q, pk->data)) return false;
+    xs_sha512_3(sig->data, 32, pk->data, 32, msg->data, (size_t)msg->f_length, h);
+    xs_ed_reduce(h);
+    xs_ed_scalarmult(p, q, h);
+    xs_ed_scalarbase(q, sig->data + 32);
+    xs_ed_add(p, q);
+    xs_ed_pack(t, p);
+    return xs_ct_equal(t, sig->data, 32);
+}

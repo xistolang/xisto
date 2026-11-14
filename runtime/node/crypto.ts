@@ -1,10 +1,10 @@
 // xisto:crypto (node:crypto). Hashes and HMACs (md5, sha1, sha224, sha256, sha384, sha512) of text or bytes;
 // randomUUID, randomBytes, randomInt, getRandomValues, timingSafeEqual; AES ciphers (createCipheriv and
 // createDecipheriv: aes-128/192/256 in cbc, ctr, gcm and ecb); pbkdf2, scrypt and hkdf; keys (createPublicKey,
-// createPrivateKey, createSecretKey, KeyObject with PEM/DER/JWK export, generateKeyPairSync for rsa and ec);
-// signatures (createSign/createVerify, sign/verify: RSA PKCS#1 v1.5 and PSS, ECDSA on P-256/P-384/P-521);
+// createPrivateKey, createSecretKey, KeyObject with PEM/DER/JWK export, generateKeyPairSync for rsa, ec, ed25519);
+// signatures (createSign/createVerify, sign/verify: RSA PKCS#1 v1.5 and PSS, ECDSA on P-256/P-384/P-521, Ed25519);
 // publicEncrypt (RSA PKCS#1 v1.5 and OAEP) and a webcrypto.subtle subset (digest, HMAC keys, sign/verify).
-// Hashes, HMACs and the KDFs are runtime/xisto_crypto.h's own C; ciphers, RSA and EC are BearSSL's
+// Hashes, HMACs, the KDFs and Ed25519 are runtime/xisto_crypto.h's own C; ciphers, RSA and EC are BearSSL's
 // (build/libbearssl.a, linked with this module; a program takes only the functions it calls).
 // Results with an encoding are text and without one a Buffer, as in Node: the compiler sends m(args) to
 // __m_bytes when the encoding is left out (checker.c, crypto_method_overload), and generateKeyPairSync with
@@ -41,6 +41,9 @@ declare function crypto_ec_keygen(curve: int): Buffer | null;
 declare function crypto_ec_public(curve: int, d: Uint8Array): Buffer | null;
 declare function crypto_ec_sign(digest: string, hash: Uint8Array, curve: int, d: Uint8Array, raw: boolean): Buffer | null;
 declare function crypto_ec_verify(hash: Uint8Array, curve: int, q: Uint8Array, sig: Uint8Array, raw: boolean): boolean;
+declare function crypto_ed25519_public(seed: Uint8Array): Buffer;
+declare function crypto_ed25519_sign(seed: Uint8Array, msg: Uint8Array): Buffer;
+declare function crypto_ed25519_verify(pk: Uint8Array, msg: Uint8Array, sig: Uint8Array): boolean;
 
 // ---- errors with Node's codes ----
 
@@ -658,6 +661,7 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
 
 const OID_RSA = "06092a864886f70d010101";
 const OID_EC = "06072a8648ce3d0201";
+const OID_ED25519 = "06032b6570";
 const NULL_PARAMS = "0500";
 // curve id (BearSSL's, TLS's) -> OID, Node's name, JWK's name, coordinate size
 function curveOid(curve: int): string {
@@ -759,19 +763,20 @@ function padTo(b: Uint8Array, n: int): Uint8Array {
 }
 
 /** A key as JSON (RFC 7517): RSA (n, e and the private numbers), EC (crv, x, y, d) or a secret (k). */
+// (the fields in Node's order for RSA, EC and oct keys, which JSON.stringify follows; Ed25519's crv comes after x)
 export class JsonWebKey {
   kty: string = "";
   n?: string;
   e?: string;
+  x?: string;
+  y?: string;
+  crv?: string;
   d?: string;
   p?: string;
   q?: string;
   dp?: string;
   dq?: string;
   qi?: string;
-  x?: string;
-  y?: string;
-  crv?: string;
   k?: string;
   alg?: string;
   use?: string;
@@ -807,7 +812,7 @@ export class KeyObject {
     this.type = type;
     this.kind = kind;
   }
-  /** rsa or ec for a key pair's key; null for a secret key. */
+  /** rsa, ec or ed25519 for a key pair's key; null for a secret key. */
   get asymmetricKeyType(): string | null {
     return this.kind === "" ? null : this.kind;
   }
@@ -827,6 +832,7 @@ export class KeyObject {
       return { modulusLength: bits, publicExponent: e };
     }
     if (this.kind === "ec") return { namedCurve: curveName(this.curve) };
+    if (this.kind === "ed25519") return new AsymmetricKeyDetails();
     return null;
   }
   secretBytes(): Uint8Array {
@@ -850,6 +856,15 @@ export class KeyObject {
       if (type === "pkcs1") return pkcs1;
       if (type !== "pkcs8") throw keyTypeError(type, "private", "rsa");
       return seq([derSmall(0), seq([hexBytes(OID_RSA), hexBytes(NULL_PARAMS)]), tlv(0x04, pkcs1)]);
+    }
+    if (this.kind === "ed25519") {
+      const ed = seq([hexBytes(OID_ED25519)]);
+      if (this.type === "public") {
+        if (type !== "spki") throw keyTypeError(type, "public", "ed25519");
+        return seq([ed, tlv(0x03, concatBytes([Uint8Array.of(0), this.q]))]);
+      }
+      if (type !== "pkcs8") throw keyTypeError(type, "private", "ed25519");
+      return seq([derSmall(0), ed, tlv(0x04, tlv(0x04, this.d))]);
     }
     const point = tlv(0x03, concatBytes([Uint8Array.of(0), this.q]));
     const algo = seq([hexBytes(OID_EC), hexBytes(curveOid(this.curve))]);
@@ -900,6 +915,13 @@ export class KeyObject {
         j.dq = b64url(f[6]);
         j.qi = b64url(f[7]);
       }
+      return j;
+    }
+    if (this.kind === "ed25519") {
+      j.kty = "OKP";
+      j.crv = "Ed25519";
+      j.x = b64url(this.q);
+      if (this.type === "private") j.d = b64url(this.d);
       return j;
     }
     const size = curveSize(this.curve);
@@ -954,6 +976,18 @@ function ecPrivate(curve: int, d: Uint8Array, q: Uint8Array | null): KeyObject {
   k.q = q !== null ? Buffer.from(q) : crypto_ec_public(curve, d)!;
   return k;
 }
+function edPublic(q: Uint8Array): KeyObject {
+  const k = new KeyObject("public", "ed25519");
+  k.q = Buffer.from(q);
+  return k;
+}
+function edPrivate(seed: Uint8Array): KeyObject {
+  if (seed.length !== 32) throw new CryptoError(DECODER_UNSUPPORTED, "ERR_OSSL_UNSUPPORTED");
+  const k = new KeyObject("private", "ed25519");
+  k.d = Buffer.from(seed);
+  k.q = crypto_ed25519_public(seed);
+  return k;
+}
 function rsaPrivateKey(der: Der): KeyObject {
   der.uint(); // version
   const f: Uint8Array[] = [];
@@ -992,6 +1026,7 @@ function spki(body: Uint8Array): KeyObject {
     return rsaPublic(r.uint(), r.uint());
   }
   if (h === "2a8648ce3d0201") return ecPublic(curveOfOid(alg.next(0x06)), key);
+  if (h === "2b6570") return edPublic(key);
   throw new CryptoError(DECODER_UNSUPPORTED, "ERR_OSSL_UNSUPPORTED");
 }
 function pkcs8(body: Uint8Array): KeyObject {
@@ -1002,6 +1037,7 @@ function pkcs8(body: Uint8Array): KeyObject {
   const inner = outer.next(0x04);
   if (oid === "2a864886f70d010101") return rsaPrivateKey(derIn(inner, 0x30));
   if (oid === "2a8648ce3d0201") return ecPrivateKey(derIn(inner, 0x30), curveOfOid(alg.next(0x06)));
+  if (oid === "2b6570") return edPrivate(derBody(inner, 0x04));
   throw new CryptoError(DECODER_UNSUPPORTED, "ERR_OSSL_UNSUPPORTED");
 }
 function fromPem(text: string, wantPrivate: boolean): KeyObject {
@@ -1044,6 +1080,11 @@ function fromJwk(j: JsonWebKey, wantPrivate: boolean): KeyObject {
     const d = j.d ?? "";
     if (!wantPrivate || d === "") return ecPublic(curve, q);
     return ecPrivate(curve, unb64url(d), q);
+  }
+  if (j.kty === "OKP" && j.crv === "Ed25519") {
+    const d = j.d ?? "";
+    if (!wantPrivate || d === "") return edPublic(unb64url(j.x ?? ""));
+    return edPrivate(unb64url(d));
   }
   throw typeError("Invalid JWK data", "ERR_CRYPTO_INVALID_JWK");
 }
@@ -1149,10 +1190,11 @@ function generate(type: string, options: KeyPairOptions | null): KeyObject {
     const curve = curveOfName(name);
     return ecPrivate(curve, crypto_ec_keygen(curve)!, null);
   }
+  if (type === "ed25519") return edPrivate(crypto_random_bytes(32));
   throw typeError(`The argument 'type' must be a supported key type. Received '${type}'`, "ERR_INVALID_ARG_VALUE");
 }
 
-/** A new key pair: "rsa" (modulusLength, publicExponent) or "ec" (namedCurve: prime256v1/P-256, P-384, P-521). */
+/** A new key pair: "rsa" (modulusLength, publicExponent), "ec" (namedCurve: prime256v1/P-256, P-384, P-521) or "ed25519". */
 export function generateKeyPairSync(type: string, options: KeyPairOptions | null = null): KeyPairKeyObjectResult {
   const priv = generate(type, options);
   return new KeyPairKeyObjectResult(priv.publicOf(), priv);
@@ -1221,9 +1263,19 @@ function pssSalt(k: KeyObject, digest: string, salt: int): int {
   return salt;
 }
 
-function signWith(digest: string, data: Uint8Array, key: string | Uint8Array | KeyObject | SignKeyInput): Buffer {
+// digest "" (algorithm null): Ed25519's own, sha256 for RSA and EC; streaming (createSign) is not for Ed25519
+function edCheck(k: KeyObject, digest: string, streaming: boolean): boolean {
+  if (k.asymmetricKeyType !== "ed25519") return false;
+  if (streaming) throw new CryptoError("Unsupported crypto operation", "ERR_CRYPTO_UNSUPPORTED_OPERATION");
+  if (digest !== "") throw new CryptoError("error:1C80007A:Provider routines::invalid digest", "ERR_OSSL_INVALID_DIGEST");
+  return true;
+}
+
+function signWith(algorithm: string, data: Uint8Array, key: string | Uint8Array | KeyObject | SignKeyInput, streaming: boolean): Buffer {
   const k = signKey(key, true);
   if (k.type !== "private") throw new CryptoError(DECODER_UNSUPPORTED, "ERR_OSSL_UNSUPPORTED");
+  if (edCheck(k, algorithm, streaming)) return crypto_ed25519_sign(k.d, data);
+  const digest = algorithm === "" ? "sha256" : algorithm;
   const o = signOptions(key);
   const h = crypto_hash2(digest, data);
   if (h === null) throw typeError("Invalid digest", "ERR_CRYPTO_INVALID_DIGEST");
@@ -1238,8 +1290,10 @@ function signWith(digest: string, data: Uint8Array, key: string | Uint8Array | K
   return sig;
 }
 
-function verifyWith(digest: string, data: Uint8Array, key: string | Uint8Array | KeyObject | SignKeyInput, signature: Uint8Array): boolean {
+function verifyWith(algorithm: string, data: Uint8Array, key: string | Uint8Array | KeyObject | SignKeyInput, signature: Uint8Array, streaming: boolean): boolean {
   const k = signKey(key, false).publicOf();
+  if (edCheck(k, algorithm, streaming)) return crypto_ed25519_verify(k.q, data, signature);
+  const digest = algorithm === "" ? "sha256" : algorithm;
   const o = signOptions(key);
   const h = crypto_hash2(digest, data);
   if (h === null) throw typeError("Invalid digest", "ERR_CRYPTO_INVALID_DIGEST");
@@ -1276,7 +1330,7 @@ export class Sign {
   }
   // sign(key): a Buffer (the compiler calls this for it)
   __sign_bytes(privateKey: string | Uint8Array | KeyObject | SignKeyInput): Buffer {
-    return signWith(this.digest, this.pieces.all(), privateKey);
+    return signWith(this.digest, this.pieces.all(), privateKey, true);
   }
 }
 
@@ -1295,7 +1349,7 @@ export class Verify {
   /** Whether signature (bytes, or text in signatureEncoding) is the data's, by the key (public, or a private key's public half). */
   verify(publicKey: string | Uint8Array | KeyObject | SignKeyInput, signature: string | Uint8Array, signatureEncoding: string = "base64"): boolean {
     const sig: Uint8Array = typeof signature === "string" ? Buffer.from(signature as string, signatureEncoding) : (signature as Uint8Array);
-    return verifyWith(this.digest, this.pieces.all(), publicKey, sig);
+    return verifyWith(this.digest, this.pieces.all(), publicKey, sig, true);
   }
 }
 
@@ -1315,14 +1369,14 @@ export function createVerify(algorithm: string): Verify {
   return new Verify(signDigest(algorithm));
 }
 
-/** The signature of data in one call (algorithm null: sha256 for RSA and EC keys). */
+/** The signature of data in one call (algorithm null: Ed25519's own; sha256 for RSA and EC keys). */
 export function sign(algorithm: string | null, data: Uint8Array, key: string | Uint8Array | KeyObject | SignKeyInput): Buffer {
-  return signWith(signDigest(algorithm ?? "sha256"), data, key);
+  return signWith(algorithm !== null ? signDigest(algorithm) : "", data, key, false);
 }
 
 /** Whether signature is data's by key, in one call. */
 export function verify(algorithm: string | null, data: Uint8Array, key: string | Uint8Array | KeyObject | SignKeyInput, signature: Uint8Array): boolean {
-  return verifyWith(signDigest(algorithm ?? "sha256"), data, key, signature);
+  return verifyWith(algorithm !== null ? signDigest(algorithm) : "", data, key, signature, false);
 }
 
 // ---- RSA encryption (publicEncrypt), over bigint ----

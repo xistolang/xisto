@@ -82,8 +82,8 @@ Differences from Node:
 
 ## crypto
 
-`node:crypto` (also `crypto`, `xisto:crypto`). Hashes, HMAC and the key derivations are xisto's own C; ciphers,
-RSA and EC are BearSSL's, linked with the module as a static library (a program takes only the functions it
+`node:crypto` (also `crypto`, `xisto:crypto`). Hashes, HMAC, the key derivations and Ed25519 are xisto's own C;
+ciphers, RSA and EC are BearSSL's, linked with the module as a static library (a program takes only the functions it
 calls: one that only hashes carries no BearSSL code).
 
 Supported:
@@ -104,20 +104,21 @@ Supported:
   KEY`, `RSA PUBLIC KEY`, `PRIVATE KEY`, `RSA PRIVATE KEY`, `EC PRIVATE KEY`), DER with its `type`, and JWK; a
   private key's PEM gives `createPublicKey` its public half;
 - `generateKeyPairSync("rsa", { modulusLength, publicExponent })` (512 to 4096 bits) and `generateKeyPairSync("ec",
-  { namedCurve })` (`prime256v1`/`P-256`, `secp384r1`/`P-384`, `secp521r1`/`P-521`); with `publicKeyEncoding` and
+  { namedCurve })` (`prime256v1`/`P-256`, `secp384r1`/`P-384`, `secp521r1`/`P-521`), `generateKeyPairSync("ed25519")`;
+  with `publicKeyEncoding` and
   `privateKeyEncoding` the keys come as PEM text, as Node; `generateKeySync("hmac" | "aes", { length })`;
 - signatures: `createSign`/`createVerify` (`update`, `sign(key, encoding?)`, `verify(key, signature,
   encoding?)`) and one-shot `sign`/`verify`, with RSA PKCS#1 v1.5, RSA-PSS (`padding:
-  constants.RSA_PKCS1_PSS_PADDING`, `saltLength`) and ECDSA (`dsaEncoding: "der"` or `"ieee-p1363"`); keys as
-  PEM text, `KeyObject` or `{ key, ... }`;
+  constants.RSA_PKCS1_PSS_PADDING`, `saltLength`), ECDSA (`dsaEncoding: "der"` or `"ieee-p1363"`) and Ed25519
+  (`sign(null, data, key)`, as Node: not through `createSign`); keys as PEM text, `KeyObject` or `{ key, ... }`;
 - `publicEncrypt` (RSA PKCS#1 v1.5 and OAEP) and `constants`;
 - `webcrypto` / `subtle`: `digest` (SHA-1/256/384/512), HMAC keys (`importKey` from `raw` or a `jwk` of kty
   `oct`, `exportKey("raw")`), `sign` and `verify`, as `jose`-style code uses them; `webcrypto.getRandomValues` and
   `randomUUID`.
 
 Byte for byte with Node (tested): hashes and HMACs, every cipher with a fixed key and IV (and GCM's tags),
-pbkdf2/scrypt/hkdf, RSA PKCS#1 v1.5 signatures, PEM/DER/JWK of a key read and written back, and the error
-messages and codes. ECDSA and RSA-PSS signatures are random in both (BearSSL's ECDSA uses RFC 6979 nonces), so
+pbkdf2/scrypt/hkdf, RSA PKCS#1 v1.5 and Ed25519 signatures, PEM/DER/JWK of a key read and written back, and the
+error messages and codes. ECDSA and RSA-PSS signatures are random in both (BearSSL's ECDSA uses RFC 6979 nonces), so
 they are tested by verifying each implementation's signatures with the other's keys.
 
 Differences from Node:
@@ -132,8 +133,9 @@ Differences from Node:
   on an error the result is an empty `Buffer`;
 - errors are `Error`s with Node's `code` and `name` (`TypeError`, `RangeError`), not instances of those classes;
   hash and HMAC errors are plain `Error`s with Node's message;
-- `asymmetricKeyType` of a secret key is `null` (Node: `undefined`);
-- missing: Ed25519/Ed448/X25519 keys, DSA and DH, encrypted private keys (`passphrase`), keys from
+- `asymmetricKeyType` of a secret key is `null` (Node: `undefined`); an Ed25519 key's JWK lists `crv` after `x`
+  in `JSON.stringify` (Node: before);
+- missing: Ed448, X25519/X448, DSA and DH, encrypted private keys (`passphrase`), keys from
   certificates, `privateDecrypt`/`privateEncrypt`/`publicDecrypt`, `createECDH`/`diffieHellman`, other
   ciphers (`chacha20-poly1305`, `aes-*-ccm`, `-ocb`, `-cfb`...), `Cipher`/`Hash` as streams (`pipe`), the async
   `generateKeyPair`, `X509Certificate`, and `subtle` beyond HMAC and digests (RSA, ECDSA, AES keys, `deriveBits`,
