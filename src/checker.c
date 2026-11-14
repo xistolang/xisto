@@ -6080,6 +6080,19 @@ static Field *find_field(Class *c, const char *name, int *index) {
     return NULL;
 }
 
+/* a callback parameter the base takes as (e?: E) => void where the override takes (e?: E, d?: D) => void (node:stream's
+   _write(chunk, encoding, callback: TransformCallback) over (error?) => void), or the other way round: the same
+   parameters as far as both go, the rest optional; the bridge hands the override a wrapper (cb_wrap) */
+static bool cb_widened(Type *bt, Type *ot) {
+    bt = bt ? bt : NULL;
+    if (!bt || !ot || bt->kind != TY_FUNC || ot->kind != TY_FUNC || bt->rest || ot->rest || bt->async_ret || ot->async_ret) return false;
+    if (!bt->ret || !ot->ret || bt->ret->kind != TY_VOID || ot->ret->kind != TY_VOID || ty_equal(bt, ot)) return false;
+    int n = bt->nparams < ot->nparams ? bt->nparams : ot->nparams;
+    for (int i = 0; i < n; i++) if (!ty_equal(bt->params[i], ot->params[i])) return false;
+    for (int i = n; i < bt->nparams; i++) if (bt->params[i]->kind != TY_NULLABLE && !ty_is_any(bt->params[i])) return false;
+    for (int i = n; i < ot->nparams; i++) if (ot->params[i]->kind != TY_NULLABLE && !ty_is_any(ot->params[i])) return false;
+    return true;
+}
 static Func *find_method(Class *c, const char *name) {
     for (int i = 0; i < c->nmethods; i++)
         if (strcmp(c->methods[i]->name, name) == 0) return c->methods[i];
@@ -9650,6 +9663,16 @@ static void check_expr_in(Expr *e, Type *expected) {
             const char *q = strchr(name, '\x01') + 1;
             if (!strcmp(q, "node:timers") || !strcmp(q, "timers") || !strcmp(q, "xisto:timers")) name = e->lhs->str = xs_strndup(name, (size_t)(q - 1 - name));
         }
+        if (name && e->args.len >= 1 && strstr(name, "__s_") && !lookup(name)) { /* C.m(array) with a static __m_array beside m: that one
+                                                                              (Readable.from([...]) of xisto:stream) */
+            const char *sp = strstr(name, "__s_");
+            const char *alt = xs_sprintf("%.*s__s___%s_array", (int)(sp - name), name, sp + 4);
+            Expr *a0 = e->args.items[0];
+            if (lookup_func(alt)) {
+                if (a0->kind != E_ARRAY_LIT && !a0->type) { check_expr(a0, NULL); a0->prechecked = true; }
+                if (a0->kind == E_ARRAY_LIT || (a0->type && ty_strip_null(a0->type)->kind == TY_ARRAY)) name = e->lhs->str = (char *)alt;
+            }
+        }
         if (!lookup_func(name) && !lookup(name)) {
             if (strcmp(name, "Boolean") == 0 && e->args.len == 1) { /* Boolean(x): x's truthiness, as !!x */
                 Expr *x = e->args.items[0];
@@ -9856,6 +9879,21 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->builtin.cfn = "xs_this_take";
                 e->type = ty_unknown;
                 prog->uses_this_reg = true;
+                return;
+            }
+            if (!strcmp(name, "__xs_overrides") && e->args.len == 2 && e->args.items[1]->kind == E_STRING) {
+                /* __xs_overrides(obj, "m"): true when the class obj has at run time declares its own m (or inherits one
+                   from below obj's type): what JavaScript's `typeof obj._final === "function"` tells a library written in
+                   xisto (runtime/node/stream.ts) */
+                Expr *o = e->args.items[0];
+                check_expr(o, NULL);
+                Type *ot = ty_strip_null(o->type);
+                if (ot->kind != TY_OBJECT || ot->cls->builtin || !find_method(ot->cls, e->args.items[1]->str))
+                    xs_error(XS8035, e->pos, NULL, "__xs_overrides takes an object and the name of one of its class's methods");
+                e->args.items[1]->type = ty_string;
+                e->cls = ot->cls;
+                e->builtin.cfn = "__xs_overrides";
+                e->type = ty_boolean;
                 return;
             }
             if (!strcmp(name, "__xs_this_set") && e->args.len == 1) {
@@ -10432,6 +10470,62 @@ static void check_expr_in(Expr *e, Type *expected) {
             *e = *l;
             check_expr(e, expected);
             return;
+        }
+        if (e->is_call && e->str && !strcmp(e->str, "toString") && e->args.len <= 1 && e->lhs) {
+            /* chunk.toString() / chunk.toString("hex") with chunk an any (a stream's chunk, an untyped listener's
+               argument): bytes as a Buffer's text, anything else as String(x), when no class of the program has a
+               toString of its own: ((v: any, enc: string) => v instanceof Uint8Array ? (v as Buffer).toString(enc) :
+               String(v))(chunk, "hex") */
+            bool own = false;
+            for (int i = 0; i < prog->nclasses && !own; i++)
+                if (!prog->classes[i]->builtin) own = find_method(prog->classes[i], "toString") != NULL;
+            if (!own) {
+                check_expr(e->lhs, NULL);
+                e->lhs->prechecked = true;
+            }
+            if (!own && e->lhs->type && ty_is_any(e->lhs->type)) {
+                static int nts;
+                Pos at = e->pos;
+                int id = nts++;
+                const char *pv = xs_sprintf("__ts%d", id), *pe = xs_sprintf("__te%d", id);
+                bool enc = e->args.len == 1;
+                Func *f = xs_alloc(sizeof *f);
+                f->pos = at; f->name = "arrow"; f->ret = ty_string;
+                f->params = xs_alloc(sizeof(Param) * 2);
+                memset(f->params, 0, sizeof(Param) * 2);
+                f->params[0].name = (char *)pv; f->params[0].type = ty_any;
+                if (enc) { f->params[1].name = (char *)pe; f->params[1].type = ty_string; }
+                f->nparams = enc ? 2 : 1;
+                Expr *str = xs_alloc(sizeof *str);
+                str->kind = E_CALL; str->pos = at; str->field = -1; str->lhs = ad_ident(at, "String");
+                expr_list_push(&str->args, ad_ident(at, pv));
+                Expr *isb = xs_alloc(sizeof *isb); /* v instanceof Uint8Array */
+                isb->kind = E_BINARY; isb->op = TK_IDENT; isb->pos = at; isb->field = -1; isb->lhs = ad_ident(at, pv); isb->rhs = ad_ident(at, "Uint8Array");
+                Expr *asb = xs_alloc(sizeof *asb); /* (v as Buffer).toString(enc) */
+                asb->kind = E_AS; asb->pos = at; asb->field = -1; asb->lhs = ad_ident(at, pv); asb->elem_type = ty_object_of(find_class("Buffer"));
+                Expr *bts = xs_alloc(sizeof *bts);
+                bts->kind = E_MEMBER; bts->pos = at; bts->field = -1; bts->lhs = asb; bts->str = "toString"; bts->is_call = true;
+                if (enc) expr_list_push(&bts->args, ad_ident(at, pe));
+                Expr *cond = xs_alloc(sizeof *cond);
+                cond->kind = E_COND; cond->pos = at; cond->field = -1; cond->lhs = isb;
+                expr_list_push(&cond->args, bts);
+                expr_list_push(&cond->args, str);
+                Stmt *body = xs_alloc(sizeof *body);
+                body->kind = S_BLOCK; body->pos = at;
+                Stmt *r = xs_alloc(sizeof *r);
+                r->kind = S_RETURN; r->pos = at; r->expr = cond;
+                stmt_list_push(&body->stmts, r);
+                f->body = body;
+                Arrow *a = xs_alloc(sizeof *a); a->pos = at; a->fn = f; a->expr_body = false;
+                Expr *ae = xs_alloc(sizeof *ae); ae->kind = E_ARROW; ae->pos = at; ae->field = -1; ae->arrow = a;
+                Expr *v = e->lhs, *ea = enc ? e->args.items[0] : NULL;
+                memset(e, 0, sizeof *e);
+                e->kind = E_CALL; e->pos = at; e->field = -1; e->lhs = ae;
+                expr_list_push(&e->args, v);
+                if (ea) expr_list_push(&e->args, ea);
+                check_expr(e, expected);
+                return;
+            }
         }
         if (e->is_call && e->str && !strcmp(e->str, "toString") && e->args.len == 0 && e->lhs && tsc_checked()) {
             /* v.toString() with v an unknown (narrowed by typeof to a number or a bigint): String(v) */
@@ -16187,7 +16281,16 @@ static void flatten_methods(Class *c) {
            call through the base runs it by the same bridge, its result widened to the base's type */
         /* (the same count with other types too: canActivate(): boolean | Promise<boolean> | Observable<boolean> over a
            base's canActivate(): boolean, handleRequest<TUser = JwtPayload>(...): TUser over one giving unknown) */
-        if (covariant || (!same && tsc_checked() && !bm->is_abstract && !b->is_interface && !b->iface_methods && own->body)) {
+        /* _transform(chunk: Buffer, ...) over a base's _transform(chunk: any, ...): TypeScript lets a method narrow a
+           parameter the base takes as any (its parameters are bivariant), and an int where the base takes a number is
+           xisto's narrower number; a call through the base converts the argument (checked at run time), by the same bridge */
+        bool any_narrowed = !same && own->nparams == bm->nparams && own->body && !own->ntparams && !bm->ntparams && !bm->is_abstract &&
+                            !b->is_interface && !b->iface_methods && (!own->ret || !bm->ret || ty_equal(own->ret, bm->ret));
+        for (int k = 0; any_narrowed && k < own->nparams; k++)
+            any_narrowed = ty_equal(own->params[k].type, bm->params[k].type) || (ty_is_any(bm->params[k].type) && !own->params[k].rest) ||
+                           (bm->params[k].type->kind == TY_NUMBER && own->params[k].type->kind == TY_INT) || /* (_read(size: int)) */
+                           cb_widened(bm->params[k].type, own->params[k].type);
+        if (covariant || any_narrowed || (!same && tsc_checked() && !bm->is_abstract && !b->is_interface && !b->iface_methods && own->body)) {
             /* upsert(input) over upsert(filter, set, setOnInsert?): TypeScript takes it, and JavaScript calls it by name: a call
                through the base (this.upsert(...) in the base's own code too) runs this one, with the arguments it was given
                (the extra ones dropped). Here a bridge with the base's signature does that: this.upsert(a0 as P0, ...),
@@ -16247,6 +16350,34 @@ static void flatten_methods(Class *c) {
                     expr_list_push(&parse->args, str);
                     a = xs_alloc(sizeof *a);
                     a->kind = E_AS; a->pos = pos; a->field = -1; a->lhs = parse; a->elem_type = own->params[k].type;
+                } else if (cb_widened(bm->params[k].type, own->params[k].type)) {
+                    /* (e, d) => __oaK(e): the base's callback as the override's type */
+                    Type *bt = bm->params[k].type, *ot = own->params[k].type;
+                    Func *wf = xs_alloc(sizeof *wf);
+                    wf->pos = pos; wf->name = "arrow"; wf->ret = ty_void;
+                    wf->params = xs_alloc(sizeof(Param) * (size_t)(ot->nparams + 1));
+                    memset(wf->params, 0, sizeof(Param) * (size_t)(ot->nparams + 1));
+                    Expr *inner = xs_alloc(sizeof *inner);
+                    inner->kind = E_CALL; inner->pos = pos; inner->field = -1; inner->lhs = id;
+                    for (int q = 0; q < ot->nparams; q++) {
+                        wf->params[q].name = xs_sprintf("__cbw%d_%d", k, q);
+                        wf->params[q].type = ot->params[q];
+                        Expr *pd = xs_alloc(sizeof *pd); pd->kind = E_NULL; pd->pos = pos; pd->field = -1;
+                        wf->params[q].dflt = pd;
+                    }
+                    wf->nparams = ot->nparams;
+                    for (int q = 0; q < bt->nparams; q++) {
+                        Expr *aq;
+                        if (q < ot->nparams) { aq = xs_alloc(sizeof *aq); aq->kind = E_IDENT; aq->pos = pos; aq->field = -1; aq->str = wf->params[q].name; }
+                        else { aq = xs_alloc(sizeof *aq); aq->kind = E_NULL; aq->pos = pos; aq->field = -1; }
+                        expr_list_push(&inner->args, aq);
+                    }
+                    Stmt *wb = xs_alloc(sizeof *wb); wb->kind = S_BLOCK; wb->pos = pos;
+                    Stmt *ws = xs_alloc(sizeof *ws); ws->kind = S_EXPR; ws->pos = pos; ws->expr = inner;
+                    stmt_list_push(&wb->stmts, ws);
+                    wf->body = wb;
+                    Arrow *wa = xs_alloc(sizeof *wa); wa->pos = pos; wa->fn = wf;
+                    a = xs_alloc(sizeof *a); a->kind = E_ARROW; a->pos = pos; a->field = -1; a->arrow = wa;
                 } else if (!ty_equal(bm->params[k].type, own->params[k].type) && !conv_ok(bm->params[k].type, own->params[k].type, 0)) {
                     Expr *u = xs_alloc(sizeof *u);
                     u->kind = E_AS; u->pos = pos; u->field = -1; u->lhs = id; u->elem_type = ty_unknown;
@@ -17616,7 +17747,8 @@ void check_program(Program *p) {
             if (p->classes[j]->mod == c->mod && strcmp(c->name, p->classes[j]->name) == 0) xs_error(XS9015, c->pos, NULL, "class '%s' is declared twice", c->name);
         for (int j = 0; j < nbuiltins; j++)
             if (strcmp(c->name, builtins[j]->name) == 0 && !((strcmp(c->name, "Worker") == 0 || strcmp(c->name, "MessagePort") == 0) && !wt_imports(c->mod, c->name)) &&
-                strcmp(c->name, "Response") != 0) /* (Express's Response: a module's own class comes first where it is declared or imported) */
+                strcmp(c->name, "Response") != 0 && strcmp(c->name, "ReadableStream") != 0) /* (Express's Response, node:stream/web's
+                                                       ReadableStream: a module's own class comes first where it is declared or imported) */
                 xs_error(XS9002, c->pos, NULL, "'%s' is a built-in class", c->name);
         SYM_EACH(funcs_by_name, c->name, e)
             if (((Func *)e->decl)->mod == c->mod) xs_error(XS9006, c->pos, NULL, "'%s' is both a class and a function", c->name);

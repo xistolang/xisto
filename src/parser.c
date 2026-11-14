@@ -250,7 +250,18 @@ static Type *parse_inline_object_type(Parser *p) {
     const char *close = p->prev_end;
     /* the key: the tokens of the body without spacing (and the module: a type written in one file is that file's) */
     Buf key = {0};
-    for (const char *q = open; q < close; q++) if (!isspace((unsigned char)*q)) buf_putc(&key, *q);
+    for (const char *q = open; q < close; q++) {
+        if (isspace((unsigned char)*q)) continue;
+        /* Node's BufferEncoding is a string here (xisto:url): { encoding: BufferEncoding } and { encoding: string } are one type
+           (a subclass's _writev chunks as Node's typings write them, and xisto:stream's) */
+        if ((q == open || !(isalnum((unsigned char)q[-1]) || q[-1] == '_')) && close - q >= 14 && strncmp(q, "BufferEncoding", 14) == 0 &&
+            !(isalnum((unsigned char)q[14]) || q[14] == '_')) {
+            buf_puts(&key, "string");
+            q += 13;
+            continue;
+        }
+        buf_putc(&key, *q);
+    }
     if (nsubst) for (int i = 0; i < nsubst; i++) buf_printf(&key, "|%s", subst_names[i]); /* (an instance: its own copy) */
     uint64_t h = 1469598103934665603ULL;
     for (size_t i = 0; i < key.len; i++) { h ^= (unsigned char)key.data[i]; h *= 1099511628211ULL; }
@@ -862,7 +873,7 @@ static Type *parse_type(Parser *p) {
         expect(p, TK_LT, "write Channel<T>");
         t = ty_chan_of(parse_type(p));
         expect(p, TK_GT, NULL);
-    } else if (strcmp(n, "Stream") == 0) {
+    } else if (strcmp(n, "Stream") == 0 && at(p, TK_LT)) { /* (Stream alone: a class, node:stream's) */
         expect(p, TK_LT, "write Stream<T>");
         t = ty_stream_of(parse_type(p));
         expect(p, TK_GT, NULL);
@@ -3739,12 +3750,14 @@ static void parse_fields_body(Parser *p, Class *c) {
         bool is_async = at(p, TK_ASYNC) && !peek_is(p, TK_QUESTION) && !peek_is(p, TK_COLON) && !peek_is(p, TK_SEMI) &&
                         !peek_is(p, TK_ASSIGN) && accept(p, TK_ASYNC); /* (async?: boolean: a field named async) */
         bool gen_method = !c->is_interface && accept(p, TK_STAR); /* *values(): a generator method */
-        if (gen_method && at(p, TK_LBRACKET)) { /* *[Symbol.iterator](): what for...of uses on the object */
+        if (gen_method && at(p, TK_LBRACKET)) { /* *[Symbol.iterator](): what for...of uses on the object; async *[Symbol.asyncIterator]():
+                                                     what for await...of uses (the same: for await reads it as for...of) */
             next(p);
             Token sym = expect(p, TK_IDENT, NULL);
             expect(p, TK_DOT, "write *[Symbol.iterator]()");
             Token it = expect(p, TK_IDENT, NULL);
-            if (strcmp(sym.str, "Symbol") != 0 || strcmp(it.str, "iterator") != 0) xs_error(XS6029, sym.pos, NULL, "only [Symbol.iterator] is supported as a computed method name");
+            if (strcmp(sym.str, "Symbol") != 0 || (strcmp(it.str, "iterator") != 0 && !(is_async && strcmp(it.str, "asyncIterator") == 0)))
+                xs_error(XS6029, sym.pos, NULL, "only [Symbol.iterator] (and async *[Symbol.asyncIterator]) are supported as computed method names");
             expect(p, TK_RBRACKET, NULL);
         }
         bool sym_iter = gen_method && at(p, TK_LPAREN) && p->prev_end && p->prev_end[-1] == ']';
@@ -4687,6 +4700,32 @@ from:
     Token path = expect(p, TK_STRING, "write the path as a string: from \"./file\"");
     im.path = path.str;
     expect_semi(p);
+    if (!im.star && !im.is_default && im.n &&
+        (strcmp(im.path, "fs") == 0 || strcmp(im.path, "node:fs") == 0 || strcmp(im.path, "xisto:fs") == 0)) {
+        /* fs.createReadStream & co are xisto:stream's (runtime/node/stream.ts): imported from there, so a program that
+           does not name them does not load the streams */
+        Import st = im;
+        st.names = xs_alloc(sizeof(char *) * (size_t)im.n);
+        st.positions = xs_alloc(sizeof(Pos) * (size_t)im.n);
+        st.n = 0;
+        st.path = "xisto:stream";
+        int keep = 0;
+        for (int i = 0; i < im.n; i++) {
+            const char *n = im.names[i];
+            if (!strcmp(n, "createReadStream") || !strcmp(n, "createWriteStream") || !strcmp(n, "ReadStream") || !strcmp(n, "WriteStream")) {
+                st.names[st.n] = im.names[i];
+                st.positions[st.n++] = im.positions[i];
+            } else {
+                im.names[keep] = im.names[i];
+                im.positions[keep++] = im.positions[i];
+            }
+        }
+        im.n = keep;
+        if (st.n) {
+            m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+            m->imports[m->nimports++] = st;
+        }
+    }
     m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
     m->imports[m->nimports++] = im;
     if (im.n) alias_collisions(p, m, alias_first, &m->imports[m->nimports - 1]);
@@ -6264,13 +6303,13 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->loading = false;
         return m;
     }
-    if (strcmp(name, "async_hooks") == 0 || strcmp(name, "crypto") == 0 || strcmp(name, "stream") == 0) {
+    if (strcmp(name, "async_hooks") == 0 || strcmp(name, "crypto") == 0) {
         /* written in xisto over runtime functions: runtime/node/<name>.ts, embedded in the compiler */
-        extern const unsigned char xs_node_async_hooks_ts[], xs_node_crypto_ts[], xs_node_stream_ts[];
+        extern const unsigned char xs_node_async_hooks_ts[], xs_node_crypto_ts[];
         bool ah = strcmp(name, "async_hooks") == 0, cr = strcmp(name, "crypto") == 0;
         m->builtin = false;
-        m->file = ah ? "xisto:async_hooks" : cr ? "xisto:crypto" : "xisto:stream";
-        m->src = (char *)(ah ? xs_node_async_hooks_ts : cr ? xs_node_crypto_ts : xs_node_stream_ts);
+        m->file = ah ? "xisto:async_hooks" : "xisto:crypto";
+        m->src = (char *)(ah ? xs_node_async_hooks_ts : xs_node_crypto_ts);
         m->native_prefix = "xs_";
         if (cr) prog->uses_crypto = true;
         m->loading = true;
@@ -6310,7 +6349,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         return m;
     }
     { /* Node's modules written in xisto over runtime functions (runtime/node/NAME.ts, NODE_TS in the Makefile) */
-        extern const unsigned char xs_node_events_ts[], xs_node_process_ts[], xs_node_http_ts[], xs_node_net_ts[], xs_node_dns_ts[], xs_node_child_process_ts[], xs_node_https_ts[], xs_node_buffer_ts[], xs_node_util_ts[], xs_node_querystring_ts[], xs_node_string_decoder_ts[], xs_node_zlib_ts[];
+        extern const unsigned char xs_node_events_ts[], xs_node_process_ts[], xs_node_http_ts[], xs_node_net_ts[], xs_node_dns_ts[], xs_node_child_process_ts[], xs_node_https_ts[], xs_node_buffer_ts[], xs_node_util_ts[], xs_node_querystring_ts[], xs_node_string_decoder_ts[], xs_node_zlib_ts[], xs_node_stream_ts[], xs_node_stream_promises_ts[], xs_node_stream_web_ts[];
         static const struct { const char *name; const unsigned char *src; bool net; bool tls; } node_ts[] = {
             {"events", xs_node_events_ts, false},
             {"process", xs_node_process_ts, true}, /* (signals and the exit hook live with the event loop) */
@@ -6324,6 +6363,9 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
             {"querystring", xs_node_querystring_ts, false},
             {"string_decoder", xs_node_string_decoder_ts, false},
             {"zlib", xs_node_zlib_ts, false},
+            {"stream", xs_node_stream_ts, true}, /* (streams defer with process.nextTick and setImmediate) */
+            {"stream/promises", xs_node_stream_promises_ts, true}, /* (a name with a slash: runtime/node/stream_promises.ts) */
+            {"stream/web", xs_node_stream_web_ts, true},
         };
         for (size_t i = 0; i < sizeof node_ts / sizeof node_ts[0]; i++) {
             if (strcmp(name, node_ts[i].name) != 0) continue;
@@ -6377,7 +6419,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         prog->uses_okmap = true;
         return m;
     }
-    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:buffer, xisto:util, xisto:querystring, xisto:string_decoder, xisto:zlib, xisto:timers, xisto:http, xisto:https, xisto:net, xisto:dns, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:stream, xisto:stream/promises, xisto:stream/web, xisto:buffer, xisto:util, xisto:querystring, xisto:string_decoder, xisto:zlib, xisto:timers, xisto:http, xisto:https, xisto:net, xisto:dns, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
     return NULL;
 }
 

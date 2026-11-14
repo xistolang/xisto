@@ -29,7 +29,7 @@ Available modules include:
 - `http` / `https`: a server and `fetch`, with TLS (AWS-LC by default, or BearSSL)
 - `crypto`: hashes, HMAC, AES ciphers, pbkdf2/scrypt/hkdf, keys and RSA/ECDSA signatures (see [crypto](#crypto))
 - `zlib`: deflate, gzip, raw deflate and Brotli (see [zlib](#zlib))
-- `stream` (synchronous, no backpressure wait)
+- `stream`, `stream/promises`, `stream/web`, and `fs.createReadStream`/`createWriteStream` (see [stream](#stream))
 - `async_hooks` (`AsyncLocalStorage`)
 - `buffer` (`Buffer`, also a global; see [Buffer](#buffer))
 - `sqlite`
@@ -37,6 +37,94 @@ Available modules include:
 
 The output of `console.log`, value formatting and error messages follow Node's, and errors carry Node-style stack
 traces.
+
+## stream
+
+`node:stream` is a port of Node's own stream state machines (`lib/internal/streams`, Node 26): the same flags and
+the same `process.nextTick` deferrals, so the events of a stream come in Node's order and on Node's ticks.
+
+```ts
+import { Readable, Transform, Writable, pipeline } from "node:stream";
+import type { TransformCallback } from "node:stream";
+
+class Upper extends Transform {
+  override _transform(chunk: Buffer, encoding: string, callback: TransformCallback): void {
+    callback(null, chunk.toString().toUpperCase());
+  }
+}
+const out: string[] = [];
+const sink = new Writable({
+  write: (chunk: any, encoding: string, cb: (error?: Error | null) => void): void => {
+    out.push(chunk.toString());
+    cb();
+  },
+});
+pipeline(Readable.from(["a", "b"]), new Upper(), sink, (err) => console.log(err ? err.message : "done", out));
+```
+
+Supported:
+
+| | |
+|---|---|
+| `Readable` | paused and flowing modes, `push`/`unshift`, `_read`, `read(n)`, `'data'`, `'readable'`, `'end'`, `'close'`, `'error'`, `'pause'`/`'resume'`, `pipe`/`unpipe` with backpressure (`'drain'`), `pause`/`resume`/`isPaused`, `setEncoding` (a character split between chunks is kept whole), `objectMode`, `highWaterMark`, `destroy(err)`, `Readable.from(array \| generator \| async generator)`, `for await (const chunk of readable)`, the `readable*` properties |
+| `Writable` | `write` (false above the `highWaterMark`), `'drain'`, `end(chunk?, encoding?, cb?)`, `'finish'`/`'prefinish'`, `_write`/`_writev`/`_final`, `cork`/`uncork`, `setDefaultEncoding`, `decodeStrings`, `objectMode`, the `writable*` properties |
+| `Duplex`, `Transform`, `PassThrough` | `allowHalfOpen`, `readable`/`writable: false`, `readableObjectMode`/`writableObjectMode`, `_transform` (pushing, or `callback(null, data)`), `_flush` |
+| all | `_construct`, `_destroy`, `destroy(err, cb)`, `autoDestroy`, `emitClose`, `destroyed`/`closed`/`errored` |
+| functions | `pipeline(...streams, cb)`, `finished(stream, [options], cb)`, `isReadable`, `isWritable`, `isErrored`, `isDisturbed`, `getDefaultHighWaterMark`/`setDefaultHighWaterMark` (64 KiB, 16 objects) |
+| `node:stream/promises` | `pipeline(...streams)`, `finished(stream, options?)` |
+| `node:fs` | `createReadStream(path, { start, end, highWaterMark, encoding, fd, flags, autoClose })` and `createWriteStream(path, { flags, encoding, start, fd })`, `ReadStream`/`WriteStream` (`'open'`, `'ready'`, `bytesRead`/`bytesWritten`, `close()`); errors as Node's (`ENOENT: no such file or directory, open '...'`, `code`, `syscall`) |
+
+Errors carry Node's `code` and message (`ERR_STREAM_PUSH_AFTER_EOF`, `ERR_STREAM_WRITE_AFTER_END`,
+`ERR_STREAM_DESTROYED`, `ERR_STREAM_PREMATURE_CLOSE`, `ERR_MULTIPLE_CALLBACK`, `ERR_INVALID_ARG_TYPE`...).
+
+Chunks: in byte mode a chunk is a `Buffer` (a string pushed or written is converted, a `Uint8Array` is taken as
+one), or a string after `setEncoding`. In object mode a chunk is any value. A listener and a method override may
+name the type they expect: `on("data", (chunk: Buffer) => ...)`, `_transform(chunk: Buffer, ...)` over the base's
+`chunk: any`, `_read(size: int)` over the base's `number`, `_write(..., callback: TransformCallback)` over the base's
+`(error?: Error | null) => void`; the value is checked when it arrives. `chunk.toString()`
+and `chunk.toString("hex")` work on an `any` chunk.
+
+Option functions (`read`, `write`, `writev`, `final`, `destroy`, `construct`, `transform`, `flush`) are written as
+properties. An arrow function has no `this`: refer to the stream by its variable (give the variable its type,
+`const w: Writable = new Writable({ ... })`, when the function reads a property of it), or write
+`read: function (this: Readable, size: number) { this.push(x); }`. Method shorthand (`read() { ... }`) in an object
+literal is not supported; a subclass that overrides `_read` and the others works as in Node.
+
+Event timing: `process.nextTick` callbacks run after the current callback and before its microtasks, and the
+program's top-level code is an ES module's (its microtasks first), as in Node. `fs` streams do their reads,
+writes, `open` and `close` on a later turn of the loop (`setImmediate`), as Node's thread pool delivers them.
+
+Differences from Node:
+
+- `Readable` is a subclass of `Writable` in xisto, so that `Duplex` can be both (xisto classes have one base): a
+  `Duplex`, `Transform` or `PassThrough` goes wherever a `Readable` or a `Writable` goes, as in Node. The price:
+  `x instanceof Writable` is also true for a plain `Readable` (`instanceof Readable` is exact; test
+  `x.writable`), and a `Readable` has `write()`/`end()`, which throw. `Writable` has no `pipe()`.
+- `Readable.from(generator)` runs the generator as a task: a value is produced when the previous one has been
+  read, one step later than Node, which reads one ahead. For an array it reads as Node does.
+- Breaking out of `for await (const c of readable)` does not destroy the stream (xisto's generators have no
+  `return()`); the loop ending normally or with an error does as in Node.
+- `pipeline` takes streams only: no generator functions or web streams among them, no `{ signal }`. There is no
+  `compose`, `addAbortSignal`, `Readable.fromWeb`/`toWeb`, `wrap`, or the operators (`map`, `filter`,
+  `toArray`...).
+- A missing argument is `null` (`finished` calls back with `null`, not `undefined`); errors are `Error` objects
+  (Node's `AggregateError` of two errors is the later one).
+- `fs.createReadStream` and `createWriteStream` must be imported by name (`import { createReadStream } from
+  "node:fs"`), not through `import fs from "node:fs"`.
+
+### stream/web
+
+`node:stream/web` has `ReadableStream` (with `getReader()`/`read()`/`releaseLock()`, `cancel`, `pipeTo`,
+`pipeThrough`, `tee`, `for await`), `WritableStream` (`getWriter()` with `write`/`close`/`abort`/`ready`/
+`closed`/`desiredSize`), `TransformStream`, `TextEncoderStream`, `TextDecoderStream`,
+`CountQueuingStrategy` and `ByteLengthQueuingStrategy`. They are not globals: import them. A source, sink or
+transformer is an object of functions written as properties (`start: (c) => { ... }`), each returning nothing or a
+promise.
+
+Differences from Node: no byte streams (`type: "bytes"`, BYOB readers), no `ReadableStream.from`, no transfer;
+the steps of one stream come in Node's order, but the number of microtasks between two of them can differ (a
+`pull` may run after a read that Node lets wait for it). `fetch()`'s `response.body` is still null (fetch reads
+the body whole).
 
 ## events
 

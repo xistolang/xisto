@@ -3716,6 +3716,20 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, ")");
             return;
         }
+        if (e->builtin.cfn && strcmp(e->builtin.cfn, "__xs_overrides") == 0) { /* (checker: __xs_overrides(obj, "m")) */
+            Func *m = emit_find_method(e->cls, e->args.items[1]->str);
+            buf_puts(out, "({ void (*f_)(void *) = xs_type_of(");
+            emit_borrowed(e->args.items[0]);
+            buf_puts(out, ")->free; (false");
+            for (int i = 0; m && i < prog->nclasses; i++) {
+                Class *k = prog->classes[i];
+                if (!k->used || k->builtin || k->is_abstract || !is_sub(k, e->cls)) continue;
+                Func *impl = emit_find_method(k, m->name);
+                if (impl && impl != m && impl->cls != m->cls) buf_printf(out, " || f_ == %s_free", k->cname);
+            }
+            buf_puts(out, "); })");
+            return;
+        }
         if (e->builtin.cfn && (strcmp(e->builtin.cfn, "__reflect_decoder") == 0 || strcmp(e->builtin.cfn, "__reflect_encoder") == 0)) {
             emit_reflect_codec(e->elem_type, e->builtin.cfn[10] == 'd');
             return;

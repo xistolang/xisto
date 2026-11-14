@@ -3384,6 +3384,47 @@ XS_NOINLINE xs_str *xs_os_arch_name(void) {
     return xs_str_new("x64", 3);
 #endif
 }
+/* ---- fs.createReadStream / fs.createWriteStream (runtime/node/stream.ts): open, read, write and close that give
+   -errno instead of throwing (the stream turns it into its 'error' event, with Node's code and message) */
+XS_NOINLINE int64_t xs_fs_stream_open(xs_str *path, xs_str *flags, int64_t mode) {
+    const char *f = flags->data;
+    int fl;
+    bool plus = strchr(f, '+') != NULL, excl = strchr(f, 'x') != NULL, sync = strchr(f, 's') != NULL;
+    if (f[0] == 'r') fl = plus ? O_RDWR : O_RDONLY;
+    else if (f[0] == 'w') fl = (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_TRUNC;
+    else if (f[0] == 'a') fl = (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_APPEND;
+    else return -EINVAL;
+    if (excl) fl |= O_EXCL;
+    if (sync) fl |= O_SYNC;
+    int fd = open(path->data, fl | O_CLOEXEC, (mode_t)mode);
+    return fd < 0 ? -(int64_t)errno : fd;
+}
+XS_NOINLINE int64_t xs_fs_stream_read(int64_t fd, xs_Uint8Array *b, int64_t off, int64_t len, int64_t pos) {
+    if (off < 0 || len < 0 || off + len > b->f_length) return -EINVAL;
+    ssize_t r = pos >= 0 ? pread((int)fd, b->data + off, (size_t)len, (off_t)pos) : read((int)fd, b->data + off, (size_t)len);
+    return r < 0 ? -(int64_t)errno : (int64_t)r;
+}
+XS_NOINLINE int64_t xs_fs_stream_write(int64_t fd, xs_Uint8Array *b, int64_t off, int64_t len, int64_t pos) {
+    if (off < 0 || len < 0 || off + len > b->f_length) return -EINVAL;
+    ssize_t r = pos >= 0 ? pwrite((int)fd, b->data + off, (size_t)len, (off_t)pos) : write((int)fd, b->data + off, (size_t)len);
+    return r < 0 ? -(int64_t)errno : (int64_t)r;
+}
+XS_NOINLINE int64_t xs_fs_stream_close(int64_t fd) { return close((int)fd) != 0 ? -(int64_t)errno : 0; }
+/* the errno's name and libuv's text for it (ENOENT, "no such file or directory") */
+XS_NOINLINE xs_str *xs_fs_stream_errcode(int64_t e) {
+    static const struct { int e; const char *code, *text; } t[] = {
+        {ENOENT, "ENOENT", "no such file or directory"}, {EACCES, "EACCES", "permission denied"},
+        {EISDIR, "EISDIR", "illegal operation on a directory"}, {EEXIST, "EEXIST", "file already exists"},
+        {ENOTDIR, "ENOTDIR", "not a directory"}, {EBADF, "EBADF", "bad file descriptor"}, {EMFILE, "EMFILE", "too many open files"},
+        {ENOSPC, "ENOSPC", "no space left on device"}, {EROFS, "EROFS", "read-only file system"}, {EPERM, "EPERM", "operation not permitted"},
+        {EINVAL, "EINVAL", "invalid argument"}, {EIO, "EIO", "i/o error"}, {EAGAIN, "EAGAIN", "resource temporarily unavailable"}};
+    int64_t a = e < 0 ? -e : e;
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++)
+        if (t[i].e == a) return xs_str_new(e < 0 ? t[i].text : t[i].code, strlen(e < 0 ? t[i].text : t[i].code));
+    const char *s = e < 0 ? strerror((int)a) : "EIO";
+    return xs_str_new(s, strlen(s));
+}
+
 XS_NOINLINE xs_str *xs_os_tmp_dir(void) { /* $TMPDIR without its trailing slash (Node), else /tmp */
     const char *t = getenv("TMPDIR");
     if (!t || !*t) return xs_str_new("/tmp", 4);

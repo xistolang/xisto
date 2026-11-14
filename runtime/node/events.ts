@@ -85,11 +85,15 @@ export class EventEmitter {
         list.splice(i, 1);
         if (list.length === 0) this._events.delete(event);
         if (this._events.has("removeListener")) this.emit("removeListener", event, listener);
+        this._listenerRemoved(event, listener);
         break;
       }
     }
     return this;
   }
+  /** What a subclass does once a listener is gone: after off()/removeListener(), and when a once() listener is
+   * removed before its call (node:stream's Readable watches 'readable' and 'data' so). */
+  protected _listenerRemoved(event: string, listener: Listener): void {}
   /** The same as removeListener(). */
   off(event: string, listener: Listener): EventEmitter {
     return this.removeListener(event, listener);
@@ -140,6 +144,9 @@ export class EventEmitter {
           }
           if (cur.length === 0) this._events.delete(event);
         }
+        // (Node's once wrapper removes itself with removeListener before the call: 'removeListener' is emitted)
+        if (this._events.has("removeListener")) this.emit("removeListener", event, e.fn);
+        this._listenerRemoved(event, e.fn);
       }
       e.fn(...args);
     }
