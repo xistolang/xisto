@@ -2894,6 +2894,67 @@ static void emit_expr_(Expr *e) {
     bracketing = saved_b;
     buf_printf(out, is_void ? "; XS_POST(%d); })" : "; XS_POST(%d); xr_; })", id);
 }
+/* ---- a selection between an Int32Array element and a sum, in 32 bits (floyd-warshall's path[i][j] = path[i][j] <
+   path[i][k] + path[k][j] ? path[i][j] : path[i][k] + path[k][j]) ----
+   X[..] = P CMP Q ? P : Q (any order of the test and the arms), P and Q int32 elements, one of them possibly the sum
+   or difference of two: the program compares and picks in 64 bits and stores ToInt32 of the pick. Here the sum is
+   made in 32 bits, wrapping, with its overflow bit: without an overflow it is the true value; with one, the true value
+   is beyond int32 on the side its first operand's sign says, and so above (or below) the other side, whatever it is.
+   The test comes out as in 64 bits, the pick is the same, and ToInt32 of the true sum is the wrapped one. The same
+   stores, with all the arithmetic in 32-bit lanes (twice as many per vector as the 64-bit sums). XISTO_NO_I32SEL
+   turns it off. */
+static bool sel_cmp(int op);
+static bool sel_eq(Expr *a, Expr *b);
+static bool i32sel_load(Expr *e) { return e && is_i32_index(e) && e->type && e->type->kind == TY_INT && bce_pure(e->rhs); }
+static bool i32sel_side(Expr *e) { /* an element, or the sum (difference) of two */
+    if (i32sel_load(e)) return true;
+    return e && e->kind == E_BINARY && (e->op == TK_PLUS || e->op == TK_MINUS) && e->type && e->type->kind == TY_INT && i32sel_load(e->lhs) && i32sel_load(e->rhs);
+}
+static bool i32sel_emit(Expr *e) {
+    Expr *r = e->rhs;
+    if (getenv("XISTO_NO_I32SEL") || xs_debug || !r || r->kind != E_COND || r->builtin.cfn || r->args.len != 2 || !r->lhs || r->lhs->kind != E_BINARY ||
+        !sel_cmp(r->lhs->op) || !r->type || r->type->kind != TY_INT) return false;
+    Expr *L = r->lhs->lhs, *R = r->lhs->rhs, *a0 = r->args.items[0], *a1 = r->args.items[1];
+    if (!i32sel_side(L) || !i32sel_side(R) || (!i32sel_load(L) && !i32sel_load(R))) return false;
+    if (!((sel_eq(a0, L) && sel_eq(a1, R)) || (sel_eq(a0, R) && sel_eq(a1, L)))) return false;
+    static int n;
+    int id = n++;
+    Expr *S = i32sel_load(L) ? (i32sel_load(R) ? NULL : R) : L; /* the sum, if any */
+    buf_printf(out, "({ int32_t *ip%d_ = ", id);
+    emit_lvalue_ptr(e->lhs);
+    buf_puts(out, "; ");
+    /* each side: its 32-bit value, and for the sum its overflow (o) and direction (h: above) */
+    for (int k = 0; k < 2; k++) {
+        Expr *x = k ? R : L;
+        if (x == S) {
+            buf_printf(out, "int32_t b%d_%d_ = (int32_t)(", id, k); emit_expr(x->lhs);
+            buf_printf(out, "), c%d_%d_ = (int32_t)(", id, k); emit_expr(x->rhs);
+            buf_printf(out, "); int32_t v%d_%d_ = (int32_t)((uint32_t)b%d_%d_ %s (uint32_t)c%d_%d_); ", id, k, id, k, x->op == TK_PLUS ? "+" : "-", id, k);
+            if (x->op == TK_PLUS) buf_printf(out, "int o%d_%d_ = ((b%d_%d_ ^ v%d_%d_) & (c%d_%d_ ^ v%d_%d_)) < 0; ", id, k, id, k, id, k, id, k, id, k);
+            else buf_printf(out, "int o%d_%d_ = ((b%d_%d_ ^ c%d_%d_) & (b%d_%d_ ^ v%d_%d_)) < 0; ", id, k, id, k, id, k, id, k, id, k);
+            buf_printf(out, "int h%d_%d_ = b%d_%d_ >= 0; ", id, k, id, k);
+        } else {
+            buf_printf(out, "int32_t v%d_%d_ = (int32_t)(", id, k); emit_expr(x); buf_puts(out, "); ");
+        }
+    }
+    const char *op = binop(r->lhs->op);
+    int sk = S == L ? 0 : S == R ? 1 : -1;
+    /* the test: with the sum out of range, decided by its side */
+    if (sk < 0) buf_printf(out, "int t%d_ = v%d_0_ %s v%d_1_; ", id, id, op, id);
+    else {
+        int lt = r->lhs->op == TK_LT || r->lhs->op == TK_LE;
+        /* sum on the right above: L < R true; on the left above: L < R false */
+        const char *above = (sk == 1) == (bool)lt ? "1" : "0", *below = (sk == 1) == (bool)lt ? "0" : "1";
+        buf_printf(out, "int t%d_ = o%d_%d_ ? (h%d_%d_ ? %s : %s) : (v%d_0_ %s v%d_1_); ", id, id, sk, id, sk, above, below, id, op, id);
+    }
+    int first = sel_eq(a0, L) ? 0 : 1; /* the side the true arm picks */
+    buf_printf(out, "int32_t r%d_ = t%d_ ? v%d_%d_ : v%d_%d_; *ip%d_ = r%d_; ", id, id, id, first, id, 1 - first, id, id);
+    /* the expression's value: the pick, the sum as the true int */
+    if (sk < 0) buf_printf(out, "(int64_t)r%d_; })", id);
+    else buf_printf(out, "(t%d_ ? %d : %d) == %d ? (int64_t)b%d_%d_ %s (int64_t)c%d_%d_ : (int64_t)r%d_; })", id, first, 1 - first, sk, id, sk,
+                    S->op == TK_PLUS ? "+" : "-", id, sk, id);
+    return true;
+}
 static void emit_expr_raw(Expr *e) {
     switch (e->kind) {
     case E_NUMBER:
@@ -3541,6 +3602,7 @@ static void emit_expr_raw(Expr *e) {
                     buf_printf(out, " = fn%d_)", bce_fw[k].id);
                     return;
                 }
+        if (is_i32_index(e->lhs) && e->op == TK_ASSIGN && i32sel_emit(e)) return;
         if (bce_promo_w64 && bce_promo_t && e->op == TK_ASSIGN && bce_fw_is(e->lhs, bce_promo_t)) { /* (bce_sel_plan: no ToInt32 on the way) */
             buf_printf(out, "(pr%d_ = (int64_t)(", bce_promo_id);
             emit_expr(e->rhs);
@@ -9515,7 +9577,7 @@ static void lj_flat(Stmt *b, Stmt **st, int *n) {
     (*n)++;
 }
 static bool lj_match(Stmt *s, Stmt **st, int *ns) {
-    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_LJAM") || bce_promo_t || bce_fw_loop) return false;
+    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_LJAM") || bce_promo_t || bce_fw_loop || nlj_map) return false;
     Expr *O0, *OL;
     if (!uj_counted(s, &lj_o, &O0, &OL) || stmt_writes_name(s->body, lj_o)) return false;
     lj_nest = s;
@@ -10029,9 +10091,295 @@ static bool rs_emit_loop(Stmt *s) {
     buf_puts(out, " }");
     return true;
 }
+/* ---- the rows of a triangular elimination in lanes (lu, ludcmp: their first half, j < i) ----
+   for (let i = I0; i < N; i++) {
+     for (let j = J0; j < i; j++) { w = A[i][j]; for (let k = K0; k < j; k++) w -= A[i][k] * A[k][j]; A[i][j] = w / A[j][j]; }
+     REST
+   }
+   (the statements of the j loop: assignments to number locals or to A[i][j], and loops over k < j of them). Row i's
+   first loop, for the j below some i0 <= i, reads only its own row and rows k < j and j: rows before i0. So the rows
+   i0 .. i0 + U - 1 can run that part together (lanes, the j and k loops in step: one load of A[k][j] for U chains),
+   and then each row, in order, the rest of its first loop (j from i0) and REST, which read only its own row and rows
+   below i (a counter bounded by i): the rows before it are then finished, as in the program. Every element gets the
+   same operations on the same values. The locals of the j loop are assigned before they are read there; the lanes
+   have copies of them, and the rows' tails run with the locals themselves, so the values left after the loop are
+   the program's. The guard, once per entry: N within A and within every row, A's rows apart from each other and from
+   the other arrays read (xs_blocks_apart_). The rows left (fewer than U), or the loop when the guard fails, as
+   written. XISTO_NO_TRI turns it off; XISTO_TRI_U sets U (8). */
+static const char *tr_i, *tr_j, *tr_k, *tr_a, *tr_loc[8];
+static int ntr_loc, tr_bad;
+static Stmt *tr_nest;
+static const char *tr_rdo[6]; /* the other arrays read in the j loop */
+static int ntr_rdo;
+static bool tr_rd(Expr *e) { /* an expression of the j loop */
+    if (!e || !e->type) return false;
+    switch (e->kind) {
+    case E_NUMBER: return true;
+    case E_IDENT:
+        if (e->type->kind != TY_NUMBER) return false;
+        for (int k = 0; k < ntr_loc; k++) if (strcmp(tr_loc[k], e->cname) == 0) return true;
+        return e->cname && bce_plain_local(e->cname) && !bce_writes(tr_nest, e->cname) && !bce_declares(tr_nest, e->cname);
+    case E_BINARY: return e->type->kind == TY_NUMBER && (e->op == TK_PLUS || e->op == TK_MINUS || e->op == TK_STAR || e->op == TK_SLASH) && tr_rd(e->lhs) && tr_rd(e->rhs);
+    case E_UNARY: return e->op == TK_MINUS && tr_rd(e->lhs);
+    case E_INDEX: {
+        if (e->builtin.cfn || e->type->kind != TY_NUMBER || nlj_set + 2 > 96) return false;
+        bool cj = lj_is(e->rhs, tr_j) || (tr_k && lj_is(e->rhs, tr_k));
+        if (!cj) return false;
+        Expr *b = e->lhs;
+        if (b->kind == E_IDENT) { /* x[j], x[k]: read only in the whole loop */
+            if (!b->cname || !bce_plain_local(b->cname) || !lj_row_num(b->type) || bce_writes(tr_nest, b->cname) || bce_declares(tr_nest, b->cname) ||
+                strcmp(b->cname, tr_a) == 0 || ntr_rdo == 6) return false;
+            bool have = false;
+            for (int k = 0; k < ntr_rdo; k++) have = have || strcmp(tr_rdo[k], b->cname) == 0;
+            if (!have) tr_rdo[ntr_rdo++] = b->cname;
+            lj_set[nlj_set++] = e;
+            return true;
+        }
+        if (b->kind != E_INDEX || b->builtin.cfn || !lj_is(b->lhs, tr_a)) return false;
+        if (!(lj_is(b->rhs, tr_i) || lj_is(b->rhs, tr_j) || (tr_k && lj_is(b->rhs, tr_k)))) return false;
+        lj_set[nlj_set++] = b;
+        lj_set[nlj_set++] = e;
+        return true;
+    }
+    default: return false;
+    }
+}
+static bool tr_assign(Stmt *s) {
+    s = uj_only(s);
+    if (!s || s->kind != S_EXPR || !s->expr || s->expr->kind != E_ASSIGN) return false;
+    Expr *a = s->expr;
+    if (a->op != TK_ASSIGN && a->op != TK_PLUS_ASSIGN && a->op != TK_MINUS_ASSIGN && a->op != TK_STAR_ASSIGN && a->op != TK_SLASH_ASSIGN) return false;
+    if (!a->type || a->type->kind != TY_NUMBER || !tr_rd(a->rhs)) return false;
+    if (a->lhs->kind == E_IDENT) {
+        for (int k = 0; k < ntr_loc; k++) if (strcmp(tr_loc[k], a->lhs->cname) == 0) return true;
+        return false;
+    }
+    Expr *l = a->lhs; /* A[i][j] */
+    if (l->kind != E_INDEX || l->builtin.cfn || !lj_is(l->rhs, tr_j) || !l->lhs || l->lhs->kind != E_INDEX || !lj_is(l->lhs->lhs, tr_a) || !lj_is(l->lhs->rhs, tr_i)) return false;
+    return tr_rd(l);
+}
+/* REST: A read and written only at row i or rows x of loops x < i; the arrays the j loop reads not written */
+static void tr_rest_e(Expr *e, const char **ok, int nok) {
+    if (!e) return;
+    if (e->kind == E_INDEX && e->lhs && e->lhs->kind == E_INDEX && lj_is(e->lhs->lhs, tr_a)) {
+        bool good = lj_is(e->lhs->rhs, tr_i);
+        for (int k = 0; k < nok && !good; k++) good = lj_is(e->lhs->rhs, ok[k]);
+        if (!good) tr_bad = 1;
+    } else if (e->kind == E_IDENT && e->cname && strcmp(e->cname, tr_a) == 0) {
+        /* (A as a base only: checked through its rows above) */
+    }
+    if (e->kind == E_ASSIGN && e->lhs && e->lhs->kind == E_INDEX) {
+        Expr *l = e->lhs;
+        if (l->lhs && l->lhs->kind == E_IDENT) for (int k = 0; k < ntr_rdo; k++) if (strcmp(l->lhs->cname, tr_rdo[k]) == 0) tr_bad = 1;
+        if (!(l->lhs && l->lhs->kind == E_INDEX && lj_is(l->lhs->lhs, tr_a) && lj_is(l->lhs->rhs, tr_i)) && !(l->lhs && l->lhs->kind == E_IDENT)) tr_bad = 1;
+    }
+    if (e->kind == E_CALL || e->kind == E_ARROW || (e->kind == E_MEMBER && e->is_call && !f32_fround_call(e))) tr_bad = 1;
+    tr_rest_e(e->lhs, ok, nok); tr_rest_e(e->rhs, ok, nok);
+    for (int k = 0; k < e->args.len; k++) tr_rest_e(e->args.items[k], ok, nok);
+}
+static void tr_rest_s(Stmt *s, const char **ok, int nok) {
+    if (!s || tr_bad) return;
+    const char *ok2[8];
+    memcpy(ok2, ok, sizeof(char *) * (size_t)nok);
+    if (s->kind == S_FOR && s->for_init && s->for_init->cname && s->cond && s->cond->kind == E_BINARY && s->cond->op == TK_LT && lj_is(s->cond->lhs, s->for_init->cname) &&
+        lj_is(s->cond->rhs, tr_i) && s->for_init->init && bce_pure(s->for_init->init) && nok < 8 && !stmt_writes_name(s->body, s->for_init->cname))
+        ok2[nok++] = s->for_init->cname; /* (x < i: rows before i) */
+    if (s->kind == S_TRY || s->kind == S_YIELD || s->kind == S_RETURN || s->kind == S_BREAK || s->kind == S_CONTINUE) { tr_bad = 1; return; }
+    tr_rest_e(s->init, ok2, nok); tr_rest_e(s->expr, ok2, nok); tr_rest_e(s->cond, ok2, nok); tr_rest_e(s->for_update, ok2, nok);
+    tr_rest_s(s->for_init, ok2, nok); tr_rest_s(s->body, ok2, nok); tr_rest_s(s->else_body, ok2, nok);
+    for (int k = 0; k < s->stmts.len; k++) tr_rest_s(s->stmts.items[k], ok2, nok);
+    if (s->ncases) tr_bad = 1;
+}
+static bool tr_reads_slot(Expr *e, Expr *t) { /* e reads the slot t (syntactically) */
+    if (!e) return false;
+    if (bce_fw_is(e, t)) return true;
+    if (tr_reads_slot(e->lhs, t) || tr_reads_slot(e->rhs, t)) return true;
+    for (int k = 0; k < e->args.len; k++) if (tr_reads_slot(e->args.items[k], t)) return true;
+    return false;
+}
+static bool tr_mentions_s(Stmt *s, const char *n) {
+    if (!s) return false;
+    if (uj_mentions(s->expr, n) || uj_mentions(s->init, n) || uj_mentions(s->cond, n) || uj_mentions(s->for_update, n)) return true;
+    if (tr_mentions_s(s->for_init, n) || tr_mentions_s(s->body, n) || tr_mentions_s(s->else_body, n)) return true;
+    for (int k = 0; k < s->stmts.len; k++) if (tr_mentions_s(s->stmts.items[k], n)) return true;
+    return false;
+}
+static bool tr_emit_loop(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_TRI") || bce_promo_t || bce_fw_loop || nlj_map) return false;
+    Expr *I0, *N;
+    if (!uj_counted(s, &tr_i, &I0, &N) || stmt_writes_name(s->body, tr_i) || !bce_inv(N, s, tr_i) || !bce_names_plain(N) || !bce_inv(I0, s, tr_i)) return false;
+    tr_nest = s;
+    Stmt *st[24];
+    int ns = 0;
+    lj_flat(s->body, st, &ns);
+    if (ns < 1 || ns > 24 || st[0]->kind != S_FOR) return false;
+    Stmt *l1 = st[0];
+    Expr *J0, *JL;
+    if (!uj_counted(l1, &tr_j, &J0, &JL) || !lj_is(JL, tr_i) || !bce_inv(J0, s, tr_i) || !bce_names_plain(J0) || stmt_writes_name(l1->body, tr_j)) return false;
+    Stmt *b1[16];
+    int nb = 0;
+    lj_flat(l1->body, b1, &nb);
+    if (!nb || nb > 16) return false;
+    /* the locals: number names the j loop assigns, each assigned before any read in it */
+    ntr_loc = ntr_rdo = nlj_set = 0;
+    tr_k = NULL;
+    tr_a = NULL;
+    Stmt *kl = NULL;
+    for (int z = 0; z < nb; z++) {
+        Stmt *t = b1[z];
+        if (t->kind == S_FOR) {
+            Expr *K0, *KL;
+            const char *k;
+            if (kl || !uj_counted(t, &k, &K0, &KL) || !lj_is(KL, tr_j) || !bce_inv(K0, s, tr_i) || !bce_names_plain(K0) || stmt_writes_name(t->body, k)) return false;
+            kl = t;
+            tr_k = k;
+            continue;
+        }
+        if (t->kind != S_EXPR || !t->expr || t->expr->kind != E_ASSIGN) return false;
+        Expr *l = t->expr->lhs;
+        if (l->kind == E_IDENT && l->cname && l->type && l->type->kind == TY_NUMBER && t->expr->op == TK_ASSIGN && !uj_mentions(t->expr->rhs, l->cname) &&
+            bce_plain_local(l->cname) && ntr_loc < 8) {
+            bool have = false;
+            for (int k = 0; k < ntr_loc; k++) have = have || strcmp(tr_loc[k], l->cname) == 0;
+            if (!have) { /* (first assigned here: not read before in the j loop) */
+                for (int y = 0; y < z; y++) if (tr_mentions_s(b1[y], l->cname)) return false;
+                tr_loc[ntr_loc++] = l->cname;
+            }
+        }
+        if (!tr_a && l->kind == E_INDEX && l->lhs && l->lhs->kind == E_INDEX && l->lhs->lhs && l->lhs->lhs->kind == E_IDENT) tr_a = l->lhs->lhs->cname;
+    }
+    if (!tr_a) return false;
+    Expr *ab = NULL; /* A, as written */
+    for (int z = 0; z < nb && !ab; z++) if (b1[z]->kind == S_EXPR && b1[z]->expr->lhs->kind == E_INDEX) ab = b1[z]->expr->lhs->lhs->lhs;
+    if (!ab || !ab->type || ab->type->kind != TY_ARRAY || !lj_row_num(ab->type->elem) || !bce_plain_local(tr_a) || bce_writes(s, tr_a) || bce_declares(s, tr_a) ||
+        bce_row_store(s)) return false;
+    for (int z = 0; z < nb; z++) {
+        Stmt *t = b1[z];
+        if (t->kind == S_FOR) {
+            Stmt *kb[16];
+            int nk = 0;
+            lj_flat(t->body, kb, &nk);
+            if (!nk || nk > 16) return false;
+            for (int y = 0; y < nk; y++) if (!tr_assign(kb[y])) return false;
+        } else if (!tr_assign(t)) return false;
+    }
+    if (!kl) return false; /* (a k loop: the work worth lanes) */
+    tr_bad = 0;
+    for (int z = 1; z < ns; z++) tr_rest_s(st[z], NULL, 0);
+    if (tr_bad) return false;
+    for (int k = 0; k < ntr_loc; k++) if (bce_declares(s, tr_loc[k])) return false;
+    int U = 8;
+    const char *ue = getenv("XISTO_TRI_U");
+    if (ue && atoi(ue) >= 2 && atoi(ue) <= 16) U = atoi(ue);
+    int id = lj_ids++;
+    const char *X = ren(tr_a), *rs = lj_rs(ab->type->elem), *Nc = bce_raw(N);
+    bce_blocks_helper_emit();
+    buf_printf(out, "{ int64_t tr%d_ = %s; { int64_t n_ = (int64_t)(%s)->len; bool ok_ = (%s) >= 0 && (%s) >= 0 && (%s) <= n_", id, bce_raw(I0), X, bce_raw(I0), bce_raw(J0), Nc);
+    { Expr *K0, *KL; const char *k; uj_counted(kl, &k, &K0, &KL); buf_printf(out, " && (%s) >= 0", bce_raw(K0)); }
+    buf_puts(out, "; int64_t nb_ = n_");
+    for (int k = 0; k < ntr_rdo; k++) buf_printf(out, " + 1; if (ok_ && (int64_t)(%s)->len < (%s)) ok_ = 0; nb_ = nb_", ren(tr_rdo[k]), Nc);
+    buf_puts(out, " + 1; ");
+    buf_printf(out, "if (ok_) { char **pp_ = malloc((size_t)nb_ * 3 * sizeof(char *)); int64_t k_ = 0; if (!pp_) xs_panic(\"out of memory\"); "
+                    "for (int64_t r_ = 0; r_ < n_; r_++) { %s *p_ = (%s *)(%s)->data[r_]; int64_t l_ = p_ ? (int64_t)p_->len : 0; if (l_ < (%s)) ok_ = 0; "
+                    "if (l_ > 0) { pp_[3 * k_] = (char *)p_->data; pp_[3 * k_ + 1] = (char *)(p_->data + l_); pp_[3 * k_ + 2] = (char *)1; k_++; } } ",
+               rs, rs, X, Nc);
+    for (int k = 0; k < ntr_rdo; k++) {
+        const char *Y = ren(tr_rdo[k]);
+        buf_printf(out, "if ((%s)->len > 0) { pp_[3 * k_] = (char *)(%s)->data; pp_[3 * k_ + 1] = (char *)((%s)->data + (%s)->len); pp_[3 * k_ + 2] = NULL; k_++; } ", Y, Y, Y, Y);
+    }
+    buf_puts(out, "if (ok_) ok_ = xs_blocks_apart_(pp_, k_) > 0; free(pp_); } ");
+    buf_printf(out, "if (ok_) for (; tr%d_ <= (%s) - %d; tr%d_ += %d) { ", id, Nc, U, id, U);
+    /* the lanes' part: j below the first lane's row */
+    const char *saved_from[24], *saved_to[24];
+    int saved_n = nlj_map;
+    memcpy(saved_from, lj_from, sizeof saved_from);
+    memcpy(saved_to, lj_to, sizeof saved_to);
+    char **names = xs_alloc(sizeof(char *) * (size_t)U * (size_t)(ntr_loc + 1));
+    for (int u = 0; u < U; u++) {
+        names[u * (ntr_loc + 1)] = xs_sprintf("(tr%d_ + %d)", id, u);
+        for (int k = 0; k < ntr_loc; k++) {
+            names[u * (ntr_loc + 1) + k + 1] = xs_sprintf("%s_l%d", tr_loc[k], u);
+            buf_printf(out, "double %s = 0.0; ", names[u * (ntr_loc + 1) + k + 1]);
+        }
+    }
+#define TR_LANE(u, all) do { nlj_map = 0; lj_from[nlj_map] = tr_i; lj_to[nlj_map++] = names[(u) * (ntr_loc + 1)]; \
+        if (all) for (int k_ = 0; k_ < ntr_loc; k_++) { lj_from[nlj_map] = tr_loc[k_]; lj_to[nlj_map++] = names[(u) * (ntr_loc + 1) + k_ + 1]; } } while (0)
+    bool saved_on = lj_on;
+    lj_on = true;
+    const char *jn = ren(tr_j);
+    buf_printf(out, "for (int64_t %s = %s; %s < tr%d_; %s++) { ", jn, bce_raw(J0), jn, id, jn);
+    for (int z = 0; z < nb; z++) {
+        Stmt *t = b1[z];
+        if (t->kind == S_FOR) {
+            Expr *K0, *KL;
+            const char *k;
+            uj_counted(t, &k, &K0, &KL);
+            nlj_map = 0;
+            const char *kn = ren(k);
+            Stmt *kb[16];
+            int nk = 0;
+            lj_flat(t->body, kb, &nk);
+            /* T op= f on one slot T = A[i][j] that f does not read: each lane's T in a local through the k loop */
+            Expr *T = NULL;
+            bool reg = !getenv("XISTO_NO_TRI_REG");
+            for (int y = 0; y < nk && reg; y++) {
+                Expr *a2 = uj_only(kb[y])->expr;
+                if (a2->op == TK_ASSIGN || !a2->lhs || a2->lhs->kind != E_INDEX || (T && !bce_fw_is(a2->lhs, T)) || tr_reads_slot(a2->rhs, a2->lhs)) reg = false;
+                else T = a2->lhs;
+            }
+            if (reg && T) {
+                for (int u = 0; u < U; u++) { TR_LANE(u, true); buf_printf(out, "double tt%d_%d_ = ", id, u); emit_expr(T); buf_puts(out, "; "); }
+                buf_printf(out, "for (int64_t %s = %s; %s < %s; %s++) { ", kn, bce_raw(K0), kn, jn, kn);
+                for (int y = 0; y < nk; y++) {
+                    Expr *a2 = uj_only(kb[y])->expr;
+                    const char *op = a2->op == TK_PLUS_ASSIGN ? "+" : a2->op == TK_MINUS_ASSIGN ? "-" : a2->op == TK_STAR_ASSIGN ? "*" : "/";
+                    for (int u = 0; u < U; u++) { TR_LANE(u, true); buf_printf(out, "tt%d_%d_ = tt%d_%d_ %s (", id, u, id, u, op); emit_expr(a2->rhs); buf_puts(out, "); "); }
+                }
+                buf_puts(out, "} ");
+                for (int u = 0; u < U; u++) { TR_LANE(u, true); emit_expr(T); buf_printf(out, " = tt%d_%d_; ", id, u); }
+            } else {
+                buf_printf(out, "for (int64_t %s = %s; %s < %s; %s++) { ", kn, bce_raw(K0), kn, jn, kn);
+                for (int y = 0; y < nk; y++) for (int u = 0; u < U; u++) { TR_LANE(u, true); emit_stmt(uj_only(kb[y])); buf_puts(out, " "); }
+                buf_puts(out, "} ");
+            }
+        } else for (int u = 0; u < U; u++) { TR_LANE(u, true); emit_stmt(t); buf_puts(out, " "); }
+    }
+    buf_puts(out, "} ");
+    lj_on = saved_on;
+    /* each row in order: the rest of its first loop (j from the first lane's row), then REST, with the locals themselves */
+    Stmt *fi = l1->for_init;
+    Stmt fi2 = *fi;
+    Expr from = {0};
+    from.kind = E_IDENT; from.cname = xs_sprintf("tr%d_", id); from.str = from.cname; from.type = J0->type; from.pos = J0->pos; from.field = -1;
+    fi2.init = &from;
+    for (int u = 0; u < U; u++) {
+        TR_LANE(u, false);
+        buf_puts(out, "{ ");
+        l1->for_init = &fi2;
+        emit_stmt(l1);
+        l1->for_init = fi;
+        for (int z = 1; z < ns; z++) { buf_puts(out, " "); emit_stmt(st[z]); }
+        buf_puts(out, " } ");
+    }
+#undef TR_LANE
+    nlj_map = saved_n;
+    memcpy(lj_from, saved_from, sizeof saved_from);
+    memcpy(lj_to, saved_to, sizeof saved_to);
+    buf_puts(out, "} } ");
+    Stmt *si = s->for_init;
+    Stmt si2 = *si;
+    Expr from2 = {0};
+    from2.kind = E_IDENT; from2.cname = xs_sprintf("tr%d_", id); from2.str = from2.cname; from2.type = I0->type; from2.pos = I0->pos; from2.field = -1;
+    si2.init = &from2;
+    s->for_init = &si2;
+    emit_stmt_for_inner_(s);
+    s->for_init = si;
+    buf_puts(out, " }");
+    return true;
+}
 static void emit_stmt_for_inner(Stmt *s) { /* the columns' least row lengths around the outermost loop that keeps them */
     int opened = bce_rect_open(s), memos = rs_memo_open(s);
-    if (!uj_emit_km(s) && !uj_emit_loop(s) && !lj_emit(s) && !sk_emit_loop(s) && !rs_emit_loop(s)) emit_stmt_for_inner_(s);
+    if (!uj_emit_km(s) && !uj_emit_loop(s) && !lj_emit(s) && !sk_emit_loop(s) && !rs_emit_loop(s) && !tr_emit_loop(s)) emit_stmt_for_inner_(s);
     rs_memo_close(memos);
     bce_rect_close(opened);
 }
