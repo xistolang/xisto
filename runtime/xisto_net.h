@@ -760,6 +760,7 @@ static bool xs_tmr_timeout(struct timespec *ts) {
 }
 /* resumes the coroutines whose timers are due; after(co) runs once each is back on the loop */
 static void xs_run_ready(void (*after)(xs_coro *));
+static void xs_task_after(xs_coro *co);
 static void xs_tmr_fire(void (*after)(xs_coro *)) {
     uint64_t now = xs_now();
     while (xs_ntmr && xs_tmrs[0].at <= now) {
@@ -771,7 +772,9 @@ static void xs_tmr_fire(void (*after)(xs_coro *)) {
         xs_coro_resume(co);
         if (after) {
             after(co);
-            xs_run_ready(after); /* (its microtasks and nextTick callbacks before the next timer's, as in Node) */
+            /* the program's loop: its microtasks and nextTick callbacks before the next timer's, as in Node. The HTTP
+               server's loop (after = xs_coro_after) keeps its order: ready tasks at the top of the loop, as before */
+            if (after == xs_task_after) xs_run_ready(after);
         }
         now = xs_now();
     }
