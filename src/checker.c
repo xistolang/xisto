@@ -558,6 +558,227 @@ static void int_arg(Expr **slot, const char *what) {
     check_expr(*slot, ty_int);
     expect_type(*slot, ty_int, what);
 }
+/* an offset of the Buffer API: an int, or a number that must hold one (Node's "It must be an integer") */
+static void buf_off_arg(Expr **slot, const char *what) {
+    check_expr(*slot, ty_int);
+    if ((*slot)->type->kind == TY_NUMBER) {
+        Expr *a = *slot, *c = xs_alloc(sizeof *c);
+        c->kind = E_CALL; c->pos = a->pos; c->field = -1; c->type = ty_int;
+        c->builtin.cfn = "xs_buf_num_offset";
+        expr_list_push(&c->args, a);
+        *slot = c;
+        return;
+    }
+    expect_type(*slot, ty_int, what);
+}
+static void buf_str_arg(Expr **slot, const char *what) {
+    check_expr(*slot, ty_string);
+    expect_type(*slot, ty_string, what);
+}
+/* readUInt16LE, writeBigInt64BE, readUintLE, writeDoubleLE ...: kind 'i' (1 to 4 bytes), 'v' (byteLength given),
+   'f' (float), 'd' (double), 'b' (bigint); flags XS_BUF_BE, XS_BUF_SIGNED of the runtime */
+static bool buf_rw_name(const char *m, bool *write, char *kind, int *size, int *flags) {
+    const char *r;
+    if (strncmp(m, "read", 4) == 0) { *write = false; r = m + 4; }
+    else if (strncmp(m, "write", 5) == 0) { *write = true; r = m + 5; }
+    else return false;
+    bool big = strncmp(r, "Big", 3) == 0;
+    if (big) r += 3;
+    *flags = 0;
+    if (!big && strncmp(r, "Float", 5) == 0) { *kind = 'f'; *size = 4; r += 5; }
+    else if (!big && strncmp(r, "Double", 6) == 0) { *kind = 'd'; *size = 8; r += 6; }
+    else {
+        if (strncmp(r, "UInt", 4) == 0 || strncmp(r, "Uint", 4) == 0) r += 4;
+        else if (strncmp(r, "Int", 3) == 0) { r += 3; *flags |= 2; }
+        else return false;
+        int bits = 0;
+        while (*r >= '0' && *r <= '9') bits = bits * 10 + (*r++ - '0');
+        if (big) { if (bits != 64) return false; *kind = 'b'; *size = 8; }
+        else if (bits == 0) { *kind = 'v'; *size = 0; }
+        else if (bits == 8 || bits == 16 || bits == 32) { *kind = 'i'; *size = bits / 8; }
+        else return false;
+        if (*size == 1) return *r == 0; /* (readUInt8: no byte order) */
+    }
+    if (strcmp(r, "BE") == 0) *flags |= 1;
+    else if (strcmp(r, "LE") != 0) return false;
+    return true;
+}
+/* Node's methods of Buffer that a Uint8Array does not have, or has otherwise (runtime/xisto_rt.h, "Buffer: the rest of
+   Node's API"); false: the method is Uint8Array's (check_bytes_member goes on) */
+static bool check_buf_method(Expr *e, Class *c) {
+    const char *m = e->str;
+    int n = e->args.len;
+    Pos pos = e->pos;
+    #define BARGS(lo, hi) do { if (n < (lo) || n > (hi)) xs_error(XS8039, pos, NULL, "Buffer.%s takes %d to %d argument(s), got %d", m, (lo), (hi), n); } while (0)
+    #define BPAD(k) do { for (int k_ = e->args.len; k_ <= (k); k_++) expr_list_push(&e->args, num_lit(pos, (double)XS_NOT_GIVEN, true)); } while (0)
+    #define TYPE_OF(k) (check_expr(e->args.items[k], NULL), e->args.items[k]->type)
+    bool write;
+    char kind;
+    int size, flags;
+    if (buf_rw_name(m, &write, &kind, &size, &flags)) {
+        Class *big = find_class("bigint");
+        if (!write) {
+            BARGS(kind == 'v' ? 2 : 0, kind == 'v' ? 2 : 1);
+            if (n >= 1) buf_off_arg(&e->args.items[0], "the offset"); else expr_list_push(&e->args, num_lit(pos, 0, true));
+            if (kind == 'v') int_arg(&e->args.items[1], "the byteLength");
+            if (kind == 'i') expr_list_push(&e->args, num_lit(pos, size, true));
+            expr_list_push(&e->args, num_lit(pos, flags, true));
+            e->builtin.cfn = kind == 'i' ? "xs_buf_read_int" : kind == 'v' ? "xs_buf_read_var" : kind == 'f' ? "xs_buf_read_f32" : kind == 'd' ? "xs_buf_read_f64" : "xs_buf_read_big";
+            e->type = kind == 'f' || kind == 'd' ? ty_number : kind == 'b' ? ty_object_of(big) : ty_int;
+            return true;
+        }
+        BARGS(kind == 'v' ? 3 : 1, kind == 'v' ? 3 : 2);
+        if (kind == 'b') {
+            check_expr(e->args.items[0], ty_object_of(big));
+            expect_type(e->args.items[0], ty_object_of(big), "the value");
+        } else date_num_arg(&e->args.items[0], "the value");
+        if (n >= 2) buf_off_arg(&e->args.items[1], "the offset"); else expr_list_push(&e->args, num_lit(pos, 0, true));
+        if (kind == 'v') int_arg(&e->args.items[2], "the byteLength");
+        if (kind == 'i') expr_list_push(&e->args, num_lit(pos, size, true));
+        expr_list_push(&e->args, num_lit(pos, flags, true));
+        e->builtin.cfn = kind == 'i' ? "xs_buf_write_int" : kind == 'v' ? "xs_buf_write_var" : kind == 'f' ? "xs_buf_write_f32" : kind == 'd' ? "xs_buf_write_f64" : "xs_buf_write_big";
+        e->type = ty_int;
+        return true;
+    }
+    if (strcmp(m, "compare") == 0) { /* buf.compare(target, targetStart, targetEnd, sourceStart, sourceEnd) */
+        BARGS(1, 5);
+        if (!is_bytes(TYPE_OF(0))) xs_error(XS7052, e->args.items[0]->pos, NULL, "compare compares with a Buffer or Uint8Array");
+        for (int k = 1; k < n; k++) buf_off_arg(&e->args.items[k], "argument of compare");
+        if (n > 1) BPAD(4);
+        e->builtin.cfn = n == 1 ? "xs_buf_compare" : "xs_buf_compare_range";
+        e->type = ty_int;
+        return true;
+    }
+    if (strcmp(m, "copy") == 0) { /* buf.copy(target, targetStart, sourceStart, sourceEnd): the bytes copied */
+        BARGS(1, 4);
+        if (!is_bytes(TYPE_OF(0))) xs_error(XS7052, e->args.items[0]->pos, NULL, "copy copies into a Buffer or Uint8Array");
+        for (int k = 1; k < n; k++) buf_off_arg(&e->args.items[k], "argument of copy");
+        BPAD(3);
+        e->builtin.cfn = "xs_buf_copy";
+        e->type = ty_int;
+        return true;
+    }
+    if (strcmp(m, "swap16") == 0 || strcmp(m, "swap32") == 0 || strcmp(m, "swap64") == 0) {
+        BARGS(0, 0);
+        expr_list_push(&e->args, num_lit(pos, m[4] == '1' ? 2 : m[4] == '3' ? 4 : 8, true));
+        e->builtin.cfn = "xs_buf_swap";
+        e->type = ty_object_of(c);
+        return true;
+    }
+    if (strcmp(m, "toJSON") == 0) { /* { type: "Buffer", data: [...bytes] } */
+        BARGS(0, 0);
+        Expr *data = xs_alloc(sizeof *data);
+        data->kind = E_CALL; data->pos = pos; data->field = -1; data->type = ty_array_of(ty_int); data->prechecked = true;
+        data->builtin.cfn = "xs_u8_to_ints";
+        expr_list_push(&data->args, e->lhs);
+        memset(e, 0, sizeof *e);
+        e->kind = E_OBJLIT; e->pos = pos; e->field = -1;
+        e->keys = xs_alloc(sizeof(char *) * 2);
+        e->keys[0] = "type"; e->keys[1] = "data";
+        expr_list_push(&e->args, str_lit(pos, "Buffer"));
+        expr_list_push(&e->args, data);
+        check_expr(e, NULL);
+        return true;
+    }
+    if (strcmp(m, "values") == 0 || strcmp(m, "keys") == 0 || strcmp(m, "entries") == 0) {
+        /* arrays (Node: iterators), for for..of and spreading: the bytes, the indexes, [index, byte] pairs */
+        BARGS(0, 0);
+        if (m[0] == 'k') { e->builtin.cfn = "xs_buf_keys"; e->type = ty_array_of(ty_int); return true; }
+        e->builtin.cfn = "xs_u8_to_ints";
+        e->type = ty_array_of(ty_int);
+        if (m[0] == 'v') return true;
+        Expr *in = xs_alloc(sizeof *in); /* entries: buf.values().entries() */
+        in->kind = E_CALL; in->pos = pos; in->field = -1; in->type = ty_array_of(ty_int); in->prechecked = true;
+        in->builtin.cfn = "xs_u8_to_ints";
+        expr_list_push(&in->args, e->lhs);
+        memset(e, 0, sizeof *e);
+        e->kind = E_MEMBER; e->pos = pos; e->field = -1; e->lhs = in; e->str = "entries"; e->is_call = true;
+        check_expr(e, NULL);
+        return true;
+    }
+    if (strcmp(m, "write") == 0) { /* buf.write(string, offset?, length?, encoding?): the bytes written */
+        BARGS(1, 4);
+        buf_str_arg(&e->args.items[0], "the string");
+        Expr *s = e->args.items[0], *off = NULL, *len = NULL, *enc = NULL;
+        for (int k = 1; k < n; k++) {
+            Type *t = TYPE_OF(k);
+            if (t->kind == TY_STRING || (t->kind == TY_NULLABLE && t->elem->kind == TY_STRING)) {
+                if (k != n - 1) xs_error(XS8039, e->args.items[k]->pos, "buf.write(string, offset, length, encoding)", "the encoding is the last argument of write");
+                enc = e->args.items[k];
+            } else if (!off) { buf_off_arg(&e->args.items[k], "the offset"); off = e->args.items[k]; }
+            else if (!len) { buf_off_arg(&e->args.items[k], "the length"); len = e->args.items[k]; }
+            else xs_error(XS8039, e->args.items[k]->pos, NULL, "write takes a string, an offset, a length and an encoding");
+        }
+        e->args.len = 0;
+        expr_list_push(&e->args, s);
+        expr_list_push(&e->args, off ? off : num_lit(pos, (double)XS_NOT_GIVEN, true));
+        expr_list_push(&e->args, len ? len : num_lit(pos, (double)XS_NOT_GIVEN, true));
+        expr_list_push(&e->args, enc ? enc : null_str(pos));
+        e->builtin.cfn = "xs_buf_write_str";
+        e->type = ty_int;
+        return true;
+    }
+    if (strcmp(m, "fill") == 0) { /* buf.fill(value, offset?, end?, encoding?) as Node: offsets checked, not relative */
+        BARGS(1, 4);
+        Type *vt = TYPE_OF(0);
+        bool str = vt->kind == TY_STRING, bytes = is_bytes(vt);
+        if (!str && !bytes && n == 1 && (vt->kind == TY_INT || vt->kind == TY_LITINT)) return false; /* (the whole buffer: Uint8Array's fill) */
+        Expr *v = e->args.items[0], *off = NULL, *end = NULL, *enc = NULL;
+        for (int k = 1; k < n; k++) {
+            Type *t = TYPE_OF(k);
+            if (t->kind == TY_STRING || (t->kind == TY_NULLABLE && t->elem->kind == TY_STRING)) {
+                if (k != n - 1) xs_error(XS8039, e->args.items[k]->pos, "buf.fill(value, offset, end, encoding)", "the encoding is the last argument of fill");
+                enc = e->args.items[k];
+            } else if (!off) { buf_off_arg(&e->args.items[k], "the offset"); off = e->args.items[k]; }
+            else if (!end) { buf_off_arg(&e->args.items[k], "the end"); end = e->args.items[k]; }
+            else xs_error(XS8039, e->args.items[k]->pos, NULL, "fill takes a value, an offset, an end and an encoding");
+        }
+        if (!str && !bytes) date_num_arg(&v, "the value of fill");
+        e->args.len = 0;
+        expr_list_push(&e->args, v);
+        expr_list_push(&e->args, off ? off : num_lit(pos, (double)XS_NOT_GIVEN, true));
+        expr_list_push(&e->args, end ? end : num_lit(pos, (double)XS_NOT_GIVEN, true));
+        if (str) expr_list_push(&e->args, enc ? enc : null_str(pos));
+        e->builtin.cfn = str ? "xs_buf_fill_str" : bytes ? "xs_buf_fill_bytes" : "xs_buf_fill_num";
+        e->type = ty_object_of(c);
+        return true;
+    }
+    if (strcmp(m, "indexOf") == 0 || strcmp(m, "lastIndexOf") == 0 || strcmp(m, "includes") == 0) {
+        /* indexOf(value, byteOffset?, encoding?): value a string, bytes or a byte (its low 8 bits, as Node) */
+        BARGS(1, 3);
+        bool fwd = m[0] != 'l', has = strcmp(m, "includes") == 0;
+        Type *vt = TYPE_OF(0);
+        Expr *v = e->args.items[0], *off = NULL, *enc = NULL;
+        for (int k = 1; k < n; k++) {
+            Type *t = TYPE_OF(k);
+            if (t->kind == TY_STRING || (t->kind == TY_NULLABLE && t->elem->kind == TY_STRING)) {
+                if (k != n - 1) xs_error(XS8039, e->args.items[k]->pos, NULL, "the encoding is the last argument of %s", m);
+                enc = e->args.items[k];
+            } else if (!off) { int_arg(&e->args.items[k], xs_sprintf("the byteOffset of %s", m)); off = e->args.items[k]; }
+            else xs_error(XS8039, e->args.items[k]->pos, NULL, "%s takes a value, a byteOffset and an encoding", m);
+        }
+        bool str = vt->kind == TY_STRING, bytes = is_bytes(vt);
+        bool byte_lit = v->kind == E_NUMBER && v->is_int_lit && v->ival >= 0 && v->ival <= 255;
+        /* (Uint8Array's and the earlier Buffer forms stay: indexOf(string | byte, offset), includes(string | byte)) */
+        if (!enc && !bytes && fwd && (str || byte_lit) && (!has || !off)) return false;
+        if (!enc && !bytes && !fwd && byte_lit) return false;
+        if (!str && !bytes) int_arg(&e->args.items[0], xs_sprintf("the value of %s", m));
+        v = e->args.items[0];
+        e->args.len = 0;
+        expr_list_push(&e->args, v);
+        expr_list_push(&e->args, off ? off : num_lit(pos, (double)XS_NOT_GIVEN, true));
+        if (str || bytes) expr_list_push(&e->args, enc ? enc : null_str(pos));
+        expr_list_push(&e->args, num_lit(pos, fwd, true));
+        e->builtin.cfn = str ? (has ? "xs_buf_has_str" : "xs_buf_index_str") : bytes ? (has ? "xs_buf_has_bytes" : "xs_buf_index_bytes")
+                       : has ? "xs_buf_has_num" : "xs_buf_index_num";
+        e->type = has ? ty_boolean : ty_int;
+        return true;
+    }
+    #undef BARGS
+    #undef BPAD
+    #undef TYPE_OF
+    return false;
+}
 /* b.slice(1, -1), b.set(src, 4), buf.toString("base64") ... */
 static void check_bytes_member(Expr *e, Class *c) {
     const char *m = e->str;
@@ -567,6 +788,7 @@ static void check_bytes_member(Expr *e, Class *c) {
     e->field = -1;
     #define ARGS(lo, hi) do { if (n < (lo) || n > (hi)) xs_error(XS8039, e->pos, NULL, "%s.%s takes %d to %d argument(s), got %d", c->name, m, (lo), (hi), n); } while (0)
     #define PAD_INT(k, v) do { for (int k_ = e->args.len; k_ <= (k); k_++) expr_list_push(&e->args, num_lit(e->pos, (double)(v), true)); } while (0)
+    if (is_buf && e->is_call && check_buf_method(e, c)) return;
     if (!e->is_call) {
         if (strcmp(m, "length") == 0 || strcmp(m, "byteLength") == 0) { e->field = 0; e->type = ty_int; return; }
         if (strcmp(m, "byteOffset") == 0) { e->builtin.cfn = "xs_u8_byte_offset"; e->type = ty_int; return; } /* (into the SharedArrayBuffer or the array it is a view on) */
@@ -761,6 +983,7 @@ static void check_bytes_static(Expr *e, const char *ns) {
     bool is_buf = strcmp(ns, "Buffer") == 0;
     Class *u8 = find_class("Uint8Array"), *bc = find_class(is_buf ? "Buffer" : "Uint8Array");
     int n = e->args.len;
+    if (is_buf && !e->is_call && strcmp(m, "poolSize") == 0) { *e = *num_lit(e->pos, 65536, true); return; } /* (Node 26's; a constant here) */
     if (!e->is_call) xs_error(XS8037, e->pos, NULL, "%s.%s is not a value", ns, m);
     e->type = ty_object_of(bc);
     if (strcmp(m, "from") == 0) {
@@ -809,10 +1032,10 @@ static void check_bytes_static(Expr *e, const char *ns) {
         if (n != 1) xs_error(XS8042, e->pos, NULL, "%s.from(bytes) takes one argument", ns);
         if (is_bytes(st)) { e->builtin.cfn = is_buf ? "xs_buf_from_bytes" : "xs_u8_copy"; return; }
         if (st->kind == TY_ARRAY && (st->elem->kind == TY_INT || st->elem->kind == TY_LITINT)) { e->builtin.cfn = is_buf ? "xs_buf_from_ints" : "xs_u8_from_ints"; return; }
-        if (!is_buf && st->kind == TY_ARRAY && st->elem->kind == TY_NUMBER) { e->builtin.cfn = "xs_u8_from_nums"; return; }
+        if (st->kind == TY_ARRAY && st->elem->kind == TY_NUMBER) { e->builtin.cfn = is_buf ? "xs_buf_from_nums" : "xs_u8_from_nums"; return; }
         xs_error(XS8040, e->args.items[0]->pos, NULL, "%s.from takes %s, not %s", ns, is_buf ? "a string, bytes or an int[]" : "bytes, an int[] or a number[]", ty_name(st));
     }
-    if (!is_buf && strcmp(m, "of") == 0) { /* Uint8Array.of(1, 2, 3): from an array literal */
+    if (strcmp(m, "of") == 0) { /* Uint8Array.of(1, 2, 3), Buffer.of(...): from an array literal */
         Expr *lit = xs_alloc(sizeof *lit);
         lit->kind = E_ARRAY_LIT; lit->pos = e->pos; lit->field = -1;
         lit->args = e->args;
@@ -820,7 +1043,7 @@ static void check_bytes_static(Expr *e, const char *ns) {
         expect_type(lit, ty_array_of(ty_int), "the values of Uint8Array.of");
         memset(&e->args, 0, sizeof e->args);
         expr_list_push(&e->args, lit);
-        e->builtin.cfn = "xs_u8_from_ints";
+        e->builtin.cfn = is_buf ? "xs_buf_from_ints" : "xs_u8_from_ints";
         return;
     }
     if (!is_buf && (strcmp(m, "fromBase64") == 0 || strcmp(m, "fromHex") == 0)) {
@@ -830,6 +1053,20 @@ static void check_bytes_static(Expr *e, const char *ns) {
         e->builtin.cfn = m[4] == 'B' ? "xs_u8_from_base64" : "xs_u8_from_hex";
         return;
     }
+    if (is_buf && strcmp(m, "alloc") == 0 && (n == 2 || n == 3)) { /* Buffer.alloc(size, string, encoding?) / (size, bytes) */
+        check_expr(e->args.items[1], NULL);
+        Type *ft = e->args.items[1]->type;
+        if (ft->kind == TY_STRING || is_bytes(ft)) {
+            int_arg(&e->args.items[0], "the size of Buffer.alloc");
+            if (ft->kind == TY_STRING) {
+                if (n == 3) buf_str_arg(&e->args.items[2], "the encoding of Buffer.alloc");
+                else expr_list_push(&e->args, null_str(e->pos));
+            } else if (n == 3) xs_error(XS7004, e->pos, NULL, "Buffer.alloc takes an encoding only with a string");
+            e->builtin.cfn = ft->kind == TY_STRING ? "xs_buf_alloc_str" : "xs_buf_alloc_bytes";
+            return;
+        }
+    }
+    if (is_buf && strcmp(m, "allocUnsafeSlow") == 0) m = "allocUnsafe";
     if (is_buf && (strcmp(m, "alloc") == 0 || strcmp(m, "allocUnsafe") == 0)) {
         if (n < 1 || n > (m[5] == 'U' ? 1 : 2)) xs_error(XS7004, e->pos, NULL, "Buffer.%s takes a size%s", m, m[5] == 'U' ? "" : " and an optional fill byte");
         for (int k = 0; k < n; k++) int_arg(&e->args.items[k], xs_sprintf("argument of Buffer.%s", m));
@@ -838,6 +1075,14 @@ static void check_bytes_static(Expr *e, const char *ns) {
         return;
     }
     if (is_buf && strcmp(m, "concat") == 0) {
+        if (n == 2) { /* Buffer.concat(list, totalLength) */
+            check_expr(e->args.items[0], ty_array_of(ty_object_of(bc)));
+            Type *lt = e->args.items[0]->type;
+            if (lt->kind != TY_ARRAY || !is_bytes(lt->elem)) xs_error(XS7006, e->args.items[0]->pos, NULL, "Buffer.concat takes Buffer[] or Uint8Array[], not %s", ty_name(lt));
+            buf_off_arg(&e->args.items[1], "the totalLength of Buffer.concat");
+            e->builtin.cfn = "xs_buf_concat_n";
+            return;
+        }
         if (n != 1) xs_error(XS7007, e->pos, NULL, "Buffer.concat takes a list of buffers");
         check_expr(e->args.items[0], ty_array_of(ty_object_of(bc)));
         Type *lt = e->args.items[0]->type;
@@ -845,7 +1090,40 @@ static void check_bytes_static(Expr *e, const char *ns) {
         e->builtin.cfn = "xs_buf_concat";
         return;
     }
+    if (is_buf && strcmp(m, "compare") == 0 && n == 2) { /* Buffer.compare(a, b): -1, 0 or 1 */
+        for (int k = 0; k < 2; k++) {
+            check_expr(e->args.items[k], NULL);
+            if (!is_bytes(e->args.items[k]->type)) xs_error(XS7052, e->args.items[k]->pos, NULL, "Buffer.compare compares Buffers or Uint8Arrays, not %s", ty_name(e->args.items[k]->type));
+        }
+        e->builtin.cfn = "xs_buf_compare";
+        e->type = ty_int;
+        return;
+    }
+    if (is_buf && strcmp(m, "isEncoding") == 0 && n == 1) {
+        buf_str_arg(&e->args.items[0], "the encoding");
+        e->builtin.cfn = "xs_buf_is_encoding";
+        e->type = ty_boolean;
+        return;
+    }
     if (is_buf && strcmp(m, "byteLength") == 0) {
+        if (n >= 1) { /* Buffer.byteLength(bytes): its length */
+            check_expr(e->args.items[0], ty_string);
+            e->args.items[0]->prechecked = true;
+            if (is_bytes(e->args.items[0]->type) && n == 1) {
+                Expr *b = e->args.items[0];
+                memset(e, 0, sizeof *e);
+                e->kind = E_MEMBER; e->pos = b->pos; e->field = -1; e->lhs = b; e->str = "length";
+                check_expr(e, NULL);
+                return;
+            }
+        }
+        if (n == 2 && e->args.items[1]->kind != E_STRING) { /* an encoding known at run time */
+            expect_type(e->args.items[0], ty_string, "argument of Buffer.byteLength");
+            buf_str_arg(&e->args.items[1], "the encoding");
+            e->builtin.cfn = "xs_buf_byte_length_enc";
+            e->type = ty_int;
+            return;
+        }
         if (n == 2 && e->args.items[1]->kind == E_STRING) { /* Buffer.byteLength(s, enc) */
             const char *enc = e->args.items[1]->str;
             if (!strcmp(enc, "latin1") || !strcmp(enc, "binary") || !strcmp(enc, "ascii")) { /* one byte per UTF-16 unit: s.length */
@@ -856,12 +1134,25 @@ static void check_bytes_static(Expr *e, const char *ns) {
                 return;
             }
             if (!strcmp(enc, "utf8") || !strcmp(enc, "utf-8")) { e->args.len = 1; n = 1; }
+            else { /* hex, base64, ucs2 ...: counted at run time */
+                expect_type(e->args.items[0], ty_string, "argument of Buffer.byteLength");
+                check_expr(e->args.items[1], ty_string);
+                e->builtin.cfn = "xs_buf_byte_length_enc";
+                e->type = ty_int;
+                return;
+            }
         }
         if (n != 1) xs_error(XS7005, e->pos, NULL, "Buffer.byteLength takes one string");
         check_expr(e->args.items[0], ty_string);
         expect_type(e->args.items[0], ty_string, "argument of Buffer.byteLength");
         e->builtin.cfn = "xs_buf_byte_length";
         e->type = ty_int;
+        return;
+    }
+    if (is_buf && strcmp(m, "isBuffer") == 0 && n == 1 && (check_expr(e->args.items[0], NULL), e->args.items[0]->prechecked = true, is_bytes(e->args.items[0]->type))) {
+        /* of a Uint8Array or Buffer known as such: whether it is a Buffer, at run time (both are one C type) */
+        e->builtin.cfn = "xs_buf_is_buffer";
+        e->type = ty_boolean;
         return;
     }
     if (is_buf && strcmp(m, "isBuffer") == 0 && n == 1) { /* Buffer.isBuffer(v): v instanceof Buffer (TK_IDENT: the instanceof operator) */
@@ -874,7 +1165,7 @@ static void check_bytes_static(Expr *e, const char *ns) {
         return;
     }
     (void)u8;
-    xs_error(XS7105, e->pos, is_buf ? "supported: Buffer.from, alloc, allocUnsafe, concat, byteLength" : "supported: Uint8Array.from, of, fromBase64, fromHex", "unknown %s member '%s'", ns, m);
+    xs_error(XS7105, e->pos, is_buf ? "supported: Buffer.from, of, alloc, allocUnsafe, allocUnsafeSlow, concat, compare, isBuffer, isEncoding, byteLength" : "supported: Uint8Array.from, of, fromBase64, fromHex", "unknown %s member '%s'", ns, m);
 }
 static Type *tuple_type(Type **ps, int n, Pos pos);
 static void check_stmt(Stmt *s);
@@ -9578,6 +9869,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     e->builtin.cfn = "xs_dyn_str"; xs_any_used = true;
                 }
                 else if (a->type->kind == TY_OBJECT && a->type->cls->builtin && strcmp(a->type->cls->name, "symbol") == 0) e->builtin.cfn = "xs_Symbol_to_string";
+                else if (is_bytes(a->type)) e->builtin.cfn = "xs_u8_to_string"; /* (a Buffer: its UTF-8 text; a Uint8Array: "1,2,3") */
                 else if (tostring_call(a)) { *e = *a; return; }
                 else xs_error(XS7040, a->pos, NULL, "String() converts int, number or boolean, but this is %s", ty_name(a->type));
                 e->type = ty_string;
@@ -10746,6 +11038,11 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (e->str[0] == 'i') { /* the type says it */
                     bool arr = st->kind == TY_ARRAY;
                     e->kind = E_BOOL; e->boolean = arr; e->type = ty_boolean; e->lhs = NULL; e->args.len = 0; e->field = -1;
+                    return;
+                }
+                if (is_bytes(st)) { /* Array.from(bytes): the bytes as ints */
+                    e->kind = E_CALL; e->lhs = NULL; e->field = -1; e->type = ty_array_of(ty_int);
+                    e->builtin.cfn = "xs_u8_to_ints";
                     return;
                 }
                 /* a copy of an array; a Set's values or a Map's entries (already arrays of their own) */
@@ -13073,6 +13370,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     continue;
                 }
             }
+            if (is_bytes(part->type)) { wrap_call(part, "xs_u8_to_string", ty_string); continue; } /* `${buf}`: its text */
             if (k == TY_OBJECT && tostring_call(part)) continue;
             if (k != TY_STRING && k != TY_INT && k != TY_NUMBER && k != TY_BOOLEAN && k != TY_ENUM)
                 xs_error(XS8098, part->pos, "template literals take strings, numbers, ints, booleans and enums; call a method that returns a string for the rest", "cannot put a %s inside a template literal", ty_name(part->type));
@@ -17236,6 +17534,8 @@ void check_program(Program *p) {
                 SYM_EACH(enums_by_name, name, e) if (((Enum *)e->decl)->mod == im->from) found = found || ((Enum *)e->decl)->exported;
                 if (!found && strcmp(im->from->file, "xisto:worker_threads") == 0 && (strcmp(name, "Worker") == 0 || strcmp(name, "MessagePort") == 0))
                     found = true; /* built-in classes */
+                if (!found && strcmp(im->from->file, "xisto:buffer") == 0 && strcmp(name, "Buffer") == 0)
+                    found = true; /* the built-in Buffer (node:buffer exports it; it is a global too) */
                 if (!found && im->from->builtin && strcmp(im->from->file, "perf_hooks") == 0 && strcmp(name, "performance") == 0)
                     found = true; /* the built-in performance */
                 if (!found && im->from->builtin && strcmp(im->from->file, "sqlite") == 0)
