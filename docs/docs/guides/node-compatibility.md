@@ -110,7 +110,10 @@ Supported:
   encoding?)`) and one-shot `sign`/`verify`, with RSA PKCS#1 v1.5, RSA-PSS (`padding:
   constants.RSA_PKCS1_PSS_PADDING`, `saltLength`) and ECDSA (`dsaEncoding: "der"` or `"ieee-p1363"`); keys as
   PEM text, `KeyObject` or `{ key, ... }`;
-- `publicEncrypt` (RSA PKCS#1 v1.5 and OAEP) and `constants`.
+- `publicEncrypt` (RSA PKCS#1 v1.5 and OAEP) and `constants`;
+- `webcrypto` / `subtle`: `digest` (SHA-1/256/384/512), HMAC keys (`importKey` from `raw` or a `jwk` of kty
+  `oct`, `exportKey("raw")`), `sign` and `verify`, as `jose`-style code uses them; `webcrypto.getRandomValues` and
+  `randomUUID`.
 
 Byte for byte with Node (tested): hashes and HMACs, every cipher with a fixed key and IV (and GCM's tags),
 pbkdf2/scrypt/hkdf, RSA PKCS#1 v1.5 signatures, PEM/DER/JWK of a key read and written back, and the error
@@ -123,7 +126,8 @@ Differences from Node:
   `sign(key)` and `export({ format: "der" })` give a `Buffer`; with an output encoding (or `format: "pem"`) text;
   `export({ format: "jwk" })` a `JsonWebKey`. The options must be an object literal at the call for `export` and
   for `generateKeyPairSync`'s encodings to decide the type;
-- `hkdfSync` returns a `Buffer` (Node: an `ArrayBuffer`; `Buffer.from(result)` works with both);
+- `hkdfSync` and `subtle`'s `digest`, `sign` and `exportKey` give a `Buffer` (Node: an `ArrayBuffer`;
+  `Buffer.from(result)` works with both);
 - the async forms (`pbkdf2`, `scrypt`, `hkdf`) compute at once and call back on a later turn of the event loop;
   on an error the result is an empty `Buffer`;
 - errors are `Error`s with Node's `code` and `name` (`TypeError`, `RangeError`), not instances of those classes;
@@ -132,7 +136,8 @@ Differences from Node:
 - missing: Ed25519/Ed448/X25519 keys, DSA and DH, encrypted private keys (`passphrase`), keys from
   certificates, `privateDecrypt`/`privateEncrypt`/`publicDecrypt`, `createECDH`/`diffieHellman`, other
   ciphers (`chacha20-poly1305`, `aes-*-ccm`, `-ocb`, `-cfb`...), `Cipher`/`Hash` as streams (`pipe`), the async
-  `generateKeyPair`, `X509Certificate`, and `webcrypto`/`subtle`.
+  `generateKeyPair`, `X509Certificate`, and `subtle` beyond HMAC and digests (RSA, ECDSA, AES keys, `deriveBits`,
+  `exportKey("jwk")`).
 
 ## npm packages
 

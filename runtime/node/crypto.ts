@@ -1431,3 +1431,125 @@ export function publicEncrypt(key: PublicKeyInput | string | KeyObject, data: Ui
   }
   return Buffer.from(fromBig(modPow(toBig(em), e, n), size));
 }
+
+// ---- webcrypto.subtle: digests and HMAC keys ----
+
+/** An algorithm by name: { name: "SHA-256" }. */
+export class AlgorithmIdentifier {
+  name: string;
+}
+
+/** The algorithm of importKey/sign/verify: { name: "HMAC", hash: "SHA-256" | { name: "SHA-256" }, length? }. */
+export class SubtleAlgorithm {
+  name: string;
+  hash?: string | AlgorithmIdentifier;
+  length?: int;
+}
+
+/** A CryptoKey's algorithm: HMAC, its hash and its length in bits. */
+export class KeyAlgorithm {
+  name: string;
+  hash: AlgorithmIdentifier;
+  length: int;
+  constructor(name: string, hash: string, length: int) {
+    this.name = name;
+    this.hash = { name: hash };
+    this.length = length;
+  }
+}
+
+/** A key of webcrypto (HMAC secret keys). */
+export class CryptoKey {
+  readonly type: string = "secret";
+  readonly extractable: boolean;
+  readonly algorithm: KeyAlgorithm;
+  readonly usages: string[];
+  readonly bytes: Uint8Array;
+  constructor(algorithm: KeyAlgorithm, extractable: boolean, usages: string[], bytes: Uint8Array) {
+    this.algorithm = algorithm;
+    this.extractable = extractable;
+    this.usages = usages;
+    this.bytes = bytes;
+  }
+}
+
+function subtleError(message: string, name: string): CryptoError {
+  return new CryptoError(message, name === "NotSupportedError" ? "ERR_CRYPTO_UNSUPPORTED" : "ERR_CRYPTO_INVALID", name);
+}
+
+// "SHA-256" (or { name: "SHA-256" }) -> sha256
+function subtleHash(a: string | AlgorithmIdentifier | null): string {
+  if (a === null) throw subtleError("Unrecognized algorithm name", "NotSupportedError");
+  const name = typeof a === "string" ? (a as string) : (a as AlgorithmIdentifier).name;
+  const n = name.toUpperCase();
+  if (n === "SHA-1") return "sha1";
+  if (n === "SHA-256") return "sha256";
+  if (n === "SHA-384") return "sha384";
+  if (n === "SHA-512") return "sha512";
+  throw subtleError("Unrecognized algorithm name", "NotSupportedError");
+}
+function hashTitle(digest: string): string {
+  return "SHA-" + digest.slice(3);
+}
+function subtleAlg(a: string | SubtleAlgorithm): SubtleAlgorithm {
+  if (typeof a === "string") return { name: a as string };
+  return a as SubtleAlgorithm;
+}
+
+/** webcrypto's SubtleCrypto: digest, and HMAC (importKey raw/jwk, exportKey raw/jwk, sign, verify). */
+export class SubtleCrypto {
+  /** The digest of data: SHA-1, SHA-256, SHA-384 or SHA-512 (Node resolves to an ArrayBuffer; xisto to a Buffer). */
+  async digest(algorithm: string | AlgorithmIdentifier, data: Uint8Array): Promise<Buffer> {
+    return crypto_hash2(subtleHash(algorithm), data)!;
+  }
+  /** An HMAC key from its bytes ("raw") or a JWK of kty "oct" ("jwk"). */
+  async importKey(
+    format: string,
+    keyData: Uint8Array | JsonWebKey,
+    algorithm: string | SubtleAlgorithm,
+    extractable: boolean,
+    keyUsages: string[]
+  ): Promise<CryptoKey> {
+    const alg = subtleAlg(algorithm);
+    if (alg.name.toUpperCase() !== "HMAC") throw subtleError("Unrecognized algorithm name", "NotSupportedError");
+    const hash = subtleHash(alg.hash ?? null);
+    let bytes: Uint8Array;
+    if (format === "raw") bytes = Buffer.from(keyData as Uint8Array);
+    else if (format === "jwk") bytes = unb64url((keyData as JsonWebKey).k ?? "");
+    else throw subtleError(`Unable to import HMAC key with format ${format}`, "NotSupportedError");
+    if (bytes.length === 0) throw subtleError("Zero-length key is not supported", "DataError");
+    return new CryptoKey(new KeyAlgorithm("HMAC", hashTitle(hash), alg.length ?? bytes.length * 8), extractable, keyUsages, bytes);
+  }
+  /** A key's bytes ("raw"). */
+  async exportKey(format: string, key: CryptoKey): Promise<Buffer> {
+    if (!key.extractable) throw subtleError("key is not extractable", "InvalidAccessError");
+    if (format !== "raw") throw subtleError(`Unable to export HMAC key with format ${format}`, "NotSupportedError");
+    return Buffer.from(key.bytes);
+  }
+  /** The HMAC of data with key. */
+  async sign(algorithm: string | SubtleAlgorithm, key: CryptoKey, data: Uint8Array): Promise<Buffer> {
+    if (subtleAlg(algorithm).name.toUpperCase() !== "HMAC") throw subtleError("Unrecognized algorithm name", "NotSupportedError");
+    if (!key.usages.includes("sign")) throw subtleError("Unable to use this key to sign", "InvalidAccessError");
+    return crypto_hmac2(subtleHash(key.algorithm.hash), key.bytes, data)!;
+  }
+  /** Whether signature is data's HMAC with key (compared in constant time). */
+  async verify(algorithm: string | SubtleAlgorithm, key: CryptoKey, signature: Uint8Array, data: Uint8Array): Promise<boolean> {
+    if (subtleAlg(algorithm).name.toUpperCase() !== "HMAC") throw subtleError("Unrecognized algorithm name", "NotSupportedError");
+    if (!key.usages.includes("verify")) throw subtleError("Unable to use this key to verify", "InvalidAccessError");
+    const mac = crypto_hmac2(subtleHash(key.algorithm.hash), key.bytes, data)!;
+    return mac.length === signature.length && timingSafeEqual(mac, signature);
+  }
+}
+
+/** webcrypto: subtle, getRandomValues and randomUUID. */
+export class WebCrypto {
+  readonly subtle: SubtleCrypto = new SubtleCrypto();
+  getRandomValues(array: Uint8Array): Uint8Array {
+    return getRandomValues(array);
+  }
+  randomUUID(): string {
+    return crypto_uuid();
+  }
+}
+export const webcrypto: WebCrypto = new WebCrypto();
+export const subtle: SubtleCrypto = webcrypto.subtle;
