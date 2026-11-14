@@ -202,11 +202,16 @@ def measure(a, name, spec, tests, levels):
                         while not stop.is_set():
                             peak[0] = max(peak[0], group_stats(p.pid)[1])
                             stop.wait(0.2)
-                    th = threading.Thread(target=sample)
+                    th = threading.Thread(target=sample, daemon=True)
                     th.start()
-                    rps, p50, p99, n = load(a, t, url, c, a.duration)
-                    stop.set()
-                    th.join()
+                    try:
+                        rps, p50, p99, n = load(a, t, url, c, a.duration)
+                    except Exception as e:  # (the load generator could not read the server: it died under load)
+                        print('# %s: the load failed at %s-c%d (%s)' % (name, t, c, e), file=sys.stderr)
+                        return rows
+                    finally:
+                        stop.set()
+                        th.join()
                     cpu1, _ = group_stats(p.pid)
                     runs.append((rps, p50, p99, (cpu1 - cpu0) * 1000 / max(n, 1) * 1000, peak[0] / 1048576))
                     time.sleep(1)
