@@ -55,6 +55,9 @@ Supported:
   (`{ [constants.BROTLI_PARAM_QUALITY]: 4 }`: mode, quality, window, block size, size hint...), `chunkSize`,
   `finishFlush`, `maxOutputLength`, and Node's errors (`Decompression failed` with `code`
   `ERR__ERROR_FORMAT_...` and the decoder's `errno`, `ERR_BROTLI_INVALID_PARAM`);
+- the streams `createGzip`, `createGunzip`, `createDeflate`, `createInflate`, `createDeflateRaw`,
+  `createInflateRaw`, `createUnzip`, `createBrotliCompress`, `createBrotliDecompress` (Transforms of
+  `node:stream`: `pipe`, `write`/`end`, `'data'`, `'error'`);
 - `crc32(data, value?)`, `constants` (flush values, return codes, levels, strategies, modes, option bounds);
 - options `level`, `windowBits`, `memLevel`, `strategy`, `dictionary`, `finishFlush` (`Z_SYNC_FLUSH` reads a
   truncated stream), `maxOutputLength`, `chunkSize`;
@@ -77,7 +80,10 @@ Differences from Node:
   thread pool); on an error the result argument is an empty `Buffer` (Node: `undefined`);
 - the `RangeError`s are `Error`s named `RangeError` (`instanceof RangeError` is `false`);
 - Brotli `params` values are numbers (Node also takes `true`/`false`);
-- missing: Zstd, the stream classes (`createGzip()`...), `params()`,
+- the streams keep what is written and compress or decompress it when the writable side ends: the output is one
+  chunk, with Node's bytes, and nothing comes out before the end (Node streams as it goes); the classes are one,
+  `ZlibStream` (Node: `Gzip`, `Deflate`...);
+- missing: Zstd, `params()`,
   `flush()`, the `info` option, and `zlib.promises`-style use without `util.promisify`.
 
 ## crypto

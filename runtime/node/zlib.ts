@@ -8,7 +8,12 @@
 //   - input is a string (UTF-8) or a Uint8Array/Buffer (no ArrayBuffer/DataView);
 //   - the callback forms compute at once and call back on a later turn of the event loop (Node: the thread pool);
 //     on an error the result argument is an empty Buffer (Node: undefined);
-//   - Brotli params are numbers (Node also takes booleans); no Zstd, and no streams (createGzip...) yet.
+//   - Brotli params are numbers (Node also takes booleans); no Zstd;
+//   - the streams (createGzip()...) keep what is written and compress or decompress it when the writable side ends
+//     (one output chunk; the bytes are Node's).
+
+import { Transform } from "xisto:stream";
+import type { TransformCallback } from "xisto:stream";
 
 declare function zlib_run(
   mode: int,
@@ -343,4 +348,82 @@ function dispatchBrotli(encode: boolean, data: string | Uint8Array, options: Bro
 /** CRC-32 of data (UTF-8 for a string), continued from value (the CRC of what came before; 0 to start). */
 export function crc32(data: string | Uint8Array, value: number = 0): number {
   return zlib_crc32(bytesOf(data), value);
+}
+
+// ---- streams: createGzip() and the others (over xisto:stream's Transform) ----
+
+/**
+ * A compressing or decompressing stream. What is written is kept, and processed in one call when the writable side
+ * ends: the output is one chunk with Node's bytes, but nothing comes out before the end (Node streams it).
+ */
+export class ZlibStream extends Transform {
+  private chunks: Uint8Array[] = [];
+  private readonly mode: int; // 1..7 as constants.DEFLATE..UNZIP; 8 Brotli decode, 9 Brotli encode
+  private readonly options: ZlibOptions | null;
+  private readonly brotliOptions: BrotliOptions | null;
+  constructor(mode: int, options: ZlibOptions | null, brotliOptions: BrotliOptions | null) {
+    super();
+    this.mode = mode;
+    this.options = options;
+    this.brotliOptions = brotliOptions;
+  }
+  override _transform(chunk: Uint8Array, encoding: string, callback: TransformCallback): void {
+    this.chunks.push(chunk);
+    callback(null);
+  }
+  override _flush(callback: TransformCallback): void {
+    let n: int = 0;
+    for (const c of this.chunks) n += c.length;
+    const all = new Uint8Array(n);
+    let at: int = 0;
+    for (const c of this.chunks) {
+      all.set(c, at);
+      at += c.length;
+    }
+    this.chunks = [];
+    try {
+      const out = this.mode >= 8 ? brotli(this.mode === 9, all, this.brotliOptions) : run(this.mode, all, this.options);
+      this.push(out);
+      callback(null);
+    } catch (e) {
+      callback(e as Error);
+    }
+  }
+}
+
+/** A stream that compresses with deflate (zlib format). */
+export function createDeflate(options: ZlibOptions | null = null): ZlibStream {
+  return new ZlibStream(1, options, null);
+}
+/** A stream that decompresses zlib data. */
+export function createInflate(options: ZlibOptions | null = null): ZlibStream {
+  return new ZlibStream(2, options, null);
+}
+/** A stream that compresses into gzip. */
+export function createGzip(options: ZlibOptions | null = null): ZlibStream {
+  return new ZlibStream(3, options, null);
+}
+/** A stream that decompresses gzip. */
+export function createGunzip(options: ZlibOptions | null = null): ZlibStream {
+  return new ZlibStream(4, options, null);
+}
+/** A stream that compresses with raw deflate. */
+export function createDeflateRaw(options: ZlibOptions | null = null): ZlibStream {
+  return new ZlibStream(5, options, null);
+}
+/** A stream that decompresses raw deflate. */
+export function createInflateRaw(options: ZlibOptions | null = null): ZlibStream {
+  return new ZlibStream(6, options, null);
+}
+/** A stream that decompresses gzip or zlib data. */
+export function createUnzip(options: ZlibOptions | null = null): ZlibStream {
+  return new ZlibStream(7, options, null);
+}
+/** A stream that compresses with Brotli. */
+export function createBrotliCompress(options: BrotliOptions | null = null): ZlibStream {
+  return new ZlibStream(9, null, options);
+}
+/** A stream that decompresses Brotli. */
+export function createBrotliDecompress(options: BrotliOptions | null = null): ZlibStream {
+  return new ZlibStream(8, null, options);
 }
