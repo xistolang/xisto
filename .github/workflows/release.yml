@@ -3,8 +3,9 @@
 #
 # Start it by pushing a tag (git tag v0.1.1 && git push origin v0.1.1) or by hand (Actions > release > Run workflow,
 # with the version; the tag is then created on the chosen commit).
-# The tap update needs the secret HOMEBREW_TAP_TOKEN: a fine-grained token with "Contents: read and write" on
-# xistolang/homebrew-tap only. Without it the release is still published and the step says what to do.
+# The tap updates itself: its workflow (xistolang/homebrew-tap, .github/workflows/update.yml) checks the latest
+# release every 30 minutes, renders the formula from packaging/homebrew/xisto.rb.in and the published sha256, and
+# runs a new-user test on macOS. With the optional secret HOMEBREW_TAP_TOKEN this workflow writes the formula at once.
 name: release
 
 on:
@@ -99,7 +100,7 @@ jobs:
         run: |
           set -eu
           if [ -z "$TAP_TOKEN" ]; then
-            echo "::warning::HOMEBREW_TAP_TOKEN is not set: the formula in xistolang/homebrew-tap was not updated (version $V, sha256 $SHA)"
+            echo "HOMEBREW_TAP_TOKEN is not set: xistolang/homebrew-tap picks up $V (sha256 $SHA) on its own within 30 minutes"
             exit 0
           fi
           git clone -q "https://x-access-token:${TAP_TOKEN}@github.com/xistolang/homebrew-tap.git" "$RUNNER_TEMP/tap"
