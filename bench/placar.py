@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""The xisto x Rust scoreboard from a bench/benchmarksgame/langs.py run (python3 bench/placar.py RESULTS.txt).
+"""The xisto x Rust scoreboard from a bench/benchmarksgame/langs.py run (python3 bench/placar.py RESULTS.txt); also
+xisto x C from a bench/polybench/run.py run (python3 bench/placar.py RESULTS.txt c: one program per side).
 
 For each problem and each side, the variant is the fastest one whose output matched, unless a lighter one is close
 enough in time (rule agreed on 8 Nov 2026, the same for both sides):
@@ -43,7 +44,8 @@ def pair(a, b, unit):
     elif b < a: sb = f"**{sb}**"
     return sa, sb
 
-OTHER = sys.argv[2] if len(sys.argv) > 2 else "rust"  # the other side's label (rust, node, bun)
+OTHER = sys.argv[2] if len(sys.argv) > 2 else "rust"  # the other side's label (rust, node, bun, c)
+OTHER_NAME = "C" if OTHER == "c" else "Rust"  # the column titles (c: PolyBench, bench/polybench/run.py)
 rows = {}
 for line in open(sys.argv[1]):
     p = line.split()
@@ -69,7 +71,7 @@ for prob, sides in rows.items():
     cells = [*pair(x[0], r[0], "s"), *pair(x[1], r[1], "u"), *pair(x[2], r[2], "MB")]
     out.append((ratio, f"| {prob} | {x[3]}{' †' if xm else ''} | {r[3]}{' †' if rm else ''} | " + " | ".join(cells) + f" | {res} |"))
 
-print("| problema | variante xisto | variante Rust | tempo xisto | tempo Rust | CPU xisto | CPU Rust | mem xisto | mem Rust | resultado |")
+print(f"| problema | variante xisto | variante {OTHER_NAME} | tempo xisto | tempo {OTHER_NAME} | CPU xisto | CPU {OTHER_NAME} | mem xisto | mem {OTHER_NAME} | resultado |")
 print("|---|---|---|---:|---:|---:|---:|---:|---:|---|")
 for _, line in sorted(out):
     print(line)

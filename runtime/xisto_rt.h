@@ -1109,11 +1109,69 @@ static int64_t xs_str_cp_at_byte(xs_str *s, int64_t b) {
     return n;
 }
 
+/* the length of a + b when a's is known: b's is counted (b is copied anyway), so `s += t; s.length` does not count
+   the whole of s again after every append */
+static inline int32_t xs_str_ulen_sum(xs_str *a, xs_str *b) {
+    if (a->ulen < 0 || a->len + b->len > INT32_MAX) return -1;
+    return a->ulen + (int32_t)xs_str_len(b);
+}
 static xs_str *xs_str_concat(xs_str *a, xs_str *b) {
     xs_str *s = xs_str_alloc(a->len + b->len);
     memcpy(s->data, a->data, (size_t)a->len);
     memcpy(s->data + a->len, b->data, (size_t)b->len);
     s->data[s->len] = 0;
+    s->ulen = xs_str_ulen_sum(a, b);
+    return s;
+}
+/* the usable size of a malloc block (0: unknown, then a string is never grown in place) */
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#define xs_msize(p) malloc_size(p)
+#elif defined(__linux__) || defined(_WIN32)
+#include <malloc.h>
+#if defined(_WIN32)
+#define xs_msize(p) _msize(p)
+#else
+#define xs_msize(p) malloc_usable_size(p)
+#endif
+#else
+#define xs_msize(p) ((size_t)0)
+#endif
+/* s += t (the emitter, when computing t calls no user code): a string held only by the variable (count 1, a malloc
+   block of its own: not a literal, nor from a slab, a region or a frame) takes t at the end of its block, which grows
+   by half when full; one that cannot (shared, small) is copied into such a block once it is past the small sizes.
+   A buffer built from short pieces is then linear instead of a copy of the whole per piece (PolyBench's dump). With
+   count 1 no other reference holds the old value, so changing it in place is not seen (strings never change). */
+static xs_str *xs_str_append_to(xs_str **slot, xs_str *b) {
+    xs_str *a = *slot;
+    int64_t n = a->len + b->len;
+    size_t need = offsetof(xs_str, data) + (size_t)n + 1;
+    if (a != b && a->hdr.rc == 1 && !(a->hdr.cls & (XS_CLS_MASK | XS_STACK | XS_RGN | XS_CYC | XS_BUF | XS_DEAD)) &&
+        xs_type_of(a)->free == xs_str_free && need > XS_SMALL_MAX) {
+        size_t cap = xs_msize(a);
+        if (cap) {
+            if (need > cap) {
+                xs_str *r = realloc(a, need + need / 2);
+                if (!r) xs_panic("out of memory");
+                a = *slot = r;
+            }
+            a->ulen = xs_str_ulen_sum(a, b);
+            memcpy(a->data + a->len, b->data, (size_t)b->len);
+            a->len = n;
+            a->data[n] = 0;
+            return a;
+        }
+    }
+    xs_str *s;
+    if (need > XS_SMALL_MAX && a != b) { /* room for the next appends */
+        s = xs_obj_alloc_raw(need + need / 2, &xs_str_type);
+        s->len = n;
+        memcpy(s->data, a->data, (size_t)a->len);
+        memcpy(s->data + a->len, b->data, (size_t)b->len);
+        s->data[n] = 0;
+        s->ulen = xs_str_ulen_sum(a, b);
+    } else s = xs_str_concat(a, b);
+    xs_assign(*slot, s);
     return s;
 }
 
@@ -1568,6 +1626,24 @@ XS_NOINLINE xs_str *xs_tpl(int n, ...) {
 /* ---- arrays: fixed length, bounds-checked ---- */
 
 #define XS_INLINE_ELEMS 4 /* small arrays keep their elements inside the object */
+/* XS_ROWPAD (a program that indexes arrays of rows, Linux): a block of 1 KB or more asks malloc for a size that makes
+   its chunk (glibc: the request + 8, rounded to 16) a whole odd number of 64-byte lines, so rows allocated one after
+   the other are a fixed whole number of lines apart. A walk down a column (adi, nussinov) then steps a constant number
+   of lines, which the stride prefetcher follows; 8016 B rows (1000 doubles) step 125.25 lines and it does not
+   (Graviton2 adi 13.5 -> 10.2 s, syrk 1.61 -> 0.88, trmm 0.96 -> 0.57). At most 120 bytes more per block. Only on
+   ARM: on the Broadwell lu gains (2.15 -> 1.55) but doitgen, syr2k and trmm lose 11-18%. */
+#if defined(XS_ROWPAD) && defined(__linux__) && defined(__aarch64__)
+static inline size_t xs_rowpad(size_t n) {
+    if (n < 1024) return n;
+    size_t c = (n + 8 + 63) & ~(size_t)63;
+    if (!((c >> 6) & 1)) c += 64;
+    return c - 8;
+}
+#else
+#define xs_rowpad(n) (n)
+#endif
+/* the table of a loop nest's row data pointers (emit.c, bce_rd_type), freed when the nest's block ends */
+static inline void xs_rd_free(void *p) { free(*(void **)p); }
 #define XS_ARRAY(T, name)                                                              \
     typedef struct name { xs_hdr hdr; size_t len; T *data; size_t cap; } name;        \
     static void name##_free(void *p) { name *a_ = p; if ((void *)a_->data != (void *)(a_ + 1)) free(a_->data); xs_obj_free(p); } \
@@ -1580,7 +1656,7 @@ XS_NOINLINE xs_str *xs_tpl(int n, ...) {
                       : xs_obj_alloc(sizeof(name), name##_free, xs_print_##name);      \
         a->len = (size_t)n;                                                            \
         a->cap = in_ ? XS_INLINE_ELEMS : (size_t)n;                                    \
-        a->data = in_ ? (T *)(a + 1) : malloc(a->cap * sizeof(T));                     \
+        a->data = in_ ? (T *)(a + 1) : malloc(xs_rowpad(a->cap * sizeof(T)));         \
         if (!a->data) xs_panic("out of memory");                                       \
         for (size_t i = 0; i < a->len; i++) a->data[i] = fill;                         \
         return a;                                                                      \
@@ -2842,6 +2918,45 @@ XS_NOINLINE xs_str *xs_num_to_fixed(double x, int64_t d) {
     if (d < 0 || d > 100) xs_panic("RangeError: toFixed() digits argument must be between 0 and 100");
     if (isnan(x)) return xs_str_new("NaN", 3);
     if (fabs(x) >= 1e21) return xs_str_from_num(x);
+    if (d <= 22 && fabs(x) < 9007199254740992.0) {
+        /* |x| = m * 2^e exactly (m < 2^53); N = |x| * 10^d rounded half up is (m * 10^d) / 2^-e rounded, in 128-bit
+           integers (m * 10^22 < 2^127): the same digits as the exact expansion below, without printing 1100 of them */
+        static const uint64_t p10[20] = {1ull, 10ull, 100ull, 1000ull, 10000ull, 100000ull, 1000000ull, 10000000ull,
+            100000000ull, 1000000000ull, 10000000000ull, 100000000000ull, 1000000000000ull, 10000000000000ull,
+            100000000000000ull, 1000000000000000ull, 10000000000000000ull, 100000000000000000ull,
+            1000000000000000000ull, 10000000000000000000ull};
+        uint64_t bits;
+        double ax = fabs(x);
+        memcpy(&bits, &ax, 8);
+        int be = (int)(bits >> 52);
+        uint64_t m = bits & ((UINT64_C(1) << 52) - 1);
+        int e = be ? be - 1075 : -1074;
+        if (be) m |= UINT64_C(1) << 52;
+        unsigned __int128 pd = d < 20 ? (unsigned __int128)p10[d] : (unsigned __int128)p10[19] * p10[d - 19];
+        unsigned __int128 N;
+        if (e >= 0) N = ((unsigned __int128)m << e) * pd; /* an integer below 2^53 */
+        else {
+            unsigned __int128 P = (unsigned __int128)m * pd;
+            int k = -e;
+            if (k >= 128) N = 0; /* P < 2^127 <= half of 2^k: below half */
+            else {
+                N = P >> k;
+                if (((P >> (k - 1)) & 1) != 0) N++; /* the remainder is half or more: up (a tie goes up, as toFixed) */
+            }
+        }
+        char dig[48];
+        int nd = 0;
+        do { dig[nd++] = (char)('0' + (int)(N % 10)); N /= 10; } while (N);
+        while (nd < d + 1) dig[nd++] = '0';
+        char out[64];
+        size_t n = 0;
+        if (x < 0) out[n++] = '-';
+        for (int i = nd - 1; i >= 0; i--) {
+            out[n++] = dig[i];
+            if (i == d && d > 0) out[n++] = '.';
+        }
+        return xs_str_new(out, n);
+    }
     static XS_TLS char exact[1200];
     snprintf(exact, sizeof exact, "%.1100f", fabs(x)); /* every digit of the double, exactly */
     char *dot = strchr(exact, '.');
@@ -6900,7 +7015,7 @@ XS_NOINLINE xs_shblk *xs_shblk_new(int64_t n, bool zero) {
         return b;
     }
 #endif
-    b = zero ? calloc(1, sizeof *b + (size_t)n) : malloc(sizeof *b + (size_t)n);
+    b = zero ? calloc(1, xs_rowpad(sizeof *b + (size_t)n)) : malloc(xs_rowpad(sizeof *b + (size_t)n));
     if (!b) xs_panic("out of memory");
     b->refs = 1;
     b->n = n;
@@ -7190,6 +7305,249 @@ XS_NOINLINE xs_str *xs_f64_join(xs_Float64Array *a, xs_str *sep) {
 }
 XS_NOINLINE xs_str *xs_f64_to_string(xs_Float64Array *a) {
     xs_str *c = xs_str_new(",", 1), *r = xs_f64_join(a, c);
+    xs_release(c);
+    return r;
+}
+
+/* ---- Float32Array (as in Node) ----
+   4 bytes per element, a float of C. An element read is the float as a double (exact); a write rounds the double to
+   the nearest float, ties to even (C's conversion in the default rounding mode, as JavaScript's), so a value too large
+   becomes an Infinity, a tiny one a subnormal or a zero of its sign, and NaN, the Infinities and -0 stay. The program's
+   arithmetic stays in double: only the reads and the writes convert (no fused operations: -ffp-contract=off). */
+static inline __attribute__((always_inline)) double xs_f32_num(float x) { return (double)x; } /* an element read: exact */
+typedef struct xs_Float32Array { xs_hdr hdr; union { int64_t f_length; int64_t len; }; float *data; xs_shblk *blk; bool shared; } xs_Float32Array;
+static void xs_f32_free(void *p) { xs_shblk_unref(((xs_Float32Array *)p)->blk); xs_obj_free(p); }
+static void xs_f32_print(void *p) {
+    xs_Float32Array *a = p;
+    xs_insp fr;
+    if (!xs_insp_begin(&fr, p, "Float32Array", a->f_length ? NULL : "Float32Array(0) []")) return;
+    int64_t n = a->f_length < 100 ? a->f_length : 100;
+    for (int64_t i = 0; i < n; i++) { xs_insp_entry(&fr); xs_print_num((double)a->data[i]); }
+    if (a->f_length > 100) { xs_insp_entry(&fr); fprintf(XS_OUT, "... %lld more item%s", (long long)(a->f_length - 100), a->f_length - 100 == 1 ? "" : "s"); }
+    char open[48];
+    snprintf(open, sizeof open, "Float32Array(%lld) [", (long long)a->f_length);
+    xs_insp_end(&fr, open, "]", true, true, a->f_length > 100);
+}
+/* a view of n floats from the off-th one of blk, whose reference it takes over */
+XS_NOINLINE xs_Float32Array *xs_f32_wrap(xs_shblk *blk, int64_t off, int64_t n, bool shared) {
+    xs_Float32Array *a = xs_obj_alloc(sizeof *a, xs_f32_free, xs_f32_print);
+    a->f_length = n;
+    a->data = (float *)xs_shblk_data(blk) + off;
+    a->blk = blk;
+    a->shared = shared;
+    return a;
+}
+XS_NOINLINE xs_Float32Array *xs_f32_new(int64_t n) {
+    if (n < 0 || n > ((int64_t)1 << 38)) xs_panic("RangeError: Invalid typed array length");
+    return xs_f32_wrap(xs_shblk_new(n * 4, true), 0, n, false);
+}
+XS_NOINLINE xs_Float32Array *xs_f32_from_nums(xs_arr_num *s) {
+    xs_Float32Array *a = xs_f32_wrap(xs_shblk_new((int64_t)s->len * 4, false), 0, (int64_t)s->len, false);
+    for (size_t i = 0; i < s->len; i++) a->data[i] = (float)s->data[i];
+    return a;
+}
+XS_NOINLINE xs_Float32Array *xs_f32_from_ints(xs_arr_int *s) {
+    xs_Float32Array *a = xs_f32_wrap(xs_shblk_new((int64_t)s->len * 4, false), 0, (int64_t)s->len, false);
+    for (size_t i = 0; i < s->len; i++) a->data[i] = (float)(double)s->data[i]; /* (through the double the int is as a number) */
+    return a;
+}
+XS_NOINLINE xs_Float32Array *xs_f32_copy(xs_Float32Array *s) {
+    xs_Float32Array *a = xs_f32_wrap(xs_shblk_new(s->f_length * 4, false), 0, s->f_length, false);
+    if (s->f_length) memcpy(a->data, s->data, (size_t)s->f_length * sizeof(float));
+    return a;
+}
+XS_NOINLINE xs_Float32Array *xs_f32_from_f64(xs_Float64Array *s) {
+    xs_Float32Array *a = xs_f32_wrap(xs_shblk_new(s->f_length * 4, false), 0, s->f_length, false);
+    for (int64_t i = 0; i < s->f_length; i++) a->data[i] = (float)s->data[i];
+    return a;
+}
+XS_NOINLINE xs_Float64Array *xs_f64_from_f32(xs_Float32Array *s) {
+    xs_Float64Array *a = xs_f64_wrap(xs_shblk_new(s->f_length * 8, false), 0, s->f_length, false);
+    for (int64_t i = 0; i < s->f_length; i++) a->data[i] = (double)s->data[i];
+    return a;
+}
+/* new Float32Array(sab, byteOffset?, length?): a view on the buffer (INT64_MIN: not given) */
+XS_NOINLINE xs_Float32Array *xs_f32_on(xs_SharedArrayBuffer *s, int64_t off, int64_t n) {
+    if (off == INT64_MIN) off = 0;
+    if (off < 0 || off % 4) xs_panic("RangeError: start offset of Float32Array should be a multiple of 4");
+    if (off > s->f_byteLength) xs_panic("RangeError: start offset is outside the bounds of the buffer");
+    if (n == INT64_MIN) {
+        if ((s->f_byteLength - off) % 4) xs_panic("RangeError: byte length of Float32Array should be a multiple of 4");
+        n = (s->f_byteLength - off) / 4;
+    } else if (n < 0 || n > (s->f_byteLength - off) / 4) xs_panic("RangeError: Invalid typed array length");
+    xs_shblk_ref(s->blk);
+    return xs_f32_wrap(s->blk, off / 4, n, true);
+}
+/* the length, with the bound every Float32Array has (as xs_f64_len) */
+static inline int64_t xs_f32_len(xs_Float32Array *a) {
+    int64_t n = a->f_length;
+#if defined(__clang__)
+    __builtin_assume(n >= 0 && n <= ((int64_t)1 << 38));
+#else
+    if (n < 0 || n > ((int64_t)1 << 38)) __builtin_unreachable();
+#endif
+    return n;
+}
+static inline float *xs_f32_at_s(xs_Float32Array *a, int64_t i, const xs_site *s) {
+    if ((uint64_t)i >= (uint64_t)a->f_length) XS_FAIL("index out of bounds", s);
+    return &a->data[i];
+}
+static inline int64_t xs_f32_byte_length(xs_Float32Array *a) { return a->f_length * 4; }
+static inline int64_t xs_f32_byte_offset(xs_Float32Array *a) { return (int64_t)((char *)a->data - xs_shblk_data(a->blk)); }
+XS_NOINLINE xs_Float32Array *xs_f32_fill(xs_Float32Array *a, double v, int64_t start, int64_t end) {
+    int64_t s = xs_u8_rel(start, a->f_length, 0), e = xs_u8_rel(end, a->f_length, a->f_length);
+    float f = (float)v;
+    for (int64_t i = s; i < e; i++) a->data[i] = f;
+    return xs_retain(a);
+}
+XS_NOINLINE void xs_f32_set_from(xs_Float32Array *d, xs_Float32Array *s, int64_t off) {
+    xs_f64_set_check(s->f_length, off, d->f_length);
+    if (s->f_length) memmove(d->data + off, s->data, (size_t)s->f_length * sizeof(float)); /* (views on one block may overlap) */
+}
+XS_NOINLINE void xs_f32_set_nums(xs_Float32Array *d, xs_arr_num *s, int64_t off) {
+    xs_f64_set_check((int64_t)s->len, off, d->f_length);
+    for (size_t i = 0; i < s->len; i++) d->data[off + (int64_t)i] = (float)s->data[i];
+}
+XS_NOINLINE void xs_f32_set_f64(xs_Float32Array *d, xs_Float64Array *s, int64_t off) {
+    xs_f64_set_check(s->f_length, off, d->f_length);
+    if (!s->f_length) return;
+    if (s->blk == d->blk) { /* (views on one block: the source read whole before any write, as the spec's clone) */
+        float *t = malloc((size_t)s->f_length * sizeof(float));
+        if (!t) xs_panic("out of memory");
+        for (int64_t i = 0; i < s->f_length; i++) t[i] = (float)s->data[i];
+        memcpy(d->data + off, t, (size_t)s->f_length * sizeof(float));
+        free(t);
+        return;
+    }
+    for (int64_t i = 0; i < s->f_length; i++) d->data[off + i] = (float)s->data[i];
+}
+XS_NOINLINE void xs_f64_set_f32(xs_Float64Array *d, xs_Float32Array *s, int64_t off) {
+    xs_f64_set_check(s->f_length, off, d->f_length);
+    if (!s->f_length) return;
+    if (s->blk == d->blk) {
+        double *t = malloc((size_t)s->f_length * sizeof(double));
+        if (!t) xs_panic("out of memory");
+        for (int64_t i = 0; i < s->f_length; i++) t[i] = (double)s->data[i];
+        memcpy(d->data + off, t, (size_t)s->f_length * sizeof(double));
+        free(t);
+        return;
+    }
+    for (int64_t i = 0; i < s->f_length; i++) d->data[off + i] = (double)s->data[i];
+}
+XS_NOINLINE xs_Float32Array *xs_f32_subarray(xs_Float32Array *a, int64_t start, int64_t end) { /* a view on the same block */
+    int64_t s = xs_u8_rel(start, a->f_length, 0), e = xs_u8_rel(end, a->f_length, a->f_length);
+    xs_shblk_ref(a->blk);
+    return xs_f32_wrap(a->blk, (a->data - (float *)xs_shblk_data(a->blk)) + s, e > s ? e - s : 0, a->shared);
+}
+XS_NOINLINE xs_Float32Array *xs_f32_slice(xs_Float32Array *a, int64_t start, int64_t end) { /* a copy, of its own */
+    int64_t s = xs_u8_rel(start, a->f_length, 0), e = xs_u8_rel(end, a->f_length, a->f_length), n = e > s ? e - s : 0;
+    xs_Float32Array *r = xs_f32_wrap(xs_shblk_new(n * 4, false), 0, n, false);
+    if (n) memcpy(r->data, a->data + s, (size_t)n * sizeof(float));
+    return r;
+}
+XS_NOINLINE xs_str *xs_f32_join(xs_Float32Array *a, xs_str *sep) {
+    xs_sb sb = {0};
+    char t[32];
+    for (int64_t i = 0; i < a->f_length; i++) {
+        if (i) xs_sb_put(&sb, sep->data, (size_t)sep->len);
+        double v = (double)a->data[i];
+        if (v == 0) xs_sb_put(&sb, "0", 1); /* (-0 joins as 0) */
+        else { xs_num_to_str(v, t); xs_sb_put(&sb, t, strlen(t)); }
+    }
+    xs_str *r = xs_str_new(sb.data ? sb.data : "", sb.len);
+    free(sb.data);
+    return r;
+}
+XS_NOINLINE xs_str *xs_f32_to_string(xs_Float32Array *a) {
+    xs_str *c = xs_str_new(",", 1), *r = xs_f32_join(a, c);
+    xs_release(c);
+    return r;
+}
+
+/* ---- Int32Array elements (as in Node): i[k] is an int; a write is ToInt32 of the value (an int wrapped modulo 2^32,
+   a number truncated first, NaN and the Infinities 0) ---- */
+static inline __attribute__((always_inline)) int32_t xs_toint32_i(int64_t v) { return (int32_t)(uint32_t)(uint64_t)v; }
+static inline int32_t xs_toint32_d(double d) {
+    if (d > -9.2e18 && d < 9.2e18) return (int32_t)(uint32_t)(uint64_t)(int64_t)d; /* (truncates toward 0; NaN fails both tests) */
+    if (!isfinite(d)) return 0;
+    double m = fmod(trunc(d), 4294967296.0); /* exact: |d| >= 2^63 is an integer */
+    if (m < 0) m += 4294967296.0;
+    return (int32_t)(uint32_t)m;
+}
+/* the length, with the bound every Int32Array has (as xs_f64_len) */
+static inline int64_t xs_i32_len(xs_Int32Array *a) {
+    int64_t n = a->f_length;
+#if defined(__clang__)
+    __builtin_assume(n >= 0 && n <= ((int64_t)1 << 38));
+#else
+    if (n < 0 || n > ((int64_t)1 << 38)) __builtin_unreachable();
+#endif
+    return n;
+}
+static inline int32_t *xs_i32_at_s(xs_Int32Array *a, int64_t i, const xs_site *s) {
+    if ((uint64_t)i >= (uint64_t)a->f_length) XS_FAIL("index out of bounds", s);
+    return &a->data[i];
+}
+static inline int64_t xs_i32_byte_length(xs_Int32Array *a) { return a->f_length * 4; }
+static inline int64_t xs_i32_byte_offset(xs_Int32Array *a) { return (int64_t)((char *)a->data - xs_shblk_data(a->blk)); }
+XS_NOINLINE xs_Int32Array *xs_i32_from_ints(xs_arr_int *s) {
+    xs_Int32Array *a = xs_i32_wrap(xs_shblk_new((int64_t)s->len * 4, false), 0, (int64_t)s->len, false);
+    for (size_t i = 0; i < s->len; i++) a->data[i] = xs_toint32_i(s->data[i]);
+    return a;
+}
+XS_NOINLINE xs_Int32Array *xs_i32_from_nums(xs_arr_num *s) {
+    xs_Int32Array *a = xs_i32_wrap(xs_shblk_new((int64_t)s->len * 4, false), 0, (int64_t)s->len, false);
+    for (size_t i = 0; i < s->len; i++) a->data[i] = xs_toint32_d(s->data[i]);
+    return a;
+}
+XS_NOINLINE xs_Int32Array *xs_i32_copy(xs_Int32Array *s) {
+    xs_Int32Array *a = xs_i32_wrap(xs_shblk_new(s->f_length * 4, false), 0, s->f_length, false);
+    if (s->f_length) memcpy(a->data, s->data, (size_t)s->f_length * sizeof(int32_t));
+    return a;
+}
+XS_NOINLINE xs_Int32Array *xs_i32_fill(xs_Int32Array *a, double v, int64_t start, int64_t end) {
+    int64_t s = xs_u8_rel(start, a->f_length, 0), e = xs_u8_rel(end, a->f_length, a->f_length);
+    int32_t x = xs_toint32_d(v);
+    for (int64_t i = s; i < e; i++) a->data[i] = x;
+    return xs_retain(a);
+}
+XS_NOINLINE void xs_i32_set_from(xs_Int32Array *d, xs_Int32Array *s, int64_t off) {
+    xs_f64_set_check(s->f_length, off, d->f_length);
+    if (s->f_length) memmove(d->data + off, s->data, (size_t)s->f_length * sizeof(int32_t)); /* (views on one block may overlap) */
+}
+XS_NOINLINE void xs_i32_set_ints(xs_Int32Array *d, xs_arr_int *s, int64_t off) {
+    xs_f64_set_check((int64_t)s->len, off, d->f_length);
+    for (size_t i = 0; i < s->len; i++) d->data[off + (int64_t)i] = xs_toint32_i(s->data[i]);
+}
+XS_NOINLINE void xs_i32_set_nums(xs_Int32Array *d, xs_arr_num *s, int64_t off) {
+    xs_f64_set_check((int64_t)s->len, off, d->f_length);
+    for (size_t i = 0; i < s->len; i++) d->data[off + (int64_t)i] = xs_toint32_d(s->data[i]);
+}
+XS_NOINLINE xs_Int32Array *xs_i32_subarray(xs_Int32Array *a, int64_t start, int64_t end) { /* a view on the same block */
+    int64_t s = xs_u8_rel(start, a->f_length, 0), e = xs_u8_rel(end, a->f_length, a->f_length);
+    xs_shblk_ref(a->blk);
+    return xs_i32_wrap(a->blk, (a->data - (int32_t *)xs_shblk_data(a->blk)) + s, e > s ? e - s : 0, a->shared);
+}
+XS_NOINLINE xs_Int32Array *xs_i32_slice(xs_Int32Array *a, int64_t start, int64_t end) { /* a copy, of its own */
+    int64_t s = xs_u8_rel(start, a->f_length, 0), e = xs_u8_rel(end, a->f_length, a->f_length), n = e > s ? e - s : 0;
+    xs_Int32Array *r = xs_i32_wrap(xs_shblk_new(n * 4, false), 0, n, false);
+    if (n) memcpy(r->data, a->data + s, (size_t)n * sizeof(int32_t));
+    return r;
+}
+XS_NOINLINE xs_str *xs_i32_join(xs_Int32Array *a, xs_str *sep) {
+    xs_sb sb = {0};
+    char t[16];
+    for (int64_t i = 0; i < a->f_length; i++) {
+        if (i) xs_sb_put(&sb, sep->data, (size_t)sep->len);
+        int k = snprintf(t, sizeof t, "%d", a->data[i]);
+        xs_sb_put(&sb, t, (size_t)k);
+    }
+    xs_str *r = xs_str_new(sb.data ? sb.data : "", sb.len);
+    free(sb.data);
+    return r;
+}
+XS_NOINLINE xs_str *xs_i32_to_string(xs_Int32Array *a) {
+    xs_str *c = xs_str_new(",", 1), *r = xs_i32_join(a, c);
     xs_release(c);
     return r;
 }

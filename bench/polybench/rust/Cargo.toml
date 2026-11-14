@@ -1,0 +1,138 @@
+[package]
+name = "polybench-rs"
+version = "0.2.0"
+authors = ["Joseph Rafael Ferrer <rafael2x0@gmail.com>"]
+edition = "2018"
+publish = false
+# one binary per kernel, named as the C program (bench/polybench/PROVENANCE.md)
+autobins = false
+license = "GPLv2"
+
+[features]
+print-result = []
+
+[dependencies]
+[profile.release]
+strip = false
+opt-level = 3
+codegen-units = 1
+
+[[bin]]
+name = "2mm"
+path = "src/bin/2mm.rs"
+
+[[bin]]
+name = "3mm"
+path = "src/bin/3mm.rs"
+
+[[bin]]
+name = "adi"
+path = "src/bin/adi.rs"
+
+[[bin]]
+name = "atax"
+path = "src/bin/atax.rs"
+
+[[bin]]
+name = "bicg"
+path = "src/bin/bicg.rs"
+
+[[bin]]
+name = "cholesky"
+path = "src/bin/cholesky.rs"
+
+[[bin]]
+name = "correlation"
+path = "src/bin/correlation.rs"
+
+[[bin]]
+name = "covariance"
+path = "src/bin/covariance.rs"
+
+[[bin]]
+name = "deriche"
+path = "src/bin/deriche.rs"
+
+[[bin]]
+name = "doitgen"
+path = "src/bin/doitgen.rs"
+
+[[bin]]
+name = "durbin"
+path = "src/bin/durbin.rs"
+
+[[bin]]
+name = "fdtd-2d"
+path = "src/bin/fdtd_2d.rs"
+
+[[bin]]
+name = "floyd-warshall"
+path = "src/bin/floyd_warshall.rs"
+
+[[bin]]
+name = "gemm"
+path = "src/bin/gemm.rs"
+
+[[bin]]
+name = "gemver"
+path = "src/bin/gemver.rs"
+
+[[bin]]
+name = "gesummv"
+path = "src/bin/gesummv.rs"
+
+[[bin]]
+name = "gramschmidt"
+path = "src/bin/gramschmidt.rs"
+
+[[bin]]
+name = "heat-3d"
+path = "src/bin/heat_3d.rs"
+
+[[bin]]
+name = "jacobi-1d"
+path = "src/bin/jacobi_1d.rs"
+
+[[bin]]
+name = "jacobi-2d"
+path = "src/bin/jacobi_2d.rs"
+
+[[bin]]
+name = "lu"
+path = "src/bin/lu.rs"
+
+[[bin]]
+name = "ludcmp"
+path = "src/bin/ludcmp.rs"
+
+[[bin]]
+name = "mvt"
+path = "src/bin/mvt.rs"
+
+[[bin]]
+name = "nussinov"
+path = "src/bin/nussinov.rs"
+
+[[bin]]
+name = "seidel-2d"
+path = "src/bin/seidel_2d.rs"
+
+[[bin]]
+name = "symm"
+path = "src/bin/symm.rs"
+
+[[bin]]
+name = "syr2k"
+path = "src/bin/syr2k.rs"
+
+[[bin]]
+name = "syrk"
+path = "src/bin/syrk.rs"
+
+[[bin]]
+name = "trisolv"
+path = "src/bin/trisolv.rs"
+
+[[bin]]
+name = "trmm"
+path = "src/bin/trmm.rs"

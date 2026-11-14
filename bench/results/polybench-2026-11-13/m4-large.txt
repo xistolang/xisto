@@ -1,0 +1,12 @@
+# Darwin arm64, 10 cpu; PolyBench LARGE; median of 3
+floyd-warshall c      floyd-warshall.c        9.582s     9.56cpu     31.2MB  par  1.0  kern    6.499s  same
+floyd-warshall xisto  floyd-warshall.ts      21.081s    21.00cpu     66.8MB  par  1.0  kern   16.398s  same
+gemm           c      gemm.c                  0.740s     0.72cpu     28.9MB  par  1.0  kern    0.192s  same
+gemm           xisto  gemm.ts                 2.741s     2.74cpu     33.9MB  par  1.0  kern    1.140s  same
+jacobi-2d      c      jacobi-2d.c             1.490s     1.46cpu     27.1MB  par  1.0  kern    0.609s  same
+jacobi-2d      xisto  jacobi-2d.ts            5.399s     5.39cpu     33.2MB  par  1.0  kern    2.974s  same
+# Diagnóstico (só o kernel, s; o C gerado pelo xisto editado à mão, nada mudou no compilador; Mac com outras cargas, load ~5):
+#   gemm       xisto 1.145 | sem checagem de índice 0.182 | + sem checagem de overflow 0.182 | C 0.192
+#   jacobi-2d  xisto 2.990 | sem checagem de índice 1.035 | + sem checagem de overflow 0.645 | C 0.609
+#   floyd      xisto 18.7 | sem checagem de índice 10.3 | + sem checagem de overflow 9.5 (uma rodada, com carga)
+#   floyd      intercalado, 2 rodadas: sem checagens 13.4 / 14.0 | C com int64 (long) 14.2 / 14.4 | C int32 11.8 / 11.4

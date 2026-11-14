@@ -400,6 +400,33 @@ static Buf compile_to_c(const char *path) {
         columns_program(p); /* (the qbe backend takes no typed-array parameter yet) */
         pad4_program(p);
     }
+    xs_jam_uk = cpu_avx2_target() ? 12 : 8; /* (emit.c: U of the jam of k by target) */
+    /* the target's processor family: the host's, or --target's */
+    bool x86 = xs_target ? strstr(xs_target, "x86_64") != NULL :
+#if defined(__x86_64__)
+                           true;
+#else
+                           false;
+#endif
+    bool arm = xs_target ? strstr(xs_target, "aarch64") != NULL :
+#if defined(__aarch64__)
+                           true;
+#else
+                           false;
+#endif
+    /* (emit.c) rows of a skewed Gauss-Seidel: 16 on Apple ARM (M4 kernel: 12 2,5 s, 16 2,08), 12 on other ARM and on
+       x86 (seidel-2d LARGE, Xeon E5-2686 v4: R = 8 4,90 s, 12 4,87, 16 4,99; Graviton2: 8 6,89, 12 6,82, 16 10,38),
+       8 elsewhere; the stencil nest without per-row tests only off x86
+       (Broadwell: fdtd-2d 1,665 -> 1,83 s with it, jacobi-2d and heat-3d equal; the Graviton2 gains) */
+    bool apple = xs_target ? (strstr(xs_target, "apple") || strstr(xs_target, "darwin")) :
+#if defined(__APPLE__)
+                             true;
+#else
+                             false;
+#endif
+    xs_skew_r = arm && apple ? 16 : arm || x86 ? 12 : 8;
+    xs_rsten = !x86;
+    xs_sel_ic = arm && !apple; /* (emit.c: 8 chains in a max/min reduction; on the Graviton2 nussinov gains, on the M4 (malloc steps rows by 10240 B) 1,63 -> 2,98 s, on the Broadwell 4,04 -> 5,48) */
     if (!use_qbe) {
         xs_wide_f64 = cpu_wide_f64();
         distribute_program(p); /* (after columns: it only touches loops over columns) */
@@ -475,6 +502,13 @@ static Buf compile_to_c(const char *path) {
             buf_printf(&b, "#line %zu \"generated.c\"\n", nl + 1);
         }
         emit_program(p, &b);
+        if (xs_rows_seen && !getenv("XISTO_NO_ROWPAD")) { /* (emit.c: arrays of rows; the runtime pads their blocks) */
+            Buf nb = {0};
+            buf_puts(&nb, "#define XS_ROWPAD 1\n");
+            buf_puts(&nb, b.data);
+            b = nb;
+            if (rt_src.len) { Buf nr = {0}; buf_puts(&nr, "#define XS_ROWPAD 1\n"); buf_puts(&nr, rt_src.data); rt_src = nr; }
+        }
     }
     if (show_time && !use_qbe) fprintf(stderr, "xisto: tls %s\n", !p->uses_tls ? "not linked" : tls_awslc() ? "AWS-LC" : "BearSSL");
     if (show_time) fprintf(stderr, "xisto: emit %.1f ms (%zu KB of %s)\n", now_ms() - t4, b.len / 1024, use_qbe ? "QBE IL" : "C");

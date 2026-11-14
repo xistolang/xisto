@@ -283,7 +283,9 @@ static void init_builtins(void) {
     bi_field(sab, "byteLength", ty_int);
     Class *f64 = bi_class("Float64Array", "xs_Float64Array");
     bi_field(f64, "length", ty_int);
-    Class *i32 = bi_class("Int32Array", "xs_Int32Array"); /* (its elements through Atomics: check_atomics) */
+    Class *f32 = bi_class("Float32Array", "xs_Float32Array"); /* (floats stored, numbers read: check_f64_member too) */
+    bi_field(f32, "length", ty_int);
+    Class *i32 = bi_class("Int32Array", "xs_Int32Array"); /* (32-bit ints: i[i] is an int, a write wraps as ToInt32; Atomics too) */
     bi_field(i32, "length", ty_int);
     /* fs.fstatSync (runtime/xisto_rt.h, xs_fs_fstat): the size and the kind of what a descriptor is open on */
     Class *stc = bi_class("Stats", "xs_Stats");
@@ -534,6 +536,8 @@ static bool check_fs_fd_call(Expr *e, Func *f) {
     return true;
 }
 static bool is_f64(Type *t) { return t && t->kind == TY_OBJECT && t->cls->builtin && strcmp(t->cls->name, "Float64Array") == 0; }
+static bool is_f32(Type *t) { return t && t->kind == TY_OBJECT && t->cls->builtin && strcmp(t->cls->name, "Float32Array") == 0; }
+static bool is_i32(Type *t) { return t && t->kind == TY_OBJECT && t->cls->builtin && strcmp(t->cls->name, "Int32Array") == 0; }
 static bool is_sab(Type *t) { return t && t->kind == TY_OBJECT && t->cls->builtin && strcmp(t->cls->name, "SharedArrayBuffer") == 0; }
 static Expr *str_lit(Pos pos, const char *s);
 static void undef_text(Expr *x);
@@ -695,27 +699,30 @@ static void check_atomics(Expr *e) {
     e->builtin.cfn = (char *)ops[k].cfn;
     e->type = wait ? ty_string : ty_int;
 }
-/* f.length, f.fill(0.5), f.set(src, 4), f.subarray(lo, hi) ... on a Float64Array */
+/* f.length, f.fill(0.5), f.set(src, 4), f.subarray(lo, hi) ... on a Float64Array, or on a Float32Array (xs_f32_*) */
 static void check_f64_member(Expr *e, Class *c) {
     const char *m = e->str;
     int n = e->args.len;
+    bool f32 = strcmp(c->name, "Float32Array") == 0, i32 = strcmp(c->name, "Int32Array") == 0;
+    const char *cn = c->name;
+    #define FN(name) (i32 ? "xs_i32_" name : f32 ? "xs_f32_" name : "xs_f64_" name)
     e->field = -1;
-    #define ARGS(lo, hi) do { if (n < (lo) || n > (hi)) xs_error(XS7021, e->pos, NULL, "Float64Array.%s takes %d to %d argument(s), got %d", m, (lo), (hi), n); } while (0)
+    #define ARGS(lo, hi) do { if (n < (lo) || n > (hi)) xs_error(XS7021, e->pos, NULL, "%s.%s takes %d to %d argument(s), got %d", cn, m, (lo), (hi), n); } while (0)
     #define PAD_INT(k, v) do { for (int k_ = e->args.len; k_ <= (k); k_++) expr_list_push(&e->args, num_lit(e->pos, (double)(v), true)); } while (0)
     if (!e->is_call) {
         if (strcmp(m, "length") == 0) { e->field = 0; e->type = ty_int; return; }
-        if (strcmp(m, "byteLength") == 0 || strcmp(m, "byteOffset") == 0) { /* (in bytes: 8 per element) */
-            e->builtin.cfn = m[4] == 'L' ? "xs_f64_byte_length" : "xs_f64_byte_offset";
+        if (strcmp(m, "byteLength") == 0 || strcmp(m, "byteOffset") == 0) { /* (in bytes: 8 per element, 4 for a Float32Array) */
+            e->builtin.cfn = m[4] == 'L' ? FN("byte_length") : FN("byte_offset");
             e->type = ty_int;
             return;
         }
-        xs_error(XS7019, e->pos, "supported: length, byteLength, byteOffset", "Float64Array has no property '%s'", m);
+        xs_error(XS7019, e->pos, "supported: length, byteLength, byteOffset", "%s has no property '%s'", cn, m);
     }
     if (strcmp(m, "slice") == 0 || strcmp(m, "subarray") == 0) {
         ARGS(0, 2);
-        for (int k = 0; k < n; k++) int_arg(&e->args.items[k], xs_sprintf("argument of Float64Array.%s", m));
+        for (int k = 0; k < n; k++) int_arg(&e->args.items[k], xs_sprintf("argument of %s.%s", cn, m));
         PAD_INT(1, XS_NOT_GIVEN);
-        e->builtin.cfn = m[1] == 'l' ? "xs_f64_slice" : "xs_f64_subarray";
+        e->builtin.cfn = m[1] == 'l' ? FN("slice") : FN("subarray");
         e->type = ty_object_of(c);
         return;
     }
@@ -723,9 +730,16 @@ static void check_f64_member(Expr *e, Class *c) {
         ARGS(1, 2);
         check_expr(e->args.items[0], e->args.items[0]->kind == E_ARRAY_LIT ? ty_array_of(ty_number) : NULL);
         Type *st = e->args.items[0]->type;
-        if (is_f64(st)) e->builtin.cfn = "xs_f64_set_from";
-        else if (st->kind == TY_ARRAY && st->elem->kind == TY_NUMBER) e->builtin.cfn = "xs_f64_set_nums";
-        else xs_error(XS7022, e->args.items[0]->pos, NULL, "Float64Array.set copies from a Float64Array or a number[], not %s", ty_name(st));
+        if (i32) { /* an Int32Array's: from an Int32Array, an int[] or a number[] (each value through ToInt32) */
+            if (is_i32(st)) e->builtin.cfn = "xs_i32_set_from";
+            else if (st->kind == TY_ARRAY && (st->elem->kind == TY_INT || st->elem->kind == TY_LITINT)) e->builtin.cfn = "xs_i32_set_ints";
+            else if (st->kind == TY_ARRAY && st->elem->kind == TY_NUMBER) e->builtin.cfn = "xs_i32_set_nums";
+            else xs_error(XS7022, e->args.items[0]->pos, NULL, "Int32Array.set copies from an Int32Array, an int[] or a number[], not %s", ty_name(st));
+        }
+        else if (is_f64(st)) e->builtin.cfn = f32 ? "xs_f32_set_f64" : "xs_f64_set_from";
+        else if (is_f32(st)) e->builtin.cfn = f32 ? "xs_f32_set_from" : "xs_f64_set_f32";
+        else if (st->kind == TY_ARRAY && st->elem->kind == TY_NUMBER) e->builtin.cfn = FN("set_nums");
+        else xs_error(XS7022, e->args.items[0]->pos, NULL, "%s.set copies from a Float64Array, a Float32Array or a number[], not %s", cn, ty_name(st));
         if (n == 2) int_arg(&e->args.items[1], "the offset"); else PAD_INT(1, 0);
         e->type = ty_void;
         return;
@@ -738,7 +752,7 @@ static void check_f64_member(Expr *e, Class *c) {
         for (int k = 1; k < n; k++) int_arg(&e->args.items[k], "argument of fill");
         PAD_INT(1, XS_NOT_GIVEN);
         PAD_INT(2, XS_NOT_GIVEN);
-        e->builtin.cfn = "xs_f64_fill";
+        e->builtin.cfn = FN("fill");
         e->type = ty_object_of(c);
         return;
     }
@@ -746,12 +760,13 @@ static void check_f64_member(Expr *e, Class *c) {
         ARGS(0, 1);
         if (n == 1) { check_expr(e->args.items[0], ty_string); expect_type(e->args.items[0], ty_string, "the separator"); }
         else expr_list_push(&e->args, str_lit(e->pos, ","));
-        e->builtin.cfn = "xs_f64_join";
+        e->builtin.cfn = FN("join");
         e->type = ty_string;
         return;
     }
-    if (strcmp(m, "toString") == 0) { ARGS(0, 0); e->builtin.cfn = "xs_f64_to_string"; e->type = ty_string; return; }
-    xs_error(XS7018, e->pos, "supported: length, byteLength, byteOffset, fill, set, subarray, slice, join, toString", "Float64Array has no method '%s'", m);
+    if (strcmp(m, "toString") == 0) { ARGS(0, 0); e->builtin.cfn = FN("to_string"); e->type = ty_string; return; }
+    xs_error(XS7018, e->pos, "supported: length, byteLength, byteOffset, fill, set, subarray, slice, join, toString", "%s has no method '%s'", cn, m);
+    #undef FN
     #undef ARGS
     #undef PAD_INT
 }
@@ -2962,6 +2977,7 @@ static void expect_type(Expr *e, Type *want, const char *what);
 static void check_type_supported(Pos pos, Type *t);
 static bool is_bytes(Type *t);
 static bool is_f64(Type *t);
+static bool is_f32(Type *t);
 /* [a, ...xs, b]: each spread source an array (a string's code points, a Set's values, a Map's entries, the bytes
    of a Uint8Array or the numbers of a Float64Array), its elements of the array's element type */
 static bool shape_copy_array(Expr *e, Type *want);
@@ -2998,7 +3014,7 @@ static void check_spread_lit(Expr *e, Type *elem) {
             st = a->lhs->type;
         }
         if (is_bytes(st)) ets[i] = ty_int;
-        else if (is_f64(st)) ets[i] = ty_number;
+        else if (is_f64(st) || is_f32(st)) ets[i] = ty_number;
         else if (st->kind == TY_ARRAY) ets[i] = st->elem;
         else xs_error(XS8101, a->lhs->pos, "spread an array, a string, a Set, a Map, a Uint8Array or a Float64Array", "cannot spread %s", ty_name(st));
         a->type = st;
@@ -3056,7 +3072,7 @@ static void check_spread_lit(Expr *e, Type *elem) {
     for (int i = 0; i < e->args.len; i++) {
         Expr *a = e->args.items[i];
         if (a->kind == E_UNARY && a->op == TK_ELLIPSIS) {
-            bool ok = ty_equal(ets[i], elem) || (ets[i]->kind == TY_INT && elem->kind == TY_NUMBER && (is_bytes(a->type) || is_f64(a->type)));
+            bool ok = ty_equal(ets[i], elem) || (ets[i]->kind == TY_INT && elem->kind == TY_NUMBER && (is_bytes(a->type) || is_f64(a->type) || is_f32(a->type)));
             if (!ok && a->lhs->type->kind == TY_ARRAY && (elem_widens(ets[i], elem) || (elem->kind == TY_JSON && ets[i]->kind == TY_OBJECT))) {
                 arr_convert(a->lhs, elem); /* ...names where (string | number)[] goes: a copy of the wider type */
                 a->type = a->lhs->type;
@@ -6353,7 +6369,7 @@ static void check_object_member_in(Expr *e, Class *c) {
     }
     if (c->builtin && strcmp(c->name, "Date") == 0) { check_date_member(e); return; }
     if (c->builtin && (strcmp(c->name, "Uint8Array") == 0 || strcmp(c->name, "Buffer") == 0)) { check_bytes_member(e, c); return; }
-    if (c->builtin && strcmp(c->name, "Float64Array") == 0) { check_f64_member(e, c); return; }
+    if (c->builtin && (strcmp(c->name, "Float64Array") == 0 || strcmp(c->name, "Float32Array") == 0 || strcmp(c->name, "Int32Array") == 0)) { check_f64_member(e, c); return; }
     if (c->builtin && strcmp(c->name, "RegExpGroups") == 0 && !e->is_call) { /* m.groups.name */
         Expr *nm = xs_alloc(sizeof *nm);
         nm->kind = E_STRING; nm->pos = e->pos; nm->str = e->str; nm->type = ty_string; nm->field = -1;
@@ -9064,6 +9080,18 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->type = target->type;
             return;
         }
+        if (target->kind == E_INDEX && target->lhs && is_i32(target->lhs->type) && !tk_bitop_of_assign(e->op)) {
+            /* i[k] = v, i[k] op= v on an Int32Array: v an int or a number, stored through ToInt32 (wrapped to 32 bits; NaN
+               and the Infinities 0); the expression's value is the value computed, as JavaScript's */
+            check_expr(e->rhs, NULL);
+            if (e->rhs->type->kind == TY_LITINT) coerce_lit(e->rhs, ty_int);
+            if (!is_numeric(e->rhs->type)) xs_error(XS8122, e->rhs->pos, NULL, "an Int32Array element takes an int or a number, not %s", ty_name(e->rhs->type));
+            if (e->op != TK_ASSIGN && e->op != TK_PLUS_ASSIGN && e->op != TK_MINUS_ASSIGN && e->op != TK_STAR_ASSIGN && e->op != TK_SLASH_ASSIGN)
+                xs_error(XS8122, e->pos, NULL, "%s is not supported on an Int32Array element", tok_kind_name(e->op));
+            e->type = e->op == TK_ASSIGN ? e->rhs->type : (e->rhs->type->kind == TY_NUMBER || e->op == TK_SLASH_ASSIGN) ? ty_number : ty_int;
+            if (narrowed) unnarrow(narrowed);
+            return;
+        }
         check_expr(e->rhs, target->type);
         if (e->op != TK_ASSIGN && is_big(target->type)) { /* acc += x: acc = acc + x (a bigint is a value: a new one) */
             const char *f = big_op(e->op);
@@ -9974,11 +10002,14 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->type = ty_int;
             return;
         }
-        if (is_f64(e->lhs->type)) { /* f[i]: a number, read and written in place (bounds checked) */
+        if (is_f64(e->lhs->type) || is_f32(e->lhs->type) || is_i32(e->lhs->type)) { /* f[i]: a number, read and written in place (bounds checked;
+                                                               a Float32Array's: a float, rounded when written; an Int32Array's: an int, wrapped
+                                                               to 32 bits when written) */
+            const char *cn = e->lhs->type->cls->name;
             if (e->rhs->type->kind == TY_NUMBER)
-                xs_error(XS7020, e->rhs->pos, "declare the index as int, or convert it with Math.trunc(x)", "Float64Array index must be int, but this is number");
-            expect_type(e->rhs, ty_int, "Float64Array index");
-            e->type = ty_number;
+                xs_error(XS7020, e->rhs->pos, "declare the index as int, or convert it with Math.trunc(x)", "%s index must be int, but this is number", cn);
+            expect_type(e->rhs, ty_int, xs_sprintf("%s index", cn));
+            e->type = is_i32(e->lhs->type) ? ty_int : ty_number;
             return;
         }
         if (e->lhs->type->kind == TY_OBJECT && e->lhs->type->cls->builtin && strcmp(e->lhs->type->cls->name, "RegExpExecArray") == 0) {
@@ -10595,7 +10626,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
             if (strcmp(ns, "ArrayBuffer") == 0 && e->is_call && strcmp(e->str, "isView") == 0 && e->args.len == 1) {
-                /* ArrayBuffer.isView(v): v is a typed array (Uint8Array, Buffer, Float64Array) */
+                /* ArrayBuffer.isView(v): v is a typed array (Uint8Array, Buffer, Float64Array, Float32Array) */
                 Expr *v = e->args.items[0];
                 Expr *c1 = xs_alloc(sizeof *c1);
                 c1->kind = E_IDENT; c1->pos = e->pos; c1->str = "Uint8Array"; c1->field = -1;
@@ -10605,8 +10636,14 @@ static void check_expr_in(Expr *e, Type *expected) {
                 c2->kind = E_IDENT; c2->pos = e->pos; c2->str = "Float64Array"; c2->field = -1;
                 Expr *t2 = xs_alloc(sizeof *t2);
                 t2->kind = E_BINARY; t2->op = TK_IDENT; t2->pos = v->pos; t2->field = -1; t2->lhs = pure_copy(v) ? pure_copy(v) : v; t2->rhs = c2;
+                Expr *c3 = xs_alloc(sizeof *c3);
+                c3->kind = E_IDENT; c3->pos = e->pos; c3->str = "Float32Array"; c3->field = -1;
+                Expr *t3 = xs_alloc(sizeof *t3);
+                t3->kind = E_BINARY; t3->op = TK_IDENT; t3->pos = v->pos; t3->field = -1; t3->lhs = pure_copy(v) ? pure_copy(v) : v; t3->rhs = c3;
+                Expr *o12 = xs_alloc(sizeof *o12);
+                o12->kind = E_BINARY; o12->op = TK_OR; o12->pos = v->pos; o12->field = -1; o12->lhs = t1; o12->rhs = t2;
                 memset(e, 0, sizeof *e);
-                if (pure_copy(v)) { e->kind = E_BINARY; e->op = TK_OR; e->pos = v->pos; e->field = -1; e->lhs = t1; e->rhs = t2; }
+                if (pure_copy(v)) { e->kind = E_BINARY; e->op = TK_OR; e->pos = v->pos; e->field = -1; e->lhs = o12; e->rhs = t3; }
                 else *e = *t1;
                 check_expr(e, ty_boolean);
                 return;
@@ -12691,6 +12728,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (e->args.len > 1 && !is_sab(st)) xs_error(XS7045, e->pos, hint, "an offset and a length go with a SharedArrayBuffer");
                 if (st->kind == TY_INT || st->kind == TY_LITINT) { if (st->kind == TY_LITINT) coerce_lit(e->args.items[0], ty_int); e->builtin.cfn = "xs_f64_new"; }
                 else if (is_f64(st)) e->builtin.cfn = "xs_f64_copy";
+                else if (is_f32(st)) e->builtin.cfn = "xs_f64_from_f32";
                 else if (is_sab(st)) {
                     for (int k = 1; k < e->args.len; k++) int_arg(&e->args.items[k], k == 1 ? "the byte offset" : "the length");
                     for (int k = e->args.len; k < 3; k++) expr_list_push(&e->args, num_lit(e->pos, (double)XS_NOT_GIVEN, true));
@@ -12701,18 +12739,40 @@ static void check_expr_in(Expr *e, Type *expected) {
                 else xs_error(XS7070, e->args.items[0]->pos, hint, "new Float64Array takes a length, a number[], a Float64Array or a SharedArrayBuffer, not %s", ty_name(st));
                 return;
             }
+            if (strcmp(c->name, "Float32Array") == 0) { /* new Float32Array(length | number[] | int[] | Float32Array | Float64Array | sab, offset?, length?) */
+                const char *hint = "new Float32Array(n), new Float32Array([1.5, 2]), new Float32Array(sharedBuffer)";
+                if (e->args.len < 1 || e->args.len > 3) xs_error(XS7071, e->pos, hint, "new Float32Array takes one argument (or a SharedArrayBuffer, an offset and a length)");
+                check_expr(e->args.items[0], e->args.items[0]->kind == E_ARRAY_LIT ? ty_array_of(ty_number) : NULL);
+                Type *st = e->args.items[0]->type;
+                if (e->args.len > 1 && !is_sab(st)) xs_error(XS7045, e->pos, hint, "an offset and a length go with a SharedArrayBuffer");
+                if (st->kind == TY_INT || st->kind == TY_LITINT) { if (st->kind == TY_LITINT) coerce_lit(e->args.items[0], ty_int); e->builtin.cfn = "xs_f32_new"; }
+                else if (is_f32(st)) e->builtin.cfn = "xs_f32_copy";
+                else if (is_f64(st)) e->builtin.cfn = "xs_f32_from_f64";
+                else if (is_sab(st)) {
+                    for (int k = 1; k < e->args.len; k++) int_arg(&e->args.items[k], k == 1 ? "the byte offset" : "the length");
+                    for (int k = e->args.len; k < 3; k++) expr_list_push(&e->args, num_lit(e->pos, (double)XS_NOT_GIVEN, true));
+                    e->builtin.cfn = "xs_f32_on";
+                }
+                else if (st->kind == TY_ARRAY && st->elem->kind == TY_NUMBER) e->builtin.cfn = "xs_f32_from_nums";
+                else if (st->kind == TY_ARRAY && (st->elem->kind == TY_INT || st->elem->kind == TY_LITINT)) e->builtin.cfn = "xs_f32_from_ints";
+                else xs_error(XS7070, e->args.items[0]->pos, hint, "new Float32Array takes a length, a number[], a Float32Array, a Float64Array or a SharedArrayBuffer, not %s", ty_name(st));
+                return;
+            }
             if (strcmp(c->name, "Int32Array") == 0) { /* new Int32Array(length | sab, offset?, length?) */
-                const char *hint = "new Int32Array(n), new Int32Array(sharedBuffer)";
+                const char *hint = "new Int32Array(n), new Int32Array([1, 2]), new Int32Array(sharedBuffer)";
                 if (e->args.len < 1 || e->args.len > 3) xs_error(XS7124, e->pos, hint, "new Int32Array takes a length or a SharedArrayBuffer (with an offset and a length), not %s", "that");
                 check_expr(e->args.items[0], NULL);
                 Type *st = e->args.items[0]->type;
                 if ((st->kind == TY_INT || st->kind == TY_LITINT) && e->args.len == 1) { if (st->kind == TY_LITINT) coerce_lit(e->args.items[0], ty_int); e->builtin.cfn = "xs_i32_new"; }
+                else if (is_i32(st) && e->args.len == 1) e->builtin.cfn = "xs_i32_copy";
+                else if (st->kind == TY_ARRAY && (st->elem->kind == TY_INT || st->elem->kind == TY_LITINT) && e->args.len == 1) e->builtin.cfn = "xs_i32_from_ints";
+                else if (st->kind == TY_ARRAY && st->elem->kind == TY_NUMBER && e->args.len == 1) e->builtin.cfn = "xs_i32_from_nums";
                 else if (is_sab(st)) {
                     for (int k = 1; k < e->args.len; k++) int_arg(&e->args.items[k], k == 1 ? "the byte offset" : "the length");
                     for (int k = e->args.len; k < 3; k++) expr_list_push(&e->args, num_lit(e->pos, (double)XS_NOT_GIVEN, true));
                     e->builtin.cfn = "xs_i32_on";
                 }
-                else xs_error(XS7124, e->args.items[0]->pos, hint, "new Int32Array takes a length or a SharedArrayBuffer (with an offset and a length), not %s", ty_name(st));
+                else xs_error(XS7124, e->args.items[0]->pos, hint, "new Int32Array takes a length, an int[], a number[], an Int32Array or a SharedArrayBuffer (with an offset and a length), not %s", ty_name(st));
                 return;
             }
             if (strcmp(c->name, "TextEncoder") == 0 || strcmp(c->name, "TextDecoder") == 0) {
@@ -14611,8 +14671,8 @@ static void check_stmt(Stmt *s) {
             s->expr = call;
             check_expr(s->expr, NULL);
         }
-        if (is_bytes(s->expr->type) || is_f64(s->expr->type)) { /* for (const b of bytes): ints; of a Float64Array: numbers */
-            Type *et = is_f64(s->expr->type) ? ty_number : ty_int;
+        if (is_bytes(s->expr->type) || is_f64(s->expr->type) || is_f32(s->expr->type) || is_i32(s->expr->type)) { /* for (const b of bytes): ints; of a Float64Array (Float32Array): numbers; of an Int32Array: ints */
+            Type *et = is_f64(s->expr->type) || is_f32(s->expr->type) ? ty_number : ty_int;
             if (s->decl_type) { s->decl_type = resolve(s->decl_type, s->pos); if (s->decl_type->kind != et->kind) xs_error(XS8133, s->pos, NULL, "the elements are %s, not %s", ty_name(et), ty_name(s->decl_type)); }
             s->type = et;
             push_scope();
