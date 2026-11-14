@@ -1,0 +1,16 @@
+## rep 1
+gemm           c      gemm.c                  0.666s     0.66cpu     29.0MB  par  1.0  kern    0.642s  same
+gemm           xisto  gemm.ts                 0.680s     0.68cpu     29.3MB  par  1.0  kern    0.650s  same
+gemm           rust   gemm.rs                 0.669s     0.67cpu     29.4MB  par  1.0  kern    0.644s  same
+gemm           go     gemm.go                 4.863s     4.88cpu     29.8MB  par  1.0  kern    4.833s  same
+## rep 2
+gemm           c      gemm.c                  0.655s     0.65cpu     29.0MB  par  1.0  kern    0.631s  same
+gemm           xisto  gemm.ts                 0.665s     0.66cpu     29.3MB  par  1.0  kern    0.633s  same
+gemm           rust   gemm.rs                 0.645s     0.64cpu     29.4MB  par  1.0  kern    0.620s  same
+gemm           go     gemm.go                 4.844s     4.86cpu     29.8MB  par  1.0  kern    4.814s  same
+## rep 3
+gemm           c      gemm.c                  0.676s     0.67cpu     29.0MB  par  1.0  kern    0.652s  same
+gemm           xisto  gemm.ts                 0.663s     0.66cpu     29.3MB  par  1.0  kern    0.633s  same
+gemm           rust   gemm.rs                 0.654s     0.65cpu     29.4MB  par  1.0  kern    0.630s  same
+gemm           go     gemm.go                 4.877s     4.89cpu     29.8MB  par  1.0  kern    4.845s  same
+DONE
