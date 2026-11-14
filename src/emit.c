@@ -598,6 +598,7 @@ static bool f32_exact(Expr *e);
 static bool bce_safe(Expr *e); /* an index the loop already checks (see bce_enter) */
 static Expr *bce_promo_t; /* a slot kept in a C local while a loop is emitted (bce_promo_plan) */
 static int bce_promo_id;
+static bool bce_promo_w64; /* that local is the int64_t of a selection reduction on an Int32Array slot (bce_sel_plan) */
 static bool bce_same_bx(Expr *a, Expr *b);
 static bool bce_same(Expr *a, Expr *b);
 /* u8reg: byte arrays a loop keeps in vector registers (see u8reg_loop) */
@@ -636,7 +637,14 @@ static const char *tmpl_into; /* the next short template's buffer (a string on t
 static bool sm_mode;
 static const char **sm_names;
 static int sm_n, sm_states;
+/* lanes of a loop (lj_emit): its lane's locals and counter, renamed while one lane is emitted */
+static bool lj_on;
+static Expr *lj_set[96];
+static int nlj_set;
+static const char *lj_from[24], *lj_to[24];
+static int nlj_map;
 static const char *ren(const char *name) {
+    if (nlj_map && name) for (int i = 0; i < nlj_map; i++) if (strcmp(lj_from[i], name) == 0) return lj_to[i];
     if (sm_mode && name) {
         for (int i = 0; i < sm_n; i++) if (strcmp(sm_names[i], name) == 0) return xs_sprintf("fr_->%s", name);
     }
@@ -1328,6 +1336,11 @@ static bool bce_fw_is(Expr *e, Expr *slot) { return e && slot && e->kind == E_IN
 static void emit_lvalue_ptr(Expr *e) {
     if (bce_fw_loop && e->kind == E_INDEX)
         for (int k = 0; k < nbce_fw; k++) if (bce_fw_is(e, bce_fw[k].r)) { buf_printf(out, "&fm%d_", bce_fw[k].id); return; }
+    if (bce_promo_t && e->kind == E_INDEX && bce_same_bx(e->lhs, bce_promo_t->lhs) && bce_same(e->rhs, bce_promo_t->rhs)) {
+        buf_printf(out, "&pr%d_", bce_promo_id); /* the slot in a register (bce_promo_plan, bce_sel_plan): before a column's
+                                                         table, which may reach it too */
+        return;
+    }
     if (e->kind == E_INDEX) { /* a column the guard proved, through the rows' data pointers (bce_rd_type) */
         int rd = bce_col_rd(e);
         if (rd >= 0) {
@@ -1338,10 +1351,6 @@ static void emit_lvalue_ptr(Expr *e) {
             buf_puts(out, "])");
             return;
         }
-    }
-    if (bce_promo_t && e->kind == E_INDEX && bce_same_bx(e->lhs, bce_promo_t->lhs) && bce_same(e->rhs, bce_promo_t->rhs)) {
-        buf_printf(out, "&pr%d_", bce_promo_id); /* the slot in a register (bce_promo_plan) */
-        return;
     }
     switch (e->kind) {
     case E_IDENT:
@@ -3532,6 +3541,12 @@ static void emit_expr_raw(Expr *e) {
                     buf_printf(out, " = fn%d_)", bce_fw[k].id);
                     return;
                 }
+        if (bce_promo_w64 && bce_promo_t && e->op == TK_ASSIGN && bce_fw_is(e->lhs, bce_promo_t)) { /* (bce_sel_plan: no ToInt32 on the way) */
+            buf_printf(out, "(pr%d_ = (int64_t)(", bce_promo_id);
+            emit_expr(e->rhs);
+            buf_puts(out, "))");
+            return;
+        }
         if (is_i32_index(e->lhs) && (e->op == TK_ASSIGN || e->op == TK_PLUS_ASSIGN || e->op == TK_MINUS_ASSIGN || e->op == TK_STAR_ASSIGN ||
                                      e->op == TK_SLASH_ASSIGN)) {
             /* i[k] = v, i[k] op= v on an Int32Array: the value computed (an int, or a number), stored through ToInt32; the
@@ -6497,7 +6512,10 @@ typedef struct { const char *x; Type *t; int id; const char *rdt; } BceRect; /* 
 /* the rows' data pointers (rd<id>_): built by the guard with the least length, once per nest, so a column X[k][c]
    reads rd[k][c], one load less than X->data[k]->data[c] (the address of the element as a 2D array of C or Rust
    gets it, from its row's start); 12-15% on B[r][s] += A[r][t] * A[s][t] at n = 2000 on the M4. Rows of number[],
-   int[], Float64Array, Float32Array, Int32Array. XISTO_NO_BCE_RD turns it off. */
+   int[], Float64Array, Float32Array, Int32Array. XISTO_NO_BCE_RD turns it off. Beside it, whether the rows' blocks
+   are apart (ad<id>_: 1 yes, -1 no, 0 not known yet; bce_rows_apart_c computes it the first time a guard asks) and
+   their span [ab<id>_, ae<id>_): with ad 1, rows of different indexes share no element, and an address outside the
+   span is in no row (bce_sel_plan). */
 static const char *bce_rd_type(Type *rt) {
     if (getenv("XISTO_NO_BCE_RD") || !rt) return NULL;
     if (rt->kind == TY_ARRAY && rt->elem) return rt->elem->kind == TY_NUMBER ? "double" : rt->elem->kind == TY_INT ? "int64_t" : NULL;
@@ -6550,7 +6568,8 @@ static int bce_rect_open(Stmt *s) {
         const char *rdt = bce_rd_type(u[k].t->elem);
         bce_rect[nbce_rect++] = (BceRect){u[k].x, u[k].t, id, rdt};
         buf_printf(out, "%sint64_t ml%d_ = -1; (void)ml%d_; ", opened ? "" : "{ ", id, id);
-        if (rdt) buf_printf(out, "%s **rd%d_ __attribute__((cleanup(xs_rd_free))) = NULL; (void)rd%d_; ", rdt, id, id);
+        if (rdt) buf_printf(out, "%s **rd%d_ __attribute__((cleanup(xs_rd_free))) = NULL; int ad%d_ = 0; char *ab%d_ = NULL, *ae%d_ = NULL; (void)rd%d_; (void)ad%d_; (void)ab%d_; (void)ae%d_; ",
+                            rdt, id, id, id, id, id, id, id, id);
         opened++;
     }
     return opened;
@@ -6828,6 +6847,7 @@ static bool bce_base_match(Expr *b, BceLoop *l) {
 /* a[i] that needs no check: the index and the array of an enclosing safe counted loop, i >= 0 */
 static bool bce_safe(Expr *e) {
     if (!e || e->kind != E_INDEX || !e->lhs || !e->rhs || ictx) return false;
+    if (lj_on) for (int k = 0; k < nlj_set; k++) if (lj_set[k] == e) return true; /* (lanes: the guard proved every index of the nest) */
     if (e->lhs->kind == E_IDENT && e->lhs->cname && bce_indexable(e->lhs->type)) { /* an array of a known length, an index whose range is within it */
         int64_t n = bce_fixed_n(e->lhs->cname);
         Rng r = n > 0 ? rng_of(e->rhs) : rng_none();
@@ -8379,6 +8399,183 @@ static char *bce_fw_plan(Stmt *s, const char *i) {
     if (!nbce_fw) return NULL;
     return g.data;
 }
+/* ---- a selection reduction on an Int32Array slot (nussinov: table[i][j] = max_score(table[i][j], table[i][k] + table[k + 1][j])) ----
+   In the copy of a versioned loop without checks, a body that is one `T = SEL(T, e)`, T an Int32Array element at an
+   invariant place and SEL one of its two operands chosen by comparing them (`a >= b ? a : b` written in place, a leaf
+   function whose body is that return, Math.max or Math.min of two ints: a max or a min), keeps T in a C int64_t for
+   the whole loop, without the ToInt32 of each store: the local starts at T and becomes SEL(local, e). That is the program's value as long as
+   no chosen e falls outside int32: the values a max (min) goes through are between the first T and the last one,
+   so when the last fits int32 (one test after the loop) every store the program made was exact and the last is the
+   value stored; otherwise the loop runs again as it was, from T, which nothing wrote. Without the ToInt32 between
+   steps the C compiler sees a max (min) reduction it can split across registers and vector lanes (an exact,
+   associative operation on integers). e cannot fail nor run user code: int names and numbers, + - * whose range
+   (rng_of) is bounded, comparisons, proved indexes of int slots, selections. T must be the only way to its element
+   among the slots e reads: the same row at another index (the counter, outside the loop's range; an invariant
+   that differs), a column X[k + E][c] with X's rows apart (ad 1, tested once per nest) and T's row of X outside the
+   rows the loop reaches, or T outside the span of X's rows, or another block with T's address outside it.
+   XISTO_NO_SEL turns it off. */
+static bool bce_rows_helper; /* xs_rows_apart_ placed among the program's helpers */
+static bool bce_cmp_helper, bce_blocks_helper;
+static void bce_cmp_helper_emit(void) {
+    if (bce_cmp_helper) return;
+    bce_cmp_helper = true;
+    buf_puts(&json_fns, "static int xs_rows_cmp_(const void *a, const void *b) { const char *x = *(char *const *)a, *y = *(char *const *)b; return x < y ? -1 : x > y; }\n");
+}
+static void bce_rows_helper_emit(void) {
+    if (bce_rows_helper) return;
+    bce_rows_helper = true;
+    bce_cmp_helper_emit();
+    buf_puts(&json_fns, "/* k blocks [pp[2i], pp[2i + 1]): 1 when no two share a byte, else -1; their span */\n"
+                        "static int xs_rows_apart_(char **pp, int64_t k, char **lo, char **hi) {\n"
+                        "    int64_t i = 1;\n"
+                        "    while (i < k && pp[2 * i] >= pp[2 * i - 1]) i++;\n"
+                        "    if (i < k) { qsort(pp, (size_t)k, 2 * sizeof(char *), xs_rows_cmp_); for (i = 1; i < k; i++) if (pp[2 * i] < pp[2 * i - 1]) return -1; }\n"
+                        "    *lo = k ? pp[0] : NULL; *hi = k ? pp[2 * k - 1] : NULL;\n"
+                        "    return 1;\n"
+                        "}\n");
+}
+static void bce_blocks_helper_emit(void) {
+    if (bce_blocks_helper) return;
+    bce_blocks_helper = true;
+    bce_cmp_helper_emit();
+    buf_puts(&json_fns, "/* k blocks [pp[3i], pp[3i + 1]), written when pp[3i + 2]: 1 when no written block shares a byte with another block */\n"
+                        "static int xs_blocks_apart_(char **pp, int64_t k) {\n"
+                        "    qsort(pp, (size_t)k, 3 * sizeof(char *), xs_rows_cmp_);\n"
+                        "    char *me = NULL, *mw = NULL;\n"
+                        "    for (int64_t i = 0; i < k; i++) {\n"
+                        "        char *b = pp[3 * i], *e = pp[3 * i + 1];\n"
+                        "        if ((mw && b < mw) || (pp[3 * i + 2] && me && b < me)) return -1;\n"
+                        "        if (!me || e > me) me = e;\n"
+                        "        if (pp[3 * i + 2] && (!mw || e > mw)) mw = e;\n"
+                        "    }\n"
+                        "    return 1;\n"
+                        "}\n");
+}
+/* the test that X's rows are apart, computed once per nest (ad<id>_), as C */
+static char *bce_rows_apart_c(int rd) {
+    BceRect *r = NULL;
+    for (int k = nbce_rect - 1; k >= 0 && !r; k--) if (bce_rect[k].id == rd) r = &bce_rect[k];
+    if (!r || !r->rdt) return NULL;
+    bce_rows_helper_emit();
+    Type *rt = r->t->elem;
+    const char *rs = rt->kind == TY_ARRAY ? arr_struct(rt) : rt->cls->cname, *X = ren(r->x);
+    return xs_sprintf("({ if (!ad%d_) { int64_t n_ = (int64_t)(%s)->len, k_ = 0; char **pp_ = malloc((size_t)(n_ ? n_ : 1) * 2 * sizeof(char *)); if (!pp_) xs_panic(\"out of memory\"); "
+                      "for (int64_t r_ = 0; r_ < n_; r_++) { %s *p_ = (%s *)(%s)->data[r_]; int64_t l_ = p_ ? (int64_t)p_->len : 0; "
+                      "if (l_ > 0) { pp_[2 * k_] = (char *)p_->data; pp_[2 * k_ + 1] = (char *)p_->data + l_ * (int64_t)sizeof(%s); k_++; } } "
+                      "ad%d_ = xs_rows_apart_(pp_, k_, &ab%d_, &ae%d_); free(pp_); } ad%d_ > 0; })",
+                      rd, X, rs, rs, X, r->rdt, rd, rd, rd, rd);
+}
+static bool sel_cmp(int op) { return op == TK_LT || op == TK_LE || op == TK_GT || op == TK_GE; }
+static bool sel_is_param(Expr *e, const char *p) { return e && e->kind == E_IDENT && e->cname && p && strcmp(e->cname, p) == 0; }
+/* f(a, b) { return a CMP b ? a : b } (either order in the test and in the arms): f's value is one of a and b */
+static bool sel_leaf_fn(Func *f) {
+    if (!f || f->nparams != 2 || !bce_leaf_pure(f) || !f->ret || f->ret->kind != TY_INT) return false;
+    if (!f->params[0].type || f->params[0].type->kind != TY_INT || !f->params[1].type || f->params[1].type->kind != TY_INT) return false;
+    Stmt *b = f->body;
+    while (b && b->kind == S_BLOCK && b->stmts.len == 1) b = b->stmts.items[0];
+    if (!b || b->kind != S_RETURN || !b->expr) return false;
+    Expr *c = b->expr;
+    if (c->kind != E_COND || c->builtin.cfn || c->args.len != 2 || !c->lhs || c->lhs->kind != E_BINARY || !sel_cmp(c->lhs->op)) return false;
+    const char *p0 = f->params[0].cname, *p1 = f->params[1].cname;
+    Expr *t0 = c->lhs->lhs, *t1 = c->lhs->rhs, *a0 = c->args.items[0], *a1 = c->args.items[1];
+    bool test = (sel_is_param(t0, p0) && sel_is_param(t1, p1)) || (sel_is_param(t0, p1) && sel_is_param(t1, p0));
+    bool arms = (sel_is_param(a0, p0) && sel_is_param(a1, p1)) || (sel_is_param(a0, p1) && sel_is_param(a1, p0));
+    return test && arms;
+}
+static bool sel_math(Expr *r) { /* Math.max(a, b) or Math.min(a, b) of two ints */
+    return r && r->kind == E_MEMBER && r->is_call && !r->func && r->lhs && r->lhs->kind == E_IDENT && !r->lhs->cname && r->lhs->str &&
+           strcmp(r->lhs->str, "Math") == 0 && r->str && (strcmp(r->str, "max") == 0 || strcmp(r->str, "min") == 0) && r->args.len == 2 &&
+           r->args.items[0]->type && r->args.items[0]->type->kind == TY_INT && r->args.items[1]->type && r->args.items[1]->type->kind == TY_INT;
+}
+static bool sel_eq(Expr *a, Expr *b) { /* the same pure expression (numbers, names, + - *, indexes) */
+    if (!a || !b || a->kind != b->kind) return false;
+    switch (a->kind) {
+    case E_NUMBER: return a->is_int_lit && b->is_int_lit && a->ival == b->ival;
+    case E_IDENT: return a->cname && b->cname && strcmp(a->cname, b->cname) == 0;
+    case E_BINARY: return a->op == b->op && sel_eq(a->lhs, b->lhs) && sel_eq(a->rhs, b->rhs);
+    case E_INDEX: return !a->builtin.cfn && !b->builtin.cfn && sel_eq(a->lhs, b->lhs) && sel_eq(a->rhs, b->rhs);
+    default: return false;
+    }
+}
+/* the operand of SEL(T, e) that is not T (NULL: r is not such a selection) */
+static Expr *sel_other(Expr *r, Expr *t) {
+    if (!r || !r->type || r->type->kind != TY_INT) return NULL;
+    Expr *a0, *a1;
+    if ((r->kind == E_CALL && r->func && r->args.len == 2 && sel_leaf_fn(r->func)) || sel_math(r)) { a0 = r->args.items[0]; a1 = r->args.items[1]; }
+    else if (r->kind == E_COND && !r->builtin.cfn && r->args.len == 2 && r->lhs && r->lhs->kind == E_BINARY && sel_cmp(r->lhs->op)) {
+        a0 = r->args.items[0]; a1 = r->args.items[1];
+        Expr *c0 = r->lhs->lhs, *c1 = r->lhs->rhs;
+        if (!((sel_eq(c0, a0) && sel_eq(c1, a1)) || (sel_eq(c0, a1) && sel_eq(c1, a0)))) return NULL;
+    } else return NULL;
+    Expr *x = bce_fw_is(a0, t) ? a1 : bce_fw_is(a1, t) ? a0 : NULL;
+    return x && x->type && x->type->kind == TY_INT ? x : NULL;
+}
+/* e cannot fail nor run user code and does not read T itself; the int slots it reads go into slots */
+static bool sel_e(Expr *e, Expr *t, Expr **slots, int *ns) {
+    if (!e || !e->type) return false;
+    switch (e->kind) {
+    case E_NUMBER: return e->is_int_lit;
+    case E_IDENT: return e->type->kind == TY_INT && e->cname;
+    case E_INDEX:
+        if (e->builtin.cfn || e->type->kind != TY_INT || bce_fw_is(e, t) || !bce_safe(e) || *ns == 16) return false;
+        slots[(*ns)++] = e;
+        return true; /* (its row and index: proved by the guard, read without a check) */
+    case E_UNARY: return e->op == TK_MINUS && e->type->kind == TY_INT && rng_of(e).ok && sel_e(e->lhs, t, slots, ns);
+    case E_BINARY:
+        if (e->type->kind == TY_INT && (e->op == TK_PLUS || e->op == TK_MINUS || e->op == TK_STAR))
+            return rng_of(e).ok && sel_e(e->lhs, t, slots, ns) && sel_e(e->rhs, t, slots, ns);
+        if (e->type->kind == TY_BOOLEAN && (sel_cmp(e->op) || e->op == TK_EQ || e->op == TK_NEQ) && e->lhs && e->lhs->type && e->lhs->type->kind == TY_INT)
+            return sel_e(e->lhs, t, slots, ns) && sel_e(e->rhs, t, slots, ns);
+        return false;
+    case E_COND:
+        if (e->builtin.cfn || e->args.len != 2 || !e->lhs || !e->lhs->type || e->lhs->type->kind != TY_BOOLEAN) return false;
+        return sel_e(e->lhs, t, slots, ns) && sel_e(e->args.items[0], t, slots, ns) && sel_e(e->args.items[1], t, slots, ns);
+    case E_CALL: case E_MEMBER:
+        if (!sel_math(e) && (e->kind != E_CALL || !e->func || e->args.len != 2 || !sel_leaf_fn(e->func))) return false;
+        return sel_e(e->args.items[0], t, slots, ns) && sel_e(e->args.items[1], t, slots, ns);
+    default: return false;
+    }
+}
+/* the tests that make T the only way to its element (NULL: not this form); sets bce_promo_t */
+static char *bce_sel_plan(Stmt *s, const char *i) {
+    if (getenv("XISTO_NO_SEL") || xs_debug || sm_mode || ictx) return NULL;
+    Stmt *b = s->body;
+    while (b && b->kind == S_BLOCK && b->stmts.len == 1) b = b->stmts.items[0];
+    if (!b || b->kind != S_EXPR || !b->expr || b->expr->kind != E_ASSIGN || b->expr->op != TK_ASSIGN) return NULL;
+    Expr *t = b->expr->lhs;
+    if (!is_i32_index(t) || !bce_safe(t) || !bce_inv(t->rhs, s->body, i) || !(t->lhs->kind == E_IDENT || bce_base(t->lhs, s->body, i))) return NULL;
+    Expr *x = sel_other(b->expr->rhs, t), *slots[16];
+    int ns = 0;
+    if (!x || !sel_e(x, t, slots, &ns)) return NULL;
+    char *c = bce_raw(t->rhs), *tb = bce_base_c(t->lhs);
+    char *ta = xs_sprintf("((char *)&%s->data[%s])", tb, c);
+    Buf g = {0};
+    buf_puts(&g, "1");
+    for (int k = 0; k < ns; k++) {
+        Expr *e = slots[k], *bb = e->lhs;
+        int rd = bce_col_rd(e);
+        if (rd >= 0) { /* a column X[k + E][c]: the rows in order and apart, T's row of X outside the rows reached, or T outside them all */
+            Expr *X = bb->lhs;
+            char *off = bce_col_off(bb->rhs, i);
+            char *ap = bce_rows_apart_c(rd);
+            if (!ap) return NULL;
+            if (t->lhs->kind == E_INDEX && t->lhs->lhs->kind == E_IDENT && t->lhs->lhs->cname && strcmp(t->lhs->lhs->cname, X->cname) == 0) {
+                char *R = bce_raw(t->lhs->rhs);
+                buf_printf(&g, " && %s && ((%s) < (%s) + %s || (%s) > %s + %s)", ap, R, bce_g_st, off, R, bce_g_last, off);
+            } else buf_printf(&g, " && %s && (%s < ab%d_ || %s >= ae%d_)", ap, ta, rd, ta, rd);
+        } else if (bce_same_bx(bb, t->lhs)) { /* T's own row at another index */
+            if (e->rhs->kind == E_IDENT && e->rhs->cname && strcmp(e->rhs->cname, i) == 0)
+                buf_printf(&g, " && ((%s) < (%s) || (%s) > %s)", c, bce_g_st, c, bce_g_last);
+            else if (bce_inv(e->rhs, s->body, i)) buf_printf(&g, " && (%s) != (%s)", bce_raw(e->rhs), c);
+            else return NULL;
+        } else if (bb->kind == E_IDENT || bce_base(bb, s->body, i)) { /* another block: T's address outside it */
+            char *B = bce_base_c(bb);
+            buf_printf(&g, " && (%s < (char *)%s->data || %s >= (char *)(%s->data + %s->len))", ta, B, ta, B, B);
+        } else return NULL;
+    }
+    bce_promo_t = t;
+    return g.data;
+}
 /* ---- unroll-and-jam of j (2mm, 3mm, doitgen, gramschmidt, the second half of lu: H3 in chat-arquiteto-cpu) ----
    for (let j = J0; j < JL; j++) {
      [T = e0; | T *= e0;]
@@ -8393,7 +8590,13 @@ static char *bce_fw_plan(Stmt *s, const char *i) {
    index on its ranges, every row reached, that no block read overlaps T's (the same row is allowed with its indexes
    apart: lu's A[i][k], k < i <= j), and that nothing read outside the lane's own column j falls on the span of Y's rows
    at an index of [J0, JL); the rows read by a counter go to a table of their data. When the guard fails, or for the
-   j's left over, the loop runs as it was. XISTO_NO_UJAM turns it off; XISTO_UJAM_U sets U (8). */
+   j's left over, the loop runs as it was. XISTO_NO_UJAM turns it off; XISTO_UJAM_U sets U (xs_jam_uj, xs_jam_uk). */
+/* U by target (kernel LARGE, 2026-11-14): the jam of j (and its forms: gramschmidt's, symm's, covariance's...) best at
+   16 on the M4, the Xeon E5-2686 v4 (Broadwell) and the Graviton2 (Neoverse-N1), 16 better than 8 in every such kernel
+   on the three; the jam of k (syrk, syr2k: U values of k into one element) 12 on x86 with AVX2 and 8 on ARM (16 made
+   syr2k slower on all three). main.c sets xs_jam_uk to 12 when the code is for an AVX2 x86 (--cpu=native there, or a
+   named Haswell-or-later); any other target keeps 16 and 8. The init's jam in t (uj_emit_km) stays at 8. */
+int xs_jam_uj = 16, xs_jam_uk = 8;
 typedef struct { Expr *e, *base, *idx; bool krow, self, lrow, mrow; int grp, yp; } UjLd; /* yp: a self load's post (Y table); lrow: X[j][c],
    the lane's own row (mvt: A[i][j] in a loop over j, i the lane), from a table by the lane */
 static UjLd uj_ld[24];
@@ -8887,7 +9090,7 @@ static bool uj_emit_loop(Stmt *s) {
     uj_kmode = false;
     if (!uj_match(s)) { if (!uj_match_k(s)) return false; uj_kmode = true; }
     bool kmode = uj_kmode;
-    int id = uj_cur = uj_ids++, U = 8;
+    int id = uj_cur = uj_ids++, U = kmode ? xs_jam_uk : xs_jam_uj;
     const char *ue = getenv("XISTO_UJAM_U");
     if (ue && atoi(ue) >= 2 && atoi(ue) <= 16) U = atoi(ue);
     bool ar = false;
@@ -9136,9 +9339,449 @@ static bool uj_emit_loop(Stmt *s) {
     buf_puts(out, " }");
     return true;
 }
+/* ---- lanes of a loop whose inner loops carry a recurrence (adi's sweeps, deriche's passes: H "jam de lanes") ----
+   for (let o = O0; o < OL; o++) {
+     let x = e; ...                                         (the lane's locals)
+     A[o][c] = e; ...                                       (stores at the lane's row, or column: A[r][o])
+     for (let m = M0; m < ML; m++) { x = e; A[o][m] = e; ... }   (or m-- down to ML; bounds invariant in the nest)
+     ...
+   }
+   Each iteration o writes only elements at its own row o (or column o) of the arrays it stores to, and its own
+   locals, and reads of those arrays stay at its own row (column); the other arrays it reads, nobody writes. So the
+   iterations are independent, and U of them (lanes) run together: each statement once per lane, in the program's
+   order within each lane, the inner loops in step. A recurrence in an inner loop (a local or an element carried from
+   one m to the next: adi's p[i][j - 1], deriche's ym1) is then U independent chains instead of one, and the time
+   per element goes from the latency of the chain (a division, a few adds) to the throughput of the units. Every
+   operation is the program's, on the same values, so the result is the same bits. Expressions: number arithmetic,
+   Math.fround, numbers, invariant names, the lane's locals and counters, elements of 2D arrays of number rows
+   (number[], Float64Array, Float32Array) at indexes o + E, m + E or invariant, 1D arrays read only. The guard, once
+   per entry: every index within its array for the whole ranges (the rows' least length), and no block (row) of an
+   array written sharing a byte with any other block of the arrays the nest reaches (sorted once: xs_blocks_apart_).
+   Only a loop with a recurrence: the others vectorize as they are. The o's left (fewer than U), and the whole loop
+   when the guard fails, run as before. XISTO_NO_LJAM turns it off; XISTO_LJ_U sets U (4). */
+typedef struct { Expr *e; int arr; Expr *ri, *ci; Stmt *loop; bool store; } LjAcc; /* dim 2: X[ri][ci]; dim 1: x[ci] (ri NULL) */
+typedef struct { const char *x; Type *t; int dim, form; bool written; } LjArr; /* form: 1 rows (W[o][..]), 2 columns (W[..][o]) */
+typedef struct { Stmt *s; const char *ctr; char *lo, *hi; bool down; } LjLoop;
+static LjAcc lj_acc[64];
+static LjArr lj_arr[8];
+static LjLoop lj_loops[6];
+static int nlj_acc, nlj_arr, nlj_loops, lj_ids;
+static const char *lj_o, *lj_loc[16];
+static int nlj_loc;
+static Stmt *lj_nest;
+static LjLoop *lj_cur; /* the inner loop being matched (NULL: the lane's own statements) */
+static bool lj_rec, lj_cur_assigned[16], lj_cur_read[16]; /* (a local both read and assigned in an inner loop: carried) */
+static int lj_loc_find(const char *c) { for (int k = 0; c && k < nlj_loc; k++) if (strcmp(lj_loc[k], c) == 0) return k; return -1; }
+static bool lj_is(Expr *e, const char *c) { return e && e->kind == E_IDENT && e->cname && c && strcmp(e->cname, c) == 0; }
+/* an index: an invariant, or the lane's counter o (or the inner loop's counter) plus or minus an invariant atom */
+static bool lj_ix(Expr *x) {
+    if (!x || !x->type || x->type->kind != TY_INT) return false;
+    const char *m = lj_cur ? lj_cur->ctr : NULL;
+    if (lj_is(x, lj_o) || (m && lj_is(x, m))) return true;
+    if (x->kind == E_BINARY && (x->op == TK_PLUS || x->op == TK_MINUS)) {
+        bool l = lj_is(x->lhs, lj_o) || (m && lj_is(x->lhs, m)), r = lj_is(x->rhs, lj_o) || (m && lj_is(x->rhs, m));
+        if (l && !r) return bce_inv_atom(x->rhs, lj_nest, lj_o) && bce_names_plain(x->rhs);
+        if (r && !l && x->op == TK_PLUS) return bce_inv_atom(x->lhs, lj_nest, lj_o) && bce_names_plain(x->lhs);
+    }
+    return bce_inv(x, lj_nest, lj_o) && bce_names_plain(x);
+}
+/* the least and the greatest value of an index over the ranges, as C */
+static void lj_range(Expr *x, LjLoop *l, char **lo, char **hi, const char *o0, const char *ol) {
+    const char *m = l ? l->ctr : NULL;
+    Expr *c = NULL, *E = NULL;
+    int sg = 1;
+    if (lj_is(x, lj_o) || (m && lj_is(x, m))) c = x;
+    else if (x->kind == E_BINARY && (lj_is(x->lhs, lj_o) || (m && lj_is(x->lhs, m)))) { c = x->lhs; E = x->rhs; sg = x->op == TK_MINUS ? -1 : 1; }
+    else if (x->kind == E_BINARY && (lj_is(x->rhs, lj_o) || (m && lj_is(x->rhs, m)))) { c = x->rhs; E = x->lhs; }
+    if (!c) { *lo = *hi = bce_raw(x); return; }
+    const char *a = lj_is(c, lj_o) ? o0 : l->lo, *b = lj_is(c, lj_o) ? xs_sprintf("((%s) - 1)", ol) : l->hi;
+    if (!E) { *lo = (char *)a; *hi = (char *)b; return; }
+    char *e = bce_raw(E);
+    *lo = xs_sprintf("((%s) %s (%s))", a, sg < 0 ? "-" : "+", e);
+    *hi = xs_sprintf("((%s) %s (%s))", b, sg < 0 ? "-" : "+", e);
+}
+static bool lj_row_num(Type *t) { /* rows of numbers */
+    return t && ((t->kind == TY_ARRAY && t->elem && t->elem->kind == TY_NUMBER) || is_f64_type(t) || is_f32_type(t));
+}
+static int lj_arr_of(const char *x, Type *t, int dim) {
+    for (int k = 0; k < nlj_arr; k++) if (strcmp(lj_arr[k].x, x) == 0) return lj_arr[k].dim == dim ? k : -1;
+    if (nlj_arr == 8) return -1;
+    lj_arr[nlj_arr] = (LjArr){x, t, dim, 0, false};
+    return nlj_arr++;
+}
+static bool lj_access(Expr *e, bool store) {
+    if (!e || e->kind != E_INDEX || e->builtin.cfn || !e->type || e->type->kind != TY_NUMBER || nlj_acc == 64 || nlj_set + 2 > 96) return false;
+    Expr *b = e->lhs;
+    int a;
+    Expr *ri = NULL;
+    if (b->kind == E_IDENT) { /* x[c]: read only */
+        if (store || !b->cname || !bce_plain_local(b->cname) || !lj_row_num(b->type) || bce_writes(lj_nest, b->cname) || bce_declares(lj_nest, b->cname)) return false;
+        if ((a = lj_arr_of(b->cname, b->type, 1)) < 0) return false;
+    } else {
+        if (b->kind != E_INDEX || b->builtin.cfn || !b->lhs || b->lhs->kind != E_IDENT || !b->lhs->cname || !bce_plain_local(b->lhs->cname) ||
+            !b->lhs->type || b->lhs->type->kind != TY_ARRAY || !lj_row_num(b->type) || bce_writes(lj_nest, b->lhs->cname) ||
+            bce_declares(lj_nest, b->lhs->cname) || !lj_ix(b->rhs)) return false;
+        if ((a = lj_arr_of(b->lhs->cname, b->lhs->type, 2)) < 0) return false;
+        ri = b->rhs;
+        lj_set[nlj_set++] = b;
+    }
+    if (!lj_ix(e->rhs)) return false;
+    if (store) {
+        int form = lj_is(ri, lj_o) ? 1 : lj_is(e->rhs, lj_o) ? 2 : 0;
+        if (!form || (lj_arr[a].form && lj_arr[a].form != form)) return false;
+        lj_arr[a].form = form;
+        lj_arr[a].written = true;
+    }
+    lj_set[nlj_set++] = e;
+    lj_acc[nlj_acc++] = (LjAcc){e, a, ri, e->rhs, lj_cur ? lj_cur->s : NULL, store};
+    return true;
+}
+static bool lj_expr(Expr *e) {
+    if (!e || !e->type) return false;
+    switch (e->kind) {
+    case E_NUMBER: return true;
+    case E_IDENT: {
+        if (e->type->kind != TY_NUMBER && e->type->kind != TY_INT) return false;
+        int k = lj_loc_find(e->cname);
+        if (k >= 0) { if (lj_cur) lj_cur_read[k] = true; return true; }
+        if (lj_is(e, lj_o) || (lj_cur && lj_is(e, lj_cur->ctr))) return true;
+        return e->cname && bce_plain_local(e->cname) && !bce_writes(lj_nest, e->cname) && !bce_declares(lj_nest, e->cname);
+    }
+    case E_BINARY:
+        if (e->type->kind != TY_NUMBER || (e->op != TK_PLUS && e->op != TK_MINUS && e->op != TK_STAR && e->op != TK_SLASH)) return false;
+        return lj_expr(e->lhs) && lj_expr(e->rhs);
+    case E_UNARY: return e->op == TK_MINUS && e->type->kind == TY_NUMBER && lj_expr(e->lhs);
+    case E_MEMBER: return f32_fround_call(e) && lj_expr(e->args.items[0]);
+    case E_INDEX: return lj_access(e, false);
+    default: return false;
+    }
+}
+static bool lj_assign(Stmt *s) { /* x = e, A[..][..] = e (op=) */
+    s = uj_only(s);
+    if (!s || s->kind != S_EXPR || !s->expr || s->expr->kind != E_ASSIGN) return false;
+    Expr *a = s->expr;
+    if (a->op != TK_ASSIGN && a->op != TK_PLUS_ASSIGN && a->op != TK_MINUS_ASSIGN && a->op != TK_STAR_ASSIGN && a->op != TK_SLASH_ASSIGN) return false;
+    if (!a->type || a->type->kind != TY_NUMBER || !lj_expr(a->rhs)) return false;
+    if (a->lhs && a->lhs->kind == E_IDENT) {
+        int k = lj_loc_find(a->lhs->cname);
+        if (k < 0) return false;
+        if (lj_cur) lj_cur_assigned[k] = true;
+        return true;
+    }
+    return lj_access(a->lhs, true);
+}
+static bool lj_inner(Stmt *f) { /* an inner loop: counted up or down, invariant bounds, a straight body of assignments */
+    if (nlj_loops == 6 || !f || f->kind != S_FOR) return false;
+    Expr *u = f->for_update, *c = f->cond;
+    Stmt *fi = f->for_init;
+    if (!fi || fi->kind != S_VAR || !fi->cname || !fi->init || !bce_pure(fi->init) || !bce_inv(fi->init, lj_nest, lj_o) || !bce_names_plain(fi->init)) return false;
+    const char *m = fi->cname;
+    bool up = u && u->builtin.cfn && strcmp(u->builtin.cfn, "counted_inc") == 0 && lj_is(u->lhs, m);
+    bool down = u && (u->kind == E_POSTFIX || u->kind == E_UNARY) && u->op == TK_MINUSMINUS && lj_is(u->lhs, m);
+    if ((!up && !down) || !c || c->kind != E_BINARY || !lj_is(c->lhs, m) || !c->rhs || !bce_inv(c->rhs, lj_nest, lj_o) || !bce_names_plain(c->rhs) ||
+        stmt_writes_name(f->body, m)) return false;
+    char *st = bce_raw(fi->init), *L = bce_raw(c->rhs);
+    LjLoop l = {f, m, NULL, NULL, down};
+    if (up && c->op == TK_LT) { l.lo = st; l.hi = xs_sprintf("((%s) - 1)", L); }
+    else if (up && c->op == TK_LE) { l.lo = st; l.hi = L; }
+    else if (down && c->op == TK_GE) { l.lo = L; l.hi = st; }
+    else if (down && c->op == TK_GT) { l.lo = xs_sprintf("((%s) + 1)", L); l.hi = st; }
+    else return false;
+    lj_loops[nlj_loops] = l;
+    lj_cur = &lj_loops[nlj_loops++];
+    memset(lj_cur_assigned, 0, sizeof lj_cur_assigned);
+    memset(lj_cur_read, 0, sizeof lj_cur_read);
+    Stmt *b = f->body;
+    bool ok = true;
+    if (b && b->kind == S_BLOCK) { for (int k = 0; k < b->stmts.len && ok; k++) ok = lj_assign(b->stmts.items[k]); }
+    else ok = lj_assign(b);
+    for (int k = 0; k < nlj_loc; k++) if (lj_cur_read[k] && lj_cur_assigned[k]) lj_rec = true;
+    for (int k = 0; k < nlj_acc && ok; k++) { /* an element of a written array read at another place than the loop stores it: carried */
+        if (lj_acc[k].loop != f || lj_acc[k].store || !lj_arr[lj_acc[k].arr].written) continue;
+        bool same = false;
+        for (int z = 0; z < nlj_acc && !same; z++) same = lj_acc[z].loop == f && lj_acc[z].store && bce_same_bx(lj_acc[z].e, lj_acc[k].e);
+        if (!same) lj_rec = true;
+    }
+    lj_cur = NULL;
+    return ok;
+}
+static void lj_flat(Stmt *b, Stmt **st, int *n) {
+    if (!b) return;
+    if (b->kind == S_BLOCK) { for (int k = 0; k < b->stmts.len; k++) lj_flat(b->stmts.items[k], st, n); return; }
+    if (*n < 24) st[*n] = b;
+    (*n)++;
+}
+static bool lj_match(Stmt *s, Stmt **st, int *ns) {
+    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_LJAM") || bce_promo_t || bce_fw_loop) return false;
+    Expr *O0, *OL;
+    if (!uj_counted(s, &lj_o, &O0, &OL) || stmt_writes_name(s->body, lj_o)) return false;
+    lj_nest = s;
+    if (!bce_inv(OL, s, lj_o) || !bce_names_plain(OL) || !bce_inv(O0, s, lj_o) || !bce_names_plain(O0) || bce_row_store(s->body)) return false;
+    nlj_acc = nlj_arr = nlj_loops = nlj_loc = nlj_set = 0;
+    lj_rec = false;
+    lj_cur = NULL;
+    *ns = 0;
+    lj_flat(s->body, st, ns);
+    if (*ns > 24 || !*ns) return false;
+    bool loops = false;
+    for (int k = 0; k < *ns; k++) {
+        Stmt *t = st[k];
+        if (t->kind == S_VAR) {
+            if (!t->cname || t->cell || !t->type || (t->type->kind != TY_NUMBER) || !t->init || nlj_loc == 16 || !lj_expr(t->init)) return false;
+            lj_loc[nlj_loc++] = t->cname;
+        } else if (t->kind == S_FOR) { if (!lj_inner(t)) return false; loops = true; }
+        else if (!lj_assign(t)) return false;
+    }
+    if (!loops || !lj_rec) return false;
+    for (int k = 0; k < nlj_acc; k++) { /* a written array read at the lane's own row (column) only */
+        LjAcc *a = &lj_acc[k];
+        LjArr *r = &lj_arr[a->arr];
+        if (!r->written || a->store) continue;
+        if (r->form == 1 ? !lj_is(a->ri, lj_o) : !lj_is(a->ci, lj_o)) return false;
+    }
+    return true;
+}
+static const char *lj_rs(Type *t) { return t->kind == TY_ARRAY ? arr_struct(t) : t->cls->cname; }
+static bool lj_emit(Stmt *s) {
+    Stmt *st[24];
+    int ns = 0;
+    if (!lj_match(s, st, &ns)) return false;
+    int U = 4;
+    const char *ue = getenv("XISTO_LJ_U");
+    if (ue && atoi(ue) >= 2 && atoi(ue) <= 16) U = atoi(ue);
+    int id = lj_ids++;
+    Expr *O0, *OL;
+    const char *o;
+    uj_counted(s, &o, &O0, &OL);
+    char *o0 = xs_sprintf("lj%d_o0_", id), *ol = bce_raw(OL);
+    buf_printf(out, "{ int64_t lj%d_o0_ = %s, lj%d_ = lj%d_o0_; { ", id, bce_raw(O0), id, id);
+    bce_blocks_helper_emit();
+    /* each array: its length and its rows' least length; every block of the arrays in one list, those of the arrays
+       written marked: no written block may share a byte with another one (xs_blocks_apart_) */
+    buf_printf(out, "int ap%d_ = 1; int64_t nb%d_ = 0", id, id);
+    for (int a = 0; a < nlj_arr; a++) buf_printf(out, " + (int64_t)(%s)->len", ren(lj_arr[a].x));
+    buf_printf(out, "; char **pp%d_ = malloc((size_t)(nb%d_ ? nb%d_ : 1) * 3 * sizeof(char *)); int64_t k%d_ = 0; if (!pp%d_) xs_panic(\"out of memory\"); ", id, id, id, id, id);
+    for (int a = 0; a < nlj_arr; a++) {
+        LjArr *r = &lj_arr[a];
+        const char *X = ren(r->x), *W = r->written ? "(char *)1" : "NULL";
+        if (r->dim == 1) {
+            buf_printf(out, "int64_t ln%d_%d_ = (int64_t)(%s)->len, ml%d_%d_ = ln%d_%d_; if (ln%d_%d_ > 0) { pp%d_[3 * k%d_] = (char *)(%s)->data; pp%d_[3 * k%d_ + 1] = (char *)((%s)->data + ln%d_%d_); pp%d_[3 * k%d_ + 2] = %s; k%d_++; } ",
+                       id, a, X, id, a, id, a, id, a, id, id, X, id, id, X, id, a, id, id, W, id);
+            continue;
+        }
+        const char *rs = lj_rs(r->t->elem);
+        buf_printf(out, "int64_t ln%d_%d_ = (int64_t)(%s)->len, ml%d_%d_ = INT64_MAX; for (int64_t r_ = 0; r_ < ln%d_%d_; r_++) { %s *p_ = (%s *)(%s)->data[r_]; "
+                        "int64_t l_ = p_ ? (int64_t)p_->len : 0; if (l_ < ml%d_%d_) ml%d_%d_ = l_; "
+                        "if (l_ > 0) { pp%d_[3 * k%d_] = (char *)p_->data; pp%d_[3 * k%d_ + 1] = (char *)(p_->data + l_); pp%d_[3 * k%d_ + 2] = %s; k%d_++; } } ",
+                   id, a, X, id, a, id, a, rs, rs, X, id, a, id, a, id, id, id, id, id, id, W, id);
+    }
+    Buf g = {0};
+    buf_printf(&g, "lj%d_o0_ < (%s)", id, ol);
+    for (int l = 0; l < nlj_loops; l++) buf_printf(&g, " && (%s) <= (%s)", lj_loops[l].lo, lj_loops[l].hi);
+    for (int k = 0; k < nlj_acc; k++) {
+        LjAcc *c = &lj_acc[k];
+        LjLoop *lp = NULL;
+        for (int l = 0; l < nlj_loops; l++) if (lj_loops[l].s == c->loop) lp = &lj_loops[l];
+        char *lo, *hi;
+        if (c->ri) {
+            lj_range(c->ri, lp, &lo, &hi, o0, ol);
+            buf_printf(&g, " && (%s) >= 0 && (%s) < ln%d_%d_", lo, hi, id, c->arr);
+        }
+        lj_range(c->ci, lp, &lo, &hi, o0, ol);
+        buf_printf(&g, " && (%s) >= 0 && (%s) < ml%d_%d_", lo, hi, id, c->arr);
+    }
+    buf_printf(&g, " && (ap%d_ = xs_blocks_apart_(pp%d_, k%d_)) > 0", id, id, id); /* (last: only when the rest holds) */
+    buf_printf(out, "bool ok%d_ = %s; free(pp%d_); (void)ap%d_; if (ok%d_) { for (; lj%d_ <= (%s) - %d; lj%d_ += %d) { ", id, g.data, id, id, id, id, ol, U, id, U);
+    /* the lanes */
+    const char *saved_from[24], *saved_to[24];
+    int saved_n = nlj_map;
+    memcpy(saved_from, lj_from, sizeof saved_from);
+    memcpy(saved_to, lj_to, sizeof saved_to);
+    bool saved_on = lj_on;
+    lj_on = true;
+    char **names = xs_alloc(sizeof(char *) * (size_t)U * (size_t)(nlj_loc + 1));
+    for (int u = 0; u < U; u++) {
+        names[u * (nlj_loc + 1)] = xs_sprintf("(lj%d_ + %d)", id, u);
+        for (int k = 0; k < nlj_loc; k++) names[u * (nlj_loc + 1) + k + 1] = xs_sprintf("%s_l%d", lj_loc[k], u);
+    }
+#define LJ_LANE(u) do { nlj_map = 0; lj_from[nlj_map] = o; lj_to[nlj_map++] = names[(u) * (nlj_loc + 1)]; \
+        for (int k_ = 0; k_ < nlj_loc; k_++) { lj_from[nlj_map] = lj_loc[k_]; lj_to[nlj_map++] = names[(u) * (nlj_loc + 1) + k_ + 1]; } } while (0)
+    for (int k = 0; k < ns; k++) {
+        Stmt *t = st[k];
+        if (t->kind == S_VAR) {
+            for (int u = 0; u < U; u++) {
+                LJ_LANE(u);
+                buf_printf(out, "%s %s = ", f32v_has(t->cname) ? "float" : "double", ren(t->cname));
+                emit_expr(t->init);
+                buf_puts(out, "; ");
+            }
+        } else if (t->kind == S_FOR) {
+            LjLoop *lp = NULL;
+            for (int l = 0; l < nlj_loops; l++) if (lj_loops[l].s == t) lp = &lj_loops[l];
+            nlj_map = 0;
+            const char *m = ren(lp->ctr);
+            if (lp->down) buf_printf(out, "for (int64_t %s = %s; %s >= %s; %s--) { ", m, lp->hi, m, lp->lo, m);
+            else buf_printf(out, "for (int64_t %s = %s; %s <= %s; %s++) { ", m, lp->lo, m, lp->hi, m);
+            Stmt *b = t->body;
+            int nb = b && b->kind == S_BLOCK ? b->stmts.len : 1;
+            for (int z = 0; z < nb; z++) {
+                Stmt *x = b && b->kind == S_BLOCK ? b->stmts.items[z] : b;
+                for (int u = 0; u < U; u++) { LJ_LANE(u); emit_stmt(uj_only(x)); buf_puts(out, " "); }
+            }
+            buf_puts(out, "} ");
+        } else for (int u = 0; u < U; u++) { LJ_LANE(u); emit_stmt(t); buf_puts(out, " "); }
+    }
+#undef LJ_LANE
+    nlj_map = saved_n;
+    memcpy(lj_from, saved_from, sizeof saved_from);
+    memcpy(lj_to, saved_to, sizeof saved_to);
+    lj_on = saved_on;
+    buf_puts(out, "} } } ");
+    /* the rest, and everything when the guard failed: the loop as it was, from lj<id>_ */
+    Stmt *fi = s->for_init;
+    Stmt fi2 = *fi;
+    Expr from = {0};
+    from.kind = E_IDENT; from.cname = xs_sprintf("lj%d_", id); from.str = from.cname; from.type = O0->type; from.pos = O0->pos; from.field = -1;
+    fi2.init = &from;
+    s->for_init = &fi2;
+    emit_stmt_for_inner_(s);
+    s->for_init = fi;
+    buf_puts(out, " }");
+    return true;
+}
+/* ---- Gauss-Seidel rows skewed (seidel-2d: H "jam de R linhas com desvio de 2 colunas") ----
+   for (let i = L; i <= H; i++) for (let j = L2; j <= H2; j++) X[i][j] = f;   (< as well)
+   f number arithmetic of numbers, invariant names and X[i + di][j + dj], |di|, |dj| <= 1: each element reads the new
+   values of row i - 1 and of X[i][j - 1], the old ones of row i + 1 and of X[i][j + 1]. R rows run together, row
+   i + r at column J - 2r in step J (r in order): the row above is two columns ahead, so it already wrote j + 1 (a
+   new value, as in the program) and this step's j - 1, j, j + 1 do not depend on it; the row below is two behind and
+   has not reached j - 1 (an old value, as in the program). Every element is the same sum of the same values in the
+   same order, so the same bits, and the R division chains are independent instead of one. The guard, once per entry:
+   the rows L - 1 .. H + 1 within X, each long enough for H2 + 1, L2 - 1 >= 0, and X's rows apart from each other
+   (xs_blocks_apart_: a row twice would change which values are old). The rows left (fewer than R), and the loop when
+   the guard fails, as written. XISTO_NO_SKEW turns it off; XISTO_SKEW_R sets R (xs_skew_r: main.c gives 16 for code
+   built for the ARM machine it runs on, 8 elsewhere; seidel-2d LARGE on the M4, kernel: 10,8 s as written, R = 4 4,3,
+   8 3,3, 12 2,5, 16 2,08; x86 has half the integer registers for the rows). */
+int xs_skew_r = 8;
+static const char *sk_i, *sk_j, *sk_x;
+static bool sk_carried;
+static int sk_id;
+static bool sk_le(Stmt *f, const char **ctr, Expr **lo, Expr **hi, bool *le) { /* for (let c = lo; c < hi | c <= hi; c++) */
+    Expr *u = f->for_update, *c = f->cond;
+    Stmt *fi = f->for_init;
+    if (!f || f->kind != S_FOR || !u || !u->builtin.cfn || strcmp(u->builtin.cfn, "counted_inc") != 0 || !u->lhs || !u->lhs->cname) return false;
+    if (!c || c->kind != E_BINARY || (c->op != TK_LT && c->op != TK_LE) || !lj_is(c->lhs, u->lhs->cname)) return false;
+    if (!fi || fi->kind != S_VAR || !fi->cname || strcmp(fi->cname, u->lhs->cname) != 0 || !fi->init || !bce_pure(fi->init)) return false;
+    *ctr = u->lhs->cname; *lo = fi->init; *hi = c->rhs; *le = c->op == TK_LE;
+    return true;
+}
+static int sk_off(Expr *x, const char *c) { /* c, c + 1, c - 1: the offset (9: not that) */
+    if (lj_is(x, c)) return 0;
+    if (x && x->kind == E_BINARY && (x->op == TK_PLUS || x->op == TK_MINUS) && lj_is(x->lhs, c) && x->rhs && x->rhs->kind == E_NUMBER &&
+        x->rhs->is_int_lit && x->rhs->ival == 1) return x->op == TK_PLUS ? 1 : -1;
+    return 9;
+}
+static bool sk_expr(Expr *e, Stmt *nest) {
+    if (!e || !e->type || e->type->kind != TY_NUMBER) return false;
+    switch (e->kind) {
+    case E_NUMBER: return true;
+    case E_IDENT: return e->cname && bce_plain_local(e->cname) && !bce_writes(nest, e->cname) && !bce_declares(nest, e->cname);
+    case E_BINARY: return (e->op == TK_PLUS || e->op == TK_MINUS || e->op == TK_STAR || e->op == TK_SLASH) && sk_expr(e->lhs, nest) && sk_expr(e->rhs, nest);
+    case E_UNARY: return e->op == TK_MINUS && sk_expr(e->lhs, nest);
+    case E_INDEX: {
+        if (e->builtin.cfn || !e->lhs || e->lhs->kind != E_INDEX || e->lhs->builtin.cfn || !lj_is(e->lhs->lhs, sk_x)) return false;
+        int di = sk_off(e->lhs->rhs, sk_i), dj = sk_off(e->rhs, sk_j);
+        if (di == 9 || dj == 9) return false;
+        if (di < 0 || (di == 0 && dj < 0)) sk_carried = true; /* (a value this loop wrote: Gauss-Seidel) */
+        return true;
+    }
+    default: return false;
+    }
+}
+static void sk_emit(Expr *e, int r, const char *J) {
+    switch (e->kind) {
+    case E_BINARY:
+        buf_puts(out, "(");
+        sk_emit(e->lhs, r, J);
+        buf_printf(out, " %s ", e->op == TK_PLUS ? "+" : e->op == TK_MINUS ? "-" : e->op == TK_STAR ? "*" : "/");
+        sk_emit(e->rhs, r, J);
+        buf_puts(out, ")");
+        return;
+    case E_UNARY: buf_puts(out, "(-"); sk_emit(e->lhs, r, J); buf_puts(out, ")"); return;
+    case E_INDEX: {
+        int di = sk_off(e->lhs->rhs, sk_i), dj = sk_off(e->rhs, sk_j);
+        buf_printf(out, "skp%d_[%d][%s - %d%s]", sk_id, r + 1 + di, J, 2 * r, dj > 0 ? " + 1" : dj < 0 ? " - 1" : "");
+        return;
+    }
+    default: emit_expr(e); return;
+    }
+}
+static bool sk_emit_loop(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_SKEW") || bce_promo_t || bce_fw_loop) return false;
+    Expr *L, *H, *L2, *H2;
+    bool le, le2;
+    if (!sk_le(s, &sk_i, &L, &H, &le)) return false;
+    Stmt *in = uj_only(s->body);
+    if (!in || !sk_le(in, &sk_j, &L2, &H2, &le2)) return false;
+    Stmt *b = uj_only(in->body);
+    if (!b || b->kind != S_EXPR || !b->expr || b->expr->kind != E_ASSIGN || b->expr->op != TK_ASSIGN) return false;
+    Expr *w = b->expr->lhs;
+    if (!w || w->kind != E_INDEX || w->builtin.cfn || !w->lhs || w->lhs->kind != E_INDEX || w->lhs->builtin.cfn || !w->lhs->lhs ||
+        w->lhs->lhs->kind != E_IDENT || !w->lhs->lhs->cname || !lj_is(w->lhs->rhs, sk_i) || !lj_is(w->rhs, sk_j)) return false;
+    sk_x = w->lhs->lhs->cname;
+    Type *xt = w->lhs->lhs->type;
+    if (!xt || xt->kind != TY_ARRAY || !xt->elem || !((xt->elem->kind == TY_ARRAY && xt->elem->elem && xt->elem->elem->kind == TY_NUMBER) || is_f64_type(xt->elem)) ||
+        !bce_plain_local(sk_x) || bce_writes(s, sk_x) || bce_declares(s, sk_x) || !w->type || w->type->kind != TY_NUMBER) return false;
+    if (!bce_inv(L, s, sk_i) || !bce_inv(H, s, sk_i) || !bce_names_plain(H) || !bce_names_plain(L) || !bce_inv(L2, s, sk_i) || !bce_inv(H2, s, sk_i) ||
+        !bce_names_plain(L2) || !bce_names_plain(H2) || uj_mentions(L2, sk_i) || uj_mentions(H2, sk_i) || uj_mentions(H2, sk_j) || uj_mentions(L2, sk_j)) return false;
+    sk_carried = false;
+    if (!sk_expr(b->expr->rhs, s) || !sk_carried) return false; /* (no value carried: the loop vectorizes as it is) */
+    int R = xs_skew_r;
+    const char *re = getenv("XISTO_SKEW_R");
+    if (re && atoi(re) >= 2 && atoi(re) <= 16) R = atoi(re);
+    int id = sk_id = lj_ids++;
+    const char *X = ren(sk_x), *rs = lj_rs(xt->elem);
+    char *lo = bce_raw(L), *hi = le ? xs_sprintf("(%s)", bce_raw(H)) : xs_sprintf("((%s) - 1)", bce_raw(H));
+    char *lo2 = bce_raw(L2), *hi2 = le2 ? xs_sprintf("(%s)", bce_raw(H2)) : xs_sprintf("((%s) - 1)", bce_raw(H2));
+    bce_blocks_helper_emit();
+    buf_printf(out, "{ int64_t sk%d_ = %s; { int64_t lo_ = %s, hi_ = %s, lo2_ = %s, hi2_ = %s, n_ = (int64_t)(%s)->len; ", id, lo, lo, hi, lo2, hi2, X);
+    buf_printf(out, "bool ok_ = lo_ + %d <= hi_ && lo2_ <= hi2_ && lo_ - 1 >= 0 && hi_ + 1 < n_ && lo2_ - 1 >= 0; ", R - 1);
+    buf_printf(out, "if (ok_) { char **pp_ = malloc((size_t)(n_ ? n_ : 1) * 3 * sizeof(char *)); int64_t k_ = 0; if (!pp_) xs_panic(\"out of memory\"); "
+                    "for (int64_t r_ = 0; r_ < n_; r_++) { %s *p_ = (%s *)(%s)->data[r_]; int64_t l_ = p_ ? (int64_t)p_->len : 0; "
+                    "if (r_ >= lo_ - 1 && r_ <= hi_ + 1 && l_ <= hi2_ + 1) ok_ = false; "
+                    "if (l_ > 0) { pp_[3 * k_] = (char *)p_->data; pp_[3 * k_ + 1] = (char *)(p_->data + l_); pp_[3 * k_ + 2] = (char *)1; k_++; } } "
+                    "if (ok_) ok_ = xs_blocks_apart_(pp_, k_) > 0; free(pp_); } ", rs, rs, X);
+    buf_printf(out, "if (ok_) for (; sk%d_ + %d <= hi_; sk%d_ += %d) { double *skp%d_[%d]; ", id, R - 1, id, R, id, R + 2);
+    buf_printf(out, "for (int r_ = 0; r_ < %d; r_++) skp%d_[r_] = ((%s *)(%s)->data[sk%d_ - 1 + r_])->data; ", R + 2, id, rs, X, id);
+    Expr *f = b->expr->rhs;
+    /* prologue (the lower rows not started), body (all busy, no test), epilogue (the upper rows done) */
+    for (int part = 0; part < 3; part++) {
+        if (part == 0) buf_printf(out, "for (int64_t J_ = lo2_; J_ < lo2_ + %d; J_++) { ", 2 * (R - 1));
+        else if (part == 1) buf_printf(out, "for (int64_t J_ = lo2_ + %d; J_ <= hi2_; J_++) { ", 2 * (R - 1));
+        else buf_printf(out, "for (int64_t J_ = (lo2_ + %d > hi2_ + 1 ? lo2_ + %d : hi2_ + 1); J_ <= hi2_ + %d; J_++) { ", 2 * (R - 1), 2 * (R - 1), 2 * (R - 1));
+        for (int r = 0; r < R; r++) {
+            if (part != 1) buf_printf(out, "if (J_ - %d >= lo2_ && J_ - %d <= hi2_) ", 2 * r, 2 * r);
+            buf_printf(out, "skp%d_[%d][J_ - %d] = ", id, r + 1, 2 * r);
+            sk_emit(f, r, "J_");
+            buf_puts(out, "; ");
+        }
+        buf_puts(out, "} ");
+    }
+    buf_puts(out, "} } ");
+    Stmt *fi = s->for_init;
+    Stmt fi2 = *fi;
+    Expr from = {0};
+    from.kind = E_IDENT; from.cname = xs_sprintf("sk%d_", id); from.str = from.cname; from.type = L->type; from.pos = L->pos; from.field = -1;
+    fi2.init = &from;
+    s->for_init = &fi2;
+    emit_stmt_for_inner_(s);
+    s->for_init = fi;
+    buf_puts(out, " }");
+    return true;
+}
 static void emit_stmt_for_inner(Stmt *s) { /* the columns' least row lengths around the outermost loop that keeps them */
     int opened = bce_rect_open(s);
-    if (!uj_emit_km(s) && !uj_emit_loop(s)) emit_stmt_for_inner_(s);
+    if (!uj_emit_km(s) && !uj_emit_loop(s) && !lj_emit(s) && !sk_emit_loop(s)) emit_stmt_for_inner_(s);
     bce_rect_close(opened);
 }
 static void emit_stmt_for_inner_(Stmt *s) { /* a for: bounds checks proved by the loop, or a versioned copy */
@@ -9167,6 +9810,35 @@ static void emit_stmt_for_inner_(Stmt *s) { /* a for: bounds checks proved by th
                 emit_for_(s);
                 bce_fw_loop = NULL;
                 buf_puts(out, " else ");
+                emit_for_(s);
+                buf_puts(out, " }");
+                nbce = saved_nbce;
+                buf_puts(out, " else ");
+                bce_slow++;
+                emit_for_(s);
+                bce_slow--;
+                bce_versions--;
+                return;
+            }
+            char *sg = bce_promo_t ? NULL : bce_sel_plan(s, s->for_update->lhs->cname);
+            if (sg) { /* T in an int64_t, its last value stored when it fits int32, else the loop again */
+                Expr *t = bce_promo_t;
+                bce_promo_t = NULL;
+                Buf *so = out, sb = {0};
+                out = &sb;
+                emit_lvalue_ptr(t);
+                out = so;
+                int id = bce_promo_ids++;
+                buf_printf(out, "{ if (%s) { int32_t *sp%d_ = %s; int64_t pr%d_ = *sp%d_; ", sg, id, sb.data, id, id);
+                bce_promo_t = t;
+                bce_promo_id = id;
+                bce_promo_w64 = true;
+                emit_for_(s);
+                bce_promo_t = NULL;
+                bce_promo_w64 = false;
+                buf_printf(out, " if (pr%d_ == (int64_t)(int32_t)pr%d_) *sp%d_ = (int32_t)pr%d_; else ", id, id, id, id);
+                emit_for_(s);
+                buf_puts(out, " } else ");
                 emit_for_(s);
                 buf_puts(out, " }");
                 nbce = saved_nbce;
@@ -12302,6 +12974,7 @@ void emit_program(Program *p, Buf *o) {
     Buf *main_out = out;
     out = &body;
     json_fns.len = 0;
+    bce_rows_helper = bce_cmp_helper = bce_blocks_helper = false;
     if (json_fns.data) json_fns.data[0] = 0;
     json_protos.len = 0;
     if (json_protos.data) json_protos.data[0] = 0;
