@@ -1649,6 +1649,17 @@ static inline size_t xs_rowpad(size_t n) {
 #else
 #define xs_rowpad(n) (n)
 #endif
+/* a block of an array's elements. XS_ROWALIGN (main.c: the program has symm's jam on ARM other than Apple's, see
+   xs_jam_ucol): blocks of 1 KB or more start on a 64-byte line (posix_memalign), as a C or Rust matrix's rows do;
+   glibc's 16-byte alignment left symm's rows wherever the earlier allocations put them (one more command-line
+   argument made its kernel 12% slower on the Graviton2). Only there: aligned blocks lose xs_rowpad's constant stride
+   (pieces between them), which the column walks of other kernels need (adi 1.38x slower with every block aligned). */
+static inline void *xs_row_alloc(size_t n) {
+#if defined(XS_ROWALIGN) && defined(__linux__)
+    if (n >= 1024) { void *p = NULL; return posix_memalign(&p, 64, (xs_rowpad(n) + 63) & ~(size_t)63) ? NULL : p; }
+#endif
+    return malloc(xs_rowpad(n));
+}
 /* the table of a loop nest's row data pointers (emit.c, bce_rd_type), freed when the nest's block ends */
 static inline void xs_rd_free(void *p) { free(*(void **)p); }
 #define XS_ARRAY(T, name)                                                              \
@@ -1663,7 +1674,7 @@ static inline void xs_rd_free(void *p) { free(*(void **)p); }
                       : xs_obj_alloc(sizeof(name), name##_free, xs_print_##name);      \
         a->len = (size_t)n;                                                            \
         a->cap = in_ ? XS_INLINE_ELEMS : (size_t)n;                                    \
-        a->data = in_ ? (T *)(a + 1) : malloc(xs_rowpad(a->cap * sizeof(T)));         \
+        a->data = in_ ? (T *)(a + 1) : xs_row_alloc(a->cap * sizeof(T));         \
         if (!a->data) xs_panic("out of memory");                                       \
         for (size_t i = 0; i < a->len; i++) a->data[i] = fill;                         \
         return a;                                                                      \
