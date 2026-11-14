@@ -753,6 +753,41 @@ static char *compile_units(const char *cc, const char *flags, const char *cfile)
     return objs;
 }
 #endif
+/* --target: a static library of third_party/<name>'s files (paths relative to it), compiled once per target into
+   tdir/<lib> */
+static char *target_archive(const char *cc, const char *zig, const char *tdir, const char *lib, const char *name, const char *flags, char **files, int n) {
+    char *out = xs_sprintf("%s/%s", tdir, lib);
+    if (access(out, R_OK) == 0) return out;
+    char *src = xs_sprintf("%s/../third_party/%s", xisto_dir, name);
+    if (n == 0 || access(src, R_OK) != 0) { fprintf(stderr, "xisto: --target with node:zlib needs %s's source at %s\n", name, src); exit(1); }
+    double t0 = now_ms();
+    char *dir = xs_sprintf("%s/%s.%d", tdir, name, xs_pid());
+    if (!xs_mkdirs(dir)) { fprintf(stderr, "xisto: cannot create %s\n", dir); exit(1); }
+    Buf objs = {0};
+    for (int k = 0; k < n; k++) {
+        char *o = xs_sprintf("%s/%d.o", dir, k);
+        if (xs_sh(xs_sprintf("%s -O2 -w %s -c -o %s %s", cc, flags, xs_q(o), xs_q(xs_sprintf("%s/%s", src, files[k])))) != 0) {
+            fprintf(stderr, "xisto: %s did not compile for %s (%s)\n", name, xs_target, files[k]);
+            exit(1);
+        }
+        buf_printf(&objs, " %s", xs_q(o));
+    }
+    /* (through a response file: Brotli has ~40 objects, and command lines have a limit) */
+    char *rsp = xs_sprintf("%s/objs.rsp", dir), *tmp = xs_sprintf("%s.%d.tmp", out, xs_pid());
+    FILE *rf = fopen(rsp, "wb");
+    if (!rf) exit(1);
+    fputs(objs.data ? objs.data : "", rf);
+    fclose(rf);
+    if (xs_sh(xs_sprintf("%s ar rcs %s @%s", xs_q(zig), xs_q(tmp), xs_q(rsp))) != 0 || !xs_rename(tmp, out)) {
+        fprintf(stderr, "xisto: %s did not compile for %s\n", name, xs_target);
+        exit(1);
+    }
+    for (int k = 0; k < n; k++) unlink(xs_sprintf("%s/%d.o", dir, k));
+    unlink(rsp);
+    rmdir(dir);
+    if (show_time) fprintf(stderr, "xisto: %s compiled once for %s: %.0f ms\n", name, xs_target, now_ms() - t0);
+    return out;
+}
 /* --target: the whole program in one unit, compiled and linked by zig's clang against musl, statically.
    SQLite and BearSSL (TLS) are compiled once per target from their source (~/.cache/xisto/target/<triple>/). */
 static void run_cc_target(const char *cfile, const char *outfile, bool dev) {
@@ -830,30 +865,15 @@ static void run_cc_target(const char *cfile, const char *outfile, bool dev) {
         }
         extra = xs_sprintf("-I%s %s", xs_q(xisto_dir), xs_q(obj));
     }
-    if (link_zlib) { /* zlib from its source, once per target (its eight files, then an archive) */
-        char *lib = xs_sprintf("%s/libxszlib.a", tdir);
-        if (access(lib, R_OK) != 0) {
-            char *src = xs_sprintf("%s/../third_party/zlib", xisto_dir);
-            if (access(xs_sprintf("%s/zlib.h", src), R_OK) != 0) { fprintf(stderr, "xisto: --target with node:zlib needs zlib's source at %s\n", src); exit(1); }
-            static const char *const zf[] = {"adler32", "crc32", "deflate", "inflate", "inffast", "inftrees", "trees", "zutil"};
-            char *objs = "";
-            if (!xs_mkdirs(tdir)) { fprintf(stderr, "xisto: cannot create %s\n", tdir); exit(1); }
-            for (size_t k = 0; k < sizeof zf / sizeof *zf; k++) {
-                char *o = xs_sprintf("%s/zlib-%s.%d.o", tdir, zf[k], xs_pid());
-                if (xs_sh(xs_sprintf("%s -O2 -w -DZ_PREFIX -c -o %s %s", cc, xs_q(o), xs_q(xs_sprintf("%s/%s.c", src, zf[k])))) != 0) {
-                    fprintf(stderr, "xisto: zlib did not compile for %s (%s.c)\n", xs_target, zf[k]);
-                    exit(1);
-                }
-                objs = xs_sprintf("%s %s", objs, xs_q(o));
-            }
-            char *tmp = xs_sprintf("%s.%d.tmp", lib, xs_pid());
-            if (xs_sh(xs_sprintf("%s ar rcs %s%s", xs_q(zig), xs_q(tmp), objs)) != 0 || !xs_rename(tmp, lib)) {
-                fprintf(stderr, "xisto: zlib did not compile for %s\n", xs_target);
-                exit(1);
-            }
-            for (size_t k = 0; k < sizeof zf / sizeof *zf; k++) unlink(xs_sprintf("%s/zlib-%s.%d.o", tdir, zf[k], xs_pid()));
-        }
-        extra = xs_sprintf("%s -I%s %s", extra, xs_q(xisto_dir), xs_q(lib));
+    if (link_zlib) { /* zlib and Brotli from their source, once per target */
+        static const char *const zf[] = {"adler32.c", "crc32.c", "deflate.c", "inflate.c", "inffast.c", "inftrees.c", "trees.c", "zutil.c"};
+        char *zl = target_archive(cc, zig, tdir, "libxszlib.a", "zlib", "-DZ_PREFIX", (char **)zf, (int)(sizeof zf / sizeof *zf));
+        char *bsrc = xs_sprintf("%s/../third_party/brotli", xisto_dir);
+        char **bf = NULL;
+        int nb = 0;
+        xs_list_files(bsrc, ".c", NULL, &bf, &nb);
+        char *bl = target_archive(cc, zig, tdir, "libxsbrotli.a", "brotli", xs_sprintf("-I%s", xs_q(xs_sprintf("%s/include", bsrc))), bf, nb);
+        extra = xs_sprintf("%s -I%s %s %s", extra, xs_q(xisto_dir), xs_q(zl), xs_q(bl));
     }
     bool win = strstr(xs_target, "windows") != NULL;
     char *cmd = xs_sprintf("%s -std=c11 %s -mllvm -hot-cold-split=false -ffp-contract=off -fno-omit-frame-pointer -ffunction-sections -fdata-sections "
@@ -905,8 +925,8 @@ static void run_cc_raw(const char *cfile, const char *outfile, bool dev) {
         cmd = xs_sprintf("%s -I'%s/bearssl-inc' '%s/libbearssl.a'", cmd, xisto_dir, xisto_dir);
     if (link_sqlite) /* SQLite: the header and the object compiled from source live next to the xisto executable */
         cmd = xs_sprintf("%s -I'%s' '%s/sqlite3.o' -lpthread", cmd, xisto_dir, xisto_dir);
-    if (link_zlib) /* zlib: build/zlib-inc and the static library next to the xisto executable (only what is called is linked) */
-        cmd = xs_sprintf("%s -I'%s' '%s/libxszlib.a'", cmd, xisto_dir, xisto_dir);
+    if (link_zlib) /* zlib and Brotli: build/zlib-inc and the static libraries next to the xisto executable (only what is called is linked) */
+        cmd = xs_sprintf("%s -I'%s' '%s/libxszlib.a' '%s/libxsbrotli.a'", cmd, xisto_dir, xisto_dir, xisto_dir);
     int rc = 0;
     if (!xs_cc_run(&cmd, 1, 1, &rc)) exit(1);
     if (rc != 0) {

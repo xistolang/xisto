@@ -1,13 +1,14 @@
-// xisto:zlib (node:zlib): deflate/inflate, gzip/gunzip, deflateRaw/inflateRaw and unzip, each as *Sync and in the
-// callback form, crc32 and constants, over zlib 1.3.1 (third_party/zlib, linked only into programs that import
-// this module; runtime/xisto_zlib.h). Options: level, windowBits, memLevel, strategy, dictionary, finishFlush,
+// xisto:zlib (node:zlib): deflate/inflate, gzip/gunzip, deflateRaw/inflateRaw, unzip and brotliCompress/
+// brotliDecompress, each as *Sync and in the callback form, crc32 and constants, over zlib 1.3.1 and Brotli 1.2.1
+// (third_party/zlib and third_party/brotli, linked only into programs that import this module, and then only
+// what they call; runtime/xisto_zlib.h). Options: level, windowBits, memLevel, strategy, dictionary, finishFlush,
 // maxOutputLength, chunkSize (the output is produced chunkSize bytes at a time, as Node: level 0's stored blocks
 // end where a chunk does, so the bytes are Node's).
 // Differences from Node (docs/docs/guides/node-compatibility.md):
 //   - input is a string (UTF-8) or a Uint8Array/Buffer (no ArrayBuffer/DataView);
 //   - the callback forms compute at once and call back on a later turn of the event loop (Node: the thread pool);
 //     on an error the result argument is an empty Buffer (Node: undefined);
-//   - no Brotli or Zstd, and no streams (createGzip...) yet.
+//   - Brotli params are numbers (Node also takes booleans); no Zstd, and no streams (createGzip...) yet.
 
 declare function zlib_run(
   mode: int,
@@ -24,6 +25,8 @@ declare function zlib_run(
 declare function zlib_last_errno(): int;
 declare function zlib_last_message(): string;
 declare function zlib_crc32(data: Uint8Array, value: number): number;
+declare function zlib_brotli(encode: boolean, data: Uint8Array, params: Uint8Array, finishFlush: int, maxOutputLength: int, chunkSize: int): Buffer | null;
+declare function zlib_brotli_errno(): int;
 
 /** zlib.constants: flush values, return codes, levels, strategies, modes and the option bounds. */
 export class ZlibConstants {
@@ -70,6 +73,36 @@ export class ZlibConstants {
   readonly Z_MIN_LEVEL: int = -1;
   readonly Z_MAX_LEVEL: int = 9;
   readonly Z_DEFAULT_LEVEL: int = -1;
+  readonly BROTLI_DECODE: int = 8;
+  readonly BROTLI_ENCODE: int = 9;
+  readonly BROTLI_OPERATION_PROCESS: int = 0;
+  readonly BROTLI_OPERATION_FLUSH: int = 1;
+  readonly BROTLI_OPERATION_FINISH: int = 2;
+  readonly BROTLI_OPERATION_EMIT_METADATA: int = 3;
+  readonly BROTLI_PARAM_MODE: int = 0;
+  readonly BROTLI_MODE_GENERIC: int = 0;
+  readonly BROTLI_MODE_TEXT: int = 1;
+  readonly BROTLI_MODE_FONT: int = 2;
+  readonly BROTLI_DEFAULT_MODE: int = 0;
+  readonly BROTLI_PARAM_QUALITY: int = 1;
+  readonly BROTLI_MIN_QUALITY: int = 0;
+  readonly BROTLI_MAX_QUALITY: int = 11;
+  readonly BROTLI_DEFAULT_QUALITY: int = 11;
+  readonly BROTLI_PARAM_LGWIN: int = 2;
+  readonly BROTLI_MIN_WINDOW_BITS: int = 10;
+  readonly BROTLI_MAX_WINDOW_BITS: int = 24;
+  readonly BROTLI_LARGE_MAX_WINDOW_BITS: int = 30;
+  readonly BROTLI_DEFAULT_WINDOW: int = 22;
+  readonly BROTLI_PARAM_LGBLOCK: int = 3;
+  readonly BROTLI_MIN_INPUT_BLOCK_BITS: int = 16;
+  readonly BROTLI_MAX_INPUT_BLOCK_BITS: int = 24;
+  readonly BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING: int = 4;
+  readonly BROTLI_PARAM_SIZE_HINT: int = 5;
+  readonly BROTLI_PARAM_LARGE_WINDOW: int = 6;
+  readonly BROTLI_PARAM_NPOSTFIX: int = 7;
+  readonly BROTLI_PARAM_NDIRECT: int = 8;
+  readonly BROTLI_DECODER_PARAM_DISABLE_RING_BUFFER_REALLOCATION: int = 0;
+  readonly BROTLI_DECODER_PARAM_LARGE_WINDOW: int = 1;
 }
 export const constants: ZlibConstants = new ZlibConstants();
 
@@ -80,6 +113,15 @@ export class ZlibOptions {
   memLevel?: int;
   strategy?: int;
   dictionary?: Uint8Array;
+  chunkSize?: int;
+  flush?: int;
+  finishFlush?: int;
+  maxOutputLength?: int;
+}
+
+/** The options of brotliCompress/brotliDecompress: params by BROTLI_PARAM_* number, and the stream options. */
+export class BrotliOptions {
+  params?: Record<number, number>;
   chunkSize?: int;
   flush?: int;
   finishFlush?: int;
@@ -150,6 +192,48 @@ function run(mode: int, data: string | Uint8Array, opts: ZlibOptions | null): Bu
   const errno = zlib_last_errno();
   if (errno === 1) throw new RangeCodeError(`Cannot create a Buffer larger than ${maxOut} bytes`, "ERR_BUFFER_TOO_LARGE");
   throw new ZlibError(zlib_last_message(), codeName(errno), errno);
+}
+
+function brotli(encode: boolean, data: string | Uint8Array, opts: BrotliOptions | null): Buffer {
+  const o: BrotliOptions = opts !== null ? opts : new BrotliOptions();
+  const chunk = o.chunkSize ?? 16384;
+  if (chunk < 64) throw new RangeCodeError(`The value of "options.chunkSize" is out of range. It must be >= 64. Received ${chunk}`, "ERR_OUT_OF_RANGE");
+  const finishFlush = checkRange("finishFlush", o.finishFlush ?? 2, 0, 3);
+  const maxOut = o.maxOutputLength ?? -1;
+  const pairs: int[] = [];
+  const params = o.params;
+  if (params != null) {
+    for (const k of Object.keys(params)) {
+      const key = Math.trunc(Number(k));
+      if (!(key >= 0 && key <= (encode ? 8 : 1)) || key !== Number(k)) throw new RangeCodeError(`${k} is not a valid Brotli parameter`, "ERR_BROTLI_INVALID_PARAM");
+      pairs.push(key);
+      pairs.push(Math.trunc(params[key]));
+    }
+  }
+  const packed = new Uint8Array(4 * pairs.length);
+  for (let i = 0; i < pairs.length; i++) {
+    const v = pairs[i];
+    packed[4 * i] = (v >> 24) & 0xff;
+    packed[4 * i + 1] = (v >> 16) & 0xff;
+    packed[4 * i + 2] = (v >> 8) & 0xff;
+    packed[4 * i + 3] = v & 0xff;
+  }
+  const out = zlib_brotli(encode, bytesOf(data), packed, finishFlush, maxOut, chunk);
+  if (out !== null) return out;
+  const errno = zlib_last_errno();
+  if (errno === 1) throw new RangeCodeError(`Cannot create a Buffer larger than ${maxOut} bytes`, "ERR_BUFFER_TOO_LARGE");
+  if (errno === 2) throw new ZlibError(zlib_last_message(), "ERR_ZLIB_INITIALIZATION_FAILED", -2);
+  if (errno === 3) throw new ZlibError("Decompression failed", "ERR_" + zlib_last_message(), zlib_brotli_errno());
+  throw new ZlibError(zlib_last_message(), codeName(errno), errno);
+}
+
+/** Compresses with Brotli (quality 11, window 22 unless params say otherwise). */
+export function brotliCompressSync(data: string | Uint8Array, options: BrotliOptions | null = null): Buffer {
+  return brotli(true, data, options);
+}
+/** Decompresses Brotli data. */
+export function brotliDecompressSync(data: string | Uint8Array, options: BrotliOptions | null = null): Buffer {
+  return brotli(false, data, options);
 }
 
 /** Compresses with deflate (a zlib stream: header, data, Adler-32). */
@@ -230,6 +314,30 @@ function dispatch(mode: int, data: string | Uint8Array, options: ZlibOptions | C
   } else {
     later(mode, data, null, options as CompressCallback);
   }
+}
+
+/** brotliCompressSync, its result given to callback. */
+export function brotliCompress(data: string | Uint8Array, options: BrotliOptions | CompressCallback, callback: CompressCallback | null = null): void {
+  dispatchBrotli(true, data, options, callback);
+}
+/** brotliDecompressSync, its result given to callback. */
+export function brotliDecompress(data: string | Uint8Array, options: BrotliOptions | CompressCallback, callback: CompressCallback | null = null): void {
+  dispatchBrotli(false, data, options, callback);
+}
+
+function dispatchBrotli(encode: boolean, data: string | Uint8Array, options: BrotliOptions | CompressCallback, callback: CompressCallback | null): void {
+  const cb: CompressCallback = callback !== null ? callback : (options as CompressCallback);
+  const opts: BrotliOptions | null = callback !== null ? (options as BrotliOptions) : null;
+  let err: Error | null = null;
+  let out: Buffer = Buffer.alloc(0);
+  try {
+    out = brotli(encode, data, opts);
+  } catch (e) {
+    err = e as Error;
+  }
+  setTimeout(() => {
+    cb(err, out);
+  }, 0);
 }
 
 /** CRC-32 of data (UTF-8 for a string), continued from value (the CRC of what came before; 0 to start). */

@@ -10,7 +10,7 @@ OBJ     := $(patsubst src/%.c,build/%.o,$(SRC)) build/rt_embed.o
 # only when it can use https; plain-http programs (TLS at the load balancer) carry no TLS code.
 TLS ?= awslc
 
-all: build/xisto build/qbe build/xisto_rt.o build/xisto_rt_dbg.o build/sqlite3.o build/sqlite3.h build/libxszlib.a build/libbearssl.a $(if $(filter awslc,$(TLS)),build/awslc/lib/libssl.a)
+all: build/xisto build/qbe build/xisto_rt.o build/xisto_rt_dbg.o build/sqlite3.o build/sqlite3.h build/libxszlib.a build/libxsbrotli.a build/libbearssl.a $(if $(filter awslc,$(TLS)),build/awslc/lib/libssl.a)
 
 build/awslc/lib/libssl.a: tools/build-awslc.sh
 	sh tools/build-awslc.sh
@@ -58,6 +58,17 @@ build/zlib/%.o: third_party/zlib/%.c $(wildcard third_party/zlib/*.h)
 build/libxszlib.a: $(ZLIB_OBJ)
 	rm -f $@ && ar rcs $@ $(ZLIB_OBJ)
 	rm -rf build/zlib-inc && mkdir -p build/zlib-inc && cp third_party/zlib/zlib.h third_party/zlib/zconf.h build/zlib-inc/
+
+# Brotli 1.2.1 from source (third_party/brotli, MIT): node:zlib's brotliCompress/brotliDecompress, the version Node
+# links (so the same bytes). Its own static library, linked only when a program imports node:zlib, and then only
+# what is called: the decoder is ~170 KB (the 120 KB dictionary), the encoder ~600 KB more.
+BROTLI_SRC := $(wildcard third_party/brotli/common/*.c third_party/brotli/dec/*.c third_party/brotli/enc/*.c)
+BROTLI_OBJ := $(patsubst third_party/brotli/%.c,build/brotli/%.o,$(BROTLI_SRC))
+build/brotli/%.o: third_party/brotli/%.c
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -w -Ithird_party/brotli/include -c -o $@ $<
+build/libxsbrotli.a: $(BROTLI_OBJ)
+	rm -f $@ && ar rcs $@ $(BROTLI_OBJ)
 
 # QBE backend (third_party/qbe, MIT) and the runtime as a linkable object
 build/qbe: $(wildcard third_party/qbe/*.c third_party/qbe/*/*.c) | build

@@ -11,6 +11,7 @@ enum { XS_Z_DEFLATE = 1, XS_Z_INFLATE, XS_Z_GZIP, XS_Z_GUNZIP, XS_Z_DEFLATERAW, 
 /* the last failure of xs_zlib_run: zlib's code (Z_DATA_ERROR...) and message, read by zlib.ts to build the Error */
 static XS_TLS int xs_zlib_errno;
 static XS_TLS char xs_zlib_msg[128];
+static XS_TLS int xs_zlib_errno_brotli; /* a Brotli decoder error: its code (negative) */
 
 XS_NOINLINE int64_t xs_zlib_last_errno(void) { return xs_zlib_errno; }
 XS_NOINLINE xs_str *xs_zlib_last_message(void) { return xs_str_new(xs_zlib_msg, strlen(xs_zlib_msg)); }
@@ -131,3 +132,78 @@ XS_NOINLINE double xs_zlib_crc32(xs_Uint8Array *data, double value) {
     }
     return (double)(uint32_t)c;
 }
+
+/* ---- Brotli (third_party/brotli, build/libxsbrotli.a): the few functions used, declared here rather than through
+   its headers (which include each other as <brotli/...>, a search path every compile would need). Their
+   signatures: c/include/brotli/encode.h and decode.h; BROTLI_BOOL and the enums are int. ---- */
+typedef struct BrotliEncoderStateStruct BrotliEncoderState;
+typedef struct BrotliDecoderStateStruct BrotliDecoderState;
+BrotliEncoderState *BrotliEncoderCreateInstance(void *(*alloc)(void *, size_t), void (*free_)(void *, void *), void *opaque);
+int BrotliEncoderSetParameter(BrotliEncoderState *s, int param, uint32_t value);
+int BrotliEncoderCompressStream(BrotliEncoderState *s, int op, size_t *avail_in, const uint8_t **next_in, size_t *avail_out, uint8_t **next_out, size_t *total_out);
+int BrotliEncoderIsFinished(BrotliEncoderState *s);
+void BrotliEncoderDestroyInstance(BrotliEncoderState *s);
+BrotliDecoderState *BrotliDecoderCreateInstance(void *(*alloc)(void *, size_t), void (*free_)(void *, void *), void *opaque);
+int BrotliDecoderSetParameter(BrotliDecoderState *s, int param, uint32_t value);
+int BrotliDecoderDecompressStream(BrotliDecoderState *s, size_t *avail_in, const uint8_t **next_in, size_t *avail_out, uint8_t **next_out, size_t *total_out);
+int BrotliDecoderGetErrorCode(const BrotliDecoderState *s);
+const char *BrotliDecoderErrorString(int c);
+void BrotliDecoderDestroyInstance(BrotliDecoderState *s);
+
+/* Brotli in one call, as Node's brotliCompressSync/brotliDecompressSync: params packed as (key, value) pairs of
+   4-byte big-endian numbers; the output asked for chunkSize bytes at a time; finishFlush is the last operation
+   (BROTLI_OPERATION_FINISH = 2, or FLUSH = 1 to accept a truncated stream). Returns a Buffer, or null with
+   xs_zlib_errno and xs_zlib_msg set: -5 "unexpected end of file", 1 past maxOutputLength, 2 a parameter Brotli
+   refused, 3 a decoder error (xs_zlib_msg then holds its name, as Node's code: _ERROR_FORMAT_...) */
+XS_NOINLINE xs_Uint8Array *xs_zlib_brotli(bool encode, xs_Uint8Array *data, xs_Uint8Array *params, int64_t finish_flush, int64_t max_out,
+                                          int64_t chunk_size) {
+    BrotliEncoderState *es = encode ? BrotliEncoderCreateInstance(NULL, NULL, NULL) : NULL;
+    BrotliDecoderState *ds = encode ? NULL : BrotliDecoderCreateInstance(NULL, NULL, NULL);
+    if (!es && !ds) xs_panic("out of memory");
+    for (int64_t i = 0; i + 8 <= params->f_length; i += 8) {
+        const uint8_t *p = params->data + i;
+        int key = (int)((uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]);
+        uint32_t v = (uint32_t)p[4] << 24 | (uint32_t)p[5] << 16 | (uint32_t)p[6] << 8 | p[7];
+        if (!(encode ? BrotliEncoderSetParameter(es, key, v) : BrotliDecoderSetParameter(ds, key, v))) {
+            if (es) BrotliEncoderDestroyInstance(es); else BrotliDecoderDestroyInstance(ds);
+            xs_zlib_fail(2, "Initialization failed");
+            return NULL;
+        }
+    }
+    xs_zbuf out = {0};
+    const uint8_t *in = data->data;
+    size_t avail_in = (size_t)data->f_length;
+    int fail = 0, err = 0;
+    for (;;) {
+        if (!xs_zbuf_room(&out, (size_t)chunk_size)) xs_panic("out of memory");
+        uint8_t *next_out = out.p + out.len;
+        size_t avail_out = (size_t)chunk_size;
+        if (encode) {
+            if (!BrotliEncoderCompressStream(es, (int)finish_flush, &avail_in, &in, &avail_out, &next_out, NULL)) { fail = 2; break; }
+            out.len += (size_t)chunk_size - avail_out;
+            if (max_out >= 0 && out.len > (size_t)max_out) { fail = 1; break; }
+            if (avail_out != 0 && avail_in == 0 && (finish_flush != 2 || BrotliEncoderIsFinished(es))) break;
+        } else {
+            int r = BrotliDecoderDecompressStream(ds, &avail_in, &in, &avail_out, &next_out, NULL);
+            out.len += (size_t)chunk_size - avail_out;
+            if (max_out >= 0 && out.len > (size_t)max_out) { fail = 1; break; }
+            if (r == 0) { fail = 3; err = BrotliDecoderGetErrorCode(ds); break; }   /* BROTLI_DECODER_RESULT_ERROR */
+            if (r == 1) break;                                                        /* SUCCESS */
+            if (r == 2) { if (finish_flush == 2) fail = 4; break; }                   /* NEEDS_MORE_INPUT: all of it was given */
+        }
+    }
+    if (es) BrotliEncoderDestroyInstance(es); else BrotliDecoderDestroyInstance(ds);
+    if (fail) {
+        free(out.p);
+        if (fail == 1) xs_zlib_fail(1, "");
+        else if (fail == 2) xs_zlib_fail(2, "Compression failed");
+        else if (fail == 4) xs_zlib_fail(-5, "unexpected end of file");
+        else { xs_zlib_fail(3, BrotliDecoderErrorString(err)); xs_zlib_errno_brotli = err; }
+        return NULL;
+    }
+    xs_Uint8Array *r = xs_u8_raw((int64_t)out.len, true, false);
+    if (out.len) memcpy(r->data, out.p, out.len);
+    free(out.p);
+    return r;
+}
+XS_NOINLINE int64_t xs_zlib_brotli_errno(void) { return xs_zlib_errno_brotli; }
