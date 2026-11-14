@@ -1,0 +1,50 @@
+# usweep 7cfb6e4 aarch64
+## U=4
+# Linux aarch64, 2 cpu; PolyBench LARGE; median of 5
+2mm            xisto  2mm.ts                  4.068s     4.07cpu     36.8MB  par  1.0  kern    4.034s  same
+3mm            xisto  3mm.ts                  7.196s     7.18cpu     52.7MB  par  1.0  kern    7.153s  same
+doitgen        xisto  doitgen.ts              0.279s     0.28cpu     28.4MB  par  1.0  kern    0.251s  same
+gramschmidt    xisto  gramschmidt.ts          4.335s     4.33cpu     30.8MB  par  1.0  kern    4.313s  same
+syrk           xisto  syrk.ts                 2.310s     2.31cpu     21.5MB  par  1.0  kern    2.286s  same
+syr2k          xisto  syr2k.ts                5.896s     5.89cpu     30.8MB  par  1.0  kern    5.866s  same
+trmm           xisto  trmm.ts                 1.519s     1.52cpu     18.2MB  par  1.0  kern    1.503s  same
+symm           xisto  symm.ts                 5.936s     5.93cpu     27.4MB  par  1.0  kern    5.911s  same
+covariance     xisto  covariance.ts           2.939s     2.94cpu     25.3MB  par  1.0  kern    2.920s  same
+correlation    xisto  correlation.ts          3.123s     3.12cpu     25.3MB  par  1.0  kern    3.098s  same
+## U=8
+# Linux aarch64, 2 cpu; PolyBench LARGE; median of 5
+2mm            xisto  2mm.ts                  3.438s     3.44cpu     36.8MB  par  1.0  kern    3.403s  same
+3mm            xisto  3mm.ts                  4.171s     4.17cpu     52.7MB  par  1.0  kern    4.128s  same
+doitgen        xisto  doitgen.ts              0.258s     0.26cpu     28.4MB  par  1.0  kern    0.230s  same
+gramschmidt    xisto  gramschmidt.ts          3.382s     3.38cpu     30.8MB  par  1.0  kern    3.360s  same
+syrk           xisto  syrk.ts                 1.553s     1.55cpu     21.5MB  par  1.0  kern    1.530s  same
+syr2k          xisto  syr2k.ts                5.162s     5.16cpu     30.8MB  par  1.0  kern    5.132s  same
+trmm           xisto  trmm.ts                 1.256s     1.25cpu     18.2MB  par  1.0  kern    1.241s  same
+symm           xisto  symm.ts                 5.283s     5.28cpu     27.4MB  par  1.0  kern    5.258s  same
+covariance     xisto  covariance.ts           2.374s     2.37cpu     25.3MB  par  1.0  kern    2.355s  same
+correlation    xisto  correlation.ts          2.400s     2.40cpu     25.2MB  par  1.0  kern    2.381s  same
+## U=12
+# Linux aarch64, 2 cpu; PolyBench LARGE; median of 5
+2mm            xisto  2mm.ts                  3.695s     3.69cpu     36.8MB  par  1.0  kern    3.660s  same
+3mm            xisto  3mm.ts                  4.689s     4.69cpu     52.7MB  par  1.0  kern    4.644s  same
+doitgen        xisto  doitgen.ts              0.263s     0.26cpu     28.4MB  par  1.0  kern    0.236s  same
+gramschmidt    xisto  gramschmidt.ts          3.305s     3.30cpu     30.8MB  par  1.0  kern    3.283s  same
+syrk           xisto  syrk.ts                 2.411s     2.40cpu     21.5MB  par  1.0  kern    2.387s  same
+syr2k          xisto  syr2k.ts                6.140s     6.13cpu     30.8MB  par  1.0  kern    6.102s  same
+trmm           xisto  trmm.ts                 1.031s     1.03cpu     18.2MB  par  1.0  kern    1.015s  same
+symm           xisto  symm.ts                 5.846s     5.84cpu     27.4MB  par  1.0  kern    5.821s  same
+covariance     xisto  covariance.ts           2.384s     2.38cpu     25.3MB  par  1.0  kern    2.365s  same
+correlation    xisto  correlation.ts          2.435s     2.43cpu     25.2MB  par  1.0  kern    2.416s  same
+## U=16
+# Linux aarch64, 2 cpu; PolyBench LARGE; median of 5
+2mm            xisto  2mm.ts                  3.043s     3.04cpu     36.8MB  par  1.0  kern    3.007s  same
+3mm            xisto  3mm.ts                  3.696s     3.69cpu     52.6MB  par  1.0  kern    3.649s  same
+doitgen        xisto  doitgen.ts              0.236s     0.23cpu     28.4MB  par  1.0  kern    0.208s  same
+gramschmidt    xisto  gramschmidt.ts          3.117s     3.11cpu     30.8MB  par  1.0  kern    3.095s  same
+syrk           xisto  syrk.ts                 2.408s     2.40cpu     21.6MB  par  1.0  kern    2.383s  same
+syr2k          xisto  syr2k.ts                5.582s     5.58cpu     30.8MB  par  1.0  kern    5.551s  same
+trmm           xisto  trmm.ts                 1.040s     1.04cpu     18.1MB  par  1.0  kern    1.024s  same
+symm           xisto  symm.ts                 4.933s     4.93cpu     27.5MB  par  1.0  kern    4.908s  same
+covariance     xisto  covariance.ts           2.349s     2.35cpu     25.2MB  par  1.0  kern    2.330s  same
+correlation    xisto  correlation.ts          2.357s     2.35cpu     25.2MB  par  1.0  kern    2.339s  same
+DONE
