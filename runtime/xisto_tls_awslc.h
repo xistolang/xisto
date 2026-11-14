@@ -63,6 +63,20 @@ static int xs_tls_io(xs_tls *t, int fd, int r, int64_t timeout_ms, uint64_t dead
     return -1;
 }
 static void xs_tls_bind(xs_tls *t, int fd) { if (!t->fd_set) { SSL_set_fd(t->ssl, fd); t->fd_set = true; } }
+/* node:tls: the handshake now (tls.connect's 'secureConnect'), waiting on the socket; false when it failed */
+XS_NOINLINE bool xs_tls_handshake(xs_tls *t, int fd) {
+    xs_tls_bind(t, fd);
+    for (;;) {
+        int r = SSL_do_handshake(t->ssl);
+        if (r == 1) return true;
+        if (xs_tls_io(t, fd, r, -1, 0) <= 0) return false;
+    }
+}
+/* node:tls / node:https option ca: these CA certificates (a PEM file) trusted too, for the connections made after */
+XS_NOINLINE void xs_tls_add_ca_file(const char *path) {
+    pthread_once(&xs_tls_client_once, xs_tls_client_init);
+    SSL_CTX_load_verify_locations(xs_tls_client_ctx, path, NULL);
+}
 
 static bool xs_tls_write_all(xs_tls *t, int fd, const char *p, size_t n, int64_t timeout_ms, uint64_t deadline) {
     xs_tls_bind(t, fd);

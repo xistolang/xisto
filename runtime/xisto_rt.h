@@ -86,6 +86,9 @@ static XS_TLS int xs_insp_rt;      /* recurseTimes of the container being printe
 static XS_TLS int xs_insp_cur;     /* ctx.currentDepth */
 static XS_TLS void **xs_insp_seen;
 static XS_TLS int xs_insp_nseen, xs_insp_seencap;
+/* util.inspect's options (runtime/node/util.ts sets them for one call; console.log keeps Node's defaults): depth,
+   breakLength, compact (a number; 0 is compact: false) */
+static XS_TLS int64_t xs_insp_depth = 2, xs_insp_brk = 80, xs_insp_compact = 3;
 static XS_TLS void **xs_circ_obj;
 static XS_TLS int xs_ncirc, xs_circcap;
 static int xs_circ_id(void *o, bool add) {
@@ -101,7 +104,7 @@ static __attribute__((noinline)) bool xs_insp_begin(xs_insp *fr, void *obj, cons
     for (int i = 0; obj && i < xs_insp_nseen; i++)
         if (xs_insp_seen[i] == obj) { fprintf(XS_OUT, "[Circular *%d]", xs_circ_id(obj, true)); return false; }
     if (empty) { fputs(empty, XS_OUT); return false; }
-    if (xs_insp_rt > 2) { fprintf(XS_OUT, "[%s]", name); return false; }
+    if (xs_insp_rt > xs_insp_depth) { fprintf(XS_OUT, "[%s]", name); return false; }
     if (xs_insp_nseen == 0) xs_ncirc = 0; /* a new top-level value */
     if (xs_insp_nseen == xs_insp_seencap) { xs_insp_seencap = xs_insp_seencap ? xs_insp_seencap * 2 : 16; xs_insp_seen = realloc(xs_insp_seen, sizeof(void *) * (size_t)xs_insp_seencap); }
     xs_insp_seen[xs_insp_nseen++] = obj;
@@ -160,7 +163,7 @@ static __attribute__((noinline)) void xs_insp_end(xs_insp *fr, const char *open,
         char **out = NULL;
         size_t *olen = NULL;
         bool grouped = false;
-        if (array && n > 6) {
+        if (array && n > 6 && xs_insp_compact >= 1) {
             int outputLength = more ? n - 1 : n;
             size_t totalLength = 0, maxLength = 0, sep = 2;
             size_t *dataLen = malloc(sizeof(size_t) * (size_t)n);
@@ -170,11 +173,11 @@ static __attribute__((noinline)) void xs_insp_end(xs_insp *fr, const char *open,
                 if (maxLength < dataLen[i]) maxLength = dataLen[i];
             }
             size_t actualMax = maxLength + sep;
-            if (actualMax * 3 + (size_t)xs_insp_level < 80 && ((double)totalLength / (double)actualMax > 5 || maxLength <= 6)) {
+            if ((int64_t)(actualMax * 3 + (size_t)xs_insp_level) < xs_insp_brk && ((double)totalLength / (double)actualMax > 5 || maxLength <= 6)) {
                 double averageBias = sqrt((double)actualMax - (double)totalLength / (double)n);
                 double biasedMax = fmax((double)actualMax - 3 - averageBias, 1);
                 double c1 = round(sqrt(2.5 * biasedMax * (double)outputLength) / biasedMax);
-                double c2 = floor((80.0 - (double)xs_insp_level) / (double)actualMax);
+                double c2 = floor(((double)xs_insp_brk - (double)xs_insp_level) / (double)actualMax);
                 int columns = (int)fmin(fmin(c1, c2), fmin(3 * 4, 15));
                 if (columns > 1) {
                     size_t *maxLineLength = malloc(sizeof(size_t) * (size_t)columns);
@@ -222,13 +225,13 @@ static __attribute__((noinline)) void xs_insp_end(xs_insp *fr, const char *open,
         const char **e = grouped ? (const char **)out : ent;
         size_t *el = grouped ? olen : len;
         bool single = false;
-        if (xs_insp_cur - fr->recurse < 3 && on == n) {
+        if (xs_insp_cur - fr->recurse < xs_insp_compact && on == n) {
             size_t start = (size_t)on + (size_t)xs_insp_level + strlen(open) + baselen + 10;
             size_t totalLength = (size_t)on + start;
-            bool below = totalLength + (size_t)on <= 80;
+            bool below = (int64_t)(totalLength + (size_t)on) <= xs_insp_brk;
             for (int i = 0; i < on && below; i++) {
                 totalLength += xs_cp_len(e[i], el[i]);
-                if (totalLength > 80) below = false;
+                if ((int64_t)totalLength > xs_insp_brk) below = false;
             }
             bool nl = false;
             for (int i = 0; i < on && !nl; i++) if (memchr(e[i], '\n', el[i])) nl = true;
@@ -588,7 +591,11 @@ typedef struct __attribute__((aligned(64))) xs_type {
     /* the program's classes when it uses `any` (src/checker.c, dynamic path): their fields by name, read and
        written through x.f / x[k] on an any; NULL otherwise */
     const struct xs_dyn_cls *dyn;
+    /* closures only: an adapter the compiler made around a function value (a typed listener given where
+       (...args: any[]) => void goes) returns the function it wraps, so === sees the same function (off(handler)) */
+    void *(*origin)(void *);
 } xs_type;
+_Static_assert(sizeof(xs_type) == 64, "xs_type is one cache line: a field more must replace one");
 /* hdr.cls: the size class in the low bits, then the flags */
 #define XS_CLS_MASK 31    /* size class of the block (8-byte steps), 0 = not pooled */
 #define XS_STACK (1 << 5) /* lives in its creator's stack frame (stack allocation, src/stackalloc.c) */
@@ -1841,11 +1848,13 @@ static inline double xs_to_number_id(double x) { return x; }
 /* ---- Error ---- */
 
 /* f___thrown: the object a throw carried (an object of a class that extends Error, or another value): instanceof and
-   casts on a caught Error read it. f_cause: new Error(message, { cause }), as in JS (null when not given). */
-typedef struct xs_Error { xs_hdr hdr; xs_str *f_message; xs_str *f_name; void *f___thrown; xs_trace *trace; xs_str *stack; void *f_cause; } xs_Error;
+   casts on a caught Error read it. f_cause: new Error(message, { cause }), as in JS (null when not given). code: Node's
+   error code of a runtime error ("RangeError [ERR_OUT_OF_RANGE]: ..."), read as err.code through an any. */
+typedef struct xs_Error { xs_hdr hdr; xs_str *f_message; xs_str *f_name; void *f___thrown; xs_trace *trace; xs_str *stack; void *f_cause; xs_str *code; } xs_Error;
 static void xs_Error_free(void *p) {
     xs_Error *e = p;
     xs_release(e->f_message); xs_release(e->f_name); xs_release(e->stack); xs_release(e->f___thrown); xs_release(e->f_cause);
+    xs_release(e->code);
     free(e->trace);
     xs_obj_free(p);
 }
@@ -1867,6 +1876,13 @@ __attribute__((noinline)) static void *xs_Error_new(void *msg) {
         for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
             size_t n = strlen(names[i]);
             if (strncmp(m, names[i], n) == 0 && m[n] == ':' && m[n + 1] == ' ') { nm = names[i]; nml = n; m += n + 2; break; }
+            if (strncmp(m, names[i], n) == 0 && m[n] == ' ' && m[n + 1] == '[') { /* "RangeError [ERR_OUT_OF_RANGE]: ...": Node's code */
+                const char *c = m + n + 2, *ce = strstr(c, "]: ");
+                if (!ce) continue;
+                e->code = xs_str_new(c, (size_t)(ce - c));
+                nm = names[i]; nml = n; m = ce + 3;
+                break;
+            }
         }
         e->f_message = xs_str_new(m, strlen(m));
     }
@@ -1990,6 +2006,16 @@ static inline void *xs_Error_thrown(void *v) {
     return v && xs_type_of(v)->free == xs_Error_free ? ((xs_Error *)v)->f___thrown : NULL;
 }
 static inline bool xs_is_a(void *v, void (*free_fn)(void *)) { return v && free_fn && xs_type_of(v)->free == free_fn; }
+XS_NOINLINE void xs_as_fail(const char *what);
+/* x as Error, x unknown: an Error is itself; an object of a class that extends Error is wrapped as throw does
+   (xs_Error_wrap_err), the wrapper borrowed from the pool of temporaries */
+XS_NOINLINE void *xs_as_error(void *v, bool (*is_sub)(void *), int nullable) {
+    if (!v) { if (nullable) return NULL; xs_as_fail("Error"); }
+    if (xs_type_of(v)->free == xs_Error_free) return v;
+    if (is_sub(v)) return xs_ar(xs_Error_wrap_err(v));
+    xs_as_fail("Error");
+    return NULL;
+}
 /* e.stack: "Error: message" and one "    at ..." line per frame, as in Node; borrowed from the Error */
 static xs_str *xs_Error_stack(xs_Error *e) {
     if (!e->stack) {
@@ -2702,6 +2728,11 @@ static void xs_num_to_str(double v, char *out);
 /* ---- closures: a refcounted object whose first field after the header is the code pointer; captures follow ---- */
 
 typedef struct xs_closure { xs_hdr hdr; void *fn; } xs_closure;
+/* the function a closure stands for: itself, or what the adapters around it wrap (=== of two function values) */
+static inline void *xs_fn_origin(void *c) {
+    while (c && xs_type_of(c)->origin) c = xs_type_of(c)->origin(c);
+    return c;
+}
 typedef struct xs_promise xs_promise; /* (runtime/xisto_net.h: a field may hold one in a program that never makes one) */
 static inline double xs_num_or(double a, double b) { return a != 0 && a == a ? a : b; } /* a || b on numbers: a unless 0 or NaN */
 static inline int64_t xs_int_or(int64_t a, int64_t b) { return a ? a : b; }
@@ -3159,6 +3190,7 @@ XS_NOINLINE void *xs_dyn_get(void *o, xs_str *k) {
         if (k->len == 4 && memcmp(k->data, "name", 4) == 0) return xs_retain_(e->f_name);
         if (k->len == 5 && memcmp(k->data, "stack", 5) == 0) return xs_retain_(xs_Error_stack(e));
         if (k->len == 5 && memcmp(k->data, "cause", 5) == 0) return xs_retain_(e->f_cause);
+        if (k->len == 4 && memcmp(k->data, "code", 4) == 0 && e->code) return xs_retain_(e->code);
         return e->f___thrown ? xs_dyn_get(e->f___thrown, k) : NULL;
     }
     if (t->free == xs_map_free) {
@@ -3367,10 +3399,13 @@ XS_NOINLINE double xs_dyn_num(void *v) {
 }
 /* String(x) / `${x}` on an any (owned) */
 static xs_str *xs_dyn_lit(const char *s) { return xs_str_new(s, strlen(s)); }
+static void xs_u8_free(void *p);
+XS_NOINLINE xs_str *xs_dyn_str_bytes(void *v); /* (below, with the bytes) */
 XS_NOINLINE xs_str *xs_dyn_str(void *v) {
     if (!v) return xs_dyn_lit("null");
     const xs_type *t = xs_type_of(v);
     if (t->free == xs_str_free) return xs_retain_(v);
+    if (t->free == xs_u8_free) return xs_dyn_str_bytes(v); /* String(buf): its text; String(u8): "1,2,3" */
     if (t->free == xs_box_num_free) return xs_str_from_num(((xs_box_d *)v)->v);
     if (t->free == xs_box_int_free) return xs_str_from_int(((xs_box_i *)v)->v);
     if (t->free == xs_box_bool_free) return xs_dyn_lit(((xs_box_i *)v)->v ? "true" : "false");
@@ -4525,15 +4560,62 @@ static void xs_print_num(double v) {
 static void xs_print_int(int64_t v) { char buf[24]; size_t n = xs_itoa(v, buf); fwrite(buf, 1, n, XS_OUT); }
 static void xs_print_bool(bool b) { fputs(b ? "true" : "false", XS_OUT); }
 static void xs_print_str(xs_str *s) { fwrite(s->data, 1, (size_t)s->len, XS_OUT); }
-static void xs_print_str_quoted(xs_str *s) { /* as Node prints strings inside objects */
-    fputc('\'', XS_OUT);
-    for (int64_t i = 0; i < s->len; i++) {
-        char c = s->data[i];
-        if (c == '\'') fputs("\\'", XS_OUT);
-        else if (c == '\n') fputs("\\n", XS_OUT);
-        else fputc(c, XS_OUT);
+/* one string as util.inspect's strEscape writes it: in '...', or "..." when it has a ' and no ", or `...` when it has
+   both and no ` or ${; control characters, the quote and \ escaped */
+XS_NOINLINE void xs_print_quoted_part(const char *d, int64_t n) {
+    bool sq = memchr(d, '\'', (size_t)n) != NULL;
+    char q = '\'';
+    if (sq) {
+        if (!memchr(d, '"', (size_t)n)) q = '"';
+        else if (!memchr(d, '`', (size_t)n) && !memmem(d, (size_t)n, "${", 2)) q = '`';
     }
-    fputc('\'', XS_OUT);
+    FILE *o = XS_OUT;
+    fputc(q, o);
+    for (int64_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)d[i];
+        if (c == '\'' && q == '\'') fputs("\\'", o);
+        else if (c == '\\') fputs("\\\\", o);
+        else if (c < 0x20 || c == 0x7f) {
+            switch (c) {
+            case '\b': fputs("\\b", o); break;
+            case '\t': fputs("\\t", o); break;
+            case '\n': fputs("\\n", o); break;
+            case '\f': fputs("\\f", o); break;
+            case '\r': fputs("\\r", o); break;
+            default: fprintf(o, "\\x%02X", c);
+            }
+        } else if (c == 0xC2 && i + 1 < n && (unsigned char)d[i + 1] >= 0x80 && (unsigned char)d[i + 1] <= 0x9F) { /* U+0080..U+009F */
+            fprintf(o, "\\x%02X", (unsigned char)d[++i]);
+        } else fputc((char)c, o);
+    }
+    fputc(q, o);
+}
+/* the length JavaScript gives a string: UTF-16 units (a character past U+FFFF counts 2) */
+static size_t xs_u16_units(const char *d, size_t n) {
+    size_t u = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)d[i];
+        if ((c & 0xC0) != 0x80) u += c >= 0xF0 ? 2 : 1;
+    }
+    return u;
+}
+static void xs_print_str_quoted(xs_str *s) { /* as Node prints strings inside objects */
+    /* a long string with line breaks: one quoted piece per line, joined by " +" (formatPrimitive; the lengths are
+       JavaScript's, in UTF-16 units) */
+    size_t cps;
+    if (xs_insp_compact >= 0 && s->len > 16 && memchr(s->data, '\n', (size_t)s->len) && (cps = xs_u16_units(s->data, (size_t)s->len)) > 16 &&
+        (int64_t)cps > xs_insp_brk - xs_insp_level - 4) {
+        const char *p = s->data, *end = s->data + s->len;
+        while (p < end) {
+            const char *nl = memchr(p, '\n', (size_t)(end - p));
+            const char *q = nl ? nl + 1 : end;
+            if (p != s->data) { fputs(" +\n", XS_OUT); for (int i = 0; i < xs_insp_level + 2; i++) fputc(' ', XS_OUT); }
+            xs_print_quoted_part(p, q - p);
+            p = q;
+        }
+        return;
+    }
+    xs_print_quoted_part(s->data, s->len);
 }
 #ifdef XS_DEBUG
 /* > 0 while the debugger renders a value: the nesting it may still print. A cycle (parent <-> child) would
@@ -5518,8 +5600,26 @@ static xs_str *xs_process_cwd(void) { /* process.cwd() */
 #endif
     return xs_str_new(b, strlen(b));
 }
-static void xs_process_exit(int64_t code) { fflush(stdout); exit((int)code); }
 static int xs_exit_code_; /* process.exitCode: the status when the program ends on its own */
+/* process.on('exit' | 'beforeExit'): runtime/node/process.ts's dispatcher, called with (code, before) */
+static xs_closure *xs_pexit_cb;
+static void (*xs_rt_cleanup)(void); /* (process.ts's signal dispatcher, let go at the end) */
+XS_NOINLINE void xs_process_on_exit(xs_closure *cb) { if (!xs_pexit_cb) xs_pexit_cb = xs_retain(cb); }
+XS_NOINLINE void xs_pexit_call(xs_closure *cb, int64_t code, bool before) {
+    size_t mark = xs_ar_mark();
+    ((void (*)(void *, int64_t, bool))cb->fn)(cb, code, before);
+    xs_ar_drain(mark);
+}
+XS_NOINLINE void xs_process_exit(int64_t code) {
+    xs_exit_code_ = (int)code;
+    if (xs_pexit_cb) { /* 'exit' (not 'beforeExit'), as Node does for process.exit() */
+        xs_closure *cb = xs_pexit_cb;
+        xs_pexit_cb = NULL;
+        xs_pexit_call(cb, code, false);
+    }
+    fflush(stdout);
+    exit((int)code);
+}
 static int64_t xs_process_set_exit_code(int64_t code) { xs_exit_code_ = (int)code; return code; }
 /* process.stdout.write / process.stderr.write: through the same FILE as console.log, so the order is kept */
 static inline void xs_out_drain(void);
@@ -6075,13 +6175,30 @@ static void xs_u8_print(void *p) {
 }
 static void xs_buf_print(void *p) {
     xs_Uint8Array *b = p;
-    fputs("<Buffer", XS_OUT);
+    fputs(b->f_length ? "<Buffer" : "<Buffer ", XS_OUT); /* (an empty one: "<Buffer >", as Node) */
     int64_t n = b->f_length < 50 ? b->f_length : 50;
     for (int64_t i = 0; i < n; i++) fprintf(XS_OUT, " %02x", b->data[i]);
     if (b->f_length > 50) fprintf(XS_OUT, " ... %lld more byte%s", (long long)(b->f_length - 50), b->f_length - 50 == 1 ? "" : "s");
     fputc('>', XS_OUT);
 }
 static inline bool xs_is_buffer(xs_Uint8Array *b) { return xs_type_of(b)->print == xs_buf_print; }
+XS_NOINLINE xs_str *xs_buf_to_string(xs_Uint8Array *b, xs_str *enc, int64_t start, int64_t end);
+XS_NOINLINE xs_str *xs_dyn_str_bytes(void *v) {
+    xs_Uint8Array *b = v;
+    if (xs_is_buffer(b)) {
+        xs_str *enc = xs_str_new("utf8", 4);
+        xs_str *r = xs_buf_to_string(b, enc, 0, b->f_length);
+        xs_release(enc);
+        return r;
+    }
+    xs_sb sb = {0};
+    char num[8];
+    for (int64_t i = 0; i < b->f_length; i++) {
+        int n = snprintf(num, sizeof num, i ? ",%u" : "%u", (unsigned)b->data[i]);
+        xs_sb_put(&sb, num, (size_t)n);
+    }
+    return xs_sb_finish(&sb);
+}
 #if defined(__linux__)
 #include <sys/mman.h>
 #endif
@@ -7568,15 +7685,16 @@ static xs_str *xs_utf8_decode(const uint8_t *p, int64_t n) {
     while (i < n) {
         uint8_t c = p[i];
         if (c < 0x80) { int64_t j = i; while (j < n && p[j] < 0x80) j++; xs_sb_put(&sb, (const char *)p + i, (size_t)(j - i)); i = j; continue; }
-        int k = c >= 0xF0 && c <= 0xF4 ? 4 : c >= 0xE0 ? 3 : c >= 0xC2 && c < 0xE0 ? 2 : 0;
-        bool ok = k > 0 && i + k <= n;
-        for (int j = 1; ok && j < k; j++) if ((p[i + j] & 0xC0) != 0x80) ok = false;
-        if (ok && k == 3) { uint32_t cp = ((c & 0x0Fu) << 12) | ((p[i + 1] & 0x3Fu) << 6) | (p[i + 2] & 0x3Fu); if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF)) ok = false; }
-        if (ok && k == 4) { uint32_t cp = ((c & 0x07u) << 18) | ((p[i + 1] & 0x3Fu) << 12) | ((p[i + 2] & 0x3Fu) << 6) | (p[i + 3] & 0x3Fu); if (cp < 0x10000 || cp > 0x10FFFF) ok = false; }
-        if (ok) { xs_sb_put(&sb, (const char *)p + i, (size_t)k); i += k; continue; }
-        xs_sb_put(&sb, "\xEF\xBF\xBD", 3);
-        i++;
-        while (i < n && (p[i] & 0xC0) == 0x80 && k > 1) { i++; k--; } /* the maximal subpart is one replacement */
+        /* the WHATWG decoder: a lead byte, then continuation bytes in the range it allows; a sequence cut short is
+           one U+FFFD (the maximal subpart) and the byte that broke it starts again */
+        int need = c >= 0xC2 && c <= 0xDF ? 1 : c >= 0xE0 && c <= 0xEF ? 2 : c >= 0xF0 && c <= 0xF4 ? 3 : 0;
+        uint8_t lo = c == 0xE0 ? 0xA0 : c == 0xF0 ? 0x90 : 0x80, hi = c == 0xED ? 0x9F : c == 0xF4 ? 0x8F : 0xBF;
+        int64_t j = i + 1;
+        int got = 0;
+        while (got < need && j < n && p[j] >= lo && p[j] <= hi) { j++; got++; lo = 0x80; hi = 0xBF; }
+        if (need && got == need) xs_sb_put(&sb, (const char *)p + i, (size_t)(j - i));
+        else xs_sb_put(&sb, "\xEF\xBF\xBD", 3);
+        i = need ? j : i + 1;
     }
     xs_str *r = xs_str_new(sb.data, sb.len);
     free(sb.data);
@@ -7591,6 +7709,255 @@ XS_NOINLINE xs_TextEncoder *xs_TextEncoder_new(void) { return xs_obj_alloc(sizeo
 XS_NOINLINE xs_TextEncoder *xs_TextDecoder_new(void) { return xs_obj_alloc(sizeof(xs_TextEncoder), xs_TextEncoder_free, xs_TextDecoder_print); }
 XS_NOINLINE xs_Uint8Array *xs_TextEncoder_encode(xs_TextEncoder *t, xs_str *s) { (void)t; return xs_text_encode(s); }
 static xs_str *xs_TextDecoder_decode(xs_TextEncoder *t, xs_Uint8Array *b) { (void)t; return xs_text_decode(b); }
+
+/* ---- node:util (runtime/node/util.ts): inspect into a string, the kind of a value, deep equality ---- */
+/* util.inspect(v): what console.log prints for v inside an object (a string quoted), with depth (recursion levels
+   shown), breakLength and compact (a number; 0 is compact: false) for this call only */
+XS_NOINLINE xs_str *xs_util_inspect(void *v, int64_t depth, int64_t brk, int64_t compact) {
+    int64_t sd = xs_insp_depth, sb = xs_insp_brk, sc = xs_insp_compact;
+    FILE *saved = xs_out_f;
+    char *buf = NULL;
+    size_t size = 0;
+    FILE *f = open_memstream(&buf, &size);
+    xs_out_f = f;
+    xs_insp_depth = depth;
+    xs_insp_brk = brk;
+    xs_insp_compact = compact;
+    xs_print_any_quoted(v);
+    xs_insp_depth = sd;
+    xs_insp_brk = sb;
+    xs_insp_compact = sc;
+    xs_out_f = saved;
+    fclose(f);
+    xs_str *r = xs_str_new(buf ? buf : "", size);
+    free(buf);
+    return r;
+}
+/* what a value is (util.types and format): 0 null, 1 string, 2 number, 3 boolean, 4 array, 5 Map, 6 Set, 7 Date,
+   9 Error (the built-in class), 10 function, 11 symbol, 12 bigint, 13 Uint8Array (Buffer), 14 Float64Array,
+   15 Int32Array, 16 SharedArrayBuffer, 18 another object (a class's), 19 an object of an interface, 20 a Record
+   (an object made as an any) */
+XS_NOINLINE int64_t xs_util_kind(void *v) {
+    if (!v) return 0;
+    const xs_type *t = xs_type_of(v);
+    void (*f)(void *) = t->free;
+    if (f == xs_str_free) return 1;
+    if (f == xs_box_num_free || f == xs_box_int_free) return 2;
+    if (f == xs_box_bool_free) return 3;
+    if (f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free) return 4;
+    if (f == xs_map_free) { xs_map *m = v; return m->record ? 20 : m->is_map ? 5 : 6; }
+    if (f == xs_Date_free) return 7;
+    if (f == xs_Error_free) return 9;
+    if (t->print == xs_print_closure) return 10;
+    if (f == xs_Symbol_free) return 11;
+    if (f == xs_big_free_fn) return 12;
+    if (f == xs_u8_free) return 13;
+    if (f == xs_f64_free) return 14;
+    if (f == xs_i32_free) return 15;
+    if (f == xs_sab_free) return 16;
+    if (t->dyn && t->dyn->shape) return 19;
+    return 18;
+}
+/* the object's class declares a method of that name (format's %s calls a toString of the program's own) */
+XS_NOINLINE bool xs_util_has_method(void *v, xs_str *name) {
+    if (!v) return false;
+    const xs_type *t = xs_type_of(v);
+    return t->dyn && xs_dyn_has_method(t->dyn, name);
+}
+/* a value seen by isDeepStrictEqual: an element of a typed array or a Map value is read without boxing */
+typedef struct { int k; double d; void *p; } xs_uv; /* k: 0 null, 1 number, 2 boolean (d), 3 reference (p) */
+static xs_uv xs_uv_ref(void *p) {
+    xs_uv u = {0, 0, NULL};
+    if (!p) return u;
+    void (*f)(void *) = xs_type_of(p)->free;
+    if (f == xs_box_num_free) { u.k = 1; u.d = ((xs_box_d *)p)->v; }
+    else if (f == xs_box_int_free) { u.k = 1; u.d = (double)((xs_box_i *)p)->v; }
+    else if (f == xs_box_bool_free) { u.k = 2; u.d = (double)((xs_box_i *)p)->v; }
+    else { u.k = 3; u.p = p; }
+    return u;
+}
+static xs_uv xs_uv_map_val(xs_map *m, xs_val v) {
+    xs_uv u = {0, 0, NULL};
+    switch (m->val_kind) {
+    case 0: if (xs_isnull_num(v.d)) return u; u.k = 1; u.d = v.d; return u;
+    case 1: if (v.i == XS_NULL_INT) return u; u.k = 1; u.d = (double)v.i; return u;
+    case 2: u.k = 2; u.d = (double)(v.i != 0); return u;
+    default: return xs_uv_ref(v.p);
+    }
+}
+static bool xs_util_deq(void *a, void *b, int depth);
+static bool xs_uv_eq(xs_uv a, xs_uv b, int depth) {
+    if (a.k != b.k) return false;
+    if (a.k == 0) return true;
+    if (a.k == 1) return a.d == b.d ? (a.d != 0 || signbit(a.d) == signbit(b.d)) : (a.d != a.d && b.d != b.d); /* Object.is */
+    if (a.k == 2) return a.d == b.d;
+    return xs_util_deq(a.p, b.p, depth);
+}
+static size_t xs_uv_arr_len(void *a) { return ((xs_arr_ref *)a)->len; } /* (the arrays share the layout of len) */
+static xs_uv xs_uv_arr_at(void *a, size_t i) {
+    void (*f)(void *) = xs_type_of(a)->free;
+    xs_uv u = {0, 0, NULL};
+    if (f == xs_arr_ref_free) return xs_uv_ref(((xs_arr_ref *)a)->data[i]);
+    if (f == xs_arr_num_free) { double d = ((xs_arr_num *)a)->data[i]; if (xs_isnull_num(d)) return u; u.k = 1; u.d = d; return u; }
+    if (f == xs_arr_int_free) { int64_t x = ((xs_arr_int *)a)->data[i]; if (x == XS_NULL_INT) return u; u.k = 1; u.d = (double)x; return u; }
+    u.k = 2; u.d = ((xs_arr_bool *)a)->data[i];
+    return u;
+}
+static bool xs_is_arr(void (*f)(void *)) { return f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free; }
+/* the own enumerable keys of a plain object (an interface's object: its fields, an optional one left out not
+   counted; a Record: its entries) and the value under a key; false when the object has no such key */
+static int64_t xs_plain_count(void *o) {
+    if (xs_type_of(o)->free == xs_map_free) return (int64_t)((xs_map *)o)->count;
+    const xs_dyn_cls *c = xs_type_of(o)->dyn;
+    int64_t n = 0;
+    for (int32_t i = 0; i < c->n; i++) {
+        if (c->f[i].optional) { void *v = xs_dyn_load(&c->f[i], o); bool there = v != NULL; xs_release(v); if (!there) continue; }
+        n++;
+    }
+    return n;
+}
+static bool xs_plain_get(void *o, const char *k, size_t kl, void **out) {
+    *out = NULL;
+    if (xs_type_of(o)->free == xs_map_free) {
+        xs_map *m = o;
+        xs_map_entry *e;
+        XS_MAP_EACH(m, e) if ((size_t)e->skey->len == kl && memcmp(e->skey->data, k, kl) == 0) { *out = xs_dyn_map_val(m, e->val); return true; }
+        return false;
+    }
+    const xs_dyn_cls *c = xs_type_of(o)->dyn;
+    for (int32_t i = 0; i < c->n; i++)
+        if (c->f[i].len == kl && memcmp(c->f[i].name, k, kl) == 0) {
+            *out = xs_dyn_load(&c->f[i], o);
+            if (!*out && c->f[i].optional) return false;
+            return true;
+        }
+    return false;
+}
+static bool xs_plain_eq(void *a, void *b, int depth) {
+    if (xs_plain_count(a) != xs_plain_count(b)) return false;
+    bool eq = true;
+    if (xs_type_of(a)->free == xs_map_free) {
+        xs_map *m = a;
+        xs_map_entry *e;
+        XS_MAP_EACH(m, e) {
+            void *bv;
+            if (!xs_plain_get(b, e->skey->data, (size_t)e->skey->len, &bv)) return false;
+            eq = xs_uv_eq(xs_uv_map_val(m, e->val), xs_uv_ref(bv), depth);
+            xs_release(bv);
+            if (!eq) return false;
+        }
+        return true;
+    }
+    const xs_dyn_cls *c = xs_type_of(a)->dyn;
+    for (int32_t i = 0; i < c->n && eq; i++) {
+        void *av = xs_dyn_load(&c->f[i], a), *bv;
+        if (!av && c->f[i].optional) continue;
+        if (!xs_plain_get(b, c->f[i].name, c->f[i].len, &bv)) { xs_release(av); return false; }
+        eq = xs_uv_eq(xs_uv_ref(av), xs_uv_ref(bv), depth);
+        xs_release(av);
+        xs_release(bv);
+    }
+    return eq;
+}
+/* util.isDeepStrictEqual: the same primitives (Object.is), or objects of the same kind and class whose own
+   fields, elements, entries and members are deep-equal (Map and Set in any order); a cycle compares as equal */
+static bool xs_util_deq(void *a, void *b, int depth) {
+    if (a == b) return true;
+    if (depth > 1000) return true;
+    xs_uv ua = xs_uv_ref(a), ub = xs_uv_ref(b);
+    if (ua.k != 3 || ub.k != 3) return xs_uv_eq(ua, ub, depth);
+    const xs_type *ta = xs_type_of(a), *tb = xs_type_of(b);
+    void (*fa)(void *) = ta->free, (*fb)(void *) = tb->free;
+    bool pa = (fa == xs_map_free && ((xs_map *)a)->record) || (ta->dyn && ta->dyn->shape);
+    bool pb = (fb == xs_map_free && ((xs_map *)b)->record) || (tb->dyn && tb->dyn->shape);
+    if (pa || pb) return pa && pb && xs_plain_eq(a, b, depth + 1);
+    if (xs_is_arr(fa) || xs_is_arr(fb)) {
+        if (!xs_is_arr(fa) || !xs_is_arr(fb) || xs_uv_arr_len(a) != xs_uv_arr_len(b)) return false;
+        for (size_t i = 0; i < xs_uv_arr_len(a); i++)
+            if (!xs_uv_eq(xs_uv_arr_at(a, i), xs_uv_arr_at(b, i), depth + 1)) return false;
+        return true;
+    }
+    if (fa != fb) return false;
+    if (fa == xs_str_free) { xs_str *x = a, *y = b; return x->len == y->len && memcmp(x->data, y->data, (size_t)x->len) == 0; }
+    if (fa == xs_Date_free) { double x = ((xs_Date *)a)->t, y = ((xs_Date *)b)->t; return x == y || (x != x && y != y); }
+    if (fa == xs_u8_free) {
+        xs_Uint8Array *x = a, *y = b;
+        return x->f_length == y->f_length && (x->f_length == 0 || memcmp(x->data, y->data, (size_t)x->f_length) == 0);
+    }
+    if (fa == xs_Error_free) {
+        xs_Error *x = a, *y = b;
+        return xs_util_deq(x->f_message, y->f_message, depth + 1) && xs_util_deq(x->f_name, y->f_name, depth + 1);
+    }
+    if (fa == xs_map_free) {
+        xs_map *x = a, *y = b;
+        if (x->is_map != y->is_map || x->count != y->count) return false;
+        if (x->count == 0) return true;
+        xs_map_entry *e, *g;
+        XS_MAP_EACH(x, e) {
+            bool found = false;
+            XS_MAP_EACH(y, g) {
+                bool keq;
+                if (x->ukeys || y->ukeys) keq = x->ukeys && y->ukeys ? xs_util_deq(e->val.p, g->val.p, depth + 1) : false;
+                else if (x->str_keys != y->str_keys) keq = false;
+                else if (x->str_keys) keq = e->skey->len == g->skey->len && memcmp(e->skey->data, g->skey->data, (size_t)e->skey->len) == 0;
+                else keq = e->ikey == g->ikey;
+                if (!keq) continue;
+                found = !x->is_map || xs_uv_eq(xs_uv_map_val(x, e->val), xs_uv_map_val(y, g->val), depth + 1);
+                break;
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+    if (ta->dyn) { /* objects of one class: field by field */
+        const xs_dyn_cls *c = ta->dyn;
+        for (int32_t i = 0; i < c->n; i++) {
+            void *av = xs_dyn_load(&c->f[i], a), *bv = xs_dyn_load(&c->f[i], b);
+            bool eq = xs_uv_eq(xs_uv_ref(av), xs_uv_ref(bv), depth + 1);
+            xs_release(av);
+            xs_release(bv);
+            if (!eq) return false;
+        }
+        return true;
+    }
+    if (fa == xs_Symbol_free || ta->print == xs_print_closure) return false; /* (only the same one) */
+    /* another built-in object (a RegExp...): equal when both print the same */
+    xs_str *x = xs_util_inspect(a, 2, 80, 3), *y = xs_util_inspect(b, 2, 80, 3);
+    bool eq = x->len == y->len && memcmp(x->data, y->data, (size_t)x->len) == 0;
+    xs_release(x);
+    xs_release(y);
+    return eq;
+}
+XS_NOINLINE bool xs_util_deep_equal(void *a, void *b) { return xs_util_deq(a, b, 0); }
+/* styleText: whether a standard stream is a terminal */
+XS_NOINLINE bool xs_util_isatty(int64_t fd) { return isatty((int)fd) == 1; }
+/* getSystemErrorName: the name of an errno value of this system ("" when unknown) */
+XS_NOINLINE xs_str *xs_util_errname(int64_t e) {
+    static const struct { int no; const char *name; } names[] = {
+        {EPERM, "EPERM"}, {ENOENT, "ENOENT"}, {ESRCH, "ESRCH"}, {EINTR, "EINTR"}, {EIO, "EIO"}, {ENXIO, "ENXIO"},
+        {E2BIG, "E2BIG"}, {EBADF, "EBADF"}, {ECHILD, "ECHILD"}, {EAGAIN, "EAGAIN"}, {ENOMEM, "ENOMEM"}, {EACCES, "EACCES"},
+        {EFAULT, "EFAULT"}, {EBUSY, "EBUSY"}, {EEXIST, "EEXIST"}, {EXDEV, "EXDEV"}, {ENODEV, "ENODEV"}, {ENOTDIR, "ENOTDIR"},
+        {EISDIR, "EISDIR"}, {EINVAL, "EINVAL"}, {ENFILE, "ENFILE"}, {EMFILE, "EMFILE"}, {ENOTTY, "ENOTTY"}, {ETXTBSY, "ETXTBSY"},
+        {EFBIG, "EFBIG"}, {ENOSPC, "ENOSPC"}, {ESPIPE, "ESPIPE"}, {EROFS, "EROFS"}, {EMLINK, "EMLINK"}, {EPIPE, "EPIPE"},
+        {ERANGE, "ERANGE"}, {ENAMETOOLONG, "ENAMETOOLONG"}, {ENOSYS, "ENOSYS"}, {ENOTEMPTY, "ENOTEMPTY"}, {ELOOP, "ELOOP"},
+        {ENOTSOCK, "ENOTSOCK"}, {EDESTADDRREQ, "EDESTADDRREQ"}, {EMSGSIZE, "EMSGSIZE"}, {EPROTOTYPE, "EPROTOTYPE"},
+        {ENOPROTOOPT, "ENOPROTOOPT"}, {EPROTONOSUPPORT, "EPROTONOSUPPORT"}, {ENOTSUP, "ENOTSUP"}, {EAFNOSUPPORT, "EAFNOSUPPORT"},
+        {EADDRINUSE, "EADDRINUSE"}, {EADDRNOTAVAIL, "EADDRNOTAVAIL"}, {ENETDOWN, "ENETDOWN"}, {ENETUNREACH, "ENETUNREACH"},
+        {ECONNABORTED, "ECONNABORTED"}, {ECONNRESET, "ECONNRESET"}, {ENOBUFS, "ENOBUFS"}, {EISCONN, "EISCONN"},
+        {ENOTCONN, "ENOTCONN"}, {ETIMEDOUT, "ETIMEDOUT"}, {ECONNREFUSED, "ECONNREFUSED"}, {EHOSTUNREACH, "EHOSTUNREACH"},
+        {EALREADY, "EALREADY"}, {EINPROGRESS, "EINPROGRESS"}, {ECANCELED, "ECANCELED"}, {EOVERFLOW, "EOVERFLOW"},
+        {EILSEQ, "EILSEQ"}, {EPROTO, "EPROTO"},
+#ifdef ESHUTDOWN
+        {ESHUTDOWN, "ESHUTDOWN"},
+#endif
+#ifdef EHOSTDOWN
+        {EHOSTDOWN, "EHOSTDOWN"},
+#endif
+    };
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
+        if (names[i].no == e && names[i].no > 0) return xs_str_new(names[i].name, strlen(names[i].name));
+    return xs_str_new("", 0);
+}
 
 /* ---- base64 / hex ---- */
 static const char xs_b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -7872,7 +8239,7 @@ XS_NOINLINE xs_Uint8Array *xs_u8_from_hex(xs_str *s) {
 }
 
 /* ---- Buffer (node:buffer, a global) ---- */
-XS_NOINLINE int xs_buf_enc(xs_str *e) { /* 0 utf8, 1 base64, 2 base64url, 3 hex, 4 latin1/binary, 5 ascii */
+XS_NOINLINE int xs_buf_enc(xs_str *e) { /* 0 utf8, 1 base64, 2 base64url, 3 hex, 4 latin1/binary, 5 ascii, 7 ucs2/utf16le */
     if (!e) return 0;
     char t[16];
     size_t n = (size_t)e->len < sizeof t - 1 ? (size_t)e->len : sizeof t - 1;
@@ -7884,10 +8251,13 @@ XS_NOINLINE int xs_buf_enc(xs_str *e) { /* 0 utf8, 1 base64, 2 base64url, 3 hex,
     if (!strcmp(t, "hex")) return 3;
     if (!strcmp(t, "latin1") || !strcmp(t, "binary")) return 4;
     if (!strcmp(t, "ascii")) return 5;
+    if (!strcmp(t, "ucs2") || !strcmp(t, "ucs-2") || !strcmp(t, "utf16le") || !strcmp(t, "utf-16le")) return 7;
     if (!strcmp(t, "xisto:raw")) return 6; /* the bytes as they are, in a string (packages: a Buffer body over http) */
-    xs_panicf("TypeError: Unknown encoding: %s", e->data);
+    xs_panicf("TypeError [ERR_UNKNOWN_ENCODING]: Unknown encoding: %s", e->data);
     return 0;
 }
+static uint8_t *xs_buf_encode(xs_str *s, int k, int64_t *n);
+static xs_str *xs_buf_ucs2_decode(const uint8_t *p, int64_t n);
 XS_NOINLINE xs_Uint8Array *xs_buf_from_str(xs_str *s, xs_str *enc) {
     int k = xs_buf_enc(enc);
     if (k == 0) { xs_Uint8Array *b = xs_u8_raw(s->len, true, false); memcpy(b->data, s->data, (size_t)s->len); return b; }
@@ -7913,16 +8283,13 @@ XS_NOINLINE xs_Uint8Array *xs_buf_from_str(xs_str *s, xs_str *enc) {
         b->f_length = i;
         return b;
     }
-    /* latin1 / ascii: one byte per code point (the low 8 bits) */
-    xs_Uint8Array *b = xs_u8_raw(xs_str_len(s), true, false);
-    int64_t o = 0;
-    for (int64_t i = 0; i < s->len;) {
-        size_t l;
-        uint32_t c = xs_utf8_cp((const unsigned char *)s->data + i, (size_t)(s->len - i), &l);
-        b->data[o++] = (uint8_t)c;
-        i += (int64_t)l;
-    }
-    b->f_length = o;
+    /* latin1 / ascii: the low byte of each UTF-16 unit; ucs2: the units, little-endian */
+    int64_t n;
+    uint8_t *p = xs_buf_encode(s, k, &n);
+    xs_Uint8Array *b = xs_u8_raw(0, true, false);
+    free(b->data);
+    b->data = p;
+    b->f_length = n;
     return b;
 }
 XS_NOINLINE xs_Uint8Array *xs_buf_from_bytes(xs_Uint8Array *s) { return xs_u8_copy_kind(s, true); }
@@ -7931,7 +8298,9 @@ XS_NOINLINE xs_Uint8Array *xs_buf_from_ints(xs_arr_int *a) {
     for (size_t i = 0; i < a->len; i++) b->data[i] = (uint8_t)a->data[i];
     return b;
 }
+XS_NOINLINE void xs_buf_check_size(int64_t n);
 XS_NOINLINE xs_Uint8Array *xs_buf_alloc(int64_t n, int64_t fill) {
+    if (n < 0) xs_buf_check_size(n); /* (Node's error) */
     xs_Uint8Array *b = xs_u8_raw(n, true, fill == 0);
     if (fill) memset(b->data, (int)(uint8_t)fill, (size_t)n);
     return b;
@@ -7961,6 +8330,7 @@ XS_NOINLINE xs_str *xs_buf_to_string(xs_Uint8Array *b, xs_str *enc, int64_t star
     case 2: return xs_b64_enc_(p, n, true, false);
     case 3: return xs_hex_encode(p, n);
     case 6: return xs_str_new((const char *)p, (size_t)n);
+    case 7: return xs_buf_ucs2_decode(p, n);
     default: { /* latin1 / ascii: each byte a code point (ascii drops the high bit) */
         bool ascii = xs_buf_enc(enc) == 5;
         xs_sb sb = {0};
@@ -8013,6 +8383,28 @@ XS_NOINLINE xs_str *xs_atob(xs_str *s) {
     free(sb.data);
     return r;
 }
+/* node:buffer's isUtf8, isAscii, atob, btoa (runtime/node/buffer.ts) */
+XS_NOINLINE bool xs_buf_is_utf8(xs_Uint8Array *b) {
+    const uint8_t *p = b->data;
+    int64_t i = 0, n = b->f_length;
+    while (i < n) {
+        uint8_t c = p[i];
+        if (c < 0x80) { i++; continue; }
+        int k = c >= 0xF0 && c <= 0xF4 ? 4 : c >= 0xE0 && c <= 0xEF ? 3 : c >= 0xC2 && c < 0xE0 ? 2 : 0;
+        if (!k || i + k > n) return false;
+        for (int j = 1; j < k; j++) if ((p[i + j] & 0xC0) != 0x80) return false;
+        if (k == 3) { uint32_t cp = ((c & 0x0Fu) << 12) | ((p[i + 1] & 0x3Fu) << 6); if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF)) return false; }
+        if (k == 4) { uint32_t cp = ((c & 0x07u) << 18) | ((p[i + 1] & 0x3Fu) << 12); if (cp < 0x10000 || cp > 0x10FFFF) return false; }
+        i += k;
+    }
+    return true;
+}
+XS_NOINLINE bool xs_buf_is_ascii(xs_Uint8Array *b) {
+    for (int64_t i = 0; i < b->f_length; i++) if (b->data[i] >= 0x80) return false;
+    return true;
+}
+XS_NOINLINE xs_str *xs_buf_atob(xs_str *s) { return xs_atob(s); }
+XS_NOINLINE xs_str *xs_buf_btoa(xs_str *s) { return xs_btoa(s); }
 XS_NOINLINE xs_Uint8Array *xs_fs_read_stdin_bytes(void) {
     xs_stdin_binary();
     size_t n;
@@ -8955,6 +9347,497 @@ static void xs_sb_buf(xs_sb *sb, xs_Uint8Array *b) { /* JSON.stringify of a Buff
     xs_sb_put(sb, "]}", 2);
 }
 
+/* ---- Buffer: the rest of Node's API (node:buffer) ----
+   Reading and writing numbers at an offset, compare, copy, fill, write, search, swap and the encodings
+   (src/checker.c, check_bytes_member and check_bytes_static, choose these functions). Errors are Node's, words
+   and codes: a message "RangeError [ERR_OUT_OF_RANGE]: ..." becomes a RangeError whose err.code is
+   ERR_OUT_OF_RANGE (xs_Error_new). An index or offset not given arrives as INT64_MIN. */
+enum { XS_BUF_BE = 1, XS_BUF_SIGNED = 2 }; /* the flags of the read and write functions */
+enum { XS_ENC_UTF8, XS_ENC_BASE64, XS_ENC_BASE64URL, XS_ENC_HEX, XS_ENC_LATIN1, XS_ENC_ASCII, XS_ENC_RAW, XS_ENC_UCS2 }; /* xs_buf_enc */
+static XS_TLS char xs_buf_errbuf[640];
+/* Node's addNumericalSeparator: "4294967296" -> "4_294_967_296" */
+static void xs_buf_sep(char *o, size_t cap, const char *v) {
+    size_t n = strlen(v), start = v[0] == '-' ? 1 : 0, i = n;
+    char tail[96] = "";
+    while (i >= start + 4) {
+        char t[96];
+        snprintf(t, sizeof t, "_%.3s%s", v + i - 3, tail);
+        snprintf(tail, sizeof tail, "%s", t);
+        i -= 3;
+    }
+    snprintf(o, cap, "%.*s%s", (int)i, v, tail);
+}
+/* a number as Node's ERR_OUT_OF_RANGE shows what it received: an integer past 2^32 with separators, else inspect's */
+static void xs_buf_recv_num(char *o, size_t cap, double v) {
+    if (v == 0 && signbit(v)) { snprintf(o, cap, "-0"); return; }
+    xs_str *s = xs_str_from_num(v);
+    if (isfinite(v) && trunc(v) == v && fabs(v) > 4294967296.0) xs_buf_sep(o, cap, s->data);
+    else snprintf(o, cap, "%s", s->data);
+    xs_release(s);
+}
+XS_NOINLINE void xs_buf_range_fail(const char *name, const char *range, const char *received) {
+    snprintf(xs_buf_errbuf, sizeof xs_buf_errbuf, "RangeError [ERR_OUT_OF_RANGE]: The value of \"%s\" is out of range. It must be %s. Received %s", name,
+             range, received);
+    xs_panic(xs_buf_errbuf);
+}
+XS_NOINLINE void xs_buf_range_num(const char *name, const char *range, double v) {
+    char r[96];
+    xs_buf_recv_num(r, sizeof r, v);
+    xs_buf_range_fail(name, range, r);
+}
+/* Node's validateOffset(v, name, min, max) */
+XS_NOINLINE void xs_buf_check_offset(int64_t v, const char *name, int64_t lo, int64_t hi) {
+    if (v >= lo && v <= hi) return;
+    char range[96];
+    snprintf(range, sizeof range, ">= %lld && <= %lld", (long long)lo, (long long)hi);
+    xs_buf_range_num(name, range, (double)v);
+}
+#define XS_BUF_KMAX INT64_C(9007199254740991)
+/* an offset given as a number: an integer, or Node's error */
+XS_NOINLINE int64_t xs_buf_num_offset(double v) {
+    if (!isfinite(v) || trunc(v) != v) xs_buf_range_num("offset", "an integer", v);
+    return (int64_t)v;
+}
+XS_NOINLINE void xs_buf_bounds_fail(int64_t off, int64_t max) {
+    if (max < 0) xs_panic("RangeError [ERR_BUFFER_OUT_OF_BOUNDS]: Attempt to access memory outside buffer bounds");
+    char range[64];
+    snprintf(range, sizeof range, ">= 0 and <= %lld", (long long)max);
+    xs_buf_range_num("offset", range, (double)off);
+}
+XS_NOINLINE void xs_buf_check(xs_Uint8Array *b, int64_t off, int64_t n) {
+    if (off < 0 || off > b->f_length - n) xs_buf_bounds_fail(off, b->f_length - n);
+}
+XS_NOINLINE void xs_buf_check_bytelength(int64_t n) {
+    if (n < 1 || n > 6) xs_buf_range_num("byteLength", ">= 1 and <= 6", (double)n);
+}
+static uint64_t xs_buf_load(const uint8_t *p, int64_t n, bool be) {
+    uint64_t v = 0;
+    if (be) for (int64_t i = 0; i < n; i++) v = v << 8 | p[i];
+    else for (int64_t i = n - 1; i >= 0; i--) v = v << 8 | p[i];
+    return v;
+}
+static void xs_buf_store(uint8_t *p, int64_t n, bool be, uint64_t v) {
+    for (int64_t i = 0; i < n; i++) { p[be ? n - 1 - i : i] = (uint8_t)v; v >>= 8; }
+}
+/* buf.readUInt16LE(offset) & co: n bytes (1 to 6) */
+XS_NOINLINE int64_t xs_buf_read_int(xs_Uint8Array *b, int64_t off, int64_t n, int64_t flags) {
+    xs_buf_check(b, off, n);
+    uint64_t v = xs_buf_load(b->data + off, n, flags & XS_BUF_BE);
+    if ((flags & XS_BUF_SIGNED) && (v >> (8 * n - 1) & 1)) v |= ~(uint64_t)0 << (8 * n);
+    return (int64_t)v;
+}
+/* buf.readUIntLE(offset, byteLength) & co */
+XS_NOINLINE int64_t xs_buf_read_var(xs_Uint8Array *b, int64_t off, int64_t n, int64_t flags) {
+    xs_buf_check_bytelength(n);
+    return xs_buf_read_int(b, off, n, flags);
+}
+XS_NOINLINE double xs_buf_read_f32(xs_Uint8Array *b, int64_t off, int64_t flags) {
+    xs_buf_check(b, off, 4);
+    uint32_t u = (uint32_t)xs_buf_load(b->data + off, 4, flags & XS_BUF_BE);
+    float f;
+    memcpy(&f, &u, 4);
+    return (double)f;
+}
+XS_NOINLINE double xs_buf_read_f64(xs_Uint8Array *b, int64_t off, int64_t flags) {
+    xs_buf_check(b, off, 8);
+    uint64_t u = xs_buf_load(b->data + off, 8, flags & XS_BUF_BE);
+    double d;
+    memcpy(&d, &u, 8);
+    return d;
+}
+XS_NOINLINE xs_big *xs_buf_read_big(xs_Uint8Array *b, int64_t off, int64_t flags) {
+    xs_buf_check(b, off, 8);
+    uint64_t u = xs_buf_load(b->data + off, 8, flags & XS_BUF_BE);
+    if (flags & XS_BUF_SIGNED) return xs_big_from_int((int64_t)u);
+    xs_big *r = xs_big_alloc(1);
+    r->d[0] = u;
+    return xs_big_norm(r);
+}
+/* buf.writeUInt16LE(value, offset) & co: the value checked against the n bytes first (Node's checkInt), then the
+   offset; the offset past what was written is the answer */
+XS_NOINLINE int64_t xs_buf_write_int(xs_Uint8Array *b, double v, int64_t off, int64_t n, int64_t flags) {
+    bool sg = flags & XS_BUF_SIGNED;
+    double lo = sg ? -ldexp(1, (int)(8 * n - 1)) : 0, hi = sg ? ldexp(1, (int)(8 * n - 1)) - 1 : ldexp(1, (int)(8 * n)) - 1;
+    if (v > hi || v < lo) {
+        char range[96];
+        if (n > 4 && !sg) snprintf(range, sizeof range, ">= 0 and < 2 ** %d", (int)(8 * n));
+        else if (n > 4) snprintf(range, sizeof range, ">= -(2 ** %d) and < 2 ** %d", (int)(8 * n - 1), (int)(8 * n - 1));
+        else snprintf(range, sizeof range, ">= %.0f and <= %.0f", lo, hi);
+        xs_buf_range_num("value", range, v);
+    }
+    xs_buf_check(b, off, n);
+    int64_t iv = v != v ? 0 : (int64_t)v; /* (NaN writes 0, a fraction is cut, as a typed array stores them) */
+    if (n > 4 && v == v) { /* 5 and 6 bytes, as Node's writeU_Int40/48: the low 32 bits of the value cut, the high ones
+                              Math.floor(value * 2 ** -32) (-0.5 writes 00 00 00 00 ff ff) */
+        uint32_t low = (uint32_t)(int64_t)trunc(v);
+        int64_t high = (int64_t)floor(v * ldexp(1, -32));
+        iv = (int64_t)(((uint64_t)high << 32) | low);
+    }
+    xs_buf_store(b->data + off, n, flags & XS_BUF_BE, (uint64_t)iv);
+    return off + n;
+}
+XS_NOINLINE int64_t xs_buf_write_var(xs_Uint8Array *b, double v, int64_t off, int64_t n, int64_t flags) {
+    xs_buf_check_bytelength(n);
+    return xs_buf_write_int(b, v, off, n, flags);
+}
+XS_NOINLINE int64_t xs_buf_write_f32(xs_Uint8Array *b, double v, int64_t off, int64_t flags) {
+    xs_buf_check(b, off, 4);
+    float f = (float)v;
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    xs_buf_store(b->data + off, 4, flags & XS_BUF_BE, u);
+    return off + 4;
+}
+XS_NOINLINE int64_t xs_buf_write_f64(xs_Uint8Array *b, double v, int64_t off, int64_t flags) {
+    xs_buf_check(b, off, 8);
+    uint64_t u;
+    memcpy(&u, &v, 8);
+    xs_buf_store(b->data + off, 8, flags & XS_BUF_BE, u);
+    return off + 8;
+}
+XS_NOINLINE int64_t xs_buf_write_big(xs_Uint8Array *b, xs_big *v, int64_t off, int64_t flags) {
+    bool sg = flags & XS_BUF_SIGNED, ok;
+    uint64_t u = 0;
+    if (v->n == 0) ok = true;
+    else if (v->n > 1) ok = false;
+    else if (!sg) { ok = !v->neg; u = v->d[0]; }
+    else if (!v->neg) { ok = v->d[0] <= (uint64_t)INT64_MAX; u = v->d[0]; }
+    else { ok = v->d[0] <= (uint64_t)1 << 63; u = (uint64_t)0 - v->d[0]; }
+    if (!ok) {
+        xs_str *s = xs_big_to_string(v);
+        char r[160];
+        if (v->n > 1 || v->d[0] > ((uint64_t)1 << 32)) xs_buf_sep(r, sizeof r - 1, s->data);
+        else snprintf(r, sizeof r - 1, "%s", s->data);
+        xs_release(s);
+        strcat(r, "n");
+        xs_buf_range_fail("value", sg ? ">= -(2n ** 63n) and < 2n ** 63n" : ">= 0n and < 2n ** 64n", r);
+    }
+    xs_buf_check(b, off, 8);
+    xs_buf_store(b->data + off, 8, flags & XS_BUF_BE, u);
+    return off + 8;
+}
+/* buf.swap16() / swap32() / swap64(): the bytes of each group reversed, in place */
+XS_NOINLINE xs_Uint8Array *xs_buf_swap(xs_Uint8Array *b, int64_t k) {
+    if (b->f_length % k) {
+        snprintf(xs_buf_errbuf, sizeof xs_buf_errbuf, "RangeError [ERR_INVALID_BUFFER_SIZE]: Buffer size must be a multiple of %d-bits", (int)(8 * k));
+        xs_panic(xs_buf_errbuf);
+    }
+    for (int64_t i = 0; i < b->f_length; i += k)
+        for (int64_t a = i, z = i + k - 1; a < z; a++, z--) { uint8_t t = b->data[a]; b->data[a] = b->data[z]; b->data[z] = t; }
+    return xs_retain(b);
+}
+static int64_t xs_buf_cmp(const uint8_t *a, int64_t na, const uint8_t *b, int64_t nb) {
+    int c = memcmp(a, b, (size_t)(na < nb ? na : nb));
+    if (c) return c < 0 ? -1 : 1;
+    return na < nb ? -1 : na > nb ? 1 : 0;
+}
+XS_NOINLINE bool xs_buf_is_buffer(xs_Uint8Array *b) { return xs_is_buffer(b); }
+/* Buffer.compare(a, b) */
+XS_NOINLINE int64_t xs_buf_compare(xs_Uint8Array *a, xs_Uint8Array *b) { return xs_buf_cmp(a->data, a->f_length, b->data, b->f_length); }
+/* buf.compare(target, targetStart, targetEnd, sourceStart, sourceEnd) */
+XS_NOINLINE int64_t xs_buf_compare_range(xs_Uint8Array *s, xs_Uint8Array *t, int64_t ts, int64_t te, int64_t ss, int64_t se) {
+    if (ts == INT64_MIN) ts = 0; else xs_buf_check_offset(ts, "targetStart", 0, XS_BUF_KMAX);
+    if (te == INT64_MIN) te = t->f_length; else xs_buf_check_offset(te, "targetEnd", 0, t->f_length);
+    if (ss == INT64_MIN) ss = 0; else xs_buf_check_offset(ss, "sourceStart", 0, XS_BUF_KMAX);
+    if (se == INT64_MIN) se = s->f_length; else xs_buf_check_offset(se, "sourceEnd", 0, s->f_length);
+    if (ss >= se) return ts >= te ? 0 : -1;
+    if (ts >= te) return 1;
+    return xs_buf_cmp(s->data + ss, se - ss, t->data + ts, te - ts);
+}
+/* buf.copy(target, targetStart, sourceStart, sourceEnd): the bytes copied (memmove: the two may overlap) */
+XS_NOINLINE int64_t xs_buf_copy(xs_Uint8Array *s, xs_Uint8Array *t, int64_t ts, int64_t ss, int64_t se) {
+    if (ts == INT64_MIN) ts = 0;
+    else if (ts < 0) xs_buf_range_num("targetStart", ">= 0", (double)ts);
+    if (ss == INT64_MIN) ss = 0;
+    else if (ss < 0 || ss > s->f_length) {
+        char range[64];
+        snprintf(range, sizeof range, ">= 0 && <= %lld", (long long)s->f_length);
+        xs_buf_range_num("sourceStart", range, (double)ss);
+    }
+    if (se == INT64_MIN) se = s->f_length;
+    else if (se < 0) xs_buf_range_num("sourceEnd", ">= 0", (double)se);
+    if (ts >= t->f_length || ss >= se) return 0;
+    if (se - ss > t->f_length - ts) se = ss + t->f_length - ts;
+    int64_t nb = se - ss;
+    if (nb > s->f_length - ss) nb = s->f_length - ss;
+    if (nb <= 0) return 0;
+    memmove(t->data + ts, s->data + ss, (size_t)nb);
+    return nb;
+}
+/* UTF-16 units of a string (JavaScript's length): code points, two for those past U+FFFF */
+static int64_t xs_buf_utf16_len(xs_str *s) {
+    int64_t n = 0;
+    for (int64_t i = 0; i < s->len; i++) {
+        uint8_t c = (uint8_t)s->data[i];
+        if ((c & 0xC0) != 0x80) n += c >= 0xF0 ? 2 : 1;
+    }
+    return n;
+}
+/* the bytes of a string in an encoding (malloc'ed; *n gets their count), as Buffer.from(s, encoding) */
+static uint8_t *xs_buf_encode(xs_str *s, int k, int64_t *n) {
+    uint8_t *o;
+    if (k == XS_ENC_UTF8) {
+        o = malloc((size_t)s->len + 1);
+        memcpy(o, s->data, (size_t)s->len);
+        *n = s->len;
+        return o;
+    }
+    if (k == XS_ENC_BASE64 || k == XS_ENC_BASE64URL) {
+        o = malloc((size_t)(s->len / 4 * 3 + 4));
+        *n = xs_b64_dec_(s->data, s->len, o, false);
+        return o;
+    }
+    if (k == XS_ENC_HEX) { /* pairs up to the first that is not hex (an odd last digit dropped), as Node does */
+        const int16_t *pt = xs_hex_pair_tab();
+        o = malloc((size_t)(s->len / 2 + 1));
+        int64_t i = 0;
+        for (; i < s->len / 2; i++) {
+            uint16_t key;
+            memcpy(&key, s->data + 2 * i, 2);
+            int v = pt[key];
+            if (v < 0) break;
+            o[i] = (uint8_t)v;
+        }
+        *n = i;
+        return o;
+    }
+    /* latin1 / ascii: the low byte of each UTF-16 unit; ucs2: each unit, little-endian; xisto:raw: each code point's
+       low byte (a string that holds bytes) */
+    bool u2 = k == XS_ENC_UCS2;
+    o = malloc((size_t)(xs_buf_utf16_len(s) * (u2 ? 2 : 1) + 1));
+    int64_t m = 0;
+    for (int64_t i = 0; i < s->len;) {
+        size_t l;
+        uint32_t c = xs_utf8_cp((const unsigned char *)s->data + i, (size_t)(s->len - i), &l);
+        i += (int64_t)l;
+        uint32_t u[2] = {c, 0};
+        int nu = 1;
+        if (c > 0xFFFF && k != XS_ENC_RAW) { u[0] = 0xD800 + ((c - 0x10000) >> 10); u[1] = 0xDC00 + ((c - 0x10000) & 0x3FF); nu = 2; }
+        for (int j = 0; j < nu; j++) {
+            o[m++] = (uint8_t)u[j];
+            if (u2) o[m++] = (uint8_t)(u[j] >> 8);
+        }
+    }
+    *n = m;
+    return o;
+}
+/* UTF-16LE bytes to a string (an odd last byte dropped; a lone surrogate becomes U+FFFD) */
+static xs_str *xs_buf_ucs2_decode(const uint8_t *p, int64_t n) {
+    xs_sb sb = {0};
+    char t[4];
+    for (int64_t i = 0; i + 1 < n; i += 2) {
+        uint32_t c = (uint32_t)p[i] | (uint32_t)p[i + 1] << 8;
+        if (c >= 0xD800 && c <= 0xDBFF && i + 3 < n) {
+            uint32_t d = (uint32_t)p[i + 2] | (uint32_t)p[i + 3] << 8;
+            if (d >= 0xDC00 && d <= 0xDFFF) { c = 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00); i += 2; }
+        }
+        if (c >= 0xD800 && c <= 0xDFFF) c = 0xFFFD;
+        xs_sb_put(&sb, t, (size_t)xs_u8_put(t, c));
+    }
+    xs_str *r = xs_str_new(sb.data ? sb.data : "", sb.len);
+    free(sb.data);
+    return r;
+}
+XS_NOINLINE void xs_buf_invalid_value_str(xs_str *v) {
+    snprintf(xs_buf_errbuf, sizeof xs_buf_errbuf, "TypeError [ERR_INVALID_ARG_VALUE]: The argument 'value' is invalid. Received '%.128s'", v->data);
+    xs_panic(xs_buf_errbuf);
+}
+/* the range of fill as Node's validates it; false when there is nothing to fill */
+XS_NOINLINE bool xs_buf_fill_range(xs_Uint8Array *b, int64_t *start, int64_t *end) {
+    if (*start == INT64_MIN) { *start = 0; *end = b->f_length; return *end > 0; }
+    xs_buf_check_offset(*start, "offset", 0, XS_BUF_KMAX);
+    if (*end == INT64_MIN) *end = b->f_length;
+    else xs_buf_check_offset(*end, "end", 0, b->f_length);
+    return *start < *end;
+}
+static void xs_buf_fill_pattern(xs_Uint8Array *b, const uint8_t *p, int64_t n, int64_t s, int64_t e) {
+    if (n == 1) { memset(b->data + s, p[0], (size_t)(e - s)); return; }
+    for (int64_t i = s; i < e; i += n) memcpy(b->data + i, p, (size_t)(e - i < n ? e - i : n));
+}
+/* buf.fill(number, offset, end): the low byte (a fraction cut) */
+XS_NOINLINE xs_Uint8Array *xs_buf_fill_num(xs_Uint8Array *b, double v, int64_t start, int64_t end) {
+    if (xs_buf_fill_range(b, &start, &end)) {
+        int64_t iv = isfinite(v) ? (int64_t)fmod(trunc(v), 256) : 0;
+        memset(b->data + start, (int)(uint8_t)iv, (size_t)(end - start));
+    }
+    return xs_retain(b);
+}
+/* buf.fill(string, offset, end, encoding): the string's bytes repeated (an empty string fills zeros) */
+XS_NOINLINE xs_Uint8Array *xs_buf_fill_str(xs_Uint8Array *b, xs_str *v, int64_t start, int64_t end, xs_str *enc) {
+    int k = xs_buf_enc(enc);
+    if (!xs_buf_fill_range(b, &start, &end)) return xs_retain(b);
+    if (v->len == 0) { memset(b->data + start, 0, (size_t)(end - start)); return xs_retain(b); }
+    int64_t n;
+    uint8_t *p = xs_buf_encode(v, k, &n);
+    if (n == 0) { free(p); xs_buf_invalid_value_str(v); }
+    xs_buf_fill_pattern(b, p, n, start, end);
+    free(p);
+    return xs_retain(b);
+}
+/* buf.fill(bytes, offset, end) */
+XS_NOINLINE xs_Uint8Array *xs_buf_fill_bytes(xs_Uint8Array *b, xs_Uint8Array *v, int64_t start, int64_t end) {
+    if (!xs_buf_fill_range(b, &start, &end)) return xs_retain(b);
+    if (v->f_length == 0) xs_panic("TypeError [ERR_INVALID_ARG_VALUE]: The argument 'value' is invalid. Received <Buffer >");
+    uint8_t *p = malloc((size_t)v->f_length); /* (v may be a view on b) */
+    memcpy(p, v->data, (size_t)v->f_length);
+    xs_buf_fill_pattern(b, p, v->f_length, start, end);
+    free(p);
+    return xs_retain(b);
+}
+XS_NOINLINE void xs_buf_check_size(int64_t n) { xs_buf_check_offset(n, "size", 0, XS_BUF_KMAX); }
+/* Buffer.alloc(size, string, encoding) / Buffer.alloc(size, bytes) */
+XS_NOINLINE xs_Uint8Array *xs_buf_alloc_str(int64_t n, xs_str *v, xs_str *enc) {
+    xs_buf_check_size(n);
+    xs_Uint8Array *b = xs_u8_raw(n, true, true);
+    if (n == 0) return b;
+    xs_Uint8Array *r = xs_buf_fill_str(b, v, INT64_MIN, INT64_MIN, enc);
+    xs_release(b);
+    return r;
+}
+XS_NOINLINE xs_Uint8Array *xs_buf_alloc_bytes(int64_t n, xs_Uint8Array *v) {
+    xs_buf_check_size(n);
+    xs_Uint8Array *b = xs_u8_raw(n, true, true);
+    if (n == 0) return b;
+    xs_Uint8Array *r = xs_buf_fill_bytes(b, v, INT64_MIN, INT64_MIN);
+    xs_release(b);
+    return r;
+}
+/* buf.write(string, offset, length, encoding): the bytes written; UTF-8 and UTF-16 write whole characters only */
+XS_NOINLINE int64_t xs_buf_write_str(xs_Uint8Array *b, xs_str *s, int64_t off, int64_t len, xs_str *enc) {
+    int k = xs_buf_enc(enc);
+    if (off == INT64_MIN) off = 0;
+    else xs_buf_check_offset(off, "offset", 0, b->f_length);
+    int64_t room = b->f_length - off;
+    if (len == INT64_MIN) len = room;
+    else {
+        xs_buf_check_offset(len, "length", 0, b->f_length);
+        if (len > room) len = room;
+    }
+    if (k == XS_ENC_UTF8) {
+        int64_t n = s->len <= len ? s->len : len;
+        if (n < s->len) while (n > 0 && ((uint8_t)s->data[n] & 0xC0) == 0x80) n--; /* (back to a character's start) */
+        memcpy(b->data + off, s->data, (size_t)n);
+        return n;
+    }
+    int64_t n;
+    uint8_t *p = xs_buf_encode(s, k, &n);
+    if (n > len) n = k == XS_ENC_UCS2 ? len & ~(int64_t)1 : len;
+    memcpy(b->data + off, p, (size_t)n);
+    free(p);
+    return n;
+}
+/* Node's IndexOfOffset: where a search starts, or -1 when none is needed */
+static int64_t xs_buf_search_from(int64_t len, int64_t off, int64_t nlen, bool fwd) {
+    if (off < 0) {
+        if (off + len >= 0) return len + off;
+        return fwd || nlen == 0 ? 0 : -1;
+    }
+    if (off + nlen <= len) return off;
+    if (nlen == 0) return len;
+    return fwd ? -1 : len - 1;
+}
+/* indexOf / lastIndexOf of a byte sequence from off (INT64_MIN: not given); step 2 for UTF-16 (whole units) */
+static int64_t xs_buf_search(xs_Uint8Array *b, const uint8_t *p, int64_t n, int64_t off, bool fwd, int64_t step) {
+    int64_t len = b->f_length;
+    if (off == INT64_MIN) off = fwd ? 0 : len;
+    int64_t at = xs_buf_search_from(len, off, n, fwd);
+    if (n == 0) return at;
+    if (len == 0 || at < 0 || n > len || (fwd && at + n > len)) return -1;
+    if (step == 2) at &= ~(int64_t)1;
+    if (fwd) {
+        for (int64_t i = at; i + n <= len; i += step)
+            if (b->data[i] == p[0] && memcmp(b->data + i, p, (size_t)n) == 0) return i;
+    } else {
+        int64_t i = at < len - n ? at : len - n;
+        if (step == 2) i &= ~(int64_t)1;
+        for (; i >= 0; i -= step)
+            if (b->data[i] == p[0] && memcmp(b->data + i, p, (size_t)n) == 0) return i;
+    }
+    return -1;
+}
+/* buf.indexOf(byte, offset) / lastIndexOf: the number's low byte, as Node takes it */
+XS_NOINLINE int64_t xs_buf_index_num(xs_Uint8Array *b, int64_t v, int64_t off, bool fwd) {
+    uint8_t c = (uint8_t)v;
+    return xs_buf_search(b, &c, 1, off, fwd, 1);
+}
+XS_NOINLINE int64_t xs_buf_index_bytes(xs_Uint8Array *b, xs_Uint8Array *v, int64_t off, xs_str *enc, bool fwd) {
+    int k = xs_buf_enc(enc);
+    uint8_t *p = malloc((size_t)v->f_length + 1);
+    memcpy(p, v->data, (size_t)v->f_length);
+    /* (ucs2: a needle or a buffer under 2 bytes is never found, as Node's IndexOfBuffer; the empty needle is) */
+    int64_t r = k == XS_ENC_UCS2 && v->f_length > 0 && (v->f_length < 2 || b->f_length < 2) ? -1
+                                                                                         : xs_buf_search(b, p, v->f_length, off, fwd, k == XS_ENC_UCS2 ? 2 : 1);
+    free(p);
+    return r;
+}
+XS_NOINLINE int64_t xs_buf_index_str(xs_Uint8Array *b, xs_str *v, int64_t off, xs_str *enc, bool fwd) {
+    int k = xs_buf_enc(enc);
+    int64_t n;
+    uint8_t *p = xs_buf_encode(v, k, &n);
+    int64_t r = k == XS_ENC_UCS2 && n > 0 && b->f_length < 2 ? -1 : xs_buf_search(b, p, n, off, fwd, k == XS_ENC_UCS2 ? 2 : 1);
+    free(p);
+    return r;
+}
+XS_NOINLINE bool xs_buf_has_num(xs_Uint8Array *b, int64_t v, int64_t off, bool fwd) { return xs_buf_index_num(b, v, off, fwd) >= 0; }
+XS_NOINLINE bool xs_buf_has_bytes(xs_Uint8Array *b, xs_Uint8Array *v, int64_t off, xs_str *enc, bool fwd) { return xs_buf_index_bytes(b, v, off, enc, fwd) >= 0; }
+XS_NOINLINE bool xs_buf_has_str(xs_Uint8Array *b, xs_str *v, int64_t off, xs_str *enc, bool fwd) { return xs_buf_index_str(b, v, off, enc, fwd) >= 0; }
+/* Buffer.byteLength(string, encoding), as Node counts it (UTF-16 units for latin1 and ucs2) */
+XS_NOINLINE int64_t xs_buf_byte_length_enc(xs_str *s, xs_str *enc) {
+    int k = XS_ENC_UTF8;
+    if (enc) {
+        char t[16];
+        size_t n = (size_t)enc->len < sizeof t - 1 ? (size_t)enc->len : sizeof t - 1;
+        for (size_t i = 0; i < n; i++) t[i] = (char)tolower((unsigned char)enc->data[i]);
+        t[n] = 0;
+        k = !strcmp(t, "ucs2") || !strcmp(t, "ucs-2") || !strcmp(t, "utf16le") || !strcmp(t, "utf-16le") ? XS_ENC_UCS2
+          : !strcmp(t, "latin1") || !strcmp(t, "binary") || !strcmp(t, "ascii") ? XS_ENC_LATIN1
+          : !strcmp(t, "hex") ? XS_ENC_HEX
+          : !strcmp(t, "base64") || !strcmp(t, "base64url") ? XS_ENC_BASE64 : XS_ENC_UTF8; /* (an unknown encoding: UTF-8, as Node) */
+    }
+    if (k == XS_ENC_UTF8) return s->len;
+    int64_t u = xs_buf_utf16_len(s);
+    if (k == XS_ENC_UCS2) return u * 2;
+    if (k == XS_ENC_LATIN1) return u;
+    if (k == XS_ENC_HEX) return u >> 1;
+    int64_t m = s->len; /* base64: 3 bytes per 4 characters, padding not counted */
+    if (m > 0 && s->data[m - 1] == '=') { m--; u--; }
+    if (m > 1 && s->data[m - 1] == '=') u--;
+    return (u * 3) >> 2;
+}
+/* Buffer.isEncoding(name) */
+XS_NOINLINE bool xs_buf_is_encoding(xs_str *e) {
+    static const char *const names[] = {"utf8", "utf-8", "ucs2", "ucs-2", "utf16le", "utf-16le", "latin1", "binary", "base64", "base64url", "hex", "ascii"};
+    if (e->len == 0 || e->len > 15) return false;
+    char t[16];
+    for (int64_t i = 0; i < e->len; i++) t[i] = (char)tolower((unsigned char)e->data[i]);
+    t[e->len] = 0;
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) if (!strcmp(t, names[i])) return true;
+    return false;
+}
+/* Buffer.concat(list, totalLength): cut to the length, or zeros after the bytes */
+XS_NOINLINE xs_Uint8Array *xs_buf_concat_n(xs_arr_ref *list, int64_t total) {
+    if (list->len == 0) return xs_u8_raw(0, true, false);
+    xs_buf_check_offset(total, "length", 0, XS_BUF_KMAX);
+    xs_Uint8Array *b = xs_u8_raw(total, true, true);
+    int64_t o = 0;
+    for (size_t i = 0; i < list->len && o < total; i++) {
+        xs_Uint8Array *p = list->data[i];
+        int64_t n = p->f_length < total - o ? p->f_length : total - o;
+        memcpy(b->data + o, p->data, (size_t)n);
+        o += n;
+    }
+    return b;
+}
+XS_NOINLINE xs_arr_int *xs_buf_keys(xs_Uint8Array *b) { /* buf.keys(): the indexes (an array) */
+    xs_arr_int *a = xs_arr_int_new(b->f_length, 0);
+    for (int64_t i = 0; i < b->f_length; i++) a->data[i] = i;
+    return a;
+}
+XS_NOINLINE xs_Uint8Array *xs_buf_from_nums(xs_arr_num *a) { /* Buffer.from([1.5, 2]): each cut to a byte */
+    xs_Uint8Array *b = xs_u8_raw((int64_t)a->len, true, false);
+    for (size_t i = 0; i < a->len; i++) { double v = a->data[i]; b->data[i] = isfinite(v) ? (uint8_t)(int64_t)fmod(trunc(v), 256) : 0; }
+    return b;
+}
 /* ---- program start / end ---- */
 
 static uint64_t xs_started;
@@ -9216,10 +10099,25 @@ static void xs_map_visit(void *p, xs_visit_cb cb, void *arg) {
     for (size_t i = 0; i < m->cap; i++) if (XS_MAP_FULL(m, i)) cb(&m->slots[i].val.p, arg);
 }
 static void (*xs_exit_hook)(void); /* background work to finish first (Promise.race losers) */
-static void xs_before_exit(void) {
+XS_NOINLINE void xs_before_exit(void) {
     void (*h)(void) = xs_exit_hook;
     xs_exit_hook = NULL;
     if (h) h();
+    if (xs_pexit_cb) {
+        /* 'beforeExit' each time the work runs out (its listeners may start more), then 'exit' */
+        for (;;) {
+            xs_pexit_call(xs_pexit_cb, xs_exit_code_, true);
+            void (*more)(void) = xs_exit_hook;
+            xs_exit_hook = NULL;
+            if (!more) break;
+            more();
+        }
+        xs_closure *cb = xs_pexit_cb;
+        xs_pexit_cb = NULL;
+        xs_pexit_call(cb, xs_exit_code_, false);
+        xs_release(cb);
+    }
+    if (xs_rt_cleanup) { void (*c)(void) = xs_rt_cleanup; xs_rt_cleanup = NULL; c(); }
 }
 /* ---- regions (the compiler's region.c) ----
    The objects of a region class are made in one loop and cannot outlive an iteration of it: they come from an
@@ -9527,7 +10425,7 @@ static xs_arr_ref *xs_arr_ref_rlit(xs_region *r, void (*print_elem)(void *), int
     return a;
 }
 
-static void xs_exit(void) {
+XS_NOINLINE void xs_exit(void) {
     xs_out_drain(); /* (a lent part is released before the count below) */
     xs_before_exit();
     if (xs_rc_counting()) { xs_ar_drain(0); for (xs_region *r = xs_regions; r; r = r->next) xs_region_reset(r); xs_gc_collect(); }

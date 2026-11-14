@@ -68,6 +68,7 @@ extern const unsigned char xs_runtime_sqlite_h[];
 extern const unsigned char xs_runtime_tls_h[];
 extern const unsigned char xs_runtime_tls_awslc_h[];
 extern const unsigned char xs_runtime_crypto_h[];
+extern const unsigned char xs_runtime_zlib_h[];
 extern const unsigned char xs_runtime_regex_h[];
 extern const unsigned char xs_runtime_regex_bt_h[];
 static void regex_with_bt(Buf *b);
@@ -75,7 +76,7 @@ extern const unsigned char xs_runtime_dbg_json_h[];
 extern const unsigned char xs_runtime_dbg_h[];
 /* the runtime split in two (tools/rtsplit.py): what a program includes, and the library compiled once */
 #define XS_RT_PAIR(n) extern const unsigned char xs_runtime_##n##_h_decl[], xs_runtime_##n##_h_impl[];
-XS_RT_PAIR(rt) XS_RT_PAIR(net) XS_RT_PAIR(sqlite) XS_RT_PAIR(tls) XS_RT_PAIR(tls_awslc) XS_RT_PAIR(crypto) XS_RT_PAIR(regex)
+XS_RT_PAIR(rt) XS_RT_PAIR(net) XS_RT_PAIR(sqlite) XS_RT_PAIR(tls) XS_RT_PAIR(tls_awslc) XS_RT_PAIR(crypto) XS_RT_PAIR(zlib) XS_RT_PAIR(regex)
 static bool split_rt;     /* the runtime is a cached object, the program only includes its declarations */
 static Buf rt_src;        /* the runtime's translation unit for this program's configuration */
 int cmd_debug(int argc, char **argv); /* src/debug.c */
@@ -118,6 +119,11 @@ static bool tls_awslc(void) {
 
 static bool link_tls;
 static bool link_sqlite;
+static bool link_zlib; /* node:zlib: build/libxszlib.a (zlib from third_party/zlib) */
+static bool link_crypto; /* node:crypto: its ciphers, signatures and keys are BearSSL's (build/libbearssl.a) */
+/* BearSSL is linked for TLS when AWS-LC is not the backend, and for node:crypto either way (static library: only
+   what the program calls; AWS-LC's symbols are not br_*, so both can be in one program) */
+static bool need_bearssl(void) { return (link_tls && !tls_awslc()) || link_crypto; }
 
 #ifndef XISTO_VERSION
 #define XISTO_VERSION "dev"
@@ -477,7 +483,8 @@ static Buf compile_to_c(const char *path) {
             if (p->uses_net || p->uses_gen) XS_RT_ADD(net);
             if (p->uses_tls) { if (tls_awslc()) XS_RT_ADD(tls_awslc); else XS_RT_ADD(tls); }
             if (p->uses_sqlite) { XS_RT_ADD(sqlite); link_sqlite = true; }
-            if (p->uses_crypto) XS_RT_ADD(crypto);
+            if (p->uses_crypto) { XS_RT_ADD(crypto); link_crypto = true; }
+            if (p->uses_zlib) { XS_RT_ADD(zlib); link_zlib = true; }
             if (p->uses_regex) XS_RT_ADD(regex);
 #undef XS_RT_ADD
         } else {
@@ -486,7 +493,8 @@ static Buf compile_to_c(const char *path) {
             if (p->uses_net || p->uses_gen) buf_puts(&b, (const char *)xs_runtime_net_h);
             if (p->uses_tls) buf_puts(&b, (const char *)(tls_awslc() ? xs_runtime_tls_awslc_h : xs_runtime_tls_h));
             if (p->uses_sqlite) { buf_puts(&b, (const char *)xs_runtime_sqlite_h); link_sqlite = true; }
-            if (p->uses_crypto) buf_puts(&b, (const char *)xs_runtime_crypto_h);
+            if (p->uses_crypto) { buf_puts(&b, (const char *)xs_runtime_crypto_h); link_crypto = true; }
+            if (p->uses_zlib) { buf_puts(&b, (const char *)xs_runtime_zlib_h); link_zlib = true; }
             if (p->uses_regex && p->uses_rebt) regex_with_bt(&b);
             else if (p->uses_regex) buf_puts(&b, (const char *)xs_runtime_regex_h);
         }
@@ -611,7 +619,7 @@ static void run_cc(const char *cfile, const char *outfile, bool dev) {
     char *cache = xs_sprintf("%s/.xisto/cache/c", dir);
     const char *cc = host_cc();
     uint64_t h = fnv(cc_text, cc_len) ^ (fnv(cc, strlen(cc)) * 31) ^ (dev ? 0x9e3779b97f4a7c15ull : 0) ^ (fnv(XS_HOST, strlen(XS_HOST)) * 3) ^
-                 (xs_debug ? 0x51afd7ed558ccdull : 0) ^ (link_tls ? 0x2545f4914f6cdd1dull : 0) ^ (link_sqlite ? 0x27d4eb2f165667c5ull : 0) ^
+                 (xs_debug ? 0x51afd7ed558ccdull : 0) ^ (link_tls ? 0x2545f4914f6cdd1dull : 0) ^ (link_sqlite ? 0x27d4eb2f165667c5ull : 0) ^ (link_zlib ? 0x85ebca77c2b2ae63ull : 0) ^ (link_crypto ? 0xc2b2ae3d27d4eb4full : 0) ^
                  (xs_target ? fnv(xs_target, strlen(xs_target)) * 7 : 0) ^ (build_dylib ? 0x165667b19e3779f9ull : 0) ^
                  fnv(XS_CC_KEY, strlen(XS_CC_KEY)) * 11 ^ /* the compiler flags this xisto passes: a new set rebuilds */
                  (xs_cpu ? fnv(xs_cpu, strlen(xs_cpu)) * 13 : 0);
@@ -647,7 +655,7 @@ static char *runtime_object(const char *cc) {
     if (!cc_is_clang(cc)) extra = "-w";
     char *inc = xs_sprintf("-I'%s'", xisto_dir);
     if (link_tls && tls_awslc()) inc = xs_sprintf("%s -I'%s/include'", inc, awslc_dir());
-    else if (link_tls) inc = xs_sprintf("%s -I'%s/bearssl-inc'", inc, xisto_dir);
+    if (need_bearssl()) inc = xs_sprintf("%s -I'%s/bearssl-inc'", inc, xisto_dir);
     char *tmp = xs_sprintf("%s.%d.tmp", obj, (int)getpid());
     char *cmd = xs_sprintf("%s -std=c11 -O2 %s -ffp-contract=off -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
                            "-Wno-ignored-qualifiers -Wno-return-type -Wno-unused-command-line-argument %s %s -c -o '%s' '%s'",
@@ -731,7 +739,7 @@ static char *compile_units(const char *cc, const char *flags, const char *cfile)
                 if (access(hdr, R_OK) != 0) rename(htmp, hdr); else unlink(htmp);
                 char *cmd = xs_sprintf("%s -std=c11 %s -ffp-contract=off -w -I'%s' -x c-header -o '%s' '%s' 2>/dev/null", cc, flags, xisto_dir, tmp, hdr); /* no link flags: they make clang expect several outputs */
                 if (link_tls && tls_awslc()) cmd = xs_sprintf("%s -I'%s/include'", cmd, awslc_dir());
-                else if (link_tls) cmd = xs_sprintf("%s -I'%s/bearssl-inc'", cmd, xisto_dir);
+                if (need_bearssl()) cmd = xs_sprintf("%s -I'%s/bearssl-inc'", cmd, xisto_dir);
                 if (system(cmd) != 0 || rename(tmp, pch) != 0) pch = NULL;
             } else pch = NULL;
         }
@@ -761,7 +769,7 @@ static char *compile_units(const char *cc, const char *flags, const char *cfile)
                                "-Wno-ignored-qualifiers -Wno-return-type -Wno-unused-command-line-argument %s -I'%s'%s -c -o '%s' '%s'",
                                cc, flags, XS_LINK_FLAGS, xisto_dir, pch ? xs_sprintf(" -include-pch '%s'", pch) : "", tmps[u], ufile);
         if (link_tls && tls_awslc()) cmd = xs_sprintf("%s -I'%s/include'", cmd, awslc_dir());
-        else if (link_tls) cmd = xs_sprintf("%s -I'%s/bearssl-inc'", cmd, xisto_dir);
+        if (need_bearssl()) cmd = xs_sprintf("%s -I'%s/bearssl-inc'", cmd, xisto_dir);
         cmds[fresh] = cmd;
         which[fresh++] = u;
     }
@@ -780,6 +788,41 @@ static char *compile_units(const char *cc, const char *flags, const char *cfile)
     return objs;
 }
 #endif
+/* --target: a static library of third_party/<name>'s files (paths relative to it), compiled once per target into
+   tdir/<lib> */
+static char *target_archive(const char *cc, const char *zig, const char *tdir, const char *lib, const char *name, const char *flags, char **files, int n) {
+    char *out = xs_sprintf("%s/%s", tdir, lib);
+    if (access(out, R_OK) == 0) return out;
+    char *src = xs_sprintf("%s/../third_party/%s", xisto_dir, name);
+    if (n == 0 || access(src, R_OK) != 0) { fprintf(stderr, "xisto: --target with node:zlib needs %s's source at %s\n", name, src); exit(1); }
+    double t0 = now_ms();
+    char *dir = xs_sprintf("%s/%s.%d", tdir, name, xs_pid());
+    if (!xs_mkdirs(dir)) { fprintf(stderr, "xisto: cannot create %s\n", dir); exit(1); }
+    Buf objs = {0};
+    for (int k = 0; k < n; k++) {
+        char *o = xs_sprintf("%s/%d.o", dir, k);
+        if (xs_sh(xs_sprintf("%s -O2 -w %s -c -o %s %s", cc, flags, xs_q(o), xs_q(xs_sprintf("%s/%s", src, files[k])))) != 0) {
+            fprintf(stderr, "xisto: %s did not compile for %s (%s)\n", name, xs_target, files[k]);
+            exit(1);
+        }
+        buf_printf(&objs, " %s", xs_q(o));
+    }
+    /* (through a response file: Brotli has ~40 objects, and command lines have a limit) */
+    char *rsp = xs_sprintf("%s/objs.rsp", dir), *tmp = xs_sprintf("%s.%d.tmp", out, xs_pid());
+    FILE *rf = fopen(rsp, "wb");
+    if (!rf) exit(1);
+    fputs(objs.data ? objs.data : "", rf);
+    fclose(rf);
+    if (xs_sh(xs_sprintf("%s ar rcs %s @%s", xs_q(zig), xs_q(tmp), xs_q(rsp))) != 0 || !xs_rename(tmp, out)) {
+        fprintf(stderr, "xisto: %s did not compile for %s\n", name, xs_target);
+        exit(1);
+    }
+    for (int k = 0; k < n; k++) unlink(xs_sprintf("%s/%d.o", dir, k));
+    unlink(rsp);
+    rmdir(dir);
+    if (show_time) fprintf(stderr, "xisto: %s compiled once for %s: %.0f ms\n", name, xs_target, now_ms() - t0);
+    return out;
+}
 /* --target: the whole program in one unit, compiled and linked by zig's clang against musl, statically.
    SQLite and BearSSL (TLS) are compiled once per target from their source (~/.cache/xisto/target/<triple>/). */
 static void run_cc_target(const char *cfile, const char *outfile, bool dev) {
@@ -797,7 +840,7 @@ static void run_cc_target(const char *cfile, const char *outfile, bool dev) {
     char *cc = xs_sprintf("%s cc -target %s", xs_q(zig), xs_target);
     char *tdir = xs_sprintf("%s/.cache/xisto/target/%s", xs_home(), xs_target);
     char *tls_extra = "";
-    if (link_tls) { /* BearSSL from its source, once per target, its files compiled in parallel */
+    if (link_tls || link_crypto) { /* BearSSL from its source, once per target, its files compiled in parallel */
         char *lib = xs_sprintf("%s/libbearssl.a", tdir);
         char *src = xs_sprintf("%s/../third_party/bearssl", xisto_dir);
         if (access(lib, R_OK) != 0) {
@@ -857,6 +900,16 @@ static void run_cc_target(const char *cfile, const char *outfile, bool dev) {
         }
         extra = xs_sprintf("-I%s %s", xs_q(xisto_dir), xs_q(obj));
     }
+    if (link_zlib) { /* zlib and Brotli from their source, once per target */
+        static const char *const zf[] = {"adler32.c", "crc32.c", "deflate.c", "inflate.c", "inffast.c", "inftrees.c", "trees.c", "zutil.c"};
+        char *zl = target_archive(cc, zig, tdir, "libxszlib.a", "zlib", "-DZ_PREFIX", (char **)zf, (int)(sizeof zf / sizeof *zf));
+        char *bsrc = xs_sprintf("%s/../third_party/brotli", xisto_dir);
+        char **bf = NULL;
+        int nb = 0;
+        xs_list_files(bsrc, ".c", NULL, &bf, &nb);
+        char *bl = target_archive(cc, zig, tdir, "libxsbrotli.a", "brotli", xs_sprintf("-I%s", xs_q(xs_sprintf("%s/include", bsrc))), bf, nb);
+        extra = xs_sprintf("%s -I%s %s %s", extra, xs_q(xisto_dir), xs_q(zl), xs_q(bl));
+    }
     bool win = strstr(xs_target, "windows") != NULL;
     char *cmd = xs_sprintf("%s -std=c11 %s -mllvm -hot-cold-split=false -ffp-contract=off -fno-omit-frame-pointer -ffunction-sections -fdata-sections "
                            "%s -static -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
@@ -902,10 +955,13 @@ static void run_cc_raw(const char *cfile, const char *outfile, bool dev) {
     if (link_tls && tls_awslc()) { /* AWS-LC: libssl is C++ inside, hence the C++ runtime */
         const char *d = awslc_dir();
         cmd = xs_sprintf("%s -I'%s/include' '%s/lib/libssl.a' '%s/lib/libcrypto.a' %s -lpthread", cmd, d, d, d, XS_CXX_LIB);
-    } else if (link_tls) /* BearSSL, compiled from source into a static library: only the parts the program uses are linked */
+    }
+    if (need_bearssl()) /* BearSSL, compiled from source into a static library: only the parts the program uses are linked */
         cmd = xs_sprintf("%s -I'%s/bearssl-inc' '%s/libbearssl.a'", cmd, xisto_dir, xisto_dir);
     if (link_sqlite) /* SQLite: the header and the object compiled from source live next to the xisto executable */
         cmd = xs_sprintf("%s -I'%s' '%s/sqlite3.o' -lpthread", cmd, xisto_dir, xisto_dir);
+    if (link_zlib) /* zlib and Brotli: build/zlib-inc and the static libraries next to the xisto executable (only what is called is linked) */
+        cmd = xs_sprintf("%s -I'%s' '%s/libxszlib.a' '%s/libxsbrotli.a'", cmd, xisto_dir, xisto_dir, xisto_dir);
     int rc = 0;
     if (!xs_cc_run(&cmd, 1, 1, &rc)) exit(1);
     if (rc != 0) {

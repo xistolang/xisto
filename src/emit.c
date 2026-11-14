@@ -2695,6 +2695,19 @@ static char *from_unknown(Type *t, const char *expr) {
             return xs_sprintf("((%s)%s)", ctype(b), from_unknown(nul ? ty_nullable_of(r) : r, expr));
         }
         if (in_hierarchy(b->cls)) return xs_sprintf("((%s)xs_as_isa((void *)(%s), %s, %d, \"%s\"))", ctype(b), expr, isa_fn(b->cls), nul, what);
+        if (b->cls->builtin && strcmp(b->cls->name, "Error") == 0) { /* an Error, or an object of a class that extends Error (wrapped) */
+            static Program *made_for; /* (once per program: a compiler process can build several, xisto test) */
+            if (made_for != prog) {
+                made_for = prog;
+                buf_puts(&isa_fns, "static bool xs_Error_sub_isa(void *v) { void (*f)(void *) = v ? xs_type_of(v)->free : NULL; return f && (0");
+                for (int i = 0; i < prog->nclasses; i++) {
+                    Class *k = prog->classes[i];
+                    if (k->used && !k->builtin && is_error_class(k)) buf_printf(&isa_fns, " || f == %s_free", k->cname);
+                }
+                buf_puts(&isa_fns, "); }\n");
+            }
+            return xs_sprintf("((xs_Error *)xs_as_error((void *)(%s), xs_Error_sub_isa, %d))", expr, nul);
+        }
         const char *fr = strcmp(b->cls->name, "Error") == 0 ? "xs_Error_free" : xs_sprintf("%s_free", b->cls->cname);
         if (strcmp(b->cls->cname, "xs_Uint8Array") == 0) fr = "xs_u8_free"; /* (Buffer too: the same free, another print) */
         else if (strcmp(b->cls->cname, "xs_Float64Array") == 0) fr = "xs_f64_free";
@@ -3016,6 +3029,19 @@ static void emit_expr_raw(Expr *e) {
                 return;
             }
         }
+        {
+            Type *et = e->elem_type && e->elem_type->kind == TY_NULLABLE ? e->elem_type->elem : e->elem_type;
+            if (et && et->kind == TY_OBJECT && et->cls->builtin && strcmp(et->cls->name, "Error") == 0 && is_fresh(e->lhs)) {
+                /* a fresh value as Error: the wrapper of an object of a class that extends Error takes its place (owned), as
+                   xs_as_record's copy does */
+                static int ner;
+                int id = ner++;
+                buf_printf(out, "({ void *ev%d_ = %s; void *er%d_ = %s; if (er%d_ != ev%d_) { xs_retain_(er%d_); xs_release_(ev%d_); } (xs_Error *)er%d_; })",
+                           id, b.data, id, from_unknown(e->elem_type, xs_sprintf("ev%d_", id)), id, id, id, id, id);
+                free(b.data);
+                return;
+            }
+        }
         fu_dyn = e->lhs->type && ty_is_any(e->lhs->type);
         buf_puts(out, from_unknown(e->elem_type, b.data));
         fu_dyn = false;
@@ -3102,7 +3128,36 @@ static void emit_expr_raw(Expr *e) {
             }
             buf_puts(out, "}\n");
         }
-        buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, xs_print_closure, %s};\n", f->cname, f->cname, env_cyc ? xs_sprintf("%s_visit", f->cname) : "NULL");
+        /* an adapter around a function value (checker: rest_any_adapter): the function it wraps, for === */
+        const char *origin_fn = "NULL";
+        if (f->origin && f->origin->kind == E_CALL && f->origin->lhs) {
+            Expr *o = f->origin->lhs; /* (the call the adapter makes: o is the function value it wraps) */
+            Capture *oc = NULL;
+            for (int i = 0; i < a->ncaptures; i++)
+                if (!a->captures[i].is_this && o->str && strcmp(a->captures[i].name, o->str) == 0) oc = &a->captures[i];
+            if (oc && !oc->boxed) {
+                buf_printf(out, "static void *%s_origin(void *p) { return ((%s_env *)p)->c_%s; }\n", f->cname, f->cname, oc->name);
+                origin_fn = xs_sprintf("%s_origin", f->cname);
+            } else if (!oc && o->kind == E_IDENT && o->cname) { /* a top-level variable */
+                buf_printf(out, "static void *%s_origin(void *p) { (void)p; return (void *)%s; }\n", f->cname, o->cname);
+                origin_fn = xs_sprintf("%s_origin", f->cname);
+            } else if (!oc && (f->origin->func || o->func) && (o->kind == E_FUNC_REF || o->kind == E_IDENT)) {
+                /* a top-level function (or a const arrow compiled as one): its static closure, as the value reads elsewhere */
+                Expr fr = *o;
+                fr.kind = E_FUNC_REF;
+                fr.func = o->func ? o->func : f->origin->func;
+                Buf ob = {0};
+                Buf *keep = out;
+                out = &ob;
+                emit_expr(&fr);
+                out = keep;
+                buf_printf(out, "static void *%s_origin(void *p) { (void)p; return (void *)(%s); }\n", f->cname, ob.data ? ob.data : "NULL");
+                origin_fn = xs_sprintf("%s_origin", f->cname);
+            }
+        }
+        buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, xs_print_closure, %s%s};\n", f->cname, f->cname,
+                   env_cyc ? xs_sprintf("%s_visit", f->cname) : "NULL",
+                   strcmp(origin_fn, "NULL") ? xs_sprintf(", .origin = %s", origin_fn) : ""); /* (no adapter: the C as before) */
         buf_printf(out, "XS_FN %s%s%s(%s_env *env", ctype(f->ret), ctype(f->ret)[strlen(ctype(f->ret)) - 1] == '*' ? "" : " ", f->cname, f->cname);
         for (int i = 0; i < f->nparams; i++) {
             buf_puts(out, ", ");
@@ -3428,6 +3483,16 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, ")");
             return;
         }
+        if ((e->op == TK_EQ || e->op == TK_NEQ) && e->lhs->type->kind != TY_NULL && e->rhs->type->kind != TY_NULL &&
+            ty_strip_null(e->lhs->type)->kind == TY_FUNC && ty_strip_null(e->rhs->type)->kind == TY_FUNC) {
+            /* two function values: the same function, through the adapters the checker made around it (xs_fn_origin) */
+            buf_puts(out, "(xs_fn_origin((void *)(");
+            emit_borrowed(e->lhs);
+            buf_printf(out, ")) %s xs_fn_origin((void *)(", e->op == TK_EQ ? "==" : "!=");
+            emit_borrowed(e->rhs);
+            buf_puts(out, ")))");
+            return;
+        }
         if ((e->op == TK_EQ || e->op == TK_NEQ) && e->builtin.cfn && strcmp(e->builtin.cfn, "ref_eq") == 0) { /* the same object */
             buf_puts(out, "((void *)(");
             emit_borrowed(e->lhs);
@@ -3483,9 +3548,24 @@ static void emit_expr_raw(Expr *e) {
                 buf_puts(out, "))");
                 return;
             }
+            if (c->builtin && strcmp(c->name, "Error") == 0 && !(lt->kind == TY_OBJECT && lt->cls->builtin)) {
+                /* x instanceof Error with x an any or a union: the built-in Error or any used class that extends it */
+                static int nei;
+                int id = nei++;
+                buf_printf(out, "({ void *ei%d_ = (void *)(", id);
+                emit_expr(e->lhs);
+                buf_printf(out, "); void (*ef%d_)(void *) = ei%d_ ? xs_type_of(ei%d_)->free : NULL; (ef%d_ && (ef%d_ == xs_Error_free", id, id, id, id, id);
+                for (int i = 0; i < prog->nclasses; i++) {
+                    Class *k = prog->classes[i];
+                    if (k->used && k->cname && !k->builtin && !k->is_interface && !k->ntparams && is_error_class(k)) buf_printf(out, " || ef%d_ == %s_free", id, k->cname);
+                }
+                buf_puts(out, ")); })");
+                return;
+            }
             buf_puts(out, "xs_is_a(");
             emit_expr(e->lhs);
             buf_printf(out, ", %s)", strcmp(c->name, "Error") == 0 ? "xs_Error_free" : c->builtin && strcmp(c->name, "Date") == 0 ? "xs_Date_free" :
+                       c->builtin && strcmp(c->name, "RegExp") == 0 ? "xs_RegExp_free" :
                        c->builtin && (strcmp(c->name, "Uint8Array") == 0 || strcmp(c->name, "Buffer") == 0) ? "xs_u8_free" :
                        c->builtin && strcmp(c->name, "Float64Array") == 0 ? "xs_f64_free" :
                        c->builtin && strcmp(c->name, "Float32Array") == 0 ? "xs_f32_free" :
@@ -3839,6 +3919,20 @@ static void emit_expr_raw(Expr *e) {
             buf_printf(out, "%s(", asif_fn(t->cls, e->type->kind == TY_NULLABLE));
             emit_borrowed(e->args.items[0]);
             buf_puts(out, ")");
+            return;
+        }
+        if (e->builtin.cfn && strcmp(e->builtin.cfn, "__xs_overrides") == 0) { /* (checker: __xs_overrides(obj, "m")) */
+            Func *m = emit_find_method(e->cls, e->args.items[1]->str);
+            buf_puts(out, "({ void (*f_)(void *) = xs_type_of(");
+            emit_borrowed(e->args.items[0]);
+            buf_puts(out, ")->free; (false");
+            for (int i = 0; m && i < prog->nclasses; i++) {
+                Class *k = prog->classes[i];
+                if (!k->used || k->builtin || k->is_abstract || !is_sub(k, e->cls)) continue;
+                Func *impl = emit_find_method(k, m->name);
+                if (impl && impl != m && impl->cls != m->cls) buf_printf(out, " || f_ == %s_free", k->cname);
+            }
+            buf_puts(out, "); })");
             return;
         }
         if (e->builtin.cfn && (strcmp(e->builtin.cfn, "__reflect_decoder") == 0 || strcmp(e->builtin.cfn, "__reflect_encoder") == 0)) {
@@ -12724,7 +12818,11 @@ static void emit_class(Class *c) {
             break;
         case TY_MAP: case TY_SET: buf_printf(out, "xs_print_map(self->%s);", fd->cname); break;
         case TY_UNION: buf_printf(out, "xs_print_any_quoted(self->%s);", fd->cname); break;
-        case TY_UNKNOWN: if (ty_is_undef(fd->type)) { buf_puts(out, "fputs(\"undefined\", XS_OUT);"); break; } /* fallthrough */
+        case TY_NULL: buf_puts(out, "fputs(\"null\", XS_OUT);"); break; /* { a: null } */
+        case TY_UNKNOWN:
+            if (ty_is_undef(fd->type)) buf_puts(out, "fputs(\"undefined\", XS_OUT);");
+            else buf_printf(out, "xs_print_any_quoted(self->%s);", fd->cname); /* ({ a: null }: an unknown holding null) */
+            break;
         default: break;
         }
         if (fd->optional) buf_puts(out, " }");

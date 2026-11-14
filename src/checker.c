@@ -562,6 +562,227 @@ static void int_arg(Expr **slot, const char *what) {
     check_expr(*slot, ty_int);
     expect_type(*slot, ty_int, what);
 }
+/* an offset of the Buffer API: an int, or a number that must hold one (Node's "It must be an integer") */
+static void buf_off_arg(Expr **slot, const char *what) {
+    check_expr(*slot, ty_int);
+    if ((*slot)->type->kind == TY_NUMBER) {
+        Expr *a = *slot, *c = xs_alloc(sizeof *c);
+        c->kind = E_CALL; c->pos = a->pos; c->field = -1; c->type = ty_int;
+        c->builtin.cfn = "xs_buf_num_offset";
+        expr_list_push(&c->args, a);
+        *slot = c;
+        return;
+    }
+    expect_type(*slot, ty_int, what);
+}
+static void buf_str_arg(Expr **slot, const char *what) {
+    check_expr(*slot, ty_string);
+    expect_type(*slot, ty_string, what);
+}
+/* readUInt16LE, writeBigInt64BE, readUintLE, writeDoubleLE ...: kind 'i' (1 to 4 bytes), 'v' (byteLength given),
+   'f' (float), 'd' (double), 'b' (bigint); flags XS_BUF_BE, XS_BUF_SIGNED of the runtime */
+static bool buf_rw_name(const char *m, bool *write, char *kind, int *size, int *flags) {
+    const char *r;
+    if (strncmp(m, "read", 4) == 0) { *write = false; r = m + 4; }
+    else if (strncmp(m, "write", 5) == 0) { *write = true; r = m + 5; }
+    else return false;
+    bool big = strncmp(r, "Big", 3) == 0;
+    if (big) r += 3;
+    *flags = 0;
+    if (!big && strncmp(r, "Float", 5) == 0) { *kind = 'f'; *size = 4; r += 5; }
+    else if (!big && strncmp(r, "Double", 6) == 0) { *kind = 'd'; *size = 8; r += 6; }
+    else {
+        if (strncmp(r, "UInt", 4) == 0 || strncmp(r, "Uint", 4) == 0) r += 4;
+        else if (strncmp(r, "Int", 3) == 0) { r += 3; *flags |= 2; }
+        else return false;
+        int bits = 0;
+        while (*r >= '0' && *r <= '9') bits = bits * 10 + (*r++ - '0');
+        if (big) { if (bits != 64) return false; *kind = 'b'; *size = 8; }
+        else if (bits == 0) { *kind = 'v'; *size = 0; }
+        else if (bits == 8 || bits == 16 || bits == 32) { *kind = 'i'; *size = bits / 8; }
+        else return false;
+        if (*size == 1) return *r == 0; /* (readUInt8: no byte order) */
+    }
+    if (strcmp(r, "BE") == 0) *flags |= 1;
+    else if (strcmp(r, "LE") != 0) return false;
+    return true;
+}
+/* Node's methods of Buffer that a Uint8Array does not have, or has otherwise (runtime/xisto_rt.h, "Buffer: the rest of
+   Node's API"); false: the method is Uint8Array's (check_bytes_member goes on) */
+static bool check_buf_method(Expr *e, Class *c) {
+    const char *m = e->str;
+    int n = e->args.len;
+    Pos pos = e->pos;
+    #define BARGS(lo, hi) do { if (n < (lo) || n > (hi)) xs_error(XS8039, pos, NULL, "Buffer.%s takes %d to %d argument(s), got %d", m, (lo), (hi), n); } while (0)
+    #define BPAD(k) do { for (int k_ = e->args.len; k_ <= (k); k_++) expr_list_push(&e->args, num_lit(pos, (double)XS_NOT_GIVEN, true)); } while (0)
+    #define TYPE_OF(k) (check_expr(e->args.items[k], NULL), e->args.items[k]->type)
+    bool write;
+    char kind;
+    int size, flags;
+    if (buf_rw_name(m, &write, &kind, &size, &flags)) {
+        Class *big = find_class("bigint");
+        if (!write) {
+            BARGS(kind == 'v' ? 2 : 0, kind == 'v' ? 2 : 1);
+            if (n >= 1) buf_off_arg(&e->args.items[0], "the offset"); else expr_list_push(&e->args, num_lit(pos, 0, true));
+            if (kind == 'v') int_arg(&e->args.items[1], "the byteLength");
+            if (kind == 'i') expr_list_push(&e->args, num_lit(pos, size, true));
+            expr_list_push(&e->args, num_lit(pos, flags, true));
+            e->builtin.cfn = kind == 'i' ? "xs_buf_read_int" : kind == 'v' ? "xs_buf_read_var" : kind == 'f' ? "xs_buf_read_f32" : kind == 'd' ? "xs_buf_read_f64" : "xs_buf_read_big";
+            e->type = kind == 'f' || kind == 'd' ? ty_number : kind == 'b' ? ty_object_of(big) : ty_int;
+            return true;
+        }
+        BARGS(kind == 'v' ? 3 : 1, kind == 'v' ? 3 : 2);
+        if (kind == 'b') {
+            check_expr(e->args.items[0], ty_object_of(big));
+            expect_type(e->args.items[0], ty_object_of(big), "the value");
+        } else date_num_arg(&e->args.items[0], "the value");
+        if (n >= 2) buf_off_arg(&e->args.items[1], "the offset"); else expr_list_push(&e->args, num_lit(pos, 0, true));
+        if (kind == 'v') int_arg(&e->args.items[2], "the byteLength");
+        if (kind == 'i') expr_list_push(&e->args, num_lit(pos, size, true));
+        expr_list_push(&e->args, num_lit(pos, flags, true));
+        e->builtin.cfn = kind == 'i' ? "xs_buf_write_int" : kind == 'v' ? "xs_buf_write_var" : kind == 'f' ? "xs_buf_write_f32" : kind == 'd' ? "xs_buf_write_f64" : "xs_buf_write_big";
+        e->type = ty_int;
+        return true;
+    }
+    if (strcmp(m, "compare") == 0) { /* buf.compare(target, targetStart, targetEnd, sourceStart, sourceEnd) */
+        BARGS(1, 5);
+        if (!is_bytes(TYPE_OF(0))) xs_error(XS7052, e->args.items[0]->pos, NULL, "compare compares with a Buffer or Uint8Array");
+        for (int k = 1; k < n; k++) buf_off_arg(&e->args.items[k], "argument of compare");
+        if (n > 1) BPAD(4);
+        e->builtin.cfn = n == 1 ? "xs_buf_compare" : "xs_buf_compare_range";
+        e->type = ty_int;
+        return true;
+    }
+    if (strcmp(m, "copy") == 0) { /* buf.copy(target, targetStart, sourceStart, sourceEnd): the bytes copied */
+        BARGS(1, 4);
+        if (!is_bytes(TYPE_OF(0))) xs_error(XS7052, e->args.items[0]->pos, NULL, "copy copies into a Buffer or Uint8Array");
+        for (int k = 1; k < n; k++) buf_off_arg(&e->args.items[k], "argument of copy");
+        BPAD(3);
+        e->builtin.cfn = "xs_buf_copy";
+        e->type = ty_int;
+        return true;
+    }
+    if (strcmp(m, "swap16") == 0 || strcmp(m, "swap32") == 0 || strcmp(m, "swap64") == 0) {
+        BARGS(0, 0);
+        expr_list_push(&e->args, num_lit(pos, m[4] == '1' ? 2 : m[4] == '3' ? 4 : 8, true));
+        e->builtin.cfn = "xs_buf_swap";
+        e->type = ty_object_of(c);
+        return true;
+    }
+    if (strcmp(m, "toJSON") == 0) { /* { type: "Buffer", data: [...bytes] } */
+        BARGS(0, 0);
+        Expr *data = xs_alloc(sizeof *data);
+        data->kind = E_CALL; data->pos = pos; data->field = -1; data->type = ty_array_of(ty_int); data->prechecked = true;
+        data->builtin.cfn = "xs_u8_to_ints";
+        expr_list_push(&data->args, e->lhs);
+        memset(e, 0, sizeof *e);
+        e->kind = E_OBJLIT; e->pos = pos; e->field = -1;
+        e->keys = xs_alloc(sizeof(char *) * 2);
+        e->keys[0] = "type"; e->keys[1] = "data";
+        expr_list_push(&e->args, str_lit(pos, "Buffer"));
+        expr_list_push(&e->args, data);
+        check_expr(e, NULL);
+        return true;
+    }
+    if (strcmp(m, "values") == 0 || strcmp(m, "keys") == 0 || strcmp(m, "entries") == 0) {
+        /* arrays (Node: iterators), for for..of and spreading: the bytes, the indexes, [index, byte] pairs */
+        BARGS(0, 0);
+        if (m[0] == 'k') { e->builtin.cfn = "xs_buf_keys"; e->type = ty_array_of(ty_int); return true; }
+        e->builtin.cfn = "xs_u8_to_ints";
+        e->type = ty_array_of(ty_int);
+        if (m[0] == 'v') return true;
+        Expr *in = xs_alloc(sizeof *in); /* entries: buf.values().entries() */
+        in->kind = E_CALL; in->pos = pos; in->field = -1; in->type = ty_array_of(ty_int); in->prechecked = true;
+        in->builtin.cfn = "xs_u8_to_ints";
+        expr_list_push(&in->args, e->lhs);
+        memset(e, 0, sizeof *e);
+        e->kind = E_MEMBER; e->pos = pos; e->field = -1; e->lhs = in; e->str = "entries"; e->is_call = true;
+        check_expr(e, NULL);
+        return true;
+    }
+    if (strcmp(m, "write") == 0) { /* buf.write(string, offset?, length?, encoding?): the bytes written */
+        BARGS(1, 4);
+        buf_str_arg(&e->args.items[0], "the string");
+        Expr *s = e->args.items[0], *off = NULL, *len = NULL, *enc = NULL;
+        for (int k = 1; k < n; k++) {
+            Type *t = TYPE_OF(k);
+            if (t->kind == TY_STRING || (t->kind == TY_NULLABLE && t->elem->kind == TY_STRING)) {
+                if (k != n - 1) xs_error(XS8039, e->args.items[k]->pos, "buf.write(string, offset, length, encoding)", "the encoding is the last argument of write");
+                enc = e->args.items[k];
+            } else if (!off) { buf_off_arg(&e->args.items[k], "the offset"); off = e->args.items[k]; }
+            else if (!len) { buf_off_arg(&e->args.items[k], "the length"); len = e->args.items[k]; }
+            else xs_error(XS8039, e->args.items[k]->pos, NULL, "write takes a string, an offset, a length and an encoding");
+        }
+        e->args.len = 0;
+        expr_list_push(&e->args, s);
+        expr_list_push(&e->args, off ? off : num_lit(pos, (double)XS_NOT_GIVEN, true));
+        expr_list_push(&e->args, len ? len : num_lit(pos, (double)XS_NOT_GIVEN, true));
+        expr_list_push(&e->args, enc ? enc : null_str(pos));
+        e->builtin.cfn = "xs_buf_write_str";
+        e->type = ty_int;
+        return true;
+    }
+    if (strcmp(m, "fill") == 0) { /* buf.fill(value, offset?, end?, encoding?) as Node: offsets checked, not relative */
+        BARGS(1, 4);
+        Type *vt = TYPE_OF(0);
+        bool str = vt->kind == TY_STRING, bytes = is_bytes(vt);
+        if (!str && !bytes && n == 1 && (vt->kind == TY_INT || vt->kind == TY_LITINT)) return false; /* (the whole buffer: Uint8Array's fill) */
+        Expr *v = e->args.items[0], *off = NULL, *end = NULL, *enc = NULL;
+        for (int k = 1; k < n; k++) {
+            Type *t = TYPE_OF(k);
+            if (t->kind == TY_STRING || (t->kind == TY_NULLABLE && t->elem->kind == TY_STRING)) {
+                if (k != n - 1) xs_error(XS8039, e->args.items[k]->pos, "buf.fill(value, offset, end, encoding)", "the encoding is the last argument of fill");
+                enc = e->args.items[k];
+            } else if (!off) { buf_off_arg(&e->args.items[k], "the offset"); off = e->args.items[k]; }
+            else if (!end) { buf_off_arg(&e->args.items[k], "the end"); end = e->args.items[k]; }
+            else xs_error(XS8039, e->args.items[k]->pos, NULL, "fill takes a value, an offset, an end and an encoding");
+        }
+        if (!str && !bytes) date_num_arg(&v, "the value of fill");
+        e->args.len = 0;
+        expr_list_push(&e->args, v);
+        expr_list_push(&e->args, off ? off : num_lit(pos, (double)XS_NOT_GIVEN, true));
+        expr_list_push(&e->args, end ? end : num_lit(pos, (double)XS_NOT_GIVEN, true));
+        if (str) expr_list_push(&e->args, enc ? enc : null_str(pos));
+        e->builtin.cfn = str ? "xs_buf_fill_str" : bytes ? "xs_buf_fill_bytes" : "xs_buf_fill_num";
+        e->type = ty_object_of(c);
+        return true;
+    }
+    if (strcmp(m, "indexOf") == 0 || strcmp(m, "lastIndexOf") == 0 || strcmp(m, "includes") == 0) {
+        /* indexOf(value, byteOffset?, encoding?): value a string, bytes or a byte (its low 8 bits, as Node) */
+        BARGS(1, 3);
+        bool fwd = m[0] != 'l', has = strcmp(m, "includes") == 0;
+        Type *vt = TYPE_OF(0);
+        Expr *v = e->args.items[0], *off = NULL, *enc = NULL;
+        for (int k = 1; k < n; k++) {
+            Type *t = TYPE_OF(k);
+            if (t->kind == TY_STRING || (t->kind == TY_NULLABLE && t->elem->kind == TY_STRING)) {
+                if (k != n - 1) xs_error(XS8039, e->args.items[k]->pos, NULL, "the encoding is the last argument of %s", m);
+                enc = e->args.items[k];
+            } else if (!off) { int_arg(&e->args.items[k], xs_sprintf("the byteOffset of %s", m)); off = e->args.items[k]; }
+            else xs_error(XS8039, e->args.items[k]->pos, NULL, "%s takes a value, a byteOffset and an encoding", m);
+        }
+        bool str = vt->kind == TY_STRING, bytes = is_bytes(vt);
+        bool byte_lit = v->kind == E_NUMBER && v->is_int_lit && v->ival >= 0 && v->ival <= 255;
+        /* (Uint8Array's and the earlier Buffer forms stay: indexOf(string | byte, offset), includes(string | byte)) */
+        if (!enc && !bytes && fwd && (str || byte_lit) && (!has || !off)) return false;
+        if (!enc && !bytes && !fwd && byte_lit) return false;
+        if (!str && !bytes) int_arg(&e->args.items[0], xs_sprintf("the value of %s", m));
+        v = e->args.items[0];
+        e->args.len = 0;
+        expr_list_push(&e->args, v);
+        expr_list_push(&e->args, off ? off : num_lit(pos, (double)XS_NOT_GIVEN, true));
+        if (str || bytes) expr_list_push(&e->args, enc ? enc : null_str(pos));
+        expr_list_push(&e->args, num_lit(pos, fwd, true));
+        e->builtin.cfn = str ? (has ? "xs_buf_has_str" : "xs_buf_index_str") : bytes ? (has ? "xs_buf_has_bytes" : "xs_buf_index_bytes")
+                       : has ? "xs_buf_has_num" : "xs_buf_index_num";
+        e->type = has ? ty_boolean : ty_int;
+        return true;
+    }
+    #undef BARGS
+    #undef BPAD
+    #undef TYPE_OF
+    return false;
+}
 /* b.slice(1, -1), b.set(src, 4), buf.toString("base64") ... */
 static void check_bytes_member(Expr *e, Class *c) {
     const char *m = e->str;
@@ -571,6 +792,7 @@ static void check_bytes_member(Expr *e, Class *c) {
     e->field = -1;
     #define ARGS(lo, hi) do { if (n < (lo) || n > (hi)) xs_error(XS8039, e->pos, NULL, "%s.%s takes %d to %d argument(s), got %d", c->name, m, (lo), (hi), n); } while (0)
     #define PAD_INT(k, v) do { for (int k_ = e->args.len; k_ <= (k); k_++) expr_list_push(&e->args, num_lit(e->pos, (double)(v), true)); } while (0)
+    if (is_buf && e->is_call && check_buf_method(e, c)) return;
     if (!e->is_call) {
         if (strcmp(m, "length") == 0 || strcmp(m, "byteLength") == 0) { e->field = 0; e->type = ty_int; return; }
         if (strcmp(m, "byteOffset") == 0) { e->builtin.cfn = "xs_u8_byte_offset"; e->type = ty_int; return; } /* (into the SharedArrayBuffer or the array it is a view on) */
@@ -776,6 +998,7 @@ static void check_bytes_static(Expr *e, const char *ns) {
     bool is_buf = strcmp(ns, "Buffer") == 0;
     Class *u8 = find_class("Uint8Array"), *bc = find_class(is_buf ? "Buffer" : "Uint8Array");
     int n = e->args.len;
+    if (is_buf && !e->is_call && strcmp(m, "poolSize") == 0) { *e = *num_lit(e->pos, 65536, true); return; } /* (Node 26's; a constant here) */
     if (!e->is_call) xs_error(XS8037, e->pos, NULL, "%s.%s is not a value", ns, m);
     e->type = ty_object_of(bc);
     if (strcmp(m, "from") == 0) {
@@ -824,10 +1047,10 @@ static void check_bytes_static(Expr *e, const char *ns) {
         if (n != 1) xs_error(XS8042, e->pos, NULL, "%s.from(bytes) takes one argument", ns);
         if (is_bytes(st)) { e->builtin.cfn = is_buf ? "xs_buf_from_bytes" : "xs_u8_copy"; return; }
         if (st->kind == TY_ARRAY && (st->elem->kind == TY_INT || st->elem->kind == TY_LITINT)) { e->builtin.cfn = is_buf ? "xs_buf_from_ints" : "xs_u8_from_ints"; return; }
-        if (!is_buf && st->kind == TY_ARRAY && st->elem->kind == TY_NUMBER) { e->builtin.cfn = "xs_u8_from_nums"; return; }
+        if (st->kind == TY_ARRAY && st->elem->kind == TY_NUMBER) { e->builtin.cfn = is_buf ? "xs_buf_from_nums" : "xs_u8_from_nums"; return; }
         xs_error(XS8040, e->args.items[0]->pos, NULL, "%s.from takes %s, not %s", ns, is_buf ? "a string, bytes or an int[]" : "bytes, an int[] or a number[]", ty_name(st));
     }
-    if (!is_buf && strcmp(m, "of") == 0) { /* Uint8Array.of(1, 2, 3): from an array literal */
+    if (strcmp(m, "of") == 0) { /* Uint8Array.of(1, 2, 3), Buffer.of(...): from an array literal */
         Expr *lit = xs_alloc(sizeof *lit);
         lit->kind = E_ARRAY_LIT; lit->pos = e->pos; lit->field = -1;
         lit->args = e->args;
@@ -835,7 +1058,7 @@ static void check_bytes_static(Expr *e, const char *ns) {
         expect_type(lit, ty_array_of(ty_int), "the values of Uint8Array.of");
         memset(&e->args, 0, sizeof e->args);
         expr_list_push(&e->args, lit);
-        e->builtin.cfn = "xs_u8_from_ints";
+        e->builtin.cfn = is_buf ? "xs_buf_from_ints" : "xs_u8_from_ints";
         return;
     }
     if (!is_buf && (strcmp(m, "fromBase64") == 0 || strcmp(m, "fromHex") == 0)) {
@@ -845,6 +1068,20 @@ static void check_bytes_static(Expr *e, const char *ns) {
         e->builtin.cfn = m[4] == 'B' ? "xs_u8_from_base64" : "xs_u8_from_hex";
         return;
     }
+    if (is_buf && strcmp(m, "alloc") == 0 && (n == 2 || n == 3)) { /* Buffer.alloc(size, string, encoding?) / (size, bytes) */
+        check_expr(e->args.items[1], NULL);
+        Type *ft = e->args.items[1]->type;
+        if (ft->kind == TY_STRING || is_bytes(ft)) {
+            int_arg(&e->args.items[0], "the size of Buffer.alloc");
+            if (ft->kind == TY_STRING) {
+                if (n == 3) buf_str_arg(&e->args.items[2], "the encoding of Buffer.alloc");
+                else expr_list_push(&e->args, null_str(e->pos));
+            } else if (n == 3) xs_error(XS7004, e->pos, NULL, "Buffer.alloc takes an encoding only with a string");
+            e->builtin.cfn = ft->kind == TY_STRING ? "xs_buf_alloc_str" : "xs_buf_alloc_bytes";
+            return;
+        }
+    }
+    if (is_buf && strcmp(m, "allocUnsafeSlow") == 0) m = "allocUnsafe";
     if (is_buf && (strcmp(m, "alloc") == 0 || strcmp(m, "allocUnsafe") == 0)) {
         if (n < 1 || n > (m[5] == 'U' ? 1 : 2)) xs_error(XS7004, e->pos, NULL, "Buffer.%s takes a size%s", m, m[5] == 'U' ? "" : " and an optional fill byte");
         for (int k = 0; k < n; k++) int_arg(&e->args.items[k], xs_sprintf("argument of Buffer.%s", m));
@@ -853,6 +1090,14 @@ static void check_bytes_static(Expr *e, const char *ns) {
         return;
     }
     if (is_buf && strcmp(m, "concat") == 0) {
+        if (n == 2) { /* Buffer.concat(list, totalLength) */
+            check_expr(e->args.items[0], ty_array_of(ty_object_of(bc)));
+            Type *lt = e->args.items[0]->type;
+            if (lt->kind != TY_ARRAY || !is_bytes(lt->elem)) xs_error(XS7006, e->args.items[0]->pos, NULL, "Buffer.concat takes Buffer[] or Uint8Array[], not %s", ty_name(lt));
+            buf_off_arg(&e->args.items[1], "the totalLength of Buffer.concat");
+            e->builtin.cfn = "xs_buf_concat_n";
+            return;
+        }
         if (n != 1) xs_error(XS7007, e->pos, NULL, "Buffer.concat takes a list of buffers");
         check_expr(e->args.items[0], ty_array_of(ty_object_of(bc)));
         Type *lt = e->args.items[0]->type;
@@ -860,7 +1105,40 @@ static void check_bytes_static(Expr *e, const char *ns) {
         e->builtin.cfn = "xs_buf_concat";
         return;
     }
+    if (is_buf && strcmp(m, "compare") == 0 && n == 2) { /* Buffer.compare(a, b): -1, 0 or 1 */
+        for (int k = 0; k < 2; k++) {
+            check_expr(e->args.items[k], NULL);
+            if (!is_bytes(e->args.items[k]->type)) xs_error(XS7052, e->args.items[k]->pos, NULL, "Buffer.compare compares Buffers or Uint8Arrays, not %s", ty_name(e->args.items[k]->type));
+        }
+        e->builtin.cfn = "xs_buf_compare";
+        e->type = ty_int;
+        return;
+    }
+    if (is_buf && strcmp(m, "isEncoding") == 0 && n == 1) {
+        buf_str_arg(&e->args.items[0], "the encoding");
+        e->builtin.cfn = "xs_buf_is_encoding";
+        e->type = ty_boolean;
+        return;
+    }
     if (is_buf && strcmp(m, "byteLength") == 0) {
+        if (n >= 1) { /* Buffer.byteLength(bytes): its length */
+            check_expr(e->args.items[0], ty_string);
+            e->args.items[0]->prechecked = true;
+            if (is_bytes(e->args.items[0]->type) && n == 1) {
+                Expr *b = e->args.items[0];
+                memset(e, 0, sizeof *e);
+                e->kind = E_MEMBER; e->pos = b->pos; e->field = -1; e->lhs = b; e->str = "length";
+                check_expr(e, NULL);
+                return;
+            }
+        }
+        if (n == 2 && e->args.items[1]->kind != E_STRING) { /* an encoding known at run time */
+            expect_type(e->args.items[0], ty_string, "argument of Buffer.byteLength");
+            buf_str_arg(&e->args.items[1], "the encoding");
+            e->builtin.cfn = "xs_buf_byte_length_enc";
+            e->type = ty_int;
+            return;
+        }
         if (n == 2 && e->args.items[1]->kind == E_STRING) { /* Buffer.byteLength(s, enc) */
             const char *enc = e->args.items[1]->str;
             if (!strcmp(enc, "latin1") || !strcmp(enc, "binary") || !strcmp(enc, "ascii")) { /* one byte per UTF-16 unit: s.length */
@@ -871,12 +1149,25 @@ static void check_bytes_static(Expr *e, const char *ns) {
                 return;
             }
             if (!strcmp(enc, "utf8") || !strcmp(enc, "utf-8")) { e->args.len = 1; n = 1; }
+            else { /* hex, base64, ucs2 ...: counted at run time */
+                expect_type(e->args.items[0], ty_string, "argument of Buffer.byteLength");
+                check_expr(e->args.items[1], ty_string);
+                e->builtin.cfn = "xs_buf_byte_length_enc";
+                e->type = ty_int;
+                return;
+            }
         }
         if (n != 1) xs_error(XS7005, e->pos, NULL, "Buffer.byteLength takes one string");
         check_expr(e->args.items[0], ty_string);
         expect_type(e->args.items[0], ty_string, "argument of Buffer.byteLength");
         e->builtin.cfn = "xs_buf_byte_length";
         e->type = ty_int;
+        return;
+    }
+    if (is_buf && strcmp(m, "isBuffer") == 0 && n == 1 && (check_expr(e->args.items[0], NULL), e->args.items[0]->prechecked = true, is_bytes(e->args.items[0]->type))) {
+        /* of a Uint8Array or Buffer known as such: whether it is a Buffer, at run time (both are one C type) */
+        e->builtin.cfn = "xs_buf_is_buffer";
+        e->type = ty_boolean;
         return;
     }
     if (is_buf && strcmp(m, "isBuffer") == 0 && n == 1) { /* Buffer.isBuffer(v): v instanceof Buffer (TK_IDENT: the instanceof operator) */
@@ -889,7 +1180,7 @@ static void check_bytes_static(Expr *e, const char *ns) {
         return;
     }
     (void)u8;
-    xs_error(XS7105, e->pos, is_buf ? "supported: Buffer.from, alloc, allocUnsafe, concat, byteLength" : "supported: Uint8Array.from, of, fromBase64, fromHex", "unknown %s member '%s'", ns, m);
+    xs_error(XS7105, e->pos, is_buf ? "supported: Buffer.from, of, alloc, allocUnsafe, allocUnsafeSlow, concat, compare, isBuffer, isEncoding, byteLength" : "supported: Uint8Array.from, of, fromBase64, fromHex", "unknown %s member '%s'", ns, m);
 }
 static Type *tuple_type(Type **ps, int n, Pos pos);
 static void check_stmt(Stmt *s);
@@ -2698,6 +2989,38 @@ static Func *lookup_func(const char *name) {
         }
     }
     return NULL;
+}
+
+/* node:crypto's methods and functions whose result type depends on the arguments, as @types/node's overloads:
+   m(args, encoding) gives text and m(args) a Buffer: the call without the encoding goes to __m_bytes, a method
+   with one parameter less (hash.digest(), cipher.update(data, inEnc), cipher.final(), sign.sign(key));
+   key.export({ format: "der" | "jwk" }) goes to __export_der / __export_jwk (a Buffer, a JsonWebKey; "pem" is
+   text). Read at the call: the options must be an object literal there. */
+static const char *objlit_str(Expr *o, const char *key) {
+    if (!o || o->kind != E_OBJLIT) return NULL;
+    for (int i = 0; i < o->args.len; i++)
+        if (o->keys[i] && !strcmp(o->keys[i], key)) return o->args.items[i] && o->args.items[i]->kind == E_STRING ? o->args.items[i]->str : "";
+    return NULL;
+}
+static Func *find_method(Class *c, const char *name);
+static void crypto_method_overload(Expr *e, Class *c) {
+    Func *bm = find_method(c, xs_sprintf("__%s_bytes", e->str));
+    if (bm && find_method(c, e->str) && e->args.len <= bm->nparams) { e->str = bm->name; return; }
+    if (!strcmp(e->str, "export") && e->args.len == 0 && find_method(c, "__export_der")) { e->str = "__export_der"; return; } /* (a secret key's bytes) */
+    if (!strcmp(e->str, "export") && e->args.len == 1) {
+        const char *fmt = objlit_str(e->args.items[0], "format");
+        if (fmt && (!strcmp(fmt, "der") || !strcmp(fmt, "jwk")) && find_method(c, xs_sprintf("__export_%s", fmt))) e->str = xs_sprintf("__export_%s", fmt);
+    }
+}
+/* generateKeyPairSync(type, { publicKeyEncoding, privateKeyEncoding }): the keys as text (PEM), not KeyObjects */
+static Func *crypto_func_overload(Expr *e, Func *f) {
+    if (!f || !f->mod || !f->mod->file || strcmp(f->mod->file, "xisto:crypto") != 0 || strcmp(f->name, "generateKeyPairSync") != 0) return f;
+    if (e->args.len < 2 || (!objlit_str(e->args.items[1], "publicKeyEncoding") && !objlit_str(e->args.items[1], "privateKeyEncoding"))) return f;
+    SYM_EACH(funcs_by_name, "__generateKeyPairSync_pem", fe) {
+        Func *g = fe->decl;
+        if (g->mod == f->mod) return g;
+    }
+    return f;
 }
 
 static bool is_builtin_name(const char *n) {
@@ -5097,8 +5420,85 @@ static bool ts_rule_diff(Expr *a, Type *ptype) {
         if (!ty_equal(at->params[k], pt->params[k]) && !dflt_param_fits(at, pt, argf, k)) return false;
     return true;
 }
+/* a function value with its own parameters, given where (...args: any[]) => R goes (an EventEmitter listener:
+   emitter.on("data", onData)): an adapter (...a: any[]) => f(a[0] as A0, a[1] as A1, ...), each argument checked as the
+   function takes it and a missing one read as null. The adapter keeps the function it wraps (Func.origin), so === and
+   off(onData) see the same function, as in Node. Arrows written at the call are typed by the call and need none. */
+static bool rest_any_adapter(Expr *a, Type *ptype) {
+    if (!a->type || !ptype) return false;
+    Type *at = ty_strip_null(a->type), *pt = ty_strip_null(ptype);
+    if (pt->kind != TY_FUNC || !pt->rest || pt->nparams != 1 || at->kind != TY_FUNC || at->rest || a->kind == E_ARROW) return false;
+    Type *el = pt->params[0]->kind == TY_ARRAY ? pt->params[0]->elem : NULL;
+    if (!el || el->kind != TY_UNKNOWN || ty_equal(at, pt)) return false;
+    if (pt->ret && pt->ret->kind != TY_VOID && pt->ret->kind != TY_UNKNOWN) return false;
+    /* ((__raf: F) => (...__ra: any[]) => __raf(...))(fn): the function is read once, where the listener is given, and
+       the adapter keeps that value (a capture by value): this.onData, obj.h, a variable reassigned later, all compare
+       by the function they were (Func.origin is the capture) */
+    static int nra;
+    const char *fname = xs_sprintf("__raf%d", nra);
+    Expr *ref = mk_ident(a->pos, fname);
+    Expr *orig = xs_alloc(sizeof *orig);
+    *orig = *a;
+    orig->prechecked = true;
+    Type *orig_t = a->type;
+    const char *an = xs_sprintf("__ra%d", nra++);
+    Func *af = xs_alloc(sizeof *af); af->pos = a->pos; af->name = "arrow";
+    af->ret = pt->ret ? pt->ret : ty_void;
+    af->params = xs_alloc(sizeof(Param));
+    af->nparams = 1;
+    af->params[0].name = (char *)an;
+    af->params[0].type = pt->params[0];
+    af->params[0].rest = true;
+    Expr *call = xs_alloc(sizeof *call); call->kind = E_CALL; call->pos = a->pos; call->field = -1; call->lhs = ref;
+    for (int k = 0; k < at->nparams; k++) {
+        /* (k < a.length ? a[k] : null) as Ak */
+        Expr *len = xs_alloc(sizeof *len); len->kind = E_MEMBER; len->pos = a->pos; len->field = -1; len->str = "length"; len->lhs = mk_ident(a->pos, an);
+        Expr *lt = xs_alloc(sizeof *lt); lt->kind = E_BINARY; lt->op = TK_LT; lt->pos = a->pos; lt->field = -1; lt->lhs = num_lit(a->pos, k, true); lt->rhs = len;
+        Expr *ix = xs_alloc(sizeof *ix); ix->kind = E_INDEX; ix->pos = a->pos; ix->field = -1; ix->lhs = mk_ident(a->pos, an); ix->rhs = num_lit(a->pos, k, true);
+        Expr *nul = xs_alloc(sizeof *nul); nul->kind = E_NULL; nul->pos = a->pos; nul->field = -1;
+        Expr *c = xs_alloc(sizeof *c); c->kind = E_COND; c->pos = a->pos; c->field = -1; c->lhs = lt;
+        expr_list_push(&c->args, ix);
+        expr_list_push(&c->args, nul);
+        Expr *as = xs_alloc(sizeof *as); as->kind = E_AS; as->pos = a->pos; as->field = -1; as->lhs = c; as->elem_type = at->params[k];
+        expr_list_push(&call->args, as);
+    }
+    Stmt *r = xs_alloc(sizeof *r); r->pos = a->pos;
+    bool void_fn = at->ret && at->ret->kind == TY_VOID; /* (a void function where (...args: any[]) => any goes: null) */
+    if (af->ret->kind == TY_VOID || void_fn) { r->kind = S_EXPR; r->expr = call; } else { r->kind = S_RETURN; r->expr = call; }
+    Stmt *b = xs_alloc(sizeof *b); b->kind = S_BLOCK; b->pos = a->pos; stmt_list_push(&b->stmts, r);
+    if (af->ret->kind != TY_VOID && void_fn) {
+        Stmt *rn = xs_alloc(sizeof *rn); rn->pos = a->pos; rn->kind = S_RETURN;
+        Expr *nul = xs_alloc(sizeof *nul); nul->kind = E_NULL; nul->pos = a->pos; nul->field = -1;
+        rn->expr = nul;
+        stmt_list_push(&b->stmts, rn);
+    }
+    af->body = b;
+    af->origin = call; /* (checked with the body: emit reads the function it calls, the capture __raf) */
+    Arrow *ar = xs_alloc(sizeof *ar); ar->pos = a->pos; ar->fn = af; ar->expr_body = af->ret->kind != TY_VOID;
+    Expr *inner = xs_alloc(sizeof *inner);
+    inner->kind = E_ARROW; inner->pos = ar->pos; inner->field = -1; inner->arrow = ar;
+    /* the outer arrow, called at once with the function value */
+    Func *of = xs_alloc(sizeof *of); of->pos = a->pos; of->name = "arrow";
+    of->ret = ptype;
+    of->params = xs_alloc(sizeof(Param));
+    of->nparams = 1;
+    of->params[0].name = (char *)fname;
+    of->params[0].type = orig_t;
+    Stmt *orr = xs_alloc(sizeof *orr); orr->pos = a->pos; orr->kind = S_RETURN; orr->expr = inner;
+    Stmt *ob = xs_alloc(sizeof *ob); ob->kind = S_BLOCK; ob->pos = a->pos; stmt_list_push(&ob->stmts, orr);
+    of->body = ob;
+    Arrow *oar = xs_alloc(sizeof *oar); oar->pos = a->pos; oar->fn = of; oar->expr_body = true;
+    Expr *outer = xs_alloc(sizeof *outer);
+    outer->kind = E_ARROW; outer->pos = a->pos; outer->field = -1; outer->arrow = oar;
+    memset(a, 0, sizeof *a);
+    a->kind = E_CALL; a->pos = outer->pos; a->field = -1; a->lhs = outer;
+    expr_list_push(&a->args, orig);
+    check_expr(a, ptype);
+    return true;
+}
 static void variance_arg(Expr *a, Func *f, int i) {
     if (!a->type || i >= f->nparams) return;
+    if (rest_any_adapter(a, f->params[i].type)) return;
     if (!tsc_checked() && !ts_rule_diff(a, f->params[i].type)) return;
     variance_arg_t(a, f, i, f->params[i].type);
 }
@@ -5734,6 +6134,19 @@ static Field *find_field(Class *c, const char *name, int *index) {
     return NULL;
 }
 
+/* a callback parameter the base takes as (e?: E) => void where the override takes (e?: E, d?: D) => void (node:stream's
+   _write(chunk, encoding, callback: TransformCallback) over (error?) => void), or the other way round: the same
+   parameters as far as both go, the rest optional; the bridge hands the override a wrapper (cb_wrap) */
+static bool cb_widened(Type *bt, Type *ot) {
+    bt = bt ? bt : NULL;
+    if (!bt || !ot || bt->kind != TY_FUNC || ot->kind != TY_FUNC || bt->rest || ot->rest || bt->async_ret || ot->async_ret) return false;
+    if (!bt->ret || !ot->ret || bt->ret->kind != TY_VOID || ot->ret->kind != TY_VOID || ty_equal(bt, ot)) return false;
+    int n = bt->nparams < ot->nparams ? bt->nparams : ot->nparams;
+    for (int i = 0; i < n; i++) if (!ty_equal(bt->params[i], ot->params[i])) return false;
+    for (int i = n; i < bt->nparams; i++) if (bt->params[i]->kind != TY_NULLABLE && !ty_is_any(bt->params[i])) return false;
+    for (int i = n; i < ot->nparams; i++) if (ot->params[i]->kind != TY_NULLABLE && !ty_is_any(ot->params[i])) return false;
+    return true;
+}
 static Func *find_method(Class *c, const char *name) {
     for (int i = 0; i < c->nmethods; i++)
         if (strcmp(c->methods[i]->name, name) == 0) return c->methods[i];
@@ -6471,9 +6884,7 @@ static void check_object_member_in(Expr *e, Class *c) {
         if (!g && find_method(c, xs_sprintf("__set_%s", e->str))) xs_error(XS8060, e->pos, "add get %s(): T { ... }", "'%s' of %s has a setter but no getter", e->str, c->name);
         if (g) { e->str = g->name; e->is_call = true; }
     }
-    if (e->is_call && e->args.len == 0 && !strcmp(e->str, "digest") && c->mod && c->mod->file && !strcmp(c->mod->file, "xisto:crypto") &&
-        (!strcmp(c->name, "Hash") || !strcmp(c->name, "Hmac")))
-        e->str = "__digestBytes"; /* hash.digest(): a Buffer (with an encoding, text) */
+    if (e->is_call && c->mod && c->mod->file && !strcmp(c->mod->file, "xisto:crypto")) crypto_method_overload(e, c);
     Func *m = find_method(c, e->str);
     if (!m && !e->is_call && !c->builtin) {
         /* an open class (a field `__expando: Record<string, any>`, as Express's Request): a property the class does
@@ -8233,6 +8644,11 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (!is_numeric(e->lhs->type) && e->lhs->type->kind != TY_LITINT)
                 xs_error(XS8119, e->lhs->pos, NULL, "operand of unary '%s' must be int or number, but this is %s", e->op == TK_PLUS ? "+" : "-", ty_name(e->lhs->type));
             e->type = e->lhs->type;
+            if (e->op == TK_MINUS && e->lhs->kind == E_NUMBER && e->lhs->type->kind == TY_LITINT && e->lhs->num == 0 &&
+                (!expected || expected->kind == TY_NUMBER || expected->kind == TY_UNKNOWN)) {
+                coerce_lit(e->lhs, ty_number); /* -0 where a number or an any goes: the float -0 (an int has no -0) */
+                e->type = ty_number;
+            }
         }
         return;
     case E_BINARY:
@@ -8496,6 +8912,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (e->op == TK_IDENT) { /* x instanceof C */
             Class *c = e->rhs->cls ? e->rhs->cls : find_class(e->rhs->str); /* (a class given: see any_method_call) */
             if (!c || c->is_interface) xs_error(XS9010, e->rhs->pos, "instanceof tests classes (interfaces have no run-time identity)", "'%s' is not a class", e->rhs->str);
+            if (c && c->builtin && strcmp(c->name, "RegExp") == 0) prog->uses_regex = true; /* (the test reads xs_RegExp_free) */
             if (!ty_is_heap(e->lhs->type)) xs_error(XS8108, e->lhs->pos, NULL, "instanceof needs an object, but this is %s", ty_name(e->lhs->type));
             e->rhs->cls = c;
             e->rhs->type = ty_object_of(c);
@@ -8635,7 +9052,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             bool lref = lt->kind == TY_OBJECT || lt->kind == TY_ARRAY || lt->kind == TY_FUNC || lt->kind == TY_MAP || lt->kind == TY_SET;
             bool rref = rt->kind == TY_OBJECT || rt->kind == TY_ARRAY || rt->kind == TY_FUNC || rt->kind == TY_MAP || rt->kind == TY_SET;
             if (lref && rref) {
-                bool related = ty_equal(lt, rt);
+                bool related = ty_equal(lt, rt) || (lt->kind == TY_FUNC && rt->kind == TY_FUNC); /* (functions: emit compares origins) */
                 if (!related && lt->kind == TY_OBJECT && rt->kind == TY_OBJECT)
                     for (Class *k = lt->cls; k && !related; k = k->base) if (k == rt->cls) related = true;
                 if (!related && lt->kind == TY_OBJECT && rt->kind == TY_OBJECT)
@@ -9308,6 +9725,20 @@ static void check_expr_in(Expr *e, Type *expected) {
             return;
         }
         const char *name = e->lhs->str;
+        if (name && strchr(name, '\x01')) { /* import { setTimeout as t } next to another setTimeout: "setTimeout\x01node:timers" */
+            const char *q = strchr(name, '\x01') + 1;
+            if (!strcmp(q, "node:timers") || !strcmp(q, "timers") || !strcmp(q, "xisto:timers")) name = e->lhs->str = xs_strndup(name, (size_t)(q - 1 - name));
+        }
+        if (name && e->args.len >= 1 && strstr(name, "__s_") && !lookup(name)) { /* C.m(array) with a static __m_array beside m: that one
+                                                                              (Readable.from([...]) of xisto:stream) */
+            const char *sp = strstr(name, "__s_");
+            const char *alt = xs_sprintf("%.*s__s___%s_array", (int)(sp - name), name, sp + 4);
+            Expr *a0 = e->args.items[0];
+            if (lookup_func(alt)) {
+                if (a0->kind != E_ARRAY_LIT && !a0->type) { check_expr(a0, NULL); a0->prechecked = true; }
+                if (a0->kind == E_ARRAY_LIT || (a0->type && ty_strip_null(a0->type)->kind == TY_ARRAY)) name = e->lhs->str = (char *)alt;
+            }
+        }
         if (!lookup_func(name) && !lookup(name)) {
             if (strcmp(name, "Boolean") == 0 && e->args.len == 1) { /* Boolean(x): x's truthiness, as !!x */
                 Expr *x = e->args.items[0];
@@ -9337,6 +9768,45 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->builtin.cfn = name[2] == 'N' ? "xs_is_nan" : "xs_is_finite";
                 return;
             }
+            if ((strcmp(name, "setTimeout") == 0 || strcmp(name, "setInterval") == 0 || strcmp(name, "setImmediate") == 0) && e->args.len >= 1) {
+                /* setTimeout(cb) / setTimeout(cb, ms, ...args): the delay defaults to 0 (Node: 1 ms), the extra arguments are
+                   given to the callback (they are read when it runs, not when the timer is set) */
+                bool imm = strcmp(name, "setImmediate") == 0;
+                int first = imm ? 1 : 2;
+                if (!imm && e->args.len == 1) expr_list_push(&e->args, num_lit(e->pos, 0, false));
+                if (e->args.len > first) {
+                    Func *af = xs_alloc(sizeof *af); af->pos = e->pos; af->name = "arrow"; af->ret = ty_void;
+                    Expr *call = xs_alloc(sizeof *call); call->kind = E_CALL; call->pos = e->pos; call->field = -1; call->lhs = e->args.items[0];
+                    for (int i = first; i < e->args.len; i++) expr_list_push(&call->args, e->args.items[i]);
+                    Stmt *r = xs_alloc(sizeof *r); r->pos = e->pos; r->kind = S_EXPR; r->expr = call;
+                    Stmt *b = xs_alloc(sizeof *b); b->kind = S_BLOCK; b->pos = e->pos; stmt_list_push(&b->stmts, r);
+                    af->body = b;
+                    Arrow *ar = xs_alloc(sizeof *ar); ar->pos = e->pos; ar->fn = af;
+                    Expr *w = xs_alloc(sizeof *w); w->kind = E_ARROW; w->pos = e->pos; w->field = -1; w->arrow = ar;
+                    e->args.items[0] = w;
+                    e->args.len = first;
+                }
+                if (imm) {
+                    Type *cbt = ty_func(NULL, 0, ty_void);
+                    check_expr(e->args.items[0], cbt);
+                    expect_type(e->args.items[0], cbt, "callback of setImmediate");
+                    e->type = ty_int;
+                    e->builtin.cfn = "xs_set_immediate";
+                    prog->uses_net = true;
+                    return;
+                }
+            }
+            if ((strcmp(name, "queueMicrotask") == 0 || strcmp(name, "__xs_next_tick") == 0) && e->args.len == 1) {
+                /* queueMicrotask(cb): after the current work, with the promise reactions; (process.nextTick: before them) */
+                Type *cbt = ty_func(NULL, 0, ty_void);
+                check_expr(e->args.items[0], cbt);
+                expect_type(e->args.items[0], cbt, xs_sprintf("callback of %s", name));
+                e->type = ty_void;
+                e->builtin.cfn = name[0] == 'q' ? "xs_queue_microtask" : "xs_next_tick";
+                prog->uses_net = true;
+                return;
+            }
+            if (strcmp(name, "clearImmediate") == 0) name = "clearTimeout";
             if (strcmp(name, "setTimeout") == 0 || strcmp(name, "setInterval") == 0) { /* Node's timers: a callback later, on the event loop */
                 if (e->args.len != 2) xs_error(XS8035, e->pos, xs_sprintf("%s(() => { ... }, ms)", name), "%s takes a callback and a delay in milliseconds", name);
                 Type *cbt = ty_func(NULL, 0, ty_void);
@@ -9477,6 +9947,21 @@ static void check_expr_in(Expr *e, Type *expected) {
                 prog->uses_this_reg = true;
                 return;
             }
+            if (!strcmp(name, "__xs_overrides") && e->args.len == 2 && e->args.items[1]->kind == E_STRING) {
+                /* __xs_overrides(obj, "m"): true when the class obj has at run time declares its own m (or inherits one
+                   from below obj's type): what JavaScript's `typeof obj._final === "function"` tells a library written in
+                   xisto (runtime/node/stream.ts) */
+                Expr *o = e->args.items[0];
+                check_expr(o, NULL);
+                Type *ot = ty_strip_null(o->type);
+                if (ot->kind != TY_OBJECT || ot->cls->builtin || !find_method(ot->cls, e->args.items[1]->str))
+                    xs_error(XS8035, e->pos, NULL, "__xs_overrides takes an object and the name of one of its class's methods");
+                e->args.items[1]->type = ty_string;
+                e->cls = ot->cls;
+                e->builtin.cfn = "__xs_overrides";
+                e->type = ty_boolean;
+                return;
+            }
             if (!strcmp(name, "__xs_this_set") && e->args.len == 1) {
                 check_expr(e->args.items[0], NULL);
                 to_unknown(e->args.items[0]);
@@ -9574,6 +10059,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     e->builtin.cfn = "xs_dyn_str"; xs_any_used = true;
                 }
                 else if (a->type->kind == TY_OBJECT && a->type->cls->builtin && strcmp(a->type->cls->name, "symbol") == 0) e->builtin.cfn = "xs_Symbol_to_string";
+                else if (is_bytes(a->type)) e->builtin.cfn = "xs_u8_to_string"; /* (a Buffer: its UTF-8 text; a Uint8Array: "1,2,3") */
                 else if (tostring_call(a)) { *e = *a; return; }
                 else xs_error(XS7040, a->pos, NULL, "String() converts int, number or boolean, but this is %s", ty_name(a->type));
                 e->type = ty_string;
@@ -9700,7 +10186,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
-        Func *f = lookup_func(name);
+        Func *f = crypto_func_overload(e, lookup_func(name));
         if (!f) {
             Binding *b = lookup(name);
             if (b && b->type->kind == TY_FUNC) { /* calling a function value */
@@ -10053,6 +10539,62 @@ static void check_expr_in(Expr *e, Type *expected) {
             *e = *l;
             check_expr(e, expected);
             return;
+        }
+        if (e->is_call && e->str && !strcmp(e->str, "toString") && e->args.len <= 1 && e->lhs) {
+            /* chunk.toString() / chunk.toString("hex") with chunk an any (a stream's chunk, an untyped listener's
+               argument): bytes as a Buffer's text, anything else as String(x), when no class of the program has a
+               toString of its own: ((v: any, enc: string) => v instanceof Uint8Array ? (v as Buffer).toString(enc) :
+               String(v))(chunk, "hex") */
+            bool own = false;
+            for (int i = 0; i < prog->nclasses && !own; i++)
+                if (!prog->classes[i]->builtin) own = find_method(prog->classes[i], "toString") != NULL;
+            if (!own) {
+                check_expr(e->lhs, NULL);
+                e->lhs->prechecked = true;
+            }
+            if (!own && e->lhs->type && ty_is_any(e->lhs->type)) {
+                static int nts;
+                Pos at = e->pos;
+                int id = nts++;
+                const char *pv = xs_sprintf("__ts%d", id), *pe = xs_sprintf("__te%d", id);
+                bool enc = e->args.len == 1;
+                Func *f = xs_alloc(sizeof *f);
+                f->pos = at; f->name = "arrow"; f->ret = ty_string;
+                f->params = xs_alloc(sizeof(Param) * 2);
+                memset(f->params, 0, sizeof(Param) * 2);
+                f->params[0].name = (char *)pv; f->params[0].type = ty_any;
+                if (enc) { f->params[1].name = (char *)pe; f->params[1].type = ty_string; }
+                f->nparams = enc ? 2 : 1;
+                Expr *str = xs_alloc(sizeof *str);
+                str->kind = E_CALL; str->pos = at; str->field = -1; str->lhs = ad_ident(at, "String");
+                expr_list_push(&str->args, ad_ident(at, pv));
+                Expr *isb = xs_alloc(sizeof *isb); /* v instanceof Uint8Array */
+                isb->kind = E_BINARY; isb->op = TK_IDENT; isb->pos = at; isb->field = -1; isb->lhs = ad_ident(at, pv); isb->rhs = ad_ident(at, "Uint8Array");
+                Expr *asb = xs_alloc(sizeof *asb); /* (v as Buffer).toString(enc) */
+                asb->kind = E_AS; asb->pos = at; asb->field = -1; asb->lhs = ad_ident(at, pv); asb->elem_type = ty_object_of(find_class("Buffer"));
+                Expr *bts = xs_alloc(sizeof *bts);
+                bts->kind = E_MEMBER; bts->pos = at; bts->field = -1; bts->lhs = asb; bts->str = "toString"; bts->is_call = true;
+                if (enc) expr_list_push(&bts->args, ad_ident(at, pe));
+                Expr *cond = xs_alloc(sizeof *cond);
+                cond->kind = E_COND; cond->pos = at; cond->field = -1; cond->lhs = isb;
+                expr_list_push(&cond->args, bts);
+                expr_list_push(&cond->args, str);
+                Stmt *body = xs_alloc(sizeof *body);
+                body->kind = S_BLOCK; body->pos = at;
+                Stmt *r = xs_alloc(sizeof *r);
+                r->kind = S_RETURN; r->pos = at; r->expr = cond;
+                stmt_list_push(&body->stmts, r);
+                f->body = body;
+                Arrow *a = xs_alloc(sizeof *a); a->pos = at; a->fn = f; a->expr_body = false;
+                Expr *ae = xs_alloc(sizeof *ae); ae->kind = E_ARROW; ae->pos = at; ae->field = -1; ae->arrow = a;
+                Expr *v = e->lhs, *ea = enc ? e->args.items[0] : NULL;
+                memset(e, 0, sizeof *e);
+                e->kind = E_CALL; e->pos = at; e->field = -1; e->lhs = ae;
+                expr_list_push(&e->args, v);
+                if (ea) expr_list_push(&e->args, ea);
+                check_expr(e, expected);
+                return;
+            }
         }
         if (e->is_call && e->str && !strcmp(e->str, "toString") && e->args.len == 0 && e->lhs && tsc_checked()) {
             /* v.toString() with v an unknown (narrowed by typeof to a number or a bigint): String(v) */
@@ -10517,6 +11059,25 @@ static void check_expr_in(Expr *e, Type *expected) {
             }
             xs_error(XS8015, e->pos, "Object.keys, values and entries take a Record<string, V> (and keys, an object)", "Object.%s of %s is not supported", e->str, ty_name(ot));
         }
+        if (e->str && find_class("XistoProcess") && !lookup("process")) {
+            /* process.X beyond the members built in below (argv, env, pid, cwd, exit, stdout/stderr.write): XistoProcess.X,
+               from xisto:process (runtime/node/process.ts); process.hrtime.bigint() and process.memoryUsage.rss() too */
+            if (e->is_call && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->str && e->lhs->lhs && e->lhs->lhs->kind == E_IDENT &&
+                strcmp(e->lhs->lhs->str, "process") == 0 &&
+                ((!strcmp(e->lhs->str, "hrtime") && !strcmp(e->str, "bigint")) || (!strcmp(e->lhs->str, "memoryUsage") && !strcmp(e->str, "rss")))) {
+                e->str = e->lhs->str[0] == 'h' ? "hrtimeBigint" : "memoryUsageRss";
+                e->lhs = mk_ident(e->lhs->pos, "XistoProcess");
+            } else if (e->lhs->kind == E_IDENT && strcmp(e->lhs->str, "process") == 0) {
+                static const char *const core[] = {"argv", "env", "pid", "cwd", "exit", "stdout", "stderr", NULL};
+                bool is_core = false;
+                for (int i = 0; core[i]; i++) if (strcmp(e->str, core[i]) == 0) is_core = true;
+                if (!is_core && !e->is_call && strcmp(e->str, "exitCode") == 0) { /* (a read: process.exitCode = n is an assignment) */
+                    e->is_call = true;
+                    e->str = "getExitCode";
+                }
+                if (!is_core) e->lhs = mk_ident(e->lhs->pos, "XistoProcess");
+            }
+        }
         if (e->is_call && e->str && strcmp(e->str, "write") == 0 && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->str &&
             (strcmp(e->lhs->str, "stdout") == 0 || strcmp(e->lhs->str, "stderr") == 0) && e->lhs->lhs->kind == E_IDENT &&
             strcmp(e->lhs->lhs->str, "process") == 0 && !lookup("process")) { /* process.stdout.write(text or bytes) */
@@ -10753,6 +11314,11 @@ static void check_expr_in(Expr *e, Type *expected) {
                     e->kind = E_BOOL; e->boolean = arr; e->type = ty_boolean; e->lhs = NULL; e->args.len = 0; e->field = -1;
                     return;
                 }
+                if (is_bytes(st)) { /* Array.from(bytes): the bytes as ints */
+                    e->kind = E_CALL; e->lhs = NULL; e->field = -1; e->type = ty_array_of(ty_int);
+                    e->builtin.cfn = "xs_u8_to_ints";
+                    return;
+                }
                 /* a copy of an array; a Set's values or a Map's entries (already arrays of their own) */
                 const char *m = st->kind == TY_ARRAY ? "slice" : st->kind == TY_SET ? "values" : st->kind == TY_MAP ? "entries" : st->kind == TY_STRING ? "split" : NULL;
                 if (!m) xs_error(XS8093, src->pos, "Array.from takes an array, a Set, a Map or a string", "cannot make an array from %s", ty_name(st));
@@ -10973,9 +11539,10 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
-        if (e->is_call && e->str && !e->args.len && !strcmp(e->str, "valueOf") &&
-            (e->lhs->type->kind == TY_STRING || is_numeric(e->lhs->type) || e->lhs->type->kind == TY_BOOLEAN)) {
-            Expr *v = e->lhs; /* s.valueOf(), n.valueOf(): the value itself */
+        if (e->is_call && e->str && !e->args.len &&
+            ((!strcmp(e->str, "valueOf") && (e->lhs->type->kind == TY_STRING || is_numeric(e->lhs->type) || e->lhs->type->kind == TY_BOOLEAN)) ||
+             (!strcmp(e->str, "toString") && e->lhs->type->kind == TY_STRING))) {
+            Expr *v = e->lhs; /* s.valueOf(), n.valueOf(), s.toString(): the value itself */
             *e = *v;
             return;
         }
@@ -11635,6 +12202,17 @@ static void check_expr_in(Expr *e, Type *expected) {
             return;
         }
         case TY_INT: case TY_NUMBER: case TY_LITINT:
+            if (e->is_call && e->args.len == 0 && e->lhs->type->kind != TY_NUMBER &&
+                (!strcmp(e->str, "unref") || !strcmp(e->str, "ref") || !strcmp(e->str, "hasRef") || !strcmp(e->str, "refresh") || !strcmp(e->str, "close"))) {
+                /* setTimeout(...).unref(): a timer is its id here (NodeJS.Timeout is int); these are its Timeout methods */
+                if (e->lhs->type->kind == TY_LITINT) coerce_lit(e->lhs, ty_int);
+                bool has = !strcmp(e->str, "hasRef"), close = !strcmp(e->str, "close");
+                e->builtin.cfn = has ? "xs_timer_has_ref" : close ? "xs_timer_close" : !strcmp(e->str, "unref") ? "xs_timer_unref" :
+                                 !strcmp(e->str, "ref") ? "xs_timer_ref" : "xs_timer_refresh";
+                e->type = has ? ty_boolean : close ? ty_void : ty_int;
+                prog->uses_net = true;
+                return;
+            }
             if (e->is_call && strcmp(e->str, "toString") == 0 && e->args.len <= 1) { /* n.toString(), n.toString(radix) */
                 if (e->lhs->type->kind == TY_LITINT) coerce_lit(e->lhs, ty_int);
                 if (e->args.len == 1) {
@@ -12588,6 +13166,15 @@ static void check_expr_in(Expr *e, Type *expected) {
                 }
             } else {
                 check_block(f->body);
+                if (f->ret->kind == TY_UNKNOWN && f->body && f->body->kind == S_BLOCK && !always_returns(f->body)) {
+                    /* () => { ... } where () => any (or unknown) goes, with no value at its end: JavaScript's undefined,
+                       null here (a callback that an API runs and passes on, as tracer.trace(name, () => {...})) */
+                    Stmt *rn = xs_alloc(sizeof *rn); rn->pos = e->pos; rn->kind = S_RETURN;
+                    Expr *nul = xs_alloc(sizeof *nul); nul->kind = E_NULL; nul->pos = e->pos; nul->field = -1;
+                    rn->expr = nul;
+                    check_stmt(rn);
+                    stmt_list_push(&f->body->stmts, rn);
+                }
                 if (f->ret->kind != TY_VOID && !always_returns(f->body))
                     xs_error(XS8144, e->pos, "add a return at the end", "this arrow function may reach its end without returning a %s", ty_name(f->ret));
             }
@@ -13101,6 +13688,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     continue;
                 }
             }
+            if (is_bytes(part->type)) { wrap_call(part, "xs_u8_to_string", ty_string); continue; } /* `${buf}`: its text */
             if (k == TY_OBJECT && tostring_call(part)) continue;
             if (k != TY_STRING && k != TY_INT && k != TY_NUMBER && k != TY_BOOLEAN && k != TY_ENUM)
                 xs_error(XS8098, part->pos, "template literals take strings, numbers, ints, booleans and enums; call a method that returns a string for the rest", "cannot put a %s inside a template literal", ty_name(part->type));
@@ -15809,7 +16397,16 @@ static void flatten_methods(Class *c) {
            call through the base runs it by the same bridge, its result widened to the base's type */
         /* (the same count with other types too: canActivate(): boolean | Promise<boolean> | Observable<boolean> over a
            base's canActivate(): boolean, handleRequest<TUser = JwtPayload>(...): TUser over one giving unknown) */
-        if (covariant || (!same && tsc_checked() && !bm->is_abstract && !b->is_interface && !b->iface_methods && own->body)) {
+        /* _transform(chunk: Buffer, ...) over a base's _transform(chunk: any, ...): TypeScript lets a method narrow a
+           parameter the base takes as any (its parameters are bivariant), and an int where the base takes a number is
+           xisto's narrower number; a call through the base converts the argument (checked at run time), by the same bridge */
+        bool any_narrowed = !same && own->nparams == bm->nparams && own->body && !own->ntparams && !bm->ntparams && !bm->is_abstract &&
+                            !b->is_interface && !b->iface_methods && (!own->ret || !bm->ret || ty_equal(own->ret, bm->ret));
+        for (int k = 0; any_narrowed && k < own->nparams; k++)
+            any_narrowed = ty_equal(own->params[k].type, bm->params[k].type) || (ty_is_any(bm->params[k].type) && !own->params[k].rest) ||
+                           (bm->params[k].type->kind == TY_NUMBER && own->params[k].type->kind == TY_INT) || /* (_read(size: int)) */
+                           cb_widened(bm->params[k].type, own->params[k].type);
+        if (covariant || any_narrowed || (!same && tsc_checked() && !bm->is_abstract && !b->is_interface && !b->iface_methods && own->body)) {
             /* upsert(input) over upsert(filter, set, setOnInsert?): TypeScript takes it, and JavaScript calls it by name: a call
                through the base (this.upsert(...) in the base's own code too) runs this one, with the arguments it was given
                (the extra ones dropped). Here a bridge with the base's signature does that: this.upsert(a0 as P0, ...),
@@ -15869,6 +16466,34 @@ static void flatten_methods(Class *c) {
                     expr_list_push(&parse->args, str);
                     a = xs_alloc(sizeof *a);
                     a->kind = E_AS; a->pos = pos; a->field = -1; a->lhs = parse; a->elem_type = own->params[k].type;
+                } else if (cb_widened(bm->params[k].type, own->params[k].type)) {
+                    /* (e, d) => __oaK(e): the base's callback as the override's type */
+                    Type *bt = bm->params[k].type, *ot = own->params[k].type;
+                    Func *wf = xs_alloc(sizeof *wf);
+                    wf->pos = pos; wf->name = "arrow"; wf->ret = ty_void;
+                    wf->params = xs_alloc(sizeof(Param) * (size_t)(ot->nparams + 1));
+                    memset(wf->params, 0, sizeof(Param) * (size_t)(ot->nparams + 1));
+                    Expr *inner = xs_alloc(sizeof *inner);
+                    inner->kind = E_CALL; inner->pos = pos; inner->field = -1; inner->lhs = id;
+                    for (int q = 0; q < ot->nparams; q++) {
+                        wf->params[q].name = xs_sprintf("__cbw%d_%d", k, q);
+                        wf->params[q].type = ot->params[q];
+                        Expr *pd = xs_alloc(sizeof *pd); pd->kind = E_NULL; pd->pos = pos; pd->field = -1;
+                        wf->params[q].dflt = pd;
+                    }
+                    wf->nparams = ot->nparams;
+                    for (int q = 0; q < bt->nparams; q++) {
+                        Expr *aq;
+                        if (q < ot->nparams) { aq = xs_alloc(sizeof *aq); aq->kind = E_IDENT; aq->pos = pos; aq->field = -1; aq->str = wf->params[q].name; }
+                        else { aq = xs_alloc(sizeof *aq); aq->kind = E_NULL; aq->pos = pos; aq->field = -1; }
+                        expr_list_push(&inner->args, aq);
+                    }
+                    Stmt *wb = xs_alloc(sizeof *wb); wb->kind = S_BLOCK; wb->pos = pos;
+                    Stmt *ws = xs_alloc(sizeof *ws); ws->kind = S_EXPR; ws->pos = pos; ws->expr = inner;
+                    stmt_list_push(&wb->stmts, ws);
+                    wf->body = wb;
+                    Arrow *wa = xs_alloc(sizeof *wa); wa->pos = pos; wa->fn = wf;
+                    a = xs_alloc(sizeof *a); a->kind = E_ARROW; a->pos = pos; a->field = -1; a->arrow = wa;
                 } else if (!ty_equal(bm->params[k].type, own->params[k].type) && !conv_ok(bm->params[k].type, own->params[k].type, 0)) {
                     Expr *u = xs_alloc(sizeof *u);
                     u->kind = E_AS; u->pos = pos; u->field = -1; u->lhs = id; u->elem_type = ty_unknown;
@@ -17238,7 +17863,8 @@ void check_program(Program *p) {
             if (p->classes[j]->mod == c->mod && strcmp(c->name, p->classes[j]->name) == 0) xs_error(XS9015, c->pos, NULL, "class '%s' is declared twice", c->name);
         for (int j = 0; j < nbuiltins; j++)
             if (strcmp(c->name, builtins[j]->name) == 0 && !((strcmp(c->name, "Worker") == 0 || strcmp(c->name, "MessagePort") == 0) && !wt_imports(c->mod, c->name)) &&
-                strcmp(c->name, "Response") != 0) /* (Express's Response: a module's own class comes first where it is declared or imported) */
+                strcmp(c->name, "Response") != 0 && strcmp(c->name, "ReadableStream") != 0) /* (Express's Response, node:stream/web's
+                                                       ReadableStream: a module's own class comes first where it is declared or imported) */
                 xs_error(XS9002, c->pos, NULL, "'%s' is a built-in class", c->name);
         SYM_EACH(funcs_by_name, c->name, e)
             if (((Func *)e->decl)->mod == c->mod) xs_error(XS9006, c->pos, NULL, "'%s' is both a class and a function", c->name);
@@ -17273,8 +17899,16 @@ void check_program(Program *p) {
                 SYM_EACH(enums_by_name, name, e) if (((Enum *)e->decl)->mod == im->from) found = found || ((Enum *)e->decl)->exported;
                 if (!found && strcmp(im->from->file, "xisto:worker_threads") == 0 && (strcmp(name, "Worker") == 0 || strcmp(name, "MessagePort") == 0))
                     found = true; /* built-in classes */
+                if (!found && strcmp(im->from->file, "xisto:buffer") == 0 && strcmp(name, "Buffer") == 0)
+                    found = true; /* the built-in Buffer (node:buffer exports it; it is a global too) */
+                if (!found && strcmp(im->from->file, "xisto:util") == 0 && (strcmp(name, "TextEncoder") == 0 || strcmp(name, "TextDecoder") == 0))
+                    found = true; /* built-in classes (node:util re-exports them) */
                 if (!found && im->from->builtin && strcmp(im->from->file, "perf_hooks") == 0 && strcmp(name, "performance") == 0)
                     found = true; /* the built-in performance */
+                if (!found && im->from->builtin && strcmp(im->from->file, "timers") == 0 && !im->is_default)
+                    for (const char *const *t = (const char *const[]){"setTimeout", "setInterval", "setImmediate", "clearTimeout", "clearInterval",
+                                                                       "clearImmediate", "queueMicrotask", NULL}; *t; t++)
+                        if (strcmp(name, *t) == 0) found = true; /* the built-in timers */
                 if (!found && im->from->builtin && strcmp(im->from->file, "sqlite") == 0)
                     for (int j = 0; j < nbuiltins; j++)
                         if (strcmp(builtins[j]->name, name) == 0 && (strcmp(name, "DatabaseSync") == 0 || strcmp(name, "StatementSync") == 0)) found = true;
