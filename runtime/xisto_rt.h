@@ -1917,6 +1917,16 @@ static inline void *xs_Error_thrown(void *v) {
     return v && xs_type_of(v)->free == xs_Error_free ? ((xs_Error *)v)->f___thrown : NULL;
 }
 static inline bool xs_is_a(void *v, void (*free_fn)(void *)) { return v && free_fn && xs_type_of(v)->free == free_fn; }
+XS_NOINLINE void xs_as_fail(const char *what);
+/* x as Error, x unknown: an Error is itself; an object of a class that extends Error is wrapped as throw does
+   (xs_Error_wrap_err), the wrapper borrowed from the pool of temporaries */
+XS_NOINLINE void *xs_as_error(void *v, bool (*is_sub)(void *), int nullable) {
+    if (!v) { if (nullable) return NULL; xs_as_fail("Error"); }
+    if (xs_type_of(v)->free == xs_Error_free) return v;
+    if (is_sub(v)) return xs_ar(xs_Error_wrap_err(v));
+    xs_as_fail("Error");
+    return NULL;
+}
 /* e.stack: "Error: message" and one "    at ..." line per frame, as in Node; borrowed from the Error */
 static xs_str *xs_Error_stack(xs_Error *e) {
     if (!e->stack) {

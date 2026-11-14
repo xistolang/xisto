@@ -2896,6 +2896,34 @@ XS_NOINLINE int64_t xs_http_bind(xs_Server *s, int64_t port) {
     xs_exit_hook = xs_tasks_drain;
     return port;
 }
+#ifdef XS_WITH_TLS
+/* node:https: the certificate and key come as PEM text (Node's options); the TLS layer reads files, so they go
+   through two private temporary files, removed once read */
+static char *xs_pem_tmp(xs_str *pem) {
+    const char *dir = getenv("TMPDIR");
+    char *path = malloc(4096);
+    snprintf(path, 4096, "%s/xisto-pem-XXXXXX", dir && *dir ? dir : "/tmp");
+    int fd = mkstemp(path);
+    if (fd < 0) xs_panic("https: cannot write the certificate to a temporary file");
+    fchmod(fd, 0600);
+    ssize_t w = write(fd, pem->data, (size_t)pem->len);
+    (void)w;
+    close(fd);
+    return path;
+}
+XS_NOINLINE int64_t xs_https_bind(xs_Server *s, int64_t port, xs_str *cert, xs_str *key) {
+    char *cp = xs_pem_tmp(cert), *kp = xs_pem_tmp(key);
+    xs_str *c = xs_str_new(cp, strlen(cp)), *k = xs_str_new(kp, strlen(kp));
+    s->cred = xs_tls_cred_load_any(c, k);
+    unlink(cp);
+    unlink(kp);
+    free(cp);
+    free(kp);
+    xs_release(c);
+    xs_release(k);
+    return xs_http_bind(s, port);
+}
+#endif
 XS_NOINLINE void xs_http_close(void) {
     if (xs_http_lfd < 0 && !xs_http_srv) return;
     xs_http_closing = true;
@@ -3820,5 +3848,288 @@ XS_NOINLINE void xs_MessagePort_postSab(xs_MessagePort *p, xs_SharedArrayBuffer 
 XS_NOINLINE void xs_MessagePort_postF64(xs_MessagePort *p, xs_Float64Array *a) {
     if (!p->out) xs_panic("parentPort is null on the main thread");
     xs_wq_put_f64(p->out, a);
+}
+#endif
+
+/* ---- node:net (runtime/node/net.ts): TCP sockets for the event loop. Each call that would wait parks the coroutine
+   (xs_wait_fd); a negative result is an error, as a code: -1 ENOTFOUND, -2 ECONNREFUSED, -3 ETIMEDOUT,
+   -4 EADDRINUSE, -5 EACCES, -6 ECONNRESET, -7 EPIPE, -8 other (xs_net_code names them) ---- */
+static int64_t xs_net_err(int e) {
+    return e == ECONNREFUSED ? -2 : e == ETIMEDOUT ? -3 : e == EADDRINUSE ? -4 : e == EACCES ? -5 : e == ECONNRESET ? -6 : e == EPIPE ? -7 : -8;
+}
+XS_NOINLINE xs_str *xs_net_code(int64_t code) {
+    static const char *const names[] = {"", "ENOTFOUND", "ECONNREFUSED", "ETIMEDOUT", "EADDRINUSE", "EACCES", "ECONNRESET", "EPIPE", "EIO"};
+    const char *n = code < 0 && code >= -8 ? names[-code] : "EIO";
+    return xs_str_new(n, strlen(n));
+}
+XS_NOINLINE int64_t xs_net_connect(xs_str *host, int64_t port) {
+    struct addrinfo hints = {0}, *res;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char ports[16];
+    snprintf(ports, sizeof ports, "%d", (int)port);
+    if (getaddrinfo(host->data, ports, &hints, &res) != 0) return -1;
+    int64_t result = -2;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        fcntl(fd, F_SETFL, O_NONBLOCK);
+        int err = 0;
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
+            err = errno;
+            if (err == EINPROGRESS) {
+                xs_wait_fd(fd, EVFILT_WRITE);
+                socklen_t len = sizeof err;
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+            }
+        }
+        if (err == 0) { result = fd; break; }
+        result = xs_net_err(err);
+        close(fd);
+    }
+    freeaddrinfo(res);
+    return result;
+}
+/* the next bytes from the socket (empty at its end; an error sets *xs_net_rerr) */
+static int64_t xs_net_rerr_;
+XS_NOINLINE int64_t xs_net_read_error(void) { int64_t e = xs_net_rerr_; xs_net_rerr_ = 0; return e; }
+/* (the read buffer is on the heap: a task's stack is 64 KB; one per thread is enough, the bytes are copied out
+   before the task can yield) */
+static XS_TLS uint8_t *xs_net_rbuf;
+XS_NOINLINE xs_Uint8Array *xs_net_read(int64_t fd) {
+    if (!xs_net_rbuf) xs_net_rbuf = malloc(65536);
+    uint8_t *b = xs_net_rbuf;
+    for (;;) {
+        ssize_t r = read((int)fd, b, 65536);
+        if (r > 0) {
+            xs_Uint8Array *u = xs_u8_new(r);
+            memcpy(u->data, b, (size_t)r);
+            return u;
+        }
+        if (r == 0) return xs_u8_new(0);
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN) { xs_wait_fd((int)fd, EVFILT_READ); continue; }
+        xs_net_rerr_ = xs_net_err(errno);
+        return xs_u8_new(0);
+    }
+}
+XS_NOINLINE int64_t xs_net_write(int64_t fd, xs_Uint8Array *bytes) { /* 0 when all is written, else the error */
+    size_t off = 0, n = (size_t)bytes->f_length;
+    while (off < n) {
+        ssize_t w = send((int)fd, bytes->data + off, n - off, 0
+#ifdef MSG_NOSIGNAL
+                         | MSG_NOSIGNAL
+#endif
+        );
+        if (w > 0) { off += (size_t)w; continue; }
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && errno == EAGAIN) { xs_wait_fd((int)fd, EVFILT_WRITE); continue; }
+        return xs_net_err(errno);
+    }
+    return 0;
+}
+XS_NOINLINE void xs_net_shutdown(int64_t fd, int64_t how) { shutdown((int)fd, how == 0 ? SHUT_RD : how == 1 ? SHUT_WR : SHUT_RDWR); }
+XS_NOINLINE void xs_net_close(int64_t fd) { close((int)fd); }
+XS_NOINLINE int64_t xs_net_listen(xs_str *host, int64_t port) { /* the listening socket, or an error */
+    signal(SIGPIPE, SIG_IGN);
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) return xs_net_err(errno);
+    int one = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (host->len == 0 || inet_pton(AF_INET, host->data, &addr.sin_addr) != 1) addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) < 0 || listen(lfd, 511) < 0) { int e = errno; close(lfd); return xs_net_err(e); }
+    fcntl(lfd, F_SETFL, O_NONBLOCK);
+    if (xs_kq < 0) xs_kq = kqueue();
+    return lfd;
+}
+XS_NOINLINE int64_t xs_net_accept(int64_t lfd) { /* the next connection (parks until one comes), or an error */
+    for (;;) {
+        int fd = accept((int)lfd, NULL, NULL);
+        if (fd >= 0) {
+            int one = 1;
+            fcntl(fd, F_SETFL, O_NONBLOCK);
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+            return fd;
+        }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) { xs_wait_fd((int)lfd, EVFILT_READ); continue; }
+        return xs_net_err(errno);
+    }
+}
+static xs_str *xs_net_addr_str(struct sockaddr_storage *ss) {
+    char b[INET6_ADDRSTRLEN] = "";
+    if (ss->ss_family == AF_INET) inet_ntop(AF_INET, &((struct sockaddr_in *)ss)->sin_addr, b, sizeof b);
+    else if (ss->ss_family == AF_INET6) inet_ntop(AF_INET6, &((struct sockaddr_in6 *)ss)->sin6_addr, b, sizeof b);
+    return xs_str_new(b, strlen(b));
+}
+static int64_t xs_net_port_of(struct sockaddr_storage *ss) {
+    return ss->ss_family == AF_INET ? ntohs(((struct sockaddr_in *)ss)->sin_port) : ss->ss_family == AF_INET6 ? ntohs(((struct sockaddr_in6 *)ss)->sin6_port) : 0;
+}
+XS_NOINLINE xs_str *xs_net_address(int64_t fd, bool peer) {
+    struct sockaddr_storage ss;
+    socklen_t l = sizeof ss;
+    memset(&ss, 0, sizeof ss);
+    if ((peer ? getpeername((int)fd, (struct sockaddr *)&ss, &l) : getsockname((int)fd, (struct sockaddr *)&ss, &l)) != 0) return xs_str_new("", 0);
+    return xs_net_addr_str(&ss);
+}
+XS_NOINLINE int64_t xs_net_port(int64_t fd, bool peer) {
+    struct sockaddr_storage ss;
+    socklen_t l = sizeof ss;
+    memset(&ss, 0, sizeof ss);
+    if ((peer ? getpeername((int)fd, (struct sockaddr *)&ss, &l) : getsockname((int)fd, (struct sockaddr *)&ss, &l)) != 0) return 0;
+    return xs_net_port_of(&ss);
+}
+XS_NOINLINE void xs_net_wake(int64_t port) { /* a connection to our own listener: its accept returns (server.close) */
+    xs_str *h = xs_str_new("127.0.0.1", 9);
+    int64_t fd = xs_net_connect(h, port);
+    xs_release(h);
+    if (fd >= 0) close((int)fd);
+}
+/* node:dns: lookup through the system resolver (getaddrinfo), as Node's dns.lookup; "" when the name is unknown */
+XS_NOINLINE xs_arr_ref *xs_dns_lookup_all(xs_str *host, int64_t family) {
+    xs_arr_ref *out = xs_arr_ref_new(0, xs_print_str_quoted_);
+    struct addrinfo hints = {0}, *res;
+    hints.ai_family = family == 4 ? AF_INET : family == 6 ? AF_INET6 : AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host->data, NULL, &hints, &res) != 0) return out;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        struct sockaddr_storage ss;
+        memset(&ss, 0, sizeof ss);
+        memcpy(&ss, ai->ai_addr, ai->ai_addrlen);
+        xs_arr_ref_push(out, xs_net_addr_str(&ss));
+    }
+    freeaddrinfo(res);
+    return out;
+}
+
+/* ---- node:child_process (runtime/node/child_process.ts): spawn with pipes; the parent's ends are non-blocking, read
+   by tasks of the event loop (xs_net_read) ---- */
+#if !defined(_WIN32)
+#include <spawn.h>
+#include <sys/wait.h>
+extern char **environ;
+/* [pid, stdin, stdout, stderr], or [-errno] */
+XS_NOINLINE xs_arr_int *xs_cp_spawn(xs_str *file, xs_arr_ref *args, xs_str *cwd, xs_arr_ref *env, bool use_env) {
+    xs_arr_int *out = xs_arr_int_new(0, 0);
+    int in[2], o[2], e[2];
+    if (pipe(in) != 0 || pipe(o) != 0 || pipe(e) != 0) { xs_arr_int_push(out, -EMFILE); return out; }
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, in[0], 0);
+    posix_spawn_file_actions_adddup2(&fa, o[1], 1);
+    posix_spawn_file_actions_adddup2(&fa, e[1], 2);
+    int fds[6] = {in[0], in[1], o[0], o[1], e[0], e[1]};
+    for (int i = 0; i < 6; i++) posix_spawn_file_actions_addclose(&fa, fds[i]);
+    if (cwd->len > 0) {
+#if defined(__APPLE__) || (defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 29)))
+        posix_spawn_file_actions_addchdir_np(&fa, cwd->data);
+#endif
+    }
+    char **argv = calloc((size_t)args->len + 2, sizeof(char *));
+    argv[0] = file->data;
+    for (size_t i = 0; i < args->len; i++) argv[i + 1] = ((xs_str *)args->data[i])->data;
+    char **envp = environ;
+    if (use_env) {
+        envp = calloc((size_t)env->len + 1, sizeof(char *));
+        for (size_t i = 0; i < env->len; i++) envp[i] = ((xs_str *)env->data[i])->data;
+    }
+    fflush(stdout);
+    pid_t pid;
+    int r = posix_spawnp(&pid, file->data, &fa, NULL, argv, envp);
+    posix_spawn_file_actions_destroy(&fa);
+    free(argv);
+    if (use_env) free(envp);
+    close(in[0]); close(o[1]); close(e[1]);
+    if (r != 0) {
+        close(in[1]); close(o[0]); close(e[0]);
+        xs_arr_int_push(out, -r);
+        return out;
+    }
+    fcntl(in[1], F_SETFL, O_NONBLOCK); fcntl(o[0], F_SETFL, O_NONBLOCK); fcntl(e[0], F_SETFL, O_NONBLOCK);
+    fcntl(in[1], F_SETFD, FD_CLOEXEC); fcntl(o[0], F_SETFD, FD_CLOEXEC); fcntl(e[0], F_SETFD, FD_CLOEXEC);
+    if (xs_kq < 0) xs_kq = kqueue();
+    xs_arr_int_push(out, pid);
+    xs_arr_int_push(out, in[1]);
+    xs_arr_int_push(out, o[0]);
+    xs_arr_int_push(out, e[0]);
+    return out;
+}
+XS_NOINLINE xs_str *xs_cp_errno_name(int64_t e) {
+    const char *n = e == ENOENT ? "ENOENT" : e == EACCES ? "EACCES" : e == ENOEXEC ? "ENOEXEC" : e == EMFILE ? "EMFILE" : "EIO";
+    return xs_str_new(n, strlen(n));
+}
+XS_NOINLINE int64_t xs_cp_write(int64_t fd, xs_Uint8Array *bytes) { /* 0, or an error (the child closed its input) */
+    size_t off = 0, n = (size_t)bytes->f_length;
+    signal(SIGPIPE, SIG_IGN);
+    while (off < n) {
+        ssize_t w = write((int)fd, bytes->data + off, n - off);
+        if (w > 0) { off += (size_t)w; continue; }
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && errno == EAGAIN) { xs_wait_fd((int)fd, EVFILT_WRITE); continue; }
+        return -7;
+    }
+    return 0;
+}
+/* [exit code, signal number] once the child has ended (a task polls, parked between tries) */
+XS_NOINLINE xs_arr_int *xs_cp_wait(int64_t pid) {
+    int st = 0;
+    int64_t ms = 1;
+    for (;;) {
+        pid_t r = waitpid((pid_t)pid, &st, WNOHANG);
+        if (r == (pid_t)pid) break;
+        if (r < 0 && errno != EINTR) { st = 0; break; }
+        xs_sleep_ms(ms);
+        if (ms < 20) ms *= 2;
+    }
+    xs_arr_int *out = xs_arr_int_new(0, 0);
+    xs_arr_int_push(out, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    xs_arr_int_push(out, WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+    return out;
+}
+XS_NOINLINE int64_t xs_cp_kill(int64_t pid, int64_t sig) { return kill((pid_t)pid, (int)sig) == 0 ? 0 : errno; }
+/* spawnSync: runs to the end; [exit code, signal] and the two outputs through out/err */
+XS_NOINLINE xs_arr_int *xs_cp_run_sync(xs_str *file, xs_arr_ref *args, xs_str *cwd, xs_str *input, xs_arr_ref *outs) {
+    xs_arr_ref *noenv = xs_arr_ref_new(0, xs_print_str_quoted_);
+    xs_arr_int *sp = xs_cp_spawn(file, args, cwd, noenv, false);
+    xs_release(noenv);
+    xs_arr_int *res = xs_arr_int_new(0, 0);
+    if (sp->data[0] < 0) {
+        xs_arr_int_push(res, sp->data[0]);
+        xs_arr_int_push(res, 0);
+        xs_release(sp);
+        return res;
+    }
+    int64_t pid = sp->data[0];
+    int fin = (int)sp->data[1], fo = (int)sp->data[2], fe = (int)sp->data[3];
+    xs_release(sp);
+    fcntl(fin, F_SETFL, 0);
+    if (input->len) { ssize_t w = write(fin, input->data, (size_t)input->len); (void)w; }
+    close(fin);
+    xs_sb so = {0}, se = {0};
+    struct pollfd p[2] = {{fo, POLLIN, 0}, {fe, POLLIN, 0}};
+    int open = 2;
+    char *b = malloc(65536);
+    while (open > 0) {
+        if (poll(p, 2, -1) < 0) { if (errno == EINTR) continue; break; }
+        for (int i = 0; i < 2; i++) {
+            if (p[i].fd < 0 || !(p[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            ssize_t r = read(p[i].fd, b, 65536);
+            if (r > 0) xs_sb_put(i ? &se : &so, b, (size_t)r);
+            else if (r == 0 || errno != EAGAIN) { close(p[i].fd); p[i].fd = -1; open--; }
+        }
+    }
+    free(b);
+    int st = 0;
+    while (waitpid((pid_t)pid, &st, 0) < 0 && errno == EINTR) {}
+    xs_arr_ref_push(outs, xs_sb_finish(&so));
+    xs_arr_ref_push(outs, xs_sb_finish(&se));
+    xs_arr_int_push(res, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    xs_arr_int_push(res, WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+    return res;
 }
 #endif

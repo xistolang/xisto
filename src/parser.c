@@ -6308,11 +6308,15 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         return m;
     }
     { /* Node's modules written in xisto over runtime functions (runtime/node/NAME.ts, NODE_TS in the Makefile) */
-        extern const unsigned char xs_node_events_ts[], xs_node_process_ts[], xs_node_http_ts[];
-        static const struct { const char *name; const unsigned char *src; bool net; } node_ts[] = {
+        extern const unsigned char xs_node_events_ts[], xs_node_process_ts[], xs_node_http_ts[], xs_node_net_ts[], xs_node_dns_ts[], xs_node_child_process_ts[], xs_node_https_ts[];
+        static const struct { const char *name; const unsigned char *src; bool net; bool tls; } node_ts[] = {
             {"events", xs_node_events_ts, false},
             {"process", xs_node_process_ts, true}, /* (signals and the exit hook live with the event loop) */
             {"http", xs_node_http_ts, true},
+            {"https", xs_node_https_ts, true, true},
+            {"net", xs_node_net_ts, true},
+            {"dns", xs_node_dns_ts, true},
+            {"child_process", xs_node_child_process_ts, true}, /* (execSync: xs_exec_sync, as before) */
         };
         for (size_t i = 0; i < sizeof node_ts / sizeof node_ts[0]; i++) {
             if (strcmp(name, node_ts[i].name) != 0) continue;
@@ -6321,6 +6325,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
             m->src = (char *)node_ts[i].src;
             m->native_prefix = "xs_";
             if (node_ts[i].net) prog->uses_net = true;
+            if (node_ts[i].tls) prog->uses_tls = true; /* (node:https: a TLS server and https:// requests) */
             m->loading = true;
             parse_module(prog, m);
             m->loading = false;
@@ -6364,13 +6369,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         prog->uses_okmap = true;
         return m;
     }
-    if (strcmp(name, "child_process") == 0) {
-        Func *f = builtin_func(m, "execSync", "xs_exec_sync", ty_string, 1, ty_string, NULL);
-        f->params[0].name = "command";
-        add_func(prog, f);
-        return m;
-    }
-    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:timers, xisto:http, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:timers, xisto:http, xisto:https, xisto:net, xisto:dns, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
     return NULL;
 }
 

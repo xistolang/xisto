@@ -239,8 +239,8 @@ async function answer(req: HttpRequest): Promise<HttpResponse> {
 /** Node's http.Server: emits 'request' (req, res) for each request, 'listening' and 'close'. */
 export class HttpServer extends EventEmitter {
   listening: boolean = false;
-  private port: int = 0;
-  private native: Server = new Server();
+  protected port: int = 0;
+  protected native: Server = new Server();
 
   constructor(listener: RequestListener | null = null) {
     super();
@@ -248,9 +248,13 @@ export class HttpServer extends EventEmitter {
     this.native.fallback(answer);
   }
   /** Starts listening on the port (0: any free port); the callback runs once it is. */
+  /** (internal) binds the native server: node:https binds it with its certificate. */
+  protected bind(native: Server, port: int): int {
+    return http_bind(native, port);
+  }
   listen(port: int = 0, callback: (() => void) | null = null): HttpServer {
     current = this;
-    this.port = http_bind(this.native, port);
+    this.port = this.bind(this.native, port);
     this.listening = true;
     if (callback !== null) this.once("listening", callback);
     setImmediate(() => {
@@ -311,6 +315,17 @@ export class ClientRequest extends EventEmitter {
     this.path = u.pathname + u.search;
     this.host = u.hostname;
     this.protocol = u.protocol;
+    if (u.protocol !== this.expected()) throw new TypeError(`Protocol "${u.protocol}" not supported. Expected "${this.expected()}"`);
+  }
+  /** (internal) the protocol this module speaks (node:https: "https:"). */
+  protected expected(): string {
+    return "http:";
+  }
+  /** (internal) the request itself: rest is the URL after "http://" (node:https fetches "https://" + rest). */
+  protected async fetchRest(rest: string, withBody: boolean, h: Record<string, string>, body: string): Promise<Response> {
+    // ("http://" written here: plain http links no TLS into the program; node:https is the one that does)
+    if (!withBody) return await fetch("http://" + rest, { method: this.method, headers: h });
+    return await fetch("http://" + rest, { method: this.method, headers: h, body: body });
   }
   setHeader(name: string, value: string | number): ClientRequest {
     this.headers.set(name, String(value));
@@ -339,9 +354,8 @@ export class ClientRequest extends EventEmitter {
     for (const k of this.headers.keys()) h[k] = this.headers.get(k) ?? "";
     const body = this.chunks.join("");
     try {
-      const r = this.method === "GET" || this.method === "HEAD"
-        ? await fetch(this.url, { method: this.method, headers: h })
-        : await fetch(this.url, { method: this.method, headers: h, body: body });
+      const rest = this.url.slice(this.expected().length + 2);
+      const r = await this.fetchRest(rest, !(this.method === "GET" || this.method === "HEAD"), h, body);
       const msg = new IncomingMessage();
       msg.statusCode = r.status;
       msg.statusMessage = reason(r.status);
@@ -359,7 +373,8 @@ export class ClientRequest extends EventEmitter {
   }
 }
 
-function toUrl(target: string | RequestOptions, defaultProtocol: string): string {
+/** (internal) the URL of a request()'s target. */
+export function _toUrl(target: string | RequestOptions, defaultProtocol: string): string {
   if (typeof target === "string") return target as string;
   const o = target as RequestOptions;
   const protocol = o.protocol ?? defaultProtocol;
@@ -369,17 +384,26 @@ function toUrl(target: string | RequestOptions, defaultProtocol: string): string
   return `${protocol}//${host}${port > 0 ? ":" + String(port) : ""}${path}`;
 }
 
-/** Makes a request: call end() (with a body) to send it. */
-export function request(target: string | RequestOptions, callback: ResponseListener | null = null): ClientRequest {
+/** (internal) the method and headers of request(), given to a ClientRequest made by http or https. */
+export function _setup(req: ClientRequest, target: string | RequestOptions, callback: ResponseListener | null): ClientRequest {
   const opts: RequestOptions | null = typeof target === "string" ? null : (target as RequestOptions);
-  const method = opts !== null && opts.method !== null ? (opts.method as string).toUpperCase() : "GET";
-  const req = new ClientRequest(toUrl(target, "http:"), method);
   if (opts !== null && opts.headers !== null) {
     const hs = opts.headers as Record<string, string>;
     for (const k of Object.keys(hs)) req.setHeader(k, hs[k] ?? "");
   }
   if (callback !== null) req.once("response", callback);
   return req;
+}
+
+/** (internal) the method request() uses. */
+export function _method(target: string | RequestOptions): string {
+  const opts: RequestOptions | null = typeof target === "string" ? null : (target as RequestOptions);
+  return opts !== null && opts.method !== null ? (opts.method as string).toUpperCase() : "GET";
+}
+
+/** Makes a request: call end() (with a body) to send it. */
+export function request(target: string | RequestOptions, callback: ResponseListener | null = null): ClientRequest {
+  return _setup(new ClientRequest(_toUrl(target, "http:"), _method(target)), target, callback);
 }
 
 /** A GET request, sent at once. */

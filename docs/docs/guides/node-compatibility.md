@@ -22,8 +22,9 @@ xisto build --node-compat -o app main.ts
 Available modules include:
 
 - `fs`, `path`, `os`, `url`
-- `http` / `https`: a server and `fetch`, with TLS (AWS-LC by default, or BearSSL)
-- `events` (`EventEmitter`), `process`, `timers` (see below)
+- `http`: Node's `createServer`/`request`/`get` (below), and xisto's own `Server` with `fetch`, with TLS for
+  `https://` (AWS-LC by default, or BearSSL)
+- `events` (`EventEmitter`), `process`, `timers`, `http`, `net`, `dns`, `child_process` (see below)
 - `crypto` (`createHash`, `createHmac`, `randomUUID`)
 - `stream` (synchronous, no backpressure wait)
 - `async_hooks` (`AsyncLocalStorage`)
@@ -114,6 +115,99 @@ Beyond `process.argv`, `process.env`, `process.pid`, `process.cwd()`, `process.e
 Differences from Node: `'uncaughtException'` and `'unhandledRejection'` listeners are not called (an uncaught
 error ends the program with exit code 1, as when no listener is set). `process.stdin` is not available yet; read standard
 input with `xisto:io`.
+
+## Default imports
+
+`import fs from "node:fs"`, `import path from "path"` and the like (TypeScript's `esModuleInterop`) read as
+`import * as fs from "node:fs"`: the default export of a Node module is the module itself. `node:events` is the
+exception, as in Node: its default export is `EventEmitter`.
+
+## http
+
+```ts
+import http from "node:http";
+
+const server = http.createServer((req, res) => {
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify({ method: req.method, url: req.url }));
+});
+server.listen(3000, () => console.log("listening"));
+```
+
+`createServer(listener)` gives a server whose listener receives an `IncomingMessage` and a `ServerResponse`:
+
+- **Request:** `method`, `url` (path and query), `headers` (lower-case names), `rawHeaders`, `httpVersion`, the
+  body as `'data'` then `'end'` (with `setEncoding`).
+- **Response:** `statusCode`, `setHeader`/`appendHeader`/`getHeader`/`getHeaders`/`hasHeader`/`removeHeader`,
+  `writeHead(status, headers)`, `write`, `end`, and `'finish'`.
+- **Server:** `listen(port, cb)`, with port 0 choosing a free port, `address()`, `close(cb)`, and the
+  `'request'`, `'listening'` and `'close'` events.
+
+`listen()` returns at once, as in Node. The server answers once the program's own code has run, on the same event
+loop as its timers and other sockets. `close()` lets the program end normally.
+
+The client side, `http.request(url | options, cb)` and `http.get(...)`, runs on `fetch`. You get a
+`ClientRequest` (`setHeader`, `write`, `end`, `'response'`, `'error'`) and an `IncomingMessage` response
+(`statusCode`, `statusMessage`, `headers`, `'data'`/`'end'`). `STATUS_CODES` and `METHODS` are there too.
+
+Differences from Node:
+
+- Bodies are text: binary request and response bodies are read and written as UTF-8.
+- A response is sent when `end()` is called. `write()` buffers, so there is no chunked streaming yet. For
+  streaming, use xisto's `HttpResponse.stream`.
+- One server per program.
+- `IncomingMessage` is an `EventEmitter`, not a `stream.Readable` yet: no `pipe()`, no `for await`.
+- The server class is `HttpServer`. The name `Server` is xisto's built-in server, so `import { Server } from
+  "node:http"` does not work; `http.createServer` does.
+- `https.createServer` and `Agent` are not there yet.
+
+## net
+
+`net.createServer((socket) => ...)` and `net.createConnection(port, host, cb)` / `net.connect` give TCP servers
+and sockets:
+
+- **Socket:** `'connect'`, `'data'` (Buffers, or strings after `setEncoding`), `'end'`, `'close'` (with `hadError`)
+  and `'error'` (with Node's `code`: `ECONNREFUSED`, `ENOTFOUND`...). Methods `write(data, cb)`, `end(data)` and
+  `destroy()`. Fields `remoteAddress`/`remotePort`/`localAddress`/`localPort`, `bytesRead`/`bytesWritten`.
+- **Server:** `listen(port, host, cb)` (port 0 picks a free one), `address()`, `close(cb)` (waits for the open
+  connections), `getConnections`.
+- `isIP`, `isIPv4`, `isIPv6`.
+
+Each socket reads on a task of its own, so `'data'` arrives as the bytes do.
+
+Differences from Node:
+
+- IPv4 listeners only. No Unix domain sockets.
+- No read backpressure (`pause()`).
+- `write()` writes before it returns.
+- The socket is an `EventEmitter`, not a `stream.Duplex` (no `pipe()`).
+- The server class is `NetServer`, because `Server` is xisto's built-in.
+
+## dns
+
+`dns.lookup(name, cb)`, `dns.resolve4` / `resolve6`, and `dns.promises.lookup(name, { family })` (plus
+`lookupAll`), through the system resolver as Node's `lookup` does. A name that does not exist gives `ENOTFOUND`.
+
+Differences from Node: `resolve4`/`resolve6` also use the system resolver (Node asks a DNS server). The record
+queries (`resolveMx`, `resolveTxt`, `reverse`...) are not there yet. `promises.lookup(name, { all: true })` is
+`promises.lookupAll(name)`.
+
+## child_process
+
+| API | Notes |
+|---|---|
+| `spawn(file, args, { cwd, env, shell })` | `stdout`/`stderr` give `'data'` as the child writes (`setEncoding` for text); `stdin.write`/`end`; `kill(signal)`; `'spawn'`, `'exit'` (code, signal), `'close'`, `'error'` (`spawn x ENOENT`) |
+| `exec(command, cb)`, `execFile(file, args, cb)` | `cb(error, stdout, stderr)`; a failure is Node's `Command failed: ...` error with `code` |
+| `spawnSync(file, args, { input, cwd, encoding })` | `status`, `signal`, `stdout`, `stderr`, `error` |
+| `execFileSync`, `execSync` | the output; a failure is thrown |
+
+Differences from Node:
+
+- stdio is always three pipes: no `'inherit'`, no extra descriptors, no `fork`/IPC.
+- `stdout`/`stderr`/`stdin` are `EventEmitter`s, not streams.
+- The synchronous calls return text: Node returns a Buffer when no `encoding` is given, so pass `{ encoding:
+  "utf8" }` to have the same result on both.
+- Not on Windows yet.
 
 ## TLS
 

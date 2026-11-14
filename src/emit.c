@@ -2608,6 +2608,19 @@ static char *from_unknown(Type *t, const char *expr) {
             return xs_sprintf("((%s)%s)", ctype(b), from_unknown(nul ? ty_nullable_of(r) : r, expr));
         }
         if (in_hierarchy(b->cls)) return xs_sprintf("((%s)xs_as_isa((void *)(%s), %s, %d, \"%s\"))", ctype(b), expr, isa_fn(b->cls), nul, what);
+        if (b->cls->builtin && strcmp(b->cls->name, "Error") == 0) { /* an Error, or an object of a class that extends Error (wrapped) */
+            static bool made;
+            if (!made) {
+                made = true;
+                buf_puts(&isa_fns, "static bool xs_Error_sub_isa(void *v) { void (*f)(void *) = v ? xs_type_of(v)->free : NULL; return f && (0");
+                for (int i = 0; i < prog->nclasses; i++) {
+                    Class *k = prog->classes[i];
+                    if (k->used && !k->builtin && is_error_class(k)) buf_printf(&isa_fns, " || f == %s_free", k->cname);
+                }
+                buf_puts(&isa_fns, "); }\n");
+            }
+            return xs_sprintf("((xs_Error *)xs_as_error((void *)(%s), xs_Error_sub_isa, %d))", expr, nul);
+        }
         const char *fr = strcmp(b->cls->name, "Error") == 0 ? "xs_Error_free" : xs_sprintf("%s_free", b->cls->cname);
         if (strcmp(b->cls->cname, "xs_Uint8Array") == 0) fr = "xs_u8_free"; /* (Buffer too: the same free, another print) */
         else if (strcmp(b->cls->cname, "xs_Float64Array") == 0) fr = "xs_f64_free";
@@ -2903,6 +2916,19 @@ static void emit_expr_raw(Expr *e) {
                 int id = nro++;
                 buf_printf(out, "({ void *rv%d_ = %s; void *rr%d_ = xs_as_record(rv%d_, %d, \"%s\"); if (rr%d_ != rv%d_) { xs_retain_(rr%d_); xs_release_(rv%d_); } "
                                 "(xs_map *)rr%d_; })", id, b.data, id, id, t->kind == TY_NULLABLE, ty_name(t), id, id, id, id, id);
+                free(b.data);
+                return;
+            }
+        }
+        {
+            Type *et = e->elem_type && e->elem_type->kind == TY_NULLABLE ? e->elem_type->elem : e->elem_type;
+            if (et && et->kind == TY_OBJECT && et->cls->builtin && strcmp(et->cls->name, "Error") == 0 && is_fresh(e->lhs)) {
+                /* a fresh value as Error: the wrapper of an object of a class that extends Error takes its place (owned), as
+                   xs_as_record's copy does */
+                static int ner;
+                int id = ner++;
+                buf_printf(out, "({ void *ev%d_ = %s; void *er%d_ = %s; if (er%d_ != ev%d_) { xs_retain_(er%d_); xs_release_(ev%d_); } (xs_Error *)er%d_; })",
+                           id, b.data, id, from_unknown(e->elem_type, xs_sprintf("ev%d_", id)), id, id, id, id, id);
                 free(b.data);
                 return;
             }
