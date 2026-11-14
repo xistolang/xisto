@@ -58,6 +58,8 @@ export class IncomingMessage extends Readable {
   /** The headers as they came: name, value, name, value... */
   rawHeaders: string[] = [];
   complete: boolean = false;
+  /** for node:diagnostics_channel's subscribers (an APM agent's span for this request) */
+  _diag: any = null;
   private body: string = "";
   private fed: boolean = false;
 
@@ -317,6 +319,8 @@ export class ClientRequest extends EventEmitter {
   path: string;
   host: string;
   protocol: string;
+  /** for node:diagnostics_channel's subscribers (an APM agent's span for this request) */
+  _diag: any = null;
   private url: string;
   private headers: Map<string, string> = new Map<string, string>();
   private chunks: string[] = [];
