@@ -2894,67 +2894,6 @@ static void emit_expr_(Expr *e) {
     bracketing = saved_b;
     buf_printf(out, is_void ? "; XS_POST(%d); })" : "; XS_POST(%d); xr_; })", id);
 }
-/* ---- a selection between an Int32Array element and a sum, in 32 bits (floyd-warshall's path[i][j] = path[i][j] <
-   path[i][k] + path[k][j] ? path[i][j] : path[i][k] + path[k][j]) ----
-   X[..] = P CMP Q ? P : Q (any order of the test and the arms), P and Q int32 elements, one of them possibly the sum
-   or difference of two: the program compares and picks in 64 bits and stores ToInt32 of the pick. Here the sum is
-   made in 32 bits, wrapping, with its overflow bit: without an overflow it is the true value; with one, the true value
-   is beyond int32 on the side its first operand's sign says, and so above (or below) the other side, whatever it is.
-   The test comes out as in 64 bits, the pick is the same, and ToInt32 of the true sum is the wrapped one. The same
-   stores, with all the arithmetic in 32-bit lanes (twice as many per vector as the 64-bit sums). XISTO_NO_I32SEL
-   turns it off. */
-static bool sel_cmp(int op);
-static bool sel_eq(Expr *a, Expr *b);
-static bool i32sel_load(Expr *e) { return e && is_i32_index(e) && e->type && e->type->kind == TY_INT && bce_pure(e->rhs); }
-static bool i32sel_side(Expr *e) { /* an element, or the sum (difference) of two */
-    if (i32sel_load(e)) return true;
-    return e && e->kind == E_BINARY && (e->op == TK_PLUS || e->op == TK_MINUS) && e->type && e->type->kind == TY_INT && i32sel_load(e->lhs) && i32sel_load(e->rhs);
-}
-static bool i32sel_emit(Expr *e) {
-    Expr *r = e->rhs;
-    if (getenv("XISTO_NO_I32SEL") || xs_debug || !r || r->kind != E_COND || r->builtin.cfn || r->args.len != 2 || !r->lhs || r->lhs->kind != E_BINARY ||
-        !sel_cmp(r->lhs->op) || !r->type || r->type->kind != TY_INT) return false;
-    Expr *L = r->lhs->lhs, *R = r->lhs->rhs, *a0 = r->args.items[0], *a1 = r->args.items[1];
-    if (!i32sel_side(L) || !i32sel_side(R) || (!i32sel_load(L) && !i32sel_load(R))) return false;
-    if (!((sel_eq(a0, L) && sel_eq(a1, R)) || (sel_eq(a0, R) && sel_eq(a1, L)))) return false;
-    static int n;
-    int id = n++;
-    Expr *S = i32sel_load(L) ? (i32sel_load(R) ? NULL : R) : L; /* the sum, if any */
-    buf_printf(out, "({ int32_t *ip%d_ = ", id);
-    emit_lvalue_ptr(e->lhs);
-    buf_puts(out, "; ");
-    /* each side: its 32-bit value, and for the sum its overflow (o) and direction (h: above) */
-    for (int k = 0; k < 2; k++) {
-        Expr *x = k ? R : L;
-        if (x == S) {
-            buf_printf(out, "int32_t b%d_%d_ = (int32_t)(", id, k); emit_expr(x->lhs);
-            buf_printf(out, "), c%d_%d_ = (int32_t)(", id, k); emit_expr(x->rhs);
-            buf_printf(out, "); int32_t v%d_%d_ = (int32_t)((uint32_t)b%d_%d_ %s (uint32_t)c%d_%d_); ", id, k, id, k, x->op == TK_PLUS ? "+" : "-", id, k);
-            if (x->op == TK_PLUS) buf_printf(out, "int o%d_%d_ = ((b%d_%d_ ^ v%d_%d_) & (c%d_%d_ ^ v%d_%d_)) < 0; ", id, k, id, k, id, k, id, k, id, k);
-            else buf_printf(out, "int o%d_%d_ = ((b%d_%d_ ^ c%d_%d_) & (b%d_%d_ ^ v%d_%d_)) < 0; ", id, k, id, k, id, k, id, k, id, k);
-            buf_printf(out, "int h%d_%d_ = b%d_%d_ >= 0; ", id, k, id, k);
-        } else {
-            buf_printf(out, "int32_t v%d_%d_ = (int32_t)(", id, k); emit_expr(x); buf_puts(out, "); ");
-        }
-    }
-    const char *op = binop(r->lhs->op);
-    int sk = S == L ? 0 : S == R ? 1 : -1;
-    /* the test: with the sum out of range, decided by its side */
-    if (sk < 0) buf_printf(out, "int t%d_ = v%d_0_ %s v%d_1_; ", id, id, op, id);
-    else {
-        int lt = r->lhs->op == TK_LT || r->lhs->op == TK_LE;
-        /* sum on the right above: L < R true; on the left above: L < R false */
-        const char *above = (sk == 1) == (bool)lt ? "1" : "0", *below = (sk == 1) == (bool)lt ? "0" : "1";
-        buf_printf(out, "int t%d_ = o%d_%d_ ? (h%d_%d_ ? %s : %s) : (v%d_0_ %s v%d_1_); ", id, id, sk, id, sk, above, below, id, op, id);
-    }
-    int first = sel_eq(a0, L) ? 0 : 1; /* the side the true arm picks */
-    buf_printf(out, "int32_t r%d_ = t%d_ ? v%d_%d_ : v%d_%d_; *ip%d_ = r%d_; ", id, id, id, first, id, 1 - first, id, id);
-    /* the expression's value: the pick, the sum as the true int */
-    if (sk < 0) buf_printf(out, "(int64_t)r%d_; })", id);
-    else buf_printf(out, "(t%d_ ? %d : %d) == %d ? (int64_t)b%d_%d_ %s (int64_t)c%d_%d_ : (int64_t)r%d_; })", id, first, 1 - first, sk, id, sk,
-                    S->op == TK_PLUS ? "+" : "-", id, sk, id);
-    return true;
-}
 static void emit_expr_raw(Expr *e) {
     switch (e->kind) {
     case E_NUMBER:
@@ -3602,7 +3541,6 @@ static void emit_expr_raw(Expr *e) {
                     buf_printf(out, " = fn%d_)", bce_fw[k].id);
                     return;
                 }
-        if (is_i32_index(e->lhs) && e->op == TK_ASSIGN && i32sel_emit(e)) return;
         if (bce_promo_w64 && bce_promo_t && e->op == TK_ASSIGN && bce_fw_is(e->lhs, bce_promo_t)) { /* (bce_sel_plan: no ToInt32 on the way) */
             buf_printf(out, "(pr%d_ = (int64_t)(", bce_promo_id);
             emit_expr(e->rhs);
@@ -9724,10 +9662,11 @@ static bool lj_emit(Stmt *s) {
    same order, so the same bits, and the R division chains are independent instead of one. The guard, once per entry:
    the rows L - 1 .. H + 1 within X, each long enough for H2 + 1, L2 - 1 >= 0, and X's rows apart from each other
    (xs_blocks_apart_: a row twice would change which values are old). The rows left (fewer than R), and the loop when
-   the guard fails, as written. XISTO_NO_SKEW turns it off; XISTO_SKEW_R sets R (xs_skew_r: main.c gives 16 for code
-   built for the ARM machine it runs on, 8 elsewhere; seidel-2d LARGE on the M4, kernel: 10,8 s as written, R = 4 4,3,
-   8 3,3, 12 2,5, 16 2,08; x86 has half the integer registers for the rows). */
+   the guard fails, as written. XISTO_NO_SKEW turns it off; XISTO_SKEW_R sets R (xs_skew_r: main.c gives 16 for ARM, 12
+   for x86, 8 elsewhere; seidel-2d LARGE on the M4, kernel: 10,8 s as written, R = 4 4,3, 8 3,3, 12 2,5, 16 2,08; on the
+   Xeon E5-2686 v4, process: 8 4,90, 12 4,87, 16 4,99). */
 int xs_skew_r = 8;
+bool xs_rsten = true; /* rs_emit_loop on (main.c: off for x86) */
 static const char *sk_i, *sk_j, *sk_x;
 static bool sk_carried;
 static int sk_id;
@@ -9854,7 +9793,8 @@ static bool sk_emit_loop(Stmt *s) {
    and the rows apart (xs_blocks_apart_: W's rows marked), and the innermost loop runs on row pointers held in locals,
    told to the C compiler that its iterations do not depend on each other (clang loop vectorize(assume_safety)): no
    test per row. The same operations in the same order per element, so the same bits. When the guard fails, the loop
-   as written. XISTO_NO_RSTEN turns it off. */
+   as written. XISTO_NO_RSTEN turns it off; it is off for x86 (xs_rsten: on the Broadwell fdtd-2d was 10% slower with
+   it, jacobi-2d and heat-3d equal), XISTO_RSTEN=1 turns it on there. */
 typedef struct { const char *x; Type *t; } RsArr;
 typedef struct { int arr; int K[3]; } RsRow;
 static RsArr rs_arr[6];
@@ -9946,6 +9886,7 @@ static bool rs_le[3];
 static int rs_op;
 static bool rs_match(Stmt *s) {
     if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_RSTEN") || bce_promo_t || bce_fw_loop) return false;
+    if (!xs_rsten && !(getenv("XISTO_RSTEN") && strcmp(getenv("XISTO_RSTEN"), "1") == 0)) return false;
     Stmt **lp = rs_lp;
     Expr **lo = rs_lo, **hi = rs_hi;
     bool *le = rs_le;
