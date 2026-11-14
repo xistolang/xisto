@@ -2609,9 +2609,9 @@ static char *from_unknown(Type *t, const char *expr) {
         }
         if (in_hierarchy(b->cls)) return xs_sprintf("((%s)xs_as_isa((void *)(%s), %s, %d, \"%s\"))", ctype(b), expr, isa_fn(b->cls), nul, what);
         if (b->cls->builtin && strcmp(b->cls->name, "Error") == 0) { /* an Error, or an object of a class that extends Error (wrapped) */
-            static bool made;
-            if (!made) {
-                made = true;
+            static Program *made_for; /* (once per program: a compiler process can build several, xisto test) */
+            if (made_for != prog) {
+                made_for = prog;
                 buf_puts(&isa_fns, "static bool xs_Error_sub_isa(void *v) { void (*f)(void *) = v ? xs_type_of(v)->free : NULL; return f && (0");
                 for (int i = 0; i < prog->nclasses; i++) {
                     Class *k = prog->classes[i];

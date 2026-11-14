@@ -5398,11 +5398,16 @@ static bool rest_any_adapter(Expr *a, Type *ptype) {
     Type *el = pt->params[0]->kind == TY_ARRAY ? pt->params[0]->elem : NULL;
     if (!el || el->kind != TY_UNKNOWN || ty_equal(at, pt)) return false;
     if (pt->ret && pt->ret->kind != TY_VOID && pt->ret->kind != TY_UNKNOWN) return false;
-    Expr *ref = NULL;
-    if ((a->kind == E_IDENT || a->kind == E_FUNC_REF) && a->str) ref = mk_ident(a->pos, a->str);
-    else ref = pure_copy(a);
-    if (!ref) return false;
+    /* ((__raf: F) => (...__ra: any[]) => __raf(...))(fn): the function is read once, where the listener is given, and
+       the adapter keeps that value (a capture by value): this.onData, obj.h, a variable reassigned later, all compare
+       by the function they were (Func.origin is the capture) */
     static int nra;
+    const char *fname = xs_sprintf("__raf%d", nra);
+    Expr *ref = mk_ident(a->pos, fname);
+    Expr *orig = xs_alloc(sizeof *orig);
+    *orig = *a;
+    orig->prechecked = true;
+    Type *orig_t = a->type;
     const char *an = xs_sprintf("__ra%d", nra++);
     Func *af = xs_alloc(sizeof *af); af->pos = a->pos; af->name = "arrow";
     af->ret = pt->ret ? pt->ret : ty_void;
@@ -5435,10 +5440,26 @@ static bool rest_any_adapter(Expr *a, Type *ptype) {
         stmt_list_push(&b->stmts, rn);
     }
     af->body = b;
-    af->origin = call; /* (checked with the body: emit reads the function it calls, a capture, a global or a top-level function) */
+    af->origin = call; /* (checked with the body: emit reads the function it calls, the capture __raf) */
     Arrow *ar = xs_alloc(sizeof *ar); ar->pos = a->pos; ar->fn = af; ar->expr_body = af->ret->kind != TY_VOID;
+    Expr *inner = xs_alloc(sizeof *inner);
+    inner->kind = E_ARROW; inner->pos = ar->pos; inner->field = -1; inner->arrow = ar;
+    /* the outer arrow, called at once with the function value */
+    Func *of = xs_alloc(sizeof *of); of->pos = a->pos; of->name = "arrow";
+    of->ret = ptype;
+    of->params = xs_alloc(sizeof(Param));
+    of->nparams = 1;
+    of->params[0].name = (char *)fname;
+    of->params[0].type = orig_t;
+    Stmt *orr = xs_alloc(sizeof *orr); orr->pos = a->pos; orr->kind = S_RETURN; orr->expr = inner;
+    Stmt *ob = xs_alloc(sizeof *ob); ob->kind = S_BLOCK; ob->pos = a->pos; stmt_list_push(&ob->stmts, orr);
+    of->body = ob;
+    Arrow *oar = xs_alloc(sizeof *oar); oar->pos = a->pos; oar->fn = of; oar->expr_body = true;
+    Expr *outer = xs_alloc(sizeof *outer);
+    outer->kind = E_ARROW; outer->pos = a->pos; outer->field = -1; outer->arrow = oar;
     memset(a, 0, sizeof *a);
-    a->kind = E_ARROW; a->pos = ar->pos; a->field = -1; a->arrow = ar;
+    a->kind = E_CALL; a->pos = outer->pos; a->field = -1; a->lhs = outer;
+    expr_list_push(&a->args, orig);
     check_expr(a, ptype);
     return true;
 }

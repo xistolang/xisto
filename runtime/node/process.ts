@@ -96,9 +96,19 @@ function isSignal(name: string): boolean {
   return name.startsWith("SIG") && signalNumber(name) > 0;
 }
 
+const watched: Set<string> = new Set<string>(); // the signals process.on watches now
+
 function onSignal(sig: int): void {
   const t = signalTable();
-  if (sig > 0 && sig < t.length) XistoProcess.emitter.emit(t[sig], t[sig], sig);
+  if (sig <= 0 || sig >= t.length) return;
+  XistoProcess.emitter.emit(t[sig], t[sig], sig);
+  unwatchIfUnused(t[sig]); // (a once listener that ran was the last: the default action is back, as in Node)
+}
+function unwatchIfUnused(event: string): void {
+  if (watched.has(event) && XistoProcess.emitter.listenerCount(event) === 0) {
+    watched.delete(event);
+    process_signal_unwatch(signalNumber(event));
+  }
 }
 function onExit(code: int, before: boolean): void {
   XistoProcess.emitter.emit(before ? "beforeExit" : "exit", code);
@@ -236,12 +246,13 @@ export class XistoProcess {
     if ((event === "exit" || event === "beforeExit") && !exitHooked) {
       exitHooked = true;
       process_on_exit(onExit);
-    } else if (isSignal(event)) {
+    } else if (isSignal(event) && !watched.has(event)) {
+      watched.add(event);
       process_signal_watch(signalNumber(event), onSignal);
     }
   }
   private static unhook(event: string): void {
-    if (isSignal(event) && XistoProcess.emitter.listenerCount(event) === 0) process_signal_unwatch(signalNumber(event));
+    unwatchIfUnused(event);
   }
 
   static on(event: string, listener: Listener): EventEmitter {
@@ -270,6 +281,7 @@ export class XistoProcess {
   static removeAllListeners(event: string | null = null): EventEmitter {
     XistoProcess.emitter.removeAllListeners(event);
     if (event !== null) XistoProcess.unhook(event);
+    else for (const s of Array.from(watched)) unwatchIfUnused(s);
     return XistoProcess.emitter;
   }
   static emit(event: string, ...args: any[]): boolean {

@@ -595,6 +595,7 @@ typedef struct __attribute__((aligned(64))) xs_type {
        (...args: any[]) => void goes) returns the function it wraps, so === sees the same function (off(handler)) */
     void *(*origin)(void *);
 } xs_type;
+_Static_assert(sizeof(xs_type) == 64, "xs_type is one cache line: a field more must replace one");
 /* hdr.cls: the size class in the low bits, then the flags */
 #define XS_CLS_MASK 31    /* size class of the block (8-byte steps), 0 = not pooled */
 #define XS_STACK (1 << 5) /* lives in its creator's stack frame (stack allocation, src/stackalloc.c) */
@@ -4474,10 +4475,20 @@ XS_NOINLINE void xs_print_quoted_part(const char *d, int64_t n) {
     }
     fputc(q, o);
 }
+/* the length JavaScript gives a string: UTF-16 units (a character past U+FFFF counts 2) */
+static size_t xs_u16_units(const char *d, size_t n) {
+    size_t u = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)d[i];
+        if ((c & 0xC0) != 0x80) u += c >= 0xF0 ? 2 : 1;
+    }
+    return u;
+}
 static void xs_print_str_quoted(xs_str *s) { /* as Node prints strings inside objects */
-    /* a long string with line breaks: one quoted piece per line, joined by " +" (formatPrimitive) */
+    /* a long string with line breaks: one quoted piece per line, joined by " +" (formatPrimitive; the lengths are
+       JavaScript's, in UTF-16 units) */
     size_t cps;
-    if (xs_insp_compact >= 0 && s->len > 16 && memchr(s->data, '\n', (size_t)s->len) && (cps = xs_cp_len(s->data, (size_t)s->len)) > 16 &&
+    if (xs_insp_compact >= 0 && s->len > 16 && memchr(s->data, '\n', (size_t)s->len) && (cps = xs_u16_units(s->data, (size_t)s->len)) > 16 &&
         (int64_t)cps > xs_insp_brk - xs_insp_level - 4) {
         const char *p = s->data, *end = s->data + s->len;
         while (p < end) {
@@ -9098,6 +9109,12 @@ XS_NOINLINE int64_t xs_buf_write_int(xs_Uint8Array *b, double v, int64_t off, in
     }
     xs_buf_check(b, off, n);
     int64_t iv = v != v ? 0 : (int64_t)v; /* (NaN writes 0, a fraction is cut, as a typed array stores them) */
+    if (n > 4 && v == v) { /* 5 and 6 bytes, as Node's writeU_Int40/48: the low 32 bits of the value cut, the high ones
+                              Math.floor(value * 2 ** -32) (-0.5 writes 00 00 00 00 ff ff) */
+        uint32_t low = (uint32_t)(int64_t)trunc(v);
+        int64_t high = (int64_t)floor(v * ldexp(1, -32));
+        iv = (int64_t)(((uint64_t)high << 32) | low);
+    }
     xs_buf_store(b->data + off, n, flags & XS_BUF_BE, (uint64_t)iv);
     return off + n;
 }
@@ -9389,7 +9406,9 @@ XS_NOINLINE int64_t xs_buf_index_bytes(xs_Uint8Array *b, xs_Uint8Array *v, int64
     int k = xs_buf_enc(enc);
     uint8_t *p = malloc((size_t)v->f_length + 1);
     memcpy(p, v->data, (size_t)v->f_length);
-    int64_t r = xs_buf_search(b, p, v->f_length, off, fwd, k == XS_ENC_UCS2 ? 2 : 1);
+    /* (ucs2: a needle or a buffer under 2 bytes is never found, as Node's IndexOfBuffer; the empty needle is) */
+    int64_t r = k == XS_ENC_UCS2 && v->f_length > 0 && (v->f_length < 2 || b->f_length < 2) ? -1
+                                                                                         : xs_buf_search(b, p, v->f_length, off, fwd, k == XS_ENC_UCS2 ? 2 : 1);
     free(p);
     return r;
 }

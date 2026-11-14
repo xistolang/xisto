@@ -965,7 +965,10 @@ XS_NOINLINE void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_m
     for (;;) {
         xs_run_ready(xs_task_after);
         xs_esm_first = false;
-        if (xs_imm_phase()) continue;
+        /* the immediates queued so far go to the ready list for the next turn: this one still goes through the timers
+           and the events (kevent does not wait while there are ready tasks), so an immediate that queues another
+           cannot hold them back (Node's phases: timers, poll, check) */
+        xs_imm_phase();
         xs_coro_flush_dead();
         xs_unh_check();
         if (stop && stop(arg)) return;
@@ -1038,8 +1041,8 @@ static inline xs_val xs_par_take(xs_tgroup *g, int i) { g->t[i].taken = true; re
 /* the program ends when the background tasks (race losers) do, as in Node */
 /* set only by programs that use them (the runtime's sections are compiled in only when used): node:http's server,
    which runs the loop until it is closed, and the timers that were unref'd, let go at the end */
-static void (*xs_http_pending)(void);
-static void (*xs_unref_drop)(void);
+static XS_TLS void (*xs_http_pending)(void); /* (per thread: a worker's drain must not run the main thread's server) */
+static XS_TLS void (*xs_unref_drop)(void);
 XS_NOINLINE void xs_tasks_drain(void) {
     if (xs_http_pending && !xs_cur_coro) { void (*h)(void) = xs_http_pending; xs_http_pending = NULL; h(); }
     if (xs_tasks_live > 0 && !xs_cur_coro) xs_loop_run(NULL, NULL, -1);
@@ -2981,8 +2984,8 @@ XS_NOINLINE void *xs_server_worker(void *arg) {
             fflush(stdout);
             _exit(0);
         }
-        do xs_run_ready(xs_coro_after); /* coroutines woken by a channel, microtasks, nextTick callbacks */
-        while (xs_imm_phase());           /* (and setImmediate's) */
+        xs_run_ready(xs_coro_after); /* coroutines woken by a channel, microtasks, nextTick callbacks */
+        xs_imm_phase();              /* (setImmediate's: run next turn, after this turn's timers and events) */
         xs_coro_flush_dead();
         xs_clients_flush_dead();
         struct timespec zero = {0, 0}, tick = {0, 200000000}, tt;
@@ -3543,6 +3546,7 @@ XS_NOINLINE int64_t xs_process_kill(int64_t pid, int64_t sig) { /* 0, or the err
 #if defined(_WIN32)
     return ESRCH;
 #else
+    if (pid == (int64_t)getpid()) { xs_out_drain(); fflush(stdout); } /* (a signal to itself may end it: what it wrote first is out) */
     return kill((pid_t)pid, (int)sig) == 0 ? 0 : errno;
 #endif
 }
@@ -3599,6 +3603,7 @@ XS_NOINLINE void xs_process_signal_watch(int64_t sig, xs_closure *cb) {
     xs_psig_mask |= 1ull << (sig & 63);
     struct sigaction sa = {0};
     sa.sa_handler = xs_psig_on;
+    sa.sa_flags = SA_RESTART; /* (as libuv: the runtime's blocking reads and writes go on after the signal) */
     sigaction((int)sig, &sa, NULL);
 }
 XS_NOINLINE void xs_process_signal_unwatch(int64_t sig) {
@@ -3681,8 +3686,8 @@ typedef struct xs_ttask { xs_closure *cb; int64_t ms; bool repeat, cancelled; in
                           bool unref;      /* timer.unref(): it does not keep the program alive (not counted in xs_tasks_live) */
                           bool immediate;  /* setImmediate: no sleep; started from the check queue, after the microtasks */
                           int64_t due;     /* timer.refresh(): the start again counts from now */ } xs_ttask;
-static xs_ttask *xs_ttasks;
-static int64_t xs_tnext = 1;
+static XS_TLS xs_ttask *xs_ttasks; /* (per thread: each event loop has its own timers) */
+static XS_TLS int64_t xs_tnext = 1;
 XS_NOINLINE void xs_ttask_run(void *p) {
     xs_ttask *t = p;
     for (;;) {
@@ -4064,8 +4069,13 @@ extern char **environ;
 /* [pid, stdin, stdout, stderr], or [-errno] */
 XS_NOINLINE xs_arr_int *xs_cp_spawn(xs_str *file, xs_arr_ref *args, xs_str *cwd, xs_arr_ref *env, bool use_env) {
     xs_arr_int *out = xs_arr_int_new(0, 0);
-    int in[2], o[2], e[2];
-    if (pipe(in) != 0 || pipe(o) != 0 || pipe(e) != 0) { xs_arr_int_push(out, -EMFILE); return out; }
+    int in[2] = {-1, -1}, o[2] = {-1, -1}, e[2] = {-1, -1};
+    if (pipe(in) != 0 || pipe(o) != 0 || pipe(e) != 0) { /* (the pipes made before the one that failed are closed) */
+        int all[6] = {in[0], in[1], o[0], o[1], e[0], e[1]};
+        for (int i = 0; i < 6; i++) if (all[i] >= 0) close(all[i]);
+        xs_arr_int_push(out, -EMFILE);
+        return out;
+    }
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_adddup2(&fa, in[0], 0);
@@ -4155,15 +4165,22 @@ XS_NOINLINE xs_arr_int *xs_cp_run_sync(xs_str *file, xs_arr_ref *args, xs_str *c
     int64_t pid = sp->data[0];
     int fin = (int)sp->data[1], fo = (int)sp->data[2], fe = (int)sp->data[3];
     xs_release(sp);
-    fcntl(fin, F_SETFL, 0);
-    if (input->len) { ssize_t w = write(fin, input->data, (size_t)input->len); (void)w; }
-    close(fin);
+    /* the input is written in the same poll loop as the outputs are read (a child that writes before it has read all
+       its input would otherwise block on a full pipe while we block writing to it) */
+    signal(SIGPIPE, SIG_IGN);
+    size_t in_off = 0;
+    if (!input->len) { close(fin); fin = -1; }
     xs_sb so = {0}, se = {0};
-    struct pollfd p[2] = {{fo, POLLIN, 0}, {fe, POLLIN, 0}};
+    struct pollfd p[3] = {{fo, POLLIN, 0}, {fe, POLLIN, 0}, {fin, POLLOUT, 0}};
     int open = 2;
     char *b = malloc(65536);
-    while (open > 0) {
-        if (poll(p, 2, -1) < 0) { if (errno == EINTR) continue; break; }
+    while (open > 0 || p[2].fd >= 0) {
+        if (poll(p, 3, -1) < 0) { if (errno == EINTR) continue; break; }
+        if (p[2].fd >= 0 && (p[2].revents & (POLLOUT | POLLERR | POLLHUP))) {
+            ssize_t w = write(p[2].fd, input->data + in_off, (size_t)input->len - in_off);
+            if (w > 0) in_off += (size_t)w;
+            if ((w < 0 && errno != EAGAIN && errno != EINTR) || in_off >= (size_t)input->len) { close(p[2].fd); p[2].fd = -1; }
+        }
         for (int i = 0; i < 2; i++) {
             if (p[i].fd < 0 || !(p[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
             ssize_t r = read(p[i].fd, b, 65536);
