@@ -9940,7 +9940,8 @@ static void rs_emit(Expr *e) {
     }
 }
 static Stmt *rs_lp[3];
-static Expr *rs_lo[3], *rs_hi[3], *rs_x;
+static Expr *rs_lo[3], *rs_hi[3];
+static Stmt *rs_x;
 static bool rs_le[3];
 static int rs_op;
 static bool rs_match(Stmt *s) {
