@@ -120,6 +120,12 @@ static void xs_tas_load(void) {
     if (extra) xs_tas_add_file(extra);
 }
 
+/* node:tls / node:https option ca: these CA certificates (a PEM file) trusted too, for the connections made after */
+XS_NOINLINE void xs_tls_add_ca_file(const char *path) {
+    pthread_once(&xs_tas_once, xs_tas_load);
+    xs_tas_add_file(path);
+}
+
 /* ---- one TLS connection, either side ---- */
 /* The record buffer is allocated apart: the client (fetch) gets the full-duplex size, the server the
    half-duplex one (16.7 KB instead of 33 KB per connection). Half-duplex fits the server: it never reads
@@ -196,6 +202,8 @@ static bool xs_tls_pump(xs_tls *t, int fd, bool (*done)(xs_tls *), int64_t timeo
 static bool xs_tls_can_send(xs_tls *t) { return (br_ssl_engine_current_state(t->eng) & BR_SSL_SENDAPP) != 0; }
 static bool xs_tls_can_recv(xs_tls *t) { return (br_ssl_engine_current_state(t->eng) & BR_SSL_RECVAPP) != 0; }
 static bool xs_tls_sent(xs_tls *t) { return (br_ssl_engine_current_state(t->eng) & BR_SSL_SENDREC) == 0; }
+/* node:tls: the handshake now (tls.connect's 'secureConnect'): done once the engine can take application data */
+XS_NOINLINE bool xs_tls_handshake(xs_tls *t, int fd) { return xs_tls_pump(t, fd, xs_tls_can_send, -1, 0); }
 
 /* blocking-style API for the client (fetch): yields inside a coroutine */
 static bool xs_tls_write_all(xs_tls *t, int fd, const char *p, size_t n, int64_t timeout_ms, uint64_t deadline) {

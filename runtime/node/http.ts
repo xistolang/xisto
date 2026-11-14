@@ -279,6 +279,8 @@ export interface RequestOptions {
   method?: string;
   headers?: Record<string, string>;
   timeout?: int;
+  /** (node:https) a CA certificate to trust, PEM */
+  ca?: string | Uint8Array;
 }
 
 export type ResponseListener = (res: IncomingMessage) => void;

@@ -251,7 +251,7 @@ Differences from Node:
 - One server per program.
 - The server class is `HttpServer`. The name `Server` is xisto's built-in server, so `import { Server } from
   "node:http"` does not work; `http.createServer` does.
-- `https.createServer` and `Agent` are not there yet.
+- `Agent` is not there yet.
 
 ## net
 
@@ -426,6 +426,31 @@ back the bytes of an incomplete group of three.
 Strings inside objects are quoted as Node quotes them: `'...'`, or `"..."` when the string has a `'`, or `` `...` ``
 when it has both; `\`, tabs, `\r` and other control characters are escaped (`\x1B`). A long string with line
 breaks inside an object is printed one line per piece, joined by `+`, as Node does.
+
+## https and tls
+
+`https.createServer({ key, cert }, listener)` is `http.createServer` over TLS. `key` and `cert` are PEM text or
+Buffers, as in Node. `https.request`/`get` make https requests. The `ca` option trusts one more CA certificate,
+on top of the system's and `NODE_EXTRA_CA_CERTS`.
+
+`tls.connect({ host, port, servername, ca }, cb)` gives a `TLSSocket`:
+
+- `'secureConnect'`, `authorized`, `'data'` (with `setEncoding`), `'end'`, `'close'` and `'error'`;
+- `write`, `end` and `destroy`.
+
+The certificate is always verified, with AWS-LC (the default) and with BearSSL (`--tls=bearssl`). Importing
+`node:https` or `node:tls` links TLS into the program; `node:http` alone does not.
+
+Differences from Node:
+
+- `rejectUnauthorized: false` is refused with an error, instead of making an unverified connection. Pass the
+  server's CA as `ca`.
+- `ca` adds to the CAs the whole program trusts, for the connections made after it. In Node it applies to that
+  connection only.
+- The handshake's error messages are the TLS library's, not OpenSSL's codes (`DEPTH_ZERO_SELF_SIGNED_CERT`...).
+- Not available yet: `tls.createServer` (`node:https` serves TLS), client certificates, `passphrase`, SNI
+  callbacks.
+- `TLSSocket` is an `EventEmitter`, not a `stream.Duplex`.
 
 ## TLS
 

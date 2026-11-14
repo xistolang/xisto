@@ -5,6 +5,7 @@
 import { HttpServer, RequestListener, ClientRequest, RequestOptions, ResponseListener, _setup, _toUrl, _method } from "xisto:http";
 
 declare function https_bind(s: Server, port: int, cert: string, key: string): int;
+declare function tls_add_ca(pem: string): void;
 
 /** The options of createServer(): the certificate and its private key, PEM. */
 export interface ServerOptions {
@@ -46,8 +47,13 @@ export class HttpsClientRequest extends ClientRequest {
   }
 }
 
-/** Makes an https request: call end() (with a body) to send it. */
+/** Makes an https request: call end() (with a body) to send it. With options.ca, that CA is trusted too (for the
+ * whole program, from now on). */
 export function request(target: string | RequestOptions, callback: ResponseListener | null = null): ClientRequest {
+  if (typeof target !== "string") {
+    const o = target as RequestOptions;
+    if (o.ca !== null) tls_add_ca(pem(o.ca as string | Uint8Array));
+  }
   return _setup(new HttpsClientRequest(_toUrl(target, "https:"), _method(target)), target, callback);
 }
 

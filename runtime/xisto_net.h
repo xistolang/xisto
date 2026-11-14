@@ -1582,6 +1582,10 @@ typedef struct xs_tls xs_tls;
 typedef struct xs_tls_cred xs_tls_cred_t;
 #ifdef XS_WITH_TLS
 static xs_tls *xs_tls_client_new(const char *host);
+XS_NOINLINE bool xs_tls_handshake(xs_tls *t, int fd);
+XS_NOINLINE void xs_tls_add_ca_file(const char *path);
+static void xs_tls_free(xs_tls *t);
+static const char *xs_tls_err(xs_tls *t);
 static const char *xs_tls_err(xs_tls *t);
 static bool xs_tls_write_all(xs_tls *t, int fd, const char *p, size_t n, int64_t timeout_ms, uint64_t deadline);
 static ssize_t xs_tls_read_some(xs_tls *t, int fd, char *out, size_t cap, int64_t timeout_ms, uint64_t deadline);
@@ -4172,5 +4176,59 @@ XS_NOINLINE xs_arr_int *xs_cp_run_sync(xs_str *file, xs_arr_ref *args, xs_str *c
     xs_arr_int_push(res, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
     xs_arr_int_push(res, WIFSIGNALED(st) ? WTERMSIG(st) : 0);
     return res;
+}
+#endif
+
+#ifdef XS_WITH_TLS
+/* ---- node:tls (runtime/node/tls.ts): client sockets over the runtime's TLS (AWS-LC or BearSSL); a socket is a
+   slot number; reads and writes park the task on the socket as node:net's do ---- */
+typedef struct { xs_tls *t; int fd; bool used; } xs_tlsc;
+static xs_tlsc *xs_tlscs;
+static int64_t xs_ntlscs;
+XS_NOINLINE void xs_tls_add_ca(xs_str *pem) { /* tls.connect / https.request option ca */
+    char *path = xs_pem_tmp(pem);
+    xs_tls_add_ca_file(path);
+    unlink(path);
+    free(path);
+}
+/* the slot of a connected and verified socket, or a node:net error code (-1..-8), or -9: the TLS handshake failed
+   (xs_tlsc_last names why) */
+static XS_TLS char xs_tlsc_why[128];
+XS_NOINLINE int64_t xs_tlsc_connect(xs_str *host, int64_t port, xs_str *servername) {
+    int64_t fd = xs_net_connect(host, port);
+    if (fd < 0) return fd;
+    xs_tls *t = xs_tls_client_new(servername->len ? servername->data : host->data);
+    if (!xs_tls_handshake(t, (int)fd)) {
+        snprintf(xs_tlsc_why, sizeof xs_tlsc_why, "%s", xs_tls_err(t));
+        xs_tls_free(t);
+        close((int)fd);
+        return -9;
+    }
+    int64_t h = 0;
+    while (h < xs_ntlscs && xs_tlscs[h].used) h++;
+    if (h == xs_ntlscs) { xs_tlscs = realloc(xs_tlscs, sizeof *xs_tlscs * (size_t)(xs_ntlscs + 1)); xs_ntlscs++; }
+    xs_tlscs[h] = (xs_tlsc){t, (int)fd, true};
+    return h;
+}
+XS_NOINLINE xs_str *xs_tlsc_last(void) { return xs_str_new(xs_tlsc_why, strlen(xs_tlsc_why)); }
+XS_NOINLINE xs_Uint8Array *xs_tlsc_read(int64_t h) { /* the next bytes; empty at the end (or after an error) */
+    if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return xs_u8_new(0);
+    if (!xs_net_rbuf) xs_net_rbuf = malloc(65536);
+    ssize_t r = xs_tls_read_some(xs_tlscs[h].t, xs_tlscs[h].fd, (char *)xs_net_rbuf, 65536, -1, 0);
+    if (r <= 0) return xs_u8_new(0);
+    xs_Uint8Array *u = xs_u8_new(r);
+    memcpy(u->data, xs_net_rbuf, (size_t)r);
+    return u;
+}
+XS_NOINLINE int64_t xs_tlsc_write(int64_t h, xs_Uint8Array *bytes) {
+    if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return -7;
+    return xs_tls_write_all(xs_tlscs[h].t, xs_tlscs[h].fd, (const char *)bytes->data, (size_t)bytes->f_length, -1, 0) ? 0 : -7;
+}
+XS_NOINLINE void xs_tlsc_shutdown(int64_t h) { if (h >= 0 && h < xs_ntlscs && xs_tlscs[h].used) shutdown(xs_tlscs[h].fd, SHUT_RDWR); }
+XS_NOINLINE void xs_tlsc_close(int64_t h) {
+    if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return;
+    xs_tls_free(xs_tlscs[h].t);
+    close(xs_tlscs[h].fd);
+    xs_tlscs[h].used = false;
 }
 #endif

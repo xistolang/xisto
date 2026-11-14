@@ -103,7 +103,7 @@ FORCE:
 build/checker.o: runtime/xisto_regex.h runtime/xisto_regex_bt.h
 
 # Node's modules written in xisto (runtime/node/NAME.ts), embedded in the compiler as xs_node_NAME_ts
-NODE_TS := async_hooks crypto stream stream_promises stream_web path fs_promises url events process http https net dns child_process buffer util querystring string_decoder zlib
+NODE_TS := async_hooks crypto stream stream_promises stream_web path fs_promises url events process http https net dns child_process tls buffer util querystring string_decoder zlib
 
 build/rt_embed.c: tools/rtsplit.py $(NODE_TS:%=runtime/node/%.ts) packages/xisto/io.ts packages/xisto/bytes.ts packages/xisto/parallel.ts packages/xisto/collections.ts packages/xisto/fractal.ts packages/xisto/random.ts runtime/xisto_regex.h runtime/xisto_regex_bt.h runtime/xisto_rt.h runtime/xisto_net.h runtime/xisto_sqlite.h runtime/xisto_tls.h runtime/xisto_tls_awslc.h runtime/xisto_crypto.h runtime/xisto_zlib.h runtime/xisto_dbg_json.h runtime/xisto_dbg.h | build
 	{ echo 'const unsigned char xs_runtime_h[] = {'; xxd -i < runtime/xisto_rt.h; echo ', 0x00 };'; \
