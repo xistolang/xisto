@@ -51,11 +51,20 @@ function seeOther(req: HttpRequest): HttpResponse {
   return HttpResponse.status(303, "").header("Location", "http://127.0.0.1:8080/redir");
 }
 
+// pipelined requests must each see their own headers, query and route parameters, also across an await while more
+// requests (one of them large) arrive on the same connection
+async function who(req: HttpRequest): Promise<HttpResponse> {
+  const ms: int = Math.trunc(Number(req.query("ms") ?? "0"));
+  if (ms > 0) await setTimeout(ms);
+  return HttpResponse.text(`who=${req.param("name")} id=${req.header("X-Id") ?? "none"} n=${req.query("n") ?? "none"};`);
+}
+
 const app: Server = new Server();
 app.get("/wait", wait);
 app.post("/publish", publish);
 app.post("/echo", echo);
 app.get("/slow", slow);
+app.get("/who/:name", who);
 app.get("/ctx", ctx);
 app.get("/abortfetch", abortFetch);
 app.get("/redir", redir);

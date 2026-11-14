@@ -1,0 +1,14 @@
+# 2026-11-14T22:17:24 gen=wrk levels=64,128,256,512,4096,16384 duration=15s repeat=1 xisto_workers=2 cpus=2
+# test side name req/s p50_ms p99_ms cpu_ms_per_1k_req rss_MB valid
+json-c64 ref actix 61472 0.667 7.280 30.0 159.3 ok
+json-c128 ref actix 63071 1.110 35.930 30.1 159.7 ok
+json-c256 ref actix 64280 2.190 38.000 30.1 160.4 ok
+json-c512 ref actix 63158 4.390 78.660 30.4 161.7 ok
+json-c4096 ref actix 52488 42.540 414.900 36.3 175.4 ok
+json-c16384 ref actix 42448 195.900 1700.000 24.8 232.4 ok
+plaintext-c64 ref actix 571734 1.420 0.000 3.5 349.9 ok
+plaintext-c128 ref actix 583058 2.200 0.000 3.4 350.2 ok
+plaintext-c256 ref actix 567677 4.100 0.000 3.5 350.8 ok
+plaintext-c512 ref actix 559159 8.020 27.430 3.5 352.2 ok
+plaintext-c4096 ref actix 476020 74.030 443.430 4.1 365.4 ok
+plaintext-c16384 ref actix 335359 337.840 2660.000 4.9 548.3 ok

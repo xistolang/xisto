@@ -1,0 +1,14 @@
+# 2026-11-14T21:56:04 gen=wrk levels=64,128,256,512,4096,16384 duration=15s repeat=1 xisto_workers=2 cpus=2
+# test side name req/s p50_ms p99_ms cpu_ms_per_1k_req rss_MB valid
+json-c64 xisto xisto-native 60994 0.678 9.140 27.9 7.9 ok
+json-c128 xisto xisto-native 69172 1.220 50.760 26.9 7.8 ok
+json-c256 xisto xisto-native 68361 2.390 55.710 27.7 7.8 ok
+json-c512 xisto xisto-native 68425 4.450 76.910 27.5 7.8 ok
+json-c4096 xisto xisto-native 61452 35.970 477.430 30.8 7.8 ok
+json-c16384 xisto xisto-native 51305 87.810 4970.000 16.0 9.2 ok
+plaintext-c64 xisto xisto-native 656862 1.540 0.000 3.0 43.7 ok
+plaintext-c128 xisto xisto-native 621667 2.430 0.000 3.0 43.5 ok
+plaintext-c256 xisto xisto-native 606978 3.860 0.000 3.2 43.5 ok
+plaintext-c512 xisto xisto-native 582674 8.430 0.000 3.4 43.5 ok
+plaintext-c4096 xisto xisto-native 518750 70.100 0.000 3.8 43.5 ok
+plaintext-c16384 xisto xisto-native 333771 301.940 3740.000 4.4 43.8 ok

@@ -69,6 +69,46 @@ except socket.timeout:
 print("pipelined: %d responses" % data.count(b"slept 1"))
 s.close()
 PY
+# pipelining with different requests: each handler sees its own headers, query and parameters, also when the first
+# one parks on an await and a large request (it grows the input buffer) arrives meanwhile
+python3 - <<'PY'
+import socket, time
+s = socket.create_connection(("127.0.0.1", 8080))
+r = lambda name, i, n, ms=0, pad=0: ("GET /who/%s?n=%s&ms=%d HTTP/1.1\r\nHost: x\r\nX-Id: %s\r\n%s\r\n" % (name, n, ms, i, "X-Pad: %s\r\n" % ("p" * pad) if pad else "")).encode()
+s.sendall(r("ann", "a1", "1", ms=50) + r("bob", "b2", "2") + r("cy", "c3", "3"))
+time.sleep(0.01)
+s.sendall(r("dee", "d4", "4", pad=60000))
+s.settimeout(3)
+data = b""
+try:
+    while data.count(b";") < 4:
+        chunk = s.recv(65536)
+        if not chunk: break
+        data += chunk
+except socket.timeout: pass
+got = [l.split(b";")[0].decode() for l in data.split(b"\r\n\r\n")[1:]]
+want = ["who=ann id=a1 n=1", "who=bob id=b2 n=2", "who=cy id=c3 n=3", "who=dee id=d4 n=4"]
+print("pipelined distinct requests:", "own data" if got[:4] == want else "MIXED %s" % got)
+s.close()
+PY
+# the head parser: header names in any case, Connection: close honoured, a head split across two packets
+python3 - <<'PY'
+import socket, time
+s = socket.create_connection(("127.0.0.1", 8080))
+s.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nx-TOKEN: t1\r\ncOnTeNt-LeNgTh: ")
+time.sleep(0.05)
+s.sendall(b"3\r\nCONNECTION: close\r\n\r\n123")
+s.settimeout(3)
+data = b""
+try:
+    while True:
+        chunk = s.recv(65536)
+        if not chunk: break
+        data += chunk
+except socket.timeout: pass
+body = data.split(b"\r\n\r\n", 1)[-1].decode()
+print("head parser: %s, %s" % (body, "closed" if b"Connection: close" in data else "KEPT OPEN"))
+PY
 # a client leaves while its handler is parked on a channel: the server must not spin
 python3 - "$SRV" <<'PY'
 import socket, subprocess, sys, time
