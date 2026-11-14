@@ -6915,6 +6915,8 @@ static char *for_hoisted_cond(Stmt *s) {
     nl();
     return xs_sprintf("(%s %s lim%d_)", lhs, c->op == TK_LT ? "<" : c->op == TK_LE ? "<=" : c->op == TK_GT ? ">" : ">=", id);
 }
+bool xs_sel_ic = true;
+static Stmt *for_pragma_loop; static const char *for_pragma; /* a loop pragma for this one loop (bce_sel_plan) */
 static void emit_for_(Stmt *s) {
     buf_puts(out, "{");
     indent++;
@@ -6952,6 +6954,7 @@ static void emit_for_(Stmt *s) {
             upd = xs_sprintf("(%s%s)", u.data, upd);
         }
         if (!cond_ar && !upd_ar) {
+            if (for_pragma_loop == s) buf_printf(out, "_Pragma(\"clang loop %s\") ", for_pragma);
             buf_printf(out, "for (; %s; %s) ", cond, upd);
             emit_block_kind(s->body, SC_LOOP_BODY);
         } else { /* drain what the condition and the update made, once per iteration */
@@ -10416,7 +10419,15 @@ static void emit_stmt_for_inner_(Stmt *s) { /* a for: bounds checks proved by th
                 bce_promo_t = t;
                 bce_promo_id = id;
                 bce_promo_w64 = true;
+                /* 8 chains, not the C compiler's 2: each load of the column X[k + 1][c] then steps 8 rows, a whole
+                   number of cache lines for any malloc stride (a multiple of 16 B), which the stride prefetcher follows
+                   (Graviton2 nussinov 10.4 -> 8.6 s, Rust 8.9; with 2 chains the step is 313.5 lines; only on non-Apple ARM, xs_sel_ic). The max of the
+                   chains is the same int: an exact, associative operation. XISTO_NO_SEL_IC turns it off. */
+                static int ic = -1;
+                if (ic < 0) ic = (xs_sel_ic || getenv("XISTO_SEL_IC")) && !getenv("XISTO_NO_SEL_IC"); /* (XISTO_SEL_IC: on anywhere) */
+                if (ic) { for_pragma_loop = s; for_pragma = "vectorize_width(1) interleave_count(8)"; }
                 emit_for_(s);
+                for_pragma_loop = NULL;
                 bce_promo_t = NULL;
                 bce_promo_w64 = false;
                 buf_printf(out, " if (pr%d_ == (int64_t)(int32_t)pr%d_) *sp%d_ = (int32_t)pr%d_; else ", id, id, id, id);

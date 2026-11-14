@@ -744,6 +744,7 @@ void inplace_program(Program *p); /* inplace.c: for-of over readStdinParts whose
 extern bool xs_pad4; /* columns.c: x y z fields as one column of 4 lanes (x86 with AVX2) */
 void pad4_program(Program *p); /* pad4.c */
 extern int xs_jam_uj, xs_jam_uk, xs_skew_r;
+extern bool xs_sel_ic; /* emit.c: 8 chains in a selection reduction (main.c: non-Apple ARM) */
 extern bool xs_rsten; /* emit.c: U of the jam of j and of k (main.c: by target) */
 extern bool xs_wide_f64; /* distribute.c: the target has 4-lane double vectors (AVX2): the slow consts that read no column go in a flat loop */
 void prune_program(Program *p); /* marks what main reaches; emitters skip the rest */

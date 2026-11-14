@@ -426,6 +426,7 @@ static Buf compile_to_c(const char *path) {
 #endif
     xs_skew_r = arm && apple ? 16 : arm || x86 ? 12 : 8;
     xs_rsten = !x86;
+    xs_sel_ic = arm && !apple; /* (emit.c: 8 chains in a max/min reduction; on the Graviton2 nussinov gains, on the M4 (malloc steps rows by 10240 B) 1,63 -> 2,98 s, on the Broadwell 4,04 -> 5,48) */
     if (!use_qbe) {
         xs_wide_f64 = cpu_wide_f64();
         distribute_program(p); /* (after columns: it only touches loops over columns) */
