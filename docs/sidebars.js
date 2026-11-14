@@ -46,7 +46,12 @@ const sidebars = {
           link: {type: 'doc', id: 'benchmarks/benchmarks-game/index'},
           items: ['benchmarks/benchmarks-game/vs-rust', 'benchmarks/benchmarks-game/vs-node', 'benchmarks/benchmarks-game/vs-bun'],
         },
-        'benchmarks/polybench',
+        {
+          type: 'category',
+          label: 'PolyBench',
+          link: {type: 'doc', id: 'benchmarks/polybench/index'},
+          items: ['benchmarks/polybench/vs-rust', 'benchmarks/polybench/vs-go'],
+        },
         'benchmarks/http',
         'benchmarks/energy-sqlite-streams',
       ],

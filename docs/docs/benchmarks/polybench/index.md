@@ -29,6 +29,10 @@ optimizations. The Benchmarks Game measures programs; PolyBench measures the **c
 
 ## Score
 
+One page per contestant, with kernel time, CPU and memory per kernel and the C reference beside them:
+[Xisto vs Rust](./vs-rust.md), [Xisto vs Go](./vs-go.md).
+
+
 | machine | Xisto wins | ties | losses |
 |---|---:|---:|---:|
 | Xeon (x86-64) | **21** | 8 | 1 |
@@ -131,7 +135,7 @@ The fastest of Xisto, Rust and Go in bold.
 | trisolv | 3 ms | **3 ms** | 3 ms | 7 ms | tie |
 | trmm | 3.91 s | **627 ms** | 3.94 s | 4.39 s | **win** |
 
-Raw output, the A/B against the Benchmarks Game and the interleaved re-measurements:
+The same rows with CPU and memory: [Xisto vs Rust](./vs-rust.md), [Xisto vs Go](./vs-go.md). Raw output, the A/B against the Benchmarks Game and the interleaved re-measurements:
 [bench/results/polybench-2026-11-14](https://github.com/xistolang/xisto/tree/main/bench/results/polybench-2026-11-14).
 
 ## Reproduce
