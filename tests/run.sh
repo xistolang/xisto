@@ -168,7 +168,7 @@ if grep -q "200 POST abc123 7 xisto" "$OUT/http.txt" && grep -q "bytes body: 200
    && grep -q "not aborted: 200 slept 10 false" "$OUT/http.txt" && grep -q "200 slept 20" "$OUT/http.txt" && grep -q "redirected: 200 http://127.0.0.1:8080/slow?ms=1 7 slept 1" "$OUT/http.txt" \
    && grep -q "overlapped (20 ok)" "$OUT/http.txt" && grep -q "during SIGTERM: slept 700" "$OUT/http.txt" && grep -q "refused: True" "$OUT/http.txt" \
    && grep -q "server exit code: 0" "$OUT/http.txt" && grep -q "channel delivered: True" "$OUT/http.txt" \
-   && grep -q "pipelined: 3 responses" "$OUT/http.txt" && grep -q "async local storage per request: isolated (30 ok)" "$OUT/http.txt" && grep -q "parked client left: idle cpu" "$OUT/http.txt"; then pass=$((pass+1)); else echo "FAIL http:"; cat "$OUT/http.txt"; fail=$((fail+1)); fi
+   && grep -q "pipelined: 3 responses" "$OUT/http.txt" && grep -q "pipelined distinct requests: own data" "$OUT/http.txt" && grep -q "async local storage per request: isolated (30 ok)" "$OUT/http.txt" && grep -q "parked client left: idle cpu" "$OUT/http.txt"; then pass=$((pass+1)); else echo "FAIL http:"; cat "$OUT/http.txt"; fail=$((fail+1)); fi
 # TechEmpower phase 1: the native app passes the TFB checks for /plaintext and /json (a free port, 1 and 2 workers)
 sh tests/techempower/run.sh > "$OUT/techempower.txt" 2>&1
 if [ "$(grep -c ' PASS$' "$OUT/techempower.txt")" -eq 4 ] && ! grep -q "FAIL" "$OUT/techempower.txt"; then pass=$((pass+1)); else echo "FAIL techempower:"; cat "$OUT/techempower.txt"; fail=$((fail+1)); fi

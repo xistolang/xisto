@@ -2804,6 +2804,13 @@ XS_NOINLINE bool xs_server_process(xs_Server *s, xs_client *c) {
             continue;
         }
         xs_HttpRequest *req = xs_obj_alloc(sizeof *req, xs_HttpRequest_free, xs_HttpRequest_print);
+        /* the handler runs after the input buffer moves on (the next pipelined request, or a read that grows it while
+           the handler awaits): the query, headers and route parameters point into a private copy of the head */
+        req->raw = malloc(hdr_len);
+        memcpy(req->raw, line, hdr_len);
+        target = req->raw + (target - line);
+        if (q) q = req->raw + (q - line);
+        headers = req->raw + (headers - line);
         xs_route *route = NULL;
         bool path_known = false;
         xs_route *fallback = NULL;
