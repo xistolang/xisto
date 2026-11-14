@@ -1,0 +1,19 @@
+# HTTP A/B on the Xeon E5-2686 v4 (2 vCPU, Ubuntu), 14 Nov 2026: main 02c991f against the node-compat-p0p1 merge (dedc7b2)
+# wrk 4.1.0 -t1 -c64 -d10s on the same machine, 3 interleaved rounds; one event loop per server; RSS in KB after the load
+# ping-*: bench/http/server.xisto.ts /ping; todo-*: bench/http/todo/server.xisto.ts /todos (10 items); nodehttp-branch: bench/http/server.node.ts (node:http createServer) built with xisto
+ping-main /ping req/s=101332.55  rss_kb= 3104
+todo-main /todos req/s=97646.52  rss_kb= 3204
+ping-branch /ping req/s=99956.68  rss_kb= 3140
+todo-branch /todos req/s=100521.31  rss_kb= 3172
+nodehttp-branch /ping req/s=50231.93  rss_kb=12248
+ping-main /ping req/s=103598.53  rss_kb= 3116
+todo-main /todos req/s=100958.19  rss_kb= 3200
+ping-branch /ping req/s=103823.28  rss_kb= 3116
+todo-branch /todos req/s=100784.82  rss_kb= 3168
+nodehttp-branch /ping req/s=50642.27  rss_kb=12280
+ping-main /ping req/s=103673.45  rss_kb= 3132
+todo-main /todos req/s=100679.83  rss_kb= 3200
+ping-branch /ping req/s=102410.66  rss_kb= 3072
+todo-branch /todos req/s=98802.43  rss_kb= 3200
+nodehttp-branch /ping req/s=49770.13  rss_kb=12116
+DONE

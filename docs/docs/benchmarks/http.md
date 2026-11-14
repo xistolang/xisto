@@ -5,9 +5,10 @@ sidebar_position: 3
 
 # HTTP
 
-All HTTP results are from an Apple M4 (10 cores, 4 of them performance cores, macOS 15.5) with the load generator
+Unless a section says otherwise, the HTTP results are from an Apple M4 (10 cores, 4 of them performance cores, macOS 15.5) with the load generator
 [`oha`](https://github.com/hatoo/oha) 1.16.0 on the same machine, Node v26.12.0 and Bun 1.4.4. Each server is one
-process with one event loop unless a table says otherwise. There are no Linux HTTP results yet.
+process with one event loop unless a table says otherwise. The first Linux results are in
+[Node's http module on Linux](#nodes-http-module-on-linux-14-nov-2026).
 
 ## Hello server (7 Nov 2026)
 
@@ -80,6 +81,23 @@ Single-request latency, cold (cache flushed) / warm, in ms:
 | current user | 1.06 / 0.53 | 1.85 / 0.88 |
 | tags | 0.64 / 0.34 | 1.12 / 0.45 |
 | login | 26.01 / 22.09 | 30.95 / 29.35 |
+
+## Node's http module on Linux (14 Nov 2026)
+
+`node:http` came to xisto with the Node core modules (main `dedc7b2`). The same `/ping` server written with Node's
+`http.createServer` (`bench/http/server.node.ts`, unchanged) built with xisto, beside xisto's own `Server` API, on
+the Xeon E5-2686 v4 (2 vCPUs, Ubuntu). wrk 4.1.0, 1 thread, 64 connections, 10 s, on the same machine, median of 3
+interleaved rounds, one event loop. Source: `bench/results/http-2026-11-14/xeon-ab-node-compat.txt`.
+
+| server (built with xisto) | route | req/s | RSS after load |
+|---|---|---:|---:|
+| xisto `Server` | `/ping` | 102,411 | 3.1 MB |
+| xisto `Server` (Todo API) | `/todos` | 100,521 | 3.2 MB |
+| Node's `http.createServer` | `/ping` | 50,231 | 12.0 MB |
+
+Node's API costs half the throughput of xisto's own on this machine: each request builds an `IncomingMessage`
+stream and a `ServerResponse` with their events, as Node does. The same run checked that the Node modules did not
+slow the native server: main before the merge served 103,598 and 100,680 req/s.
 
 ## Threads
 
