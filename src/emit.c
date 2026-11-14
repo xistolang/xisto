@@ -658,6 +658,7 @@ static void emit_releases(EScope *s);
 static void emit_block(Stmt *b, bool func_root);
 static Stmt *blk_prev_stmt; /* in the block loops: the statement before the one being emitted, in the same block */
 static bool dctr_is(Expr *e);
+static Stmt *fz_skip; /* a statement already emitted with the one before it (rs_fuse) */
 static Stmt *blk_cur; /* the block whose statement is being emitted, and its index (dctr) */
 static int blk_cur_i;
 static void nl(void);
@@ -4938,6 +4939,7 @@ static void emit_block_kind(Stmt *b, ScopeKind kind) {
         nl();
         emit_dbg_hook(b->stmts.items[i]);
         blk_prev_stmt = i > 0 ? b->stmts.items[i - 1] : NULL;
+        if (b->stmts.items[i] == fz_skip) { fz_skip = NULL; continue; } /* (emitted with the one before: rs_fuse) */
         { Stmt *sb = blk_cur; int si = blk_cur_i; blk_cur = b; blk_cur_i = i; emit_stmt(b->stmts.items[i]); blk_cur = sb; blk_cur_i = si; }
     }
     emit_releases(escope);
@@ -4967,6 +4969,7 @@ static void emit_block(Stmt *b, bool func_root) {
         nl();
         emit_dbg_hook(b->stmts.items[i]);
         blk_prev_stmt = i > 0 ? b->stmts.items[i - 1] : NULL;
+        if (b->stmts.items[i] == fz_skip) { fz_skip = NULL; continue; } /* (emitted with the one before: rs_fuse) */
         { Stmt *sb = blk_cur; int si = blk_cur_i; blk_cur = b; blk_cur_i = i; emit_stmt(b->stmts.items[i]); blk_cur = sb; blk_cur_i = si; }
         if (i == 0 && after_super) emit_own_field_inits(after_super); /* super(...) ran: now the class's own fields */
     }
@@ -10008,7 +10011,96 @@ static void rs_memo_close(int opened) {
     buf_puts(out, " }");
 }
 static int rs_memo_find(Stmt *s) { for (int k = 0; k < nrs_memo; k++) if (rs_memo[k].nest == s) return rs_memo[k].id; return -1; }
+static int rs_mode; /* 0 the nest; 1 its guard only, and-ed into rs_fz_ok (memo needed); 2 one plane c1 = rs_plane_c1 (3D) */
+static const char *rs_plane_c1, *rs_plane_c2, *rs_fz_ok; /* (mode 3: one row c1, c2) */
+static void rs_plane(int id, const char *c1, char **L, char **Hh, char **RT, char **RW, bool tab, int wr, int op, Stmt *x) {
+    const char *c2 = rs_mode == 3 ? rs_plane_c2 : ren(rs_c[1]);
+    if (rs_D == 3 && rs_mode != 3) buf_printf(out, "for (int64_t %s = %s; %s <= %s; %s++) { ", ren(rs_c[1]), L[1], ren(rs_c[1]), Hh[1], ren(rs_c[1]));
+    else if (rs_mode == 3) buf_puts(out, "{ ");
+    for (int r = 0; r < nrs_row; r++) {
+        RsArr *A = &rs_arr[rs_row[r].arr];
+        const char *r1 = lj_rs(A->t->elem);
+        if (rs_D == 2) buf_printf(out, "double *rp%d_%d_ = ((%s *)(%s)->data[%s + %d])->data; ", id, r, r1, ren(A->x), c1, rs_row[r].K[0]);
+        else if (tab) buf_printf(out, "double *rp%d_%d_ = %s[(%s + %d) * %s + %s + %d]; ", id, r, RT[rs_row[r].arr], c1, rs_row[r].K[0], RW[rs_row[r].arr], c2, rs_row[r].K[1]);
+        else buf_printf(out, "double *rp%d_%d_ = ((%s *)((%s *)(%s)->data[%s + %d])->data[%s + %d])->data; ", id, r, lj_rs(A->t->elem->elem), r1, ren(A->x), c1,
+                        rs_row[r].K[0], c2, rs_row[r].K[1]);
+    }
+    const char *cD = ren(rs_c[rs_D - 1]);
+    buf_printf(out, "_Pragma(\"clang loop vectorize(assume_safety)\") for (int64_t %s = %s; %s <= %s; %s++) rp%d_%d_[%s] %s= ", cD, L[rs_D - 1], cD, Hh[rs_D - 1], cD, id, wr, cD,
+               op == TK_PLUS_ASSIGN ? "+" : op == TK_MINUS_ASSIGN ? "-" : op == TK_STAR_ASSIGN ? "*" : op == TK_SLASH_ASSIGN ? "/" : "");
+    if (op != TK_ASSIGN) buf_puts(out, "(");
+    rs_emit(x->expr->rhs);
+    buf_puts(out, op != TK_ASSIGN ? "); " : "; ");
+    if (rs_D == 3) buf_puts(out, "} ");
+}
+/* ---- two 3D stencil sweeps fused, one plane apart (heat-3d: B = f(A) over the interior, then A = f(B)) ----
+   S1: for i, j, k: W1[i][j][k] = f(W2 at i-1..i+1), S2: the same ranges, W2[i][j][k] = g(W1 at i-1..i+1) (each may
+   read its own written element too). Plane i of S1 reads W2's planes i-1..i+1 and plane i-1 of S2 reads W1's planes
+   i-2..i: after S1's plane i, every W1 plane S2's plane i-1 reads is final, and W2's plane i-1 is no longer read by
+   S1 (its later planes read i and up). So the planes run S1(1), S1(2) S2(1), S1(3) S2(2), ..., S2(last): every
+   element is computed by the same expression from the same values, and the planes being reused are still in the
+   cache. Rows one apart as well (S2's row j - 1 of plane i - 1 right after S1's row j of plane i): Xeon E5-2686 v4
+   kernel 2.10 -> 1.83 s (Rust 1.96); x86 only (xs_fuse): Graviton2 3.66 -> 3.72, M4 0.734 -> 0.777. Guard: the two nests' own guards (ranges, every leaf row of both arrays apart), kept for the outer loop;
+   else the two nests as written. XISTO_NO_FUSE turns it off. */
+bool xs_fuse = true; /* main.c: x86 only */
+static bool fz_busy;
+static bool rs_emit_loop(Stmt *s);
+static bool rs_fuse(Stmt *s1) {
+    static int off = -1;
+    if (off < 0) off = getenv("XISTO_NO_FUSE") != NULL || !(xs_fuse || getenv("XISTO_FUSE")); /* (XISTO_FUSE: on anywhere) */
+    if (off || fz_busy || rs_mode || !blk_cur || blk_cur->kind != S_BLOCK || blk_cur_i + 1 >= blk_cur->stmts.len || blk_cur->stmts.items[blk_cur_i] != s1) return false;
+    Stmt *s2 = blk_cur->stmts.items[blk_cur_i + 1];
+    if (!s2 || s2->kind != S_FOR || rs_memo_find(s1) < 0 || rs_memo_find(s2) < 0) return false;
+    const char *W[2], *R[2], *Ls[2][3], *Hs[2][3];
+    bool le[2][3];
+    Stmt *ss[2] = {s1, s2};
+    for (int n = 0; n < 2; n++) {
+        if (!rs_match(ss[n]) || rs_D != 3 || rs_op != TK_ASSIGN || nrs_arr != 2) return false;
+        int w = rs_w, o = 1 - rs_w;
+        for (int d = 0; d < 3; d++) {
+            if (rs_kmin[w][d] || rs_kmax[w][d]) return false; /* (its own element only) */
+            Ls[n][d] = bce_raw(rs_lo[d]); Hs[n][d] = bce_raw(rs_hi[d]); le[n][d] = rs_le[d];
+        }
+        if (rs_kmin[o][0] < -1 || rs_kmax[o][0] > 1) return false;
+        /* one row apart too: S1's row (i, j) reads S2's plane i - 1 at rows j - 1 and up (S2 writes row j - 1 after
+           it), S2's row (i - 1, j - 1) reads S1's plane i at rows j and down */
+        for (int r = 0; r < nrs_row; r++)
+            if (rs_row[r].arr == o && rs_row[r].K[0] == (n ? 1 : -1) && (n ? rs_row[r].K[1] > 1 : rs_row[r].K[1] < -1)) return false;
+        W[n] = rs_arr[w].x; R[n] = rs_arr[o].x;
+    }
+    if (strcmp(W[0], R[1]) || strcmp(W[1], R[0]) || !strcmp(W[0], W[1])) return false;
+    for (int d = 0; d < 3; d++) if (strcmp(Ls[0][d], Ls[1][d]) || strcmp(Hs[0][d], Hs[1][d]) || le[0][d] != le[1][d]) return false;
+    static int ids;
+    int id = ids++;
+    const char *ok = xs_sprintf("fz%d_", id), *c = xs_sprintf("fi%d_", id);
+    char *L0 = (char *)Ls[0][0], *H0 = le[0][0] ? xs_sprintf("(%s)", Hs[0][0]) : xs_sprintf("((%s) - 1)", Hs[0][0]);
+    buf_printf(out, "{ bool %s = 1; ", ok);
+    rs_fz_ok = ok;
+    rs_mode = 1; rs_emit_loop(s1); rs_emit_loop(s2);
+    char *L1 = (char *)Ls[0][1], *H1 = le[0][1] ? xs_sprintf("(%s)", Hs[0][1]) : xs_sprintf("((%s) - 1)", Hs[0][1]);
+    const char *cj = xs_sprintf("fj%d_", id), *cm = xs_sprintf("(%s - 1)", c);
+    buf_printf(out, "if (%s) { int64_t %s = %s; for (; %s <= %s; %s++) { bool lag_ = %s - 1 >= %s; for (int64_t %s = %s; %s <= %s; %s++) { ", ok, c, L0, c, H0, c,
+               c, L0, cj, L1, cj, H1, cj);
+    rs_mode = 3;
+    rs_plane_c1 = c; rs_plane_c2 = cj; rs_emit_loop(s1);
+    buf_printf(out, "if (lag_ && %s - 1 >= %s) ", cj, L1);
+    rs_plane_c1 = cm; rs_plane_c2 = xs_sprintf("(%s - 1)", cj); rs_emit_loop(s2);
+    buf_printf(out, "} if (lag_ && %s >= %s) ", H1, L1);
+    rs_plane_c2 = H1; rs_emit_loop(s2);
+    buf_printf(out, "} if (%s >= %s) { ", H0, L0);
+    rs_mode = 2;
+    rs_plane_c1 = H0; rs_emit_loop(s2);
+    buf_puts(out, "} } else { ");
+    rs_mode = 0;
+    fz_busy = true;
+    emit_stmt(s1); emit_stmt(s2);
+    fz_busy = false;
+    buf_puts(out, " } }");
+    fz_skip = s2;
+    return true;
+}
 static bool rs_emit_loop(Stmt *s) {
+    if (rs_mode == 0 && rs_fuse(s)) return true;
     if (!rs_match(s)) return false;
     Expr **lo = rs_lo, **hi = rs_hi;
     bool *le = rs_le;
@@ -10029,7 +10121,9 @@ static bool rs_emit_loop(Stmt *s) {
         RT[b] = memo >= 0 ? xs_sprintf("rtm%d_%d_", memo, b) : xs_sprintf("rt%d_%d_", id, b);
         RW[b] = memo >= 0 ? xs_sprintf("rwm%d_%d_", memo, b) : xs_sprintf("rw%d_%d_", id, b);
     }
-    buf_printf(out, "{ int64_t rs%d_ = %s; ", id, L[0]);
+    if (rs_mode >= 2) { rs_plane(id, rs_plane_c1, L, Hh, RT, RW, tab, wr, op, x); return true; }
+    if (rs_mode == 1) buf_puts(out, "{ ");
+    else buf_printf(out, "{ int64_t rs%d_ = %s; ", id, L[0]);
     if (tab && memo < 0)
         for (int b = 0; b < nrs_arr; b++) buf_printf(out, "double **%s __attribute__((cleanup(xs_rd_free))) = NULL; int64_t %s = 0; ", RT[b], RW[b]);
     if (memo >= 0) buf_printf(out, "{ bool ok_ = rsm%d_ > 0; if (!rsm%d_) { ok_ = 1", memo, memo);
@@ -10071,24 +10165,10 @@ static bool rs_emit_loop(Stmt *s) {
     }
     buf_puts(out, "if (ok_ && pp_) ok_ = xs_blocks_apart_(pp_, k_) > 0; free(pp_); (void)nb_; ");
     if (memo >= 0) buf_printf(out, "rsm%d_ = ok_ ? 1 : -1; } ", memo);
+    if (rs_mode == 1) { buf_printf(out, "%s = %s && ok_; } } ", rs_fz_ok, rs_fz_ok); return true; }
     buf_printf(out, "if (ok_) for (; rs%d_ <= %s; rs%d_++) { ", id, Hh[0], id);
     const char *c1 = xs_sprintf("rs%d_", id);
-    if (rs_D == 3) buf_printf(out, "for (int64_t %s = %s; %s <= %s; %s++) { ", ren(rs_c[1]), L[1], ren(rs_c[1]), Hh[1], ren(rs_c[1]));
-    for (int r = 0; r < nrs_row; r++) {
-        RsArr *A = &rs_arr[rs_row[r].arr];
-        const char *r1 = lj_rs(A->t->elem);
-        if (rs_D == 2) buf_printf(out, "double *rp%d_%d_ = ((%s *)(%s)->data[%s + %d])->data; ", id, r, r1, ren(A->x), c1, rs_row[r].K[0]);
-        else if (tab) buf_printf(out, "double *rp%d_%d_ = %s[(%s + %d) * %s + %s + %d]; ", id, r, RT[rs_row[r].arr], c1, rs_row[r].K[0], RW[rs_row[r].arr], ren(rs_c[1]), rs_row[r].K[1]);
-        else buf_printf(out, "double *rp%d_%d_ = ((%s *)((%s *)(%s)->data[%s + %d])->data[%s + %d])->data; ", id, r, lj_rs(A->t->elem->elem), r1, ren(A->x), c1,
-                        rs_row[r].K[0], ren(rs_c[1]), rs_row[r].K[1]);
-    }
-    const char *cD = ren(rs_c[rs_D - 1]);
-    buf_printf(out, "_Pragma(\"clang loop vectorize(assume_safety)\") for (int64_t %s = %s; %s <= %s; %s++) rp%d_%d_[%s] %s= ", cD, L[rs_D - 1], cD, Hh[rs_D - 1], cD, id, wr, cD,
-               op == TK_PLUS_ASSIGN ? "+" : op == TK_MINUS_ASSIGN ? "-" : op == TK_STAR_ASSIGN ? "*" : op == TK_SLASH_ASSIGN ? "/" : "");
-    if (op != TK_ASSIGN) buf_puts(out, "(");
-    rs_emit(x->expr->rhs);
-    buf_puts(out, op != TK_ASSIGN ? "); " : "; ");
-    if (rs_D == 3) buf_puts(out, "} ");
+    rs_plane(id, c1, L, Hh, RT, RW, tab, wr, op, x);
     buf_puts(out, "} } ");
     Stmt *fi = s->for_init;
     Stmt fi2 = *fi;
@@ -10387,9 +10467,77 @@ static bool tr_emit_loop(Stmt *s) {
     buf_puts(out, " }");
     return true;
 }
+
+/* ---- a min-plus row update with the pivot hoisted (floyd-warshall) ----
+   for (let j = L; j < H; j++) X[I][j] = X[I][j] < X[I][K] + X[K][j] ? X[I][j] : X[I][K] + X[K][j];   (<= as well;
+   X[K][j] + X[I][K] as well), X an Int32Array[], I and K invariant names. The loop writes X[I][K] once, at j = K, with
+   min(X[I][K], X[I][K] + X[K][K]): when X[K][K] >= 0 that is X[I][K] again (the sum is not less; equal, ToInt32 of
+   the same value), so X[I][K] does not change in the loop and is read once before it. The sums are of two int32
+   values in int64: no overflow. Guard (per entry): I, K, L..H - 1 inside X and both rows, X[K][K] >= 0, and rows I
+   and K the same block or blocks without a common byte. Then the loop runs on the row pointers with the C compiler
+   told its iterations are independent (each reads and writes only element j, and row K's element j at most), so it
+   vectorizes. Otherwise the loop as written. XISTO_NO_MINPLUS turns it off. */
+static bool fw_same(Expr *a, Expr *b) { /* bce_same, with indexes */
+    if (a && b && a->kind == E_INDEX && b->kind == E_INDEX) return !a->builtin.cfn && !b->builtin.cfn && fw_same(a->lhs, b->lhs) && fw_same(a->rhs, b->rhs);
+    if (a && b && a->kind == E_BINARY && b->kind == E_BINARY) return a->op == b->op && fw_same(a->lhs, b->lhs) && fw_same(a->rhs, b->rhs);
+    return a && b && bce_same(a, b);
+}
+static bool fw_slot(Expr *e, const char *X, Expr **row) { /* X[R][c]: R */
+    if (!e || e->kind != E_INDEX || e->builtin.cfn || !e->lhs || e->lhs->kind != E_INDEX || e->lhs->builtin.cfn) return false;
+    if (!lj_is(e->lhs->lhs, X)) return false;
+    *row = e->lhs->rhs;
+    return true;
+}
+static bool fw_emit_loop(Stmt *s) {
+    static int off = -1, ids;
+    if (off < 0) off = getenv("XISTO_NO_MINPLUS") != NULL;
+    if (off || xs_debug || sm_mode || ictx || bce_promo_t || bce_fw_loop) return false;
+    const char *j; Expr *lo, *hi; bool le;
+    if (!sk_le(s, &j, &lo, &hi, &le)) return false;
+    Stmt *b = uj_only(s->body);
+    if (!b || b->kind != S_EXPR || !b->expr || b->expr->kind != E_ASSIGN || b->expr->op != TK_ASSIGN) return false;
+    Expr *w = b->expr->lhs, *r = b->expr->rhs;
+    if (!w || w->kind != E_INDEX || !w->lhs || w->lhs->kind != E_INDEX || !w->lhs->lhs || w->lhs->lhs->kind != E_IDENT) return false;
+    const char *X = w->lhs->lhs->cname;
+    Type *xt = w->lhs->lhs->type;
+    if (!X || !bce_plain_local(X) || !xt || xt->kind != TY_ARRAY || !is_i32_type(xt->elem)) return false;
+    Expr *I = w->lhs->rhs;
+    if (!lj_is(w->rhs, j) || !I || I->kind != E_IDENT || !I->cname || !bce_plain_local(I->cname)) return false;
+    if (!r || r->kind != E_COND || r->builtin.cfn || r->args.len != 2 || !r->lhs || r->lhs->kind != E_BINARY || (r->lhs->op != TK_LT && r->lhs->op != TK_LE)) return false;
+    Expr *P = r->lhs->lhs, *Q = r->lhs->rhs, *T = r->args.items[0], *F = r->args.items[1];
+    if (!fw_same(P, w) || !fw_same(T, w) || !fw_same(Q, F) || !Q || Q->kind != E_BINARY || Q->op != TK_PLUS) return false;
+    Expr *a = Q->lhs, *c = Q->rhs, *ra, *rc;
+    if (!fw_slot(a, X, &ra) || !fw_slot(c, X, &rc)) return false;
+    if (lj_is(a->rhs, j)) { Expr *t = a; a = c; c = t; t = ra; ra = rc; rc = t; } /* X[K][j] + X[I][K] */
+    if (!fw_same(ra, I) || !lj_is(c->rhs, j) || !a->rhs || a->rhs->kind != E_IDENT || !a->rhs->cname || !bce_plain_local(a->rhs->cname) || !fw_same(rc, a->rhs))
+        return false;
+    Expr *K = a->rhs;
+    if (strcmp(K->cname, j) == 0 || strcmp(I->cname, j) == 0 || bce_writes(s->body, X) || bce_writes(s->body, I->cname) || bce_writes(s->body, K->cname)) return false;
+    if (!bce_inv(lo, s->body, j) || !bce_inv(hi, s->body, j) || !bce_names_plain(lo) || !bce_names_plain(hi) || uj_mentions(lo, j) || uj_mentions(hi, j)) return false;
+    int id = ids++;
+    const char *Xc = ren(X), *Ic = ren(I->cname), *Kc = ren(K->cname), *Jc = ren(j);
+    char *L = bce_raw(lo), *Hh = le ? xs_sprintf("(%s)", bce_raw(hi)) : xs_sprintf("((%s) - 1)", bce_raw(hi));
+    buf_printf(out, "{ xs_Int32Array *fa%d_ = NULL, *fb%d_ = NULL; bool fok%d_ = %s >= 0 && %s >= 0 && %s < (int64_t)(%s)->len && %s < (int64_t)(%s)->len; ",
+               id, id, id, Ic, Kc, Ic, Xc, Kc, Xc);
+    buf_printf(out, "if (fok%d_) { fa%d_ = (xs_Int32Array *)(%s)->data[%s]; fb%d_ = (xs_Int32Array *)(%s)->data[%s]; "
+                    "fok%d_ = fa%d_ && fb%d_ && (%s) >= 0 && %s < (int64_t)fa%d_->len && %s < (int64_t)fb%d_->len && %s < (int64_t)fa%d_->len && %s < (int64_t)fb%d_->len && fb%d_->data[%s] >= 0 && "
+                    "(fa%d_->data == fb%d_->data ? fa%d_->len == fb%d_->len : (fa%d_->data + fa%d_->len <= fb%d_->data || fb%d_->data + fb%d_->len <= fa%d_->data)); } ",
+               id, id, Xc, Ic, id, Xc, Kc,
+               id, id, id, L, Hh, id, Hh, id, Kc, id, Kc, id, id, Kc,
+               id, id, id, id, id, id, id, id, id, id);
+    buf_printf(out, "if (fok%d_) { int32_t *ri%d_ = fa%d_->data; const int32_t *rk%d_ = fb%d_->data; int64_t pk%d_ = ri%d_[%s]; "
+                    "_Pragma(\"clang loop vectorize(assume_safety)\") for (int64_t %s = %s; %s <= %s; %s++) { int64_t p_ = ri%d_[%s], q_ = pk%d_ + (int64_t)rk%d_[%s]; "
+                    "ri%d_[%s] = (int32_t)(uint32_t)(uint64_t)(p_ %s q_ ? p_ : q_); } } else ",
+               id, id, id, id, id, id, id, Kc,
+               Jc, L, Jc, Hh, Jc, id, Jc, id, id, Jc,
+               id, Jc, r->lhs->op == TK_LT ? "<" : "<=");
+    emit_stmt_for_inner_(s);
+    buf_puts(out, " }");
+    return true;
+}
 static void emit_stmt_for_inner(Stmt *s) { /* the columns' least row lengths around the outermost loop that keeps them */
     int opened = bce_rect_open(s), memos = rs_memo_open(s);
-    if (!uj_emit_km(s) && !uj_emit_loop(s) && !lj_emit(s) && !sk_emit_loop(s) && !rs_emit_loop(s) && !tr_emit_loop(s)) emit_stmt_for_inner_(s);
+    if (!uj_emit_km(s) && !uj_emit_loop(s) && !lj_emit(s) && !sk_emit_loop(s) && !rs_emit_loop(s) && !tr_emit_loop(s) && !fw_emit_loop(s)) emit_stmt_for_inner_(s);
     rs_memo_close(memos);
     bce_rect_close(opened);
 }
