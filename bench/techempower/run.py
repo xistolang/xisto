@@ -63,6 +63,17 @@ def servers(a):
         'xisto-nest': ('xisto', 9101, nest, [os.path.join(out, 'te-nest')],
                        {'PORT': '9101', 'XISTO_WORKERS': xw},
                        ['sh', '-c', '(test -d .xisto || %s install) && %s build -o %s' % (X, X, os.path.join(out, 'te-nest'))]),
+        # the same Nest binary in the two other modes Isa asked for (14 Nov): workers without the handler lock (its
+        # singletons are shared: measured as is, the validator says whether the answers stay right), and N
+        # processes of one worker each on one port (SO_REUSEPORT: the kernel spreads the connections, as Node's
+        # cluster or Bun's reusePort; each process has its own singletons, nothing shared, no lock)
+        'xisto-nest-nolock': ('xisto', 9102, nest, [os.path.join(out, 'te-nest')],
+                              {'PORT': '9102', 'XISTO_WORKERS': xw, 'XISTO_LOCK': '0'},
+                              ['sh', '-c', '(test -d .xisto || %s install) && %s build -o %s' % (X, X, os.path.join(out, 'te-nest'))]),
+        'xisto-nest-procs': ('xisto', 9103, nest,
+                             ['sh', '-c', 'for i in $(seq %s); do "%s" & done; wait' % (xw, os.path.join(out, 'te-nest'))],
+                             {'PORT': '9103', 'XISTO_WORKERS': '1', 'XISTO_REUSEPORT': '1'},
+                             ['sh', '-c', '(test -d .xisto || %s install) && %s build -o %s' % (X, X, os.path.join(out, 'te-nest'))]),
         'actix': ('ref', 9110, R + '/actix', [R + '/actix/target/release/tfb-web'], {}, None),
         'go-std': ('ref', 9111, R + '/go-std/src', [R + '/go-std/src/app', '-bind', ':9111'], {}, None),
         'nodejs': ('ref', 9112, R + '/nodejs', ['node', 'app.js'], {'NODE_ENV': 'production'}, None),
@@ -205,19 +216,30 @@ def measure(a, name, spec, tests, levels):
                 print(line, flush=True)
                 rows.append(line)
     finally:
-        os.killpg(p.pid, signal.SIGTERM)
+        crashed = p.poll() is not None
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):  # (the group is gone: the server died, macOS says EPERM)
+            pass
         try:
             p.wait(5)
         except subprocess.TimeoutExpired:
-            os.killpg(p.pid, signal.SIGKILL)
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
             p.wait()
+        if crashed:
+            line = '%s crashed %s during the load (exit %s): see bench/out/te-%s.log' % (side, name, p.returncode, name)
+            print(line, flush=True)
+            rows.append('# ' + line)
         time.sleep(1)
     return rows
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--servers', default='xisto-native,xisto-nest,actix,go-std,nodejs,fastify,bun')
+    ap.add_argument('--servers', default='xisto-native,xisto-nest,xisto-nest-nolock,xisto-nest-procs,actix,go-std,nodejs,fastify,bun')
     ap.add_argument('--tests', default='plaintext,json')
     ap.add_argument('--levels', default='16,64,256')
     ap.add_argument('--duration', type=int, default=10)

@@ -2868,6 +2868,11 @@ XS_NOINLINE int xs_listen_socket(int64_t port) {
     if (lfd < 0) xs_panic("listen: socket failed");
     int one = 1;
     setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+#ifdef SO_REUSEPORT
+    /* XISTO_REUSEPORT=1: several processes of the program on one port, the kernel spreading the connections between
+       them (as Node's cluster or Bun's reusePort): each process with its own state, no lock between them */
+    { const char *rp = getenv("XISTO_REUSEPORT"); if (rp && atoi(rp) != 0) setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one); }
+#endif
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);

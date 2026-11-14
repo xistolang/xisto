@@ -13,7 +13,7 @@
 #   TFB_DIR [~/tfb/FrameworkBenchmarks]  TFB_COMMIT [57d92fbec6f8fd7431bc77326dd0484e60c96e20]
 #   REFS_DIR [$TFB_DIR/../tfb-refs]      DURATION [15] (the TFB uses 15 s)   REPEAT [3]
 #   LEVELS [16,32,64,128,256,512] (json)  PIPE_LEVELS [256,1024,4096,16384] (plaintext, pipeline depth 16)
-#   SERVERS [xisto-native,xisto-nest,actix,go-std,nodejs,fastify,bun]  XISTO_WORKERS [nproc]
+#   SERVERS [xisto-native,xisto-nest,xisto-nest-nolock,xisto-nest-procs,actix,go-std,nodejs,fastify,bun]  XISTO_WORKERS [nproc]
 #   GEN_SSH (user@host of the generator: needs wrk there and key-based SSH)  SERVER_HOST (this machine, seen from it)
 # Needs here: cc, make, cmake, python3, git, rustup (stable), go, node+npm, bun; wrk here or on the generator.
 # Raise the open-file limit for 16384 connections (ulimit -n 65536, on both machines).
@@ -26,7 +26,7 @@ DURATION=${DURATION:-15}
 REPEAT=${REPEAT:-3}
 LEVELS=${LEVELS:-16,32,64,128,256,512}
 PIPE_LEVELS=${PIPE_LEVELS:-256,1024,4096,16384}
-SERVERS=${SERVERS:-xisto-native,xisto-nest,actix,go-std,nodejs,fastify,bun}
+SERVERS=${SERVERS:-xisto-native,xisto-nest,xisto-nest-nolock,xisto-nest-procs,actix,go-std,nodejs,fastify,bun}
 NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 XISTO_WORKERS=${XISTO_WORKERS:-$NPROC}
 OUT=bench/results/techempower-$(date +%Y-%m-%d)
