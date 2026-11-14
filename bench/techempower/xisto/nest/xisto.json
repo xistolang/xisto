@@ -1,0 +1,9 @@
+{
+  "name": "tfb-nest",
+  "main": "src/main.ts",
+  "dependencies": {
+    "@nestjs/common": "*",
+    "@nestjs/core": "*",
+    "@nestjs/platform-express": "*"
+  }
+}

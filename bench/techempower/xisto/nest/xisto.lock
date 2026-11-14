@@ -1,0 +1,9 @@
+{
+  "@nestjs/common": {"source": "https://github.com/xistolang/packages", "subdir": "@nestjs/common", "commit": "aabcc672441e0ac7c4d51b41ebeebaacacb14fd0"},
+  "@nestjs/core": {"source": "https://github.com/xistolang/packages", "subdir": "@nestjs/core", "commit": "aabcc672441e0ac7c4d51b41ebeebaacacb14fd0"},
+  "@nestjs/platform-express": {"source": "https://github.com/xistolang/packages", "subdir": "@nestjs/platform-express", "commit": "aabcc672441e0ac7c4d51b41ebeebaacacb14fd0"},
+  "class-transformer": {"source": "https://github.com/xistolang/packages", "subdir": "class-transformer", "commit": "aabcc672441e0ac7c4d51b41ebeebaacacb14fd0", "indirect": true},
+  "class-validator": {"source": "https://github.com/xistolang/packages", "subdir": "class-validator", "commit": "aabcc672441e0ac7c4d51b41ebeebaacacb14fd0", "indirect": true},
+  "express": {"source": "https://github.com/xistolang/packages", "subdir": "express", "commit": "aabcc672441e0ac7c4d51b41ebeebaacacb14fd0", "indirect": true},
+  "rxjs": {"source": "https://github.com/xistolang/packages", "subdir": "rxjs", "commit": "aabcc672441e0ac7c4d51b41ebeebaacacb14fd0", "indirect": true}
+}

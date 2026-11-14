@@ -52,6 +52,7 @@ const sidebars = {
           link: {type: 'doc', id: 'benchmarks/polybench/index'},
           items: ['benchmarks/polybench/vs-rust', 'benchmarks/polybench/vs-go'],
         },
+        'benchmarks/techempower',
         'benchmarks/http',
         'benchmarks/energy-sqlite-streams',
       ],

@@ -45,6 +45,25 @@ of 3, a tie within 3%, against the faster of Rust and Go:
 
 The per-kernel tables, with the C reference beside them, are on [PolyBench](./polybench/index.md).
 
+## TechEmpower (json, plaintext)
+
+14 Nov 2026, the TFB's rules: servers on the Xeon, wrk on the Graviton2 over the private network, 15 s per level,
+median of 3. Best requests per second:
+
+| server | json | plaintext | json peak RSS |
+|---|---:|---:|---:|
+| actix-web (Rust) | 65,068 | 569,578 | 12.3 MB |
+| Xisto (native) | 56,352 | 331,283 | 5.5 MB |
+| Bun | 55,207 | 114,082 | 89.9 MB |
+| Xisto + NestJS, 2 processes | 48,332 | 199,633 | 16.0 MB |
+| Go net/http | 32,831 | 44,851 | 20.1 MB |
+| Node http | 29,524 | 51,486 | 243.8 MB |
+| fastify | 22,962 | 35,972 | 263.3 MB |
+
+actix is ahead; Xisto's native server is second, and NestJS built with Xisto passes Go, Node and fastify. NestJS's
+workers without the handler lock crash (shared singletons), and 16,384 connections are Xisto's weak point. The
+per-level tables are on [TechEmpower](./techempower.md).
+
 ## Benchmarks Game against Node and Bun
 
 13 Nov 2026, the same xisto variants as the Rust round against the official Node programs under Node v26.12.0 and
@@ -77,6 +96,7 @@ program. Apple M4, 7 Nov 2026, `bench/results/2026-11-07-Apple-M4.csv`.
 
 - [Benchmarks Game](./benchmarks-game/index.md): against Rust, Node and Bun, per problem.
 - [PolyBench](./polybench/index.md): 30 numerical kernels against Rust and Go, per kernel.
+- [TechEmpower](./techempower.md): json and plaintext against actix, Go, Node, fastify and Bun.
 - [HTTP](./http.md): hello, Todo API, the Conduit NestJS app, threads, resilience, slow dependencies.
 - [Energy, SQLite, streams and micro programs](./energy-sqlite-streams.md).
 
