@@ -431,7 +431,7 @@ static Buf compile_to_c(const char *path) {
                              false;
 #endif
     xs_skew_r = arm && apple ? 16 : arm || x86 ? 12 : 8;
-    xs_jam_ucol = arm && !apple ? 4 : 0; /* (emit.c: symm's jam on the Neoverse) */
+    xs_jam_ucol = arm && !apple ? 2 : 0; /* (emit.c: symm's jam on the Neoverse) */
     xs_rsten = !x86;
     xs_fuse = x86; /* (emit.c, rs_fuse: heat-3d Xeon 2.10 -> 1.83 s; Graviton2 and M4 slower) */
     xs_sel_ic = arm && !apple; /* (emit.c: 8 chains in a max/min reduction; on the Graviton2 nussinov gains, on the M4 (malloc steps rows by 10240 B) 1,63 -> 2,98 s, on the Broadwell 4,04 -> 5,48) */
@@ -515,9 +515,10 @@ static Buf compile_to_c(const char *path) {
         if (xs_rows_seen && !getenv("XISTO_NO_ROWPAD")) { /* (emit.c: arrays of rows; the runtime pads their blocks) */
             Buf nb = {0};
             buf_puts(&nb, "#define XS_ROWPAD 1\n");
+            if (xs_rows_align && !getenv("XISTO_NO_ROWALIGN")) buf_puts(&nb, "#define XS_ROWALIGN 1\n");
             buf_puts(&nb, b.data);
             b = nb;
-            if (rt_src.len) { Buf nr = {0}; buf_puts(&nr, "#define XS_ROWPAD 1\n"); buf_puts(&nr, rt_src.data); rt_src = nr; }
+            if (rt_src.len) { Buf nr = {0}; buf_puts(&nr, "#define XS_ROWPAD 1\n"); if (xs_rows_align && !getenv("XISTO_NO_ROWALIGN")) buf_puts(&nr, "#define XS_ROWALIGN 1\n"); buf_puts(&nr, rt_src.data); rt_src = nr; }
         }
     }
     if (show_time && !use_qbe) fprintf(stderr, "xisto: tls %s\n", !p->uses_tls ? "not linked" : tls_awslc() ? "AWS-LC" : "BearSSL");
