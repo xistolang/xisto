@@ -86,3 +86,17 @@ console.log("fdtd", sum(ex), sum(ey), sum(hz));
 A = grid(12, 12, 1); B = grid(12, 12, 2);
 swapping(4, 12, A, B, A[6]);
 console.log("swapping", sum(A), sum(B));
+// 3D with uneven rows: rows of rows of different lengths (the table of row pointers is as wide as the longest), and
+// one so long (empty leaf rows) that the table would pass four times the leaf rows: the loop as written
+const E = cube(9, 3), F = cube(9, 4);
+E[2].push([1.5, 2.5]); F[6].push([]);
+heat(2, 9, E, F);
+h = 0.0;
+for (const g of E) h = h * 0.5 + sum(g);
+console.log("heat uneven", h);
+const G = cube(9, 5), H = cube(9, 6);
+for (let k = 0; k < 6000; k++) G[0].push([]);
+heat(2, 9, G, H);
+h = 0.0;
+for (const g of G) h = h * 0.5 + sum(g);
+console.log("heat wide", h);
