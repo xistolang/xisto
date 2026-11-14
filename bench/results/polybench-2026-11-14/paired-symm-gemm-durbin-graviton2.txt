@@ -1,0 +1,29 @@
+## base 1
+symm           c      symm.c                  4.587s     4.58cpu     27.3MB  par  1.0  kern    4.565s  same
+symm           xisto  symm.ts                 4.578s     4.57cpu     27.7MB  par  1.0  kern    4.553s  same
+symm           rust   symm.rs                 4.586s     4.57cpu     27.7MB  par  1.0  kern    4.561s  same
+gemm           c      gemm.c                  0.649s     0.65cpu     29.0MB  par  1.0  kern    0.626s  same
+gemm           xisto  gemm.ts                 0.666s     0.66cpu     29.3MB  par  1.0  kern    0.635s  same
+gemm           rust   gemm.rs                 0.662s     0.66cpu     29.4MB  par  1.0  kern    0.637s  same
+durbin         c      durbin.c                0.006s     0.00cpu      1.6MB  par  0.6  kern    0.003s  same
+durbin         xisto  durbin.ts               0.009s     0.01cpu      1.3MB  par  0.7  kern    0.005s  same
+durbin         rust   durbin.rs               0.007s     0.00cpu      1.8MB  par  0.6  kern    0.003s  same
+## NO_ROWPAD 1
+symm           xisto  symm.ts                 5.073s     4.99cpu     27.4MB  par  1.0  kern    5.047s  same
+gemm           xisto  gemm.ts                 0.684s     0.68cpu     29.0MB  par  1.0  kern    0.653s  same
+durbin         xisto  durbin.ts               0.009s     0.01cpu      1.3MB  par  0.7  kern    0.005s  same
+## base 2
+symm           c      symm.c                  4.589s     4.59cpu     27.3MB  par  1.0  kern    4.568s  same
+symm           xisto  symm.ts                 4.534s     4.52cpu     27.7MB  par  1.0  kern    4.508s  same
+symm           rust   symm.rs                 4.585s     4.57cpu     27.7MB  par  1.0  kern    4.561s  same
+gemm           c      gemm.c                  0.682s     0.68cpu     28.9MB  par  1.0  kern    0.659s  same
+gemm           xisto  gemm.ts                 0.676s     0.67cpu     29.3MB  par  1.0  kern    0.646s  same
+gemm           rust   gemm.rs                 0.667s     0.66cpu     29.4MB  par  1.0  kern    0.642s  same
+durbin         c      durbin.c                0.006s     0.00cpu      1.6MB  par  0.6  kern    0.003s  same
+durbin         xisto  durbin.ts               0.009s     0.01cpu      1.2MB  par  0.7  kern    0.005s  same
+durbin         rust   durbin.rs               0.007s     0.00cpu      1.8MB  par  0.6  kern    0.003s  same
+## NO_ROWPAD 2
+symm           xisto  symm.ts                 4.834s     4.82cpu     27.5MB  par  1.0  kern    4.808s  same
+gemm           xisto  gemm.ts                 0.723s     0.72cpu     29.0MB  par  1.0  kern    0.692s  same
+durbin         xisto  durbin.ts               0.009s     0.01cpu      1.3MB  par  0.7  kern    0.005s  same
+DONE

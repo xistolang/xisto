@@ -1,0 +1,12 @@
+built main
+built branch
+bench/benchmarksgame/binarytrees.ts 21: main 1.651s  branch 1.642s  (1.01x)  same
+bench/benchmarksgame/fannkuchredux.ts 12: main 27.398s  branch 26.916s  (1.02x)  same
+bench/benchmarksgame/fasta.ts 25000000: main 0.543s  branch 0.551s  (0.98x)  same
+bench/benchmarksgame/knucleotide.ts 0: main 1.547s  branch 1.477s  (1.05x)  same
+bench/benchmarksgame/mandelbrot.ts 16000: main 2.696s  branch 2.680s  (1.01x)  same
+bench/benchmarksgame/nbody.ts 50000000: main 2.563s  branch 2.561s  (1.00x)  same
+bench/benchmarksgame/pidigits.ts 10000: main 0.708s  branch 0.708s  (1.00x)  same
+bench/benchmarksgame/regexredux.ts 0: main 1.001s  branch 0.994s  (1.01x)  same
+bench/benchmarksgame/revcomp.ts 0: main 0.568s  branch 0.578s  (0.98x)  same
+bench/benchmarksgame/spectralnorm.ts 5500: main 0.643s  branch 0.643s  (1.00x)  same

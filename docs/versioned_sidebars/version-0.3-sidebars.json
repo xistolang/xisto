@@ -68,6 +68,7 @@
             "benchmarks/benchmarks-game/vs-bun"
           ]
         },
+        "benchmarks/polybench",
         "benchmarks/http",
         "benchmarks/energy-sqlite-streams"
       ]
