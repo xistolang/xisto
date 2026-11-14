@@ -2748,7 +2748,7 @@ static const char **member_names(Class *c, int *n) {
    cell shared by the function and its closures; every other capture stays a copy (no cost). Found by name per
    function (or module): a use at a deeper arrow than the declaration, and an assignment anywhere. A `let` in a
    for header keeps JavaScript's copy per iteration unless a closure itself assigns it. ---- */
-typedef struct { const char *name; int depth; char kind; } ScanEv; /* d declared, u used, a assigned */
+typedef struct { const char *name; int depth; char kind; } ScanEv; /* d declared, u used, a assigned; b / e: a block or closure opens / closes (name "") */
 static ScanEv *sev;
 static int nsev, cap_sev;
 static bool for_init_decl;
@@ -2758,13 +2758,16 @@ static void scan_ev(const char *name, int depth, char kind) {
     sev[nsev++] = (ScanEv){name, depth, kind};
 }
 static void scan_stmt(Stmt *s, int depth);
+static void scan_stmt_inner(Stmt *s, int depth);
 static void scan_expr(Expr *e, int depth) {
     if (!e) return;
     if (e->kind == E_IDENT && e->str) scan_ev(e->str, depth, 'u');
     if ((e->kind == E_ASSIGN || e->kind == E_POSTFIX) && e->lhs && e->lhs->kind == E_IDENT) scan_ev(e->lhs->str, depth, 'a');
     if (e->kind == E_ARROW) {
+        scan_ev("", depth + 1, 'b');
         for (int i = 0; i < e->arrow->fn->nparams; i++) scan_ev(e->arrow->fn->params[i].name, depth + 1, 'd');
         scan_stmt(e->arrow->fn->body, depth + 1);
+        scan_ev("", depth + 1, 'e');
         return;
     }
     scan_expr(e->lhs, depth);
@@ -2773,6 +2776,15 @@ static void scan_expr(Expr *e, int depth) {
 }
 static void scan_stmt(Stmt *s, int depth) {
     if (!s) return;
+    if (s->kind != S_VAR) { /* (a variable lives to the end of its block: the block's own events, see boxed_name) */
+        scan_ev("", depth, 'b');
+        scan_stmt_inner(s, depth);
+        scan_ev("", depth, 'e');
+        return;
+    }
+    scan_stmt_inner(s, depth);
+}
+static void scan_stmt_inner(Stmt *s, int depth) {
     if ((s->kind == S_VAR || s->kind == S_FOROF) && s->name) scan_ev(s->name, depth, 'd');
     scan_expr(s->init, depth);
     scan_expr(s->expr, depth);
@@ -2786,8 +2798,13 @@ static void scan_stmt(Stmt *s, int depth) {
 }
 static bool boxed_name(const char *name, int decl_depth, bool for_init) {
     bool captured = false, assigned = false, assigned_inside = false;
+    int nest = 0, shadow = -1; /* a closure's own variable of this name (a loop's k inside a closure): its events are another variable's */
     for (int i = 0; i < nsev; i++) {
+        if (sev[i].kind == 'b') { nest++; continue; }
+        if (sev[i].kind == 'e') { nest--; if (shadow > nest) shadow = -1; continue; }
         if (strcmp(sev[i].name, name) != 0) continue;
+        if (sev[i].kind == 'd' && sev[i].depth > decl_depth && shadow < 0) shadow = nest;
+        if (shadow >= 0) continue;
         if (sev[i].kind == 'u' && sev[i].depth > decl_depth) captured = true;
         if (sev[i].kind == 'a') { assigned = true; if (sev[i].depth > decl_depth) assigned_inside = true; }
     }
@@ -13435,6 +13452,7 @@ static void check_var(Stmt *s, bool global) {
         return;
     }
     check_expr(s->init, s->decl_type);
+    if ((!s->decl_type || s->decl_type->kind == TY_NULLABLE) && !s->init->prechecked) missing_get(s->init); /* const v = m.get(k): T | null, as in TypeScript (XB-217) */
     if (!s->decl_type && pr_async_call(s->init) && !(s->init->func && s->init->func->ret_maybe_sync))
         pr_spawn(s->init); /* const p = f(): the promise (XB-106); f(): T | Promise<T> not async: its value, as JavaScript's sync return */
     if (s->init->type->kind == TY_VOID && tsc_checked() && (!s->decl_type || s->decl_type->kind == TY_UNKNOWN || s->decl_type->kind == TY_VOID)) {
@@ -13701,14 +13719,22 @@ static void check_optchain(Expr *e, Type *expected) {
 }
 /* m.get(k) with a primitive value (a missing key is an error there: get has no null for it), read through ?? or ?.:
    m.has(k) ? m.get(k) : absent, as JavaScript's undefined for a missing key. m a name or a field, k a name or a literal */
+/* a key with no side effect (read twice by the has/get pair): a path, a literal, arithmetic or a + b of them */
+static bool pure_key(Expr *k) {
+    if (!k) return false;
+    if (k->kind == E_BINARY && !k->builtin.cfn && k->op != TK_QQ) return pure_key(k->lhs) && pure_key(k->rhs);
+    if (k->kind == E_CALL && k->builtin.cfn && !strcmp(k->builtin.cfn, "xs_num_key_find") && k->args.len == 1) return pure_key(k->args.items[0]);
+    if (k->kind == E_BINARY) return false;
+    return pure_read(k);
+}
 static bool missing_get(Expr *l) {
     if (!(l->kind == E_MEMBER && l->is_call && l->builtin.cfn && strcmp(l->builtin.cfn, "get") == 0 && l->lhs->type &&
-          l->lhs->type->kind == TY_MAP && l->type && l->type->kind != TY_NULLABLE && l->type->kind != TY_UNKNOWN && rereadable(l->lhs) && l->args.len == 1))
+          l->lhs->type->kind == TY_MAP && l->type && l->type->kind != TY_NULLABLE && l->type->kind != TY_UNKNOWN && pure_read(l->lhs) && l->args.len == 1))
         return false;
     Expr *k = l->args.items[0];
     bool nk = k->kind == E_CALL && k->builtin.cfn && !strcmp(k->builtin.cfn, "xs_nkey") && k->args.len == 1 &&
               (k->args.items[0]->kind == E_IDENT || k->args.items[0]->kind == E_NUMBER || k->args.items[0]->kind == E_NULL); /* (Map<number | null, V>) */
-    if (k->kind != E_IDENT && k->kind != E_STRING && k->kind != E_NUMBER && !nk) return false;
+    if (!pure_key(k) && !nk) return false;
     Expr *get = expr_copy(l);
     Expr *has = xs_alloc(sizeof *has);
     has->kind = E_MEMBER;
