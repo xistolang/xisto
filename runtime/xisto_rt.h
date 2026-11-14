@@ -5416,12 +5416,12 @@ static int xs_exit_code_; /* process.exitCode: the status when the program ends 
 static xs_closure *xs_pexit_cb;
 static void (*xs_rt_cleanup)(void); /* (process.ts's signal dispatcher, let go at the end) */
 XS_NOINLINE void xs_process_on_exit(xs_closure *cb) { if (!xs_pexit_cb) xs_pexit_cb = xs_retain(cb); }
-static void xs_pexit_call(xs_closure *cb, int64_t code, bool before) {
+XS_NOINLINE void xs_pexit_call(xs_closure *cb, int64_t code, bool before) {
     size_t mark = xs_ar_mark();
     ((void (*)(void *, int64_t, bool))cb->fn)(cb, code, before);
     xs_ar_drain(mark);
 }
-static void xs_process_exit(int64_t code) {
+XS_NOINLINE void xs_process_exit(int64_t code) {
     xs_exit_code_ = (int)code;
     if (xs_pexit_cb) { /* 'exit' (not 'beforeExit'), as Node does for process.exit() */
         xs_closure *cb = xs_pexit_cb;
@@ -8854,7 +8854,7 @@ static void xs_map_visit(void *p, xs_visit_cb cb, void *arg) {
     for (size_t i = 0; i < m->cap; i++) if (XS_MAP_FULL(m, i)) cb(&m->slots[i].val.p, arg);
 }
 static void (*xs_exit_hook)(void); /* background work to finish first (Promise.race losers) */
-static void xs_before_exit(void) {
+XS_NOINLINE void xs_before_exit(void) {
     void (*h)(void) = xs_exit_hook;
     xs_exit_hook = NULL;
     if (h) h();
@@ -9180,7 +9180,7 @@ static xs_arr_ref *xs_arr_ref_rlit(xs_region *r, void (*print_elem)(void *), int
     return a;
 }
 
-static void xs_exit(void) {
+XS_NOINLINE void xs_exit(void) {
     xs_out_drain(); /* (a lent part is released before the count below) */
     xs_before_exit();
     if (xs_rc_counting()) { xs_ar_drain(0); for (xs_region *r = xs_regions; r; r = r->next) xs_region_reset(r); xs_gc_collect(); }

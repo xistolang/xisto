@@ -4600,6 +4600,19 @@ static void parse_import(Parser *p, Module *m) {
     if (!has_dflt && at(p, TK_IDENT)) { /* import name from "m": m's default export, which must have this name */
         Token name = p->tok;
         next(p);
+        if (at_ident(p, "from") && peek_is(p, TK_STRING)) {
+            /* import fs from "node:fs" / import path from "path" (esModuleInterop): a Node module's default export is
+               the module itself, so the name reads as import * as name; node:events' default is EventEmitter */
+            Parser look = *p;
+            next(&look);
+            const char *spec = look.tok.str;
+            const char *base = !strncmp(spec, "node:", 5) ? spec + 5 : !strncmp(spec, "xisto:", 6) ? spec + 6 : spec;
+            bool core = !strncmp(spec, "node:", 5) || xs_node_core_name(spec);
+            if (core && strcmp(base, "events") != 0) {
+                ns_register(p, m, name.str);
+                goto from;
+            }
+        }
         im.is_default = true;
         im.names = xs_alloc(sizeof(char *));
         im.positions = xs_alloc(sizeof(Pos));
@@ -6295,10 +6308,11 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         return m;
     }
     { /* Node's modules written in xisto over runtime functions (runtime/node/NAME.ts, NODE_TS in the Makefile) */
-        extern const unsigned char xs_node_events_ts[], xs_node_process_ts[];
+        extern const unsigned char xs_node_events_ts[], xs_node_process_ts[], xs_node_http_ts[];
         static const struct { const char *name; const unsigned char *src; bool net; } node_ts[] = {
             {"events", xs_node_events_ts, false},
             {"process", xs_node_process_ts, true}, /* (signals and the exit hook live with the event loop) */
+            {"http", xs_node_http_ts, true},
         };
         for (size_t i = 0; i < sizeof node_ts / sizeof node_ts[0]; i++) {
             if (strcmp(name, node_ts[i].name) != 0) continue;
@@ -6356,7 +6370,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         add_func(prog, f);
         return m;
     }
-    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:timers, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:timers, xisto:http, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
     return NULL;
 }
 

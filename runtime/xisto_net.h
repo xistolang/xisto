@@ -759,7 +759,7 @@ static bool xs_tmr_timeout(struct timespec *ts) {
     return true;
 }
 /* resumes the coroutines whose timers are due; after(co) runs once each is back on the loop */
-static void xs_run_ready(void);
+static void xs_run_ready(void (*after)(xs_coro *));
 static void xs_tmr_fire(void (*after)(xs_coro *)) {
     uint64_t now = xs_now();
     while (xs_ntmr && xs_tmrs[0].at <= now) {
@@ -771,7 +771,7 @@ static void xs_tmr_fire(void (*after)(xs_coro *)) {
         xs_coro_resume(co);
         if (after) {
             after(co);
-            xs_run_ready(); /* (its microtasks and nextTick callbacks before the next timer's, as in Node) */
+            xs_run_ready(after); /* (its microtasks and nextTick callbacks before the next timer's, as in Node) */
         }
         now = xs_now();
     }
@@ -930,7 +930,7 @@ static void xs_task_after(xs_coro *co) { if (co->done && co->on_done) co->on_don
 static bool xs_par_settled(xs_tgroup *g) { return g->mode == 1 ? g->winner >= 0 : g->pending == 0; }
 /* runs the loop from plain code until stop() (or nothing more can happen) */
 /* runs the ready coroutines (microtasks, woken tasks), the nextTick callbacks first, until none is left */
-static void xs_run_ready(void) {
+static void xs_run_ready(void (*after)(xs_coro *)) {
     while (xs_ready_head || xs_tick_head) {
         xs_coro *co;
         if (xs_esm_first && !xs_ready_head) xs_esm_first = false;
@@ -944,22 +944,25 @@ static void xs_run_ready(void) {
             if (!xs_ready_head) xs_ready_tail = NULL;
         }
         xs_coro_resume(co);
-        if (co->done && co->on_done) co->on_done(co);
+        after(co);
     }
+}
+/* the check phase: the immediates queued so far go to the ready list (those they queue wait for the next one) */
+static bool xs_imm_phase(void) {
+    if (!xs_imm_head) return false;
+    xs_coro *first = xs_imm_head, *last = xs_imm_tail;
+    xs_imm_head = xs_imm_tail = NULL;
+    if (xs_ready_tail) xs_ready_tail->next = first; else xs_ready_head = first;
+    xs_ready_tail = last;
+    return true;
 }
 XS_NOINLINE void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_ms) {
     if (xs_kq < 0) xs_kq = kqueue();
     struct kevent evs[64];
     for (;;) {
-        xs_run_ready();
+        xs_run_ready(xs_task_after);
         xs_esm_first = false;
-        if (xs_imm_head) { /* the check phase: the immediates queued so far (those they queue wait for the next one) */
-            xs_coro *first = xs_imm_head, *last = xs_imm_tail;
-            xs_imm_head = xs_imm_tail = NULL;
-            if (xs_ready_tail) xs_ready_tail->next = first; else xs_ready_head = first;
-            xs_ready_tail = last;
-            continue;
-        }
+        if (xs_imm_phase()) continue;
         xs_coro_flush_dead();
         xs_unh_check();
         if (stop && stop(arg)) return;
@@ -1030,8 +1033,16 @@ XS_NOINLINE void xs_par_check(xs_tgroup *g) {
 }
 static inline xs_val xs_par_take(xs_tgroup *g, int i) { g->t[i].taken = true; return g->t[i].out; }
 /* the program ends when the background tasks (race losers) do, as in Node */
-static void xs_ttasks_unref_drop(void);
-XS_NOINLINE void xs_tasks_drain(void) { if (xs_tasks_live > 0 && !xs_cur_coro) xs_loop_run(NULL, NULL, -1); xs_unh_check(); xs_ttasks_unref_drop(); }
+/* set only by programs that use them (the runtime's sections are compiled in only when used): node:http's server,
+   which runs the loop until it is closed, and the timers that were unref'd, let go at the end */
+static void (*xs_http_pending)(void);
+static void (*xs_unref_drop)(void);
+XS_NOINLINE void xs_tasks_drain(void) {
+    if (xs_http_pending && !xs_cur_coro) { void (*h)(void) = xs_http_pending; xs_http_pending = NULL; h(); }
+    if (xs_tasks_live > 0 && !xs_cur_coro) xs_loop_run(NULL, NULL, -1);
+    xs_unh_check();
+    if (xs_unref_drop) xs_unref_drop();
+}
 
 /* ---- Promise values (XB-106) ----
    await f() and a statement f() call the async function directly (its I/O parks the caller): no promise is made.
@@ -2731,10 +2742,11 @@ static bool xs_server_flush(xs_client *c) {
     return true;
 }
 
-typedef struct { xs_Server *s; int64_t port; int index; int lfd; } xs_worker_args;
+typedef struct { xs_Server *s; int64_t port; int index; int lfd; bool inline_loop; } xs_worker_args; /* inline_loop: node:http (below) */
 
 /* ---- graceful shutdown: SIGTERM/SIGINT stop accepting, in-flight requests finish, then the process exits ---- */
 static volatile sig_atomic_t xs_shutting_down;
+static bool xs_http_closing; /* node:http's server.close() (xs_http_close, below) */
 static uint64_t xs_psig_mask; /* the signals process.on watches (runtime/node/process.ts): the server leaves them to it */
 static uint64_t xs_shutdown_t0;
 static int xs_sig_pipe[2] = {-1, -1};
@@ -2861,6 +2873,45 @@ XS_NOINLINE void xs_Server_listen(xs_Server *s, int64_t port) {
     xs_server_worker(&a);
 }
 
+/* ---- node:http (runtime/node/http.ts): server.listen() binds at once and returns, as Node's does; the server
+   runs on the program's event loop once the program's own code is done (xs_tasks_drain), and server.close() lets
+   the loop end (the program then exits when nothing else is pending) instead of exiting at once ---- */
+static xs_Server *xs_http_srv;
+static int xs_http_lfd = -1;
+static int64_t xs_http_port;
+XS_NOINLINE void xs_http_serve(void);
+XS_NOINLINE int64_t xs_http_bind(xs_Server *s, int64_t port) {
+    if (xs_http_srv) xs_panic("node:http: one server per program (xisto)");
+    xs_resolver_warm();
+    signal(SIGPIPE, SIG_IGN);
+    int lfd = xs_listen_socket(port);
+    struct sockaddr_in a;
+    socklen_t al = sizeof a;
+    if (getsockname(lfd, (struct sockaddr *)&a, &al) == 0) port = ntohs(a.sin_port);
+    xs_http_srv = xs_retain(s);
+    xs_http_lfd = lfd;
+    xs_http_port = port;
+    if (xs_kq < 0) xs_kq = kqueue();
+    xs_http_pending = xs_http_serve;
+    xs_exit_hook = xs_tasks_drain;
+    return port;
+}
+XS_NOINLINE void xs_http_close(void) {
+    if (xs_http_lfd < 0 && !xs_http_srv) return;
+    xs_http_closing = true;
+    xs_shutting_down = 1;
+    if (!xs_shutdown_t0) xs_shutdown_t0 = xs_now();
+}
+XS_NOINLINE void xs_http_serve(void) {
+    xs_Server *s = xs_http_srv;
+    xs_worker_args a = {s, xs_http_port, 0, xs_http_lfd, true};
+    if (!xs_http_closing) xs_server_worker(&a);
+    else close(xs_http_lfd);
+    xs_http_srv = NULL;
+    xs_http_lfd = -1;
+    xs_shutdown_t0 = 0;
+    xs_release(s);
+}
 XS_NOINLINE void *xs_server_worker(void *arg) {
     xs_worker_args *wa = arg;
     xs_Server *s = wa->s;
@@ -2868,30 +2919,35 @@ XS_NOINLINE void *xs_server_worker(void *arg) {
     int lfd = wa->lfd;
     int one = 1;
 
-    int kq = kqueue();
+    /* node:http's server shares the program's event loop: its pending timers and sockets go on (xs_kq) */
+    int kq = wa->inline_loop && xs_kq >= 0 ? xs_kq : kqueue();
     xs_kq = kq;
     struct kevent ev;
     EV_SET(&ev, lfd, EVFILT_READ, EV_ADD, 0, 0, &xs_listen_tag);
     kevent(kq, &ev, 1, NULL, 0, NULL);
-    if (wa->index == 0) fprintf(stderr, "xisto: listening on %s://127.0.0.1:%lld\n", s->cred ? "https" : "http", (long long)port);
+    if (wa->index == 0 && !wa->inline_loop) fprintf(stderr, "xisto: listening on %s://127.0.0.1:%lld\n", s->cred ? "https" : "http", (long long)port);
     fflush(stdout);
 
     xs_server_signals(kq);
     struct kevent events[256];
     for (;;) {
         xs_coro_flush_dead();
+        if (xs_shutting_down && xs_inflight_total == 0 && wa->inline_loop && xs_http_closing) {
+            /* node:http's server.close(): no more connections; the program goes on (its loop, then its end) */
+            EV_SET(&ev, lfd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+            kevent(kq, &ev, 1, NULL, 0, NULL);
+            close(lfd); /* (idle keep-alive connections stay open until the program ends; their events are ignored) */
+            xs_shutting_down = 0;
+            xs_http_closing = false;
+            return NULL;
+        }
         if (xs_shutting_down && xs_inflight_total == 0) {
             if (wa->index == 0) fprintf(stderr, "xisto: shutdown complete\n");
             fflush(stdout);
             _exit(0);
         }
-        while (xs_ready_head) { /* coroutines woken by a channel */
-            xs_coro *co = xs_ready_head;
-            xs_ready_head = co->next;
-            if (!xs_ready_head) xs_ready_tail = NULL;
-            xs_coro_resume(co);
-            xs_coro_after(co);
-        }
+        do xs_run_ready(xs_coro_after); /* coroutines woken by a channel, microtasks, nextTick callbacks */
+        while (xs_imm_phase());           /* (and setImmediate's) */
         xs_coro_flush_dead();
         xs_clients_flush_dead();
         struct timespec zero = {0, 0}, tick = {0, 200000000}, tt;
@@ -3602,7 +3658,7 @@ static void xs_coro_fifo_push(xs_coro **head, xs_coro **tail, xs_coro *co) {
     if (*tail) (*tail)->next = co; else *head = co;
     *tail = co;
 }
-static xs_ttask *xs_ttask_new(xs_closure *cb) {
+XS_NOINLINE xs_ttask *xs_ttask_new(xs_closure *cb) {
     if (xs_kq < 0) xs_kq = kqueue();
     xs_ttask *t = calloc(1, sizeof *t);
     t->cb = xs_retain(cb);
@@ -3637,9 +3693,10 @@ static xs_ttask *xs_ttask_find(int64_t id) {
     return NULL;
 }
 /* timer.unref() / ref() / hasRef() / refresh() on the id setTimeout gave (Node: methods of its Timeout object) */
+static void xs_ttasks_unref_drop(void);
 XS_NOINLINE int64_t xs_timer_unref(int64_t id) {
     xs_ttask *t = xs_ttask_find(id);
-    if (t && !t->unref && !t->cancelled) { t->unref = true; xs_tasks_live--; }
+    if (t && !t->unref && !t->cancelled) { t->unref = true; xs_tasks_live--; xs_unref_drop = xs_ttasks_unref_drop; }
     return id;
 }
 XS_NOINLINE int64_t xs_timer_ref(int64_t id) {
@@ -3657,7 +3714,7 @@ XS_NOINLINE int64_t xs_timer_refresh(int64_t id) {
     return id;
 }
 /* at the end: timers that were unref'd and never fired let go of their callbacks (Node exits with them pending) */
-static void xs_ttasks_unref_drop(void) {
+static void xs_ttasks_unref_drop(void) { /* (xs_unref_drop) */
     for (xs_ttask *t = xs_ttasks; t; t = t->next)
         if (t->unref && t->cb) { t->cancelled = true; xs_closure *cb = t->cb; t->cb = NULL; xs_release(cb); }
 }
