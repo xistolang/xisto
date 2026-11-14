@@ -8963,7 +8963,37 @@ static uint64_t xs_started;
 #include <fcntl.h>
 #include <io.h>
 #endif
+#if !defined(_WIN32)
+#include <signal.h>
+/* a read through a null reference (the hole of a new Array<T[]>(n) never set: JavaScript throws a TypeError there) said as
+   a run-time error with the status 70 of the others, not a silent segmentation fault; any other fault keeps its default */
+static void xs_null_fault(int sig, siginfo_t *si, void *uc) {
+    (void)uc;
+    if ((uintptr_t)si->si_addr < 65536) {
+        static const char m[] = "runtime error: null reference: read of an element that was never set (a hole of new Array<T>(n)); fill it first\n";
+        xs_out_drain();
+        fflush(stdout);
+        if (write(2, m, sizeof m - 1) < 0) {}
+        _exit(70);
+    }
+    signal(sig, SIG_DFL);
+}
+static void xs_fault_init(void) {
+    static char stk[65536];
+    stack_t ss = {.ss_sp = stk, .ss_size = sizeof stk};
+    sigaltstack(&ss, NULL);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = xs_null_fault;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
+#endif
 static void xs_init(int argc, char **argv) {
+#if !defined(_WIN32)
+    xs_fault_init();
+#endif
 #if defined(_WIN32) /* bytes as written, as Node does: no \r\n translation on the standard streams */
     _setmode(_fileno(stdout), _O_BINARY);
     _setmode(_fileno(stderr), _O_BINARY);
