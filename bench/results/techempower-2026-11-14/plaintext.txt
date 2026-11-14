@@ -1,0 +1,35 @@
+# 2026-11-14T17:51:33 gen=wrk levels=256,1024,4096,16384 duration=15s repeat=3 xisto_workers=2 cpus=2
+# test side name req/s p50_ms p99_ms cpu_ms_per_1k_req rss_MB valid
+plaintext-c256 xisto xisto-native 331283 6.830 16.740 6.0 41.9 ok
+plaintext-c1024 xisto xisto-native 302379 29.210 70.370 6.5 41.9 ok
+plaintext-c4096 xisto xisto-native 278373 127.420 332.690 7.1 41.9 ok
+plaintext-c16384 xisto xisto-native 90153 538.590 1840.000 8.4 43.5 ok
+plaintext-c256 xisto xisto-nest 97339 23.280 48.600 14.0 69.1 ok
+plaintext-c1024 xisto xisto-nest 94755 93.560 216.350 14.3 69.0 ok
+plaintext-c4096 xisto xisto-nest 92809 370.660 830.260 14.7 70.5 ok
+plaintext-c16384 xisto xisto-nest 217 82.520 82.920 236.5 70.4 ok
+# xisto crashed xisto-nest-nolock during the load (exit 70): see bench/out/te-xisto-nest-nolock.log
+plaintext-c256 xisto xisto-nest-procs 199633 12.150 0.000 9.9 74.3 ok
+plaintext-c1024 xisto xisto-nest-procs 193004 46.210 99.450 10.2 74.3 ok
+plaintext-c4096 xisto xisto-nest-procs 179739 193.360 444.780 11.0 74.3 ok
+plaintext-c16384 xisto xisto-nest-procs 29311 845.890 2400.000 14.5 74.8 ok
+plaintext-c256 ref actix 569578 4.000 0.000 3.5 325.4 ok
+plaintext-c1024 ref actix 528068 17.220 145.500 3.7 329.0 ok
+plaintext-c4096 ref actix 478056 81.980 0.000 4.1 349.5 ok
+plaintext-c16384 ref actix 329444 341.900 2080.000 4.9 559.0 ok
+plaintext-c256 ref go-std 41543 54.800 179.710 47.5 63.0 ok
+plaintext-c1024 ref go-std 44209 205.990 450.490 44.9 84.8 ok
+plaintext-c4096 ref go-std 44851 781.170 1540.000 44.3 178.3 ok
+plaintext-c16384 ref go-std 32751 2970.000 6590.000 62.5 558.8 ok
+plaintext-c256 ref nodejs 51439 44.840 3550.000 38.6 550.3 ok
+plaintext-c1024 ref nodejs 51486 111.530 4080.000 39.1 609.4 ok
+plaintext-c4096 ref nodejs 51171 288.670 897.960 39.9 613.6 ok
+plaintext-c16384 ref nodejs 34508 2280.000 6800.000 64.4 632.5 ok
+plaintext-c256 ref fastify 33618 69.050 5920.000 59.1 726.9 ok
+plaintext-c1024 ref fastify 35207 144.230 3700.000 57.4 727.8 ok
+plaintext-c4096 ref fastify 35972 386.100 1550.000 58.3 728.9 ok
+plaintext-c16384 ref fastify 22978 2690.000 7040.000 103.4 789.1 ok
+plaintext-c256 ref bun 113731 19.670 79.710 18.0 92.4 ok
+plaintext-c1024 ref bun 113997 77.610 371.900 17.2 93.0 ok
+plaintext-c4096 ref bun 114082 303.900 1380.000 17.4 94.4 ok
+plaintext-c16384 ref bun 89059 1190.000 5710.000 19.2 98.0 ok

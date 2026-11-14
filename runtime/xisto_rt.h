@@ -9864,7 +9864,7 @@ static uint64_t xs_started;
 static void xs_null_fault(int sig, siginfo_t *si, void *uc) {
     (void)uc;
     if ((uintptr_t)si->si_addr < 65536) {
-        static const char m[] = "runtime error: null reference: read of an element that was never set (a hole of new Array<T>(n)); fill it first\n";
+        static const char m[] = "runtime error: null reference: a read through an empty slot (an element never set, such as a hole of new Array<T>(n), or state shared between workers without the lock)\n";
         xs_out_drain();
         fflush(stdout);
         if (write(2, m, sizeof m - 1) < 0) {}
