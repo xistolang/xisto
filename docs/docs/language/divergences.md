@@ -26,7 +26,7 @@ Every row was checked on 12 Nov 2026 by running the same program with xisto and 
 |---|---|---|---|
 | `undefined` | a value | read as `null`, warning XS2101 | one empty value |
 | absent optional field `=== null` | `false` | `true` | absent reads as `null`; use `== null` |
-| `Map.get` of a missing key | `undefined` | `null`; for an `int` value a run-time error | no `undefined` |
+| `Map.get` of a missing key | `undefined` | `null`; with an `int`, `number` or `boolean` value that is so for `m.get(k) ?? d` and `const v = m.get(k)` (`v` is `T \| null`), any other use of the result is a run-time error (check with `has()` first) | no `undefined` |
 | field missing on an `any` | `undefined` | `null` | |
 | `x!`, `x as T`, `base as Sub` | trusted | checked: `TypeError` | nothing silent |
 | `arr[i]`, `bytes[i]` out of bounds | `undefined` | run-time error (catchable) | |

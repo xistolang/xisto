@@ -13435,6 +13435,7 @@ static void check_var(Stmt *s, bool global) {
         return;
     }
     check_expr(s->init, s->decl_type);
+    if ((!s->decl_type || s->decl_type->kind == TY_NULLABLE) && !s->init->prechecked) missing_get(s->init); /* const v = m.get(k): T | null, as in TypeScript (XB-217) */
     if (!s->decl_type && pr_async_call(s->init) && !(s->init->func && s->init->func->ret_maybe_sync))
         pr_spawn(s->init); /* const p = f(): the promise (XB-106); f(): T | Promise<T> not async: its value, as JavaScript's sync return */
     if (s->init->type->kind == TY_VOID && tsc_checked() && (!s->decl_type || s->decl_type->kind == TY_UNKNOWN || s->decl_type->kind == TY_VOID)) {
@@ -13701,14 +13702,22 @@ static void check_optchain(Expr *e, Type *expected) {
 }
 /* m.get(k) with a primitive value (a missing key is an error there: get has no null for it), read through ?? or ?.:
    m.has(k) ? m.get(k) : absent, as JavaScript's undefined for a missing key. m a name or a field, k a name or a literal */
+/* a key with no side effect (read twice by the has/get pair): a path, a literal, arithmetic or a + b of them */
+static bool pure_key(Expr *k) {
+    if (!k) return false;
+    if (k->kind == E_BINARY && !k->builtin.cfn && k->op != TK_QQ) return pure_key(k->lhs) && pure_key(k->rhs);
+    if (k->kind == E_CALL && k->builtin.cfn && !strcmp(k->builtin.cfn, "xs_num_key_find") && k->args.len == 1) return pure_key(k->args.items[0]);
+    if (k->kind == E_BINARY) return false;
+    return pure_read(k);
+}
 static bool missing_get(Expr *l) {
     if (!(l->kind == E_MEMBER && l->is_call && l->builtin.cfn && strcmp(l->builtin.cfn, "get") == 0 && l->lhs->type &&
-          l->lhs->type->kind == TY_MAP && l->type && l->type->kind != TY_NULLABLE && l->type->kind != TY_UNKNOWN && rereadable(l->lhs) && l->args.len == 1))
+          l->lhs->type->kind == TY_MAP && l->type && l->type->kind != TY_NULLABLE && l->type->kind != TY_UNKNOWN && pure_read(l->lhs) && l->args.len == 1))
         return false;
     Expr *k = l->args.items[0];
     bool nk = k->kind == E_CALL && k->builtin.cfn && !strcmp(k->builtin.cfn, "xs_nkey") && k->args.len == 1 &&
               (k->args.items[0]->kind == E_IDENT || k->args.items[0]->kind == E_NUMBER || k->args.items[0]->kind == E_NULL); /* (Map<number | null, V>) */
-    if (k->kind != E_IDENT && k->kind != E_STRING && k->kind != E_NUMBER && !nk) return false;
+    if (!pure_key(k) && !nk) return false;
     Expr *get = expr_copy(l);
     Expr *has = xs_alloc(sizeof *has);
     has->kind = E_MEMBER;
