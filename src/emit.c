@@ -3412,9 +3412,24 @@ static void emit_expr_raw(Expr *e) {
                 buf_puts(out, "))");
                 return;
             }
+            if (c->builtin && strcmp(c->name, "Error") == 0 && !(lt->kind == TY_OBJECT && lt->cls->builtin)) {
+                /* x instanceof Error with x an any or a union: the built-in Error or any used class that extends it */
+                static int nei;
+                int id = nei++;
+                buf_printf(out, "({ void *ei%d_ = (void *)(", id);
+                emit_expr(e->lhs);
+                buf_printf(out, "); void (*ef%d_)(void *) = ei%d_ ? xs_type_of(ei%d_)->free : NULL; (ef%d_ && (ef%d_ == xs_Error_free", id, id, id, id, id);
+                for (int i = 0; i < prog->nclasses; i++) {
+                    Class *k = prog->classes[i];
+                    if (k->used && k->cname && !k->builtin && !k->is_interface && !k->ntparams && is_error_class(k)) buf_printf(out, " || ef%d_ == %s_free", id, k->cname);
+                }
+                buf_puts(out, ")); })");
+                return;
+            }
             buf_puts(out, "xs_is_a(");
             emit_expr(e->lhs);
             buf_printf(out, ", %s)", strcmp(c->name, "Error") == 0 ? "xs_Error_free" : c->builtin && strcmp(c->name, "Date") == 0 ? "xs_Date_free" :
+                       c->builtin && strcmp(c->name, "RegExp") == 0 ? "xs_RegExp_free" :
                        c->builtin && (strcmp(c->name, "Uint8Array") == 0 || strcmp(c->name, "Buffer") == 0) ? "xs_u8_free" :
                        c->builtin ? "NULL" : xs_sprintf("%s_free", c->cname));
             return;
@@ -9652,7 +9667,11 @@ static void emit_class(Class *c) {
             break;
         case TY_MAP: case TY_SET: buf_printf(out, "xs_print_map(self->%s);", fd->cname); break;
         case TY_UNION: buf_printf(out, "xs_print_any_quoted(self->%s);", fd->cname); break;
-        case TY_UNKNOWN: if (ty_is_undef(fd->type)) { buf_puts(out, "fputs(\"undefined\", XS_OUT);"); break; } /* fallthrough */
+        case TY_NULL: buf_puts(out, "fputs(\"null\", XS_OUT);"); break; /* { a: null } */
+        case TY_UNKNOWN:
+            if (ty_is_undef(fd->type)) buf_puts(out, "fputs(\"undefined\", XS_OUT);");
+            else buf_printf(out, "xs_print_any_quoted(self->%s);", fd->cname); /* ({ a: null }: an unknown holding null) */
+            break;
         default: break;
         }
         if (fd->optional) buf_puts(out, " }");

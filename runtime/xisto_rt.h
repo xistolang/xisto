@@ -86,6 +86,9 @@ static XS_TLS int xs_insp_rt;      /* recurseTimes of the container being printe
 static XS_TLS int xs_insp_cur;     /* ctx.currentDepth */
 static XS_TLS void **xs_insp_seen;
 static XS_TLS int xs_insp_nseen, xs_insp_seencap;
+/* util.inspect's options (runtime/node/util.ts sets them for one call; console.log keeps Node's defaults): depth,
+   breakLength, compact (a number; 0 is compact: false) */
+static XS_TLS int64_t xs_insp_depth = 2, xs_insp_brk = 80, xs_insp_compact = 3;
 static XS_TLS void **xs_circ_obj;
 static XS_TLS int xs_ncirc, xs_circcap;
 static int xs_circ_id(void *o, bool add) {
@@ -101,7 +104,7 @@ static __attribute__((noinline)) bool xs_insp_begin(xs_insp *fr, void *obj, cons
     for (int i = 0; obj && i < xs_insp_nseen; i++)
         if (xs_insp_seen[i] == obj) { fprintf(XS_OUT, "[Circular *%d]", xs_circ_id(obj, true)); return false; }
     if (empty) { fputs(empty, XS_OUT); return false; }
-    if (xs_insp_rt > 2) { fprintf(XS_OUT, "[%s]", name); return false; }
+    if (xs_insp_rt > xs_insp_depth) { fprintf(XS_OUT, "[%s]", name); return false; }
     if (xs_insp_nseen == 0) xs_ncirc = 0; /* a new top-level value */
     if (xs_insp_nseen == xs_insp_seencap) { xs_insp_seencap = xs_insp_seencap ? xs_insp_seencap * 2 : 16; xs_insp_seen = realloc(xs_insp_seen, sizeof(void *) * (size_t)xs_insp_seencap); }
     xs_insp_seen[xs_insp_nseen++] = obj;
@@ -160,7 +163,7 @@ static __attribute__((noinline)) void xs_insp_end(xs_insp *fr, const char *open,
         char **out = NULL;
         size_t *olen = NULL;
         bool grouped = false;
-        if (array && n > 6) {
+        if (array && n > 6 && xs_insp_compact >= 1) {
             int outputLength = more ? n - 1 : n;
             size_t totalLength = 0, maxLength = 0, sep = 2;
             size_t *dataLen = malloc(sizeof(size_t) * (size_t)n);
@@ -170,11 +173,11 @@ static __attribute__((noinline)) void xs_insp_end(xs_insp *fr, const char *open,
                 if (maxLength < dataLen[i]) maxLength = dataLen[i];
             }
             size_t actualMax = maxLength + sep;
-            if (actualMax * 3 + (size_t)xs_insp_level < 80 && ((double)totalLength / (double)actualMax > 5 || maxLength <= 6)) {
+            if ((int64_t)(actualMax * 3 + (size_t)xs_insp_level) < xs_insp_brk && ((double)totalLength / (double)actualMax > 5 || maxLength <= 6)) {
                 double averageBias = sqrt((double)actualMax - (double)totalLength / (double)n);
                 double biasedMax = fmax((double)actualMax - 3 - averageBias, 1);
                 double c1 = round(sqrt(2.5 * biasedMax * (double)outputLength) / biasedMax);
-                double c2 = floor((80.0 - (double)xs_insp_level) / (double)actualMax);
+                double c2 = floor(((double)xs_insp_brk - (double)xs_insp_level) / (double)actualMax);
                 int columns = (int)fmin(fmin(c1, c2), fmin(3 * 4, 15));
                 if (columns > 1) {
                     size_t *maxLineLength = malloc(sizeof(size_t) * (size_t)columns);
@@ -222,13 +225,13 @@ static __attribute__((noinline)) void xs_insp_end(xs_insp *fr, const char *open,
         const char **e = grouped ? (const char **)out : ent;
         size_t *el = grouped ? olen : len;
         bool single = false;
-        if (xs_insp_cur - fr->recurse < 3 && on == n) {
+        if (xs_insp_cur - fr->recurse < xs_insp_compact && on == n) {
             size_t start = (size_t)on + (size_t)xs_insp_level + strlen(open) + baselen + 10;
             size_t totalLength = (size_t)on + start;
-            bool below = totalLength + (size_t)on <= 80;
+            bool below = (int64_t)(totalLength + (size_t)on) <= xs_insp_brk;
             for (int i = 0; i < on && below; i++) {
                 totalLength += xs_cp_len(e[i], el[i]);
-                if (totalLength > 80) below = false;
+                if ((int64_t)totalLength > xs_insp_brk) below = false;
             }
             bool nl = false;
             for (int i = 0; i < on && !nl; i++) if (memchr(e[i], '\n', el[i])) nl = true;
@@ -4418,15 +4421,52 @@ static void xs_print_num(double v) {
 static void xs_print_int(int64_t v) { char buf[24]; size_t n = xs_itoa(v, buf); fwrite(buf, 1, n, XS_OUT); }
 static void xs_print_bool(bool b) { fputs(b ? "true" : "false", XS_OUT); }
 static void xs_print_str(xs_str *s) { fwrite(s->data, 1, (size_t)s->len, XS_OUT); }
-static void xs_print_str_quoted(xs_str *s) { /* as Node prints strings inside objects */
-    fputc('\'', XS_OUT);
-    for (int64_t i = 0; i < s->len; i++) {
-        char c = s->data[i];
-        if (c == '\'') fputs("\\'", XS_OUT);
-        else if (c == '\n') fputs("\\n", XS_OUT);
-        else fputc(c, XS_OUT);
+/* one string as util.inspect's strEscape writes it: in '...', or "..." when it has a ' and no ", or `...` when it has
+   both and no ` or ${; control characters, the quote and \ escaped */
+XS_NOINLINE void xs_print_quoted_part(const char *d, int64_t n) {
+    bool sq = memchr(d, '\'', (size_t)n) != NULL;
+    char q = '\'';
+    if (sq) {
+        if (!memchr(d, '"', (size_t)n)) q = '"';
+        else if (!memchr(d, '`', (size_t)n) && !memmem(d, (size_t)n, "${", 2)) q = '`';
     }
-    fputc('\'', XS_OUT);
+    FILE *o = XS_OUT;
+    fputc(q, o);
+    for (int64_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)d[i];
+        if (c == '\'' && q == '\'') fputs("\\'", o);
+        else if (c == '\\') fputs("\\\\", o);
+        else if (c < 0x20 || c == 0x7f) {
+            switch (c) {
+            case '\b': fputs("\\b", o); break;
+            case '\t': fputs("\\t", o); break;
+            case '\n': fputs("\\n", o); break;
+            case '\f': fputs("\\f", o); break;
+            case '\r': fputs("\\r", o); break;
+            default: fprintf(o, "\\x%02X", c);
+            }
+        } else if (c == 0xC2 && i + 1 < n && (unsigned char)d[i + 1] >= 0x80 && (unsigned char)d[i + 1] <= 0x9F) { /* U+0080..U+009F */
+            fprintf(o, "\\x%02X", (unsigned char)d[++i]);
+        } else fputc((char)c, o);
+    }
+    fputc(q, o);
+}
+static void xs_print_str_quoted(xs_str *s) { /* as Node prints strings inside objects */
+    /* a long string with line breaks: one quoted piece per line, joined by " +" (formatPrimitive) */
+    size_t cps;
+    if (xs_insp_compact >= 0 && s->len > 16 && memchr(s->data, '\n', (size_t)s->len) && (cps = xs_cp_len(s->data, (size_t)s->len)) > 16 &&
+        (int64_t)cps > xs_insp_brk - xs_insp_level - 4) {
+        const char *p = s->data, *end = s->data + s->len;
+        while (p < end) {
+            const char *nl = memchr(p, '\n', (size_t)(end - p));
+            const char *q = nl ? nl + 1 : end;
+            if (p != s->data) { fputs(" +\n", XS_OUT); for (int i = 0; i < xs_insp_level + 2; i++) fputc(' ', XS_OUT); }
+            xs_print_quoted_part(p, q - p);
+            p = q;
+        }
+        return;
+    }
+    xs_print_quoted_part(s->data, s->len);
 }
 #ifdef XS_DEBUG
 /* > 0 while the debugger renders a value: the nesting it may still print. A cycle (parent <-> child) would
@@ -7241,6 +7281,255 @@ XS_NOINLINE xs_TextEncoder *xs_TextEncoder_new(void) { return xs_obj_alloc(sizeo
 XS_NOINLINE xs_TextEncoder *xs_TextDecoder_new(void) { return xs_obj_alloc(sizeof(xs_TextEncoder), xs_TextEncoder_free, xs_TextDecoder_print); }
 XS_NOINLINE xs_Uint8Array *xs_TextEncoder_encode(xs_TextEncoder *t, xs_str *s) { (void)t; return xs_text_encode(s); }
 static xs_str *xs_TextDecoder_decode(xs_TextEncoder *t, xs_Uint8Array *b) { (void)t; return xs_text_decode(b); }
+
+/* ---- node:util (runtime/node/util.ts): inspect into a string, the kind of a value, deep equality ---- */
+/* util.inspect(v): what console.log prints for v inside an object (a string quoted), with depth (recursion levels
+   shown), breakLength and compact (a number; 0 is compact: false) for this call only */
+XS_NOINLINE xs_str *xs_util_inspect(void *v, int64_t depth, int64_t brk, int64_t compact) {
+    int64_t sd = xs_insp_depth, sb = xs_insp_brk, sc = xs_insp_compact;
+    FILE *saved = xs_out_f;
+    char *buf = NULL;
+    size_t size = 0;
+    FILE *f = open_memstream(&buf, &size);
+    xs_out_f = f;
+    xs_insp_depth = depth;
+    xs_insp_brk = brk;
+    xs_insp_compact = compact;
+    xs_print_any_quoted(v);
+    xs_insp_depth = sd;
+    xs_insp_brk = sb;
+    xs_insp_compact = sc;
+    xs_out_f = saved;
+    fclose(f);
+    xs_str *r = xs_str_new(buf ? buf : "", size);
+    free(buf);
+    return r;
+}
+/* what a value is (util.types and format): 0 null, 1 string, 2 number, 3 boolean, 4 array, 5 Map, 6 Set, 7 Date,
+   9 Error (the built-in class), 10 function, 11 symbol, 12 bigint, 13 Uint8Array (Buffer), 14 Float64Array,
+   15 Int32Array, 16 SharedArrayBuffer, 18 another object (a class's), 19 an object of an interface, 20 a Record
+   (an object made as an any) */
+XS_NOINLINE int64_t xs_util_kind(void *v) {
+    if (!v) return 0;
+    const xs_type *t = xs_type_of(v);
+    void (*f)(void *) = t->free;
+    if (f == xs_str_free) return 1;
+    if (f == xs_box_num_free || f == xs_box_int_free) return 2;
+    if (f == xs_box_bool_free) return 3;
+    if (f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free) return 4;
+    if (f == xs_map_free) { xs_map *m = v; return m->record ? 20 : m->is_map ? 5 : 6; }
+    if (f == xs_Date_free) return 7;
+    if (f == xs_Error_free) return 9;
+    if (t->print == xs_print_closure) return 10;
+    if (f == xs_Symbol_free) return 11;
+    if (f == xs_big_free_fn) return 12;
+    if (f == xs_u8_free) return 13;
+    if (f == xs_f64_free) return 14;
+    if (f == xs_i32_free) return 15;
+    if (f == xs_sab_free) return 16;
+    if (t->dyn && t->dyn->shape) return 19;
+    return 18;
+}
+/* the object's class declares a method of that name (format's %s calls a toString of the program's own) */
+XS_NOINLINE bool xs_util_has_method(void *v, xs_str *name) {
+    if (!v) return false;
+    const xs_type *t = xs_type_of(v);
+    return t->dyn && xs_dyn_has_method(t->dyn, name);
+}
+/* a value seen by isDeepStrictEqual: an element of a typed array or a Map value is read without boxing */
+typedef struct { int k; double d; void *p; } xs_uv; /* k: 0 null, 1 number, 2 boolean (d), 3 reference (p) */
+static xs_uv xs_uv_ref(void *p) {
+    xs_uv u = {0, 0, NULL};
+    if (!p) return u;
+    void (*f)(void *) = xs_type_of(p)->free;
+    if (f == xs_box_num_free) { u.k = 1; u.d = ((xs_box_d *)p)->v; }
+    else if (f == xs_box_int_free) { u.k = 1; u.d = (double)((xs_box_i *)p)->v; }
+    else if (f == xs_box_bool_free) { u.k = 2; u.d = (double)((xs_box_i *)p)->v; }
+    else { u.k = 3; u.p = p; }
+    return u;
+}
+static xs_uv xs_uv_map_val(xs_map *m, xs_val v) {
+    xs_uv u = {0, 0, NULL};
+    switch (m->val_kind) {
+    case 0: if (xs_isnull_num(v.d)) return u; u.k = 1; u.d = v.d; return u;
+    case 1: if (v.i == XS_NULL_INT) return u; u.k = 1; u.d = (double)v.i; return u;
+    case 2: u.k = 2; u.d = (double)(v.i != 0); return u;
+    default: return xs_uv_ref(v.p);
+    }
+}
+static bool xs_util_deq(void *a, void *b, int depth);
+static bool xs_uv_eq(xs_uv a, xs_uv b, int depth) {
+    if (a.k != b.k) return false;
+    if (a.k == 0) return true;
+    if (a.k == 1) return a.d == b.d ? (a.d != 0 || signbit(a.d) == signbit(b.d)) : (a.d != a.d && b.d != b.d); /* Object.is */
+    if (a.k == 2) return a.d == b.d;
+    return xs_util_deq(a.p, b.p, depth);
+}
+static size_t xs_uv_arr_len(void *a) { return ((xs_arr_ref *)a)->len; } /* (the arrays share the layout of len) */
+static xs_uv xs_uv_arr_at(void *a, size_t i) {
+    void (*f)(void *) = xs_type_of(a)->free;
+    xs_uv u = {0, 0, NULL};
+    if (f == xs_arr_ref_free) return xs_uv_ref(((xs_arr_ref *)a)->data[i]);
+    if (f == xs_arr_num_free) { double d = ((xs_arr_num *)a)->data[i]; if (xs_isnull_num(d)) return u; u.k = 1; u.d = d; return u; }
+    if (f == xs_arr_int_free) { int64_t x = ((xs_arr_int *)a)->data[i]; if (x == XS_NULL_INT) return u; u.k = 1; u.d = (double)x; return u; }
+    u.k = 2; u.d = ((xs_arr_bool *)a)->data[i];
+    return u;
+}
+static bool xs_is_arr(void (*f)(void *)) { return f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free; }
+/* the own enumerable keys of a plain object (an interface's object: its fields, an optional one left out not
+   counted; a Record: its entries) and the value under a key; false when the object has no such key */
+static int64_t xs_plain_count(void *o) {
+    if (xs_type_of(o)->free == xs_map_free) return (int64_t)((xs_map *)o)->count;
+    const xs_dyn_cls *c = xs_type_of(o)->dyn;
+    int64_t n = 0;
+    for (int32_t i = 0; i < c->n; i++) {
+        if (c->f[i].optional) { void *v = xs_dyn_load(&c->f[i], o); bool there = v != NULL; xs_release(v); if (!there) continue; }
+        n++;
+    }
+    return n;
+}
+static bool xs_plain_get(void *o, const char *k, size_t kl, void **out) {
+    *out = NULL;
+    if (xs_type_of(o)->free == xs_map_free) {
+        xs_map *m = o;
+        xs_map_entry *e;
+        XS_MAP_EACH(m, e) if ((size_t)e->skey->len == kl && memcmp(e->skey->data, k, kl) == 0) { *out = xs_dyn_map_val(m, e->val); return true; }
+        return false;
+    }
+    const xs_dyn_cls *c = xs_type_of(o)->dyn;
+    for (int32_t i = 0; i < c->n; i++)
+        if (c->f[i].len == kl && memcmp(c->f[i].name, k, kl) == 0) {
+            *out = xs_dyn_load(&c->f[i], o);
+            if (!*out && c->f[i].optional) return false;
+            return true;
+        }
+    return false;
+}
+static bool xs_plain_eq(void *a, void *b, int depth) {
+    if (xs_plain_count(a) != xs_plain_count(b)) return false;
+    bool eq = true;
+    if (xs_type_of(a)->free == xs_map_free) {
+        xs_map *m = a;
+        xs_map_entry *e;
+        XS_MAP_EACH(m, e) {
+            void *bv;
+            if (!xs_plain_get(b, e->skey->data, (size_t)e->skey->len, &bv)) return false;
+            eq = xs_uv_eq(xs_uv_map_val(m, e->val), xs_uv_ref(bv), depth);
+            xs_release(bv);
+            if (!eq) return false;
+        }
+        return true;
+    }
+    const xs_dyn_cls *c = xs_type_of(a)->dyn;
+    for (int32_t i = 0; i < c->n && eq; i++) {
+        void *av = xs_dyn_load(&c->f[i], a), *bv;
+        if (!av && c->f[i].optional) continue;
+        if (!xs_plain_get(b, c->f[i].name, c->f[i].len, &bv)) { xs_release(av); return false; }
+        eq = xs_uv_eq(xs_uv_ref(av), xs_uv_ref(bv), depth);
+        xs_release(av);
+        xs_release(bv);
+    }
+    return eq;
+}
+/* util.isDeepStrictEqual: the same primitives (Object.is), or objects of the same kind and class whose own
+   fields, elements, entries and members are deep-equal (Map and Set in any order); a cycle compares as equal */
+static bool xs_util_deq(void *a, void *b, int depth) {
+    if (a == b) return true;
+    if (depth > 1000) return true;
+    xs_uv ua = xs_uv_ref(a), ub = xs_uv_ref(b);
+    if (ua.k != 3 || ub.k != 3) return xs_uv_eq(ua, ub, depth);
+    const xs_type *ta = xs_type_of(a), *tb = xs_type_of(b);
+    void (*fa)(void *) = ta->free, (*fb)(void *) = tb->free;
+    bool pa = (fa == xs_map_free && ((xs_map *)a)->record) || (ta->dyn && ta->dyn->shape);
+    bool pb = (fb == xs_map_free && ((xs_map *)b)->record) || (tb->dyn && tb->dyn->shape);
+    if (pa || pb) return pa && pb && xs_plain_eq(a, b, depth + 1);
+    if (xs_is_arr(fa) || xs_is_arr(fb)) {
+        if (!xs_is_arr(fa) || !xs_is_arr(fb) || xs_uv_arr_len(a) != xs_uv_arr_len(b)) return false;
+        for (size_t i = 0; i < xs_uv_arr_len(a); i++)
+            if (!xs_uv_eq(xs_uv_arr_at(a, i), xs_uv_arr_at(b, i), depth + 1)) return false;
+        return true;
+    }
+    if (fa != fb) return false;
+    if (fa == xs_str_free) { xs_str *x = a, *y = b; return x->len == y->len && memcmp(x->data, y->data, (size_t)x->len) == 0; }
+    if (fa == xs_Date_free) { double x = ((xs_Date *)a)->t, y = ((xs_Date *)b)->t; return x == y || (x != x && y != y); }
+    if (fa == xs_u8_free) {
+        xs_Uint8Array *x = a, *y = b;
+        return x->f_length == y->f_length && (x->f_length == 0 || memcmp(x->data, y->data, (size_t)x->f_length) == 0);
+    }
+    if (fa == xs_Error_free) {
+        xs_Error *x = a, *y = b;
+        return xs_util_deq(x->f_message, y->f_message, depth + 1) && xs_util_deq(x->f_name, y->f_name, depth + 1);
+    }
+    if (fa == xs_map_free) {
+        xs_map *x = a, *y = b;
+        if (x->is_map != y->is_map || x->count != y->count) return false;
+        if (x->count == 0) return true;
+        xs_map_entry *e, *g;
+        XS_MAP_EACH(x, e) {
+            bool found = false;
+            XS_MAP_EACH(y, g) {
+                bool keq;
+                if (x->ukeys || y->ukeys) keq = x->ukeys && y->ukeys ? xs_util_deq(e->val.p, g->val.p, depth + 1) : false;
+                else if (x->str_keys != y->str_keys) keq = false;
+                else if (x->str_keys) keq = e->skey->len == g->skey->len && memcmp(e->skey->data, g->skey->data, (size_t)e->skey->len) == 0;
+                else keq = e->ikey == g->ikey;
+                if (!keq) continue;
+                found = !x->is_map || xs_uv_eq(xs_uv_map_val(x, e->val), xs_uv_map_val(y, g->val), depth + 1);
+                break;
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+    if (ta->dyn) { /* objects of one class: field by field */
+        const xs_dyn_cls *c = ta->dyn;
+        for (int32_t i = 0; i < c->n; i++) {
+            void *av = xs_dyn_load(&c->f[i], a), *bv = xs_dyn_load(&c->f[i], b);
+            bool eq = xs_uv_eq(xs_uv_ref(av), xs_uv_ref(bv), depth + 1);
+            xs_release(av);
+            xs_release(bv);
+            if (!eq) return false;
+        }
+        return true;
+    }
+    if (fa == xs_Symbol_free || ta->print == xs_print_closure) return false; /* (only the same one) */
+    /* another built-in object (a RegExp...): equal when both print the same */
+    xs_str *x = xs_util_inspect(a, 2, 80, 3), *y = xs_util_inspect(b, 2, 80, 3);
+    bool eq = x->len == y->len && memcmp(x->data, y->data, (size_t)x->len) == 0;
+    xs_release(x);
+    xs_release(y);
+    return eq;
+}
+XS_NOINLINE bool xs_util_deep_equal(void *a, void *b) { return xs_util_deq(a, b, 0); }
+/* styleText: whether a standard stream is a terminal */
+XS_NOINLINE bool xs_util_isatty(int64_t fd) { return isatty((int)fd) == 1; }
+/* getSystemErrorName: the name of an errno value of this system ("" when unknown) */
+XS_NOINLINE xs_str *xs_util_errname(int64_t e) {
+    static const struct { int no; const char *name; } names[] = {
+        {EPERM, "EPERM"}, {ENOENT, "ENOENT"}, {ESRCH, "ESRCH"}, {EINTR, "EINTR"}, {EIO, "EIO"}, {ENXIO, "ENXIO"},
+        {E2BIG, "E2BIG"}, {EBADF, "EBADF"}, {ECHILD, "ECHILD"}, {EAGAIN, "EAGAIN"}, {ENOMEM, "ENOMEM"}, {EACCES, "EACCES"},
+        {EFAULT, "EFAULT"}, {EBUSY, "EBUSY"}, {EEXIST, "EEXIST"}, {EXDEV, "EXDEV"}, {ENODEV, "ENODEV"}, {ENOTDIR, "ENOTDIR"},
+        {EISDIR, "EISDIR"}, {EINVAL, "EINVAL"}, {ENFILE, "ENFILE"}, {EMFILE, "EMFILE"}, {ENOTTY, "ENOTTY"}, {ETXTBSY, "ETXTBSY"},
+        {EFBIG, "EFBIG"}, {ENOSPC, "ENOSPC"}, {ESPIPE, "ESPIPE"}, {EROFS, "EROFS"}, {EMLINK, "EMLINK"}, {EPIPE, "EPIPE"},
+        {ERANGE, "ERANGE"}, {ENAMETOOLONG, "ENAMETOOLONG"}, {ENOSYS, "ENOSYS"}, {ENOTEMPTY, "ENOTEMPTY"}, {ELOOP, "ELOOP"},
+        {ENOTSOCK, "ENOTSOCK"}, {EDESTADDRREQ, "EDESTADDRREQ"}, {EMSGSIZE, "EMSGSIZE"}, {EPROTOTYPE, "EPROTOTYPE"},
+        {ENOPROTOOPT, "ENOPROTOOPT"}, {EPROTONOSUPPORT, "EPROTONOSUPPORT"}, {ENOTSUP, "ENOTSUP"}, {EAFNOSUPPORT, "EAFNOSUPPORT"},
+        {EADDRINUSE, "EADDRINUSE"}, {EADDRNOTAVAIL, "EADDRNOTAVAIL"}, {ENETDOWN, "ENETDOWN"}, {ENETUNREACH, "ENETUNREACH"},
+        {ECONNABORTED, "ECONNABORTED"}, {ECONNRESET, "ECONNRESET"}, {ENOBUFS, "ENOBUFS"}, {EISCONN, "EISCONN"},
+        {ENOTCONN, "ENOTCONN"}, {ETIMEDOUT, "ETIMEDOUT"}, {ECONNREFUSED, "ECONNREFUSED"}, {EHOSTUNREACH, "EHOSTUNREACH"},
+        {EALREADY, "EALREADY"}, {EINPROGRESS, "EINPROGRESS"}, {ECANCELED, "ECANCELED"}, {EOVERFLOW, "EOVERFLOW"},
+        {EILSEQ, "EILSEQ"}, {EPROTO, "EPROTO"},
+#ifdef ESHUTDOWN
+        {ESHUTDOWN, "ESHUTDOWN"},
+#endif
+#ifdef EHOSTDOWN
+        {EHOSTDOWN, "EHOSTDOWN"},
+#endif
+    };
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
+        if (names[i].no == e && names[i].no > 0) return xs_str_new(names[i].name, strlen(names[i].name));
+    return xs_str_new("", 0);
+}
 
 /* ---- base64 / hex ---- */
 static const char xs_b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

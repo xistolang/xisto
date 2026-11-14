@@ -6241,9 +6241,12 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         return m;
     }
     { /* Node's modules written in xisto over runtime functions (runtime/node/NAME.ts, NODE_TS in the Makefile) */
-        extern const unsigned char xs_node_events_ts[];
+        extern const unsigned char xs_node_events_ts[], xs_node_util_ts[], xs_node_querystring_ts[], xs_node_string_decoder_ts[];
         static const struct { const char *name; const unsigned char *src; } node_ts[] = {
             {"events", xs_node_events_ts},
+            {"util", xs_node_util_ts},
+            {"querystring", xs_node_querystring_ts},
+            {"string_decoder", xs_node_string_decoder_ts},
         };
         for (size_t i = 0; i < sizeof node_ts / sizeof node_ts[0]; i++) {
             if (strcmp(name, node_ts[i].name) != 0) continue;
@@ -6299,7 +6302,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         add_func(prog, f);
         return m;
     }
-    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:util, xisto:querystring, xisto:string_decoder, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
     return NULL;
 }
 
