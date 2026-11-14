@@ -8440,6 +8440,9 @@ static void bce_blocks_helper_emit(void) {
     bce_cmp_helper_emit();
     buf_puts(&json_fns, "/* k blocks [pp[3i], pp[3i + 1]), written when pp[3i + 2]: 1 when no written block shares a byte with another block */\n"
                         "static int xs_blocks_apart_(char **pp, int64_t k) {\n"
+                        "    int64_t j = 1;\n"
+                        "    while (j < k && pp[3 * j] >= pp[3 * j - 2]) j++; /* (in order and apart already: the usual case, no sort) */\n"
+                        "    if (j >= k) return 1;\n"
                         "    qsort(pp, (size_t)k, 3 * sizeof(char *), xs_rows_cmp_);\n"
                         "    char *me = NULL, *mw = NULL;\n"
                         "    for (int64_t i = 0; i < k; i++) {\n"
@@ -9779,9 +9782,257 @@ static bool sk_emit_loop(Stmt *s) {
     buf_puts(out, " }");
     return true;
 }
+/* ---- a stencil nest without a carried value (jacobi-2d, heat-3d, fdtd-2d) ----
+   for (let c1 = L1; c1 < H1; c1++) [for (let c2 ...)] for (let cD = LD; cD < HD; cD++) W[c1]..[cD] = f;   (<= as well; D 2 or 3)
+   f number arithmetic of numbers, invariant names and Y[c1 + K1]..[cD + KD] (K int literals); W itself only at
+   [c1]..[cD]. No element is read after another iteration wrote it when W's rows share no byte with any other row
+   reached: then every iteration is independent. The checked copy tests each row's length and lets the vectorizer add
+   overlap tests per row, a cost per row that stencils of 1000-2000 columns feel (jacobi-2d 14% behind Rust on the
+   M4). Here one guard per entry of the nest tests every index on its whole range (the least length of each level)
+   and the rows apart (xs_blocks_apart_: W's rows marked), and the innermost loop runs on row pointers held in locals,
+   told to the C compiler that its iterations do not depend on each other (clang loop vectorize(assume_safety)): no
+   test per row. The same operations in the same order per element, so the same bits. When the guard fails, the loop
+   as written. XISTO_NO_RSTEN turns it off. */
+typedef struct { const char *x; Type *t; } RsArr;
+typedef struct { int arr; int K[3]; } RsRow;
+static RsArr rs_arr[6];
+static RsRow rs_row[24];
+static int nrs_arr, nrs_row, rs_D, rs_kmin[6][3], rs_kmax[6][3];
+static const char *rs_c[3];
+static bool rs_kidx(Expr *x, int l, int *K) { /* c_l, c_l + K, c_l - K, K + c_l */
+    if (lj_is(x, rs_c[l])) { *K = 0; return true; }
+    if (!x || x->kind != E_BINARY || (x->op != TK_PLUS && x->op != TK_MINUS)) return false;
+    if (lj_is(x->lhs, rs_c[l]) && x->rhs && x->rhs->kind == E_NUMBER && x->rhs->is_int_lit && x->rhs->ival >= -64 && x->rhs->ival <= 64) {
+        *K = (int)(x->op == TK_PLUS ? x->rhs->ival : -x->rhs->ival); return true;
+    }
+    if (x->op == TK_PLUS && lj_is(x->rhs, rs_c[l]) && x->lhs && x->lhs->kind == E_NUMBER && x->lhs->is_int_lit && x->lhs->ival >= -64 && x->lhs->ival <= 64) {
+        *K = (int)x->lhs->ival; return true;
+    }
+    return false;
+}
+/* Y[..][..] at depth D: the array and the offsets (-1: not this form) */
+static int rs_ref(Expr *e, int *K) {
+    Expr *x = e;
+    for (int l = rs_D - 1; l >= 0; l--) {
+        if (!x || x->kind != E_INDEX || x->builtin.cfn || !rs_kidx(x->rhs, l, &K[l])) return -1;
+        x = x->lhs;
+    }
+    if (!x || x->kind != E_IDENT || !x->cname || !bce_plain_local(x->cname) || !x->type) return -1;
+    Type *t = x->type;
+    for (int l = 0; l < rs_D - 1; l++) { if (!t || t->kind != TY_ARRAY) return -1; t = t->elem; }
+    if (!t || !((t->kind == TY_ARRAY && t->elem && t->elem->kind == TY_NUMBER) || is_f64_type(t))) return -1;
+    for (int a = 0; a < nrs_arr; a++) if (strcmp(rs_arr[a].x, x->cname) == 0) return a;
+    if (nrs_arr == 6) return -1;
+    rs_arr[nrs_arr] = (RsArr){x->cname, x->type};
+    for (int l = 0; l < 3; l++) { rs_kmin[nrs_arr][l] = 64; rs_kmax[nrs_arr][l] = -64; }
+    return nrs_arr++;
+}
+static int rs_row_of(int a, int *K) { /* a row of the innermost level: Y[c1 + K1](..) */
+    for (int r = 0; r < nrs_row; r++) {
+        bool same = rs_row[r].arr == a;
+        for (int l = 0; l < rs_D - 1 && same; l++) same = rs_row[r].K[l] == K[l];
+        if (same) return r;
+    }
+    if (nrs_row == 24) return -1;
+    rs_row[nrs_row] = (RsRow){a, {K[0], K[1], K[2]}};
+    return nrs_row++;
+}
+static int rs_w = -1;
+static Stmt *rs_nest;
+static bool rs_expr(Expr *e) {
+    if (!e || !e->type || e->type->kind != TY_NUMBER) return false;
+    switch (e->kind) {
+    case E_NUMBER: return true;
+    case E_IDENT: return e->cname && bce_plain_local(e->cname) && !bce_writes(rs_nest, e->cname) && !bce_declares(rs_nest, e->cname);
+    case E_BINARY: return (e->op == TK_PLUS || e->op == TK_MINUS || e->op == TK_STAR || e->op == TK_SLASH) && rs_expr(e->lhs) && rs_expr(e->rhs);
+    case E_UNARY: return e->op == TK_MINUS && rs_expr(e->lhs);
+    case E_INDEX: {
+        int K[3] = {0, 0, 0}, a = rs_ref(e, K);
+        if (a < 0) return false;
+        if (a == rs_w) for (int l = 0; l < rs_D; l++) if (K[l]) return false; /* (W at another place: carried) */
+        for (int l = 0; l < rs_D; l++) { if (K[l] < rs_kmin[a][l]) rs_kmin[a][l] = K[l]; if (K[l] > rs_kmax[a][l]) rs_kmax[a][l] = K[l]; }
+        return rs_row_of(a, K) >= 0;
+    }
+    default: return false;
+    }
+}
+static int rs_id;
+static void rs_emit(Expr *e) {
+    switch (e->kind) {
+    case E_BINARY:
+        buf_puts(out, "(");
+        rs_emit(e->lhs);
+        buf_printf(out, " %s ", e->op == TK_PLUS ? "+" : e->op == TK_MINUS ? "-" : e->op == TK_STAR ? "*" : "/");
+        rs_emit(e->rhs);
+        buf_puts(out, ")");
+        return;
+    case E_UNARY: buf_puts(out, "(-"); rs_emit(e->lhs); buf_puts(out, ")"); return;
+    case E_INDEX: {
+        int K[3] = {0, 0, 0}, a = rs_ref(e, K), r = rs_row_of(a, K);
+        buf_printf(out, "rp%d_%d_[%s", rs_id, r, ren(rs_c[rs_D - 1]));
+        if (K[rs_D - 1]) buf_printf(out, " %s %d", K[rs_D - 1] > 0 ? "+" : "-", abs(K[rs_D - 1]));
+        buf_puts(out, "]");
+        return;
+    }
+    default: emit_expr(e); return;
+    }
+}
+static Stmt *rs_lp[3];
+static Expr *rs_lo[3], *rs_hi[3], *rs_x;
+static bool rs_le[3];
+static int rs_op;
+static bool rs_match(Stmt *s) {
+    if (xs_debug || sm_mode || ictx || getenv("XISTO_NO_RSTEN") || bce_promo_t || bce_fw_loop) return false;
+    Stmt **lp = rs_lp;
+    Expr **lo = rs_lo, **hi = rs_hi;
+    bool *le = rs_le;
+    Stmt *x = s;
+    rs_D = 0;
+    while (rs_D < 3 && x && x->kind == S_FOR) {
+        if (!sk_le(x, &rs_c[rs_D], &lo[rs_D], &hi[rs_D], &le[rs_D])) return false;
+        lp[rs_D++] = x;
+        x = uj_only(x->body);
+    }
+    if (rs_D < 2 || !x || x->kind != S_EXPR || !x->expr || x->expr->kind != E_ASSIGN) return false;
+    int op = rs_op = x->expr->op; /* (=, or op= as x = x op f became: fdtd-2d) */
+    if (op != TK_ASSIGN && op != TK_PLUS_ASSIGN && op != TK_MINUS_ASSIGN && op != TK_STAR_ASSIGN && op != TK_SLASH_ASSIGN) return false;
+    rs_nest = s;
+    for (int l = 0; l < rs_D; l++) {
+        if (!bce_inv(lo[l], s, rs_c[0]) || !bce_inv(hi[l], s, rs_c[0]) || !bce_names_plain(lo[l]) || !bce_names_plain(hi[l])) return false;
+        for (int m = 0; m < rs_D; m++) if (uj_mentions(lo[l], rs_c[m]) || uj_mentions(hi[l], rs_c[m])) return false;
+    }
+    nrs_arr = nrs_row = 0;
+    rs_w = -1;
+    int K[3] = {0, 0, 0};
+    Expr *w = x->expr->lhs;
+    int a = rs_ref(w, K);
+    if (a < 0 || K[0] || K[1] || K[2] || !w->type || w->type->kind != TY_NUMBER) return false;
+    rs_w = a;
+    rs_kmin[a][0] = rs_kmin[a][1] = rs_kmin[a][2] = rs_kmax[a][0] = rs_kmax[a][1] = rs_kmax[a][2] = 0;
+    int wr = rs_row_of(a, K);
+    if (wr < 0 || !rs_expr(x->expr->rhs)) return false;
+    for (int b = 0; b < nrs_arr; b++) if (bce_writes(s, rs_arr[b].x) || bce_declares(s, rs_arr[b].x)) return false;
+    rs_x = x;
+    return true;
+}
+/* the guard once per outermost loop (heat-3d, jacobi-2d: per entry of the nest it cost more than it saved, every row
+   header read 1000 times): the outermost loop around a nest whose arrays it neither writes as names nor reshapes
+   (bce_ok, bce_row_store) and whose bounds it does not change keeps the guard's answer in a local (rsm<k>_: 0 not
+   known yet, 1 holds, -1 fails), computed the first time the nest runs */
+typedef struct { Stmt *nest; int id; } RsMemo;
+static RsMemo rs_memo[16];
+static int nrs_memo, rs_memo_ids;
+static Stmt *rs_memo_owner;
+static void rs_memo_scan(Stmt *t, Stmt *outer, const char *oc) {
+    if (!t || nrs_memo == 16) return;
+    if (t->kind == S_FOR && rs_match(t)) {
+        bool ok = !bce_row_store(outer);
+        for (int b = 0; b < nrs_arr && ok; b++)
+            ok = !bce_writes(outer, rs_arr[b].x) && !bce_declares(outer, rs_arr[b].x) && bce_ok(outer, rs_arr[b].x, rs_arr[b].t, false);
+        for (int l = 0; l < rs_D && ok; l++) ok = bce_inv(rs_lo[l], outer, oc) && bce_inv(rs_hi[l], outer, oc);
+        if (ok) rs_memo[nrs_memo++] = (RsMemo){t, rs_memo_ids++};
+        return;
+    }
+    rs_memo_scan(t->body, outer, oc); rs_memo_scan(t->else_body, outer, oc); rs_memo_scan(t->for_init, outer, oc);
+    for (int k = 0; k < t->stmts.len; k++) rs_memo_scan(t->stmts.items[k], outer, oc);
+}
+static int rs_memo_open(Stmt *s) { /* at the outermost loop: the memos of its nests (how many) */
+    if (rs_memo_owner || xs_debug || sm_mode || ictx || getenv("XISTO_NO_RSTEN") || !s->for_update || !s->for_update->lhs || !s->for_update->lhs->cname) return 0;
+    int n0 = nrs_memo;
+    rs_memo_scan(s->body, s, s->for_update->lhs->cname);
+    if (nrs_memo == n0) return 0;
+    buf_puts(out, "{ ");
+    for (int k = n0; k < nrs_memo; k++) buf_printf(out, "int rsm%d_ = 0; (void)rsm%d_; ", rs_memo[k].id, rs_memo[k].id);
+    rs_memo_owner = s;
+    return nrs_memo - n0 + 1;
+}
+static void rs_memo_close(int opened) {
+    if (!opened) return;
+    nrs_memo -= opened - 1;
+    rs_memo_owner = NULL;
+    buf_puts(out, " }");
+}
+static int rs_memo_find(Stmt *s) { for (int k = 0; k < nrs_memo; k++) if (rs_memo[k].nest == s) return rs_memo[k].id; return -1; }
+static bool rs_emit_loop(Stmt *s) {
+    if (!rs_match(s)) return false;
+    Expr **lo = rs_lo, **hi = rs_hi;
+    bool *le = rs_le;
+    Stmt *x = rs_x;
+    int op = rs_op, wr = 0;
+    { int K[3] = {0, 0, 0}; wr = rs_row_of(rs_w, K); }
+    int memo = rs_memo_find(s);
+    int id = rs_id = lj_ids++;
+    char *L[3], *Hh[3];
+    for (int l = 0; l < rs_D; l++) {
+        L[l] = bce_raw(lo[l]);
+        Hh[l] = le[l] ? xs_sprintf("(%s)", bce_raw(hi[l])) : xs_sprintf("((%s) - 1)", bce_raw(hi[l]));
+    }
+    bce_blocks_helper_emit();
+    if (memo >= 0) buf_printf(out, "{ int64_t rs%d_ = %s; { bool ok_ = rsm%d_ > 0; if (!rsm%d_) { ok_ = 1", id, L[0], memo, memo);
+    else buf_printf(out, "{ int64_t rs%d_ = %s; { bool ok_ = 1", id, L[0]);
+    for (int l = 0; l < rs_D; l++) buf_printf(out, " && (%s) <= %s", L[l], Hh[l]);
+    buf_puts(out, "; int64_t nb_ = 0");
+    for (int b = 0; b < nrs_arr; b++) buf_printf(out, " + (int64_t)(%s)->len", ren(rs_arr[b].x));
+    buf_puts(out, "; char **pp_ = NULL; int64_t k_ = 0; ");
+    /* each array: level 0 in range, every row (and row of rows) reached long enough, its leaf rows in the list */
+    for (int b = 0; b < nrs_arr && true; b++) {
+        const char *X = ren(rs_arr[b].x);
+        Type *t1 = rs_arr[b].t->elem;
+        buf_printf(out, "if (ok_ && ((%s) + %d < 0 || %s + %d >= (int64_t)(%s)->len)) ok_ = 0; ", L[0], rs_kmin[b][0], Hh[0], rs_kmax[b][0], X);
+        if (rs_D == 2) {
+            const char *r1 = lj_rs(t1);
+            buf_printf(out, "if (ok_) { pp_ = realloc(pp_, (size_t)(k_ + (int64_t)(%s)->len + 1) * 3 * sizeof(char *)); if (!pp_) xs_panic(\"out of memory\"); "
+                            "for (int64_t r_ = 0; r_ < (int64_t)(%s)->len; r_++) { %s *p_ = (%s *)(%s)->data[r_]; int64_t l_ = p_ ? (int64_t)p_->len : 0; "
+                            "if ((%s) + %d < 0 || (l_ <= %s + %d && r_ >= (%s) + %d && r_ <= %s + %d)) ok_ = 0; "
+                            "if (l_ > 0) { pp_[3 * k_] = (char *)p_->data; pp_[3 * k_ + 1] = (char *)(p_->data + l_); pp_[3 * k_ + 2] = %s; k_++; } } } ",
+                       X, X, r1, r1, X, L[1], rs_kmin[b][1], Hh[1], rs_kmax[b][1], L[0], rs_kmin[b][0], Hh[0], rs_kmax[b][0], b == rs_w ? "(char *)1" : "NULL");
+        } else {
+            const char *r1 = lj_rs(t1), *r2 = lj_rs(t1->elem);
+            buf_printf(out, "if (ok_) for (int64_t r_ = 0; r_ < (int64_t)(%s)->len && ok_; r_++) { %s *q_ = (%s *)(%s)->data[r_]; int64_t m_ = q_ ? (int64_t)q_->len : 0; "
+                            "bool in_ = r_ >= (%s) + %d && r_ <= %s + %d; if (in_ && ((%s) + %d < 0 || m_ <= %s + %d)) { ok_ = 0; break; } "
+                            "pp_ = realloc(pp_, (size_t)(k_ + m_ + 1) * 3 * sizeof(char *)); if (!pp_) xs_panic(\"out of memory\"); "
+                            "for (int64_t s_ = 0; s_ < m_; s_++) { %s *p_ = (%s *)q_->data[s_]; int64_t l_ = p_ ? (int64_t)p_->len : 0; "
+                            "if (in_ && ((%s) + %d < 0 || (l_ <= %s + %d && s_ >= (%s) + %d && s_ <= %s + %d))) ok_ = 0; "
+                            "if (l_ > 0) { pp_[3 * k_] = (char *)p_->data; pp_[3 * k_ + 1] = (char *)(p_->data + l_); pp_[3 * k_ + 2] = %s; k_++; } } } ",
+                       X, r1, r1, X, L[0], rs_kmin[b][0], Hh[0], rs_kmax[b][0], L[1], rs_kmin[b][1], Hh[1], rs_kmax[b][1], r2, r2,
+                       L[2], rs_kmin[b][2], Hh[2], rs_kmax[b][2], L[1], rs_kmin[b][1], Hh[1], rs_kmax[b][1], b == rs_w ? "(char *)1" : "NULL");
+        }
+    }
+    buf_puts(out, "if (ok_ && pp_) ok_ = xs_blocks_apart_(pp_, k_) > 0; free(pp_); (void)nb_; ");
+    if (memo >= 0) buf_printf(out, "rsm%d_ = ok_ ? 1 : -1; } ", memo);
+    buf_printf(out, "if (ok_) for (; rs%d_ <= %s; rs%d_++) { ", id, Hh[0], id);
+    const char *c1 = xs_sprintf("rs%d_", id);
+    if (rs_D == 3) buf_printf(out, "for (int64_t %s = %s; %s <= %s; %s++) { ", ren(rs_c[1]), L[1], ren(rs_c[1]), Hh[1], ren(rs_c[1]));
+    for (int r = 0; r < nrs_row; r++) {
+        RsArr *A = &rs_arr[rs_row[r].arr];
+        const char *r1 = lj_rs(A->t->elem);
+        if (rs_D == 2) buf_printf(out, "double *rp%d_%d_ = ((%s *)(%s)->data[%s + %d])->data; ", id, r, r1, ren(A->x), c1, rs_row[r].K[0]);
+        else buf_printf(out, "double *rp%d_%d_ = ((%s *)((%s *)(%s)->data[%s + %d])->data[%s + %d])->data; ", id, r, lj_rs(A->t->elem->elem), r1, ren(A->x), c1,
+                        rs_row[r].K[0], ren(rs_c[1]), rs_row[r].K[1]);
+    }
+    const char *cD = ren(rs_c[rs_D - 1]);
+    buf_printf(out, "_Pragma(\"clang loop vectorize(assume_safety)\") for (int64_t %s = %s; %s <= %s; %s++) rp%d_%d_[%s] %s= ", cD, L[rs_D - 1], cD, Hh[rs_D - 1], cD, id, wr, cD,
+               op == TK_PLUS_ASSIGN ? "+" : op == TK_MINUS_ASSIGN ? "-" : op == TK_STAR_ASSIGN ? "*" : op == TK_SLASH_ASSIGN ? "/" : "");
+    if (op != TK_ASSIGN) buf_puts(out, "(");
+    rs_emit(x->expr->rhs);
+    buf_puts(out, op != TK_ASSIGN ? "); " : "; ");
+    if (rs_D == 3) buf_puts(out, "} ");
+    buf_puts(out, "} } ");
+    Stmt *fi = s->for_init;
+    Stmt fi2 = *fi;
+    Expr from = {0};
+    from.kind = E_IDENT; from.cname = (char *)c1; from.str = from.cname; from.type = lo[0]->type; from.pos = lo[0]->pos; from.field = -1;
+    fi2.init = &from;
+    s->for_init = &fi2;
+    emit_stmt_for_inner_(s);
+    s->for_init = fi;
+    buf_puts(out, " }");
+    return true;
+}
 static void emit_stmt_for_inner(Stmt *s) { /* the columns' least row lengths around the outermost loop that keeps them */
-    int opened = bce_rect_open(s);
-    if (!uj_emit_km(s) && !uj_emit_loop(s) && !lj_emit(s) && !sk_emit_loop(s)) emit_stmt_for_inner_(s);
+    int opened = bce_rect_open(s), memos = rs_memo_open(s);
+    if (!uj_emit_km(s) && !uj_emit_loop(s) && !lj_emit(s) && !sk_emit_loop(s) && !rs_emit_loop(s)) emit_stmt_for_inner_(s);
+    rs_memo_close(memos);
     bce_rect_close(opened);
 }
 static void emit_stmt_for_inner_(Stmt *s) { /* a for: bounds checks proved by the loop, or a versioned copy */
