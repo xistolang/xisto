@@ -2021,17 +2021,54 @@ static void xs_buf_consume(xs_buf *b, size_t n) {
 
 /* Returns the length of the complete HTTP message at the start of buf, or 0 if incomplete.
    On success fills *hdr_len (through the blank line) and *body_len. Chunked bodies are decoded into *chunked_body. */
-static size_t xs_http_message_len(xs_buf *buf, size_t *hdr_len, size_t *body_len, bool *is_chunked, xs_buf *chunked_body) {
-    if (buf->len < 4) return 0;
-    const char *blank = NULL;
-    for (size_t i = 0; i + 3 < buf->len; i++)
-        if (buf->data[i] == '\r' && buf->data[i + 1] == '\n' && buf->data[i + 2] == '\r' && buf->data[i + 3] == '\n') { blank = buf->data + i; break; }
-    if (!blank) return 0;
-    *hdr_len = (size_t)(blank - buf->data) + 4;
-    const char *v;
-    size_t vlen;
+/* a header name against a lowercase one: | 0x20 folds ASCII letters (and nothing in a name before its colon is
+   folded into a letter by it), without a call to tolower per character */
+static inline bool xs_name_is(const char *a, size_t alen, const char *lc, size_t n) {
+    if (alen != n) return false;
+    for (size_t i = 0; i < n; i++)
+        if (((unsigned char)a[i] | 0x20) != (unsigned char)lc[i]) return false;
+    return true;
+}
+static void xs_header_value(const char *colon, const char *eol, const char **val, size_t *vlen) {
+    const char *v = colon + 1;
+    while (v < eol && (*v == ' ' || *v == '\t')) v++;
+    const char *ve = eol;
+    while (ve > v && (ve[-1] == '\r' || ve[-1] == ' ')) ve--;
+    *val = v;
+    *vlen = (size_t)(ve - v);
+}
+/* (the server's own: also the Connection header, found in the same pass) */
+static size_t xs_http_message_len_c(xs_buf *buf, size_t *hdr_len, size_t *body_len, bool *is_chunked, xs_buf *chunked_body,
+                                    const char **conn, size_t *conn_len) {
+    /* one pass over the head, line by line: the blank line (\r\n\r\n) and the headers the server itself reads
+       (it used to search for the blank line byte by byte and then once more per header) */
+    const char *te = NULL, *cl = NULL, *cn = NULL;
+    size_t te_len = 0, cl_len = 0, cn_len = 0;
+    const char *p = buf->data, *end = buf->data + buf->len, *blank_end = NULL;
+    bool prev_crlf = false, first = true;
+    while (p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        if (!eol) return 0;
+        size_t ll = (size_t)(eol - p);
+        if (ll == 1 && p[0] == '\r' && prev_crlf) { blank_end = eol + 1; break; }
+        if (!first) {
+            const char *colon = memchr(p, ':', ll);
+            if (colon) {
+                size_t nl = (size_t)(colon - p);
+                if (!cn && xs_name_is(p, nl, "connection", 10)) xs_header_value(colon, eol, &cn, &cn_len);
+                else if (!cl && xs_name_is(p, nl, "content-length", 14)) xs_header_value(colon, eol, &cl, &cl_len);
+                else if (!te && xs_name_is(p, nl, "transfer-encoding", 17)) xs_header_value(colon, eol, &te, &te_len);
+            }
+        }
+        first = false;
+        prev_crlf = ll > 0 && p[ll - 1] == '\r';
+        p = eol + 1;
+    }
+    if (!blank_end) return 0;
+    *hdr_len = (size_t)(blank_end - buf->data);
+    if (conn) { *conn = cn; *conn_len = cn_len; }
     *is_chunked = false;
-    if (xs_find_header(buf->data, *hdr_len, "Transfer-Encoding", &v, &vlen) && xs_ieq(v, vlen, "chunked")) {
+    if (te && xs_ieq(te, te_len, "chunked")) {
         *is_chunked = true;
         chunked_body->len = 0;
         size_t p = *hdr_len;
@@ -2051,9 +2088,12 @@ static size_t xs_http_message_len(xs_buf *buf, size_t *hdr_len, size_t *body_len
         }
     }
     *body_len = 0;
-    if (xs_find_header(buf->data, *hdr_len, "Content-Length", &v, &vlen)) *body_len = strtoul(v, NULL, 10);
+    if (cl) *body_len = strtoul(cl, NULL, 10);
     if (*hdr_len + *body_len > buf->len) return 0;
     return *hdr_len + *body_len;
+}
+static size_t xs_http_message_len(xs_buf *buf, size_t *hdr_len, size_t *body_len, bool *is_chunked, xs_buf *chunked_body) {
+    return xs_http_message_len_c(buf, hdr_len, body_len, is_chunked, chunked_body, NULL, NULL);
 }
 
 /* ---- client: fetch ---- */
@@ -2584,7 +2624,15 @@ static void xs_server_respond_x(xs_client *c, int64_t status, const char *ctype,
     else { memcpy(h, "\r\nConnection: close\r\n\r\n", 23); h += 23; }
     int n = (int)(h - head);
     if (c->out.len == 0 && c->fast_ok && !c->tls) {
-        /* nothing queued and no pipelined request behind: write straight from the response, no copy */
+        /* nothing queued and no pipelined request behind: write straight from the response; a small body is copied
+           after the head, one buffer for the kernel instead of two */
+        if (body_len <= 1024 && (size_t)n + body_len <= sizeof head) {
+            memcpy(head + n, body, body_len);
+            ssize_t w = write(c->fd, head, (size_t)n + body_len);
+            if (w < 0) w = 0;
+            if ((size_t)w < (size_t)n + body_len) xs_buf_append(&c->out, head + w, (size_t)n + body_len - (size_t)w);
+            return;
+        }
         struct iovec iov[2] = {{head, (size_t)n}, {(void *)body, body_len}};
         ssize_t w = writev(c->fd, iov, body_len ? 2 : 1);
         if (w < 0) w = 0;
@@ -2763,7 +2811,9 @@ XS_NOINLINE bool xs_server_process(xs_Server *s, xs_client *c) {
         size_t hdr_len, body_len;
         bool is_chunked;
         xs_buf chunked = {0};
-        size_t total = xs_http_message_len(&c->in, &hdr_len, &body_len, &is_chunked, &chunked);
+        const char *conn_v;
+        size_t conn_vlen;
+        size_t total = xs_http_message_len_c(&c->in, &hdr_len, &body_len, &is_chunked, &chunked, &conn_v, &conn_vlen);
         if (!total) {
             free(chunked.data);
             return c->in.len < (1 << 20); /* drop clients that send a megabyte without finishing a request */
@@ -2787,10 +2837,8 @@ XS_NOINLINE bool xs_server_process(xs_Server *s, xs_client *c) {
         const char *headers = eol + 1;
         size_t headers_len = hdr_len - (size_t)(headers - line);
         bool http10 = memcmp(sp2 + 1, "HTTP/1.0", 8) == 0;
-        const char *v;
-        size_t vlen;
         bool keep_alive = !http10;
-        if (xs_find_header(headers, headers_len, "Connection", &v, &vlen)) keep_alive = xs_ieq(v, vlen, "keep-alive") || (!http10 && !xs_ieq(v, vlen, "close"));
+        if (conn_v) keep_alive = xs_ieq(conn_v, conn_vlen, "keep-alive") || (!http10 && !xs_ieq(conn_v, conn_vlen, "close"));
 
         if (mlen == 3 && plen == 10 && memcmp(target, "/__metrics", 10) == 0 && memcmp(line, "GET", 3) == 0) {
             xs_sb b = {0};
@@ -2951,7 +2999,7 @@ XS_NOINLINE int xs_listen_socket_x(int64_t port, bool reuseport) {
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons((uint16_t)port);
     if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) < 0) xs_panic("listen: bind failed (port in use?)");
-    if (listen(lfd, 4096) < 0) xs_panic("listen: listen failed");
+    if (listen(lfd, 65535) < 0) xs_panic("listen: listen failed"); /* (the kernel caps it at net.core.somaxconn) */
     fcntl(lfd, F_SETFL, O_NONBLOCK);
     return lfd;
 }
@@ -3150,10 +3198,15 @@ XS_NOINLINE void *xs_server_worker(void *arg) {
         for (int i = 0; i < n; i++) {
             if (events[i].udata == &xs_listen_tag) {
                 if (xs_shutting_down) continue;
-                for (;;) {
+                for (int k = 0; k < 64; k++) { /* at most 64 per turn: serving the connections already open goes on */
+#if defined(__linux__)
+                    int fd = accept4(lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+                    if (fd < 0) break;
+#else
                     int fd = accept(lfd, NULL, NULL);
                     if (fd < 0) break;
                     fcntl(fd, F_SETFL, O_NONBLOCK);
+#endif
                     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
                     xs_client *c = calloc(1, sizeof *c);
                     c->fd = fd;

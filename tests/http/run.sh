@@ -91,6 +91,24 @@ want = ["who=ann id=a1 n=1", "who=bob id=b2 n=2", "who=cy id=c3 n=3", "who=dee i
 print("pipelined distinct requests:", "own data" if got[:4] == want else "MIXED %s" % got)
 s.close()
 PY
+# the head parser: header names in any case, Connection: close honoured, a head split across two packets
+python3 - <<'PY'
+import socket, time
+s = socket.create_connection(("127.0.0.1", 8080))
+s.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nx-TOKEN: t1\r\ncOnTeNt-LeNgTh: ")
+time.sleep(0.05)
+s.sendall(b"3\r\nCONNECTION: close\r\n\r\n123")
+s.settimeout(3)
+data = b""
+try:
+    while True:
+        chunk = s.recv(65536)
+        if not chunk: break
+        data += chunk
+except socket.timeout: pass
+body = data.split(b"\r\n\r\n", 1)[-1].decode()
+print("head parser: %s, %s" % (body, "closed" if b"Connection: close" in data else "KEPT OPEN"))
+PY
 # a client leaves while its handler is parked on a channel: the server must not spin
 python3 - "$SRV" <<'PY'
 import socket, subprocess, sys, time
