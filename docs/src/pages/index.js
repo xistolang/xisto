@@ -9,7 +9,7 @@ const results = [
   {
     value: '0 losses',
     label: 'against Rust',
-    text: 'Benchmarks Game, 10 problems on a Xeon and a Graviton2: 9 wins and 1 tie on each, with peak memory at or below Rust\'s.',
+    text: 'On a Xeon and a Graviton2: Benchmarks Game, 9 wins and 1 tie on each, with peak memory at or below Rust\'s; PolyBench, 30 kernels, 22 and 21 wins, no loss to Rust or Go.',
     to: '/docs/benchmarks/benchmarks-game/vs-rust',
   },
   {
