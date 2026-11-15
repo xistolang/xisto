@@ -3,6 +3,8 @@ title: Xisto vs Go
 sidebar_position: 2
 ---
 
+import {SpeedupBars, MemoryBars} from '@site/src/components/Charts/Speedup';
+
 # Xisto vs Go
 
 Go has no community PolyBench port, so its side is a line-by-line transliteration of the C ([bench/polybench/go](https://github.com/xistolang/xisto/tree/main/bench/polybench/go)), reviewed against it, with slices of slices (`[][]float64`) like Xisto's `number[][]`, built with Go 1.27. Kernel time is PolyBench's own timer around the kernel, the same region in every port; CPU is the whole process's user + system time; memory is peak RSS. LARGE dataset, median of 3 runs (10 for kernels under 50 ms). Every run's array dump hashes the same as the C reference's. Round of main `40cdc16`, 14 Nov 2026; kernels marked ² were close in the round and re-measured with the four sides interleaved in one invocation (median of 3 × 10 runs): their kernel times are the interleaved ones.
@@ -10,6 +12,10 @@ Go has no community PolyBench port, so its side is a line-by-line transliteratio
 ## Xeon E5-2686 v4 (x86-64, 2 vCPUs, AVX2)
 
 Kernel time: Xisto **30 wins**, 0 ties, 0 losses (a tie is within 3%). The winner of each column pair (kernel time, CPU, memory) is in bold when ahead by more than 3%; C is the reference, not scored.
+
+<SpeedupBars page="pb-vs-go" section="Xeon E5-2686 v4" unit="kernel" />
+
+<MemoryBars page="pb-vs-go" section="Xeon E5-2686 v4" unit="kernel" />
 
 | kernel | C (ref.) kernel | Xisto kernel | Go kernel | ratio | Xisto CPU | Go CPU | Xisto memory | Go memory | faster |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
@@ -47,6 +53,10 @@ Kernel time: Xisto **30 wins**, 0 ties, 0 losses (a tie is within 3%). The winne
 ## Graviton2 (Neoverse N1, arm64, 2 vCPUs)
 
 Kernel time: Xisto **30 wins**, 0 ties, 0 losses (a tie is within 3%). The winner of each column pair (kernel time, CPU, memory) is in bold when ahead by more than 3%; C is the reference, not scored.
+
+<SpeedupBars page="pb-vs-go" section="Graviton2" unit="kernel" />
+
+<MemoryBars page="pb-vs-go" section="Graviton2" unit="kernel" />
 
 | kernel | C (ref.) kernel | Xisto kernel | Go kernel | ratio | Xisto CPU | Go CPU | Xisto memory | Go memory | faster |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|

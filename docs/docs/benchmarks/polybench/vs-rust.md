@@ -3,6 +3,8 @@ title: Xisto vs Rust
 sidebar_position: 1
 ---
 
+import {SpeedupBars, MemoryBars} from '@site/src/components/Charts/Speedup';
+
 # Xisto vs Rust
 
 Rust's side is the community port [polybench-rs](https://github.com/JRF63/polybench-rs): every kernel with fixed-size contiguous arrays (`Box<[[f64; N]; M]>`), release build with `-C target-cpu=native`. Xisto's side is the TypeScript port with `number[][]`, the same loops in the same order. Kernel time is PolyBench's own timer around the kernel, the same region in every port; CPU is the whole process's user + system time; memory is peak RSS. LARGE dataset, median of 3 runs (10 for kernels under 50 ms). Every run's array dump hashes the same as the C reference's. Round of main `40cdc16`, 14 Nov 2026; kernels marked ² were close in the round and re-measured with the four sides interleaved in one invocation (median of 3 × 10 runs): their kernel times are the interleaved ones.
@@ -10,6 +12,10 @@ Rust's side is the community port [polybench-rs](https://github.com/JRF63/polybe
 ## Xeon E5-2686 v4 (x86-64, 2 vCPUs, AVX2)
 
 Kernel time: Xisto **21 wins**, 9 ties, 0 losses (a tie is within 3%). The winner of each column pair (kernel time, CPU, memory) is in bold when ahead by more than 3%; C is the reference, not scored.
+
+<SpeedupBars page="pb-vs-rust" section="Xeon E5-2686 v4" unit="kernel" />
+
+<MemoryBars page="pb-vs-rust" section="Xeon E5-2686 v4" unit="kernel" />
 
 | kernel | C (ref.) kernel | Xisto kernel | Rust kernel | ratio | Xisto CPU | Rust CPU | Xisto memory | Rust memory | faster |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
@@ -47,6 +53,10 @@ Kernel time: Xisto **21 wins**, 9 ties, 0 losses (a tie is within 3%). The winne
 ## Graviton2 (Neoverse N1, arm64, 2 vCPUs)
 
 Kernel time: Xisto **21 wins**, 9 ties, 0 losses (a tie is within 3%). The winner of each column pair (kernel time, CPU, memory) is in bold when ahead by more than 3%; C is the reference, not scored.
+
+<SpeedupBars page="pb-vs-rust" section="Graviton2" unit="kernel" />
+
+<MemoryBars page="pb-vs-rust" section="Graviton2" unit="kernel" />
 
 | kernel | C (ref.) kernel | Xisto kernel | Rust kernel | ratio | Xisto CPU | Rust CPU | Xisto memory | Rust memory | faster |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
