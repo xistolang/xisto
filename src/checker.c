@@ -1414,15 +1414,23 @@ static void check_promise(Expr *e, Type *expected) {
         /* Promise.race([stored, wait]) of promises kept in variables, all of one type: the race is on them, as an array kept
            (XB-162). A task awaiting each would stay parked on a loser that never settles (its timer cleared) */
         Type *u = NULL;
-        bool kept = true;
+        bool kept = true, var = false;
         for (int i = 0; i < a->args.len && kept; i++) {
             Expr *x = a->args.items[i];
             Binding *b = x->kind == E_IDENT && x->str ? lookup(x->str) : NULL;
             Type *bt = b && b->type ? b->type : NULL;
             kept = bt && bt->kind == TY_PROMISE && bt->elem->kind != TY_VOID && (!u || ty_equal(u, bt->elem));
-            if (kept) u = bt->elem;
+            if (kept) { u = bt->elem; var = true; }
+            else if (x->kind == E_CALL && x->lhs && x->lhs->kind == E_IDENT && x->lhs->str && !lookup(x->lhs->str)) {
+                /* Promise.race([quick(), wait]): a call of an async function of the same type, kept as a promise too
+                   (it runs to its end; the race does not park a task on the loser, XB-231) */
+                Func *f = lookup_func(x->lhs->str);
+                kept = f && (f->is_async || f->ret_promise) && f->ntparams == 0 && f->ret && f->ret->kind != TY_VOID && f->ret->kind != TY_PROMISE &&
+                       (!u || ty_equal(u, f->ret));
+                if (kept) u = f->ret;
+            }
         }
-        if (kept) {
+        if (kept && var) { /* (calls only: each a task, below) */
             check_expr(a, ty_array_of(ty_promise_of(u)));
             if (a->type->kind == TY_ARRAY && a->type->elem->kind == TY_PROMISE && ty_equal(a->type->elem->elem, u)) {
                 e->builtin.cfn = "promise_race_arr";
