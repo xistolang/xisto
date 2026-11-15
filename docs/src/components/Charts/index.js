@@ -17,7 +17,8 @@ function useWidth(fallback) {
   return [ref, w];
 }
 
-const fmt = (v) => (v >= 1e6 ? `${(v / 1e6).toFixed(2)}M` : v >= 1e4 ? `${Math.round(v / 1e3)}k` : v >= 1e3 ? `${(v / 1e3).toFixed(1)}k` : `${Math.round(v)}`);
+const fmt = (v) =>
+  v >= 1e6 ? `${(v / 1e6).toFixed(2)}M` : v >= 1e4 ? `${Math.round(v / 1e3)}k` : v >= 1e3 ? `${(v / 1e3).toFixed(1)}k` : v < 10 && !Number.isInteger(v) ? v.toFixed(1) : `${Math.round(v)}`;
 const full = (v) => Math.round(v).toLocaleString('en-US');
 
 // clean ticks: 0 and steps of 1, 2 or 5 × 10^n, at most `n` of them
@@ -52,10 +53,11 @@ function Tooltip({tip, docked}) {
  * Horizontal bars, largest first: one bar per server.
  * rows: [{name, value, highlight?, detail?: [[label, value], ...]}]; unit: axis caption.
  */
-export function BarChart({title, caption, rows, unit = 'requests per second'}) {
+export function BarChart({title, caption, rows, unit = 'requests per second', format = fmt, formatFull = full, lowerIsBetter = false, keepOrder = false, refLine = null}) {
   const [ref, width] = useWidth(640);
   const [tip, setTip] = useState(null);
-  const sorted = [...rows].sort((a, b) => b.value - a.value);
+  // best first: the largest, or the smallest when less is better (CPU, memory, latency)
+  const sorted = keepOrder ? rows : [...rows].sort((a, b) => (lowerIsBetter ? a.value - b.value : b.value - a.value));
   // narrow screens put each name above its bar; wide ones keep a column of names long enough for the longest
   const stacked = width < 560;
   const labelW = stacked ? 4 : 230;
@@ -65,7 +67,7 @@ export function BarChart({title, caption, rows, unit = 'requests per second'}) {
   const barTop = stacked ? 20 : (band - bar) / 2;
   const top = 8;
   const plotW = width - labelW - valueW - 8;
-  const tk = ticks(sorted[0].value, width < 480 ? 4 : 5);
+  const tk = ticks(Math.max(...sorted.map((r) => r.value)), width < 480 ? 4 : 5);
   const max = tk[tk.length - 1];
   const x = (v) => labelW + (v / max) * plotW;
   const h = top + sorted.length * band + 28;
@@ -76,20 +78,23 @@ export function BarChart({title, caption, rows, unit = 'requests per second'}) {
       x: Math.min(px + 12, width - 200),
       y: top + i * band + band,
       title: r.name,
-      rows: [{label: unit, value: full(r.value)}, ...(r.detail || []).map(([l, v]) => ({label: l, value: v}))],
+      rows: [{label: unit, value: formatFull(r.value)}, ...(r.detail || []).map(([l, v]) => ({label: l, value: v}))],
     });
   };
   return (
     <figure className={styles.figure}>
       {title && <figcaption className={styles.title}>{title}</figcaption>}
       <div ref={ref} className={styles.plot} onMouseLeave={() => setTip(null)}>
-        <svg width={width} height={h} role="img" aria-label={`${title || 'Bar chart'}: ${sorted.map((r) => `${r.name} ${full(r.value)}`).join(', ')}`}>
+        <svg width={width} height={h} role="img" aria-label={`${title || 'Bar chart'}: ${sorted.map((r) => `${r.name} ${formatFull(r.value)}`).join(', ')}`}>
           {tk.map((t) => (
             <g key={t}>
               <line x1={x(t)} x2={x(t)} y1={top} y2={h - 24} className={styles.grid} />
               <text x={x(t)} y={h - 8} textAnchor="middle" className={styles.axis}>{fmt(t)}</text>
             </g>
           ))}
+          {refLine != null && (
+            <line x1={x(refLine)} x2={x(refLine)} y1={top} y2={h - 24} className={styles.crosshair} strokeDasharray="4 3" />
+          )}
           {sorted.map((r, i) => {
             const y = top + i * band + barTop;
             const w = Math.max(2, x(r.value) - labelW);
@@ -105,13 +110,13 @@ export function BarChart({title, caption, rows, unit = 'requests per second'}) {
                 onFocus={() => show(r, i)}
                 onBlur={() => setTip(null)}
                 onClick={(ev) => show(r, i, ev)}
-                aria-label={`${r.name}: ${full(r.value)} ${unit}`}>
+                aria-label={`${r.name}: ${formatFull(r.value)} ${unit}`}>
                 <rect x={0} y={top + i * band} width={width} height={band} fill="transparent" />
                 <text x={stacked ? labelW : labelW - 10} y={stacked ? y - 6 : y + bar / 2} dy={stacked ? 0 : '0.35em'} textAnchor={stacked ? 'start' : 'end'} className={r.highlight ? styles.labelStrong : styles.label}>
                   {r.name}
                 </text>
                 <path d={d} fill={r.highlight ? 'var(--chart-accent)' : 'var(--chart-muted)'} />
-                <text x={labelW + w + 6} y={y + bar / 2} dy="0.35em" className={styles.value}>{fmt(r.value)}</text>
+                <text x={labelW + w + 6} y={y + bar / 2} dy="0.35em" className={styles.value}>{format(r.value)}</text>
               </g>
             );
           })}
@@ -127,7 +132,7 @@ export function BarChart({title, caption, rows, unit = 'requests per second'}) {
  * Lines over discrete levels (evenly spaced, e.g. connections), one line per series, with a crosshair tooltip.
  * levels: [16, 32, ...]; series: [{name, values: [v | null per level], color: 1..6}]; xLabel: axis caption.
  */
-export function LineChart({title, caption, levels, series, xLabel = 'connections', unit = 'requests per second'}) {
+export function LineChart({title, caption, levels, series, xLabel = 'connections', format = fmt, formatFull = full, log = false, lowerIsBetter = false}) {
   const [ref, width] = useWidth(640);
   const [hover, setHover] = useState(null);
   const left = 44;
@@ -136,11 +141,14 @@ export function LineChart({title, caption, levels, series, xLabel = 'connections
   const h = width < 480 ? 240 : 300;
   const bottom = 40;
   const all = series.flatMap((s) => s.values.filter((v) => v != null));
-  const tk = ticks(Math.max(...all), 4);
+  // log scale (latency spans 1 ms to seconds): ticks at the powers of ten around the data
+  const lo = log ? Math.floor(Math.log10(Math.min(...all))) : 0;
+  const hi = log ? Math.max(lo + 1, Math.ceil(Math.log10(Math.max(...all)))) : 0;
+  const tk = log ? Array.from({length: hi - lo + 1}, (_, i) => 10 ** (lo + i)) : ticks(Math.max(...all), 4);
   const max = tk[tk.length - 1];
   const step = (width - left - right) / Math.max(1, levels.length - 1);
   const x = (i) => left + i * step;
-  const y = (v) => top + (1 - v / max) * (h - top - bottom);
+  const y = (v) => top + (1 - (log ? (Math.log10(v) - lo) / (hi - lo) : v / max)) * (h - top - bottom);
   const at = (ev) => {
     const box = ref.current.getBoundingClientRect();
     const cx = (ev.touches ? ev.touches[0].clientX : ev.clientX) - box.left;
@@ -157,8 +165,8 @@ export function LineChart({title, caption, levels, series, xLabel = 'connections
           rows: series
             .map((s) => ({label: s.name, v: s.values[hover], key: `--chart-s${s.color}`}))
             .filter((r) => r.v != null)
-            .sort((a, b) => b.v - a.v)
-            .map((r) => ({...r, value: full(r.v)})),
+            .sort((a, b) => (lowerIsBetter ? a.v - b.v : b.v - a.v))
+            .map((r) => ({...r, value: formatFull(r.v)})),
         };
   return (
     <figure className={styles.figure}>
@@ -189,7 +197,7 @@ export function LineChart({title, caption, levels, series, xLabel = 'connections
           {tk.map((t) => (
             <g key={t}>
               <line x1={left} x2={width - right} y1={y(t)} y2={y(t)} className={styles.grid} />
-              <text x={left - 6} y={y(t)} dy="0.35em" textAnchor="end" className={styles.axis}>{fmt(t)}</text>
+              <text x={left - 6} y={y(t)} dy="0.35em" textAnchor="end" className={styles.axis}>{format(t)}</text>
             </g>
           ))}
           {levels.map((l, i) => (
