@@ -49,3 +49,10 @@ console.log(JSON.stringify({ a: "x" }, null, -1));
 const rec: Record<string, unknown> = { a: 1, b: "two", c: [true, false], n: null, d: { e: [] as number[] } };
 console.log(JSON.stringify(rec, null, 2));
 console.log(JSON.stringify(rec));
+// a Map or a Set the replacer returns has no properties of its own: {}
+const mp = new Map<string, number>();
+mp.set("a", 1);
+console.log(JSON.stringify(u, (k, v) => k === "roles" ? mp : k === "email" ? new Set<string>(["x"]) : v, 2));
+// the root replaced, dropped
+console.log(JSON.stringify(u, (k, v) => k === "" ? [1, "a"] : v, 2));
+console.log(JSON.stringify(u, (k, v) => k === "" ? undefined : v));
