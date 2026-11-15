@@ -59,7 +59,17 @@ async function who(req: HttpRequest): Promise<HttpResponse> {
   return HttpResponse.text(`who=${req.param("name")} id=${req.header("X-Id") ?? "none"} n=${req.query("n") ?? "none"};`);
 }
 
+// HttpResponse.status: a JSON body goes out as application/json, as Express's res.status(code).json(...) sends it
+function byStatus(req: HttpRequest): HttpResponse {
+  const kind = req.param("kind");
+  if (kind === "created") return HttpResponse.status(201, JSON.stringify({ id: 1 }));
+  if (kind === "missing") return HttpResponse.status(404, `{"error":"not found"}`);
+  if (kind === "list") return HttpResponse.status(200, " [1, 2] ");
+  return HttpResponse.status(418, "{teapot");
+}
+
 const app: Server = new Server();
+app.get("/status/:kind", byStatus);
 app.get("/wait", wait);
 app.post("/publish", publish);
 app.post("/echo", echo);

@@ -1722,7 +1722,15 @@ static xs_HttpResponse *xs_HttpResponse_make(int64_t status, xs_str *body, const
 }
 static xs_HttpResponse *xs_HttpResponse_text(xs_str *body) { return xs_HttpResponse_make(200, body, "text/plain; charset=utf-8"); }
 static xs_HttpResponse *xs_HttpResponse_json(xs_str *body) { return xs_HttpResponse_make(200, body, "application/json"); }
-static xs_HttpResponse *xs_HttpResponse_status(int64_t code, xs_str *body) { return xs_HttpResponse_make(code, body, "text/plain; charset=utf-8"); }
+/* HttpResponse.status(code, body): the content type follows the body, as Express's res.status(code).json(...) and
+   res.status(code).send(text) do: a JSON object or array is application/json, anything else text */
+static xs_HttpResponse *xs_HttpResponse_status(int64_t code, xs_str *body) {
+    const char *p = body->data, *e = body->data + body->len;
+    while (p < e && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    while (e > p && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) e--;
+    bool json = e - p >= 2 && ((*p == '{' && e[-1] == '}') || (*p == '[' && e[-1] == ']'));
+    return xs_HttpResponse_make(code, body, json ? "application/json" : "text/plain; charset=utf-8");
+}
 static bool xs_has_ctl(const char *p, size_t n);
 /* HttpResponse.of(status, contentType, body) */
 XS_NOINLINE xs_HttpResponse *xs_HttpResponse_of(int64_t code, xs_str *ctype, xs_str *body) {
