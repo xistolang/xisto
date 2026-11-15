@@ -37,8 +37,13 @@ const config = {
           showLastUpdateTime: false,
           // the latest release is the default; "Next" (main) documents what is not released yet
           lastVersion: released.length ? released[0] : 'current',
+          // older releases stay readable from the version menu but out of search engines (noindex), so a search
+          // lands on the latest release's numbers, not on an old page
           versions: released.length
-            ? {current: {label: 'Next (unreleased)', path: 'next', banner: 'unreleased'}}
+            ? {
+                current: {label: 'Next (unreleased)', path: 'next', banner: 'unreleased'},
+                ...Object.fromEntries(released.slice(1).map((v) => [v, {noIndex: true}])),
+              }
             : {current: {label: 'Next', banner: 'none'}},
         },
         blog: false,
