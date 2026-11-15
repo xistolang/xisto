@@ -57,6 +57,16 @@ static Func **pending_overloads; /* function f(...): R; signatures waiting for t
 static int npending_overloads;
 static bool wants_arrays; /* a .reduce( / .flatMap( / .flat( call, or an Iterable<T> type, was parsed: xisto:arrays is loaded */
 static bool wants_settled; /* Promise.allSettled was named: xisto:settled is loaded */
+static bool wants_builtins; /* xs.at(i), Object.groupBy, a Set method of ES2025... was named: xisto:builtins is loaded */
+static bool wants_promises; /* Promise.withResolvers or Promise.any was named: xisto:promises is loaded */
+/* the member names whose call the checker may turn into a function of xisto:builtins */
+static bool is_builtins_member(const char *n) {
+    static const char *const names[] = {"at", "findLast", "findLastIndex", "with", "toSpliced", "copyWithin", "values", "keys",
+        "groupBy", "union", "intersection", "difference", "symmetricDifference", "isSubsetOf", "isSupersetOf", "isDisjointFrom",
+        "drop", "flatMap", "some", "every", "find", "toArray", "is", "assign", "asUintN", "asIntN"};
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) if (!strcmp(n, names[i])) return true;
+    return false;
+}
 static bool wants_okmap; /* WeakMap, or Map<object, V>, was written: xisto:okmap is loaded */
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
 static void import_process(Program *prog, Module *m);
@@ -65,7 +75,7 @@ static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... 
 static bool wants_errors; /* TypeError, RangeError, SyntaxError or ReferenceError was named: xisto:errors is loaded */
 static bool is_js_error_name(const char *n) {
     return n && (!strcmp(n, "TypeError") || !strcmp(n, "RangeError") || !strcmp(n, "SyntaxError") || !strcmp(n, "ReferenceError") ||
-                 !strcmp(n, "URIError"));
+                 !strcmp(n, "URIError") || !strcmp(n, "AggregateError"));
 }
 static bool is_url_global_name(const char *n);
 /* generics: the type parameters in scope while a template is parsed, or their types while an instance is */
@@ -1872,6 +1882,8 @@ static Expr *parse_postfix(Parser *p) {
             if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from") ||
                 !strcmp(name.str, "fromEntries")) wants_arrays = true;
             if (!strcmp(name.str, "allSettled")) wants_settled = true;
+            if (is_builtins_member(name.str)) wants_builtins = true;
+            if ((!strcmp(name.str, "withResolvers") || !strcmp(name.str, "any")) && e->kind == E_IDENT && !strcmp(e->str, "Promise")) wants_promises = true;
             if (!strcmp(name.str, "next") && e->kind == E_MEMBER && e->str && (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")))
                 wants_arrays = true; /* m.keys().next().value: __xs_first */
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs);
@@ -1882,6 +1894,7 @@ static Expr *parse_postfix(Parser *p) {
                 at_push_call = false;
                 if (!strcmp(m->str, "splice") && m->args.len == 1) wants_arrays = true; /* xs.splice(i): __xs_spliceFrom */
                 if (!strcmp(m->str, "entries") && m->args.len == 0) wants_arrays = true; /* xs.entries(): __xs_entries */
+                if (!strcmp(m->str, "toString") && m->args.len == 1) wants_builtins = true; /* big.toString(radix): __xs_big_radix */
                 if (m->args.len == 1 && m->args.items[0]->kind == E_ARROW && m->args.items[0]->arrow->fn->nparams == 3)
                     wants_arrays = true; /* xs.filter((x, i, arr) => ...): __xs_filter3 */
             }
@@ -1913,6 +1926,8 @@ static Expr *parse_postfix(Parser *p) {
             if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from") ||
                 !strcmp(name.str, "fromEntries")) wants_arrays = true;
             if (!strcmp(name.str, "allSettled")) wants_settled = true;
+            if (is_builtins_member(name.str)) wants_builtins = true;
+            if ((!strcmp(name.str, "withResolvers") || !strcmp(name.str, "any")) && e->kind == E_IDENT && !strcmp(e->str, "Promise")) wants_promises = true;
             if (!strcmp(name.str, "next") && e->kind == E_MEMBER && e->str && (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")))
                 wants_arrays = true; /* m.keys().next().value: __xs_first */
             if (!strcmp(name.str, "length") && at(p, TK_ASSIGN)) wants_arrays = true; /* xs.length = 0 */
@@ -1925,6 +1940,7 @@ static Expr *parse_postfix(Parser *p) {
                 at_push_call = false;
                 if (!strcmp(m->str, "splice") && m->args.len == 1) wants_arrays = true; /* xs.splice(i): __xs_spliceFrom */
                 if (!strcmp(m->str, "entries") && m->args.len == 0) wants_arrays = true; /* xs.entries(): __xs_entries */
+                if (!strcmp(m->str, "toString") && m->args.len == 1) wants_builtins = true; /* big.toString(radix): __xs_big_radix */
                 if (m->args.len == 1 && m->args.items[0]->kind == E_ARROW && m->args.items[0]->arrow->fn->nparams == 3)
                     wants_arrays = true; /* xs.filter((x, i, arr) => ...): __xs_filter3 */
             }
@@ -6091,6 +6107,322 @@ static const char xs_settled_src[] =
     "  }\n"
     "  return out;\n"
     "}\n";
+/* xisto:builtins: the ES2022-ES2025 methods written in xisto (Array at/findLast/with/toSpliced, Object.groupBy,
+   the Set methods, iterator helpers, BigInt.asUintN...): the checker turns xs.at(i) into __xs_at(xs, i) and so on;
+   loaded only by a program that names one of them. Its errors are the runtime's (__xs_throw): no class of xisto:errors */
+static const char xs_builtins_src[] =
+    "// arrays (ES2022-ES2023): the compiler turns xs.at(i) into __xs_at(xs, i) and so on\n"
+    "export function __xs_at<T>(xs: T[], i: int): T | null {\n"
+    "  const k = i < 0 ? xs.length + i : i;\n"
+    "  if (k < 0 || k >= xs.length) return null;\n"
+    "  return xs[k];\n"
+    "}\n"
+    "export function __xs_str_at(s: string, i: int): string | null {\n"
+    "  const k = i < 0 ? s.length + i : i;\n"
+    "  if (k < 0 || k >= s.length) return null;\n"
+    "  return s.charAt(k);\n"
+    "}\n"
+    "// a typed array's at(i): its length and a reader of its elements (written at the call, on the array there)\n"
+    "export function __xs_ta_at<E>(n: int, i: int, get: (k: int) => E): E | null {\n"
+    "  const k = i < 0 ? n + i : i;\n"
+    "  if (k < 0 || k >= n) return null;\n"
+    "  return get(k);\n"
+    "}\n"
+    "export function __xs_findLast<T>(xs: T[], f: (x: T, i: int) => boolean): T | null {\n"
+    "  for (let i = xs.length - 1; i >= 0; i--) if (f(xs[i], i)) return xs[i];\n"
+    "  return null;\n"
+    "}\n"
+    "export function __xs_findLastIndex<T>(xs: T[], f: (x: T, i: int) => boolean): int {\n"
+    "  for (let i = xs.length - 1; i >= 0; i--) if (f(xs[i], i)) return i;\n"
+    "  return -1;\n"
+    "}\n"
+    "export function __xs_with<T>(xs: T[], i: int, v: T): T[] {\n"
+    "  const k = i < 0 ? xs.length + i : i;\n"
+    "  if (k < 0 || k >= xs.length) __xs_throw(\"RangeError: Invalid index : \" + i);\n"
+    "  const out: T[] = [];\n"
+    "  for (let j = 0; j < xs.length; j++) out.push(j === k ? v : xs[j]);\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_toSpliced<T>(xs: T[], start: int, del: int, items: T[]): T[] {\n"
+    "  const n = xs.length;\n"
+    "  const s = start < 0 ? Math.max(n + start, 0) : Math.min(start, n);\n"
+    "  const d = Math.min(Math.max(del, 0), n - s);\n"
+    "  const out: T[] = [];\n"
+    "  for (let j = 0; j < s; j++) out.push(xs[j]);\n"
+    "  for (const x of items) out.push(x);\n"
+    "  for (let j = s + d; j < n; j++) out.push(xs[j]);\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_copyWithin<T>(xs: T[], target: int, start: int, end: int): T[] {\n"
+    "  const n = xs.length;\n"
+    "  const to = target < 0 ? Math.max(n + target, 0) : Math.min(target, n);\n"
+    "  const from = start < 0 ? Math.max(n + start, 0) : Math.min(start, n);\n"
+    "  const fin = end < 0 ? Math.max(n + end, 0) : Math.min(end, n);\n"
+    "  const count = Math.min(fin - from, n - to);\n"
+    "  if (count <= 0) return xs;\n"
+    "  const tmp: T[] = [];\n"
+    "  for (let j = 0; j < count; j++) tmp.push(xs[from + j]);\n"
+    "  for (let j = 0; j < count; j++) xs[to + j] = tmp[j];\n"
+    "  return xs;\n"
+    "}\n"
+    "// xs.values() / xs.keys(): iterators (generators) over the array, read as it is at each step\n"
+    "export function* __xs_values<T>(xs: T[]): Generator<T> {\n"
+    "  for (let i = 0; i < xs.length; i++) yield xs[i];\n"
+    "}\n"
+    "export function* __xs_keys<T>(xs: T[]): Generator<int> {\n"
+    "  for (let i = 0; i < xs.length; i++) yield i;\n"
+    "}\n"
+    "// Object.groupBy / Map.groupBy (ES2024)\n"
+    "export function __xs_groupBy<T>(xs: T[], f: (x: T, i: int) => string): Record<string, T[]> {\n"
+    "  const out: Record<string, T[]> = {};\n"
+    "  for (let i = 0; i < xs.length; i++) {\n"
+    "    const k = f(xs[i], i);\n"
+    "    const g = out[k];\n"
+    "    if (g === null) out[k] = [xs[i]];\n"
+    "    else g.push(xs[i]);\n"
+    "  }\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_mapGroupBy<K, T>(xs: T[], f: (x: T, i: int) => K): Map<K, T[]> {\n"
+    "  const out = new Map<K, T[]>();\n"
+    "  for (let i = 0; i < xs.length; i++) {\n"
+    "    const k = f(xs[i], i);\n"
+    "    const g = out.get(k);\n"
+    "    if (g === null) out.set(k, [xs[i]]);\n"
+    "    else g.push(xs[i]);\n"
+    "  }\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_set_values<T>(s: Set<T>): T[] {\n"
+    "  const out: T[] = [];\n"
+    "  for (const x of s) out.push(x);\n"
+    "  return out;\n"
+    "}\n"
+    "// Set methods (ES2025), in the order of the specification's steps\n"
+    "export function __xs_set_union<T>(a: Set<T>, b: Set<T>): Set<T> {\n"
+    "  const out = new Set<T>();\n"
+    "  for (const x of a) out.add(x);\n"
+    "  for (const x of b) out.add(x);\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_set_intersection<T>(a: Set<T>, b: Set<T>): Set<T> {\n"
+    "  const out = new Set<T>();\n"
+    "  if (a.size <= b.size) { for (const x of a) if (b.has(x)) out.add(x); }\n"
+    "  else { for (const x of b) if (a.has(x)) out.add(x); }\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_set_difference<T>(a: Set<T>, b: Set<T>): Set<T> {\n"
+    "  const out = new Set<T>();\n"
+    "  for (const x of a) out.add(x);\n"
+    "  if (a.size <= b.size) { for (const x of a) if (b.has(x)) out.delete(x); }\n"
+    "  else { for (const x of b) out.delete(x); }\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_set_symmetricDifference<T>(a: Set<T>, b: Set<T>): Set<T> {\n"
+    "  const out = new Set<T>();\n"
+    "  for (const x of a) out.add(x);\n"
+    "  for (const x of b) { if (a.has(x)) out.delete(x); else out.add(x); }\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_set_isSubsetOf<T>(a: Set<T>, b: Set<T>): boolean {\n"
+    "  if (a.size > b.size) return false;\n"
+    "  for (const x of a) if (!b.has(x)) return false;\n"
+    "  return true;\n"
+    "}\n"
+    "export function __xs_set_isSupersetOf<T>(a: Set<T>, b: Set<T>): boolean {\n"
+    "  if (a.size < b.size) return false;\n"
+    "  for (const x of b) if (!a.has(x)) return false;\n"
+    "  return true;\n"
+    "}\n"
+    "export function __xs_set_isDisjointFrom<T>(a: Set<T>, b: Set<T>): boolean {\n"
+    "  if (a.size <= b.size) { for (const x of a) if (b.has(x)) return false; }\n"
+    "  else { for (const x of b) if (a.has(x)) return false; }\n"
+    "  return true;\n"
+    "}\n"
+    "// iterator helpers (ES2025) that the generators' own (map, filter, take, forEach, reduce, toArray) do not cover\n"
+    "// (the count is checked when the helper is called, as JavaScript does: the generators below are lazy)\n"
+    "export function __xs_it_drop<T>(g: Generator<T>, n: number): Generator<T> {\n"
+    "  if (!(n >= 0)) __xs_throw(\"RangeError: \" + n + \" must be positive\");\n"
+    "  return __xs_it_drop_(g, n);\n"
+    "}\n"
+    "export function* __xs_it_drop_<T>(g: Generator<T>, n: number): Generator<T> {\n"
+    "  let i = 0;\n"
+    "  for (const x of g) {\n"
+    "    if (i < n) { i++; continue; }\n"
+    "    yield x;\n"
+    "  }\n"
+    "}\n"
+    "export function __xs_it_take<T>(g: Generator<T>, n: number): Generator<T> {\n"
+    "  if (!(n >= 0)) __xs_throw(\"RangeError: \" + n + \" must be positive\");\n"
+    "  return __xs_it_take_(g, n);\n"
+    "}\n"
+    "export function* __xs_it_take_<T>(g: Generator<T>, n: number): Generator<T> {\n"
+    "  if (n === 0) return;\n"
+    "  let i = 0;\n"
+    "  for (const x of g) {\n"
+    "    yield x;\n"
+    "    i++;\n"
+    "    if (i >= n) return;\n"
+    "  }\n"
+    "}\n"
+    "export function* __xs_it_map<T, U>(g: Generator<T>, f: (x: T, i: int) => U): Generator<U> {\n"
+    "  let i = 0;\n"
+    "  for (const x of g) yield f(x, i++);\n"
+    "}\n"
+    "export function* __xs_it_filter<T>(g: Generator<T>, f: (x: T, i: int) => boolean): Generator<T> {\n"
+    "  let i = 0;\n"
+    "  for (const x of g) if (f(x, i++)) yield x;\n"
+    "}\n"
+    "export function* __xs_it_flatMap<T, U>(g: Generator<T>, f: (x: T, i: int) => U[]): Generator<U> {\n"
+    "  let i = 0;\n"
+    "  for (const x of g) for (const y of f(x, i++)) yield y;\n"
+    "}\n"
+    "export function __xs_it_forEach<T>(g: Generator<T>, f: (x: T, i: int) => void): void {\n"
+    "  let i = 0;\n"
+    "  for (const x of g) f(x, i++);\n"
+    "}\n"
+    "export function __xs_it_some<T>(g: Generator<T>, f: (x: T, i: int) => boolean): boolean {\n"
+    "  let i = 0;\n"
+    "  for (const x of g) if (f(x, i++)) return true;\n"
+    "  return false;\n"
+    "}\n"
+    "export function __xs_it_every<T>(g: Generator<T>, f: (x: T, i: int) => boolean): boolean {\n"
+    "  let i = 0;\n"
+    "  for (const x of g) if (!f(x, i++)) return false;\n"
+    "  return true;\n"
+    "}\n"
+    "export function __xs_it_find<T>(g: Generator<T>, f: (x: T, i: int) => boolean): T | null {\n"
+    "  let i = 0;\n"
+    "  for (const x of g) if (f(x, i++)) return x;\n"
+    "  return null;\n"
+    "}\n"
+    "export function __xs_it_reduce<A, T>(g: Generator<T>, f: (acc: A, x: T, i: int) => A, init: A): A {\n"
+    "  let acc: A = init;\n"
+    "  let i = 0;\n"
+    "  for (const x of g) acc = f(acc, x, i++);\n"
+    "  return acc;\n"
+    "}\n"
+    "export function __xs_it_reduce1<T>(g: Generator<T>, f: (acc: T, x: T, i: int) => T): T {\n"
+    "  let acc: T | null = null;\n"
+    "  let i = 0;\n"
+    "  for (const x of g) {\n"
+    "    if (i === 0) acc = x;\n"
+    "    else acc = f(acc!, x, i);\n"
+    "    i++;\n"
+    "  }\n"
+    "  if (i === 0) __xs_throw(\"TypeError: Reduce of a done iterator with no initial value\");\n"
+    "  return acc!;\n"
+    "}\n"
+    "export function __xs_it_toArray<T>(g: Generator<T>): T[] {\n"
+    "  const out: T[] = [];\n"
+    "  for (const x of g) out.push(x);\n"
+    "  return out;\n"
+    "}\n"
+    "// Object.is of numbers (NaN is NaN; 0 is not -0), Object.assign of Records\n"
+    "export function __xs_is_num(a: number, b: number): boolean {\n"
+    "  if (a !== a) return b !== b;\n"
+    "  if (a === 0 && b === 0) return 1 / a === 1 / b;\n"
+    "  return a === b;\n"
+    "}\n"
+    "export function __xs_assign_rec<V>(t: Record<string, V>, s: Record<string, V>): Record<string, V> {\n"
+    "  for (const k of Object.keys(s)) t[k] = s[k];\n"
+    "  return t;\n"
+    "}\n"
+    "// BigInt.asUintN / asIntN, bigint.toString(radix)\n"
+    "export function __xs_asUintN(bits: number, b: bigint): bigint {\n"
+    "  if (!(bits >= 0 && bits <= 9007199254740991 && Math.trunc(bits) === bits)) __xs_throw(\"RangeError: Invalid value: not (convertible to) a safe integer\");\n"
+    "  if (bits === 0) return 0n;\n"
+    "  const m = 2n ** BigInt(bits);\n"
+    "  let r = b % m;\n"
+    "  if (r < 0n) r += m;\n"
+    "  return r;\n"
+    "}\n"
+    "export function __xs_asIntN(bits: number, b: bigint): bigint {\n"
+    "  const r = __xs_asUintN(bits, b);\n"
+    "  if (bits === 0) return r;\n"
+    "  const h = 2n ** BigInt(bits - 1);\n"
+    "  return r >= h ? r - h - h : r;\n"
+    "}\n"
+    "export function __xs_big_radix(b: bigint, radix: number): string {\n"
+    "  if (!(radix >= 2 && radix <= 36)) __xs_throw(\"RangeError: toString() radix argument must be between 2 and 36\");\n"
+    "  const r: number = Math.trunc(radix);\n"
+    "  if (r === 10) return String(b);\n"
+    "  const neg = b < 0n;\n"
+    "  let x = neg ? -b : b;\n"
+    "  if (x === 0n) return \"0\";\n"
+    "  const digits = \"0123456789abcdefghijklmnopqrstuvwxyz\";\n"
+    "  // a chunk of k digits at a time: r^k below 2^53\n"
+    "  let k = 1;\n"
+    "  let rk: number = r;\n"
+    "  while (rk * r < 9007199254740992) { rk *= r; k++; }\n"
+    "  const R = BigInt(rk);\n"
+    "  const parts: string[] = [];\n"
+    "  while (x > 0n) {\n"
+    "    let c: number = Number(x % R);\n"
+    "    x = x / R;\n"
+    "    let s = \"\";\n"
+    "    for (let j = 0; j < k; j++) {\n"
+    "      s = digits.charAt(c % r) + s;\n"
+    "      c = Math.trunc(c / r);\n"
+    "      if (x === 0n && c === 0) break;\n"
+    "    }\n"
+    "    parts.push(s);\n"
+    "  }\n"
+    "  let out = \"\";\n"
+    "  for (let j = parts.length - 1; j >= 0; j--) out += parts[j];\n"
+    "  return neg ? \"-\" + out : out;\n"
+    "}\n";
+
+/* xisto:promises: Promise.withResolvers and Promise.any (whose rejection is an AggregateError of xisto:errors);
+   loaded only by a program that names them on Promise */
+static const char xs_promises_src[] =
+    "// Promise.withResolvers (ES2024) and Promise.any (ES2021)\n"
+    "export interface PromiseWithResolvers<T> {\n"
+    "  promise: Promise<T>;\n"
+    "  resolve: (v: T) => void;\n"
+    "  reject: (e: Error) => void;\n"
+    "}\n"
+    "export function __xs_withResolvers<T>(): PromiseWithResolvers<T> {\n"
+    "  let res: ((v: T) => void) | null = null;\n"
+    "  let rej: ((e: Error) => void) | null = null;\n"
+    "  const promise = new Promise<T>((a, b) => { res = a; rej = b; });\n"
+    "  return { promise, resolve: res!, reject: rej! };\n"
+    "}\n"
+    "export function __xs_any<T>(ps: Promise<T>[]): Promise<T> {\n"
+    "  return new Promise<T>((resolve, reject) => {\n"
+    "    const errs: Error[] = [];\n"
+    "    let left = ps.length;\n"
+    "    let done = false;\n"
+    "    if (left === 0) { reject(new AggregateError(errs, \"All promises were rejected\")); return; }\n"
+    "    for (let i = 0; i < ps.length; i++) {\n"
+    "      errs.push(new Error(\"\"));\n"
+    "      const k = i;\n"
+    "      ps[i].then((v) => { if (!done) { done = true; resolve(v); } }, (e) => {\n"
+    "        errs[k] = e;\n"
+    "        left--;\n"
+    "        if (left === 0 && !done) { done = true; reject(new AggregateError(errs, \"All promises were rejected\")); }\n"
+    "      });\n"
+    "    }\n"
+    "  });\n"
+    "}\n"
+    "export function __xs_anyVoid(ps: Promise<void>[]): Promise<void> {\n"
+    "  return new Promise<void>((resolve, reject) => {\n"
+    "    const errs: Error[] = [];\n"
+    "    let left = ps.length;\n"
+    "    let done = false;\n"
+    "    if (left === 0) { reject(new AggregateError(errs, \"All promises were rejected\")); return; }\n"
+    "    for (let i = 0; i < ps.length; i++) {\n"
+    "      errs.push(new Error(\"\"));\n"
+    "      const k = i;\n"
+    "      ps[i].then(() => { if (!done) { done = true; resolve(); } }, (e) => {\n"
+    "        errs[k] = e;\n"
+    "        left--;\n"
+    "        if (left === 0 && !done) { done = true; reject(new AggregateError(errs, \"All promises were rejected\")); }\n"
+    "      });\n"
+    "    }\n"
+    "  });\n"
+    "}\n";
+
 /* xisto:errors: JavaScript's Error subclasses, visible in every module like Error itself */
 /* xisto:intl: Intl.DateTimeFormat (en-US, en-GB, pt-BR; numeric and 2-digit fields; a timeZone of the system TZ
    database), as Node formats it; loaded when the program names Intl */
@@ -6241,7 +6573,9 @@ static const char xs_errors_src[] =
     "export class RangeError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"RangeError\"; }\n}\n"
     "export class SyntaxError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"SyntaxError\"; }\n}\n"
     "export class ReferenceError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"ReferenceError\"; }\n}\n"
-    "export class URIError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"URIError\"; }\n}\n";
+    "export class URIError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"URIError\"; }\n}\n"
+    "export class AggregateError extends Error {\n  errors: unknown[];\n"
+    "  constructor(errors: unknown[], message: string = \"\") { super(message); this.name = \"AggregateError\"; this.errors = errors; }\n}\n";
 /* xisto:reflect: the descriptors the compiler builds for decorated classes (see "static reflection") */
 static const char xs_reflect_src[] =
     "// What a type is, and how to read and write a value of it as JSON.\n"
@@ -6603,6 +6937,24 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->loading = false;
         return m;
     }
+    if (strcmp(name, "promises") == 0) { /* xisto:promises: Promise.withResolvers, Promise.any (see xs_promises_src) */
+        m->builtin = false;
+        m->file = "xisto:promises";
+        m->src = (char *)xs_promises_src;
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
+    if (strcmp(name, "builtins") == 0) { /* xisto:builtins: at, groupBy, the Set methods... (see xs_builtins_src) */
+        m->builtin = false;
+        m->file = "xisto:builtins";
+        m->src = (char *)xs_builtins_src;
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
     if (strcmp(name, "arrays") == 0) { /* xisto:arrays: reduce, flatMap, flat (see xs_arrays_src) */
         m->builtin = false;
         m->file = "xisto:arrays";
@@ -6954,6 +7306,8 @@ Program *parse_program(const char *entry_file) {
     load_module(prog, entry_file, (Pos){0, 0}, NULL);
     if (wants_arrays) load_module(prog, "xisto:arrays", (Pos){1, 1}, entry_file);
     if (wants_settled) load_module(prog, "xisto:settled", (Pos){1, 1}, entry_file);
+    if (wants_builtins) load_module(prog, "xisto:builtins", (Pos){1, 1}, entry_file);
+    if (wants_promises) load_module(prog, "xisto:promises", (Pos){1, 1}, entry_file); /* (before errors: it names AggregateError) */
     if (wants_okmap) load_module(prog, "xisto:okmap", (Pos){1, 1}, entry_file);
     if (wants_url) load_module(prog, "xisto:url", (Pos){1, 1}, entry_file); /* (before errors: its DOMException extends Error) */
     if (wants_errors) load_module(prog, "xisto:errors", (Pos){1, 1}, entry_file);

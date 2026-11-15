@@ -1304,6 +1304,7 @@ static bool tostring_call(Expr *e) {
 static int mapnull_ok; /* checking the xs.map(f) of xs.map(f).filter(p): f may give number | null */
 static bool nullable_ok(Type *t);
 static Func *lookup_func(const char *name);
+static bool check_es_promise(Expr *e, Type *expected);
 static void check_promise(Expr *e, Type *expected) {
     const char *m = e->str;
     if (!e->is_call) xs_error(XS7030, e->pos, NULL, "Promise.%s is not a value", m);
@@ -1399,6 +1400,7 @@ static void check_promise(Expr *e, Type *expected) {
         check_expr(e, expected);
         return;
     }
+    if (check_es_promise(e, expected)) return; /* (Promise.withResolvers, Promise.any: xisto:builtins) */
     bool race = strcmp(m, "race") == 0 || strcmp(m, "any") == 0;
     if (!race && strcmp(m, "all") != 0) xs_error(XS7111, e->pos, "supported: Promise.all, Promise.race, Promise.any, Promise.resolve, Promise.reject", "unknown Promise member '%s'", m);
     if (e->args.len != 1) xs_error(XS7032, e->pos, NULL, "Promise.%s takes an array", m);
@@ -3044,6 +3046,8 @@ static Func *lookup_func(const char *name) {
         if (f->mod == cur_mod || (f->exported && imports_name(cur_mod, f->mod, name))) return f;
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:arrays") == 0) return f; /* (reduce & co) */
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:settled") == 0) return f; /* (Promise.allSettled) */
+        if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:builtins") == 0) return f; /* (xs.at & co) */
+        if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:promises") == 0) return f; /* (Promise.any) */
         if ((!strcmp(name, "__xs_construct") || !strcmp(name, "__xs_ci_params") || !strcmp(name, "__xs_apply") || !strcmp(name, "__xs_use_desc") || !strcmp(name, "__xs_desc_enter") || !strcmp(name, "__xs_desc_leave") || !strcmp(name, "__xs_deco_target") || !strcmp(name, "__xs_target_ctor")) &&
             f->mod && f->mod->file && !strcmp(f->mod->file, "xisto:reflect")) return f; /* (new (c)(); XB-107's f.apply and descriptors) */
         if (f->exported && (strstr(name, "__s_") || !strcmp(name, "__xs_fetch")) && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:url") == 0) return f; /* (URL.canParse, AbortSignal.timeout: statics of globals; fetch with its options in a value) */
@@ -8987,6 +8991,381 @@ static bool objlit_by_kind(Expr *e, Type *u, Type *expected) {
     check_expr(e, expected);
     return true;
 }
+/* ---- ES2022-ES2025 built-in methods (xisto:builtins) ----
+   xs.at(i), xs.findLast(f), xs.with(i, v), xs.toSorted(cmp), s.union(t), gen.drop(n), Object.groupBy(xs, f)...: each
+   becomes a call of the function of xisto:builtins that does it (written in xisto), or the form xisto has already
+   (xs.toSorted(cmp): xs.slice().sort(cmp)). The receiver is checked already. */
+static Func *lookup_func(const char *name);
+static bool is_big(Type *t);
+static bool es_ready(const char *fn) { return lookup_func(fn) != NULL; }
+/* e becomes fn(self, e's arguments...) (self checked already), checked where expected goes */
+static void es_call(Expr *e, const char *fn, Expr *self, Type *expected) {
+    Pos pos = e->pos;
+    Expr *c = xs_alloc(sizeof *c);
+    c->kind = E_CALL; c->pos = pos; c->field = -1; c->lhs = mk_ident(pos, fn);
+    c->targs = e->targs; c->ntargs = e->ntargs;
+    if (self) { self->prechecked = true; expr_list_push(&c->args, self); }
+    for (int i = 0; i < e->args.len; i++) expr_list_push(&c->args, e->args.items[i]);
+    *e = *c;
+    check_expr(e, expected);
+}
+/* e (a call of a member of the checked e->lhs) becomes lhs.<m1>().<m2>(e's arguments) */
+static void es_chain(Expr *e, const char *m1, const char *m2, Type *expected) {
+    Pos pos = e->pos;
+    Expr *in = xs_alloc(sizeof *in);
+    in->kind = E_MEMBER; in->pos = pos; in->field = -1; in->lhs = e->lhs; in->str = (char *)m1; in->is_call = true;
+    e->lhs->prechecked = true;
+    e->lhs = in;
+    e->str = (char *)m2;
+    check_expr(e, expected);
+}
+static bool es_name(const char *m, const char *const *names, int n) {
+    for (int i = 0; i < n; i++) if (!strcmp(m, names[i])) return true;
+    return false;
+}
+/* an iterator of a Map, Set or array (m.keys(), s.values(), xs.entries()), held as an array of its own in xisto */
+static bool es_iter_array(Expr *x) {
+    if (x->kind == E_MEMBER && x->is_call && x->str && x->args.len == 0 && x->lhs && x->lhs->type &&
+        (x->lhs->type->kind == TY_MAP || x->lhs->type->kind == TY_SET) &&
+        (!strcmp(x->str, "keys") || !strcmp(x->str, "values") || !strcmp(x->str, "entries"))) return true;
+    return x->kind == E_CALL && x->lhs && x->lhs->kind == E_IDENT && x->lhs->str && !strcmp(x->lhs->str, "__xs_entries");
+}
+static bool check_es_member(Expr *e, Type *expected) {
+    if (!e->is_call || !e->str || !e->lhs || !e->lhs->type) return false;
+    Type *t = e->lhs->type;
+    const char *m = e->str;
+    int n = e->args.len;
+    Pos pos = e->pos;
+    if (t->kind == TY_ARRAY) {
+        static const char *const it_only[] = {"drop", "take", "toArray"};
+        if (es_name(m, it_only, 3) && es_iter_array(e->lhs) && es_ready("__xs_values")) {
+            /* m.keys().take(2): the iterator's helpers, on the generator of its values */
+            Expr *self = e->lhs;
+            Expr *g = xs_alloc(sizeof *g);
+            g->kind = E_CALL; g->pos = self->pos; g->field = -1; g->lhs = mk_ident(self->pos, "__xs_values");
+            self->prechecked = true;
+            expr_list_push(&g->args, self);
+            check_expr(g, NULL);
+            g->prechecked = true;
+            e->lhs = g;
+            check_expr(e, expected);
+            return true;
+        }
+        if (!strcmp(m, "toSorted") && n <= 1) { es_chain(e, "slice", "sort", expected); return true; }
+        if (!strcmp(m, "toReversed") && n == 0) { es_chain(e, "slice", "reverse", expected); return true; }
+        if (!es_ready("__xs_at")) return false;
+        if (!strcmp(m, "at") && n == 1) { es_call(e, "__xs_at", e->lhs, expected); return true; }
+        if ((!strcmp(m, "findLast") || !strcmp(m, "findLastIndex")) && n == 1) {
+            es_call(e, !strcmp(m, "findLast") ? "__xs_findLast" : "__xs_findLastIndex", e->lhs, expected);
+            return true;
+        }
+        if (!strcmp(m, "with") && n == 2) { es_call(e, "__xs_with", e->lhs, expected); return true; }
+        if (!strcmp(m, "values") && n == 0) { es_call(e, "__xs_values", e->lhs, expected); return true; }
+        if (!strcmp(m, "keys") && n == 0) { es_call(e, "__xs_keys", e->lhs, expected); return true; }
+        if (!strcmp(m, "toSpliced")) { /* toSpliced(start, deleteCount, ...items): __xs_toSpliced(xs, start, deleteCount, [items]) */
+            Expr *items = xs_alloc(sizeof *items);
+            items->kind = E_ARRAY_LIT; items->pos = pos; items->field = -1;
+            for (int i = 2; i < n; i++) expr_list_push(&items->args, e->args.items[i]);
+            check_expr(items, t); /* (none: an empty T[]) */
+            items->prechecked = true;
+            Expr *start = n >= 1 ? e->args.items[0] : num_lit(pos, 0, true);
+            Expr *del = n >= 2 ? e->args.items[1] : num_lit(pos, n == 0 ? 0 : 9007199254740991.0, true);
+            e->args = (ExprList){0};
+            expr_list_push(&e->args, start);
+            expr_list_push(&e->args, del);
+            expr_list_push(&e->args, items);
+            es_call(e, "__xs_toSpliced", e->lhs, expected);
+            return true;
+        }
+        if (!strcmp(m, "copyWithin") && n >= 1 && n <= 3) {
+            if (n < 2) expr_list_push(&e->args, num_lit(pos, 0, true));
+            if (n < 3) expr_list_push(&e->args, num_lit(pos, 9007199254740991.0, true));
+            es_call(e, "__xs_copyWithin", e->lhs, expected);
+            return true;
+        }
+        return false;
+    }
+    if (t->kind == TY_STRING) {
+        if (!strcmp(m, "at") && n == 1 && es_ready("__xs_str_at")) { es_call(e, "__xs_str_at", e->lhs, expected); return true; }
+        if (!strcmp(m, "isWellFormed") && n == 0) { /* (a string of xisto is UTF-8: never a lone surrogate) */
+            memset(e, 0, sizeof *e);
+            e->kind = E_BOOL; e->pos = pos; e->field = -1; e->boolean = true; e->type = ty_boolean;
+            return true;
+        }
+        if (!strcmp(m, "toWellFormed") && n == 0) { Expr *s = e->lhs; *e = *s; return true; }
+        return false;
+    }
+    if (t->kind == TY_SET) {
+        static const char *const ops[] = {"union", "intersection", "difference", "symmetricDifference", "isSubsetOf", "isSupersetOf", "isDisjointFrom"};
+        if (!es_name(m, ops, 7) || !es_ready("__xs_set_union")) return false;
+        if (n != 1) xs_error(XS8038, pos, NULL, "Set.%s takes 1 argument(s), got %d", m, n);
+        check_expr(e->args.items[0], t);
+        Type *at = e->args.items[0]->type;
+        if (!at || at->kind != TY_SET || !ty_equal(at, t))
+            xs_error(XS8018, e->args.items[0]->pos, "xisto's Set methods take a Set of the same type (not a set-like object)", "argument of Set.%s must be %s, but this is %s", m, ty_name(t), ty_name(at));
+        e->args.items[0]->prechecked = true;
+        es_call(e, xs_sprintf("__xs_set_%s", m), e->lhs, expected);
+        return true;
+    }
+    if (t->kind == TY_STREAM) {
+        if (!es_ready("__xs_it_drop")) return false;
+        static const char *const cbs[] = {"some", "every", "find", "flatMap"};
+        if (!strcmp(m, "drop") && n == 1) { es_call(e, "__xs_it_drop", e->lhs, expected); return true; }
+        if (es_name(m, cbs, 4) && n == 1) { es_call(e, xs_sprintf("__xs_it_%s", m), e->lhs, expected); return true; }
+        if (!strcmp(m, "reduce") && n == 1) { es_call(e, "__xs_it_reduce1", e->lhs, expected); return true; }
+        if (!strcmp(m, "reduce") && n == 2 && e->args.items[0]->kind == E_ARROW && e->args.items[0]->arrow->fn->nparams == 3) {
+            es_call(e, "__xs_it_reduce", e->lhs, expected);
+            return true;
+        }
+        if ((!strcmp(m, "map") || !strcmp(m, "filter") || !strcmp(m, "forEach")) && n == 1 && e->args.items[0]->kind == E_ARROW &&
+            e->args.items[0]->arrow->fn->nparams == 2) { /* (x, i) => ...: the counter too */
+            es_call(e, xs_sprintf("__xs_it_%s", m), e->lhs, expected);
+            return true;
+        }
+        if (!strcmp(m, "take") && n == 1 && !(e->args.items[0]->kind == E_NUMBER && e->args.items[0]->num >= 0)) {
+            es_call(e, "__xs_it_take", e->lhs, expected); /* (a count that may be negative: the RangeError) */
+            return true;
+        }
+        return false;
+    }
+    if (t->kind == TY_OBJECT && t->cls->builtin && !strcmp(m, "at") && n == 1 && es_ready("__xs_ta_at")) {
+        /* a typed array's at(i): __xs_ta_at(a.length, i, (k) => a[k]), on the array held in a parameter when it is not a
+           plain path ((a) => a.at(i))(new Uint8Array(...)) */
+        const char *cn = t->cls->name;
+        if (strcmp(cn, "Uint8Array") && strcmp(cn, "Buffer") && strcmp(cn, "Float64Array") && strcmp(cn, "Float32Array") && strcmp(cn, "Int32Array"))
+            return false;
+        Expr *a = e->lhs;
+        if (!pure_read(a) || !pure_copy(a)) {
+            static int nta;
+            const char *pn = xs_sprintf("__ta%d", nta++);
+            Expr *inner = xs_alloc(sizeof *inner);
+            inner->kind = E_MEMBER; inner->pos = pos; inner->field = -1; inner->lhs = mk_ident(pos, pn); inner->str = "at"; inner->is_call = true;
+            expr_list_push(&inner->args, e->args.items[0]);
+            Expr *ar = thunk_of(inner);
+            Func *af = ar->arrow->fn;
+            af->params = xs_alloc(sizeof(Param));
+            memset(af->params, 0, sizeof(Param));
+            af->params[0].name = (char *)pn;
+            af->params[0].type = t;
+            af->nparams = 1;
+            a->prechecked = true;
+            memset(e, 0, sizeof *e);
+            e->kind = E_CALL; e->pos = pos; e->field = -1; e->lhs = ar;
+            expr_list_push(&e->args, a);
+            check_expr(e, expected);
+            return true;
+        }
+        Expr *len = xs_alloc(sizeof *len);
+        len->kind = E_MEMBER; len->pos = pos; len->field = -1; len->lhs = pure_copy(a); len->str = "length";
+        Expr *ix = xs_alloc(sizeof *ix);
+        ix->kind = E_INDEX; ix->pos = pos; ix->field = -1; ix->lhs = pure_copy(a); ix->rhs = mk_ident(pos, "__tak");
+        Expr *get = thunk_of(ix);
+        Func *gf = get->arrow->fn;
+        gf->params = xs_alloc(sizeof(Param));
+        memset(gf->params, 0, sizeof(Param));
+        gf->params[0].name = "__tak";
+        gf->params[0].type = ty_int;
+        gf->nparams = 1;
+        Expr *i = e->args.items[0];
+        memset(e, 0, sizeof *e);
+        e->kind = E_CALL; e->pos = pos; e->field = -1; e->lhs = mk_ident(pos, "__xs_ta_at");
+        expr_list_push(&e->args, len);
+        expr_list_push(&e->args, i);
+        expr_list_push(&e->args, get);
+        check_expr(e, expected);
+        return true;
+    }
+    if (is_big(t) && !strcmp(m, "toString") && n == 1 && es_ready("__xs_big_radix")) {
+        es_call(e, "__xs_big_radix", e->lhs, expected);
+        return true;
+    }
+    return false;
+}
+/* Object.groupBy, Object.hasOwn, Object.is, Map.groupBy, Array.of, BigInt.asUintN... (ns: the global's name) */
+static bool check_es_static(Expr *e, const char *ns, Type *expected) {
+    if (!e->str) return false;
+    const char *m = e->str;
+    int n = e->args.len;
+    Pos pos = e->pos;
+    if (!e->is_call) return false;
+    if (!strcmp(ns, "Array") && !strcmp(m, "of")) { /* Array.of(a, b): [a, b] */
+        e->kind = E_ARRAY_LIT; e->lhs = NULL; e->str = NULL; e->is_call = false; e->field = -1;
+        check_expr(e, expected);
+        return true;
+    }
+    if (!strcmp(ns, "BigInt") && (!strcmp(m, "asUintN") || !strcmp(m, "asIntN")) && es_ready("__xs_asUintN")) {
+        if (n != 2) xs_error(XS8026, pos, NULL, "BigInt.%s takes 2 argument(s), got %d", m, n);
+        es_call(e, m[2] == 'U' ? "__xs_asUintN" : "__xs_asIntN", NULL, expected);
+        return true;
+    }
+    if ((!strcmp(ns, "Object") || !strcmp(ns, "Map")) && !strcmp(m, "groupBy") && es_ready("__xs_groupBy")) {
+        if (n != 2) xs_error(XS8026, pos, NULL, "%s.groupBy takes 2 argument(s), got %d", ns, n);
+        Expr *items = e->args.items[0];
+        check_expr(items, NULL);
+        Type *it = items->type;
+        if (it->kind == TY_SET || it->kind == TY_STREAM) { /* (a Set's values, a generator's elements: an array of them) */
+            Expr *g = xs_alloc(sizeof *g);
+            g->kind = E_CALL; g->pos = items->pos; g->field = -1;
+            g->lhs = mk_ident(items->pos, it->kind == TY_SET ? "__xs_set_values" : "__xs_it_toArray");
+            items->prechecked = true;
+            expr_list_push(&g->args, items);
+            check_expr(g, NULL);
+            e->args.items[0] = items = g;
+            it = items->type;
+        }
+        if (it->kind != TY_ARRAY) xs_error(XS8018, items->pos, "groupBy takes an array, a Set or a generator", "cannot group the elements of %s", ty_name(it));
+        items->prechecked = true;
+        if (ns[0] == 'M') { es_call(e, "__xs_mapGroupBy", NULL, expected); return true; }
+        es_call(e, "__xs_groupBy", NULL, NULL);
+        wrap_call(e, "xs_map_nullproto", e->type); /* (printed as Node prints it: [Object: null prototype] { ... }) */
+        return true;
+    }
+    if (strcmp(ns, "Object") != 0) return false;
+    if (!strcmp(m, "hasOwn") && n == 2) { /* Object.hasOwn(o, k): k in o */
+        Expr *o = e->args.items[0], *k = e->args.items[1];
+        memset(e, 0, sizeof *e);
+        e->kind = E_BINARY; e->op = TK_IN; e->pos = pos; e->field = -1; e->lhs = k; e->rhs = o;
+        check_expr(e, expected);
+        return true;
+    }
+    if (!strcmp(m, "getOwnPropertyNames") && n == 1) { e->str = "keys"; check_expr(e, expected); return true; }
+    if ((!strcmp(m, "freeze") || !strcmp(m, "seal") || !strcmp(m, "preventExtensions")) && n == 1) {
+        /* the object itself: xisto keeps no flag on objects, and a write to one is not refused (see divergences) */
+        Expr *o = e->args.items[0];
+        *e = *o;
+        check_expr(e, expected);
+        return true;
+    }
+    if (!strcmp(m, "isFrozen") || !strcmp(m, "isSealed") || !strcmp(m, "isExtensible"))
+        xs_error(XS8015, pos, "Object.freeze, seal and preventExtensions return the object unchanged in xisto: nothing records that it was frozen",
+                 "Object.%s is not supported", m);
+    if (!strcmp(m, "is") && n == 2) {
+        Expr *a = e->args.items[0], *b = e->args.items[1];
+        check_expr(a, NULL);
+        check_expr(b, a->type->kind == TY_LITINT ? ty_number : a->type);
+        if (a->type->kind == TY_LITINT) coerce_lit(a, ty_number);
+        if (b->type->kind == TY_LITINT) coerce_lit(b, ty_number);
+        a->prechecked = b->prechecked = true;
+        if (is_numeric(a->type) && is_numeric(b->type) && es_ready("__xs_is_num")) { es_call(e, "__xs_is_num", NULL, expected); return true; }
+        memset(e, 0, sizeof *e); /* (anything else: ===, which is the same test there) */
+        e->kind = E_BINARY; e->op = TK_EQ; e->pos = pos; e->field = -1; e->lhs = a; e->rhs = b;
+        check_expr(e, expected);
+        return true;
+    }
+    if (!strcmp(m, "assign") && n > 2 && fresh_path(e->args.items[0])) {
+        /* Object.assign(t, a, b): Object.assign(t, a), Object.assign(t, b), then t */
+        Expr *tg = e->args.items[0];
+        Expr *seq = xs_alloc(sizeof *seq);
+        seq->kind = E_SEQ; seq->pos = pos; seq->field = -1;
+        for (int i = 1; i < n; i++) {
+            Expr *one = xs_alloc(sizeof *one);
+            one->kind = E_MEMBER; one->pos = pos; one->field = -1; one->lhs = mk_ident(pos, "Object"); one->str = "assign"; one->is_call = true;
+            expr_list_push(&one->args, fresh_path(tg));
+            expr_list_push(&one->args, e->args.items[i]);
+            check_expr(one, NULL);
+            expr_list_push(&seq->args, one);
+        }
+        Expr *back = fresh_path(tg);
+        check_expr(back, NULL);
+        expr_list_push(&seq->args, back);
+        seq->type = back->type;
+        *e = *seq;
+        return true;
+    }
+    if (!strcmp(m, "assign") && n == 2 && es_ready("__xs_assign_rec")) { /* Object.assign(rec, other): each entry of other set in rec */
+        Expr *tg = e->args.items[0], *src = e->args.items[1];
+        if (!tg->type) check_expr(tg, NULL);
+        if (!src->type) check_expr(src, tg->type);
+        if (tg->type->kind == TY_MAP && tg->type->record && src->type->kind == TY_MAP && src->type->record) {
+            tg->prechecked = src->prechecked = true;
+            es_call(e, "__xs_assign_rec", NULL, expected);
+            return true;
+        }
+        return false;
+    }
+    if ((!strcmp(m, "defineProperty") && n == 3) || (!strcmp(m, "defineProperties") && n == 2)) {
+        /* Object.defineProperty(o, "k", { value: v }): o.k = v (o["k"] = v on a Record), then o. Only a value is defined:
+           writable and configurable change nothing in xisto; a getter, a setter or enumerable: false is refused */
+        Expr *tg = e->args.items[0];
+        if (!fresh_path(tg)) return false;
+        Expr *seq = xs_alloc(sizeof *seq);
+        seq->kind = E_SEQ; seq->pos = pos; seq->field = -1;
+        Expr *props = !strcmp(m, "defineProperty") ? NULL : e->args.items[1];
+        if (props && (props->kind != E_OBJLIT || objlit_has_spread(props)))
+            xs_error(XS8015, props->pos, "write the descriptors in place: Object.defineProperties(o, { a: { value: 1 } })", "Object.defineProperties of a value is not supported");
+        int count = props ? props->args.len : 1;
+        for (int i = 0; i < count; i++) {
+            Expr *key = props ? NULL : e->args.items[1];
+            const char *kname = props ? props->keys[i] : NULL;
+            Expr *d = props ? props->args.items[i] : e->args.items[2];
+            if (props && !strcmp(kname, "[]")) xs_error(XS8015, d->pos, NULL, "a computed key in Object.defineProperties is not supported");
+            if (!props && key->kind == E_STRING) kname = key->str;
+            if (d->kind != E_OBJLIT || objlit_has_spread(d))
+                xs_error(XS8015, d->pos, "write the descriptor in place: { value: v }", "Object.defineProperty with a descriptor held in a value is not supported");
+            Expr *val = NULL;
+            for (int k = 0; k < d->args.len; k++) {
+                const char *dk = d->keys[k];
+                Expr *dv = d->args.items[k];
+                if (!strcmp(dk, "value")) val = dv;
+                else if (!strcmp(dk, "writable") || !strcmp(dk, "configurable")) continue;
+                else if (!strcmp(dk, "enumerable") && dv->kind == E_BOOL && dv->boolean) continue;
+                else xs_error(XS8015, dv->pos, "xisto defines a property with its value only ({ value: v }): a field, or a Record's entry",
+                              "'%s' in a property descriptor is not supported", dk);
+            }
+            if (!val) xs_error(XS8015, d->pos, "give it its value: { value: v }", "a property descriptor without a value is not supported");
+            Expr *lv = xs_alloc(sizeof *lv);
+            lv->pos = val->pos; lv->field = -1; lv->lhs = fresh_path(tg);
+            if (kname) { lv->kind = E_MEMBER; lv->str = (char *)kname; }
+            else { lv->kind = E_INDEX; lv->rhs = key; }
+            Expr *as = xs_alloc(sizeof *as);
+            as->kind = E_ASSIGN; as->op = TK_ASSIGN; as->pos = val->pos; as->field = -1; as->lhs = lv; as->rhs = val;
+            check_expr(as, NULL);
+            expr_list_push(&seq->args, as);
+        }
+        Expr *back = fresh_path(tg);
+        check_expr(back, NULL);
+        expr_list_push(&seq->args, back);
+        seq->type = back->type;
+        *e = *seq;
+        return true;
+    }
+    return false;
+}
+/* Promise.withResolvers<T>(), Promise.any(ps) (check_promise) */
+static bool check_es_promise(Expr *e, Type *expected) {
+    const char *m = e->str;
+    Pos pos = e->pos;
+    if (!strcmp(m, "withResolvers") && es_ready("__xs_withResolvers")) {
+        if (e->args.len != 0) xs_error(XS8026, pos, NULL, "Promise.withResolvers takes 0 argument(s), got %d", e->args.len);
+        if (e->ntargs != 1) xs_error(XS3003, pos, "write the type: Promise.withResolvers<T>()", "Promise.withResolvers needs to know the type of its value");
+        es_call(e, "__xs_withResolvers", NULL, expected);
+        return true;
+    }
+    if (!strcmp(m, "any") && e->args.len == 1 && es_ready("__xs_any")) {
+        /* Promise.any(ps): the first value of a promise that fulfils; when all reject, an AggregateError of their errors */
+        Expr *a = e->args.items[0];
+        Type *T = NULL;
+        if (a->kind == E_ARRAY_LIT && !a->spread && a->args.len > 0) { /* (the value of an element: a copy of it checked) */
+            Expr *probe = branch_copy(a->args.items[0]);
+            if (!probe) xs_error(XS3003, a->pos, "keep the promises in a typed array first: const ps: Promise<T>[] = [...]", "Promise.any cannot learn the type of these promises");
+            check_expr(probe, NULL);
+            T = probe->type->kind == TY_PROMISE ? probe->type->elem : probe->type;
+            if (T->kind == TY_LITINT) T = ty_number;
+            check_expr(a, ty_array_of(ty_promise_of(T)));
+        } else check_expr(a, NULL);
+        Type *at = ty_strip_null(a->type);
+        if (at->kind != TY_ARRAY || at->elem->kind != TY_PROMISE)
+            xs_error(XS8018, a->pos, NULL, "Promise.any takes an array of promises, but this is %s", ty_name(a->type));
+        a->prechecked = true;
+        e->targs = xs_alloc(sizeof(Type *));
+        e->targs[0] = at->elem->elem;
+        e->ntargs = at->elem->elem->kind == TY_VOID ? 0 : 1;
+        es_call(e, at->elem->elem->kind == TY_VOID ? "__xs_anyVoid" : "__xs_any", NULL, expected);
+        prog->uses_gen = true;
+        return true;
+    }
+    return false;
+}
 static void check_expr_in(Expr *e, Type *expected) {
     if (e->prechecked) return;
     if (e->kind == E_CALL && !e->lhs && e->builtin.cfn && e->type) return; /* a runtime call the checker made (wrap_call): checked */
@@ -9508,7 +9887,8 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->rhs->cls = c;
             e->rhs->type = ty_object_of(c);
             e->type = ty_boolean;
-            if (c && c->mod && c->mod->file && !strcmp(c->mod->file, "xisto:errors") && pure_read(e->lhs)) {
+            if (c && c->mod && c->mod->file && !strcmp(c->mod->file, "xisto:errors") && strcmp(c->name, "AggregateError") && pure_read(e->lhs)) {
+                /* (not AggregateError: the runtime raises none, and the test narrows as any other class's) */
                 /* x instanceof SyntaxError (TypeError, ...): also an Error the runtime raised with that name
                    (JSON.parse, decodeURIComponent, a null read), which is not an object of the class */
                 Expr *test = expr_copy(e);
@@ -10415,6 +10795,15 @@ static void check_expr_in(Expr *e, Type *expected) {
                 prog->uses_net = true;
                 return;
             }
+            if (strcmp(name, "__xs_throw") == 0 && e->args.len == 1 && cur_mod && cur_mod->file && !strcmp(cur_mod->file, "xisto:builtins")) {
+                /* (xisto:builtins: __xs_throw("RangeError: ...") raises the error the runtime would, of that name: the
+                   module needs no class of xisto:errors) */
+                check_expr(e->args.items[0], ty_string);
+                expect_type(e->args.items[0], ty_string, "internal: the message of __xs_throw");
+                e->type = ty_void;
+                e->builtin.cfn = "xs_throw_str";
+                return;
+            }
             if (strcmp(name, "__xs_promises_handled") == 0 && e->args.len == 1 && cur_mod && cur_mod->file && !strcmp(cur_mod->file, "xisto:settled")) {
                 /* (xisto:settled: every promise of Promise.allSettled(ps) handled before its outcomes are read, XB-204) */
                 check_expr(e->args.items[0], NULL);
@@ -10504,6 +10893,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (a->type->kind == TY_INT) e->builtin.cfn = "xs_big_from_int";
                 else if (a->type->kind == TY_NUMBER) e->builtin.cfn = "xs_big_from_num";
                 else if (a->type->kind == TY_STRING) e->builtin.cfn = "xs_big_from_str";
+                else if (a->type->kind == TY_BOOLEAN) e->builtin.cfn = "xs_big_from_int"; /* (BigInt(true): 1n) */
                 else if (is_big(a->type)) { *e = *a; return; }
                 else if (a->type->kind == TY_UNION && pure_read(a) && pr_copy(a)) {
                     /* BigInt(v) with v: number | bigint: typeof v === 'bigint' ? v : BigInt(v) (each member converted as itself) */
@@ -11647,6 +12037,29 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
             Type *st = ty_strip_null(ot);
+            if (st->kind == TY_OBJECT && !st->cls->builtin && ot->kind != TY_NULLABLE && !st->cls->is_tuple && !pure_read(o)) {
+                /* Object.entries(new P()), Object.keys({ a: 1 }): of the object held in a parameter,
+                   ((o: P) => Object.entries(o))(new P()), read as below */
+                static int noe;
+                const char *pn = xs_sprintf("__oe%d", noe++);
+                Pos at = e->pos;
+                Expr *inner = xs_alloc(sizeof *inner);
+                inner->kind = E_MEMBER; inner->pos = at; inner->field = -1; inner->lhs = mk_ident(at, "Object"); inner->str = e->str; inner->is_call = true;
+                expr_list_push(&inner->args, mk_ident(at, pn));
+                Expr *ar = thunk_of(inner);
+                Func *af = ar->arrow->fn;
+                af->params = xs_alloc(sizeof(Param));
+                memset(af->params, 0, sizeof(Param));
+                af->params[0].name = (char *)pn;
+                af->params[0].type = ot;
+                af->nparams = 1;
+                o->prechecked = true;
+                memset(e, 0, sizeof *e);
+                e->kind = E_CALL; e->pos = at; e->field = -1; e->lhs = ar;
+                expr_list_push(&e->args, o);
+                check_expr(e, expected);
+                return;
+            }
             if (st->kind == TY_OBJECT && !st->cls->builtin && ot->kind != TY_NULLABLE && !st->cls->is_tuple && pure_read(o)) {
                 /* Object.keys/values/entries of an object with optional fields (or its values): of a Record of the fields
                    it has (an optional one left out is not there), read through its class's field table */
@@ -11781,6 +12194,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 check_expr(e, expected);
                 return;
             }
+            if (check_es_static(e, ns, expected)) return; /* (Object.groupBy, Array.of, BigInt.asUintN...: xisto:builtins) */
             if (strcmp(ns, "Math") == 0) {
                 check_math(e);
                 return;
@@ -11974,8 +12388,9 @@ static void check_expr_in(Expr *e, Type *expected) {
                     return;
                 }
                 /* a copy of an array; a Set's values or a Map's entries (already arrays of their own) */
-                const char *m = st->kind == TY_ARRAY ? "slice" : st->kind == TY_SET ? "values" : st->kind == TY_MAP ? "entries" : st->kind == TY_STRING ? "split" : NULL;
-                if (!m) xs_error(XS8093, src->pos, "Array.from takes an array, a Set, a Map or a string", "cannot make an array from %s", ty_name(st));
+                const char *m = st->kind == TY_ARRAY ? "slice" : st->kind == TY_SET ? "values" : st->kind == TY_MAP ? "entries" : st->kind == TY_STRING ? "split" :
+                                st->kind == TY_STREAM ? "toArray" : NULL; /* (a generator: its elements, pulled to the end) */
+                if (!m) xs_error(XS8093, src->pos, "Array.from takes an array, a Set, a Map, a string or a generator", "cannot make an array from %s", ty_name(st));
                 e->lhs = src;
                 e->str = (char *)m;
                 e->args.len = 0;
@@ -12265,6 +12680,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             expr_list_push(&e->args, str_lit(e->pos, e->str));
             e->str = "get";
         }
+        if (check_es_member(e, expected)) return; /* (xs.at(i), s.union(t), gen.drop(n)...: xisto:builtins) */
         if (e->lhs->type->kind == TY_MAP || e->lhs->type->kind == TY_SET) {
             check_map_member(e);
             return;
@@ -12483,6 +12899,33 @@ static void check_expr_in(Expr *e, Type *expected) {
                 /* xs.reduce(f, a) / xs.flatMap(f) / xs.flat(): the loop of xisto:arrays, __xs_reduce(xs, f, a) */
                 const char *m = e->str;
                 const char *fn = !strcmp(m, "flat") ? "__xs_flat" : !strcmp(m, "flatMap") ? "__xs_flatMap" : e->args.len >= 2 ? "__xs_reduce" : "__xs_reduce1";
+                if (!strcmp(m, "flat") && e->args.len == 1 && lookup_func("__xs_flat")) {
+                    /* xs.flat(depth), the depth written as a number (or Infinity): __xs_flat once per level, as deep as the
+                       type goes; flat(0), a copy */
+                    Expr *d = e->args.items[0];
+                    double dv = d->kind == E_NUMBER ? d->num : d->kind == E_IDENT && d->str && !strcmp(d->str, "Infinity") && !lookup("Infinity") ? INFINITY : -1;
+                    if (dv < 0) xs_error(XS7001, d->pos, "write the depth in place: xs.flat(2), xs.flat(Infinity)", "the depth of flat must be a number written in place");
+                    Expr *x = e->lhs;
+                    x->prechecked = true;
+                    int k = 0;
+                    for (; k < dv && x->type->kind == TY_ARRAY && x->type->elem->kind == TY_ARRAY; k++) {
+                        Expr *c = xs_alloc(sizeof *c);
+                        c->kind = E_CALL; c->pos = e->pos; c->field = -1; c->lhs = mk_ident(e->pos, "__xs_flat");
+                        expr_list_push(&c->args, x);
+                        check_expr(c, NULL);
+                        c->prechecked = true;
+                        x = c;
+                    }
+                    if (k == 0) {
+                        Expr *c = xs_alloc(sizeof *c);
+                        c->kind = E_MEMBER; c->pos = e->pos; c->field = -1; c->lhs = x; c->str = "slice"; c->is_call = true;
+                        check_expr(c, NULL);
+                        x = c;
+                    }
+                    *e = *x;
+                    e->prechecked = false;
+                    return;
+                }
                 if (!strcmp(m, "flat") && e->args.len > 0) xs_error(XS7001, e->pos, "flat() flattens one level", "flat takes no argument in xisto");
                 Expr *callee = xs_alloc(sizeof *callee);
                 callee->kind = E_IDENT; callee->pos = e->pos; callee->str = (char *)fn; callee->field = -1;
