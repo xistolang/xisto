@@ -1103,7 +1103,6 @@ static void xs_promise_free(void *p) {
     if (q->state == 2 && q->err) xs_release_(q->err);
     xs_obj_free(p);
 }
-static void xs_print_any_quoted(void *p);
 static void xs_promise_print(void *p) {
     xs_promise *q = p;
     fputs("Promise { ", XS_OUT);
@@ -3589,6 +3588,7 @@ static xs_MessagePort *xs_wt_port(void) { /* parentPort: on the main thread, a p
     m->out = xs_wt_out;
     return m;
 }
+#endif /* XS_THREADS (worker threads; what follows is for every program with an event loop) */
 /* node:os: the machine's name, the system and the user's folders, as Node gives them */
 XS_NOINLINE xs_str *xs_os_host_name(void) {
     char b[256];
@@ -3831,6 +3831,7 @@ XS_NOINLINE void xs_process_signal_unwatch(int64_t sig) {
     sigaction((int)sig, &sa, NULL);
 }
 
+#ifdef XS_THREADS
 /* the listener's coroutine: each message, in order, to the closure; ends when the sender is done */
 typedef struct { xs_wq *q; xs_closure **cb; uint8_t *kind; xs_hdr *owner; } xs_wlisten; /* kind: what the listener takes (XS_WM_...) */
 XS_NOINLINE void xs_wt_listen(void *p) {
@@ -3897,6 +3898,7 @@ XS_NOINLINE void xs_wt_listen_start(xs_wq *q, xs_closure **cb, uint8_t *kind, xs
     xs_exit_hook = xs_tasks_drain;
     xs_ready_push(co); /* it starts when the loop runs: after the code that set the listener up */
 }
+#endif
 /* ---- setTimeout / setInterval (Node's globals): each timer is a coroutine on the event loop. It starts when the
    loop runs (a server's, or the one the program's exit waits on), sleeps, then calls its callback; an interval goes
    on until clearInterval. Like Node, a pending timer keeps the program alive. */
@@ -4029,6 +4031,7 @@ XS_NOINLINE void xs_clear_timer(double idn) { /* the timer's coroutine ends when
         }
 }
 XS_NOINLINE void xs_timer_close(int64_t id) { xs_clear_timer((double)id); } /* timer.close() */
+#ifdef XS_THREADS /* worker threads, continued */
 XS_NOINLINE void xs_wt_check_event(xs_str *ev, const char *who) {
     if (ev->len != 7 || memcmp(ev->data, "message", 7) != 0)
         xs_panicf("%s.on: only \"message\" is supported (messages are text)", who);
