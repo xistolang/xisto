@@ -63,6 +63,9 @@ static void import_process(Program *prog, Module *m);
 static void import_stdio(Program *prog, Module *m);
 static void import_builtin_class(Program *prog, Module *m, const char *path, const char *name);
 static bool declares_top_from(const char *src, const char *q, const char *name);
+static bool is_assert_path(const char *path);
+static struct Expr *ns_member(Parser *p, struct Expr *e, Token name);
+static void assert_src_arg(Parser *p, struct Expr *call, const char *start);
 static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... was named: xisto:url is loaded */
 static bool wants_errors; /* TypeError, RangeError, SyntaxError or ReferenceError was named: xisto:errors is loaded */
 static bool is_js_error_name(const char *n) {
@@ -1629,6 +1632,29 @@ static Expr *parse_primary(Parser *p) {
                 }
             }
         }
+        if (peek_is(p, TK_LPAREN)) { /* assert(x) with assert the namespace of node:assert: assert.ok(x); ok(x) of node:assert */
+            const char *start = p->tok.start;
+            Import *ai = ns_import_of(p, p->tok.str);
+            bool named_ok = false;
+            if (!ai && !strcmp(p->tok.str, "ok") && p->mod)
+                for (int i = 0; i < p->mod->nimports; i++)
+                    for (int k = 0; k < p->mod->imports[i].n; k++)
+                        if (!strcmp(p->mod->imports[i].names[k], "ok") && is_assert_path(p->mod->imports[i].path)) named_ok = true;
+            if ((ai && is_assert_path(ai->path)) || named_ok) {
+                Expr *callee;
+                if (ai) {
+                    Token okn = p->tok;
+                    okn.str = "ok";
+                    callee = ns_member(p, ident_expr(pos, p->tok.str), okn);
+                } else callee = ident_expr(pos, "ok");
+                next(p);
+                Expr *c = new_expr(E_CALL, pos);
+                c->lhs = callee;
+                parse_args(p, &c->args);
+                assert_src_arg(p, c, start);
+                return c;
+            }
+        }
         Expr *e = new_expr(E_IDENT, pos);
         e->str = p->tok.str;
         next(p);
@@ -1919,7 +1945,24 @@ static int parse_type_args(Parser *p, Type ***out) {
 static int noptc;
 static Expr *ident_expr(Pos pos, const char *name);
 static Expr *ns_member(Parser *p, Expr *e, Token name);
+/* node:assert: the module (or assert/strict) by the path of an import */
+static bool is_assert_path(const char *path) {
+    if (!path) return false;
+    const char *b = !strncmp(path, "node:", 5) ? path + 5 : !strncmp(path, "xisto:", 6) ? path + 6 : path;
+    return !strcmp(b, "assert") || !strcmp(b, "assert/strict");
+}
+static Import *ns_import_of(Parser *p, const char *alias);
+/* assert.ok(value) / assert(value) with no message: the call as written (from start to the end of its ')') goes
+   after a null message, for "The expression evaluated to a falsy value:\n\n  assert(x)\n" (xisto:assert's ok) */
+static void assert_src_arg(Parser *p, Expr *call, const char *start) {
+    if (call->args.len != 1 || !start || !p->prev_end || p->prev_end <= start) return;
+    expr_list_push(&call->args, new_expr(E_NULL, call->pos));
+    Expr *s = new_expr(E_STRING, call->pos);
+    s->str = xs_strndup(start, (size_t)(p->prev_end - start));
+    expr_list_push(&call->args, s);
+}
 static Expr *parse_postfix(Parser *p) {
+    const char *pstart = p->tok.start; /* (assert.ok(x): the source of the call) */
     Expr *e = parse_primary(p);
     if (e && e->kind == E_IDENT && is_js_error_name(e->str)) wants_errors = true;
     if (e && e->kind == E_IDENT && is_url_global_name(e->str)) wants_url = true;
@@ -2011,11 +2054,13 @@ static Expr *parse_postfix(Parser *p) {
             Token name = expect_prop_name(p, NULL);
             Expr *nsx = ns_member(p, e, name);
             if (nsx) { /* ns.f(...), ns.x: the module's own name */
+                bool aok = e->kind == E_IDENT && !strcmp(name.str, "ok") && ns_import_of(p, e->str) && is_assert_path(ns_import_of(p, e->str)->path);
                 e = nsx;
                 if (at(p, TK_LPAREN)) {
                     Expr *c = new_expr(E_CALL, name.pos);
                     c->lhs = e;
                     parse_args(p, &c->args);
+                    if (aok) assert_src_arg(p, c, pstart);
                     e = c;
                 }
                 continue;
@@ -4995,6 +5040,33 @@ static void parse_import(Parser *p, Module *m) {
         ns_register(p, m, ns.str);
         goto from;
     }
+    { /* import { strict as assert } from "node:assert" (or { strict }): import * as assert from "node:assert/strict" */
+        Parser look = *p;
+        if (at(&look, TK_LBRACE)) {
+            next(&look);
+            if (at_ident(&look, "strict")) {
+                Token local = look.tok;
+                next(&look);
+                if (at_ident(&look, "as")) { next(&look); local = look.tok; next(&look); }
+                if (at(&look, TK_RBRACE) && local.kind == TK_IDENT) {
+                    next(&look);
+                    if (at_ident(&look, "from")) {
+                        next(&look);
+                        if (at(&look, TK_STRING) && is_assert_path(look.tok.str) && !strstr(look.tok.str, "/strict")) {
+                            next(&look);
+                            *p = look;
+                            ns_register(p, m, local.str);
+                            expect_semi(p);
+                            im.path = "node:assert/strict";
+                            m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+                            m->imports[m->nimports++] = im;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
     if (!at(p, TK_LBRACE))
         xs_error(XS1016, p->tok.pos, "xisto supports named imports only: import { a, b } from \"./file\";", "expected '{' after import");
     next(p);
@@ -5079,7 +5151,14 @@ from:
     m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
     m->imports[m->nimports++] = im;
     if (im.n) alias_collisions(p, m, alias_first, &m->imports[m->nimports - 1]);
-    if (has_dflt) {
+    if (has_dflt && is_assert_path(path.str)) { /* (import assert, { x } from "node:assert": assert is the module) */
+        ns_register(p, m, dflt.str);
+        Import d = {0};
+        d.pos = pos;
+        d.path = path.str;
+        m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+        m->imports[m->nimports++] = d;
+    } else if (has_dflt) {
         Import d = {0};
         d.pos = pos;
         d.is_default = true;
@@ -6874,7 +6953,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
     { /* Node's modules written in xisto over runtime functions (runtime/node/NAME.ts, NODE_TS in the Makefile) */
         extern const unsigned char xs_node_events_ts[], xs_node_process_ts[], xs_node_http_ts[], xs_node_net_ts[], xs_node_dns_ts[], xs_node_child_process_ts[], xs_node_https_ts[], xs_node_tls_ts[], xs_node_diagnostics_channel_ts[], xs_node_buffer_ts[], xs_node_util_ts[], xs_node_querystring_ts[], xs_node_string_decoder_ts[], xs_node_zlib_ts[], xs_node_stream_ts[], xs_node_stream_promises_ts[], xs_node_stream_web_ts[];
         extern const unsigned char xs_node_tty_ts[], xs_node_readline_ts[], xs_node_readline_promises_ts[];
-        extern const unsigned char xs_node_console_ts[], xs_node_perf_hooks_ts[], xs_node_assert_ts[], xs_node_assert_strict_ts[], xs_node_test_ts[];
+        extern const unsigned char xs_node_console_ts[], xs_node_perf_hooks_ts[], xs_node_assert_ts[], xs_node_assert_strict_ts[];
         static const struct { const char *name; const unsigned char *src; bool net; bool tls; } node_ts[] = {
             {"events", xs_node_events_ts, false},
             {"process", xs_node_process_ts, true}, /* (signals and the exit hook live with the event loop) */
@@ -6894,7 +6973,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
             {"stream/promises", xs_node_stream_promises_ts, true}, /* (a name with a slash: runtime/node/stream_promises.ts) */
             {"stream/web", xs_node_stream_web_ts, true},
             {"tty", xs_node_tty_ts, true}, {"readline", xs_node_readline_ts, true}, {"readline/promises", xs_node_readline_promises_ts, true},
-            {"console", xs_node_console_ts, false}, {"perf_hooks", xs_node_perf_hooks_ts, false}, {"assert", xs_node_assert_ts, false}, {"assert/strict", xs_node_assert_strict_ts, false}, {"test", xs_node_test_ts, true},
+            {"console", xs_node_console_ts, false}, {"perf_hooks", xs_node_perf_hooks_ts, false}, {"assert", xs_node_assert_ts, false}, {"assert/strict", xs_node_assert_strict_ts, false},
         };
         for (size_t i = 0; i < sizeof node_ts / sizeof node_ts[0]; i++) {
             if (strcmp(name, node_ts[i].name) != 0) continue;

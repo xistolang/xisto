@@ -1,0 +1,7 @@
+uncaught Error: Expected values to be strictly equal:
+
+2 !== 3
+
+    at fails (xisto:assert:332:9)
+    at strictEqual (xisto:assert:407:32)
+    at tests/stderr/node-assert-uncaught.ts:5:8

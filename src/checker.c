@@ -3092,6 +3092,66 @@ static Func *crypto_func_overload(Expr *e, Func *f) {
     return f;
 }
 
+/* node:assert's throws, rejects, doesNotThrow, doesNotReject: the form for the second argument (xisto:assert):
+   a class (C) is __throwsClass(fn, (e: any) => e instanceof C, "C", ...), a RegExp __throwsRe, a function
+   __throwsFn, a message __throwsMsg; anything else (an object to compare) stays throws. doesNotThrow and
+   doesNotReject: __doesNotThrowClass/Re for a class or a RegExp (another error is thrown again); a validation
+   function before the message is dropped */
+static Expr *ad_ident(Pos at, const char *n);
+static Func *assert_func_overload(Expr *e, Func *f) {
+    if (!f || !f->mod || !f->mod->file || strcmp(f->mod->file, "xisto:assert") != 0 || e->args.len < 2) return f;
+    bool th = !strcmp(f->name, "throws"), rj = !strcmp(f->name, "rejects");
+    bool dn = !strcmp(f->name, "doesNotThrow") || !strcmp(f->name, "doesNotReject");
+    if (!th && !rj && !dn) return f;
+    Expr *a = e->args.items[1];
+    bool cls = a->kind == E_IDENT && !lookup(a->str) && find_class(a->str) && !lookup_func(a->str);
+    bool msg = a->kind == E_STRING || a->kind == E_TEMPLATE;
+    if (dn && (msg || (!cls && a->kind != E_REGEX))) { /* (fn, message), or (fn, validate, message): (fn, message) */
+        if (a->kind == E_ARROW) {
+            for (int i = 1; i + 1 < e->args.len; i++) e->args.items[i] = e->args.items[i + 1];
+            e->args.len--;
+        }
+        return f;
+    }
+    const char *form = cls ? "Class" : a->kind == E_REGEX ? "Re" : a->kind == E_ARROW ? "Fn" : msg ? "Msg" : NULL;
+    if (!form) return f;
+    if (cls) { /* (e: any): boolean => e instanceof C, then the class's name */
+        static int nisa;
+        Pos at = a->pos;
+        const char *pv = xs_sprintf("__ae%d", nisa++);
+        Func *fn = xs_alloc(sizeof *fn);
+        fn->pos = at; fn->name = "arrow"; fn->ret = ty_boolean;
+        fn->params = xs_alloc(sizeof(Param));
+        memset(fn->params, 0, sizeof(Param));
+        fn->params[0].name = (char *)pv; fn->params[0].type = ty_any;
+        fn->nparams = 1;
+        Expr *isa = xs_alloc(sizeof *isa);
+        isa->kind = E_BINARY; isa->op = TK_IDENT; isa->pos = at; isa->field = -1; isa->lhs = ad_ident(at, pv); isa->rhs = ad_ident(at, a->str);
+        Stmt *body = xs_alloc(sizeof *body);
+        body->kind = S_BLOCK; body->pos = at;
+        Stmt *r = xs_alloc(sizeof *r);
+        r->kind = S_RETURN; r->pos = at; r->expr = isa;
+        stmt_list_push(&body->stmts, r);
+        fn->body = body;
+        Arrow *ar = xs_alloc(sizeof *ar); ar->pos = at; ar->fn = fn; ar->expr_body = false;
+        Expr *ae = xs_alloc(sizeof *ae); ae->kind = E_ARROW; ae->pos = at; ae->field = -1; ae->arrow = ar;
+        Expr *nm = xs_alloc(sizeof *nm);
+        nm->kind = E_STRING; nm->pos = at; nm->field = -1; nm->str = a->str;
+        ExprList args = {0};
+        expr_list_push(&args, e->args.items[0]);
+        expr_list_push(&args, ae);
+        expr_list_push(&args, nm);
+        for (int i = 2; i < e->args.len; i++) expr_list_push(&args, e->args.items[i]);
+        e->args = args;
+    }
+    const char *gname = xs_sprintf("__%s%s", th ? "throws" : rj ? "rejects" : f->name, form);
+    SYM_EACH(funcs_by_name, gname, fe) {
+        Func *g = fe->decl;
+        if (g->mod == f->mod) return g;
+    }
+    return f;
+}
+
 static bool is_builtin_name(const char *n) {
     return strcmp(n, "Math") == 0 || strcmp(n, "console") == 0 || strcmp(n, "Number") == 0 || strcmp(n, "process") == 0 || strcmp(n, "Date") == 0 || strcmp(n, "performance") == 0 || strcmp(n, "Atomics") == 0 || strcmp(n, "lines") == 0 || strcmp(n, "chunks") == 0 || strcmp(n, "assert") == 0 ||
            strcmp(n, "String") == 0 || strcmp(n, "Array") == 0 || strcmp(n, "fetch") == 0 || strcmp(n, "Promise") == 0 || find_class(n) != NULL || find_enum(n) != NULL;
@@ -10813,7 +10873,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
-        Func *f = crypto_func_overload(e, lookup_func(name));
+        Func *f = assert_func_overload(e, crypto_func_overload(e, lookup_func(name)));
         if (!f) {
             Binding *b = lookup(name);
             if (b && b->type->kind == TY_FUNC) { /* calling a function value */
