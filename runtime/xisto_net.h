@@ -338,6 +338,11 @@ static int kevent(int ep, const struct kevent *ch, int nch, struct kevent *out, 
 #if !defined(_WIN32)
 #include <poll.h>
 #include <sys/mman.h>
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#elif defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #endif
 
 /* ---- coroutines: one small stack per in-flight request; `await fetch` yields to the event loop ----
@@ -2531,13 +2536,37 @@ struct xs_client { int kind; int fd; xs_buf in, out; bool closing; bool fast_ok;
 #define XS_HAS_PENDING(c) ((c)->out.len > 0 || XS_TLS_PENDING(c))
 /* clients are freed after the current batch of events: a later event in the same batch may still name them */
 static XS_TLS xs_client *xs_clients_dead;
+static XS_TLS int64_t xs_clients_live;  /* this worker's open connections */
+static XS_TLS int64_t xs_clients_freed; /* connections freed since memory was last given back */
+static XS_TLS uint64_t xs_trim_ns;
 static void xs_client_free_later(xs_client *c) { c->next_dead = xs_clients_dead; xs_clients_dead = c; }
+/* Gives the allocator's free pages back to the system once a burst of connections is gone. Each connection's
+   buffers are freed when it closes, but the system allocator keeps the emptied pages (macOS's magazines,
+   glibc's arenas): after 1,000 connections the Todo API held 21-28 MB with 0.6 MB in use. Only when this worker
+   has no connection left, at least 256 were freed since the last time, and at most once a second, so a server
+   under steady load never pays for it. */
+static void xs_clients_trim(void) {
+    if (xs_clients_live != 0 || xs_clients_freed < 256) return;
+    uint64_t now = xs_now();
+    if (now - xs_trim_ns < 1000000000ull) return;
+    xs_trim_ns = now;
+    xs_clients_freed = 0;
+#if defined(__APPLE__)
+    malloc_zone_pressure_relief(NULL, 0);
+#elif defined(__GLIBC__)
+    malloc_trim(0);
+#endif
+}
 static void xs_clients_flush_dead(void) {
+    if (!xs_clients_dead) return;
     while (xs_clients_dead) {
         xs_client *c = xs_clients_dead;
         xs_clients_dead = c->next_dead;
         free(c->in.data); free(c->out.data); XS_TLS_FREE(c->tls); free(c);
+        xs_clients_live--;
+        xs_clients_freed++;
     }
+    xs_clients_trim();
 }
 typedef struct { xs_Server *s; xs_client *c; xs_HttpRequest *req; xs_route *route; bool keep_alive; } xs_request_job;
 
@@ -3227,6 +3256,7 @@ XS_NOINLINE void *xs_server_worker(void *arg) {
                     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
                     xs_client *c = calloc(1, sizeof *c);
                     c->fd = fd;
+                    xs_clients_live++;
 #ifdef XS_WITH_TLS
                     if (s->cred) c->tls = xs_tls_server_new(s->cred);
 #endif
