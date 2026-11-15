@@ -4407,20 +4407,26 @@ XS_NOINLINE xs_jv *xs_json_value(xs_jp *j) {
     } else if (c == '"') {
         v = xs_jv_new(XJ_STR);
         v->str = xs_json_string(j, &v->slen);
-    } else if (c == 't') {
-        xs_json_word(j, "true", 4);
+    } else if (c == 't') { /* (the whole word compared in place; xs_json_word only finds the character to report) */
+        if (j->end - j->p >= 4 && memcmp(j->p, "true", 4) == 0) j->p += 4; else xs_json_word(j, "true", 4);
         v = xs_jv_new(XJ_BOOL); v->b = true;
     } else if (c == 'f') {
-        xs_json_word(j, "false", 5);
+        if (j->end - j->p >= 5 && memcmp(j->p, "false", 5) == 0) j->p += 5; else xs_json_word(j, "false", 5);
         v = xs_jv_new(XJ_BOOL);
     } else if (c == 'n') {
-        xs_json_word(j, "null", 4);
+        if (j->end - j->p >= 4 && memcmp(j->p, "null", 4) == 0) j->p += 4; else xs_json_word(j, "null", 4);
         v = xs_jv_new(XJ_NULL);
     } else if (c == '-' || (c >= '0' && c <= '9')) { /* JSON's number grammar first, then strtod on what it took */
         const char *s = j->p;
         if (c == '-') { j->p++; if (!xs_json_digit(j)) xs_json_fail(j, XJE_MINUS); }
+        /* the integer part's value as it is scanned: up to 15 digits it is exact in a double, and a number with
+           no fraction or exponent needs no strtod */
+        int64_t iv = 0;
+        int nd = 0;
         if (*j->p == '0') { j->p++; if (xs_json_digit(j)) xs_json_fail(j, XJE_NUMBER); }
-        else while (xs_json_digit(j)) j->p++;
+        else while (xs_json_digit(j)) { if (nd < 16) iv = iv * 10 + (*j->p - '0'); nd++; j->p++; }
+        bool plain = nd <= 15;
+        if (j->p < j->end && (*j->p == '.' || *j->p == 'e' || *j->p == 'E')) plain = false;
         if (j->p < j->end && *j->p == '.') { j->p++; if (!xs_json_digit(j)) xs_json_fail(j, XJE_FRAC); while (xs_json_digit(j)) j->p++; }
         if (j->p < j->end && (*j->p == 'e' || *j->p == 'E')) {
             j->p++;
@@ -4429,9 +4435,13 @@ XS_NOINLINE xs_jv *xs_json_value(xs_jp *j) {
             while (xs_json_digit(j)) j->p++;
         }
         v = xs_jv_new(XJ_NUM);
-        char *stop;
-        v->num = strtod(s, &stop);
-        if (stop != j->p) v->num = c == '-' ? -0.0 : 0.0; /* ("0x1": strtod reads hex past the 0; the x is an error after it) */
+        if (plain) {
+            v->num = c == '-' ? -(double)iv : (double)iv; /* ("-0" stays -0) */
+        } else {
+            char *stop;
+            v->num = strtod(s, &stop);
+            if (stop != j->p) v->num = c == '-' ? -0.0 : 0.0; /* ("0x1": strtod reads hex past the 0; the x is an error after it) */
+        }
     } else {
         xs_json_fail(j, XJE_TOKEN);
         return NULL;
