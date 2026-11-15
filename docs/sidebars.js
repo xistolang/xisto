@@ -63,7 +63,12 @@ const sidebars = {
             'benchmarks/techempower/vs-node',
           ],
         },
-        'benchmarks/nest',
+        {
+          type: 'category',
+          label: 'NestJS',
+          link: {type: 'doc', id: 'benchmarks/nest/index'},
+          items: ['benchmarks/nest/vs-node', 'benchmarks/nest/vs-bun'],
+        },
         'benchmarks/http',
         'benchmarks/energy-sqlite-streams',
       ],

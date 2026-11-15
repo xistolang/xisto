@@ -16,7 +16,7 @@ Xisto's native `Server` against it, at a glance:
 The same round as the [TechEmpower page](./index.md), which has the full setup: the servers on the Xeon E5-2686 v4
 (2 vCPUs), wrk 4.2.0 on the Graviton2 over the private network, the TFB's levels and rules, 15 s per level, the
 median of 3 runs. The reference here is actix-web (Rust 1.99, built with `RUSTFLAGS=-C target-cpu=native` as the TFB's Dockerfile), the `tfb-web` binary of the TFB's `frameworks/Rust/actix`, unmodified except for the port. On the Xisto side, the native
-`Server` with 2 workers. NestJS, on Xisto, Node and Bun, has [its own page](../nest.md).
+`Server` with 2 workers. NestJS, on Xisto, Node and Bun, has [its own page](../nest/index.md).
 
 ## json
 

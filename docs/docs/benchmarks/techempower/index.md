@@ -15,7 +15,7 @@ Head to head, with every level, latency, CPU and memory: [vs Rust](./vs-rust.md)
 [vs Go](./vs-go.md) (net/http), [vs Bun](./vs-bun.md) and [vs Node](./vs-node.md) (http and fastify).
 
 Each runtime is here once, with its plain HTTP server. **Running NestJS?** The same Nest app on Xisto, Node and Bun is
-on [NestJS](../nest.md).
+on [NestJS](../nest/index.md).
 
 ## Setup
 

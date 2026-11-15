@@ -16,7 +16,7 @@ const results = [
     value: '20 ms',
     label: 'NestJS startup',
     text: 'A real NestJS app (Conduit) starts in 20 ms, against 267 ms on Node.',
-    to: '/docs/benchmarks/nest#conduit-a-real-nestjs-app',
+    to: '/docs/benchmarks/nest/vs-node#conduit-a-real-nestjs-app',
   },
   {
     value: '10 / 10',

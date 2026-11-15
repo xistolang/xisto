@@ -118,10 +118,10 @@ export function CostBars({test, only, metric}) {
 }
 
 // how many times the reference's requests per second each Xisto server answers, level by level
-export function RatioBars({test, against}) {
+export function RatioBars({test, against, xisto = 'xisto-native'}) {
   const t = data[test];
   const r = t.servers.find((s) => s.id === against);
-  const x = t.servers.find((s) => s.id === 'xisto-native');
+  const x = t.servers.find((s) => s.id === xisto);
   if (!r || !x) return null;
   const rows = t.levels
     .map((l, i) => ({l, xv: x.values[i], rv: r.values[i]}))
@@ -237,10 +237,10 @@ export function VsTable({test, against = [], ids}) {
 }
 
 // a short summary for the top of a subpage, computed from the data so it never drifts from the charts
-export function VsHeadline({against}) {
+export function VsHeadline({against, xisto = 'xisto-native', lead}) {
   const line = (test) => {
     const t = data[test];
-    const x = t.servers.find((s) => s.id === 'xisto-native');
+    const x = t.servers.find((s) => s.id === xisto);
     const r = t.servers.find((s) => s.id === against);
     if (!x || !r) return null;
     const ratio = x.best / r.best;
@@ -256,5 +256,19 @@ export function VsHeadline({against}) {
       </li>
     );
   };
-  return <ul>{['json', 'plaintext'].map(line)}</ul>;
+  const lines = ['json', 'plaintext'].map(line).filter(Boolean);
+  if (!lines.length) return null;
+  return (
+    <>
+      {lead && <p>{lead}</p>}
+      <ul>{lines}</ul>
+    </>
+  );
+}
+
+// shows its children only while the round's data has no results for `id` (a server not measured yet): the pages say
+// what is coming, and the note goes away by itself when chartdata.py writes the next round
+export function Pending({id, children}) {
+  const measured = ['json', 'plaintext'].some((test) => data[test].servers.some((s) => s.id === id));
+  return measured ? null : <div className="alert alert--info" role="note" style={{marginBottom: '1.5rem'}}>{children}</div>;
 }

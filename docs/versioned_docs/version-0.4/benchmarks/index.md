@@ -69,7 +69,7 @@ The same Nest app, unchanged, built with Xisto or run on Node and Bun. On the Te
 the app built with Xisto serves 53,032 json requests per second in two processes with 16.2 MB; Node and Bun on that
 app come with the next VM round. On Conduit, the RealWorld app with Postgres and Redis (M4, 14 Nov), Xisto starts in
 20 ms against Node's 267 ms, rests at 7.3 MB against 137.3 MB, and answers more requests on every route but the
-article by slug with the cache warm. The charts and tables are on [NestJS](./nest.md).
+article by slug with the cache warm. The charts and tables are on [NestJS](./nest/index.md).
 
 ## Benchmarks Game against Node and Bun
 
@@ -104,7 +104,7 @@ program. Apple M4, 7 Nov 2026, `bench/results/2026-11-07-Apple-M4.csv`.
 - [Benchmarks Game](./benchmarks-game/index.md): against Rust, Node and Bun, per problem.
 - [PolyBench](./polybench/index.md): 30 numerical kernels against Rust and Go, per kernel.
 - [TechEmpower](./techempower/index.md): json and plaintext against actix, Go, Node, fastify and Bun.
-- [NestJS](./nest.md): the same Nest app on Xisto, Node and Bun: the TechEmpower routes and Conduit.
+- [NestJS](./nest/index.md): the same Nest app on Xisto, Node and Bun: the TechEmpower routes and Conduit.
 - [HTTP](./http.md): hello, Todo API, threads, resilience, slow dependencies.
 - [Energy, SQLite, streams and micro programs](./energy-sqlite-streams.md).
 

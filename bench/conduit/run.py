@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Conduit (NestJS RealWorld) under load: the same source built with xisto and run on Node (NestJS), against
 the same Postgres. Per endpoint: req/s, p50/p99 latency, server CPU per 1k requests, peak RSS.
-Usage: run.py xisto|node [duration=10s] [concurrency=64]
+Usage: run.py xisto|node|bun [duration=10s] [concurrency=64]
 Also: startup (exec to the first 200 on GET /api/tags, median of STARTS=5 fresh starts), RSS at rest (2 s after
 the start, before any data) and RSS after the load; per endpoint the server's CPU share during the run.
 Cache (Redis, the article list and an article by slug): per endpoint the latency of a cold call (FLUSHALL, then one
@@ -30,7 +30,8 @@ def reset():
 
 def start():
     xbin = os.environ.get("CONDUIT_BIN", os.path.join(APP, "conduit"))  # e.g. a build with or without the cache
-    cmd = [xbin] if which == "xisto" else ["node", os.path.join(APP, "dist", "main.js")]
+    # node and bun run the same `npm run build` output (dist/main.js)
+    cmd = [xbin] if which == "xisto" else [which, os.path.join(APP, "dist", "main.js")]
     t0 = time.time()
     p = subprocess.Popen(cmd, cwd=APP, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     while True:

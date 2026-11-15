@@ -1,85 +1,19 @@
 ---
-title: NestJS
-sidebar_position: 5
+title: Xisto vs Node
+sidebar_position: 1
 ---
 
 import {BarChart} from '@site/src/components/Charts';
-import {BestBars, LevelLines, CostBars, VsTable} from '@site/src/components/Charts/TechEmpower';
+import {BestBars, LevelLines, CostBars, RatioBars, VsTable, VsHeadline, Pending} from '@site/src/components/Charts/TechEmpower';
 
-# NestJS on Xisto, Node and Bun
+# NestJS: Xisto vs Node
 
-The [TechEmpower](./techempower/index.md) pages ask which runtime serves HTTP fastest, with one plain server per
-runtime. This page asks the question a team with a NestJS service has: **the same Nest app, not one line changed,
-built with Xisto or run on Node or on Bun: what does each give?**
+The same NestJS app, not one line changed, built with Xisto or run on Node. On Node it runs as the TFB's own Nest app
+does: compiled with `tsc`, one process per CPU with `node:cluster`. On Xisto, in two processes on one port (each with
+its own singletons, as the cluster) and in one process with workers and the handler lock. The setup and both apps are
+described on [NestJS](./index.md).
 
-Two apps:
-
-- **The TFB app**: NestJS with the TechEmpower routes `/json` and `/plaintext`
-  ([bench/techempower/xisto/nest](https://github.com/xistolang/xisto/tree/main/bench/techempower/xisto/nest)), under
-  the TechEmpower rules on the AWS VMs.
-- **Conduit**: the public RealWorld app, with guards, JWT, argon2, Postgres and Redis, on an Apple M4.
-
-:::note[Node and Bun on the TFB app come with the next VM round]
-The Node and Bun builds of the TFB app are ready (`bench/techempower/nest-node`: the same `main.ts` compiled with
-`tsc`, one process per CPU with `node:cluster`, as the TFB's own Nest app runs) and pass the TechEmpower validator;
-they are measured in the next round on the VMs, and the charts below fill in from the data. Bun is not measured on
-Conduit yet.
-:::
-
-## The TFB app: json and plaintext
-
-14 Nov 2026, main `3f24503`, the same round and setup as the [TechEmpower page](./techempower/index.md): the server on
-the Xeon E5-2686 v4 (2 vCPUs), wrk 4.2.0 on the Graviton2 over the private network, the TFB's levels and rules, 15 s
-per level, the median of 3 runs. The app is built with Xisto and run in three modes:
-
-- **2 processes on one port** (`XISTO_REUSEPORT=1`, one worker each): the kernel spreads the connections, each process
-  has its own singletons and nothing is shared, as Node's cluster or Bun's `reusePort`;
-- **workers with the lock** (`XISTO_WORKERS=2`, the default): one event loop per CPU in one process, the handlers one
-  at a time under a lock, because Nest's singletons are shared;
-- **workers without the lock** (`XISTO_LOCK=0`): the handlers in parallel. It crashed under load (below).
-
-On Node and Bun the app runs as the TFB's own NestJS app does: compiled with `tsc`, one process per CPU.
-
-### json
-
-<BestBars test="json" only={['xisto-nest-procs', 'xisto-nest', 'nest-bun', 'nest-node']} />
-
-<LevelLines test="json" only={['xisto-nest-procs', 'xisto-nest', 'nest-bun', 'nest-node']} slots={{'xisto-nest-procs': 2, 'xisto-nest': 1, 'nest-bun': 4, 'nest-node': 6}} />
-
-<CostBars test="json" metric="cpu" only={['xisto-nest-procs', 'xisto-nest', 'nest-bun', 'nest-node']} />
-
-<CostBars test="json" metric="rss" only={['xisto-nest-procs', 'xisto-nest', 'nest-bun', 'nest-node']} />
-
-<LevelLines test="json" metric="p99" only={['xisto-nest-procs', 'xisto-nest', 'nest-bun', 'nest-node']} slots={{'xisto-nest-procs': 2, 'xisto-nest': 1, 'nest-bun': 4, 'nest-node': 6}} />
-
-#### json in numbers
-
-<VsTable test="json" ids={['xisto-nest-procs', 'xisto-nest', 'nest-bun', 'nest-node']} />
-
-### plaintext
-
-<BestBars test="plaintext" only={['xisto-nest-procs', 'xisto-nest', 'nest-bun', 'nest-node']} />
-
-<LevelLines test="plaintext" only={['xisto-nest-procs', 'xisto-nest', 'nest-bun', 'nest-node']} slots={{'xisto-nest-procs': 2, 'xisto-nest': 1, 'nest-bun': 4, 'nest-node': 6}} />
-
-<CostBars test="plaintext" metric="cpu" only={['xisto-nest-procs', 'xisto-nest', 'nest-bun', 'nest-node']} />
-
-<CostBars test="plaintext" metric="rss" only={['xisto-nest-procs', 'xisto-nest', 'nest-bun', 'nest-node']} />
-
-#### plaintext in numbers
-
-<VsTable test="plaintext" ids={['xisto-nest-procs', 'xisto-nest', 'nest-bun', 'nest-node']} />
-
-### What this says
-
-- **In two processes** the app built with Xisto serves 53,032 json requests per second with 16.2 MB of memory, and
-  239,187 plaintext requests (HTTP pipelining 16 deep). With the lock, in one process: 44,216 and 116,817, with
-  10.7 MB on json.
-- **For scale until Nest on Node is measured**: on the same VM Node's bare `http` module, which Nest on Node runs on
-  through Express, serves 29,317 json and 51,066 plaintext requests per second with 289 MB
-  ([vs Node](./techempower/vs-node.md)).
-- **Without the lock the workers crash** under load: Nest's singletons are shared by the workers and touched without
-  synchronization. The lock is the default for that reason, and the multi-process mode is the one that scales.
+<VsHeadline against="nest-node" xisto="xisto-nest-procs" lead="The app built with Xisto in two processes against NestJS on Node, at a glance:" />
 
 ## Conduit: a real NestJS app
 
@@ -184,8 +118,52 @@ Single-request latency, cold (cache flushed) / warm, in ms:
 | tags | 0.90 / 0.47 | 1.22 / 0.55 |
 | login | 25.30 / 23.78 | 29.53 / 28.64 |
 
+<Pending id="nest-node">
+
+**NestJS on Node is measured in the next round on the VMs.** The build is ready (`bench/techempower/nest-node`, run
+as `nest-node` by `bench/techempower/run.py`) and passes the TechEmpower validator; the charts and tables of this section
+fill in from the data. Until then they show Xisto alone.
+
+</Pending>
+
+## The TFB app: json
+
+14 Nov 2026 round: the server on the Xeon E5-2686 v4 (2 vCPUs), wrk 4.2.0 on the Graviton2, the TFB's levels and
+rules, 15 s per level, the median of 3 runs.
+
+<BestBars test="json" only={['xisto-nest-procs', 'xisto-nest', 'nest-node']} />
+
+<RatioBars test="json" against="nest-node" xisto="xisto-nest-procs" />
+
+<LevelLines test="json" only={['xisto-nest-procs', 'xisto-nest', 'nest-node']} slots={{'xisto-nest-procs': 2, 'xisto-nest': 1, 'nest-node': 6}} />
+
+<CostBars test="json" metric="cpu" only={['xisto-nest-procs', 'xisto-nest', 'nest-node']} />
+
+<CostBars test="json" metric="rss" only={['xisto-nest-procs', 'xisto-nest', 'nest-node']} />
+
+<LevelLines test="json" metric="p99" only={['xisto-nest-procs', 'xisto-nest', 'nest-node']} slots={{'xisto-nest-procs': 2, 'xisto-nest': 1, 'nest-node': 6}} />
+
+### json in numbers
+
+<VsTable test="json" ids={['xisto-nest-procs', 'xisto-nest', 'nest-node']} />
+
+## The TFB app: plaintext
+
+<BestBars test="plaintext" only={['xisto-nest-procs', 'xisto-nest', 'nest-node']} />
+
+<RatioBars test="plaintext" against="nest-node" xisto="xisto-nest-procs" />
+
+<LevelLines test="plaintext" only={['xisto-nest-procs', 'xisto-nest', 'nest-node']} slots={{'xisto-nest-procs': 2, 'xisto-nest': 1, 'nest-node': 6}} />
+
+<CostBars test="plaintext" metric="cpu" only={['xisto-nest-procs', 'xisto-nest', 'nest-node']} />
+
+<CostBars test="plaintext" metric="rss" only={['xisto-nest-procs', 'xisto-nest', 'nest-node']} />
+
+### plaintext in numbers
+
+<VsTable test="plaintext" ids={['xisto-nest-procs', 'xisto-nest', 'nest-node']} />
+
 ## See also
 
-- [TechEmpower](./techempower/index.md): the runtimes' plain servers
-- [HTTP](./http.md): hello, Todo API, threads, resilience and slow dependencies against Node, Bun, Rust and Go
-- [NestJS with Xisto](../getting-started/nestjs.md)
+- [NestJS](./index.md) and [vs Bun](./vs-bun.md)
+- [TechEmpower vs Node](../techempower/vs-node.md): the plain `node:http` server and fastify

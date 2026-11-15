@@ -16,7 +16,7 @@ Xisto's native `Server` against Node http, at a glance:
 The same round as the [TechEmpower page](./index.md), which has the full setup: the servers on the Xeon E5-2686 v4
 (2 vCPUs), wrk 4.2.0 on the Graviton2 over the private network, the TFB's levels and rules, 15 s per level, the
 median of 3 runs. The reference here is Node v22.22.1 (Ubuntu's package), the TFB's `frameworks/JavaScript/nodejs` (`node:http`) and `frameworks/JavaScript/fastify`, both with `node:cluster` and one worker per CPU, unmodified except for the port. On the Xisto side, the native
-`Server` with 2 workers. NestJS, on Xisto, Node and Bun, has [its own page](../nest.md).
+`Server` with 2 workers. NestJS, on Xisto, Node and Bun, has [its own page](../nest/index.md).
 
 ## json
 

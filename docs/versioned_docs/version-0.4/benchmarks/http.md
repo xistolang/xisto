@@ -15,7 +15,7 @@ unless a table says otherwise: Rust on tokio's `current_thread` runtime, Go with
 servers ([bench/http/rust](https://github.com/xistolang/xisto/tree/main/bench/http/rust),
 [bench/http/go](https://github.com/xistolang/xisto/tree/main/bench/http/go)) answer every measured route byte for
 byte as the Xisto server does (status, content type, body), checked with `bench/http/probe.sh`. NestJS, the Conduit
-app included, has [its own page](./nest.md). The first Linux results are in [Node's http module on Linux](#nodes-http-module-on-linux).
+app included, has [its own page](./nest/index.md). The first Linux results are in [Node's http module on Linux](#nodes-http-module-on-linux).
 
 ## Hello server
 
