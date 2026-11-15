@@ -995,7 +995,7 @@ static bool is_fresh(Expr *e) {
         if (e->lhs->type && e->lhs->type->kind == TY_STREAM) return cref(e->type); /* every stream op returns a new owned value */
         if (e->lhs->type && e->lhs->type->kind == TY_CHAN) return cref(e->type); /* receive hands over ownership */
         if (e->cls && e->cls->builtin && strcmp(e->cls->name, "StatementSync") == 0) return true;
-        if (e->builtin.cfn && (strcmp(e->builtin.cfn, "get") == 0 || strcmp(e->builtin.cfn, "set") == 0 || strcmp(e->builtin.cfn, "add") == 0 ||
+        if (e->builtin.cfn && (strcmp(e->builtin.cfn, "get") == 0 || strcmp(e->builtin.cfn, "get_falsy") == 0 || strcmp(e->builtin.cfn, "set") == 0 || strcmp(e->builtin.cfn, "add") == 0 ||
                                strcmp(e->builtin.cfn, "find") == 0 || strcmp(e->builtin.cfn, "sort") == 0 || strcmp(e->builtin.cfn, "reverse") == 0)) return false; /* borrowed */
         return true; /* every other method/static call returns an owned reference */
     case E_BINARY: return e->op == TK_PLUS; /* string concatenation */
@@ -2104,9 +2104,13 @@ static void emit_member(Expr *e) {
             buf_puts(out, ")");
             return;
         }
-        if (strcmp(op, "get") == 0) {
+        if (strcmp(op, "get") == 0 || strcmp(op, "get_falsy") == 0) {
             int vk = val_kind(v);
-            buf_printf(out, vk == 0 ? "xs_map_get_num_%s(" : vk == 1 ? "xs_map_get_int_%s(" : vk == 2 ? "xs_map_get_bool_%s(" : "((%s)xs_map_get_ptr_%s(", vk == 3 ? ctype(v) : ks, ks);
+            /* a primitive read as T | null (checker.c, missing_get): null for a missing key; read as a condition
+               (falsy_get): the false value; else a missing key is a run-time error */
+            const char *how = vk == 3 ? "" : op[3] ? "z" : e->type && e->type->kind == TY_NULLABLE ? "n" : "";
+            if (vk == 3) buf_printf(out, "((%s)xs_map_get_ptr_%s(", ctype(v), ks);
+            else buf_printf(out, "xs_map_get%s_%s_%s(", how, vk == 0 ? "num" : vk == 1 ? "int" : "bool", ks);
             emit_borrowed(base);
             buf_puts(out, ", ");
             emit_borrowed(e->args.items[0]);

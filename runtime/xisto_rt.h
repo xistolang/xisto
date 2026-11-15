@@ -2705,6 +2705,21 @@ XS_NOINLINE bool xs_map_get_bool_s(xs_map *m, xs_str *k) { return xs_map_need(m,
 XS_NOINLINE bool xs_map_get_bool_i(xs_map *m, int64_t k) { return xs_map_need(m, NULL, k).i != 0; }
 static void *xs_map_get_ptr_s(xs_map *m, xs_str *k) { xs_map_entry *e = xs_map_lookup(m, k, 0); return e ? e->val.p : NULL; }
 static void *xs_map_get_ptr_i(xs_map *m, int64_t k) { xs_map_entry *e = xs_map_lookup(m, NULL, k); return e ? e->val.p : NULL; }
+/* m.get(k) of a primitive read as T | null (getn: a missing key is null) or as a condition (getz: a missing key is the
+   false value, 0 / NaN / false): one lookup, no error path */
+#define XS_MAP_GET_OR(name, T, field, miss) \
+    static T xs_map_get##name##_s(xs_map *m, xs_str *k) { xs_map_entry *e = xs_map_lookup(m, k, 0); return e ? (T)e->val.field : (miss); } \
+    static inline __attribute__((always_inline)) T xs_map_get##name##_i(xs_map *m, int64_t k) { \
+        xs_map_entry *e = xs_map_lookup_i(m, k); \
+        return __builtin_expect(e != NULL, 1) ? (T)e->val.field : (miss); \
+    }
+XS_MAP_GET_OR(n_num, double, d, xs_null_num())
+XS_MAP_GET_OR(n_int, int64_t, i, XS_NULL_INT)
+XS_MAP_GET_OR(n_bool, int8_t, i, XS_NULL_BOOL)
+XS_MAP_GET_OR(z_num, double, d, xs_null_num())
+XS_MAP_GET_OR(z_int, int64_t, i, 0)
+XS_MAP_GET_OR(z_bool, bool, i, false)
+#undef XS_MAP_GET_OR
 
 /* keys() / values() as new arrays, in insertion order */
 static void *xs_map_keys(xs_map *m, void (*print_elem)(void *)) {

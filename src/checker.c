@@ -3277,6 +3277,7 @@ static bool prim_like(Type *t) {
     return true;
 }
 static bool missing_get(Expr *l);
+static void falsy_get(Expr *l);
 static Expr *copy_target(Expr *x);
 static void check_loose_eq(Expr *e);
 static bool rereadable(Expr *e);
@@ -4397,6 +4398,7 @@ static bool union_convert(Expr *e, Type *want) {
     return true;
 }
 static void expect_type(Expr *e, Type *want, const char *what) {
+    if (want && want->kind == TY_NULLABLE) missing_get(e); /* m.get(k) where T | null goes: null for a missing k */
     if (union_convert(e, want)) return;
     if (tsc_checked() && e->type) { /* Repository<A> where Repository<any> goes: the class's own __xs_any() (a package says how its
                                        instance is read as G<any>: Repository keeps its entity by name) */
@@ -8625,6 +8627,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (e->op == TK_NOT) fn_truthy(e->lhs);
         check_expr(e->lhs, expected);
         if (e->op == TK_NOT) {
+            falsy_get(e->lhs); /* !m.get(k): true for a missing k */
             if (e->lhs->type->kind != TY_BOOLEAN && cond_truthy_type(e->lhs->type)) make_truthy(e->lhs, "operand of '!'");
             expect_type(e->lhs, ty_boolean, "operand of '!'");
             e->type = ty_boolean;
@@ -8778,6 +8781,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
+        if (e->op == TK_OR) falsy_get(e->lhs); /* m.get(k) || d: d for a missing k */
         if (e->op == TK_OR && e->lhs->type->kind != TY_BOOLEAN && !is_numeric(e->lhs->type) && e->lhs->type->kind != TY_STRING &&
             truthy_type(e->lhs->type) && rereadable(e->lhs) && boolish(e->rhs))
             make_truthy(e->lhs, "left operand of '||'"); /* err || !Array.isArray(v): a test (err !== null), not a default */
@@ -9065,6 +9069,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
             if (e->lhs->type->kind == TY_NULL || e->rhs->type->kind == TY_NULL) {
                 Expr *other = e->lhs->type->kind == TY_NULL ? e->rhs : e->lhs;
+                if (other->type->kind != TY_NULLABLE) missing_get(other); /* m.get(k) === undefined: the key is missing */
                 if (other->type->kind != TY_NULLABLE && other->type->kind != TY_NULL && other->type->kind != TY_UNKNOWN) {
                     /* x === null (or undefined) with x never null: always false, as TypeScript lets it be written
                        (a check kept from code where the value could be absent) */
@@ -13719,6 +13724,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         const char *then_path = ty_path && e->args.len == 2 ? member_path_text(e->args.items[0]) : NULL;
         check_expr(e->lhs, NULL);
+        falsy_get(e->lhs); /* m.get(k) ? a : b: b for a missing k */
         if (e->lhs->type->kind != TY_BOOLEAN && cond_truthy_type(e->lhs->type)) make_truthy(e->lhs, "condition of '?:'");
         if (e->lhs->type->kind != TY_BOOLEAN)
             xs_error(XS8105, e->lhs->pos, "there is no truthiness in xisto; compare explicitly", "condition of '?:' must be boolean, but this is %s", ty_name(e->lhs->type));
@@ -14305,47 +14311,23 @@ static void check_optchain(Expr *e, Type *expected) {
         e->type = ty_optional_of(rt);
     }
 }
-/* m.get(k) with a primitive value (a missing key is an error there: get has no null for it), read through ?? or ?.:
-   m.has(k) ? m.get(k) : absent, as JavaScript's undefined for a missing key. m a name or a field, k a name or a literal */
-/* a key with no side effect (read twice by the has/get pair): a path, a literal, arithmetic or a + b of them */
-static bool pure_key(Expr *k) {
-    if (!k) return false;
-    if (k->kind == E_BINARY && !k->builtin.cfn && k->op != TK_QQ) return pure_key(k->lhs) && pure_key(k->rhs);
-    if (k->kind == E_CALL && k->builtin.cfn && !strcmp(k->builtin.cfn, "xs_num_key_find") && k->args.len == 1) return pure_key(k->args.items[0]);
-    if (k->kind == E_BINARY) return false;
-    return pure_read(k);
-}
+/* m.get(k) with a primitive value read where a missing key can show (?? d, ?., const v = m.get(k), a T | null slot,
+   === undefined): its type becomes T | absent, and emit.c reads the key once, a missing one giving null (as JavaScript's
+   undefined). Anywhere else a missing key stays a run-time error (the value has no room for null there). */
 static bool missing_get(Expr *l) {
     if (!(l->kind == E_MEMBER && l->is_call && l->builtin.cfn && strcmp(l->builtin.cfn, "get") == 0 && l->lhs->type &&
-          l->lhs->type->kind == TY_MAP && l->type && l->type->kind != TY_NULLABLE && l->type->kind != TY_UNKNOWN && pure_read(l->lhs) && l->args.len == 1))
+          l->lhs->type->kind == TY_MAP && l->type && l->type->kind != TY_NULLABLE && l->type->kind != TY_UNKNOWN && l->args.len == 1))
         return false;
-    Expr *k = l->args.items[0];
-    bool nk = k->kind == E_CALL && k->builtin.cfn && !strcmp(k->builtin.cfn, "xs_nkey") && k->args.len == 1 &&
-              (k->args.items[0]->kind == E_IDENT || k->args.items[0]->kind == E_NUMBER || k->args.items[0]->kind == E_NULL); /* (Map<number | null, V>) */
-    if (!pure_key(k) && !nk) return false;
-    Expr *get = expr_copy(l);
-    Expr *has = xs_alloc(sizeof *has);
-    has->kind = E_MEMBER;
-    has->pos = l->pos;
-    has->lhs = expr_copy(l->lhs);
-    has->str = "has";
-    has->is_call = true;
-    has->field = -1;
-    expr_list_push(&has->args, expr_copy(k));
-    check_expr(has, NULL);
-    Type *t = ty_optional_of(get->type);
-    Expr *nul = xs_alloc(sizeof *nul);
-    nul->kind = E_NULL;
-    nul->pos = l->pos;
-    nul->type = t;
-    memset(l, 0, sizeof *l);
-    l->kind = E_COND;
-    l->pos = get->pos;
-    l->lhs = has;
-    expr_list_push(&l->args, get);
-    expr_list_push(&l->args, nul);
-    l->type = t;
+    l->type = ty_optional_of(l->type);
     return true;
+}
+/* m.get(k) with a primitive value read as a condition or before || (if (m.get(k)), m.get(k) || d): a missing key reads
+   as the value's false one (0, NaN, false), as JavaScript's undefined there */
+static void falsy_get(Expr *l) {
+    if (l->kind == E_MEMBER && l->is_call && l->builtin.cfn && strcmp(l->builtin.cfn, "get") == 0 && l->lhs->type &&
+        l->lhs->type->kind == TY_MAP && l->type && l->type->kind != TY_NULLABLE && l->type->kind != TY_UNKNOWN && l->args.len == 1 &&
+        (l->type->kind == TY_NUMBER || l->type->kind == TY_INT || l->type->kind == TY_BOOLEAN))
+        l->builtin.cfn = "get_falsy";
 }
 /* a ?? b: a unless it is null; b runs only then. With a never null, a (b is checked, never run) */
 static void check_nullish(Expr *e, Type *expected) {
@@ -14499,6 +14481,7 @@ static void check_loose_eq(Expr *e) {
 }
 
 static void make_truthy(Expr *e, const char *what) {
+    falsy_get(e); /* if (m.get(k)): false for a missing k */
     if (e->type->kind == TY_INT) { /* XB-118 rule 5: x !== 0 */
         xs_warn_rule(XS2105, e->pos, "compare explicitly: x !== 0 (or x > 0)", "an int as a condition: read as '!== 0'");
         Expr *v = expr_copy(e);
@@ -14629,6 +14612,7 @@ static void make_truthy(Expr *e, const char *what) {
 static void check_cond(Expr *c, const char *what) {
     fn_truthy(c);
     check_expr(c, NULL);
+    falsy_get(c); /* (a boolean value: false for a missing key) */
     if (c->type->kind != TY_BOOLEAN && cond_truthy_type(c->type)) make_truthy(c, what);
     if (c->type->kind != TY_BOOLEAN)
         xs_error(XS8022, c->pos, "there is no truthiness for numbers in xisto; compare explicitly, e.g. 'x !== 0'", "%s must be boolean, but this is %s", what, ty_name(c->type));

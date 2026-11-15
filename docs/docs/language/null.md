@@ -76,7 +76,9 @@ runtime error: TypeError: 'last' is null here: a call made since it was checked 
 
 `console.log` prints `undefined` where Node would: an absent optional field read through `?.`, an unmatched regex
 group. A `null` you stored prints `null`. `Map.get` of a missing key returns `null` for reference values (Node:
-`undefined`); for `int` values it is a run-time error ("Map.get: key not found (check with has() first)").
+`undefined`); for `int`, `number` and `boolean` values too wherever the result can be absent (`m.get(k) ?? 0`,
+`m.get(k) === undefined`, `const v = m.get(k)`, a `T | undefined` slot). Read where only the value's type fits
+(`m.get(k) + 1`), a missing key is a run-time error ("Map.get: key not found (check with has() first)").
 
 ## Comparing with `null`
 
