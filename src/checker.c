@@ -9764,6 +9764,8 @@ static void check_expr_in(Expr *e, Type *expected) {
             callee->kind = E_IDENT; callee->pos = a->pos; callee->str = "Number"; callee->field = -1;
             c->lhs = callee;
         }
+        if (e->op == TK_PLUS_ASSIGN && target->type->kind == TY_STRING && ty_is_any(e->rhs->type))
+            dyn_wrap(e->rhs, "xs_dyn_str", ty_string); /* s += x with x an any: String(x), as s = s + x (a Buffer: its text) */
         expect_type(e->rhs, target->type, e->op == TK_ASSIGN ? "assigned value" : "right side of compound assignment");
         e->type = target->type;
         if (narrowed) unnarrow(narrowed);
