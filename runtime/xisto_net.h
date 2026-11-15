@@ -3229,12 +3229,41 @@ XS_NOINLINE void xs_http_serve(void) {
     xs_shutdown_t0 = 0;
     xs_release(s);
 }
+/* Accepts at most 64 connections; true when it stopped at that cap with more maybe waiting. The poller hands out at
+   most 128 ready sockets per call and rotates through the rest, so with thousands of busy connections the listening
+   socket's own event comes back only every few dozen turns: a worker that waited for it accepted about one
+   connection per turn, and a burst of new connections sat in the kernel's queue for seconds with their first
+   requests already sent (the tail at 16,384 connections, XB-241). The caller tries again on the next turn instead. */
+static bool xs_server_accept(int kq, int lfd, xs_Server *s) {
+    struct kevent ev;
+    int one = 1;
+    (void)s;
+    for (int k = 0; k < 64; k++) { /* at most 64 per turn: serving the connections already open goes on */
+#if defined(__linux__)
+        int fd = accept4(lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (fd < 0) return false;
+#else
+        int fd = accept(lfd, NULL, NULL);
+        if (fd < 0) return false;
+        fcntl(fd, F_SETFL, O_NONBLOCK);
+#endif
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        xs_client *c = calloc(1, sizeof *c);
+        c->fd = fd;
+        xs_clients_live++;
+#ifdef XS_WITH_TLS
+        if (s->cred) c->tls = xs_tls_server_new(s->cred);
+#endif
+        EV_SET(&ev, fd, EVFILT_READ, EV_ADD, 0, 0, c);
+        kevent(kq, &ev, 1, NULL, 0, NULL);
+    }
+    return true;
+}
 XS_NOINLINE void *xs_server_worker(void *arg) {
     xs_worker_args *wa = arg;
     xs_Server *s = wa->s;
     int64_t port = wa->port;
     int lfd = wa->lfd;
-    int one = 1;
 
     /* node:http's server shares the program's event loop: its pending timers and sockets go on (xs_kq) */
     int kq = wa->inline_loop && xs_kq >= 0 ? xs_kq : kqueue();
@@ -3247,6 +3276,7 @@ XS_NOINLINE void *xs_server_worker(void *arg) {
 
     xs_server_signals(kq);
     struct kevent events[256];
+    bool accept_more = false; /* the last accept stopped at its cap: try again next turn without waiting for the event */
     for (;;) {
         xs_coro_flush_dead();
         if (xs_shutting_down && xs_inflight_total == 0 && wa->inline_loop && xs_http_closing) {
@@ -3270,7 +3300,7 @@ XS_NOINLINE void *xs_server_worker(void *arg) {
         struct timespec zero = {0, 0}, tick = {0, 200000000}, tt;
         bool has_t = xs_tmr_timeout(&tt);
         if (xs_shutting_down && (!has_t || tt.tv_sec > 0 || tt.tv_nsec > tick.tv_nsec)) { tt = tick; has_t = true; }
-        int n = kevent(kq, NULL, 0, events, 256, xs_ready_head ? &zero : has_t ? &tt : NULL);
+        int n = kevent(kq, NULL, 0, events, 256, xs_ready_head || accept_more ? &zero : has_t ? &tt : NULL);
         xs_loop_ns = xs_now();
         xs_batch++;
         if (xs_shutting_down && xs_shutdown_t0 && xs_now() - xs_shutdown_t0 > 10000000000ull) { /* handlers parked forever: give up after 10 s */
@@ -3283,28 +3313,13 @@ XS_NOINLINE void *xs_server_worker(void *arg) {
             xs_panic("kevent failed");
         }
         xs_tmr_fire(xs_coro_after); /* due timers: sleeps and wait timeouts */
+        bool accepted = false;
+        if (accept_more && !xs_shutting_down) { accept_more = xs_server_accept(kq, lfd, s); accepted = true; }
         for (int i = 0; i < n; i++) {
             if (events[i].udata == &xs_listen_tag) {
                 if (xs_shutting_down) continue;
-                for (int k = 0; k < 64; k++) { /* at most 64 per turn: serving the connections already open goes on */
-#if defined(__linux__)
-                    int fd = accept4(lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
-                    if (fd < 0) break;
-#else
-                    int fd = accept(lfd, NULL, NULL);
-                    if (fd < 0) break;
-                    fcntl(fd, F_SETFL, O_NONBLOCK);
-#endif
-                    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-                    xs_client *c = calloc(1, sizeof *c);
-                    c->fd = fd;
-                    xs_clients_live++;
-#ifdef XS_WITH_TLS
-                    if (s->cred) c->tls = xs_tls_server_new(s->cred);
-#endif
-                    EV_SET(&ev, fd, EVFILT_READ, EV_ADD, 0, 0, c);
-                    kevent(kq, &ev, 1, NULL, 0, NULL);
-                }
+                if (!accepted) accept_more = xs_server_accept(kq, lfd, s);
+                accepted = true;
                 continue;
             }
             if (events[i].udata && *(int *)events[i].udata == 2) { /* a parked coroutine: its socket or its timer */
