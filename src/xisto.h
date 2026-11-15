@@ -489,6 +489,7 @@ struct Func {
     int access;        /* 0 public, 1 protected, 2 private */
     bool is_getter, is_setter; /* get x(): T / set x(v: T): named __get_x / __set_x, used as obj.x */
     bool is_gen;       /* function* f(): Generator<T>: returns a Stream<T> whose values the body yields */
+    struct Func *outer_fn; /* an arrow or function expression: the function it is written in (NULL: top level) */
     struct Func **overrides; /* methods of subclasses that override this one (all levels) */
     int noverrides;
     bool virt_target;  /* called through a dispatcher: never inlined into one call site */
@@ -558,6 +559,7 @@ struct Class {
     bool exported;
     bool is_default;   /* export default class X, or export default X; of a class declared here */
     bool used;
+    bool made;         /* prune.c: an object of it can exist (new, a literal, a decoder) */
     Field *fields;
     int nfields, cap_fields;
     Func **methods;
@@ -729,6 +731,9 @@ typedef struct {
     bool uses_v8, uses_unk_map, uses_symbol_for, uses_nkey, uses_okmap; /* xisto:v8, x instanceof Map/Set of an unknown, Symbol.for: their runtime joins the program */
     bool uses_this_reg; /* XB-107: function (this: T) / method slots: the this register's helpers join the program */
     bool uses_tls;
+    struct Func **tls_fns; /* XB-232: functions with a fetch that may be https (checker); TLS joins when prune finds one of
+                              them reachable (a method: and an object of its class made) */
+    int ntls_fns;
     bool uses_crypto;  /* node:crypto, or a native package that needs it */
     bool uses_zlib;    /* node:zlib: runtime/xisto_zlib.h joins the program, zlib (build/libxszlib.a) is linked */
     char **native_files; /* C sources of native packages (xisto.json "native"), compiled with the program */
