@@ -48,7 +48,7 @@ mechanisms behind each row.
 
 | pattern | what happens | do this instead |
 |---|---|---|
-| `nums.sort()` on numbers | Error XS7089: JavaScript would compare as strings. `sort()` on strings works as in JavaScript. | `nums.sort((a, b) => a - b)`. |
+| `nums.sort()` on numbers | Compares the numbers as strings (`[1, 10, 2]`), as JavaScript does, converting each one per comparison. | `nums.sort((a, b) => a - b)`. |
 | `xs.push(a, b)` | On a variable: one `push` per argument. On an expression that cannot be read twice (a call result): XS7083. | Push to a variable. |
 | `xs.unshift(a, b)` | Error XS7117: `unshift` takes one argument. | One `unshift` per value, last first. |
 | Measuring or serving with `--dev` | `-O0`: 4–10× slower than release (fib 0.11 vs 0.02 s, nbody 3.78 vs 0.39 s; M4, 7 Nov 2026, `bench/results/2026-11-07-Apple-M4.csv`). Frames over 16 KB can overflow a server's 64 KB request stack (SIGBUS). | `--dev` for the edit loop only; release (the default) for anything you measure or deploy. |

@@ -54,7 +54,6 @@ Every row was checked on 12 Nov 2026 by running the same program with xisto and 
 | `Object.freeze(o)`, then `o.x = 1` | `TypeError` (strict mode) | the write happens; `Object.isFrozen` is refused | no flag per object |
 | `console.log(new AggregateError(es, m))` | the stack, then `[errors]` | `AggregateError: m {` `[errors]: ... }` | xisto prints no frames |
 | `m.set(new, …)` inside `for…of` over `m` | the loop sees it | the loop does not see it | |
-| `numbers.sort()` without comparator | sorts as strings | error XS7089 (strings sort as on Node) | the default surprises |
 | `const a = []` | `any[]` | error XS3008 | a type is needed |
 | `new Date("bad").getFullYear()` | `NaN` | `0` | getters return `int` |
 | `Date.toString()` zone name | `(Brasilia Standard Time)` | `(-03)` | no ICU data |
@@ -84,7 +83,9 @@ Every row was checked on 12 Nov 2026 by running the same program with xisto and 
 
 Earlier versions refused these; they now behave as on Node: `==` without conversion, `int` mixed with `number`
 (warning XS2103), optional `boolean`/`int` fields, `(int | null)[]`, regex backreferences and lookaround,
-`extends Error`, `Promise.all` of different types (a tuple), `Buffer`, `string[].sort()`, `process.env.X`.
+`extends Error`, `Promise.all` of different types (a tuple), `Buffer`, `string[].sort()`, `process.env.X`, `sort()` and `toSorted()` without a comparator on numbers, bigints,
+booleans and `unknown[]` (the elements' `String()` forms by UTF-16 code units, as on Node: `[1, 10, 2, 3]`),
+`Object.assign({}, a)`, `Promise.reject(e)` beside other promises in `Promise.all`/`race`/`any`/`allSettled`.
 
 ## See also
 
