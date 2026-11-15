@@ -1,5 +1,6 @@
 #!/bin/sh
-# HTTP bench: the three servers under the same oha load, then the three clients against the Xisto server.
+# HTTP bench: the servers (xisto, node, bun, rust, go) under the same oha load, then the same clients against the
+# Xisto server. Rust is axum on tokio's current_thread runtime, Go net/http with GOMAXPROCS=1 (bench/http/build-native.sh).
 # Usage: bench/http/run.sh [DURATION]   (default 10s per route)
 export XISTO_NODE_COMPAT=1 # these programs also run on Node for comparison: node: imports allowed
 cd "$(dirname "$0")/../.." || exit 1
@@ -26,12 +27,13 @@ mb() { echo "$1" | awk '{printf "%.2f", $1/1048576}'; }
 
 $XISTO build -o "$OUT/server-xisto" bench/http/server.xisto.ts || exit 1
 $XISTO build -o "$OUT/client-xisto" bench/http/client.ts || exit 1
+sh bench/http/build-native.sh || exit 1
 
 echo "kind,target,route,duration,req_per_s,p50_ms,p99_ms,errors,rss_mb,startup_ms,executable_bytes" > "$csv"
 {
     echo "# HTTP bench $stamp"
     echo
-    echo "Machine: $(sysctl -n machdep.cpu.brand_string), macOS $(sw_vers -productVersion). node $($NODE --version), bun $($BUN --version), oha $($OHA --version | awk '{print $2}')."
+    echo "Machine: $(sysctl -n machdep.cpu.brand_string), macOS $(sw_vers -productVersion). node $($NODE --version), bun $($BUN --version), oha $($OHA --version | awk '{print $2}'), $(cat $OUT/native-versions.txt)."
     echo "Load: oha, $CONC connections, $DUR per route, keep-alive. Servers on 127.0.0.1:8080, one process each. RSS sampled right after the load. Errors exclude the connections oha aborts at the deadline. Startup = ms from spawn to the first 200 on /ping."
     echo
     echo "## Servers"
@@ -99,12 +101,14 @@ PYEOF
 run_server xisto "$OUT/server-xisto" "$OUT/server-xisto"
 run_server node "$NODE" "$NODE" bench/http/server.node.ts
 run_server bun "$BUN" "$BUN" bench/http/server.bun.ts
+[ -x "$OUT/rust-hello" ] && run_server rust "$OUT/rust-hello" env WORKERS=1 "$OUT/rust-hello"
+[ -x "$OUT/go-hello" ] && run_server go "$OUT/go-hello" env GOMAXPROCS=1 "$OUT/go-hello"
 
 {
     echo
     echo "## Clients"
     echo
-    echo "Same file (bench/http/client.ts) on the three runtimes, 20000 iterations of ping + hello, sequential, against the Xisto server. Median of 3."
+    echo "Same file (bench/http/client.ts) on xisto, node and bun, and its Rust (reqwest, current_thread) and Go (net/http, GOMAXPROCS=1) translations: 20000 iterations of ping + hello, sequential, against the Xisto server. Median of 3."
     echo
     echo "| client | time (s) | RSS (MB) | output |"
     echo "|---|---:|---:|---|"
@@ -132,5 +136,7 @@ echo "== clients (against the xisto server)"
 run_client xisto "$OUT/client-xisto"
 run_client node "$NODE" bench/http/client.ts
 run_client bun "$BUN" bench/http/client.ts
+[ -x "$OUT/rust-client" ] && run_client rust "$OUT/rust-client"
+[ -x "$OUT/go-client" ] && run_client go env GOMAXPROCS=1 "$OUT/go-client"
 kill $spid 2>/dev/null; wait $spid 2>/dev/null
 echo; echo "results: $csv"; echo "         $md"

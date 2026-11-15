@@ -1,5 +1,6 @@
 #!/bin/sh
-# Todo API bench: the three servers seeded with 50 todos, then oha on list, read and update.
+# Todo API bench: the servers (xisto, node, bun, rust, go) seeded with 50 todos, then oha on list, read and update.
+# Rust is axum on tokio's current_thread runtime, Go net/http with GOMAXPROCS=1 (bench/http/build-native.sh).
 export XISTO_NODE_COMPAT=1 # these programs also run on Node for comparison: node: imports allowed
 cd "$(dirname "$0")/../../.." || exit 1
 DUR=${1:-10s}; CONC=64
@@ -30,10 +31,11 @@ while time.time() - t0 < 30:
 PYEOF
 }
 $XISTO build -o "$OUT/todo-xisto" bench/http/todo/server.xisto.ts || exit 1
+sh bench/http/build-native.sh || exit 1
 echo "server,route,req_per_s,p50_ms,p99_ms,errors,rss_mb,startup_ms,executable_bytes" > "$csv"
 {
     echo "# Todo API bench $stamp"; echo
-    echo "Machine: $(sysctl -n machdep.cpu.brand_string), macOS $(sw_vers -productVersion). node $($NODE --version), bun $($BUN --version), oha $($OHA --version | awk '{print $2}')."
+    echo "Machine: $(sysctl -n machdep.cpu.brand_string), macOS $(sw_vers -productVersion). node $($NODE --version), bun $($BUN --version), oha $($OHA --version | awk '{print $2}'), $(cat $OUT/native-versions.txt)."
     echo "Each server is seeded with 50 todos, then oha runs $CONC connections for $DUR per route. Routes: list (GET /todos, 50 items serialized), read (GET /todos/25), update (PUT /todos/25 with a JSON body). Errors exclude connections aborted at the deadline."; echo
     echo "| server | route | req/s | p50 (ms) | p99 (ms) | errors | RSS (MB) | startup (ms) | executable (MB) |"
     echo "|---|---|---:|---:|---:|---:|---:|---:|---:|"
@@ -65,4 +67,6 @@ print('%.0f %.3f %.3f %d' % (s['requestsPerSec'], p['p50']*1000, p['p99']*1000, 
 run_server xisto "$OUT/todo-xisto" "$OUT/todo-xisto"
 run_server node "$NODE" "$NODE" bench/http/todo/server.node.ts
 run_server bun "$BUN" "$BUN" bench/http/todo/server.bun.ts
+[ -x "$OUT/rust-todo" ] && run_server rust "$OUT/rust-todo" env WORKERS=1 "$OUT/rust-todo"
+[ -x "$OUT/go-todo" ] && run_server go "$OUT/go-todo" env GOMAXPROCS=1 "$OUT/go-todo"
 echo; echo "results: $csv"; echo "         $md"

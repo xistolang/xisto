@@ -1,5 +1,7 @@
 #!/bin/sh
-# Threads bench: one event loop vs N workers, on Xisto, Node (cluster) and Bun (reusePort).
+# Threads bench: one event loop vs N workers, on Xisto, Node (cluster), Bun (reusePort), Rust (axum: tokio's
+# multi-threaded runtime with WORKERS=N worker threads, current_thread for 1) and Go (net/http, GOMAXPROCS=N).
+# Note: in sh, VAR=x before a function call stays set (and exported) after it, so every target sets its own.
 # Records throughput, latency, and the CPU seconds the server(s) burned during the load.
 export XISTO_NODE_COMPAT=1 # these programs also run on Node for comparison: node: imports allowed
 cd "$(dirname "$0")/../../.." || exit 1
@@ -10,6 +12,7 @@ csv="bench/results/$stamp-$host-threads.csv"; md="bench/results/$stamp-$host-thr
 NODE=$(command -v node); BUN=$(command -v bun); OHA=$(command -v oha)
 $XISTO build -o "$OUT/server-xisto" bench/http/server.xisto.ts || exit 1
 $XISTO build -o "$OUT/todo-xisto" bench/http/todo/server.xisto.ts || exit 1
+sh bench/http/build-native.sh || exit 1
 cores=$(sysctl -n hw.ncpu); pcores=$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || echo "?")
 
 wait_ready() {
@@ -53,7 +56,7 @@ PYEOF
 echo "target,workers,route,req_per_s,p50_ms,p99_ms,errors,server_cpu_s,cpu_s_per_100k,rss_mb" > "$csv"
 {
     echo "# Threads bench $stamp"; echo
-    echo "Machine: $(sysctl -n machdep.cpu.brand_string), $cores logical cores ($pcores performance). macOS $(sw_vers -productVersion). node $($NODE --version), bun $($BUN --version), oha $($OHA --version | awk '{print $2}')."
+    echo "Machine: $(sysctl -n machdep.cpu.brand_string), $cores logical cores ($pcores performance). macOS $(sw_vers -productVersion). node $($NODE --version), bun $($BUN --version), oha $($OHA --version | awk '{print $2}'), $(cat $OUT/native-versions.txt)."
     echo "Load: oha, $CONC connections, $DUR per route, keep-alive, on the same machine (the load generator competes for cores). \"server CPU\" = CPU seconds burned by the server process tree during the load; \"CPU/100k\" = that divided by requests, times 100 000: the energy proxy."; echo
     echo "| target | workers | route | req/s | p50 (ms) | p99 (ms) | server CPU (s) | CPU s / 100k req | RSS (MB, all processes) |"
     echo "|---|---:|---|---:|---:|---:|---:|---:|---:|"
@@ -105,6 +108,10 @@ WORKERS=1 run_target node 1 /ping "$NODE" bench/http/threads/server.node.cluster
 WORKERS=4 run_target node-cluster 4 /ping "$NODE" bench/http/threads/server.node.cluster.ts
 run_target bun 1 /ping "$BUN" bench/http/threads/server.bun.reuseport.ts
 bun4() { "$BUN" bench/http/threads/server.bun.reuseport.ts & "$BUN" bench/http/threads/server.bun.reuseport.ts & "$BUN" bench/http/threads/server.bun.reuseport.ts & exec "$BUN" bench/http/threads/server.bun.reuseport.ts; }
+for n in 1 2 4 8; do
+    [ -x "$OUT/rust-hello" ] && WORKERS=$n run_target rust $n /ping "$OUT/rust-hello"
+    [ -x "$OUT/go-hello" ] && GOMAXPROCS=$n run_target go $n /ping "$OUT/go-hello"
+done
 run_target bun-reuseport 4 /ping sh -c 'exec "$0" "$@"' sh -c "$BUN bench/http/threads/server.bun.reuseport.ts & $BUN bench/http/threads/server.bun.reuseport.ts & $BUN bench/http/threads/server.bun.reuseport.ts & exec $BUN bench/http/threads/server.bun.reuseport.ts"
 
 {
@@ -131,7 +138,12 @@ print('%.0f %.3f %.3f %.2f %.3f' % (s['requestsPerSec'], p['p50']*1000, p['p99']
     printf "   list %8s req/s  p50 %6s  p99 %6s  cpu %5ss  cpu/100k %s\n" "$1" "$2" "$3" "$4" "$5"
     kill $pid 2>/dev/null; wait $pid 2>/dev/null
 }
-run_todo xisto 1 "$OUT/todo-xisto"
+XISTO_WORKERS=1 XISTO_LOCK=0 run_todo xisto 1 "$OUT/todo-xisto"
 XISTO_WORKERS=4 XISTO_LOCK=1 run_todo xisto-lock 4 "$OUT/todo-xisto"
 XISTO_WORKERS=4 XISTO_LOCK=0 run_todo xisto-nolock-reads 4 "$OUT/todo-xisto"
+# Rust and Go guard the list with a reader-writer lock (RwLock / sync.RWMutex): reads run in parallel
+for n in 1 4; do
+    [ -x "$OUT/rust-todo" ] && WORKERS=$n run_todo rust $n "$OUT/rust-todo"
+    [ -x "$OUT/go-todo" ] && GOMAXPROCS=$n run_todo go $n "$OUT/go-todo"
+done
 echo; echo "results: $csv"; echo "         $md"
