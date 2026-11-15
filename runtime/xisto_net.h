@@ -717,9 +717,16 @@ static void xs_coro_yield(void) {
    kevent only until the nearest deadline, and disarming just forgets it (an entry whose waiter was re-armed
    or disarmed is skipped when it comes up). With 10k sleeping tasks this took 2 syscalls per sleep away, and
    macOS stopped coalescing (delaying) thousands of kernel timers. */
-typedef struct { uint64_t at; xs_waiter *w; uint32_t gen; } xs_tmr;
+/* seq: the order of arming. Timers with the same deadline (the clock's resolution is a microsecond on macOS, and
+   timers armed together often share one) fire in the order they were armed, as Node's (XB-183). It fits in the
+   entry's padding (24 bytes either way); the push needs no tie-break, since the newest entry has the largest seq */
+typedef struct { uint64_t at; xs_waiter *w; uint32_t gen, seq; } xs_tmr;
 static XS_TLS xs_tmr *xs_tmrs;
 static XS_TLS size_t xs_ntmr, xs_tmrcap;
+static XS_TLS uint32_t xs_tmr_seq;
+static inline bool xs_tmr_before(const xs_tmr *a, const xs_tmr *b) {
+    return a->at < b->at || (a->at == b->at && (int32_t)(a->seq - b->seq) < 0); /* (wraps: compared as a difference) */
+}
 static void xs_tmr_push(xs_tmr t) {
     if (xs_ntmr == xs_tmrcap) { xs_tmrcap = xs_tmrcap ? xs_tmrcap * 2 : 64; xs_tmrs = realloc(xs_tmrs, sizeof(xs_tmr) * xs_tmrcap); }
     size_t i = xs_ntmr++;
@@ -732,8 +739,8 @@ static xs_tmr xs_tmr_pop(void) {
     for (;;) {
         size_t c = 2 * i + 1;
         if (c >= xs_ntmr) break;
-        if (c + 1 < xs_ntmr && xs_tmrs[c + 1].at < xs_tmrs[c].at) c++;
-        if (xs_tmrs[c].at >= last.at) break;
+        if (c + 1 < xs_ntmr && xs_tmr_before(&xs_tmrs[c + 1], &xs_tmrs[c])) c++;
+        if (!xs_tmr_before(&xs_tmrs[c], &last)) break;
         xs_tmrs[i] = xs_tmrs[c];
         i = c;
     }
@@ -745,7 +752,7 @@ static void xs_timer_arm(xs_waiter *w, int64_t ms) {
     w->fired = false;
     w->armed_batch = xs_batch;
     w->tgen++;
-    xs_tmr_push((xs_tmr){xs_now() + (uint64_t)(ms < 0 ? 0 : ms) * 1000000ull, w, w->tgen});
+    xs_tmr_push((xs_tmr){xs_now() + (uint64_t)(ms < 0 ? 0 : ms) * 1000000ull, w, w->tgen, xs_tmr_seq++});
 }
 static void xs_timer_disarm(xs_waiter *w) { w->armed = false; }
 /* how long the loop may sleep in kevent: until the nearest live timer (false: no timer) */
