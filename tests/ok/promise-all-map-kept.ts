@@ -1,7 +1,7 @@
 // XB-171: Promise.all(xs.map(f)) kept as a promise (.then on it, a const, an element of Promise.race): the map runs at
 // once, each f(x) a task, and the promise settles with the values in order (or the first rejection)
 async function double(x: number): Promise<number> {
-  await new Promise<void>((r) => { setTimeout(r, 3 - x); });
+  await new Promise<void>((r) => { setTimeout(r, (3 - x) * 25); }); // (25 ms apart: the order holds on a loaded machine)
   console.log("double", x);
   return x * 2;
 }
@@ -14,7 +14,7 @@ const xs: number[] = [1, 2, 3];
 Promise.all(xs.map(double)).then((vs) => console.log("then", vs.join(",")));
 console.log("after then");
 async function main(): Promise<void> {
-  await new Promise<void>((r) => { setTimeout(r, 10); });
+  await new Promise<void>((r) => { setTimeout(r, 100); });
   const k = 10;
   const local: number[] = [4, 5];
   const kept = Promise.all(local.map(async (x) => (await double(x - 3)) + k));
