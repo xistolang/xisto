@@ -14,6 +14,9 @@ check http_template ""          "xisto: tls not linked"
 check https_literal "--tls=bearssl" "xisto: tls BearSSL"
 check dynamic       "--tls=bearssl" "xisto: tls BearSSL"
 check listen_cert   "--tls=bearssl" "xisto: tls BearSSL"
+check dead_impl     "--tls=bearssl" "xisto: tls not linked"   # (XB-232: a fetch in code that cannot run)
+check live_impl     "--tls=bearssl" "xisto: tls BearSSL"
+check sub_impl      "--tls=bearssl" "xisto: tls BearSSL"
 if [ -f build/awslc/lib/libssl.a ] || [ -n "${XISTO_AWSLC:-}" ]; then
     check https_literal "" "xisto: tls AWS-LC"
     check dynamic       "" "xisto: tls AWS-LC"
