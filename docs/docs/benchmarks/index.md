@@ -11,7 +11,7 @@ How they were measured is in [Methodology](../performance/methodology.md).
 ## Read this first
 
 - The Benchmarks Game against Rust was re-run on 13 Nov 2026 (main `4a2f388`), against Node and Bun the same day
-  (main `e5fb066`), PolyBench against Rust and Go on 14 Nov (main `40cdc16`), TechEmpower on 14 Nov. The other tables are from 5–10 Nov.
+  (main `e5fb066`), PolyBench against Rust and Go on 14 Nov (main `40cdc16`), TechEmpower and NestJS on 15 Nov (main `f766bf8`). The other tables are from 5–10 Nov.
 - Some rows are lost or tied, and they are shown, not dropped: Bun on a slow dependency at 1 and 5 ms (4–5%), energy
   per HTTP request, streaming energy and SQLite time; Bun on Conduit's two cached routes and Node on its cached article
   by slug; actix-web on tail latency (p99) at high concurrency. The HTTP tables were re-measured on 14 Nov.
@@ -48,29 +48,30 @@ The per-kernel tables, with the C reference beside them, are on [PolyBench](./po
 
 ## TechEmpower (json, plaintext)
 
-14 Nov 2026, main `3f24503`, the TFB's rules: servers on the Xeon, wrk on the Graviton2 over the private network,
+15 Nov 2026, main `f766bf8`, the TFB's rules: servers on the Xeon, wrk on the Graviton2 over the private network,
 15 s per level, median of 3. Best requests per second:
 
 | server | json | plaintext | json peak RSS |
 |---|---:|---:|---:|
-| Xisto (native) | **71,544** | **662,156** | 5.5 MB |
-| actix-web (Rust) | 65,891 | 570,564 | 14.1 MB |
-| Bun | 54,497 | 114,146 | 90.8 MB |
-| Go net/http | 32,636 | 44,657 | 30.8 MB |
-| Node http | 29,317 | 51,066 | 289.4 MB |
-| fastify | 25,672 | 36,387 | 303.7 MB |
+| Xisto (native) | **71,666** | **649,581** | 5.5 MB |
+| actix-web (Rust) | 64,161 | 569,047 | 14.4 MB |
+| Bun | 54,474 | 113,242 | 88.4 MB |
+| Go net/http | 33,141 | 44,637 | 30.7 MB |
+| Node http | 29,258 | 51,714 | 290.3 MB |
+| fastify | 23,017 | 36,534 | 301.6 MB |
 
 Xisto's native server is first on both tests, ahead of actix-web. At high concurrency Xisto's tail latency (p99) is
-still worse than actix-web's. The per-level tables and charts are on [TechEmpower](./techempower/index.md).
+still worse than actix-web's, with a lower median. The per-level tables, charts and the latency distribution are on
+[TechEmpower](./techempower/index.md).
 
 ## NestJS
 
-The same Nest app, unchanged, built with Xisto or run on Node and Bun. On the TechEmpower routes (Xeon VM, 14 Nov)
-the app built with Xisto serves 53,032 json requests per second in two processes with 16.2 MB; Node and Bun on that
-app come with the next VM round. On Conduit, the RealWorld app with Postgres and Redis (M4, 15 Nov), Xisto starts in
-26 ms against Bun's 214 and Node's 264, holds 11.6 MB after the load against 130.8 and 154.4 MB, and answers the most
-requests on five of seven routes; on the two served from the Redis cache Bun is first. The charts and tables are on
-[NestJS](./nest/index.md).
+The same Nest app, unchanged, built with Xisto or run on Node and Bun. On the TechEmpower routes (Xeon VM, 15 Nov)
+the app built with Xisto serves 54,049 json requests per second in two processes with 16.2 MB, against Bun's 27,306
+with 233 MB and Node's 7,027 with 354 MB. On Conduit, the RealWorld app with Postgres and Redis (M4, 15 Nov), Xisto
+starts in 26 ms against Bun's 214 and Node's 264, holds 11.6 MB after the load against 130.8 and 154.4 MB, and
+answers the most requests on five of seven routes; on the two served from the Redis cache Bun is first. The charts
+and tables are on [NestJS](./nest/index.md).
 
 ## Benchmarks Game against Node and Bun
 

@@ -1,0 +1,17 @@
+json      http://127.0.0.1:9104 PASS
+# 2026-11-15T13:08:57 gen=wrk levels=16,32,64,128,256,512 duration=15s repeat=3 xisto_workers=2 cpus=2
+# test side name req/s p50_ms p99_ms cpu_ms_per_1k_req rss_MB valid
+json-c16 ref nest-node 6986 1.990 9.550 282.1 343.5 ok
+json-c32 ref nest-node 6974 4.010 14.310 283.5 343.5 ok
+json-c64 ref nest-node 7027 7.880 23.150 281.7 344.0 ok
+json-c128 ref nest-node 7021 16.880 75.890 282.1 346.3 ok
+json-c256 ref nest-node 6775 34.890 1270.000 292.5 349.3 ok
+json-c512 ref nest-node 6712 67.350 4980.000 295.8 354.4 ok
+json      http://127.0.0.1:9105 PASS
+json-c16 ref nest-bun 21171 0.677 2.610 79.2 193.7 ok
+json-c32 ref nest-bun 26149 1.020 3.850 74.6 180.4 ok
+json-c64 ref nest-bun 26807 1.970 7.630 73.2 186.3 ok
+json-c128 ref nest-bun 27306 4.380 12.980 72.1 196.8 ok
+json-c256 ref nest-bun 27013 8.110 23.040 72.9 215.4 ok
+json-c512 ref nest-bun 26174 16.130 35.260 75.4 233.3 ok
+# saved bench/results/techempower-2026-11-15-f766bf8/json-nest.txt

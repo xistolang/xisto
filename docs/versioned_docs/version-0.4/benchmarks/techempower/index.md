@@ -7,7 +7,7 @@ import {BestBars, LevelLines, CostBars} from '@site/src/components/Charts/TechEm
 
 # TechEmpower: HTTP servers
 
-14 Nov 2026, main `3f24503`. The [TechEmpower Framework Benchmarks](https://www.techempower.com/benchmarks/) (TFB)
+15 Nov 2026, main `f766bf8`. The [TechEmpower Framework Benchmarks](https://www.techempower.com/benchmarks/) (TFB)
 measure web frameworks on fixed tests; this page runs its two tests without a database, **json** and **plaintext**,
 with the TFB's rules, on the two AWS VMs. The database tests come next.
 
@@ -32,7 +32,7 @@ on [NestJS](../nest/index.md).
 - **CPU** is the server's user + system time per 1,000 requests at the best level; **peak RSS** the largest of all
   its processes over every level.
 - Source: `bench/techempower/` (apps, `run.py`, `validate.py`, `chartdata.py` for the charts), raw results in
-  [bench/results/techempower-2026-11-14-3f24503](https://github.com/xistolang/xisto/tree/main/bench/results/techempower-2026-11-14-3f24503).
+  [bench/results/techempower-2026-11-15-f766bf8](https://github.com/xistolang/xisto/tree/main/bench/results/techempower-2026-11-15-f766bf8), with every wrk run's own output in `raw/`.
 
 ## Results
 
@@ -52,23 +52,23 @@ on [NestJS](../nest/index.md).
 
 | server | best req/s | connections there | p99 there | CPU ms per 1k requests | peak RSS (all levels) |
 |---|---:|---:|---:|---:|---:|
-| Xisto (native `Server`) | **71,544** | 128 | 31.5 ms | 26.1 | 5.5 MB |
-| actix-web (Rust) | 65,891 | 256 | 45.6 ms | 28.1 | 14.1 MB |
-| Bun | 54,497 | 256 | 22.0 ms | 35.8 | 90.8 MB |
-| Go net/http | 32,636 | 64 | 6.1 ms | 58.8 | 30.8 MB |
-| Node http | 29,317 | 64 | 6.3 ms | 67.1 | 289.4 MB |
-| fastify (Node) | 25,672 | 128 | 12.9 ms | 76.7 | 303.7 MB |
+| Xisto (native `Server`) | **71,666** | 256 | 66.9 ms | 25.4 | 5.5 MB |
+| actix-web (Rust) | 64,161 | 128 | 20.0 ms | 29.9 | 14.4 MB |
+| Bun | 54,474 | 128 | 13.7 ms | 35.8 | 88.4 MB |
+| Go net/http | 33,141 | 64 | 5.5 ms | 58.1 | 30.7 MB |
+| Node http | 29,258 | 64 | 6.9 ms | 67.0 | 290.3 MB |
+| fastify (Node) | 23,017 | 128 | 14.0 ms | 85.6 | 301.6 MB |
 
 Requests per second at each concurrency level (connections):
 
 | server | 16 | 32 | 64 | 128 | 256 | 512 |
 |---|---:|---:|---:|---:|---:|---:|
-| Xisto (native `Server`) | 29,680 | 50,193 | 65,676 | 71,544 | 71,383 | 70,573 |
-| actix-web (Rust) | 29,050 | 49,526 | 60,875 | 64,773 | 65,891 | 64,270 |
-| Bun | 28,016 | 43,747 | 52,600 | 54,024 | 54,497 | 53,664 |
-| Go net/http | 24,057 | 32,629 | 32,636 | 32,498 | 32,038 | 31,509 |
-| Node http | 22,580 | 28,560 | 29,317 | 29,210 | 28,643 | 27,466 |
-| fastify (Node) | 19,562 | 24,263 | 25,357 | 25,672 | 25,174 | 21,719 |
+| Xisto (native `Server`) | 29,615 | 51,415 | 66,449 | 69,712 | 71,666 | 71,553 |
+| actix-web (Rust) | 29,207 | 48,964 | 59,571 | 64,161 | 64,109 | 62,197 |
+| Bun | 28,175 | 43,166 | 52,899 | 54,474 | 54,147 | 53,963 |
+| Go net/http | 24,256 | 32,397 | 33,141 | 32,171 | 32,225 | 31,517 |
+| Node http | 22,678 | 28,942 | 29,258 | 29,043 | 28,892 | 27,738 |
+| fastify (Node) | 20,061 | 22,241 | 21,420 | 23,017 | 22,628 | 21,756 |
 
 ### plaintext
 
@@ -86,35 +86,44 @@ Requests per second at each concurrency level (connections):
 
 | server | best req/s | connections there | p99 there | CPU ms per 1k requests | peak RSS (all levels) |
 |---|---:|---:|---:|---:|---:|
-| Xisto (native `Server`) | **662,156** | 256 | — | 3.0 | 42.2 MB |
-| actix-web (Rust) | 570,564 | 256 | — | 3.5 | 562.7 MB |
-| Bun | 114,146 | 4,096 | 1550.0 ms | 17.3 | 96.9 MB |
-| Node http | 51,066 | 4,096 | 961.5 ms | 40.0 | 607.1 MB |
-| Go net/http | 44,657 | 1,024 | 451.0 ms | 44.4 | 540.6 MB |
-| fastify (Node) | 36,387 | 4,096 | 1080.0 ms | 57.0 | 843.5 MB |
+| Xisto (native `Server`) | **649,581** | 256 | 203.8 ms | 3.0 | 42.4 MB |
+| actix-web (Rust) | 569,047 | 256 | 116.3 ms | 3.5 | 573.6 MB |
+| Bun | 113,242 | 4,096 | 1.46 s | 17.4 | 95.6 MB |
+| Node http | 51,714 | 4,096 | 1.03 s | 39.3 | 826.6 MB |
+| Go net/http | 44,637 | 4,096 | 1.57 s | 44.5 | 567.1 MB |
+| fastify (Node) | 36,534 | 4,096 | 1.03 s | 57.1 | 848.2 MB |
 
 Requests per second at each concurrency level (connections; HTTP pipelining 16 deep):
 
 | server | 256 | 1,024 | 4,096 | 16,384 |
 |---|---:|---:|---:|---:|
-| Xisto (native `Server`) | 662,156 | 598,816 | 572,353 | 392,360 |
-| actix-web (Rust) | 570,564 | 523,963 | 476,486 | 324,000 |
-| Bun | 113,941 | 113,461 | 114,146 | 86,961 |
-| Go net/http | 41,237 | 44,657 | 44,631 | 33,274 |
-| Node http | 50,118 | 50,556 | 51,066 | 35,627 |
-| fastify (Node) | 33,828 | 35,410 | 36,387 | 24,318 |
+| Xisto (native `Server`) | 649,581 | 596,731 | 552,728 | 411,863 |
+| actix-web (Rust) | 569,047 | 522,104 | 473,669 | 328,127 |
+| Bun | 111,901 | 110,828 | 113,242 | 86,769 |
+| Node http | 51,086 | 50,687 | 51,714 | 35,409 |
+| Go net/http | 41,014 | 44,095 | 44,637 | 33,867 |
+| fastify (Node) | 34,576 | 35,116 | 36,534 | 24,701 |
 
 ## What this says
 
-- **Xisto's native server is first on both tests**: 71,544 json requests per second against actix-web's 65,891
-  (+9%), and 662,156 plaintext against 570,564 (+16%), with less CPU per request and the least memory of all on
-  json (5.5 MB against 14.1 MB).
-- **At 16,384 connections** every server loses throughput (Xisto's native 41%, actix-web 43%), and Xisto still
-  answers the most requests (392,360 against 324,000). Its **tail latency is worse** than actix-web's at high
-  concurrency, though: p99 1.5 s against 0.43 s at 4,096 connections and 3.4 s against 2.3 s at 16,384, with a
-  lower median (68 ms against 74 ms, 277 ms against 338 ms). Under investigation: how the event loop shares its
-  turns between connections that have many pipelined requests waiting.
-- p99 values marked — were not read from wrk's output for that run.
+- **Xisto's native server is first on both tests**: 71,666 json requests per second against actix-web's 64,161
+  (+12%), and 649,581 plaintext against 569,047 (+14%), with less CPU per request than any other server and the
+  least memory of all (5.5 MB against 14.4 MB on json, 42.4 against 573.6 MB on plaintext).
+- **At 16,384 connections** every server loses throughput, and Xisto still answers the most requests (411,863
+  against 328,127). Its **tail latency is worse** than actix-web's at high concurrency, though, with a lower median:
+
+  | plaintext | Xisto p50 | actix p50 | Xisto p90 | actix p90 | Xisto p99 | actix p99 |
+  |---|---:|---:|---:|---:|---:|---:|
+  | 4,096 connections | 64–70 ms | 74–79 ms | 262–348 ms | 203–222 ms | 0.59–0.92 s | 0.29 s |
+  | 16,384 connections | 265–289 ms | 337–347 ms | 1.36–1.54 s | 1.04–1.16 s | 1.9–5.1 s | 1.5–3.4 s |
+
+  The ranges are the three runs of each level, read from wrk's own output (`raw/`). At 16,384 connections the p99
+  moves by seconds from run to run on both servers: it is set by the requests that hit wrk's 8 s timeout (Xisto 386,
+  0 and 344 per run; actix-web 196, 0 and 162). The likely cause on Xisto's side is how a worker accepts new
+  connections while thousands are busy; a fix is being measured.
+- **p99 values marked —**: wrk 4.2 prints some percentiles as `0.00us` under pipelining (its correction for
+  coordinated omission can add samples below the lowest one it recorded, and its percentile walk starts there). Those
+  runs have no p99; a row's p99 is the median of the runs that have one, and — when none has.
 
 ## What changed since the first round
 

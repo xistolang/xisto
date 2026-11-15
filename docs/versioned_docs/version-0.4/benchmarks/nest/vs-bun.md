@@ -4,7 +4,7 @@ sidebar_position: 2
 ---
 
 import {BarChart} from '@site/src/components/Charts';
-import {BestBars, LevelLines, CostBars, RatioBars, VsTable, VsHeadline, Pending} from '@site/src/components/Charts/TechEmpower';
+import {BestBars, LevelLines, CostBars, RatioBars, VsTable, VsHeadline} from '@site/src/components/Charts/TechEmpower';
 
 # NestJS: Xisto vs Bun
 
@@ -119,17 +119,9 @@ Single-request latency, cold (cache flushed) / warm, in ms:
 | tags | 1.44 / 0.50 | 1.09 / 0.50 |
 | login | 21.83 / 22.75 | 29.60 / 28.53 |
 
-<Pending id="nest-bun">
-
-**NestJS on Bun is measured in the next round on the VMs.** The build is ready (`bench/techempower/nest-node`, run
-as `nest-bun` by `bench/techempower/run.py`) and passes the TechEmpower validator; the charts and tables of this section
-fill in from the data. Until then they show Xisto alone.
-
-</Pending>
-
 ## The TFB app: json
 
-14 Nov 2026 round: the server on the Xeon E5-2686 v4 (2 vCPUs), wrk 4.2.0 on the Graviton2, the TFB's levels and
+15 Nov 2026 round (main `f766bf8`): the server on the Xeon E5-2686 v4 (2 vCPUs), wrk 4.2.0 on the Graviton2, the TFB's levels and
 rules, 15 s per level, the median of 3 runs.
 
 <BestBars test="json" only={['xisto-nest-procs', 'xisto-nest', 'nest-bun']} />

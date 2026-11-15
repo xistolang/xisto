@@ -4,7 +4,7 @@ sidebar_position: 1
 ---
 
 import {BarChart} from '@site/src/components/Charts';
-import {BestBars, LevelLines, CostBars, RatioBars, VsTable, VsHeadline, Pending} from '@site/src/components/Charts/TechEmpower';
+import {BestBars, LevelLines, CostBars, RatioBars, VsTable, VsHeadline} from '@site/src/components/Charts/TechEmpower';
 
 # NestJS: Xisto vs Node
 
@@ -120,17 +120,9 @@ Single-request latency, cold (cache flushed) / warm, in ms:
 | tags | 1.44 / 0.50 | 1.17 / 0.52 |
 | login | 21.83 / 22.75 | 30.87 / 29.82 |
 
-<Pending id="nest-node">
-
-**NestJS on Node is measured in the next round on the VMs.** The build is ready (`bench/techempower/nest-node`, run
-as `nest-node` by `bench/techempower/run.py`) and passes the TechEmpower validator; the charts and tables of this section
-fill in from the data. Until then they show Xisto alone.
-
-</Pending>
-
 ## The TFB app: json
 
-14 Nov 2026 round: the server on the Xeon E5-2686 v4 (2 vCPUs), wrk 4.2.0 on the Graviton2, the TFB's levels and
+15 Nov 2026 round (main `f766bf8`): the server on the Xeon E5-2686 v4 (2 vCPUs), wrk 4.2.0 on the Graviton2, the TFB's levels and
 rules, 15 s per level, the median of 3 runs.
 
 <BestBars test="json" only={['xisto-nest-procs', 'xisto-nest', 'nest-node']} />
@@ -164,6 +156,10 @@ rules, 15 s per level, the median of 3 runs.
 ### plaintext in numbers
 
 <VsTable test="plaintext" ids={['xisto-nest-procs', 'xisto-nest', 'nest-node']} />
+
+At 16,384 connections Node answered the first of the three runs (7,944 requests per second, 2,053 requests past
+wrk's 8 s timeout, 2.3 GB) and none in the next two, still working through the first run's queue: that level has no
+Node value.
 
 ## See also
 

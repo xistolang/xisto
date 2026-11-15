@@ -4,7 +4,7 @@ sidebar_position: 5
 ---
 
 import {BarChart} from '@site/src/components/Charts';
-import {BestBars, LevelLines, CostBars, VsTable, Pending} from '@site/src/components/Charts/TechEmpower';
+import {BestBars, LevelLines, CostBars, VsTable} from '@site/src/components/Charts/TechEmpower';
 
 # NestJS on Xisto, Node and Bun
 
@@ -21,17 +21,9 @@ Two apps:
   the TechEmpower rules on the AWS VMs.
 - **Conduit**: the public RealWorld app, with guards, JWT, argon2, Postgres and Redis, on an Apple M4.
 
-<Pending id="nest-node">
-
-**Node and Bun on the TFB app come with the next VM round.** Their builds are ready (`bench/techempower/nest-node`:
-the same `main.ts` compiled with `tsc`, one process per CPU with `node:cluster`, as the TFB's own Nest app runs) and
-pass the TechEmpower validator; the charts below fill in from the data when they are measured.
-
-</Pending>
-
 ## The TFB app: json and plaintext
 
-14 Nov 2026, main `3f24503`, the same round and setup as the [TechEmpower page](../techempower/index.md): the server on
+15 Nov 2026, main `f766bf8`, the same round and setup as the [TechEmpower page](../techempower/index.md): the server on
 the Xeon E5-2686 v4 (2 vCPUs), wrk 4.2.0 on the Graviton2 over the private network, the TFB's levels and rules, 15 s
 per level, the median of 3 runs. The app is built with Xisto and run in three modes:
 
@@ -75,12 +67,16 @@ On Node and Bun the app runs as the TFB's own NestJS app does: compiled with `ts
 
 ### What this says
 
-- **In two processes** the app built with Xisto serves 53,032 json requests per second with 16.2 MB of memory, and
-  239,187 plaintext requests (HTTP pipelining 16 deep). With the lock, in one process: 44,216 and 116,817, with
-  10.7 MB on json.
-- **For scale until Nest on Node is measured**: on the same VM Node's bare `http` module, which Nest on Node runs on
-  through Express, serves 29,317 json and 51,066 plaintext requests per second with 289 MB
-  ([vs Node](../techempower/vs-node.md)).
+- **In two processes** the app built with Xisto serves 54,049 json requests per second with 16.2 MB of memory:
+  2.0× Bun's 27,306 (233 MB) and 7.7× Node's 7,027 (354 MB), with half of Bun's CPU per request and an eighth of
+  Node's (36.1 ms per 1,000 requests against 72.1 and 281.7).
+- **On plaintext** (HTTP pipelining 16 deep) the gap grows: 239,831 requests per second against Bun's 29,629 (8.1×)
+  and Node's 11,092 (21.6×), with 74 MB at the peak against 1.5 GB and 2.3 GB.
+- **At 16,384 connections** Node answered the first of the three runs (7,944 requests per second, 2,053 requests
+  past wrk's 8 s timeout) and none in the next two: it was still working through the first run's queue. That level
+  has no Node row.
+- **With the lock, in one process**: 44,170 json and 115,557 plaintext requests per second, with 10.7 MB on json.
+  Still ahead of Bun's cluster on both.
 - **Without the lock the workers crash** under load: Nest's singletons are shared by the workers and touched without
   synchronization. The lock is the default for that reason, and the multi-process mode is the one that scales.
 

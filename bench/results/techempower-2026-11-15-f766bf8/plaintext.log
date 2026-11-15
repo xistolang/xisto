@@ -1,0 +1,60 @@
+plaintext http://127.0.0.1:9100 PASS
+# 2026-11-15T12:27:32 gen=wrk levels=256,1024,4096,16384 duration=15s repeat=3 xisto_workers=2 cpus=2
+# test side name req/s p50_ms p99_ms cpu_ms_per_1k_req rss_MB valid
+plaintext-c256 xisto xisto-native 649581 3.790 0.000 3.0 42.4 ok
+plaintext-c1024 xisto xisto-native 596731 15.160 191.390 3.3 42.3 ok
+plaintext-c4096 xisto xisto-native 552728 66.060 585.380 3.5 42.3 ok
+plaintext-c16384 xisto xisto-native 411863 280.080 4110.000 3.8 42.3 ok
+plaintext http://127.0.0.1:9101 PASS
+plaintext-c256 xisto xisto-nest 115557 20.080 0.000 11.9 67.7 ok
+plaintext-c1024 xisto xisto-nest 112929 78.500 192.050 12.1 67.6 ok
+plaintext-c4096 xisto xisto-nest 109779 317.640 1380.000 12.5 67.6 ok
+plaintext-c16384 xisto xisto-nest 84875 1260.000 3300.000 13.8 74.9 ok
+plaintext http://127.0.0.1:9102 PASS
+# xisto-nest-nolock: the load failed at plaintext-c256 ('NoneType' object has no attribute 'group')
+xisto crashed xisto-nest-nolock during the load (exit 70): see bench/out/te-xisto-nest-nolock.log
+plaintext http://127.0.0.1:9103 PASS
+plaintext-c256 xisto xisto-nest-procs 239831 9.650 26.580 8.5 73.0 ok
+plaintext-c1024 xisto xisto-nest-procs 224576 39.310 86.040 8.8 72.9 ok
+plaintext-c4096 xisto xisto-nest-procs 208115 169.200 401.550 9.6 72.9 ok
+plaintext-c16384 xisto xisto-nest-procs 159455 670.900 2880.000 10.1 73.8 ok
+plaintext http://127.0.0.1:9110 PASS
+plaintext-c256 ref actix 569047 4.070 21.750 3.5 321.4 ok
+plaintext-c1024 ref actix 522104 17.190 153.350 3.7 325.8 ok
+plaintext-c4096 ref actix 473669 76.960 0.000 4.1 344.1 ok
+plaintext-c16384 ref actix 328127 345.650 3030.000 4.9 573.6 ok
+plaintext http://127.0.0.1:9111 PASS
+plaintext-c256 ref go-std 41014 55.570 173.030 48.2 61.9 ok
+plaintext-c1024 ref go-std 44095 207.030 455.580 44.9 84.3 ok
+plaintext-c4096 ref go-std 44637 777.900 1570.000 44.5 176.7 ok
+plaintext-c16384 ref go-std 33867 2930.000 6570.000 62.0 567.1 ok
+plaintext http://127.0.0.1:9112 PASS
+plaintext-c256 ref nodejs 51086 45.030 3560.000 38.7 813.4 ok
+plaintext-c1024 ref nodejs 50687 113.840 3920.000 39.7 826.6 ok
+plaintext-c4096 ref nodejs 51714 237.970 1030.000 39.3 590.4 ok
+plaintext-c16384 ref nodejs 35409 2150.000 6680.000 63.0 822.8 ok
+plaintext http://127.0.0.1:9113 PASS
+plaintext-c256 ref fastify 34576 67.820 5760.000 57.5 809.0 ok
+plaintext-c1024 ref fastify 35116 152.200 3530.000 57.3 833.0 ok
+plaintext-c4096 ref fastify 36534 375.910 1030.000 57.1 833.6 ok
+plaintext-c16384 ref fastify 24701 2450.000 7130.000 96.6 848.2 ok
+plaintext http://127.0.0.1:9114 PASS
+plaintext-c256 ref bun 111901 21.230 0.000 17.6 90.4 ok
+plaintext-c1024 ref bun 110828 79.730 354.160 17.7 90.4 ok
+plaintext-c4096 ref bun 113242 310.420 1460.000 17.4 91.7 ok
+plaintext-c16384 ref bun 86769 1190.000 5970.000 20.0 95.6 ok
+plaintext http://127.0.0.1:9115 PASS
+Traceback (most recent call last):
+  File "/home/ubuntu/te-main/bench/techempower/run.py", line 296, in <module>
+    main()
+    ~~~~^^
+  File "/home/ubuntu/te-main/bench/techempower/run.py", line 288, in main
+    rows += measure(a, name, all_s[name], tests, levels)
+            ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/te-main/bench/techempower/run.py", line 200, in measure
+    load(a, t, url, max(levels), a.warmup)  # warmup
+    ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/te-main/bench/techempower/run.py", line 166, in load
+    rps = float(re.search(r'Requests/sec:\s+([\d.]+)', o).group(1))
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute 'group'

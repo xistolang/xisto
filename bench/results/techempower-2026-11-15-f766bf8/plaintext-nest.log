@@ -1,0 +1,13 @@
+plaintext http://127.0.0.1:9104 PASS
+# 2026-11-15T13:20:55 gen=wrk levels=256,1024,4096,16384 duration=15s repeat=3 xisto_workers=2 cpus=2
+# test side name req/s p50_ms p99_ms cpu_ms_per_1k_req rss_MB valid
+plaintext-c256 ref nest-node 8546 151.060 6120.000 284.4 2267.2 ok
+plaintext-c1024 ref nest-node 11092 454.100 1200.000 181.2 2268.7 ok
+plaintext-c4096 ref nest-node 9907 210.160 5400.000 244.3 2270.3 ok
+plaintext-c16384 ref nest-node 0 3910.000 7980.000 35820000.0 2286.7 ok
+plaintext http://127.0.0.1:9105 PASS
+plaintext-c256 ref nest-bun 28184 79.110 184.780 70.1 1143.7 ok
+plaintext-c1024 ref nest-bun 29629 297.280 1000.000 67.3 244.5 ok
+plaintext-c4096 ref nest-bun 29232 1170.000 2940.000 69.1 399.9 ok
+plaintext-c16384 ref nest-bun 19171 3100.000 7420.000 118.5 1480.4 ok
+# saved bench/results/techempower-2026-11-15-f766bf8/plaintext-nest.txt

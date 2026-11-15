@@ -1,0 +1,14 @@
+Running 15s test @ http://172.31.27.95:9101/plaintext
+  2 threads and 16384 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     1.37s   818.00ms   6.60s    66.10%
+    Req/Sec    56.14k    27.49k  115.39k    64.73%
+  Latency Distribution
+     50%    1.29s 
+     75%    1.88s 
+     90%    2.48s 
+     99%    3.72s 
+  1259008 requests in 15.11s, 186.11MB read
+  Socket errors: connect 0, read 0, write 0, timeout 42
+Requests/sec:  83338.71
+Transfer/sec:     12.32MB

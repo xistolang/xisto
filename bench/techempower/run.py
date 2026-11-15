@@ -80,9 +80,10 @@ def servers(a):
         'fastify': ('ref', 9113, R + '/fastify', ['node', 'app.js'], {'NODE_ENV': 'production'}, None),
         'bun': ('ref', 9114, R + '/bun/src', ['bun', 'spawn.ts'], {'NODE_ENV': 'production'}, None),
         # the same Nest app as xisto-nest, compiled with tsc (refs.sh nest-node), one process per CPU as the TFB's
-        # own Nest app runs: on Node with node:cluster, on Bun with its node:cluster
-        'nest-node': ('ref', 9115, R + '/nest-node', ['node', 'cluster.js'], {'NODE_ENV': 'production', 'PORT': '9115'}, None),
-        'nest-bun': ('ref', 9116, R + '/nest-node', ['bun', 'cluster.js'], {'NODE_ENV': 'production', 'PORT': '9116'}, None),
+        # own Nest app runs: on Node with node:cluster, on Bun with its node:cluster. Ports 9104/9105: the VMs'
+        # security group lets the generator reach 9100-9114 only.
+        'nest-node': ('ref', 9104, R + '/nest-node', ['node', 'cluster.js'], {'NODE_ENV': 'production', 'PORT': '9104'}, None),
+        'nest-bun': ('ref', 9105, R + '/nest-node', ['bun', 'cluster.js'], {'NODE_ENV': 'production', 'PORT': '9105'}, None),
     }
 
 
@@ -167,7 +168,10 @@ def load(a, test, url, c, dur, raw=None):
     n = int(re.search(r'(\d+) requests in', o).group(1))
     lat = dict((m.group(1), unit_ms(m.group(2), m.group(3)))
                for m in re.finditer(r'^\s+(50|99)%\s+([\d.]+)(us|ms|s|m)\s*$', o, re.M))
-    return rps, lat.get('50', 0.0), lat.get('99', 0.0), n
+    # wrk 4.2 sometimes prints a percentile as 0.00us (its coordinated-omission correction adds samples below the
+    # recorded minimum, and the percentile walk starts at that minimum and never reaches the rank): a missing value,
+    # not a zero; the row's median takes the runs that have it.
+    return rps, lat.get('50') or None, lat.get('99') or None, n
 
 
 def measure(a, name, spec, tests, levels):
@@ -197,7 +201,11 @@ def measure(a, name, spec, tests, levels):
             valid[t] = validate('http://127.0.0.1:%d' % port, (t,), out=sys.stderr)
         for t in tests:
             url = 'http://%s:%d%s' % (host, port, PATHS[t])
-            load(a, t, url, max(levels), a.warmup)  # warmup
+            try:
+                load(a, t, url, max(levels), a.warmup)  # warmup
+            except Exception as e:  # (the generator never read an answer: a port it cannot reach, a server down)
+                print('# %s: the warmup failed at %s-c%d (%s)' % (name, t, max(levels), e), file=sys.stderr)
+                return rows
             for c in levels:
                 runs = []
                 for run in range(a.repeat):
@@ -223,7 +231,7 @@ def measure(a, name, spec, tests, levels):
                     cpu1, _ = group_stats(p.pid)
                     runs.append((rps, p50, p99, (cpu1 - cpu0) * 1000 / max(n, 1) * 1000, peak[0] / 1048576))
                     time.sleep(1)
-                med = [statistics.median(r[i] for r in runs) for i in range(5)]
+                med = [statistics.median([r[i] for r in runs if r[i] is not None] or [0.0]) for i in range(5)]
                 line = '%s-c%d %s %s %.0f %.3f %.3f %.1f %.1f %s' % (
                     t, c, side, name, med[0], med[1], med[2], med[3], med[4], 'ok' if valid[t] else 'INVALID')
                 print(line, flush=True)
