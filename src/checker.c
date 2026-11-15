@@ -9806,6 +9806,16 @@ static void check_expr_in(Expr *e, Type *expected) {
                 prog->uses_net = true;
                 return;
             }
+            if (strcmp(name, "__xs_promises_handled") == 0 && e->args.len == 1 && cur_mod && cur_mod->file && !strcmp(cur_mod->file, "xisto:settled")) {
+                /* (xisto:settled: every promise of Promise.allSettled(ps) handled before its outcomes are read, XB-204) */
+                check_expr(e->args.items[0], NULL);
+                Type *at = ty_strip_null(e->args.items[0]->type);
+                if (at->kind != TY_ARRAY || at->elem->kind != TY_PROMISE) xs_error(XS7033, e->pos, NULL, "internal: __xs_promises_handled takes an array of promises");
+                e->type = ty_void;
+                e->builtin.cfn = "xs_promises_handled";
+                prog->uses_net = true;
+                return;
+            }
             if (strcmp(name, "clearImmediate") == 0) name = "clearTimeout";
             if (strcmp(name, "setTimeout") == 0 || strcmp(name, "setInterval") == 0) { /* Node's timers: a callback later, on the event loop */
                 if (e->args.len != 2) xs_error(XS8035, e->pos, xs_sprintf("%s(() => { ... }, ms)", name), "%s takes a callback and a delay in milliseconds", name);

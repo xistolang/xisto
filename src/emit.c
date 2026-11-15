@@ -2423,6 +2423,8 @@ static void emit_promise(Expr *e) {
                        id, id, ctype(t), id, ctype(t), sf, id, id, id);
             return;
         }
+        /* (XB-204: first all settled, or the first rejection, with every promise handled meanwhile; then the values) */
+        buf_printf(out, "xs_promise_await_v(xs_ar(xs_promise_all_arr(pa%d_))); ", id);
         if (k == 4) { buf_printf(out, "for (size_t i_ = 0; i_ < pa%d_->len; i_++) xs_promise_await_v(pa%d_->data[i_]); })", id, id); return; }
         Type *at = e->type;
         if (arr_is_ref(at))

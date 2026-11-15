@@ -1447,6 +1447,42 @@ XS_NOINLINE xs_promise *xs_promise_race_arr(xs_arr_ref *ps) {
     }
     return to;
 }
+/* Promise.all(ps) of an array kept (XB-204): a void promise that rejects as the first of them does (in the order
+   they settle, as Node's) and fulfills once all have; the values are then read in order. Every one is handled from
+   now on: a rejection while an earlier one is still pending is Promise.all's, not an uncaught one. The pending count
+   lives in the promise's value until it settles. */
+typedef struct { xs_closure c; xs_promise *to, *from; } xs_pall_cl;
+XS_NOINLINE void xs_pall_cb(void *c) {
+    xs_pall_cl *r = c;
+    if (r->to->state != 0) return;
+    if (r->from->state == 2) xs_promise_reject(r->to, xs_retain_(r->from->err));
+    else if (--r->to->val.i == 0) xs_promise_fulfill(r->to, (xs_val){0});
+}
+XS_NOINLINE xs_promise *xs_promise_all_arr(xs_arr_ref *ps) {
+    xs_promise *to = xs_promise_make(4);
+    for (size_t i = 0; i < ps->len; i++) if (ps->data[i]) to->val.i++;
+    if (to->val.i == 0) { to->state = 1; return to; }
+    for (size_t i = 0; i < ps->len; i++) {
+        xs_promise *q = ps->data[i];
+        if (!q) continue;
+        xs_pall_cl *cl = xs_obj_alloc(sizeof *cl, xs_prace_cl_free, xs_presolver_print);
+        cl->c.fn = (void *)xs_pall_cb;
+        cl->to = xs_retain_(to);
+        cl->from = xs_retain_(q);
+        xs_promise *d = xs_promise_then(q, 1, &cl->c, 4, NULL, 4, q->kind); /* (marks q handled) */
+        d->handled = true;
+        xs_release_(d);
+        xs_release_(cl);
+    }
+    return to;
+}
+/* Promise.allSettled(ps) of an array kept: every one handled now, before the outcomes are read in order */
+XS_NOINLINE void xs_promises_handled(xs_arr_ref *ps) {
+    for (size_t i = 0; i < ps->len; i++) {
+        xs_promise *q = ps->data[i];
+        if (q) { q->handled = true; xs_unh_drop(q); }
+    }
+}
 /* new Promise((resolve, reject) => ...): the two functions are closures that hold the promise */
 typedef struct { xs_closure c; xs_promise *p; } xs_presolver;
 static void xs_presolver_free(void *x) { xs_release_(((xs_presolver *)x)->p); xs_obj_free(x); }
