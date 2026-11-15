@@ -69,6 +69,7 @@ extern const unsigned char xs_runtime_tls_h[];
 extern const unsigned char xs_runtime_tls_awslc_h[];
 extern const unsigned char xs_runtime_crypto_h[];
 extern const unsigned char xs_runtime_zlib_h[];
+extern const unsigned char xs_runtime_prof_h[];
 extern const unsigned char xs_runtime_regex_h[];
 extern const unsigned char xs_runtime_regex_bt_h[];
 static void regex_with_bt(Buf *b);
@@ -76,7 +77,7 @@ extern const unsigned char xs_runtime_dbg_json_h[];
 extern const unsigned char xs_runtime_dbg_h[];
 /* the runtime split in two (tools/rtsplit.py): what a program includes, and the library compiled once */
 #define XS_RT_PAIR(n) extern const unsigned char xs_runtime_##n##_h_decl[], xs_runtime_##n##_h_impl[];
-XS_RT_PAIR(rt) XS_RT_PAIR(net) XS_RT_PAIR(sqlite) XS_RT_PAIR(tls) XS_RT_PAIR(tls_awslc) XS_RT_PAIR(crypto) XS_RT_PAIR(zlib) XS_RT_PAIR(regex)
+XS_RT_PAIR(rt) XS_RT_PAIR(net) XS_RT_PAIR(sqlite) XS_RT_PAIR(tls) XS_RT_PAIR(tls_awslc) XS_RT_PAIR(crypto) XS_RT_PAIR(zlib) XS_RT_PAIR(prof) XS_RT_PAIR(regex)
 static bool split_rt;     /* the runtime is a cached object, the program only includes its declarations */
 static Buf rt_src;        /* the runtime's translation unit for this program's configuration */
 int cmd_debug(int argc, char **argv); /* src/debug.c */
@@ -486,6 +487,7 @@ static Buf compile_to_c(const char *path) {
             if (p->uses_sqlite) { XS_RT_ADD(sqlite); link_sqlite = true; }
             if (p->uses_crypto) { XS_RT_ADD(crypto); link_crypto = true; }
             if (p->uses_zlib) { XS_RT_ADD(zlib); link_zlib = true; }
+            if (p->uses_profiler) XS_RT_ADD(prof);
             if (p->uses_regex) XS_RT_ADD(regex);
 #undef XS_RT_ADD
         } else {
@@ -496,6 +498,7 @@ static Buf compile_to_c(const char *path) {
             if (p->uses_sqlite) { buf_puts(&b, (const char *)xs_runtime_sqlite_h); link_sqlite = true; }
             if (p->uses_crypto) { buf_puts(&b, (const char *)xs_runtime_crypto_h); link_crypto = true; }
             if (p->uses_zlib) { buf_puts(&b, (const char *)xs_runtime_zlib_h); link_zlib = true; }
+            if (p->uses_profiler) buf_puts(&b, (const char *)xs_runtime_prof_h);
             if (p->uses_regex && p->uses_rebt) regex_with_bt(&b);
             else if (p->uses_regex) buf_puts(&b, (const char *)xs_runtime_regex_h);
         }

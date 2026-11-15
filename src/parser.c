@@ -6289,6 +6289,22 @@ static const char xs_v8_src[] =
     "export function serialize(value: unknown): Buffer {\n"
     "  return Buffer.from(JSON.stringify(value) ?? '');\n"
     "}\n";
+/* xisto:profiler: a sampling CPU profiler (runtime/xisto_prof.h); dd-trace's profiling builds on it */
+static const char xs_profiler_src[] =
+    "declare function cpuprof_start(hz: int): boolean;\n"
+    "declare function cpuprof_stop(): void;\n"
+    "declare function cpuprof_collect(): Uint8Array;\n"
+    "declare function cpuprof_last_samples(): int;\n"
+    "/** Starts sampling the process: hz times per second of CPU time, every thread (99 by default, as dd-trace on Node).\n"
+    " * false when the process already has a profiler (another thread started it) or the system has none (Windows). */\n"
+    "export function start(hz: int = 99): boolean {\n  return cpuprof_start(hz);\n}\n"
+    "/** Stops sampling; the samples taken stay for the next collect(). */\n"
+    "export function stop(): void {\n  cpuprof_stop();\n}\n"
+    "/** The samples since the last collect() (or start()) as a pprof profile: profile.proto, not compressed. Sample\n"
+    " * types sample/count and cpu/nanoseconds; frames are TypeScript functions with file and line. */\n"
+    "export function collect(): Uint8Array {\n  return cpuprof_collect();\n}\n"
+    "/** How many samples the last collect() had. */\n"
+    "export function lastSamples(): int {\n  return cpuprof_last_samples();\n}\n";
 /* xisto:okmap: Map<object, V> and WeakMap<K, V>: keys by identity (the object kept while it is a key: a WeakMap's entries
    are observed only through get/set/has/delete, as JavaScript allows) */
 static const char xs_okmap_src[] =
@@ -6336,6 +6352,9 @@ static const char xs_os_src[] =
     "export function platform(): string {\n  return os_platform_name();\n}\n"
     "export function type(): string {\n  return os_platform_name() === \"darwin\" ? \"Darwin\" : \"Linux\";\n}\n"
     "export function arch(): string {\n  return os_arch_name();\n}\n"
+    "declare function os_kernel_text(which: int): string;\n"
+    "export function release(): string {\n  return os_kernel_text(0);\n}\n"
+    "export function version(): string {\n  return os_kernel_text(1);\n}\n"
     "export function tmpdir(): string {\n  return os_tmp_dir();\n}\n"
     "export function homedir(): string {\n  return os_home_dir();\n}\n"
     "export const EOL: string = \"\\n\";\n";
@@ -6559,6 +6578,17 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->loading = false;
         return m;
     }
+    if (strcmp(name, "profiler") == 0) { /* written in xisto over runtime functions (see xs_profiler_src) */
+        m->builtin = false;
+        m->file = "xisto:profiler";
+        m->src = (char *)xs_profiler_src;
+        prog->uses_profiler = true;
+        m->native_prefix = "xs_";
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
     if (strcmp(name, "okmap") == 0) { /* xisto:okmap: identity-keyed maps (see xs_okmap_src) */
         m->builtin = false;
         m->file = "xisto:okmap";
@@ -6570,7 +6600,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         prog->uses_okmap = true;
         return m;
     }
-    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:stream, xisto:stream/promises, xisto:stream/web, xisto:buffer, xisto:util, xisto:querystring, xisto:string_decoder, xisto:zlib, xisto:timers, xisto:http, xisto:https, xisto:tls, xisto:diagnostics_channel, xisto:net, xisto:dns, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:stream, xisto:stream/promises, xisto:stream/web, xisto:buffer, xisto:util, xisto:querystring, xisto:string_decoder, xisto:zlib, xisto:timers, xisto:http, xisto:https, xisto:tls, xisto:diagnostics_channel, xisto:net, xisto:dns, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random, xisto:profiler", "unknown built-in module '%s'", spec);
     return NULL;
 }
 
