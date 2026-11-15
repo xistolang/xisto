@@ -6001,15 +6001,19 @@ XS_NOINLINE xs_arr_num *xs_fs_stat(xs_str *p, bool follow, int64_t fd) {
 #endif
     if (r != 0) { xs_fs_err = -(int64_t)errno; return a; }
     xs_fs_err = 0;
-    double v[14] = {(double)st.st_dev, (double)st.st_mode, (double)st.st_nlink, (double)st.st_uid, (double)st.st_gid, (double)st.st_rdev,
+    /* (no braces inside the #if branches: tools/rtsplit.py counts them) */
+    double v[14];
+    v[0] = (double)st.st_dev; v[1] = (double)st.st_mode; v[2] = (double)st.st_nlink; v[3] = (double)st.st_uid;
+    v[4] = (double)st.st_gid; v[5] = (double)st.st_rdev; v[7] = (double)st.st_ino; v[8] = (double)st.st_size;
 #ifdef _WIN32
-                    4096, (double)st.st_ino, (double)st.st_size, 0, (double)st.st_atime * 1000, (double)st.st_mtime * 1000, (double)st.st_ctime * 1000, (double)st.st_ctime * 1000};
+    v[6] = 4096; v[9] = 0;
+    v[10] = (double)st.st_atime * 1000; v[11] = (double)st.st_mtime * 1000; v[12] = (double)st.st_ctime * 1000; v[13] = v[12];
 #elif defined(__APPLE__)
-                    (double)st.st_blksize, (double)st.st_ino, (double)st.st_size, (double)st.st_blocks, XS_FS_MS(st.st_atimespec), XS_FS_MS(st.st_mtimespec),
-                    XS_FS_MS(st.st_ctimespec), XS_FS_MS(st.st_birthtimespec)};
+    v[6] = (double)st.st_blksize; v[9] = (double)st.st_blocks;
+    v[10] = XS_FS_MS(st.st_atimespec); v[11] = XS_FS_MS(st.st_mtimespec); v[12] = XS_FS_MS(st.st_ctimespec); v[13] = XS_FS_MS(st.st_birthtimespec);
 #else
-                    (double)st.st_blksize, (double)st.st_ino, (double)st.st_size, (double)st.st_blocks, XS_FS_MS(st.st_atim), XS_FS_MS(st.st_mtim),
-                    XS_FS_MS(st.st_ctim), XS_FS_MS(st.st_ctim)};
+    v[6] = (double)st.st_blksize; v[9] = (double)st.st_blocks;
+    v[10] = XS_FS_MS(st.st_atim); v[11] = XS_FS_MS(st.st_mtim); v[12] = XS_FS_MS(st.st_ctim); v[13] = v[12];
 #if defined(STATX_BTIME)
     struct statx sx; /* the birth time, where the file system keeps it (libuv reads it so too) */
     if (statx(fd >= 0 ? (int)fd : AT_FDCWD, fd >= 0 ? "" : p->data, (fd >= 0 ? AT_EMPTY_PATH : 0) | (follow ? 0 : AT_SYMLINK_NOFOLLOW), STATX_BTIME, &sx) == 0 && (sx.stx_mask & STATX_BTIME))
