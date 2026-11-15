@@ -13,22 +13,22 @@ const results = [
     to: '/docs/benchmarks/benchmarks-game/vs-rust',
   },
   {
-    value: '26 ms',
-    label: 'NestJS startup',
-    text: 'A real NestJS app (Conduit) starts in 26 ms, against 214 ms on Bun and 264 ms on Node.',
-    to: '/docs/benchmarks/nest/vs-node#conduit-a-real-nestjs-app',
+    value: '+12% / +14%',
+    label: 'HTTP server against actix-web',
+    text: 'The native server under the TechEmpower rules: 71,666 json and 649,581 plaintext requests per second against actix-web\'s 64,161 and 569,047, with 5.5 MB of memory against 14.4 MB on json. Its p99 at 16k connections is still worse.',
+    to: '/docs/benchmarks/techempower/vs-rust',
+  },
+  {
+    value: '2× / 7.7×',
+    label: 'the same NestJS app, against Bun / Node',
+    text: 'An unchanged Nest app built with Xisto serves 54,049 json requests per second against 27,306 on Bun and 7,027 on Node, in 16 MB. A real one (Conduit) starts in 26 ms against 214 and 264.',
+    to: '/docs/benchmarks/nest/',
   },
   {
     value: '10 / 10',
     label: 'against Node and Bun',
     text: 'Every Benchmarks Game problem on an Apple M4, faster and in less memory than Node 26 and Bun 1.4.',
     to: '/docs/benchmarks/benchmarks-game/vs-node',
-  },
-  {
-    value: '1.3 MB',
-    label: 'peak memory',
-    text: 'A small program (fib) peaks at 1.3 MB; the same file on Node takes 66.1 MB.',
-    to: '/docs/#three-numbers',
   },
 ];
 

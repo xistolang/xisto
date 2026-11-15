@@ -119,8 +119,9 @@ Requests per second at each concurrency level (connections; HTTP pipelining 16 d
 
   The ranges are the three runs of each level, read from wrk's own output (`raw/`). At 16,384 connections the p99
   moves by seconds from run to run on both servers: it is set by the requests that hit wrk's 8 s timeout (Xisto 386,
-  0 and 344 per run; actix-web 196, 0 and 162). The likely cause on Xisto's side is how a worker accepts new
-  connections while thousands are busy; a fix is being measured.
+  0 and 344 per run; actix-web 196, 0 and 162). The cause on Xisto's side is still open. One suspect was ruled out:
+  a worker accepting new connections only when the listening socket's event came round; accepting on every turn
+  changed nothing (six runs each way, the same ranges).
 - **p99 values marked —**: wrk 4.2 prints some percentiles as `0.00us` under pipelining (its correction for
   coordinated omission can add samples below the lowest one it recorded, and its percentile walk starts there). Those
   runs have no p99; a row's p99 is the median of the runs that have one, and — when none has.

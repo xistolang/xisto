@@ -1,0 +1,9 @@
+plaintext http://127.0.0.1:9100 PASS
+# 2026-11-15T13:29:40 gen=wrk levels=4096,16384 duration=15s repeat=3 xisto_workers=2 cpus=2
+# test side name req/s p50_ms p99_ms cpu_ms_per_1k_req rss_MB valid
+plaintext-c4096 xisto xisto-native 548319 66.350 689.990 3.5 42.0 ok
+plaintext-c16384 xisto xisto-native 407330 275.470 4020.000 3.8 42.5 ok
+plaintext http://127.0.0.1:9103 PASS
+plaintext-c4096 xisto xisto-nest-procs 208420 168.110 395.330 9.6 73.3 ok
+plaintext-c16384 xisto xisto-nest-procs 165695 664.430 3060.000 10.1 73.8 ok
+# saved /home/ubuntu/te-main/bench/results/techempower-2026-11-15-f766bf8/accept-ab/main-1.txt
