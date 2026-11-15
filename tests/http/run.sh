@@ -14,6 +14,16 @@ while time.time()-t0<10:
     try: socket.create_connection(('127.0.0.1',8080),timeout=0.2).close(); break
     except OSError: time.sleep(0.01)"
 $T/client
+# a body larger than the socket's buffers to a server that never reads: fetch's timeout covers the write too
+$X build -o $T/upload tests/http/upload.ts || exit 1
+python3 - "$T/upload" <<'PY'
+import socket, subprocess, sys, threading
+ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); ls.bind(("127.0.0.1", 8095)); ls.listen(8)
+held = []
+threading.Thread(target=lambda: [held.append(ls.accept()[0]) for _ in iter(int, 1)], daemon=True).start()
+try: print(subprocess.run([sys.argv[1]], capture_output=True, text=True, timeout=10).stdout.strip())
+except subprocess.TimeoutExpired: print("upload: HUNG")
+PY
 # 20 handlers sleeping 300 ms at once: one thread, so they must overlap (well under 20 x 300 ms)
 python3 - <<'PY'
 import threading, time, urllib.request

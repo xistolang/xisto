@@ -2179,12 +2179,27 @@ static void xs_conn_give(xs_conn *c) {
 
 static void xs_conn_drop(xs_conn *c) { close(c->fd); XS_TLS_FREE(c->tls); free(c); }
 
-static bool xs_write_all(int fd, const char *p, size_t n) {
+/* Writes all of p. With a deadline (xs_now() nanoseconds, 0 for none) or an abort flag, a peer that stops reading
+   (its window full) is waited for in slices and given up on at the deadline or the abort: false, as on an error.
+   (A fetch whose body is larger than the socket's buffers, to a server that accepts and never reads, used to wait
+   here forever, past its AbortSignal.timeout.) */
+static bool xs_write_until(int fd, const char *p, size_t n, uint64_t deadline, xs_Uint8Array *abort) {
     while (n > 0) {
         ssize_t w = write(fd, p, n);
         if (w < 0) {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN) { xs_wait_fd(fd, EVFILT_WRITE); continue; }
+            if (errno == EAGAIN) {
+                int64_t slice = -1;
+                if (deadline) {
+                    uint64_t now = xs_now();
+                    if (now >= deadline) return false;
+                    slice = (int64_t)((deadline - now) / 1000000ull) + 1;
+                }
+                if (abort && (slice < 0 || slice > 20)) slice = 20;
+                xs_wait_fd_ms(fd, EVFILT_WRITE, slice);
+                if (abort && abort->data[0]) return false;
+                continue;
+            }
             return false;
         }
         p += w;
@@ -2192,6 +2207,7 @@ static bool xs_write_all(int fd, const char *p, size_t n) {
     }
     return true;
 }
+static bool xs_write_all(int fd, const char *p, size_t n) { return xs_write_until(fd, p, n, 0, NULL); }
 
 static xs_Response *xs_fetch_full(xs_str *url, xs_str *method, xs_str *body, int nh, xs_str **hdrs, int64_t timeout_ms, xs_Uint8Array *abort);
 XS_NOINLINE xs_Response *xs_fetch(xs_str *url) { return xs_fetch_full(url, NULL, NULL, 0, NULL, -1, NULL); }
@@ -2396,8 +2412,9 @@ XS_NOINLINE xs_Response *xs_fetch_once(xs_str *url, xs_str *method, xs_str *body
         if (c->tls) wrote = xs_tls_write_all(c->tls, c->fd, req, (size_t)n, timeout_ms, deadline);
         else
 #endif
-        wrote = xs_write_all(c->fd, req, (size_t)n);
+        wrote = xs_write_until(c->fd, req, (size_t)n, timeout_ms >= 0 ? deadline : 0, abort);
         if (!wrote) {
+            if (abort && abort->data[0]) { int k = abort->data[0]; free(rq.data); xs_conn_drop(c); xs_fetch_aborted(k); }
 #ifdef XS_WITH_TLS
             if (c->tls && xs_tls_last_error(c->tls) != 0) {
                 static XS_TLS char msg[200];
