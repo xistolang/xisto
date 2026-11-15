@@ -9250,6 +9250,28 @@ XS_NOINLINE xs_big *xs_big_from_num(double v) {
     return xs_big_norm(b);
 }
 
+/* the default order of xs.sort(): by UTF-16 code units, as JavaScript compares strings. UTF-8 bytes order by code
+   point, which agrees except where a character past U+FFFF (a surrogate pair, D800-DBFF first) meets one of
+   U+E000-U+FFFF: at the first character that differs, a code point past U+FFFF is weighed as its high surrogate */
+XS_NOINLINE int64_t xs_str_cmp16(xs_str *a, xs_str *b) {
+    int64_t n = a->len < b->len ? a->len : b->len, i = 0;
+    while (i < n && a->data[i] == b->data[i]) i++;
+    if (i == n) return a->len < b->len ? -1 : a->len > b->len ? 1 : 0;
+    while (i > 0 && ((unsigned char)a->data[i] & 0xC0) == 0x80) i--; /* (the start of the character, the same in both) */
+    uint32_t ca = 0, cb = 0;
+    for (int k = 0; k < 2; k++) {
+        const unsigned char *s = (const unsigned char *)(k ? b->data : a->data) + i;
+        uint32_t c = s[0];
+        if (c >= 0xF0) c = ((c & 7) << 18) | ((s[1] & 63u) << 12) | ((s[2] & 63u) << 6) | (s[3] & 63u);
+        else if (c >= 0xE0) c = ((c & 15) << 12) | ((s[1] & 63u) << 6) | (s[2] & 63u);
+        else if (c >= 0xC0) c = ((c & 31) << 6) | (s[1] & 63u);
+        if (k) cb = c; else ca = c;
+    }
+    uint32_t ka = ca >= 0x10000 ? 0xD800 + ((ca - 0x10000) >> 10) : ca, kb = cb >= 0x10000 ? 0xD800 + ((cb - 0x10000) >> 10) : cb;
+    if (ka != kb) return ka < kb ? -1 : 1;
+    return ca < cb ? -1 : ca > cb ? 1 : 0;
+}
+
 /* xisto:builtins' __xs_throw("RangeError: ..."): an Error of that name, as the runtime raises its own */
 XS_NOINLINE void xs_throw_str(xs_str *msg) { xs_panicf("%s", msg->data); }
 
