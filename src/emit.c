@@ -96,10 +96,10 @@ static void dbg_params(Func *f, bool arrow_env, Arrow *a);
 static void emit_dbg_hook(Stmt *s);
 static const char *dbg_func_name(Func *f) {
     if (!f) return "(top level)";
-    if (f->is_ctor && f->cls) return xs_sprintf("new %s", f->cls->name);
+    if (f->is_ctor && f->cls) return xs_sprintf("new %s", xs_src_name(f->cls->name));
     if (f->name && strcmp(f->name, "arrow") == 0 && !f->cls) return "<anonymous>";
-    if (f->cls) return xs_sprintf("%s.%s", f->cls->name, f->name);
-    return f->name;
+    if (f->cls) return xs_sprintf("%s.%s", xs_src_name(f->cls->name), f->name);
+    return xs_src_name(f->name);
 }
 static bool *lit_used; /* literals referenced by emitted code: only those are declared */
 static int lit_ref(int id) { if (lit_used) lit_used[id] = true; return id; }
@@ -156,10 +156,10 @@ static int new_site_in(Pos pos, Func *f, Class *cls, Module *m) {
     if (!nsites) { buf_puts(&site_tab, "    {0}"); nsites = 1; }
     const char *fn = "";
     if (f && f->name && strcmp(f->name, "arrow") == 0 && !f->cls) fn = ""; /* anonymous, printed without a name as in Node */
-    else if (f && f->is_ctor && f->cls) fn = xs_sprintf("new %s", f->cls->name);
-    else if (f && f->cls) fn = xs_sprintf("%s.%s", f->cls->name, f->name);
-    else if (f) fn = f->name;
-    else if (cls) fn = xs_sprintf("new %s", cls->name);
+    else if (f && f->is_ctor && f->cls) fn = xs_sprintf("new %s", xs_src_name(f->cls->name));
+    else if (f && f->cls) fn = xs_sprintf("%s.%s", xs_src_name(f->cls->name), f->name);
+    else if (f) fn = xs_src_name(f->name);
+    else if (cls) fn = xs_sprintf("new %s", xs_src_name(cls->name));
     if (f && f->mod) m = f->mod;
     else if (!f && cls) m = cls->mod;
     /* a function inlined into its only caller: its frames are followed by that call, statically */
@@ -2912,7 +2912,7 @@ static void emit_dyn_tables(Program *p) {
                 nm++;
             }
         if (nm) buf_puts(&tabs, "};\n");
-        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s, %d, %d};\n", c->cname, c->name, c->nfields, c->nfields ? xs_sprintf("%s_dynf", c->cname) : "NULL",
+        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s, %d, %d};\n", c->cname, xs_src_name(c->name), c->nfields, c->nfields ? xs_sprintf("%s_dynf", c->cname) : "NULL",
                    nm, nm ? xs_sprintf("%s_dynm", c->cname) : "NULL", c->is_interface ? 1 : 0, !c->builtin && is_error_class(c) ? 1 : 0);
     }
     if (fns.data) buf_puts(out, fns.data);
@@ -13127,14 +13127,14 @@ static void emit_class(Class *c) {
     { /* an object whose fields are all optional and absent prints as an empty one */
         int always = 0, opt = 0;
         for (int i = 0; i < c->nfields; i++) { if (c->fields[i].optional) opt++; else always++; }
-        const char *empty_s = c->is_interface ? "{}" : xs_sprintf("%s {}", c->name);
+        const char *empty_s = c->is_interface ? "{}" : xs_sprintf("%s {}", xs_src_name(c->name));
         if (always || !opt) {
-            buf_printf(out, "xs_insp fr_; if (!xs_insp_begin(&fr_, p, \"%s\", %s)) return;", c->is_interface ? "Object" : c->name,
+            buf_printf(out, "xs_insp fr_; if (!xs_insp_begin(&fr_, p, \"%s\", %s)) return;", c->is_interface ? "Object" : xs_src_name(c->name),
                        always ? "NULL" : xs_sprintf("\"%s\"", empty_s));
         } else {
             Buf cond = {0};
             for (int i = 0; i < c->nfields; i++) buf_printf(&cond, "%s%s", i ? " || " : "", not_null(c->fields[i].type, xs_sprintf("self->%s", c->fields[i].cname)));
-            buf_printf(out, "xs_insp fr_; if (!xs_insp_begin(&fr_, p, \"%s\", (%s) ? NULL : \"%s\")) return;", c->is_interface ? "Object" : c->name, cond.data, empty_s);
+            buf_printf(out, "xs_insp fr_; if (!xs_insp_begin(&fr_, p, \"%s\", (%s) ? NULL : \"%s\")) return;", c->is_interface ? "Object" : xs_src_name(c->name), cond.data, empty_s);
         }
     }
     for (int i = 0; i < c->nfields; i++) {
@@ -13170,7 +13170,7 @@ static void emit_class(Class *c) {
     }
     nl();
     if (c->is_tuple) buf_puts(out, "xs_insp_end(&fr_, \"[\", \"]\", true, false, false);");
-    else buf_printf(out, "xs_insp_end(&fr_, \"%s\", \"}\", false, false, false);", c->is_interface ? "{" : xs_sprintf("%s {", c->name));
+    else buf_printf(out, "xs_insp_end(&fr_, \"%s\", \"}\", false, false, false);", c->is_interface ? "{" : xs_sprintf("%s {", xs_src_name(c->name)));
     indent--;
     nl();
     buf_puts(out, "}\n");

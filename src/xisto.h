@@ -13,6 +13,7 @@
 
 void *xs_alloc(size_t n);
 char *xs_strndup(const char *s, size_t n);
+const char *xs_src_name(const char *name);
 char *xs_sprintf(const char *fmt, ...);
 
 typedef struct {

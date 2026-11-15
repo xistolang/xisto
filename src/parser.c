@@ -141,6 +141,9 @@ static Token expect_prop_name(Parser *p, const char *help) {
     return t;
 }
 
+static Import *ns_import_of(Parser *p, const char *alias);
+static char *ns_name(Parser *p, Import *im, Token name);
+
 static bool accept(Parser *p, TokKind k) {
     if (at(p, k)) {
         next(p);
@@ -962,20 +965,23 @@ static Type *parse_type(Parser *p) {
     } else {
         if (at(p, TK_DOT) && peek_is_ident(p) && p->mod) { /* Types.ObjectId (or ns.Type): the type Types's module exports as
                                                               ObjectId, imported from there with it */
-            Import *im = NULL;
-            for (int i = 0; i < p->nns && !im; i++) if (strcmp(p->ns_alias[i], name.str) == 0) im = &p->mod->imports[p->ns_import[i]];
+            Import *im = ns_import_of(p, name.str);
+            bool isns = im != NULL;
             for (int i = 0; i < p->mod->nimports && !im; i++) {
                 Import *q = &p->mod->imports[i];
                 if (q->reexport || q->star) continue;
                 for (int k = 0; k < q->n; k++) if (strcmp(q->names[k], name.str) == 0) { im = q; break; }
             }
             if (im) { /* (stream.xlsx.WorkbookWriter: the last name, the type the module exports) */
+                int depth = 0;
                 while (at(p, TK_DOT) && peek_is_ident(p)) {
                     next(p);
                     name = p->tok;
                     next(p);
+                    depth++;
                 }
-                import_add_name(im, name);
+                if (isns && depth == 1) name.str = ns_name(p, im, name); /* (ns.Type: ns's, XB-223) */
+                else import_add_name(im, name);
             }
         }
         t = named_type(p, name);
@@ -1629,20 +1635,23 @@ static Expr *parse_primary(Parser *p) {
             wants_intl = true;
         } else if (at(p, TK_DOT) && peek_is_ident(p) && p->mod) { /* new Types.ObjectId(x) (or new ns.C(x)): the class Types's
                                                                      module exports as ObjectId, as Types.ObjectId in a type */
-            Import *im = NULL;
-            for (int i = 0; i < p->nns && !im; i++) if (strcmp(p->ns_alias[i], name.str) == 0) im = &p->mod->imports[p->ns_import[i]];
+            Import *im = ns_import_of(p, name.str);
+            bool isns = im != NULL;
             for (int i = 0; i < p->mod->nimports && !im; i++) {
                 Import *q = &p->mod->imports[i];
                 if (q->reexport || q->star) continue;
                 for (int k = 0; k < q->n; k++) if (strcmp(q->names[k], name.str) == 0) { im = q; break; }
             }
             if (im) { /* (new stream.xlsx.WorkbookWriter(o): the last name, the class the module exports) */
+                int depth = 0;
                 while (at(p, TK_DOT) && peek_is_ident(p)) {
                     next(p);
                     name = p->tok;
                     next(p);
+                    depth++;
                 }
-                import_add_name(im, name);
+                if (isns && depth == 1) name.str = ns_name(p, im, name); /* (new ns.C(): ns's, XB-223) */
+                else import_add_name(im, name);
             }
         }
         if (strcmp(name.str, "Array") == 0) {
@@ -2074,6 +2083,14 @@ static Expr *parse_rel(Parser *p) {
         next(p);
         Expr *c = new_expr(E_IDENT, p->tok.pos);
         c->str = expect(p, TK_IDENT, "write a class name: x instanceof Foo").str;
+        Import *nsi = at(p, TK_DOT) && peek_is_ident(p) ? ns_import_of(p, c->str) : NULL;
+        if (nsi) { /* x instanceof ns.C: the class C of ns's module */
+            next(p);
+            Token cn = p->tok;
+            next(p);
+            c->pos = cn.pos;
+            c->str = ns_name(p, nsi, cn);
+        }
         if (is_js_error_name(c->str)) wants_errors = true; /* (x instanceof SyntaxError with no other mention of it) */
         if (is_url_global_name(c->str)) wants_url = true;
         e = binary(TK_IDENT, pos, e, c); /* TK_IDENT as operator: instanceof */
@@ -4347,13 +4364,15 @@ static bool thunk_arrow_ahead(Parser *p) {
 /* the rest of the module declares `name` at its top level: a line that starts (after export / declare / abstract)
    with class / interface / type / function / enum / const / let and then the name (read as text: a lexer this far
    ahead would not know where a regular expression starts) */
-static bool declares_top(Parser *p, const char *name) {
-    const char *q = p->lx.src + p->lx.pos;
+static bool declares_top_from(const char *src, const char *q, const char *name);
+static bool declares_top(Parser *p, const char *name) { return declares_top_from(p->lx.src, p->lx.src + p->lx.pos, name); }
+/* (from q on, in the module whose source starts at src) */
+static bool declares_top_from(const char *src, const char *q, const char *name) {
     size_t n = strlen(name);
     static const char *const lead[] = {"export ", "declare ", "default ", "abstract ", "async "};
     static const char *const kw[] = {"class ", "interface ", "type ", "function ", "enum ", "const ", "let "};
     for (; *q; q++) {
-        if (q != p->lx.src && q[-1] != '\n') continue;
+        if (q != src && q[-1] != '\n') continue;
         const char *r = q;
         for (bool again = true; again;) {
             again = false;
@@ -4487,16 +4506,54 @@ static void import_add_name(Import *im, Token name) {
         im->as_names = realloc(im->as_names, sizeof(char *) * (size_t)(im->n + 1));
         im->as_names[im->n] = name.str;
     }
+    if (im->qualified) { /* (sized to the names: one more) */
+        im->qualified = realloc(im->qualified, sizeof(bool) * (size_t)(im->n + 1));
+        im->qualified[im->n] = false;
+    }
     im->names[im->n] = name.str;
     im->positions[im->n++] = name.pos;
 }
+/* XB-223: ns.name of `import * as ns` where the module has another `name` (its own top-level declaration, or another
+   import's): the name reads as "name\x01path" (XB-117's form), which the checker resolves in ns's module only, while a
+   plain `name` keeps meaning the module's own (or the other import's). Decided once per name of the import, when it is
+   first read through ns. Returns the name the reference is written with. */
+static const char *export_orig(Module *m, const char *name, Module **via, int depth);
+static char *ns_name(Parser *p, Import *im, Token name) {
+    if (im->from && !im->from->loading && !im->from->missing && strcmp(name.str, "default") != 0) {
+        /* ns.a where ns's module exports its own declaration under another name (its a read as a__local next to an
+           import { a as b }, XB-224; export { x as a }): the declaration's name */
+        Module *via = im->from;
+        const char *o = export_orig(im->from, name.str, &via, 0);
+        if (via == im->from && o != name.str && strcmp(o, name.str) != 0) name.str = (char *)o;
+    }
+    for (int i = 0; i < im->n; i++)
+        if (strcmp(im->names[i], name.str) == 0)
+            return im->qualified && im->qualified[i] && im->path ? xs_sprintf("%s\x01%s", name.str, im->path) : name.str;
+    import_add_name(im, name);
+    if (!im->path) return name.str;
+    bool clash = declares_top_from(p->lx.src, p->lx.src, name.str);
+    for (int k = 0; k < p->mod->nimports && !clash; k++) {
+        Import *o = &p->mod->imports[k];
+        if (o == im || o->reexport || o->star || !o->path || strcmp(o->path, im->path) == 0) continue;
+        for (int j = 0; j < o->n && !clash; j++)
+            if (strcmp(o->names[j], name.str) == 0 && !(o->qualified && o->qualified[j])) clash = true;
+    }
+    if (!clash) return name.str;
+    if (!im->qualified) im->qualified = xs_alloc(sizeof(bool) * (size_t)im->n);
+    im->qualified[im->n - 1] = true;
+    return xs_sprintf("%s\x01%s", name.str, im->path);
+}
+/* the import of `import * as alias` in the module being parsed */
+static Import *ns_import_of(Parser *p, const char *alias) {
+    if (!p->mod) return NULL;
+    for (int i = 0; i < p->nns; i++) if (strcmp(p->ns_alias[i], alias) == 0) return &p->mod->imports[p->ns_import[i]];
+    return NULL;
+}
 static Expr *ns_member(Parser *p, Expr *e, Token name) {
     if (e->kind != E_IDENT || !p->nns || !p->mod) return NULL;
-    int k = -1;
-    for (int i = 0; i < p->nns; i++) if (strcmp(p->ns_alias[i], e->str) == 0) k = i;
-    if (k < 0) return NULL;
-    import_add_name(&p->mod->imports[p->ns_import[k]], name);
-    Expr *id = ident_expr(name.pos, name.str);
+    Import *im = ns_import_of(p, e->str);
+    if (!im) return NULL;
+    Expr *id = ident_expr(name.pos, ns_name(p, im, name));
     id->boolean = true; /* (read through a namespace: ns.x = v writes the module's let, as a CommonJS module object allows) */
     return id;
 }
