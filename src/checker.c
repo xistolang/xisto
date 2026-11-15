@@ -41,6 +41,7 @@ typedef struct Binding {
     bool lit_number; /* `let s = 0` (or 0.5, or any number) with no type written: s += i takes an int i as Number(i), as
                         JavaScript adds it (XB-094); the type the dev never wrote does not ask for a conversion */
     bool null_const;  /* const x = null (no type written): each read of x is null */
+    bool fn_assigned; /* a module variable some function, method or closure of its module assigns (fn_assigned_global) */
     struct Class *proto_of; /* const p = Object.getPrototypeOf(x): the prototype of x's class (its methods' slots, an expando) */
     struct Binding *next;
 } Binding;
@@ -3134,6 +3135,55 @@ static bool boxed_name(const char *name, int decl_depth, bool for_init) {
     }
     return captured && (for_init ? assigned_inside : assigned);
 }
+/* XB-202, XB-215: the names a module's functions, methods and closures assign. A module variable of one of those names
+   may change during any call: narrowed to not null, each read after is checked (as a variable in a cell is); passed
+   to a call, it is held for the call (the callee may let go of the value it was given). By name, with no regard to
+   shadowing: a name too many only costs a check. */
+static Module *fa_mod;
+static const char **fa_names;
+static int nfa, cap_fa;
+static void fa_stmt(Stmt *s, bool in_fn);
+static void fa_expr(Expr *e, bool in_fn) {
+    if (!e) return;
+    if (in_fn && (e->kind == E_ASSIGN || e->kind == E_POSTFIX) && e->lhs && e->lhs->kind == E_IDENT && e->lhs->str) {
+        if (nfa == cap_fa) { cap_fa = cap_fa ? cap_fa * 2 : 32; fa_names = realloc(fa_names, sizeof(char *) * (size_t)cap_fa); }
+        fa_names[nfa++] = e->lhs->str;
+    }
+    if (e->kind == E_ARROW) { fa_stmt(e->arrow->fn->body, true); return; }
+    fa_expr(e->lhs, in_fn);
+    fa_expr(e->rhs, in_fn);
+    for (int i = 0; i < e->args.len; i++) fa_expr(e->args.items[i], in_fn);
+}
+static void fa_stmt(Stmt *s, bool in_fn) {
+    if (!s) return;
+    fa_expr(s->init, in_fn);
+    fa_expr(s->expr, in_fn);
+    fa_expr(s->cond, in_fn);
+    fa_stmt(s->for_init, in_fn);
+    fa_expr(s->for_update, in_fn);
+    fa_stmt(s->body, in_fn);
+    fa_stmt(s->else_body, in_fn);
+    for (int i = 0; i < s->stmts.len; i++) fa_stmt(s->stmts.items[i], in_fn);
+    for (int i = 0; i < s->ncases; i++) { fa_expr(s->cases[i].value, in_fn); fa_stmt(s->cases[i].body, in_fn); }
+}
+static bool fn_assigned_global(const char *name) {
+    if (!cur_mod) return false;
+    if (fa_mod != cur_mod) {
+        fa_mod = cur_mod;
+        nfa = 0;
+        for (int i = 0; i < prog->top.len; i++) if (prog->top.items[i]->mod == cur_mod) fa_stmt(prog->top.items[i], false);
+        for (int i = 0; i < prog->nfuncs; i++) if (prog->funcs[i]->mod == cur_mod) fa_stmt(prog->funcs[i]->body, true);
+        for (int i = 0; i < prog->nclasses; i++) {
+            Class *c = prog->classes[i];
+            if (c->mod != cur_mod) continue;
+            for (int k = 0; k < c->nmethods; k++) fa_stmt(c->methods[k]->body, true);
+            if (c->ctor) fa_stmt(c->ctor->body, true);
+            for (int k = 0; k < c->nfields; k++) fa_expr(c->fields[k].init, true);
+        }
+    }
+    for (int i = 0; i < nfa; i++) if (strcmp(fa_names[i], name) == 0) return true;
+    return false;
+}
 static int arrow_depth(void) {
     int n = 0;
     for (Scope *s = scope; s; s = s->parent) if (s->arrow) n++;
@@ -3157,6 +3207,7 @@ static Binding *declare(Pos pos, const char *name, Type *type, bool is_const, bo
         b->cell = xs_sprintf("%s_c", b->cname);
         b->cname = xs_sprintf("(%s->v)", b->cell);
     }
+    if (global) b->fn_assigned = fn_assigned_global(name);
     b->pos = pos;
     b->no_warn = global || is_param || name[0] == '_';
     b->next = scope->head;
@@ -8565,6 +8616,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (o->poisoned) xs_error_quiet(); /* the error was its declaration's: no cascade */
         e->type = b->type;
         e->cname = b->cname;
+        e->gl_hold = b->fn_assigned;
         if (cell_narrowed(b)) {
             /* a variable a closure reassigns (it lives in a cell), narrowed here to not null: a call may have set it
                to null since (TypeScript keeps the narrowing), so each read is checked, a TypeError when it is null; a
@@ -14756,9 +14808,10 @@ static void narrow_set(Expr *c, bool when, NSet *out) {
 static void shadow_narrowed(Binding *b);
 static void shadow_set(NSet *s) { for (int i = 0; i < s->n; i++) shadow_narrowed(s->b[i]); }
 
-/* a binding narrowed to not null (by a test or an assignment) of a variable that lives in a cell */
+/* a binding narrowed to not null (by a test or an assignment) of a variable that lives in a cell, or of a module variable
+   a function assigns (XB-202): a call may have set it back to null */
 static bool cell_narrowed(Binding *b) {
-    return b && b->cell && b->orig && b->origin && !b->union_narrow && b->orig->kind == TY_NULLABLE && b->type != b->orig &&
+    return b && (b->cell || b->fn_assigned) && b->orig && b->origin && !b->union_narrow && b->orig->kind == TY_NULLABLE && b->type != b->orig &&
            b->type->kind != TY_NULLABLE;
 }
 static void shadow_narrowed(Binding *b) {

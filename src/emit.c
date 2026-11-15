@@ -1336,6 +1336,86 @@ static void emit_args_borrowed(ExprList *l, bool leading_comma) {
         emit_borrowed(l->items[i]);
     }
 }
+/* XB-215: a module variable some function assigns, passed to user code: the call may assign it, letting go of the value
+   the callee was given; held (retained, let go at the statement's end) for the call. Other values as emit_borrowed. */
+static bool held_ident(Expr *e) {
+    if (e->kind == E_AS && e->op == TK_NOT && !e->elem_type) e = e->lhs; /* (narrowed: x checked not null) */
+    return e->kind == E_IDENT && e->gl_hold && rcnt(e->type);
+}
+static void emit_held(Expr *e) {
+    if (!held_ident(e)) { emit_borrowed(e); return; }
+    used_ar = true;
+    buf_puts(out, "xs_ar(xs_retain(");
+    emit_expr(e);
+    buf_puts(out, "))");
+}
+static void emit_args_held(ExprList *l, bool leading_comma) {
+    for (int i = 0; i < l->len; i++) {
+        if (i || leading_comma) buf_puts(out, ", ");
+        emit_held(l->items[i]);
+    }
+}
+/* a call of a built-in that takes a function (xs.forEach(f), s.replace(re, f)...) runs user code too */
+static bool args_have_fn(ExprList *l) {
+    for (int i = 0; i < l->len; i++) if (l->items[i]->type && l->items[i]->type->kind == TY_FUNC) return true;
+    return false;
+}
+/* f can let go of a held module variable's value: it assigns one (gl_hold), or runs code that may (a function or method
+   that may, a closure, a constructor, a virtual call, an await). f(s) { return s.length } cannot, nor a function that
+   only calls such ones: its callers pass the variable as it is, with no retain (the hot path of small helpers).
+   Memoized per function; a recursive call counts as one that may. */
+static bool may_drop_stmt(Stmt *s);
+static bool fn_may_drop(Func *f);
+static bool may_drop_expr(Expr *e) {
+    if (!e) return false;
+    switch (e->kind) {
+    case E_ASSIGN: case E_POSTFIX:
+        if (e->lhs && e->lhs->kind == E_IDENT && e->lhs->gl_hold) return true;
+        break;
+    case E_CALL:
+        if (args_have_fn(&e->args)) return true;
+        if (!e->builtin.cfn && (!e->func || fn_may_drop(e->func))) return true; /* (a closure value: unknown code) */
+        break;
+    case E_MEMBER:
+        if (!e->is_call) break;
+        if (args_have_fn(&e->args)) return true;
+        if ((!e->cls || !e->cls->builtin) && (e->virt || !e->func || fn_may_drop(e->func))) return true;
+        break;
+    case E_NEW_OBJ: if (!e->cls || !e->cls->builtin) return true; break;
+    case E_SUPER_CALL: case E_AWAIT: case E_SPAWN: return true;
+    case E_ARROW: return false; /* (made, not run) */
+    default: break;
+    }
+    if (may_drop_expr(e->lhs) || may_drop_expr(e->rhs)) return true;
+    for (int i = 0; i < e->args.len; i++) if (may_drop_expr(e->args.items[i])) return true;
+    return false;
+}
+static bool may_drop_stmt(Stmt *s) {
+    if (!s) return false;
+    if (s->kind == S_YIELD) return true;
+    if (may_drop_expr(s->init) || may_drop_expr(s->expr) || may_drop_expr(s->cond) || may_drop_stmt(s->for_init) ||
+        may_drop_expr(s->for_update) || may_drop_stmt(s->body) || may_drop_stmt(s->else_body))
+        return true;
+    for (int i = 0; i < s->stmts.len; i++) if (may_drop_stmt(s->stmts.items[i])) return true;
+    for (int i = 0; i < s->ncases; i++) if (may_drop_expr(s->cases[i].value) || may_drop_stmt(s->cases[i].body)) return true;
+    return false;
+}
+static Func **md_fns;
+static bool *md_val;
+static int nmd;
+static bool fn_may_drop(Func *f) {
+    if (!f || !f->body || f->is_async || f->is_gen) return true;
+    for (int i = 0; i < nmd; i++) if (md_fns[i] == f) return md_val[i];
+    int me = nmd++; /* (true while it is being looked at: a recursive call may) */
+    md_fns = realloc(md_fns, sizeof(Func *) * (size_t)nmd);
+    md_val = realloc(md_val, sizeof(bool) * (size_t)nmd);
+    md_fns[me] = f;
+    md_val[me] = true;
+    bool v = may_drop_stmt(f->body);
+    for (int i = 0; i < f->nparams && !v; i++) v = may_drop_expr(f->params[i].dflt);
+    if (!v) md_val[me] = false;
+    return v;
+}
 
 static const char *binop(TokKind op) {
     switch (op) {
@@ -2480,16 +2560,27 @@ static void emit_member(Expr *e) {
     if (!e->cls->builtin && e->func->cls && e->func->cls != e->cls) { /* inherited (or dispatched): the receiver as the method's class */
         buf_printf(out, "%s((%s *)(", e->virt ? dispatcher(e->func) : e->deco_orig && e->func->deco_stub ? xs_sprintf("%s__orig", e->func->cname) : e->func->cname,
                    e->func->cls->cname);
-        emit_borrowed(base);
-        buf_puts(out, ")");
-        emit_args_borrowed(&e->args, true);
+        if (e->virt || fn_may_drop(e->func) || args_have_fn(&e->args)) { /* (XB-215) */
+            emit_held(base);
+            buf_puts(out, ")");
+            emit_args_held(&e->args, true);
+        } else {
+            emit_borrowed(base);
+            buf_puts(out, ")");
+            emit_args_borrowed(&e->args, true);
+        }
         buf_puts(out, ")");
         return;
     }
     buf_printf(out, "%s(", e->cls->builtin ? e->builtin.cfn : e->virt ? dispatcher(e->func)
                           : e->deco_orig && e->func->deco_stub ? xs_sprintf("%s__orig", e->func->cname) : e->func->cname);
-    emit_borrowed(base);
-    emit_args_borrowed(&e->args, true);
+    if ((!e->cls->builtin && (e->virt || fn_may_drop(e->func))) || args_have_fn(&e->args)) { /* user code that may let go of it runs (XB-215) */
+        emit_held(base);
+        emit_args_held(&e->args, true);
+    } else {
+        emit_borrowed(base);
+        emit_args_borrowed(&e->args, true);
+    }
     buf_puts(out, ")");
 }
 
@@ -3058,7 +3149,7 @@ static void emit_expr_raw(Expr *e) {
         return;
     case E_SUPER_CALL: /* the base's initializer on this object */
         buf_printf(out, "%s_init((%s *)self", e->cls->cname, e->cls->cname);
-        emit_args_borrowed(&e->args, true);
+        emit_args_held(&e->args, true);
         buf_puts(out, ")");
         return;
     case E_AS: { /* unknown as T: the object's free function says what it is */
@@ -3099,7 +3190,7 @@ static void emit_expr_raw(Expr *e) {
         if (e->op == TK_NOT && !e->elem_type) { /* x! or (T | null) as T: a TypeError when it is null */
             Type *nt = e->lhs->type;
             if (e->str) /* a narrowed variable a closure set back to null (checker: cell_narrowed) */
-                buf_printf(out, "({ %s nn_ = %s; if (!%s) xs_panic(\"TypeError: '%s' is null here: a call made since it was checked set it back to null\"); nn_; })",
+                buf_printf(out, "({ %s nn_ = %s; if (__builtin_expect(!%s, 0)) XS_FAIL(\"TypeError: '%s' is null here: a call made since it was checked set it back to null\", NULL); nn_; })",
                            ctype(nt), b.data, not_null(nt, "nn_"), e->str);
             else
                 buf_printf(out, "({ %s nn_ = %s; if (!%s) xs_panic(\"TypeError: the value is null\"); nn_; })", ctype(nt), b.data, not_null(nt, "nn_"));
@@ -4100,7 +4191,7 @@ static void emit_expr_raw(Expr *e) {
             if (!v) buf_printf(out, "ocr%d_ = ", id);
             emit_closure_call_prefix(ft);
             buf_printf(out, "oc%d_->fn)(oc%d_", id, id);
-            emit_args_borrowed(&e->args, true);
+            emit_args_held(&e->args, true);
             buf_puts(out, ");");
             if (!v) buf_printf(out, " ocr%d_;", id);
             buf_puts(out, " })");
@@ -4116,7 +4207,7 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, "; ");
             emit_closure_call_prefix(e->lhs->type);
             buf_printf(out, "cc%d_->fn)(cc%d_", id, id);
-            emit_args_borrowed(&e->args, true);
+            emit_args_held(&e->args, true);
             buf_puts(out, "); })");
             return;
         }
@@ -4126,13 +4217,14 @@ static void emit_expr_raw(Expr *e) {
             emit_borrowed(e->lhs);
             buf_puts(out, ")->fn)(");
             emit_borrowed(e->lhs);
-            emit_args_borrowed(&e->args, true);
+            emit_args_held(&e->args, true);
             buf_puts(out, ")");
             return;
         }
         if (e->par_native) buf_printf(out, "%s_par(", e->func->cname); /* xisto:parallel on the pool */
         else buf_printf(out, "%s(", e->builtin.cfn ? e->builtin.cfn : rg_call_name(e->func));
-        emit_args_borrowed(&e->args, false);
+        if ((!e->builtin.cfn && fn_may_drop(e->func)) || args_have_fn(&e->args)) emit_args_held(&e->args, false); /* (XB-215) */
+        else emit_args_borrowed(&e->args, false);
         buf_puts(out, ")");
         return;
     case E_INDEX:
@@ -4228,7 +4320,7 @@ static void emit_expr_raw(Expr *e) {
             for (int i = 0; i < e->args.len; i++) { /* a consumed parameter takes an owned reference: a new value moves in */
                 if (i) buf_puts(out, ", ");
                 if (ct && i < ct->nparams && ct->params[i].consumed) emit_owned(e->args.items[i]);
-                else emit_borrowed(e->args.items[i]);
+                else emit_held(e->args.items[i]);
             }
         }
         buf_puts(out, ")");
