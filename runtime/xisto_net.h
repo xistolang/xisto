@@ -4355,6 +4355,102 @@ XS_NOINLINE void xs_net_wake(int64_t port) { /* a connection to our own listener
     xs_release(h);
     if (fd >= 0) close((int)fd);
 }
+/* node:http (runtime/node/http.ts) over node:net's sockets: a write that never parks (what the socket takes now),
+   and the message head (request or status line, then the headers) parsed in one call */
+XS_NOINLINE xs_Uint8Array *xs_net_read_buf(int64_t fd) { /* as xs_net_read, the bytes as a Buffer (what Node's 'data' gives) */
+    if (!xs_net_rbuf) xs_net_rbuf = malloc(65536);
+    for (;;) {
+        ssize_t r = read((int)fd, xs_net_rbuf, 65536);
+        if (r > 0) {
+            xs_Uint8Array *u = xs_u8_raw(r, true, false);
+            memcpy(u->data, xs_net_rbuf, (size_t)r);
+            return u;
+        }
+        if (r == 0) return xs_u8_raw(0, true, false);
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN) { xs_wait_fd((int)fd, EVFILT_READ); continue; }
+        xs_net_rerr_ = xs_net_err(errno);
+        return xs_u8_raw(0, true, false);
+    }
+}
+XS_NOINLINE int64_t xs_net_send(int64_t fd, xs_Uint8Array *bytes, int64_t off) { /* bytes written (0: the socket is full), or an error */
+    if (off >= bytes->f_length) return 0;
+    for (;;) {
+        ssize_t w = send((int)fd, bytes->data + off, (size_t)(bytes->f_length - off), 0
+#ifdef MSG_NOSIGNAL
+                         | MSG_NOSIGNAL
+#endif
+        );
+        if (w >= 0) return (int64_t)w;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        return xs_net_err(errno);
+    }
+}
+/* where the head parsed last ends (the body's first byte); -1: not complete yet; -2: not HTTP (or a head over 64 KB) */
+static XS_TLS int64_t xs_nhttp_end_;
+XS_NOINLINE int64_t xs_nhttp_end(void) { return xs_nhttp_end_; }
+static xs_str *xs_nhttp_str(const uint8_t *p, size_t n) { /* bytes read as latin1 (as Node reads a head) */
+    size_t hi = 0;
+    for (size_t i = 0; i < n; i++) hi += p[i] >= 0x80;
+    if (!hi) return xs_str_new((const char *)p, n);
+    xs_str *s = xs_str_alloc((int64_t)(n + hi));
+    char *o = s->data;
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] < 0x80) *o++ = (char)p[i];
+        else { *o++ = (char)(0xC0 | (p[i] >> 6)); *o++ = (char)(0x80 | (p[i] & 0x3F)); }
+    }
+    *o = 0;
+    return s;
+}
+static void xs_nhttp_trim(const uint8_t **p, const uint8_t **e) {
+    while (*p < *e && (**p == ' ' || **p == '\t')) (*p)++;
+    while (*e > *p && ((*e)[-1] == ' ' || (*e)[-1] == '\t')) (*e)--;
+}
+/* bytes[start, end): [method, target, version, name, value, name, value...] for a request; [version, status, reason,
+   name, value...] for a response (the three parts of the first line either way). Empty while the head is not complete
+   or when it is not HTTP (xs_nhttp_end says which). Empty lines before the first line are skipped, as Node does. */
+XS_NOINLINE xs_arr_ref *xs_nhttp_parse(xs_Uint8Array *bytes, int64_t start, int64_t end) {
+    xs_arr_ref *out = xs_arr_ref_new(0, xs_print_str_quoted_);
+    xs_nhttp_end_ = -1;
+    if (start < 0) start = 0;
+    if (end > bytes->f_length) end = bytes->f_length;
+    const uint8_t *p = bytes->data + start, *lim = bytes->data + (end > start ? end : start);
+    while (lim - p >= 2 && p[0] == '\r' && p[1] == '\n') p += 2;
+    const uint8_t *hend = lim - p >= 4 ? memmem(p, (size_t)(lim - p), "\r\n\r\n", 4) : NULL;
+    if (!hend) {
+        if (lim - p > 65536) xs_nhttp_end_ = -2;
+        return out;
+    }
+    if (hend - p > 65536) { xs_nhttp_end_ = -2; return out; }
+    const uint8_t *le = memmem(p, (size_t)(hend - p) + 2, "\r\n", 2);
+    const uint8_t *s1 = memchr(p, ' ', (size_t)(le - p));
+    const uint8_t *s2 = s1 ? memchr(s1 + 1, ' ', (size_t)(le - s1 - 1)) : NULL;
+    if (!s1 || s1 == p) { xs_nhttp_end_ = -2; return out; }
+    xs_arr_ref_push(out, xs_nhttp_str(p, (size_t)(s1 - p)));
+    if (s2) {
+        xs_arr_ref_push(out, xs_nhttp_str(s1 + 1, (size_t)(s2 - s1 - 1)));
+        xs_arr_ref_push(out, xs_nhttp_str(s2 + 1, (size_t)(le - s2 - 1)));
+    } else { /* a status line without a reason phrase ("HTTP/1.1 200") */
+        xs_arr_ref_push(out, xs_nhttp_str(s1 + 1, (size_t)(le - s1 - 1)));
+        xs_arr_ref_push(out, xs_str_new("", 0));
+    }
+    const uint8_t *q = le + 2;
+    while (q < hend + 2) {
+        const uint8_t *e = memmem(q, (size_t)(hend + 2 - q), "\r\n", 2);
+        if (!e) e = hend;
+        const uint8_t *colon = memchr(q, ':', (size_t)(e - q));
+        if (!colon || colon == q) { xs_nhttp_end_ = -2; for (size_t i = 0; i < out->len; i++) xs_release_(out->data[i]); out->len = 0; return out; }
+        const uint8_t *ns = q, *ne = colon, *vs = colon + 1, *ve = e;
+        xs_nhttp_trim(&ns, &ne);
+        xs_nhttp_trim(&vs, &ve);
+        xs_arr_ref_push(out, xs_nhttp_str(ns, (size_t)(ne - ns)));
+        xs_arr_ref_push(out, xs_nhttp_str(vs, (size_t)(ve - vs)));
+        q = e + 2;
+    }
+    xs_nhttp_end_ = (int64_t)(hend + 4 - bytes->data);
+    return out;
+}
 /* node:dns: lookup through the system resolver (getaddrinfo), as Node's dns.lookup; "" when the name is unknown */
 XS_NOINLINE xs_arr_ref *xs_dns_lookup_all(xs_str *host, int64_t family) {
     xs_arr_ref *out = xs_arr_ref_new(0, xs_print_str_quoted_);
@@ -4561,6 +4657,15 @@ XS_NOINLINE xs_Uint8Array *xs_tlsc_read(int64_t h) { /* the next bytes; empty at
     memcpy(u->data, xs_net_rbuf, (size_t)r);
     return u;
 }
+XS_NOINLINE xs_Uint8Array *xs_tlsc_read_buf(int64_t h) { /* as xs_tlsc_read, the bytes as a Buffer (node:https's client) */
+    if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return xs_u8_raw(0, true, false);
+    if (!xs_net_rbuf) xs_net_rbuf = malloc(65536);
+    ssize_t r = xs_tls_read_some(xs_tlscs[h].t, xs_tlscs[h].fd, (char *)xs_net_rbuf, 65536, -1, 0);
+    if (r <= 0) return xs_u8_raw(0, true, false);
+    xs_Uint8Array *u = xs_u8_raw(r, true, false);
+    memcpy(u->data, xs_net_rbuf, (size_t)r);
+    return u;
+}
 XS_NOINLINE int64_t xs_tlsc_write(int64_t h, xs_Uint8Array *bytes) {
     if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return -7;
     return xs_tls_write_all(xs_tlscs[h].t, xs_tlscs[h].fd, (const char *)bytes->data, (size_t)bytes->f_length, -1, 0) ? 0 : -7;
@@ -4571,5 +4676,73 @@ XS_NOINLINE void xs_tlsc_close(int64_t h) {
     xs_tls_free(xs_tlscs[h].t);
     close(xs_tlscs[h].fd);
     xs_tlscs[h].used = false;
+}
+/* node:https's server connections (runtime/node/http.ts over node:net's sockets): the same slots as the client's;
+   the handshake happens within the first reads. A credential is a number too (the certificate and key, PEM) */
+static void **xs_tlss_creds;
+static int64_t xs_ntlss_creds;
+XS_NOINLINE int64_t xs_tlss_cred(xs_str *cert, xs_str *key) {
+    char *cp = xs_pem_tmp(cert), *kp = xs_pem_tmp(key);
+    xs_str *c = xs_str_new(cp, strlen(cp)), *k = xs_str_new(kp, strlen(kp));
+    void *cr = xs_tls_cred_load_any(c, k);
+    unlink(cp);
+    unlink(kp);
+    free(cp);
+    free(kp);
+    xs_release(c);
+    xs_release(k);
+    xs_tlss_creds = realloc(xs_tlss_creds, sizeof *xs_tlss_creds * (size_t)(xs_ntlss_creds + 1));
+    xs_tlss_creds[xs_ntlss_creds] = cr;
+    return xs_ntlss_creds++;
+}
+XS_NOINLINE int64_t xs_tlss_accept(int64_t cred, int64_t fd) { /* the slot of an accepted connection */
+    xs_tls *t = xs_tls_server_new(xs_tlss_creds[cred]);
+    int64_t h = 0;
+    while (h < xs_ntlscs && xs_tlscs[h].used) h++;
+    if (h == xs_ntlscs) { xs_tlscs = realloc(xs_tlscs, sizeof *xs_tlscs * (size_t)(xs_ntlscs + 1)); xs_ntlscs++; }
+    xs_tlscs[h] = (xs_tlsc){t, (int)fd, true};
+    return h;
+}
+XS_NOINLINE xs_Uint8Array *xs_tlss_read(int64_t h) { /* the next plaintext bytes (parks); empty at the end or on an error */
+    if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return xs_u8_new(0);
+    if (!xs_net_rbuf) xs_net_rbuf = malloc(65536);
+    for (;;) {
+        xs_tlsc *s = &xs_tlscs[h]; /* (the table may move while parked) */
+        ssize_t r = xs_tls_srv_read(s->t, s->fd, (char *)xs_net_rbuf, 65536);
+        if (r > 0) {
+            xs_Uint8Array *u = xs_u8_raw(r, true, false);
+            memcpy(u->data, xs_net_rbuf, (size_t)r);
+            return u;
+        }
+        if (r < 0) return xs_u8_new(0);
+        int fd = s->fd;
+        xs_wait_fd(fd, xs_tls_srv_pending(s->t) ? EVFILT_WRITE : EVFILT_READ);
+        if (!xs_tlscs[h].used) return xs_u8_new(0);
+    }
+}
+XS_NOINLINE int64_t xs_tlss_send(int64_t h, xs_Uint8Array *bytes, int64_t off) { /* plaintext taken now (never parks), or -7 */
+    if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return -7;
+    if (off >= bytes->f_length) return 0;
+    ssize_t w = xs_tls_srv_write(xs_tlscs[h].t, xs_tlscs[h].fd, (const char *)bytes->data + off, (size_t)(bytes->f_length - off));
+    return w < 0 ? -7 : (int64_t)w;
+}
+XS_NOINLINE bool xs_tlss_pending(int64_t h) { return h >= 0 && h < xs_ntlscs && xs_tlscs[h].used && xs_tls_srv_pending(xs_tlscs[h].t); }
+XS_NOINLINE int64_t xs_tlss_write(int64_t h, xs_Uint8Array *bytes, int64_t off) { /* all of it (parks while the socket is full): 0, or -7 */
+    for (;;) {
+        if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return -7;
+        int fd = xs_tlscs[h].fd;
+        if (off < bytes->f_length) {
+            ssize_t w = xs_tls_srv_write(xs_tlscs[h].t, fd, (const char *)bytes->data + off, (size_t)(bytes->f_length - off));
+            if (w < 0) return -7;
+            off += w;
+        }
+        if (off >= bytes->f_length && !xs_tls_srv_pending(xs_tlscs[h].t)) return 0;
+        xs_wait_fd(fd, EVFILT_WRITE);
+    }
+}
+XS_NOINLINE void xs_tlss_close(int64_t h) { /* close_notify, then as the client's */
+    if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return;
+    xs_tls_srv_close_notify(xs_tlscs[h].t, xs_tlscs[h].fd);
+    xs_tlsc_close(h);
 }
 #endif
