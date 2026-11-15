@@ -640,7 +640,9 @@ Differences from Node:
 - Paths are strings: not `Buffer`s or `URL`s (`fileURLToPath(url)` gives one), no file descriptors where a path
   goes (beyond `fstatSync`, `readSync` and the streams).
 - `readFileSync` takes `"utf8"`/`"utf-8"` (or `{ encoding }` with one) for text; another encoding is
-  `readFileSync(path).toString(encoding)`. `openSync` takes the flags `r`, `w`, `a`, `r+`.
+  `readFileSync(path).toString(encoding)`. `writeFileSync`/`appendFileSync` write text in another encoding
+  (`"latin1"`, `"base64"`...) when the encoding is written in the call (a literal; one held in a variable throws
+  an error that says so). `openSync` takes the flags `r`, `w`, `a`, `r+`.
 - On an error the callback's result is empty (`""`, an empty `Buffer` or array, a `Stats` of zeros) where Node
   passes `undefined`; a missing optional value (`mkdirSync`'s result, `err.dest`) prints as `null` in
   `console.log`.
