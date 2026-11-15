@@ -1,5 +1,7 @@
 #!/bin/sh
 # Slow-dependency bench: handlers that wait on a fake database answering after N ms.
+# Targets: xisto (1, 4, 16 workers), node, bun, rust (axum + one reqwest client, tokio current_thread), go (net/http
+# + one http.Client, GOMAXPROCS=1). DUR (default 10s) and DUR_LONG (default 20s, for delays >= 1 s) shorten a smoke run.
 export XISTO_NODE_COMPAT=1 # these programs also run on Node for comparison: node: imports allowed
 cd "$(dirname "$0")/../../.." || exit 1
 ulimit -n 16384 2>/dev/null
@@ -7,8 +9,9 @@ XISTO=./build/xisto; OUT=bench/out; mkdir -p "$OUT" bench/results
 stamp=$(date +%Y-%m-%d); host=$(sysctl -n machdep.cpu.brand_string | tr ' ' '-' | tr -cd 'A-Za-z0-9-')
 csv="bench/results/$stamp-$host-deps.csv"; md="bench/results/$stamp-$host-deps.md"
 NODE=$(command -v node); BUN=$(command -v bun); OHA=$(command -v oha)
-CONC=${CONC:-64}
+CONC=${CONC:-64}; DUR=${DUR:-10s}; DUR_LONG=${DUR_LONG:-20s}
 $XISTO build -o "$OUT/app-xisto" bench/http/deps/app.xisto.ts || exit 1
+sh bench/http/build-native.sh || exit 1
 [ -d node_modules/undici ] || npm install --silent --no-save undici > /dev/null 2>&1
 
 wait_port() { # $1=port $2=path
@@ -34,7 +37,7 @@ wait_port 8081 "/q?ms=0"
 echo "target,route,latency_ms,req_per_s,p50_ms,p99_ms,timeouts,server_cpu_s,cpu_s_per_100k,rss_mb" > "$csv"
 {
     echo "# Slow dependency bench $stamp"; echo
-    echo "Machine: $(sysctl -n machdep.cpu.brand_string). node $($NODE --version), bun $($BUN --version), oha $($OHA --version | awk '{print $2}'). Fake database on Bun (8081) answering after N ms. Load: oha, $CONC connections, keep-alive. Routes: one = 1 call, three = 3 sequential calls, mixed = 1 call + 50 items serialized."; echo
+    echo "Machine: $(sysctl -n machdep.cpu.brand_string). node $($NODE --version), bun $($BUN --version), oha $($OHA --version | awk '{print $2}'), $(cat $OUT/native-versions.txt). Fake database on Bun (8081) answering after N ms. Load: oha, $CONC connections, keep-alive. Routes: one = 1 call, three = 3 sequential calls, mixed = 1 call + 50 items serialized."; echo
     echo "| target | route | dependency | req/s | p50 (ms) | p99 (ms) | timeouts | CPU s / 100k | RSS (MB) |"
     echo "|---|---|---:|---:|---:|---:|---:|---:|---:|"
 } > "$md"
@@ -47,7 +50,7 @@ run_target() { # $1=label rest=command
     wait_port 8080 "/one?ms=0"
     for spec in "one|1" "one|5" "one|20" "one|100" "one|1000" "one|5000" "three|5" "three|100" "three|1000" "mixed|5" "mixed|100"; do
         route=${spec%%|*}; ms=${spec#*|}
-        dur=10s; [ "$ms" -ge 1000 ] && dur=20s
+        dur=$DUR; [ "$ms" -ge 1000 ] && dur=$DUR_LONG
         cpu0=$(cpu_of $pid)
         $OHA -z "$dur" -c $CONC -t 30s --no-tui --output-format json "http://127.0.0.1:8080/$route?ms=$ms" > "$OUT/oha-deps.json" 2>/dev/null
         cpu1=$(cpu_of $pid)
@@ -69,5 +72,7 @@ XISTO_WORKERS=4 XISTO_LOCK=0 run_target xisto-4 "$OUT/app-xisto"
 XISTO_WORKERS=16 XISTO_LOCK=0 run_target xisto-16 "$OUT/app-xisto"
 run_target node "$NODE" bench/http/deps/app.node.ts
 run_target bun "$BUN" bench/http/deps/app.bun.ts
+[ -x "$OUT/rust-deps" ] && WORKERS=1 run_target rust "$OUT/rust-deps"
+[ -x "$OUT/go-deps" ] && GOMAXPROCS=1 run_target go "$OUT/go-deps"
 kill $dbpid 2>/dev/null; wait $dbpid 2>/dev/null
 echo; echo "results: $csv"; echo "         $md"

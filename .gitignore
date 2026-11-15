@@ -28,3 +28,5 @@ __pycache__/
 /docs/node_modules/
 /docs/build/
 /docs/.docusaurus/
+# the Rust side of the HTTP benchmarks when built in place (build-native.sh builds into bench/out)
+bench/http/rust/target/
