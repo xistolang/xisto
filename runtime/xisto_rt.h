@@ -4668,7 +4668,7 @@ static xs_str *xs_sb_finish(xs_sb *b) {
    keeps its own generated writer). The value is written as JSON.stringify(value) writes it (toJSON, Dates, a class's
    fields), read back as an any (Records, unknown[], boxed numbers), then written again through the replacer (a
    function called as replacer(key, value), or an allow-list of keys) with the indentation of space. ---- */
-static void xs_json_undef_called(void) { xs_panic("TypeError: undefined is not a function"); }
+XS_NOINLINE void xs_json_undef_called(void) { xs_panic("TypeError: undefined is not a function"); }
 static xs_closure xs_json_undef_cl = {{XS_IMMORTAL, 0}, (void *)xs_json_undef_called};
 /* undefined returned by a replacer (the checker puts it where the replacer's code returns undefined): a function,
    which JSON leaves out of an object and writes as null in an array, as it does undefined */
@@ -4678,9 +4678,9 @@ static void xs_jx_nl(xs_sb *b, const xs_jx *st, int depth) {
     xs_sb_put(b, "\n", 1);
     for (int i = 0; i < depth; i++) xs_sb_put(b, st->gap, st->glen);
 }
-static bool xs_jx_write(xs_sb *b, const xs_jx *st, void *v, int depth);
+XS_NOINLINE bool xs_jx_write(xs_sb *b, const xs_jx *st, void *v, int depth);
 /* holder[key] through the replacer, then written; false when it is undefined (nothing written) */
-static bool xs_jx_prop(xs_sb *b, const xs_jx *st, xs_str *key, void *v, int depth) {
+XS_NOINLINE bool xs_jx_prop(xs_sb *b, const xs_jx *st, xs_str *key, void *v, int depth) {
     if (!st->fn) return xs_jx_write(b, st, v, depth);
     xs_closure *cl = st->fn;
     void *r = ((void *(*)(void *, xs_str *, void *))cl->fn)(cl, key, v);
@@ -4696,7 +4696,7 @@ static void *xs_jx_val(xs_map *m, xs_map_entry *e) { /* a Record's value as an a
     default: return e->val.p ? xs_retain_(e->val.p) : NULL;
     }
 }
-static bool xs_jx_member(xs_sb *b, const xs_jx *st, xs_str *k, void *val, int depth, bool *any) {
+XS_NOINLINE bool xs_jx_member(xs_sb *b, const xs_jx *st, xs_str *k, void *val, int depth, bool *any) {
     size_t at = b->len;
     if (*any) xs_sb_put(b, ",", 1);
     if (st->glen) xs_jx_nl(b, st, depth + 1);
@@ -4707,7 +4707,7 @@ static bool xs_jx_member(xs_sb *b, const xs_jx *st, xs_str *k, void *val, int de
     if (b->data) b->data[at] = 0;
     return false;
 }
-static bool xs_jx_write(xs_sb *b, const xs_jx *st, void *v, int depth) {
+XS_NOINLINE bool xs_jx_write(xs_sb *b, const xs_jx *st, void *v, int depth) {
     if (!v) { xs_sb_put(b, "null", 4); return true; }
     if (xs_type_of(v)->print == xs_print_closure) return false; /* a function (or undefined): nothing */
     void (*f)(void *) = xs_type_of(v)->free;
@@ -4822,7 +4822,7 @@ XS_NOINLINE xs_str *xs_json_ext(xs_str *text, xs_arr_ref *keys, void *fn, double
    reviver(key, value), whose undefined deletes the member (null in an array). xs_json_revive_any gives the revived
    any; xs_json_revive its text again, for a typed target (parsed then as JSON.parse(text) parses it) */
 static bool xs_jr_undef(void *v) { return v && xs_type_of(v)->print == xs_print_closure; }
-static void *xs_jr_walk(xs_closure *cl, xs_str *key, void *val /* owned */) {
+XS_NOINLINE void *xs_jr_walk(xs_closure *cl, xs_str *key, void *val /* owned */) {
     void (*f)(void *) = val ? xs_type_of(val)->free : NULL;
     if (f == xs_map_free && ((xs_map *)val)->record && ((xs_map *)val)->val_kind == 3) {
         xs_map *m = val;
