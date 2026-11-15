@@ -14,6 +14,9 @@ with the TFB's rules, on the two AWS VMs. The database tests come next.
 Head to head, with every level, latency, CPU and memory: [vs Rust](./vs-rust.md) (actix-web),
 [vs Go](./vs-go.md) (net/http), [vs Bun](./vs-bun.md) and [vs Node](./vs-node.md) (http and fastify).
 
+Each runtime is here once, with its plain HTTP server. **Running NestJS?** The same Nest app on Xisto, Node and Bun is
+on [NestJS](../nest.md).
+
 ## Setup
 
 - **Topology**: the servers on the Xeon E5-2686 v4 (2 vCPUs, 3.9 GB, Ubuntu); the load generator,
@@ -25,13 +28,7 @@ Head to head, with every level, latency, CPU and memory: [vs Rust](./vs-rust.md)
 - **References**: the TFB's own implementations at commit `57d92fb`: actix-web (Rust 1.99, `target-cpu=native`),
   Go net/http (Go 1.27), Node http and fastify (Node v22.22.1, Ubuntu's), Bun 1.4.4 (`reusePort`, one process
   per CPU). Each uses every core, as the TFB runs them.
-- **Xisto**: the native `Server` API with 2 workers, and a NestJS app with the TFB's routes
-  (`bench/techempower/xisto/nest`) built with Xisto in three modes:
-  - **workers with the lock** (`XISTO_WORKERS=2`, the default): one event loop per CPU, the handlers one at a time
-    under a lock, because Nest's singletons are shared;
-  - **workers without the lock** (`XISTO_LOCK=0`): the handlers in parallel;
-  - **2 processes on one port** (`XISTO_REUSEPORT=1`, one worker each): the kernel spreads the connections, each
-    process has its own singletons, nothing is shared, as Node's cluster or Bun's `reusePort`.
+- **Xisto**: the native `Server` API (`bench/techempower/xisto/native`) with 2 workers, one event loop per CPU.
 - **CPU** is the server's user + system time per 1,000 requests at the best level; **peak RSS** the largest of all
   its processes over every level.
 - Source: `bench/techempower/` (apps, `run.py`, `validate.py`, `chartdata.py` for the charts), raw results in
@@ -58,21 +55,15 @@ Head to head, with every level, latency, CPU and memory: [vs Rust](./vs-rust.md)
 | Xisto (native `Server`) | **71,544** | 128 | 31.5 ms | 26.1 | 5.5 MB |
 | actix-web (Rust) | 65,891 | 256 | 45.6 ms | 28.1 | 14.1 MB |
 | Bun | 54,497 | 256 | 22.0 ms | 35.8 | 90.8 MB |
-| Xisto + NestJS, 2 processes on one port | 53,032 | 128 | 11.9 ms | 35.9 | 16.2 MB |
-| Xisto + NestJS, workers with the lock | 44,216 | 128 | 9.2 ms | 36.7 | 10.7 MB |
 | Go net/http | 32,636 | 64 | 6.1 ms | 58.8 | 30.8 MB |
 | Node http | 29,317 | 64 | 6.3 ms | 67.1 | 289.4 MB |
 | fastify (Node) | 25,672 | 128 | 12.9 ms | 76.7 | 303.7 MB |
-| Xisto + NestJS, workers without the lock | crashed under load | | | | |
 
 Requests per second at each concurrency level (connections):
 
 | server | 16 | 32 | 64 | 128 | 256 | 512 |
 |---|---:|---:|---:|---:|---:|---:|
 | Xisto (native `Server`) | 29,680 | 50,193 | 65,676 | 71,544 | 71,383 | 70,573 |
-| Xisto + NestJS, 2 processes on one port | 28,312 | 41,622 | 52,948 | 53,032 | 51,347 | 52,648 |
-| Xisto + NestJS, workers with the lock | 27,198 | 38,971 | 43,528 | 44,216 | 43,308 | 42,829 |
-| Xisto + NestJS, workers without the lock | crashed | | | | | |
 | actix-web (Rust) | 29,050 | 49,526 | 60,875 | 64,773 | 65,891 | 64,270 |
 | Bun | 28,016 | 43,747 | 52,600 | 54,024 | 54,497 | 53,664 |
 | Go net/http | 24,057 | 32,629 | 32,636 | 32,498 | 32,038 | 31,509 |
@@ -97,22 +88,16 @@ Requests per second at each concurrency level (connections):
 |---|---:|---:|---:|---:|---:|
 | Xisto (native `Server`) | **662,156** | 256 | — | 3.0 | 42.2 MB |
 | actix-web (Rust) | 570,564 | 256 | — | 3.5 | 562.7 MB |
-| Xisto + NestJS, 2 processes on one port | 239,187 | 256 | — | 8.4 | 74.2 MB |
-| Xisto + NestJS, workers with the lock | 116,817 | 256 | — | 11.7 | 69.8 MB |
 | Bun | 114,146 | 4,096 | 1550.0 ms | 17.3 | 96.9 MB |
 | Node http | 51,066 | 4,096 | 961.5 ms | 40.0 | 607.1 MB |
 | Go net/http | 44,657 | 1,024 | 451.0 ms | 44.4 | 540.6 MB |
 | fastify (Node) | 36,387 | 4,096 | 1080.0 ms | 57.0 | 843.5 MB |
-| Xisto + NestJS, workers without the lock | crashed under load | | | | |
 
 Requests per second at each concurrency level (connections; HTTP pipelining 16 deep):
 
 | server | 256 | 1,024 | 4,096 | 16,384 |
 |---|---:|---:|---:|---:|
 | Xisto (native `Server`) | 662,156 | 598,816 | 572,353 | 392,360 |
-| Xisto + NestJS, 2 processes on one port | 239,187 | 226,775 | 207,750 | 156,190 |
-| Xisto + NestJS, workers with the lock | 116,817 | 113,749 | 109,930 | 82,447 |
-| Xisto + NestJS, workers without the lock | crashed | | | |
 | actix-web (Rust) | 570,564 | 523,963 | 476,486 | 324,000 |
 | Bun | 113,941 | 113,461 | 114,146 | 86,961 |
 | Go net/http | 41,237 | 44,657 | 44,631 | 33,274 |
@@ -124,10 +109,6 @@ Requests per second at each concurrency level (connections; HTTP pipelining 16 d
 - **Xisto's native server is first on both tests**: 71,544 json requests per second against actix-web's 65,891
   (+9%), and 662,156 plaintext against 570,564 (+16%), with less CPU per request and the least memory of all on
   json (5.5 MB against 14.1 MB).
-- **NestJS built with Xisto** in two processes serves 53,032 json requests per second, about Bun's and more than
-  Go's net/http, Node's own http module and fastify, with 16 MB; with the lock, 44,216.
-- **Nest without the lock crashes** under load: its singletons are shared by the workers and touched without
-  synchronization. The lock is the default for that reason; the multi-process mode is the one that scales.
 - **At 16,384 connections** every server loses throughput (Xisto's native 41%, actix-web 43%), and Xisto still
   answers the most requests (392,360 against 324,000). Its **tail latency is worse** than actix-web's at high
   concurrency, though: p99 1.5 s against 0.43 s at 4,096 connections and 3.4 s against 2.3 s at 16,384, with a
@@ -138,7 +119,7 @@ Requests per second at each concurrency level (connections; HTTP pipelining 16 d
 ## What changed since the first round
 
 The first round (main `40cdc16`, same day) had actix-web 16% ahead on json and 1.7× on plaintext, and Xisto's
-servers collapsing at 16,384 connections (the Nest app with the lock answered 217 requests per second). The runtime
+servers collapsing at 16,384 connections. The runtime
 then stopped spending system calls a request does not need: three clock reads per request (on this VM's Xen
 clocksource each is a real system call), an extra `read` that only returned `EAGAIN`, and the `Date` header
 rendered once a second instead of per request; each worker got its own listening socket, so the kernel spreads new

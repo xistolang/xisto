@@ -6,17 +6,22 @@ import {BarChart, LineChart} from './index';
 const mb = (v) => `${v.toFixed(1)} MB`;
 const ms = (v) => (v == null ? '—' : v >= 100 ? `${Math.round(v)} ms` : `${v.toFixed(1)} ms`);
 const int = (v) => (v == null ? '—' : Math.round(v).toLocaleString('en-US'));
-const XISTO = ['xisto-native', 'xisto-nest-procs', 'xisto-nest'];
-// one colour per server on every chart of every page (the six validated categorical slots); the servers without a
-// slot (Nest with the lock, fastify) are in the bar charts and the tables
-const SLOT = {'xisto-native': 1, 'xisto-nest-procs': 2, actix: 3, bun: 4, 'go-std': 5, nodejs: 6};
+// the NestJS app (on Xisto, Node and Bun) has its own page (benchmarks/nest): the TechEmpower pages compare the
+// runtimes' plain servers, one per runtime, and leave it out unless a chart names it in `only`
+const isNest = (id) => id.includes('nest');
+const isNestName = (name) => name.includes('Nest');
+// one colour per server on every chart of every page (the six validated categorical slots); fastify has no slot and
+// is in the bar charts and the tables. The Nest page passes its own `slots` (one per runtime).
+const SLOT = {'xisto-native': 1, actix: 3, bun: 4, 'go-std': 5, nodejs: 6};
 
 const pick = (test, only) => {
   const t = data[test];
-  return only ? only.map((id) => t.servers.find((s) => s.id === id)).filter(Boolean) : t.servers;
+  return only
+    ? only.map((id) => t.servers.find((s) => s.id === id)).filter(Boolean)
+    : t.servers.filter((s) => !isNest(s.id));
 };
 const crashedNote = (test) => {
-  const c = data[test].crashed;
+  const c = data[test].crashed.filter((n) => !isNestName(n));
   return c.length ? ` ${c.join(', ')} crashed under load and is not drawn.` : '';
 };
 
@@ -37,19 +42,19 @@ export function BestBars({test, only}) {
     <BarChart
       title={`${test}: best requests per second (higher is better)`}
       rows={rows}
-      caption={`The best of the levels, median of 3 runs at each level; Xisto's servers in the accent colour.${only ? '' : crashedNote(test)} Every value is in the tables below.`}
+      caption={`The best of the levels, median of 3 runs at each level; Xisto in the accent colour.${only ? '' : crashedNote(test)} Every value is in the tables below.`}
     />
   );
 }
 
 // requests per second (or p99) at each number of connections
-export function LevelLines({test, only, metric = 'values'}) {
+export function LevelLines({test, only, metric = 'values', slots = SLOT}) {
   const t = data[test];
-  const ids = only || t.lines;
+  const ids = only || t.lines.filter((id) => !isNest(id));
   const series = ids
     .map((id) => t.servers.find((s) => s.id === id))
-    .filter((s) => s && SLOT[s.id])
-    .map((s) => ({name: s.name, values: s[metric], color: SLOT[s.id], highlight: s.id === 'xisto-native'}))
+    .filter((s) => s && slots[s.id])
+    .map((s) => ({name: s.name, values: s[metric], color: slots[s.id], highlight: s.id.startsWith('xisto')}))
     .filter((s) => s.values.some((v) => v != null));
   if (metric === 'p99') {
     return (
@@ -73,7 +78,7 @@ export function LevelLines({test, only, metric = 'values'}) {
       caption={
         only
           ? 'Every level of the round; the values are in the table below.'
-          : 'Six of the servers, to keep the lines readable; all of them are in the tables below.'
+          : 'Five of the servers, to keep the lines readable; all of them are in the tables below.'
       }
     />
   );
@@ -144,12 +149,13 @@ export function RatioBars({test, against}) {
   );
 }
 
-// the head-to-head table under the charts: every level, the reference against each Xisto server
-export function VsTable({test, against}) {
+// the head-to-head table under the charts: every level, Xisto's server against the reference (or the servers `ids`
+// names, in that order)
+export function VsTable({test, against = [], ids}) {
   const t = data[test];
-  const ids = [...XISTO, ...(Array.isArray(against) ? against : [against])];
-  const servers = ids.map((id) => t.servers.find((s) => s.id === id)).filter(Boolean);
-  const crashed = t.crashed;
+  const list = ids || ['xisto-native', ...(Array.isArray(against) ? against : [against])];
+  const servers = list.map((id) => t.servers.find((s) => s.id === id)).filter(Boolean);
+  const crashed = t.crashed.filter((n) => (ids ? true : !isNestName(n)));
   return (
     <>
       <table>

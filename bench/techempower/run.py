@@ -79,6 +79,10 @@ def servers(a):
         'nodejs': ('ref', 9112, R + '/nodejs', ['node', 'app.js'], {'NODE_ENV': 'production'}, None),
         'fastify': ('ref', 9113, R + '/fastify', ['node', 'app.js'], {'NODE_ENV': 'production'}, None),
         'bun': ('ref', 9114, R + '/bun/src', ['bun', 'spawn.ts'], {'NODE_ENV': 'production'}, None),
+        # the same Nest app as xisto-nest, compiled with tsc (refs.sh nest-node), one process per CPU as the TFB's
+        # own Nest app runs: on Node with node:cluster, on Bun with its node:cluster
+        'nest-node': ('ref', 9115, R + '/nest-node', ['node', 'cluster.js'], {'NODE_ENV': 'production', 'PORT': '9115'}, None),
+        'nest-bun': ('ref', 9116, R + '/nest-node', ['bun', 'cluster.js'], {'NODE_ENV': 'production', 'PORT': '9116'}, None),
     }
 
 
@@ -244,7 +248,7 @@ def measure(a, name, spec, tests, levels):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--servers', default='xisto-native,xisto-nest,xisto-nest-nolock,xisto-nest-procs,actix,go-std,nodejs,fastify,bun')
+    ap.add_argument('--servers', default='xisto-native,xisto-nest,xisto-nest-nolock,xisto-nest-procs,actix,go-std,nodejs,fastify,bun,nest-node,nest-bun')
     ap.add_argument('--tests', default='plaintext,json')
     ap.add_argument('--levels', default='16,64,256')
     ap.add_argument('--duration', type=int, default=10)

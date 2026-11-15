@@ -13,6 +13,8 @@
 #   nodejs  frameworks/JavaScript/nodejs (node:http, node:cluster one worker per CPU)                            9112
 #   fastify frameworks/JavaScript/fastify (cluster, one worker per CPU)                                            9113
 #   bun     frameworks/TypeScript/bun (Bun.serve, reusePort, spawn.ts starts one process per CPU)                  9114
+#   nest-node  not a TFB app: Xisto's own Nest app (bench/techempower/xisto/nest/src/main.ts), unchanged, compiled
+#              with tsc (bench/techempower/nest-node) and run with one process per CPU on Node (9115) and Bun (9116)
 # Toolchains: Rust via `rustup run stable cargo`, Go from /opt/homebrew/bin/go (or PATH), node/npm and bun on PATH.
 set -e
 TFB=${1:-$HOME/workspace/tessarotto/port/FrameworkBenchmarks}
@@ -22,7 +24,8 @@ mkdir -p "$OUT"
 GO=$(command -v go || echo /opt/homebrew/bin/go)
 command -v cargo >/dev/null 2>&1 || PATH=$(dirname "$(rustup which --toolchain stable cargo)"):$PATH
 CARGO=cargo
-only=${REFS:-"actix go-std nodejs fastify bun"}
+only=${REFS:-"actix go-std nodejs fastify bun nest-node"}
+HERE=$(cd "$(dirname "$0")" && pwd)
 
 copy() { rm -rf "${OUT:?}/${1:?}"; cp -R "$F/$2" "$OUT/$1"; }
 
@@ -48,6 +51,11 @@ for r in $only; do
     copy bun TypeScript/bun
     sed -i.bak 's/port: 8080/port: 9114/' "$OUT/bun/src/index.ts"
     (cd "$OUT/bun/src" && NODE_ENV=production bun build --compile --minify --outfile server .) ;;
+  nest-node)
+    rm -rf "${OUT:?}/nest-node"; mkdir -p "$OUT/nest-node/src"
+    cp "$HERE/nest-node/package.json" "$HERE/nest-node/tsconfig.json" "$HERE/nest-node/cluster.js" "$OUT/nest-node/"
+    cp "$HERE/xisto/nest/src/main.ts" "$OUT/nest-node/src/main.ts"
+    (cd "$OUT/nest-node" && npm install --silent --no-audit --no-fund && npm run --silent build) ;;
   esac
 done
 echo "refs built in $OUT"

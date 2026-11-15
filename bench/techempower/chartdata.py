@@ -10,6 +10,7 @@ NAMES = {
     'xisto-native': 'Xisto (native)', 'xisto-nest': 'Xisto + NestJS (lock)', 'xisto-nest-procs': 'Xisto + NestJS (2 processes)',
     'xisto-nest-nolock': 'Xisto + NestJS (no lock)', 'actix': 'actix-web (Rust)', 'go-std': 'Go net/http', 'nodejs': 'Node.js http',
     'fastify': 'Fastify (Node.js)', 'bun': 'Bun',
+    'nest-node': 'NestJS on Node.js', 'nest-bun': 'NestJS on Bun',
 }
 # the line charts: six series at most (the categorical slots validated for the site), Xisto first
 LINES = ['xisto-native', 'xisto-nest-procs', 'actix', 'bun', 'go-std', 'nodejs']

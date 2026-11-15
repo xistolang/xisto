@@ -14,8 +14,8 @@ tokio 1.54.1, and Go 1.27.2 with the standard library's `net/http`. Each server 
 unless a table says otherwise: Rust on tokio's `current_thread` runtime, Go with `GOMAXPROCS=1`. The Rust and Go
 servers ([bench/http/rust](https://github.com/xistolang/xisto/tree/main/bench/http/rust),
 [bench/http/go](https://github.com/xistolang/xisto/tree/main/bench/http/go)) answer every measured route byte for
-byte as the Xisto server does (status, content type, body), checked with `bench/http/probe.sh`. Conduit, a NestJS app,
-is Xisto against Node only. The first Linux results are in [Node's http module on Linux](#nodes-http-module-on-linux).
+byte as the Xisto server does (status, content type, body), checked with `bench/http/probe.sh`. NestJS, the Conduit
+app included, has [its own page](./nest.md). The first Linux results are in [Node's http module on Linux](#nodes-http-module-on-linux).
 
 ## Hello server
 
@@ -94,54 +94,6 @@ one, `update` parses a JSON body. Source: `bench/results/2026-11-15-Apple-M4-tod
 Xisto is ahead on all three routes: 15% to 35% over Rust and Bun, 1.7 to 2.2 times Go and Node. Rust has the lowest
 p99 on `list` and `read` and the least memory (6.8 to 8.4 MB, Xisto 8.4 to 9.6 MB). Go's `encoding/json` makes `list`
 its slowest route: 79,875 req/s, half of its `read`.
-
-## Conduit: a NestJS app
-
-[Conduit](https://github.com/lujakob/nestjs-realworld-example-app) is the public RealWorld example built with
-NestJS: controllers, guards, JWT, argon2, a Postgres database and a Redis cache. The same source was built with
-Xisto 0.4.1 and run on Node v26.12.0 (after `npm run build`). Postgres 16 and Redis 7 in local containers.
-20 connections, 30 s per route, startup the median of 5 fresh starts, cold latency the median of 10. Source:
-`bench/results/conduit-mac-2026-11-14.txt`.
-
-| | xisto | Node |
-|---|---:|---:|
-| startup (to the first 200) | **20 ms** | 267 ms |
-| RSS at rest | **7.3 MB** | 137.3 MB |
-| RSS after the load | **12.0 MB** | 234.5 MB |
-
-Under load, with the Redis cache warm:
-
-| route | xisto req/s | Node req/s | xisto p99 | Node p99 | xisto CPU per 1k req | Node CPU per 1k req | xisto RSS | Node RSS |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| article list (2 queries) | 16,236 | 15,922 | 2.89 ms | 3.51 ms | 41.0 ms | 48.0 ms | 23.0 MB | 170.0 MB |
-| article by slug | 25,363 | **33,754** | 1.83 ms | 1.65 ms | 20.8 ms | 19.5 ms | 11.0 MB | 164.1 MB |
-| current user (guard, JWT, query) | **8,357** | 6,123 | 4.20 ms | 5.56 ms | 46.2 ms | 137.0 ms | 10.8 MB | 153.0 MB |
-| tags | **16,508** | 13,821 | 2.41 ms | 2.71 ms | 19.8 ms | 39.6 ms | 10.2 MB | 145.6 MB |
-| login (argon2) | **65** | 43 | 352.47 ms | 574.88 ms | 130,057 ms | 224,858 ms | 203.1 MB | 402.8 MB |
-
-Without the cache (Redis stopped; every request reads Postgres):
-
-| route | xisto req/s | Node req/s | xisto CPU per 1k req | Node CPU per 1k req | xisto RSS | Node RSS |
-|---|---:|---:|---:|---:|---:|---:|
-| article list | 5,545 | 4,954 | 96.9 ms | 141.6 ms | 11.5 MB | 402.9 MB |
-| article by slug | 8,179 | 7,263 | 42.5 ms | 66.1 ms | 12.0 MB | 234.5 MB |
-
-**Node is ahead on the article by slug with the cache warm** (33,754 against 25,363 req/s: a Redis read and a JSON
-answer); xisto leads the other routes, uses less CPU per request on all but that one, and a tenth of the memory or
-less. Compared with the round of 8 Nov the database routes are slower on both sides (Node's article list without
-the cache 7,086 then, 4,954 now): the Postgres and Redis containers were made again for this round. A/B rounds in
-the same environment (`bench/results/conduit-mac-2026-11-14-ab.txt`) found no change from the compiler (main
-`40cdc16` against 0.4.1) nor from the packages (their main against the APM branch).
-
-Single-request latency, cold (cache flushed) / warm, in ms:
-
-| route | xisto | Node |
-|---|---:|---:|
-| article list | 2.09 / 0.51 | 2.43 / 0.49 |
-| article by slug | 1.59 / 0.39 | 2.02 / 0.53 |
-| current user | 1.09 / 0.63 | 1.92 / 1.00 |
-| tags | 0.90 / 0.47 | 1.22 / 0.55 |
-| login | 25.30 / 23.78 | 29.53 / 28.64 |
 
 ## Node's http module on Linux
 

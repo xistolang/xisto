@@ -56,15 +56,20 @@ The per-kernel tables, with the C reference beside them, are on [PolyBench](./po
 | Xisto (native) | **71,544** | **662,156** | 5.5 MB |
 | actix-web (Rust) | 65,891 | 570,564 | 14.1 MB |
 | Bun | 54,497 | 114,146 | 90.8 MB |
-| Xisto + NestJS, 2 processes | 53,032 | 239,187 | 16.2 MB |
-| Xisto + NestJS, with the lock | 44,216 | 116,817 | 10.7 MB |
 | Go net/http | 32,636 | 44,657 | 30.8 MB |
 | Node http | 29,317 | 51,066 | 289.4 MB |
 | fastify | 25,672 | 36,387 | 303.7 MB |
 
-Xisto's native server is first on both tests, ahead of actix-web, and NestJS built with Xisto passes Go, Node and
-fastify. NestJS's workers without the handler lock crash (shared singletons). At high concurrency Xisto's tail
-latency (p99) is still worse than actix-web's. The per-level tables and charts are on [TechEmpower](./techempower/index.md).
+Xisto's native server is first on both tests, ahead of actix-web. At high concurrency Xisto's tail latency (p99) is
+still worse than actix-web's. The per-level tables and charts are on [TechEmpower](./techempower/index.md).
+
+## NestJS
+
+The same Nest app, unchanged, built with Xisto or run on Node and Bun. On the TechEmpower routes (Xeon VM, 14 Nov)
+the app built with Xisto serves 53,032 json requests per second in two processes with 16.2 MB; Node and Bun on that
+app come with the next VM round. On Conduit, the RealWorld app with Postgres and Redis (M4, 14 Nov), Xisto starts in
+20 ms against Node's 267 ms, rests at 7.3 MB against 137.3 MB, and answers more requests on every route but the
+article by slug with the cache warm. The charts and tables are on [NestJS](./nest.md).
 
 ## Benchmarks Game against Node and Bun
 
@@ -99,7 +104,8 @@ program. Apple M4, 7 Nov 2026, `bench/results/2026-11-07-Apple-M4.csv`.
 - [Benchmarks Game](./benchmarks-game/index.md): against Rust, Node and Bun, per problem.
 - [PolyBench](./polybench/index.md): 30 numerical kernels against Rust and Go, per kernel.
 - [TechEmpower](./techempower/index.md): json and plaintext against actix, Go, Node, fastify and Bun.
-- [HTTP](./http.md): hello, Todo API, the Conduit NestJS app, threads, resilience, slow dependencies.
+- [NestJS](./nest.md): the same Nest app on Xisto, Node and Bun: the TechEmpower routes and Conduit.
+- [HTTP](./http.md): hello, Todo API, threads, resilience, slow dependencies.
 - [Energy, SQLite, streams and micro programs](./energy-sqlite-streams.md).
 
 ## See also
