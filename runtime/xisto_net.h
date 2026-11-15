@@ -4357,8 +4357,11 @@ XS_NOINLINE void xs_net_wake(int64_t port) { /* a connection to our own listener
 }
 /* node:http (runtime/node/http.ts) over node:net's sockets: a write that never parks (what the socket takes now),
    and the message head (request or status line, then the headers) parsed in one call */
-XS_NOINLINE xs_Uint8Array *xs_net_read_buf(int64_t fd) { /* as xs_net_read, the bytes as a Buffer (what Node's 'data' gives) */
+/* as xs_net_read, the bytes as a Buffer (what Node's 'data' gives). drained: the last read was short, so the socket is
+   empty: wait for it first instead of a read that would only say EAGAIN (one system call less per request) */
+XS_NOINLINE xs_Uint8Array *xs_net_read_buf(int64_t fd, bool drained) {
     if (!xs_net_rbuf) xs_net_rbuf = malloc(65536);
+    if (drained) xs_wait_fd((int)fd, EVFILT_READ);
     for (;;) {
         ssize_t r = read((int)fd, xs_net_rbuf, 65536);
         if (r > 0) {

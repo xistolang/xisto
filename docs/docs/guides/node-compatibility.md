@@ -230,30 +230,47 @@ server.listen(3000, () => console.log("listening"));
 
 `createServer(listener)` gives a server whose listener receives an `IncomingMessage` and a `ServerResponse`:
 
-- **Request:** `method`, `url` (path and query), `headers` (lower-case names), `rawHeaders`, `httpVersion`. The
-  request (and the client's response) is a `stream.Readable`: `'data'`/`'end'`, `setEncoding`, `pipe()` and
-  `for await (const chunk of req)`.
-- **Response:** `statusCode`, `setHeader`/`appendHeader`/`getHeader`/`getHeaders`/`hasHeader`/`removeHeader`,
-  `writeHead(status, headers)`, `write`, `end`, and `'finish'`.
-- **Server:** `listen(port, cb)`, with port 0 choosing a free port, `address()`, `close(cb)`, and the
-  `'request'`, `'listening'` and `'close'` events.
+- **Request:** `method`, `url` (path and query), `headers` (lower-case names), `rawHeaders`, `httpVersion`,
+  `socket` (`remoteAddress`, `remotePort`, `localPort`, `encrypted`, `destroy()`), `complete`, `aborted`. The
+  request (and the client's response) is a `stream.Readable`: `'data'`/`'end'`/`'close'`, `setEncoding`, `pipe()`
+  and `for await (const chunk of req)`. Bodies are bytes: `'data'` gives Buffers (strings after `setEncoding`), so
+  uploads of images or any binary arrive byte for byte; `body += chunk` gives the UTF-8 text, as in Node.
+- **Response:** `statusCode`, `statusMessage`, `setHeader`/`appendHeader`/`getHeader`/`getHeaders`/`hasHeader`/
+  `removeHeader`, `writeHead(status[, reason], headers)`, `flushHeaders()`, `write`, `end`, `headersSent`,
+  `writableEnded`/`writableFinished`, and `'finish'`, `'close'` and `'drain'`. `write()` and `end()` take strings,
+  Buffers and Uint8Arrays (gzip from `node:zlib`, files, downloads), and `Content-Length` counts bytes. The
+  response is a `stream.Writable`, so a stream can `pipe()` into it.
+- **Server:** `listen(port[, host], cb)`, with port 0 choosing a free port, `address()`, `close(cb)`,
+  `closeIdleConnections()`, `closeAllConnections()`, `keepAliveTimeout` and the `'request'`, `'connection'`,
+  `'checkContinue'`, `'listening'`, `'close'` and `'error'` events. `http.Server` works as a type and with `new`.
 
-`listen()` returns at once, as in Node. The server answers once the program's own code has run, on the same event
-loop as its timers and other sockets. `close()` lets the program end normally.
+Responses stream as in Node. The head goes out with the first `write()` (or `flushHeaders()`), each `write()` is
+sent at once, and the body is chunked when no `Content-Length` was set (`end(body)` alone sends a
+`Content-Length`). Server-sent events work: `res.writeHead(200, { "Content-Type": "text/event-stream" })`, then
+`res.write("data: ...\n\n")` from a timer. `write()` returns false once more than 16 KB wait to be sent, and
+`'drain'` follows. When the client goes away, the request and the response get `'close'`.
 
-The client side, `http.request(url | options, cb)` and `http.get(...)`, runs on `fetch`. You get a
-`ClientRequest` (`setHeader`, `write`, `end`, `'response'`, `'error'`) and an `IncomingMessage` response
-(`statusCode`, `statusMessage`, `headers`, `'data'`/`'end'`). `STATUS_CODES` and `METHODS` are there too.
+A program can run any number of servers (an app and a metrics endpoint, the servers of a test), each on its own
+port. `close()` of one leaves the others serving. `listen()` returns at once, as in Node. Each connection is a
+task on the program's event loop, next to its timers and other sockets, and `close()` lets the program end
+normally once its connections are closed.
+
+The client side, `http.request(url | options, cb)` and `http.get(...)`, gives a `ClientRequest` (`setHeader`,
+`write`, `end`, `setTimeout`, `destroy`, `'response'`, `'error'`, `'close'`) and an `IncomingMessage` response
+(`statusCode`, `statusMessage`, `headers`, `'data'`/`'end'`). The response's body comes as it arrives (a
+server-sent events stream can be read), as Buffers. `STATUS_CODES` and `METHODS` are there too.
 
 Differences from Node:
 
-- Bodies are text: binary request and response bodies are read and written as UTF-8.
-- A response is sent when `end()` is called. `write()` buffers, so there is no chunked streaming yet. For
-  streaming, use xisto's `HttpResponse.stream`.
-- One server per program.
-- The server class is `HttpServer`. The name `Server` is xisto's built-in server, so `import { Server } from
-  "node:http"` does not work; `http.createServer` does.
-- `Agent` is not there yet.
+- A client request's body is sent at `end()` with a `Content-Length` (Node streams it chunked when `write()` came
+  before `end()`). Each request opens its own connection: there is no `Agent` and no connection reuse yet.
+- A request body is not held back: `req.pause()` does not stop the reading of the socket, so a large upload the
+  handler does not read is kept in memory.
+- `headersTimeout`, `requestTimeout` and `server.setTimeout` are accepted but not enforced; idle keep-alive
+  connections are closed after `keepAliveTimeout`. HTTP/1.1 only (no HTTP/2, no `upgrade`/`CONNECT` events).
+- `req.socket` is a small socket object (addresses, `destroy()`, `'close'`), not a `net.Socket`.
+- `new http.Server()` and `import { Server } from "node:http"` name node:http's server where they are imported;
+  elsewhere `Server` is xisto's built-in server.
 
 ## net
 
@@ -468,7 +485,7 @@ Differences from Node:
   connection only.
 - The handshake's error messages are the TLS library's, not OpenSSL's codes (`DEPTH_ZERO_SELF_SIGNED_CERT`...).
 - Not available yet: `tls.createServer` (`node:https` serves TLS), client certificates, `passphrase`, SNI
-  callbacks.
+  callbacks. `node:https` has node:http's behavior otherwise: binary bodies, streaming, several servers.
 - `TLSSocket` is an `EventEmitter`, not a `stream.Duplex`.
 
 ## TLS

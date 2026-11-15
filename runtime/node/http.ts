@@ -13,7 +13,7 @@ import { channel } from "xisto:diagnostics_channel";
 declare function net_listen(host: string, port: int): int;
 declare function net_accept(lfd: int): int;
 declare function net_connect(host: string, port: int): int;
-declare function net_read_buf(fd: int): Uint8Array;
+declare function net_read_buf(fd: int, drained: boolean): Uint8Array;
 declare function net_read_error(): int;
 declare function net_write(fd: int, bytes: Uint8Array): int;
 declare function net_send(fd: int, bytes: Uint8Array, off: int): int;
@@ -115,12 +115,15 @@ export class HttpSystemError extends Error {
  * read() and writeAll() park the task that calls them; send() never does. */
 export class HttpTransport {
   fd: int;
+  private drained: boolean = false;
   constructor(fd: int) {
     this.fd = fd;
   }
   /** The next bytes (a Buffer); empty at the end or on an error. */
   read(): Uint8Array {
-    return net_read_buf(this.fd);
+    const b = net_read_buf(this.fd, this.drained);
+    this.drained = b.length < 65536;
+    return b;
   }
   /** Writes what the socket takes now: the bytes written (0: it is full), or a negative error code. */
   send(b: Uint8Array, off: int): int {
