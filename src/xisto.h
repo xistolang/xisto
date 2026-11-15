@@ -85,6 +85,8 @@ void xs_warn_rule_summary(void);
 extern bool xs_show_warnings, xs_deny_warnings;
 extern jmp_buf *xs_error_recover; /* when set, xs_error longjmps here instead of exiting (up to 20 errors) */
 extern int xs_error_count;
+extern bool xs_diag_mute;   /* (XB-231: a promise version is checked without reporting) */
+extern int xs_muted_errors;
 extern bool xs_warnings;
 /* --tls=off: never link TLS; a dynamic fetch URL is then assumed to be http:// (TLS ends at the load balancer) */
 extern bool xs_tls_off;
@@ -467,6 +469,12 @@ struct Func {
     bool is_async;
     bool ret_maybe_sync; /* declared T | Promise<T> and not async: a call kept gives its value (JavaScript's T when it returns one) */
     bool ret_promise;  /* declared to return Promise<T> (ret is T): async whether or not it is written async */
+    void *pv_state;    /* not async, declared Promise<T>: where its parameters start, to parse it again as its promise version */
+    struct Type **inst_args; /* a generic instance: its type arguments (its promise version is parsed with them) */
+    struct Func *pver; /* XB-231: its version that returns the promise its body hands back (no await, no coroutine), for the
+                          calls whose promise is kept; used when pv_ok */
+    struct Func *pv_of; /* a promise version: the function it was made from */
+    bool pv_ok;        /* a promise version whose body never waits: its calls replace the spawned ones */
     Class *cls;        /* owning class for methods, else NULL */
     Class *static_of;  /* a static method (lowered to Class__s_name): its class, which reaches its private members */
     bool is_ctor;
@@ -762,6 +770,7 @@ extern bool xs_rsten; /* emit.c: U of the jam of j and of k (main.c: by target) 
 extern bool xs_wide_f64; /* distribute.c: the target has 4-lane double vectors (AVX2): the slow consts that read no column go in a flat loop */
 void prune_program(Program *p); /* marks what main reaches; emitters skip the rest */
 Func *xs_parse_instance(Func *tmpl, Type **args);
+Func *xs_parse_promise_version(Func *f);
 Class *xs_parse_class_instance(Class *tmpl, Type **args, const char *name); /* parser.c: a generic function parsed again with its T bound */
 extern bool xs_debug;   /* --debug: statement hooks and the debugger agent (docs/debugger.md) */
 extern bool xs_profile; /* --profile: instrument every function with call counts and timing */
