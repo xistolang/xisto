@@ -326,3 +326,10 @@ code, pre, kbd, .prism-code { font-variant-ligatures: none; font-feature-setting
   --chart-s5: #3987e5;
   --chart-s6: #d55181;
 }
+
+/* the version dropdown on top of the docs sidebar on a phone (src/theme/Navbar/MobileSidebar/SecondaryMenu) */
+.xisto-mobile-versions {
+  margin-bottom: 0.5rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--ifm-toc-border-color);
+}
