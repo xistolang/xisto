@@ -125,12 +125,16 @@ else
 fi
 
 # stderr: console.error/warn go to stderr and log/info/debug to stdout, each as Node writes it (the expected files are
-# Node's two streams, checked in: the tests/ok oracle merges them)
+# Node's two streams, checked in: the tests/ok oracle merges them). Durations ("1.234ms", "(0.5ms)", "duration_ms 2.1")
+# and the pid of Node's warnings ("(node:123)") are normalized in both; NAME.rc next to the program: its exit status
+norm_times() { sed -E 's/[0-9]+(\.[0-9]+)?(ms|s)([^a-zA-Z0-9]|$)/Nms\3/g; s/duration_ms [0-9.]+/duration_ms N/g; s/\(node:[0-9]+\)/(node:PID)/g'; }
 for f in tests/stderr/*.ts; do
     name=stderr-$(basename "$f" .ts)
     if ! $XISTO build -o "$OUT/$name" "$f" > "$OUT/$name.build" 2>&1; then echo "FAIL $f: xisto build failed"; cat "$OUT/$name.build"; fail=$((fail+1)); continue; fi
-    "$OUT/$name" > "$OUT/$name.out" 2> "$OUT/$name.err" < /dev/null
-    if cmp -s "$OUT/$name.out" "${f%.ts}.stdout" && cmp -s "$OUT/$name.err" "${f%.ts}.stderr"; then pass=$((pass+1));
+    "$OUT/$name" > "$OUT/$name.out0" 2> "$OUT/$name.err0" < /dev/null; rc=$?
+    norm_times < "$OUT/$name.out0" > "$OUT/$name.out"; norm_times < "$OUT/$name.err0" > "$OUT/$name.err"
+    if [ -f "${f%.ts}.rc" ] && [ "$rc" != "$(cat "${f%.ts}.rc")" ]; then echo "FAIL $f: exit status $rc, expected $(cat "${f%.ts}.rc")"; fail=$((fail+1));
+    elif cmp -s "$OUT/$name.out" "${f%.ts}.stdout" && cmp -s "$OUT/$name.err" "${f%.ts}.stderr"; then pass=$((pass+1));
     else echo "FAIL $f: stdout or stderr differs from node"; diff "${f%.ts}.stdout" "$OUT/$name.out" | head; diff "${f%.ts}.stderr" "$OUT/$name.err" | head; fail=$((fail+1)); fi
 done
 

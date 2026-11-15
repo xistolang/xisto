@@ -3096,6 +3096,68 @@ static Func *crypto_func_overload(Expr *e, Func *f) {
     return f;
 }
 
+/* node:assert's throws, rejects, doesNotThrow, doesNotReject: the form for the second argument (xisto:assert):
+   a class (C) is __throwsClass(fn, (e: any) => e instanceof C, "C", ...), a RegExp __throwsRe, a function
+   __throwsFn, a message __throwsMsg; anything else (an object to compare) stays throws. doesNotThrow and
+   doesNotReject: __doesNotThrowClass/Re for a class or a RegExp (another error is thrown again); a validation
+   function before the message is dropped */
+static Expr *ad_ident(Pos at, const char *n);
+static Func *assert_func_overload(Expr *e, Func *f) {
+    if (!f || !f->mod || !f->mod->file || strcmp(f->mod->file, "xisto:assert") != 0 || e->args.len < 2) return f;
+    bool th = !strcmp(f->name, "throws"), rj = !strcmp(f->name, "rejects");
+    bool dn = !strcmp(f->name, "doesNotThrow") || !strcmp(f->name, "doesNotReject");
+    if (!th && !rj && !dn) return f;
+    Expr *a = e->args.items[1];
+    bool done = a->kind == E_ARROW && a->arrow && a->arrow->fn->nparams == 1 && a->arrow->fn->params[0].name &&
+                !strncmp(a->arrow->fn->params[0].name, "__ae", 4); /* (a call checked again: already the class form) */
+    bool cls = !done && a->kind == E_IDENT && !lookup(a->str) && find_class(a->str) && !lookup_func(a->str);
+    bool msg = a->kind == E_STRING || a->kind == E_TEMPLATE;
+    if (dn && (msg || (!cls && !done && a->kind != E_REGEX))) { /* (fn, message), or (fn, validate, message): (fn, message) */
+        if (a->kind == E_ARROW) {
+            for (int i = 1; i + 1 < e->args.len; i++) e->args.items[i] = e->args.items[i + 1];
+            e->args.len--;
+        }
+        return f;
+    }
+    const char *form = cls || done ? "Class" : a->kind == E_REGEX ? "Re" : a->kind == E_ARROW ? "Fn" : msg ? "Msg" : NULL;
+    if (!form) return f;
+    if (cls) { /* (e: any): boolean => e instanceof C, then the class's name */
+        static int nisa;
+        Pos at = a->pos;
+        const char *pv = xs_sprintf("__ae%d", nisa++);
+        Func *fn = xs_alloc(sizeof *fn);
+        fn->pos = at; fn->name = "arrow"; fn->ret = ty_boolean;
+        fn->params = xs_alloc(sizeof(Param));
+        memset(fn->params, 0, sizeof(Param));
+        fn->params[0].name = (char *)pv; fn->params[0].type = ty_any;
+        fn->nparams = 1;
+        Expr *isa = xs_alloc(sizeof *isa);
+        isa->kind = E_BINARY; isa->op = TK_IDENT; isa->pos = at; isa->field = -1; isa->lhs = ad_ident(at, pv); isa->rhs = ad_ident(at, a->str);
+        Stmt *body = xs_alloc(sizeof *body);
+        body->kind = S_BLOCK; body->pos = at;
+        Stmt *r = xs_alloc(sizeof *r);
+        r->kind = S_RETURN; r->pos = at; r->expr = isa;
+        stmt_list_push(&body->stmts, r);
+        fn->body = body;
+        Arrow *ar = xs_alloc(sizeof *ar); ar->pos = at; ar->fn = fn; ar->expr_body = false;
+        Expr *ae = xs_alloc(sizeof *ae); ae->kind = E_ARROW; ae->pos = at; ae->field = -1; ae->arrow = ar;
+        Expr *nm = xs_alloc(sizeof *nm);
+        nm->kind = E_STRING; nm->pos = at; nm->field = -1; nm->str = a->str;
+        ExprList args = {0};
+        expr_list_push(&args, e->args.items[0]);
+        expr_list_push(&args, ae);
+        expr_list_push(&args, nm);
+        for (int i = 2; i < e->args.len; i++) expr_list_push(&args, e->args.items[i]);
+        e->args = args;
+    }
+    const char *gname = xs_sprintf("__%s%s", th ? "throws" : rj ? "rejects" : f->name, form);
+    SYM_EACH(funcs_by_name, gname, fe) {
+        Func *g = fe->decl;
+        if (g->mod == f->mod) return g;
+    }
+    return f;
+}
+
 static bool is_builtin_name(const char *n) {
     return strcmp(n, "Math") == 0 || strcmp(n, "console") == 0 || strcmp(n, "Number") == 0 || strcmp(n, "process") == 0 || strcmp(n, "Date") == 0 || strcmp(n, "performance") == 0 || strcmp(n, "Atomics") == 0 || strcmp(n, "lines") == 0 || strcmp(n, "chunks") == 0 || strcmp(n, "assert") == 0 ||
            strcmp(n, "String") == 0 || strcmp(n, "Array") == 0 || strcmp(n, "fetch") == 0 || strcmp(n, "Promise") == 0 || find_class(n) != NULL || find_enum(n) != NULL;
@@ -11203,7 +11265,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
-        Func *f = crypto_func_overload(e, lookup_func(name));
+        Func *f = assert_func_overload(e, crypto_func_overload(e, lookup_func(name)));
         if (!f) {
             Binding *b = lookup(name);
             if (b && b->type->kind == TY_FUNC) { /* calling a function value */
@@ -12212,7 +12274,12 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
             if (strcmp(ns, "performance") == 0) {
-                if (!e->is_call || strcmp(e->str, "now") != 0 || e->args.len != 0) xs_error(XS7114, e->pos, "supported: performance.now()", "unknown performance member '%s'", e->str);
+                if (!(e->is_call && strcmp(e->str, "now") == 0 && e->args.len == 0) && find_class("XistoPerformance")) {
+                    e->lhs = mk_ident(e->lhs->pos, "XistoPerformance"); /* performance.mark & co: xisto:perf_hooks */
+                    check_expr(e, expected);
+                    return;
+                }
+                if (!e->is_call || strcmp(e->str, "now") != 0 || e->args.len != 0) xs_error(XS7114, e->pos, "supported: performance.now, timeOrigin, mark, measure, getEntries, getEntriesByName, getEntriesByType, clearMarks, clearMeasures, toJSON", "unknown performance member '%s'", e->str);
                 e->type = ty_number;
                 e->builtin.cfn = "xs_performance_now";
                 return;
@@ -12493,6 +12560,12 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
             if (strcmp(ns, "console") == 0) {
+                bool core = e->is_call && (!strcmp(e->str, "log") || !strcmp(e->str, "info") || !strcmp(e->str, "debug") || !strcmp(e->str, "error") || !strcmp(e->str, "warn"));
+                if (!core && find_class("XistoConsole")) { /* console.time & co: XistoConsole.X of xisto:console (runtime/node/console.ts) */
+                    e->lhs = mk_ident(e->lhs->pos, "XistoConsole");
+                    check_expr(e, expected);
+                    return;
+                }
                 if (!e->is_call || (strcmp(e->str, "log") != 0 && strcmp(e->str, "info") != 0 && strcmp(e->str, "debug") != 0 &&
                                     strcmp(e->str, "error") != 0 && strcmp(e->str, "warn") != 0))
                     xs_error(XS7112, e->pos, "supported: console.log, console.info, console.debug (stdout), console.error, console.warn (stderr)", "unknown console member '%s'", e->str);
@@ -19030,8 +19103,8 @@ void check_program(Program *p) {
                     found = true; /* the built-in Buffer (node:buffer exports it; it is a global too) */
                 if (!found && strcmp(im->from->file, "xisto:util") == 0 && (strcmp(name, "TextEncoder") == 0 || strcmp(name, "TextDecoder") == 0))
                     found = true; /* built-in classes (node:util re-exports them) */
-                if (!found && im->from->builtin && strcmp(im->from->file, "perf_hooks") == 0 && strcmp(name, "performance") == 0)
-                    found = true; /* the built-in performance */
+                if (!found && strcmp(im->from->file, "xisto:perf_hooks") == 0 && strcmp(name, "performance") == 0)
+                    found = true; /* the built-in performance (its other members: XistoPerformance) */
                 if (!found && im->from->builtin && strcmp(im->from->file, "timers") == 0 && !im->is_default)
                     for (const char *const *t = (const char *const[]){"setTimeout", "setInterval", "setImmediate", "clearTimeout", "clearInterval",
                                                                        "clearImmediate", "queueMicrotask", NULL}; *t; t++)

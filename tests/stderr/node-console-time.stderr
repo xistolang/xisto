@@ -1,0 +1,12 @@
+Assertion failed
+Assertion failed: x y 3
+Assertion failed: count: 7
+  error in group
+  warn
+  in group
+  Assertion failed: assert in group
+(node:PID) Warning: Label 'load' already exists for console.time()
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:PID) Warning: No such label 'nope' for console.timeEnd()
+(node:PID) Warning: No such label 'nope' for console.timeLog()
+(node:PID) Warning: Count for 'zz' does not exist

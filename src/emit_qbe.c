@@ -738,6 +738,7 @@ static char *emit_expr_raw(Expr *e) {
         }
         if (base->kind == E_IDENT && !base->cname && strcmp(base->str, "console") == 0) {
             if (strcmp(e->str, "error") == 0 || strcmp(e->str, "warn") == 0) { unsupported(e->pos, xs_sprintf("console.%s", e->str)); return ""; }
+            if (prog->uses_console_group) { unsupported(e->pos, "console.log in a program with console.group"); return ""; } /* (the C path indents it) */
             for (int i = 0; i < e->args.len; i++) {
                 if (i) ins("call $xr_print_sep()");
                 emit_print(e->args.items[i]);

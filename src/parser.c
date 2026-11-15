@@ -71,6 +71,12 @@ static bool wants_okmap; /* WeakMap, or Map<object, V>, was written: xisto:okmap
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
 static void import_process(Program *prog, Module *m);
 static void import_stdio(Program *prog, Module *m);
+static void import_builtin_class(Program *prog, Module *m, const char *path, const char *name);
+static bool declares_top_from(const char *src, const char *q, const char *name);
+static bool is_assert_path(const char *path);
+static bool is_test_path(const char *path);
+static struct Expr *ns_member(Parser *p, struct Expr *e, Token name);
+static void assert_src_arg(Parser *p, struct Expr *call, const char *start);
 static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... was named: xisto:url is loaded */
 static bool wants_errors; /* TypeError, RangeError, SyntaxError or ReferenceError was named: xisto:errors is loaded */
 static bool is_js_error_name(const char *n) {
@@ -1302,6 +1308,61 @@ static bool is_url_global_name(const char *n) {
     return n && (!strcmp(n, "URL") || !strcmp(n, "URLSearchParams") || !strcmp(n, "AbortController") || !strcmp(n, "AbortSignal") ||
                  !strcmp(n, "DOMException") || !strcmp(n, "RequestInit") || !strcmp(n, "HeadersInit") || !strcmp(n, "fetch") || !strcmp(n, "BufferEncoding"));
 }
+/* globalThis: the standard globals of Node, each with what typeof gives for it there. globalThis.X is the global X
+   (read as X), typeof globalThis.X is that string ("undefined" for a name Node does not have), "X" in globalThis is
+   true for these names. A global is a static name here, so globalThis is never a value: assigning a new property
+   (globalThis.foo = 1), reading one of a name not listed, or passing globalThis around is an error that says so */
+static const struct { const char *name, *type; } js_globals[] = {
+    {"globalThis", "object"}, {"global", "object"}, {"console", "object"}, {"process", "object"}, {"performance", "object"},
+    {"crypto", "object"}, {"Math", "object"}, {"JSON", "object"}, {"Reflect", "object"}, {"Intl", "object"}, {"Atomics", "object"},
+    {"navigator", "object"}, {"setTimeout", "function"}, {"setInterval", "function"}, {"setImmediate", "function"},
+    {"clearTimeout", "function"}, {"clearInterval", "function"}, {"clearImmediate", "function"}, {"queueMicrotask", "function"},
+    {"structuredClone", "function"}, {"fetch", "function"}, {"atob", "function"}, {"btoa", "function"}, {"parseInt", "function"},
+    {"parseFloat", "function"}, {"isNaN", "function"}, {"isFinite", "function"}, {"encodeURIComponent", "function"},
+    {"decodeURIComponent", "function"}, {"encodeURI", "function"}, {"decodeURI", "function"}, {"String", "function"},
+    {"Number", "function"}, {"Boolean", "function"}, {"Array", "function"}, {"Object", "function"}, {"Map", "function"},
+    {"Set", "function"}, {"WeakMap", "function"}, {"WeakSet", "function"}, {"WeakRef", "function"}, {"Promise", "function"},
+    {"Date", "function"}, {"RegExp", "function"}, {"Error", "function"}, {"TypeError", "function"}, {"RangeError", "function"},
+    {"SyntaxError", "function"}, {"ReferenceError", "function"}, {"URIError", "function"}, {"EvalError", "function"},
+    {"AggregateError", "function"}, {"Symbol", "function"}, {"BigInt", "function"}, {"Function", "function"}, {"Proxy", "function"},
+    {"Buffer", "function"}, {"URL", "function"}, {"URLSearchParams", "function"}, {"TextEncoder", "function"}, {"TextDecoder", "function"},
+    {"AbortController", "function"}, {"AbortSignal", "function"}, {"DOMException", "function"}, {"Uint8Array", "function"},
+    {"Uint8ClampedArray", "function"}, {"Int8Array", "function"}, {"Uint16Array", "function"}, {"Int16Array", "function"},
+    {"Uint32Array", "function"}, {"Int32Array", "function"}, {"Float32Array", "function"}, {"Float64Array", "function"},
+    {"BigInt64Array", "function"}, {"BigUint64Array", "function"}, {"ArrayBuffer", "function"}, {"SharedArrayBuffer", "function"},
+    {"DataView", "function"}, {"Headers", "function"}, {"Request", "function"}, {"Response", "function"}, {"FormData", "function"},
+    {"Blob", "function"}, {"File", "function"}, {"WebSocket", "function"}, {"EventTarget", "function"}, {"Event", "function"},
+    {"CustomEvent", "function"}, {"MessageChannel", "function"}, {"MessagePort", "function"}, {"BroadcastChannel", "function"},
+    {"ReadableStream", "function"}, {"WritableStream", "function"}, {"TransformStream", "function"}, {"CompressionStream", "function"},
+    {"DecompressionStream", "function"}, {"TextEncoderStream", "function"}, {"TextDecoderStream", "function"},
+    {"PerformanceEntry", "function"}, {"PerformanceMark", "function"}, {"PerformanceMeasure", "function"},
+    {"Crypto", "function"}, {"CryptoKey", "function"}, {"SubtleCrypto", "function"}, {"NaN", "number"}, {"Infinity", "number"},
+    {"undefined", "undefined"},
+};
+static const char *js_global_type(const char *n) {
+    for (size_t i = 0; n && i < sizeof js_globals / sizeof *js_globals; i++)
+        if (strcmp(js_globals[i].name, n) == 0) return js_globals[i].type;
+    return NULL;
+}
+/* the global objects of other runtimes (browsers, Deno, Bun): typeof window is "undefined" on Node, as here */
+static bool is_foreign_global(const char *n) {
+    static const char *const names[] = {"window", "document", "self", "location", "Deno", "Bun", "importScripts", "WorkerGlobalScope", NULL};
+    for (int i = 0; names[i]; i++) if (strcmp(names[i], n) == 0) return true;
+    return false;
+}
+/* the module binds the name itself: an import (named, default or namespace), or a top-level declaration */
+static bool binds_name(Parser *p, const char *n) {
+    if (p->mod)
+        for (int i = 0; i < p->mod->nimports; i++)
+            for (int k = 0; k < p->mod->imports[i].n; k++)
+                if (strcmp(p->mod->imports[i].names[k], n) == 0) return true;
+    for (int i = 0; i < p->nns; i++) if (strcmp(p->ns_alias[i], n) == 0) return true;
+    for (int i = 0; i < p->nalias; i++) if (strcmp(p->alias_from[i], n) == 0) return true;
+    return declares_top_from(p->lx.src, p->lx.src, n);
+}
+static const char *globalthis_help =
+    "globalThis reads the standard globals (globalThis.setTimeout, globalThis.crypto...); a value shared across modules is "
+    "an exported module variable: export let config = ...";
 /* import.meta.url / dirname / filename: the module's source file as the build found it (an absolute path, symbolic
    links resolved, as Node gives the main module's). xisto compiles ahead of time, so this is where the source was
    built, not where the binary runs: what new URL("./x", import.meta.url) and fileURLToPath(import.meta.url) want to
@@ -1515,6 +1576,36 @@ static Expr *parse_primary(Parser *p) {
             next(p);
             return new_expr(E_NULL, pos);
         }
+        if (strcmp(p->tok.str, "globalThis") == 0 && !binds_name(p, "globalThis")) { /* globalThis.X: the global X (js_globals) */
+            next(p);
+            if (!at(p, TK_DOT) && !at(p, TK_QDOT))
+                xs_error(XS7151, pos, globalthis_help, "globalThis as a value is not supported (its properties are the program's static globals)");
+            next(p);
+            if (!at(p, TK_IDENT)) xs_error(XS7151, p->tok.pos, globalthis_help, "globalThis[...] is not supported: write globalThis.name");
+            const char *gn = p->tok.str;
+            if (!js_global_type(gn) || !strcmp(gn, "globalThis") || !strcmp(gn, "global"))
+                xs_error(XS7150, p->tok.pos, globalthis_help, "globalThis.%s is not a global xisto knows", gn);
+            Parser look = *p;
+            next(&look);
+            if (at(&look, TK_ASSIGN))
+                xs_error(XS7151, p->tok.pos, globalthis_help, "assigning globalThis.%s is not supported: the globals are fixed when the program is compiled", gn);
+            if (!strcmp(gn, "crypto")) { /* (globalThis.crypto is the global one even where the module has a crypto of its own) */
+                import_builtin_class(p->prog, p->mod, "xisto:crypto", "__xs_crypto");
+                p->tok.str = "__xs_crypto";
+            }
+            return parse_primary(p); /* (the global itself, as if written without globalThis.) */
+        }
+        if (strcmp(p->tok.str, "crypto") == 0) { /* crypto.randomUUID() & co: the global Web Crypto, xisto:crypto's webcrypto */
+            Parser look = *p;
+            next(&look);
+            if (at(&look, TK_DOT) && peek_is_ident(&look) && !binds_name(p, "crypto")) {
+                next(&look);
+                if (!strcmp(look.tok.str, "randomUUID") || !strcmp(look.tok.str, "getRandomValues") || !strcmp(look.tok.str, "subtle")) {
+                    import_builtin_class(p->prog, p->mod, "xisto:crypto", "__xs_crypto");
+                    p->tok.str = "__xs_crypto";
+                }
+            }
+        }
         if (is_url_global_name(p->tok.str)) wants_url = true; /* (AbortSignal.timeout(n): a member read made here) */
         if (strcmp(p->tok.str, "process") == 0) { /* process.on(...), process.platform...: xisto:process */
             Parser look = *p;
@@ -1530,6 +1621,81 @@ static Expr *parse_primary(Parser *p) {
                     if (!at(&look, TK_DOT) || (next(&look), !look.tok.str || strcmp(look.tok.str, "write") != 0)) import_stdio(p->prog, p->mod);
                 }
                 if (!is_core) import_process(p->prog, p->mod);
+            }
+        }
+        if (strcmp(p->tok.str, "performance") == 0) { /* performance.mark & co: XistoPerformance of xisto:perf_hooks */
+            Parser look = *p;
+            next(&look);
+            if (at(&look, TK_DOT)) {
+                next(&look);
+                if (look.tok.str && strcmp(look.tok.str, "now") != 0) import_builtin_class(p->prog, p->mod, "xisto:perf_hooks", "XistoPerformance");
+            }
+        }
+        if (strcmp(p->tok.str, "console") == 0) { /* console.time, console.table...: XistoConsole of xisto:console (runtime/node/console.ts) */
+            Parser look = *p;
+            next(&look);
+            if (at(&look, TK_DOT)) {
+                next(&look);
+                const char *mn = look.tok.str;
+                if (mn && strcmp(mn, "log") != 0 && strcmp(mn, "info") != 0 && strcmp(mn, "debug") != 0 && strcmp(mn, "error") != 0 && strcmp(mn, "warn") != 0) {
+                    import_builtin_class(p->prog, p->mod, "xisto:console", "XistoConsole");
+                    if (!strcmp(mn, "group") || !strcmp(mn, "groupCollapsed")) p->prog->uses_console_group = true;
+                }
+            }
+        }
+        if (peek_is(p, TK_DOT) && p->mod) { /* test.skip(...) & co of node:test (a named import): __test_skip(...) */
+            const char *tn = p->tok.str;
+            bool t_or_d = !strcmp(tn, "test") || !strcmp(tn, "it") || !strcmp(tn, "describe") || !strcmp(tn, "suite");
+            bool imported = false;
+            for (int i = 0; t_or_d && i < p->mod->nimports; i++)
+                for (int k = 0; k < p->mod->imports[i].n; k++)
+                    if (!strcmp(p->mod->imports[i].names[k], tn) && is_test_path(p->mod->imports[i].path)) imported = true;
+            Parser look = *p;
+            next(&look);
+            next(&look);
+            if (imported && at(&look, TK_IDENT) && (!strcmp(look.tok.str, "skip") || !strcmp(look.tok.str, "todo") || !strcmp(look.tok.str, "only")) &&
+                peek_is(&look, TK_LPAREN)) {
+                const char *fname = xs_sprintf("__%s_%s", tn[0] == 't' || tn[0] == 'i' ? "test" : "describe", look.tok.str);
+                import_builtin_class(p->prog, p->mod, "xisto:test", fname);
+                next(&look);
+                *p = look;
+                Expr *c = new_expr(E_CALL, pos);
+                c->lhs = ident_expr(pos, fname);
+                parse_args(p, &c->args);
+                return c;
+            }
+        }
+        if (peek_is(p, TK_LPAREN) && ns_import_of(p, p->tok.str) && is_test_path(ns_import_of(p, p->tok.str)->path)) {
+            Token tn = p->tok; /* test(...) with test the default import of node:test (the module): its test() */
+            tn.str = "test";
+            Expr *callee = ns_member(p, ident_expr(pos, p->tok.str), tn);
+            next(p);
+            Expr *c = new_expr(E_CALL, pos);
+            c->lhs = callee;
+            parse_args(p, &c->args);
+            return c;
+        }
+        if (peek_is(p, TK_LPAREN)) { /* assert(x) with assert the namespace of node:assert: assert.ok(x); ok(x) of node:assert */
+            const char *start = p->tok.start;
+            Import *ai = ns_import_of(p, p->tok.str);
+            bool named_ok = false;
+            if (!ai && !strcmp(p->tok.str, "ok") && p->mod)
+                for (int i = 0; i < p->mod->nimports; i++)
+                    for (int k = 0; k < p->mod->imports[i].n; k++)
+                        if (!strcmp(p->mod->imports[i].names[k], "ok") && is_assert_path(p->mod->imports[i].path)) named_ok = true;
+            if ((ai && is_assert_path(ai->path)) || named_ok) {
+                Expr *callee;
+                if (ai) {
+                    Token okn = p->tok;
+                    okn.str = "ok";
+                    callee = ns_member(p, ident_expr(pos, p->tok.str), okn);
+                } else callee = ident_expr(pos, "ok");
+                next(p);
+                Expr *c = new_expr(E_CALL, pos);
+                c->lhs = callee;
+                parse_args(p, &c->args);
+                assert_src_arg(p, c, start);
+                return c;
             }
         }
         Expr *e = new_expr(E_IDENT, pos);
@@ -1677,6 +1843,12 @@ static Expr *parse_primary(Parser *p) {
             wants_reflect = true;
             return c;
         }
+        if (at_ident(p, "globalThis") && peek_is(p, TK_DOT) && !binds_name(p, "globalThis")) { /* new globalThis.URL(...): new URL(...) */
+            next(p);
+            next(p);
+            if (!at(p, TK_IDENT) || !js_global_type(p->tok.str) || strcmp(js_global_type(p->tok.str), "function") != 0)
+                xs_error(XS7150, p->tok.pos, globalthis_help, "globalThis.%s is not a global xisto knows", at(p, TK_IDENT) ? p->tok.str : "?");
+        }
         Token name = expect(p, TK_IDENT, NULL);
         if (strcmp(name.str, "Intl") == 0 && at(p, TK_DOT)) { /* new Intl.DateTimeFormat(...): xisto:intl's Intl_DateTimeFormat */
             next(p);
@@ -1816,7 +1988,27 @@ static int parse_type_args(Parser *p, Type ***out) {
 static int noptc;
 static Expr *ident_expr(Pos pos, const char *name);
 static Expr *ns_member(Parser *p, Expr *e, Token name);
+/* node:assert: the module (or assert/strict) by the path of an import */
+static bool is_assert_path(const char *path) {
+    if (!path) return false;
+    const char *b = !strncmp(path, "node:", 5) ? path + 5 : !strncmp(path, "xisto:", 6) ? path + 6 : path;
+    return !strcmp(b, "assert") || !strcmp(b, "assert/strict");
+}
+static bool is_test_path(const char *path) {
+    return path && (!strcmp(path, "node:test") || !strcmp(path, "xisto:test") || !strcmp(path, "test"));
+}
+static Import *ns_import_of(Parser *p, const char *alias);
+/* assert.ok(value) / assert(value) with no message: the call as written (from start to the end of its ')') goes
+   after a null message, for "The expression evaluated to a falsy value:\n\n  assert(x)\n" (xisto:assert's ok) */
+static void assert_src_arg(Parser *p, Expr *call, const char *start) {
+    if (call->args.len != 1 || !start || !p->prev_end || p->prev_end <= start) return;
+    expr_list_push(&call->args, new_expr(E_NULL, call->pos));
+    Expr *s = new_expr(E_STRING, call->pos);
+    s->str = xs_strndup(start, (size_t)(p->prev_end - start));
+    expr_list_push(&call->args, s);
+}
 static Expr *parse_postfix(Parser *p) {
+    const char *pstart = p->tok.start; /* (assert.ok(x): the source of the call) */
     Expr *e = parse_primary(p);
     if (e && e->kind == E_IDENT && is_js_error_name(e->str)) wants_errors = true;
     if (e && e->kind == E_IDENT && is_url_global_name(e->str)) wants_url = true;
@@ -1911,11 +2103,13 @@ static Expr *parse_postfix(Parser *p) {
             Token name = expect_prop_name(p, NULL);
             Expr *nsx = ns_member(p, e, name);
             if (nsx) { /* ns.f(...), ns.x: the module's own name */
+                bool aok = e->kind == E_IDENT && !strcmp(name.str, "ok") && ns_import_of(p, e->str) && is_assert_path(ns_import_of(p, e->str)->path);
                 e = nsx;
                 if (at(p, TK_LPAREN)) {
                     Expr *c = new_expr(E_CALL, name.pos);
                     c->lhs = e;
                     parse_args(p, &c->args);
+                    if (aok) assert_src_arg(p, c, pstart);
                     e = c;
                 }
                 continue;
@@ -2007,6 +2201,27 @@ static Expr *parse_unary(Parser *p) {
         Expr *e = new_expr(E_UNARY, p->tok.pos);
         e->op = TK_IDENT;
         next(p);
+        { /* typeof globalThis.X, typeof window: known when the program is compiled (js_globals) */
+            Parser look = *p;
+            const char *gn = NULL;
+            if (at_ident(&look, "globalThis") && !binds_name(p, "globalThis")) {
+                next(&look);
+                if (at(&look, TK_DOT) || at(&look, TK_QDOT)) {
+                    next(&look);
+                    if (at(&look, TK_IDENT)) { gn = look.tok.str; next(&look); }
+                } else gn = "globalThis";
+            } else if (at(&look, TK_IDENT) && is_foreign_global(look.tok.str) && !binds_name(p, look.tok.str)) {
+                gn = look.tok.str;
+                next(&look);
+            }
+            if (gn && !at(&look, TK_DOT) && !at(&look, TK_QDOT) && !at(&look, TK_LBRACKET) && !at(&look, TK_LPAREN)) {
+                const char *ty = js_global_type(gn);
+                *p = look;
+                Expr *s = new_expr(E_STRING, e->pos);
+                s->str = (char *)(ty ? ty : "undefined");
+                return s;
+            }
+        }
         e->lhs = parse_unary(p);
         return e;
     }
@@ -2133,6 +2348,17 @@ static Expr *parse_rel(Parser *p) {
         Pos pos = p->tok.pos;
         if (at_ident(p, "in")) { /* "key" in obj */
             next(p);
+            if (e->kind == E_STRING && at_ident(p, "globalThis") && !binds_name(p, "globalThis")) { /* "fetch" in globalThis: js_globals */
+                Parser look = *p;
+                next(&look);
+                if (!at(&look, TK_DOT) && !at(&look, TK_QDOT) && !at(&look, TK_LBRACKET)) {
+                    *p = look;
+                    Expr *b = new_expr(E_BOOL, pos);
+                    b->boolean = js_global_type(e->str) && strcmp(e->str, "undefined") != 0;
+                    e = b;
+                    continue;
+                }
+            }
             e = binary(TK_IN, pos, e, parse_rel_base(p));
             continue;
         }
@@ -4757,7 +4983,9 @@ static void import_stdio(Program *prog, Module *m) { import_builtin_class(prog, 
 static void import_builtin_class(Program *prog, Module *m, const char *path, const char *name) {
     if (!m) return;
     for (int i = 0; i < m->nimports; i++)
-        if (m->imports[i].path && strcmp(m->imports[i].path, path) == 0) return;
+        if (m->imports[i].path && strcmp(m->imports[i].path, path) == 0)
+            for (int k = 0; k < m->imports[i].n; k++)
+                if (strcmp(m->imports[i].names[k], name) == 0) return; /* (this name of this module, once) */
     Import im = {0};
     im.pos = (Pos){1, 1};
     im.names = xs_alloc(sizeof(char *));
@@ -4866,6 +5094,33 @@ static void parse_import(Parser *p, Module *m) {
         ns_register(p, m, ns.str);
         goto from;
     }
+    { /* import { strict as assert } from "node:assert" (or { strict }): import * as assert from "node:assert/strict" */
+        Parser look = *p;
+        if (at(&look, TK_LBRACE)) {
+            next(&look);
+            if (at_ident(&look, "strict")) {
+                Token local = look.tok;
+                next(&look);
+                if (at_ident(&look, "as")) { next(&look); local = look.tok; next(&look); }
+                if (at(&look, TK_RBRACE) && local.kind == TK_IDENT) {
+                    next(&look);
+                    if (at_ident(&look, "from")) {
+                        next(&look);
+                        if (at(&look, TK_STRING) && is_assert_path(look.tok.str) && !strstr(look.tok.str, "/strict")) {
+                            next(&look);
+                            *p = look;
+                            ns_register(p, m, local.str);
+                            expect_semi(p);
+                            im.path = "node:assert/strict";
+                            m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+                            m->imports[m->nimports++] = im;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
     if (!at(p, TK_LBRACE))
         xs_error(XS1016, p->tok.pos, "xisto supports named imports only: import { a, b } from \"./file\";", "expected '{' after import");
     next(p);
@@ -4938,10 +5193,26 @@ from:
             m->imports[m->nimports++] = st;
         }
     }
+    if (!im.star && !im.is_default && im.n && (!strcmp(im.path, "perf_hooks") || !strcmp(im.path, "node:perf_hooks") || !strcmp(im.path, "xisto:perf_hooks"))) {
+        /* import { performance } from "node:perf_hooks": the global performance (performance.now() is built in; its other
+           members load xisto:perf_hooks where they are named), so the name alone does not load the module */
+        int keep = 0;
+        for (int i = 0; i < im.n; i++)
+            if (strcmp(im.names[i], "performance") != 0) { im.names[keep] = im.names[i]; im.positions[keep++] = im.positions[i]; }
+        im.n = keep;
+        if (!keep && !has_dflt) return;
+    }
     m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
     m->imports[m->nimports++] = im;
     if (im.n) alias_collisions(p, m, alias_first, &m->imports[m->nimports - 1]);
-    if (has_dflt) {
+    if (has_dflt && (is_assert_path(path.str) || is_test_path(path.str))) { /* (import assert, { x } from "node:assert": the module) */
+        ns_register(p, m, dflt.str);
+        Import d = {0};
+        d.pos = pos;
+        d.path = path.str;
+        m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+        m->imports[m->nimports++] = d;
+    } else if (has_dflt) {
         Import d = {0};
         d.pos = pos;
         d.is_default = true;
@@ -7072,6 +7343,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
     { /* Node's modules written in xisto over runtime functions (runtime/node/NAME.ts, NODE_TS in the Makefile) */
         extern const unsigned char xs_node_events_ts[], xs_node_process_ts[], xs_node_http_ts[], xs_node_net_ts[], xs_node_dns_ts[], xs_node_child_process_ts[], xs_node_https_ts[], xs_node_tls_ts[], xs_node_diagnostics_channel_ts[], xs_node_buffer_ts[], xs_node_util_ts[], xs_node_querystring_ts[], xs_node_string_decoder_ts[], xs_node_zlib_ts[], xs_node_stream_ts[], xs_node_stream_promises_ts[], xs_node_stream_web_ts[];
         extern const unsigned char xs_node_tty_ts[], xs_node_readline_ts[], xs_node_readline_promises_ts[];
+        extern const unsigned char xs_node_console_ts[], xs_node_perf_hooks_ts[], xs_node_assert_ts[], xs_node_assert_strict_ts[], xs_node_test_ts[];
         static const struct { const char *name; const unsigned char *src; bool net; bool tls; } node_ts[] = {
             {"events", xs_node_events_ts, false},
             {"process", xs_node_process_ts, true}, /* (signals and the exit hook live with the event loop) */
@@ -7091,6 +7363,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
             {"stream/promises", xs_node_stream_promises_ts, true}, /* (a name with a slash: runtime/node/stream_promises.ts) */
             {"stream/web", xs_node_stream_web_ts, true},
             {"tty", xs_node_tty_ts, true}, {"readline", xs_node_readline_ts, true}, {"readline/promises", xs_node_readline_promises_ts, true},
+            {"console", xs_node_console_ts, false}, {"perf_hooks", xs_node_perf_hooks_ts, false}, {"assert", xs_node_assert_ts, false}, {"assert/strict", xs_node_assert_strict_ts, false}, {"test", xs_node_test_ts, true},
         };
         for (size_t i = 0; i < sizeof node_ts / sizeof node_ts[0]; i++) {
             if (strcmp(name, node_ts[i].name) != 0) continue;
@@ -7107,7 +7380,6 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
             return m;
         }
     }
-    if (strcmp(name, "perf_hooks") == 0) return m; /* performance is built in (performance.now()) */
     if (strcmp(name, "timers") == 0) return m; /* setTimeout & co are the built-in globals (checker: import check) */
     if (strcmp(name, "worker_threads") == 0 || strcmp(name, "os") == 0) { /* written in xisto over runtime functions */
         bool wt = strcmp(name, "worker_threads") == 0;
@@ -7155,7 +7427,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         prog->uses_okmap = true;
         return m;
     }
-    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:stream, xisto:stream/promises, xisto:stream/web, xisto:buffer, xisto:util, xisto:querystring, xisto:string_decoder, xisto:zlib, xisto:timers, xisto:http, xisto:https, xisto:tls, xisto:diagnostics_channel, xisto:net, xisto:dns, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random, xisto:profiler", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:stream, xisto:stream/promises, xisto:stream/web, xisto:buffer, xisto:util, xisto:querystring, xisto:string_decoder, xisto:zlib, xisto:timers, xisto:http, xisto:https, xisto:tls, xisto:diagnostics_channel, xisto:net, xisto:dns, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random, xisto:profiler, xisto:assert, xisto:assert/strict, xisto:test", "unknown built-in module '%s'", spec);
     return NULL;
 }
 

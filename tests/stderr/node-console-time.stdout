@@ -1,0 +1,6 @@
+load: Nms step 1 { a: 1 }
+load: Nms
+default: Nms
+grp
+  log in group
+done
