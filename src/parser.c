@@ -61,6 +61,11 @@ static bool wants_okmap; /* WeakMap, or Map<object, V>, was written: xisto:okmap
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
 static void import_process(Program *prog, Module *m);
 static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... was named: xisto:url is loaded */
+static bool wants_errors; /* TypeError, RangeError, SyntaxError or ReferenceError was named: xisto:errors is loaded */
+static bool is_js_error_name(const char *n) {
+    return n && (!strcmp(n, "TypeError") || !strcmp(n, "RangeError") || !strcmp(n, "SyntaxError") || !strcmp(n, "ReferenceError") ||
+                 !strcmp(n, "URIError"));
+}
 static bool is_url_global_name(const char *n);
 /* generics: the type parameters in scope while a template is parsed, or their types while an instance is */
 static int no_dyn_note; /* inside generated code: its anys are not the program's uses */
@@ -96,8 +101,9 @@ static void tp_push(char **names, int n) { /* the type parameters in scope: the 
 
 static void next(Parser *p) {
     p->prev_end = p->tok.start ? p->tok.start + p->tok.len : NULL;
+    TokKind before = p->tok.kind;
     p->tok = lexer_next(&p->lx);
-    if (p->nalias && p->tok.kind == TK_IDENT)
+    if (p->nalias && p->tok.kind == TK_IDENT && before != TK_DOT && before != TK_QDOT) /* (o.a: a property, never an import's alias) */
         for (int i = 0; i < p->nalias; i++)
             if (strcmp(p->tok.str, p->alias_from[i]) == 0) { p->tok.str = p->alias_to[i]; break; }
 }
@@ -117,11 +123,22 @@ static Token expect(Parser *p, TokKind k, const char *help) {
     return t;
 }
 
+/* the name a property was written with: an identifier the module's import aliases renamed (import { a as b } reads
+   b as a, and a module's own a as a__local) is, as a property, still the name written (XB-224) */
+static char *prop_raw(Parser *p, Token t) {
+    if (t.kind != TK_IDENT || !t.start || ((int)strlen(t.str) == t.len && !strncmp(t.str, t.start, (size_t)t.len))) return t.str;
+    for (int i = 0; i < p->nalias; i++)
+        if (p->alias_to[i] == t.str && (int)strlen(p->alias_from[i]) == t.len && !strncmp(p->alias_from[i], t.start, (size_t)t.len))
+            return p->alias_from[i];
+    return t.str;
+}
 /* a property name: an identifier or any keyword (obj.default, { default: 0 }, interface { delete?: x }) */
 static Token expect_prop_name(Parser *p, const char *help) {
     const char *w = tok_keyword_text(p->tok.kind);
     if (w) { Token t = p->tok; t.kind = TK_IDENT; t.str = (char *)w; next(p); return t; }
-    return expect(p, TK_IDENT, help);
+    Token t = expect(p, TK_IDENT, help);
+    t.str = prop_raw(p, t);
+    return t;
 }
 
 static bool accept(Parser *p, TokKind k) {
@@ -157,6 +174,7 @@ static Type *parse_type(Parser *p);
 /* Unresolved class names are stored as objects of a placeholder class; the checker resolves them. */
 static Type *named_type(Parser *p, Token name) {
     if (is_url_global_name(name.str)) wants_url = true; /* (a URL or AbortSignal parameter) */
+    if (is_js_error_name(name.str)) wants_errors = true; /* (a TypeError parameter, field or return type) */
     Class *c = xs_alloc(sizeof *c);
     c->name = name.str;
     c->pos = name.pos;
@@ -1261,12 +1279,7 @@ static Expr *parse_arrow(Parser *p) {
 }
 
 static bool tmpl_raw; /* parsing the template of String.raw`...` */
-static bool wants_errors; /* TypeError, RangeError, SyntaxError or ReferenceError was named: xisto:errors is loaded */
 static bool wants_intl; /* Intl.X was named: xisto:intl is loaded (Intl.DateTimeFormat is its class Intl_DateTimeFormat) */
-static bool is_js_error_name(const char *n) {
-    return n && (!strcmp(n, "TypeError") || !strcmp(n, "RangeError") || !strcmp(n, "SyntaxError") || !strcmp(n, "ReferenceError") ||
-                 !strcmp(n, "URIError"));
-}
 /* the web globals xisto:url declares (runtime/node/url.ts) */
 static bool is_url_global_name(const char *n) {
     return n && (!strcmp(n, "URL") || !strcmp(n, "URLSearchParams") || !strcmp(n, "AbortController") || !strcmp(n, "AbortSignal") ||
@@ -1547,7 +1560,7 @@ static Expr *parse_primary(Parser *p) {
                 val->str = key.str;
             }
             if (e->args.len == cap) { cap = cap ? cap * 2 : 4; e->keys = realloc(e->keys, sizeof(char *) * (size_t)cap); }
-            e->keys[e->args.len] = key.str;
+            e->keys[e->args.len] = prop_raw(p, key); /* ({ a: 1 }, { a }: the key as written, the value through the aliases) */
             expr_list_push(&e->args, val);
             if (!accept(p, TK_COMMA)) break;
         }
@@ -2061,6 +2074,8 @@ static Expr *parse_rel(Parser *p) {
         next(p);
         Expr *c = new_expr(E_IDENT, p->tok.pos);
         c->str = expect(p, TK_IDENT, "write a class name: x instanceof Foo").str;
+        if (is_js_error_name(c->str)) wants_errors = true; /* (x instanceof SyntaxError with no other mention of it) */
+        if (is_url_global_name(c->str)) wants_url = true;
         e = binary(TK_IDENT, pos, e, c); /* TK_IDENT as operator: instanceof */
     }
     return e;
@@ -3609,6 +3624,7 @@ static Class *parse_class_ex(Parser *p, bool abstract) {
         next(p);
         c->base_pos = p->tok.pos;
         Token bt = expect(p, TK_IDENT, NULL);
+        if (is_js_error_name(bt.str)) wants_errors = true; /* (class E extends TypeError) */
         bool mapped = !strcmp(bt.str, "PartialType") || !strcmp(bt.str, "OmitType") || !strcmp(bt.str, "PickType") || !strcmp(bt.str, "IntersectionType");
         if (at(p, TK_LPAREN) && mapped) c->mixin = parse_mixin_rest(p, bt); /* extends PartialType(CreateDto) */
         else if (at(p, TK_LPAREN)) { /* extends PassportStrategy(Strategy, "jwt"), AuthGuard(["jwt"]): a class factory as the
@@ -4559,6 +4575,62 @@ static bool pkg_available(const char *from_file, const char *name) {
     return false;
 }
 static Module *load_module(Program *prog, const char *file, Pos from_pos, const char *from_file);
+/* the entry file of the package `name` imported from from_file (as load_module finds it: XISTO_PKGS, a .xisto/pkgs
+   above the file or above the program's first module; xisto.json "main", else index.ts or src/index.ts), or NULL.
+   No error: the import is resolved (and reported) by load_module later */
+static char *pkg_entry_file(Program *prog, const char *from_file, const char *name) {
+    if (!from_file || name[0] == '.' || name[0] == '/' || strchr(name, ':')) return NULL;
+    const char *slash = strchr(name, '/');
+    if (slash && name[0] == '@') slash = strchr(slash + 1, '/');
+    if (slash) return NULL; /* (a deep import: a file of the package, not its entry) */
+    char *found = NULL;
+    const char *extra = getenv("XISTO_PKGS");
+    if (extra && *extra && access(xs_sprintf("%s/%s", extra, name), R_OK) == 0) found = xs_sprintf("%s/%s", extra, name);
+    const char *starts[2] = {from_file, prog && prog->nmodules > 0 ? prog->modules[0]->path : NULL};
+    for (int s = 0; s < 2 && !found; s++) {
+        if (!starts[s]) continue;
+        char dir[PATH_MAX];
+        strncpy(dir, starts[s], sizeof dir - 1);
+        dir[sizeof dir - 1] = 0;
+        for (char *sl; !found && (sl = strrchr(dir, '/')); ) {
+            *sl = 0;
+            char *probe = xs_sprintf("%s/.xisto/pkgs/%s", dir, name);
+            if (access(probe, R_OK) == 0) found = probe;
+        }
+    }
+    if (!found) return NULL;
+    char *meta = xs_read_file(xs_sprintf("%s/xisto.json", found));
+    if (meta) {
+        char *mm = strstr(meta, "\"main\"");
+        if (mm && (mm = strchr(mm + 6, '"'))) {
+            char *e = strchr(mm + 1, '"');
+            if (e) {
+                char *entry = xs_sprintf("%s/%.*s", found, (int)(e - mm - 1), mm + 1);
+                if (access(entry, R_OK) == 0) return entry;
+                if (access(xs_sprintf("%s.ts", entry), R_OK) == 0) return xs_sprintf("%s.ts", entry);
+                return NULL;
+            }
+        }
+    }
+    if (access(xs_sprintf("%s/index.ts", found), R_OK) == 0) return xs_sprintf("%s/index.ts", found);
+    if (access(xs_sprintf("%s/src/index.ts", found), R_OK) == 0) return xs_sprintf("%s/src/index.ts", found);
+    return NULL;
+}
+/* the source declares a default export: export default ..., or default in an export list (export { f as default },
+   export { default } from "./x") */
+static bool src_has_default_export(const char *src) {
+    for (const char *s = strstr(src, "export"); s; s = strstr(s + 6, "export")) {
+        if (s > src && (isalnum((unsigned char)s[-1]) || s[-1] == '_' || s[-1] == '$')) continue;
+        const char *q = s + 6;
+        while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+        if (!strncmp(q, "default", 7) && !isalnum((unsigned char)q[7]) && q[7] != '_') return true;
+        if (*q != '{') continue;
+        const char *end = strchr(q, '}');
+        for (const char *d = q; end && (d = strstr(d, "default")) && d < end; d += 7)
+            if (!isalnum((unsigned char)d[-1]) && d[-1] != '_' && !isalnum((unsigned char)d[7]) && d[7] != '_') return true;
+    }
+    return false;
+}
 /* process.X beyond the members the compiler builds in: the module reads XistoProcess.X (checker), so it imports
    XistoProcess from xisto:process (runtime/node/process.ts), once */
 static void import_process(Program *prog, Module *m) {
@@ -4632,6 +4704,14 @@ static void parse_import(Parser *p, Module *m) {
             const char *base = !strncmp(spec, "node:", 5) ? spec + 5 : !strncmp(spec, "xisto:", 6) ? spec + 6 : spec;
             bool core = !strncmp(spec, "node:", 5) || xs_node_core_name(spec);
             if (core && strcmp(base, "events") != 0) {
+                ns_register(p, m, name.str);
+                goto from;
+            }
+            /* import tracer from "pkg" with a package that has no default export: the package itself, as TypeScript's
+               esModuleInterop reads a module without one (import * as tracer) (XB-222) */
+            char *entry = core ? NULL : pkg_entry_file(p->prog, m->path, spec);
+            char *esrc = entry ? xs_read_file(entry) : NULL;
+            if (esrc && !src_has_default_export(esrc)) {
                 ns_register(p, m, name.str);
                 goto from;
             }

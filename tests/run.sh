@@ -221,7 +221,7 @@ if sh tests/tlsgate/run.sh > "$OUT/tlsgate.txt" 2>&1; then pass=$((pass+1)); els
 fi
 
 # packages: xisto add / install from a local git repository
-if sh tests/pkg/run.sh > "$OUT/pkg.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg.txt")" -ge 8 ] && ! grep -q FAIL "$OUT/pkg.txt"; then pass=$((pass+1)); else echo "FAIL packages:"; cat "$OUT/pkg.txt"; fail=$((fail+1)); fi
+if sh tests/pkg/run.sh > "$OUT/pkg.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg.txt")" -ge 9 ] && ! grep -q FAIL "$OUT/pkg.txt"; then pass=$((pass+1)); else echo "FAIL packages:"; cat "$OUT/pkg.txt"; fail=$((fail+1)); fi
 # packages: xisto init / add NAME / install against a local monorepo registry (tests/pkg/registry.sh)
 if sh tests/pkg/registry.sh > "$OUT/pkg-registry.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg-registry.txt")" -ge 32 ] && ! grep -q FAIL "$OUT/pkg-registry.txt"; then pass=$((pass+1)); else echo "FAIL package registry:"; cat "$OUT/pkg-registry.txt"; fail=$((fail+1)); fi
 

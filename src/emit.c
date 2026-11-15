@@ -995,7 +995,7 @@ static bool is_fresh(Expr *e) {
         if (e->lhs->type && e->lhs->type->kind == TY_STREAM) return cref(e->type); /* every stream op returns a new owned value */
         if (e->lhs->type && e->lhs->type->kind == TY_CHAN) return cref(e->type); /* receive hands over ownership */
         if (e->cls && e->cls->builtin && strcmp(e->cls->name, "StatementSync") == 0) return true;
-        if (e->builtin.cfn && (strcmp(e->builtin.cfn, "get") == 0 || strcmp(e->builtin.cfn, "set") == 0 || strcmp(e->builtin.cfn, "add") == 0 ||
+        if (e->builtin.cfn && (strcmp(e->builtin.cfn, "get") == 0 || strcmp(e->builtin.cfn, "get_falsy") == 0 || strcmp(e->builtin.cfn, "set") == 0 || strcmp(e->builtin.cfn, "add") == 0 ||
                                strcmp(e->builtin.cfn, "find") == 0 || strcmp(e->builtin.cfn, "sort") == 0 || strcmp(e->builtin.cfn, "reverse") == 0)) return false; /* borrowed */
         return true; /* every other method/static call returns an owned reference */
     case E_BINARY: return e->op == TK_PLUS; /* string concatenation */
@@ -2319,9 +2319,13 @@ static void emit_member(Expr *e) {
             buf_puts(out, ")");
             return;
         }
-        if (strcmp(op, "get") == 0) {
+        if (strcmp(op, "get") == 0 || strcmp(op, "get_falsy") == 0) {
             int vk = val_kind(v);
-            buf_printf(out, vk == 0 ? "xs_map_get_num_%s(" : vk == 1 ? "xs_map_get_int_%s(" : vk == 2 ? "xs_map_get_bool_%s(" : "((%s)xs_map_get_ptr_%s(", vk == 3 ? ctype(v) : ks, ks);
+            /* a primitive read as T | null (checker.c, missing_get): null for a missing key; read as a condition
+               (falsy_get): the false value; else a missing key is a run-time error */
+            const char *how = vk == 3 ? "" : op[3] ? "z" : e->type && e->type->kind == TY_NULLABLE ? "n" : "";
+            if (vk == 3) buf_printf(out, "((%s)xs_map_get_ptr_%s(", ctype(v), ks);
+            else buf_printf(out, "xs_map_get%s_%s_%s(", how, vk == 0 ? "num" : vk == 1 ? "int" : "bool", ks);
             emit_borrowed(base);
             buf_puts(out, ", ");
             emit_borrowed(e->args.items[0]);
@@ -2908,8 +2912,8 @@ static void emit_dyn_tables(Program *p) {
                 nm++;
             }
         if (nm) buf_puts(&tabs, "};\n");
-        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s, %d};\n", c->cname, c->name, c->nfields, c->nfields ? xs_sprintf("%s_dynf", c->cname) : "NULL",
-                   nm, nm ? xs_sprintf("%s_dynm", c->cname) : "NULL", c->is_interface ? 1 : 0);
+        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s, %d, %d};\n", c->cname, c->name, c->nfields, c->nfields ? xs_sprintf("%s_dynf", c->cname) : "NULL",
+                   nm, nm ? xs_sprintf("%s_dynm", c->cname) : "NULL", c->is_interface ? 1 : 0, !c->builtin && is_error_class(c) ? 1 : 0);
     }
     if (fns.data) buf_puts(out, fns.data);
     if (tabs.data) buf_puts(out, tabs.data);
@@ -3237,6 +3241,13 @@ static void emit_expr_raw(Expr *e) {
             Type *lt = e->lhs->type;
             if (t->kind == TY_OBJECT && is_error_class(t->cls) && lt && lt->kind == TY_OBJECT && lt->cls->builtin && strcmp(lt->cls->name, "Error") == 0) {
                 buf_printf(out, "((%s)xs_Error_thrown(%s))", ctype(t), b.data); /* catch (e) { if (e instanceof X) e.code } */
+                free(b.data);
+                return;
+            }
+            if (t->kind == TY_OBJECT && t->cls->builtin && !strcmp(t->cls->name, "Error") && lt && (lt->kind == TY_UNKNOWN || lt->kind == TY_UNION)) {
+                /* err: unknown narrowed by instanceof Error: a TypeError object (a class that extends Error) read as the
+                   Error that wraps it, as where an Error goes */
+                buf_puts(out, from_unknown(t, b.data)); /* (an arena string) */
                 free(b.data);
                 return;
             }
@@ -4273,9 +4284,12 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, " })");
             return;
         }
+        bool fld_path = false; /* o.f, this.a.f: a field read off a variable, safe to read twice (mk().f is not: mk runs once) */
+        for (Expr *p = e->lhs; p && p->kind == E_MEMBER && !p->is_call; p = p->lhs)
+            if (p->lhs && (p->lhs->kind == E_IDENT || p->lhs->kind == E_THIS)) fld_path = true;
         if (e->lhs && e->lhs->type && e->lhs->type->kind == TY_FUNC && !e->func && !e->builtin.cfn &&
-            e->lhs->kind != E_IDENT && e->lhs->kind != E_THIS && !(e->lhs->kind == E_MEMBER && !e->lhs->is_call)) {
-            /* (() => ...)(), f(a)(b): the function value once, in a temporary */
+            e->lhs->kind != E_IDENT && e->lhs->kind != E_THIS && !fld_path) {
+            /* (() => ...)(), f(a)(b), mk().f(x): the function value once, in a temporary */
             static int ncc;
             int id = ncc++;
             buf_printf(out, "({ xs_closure *cc%d_ = (xs_closure *)", id);

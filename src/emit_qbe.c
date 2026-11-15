@@ -559,6 +559,7 @@ static char *emit_expr_raw(Expr *e) {
     }
     case E_BINARY: {
         if (tk_bitop(e->op) || e->op == TK_STARSTAR) { unsupported(e->pos, e->op == TK_STARSTAR ? "**" : "bitwise operators"); return ""; }
+        if (e->op == TK_IDENT) { unsupported(e->pos, "instanceof"); return ""; } /* (its right side is a class name, not a value) */
         if (e->op == TK_AND || e->op == TK_OR) {
             char *res = tmp(), *rhs_l = label("rhs"), *end = label("end"), *short_l = label("short");
             char *a = emit_expr(e->lhs);

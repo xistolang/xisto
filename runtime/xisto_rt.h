@@ -1875,6 +1875,13 @@ static void xs_Error_free(void *p) {
     free(e->trace);
     xs_obj_free(p);
 }
+/* x instanceof TypeError (SyntaxError, ...) for an Error the runtime raised (JSON.parse, decodeURIComponent, a null
+   read): an Error of that name that is not the wrapper of a thrown object (checker.c, instanceof) */
+static inline bool xs_Error_native_is(void *v, xs_str *name) {
+    if (!v || xs_type_of(v)->free != xs_Error_free) return false;
+    xs_Error *e = v;
+    return !e->f___thrown && e->f_name && e->f_name->len == name->len && memcmp(e->f_name->data, name->data, (size_t)name->len) == 0;
+}
 static void xs_print_any_quoted(void *p);
 /* console.log(err): its first line; a cause as Node prints it below the stack ("{\n  [cause]: ...\n}") */
 static void xs_Error_print(void *p) {
@@ -2000,7 +2007,32 @@ XS_NOINLINE xs_str *xs_uri_decode(xs_str *s, const char *reserved) {
             if (hv >= 0 && lv >= 0) v = hv * 16 + lv;
         }
         if (v < 0) { free(out); xs_panic("URIError: URI malformed"); }
-        if (v < 128 && v && strchr(reserved, v)) { out[n++] = '%'; out[n++] = s->data[i + 1]; out[n++] = s->data[i + 2]; }
+        if (v >= 0x80) { /* the first byte of a UTF-8 sequence: the rest are %XX too, and the code point valid (no
+                            overlong form, no surrogate, at most U+10FFFF) */
+            int len = (v & 0xE0) == 0xC0 ? 2 : (v & 0xF0) == 0xE0 ? 3 : (v & 0xF8) == 0xF0 ? 4 : 0;
+            uint32_t cp = len == 2 ? (uint32_t)(v & 0x1F) : len == 3 ? (uint32_t)(v & 0x0F) : (uint32_t)(v & 0x07);
+            unsigned char seq[4] = {(unsigned char)v};
+            for (int k = 1; k < len; k++) {
+                int64_t j = i + 3 * k;
+                int b = -1;
+                if (j + 2 < s->len && s->data[j] == '%') {
+                    int h = s->data[j + 1], l = s->data[j + 2];
+                    int hv = isdigit(h) ? h - '0' : (h >= 'a' && h <= 'f') ? h - 'a' + 10 : (h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1;
+                    int lv = isdigit(l) ? l - '0' : (l >= 'a' && l <= 'f') ? l - 'a' + 10 : (l >= 'A' && l <= 'F') ? l - 'A' + 10 : -1;
+                    if (hv >= 0 && lv >= 0) b = hv * 16 + lv;
+                }
+                if (b < 0 || (b & 0xC0) != 0x80) { len = 0; break; }
+                seq[k] = (unsigned char)b;
+                cp = (cp << 6) | (uint32_t)(b & 0x3F);
+            }
+            static const uint32_t min_cp[5] = {0, 0, 0x80, 0x800, 0x10000};
+            if (!len || cp < min_cp[len] || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) { free(out); xs_panic("URIError: URI malformed"); }
+            memcpy(out + n, seq, (size_t)len);
+            n += (size_t)len;
+            i += 3 * len - 1;
+            continue;
+        }
+        if (v && strchr(reserved, v)) { out[n++] = '%'; out[n++] = s->data[i + 1]; out[n++] = s->data[i + 2]; }
         else out[n++] = (char)v;
         i += 2;
     }
@@ -2711,6 +2743,21 @@ XS_NOINLINE bool xs_map_get_bool_s(xs_map *m, xs_str *k) { return xs_map_need(m,
 XS_NOINLINE bool xs_map_get_bool_i(xs_map *m, int64_t k) { return xs_map_need(m, NULL, k).i != 0; }
 static void *xs_map_get_ptr_s(xs_map *m, xs_str *k) { xs_map_entry *e = xs_map_lookup(m, k, 0); return e ? e->val.p : NULL; }
 static void *xs_map_get_ptr_i(xs_map *m, int64_t k) { xs_map_entry *e = xs_map_lookup(m, NULL, k); return e ? e->val.p : NULL; }
+/* m.get(k) of a primitive read as T | null (getn: a missing key is null) or as a condition (getz: a missing key is the
+   false value, 0 / NaN / false): one lookup, no error path */
+#define XS_MAP_GET_OR(name, T, field, miss) \
+    static T xs_map_get##name##_s(xs_map *m, xs_str *k) { xs_map_entry *e = xs_map_lookup(m, k, 0); return e ? (T)e->val.field : (miss); } \
+    static inline __attribute__((always_inline)) T xs_map_get##name##_i(xs_map *m, int64_t k) { \
+        xs_map_entry *e = xs_map_lookup_i(m, k); \
+        return __builtin_expect(e != NULL, 1) ? (T)e->val.field : (miss); \
+    }
+XS_MAP_GET_OR(n_num, double, d, xs_null_num())
+XS_MAP_GET_OR(n_int, int64_t, i, XS_NULL_INT)
+XS_MAP_GET_OR(n_bool, int8_t, i, XS_NULL_BOOL)
+XS_MAP_GET_OR(z_num, double, d, xs_null_num())
+XS_MAP_GET_OR(z_int, int64_t, i, 0)
+XS_MAP_GET_OR(z_bool, bool, i, false)
+#undef XS_MAP_GET_OR
 
 /* keys() / values() as new arrays, in insertion order */
 static void *xs_map_keys(xs_map *m, void (*print_elem)(void *)) {
@@ -3123,7 +3170,7 @@ XS_NOINLINE double xs_math_min_ints(xs_arr_int *a) { double m = INFINITY; for (s
    field). An object made as an any ({} or { a: 1 } typed any) is a Record<string, unknown>. ---- */
 enum { XD_NUM, XD_INT, XD_BOOL, XD_NNUM, XD_NINT, XD_NBOOL, XD_STR, XD_REF, XD_ANY };
 typedef struct { const char *name; uint32_t len, off; uint8_t kind, nullable, optional; bool (*isa)(void *); const char *tname; } xs_dyn_field;
-typedef struct xs_dyn_cls { const char *name; int32_t n; const xs_dyn_field *f; int32_t nm; const char *const *m; int32_t shape; } xs_dyn_cls; /* m: its methods' names; shape: an interface's (made from literals: an optional field left out is not there) */
+typedef struct xs_dyn_cls { const char *name; int32_t n; const xs_dyn_field *f; int32_t nm; const char *const *m; int32_t shape; int32_t err; } xs_dyn_cls; /* m: its methods' names; shape: an interface's (made from literals: an optional field left out is not there); err: a class that extends Error */
 /* a method read by name through an any (typeof x.toJSON === "function"): a function whose call is not supported yet */
 XS_NOINLINE void xs_dyn_method_called(void) { xs_panic("TypeError: a method read through an any cannot be called (call it on a value of its class)"); }
 static xs_closure xs_dyn_method_cl = {{XS_IMMORTAL, 0}, (void *)xs_dyn_method_called};
@@ -3192,6 +3239,9 @@ XS_NOINLINE void *xs_dyn_get(void *o, xs_str *k) {
     const xs_type *t = xs_type_of(o);
     if (t->dyn) {
         const xs_dyn_field *f = xs_dyn_field_of(t->dyn, k);
+        if (!f && t->dyn->err && k->len == 5 && memcmp(k->data, "stack", 5) == 0) /* err.stack, err a TypeError (a class that
+                                                                                    extends Error): through the Error that wraps it */
+            return xs_retain_(xs_Error_stack(xs_ar(xs_Error_wrap_err(o))));
         if (!f) return xs_dyn_has_method(t->dyn, k) ? xs_cl_static(&xs_dyn_method_cl) : NULL; /* a field the class does not
                                 declare reads as undefined, as in JavaScript (err?.status || 500); writing one is still an error */
         return xs_dyn_load(f, o);
@@ -4161,14 +4211,68 @@ static void xs_jarena_free(void) {
     }
 }
 
-XS_NOINLINE void xs_json_fail(xs_jp *j, const char *what) {
-    static XS_TLS char buf[256];
-    snprintf(buf, sizeof buf, "JSON: %s at offset %ld", what, (long)(j->p - j->start));
+/* a JSON.parse failure: a SyntaxError with V8's message (positions in UTF-16 units, as JavaScript counts them).
+   XJE_TOKEN: the character at j->p is not what can come there ("Unexpected end of JSON input" at the end) */
+enum { XJE_TOKEN, XJE_PROP_OR_CLOSE, XJE_DQ_PROP, XJE_COLON, XJE_OBJ_SEP, XJE_ARR_SEP, XJE_TRAILING, XJE_UNTERM_STR,
+       XJE_BAD_ESC, XJE_BAD_UESC, XJE_CTRL, XJE_MINUS, XJE_FRAC, XJE_EXP, XJE_NUMBER, XJE_DEEP };
+static size_t xs_json_u16(const char *a, const char *b) { /* UTF-16 units of the UTF-8 bytes [a, b) */
+    size_t n = 0;
+    for (; a < b; a++) {
+        unsigned char c = (unsigned char)*a;
+        if ((c & 0xC0) != 0x80) n += c >= 0xF0 ? 2 : 1;
+    }
+    return n;
+}
+static const char *xs_json_at_u16(const char *a, const char *end, size_t u) { /* the byte where UTF-16 unit u starts */
+    while (a < end && u > 0) {
+        unsigned char c = (unsigned char)*a;
+        size_t w = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1, us = c >= 0xF0 ? 2 : 1;
+        if (us > u) break;
+        u -= us;
+        a += w;
+    }
+    return a < end ? a : end;
+}
+XS_NOINLINE void xs_json_fail(xs_jp *j, int kind) {
+    static XS_TLS char buf[512];
+    static const char *const msgs[] = {NULL, "Expected property name or '}'", "Expected double-quoted property name",
+        "Expected ':' after property name", "Expected ',' or '}' after property value", "Expected ',' or ']' after array element",
+        "Unexpected non-whitespace character after JSON", "Unterminated string", "Bad escaped character", "Bad Unicode escape",
+        "Bad control character in string literal", "No number after minus sign", "Unterminated fractional number",
+        "Exponent part is missing a number", "Unexpected number"};
+    const char *s = j->start, *e = j->end, *p = j->p < e ? j->p : e;
+    size_t slen = (size_t)(e - s);
+    if (kind == XJE_DEEP) snprintf(buf, sizeof buf, "JSON: too deep at offset %ld", (long)(p - s));
+    else if (kind == XJE_TOKEN && p >= e) snprintf(buf, sizeof buf, "SyntaxError: Unexpected end of JSON input");
+    else if (kind == XJE_TOKEN) {
+        static const char *const special[] = {"undefined", "NaN", "Infinity", "[object Object]"};
+        bool sp = false;
+        for (size_t i = 0; i < sizeof special / sizeof *special; i++) sp = sp || (slen == strlen(special[i]) && !memcmp(s, special[i], slen));
+        unsigned char c = (unsigned char)*p;
+        int tw = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+        if (p + tw > e) tw = (int)(e - p);
+        size_t len = xs_json_u16(s, e), pos = xs_json_u16(s, p);
+        if (sp) snprintf(buf, sizeof buf, "SyntaxError: \"%.*s\" is not valid JSON", (int)slen, s);
+        else if (len <= 21) snprintf(buf, sizeof buf, "SyntaxError: Unexpected token '%.*s', \"%.*s\" is not valid JSON", tw, p, (int)slen, s);
+        else { /* 10 characters of context on each side of the token, as V8 */
+            size_t from = pos < 10 ? 0 : pos - 10, to = pos + 10 < len ? pos + 10 : len;
+            const char *a = xs_json_at_u16(s, e, from), *b = xs_json_at_u16(s, e, to);
+            snprintf(buf, sizeof buf, "SyntaxError: Unexpected token '%.*s', %s\"%.*s\"%s is not valid JSON", tw, p, from > 0 ? "..." : "",
+                     (int)(b - a), a, to < len ? "..." : "");
+        }
+    } else {
+        size_t pos = xs_json_u16(s, p), line = 1;
+        const char *ls = s;
+        for (const char *q = s; q < p; q++) if (*q == '\n') { line++; ls = q + 1; }
+        snprintf(buf, sizeof buf, "SyntaxError: %s%s at position %zu (line %zu column %zu)", msgs[kind],
+                 kind == XJE_TRAILING ? "" : " in JSON", pos, line, xs_json_u16(ls, p) + 1); /* ("... after JSON at position") */
+    }
     xs_jarena_free();
     xs_panic(buf);
 }
 
-static void xs_json_ws(xs_jp *j) { while (j->p < j->end && isspace((unsigned char)*j->p)) j->p++; }
+/* JSON's whitespace: space, tab, line feed, carriage return (not \f or \v) */
+static void xs_json_ws(xs_jp *j) { while (j->p < j->end && (*j->p == ' ' || *j->p == '\n' || *j->p == '\r' || *j->p == '\t')) j->p++; }
 
 static xs_jv *xs_json_value(xs_jp *j);
 
@@ -4188,19 +4292,22 @@ static void *xs_jgrow(void *old, size_t old_n, size_t new_n, size_t elem) {
     return p;
 }
 
+static inline int xs_json_hex(char h) { return h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1; }
 XS_NOINLINE char *xs_json_string(xs_jp *j, size_t *outlen) {
-    if (j->p >= j->end || *j->p != '"') xs_json_fail(j, "expected a string");
+    if (j->p >= j->end || *j->p != '"') xs_json_fail(j, XJE_TOKEN);
     j->p++;
     size_t cap = 32, n = 0;
     char *out = xs_jalloc(cap);
     for (;;) {
-        if (j->p >= j->end) xs_json_fail(j, "unterminated string");
-        unsigned char c = (unsigned char)*j->p++;
+        if (j->p >= j->end) xs_json_fail(j, XJE_UNTERM_STR);
+        unsigned char c = (unsigned char)*j->p;
+        if (c < 0x20) xs_json_fail(j, XJE_CTRL);
+        j->p++;
         if (c == '"') break;
         if (n + 4 >= cap) { out = xs_jgrow(out, n, cap * 2, 1); cap *= 2; }
         if (c == '\\') {
-            if (j->p >= j->end) xs_json_fail(j, "bad escape");
-            char e = *j->p++;
+            if (j->p >= j->end) xs_json_fail(j, XJE_TOKEN);
+            char e = *j->p;
             switch (e) {
             case 'n': out[n++] = '\n'; break;
             case 't': out[n++] = '\t'; break;
@@ -4211,16 +4318,17 @@ XS_NOINLINE char *xs_json_string(xs_jp *j, size_t *outlen) {
             case '\\': out[n++] = '\\'; break;
             case '"': out[n++] = '"'; break;
             case 'u': {
-                if (j->end - j->p < 4) xs_json_fail(j, "bad \\u escape");
+                j->p++;
                 unsigned cp = 0;
                 for (int k = 0; k < 4; k++) {
-                    char h = *j->p++;
-                    int hv = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
-                    if (hv < 0) xs_json_fail(j, "bad \\u escape");
+                    int hv = j->p < j->end ? xs_json_hex(*j->p) : -1;
+                    if (hv < 0) xs_json_fail(j, XJE_BAD_UESC);
+                    j->p++;
                     cp = cp * 16 + (unsigned)hv;
                 }
-                if (cp >= 0xD800 && cp <= 0xDBFF && j->end - j->p >= 6 && j->p[0] == '\\' && j->p[1] == 'u') {
-                    char hex4[5] = {j->p[2], j->p[3], j->p[4], j->p[5], 0};
+                j->p--; /* (the j->p++ after the switch) */
+                if (cp >= 0xD800 && cp <= 0xDBFF && j->end - j->p >= 7 && j->p[1] == '\\' && j->p[2] == 'u') {
+                    char hex4[5] = {j->p[3], j->p[4], j->p[5], j->p[6], 0};
                     unsigned lo = (unsigned)strtoul(hex4, NULL, 16);
                     if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); j->p += 6; }
                 }
@@ -4230,8 +4338,9 @@ XS_NOINLINE char *xs_json_string(xs_jp *j, size_t *outlen) {
                 else { out[n++] = (char)(0xF0 | (cp >> 18)); out[n++] = (char)(0x80 | ((cp >> 12) & 0x3F)); out[n++] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[n++] = (char)(0x80 | (cp & 0x3F)); }
                 break;
             }
-            default: xs_json_fail(j, "bad escape");
+            default: xs_json_fail(j, XJE_BAD_ESC);
             }
+            j->p++;
         } else {
             out[n++] = (char)c;
         }
@@ -4240,11 +4349,17 @@ XS_NOINLINE char *xs_json_string(xs_jp *j, size_t *outlen) {
     *outlen = n;
     return out;
 }
+/* true / false / null: the first character that differs is the unexpected one */
+static void xs_json_word(xs_jp *j, const char *w, size_t n) {
+    for (size_t i = 0; i < n; i++, j->p++)
+        if (j->p >= j->end || *j->p != w[i]) xs_json_fail(j, XJE_TOKEN);
+}
+static inline bool xs_json_digit(xs_jp *j) { return j->p < j->end && *j->p >= '0' && *j->p <= '9'; }
 
 XS_NOINLINE xs_jv *xs_json_value(xs_jp *j) {
     xs_json_ws(j);
-    if (j->p >= j->end) xs_json_fail(j, "unexpected end");
-    if (++j->depth > 200) xs_json_fail(j, "too deep");
+    if (j->p >= j->end) xs_json_fail(j, XJE_TOKEN);
+    if (++j->depth > 200) xs_json_fail(j, XJE_DEEP);
     char c = *j->p;
     xs_jv *v;
     if (c == '{') {
@@ -4253,21 +4368,26 @@ XS_NOINLINE xs_jv *xs_json_value(xs_jp *j) {
         size_t cap = 0;
         xs_json_ws(j);
         if (j->p < j->end && *j->p == '}') { j->p++; j->depth--; return v; }
+        if (j->p >= j->end || *j->p != '"') xs_json_fail(j, XJE_PROP_OR_CLOSE);
         for (;;) {
-            xs_json_ws(j);
             size_t klen;
             char *key = xs_json_string(j, &klen);
             xs_json_ws(j);
-            if (j->p >= j->end || *j->p != ':') xs_json_fail(j, "expected ':'");
+            if (j->p >= j->end || *j->p != ':') xs_json_fail(j, XJE_COLON);
             j->p++;
             xs_jv *item = xs_json_value(j);
             if (v->n == cap) { size_t nc = cap ? cap * 2 : 4; v->items = xs_jgrow(v->items, v->n, nc, sizeof(void *)); v->keys = xs_jgrow(v->keys, v->n, nc, sizeof(char *)); cap = nc; }
             v->keys[v->n] = key;
             v->items[v->n++] = item;
             xs_json_ws(j);
-            if (j->p < j->end && *j->p == ',') { j->p++; continue; }
+            if (j->p < j->end && *j->p == ',') {
+                j->p++;
+                xs_json_ws(j);
+                if (j->p >= j->end || *j->p != '"') xs_json_fail(j, XJE_DQ_PROP);
+                continue;
+            }
             if (j->p < j->end && *j->p == '}') { j->p++; break; }
-            xs_json_fail(j, "expected ',' or '}'");
+            xs_json_fail(j, XJE_OBJ_SEP);
         }
     } else if (c == '[') {
         j->p++;
@@ -4282,25 +4402,38 @@ XS_NOINLINE xs_jv *xs_json_value(xs_jp *j) {
             xs_json_ws(j);
             if (j->p < j->end && *j->p == ',') { j->p++; continue; }
             if (j->p < j->end && *j->p == ']') { j->p++; break; }
-            xs_json_fail(j, "expected ',' or ']'");
+            xs_json_fail(j, XJE_ARR_SEP);
         }
     } else if (c == '"') {
         v = xs_jv_new(XJ_STR);
         v->str = xs_json_string(j, &v->slen);
-    } else if (c == 't' && j->end - j->p >= 4 && memcmp(j->p, "true", 4) == 0) {
-        v = xs_jv_new(XJ_BOOL); v->b = true; j->p += 4;
-    } else if (c == 'f' && j->end - j->p >= 5 && memcmp(j->p, "false", 5) == 0) {
-        v = xs_jv_new(XJ_BOOL); j->p += 5;
-    } else if (c == 'n' && j->end - j->p >= 4 && memcmp(j->p, "null", 4) == 0) {
-        v = xs_jv_new(XJ_NULL); j->p += 4;
-    } else if (c == '-' || (c >= '0' && c <= '9')) {
+    } else if (c == 't') {
+        xs_json_word(j, "true", 4);
+        v = xs_jv_new(XJ_BOOL); v->b = true;
+    } else if (c == 'f') {
+        xs_json_word(j, "false", 5);
+        v = xs_jv_new(XJ_BOOL);
+    } else if (c == 'n') {
+        xs_json_word(j, "null", 4);
+        v = xs_jv_new(XJ_NULL);
+    } else if (c == '-' || (c >= '0' && c <= '9')) { /* JSON's number grammar first, then strtod on what it took */
+        const char *s = j->p;
+        if (c == '-') { j->p++; if (!xs_json_digit(j)) xs_json_fail(j, XJE_MINUS); }
+        if (*j->p == '0') { j->p++; if (xs_json_digit(j)) xs_json_fail(j, XJE_NUMBER); }
+        else while (xs_json_digit(j)) j->p++;
+        if (j->p < j->end && *j->p == '.') { j->p++; if (!xs_json_digit(j)) xs_json_fail(j, XJE_FRAC); while (xs_json_digit(j)) j->p++; }
+        if (j->p < j->end && (*j->p == 'e' || *j->p == 'E')) {
+            j->p++;
+            if (j->p < j->end && (*j->p == '+' || *j->p == '-')) j->p++;
+            if (!xs_json_digit(j)) xs_json_fail(j, XJE_EXP);
+            while (xs_json_digit(j)) j->p++;
+        }
         v = xs_jv_new(XJ_NUM);
         char *stop;
-        v->num = strtod(j->p, &stop);
-        if (stop == j->p) xs_json_fail(j, "bad number");
-        j->p = stop;
+        v->num = strtod(s, &stop);
+        if (stop != j->p) v->num = c == '-' ? -0.0 : 0.0; /* ("0x1": strtod reads hex past the 0; the x is an error after it) */
     } else {
-        xs_json_fail(j, "unexpected character");
+        xs_json_fail(j, XJE_TOKEN);
         return NULL;
     }
     j->depth--;
@@ -4313,7 +4446,7 @@ XS_NOINLINE xs_jv *xs_json_parse(xs_str *text) {
     xs_jp j = {text->data, text->data + text->len, text->data, 0};
     xs_jv *v = xs_json_value(&j);
     xs_json_ws(&j);
-    if (j.p != j.end) xs_json_fail(&j, "trailing characters");
+    if (j.p != j.end) xs_json_fail(&j, XJE_TRAILING);
     return v;
 }
 
