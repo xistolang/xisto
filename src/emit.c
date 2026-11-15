@@ -7375,6 +7375,16 @@ static void emit_for_(Stmt *s) {
             for (int k = 0; k < nbce_fw; k++) buf_printf(&u, "fm%d_ = fn%d_, ", bce_fw[k].id, bce_fw[k].id);
             upd = xs_sprintf("(%s%s)", u.data, upd);
         }
+        if (s->for_init && s->for_init->kind == S_VAR && s->for_init->cell) {
+            /* `for (let k ...)` whose k a closure shares: each iteration has its own binding (as JS), so a closure
+               made in this iteration keeps its k. Before the update the value moves to a new cell when a closure
+               holds the current one (XB-212); a loop no closure was made in keeps its single cell. */
+            Stmt *v = s->for_init;
+            const char *cs = cell_struct(v->type), *c = v->cell;
+            char *cp = xs_sprintf("({ if (%s->hdr.rc > 1) { %s *nc_ = %s_new(); nc_->v = %s%s->v%s; xs_release(%s); %s = nc_; } })",
+                                  c, cs, cs, crc(v->type) ? "xs_retain(" : "", c, crc(v->type) ? ")" : "", c, c);
+            upd = *upd ? xs_sprintf("(%s, %s)", cp, upd) : cp;
+        }
         if (!cond_ar && !upd_ar) {
             if (for_pragma_loop == s) buf_printf(out, "_Pragma(\"clang loop %s\") ", for_pragma);
             buf_printf(out, "for (; %s; %s) ", cond, upd);
