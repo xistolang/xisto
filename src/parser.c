@@ -2530,6 +2530,7 @@ static Stmt *tdz_split(Parser *p, Stmt *s) {
 static bool tok_ident_is(Parser *q, const char *s);
 static void fix_import_names(Parser *p, Module *m, int i0);
 static void ns_register(Parser *p, Module *m, const char *alias);
+static void fs_extras(Program *prog, Module *m, Import *im);
 static Module *load_module(Program *prog, const char *file, Pos from_pos, const char *from_file);
 static Stmt *parse_var(Parser *p) {
     Stmt *s = new_stmt(S_VAR, p->tok.pos);
@@ -2574,6 +2575,7 @@ static Stmt *parse_var(Parser *p) {
                             m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
                             m->imports[m->nimports++] = im;
                             m->imports[n0].from = load_module(prog, pa, nm.pos, m->path);
+                            fs_extras(prog, m, &m->imports[n0]);
                             xs_file_name = m->file;
                             xs_source = m->src;
                             parsing_prog = prog;
@@ -5781,6 +5783,7 @@ static void parse_module(Program *prog, Module *m) {
                     else im->from = missing_module(prog, im->path);
                     xs_error_recover = saved;
                 } else im->from = load_module(prog, im->path, im->pos, m->path);
+                fs_extras(prog, m, &m->imports[i]);
                 xs_file_name = m->file;
                 xs_source = m->src;
                 parsing_prog = prog;
