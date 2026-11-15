@@ -1305,6 +1305,8 @@ static int mapnull_ok; /* checking the xs.map(f) of xs.map(f).filter(p): f may g
 static bool nullable_ok(Type *t);
 static Func *lookup_func(const char *name);
 static bool check_es_promise(Expr *e, Type *expected);
+static Type *resolve(Type *t, Pos pos);
+static Expr *branch_copy(Expr *x);
 static void check_promise(Expr *e, Type *expected) {
     const char *m = e->str;
     if (!e->is_call) xs_error(XS7030, e->pos, NULL, "Promise.%s is not a value", m);
@@ -1333,7 +1335,7 @@ static void check_promise(Expr *e, Type *expected) {
         Type *et = ty_object_of(find_class("Error"));
         check_expr(e->args.items[0], et);
         expect_type(e->args.items[0], et, "the argument of Promise.reject");
-        Type *T = pexp && pexp->kind == TY_PROMISE ? pexp->elem : ty_void;
+        Type *T = e->ntargs == 1 && e->targs[0] ? resolve(e->targs[0], e->pos) : pexp && pexp->kind == TY_PROMISE ? pexp->elem : ty_void;
         Expr *x = e->args.items[0];
         e->kind = E_CALL; e->lhs = NULL; e->is_call = false; e->str = NULL;
         e->builtin.cfn = "xs_promise_rejected";
@@ -1343,6 +1345,36 @@ static void check_promise(Expr *e, Type *expected) {
         e->type = ty_promise_of(T);
         prog->uses_gen = true;
         return;
+    }
+    if ((!strcmp(m, "all") || !strcmp(m, "race") || !strcmp(m, "any") || !strcmp(m, "allSettled")) && e->args.len == 1 &&
+        e->args.items[0]->kind == E_ARRAY_LIT && !e->args.items[0]->spread) {
+        /* Promise.any([Promise.reject(err), Promise.resolve(2)]): a rejection is a promise of any type (TypeScript's
+           Promise<never>): each Promise.reject(...) takes the type of the first other element's value */
+        Expr *a = e->args.items[0];
+        bool rej = false;
+        Expr *other = NULL;
+        for (int i = 0; i < a->args.len; i++) {
+            Expr *x = a->args.items[i];
+            bool r = x->kind == E_MEMBER && x->is_call && x->str && !strcmp(x->str, "reject") && x->lhs && x->lhs->kind == E_IDENT &&
+                     !strcmp(x->lhs->str, "Promise") && !lookup("Promise") && x->ntargs == 0;
+            if (r) rej = true;
+            else if (!other) other = x;
+        }
+        Expr *probe = rej && other ? branch_copy(other) : NULL;
+        if (probe) {
+            check_expr(probe, NULL);
+            Type *T = probe->type->kind == TY_PROMISE ? probe->type->elem : probe->type;
+            if (T->kind == TY_LITINT) T = ty_number;
+            for (int i = 0; i < a->args.len; i++) {
+                Expr *x = a->args.items[i];
+                if (x->kind == E_MEMBER && x->is_call && x->str && !strcmp(x->str, "reject") && x->lhs && x->lhs->kind == E_IDENT &&
+                    !strcmp(x->lhs->str, "Promise") && x->ntargs == 0) {
+                    x->targs = xs_alloc(sizeof(Type *));
+                    x->targs[0] = T;
+                    x->ntargs = 1;
+                }
+            }
+        }
     }
     if (strcmp(m, "allSettled") == 0 && lookup_func("__xs_allSettled")) { /* the outcome of each promise: xisto:arrays */
         if (e->args.len != 1) xs_error(XS7032, e->pos, NULL, "Promise.%s takes an array", m);
@@ -9314,6 +9346,25 @@ static bool check_es_static(Expr *e, const char *ns, Type *expected) {
         check_expr(e, expected);
         return true;
     }
+    if (!strcmp(m, "assign") && n >= 2 && e->args.items[0]->kind == E_OBJLIT && !e->args.items[0]->type) {
+        /* Object.assign({}, a, b) / Object.assign({ x: 1 }, a): a new object, { x: 1, ...a, ...b } (the same entries, in order) */
+        Expr *lit = e->args.items[0];
+        Expr *o = xs_alloc(sizeof *o);
+        *o = *lit;
+        o->args = (ExprList){0};
+        o->keys = xs_alloc(sizeof(char *) * (size_t)(lit->args.len + n));
+        for (int i = 0; i < lit->args.len; i++) { o->keys[o->args.len] = lit->keys[i]; expr_list_push(&o->args, lit->args.items[i]); }
+        for (int i = 1; i < n; i++) {
+            Expr *u = xs_alloc(sizeof *u);
+            u->kind = E_UNARY; u->op = TK_ELLIPSIS; u->pos = e->args.items[i]->pos; u->field = -1; u->lhs = e->args.items[i];
+            o->keys[o->args.len] = "...";
+            expr_list_push(&o->args, u);
+        }
+        o->spread = true;
+        *e = *o;
+        check_expr(e, expected);
+        return true;
+    }
     if (!strcmp(m, "assign") && n > 2 && fresh_path(e->args.items[0])) {
         /* Object.assign(t, a, b): Object.assign(t, a), Object.assign(t, b), then t */
         Expr *tg = e->args.items[0];
@@ -10855,6 +10906,13 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->type = ty_void;
                 e->builtin.cfn = name[0] == 'q' ? "xs_queue_microtask" : "xs_next_tick";
                 prog->uses_net = true;
+                return;
+            }
+            if (strcmp(name, "__xs_cmp16") == 0 && e->args.len == 2 && !lookup_func(name)) {
+                /* (xs.sort() without a comparator: two strings compared by UTF-16 code units, as JavaScript's default) */
+                for (int k = 0; k < 2; k++) { check_expr(e->args.items[k], ty_string); expect_type(e->args.items[k], ty_string, "internal: __xs_cmp16"); }
+                e->type = ty_int;
+                e->builtin.cfn = "xs_str_cmp16";
                 return;
             }
             if (strcmp(name, "__xs_throw") == 0 && e->args.len == 1 && cur_mod && cur_mod->file && !strcmp(cur_mod->file, "xisto:builtins")) {
@@ -13220,20 +13278,22 @@ static void check_expr_in(Expr *e, Type *expected) {
                     return;
                 }
                 if (strcmp(m, "sort") == 0) {
-                    if (e->args.len == 0 && (elem->kind == TY_STRING || (elem->kind == TY_ENUM && elem->en->is_string))) {
-                        /* names.sort(): strings in their default order (by their characters), as JavaScript sorts */
+                    bool strs = elem->kind == TY_STRING || (elem->kind == TY_ENUM && elem->en->is_string);
+                    if (e->args.len == 0 && (strs || is_numeric(elem) || elem->kind == TY_BOOLEAN || is_big(elem) || elem->kind == TY_ENUM ||
+                                             (elem->kind == TY_UNKNOWN && !elem->tname) || ty_is_any(elem) ||
+                                             (elem->kind == TY_NULLABLE && (elem->elem->kind == TY_STRING || is_numeric(elem->elem))))) {
+                        /* xs.sort() without a comparator: JavaScript's default order, the elements' String() forms
+                           compared by UTF-16 code units (xs_str_cmp16): (a, b) => cmp16(String(a), String(b)) */
                         Pos at = e->pos;
                         #define ID_(n_) ({ Expr *x_ = xs_alloc(sizeof *x_); x_->kind = E_IDENT; x_->pos = at; x_->field = -1; x_->str = n_; x_; })
-                        #define NUM_(v_) ({ Expr *x_ = xs_alloc(sizeof *x_); x_->kind = E_NUMBER; x_->pos = at; x_->field = -1; x_->is_int_lit = true; x_->ival = v_; x_->num = v_; x_; })
-                        #define BIN_(op_, l_, r_) ({ Expr *x_ = xs_alloc(sizeof *x_); x_->kind = E_BINARY; x_->pos = at; x_->field = -1; x_->op = op_; x_->lhs = l_; x_->rhs = r_; x_; })
-                        #define COND_(c_, y_, n_) ({ Expr *x_ = xs_alloc(sizeof *x_); x_->kind = E_COND; x_->pos = at; x_->field = -1; x_->lhs = c_; expr_list_push(&x_->args, y_); expr_list_push(&x_->args, n_); x_; })
-                        Expr *neg = xs_alloc(sizeof *neg);
-                        neg->kind = E_UNARY; neg->op = TK_MINUS; neg->pos = at; neg->field = -1; neg->lhs = NUM_(1);
-                        Expr *body = COND_(BIN_(TK_LT, ID_("__sa"), ID_("__sb")), neg, COND_(BIN_(TK_GT, ID_("__sa"), ID_("__sb")), NUM_(1), NUM_(0)));
+                        #define STR_(x0_) (strs ? (x0_) : ({ Expr *c_ = xs_alloc(sizeof *c_); c_->kind = E_CALL; c_->pos = at; c_->field = -1; \
+                                                            c_->lhs = ID_("String"); expr_list_push(&c_->args, (x0_)); c_; }))
+                        Expr *body = xs_alloc(sizeof *body);
+                        body->kind = E_CALL; body->pos = at; body->field = -1; body->lhs = ID_("__xs_cmp16");
+                        expr_list_push(&body->args, STR_(ID_("__sa")));
+                        expr_list_push(&body->args, STR_(ID_("__sb")));
+                        #undef STR_
                         #undef ID_
-                        #undef NUM_
-                        #undef BIN_
-                        #undef COND_
                         Expr *arrow = thunk_of(body);
                         Func *f = arrow->arrow->fn;
                         f->params = xs_alloc(sizeof(Param) * 2);

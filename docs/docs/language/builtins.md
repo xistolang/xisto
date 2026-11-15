@@ -28,8 +28,11 @@ Array.from(set, (x) => x * 2);      // of an array, a Set, a Map, a string or a 
 "hello".at(-1);                     // "o"
 ```
 
-`xs.with(i, v)` out of range throws the `RangeError` Node throws (`Invalid index : 5`). `toSorted()` without a
-comparator sorts strings as `sort()` does; numbers need a comparator, as for `sort` (XS7089). The indices are
+`xs.with(i, v)` out of range throws the `RangeError` Node throws (`Invalid index : 5`). `sort()` and `toSorted()`
+without a comparator use JavaScript's default order: the elements' `String()` forms compared by UTF-16 code units
+(`[3, 1, 10, 2]` gives `[1, 10, 2, 3]`), for strings, numbers, bigints, booleans and `unknown[]`; a `null` sorts as
+the string `"null"` (xisto has no `undefined` to put last). Arrays of objects still need a comparator (XS7089). The
+indices are
 `int`, as everywhere in xisto. `s.isWellFormed()` is `true` and `s.toWellFormed()` is `s`: a string of xisto is
 UTF-8 and cannot hold a lone surrogate.
 
@@ -38,6 +41,7 @@ UTF-8 and cannot hold a lone surrogate.
 ```ts
 Object.groupBy(items, (it) => it.kind);   // a Record<string, T[]>, printed [Object: null prototype] { ... }
 Object.assign(target, a, b);              // several sources, in order; a Record into a Record too
+Object.assign({}, a, b);                  // a new object: { ...a, ...b }
 Object.fromEntries(map);                  // of a Map<string, V>, or of [string, V] pairs
 Object.entries(new Point());              // of a class instance: its fields (inherited ones first)
 Object.getOwnPropertyNames(o);            // as Object.keys(o)
