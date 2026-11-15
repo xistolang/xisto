@@ -3703,20 +3703,21 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, "; })");
             return;
         }
-        if (e->op == TK_IDENT) { /* instanceof: the same identity test as `as` */
+        if (e->op == TK_IDENT) { /* instanceof: the same identity test as `as`; the value borrowed (a fresh one is let go
+                                     at the statement's end: XB-213) */
             Class *c = e->rhs->cls;
             Type *lt = e->lhs->type;
             bool l_err = lt->kind == TY_OBJECT && lt->cls->builtin && strcmp(lt->cls->name, "Error") == 0;
             if (lt->kind == TY_OBJECT && is_error_class(lt->cls) && strcmp(c->name, "Error") == 0 && c->builtin) {
                 buf_puts(out, "((void *)("); /* an object of a class that extends Error is an Error */
-                emit_expr(e->lhs);
+                emit_borrowed(e->lhs);
                 buf_puts(out, ") != NULL)");
                 return;
             }
             if (l_err && is_error_class(c)) { /* a caught Error: the class of the object it was thrown as */
                 if (in_hierarchy(c)) buf_printf(out, "%s(xs_Error_thrown((void *)(", isa_fn(c));
                 else buf_printf(out, "xs_is_a(xs_Error_thrown((void *)(");
-                emit_expr(e->lhs);
+                emit_borrowed(e->lhs);
                 if (in_hierarchy(c)) buf_puts(out, ")))");
                 else buf_printf(out, ")), %s_free)", c->cname);
                 return;
@@ -3725,7 +3726,7 @@ static void emit_expr_raw(Expr *e) {
                 static int ngi;
                 int id = ngi++;
                 buf_printf(out, "({ void *gi%d_ = (void *)(", id);
-                emit_expr(e->lhs);
+                emit_borrowed(e->lhs);
                 buf_printf(out, "); void (*gf%d_)(void *) = gi%d_ ? xs_type_of(gi%d_)->free : NULL; (false", id, id, id);
                 for (int i = 0; i < prog->nclasses; i++)
                     if (prog->classes[i]->generic_of == c && prog->classes[i]->used) buf_printf(out, " || gf%d_ == %s_free", id, prog->classes[i]->cname);
@@ -3734,7 +3735,7 @@ static void emit_expr_raw(Expr *e) {
             }
             if (in_hierarchy(c)) {
                 buf_printf(out, "%s((void *)(", isa_fn(c));
-                emit_expr(e->lhs);
+                emit_borrowed(e->lhs);
                 buf_puts(out, "))");
                 return;
             }
@@ -3743,7 +3744,7 @@ static void emit_expr_raw(Expr *e) {
                 static int nei;
                 int id = nei++;
                 buf_printf(out, "({ void *ei%d_ = (void *)(", id);
-                emit_expr(e->lhs);
+                emit_borrowed(e->lhs);
                 buf_printf(out, "); void (*ef%d_)(void *) = ei%d_ ? xs_type_of(ei%d_)->free : NULL; (ef%d_ && (ef%d_ == xs_Error_free", id, id, id, id, id);
                 for (int i = 0; i < prog->nclasses; i++) {
                     Class *k = prog->classes[i];
@@ -3753,7 +3754,7 @@ static void emit_expr_raw(Expr *e) {
                 return;
             }
             buf_puts(out, "xs_is_a(");
-            emit_expr(e->lhs);
+            emit_borrowed(e->lhs);
             buf_printf(out, ", %s)", strcmp(c->name, "Error") == 0 ? "xs_Error_free" : c->builtin && strcmp(c->name, "Date") == 0 ? "xs_Date_free" :
                        c->builtin && strcmp(c->name, "RegExp") == 0 ? "xs_RegExp_free" :
                        c->builtin && (strcmp(c->name, "Uint8Array") == 0 || strcmp(c->name, "Buffer") == 0) ? "xs_u8_free" :
@@ -4104,6 +4105,17 @@ static void emit_expr_raw(Expr *e) {
             }
         }
         if (!nz_mute && e->builtin.cfn && strcmp(e->builtin.cfn, "xs_to_number") == 0 && e->args.len == 1 && may_nz(e->args.items[0])) { emit_nzd(e->args.items[0]); return; } /* XB-087 */
+        if (e->builtin.cfn && strcmp(e->builtin.cfn, "__xs_is_view") == 0) { /* ArrayBuffer.isView(f()): one read (XB-213) */
+            static int niv;
+            int id = niv++;
+            Expr *v = e->args.items[0];
+            if (!cref(v->type)) { buf_puts(out, "((void)("); emit_expr(v); buf_puts(out, "), false)"); return; }
+            buf_printf(out, "({ void *iv%d_ = (void *)(", id);
+            emit_borrowed(v);
+            buf_printf(out, "); void (*ivf%d_)(void *) = iv%d_ ? xs_type_of(iv%d_)->free : NULL; ivf%d_ && (ivf%d_ == xs_u8_free || "
+                            "ivf%d_ == xs_f64_free || ivf%d_ == xs_f32_free || ivf%d_ == xs_i32_free); })", id, id, id, id, id, id, id, id);
+            return;
+        }
         if (e->builtin.cfn && strcmp(e->builtin.cfn, "__iface_as") == 0) { /* XB-126 */
             Type *t = e->type->kind == TY_NULLABLE ? e->type->elem : e->type;
             buf_printf(out, "%s(", asif_fn(t->cls, e->type->kind == TY_NULLABLE));

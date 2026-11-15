@@ -11273,9 +11273,19 @@ static void check_expr_in(Expr *e, Type *expected) {
                 t3->kind = E_BINARY; t3->op = TK_IDENT; t3->pos = v->pos; t3->field = -1; t3->lhs = pure_copy(v) ? pure_copy(v) : v; t3->rhs = c3;
                 Expr *o12 = xs_alloc(sizeof *o12);
                 o12->kind = E_BINARY; o12->op = TK_OR; o12->pos = v->pos; o12->field = -1; o12->lhs = t1; o12->rhs = t2;
+                if (!pure_copy(v)) { /* ArrayBuffer.isView(new Float64Array(n)): the value made once, each kind tested
+                                        (the emitter's __xs_is_view; it was the Uint8Array test alone), then let go (XB-213) */
+                    Pos pos = e->pos;
+                    check_expr(v, NULL);
+                    settle(v);
+                    memset(e, 0, sizeof *e);
+                    e->kind = E_CALL; e->pos = pos; e->field = -1; e->type = ty_boolean;
+                    e->builtin.cfn = "__xs_is_view";
+                    expr_list_push(&e->args, v);
+                    return;
+                }
                 memset(e, 0, sizeof *e);
-                if (pure_copy(v)) { e->kind = E_BINARY; e->op = TK_OR; e->pos = v->pos; e->field = -1; e->lhs = o12; e->rhs = t3; }
-                else *e = *t1;
+                e->kind = E_BINARY; e->op = TK_OR; e->pos = v->pos; e->field = -1; e->lhs = o12; e->rhs = t3;
                 check_expr(e, ty_boolean);
                 return;
             }
