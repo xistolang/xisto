@@ -164,7 +164,7 @@ static const char *xs_tls_err(xs_tls *t) {
 
 /* Moves records between the engine and the socket until `done(t)` holds. Waits (with an optional deadline)
    when the socket is not ready. Returns false if the connection closed or failed. */
-static bool xs_tls_pump(xs_tls *t, int fd, bool (*done)(xs_tls *), int64_t timeout_ms, uint64_t deadline) {
+XS_NOINLINE bool xs_tls_pump(xs_tls *t, int fd, bool (*done)(xs_tls *), int64_t timeout_ms, uint64_t deadline) {
     for (;;) {
         unsigned st = br_ssl_engine_current_state(t->eng);
         if (st & BR_SSL_CLOSED) return false;

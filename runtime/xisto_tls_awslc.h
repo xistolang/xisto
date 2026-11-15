@@ -50,7 +50,7 @@ static const char *xs_tls_err(xs_tls *t) {
 static int xs_tls_last_error(xs_tls *t) { return t->err; }
 
 /* one SSL call, waiting on the socket (yielding inside a coroutine) when it asks to */
-static int xs_tls_io(xs_tls *t, int fd, int r, int64_t timeout_ms, uint64_t deadline) {
+XS_NOINLINE int xs_tls_io(xs_tls *t, int fd, int r, int64_t timeout_ms, uint64_t deadline) {
     int e = SSL_get_error(t->ssl, r);
     if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
         int64_t left = timeout_ms < 0 ? -1 : (int64_t)((deadline > xs_now() ? deadline - xs_now() : 0) / 1000000ull);
@@ -78,7 +78,7 @@ XS_NOINLINE void xs_tls_add_ca_file(const char *path) {
     SSL_CTX_load_verify_locations(xs_tls_client_ctx, path, NULL);
 }
 
-static bool xs_tls_write_all(xs_tls *t, int fd, const char *p, size_t n, int64_t timeout_ms, uint64_t deadline) {
+XS_NOINLINE bool xs_tls_write_all(xs_tls *t, int fd, const char *p, size_t n, int64_t timeout_ms, uint64_t deadline) {
     xs_tls_bind(t, fd);
     while (n > 0) {
         int w = SSL_write(t->ssl, p, n > INT32_MAX ? INT32_MAX : (int)n);
@@ -87,7 +87,7 @@ static bool xs_tls_write_all(xs_tls *t, int fd, const char *p, size_t n, int64_t
     }
     return true;
 }
-static ssize_t xs_tls_read_some(xs_tls *t, int fd, char *out, size_t cap, int64_t timeout_ms, uint64_t deadline) {
+XS_NOINLINE ssize_t xs_tls_read_some(xs_tls *t, int fd, char *out, size_t cap, int64_t timeout_ms, uint64_t deadline) {
     xs_tls_bind(t, fd);
     for (;;) {
         int r = SSL_read(t->ssl, out, cap > INT32_MAX ? INT32_MAX : (int)cap);
