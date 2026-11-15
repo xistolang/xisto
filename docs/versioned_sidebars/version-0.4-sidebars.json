@@ -1,0 +1,112 @@
+{
+  "docs": [
+    "intro",
+    "why",
+    {
+      "type": "category",
+      "label": "Getting started",
+      "collapsed": false,
+      "items": [
+        "getting-started/install",
+        "getting-started/first-program",
+        "getting-started/nestjs",
+        "guides/projects-and-packages"
+      ]
+    },
+    {
+      "type": "category",
+      "label": "The language",
+      "link": {
+        "type": "doc",
+        "id": "language/index"
+      },
+      "items": [
+        "language/types",
+        "language/null",
+        "language/equality-and-truthiness",
+        "language/any",
+        "language/classes-interfaces-generics",
+        "language/functions-async",
+        "language/generators",
+        "language/modules",
+        "language/errors",
+        "language/decorators",
+        "language/divergences",
+        "language/warnings",
+        "language/known-limitations"
+      ]
+    },
+    {
+      "type": "category",
+      "label": "Performance",
+      "items": [
+        "performance/model",
+        "performance/coroutines",
+        "performance/best-practices",
+        "performance/measuring",
+        "performance/methodology"
+      ]
+    },
+    {
+      "type": "category",
+      "label": "Benchmarks",
+      "link": {
+        "type": "doc",
+        "id": "benchmarks/index"
+      },
+      "items": [
+        {
+          "type": "category",
+          "label": "Benchmarks Game",
+          "link": {
+            "type": "doc",
+            "id": "benchmarks/benchmarks-game/index"
+          },
+          "items": [
+            "benchmarks/benchmarks-game/vs-rust",
+            "benchmarks/benchmarks-game/vs-node",
+            "benchmarks/benchmarks-game/vs-bun"
+          ]
+        },
+        {
+          "type": "category",
+          "label": "PolyBench",
+          "link": {
+            "type": "doc",
+            "id": "benchmarks/polybench/index"
+          },
+          "items": [
+            "benchmarks/polybench/vs-rust",
+            "benchmarks/polybench/vs-go"
+          ]
+        },
+        "benchmarks/techempower",
+        "benchmarks/http",
+        "benchmarks/energy-sqlite-streams"
+      ]
+    },
+    {
+      "type": "category",
+      "label": "Node compatibility",
+      "items": [
+        "guides/node-compatibility"
+      ]
+    },
+    {
+      "type": "category",
+      "label": "Porting",
+      "items": [
+        "guides/porting"
+      ]
+    },
+    {
+      "type": "category",
+      "label": "Reference",
+      "items": [
+        "reference/cli",
+        "reference/project-files"
+      ]
+    },
+    "contributing"
+  ]
+}
