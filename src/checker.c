@@ -3439,6 +3439,8 @@ static bool always_returns(Stmt *s);
 static void check_block(Stmt *b);
 static Binding *narrow_target(Expr *cond, bool *not_null);
 static const char *path_key(Expr *m);
+static void upath_read(Expr *e);
+static void upath_invalidate(Expr *target);
 typedef struct { Binding *b[8]; int n; } NSet;
 static void narrow_set(Expr *c, bool when, NSet *out);
 static void shadow_set(NSet *s);
@@ -7083,6 +7085,7 @@ static void check_object_member_in(Expr *e, Class *c) {
         e->field = idx;
         e->type = f->type;
         e->cls = c;
+        if (e->type->kind == TY_UNION) { upath_read(e); return; } /* narrowed by o.f.kind === "a" (XB-146) */
         if (e->type->kind == TY_NULLABLE) { /* narrowed by o.f !== null: read as o.f! (checked) */
             const char *key = path_key(e);
             Binding *pb = key ? lookup(key) : NULL;
@@ -9818,6 +9821,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->op = TK_ASSIGN;
             e->type = target->type;
             if (narrowed) unnarrow(narrowed);
+            upath_invalidate(target);
             return;
         }
         if (tk_bitop_of_assign(e->op)) { /* x &= m: x must hold the int result */
@@ -9844,6 +9848,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         expect_type(e->rhs, target->type, e->op == TK_ASSIGN ? "assigned value" : "right side of compound assignment");
         e->type = target->type;
         if (narrowed) unnarrow(narrowed);
+        upath_invalidate(target);
         if (target->kind == E_IDENT && e->op == TK_ASSIGN && e->rhs->type->kind != TY_NULLABLE && e->rhs->type->kind != TY_NULL &&
             e->rhs->kind != E_NULL && !ty_is_any(e->rhs->type) && e->rhs->type->kind != TY_UNKNOWN) {
             /* as TypeScript: after x = <not null>, x is not null (until it is assigned again) */
@@ -10764,6 +10769,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->field = (int)k;
             e->cls = tc;
             e->type = tc->fields[k].type;
+            if (e->type->kind == TY_UNION) upath_read(e); /* if (t[0].ok) t[0].value (XB-146) */
             return;
         }
         if (e->lhs->type->kind == TY_STRING && tsc_checked()) { /* s[i] with --tsc-checked: s.charAt(i) ('' past the end, where JavaScript gives undefined) */
@@ -14998,7 +15004,7 @@ static void check_cond(Expr *c, const char *what) {
    the scopes, from the variable's C name (unique, so an inner `o` that shadows it is another path), or NULL */
 /* the stable reference a path starts from: x, this, x.f, this.f.g (fields only, no calls), or NULL */
 static const char *path_base(Expr *e) {
-    while (e && e->kind == E_AS && e->op == TK_NOT && !e->elem_type) e = e->lhs; /* o.f narrowed already: the same path */
+    while (e && e->kind == E_AS && ((e->op == TK_NOT && !e->elem_type) || e->upath)) e = e->lhs; /* o.f narrowed already: the same path */
     if (!e) return NULL;
     if (e->kind == E_THIS) return "this";
     if (e->kind == E_IDENT) {
@@ -15017,8 +15023,67 @@ static const char *path_key(Expr *m) {
     if (!in) return NULL;
     return xs_sprintf("\x01%s.%d.%s", in, m->field, m->cls->name);
 }
-/* `x !== null` / `x === null` on a nullable local: returns the binding and whether the test is "not null". */
+/* A union-typed field path (r.data, this.state, t[0], a.b.c) narrowed by a test as a variable is (XB-146): the key its
+   narrowing goes by in the scopes (a "\x01" key, so a callback written in the source does not see it, as for o.f !== null).
+   As TypeScript does, the narrowing holds until the path or a prefix of it is assigned; a call in between keeps it (the
+   called code may change the field: TypeScript does not look, so each read is a checked conversion, a TypeError when the
+   object is not that member any more, where TypeScript's program would read undefined). */
+static Expr *upath_strip(Expr *e) {
+    while (e && e->kind == E_AS && (e->upath || (e->op == TK_NOT && !e->elem_type))) e = e->lhs;
+    return e;
+}
+static const char *upath_key(Expr *m) {
+    m = upath_strip(m);
+    if (!m || m->kind != E_MEMBER || m->is_call || m->field < 0 || !m->cls || m->cls->builtin || !m->type || m->type->kind != TY_UNION) return NULL;
+    const char *in = path_base(m->lhs);
+    return in ? xs_sprintf("\x01\x02%s.%d.%s", in, m->field, m->cls->name) : NULL;
+}
+/* a field read of a union type: the member (or fewer members) a test narrowed its path to */
+static void upath_read(Expr *e) {
+    if (e == dyn_lvalue) return; /* (the target of an assignment: the field as declared) */
+    const char *key = upath_key(e);
+    Binding *pb = key ? lookup(key) : NULL;
+    if (!pb || !pb->union_narrow || !pb->type || pb->type == e->type) return;
+    if (pb->type->kind == TY_UNION) { e->type = pb->type; return; } /* fewer members: held as the union is */
+    Expr *inner = xs_alloc(sizeof *inner);
+    *inner = *e;
+    inner->prechecked = true;
+    memset(e, 0, sizeof *e);
+    e->kind = E_AS; e->pos = inner->pos; e->lhs = inner; e->field = -1; e->elem_type = pb->type; e->upath = true;
+    check_expr(e, NULL);
+}
+/* the variable or field path a union narrowing is about: a binding (for a path, the one in scope or a new one as declared) */
 static Expr *union_ident(Expr *e);
+static Binding *union_subject(Expr *e) {
+    Expr *id = union_ident(e);
+    if (id) return lookup(id->str);
+    const char *key = upath_key(e);
+    if (!key) return NULL;
+    Binding *pb = lookup(key);
+    if (pb) return pb;
+    pb = xs_alloc(sizeof *pb);
+    pb->name = (char *)key;
+    pb->type = upath_strip(e)->type;
+    pb->cname = "";
+    return pb;
+}
+/* x = v, o.f = v: the union narrowings of the paths that start there end (as TypeScript's) */
+static void upath_invalidate(Expr *target) {
+    Expr *t = upath_strip(target);
+    const char *in = NULL;
+    if (t && t->kind == E_IDENT) { Binding *b = lookup(t->str); in = b && b->cname ? b->cname : NULL; }
+    else if (t && t->kind == E_MEMBER) in = path_base(t);
+    if (!in) return;
+    const char *pre = xs_sprintf("\x01\x02%s", in);
+    size_t n = strlen(pre);
+    for (Scope *s = scope; s; s = s->parent)
+        for (Binding *b = s->head; b; b = b->next)
+            if (!strncmp(b->name, pre, n) && (b->name[n] == '.' || b->name[n] == 0)) {
+                Binding *cur = lookup(b->name);
+                if (cur && cur->union_narrow) unnarrow(cur);
+            }
+}
+/* `x !== null` / `x === null` on a nullable local: returns the binding and whether the test is "not null". */
 static Binding *narrow_target(Expr *cond, bool *not_null) {
     if (cond->kind == E_BINARY && cond->op == TK_AND) {
         Binding *b = narrow_target(cond->lhs, not_null);
@@ -15235,25 +15300,25 @@ static UNarrow union_narrow(Expr *c) {
     bool is_ufield = c->kind == E_MEMBER && c->builtin.cfn && strcmp(c->builtin.cfn, "union_field") == 0;
     if (c->kind != E_BINARY && !is_ufield) return r;
     bool neg = c->kind == E_BINARY && c->op == TK_NEQ;
-    Expr *id = NULL, *lit = NULL, *bfield = NULL;
+    Expr *id = NULL, *lit = NULL, *bfield = NULL; /* (id: the variable or field path narrowed) */
     bool bwant = true;
     int how = 0; /* 1 typeof, 2 instanceof, 3 discriminant field, 4 boolean discriminant ({ ok: true } | { ok: false }) */
-    if (is_ufield) { id = union_ident(c->lhs); how = 4; bfield = c; }
+    if (is_ufield) { id = c->lhs; how = 4; bfield = c; }
     else if ((c->op == TK_EQ || c->op == TK_NEQ) && (c->rhs->kind == E_BOOL || c->lhs->kind == E_BOOL)) {
         Expr *a = c->rhs->kind == E_BOOL ? c->lhs : c->rhs, *bl = c->rhs->kind == E_BOOL ? c->rhs : c->lhs;
-        if (a->kind == E_MEMBER && a->builtin.cfn && strcmp(a->builtin.cfn, "union_field") == 0) { id = union_ident(a->lhs); how = 4; bfield = a; bwant = bl->boolean; }
+        if (a->kind == E_MEMBER && a->builtin.cfn && strcmp(a->builtin.cfn, "union_field") == 0) { id = a->lhs; how = 4; bfield = a; bwant = bl->boolean; }
     }
-    else if (c->op == TK_IDENT) { id = union_ident(c->lhs); how = 2; }
+    else if (c->op == TK_IDENT) { id = c->lhs; how = 2; }
     else if (c->op == TK_EQ || c->op == TK_NEQ) {
         Expr *a = c->lhs, *b = c->rhs;
         if (b->kind != E_STRING) { Expr *t = a; a = b; b = t; }
         if (b->kind != E_STRING) return r;
         lit = b;
-        if (a->kind == E_UNARY && a->op == TK_IDENT) { id = union_ident(a->lhs); how = 1; }
-        else if (a->kind == E_MEMBER && a->builtin.cfn && strcmp(a->builtin.cfn, "union_field") == 0) { id = union_ident(a->lhs); how = 3; }
+        if (a->kind == E_UNARY && a->op == TK_IDENT) { id = a->lhs; how = 1; }
+        else if (a->kind == E_MEMBER && a->builtin.cfn && strcmp(a->builtin.cfn, "union_field") == 0) { id = a->lhs; how = 3; }
     }
     if (!id) return r;
-    Binding *b = lookup(id->str);
+    Binding *b = union_subject(id);
     if (!b) return r;
     if (how == 2 && !neg && b->type->kind == TY_OBJECT && b->type->cls->builtin && strcmp(b->type->cls->name, "Error") == 0 &&
         c->rhs->cls && is_error_class(c->rhs->cls)) { /* catch (e) { if (e instanceof HttpException) ... }: e is the thrown object */
@@ -15513,6 +15578,11 @@ static void check_stmt(Stmt *s) {
                 else check_stmt(s->else_body);
                 pop_scope();
             } else if (always_exits(s->body)) { shadow_union(un.b, un.else_t); shadow_set(&ufs); }
+            if (s->else_body) { /* if (m.kind === "a") { return; } else { ... }: the rest sees the members of the branch that goes on */
+                bool te = always_exits(s->body), ee = always_exits(s->else_body);
+                if (te && !ee) { shadow_union(un.b, un.else_t); shadow_set(&ufs); }
+                else if (ee && !te) { shadow_union(un.b, un.then_t); shadow_set(&uts); }
+            }
             return;
         }
         NSet ts = {0}, fs = {0};
@@ -15530,6 +15600,8 @@ static void check_stmt(Stmt *s) {
         }
         /* if (x === null || y === null) { return; }  →  x and y are not null for the rest of the block */
         if (!s->else_body && always_exits(s->body)) shadow_set(&fs);
+        else if (s->else_body && always_exits(s->body) && !always_exits(s->else_body)) shadow_set(&fs); /* (an else that goes on: the same) */
+        else if (s->else_body && always_exits(s->else_body) && !always_exits(s->body)) shadow_set(&ts);
         else if (!s->else_body) /* if (!x) { x = new Map(); }  →  x is not null after it */
             for (int i = 0; i < fs.n; i++)
                 if (assigns_non_null(s->body, fs.b[i]->name)) shadow_narrowed(fs.b[i]);
@@ -15741,12 +15813,39 @@ static void check_stmt(Stmt *s) {
         check_expr(s->expr, NULL);
         settle(s->expr);
         Type *t = s->expr->type;
-        if (t->kind == TY_NULLABLE && (is_numeric(t->elem) || t->elem->kind == TY_STRING) && !t->elem->tname) {
+        Expr *nsubj = NULL; /* switch (x) with x: T | null: x, which each case for a value narrows to T (XB-147) */
+        bool *null_case = NULL; /* the cases null can reach: case null:, default: */
+        if (t->kind == TY_NULLABLE && (is_numeric(t->elem) || t->elem->kind == TY_STRING)) {
             /* switch (pflIn) with pflIn: number | null: null matches none of the cases (JavaScript's ===), so the switch
-               is on pflIn ?? a value no case has (NaN, equal to nothing; a string no case is) */
+               is on pflIn ?? a value no case has (NaN, equal to nothing; a string no case is). With a case null: (XB-147)
+               a string's is that same value; a number's switch becomes switch (true) { case x === v: ... case x === null: } */
             bool case_null = false;
-            for (int i = 0; i < s->ncases; i++) if (s->cases[i].value && s->cases[i].value->kind == E_NULL) case_null = true;
-            if (!case_null) {
+            nsubj = s->expr;
+            null_case = xs_alloc(sizeof(bool) * (size_t)(s->ncases + 1));
+            for (int i = 0; i < s->ncases; i++) {
+                null_case[i] = !s->cases[i].value || s->cases[i].value->kind == E_NULL;
+                if (s->cases[i].value && s->cases[i].value->kind == E_NULL) case_null = true;
+            }
+            if (case_null && t->elem->kind != TY_STRING) {
+                if (!rereadable(s->expr))
+                    xs_error(XS8127, s->expr->pos, "store it in a const first: const v = ...; switch (v)", "a switch with case null on a number needs a variable or a field");
+                for (int i = 0; i < s->ncases; i++) {
+                    Case *c = &s->cases[i];
+                    if (!c->value) continue;
+                    Expr *eq = xs_alloc(sizeof *eq);
+                    eq->kind = E_BINARY; eq->pos = c->value->pos; eq->field = -1; eq->op = TK_EQ;
+                    eq->lhs = fresh_path(s->expr); eq->rhs = c->value;
+                    c->value = eq;
+                }
+                Expr *tr = xs_alloc(sizeof *tr);
+                tr->kind = E_BOOL; tr->pos = s->expr->pos; tr->field = -1; tr->boolean = true;
+                s->expr = tr;
+                check_expr(tr, NULL);
+                t = tr->type;
+            } else {
+                if (case_null) /* case null: the value the switch reads for null */
+                    for (int i = 0; i < s->ncases; i++)
+                        if (s->cases[i].value && s->cases[i].value->kind == E_NULL) s->cases[i].value = str_lit(s->cases[i].value->pos, "\x01(null)\x01");
                 Expr *d;
                 if (is_numeric(t->elem)) {
                     d = xs_alloc(sizeof *d); d->kind = E_IDENT; d->pos = s->expr->pos; d->field = -1; d->str = "NaN";
@@ -15770,7 +15869,7 @@ static void check_stmt(Stmt *s) {
                 expect_type(c->value, t, "case value");
             }
         }
-        if (tsc_checked() && t->kind == TY_STRING && t->nslits > 0) {
+        if (tsc_checked() && t->kind == TY_STRING && t->nslits > 0 && !nsubj) { /* (T | null: null gets past them) */
             /* switch (input.subprogram) over 'a' | 'b' with a case for each and no default: TypeScript knows no value gets past
                it; here a value outside the type (data not checked) throws there instead of falling off the function's end */
             bool has_default = false, all = true;
@@ -15800,8 +15899,8 @@ static void check_stmt(Stmt *s) {
         }
         switch_depth++;
         Expr *sx = s->expr;
-        Expr *sid = sx->kind == E_MEMBER && sx->builtin.cfn && strcmp(sx->builtin.cfn, "union_field") == 0 ? union_ident(sx->lhs) : NULL;
-        Binding *sb = sid ? lookup(sid->str) : NULL;
+        Binding *sb = sx->kind == E_MEMBER && sx->builtin.cfn && strcmp(sx->builtin.cfn, "union_field") == 0 ? union_subject(sx->lhs) : NULL;
+        bool null_in = false; /* the case before falls through into this one, maybe with null */
         for (int i = 0; i < s->ncases; i++) {
             Case *c = &s->cases[i];
             if (sb && sb->type->kind == TY_UNION && c->value && c->value->kind == E_STRING) { /* case "circle": that member */
@@ -15814,6 +15913,12 @@ static void check_stmt(Stmt *s) {
                 Type *t = union_subset(u, keep);
                 if (!t) xs_error(XS8114, c->value->pos, NULL, "no member of %s has %s \"%s\"", ty_name(u), sx->str, c->value->str);
                 check_block_union(c->body, sb, t);
+            } else if (nsubj) {
+                /* case "a": x is not null there, unless null can fall through into it (from case null: or default:) */
+                NSet ns = {0};
+                if (!null_case[i] && !null_in) narrow_set(null_test_of(nsubj), true, &ns);
+                check_block_narrowed_set(c->body, &ns);
+                null_in = (null_case[i] || null_in) && !always_exits(c->body);
             } else check_block(c->body);
         }
         switch_depth--;
