@@ -1,0 +1,36 @@
+== old r1
+== xisto : startup 30 ms (median of 1), rss at rest 7.6 MB
+ [cache] list (2 queries, 20 of 50) 15717 req/s p50 1.10 ms p99 3.11 ms cpu/1k 41.8 ms cpu 0.65 cores rss 77.3 MB ok 188644/188644
+ [cache] article by slug 23079 req/s p50 0.67 ms p99 2.08 ms cpu/1k 22.9 ms cpu 0.52 cores rss 77.4 MB ok 277005/277005
+ [cache] current user (guard, JWT, query) 7718 req/s p50 2.51 ms p99 4.62 ms cpu/1k 60.1 ms cpu 0.46 cores rss 77.8 MB ok 92608/92608
+ [cache] tags 16481 req/s p50 1.00 ms p99 2.37 ms cpu/1k 21.6 ms cpu 0.36 cores rss 78.3 MB ok 197811/197811
+ [cache] login (argon2) 66 req/s p50 304.56 ms p99 536.63 ms cpu/1k 129318.8 ms cpu 8.38 cores rss 205.8 MB ok 778/778
+ [no-cache] list (2 queries, 20 of 50) 5853 req/s p50 3.22 ms p99 6.21 ms cpu/1k 92.7 ms cpu 0.54 cores rss 127.9 MB ok 70224/70224
+ [no-cache] article by slug 8001 req/s p50 2.41 ms p99 4.46 ms cpu/1k 43.6 ms cpu 0.35 cores rss 83.0 MB ok 96012/96012
+== new r1
+== xisto : startup 18 ms (median of 1), rss at rest 6.8 MB
+ [cache] list (2 queries, 20 of 50) 15390 req/s p50 1.12 ms p99 3.26 ms cpu/1k 42.3 ms cpu 0.65 cores rss 77.2 MB ok 184698/184698
+ [cache] article by slug 22875 req/s p50 0.67 ms p99 2.09 ms cpu/1k 23.9 ms cpu 0.54 cores rss 77.2 MB ok 274571/274571
+ [cache] current user (guard, JWT, query) 7675 req/s p50 2.51 ms p99 4.70 ms cpu/1k 57.9 ms cpu 0.44 cores rss 77.7 MB ok 92101/92101
+ [cache] tags 15768 req/s p50 1.06 ms p99 2.45 ms cpu/1k 22.7 ms cpu 0.36 cores rss 77.8 MB ok 189240/189240
+ [cache] login (argon2) 55 req/s p50 382.86 ms p99 409.14 ms cpu/1k 163323.0 ms cpu 8.75 cores rss 206.6 MB ok 644/644
+ [no-cache] list (2 queries, 20 of 50) 5046 req/s p50 3.81 ms p99 7.34 ms cpu/1k 116.4 ms cpu 0.59 cores rss 141.0 MB ok 60552/60552
+ [no-cache] article by slug 7571 req/s p50 2.54 ms p99 4.75 ms cpu/1k 46.9 ms cpu 0.35 cores rss 84.4 MB ok 90846/90846
+== old r2
+== xisto : startup 18 ms (median of 1), rss at rest 7.0 MB
+ [cache] list (2 queries, 20 of 50) 13864 req/s p50 1.35 ms p99 3.23 ms cpu/1k 49.6 ms cpu 0.69 cores rss 77.0 MB ok 166382/166382
+ [cache] article by slug 22685 req/s p50 0.68 ms p99 2.09 ms cpu/1k 24.7 ms cpu 0.56 cores rss 77.3 MB ok 272269/272269
+ [cache] current user (guard, JWT, query) 7586 req/s p50 2.54 ms p99 4.69 ms cpu/1k 55.3 ms cpu 0.42 cores rss 12.9 MB ok 91031/91031
+ [cache] tags 15233 req/s p50 1.16 ms p99 2.52 ms cpu/1k 26.4 ms cpu 0.40 cores rss 13.2 MB ok 182810/182810
+ [cache] login (argon2) 50 req/s p50 415.07 ms p99 513.66 ms cpu/1k 178898.5 ms cpu 8.65 cores rss 205.8 MB ok 581/581
+ [no-cache] list (2 queries, 20 of 50) 4787 req/s p50 3.99 ms p99 8.22 ms cpu/1k 123.6 ms cpu 0.59 cores rss 205.8 MB ok 57435/57435
+ [no-cache] article by slug 7656 req/s p50 2.51 ms p99 4.57 ms cpu/1k 46.0 ms cpu 0.35 cores rss 206.1 MB ok 91879/91879
+== new r2
+== xisto : startup 18 ms (median of 1), rss at rest 7.5 MB
+ [cache] list (2 queries, 20 of 50) 14189 req/s p50 1.31 ms p99 3.19 ms cpu/1k 47.9 ms cpu 0.68 cores rss 77.2 MB ok 170275/170275
+ [cache] article by slug 22698 req/s p50 0.68 ms p99 2.12 ms cpu/1k 24.9 ms cpu 0.56 cores rss 77.4 MB ok 272403/272403
+ [cache] current user (guard, JWT, query) 7371 req/s p50 2.47 ms p99 6.99 ms cpu/1k 55.2 ms cpu 0.41 cores rss 54.5 MB ok 88444/88444
+ [cache] tags 15779 req/s p50 1.09 ms p99 2.44 ms cpu/1k 23.8 ms cpu 0.37 cores rss 44.6 MB ok 189387/189387
+ [cache] login (argon2) 52 req/s p50 403.83 ms p99 468.86 ms cpu/1k 174129.4 ms cpu 8.74 cores rss 205.3 MB ok 603/603
+ [no-cache] list (2 queries, 20 of 50) 5094 req/s p50 3.77 ms p99 6.98 ms cpu/1k 115.5 ms cpu 0.59 cores rss 205.1 MB ok 61124/61124
+ [no-cache] article by slug 7640 req/s p50 2.52 ms p99 4.66 ms cpu/1k 46.9 ms cpu 0.36 cores rss 76.8 MB ok 91683/91683

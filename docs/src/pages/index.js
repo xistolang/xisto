@@ -13,10 +13,10 @@ const results = [
     to: '/docs/benchmarks/benchmarks-game/vs-rust',
   },
   {
-    value: '21 ms',
+    value: '20 ms',
     label: 'NestJS startup',
-    text: 'A real NestJS app (Conduit) starts in 21 ms, against 268 ms on Node.',
-    to: '/docs/benchmarks/http#conduit-a-nestjs-app-8-nov-2026',
+    text: 'A real NestJS app (Conduit) starts in 20 ms, against 267 ms on Node.',
+    to: '/docs/benchmarks/http#conduit-a-nestjs-app',
   },
   {
     value: '10 / 10',

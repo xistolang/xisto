@@ -12,8 +12,9 @@ How they were measured is in [Methodology](../performance/methodology.md).
 
 - The Benchmarks Game against Rust was re-run on 13 Nov 2026 (main `4a2f388`), against Node and Bun the same day
   (main `e5fb066`), PolyBench against Rust and Go on 14 Nov (main `40cdc16`), TechEmpower on 14 Nov. The other tables are from 5–10 Nov.
-- Bun wins or ties some rows: the Todo API, energy per HTTP request, streaming energy and SQLite time. Those rows are
-  shown, not dropped.
+- Some rows are lost or tied, and they are shown, not dropped: Bun on a slow dependency at 1 and 5 ms (4–5%), energy
+  per HTTP request, streaming energy and SQLite time; Node on Conduit's article by slug with the cache warm; actix-web
+  on tail latency (p99) at high concurrency. The HTTP tables were re-measured on 14 Nov.
 - Against Rust no Benchmarks Game problem is lost on either VM, and no PolyBench kernel against Rust or Go. Two rows are ties within 5%: spectral-norm on both VMs, at the
   floor of the divisions the problem asks for. xisto's peak memory is below Rust's on 9 of 10 rows on the Xeon (fannkuch-redux: 2.3 against
   2.2 MB) and on all 10 on the Graviton2.
@@ -78,11 +79,11 @@ xisto uses less CPU on every row but regex-redux against Bun on the M4 (0.37 s a
 
 | | xisto | Node | Bun | source |
 |---|---:|---:|---:|---|
-| hello `/ping`, req/s | 231,097 | 136,913 | 198,223 | M4, 7 Nov, `2026-11-07-Apple-M4-http.csv` |
-| hello `/ping`, RSS after load | 4.20 MB | 100.72 MB | 34.47 MB | same |
-| Todo API list, req/s | 111,914 | 68,697 | 115,425 | M4, 5 Nov, `2026-11-05-Apple-M4-todo.csv` |
-| Conduit (NestJS) startup | 21 ms | 268 ms | — | M4, 8 Nov, `conduit-mac-2026-11-08.txt` |
-| Conduit RSS at rest | 2.6 MB | 136.0 MB | — | same |
+| hello `/ping`, req/s | 244,918 | 127,738 | 183,577 | M4, 14 Nov, `2026-11-14-Apple-M4-http.csv` |
+| hello `/ping`, RSS after load | 6.39 MB | 78.14 MB | 35.56 MB | same |
+| Todo API list, req/s | 180,209 | 102,813 | 145,815 | M4, 14 Nov, `2026-11-14-Apple-M4-todo.csv` |
+| Conduit (NestJS) startup | 20 ms | 267 ms | — | M4, 14 Nov, `conduit-mac-2026-11-14.txt` |
+| Conduit RSS at rest | 7.3 MB | 137.3 MB | — | same |
 
 ## What you ship
 
