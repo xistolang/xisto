@@ -1,0 +1,34 @@
+# xisto bg f766bf8 vs go, 2026-11-15T17:19Z, Linux x86_64, go version go1.27.2 linux/amd64
+-- regexredux_4 failed:
+# github.com/mdellandrea/golang-pkg-pcre/src/pkg/pcre
+../../go/pkg/mod/github.com/mdellandrea/golang-pkg-pcre@v0.0.0-20180320014923-72b7ffe8d2be/src/pkg/pcre/pcre.go:52:10: fatal error: pcre.h: No such file or directory
+   52 | #include <pcre.h>
+      |          ^~~~~~~~
+compilation terminated.
+-- regexredux_5 failed:
+# github.com/GRbit/go-pcre
+# [pkg-config --cflags  -- libpcre]
+Package libpcre was not found in the pkg-config search path.
+Perhaps you should add the directory containing `libpcre.pc'
+to the PKG_CONFIG_PATH environment variable
+built (46): binarytrees binarytrees_2 binarytrees_3 binarytrees_5 binarytrees_6 binarytrees_7 fannkuchredux fannkuchredux_2 fannkuchredux_3 fannkuchredux_8 fasta fasta_2 fasta_3 fasta_8 knucleotide_3 knucleotide_4 knucleotide_6 knucleotide_7 knucleotide_8 mandelbrot mandelbrot_2 mandelbrot_3 mandelbrot_4 mandelbrot_6 mandelbrot_8 nbody nbody_2 nbody_3 nbody_8 pidigits pidigits_2 pidigits_3 pidigits_4 pidigits_6 pidigits_7 regexredux regexredux_3 revcomp revcomp_2 revcomp_3 revcomp_5 revcomp_6 spectralnorm spectralnorm_2 spectralnorm_4 spectralnorm_8
+FAILED (2): regexredux_4 regexredux_5
+run: python3 bench/benchmarksgame/langs.py 3 go=/home/ubuntu/gobg/bin
+steal before 151850
+/usr/bin/x86_64-linux-gnu-ld.bfd: cannot open output file bench/benchmarksgame/out/spectralnorm: No such file or directory
+clang: error: linker command failed with exit code 1 (use -v to see invocation)
+xisto: the C compiler failed (this is a bug in xisto; generated file kept at /tmp/xisto-pazO7X/spectralnorm.c)
+# Linux x86_64, 2 cpu; median of 3
+Traceback (most recent call last):
+  File "/home/ubuntu/te-main/bench/benchmarksgame/langs.py", line 92, in <module>
+    main()
+    ~~~~^^
+  File "/home/ubuntu/te-main/bench/benchmarksgame/langs.py", line 57, in main
+    subprocess.run(["build/xisto", "build", "-o", exe, f"{B}/{p}.ts"], check=True, stdout=subprocess.DEVNULL)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/subprocess.py", line 578, in run
+    raise CalledProcessError(retcode, process.args,
+                             output=stdout, stderr=stderr)
+subprocess.CalledProcessError: Command '['build/xisto', 'build', '-o', 'bench/benchmarksgame/out/spectralnorm', 'bench/benchmarksgame/spectralnorm.ts']' returned non-zero exit status 1.
+steal after 151850
+DONE

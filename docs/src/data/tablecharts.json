@@ -569,6 +569,76 @@
    ]
   }
  },
+ "bg-vs-go": {
+  "other": "Go",
+  "sections": {
+   "Xeon E5-2686 v4 (AWS t2.medium, 2 vCPUs, AVX2)": [
+    {
+     "name": "binary-trees",
+     "x": 1.538,
+     "o": 16.604,
+     "xm": 114.3,
+     "om": 307.2
+    },
+    {
+     "name": "mandelbrot",
+     "x": 1.323,
+     "o": 7.155,
+     "xm": 7.3,
+     "om": 33.2
+    },
+    {
+     "name": "k-nucleotide",
+     "x": 1.357,
+     "o": 6.973,
+     "xm": 70.4,
+     "om": 142.2
+    },
+    {
+     "name": "fasta",
+     "x": 1.135,
+     "o": 3.021,
+     "xm": 2.4,
+     "om": 10.3
+    },
+    {
+     "name": "fannkuch-redux",
+     "x": 6.815,
+     "o": 17.082,
+     "xm": 2.4,
+     "om": 5.2
+    },
+    {
+     "name": "spectral-norm",
+     "x": 0.453,
+     "o": 1.124,
+     "xm": 2.3,
+     "om": 2.4
+    },
+    {
+     "name": "n-body",
+     "x": 2.451,
+     "o": 3.641,
+     "xm": 2.0,
+     "om": 1.9
+    },
+    {
+     "name": "pidigits",
+     "x": 0.628,
+     "o": 0.899,
+     "xm": 2.6,
+     "om": 5.0
+    },
+    {
+     "name": "reverse-complement",
+     "x": 0.838,
+     "o": 1.021,
+     "xm": 11.0,
+     "om": 245.1
+    }
+   ]
+  }
+ },
  "pb-vs-rust": {
   "other": "Rust",
   "sections": {

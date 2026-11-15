@@ -1,0 +1,41 @@
+# xisto bg f766bf8 vs go (the 4 problems with an input file), 2026-11-15T18:53Z, Linux x86_64, go version go1.27.2 linux/amd64
+# Linux x86_64, 2 cpu; median of 3
+knucleotide    xisto  knucleotide             1.389s     2.64cpu    364.1MB  par  1.9  same
+knucleotide    xisto  knucleotide-2           4.099s     7.07cpu    367.2MB  par  1.7  same
+knucleotide    xisto  knucleotide-3           3.694s     7.05cpu    363.9MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           2.600s     4.59cpu    160.7MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           2.139s     4.14cpu    158.9MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           1.351s     2.55cpu    161.0MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           1.357s     2.65cpu     70.4MB  par  2.0  same
+knucleotide    go     knucleotide_3           7.775s    13.55cpu    142.2MB  par  1.7  same
+knucleotide    go     knucleotide_4           7.297s    13.34cpu    136.7MB  par  1.8  same
+knucleotide    go     knucleotide_6           6.973s    12.28cpu    142.2MB  par  1.8  same
+knucleotide    go     knucleotide_7           7.035s    13.41cpu    153.8MB  par  1.9  same
+knucleotide    go     knucleotide_8          36.338s    36.88cpu    540.7MB  par  1.0  same
+revcomp        xisto  revcomp                 0.886s     0.28cpu    244.4MB  par  0.3  same
+revcomp        xisto  revcomp-10              0.838s     0.24cpu     11.0MB  par  0.3  same
+revcomp        xisto  revcomp-2               1.043s     0.30cpu    244.5MB  par  0.3  same
+revcomp        xisto  revcomp-3               1.024s     0.35cpu    486.8MB  par  0.3  same
+revcomp        xisto  revcomp-4               0.936s     0.22cpu    244.6MB  par  0.2  same
+revcomp        xisto  revcomp-5               0.893s     0.29cpu    308.8MB  par  0.3  same
+revcomp        xisto  revcomp-6               0.859s     0.27cpu    188.7MB  par  0.3  same
+revcomp        xisto  revcomp-7               0.907s     0.27cpu    189.4MB  par  0.3  same
+revcomp        xisto  revcomp-8               0.880s     0.31cpu     69.0MB  par  0.3  same
+revcomp        xisto  revcomp-9               0.838s     0.25cpu     10.9MB  par  0.3  same
+revcomp        go     revcomp                 1.021s     0.51cpu    245.1MB  par  0.5  same
+revcomp        go     revcomp_2               1.446s     0.62cpu    158.1MB  par  0.4  same
+revcomp        go     revcomp_3               1.474s     0.65cpu    158.0MB  par  0.4  same
+revcomp        go     revcomp_5               1.263s     1.10cpu    413.6MB  par  0.9  same
+revcomp        go     revcomp_6               1.230s     0.49cpu    125.2MB  par  0.4  same
+regexredux     xisto  regexredux              0.964s     0.97cpu    149.0MB  par  1.0  same
+regexredux     xisto  regexredux-2            0.692s     0.97cpu    149.1MB  par  1.4  same
+regexredux     go     regexredux             27.603s    45.01cpu    309.9MB  par  1.6  same
+regexredux     go     regexredux_3           27.532s    45.49cpu    392.2MB  par  1.7  same
+pidigits       xisto  pidigits                0.628s     0.63cpu      2.6MB  par  1.0  same
+pidigits       go     pidigits                1.205s     1.23cpu      6.2MB  par  1.0  same
+pidigits       go     pidigits_2              1.200s     1.29cpu      6.0MB  par  1.1  same
+pidigits       go     pidigits_3              0.935s     1.00cpu      5.0MB  par  1.1  same
+pidigits       go     pidigits_4              0.899s     0.97cpu      5.0MB  par  1.1  same
+pidigits       go     pidigits_6              1.727s     1.73cpu      8.6MB  par  1.0  same
+pidigits       go     pidigits_7              1.744s     1.83cpu      8.3MB  par  1.1  same
+DONE

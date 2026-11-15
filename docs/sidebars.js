@@ -44,7 +44,7 @@ const sidebars = {
           type: 'category',
           label: 'Benchmarks Game',
           link: {type: 'doc', id: 'benchmarks/benchmarks-game/index'},
-          items: ['benchmarks/benchmarks-game/vs-rust', 'benchmarks/benchmarks-game/vs-node', 'benchmarks/benchmarks-game/vs-bun'],
+          items: ['benchmarks/benchmarks-game/vs-rust', 'benchmarks/benchmarks-game/vs-node', 'benchmarks/benchmarks-game/vs-bun', 'benchmarks/benchmarks-game/vs-go'],
         },
         {
           type: 'category',

@@ -82,6 +82,13 @@ Most xisto variants use every core while the Node programs use one, so the CPU c
 xisto uses less CPU on every row but regex-redux against Bun on the M4 (0.37 s against 0.34 s). The tables are on
 [Xisto vs Node](./benchmarks-game/vs-node.md) and [Xisto vs Bun](./benchmarks-game/vs-bun.md).
 
+## Benchmarks Game against Go
+
+15 Nov 2026, main `f766bf8` against every official Go program (Go 1.27.2) on the Xeon: 9 wins out of 9 scored
+problems, from 1.2× (reverse-complement) to 10.8× (binary-trees), with less CPU on every row and less memory on 8
+of 9 (n-body 2.0 against 1.9 MB). regex-redux is not scored: Go's fastest programs for it need PCRE 1, which
+Ubuntu 26.04 no longer ships. The table is on [Xisto vs Go](./benchmarks-game/vs-go.md).
+
 ## Servers
 
 | | xisto | Node | Bun | source |
