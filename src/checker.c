@@ -1542,7 +1542,8 @@ static void check_promise(Expr *e, Type *expected) {
         return;
     }
     check_expr(a, expected && !race ? expected : NULL);
-    if (a->kind == E_MEMBER && a->is_call && a->builtin.cfn && strcmp(a->builtin.cfn, "map") == 0 && a->lhs->type->kind == TY_ARRAY && a->field == 1) {
+    if (a->kind == E_MEMBER && a->is_call && a->builtin.cfn && strcmp(a->builtin.cfn, "map") == 0 && a->lhs->type->kind == TY_ARRAY && a->field == 1 &&
+        a->type->elem->kind != TY_PROMISE) { /* (a callback that gives a promise kept, such as f(x).then(...): the array of promises below, XB-230) */
         /* xs.map(f): f(x) for each element as a task */
         e->builtin.cfn = race ? "promise_race_map" : "promise_all_map";
         e->elem_type = a->type->elem;
