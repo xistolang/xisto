@@ -22,7 +22,25 @@ Check the installation:
 xisto --version
 ```
 
-## Linux and Intel Macs: build from source
+## Linux (x86-64 and ARM64)
+
+From 0.4.4 every release has a Linux archive for each architecture. Unpack it anywhere and put its `bin/` on your
+`PATH`:
+
+```sh
+V=0.4.4
+ARCH=$(uname -m | sed -e 's/x86_64/x64/' -e 's/aarch64/arm64/')
+curl -fsSLO https://github.com/xistolang/xisto/releases/download/v$V/xisto-$V-linux-$ARCH.tar.gz
+tar -xzf xisto-$V-linux-$ARCH.tar.gz
+export PATH="$PWD/xisto-$V/bin:$PATH"
+xisto --version
+```
+
+xisto calls the system C compiler, so install clang (or gcc) first: `sudo apt-get install clang` on Debian and
+Ubuntu, `sudo dnf install clang` on Fedora and Amazon Linux. The executables xisto makes need nothing installed.
+The Linux archives use BearSSL for TLS.
+
+## Intel Macs and other systems: build from source
 
 Building needs a C compiler (clang or gcc), `make`, `python3`, `xxd` and `cmake` (for AWS-LC, the default TLS
 library, downloaded once and checked by SHA-256; `make TLS=bearssl` skips it and uses BearSSL, which is in the tree).
