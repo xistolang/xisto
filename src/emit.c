@@ -1075,6 +1075,66 @@ static const char *asif_fn(Class *ifc, bool nullable) {
     return name;
 }
 
+/* XB-200: a field of an interface with methods (an abstract class), read or written through that type, when an adapter of a
+   class that does not implement it (make_adapter: it holds only the wrapped object) may be behind it: a pointer to the field,
+   in the wrapped object for an adapter (the checker's iface_fits made each such field one of the same type), in the object
+   itself otherwise. NULL when no used adapter is below c: the plain c->f access, as before. */
+static Buf ifld_fns;
+static char **ifld_made;
+static int nifld;
+static const char *ifld_fn(Class *c, int field, Pos pos) {
+    if (!c || c->builtin || c->adapter_of || field < 0 || field >= c->nfields) return NULL;
+    bool any = false;
+    for (int i = 0; i < prog->nclasses && !any; i++) {
+        Class *k = prog->classes[i];
+        any = k->used && k->adapter_of && is_sub(k, c);
+    }
+    if (!any) return NULL;
+    Field *fd = &c->fields[field];
+    char *name = xs_sprintf("%s_ifld_%s", c->cname, fd->cname);
+    for (int i = 0; i < nifld; i++) if (strcmp(ifld_made[i], name) == 0) return name;
+    ifld_made = realloc(ifld_made, sizeof(char *) * (size_t)(nifld + 1));
+    ifld_made[nifld++] = name;
+    char *ft = xs_sprintf("__typeof__(((%s *)0)->%s)", c->cname, fd->cname);
+    buf_printf(&ifld_fns, "static inline %s *%s(%s *o) {\n    void (*f_)(void *) = xs_type_of(o)->free;\n", ft, name, c->cname);
+    for (int i = 0; i < prog->nclasses; i++) {
+        Class *a = prog->classes[i], *src = a->adapter_of;
+        if (!a->used || !src || !is_sub(a, c)) continue;
+        int sk = -1;
+        for (int k = 0; k < src->nfields; k++) if (strcmp(src->fields[k].name, fd->name) == 0) sk = k;
+        if (sk < 0 || cp_field(src, sk) || src->nohdr || src->region)
+            xs_error(XS9902, pos, "declare `implements` on the class", "internal: %s cannot be read through the adapter of %s", fd->name, src->name);
+        buf_printf(&ifld_fns, "    if (f_ == %s_free) return (%s *)&((%s *)o)->%s->%s;\n", a->cname, ft, a->cname, a->fields[0].cname, src->fields[sk].cname);
+    }
+    buf_printf(&ifld_fns, "    return &o->%s;\n}\n", fd->cname);
+    return name;
+}
+
+/* XB-201: i as C, i of an interface with methods and C a class that does not implement it: the object an adapter of C (or
+   of a class above or below C) wraps, as JavaScript has only the object itself; anything else is left as it is, for the
+   checked cast to accept or refuse. NULL when no used adapter wraps such a class. Borrowed: the adapter holds it. */
+static const char *unad_fn(Class *c) {
+    if (!c || c->builtin || c->adapter_of) return NULL;
+    Buf b = {0};
+    char *name = xs_sprintf("%s_unad", c->cname);
+    buf_printf(&b, "static void *%s(void *v) {\n    while (v) {\n        void (*f_)(void *) = xs_type_of(v)->free;\n", name);
+    int n = 0;
+    for (int i = 0; i < prog->nclasses; i++) {
+        Class *a = prog->classes[i], *src = a->adapter_of;
+        if (!a->used || !src || is_sub(a, c) || !(is_sub(src, c) || is_sub(c, src))) continue;
+        buf_printf(&b, "        if (f_ == %s_free) { v = ((%s *)v)->%s; continue; }\n", a->cname, a->cname, a->fields[0].cname);
+        n++;
+    }
+    buf_puts(&b, "        return v;\n    }\n    return v;\n}\n");
+    if (!n) { free(b.data); return NULL; }
+    for (int i = 0; i < nisa; i++) if (strcmp(isa_made[i], name) == 0) { free(b.data); return name; }
+    isa_made = realloc(isa_made, sizeof(char *) * (size_t)(nisa + 1));
+    isa_made[nisa++] = name;
+    buf_puts(&isa_fns, b.data);
+    free(b.data);
+    return name;
+}
+
 /* a method that some subclass overrides, called through its class: chooses by the object's class */
 static Buf disp_fns;
 static char **disp_made;
@@ -1357,11 +1417,19 @@ static void emit_lvalue_ptr(Expr *e) {
     case E_IDENT:
         buf_printf(out, "&%s", ren(e->cname));
         return;
-    case E_MEMBER:
+    case E_MEMBER: {
+        const char *ifl = ifld_fn(e->cls, e->field, e->pos); /* (XB-200) */
+        if (ifl) {
+            buf_printf(out, "%s(", ifl);
+            emit_borrowed(e->lhs);
+            buf_puts(out, ")");
+            return;
+        }
         buf_puts(out, "&(");
         emit_borrowed(e->lhs);
         buf_printf(out, ")->%s", e->cls->fields[e->field].cname);
         return;
+    }
     default: /* E_INDEX */
         if (is_f64_type(e->lhs->type) || is_f32_type(e->lhs->type) || is_i32_type(e->lhs->type)) { /* f[i] on a Float64Array: its data, as a number[]'s
                                                                          (a float * on a Float32Array's, an int32_t * on an Int32Array's) */
@@ -1540,6 +1608,7 @@ static char *type_tag(Type *t) {
 }
 
 static void ensure_json(Type *t);
+static bool json_capable(Type *t);
 static const char *where_elem(int i) { return xs_sprintf("[%d]", i); }
 
 /* JSON.stringify of an unknown (a field of that type too): xs_json_unknown, generated after the program, looks at
@@ -1686,7 +1755,19 @@ static void ensure_json(Type *t) {
     if (tj) /* toJSON(): string: its result, as a JSON string */
         buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *o) {\n    xs_str *t_ = %s((%s *)o);\n    xs_sb_str(sb, t_);\n    xs_release(t_);\n    if (0) {\n",
                    tag, c->cname, tj->cname, tj->cls->cname);
-    buf_printf(b, tj ? "    xs_sb_put(sb, \"{\", 1);\n    bool first_ = true; (void)first_;\n" : "static void json_put_%s(xs_sb *sb, %s *o) {\n    xs_sb_put(sb, \"{\", 1);\n    bool first_ = true; (void)first_;\n", tag, c->cname);
+    if (!tj) {
+        buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *o) {\n", tag, c->cname);
+        /* an adapter of a class used as this interface (XB-200): the object it wraps, all of its fields, as JavaScript writes
+           the object itself */
+        for (int i = 0; i < prog->nclasses; i++) {
+            Class *a = prog->classes[i], *src = a->adapter_of;
+            if (!a->used || !src || !is_sub(a, c) || !json_capable(ty_object_of(src))) continue;
+            ensure_json(ty_object_of(src));
+            buf_printf(b, "    if (xs_type_of(o)->free == %s_free) { json_put_%s(sb, ((%s *)o)->%s); return; }\n", a->cname,
+                       type_tag(ty_object_of(src)), a->cname, a->fields[0].cname);
+        }
+    }
+    buf_puts(b, "    xs_sb_put(sb, \"{\", 1);\n    bool first_ = true; (void)first_;\n");
     for (int i = 0; i < c->nfields; i++) {
         Field *f = &c->fields[i];
         if (ty_is_undef(f->type)) continue; /* r: undefined: JSON.stringify leaves it out */
@@ -2384,6 +2465,13 @@ static void emit_member(Expr *e) {
         return;
     }
     if (e->field >= 0) {
+        const char *ifl = ifld_fn(e->cls, e->field, e->pos); /* (an interface field an adapter may hold: XB-200) */
+        if (ifl) {
+            buf_printf(out, "(*%s(", ifl);
+            emit_borrowed(base);
+            buf_puts(out, "))");
+            return;
+        }
         buf_puts(out, "(");
         emit_borrowed(base);
         buf_printf(out, ")->%s", e->cls->fields[e->field].cname);
@@ -2977,7 +3065,8 @@ static void emit_expr_raw(Expr *e) {
         Buf b = {0};
         Buf *saved = out;
         out = &b;
-        emit_expr(e->lhs);
+        if (e->op == TK_CLASS) emit_borrowed(e->lhs); /* a downcast is borrowed (is_fresh): a fresh object let go at the statement's end */
+        else emit_expr(e->lhs);
         out = saved;
         if (e->op == 0 && e->lhs->type && e->lhs->type->kind == TY_UNKNOWN && !cref(e->type) && is_fresh(e->lhs)) {
             /* f() as number: unbox the fresh box, then let it go */
@@ -3041,6 +3130,15 @@ static void emit_expr_raw(Expr *e) {
                            id, b.data, id, from_unknown(e->elem_type, xs_sprintf("ev%d_", id)), id, id, id, id, id);
                 free(b.data);
                 return;
+            }
+        }
+        if (e->op == TK_CLASS && e->elem_type) { /* a downcast: through an adapter, the object it wraps (XB-201) */
+            Type *dt = e->elem_type->kind == TY_NULLABLE ? e->elem_type->elem : e->elem_type;
+            const char *un = dt->kind == TY_OBJECT ? unad_fn(dt->cls) : NULL;
+            if (un) {
+                char *w = xs_sprintf("%s((void *)(%s))", un, b.data);
+                free(b.data);
+                b.data = w;
             }
         }
         fu_dyn = e->lhs->type && ty_is_any(e->lhs->type);
@@ -14144,6 +14242,7 @@ void emit_program(Program *p, Buf *o) {
         *out = joined;
     }
     if (cell_fns.data) { buf_puts(out, cell_fns.data); cell_fns.len = 0; cell_fns.data[0] = 0; ncell = 0; }
+    if (ifld_fns.data) { buf_puts(out, ifld_fns.data); ifld_fns.len = 0; ifld_fns.data[0] = 0; nifld = 0; }
     if (json_unknown_used) {
         /* every class JSON can write, for the values an unknown holds */
         int ncls = 0;

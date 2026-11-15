@@ -1671,6 +1671,7 @@ static void ret_infer_end(Func *f, Pos pos);
 static void check_type_supported(Pos pos, Type *t);
 static Func *eff_ctor(Class *c);
 static Field *find_field(Class *c, const char *name, int *index);
+static Class *iface_adapter(Class *src, Class *ifc, Pos pos, char **why);
 static bool ad_partial; /* (see fn_field_of) */
 static bool ad_partial_cls; /* (a class's missing methods too: see iface_runtime) */
 static bool ad_lenient; /* (a class's methods with other parameters too: see iface_runtime) */
@@ -12634,6 +12635,13 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (g->kind == TY_OBJECT && w->kind == TY_OBJECT && !g->cls->is_interface && !w->cls->is_interface) {
                 if (is_subclass(g->cls, w->cls)) { *e = *v; upcast(e, want); return; }
                 if (is_subclass(w->cls, g->cls)) { e->type = want; e->elem_type = want; e->op = TK_CLASS; return; } /* op marks a downcast */
+                if (g->cls->iface_base && !w->cls->iface_base && !w->cls->builtin && !w->cls->adapter_of && !w->cls->gen_state &&
+                    iface_adapter(w->cls, g->cls, e->pos, NULL)) {
+                    /* i as C, C a class that fits I without implementing it (XB-201): i may be C's adapter, which the
+                       emitter unwraps (unad_fn) before the checked downcast; not a copy of i through its JSON */
+                    e->type = want; e->elem_type = want; e->op = TK_CLASS;
+                    return;
+                }
             }
         }
         if (iface_adapt(v, want, "the value of 'as'")) { *e = *v; return; } /* c as I: I's shape (XB-126) */
@@ -16737,6 +16745,21 @@ static bool method_fits(Func *cm, Func *im, Class *src, Class *ifc, bool infer, 
 }
 static bool iface_fits(Class *src, Class *ifc, bool infer, Pos pos, int depth, char **why) {
     if (depth > 4 || src == ifc || src->builtin || src->gen_state) return false;
+    /* XB-200: the adapter has no fields of its own; a read or write of an interface field goes to the class's field of the
+       same name through the wrapped object (the emitter's ifld_fn). So each one must be a field of the same type (a pointer
+       to it is handed out), not one that converts or is left out. */
+    for (int k = 0; k < ifc->nfields; k++) {
+        Field *iff = &ifc->fields[k], *sf = find_field(src, iff->name, NULL);
+        if (!sf || !sf->type || !iff->type || !ty_equal(sf->type, iff->type)) {
+            if (why) {
+                if (!sf) *why = xs_sprintf("%s has no field '%s' (declare it, or write `implements %s`)", src->name, iff->name, ifc->name);
+                else *why = xs_sprintf("%s.%s is %s, but %s.%s is %s: a class used as %s without `implements %s` must declare its fields "
+                                       "with the same types", src->name, iff->name, sf->type ? ad_tname(sf->type) : "?", ifc->name, iff->name,
+                                       iff->type ? ad_tname(iff->type) : "?", ifc->name, ifc->name);
+            }
+            return false;
+        }
+    }
     for (int k = 0; k < ifc->nmethods; k++) {
         Func *im = ifc->methods[k];
         if (!im->is_abstract) continue;
