@@ -65,6 +65,10 @@ Every row was checked on 12 Nov 2026 by running the same program with xisto and 
 | bare `f();` of an async function | runs to its first `await` | runs to the end | no promise unless kept |
 | function that can reach its end without `return` | allowed | error XS8058 | |
 | `throw "text"` | allowed | error XS8005 | only objects can be thrown |
+| `const g = obj.method; g()` | `this` is lost (`TypeError`) | bound to `obj` | correct programs run the same |
+| `obj.method === obj.method` | `true` | `false` (a new bound function per read) | keep it in a variable for `on`/`off` |
+| `a.m.bind(b)`, `a.m.call(b)` | `a`'s `m` with `this = b` | `b`'s `m` | dispatch on the object it runs on |
+| `JSON.stringify(x, replacer)` | the replacer sees class instances | it sees them as plain objects | the value is rewritten from its JSON |
 | `catch (e)` | `unknown` | `Error` | |
 | class object passed as a data interface | the same object | a copy | fixed layouts |
 | class object passed as a method interface without `implements` | the same object | an adapter: `===` differs | |

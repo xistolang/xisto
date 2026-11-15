@@ -423,6 +423,41 @@ back the bytes of an incomplete group of three.
   even byte (the usual case) is joined as in Node.
 - `lastChar`, `lastNeed` and `lastTotal` are missing.
 
+## JSON
+
+`JSON.stringify(value)` is generated for the value's type (the fast path, unchanged). `JSON.stringify(value,
+replacer, space)` writes what Node writes:
+
+- `space`: a number of spaces (clamped to 0..10) or a string (its first 10 characters); nested objects and arrays
+  one member per line, `": "` after keys, empty `{}` and `[]` compact;
+- `replacer`: `null`/`undefined`, a `string[]` of the keys to keep (at every level, in the list's order), or a
+  function `(key: string, value: any) => any`, called first with the key `""` for the root, then for each member
+  and element; returning `undefined` leaves a member out (`null` in an array), a new object or array returned is
+  walked in turn;
+- `toJSON`, `Date` and optional fields left out behave as in the one-argument call.
+
+`JSON.parse(text, reviver)` calls `reviver(key, value)` from the leaves up, the root last with the key `""`;
+`undefined` deletes the member. Into an `any` the revived value is kept as the reviver made it (a `Date` stays a
+`Date`); into a declared type, the revived JSON is decoded as `JSON.parse(text)` decodes it.
+
+```ts
+console.log(JSON.stringify(user, ["id", "email"], 2));
+console.log(JSON.stringify(user, (k, v) => (k === "password" ? undefined : v), "\t"));
+const ev: any = JSON.parse(text, (k, v) => (k === "at" ? new Date(v) : v));
+```
+
+Differences from Node:
+
+- The replacer sees the value as JSON gives it back: after `toJSON` (as in Node: a `Date` is already its ISO
+  string), but a class instance as a plain object (`Record<string, any>`), where Node passes the instance itself.
+  `value instanceof MyClass` is `false` there. A `Map` or `Set` the replacer returns is written `{}`, as in Node.
+- xisto has one empty value, so `undefined` in a replacer is recognized where the code says it: `return undefined`
+  or `undefined` in a `?:` branch of a replacer written in place, or of a function declared with an `any` or
+  `unknown` result passed by name (that function then returns JSON's `undefined` for every caller). Elsewhere
+  `undefined` is `null` and is written as `null`.
+- When the replacer drops the root, the result is the string `"undefined"` (Node: the value `undefined`).
+- `this` inside a replacer is not the holder object.
+
 ## console.log and inspect
 
 Strings inside objects are quoted as Node quotes them: `'...'`, or `"..."` when the string has a `'`, or `` `...` ``
