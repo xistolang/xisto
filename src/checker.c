@@ -4164,7 +4164,130 @@ static bool pr_async_call(Expr *e) {
     if (e->builtin.cfn && (!strcmp(e->builtin.cfn, "promise_all_map") || !strcmp(e->builtin.cfn, "promise_race_map"))) return true;
     return false;
 }
+/* XB-231: a function not written async but declared Promise<T> is async here (its returns await what they hand
+   back), so a call whose promise is kept runs on a coroutine parked on that promise: `return w` with w a promise it
+   keeps in a map left the task parked for good (alive at exit) and f(k) !== map.get(k). Such a function gets a promise
+   version, its body checked again with Promise<T> as written (no await, no coroutine); when that body never waits
+   (pv_body_waits), the kept calls call it instead (pv_finish). Its calls that are awaited stay as they were. */
+static Func **pv_funcs;
+static int npv_funcs;
+static Expr **pv_sites;
+static int npv_sites;
+static Func **gen_work;
+static int ngen_work;
+static Expr **pv_awaits; /* await f(k) with f such a function: its version too when f's body starts async calls (pv_fires) */
+static int npv_awaits;
+static bool pv_can(Func *f) {
+    return f && !f->pv_of && !f->is_async && f->ret_promise && !f->ret_maybe_sync && !f->cls && !f->is_gen && !f->is_native && f->body &&
+           !f->decos.len && !f->deco_stub && !f->sig_failed && !f->mod->builtin && (f->pv_state || (f->template_of && f->inst_args)) &&
+           !getenv("XISTO_NO_PV");
+}
+static Func *pv_version(Func *f) {
+    if (!pv_can(f)) return NULL;
+    if (f->pver) return f->pver;
+    Func *v = xs_parse_promise_version(f);
+    v->cname = xs_sprintf("%s_pv", f->cname);
+    f->pver = v;
+    Module *sm = cur_mod;
+    Scope *ss = scope;
+    const char *sfn = xs_file_name, *ssrc = xs_source;
+    enter_module(f->mod);
+    resolve_signature(v);
+    cur_mod = sm;
+    scope = ss;
+    xs_file_name = sfn;
+    xs_source = ssrc;
+    pv_funcs = realloc(pv_funcs, sizeof(Func *) * (size_t)(npv_funcs + 1));
+    pv_funcs[npv_funcs++] = v;
+    gen_work = realloc(gen_work, sizeof(Func *) * (size_t)(ngen_work + 1));
+    gen_work[ngen_work++] = v;
+    return v;
+}
+/* the body waits somewhere (an await, an async call that runs in it): its promise version would not keep the order */
+static bool pv_expr_waits(Expr *e) {
+    if (!e || e->kind == E_ARROW) return false; /* (a closure's body runs when it is called) */
+    if (e->kind == E_AWAIT) return true;
+    if (e->kind == E_SPAWN) { /* (a task of its own: the arguments are evaluated here) */
+        Expr *c = e->lhs;
+        if (c->kind == E_MEMBER && pv_expr_waits(c->lhs)) return true;
+        for (int i = 0; i < c->args.len; i++) if (pv_expr_waits(c->args.items[i])) return true;
+        return false;
+    }
+    if ((e->kind == E_CALL || (e->kind == E_MEMBER && e->is_call)) &&
+        ((e->builtin.cfn && !strncmp(e->builtin.cfn, "xs_promise_await", 16)) || pr_async_call(e))) return true;
+    if (pv_expr_waits(e->lhs) || pv_expr_waits(e->rhs)) return true;
+    for (int i = 0; i < e->args.len; i++) if (pv_expr_waits(e->args.items[i])) return true;
+    return false;
+}
+static bool pv_body_waits(Stmt *s) {
+    if (!s) return false;
+    if (pv_expr_waits(s->init) || pv_expr_waits(s->expr) || pv_expr_waits(s->cond) || pv_expr_waits(s->for_update)) return true;
+    if (pv_body_waits(s->for_init) || pv_body_waits(s->body) || pv_body_waits(s->else_body)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (pv_body_waits(s->stmts.items[i])) return true;
+    for (int i = 0; i < s->ncases; i++) if (pv_expr_waits(s->cases[i].value) || pv_body_waits(s->cases[i].body)) return true;
+    return false;
+}
+/* f(); with f async, as a statement of the body (not in a closure): the version starts it and goes on, as JavaScript
+   does, where the function itself waits for it; so an awaited call takes the version too (the same order as Node) */
+static bool pv_body_fires(Stmt *s) {
+    if (!s) return false;
+    if (s->kind == S_EXPR && s->expr && s->expr->kind != E_SPAWN && pr_async_call(s->expr)) return true;
+    if (pv_body_fires(s->for_init) || pv_body_fires(s->body) || pv_body_fires(s->else_body)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (pv_body_fires(s->stmts.items[i])) return true;
+    for (int i = 0; i < s->ncases; i++) if (pv_body_fires(s->cases[i].body)) return true;
+    return false;
+}
+/* the awaited calls of functions whose body starts async calls: their versions, to be checked (true: some made) */
+static bool pv_more(void) {
+    bool made = false;
+    for (int i = 0; i < npv_awaits; i++) {
+        Expr *c = pv_awaits[i]->lhs;
+        if (c->kind != E_CALL || !c->func || c->func->pver || !pv_can(c->func) || !pv_body_fires(c->func->body)) continue;
+        pv_version(c->func);
+        made = true;
+    }
+    return made;
+}
+/* after every body is checked: the promise versions that never wait replace the spawned calls */
+static void pv_finish(void) {
+    for (int i = 0; i < npv_funcs; i++) {
+        Func *v = pv_funcs[i];
+        if (v->pv_ok && (!v->ret || v->ret->kind != TY_PROMISE || pv_body_waits(v->body))) v->pv_ok = false;
+        if (getenv("XISTO_PV_LOG")) fprintf(stderr, "pv: %s %s\n", v->name, v->pv_ok ? "ok" : "not used");
+    }
+    for (int i = 0; i < npv_sites; i++) {
+        Expr *e = pv_sites[i];
+        if (e->kind != E_SPAWN || e->lhs->kind != E_CALL || !e->lhs->func || !e->lhs->func->pver || !e->lhs->func->pver->pv_ok) continue;
+        Type *t = e->type;
+        Expr *c = e->lhs;
+        *e = *c;
+        e->func = c->func->pver;
+        e->type = t;
+        if (e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname && c->func->cname && !strcmp(e->lhs->cname, c->func->cname)) {
+            Expr *l = expr_copy(e->lhs);
+            l->cname = e->func->cname;
+            e->lhs = l;
+        }
+    }
+    for (int i = 0; i < npv_awaits; i++) {
+        Expr *c = pv_awaits[i]->lhs;
+        Func *f = c->kind == E_CALL ? c->func : NULL;
+        if (!f || !f->pver || !f->pver->pv_ok || !pv_body_fires(f->body)) continue;
+        c->func = f->pver;
+        c->type = f->pver->ret;
+        if (c->lhs && c->lhs->kind == E_IDENT && c->lhs->cname && f->cname && !strcmp(c->lhs->cname, f->cname)) {
+            Expr *l = expr_copy(c->lhs);
+            l->cname = f->pver->cname;
+            c->lhs = l;
+        }
+        pr_await(c); /* (its value, as before: the await around it is the identity) */
+    }
+}
 static void pr_spawn(Expr *e) { /* the call e (checked), kept as a promise */
+    if (e->kind == E_CALL && e->func && !e->builtin.cfn && pv_version(e->func)) {
+        pv_sites = realloc(pv_sites, sizeof(Expr *) * (size_t)(npv_sites + 1));
+        pv_sites[npv_sites++] = e; /* (the E_SPAWN it becomes below) */
+    }
     Expr *c = xs_alloc(sizeof *c);
     *c = *e;
     memset(e, 0, sizeof *e);
@@ -6563,8 +6686,6 @@ static int super_calls; /* super(...) calls met while checking a constructor */
 
 /* ---- generics: function f<T>(x: T): T is a template; each list of types used makes an instance (parsed again
    with T bound, checked like any function, compiled on its own: no cost at run time) ---- */
-static Func **gen_work;
-static int ngen_work;
 static bool has_tparam(Type *t) {
     if (!t) return false;
     switch (t->kind) {
@@ -6701,6 +6822,8 @@ static Func *instantiate_func(Func *tmpl, Type **args) {
     for (int i = 0; i < tmpl->ninstances; i++) if (strcmp(tmpl->inst_keys[i], key.data) == 0) { free(key.data); return tmpl->instances[i]; }
     Func *inst = xs_parse_instance(tmpl, args);
     inst->cname = xs_sprintf("%s_g%d", tmpl->cname, tmpl->ninstances);
+    inst->inst_args = xs_alloc(sizeof(Type *) * (size_t)tmpl->ntparams);
+    memcpy(inst->inst_args, args, sizeof(Type *) * (size_t)tmpl->ntparams);
     tmpl->instances = realloc(tmpl->instances, sizeof(Func *) * (size_t)(tmpl->ninstances + 1));
     tmpl->inst_keys = realloc(tmpl->inst_keys, sizeof(char *) * (size_t)(tmpl->ninstances + 1));
     tmpl->instances[tmpl->ninstances] = inst;
@@ -8656,6 +8779,10 @@ static void check_expr_in(Expr *e, Type *expected) {
             check_expr(e->lhs, expected);
         }
         pr_awaited = was;
+        if (e->lhs->kind == E_CALL && !e->lhs->builtin.cfn && pv_can(e->lhs->func)) { /* (XB-231: pv_more) */
+            pv_awaits = realloc(pv_awaits, sizeof(Expr *) * (size_t)(npv_awaits + 1));
+            pv_awaits[npv_awaits++] = e;
+        }
         if (e->lhs->type->kind == TY_PROMISE) pr_await(e->lhs); /* a promise kept: its value */
         else if (e->lhs->type->kind == TY_NULLABLE && e->lhs->type->elem->kind == TY_PROMISE) { /* await of a Promise<T> | null: null gives null */
             Type *t = e->lhs->type->elem->elem;
@@ -9289,6 +9416,18 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         case TK_EQ: case TK_NEQ: {
             if (e->loose) check_loose_eq(e); /* == / !=: the same as === / !== when nothing would be converted */
+            for (int side = 0; side < 2; side++) { /* f(k) === p, p a promise: f's promise (XB-231), as in JavaScript */
+                Expr *c = side ? e->rhs : e->lhs, *o = side ? e->lhs : e->rhs;
+                Type *ot = ty_strip_null(o->type);
+                if (ot->kind == TY_PROMISE && pr_async_call(c) && c->type && (ty_equal(c->type, ot->elem) || ot->elem->kind == TY_VOID) &&
+                    !(c->func && c->func->ret_maybe_sync))
+                    pr_spawn(c);
+            }
+            if (ty_strip_null(e->lhs->type)->kind == TY_PROMISE && ty_strip_null(e->rhs->type)->kind == TY_PROMISE) {
+                e->type = ty_boolean; /* (two promises: the same one; a call's promise is a temporary, let go after) */
+                e->builtin.cfn = "ref_eq";
+                return;
+            }
             /* objects, arrays and functions compare by reference (the same object), as in JS; T | null too */
             Type *lt = e->lhs->type->kind == TY_NULLABLE ? e->lhs->type->elem : e->lhs->type;
             Type *rt = e->rhs->type->kind == TY_NULLABLE ? e->rhs->type->elem : e->rhs->type;
@@ -15484,6 +15623,8 @@ static void check_stmt(Stmt *s) {
         check_expr(s->expr, NULL);
         pr_discard = false;
         settle(s->expr);
+        if (cur_func && cur_func->pv_of && pr_async_call(s->expr) && !(s->expr->func && s->expr->func->ret_maybe_sync))
+            pr_spawn(s->expr); /* f(); in a promise version (XB-231): started, as in JavaScript, not waited for (the caller goes on) */
         return;
     case S_IF: {
         instanceof_path_narrow(s);
@@ -16012,7 +16153,7 @@ static void resolve_signature(Func *f) {
     {
         Type *decl = f->ret;
         bool as = false;
-        f->ret = ret_unpromise(f->ret, &as);
+        if (!f->pv_of) f->ret = ret_unpromise(f->ret, &as); /* (a promise version returns the promise itself, XB-231) */
         if (as) f->ret_promise = true; /* (): Promise<T>: T, and async (XB-106) */
         if (as && tsc_checked() && !f->is_async && decl && ty_strip_null(decl)->kind == TY_UNION) f->ret_maybe_sync = true;
     }
@@ -18590,11 +18731,17 @@ void check_program(Program *p) {
     for (int i = 0; i < p->nfuncs; i++)
         if (!p->funcs[i]->mod->builtin && !p->funcs[i]->ntparams && !p->funcs[i]->sig_failed) { RECOVER_BEGIN check_func(p->funcs[i]); RECOVER_END }
     /* generic instances, classes and functions (an instance can make more); then they join the program */
-    for (int w = 0, cw = 0; w < ngen_work || cw < nclass_work;) {
+    for (int w = 0, cw = 0; w < ngen_work || cw < nclass_work || (w == ngen_work && pv_more());) {
         if (cw < nclass_work) { check_class_bodies(class_work[cw++]); continue; }
-        RECOVER_BEGIN check_func(gen_work[w]); RECOVER_END
+        Func *gf = gen_work[w];
+        int muted = xs_muted_errors;
+        xs_diag_mute = gf->pv_of != NULL; /* (a promise version: the function's own errors were reported with it) */
+        RECOVER_BEGIN check_func(gf); RECOVER_END
+        xs_diag_mute = false;
+        if (gf->pv_of) gf->pv_ok = xs_muted_errors == muted && !failed_;
         w++;
-    }
+    } /* (pv_more: the promise versions awaited calls need, XB-231, checked in turn) */
+    pv_finish();
     {   /* the templates of generic classes leave the program: only their instances are emitted */
         int k = 0;
         for (int i = 0; i < p->nclasses; i++) if (!p->classes[i]->gen_state) p->classes[k++] = p->classes[i];
@@ -18602,6 +18749,7 @@ void check_program(Program *p) {
     }
     for (int w = 0; w < ngen_work; w++) {
         Func *f = gen_work[w];
+        if (f->pv_of && !f->pv_ok) continue; /* (a promise version not used) */
         if (f->cls) {
             f->cls->methods = realloc(f->cls->methods, sizeof(Func *) * (size_t)(f->cls->nmethods + 1));
             f->cls->methods[f->cls->nmethods++] = f;
