@@ -2001,7 +2001,32 @@ XS_NOINLINE xs_str *xs_uri_decode(xs_str *s, const char *reserved) {
             if (hv >= 0 && lv >= 0) v = hv * 16 + lv;
         }
         if (v < 0) { free(out); xs_panic("URIError: URI malformed"); }
-        if (v < 128 && v && strchr(reserved, v)) { out[n++] = '%'; out[n++] = s->data[i + 1]; out[n++] = s->data[i + 2]; }
+        if (v >= 0x80) { /* the first byte of a UTF-8 sequence: the rest are %XX too, and the code point valid (no
+                            overlong form, no surrogate, at most U+10FFFF) */
+            int len = (v & 0xE0) == 0xC0 ? 2 : (v & 0xF0) == 0xE0 ? 3 : (v & 0xF8) == 0xF0 ? 4 : 0;
+            uint32_t cp = len == 2 ? (uint32_t)(v & 0x1F) : len == 3 ? (uint32_t)(v & 0x0F) : (uint32_t)(v & 0x07);
+            unsigned char seq[4] = {(unsigned char)v};
+            for (int k = 1; k < len; k++) {
+                int64_t j = i + 3 * k;
+                int b = -1;
+                if (j + 2 < s->len && s->data[j] == '%') {
+                    int h = s->data[j + 1], l = s->data[j + 2];
+                    int hv = isdigit(h) ? h - '0' : (h >= 'a' && h <= 'f') ? h - 'a' + 10 : (h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1;
+                    int lv = isdigit(l) ? l - '0' : (l >= 'a' && l <= 'f') ? l - 'a' + 10 : (l >= 'A' && l <= 'F') ? l - 'A' + 10 : -1;
+                    if (hv >= 0 && lv >= 0) b = hv * 16 + lv;
+                }
+                if (b < 0 || (b & 0xC0) != 0x80) { len = 0; break; }
+                seq[k] = (unsigned char)b;
+                cp = (cp << 6) | (uint32_t)(b & 0x3F);
+            }
+            static const uint32_t min_cp[5] = {0, 0, 0x80, 0x800, 0x10000};
+            if (!len || cp < min_cp[len] || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) { free(out); xs_panic("URIError: URI malformed"); }
+            memcpy(out + n, seq, (size_t)len);
+            n += (size_t)len;
+            i += 3 * len - 1;
+            continue;
+        }
+        if (v && strchr(reserved, v)) { out[n++] = '%'; out[n++] = s->data[i + 1]; out[n++] = s->data[i + 2]; }
         else out[n++] = (char)v;
         i += 2;
     }
