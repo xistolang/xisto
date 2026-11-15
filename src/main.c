@@ -61,12 +61,24 @@
    level; aligning functions too made binary-trees slower. Not on arm64: the Graviton2 and the M4 showed no effect.
    Cost: ~4.5 KB of padding per program. (15/11/2026, bench/results: the integ-1115 A/B) */
 #define XS_X86_ALIGN " -falign-loops=64"
+/* The x86-64 floor: x86-64-v2 (SSE4.2, SSSE3, POPCNT; every x86 processor since 2009), the oldest x86 xisto
+   supports, so the default (portable) build targets it rather than the 2003 baseline (SSE2) the C compilers
+   default to. Without SSSE3 there is no pshufb: each xs_u8x16_shuffle became 16 lanes, each one a 16-byte store,
+   a byte store into it and a 16-byte load back, a store the load cannot forward from (~12 cycles on Broadwell,
+   chained lane after lane), and fannkuch-redux ran 3.3x slower than with --cpu=native on the Xeon E5 (13/11,
+   XB-211). revcomp's translate (xs_u8_trade, xs_rap_*: table lookup and newline scans) takes its SSSE3 path too.
+   --cpu=X replaces it; every x86 compile gets it otherwise (the runtime object of --dev too: struct layouts in
+   the runtime depend on __SSSE3__). zig spells the name with underscores. */
+#define XS_X86_FLOOR " -march=x86-64-v2"
+#define XS_ZIG_X86_FLOOR " -march=x86_64_v2"
 #if defined(__x86_64__)
 #define XS_HOST_ALIGN XS_X86_ALIGN
+#define XS_HOST_FLOOR XS_X86_FLOOR
 #else
 #define XS_HOST_ALIGN ""
+#define XS_HOST_FLOOR ""
 #endif
-#define XS_CC_KEY XS_LINK_FLAGS " " XS_CLANG_FLAGS " -O3" XS_HOST_ALIGN
+#define XS_CC_KEY XS_LINK_FLAGS " " XS_CLANG_FLAGS " -O3" XS_HOST_ALIGN XS_HOST_FLOOR
 static bool show_time;
 static double now_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6; }
 
@@ -634,7 +646,7 @@ static void run_cc(const char *cfile, const char *outfile, bool dev) {
     const char *cc = host_cc();
     uint64_t h = fnv(cc_text, cc_len) ^ (fnv(cc, strlen(cc)) * 31) ^ (dev ? 0x9e3779b97f4a7c15ull : 0) ^ (fnv(XS_HOST, strlen(XS_HOST)) * 3) ^
                  (xs_debug ? 0x51afd7ed558ccdull : 0) ^ (link_tls ? 0x2545f4914f6cdd1dull : 0) ^ (link_sqlite ? 0x27d4eb2f165667c5ull : 0) ^ (link_zlib ? 0x85ebca77c2b2ae63ull : 0) ^ (link_crypto ? 0xc2b2ae3d27d4eb4full : 0) ^
-                 (xs_target ? fnv(xs_target, strlen(xs_target)) * 7 : 0) ^ (xs_target && strstr(xs_target, "x86_64") ? fnv(XS_X86_ALIGN, strlen(XS_X86_ALIGN)) * 17 : 0) ^ (build_dylib ? 0x165667b19e3779f9ull : 0) ^
+                 (xs_target ? fnv(xs_target, strlen(xs_target)) * 7 : 0) ^ (xs_target && strstr(xs_target, "x86_64") ? fnv(XS_X86_ALIGN XS_ZIG_X86_FLOOR, strlen(XS_X86_ALIGN XS_ZIG_X86_FLOOR)) * 17 : 0) ^ (build_dylib ? 0x165667b19e3779f9ull : 0) ^
                  fnv(XS_CC_KEY, strlen(XS_CC_KEY)) * 11 ^ /* the compiler flags this xisto passes: a new set rebuilds */
                  (xs_cpu ? fnv(xs_cpu, strlen(xs_cpu)) * 13 : 0);
     char *hit = xs_sprintf("%s/%016llx", cache, (unsigned long long)h);
@@ -652,7 +664,7 @@ static char *runtime_object(const char *cc) {
     if (!split_rt || rt_src.len == 0) return NULL;
     const char *home = getenv("HOME");
     char *cache = xs_sprintf("%s/.cache/xisto/rt", home ? home : "/tmp");
-    uint64_t h = fnv(rt_src.data, rt_src.len) ^ (fnv(cc, strlen(cc)) * 31) ^ (fnv(XS_HOST, strlen(XS_HOST)) * 3);
+    uint64_t h = fnv(rt_src.data, rt_src.len) ^ (fnv(cc, strlen(cc)) * 31) ^ (fnv(XS_HOST, strlen(XS_HOST)) * 3) ^ (fnv(XS_HOST_FLOOR, strlen(XS_HOST_FLOOR)) * 5);
     char *obj = xs_sprintf("%s/%016llx.o", cache, (unsigned long long)h);
     if (access(obj, R_OK) == 0) return obj;
     double t0 = now_ms();
@@ -671,9 +683,9 @@ static char *runtime_object(const char *cc) {
     if (link_tls && tls_awslc()) inc = xs_sprintf("%s -I'%s/include'", inc, awslc_dir());
     if (need_bearssl()) inc = xs_sprintf("%s -I'%s/bearssl-inc'", inc, xisto_dir);
     char *tmp = xs_sprintf("%s.%d.tmp", obj, (int)getpid());
-    char *cmd = xs_sprintf("%s -std=c11 -O2 %s -ffp-contract=off -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
+    char *cmd = xs_sprintf("%s -std=c11 -O2%s %s -ffp-contract=off -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
                            "-Wno-ignored-qualifiers -Wno-return-type -Wno-unused-command-line-argument %s %s -c -o '%s' '%s'",
-                           cc, extra, XS_LINK_FLAGS, inc, tmp, src);
+                           cc, XS_HOST_FLOOR, extra, XS_LINK_FLAGS, inc, tmp, src);
     if (system(cmd) != 0 || rename(tmp, obj) != 0) {
         fprintf(stderr, "xisto: the runtime library did not compile (this is a bug in xisto; source kept at %s)\n", src);
         exit(1);
@@ -900,6 +912,7 @@ static void run_cc_target(const char *cfile, const char *outfile, bool dev) {
     }
     const char *flags = xs_debug ? "-O0 -g" : dev ? "-O0" : "-O3"; /* (as on the host, run_cc_raw) */
     if (!dev && !xs_debug && strstr(xs_target, "x86_64")) flags = xs_sprintf("%s%s", flags, XS_X86_ALIGN);
+    if (strstr(xs_target, "x86_64")) flags = xs_sprintf("%s%s", flags, XS_ZIG_X86_FLOOR); /* (the x86-64 floor, above) */
     char *extra = "";
     if (link_sqlite) {
         char *dir = tdir;
@@ -948,7 +961,8 @@ static void run_cc_raw(const char *cfile, const char *outfile, bool dev) {
 #else
         flags = xs_sprintf("%s -march=%s", flags, xs_cpu);
 #endif
-    }
+    } else
+        flags = xs_sprintf("%s%s", flags, XS_HOST_FLOOR); /* (the x86-64 floor, above; nothing on arm64) */
     if (!dev && !xs_debug) flags = xs_sprintf("%s%s", flags, XS_HOST_ALIGN);
     /* JS semantics are strict IEEE 754: no fused multiply-add. */
 #ifdef XS_CLANG_FLAGS

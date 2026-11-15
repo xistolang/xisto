@@ -5921,11 +5921,24 @@ static inline void xs_u8x16_store(uint8_t *p, xs_u8x16 v) { memcpy(p, &v, 16); }
 #if defined(__SSSE3__)
 #include <tmmintrin.h>
 static inline xs_u8x16 xs_u8x16_shuffle(xs_u8x16 v, xs_u8x16 m) { return (xs_u8x16)_mm_shuffle_epi8((__m128i)v, (__m128i)m); }
+#define XS_U8X16_TBL 1
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
 static inline xs_u8x16 xs_u8x16_shuffle(xs_u8x16 v, xs_u8x16 m) { return (xs_u8x16)vqtbl1q_u8((uint8x16_t)v, (uint8x16_t)m); }
+#define XS_U8X16_TBL 1
 #else
-static inline xs_u8x16 xs_u8x16_shuffle(xs_u8x16 v, xs_u8x16 m) { xs_u8x16 r; for (int i = 0; i < 16; i++) r[i] = (m[i] & 0x80) ? 0 : v[m[i] & 15]; return r; }
+/* (no byte shuffle, as on x86 below the x86-64 floor: the lanes go through memory, every byte store before the
+   one 16-byte load. Writing each lane into the vector put a 16-byte load after every byte store, which the store
+   cannot forward to: 16 stalls of ~12 cycles in a chain per shuffle, fannkuch-redux 3.3x slower, XB-211) */
+static inline xs_u8x16 xs_u8x16_shuffle(xs_u8x16 v, xs_u8x16 m) {
+    uint8_t a[16], k[16], r[16];
+    memcpy(a, &v, 16);
+    memcpy(k, &m, 16);
+    for (int i = 0; i < 16; i++) r[i] = (k[i] & 0x80) ? 0 : a[k[i] & 15];
+    xs_u8x16 o;
+    memcpy(&o, r, 16);
+    return o;
+}
 #endif
 /* A local Uint8Array(N <= 16) that a loop only indexes (emit.c u8reg) lives in one of these for the loop's
    duration, loaded before and stored after: reads, writes, the reversal and the copy idioms never touch
@@ -5958,7 +5971,13 @@ static inline void xs_v16_store(uint8_t *d, xs_u8x16 v, int64_t n) { if (n >= 16
 /* an int[] of n <= 16 elements, each a byte (proved), in a register and back */
 static inline xs_u8x16 xs_v16_load_i64(const int64_t *d, int64_t n) { xs_u8x16 v = xs_u8x16_splat(0); for (int64_t i = 0; i < n; i++) v[i] = (uint8_t)d[i]; return v; }
 static inline void xs_v16_store_i64(int64_t *d, xs_u8x16 v, int64_t n) { for (int64_t i = 0; i < n; i++) d[i] = (int64_t)v[i]; }
+/* lane i (< 16): a shuffle where it is one instruction, else a load from the vector stored (a 1-byte load is
+   forwarded from the 16-byte store) */
+#if defined(XS_U8X16_TBL)
 static inline int64_t xs_v16_get_nc(xs_u8x16 v, int64_t i) { return (int64_t)xs_u8x16_shuffle(v, xs_u8x16_splat((uint8_t)i))[0]; }
+#else
+static inline int64_t xs_v16_get_nc(xs_u8x16 v, int64_t i) { uint8_t a[16]; memcpy(a, &v, 16); return a[i & 15]; }
+#endif
 static inline int64_t xs_v16_get(xs_u8x16 v, int64_t i, int64_t n, const xs_site *s) {
     if ((uint64_t)i >= (uint64_t)XS_V16_LEN(n)) XS_FAIL(XS_V16_OOB(n), s);
     return xs_v16_get_nc(v, i);
