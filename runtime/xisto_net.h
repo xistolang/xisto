@@ -795,7 +795,8 @@ static void xs_tmr_fire(void (*after)(xs_coro *)) {
 static XS_TLS int64_t xs_fd_waits; /* coroutines parked on a socket (what, besides a timer, can wake a parked task) */
 /* Waits until fd is readable/writable or the timeout (ms, -1 = none) passes. Yields inside a coroutine,
    polls from plain code. Returns false on timeout. */
-static bool xs_wait_fd_ms(int fd, int16_t filter, int64_t timeout_ms) {
+XS_NOINLINE int xs_wait_fd_loop(int fd, int16_t filter, int64_t timeout_ms);
+XS_NOINLINE bool xs_wait_fd_ms(int fd, int16_t filter, int64_t timeout_ms) {
     if (xs_cur_coro && xs_kq >= 0) {
         xs_coro *co = xs_cur_coro;
         struct kevent ev;
@@ -817,12 +818,14 @@ static bool xs_wait_fd_ms(int fd, int16_t filter, int64_t timeout_ms) {
         if (timeout_ms >= 0) xs_timer_disarm(&co->tmw);
         return ready;
     }
+    int lw = xs_wait_fd_loop(fd, filter, timeout_ms);
+    if (lw >= 0) return lw != 0;
     struct pollfd p = {fd, filter == EVFILT_READ ? POLLIN : POLLOUT, 0};
     int r;
     while ((r = poll(&p, 1, timeout_ms < 0 ? -1 : (int)timeout_ms)) < 0 && errno == EINTR) {}
     return r > 0;
 }
-static void xs_wait_fd(int fd, int16_t filter) { xs_wait_fd_ms(fd, filter, -1); }
+XS_NOINLINE void xs_wait_fd(int fd, int16_t filter) { xs_wait_fd_ms(fd, filter, -1); }
 
 static XS_TLS int64_t xs_tasks_live; /* Promise.all/race tasks not finished yet */
 static void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_ms);
@@ -1005,10 +1008,31 @@ XS_NOINLINE void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_m
             w->armed = false;
             w->fired = true;
             xs_coro *co = w->co;
+            if (!co) continue; /* plain code waiting on its socket (xs_wait_fd_loop): it sees fired */
             xs_coro_resume(co);
             if (co->done && co->on_done) co->on_done(co);
         }
     }
+}
+/* A socket wait from plain code (an async main() called at the top, its fetch) while timers, immediates or tasks are
+   pending: the loop runs meanwhile, as Node's does, so a setTimeout that aborts the fetch fires (XB-225). Returns
+   1 ready, 0 timed out, -1 when nothing else could run (the caller just polls). */
+static bool xs_fdwait_stop(void *w) { return ((xs_waiter *)w)->fired; }
+XS_NOINLINE int xs_wait_fd_loop(int fd, int16_t filter, int64_t timeout_ms) {
+    if (xs_cur_coro || timeout_ms == 0 || !(xs_ntmr || xs_tasks_live > 0 || xs_ready_head || xs_imm_head || xs_tick_head)) return -1;
+    if (xs_kq < 0) xs_kq = kqueue();
+    xs_waiter w = {.kind = 2, .co = NULL, .armed = true, .fired = false, .tfd = -1, .armed_batch = xs_batch};
+    struct kevent ev;
+    EV_SET(&ev, fd, filter, EV_ADD | EV_ONESHOT, 0, 0, &w);
+    kevent(xs_kq, &ev, 1, NULL, 0, NULL);
+    xs_fd_waits++;
+    xs_loop_run(xs_fdwait_stop, &w, timeout_ms < 0 ? -1 : (int64_t)xs_date_now() + timeout_ms);
+    xs_fd_waits--;
+    if (w.armed) { /* the deadline came first: stop watching the socket */
+        EV_SET(&ev, fd, filter, EV_DELETE, 0, 0, NULL);
+        kevent(xs_kq, &ev, 1, NULL, 0, NULL);
+    }
+    return w.fired ? 1 : 0;
 }
 static bool xs_par_stop(void *g) { return xs_par_settled(g); }
 /* runs the group's tasks; returns when it settles (all done, or the first for race) */
@@ -1640,8 +1664,8 @@ XS_NOINLINE void xs_tls_add_ca_file(const char *path);
 static void xs_tls_free(xs_tls *t);
 static const char *xs_tls_err(xs_tls *t);
 static const char *xs_tls_err(xs_tls *t);
-static bool xs_tls_write_all(xs_tls *t, int fd, const char *p, size_t n, int64_t timeout_ms, uint64_t deadline);
-static ssize_t xs_tls_read_some(xs_tls *t, int fd, char *out, size_t cap, int64_t timeout_ms, uint64_t deadline);
+XS_NOINLINE bool xs_tls_write_all(xs_tls *t, int fd, const char *p, size_t n, int64_t timeout_ms, uint64_t deadline);
+XS_NOINLINE ssize_t xs_tls_read_some(xs_tls *t, int fd, char *out, size_t cap, int64_t timeout_ms, uint64_t deadline);
 static ssize_t xs_tls_srv_read(xs_tls *t, int fd, char *out, size_t cap);
 static ssize_t xs_tls_srv_write(xs_tls *t, int fd, const char *p, size_t n);
 static bool xs_tls_srv_pending(xs_tls *t);
@@ -2230,7 +2254,7 @@ static void xs_conn_drop(xs_conn *c) { close(c->fd); XS_TLS_FREE(c->tls); free(c
    (its window full) is waited for in slices and given up on at the deadline or the abort: false, as on an error.
    (A fetch whose body is larger than the socket's buffers, to a server that accepts and never reads, used to wait
    here forever, past its AbortSignal.timeout.) */
-static bool xs_write_until(int fd, const char *p, size_t n, uint64_t deadline, xs_Uint8Array *abort) {
+XS_NOINLINE bool xs_write_until(int fd, const char *p, size_t n, uint64_t deadline, xs_Uint8Array *abort) {
     while (n > 0) {
         ssize_t w = write(fd, p, n);
         if (w < 0) {
@@ -2254,7 +2278,7 @@ static bool xs_write_until(int fd, const char *p, size_t n, uint64_t deadline, x
     }
     return true;
 }
-static bool xs_write_all(int fd, const char *p, size_t n) { return xs_write_until(fd, p, n, 0, NULL); }
+XS_NOINLINE bool xs_write_all(int fd, const char *p, size_t n) { return xs_write_until(fd, p, n, 0, NULL); }
 
 static xs_Response *xs_fetch_full(xs_str *url, xs_str *method, xs_str *body, int nh, xs_str **hdrs, int64_t timeout_ms, xs_Uint8Array *abort);
 XS_NOINLINE xs_Response *xs_fetch(xs_str *url) { return xs_fetch_full(url, NULL, NULL, 0, NULL, -1, NULL); }
@@ -2737,7 +2761,7 @@ static void xs_server_respond_x(xs_client *c, int64_t status, const char *ctype,
 static bool xs_server_flush(xs_client *c);
 
 /* writes to the client socket from inside the request coroutine, yielding when the socket is full */
-static bool xs_client_write_all(xs_client *c, const char *p, size_t n) {
+XS_NOINLINE bool xs_client_write_all(xs_client *c, const char *p, size_t n) {
 #ifdef XS_WITH_TLS
     if (c->tls) {
         while (n > 0 || xs_tls_srv_pending(c->tls)) {
@@ -2765,7 +2789,7 @@ static bool xs_client_write_all(xs_client *c, const char *p, size_t n) {
 }
 
 /* chunked transfer: the stream is pulled only as fast as the client reads, so the file behind it is too */
-static void xs_server_respond_stream(xs_client *c, xs_HttpResponse *res, bool keep_alive) {
+XS_NOINLINE void xs_server_respond_stream(xs_client *c, xs_HttpResponse *res, bool keep_alive) {
     if (!xs_server_flush(c)) return; /* anything queued before */
     char head[256];
     int n = snprintf(head, sizeof head, "HTTP/1.1 %lld %s\r\nContent-Type: %s%s\r\nTransfer-Encoding: chunked\r\nConnection: %s\r\n\r\n",
@@ -3313,6 +3337,7 @@ XS_NOINLINE void *xs_server_worker(void *arg) {
                 w->armed = false;
                 w->fired = true;
                 xs_coro *co = w->co;
+                if (!co) continue; /* (plain code's own wait: xs_wait_fd_loop) */
                 xs_coro_resume(co);
                 xs_coro_after(co);
                 continue;

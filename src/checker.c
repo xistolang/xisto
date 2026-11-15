@@ -8410,7 +8410,7 @@ static bool early_global(const char *name) {
                     Binding *alias = xs_alloc(sizeof *alias);
                     *alias = *b;
                     alias->origin = b;
-                    alias->is_const = true;
+                    alias->is_const = st ? b->is_const : true; /* (a static field stays assignable unless readonly: XB-228) */
                     Scope *ms = mod_scopes[cur_mod->id];
                     alias->next = ms->head;
                     ms->head = alias;
@@ -8444,7 +8444,7 @@ static bool early_global(const char *name) {
             Binding *alias = xs_alloc(sizeof *alias);
             *alias = *b;
             alias->origin = b;
-            alias->is_const = true;
+            alias->is_const = st ? b->is_const : true;
             Scope *ms = mod_scopes[cur_mod->id];
             alias->next = ms->head;
             ms->head = alias;
@@ -9730,6 +9730,12 @@ static void check_expr_in(Expr *e, Type *expected) {
             for (Binding *o = b; o; o = o->origin) if (o->lit_number) widen_rhs = true;
             if (strncmp(b->cname, "env->", 5) == 0)
                 xs_error(XS8085, e->pos, "arrow functions capture by value; keep the state in an object or array and change that", "cannot assign to '%s', captured from the enclosing function", target->str);
+            const char *sst = b->is_const && !target->boolean ? strstr(target->str, "__s_") : NULL;
+            if (sst) { /* Class.x = v with x a static readonly field (Class__s_x) */
+                const char *fe = strchr(sst + 4, '\x01');
+                xs_error(XS8087, e->pos, "remove readonly from the field if it changes", "cannot assign to '%.*s.%.*s': it is a readonly static field",
+                         (int)(sst - target->str), target->str, fe ? (int)(fe - sst - 4) : (int)strlen(sst + 4), sst + 4);
+            }
             if (b->is_const && !target->boolean) xs_error(XS8087, e->pos, "declare it with 'let' if it changes", "cannot assign to constant '%s'", target->str);
             if (b->is_param && ty_is_heap(b->type))
                 xs_error(XS8099, e->pos, "copy it into a local first: let s: string = param;", "cannot reassign parameter '%s' of reference type", target->str);
@@ -11439,7 +11445,18 @@ static void check_expr_in(Expr *e, Type *expected) {
                     check_expr(e, expected);
                     return;
                 }
-                if (e->is_call) xs_error(XS8051, e->pos, NULL, "'%s' is a static field of %s, not a method", e->str, sc->name);
+                if (e->is_call) { /* Class.hook(...) with a static field of function type: a call of its value */
+                    Expr *callee = xs_alloc(sizeof *callee);
+                    callee->kind = E_IDENT;
+                    callee->pos = e->pos;
+                    callee->str = (char *)gen;
+                    callee->field = -1;
+                    e->kind = E_CALL;
+                    e->lhs = callee;
+                    e->is_call = false;
+                    check_expr(e, expected);
+                    return;
+                }
                 e->kind = E_IDENT;
                 e->str = (char *)gen;
                 e->lhs = NULL;
@@ -18538,7 +18555,7 @@ void check_program(Program *p) {
                     *alias = *b;
                     if (qualified) alias->name = xs_sprintf("%s\x01%s", b->name, im->path);
                     alias->origin = b;
-                    alias->is_const = true;
+                    alias->is_const = is_static ? b->is_const : true; /* Class.x = v from another module, as in TypeScript, unless readonly (XB-228) */
                     alias->next = scope->head;
                     scope->head = alias;
                 }
