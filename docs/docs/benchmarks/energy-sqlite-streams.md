@@ -1,6 +1,6 @@
 ---
 title: Energy, SQLite, streams and micro programs
-sidebar_position: 4
+sidebar_position: 5
 ---
 
 # Energy, SQLite, streams and micro programs

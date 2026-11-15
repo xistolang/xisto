@@ -47,22 +47,23 @@ The per-kernel tables, with the C reference beside them, are on [PolyBench](./po
 
 ## TechEmpower (json, plaintext)
 
-14 Nov 2026, the TFB's rules: servers on the Xeon, wrk on the Graviton2 over the private network, 15 s per level,
-median of 3. Best requests per second:
+14 Nov 2026, main `3f24503`, the TFB's rules: servers on the Xeon, wrk on the Graviton2 over the private network,
+15 s per level, median of 3. Best requests per second:
 
 | server | json | plaintext | json peak RSS |
 |---|---:|---:|---:|
-| actix-web (Rust) | 65,068 | 569,578 | 12.3 MB |
-| Xisto (native) | 56,352 | 331,283 | 5.5 MB |
-| Bun | 55,207 | 114,082 | 89.9 MB |
-| Xisto + NestJS, 2 processes | 48,332 | 199,633 | 16.0 MB |
-| Go net/http | 32,831 | 44,851 | 20.1 MB |
-| Node http | 29,524 | 51,486 | 243.8 MB |
-| fastify | 22,962 | 35,972 | 263.3 MB |
+| Xisto (native) | **71,544** | **662,156** | 5.5 MB |
+| actix-web (Rust) | 65,891 | 570,564 | 14.1 MB |
+| Bun | 54,497 | 114,146 | 90.8 MB |
+| Xisto + NestJS, 2 processes | 53,032 | 239,187 | 16.2 MB |
+| Xisto + NestJS, with the lock | 44,216 | 116,817 | 10.7 MB |
+| Go net/http | 32,636 | 44,657 | 30.8 MB |
+| Node http | 29,317 | 51,066 | 289.4 MB |
+| fastify | 25,672 | 36,387 | 303.7 MB |
 
-actix is ahead; Xisto's native server is second, and NestJS built with Xisto passes Go, Node and fastify. NestJS's
-workers without the handler lock crash (shared singletons), and 16,384 connections are Xisto's weak point. The
-per-level tables are on [TechEmpower](./techempower.md).
+Xisto's native server is first on both tests, ahead of actix-web, and NestJS built with Xisto passes Go, Node and
+fastify. NestJS's workers without the handler lock crash (shared singletons). At high concurrency Xisto's tail
+latency (p99) is still worse than actix-web's. The per-level tables and charts are on [TechEmpower](./techempower.md).
 
 ## Benchmarks Game against Node and Bun
 
