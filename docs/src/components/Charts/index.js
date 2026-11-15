@@ -53,7 +53,7 @@ function Tooltip({tip, docked}) {
  * Horizontal bars, largest first: one bar per server.
  * rows: [{name, value, highlight?, detail?: [[label, value], ...]}]; unit: axis caption.
  */
-export function BarChart({title, caption, rows, unit = 'requests per second', format = fmt, formatFull = full, lowerIsBetter = false, keepOrder = false, refLine = null}) {
+export function BarChart({title, caption, rows, unit = 'requests per second', format = fmt, formatFull = full, lowerIsBetter = false, keepOrder = false, refLine = null, log = false}) {
   const [ref, width] = useWidth(640);
   const [tip, setTip] = useState(null);
   // best first: the largest, or the smallest when less is better (CPU, memory, latency)
@@ -67,9 +67,11 @@ export function BarChart({title, caption, rows, unit = 'requests per second', fo
   const barTop = stacked ? 20 : (band - bar) / 2;
   const top = 8;
   const plotW = width - labelW - valueW - 8;
-  const tk = ticks(Math.max(...sorted.map((r) => r.value)), width < 480 ? 4 : 5);
+  // log scale (ratios from 1× to 100×): ticks at 1, 10, 100...; a bar starts at 1×, so a value at or under 1 has none
+  const hiExp = Math.max(1, Math.ceil(Math.log10(Math.max(...sorted.map((r) => r.value)))));
+  const tk = log ? Array.from({length: hiExp + 1}, (_, i) => 10 ** i) : ticks(Math.max(...sorted.map((r) => r.value)), width < 480 ? 4 : 5);
   const max = tk[tk.length - 1];
-  const x = (v) => labelW + (v / max) * plotW;
+  const x = (v) => labelW + (log ? Math.max(0, Math.log10(v)) / hiExp : v / max) * plotW;
   const h = top + sorted.length * band + 28;
   const show = (r, i, ev) => {
     const box = ref.current.getBoundingClientRect();

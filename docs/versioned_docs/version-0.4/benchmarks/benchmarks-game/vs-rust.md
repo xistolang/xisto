@@ -3,6 +3,8 @@ title: Xisto vs Rust
 sidebar_position: 1
 ---
 
+import {SpeedupBars, MemoryBars} from '@site/src/components/Charts/Speedup';
+
 # Xisto vs Rust
 
 13 Nov 2026, main `4a2f388`, on the two AWS VMs. Rust is the language the Benchmarks Game's fastest programs are
@@ -30,6 +32,10 @@ language.
 
 Source: `bench/results/vm-2026-11-13/rust-ubuntu-xeon-2026-11-13-4a2f388.txt`.
 
+<SpeedupBars page="bg-vs-rust" section="Xeon E5-2686 v4" unit="problem" />
+
+<MemoryBars page="bg-vs-rust" section="Xeon E5-2686 v4" unit="problem" />
+
 | problem | xisto | Rust | xisto time | Rust time | xisto CPU | Rust CPU | xisto mem | Rust mem | result |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
 | fasta | fasta | fasta_7 | 1.124 s | 1.989 s | 0.34 s | 2.66 s | 2.4 MB | 2.9 MB | win |
@@ -51,6 +57,10 @@ excluded because they compute `1/√x` with the approximate `rsqrtps` instructio
 ## Graviton2 (AWS t4g.small, 2 vCPUs, arm64)
 
 Source: `bench/results/vm-2026-11-13/rust-arm-graviton2-2026-11-13-4a2f388.txt`.
+
+<SpeedupBars page="bg-vs-rust" section="Graviton2" unit="problem" />
+
+<MemoryBars page="bg-vs-rust" section="Graviton2" unit="problem" />
 
 | problem | xisto | Rust | xisto time | Rust time | xisto CPU | Rust CPU | xisto mem | Rust mem | result |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|

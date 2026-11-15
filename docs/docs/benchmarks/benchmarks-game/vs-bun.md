@@ -3,6 +3,8 @@ title: Xisto vs Bun
 sidebar_position: 3
 ---
 
+import {SpeedupBars, MemoryBars} from '@site/src/components/Charts/Speedup';
+
 # Xisto vs Bun
 
 13 Nov 2026, the xisto variants of main `e5fb066` (before `mandelbrot-8`), on the Apple M4 and the
@@ -32,6 +34,10 @@ result column is Bun's time divided by xisto's.
 
 Source: `bench/results/node-bun-mac-m4-2026-11-13-e5fb066.txt`.
 
+<SpeedupBars page="bg-vs-bun" section="Apple M4" unit="problem" />
+
+<MemoryBars page="bg-vs-bun" section="Apple M4" unit="problem" />
+
 | problem | xisto | Bun | xisto time | Bun time | xisto CPU | Bun CPU | xisto mem | Bun mem | result |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
 | spectral-norm | spectralnorm-6 | spectralnorm-1 | 0.069 s | 1.312 s | 0.53 s | 1.32 s | 2.7 MB | 20 MB | win, 19.0× |
@@ -49,6 +55,10 @@ Source: `bench/results/node-bun-mac-m4-2026-11-13-e5fb066.txt`.
 
 Source: `bench/results/vm-2026-11-13/node-bun-ubuntu-xeon-2026-11-13-e5fb066.txt`.
 
+<SpeedupBars page="bg-vs-bun" section="Xeon E5-2686 v4" unit="problem" />
+
+<MemoryBars page="bg-vs-bun" section="Xeon E5-2686 v4" unit="problem" />
+
 | problem | xisto | Bun | xisto time | Bun time | xisto CPU | Bun CPU | xisto mem | Bun mem | result |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
 | spectral-norm | spectralnorm-6 | spectralnorm-1 | 0.459 s | 4.164 s | 0.89 s | 4.19 s | 2.3 MB | 34 MB | win, 9.1× |
@@ -65,6 +75,10 @@ Source: `bench/results/vm-2026-11-13/node-bun-ubuntu-xeon-2026-11-13-e5fb066.txt
 ## Graviton2 (2 vCPUs)
 
 Source: `bench/results/vm-2026-11-13/node-bun-arm-graviton2-2026-11-13-e5fb066.txt`.
+
+<SpeedupBars page="bg-vs-bun" section="Graviton2" unit="problem" />
+
+<MemoryBars page="bg-vs-bun" section="Graviton2" unit="problem" />
 
 | problem | xisto | Bun | xisto time | Bun time | xisto CPU | Bun CPU | xisto mem | Bun mem | result |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
