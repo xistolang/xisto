@@ -1075,6 +1075,66 @@ static const char *asif_fn(Class *ifc, bool nullable) {
     return name;
 }
 
+/* XB-200: a field of an interface with methods (an abstract class), read or written through that type, when an adapter of a
+   class that does not implement it (make_adapter: it holds only the wrapped object) may be behind it: a pointer to the field,
+   in the wrapped object for an adapter (the checker's iface_fits made each such field one of the same type), in the object
+   itself otherwise. NULL when no used adapter is below c: the plain c->f access, as before. */
+static Buf ifld_fns;
+static char **ifld_made;
+static int nifld;
+static const char *ifld_fn(Class *c, int field, Pos pos) {
+    if (!c || c->builtin || c->adapter_of || field < 0 || field >= c->nfields) return NULL;
+    bool any = false;
+    for (int i = 0; i < prog->nclasses && !any; i++) {
+        Class *k = prog->classes[i];
+        any = k->used && k->adapter_of && is_sub(k, c);
+    }
+    if (!any) return NULL;
+    Field *fd = &c->fields[field];
+    char *name = xs_sprintf("%s_ifld_%s", c->cname, fd->cname);
+    for (int i = 0; i < nifld; i++) if (strcmp(ifld_made[i], name) == 0) return name;
+    ifld_made = realloc(ifld_made, sizeof(char *) * (size_t)(nifld + 1));
+    ifld_made[nifld++] = name;
+    char *ft = xs_sprintf("__typeof__(((%s *)0)->%s)", c->cname, fd->cname);
+    buf_printf(&ifld_fns, "static inline %s *%s(%s *o) {\n    void (*f_)(void *) = xs_type_of(o)->free;\n", ft, name, c->cname);
+    for (int i = 0; i < prog->nclasses; i++) {
+        Class *a = prog->classes[i], *src = a->adapter_of;
+        if (!a->used || !src || !is_sub(a, c)) continue;
+        int sk = -1;
+        for (int k = 0; k < src->nfields; k++) if (strcmp(src->fields[k].name, fd->name) == 0) sk = k;
+        if (sk < 0 || cp_field(src, sk) || src->nohdr || src->region)
+            xs_error(XS9902, pos, "declare `implements` on the class", "internal: %s cannot be read through the adapter of %s", fd->name, src->name);
+        buf_printf(&ifld_fns, "    if (f_ == %s_free) return (%s *)&((%s *)o)->%s->%s;\n", a->cname, ft, a->cname, a->fields[0].cname, src->fields[sk].cname);
+    }
+    buf_printf(&ifld_fns, "    return &o->%s;\n}\n", fd->cname);
+    return name;
+}
+
+/* XB-201: i as C, i of an interface with methods and C a class that does not implement it: the object an adapter of C (or
+   of a class above or below C) wraps, as JavaScript has only the object itself; anything else is left as it is, for the
+   checked cast to accept or refuse. NULL when no used adapter wraps such a class. Borrowed: the adapter holds it. */
+static const char *unad_fn(Class *c) {
+    if (!c || c->builtin || c->adapter_of) return NULL;
+    Buf b = {0};
+    char *name = xs_sprintf("%s_unad", c->cname);
+    buf_printf(&b, "static void *%s(void *v) {\n    while (v) {\n        void (*f_)(void *) = xs_type_of(v)->free;\n", name);
+    int n = 0;
+    for (int i = 0; i < prog->nclasses; i++) {
+        Class *a = prog->classes[i], *src = a->adapter_of;
+        if (!a->used || !src || is_sub(a, c) || !(is_sub(src, c) || is_sub(c, src))) continue;
+        buf_printf(&b, "        if (f_ == %s_free) { v = ((%s *)v)->%s; continue; }\n", a->cname, a->cname, a->fields[0].cname);
+        n++;
+    }
+    buf_puts(&b, "        return v;\n    }\n    return v;\n}\n");
+    if (!n) { free(b.data); return NULL; }
+    for (int i = 0; i < nisa; i++) if (strcmp(isa_made[i], name) == 0) { free(b.data); return name; }
+    isa_made = realloc(isa_made, sizeof(char *) * (size_t)(nisa + 1));
+    isa_made[nisa++] = name;
+    buf_puts(&isa_fns, b.data);
+    free(b.data);
+    return name;
+}
+
 /* a method that some subclass overrides, called through its class: chooses by the object's class */
 static Buf disp_fns;
 static char **disp_made;
@@ -1276,6 +1336,86 @@ static void emit_args_borrowed(ExprList *l, bool leading_comma) {
         emit_borrowed(l->items[i]);
     }
 }
+/* XB-215: a module variable some function assigns, passed to user code: the call may assign it, letting go of the value
+   the callee was given; held (retained, let go at the statement's end) for the call. Other values as emit_borrowed. */
+static bool held_ident(Expr *e) {
+    if (e->kind == E_AS && e->op == TK_NOT && !e->elem_type) e = e->lhs; /* (narrowed: x checked not null) */
+    return e->kind == E_IDENT && e->gl_hold && rcnt(e->type);
+}
+static void emit_held(Expr *e) {
+    if (!held_ident(e)) { emit_borrowed(e); return; }
+    used_ar = true;
+    buf_puts(out, "xs_ar(xs_retain(");
+    emit_expr(e);
+    buf_puts(out, "))");
+}
+static void emit_args_held(ExprList *l, bool leading_comma) {
+    for (int i = 0; i < l->len; i++) {
+        if (i || leading_comma) buf_puts(out, ", ");
+        emit_held(l->items[i]);
+    }
+}
+/* a call of a built-in that takes a function (xs.forEach(f), s.replace(re, f)...) runs user code too */
+static bool args_have_fn(ExprList *l) {
+    for (int i = 0; i < l->len; i++) if (l->items[i]->type && l->items[i]->type->kind == TY_FUNC) return true;
+    return false;
+}
+/* f can let go of a held module variable's value: it assigns one (gl_hold), or runs code that may (a function or method
+   that may, a closure, a constructor, a virtual call, an await). f(s) { return s.length } cannot, nor a function that
+   only calls such ones: its callers pass the variable as it is, with no retain (the hot path of small helpers).
+   Memoized per function; a recursive call counts as one that may. */
+static bool may_drop_stmt(Stmt *s);
+static bool fn_may_drop(Func *f);
+static bool may_drop_expr(Expr *e) {
+    if (!e) return false;
+    switch (e->kind) {
+    case E_ASSIGN: case E_POSTFIX:
+        if (e->lhs && e->lhs->kind == E_IDENT && e->lhs->gl_hold) return true;
+        break;
+    case E_CALL:
+        if (args_have_fn(&e->args)) return true;
+        if (!e->builtin.cfn && (!e->func || fn_may_drop(e->func))) return true; /* (a closure value: unknown code) */
+        break;
+    case E_MEMBER:
+        if (!e->is_call) break;
+        if (args_have_fn(&e->args)) return true;
+        if ((!e->cls || !e->cls->builtin) && (e->virt || !e->func || fn_may_drop(e->func))) return true;
+        break;
+    case E_NEW_OBJ: if (!e->cls || !e->cls->builtin) return true; break;
+    case E_SUPER_CALL: case E_AWAIT: case E_SPAWN: return true;
+    case E_ARROW: return false; /* (made, not run) */
+    default: break;
+    }
+    if (may_drop_expr(e->lhs) || may_drop_expr(e->rhs)) return true;
+    for (int i = 0; i < e->args.len; i++) if (may_drop_expr(e->args.items[i])) return true;
+    return false;
+}
+static bool may_drop_stmt(Stmt *s) {
+    if (!s) return false;
+    if (s->kind == S_YIELD) return true;
+    if (may_drop_expr(s->init) || may_drop_expr(s->expr) || may_drop_expr(s->cond) || may_drop_stmt(s->for_init) ||
+        may_drop_expr(s->for_update) || may_drop_stmt(s->body) || may_drop_stmt(s->else_body))
+        return true;
+    for (int i = 0; i < s->stmts.len; i++) if (may_drop_stmt(s->stmts.items[i])) return true;
+    for (int i = 0; i < s->ncases; i++) if (may_drop_expr(s->cases[i].value) || may_drop_stmt(s->cases[i].body)) return true;
+    return false;
+}
+static Func **md_fns;
+static bool *md_val;
+static int nmd;
+static bool fn_may_drop(Func *f) {
+    if (!f || !f->body || f->is_async || f->is_gen) return true;
+    for (int i = 0; i < nmd; i++) if (md_fns[i] == f) return md_val[i];
+    int me = nmd++; /* (true while it is being looked at: a recursive call may) */
+    md_fns = realloc(md_fns, sizeof(Func *) * (size_t)nmd);
+    md_val = realloc(md_val, sizeof(bool) * (size_t)nmd);
+    md_fns[me] = f;
+    md_val[me] = true;
+    bool v = may_drop_stmt(f->body);
+    for (int i = 0; i < f->nparams && !v; i++) v = may_drop_expr(f->params[i].dflt);
+    if (!v) md_val[me] = false;
+    return v;
+}
 
 static const char *binop(TokKind op) {
     switch (op) {
@@ -1334,6 +1474,42 @@ static Stmt *bce_fw_loop; /* the loop whose emission uses them (NULL: none) */
 static bool bce_same_bx(Expr *a, Expr *b);
 static bool bce_same(Expr *a, Expr *b);
 static bool bce_fw_is(Expr *e, Expr *slot) { return e && slot && e->kind == E_INDEX && bce_same_bx(e->lhs, slot->lhs) && bce_same(e->rhs, slot->rhs); }
+/* XB-216: X[i] of an array of arrays (or objects) can be a hole (new Array<T[]>(n), an element never set), which the
+   type does not say: reading through it (X[i][j], X[i].f, X[i].length, X[i].m()) is JavaScript's TypeError
+   "Cannot read properties of undefined (reading 'j')", catchable, not a fault. The element is held in a temporary
+   and tested once; the guarded loops of bce (a column's rows read through bce_col_rd) test the rows already. */
+static bool hole_read(Expr *b) {
+    if (!b || b->kind != E_INDEX || b->builtin.cfn || !b->lhs || !b->lhs->type || b->lhs->type->kind != TY_ARRAY) return false;
+    if (!arr_is_ref(b->lhs->type) || !b->type || b->type->kind == TY_NULLABLE || !cref(b->type)) return false;
+    return true;
+}
+static Expr *hole_set_target; /* the left side of the `=` being emitted: X[i][j] = v "sets" (Node's other wording) */
+/* opens ({ T hbN_ = <b>; if (!hbN_) TypeError; and puts a variable of hbN_ in *slot (put back by hole_close) */
+static Expr *hole_open(Expr **slot, Expr *key_idx, const char *key, Pos pos, bool set) {
+    static int nhb;
+    int id = nhb++;
+    Expr *b = *slot;
+    buf_printf(out, "({ %s hb%d_ = ", ctype(b->type), id);
+    emit_borrowed(b);
+    char *msg;
+    const char *rd = set ? "set properties of undefined (setting" : "read properties of undefined (reading";
+    if (key) msg = xs_sprintf("\"TypeError: Cannot %s '%s')\"", rd, key);
+    else if (key_idx && key_idx->kind == E_NUMBER && key_idx->num == (double)(int64_t)key_idx->num)
+        msg = xs_sprintf("\"TypeError: Cannot %s '%lld')\"", rd, (long long)key_idx->num);
+    else if (key_idx && key_idx->kind == E_IDENT && key_idx->cname && key_idx->type && int_like(key_idx->type))
+        msg = xs_sprintf("xs_hole_msg_i(%s, %d)", ren(key_idx->cname), set);
+    else msg = xs_sprintf("\"TypeError: Cannot %s an element of a hole)\"", rd);
+    buf_printf(out, "; if (__builtin_expect(!hb%d_, 0)) XS_FAIL(%s, XS_S(%d)); ", id, msg, new_site(pos));
+    Expr *v = xs_alloc(sizeof *v);
+    v->kind = E_IDENT; v->pos = b->pos; v->field = -1; v->type = b->type; v->cname = xs_sprintf("hb%d_", id); v->str = v->cname;
+    *slot = v;
+    return b;
+}
+static void hole_close(Expr **slot, Expr *was) {
+    *slot = was;
+    buf_puts(out, "; })");
+}
+
 static void emit_lvalue_ptr(Expr *e) {
     if (bce_fw_loop && e->kind == E_INDEX)
         for (int k = 0; k < nbce_fw; k++) if (bce_fw_is(e, bce_fw[k].r)) { buf_printf(out, "&fm%d_", bce_fw[k].id); return; }
@@ -1357,12 +1533,32 @@ static void emit_lvalue_ptr(Expr *e) {
     case E_IDENT:
         buf_printf(out, "&%s", ren(e->cname));
         return;
-    case E_MEMBER:
+    case E_MEMBER: {
+        if (hole_read(e->lhs)) { /* X[i].f = v with X[i] a hole: a TypeError (XB-216) */
+            Expr *was = hole_open(&e->lhs, NULL, e->str, e->pos, e == hole_set_target);
+            emit_lvalue_ptr(e);
+            hole_close(&e->lhs, was);
+            return;
+        }
+        const char *ifl = ifld_fn(e->cls, e->field, e->pos); /* (XB-200) */
+        if (ifl) {
+            buf_printf(out, "%s(", ifl);
+            emit_borrowed(e->lhs);
+            buf_puts(out, ")");
+            return;
+        }
         buf_puts(out, "&(");
         emit_borrowed(e->lhs);
         buf_printf(out, ")->%s", e->cls->fields[e->field].cname);
         return;
+    }
     default: /* E_INDEX */
+        if (hole_read(e->lhs)) { /* X[i][j] with X[i] a hole: a TypeError (XB-216) */
+            Expr *was = hole_open(&e->lhs, e->rhs, NULL, e->pos, e == hole_set_target);
+            emit_lvalue_ptr(e);
+            hole_close(&e->lhs, was);
+            return;
+        }
         if (is_f64_type(e->lhs->type) || is_f32_type(e->lhs->type) || is_i32_type(e->lhs->type)) { /* f[i] on a Float64Array: its data, as a number[]'s
                                                                          (a float * on a Float32Array's, an int32_t * on an Int32Array's) */
             bool safe = bce_safe(e);
@@ -1540,6 +1736,7 @@ static char *type_tag(Type *t) {
 }
 
 static void ensure_json(Type *t);
+static bool json_capable(Type *t);
 static const char *where_elem(int i) { return xs_sprintf("[%d]", i); }
 
 /* JSON.stringify of an unknown (a field of that type too): xs_json_unknown, generated after the program, looks at
@@ -1686,7 +1883,19 @@ static void ensure_json(Type *t) {
     if (tj) /* toJSON(): string: its result, as a JSON string */
         buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *o) {\n    xs_str *t_ = %s((%s *)o);\n    xs_sb_str(sb, t_);\n    xs_release(t_);\n    if (0) {\n",
                    tag, c->cname, tj->cname, tj->cls->cname);
-    buf_printf(b, tj ? "    xs_sb_put(sb, \"{\", 1);\n    bool first_ = true; (void)first_;\n" : "static void json_put_%s(xs_sb *sb, %s *o) {\n    xs_sb_put(sb, \"{\", 1);\n    bool first_ = true; (void)first_;\n", tag, c->cname);
+    if (!tj) {
+        buf_printf(b, "static void json_put_%s(xs_sb *sb, %s *o) {\n", tag, c->cname);
+        /* an adapter of a class used as this interface (XB-200): the object it wraps, all of its fields, as JavaScript writes
+           the object itself */
+        for (int i = 0; i < prog->nclasses; i++) {
+            Class *a = prog->classes[i], *src = a->adapter_of;
+            if (!a->used || !src || !is_sub(a, c) || !json_capable(ty_object_of(src))) continue;
+            ensure_json(ty_object_of(src));
+            buf_printf(b, "    if (xs_type_of(o)->free == %s_free) { json_put_%s(sb, ((%s *)o)->%s); return; }\n", a->cname,
+                       type_tag(ty_object_of(src)), a->cname, a->fields[0].cname);
+        }
+    }
+    buf_puts(b, "    xs_sb_put(sb, \"{\", 1);\n    bool first_ = true; (void)first_;\n");
     for (int i = 0; i < c->nfields; i++) {
         Field *f = &c->fields[i];
         if (ty_is_undef(f->type)) continue; /* r: undefined: JSON.stringify leaves it out */
@@ -1760,6 +1969,12 @@ static void emit_union_class_test(Type *u, const char *field, const char *lit, c
 }
 
 static void emit_member(Expr *e) {
+    if (hole_read(e->lhs)) { /* X[i].f, X[i].length, X[i].m() with X[i] a hole: a TypeError (XB-216) */
+        Expr *was = hole_open(&e->lhs, NULL, e->str, e->pos, false);
+        emit_member(e);
+        hole_close(&e->lhs, was);
+        return;
+    }
     Expr *base = e->lhs;
     if (e->builtin.cfn && strcmp(e->builtin.cfn, "union_field") == 0) { /* s.kind on a union: by the object's class */
         Type *u = e->elem_type;
@@ -2384,6 +2599,13 @@ static void emit_member(Expr *e) {
         return;
     }
     if (e->field >= 0) {
+        const char *ifl = ifld_fn(e->cls, e->field, e->pos); /* (an interface field an adapter may hold: XB-200) */
+        if (ifl) {
+            buf_printf(out, "(*%s(", ifl);
+            emit_borrowed(base);
+            buf_puts(out, "))");
+            return;
+        }
         buf_puts(out, "(");
         emit_borrowed(base);
         buf_printf(out, ")->%s", e->cls->fields[e->field].cname);
@@ -2392,16 +2614,27 @@ static void emit_member(Expr *e) {
     if (!e->cls->builtin && e->func->cls && e->func->cls != e->cls) { /* inherited (or dispatched): the receiver as the method's class */
         buf_printf(out, "%s((%s *)(", e->virt ? dispatcher(e->func) : e->deco_orig && e->func->deco_stub ? xs_sprintf("%s__orig", e->func->cname) : e->func->cname,
                    e->func->cls->cname);
-        emit_borrowed(base);
-        buf_puts(out, ")");
-        emit_args_borrowed(&e->args, true);
+        if (e->virt || fn_may_drop(e->func) || args_have_fn(&e->args)) { /* (XB-215) */
+            emit_held(base);
+            buf_puts(out, ")");
+            emit_args_held(&e->args, true);
+        } else {
+            emit_borrowed(base);
+            buf_puts(out, ")");
+            emit_args_borrowed(&e->args, true);
+        }
         buf_puts(out, ")");
         return;
     }
     buf_printf(out, "%s(", e->cls->builtin ? e->builtin.cfn : e->virt ? dispatcher(e->func)
                           : e->deco_orig && e->func->deco_stub ? xs_sprintf("%s__orig", e->func->cname) : e->func->cname);
-    emit_borrowed(base);
-    emit_args_borrowed(&e->args, true);
+    if ((!e->cls->builtin && (e->virt || fn_may_drop(e->func))) || args_have_fn(&e->args)) { /* user code that may let go of it runs (XB-215) */
+        emit_held(base);
+        emit_args_held(&e->args, true);
+    } else {
+        emit_borrowed(base);
+        emit_args_borrowed(&e->args, true);
+    }
     buf_puts(out, ")");
 }
 
@@ -2970,14 +3203,15 @@ static void emit_expr_raw(Expr *e) {
         return;
     case E_SUPER_CALL: /* the base's initializer on this object */
         buf_printf(out, "%s_init((%s *)self", e->cls->cname, e->cls->cname);
-        emit_args_borrowed(&e->args, true);
+        emit_args_held(&e->args, true);
         buf_puts(out, ")");
         return;
     case E_AS: { /* unknown as T: the object's free function says what it is */
         Buf b = {0};
         Buf *saved = out;
         out = &b;
-        emit_expr(e->lhs);
+        if (e->op == TK_CLASS) emit_borrowed(e->lhs); /* a downcast is borrowed (is_fresh): a fresh object let go at the statement's end */
+        else emit_expr(e->lhs);
         out = saved;
         if (e->op == 0 && e->lhs->type && e->lhs->type->kind == TY_UNKNOWN && !cref(e->type) && is_fresh(e->lhs)) {
             /* f() as number: unbox the fresh box, then let it go */
@@ -3010,7 +3244,7 @@ static void emit_expr_raw(Expr *e) {
         if (e->op == TK_NOT && !e->elem_type) { /* x! or (T | null) as T: a TypeError when it is null */
             Type *nt = e->lhs->type;
             if (e->str) /* a narrowed variable a closure set back to null (checker: cell_narrowed) */
-                buf_printf(out, "({ %s nn_ = %s; if (!%s) xs_panic(\"TypeError: '%s' is null here: a call made since it was checked set it back to null\"); nn_; })",
+                buf_printf(out, "({ %s nn_ = %s; if (__builtin_expect(!%s, 0)) XS_FAIL(\"TypeError: '%s' is null here: a call made since it was checked set it back to null\", NULL); nn_; })",
                            ctype(nt), b.data, not_null(nt, "nn_"), e->str);
             else
                 buf_printf(out, "({ %s nn_ = %s; if (!%s) xs_panic(\"TypeError: the value is null\"); nn_; })", ctype(nt), b.data, not_null(nt, "nn_"));
@@ -3041,6 +3275,15 @@ static void emit_expr_raw(Expr *e) {
                            id, b.data, id, from_unknown(e->elem_type, xs_sprintf("ev%d_", id)), id, id, id, id, id);
                 free(b.data);
                 return;
+            }
+        }
+        if (e->op == TK_CLASS && e->elem_type) { /* a downcast: through an adapter, the object it wraps (XB-201) */
+            Type *dt = e->elem_type->kind == TY_NULLABLE ? e->elem_type->elem : e->elem_type;
+            const char *un = dt->kind == TY_OBJECT ? unad_fn(dt->cls) : NULL;
+            if (un) {
+                char *w = xs_sprintf("%s((void *)(%s))", un, b.data);
+                free(b.data);
+                b.data = w;
             }
         }
         fu_dyn = e->lhs->type && ty_is_any(e->lhs->type);
@@ -3514,20 +3757,21 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, "; })");
             return;
         }
-        if (e->op == TK_IDENT) { /* instanceof: the same identity test as `as` */
+        if (e->op == TK_IDENT) { /* instanceof: the same identity test as `as`; the value borrowed (a fresh one is let go
+                                     at the statement's end: XB-213) */
             Class *c = e->rhs->cls;
             Type *lt = e->lhs->type;
             bool l_err = lt->kind == TY_OBJECT && lt->cls->builtin && strcmp(lt->cls->name, "Error") == 0;
             if (lt->kind == TY_OBJECT && is_error_class(lt->cls) && strcmp(c->name, "Error") == 0 && c->builtin) {
                 buf_puts(out, "((void *)("); /* an object of a class that extends Error is an Error */
-                emit_expr(e->lhs);
+                emit_borrowed(e->lhs);
                 buf_puts(out, ") != NULL)");
                 return;
             }
             if (l_err && is_error_class(c)) { /* a caught Error: the class of the object it was thrown as */
                 if (in_hierarchy(c)) buf_printf(out, "%s(xs_Error_thrown((void *)(", isa_fn(c));
                 else buf_printf(out, "xs_is_a(xs_Error_thrown((void *)(");
-                emit_expr(e->lhs);
+                emit_borrowed(e->lhs);
                 if (in_hierarchy(c)) buf_puts(out, ")))");
                 else buf_printf(out, ")), %s_free)", c->cname);
                 return;
@@ -3536,7 +3780,7 @@ static void emit_expr_raw(Expr *e) {
                 static int ngi;
                 int id = ngi++;
                 buf_printf(out, "({ void *gi%d_ = (void *)(", id);
-                emit_expr(e->lhs);
+                emit_borrowed(e->lhs);
                 buf_printf(out, "); void (*gf%d_)(void *) = gi%d_ ? xs_type_of(gi%d_)->free : NULL; (false", id, id, id);
                 for (int i = 0; i < prog->nclasses; i++)
                     if (prog->classes[i]->generic_of == c && prog->classes[i]->used) buf_printf(out, " || gf%d_ == %s_free", id, prog->classes[i]->cname);
@@ -3545,7 +3789,7 @@ static void emit_expr_raw(Expr *e) {
             }
             if (in_hierarchy(c)) {
                 buf_printf(out, "%s((void *)(", isa_fn(c));
-                emit_expr(e->lhs);
+                emit_borrowed(e->lhs);
                 buf_puts(out, "))");
                 return;
             }
@@ -3554,7 +3798,7 @@ static void emit_expr_raw(Expr *e) {
                 static int nei;
                 int id = nei++;
                 buf_printf(out, "({ void *ei%d_ = (void *)(", id);
-                emit_expr(e->lhs);
+                emit_borrowed(e->lhs);
                 buf_printf(out, "); void (*ef%d_)(void *) = ei%d_ ? xs_type_of(ei%d_)->free : NULL; (ef%d_ && (ef%d_ == xs_Error_free", id, id, id, id, id);
                 for (int i = 0; i < prog->nclasses; i++) {
                     Class *k = prog->classes[i];
@@ -3564,7 +3808,7 @@ static void emit_expr_raw(Expr *e) {
                 return;
             }
             buf_puts(out, "xs_is_a(");
-            emit_expr(e->lhs);
+            emit_borrowed(e->lhs);
             buf_printf(out, ", %s)", strcmp(c->name, "Error") == 0 ? "xs_Error_free" : c->builtin && strcmp(c->name, "Date") == 0 ? "xs_Date_free" :
                        c->builtin && strcmp(c->name, "RegExp") == 0 ? "xs_RegExp_free" :
                        c->builtin && (strcmp(c->name, "Uint8Array") == 0 || strcmp(c->name, "Buffer") == 0) ? "xs_u8_free" :
@@ -3622,6 +3866,7 @@ static void emit_expr_raw(Expr *e) {
         buf_puts(out, ")");
         return;
     case E_ASSIGN:
+        if (e->op == TK_ASSIGN) hole_set_target = e->lhs; /* (XB-216) */
         if (bce_fw_loop && e->op == TK_ASSIGN)
             for (int k = 0; k < nbce_fw; k++)
                 if (bce_fw_is(e->lhs, bce_fw[k].w)) { /* the carried value: stored, and kept for the next iteration */
@@ -3915,6 +4160,17 @@ static void emit_expr_raw(Expr *e) {
             }
         }
         if (!nz_mute && e->builtin.cfn && strcmp(e->builtin.cfn, "xs_to_number") == 0 && e->args.len == 1 && may_nz(e->args.items[0])) { emit_nzd(e->args.items[0]); return; } /* XB-087 */
+        if (e->builtin.cfn && strcmp(e->builtin.cfn, "__xs_is_view") == 0) { /* ArrayBuffer.isView(f()): one read (XB-213) */
+            static int niv;
+            int id = niv++;
+            Expr *v = e->args.items[0];
+            if (!cref(v->type)) { buf_puts(out, "((void)("); emit_expr(v); buf_puts(out, "), false)"); return; }
+            buf_printf(out, "({ void *iv%d_ = (void *)(", id);
+            emit_borrowed(v);
+            buf_printf(out, "); void (*ivf%d_)(void *) = iv%d_ ? xs_type_of(iv%d_)->free : NULL; ivf%d_ && (ivf%d_ == xs_u8_free || "
+                            "ivf%d_ == xs_f64_free || ivf%d_ == xs_f32_free || ivf%d_ == xs_i32_free); })", id, id, id, id, id, id, id, id);
+            return;
+        }
         if (e->builtin.cfn && strcmp(e->builtin.cfn, "__iface_as") == 0) { /* XB-126 */
             Type *t = e->type->kind == TY_NULLABLE ? e->type->elem : e->type;
             buf_printf(out, "%s(", asif_fn(t->cls, e->type->kind == TY_NULLABLE));
@@ -4002,7 +4258,7 @@ static void emit_expr_raw(Expr *e) {
             if (!v) buf_printf(out, "ocr%d_ = ", id);
             emit_closure_call_prefix(ft);
             buf_printf(out, "oc%d_->fn)(oc%d_", id, id);
-            emit_args_borrowed(&e->args, true);
+            emit_args_held(&e->args, true);
             buf_puts(out, ");");
             if (!v) buf_printf(out, " ocr%d_;", id);
             buf_puts(out, " })");
@@ -4018,7 +4274,7 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, "; ");
             emit_closure_call_prefix(e->lhs->type);
             buf_printf(out, "cc%d_->fn)(cc%d_", id, id);
-            emit_args_borrowed(&e->args, true);
+            emit_args_held(&e->args, true);
             buf_puts(out, "); })");
             return;
         }
@@ -4028,13 +4284,14 @@ static void emit_expr_raw(Expr *e) {
             emit_borrowed(e->lhs);
             buf_puts(out, ")->fn)(");
             emit_borrowed(e->lhs);
-            emit_args_borrowed(&e->args, true);
+            emit_args_held(&e->args, true);
             buf_puts(out, ")");
             return;
         }
         if (e->par_native) buf_printf(out, "%s_par(", e->func->cname); /* xisto:parallel on the pool */
         else buf_printf(out, "%s(", e->builtin.cfn ? e->builtin.cfn : rg_call_name(e->func));
-        emit_args_borrowed(&e->args, false);
+        if ((!e->builtin.cfn && fn_may_drop(e->func)) || args_have_fn(&e->args)) emit_args_held(&e->args, false); /* (XB-215) */
+        else emit_args_borrowed(&e->args, false);
         buf_puts(out, ")");
         return;
     case E_INDEX:
@@ -4130,7 +4387,7 @@ static void emit_expr_raw(Expr *e) {
             for (int i = 0; i < e->args.len; i++) { /* a consumed parameter takes an owned reference: a new value moves in */
                 if (i) buf_puts(out, ", ");
                 if (ct && i < ct->nparams && ct->params[i].consumed) emit_owned(e->args.items[i]);
-                else emit_borrowed(e->args.items[i]);
+                else emit_held(e->args.items[i]);
             }
         }
         buf_puts(out, ")");
@@ -14144,6 +14401,7 @@ void emit_program(Program *p, Buf *o) {
         *out = joined;
     }
     if (cell_fns.data) { buf_puts(out, cell_fns.data); cell_fns.len = 0; cell_fns.data[0] = 0; ncell = 0; }
+    if (ifld_fns.data) { buf_puts(out, ifld_fns.data); ifld_fns.len = 0; ifld_fns.data[0] = 0; nifld = 0; }
     if (json_unknown_used) {
         /* every class JSON can write, for the values an unknown holds */
         int ncls = 0;
