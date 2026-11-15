@@ -183,7 +183,14 @@ static char *vformat(const char *fmt, va_list ap) {
     return msg;
 }
 
+/* checking code the program may not use (a promise version, XB-231): its errors are counted here, not reported */
+bool xs_diag_mute;
+int xs_muted_errors;
 void xs_error(DiagCode code, Pos pos, const char *help, const char *fmt, ...) {
+    if (xs_diag_mute) {
+        xs_muted_errors++;
+        if (xs_error_recover) _longjmp(*xs_error_recover, 1);
+    }
     va_list ap;
     va_start(ap, fmt);
     char *msg = vformat(fmt, ap);
@@ -196,6 +203,7 @@ void xs_error(DiagCode code, Pos pos, const char *help, const char *fmt, ...) {
 }
 
 void xs_error_continue(DiagCode code, Pos pos, const char *help, const char *fmt, ...) {
+    if (xs_diag_mute) { xs_muted_errors++; return; }
     va_list ap;
     va_start(ap, fmt);
     char *msg = vformat(fmt, ap);
@@ -206,7 +214,8 @@ void xs_error_continue(DiagCode code, Pos pos, const char *help, const char *fmt
 
 /* stops checking the current statement for an error already reported (a use of a failed declaration) */
 void xs_error_quiet(void) {
-    xs_quiet_count++;
+    if (xs_diag_mute) xs_muted_errors++;
+    else xs_quiet_count++;
     if (xs_error_recover) _longjmp(*xs_error_recover, 1);
     exit(1);
 }
@@ -217,7 +226,7 @@ bool xs_node_compat = false;
 int xs_warning_count;
 
 void xs_warn(Pos pos, const char *help, const char *fmt, ...) {
-    if (!xs_warnings) return;
+    if (!xs_warnings || xs_diag_mute) return;
     va_list ap;
     va_start(ap, fmt);
     char *msg = vformat(fmt, ap);
@@ -264,7 +273,7 @@ static bool warned_before(DiagCode code, Pos pos) {
     return false;
 }
 void xs_warn_rule(DiagCode code, Pos pos, const char *help, const char *fmt, ...) {
-    if (in_package_file()) return;
+    if (in_package_file() || xs_diag_mute) return;
     if (warned_before(code, pos)) return;
     va_list ap;
     va_start(ap, fmt);
