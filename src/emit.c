@@ -1474,6 +1474,42 @@ static Stmt *bce_fw_loop; /* the loop whose emission uses them (NULL: none) */
 static bool bce_same_bx(Expr *a, Expr *b);
 static bool bce_same(Expr *a, Expr *b);
 static bool bce_fw_is(Expr *e, Expr *slot) { return e && slot && e->kind == E_INDEX && bce_same_bx(e->lhs, slot->lhs) && bce_same(e->rhs, slot->rhs); }
+/* XB-216: X[i] of an array of arrays (or objects) can be a hole (new Array<T[]>(n), an element never set), which the
+   type does not say: reading through it (X[i][j], X[i].f, X[i].length, X[i].m()) is JavaScript's TypeError
+   "Cannot read properties of undefined (reading 'j')", catchable, not a fault. The element is held in a temporary
+   and tested once; the guarded loops of bce (a column's rows read through bce_col_rd) test the rows already. */
+static bool hole_read(Expr *b) {
+    if (!b || b->kind != E_INDEX || b->builtin.cfn || !b->lhs || !b->lhs->type || b->lhs->type->kind != TY_ARRAY) return false;
+    if (!arr_is_ref(b->lhs->type) || !b->type || b->type->kind == TY_NULLABLE || !cref(b->type)) return false;
+    return true;
+}
+static Expr *hole_set_target; /* the left side of the `=` being emitted: X[i][j] = v "sets" (Node's other wording) */
+/* opens ({ T hbN_ = <b>; if (!hbN_) TypeError; and puts a variable of hbN_ in *slot (put back by hole_close) */
+static Expr *hole_open(Expr **slot, Expr *key_idx, const char *key, Pos pos, bool set) {
+    static int nhb;
+    int id = nhb++;
+    Expr *b = *slot;
+    buf_printf(out, "({ %s hb%d_ = ", ctype(b->type), id);
+    emit_borrowed(b);
+    char *msg;
+    const char *rd = set ? "set properties of undefined (setting" : "read properties of undefined (reading";
+    if (key) msg = xs_sprintf("\"TypeError: Cannot %s '%s')\"", rd, key);
+    else if (key_idx && key_idx->kind == E_NUMBER && key_idx->num == (double)(int64_t)key_idx->num)
+        msg = xs_sprintf("\"TypeError: Cannot %s '%lld')\"", rd, (long long)key_idx->num);
+    else if (key_idx && key_idx->kind == E_IDENT && key_idx->cname && key_idx->type && int_like(key_idx->type))
+        msg = xs_sprintf("xs_hole_msg_i(%s, %d)", ren(key_idx->cname), set);
+    else msg = xs_sprintf("\"TypeError: Cannot %s an element of a hole)\"", rd);
+    buf_printf(out, "; if (__builtin_expect(!hb%d_, 0)) XS_FAIL(%s, XS_S(%d)); ", id, msg, new_site(pos));
+    Expr *v = xs_alloc(sizeof *v);
+    v->kind = E_IDENT; v->pos = b->pos; v->field = -1; v->type = b->type; v->cname = xs_sprintf("hb%d_", id); v->str = v->cname;
+    *slot = v;
+    return b;
+}
+static void hole_close(Expr **slot, Expr *was) {
+    *slot = was;
+    buf_puts(out, "; })");
+}
+
 static void emit_lvalue_ptr(Expr *e) {
     if (bce_fw_loop && e->kind == E_INDEX)
         for (int k = 0; k < nbce_fw; k++) if (bce_fw_is(e, bce_fw[k].r)) { buf_printf(out, "&fm%d_", bce_fw[k].id); return; }
@@ -1498,6 +1534,12 @@ static void emit_lvalue_ptr(Expr *e) {
         buf_printf(out, "&%s", ren(e->cname));
         return;
     case E_MEMBER: {
+        if (hole_read(e->lhs)) { /* X[i].f = v with X[i] a hole: a TypeError (XB-216) */
+            Expr *was = hole_open(&e->lhs, NULL, e->str, e->pos, e == hole_set_target);
+            emit_lvalue_ptr(e);
+            hole_close(&e->lhs, was);
+            return;
+        }
         const char *ifl = ifld_fn(e->cls, e->field, e->pos); /* (XB-200) */
         if (ifl) {
             buf_printf(out, "%s(", ifl);
@@ -1511,6 +1553,12 @@ static void emit_lvalue_ptr(Expr *e) {
         return;
     }
     default: /* E_INDEX */
+        if (hole_read(e->lhs)) { /* X[i][j] with X[i] a hole: a TypeError (XB-216) */
+            Expr *was = hole_open(&e->lhs, e->rhs, NULL, e->pos, e == hole_set_target);
+            emit_lvalue_ptr(e);
+            hole_close(&e->lhs, was);
+            return;
+        }
         if (is_f64_type(e->lhs->type) || is_f32_type(e->lhs->type) || is_i32_type(e->lhs->type)) { /* f[i] on a Float64Array: its data, as a number[]'s
                                                                          (a float * on a Float32Array's, an int32_t * on an Int32Array's) */
             bool safe = bce_safe(e);
@@ -1921,6 +1969,12 @@ static void emit_union_class_test(Type *u, const char *field, const char *lit, c
 }
 
 static void emit_member(Expr *e) {
+    if (hole_read(e->lhs)) { /* X[i].f, X[i].length, X[i].m() with X[i] a hole: a TypeError (XB-216) */
+        Expr *was = hole_open(&e->lhs, NULL, e->str, e->pos, false);
+        emit_member(e);
+        hole_close(&e->lhs, was);
+        return;
+    }
     Expr *base = e->lhs;
     if (e->builtin.cfn && strcmp(e->builtin.cfn, "union_field") == 0) { /* s.kind on a union: by the object's class */
         Type *u = e->elem_type;
@@ -3812,6 +3866,7 @@ static void emit_expr_raw(Expr *e) {
         buf_puts(out, ")");
         return;
     case E_ASSIGN:
+        if (e->op == TK_ASSIGN) hole_set_target = e->lhs; /* (XB-216) */
         if (bce_fw_loop && e->op == TK_ASSIGN)
             for (int k = 0; k < nbce_fw; k++)
                 if (bce_fw_is(e->lhs, bce_fw[k].w)) { /* the carried value: stored, and kept for the next iteration */

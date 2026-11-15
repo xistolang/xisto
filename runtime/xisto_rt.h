@@ -551,6 +551,12 @@ __attribute__((noinline)) static void xs_panic_at(const char *msg, const xs_site
     if (!xs_never) exit(70);
 }
 static void xs_panic(const char *msg) { xs_panic_at(msg, NULL); }
+/* the message of X[i][j] on a hole of X (XB-216), as Node words it */
+XS_NOINLINE const char *xs_hole_msg_i(int64_t i, int set) {
+    static char m[96];
+    snprintf(m, sizeof m, set ? "TypeError: Cannot set properties of undefined (setting '%lld')" : "TypeError: Cannot read properties of undefined (reading '%lld')", (long long)i);
+    return m;
+}
 
 /* integer to decimal without printf: the hot path of JSON serialization */
 static size_t xs_itoa(int64_t v, char *out /* >= 21 bytes */) {
