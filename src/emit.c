@@ -4019,9 +4019,12 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, " })");
             return;
         }
+        bool fld_path = false; /* o.f, this.a.f: a field read off a variable, safe to read twice (mk().f is not: mk runs once) */
+        for (Expr *p = e->lhs; p && p->kind == E_MEMBER && !p->is_call; p = p->lhs)
+            if (p->lhs && (p->lhs->kind == E_IDENT || p->lhs->kind == E_THIS)) fld_path = true;
         if (e->lhs && e->lhs->type && e->lhs->type->kind == TY_FUNC && !e->func && !e->builtin.cfn &&
-            e->lhs->kind != E_IDENT && e->lhs->kind != E_THIS && !(e->lhs->kind == E_MEMBER && !e->lhs->is_call)) {
-            /* (() => ...)(), f(a)(b): the function value once, in a temporary */
+            e->lhs->kind != E_IDENT && e->lhs->kind != E_THIS && !fld_path) {
+            /* (() => ...)(), f(a)(b), mk().f(x): the function value once, in a temporary */
             static int ncc;
             int id = ncc++;
             buf_printf(out, "({ xs_closure *cc%d_ = (xs_closure *)", id);
