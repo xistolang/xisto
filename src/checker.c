@@ -3106,7 +3106,8 @@ static const char **member_names(Class *c, int *n) {
 /* ---- closures that capture by reference: a variable a closure captures and someone reassigns lives in a heap
    cell shared by the function and its closures; every other capture stays a copy (no cost). Found by name per
    function (or module): a use at a deeper arrow than the declaration, and an assignment anywhere. A `let` in a
-   for header keeps JavaScript's copy per iteration unless a closure itself assigns it. ---- */
+   for header keeps JavaScript's copy per iteration unless a closure or the body assigns it (then a cell per
+   iteration, emit_for_); the loop's own update alone does not need one. ---- */
 typedef struct { const char *name; int depth; char kind; } ScanEv; /* d declared, u used, a assigned; b / e: a block or closure opens / closes (name "") */
 static ScanEv *sev;
 static int nsev, cap_sev;
@@ -3118,10 +3119,16 @@ static void scan_ev(const char *name, int depth, char kind) {
 }
 static void scan_stmt(Stmt *s, int depth);
 static void scan_stmt_inner(Stmt *s, int depth);
+/* a for loop's update (k++, or i++, j-- of `let i = 0, j = n`) assigns between two iterations, after the copy to the
+   next one: kind 'p', which a closure of the iteration that ended never sees (an assignment in the body is 'a': it
+   does); for any other variable 'p' counts as 'a' */
+static bool scan_upd;
+static int scan_upd_depth;
 static void scan_expr(Expr *e, int depth) {
     if (!e) return;
     if (e->kind == E_IDENT && e->str) scan_ev(e->str, depth, 'u');
-    if ((e->kind == E_ASSIGN || e->kind == E_POSTFIX) && e->lhs && e->lhs->kind == E_IDENT) scan_ev(e->lhs->str, depth, 'a');
+    if ((e->kind == E_ASSIGN || e->kind == E_POSTFIX) && e->lhs && e->lhs->kind == E_IDENT)
+        scan_ev(e->lhs->str, depth, scan_upd && depth == scan_upd_depth ? 'p' : 'a');
     if (e->kind == E_ARROW) {
         scan_ev("", depth + 1, 'b');
         for (int i = 0; i < e->arrow->fn->nparams; i++) scan_ev(e->arrow->fn->params[i].name, depth + 1, 'd');
@@ -3149,14 +3156,22 @@ static void scan_stmt_inner(Stmt *s, int depth) {
     scan_expr(s->expr, depth);
     scan_expr(s->cond, depth);
     scan_stmt(s->for_init, depth);
-    scan_expr(s->for_update, depth);
+    {
+        bool un = scan_upd;
+        int ud = scan_upd_depth;
+        scan_upd = s->kind == S_FOR;
+        scan_upd_depth = depth;
+        scan_expr(s->for_update, depth);
+        scan_upd = un;
+        scan_upd_depth = ud;
+    }
     scan_stmt(s->body, depth);
     scan_stmt(s->else_body, depth);
     for (int i = 0; i < s->stmts.len; i++) scan_stmt(s->stmts.items[i], depth);
     for (int i = 0; i < s->ncases; i++) { scan_expr(s->cases[i].value, depth); scan_stmt(s->cases[i].body, depth); }
 }
 static bool boxed_name(const char *name, int decl_depth, bool for_init) {
-    bool captured = false, assigned = false, assigned_inside = false;
+    bool captured = false, assigned = false, assigned_inside = false, assigned_body = false;
     int nest = 0, shadow = -1; /* a closure's own variable of this name (a loop's k inside a closure): its events are another variable's */
     for (int i = 0; i < nsev; i++) {
         if (sev[i].kind == 'b') { nest++; continue; }
@@ -3165,9 +3180,10 @@ static bool boxed_name(const char *name, int decl_depth, bool for_init) {
         if (sev[i].kind == 'd' && sev[i].depth > decl_depth && shadow < 0) shadow = nest;
         if (shadow >= 0) continue;
         if (sev[i].kind == 'u' && sev[i].depth > decl_depth) captured = true;
-        if (sev[i].kind == 'a') { assigned = true; if (sev[i].depth > decl_depth) assigned_inside = true; }
+        if (sev[i].kind == 'a' || sev[i].kind == 'p') { assigned = true; if (sev[i].depth > decl_depth) assigned_inside = true; }
+        if (sev[i].kind == 'a') assigned_body = true;
     }
-    return captured && (for_init ? assigned_inside : assigned);
+    return captured && (for_init ? assigned_inside || assigned_body : assigned);
 }
 /* XB-202, XB-215: the names a module's functions, methods and closures assign. A module variable of one of those names
    may change during any call: narrowed to not null, each read after is checked (as a variable in a cell is); passed
