@@ -40,7 +40,7 @@ The same client program (`bench/http/client.ts`, 20,000 sequential requests agai
 and peaks at 2.44 MB on xisto, 1.01 s and 35.98 MB on Bun, 1.72 s and 218.11 MB on Node.
 
 On 7 Nov xisto served 231,097 req/s on `/ping` with 4.20 MB after the load; the server now answers more (the
-system calls a request no longer makes, see [TechEmpower](./techempower.md)) and holds about 2 MB more after the
+system calls a request no longer makes, see [TechEmpower](./techempower/index.md)) and holds about 2 MB more after the
 load, which is being looked into.
 
 ## Todo API
@@ -150,7 +150,7 @@ one port; Node runs a cluster, Bun `reusePort`. Source: `bench/results/2026-11-1
 On macOS more workers add CPU per request without adding throughput: the kernel does not spread connections
 between sockets on one port (`SO_REUSEPORT`), so the workers share one, and the load generator competes for the same
 cores. On Linux each worker has its own socket since 14 Nov and two workers serve more than one (see
-[TechEmpower](./techempower.md)). Threads also pay off for CPU-bound work (see [Benchmarks Game](./benchmarks-game/index.md)).
+[TechEmpower](./techempower/index.md)). Threads also pay off for CPU-bound work (see [Benchmarks Game](./benchmarks-game/index.md)).
 
 ## Resilience
 

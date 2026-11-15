@@ -64,7 +64,7 @@ The per-kernel tables, with the C reference beside them, are on [PolyBench](./po
 
 Xisto's native server is first on both tests, ahead of actix-web, and NestJS built with Xisto passes Go, Node and
 fastify. NestJS's workers without the handler lock crash (shared singletons). At high concurrency Xisto's tail
-latency (p99) is still worse than actix-web's. The per-level tables and charts are on [TechEmpower](./techempower.md).
+latency (p99) is still worse than actix-web's. The per-level tables and charts are on [TechEmpower](./techempower/index.md).
 
 ## Benchmarks Game against Node and Bun
 
@@ -98,7 +98,7 @@ program. Apple M4, 7 Nov 2026, `bench/results/2026-11-07-Apple-M4.csv`.
 
 - [Benchmarks Game](./benchmarks-game/index.md): against Rust, Node and Bun, per problem.
 - [PolyBench](./polybench/index.md): 30 numerical kernels against Rust and Go, per kernel.
-- [TechEmpower](./techempower.md): json and plaintext against actix, Go, Node, fastify and Bun.
+- [TechEmpower](./techempower/index.md): json and plaintext against actix, Go, Node, fastify and Bun.
 - [HTTP](./http.md): hello, Todo API, the Conduit NestJS app, threads, resilience, slow dependencies.
 - [Energy, SQLite, streams and micro programs](./energy-sqlite-streams.md).
 
