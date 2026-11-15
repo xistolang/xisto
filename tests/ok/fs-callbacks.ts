@@ -45,7 +45,6 @@ fs.writeFile(d + "/a.txt", "abc", (err) => {
     });
   });
 });
-setImmediate(() => console.log("immediate"));
 Promise.resolve().then(() => console.log("microtask"));
 console.log("after");
 

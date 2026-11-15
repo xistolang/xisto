@@ -487,20 +487,26 @@ static bool is_bytes(Type *t) {
     return t && t->kind == TY_OBJECT && t->cls->builtin && (strcmp(t->cls->name, "Uint8Array") == 0 || strcmp(t->cls->name, "Buffer") == 0);
 }
 /* node:fs's overloads by an option (runtime/node/fs.ts and its kin), as TypeScript picks them: F(p, { withFileTypes:
-   true }) calls F__withFileTypes, F(p, "utf8") and F(p, { encoding: "utf8" }) F__encoding, F(p, { throwIfNoEntry: false })
+   true }) calls F__withFileTypes, F(p, "utf8") and F(p, { encoding: "utf8" }) F__encoding (F__utf8 first, for UTF-8,
+   when there is one), F(p, { throwIfNoEntry: false })
    F__throwIfNoEntry_false, when the module declares that function; the option is read where it is written (a literal) */
 static Func *fs_option_variant(Expr *e, Func *f) {
     if (!f->mod || !f->mod->file || strncmp(f->mod->file, "xisto:fs", 8) != 0) return f;
     for (int i = 1; i < e->args.len; i++) {
         Expr *a = e->args.items[i];
-        int nk = a->kind == E_OBJLIT ? a->args.len : a->kind == E_STRING && i == 1 ? 1 : 0;
+        if (i >= f->nparams || !f->params[i].name || strcmp(f->params[i].name, "options") != 0) continue; /* (the parameter named options) */
+        int nk = a->kind == E_OBJLIT ? a->args.len : a->kind == E_STRING ? 1 : 0;
         for (int k = 0; k < nk; k++) {
             const char *key = a->kind == E_STRING ? "encoding" : a->keys[k];
             Expr *v = a->kind == E_STRING ? a : a->args.items[k];
             const char *vn = NULL;
-            if (!strcmp(key, "encoding") && v->kind == E_STRING && strcmp(v->str, "buffer") != 0) vn = "encoding";
-            else if (v->kind == E_BOOL) vn = v->boolean ? key : xs_sprintf("%s_false", key);
+            bool utf8 = false; /* F__utf8 before F__encoding (writeFileSync(p, text, "utf8") needs no other encoder) */
+            if (!strcmp(key, "encoding") && v->kind == E_STRING && strcmp(v->str, "buffer") != 0) {
+                vn = "encoding";
+                utf8 = !strcmp(v->str, "utf8") || !strcmp(v->str, "utf-8");
+            } else if (v->kind == E_BOOL) vn = v->boolean ? key : xs_sprintf("%s_false", key);
             if (!vn) continue;
+            if (utf8) SYM_EACH(funcs_by_name, xs_sprintf("%s__utf8", f->name), d) if (((Func *)d->decl)->mod == f->mod) return d->decl;
             char *want = xs_sprintf("%s__%s", f->name, vn);
             SYM_EACH(funcs_by_name, want, d) if (((Func *)d->decl)->mod == f->mod) return d->decl;
         }

@@ -676,6 +676,8 @@ export function __xs_fetch(url: string, init: RequestInit): Response {
 
 // ---- fileURLToPath / pathToFileURL ----
 
+declare function url_platform(): string;
+
 class UrlCodeError extends TypeError {
   code: string;
   constructor(code: string, message: string) {
@@ -689,7 +691,7 @@ export function fileURLToPath(url: string | URL): string {
   const u = typeof url === "string" ? new URL(url) : url;
   if (u.protocol !== "file:") throw new UrlCodeError("ERR_INVALID_URL_SCHEME", "The URL must be of scheme file");
   if (u.hostname !== "" && u.hostname !== "localhost") {
-    throw new UrlCodeError("ERR_INVALID_FILE_URL_HOST", `File URL host must be "localhost" or empty on ${process.platform}`);
+    throw new UrlCodeError("ERR_INVALID_FILE_URL_HOST", `File URL host must be "localhost" or empty on ${url_platform()}`);
   }
   const p = u.pathname;
   for (let i = 0; i + 2 < p.length; i++) {

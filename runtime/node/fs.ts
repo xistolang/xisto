@@ -28,6 +28,7 @@ declare function fs_mkdtemp(prefix: string): string;
 declare function fs_write_str(path: string, data: string, flags: string, mode: int): int;
 declare function fs_write_buf(path: string, data: Uint8Array, flags: string, mode: int): int;
 declare function fs_copy_file(src: string, dest: string, excl: boolean): int;
+declare function fs_date_ms(d: Date): number;
 
 // ---- errors ----
 
@@ -253,7 +254,7 @@ export interface CopyOptions {
 
 // ---- files ----
 
-function writeAll(path: string, data: string | Uint8Array, options: string | WriteFileOptions | undefined, flag: string): void {
+function writeAll(path: string, data: string | Uint8Array, options: string | WriteFileOptions | undefined, flag: string, other: boolean): void {
   let enc = "utf8";
   let mode: int = 0o666;
   let fl = flag;
@@ -265,22 +266,39 @@ function writeAll(path: string, data: string | Uint8Array, options: string | Wri
     fl = options.flag ?? flag;
   }
   let r: int = 0;
-  if (typeof data === "string") {
-    r = enc === "utf8" || enc === "utf-8" ? fs_write_str(path, data, fl, mode) : fs_write_buf(path, Buffer.alloc(Buffer.byteLength(data, enc), data, enc), fl, mode);
-  } else {
+  if (typeof data !== "string") {
     r = fs_write_buf(path, data, fl, mode);
+  } else if (enc === "utf8" || enc === "utf-8") {
+    r = fs_write_str(path, data, fl, mode);
+  } else if (other) {
+    r = fs_write_buf(path, Buffer.alloc(Buffer.byteLength(data, enc), data, enc), fl, mode);
+  } else {
+    throw new Error(`xisto: text in the encoding '${enc}' is written when the encoding is written where the call is: writeFileSync(path, text, "${enc}")`);
   }
   __fsCheck(r, "open", path);
 }
 
 /** Writes data (text, UTF-8 unless an encoding says otherwise, or bytes) to a file, replacing it. */
 export function writeFileSync(path: string, data: string | Uint8Array, options?: string | WriteFileOptions): void {
-  writeAll(path, data, options, "w");
+  writeAll(path, data, options, "w", false);
+}
+/** (the checker's choice for an encoding written in the call: "utf8" here, another one in __encoding) */
+export function writeFileSync__utf8(path: string, data: string | Uint8Array, options?: string | WriteFileOptions): void {
+  writeAll(path, data, options, "w", false);
+}
+export function writeFileSync__encoding(path: string, data: string | Uint8Array, options?: string | WriteFileOptions): void {
+  writeAll(path, data, options, "w", true);
 }
 
 /** Adds data at the end of a file, creating it when missing. */
 export function appendFileSync(path: string, data: string | Uint8Array, options?: string | WriteFileOptions): void {
-  writeAll(path, data, options, "a");
+  writeAll(path, data, options, "a", false);
+}
+export function appendFileSync__utf8(path: string, data: string | Uint8Array, options?: string | WriteFileOptions): void {
+  writeAll(path, data, options, "a", false);
+}
+export function appendFileSync__encoding(path: string, data: string | Uint8Array, options?: string | WriteFileOptions): void {
+  writeAll(path, data, options, "a", true);
 }
 
 /** Removes a file (or a symbolic link). */
@@ -315,7 +333,7 @@ export function accessSync(path: string, mode: int = 0): void {
 }
 
 function seconds(t: number | Date): number {
-  return typeof t === "number" ? t : t.getTime() / 1000;
+  return typeof t === "number" ? t : fs_date_ms(t) / 1000;
 }
 
 /** Sets the access and modification times (seconds since the epoch, or Dates). */
@@ -373,21 +391,22 @@ export function mkdtempSync(prefix: string, options: string | null = null): stri
 
 // ---- directories ----
 
-function mkdirp(path: string, mode: int): string | undefined {
+// mkdir -p: the first directory made (undefined when all were there); errors name `asked`, the path asked for
+function mkdirp(path: string, mode: int, asked: string): string | undefined {
   const r = fs_mkdir(path, mode);
   if (r === 0) return path;
   const code = __fsCode(r);
   if (code === "EEXIST") {
     const st = fs_stat(path, true, -1);
     if (st.length > 0 && (Math.trunc(st[1]) & 0o170000) === 0o040000) return undefined;
-    fs_throw(r, "mkdir", path, "");
+    fs_throw(r, "mkdir", asked, "");
   }
-  if (code !== "ENOENT") fs_throw(r, "mkdir", path, "");
+  if (code !== "ENOENT") fs_throw(r, "mkdir", asked, "");
   const parent = parentOf(path);
-  if (parent === path) fs_throw(r, "mkdir", path, "");
-  const first = mkdirp(parent, mode);
+  if (parent === path) fs_throw(r, "mkdir", asked, "");
+  const first = mkdirp(parent, mode, asked);
   const r2 = fs_mkdir(path, mode);
-  if (r2 < 0 && __fsCode(r2) !== "EEXIST") fs_throw(r2, "mkdir", path, "");
+  if (r2 < 0 && __fsCode(r2) !== "EEXIST") fs_throw(r2, "mkdir", asked, "");
   return first !== undefined ? first : r2 === 0 ? path : undefined;
 }
 
@@ -405,17 +424,7 @@ export function mkdirSync(path: string, options?: int | MkdirOptions): string | 
     __fsCheck(fs_mkdir(path, mode), "mkdir", path);
     return undefined;
   }
-  try {
-    return mkdirp(path, mode);
-  } catch (e: any) {
-    // (the error names the path asked for, as Node's)
-    const code: string = e.code;
-    if (code === "ENOTDIR" || code === "EEXIST" || code === "EACCES" || code === "ENOENT") {
-      const ee: int = e.errno;
-      fs_throw(ee, "mkdir", path, "");
-    }
-    throw e;
-  }
+  return mkdirp(path, mode, path);
 }
 
 export function rmdirSync(path: string, options?: RmdirOptions): void {

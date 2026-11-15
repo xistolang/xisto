@@ -6153,6 +6153,17 @@ XS_NOINLINE int64_t xs_fs_copy_file(xs_str *src, xs_str *dest, bool excl) {
     if (close(out) != 0 && !rc) rc = -(int64_t)errno;
     return rc;
 }
+XS_NOINLINE double xs_fs_date_ms(xs_Date *d) { return d->t; } /* (utimesSync of a Date; d.getTime() in xisto:fs would bring the event loop) */
+/* the platform's name, as process.platform gives it (fileURLToPath's errors name it without node:process) */
+XS_NOINLINE xs_str *xs_url_platform(void) {
+#if defined(__APPLE__)
+    return xs_str_new("darwin", 6);
+#elif defined(_WIN32)
+    return xs_str_new("win32", 5);
+#else
+    return xs_str_new("linux", 5);
+#endif
+}
 XS_NOINLINE xs_str *xs_fs_errcode_of(int64_t e) { /* the errno's name ("ENOENT"), or with e < 0 its words */
     const char *text, *code = xs_fs_err_name(e, &text);
     const char *s = e < 0 ? text : code;
