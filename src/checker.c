@@ -3503,6 +3503,66 @@ static bool json_target_u(Type *t) {
     return ok;
 }
 
+/* (__fo => (__fu0, __fu1...) => __fo(__fu0, __fu1...) [as R])(x), into e: the function x (of type ft) seen with another
+   return type: ret unknown (its primitive result boxed) where an unknown holds it, or, from an unknown back to a
+   function returning a primitive, the boxed result read as R (checked). x is evaluated once */
+static void fn_adapt(Expr *e, Expr *x, Type *ft, Type *ret, Type *unbox) {
+    Pos pos = e->pos;
+    Func *in = xs_alloc(sizeof *in);
+    in->pos = pos; in->name = "arrow";
+    in->params = xs_alloc(sizeof(Param) * (size_t)(ft->nparams + 1));
+    in->nparams = ft->nparams;
+    in->ret = ret;
+    Expr *fo = xs_alloc(sizeof *fo);
+    fo->kind = E_IDENT; fo->pos = pos; fo->field = -1; fo->str = "__fo";
+    Expr *call = xs_alloc(sizeof *call);
+    call->kind = E_CALL; call->pos = pos; call->field = -1; call->lhs = fo;
+    for (int i = 0; i < ft->nparams; i++) {
+        memset(&in->params[i], 0, sizeof(Param));
+        in->params[i].name = xs_sprintf("__fu%d", i);
+        in->params[i].type = ft->params[i];
+        Expr *id = xs_alloc(sizeof *id);
+        id->kind = E_IDENT; id->pos = pos; id->field = -1; id->str = in->params[i].name;
+        expr_list_push(&call->args, id);
+    }
+    Expr *val = call;
+    if (unbox) {
+        val = xs_alloc(sizeof *val);
+        val->kind = E_AS; val->pos = pos; val->field = -1; val->lhs = call; val->elem_type = unbox;
+    }
+    Stmt *ib = xs_alloc(sizeof *ib);
+    ib->kind = S_BLOCK; ib->pos = pos;
+    Stmt *ir = xs_alloc(sizeof *ir);
+    ir->kind = S_RETURN; ir->pos = pos; ir->expr = val;
+    stmt_list_push(&ib->stmts, ir);
+    in->body = ib;
+    Arrow *ia = xs_alloc(sizeof *ia);
+    ia->pos = pos; ia->fn = in; ia->expr_body = true;
+    Expr *inner = xs_alloc(sizeof *inner);
+    inner->kind = E_ARROW; inner->pos = pos; inner->field = -1; inner->arrow = ia;
+    Func *out = xs_alloc(sizeof *out);
+    out->pos = pos; out->name = "arrow";
+    out->params = xs_alloc(sizeof(Param) * 2);
+    out->nparams = 1;
+    memset(&out->params[0], 0, sizeof(Param));
+    out->params[0].name = "__fo";
+    out->params[0].type = ft;
+    out->ret = ty_func(ft->params, ft->nparams, ret);
+    Stmt *ob = xs_alloc(sizeof *ob);
+    ob->kind = S_BLOCK; ob->pos = pos;
+    Stmt *orr = xs_alloc(sizeof *orr);
+    orr->kind = S_RETURN; orr->pos = pos; orr->expr = inner;
+    stmt_list_push(&ob->stmts, orr);
+    out->body = ob;
+    Arrow *oa = xs_alloc(sizeof *oa);
+    oa->pos = pos; oa->fn = out; oa->expr_body = true;
+    Expr *outer = xs_alloc(sizeof *outer);
+    outer->kind = E_ARROW; outer->pos = pos; outer->field = -1; outer->arrow = oa;
+    memset(e, 0, sizeof *e);
+    e->kind = E_CALL; e->pos = pos; e->field = -1; e->lhs = outer;
+    expr_list_push(&e->args, x);
+    check_expr(e, NULL);
+}
 /* T -> unknown: references as they are, primitives boxed */
 static Expr *pure_copy(Expr *x);
 static void to_unknown(Expr *e) {
@@ -3545,6 +3605,10 @@ static void to_unknown(Expr *e) {
             memset(e, 0, sizeof *e);
             e->kind = E_ARROW; e->pos = pos; e->field = -1; e->arrow = a;
             check_expr(e, NULL);
+        } else if (!e->type->async_ret) { /* a closure with captures, a call's result...: adapted through a parameter (XB-219) */
+            Expr *x = expr_copy(e);
+            x->prechecked = true;
+            fn_adapt(e, x, x->type, ty_unknown, NULL);
         }
     }
     if (e->type->kind == TY_NULL) { e->type = ty_unknown; return; }
@@ -3819,6 +3883,11 @@ static bool dyn_to(Expr *e, Type *want) {
     }
     memset(e, 0, sizeof *e);
     e->kind = E_AS; e->pos = pos; e->field = -1; e->lhs = v; e->elem_type = want; e->type = want;
+    if (want->kind == TY_FUNC && want->ret && !ty_is_heap(want->ret) && want->ret->kind != TY_VOID && want->ret->kind != TY_UNKNOWN) {
+        e->type = NULL; /* (a function returning a primitive: read back through the adapter, see E_AS) */
+        v->prechecked = true;
+        check_expr(e, want);
+    }
     return true;
 }
 static bool unknown_target(Type *t) {
@@ -12618,6 +12687,17 @@ static void check_expr_in(Expr *e, Type *expected) {
             return;
         }
         if (v->type->kind == TY_UNKNOWN && shape_probe(e, v, want)) return;
+        if (v->type->kind == TY_UNKNOWN && want->kind == TY_FUNC && want->ret && !ty_is_heap(want->ret) && want->ret->kind != TY_VOID &&
+            want->ret->kind != TY_UNKNOWN && !want->async_ret) {
+            /* cb as (v: int) => int, cb an any: an unknown holds such a function returning unknown (to_unknown boxes its
+               result); read back through an adapter that unboxes it (XB-219) */
+            Type *g = ty_func(want->params, want->nparams, ty_unknown);
+            Expr *x = xs_alloc(sizeof *x);
+            x->kind = E_AS; x->pos = e->pos; x->field = -1; x->lhs = v; x->elem_type = g;
+            x->lhs->prechecked = true;
+            fn_adapt(e, x, g, want->ret, want->ret);
+            return;
+        }
         if (v->type->kind == TY_UNKNOWN) { /* checked at run time: the emitter compares the object's type */
             if (!unknown_target(want)) xs_error(XS2010, e->pos, NULL, "cannot check %s at run time", ty_name(want));
             Type *wi = want->kind == TY_NULLABLE ? want->elem : want;
