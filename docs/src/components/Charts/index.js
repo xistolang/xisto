@@ -53,7 +53,7 @@ function Tooltip({tip, docked}) {
  * Horizontal bars, largest first: one bar per server.
  * rows: [{name, value, highlight?, detail?: [[label, value], ...]}]; unit: axis caption.
  */
-export function BarChart({title, caption, rows, unit = 'requests per second', format = fmt, formatFull = full, lowerIsBetter = false, keepOrder = false}) {
+export function BarChart({title, caption, rows, unit = 'requests per second', format = fmt, formatFull = full, lowerIsBetter = false, keepOrder = false, refLine = null}) {
   const [ref, width] = useWidth(640);
   const [tip, setTip] = useState(null);
   // best first: the largest, or the smallest when less is better (CPU, memory, latency)
@@ -92,6 +92,9 @@ export function BarChart({title, caption, rows, unit = 'requests per second', fo
               <text x={x(t)} y={h - 8} textAnchor="middle" className={styles.axis}>{fmt(t)}</text>
             </g>
           ))}
+          {refLine != null && (
+            <line x1={x(refLine)} x2={x(refLine)} y1={top} y2={h - 24} className={styles.crosshair} strokeDasharray="4 3" />
+          )}
           {sorted.map((r, i) => {
             const y = top + i * band + barTop;
             const w = Math.max(2, x(r.value) - labelW);

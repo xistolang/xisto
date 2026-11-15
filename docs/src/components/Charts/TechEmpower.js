@@ -137,8 +137,9 @@ export function RatioBars({test, against}) {
       format={(v) => `${v.toFixed(2)}×`}
       formatFull={(v) => `${v.toFixed(2)}×`}
       keepOrder
+      refLine={1}
       rows={rows}
-      caption={`Accent: the levels where Xisto answers more requests; grey: where ${r.name} does.`}
+      caption={`The dashed line is 1×, the same requests per second. Accent: the levels where Xisto answers more; grey: where ${r.name} does.`}
     />
   );
 }
