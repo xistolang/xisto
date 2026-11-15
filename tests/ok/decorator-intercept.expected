@@ -1,0 +1,28 @@
+15
+x10
+13
+14
+60
+42
+203
+evaluate top
+evaluate bottom
+apply bottom to sum
+apply top to sum
+seen mul
+evaluate static
+apply static to twice
+get took true get
+other took true anon
+enter top
+enter bottom
+sum body
+leave bottom
+leave top
+enter static
+leave static
+enter top
+enter bottom
+sum body
+leave bottom
+leave top
