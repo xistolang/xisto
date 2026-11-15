@@ -25,8 +25,7 @@ Two apps:
 
 **Node and Bun on the TFB app come with the next VM round.** Their builds are ready (`bench/techempower/nest-node`:
 the same `main.ts` compiled with `tsc`, one process per CPU with `node:cluster`, as the TFB's own Nest app runs) and
-pass the TechEmpower validator; the charts below fill in from the data when they are measured. Bun is not measured on
-Conduit yet.
+pass the TechEmpower validator; the charts below fill in from the data when they are measured.
 
 </Pending>
 
@@ -88,30 +87,52 @@ On Node and Bun the app runs as the TFB's own NestJS app does: compiled with `ts
 ## Conduit: a real NestJS app
 
 [Conduit](https://github.com/lujakob/nestjs-realworld-example-app), the public RealWorld example built with NestJS
-(guards, JWT, argon2, Postgres, Redis), built with Xisto 0.4.1 and run on Node v26.12.0, on an Apple M4, 14 Nov 2026.
-Xisto starts in **20 ms** against Node's 267 ms and rests at **7.3 MB** against 137.3 MB.
+(guards, JWT, argon2, Postgres, Redis), built with Xisto and run on Node v26.12.0 and Bun 1.4.4, in one session on an
+Apple M4, 15 Nov 2026 (`bench/results/conduit-mac-2026-11-15.txt`).
 
 <BarChart
-  title="Conduit: Xisto's requests per second ÷ Node's, per route (above 1× Xisto answers more)"
-  unit="times"
-  keepOrder
-  refLine={1}
-  format={(v) => `${v.toFixed(2)}×`}
-  formatFull={(v) => `${v.toFixed(2)}×`}
+  title="Conduit: startup, from exec to the first 200, in ms (lower is better)"
+  unit="ms"
+  lowerIsBetter
+  format={(v) => v.toFixed(0)}
+  formatFull={(v) => `${v.toFixed(0)} ms`}
   rows={[
-    {name: 'current user (guard, JWT, query)', value: 8357 / 6123, highlight: true, detail: [['Xisto req/s', '8,357'], ['Node req/s', '6,123']]},
-    {name: 'login (argon2)', value: 65 / 43, highlight: true, detail: [['Xisto req/s', '65'], ['Node req/s', '43']]},
-    {name: 'tags', value: 16508 / 13821, highlight: true, detail: [['Xisto req/s', '16,508'], ['Node req/s', '13,821']]},
-    {name: 'article list (2 queries)', value: 16236 / 15922, highlight: true, detail: [['Xisto req/s', '16,236'], ['Node req/s', '15,922']]},
-    {name: 'article by slug', value: 25363 / 33754, detail: [['Xisto req/s', '25,363'], ['Node req/s', '33,754']]},
-    {name: 'article list, no cache', value: 5545 / 4954, highlight: true, detail: [['Xisto req/s', '5,545'], ['Node req/s', '4,954']]},
-    {name: 'article by slug, no cache', value: 8179 / 7263, highlight: true, detail: [['Xisto req/s', '8,179'], ['Node req/s', '7,263']]},
+    {name: 'Xisto', value: 26, highlight: true, detail: []},
+    {name: 'Bun', value: 214, detail: []},
+    {name: 'Node', value: 264, detail: []},
   ]}
-  caption="20 connections, 30 s per route; the first five with the Redis cache warm, the last two with Redis stopped. The dashed line is 1×; grey: the route where Node answers more. Every value is in the tables on the vs Node page."
+  caption="The median of 5 fresh starts, until GET /api/tags answers."
 />
 
-The full tables (p99, CPU, memory per route, cold and warm latency) are on [vs Node](./vs-node.md#conduit-a-real-nestjs-app).
-Bun on Conduit is not measured yet.
+<BarChart
+  title="Conduit: memory after the load, in MB (lower is better)"
+  unit="MB"
+  lowerIsBetter
+  format={(v) => v.toFixed(1)}
+  formatFull={(v) => `${v.toFixed(1)} MB`}
+  rows={[
+    {name: 'Xisto', value: 11.6, highlight: true, detail: [['at rest', '7.5 MB']]},
+    {name: 'Bun', value: 130.8, detail: [['at rest', '76.5 MB']]},
+    {name: 'Node', value: 154.4, detail: [['at rest', '142.5 MB']]},
+  ]}
+  caption="Resident memory of the server process after every route's load; at rest in the tooltip."
+/>
+
+Requests per second, 20 connections, 30 s per route:
+
+| route | Xisto | Node | Bun |
+|---|---:|---:|---:|
+| current user (guard, JWT, query) | **8,134** | 6,528 | 7,213 |
+| tags | **17,373** | 15,731 | 15,124 |
+| login (argon2) | **65** | 45 | 44 |
+| article list, cache warm | 15,361 | 14,497 | **19,572** |
+| article by slug, cache warm | 23,803 | 34,153 | **38,660** |
+| article list, no cache | **5,956** | 5,431 | 5,237 |
+| article by slug, no cache | **8,550** | 7,920 | 7,508 |
+
+Xisto answers the most on five of the seven routes; on the two served from the Redis cache Bun is first and Node is
+ahead of Xisto on the article by slug. Every route, latency, CPU and memory number is on [vs Node](./vs-node.md) and
+[vs Bun](./vs-bun.md).
 
 ## See also
 

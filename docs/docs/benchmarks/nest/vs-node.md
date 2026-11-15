@@ -18,10 +18,11 @@ described on [NestJS](./index.md).
 ## Conduit: a real NestJS app
 
 [Conduit](https://github.com/lujakob/nestjs-realworld-example-app) is the public RealWorld example built with
-NestJS: controllers, guards, JWT, argon2, a Postgres database and a Redis cache. The same source was built with
-Xisto 0.4.1 and run on Node v26.12.0 (after `npm run build`). Postgres 16 and Redis 7 in local containers.
-20 connections, 30 s per route, startup the median of 5 fresh starts, cold latency the median of 10. Source:
-`bench/results/conduit-mac-2026-11-14.txt`.
+NestJS: controllers, guards, JWT, argon2, a Postgres database and a Redis cache. The same source, not one line
+changed, built with Xisto (main `c684667`) and run on Node v26.12.0 (after `npm run build`), on an Apple M4 (10 cores), 15 Nov 2026;
+Postgres 16 and Redis 7 in local containers. 20 connections, 30 s per route, startup the median of 5 fresh starts,
+cold latency the median of 10; every request of every run answered correctly. Source:
+`bench/results/conduit-mac-2026-11-15.txt` (Xisto, Node and Bun in one session).
 
 <BarChart
   title="Conduit: Xisto's requests per second ÷ Node's, per route (above 1× Xisto answers more)"
@@ -31,13 +32,13 @@ Xisto 0.4.1 and run on Node v26.12.0 (after `npm run build`). Postgres 16 and Re
   format={(v) => `${v.toFixed(2)}×`}
   formatFull={(v) => `${v.toFixed(2)}×`}
   rows={[
-    {name: 'current user (guard, JWT, query)', value: 8357 / 6123, highlight: true, detail: [['Xisto req/s', '8,357'], ['Node req/s', '6,123']]},
-    {name: 'login (argon2)', value: 65 / 43, highlight: true, detail: [['Xisto req/s', '65'], ['Node req/s', '43']]},
-    {name: 'tags', value: 16508 / 13821, highlight: true, detail: [['Xisto req/s', '16,508'], ['Node req/s', '13,821']]},
-    {name: 'article list (2 queries)', value: 16236 / 15922, highlight: true, detail: [['Xisto req/s', '16,236'], ['Node req/s', '15,922']]},
-    {name: 'article by slug', value: 25363 / 33754, detail: [['Xisto req/s', '25,363'], ['Node req/s', '33,754']]},
-    {name: 'article list, no cache', value: 5545 / 4954, highlight: true, detail: [['Xisto req/s', '5,545'], ['Node req/s', '4,954']]},
-    {name: 'article by slug, no cache', value: 8179 / 7263, highlight: true, detail: [['Xisto req/s', '8,179'], ['Node req/s', '7,263']]},
+    {name: 'current user (guard, JWT, query)', value: 8134 / 6528, highlight: true, detail: [['Xisto req/s', '8,134'], ['Node req/s', '6,528']]},
+    {name: 'login (argon2)', value: 65 / 45, highlight: true, detail: [['Xisto req/s', '65'], ['Node req/s', '45']]},
+    {name: 'tags', value: 17373 / 15731, highlight: true, detail: [['Xisto req/s', '17,373'], ['Node req/s', '15,731']]},
+    {name: 'article list (2 queries)', value: 15361 / 14497, highlight: true, detail: [['Xisto req/s', '15,361'], ['Node req/s', '14,497']]},
+    {name: 'article by slug', value: 23803 / 34153, detail: [['Xisto req/s', '23,803'], ['Node req/s', '34,153']]},
+    {name: 'article list, no cache', value: 5956 / 5431, highlight: true, detail: [['Xisto req/s', '5,956'], ['Node req/s', '5,431']]},
+    {name: 'article by slug, no cache', value: 8550 / 7920, highlight: true, detail: [['Xisto req/s', '8,550'], ['Node req/s', '7,920']]},
   ]}
   caption="20 connections, 30 s per route; the first five with the Redis cache warm, the last two with Redis stopped. The dashed line is 1×; grey: the route where Node answers more. Every value is in the tables below."
 />
@@ -50,16 +51,16 @@ Xisto 0.4.1 and run on Node v26.12.0 (after `npm run build`). Postgres 16 and Re
   format={(v) => v.toFixed(1)}
   formatFull={(v) => `${v.toFixed(1)} ms`}
   rows={[
-    {name: 'current user · Xisto', value: 46.2, highlight: true, detail: []},
-    {name: 'current user · Node', value: 137.0, detail: []},
-    {name: 'tags · Xisto', value: 19.8, highlight: true, detail: []},
-    {name: 'tags · Node', value: 39.6, detail: []},
-    {name: 'article list · Xisto', value: 41.0, highlight: true, detail: []},
-    {name: 'article list · Node', value: 48.0, detail: []},
-    {name: 'article by slug · Xisto', value: 20.8, highlight: true, detail: []},
-    {name: 'article by slug · Node', value: 19.5, detail: []},
+    {name: 'current user · Xisto', value: 63.1, highlight: true, detail: []},
+    {name: 'current user · Node', value: 129.1, detail: []},
+    {name: 'tags · Xisto', value: 26.7, highlight: true, detail: []},
+    {name: 'tags · Node', value: 34.9, detail: []},
+    {name: 'article list · Xisto', value: 43.9, highlight: true, detail: []},
+    {name: 'article list · Node', value: 51.3, detail: []},
+    {name: 'article by slug · Xisto', value: 25.0, highlight: true, detail: []},
+    {name: 'article by slug · Node', value: 19.8, detail: []},
   ]}
-  caption="The server's user + system time over the run divided by the requests it answered; login (argon2: 130 s against 225 s per 1,000) is in the table."
+  caption="The server's user + system time over the run divided by the requests it answered; login (argon2: 127 s against 210 s per 1,000) is in the table."
 />
 
 <BarChart
@@ -70,53 +71,54 @@ Xisto 0.4.1 and run on Node v26.12.0 (after `npm run build`). Postgres 16 and Re
   format={(v) => v.toFixed(1)}
   formatFull={(v) => `${v.toFixed(1)} MB`}
   rows={[
-    {name: 'at rest · Xisto', value: 7.3, highlight: true, detail: []},
-    {name: 'at rest · Node', value: 137.3, detail: []},
-    {name: 'after the load · Xisto', value: 12.0, highlight: true, detail: []},
-    {name: 'after the load · Node', value: 234.5, detail: []},
+    {name: 'at rest · Xisto', value: 7.5, highlight: true, detail: []},
+    {name: 'at rest · Node', value: 142.5, detail: []},
+    {name: 'after the load · Xisto', value: 11.6, highlight: true, detail: []},
+    {name: 'after the load · Node', value: 154.4, detail: []},
   ]}
-  caption="Resident memory of the server process; startup to the first 200: 20 ms with Xisto, 267 ms with Node."
+  caption="Resident memory of the server process; startup to the first 200: 26 ms with Xisto, 264 ms with Node."
 />
 
-| | xisto | Node |
+**Node is ahead on the article by slug with the cache warm** (34,153 against 23,803 requests per second: one Redis
+read and a JSON answer), with less CPU per request there (19.8 against 25.0 ms per 1,000). Xisto answers more on
+every other route, with and without the cache, uses less CPU on all of them (half of Node's on the current user and
+on the article by slug without the cache), starts 10× faster and holds 11.6 MB after the load against 154.4 MB.
+Against the round of 14 Nov, Xisto's startup went from 20 to 26 ms and its current-user route from 46 to 63 ms of
+CPU per 1,000 requests (Xisto 0.4.1 then, main now); Node's routes moved between −9% and +14%; the Postgres and
+Redis containers were restarted in between.
+
+| | Xisto | Node |
 |---|---:|---:|
-| startup (to the first 200) | **20 ms** | 267 ms |
-| RSS at rest | **7.3 MB** | 137.3 MB |
-| RSS after the load | **12.0 MB** | 234.5 MB |
+| startup (to the first 200) | **26 ms** | 264 ms |
+| RSS at rest | **7.5 MB** | 142.5 MB |
+| RSS after the load | **11.6 MB** | 154.4 MB |
 
 Under load, with the Redis cache warm:
 
-| route | xisto req/s | Node req/s | xisto p99 | Node p99 | xisto CPU per 1k req | Node CPU per 1k req | xisto RSS | Node RSS |
+| route | Xisto req/s | Node req/s | Xisto p99 | Node p99 | Xisto CPU per 1k req | Node CPU per 1k req | Xisto RSS | Node RSS |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| article list (2 queries) | 16,236 | 15,922 | 2.89 ms | 3.51 ms | 41.0 ms | 48.0 ms | 23.0 MB | 170.0 MB |
-| article by slug | 25,363 | **33,754** | 1.83 ms | 1.65 ms | 20.8 ms | 19.5 ms | 11.0 MB | 164.1 MB |
-| current user (guard, JWT, query) | **8,357** | 6,123 | 4.20 ms | 5.56 ms | 46.2 ms | 137.0 ms | 10.8 MB | 153.0 MB |
-| tags | **16,508** | 13,821 | 2.41 ms | 2.71 ms | 19.8 ms | 39.6 ms | 10.2 MB | 145.6 MB |
-| login (argon2) | **65** | 43 | 352.47 ms | 574.88 ms | 130,057 ms | 224,858 ms | 203.1 MB | 402.8 MB |
+| article list (2 queries) | **15,361** | 14,497 | 2.81 ms | 4.35 ms | 43.9 ms | 51.3 ms | 12.5 MB | 167.4 MB |
+| article by slug | 23,803 | **34,153** | 2.03 ms | 1.53 ms | 25.0 ms | 19.8 ms | 11.5 MB | 148.6 MB |
+| current user (guard, JWT, query) | **8,134** | 6,528 | 4.27 ms | 4.86 ms | 63.1 ms | 129.1 ms | 11.2 MB | 162.0 MB |
+| tags | **17,373** | 15,731 | 2.40 ms | 2.34 ms | 26.7 ms | 34.9 ms | 11.0 MB | 150.2 MB |
+| login (argon2) | **65** | 45 | 379.83 ms | 528.74 ms | 127,182.7 ms | 210,270.7 ms | 203.3 MB | 406.1 MB |
 
 Without the cache (Redis stopped; every request reads Postgres):
 
-| route | xisto req/s | Node req/s | xisto CPU per 1k req | Node CPU per 1k req | xisto RSS | Node RSS |
-|---|---:|---:|---:|---:|---:|---:|
-| article list | 5,545 | 4,954 | 96.9 ms | 141.6 ms | 11.5 MB | 402.9 MB |
-| article by slug | 8,179 | 7,263 | 42.5 ms | 66.1 ms | 12.0 MB | 234.5 MB |
-
-**Node is ahead on the article by slug with the cache warm** (33,754 against 25,363 req/s: a Redis read and a JSON
-answer); xisto leads the other routes, uses less CPU per request on all but that one, and a tenth of the memory or
-less. Compared with the round of 8 Nov the database routes are slower on both sides (Node's article list without
-the cache 7,086 then, 4,954 now): the Postgres and Redis containers were made again for this round. A/B rounds in
-the same environment (`bench/results/conduit-mac-2026-11-14-ab.txt`) found no change from the compiler (main
-`40cdc16` against 0.4.1) nor from the packages (their main against the APM branch).
+| route | Xisto req/s | Node req/s | Xisto p99 | Node p99 | Xisto CPU per 1k req | Node CPU per 1k req | Xisto RSS | Node RSS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| article list | **5,956** | 5,431 | 6.10 ms | 6.42 ms | 92.1 ms | 122.9 ms | 11.5 MB | 304.8 MB |
+| article by slug | **8,550** | 7,920 | 4.15 ms | 4.25 ms | 32.2 ms | 61.1 ms | 11.6 MB | 154.4 MB |
 
 Single-request latency, cold (cache flushed) / warm, in ms:
 
-| route | xisto | Node |
+| route | Xisto | Node |
 |---|---:|---:|
-| article list | 2.09 / 0.51 | 2.43 / 0.49 |
-| article by slug | 1.59 / 0.39 | 2.02 / 0.53 |
-| current user | 1.09 / 0.63 | 1.92 / 1.00 |
-| tags | 0.90 / 0.47 | 1.22 / 0.55 |
-| login | 25.30 / 23.78 | 29.53 / 28.64 |
+| article list | 2.09 / 0.65 | 2.68 / 0.61 |
+| article by slug | 2.14 / 0.50 | 2.09 / 0.55 |
+| current user | 1.71 / 0.72 | 1.81 / 0.96 |
+| tags | 1.44 / 0.50 | 1.17 / 0.52 |
+| login | 21.83 / 22.75 | 30.87 / 29.82 |
 
 <Pending id="nest-node">
 

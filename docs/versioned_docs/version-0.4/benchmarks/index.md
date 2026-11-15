@@ -13,8 +13,8 @@ How they were measured is in [Methodology](../performance/methodology.md).
 - The Benchmarks Game against Rust was re-run on 13 Nov 2026 (main `4a2f388`), against Node and Bun the same day
   (main `e5fb066`), PolyBench against Rust and Go on 14 Nov (main `40cdc16`), TechEmpower on 14 Nov. The other tables are from 5–10 Nov.
 - Some rows are lost or tied, and they are shown, not dropped: Bun on a slow dependency at 1 and 5 ms (4–5%), energy
-  per HTTP request, streaming energy and SQLite time; Node on Conduit's article by slug with the cache warm; actix-web
-  on tail latency (p99) at high concurrency. The HTTP tables were re-measured on 14 Nov.
+  per HTTP request, streaming energy and SQLite time; Bun on Conduit's two cached routes and Node on its cached article
+  by slug; actix-web on tail latency (p99) at high concurrency. The HTTP tables were re-measured on 14 Nov.
 - Against Rust no Benchmarks Game problem is lost on either VM, and no PolyBench kernel against Rust or Go. Two rows are ties within 5%: spectral-norm on both VMs, at the
   floor of the divisions the problem asks for. xisto's peak memory is below Rust's on 9 of 10 rows on the Xeon (fannkuch-redux: 2.3 against
   2.2 MB) and on all 10 on the Graviton2.
@@ -67,9 +67,10 @@ still worse than actix-web's. The per-level tables and charts are on [TechEmpowe
 
 The same Nest app, unchanged, built with Xisto or run on Node and Bun. On the TechEmpower routes (Xeon VM, 14 Nov)
 the app built with Xisto serves 53,032 json requests per second in two processes with 16.2 MB; Node and Bun on that
-app come with the next VM round. On Conduit, the RealWorld app with Postgres and Redis (M4, 14 Nov), Xisto starts in
-20 ms against Node's 267 ms, rests at 7.3 MB against 137.3 MB, and answers more requests on every route but the
-article by slug with the cache warm. The charts and tables are on [NestJS](./nest/index.md).
+app come with the next VM round. On Conduit, the RealWorld app with Postgres and Redis (M4, 15 Nov), Xisto starts in
+26 ms against Bun's 214 and Node's 264, holds 11.6 MB after the load against 130.8 and 154.4 MB, and answers the most
+requests on five of seven routes; on the two served from the Redis cache Bun is first. The charts and tables are on
+[NestJS](./nest/index.md).
 
 ## Benchmarks Game against Node and Bun
 
@@ -87,8 +88,8 @@ xisto uses less CPU on every row but regex-redux against Bun on the M4 (0.37 s a
 | hello `/ping`, req/s | 244,918 | 127,738 | 183,577 | M4, 14 Nov, `2026-11-14-Apple-M4-http.csv` |
 | hello `/ping`, RSS after load | 6.39 MB | 78.14 MB | 35.56 MB | same |
 | Todo API list, req/s | 180,209 | 102,813 | 145,815 | M4, 14 Nov, `2026-11-14-Apple-M4-todo.csv` |
-| Conduit (NestJS) startup | 20 ms | 267 ms | — | M4, 14 Nov, `conduit-mac-2026-11-14.txt` |
-| Conduit RSS at rest | 7.3 MB | 137.3 MB | — | same |
+| Conduit (NestJS) startup | 26 ms | 264 ms | 214 ms | M4, 15 Nov, `conduit-mac-2026-11-15.txt` |
+| Conduit RSS at rest | 7.5 MB | 142.5 MB | 76.5 MB | same |
 
 ## What you ship
 
