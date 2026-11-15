@@ -4,6 +4,9 @@
 // "node:url". Parsing follows the WHATWG URL Standard for the special schemes (http, https, ws, wss, ftp, file):
 // lower-case scheme and host, default ports dropped, dot segments removed, percent-encoding per component; other
 // schemes keep an opaque path. Not here: IDNA (non-ASCII hosts), IPv4 shorthand (127.1), blob: origins.
+// fileURLToPath and pathToFileURL: node:url's, for POSIX paths.
+import { TypeError } from "xisto:errors";
+import { resolve as __resolvePath } from "xisto:path";
 
 
 function utf8(s: string): Uint8Array {
@@ -669,4 +672,48 @@ export function __xs_fetch(url: string, init: RequestInit): Response {
   }
   if (body !== null) return fetch(url, { method: method, headers: headers, body: body });
   return fetch(url, { method: method, headers: headers });
+}
+
+// ---- fileURLToPath / pathToFileURL ----
+
+declare function url_platform(): string;
+
+class UrlCodeError extends TypeError {
+  code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.code = code;
+  }
+}
+
+/** The path a file: URL names, decoded ("file:///a%20b" is "/a b"). */
+export function fileURLToPath(url: string | URL): string {
+  const u = typeof url === "string" ? new URL(url) : url;
+  if (u.protocol !== "file:") throw new UrlCodeError("ERR_INVALID_URL_SCHEME", "The URL must be of scheme file");
+  if (u.hostname !== "" && u.hostname !== "localhost") {
+    throw new UrlCodeError("ERR_INVALID_FILE_URL_HOST", `File URL host must be "localhost" or empty on ${url_platform()}`);
+  }
+  const p = u.pathname;
+  for (let i = 0; i + 2 < p.length; i++) {
+    if (p.charAt(i) === "%" && p.charAt(i + 1) === "2" && (p.charAt(i + 2) === "f" || p.charAt(i + 2) === "F")) {
+      throw new UrlCodeError("ERR_INVALID_FILE_URL_PATH", "File URL path must not include encoded / characters");
+    }
+  }
+  return decodeURIComponent(p);
+}
+
+/** The file: URL of a path (made absolute), its bytes percent-encoded as Node encodes them (spaces, %, #, ?...). */
+export function pathToFileURL(path: string): URL {
+  let abs = __resolvePath(path);
+  if (path.endsWith("/") && !abs.endsWith("/")) abs += "/";
+  const bytes = utf8(abs);
+  let out = "file://";
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    const keep = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 45 || b === 46 || b === 95 || b === 33 ||
+      b === 36 || b === 38 || b === 39 || b === 40 || b === 41 || b === 42 || b === 43 || b === 44 || b === 59 || b === 61 || b === 58 ||
+      b === 64 || b === 47;
+    out += keep ? String.fromCharCode(b) : pct(b);
+  }
+  return new URL(out);
 }

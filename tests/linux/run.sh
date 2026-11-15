@@ -15,12 +15,13 @@ for f in tests/ok/*.ts; do
     oracle=oracle/$name.node
     [ -f "$oracle" ] || continue
     if ! $X build -o $OUT/$name "$f" > $OUT/$name.build 2>&1; then echo "FAIL build $f"; head -5 $OUT/$name.build; fail=$((fail+1)); continue; fi
-    XISTO_RC_STATS=1 $OUT/$name > $OUT/$name.out 2> $OUT/$name.stats || true
+    in=/dev/null; [ -f "${f%.ts}.stdin" ] && in="${f%.ts}.stdin"   # (NAME.stdin: its standard input, as in tests/run.sh)
+    XISTO_RC_STATS=1 $OUT/$name < "$in" > $OUT/$name.out 2> $OUT/$name.stats || true
     if ! grep -q ' 0 still alive' $OUT/$name.stats; then echo "FAIL leak $f: $(cat $OUT/$name.stats)"; fail=$((fail+1)); continue; fi
     if cmp -s "$oracle" $OUT/$name.out; then pass=$((pass+1)); else echo "FAIL output $f"; diff "$oracle" $OUT/$name.out | head -6; fail=$((fail+1)); fi
     if $X build --backend=qbe -o $OUT/$name-qbe "$f" > /dev/null 2>&1; then
         qbe=$((qbe+1))
-        if $OUT/$name-qbe 2>/dev/null | cmp -s "$oracle" -; then pass=$((pass+1)); else echo "FAIL qbe $f"; fail=$((fail+1)); fi
+        if $OUT/$name-qbe < "$in" 2>/dev/null | cmp -s "$oracle" -; then pass=$((pass+1)); else echo "FAIL qbe $f"; fail=$((fail+1)); fi
     fi
 done
 for f in tests/err/*.ts; do

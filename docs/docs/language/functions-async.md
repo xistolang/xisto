@@ -17,6 +17,50 @@ const apply = (f: (x: int) => int, v: int): int => f(v);
 console.log(apply(add, 5), [1, 2, 3].map((x) => x * 2));   // 15 [ 2, 4, 6 ]
 ```
 
+## Methods as values: bind, call, apply
+
+A method read without a call, `obj.method`, is a function bound to `obj`. `bind`, `call` and `apply` work on
+methods and on function values; `bind` takes partial arguments and gives a function of the parameters left.
+
+```ts
+class Feed {
+  name = "feed";
+  got: string[] = [];
+  onData(chunk: string): void { this.got.push(this.name + ":" + chunk); }
+  fmt(n: number): string { return this.name + "#" + n; }
+  static create(): Feed { return new Feed(); }
+}
+const f = new Feed();
+const h = f.onData.bind(f);
+emitter.on("data", h);
+emitter.off("data", h);                    // the same function: removed
+[1, 2].map(f.fmt.bind(f));                 // [ 'feed#1', 'feed#2' ]
+[1, 2].map(f.fmt, f);                      // the same (thisArg is the method's own object)
+const add3 = (a: number, b: number, c: number): number => a + b + c;
+add3.bind(null, 1, 2)(3);                  // 6
+f.fmt.call(f, 7); add3.apply(null, [1, 2, 3]);
+const make = Feed.create;                  // a static method as a value
+console.log(add3.length, f.fmt.name);      // 3 fmt
+```
+
+What differs from JavaScript:
+
+- `const g = obj.method` is bound to `obj`. JavaScript reads it unbound: calling `g()` alone loses `this` (a
+  `TypeError` in a class). A program that works in JavaScript does the same here; one that would lose `this`
+  keeps it.
+- Each read of `obj.method` makes a new function, so `obj.method === obj.method` is `false` (JavaScript: `true`).
+  Keep the value in a variable or a field when you need the same function twice (`on`/`off`). Two `bind` calls
+  give two functions, as in JavaScript.
+- `a.m.bind(b)` and `a.m.call(b, ...)` run `b`'s `m` (`b`'s override, if its class has one). JavaScript runs the
+  `m` read from `a` with `this = b`. `thisArg` must be an object of the method's class.
+- On a function value or an arrow, `thisArg` of `bind`, `call` and `apply` is not used: arrows have no `this` of
+  their own, and xisto passes none to functions. `apply` takes an array literal or the array of a rest parameter.
+- `xs.map(fn, thisArg)` (and `forEach`, `filter`, `find`, `findIndex`, `some`, `every`) accepts a `thisArg` only
+  when it is the object of the method passed (`this.fmt, this`) or when `fn` is an arrow.
+- `f.length` counts the declared parameters (not a rest parameter); `f.name` is known for a top-level function,
+  a static method and `obj.method`. For a function held in a variable or a parameter it is an error (XS8013).
+- A generic method is not a value (XS8049): wrap it, `(x: T) => obj.m(x)`.
+
 ## Closures
 
 A closure captures by value when the variable is never reassigned after capture: a copy, no allocation. A

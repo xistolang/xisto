@@ -51,6 +51,9 @@ const bad: string = o.id;   // TypeError: the value is not string (Node goes on 
 
 A field that the object does not have reads as `null` (printed as `null`; Node prints `undefined`).
 
+String concatenation is not such a slot: `s + x` and `s += x` convert the `any` with `String(x)`, as JavaScript does.
+A Buffer gives its UTF-8 text, so `req.on("data", (c) => (body += c))` collects a request's body as in Node.
+
 ## The cost
 
 Reading a field through `any` costs ten times a typed read or more. Measured on an Apple M4 (12 Nov 2026), a loop

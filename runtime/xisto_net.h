@@ -1188,9 +1188,29 @@ XS_NOINLINE void xs_promise_reject(xs_promise *p, void *err) {
     p->err = err;
     xs_promise_settled(p);
 }
+/* process.on('unhandledRejection') (runtime/node/process.ts): its dispatcher, (reason, promise) => handled */
+static XS_TLS xs_closure *xs_rejection_cb;
+XS_NOINLINE void xs_unh_dispatch(void) {
+    while (xs_unh) {
+        xs_promise *p = xs_unh;
+        while (p->unh_next) p = p->unh_next; /* the first rejected */
+        xs_retain_(p);
+        xs_unh_drop(p);
+        p->handled = true;
+        size_t mark = xs_ar_mark();
+        bool handled = ((bool (*)(void *, void *, void *))xs_rejection_cb->fn)(xs_rejection_cb, p->err, p);
+        xs_ar_drain(mark);
+        if (!handled) { /* nothing listens (any more): back on the list, for the message below */
+            p->in_unh = true; p->unh_next = xs_unh; xs_unh = p;
+            return;
+        }
+        xs_release_(p);
+    }
+}
 /* a rejection that no handler took by the time the loop has nothing ready: the program ends, as in Node */
-static void xs_unh_check(void) {
+XS_NOINLINE void xs_unh_check(void) {
     if (!xs_unh) return;
+    if (xs_rejection_cb) { xs_unh_dispatch(); if (!xs_unh) return; }
     xs_promise *p = xs_unh;
     while (p->unh_next) p = p->unh_next; /* the first rejected */
     xs_Error *e = p->err;
@@ -1198,7 +1218,7 @@ static void xs_unh_check(void) {
     xs_out_drain();
     fprintf(stderr, "uncaught Error (in promise): %s\n", e->f_message->data);
     if (e->trace) xs_trace_print(e->trace, stderr);
-    if (!xs_never) exit(1);
+    if (!xs_never) xs_process_exit(1); /* (as exit(1), after the 'exit' listeners) */
 }
 
 /* resume a coroutine from inside another (a call that makes a promise starts its coroutine at once): the outer
@@ -1285,7 +1305,7 @@ XS_NOINLINE xs_promise *xs_promise_rejected(int kind, void *err) {
 }
 
 /* await p */
-static bool xs_promise_stop(void *p) {
+XS_NOINLINE bool xs_promise_stop(void *p) {
     xs_promise *q = p;
     if (q->state != 0) return true;
     if (xs_tasks_live == 0 && !xs_ready_head) { /* nothing left that could settle it: Node's loop would be empty */
@@ -3725,6 +3745,283 @@ XS_NOINLINE xs_str *xs_os_kernel_text(int64_t which) {
     return xs_str_new(s, strlen(s));
 #endif
 }
+/* os.machine(), os.uptime(), os.loadavg(), os.totalmem(), os.freemem(), os.userInfo(), os.networkInterfaces() and
+   os.constants, as libuv gives them to Node */
+#if !defined(_WIN32)
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <pwd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <net/if_dl.h>
+#include <sys/sysctl.h>
+#else
+#include <netpacket/packet.h>
+#include <sys/sysinfo.h>
+#endif
+#endif
+XS_NOINLINE xs_str *xs_os_machine_name(void) {
+#if defined(_WIN32)
+    return xs_os_arch_name();
+#else
+    struct utsname u;
+    if (uname(&u) != 0) return xs_str_new("", 0);
+    return xs_str_new(u.machine, strlen(u.machine));
+#endif
+}
+#if defined(__linux__)
+static double xs_os_meminfo(const char *key) { /* a /proc/meminfo line's kB, in bytes; -1 when missing */
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char line[256];
+    size_t kl = strlen(key);
+    double v = -1;
+    while (fgets(line, sizeof line, f))
+        if (strncmp(line, key, kl) == 0 && line[kl] == ':') { v = strtod(line + kl + 1, NULL) * 1024; break; }
+    fclose(f);
+    return v;
+}
+#endif
+/* [uptime s, load 1, 5, 15, total memory, free memory] */
+XS_NOINLINE xs_arr_num *xs_os_figures(void) {
+    xs_arr_num *a = xs_arr_num_new(0, 0);
+    double v[6] = {0, 0, 0, 0, 0, 0};
+#if defined(__APPLE__)
+    struct timeval bt;
+    size_t n = sizeof bt;
+    int mib[2] = {CTL_KERN, KERN_BOOTTIME};
+    if (sysctl(mib, 2, &bt, &n, NULL, 0) == 0) v[0] = (double)(time(NULL) - bt.tv_sec);
+    uint64_t mem = 0;
+    n = sizeof mem;
+    if (sysctlbyname("hw.memsize", &mem, &n, NULL, 0) == 0) v[4] = (double)mem;
+    vm_statistics_data_t vs;
+    mach_msg_type_number_t cnt = sizeof vs / sizeof(integer_t);
+    if (host_statistics(mach_host_self(), HOST_VM_INFO, (host_info_t)&vs, &cnt) == KERN_SUCCESS) v[5] = (double)vs.free_count * (double)sysconf(_SC_PAGESIZE);
+#elif defined(__linux__)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_BOOTTIME, &ts) == 0) v[0] = (double)ts.tv_sec + (double)(ts.tv_nsec / 10000000) / 100;
+    v[4] = xs_os_meminfo("MemTotal");
+    v[5] = xs_os_meminfo("MemAvailable");
+    struct sysinfo si;
+    if ((v[4] < 0 || v[5] < 0) && sysinfo(&si) == 0) {
+        if (v[4] < 0) v[4] = (double)si.totalram * si.mem_unit;
+        if (v[5] < 0) v[5] = (double)si.freeram * si.mem_unit;
+    }
+#endif
+#if !defined(_WIN32)
+    double l[3];
+    if (getloadavg(l, 3) == 3) { v[1] = l[0]; v[2] = l[1]; v[3] = l[2]; }
+#endif
+    for (int i = 0; i < 6; i++) xs_arr_num_push(a, v[i] < 0 ? 0 : v[i]);
+    return a;
+}
+/* [uid, gid, username, homedir, shell] of the effective user (uv_os_get_passwd); empty when unknown */
+XS_NOINLINE xs_arr_ref *xs_os_user_info(void) {
+    xs_arr_ref *a = xs_arr_ref_new(0, xs_print_str_quoted_);
+#if !defined(_WIN32)
+    struct passwd pw, *r = NULL;
+    char buf[4096];
+    if (getpwuid_r(geteuid(), &pw, buf, sizeof buf, &r) != 0 || !r) return a;
+    char num[32];
+    snprintf(num, sizeof num, "%lld", (long long)pw.pw_uid);
+    xs_arr_ref_push(a, xs_str_new(num, strlen(num)));
+    snprintf(num, sizeof num, "%lld", (long long)pw.pw_gid);
+    xs_arr_ref_push(a, xs_str_new(num, strlen(num)));
+    const char *f[3] = {pw.pw_name, pw.pw_dir, pw.pw_shell};
+    for (int i = 0; i < 3; i++) xs_arr_ref_push(a, xs_str_new(f[i] ? f[i] : "", f[i] ? strlen(f[i]) : 0));
+#endif
+    return a;
+}
+/* one string per address of an interface that is up: name \t family \t address \t netmask \t mac \t internal \t scope id */
+XS_NOINLINE xs_arr_ref *xs_os_interfaces(void) {
+    xs_arr_ref *a = xs_arr_ref_new(0, xs_print_str_quoted_);
+#if !defined(_WIN32)
+    struct ifaddrs *all, *e;
+    if (getifaddrs(&all) != 0) return a;
+    for (e = all; e; e = e->ifa_next) {
+        if (!((e->ifa_flags & IFF_UP) && (e->ifa_flags & IFF_RUNNING)) || !e->ifa_addr) continue;
+        int fam = e->ifa_addr->sa_family;
+        if (fam != AF_INET && fam != AF_INET6) continue;
+        char addr[INET6_ADDRSTRLEN] = "", mask[INET6_ADDRSTRLEN] = "", mac[18] = "00:00:00:00:00:00";
+        unsigned scope = 0;
+        if (fam == AF_INET) {
+            inet_ntop(AF_INET, &((struct sockaddr_in *)e->ifa_addr)->sin_addr, addr, sizeof addr);
+            if (e->ifa_netmask) inet_ntop(AF_INET, &((struct sockaddr_in *)e->ifa_netmask)->sin_addr, mask, sizeof mask);
+        } else {
+            struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)e->ifa_addr;
+            inet_ntop(AF_INET6, &s6->sin6_addr, addr, sizeof addr);
+            scope = s6->sin6_scope_id;
+            if (e->ifa_netmask) inet_ntop(AF_INET6, &((struct sockaddr_in6 *)e->ifa_netmask)->sin6_addr, mask, sizeof mask);
+        }
+        for (struct ifaddrs *l = all; l; l = l->ifa_next) { /* the interface's hardware address */
+            if (!l->ifa_addr || strcmp(l->ifa_name, e->ifa_name) != 0) continue;
+            const unsigned char *m = NULL;
+#if defined(__APPLE__)
+            if (l->ifa_addr->sa_family == AF_LINK) m = (const unsigned char *)LLADDR((struct sockaddr_dl *)l->ifa_addr);
+#else
+            if (l->ifa_addr->sa_family == AF_PACKET) m = ((struct sockaddr_ll *)l->ifa_addr)->sll_addr;
+#endif
+            if (m) { snprintf(mac, sizeof mac, "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]); break; }
+        }
+        char line[512];
+        int n = snprintf(line, sizeof line, "%s\t%s\t%s\t%s\t%s\t%d\t%u", e->ifa_name, fam == AF_INET ? "IPv4" : "IPv6", addr, mask, mac,
+                         (e->ifa_flags & IFF_LOOPBACK) ? 1 : 0, scope);
+        xs_arr_ref_push(a, xs_str_new(line, (size_t)(n < (int)sizeof line ? n : (int)sizeof line - 1)));
+    }
+    freeifaddrs(all);
+#endif
+    return a;
+}
+/* os.constants: "NAME\tvalue" of each signal (kind 0), errno (1) the system defines, in Node's order */
+XS_NOINLINE xs_arr_ref *xs_os_constant_list(int64_t kind) {
+    xs_arr_ref *a = xs_arr_ref_new(0, xs_print_str_quoted_);
+#define XS_C(n) {#n, n},
+    static const struct { const char *n; int v; } sig[] = {
+#ifdef SIGHUP
+        XS_C(SIGHUP)
+#endif
+        XS_C(SIGINT)
+#ifdef SIGQUIT
+        XS_C(SIGQUIT)
+#endif
+        XS_C(SIGILL)
+#ifdef SIGTRAP
+        XS_C(SIGTRAP)
+#endif
+        XS_C(SIGABRT)
+#ifdef SIGIOT
+        XS_C(SIGIOT)
+#endif
+#ifdef SIGBUS
+        XS_C(SIGBUS)
+#endif
+        XS_C(SIGFPE)
+#ifdef SIGKILL
+        XS_C(SIGKILL)
+#endif
+#ifdef SIGUSR1
+        XS_C(SIGUSR1)
+#endif
+        XS_C(SIGSEGV)
+#ifdef SIGUSR2
+        XS_C(SIGUSR2)
+#endif
+#ifdef SIGPIPE
+        XS_C(SIGPIPE)
+#endif
+#ifdef SIGALRM
+        XS_C(SIGALRM)
+#endif
+        XS_C(SIGTERM)
+#ifdef SIGCHLD
+        XS_C(SIGCHLD)
+#endif
+#ifdef SIGSTKFLT
+        XS_C(SIGSTKFLT)
+#endif
+#ifdef SIGCONT
+        XS_C(SIGCONT)
+#endif
+#ifdef SIGSTOP
+        XS_C(SIGSTOP)
+#endif
+#ifdef SIGTSTP
+        XS_C(SIGTSTP)
+#endif
+#ifdef SIGBREAK
+        XS_C(SIGBREAK)
+#endif
+#ifdef SIGTTIN
+        XS_C(SIGTTIN)
+#endif
+#ifdef SIGTTOU
+        XS_C(SIGTTOU)
+#endif
+#ifdef SIGURG
+        XS_C(SIGURG)
+#endif
+#ifdef SIGXCPU
+        XS_C(SIGXCPU)
+#endif
+#ifdef SIGXFSZ
+        XS_C(SIGXFSZ)
+#endif
+#ifdef SIGVTALRM
+        XS_C(SIGVTALRM)
+#endif
+#ifdef SIGPROF
+        XS_C(SIGPROF)
+#endif
+#ifdef SIGWINCH
+        XS_C(SIGWINCH)
+#endif
+#ifdef SIGIO
+        XS_C(SIGIO)
+#endif
+#ifdef SIGPOLL
+        XS_C(SIGPOLL)
+#endif
+#ifdef SIGLOST
+        XS_C(SIGLOST)
+#endif
+#ifdef SIGPWR
+        XS_C(SIGPWR)
+#endif
+#ifdef SIGINFO
+        XS_C(SIGINFO)
+#endif
+#ifdef SIGSYS
+        XS_C(SIGSYS)
+#endif
+    };
+    static const struct { const char *n; int v; } err[] = {
+        XS_C(E2BIG) XS_C(EACCES) XS_C(EADDRINUSE) XS_C(EADDRNOTAVAIL) XS_C(EAFNOSUPPORT) XS_C(EAGAIN) XS_C(EALREADY) XS_C(EBADF)
+        XS_C(EBADMSG) XS_C(EBUSY) XS_C(ECANCELED) XS_C(ECHILD) XS_C(ECONNABORTED) XS_C(ECONNREFUSED) XS_C(ECONNRESET) XS_C(EDEADLK)
+        XS_C(EDESTADDRREQ) XS_C(EDOM)
+#ifdef EDQUOT
+        XS_C(EDQUOT)
+#endif
+        XS_C(EEXIST) XS_C(EFAULT) XS_C(EFBIG) XS_C(EHOSTUNREACH) XS_C(EIDRM) XS_C(EILSEQ) XS_C(EINPROGRESS) XS_C(EINTR) XS_C(EINVAL)
+        XS_C(EIO) XS_C(EISCONN) XS_C(EISDIR) XS_C(ELOOP) XS_C(EMFILE) XS_C(EMLINK) XS_C(EMSGSIZE)
+#ifdef EMULTIHOP
+        XS_C(EMULTIHOP)
+#endif
+        XS_C(ENAMETOOLONG) XS_C(ENETDOWN) XS_C(ENETRESET) XS_C(ENETUNREACH) XS_C(ENFILE) XS_C(ENOBUFS)
+#ifdef ENODATA
+        XS_C(ENODATA)
+#endif
+        XS_C(ENODEV) XS_C(ENOENT) XS_C(ENOEXEC) XS_C(ENOLCK)
+#ifdef ENOLINK
+        XS_C(ENOLINK)
+#endif
+        XS_C(ENOMEM) XS_C(ENOMSG) XS_C(ENOPROTOOPT) XS_C(ENOSPC)
+#ifdef ENOSR
+        XS_C(ENOSR)
+#endif
+#ifdef ENOSTR
+        XS_C(ENOSTR)
+#endif
+        XS_C(ENOSYS) XS_C(ENOTCONN) XS_C(ENOTDIR) XS_C(ENOTEMPTY) XS_C(ENOTSOCK) XS_C(ENOTSUP) XS_C(ENOTTY) XS_C(ENXIO)
+        XS_C(EOPNOTSUPP) XS_C(EOVERFLOW) XS_C(EPERM) XS_C(EPIPE) XS_C(EPROTO) XS_C(EPROTONOSUPPORT) XS_C(EPROTOTYPE) XS_C(ERANGE)
+        XS_C(EROFS) XS_C(ESPIPE) XS_C(ESRCH)
+#ifdef ESTALE
+        XS_C(ESTALE)
+#endif
+#ifdef ETIME
+        XS_C(ETIME)
+#endif
+        XS_C(ETIMEDOUT) XS_C(ETXTBSY) XS_C(EWOULDBLOCK) XS_C(EXDEV)
+    };
+#undef XS_C
+    size_t n = kind == 0 ? sizeof sig / sizeof sig[0] : sizeof err / sizeof err[0];
+    for (size_t i = 0; i < n; i++) {
+        char line[64];
+        int k = snprintf(line, sizeof line, "%s\t%d", kind == 0 ? sig[i].n : err[i].n, kind == 0 ? sig[i].v : err[i].v);
+        xs_arr_ref_push(a, xs_str_new(line, (size_t)k));
+    }
+    return a;
+}
 /* ---- fs.createReadStream / fs.createWriteStream (runtime/node/stream.ts): open, read, write and close that give
    -errno instead of throwing (the stream turns it into its 'error' event, with Node's code and message) */
 XS_NOINLINE int64_t xs_fs_stream_open(xs_str *path, xs_str *flags, int64_t mode) {
@@ -3944,6 +4241,70 @@ XS_NOINLINE void xs_process_signal_unwatch(int64_t sig) {
     sigaction((int)sig, &sa, NULL);
 }
 
+/* process.on('uncaughtException' | 'uncaughtExceptionMonitor') and setUncaughtExceptionCaptureCallback: an error
+   nothing catches goes to process.ts's dispatcher, (err, origin) => handled. Taken, the work it interrupted ends
+   (a coroutine finishes; on main's stack, the rest of the top level is skipped) and the event loop goes on, as in
+   Node; a timer's callback runs under a catch (xs_call_guarded), so an interval keeps going */
+static XS_TLS xs_closure *xs_uncaught_cb;
+static void xs_uncaught_print(void *err, int code) {
+    xs_Error *e = err;
+    fflush(stdout);
+    xs_out_drain();
+    fprintf(stderr, "uncaught Error: %s\n", e->f_message->data);
+    if (e->trace) xs_trace_print(e->trace, stderr);
+    xs_process_exit(code); /* ('exit' listeners run, with the code, as in Node) */
+}
+static void xs_uncaught_again(void *err) { xs_uncaught_print(err, 7); } /* a listener threw: Node's exit code 7 */
+XS_NOINLINE bool xs_uncaught_call(void *err, const char *origin) {
+    void (*hook)(void *) = xs_uncaught_hook;
+    xs_uncaught_hook = xs_uncaught_again;
+    xs_str *o = xs_str_new(origin, strlen(origin));
+    size_t mark = xs_ar_mark();
+    bool handled = ((bool (*)(void *, void *, xs_str *))xs_uncaught_cb->fn)(xs_uncaught_cb, err, o);
+    xs_ar_drain(mark);
+    xs_release(o);
+    xs_uncaught_hook = hook;
+    return handled;
+}
+XS_NOINLINE void xs_uncaught_run(void *err) { /* (xs_uncaught_hook: from xs_throw, with no catch on this stack) */
+    /* (an error of the top level: Node reports the module's rejection as the origin, to these listeners only) */
+    bool handled = xs_uncaught_call(err, xs_uncaught_top && !xs_cur_coro ? "unhandledRejection" : "uncaughtException");
+    if (!handled) xs_uncaught_print(err, 1);
+    xs_release(err);
+    xs_cln_unwind(0);
+    if (xs_cur_coro) { xs_ar_drain(0); xs_coro_finish(); }
+    if (xs_uncaught_main) _longjmp(*xs_uncaught_main, 1);
+    xs_before_exit(); /* (no landing: the loop runs from here) */
+    fflush(stdout);
+    exit(xs_exit_code_);
+}
+XS_NOINLINE void xs_call_guarded(xs_closure *cb) {
+    jmp_buf jb;
+    xs_try_push(&jb);
+    if (_setjmp(jb) == 0) {
+        ((void (*)(void *))cb->fn)(cb);
+        xs_try_pop();
+        return;
+    }
+    void *err = xs_caught();
+    if (!xs_uncaught_cb || !xs_uncaught_call(err, "uncaughtException")) xs_uncaught_print(err, 1);
+    xs_release(err);
+}
+static void xs_uncaught_release(void) {
+    xs_closure *a = xs_uncaught_cb, *b = xs_rejection_cb;
+    xs_uncaught_cb = xs_rejection_cb = NULL;
+    xs_uncaught_hook = NULL;
+    if (a) xs_release(a);
+    if (b) xs_release(b);
+}
+XS_NOINLINE void xs_process_on_uncaught(xs_closure *uncaught, xs_closure *rejection) {
+    if (xs_uncaught_cb) return;
+    xs_uncaught_cb = xs_retain(uncaught);
+    xs_rejection_cb = xs_retain(rejection);
+    xs_uncaught_hook = xs_uncaught_run;
+    xs_uncaught_cleanup = xs_uncaught_release;
+}
+
 #ifdef XS_THREADS
 /* the listener's coroutine: each message, in order, to the closure; ends when the sender is done */
 typedef struct { xs_wq *q; xs_closure **cb; uint8_t *kind; xs_hdr *owner; } xs_wlisten; /* kind: what the listener takes (XS_WM_...) */
@@ -4012,6 +4373,156 @@ XS_NOINLINE void xs_wt_listen_start(xs_wq *q, xs_closure **cb, uint8_t *kind, xs
     xs_ready_push(co); /* it starts when the loop runs: after the code that set the listener up */
 }
 #endif
+/* ---- process.stdin and node:tty (runtime/node/tty.ts) ----
+   A read of a stream on a descriptor (stdin) is a coroutine: it waits until the descriptor is readable (a pipe, a
+   socket, a terminal; a file or /dev/null is read at once, as epoll cannot wait on them), reads one chunk into the
+   caller's buffer and calls back with the count (0: the end, < 0: -errno). While it is pending it keeps the program
+   alive, as a flowing stdin does in Node; xs_fd_read_cancel lets it go (pause()). The descriptor is not made
+   non-blocking (it is shared with the parent shell): a read comes only after the wait says there is data. */
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+#endif
+typedef struct xs_fdrd { int fd; bool stop, parked; xs_closure *cb; xs_Uint8Array *buf; xs_coro *co; struct xs_fdrd *next; } xs_fdrd;
+static XS_TLS xs_fdrd *xs_fdrds; /* the reads in flight */
+static bool xs_fd_pollable(int fd) {
+#if defined(_WIN32)
+    return false;
+#else
+    struct stat st;
+    if (fstat(fd, &st) != 0) return false;
+    return S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode) || (S_ISCHR(st.st_mode) && isatty(fd));
+#endif
+}
+XS_NOINLINE bool xs_fd_is_stream(int64_t fd) { return xs_fd_pollable((int)fd); } /* (a pipe, a socket, a terminal) */
+XS_NOINLINE void xs_fd_read_run(void *p) {
+    xs_fdrd *r = p;
+    if (r->stop) return;
+    ssize_t n;
+    for (;;) {
+        if (xs_fd_pollable(r->fd)) {
+            r->parked = true;
+            xs_wait_fd(r->fd, EVFILT_READ);
+            r->parked = false;
+            if (r->stop) return;
+        }
+        n = read(r->fd, r->buf->data, (size_t)r->buf->f_length);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && errno == EAGAIN) continue; /* (someone made it non-blocking: wait again) */
+        break;
+    }
+    for (xs_fdrd **pp = &xs_fdrds; *pp; pp = &(*pp)->next) /* done: a read the callback starts is a new one */
+        if (*pp == r) { *pp = r->next; break; }
+    int64_t res = n < 0 ? -(int64_t)errno : (int64_t)n;
+    size_t mark = xs_ar_mark();
+    if (xs_uncaught_hook) { /* (process.on('uncaughtException'): a throwing 'data' listener does not end the reads) */
+        jmp_buf jb;
+        xs_try_push(&jb);
+        if (_setjmp(jb) == 0) {
+            ((void (*)(void *, int64_t))r->cb->fn)(r->cb, res);
+            xs_try_pop();
+        } else {
+            void *err = xs_caught();
+            if (!xs_uncaught_cb || !xs_uncaught_call(err, "uncaughtException")) xs_uncaught_print(err, 1);
+            xs_release(err);
+        }
+    } else ((void (*)(void *, int64_t))r->cb->fn)(r->cb, res);
+    xs_ar_drain(mark);
+}
+static void xs_fd_read_done(xs_coro *co) {
+    xs_fdrd *r = co->arg;
+    xs_tasks_live--;
+    xs_coro_recycle(co);
+    for (xs_fdrd **pp = &xs_fdrds; *pp; pp = &(*pp)->next)
+        if (*pp == r) { *pp = r->next; break; }
+    xs_release(r->cb);
+    xs_release(r->buf);
+    free(r);
+}
+XS_NOINLINE void xs_fd_read_start(int64_t fd, xs_Uint8Array *buf, xs_closure *cb) {
+    if (xs_kq < 0) xs_kq = kqueue();
+    xs_fdrd *r = calloc(1, sizeof *r);
+    r->fd = (int)fd;
+    r->cb = xs_retain(cb);
+    r->buf = xs_retain(buf);
+    r->next = xs_fdrds;
+    xs_fdrds = r;
+    xs_coro *co = xs_coro_new_shared(xs_fd_read_run, r);
+    r->co = co;
+    co->on_done = xs_fd_read_done;
+    xs_tasks_live++;
+    xs_exit_hook = xs_tasks_drain;
+    xs_ready_push(co);
+}
+/* the read in flight on fd ends without calling back (true when there was one) */
+XS_NOINLINE bool xs_fd_read_cancel(int64_t fd) {
+    for (xs_fdrd **pp = &xs_fdrds; *pp; pp = &(*pp)->next) {
+        xs_fdrd *r = *pp;
+        if (r->fd != (int)fd) continue;
+        *pp = r->next;
+        r->next = NULL;
+        r->stop = true;
+        if (r->parked) xs_ready_push(r->co); /* (waiting on the descriptor: woken, it stops watching it and ends) */
+        return true;
+    }
+    return false;
+}
+XS_NOINLINE bool xs_tty_isatty(int64_t fd) {
+#if defined(_WIN32)
+    return _isatty((int)fd) != 0;
+#else
+    return fd >= 0 && isatty((int)fd) == 1;
+#endif
+}
+/* [columns, rows] of the terminal on fd (empty: not a terminal) */
+XS_NOINLINE xs_arr_int *xs_tty_size(int64_t fd) {
+    xs_arr_int *a = xs_arr_int_new(0, 0);
+#if !defined(_WIN32)
+    struct winsize ws;
+    if (ioctl((int)fd, TIOCGWINSZ, &ws) == 0) {
+        xs_arr_int_push(a, ws.ws_col);
+        xs_arr_int_push(a, ws.ws_row);
+    }
+#endif
+    return a;
+}
+#if !defined(_WIN32)
+static struct termios xs_tty_orig;
+static int xs_tty_orig_fd = -1;
+static void xs_tty_restore(void) { if (xs_tty_orig_fd >= 0) tcsetattr(xs_tty_orig_fd, TCSANOW, &xs_tty_orig); }
+#endif
+/* setRawMode: raw (no echo, no line discipline, no signals from keys) or back to the mode it had; 0 or the errno */
+XS_NOINLINE int64_t xs_tty_set_raw(int64_t fd, bool raw) {
+#if defined(_WIN32)
+    return ENOTTY;
+#else
+    if (xs_tty_orig_fd < 0) {
+        if (tcgetattr((int)fd, &xs_tty_orig) != 0) return errno;
+        xs_tty_orig_fd = (int)fd;
+        atexit(xs_tty_restore); /* (the terminal is given back as it was, as libuv does) */
+    }
+    struct termios t = xs_tty_orig;
+    if (raw) { /* (libuv's UV_TTY_MODE_RAW) */
+        t.c_iflag &= ~(tcflag_t)(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+        t.c_oflag |= ONLCR;
+        t.c_cflag |= CS8;
+        t.c_lflag &= ~(tcflag_t)(ECHO | ICANON | IEXTEN | ISIG);
+        t.c_cc[VMIN] = 1;
+        t.c_cc[VTIME] = 0;
+    }
+    return tcsetattr((int)fd, TCSADRAIN, &t) == 0 ? 0 : errno;
+#endif
+}
+/* a chunk written to stdout or stderr by their streams (tty.WriteStream): the same FILEs as console.log */
+XS_NOINLINE void xs_tty_write(int64_t fd, xs_Uint8Array *b) {
+    xs_out_drain();
+    fwrite(b->data, 1, (size_t)b->f_length, fd == 2 ? stderr : XS_OUT);
+    if (fd == 2) fflush(stderr);
+}
+/* on a terminal what the stream wrote shows now (a prompt has no newline) */
+XS_NOINLINE void xs_tty_flush(int64_t fd) { xs_out_drain(); fflush(fd == 2 ? stderr : XS_OUT); }
+
 /* ---- setTimeout / setInterval (Node's globals): each timer is a coroutine on the event loop. It starts when the
    loop runs (a server's, or the one the program's exit waits on), sleeps, then calls its callback; an interval goes
    on until clearInterval. Like Node, a pending timer keeps the program alive. */
@@ -4031,7 +4542,8 @@ XS_NOINLINE void xs_ttask_run(void *p) {
         }
         if (t->cancelled) return;
         size_t mark = xs_ar_mark();
-        ((void (*)(void *))t->cb->fn)(t->cb);
+        if (xs_uncaught_hook) xs_call_guarded(t->cb); /* (process.on('uncaughtException'): the timer goes on) */
+        else ((void (*)(void *))t->cb->fn)(t->cb);
         xs_ar_drain(mark);
         if (!t->repeat || t->cancelled) return;
     }
@@ -4380,6 +4892,105 @@ XS_NOINLINE void xs_net_wake(int64_t port) { /* a connection to our own listener
     xs_release(h);
     if (fd >= 0) close((int)fd);
 }
+/* node:http (runtime/node/http.ts) over node:net's sockets: a write that never parks (what the socket takes now),
+   and the message head (request or status line, then the headers) parsed in one call */
+/* as xs_net_read, the bytes as a Buffer (what Node's 'data' gives). drained: the last read was short, so the socket is
+   empty: wait for it first instead of a read that would only say EAGAIN (one system call less per request) */
+XS_NOINLINE xs_Uint8Array *xs_net_read_buf(int64_t fd, bool drained) {
+    if (!xs_net_rbuf) xs_net_rbuf = malloc(65536);
+    if (drained) xs_wait_fd((int)fd, EVFILT_READ);
+    for (;;) {
+        ssize_t r = read((int)fd, xs_net_rbuf, 65536);
+        if (r > 0) {
+            xs_Uint8Array *u = xs_u8_raw(r, true, false);
+            memcpy(u->data, xs_net_rbuf, (size_t)r);
+            return u;
+        }
+        if (r == 0) return xs_u8_raw(0, true, false);
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN) { xs_wait_fd((int)fd, EVFILT_READ); continue; }
+        xs_net_rerr_ = xs_net_err(errno);
+        return xs_u8_raw(0, true, false);
+    }
+}
+XS_NOINLINE int64_t xs_net_send(int64_t fd, xs_Uint8Array *bytes, int64_t off) { /* bytes written (0: the socket is full), or an error */
+    if (off >= bytes->f_length) return 0;
+    for (;;) {
+        ssize_t w = send((int)fd, bytes->data + off, (size_t)(bytes->f_length - off), 0
+#ifdef MSG_NOSIGNAL
+                         | MSG_NOSIGNAL
+#endif
+        );
+        if (w >= 0) return (int64_t)w;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        return xs_net_err(errno);
+    }
+}
+/* where the head parsed last ends (the body's first byte); -1: not complete yet; -2: not HTTP (or a head over 64 KB) */
+static XS_TLS int64_t xs_nhttp_end_;
+XS_NOINLINE int64_t xs_nhttp_end(void) { return xs_nhttp_end_; }
+static xs_str *xs_nhttp_str(const uint8_t *p, size_t n) { /* bytes read as latin1 (as Node reads a head) */
+    size_t hi = 0;
+    for (size_t i = 0; i < n; i++) hi += p[i] >= 0x80;
+    if (!hi) return xs_str_new((const char *)p, n);
+    xs_str *s = xs_str_alloc((int64_t)(n + hi));
+    char *o = s->data;
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] < 0x80) *o++ = (char)p[i];
+        else { *o++ = (char)(0xC0 | (p[i] >> 6)); *o++ = (char)(0x80 | (p[i] & 0x3F)); }
+    }
+    *o = 0;
+    return s;
+}
+static void xs_nhttp_trim(const uint8_t **p, const uint8_t **e) {
+    while (*p < *e && (**p == ' ' || **p == '\t')) (*p)++;
+    while (*e > *p && ((*e)[-1] == ' ' || (*e)[-1] == '\t')) (*e)--;
+}
+/* bytes[start, end): [method, target, version, name, value, name, value...] for a request; [version, status, reason,
+   name, value...] for a response (the three parts of the first line either way). Empty while the head is not complete
+   or when it is not HTTP (xs_nhttp_end says which). Empty lines before the first line are skipped, as Node does. */
+XS_NOINLINE xs_arr_ref *xs_nhttp_parse(xs_Uint8Array *bytes, int64_t start, int64_t end) {
+    xs_arr_ref *out = xs_arr_ref_new(0, xs_print_str_quoted_);
+    xs_nhttp_end_ = -1;
+    if (start < 0) start = 0;
+    if (end > bytes->f_length) end = bytes->f_length;
+    const uint8_t *p = bytes->data + start, *lim = bytes->data + (end > start ? end : start);
+    while (lim - p >= 2 && p[0] == '\r' && p[1] == '\n') p += 2;
+    const uint8_t *hend = lim - p >= 4 ? memmem(p, (size_t)(lim - p), "\r\n\r\n", 4) : NULL;
+    if (!hend) {
+        if (lim - p > 65536) xs_nhttp_end_ = -2;
+        return out;
+    }
+    if (hend - p > 65536) { xs_nhttp_end_ = -2; return out; }
+    const uint8_t *le = memmem(p, (size_t)(hend - p) + 2, "\r\n", 2);
+    const uint8_t *s1 = memchr(p, ' ', (size_t)(le - p));
+    const uint8_t *s2 = s1 ? memchr(s1 + 1, ' ', (size_t)(le - s1 - 1)) : NULL;
+    if (!s1 || s1 == p) { xs_nhttp_end_ = -2; return out; }
+    xs_arr_ref_push(out, xs_nhttp_str(p, (size_t)(s1 - p)));
+    if (s2) {
+        xs_arr_ref_push(out, xs_nhttp_str(s1 + 1, (size_t)(s2 - s1 - 1)));
+        xs_arr_ref_push(out, xs_nhttp_str(s2 + 1, (size_t)(le - s2 - 1)));
+    } else { /* a status line without a reason phrase ("HTTP/1.1 200") */
+        xs_arr_ref_push(out, xs_nhttp_str(s1 + 1, (size_t)(le - s1 - 1)));
+        xs_arr_ref_push(out, xs_str_new("", 0));
+    }
+    const uint8_t *q = le + 2;
+    while (q < hend + 2) {
+        const uint8_t *e = memmem(q, (size_t)(hend + 2 - q), "\r\n", 2);
+        if (!e) e = hend;
+        const uint8_t *colon = memchr(q, ':', (size_t)(e - q));
+        if (!colon || colon == q) { xs_nhttp_end_ = -2; for (size_t i = 0; i < out->len; i++) xs_release_(out->data[i]); out->len = 0; return out; }
+        const uint8_t *ns = q, *ne = colon, *vs = colon + 1, *ve = e;
+        xs_nhttp_trim(&ns, &ne);
+        xs_nhttp_trim(&vs, &ve);
+        xs_arr_ref_push(out, xs_nhttp_str(ns, (size_t)(ne - ns)));
+        xs_arr_ref_push(out, xs_nhttp_str(vs, (size_t)(ve - vs)));
+        q = e + 2;
+    }
+    xs_nhttp_end_ = (int64_t)(hend + 4 - bytes->data);
+    return out;
+}
 /* node:dns: lookup through the system resolver (getaddrinfo), as Node's dns.lookup; "" when the name is unknown */
 XS_NOINLINE xs_arr_ref *xs_dns_lookup_all(xs_str *host, int64_t family) {
     xs_arr_ref *out = xs_arr_ref_new(0, xs_print_str_quoted_);
@@ -4586,6 +5197,15 @@ XS_NOINLINE xs_Uint8Array *xs_tlsc_read(int64_t h) { /* the next bytes; empty at
     memcpy(u->data, xs_net_rbuf, (size_t)r);
     return u;
 }
+XS_NOINLINE xs_Uint8Array *xs_tlsc_read_buf(int64_t h) { /* as xs_tlsc_read, the bytes as a Buffer (node:https's client) */
+    if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return xs_u8_raw(0, true, false);
+    if (!xs_net_rbuf) xs_net_rbuf = malloc(65536);
+    ssize_t r = xs_tls_read_some(xs_tlscs[h].t, xs_tlscs[h].fd, (char *)xs_net_rbuf, 65536, -1, 0);
+    if (r <= 0) return xs_u8_raw(0, true, false);
+    xs_Uint8Array *u = xs_u8_raw(r, true, false);
+    memcpy(u->data, xs_net_rbuf, (size_t)r);
+    return u;
+}
 XS_NOINLINE int64_t xs_tlsc_write(int64_t h, xs_Uint8Array *bytes) {
     if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return -7;
     return xs_tls_write_all(xs_tlscs[h].t, xs_tlscs[h].fd, (const char *)bytes->data, (size_t)bytes->f_length, -1, 0) ? 0 : -7;
@@ -4596,5 +5216,73 @@ XS_NOINLINE void xs_tlsc_close(int64_t h) {
     xs_tls_free(xs_tlscs[h].t);
     close(xs_tlscs[h].fd);
     xs_tlscs[h].used = false;
+}
+/* node:https's server connections (runtime/node/http.ts over node:net's sockets): the same slots as the client's;
+   the handshake happens within the first reads. A credential is a number too (the certificate and key, PEM) */
+static void **xs_tlss_creds;
+static int64_t xs_ntlss_creds;
+XS_NOINLINE int64_t xs_tlss_cred(xs_str *cert, xs_str *key) {
+    char *cp = xs_pem_tmp(cert), *kp = xs_pem_tmp(key);
+    xs_str *c = xs_str_new(cp, strlen(cp)), *k = xs_str_new(kp, strlen(kp));
+    void *cr = xs_tls_cred_load_any(c, k);
+    unlink(cp);
+    unlink(kp);
+    free(cp);
+    free(kp);
+    xs_release(c);
+    xs_release(k);
+    xs_tlss_creds = realloc(xs_tlss_creds, sizeof *xs_tlss_creds * (size_t)(xs_ntlss_creds + 1));
+    xs_tlss_creds[xs_ntlss_creds] = cr;
+    return xs_ntlss_creds++;
+}
+XS_NOINLINE int64_t xs_tlss_accept(int64_t cred, int64_t fd) { /* the slot of an accepted connection */
+    xs_tls *t = xs_tls_server_new(xs_tlss_creds[cred]);
+    int64_t h = 0;
+    while (h < xs_ntlscs && xs_tlscs[h].used) h++;
+    if (h == xs_ntlscs) { xs_tlscs = realloc(xs_tlscs, sizeof *xs_tlscs * (size_t)(xs_ntlscs + 1)); xs_ntlscs++; }
+    xs_tlscs[h] = (xs_tlsc){t, (int)fd, true};
+    return h;
+}
+XS_NOINLINE xs_Uint8Array *xs_tlss_read(int64_t h) { /* the next plaintext bytes (parks); empty at the end or on an error */
+    if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return xs_u8_new(0);
+    if (!xs_net_rbuf) xs_net_rbuf = malloc(65536);
+    for (;;) {
+        xs_tlsc *s = &xs_tlscs[h]; /* (the table may move while parked) */
+        ssize_t r = xs_tls_srv_read(s->t, s->fd, (char *)xs_net_rbuf, 65536);
+        if (r > 0) {
+            xs_Uint8Array *u = xs_u8_raw(r, true, false);
+            memcpy(u->data, xs_net_rbuf, (size_t)r);
+            return u;
+        }
+        if (r < 0) return xs_u8_new(0);
+        int fd = s->fd;
+        xs_wait_fd(fd, xs_tls_srv_pending(s->t) ? EVFILT_WRITE : EVFILT_READ);
+        if (!xs_tlscs[h].used) return xs_u8_new(0);
+    }
+}
+XS_NOINLINE int64_t xs_tlss_send(int64_t h, xs_Uint8Array *bytes, int64_t off) { /* plaintext taken now (never parks), or -7 */
+    if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return -7;
+    if (off >= bytes->f_length) return 0;
+    ssize_t w = xs_tls_srv_write(xs_tlscs[h].t, xs_tlscs[h].fd, (const char *)bytes->data + off, (size_t)(bytes->f_length - off));
+    return w < 0 ? -7 : (int64_t)w;
+}
+XS_NOINLINE bool xs_tlss_pending(int64_t h) { return h >= 0 && h < xs_ntlscs && xs_tlscs[h].used && xs_tls_srv_pending(xs_tlscs[h].t); }
+XS_NOINLINE int64_t xs_tlss_write(int64_t h, xs_Uint8Array *bytes, int64_t off) { /* all of it (parks while the socket is full): 0, or -7 */
+    for (;;) {
+        if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return -7;
+        int fd = xs_tlscs[h].fd;
+        if (off < bytes->f_length) {
+            ssize_t w = xs_tls_srv_write(xs_tlscs[h].t, fd, (const char *)bytes->data + off, (size_t)(bytes->f_length - off));
+            if (w < 0) return -7;
+            off += w;
+        }
+        if (off >= bytes->f_length && !xs_tls_srv_pending(xs_tlscs[h].t)) return 0;
+        xs_wait_fd(fd, EVFILT_WRITE);
+    }
+}
+XS_NOINLINE void xs_tlss_close(int64_t h) { /* close_notify, then as the client's */
+    if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return;
+    xs_tls_srv_close_notify(xs_tlscs[h].t, xs_tlscs[h].fd);
+    xs_tlsc_close(h);
 }
 #endif

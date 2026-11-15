@@ -1788,6 +1788,7 @@ static const char *where_elem(int i) { return xs_sprintf("[%d]", i); }
    the value's type at run time: a string, a boxed number or boolean, an array, or an object of one of the
    program's classes (each class JSON can write gets its json_put_ function then) */
 static bool json_unknown_used;
+extern bool xs_json_ext_used; /* (checker.c) */
 static void json_emit_value(Buf *b, Type *t, const char *expr) { /* appends into xs_sb *sb */
     switch (t->kind) {
     case TY_NUMBER: buf_printf(b, "xs_sb_num(sb, %s);", expr); break;
@@ -2129,6 +2130,23 @@ static void emit_member(Expr *e) {
             buf_puts(out, "; ");
             json_emit_value(out, a->type, "ja_");
             buf_puts(out, " xs_sb_finish(sb); })");
+            return;
+        }
+        if (strcmp(fn, "json_stringify_ext") == 0) { /* JSON.stringify(value, replacer, space): the value's text, rewritten */
+            Expr *a = e->args.items[0], *r = e->args.items[1], *s = e->args.len > 2 ? e->args.items[2] : NULL;
+            json_unknown_used = true;
+            buf_printf(out, "({ xs_sb sb_ = {0}; xs_sb *sb = &sb_; %s ja_ = ", ctype(a->type));
+            emit_borrowed(a);
+            buf_puts(out, "; ");
+            json_emit_value(out, a->type, "ja_");
+            buf_puts(out, " xs_json_ext(xs_sb_finish(sb), ");
+            if (r->type->kind == TY_ARRAY) { buf_puts(out, "(xs_arr_ref *)("); emit_borrowed(r); buf_puts(out, "), NULL, "); }
+            else if (r->type->kind == TY_FUNC) { buf_puts(out, "NULL, (void *)("); emit_borrowed(r); buf_puts(out, "), "); }
+            else { if (r->kind != E_NULL) { buf_puts(out, "((void)("); emit_expr(r); buf_puts(out, "), NULL), NULL, "); } else buf_puts(out, "NULL, NULL, "); }
+            if (s && s->type->kind == TY_STRING) { buf_puts(out, "0, "); emit_borrowed(s); }
+            else if (s && s->type->kind != TY_NULL) { buf_puts(out, "(double)("); emit_expr(s); buf_puts(out, "), NULL"); }
+            else buf_puts(out, "0, NULL");
+            buf_puts(out, ", xs_json_unknown); })");
             return;
         }
         if (strcmp(fn, "json_parse") == 0) {
@@ -13637,6 +13655,7 @@ static void fnrefs_stmt(Stmt *s, NameSet *ns, bool in_fn) {
     for (int i = 0; i < s->ncases; i++) { fnrefs_expr(s->cases[i].value, ns, in_fn); fnrefs_stmt(s->cases[i].body, ns, in_fn); }
 }
 static NameSet main_locals; /* top-level variables declared in main */
+static bool uncaught_land; /* main has a landing for the errors an 'uncaughtException' listener takes */
 /* a top-level const of a number, int or boolean literal (const IM: int = 139968): a C constant, not a global
    assigned in main, so the C compiler folds it (x % IM becomes a multiplication, overflow checks with it go) */
 static bool const_lit_global(Stmt *s) {
@@ -14395,8 +14414,11 @@ void emit_program(Program *p, Buf *o) {
         }
         buf_puts(out, " };\n");
     }
+    uncaught_land = false; /* process.on('uncaughtException') can be reached: main gets a landing (xs_uncaught_main) */
+    for (int i = 0; i < p->nfuncs && !uncaught_land; i++)
+        if (p->funcs[i]->is_native && p->funcs[i]->used && strcmp(p->funcs[i]->name, "process_on_uncaught") == 0) uncaught_land = true;
     {
-        bool top_try = false;
+        bool top_try = uncaught_land; /* (the top-level variables are globals then: a longjmp keeps them) */
         for (int i = 0; i < p->top.len; i++) if (stmt_has_try(p->top.items[i])) top_try = true;
         find_main_locals(p, top_try);
     }
@@ -14640,6 +14662,7 @@ void emit_program(Program *p, Buf *o) {
         vol_locals = mvol;
     }
     emit_dbg_enter(NULL);
+    if (uncaught_land) { nl(); buf_puts(out, "jmp_buf land_; if (_setjmp(land_)) goto xs_landed; xs_uncaught_main = &land_; xs_uncaught_top = true;"); }
     epush(true);
     for (int i = 0; i < p->top.len; i++) {
         Stmt *s = p->top.items[i];
@@ -14652,6 +14675,7 @@ void emit_program(Program *p, Buf *o) {
     }
     emit_releases(escope);
     epop();
+    if (uncaught_land) { nl(); buf_puts(out, "xs_landed: xs_uncaught_top = false; xs_ar_drain(ar_mark);"); }
     emit_dbg_finish();
     if (wbody) { /* main: the setup once, then the program, as any thread */
         /* the body's own top-level locals: each thread releases its own here (main cannot see them) */
@@ -14765,6 +14789,7 @@ void emit_program(Program *p, Buf *o) {
     }
     if (cell_fns.data) { buf_puts(out, cell_fns.data); cell_fns.len = 0; cell_fns.data[0] = 0; ncell = 0; }
     if (ifld_fns.data) { buf_puts(out, ifld_fns.data); ifld_fns.len = 0; ifld_fns.data[0] = 0; nifld = 0; nifld_puts = 0; }
+    if (xs_json_ext_used) json_unknown_used = true; /* (JSON.stringify with a replacer or a space, JSON.parse with a reviver) */
     if (json_unknown_used) {
         /* every class JSON can write, for the values an unknown holds */
         int ncls = 0;

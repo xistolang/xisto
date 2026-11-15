@@ -1871,11 +1871,16 @@ static inline double xs_to_number_id(double x) { return x; }
 /* f___thrown: the object a throw carried (an object of a class that extends Error, or another value): instanceof and
    casts on a caught Error read it. f_cause: new Error(message, { cause }), as in JS (null when not given). code: Node's
    error code of a runtime error ("RangeError [ERR_OUT_OF_RANGE]: ..."), read as err.code through an any. */
-typedef struct xs_Error { xs_hdr hdr; xs_str *f_message; xs_str *f_name; void *f___thrown; xs_trace *trace; xs_str *stack; void *f_cause; xs_str *code; } xs_Error;
+typedef struct xs_Error { xs_hdr hdr; xs_str *f_message; xs_str *f_name; void *f___thrown; xs_trace *trace; xs_str *stack; void *f_cause; xs_str *code;
+    struct xs_fs_errinfo *sys; } xs_Error;
+/* a system error of node:fs (xs_fs_throw): err.errno, err.syscall, err.path and err.dest, as Node's */
+typedef struct xs_fs_errinfo { int64_t errnum; xs_str *syscall, *path, *dest; } xs_fs_errinfo;
+static XS_TLS xs_fs_errinfo *xs_fs_err_pending; /* for the Error the next runtime panic makes */
 static void xs_Error_free(void *p) {
     xs_Error *e = p;
     xs_release(e->f_message); xs_release(e->f_name); xs_release(e->stack); xs_release(e->f___thrown); xs_release(e->f_cause);
     xs_release(e->code);
+    if (e->sys) { xs_release(e->sys->syscall); xs_release(e->sys->path); xs_release(e->sys->dest); free(e->sys); }
     free(e->trace);
     xs_obj_free(p);
 }
@@ -1913,6 +1918,12 @@ __attribute__((noinline)) static void *xs_Error_new(void *msg) {
             }
         }
         e->f_message = xs_str_new(m, strlen(m));
+        if (xs_fs_err_pending) { /* "ENOENT: no such file or directory, open '/x'": its code, errno, syscall and path */
+            e->sys = xs_fs_err_pending;
+            xs_fs_err_pending = NULL;
+            const char *c = strchr(m, ':');
+            if (c) e->code = xs_str_new(m, (size_t)(c - m));
+        }
     }
     else e->f_message = xs_str_new("", 0);
     e->f_name = xs_str_new(nm, nml);
@@ -2081,6 +2092,13 @@ static xs_str *xs_Error_stack(xs_Error *e) {
     }
     return e->stack;
 }
+/* process.on('uncaughtException') (runtime/node/process.ts, xisto_net.h): set only once a program listens; it
+   returns only when nothing listens, and the error is printed as below. xs_uncaught_main: main's landing (emitted
+   only in a program that can set the hook), where a top-level error a listener took goes on to the event loop. Node
+   runs a .ts program as an ES module: an error of its top level has the origin "unhandledRejection" */
+static XS_TLS void (*xs_uncaught_hook)(void *err);
+static XS_TLS jmp_buf *xs_uncaught_main;
+static XS_TLS bool xs_uncaught_top; /* the top level is running (the origin of its errors: xs_uncaught_run) */
 /* takes an owned Error */
 static void xs_throw(void *err) {
 #ifdef XS_DEBUG
@@ -2105,6 +2123,7 @@ static void xs_throw(void *err) {
         xs_cln_unwind(xs_recover_cln);
         _longjmp(*xs_recover, 1);
     }
+    if (xs_uncaught_hook) xs_uncaught_hook(err);
     fflush(stdout);
     fprintf(stderr, "uncaught Error: %s\n", e->f_message->data);
     if (e->trace) xs_trace_print(e->trace, stderr);
@@ -3271,6 +3290,12 @@ XS_NOINLINE void *xs_dyn_get(void *o, xs_str *k) {
         if (k->len == 5 && memcmp(k->data, "stack", 5) == 0) return xs_retain_(xs_Error_stack(e));
         if (k->len == 5 && memcmp(k->data, "cause", 5) == 0) return xs_retain_(e->f_cause);
         if (k->len == 4 && memcmp(k->data, "code", 4) == 0 && e->code) return xs_retain_(e->code);
+        if (e->sys) {
+            if (k->len == 5 && memcmp(k->data, "errno", 5) == 0) return xs_box_int(e->sys->errnum);
+            if (k->len == 7 && memcmp(k->data, "syscall", 7) == 0) return xs_retain_(e->sys->syscall);
+            if (k->len == 4 && memcmp(k->data, "path", 4) == 0) return xs_retain_(e->sys->path);
+            if (k->len == 4 && memcmp(k->data, "dest", 4) == 0) return xs_retain_(e->sys->dest);
+        }
         return e->f___thrown ? xs_dyn_get(e->f___thrown, k) : NULL;
     }
     if (t->free == xs_map_free) {
@@ -4678,6 +4703,217 @@ static xs_str *xs_sb_finish(xs_sb *b) {
     return s;
 }
 
+/* ---- JSON.stringify(value, replacer, space): the extended path (checker: json_stringify_ext; the one-argument call
+   keeps its own generated writer). The value is written as JSON.stringify(value) writes it (toJSON, Dates, a class's
+   fields), read back as an any (Records, unknown[], boxed numbers), then written again through the replacer (a
+   function called as replacer(key, value), or an allow-list of keys) with the indentation of space. ---- */
+XS_NOINLINE void xs_json_undef_called(void) { xs_panic("TypeError: undefined is not a function"); }
+static xs_closure xs_json_undef_cl = {{XS_IMMORTAL, 0}, (void *)xs_json_undef_called};
+/* undefined returned by a replacer (the checker puts it where the replacer's code returns undefined): a function,
+   which JSON leaves out of an object and writes as null in an array, as it does undefined */
+static void *xs_json_undef(void) { return xs_cl_static(&xs_json_undef_cl); }
+typedef struct { void *fn; xs_arr_ref *keys; char gap[44]; size_t glen; void (*unk)(xs_sb *, void *); } xs_jx;
+static void xs_jx_nl(xs_sb *b, const xs_jx *st, int depth) {
+    xs_sb_put(b, "\n", 1);
+    for (int i = 0; i < depth; i++) xs_sb_put(b, st->gap, st->glen);
+}
+XS_NOINLINE bool xs_jx_write(xs_sb *b, const xs_jx *st, void *v, int depth);
+/* holder[key] through the replacer, then written; false when it is undefined (nothing written) */
+XS_NOINLINE bool xs_jx_prop(xs_sb *b, const xs_jx *st, xs_str *key, void *v, int depth) {
+    if (!st->fn) return xs_jx_write(b, st, v, depth);
+    xs_closure *cl = st->fn;
+    void *r = ((void *(*)(void *, xs_str *, void *))cl->fn)(cl, key, v);
+    bool ok = xs_jx_write(b, st, r, depth);
+    xs_release(r);
+    return ok;
+}
+static void *xs_jx_val(xs_map *m, xs_map_entry *e) { /* a Record's value as an any: owned */
+    switch (m->val_kind) {
+    case 0: return xs_box_num(e->val.d);
+    case 1: return xs_box_num((double)e->val.i);
+    case 2: return xs_box_bool(e->val.i != 0);
+    default: return e->val.p ? xs_retain_(e->val.p) : NULL;
+    }
+}
+XS_NOINLINE bool xs_jx_member(xs_sb *b, const xs_jx *st, xs_str *k, void *val, int depth, bool *any) {
+    size_t at = b->len;
+    if (*any) xs_sb_put(b, ",", 1);
+    if (st->glen) xs_jx_nl(b, st, depth + 1);
+    xs_sb_str(b, k);
+    xs_sb_put(b, st->glen ? ": " : ":", st->glen ? 2 : 1);
+    if (xs_jx_prop(b, st, k, val, depth + 1)) { *any = true; return true; }
+    b->len = at; /* (undefined: the member left out) */
+    if (b->data) b->data[at] = 0;
+    return false;
+}
+XS_NOINLINE bool xs_jx_write(xs_sb *b, const xs_jx *st, void *v, int depth) {
+    if (!v) { xs_sb_put(b, "null", 4); return true; }
+    if (xs_type_of(v)->print == xs_print_closure) return false; /* a function (or undefined): nothing */
+    void (*f)(void *) = xs_type_of(v)->free;
+    if (f == xs_str_free) { xs_sb_str(b, v); return true; }
+    if (f == xs_box_num_free) { xs_sb_num(b, ((xs_box_d *)v)->v); return true; }
+    if (f == xs_box_int_free) { xs_sb_int(b, ((xs_box_i *)v)->v); return true; }
+    if (f == xs_box_bool_free) { xs_sb_bool(b, ((xs_box_i *)v)->v != 0); return true; }
+    if (f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free) {
+        size_t n = ((xs_arr_ref *)v)->len; /* (the same layout: header, len, data) */
+        if (!n) { xs_sb_put(b, "[]", 2); return true; }
+        xs_sb_put(b, "[", 1);
+        for (size_t i = 0; i < n; i++) {
+            if (i) xs_sb_put(b, ",", 1);
+            if (st->glen) xs_jx_nl(b, st, depth + 1);
+            void *el = f == xs_arr_ref_free ? xs_retain_(((xs_arr_ref *)v)->data[i])
+                     : f == xs_arr_num_free ? xs_box_num(((xs_arr_num *)v)->data[i])
+                     : f == xs_arr_int_free ? xs_box_num((double)((xs_arr_int *)v)->data[i]) : xs_box_bool(((xs_arr_bool *)v)->data[i]);
+            xs_str *k = NULL;
+            if (st->fn) { char kb[24]; size_t kn = xs_itoa((int64_t)i, kb); k = xs_str_new(kb, kn); }
+            if (!xs_jx_prop(b, st, k, el, depth + 1)) xs_sb_put(b, "null", 4); /* (undefined in an array: null) */
+            xs_release(k);
+            xs_release(el);
+        }
+        if (st->glen) xs_jx_nl(b, st, depth);
+        xs_sb_put(b, "]", 1);
+        return true;
+    }
+    if (f == xs_map_free && ((xs_map *)v)->record && ((xs_map *)v)->str_keys) {
+        xs_map *m = v;
+        bool any = false;
+        xs_sb_put(b, "{", 1);
+        if (st->keys) {
+            for (size_t i = 0; i < st->keys->len; i++) {
+                xs_str *k = st->keys->data[i];
+                xs_map_entry *e = xs_map_lookup(m, k, 0);
+                if (!e) continue;
+                void *val = xs_jx_val(m, e);
+                xs_jx_member(b, st, k, val, depth, &any);
+                xs_release(val);
+            }
+        } else {
+            xs_map_entry *e;
+            XS_MAP_EACH(m, e) {
+                void *val = xs_jx_val(m, e);
+                xs_str *k = xs_retain(e->skey); /* (the replacer may change the Record) */
+                xs_jx_member(b, st, k, val, depth, &any);
+                xs_release(k);
+                xs_release(val);
+            }
+        }
+        if (any && st->glen) xs_jx_nl(b, st, depth);
+        xs_sb_put(b, "}", 1);
+        return true;
+    }
+    if (f == xs_map_free) { xs_sb_put(b, "{}", 2); return true; } /* a Map or a Set: no properties of its own */
+    /* another object (a class's, a Date: one the replacer returned): as JSON.stringify writes it, read back as an any */
+    xs_sb t = {0};
+    st->unk(&t, v);
+    xs_str *s = xs_sb_finish(&t);
+    void *a = xs_json_any(s);
+    xs_release(s);
+    bool ok = xs_jx_write(b, st, a, depth);
+    xs_release(a);
+    return ok;
+}
+/* text: the value written as one argument writes it (consumed); keys: the replacer's allow-list or NULL; fn: the
+   replacer function or NULL; space: a number of spaces (sspace NULL) or the string sspace */
+XS_NOINLINE xs_str *xs_json_ext(xs_str *text, xs_arr_ref *keys, void *fn, double nspace, xs_str *sspace, void (*unk)(xs_sb *, void *)) {
+    xs_jx st = {0};
+    st.fn = fn;
+    st.unk = unk;
+    if (sspace) { /* its first 10 characters (UTF-16 units: a character past U+FFFF counts two) */
+        size_t i = 0, units = 0;
+        while (i < (size_t)sspace->len && units < 10) {
+            unsigned char c = (unsigned char)sspace->data[i];
+            size_t n = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+            if (n == 4 && units == 9) break;
+            units += n == 4 ? 2 : 1;
+            i += n;
+        }
+        if (i > (size_t)sspace->len) i = (size_t)sspace->len;
+        memcpy(st.gap, sspace->data, i);
+        st.glen = i;
+    } else {
+        int n = nspace >= 10 ? 10 : nspace >= 1 ? (int)nspace : 0;
+        memset(st.gap, ' ', (size_t)n);
+        st.glen = (size_t)n;
+    }
+    xs_arr_ref *dk = NULL;
+    if (keys && !fn) { /* the allow-list, each key once (its first place) */
+        dk = xs_arr_ref_new(keys->len, NULL);
+        for (size_t i = 0; i < keys->len; i++) {
+            xs_str *k = keys->data[i];
+            bool seen = false;
+            for (size_t j = 0; j < dk->len && !seen; j++) seen = xs_str_eq(dk->data[j], k);
+            if (!seen) xs_arr_ref_push(dk, xs_retain(k));
+        }
+        st.keys = dk;
+    }
+    void *v = xs_json_any(text);
+    xs_release(text);
+    xs_sb b = {0};
+    xs_str *root = xs_str_new("", 0);
+    bool ok = xs_jx_prop(&b, &st, root, v, 0);
+    xs_release(root);
+    xs_release(v);
+    xs_release(dk);
+    if (!ok) { free(b.data); return xs_str_new("undefined", 9); } /* (JavaScript's undefined: the replacer dropped the value) */
+    return xs_sb_finish(&b);
+}
+/* JSON.parse(text, reviver): the text read as an any, then each value from the leaves up passed through
+   reviver(key, value), whose undefined deletes the member (null in an array). xs_json_revive_any gives the revived
+   any; xs_json_revive its text again, for a typed target (parsed then as JSON.parse(text) parses it) */
+static bool xs_jr_undef(void *v) { return v && xs_type_of(v)->print == xs_print_closure; }
+XS_NOINLINE void *xs_jr_walk(xs_closure *cl, xs_str *key, void *val /* owned */) {
+    void (*f)(void *) = val ? xs_type_of(val)->free : NULL;
+    if (f == xs_map_free && ((xs_map *)val)->record && ((xs_map *)val)->val_kind == 3) {
+        xs_map *m = val;
+        xs_arr_ref *ks = xs_arr_ref_new(m->count, NULL); /* (the keys first: the reviver may change the Record) */
+        xs_map_entry *e;
+        XS_MAP_EACH(m, e) xs_arr_ref_push(ks, xs_retain(e->skey));
+        for (size_t i = 0; i < ks->len; i++) {
+            xs_map_entry *ce = xs_map_lookup(m, ks->data[i], 0);
+            void *child = ce && ce->val.p ? xs_retain_(ce->val.p) : NULL;
+            void *nv = xs_jr_walk(cl, ks->data[i], child);
+            if (xs_jr_undef(nv)) { xs_release(nv); xs_map_delete_s(m, ks->data[i]); }
+            else xs_map_set_s(m, ks->data[i], XS_VPTR(nv));
+        }
+        xs_release(ks);
+    } else if (f == xs_arr_ref_free) {
+        xs_arr_ref *a = val;
+        for (size_t i = 0; i < a->len; i++) {
+            char kb[24];
+            size_t kn = xs_itoa((int64_t)i, kb);
+            xs_str *k = xs_str_new(kb, kn);
+            void *child = a->data[i] ? xs_retain_(a->data[i]) : NULL;
+            void *nv = xs_jr_walk(cl, k, child);
+            xs_release(k);
+            if (xs_jr_undef(nv)) { xs_release(nv); nv = NULL; }
+            void *old = a->data[i];
+            a->data[i] = nv;
+            xs_release(old);
+        }
+    }
+    void *r = ((void *(*)(void *, xs_str *, void *))cl->fn)(cl, key, val);
+    xs_release(val);
+    return r;
+}
+XS_NOINLINE void *xs_json_revive_any(xs_str *text, void *fn) {
+    void *v = xs_json_any(text);
+    xs_str *root = xs_str_new("", 0);
+    void *r = xs_jr_walk(fn, root, v);
+    xs_release(root);
+    if (xs_jr_undef(r)) { xs_release(r); r = NULL; }
+    return r;
+}
+XS_NOINLINE xs_str *xs_json_revive_(xs_str *text, void *fn, void (*unk)(xs_sb *, void *)) {
+    void *r = xs_json_revive_any(text, fn);
+    xs_jx st = {0};
+    st.unk = unk;
+    xs_sb b = {0};
+    xs_jx_write(&b, &st, r, 0);
+    xs_release(r);
+    return xs_sb_finish(&b);
+}
+#define xs_json_revive(text, fn) xs_json_revive_((text), (fn), xs_json_unknown) /* (the program's writer of its classes) */
+
 /* a parsed JSON value back as its text, with JSON's own number spelling (packages/typeorm's native code) */
 static void xs_sb_jstr(xs_sb *b, const char *p, size_t n) {
     xs_sb_put(b, "\"", 1);
@@ -5789,7 +6025,12 @@ static int xs_exit_code_; /* process.exitCode: the status when the program ends 
 /* process.on('exit' | 'beforeExit'): runtime/node/process.ts's dispatcher, called with (code, before) */
 static xs_closure *xs_pexit_cb;
 static void (*xs_rt_cleanup)(void); /* (process.ts's signal dispatcher, let go at the end) */
-XS_NOINLINE void xs_process_on_exit(xs_closure *cb) { if (!xs_pexit_cb) xs_pexit_cb = xs_retain(cb); }
+static void (*xs_uncaught_cleanup)(void); /* (process.ts's error dispatchers, let go at the end) */
+static void xs_uncaught_exit(void *err);
+XS_NOINLINE void xs_process_on_exit(xs_closure *cb) {
+    if (!xs_pexit_cb) xs_pexit_cb = xs_retain(cb);
+    if (!xs_uncaught_hook) xs_uncaught_hook = xs_uncaught_exit;
+}
 XS_NOINLINE void xs_pexit_call(xs_closure *cb, int64_t code, bool before) {
     size_t mark = xs_ar_mark();
     ((void (*)(void *, int64_t, bool))cb->fn)(cb, code, before);
@@ -5804,6 +6045,17 @@ XS_NOINLINE void xs_process_exit(int64_t code) {
     }
     fflush(stdout);
     exit((int)code);
+}
+/* an error nothing catches in a program with 'exit' listeners (and none for the error): printed as xs_throw does,
+   then 'exit' with the code 1, as in Node */
+static inline void xs_out_drain(void);
+static void xs_uncaught_exit(void *err) {
+    xs_Error *e = err;
+    fflush(stdout);
+    xs_out_drain();
+    fprintf(stderr, "uncaught Error: %s\n", e->f_message->data);
+    if (e->trace) xs_trace_print(e->trace, stderr);
+    xs_process_exit(1);
 }
 static int64_t xs_process_set_exit_code(int64_t code) { xs_exit_code_ = (int)code; return code; }
 /* process.stdout.write / process.stderr.write: through the same FILE as console.log, so the order is kept */
@@ -5878,9 +6130,17 @@ XS_NOINLINE xs_str *xs_fs_read_stdin(void) {
     buf[offsetof(xs_str, data) + n] = 0;
     return xs_str_adopt(buf, n);
 }
+#include <errno.h>
+#include <sys/stat.h>
+static void xs_fs_fail(int e, const char *syscall, xs_str *path);
+static void xs_fs_check_dir(FILE *f) { /* a directory opens, its read fails: Node's EISDIR (without the path) */
+    struct stat st;
+    if (fstat(fileno(f), &st) == 0 && S_ISDIR(st.st_mode)) { fclose(f); xs_fs_fail(EISDIR, "read", NULL); }
+}
 XS_NOINLINE xs_str *xs_fs_read(xs_str *path) {
     FILE *f = fopen(path->data, "rb");
-    if (!f) xs_panicf("ENOENT: no such file or directory, open '%s'", path->data);
+    if (!f) xs_fs_fail(errno, "open", path);
+    xs_fs_check_dir(f);
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     if (n < 0) { /* not a regular file (/dev/stdin on a pipe): read until the end */
@@ -5899,13 +6159,280 @@ XS_NOINLINE xs_str *xs_fs_read(xs_str *path) {
 }
 XS_NOINLINE void xs_fs_write_mode(xs_str *path, xs_str *data, const char *mode) {
     FILE *f = fopen(path->data, mode);
-    if (!f) xs_panicf("EACCES: cannot open '%s' for writing", path->data);
+    if (!f) xs_fs_fail(errno, "open", path);
     fwrite(data->data, 1, (size_t)data->len, f);
     fclose(f);
 }
 XS_NOINLINE void xs_fs_write(xs_str *path, xs_str *data) { xs_fs_write_mode(path, data, "wb"); }
 XS_NOINLINE void xs_fs_append(xs_str *path, xs_str *data) { xs_fs_write_mode(path, data, "ab"); }
 static bool xs_fs_exists(xs_str *path) { return access(path->data, F_OK) == 0; }
+
+/* ---- node:fs (runtime/node/fs.ts): system calls that give 0 or -errno, values with the error in xs_fs_err, and
+   Node's errors: "ENOENT: no such file or directory, open '/x'" with err.code, errno, syscall, path (and dest) ---- */
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#ifndef _WIN32
+#include <dirent.h>
+#include <limits.h>
+#endif
+static XS_TLS int64_t xs_fs_err; /* the last call's -errno (0: it worked), for the calls that give a value */
+XS_NOINLINE int64_t xs_fs_last_err(void) { return xs_fs_err; }
+/* libuv's name and words for an errno (uv_err_name, uv_strerror) */
+static const char *xs_fs_err_name(int64_t e, const char **text) {
+    static const struct { int e; const char *code, *text; } t[] = {
+        {ENOENT, "ENOENT", "no such file or directory"}, {EEXIST, "EEXIST", "file already exists"},
+        {ENOTDIR, "ENOTDIR", "not a directory"}, {EISDIR, "EISDIR", "illegal operation on a directory"},
+        {ENOTEMPTY, "ENOTEMPTY", "directory not empty"}, {EACCES, "EACCES", "permission denied"},
+        {EPERM, "EPERM", "operation not permitted"}, {EINVAL, "EINVAL", "invalid argument"}, {EBADF, "EBADF", "bad file descriptor"},
+        {EMFILE, "EMFILE", "too many open files"}, {ENFILE, "ENFILE", "file table overflow"}, {EXDEV, "EXDEV", "cross-device link not permitted"},
+        {ELOOP, "ELOOP", "too many symbolic links encountered"}, {ENAMETOOLONG, "ENAMETOOLONG", "name too long"},
+        {EBUSY, "EBUSY", "resource busy or locked"}, {ENOSPC, "ENOSPC", "no space left on device"}, {EROFS, "EROFS", "read-only file system"},
+        {EIO, "EIO", "i/o error"}, {EAGAIN, "EAGAIN", "resource temporarily unavailable"}, {ENOSYS, "ENOSYS", "function not implemented"},
+        {ENOTSUP, "ENOTSUP", "operation not supported on socket"}, {EFBIG, "EFBIG", "file too large"}, {ETXTBSY, "ETXTBSY", "text file is busy"},
+        {EMLINK, "EMLINK", "too many links"}};
+    int a = (int)(e < 0 ? -e : e);
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++)
+        if (t[i].e == a) { *text = t[i].text; return t[i].code; }
+    *text = strerror(a);
+    return "EIO";
+}
+/* throws Node's error for -errno e of syscall (owned) on path (dest: rename, copyfile, symlink and link name two;
+   both borrowed, NULL or empty when not given) */
+static void xs_fs_raise(int64_t e, xs_str *syscall, xs_str *path, xs_str *dest) {
+    static XS_TLS char m[2 * 4096 + 160];
+    const char *text, *code = xs_fs_err_name(e, &text);
+    int n = snprintf(m, sizeof m, "%s: %s, %s", code, text, syscall->data);
+    bool hp = path && path->len, hd = dest && dest->len;
+    if (hp && n >= 0 && (size_t)n < sizeof m) n += snprintf(m + n, sizeof m - (size_t)n, " '%s'", path->data);
+    if (hd && n >= 0 && (size_t)n < sizeof m) snprintf(m + n, sizeof m - (size_t)n, " -> '%s'", dest->data);
+    if (xs_try_depth == 0) { xs_release(syscall); xs_panic(m); } /* (no Error is made: the program ends, or an HTTP handler fails) */
+    xs_fs_errinfo *i = calloc(1, sizeof *i);
+    i->errnum = e < 0 ? e : -e;
+    i->syscall = syscall;
+    i->path = hp ? xs_retain(path) : NULL;
+    i->dest = hd ? xs_retain(dest) : NULL;
+    xs_fs_err_pending = i;
+    xs_panic(m);
+}
+XS_NOINLINE void xs_fs_throw(int64_t e, xs_str *syscall, xs_str *path, xs_str *dest) { xs_fs_raise(e, xs_retain(syscall), path, dest); }
+static void xs_fs_fail(int e, const char *syscall, xs_str *path) { /* (the runtime's own functions: readFileSync & co) */
+    xs_fs_raise(-(int64_t)e, xs_str_new(syscall, strlen(syscall)), path, NULL);
+}
+#define XS_FS_RC(call) ((call) == 0 ? 0 : -(int64_t)errno)
+XS_NOINLINE int64_t xs_fs_mkdir(xs_str *p, int64_t mode) {
+#ifdef _WIN32
+    return XS_FS_RC(mkdir(p->data));
+#else
+    return XS_FS_RC(mkdir(p->data, (mode_t)mode));
+#endif
+}
+XS_NOINLINE int64_t xs_fs_rmdir(xs_str *p) { return XS_FS_RC(rmdir(p->data)); }
+XS_NOINLINE int64_t xs_fs_unlink_rc(xs_str *p) { return XS_FS_RC(unlink(p->data)); }
+XS_NOINLINE int64_t xs_fs_rename(xs_str *a, xs_str *b) { return XS_FS_RC(rename(a->data, b->data)); }
+XS_NOINLINE int64_t xs_fs_chmod(xs_str *p, int64_t mode) { return XS_FS_RC(chmod(p->data, (mode_t)mode)); }
+XS_NOINLINE int64_t xs_fs_access(xs_str *p, int64_t mode) { return XS_FS_RC(access(p->data, (int)mode)); }
+XS_NOINLINE int64_t xs_fs_truncate(xs_str *p, int64_t len) { return XS_FS_RC(truncate(p->data, (off_t)len)); }
+#ifndef _WIN32
+XS_NOINLINE int64_t xs_fs_symlink(xs_str *target, xs_str *p) { return XS_FS_RC(symlink(target->data, p->data)); }
+XS_NOINLINE int64_t xs_fs_link(xs_str *a, xs_str *b) { return XS_FS_RC(link(a->data, b->data)); }
+XS_NOINLINE int64_t xs_fs_utimes(xs_str *p, double at, double mt, bool follow) { /* seconds, as Node takes them */
+    struct timespec ts[2];
+    double t[2] = {at, mt};
+    for (int i = 0; i < 2; i++) {
+        double s = floor(t[i]);
+        ts[i].tv_sec = (time_t)s;
+        ts[i].tv_nsec = (long)((t[i] - s) * 1e9);
+    }
+    return XS_FS_RC(utimensat(AT_FDCWD, p->data, ts, follow ? 0 : AT_SYMLINK_NOFOLLOW));
+}
+#endif
+/* [dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks, atimeMs, mtimeMs, ctimeMs, birthtimeMs]: Node's
+   Stats, in its order; empty, with xs_fs_err, when it fails. fd >= 0: fstat of it; else stat, or lstat (!follow) */
+#define XS_FS_MS(ts) ((double)(ts).tv_sec * 1000 + (double)(ts).tv_nsec / 1e6)
+XS_NOINLINE xs_arr_num *xs_fs_stat(xs_str *p, bool follow, int64_t fd) {
+    xs_arr_num *a = xs_arr_num_new(0, 0);
+    struct stat st;
+#ifdef _WIN32
+    int r = fd >= 0 ? fstat((int)fd, &st) : stat(p->data, &st);
+#else
+    int r = fd >= 0 ? fstat((int)fd, &st) : follow ? stat(p->data, &st) : lstat(p->data, &st);
+#endif
+    if (r != 0) { xs_fs_err = -(int64_t)errno; return a; }
+    xs_fs_err = 0;
+    /* (no braces inside the #if branches: tools/rtsplit.py counts them) */
+    double v[14];
+    v[0] = (double)st.st_dev; v[1] = (double)st.st_mode; v[2] = (double)st.st_nlink; v[3] = (double)st.st_uid;
+    v[4] = (double)st.st_gid; v[5] = (double)st.st_rdev; v[7] = (double)st.st_ino; v[8] = (double)st.st_size;
+#ifdef _WIN32
+    v[6] = 4096; v[9] = 0;
+    v[10] = (double)st.st_atime * 1000; v[11] = (double)st.st_mtime * 1000; v[12] = (double)st.st_ctime * 1000; v[13] = v[12];
+#elif defined(__APPLE__)
+    v[6] = (double)st.st_blksize; v[9] = (double)st.st_blocks;
+    v[10] = XS_FS_MS(st.st_atimespec); v[11] = XS_FS_MS(st.st_mtimespec); v[12] = XS_FS_MS(st.st_ctimespec); v[13] = XS_FS_MS(st.st_birthtimespec);
+#else
+    v[6] = (double)st.st_blksize; v[9] = (double)st.st_blocks;
+    v[10] = XS_FS_MS(st.st_atim); v[11] = XS_FS_MS(st.st_mtim); v[12] = XS_FS_MS(st.st_ctim); v[13] = v[12];
+#if defined(STATX_BTIME)
+    struct statx sx; /* the birth time, where the file system keeps it (libuv reads it so too) */
+    if (statx(fd >= 0 ? (int)fd : AT_FDCWD, fd >= 0 ? "" : p->data, (fd >= 0 ? AT_EMPTY_PATH : 0) | (follow ? 0 : AT_SYMLINK_NOFOLLOW), STATX_BTIME, &sx) == 0 && (sx.stx_mask & STATX_BTIME))
+        v[13] = (double)sx.stx_btime.tv_sec * 1000 + (double)sx.stx_btime.tv_nsec / 1e6;
+#endif
+#endif
+    for (int i = 0; i < 14; i++) xs_arr_num_push(a, v[i]);
+    return a;
+}
+/* a directory's entries, sorted as libuv's scandir sorts them (strcmp), each its kind's letter and its name: f file,
+   d directory, l symbolic link, b c p s devices, FIFOs and sockets, u unknown */
+XS_NOINLINE xs_arr_ref *xs_fs_readdir(xs_str *p) {
+    xs_arr_ref *a = xs_arr_ref_new(0, xs_print_str_quoted_);
+#ifdef _WIN32
+    xs_fs_err = -ENOSYS;
+    return a;
+#else
+    DIR *d = opendir(p->data);
+    if (!d) { xs_fs_err = -(int64_t)errno; return a; }
+    xs_fs_err = 0;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        const char *n = de->d_name;
+        if (n[0] == '.' && (n[1] == 0 || (n[1] == '.' && n[2] == 0))) continue;
+        char k = 'u';
+#ifdef DT_DIR
+        switch (de->d_type) {
+        case DT_REG: k = 'f'; break; case DT_DIR: k = 'd'; break; case DT_LNK: k = 'l'; break; case DT_BLK: k = 'b'; break;
+        case DT_CHR: k = 'c'; break; case DT_FIFO: k = 'p'; break; case DT_SOCK: k = 's'; break; default: break;
+        }
+#endif
+        size_t len = strlen(n);
+        xs_str *s = xs_str_alloc((int64_t)len + 1);
+        s->data[0] = k;
+        memcpy(s->data + 1, n, len + 1);
+        xs_arr_ref_push(a, s);
+    }
+    closedir(d);
+    /* (insertion sort by the names: directories are small, and the order is strcmp's) */
+    for (int64_t i = 1; i < a->len; i++) {
+        void *x = a->data[i];
+        int64_t j = i;
+        while (j > 0 && strcmp(((xs_str *)a->data[j - 1])->data + 1, ((xs_str *)x)->data + 1) > 0) { a->data[j] = a->data[j - 1]; j--; }
+        a->data[j] = x;
+    }
+    return a;
+#endif
+}
+static xs_str *xs_fs_str_or_err(const char *s, int e) {
+    if (!s) { xs_fs_err = -(int64_t)e; return xs_str_new("", 0); }
+    xs_fs_err = 0;
+    return xs_str_new(s, strlen(s));
+}
+XS_NOINLINE xs_str *xs_fs_realpath(xs_str *p) {
+#ifdef _WIN32
+    return xs_fs_str_or_err(NULL, ENOSYS);
+#else
+    char buf[PATH_MAX];
+    const char *r = realpath(p->data, buf);
+    return xs_fs_str_or_err(r, errno);
+#endif
+}
+XS_NOINLINE xs_str *xs_fs_readlink(xs_str *p) {
+#ifdef _WIN32
+    return xs_fs_str_or_err(NULL, ENOSYS);
+#else
+    char buf[PATH_MAX];
+    ssize_t n = readlink(p->data, buf, sizeof buf - 1);
+    if (n < 0) return xs_fs_str_or_err(NULL, errno);
+    buf[n] = 0;
+    return xs_fs_str_or_err(buf, 0);
+#endif
+}
+XS_NOINLINE xs_str *xs_fs_mkdtemp(xs_str *prefix) {
+#ifdef _WIN32
+    return xs_fs_str_or_err(NULL, ENOSYS);
+#else
+    size_t n = (size_t)prefix->len;
+    char *t = malloc(n + 7);
+    memcpy(t, prefix->data, n);
+    memcpy(t + n, "XXXXXX", 7);
+    const char *r = mkdtemp(t);
+    xs_str *s = xs_fs_str_or_err(r, errno);
+    free(t);
+    return s;
+#endif
+}
+/* open flags as Node's strings: r r+ rs+ w wx w+ wx+ a ax a+ ax+ as as+ */
+static int xs_fs_oflags(const char *f) {
+    bool plus = strchr(f, '+') != NULL, excl = strchr(f, 'x') != NULL;
+    int fl = f[0] == 'w' ? (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_TRUNC : f[0] == 'a' ? (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_APPEND : plus ? O_RDWR : O_RDONLY;
+    if (excl) fl |= O_EXCL;
+#ifdef O_CLOEXEC
+    fl |= O_CLOEXEC;
+#endif
+    return fl;
+}
+/* writeFileSync / appendFileSync: the bytes into the file opened with flags (0 or -errno) */
+static int64_t xs_fs_put(const char *path, const char *data, size_t n, xs_str *flags, int64_t mode) {
+    int fd = open(path, xs_fs_oflags(flags->data), (int)mode);
+    if (fd < 0) return -(int64_t)errno;
+    while (n > 0) {
+        ssize_t w = write(fd, data, n);
+        if (w < 0) { if (errno == EINTR) continue; int e = errno; close(fd); return -(int64_t)e; }
+        data += w;
+        n -= (size_t)w;
+    }
+    return XS_FS_RC(close(fd));
+}
+XS_NOINLINE int64_t xs_fs_write_str(xs_str *p, xs_str *data, xs_str *flags, int64_t mode) { return xs_fs_put(p->data, data->data, (size_t)data->len, flags, mode); }
+/* copyFileSync: src's bytes into dest (excl: fails when dest exists), with src's mode */
+XS_NOINLINE int64_t xs_fs_copy_file(xs_str *src, xs_str *dest, bool excl) {
+    int in = open(src->data, O_RDONLY);
+    if (in < 0) return -(int64_t)errno;
+    struct stat st;
+    if (fstat(in, &st) != 0) { int e = errno; close(in); return -(int64_t)e; }
+    if (S_ISDIR(st.st_mode)) { close(in); return -EISDIR; }
+    int out = open(dest->data, O_WRONLY | O_CREAT | O_TRUNC | (excl ? O_EXCL : 0), (int)(st.st_mode & 07777));
+    if (out < 0) { int e = errno; close(in); return -(int64_t)e; }
+    enum { XS_FS_COPY_BUF = 65536 };
+    char *buf = malloc(XS_FS_COPY_BUF); /* (not on the stack: the event loop's coroutines have small ones) */
+    int64_t rc = 0;
+    for (;;) {
+        ssize_t r = read(in, buf, XS_FS_COPY_BUF);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) { rc = -(int64_t)errno; break; }
+        if (r == 0) break;
+        for (ssize_t o = 0; o < r;) {
+            ssize_t w = write(out, buf + o, (size_t)(r - o));
+            if (w < 0 && errno == EINTR) continue;
+            if (w < 0) { rc = -(int64_t)errno; break; }
+            o += w;
+        }
+        if (rc) break;
+    }
+    free(buf);
+#ifndef _WIN32
+    if (!rc) fchmod(out, st.st_mode & 07777);
+#endif
+    close(in);
+    if (close(out) != 0 && !rc) rc = -(int64_t)errno;
+    return rc;
+}
+XS_NOINLINE double xs_fs_date_ms(xs_Date *d) { return d->t; } /* (utimesSync of a Date; d.getTime() in xisto:fs would bring the event loop) */
+/* the platform's name, as process.platform gives it (fileURLToPath's errors name it without node:process) */
+XS_NOINLINE xs_str *xs_url_platform(void) {
+#if defined(__APPLE__)
+    return xs_str_new("darwin", 6);
+#elif defined(_WIN32)
+    return xs_str_new("win32", 5);
+#else
+    return xs_str_new("linux", 5);
+#endif
+}
+XS_NOINLINE xs_str *xs_fs_errcode_of(int64_t e) { /* the errno's name ("ENOENT"), or with e < 0 its words */
+    const char *text, *code = xs_fs_err_name(e, &text);
+    const char *s = e < 0 ? text : code;
+    return xs_str_new(s, strlen(s));
+}
 
 /* ---- bytes: Uint8Array (and Buffer, the same object printed the Node way), TextEncoder/Decoder, base64/hex ----
    An array owns its bytes, or is a view (subarray) on another one's, which it keeps alive. Indexing is bounds
@@ -8603,7 +9130,8 @@ XS_NOINLINE xs_Uint8Array *xs_fs_read_stdin_bytes(void) {
 /* readFileSync(path) without an encoding: the bytes (a Buffer); writeFileSync(path, bytes) */
 XS_NOINLINE xs_Uint8Array *xs_fs_read_bytes(xs_str *path) {
     FILE *f = fopen(path->data, "rb");
-    if (!f) xs_panicf("ENOENT: no such file or directory, open '%s'", path->data);
+    if (!f) xs_fs_fail(errno, "open", path);
+    xs_fs_check_dir(f);
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     if (n < 0) { /* not a regular file: read until the end */
@@ -8622,34 +9150,22 @@ XS_NOINLINE xs_Uint8Array *xs_fs_read_bytes(xs_str *path) {
     fclose(f);
     return b;
 }
+XS_NOINLINE int64_t xs_fs_write_buf(xs_str *p, xs_Uint8Array *b, xs_str *flags, int64_t mode) { return xs_fs_put(p->data, (const char *)b->data, (size_t)b->f_length, flags, mode); }
 XS_NOINLINE void xs_fs_write_bytes(xs_str *path, xs_Uint8Array *b) {
     FILE *f = fopen(path->data, "wb");
-    if (!f) xs_panicf("EACCES: cannot open '%s' for writing", path->data);
+    if (!f) xs_fs_fail(errno, "open", path);
     fwrite(b->data, 1, (size_t)b->f_length, f);
     fclose(f);
 }
 
-/* node:fs on file descriptors (checker: check_fs_fd_call): openSync, closeSync, fstatSync, readSync */
+/* node:fs on file descriptors (checker: check_fs_fd_call): openSync, closeSync, readSync (fstatSync: xs_fs_stat) */
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-typedef struct xs_Stats { xs_hdr hdr; int64_t f_size; int64_t mode; } xs_Stats;
-static void xs_Stats_print(void *p) { fprintf(XS_OUT, "Stats { size: %lld }", (long long)((xs_Stats *)p)->f_size); }
-static void xs_Stats_free(void *p) { xs_obj_free(p); }
-XS_NOINLINE xs_Stats *xs_fs_fstat(int64_t fd) {
-    struct stat st;
-    if (fstat((int)fd, &st) != 0) { char m_[96]; snprintf(m_, sizeof m_, "EBADF: bad file descriptor, fstat (%lld)", (long long)fd); xs_panic(m_); }
-    xs_Stats *s = xs_obj_alloc(sizeof *s, xs_Stats_free, xs_Stats_print);
-    s->f_size = (int64_t)st.st_size;
-    s->mode = (int64_t)st.st_mode;
-    return s;
-}
-static bool xs_Stats_isFile(xs_Stats *s) { return S_ISREG((mode_t)s->mode); }
-static bool xs_Stats_isDirectory(xs_Stats *s) { return S_ISDIR((mode_t)s->mode); }
 XS_NOINLINE int64_t xs_fs_open(xs_str *path, xs_str *flags) {
     int fl = strcmp(flags->data, "w") == 0 ? O_WRONLY | O_CREAT | O_TRUNC : strcmp(flags->data, "a") == 0 ? O_WRONLY | O_CREAT | O_APPEND : strcmp(flags->data, "r+") == 0 ? O_RDWR : O_RDONLY;
     int fd = open(path->data, fl, 0666);
-    if (fd < 0) xs_panicf("ENOENT: no such file or directory, open '%s'", path->data);
+    if (fd < 0) xs_fs_fail(errno, "open", path);
     return fd;
 }
 XS_NOINLINE void xs_fs_close(int64_t fd) {
@@ -8698,7 +9214,7 @@ XS_NOINLINE xs_str *xs_exec_sync(xs_str *cmd) {
     if (st != 0) { free(b.data); xs_panicf("Command failed: %s", cmd->data); }
     return xs_sb_finish(&b);
 }
-XS_NOINLINE void xs_fs_unlink(xs_str *path) { if (unlink(path->data) != 0) xs_panicf("ENOENT: no such file or directory, unlink '%s'", path->data); }
+XS_NOINLINE void xs_fs_unlink(xs_str *path) { if (unlink(path->data) != 0) xs_fs_fail(errno, "unlink", path); }
 
 /* BigInt: arbitrary-precision integers, immutable values as in JavaScript.
    Sign and magnitude, 64-bit limbs (least significant first) in the object itself; products and the
@@ -10303,6 +10819,7 @@ XS_NOINLINE void xs_before_exit(void) {
         xs_release(cb);
     }
     if (xs_rt_cleanup) { void (*c)(void) = xs_rt_cleanup; xs_rt_cleanup = NULL; c(); }
+    if (xs_uncaught_cleanup) { void (*c)(void) = xs_uncaught_cleanup; xs_uncaught_cleanup = NULL; c(); }
 }
 /* ---- regions (the compiler's region.c) ----
    The objects of a region class are made in one loop and cannot outlive an iteration of it: they come from an

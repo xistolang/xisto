@@ -1,0 +1,2 @@
+uncaught Error: boom
+    at tests/stderr/node-process-uncaught-default.ts:5:9

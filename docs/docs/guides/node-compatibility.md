@@ -21,10 +21,11 @@ xisto build --node-compat -o app main.ts
 
 Available modules include:
 
-- `fs`, `path`, `os`, `url`
+- `fs`, `fs/promises`, `path`, `os`, `url` and `import.meta` (see [fs, path, os, url](#fs-path-os-url))
 - `http`: Node's `createServer`/`request`/`get` (below), and xisto's own `Server` with `fetch`, with TLS for
   `https://` (AWS-LC by default, or BearSSL)
 - `events` (`EventEmitter`), `process`, `timers`, `http`, `net`, `dns`, `child_process` (see below)
+- `readline`, `readline/promises` and `tty`, with `process.stdin` (see [readline](#readline) and [tty](#tty))
 - `util`, `querystring`, `string_decoder` (below)
 - `http` / `https`: a server and `fetch`, with TLS (AWS-LC by default, or BearSSL)
 - `crypto`: hashes, HMAC, AES ciphers, pbkdf2/scrypt/hkdf, keys and RSA/ECDSA signatures (see [crypto](#crypto))
@@ -72,7 +73,7 @@ Supported:
 | all | `_construct`, `_destroy`, `destroy(err, cb)`, `autoDestroy`, `emitClose`, `destroyed`/`closed`/`errored` |
 | functions | `pipeline(...streams, cb)`, `finished(stream, [options], cb)`, `isReadable`, `isWritable`, `isErrored`, `isDisturbed`, `getDefaultHighWaterMark`/`setDefaultHighWaterMark` (64 KiB, 16 objects) |
 | `node:stream/promises` | `pipeline(...streams)`, `finished(stream, options?)` |
-| `node:fs` | `createReadStream(path, { start, end, highWaterMark, encoding, fd, flags, autoClose })` and `createWriteStream(path, { flags, encoding, start, fd })`, `ReadStream`/`WriteStream` (`'open'`, `'ready'`, `bytesRead`/`bytesWritten`, `close()`); errors as Node's (`ENOENT: no such file or directory, open '...'`, `code`, `syscall`) |
+| `node:fs` | `createReadStream(path, { start, end, highWaterMark, encoding, fd, flags, autoClose })` (by name or as `fs.createReadStream`) and `createWriteStream(path, { flags, encoding, start, fd })`, `ReadStream`/`WriteStream` (`'open'`, `'ready'`, `bytesRead`/`bytesWritten`, `close()`); errors as Node's (`ENOENT: no such file or directory, open '...'`, `code`, `syscall`) |
 
 Errors carry Node's `code` and message (`ERR_STREAM_PUSH_AFTER_EOF`, `ERR_STREAM_WRITE_AFTER_END`,
 `ERR_STREAM_DESTROYED`, `ERR_STREAM_PREMATURE_CLOSE`, `ERR_MULTIPLE_CALLBACK`, `ERR_INVALID_ARG_TYPE`...).
@@ -109,8 +110,6 @@ Differences from Node:
   `toArray`...).
 - A missing argument is `null` (`finished` calls back with `null`, not `undefined`); errors are `Error` objects
   (Node's `AggregateError` of two errors is the later one).
-- `fs.createReadStream` and `createWriteStream` must be imported by name (`import { createReadStream } from
-  "node:fs"`), not through `import fs from "node:fs"`.
 
 ### stream/web
 
@@ -204,9 +203,67 @@ Beyond `process.argv`, `process.env`, `process.pid`, `process.cwd()`, `process.e
 | `on('SIGINT' \| 'SIGTERM' \| 'SIGHUP' \| 'SIGUSR1' \| 'SIGUSR2' ...)` | a listener replaces the default action; it also takes precedence over the HTTP server's graceful shutdown |
 | `kill(pid, signal)`, `chdir(dir)`, `umask()`, `getuid()`/`getgid()`/`geteuid()`/`getegid()`, `emitWarning()`, `abort()` | errors carry Node's messages (`ENOENT: no such file or directory, chdir ...`) |
 
-Differences from Node: `'uncaughtException'` and `'unhandledRejection'` listeners are not called (an uncaught
-error ends the program with exit code 1, as when no listener is set). `process.stdin` is not available yet; read standard
-input with `xisto:io`.
+| `on('uncaughtException' \| 'uncaughtExceptionMonitor')`, `setUncaughtExceptionCaptureCallback(fn)`, `hasUncaughtExceptionCaptureCallback()` | the listener gets `(err, origin)`; the work the error interrupted ends and the event loop goes on (an interval keeps firing). A listener that throws ends the program with code 7 |
+| `on('unhandledRejection')` | `(reason, promise)` once the microtasks have run; with no such listener the rejection goes to `'uncaughtException'` with the origin `"unhandledRejection"` (Node's default `--unhandled-rejections=throw`) |
+| `stdin`, `stdout`, `stderr` as streams | `process.stdin` is a `Readable` over fd 0 (see [tty](#tty)); `process.stdout`/`stderr` are `Writable`s (`isTTY`, `columns`, `rows`, a `pipe()` target); `process.stdout.write(x)` itself stays the built-in fast path |
+
+With no `'uncaughtException'` listener an uncaught error is printed (`uncaught Error: message` and its stack) and the
+program ends with code 1, after the `'exit'` listeners, as in Node.
+
+Differences from Node:
+
+- the promise an `'unhandledRejection'` listener gets is typed `unknown` (`(reason: Error, promise: unknown) => ...`):
+  a `Promise<void>` parameter cannot be checked at run time;
+- an error thrown by the top level reports the origin `"unhandledRejection"` (Node runs a `.ts` file with an import or
+  an export as an ES module, whose top level is a promise; a CommonJS file reports `"uncaughtException"`), and only the
+  `'uncaughtException'` listeners get it, as in Node 26;
+- an `async` function called without `await` whose body throws before its first real wait (one that parks) throws
+  synchronously, so it reaches `'uncaughtException'`, not `'unhandledRejection'`;
+- `'rejectionHandled'` is not emitted, and `'warning'` only by `process.emitWarning`;
+- a program that listens for `'uncaughtException'` (or `'exit'`) keeps its top-level variables as globals (main has
+  a landing for the errors a listener takes); other programs compile as before.
+
+## readline
+
+`node:readline` and `node:readline/promises` (also `readline.promises`) read lines from any `Readable`:
+`process.stdin`, `fs.createReadStream`, a stream of your own.
+
+| API | Notes |
+|---|---|
+| `createInterface({ input, output, prompt, crlfDelay, terminal })`, `createInterface(input, output)` | `'line'` for each line, `'close'` at the end of the input (or `rl.close()`), `'pause'`, `'resume'` |
+| `rl.question(query, cb)`; `readline/promises`: `await rl.question(query)` | the query goes to `output`; the next line is the answer. A pending promise is rejected (`AbortError`) when the interface closes |
+| `rl.prompt()`, `setPrompt()`, `getPrompt()`, `write(data)`, `pause()`, `resume()`, `close()`, `closed` | |
+| `for await (const line of rl)` | the input pauses while 1024 lines wait to be read |
+| `clearLine`, `clearScreenDown`, `cursorTo`, `moveCursor`; `readline/promises`' `Readline` (`commit()`) | ANSI sequences written to the stream |
+
+Lines end at `\n`, `\r\n` or a lone `\r` (a `\r\n` split across two chunks is one ending when the `\n` comes within
+`crlfDelay` ms); the last line is emitted at the end of the input even without a newline. As in Node, with piped
+input every line already read is emitted at once: answers of `await rl.question()` asked one after another can be
+lost (the callback form, which asks the next question from the callback, gets each line).
+
+Differences from Node: there is no terminal line editing, history, completion or `'keypress'` event; on a terminal
+the input is read in its normal (cooked) mode, so the terminal echoes and edits the line, and `rl.line` and
+`rl.cursor` stay empty. No `'SIGINT'`/`'SIGTSTP'`/`'SIGCONT'` events; `emitKeypressEvents` does nothing.
+
+## tty
+
+| API | Notes |
+|---|---|
+| `isatty(fd)` | |
+| `process.stdin` (`tty.ReadStream`) | `'data'` (Buffers, or strings after `setEncoding`), `'end'`, `'close'` (on a pipe or a terminal), `pause()`/`resume()`, `pipe()`, `for await`; `isTTY` (true, or `undefined` off a terminal), `setRawMode(mode)`, `isRaw` |
+| `process.stdout`/`stderr` (`tty.WriteStream`) | `write`, `end`, `pipe()` target, `isTTY`, `columns`/`rows` (TIOCGWINSZ), `getWindowSize()`, `getColorDepth(env?)`/`hasColors(count?, env?)` with Node's rules (`FORCE_COLOR`, `NO_COLOR`, `TERM`, `COLORTERM`, `TMUX`, `CI`, `TERM_PROGRAM`) |
+
+`process.stdin` works over a pipe, a file, `/dev/null` and a terminal. It is read on the event loop in 64 KiB
+chunks, only while someone reads it (a `'data'` listener, `read()`, `pipe()`, `for await`, a readline interface):
+a paused or untouched stdin does not keep the program alive, as in Node. The descriptor is not made non-blocking (it
+is shared with the shell): a read comes only once the event loop says there is data.
+
+Differences from Node: `process.stdin` is a `tty.ReadStream` whatever fd 0 is (Node: a `net.Socket` for a pipe, an
+`fs.ReadStream` for a file); writes to `process.stdout`/`stderr` are synchronous (Node: asynchronous on pipes), and
+their `end()` ends the stream object only (the descriptor stays open, `console.log` goes on); `pipe()` into
+`process.stdout` ends that stream object when the source ends (Node leaves stdout open); there is no `'resize'`
+event (`getWindowSize()` reads the size again); `new tty.WriteStream(fd)` also works on a descriptor that is not a
+terminal.
 
 ## Default imports
 
@@ -230,30 +287,47 @@ server.listen(3000, () => console.log("listening"));
 
 `createServer(listener)` gives a server whose listener receives an `IncomingMessage` and a `ServerResponse`:
 
-- **Request:** `method`, `url` (path and query), `headers` (lower-case names), `rawHeaders`, `httpVersion`. The
-  request (and the client's response) is a `stream.Readable`: `'data'`/`'end'`, `setEncoding`, `pipe()` and
-  `for await (const chunk of req)`.
-- **Response:** `statusCode`, `setHeader`/`appendHeader`/`getHeader`/`getHeaders`/`hasHeader`/`removeHeader`,
-  `writeHead(status, headers)`, `write`, `end`, and `'finish'`.
-- **Server:** `listen(port, cb)`, with port 0 choosing a free port, `address()`, `close(cb)`, and the
-  `'request'`, `'listening'` and `'close'` events.
+- **Request:** `method`, `url` (path and query), `headers` (lower-case names), `rawHeaders`, `httpVersion`,
+  `socket` (`remoteAddress`, `remotePort`, `localPort`, `encrypted`, `destroy()`), `complete`, `aborted`. The
+  request (and the client's response) is a `stream.Readable`: `'data'`/`'end'`/`'close'`, `setEncoding`, `pipe()`
+  and `for await (const chunk of req)`. Bodies are bytes: `'data'` gives Buffers (strings after `setEncoding`), so
+  uploads of images or any binary arrive byte for byte; `body += chunk` gives the UTF-8 text, as in Node.
+- **Response:** `statusCode`, `statusMessage`, `setHeader`/`appendHeader`/`getHeader`/`getHeaders`/`hasHeader`/
+  `removeHeader`, `writeHead(status[, reason], headers)`, `flushHeaders()`, `write`, `end`, `headersSent`,
+  `writableEnded`/`writableFinished`, and `'finish'`, `'close'` and `'drain'`. `write()` and `end()` take strings,
+  Buffers and Uint8Arrays (gzip from `node:zlib`, files, downloads), and `Content-Length` counts bytes. The
+  response is a `stream.Writable`, so a stream can `pipe()` into it.
+- **Server:** `listen(port[, host], cb)`, with port 0 choosing a free port, `address()`, `close(cb)`,
+  `closeIdleConnections()`, `closeAllConnections()`, `keepAliveTimeout` and the `'request'`, `'connection'`,
+  `'checkContinue'`, `'listening'`, `'close'` and `'error'` events. `http.Server` works as a type and with `new`.
 
-`listen()` returns at once, as in Node. The server answers once the program's own code has run, on the same event
-loop as its timers and other sockets. `close()` lets the program end normally.
+Responses stream as in Node. The head goes out with the first `write()` (or `flushHeaders()`), each `write()` is
+sent at once, and the body is chunked when no `Content-Length` was set (`end(body)` alone sends a
+`Content-Length`). Server-sent events work: `res.writeHead(200, { "Content-Type": "text/event-stream" })`, then
+`res.write("data: ...\n\n")` from a timer. `write()` returns false once more than 16 KB wait to be sent, and
+`'drain'` follows. When the client goes away, the request and the response get `'close'`.
 
-The client side, `http.request(url | options, cb)` and `http.get(...)`, runs on `fetch`. You get a
-`ClientRequest` (`setHeader`, `write`, `end`, `'response'`, `'error'`) and an `IncomingMessage` response
-(`statusCode`, `statusMessage`, `headers`, `'data'`/`'end'`). `STATUS_CODES` and `METHODS` are there too.
+A program can run any number of servers (an app and a metrics endpoint, the servers of a test), each on its own
+port. `close()` of one leaves the others serving. `listen()` returns at once, as in Node. Each connection is a
+task on the program's event loop, next to its timers and other sockets, and `close()` lets the program end
+normally once its connections are closed.
+
+The client side, `http.request(url | options, cb)` and `http.get(...)`, gives a `ClientRequest` (`setHeader`,
+`write`, `end`, `setTimeout`, `destroy`, `'response'`, `'error'`, `'close'`) and an `IncomingMessage` response
+(`statusCode`, `statusMessage`, `headers`, `'data'`/`'end'`). The response's body comes as it arrives (a
+server-sent events stream can be read), as Buffers. `STATUS_CODES` and `METHODS` are there too.
 
 Differences from Node:
 
-- Bodies are text: binary request and response bodies are read and written as UTF-8.
-- A response is sent when `end()` is called. `write()` buffers, so there is no chunked streaming yet. For
-  streaming, use xisto's `HttpResponse.stream`.
-- One server per program.
-- The server class is `HttpServer`. The name `Server` is xisto's built-in server, so `import { Server } from
-  "node:http"` does not work; `http.createServer` does.
-- `Agent` is not there yet.
+- A client request's body is sent at `end()` with a `Content-Length` (Node streams it chunked when `write()` came
+  before `end()`). Each request opens its own connection: there is no `Agent` and no connection reuse yet.
+- A request body is not held back: `req.pause()` does not stop the reading of the socket, so a large upload the
+  handler does not read is kept in memory.
+- `headersTimeout`, `requestTimeout` and `server.setTimeout` are accepted but not enforced; idle keep-alive
+  connections are closed after `keepAliveTimeout`. HTTP/1.1 only (no HTTP/2, no `upgrade`/`CONNECT` events).
+- `req.socket` is a small socket object (addresses, `destroy()`, `'close'`), not a `net.Socket`.
+- `new http.Server()` and `import { Server } from "node:http"` name node:http's server where they are imported;
+  elsewhere `Server` is xisto's built-in server.
 
 ## net
 
@@ -423,6 +497,41 @@ back the bytes of an incomplete group of three.
   even byte (the usual case) is joined as in Node.
 - `lastChar`, `lastNeed` and `lastTotal` are missing.
 
+## JSON
+
+`JSON.stringify(value)` is generated for the value's type (the fast path, unchanged). `JSON.stringify(value,
+replacer, space)` writes what Node writes:
+
+- `space`: a number of spaces (clamped to 0..10) or a string (its first 10 characters); nested objects and arrays
+  one member per line, `": "` after keys, empty `{}` and `[]` compact;
+- `replacer`: `null`/`undefined`, a `string[]` of the keys to keep (at every level, in the list's order), or a
+  function `(key: string, value: any) => any`, called first with the key `""` for the root, then for each member
+  and element; returning `undefined` leaves a member out (`null` in an array), a new object or array returned is
+  walked in turn;
+- `toJSON`, `Date` and optional fields left out behave as in the one-argument call.
+
+`JSON.parse(text, reviver)` calls `reviver(key, value)` from the leaves up, the root last with the key `""`;
+`undefined` deletes the member. Into an `any` the revived value is kept as the reviver made it (a `Date` stays a
+`Date`); into a declared type, the revived JSON is decoded as `JSON.parse(text)` decodes it.
+
+```ts
+console.log(JSON.stringify(user, ["id", "email"], 2));
+console.log(JSON.stringify(user, (k, v) => (k === "password" ? undefined : v), "\t"));
+const ev: any = JSON.parse(text, (k, v) => (k === "at" ? new Date(v) : v));
+```
+
+Differences from Node:
+
+- The replacer sees the value as JSON gives it back: after `toJSON` (as in Node: a `Date` is already its ISO
+  string), but a class instance as a plain object (`Record<string, any>`), where Node passes the instance itself.
+  `value instanceof MyClass` is `false` there. A `Map` or `Set` the replacer returns is written `{}`, as in Node.
+- xisto has one empty value, so `undefined` in a replacer is recognized where the code says it: `return undefined`
+  or `undefined` in a `?:` branch of a replacer written in place, or of a function declared with an `any` or
+  `unknown` result passed by name (that function then returns JSON's `undefined` for every caller). Elsewhere
+  `undefined` is `null` and is written as `null`.
+- When the replacer drops the root, the result is the string `"undefined"` (Node: the value `undefined`).
+- `this` inside a replacer is not the holder object.
+
 ## console.log and inspect
 
 Strings inside objects are quoted as Node quotes them: `'...'`, or `"..."` when the string has a `'`, or `` `...` ``
@@ -468,7 +577,7 @@ Differences from Node:
   connection only.
 - The handshake's error messages are the TLS library's, not OpenSSL's codes (`DEPTH_ZERO_SELF_SIGNED_CERT`...).
 - Not available yet: `tls.createServer` (`node:https` serves TLS), client certificates, `passphrase`, SNI
-  callbacks.
+  callbacks. `node:https` has node:http's behavior otherwise: binary bodies, streaming, several servers.
 - `TLSSocket` is an `EventEmitter`, not a `stream.Duplex`.
 
 ## TLS
@@ -584,6 +693,80 @@ Differences from Node:
   ciphers (`chacha20-poly1305`, `aes-*-ccm`, `-ocb`, `-cfb`...), `Cipher`/`Hash` as streams (`pipe`), the async
   `generateKeyPair`, `X509Certificate`, and `subtle` beyond HMAC and digests (RSA, ECDSA, AES keys, `deriveBits`,
   `exportKey("jwk")`).
+
+## fs, path, os, url
+
+**`node:fs`, synchronous**: `readFileSync`, `writeFileSync`, `appendFileSync` (with an encoding or an options
+object: `{ encoding, flag, mode }`), `existsSync`, `unlinkSync`, `mkdirSync` (`{ recursive }`: gives the first
+directory made), `readdirSync` (`{ withFileTypes }`: `Dirent`s with `name`, `parentPath`, `isFile()`,
+`isDirectory()`, `isSymbolicLink()`...; `{ recursive }`), `statSync`/`lstatSync`/`fstatSync` (`Stats`: `size`,
+`mode`, `nlink`, `uid`, `ino`..., `atimeMs`/`mtimeMs`/`ctimeMs`/`birthtimeMs` and their `Date`s, `isFile()`,
+`isDirectory()`, `isSymbolicLink()`...; `{ throwIfNoEntry: false }`), `rmSync` (`{ recursive, force }`),
+`rmdirSync`, `renameSync`, `copyFileSync` (`COPYFILE_EXCL`), `cpSync` (`{ recursive, force, errorOnExist,
+filter }`), `mkdtempSync`, `realpathSync`, `accessSync`, `chmodSync`, `symlinkSync`, `readlinkSync`, `linkSync`,
+`truncateSync`, `utimesSync`/`lutimesSync`, `openSync`/`closeSync`/`readSync`, and `fs.constants` (`F_OK`, `R_OK`,
+`W_OK`, `X_OK`, `COPYFILE_EXCL`, `S_IF*`...). Errors are Node's: the message (`ENOENT: no such file or directory,
+open '/x'`, `EEXIST: file already exists, mkdir '/x'`, `rename 'a' -> 'b'`...) and `err.code`, `errno` (this
+system's, negative), `syscall`, `path` and `dest`, read through an `any` (`catch (e: any)`) or a cast; `rmSync` of
+a directory without `recursive` is Node's `SystemError` `ERR_FS_EISDIR`.
+
+**Callbacks**: `fs.readFile(path, options?, callback)` (`"utf8"` or `{ encoding }`: text; otherwise a `Buffer`),
+`writeFile`, `appendFile`, `mkdir`, `readdir` (`withFileTypes`), `stat`, `lstat`, `fstat`, `rm`, `rmdir`, `rename`,
+`access`, `unlink`, `copyFile`, `cp`, `realpath`, `mkdtemp`, `readlink`, `symlink`, `link`, `chmod`, `truncate`,
+`utimes`: the work and the callback happen on a later turn of the event loop, `err` is `null` when it worked.
+
+**Promises**: `node:fs/promises` and `fs.promises` (also `import { promises } from "node:fs"`): `readFile`
+(text with an encoding, else a `Buffer`), `writeFile`, `appendFile`, `unlink`, `mkdir`, `readdir`, `stat`,
+`lstat`, `rm`, `rmdir`, `rename`, `copyFile`, `cp`, `mkdtemp`, `realpath`, `access`, `chmod`, `readlink`,
+`symlink`, `link`, `utimes`, `lutimes`, `truncate`.
+
+The callback API, `fs.promises` and the streams are loaded only by programs that name them (as `fs.readFile`,
+`import { readFile }`...): a program that only calls `readFileSync` does not carry the event loop.
+
+**`node:path`**: POSIX `join`, `resolve`, `normalize`, `relative`, `dirname`, `basename`, `extname`,
+`isAbsolute`, `parse`, `format`, `toNamespacedPath`, `sep`, `delimiter`; `path.posix` (the same) and
+`path.win32` (`normalize`, `join`, `isAbsolute`, `dirname`, `basename`, `extname`, `parse`, `format`,
+`toNamespacedPath`, `sep`, `delimiter`, with drive letters and UNC roots as Node's).
+
+**`node:os`**: `platform`, `type`, `arch`, `machine`, `release`, `version`, `hostname`, `homedir`, `tmpdir`,
+`endianness`, `EOL`, `devNull`, `uptime`, `loadavg`, `totalmem`, `freemem`, `availableParallelism`, `cpus`,
+`userInfo` (`uid`, `gid`, `username`, `homedir`, `shell`), `networkInterfaces` (`address`, `netmask`, `family`,
+`mac`, `internal`, `cidr`, `scopeid`) and `os.constants` (`signals` and `errno` with this system's numbers,
+`priority`).
+
+**`node:url`**: `fileURLToPath(url)` and `pathToFileURL(path)`, encoded as Node encodes them (spaces, `%`, `#`, `?`,
+`\`, non-ASCII), with Node's errors (`ERR_INVALID_URL_SCHEME`, `ERR_INVALID_FILE_URL_HOST`,
+`ERR_INVALID_FILE_URL_PATH`).
+
+**`import.meta`**: `import.meta.url` (a `file://` URL), `import.meta.filename` and `import.meta.dirname` are the
+module's source file **as the build found it** (absolute, symbolic links resolved). Node gives the file it runs;
+xisto compiles ahead of time, so the value is where the source was when it was built, not where the binary runs.
+That is what `new URL("./data.json", import.meta.url)` and `fileURLToPath(import.meta.url)` want to find files
+kept next to the source; a binary moved to another machine still names the build machine's paths (ship such
+files next to the binary and find them with `process.execPath` instead). `import.meta.resolve` and
+`import.meta.main` are not there.
+
+Differences from Node:
+
+- Paths are strings: not `Buffer`s or `URL`s (`fileURLToPath(url)` gives one), no file descriptors where a path
+  goes (beyond `fstatSync`, `readSync` and the streams).
+- `readFileSync` takes `"utf8"`/`"utf-8"` (or `{ encoding }` with one) for text; another encoding is
+  `readFileSync(path).toString(encoding)`. `writeFileSync`/`appendFileSync` write text in another encoding
+  (`"latin1"`, `"base64"`...) when the encoding is written in the call (a literal; one held in a variable throws
+  an error that says so). `openSync` takes the flags `r`, `w`, `a`, `r+`.
+- On an error the callback's result is empty (`""`, an empty `Buffer` or array, a `Stats` of zeros) where Node
+  passes `undefined`; a missing optional value (`mkdirSync`'s result, `err.dest`) prints as `null` in
+  `console.log`.
+- `console.log(err)` prints `Error: <message>` (no `{ errno, code, syscall, path }` block and no stack);
+  `console.log(stats)`/`console.log(dirent)` print xisto's form of the object; `os.userInfo()` and
+  `os.constants.priority` print without `[Object: null prototype]`.
+- `fs.promises` calls run when awaited, on the calling thread (Node: its thread pool), and the callback API
+  runs the call on a later turn of the event loop (Node: in parallel).
+- Not there: `fs.watch`/`watchFile`, `fs.glob`/`globSync`, `opendirSync`/`Dir`, `FileHandle`
+  (`fs/promises` `open`), `fs.read`/`write` on descriptors with callbacks, `statfs`, `bigint` stats,
+  `path.matchesGlob`, `path.win32.resolve`/`relative` (and `toNamespacedPath` of a relative Windows path, which
+  Node resolves against the current directory first), `os.setPriority`/`getPriority`, `os.cpus()` models and
+  speeds (empty and 0).
 
 ## npm packages
 
