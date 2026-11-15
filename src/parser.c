@@ -1291,8 +1291,42 @@ static bool is_url_global_name(const char *n) {
     return n && (!strcmp(n, "URL") || !strcmp(n, "URLSearchParams") || !strcmp(n, "AbortController") || !strcmp(n, "AbortSignal") ||
                  !strcmp(n, "DOMException") || !strcmp(n, "RequestInit") || !strcmp(n, "HeadersInit") || !strcmp(n, "fetch") || !strcmp(n, "BufferEncoding"));
 }
+/* import.meta.url / dirname / filename: the module's source file as the build found it (an absolute path, symbolic
+   links resolved, as Node gives the main module's). xisto compiles ahead of time, so this is where the source was
+   built, not where the binary runs: what new URL("./x", import.meta.url) and fileURLToPath(import.meta.url) want to
+   find files kept next to the source. The URL is percent-encoded as Node's pathToFileURL encodes it. */
+static Expr *parse_import_meta(Parser *p) {
+    Pos pos = p->tok.pos;
+    expect(p, TK_IMPORT, NULL);
+    expect(p, TK_DOT, NULL);
+    if (!at_ident(p, "meta")) xs_error(XS1021, p->tok.pos, "import.meta.url, import.meta.dirname, import.meta.filename", "expected an expression but found 'import'");
+    next(p);
+    expect(p, TK_DOT, "import.meta.url, import.meta.dirname or import.meta.filename");
+    Token name = expect(p, TK_IDENT, NULL);
+    const char *file = p->mod && p->mod->path && p->mod->path[0] == '/' ? p->mod->path : NULL;
+    char abs[PATH_MAX];
+    if (!file && p->mod && p->mod->path && realpath(p->mod->path, abs)) file = abs;
+    if (!file) file = p->mod && p->mod->path ? p->mod->path : "";
+    Expr *e = new_expr(E_STRING, pos);
+    if (strcmp(name.str, "filename") == 0) e->str = xs_strndup(file, strlen(file));
+    else if (strcmp(name.str, "dirname") == 0) {
+        const char *sl = strrchr(file, '/');
+        e->str = sl == file ? "/" : xs_strndup(file, sl ? (size_t)(sl - file) : 0);
+    } else if (strcmp(name.str, "url") == 0) {
+        Buf b = {0};
+        buf_puts(&b, "file://");
+        for (const unsigned char *c = (const unsigned char *)file; *c; c++) {
+            if (isalnum(*c) || strchr("-._!$&'()*+,;=:@/", *c)) buf_printf(&b, "%c", *c);
+            else buf_printf(&b, "%%%02X", *c);
+        }
+        e->str = b.data ? b.data : "file://";
+    } else xs_error(XS1021, name.pos, "import.meta.url, import.meta.dirname, import.meta.filename", "import.meta.%s is not supported", name.str);
+    return e;
+}
+
 static Expr *parse_primary(Parser *p) {
     Pos pos = p->tok.pos;
+    if (at(p, TK_IMPORT) && peek_is(p, TK_DOT)) return parse_import_meta(p);
     if (at(p, TK_IDENT) && strncmp(p->tok.str, "__reflect_", 10) == 0) { /* __reflect_kind(T) & co: generated code only */
         Expr *e = new_expr(E_CALL, pos);
         e->builtin.cfn = p->tok.str;
@@ -3089,6 +3123,8 @@ static Stmt *parse_stmt(Parser *p) {
         return s;
     }
     case TK_IMPORT:
+        if (peek_is(p, TK_DOT)) goto expression; /* import.meta.url ... */
+        /* fallthrough */
     case TK_EXPORT:
         xs_error(XS6004, pos, "imports and exports go at the top level of the file", "'%s' is not allowed here", p->tok.kind == TK_IMPORT ? "import" : "export");
         return NULL;
@@ -3096,7 +3132,8 @@ static Stmt *parse_stmt(Parser *p) {
     case TK_ENUM:
         xs_error(XS6027, pos, "move it to the top level of the file", "nested classes and enums are not supported");
         return NULL;
-    default: {
+    default:
+    expression: {
         Stmt *s = new_stmt(S_EXPR, pos);
         bool so = p->spread_ok; Expr *sa = p->spread_arg;
         p->spread_ok = true;
@@ -5613,7 +5650,7 @@ static void parse_module(Program *prog, Module *m) {
             xs_lex_skipping = false;
         }
     }
-    while (at(&p, TK_IMPORT) || reexport_ahead(&p)) {
+    while ((at(&p, TK_IMPORT) && !peek_is(&p, TK_DOT)) || reexport_ahead(&p)) { /* (import.meta.url: an expression) */
         if (at(&p, TK_IMPORT)) parse_import(&p, m);
         else parse_reexport(&p, m, prog, false);
     }
@@ -5723,7 +5760,7 @@ static void parse_module(Program *prog, Module *m) {
         char *treq_name = NULL, *treq_path = NULL;
         Pos treq_pos = p.tok.pos;
         bool treq = at(&p, TK_LET) && try_require_ahead(&p, &treq_name, &treq_path);
-        if (treq || at(&p, TK_IMPORT) || require_ahead(&p)) { /* an import after declarations (ES hoists it): read and loaded here; names resolve in the
+        if (treq || (at(&p, TK_IMPORT) && !peek_is(&p, TK_DOT)) || require_ahead(&p)) { /* an import after declarations (ES hoists it): read and loaded here; names resolve in the
                                     checker, after the whole file, so declarations above may use them */
             int n0 = m->nimports;
             if (treq) {
