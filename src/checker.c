@@ -9518,9 +9518,11 @@ static void check_expr_in(Expr *e, Type *expected) {
             }
         }
         const char *path_assigned = NULL; /* o.f = v: the field path, narrowed or not by what v is */
-        if (e->kind == E_ASSIGN && target->kind == E_MEMBER && !target->is_call && rereadable(target->lhs) &&
-            !(target->lhs->kind == E_IDENT && !lookup(target->lhs->str))) { /* obj.x = v with set x(v) (not Class.static) */
+        if (e->kind == E_ASSIGN && target->kind == E_MEMBER && !target->is_call && (rereadable(target->lhs) || e->op == TK_ASSIGN) &&
+            !(target->lhs->kind == E_IDENT && !lookup(target->lhs->str))) { /* obj.x = v with set x(v) (not Class.static); (u as C).x = v
+                                                                                (read once: no getter call, so any receiver) */
             check_expr(target->lhs, NULL);
+            if (!rereadable(target->lhs)) target->lhs->prechecked = true; /* (checked once: the plain field write below reuses it) */
             Type *rt = target->lhs->type;
             Class *rc = rt && rt->kind == TY_OBJECT && !rt->cls->builtin ? rt->cls : NULL;
             Func *setter = rc && !find_field(rc, target->str, NULL) ? find_method(rc, xs_sprintf("__set_%s", target->str)) : NULL;
