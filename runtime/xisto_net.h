@@ -2425,7 +2425,7 @@ XS_NOINLINE xs_Response *xs_fetch_once(xs_str *url, xs_str *method, xs_str *body
     bool https = strncmp(u, "https://", 8) == 0;
     if (!https && strncmp(u, "http://", 7) != 0) xs_panic("fetch: the URL must start with http:// or https://");
 #ifndef XS_WITH_TLS
-    if (https) xs_panic("fetch: https is not available: the program was built with --tls=off");
+    if (https) xs_panic("fetch: https is not available: TLS is not linked into this program (built with --tls=off, or the compiler saw no https fetch that can run here: please report it)");
 #endif
     u += https ? 8 : 7;
     const char *path = strchr(u, '/');
