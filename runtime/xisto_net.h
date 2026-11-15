@@ -4074,6 +4074,9 @@ XS_NOINLINE void xs_clear_timer(double idn) { /* the timer's coroutine ends when
         }
 }
 XS_NOINLINE void xs_timer_close(int64_t id) { xs_clear_timer((double)id); } /* timer.close() */
+/* clearTimeout of a timer id that may be none (int | null, number | null): nothing to clear then */
+XS_NOINLINE void xs_clear_timer_ni(int64_t id) { if (id != XS_NULL_INT) xs_clear_timer((double)id); }
+XS_NOINLINE void xs_clear_timer_nn(double id) { if (!xs_isnull_num(id)) xs_clear_timer(id); }
 #ifdef XS_THREADS /* worker threads, continued */
 XS_NOINLINE void xs_wt_check_event(xs_str *ev, const char *who) {
     if (ev->len != 7 || memcmp(ev->data, "message", 7) != 0)
