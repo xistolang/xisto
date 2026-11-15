@@ -11798,7 +11798,12 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
             if (strcmp(ns, "performance") == 0) {
-                if (!e->is_call || strcmp(e->str, "now") != 0 || e->args.len != 0) xs_error(XS7114, e->pos, "supported: performance.now()", "unknown performance member '%s'", e->str);
+                if (!(e->is_call && strcmp(e->str, "now") == 0 && e->args.len == 0) && find_class("XistoPerformance")) {
+                    e->lhs = mk_ident(e->lhs->pos, "XistoPerformance"); /* performance.mark & co: xisto:perf_hooks */
+                    check_expr(e, expected);
+                    return;
+                }
+                if (!e->is_call || strcmp(e->str, "now") != 0 || e->args.len != 0) xs_error(XS7114, e->pos, "supported: performance.now, timeOrigin, mark, measure, getEntries, getEntriesByName, getEntriesByType, clearMarks, clearMeasures, toJSON", "unknown performance member '%s'", e->str);
                 e->type = ty_number;
                 e->builtin.cfn = "xs_performance_now";
                 return;
@@ -12078,6 +12083,12 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
             if (strcmp(ns, "console") == 0) {
+                bool core = e->is_call && (!strcmp(e->str, "log") || !strcmp(e->str, "info") || !strcmp(e->str, "debug") || !strcmp(e->str, "error") || !strcmp(e->str, "warn"));
+                if (!core && find_class("XistoConsole")) { /* console.time & co: XistoConsole.X of xisto:console (runtime/node/console.ts) */
+                    e->lhs = mk_ident(e->lhs->pos, "XistoConsole");
+                    check_expr(e, expected);
+                    return;
+                }
                 if (!e->is_call || (strcmp(e->str, "log") != 0 && strcmp(e->str, "info") != 0 && strcmp(e->str, "debug") != 0 &&
                                     strcmp(e->str, "error") != 0 && strcmp(e->str, "warn") != 0))
                     xs_error(XS7112, e->pos, "supported: console.log, console.info, console.debug (stdout), console.error, console.warn (stderr)", "unknown console member '%s'", e->str);
@@ -18587,8 +18598,8 @@ void check_program(Program *p) {
                     found = true; /* the built-in Buffer (node:buffer exports it; it is a global too) */
                 if (!found && strcmp(im->from->file, "xisto:util") == 0 && (strcmp(name, "TextEncoder") == 0 || strcmp(name, "TextDecoder") == 0))
                     found = true; /* built-in classes (node:util re-exports them) */
-                if (!found && im->from->builtin && strcmp(im->from->file, "perf_hooks") == 0 && strcmp(name, "performance") == 0)
-                    found = true; /* the built-in performance */
+                if (!found && strcmp(im->from->file, "xisto:perf_hooks") == 0 && strcmp(name, "performance") == 0)
+                    found = true; /* the built-in performance (its other members: XistoPerformance) */
                 if (!found && im->from->builtin && strcmp(im->from->file, "timers") == 0 && !im->is_default)
                     for (const char *const *t = (const char *const[]){"setTimeout", "setInterval", "setImmediate", "clearTimeout", "clearInterval",
                                                                        "clearImmediate", "queueMicrotask", NULL}; *t; t++)

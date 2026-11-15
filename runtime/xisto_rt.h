@@ -8445,6 +8445,67 @@ XS_NOINLINE int64_t xs_util_kind(void *v) {
     if (t->dyn && t->dyn->shape) return 19;
     return 18;
 }
+/* console.group: the indentation (spaces) of what console.log & co print (xisto:console changes it). A program that
+   names console.group emits each console.log between xs_grp_begin and xs_grp_end: inside a group the line is
+   printed into memory, then written with the indentation at the start of each of its lines, as Node does */
+static int64_t xs_grp_indent;
+static FILE *xs_grp_mem, *xs_grp_saved;
+static char *xs_grp_buf;
+static size_t xs_grp_size;
+XS_NOINLINE void xs_console_group_indent(int64_t n) { xs_grp_indent = n < 0 ? 0 : n; }
+XS_NOINLINE void xs_grp_begin(void) {
+    if (!xs_grp_indent) return;
+    xs_grp_saved = xs_out_f;
+    xs_grp_mem = open_memstream(&xs_grp_buf, &xs_grp_size);
+    xs_out_f = xs_grp_mem;
+}
+XS_NOINLINE void xs_grp_end(void) {
+    if (!xs_grp_mem) return;
+    fclose(xs_grp_mem);
+    xs_grp_mem = NULL;
+    xs_out_f = xs_grp_saved;
+    FILE *f = XS_OUT;
+    for (size_t i = 0; i < xs_grp_size; i++) {
+        if (i == 0 || xs_grp_buf[i - 1] == '\n') fprintf(f, "%*s", (int)xs_grp_indent, "");
+        fputc(xs_grp_buf[i], f);
+    }
+    free(xs_grp_buf);
+    xs_grp_buf = NULL;
+}
+/* Object.keys(v) of a value seen as an any (console.table, assert's deep comparisons): an array's indices, an object's
+   fields in declaration order (an optional field left out is not there), a Record's keys; [] for anything else */
+XS_NOINLINE xs_arr_ref *xs_util_keys(void *v) {
+    xs_arr_ref *a = xs_arr_ref_new(4, xs_print_str_quoted_);
+    if (!v) return a;
+    const xs_type *t = xs_type_of(v);
+    int64_t n = -1;
+    if (t->free == xs_arr_ref_free) n = (int64_t)((xs_arr_ref *)v)->len;
+    else if (t->free == xs_arr_num_free) n = (int64_t)((xs_arr_num *)v)->len;
+    else if (t->free == xs_arr_int_free) n = (int64_t)((xs_arr_int *)v)->len;
+    else if (t->free == xs_arr_bool_free) n = (int64_t)((xs_arr_bool *)v)->len;
+    if (n >= 0) {
+        for (int64_t i = 0; i < n; i++) xs_arr_ref_push(a, xs_str_from_int(i));
+        return a;
+    }
+    if (t->dyn) {
+        for (int32_t i = 0; i < t->dyn->n; i++) {
+            const xs_dyn_field *f = &t->dyn->f[i];
+            if (f->optional) {
+                void *fv = xs_dyn_load(f, v);
+                bool has = fv != NULL;
+                xs_release(fv);
+                if (!has) continue;
+            }
+            xs_arr_ref_push(a, xs_str_new(f->name, f->len));
+        }
+        return a;
+    }
+    if (t->free == xs_map_free && ((xs_map *)v)->record && ((xs_map *)v)->str_keys) {
+        xs_map_entry *e;
+        XS_MAP_EACH((xs_map *)v, e) xs_arr_ref_push(a, xs_retain(e->skey));
+    }
+    return a;
+}
 /* the object's class declares a method of that name (format's %s calls a toString of the program's own) */
 XS_NOINLINE bool xs_util_has_method(void *v, xs_str *name) {
     if (!v) return false;

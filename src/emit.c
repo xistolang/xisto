@@ -2154,6 +2154,7 @@ static void emit_member(Expr *e) {
         buf_puts(out, "xs_out_drain(); "); /* (XB-091: stdout written behind goes out first) */
         bool to_err = strcmp(e->str, "error") == 0 || strcmp(e->str, "warn") == 0; /* (as Node: error, warn -> stderr) */
         if (to_err) buf_puts(out, "fflush(stdout); FILE *pf_ = xs_out_f; xs_out_f = stderr; ");
+        if (prog->uses_console_group) buf_puts(out, "xs_grp_begin(); "); /* (inside a console.group: the line is indented) */
         for (int i = 0; i < e->args.len; i++) {
             Expr *a = e->args.items[i];
             if (i) buf_puts(out, "xs_print_sep(); ");
@@ -2164,7 +2165,9 @@ static void emit_member(Expr *e) {
             emit_print_arg(&tmpv);
             buf_puts(out, "; ");
         }
-        buf_puts(out, to_err ? "xs_print_nl(); xs_out_f = pf_; })" : "xs_print_nl(); })");
+        if (prog->uses_console_group) buf_puts(out, "xs_print_nl(); xs_grp_end(); ");
+        else buf_puts(out, "xs_print_nl(); ");
+        buf_puts(out, to_err ? "xs_out_f = pf_; })" : "})");
         return;
     }
     if (base->kind == E_IDENT && !base->cname && e->cls && e->cls->builtin && e->func && e->field < 0 && e->builtin.cfn && !e->builtin.self_first) {

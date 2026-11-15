@@ -715,6 +715,7 @@ typedef struct {
     char **lits;       /* interned string literals */
     int nlits, cap_lits;
     bool uses_net;
+    bool uses_console_group; /* console.group or console.groupCollapsed was named: console.log & co are emitted with the group's indentation (xs_grp_begin) */
     bool uses_workers; /* imports xisto:worker_threads: per-thread globals, the program body callable (emit.c) */
     bool uses_parallel; /* imports xisto:parallel (parser) */
     bool par_native;   /* some call of it runs on the thread pool (parallel.c): per-thread runtime state (XS_THREADS),

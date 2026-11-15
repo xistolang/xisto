@@ -61,6 +61,7 @@ static bool wants_okmap; /* WeakMap, or Map<object, V>, was written: xisto:okmap
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
 static void import_process(Program *prog, Module *m);
 static void import_stdio(Program *prog, Module *m);
+static void import_builtin_class(Program *prog, Module *m, const char *path, const char *name);
 static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... was named: xisto:url is loaded */
 static bool wants_errors; /* TypeError, RangeError, SyntaxError or ReferenceError was named: xisto:errors is loaded */
 static bool is_js_error_name(const char *n) {
@@ -1520,6 +1521,26 @@ static Expr *parse_primary(Parser *p) {
                     if (!at(&look, TK_DOT) || (next(&look), !look.tok.str || strcmp(look.tok.str, "write") != 0)) import_stdio(p->prog, p->mod);
                 }
                 if (!is_core) import_process(p->prog, p->mod);
+            }
+        }
+        if (strcmp(p->tok.str, "performance") == 0) { /* performance.mark & co: XistoPerformance of xisto:perf_hooks */
+            Parser look = *p;
+            next(&look);
+            if (at(&look, TK_DOT)) {
+                next(&look);
+                if (look.tok.str && strcmp(look.tok.str, "now") != 0) import_builtin_class(p->prog, p->mod, "xisto:perf_hooks", "XistoPerformance");
+            }
+        }
+        if (strcmp(p->tok.str, "console") == 0) { /* console.time, console.table...: XistoConsole of xisto:console (runtime/node/console.ts) */
+            Parser look = *p;
+            next(&look);
+            if (at(&look, TK_DOT)) {
+                next(&look);
+                const char *mn = look.tok.str;
+                if (mn && strcmp(mn, "log") != 0 && strcmp(mn, "info") != 0 && strcmp(mn, "debug") != 0 && strcmp(mn, "error") != 0 && strcmp(mn, "warn") != 0) {
+                    import_builtin_class(p->prog, p->mod, "xisto:console", "XistoConsole");
+                    if (!strcmp(mn, "group") || !strcmp(mn, "groupCollapsed")) p->prog->uses_console_group = true;
+                }
             }
         }
         Expr *e = new_expr(E_IDENT, pos);
@@ -4922,6 +4943,15 @@ from:
             m->imports[m->nimports++] = st;
         }
     }
+    if (!im.star && !im.is_default && im.n && (!strcmp(im.path, "perf_hooks") || !strcmp(im.path, "node:perf_hooks") || !strcmp(im.path, "xisto:perf_hooks"))) {
+        /* import { performance } from "node:perf_hooks": the global performance (performance.now() is built in; its other
+           members load xisto:perf_hooks where they are named), so the name alone does not load the module */
+        int keep = 0;
+        for (int i = 0; i < im.n; i++)
+            if (strcmp(im.names[i], "performance") != 0) { im.names[keep] = im.names[i]; im.positions[keep++] = im.positions[i]; }
+        im.n = keep;
+        if (!keep && !has_dflt) return;
+    }
     m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
     m->imports[m->nimports++] = im;
     if (im.n) alias_collisions(p, m, alias_first, &m->imports[m->nimports - 1]);
@@ -6720,6 +6750,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
     { /* Node's modules written in xisto over runtime functions (runtime/node/NAME.ts, NODE_TS in the Makefile) */
         extern const unsigned char xs_node_events_ts[], xs_node_process_ts[], xs_node_http_ts[], xs_node_net_ts[], xs_node_dns_ts[], xs_node_child_process_ts[], xs_node_https_ts[], xs_node_tls_ts[], xs_node_diagnostics_channel_ts[], xs_node_buffer_ts[], xs_node_util_ts[], xs_node_querystring_ts[], xs_node_string_decoder_ts[], xs_node_zlib_ts[], xs_node_stream_ts[], xs_node_stream_promises_ts[], xs_node_stream_web_ts[];
         extern const unsigned char xs_node_tty_ts[], xs_node_readline_ts[], xs_node_readline_promises_ts[];
+        extern const unsigned char xs_node_console_ts[], xs_node_perf_hooks_ts[];
         static const struct { const char *name; const unsigned char *src; bool net; bool tls; } node_ts[] = {
             {"events", xs_node_events_ts, false},
             {"process", xs_node_process_ts, true}, /* (signals and the exit hook live with the event loop) */
@@ -6739,6 +6770,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
             {"stream/promises", xs_node_stream_promises_ts, true}, /* (a name with a slash: runtime/node/stream_promises.ts) */
             {"stream/web", xs_node_stream_web_ts, true},
             {"tty", xs_node_tty_ts, true}, {"readline", xs_node_readline_ts, true}, {"readline/promises", xs_node_readline_promises_ts, true},
+            {"console", xs_node_console_ts, false}, {"perf_hooks", xs_node_perf_hooks_ts, false},
         };
         for (size_t i = 0; i < sizeof node_ts / sizeof node_ts[0]; i++) {
             if (strcmp(name, node_ts[i].name) != 0) continue;
@@ -6755,7 +6787,6 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
             return m;
         }
     }
-    if (strcmp(name, "perf_hooks") == 0) return m; /* performance is built in (performance.now()) */
     if (strcmp(name, "timers") == 0) return m; /* setTimeout & co are the built-in globals (checker: import check) */
     if (strcmp(name, "worker_threads") == 0 || strcmp(name, "os") == 0) { /* written in xisto over runtime functions */
         bool wt = strcmp(name, "worker_threads") == 0;
