@@ -3382,6 +3382,29 @@ static Expr *rec_get_nn(Expr *x) {
 }
 /* x, this, x.a.b before checking: a path with no call in it, safe to check twice */
 static bool plain_path(Expr *e) { return e->kind == E_IDENT || e->kind == E_THIS || (e->kind == E_MEMBER && !e->is_call && e->op != TK_QDOT && plain_path(e->lhs)); }
+/* (u as C), (u as unknown as C) before checking: a cast of a plain path, read again with no other effect (the receiver
+   of (u as C).x += 1 through a setter: read for the getter and for the setter) */
+static bool cast_path(Expr *e) { return e->kind == E_AS && e->elem_type && e->op != TK_NOT && (plain_path(e->lhs) || cast_path(e->lhs)); }
+static Field *find_field(Class *c, const char *name, int *idx);
+/* (t as unknown as { name: string }).name, read or written, with t (a plain path) an object of a class that has that
+   field of that type: the member becomes t.name, the field of t itself (JavaScript's cast converts nothing; a shape's
+   copy would lose the write). 0: left as it is; 1: done; 2: done, and the field is private or protected (TypeScript
+   checks nothing through the cast: the caller checks the member without the access rule) */
+static int cast_peel(Expr *e) {
+    if (e->kind != E_MEMBER || e->is_call || !e->str || !e->lhs || !cast_path(e->lhs) || e->lhs->prechecked) return 0;
+    Expr *in = e->lhs;
+    while (in->kind == E_AS && !in->prechecked) in = in->lhs;
+    if (in->prechecked || !plain_path(in)) return 0;
+    Type *want = resolve(e->lhs->elem_type, e->lhs->pos);
+    Field *fw = want && want->kind == TY_OBJECT && !want->cls->builtin ? find_field(want->cls, e->str, NULL) : NULL;
+    if (!fw) return 0;
+    check_expr(in, NULL); /* (a plain path: checked again as the member's receiver) */
+    Type *it = in->type;
+    Field *fc = it && it->kind == TY_OBJECT && !it->cls->builtin && !it->cls->adapter_of && it->cls != want->cls ? find_field(it->cls, e->str, NULL) : NULL;
+    if (!fc || !fc->type || !fw->type || !ty_equal(fc->type, fw->type)) return 0;
+    e->lhs = in;
+    return fc->access ? 2 : 1;
+}
 static const char **member_names(Class *c, int *n);
 static bool always_returns(Stmt *s);
 static void check_block(Stmt *b);
@@ -9468,6 +9491,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         Expr *target = e->lhs;
         bool dyn_target = false;
+        int peeled = cast_peel(target); /* ((t as unknown as { name: string }).name = v: t.name = v) */
         if (target->kind == E_INDEX && target->lhs && target->rhs && rereadable(target->lhs) &&
             (target->rhs->kind == E_STRING || (target->rhs->kind == E_IDENT && const_string_of(target->rhs->str)))) {
             /* req[AUDIT_CONTEXT_KEY] = v with a key known when compiling: the property of that name (an open class's
@@ -9609,7 +9633,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             }
         }
         const char *path_assigned = NULL; /* o.f = v: the field path, narrowed or not by what v is */
-        if (e->kind == E_ASSIGN && target->kind == E_MEMBER && !target->is_call && (rereadable(target->lhs) || e->op == TK_ASSIGN) &&
+        if (e->kind == E_ASSIGN && target->kind == E_MEMBER && !target->is_call && (rereadable(target->lhs) || e->op == TK_ASSIGN || cast_path(target->lhs)) &&
             !(target->lhs->kind == E_IDENT && !lookup(target->lhs->str))) { /* obj.x = v with set x(v) (not Class.static); (u as C).x = v
                                                                                 (read once: no getter call, so any receiver) */
             check_expr(target->lhs, NULL);
@@ -9654,7 +9678,10 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (ub && ub->union_narrow) { target->type = ub->orig; target->cname = ub->cname; } /* x = ...: the union again */
         else {
             dyn_lvalue = target;
+            bool was_gen = checking_generated;
+            if (peeled == 2) checking_generated = true;
             check_expr(target, NULL);
+            checking_generated = was_gen;
             dyn_lvalue = NULL;
             /* o.f = v with o.f narrowed: the target is the field itself, not its checked read (inner reads, as
                the n.next of n.next.next = v, stay checked reads) */
@@ -10739,6 +10766,13 @@ static void check_expr_in(Expr *e, Type *expected) {
         e->type = e->lhs->type->elem;
         return;
     case E_MEMBER:
+        if (cast_peel(e) == 2) {
+            bool was = checking_generated; /* (a private field too: TypeScript checks nothing through the cast) */
+            checking_generated = true;
+            check_expr(e, expected);
+            checking_generated = was;
+            return;
+        }
         if (!e->is_call && e->str && !strcmp(e->str, "prototype") && e->lhs && e->lhs->kind == E_IDENT && !strcmp(e->lhs->str, "Object") &&
             !lookup("Object") && tsc_checked() && prog->uses_plain) { /* proto === Object.prototype: the mark of a plain object (see check_var) */
             Expr *l = str_lit(e->pos, "\x01Object.prototype");
@@ -10971,6 +11005,36 @@ static void check_expr_in(Expr *e, Type *expected) {
                         chain = cd;
                     }
                     if (!any_at) break;
+                }
+                *e = *chain;
+                check_expr(e, expected);
+                return;
+            }
+            bool members = ot->kind == TY_UNION;
+            for (int i = 0; members && i < ot->nparams; i++) {
+                Type *m = ot->params[i];
+                members = m->kind == TY_OBJECT && !m->cls->is_interface && !made_shape(m->cls) && !inline_cls(m);
+            }
+            if (members) { /* x.constructor.name with x: A | B: x instanceof A ? (x as A).constructor.name : ... (each member's
+                              own chain, its subclasses first) */
+                Expr *chain = NULL;
+                for (int i = ot->nparams - 1; i >= 0; i--) {
+                    Expr *as = xs_alloc(sizeof *as);
+                    as->kind = E_AS; as->pos = e->pos; as->field = -1; as->lhs = pure_copy(obj); as->elem_type = ot->params[i];
+                    Expr *ctor = xs_alloc(sizeof *ctor);
+                    ctor->kind = E_MEMBER; ctor->pos = e->pos; ctor->field = -1; ctor->lhs = as; ctor->str = "constructor";
+                    Expr *nm = xs_alloc(sizeof *nm);
+                    nm->kind = E_MEMBER; nm->pos = e->pos; nm->field = -1; nm->lhs = ctor; nm->str = "name";
+                    if (!chain) { chain = nm; continue; }
+                    Expr *id = xs_alloc(sizeof *id);
+                    id->kind = E_IDENT; id->pos = e->pos; id->field = -1; id->str = ot->params[i]->cls->name;
+                    Expr *io = xs_alloc(sizeof *io);
+                    io->kind = E_BINARY; io->pos = e->pos; io->field = -1; io->op = TK_IDENT; io->lhs = pure_copy(obj); io->rhs = id;
+                    Expr *cd = xs_alloc(sizeof *cd);
+                    cd->kind = E_COND; cd->pos = e->pos; cd->field = -1; cd->lhs = io;
+                    expr_list_push(&cd->args, nm);
+                    expr_list_push(&cd->args, chain);
+                    chain = cd;
                 }
                 *e = *chain;
                 check_expr(e, expected);
@@ -11228,6 +11292,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                    it has (an optional one left out is not there), read through its class's field table */
                 bool opt = false;
                 for (int i = 0; i < st->cls->nfields; i++) if (st->cls->fields[i].optional) opt = true;
+                if (st->cls->iface_base) opt = true; /* (an interface with methods: maybe a class's adapter, whose object has the
+                                                         fields of its own class: read at run time, XB-233) */
                 if (opt || strcmp(e->str, "keys") != 0) {
                     Expr *u = expr_copy(o);
                     to_unknown(u);
@@ -11644,6 +11710,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     settle(e->args.items[i]);
                     Type *t = e->args.items[i]->type;
                     if (ty_is_undef(t)) { undef_text(e->args.items[i]); continue; } /* console.log(f()) with f(): undefined */
+                    if (t->kind == TY_JSON) { from_json(e->args.items[i], ty_unknown); continue; } /* (an object: its JSON text read back, printed as the value) */
                     if (t->kind == TY_VOID || t->kind == TY_FUNC)
                         xs_error(XS8097, e->args.items[i]->pos, NULL, "cannot print a %s value", ty_name(t));
                 }
@@ -13811,6 +13878,21 @@ static void check_expr_in(Expr *e, Type *expected) {
                 else if (i && !ty_equal(t, e->args.items[0]->type)) differ = true;
             }
             json_ok_unknown = ju;
+            bool classes = e->args.len > 1, cdiffer = false;
+            for (int i = 0; i < e->args.len && classes; i++) {
+                Type *t = e->args.items[i]->type;
+                classes = t->kind == TY_OBJECT && !t->cls->builtin && !t->cls->is_tuple && !made_shape(t->cls) && !t->cls->is_interface &&
+                          !t->cls->adapter_of && !t->cls->fake && !t->cls->tparams;
+                if (classes && i && !ty_equal(t, e->args.items[0]->type)) cdiffer = true;
+            }
+            classes = classes && cdiffer;
+            if (classes) { /* [new A(), new B()]: objects of classes, (A | B)[] as TypeScript infers it (each keeps its class) */
+                Type *u = NULL;
+                for (int i = 0; i < e->args.len; i++) u = ty_union2(u, e->args.items[i]->type);
+                for (int i = 0; i < e->args.len; i++) expect_type(e->args.items[i], u, "array element");
+                e->type = ty_array_of(u);
+                return;
+            }
             if (objs && differ) {
                 for (int i = 0; i < e->args.len; i++) expect_type(e->args.items[i], ty_json, "array element");
                 e->type = ty_array_of(ty_json);
@@ -16954,6 +17036,23 @@ static bool method_fits(Func *cm, Func *im, Class *src, Class *ifc, bool infer, 
     }
     return true;
 }
+/* XB-233: an interface field the adapter of src holds in a slot of its own (the emitter's ifld_fn points there):
+   AD_FIELD_ABSENT, an optional field src does not declare (null until written through the interface; TypeScript lets
+   the class leave it out); AD_FIELD_NUM, an int field of src where the interface says number (the slot is the number
+   read from src at each access, and a write through the interface goes back to src's int: see emit's ifld_put).
+   0: a field of src of the same type, reached in place */
+enum { AD_FIELD_ABSENT = 1, AD_FIELD_NUM = 2 };
+static int ad_field_kind(Class *src, Field *iff) {
+    Field *sf = find_field(src, iff->name, NULL);
+    if (!iff->type) return 0;
+    if (!sf) {
+        if (iff->optional && iff->type->kind == TY_NULLABLE && !find_method(src, xs_sprintf("__get_%s", iff->name)) && !find_method(src, iff->name))
+            return AD_FIELD_ABSENT;
+        return 0;
+    }
+    if (sf->type && sf->type->kind == TY_INT && iff->type->kind == TY_NUMBER) return AD_FIELD_NUM;
+    return 0;
+}
 static bool iface_fits(Class *src, Class *ifc, bool infer, Pos pos, int depth, char **why) {
     if (depth > 4 || src == ifc || src->builtin || src->gen_state) return false;
     /* XB-200: the adapter has no fields of its own; a read or write of an interface field goes to the class's field of the
@@ -16961,6 +17060,7 @@ static bool iface_fits(Class *src, Class *ifc, bool infer, Pos pos, int depth, c
        to it is handed out), not one that converts or is left out. */
     for (int k = 0; k < ifc->nfields; k++) {
         Field *iff = &ifc->fields[k], *sf = find_field(src, iff->name, NULL);
+        if (ad_field_kind(src, iff)) continue; /* (an optional field the class leaves out, an int field where a number goes: XB-233) */
         if (!sf || !sf->type || !iff->type || !ty_equal(sf->type, iff->type)) {
             if (why) {
                 if (!sf) *why = xs_sprintf("%s has no field '%s' (declare it, or write `implements %s`)", src->name, iff->name, ifc->name);
@@ -17023,7 +17123,20 @@ static Class *make_adapter(Class *src, Class *ifc) {
     a->fields[0].readonly = true;
     a->fields[0].owner = a;
     a->nfields = a->cap_fields = 1;
-    a->nbase_fields = 0; /* (an interface with methods has no fields) */
+    for (int k = 0; k < ifc->nfields; k++) { /* __slot_<f>: the interface fields held here (ad_field_kind) */
+        int kind = ad_field_kind(src, &ifc->fields[k]);
+        if (!kind) continue;
+        a->fields = realloc(a->fields, sizeof(Field) * (size_t)(a->nfields + 1));
+        Field *sl = &a->fields[a->nfields++];
+        memset(sl, 0, sizeof *sl);
+        sl->name = xs_sprintf("__slot_%s", ifc->fields[k].name);
+        sl->pos = pos;
+        sl->type = kind == AD_FIELD_NUM ? ty_number : ifc->fields[k].type;
+        sl->cname = field_cname(sl->name);
+        sl->owner = a;
+    }
+    a->cap_fields = a->nfields;
+    a->nbase_fields = 0; /* (the interface's fields are reached through __t, or held in the slots above) */
     a->flattened = true;
     Func *ct = xs_alloc(sizeof *ct);
     ct->name = "constructor"; ct->pos = pos; ct->mod = src->mod; ct->cls = a; ct->is_ctor = true; ct->ret = ty_void;
@@ -17038,6 +17151,22 @@ static Class *make_adapter(Class *src, Class *ifc) {
         Stmt *s = xs_alloc(sizeof *s);
         s->kind = S_EXPR; s->pos = pos; s->expr = as;
         ct->body = ad_block(pos, s);
+        for (int k = 1; k < a->nfields; k++) { /* this.__slot_f = null (an absent optional field starts empty), or 0 (a number
+                                                   slot, read from the class at each access) */
+            Expr *self = xs_alloc(sizeof *self);
+            self->kind = E_THIS; self->pos = pos; self->field = -1;
+            Expr *m = xs_alloc(sizeof *m);
+            m->kind = E_MEMBER; m->pos = pos; m->field = -1; m->lhs = self; m->str = a->fields[k].name;
+            Expr *z = xs_alloc(sizeof *z);
+            z->pos = pos; z->field = -1;
+            if (a->fields[k].type->kind == TY_NULLABLE) z->kind = E_NULL;
+            else { z->kind = E_NUMBER; z->num = 0; }
+            Expr *set = xs_alloc(sizeof *set);
+            set->kind = E_ASSIGN; set->op = TK_ASSIGN; set->pos = pos; set->field = -1; set->lhs = m; set->rhs = z;
+            Stmt *s2 = xs_alloc(sizeof *s2);
+            s2->kind = S_EXPR; s2->pos = pos; s2->expr = set;
+            stmt_list_push(&ct->body->stmts, s2);
+        }
     }
     a->ctor = ct;
     for (int k = 0; k < ifc->nmethods; k++) {
@@ -17394,12 +17523,14 @@ static bool iface_adapt(Expr *e, Type *want, const char *what) {
     e->type = want;
     return true;
 }
-/* `x as I` from unknown (an injector's construct(args)): the decorated classes that fit I get their adapters now, so
-   that the cast can wrap an object of one of them (the emitter's table: class -> adapter); true when there is any */
+/* `x as I` from unknown (an injector's construct(args), or any class put into an unknown): the classes that fit I get
+   their adapters now, so that the cast can wrap an object of one of them (the emitter's table: class -> adapter); true
+   when there is any */
 static bool iface_runtime(Class *ifc, Pos pos) {
     for (int i = 0; i < prog->nclasses; i++) {
         Class *c = prog->classes[i];
-        if (!c->decos.len || c->builtin || c->is_interface || c->iface_base || c->gen_state || c->adapter_of || is_subclass(c, ifc)) continue;
+        if (c->builtin || c->is_interface || c->iface_base || c->gen_state || c->adapter_of || c->fake || c->tparams || made_shape(c) ||
+            is_subclass(c, ifc)) continue;
         bool named = true; /* (cheap first: every method name is there) */
         for (int k = 0; k < ifc->nmethods && named; k++)
             if (ifc->methods[k]->is_abstract && !find_method(c, ifc->methods[k]->name)) named = false;

@@ -1084,6 +1084,8 @@ static const char *asif_fn(Class *ifc, bool nullable) {
 static Buf ifld_fns;
 static char **ifld_made;
 static int nifld;
+static char **ifld_puts; /* the ifld_fn names that have a _put (a slot written back) */
+static int nifld_puts;
 static const char *ifld_fn(Class *c, int field, Pos pos) {
     if (!c || c->builtin || c->adapter_of || field < 0 || field >= c->nfields) return NULL;
     bool any = false;
@@ -1098,18 +1100,46 @@ static const char *ifld_fn(Class *c, int field, Pos pos) {
     ifld_made = realloc(ifld_made, sizeof(char *) * (size_t)(nifld + 1));
     ifld_made[nifld++] = name;
     char *ft = xs_sprintf("__typeof__(((%s *)0)->%s)", c->cname, fd->cname);
+    Buf put = {0}; /* (the slots of int fields written back: ifld_put_fn) */
     buf_printf(&ifld_fns, "static inline %s *%s(%s *o) {\n    void (*f_)(void *) = xs_type_of(o)->free;\n", ft, name, c->cname);
     for (int i = 0; i < prog->nclasses; i++) {
         Class *a = prog->classes[i], *src = a->adapter_of;
         if (!a->used || !src || !is_sub(a, c)) continue;
-        int sk = -1;
+        int sk = -1, sl = -1;
         for (int k = 0; k < src->nfields; k++) if (strcmp(src->fields[k].name, fd->name) == 0) sk = k;
+        const char *slot = xs_sprintf("__slot_%s", fd->name);
+        for (int k = 1; k < a->nfields; k++) if (strcmp(a->fields[k].name, slot) == 0) sl = k;
+        if (sl > 0 && sk < 0) { /* an optional field the class leaves out: held by the adapter (XB-233) */
+            buf_printf(&ifld_fns, "    if (f_ == %s_free) return (%s *)&((%s *)o)->%s;\n", a->cname, ft, a->cname, a->fields[sl].cname);
+            continue;
+        }
         if (sk < 0 || cp_field(src, sk) || src->nohdr || src->region)
             xs_error(XS9902, pos, "declare `implements` on the class", "internal: %s cannot be read through the adapter of %s", fd->name, src->name);
+        if (sl > 0) { /* the class's int where the interface says number: the number, in the adapter's slot (XB-233) */
+            buf_printf(&ifld_fns, "    if (f_ == %s_free) { %s *a_ = (%s *)o; a_->%s = (double)a_->%s->%s; return (%s *)&a_->%s; }\n", a->cname, a->cname,
+                       a->cname, a->fields[sl].cname, a->fields[0].cname, src->fields[sk].cname, ft, a->fields[sl].cname);
+            buf_printf(&put, "    if (f_ == %s_free) { %s *a_ = (%s *)o; a_->%s->%s = xs_ifld_int(a_->%s, \"%s\", \"%s\"); return; }\n", a->cname, a->cname,
+                       a->cname, a->fields[0].cname, src->fields[sk].cname, a->fields[sl].cname, xs_src_name(src->name), fd->name);
+            continue;
+        }
         buf_printf(&ifld_fns, "    if (f_ == %s_free) return (%s *)&((%s *)o)->%s->%s;\n", a->cname, ft, a->cname, a->fields[0].cname, src->fields[sk].cname);
     }
     buf_printf(&ifld_fns, "    return &o->%s;\n}\n", fd->cname);
+    if (put.len) {
+        buf_printf(&ifld_fns, "static inline void %s_put(%s *o) {\n    void (*f_)(void *) = xs_type_of(o)->free;\n%s}\n", name, c->cname, put.data);
+        ifld_puts = realloc(ifld_puts, sizeof(char *) * (size_t)(nifld_puts + 1));
+        ifld_puts[nifld_puts++] = name;
+    }
+    free(put.data);
     return name;
+}
+/* o.f = v through an interface whose adapters hold f in a slot that converts (ifld_fn): the function that writes the
+   slot back after the write (NULL: none) */
+static const char *ifld_put_fn(Class *c, int field, Pos pos) {
+    const char *f = ifld_fn(c, field, pos);
+    if (!f) return NULL;
+    for (int i = 0; i < nifld_puts; i++) if (strcmp(ifld_puts[i], f) == 0) return xs_sprintf("%s_put", f);
+    return NULL;
 }
 
 /* XB-201: i as C, i of an interface with methods and C a class that does not implement it: the object an adapter of C (or
@@ -3130,6 +3160,32 @@ static void rows_note(Expr *e) {
     else if (t->kind == TY_OBJECT && t->cls && t->cls->builtin && t->cls->cname && strncmp(t->cls->cname, "xs_", 3) == 0 &&
              strstr(t->cls->cname, "Array")) xs_rows_seen = true;
 }
+/* o.f = v, o.f op= v, o.f++ with f an interface field some adapter holds in a slot that converts (XB-233: the class's
+   int where the interface says number): written to the slot, then put back into the class's field (ifld_put_fn); o
+   evaluated once. false: not such a write */
+static Expr *ifld_put_done;
+static bool emit_ifld_put(Expr *e) {
+    Expr *t = e->lhs;
+    if (!t || t == ifld_put_done || t->kind != E_MEMBER || t->is_call || t->field < 0 || !t->cls) return false;
+    const char *put = ifld_put_fn(t->cls, t->field, e->pos);
+    if (!put) return false;
+    static int nip;
+    int id = nip++;
+    Expr *base = t->lhs;
+    buf_printf(out, "({ %s ipo%d_ = ", ctype(base->type), id);
+    emit_borrowed(base);
+    buf_printf(out, "; __auto_type ipr%d_ = ", id);
+    Expr *v = xs_alloc(sizeof *v);
+    v->kind = E_IDENT; v->pos = base->pos; v->field = -1; v->type = base->type; v->cname = xs_sprintf("ipo%d_", id); v->str = v->cname;
+    t->lhs = v;
+    Expr *was = ifld_put_done;
+    ifld_put_done = t;
+    emit_expr(e);
+    ifld_put_done = was;
+    t->lhs = base;
+    buf_printf(out, "; %s((%s *)ipo%d_); ipr%d_; })", put, t->cls->cname, id, id);
+    return true;
+}
 static void emit_expr(Expr *e) {
     if (e) rows_note(e);
     if (!nz_mute || nz_passes(e)) { emit_expr_m(e); return; }
@@ -3907,6 +3963,7 @@ static void emit_expr_raw(Expr *e) {
         buf_puts(out, ")");
         return;
     case E_ASSIGN:
+        if (emit_ifld_put(e)) return; /* (XB-233) */
         if (e->op == TK_ASSIGN) hole_set_target = e->lhs; /* (XB-216) */
         if (bce_fw_loop && e->op == TK_ASSIGN)
             for (int k = 0; k < nbce_fw; k++)
@@ -4136,6 +4193,7 @@ static void emit_expr_raw(Expr *e) {
         buf_puts(out, ")");
         return;
     case E_POSTFIX:
+        if (emit_ifld_put(e)) return; /* (XB-233) */
         if (is_i32_index(e->lhs)) { /* i[k]++ on an Int32Array: the old value, the new one wrapped to 32 bits */
             buf_puts(out, "({ int32_t *ip_ = ");
             emit_lvalue_ptr(e->lhs);
@@ -13171,6 +13229,7 @@ static void emit_class(Class *c) {
 
     if (c->adapter_of) { /* an adapter (XB-126) prints as the object it holds: TypeScript has only that object */
         buf_printf(out, "static void %s_print(void *p) { xs_print_obj(((%s *)p)->%s); }\n", c->cname, c->cname, c->fields[0].cname);
+        buf_printf(out, "static void *%s_origin(void *p) { return ((%s *)p)->%s; }\n", c->cname, c->cname, c->fields[0].cname);
     } else if (c->cptr) { /* (header-less: never printed, nohdr_compute) */
         buf_printf(out, "static void %s_print(void *p) { (void)p; }\n", c->cname);
     } else {
@@ -14463,6 +14522,11 @@ void emit_program(Program *p, Buf *o) {
             } else if (c->rdual) {
                 buf_printf(out, "static void %s_rref(void *p);\n", c->cname);
                 buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, %s_print, NULL, NULL, %s_rref%s};\n", c->cname, c->cname, c->cname, c->cname, dyn_ref(c));
+            } else if (c->adapter_of) { /* an adapter (make_adapter): its origin is the object it wraps (xs_fn_origin: one object for
+                                             ===, a Map key, Object.keys through an unknown; TypeScript has only that object) */
+                buf_printf(out, "static void *%s_origin(void *p);\n", c->cname);
+                buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, %s_print, %s%s, .origin = %s_origin};\n", c->cname, c->cname, c->cname,
+                           cy ? xs_sprintf("%s_visit", c->cname) : "NULL", dyn_ref(c), c->cname);
             } else
             buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, %s_print, %s%s};\n", c->cname, c->cname, c->cname, cy ? xs_sprintf("%s_visit", c->cname) : "NULL", dyn_ref(c));
         }
@@ -14489,7 +14553,7 @@ void emit_program(Program *p, Buf *o) {
         *out = joined;
     }
     if (cell_fns.data) { buf_puts(out, cell_fns.data); cell_fns.len = 0; cell_fns.data[0] = 0; ncell = 0; }
-    if (ifld_fns.data) { buf_puts(out, ifld_fns.data); ifld_fns.len = 0; ifld_fns.data[0] = 0; nifld = 0; }
+    if (ifld_fns.data) { buf_puts(out, ifld_fns.data); ifld_fns.len = 0; ifld_fns.data[0] = 0; nifld = 0; nifld_puts = 0; }
     if (json_unknown_used) {
         /* every class JSON can write, for the values an unknown holds */
         int ncls = 0;

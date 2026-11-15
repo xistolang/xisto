@@ -3349,6 +3349,7 @@ XS_NOINLINE void xs_dyn_set(void *o, xs_str *k, void *v) {
    to the copy does not change the object). Borrowed, as a cast's value is: the copy lives until the arena drains. */
 XS_NOINLINE void *xs_as_record(void *v, int nullable, const char *what) {
     if (!v) { if (nullable) return NULL; xs_as_fail(what); }
+    v = xs_fn_origin(v); /* (an object through an interface adapter: the object; XB-233) */
     const xs_type *t = xs_type_of(v);
     if (t->free == xs_map_free && ((xs_map *)v)->str_keys) return v;
     if (!t->dyn) xs_as_fail(what);
@@ -4359,7 +4360,7 @@ static inline bool xs_json_digit(xs_jp *j) { return j->p < j->end && *j->p >= '0
 XS_NOINLINE xs_jv *xs_json_value(xs_jp *j) {
     xs_json_ws(j);
     if (j->p >= j->end) xs_json_fail(j, XJE_TOKEN);
-    if (++j->depth > 200) xs_json_fail(j, XJE_DEEP);
+    if (++j->depth > 10000) xs_json_fail(j, XJE_DEEP); /* (recursive: JSON nested deeper than 10000 levels is refused; V8 takes any depth) */
     char c = *j->p;
     xs_jv *v;
     if (c == '{') {
@@ -5734,6 +5735,17 @@ static xs_arr_ref *xs_process_argv(void) { return xs_argv; }
 static xs_map *xs_process_env(void) { return xs_env; }
 static int64_t xs_process_pid(void) { return (int64_t)getpid(); } /* process.pid */
 /* a key of a Map<number, V> / an element of a Set<number>: held as an int, so it must be a whole number */
+/* a number written through an interface field (number) into the int field of a class used as that interface (XB-233) */
+XS_NOINLINE int64_t xs_ifld_int(double d, const char *cls, const char *field) {
+    if (d != d || d != trunc(d) || fabs(d) > 9007199254740991.0) {
+        char b[40];
+        snprintf(b, sizeof b, "%.17g", d);
+        char m[256];
+        snprintf(m, sizeof m, "%s.%s is an int (xisto): a number written to it must be whole, got %s", cls, field, b);
+        xs_panic(m);
+    }
+    return (int64_t)d;
+}
 XS_NOINLINE int64_t xs_num_key(double d) {
     if (d != d || d != trunc(d) || fabs(d) > 9007199254740991.0) {
         char b[40];
