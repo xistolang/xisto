@@ -3976,6 +3976,8 @@ static bool pr_async_call(Expr *e) {
     if (!pr_is_call(e)) return false;
     if (e->func && (e->func->ret_promise || e->func->is_async)) return true;
     if (e->kind == E_CALL && !e->func && !e->builtin.cfn && e->lhs && e->lhs->type && e->lhs->type->kind == TY_FUNC && e->lhs->type->async_ret) return true;
+    /* const p = Promise.all(xs.map(f)): the group runs on a coroutine of its own and p is its promise (XB-171) */
+    if (e->builtin.cfn && (!strcmp(e->builtin.cfn, "promise_all_map") || !strcmp(e->builtin.cfn, "promise_race_map"))) return true;
     return false;
 }
 static void pr_spawn(Expr *e) { /* the call e (checked), kept as a promise */

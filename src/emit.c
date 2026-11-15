@@ -2516,7 +2516,14 @@ static void emit_spawn(Expr *e) {
     int n = 0;
     bool named = c->kind == E_CALL && (c->func || c->builtin.cfn);
     if (c->lhs && !named && !sp_plain(c->lhs) && n < 128) slot[n++] = &c->lhs;
-    for (int i = 0; i < c->args.len && n < 128; i++) if (!sp_plain(c->args.items[i])) slot[n++] = &c->args.items[i];
+    Expr *mc = c->builtin.cfn && strstr(c->builtin.cfn, "promise_") == c->builtin.cfn && strstr(c->builtin.cfn, "_map") && c->args.len == 1 ? c->args.items[0] : NULL;
+    if (mc && mc->kind == E_MEMBER && mc->lhs && mc->args.len == 1) {
+        /* Promise.all(xs.map(f)) kept as a promise (XB-171): xs and f are evaluated here; the map itself is the group's,
+           in the spawned call (each f(x) a task), not an array computed before it */
+        if (!sp_plain(mc->lhs)) slot[n++] = &mc->lhs;
+        if (!sp_plain(mc->args.items[0])) slot[n++] = &mc->args.items[0];
+    } else
+        for (int i = 0; i < c->args.len && n < 128; i++) if (!sp_plain(c->args.items[i])) slot[n++] = &c->args.items[i];
     Expr *orig[128];
     Expr *fake = xs_alloc(sizeof(Expr) * (size_t)(n ? n : 1));
     for (int i = 0; i < n; i++) {
