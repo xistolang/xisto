@@ -2061,6 +2061,8 @@ static Expr *parse_rel(Parser *p) {
         next(p);
         Expr *c = new_expr(E_IDENT, p->tok.pos);
         c->str = expect(p, TK_IDENT, "write a class name: x instanceof Foo").str;
+        if (is_js_error_name(c->str)) wants_errors = true; /* (x instanceof SyntaxError with no other mention of it) */
+        if (is_url_global_name(c->str)) wants_url = true;
         e = binary(TK_IDENT, pos, e, c); /* TK_IDENT as operator: instanceof */
     }
     return e;

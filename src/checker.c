@@ -8921,6 +8921,19 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->rhs->cls = c;
             e->rhs->type = ty_object_of(c);
             e->type = ty_boolean;
+            if (c && c->mod && c->mod->file && !strcmp(c->mod->file, "xisto:errors") && pure_read(e->lhs)) {
+                /* x instanceof SyntaxError (TypeError, ...): also an Error the runtime raised with that name
+                   (JSON.parse, decodeURIComponent, a null read), which is not an object of the class */
+                Expr *test = expr_copy(e);
+                Expr *nat = xs_alloc(sizeof *nat);
+                nat->kind = E_CALL; nat->pos = e->pos; nat->field = -1; nat->type = ty_boolean;
+                nat->builtin.cfn = "xs_Error_native_is";
+                expr_list_push(&nat->args, expr_copy(e->lhs));
+                expr_list_push(&nat->args, str_lit(e->pos, c->name));
+                memset(e, 0, sizeof *e);
+                e->kind = E_BINARY; e->op = TK_OR; e->pos = test->pos; e->field = -1; e->type = ty_boolean;
+                e->lhs = nat; e->rhs = test;
+            }
             return;
         }
         if (ty_is_any(e->lhs->type) || ty_is_any(e->rhs->type)) { /* an any on one side: JavaScript's rules, at run time */
