@@ -40,7 +40,13 @@ def test(path):
         servers.append({'id': name, 'name': NAMES.get(name, name), 'best': by[best]['rps'], 'bestLevel': best,
                         'p99AtBest': by[best]['p99'], 'cpuAtBest': by[best]['cpu'],
                         'peakRss': max(v['rss'] for v in by.values()),
-                        'values': [by[l]['rps'] if l in by else None for l in levels]})
+                        'values': [by[l]['rps'] if l in by else None for l in levels],
+                        # per level, aligned with 'levels' (None where the server has no valid run): the subpages'
+                        # latency, CPU and memory charts and tables
+                        'p50': [by[l]['p50'] if l in by else None for l in levels],
+                        'p99': [by[l]['p99'] if l in by else None for l in levels],
+                        'cpu': [by[l]['cpu'] if l in by else None for l in levels],
+                        'rss': [by[l]['rss'] if l in by else None for l in levels]})
     return {'levels': levels, 'servers': servers, 'crashed': [NAMES.get(c, c) for c in crashed], 'lines': LINES}
 
 

@@ -52,7 +52,17 @@ const sidebars = {
           link: {type: 'doc', id: 'benchmarks/polybench/index'},
           items: ['benchmarks/polybench/vs-rust', 'benchmarks/polybench/vs-go'],
         },
-        'benchmarks/techempower',
+        {
+          type: 'category',
+          label: 'TechEmpower',
+          link: {type: 'doc', id: 'benchmarks/techempower/index'},
+          items: [
+            'benchmarks/techempower/vs-rust',
+            'benchmarks/techempower/vs-go',
+            'benchmarks/techempower/vs-bun',
+            'benchmarks/techempower/vs-node',
+          ],
+        },
         'benchmarks/http',
         'benchmarks/energy-sqlite-streams',
       ],

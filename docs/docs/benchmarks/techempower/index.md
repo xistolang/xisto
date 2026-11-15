@@ -3,13 +3,16 @@ title: TechEmpower
 sidebar_position: 4
 ---
 
-import {BestBars, LevelLines} from '@site/src/components/Charts/TechEmpower';
+import {BestBars, LevelLines, CostBars} from '@site/src/components/Charts/TechEmpower';
 
 # TechEmpower: HTTP servers
 
 14 Nov 2026, main `3f24503`. The [TechEmpower Framework Benchmarks](https://www.techempower.com/benchmarks/) (TFB)
 measure web frameworks on fixed tests; this page runs its two tests without a database, **json** and **plaintext**,
 with the TFB's rules, on the two AWS VMs. The database tests come next.
+
+Head to head, with every level, latency, CPU and memory: [vs Rust](./vs-rust.md) (actix-web),
+[vs Go](./vs-go.md) (net/http), [vs Bun](./vs-bun.md) and [vs Node](./vs-node.md) (http and fastify).
 
 ## Setup
 
@@ -42,6 +45,14 @@ with the TFB's rules, on the two AWS VMs. The database tests come next.
 
 <LevelLines test="json" />
 
+<CostBars test="json" metric="cpu" />
+
+<CostBars test="json" metric="rss" />
+
+<LevelLines test="json" metric="p99" />
+
+#### json in numbers
+
 | server | best req/s | connections there | p99 there | CPU ms per 1k requests | peak RSS (all levels) |
 |---|---:|---:|---:|---:|---:|
 | Xisto (native `Server`) | **71,544** | 128 | 31.5 ms | 26.1 | 5.5 MB |
@@ -73,6 +84,14 @@ Requests per second at each concurrency level (connections):
 <BestBars test="plaintext" />
 
 <LevelLines test="plaintext" />
+
+<CostBars test="plaintext" metric="cpu" />
+
+<CostBars test="plaintext" metric="rss" />
+
+<LevelLines test="plaintext" metric="p99" />
+
+#### plaintext in numbers
 
 | server | best req/s | connections there | p99 there | CPU ms per 1k requests | peak RSS (all levels) |
 |---|---:|---:|---:|---:|---:|
