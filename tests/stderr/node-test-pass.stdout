@@ -1,0 +1,37 @@
+module body
+end of module body
+✔ adds (Nms)
+✔ async (Nms)
+✔ with options (Nms)
+﹣ skipped by option (Nms) # SKIP
+﹣ skipped with a reason (Nms) # not on this platform
+﹣ test.skip (Nms) # SKIP
+✔ a todo (Nms) # TODO
+✔ todo by option (Nms) # later
+✔ diagnostics (Nms)
+ℹ running diagnostics
+ℹ second line
+﹣ skips itself (Nms) # decided at run time
+▶ subtests
+  ✔ first (Nms)
+  ✔ second (Nms)
+✔ subtests (Nms)
+▶ a suite
+  ✔ one (Nms)
+  ✔ two (Nms)
+  ▶ nested
+    ✔ three (Nms)
+  ✔ nested (Nms)
+  ﹣ skipped it (Nms) # SKIP
+  ✔ todo it (Nms) # TODO
+✔ a suite (Nms)
+﹣ skipped suite (Nms) # SKIP
+✔ hooks ran in order (Nms)
+ℹ tests 19
+ℹ suites 3
+ℹ pass 11
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 5
+ℹ todo 3
+ℹ duration_ms N

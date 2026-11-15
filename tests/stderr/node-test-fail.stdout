@@ -1,0 +1,85 @@
+✔ passes (Nms)
+✖ strictEqual fails (Nms)
+✖ throws an Error (Nms)
+✖ rejects (Nms)
+▶ parent
+  ✔ good child (Nms)
+  ✖ bad child (Nms)
+✖ parent (Nms)
+▶ suite with a bad hook
+  ✖ cannot run (Nms)
+✖ suite with a bad hook (Nms)
+⚠ todo that fails (Nms) # not done
+✖ non-error thrown (Nms)
+ℹ tests 10
+ℹ suites 1
+ℹ pass 2
+ℹ fail 7
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 1
+ℹ duration_ms N
+
+✖ failing tests:
+
+test at tests/stderr/node-test-fail.ts:8:1
+✖ strictEqual fails (Nms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  2 !== 3
+  
+      at tests/stderr/node-test-fail.ts:9:10 {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 2,
+    expected: 3,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests/stderr/node-test-fail.ts:11:1
+✖ throws an Error (Nms)
+  Error: boom
+      at tests/stderr/node-test-fail.ts:12:9
+
+test at tests/stderr/node-test-fail.ts:14:1
+✖ rejects (Nms)
+  TypeError: async boom
+      at tests/stderr/node-test-fail.ts:16:9
+
+test at tests/stderr/node-test-fail.ts:20:11
+✖ bad child (Nms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    {
+      a: [
+        1,
+  +     2
+  -     3
+      ]
+    }
+  
+      at tests/stderr/node-test-fail.ts:21:12
+      at tests/stderr/node-test-fail.ts:20:11 {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [Object],
+    expected: [Object],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at tests/stderr/node-test-fail.ts:28:3
+✖ cannot run (Nms)
+  Error: hook failed
+      at tests/stderr/node-test-fail.ts:26:11
+
+test at tests/stderr/node-test-fail.ts:30:1
+⚠ todo that fails (Nms) # not done
+  Error: expected for now
+      at tests/stderr/node-test-fail.ts:31:9
+
+test at tests/stderr/node-test-fail.ts:36:1
+✖ non-error thrown (Nms)
+  Problem { code: 7 }
