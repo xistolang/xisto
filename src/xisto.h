@@ -561,6 +561,7 @@ typedef struct {
     int access;        /* 0 public, 1 protected, 2 private */
     bool readonly;     /* assigned only in the constructor of its class */
     struct Class *owner; /* the class that declares it (inheritance copies fields down) */
+    bool static_block; /* (sfields) static { ... }: init is the call of the static method that holds the block */
 } Field;
 
 struct Class {
