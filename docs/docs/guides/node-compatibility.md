@@ -212,7 +212,9 @@ input with `xisto:io`.
 
 `import fs from "node:fs"`, `import path from "path"` and the like (TypeScript's `esModuleInterop`) read as
 `import * as fs from "node:fs"`: the default export of a Node module is the module itself. `node:events` is the
-exception, as in Node: its default export is `EventEmitter`.
+exception, as in Node: its default export is `EventEmitter`. The same holds for a package with no default export:
+`import tracer from "dd-trace"` reads as `import * as tracer from "dd-trace"`; a package that has one
+(`export default ...`) gives that.
 
 ## http
 

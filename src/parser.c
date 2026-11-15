@@ -4553,6 +4553,62 @@ static bool pkg_available(const char *from_file, const char *name) {
     return false;
 }
 static Module *load_module(Program *prog, const char *file, Pos from_pos, const char *from_file);
+/* the entry file of the package `name` imported from from_file (as load_module finds it: XISTO_PKGS, a .xisto/pkgs
+   above the file or above the program's first module; xisto.json "main", else index.ts or src/index.ts), or NULL.
+   No error: the import is resolved (and reported) by load_module later */
+static char *pkg_entry_file(Program *prog, const char *from_file, const char *name) {
+    if (!from_file || name[0] == '.' || name[0] == '/' || strchr(name, ':')) return NULL;
+    const char *slash = strchr(name, '/');
+    if (slash && name[0] == '@') slash = strchr(slash + 1, '/');
+    if (slash) return NULL; /* (a deep import: a file of the package, not its entry) */
+    char *found = NULL;
+    const char *extra = getenv("XISTO_PKGS");
+    if (extra && *extra && access(xs_sprintf("%s/%s", extra, name), R_OK) == 0) found = xs_sprintf("%s/%s", extra, name);
+    const char *starts[2] = {from_file, prog && prog->nmodules > 0 ? prog->modules[0]->path : NULL};
+    for (int s = 0; s < 2 && !found; s++) {
+        if (!starts[s]) continue;
+        char dir[PATH_MAX];
+        strncpy(dir, starts[s], sizeof dir - 1);
+        dir[sizeof dir - 1] = 0;
+        for (char *sl; !found && (sl = strrchr(dir, '/')); ) {
+            *sl = 0;
+            char *probe = xs_sprintf("%s/.xisto/pkgs/%s", dir, name);
+            if (access(probe, R_OK) == 0) found = probe;
+        }
+    }
+    if (!found) return NULL;
+    char *meta = xs_read_file(xs_sprintf("%s/xisto.json", found));
+    if (meta) {
+        char *mm = strstr(meta, "\"main\"");
+        if (mm && (mm = strchr(mm + 6, '"'))) {
+            char *e = strchr(mm + 1, '"');
+            if (e) {
+                char *entry = xs_sprintf("%s/%.*s", found, (int)(e - mm - 1), mm + 1);
+                if (access(entry, R_OK) == 0) return entry;
+                if (access(xs_sprintf("%s.ts", entry), R_OK) == 0) return xs_sprintf("%s.ts", entry);
+                return NULL;
+            }
+        }
+    }
+    if (access(xs_sprintf("%s/index.ts", found), R_OK) == 0) return xs_sprintf("%s/index.ts", found);
+    if (access(xs_sprintf("%s/src/index.ts", found), R_OK) == 0) return xs_sprintf("%s/src/index.ts", found);
+    return NULL;
+}
+/* the source declares a default export: export default ..., or default in an export list (export { f as default },
+   export { default } from "./x") */
+static bool src_has_default_export(const char *src) {
+    for (const char *s = strstr(src, "export"); s; s = strstr(s + 6, "export")) {
+        if (s > src && (isalnum((unsigned char)s[-1]) || s[-1] == '_' || s[-1] == '$')) continue;
+        const char *q = s + 6;
+        while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+        if (!strncmp(q, "default", 7) && !isalnum((unsigned char)q[7]) && q[7] != '_') return true;
+        if (*q != '{') continue;
+        const char *end = strchr(q, '}');
+        for (const char *d = q; end && (d = strstr(d, "default")) && d < end; d += 7)
+            if (!isalnum((unsigned char)d[-1]) && d[-1] != '_' && !isalnum((unsigned char)d[7]) && d[7] != '_') return true;
+    }
+    return false;
+}
 /* process.X beyond the members the compiler builds in: the module reads XistoProcess.X (checker), so it imports
    XistoProcess from xisto:process (runtime/node/process.ts), once */
 static void import_process(Program *prog, Module *m) {
@@ -4626,6 +4682,14 @@ static void parse_import(Parser *p, Module *m) {
             const char *base = !strncmp(spec, "node:", 5) ? spec + 5 : !strncmp(spec, "xisto:", 6) ? spec + 6 : spec;
             bool core = !strncmp(spec, "node:", 5) || xs_node_core_name(spec);
             if (core && strcmp(base, "events") != 0) {
+                ns_register(p, m, name.str);
+                goto from;
+            }
+            /* import tracer from "pkg" with a package that has no default export: the package itself, as TypeScript's
+               esModuleInterop reads a module without one (import * as tracer) (XB-222) */
+            char *entry = core ? NULL : pkg_entry_file(p->prog, m->path, spec);
+            char *esrc = entry ? xs_read_file(entry) : NULL;
+            if (esrc && !src_has_default_export(esrc)) {
                 ns_register(p, m, name.str);
                 goto from;
             }
