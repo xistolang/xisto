@@ -3622,6 +3622,7 @@ static void fn_adapt(Expr *e, Expr *x, Type *ft, Type *ret, Type *unbox) {
     ir->kind = S_RETURN; ir->pos = pos; ir->expr = val;
     stmt_list_push(&ib->stmts, ir);
     in->body = ib;
+    in->origin = call; /* (the function it wraps, for identity: ===, Map and Set keys; emit reads the capture __fo) */
     Arrow *ia = xs_alloc(sizeof *ia);
     ia->pos = pos; ia->fn = in; ia->expr_body = true;
     Expr *inner = xs_alloc(sizeof *inner);
@@ -3686,6 +3687,7 @@ static void to_unknown(Expr *e) {
             r->kind = S_RETURN; r->pos = pos; r->expr = call;
             stmt_list_push(&b->stmts, r);
             f->body = b;
+            f->origin = call; /* (the function it wraps, for identity) */
             Arrow *a = xs_alloc(sizeof *a);
             a->pos = pos; a->fn = f; a->expr_body = true;
             memset(e, 0, sizeof *e);
