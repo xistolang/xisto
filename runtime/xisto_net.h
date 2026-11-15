@@ -3720,6 +3720,283 @@ XS_NOINLINE xs_str *xs_os_kernel_text(int64_t which) {
     return xs_str_new(s, strlen(s));
 #endif
 }
+/* os.machine(), os.uptime(), os.loadavg(), os.totalmem(), os.freemem(), os.userInfo(), os.networkInterfaces() and
+   os.constants, as libuv gives them to Node */
+#if !defined(_WIN32)
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <pwd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <net/if_dl.h>
+#include <sys/sysctl.h>
+#else
+#include <netpacket/packet.h>
+#include <sys/sysinfo.h>
+#endif
+#endif
+XS_NOINLINE xs_str *xs_os_machine_name(void) {
+#if defined(_WIN32)
+    return xs_os_arch_name();
+#else
+    struct utsname u;
+    if (uname(&u) != 0) return xs_str_new("", 0);
+    return xs_str_new(u.machine, strlen(u.machine));
+#endif
+}
+#if defined(__linux__)
+static double xs_os_meminfo(const char *key) { /* a /proc/meminfo line's kB, in bytes; -1 when missing */
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char line[256];
+    size_t kl = strlen(key);
+    double v = -1;
+    while (fgets(line, sizeof line, f))
+        if (strncmp(line, key, kl) == 0 && line[kl] == ':') { v = strtod(line + kl + 1, NULL) * 1024; break; }
+    fclose(f);
+    return v;
+}
+#endif
+/* [uptime s, load 1, 5, 15, total memory, free memory] */
+XS_NOINLINE xs_arr_num *xs_os_figures(void) {
+    xs_arr_num *a = xs_arr_num_new(0, 0);
+    double v[6] = {0, 0, 0, 0, 0, 0};
+#if defined(__APPLE__)
+    struct timeval bt;
+    size_t n = sizeof bt;
+    int mib[2] = {CTL_KERN, KERN_BOOTTIME};
+    if (sysctl(mib, 2, &bt, &n, NULL, 0) == 0) v[0] = (double)(time(NULL) - bt.tv_sec);
+    uint64_t mem = 0;
+    n = sizeof mem;
+    if (sysctlbyname("hw.memsize", &mem, &n, NULL, 0) == 0) v[4] = (double)mem;
+    vm_statistics_data_t vs;
+    mach_msg_type_number_t cnt = sizeof vs / sizeof(integer_t);
+    if (host_statistics(mach_host_self(), HOST_VM_INFO, (host_info_t)&vs, &cnt) == KERN_SUCCESS) v[5] = (double)vs.free_count * (double)sysconf(_SC_PAGESIZE);
+#elif defined(__linux__)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_BOOTTIME, &ts) == 0) v[0] = (double)ts.tv_sec + (double)(ts.tv_nsec / 10000000) / 100;
+    v[4] = xs_os_meminfo("MemTotal");
+    v[5] = xs_os_meminfo("MemAvailable");
+    struct sysinfo si;
+    if ((v[4] < 0 || v[5] < 0) && sysinfo(&si) == 0) {
+        if (v[4] < 0) v[4] = (double)si.totalram * si.mem_unit;
+        if (v[5] < 0) v[5] = (double)si.freeram * si.mem_unit;
+    }
+#endif
+#if !defined(_WIN32)
+    double l[3];
+    if (getloadavg(l, 3) == 3) { v[1] = l[0]; v[2] = l[1]; v[3] = l[2]; }
+#endif
+    for (int i = 0; i < 6; i++) xs_arr_num_push(a, v[i] < 0 ? 0 : v[i]);
+    return a;
+}
+/* [uid, gid, username, homedir, shell] of the effective user (uv_os_get_passwd); empty when unknown */
+XS_NOINLINE xs_arr_ref *xs_os_user_info(void) {
+    xs_arr_ref *a = xs_arr_ref_new(0, xs_print_str_quoted_);
+#if !defined(_WIN32)
+    struct passwd pw, *r = NULL;
+    char buf[4096];
+    if (getpwuid_r(geteuid(), &pw, buf, sizeof buf, &r) != 0 || !r) return a;
+    char num[32];
+    snprintf(num, sizeof num, "%lld", (long long)pw.pw_uid);
+    xs_arr_ref_push(a, xs_str_new(num, strlen(num)));
+    snprintf(num, sizeof num, "%lld", (long long)pw.pw_gid);
+    xs_arr_ref_push(a, xs_str_new(num, strlen(num)));
+    const char *f[3] = {pw.pw_name, pw.pw_dir, pw.pw_shell};
+    for (int i = 0; i < 3; i++) xs_arr_ref_push(a, xs_str_new(f[i] ? f[i] : "", f[i] ? strlen(f[i]) : 0));
+#endif
+    return a;
+}
+/* one string per address of an interface that is up: name \t family \t address \t netmask \t mac \t internal \t scope id */
+XS_NOINLINE xs_arr_ref *xs_os_interfaces(void) {
+    xs_arr_ref *a = xs_arr_ref_new(0, xs_print_str_quoted_);
+#if !defined(_WIN32)
+    struct ifaddrs *all, *e;
+    if (getifaddrs(&all) != 0) return a;
+    for (e = all; e; e = e->ifa_next) {
+        if (!((e->ifa_flags & IFF_UP) && (e->ifa_flags & IFF_RUNNING)) || !e->ifa_addr) continue;
+        int fam = e->ifa_addr->sa_family;
+        if (fam != AF_INET && fam != AF_INET6) continue;
+        char addr[INET6_ADDRSTRLEN] = "", mask[INET6_ADDRSTRLEN] = "", mac[18] = "00:00:00:00:00:00";
+        unsigned scope = 0;
+        if (fam == AF_INET) {
+            inet_ntop(AF_INET, &((struct sockaddr_in *)e->ifa_addr)->sin_addr, addr, sizeof addr);
+            if (e->ifa_netmask) inet_ntop(AF_INET, &((struct sockaddr_in *)e->ifa_netmask)->sin_addr, mask, sizeof mask);
+        } else {
+            struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)e->ifa_addr;
+            inet_ntop(AF_INET6, &s6->sin6_addr, addr, sizeof addr);
+            scope = s6->sin6_scope_id;
+            if (e->ifa_netmask) inet_ntop(AF_INET6, &((struct sockaddr_in6 *)e->ifa_netmask)->sin6_addr, mask, sizeof mask);
+        }
+        for (struct ifaddrs *l = all; l; l = l->ifa_next) { /* the interface's hardware address */
+            if (!l->ifa_addr || strcmp(l->ifa_name, e->ifa_name) != 0) continue;
+            const unsigned char *m = NULL;
+#if defined(__APPLE__)
+            if (l->ifa_addr->sa_family == AF_LINK) m = (const unsigned char *)LLADDR((struct sockaddr_dl *)l->ifa_addr);
+#else
+            if (l->ifa_addr->sa_family == AF_PACKET) m = ((struct sockaddr_ll *)l->ifa_addr)->sll_addr;
+#endif
+            if (m) { snprintf(mac, sizeof mac, "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]); break; }
+        }
+        char line[512];
+        int n = snprintf(line, sizeof line, "%s\t%s\t%s\t%s\t%s\t%d\t%u", e->ifa_name, fam == AF_INET ? "IPv4" : "IPv6", addr, mask, mac,
+                         (e->ifa_flags & IFF_LOOPBACK) ? 1 : 0, scope);
+        xs_arr_ref_push(a, xs_str_new(line, (size_t)(n < (int)sizeof line ? n : (int)sizeof line - 1)));
+    }
+    freeifaddrs(all);
+#endif
+    return a;
+}
+/* os.constants: "NAME\tvalue" of each signal (kind 0), errno (1) the system defines, in Node's order */
+XS_NOINLINE xs_arr_ref *xs_os_constant_list(int64_t kind) {
+    xs_arr_ref *a = xs_arr_ref_new(0, xs_print_str_quoted_);
+#define XS_C(n) {#n, n},
+    static const struct { const char *n; int v; } sig[] = {
+#ifdef SIGHUP
+        XS_C(SIGHUP)
+#endif
+        XS_C(SIGINT)
+#ifdef SIGQUIT
+        XS_C(SIGQUIT)
+#endif
+        XS_C(SIGILL)
+#ifdef SIGTRAP
+        XS_C(SIGTRAP)
+#endif
+        XS_C(SIGABRT)
+#ifdef SIGIOT
+        XS_C(SIGIOT)
+#endif
+#ifdef SIGBUS
+        XS_C(SIGBUS)
+#endif
+        XS_C(SIGFPE)
+#ifdef SIGKILL
+        XS_C(SIGKILL)
+#endif
+#ifdef SIGUSR1
+        XS_C(SIGUSR1)
+#endif
+        XS_C(SIGSEGV)
+#ifdef SIGUSR2
+        XS_C(SIGUSR2)
+#endif
+#ifdef SIGPIPE
+        XS_C(SIGPIPE)
+#endif
+#ifdef SIGALRM
+        XS_C(SIGALRM)
+#endif
+        XS_C(SIGTERM)
+#ifdef SIGCHLD
+        XS_C(SIGCHLD)
+#endif
+#ifdef SIGSTKFLT
+        XS_C(SIGSTKFLT)
+#endif
+#ifdef SIGCONT
+        XS_C(SIGCONT)
+#endif
+#ifdef SIGSTOP
+        XS_C(SIGSTOP)
+#endif
+#ifdef SIGTSTP
+        XS_C(SIGTSTP)
+#endif
+#ifdef SIGBREAK
+        XS_C(SIGBREAK)
+#endif
+#ifdef SIGTTIN
+        XS_C(SIGTTIN)
+#endif
+#ifdef SIGTTOU
+        XS_C(SIGTTOU)
+#endif
+#ifdef SIGURG
+        XS_C(SIGURG)
+#endif
+#ifdef SIGXCPU
+        XS_C(SIGXCPU)
+#endif
+#ifdef SIGXFSZ
+        XS_C(SIGXFSZ)
+#endif
+#ifdef SIGVTALRM
+        XS_C(SIGVTALRM)
+#endif
+#ifdef SIGPROF
+        XS_C(SIGPROF)
+#endif
+#ifdef SIGWINCH
+        XS_C(SIGWINCH)
+#endif
+#ifdef SIGIO
+        XS_C(SIGIO)
+#endif
+#ifdef SIGPOLL
+        XS_C(SIGPOLL)
+#endif
+#ifdef SIGLOST
+        XS_C(SIGLOST)
+#endif
+#ifdef SIGPWR
+        XS_C(SIGPWR)
+#endif
+#ifdef SIGINFO
+        XS_C(SIGINFO)
+#endif
+#ifdef SIGSYS
+        XS_C(SIGSYS)
+#endif
+    };
+    static const struct { const char *n; int v; } err[] = {
+        XS_C(E2BIG) XS_C(EACCES) XS_C(EADDRINUSE) XS_C(EADDRNOTAVAIL) XS_C(EAFNOSUPPORT) XS_C(EAGAIN) XS_C(EALREADY) XS_C(EBADF)
+        XS_C(EBADMSG) XS_C(EBUSY) XS_C(ECANCELED) XS_C(ECHILD) XS_C(ECONNABORTED) XS_C(ECONNREFUSED) XS_C(ECONNRESET) XS_C(EDEADLK)
+        XS_C(EDESTADDRREQ) XS_C(EDOM)
+#ifdef EDQUOT
+        XS_C(EDQUOT)
+#endif
+        XS_C(EEXIST) XS_C(EFAULT) XS_C(EFBIG) XS_C(EHOSTUNREACH) XS_C(EIDRM) XS_C(EILSEQ) XS_C(EINPROGRESS) XS_C(EINTR) XS_C(EINVAL)
+        XS_C(EIO) XS_C(EISCONN) XS_C(EISDIR) XS_C(ELOOP) XS_C(EMFILE) XS_C(EMLINK) XS_C(EMSGSIZE)
+#ifdef EMULTIHOP
+        XS_C(EMULTIHOP)
+#endif
+        XS_C(ENAMETOOLONG) XS_C(ENETDOWN) XS_C(ENETRESET) XS_C(ENETUNREACH) XS_C(ENFILE) XS_C(ENOBUFS)
+#ifdef ENODATA
+        XS_C(ENODATA)
+#endif
+        XS_C(ENODEV) XS_C(ENOENT) XS_C(ENOEXEC) XS_C(ENOLCK)
+#ifdef ENOLINK
+        XS_C(ENOLINK)
+#endif
+        XS_C(ENOMEM) XS_C(ENOMSG) XS_C(ENOPROTOOPT) XS_C(ENOSPC)
+#ifdef ENOSR
+        XS_C(ENOSR)
+#endif
+#ifdef ENOSTR
+        XS_C(ENOSTR)
+#endif
+        XS_C(ENOSYS) XS_C(ENOTCONN) XS_C(ENOTDIR) XS_C(ENOTEMPTY) XS_C(ENOTSOCK) XS_C(ENOTSUP) XS_C(ENOTTY) XS_C(ENXIO)
+        XS_C(EOPNOTSUPP) XS_C(EOVERFLOW) XS_C(EPERM) XS_C(EPIPE) XS_C(EPROTO) XS_C(EPROTONOSUPPORT) XS_C(EPROTOTYPE) XS_C(ERANGE)
+        XS_C(EROFS) XS_C(ESPIPE) XS_C(ESRCH)
+#ifdef ESTALE
+        XS_C(ESTALE)
+#endif
+#ifdef ETIME
+        XS_C(ETIME)
+#endif
+        XS_C(ETIMEDOUT) XS_C(ETXTBSY) XS_C(EWOULDBLOCK) XS_C(EXDEV)
+    };
+#undef XS_C
+    size_t n = kind == 0 ? sizeof sig / sizeof sig[0] : sizeof err / sizeof err[0];
+    for (size_t i = 0; i < n; i++) {
+        char line[64];
+        int k = snprintf(line, sizeof line, "%s\t%d", kind == 0 ? sig[i].n : err[i].n, kind == 0 ? sig[i].v : err[i].v);
+        xs_arr_ref_push(a, xs_str_new(line, (size_t)k));
+    }
+    return a;
+}
 /* ---- fs.createReadStream / fs.createWriteStream (runtime/node/stream.ts): open, read, write and close that give
    -errno instead of throwing (the stream turns it into its 'error' event, with Node's code and message) */
 XS_NOINLINE int64_t xs_fs_stream_open(xs_str *path, xs_str *flags, int64_t mode) {

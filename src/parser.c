@@ -1292,8 +1292,42 @@ static bool is_url_global_name(const char *n) {
     return n && (!strcmp(n, "URL") || !strcmp(n, "URLSearchParams") || !strcmp(n, "AbortController") || !strcmp(n, "AbortSignal") ||
                  !strcmp(n, "DOMException") || !strcmp(n, "RequestInit") || !strcmp(n, "HeadersInit") || !strcmp(n, "fetch") || !strcmp(n, "BufferEncoding"));
 }
+/* import.meta.url / dirname / filename: the module's source file as the build found it (an absolute path, symbolic
+   links resolved, as Node gives the main module's). xisto compiles ahead of time, so this is where the source was
+   built, not where the binary runs: what new URL("./x", import.meta.url) and fileURLToPath(import.meta.url) want to
+   find files kept next to the source. The URL is percent-encoded as Node's pathToFileURL encodes it. */
+static Expr *parse_import_meta(Parser *p) {
+    Pos pos = p->tok.pos;
+    expect(p, TK_IMPORT, NULL);
+    expect(p, TK_DOT, NULL);
+    if (!at_ident(p, "meta")) xs_error(XS1021, p->tok.pos, "import.meta.url, import.meta.dirname, import.meta.filename", "expected an expression but found 'import'");
+    next(p);
+    expect(p, TK_DOT, "import.meta.url, import.meta.dirname or import.meta.filename");
+    Token name = expect(p, TK_IDENT, NULL);
+    const char *file = p->mod && p->mod->path && p->mod->path[0] == '/' ? p->mod->path : NULL;
+    char abs[PATH_MAX];
+    if (!file && p->mod && p->mod->path && realpath(p->mod->path, abs)) file = abs;
+    if (!file) file = p->mod && p->mod->path ? p->mod->path : "";
+    Expr *e = new_expr(E_STRING, pos);
+    if (strcmp(name.str, "filename") == 0) e->str = xs_strndup(file, strlen(file));
+    else if (strcmp(name.str, "dirname") == 0) {
+        const char *sl = strrchr(file, '/');
+        e->str = sl == file ? "/" : xs_strndup(file, sl ? (size_t)(sl - file) : 0);
+    } else if (strcmp(name.str, "url") == 0) {
+        Buf b = {0};
+        buf_puts(&b, "file://");
+        for (const unsigned char *c = (const unsigned char *)file; *c; c++) {
+            if (isalnum(*c) || strchr("-._!$&'()*+,;=:@/", *c)) buf_printf(&b, "%c", *c);
+            else buf_printf(&b, "%%%02X", *c);
+        }
+        e->str = b.data ? b.data : "file://";
+    } else xs_error(XS1021, name.pos, "import.meta.url, import.meta.dirname, import.meta.filename", "import.meta.%s is not supported", name.str);
+    return e;
+}
+
 static Expr *parse_primary(Parser *p) {
     Pos pos = p->tok.pos;
+    if (at(p, TK_IMPORT) && peek_is(p, TK_DOT)) return parse_import_meta(p);
     if (at(p, TK_IDENT) && strncmp(p->tok.str, "__reflect_", 10) == 0) { /* __reflect_kind(T) & co: generated code only */
         Expr *e = new_expr(E_CALL, pos);
         e->builtin.cfn = p->tok.str;
@@ -2502,6 +2536,7 @@ static Stmt *tdz_split(Parser *p, Stmt *s) {
 static bool tok_ident_is(Parser *q, const char *s);
 static void fix_import_names(Parser *p, Module *m, int i0);
 static void ns_register(Parser *p, Module *m, const char *alias);
+static void fs_extras(Program *prog, Module *m, Import *im);
 static Module *load_module(Program *prog, const char *file, Pos from_pos, const char *from_file);
 static Stmt *parse_var(Parser *p) {
     Stmt *s = new_stmt(S_VAR, p->tok.pos);
@@ -2546,6 +2581,7 @@ static Stmt *parse_var(Parser *p) {
                             m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
                             m->imports[m->nimports++] = im;
                             m->imports[n0].from = load_module(prog, pa, nm.pos, m->path);
+                            fs_extras(prog, m, &m->imports[n0]);
                             xs_file_name = m->file;
                             xs_source = m->src;
                             parsing_prog = prog;
@@ -3095,6 +3131,8 @@ static Stmt *parse_stmt(Parser *p) {
         return s;
     }
     case TK_IMPORT:
+        if (peek_is(p, TK_DOT)) goto expression; /* import.meta.url ... */
+        /* fallthrough */
     case TK_EXPORT:
         xs_error(XS6004, pos, "imports and exports go at the top level of the file", "'%s' is not allowed here", p->tok.kind == TK_IMPORT ? "import" : "export");
         return NULL;
@@ -3102,7 +3140,8 @@ static Stmt *parse_stmt(Parser *p) {
     case TK_ENUM:
         xs_error(XS6027, pos, "move it to the top level of the file", "nested classes and enums are not supported");
         return NULL;
-    default: {
+    default:
+    expression: {
         Stmt *s = new_stmt(S_EXPR, pos);
         bool so = p->spread_ok; Expr *sa = p->spread_arg;
         p->spread_ok = true;
@@ -4993,8 +5032,8 @@ static Enum *parse_enum(Parser *p) {
    first) then the member's decorators (bottom up); constructor parameters; then the class (bottom up). */
 static bool class_decorated(Class *c) {
     if (c->decos.len || c->as_value) return true;
-    if (c->base_name && strcmp(c->base_name, "Error") == 0 && !(c->mod && c->mod->file && (!strcmp(c->mod->file, "xisto:crypto") || !strcmp(c->mod->file, "xisto:zlib"))))
-        return true; /* an error class: a value too (@Catch(MyError)); not node:crypto's and node:zlib's errors with a code, which
+    if (c->base_name && strcmp(c->base_name, "Error") == 0 && !(c->mod && c->mod->file && (!strcmp(c->mod->file, "xisto:crypto") || !strcmp(c->mod->file, "xisto:zlib") || !strcmp(c->mod->file, "xisto:fs"))))
+        return true; /* an error class: a value too (@Catch(MyError)); not node:crypto's, node:zlib's and node:fs's errors with a code, which
                         would make every program that imports them carry xisto:reflect (~40 KB) */
     if (c->mixin) return true; /* class UpdateDto extends PartialType(CreateDto) {}: a value too (@Body() dto: UpdateDto) */
     for (int i = 0; i < c->nfields; i++) if (c->fields[i].decos.len) return true;
@@ -5555,6 +5594,51 @@ static void apply_local_exports(Program *prog, Module *m, int top_start) {
     }
 }
 
+/* node:fs's parts that only the programs naming them load (runtime/node/fs.ts holds the synchronous API): the callback
+   API (fs.readFile & co, xisto:fs_callbacks: it runs on the event loop), fs.promises (xisto:fs/promises) and the
+   streams (fs.createReadStream & co, xisto:stream). A module that imports xisto:fs and names one of them, as fs.X or
+   import { X }, makes it a re-export of xisto:fs. */
+static const char *const fs_cb_names[] = {"readFile", "writeFile", "appendFile", "mkdir", "readdir", "stat", "lstat", "fstat", "rm",
+                                          "rmdir", "rename", "access", "unlink", "copyFile", "cp", "realpath", "mkdtemp", "readlink",
+                                          "symlink", "link", "chmod", "truncate", "utimes", NULL};
+static const char *const fs_stream_names[] = {"createReadStream", "createWriteStream", "ReadStream", "WriteStream", NULL};
+static bool fs_names(const char *src, Import *im, const char *const *names) {
+    for (const char *const *n = names; *n; n++) {
+        for (int i = 0; i < im->n; i++) if (strcmp(im->names[i], *n) == 0) return true;
+        size_t len = strlen(*n);
+        for (const char *q = strstr(src, *n); q; q = strstr(q + 1, *n)) /* fs.readFile( / fs.ReadStream */
+            if (q > src && q[-1] == '.' && !isalnum((unsigned char)q[len]) && q[len] != '_' && q[len] != '$') return true;
+    }
+    return false;
+}
+static void fs_reexport(Program *prog, Module *fs, const char *path, const char *const *names) {
+    for (int i = 0; i < fs->nimports; i++) if (fs->imports[i].reexport && strcmp(fs->imports[i].path, path) == 0) return;
+    Import im = {0};
+    im.pos = (Pos){1, 1};
+    im.reexport = true;
+    im.path = (char *)path;
+    if (!names) im.star = true;
+    else
+        for (const char *const *n = names; *n; n++) {
+            im.names = realloc(im.names, sizeof(char *) * (size_t)(im.n + 1));
+            im.positions = realloc(im.positions, sizeof(Pos) * (size_t)(im.n + 1));
+            im.as_names = realloc(im.as_names, sizeof(char *) * (size_t)(im.n + 1));
+            im.names[im.n] = im.as_names[im.n] = (char *)*n;
+            im.positions[im.n++] = im.pos;
+        }
+    fs->imports = realloc(fs->imports, sizeof(Import) * (size_t)(fs->nimports + 1));
+    fs->imports[fs->nimports++] = im;
+    load_import(prog, fs, &fs->imports[fs->nimports - 1]);
+}
+static void fs_extras(Program *prog, Module *m, Import *im) {
+    Module *fs = im->from;
+    if (!fs || fs->missing || !fs->file || strcmp(fs->file, "xisto:fs") != 0 || !m->src || !strncmp(m->file, "xisto:", 6)) return;
+    static const char *const promises[] = {"promises", NULL};
+    if (fs_names(m->src, im, fs_cb_names)) fs_reexport(prog, fs, "xisto:fs_callbacks", NULL);
+    if (fs_names(m->src, im, promises)) fs_reexport(prog, fs, "xisto:fs/promises", promises);
+    if (fs_names(m->src, im, fs_stream_names)) fs_reexport(prog, fs, "xisto:stream", fs_stream_names);
+}
+
 static void parse_module(Program *prog, Module *m) {
     xs_file_name = m->file;
     xs_source = m->src;
@@ -5578,7 +5662,7 @@ static void parse_module(Program *prog, Module *m) {
             xs_lex_skipping = false;
         }
     }
-    while (at(&p, TK_IMPORT) || reexport_ahead(&p)) {
+    while ((at(&p, TK_IMPORT) && !peek_is(&p, TK_DOT)) || reexport_ahead(&p)) { /* (import.meta.url: an expression) */
         if (at(&p, TK_IMPORT)) parse_import(&p, m);
         else parse_reexport(&p, m, prog, false);
     }
@@ -5591,6 +5675,7 @@ static void parse_module(Program *prog, Module *m) {
             else im->from = missing_module(prog, im->path);
             xs_error_recover = &prb;
         } else im->from = load_module(prog, im->path, im->pos, m->path);
+        fs_extras(prog, m, &m->imports[i]);
         xs_file_name = m->file;
         xs_source = m->src;
     }
@@ -5687,7 +5772,7 @@ static void parse_module(Program *prog, Module *m) {
         char *treq_name = NULL, *treq_path = NULL;
         Pos treq_pos = p.tok.pos;
         bool treq = at(&p, TK_LET) && try_require_ahead(&p, &treq_name, &treq_path);
-        if (treq || at(&p, TK_IMPORT) || require_ahead(&p)) { /* an import after declarations (ES hoists it): read and loaded here; names resolve in the
+        if (treq || (at(&p, TK_IMPORT) && !peek_is(&p, TK_DOT)) || require_ahead(&p)) { /* an import after declarations (ES hoists it): read and loaded here; names resolve in the
                                     checker, after the whole file, so declarations above may use them */
             int n0 = m->nimports;
             if (treq) {
@@ -5708,6 +5793,7 @@ static void parse_module(Program *prog, Module *m) {
                     else im->from = missing_module(prog, im->path);
                     xs_error_recover = saved;
                 } else im->from = load_module(prog, im->path, im->pos, m->path);
+                fs_extras(prog, m, &m->imports[i]);
                 xs_file_name = m->file;
                 xs_source = m->src;
                 parsing_prog = prog;
@@ -6367,7 +6453,102 @@ static const char xs_os_src[] =
     "export function version(): string {\n  return os_kernel_text(1);\n}\n"
     "export function tmpdir(): string {\n  return os_tmp_dir();\n}\n"
     "export function homedir(): string {\n  return os_home_dir();\n}\n"
-    "export const EOL: string = \"\\n\";\n";
+    "export const EOL: string = \"\\n\";\n"
+    "export const devNull: string = \"/dev/null\";\n"
+    "declare function os_machine_name(): string;\n"
+    "declare function os_figures(): number[];\n"
+    "declare function os_user_info(): string[];\n"
+    "declare function os_interfaces(): string[];\n"
+    "declare function os_constant_list(kind: int): string[];\n"
+    "export function machine(): string {\n"
+    "  return os_machine_name();\n"
+    "}\n"
+    "export function endianness(): string {\n"
+    "  return \"LE\";\n"
+    "}\n"
+    "export function uptime(): number {\n"
+    "  return os_figures()[0];\n"
+    "}\n"
+    "export function loadavg(): number[] {\n"
+    "  const f = os_figures();\n"
+    "  return [f[1], f[2], f[3]];\n"
+    "}\n"
+    "export function totalmem(): number {\n"
+    "  return os_figures()[4];\n"
+    "}\n"
+    "export function freemem(): number {\n"
+    "  return os_figures()[5];\n"
+    "}\n"
+    "export function availableMemory(): number {\n"
+    "  return os_figures()[5];\n"
+    "}\n"
+    "export interface UserInfo {\n"
+    "  uid: int;\n"
+    "  gid: int;\n"
+    "  username: string;\n"
+    "  homedir: string;\n"
+    "  shell: string | null;\n"
+    "}\n"
+    "export function userInfo(options: object | null = null): UserInfo {\n"
+    "  const u = os_user_info();\n"
+    "  if (u.length < 5) return { uid: -1, gid: -1, username: \"\", homedir: os_home_dir(), shell: null };\n"
+    "  return { uid: Math.trunc(parseInt(u[0], 10)), gid: Math.trunc(parseInt(u[1], 10)), username: u[2], homedir: u[3], shell: u[4] };\n"
+    "}\n"
+    "export interface NetworkInterfaceInfo {\n"
+    "  address: string;\n"
+    "  netmask: string;\n"
+    "  family: string;\n"
+    "  mac: string;\n"
+    "  internal: boolean;\n"
+    "  cidr: string | null;\n"
+    "  scopeid?: int;\n"
+    "}\n"
+    "function __os_prefix(mask: string, v6: boolean): int {\n"
+    "  let bits = 0;\n"
+    "  for (const part of mask.split(v6 ? \":\" : \".\")) {\n"
+    "    let n = part.length === 0 ? 0 : Math.trunc(parseInt(part, v6 ? 16 : 10));\n"
+    "    while (n > 0) {\n"
+    "      bits += n & 1;\n"
+    "      n = n >> 1;\n"
+    "    }\n"
+    "  }\n"
+    "  return bits;\n"
+    "}\n"
+    "export function networkInterfaces(): Record<string, NetworkInterfaceInfo[]> {\n"
+    "  const out: Record<string, NetworkInterfaceInfo[]> = {};\n"
+    "  for (const line of os_interfaces()) {\n"
+    "    const f = line.split(\"\\t\");\n"
+    "    const v6 = f[1] === \"IPv6\";\n"
+    "    const info: NetworkInterfaceInfo = { address: f[2], netmask: f[3], family: f[1], mac: f[4], internal: f[5] === \"1\", cidr: f[2] + \"/\" + __os_prefix(f[3], v6) };\n"
+    "    if (v6) info.scopeid = Math.trunc(parseInt(f[6], 10));\n"
+    "    const list = out[f[0]];\n"
+    "    if (list === undefined) out[f[0]] = [info];\n"
+    "    else list.push(info);\n"
+    "  }\n"
+    "  return out;\n"
+    "}\n"
+    "function __os_table(kind: int): Record<string, int> {\n"
+    "  const r: Record<string, int> = {};\n"
+    "  for (const line of os_constant_list(kind)) {\n"
+    "    const t = line.indexOf(\"\\t\");\n"
+    "    r[line.slice(0, t)] = Math.trunc(parseInt(line.slice(t + 1), 10));\n"
+    "  }\n"
+    "  return r;\n"
+    "}\n"
+    "export interface OsPriority {\n"
+    "  PRIORITY_LOW: int;\n"
+    "  PRIORITY_BELOW_NORMAL: int;\n"
+    "  PRIORITY_NORMAL: int;\n"
+    "  PRIORITY_ABOVE_NORMAL: int;\n"
+    "  PRIORITY_HIGH: int;\n"
+    "  PRIORITY_HIGHEST: int;\n"
+    "}\n"
+    "/** os.constants: the signals' and errno's numbers on this system, and the scheduling priorities. */\n"
+    "export class constants {\n"
+    "  static readonly signals: Record<string, int> = __os_table(0);\n"
+    "  static readonly errno: Record<string, int> = __os_table(1);\n"
+    "  static readonly priority: OsPriority = { PRIORITY_LOW: 19, PRIORITY_BELOW_NORMAL: 10, PRIORITY_NORMAL: 0, PRIORITY_ABOVE_NORMAL: -7, PRIORITY_HIGH: -14, PRIORITY_HIGHEST: -20 };\n"
+    "}\n";
 static void parse_module(Program *prog, Module *m);
 
 /* xisto:fs is the canonical name of a built-in module; node:fs (and the bare fs, sqlite) only in Node
@@ -6397,16 +6578,12 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
     }
     m->id = prog->nmodules;
     prog->modules[prog->nmodules++] = m;
-    if (strcmp(name, "fs") == 0) {
+    if (strcmp(name, "fs_native") == 0) { /* what runtime/node/fs.ts (xisto:fs) re-exports of the runtime's own */
         add_func(prog, builtin_func(m, "readFileSync", "xs_fs_read", ty_string, 2, ty_string, ty_string));
-        add_func(prog, builtin_func(m, "writeFileSync", "xs_fs_write", ty_void, 2, ty_string, ty_string));
-        add_func(prog, builtin_func(m, "appendFileSync", "xs_fs_append", ty_void, 2, ty_string, ty_string));
         add_func(prog, builtin_func(m, "existsSync", "xs_fs_exists", ty_boolean, 1, ty_string, NULL));
-        add_func(prog, builtin_func(m, "unlinkSync", "xs_fs_unlink", ty_void, 1, ty_string, NULL));
         /* file descriptors (checker: check_fs_fd_call fixes the arities and types) */
         add_func(prog, builtin_func(m, "openSync", "xs_fs_open", ty_int, 2, ty_string, ty_string));
         add_func(prog, builtin_func(m, "closeSync", "xs_fs_close", ty_void, 1, ty_int, NULL));
-        add_func(prog, builtin_func(m, "fstatSync", "xs_fs_fstat", ty_int, 1, ty_int, NULL));
         add_func(prog, builtin_func(m, "readSync", "xs_fs_read_sync", ty_int, 2, ty_int, ty_int));
         return m;
     }
@@ -6511,6 +6688,20 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->builtin = false;
         m->file = "xisto:path";
         m->src = (char *)xs_node_path_ts;
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
+    if (strcmp(name, "fs") == 0 || strcmp(name, "fs_callbacks") == 0) {
+        /* Node's fs, written in xisto: runtime/node/fs.ts (synchronous), fs_callbacks.ts (fs.readFile & co, see fs_extras) */
+        extern const unsigned char xs_node_fs_ts[], xs_node_fs_callbacks_ts[];
+        bool cb = strcmp(name, "fs_callbacks") == 0;
+        m->builtin = false;
+        m->file = cb ? "xisto:fs_callbacks" : "xisto:fs";
+        m->src = (char *)(cb ? xs_node_fs_callbacks_ts : xs_node_fs_ts);
+        m->native_prefix = "xs_";
+        if (cb) prog->uses_net = true; /* (the callbacks come on the event loop) */
         m->loading = true;
         parse_module(prog, m);
         m->loading = false;

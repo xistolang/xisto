@@ -288,11 +288,6 @@ static void init_builtins(void) {
     bi_field(f32, "length", ty_int);
     Class *i32 = bi_class("Int32Array", "xs_Int32Array"); /* (32-bit ints: i[i] is an int, a write wraps as ToInt32; Atomics too) */
     bi_field(i32, "length", ty_int);
-    /* fs.fstatSync (runtime/xisto_rt.h, xs_fs_fstat): the size and the kind of what a descriptor is open on */
-    Class *stc = bi_class("Stats", "xs_Stats");
-    bi_field(stc, "size", ty_int);
-    bi_method(stc, "isFile", "xs_Stats_isFile", ty_boolean, 0);
-    bi_method(stc, "isDirectory", "xs_Stats_isDirectory", ty_boolean, 0);
     Class *tenc = bi_class("TextEncoder", "xs_TextEncoder");
     bi_method(tenc, "encode", "xs_TextEncoder_encode", ty_object_of(u8), 1, ty_string);
     Class *tdec = bi_class("TextDecoder", "xs_TextEncoder");
@@ -491,15 +486,58 @@ static void check_date_member(Expr *e) {
 static bool is_bytes(Type *t) {
     return t && t->kind == TY_OBJECT && t->cls->builtin && (strcmp(t->cls->name, "Uint8Array") == 0 || strcmp(t->cls->name, "Buffer") == 0);
 }
-/* node:fs on file descriptors: openSync(path, flags?), closeSync(fd), fstatSync(fd) (a Stats: size, isFile(),
-   isDirectory()) and readSync(fd, buffer, offset?, length?, position?) -> bytes read, the buffer a Uint8Array
+/* node:fs's overloads by an option (runtime/node/fs.ts and its kin), as TypeScript picks them: F(p, { withFileTypes:
+   true }) calls F__withFileTypes, F(p, "utf8") and F(p, { encoding: "utf8" }) F__encoding (F__utf8 first, for UTF-8,
+   when there is one), F(p, { throwIfNoEntry: false })
+   F__throwIfNoEntry_false, when the module declares that function; the option is read where it is written (a literal) */
+static Func *fs_option_variant(Expr *e, Func *f) {
+    if (!f->mod || !f->mod->file || strncmp(f->mod->file, "xisto:fs", 8) != 0) return f;
+    for (int i = 1; i < e->args.len; i++) {
+        Expr *a = e->args.items[i];
+        if (i >= f->nparams || !f->params[i].name || strcmp(f->params[i].name, "options") != 0) continue; /* (the parameter named options) */
+        int nk = a->kind == E_OBJLIT ? a->args.len : a->kind == E_STRING ? 1 : 0;
+        for (int k = 0; k < nk; k++) {
+            const char *key = a->kind == E_STRING ? "encoding" : a->keys[k];
+            Expr *v = a->kind == E_STRING ? a : a->args.items[k];
+            const char *vn = NULL;
+            bool utf8 = false; /* F__utf8 before F__encoding (writeFileSync(p, text, "utf8") needs no other encoder) */
+            if (!strcmp(key, "encoding") && v->kind == E_STRING && strcmp(v->str, "buffer") != 0) {
+                vn = "encoding";
+                utf8 = !strcmp(v->str, "utf8") || !strcmp(v->str, "utf-8");
+            } else if (v->kind == E_BOOL) vn = v->boolean ? key : xs_sprintf("%s_false", key);
+            if (!vn) continue;
+            if (utf8) SYM_EACH(funcs_by_name, xs_sprintf("%s__utf8", f->name), d) if (((Func *)d->decl)->mod == f->mod) return d->decl;
+            char *want = xs_sprintf("%s__%s", f->name, vn);
+            SYM_EACH(funcs_by_name, want, d) if (((Func *)d->decl)->mod == f->mod) return d->decl;
+        }
+    }
+    return f;
+}
+/* readFileSync(path, options): { encoding: "utf8" } reads text, as "utf8" does; without an encoding (or null), the
+   bytes; flag "r" is how the file is opened anyway */
+static void fs_read_options(Expr *e) {
+    Expr *o = e->args.items[1];
+    if (o->kind == E_NULL) { e->args.len = 1; return; }
+    if (o->kind != E_OBJLIT) return;
+    Expr *enc = NULL;
+    for (int k = 0; k < o->args.len; k++) {
+        Expr *v = o->args.items[k];
+        if (!strcmp(o->keys[k], "encoding")) { if (v->kind != E_NULL) enc = v; }
+        else if (!strcmp(o->keys[k], "flag") && v->kind == E_STRING && !strcmp(v->str, "r")) continue;
+        else xs_error(XS7118, v->pos, "readFileSync(path, { encoding: \"utf8\" }) or readFileSync(path)", "unsupported option '%s' of readFileSync", o->keys[k]);
+    }
+    if (enc) e->args.items[1] = enc;
+    else e->args.len = 1;
+}
+/* node:fs on file descriptors: openSync(path, flags?), closeSync(fd) (fstatSync(fd): runtime/node/fs.ts) and
+   readSync(fd, buffer, offset?, length?, position?) -> bytes read, the buffer a Uint8Array
    (a view on a SharedArrayBuffer too: the bytes land in it, no copy); position null or left out reads at the
    current position, a number reads there without moving it (pread), as in Node. Missing arguments become -1
    (offset: 0), so the runtime takes one shape. */
 static bool check_fs_fd_call(Expr *e, Func *f) {
     const char *n = f->name;
-    bool is_open = strcmp(n, "openSync") == 0, is_close = strcmp(n, "closeSync") == 0, is_stat = strcmp(n, "fstatSync") == 0, is_read = strcmp(n, "readSync") == 0;
-    if (!is_open && !is_close && !is_stat && !is_read) return false;
+    bool is_open = strcmp(n, "openSync") == 0, is_close = strcmp(n, "closeSync") == 0, is_read = strcmp(n, "readSync") == 0;
+    if (!is_open && !is_close && !is_read) return false;
     if (is_open) {
         if (e->args.len < 1 || e->args.len > 2) xs_error(XS7078, e->pos, "openSync(path, \"r\" | \"w\" | \"a\" | \"r+\")", "openSync takes a path and optionally the flags");
         check_expr(e->args.items[0], ty_string);
@@ -523,11 +561,6 @@ static bool check_fs_fd_call(Expr *e, Func *f) {
     if (is_close) {
         if (e->args.len != 1) xs_error(XS7051, e->pos, NULL, "closeSync takes only the file descriptor");
         e->func = NULL; e->builtin.cfn = "xs_fs_close"; e->type = ty_void;
-        return true;
-    }
-    if (is_stat) {
-        if (e->args.len != 1) xs_error(XS7057, e->pos, NULL, "fstatSync takes only the file descriptor");
-        e->func = NULL; e->builtin.cfn = "xs_fs_fstat"; e->type = ty_object_of(find_class("Stats"));
         return true;
     }
     if (e->args.len < 2 || e->args.len > 5 || e->args.len == 3) /* (Node reads a third argument alone as an options object) */
@@ -10849,6 +10882,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                 xs_error(XS9032, e->pos, xs_help_suggest(name, cands, n, "declare it at the top level: function name(...): type { ... }"), "unknown function '%s'", name);
             }
         }
+        f = fs_option_variant(e, f);
+        if (f->mod && f->mod->builtin && strcmp(f->name, "readFileSync") == 0 && e->args.len == 2) fs_read_options(e);
         if (f->mod && f->mod->builtin && strcmp(f->name, "execSync") == 0 && e->args.len == 2) {
             /* execSync(cmd, { encoding: "utf8" }): xisto always returns the output as a string */
             Expr *o = e->args.items[1];

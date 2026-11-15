@@ -21,7 +21,7 @@ xisto build --node-compat -o app main.ts
 
 Available modules include:
 
-- `fs`, `path`, `os`, `url`
+- `fs`, `fs/promises`, `path`, `os`, `url` and `import.meta` (see [fs, path, os, url](#fs-path-os-url))
 - `http`: Node's `createServer`/`request`/`get` (below), and xisto's own `Server` with `fetch`, with TLS for
   `https://` (AWS-LC by default, or BearSSL)
 - `events` (`EventEmitter`), `process`, `timers`, `http`, `net`, `dns`, `child_process` (see below)
@@ -73,7 +73,7 @@ Supported:
 | all | `_construct`, `_destroy`, `destroy(err, cb)`, `autoDestroy`, `emitClose`, `destroyed`/`closed`/`errored` |
 | functions | `pipeline(...streams, cb)`, `finished(stream, [options], cb)`, `isReadable`, `isWritable`, `isErrored`, `isDisturbed`, `getDefaultHighWaterMark`/`setDefaultHighWaterMark` (64 KiB, 16 objects) |
 | `node:stream/promises` | `pipeline(...streams)`, `finished(stream, options?)` |
-| `node:fs` | `createReadStream(path, { start, end, highWaterMark, encoding, fd, flags, autoClose })` and `createWriteStream(path, { flags, encoding, start, fd })`, `ReadStream`/`WriteStream` (`'open'`, `'ready'`, `bytesRead`/`bytesWritten`, `close()`); errors as Node's (`ENOENT: no such file or directory, open '...'`, `code`, `syscall`) |
+| `node:fs` | `createReadStream(path, { start, end, highWaterMark, encoding, fd, flags, autoClose })` (by name or as `fs.createReadStream`) and `createWriteStream(path, { flags, encoding, start, fd })`, `ReadStream`/`WriteStream` (`'open'`, `'ready'`, `bytesRead`/`bytesWritten`, `close()`); errors as Node's (`ENOENT: no such file or directory, open '...'`, `code`, `syscall`) |
 
 Errors carry Node's `code` and message (`ERR_STREAM_PUSH_AFTER_EOF`, `ERR_STREAM_WRITE_AFTER_END`,
 `ERR_STREAM_DESTROYED`, `ERR_STREAM_PREMATURE_CLOSE`, `ERR_MULTIPLE_CALLBACK`, `ERR_INVALID_ARG_TYPE`...).
@@ -110,8 +110,6 @@ Differences from Node:
   `toArray`...).
 - A missing argument is `null` (`finished` calls back with `null`, not `undefined`); errors are `Error` objects
   (Node's `AggregateError` of two errors is the later one).
-- `fs.createReadStream` and `createWriteStream` must be imported by name (`import { createReadStream } from
-  "node:fs"`), not through `import fs from "node:fs"`.
 
 ### stream/web
 
@@ -695,6 +693,80 @@ Differences from Node:
   ciphers (`chacha20-poly1305`, `aes-*-ccm`, `-ocb`, `-cfb`...), `Cipher`/`Hash` as streams (`pipe`), the async
   `generateKeyPair`, `X509Certificate`, and `subtle` beyond HMAC and digests (RSA, ECDSA, AES keys, `deriveBits`,
   `exportKey("jwk")`).
+
+## fs, path, os, url
+
+**`node:fs`, synchronous**: `readFileSync`, `writeFileSync`, `appendFileSync` (with an encoding or an options
+object: `{ encoding, flag, mode }`), `existsSync`, `unlinkSync`, `mkdirSync` (`{ recursive }`: gives the first
+directory made), `readdirSync` (`{ withFileTypes }`: `Dirent`s with `name`, `parentPath`, `isFile()`,
+`isDirectory()`, `isSymbolicLink()`...; `{ recursive }`), `statSync`/`lstatSync`/`fstatSync` (`Stats`: `size`,
+`mode`, `nlink`, `uid`, `ino`..., `atimeMs`/`mtimeMs`/`ctimeMs`/`birthtimeMs` and their `Date`s, `isFile()`,
+`isDirectory()`, `isSymbolicLink()`...; `{ throwIfNoEntry: false }`), `rmSync` (`{ recursive, force }`),
+`rmdirSync`, `renameSync`, `copyFileSync` (`COPYFILE_EXCL`), `cpSync` (`{ recursive, force, errorOnExist,
+filter }`), `mkdtempSync`, `realpathSync`, `accessSync`, `chmodSync`, `symlinkSync`, `readlinkSync`, `linkSync`,
+`truncateSync`, `utimesSync`/`lutimesSync`, `openSync`/`closeSync`/`readSync`, and `fs.constants` (`F_OK`, `R_OK`,
+`W_OK`, `X_OK`, `COPYFILE_EXCL`, `S_IF*`...). Errors are Node's: the message (`ENOENT: no such file or directory,
+open '/x'`, `EEXIST: file already exists, mkdir '/x'`, `rename 'a' -> 'b'`...) and `err.code`, `errno` (this
+system's, negative), `syscall`, `path` and `dest`, read through an `any` (`catch (e: any)`) or a cast; `rmSync` of
+a directory without `recursive` is Node's `SystemError` `ERR_FS_EISDIR`.
+
+**Callbacks**: `fs.readFile(path, options?, callback)` (`"utf8"` or `{ encoding }`: text; otherwise a `Buffer`),
+`writeFile`, `appendFile`, `mkdir`, `readdir` (`withFileTypes`), `stat`, `lstat`, `fstat`, `rm`, `rmdir`, `rename`,
+`access`, `unlink`, `copyFile`, `cp`, `realpath`, `mkdtemp`, `readlink`, `symlink`, `link`, `chmod`, `truncate`,
+`utimes`: the work and the callback happen on a later turn of the event loop, `err` is `null` when it worked.
+
+**Promises**: `node:fs/promises` and `fs.promises` (also `import { promises } from "node:fs"`): `readFile`
+(text with an encoding, else a `Buffer`), `writeFile`, `appendFile`, `unlink`, `mkdir`, `readdir`, `stat`,
+`lstat`, `rm`, `rmdir`, `rename`, `copyFile`, `cp`, `mkdtemp`, `realpath`, `access`, `chmod`, `readlink`,
+`symlink`, `link`, `utimes`, `lutimes`, `truncate`.
+
+The callback API, `fs.promises` and the streams are loaded only by programs that name them (as `fs.readFile`,
+`import { readFile }`...): a program that only calls `readFileSync` does not carry the event loop.
+
+**`node:path`**: POSIX `join`, `resolve`, `normalize`, `relative`, `dirname`, `basename`, `extname`,
+`isAbsolute`, `parse`, `format`, `toNamespacedPath`, `sep`, `delimiter`; `path.posix` (the same) and
+`path.win32` (`normalize`, `join`, `isAbsolute`, `dirname`, `basename`, `extname`, `parse`, `format`,
+`toNamespacedPath`, `sep`, `delimiter`, with drive letters and UNC roots as Node's).
+
+**`node:os`**: `platform`, `type`, `arch`, `machine`, `release`, `version`, `hostname`, `homedir`, `tmpdir`,
+`endianness`, `EOL`, `devNull`, `uptime`, `loadavg`, `totalmem`, `freemem`, `availableParallelism`, `cpus`,
+`userInfo` (`uid`, `gid`, `username`, `homedir`, `shell`), `networkInterfaces` (`address`, `netmask`, `family`,
+`mac`, `internal`, `cidr`, `scopeid`) and `os.constants` (`signals` and `errno` with this system's numbers,
+`priority`).
+
+**`node:url`**: `fileURLToPath(url)` and `pathToFileURL(path)`, encoded as Node encodes them (spaces, `%`, `#`, `?`,
+`\`, non-ASCII), with Node's errors (`ERR_INVALID_URL_SCHEME`, `ERR_INVALID_FILE_URL_HOST`,
+`ERR_INVALID_FILE_URL_PATH`).
+
+**`import.meta`**: `import.meta.url` (a `file://` URL), `import.meta.filename` and `import.meta.dirname` are the
+module's source file **as the build found it** (absolute, symbolic links resolved). Node gives the file it runs;
+xisto compiles ahead of time, so the value is where the source was when it was built, not where the binary runs.
+That is what `new URL("./data.json", import.meta.url)` and `fileURLToPath(import.meta.url)` want to find files
+kept next to the source; a binary moved to another machine still names the build machine's paths (ship such
+files next to the binary and find them with `process.execPath` instead). `import.meta.resolve` and
+`import.meta.main` are not there.
+
+Differences from Node:
+
+- Paths are strings: not `Buffer`s or `URL`s (`fileURLToPath(url)` gives one), no file descriptors where a path
+  goes (beyond `fstatSync`, `readSync` and the streams).
+- `readFileSync` takes `"utf8"`/`"utf-8"` (or `{ encoding }` with one) for text; another encoding is
+  `readFileSync(path).toString(encoding)`. `writeFileSync`/`appendFileSync` write text in another encoding
+  (`"latin1"`, `"base64"`...) when the encoding is written in the call (a literal; one held in a variable throws
+  an error that says so). `openSync` takes the flags `r`, `w`, `a`, `r+`.
+- On an error the callback's result is empty (`""`, an empty `Buffer` or array, a `Stats` of zeros) where Node
+  passes `undefined`; a missing optional value (`mkdirSync`'s result, `err.dest`) prints as `null` in
+  `console.log`.
+- `console.log(err)` prints `Error: <message>` (no `{ errno, code, syscall, path }` block and no stack);
+  `console.log(stats)`/`console.log(dirent)` print xisto's form of the object; `os.userInfo()` and
+  `os.constants.priority` print without `[Object: null prototype]`.
+- `fs.promises` calls run when awaited, on the calling thread (Node: its thread pool), and the callback API
+  runs the call on a later turn of the event loop (Node: in parallel).
+- Not there: `fs.watch`/`watchFile`, `fs.glob`/`globSync`, `opendirSync`/`Dir`, `FileHandle`
+  (`fs/promises` `open`), `fs.read`/`write` on descriptors with callbacks, `statfs`, `bigint` stats,
+  `path.matchesGlob`, `path.win32.resolve`/`relative` (and `toNamespacedPath` of a relative Windows path, which
+  Node resolves against the current directory first), `os.setPriority`/`getPriority`, `os.cpus()` models and
+  speeds (empty and 0).
 
 ## npm packages
 
