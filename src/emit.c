@@ -1745,6 +1745,7 @@ static const char *where_elem(int i) { return xs_sprintf("[%d]", i); }
    the value's type at run time: a string, a boxed number or boolean, an array, or an object of one of the
    program's classes (each class JSON can write gets its json_put_ function then) */
 static bool json_unknown_used;
+extern bool xs_json_ext_used; /* (checker.c) */
 static void json_emit_value(Buf *b, Type *t, const char *expr) { /* appends into xs_sb *sb */
     switch (t->kind) {
     case TY_NUMBER: buf_printf(b, "xs_sb_num(sb, %s);", expr); break;
@@ -2079,6 +2080,23 @@ static void emit_member(Expr *e) {
             buf_puts(out, "; ");
             json_emit_value(out, a->type, "ja_");
             buf_puts(out, " xs_sb_finish(sb); })");
+            return;
+        }
+        if (strcmp(fn, "json_stringify_ext") == 0) { /* JSON.stringify(value, replacer, space): the value's text, rewritten */
+            Expr *a = e->args.items[0], *r = e->args.items[1], *s = e->args.len > 2 ? e->args.items[2] : NULL;
+            json_unknown_used = true;
+            buf_printf(out, "({ xs_sb sb_ = {0}; xs_sb *sb = &sb_; %s ja_ = ", ctype(a->type));
+            emit_borrowed(a);
+            buf_puts(out, "; ");
+            json_emit_value(out, a->type, "ja_");
+            buf_puts(out, " xs_json_ext(xs_sb_finish(sb), ");
+            if (r->type->kind == TY_ARRAY) { buf_puts(out, "(xs_arr_ref *)("); emit_borrowed(r); buf_puts(out, "), NULL, "); }
+            else if (r->type->kind == TY_FUNC) { buf_puts(out, "NULL, (void *)("); emit_borrowed(r); buf_puts(out, "), "); }
+            else { if (r->kind != E_NULL) { buf_puts(out, "((void)("); emit_expr(r); buf_puts(out, "), NULL), NULL, "); } else buf_puts(out, "NULL, NULL, "); }
+            if (s && s->type->kind == TY_STRING) { buf_puts(out, "0, "); emit_borrowed(s); }
+            else if (s && s->type->kind != TY_NULL) { buf_puts(out, "(double)("); emit_expr(s); buf_puts(out, "), NULL"); }
+            else buf_puts(out, "0, NULL");
+            buf_puts(out, ", xs_json_unknown); })");
             return;
         }
         if (strcmp(fn, "json_parse") == 0) {
@@ -14472,6 +14490,7 @@ void emit_program(Program *p, Buf *o) {
     }
     if (cell_fns.data) { buf_puts(out, cell_fns.data); cell_fns.len = 0; cell_fns.data[0] = 0; ncell = 0; }
     if (ifld_fns.data) { buf_puts(out, ifld_fns.data); ifld_fns.len = 0; ifld_fns.data[0] = 0; nifld = 0; }
+    if (xs_json_ext_used) json_unknown_used = true; /* (JSON.stringify with a replacer or a space, JSON.parse with a reviver) */
     if (json_unknown_used) {
         /* every class JSON can write, for the values an unknown holds */
         int ncls = 0;

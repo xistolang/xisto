@@ -3580,6 +3580,108 @@ static void from_json(Expr *e, Type *want) {
     *e = *json_call(v, "parse", "json_parse", want);
 }
 static bool json_target(Type *t) { return (t->kind == TY_OBJECT || t->kind == TY_ARRAY) && json_ok(t, 0); }
+/* undefined returned by a replacer arrow (xisto's undefined is its null): the runtime's own undefined, so the member is
+   left out while a null returned stays null; the returns of the body and the branches of c ? a : b there */
+static void json_undef_expr(Expr **slot) {
+    Expr *x = *slot;
+    if (!x) return;
+    if ((x->kind == E_IDENT && x->str && strcmp(x->str, "undefined") == 0 && !lookup("undefined")) ||
+        (x->kind == E_NULL && x->str && strcmp(x->str, "undefined") == 0)) { /* (before or after it was checked) */
+        Expr *u = xs_alloc(sizeof *u);
+        u->kind = E_CALL; u->pos = x->pos; u->field = -1; u->type = ty_any; u->prechecked = true;
+        u->builtin.cfn = "xs_json_undef";
+        *slot = u;
+    } else if (x->kind == E_COND && x->args.len == 2) {
+        json_undef_expr(&x->args.items[0]);
+        json_undef_expr(&x->args.items[1]);
+    }
+}
+static void json_undef_returns(Stmt *s) {
+    if (!s) return;
+    switch (s->kind) {
+    case S_RETURN: json_undef_expr(&s->expr); break;
+    case S_BLOCK: for (int i = 0; i < s->stmts.len; i++) json_undef_returns(s->stmts.items[i]); break;
+    case S_IF: json_undef_returns(s->body); json_undef_returns(s->else_body); break;
+    case S_WHILE: case S_FOR: case S_FOROF: json_undef_returns(s->body); break;
+    case S_SWITCH: for (int i = 0; i < s->ncases; i++) json_undef_returns(s->cases[i].body); break;
+    case S_TRY: json_undef_returns(s->body); json_undef_returns(s->else_body); json_undef_returns(s->for_init); break;
+    default: break;
+    }
+}
+/* JSON.stringify(value, replacer, space): checked here, written by the runtime (xs_json_ext) from the value's
+   one-argument JSON text. replacer: null/undefined, a string[] (the keys kept, at every level) or a function
+   (key: string, value: any) => any; space: a number or a string. The one-argument call keeps its own path */
+bool xs_json_ext_used; /* (emit: xs_json_unknown is generated for the replacer's values) */
+static void json_stringify_ext(Expr *e) {
+    Expr *v = e->args.items[0];
+    check_expr(v, NULL);
+    settle(v);
+    Type *t = v->type;
+    if (t->kind != TY_JSON) {
+        json_ok_unknown = true;
+        bool ok = json_ok(t, 0);
+        json_ok_unknown = false;
+        if (!ok) xs_error(XS8100, v->pos, "JSON covers number, int, boolean, string, arrays and classes made of those", "cannot serialize %s to JSON", ty_name(t));
+    }
+    Expr *r = e->args.items[1];
+    bool rnull = r->kind == E_NULL || (r->kind == E_IDENT && r->str && strcmp(r->str, "undefined") == 0 && !lookup("undefined"));
+    Type **ps = xs_alloc(sizeof(Type *) * 2);
+    ps[0] = ty_string; ps[1] = ty_any;
+    Type *ft = ty_func(ps, 2, ty_any);
+    if (r->kind == E_ARROW && r->arrow && r->arrow->fn) json_undef_returns(r->arrow->fn->body);
+    check_expr(r, rnull ? NULL : r->kind == E_ARROW ? ft : NULL);
+    settle(r);
+    /* a function declared elsewhere as the replacer: its `return undefined` leaves the member out, too (that function
+       returns JSON's undefined from then on, wherever it is called) */
+    if (r->kind == E_FUNC_REF && r->func && r->func->body && r->func->ret && r->func->ret->kind == TY_UNKNOWN) json_undef_returns(r->func->body);
+    if (!rnull) {
+        Type *rt = r->type;
+        if (rt->kind == TY_FUNC) expect_type(r, ft, "the replacer of JSON.stringify");
+        else if (!(rt->kind == TY_ARRAY && rt->elem->kind == TY_STRING))
+            xs_error(XS7025, r->pos, "a function (key: string, value: any) => any, a string[] of the keys to keep, or null",
+                     "the replacer of JSON.stringify cannot be %s", ty_name(rt));
+    }
+    if (e->args.len == 3) {
+        Expr *s = e->args.items[2];
+        check_expr(s, NULL);
+        settle(s);
+        if (s->type->kind == TY_LITINT) coerce_lit(s, ty_number);
+        Type *st = s->type;
+        if (!(st->kind == TY_NUMBER || st->kind == TY_INT || st->kind == TY_STRING || st->kind == TY_NULL))
+            xs_error(XS7025, s->pos, "a number of spaces (up to 10) or a string", "the space of JSON.stringify cannot be %s", ty_name(st));
+    }
+    xs_json_ext_used = true;
+    e->type = ty_string;
+    e->builtin.cfn = "json_stringify_ext";
+}
+/* JSON.parse(text, reviver): the text revived by the runtime (xs_json_revive: read as an any, each value through
+   reviver(key, value) from the leaves up, written back as text), then parsed as JSON.parse(text) parses it; into an
+   any, the revived value itself (xs_json_revive_any: a Date the reviver made stays a Date) */
+static void json_parse_reviver(Expr *e) {
+    Expr *rv = e->args.items[1];
+    Type **ps = xs_alloc(sizeof(Type *) * 2);
+    ps[0] = ty_string; ps[1] = ty_any;
+    Type *ft = ty_func(ps, 2, ty_any);
+    if (rv->kind == E_ARROW && rv->arrow && rv->arrow->fn) json_undef_returns(rv->arrow->fn->body);
+    check_expr(rv, rv->kind == E_ARROW ? ft : NULL);
+    settle(rv);
+    if (rv->kind == E_FUNC_REF && rv->func && rv->func->body && rv->func->ret && rv->func->ret->kind == TY_UNKNOWN) json_undef_returns(rv->func->body);
+    if (rv->type->kind != TY_FUNC)
+        xs_error(XS7025, rv->pos, "a function (key: string, value: any) => any", "the reviver of JSON.parse cannot be %s", ty_name(rv->type));
+    expect_type(rv, ft, "the reviver of JSON.parse");
+    Expr *t = e->args.items[0];
+    check_expr(t, ty_string);
+    if (t->type->kind == TY_JSON) t->type = ty_string;
+    expect_type(t, ty_string, "argument of JSON.parse");
+    Expr *c = xs_alloc(sizeof *c);
+    c->kind = E_CALL; c->pos = e->pos; c->field = -1; c->type = ty_string; c->prechecked = true;
+    c->builtin.cfn = "xs_json_revive";
+    expr_list_push(&c->args, t);
+    expr_list_push(&c->args, rv);
+    e->args.len = 1;
+    e->args.items[0] = c;
+    xs_json_ext_used = true;
+}
 /* a target that holds unknown values (Record<string, unknown>[], a shape with unknown fields): decoded by what they hold */
 static bool json_target_u(Type *t) {
     bool ju = json_ok_unknown;
@@ -11598,7 +11700,9 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (strcmp(ns, "JSON") == 0) {
                 if (!e->is_call || (strcmp(e->str, "stringify") != 0 && strcmp(e->str, "parse") != 0))
                     xs_error(XS7107, e->pos, "supported: JSON.stringify(value), JSON.parse(text) assigned to a typed variable", "unknown JSON member '%s'", e->str);
-                if (e->args.len != 1) xs_error(XS7025, e->pos, NULL, "JSON.%s takes exactly one argument", e->str);
+                if (strcmp(e->str, "stringify") == 0 && e->args.len >= 2 && e->args.len <= 3) { json_stringify_ext(e); return; }
+                if (strcmp(e->str, "parse") == 0 && e->args.len == 2) json_parse_reviver(e); /* (then parsed as one argument) */
+                if (e->args.len != 1) xs_error(XS7025, e->pos, NULL, strcmp(e->str, "stringify") == 0 ? "JSON.stringify takes one to three arguments" : "JSON.%s takes exactly one argument", e->str);
                 if (strcmp(e->str, "stringify") == 0) {
                     check_expr(e->args.items[0], NULL);
                     settle(e->args.items[0]);
@@ -11619,6 +11723,10 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (!expected) xs_error(XS3003, e->pos, "write the type: const t: Todo = JSON.parse(text);", "JSON.parse needs to know the type it produces");
                 if (ty_is_any(expected)) { /* JSON.parse(text) as an any: Records, unknown[] and boxed values */
                     Expr *t = e->args.items[0];
+                    if (t->kind == E_CALL && t->builtin.cfn && !strcmp(t->builtin.cfn, "xs_json_revive")) { /* (revived: the value itself) */
+                        t->builtin.cfn = "xs_json_revive_any";
+                        t->type = expected;
+                    } else
                     wrap_call(t, "xs_json_any", expected);
                     *e = *t;
                     return;

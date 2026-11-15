@@ -4664,6 +4664,217 @@ static xs_str *xs_sb_finish(xs_sb *b) {
     return s;
 }
 
+/* ---- JSON.stringify(value, replacer, space): the extended path (checker: json_stringify_ext; the one-argument call
+   keeps its own generated writer). The value is written as JSON.stringify(value) writes it (toJSON, Dates, a class's
+   fields), read back as an any (Records, unknown[], boxed numbers), then written again through the replacer (a
+   function called as replacer(key, value), or an allow-list of keys) with the indentation of space. ---- */
+static void xs_json_undef_called(void) { xs_panic("TypeError: undefined is not a function"); }
+static xs_closure xs_json_undef_cl = {{XS_IMMORTAL, 0}, (void *)xs_json_undef_called};
+/* undefined returned by a replacer (the checker puts it where the replacer's code returns undefined): a function,
+   which JSON leaves out of an object and writes as null in an array, as it does undefined */
+static void *xs_json_undef(void) { return xs_cl_static(&xs_json_undef_cl); }
+typedef struct { void *fn; xs_arr_ref *keys; char gap[44]; size_t glen; void (*unk)(xs_sb *, void *); } xs_jx;
+static void xs_jx_nl(xs_sb *b, const xs_jx *st, int depth) {
+    xs_sb_put(b, "\n", 1);
+    for (int i = 0; i < depth; i++) xs_sb_put(b, st->gap, st->glen);
+}
+static bool xs_jx_write(xs_sb *b, const xs_jx *st, void *v, int depth);
+/* holder[key] through the replacer, then written; false when it is undefined (nothing written) */
+static bool xs_jx_prop(xs_sb *b, const xs_jx *st, xs_str *key, void *v, int depth) {
+    if (!st->fn) return xs_jx_write(b, st, v, depth);
+    xs_closure *cl = st->fn;
+    void *r = ((void *(*)(void *, xs_str *, void *))cl->fn)(cl, key, v);
+    bool ok = xs_jx_write(b, st, r, depth);
+    xs_release(r);
+    return ok;
+}
+static void *xs_jx_val(xs_map *m, xs_map_entry *e) { /* a Record's value as an any: owned */
+    switch (m->val_kind) {
+    case 0: return xs_box_num(e->val.d);
+    case 1: return xs_box_num((double)e->val.i);
+    case 2: return xs_box_bool(e->val.i != 0);
+    default: return e->val.p ? xs_retain_(e->val.p) : NULL;
+    }
+}
+static bool xs_jx_member(xs_sb *b, const xs_jx *st, xs_str *k, void *val, int depth, bool *any) {
+    size_t at = b->len;
+    if (*any) xs_sb_put(b, ",", 1);
+    if (st->glen) xs_jx_nl(b, st, depth + 1);
+    xs_sb_str(b, k);
+    xs_sb_put(b, st->glen ? ": " : ":", st->glen ? 2 : 1);
+    if (xs_jx_prop(b, st, k, val, depth + 1)) { *any = true; return true; }
+    b->len = at; /* (undefined: the member left out) */
+    if (b->data) b->data[at] = 0;
+    return false;
+}
+static bool xs_jx_write(xs_sb *b, const xs_jx *st, void *v, int depth) {
+    if (!v) { xs_sb_put(b, "null", 4); return true; }
+    if (xs_type_of(v)->print == xs_print_closure) return false; /* a function (or undefined): nothing */
+    void (*f)(void *) = xs_type_of(v)->free;
+    if (f == xs_str_free) { xs_sb_str(b, v); return true; }
+    if (f == xs_box_num_free) { xs_sb_num(b, ((xs_box_d *)v)->v); return true; }
+    if (f == xs_box_int_free) { xs_sb_int(b, ((xs_box_i *)v)->v); return true; }
+    if (f == xs_box_bool_free) { xs_sb_bool(b, ((xs_box_i *)v)->v != 0); return true; }
+    if (f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free) {
+        size_t n = ((xs_arr_ref *)v)->len; /* (the same layout: header, len, data) */
+        if (!n) { xs_sb_put(b, "[]", 2); return true; }
+        xs_sb_put(b, "[", 1);
+        for (size_t i = 0; i < n; i++) {
+            if (i) xs_sb_put(b, ",", 1);
+            if (st->glen) xs_jx_nl(b, st, depth + 1);
+            void *el = f == xs_arr_ref_free ? xs_retain_(((xs_arr_ref *)v)->data[i])
+                     : f == xs_arr_num_free ? xs_box_num(((xs_arr_num *)v)->data[i])
+                     : f == xs_arr_int_free ? xs_box_num((double)((xs_arr_int *)v)->data[i]) : xs_box_bool(((xs_arr_bool *)v)->data[i]);
+            xs_str *k = NULL;
+            if (st->fn) { char kb[24]; size_t kn = xs_itoa((int64_t)i, kb); k = xs_str_new(kb, kn); }
+            if (!xs_jx_prop(b, st, k, el, depth + 1)) xs_sb_put(b, "null", 4); /* (undefined in an array: null) */
+            xs_release(k);
+            xs_release(el);
+        }
+        if (st->glen) xs_jx_nl(b, st, depth);
+        xs_sb_put(b, "]", 1);
+        return true;
+    }
+    if (f == xs_map_free && ((xs_map *)v)->record && ((xs_map *)v)->str_keys) {
+        xs_map *m = v;
+        bool any = false;
+        xs_sb_put(b, "{", 1);
+        if (st->keys) {
+            for (size_t i = 0; i < st->keys->len; i++) {
+                xs_str *k = st->keys->data[i];
+                xs_map_entry *e = xs_map_lookup(m, k, 0);
+                if (!e) continue;
+                void *val = xs_jx_val(m, e);
+                xs_jx_member(b, st, k, val, depth, &any);
+                xs_release(val);
+            }
+        } else {
+            xs_map_entry *e;
+            XS_MAP_EACH(m, e) {
+                void *val = xs_jx_val(m, e);
+                xs_str *k = xs_retain(e->skey); /* (the replacer may change the Record) */
+                xs_jx_member(b, st, k, val, depth, &any);
+                xs_release(k);
+                xs_release(val);
+            }
+        }
+        if (any && st->glen) xs_jx_nl(b, st, depth);
+        xs_sb_put(b, "}", 1);
+        return true;
+    }
+    if (f == xs_map_free) { xs_sb_put(b, "{}", 2); return true; } /* a Map or a Set: no properties of its own */
+    /* another object (a class's, a Date: one the replacer returned): as JSON.stringify writes it, read back as an any */
+    xs_sb t = {0};
+    st->unk(&t, v);
+    xs_str *s = xs_sb_finish(&t);
+    void *a = xs_json_any(s);
+    xs_release(s);
+    bool ok = xs_jx_write(b, st, a, depth);
+    xs_release(a);
+    return ok;
+}
+/* text: the value written as one argument writes it (consumed); keys: the replacer's allow-list or NULL; fn: the
+   replacer function or NULL; space: a number of spaces (sspace NULL) or the string sspace */
+XS_NOINLINE xs_str *xs_json_ext(xs_str *text, xs_arr_ref *keys, void *fn, double nspace, xs_str *sspace, void (*unk)(xs_sb *, void *)) {
+    xs_jx st = {0};
+    st.fn = fn;
+    st.unk = unk;
+    if (sspace) { /* its first 10 characters (UTF-16 units: a character past U+FFFF counts two) */
+        size_t i = 0, units = 0;
+        while (i < (size_t)sspace->len && units < 10) {
+            unsigned char c = (unsigned char)sspace->data[i];
+            size_t n = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+            if (n == 4 && units == 9) break;
+            units += n == 4 ? 2 : 1;
+            i += n;
+        }
+        if (i > (size_t)sspace->len) i = (size_t)sspace->len;
+        memcpy(st.gap, sspace->data, i);
+        st.glen = i;
+    } else {
+        int n = nspace >= 10 ? 10 : nspace >= 1 ? (int)nspace : 0;
+        memset(st.gap, ' ', (size_t)n);
+        st.glen = (size_t)n;
+    }
+    xs_arr_ref *dk = NULL;
+    if (keys && !fn) { /* the allow-list, each key once (its first place) */
+        dk = xs_arr_ref_new(keys->len, NULL);
+        for (size_t i = 0; i < keys->len; i++) {
+            xs_str *k = keys->data[i];
+            bool seen = false;
+            for (size_t j = 0; j < dk->len && !seen; j++) seen = xs_str_eq(dk->data[j], k);
+            if (!seen) xs_arr_ref_push(dk, xs_retain(k));
+        }
+        st.keys = dk;
+    }
+    void *v = xs_json_any(text);
+    xs_release(text);
+    xs_sb b = {0};
+    xs_str *root = xs_str_new("", 0);
+    bool ok = xs_jx_prop(&b, &st, root, v, 0);
+    xs_release(root);
+    xs_release(v);
+    xs_release(dk);
+    if (!ok) { free(b.data); return xs_str_new("undefined", 9); } /* (JavaScript's undefined: the replacer dropped the value) */
+    return xs_sb_finish(&b);
+}
+/* JSON.parse(text, reviver): the text read as an any, then each value from the leaves up passed through
+   reviver(key, value), whose undefined deletes the member (null in an array). xs_json_revive_any gives the revived
+   any; xs_json_revive its text again, for a typed target (parsed then as JSON.parse(text) parses it) */
+static bool xs_jr_undef(void *v) { return v && xs_type_of(v)->print == xs_print_closure; }
+static void *xs_jr_walk(xs_closure *cl, xs_str *key, void *val /* owned */) {
+    void (*f)(void *) = val ? xs_type_of(val)->free : NULL;
+    if (f == xs_map_free && ((xs_map *)val)->record && ((xs_map *)val)->val_kind == 3) {
+        xs_map *m = val;
+        xs_arr_ref *ks = xs_arr_ref_new(m->count, NULL); /* (the keys first: the reviver may change the Record) */
+        xs_map_entry *e;
+        XS_MAP_EACH(m, e) xs_arr_ref_push(ks, xs_retain(e->skey));
+        for (size_t i = 0; i < ks->len; i++) {
+            xs_map_entry *ce = xs_map_lookup(m, ks->data[i], 0);
+            void *child = ce && ce->val.p ? xs_retain_(ce->val.p) : NULL;
+            void *nv = xs_jr_walk(cl, ks->data[i], child);
+            if (xs_jr_undef(nv)) { xs_release(nv); xs_map_delete_s(m, ks->data[i]); }
+            else xs_map_set_s(m, ks->data[i], XS_VPTR(nv));
+        }
+        xs_release(ks);
+    } else if (f == xs_arr_ref_free) {
+        xs_arr_ref *a = val;
+        for (size_t i = 0; i < a->len; i++) {
+            char kb[24];
+            size_t kn = xs_itoa((int64_t)i, kb);
+            xs_str *k = xs_str_new(kb, kn);
+            void *child = a->data[i] ? xs_retain_(a->data[i]) : NULL;
+            void *nv = xs_jr_walk(cl, k, child);
+            xs_release(k);
+            if (xs_jr_undef(nv)) { xs_release(nv); nv = NULL; }
+            void *old = a->data[i];
+            a->data[i] = nv;
+            xs_release(old);
+        }
+    }
+    void *r = ((void *(*)(void *, xs_str *, void *))cl->fn)(cl, key, val);
+    xs_release(val);
+    return r;
+}
+XS_NOINLINE void *xs_json_revive_any(xs_str *text, void *fn) {
+    void *v = xs_json_any(text);
+    xs_str *root = xs_str_new("", 0);
+    void *r = xs_jr_walk(fn, root, v);
+    xs_release(root);
+    if (xs_jr_undef(r)) { xs_release(r); r = NULL; }
+    return r;
+}
+XS_NOINLINE xs_str *xs_json_revive_(xs_str *text, void *fn, void (*unk)(xs_sb *, void *)) {
+    void *r = xs_json_revive_any(text, fn);
+    xs_jx st = {0};
+    st.unk = unk;
+    xs_sb b = {0};
+    xs_jx_write(&b, &st, r, 0);
+    xs_release(r);
+    return xs_sb_finish(&b);
+}
+#define xs_json_revive(text, fn) xs_json_revive_((text), (fn), xs_json_unknown) /* (the program's writer of its classes) */
+
 /* a parsed JSON value back as its text, with JSON's own number spelling (packages/typeorm's native code) */
 static void xs_sb_jstr(xs_sb *b, const char *p, size_t n) {
     xs_sb_put(b, "\"", 1);
