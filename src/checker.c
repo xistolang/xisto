@@ -3751,6 +3751,284 @@ static void fn_adapt(Expr *e, Expr *x, Type *ft, Type *ret, Type *unbox) {
     expr_list_push(&e->args, x);
     check_expr(e, NULL);
 }
+static const char *prop_name(const char *m);
+/* ---- methods and bound functions as values ----
+   ((__bv0: T0, __bv1: T1...) => (__bu0: P0, ...) => CALL)(x0, x1...) into e: a closure of the parameters ps whose
+   call is CALL, made by mk from the identifiers __bv0.. (the bound values, evaluated once, when the value is made)
+   and __bu0.. (its own parameters). obj.method reads as one bound to obj, f.bind(t, a) as one with a bound */
+static Expr *bv_ident(Pos pos, const char *name) {
+    Expr *id = xs_alloc(sizeof *id);
+    id->kind = E_IDENT; id->pos = pos; id->field = -1; id->str = (char *)name;
+    return id;
+}
+typedef Expr *(*BoundCall)(Pos pos, Expr **bound, int nb, ExprList *own, void *ctx);
+static void bound_closure(Expr *e, Expr **xs, Type **xts, int nx, Type **ps, int np, bool rest, Type *ret, bool is_async, BoundCall mk, void *ctx) {
+    Pos pos = e->pos;
+    static int nbound; /* (names of their own: one of these may be made inside another's arguments) */
+    int id = nbound++;
+    Func *in = xs_alloc(sizeof *in);
+    in->pos = pos; in->name = "arrow";
+    in->params = xs_alloc(sizeof(Param) * (size_t)(np + 1));
+    in->nparams = np;
+    in->ret = ret;
+    in->is_async = is_async;
+    ExprList own = {0};
+    for (int i = 0; i < np; i++) {
+        memset(&in->params[i], 0, sizeof(Param));
+        in->params[i].name = xs_sprintf("__bu%d_%d", id, i);
+        in->params[i].type = ps[i];
+        in->params[i].rest = rest && i == np - 1;
+        Expr *a = bv_ident(pos, in->params[i].name);
+        if (in->params[i].rest) { /* ...xs passed on as ...xs */
+            Expr *sp = xs_alloc(sizeof *sp);
+            sp->kind = E_UNARY; sp->op = TK_ELLIPSIS; sp->pos = pos; sp->field = -1; sp->lhs = a;
+            a = sp;
+        }
+        expr_list_push(&own, a);
+    }
+    Expr **bound = xs_alloc(sizeof(Expr *) * (size_t)(nx + 1));
+    for (int i = 0; i < nx; i++) bound[i] = bv_ident(pos, xs_sprintf("__bv%d_%d", id, i));
+    Expr *call = mk(pos, bound, nx, &own, ctx);
+    Stmt *ib = xs_alloc(sizeof *ib);
+    ib->kind = S_BLOCK; ib->pos = pos;
+    Stmt *ir = xs_alloc(sizeof *ir);
+    ir->pos = pos;
+    if (ret->kind == TY_VOID) { ir->kind = S_EXPR; ir->expr = call; }
+    else { ir->kind = S_RETURN; ir->expr = call; }
+    stmt_list_push(&ib->stmts, ir);
+    in->body = ib;
+    Arrow *ia = xs_alloc(sizeof *ia);
+    ia->pos = pos; ia->fn = in; ia->expr_body = ret->kind != TY_VOID;
+    Expr *inner = xs_alloc(sizeof *inner);
+    inner->kind = E_ARROW; inner->pos = pos; inner->field = -1; inner->arrow = ia;
+    Func *out = xs_alloc(sizeof *out);
+    out->pos = pos; out->name = "arrow";
+    out->params = xs_alloc(sizeof(Param) * (size_t)(nx + 1));
+    out->nparams = nx;
+    for (int i = 0; i < nx; i++) {
+        memset(&out->params[i], 0, sizeof(Param));
+        out->params[i].name = bound[i]->str;
+        out->params[i].type = xts[i];
+    }
+    Type *ft = ty_func(ps, np, ret);
+    ft->rest = rest;
+    ft->async_ret = is_async;
+    out->ret = ft;
+    Stmt *ob = xs_alloc(sizeof *ob);
+    ob->kind = S_BLOCK; ob->pos = pos;
+    Stmt *orr = xs_alloc(sizeof *orr);
+    orr->kind = S_RETURN; orr->pos = pos; orr->expr = inner;
+    stmt_list_push(&ob->stmts, orr);
+    out->body = ob;
+    Arrow *oa = xs_alloc(sizeof *oa);
+    oa->pos = pos; oa->fn = out; oa->expr_body = true;
+    Expr *outer = xs_alloc(sizeof *outer);
+    outer->kind = E_ARROW; outer->pos = pos; outer->field = -1; outer->arrow = oa;
+    memset(e, 0, sizeof *e);
+    e->kind = E_CALL; e->pos = pos; e->field = -1; e->lhs = outer;
+    for (int i = 0; i < nx; i++) expr_list_push(&e->args, xs[i]);
+    check_expr(e, NULL);
+}
+/* what a bound closure's call is made with: the method's name (none: a function value), and how many of the bound
+   arguments go into its rest parameter (passed as ...[those, ...the closure's own rest]) */
+typedef struct { const char *name; int nrest; } BoundCtx;
+static Expr *bound_call(Pos pos, Expr **bound, int nb, ExprList *own, void *ctx) {
+    BoundCtx *bc = ctx;
+    Expr *c = xs_alloc(sizeof *c);
+    if (bc->name) { c->kind = E_MEMBER; c->str = (char *)bc->name; c->is_call = true; } /* __bv0.m(...) */
+    else c->kind = E_CALL;                                                            /* __bv0(...) */
+    c->pos = pos; c->field = -1; c->lhs = bound[0];
+    for (int i = 1; i < nb - bc->nrest; i++) expr_list_push(&c->args, bound[i]);
+    if (!bc->nrest) {
+        for (int i = 0; i < own->len; i++) expr_list_push(&c->args, own->items[i]);
+        return c;
+    }
+    Expr *arr = xs_alloc(sizeof *arr);
+    arr->kind = E_ARRAY_LIT; arr->pos = pos; arr->field = -1; arr->spread = true;
+    for (int i = nb - bc->nrest; i < nb; i++) expr_list_push(&arr->args, bound[i]);
+    for (int i = 0; i < own->len; i++) expr_list_push(&arr->args, own->items[i]); /* (the rest, spread) */
+    Expr *sp = xs_alloc(sizeof *sp);
+    sp->kind = E_UNARY; sp->op = TK_ELLIPSIS; sp->pos = pos; sp->field = -1; sp->lhs = arr;
+    expr_list_push(&c->args, sp);
+    return c;
+}
+/* the closure of a callee (recv, of type rt) of parameters ps with the arguments partial bound first: those past the
+   fixed parameters go into a rest parameter, which the closure keeps */
+static void bound_args(Expr *e, Expr *recv, Type *rt, Type **ps, int nps, bool rest, Expr **partial, int npartial, Type *ret, bool is_async, const char *name) {
+    int nfixed = nps - (rest ? 1 : 0);
+    if (npartial > nfixed && !rest) xs_error(XS7025, e->pos, NULL, "the function takes %d arguments, and bind gives it %d", nps, npartial);
+    int nx = 1 + npartial;
+    Expr **xs = xs_alloc(sizeof(Expr *) * (size_t)nx);
+    Type **xts = xs_alloc(sizeof(Type *) * (size_t)nx);
+    xs[0] = recv; xts[0] = rt;
+    for (int i = 0; i < npartial; i++) { xs[1 + i] = partial[i]; xts[1 + i] = i < nfixed ? ps[i] : ps[nps - 1]->elem; }
+    int skip = npartial < nfixed ? npartial : nfixed;
+    int np = nps - skip;
+    Type **left = xs_alloc(sizeof(Type *) * (size_t)(np + 1));
+    for (int i = 0; i < np; i++) left[i] = ps[skip + i];
+    BoundCtx *bc = xs_alloc(sizeof *bc);
+    bc->name = name;
+    bc->nrest = npartial > nfixed ? npartial - nfixed : 0;
+    bound_closure(e, xs, xts, nx, left, np, rest, ret, is_async, bound_call, bc);
+}
+/* recv.m as a value (recv checked, of class c), with the arguments partial bound first (f.bind(recv, ...partial)):
+   a closure bound to recv. JavaScript reads a method unbound (calling it alone loses `this`); bound here, a program
+   that is correct in JavaScript does the same, and one that would lose `this` keeps it */
+static void method_value(Expr *e, Expr *recv, Type *rt, Func *m, Expr **partial, int npartial) {
+    if (m->ntparams) xs_error(XS8049, e->pos, xs_sprintf("wrap it: (x: Type) => obj.%s(x)", m->name), "the generic method '%s' is not a value", m->name);
+    Type **mps = xs_alloc(sizeof(Type *) * (size_t)(m->nparams + 1));
+    for (int i = 0; i < m->nparams; i++) mps[i] = m->params[i].type;
+    bool mrest = m->nparams && m->params[m->nparams - 1].rest;
+    bound_args(e, recv, rt, mps, m->nparams, mrest, partial, npartial, fret(m, e->pos), m->is_async || m->ret_promise, m->name);
+}
+/* f.bind(thisArg, ...partial) on a function value (thisArg is not used: an arrow's and a function's own this is not
+   one xisto passes): a closure of the parameters left */
+static void fn_bind_value(Expr *e, Expr *f, Expr **partial, int npartial) {
+    Type *ft = f->type;
+    bound_args(e, f, ft, ft->params, ft->nparams, ft->rest, partial, npartial, ft->ret, ft->async_ret, NULL);
+}
+/* a method of a class instance read as a value (o.m, not a field nor a getter): the class and the method */
+static Func *method_of_value(Expr *x, Class **cls) {
+    if (!x || x->kind != E_MEMBER || x->is_call || !x->lhs || !x->lhs->type || !x->str) return NULL;
+    Type *ot = x->lhs->type;
+    if (ot->kind != TY_OBJECT || ot->cls->builtin) return NULL;
+    if (find_field(ot->cls, x->str, NULL) || find_method(ot->cls, xs_sprintf("__get_%s", x->str))) return NULL;
+    Func *m = find_method(ot->cls, x->str);
+    if (m) *cls = ot->cls;
+    return m;
+}
+/* f.bind / f.call / f.apply / f.name / f.length on a function value or a method (o.m.bind(t) binds m to t,
+   o.m.call(t, a) is t.m(a)). false: not one of those, e left as it was (its object may have been checked) */
+static bool fn_member(Expr *e, Type *expected) {
+    if (!e->str || !e->lhs) return false;
+    bool isbind = e->is_call && !strcmp(e->str, "bind"), iscall = e->is_call && !strcmp(e->str, "call"),
+         isapply = e->is_call && !strcmp(e->str, "apply") && e->args.len <= 2,
+         isname = !e->is_call && !strcmp(e->str, "name"), islen = !e->is_call && !strcmp(e->str, "length");
+    if (!(isbind || iscall || isapply || isname || islen) || e->op == TK_QDOT) return false;
+    Expr *x = e->lhs;
+    /* only what can be a function: a variable, a top-level function, o.m of a class's method (namespaces such as
+       MyClass.name or Reflect.apply go their own way) */
+    if (x->kind == E_IDENT) {
+        Binding *b = lookup(x->str);
+        if (b ? !(b->type && b->type->kind == TY_FUNC) : !lookup_func(x->str)) return false;
+        if (isapply && e->args.len == 2 && b && b->type->rest) return false; /* (original.apply(this, args): XB-107's __xs_apply) */
+    } else if (x->kind == E_MEMBER && !x->is_call && x->lhs && x->str) {
+        if (x->lhs->kind == E_IDENT && !lookup(x->lhs->str)) {
+            Class *sc = find_class(x->lhs->str); /* Class.staticMethod */
+            bool sm = false;
+            for (int k = 0; sc && !sc->builtin && k < sc->nstatics_user; k++)
+                if (!strcmp(sc->static_names[k], x->str) && sc->static_is_method[k]) sm = true;
+            if (!sm) return false;
+        } else {
+            Expr *root = x->lhs; /* (an object read from this, a variable or a new: not Object.prototype and the like) */
+            while (root->kind == E_MEMBER && !root->is_call && root->lhs && root->str && strcmp(root->str, "prototype")) root = root->lhs;
+            if (!(root->kind == E_THIS || root->kind == E_NEW_OBJ || (root->kind == E_IDENT && lookup(root->str)) ||
+                  (root->kind == E_INDEX && root->lhs && root->lhs->kind == E_IDENT && lookup(root->lhs->str))))
+                return false;
+            check_expr(x->lhs, NULL);
+            x->lhs->prechecked = true;
+            Class *mc = NULL;
+            Func *m = method_of_value(x, &mc);
+            if (!m) return false;
+            if (isname || islen) { /* o.m.name, o.m.length */
+                Pos pos = e->pos;
+                Expr *v = isname ? str_lit(pos, prop_name(m->name)) : num_lit(pos, m->nparams - (m->nparams && m->params[m->nparams - 1].rest ? 1 : 0), true);
+                memset(e, 0, sizeof *e);
+                *e = *v;
+                check_expr(e, expected);
+                return true;
+            }
+            if (iscall || isapply || isbind) {
+                if (e->args.len < 1) xs_error(XS7025, e->pos, xs_sprintf("give it the object: %s.%s(obj, ...)", x->str, e->str), "%s.%s needs the object it runs on", x->str, e->str);
+                Expr *recv = e->args.items[0];
+                if (isbind) {
+                    check_expr(recv, ty_object_of(mc));
+                    expect_type(recv, ty_object_of(mc), xs_sprintf("the object %s.bind gives", x->str));
+                    recv->prechecked = true;
+                    for (int i = 1; i < e->args.len; i++) {
+                        bool mr = m->nparams && m->params[m->nparams - 1].rest;
+                        Type *pt = i - 1 < m->nparams - (mr ? 1 : 0) ? m->params[i - 1].type : mr ? m->params[m->nparams - 1].type->elem : NULL;
+                        check_expr(e->args.items[i], pt);
+                        if (pt) expect_type(e->args.items[i], pt, "a bound argument");
+                        e->args.items[i]->prechecked = true;
+                    }
+                    method_value(e, recv, ty_object_of(mc), m, e->args.items + 1, e->args.len - 1);
+                    return true;
+                }
+                /* o.m.call(t, a, b) / o.m.apply(t, [a, b]): t.m(a, b) */
+                ExprList args = {0};
+                if (iscall) for (int i = 1; i < e->args.len; i++) expr_list_push(&args, e->args.items[i]);
+                else if (e->args.len == 2) {
+                    Expr *arr = e->args.items[1];
+                    if (arr->kind == E_ARRAY_LIT) for (int i = 0; i < arr->args.len; i++) expr_list_push(&args, arr->args.items[i]);
+                    else if (arr->kind != E_NULL && !(arr->kind == E_IDENT && !strcmp(arr->str, "undefined"))) {
+                        Expr *sp = xs_alloc(sizeof *sp);
+                        sp->kind = E_UNARY; sp->op = TK_ELLIPSIS; sp->pos = arr->pos; sp->field = -1; sp->lhs = arr;
+                        expr_list_push(&args, sp);
+                    }
+                }
+                e->lhs = recv;
+                e->str = (char *)m->name;
+                e->args = args;
+                check_expr(e, expected);
+                return true;
+            }
+        }
+    } else return false;
+    Expr *callee = xs_alloc(sizeof *callee); /* (f as written, for f.call(t, a): f(a) checked as a call of f) */
+    *callee = *x;
+    if (x->kind == E_MEMBER) { callee->lhs = xs_alloc(sizeof *callee->lhs); *callee->lhs = *x->lhs; }
+    check_expr(x, NULL);
+    x->prechecked = true;
+    if (x->type->kind != TY_FUNC) return false;
+    if (islen) { /* its parameters (a rest parameter not counted, as in JavaScript) */
+        Pos pos = e->pos;
+        int n = x->type->nparams - (x->type->rest ? 1 : 0);
+        memset(e, 0, sizeof *e);
+        *e = *num_lit(pos, n, true);
+        check_expr(e, expected);
+        return true;
+    }
+    if (isname) { /* the name it was declared with, when the compiler sees it */
+        const char *nm = NULL;
+        if (x->kind == E_FUNC_REF && x->func) nm = x->func->name;
+        else if (x->kind == E_IDENT && x->func && x->func->name && strcmp(x->func->name, "arrow")) nm = x->func->name;
+        if (!nm) return false;
+        if (!strncmp(nm, "__get_", 6)) nm += 6;
+        Pos pos = e->pos;
+        memset(e, 0, sizeof *e);
+        *e = *str_lit(pos, nm);
+        check_expr(e, expected);
+        return true;
+    }
+    if (isbind) {
+        for (int i = 1; i < e->args.len; i++) {
+            Type *pt = i - 1 < x->type->nparams - (x->type->rest ? 1 : 0) ? x->type->params[i - 1] : x->type->rest ? x->type->params[x->type->nparams - 1]->elem : NULL;
+            check_expr(e->args.items[i], pt);
+            if (pt) expect_type(e->args.items[i], pt, "a bound argument");
+            e->args.items[i]->prechecked = true;
+        }
+        fn_bind_value(e, x, e->args.len > 1 ? e->args.items + 1 : NULL, e->args.len > 1 ? e->args.len - 1 : 0);
+        return true;
+    }
+    /* f.call(t, a, b) / f.apply(t, [a, b]): f(a, b) (t not used, as bind) */
+    ExprList args = {0};
+    if (iscall) for (int i = 1; i < e->args.len; i++) expr_list_push(&args, e->args.items[i]);
+    else if (e->args.len == 2) {
+        Expr *arr = e->args.items[1];
+        if (arr->kind == E_ARRAY_LIT) for (int i = 0; i < arr->args.len; i++) expr_list_push(&args, arr->args.items[i]);
+        else if (arr->kind != E_NULL && !(arr->kind == E_IDENT && !strcmp(arr->str, "undefined"))) {
+            Expr *sp = xs_alloc(sizeof *sp);
+            sp->kind = E_UNARY; sp->op = TK_ELLIPSIS; sp->pos = arr->pos; sp->field = -1; sp->lhs = arr;
+            expr_list_push(&args, sp);
+        }
+    }
+    Pos pos = e->pos;
+    memset(e, 0, sizeof *e);
+    e->kind = E_CALL; e->pos = pos; e->field = -1; e->lhs = callee; e->args = args;
+    check_expr(e, expected);
+    return true;
+}
 /* T -> unknown: references as they are, primitives boxed */
 static Expr *pure_copy(Expr *x);
 static void to_unknown(Expr *e) {
@@ -7204,7 +7482,15 @@ static void check_object_member_in(Expr *e, Class *c) {
         }
         xs_error(XS8013, e->pos, xs_help_suggest(e->str, cands, n, NULL), "%s has no member '%s'", c->name, e->str);
     }
-    if (!e->is_call) xs_error(XS8049, e->pos, "call it: obj.method(...)", "'%s' is a method of %s, and methods are not values", e->str, c->name);
+    if (!e->is_call && (c->builtin || e == dyn_lvalue || e->lhs->type->kind != TY_OBJECT || e->op == TK_QDOT))
+        xs_error(XS8049, e->pos, "call it: obj.method(...)", "'%s' is a method of %s, and methods are not values", e->str, c->name);
+    if (!e->is_call) { /* obj.method as a value: a closure bound to obj (see method_value) */
+        check_access(m->access, m->cls, prop_name(m->name), e->pos);
+        Expr *recv = e->lhs;
+        recv->prechecked = true;
+        method_value(e, recv, recv->type, m, NULL, 0);
+        return;
+    }
     if (!c->builtin) check_access(m->access, m->cls, prop_name(m->name), e->pos);
     if (m->is_setter && e->args.len == 1 && strncmp(e->str, "__set_", 6) != 0) xs_error(XS8050, e->pos, NULL, "'%s' is a setter: assign it", prop_name(m->name));
     if (m->ntparams) { /* a generic method: its instance for these types */
@@ -10839,6 +11125,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         e->type = e->lhs->type->elem;
         return;
     case E_MEMBER:
+        if (fn_member(e, expected)) return; /* f.bind(t), o.m.call(t, a), f.name, f.length (a function value) */
         if (!e->is_call && e->str && !strcmp(e->str, "prototype") && e->lhs && e->lhs->kind == E_IDENT && !strcmp(e->lhs->str, "Object") &&
             !lookup("Object") && tsc_checked() && prog->uses_plain) { /* proto === Object.prototype: the mark of a plain object (see check_var) */
             Expr *l = str_lit(e->pos, "\x01Object.prototype");
@@ -11426,7 +11713,13 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (strcmp(sc->static_names[k], e->str) != 0) continue;
                 const char *gen = nsq ? xs_sprintf("%s%s", sc->static_gen[k], nsq) : sc->static_gen[k];
                 if (sc->static_is_method[k]) {
-                    if (!e->is_call) xs_error(XS8123, e->pos, "call it: Class.method(...)", "static methods are not values");
+                    if (!e->is_call) { /* Class.staticMethod as a value: the function it is lowered to */
+                        e->kind = E_IDENT;
+                        e->str = (char *)gen;
+                        e->lhs = NULL;
+                        check_expr(e, expected);
+                        return;
+                    }
                     Expr *callee = xs_alloc(sizeof *callee);
                     callee->kind = E_IDENT;
                     callee->pos = e->pos;
@@ -12165,6 +12458,12 @@ static void check_expr_in(Expr *e, Type *expected) {
                 #define CB(nparams_, ret_) ({ Type **ps_ = xs_alloc(sizeof(Type *) * 2); ps_[0] = elem; ps_[1] = ty_int; ty_func(ps_, nparams_, ret_); })
                 if (strcmp(m, "forEach") == 0 || strcmp(m, "filter") == 0 || strcmp(m, "find") == 0 || strcmp(m, "findIndex") == 0 ||
                     strcmp(m, "some") == 0 || strcmp(m, "every") == 0 || strcmp(m, "map") == 0) {
+                    if (e->args.len == 2) { /* xs.map(this.fmt, this): the method is bound to its object already; an arrow has no this */
+                        Expr *f0 = e->args.items[0], *t = e->args.items[1];
+                        bool same = (t->kind == E_THIS && f0->kind == E_MEMBER && !f0->is_call && f0->lhs && f0->lhs->kind == E_THIS) ||
+                                    (t->kind == E_IDENT && f0->kind == E_MEMBER && !f0->is_call && f0->lhs && f0->lhs->kind == E_IDENT && !strcmp(t->str, f0->lhs->str));
+                        if (same || (f0->kind == E_ARROW && (t->kind == E_THIS || t->kind == E_IDENT || t->kind == E_NULL))) e->args.len = 1;
+                    }
                     if (e->args.len != 1) xs_error(XS8034, e->pos, NULL, "%s takes one function", m);
                     Expr *cb = e->args.items[0];
                     if (!strcmp(m, "find") && (is_numeric(elem) || elem->kind == TY_BOOLEAN) && tsc_checked()) {
