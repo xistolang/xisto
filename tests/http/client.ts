@@ -56,3 +56,11 @@ console.log(ok.status, await ok.text());
 const rd: Response = await fetch("http://127.0.0.1:8080/seeother", { method: "POST", body: "x" });
 const bytes = await rd.arrayBuffer();
 console.log("redirected:", rd.status, rd.url, bytes.length, Buffer.from(bytes).toString());
+// HttpResponse.json(body, status) answers application/json; status(code, body) text
+const types: string[] = [];
+for (const kind of ["created", "missing", "list", "text"]) {
+  const rs: Response = await fetch(`http://127.0.0.1:8080/status/${kind}`);
+  types.push(`${rs.status} ${rs.headers.get("content-type")}`);
+  await rs.text();
+}
+console.log("status content types:", types.join(", "));

@@ -1744,8 +1744,8 @@ static xs_HttpResponse *xs_HttpResponse_make(int64_t status, xs_str *body, const
     r->content_type = ctype;
     return r;
 }
-static xs_HttpResponse *xs_HttpResponse_text(xs_str *body) { return xs_HttpResponse_make(200, body, "text/plain; charset=utf-8"); }
-static xs_HttpResponse *xs_HttpResponse_json(xs_str *body) { return xs_HttpResponse_make(200, body, "application/json"); }
+static xs_HttpResponse *xs_HttpResponse_text(xs_str *body, int64_t code) { return xs_HttpResponse_make(code, body, "text/plain; charset=utf-8"); }
+static xs_HttpResponse *xs_HttpResponse_json(xs_str *body, int64_t code) { return xs_HttpResponse_make(code, body, "application/json"); }
 static xs_HttpResponse *xs_HttpResponse_status(int64_t code, xs_str *body) { return xs_HttpResponse_make(code, body, "text/plain; charset=utf-8"); }
 static bool xs_has_ctl(const char *p, size_t n);
 /* HttpResponse.of(status, contentType, body) */

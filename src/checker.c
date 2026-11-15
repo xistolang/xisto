@@ -190,6 +190,7 @@ static Func *bi_func(const char *name, const char *cfn, Type *ret, int nparams, 
     return f;
 }
 
+static Expr *num_lit(Pos pos, double v, bool is_int);
 static void bi_method(Class *c, const char *name, const char *cfn, Type *ret, int nparams, ...) {
     va_list ap;
     va_start(ap, nparams);
@@ -240,8 +241,11 @@ static void init_builtins(void) {
     Class *res = bi_class("HttpResponse", "xs_HttpResponse");
     bi_field(res, "status", ty_int);
     bi_field(res, "body", ty_string);
-    bi_static(res, "text", "xs_HttpResponse_text", ty_object_of(res), 1, ty_string);
-    bi_static(res, "json", "xs_HttpResponse_json", ty_object_of(res), 1, ty_string);
+    /* text(body, status = 200) / json(body, status = 200): the content type is the method's, the status optional
+       (XB-229: HttpResponse.json(body, 201) instead of status(201, body) answering text/plain) */
+    bi_static(res, "text", "xs_HttpResponse_text", ty_object_of(res), 2, ty_string, ty_int);
+    bi_static(res, "json", "xs_HttpResponse_json", ty_object_of(res), 2, ty_string, ty_int);
+    for (int k = res->nstatics - 2; k < res->nstatics; k++) res->statics[k]->params[1].dflt = num_lit((Pos){0}, 200, true);
     bi_static(res, "status", "xs_HttpResponse_status", ty_object_of(res), 2, ty_int, ty_string);
     bi_static(res, "of", "xs_HttpResponse_of", ty_object_of(res), 3, ty_int, ty_string, ty_string);
     bi_method(res, "header", "xs_HttpResponse_header", ty_object_of(res), 2, ty_string, ty_string);
@@ -9144,6 +9148,9 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (!c || c->is_interface) xs_error(XS9010, e->rhs->pos, "instanceof tests classes (interfaces have no run-time identity)", "'%s' is not a class", e->rhs->str);
             if (c && c->builtin && strcmp(c->name, "RegExp") == 0) prog->uses_regex = true; /* (the test reads xs_RegExp_free) */
             if (!ty_is_heap(e->lhs->type)) xs_error(XS8108, e->lhs->pos, NULL, "instanceof needs an object, but this is %s", ty_name(e->lhs->type));
+            if (c && ty_strip_null(e->lhs->type)->kind == TY_JSON) /* (an object is JSON data: the class is gone) */
+                xs_error(XS8150, e->pos, xs_sprintf("keep the class: declare the value as %s (or a union of classes), or as unknown to check it at run time", c->name),
+                         "'instanceof' on an 'object' is always false: an object holds a copy of the data, not the %s object", c->name);
             e->rhs->cls = c;
             e->rhs->type = ty_object_of(c);
             e->type = ty_boolean;

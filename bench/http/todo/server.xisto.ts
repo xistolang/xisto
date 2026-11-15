@@ -65,7 +65,7 @@ function parseId(req: HttpRequest): int {
 }
 
 function notFound(): HttpResponse {
-  return HttpResponse.status(404, "{\"error\":\"not found\"}");
+  return HttpResponse.json("{\"error\":\"not found\"}", 404);
 }
 
 function listTodos(req: HttpRequest): HttpResponse {
@@ -75,10 +75,10 @@ function listTodos(req: HttpRequest): HttpResponse {
 function createTodo(req: HttpRequest): HttpResponse {
   const input: NewTodo = JSON.parse(req.body);
   if (input.title.trim().length === 0) {
-    return HttpResponse.status(400, "{\"error\":\"title is required\"}");
+    return HttpResponse.json("{\"error\":\"title is required\"}", 400);
   }
   const t: Todo = store.add(input.title.trim());
-  return HttpResponse.status(201, JSON.stringify(t));
+  return HttpResponse.json(JSON.stringify(t), 201);
 }
 
 function getTodo(req: HttpRequest): HttpResponse {
