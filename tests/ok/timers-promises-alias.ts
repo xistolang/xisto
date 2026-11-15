@@ -5,9 +5,9 @@ setTimeout(() => console.log("global timer"), 5);
 const id = setTimeout(() => console.log("never"), 1);
 clearTimeout(id);
 async function main(): Promise<void> {
-    await sleep(1);
-    console.log("slept");
-    await sleep(20);
-    console.log("slept again");
+  await sleep(1);
+  console.log("slept");
+  await sleep(20);
+  console.log("slept again");
 }
 main();

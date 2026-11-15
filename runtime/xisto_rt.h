@@ -4350,7 +4350,7 @@ XS_NOINLINE char *xs_json_string(xs_jp *j, size_t *outlen) {
     return out;
 }
 /* true / false / null: the first character that differs is the unexpected one */
-static void xs_json_word(xs_jp *j, const char *w, size_t n) {
+XS_NOINLINE void xs_json_word(xs_jp *j, const char *w, size_t n) {
     for (size_t i = 0; i < n; i++, j->p++)
         if (j->p >= j->end || *j->p != w[i]) xs_json_fail(j, XJE_TOKEN);
 }
