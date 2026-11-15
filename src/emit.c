@@ -1515,6 +1515,7 @@ static bool hole_read(Expr *b) {
     if (!arr_is_ref(b->lhs->type) || !b->type || b->type->kind == TY_NULLABLE || !cref(b->type)) return false;
     return true;
 }
+static bool hole_proven(Expr *b); /* a row a hole guard (hole_version) proved is no hole */
 static Expr *hole_set_target; /* the left side of the `=` being emitted: X[i][j] = v "sets" (Node's other wording) */
 /* opens ({ T hbN_ = <b>; if (!hbN_) TypeError; and puts a variable of hbN_ in *slot (put back by hole_close) */
 static Expr *hole_open(Expr **slot, Expr *key_idx, const char *key, Pos pos, bool set) {
@@ -1566,7 +1567,7 @@ static void emit_lvalue_ptr(Expr *e) {
         buf_printf(out, "&%s", ren(e->cname));
         return;
     case E_MEMBER: {
-        if (hole_read(e->lhs)) { /* X[i].f = v with X[i] a hole: a TypeError (XB-216) */
+        if (hole_read(e->lhs) && !hole_proven(e->lhs)) { /* X[i].f = v with X[i] a hole: a TypeError (XB-216) */
             Expr *was = hole_open(&e->lhs, NULL, e->str, e->pos, e == hole_set_target);
             emit_lvalue_ptr(e);
             hole_close(&e->lhs, was);
@@ -1585,7 +1586,9 @@ static void emit_lvalue_ptr(Expr *e) {
         return;
     }
     default: /* E_INDEX */
-        if (hole_read(e->lhs)) { /* X[i][j] with X[i] a hole: a TypeError (XB-216) */
+        if (hole_read(e->lhs) && !hole_proven(e->lhs) && !bce_safe(e)) { /* X[i][j] with X[i] a hole: a TypeError (XB-216); not where a
+                                                   versioned loop's guard proved j within X[i] (a hole's length is 0
+                                                   there, so the guard holds only when no X[i][j] runs) */
             Expr *was = hole_open(&e->lhs, e->rhs, NULL, e->pos, e == hole_set_target);
             emit_lvalue_ptr(e);
             hole_close(&e->lhs, was);
@@ -2001,7 +2004,7 @@ static void emit_union_class_test(Type *u, const char *field, const char *lit, c
 }
 
 static void emit_member(Expr *e) {
-    if (hole_read(e->lhs)) { /* X[i].f, X[i].length, X[i].m() with X[i] a hole: a TypeError (XB-216) */
+    if (hole_read(e->lhs) && !hole_proven(e->lhs)) { /* X[i].f, X[i].length, X[i].m() with X[i] a hole: a TypeError (XB-216) */
         Expr *was = hole_open(&e->lhs, NULL, e->str, e->pos, false);
         emit_member(e);
         hole_close(&e->lhs, was);
@@ -7357,6 +7360,129 @@ static int bce_col_rd(Expr *e) {
         if (bce_loops[k].col && bce_loops[k].idx && bce_base_match(e->lhs, &bce_loops[k]) && bce_same(bce_loops[k].idx, e->rhs)) return r->id;
     return -1;
 }
+/* ---- rows that are no hole (XB-216) ----
+   An innermost loop that reads through rows X[R] (X[R][j], X[R].f, X[R].length), X a name and R invariant in the loop
+   (a literal or int names the loop does not write, + or - of two), where nothing in the loop can replace a row,
+   change a length or call user code (bce_ok, bce_row_store, hole_slot_store), reads the same rows in every iteration.
+   The loop is emitted twice: run when each such row is within its array and not a hole (tested once, before the
+   loop), without the hole tests; otherwise the loop as written, which throws the TypeError where Node does (and a
+   loop that runs zero times throws nothing). Reads a versioned loop's guard proved (bce_safe) need no test either:
+   a hole's length is 0 there. XISTO_NO_HOLE_HOIST turns it off. */
+static Expr *hole_ok[64];
+static int nhole_ok;
+static bool hole_proven(Expr *b) {
+    for (int k = 0; k < nhole_ok; k++) if (bce_same_bx(b, hole_ok[k])) return true;
+    return false;
+}
+static bool hole_slot_store_e(Expr *e) { /* a store into a slot of an array of references (X[k] = obj) */
+    if (!e) return false;
+    if (e->kind == E_ASSIGN && e->lhs && e->lhs->kind == E_INDEX && e->lhs->lhs && e->lhs->lhs->type && e->lhs->lhs->type->kind == TY_ARRAY &&
+        arr_is_ref(e->lhs->lhs->type)) return true;
+    if (hole_slot_store_e(e->lhs) || hole_slot_store_e(e->rhs)) return true;
+    for (int k = 0; k < e->args.len; k++) if (hole_slot_store_e(e->args.items[k])) return true;
+    return false;
+}
+static bool hole_slot_store(Stmt *s) {
+    if (!s) return false;
+    if (hole_slot_store_e(s->init) || hole_slot_store_e(s->expr) || hole_slot_store_e(s->cond) || hole_slot_store_e(s->for_update)) return true;
+    if (hole_slot_store(s->for_init) || hole_slot_store(s->body) || hole_slot_store(s->else_body)) return true;
+    for (int k = 0; k < s->stmts.len; k++) if (hole_slot_store(s->stmts.items[k])) return true;
+    for (int k = 0; k < s->ncases; k++) if (hole_slot_store_e(s->cases[k].value) || hole_slot_store(s->cases[k].body)) return true;
+    return false;
+}
+static bool hole_has_loop(Stmt *s) {
+    if (!s) return false;
+    if (s->kind == S_FOR || s->kind == S_WHILE || s->kind == S_FOROF) return true;
+    if (hole_has_loop(s->body) || hole_has_loop(s->else_body)) return true;
+    for (int k = 0; k < s->stmts.len; k++) if (hole_has_loop(s->stmts.items[k])) return true;
+    for (int k = 0; k < s->ncases; k++) if (hole_has_loop(s->cases[k].body)) return true;
+    return false;
+}
+/* a row the loop s reads the same in every iteration: X[R], X a name of an array of arrays or objects or itself such
+   a row (A[r][q] of a number[][][]), R invariant */
+static bool hole_inv_row(Expr *b, Stmt *s) {
+    if (!hole_read(b) || !b->type || (b->type->kind != TY_ARRAY && !(b->type->kind == TY_OBJECT && b->type->cls)) || !bce_inv(b->rhs, s, NULL)) return false;
+    Expr *x = b->lhs;
+    if (x->kind == E_INDEX) return hole_inv_row(x, s);
+    return x->kind == E_IDENT && x->cname && !bce_writes(s, x->cname) && !bce_declares(s, x->cname);
+}
+/* the row as C, read without a check, and the test that it is within its array(s) and no hole (hole_guard) */
+static char *hole_raw(Expr *b, Buf *test, bool *ar) {
+    if (b->kind == E_IDENT) return emit_expr_to_str(b, ar);
+    char *x = hole_raw(b->lhs, test, ar), *r = bce_raw(b->rhs);
+    char *t = xs_sprintf("(%s) >= 0 && (%s) < (int64_t)(%s)->len && (%s)->data[%s]", r, r, x, x, r);
+    if (!test->data || !strstr(test->data, t)) buf_printf(test, "%s%s", test->len ? " && " : "", t); /* (once: an inner row's test) */
+    return xs_sprintf("((%s)(%s)->data[%s])", ctype(b->type), x, r);
+}
+static Expr *hole_cand[16];
+static int nhole_cand;
+static void hole_cand_add(Expr *b, Stmt *s) {
+    if (hole_proven(b) || !hole_inv_row(b, s)) return;
+    for (int k = 0; k < nhole_cand; k++) if (bce_same_bx(hole_cand[k], b)) return;
+    if (nhole_cand < 16) hole_cand[nhole_cand++] = b; /* (more: those stay tested) */
+}
+static void hole_cands_e(Expr *e, Stmt *s) {
+    if (!e) return;
+    hole_cands_e(e->lhs, s); /* (the inner rows first) */
+    if ((e->kind == E_MEMBER && hole_read(e->lhs)) || (e->kind == E_INDEX && hole_read(e->lhs) && !bce_safe(e))) hole_cand_add(e->lhs, s);
+    hole_cands_e(e->rhs, s);
+    for (int k = 0; k < e->args.len; k++) hole_cands_e(e->args.items[k], s);
+}
+static void hole_cands(Stmt *t, Stmt *s) {
+    if (!t) return;
+    hole_cands_e(t->init, s); hole_cands_e(t->expr, s); hole_cands_e(t->cond, s); hole_cands_e(t->for_update, s);
+    hole_cands(t->body, s); hole_cands(t->else_body, s);
+    for (int k = 0; k < t->stmts.len; k++) hole_cands(t->stmts.items[k], s);
+    for (int k = 0; k < t->ncases; k++) { hole_cands_e(t->cases[k].value, s); hole_cands(t->cases[k].body, s); }
+}
+/* the guard of hole_version (NULL: none); the rows it tests in hole_cand */
+static char *hole_guard(Stmt *s) {
+    static int off = -1;
+    if (off < 0) off = getenv("XISTO_NO_HOLE_HOIST") != NULL;
+    nhole_cand = 0;
+    if (off || xs_debug || sm_mode || ictx || nhole_ok + 16 > 64 || hole_has_loop(s->body)) return NULL;
+    hole_cands_e(s->cond, s);
+    hole_cands_e(s->for_update, s);
+    hole_cands(s->body, s);
+    if (nhole_cand == 0 || hole_slot_store(s) || bce_row_store(s)) return NULL;
+    Buf g = {0};
+    for (int k = 0; k < nhole_cand; k++) {
+        Expr *b = hole_cand[k];
+        Expr *root = b;
+        while (root->kind == E_INDEX) root = root->lhs;
+        if (!bce_ok(s, root->cname, root->type, false)) return NULL;
+        bool ar = false;
+        hole_raw(b, &g, &ar);
+        if (ar) return NULL;
+    }
+    return g.data;
+}
+/* a loop (a for: emit, a while: its statement) without the hole tests of its invariant rows when the guard proves
+   them, else as written (true: emitted) */
+static bool hole_version(Stmt *s, void (*emit)(Stmt *)) {
+    char *g = hole_guard(s);
+    if (!g) return false;
+    int n = nhole_cand, saved = nhole_ok;
+    Expr *rows[16];
+    memcpy(rows, hole_cand, sizeof rows);
+    buf_printf(out, "if (%s) ", g);
+    for (int k = 0; k < n; k++) hole_ok[nhole_ok++] = rows[k];
+    emit(s);
+    nhole_ok = saved;
+    buf_puts(out, " else ");
+    emit(s);
+    return true;
+}
+static Stmt *hole_while; /* the while hole_version is emitting (its two copies) */
+static void emit_stmt(Stmt *s);
+static void emit_while_holes(Stmt *s) {
+    Stmt *saved = hole_while;
+    hole_while = s;
+    buf_puts(out, "{");
+    emit_stmt(s);
+    buf_puts(out, "}");
+    hole_while = saved;
+}
 /* the index of an a[i] bce_safe allows, unchecked */
 static void emit_bce_index(Expr *i) {
     if (i->kind == E_BINARY && (i->op == TK_PLUS || i->op == TK_MINUS) && i->type && i->type->kind == TY_INT) {
@@ -7398,7 +7524,11 @@ static char *for_hoisted_cond(Stmt *s) {
 }
 bool xs_sel_ic = true;
 static Stmt *for_pragma_loop; static const char *for_pragma; /* a loop pragma for this one loop (bce_sel_plan) */
+static void emit_for_body_(Stmt *s);
 static void emit_for_(Stmt *s) {
+    if (!hole_version(s, emit_for_body_)) emit_for_body_(s);
+}
+static void emit_for_body_(Stmt *s) {
     buf_puts(out, "{");
     indent++;
     epush(false);
@@ -11273,6 +11403,7 @@ static void emit_stmt_(Stmt *s) {
                 return;
             }
         }
+        if (hole_while != s && hole_version(s, emit_while_holes)) return;
         if (emit_u8_while_rev(s)) { drain_if_needed(); return; }
         Expr *dc[4];
         int saved_ndctr = ndctr;
