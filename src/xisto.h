@@ -459,6 +459,8 @@ typedef struct {
 struct Func {
     Expr *origin;      /* an adapter arrow the checker made around a function value: that value (emit: the type's origin) */
     char *name;
+    char *js_name;     /* an arrow or function expression: the name JavaScript gives it (const f = () => ..., { next: () => ... },
+                          function g() {}), printed as [Function: f]; NULL: anonymous */
     Pos pos;
     Module *mod;
     bool exported;

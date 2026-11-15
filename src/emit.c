@@ -1738,6 +1738,7 @@ static void emit_print_arg(Expr *a) {
     case TY_ENUM: buf_puts(out, a->type->en->is_string ? "xs_print_str(" : "xs_print_int("); break;
     case TY_UNION: case TY_UNKNOWN: buf_puts(out, "xs_print_obj_or_null("); break;
     case TY_PROMISE: buf_puts(out, "xs_print_obj("); break;
+    case TY_FUNC: buf_puts(out, "xs_print_closure("); break;
     default: break;
     }
     emit_borrowed(a);
@@ -1769,6 +1770,15 @@ static char *type_tag(Type *t) {
 
 static void ensure_json(Type *t);
 static bool json_capable(Type *t);
+/* a field JSON leaves out: a function that may be null (next?: (v: T) => void); JSON.stringify skips functions */
+static bool json_fn_field(Type *t) { return t->kind == TY_NULLABLE && t->elem->kind == TY_FUNC; }
+/* a field that may hold a function (string | ((a) => string), unknown): left out when it does, as JSON.stringify does */
+static bool json_may_fn(Type *t) {
+    Type *b = t->kind == TY_NULLABLE ? t->elem : t;
+    if (b->kind == TY_UNKNOWN) return true;
+    if (b->kind == TY_UNION) for (int i = 0; i < b->nparams; i++) if (b->params[i]->kind == TY_FUNC) return true;
+    return false;
+}
 static const char *where_elem(int i) { return xs_sprintf("[%d]", i); }
 
 /* JSON.stringify of an unknown (a field of that type too): xs_json_unknown, generated after the program, looks at
@@ -1931,14 +1941,20 @@ static void ensure_json(Type *t) {
     for (int i = 0; i < c->nfields; i++) {
         Field *f = &c->fields[i];
         if (ty_is_undef(f->type)) continue; /* r: undefined: JSON.stringify leaves it out */
-        /* optional fields that are null are left out, like undefined in JSON.stringify */
-        if (f->optional) buf_printf(b, "    if (%s) {\n", not_null(f->type, xs_sprintf("o->%s", f->cname)));
+        if (json_fn_field(f->type)) continue; /* a function: left out, as JSON.stringify does */
+        /* optional fields that are null are left out, like undefined in JSON.stringify (and a value that is a function) */
+        bool may_fn = json_may_fn(f->type);
+        if (f->optional || may_fn) {
+            const char *v = xs_sprintf("o->%s", f->cname);
+            buf_printf(b, "    if (%s && %s) {\n", f->optional ? not_null(f->type, v) : "true",
+                       may_fn ? xs_sprintf("!xs_is_closure(%s)", v) : "true");
+        }
         buf_printf(b, "    if (!first_) xs_sb_put(sb, \",\", 1);\n    first_ = false;\n    xs_sb_put(sb, \"\\\"%s\\\":\", %zu);\n    ", f->name, strlen(f->name) + 3);
         /* (x?: unknown is unknown, which holds null already: no nullable wrapper around it) */
         Type *ft = f->optional && f->type->kind == TY_NULLABLE ? f->type->elem : f->type;
         json_emit_value(b, ft, f->optional && ft->kind == TY_BOOLEAN && f->type->kind == TY_NULLABLE ? xs_sprintf("(bool)o->%s", f->cname) : xs_sprintf("o->%s", f->cname));
         buf_puts(b, "\n");
-        if (f->optional) buf_puts(b, "    }\n");
+        if (f->optional || may_fn) buf_puts(b, "    }\n");
     }
     buf_puts(b, tj ? "    xs_sb_put(sb, \"}\", 1);\n    }\n}\n" : "    xs_sb_put(sb, \"}\", 1);\n}\n");
     /* parse: allocate the object without running the constructor, then fill every field from the JSON */
@@ -1950,6 +1966,7 @@ static void ensure_json(Type *t) {
     for (int i = 0; i < c->nfields; i++) {
         Field *f = &c->fields[i];
         buf_printf(b, "    o->%s = ", f->cname);
+        if (json_fn_field(f->type)) { buf_puts(b, "NULL;\n"); continue; } /* (a function: JSON has none, so it is not there) */
         if (f->optional) { /* absent or null: null */
             buf_printf(b, "({ xs_jv *fv_ = xs_json_field_opt(v, \"%s\"); fv_ && fv_->kind != XJ_NULL ? ", f->name);
             json_emit_read(b, f->type->kind == TY_NULLABLE ? f->type->elem : f->type, "fv_", f->name);
@@ -3029,8 +3046,8 @@ static bool json_capable(Type *t) {
     switch (t->kind) {
     case TY_NUMBER: case TY_INT: case TY_BOOLEAN: case TY_STRING: case TY_ENUM: case TY_JSON: case TY_UNKNOWN: return true;
     case TY_UNION: /* (boolean | Observable<boolean>: a member that holds a function is not read from JSON) */
-        for (int i = 0; i < t->nparams; i++) if (!json_capable(t->params[i])) return false;
-        return true;
+        for (int i = 0; i < t->nparams; i++) if (t->params[i]->kind != TY_FUNC && !json_capable(t->params[i])) return false;
+        return true; /* (string | ((a) => string): a function is left out where JSON.stringify leaves it out, and never read) */
     case TY_ARRAY: case TY_NULLABLE: return json_capable(t->elem);
     case TY_MAP: return t->record && t->key && t->key->kind == TY_STRING && json_capable(t->elem); /* (a Record<string, V>: an object) */
     case TY_OBJECT: {
@@ -3039,7 +3056,7 @@ static bool json_capable(Type *t) {
         if (json_capable_depth == 64) return false;
         json_capable_stack[json_capable_depth++] = t->cls;
         bool ok = true;
-        for (int i = 0; ok && i < t->cls->nfields; i++) ok = json_capable(t->cls->fields[i].type);
+        for (int i = 0; ok && i < t->cls->nfields; i++) ok = json_fn_field(t->cls->fields[i].type) || json_capable(t->cls->fields[i].type);
         json_capable_depth--;
         return ok;
     }
@@ -3101,6 +3118,39 @@ static bool needs_brackets(Expr *e) {
     return true;
 }
 static void emit_expr_raw(Expr *e);
+/* a function value's descriptor: how console.log shows it, [Function: f] ([AsyncFunction: f]); "" for an anonymous one */
+static const char *fn_label(Func *f, const char *name) {
+    if (!name || !*name) return f->is_async ? ", .fname = \"AsyncFunction (anonymous)\"" : "";
+    Buf b = {0};
+    buf_printf(&b, ", .fname = \"%s: ", f->is_async ? "AsyncFunction" : f->is_gen ? "GeneratorFunction" : "Function");
+    for (const char *c = name; *c; c++) {
+        if (*c == '"' || *c == '\\') buf_printf(&b, "\\%c", *c);
+        else if ((unsigned char)*c < 32) buf_printf(&b, "\\%03o", (unsigned char)*c);
+        else buf_printf(&b, "%c", *c);
+    }
+    buf_puts(&b, "\"");
+    return b.data;
+}
+/* an arrow's name; an adapter's (a function value seen with another type): the name of the arrow or function it wraps,
+   when that is known here */
+static const char *fn_src_name(Func *f);
+static const char *adapted_name(Func *f, Expr *ocall) {
+    if (f->js_name || !f->origin || !ocall || ocall->kind != E_CALL || !ocall->lhs) return f->js_name;
+    Expr *o = ocall->lhs;
+    if (o->kind == E_ARROW && o->arrow && o->arrow->fn) return o->arrow->fn->origin ? NULL : o->arrow->fn->js_name;
+    if (o->kind == E_FUNC_REF && o->func) return fn_src_name(o->func);
+    return NULL;
+}
+/* a function of the program taken as a value: its name as written (a generic one's instance: the template's; a
+   static method: the method's) */
+static const char *fn_src_name(Func *f) {
+    Func *g = f->template_of ? f->template_of : f;
+    const char *n = g->name;
+    if (!n) return NULL;
+    const char *st = strstr(n, "__s_");
+    if (st) n = st + 4;
+    return n;
+}
 static void emit_expr_(Expr *e);
 /* a boolean that is cheap to compute and cannot fail or have an effect: comparisons, !, && and || of
    primitive names, literals and floating-point + - * (integer arithmetic is checked, so it is left out);
@@ -3261,8 +3311,9 @@ static void emit_expr_raw(Expr *e) {
             buf_printf(b, ") { (void)env_; %s%s(", f->ret->kind == TY_VOID ? "" : "return ", f->cname);
             for (int i = 0; i < f->nparams; i++) buf_printf(b, "%s%s", i ? ", " : "", f->params[i].cname);
             buf_printf(b, "); }\nstatic xs_closure %s_cl = {{XS_IMMORTAL, 0}, (void *)%s_tramp};\n", f->cname, f->cname);
+            buf_printf(b, "static const xs_type XS_TYPE_SEC %s_cltype = {NULL, xs_print_closure%s};\n", f->cname, fn_label(f, fn_src_name(f)));
         }
-        buf_printf(out, "xs_cl_static(&%s_cl)", f->cname);
+        buf_printf(out, "xs_cl_static_t(&%s_cl, &%s_cltype)", f->cname, f->cname);
         return;
     }
     case E_THIS: buf_puts(out, ren(e->cname ? e->cname : "self")); return;
@@ -3483,9 +3534,10 @@ static void emit_expr_raw(Expr *e) {
                 origin_fn = xs_sprintf("%s_origin", f->cname);
             }
         }
-        buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, xs_print_closure, %s%s};\n", f->cname, f->cname,
+        buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, xs_print_closure, %s%s%s};\n", f->cname, f->cname,
                    env_cyc ? xs_sprintf("%s_visit", f->cname) : "NULL",
-                   strcmp(origin_fn, "NULL") ? xs_sprintf(", .origin = %s", origin_fn) : ""); /* (no adapter: the C as before) */
+                   strcmp(origin_fn, "NULL") ? xs_sprintf(", .origin = %s", origin_fn) : "", /* (no adapter: the C as before) */
+                   fn_label(f, adapted_name(f, ocall)));
         prof_fn_note(f, f->cname, "XS_FN");
         buf_printf(out, "XS_FN %s%s%s(%s_env *env", ctype(f->ret), ctype(f->ret)[strlen(ctype(f->ret)) - 1] == '*' ? "" : " ", f->cname, f->cname);
         for (int i = 0; i < f->nparams; i++) {
@@ -3820,6 +3872,18 @@ static void emit_expr_raw(Expr *e) {
             buf_printf(out, ")) %s xs_fn_origin((void *)(", e->op == TK_EQ ? "==" : "!=");
             emit_borrowed(e->rhs);
             buf_puts(out, ")))");
+            return;
+        }
+        if ((e->op == TK_EQ || e->op == TK_NEQ) && !e->builtin.cfn && e->lhs->type->kind != TY_NULL && e->rhs->type->kind != TY_NULL &&
+            ((ty_strip_null(e->lhs->type)->kind == TY_UNION && (ty_strip_null(e->rhs->type)->kind == TY_UNION || ty_strip_null(e->rhs->type)->kind == TY_FUNC)) ||
+             (ty_strip_null(e->rhs->type)->kind == TY_UNION && ty_strip_null(e->lhs->type)->kind == TY_FUNC))) {
+            /* two unions (string | (() => string)), or one and a function: by what each holds, as ===: the same text, number
+               or function (through the adapters the checker made around it), else the same object */
+            buf_puts(out, e->op == TK_EQ ? "xs_dyn_eq((void *)(" : "!xs_dyn_eq((void *)(");
+            emit_borrowed(e->lhs);
+            buf_puts(out, "), (void *)(");
+            emit_borrowed(e->rhs);
+            buf_puts(out, "))");
             return;
         }
         if ((e->op == TK_EQ || e->op == TK_NEQ) && ty_strip_null(e->lhs->type)->kind == TY_UNKNOWN &&
@@ -13293,6 +13357,7 @@ static void emit_class(Class *c) {
         case TY_MAP: case TY_SET: buf_printf(out, "xs_print_map(self->%s);", fd->cname); break;
         case TY_UNION: buf_printf(out, "xs_print_any_quoted(self->%s);", fd->cname); break;
         case TY_NULL: buf_puts(out, "fputs(\"null\", XS_OUT);"); break; /* { a: null } */
+        case TY_FUNC: buf_printf(out, "xs_print_closure(self->%s);", fd->cname); break; /* { next: [Function: next] } */
         case TY_UNKNOWN:
             if (ty_is_undef(fd->type)) buf_puts(out, "fputs(\"undefined\", XS_OUT);");
             else buf_printf(out, "xs_print_any_quoted(self->%s);", fd->cname); /* ({ a: null }: an unknown holding null) */
