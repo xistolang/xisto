@@ -13,6 +13,7 @@
 
 void *xs_alloc(size_t n);
 char *xs_strndup(const char *s, size_t n);
+const char *xs_src_name(const char *name);
 char *xs_sprintf(const char *fmt, ...);
 
 typedef struct {
@@ -315,6 +316,7 @@ struct Expr {
     bool prechecked;   /* checked already (its type is final): check_expr leaves it as it is */
     bool want_tuple;   /* E_ARRAY_LIT: [k, v] returned to new Map(xs.map(...)): a tuple, as TypeScript reads it there */
     bool cell_raw;     /* E_IDENT tested against null (x === null, x ?? d): a narrowed variable in a cell read as declared (T | null) */
+    bool gl_hold;      /* E_IDENT of a module variable some function assigns (XB-215): held for the length of a call it is passed to */
     char *str;         /* E_STRING literal, E_IDENT name, E_MEMBER member name, E_NEW_OBJ class name */
     TokKind op;
     Expr *lhs, *rhs;
@@ -723,6 +725,7 @@ typedef struct {
     bool uses_rebt; /* a RegExp that needs backtracking (or one built from text at run time): runtime/xisto_regex_bt.h joins */
     bool uses_plain; /* Object.getPrototypeOf(u) of an unknown: xs_is_plain, by the value's class (emitted only then) */
     bool uses_clone; /* structuredClone: a copy by the value's class at run time (emitted only then) */
+    bool uses_profiler; /* xisto:profiler: its runtime (xisto_prof.h) and the table of the program's functions (emit.c) */
     bool uses_v8, uses_unk_map, uses_symbol_for, uses_nkey, uses_okmap; /* xisto:v8, x instanceof Map/Set of an unknown, Symbol.for: their runtime joins the program */
     bool uses_this_reg; /* XB-107: function (this: T) / method slots: the this register's helpers join the program */
     bool uses_tls;

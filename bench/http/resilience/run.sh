@@ -42,6 +42,14 @@ while st:
     p=st.pop(); t+=rss.get(p,0); st+=kids.get(p,[])
 print('%.1f' % (t/1024))"
 }
+# footprint_tree PID: the macOS physical footprint (what Activity Monitor shows) of PID and its children, in MB; empty
+# elsewhere. RSS on macOS still counts the pages the allocator gave back as reusable until the kernel needs them.
+footprint_tree() {
+    [ "$(uname)" = Darwin ] || return 0
+    pids="$1 $(pgrep -P "$1" | tr '\n' ' ')"
+    for p in $pids; do footprint "$p" 2>/dev/null | awk '/phys_footprint:/{v=$2; u=$3; if (u=="KB") v/=1024; if (u=="GB") v*=1024; print v; exit}'; done |
+        awk '{t+=$1} END {if (NR) printf "%.1f", t}'
+}
 alive() { curl -s -m 2 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/todos/1; }
 oha_json() { # $1=duration $2=conc rest=oha args ; prints "rps p50 p99 errors timeouts"
     d=$1; c=$2; shift 2
@@ -55,20 +63,20 @@ bad=sum(v for k,v in sc.items() if k not in ('200','201','400','404'))
 print('%.0f %.3f %.3f %d %d %d' % (s['requestsPerSec'], p['p50']*1000, p['p99']*1000, errs, timeouts, bad))"
 }
 
-echo "target,phase,param,req_per_s,p50_ms,p99_ms,conn_errors,timeouts,bad_status,rss_mb,alive" > "$csv"
+echo "target,phase,param,req_per_s,p50_ms,p99_ms,conn_errors,timeouts,bad_status,rss_mb,alive,footprint_mb" > "$csv"
 {
     echo "# Resilience bench $stamp"; echo
     echo "Machine: $(sysctl -n machdep.cpu.brand_string), macOS $(sw_vers -productVersion). node $($NODE --version), bun $($BUN --version), oha $($OHA --version | awk '{print $2}'), $(cat $OUT/native-versions.txt). Todo API with 50 items on every server."
     echo "Phases: ramp ($RAMP per concurrency step, GET /todos/25), overload (4096 connections, $PHASE), error storm (POST with invalid JSON, 256 connections, $PHASE: 400 is the right answer), idle (1000 open idle connections while measuring 64 active), soak ($SOAK at 64 connections on GET /todos, RSS sampled), recovery (64 connections after everything). alive = status of a request after each phase."; echo
-    echo "| target | phase | param | req/s | p50 (ms) | p99 (ms) | conn errors | timeouts | bad status | RSS (MB) | alive |"
-    echo "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|"
+    echo "| target | phase | param | req/s | p50 (ms) | p99 (ms) | conn errors | timeouts | bad status | RSS (MB) | alive | footprint (MB) |"
+    echo "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|"
 } > "$md"
 
 record() { # $1=target $2=phase $3=param $4..=oha_json output, then rss
     t=$1; ph=$2; pa=$3; shift 3
-    rps=$1; p50=$2; p99=$3; ce=$4; to=$5; bad=$6; rss=$7; al=$8
-    echo "$t,$ph,$pa,$rps,$p50,$p99,$ce,$to,$bad,$rss,$al" >> "$csv"
-    echo "| $t | $ph | $pa | $rps | $p50 | $p99 | $ce | $to | $bad | $rss | $al |" >> "$md"
+    rps=$1; p50=$2; p99=$3; ce=$4; to=$5; bad=$6; rss=$7; al=$8; fp=$9
+    echo "$t,$ph,$pa,$rps,$p50,$p99,$ce,$to,$bad,$rss,$al,$fp" >> "$csv"
+    echo "| $t | $ph | $pa | $rps | $p50 | $p99 | $ce | $to | $bad | $rss | $al | $fp |" >> "$md"
     printf "   %-10s %-8s %8s req/s  p50 %7s  p99 %8s  err %s/%s/%s  rss %s MB  alive %s\n" "$ph" "$pa" "$rps" "$p50" "$p99" "$ce" "$to" "$bad" "$rss" "$al"
 }
 
@@ -81,12 +89,12 @@ run_target() { # $1=label rest=command
     i=1; while [ $i -le 50 ]; do curl -s -o /dev/null -X POST -d "{\"title\":\"todo $i\"}" http://127.0.0.1:8080/todos; i=$((i+1)); done
     for c in 1 8 64 256 1024 4096; do
         set -- $(oha_json $RAMP $c http://127.0.0.1:8080/todos/25)
-        record "$label" ramp "c=$c" "$@" "$(rss_tree $pid)" "$(alive)"
+        record "$label" ramp "c=$c" "$@" "$(rss_tree $pid)" "$(alive)" "$(footprint_tree $pid)"
     done
     set -- $(oha_json $PHASE 4096 http://127.0.0.1:8080/todos/25)
-    record "$label" overload "c=4096" "$@" "$(rss_tree $pid)" "$(alive)"
+    record "$label" overload "c=4096" "$@" "$(rss_tree $pid)" "$(alive)" "$(footprint_tree $pid)"
     set -- $(oha_json $PHASE 256 -m POST -d '{"title": ' -T application/json http://127.0.0.1:8080/todos)
-    record "$label" error-storm "bad JSON" "$@" "$(rss_tree $pid)" "$(alive)"
+    record "$label" error-storm "bad JSON" "$@" "$(rss_tree $pid)" "$(alive)" "$(footprint_tree $pid)"
     # idle connections: open 1000 sockets that never send a full request, then measure with 64 active
     python3 - "$(( ${PHASE%s} + 4 ))" <<'PYEOF' &
 import socket, sys, time
@@ -102,13 +110,13 @@ PYEOF
     idle_pid=$!
     sleep 2
     set -- $(oha_json $PHASE 64 http://127.0.0.1:8080/todos/25)
-    record "$label" idle "1000 idle" "$@" "$(rss_tree $pid)" "$(alive)"
+    record "$label" idle "1000 idle" "$@" "$(rss_tree $pid)" "$(alive)" "$(footprint_tree $pid)"
     wait $idle_pid 2>/dev/null
     rss_before=$(rss_tree $pid)
     set -- $(oha_json "$SOAK" 64 http://127.0.0.1:8080/todos)
-    record "$label" soak "$SOAK list" "$@" "$(rss_tree $pid) (before: $rss_before)" "$(alive)"
+    record "$label" soak "$SOAK list" "$@" "$(rss_tree $pid) (before: $rss_before)" "$(alive)" "$(footprint_tree $pid)"
     set -- $(oha_json $PHASE 64 http://127.0.0.1:8080/todos/25)
-    record "$label" recovery "c=64" "$@" "$(rss_tree $pid)" "$(alive)"
+    record "$label" recovery "c=64" "$@" "$(rss_tree $pid)" "$(alive)" "$(footprint_tree $pid)"
     pkill -P $pid 2>/dev/null; kill $pid 2>/dev/null; wait $pid 2>/dev/null
 }
 

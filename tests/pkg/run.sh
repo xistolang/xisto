@@ -40,4 +40,25 @@ $X add "$W/mathx" --name mathx > /dev/null && $X build -o app main.ts && [ "$(./
 # a lock written before folders and refs ({"source", "commit"}): still installs
 printf '{\n  "mathx": {"source": "%s", "commit": "%s"}\n}\n' "$W/mathx" "$v1" > xisto.lock
 rm -rf .xisto && $X install > /dev/null && $X build -o app main.ts && [ "$(./app)" = "42" ] && echo "ok: an old xisto.lock still installs"
+# import x from "pkg" of a package with no default export: the package as a namespace (XB-222), as esModuleInterop reads it
+mkdir -p "$W/nsapp/.xisto/pkgs/nodef" "$W/nsapp/.xisto/pkgs/withdef" && cd "$W/nsapp"
+cat > .xisto/pkgs/nodef/index.ts <<'TS'
+export function double(x: int): int {
+  return x * 2;
+}
+export const NAME = "nodef";
+export class Tracer {
+  startSpan(n: string): string {
+    return "span:" + n;
+  }
+}
+TS
+printf 'export default function hello(): string {\n  return "hi";\n}\n' > .xisto/pkgs/withdef/index.ts
+cat > main.ts <<'TS'
+import nodef from "nodef";
+import hello from "withdef";
+const t: nodef.Tracer = new nodef.Tracer();
+console.log(nodef.double(21), nodef.NAME, t.startSpan("a"), hello());
+TS
+$X build -o app main.ts && [ "$(./app)" = "42 nodef span:a hi" ] && echo "ok: import x from a package without a default export reads the package"
 rm -rf "$W"

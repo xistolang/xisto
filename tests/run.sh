@@ -214,6 +214,8 @@ if sh tests/stack/run.sh > "$OUT/stack.txt" 2>&1 && grep -q 'boom: 500 {"error":
    && grep -q "item: 400 {'error': \"JSON: 'id' must be an integer\"}" "$OUT/stack.txt" \
    && grep -q "    at pick (tests/stack/server.ts:7:11)" "$OUT/stack.txt" && grep -q "    at boom (tests/stack/server.ts:10:31)" "$OUT/stack.txt" \
    && grep -q "    at late (tests/stack/server.ts:14:9)" "$OUT/stack.txt" && ! grep -q "warning" "$OUT/stack.txt"; then pass=$((pass+1)); else echo "FAIL stack:"; cat "$OUT/stack.txt"; fail=$((fail+1)); fi
+# xisto:profiler: the sampled pprof against what the program measured (work split, CPU time, inlined frames)
+if sh tests/profiler/run.sh > "$OUT/profiler.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL profiler:"; cat "$OUT/profiler.txt"; fail=$((fail+1)); fi
 # runtime functions that can fail or call back into user code must not be inlined (stack traces)
 if python3 tools/noinline-scan.py --check runtime/xisto_rt.h runtime/xisto_net.h runtime/xisto_sqlite.h runtime/xisto_tls.h runtime/xisto_tls_awslc.h runtime/xisto_regex.h > "$OUT/noinline.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL noinline:"; cat "$OUT/noinline.txt"; fail=$((fail+1)); fi
 # TLS is linked only when the program can use https
@@ -221,7 +223,7 @@ if sh tests/tlsgate/run.sh > "$OUT/tlsgate.txt" 2>&1; then pass=$((pass+1)); els
 fi
 
 # packages: xisto add / install from a local git repository
-if sh tests/pkg/run.sh > "$OUT/pkg.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg.txt")" -ge 8 ] && ! grep -q FAIL "$OUT/pkg.txt"; then pass=$((pass+1)); else echo "FAIL packages:"; cat "$OUT/pkg.txt"; fail=$((fail+1)); fi
+if sh tests/pkg/run.sh > "$OUT/pkg.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg.txt")" -ge 9 ] && ! grep -q FAIL "$OUT/pkg.txt"; then pass=$((pass+1)); else echo "FAIL packages:"; cat "$OUT/pkg.txt"; fail=$((fail+1)); fi
 # packages: xisto init / add NAME / install against a local monorepo registry (tests/pkg/registry.sh)
 if sh tests/pkg/registry.sh > "$OUT/pkg-registry.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg-registry.txt")" -ge 32 ] && ! grep -q FAIL "$OUT/pkg-registry.txt"; then pass=$((pass+1)); else echo "FAIL package registry:"; cat "$OUT/pkg-registry.txt"; fail=$((fail+1)); fi
 
@@ -238,7 +240,7 @@ for f in tests/qbe/*.ts; do
 done
 # --dev (the runtime as a library, tools/rtsplit.py): a few programs must build and print what Node prints. Nothing
 # else in the suite builds with --dev, and a runtime comment once broke every --dev build unnoticed
-for n in arrays classes closures-ref nullish write-behind xisto-collections; do
+for n in arrays classes closures-ref nullish write-behind xisto-collections dev-timers; do
     f=tests/ok/$n.ts
     [ -f "$f" ] && [ -f "$OUT/$n.node" ] || continue
     if $XISTO run --dev "$f" < /dev/null > "$OUT/$n.dev" 2>&1 && cmp -s "$OUT/$n.node" "$OUT/$n.dev"; then pass=$((pass+1)); else echo "FAIL --dev $f"; head -5 "$OUT/$n.dev"; fail=$((fail+1)); fi

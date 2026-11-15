@@ -61,6 +61,11 @@ static bool wants_okmap; /* WeakMap, or Map<object, V>, was written: xisto:okmap
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
 static void import_process(Program *prog, Module *m);
 static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... was named: xisto:url is loaded */
+static bool wants_errors; /* TypeError, RangeError, SyntaxError or ReferenceError was named: xisto:errors is loaded */
+static bool is_js_error_name(const char *n) {
+    return n && (!strcmp(n, "TypeError") || !strcmp(n, "RangeError") || !strcmp(n, "SyntaxError") || !strcmp(n, "ReferenceError") ||
+                 !strcmp(n, "URIError"));
+}
 static bool is_url_global_name(const char *n);
 /* generics: the type parameters in scope while a template is parsed, or their types while an instance is */
 static int no_dyn_note; /* inside generated code: its anys are not the program's uses */
@@ -96,8 +101,9 @@ static void tp_push(char **names, int n) { /* the type parameters in scope: the 
 
 static void next(Parser *p) {
     p->prev_end = p->tok.start ? p->tok.start + p->tok.len : NULL;
+    TokKind before = p->tok.kind;
     p->tok = lexer_next(&p->lx);
-    if (p->nalias && p->tok.kind == TK_IDENT)
+    if (p->nalias && p->tok.kind == TK_IDENT && before != TK_DOT && before != TK_QDOT) /* (o.a: a property, never an import's alias) */
         for (int i = 0; i < p->nalias; i++)
             if (strcmp(p->tok.str, p->alias_from[i]) == 0) { p->tok.str = p->alias_to[i]; break; }
 }
@@ -117,12 +123,26 @@ static Token expect(Parser *p, TokKind k, const char *help) {
     return t;
 }
 
+/* the name a property was written with: an identifier the module's import aliases renamed (import { a as b } reads
+   b as a, and a module's own a as a__local) is, as a property, still the name written (XB-224) */
+static char *prop_raw(Parser *p, Token t) {
+    if (t.kind != TK_IDENT || !t.start || ((int)strlen(t.str) == t.len && !strncmp(t.str, t.start, (size_t)t.len))) return t.str;
+    for (int i = 0; i < p->nalias; i++)
+        if (p->alias_to[i] == t.str && (int)strlen(p->alias_from[i]) == t.len && !strncmp(p->alias_from[i], t.start, (size_t)t.len))
+            return p->alias_from[i];
+    return t.str;
+}
 /* a property name: an identifier or any keyword (obj.default, { default: 0 }, interface { delete?: x }) */
 static Token expect_prop_name(Parser *p, const char *help) {
     const char *w = tok_keyword_text(p->tok.kind);
     if (w) { Token t = p->tok; t.kind = TK_IDENT; t.str = (char *)w; next(p); return t; }
-    return expect(p, TK_IDENT, help);
+    Token t = expect(p, TK_IDENT, help);
+    t.str = prop_raw(p, t);
+    return t;
 }
+
+static Import *ns_import_of(Parser *p, const char *alias);
+static char *ns_name(Parser *p, Import *im, Token name);
 
 static bool accept(Parser *p, TokKind k) {
     if (at(p, k)) {
@@ -157,6 +177,7 @@ static Type *parse_type(Parser *p);
 /* Unresolved class names are stored as objects of a placeholder class; the checker resolves them. */
 static Type *named_type(Parser *p, Token name) {
     if (is_url_global_name(name.str)) wants_url = true; /* (a URL or AbortSignal parameter) */
+    if (is_js_error_name(name.str)) wants_errors = true; /* (a TypeError parameter, field or return type) */
     Class *c = xs_alloc(sizeof *c);
     c->name = name.str;
     c->pos = name.pos;
@@ -944,20 +965,23 @@ static Type *parse_type(Parser *p) {
     } else {
         if (at(p, TK_DOT) && peek_is_ident(p) && p->mod) { /* Types.ObjectId (or ns.Type): the type Types's module exports as
                                                               ObjectId, imported from there with it */
-            Import *im = NULL;
-            for (int i = 0; i < p->nns && !im; i++) if (strcmp(p->ns_alias[i], name.str) == 0) im = &p->mod->imports[p->ns_import[i]];
+            Import *im = ns_import_of(p, name.str);
+            bool isns = im != NULL;
             for (int i = 0; i < p->mod->nimports && !im; i++) {
                 Import *q = &p->mod->imports[i];
                 if (q->reexport || q->star) continue;
                 for (int k = 0; k < q->n; k++) if (strcmp(q->names[k], name.str) == 0) { im = q; break; }
             }
             if (im) { /* (stream.xlsx.WorkbookWriter: the last name, the type the module exports) */
+                int depth = 0;
                 while (at(p, TK_DOT) && peek_is_ident(p)) {
                     next(p);
                     name = p->tok;
                     next(p);
+                    depth++;
                 }
-                import_add_name(im, name);
+                if (isns && depth == 1) name.str = ns_name(p, im, name); /* (ns.Type: ns's, XB-223) */
+                else import_add_name(im, name);
             }
         }
         t = named_type(p, name);
@@ -1261,12 +1285,7 @@ static Expr *parse_arrow(Parser *p) {
 }
 
 static bool tmpl_raw; /* parsing the template of String.raw`...` */
-static bool wants_errors; /* TypeError, RangeError, SyntaxError or ReferenceError was named: xisto:errors is loaded */
 static bool wants_intl; /* Intl.X was named: xisto:intl is loaded (Intl.DateTimeFormat is its class Intl_DateTimeFormat) */
-static bool is_js_error_name(const char *n) {
-    return n && (!strcmp(n, "TypeError") || !strcmp(n, "RangeError") || !strcmp(n, "SyntaxError") || !strcmp(n, "ReferenceError") ||
-                 !strcmp(n, "URIError"));
-}
 /* the web globals xisto:url declares (runtime/node/url.ts) */
 static bool is_url_global_name(const char *n) {
     return n && (!strcmp(n, "URL") || !strcmp(n, "URLSearchParams") || !strcmp(n, "AbortController") || !strcmp(n, "AbortSignal") ||
@@ -1547,7 +1566,7 @@ static Expr *parse_primary(Parser *p) {
                 val->str = key.str;
             }
             if (e->args.len == cap) { cap = cap ? cap * 2 : 4; e->keys = realloc(e->keys, sizeof(char *) * (size_t)cap); }
-            e->keys[e->args.len] = key.str;
+            e->keys[e->args.len] = prop_raw(p, key); /* ({ a: 1 }, { a }: the key as written, the value through the aliases) */
             expr_list_push(&e->args, val);
             if (!accept(p, TK_COMMA)) break;
         }
@@ -1616,20 +1635,23 @@ static Expr *parse_primary(Parser *p) {
             wants_intl = true;
         } else if (at(p, TK_DOT) && peek_is_ident(p) && p->mod) { /* new Types.ObjectId(x) (or new ns.C(x)): the class Types's
                                                                      module exports as ObjectId, as Types.ObjectId in a type */
-            Import *im = NULL;
-            for (int i = 0; i < p->nns && !im; i++) if (strcmp(p->ns_alias[i], name.str) == 0) im = &p->mod->imports[p->ns_import[i]];
+            Import *im = ns_import_of(p, name.str);
+            bool isns = im != NULL;
             for (int i = 0; i < p->mod->nimports && !im; i++) {
                 Import *q = &p->mod->imports[i];
                 if (q->reexport || q->star) continue;
                 for (int k = 0; k < q->n; k++) if (strcmp(q->names[k], name.str) == 0) { im = q; break; }
             }
             if (im) { /* (new stream.xlsx.WorkbookWriter(o): the last name, the class the module exports) */
+                int depth = 0;
                 while (at(p, TK_DOT) && peek_is_ident(p)) {
                     next(p);
                     name = p->tok;
                     next(p);
+                    depth++;
                 }
-                import_add_name(im, name);
+                if (isns && depth == 1) name.str = ns_name(p, im, name); /* (new ns.C(): ns's, XB-223) */
+                else import_add_name(im, name);
             }
         }
         if (strcmp(name.str, "Array") == 0) {
@@ -2061,6 +2083,16 @@ static Expr *parse_rel(Parser *p) {
         next(p);
         Expr *c = new_expr(E_IDENT, p->tok.pos);
         c->str = expect(p, TK_IDENT, "write a class name: x instanceof Foo").str;
+        Import *nsi = at(p, TK_DOT) && peek_is_ident(p) ? ns_import_of(p, c->str) : NULL;
+        if (nsi) { /* x instanceof ns.C: the class C of ns's module */
+            next(p);
+            Token cn = p->tok;
+            next(p);
+            c->pos = cn.pos;
+            c->str = ns_name(p, nsi, cn);
+        }
+        if (is_js_error_name(c->str)) wants_errors = true; /* (x instanceof SyntaxError with no other mention of it) */
+        if (is_url_global_name(c->str)) wants_url = true;
         e = binary(TK_IDENT, pos, e, c); /* TK_IDENT as operator: instanceof */
     }
     return e;
@@ -3609,6 +3641,7 @@ static Class *parse_class_ex(Parser *p, bool abstract) {
         next(p);
         c->base_pos = p->tok.pos;
         Token bt = expect(p, TK_IDENT, NULL);
+        if (is_js_error_name(bt.str)) wants_errors = true; /* (class E extends TypeError) */
         bool mapped = !strcmp(bt.str, "PartialType") || !strcmp(bt.str, "OmitType") || !strcmp(bt.str, "PickType") || !strcmp(bt.str, "IntersectionType");
         if (at(p, TK_LPAREN) && mapped) c->mixin = parse_mixin_rest(p, bt); /* extends PartialType(CreateDto) */
         else if (at(p, TK_LPAREN)) { /* extends PassportStrategy(Strategy, "jwt"), AuthGuard(["jwt"]): a class factory as the
@@ -4331,13 +4364,15 @@ static bool thunk_arrow_ahead(Parser *p) {
 /* the rest of the module declares `name` at its top level: a line that starts (after export / declare / abstract)
    with class / interface / type / function / enum / const / let and then the name (read as text: a lexer this far
    ahead would not know where a regular expression starts) */
-static bool declares_top(Parser *p, const char *name) {
-    const char *q = p->lx.src + p->lx.pos;
+static bool declares_top_from(const char *src, const char *q, const char *name);
+static bool declares_top(Parser *p, const char *name) { return declares_top_from(p->lx.src, p->lx.src + p->lx.pos, name); }
+/* (from q on, in the module whose source starts at src) */
+static bool declares_top_from(const char *src, const char *q, const char *name) {
     size_t n = strlen(name);
     static const char *const lead[] = {"export ", "declare ", "default ", "abstract ", "async "};
     static const char *const kw[] = {"class ", "interface ", "type ", "function ", "enum ", "const ", "let "};
     for (; *q; q++) {
-        if (q != p->lx.src && q[-1] != '\n') continue;
+        if (q != src && q[-1] != '\n') continue;
         const char *r = q;
         for (bool again = true; again;) {
             again = false;
@@ -4471,16 +4506,54 @@ static void import_add_name(Import *im, Token name) {
         im->as_names = realloc(im->as_names, sizeof(char *) * (size_t)(im->n + 1));
         im->as_names[im->n] = name.str;
     }
+    if (im->qualified) { /* (sized to the names: one more) */
+        im->qualified = realloc(im->qualified, sizeof(bool) * (size_t)(im->n + 1));
+        im->qualified[im->n] = false;
+    }
     im->names[im->n] = name.str;
     im->positions[im->n++] = name.pos;
 }
+/* XB-223: ns.name of `import * as ns` where the module has another `name` (its own top-level declaration, or another
+   import's): the name reads as "name\x01path" (XB-117's form), which the checker resolves in ns's module only, while a
+   plain `name` keeps meaning the module's own (or the other import's). Decided once per name of the import, when it is
+   first read through ns. Returns the name the reference is written with. */
+static const char *export_orig(Module *m, const char *name, Module **via, int depth);
+static char *ns_name(Parser *p, Import *im, Token name) {
+    if (im->from && !im->from->loading && !im->from->missing && strcmp(name.str, "default") != 0) {
+        /* ns.a where ns's module exports its own declaration under another name (its a read as a__local next to an
+           import { a as b }, XB-224; export { x as a }): the declaration's name */
+        Module *via = im->from;
+        const char *o = export_orig(im->from, name.str, &via, 0);
+        if (via == im->from && o != name.str && strcmp(o, name.str) != 0) name.str = (char *)o;
+    }
+    for (int i = 0; i < im->n; i++)
+        if (strcmp(im->names[i], name.str) == 0)
+            return im->qualified && im->qualified[i] && im->path ? xs_sprintf("%s\x01%s", name.str, im->path) : name.str;
+    import_add_name(im, name);
+    if (!im->path) return name.str;
+    bool clash = declares_top_from(p->lx.src, p->lx.src, name.str);
+    for (int k = 0; k < p->mod->nimports && !clash; k++) {
+        Import *o = &p->mod->imports[k];
+        if (o == im || o->reexport || o->star || !o->path || strcmp(o->path, im->path) == 0) continue;
+        for (int j = 0; j < o->n && !clash; j++)
+            if (strcmp(o->names[j], name.str) == 0 && !(o->qualified && o->qualified[j])) clash = true;
+    }
+    if (!clash) return name.str;
+    if (!im->qualified) im->qualified = xs_alloc(sizeof(bool) * (size_t)im->n);
+    im->qualified[im->n - 1] = true;
+    return xs_sprintf("%s\x01%s", name.str, im->path);
+}
+/* the import of `import * as alias` in the module being parsed */
+static Import *ns_import_of(Parser *p, const char *alias) {
+    if (!p->mod) return NULL;
+    for (int i = 0; i < p->nns; i++) if (strcmp(p->ns_alias[i], alias) == 0) return &p->mod->imports[p->ns_import[i]];
+    return NULL;
+}
 static Expr *ns_member(Parser *p, Expr *e, Token name) {
     if (e->kind != E_IDENT || !p->nns || !p->mod) return NULL;
-    int k = -1;
-    for (int i = 0; i < p->nns; i++) if (strcmp(p->ns_alias[i], e->str) == 0) k = i;
-    if (k < 0) return NULL;
-    import_add_name(&p->mod->imports[p->ns_import[k]], name);
-    Expr *id = ident_expr(name.pos, name.str);
+    Import *im = ns_import_of(p, e->str);
+    if (!im) return NULL;
+    Expr *id = ident_expr(name.pos, ns_name(p, im, name));
     id->boolean = true; /* (read through a namespace: ns.x = v writes the module's let, as a CommonJS module object allows) */
     return id;
 }
@@ -4508,6 +4581,16 @@ static void alias_collisions(Parser *p, Module *m, int first, Import *im) {
         if (strstr(p->alias_to[i], "__local")) continue;
         alias_recs = realloc(alias_recs, sizeof(AliasRec) * (size_t)(nalias_recs + 1));
         alias_recs[nalias_recs++] = (AliasRec){m, i, p->alias_to[i], im->path};
+        /* XB-206: import { setTimeout as sleep } from "node:timers/promises": the global setTimeout(cb, ms) stays the
+           global (the import only names `sleep`), so the alias reads as qualified, as next to another import */
+        static const char *const globals[] = {"setTimeout", "setInterval", "setImmediate", "clearTimeout", "clearInterval", "clearImmediate", NULL};
+        bool global = false;
+        for (int g = 0; globals[g]; g++) if (strcmp(p->alias_to[i], globals[g]) == 0) global = true;
+        if (global && !strchr(p->alias_to[i], '\x01')) {
+            mark_qualified(m, im->path, p->alias_to[i]);
+            p->alias_to[i] = xs_sprintf("%s\x01%s", p->alias_to[i], im->path);
+            continue;
+        }
         for (int k = 0; k + 1 < m->nimports; k++)
             for (int j = 0; j < m->imports[k].n; j++)
                 if (strcmp(m->imports[k].names[j], p->alias_to[i]) == 0 && m->imports[k].path && strcmp(m->imports[k].path, im->path) != 0) {
@@ -4549,6 +4632,62 @@ static bool pkg_available(const char *from_file, const char *name) {
     return false;
 }
 static Module *load_module(Program *prog, const char *file, Pos from_pos, const char *from_file);
+/* the entry file of the package `name` imported from from_file (as load_module finds it: XISTO_PKGS, a .xisto/pkgs
+   above the file or above the program's first module; xisto.json "main", else index.ts or src/index.ts), or NULL.
+   No error: the import is resolved (and reported) by load_module later */
+static char *pkg_entry_file(Program *prog, const char *from_file, const char *name) {
+    if (!from_file || name[0] == '.' || name[0] == '/' || strchr(name, ':')) return NULL;
+    const char *slash = strchr(name, '/');
+    if (slash && name[0] == '@') slash = strchr(slash + 1, '/');
+    if (slash) return NULL; /* (a deep import: a file of the package, not its entry) */
+    char *found = NULL;
+    const char *extra = getenv("XISTO_PKGS");
+    if (extra && *extra && access(xs_sprintf("%s/%s", extra, name), R_OK) == 0) found = xs_sprintf("%s/%s", extra, name);
+    const char *starts[2] = {from_file, prog && prog->nmodules > 0 ? prog->modules[0]->path : NULL};
+    for (int s = 0; s < 2 && !found; s++) {
+        if (!starts[s]) continue;
+        char dir[PATH_MAX];
+        strncpy(dir, starts[s], sizeof dir - 1);
+        dir[sizeof dir - 1] = 0;
+        for (char *sl; !found && (sl = strrchr(dir, '/')); ) {
+            *sl = 0;
+            char *probe = xs_sprintf("%s/.xisto/pkgs/%s", dir, name);
+            if (access(probe, R_OK) == 0) found = probe;
+        }
+    }
+    if (!found) return NULL;
+    char *meta = xs_read_file(xs_sprintf("%s/xisto.json", found));
+    if (meta) {
+        char *mm = strstr(meta, "\"main\"");
+        if (mm && (mm = strchr(mm + 6, '"'))) {
+            char *e = strchr(mm + 1, '"');
+            if (e) {
+                char *entry = xs_sprintf("%s/%.*s", found, (int)(e - mm - 1), mm + 1);
+                if (access(entry, R_OK) == 0) return entry;
+                if (access(xs_sprintf("%s.ts", entry), R_OK) == 0) return xs_sprintf("%s.ts", entry);
+                return NULL;
+            }
+        }
+    }
+    if (access(xs_sprintf("%s/index.ts", found), R_OK) == 0) return xs_sprintf("%s/index.ts", found);
+    if (access(xs_sprintf("%s/src/index.ts", found), R_OK) == 0) return xs_sprintf("%s/src/index.ts", found);
+    return NULL;
+}
+/* the source declares a default export: export default ..., or default in an export list (export { f as default },
+   export { default } from "./x") */
+static bool src_has_default_export(const char *src) {
+    for (const char *s = strstr(src, "export"); s; s = strstr(s + 6, "export")) {
+        if (s > src && (isalnum((unsigned char)s[-1]) || s[-1] == '_' || s[-1] == '$')) continue;
+        const char *q = s + 6;
+        while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+        if (!strncmp(q, "default", 7) && !isalnum((unsigned char)q[7]) && q[7] != '_') return true;
+        if (*q != '{') continue;
+        const char *end = strchr(q, '}');
+        for (const char *d = q; end && (d = strstr(d, "default")) && d < end; d += 7)
+            if (!isalnum((unsigned char)d[-1]) && d[-1] != '_' && !isalnum((unsigned char)d[7]) && d[7] != '_') return true;
+    }
+    return false;
+}
 /* process.X beyond the members the compiler builds in: the module reads XistoProcess.X (checker), so it imports
    XistoProcess from xisto:process (runtime/node/process.ts), once */
 static void import_process(Program *prog, Module *m) {
@@ -4622,6 +4761,14 @@ static void parse_import(Parser *p, Module *m) {
             const char *base = !strncmp(spec, "node:", 5) ? spec + 5 : !strncmp(spec, "xisto:", 6) ? spec + 6 : spec;
             bool core = !strncmp(spec, "node:", 5) || xs_node_core_name(spec);
             if (core && strcmp(base, "events") != 0) {
+                ns_register(p, m, name.str);
+                goto from;
+            }
+            /* import tracer from "pkg" with a package that has no default export: the package itself, as TypeScript's
+               esModuleInterop reads a module without one (import * as tracer) (XB-222) */
+            char *entry = core ? NULL : pkg_entry_file(p->prog, m->path, spec);
+            char *esrc = entry ? xs_read_file(entry) : NULL;
+            if (esrc && !src_has_default_export(esrc)) {
                 ns_register(p, m, name.str);
                 goto from;
             }
@@ -5824,6 +5971,7 @@ static const char xs_settled_src[] =
     "}\n"
     "export async function __xs_allSettledVoid(ps: Promise<void>[]): Promise<PromiseSettledResult<unknown>[]> {\n"
     "  const out: PromiseSettledResult<unknown>[] = [];\n"
+    "  __xs_promises_handled(ps); // (a later one may reject while an earlier one is awaited)\n"
     "  for (const p of ps) {\n"
     "    try {\n"
     "      await p;\n"
@@ -5836,6 +5984,7 @@ static const char xs_settled_src[] =
     "}\n"
     "export async function __xs_allSettled<T>(ps: Promise<T>[]): Promise<PromiseSettledResult<T>[]> {\n"
     "  const out: PromiseSettledResult<T>[] = [];\n"
+    "  __xs_promises_handled(ps); // (a later one may reject while an earlier one is awaited)\n"
     "  for (const p of ps) {\n"
     "    try {\n"
     "      const v = await p;\n"
@@ -6140,6 +6289,22 @@ static const char xs_v8_src[] =
     "export function serialize(value: unknown): Buffer {\n"
     "  return Buffer.from(JSON.stringify(value) ?? '');\n"
     "}\n";
+/* xisto:profiler: a sampling CPU profiler (runtime/xisto_prof.h); dd-trace's profiling builds on it */
+static const char xs_profiler_src[] =
+    "declare function cpuprof_start(hz: int): boolean;\n"
+    "declare function cpuprof_stop(): void;\n"
+    "declare function cpuprof_collect(): Uint8Array;\n"
+    "declare function cpuprof_last_samples(): int;\n"
+    "/** Starts sampling the process: hz times per second of CPU time, every thread (99 by default, as dd-trace on Node).\n"
+    " * false when the process already has a profiler (another thread started it) or the system has none (Windows). */\n"
+    "export function start(hz: int = 99): boolean {\n  return cpuprof_start(hz);\n}\n"
+    "/** Stops sampling; the samples taken stay for the next collect(). */\n"
+    "export function stop(): void {\n  cpuprof_stop();\n}\n"
+    "/** The samples since the last collect() (or start()) as a pprof profile: profile.proto, not compressed. Sample\n"
+    " * types sample/count and cpu/nanoseconds; frames are TypeScript functions with file and line. */\n"
+    "export function collect(): Uint8Array {\n  return cpuprof_collect();\n}\n"
+    "/** How many samples the last collect() had. */\n"
+    "export function lastSamples(): int {\n  return cpuprof_last_samples();\n}\n";
 /* xisto:okmap: Map<object, V> and WeakMap<K, V>: keys by identity (the object kept while it is a key: a WeakMap's entries
    are observed only through get/set/has/delete, as JavaScript allows) */
 static const char xs_okmap_src[] =
@@ -6187,6 +6352,9 @@ static const char xs_os_src[] =
     "export function platform(): string {\n  return os_platform_name();\n}\n"
     "export function type(): string {\n  return os_platform_name() === \"darwin\" ? \"Darwin\" : \"Linux\";\n}\n"
     "export function arch(): string {\n  return os_arch_name();\n}\n"
+    "declare function os_kernel_text(which: int): string;\n"
+    "export function release(): string {\n  return os_kernel_text(0);\n}\n"
+    "export function version(): string {\n  return os_kernel_text(1);\n}\n"
     "export function tmpdir(): string {\n  return os_tmp_dir();\n}\n"
     "export function homedir(): string {\n  return os_home_dir();\n}\n"
     "export const EOL: string = \"\\n\";\n";
@@ -6410,6 +6578,17 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->loading = false;
         return m;
     }
+    if (strcmp(name, "profiler") == 0) { /* written in xisto over runtime functions (see xs_profiler_src) */
+        m->builtin = false;
+        m->file = "xisto:profiler";
+        m->src = (char *)xs_profiler_src;
+        prog->uses_profiler = true;
+        m->native_prefix = "xs_";
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
     if (strcmp(name, "okmap") == 0) { /* xisto:okmap: identity-keyed maps (see xs_okmap_src) */
         m->builtin = false;
         m->file = "xisto:okmap";
@@ -6421,7 +6600,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         prog->uses_okmap = true;
         return m;
     }
-    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:stream, xisto:stream/promises, xisto:stream/web, xisto:buffer, xisto:util, xisto:querystring, xisto:string_decoder, xisto:zlib, xisto:timers, xisto:http, xisto:https, xisto:tls, xisto:diagnostics_channel, xisto:net, xisto:dns, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:stream, xisto:stream/promises, xisto:stream/web, xisto:buffer, xisto:util, xisto:querystring, xisto:string_decoder, xisto:zlib, xisto:timers, xisto:http, xisto:https, xisto:tls, xisto:diagnostics_channel, xisto:net, xisto:dns, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random, xisto:profiler", "unknown built-in module '%s'", spec);
     return NULL;
 }
 

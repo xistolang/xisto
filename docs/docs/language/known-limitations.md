@@ -33,13 +33,12 @@ instead. Intended differences are in [Divergences from TypeScript](./divergences
 - `Map` and `Set` `for…of` does not see entries added during the loop.
 - `String.prototype.normalize` returns the string unchanged; `localeCompare` and `Date` have no ICU data:
   `Date.toString()` shows the zone abbreviation (`-03`), not its long name.
-- `Map.get` of a missing key with an `int` value is a run-time error: test with `has`.
+- `Map.get` of a missing key with an `int`, `number` or `boolean` value, read where only that type fits
+  (`m.get(k) + 1`), is a run-time error: test with `has`, or write `m.get(k) ?? 0`.
 - Stack traces stop after 39 frames and do not show runtime frames.
 
 ## Tools
 
-- `--dev` builds of programs that use `setTimeout`, `setInterval` or `clearInterval` currently fail in the C
-  compiler; build without `--dev`.
 - The `qbe` backend covers numbers, strings, arrays, classes, interfaces and control flow; it has no closures,
   `Map`/`Set`, streams, exceptions or networking (XS6001). The default C backend has none of these limits.
 - No language server: editors get the debugger only.

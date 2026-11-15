@@ -338,6 +338,11 @@ static int kevent(int ep, const struct kevent *ch, int nch, struct kevent *out, 
 #if !defined(_WIN32)
 #include <poll.h>
 #include <sys/mman.h>
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#elif defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #endif
 
 /* ---- coroutines: one small stack per in-flight request; `await fetch` yields to the event loop ----
@@ -717,9 +722,16 @@ static void xs_coro_yield(void) {
    kevent only until the nearest deadline, and disarming just forgets it (an entry whose waiter was re-armed
    or disarmed is skipped when it comes up). With 10k sleeping tasks this took 2 syscalls per sleep away, and
    macOS stopped coalescing (delaying) thousands of kernel timers. */
-typedef struct { uint64_t at; xs_waiter *w; uint32_t gen; } xs_tmr;
+/* seq: the order of arming. Timers with the same deadline (the clock's resolution is a microsecond on macOS, and
+   timers armed together often share one) fire in the order they were armed, as Node's (XB-183). It fits in the
+   entry's padding (24 bytes either way); the push needs no tie-break, since the newest entry has the largest seq */
+typedef struct { uint64_t at; xs_waiter *w; uint32_t gen, seq; } xs_tmr;
 static XS_TLS xs_tmr *xs_tmrs;
 static XS_TLS size_t xs_ntmr, xs_tmrcap;
+static XS_TLS uint32_t xs_tmr_seq;
+static inline bool xs_tmr_before(const xs_tmr *a, const xs_tmr *b) {
+    return a->at < b->at || (a->at == b->at && (int32_t)(a->seq - b->seq) < 0); /* (wraps: compared as a difference) */
+}
 static void xs_tmr_push(xs_tmr t) {
     if (xs_ntmr == xs_tmrcap) { xs_tmrcap = xs_tmrcap ? xs_tmrcap * 2 : 64; xs_tmrs = realloc(xs_tmrs, sizeof(xs_tmr) * xs_tmrcap); }
     size_t i = xs_ntmr++;
@@ -732,8 +744,8 @@ static xs_tmr xs_tmr_pop(void) {
     for (;;) {
         size_t c = 2 * i + 1;
         if (c >= xs_ntmr) break;
-        if (c + 1 < xs_ntmr && xs_tmrs[c + 1].at < xs_tmrs[c].at) c++;
-        if (xs_tmrs[c].at >= last.at) break;
+        if (c + 1 < xs_ntmr && xs_tmr_before(&xs_tmrs[c + 1], &xs_tmrs[c])) c++;
+        if (!xs_tmr_before(&xs_tmrs[c], &last)) break;
         xs_tmrs[i] = xs_tmrs[c];
         i = c;
     }
@@ -745,7 +757,7 @@ static void xs_timer_arm(xs_waiter *w, int64_t ms) {
     w->fired = false;
     w->armed_batch = xs_batch;
     w->tgen++;
-    xs_tmr_push((xs_tmr){xs_now() + (uint64_t)(ms < 0 ? 0 : ms) * 1000000ull, w, w->tgen});
+    xs_tmr_push((xs_tmr){xs_now() + (uint64_t)(ms < 0 ? 0 : ms) * 1000000ull, w, w->tgen, xs_tmr_seq++});
 }
 static void xs_timer_disarm(xs_waiter *w) { w->armed = false; }
 /* how long the loop may sleep in kevent: until the nearest live timer (false: no timer) */
@@ -1103,7 +1115,6 @@ static void xs_promise_free(void *p) {
     if (q->state == 2 && q->err) xs_release_(q->err);
     xs_obj_free(p);
 }
-static void xs_print_any_quoted(void *p);
 static void xs_promise_print(void *p) {
     xs_promise *q = p;
     fputs("Promise { ", XS_OUT);
@@ -1447,6 +1458,42 @@ XS_NOINLINE xs_promise *xs_promise_race_arr(xs_arr_ref *ps) {
         xs_release_(cl);
     }
     return to;
+}
+/* Promise.all(ps) of an array kept (XB-204): a void promise that rejects as the first of them does (in the order
+   they settle, as Node's) and fulfills once all have; the values are then read in order. Every one is handled from
+   now on: a rejection while an earlier one is still pending is Promise.all's, not an uncaught one. The pending count
+   lives in the promise's value until it settles. */
+typedef struct { xs_closure c; xs_promise *to, *from; } xs_pall_cl;
+XS_NOINLINE void xs_pall_cb(void *c) {
+    xs_pall_cl *r = c;
+    if (r->to->state != 0) return;
+    if (r->from->state == 2) xs_promise_reject(r->to, xs_retain_(r->from->err));
+    else if (--r->to->val.i == 0) xs_promise_fulfill(r->to, (xs_val){0});
+}
+XS_NOINLINE xs_promise *xs_promise_all_arr(xs_arr_ref *ps) {
+    xs_promise *to = xs_promise_make(4);
+    for (size_t i = 0; i < ps->len; i++) if (ps->data[i]) to->val.i++;
+    if (to->val.i == 0) { to->state = 1; return to; }
+    for (size_t i = 0; i < ps->len; i++) {
+        xs_promise *q = ps->data[i];
+        if (!q) continue;
+        xs_pall_cl *cl = xs_obj_alloc(sizeof *cl, xs_prace_cl_free, xs_presolver_print);
+        cl->c.fn = (void *)xs_pall_cb;
+        cl->to = xs_retain_(to);
+        cl->from = xs_retain_(q);
+        xs_promise *d = xs_promise_then(q, 1, &cl->c, 4, NULL, 4, q->kind); /* (marks q handled) */
+        d->handled = true;
+        xs_release_(d);
+        xs_release_(cl);
+    }
+    return to;
+}
+/* Promise.allSettled(ps) of an array kept: every one handled now, before the outcomes are read in order */
+XS_NOINLINE void xs_promises_handled(xs_arr_ref *ps) {
+    for (size_t i = 0; i < ps->len; i++) {
+        xs_promise *q = ps->data[i];
+        if (q) { q->handled = true; xs_unh_drop(q); }
+    }
 }
 /* new Promise((resolve, reject) => ...): the two functions are closures that hold the promise */
 typedef struct { xs_closure c; xs_promise *p; } xs_presolver;
@@ -2531,13 +2578,37 @@ struct xs_client { int kind; int fd; xs_buf in, out; bool closing; bool fast_ok;
 #define XS_HAS_PENDING(c) ((c)->out.len > 0 || XS_TLS_PENDING(c))
 /* clients are freed after the current batch of events: a later event in the same batch may still name them */
 static XS_TLS xs_client *xs_clients_dead;
+static XS_TLS int64_t xs_clients_live;  /* this worker's open connections */
+static XS_TLS int64_t xs_clients_freed; /* connections freed since memory was last given back */
+static XS_TLS uint64_t xs_trim_ns;
 static void xs_client_free_later(xs_client *c) { c->next_dead = xs_clients_dead; xs_clients_dead = c; }
+/* Gives the allocator's free pages back to the system once a burst of connections is gone. Each connection's
+   buffers are freed when it closes, but the system allocator keeps the emptied pages (macOS's magazines,
+   glibc's arenas): after 1,000 connections the Todo API held 21-28 MB with 0.6 MB in use. Only when this worker
+   has no connection left, at least 256 were freed since the last time, and at most once a second, so a server
+   under steady load never pays for it. */
+static void xs_clients_trim(void) {
+    if (xs_clients_live != 0 || xs_clients_freed < 256) return;
+    uint64_t now = xs_now();
+    if (now - xs_trim_ns < 1000000000ull) return;
+    xs_trim_ns = now;
+    xs_clients_freed = 0;
+#if defined(__APPLE__)
+    malloc_zone_pressure_relief(NULL, 0);
+#elif defined(__GLIBC__)
+    malloc_trim(0);
+#endif
+}
 static void xs_clients_flush_dead(void) {
+    if (!xs_clients_dead) return;
     while (xs_clients_dead) {
         xs_client *c = xs_clients_dead;
         xs_clients_dead = c->next_dead;
         free(c->in.data); free(c->out.data); XS_TLS_FREE(c->tls); free(c);
+        xs_clients_live--;
+        xs_clients_freed++;
     }
+    xs_clients_trim();
 }
 typedef struct { xs_Server *s; xs_client *c; xs_HttpRequest *req; xs_route *route; bool keep_alive; } xs_request_job;
 
@@ -3227,6 +3298,7 @@ XS_NOINLINE void *xs_server_worker(void *arg) {
                     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
                     xs_client *c = calloc(1, sizeof *c);
                     c->fd = fd;
+                    xs_clients_live++;
 #ifdef XS_WITH_TLS
                     if (s->cred) c->tls = xs_tls_server_new(s->cred);
 #endif
@@ -3589,6 +3661,7 @@ static xs_MessagePort *xs_wt_port(void) { /* parentPort: on the main thread, a p
     m->out = xs_wt_out;
     return m;
 }
+#endif /* XS_THREADS (worker threads; what follows is for every program with an event loop) */
 /* node:os: the machine's name, the system and the user's folders, as Node gives them */
 XS_NOINLINE xs_str *xs_os_host_name(void) {
     char b[256];
@@ -3610,6 +3683,21 @@ XS_NOINLINE xs_str *xs_os_arch_name(void) {
     return xs_str_new("arm64", 5);
 #else
     return xs_str_new("x64", 3);
+#endif
+}
+/* os.release() and os.version(): the kernel's release and version strings (uname), as Node gives them */
+#if !defined(_WIN32)
+#include <sys/utsname.h>
+#endif
+XS_NOINLINE xs_str *xs_os_kernel_text(int64_t which) {
+#if defined(_WIN32)
+    (void)which;
+    return xs_str_new("", 0);
+#else
+    struct utsname u;
+    if (uname(&u) != 0) return xs_str_new("", 0);
+    const char *s = which == 0 ? u.release : u.version;
+    return xs_str_new(s, strlen(s));
 #endif
 }
 /* ---- fs.createReadStream / fs.createWriteStream (runtime/node/stream.ts): open, read, write and close that give
@@ -3831,6 +3919,7 @@ XS_NOINLINE void xs_process_signal_unwatch(int64_t sig) {
     sigaction((int)sig, &sa, NULL);
 }
 
+#ifdef XS_THREADS
 /* the listener's coroutine: each message, in order, to the closure; ends when the sender is done */
 typedef struct { xs_wq *q; xs_closure **cb; uint8_t *kind; xs_hdr *owner; } xs_wlisten; /* kind: what the listener takes (XS_WM_...) */
 XS_NOINLINE void xs_wt_listen(void *p) {
@@ -3897,6 +3986,7 @@ XS_NOINLINE void xs_wt_listen_start(xs_wq *q, xs_closure **cb, uint8_t *kind, xs
     xs_exit_hook = xs_tasks_drain;
     xs_ready_push(co); /* it starts when the loop runs: after the code that set the listener up */
 }
+#endif
 /* ---- setTimeout / setInterval (Node's globals): each timer is a coroutine on the event loop. It starts when the
    loop runs (a server's, or the one the program's exit waits on), sleeps, then calls its callback; an interval goes
    on until clearInterval. Like Node, a pending timer keeps the program alive. */
@@ -4029,6 +4119,10 @@ XS_NOINLINE void xs_clear_timer(double idn) { /* the timer's coroutine ends when
         }
 }
 XS_NOINLINE void xs_timer_close(int64_t id) { xs_clear_timer((double)id); } /* timer.close() */
+/* clearTimeout of a timer id that may be none (int | null, number | null): nothing to clear then */
+XS_NOINLINE void xs_clear_timer_ni(int64_t id) { if (id != XS_NULL_INT) xs_clear_timer((double)id); }
+XS_NOINLINE void xs_clear_timer_nn(double id) { if (!xs_isnull_num(id)) xs_clear_timer(id); }
+#ifdef XS_THREADS /* worker threads, continued */
 XS_NOINLINE void xs_wt_check_event(xs_str *ev, const char *who) {
     if (ev->len != 7 || memcmp(ev->data, "message", 7) != 0)
         xs_panicf("%s.on: only \"message\" is supported (messages are text)", who);
