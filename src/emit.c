@@ -13174,6 +13174,21 @@ static void emit_class(Class *c) {
         buf_printf(out, "static void %s_print(void *p) { xs_print_obj(((%s *)p)->%s); }\n", c->cname, c->cname, c->fields[0].cname);
     } else if (c->cptr) { /* (header-less: never printed, nohdr_compute) */
         buf_printf(out, "static void %s_print(void *p) { (void)p; }\n", c->cname);
+    } else if (c->mod && c->mod->file && !strcmp(c->mod->file, "xisto:errors") && !strcmp(c->name, "AggregateError")) {
+        /* as Node prints one (its stack's first line, as xisto prints an Error), its errors below: AggregateError: m {
+           [errors]: [ ... ] } */
+        Field *fm = NULL, *fn = NULL, *fe = NULL;
+        for (int i = 0; i < c->nfields; i++) {
+            if (!strcmp(c->fields[i].name, "message")) fm = &c->fields[i];
+            else if (!strcmp(c->fields[i].name, "name")) fn = &c->fields[i];
+            else if (!strcmp(c->fields[i].name, "errors")) fe = &c->fields[i];
+        }
+        buf_printf(out, "static void %s_print(void *p) {\n    %s *self = p; (void)self;\n", c->cname, c->cname);
+        if (fm && fn && fe && fe->type->kind == TY_ARRAY) {
+            buf_printf(out, "    xs_print_str(self->%s); fputs(\": \", XS_OUT); xs_print_str(self->%s);\n", fn->cname, fm->cname);
+            buf_printf(out, "    fputs(\" {\\n  [errors]: \", XS_OUT); xs_print_arr_%s(self->%s); fputs(\"\\n}\", XS_OUT);\n", arr_print_suffix(fe->type), fe->cname);
+        }
+        buf_puts(out, "}\n");
     } else {
     /* Node-style printing: Name { a: 1, s: 'x' } */
     buf_printf(out, "static void %s_print(void *p) {", c->cname);

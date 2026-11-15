@@ -1891,6 +1891,10 @@ static void xs_print_any_quoted(void *p);
 /* console.log(err): its first line; a cause as Node prints it below the stack ("{\n  [cause]: ...\n}") */
 static void xs_Error_print(void *p) {
     xs_Error *e = p;
+    if (e->f___thrown && e->f_name && e->f_name->len == 14 && memcmp(e->f_name->data, "AggregateError", 14) == 0) {
+        xs_type_of(e->f___thrown)->print(e->f___thrown); /* (a thrown AggregateError: printed with its errors) */
+        return;
+    }
     xs_print_str(e->f_name); fputs(": ", XS_OUT); xs_print_str(e->f_message);
     if (e->f_cause) { fputs(" {\n  [cause]: ", XS_OUT); xs_print_any_quoted(e->f_cause); fputs("\n}", XS_OUT); }
 }
@@ -2168,6 +2172,7 @@ typedef struct xs_map {
                      high), read only by the counting idiom (xs_map_add_i) and put; anything else widens it first */
     int val_kind; /* 0 num, 1 int, 2 bool, 3 heap pointer */
     bool ukeys;   /* a Set<unknown>: string keys made from the elements (SameValueZero), each entry's value the element */
+    bool nullproto; /* a record of Object.groupBy: printed as Node prints an object without prototype */
     void (*print_key)(void *);
     void (*print_val)(void *);
     xs_str *lk;   /* the last string key hashed, held, and its hash: has(k), get(k), set(k, ...) in a row hash once */
@@ -2278,11 +2283,11 @@ static void xs_print_key_ident(xs_str *k) { /* an object key as Node shows it: b
     }
     if (ident) fwrite(k->data, 1, (size_t)k->len, XS_OUT); else xs_print_str_quoted_(k);
 }
-static void xs_print_map(void *p) {
+XS_NOINLINE void xs_print_map(void *p) {
     xs_map *m = p;
     xs_insp fr;
     if (m->record) {
-        if (!xs_insp_begin(&fr, p, "Object", m->count ? NULL : "{}")) return;
+        if (!xs_insp_begin(&fr, p, "Object", m->count ? NULL : m->nullproto ? "[Object: null prototype] {}" : "{}")) return;
         xs_map_entry *e;
         XS_MAP_EACH(m, e) {
             xs_insp_entry(&fr);
@@ -2291,7 +2296,7 @@ static void xs_print_map(void *p) {
             if (m->val_kind == 3) { if (e->val.p) m->print_val(e->val.p); else fputs("null", XS_OUT); }
             else m->print_val(&e->val);
         }
-        xs_insp_end(&fr, "{", "}", false, false, false);
+        xs_insp_end(&fr, m->nullproto ? "[Object: null prototype] {" : "{", "}", false, false, false);
         return;
     }
     if (!xs_insp_begin(&fr, p, m->is_map ? "Map" : "Set", m->count ? NULL : m->is_map ? "Map(0) {}" : "Set(0) {}")) return;
@@ -2325,6 +2330,8 @@ static void xs_map_alloc(xs_map *m, size_t cap) {
 }
 
 static inline xs_map *xs_map_rec(xs_map *m) { m->record = true; return m; } /* (a Record<string, V>: see xs_map.record) */
+/* Object.groupBy's record (a new one, borrowed here): the same object, counted once more for its new owner */
+static inline xs_map *xs_map_nullproto(xs_map *m) { m->nullproto = true; return xs_retain(m); }
 static xs_map *xs_map_new(int is_map, int str_keys, int val_kind, void (*print_key)(void *), void (*print_val)(void *)) {
     xs_map *m = xs_obj_alloc(sizeof *m, xs_map_free, xs_print_map);
     m->is_map = is_map != 0;
@@ -9224,7 +9231,11 @@ XS_NOINLINE xs_big *xs_big_from_int(int64_t v) {
 }
 XS_NOINLINE xs_big *xs_big_from_num(double v) {
     if (!isfinite(v) || trunc(v) != v) {
-        xs_panicf("RangeError: The number %s cannot be converted to a BigInt because it is not an integer", xs_str_from_num(v)->data);
+        xs_str *t = xs_str_from_num(v); /* (the text released before the panic: nothing is left alive) */
+        char num[64];
+        snprintf(num, sizeof num, "%s", t->data);
+        xs_release(t);
+        xs_panicf("RangeError: The number %s cannot be converted to a BigInt because it is not an integer", num);
     }
     int e;
     double m = frexp(fabs(v), &e); /* |v| = m * 2^e, 0.5 <= m < 1 */
@@ -9238,6 +9249,9 @@ XS_NOINLINE xs_big *xs_big_from_num(double v) {
     b->neg = v < 0;
     return xs_big_norm(b);
 }
+
+/* xisto:builtins' __xs_throw("RangeError: ..."): an Error of that name, as the runtime raises its own */
+XS_NOINLINE void xs_throw_str(xs_str *msg) { xs_panicf("%s", msg->data); }
 
 /* |a| <=> |b| */
 static int xs_big_mag_cmp(const xs_big *a, const xs_big *b) {
