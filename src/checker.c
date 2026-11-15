@@ -11263,6 +11263,12 @@ static void check_expr_in(Expr *e, Type *expected) {
             }
             xs_error(XS8015, e->pos, "Object.keys, values and entries take a Record<string, V> (and keys, an object)", "Object.%s of %s is not supported", e->str, ty_name(ot));
         }
+        if (e->str && e->lhs->kind == E_IDENT && strcmp(e->lhs->str, "process") == 0 && !e->is_call && find_class("XistoStdio") && !lookup("process") &&
+            (!strcmp(e->str, "stdin") || !strcmp(e->str, "stdout") || !strcmp(e->str, "stderr"))) {
+            /* process.stdin, and process.stdout / process.stderr as streams: XistoStdio.X() (runtime/node/tty.ts) */
+            e->is_call = true;
+            e->lhs = mk_ident(e->lhs->pos, "XistoStdio");
+        }
         if (e->str && find_class("XistoProcess") && !lookup("process")) {
             /* process.X beyond the members built in below (argv, env, pid, cwd, exit, stdout/stderr.write): XistoProcess.X,
                from xisto:process (runtime/node/process.ts); process.hrtime.bigint() and process.memoryUsage.rss() too */

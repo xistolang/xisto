@@ -4071,6 +4071,156 @@ XS_NOINLINE void xs_wt_listen_start(xs_wq *q, xs_closure **cb, uint8_t *kind, xs
     xs_ready_push(co); /* it starts when the loop runs: after the code that set the listener up */
 }
 #endif
+/* ---- process.stdin and node:tty (runtime/node/tty.ts) ----
+   A read of a stream on a descriptor (stdin) is a coroutine: it waits until the descriptor is readable (a pipe, a
+   socket, a terminal; a file or /dev/null is read at once, as epoll cannot wait on them), reads one chunk into the
+   caller's buffer and calls back with the count (0: the end, < 0: -errno). While it is pending it keeps the program
+   alive, as a flowing stdin does in Node; xs_fd_read_cancel lets it go (pause()). The descriptor is not made
+   non-blocking (it is shared with the parent shell): a read comes only after the wait says there is data. */
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+#endif
+typedef struct xs_fdrd { int fd; bool stop, parked; xs_closure *cb; xs_Uint8Array *buf; xs_coro *co; struct xs_fdrd *next; } xs_fdrd;
+static XS_TLS xs_fdrd *xs_fdrds; /* the reads in flight */
+static bool xs_fd_pollable(int fd) {
+#if defined(_WIN32)
+    return false;
+#else
+    struct stat st;
+    if (fstat(fd, &st) != 0) return false;
+    return S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode) || (S_ISCHR(st.st_mode) && isatty(fd));
+#endif
+}
+XS_NOINLINE bool xs_fd_is_stream(int64_t fd) { return xs_fd_pollable((int)fd); } /* (a pipe, a socket, a terminal) */
+XS_NOINLINE void xs_fd_read_run(void *p) {
+    xs_fdrd *r = p;
+    if (r->stop) return;
+    ssize_t n;
+    for (;;) {
+        if (xs_fd_pollable(r->fd)) {
+            r->parked = true;
+            xs_wait_fd(r->fd, EVFILT_READ);
+            r->parked = false;
+            if (r->stop) return;
+        }
+        n = read(r->fd, r->buf->data, (size_t)r->buf->f_length);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && errno == EAGAIN) continue; /* (someone made it non-blocking: wait again) */
+        break;
+    }
+    for (xs_fdrd **pp = &xs_fdrds; *pp; pp = &(*pp)->next) /* done: a read the callback starts is a new one */
+        if (*pp == r) { *pp = r->next; break; }
+    int64_t res = n < 0 ? -(int64_t)errno : (int64_t)n;
+    size_t mark = xs_ar_mark();
+    if (xs_uncaught_hook) { /* (process.on('uncaughtException'): a throwing 'data' listener does not end the reads) */
+        jmp_buf jb;
+        xs_try_push(&jb);
+        if (_setjmp(jb) == 0) {
+            ((void (*)(void *, int64_t))r->cb->fn)(r->cb, res);
+            xs_try_pop();
+        } else {
+            void *err = xs_caught();
+            if (!xs_uncaught_cb || !xs_uncaught_call(err, "uncaughtException")) xs_uncaught_print(err, 1);
+            xs_release(err);
+        }
+    } else ((void (*)(void *, int64_t))r->cb->fn)(r->cb, res);
+    xs_ar_drain(mark);
+}
+static void xs_fd_read_done(xs_coro *co) {
+    xs_fdrd *r = co->arg;
+    xs_tasks_live--;
+    xs_coro_recycle(co);
+    for (xs_fdrd **pp = &xs_fdrds; *pp; pp = &(*pp)->next)
+        if (*pp == r) { *pp = r->next; break; }
+    xs_release(r->cb);
+    xs_release(r->buf);
+    free(r);
+}
+XS_NOINLINE void xs_fd_read_start(int64_t fd, xs_Uint8Array *buf, xs_closure *cb) {
+    if (xs_kq < 0) xs_kq = kqueue();
+    xs_fdrd *r = calloc(1, sizeof *r);
+    r->fd = (int)fd;
+    r->cb = xs_retain(cb);
+    r->buf = xs_retain(buf);
+    r->next = xs_fdrds;
+    xs_fdrds = r;
+    xs_coro *co = xs_coro_new_shared(xs_fd_read_run, r);
+    r->co = co;
+    co->on_done = xs_fd_read_done;
+    xs_tasks_live++;
+    xs_exit_hook = xs_tasks_drain;
+    xs_ready_push(co);
+}
+/* the read in flight on fd ends without calling back (true when there was one) */
+XS_NOINLINE bool xs_fd_read_cancel(int64_t fd) {
+    for (xs_fdrd **pp = &xs_fdrds; *pp; pp = &(*pp)->next) {
+        xs_fdrd *r = *pp;
+        if (r->fd != (int)fd) continue;
+        *pp = r->next;
+        r->next = NULL;
+        r->stop = true;
+        if (r->parked) xs_ready_push(r->co); /* (waiting on the descriptor: woken, it stops watching it and ends) */
+        return true;
+    }
+    return false;
+}
+XS_NOINLINE bool xs_tty_isatty(int64_t fd) {
+#if defined(_WIN32)
+    return _isatty((int)fd) != 0;
+#else
+    return fd >= 0 && isatty((int)fd) == 1;
+#endif
+}
+/* [columns, rows] of the terminal on fd (empty: not a terminal) */
+XS_NOINLINE xs_arr_int *xs_tty_size(int64_t fd) {
+    xs_arr_int *a = xs_arr_int_new(0, 0);
+#if !defined(_WIN32)
+    struct winsize ws;
+    if (ioctl((int)fd, TIOCGWINSZ, &ws) == 0) {
+        xs_arr_int_push(a, ws.ws_col);
+        xs_arr_int_push(a, ws.ws_row);
+    }
+#endif
+    return a;
+}
+#if !defined(_WIN32)
+static struct termios xs_tty_orig;
+static int xs_tty_orig_fd = -1;
+static void xs_tty_restore(void) { if (xs_tty_orig_fd >= 0) tcsetattr(xs_tty_orig_fd, TCSANOW, &xs_tty_orig); }
+#endif
+/* setRawMode: raw (no echo, no line discipline, no signals from keys) or back to the mode it had; 0 or the errno */
+XS_NOINLINE int64_t xs_tty_set_raw(int64_t fd, bool raw) {
+#if defined(_WIN32)
+    return ENOTTY;
+#else
+    if (xs_tty_orig_fd < 0) {
+        if (tcgetattr((int)fd, &xs_tty_orig) != 0) return errno;
+        xs_tty_orig_fd = (int)fd;
+        atexit(xs_tty_restore); /* (the terminal is given back as it was, as libuv does) */
+    }
+    struct termios t = xs_tty_orig;
+    if (raw) { /* (libuv's UV_TTY_MODE_RAW) */
+        t.c_iflag &= ~(tcflag_t)(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+        t.c_oflag |= ONLCR;
+        t.c_cflag |= CS8;
+        t.c_lflag &= ~(tcflag_t)(ECHO | ICANON | IEXTEN | ISIG);
+        t.c_cc[VMIN] = 1;
+        t.c_cc[VTIME] = 0;
+    }
+    return tcsetattr((int)fd, TCSADRAIN, &t) == 0 ? 0 : errno;
+#endif
+}
+/* a chunk written to stdout or stderr by their streams (tty.WriteStream): the same FILEs as console.log */
+XS_NOINLINE void xs_tty_write(int64_t fd, xs_Uint8Array *b) {
+    xs_out_drain();
+    fwrite(b->data, 1, (size_t)b->f_length, fd == 2 ? stderr : XS_OUT);
+    if (fd == 2) fflush(stderr);
+}
+/* on a terminal what the stream wrote shows now (a prompt has no newline) */
+XS_NOINLINE void xs_tty_flush(int64_t fd) { xs_out_drain(); fflush(fd == 2 ? stderr : XS_OUT); }
+
 /* ---- setTimeout / setInterval (Node's globals): each timer is a coroutine on the event loop. It starts when the
    loop runs (a server's, or the one the program's exit waits on), sleeps, then calls its callback; an interval goes
    on until clearInterval. Like Node, a pending timer keeps the program alive. */
