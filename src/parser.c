@@ -3435,6 +3435,7 @@ static void parse_generic_rest(Parser *p, Func *f, bool method) {
         f->gen_subst = subst_save();
         tp_push(f->tparams, f->ntparams);
     }
+    Parser pv_st = *p; /* (a function not async declared Promise<T>: kept below, for its promise version, XB-231) */
     if (method) parse_params_ex(p, f, false);
     else parse_params(p, f);
     if (!at(p, TK_COLON) && (at(p, TK_LBRACE) || (f->gen_arrow && at(p, TK_ARROW))) && !f->is_gen) {
@@ -3447,6 +3448,11 @@ static void parse_generic_rest(Parser *p, Func *f, bool method) {
         const char *rfrom = p->tok.start;
         f->ret = parse_type(p);
         f->ret_src = span(p, rfrom);
+        if (!method && !f->ntparams && !f->is_async && !f->is_gen && !f->gen_arrow && f->ret_src && !strncmp(f->ret_src, "Promise<", 8)) {
+            Parser *st = xs_alloc(sizeof *st);
+            *st = pv_st;
+            f->pv_state = st;
+        }
     }
     if (!method && !f->gen_arrow && at(p, TK_SEMI)) { /* function f<A>(a: A): R;  an overload signature */
         next(p);
@@ -3507,6 +3513,25 @@ Func *xs_parse_instance(Func *tmpl, Type **args) {
     subst_types = st;
     nsubst = sk;
     return f;
+}
+
+/* XB-231: f (not async, declared Promise<T>) parsed again, as the function its promise version is made from */
+Func *xs_parse_promise_version(Func *f) {
+    Func *v;
+    if (f->template_of) v = xs_parse_instance(f->template_of, f->inst_args);
+    else {
+        Parser p = *(Parser *)f->pv_state;
+        v = xs_alloc(sizeof *v);
+        v->pos = f->pos;
+        v->name = f->name;
+        v->mod = f->mod;
+        v->exported = f->exported;
+        parse_generic_rest(&p, v, false);
+    }
+    v->template_of = NULL;
+    v->pv_state = NULL;
+    v->pv_of = f;
+    return v;
 }
 
 /* member modifiers: public, private, protected, override are accepted; static, abstract and readonly are kept */
