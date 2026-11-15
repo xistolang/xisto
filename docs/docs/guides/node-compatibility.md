@@ -34,7 +34,12 @@ Available modules include:
 - `async_hooks` (`AsyncLocalStorage`)
 - `buffer` (`Buffer`, also a global; see [Buffer](#buffer))
 - `sqlite`
+- `assert` and `assert/strict` (see [assert](#assert)), `test` (see [test](#test)), `perf_hooks` (see
+  [performance](#performance))
 - timers, and more
+
+The globals `globalThis`, `crypto`, `console` and `performance` are described in [globalThis and the global
+crypto](#globalthis-and-the-global-crypto), [console](#console) and [performance](#performance).
 
 The output of `console.log`, value formatting and error messages follow Node's, and errors carry Node-style stack
 traces.
@@ -537,6 +542,152 @@ Differences from Node:
 Strings inside objects are quoted as Node quotes them: `'...'`, or `"..."` when the string has a `'`, or `` `...` ``
 when it has both; `\`, tabs, `\r` and other control characters are escaped (`\x1B`). A long string with line
 breaks inside an object is printed one line per piece, joined by `+`, as Node does.
+
+## console
+
+`console.log`, `info`, `debug` (stdout), `error` and `warn` (stderr) are the compiler's own, as before. The rest is
+`runtime/node/console.ts`, loaded only by a program that names one of them:
+
+- `console.time(label?)`, `timeLog(label?, ...data)`, `timeEnd(label?)`: `label: 1.234ms` in Node's format
+  (`1.500s`, `1:02.345 (m:ss.mmm)` for longer times);
+- `console.count(label?)` (`default: 1`), `countReset(label?)`;
+- `console.group(...label)`, `groupCollapsed`, `groupEnd`: everything printed by `console.log`, `info`, `debug`,
+  `error`, `warn`, `dir`, `table`, `count`, `timeEnd`... inside a group is indented by two spaces per level, each
+  line of a multi-line text too;
+- `console.table(data, columns?)`: Node's box-drawing table for arrays of objects, of primitives and of arrays,
+  and for objects of objects (the `(index)` column, a `Values` column for primitives, the `columns` filter);
+  cells are inspected as Node does (depth 0, at most three array items, an object of more than two keys as
+  `[Object]`), and wide East Asian characters count as two columns; anything else is printed as `console.log`;
+- `console.dir(value, { depth })` (`depth: null` for every level), `dirxml`;
+- `console.assert(value, ...message)`: `Assertion failed` or `Assertion failed: message` to stderr;
+- `console.trace(...message)`: `Trace: message` and the stack to stderr.
+
+Differences from Node:
+
+- `console.log` keeps its emitted code and its stdout fast path. Only a program that names `console.group` or
+  `console.groupCollapsed` emits each `console.log` between a begin/end pair that, inside a group, prints the
+  line into memory and writes it indented: a program that never groups pays nothing;
+- `console.trace` prints xisto's stack frames (`at file.ts:3:5`), not Node's;
+- `console.table` takes arrays and objects; `Map`, `Set` and iterators print as `console.log` does. An array of
+  objects of different shapes must be typed (`const rows: any[] = [...]`); its values take the dynamic path;
+- the warnings for a label that is not there (`timeEnd`, `timeLog`, `countReset`) and for a `time` label used
+  twice are written as Node's process warnings (`(node:PID) Warning: ...`, after the current task), without a
+  `'warning'` event on `process`.
+
+## performance
+
+`performance.now()` is the compiler's own (one clock read). The rest of User Timing is
+`runtime/node/perf_hooks.ts`, also through `import { performance } from "node:perf_hooks"` (the same global
+object; importing only `performance` loads nothing):
+
+- `performance.mark(name, { detail, startTime }?)` returns a `PerformanceMark` (`name`, `entryType: "mark"`,
+  `startTime`, `duration: 0`, `detail`);
+- `performance.measure(name, startMark?, endMark?)` or `measure(name, { start, end, duration, detail })` (marks by
+  name or times) returns a `PerformanceMeasure`; a mark that was not set throws `The "x" performance mark has not
+  been set`;
+- `getEntries()` (in `startTime` order), `getEntriesByName(name, type?)`, `getEntriesByType(type)`,
+  `clearMarks(name?)`, `clearMeasures(name?)`, `timeOrigin` and `toJSON()`;
+- `PerformanceEntry`, `PerformanceMark`, `PerformanceMeasure` from `node:perf_hooks`, for `instanceof`.
+
+Differences from Node: the clock starts at the program's start (Node's `now()` also counts its own startup, some
+tens of milliseconds); `toJSON()` gives `{ timeOrigin }` only; the missing-mark error is a `SyntaxError` (Node: a
+`DOMException` named `SyntaxError`); `performance` is not a value (it cannot be passed around or compared); no
+`PerformanceObserver`, `timerify`, `eventLoopUtilization`, `nodeTiming` or resource timing.
+
+## globalThis and the global crypto
+
+`globalThis.X` reads the standard global `X` (`globalThis.setTimeout(...)`, `globalThis.crypto.randomUUID()`,
+`globalThis.process.platform`, `new globalThis.URL(...)`): it is read as `X`. The feature checks are constants
+known when the program is compiled, with Node's answers:
+
+```ts
+typeof globalThis.fetch !== "undefined"; // true
+typeof globalThis.Deno; // "undefined"
+"Bun" in globalThis; // false
+typeof window === "undefined"; // true: window, document, self, Deno, Bun... are not Node's globals
+```
+
+`globalThis` holds the fixed set of Node's globals (functions, constructors, `console`, `process`, `crypto`,
+`performance`, `Math`, `JSON`...). What would make it a dynamic object is an error that says so: assigning a
+property (`globalThis.config = ...`, also for a known global: a polyfill), reading a name that is not a global, and
+`globalThis` as a value. A value shared across modules is an exported module variable (`export let config`).
+`typeof` and `in` answer for every Node global, also the ones xisto does not provide (`WebSocket`); using one of
+those still fails where it is used.
+
+The global `crypto` is Web Crypto, as in Node 20+: `crypto.randomUUID()`, `crypto.getRandomValues(bytes)` and
+`crypto.subtle` (`digest` with SHA-1/256/384/512, HMAC `importKey`/`sign`/`verify`/`exportKey`), the same object as
+`import { webcrypto } from "node:crypto"`; a module that imports or declares its own `crypto` keeps it. As with
+node:crypto's `subtle`, `digest` and `sign` give a `Buffer` (Node: an `ArrayBuffer`); `getRandomValues` takes a
+`Uint8Array`; `subtle` has no RSA, ECDSA or AES keys (see [crypto](#crypto)).
+
+## assert
+
+`node:assert` and `node:assert/strict` (`runtime/node/assert.ts`, `assert_strict.ts`), imported as a default (the
+module, also callable: `assert(value)`), as a namespace, by name, or as `import { strict as assert } from
+"node:assert"`:
+
+- `assert(value, message?)` / `ok`, `equal`, `notEqual`, `strictEqual`, `notStrictEqual`, `deepEqual`,
+  `notDeepEqual`, `deepStrictEqual`, `notDeepStrictEqual`, `match`, `doesNotMatch`, `fail`, `ifError`;
+- `throws(fn, expected?, message?)` and `rejects(asyncFn, ...)` with a class (`TypeError`, a class of the
+  program), a `RegExp` (tested against `String(error)`), a validation function, an object whose properties the
+  error must have (compared with `deepStrictEqual`), or a message; `doesNotThrow` and `doesNotReject` (an error
+  of another class than the one given is thrown again);
+- `AssertionError` (`assert.AssertionError` too): `name`, `code: "ERR_ASSERTION"`, `actual`, `expected`,
+  `operator`, `generatedMessage`; `new AssertionError({ actual, expected, operator, message })`.
+
+The messages are Node's: `assert(x > 2)` says `The expression evaluated to a falsy value:\n\n  assert(x > 2)\n` (the
+compiler passes the call's source text), `strictEqual(1, 2)` says `Expected values to be strictly equal:\n\n1 !== 2\n`,
+longer values the stacked `+ actual - expected` form with Node's caret, and objects and arrays Node's line diff
+(Myers, with `...` for skipped lines); `deepEqual`, the `not` forms, `throws`' class, RegExp, validation and
+object checks, `Missing expected exception.`, `Got unwanted exception.` all as Node writes them.
+
+Differences from Node:
+
+- the messages show an object's keys in declaration order (Node sorts them); `undefined` reads as `null`;
+- an uncaught `AssertionError` is printed in xisto's format (`uncaught Error: Expected values...` and the stack;
+  Node prints the error object with its properties); the exit status is 1 in both;
+- `deepEqual` compares primitives with `==` and objects by their own keys, without Node's other loose rules
+  (prototypes are not compared in either); in an object given to `throws`, a `RegExp` value is compared as a
+  value, not tested against the string;
+- `assert.strict.x(...)` (a member of a member) is not supported: import `node:assert/strict`, or `{ strict }`;
+  `fail(error)` takes an `Error` (not an instance of a subclass); the messages are `string`s (an `Error` as the
+  message of `ok`/`equal`... is thrown as it is);
+- no `CallTracker`, `partialDeepStrictEqual` or `assert.Assert` instances.
+
+## test
+
+`node:test` (`runtime/node/test.ts`): a program that registers tests runs them after its module body, one at a
+time, and prints Node's default reporter (spec) to stdout, as `node file.ts` does; the exit status is 1 when a test
+fails.
+
+- `test(name, fn)`, `test(name, options, fn)`, `it`, `describe`/`suite` (the suite's body runs at once and
+  registers its tests and hooks), `before`, `after`, `beforeEach`, `afterEach` (in Node's order, inner suites'
+  `beforeEach` after the outer ones');
+- `test.skip`, `test.todo`, `test.only`, `it.skip`..., `describe.skip`..., and the options `{ skip, todo, only }`
+  (`true` or a reason); with `only` in a file, the other tests of that level do not run and are not reported, as
+  Node 26 does without `--test-only`;
+- async tests, subtests (`await t.test(name, fn)`), `t.name`, `t.diagnostic(message)`, `t.skip(message?)`,
+  `t.todo(message?)`;
+- the output: `✔ name (0.5ms)`, `✖`, `﹣ ... # SKIP`, `# TODO`, `⚠` for a todo that throws, `▶ suite` headers with
+  the children indented, `ℹ` diagnostics, the summary (`ℹ tests`, `suites`, `pass`, `fail`, `cancelled`,
+  `skipped`, `todo`, `duration_ms`) and the `✖ failing tests:` section (`test at file.ts:12:1`, the result line and
+  the error).
+
+`xisto test` builds and runs each `*.test.ts` as a program and reports it as failed when it exits with an error:
+a file that uses `node:test` (built with `--node-compat`, or importing `xisto:test`) fails there when one of its
+tests fails, and its output is this reporter's.
+
+Differences from Node:
+
+- the errors in the failing-tests section show xisto's stack frames (`at file.ts:9:10`) and, for an
+  `AssertionError`, its properties with `diff: 'simple'`; an error of a class that extends `Error` is shown
+  without its own extra properties;
+- the reporter's lines are held until the program first waits on the event loop (all of them at the end when no
+  test waits on a timer or I/O), then written as each test ends; Node's reporter stream can place them
+  differently around a test's own `console.log` output;
+- `timeout`, `concurrency` and `signal` are accepted and not applied; no `mock`, `t.plan`, `t.assert`, `t.mock`,
+  snapshot tests, `run()`, reporters other than spec, or the done-callback form; subtests must be awaited;
+- a test function's result is awaited when it is a promise; any other value is ignored.
 
 ## diagnostics_channel
 
