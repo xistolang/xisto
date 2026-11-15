@@ -4794,12 +4794,16 @@ static void parse_import(Parser *p, Module *m) {
         im.n = 1;
         goto from;
     }
-    if (at(p, TK_STRING)) { /* import "x": for its effects on Node; xisto loads nothing for it, but "reflect-metadata", whose
-                               package gives the global Reflect (when the program's packages have it) */
+    if (at(p, TK_STRING)) { /* import "x": for its effects (XB-184): the module is loaded with no names, so its top level
+                               runs where Node runs it (dependencies first, once). A Node core module has no effect to
+                               run; "reflect-metadata" without the package is the built-in Reflect */
         const char *spec = p->tok.str;
+        im.pos = p->tok.pos;
         next(p);
         expect_semi(p);
-        if (!strcmp(spec, "reflect-metadata") && pkg_available(m->path, spec)) {
+        bool core = !strncmp(spec, "node:", 5) || xs_node_core_name(spec);
+        bool builtin_reflect = !strcmp(spec, "reflect-metadata") && !pkg_available(m->path, spec);
+        if (!core && !builtin_reflect) {
             im.path = spec;
             m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
             m->imports[m->nimports++] = im;
