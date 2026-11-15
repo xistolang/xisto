@@ -2959,6 +2959,14 @@ static Binding *lookup(const char *name) {
                 return b;
             }
             mark_used(b);
+            if (nb > 0 && global && b->union_narrow && b->orig) {
+                /* a module variable narrowed out here, read in a callback: it may run after the variable was assigned
+                   another member, so it is seen as declared there (as TypeScript does when it is assigned after) */
+                Binding *d = xs_alloc(sizeof *d);
+                *d = *b;
+                d->origin = b; d->type = b->orig; d->orig = NULL; d->union_narrow = false;
+                return d;
+            }
             if (nb == 0 || global) return b;
             /* capture into each arrow from the outermost boundary inward */
             Binding *cur = b;
@@ -2966,7 +2974,8 @@ static Binding *lookup(const char *name) {
                 Arrow *a = boundaries[i]->arrow;
                 /* (a variable in a cell narrowed here: a callback sees it as declared, as in TypeScript, since it
                    may run after the variable was set to null again) */
-                Type *ctype_ = cell_narrowed(cur) ? cur->orig : cur->type;
+                bool cell_union = cur->union_narrow && cur->cell && cur->orig; /* (a union narrowed here, in a cell: as declared too) */
+                Type *ctype_ = cell_narrowed(cur) || cell_union ? cur->orig : cur->type;
                 Capture *c = add_capture(a, name, cur->cell ? cur->cell : cur->cname, ctype_, false);
                 Binding *nbind = xs_alloc(sizeof *nbind);
                 *nbind = *cur;
@@ -2974,6 +2983,7 @@ static Binding *lookup(const char *name) {
                 nbind->origin = cur;
                 nbind->is_param = false;
                 nbind->orig = NULL;
+                if (cell_union) nbind->union_narrow = false;
                 if (cur->cell) { /* shared with the enclosing function through the cell: reads and writes see each other */
                     c->boxed = true;
                     nbind->cell = xs_sprintf("env->c_%s", cap_cid(name));
@@ -3441,6 +3451,8 @@ static Binding *narrow_target(Expr *cond, bool *not_null);
 static const char *path_key(Expr *m);
 static void upath_read(Expr *e);
 static void upath_invalidate(Expr *target);
+static void assign_unnarrow(Binding *b);
+static Type *objlit_member(Type *u, Expr *lit);
 typedef struct { Binding *b[8]; int n; } NSet;
 static void narrow_set(Expr *c, bool when, NSet *out);
 static void shadow_set(NSet *s);
@@ -8816,6 +8828,15 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (b->union_narrow && b->type->kind != TY_UNION) { /* seen as one member: read through an (unchecked) conversion */
             Expr *v = expr_copy(e);
             v->type = b->orig;
+            /* (a variable in a cell, or a module variable a function assigns: a call made since the test may have assigned
+               another member, as TypeScript does not look; the read is checked, a TypeError then, as a field path's) */
+            if ((b->cell || b->fn_assigned) && b->orig && b->orig->kind == TY_UNION && b->type->kind == TY_OBJECT) {
+                v->prechecked = true;
+                memset(e, 0, sizeof *e);
+                e->kind = E_AS; e->pos = v->pos; e->lhs = v; e->field = -1; e->elem_type = b->type;
+                check_expr(e, NULL);
+                return;
+            }
             memset(e, 0, sizeof *e);
             e->kind = E_AS;
             e->pos = v->pos;
@@ -9789,9 +9810,11 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (e->op != TK_ASSIGN && e->op != TK_PLUS_ASSIGN && e->op != TK_MINUS_ASSIGN && e->op != TK_STAR_ASSIGN && e->op != TK_SLASH_ASSIGN)
                 xs_error(XS8122, e->pos, NULL, "%s is not supported on an Int32Array element", tok_kind_name(e->op));
             e->type = e->op == TK_ASSIGN ? e->rhs->type : (e->rhs->type->kind == TY_NUMBER || e->op == TK_SLASH_ASSIGN) ? ty_number : ty_int;
-            if (narrowed) unnarrow(narrowed);
+            if (narrowed) assign_unnarrow(narrowed);
             return;
         }
+        Expr *assigned_lit = e->op == TK_ASSIGN && e->rhs->kind == E_OBJLIT ? e->rhs : NULL; /* (read before it is checked) */
+        if (assigned_lit) { Expr *c = xs_alloc(sizeof *c); *c = *assigned_lit; assigned_lit = c; }
         check_expr(e->rhs, target->type);
         if (e->op != TK_ASSIGN && is_big(target->type)) { /* acc += x: acc = acc + x (a bigint is a value: a new one) */
             const char *f = big_op(e->op);
@@ -9820,7 +9843,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->rhs = bin;
             e->op = TK_ASSIGN;
             e->type = target->type;
-            if (narrowed) unnarrow(narrowed);
+            if (narrowed) assign_unnarrow(narrowed);
             upath_invalidate(target);
             return;
         }
@@ -9847,8 +9870,19 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         expect_type(e->rhs, target->type, e->op == TK_ASSIGN ? "assigned value" : "right side of compound assignment");
         e->type = target->type;
-        if (narrowed) unnarrow(narrowed);
+        if (narrowed) assign_unnarrow(narrowed);
         upath_invalidate(target);
+        if (target->kind == E_IDENT && e->op == TK_ASSIGN && (assigned_lit || (e->rhs->type && e->rhs->type->kind == TY_OBJECT))) {
+            /* r = { kind: "ok", ... } with r: Ok | Err: r is the Ok from here on, as TypeScript narrows by assignment */
+            Binding *b = lookup(target->str);
+            Type *u = b ? b->type : NULL;
+            if (u && u->kind == TY_UNION && !b->cell && !b->fn_assigned && strncmp(b->cname, "env->", 5) != 0) {
+                Type *m = assigned_lit ? objlit_member(u, assigned_lit) : NULL;
+                for (int i = 0; !m && i < u->nparams; i++)
+                    if (ty_equal(u->params[i], e->rhs->type)) m = u->params[i];
+                if (m) shadow_union(b, m);
+            }
+        }
         if (target->kind == E_IDENT && e->op == TK_ASSIGN && e->rhs->type->kind != TY_NULLABLE && e->rhs->type->kind != TY_NULL &&
             e->rhs->kind != E_NULL && !ty_is_any(e->rhs->type) && e->rhs->type->kind != TY_UNKNOWN) {
             /* as TypeScript: after x = <not null>, x is not null (until it is assigned again) */
@@ -15067,6 +15101,30 @@ static Binding *union_subject(Expr *e) {
     pb->cname = "";
     return pb;
 }
+/* { kind: "ok", value: 1 } for Ok | Err: the one member whose literal fields (kind: "ok", ok: true) the object literal
+   gives those values, or NULL */
+static Type *objlit_member(Type *u, Expr *lit) {
+    if (!lit->keys) return NULL;
+    Type *found = NULL;
+    for (int i = 0; i < u->nparams; i++) {
+        Type *m = u->params[i];
+        if (m->kind != TY_OBJECT || m->cls->builtin) return NULL;
+        bool all = true, any = false;
+        for (int f = 0; f < m->cls->nfields && all; f++) {
+            Field *fd = &m->cls->fields[f];
+            if (!fd->type->tname || (fd->type->kind != TY_STRING && fd->type->kind != TY_BOOLEAN)) continue;
+            any = true;
+            Expr *v = NULL;
+            for (int k = 0; k < lit->args.len; k++) if (lit->keys[k] && !strcmp(lit->keys[k], fd->name)) v = lit->args.items[k];
+            if (!v) all = false;
+            else if (v->kind == E_STRING) all = fd->type->kind == TY_STRING && !strcmp(v->str, fd->type->tname);
+            else if (v->kind == E_BOOL) all = fd->type->kind == TY_BOOLEAN && !strcmp(fd->type->tname, v->boolean ? "true" : "false");
+            else all = false;
+        }
+        if (all && any) { if (found) return NULL; found = m; }
+    }
+    return found;
+}
 /* x = v, o.f = v: the union narrowings of the paths that start there end (as TypeScript's) */
 static void upath_invalidate(Expr *target) {
     Expr *t = upath_strip(target);
@@ -15508,7 +15566,53 @@ static bool cond_as_if(Stmt *s) {
     s->kind = S_IF; s->pos = x->pos; s->cond = c; s->body = ba; s->else_body = bb;
     return true;
 }
+/* ---- a union variable narrowed by a test, assigned inside the region the test narrows (XB-146): from there on it is the
+   declared union again, as in TypeScript. The assignment ends it in its own scope; the kill is kept and, after each
+   statement that holds it ends, applied in the enclosing scope too (so the rest of the region sees the union, while a
+   sibling branch checked before that, the else of the if, keeps the narrowing). A loop whose body assigns it sees the
+   union from its start (the assignment flows back to the top). ---- */
+static struct { Binding *root; Scope *at; } *ukill; /* (at: the scope of the assignment, where its own effect stands) */
+static int nukill, capukill;
+static Binding *b_root(Binding *b) { while (b && b->origin) b = b->origin; return b; }
+static Binding *lookup_here(const char *name) { /* (no capture: stops at the enclosing arrow) */
+    for (Scope *s = scope; s; s = s->parent) {
+        for (Binding *b = s->head; b; b = b->next) if (strcmp(b->name, name) == 0) return b;
+        if (s->arrow) break;
+    }
+    return NULL;
+}
+static void assign_unnarrow(Binding *b) {
+    bool un = b->union_narrow;
+    unnarrow(b);
+    if (!un) return;
+    if (nukill == capukill) { capukill = capukill ? capukill * 2 : 16; ukill = realloc(ukill, sizeof *ukill * (size_t)capukill); }
+    ukill[nukill].root = b_root(b);
+    ukill[nukill++].at = scope;
+}
+static void loop_unnarrow(Stmt *s) {
+    for (Scope *sc = scope; sc; sc = sc->parent) {
+        for (Binding *b = sc->head; b; b = b->next) {
+            if (!b->union_narrow || b->name[0] == '\x01' || lookup_here(b->name) != b) continue;
+            Expr id = {.kind = E_IDENT, .str = b->name, .field = -1};
+            bool assigned = false;
+            io_scan_s(s, &id, NULL, false, &assigned);
+            if (assigned) unnarrow(b);
+        }
+        if (sc->arrow) break;
+    }
+}
+static void check_stmt_one(Stmt *s);
 static void check_stmt(Stmt *s) {
+    if (s->kind == S_WHILE || s->kind == S_FOR || s->kind == S_FOROF) loop_unnarrow(s);
+    int mark = nukill;
+    check_stmt_one(s);
+    for (int i = mark; i < nukill; i++) {
+        if (ukill[i].at == scope) continue;
+        Binding *cur = lookup_here(ukill[i].root->name);
+        if (cur && cur->union_narrow && b_root(cur) == ukill[i].root) unnarrow(cur);
+    }
+}
+static void check_stmt_one(Stmt *s) {
     switch (s->kind) {
     case S_VAR:
         if (s->for_head) { /* for (let i = 0, j = n - 1; ...): the loop's variables, a copy per iteration */
