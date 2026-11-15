@@ -54,11 +54,19 @@
 #define XS_HOST_ARCH "cpu"
 #endif
 #define XS_HOST XS_HOST_OS "-" XS_HOST_ARCH
-#ifdef XS_CLANG_FLAGS
-#define XS_CC_KEY XS_LINK_FLAGS " " XS_CLANG_FLAGS " -O3"
+/* x86-64 release builds start every loop on a 64-byte line. Where a hot loop starts inside its line is decided by
+   whatever code comes before it, so an unrelated change in the runtime moved binary-trees and spectral-norm by 32
+   bytes and cost them 4-8% on the Xeon E5 (Broadwell: one more i-cache line per iteration, another DSB set; the
+   instructions were byte for byte the same). With the loops aligned both sides measured the same, at the faster
+   level; aligning functions too made binary-trees slower. Not on arm64: the Graviton2 and the M4 showed no effect.
+   Cost: ~4.5 KB of padding per program. (15/11/2026, bench/results: the integ-1115 A/B) */
+#define XS_X86_ALIGN " -falign-loops=64"
+#if defined(__x86_64__)
+#define XS_HOST_ALIGN XS_X86_ALIGN
 #else
-#define XS_CC_KEY XS_LINK_FLAGS " " XS_CLANG_FLAGS " -O3"
+#define XS_HOST_ALIGN ""
 #endif
+#define XS_CC_KEY XS_LINK_FLAGS " " XS_CLANG_FLAGS " -O3" XS_HOST_ALIGN
 static bool show_time;
 static double now_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6; }
 
@@ -626,7 +634,7 @@ static void run_cc(const char *cfile, const char *outfile, bool dev) {
     const char *cc = host_cc();
     uint64_t h = fnv(cc_text, cc_len) ^ (fnv(cc, strlen(cc)) * 31) ^ (dev ? 0x9e3779b97f4a7c15ull : 0) ^ (fnv(XS_HOST, strlen(XS_HOST)) * 3) ^
                  (xs_debug ? 0x51afd7ed558ccdull : 0) ^ (link_tls ? 0x2545f4914f6cdd1dull : 0) ^ (link_sqlite ? 0x27d4eb2f165667c5ull : 0) ^ (link_zlib ? 0x85ebca77c2b2ae63ull : 0) ^ (link_crypto ? 0xc2b2ae3d27d4eb4full : 0) ^
-                 (xs_target ? fnv(xs_target, strlen(xs_target)) * 7 : 0) ^ (build_dylib ? 0x165667b19e3779f9ull : 0) ^
+                 (xs_target ? fnv(xs_target, strlen(xs_target)) * 7 : 0) ^ (xs_target && strstr(xs_target, "x86_64") ? fnv(XS_X86_ALIGN, strlen(XS_X86_ALIGN)) * 17 : 0) ^ (build_dylib ? 0x165667b19e3779f9ull : 0) ^
                  fnv(XS_CC_KEY, strlen(XS_CC_KEY)) * 11 ^ /* the compiler flags this xisto passes: a new set rebuilds */
                  (xs_cpu ? fnv(xs_cpu, strlen(xs_cpu)) * 13 : 0);
     char *hit = xs_sprintf("%s/%016llx", cache, (unsigned long long)h);
@@ -891,6 +899,7 @@ static void run_cc_target(const char *cfile, const char *outfile, bool dev) {
         tls_extra = xs_sprintf("-I%s %s", xs_q(xs_sprintf("%s/inc", src)), xs_q(lib));
     }
     const char *flags = xs_debug ? "-O0 -g" : dev ? "-O0" : "-O3"; /* (as on the host, run_cc_raw) */
+    if (!dev && !xs_debug && strstr(xs_target, "x86_64")) flags = xs_sprintf("%s%s", flags, XS_X86_ALIGN);
     char *extra = "";
     if (link_sqlite) {
         char *dir = tdir;
@@ -940,6 +949,7 @@ static void run_cc_raw(const char *cfile, const char *outfile, bool dev) {
         flags = xs_sprintf("%s -march=%s", flags, xs_cpu);
 #endif
     }
+    if (!dev && !xs_debug) flags = xs_sprintf("%s%s", flags, XS_HOST_ALIGN);
     /* JS semantics are strict IEEE 754: no fused multiply-add. */
 #ifdef XS_CLANG_FLAGS
     if (cc_is_clang(cc)) flags = xs_sprintf("%s %s", flags, XS_CLANG_FLAGS);
