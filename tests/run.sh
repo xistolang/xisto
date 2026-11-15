@@ -238,7 +238,7 @@ for f in tests/qbe/*.ts; do
 done
 # --dev (the runtime as a library, tools/rtsplit.py): a few programs must build and print what Node prints. Nothing
 # else in the suite builds with --dev, and a runtime comment once broke every --dev build unnoticed
-for n in arrays classes closures-ref nullish write-behind xisto-collections; do
+for n in arrays classes closures-ref nullish write-behind xisto-collections dev-timers; do
     f=tests/ok/$n.ts
     [ -f "$f" ] && [ -f "$OUT/$n.node" ] || continue
     if $XISTO run --dev "$f" < /dev/null > "$OUT/$n.dev" 2>&1 && cmp -s "$OUT/$n.node" "$OUT/$n.dev"; then pass=$((pass+1)); else echo "FAIL --dev $f"; head -5 "$OUT/$n.dev"; fail=$((fail+1)); fi

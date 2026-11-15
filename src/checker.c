@@ -1401,6 +1401,28 @@ static void check_promise(Expr *e, Type *expected) {
             xs_error(XS8090, a->pos, "give the promises one type", "Promise.race of these promises: their values are of types that are not objects");
         }
     }
+    if (race && a->kind == E_ARRAY_LIT && !a->spread && a->args.len > 0) {
+        /* Promise.race([stored, wait]) of promises kept in variables, all of one type: the race is on them, as an array kept
+           (XB-162). A task awaiting each would stay parked on a loser that never settles (its timer cleared) */
+        Type *u = NULL;
+        bool kept = true;
+        for (int i = 0; i < a->args.len && kept; i++) {
+            Expr *x = a->args.items[i];
+            Binding *b = x->kind == E_IDENT && x->str ? lookup(x->str) : NULL;
+            Type *bt = b && b->type ? b->type : NULL;
+            kept = bt && bt->kind == TY_PROMISE && bt->elem->kind != TY_VOID && (!u || ty_equal(u, bt->elem));
+            if (kept) u = bt->elem;
+        }
+        if (kept) {
+            check_expr(a, ty_array_of(ty_promise_of(u)));
+            if (a->type->kind == TY_ARRAY && a->type->elem->kind == TY_PROMISE && ty_equal(a->type->elem->elem, u)) {
+                e->builtin.cfn = "promise_race_arr";
+                e->elem_type = u;
+                e->type = u;
+                return;
+            }
+        }
+    }
     if (a->kind == E_ARRAY_LIT && !a->spread) { /* each element a task (with a spread, [p, ...ps.map(f)]: an array of promises, below) */
         if (a->args.len == 0) xs_error(XS7031, a->pos, NULL, "Promise.%s of an empty list", m);
         Type *t = NULL;
@@ -4006,6 +4028,8 @@ static bool pr_async_call(Expr *e) {
     if (!pr_is_call(e)) return false;
     if (e->func && (e->func->ret_promise || e->func->is_async)) return true;
     if (e->kind == E_CALL && !e->func && !e->builtin.cfn && e->lhs && e->lhs->type && e->lhs->type->kind == TY_FUNC && e->lhs->type->async_ret) return true;
+    /* const p = Promise.all(xs.map(f)): the group runs on a coroutine of its own and p is its promise (XB-171) */
+    if (e->builtin.cfn && (!strcmp(e->builtin.cfn, "promise_all_map") || !strcmp(e->builtin.cfn, "promise_race_map"))) return true;
     return false;
 }
 static void pr_spawn(Expr *e) { /* the call e (checked), kept as a promise */
@@ -9859,6 +9883,16 @@ static void check_expr_in(Expr *e, Type *expected) {
                 prog->uses_net = true;
                 return;
             }
+            if (strcmp(name, "__xs_promises_handled") == 0 && e->args.len == 1 && cur_mod && cur_mod->file && !strcmp(cur_mod->file, "xisto:settled")) {
+                /* (xisto:settled: every promise of Promise.allSettled(ps) handled before its outcomes are read, XB-204) */
+                check_expr(e->args.items[0], NULL);
+                Type *at = ty_strip_null(e->args.items[0]->type);
+                if (at->kind != TY_ARRAY || at->elem->kind != TY_PROMISE) xs_error(XS7033, e->pos, NULL, "internal: __xs_promises_handled takes an array of promises");
+                e->type = ty_void;
+                e->builtin.cfn = "xs_promises_handled";
+                prog->uses_net = true;
+                return;
+            }
             if (strcmp(name, "clearImmediate") == 0) name = "clearTimeout";
             if (strcmp(name, "setTimeout") == 0 || strcmp(name, "setInterval") == 0) { /* Node's timers: a callback later, on the event loop */
                 if (e->args.len != 2) xs_error(XS8035, e->pos, xs_sprintf("%s(() => { ... }, ms)", name), "%s takes a callback and a delay in milliseconds", name);
@@ -9876,6 +9910,14 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (strcmp(name, "clearTimeout") == 0 || strcmp(name, "clearInterval") == 0) {
                 if (e->args.len != 1) xs_error(XS8035, e->pos, NULL, "%s takes the timer's id", name);
                 check_expr(e->args.items[0], ty_number);
+                Type *idt = e->args.items[0]->type;
+                if (idt->kind == TY_NULLABLE && (idt->elem->kind == TY_INT || idt->elem->kind == TY_NUMBER)) {
+                    /* let timer: ReturnType<typeof setTimeout> | undefined: clearTimeout(timer) of none does nothing, as Node */
+                    e->type = ty_void;
+                    e->builtin.cfn = idt->elem->kind == TY_INT ? "xs_clear_timer_ni" : "xs_clear_timer_nn";
+                    prog->uses_net = true;
+                    return;
+                }
                 if (e->args.items[0]->type->kind == TY_LITINT) coerce_lit(e->args.items[0], ty_number);
                 expect_type(e->args.items[0], ty_number, "the timer's id");
                 e->type = ty_void;

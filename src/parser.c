@@ -4508,6 +4508,16 @@ static void alias_collisions(Parser *p, Module *m, int first, Import *im) {
         if (strstr(p->alias_to[i], "__local")) continue;
         alias_recs = realloc(alias_recs, sizeof(AliasRec) * (size_t)(nalias_recs + 1));
         alias_recs[nalias_recs++] = (AliasRec){m, i, p->alias_to[i], im->path};
+        /* XB-206: import { setTimeout as sleep } from "node:timers/promises": the global setTimeout(cb, ms) stays the
+           global (the import only names `sleep`), so the alias reads as qualified, as next to another import */
+        static const char *const globals[] = {"setTimeout", "setInterval", "setImmediate", "clearTimeout", "clearInterval", "clearImmediate", NULL};
+        bool global = false;
+        for (int g = 0; globals[g]; g++) if (strcmp(p->alias_to[i], globals[g]) == 0) global = true;
+        if (global && !strchr(p->alias_to[i], '\x01')) {
+            mark_qualified(m, im->path, p->alias_to[i]);
+            p->alias_to[i] = xs_sprintf("%s\x01%s", p->alias_to[i], im->path);
+            continue;
+        }
         for (int k = 0; k + 1 < m->nimports; k++)
             for (int j = 0; j < m->imports[k].n; j++)
                 if (strcmp(m->imports[k].names[j], p->alias_to[i]) == 0 && m->imports[k].path && strcmp(m->imports[k].path, im->path) != 0) {
@@ -5824,6 +5834,7 @@ static const char xs_settled_src[] =
     "}\n"
     "export async function __xs_allSettledVoid(ps: Promise<void>[]): Promise<PromiseSettledResult<unknown>[]> {\n"
     "  const out: PromiseSettledResult<unknown>[] = [];\n"
+    "  __xs_promises_handled(ps); // (a later one may reject while an earlier one is awaited)\n"
     "  for (const p of ps) {\n"
     "    try {\n"
     "      await p;\n"
@@ -5836,6 +5847,7 @@ static const char xs_settled_src[] =
     "}\n"
     "export async function __xs_allSettled<T>(ps: Promise<T>[]): Promise<PromiseSettledResult<T>[]> {\n"
     "  const out: PromiseSettledResult<T>[] = [];\n"
+    "  __xs_promises_handled(ps); // (a later one may reject while an earlier one is awaited)\n"
     "  for (const p of ps) {\n"
     "    try {\n"
     "      const v = await p;\n"

@@ -38,8 +38,6 @@ instead. Intended differences are in [Divergences from TypeScript](./divergences
 
 ## Tools
 
-- `--dev` builds of programs that use `setTimeout`, `setInterval` or `clearInterval` currently fail in the C
-  compiler; build without `--dev`.
 - The `qbe` backend covers numbers, strings, arrays, classes, interfaces and control flow; it has no closures,
   `Map`/`Set`, streams, exceptions or networking (XS6001). The default C backend has none of these limits.
 - No language server: editors get the debugger only.
