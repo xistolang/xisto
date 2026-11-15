@@ -48,7 +48,8 @@ async function main(): Promise<void> {
   console.log(await text(a, "/two"));
   console.log(await text(m, "/metrics"));
   const both = await Promise.all([text(a, "/x"), text(m, "/y"), text(a, "/z", "zz")]);
-  console.log("at once:", both.join(" | "));
+  // (the metrics request races the app ones, so its count depends on which arrives first)
+  console.log("at once:", both.join(" | ").replace(/hits \d+/, "hits n"));
   console.log("socket:", (await new Promise<string>((resolve) => {
     const s = http.createServer((req, res) => {
       res.end("ok");
