@@ -2658,8 +2658,9 @@ static void emit_promise(Expr *e) {
         emit_borrowed(e->args.items[0]);
         buf_puts(out, "; ");
         if (fn[8] == 'r') {
-            buf_printf(out, "xs_promise *pw%d_ = xs_promise_race_arr(pa%d_); %s pr%d_ = (%s)xs_promise_await_%s(pw%d_); xs_release(pw%d_); pr%d_; })",
-                       id, id, ctype(t), id, ctype(t), sf, id, id, id);
+            /* (the race's promise in the arena: a rejection thrown by the await lets it go too, XB-231) */
+            buf_printf(out, "xs_promise *pw%d_ = xs_ar(xs_promise_race_arr(pa%d_)); %s pr%d_ = (%s)xs_promise_await_%s(pw%d_); pr%d_; })",
+                       id, id, ctype(t), id, ctype(t), sf, id, id);
             return;
         }
         /* (XB-204: first all settled, or the first rejection, with every promise handled meanwhile; then the values) */
