@@ -246,12 +246,21 @@ static bool looks_like_fn_type(Parser *p) {
 }
 static Type *union_of(Type *a, Type *b);
 static Type *parse_type(Parser *p);
+/* `| null` or `| undefined` after T (the keyword consumed here): T | null. T | undefined with no null in the union is the
+   same type whose null is absent (ty_optional_of): it prints as undefined, as JavaScript's value would; a null anywhere
+   in the union makes it the plain T | null */
+static Type *nullable_kw(Parser *p, Type *t) {
+    bool undef = at_ident(p, "undefined");
+    next(p);
+    if (undef) return t->kind == TY_NULLABLE ? t : ty_optional_of(t);
+    if (t->kind == TY_NULLABLE && t->absent) return ty_nullable_of(t->elem);
+    return ty_nullable_of(t);
+}
 /* after '|': the rest of a union, where null and undefined make it nullable (T | null | U, 'a' | 'b' | null) */
 static Type *union_rest(Parser *p, Type *t) {
     for (;;) {
         if (at_ident(p, "null") || at_ident(p, "undefined")) {
-            next(p);
-            t = ty_nullable_of(t);
+            t = nullable_kw(p, t);
             if (!accept(p, TK_PIPE)) return t;
             continue;
         }
@@ -661,7 +670,7 @@ static Type *parse_type(Parser *p) {
         }
         while (at(p, TK_LBRACKET) && peek_is(p, TK_RBRACKET)) { next(p); next(p); t = ty_array_of(t); }
         if (accept(p, TK_PIPE)) {
-            if (at_ident(p, "null") || at_ident(p, "undefined")) { next(p); t = ty_nullable_of(t); if (accept(p, TK_PIPE)) t = union_of(t, parse_type(p)); }
+            if (at_ident(p, "null") || at_ident(p, "undefined")) { t = nullable_kw(p, t); if (accept(p, TK_PIPE)) t = union_of(t, parse_type(p)); }
             else t = union_of(t, parse_type(p));
         }
         return t;
@@ -1005,11 +1014,10 @@ suffix:
         next(p);
         if (at_ident(p, "null") || at_ident(p, "undefined")) { /* T | undefined: the same nullable type (xisto has one
                                                                     empty, null; an absent optional reads as it) */
-            next(p);
-            t = ty_nullable_of(t);
+            t = nullable_kw(p, t);
             while (at(p, TK_PIPE)) {
                 next(p);
-                if (at_ident(p, "null") || at_ident(p, "undefined")) { next(p); continue; }
+                if (at_ident(p, "null") || at_ident(p, "undefined")) { t = nullable_kw(p, t); continue; }
                 t = union_of(t, parse_type(p));
                 break;
             }
@@ -1416,6 +1424,11 @@ static Expr *parse_primary(Parser *p) {
                 sub.lx.col = col;
                 sub.prog = p->prog;
                 sub.mod = p->mod;
+                /* (what the module's imports and the functions around make names read as: ${ns.x}, ${sleep(1)}) */
+                sub.alias_from = p->alias_from; sub.alias_to = p->alias_to; sub.nalias = p->nalias;
+                sub.ns_alias = p->ns_alias; sub.ns_import = p->ns_import; sub.nns = p->nns;
+                sub.vt_names = p->vt_names; sub.vt_types = p->vt_types; sub.nvt = p->nvt;
+                sub.this_alias = p->this_alias;
                 next(&sub);
                 if (at(&sub, TK_EOF)) xs_error(XS1007, (Pos){line, col}, NULL, "empty ${} in template literal");
                 Expr *inner = parse_expr(&sub);
