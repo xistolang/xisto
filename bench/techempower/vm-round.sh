@@ -76,9 +76,9 @@ cat "$OUT/env.txt"
 # shellcheck disable=SC2086
 python3 bench/techempower/run.py --gen wrk --tests json --levels "$LEVELS" --duration "$DURATION" --repeat "$REPEAT" \
     --servers "$SERVERS" --xisto-workers "$XISTO_WORKERS" --refs "$REFS_DIR" --tfb "$TFB_DIR" $GEN_ARGS \
-    --out "$OUT/json.txt"
+    --raw "$OUT/raw" --out "$OUT/json.txt"
 # shellcheck disable=SC2086
 python3 bench/techempower/run.py --gen wrk --tests plaintext --levels "$PIPE_LEVELS" --duration "$DURATION" \
     --repeat "$REPEAT" --servers "$SERVERS" --xisto-workers "$XISTO_WORKERS" --refs "$REFS_DIR" --tfb "$TFB_DIR" \
-    --pipeline-lua "$LUA" --no-build $GEN_ARGS --out "$OUT/plaintext.txt"
+    --pipeline-lua "$LUA" --no-build $GEN_ARGS --raw "$OUT/raw" --out "$OUT/plaintext.txt"
 echo "results in $OUT"

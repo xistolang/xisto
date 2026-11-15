@@ -140,8 +140,8 @@ def unit_ms(v, u):
     return float(v) * {'us': 0.001, 'ms': 1.0, 's': 1000.0, 'm': 60000.0}[u]
 
 
-def load(a, test, url, c, dur):
-    """(req/s, p50 ms, p99 ms, responses) from one load run."""
+def load(a, test, url, c, dur, raw=None):
+    """(req/s, p50 ms, p99 ms, responses) from one load run; with raw, the generator's output is kept in that file."""
     if a.gen == 'oha':
         cmd = ['oha', '-z', '%ds' % dur, '-c', str(c), '--no-tui', '--output-format', 'json',
                '-H', 'Accept: ' + ACCEPT[test], url]
@@ -154,6 +154,9 @@ def load(a, test, url, c, dur):
     if a.gen_ssh:
         cmd = ['ssh', a.gen_ssh, ' '.join("'%s'" % x for x in cmd)]
     o = subprocess.run(cmd, capture_output=True, text=True).stdout
+    if raw:  # (XB-236: the output as the generator printed it, to read the latency distribution again later)
+        with open(raw, 'w') as f:
+            f.write(o)
     if a.gen == 'oha':
         j = json.loads(o)
         s = j['summary']
@@ -197,7 +200,7 @@ def measure(a, name, spec, tests, levels):
             load(a, t, url, max(levels), a.warmup)  # warmup
             for c in levels:
                 runs = []
-                for _ in range(a.repeat):
+                for run in range(a.repeat):
                     cpu0, _ = group_stats(p.pid)
                     peak = [0]
                     stop = threading.Event()
@@ -209,7 +212,8 @@ def measure(a, name, spec, tests, levels):
                     th = threading.Thread(target=sample, daemon=True)
                     th.start()
                     try:
-                        rps, p50, p99, n = load(a, t, url, c, a.duration)
+                        raw = os.path.join(a.raw, '%s-c%d-%s-%d.txt' % (t, c, name, run + 1)) if a.raw else None
+                        rps, p50, p99, n = load(a, t, url, c, a.duration, raw)
                     except Exception as e:  # (the load generator could not read the server: it died under load)
                         print('# %s: the load failed at %s-c%d (%s)' % (name, t, c, e), file=sys.stderr)
                         return rows
@@ -264,7 +268,10 @@ def main():
     ap.add_argument('--pipeline-lua', default='', help="the TFB's pipeline.lua on the generator (default: in --tfb)")
     ap.add_argument('--no-build', action='store_true')
     ap.add_argument('--out', default='')
+    ap.add_argument('--raw', default='', help="keep each load run's generator output in this directory")
     a = ap.parse_args()
+    if a.raw:
+        os.makedirs(a.raw, exist_ok=True)
     a.pipeline_lua = a.pipeline_lua or os.path.join(a.tfb, 'toolset', 'wrk', 'pipeline.lua')
     tests = a.tests.split(',')
     levels = [int(x) for x in a.levels.split(',')]
