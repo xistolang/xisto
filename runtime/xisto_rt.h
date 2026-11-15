@@ -1867,11 +1867,16 @@ static inline double xs_to_number_id(double x) { return x; }
 /* f___thrown: the object a throw carried (an object of a class that extends Error, or another value): instanceof and
    casts on a caught Error read it. f_cause: new Error(message, { cause }), as in JS (null when not given). code: Node's
    error code of a runtime error ("RangeError [ERR_OUT_OF_RANGE]: ..."), read as err.code through an any. */
-typedef struct xs_Error { xs_hdr hdr; xs_str *f_message; xs_str *f_name; void *f___thrown; xs_trace *trace; xs_str *stack; void *f_cause; xs_str *code; } xs_Error;
+typedef struct xs_Error { xs_hdr hdr; xs_str *f_message; xs_str *f_name; void *f___thrown; xs_trace *trace; xs_str *stack; void *f_cause; xs_str *code;
+    struct xs_fs_errinfo *sys; } xs_Error;
+/* a system error of node:fs (xs_fs_throw): err.errno, err.syscall, err.path and err.dest, as Node's */
+typedef struct xs_fs_errinfo { int64_t errnum; xs_str *syscall, *path, *dest; } xs_fs_errinfo;
+static XS_TLS xs_fs_errinfo *xs_fs_err_pending; /* for the Error the next runtime panic makes */
 static void xs_Error_free(void *p) {
     xs_Error *e = p;
     xs_release(e->f_message); xs_release(e->f_name); xs_release(e->stack); xs_release(e->f___thrown); xs_release(e->f_cause);
     xs_release(e->code);
+    if (e->sys) { xs_release(e->sys->syscall); xs_release(e->sys->path); xs_release(e->sys->dest); free(e->sys); }
     free(e->trace);
     xs_obj_free(p);
 }
@@ -1909,6 +1914,12 @@ __attribute__((noinline)) static void *xs_Error_new(void *msg) {
             }
         }
         e->f_message = xs_str_new(m, strlen(m));
+        if (xs_fs_err_pending) { /* "ENOENT: no such file or directory, open '/x'": its code, errno, syscall and path */
+            e->sys = xs_fs_err_pending;
+            xs_fs_err_pending = NULL;
+            const char *c = strchr(m, ':');
+            if (c) e->code = xs_str_new(m, (size_t)(c - m));
+        }
     }
     else e->f_message = xs_str_new("", 0);
     e->f_name = xs_str_new(nm, nml);
@@ -3258,6 +3269,12 @@ XS_NOINLINE void *xs_dyn_get(void *o, xs_str *k) {
         if (k->len == 5 && memcmp(k->data, "stack", 5) == 0) return xs_retain_(xs_Error_stack(e));
         if (k->len == 5 && memcmp(k->data, "cause", 5) == 0) return xs_retain_(e->f_cause);
         if (k->len == 4 && memcmp(k->data, "code", 4) == 0 && e->code) return xs_retain_(e->code);
+        if (e->sys) {
+            if (k->len == 5 && memcmp(k->data, "errno", 5) == 0) return xs_box_int(e->sys->errnum);
+            if (k->len == 7 && memcmp(k->data, "syscall", 7) == 0) return xs_retain_(e->sys->syscall);
+            if (k->len == 4 && memcmp(k->data, "path", 4) == 0) return xs_retain_(e->sys->path);
+            if (k->len == 4 && memcmp(k->data, "dest", 4) == 0) return xs_retain_(e->sys->dest);
+        }
         return e->f___thrown ? xs_dyn_get(e->f___thrown, k) : NULL;
     }
     if (t->free == xs_map_free) {
@@ -5853,9 +5870,17 @@ XS_NOINLINE xs_str *xs_fs_read_stdin(void) {
     buf[offsetof(xs_str, data) + n] = 0;
     return xs_str_adopt(buf, n);
 }
+#include <errno.h>
+#include <sys/stat.h>
+static void xs_fs_fail(int e, const char *syscall, xs_str *path);
+static void xs_fs_check_dir(FILE *f) { /* a directory opens, its read fails: Node's EISDIR (without the path) */
+    struct stat st;
+    if (fstat(fileno(f), &st) == 0 && S_ISDIR(st.st_mode)) { fclose(f); xs_fs_fail(EISDIR, "read", NULL); }
+}
 XS_NOINLINE xs_str *xs_fs_read(xs_str *path) {
     FILE *f = fopen(path->data, "rb");
-    if (!f) xs_panicf("ENOENT: no such file or directory, open '%s'", path->data);
+    if (!f) xs_fs_fail(errno, "open", path);
+    xs_fs_check_dir(f);
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     if (n < 0) { /* not a regular file (/dev/stdin on a pipe): read until the end */
@@ -5874,13 +5899,265 @@ XS_NOINLINE xs_str *xs_fs_read(xs_str *path) {
 }
 XS_NOINLINE void xs_fs_write_mode(xs_str *path, xs_str *data, const char *mode) {
     FILE *f = fopen(path->data, mode);
-    if (!f) xs_panicf("EACCES: cannot open '%s' for writing", path->data);
+    if (!f) xs_fs_fail(errno, "open", path);
     fwrite(data->data, 1, (size_t)data->len, f);
     fclose(f);
 }
 XS_NOINLINE void xs_fs_write(xs_str *path, xs_str *data) { xs_fs_write_mode(path, data, "wb"); }
 XS_NOINLINE void xs_fs_append(xs_str *path, xs_str *data) { xs_fs_write_mode(path, data, "ab"); }
 static bool xs_fs_exists(xs_str *path) { return access(path->data, F_OK) == 0; }
+
+/* ---- node:fs (runtime/node/fs.ts): system calls that give 0 or -errno, values with the error in xs_fs_err, and
+   Node's errors: "ENOENT: no such file or directory, open '/x'" with err.code, errno, syscall, path (and dest) ---- */
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#ifndef _WIN32
+#include <dirent.h>
+#include <limits.h>
+#endif
+static XS_TLS int64_t xs_fs_err; /* the last call's -errno (0: it worked), for the calls that give a value */
+XS_NOINLINE int64_t xs_fs_last_err(void) { return xs_fs_err; }
+/* libuv's name and words for an errno (uv_err_name, uv_strerror) */
+static const char *xs_fs_err_name(int64_t e, const char **text) {
+    static const struct { int e; const char *code, *text; } t[] = {
+        {ENOENT, "ENOENT", "no such file or directory"}, {EEXIST, "EEXIST", "file already exists"},
+        {ENOTDIR, "ENOTDIR", "not a directory"}, {EISDIR, "EISDIR", "illegal operation on a directory"},
+        {ENOTEMPTY, "ENOTEMPTY", "directory not empty"}, {EACCES, "EACCES", "permission denied"},
+        {EPERM, "EPERM", "operation not permitted"}, {EINVAL, "EINVAL", "invalid argument"}, {EBADF, "EBADF", "bad file descriptor"},
+        {EMFILE, "EMFILE", "too many open files"}, {ENFILE, "ENFILE", "file table overflow"}, {EXDEV, "EXDEV", "cross-device link not permitted"},
+        {ELOOP, "ELOOP", "too many symbolic links encountered"}, {ENAMETOOLONG, "ENAMETOOLONG", "name too long"},
+        {EBUSY, "EBUSY", "resource busy or locked"}, {ENOSPC, "ENOSPC", "no space left on device"}, {EROFS, "EROFS", "read-only file system"},
+        {EIO, "EIO", "i/o error"}, {EAGAIN, "EAGAIN", "resource temporarily unavailable"}, {ENOSYS, "ENOSYS", "function not implemented"},
+        {ENOTSUP, "ENOTSUP", "operation not supported on socket"}, {EFBIG, "EFBIG", "file too large"}, {ETXTBSY, "ETXTBSY", "text file is busy"},
+        {EMLINK, "EMLINK", "too many links"}};
+    int a = (int)(e < 0 ? -e : e);
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++)
+        if (t[i].e == a) { *text = t[i].text; return t[i].code; }
+    *text = strerror(a);
+    return "EIO";
+}
+/* throws Node's error for -errno e of syscall (owned) on path (dest: rename, copyfile, symlink and link name two;
+   both borrowed, NULL or empty when not given) */
+static void xs_fs_raise(int64_t e, xs_str *syscall, xs_str *path, xs_str *dest) {
+    static XS_TLS char m[2 * 4096 + 160];
+    const char *text, *code = xs_fs_err_name(e, &text);
+    int n = snprintf(m, sizeof m, "%s: %s, %s", code, text, syscall->data);
+    bool hp = path && path->len, hd = dest && dest->len;
+    if (hp && n >= 0 && (size_t)n < sizeof m) n += snprintf(m + n, sizeof m - (size_t)n, " '%s'", path->data);
+    if (hd && n >= 0 && (size_t)n < sizeof m) snprintf(m + n, sizeof m - (size_t)n, " -> '%s'", dest->data);
+    if (xs_try_depth == 0) { xs_release(syscall); xs_panic(m); } /* (no Error is made: the program ends, or an HTTP handler fails) */
+    xs_fs_errinfo *i = calloc(1, sizeof *i);
+    i->errnum = e < 0 ? e : -e;
+    i->syscall = syscall;
+    i->path = hp ? xs_retain(path) : NULL;
+    i->dest = hd ? xs_retain(dest) : NULL;
+    xs_fs_err_pending = i;
+    xs_panic(m);
+}
+XS_NOINLINE void xs_fs_throw(int64_t e, xs_str *syscall, xs_str *path, xs_str *dest) { xs_fs_raise(e, xs_retain(syscall), path, dest); }
+static void xs_fs_fail(int e, const char *syscall, xs_str *path) { /* (the runtime's own functions: readFileSync & co) */
+    xs_fs_raise(-(int64_t)e, xs_str_new(syscall, strlen(syscall)), path, NULL);
+}
+#define XS_FS_RC(call) ((call) == 0 ? 0 : -(int64_t)errno)
+XS_NOINLINE int64_t xs_fs_mkdir(xs_str *p, int64_t mode) {
+#ifdef _WIN32
+    return XS_FS_RC(mkdir(p->data));
+#else
+    return XS_FS_RC(mkdir(p->data, (mode_t)mode));
+#endif
+}
+XS_NOINLINE int64_t xs_fs_rmdir(xs_str *p) { return XS_FS_RC(rmdir(p->data)); }
+XS_NOINLINE int64_t xs_fs_unlink_rc(xs_str *p) { return XS_FS_RC(unlink(p->data)); }
+XS_NOINLINE int64_t xs_fs_rename(xs_str *a, xs_str *b) { return XS_FS_RC(rename(a->data, b->data)); }
+XS_NOINLINE int64_t xs_fs_chmod(xs_str *p, int64_t mode) { return XS_FS_RC(chmod(p->data, (mode_t)mode)); }
+XS_NOINLINE int64_t xs_fs_access(xs_str *p, int64_t mode) { return XS_FS_RC(access(p->data, (int)mode)); }
+XS_NOINLINE int64_t xs_fs_truncate(xs_str *p, int64_t len) { return XS_FS_RC(truncate(p->data, (off_t)len)); }
+#ifndef _WIN32
+XS_NOINLINE int64_t xs_fs_symlink(xs_str *target, xs_str *p) { return XS_FS_RC(symlink(target->data, p->data)); }
+XS_NOINLINE int64_t xs_fs_link(xs_str *a, xs_str *b) { return XS_FS_RC(link(a->data, b->data)); }
+XS_NOINLINE int64_t xs_fs_utimes(xs_str *p, double at, double mt, bool follow) { /* seconds, as Node takes them */
+    struct timespec ts[2];
+    double t[2] = {at, mt};
+    for (int i = 0; i < 2; i++) {
+        double s = floor(t[i]);
+        ts[i].tv_sec = (time_t)s;
+        ts[i].tv_nsec = (long)((t[i] - s) * 1e9);
+    }
+    return XS_FS_RC(utimensat(AT_FDCWD, p->data, ts, follow ? 0 : AT_SYMLINK_NOFOLLOW));
+}
+#endif
+/* [dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks, atimeMs, mtimeMs, ctimeMs, birthtimeMs]: Node's
+   Stats, in its order; empty, with xs_fs_err, when it fails. fd >= 0: fstat of it; else stat, or lstat (!follow) */
+#define XS_FS_MS(ts) ((double)(ts).tv_sec * 1000 + (double)(ts).tv_nsec / 1e6)
+XS_NOINLINE xs_arr_num *xs_fs_stat(xs_str *p, bool follow, int64_t fd) {
+    xs_arr_num *a = xs_arr_num_new(0, 0);
+    struct stat st;
+#ifdef _WIN32
+    int r = fd >= 0 ? fstat((int)fd, &st) : stat(p->data, &st);
+#else
+    int r = fd >= 0 ? fstat((int)fd, &st) : follow ? stat(p->data, &st) : lstat(p->data, &st);
+#endif
+    if (r != 0) { xs_fs_err = -(int64_t)errno; return a; }
+    xs_fs_err = 0;
+    double v[14] = {(double)st.st_dev, (double)st.st_mode, (double)st.st_nlink, (double)st.st_uid, (double)st.st_gid, (double)st.st_rdev,
+#ifdef _WIN32
+                    4096, (double)st.st_ino, (double)st.st_size, 0, (double)st.st_atime * 1000, (double)st.st_mtime * 1000, (double)st.st_ctime * 1000, (double)st.st_ctime * 1000};
+#elif defined(__APPLE__)
+                    (double)st.st_blksize, (double)st.st_ino, (double)st.st_size, (double)st.st_blocks, XS_FS_MS(st.st_atimespec), XS_FS_MS(st.st_mtimespec),
+                    XS_FS_MS(st.st_ctimespec), XS_FS_MS(st.st_birthtimespec)};
+#else
+                    (double)st.st_blksize, (double)st.st_ino, (double)st.st_size, (double)st.st_blocks, XS_FS_MS(st.st_atim), XS_FS_MS(st.st_mtim),
+                    XS_FS_MS(st.st_ctim), XS_FS_MS(st.st_ctim)};
+#if defined(STATX_BTIME)
+    struct statx sx; /* the birth time, where the file system keeps it (libuv reads it so too) */
+    if (statx(fd >= 0 ? (int)fd : AT_FDCWD, fd >= 0 ? "" : p->data, (fd >= 0 ? AT_EMPTY_PATH : 0) | (follow ? 0 : AT_SYMLINK_NOFOLLOW), STATX_BTIME, &sx) == 0 && (sx.stx_mask & STATX_BTIME))
+        v[13] = (double)sx.stx_btime.tv_sec * 1000 + (double)sx.stx_btime.tv_nsec / 1e6;
+#endif
+#endif
+    for (int i = 0; i < 14; i++) xs_arr_num_push(a, v[i]);
+    return a;
+}
+/* a directory's entries, sorted as libuv's scandir sorts them (strcmp), each its kind's letter and its name: f file,
+   d directory, l symbolic link, b c p s devices, FIFOs and sockets, u unknown */
+XS_NOINLINE xs_arr_ref *xs_fs_readdir(xs_str *p) {
+    xs_arr_ref *a = xs_arr_ref_new(0, xs_print_str_quoted_);
+#ifdef _WIN32
+    xs_fs_err = -ENOSYS;
+    return a;
+#else
+    DIR *d = opendir(p->data);
+    if (!d) { xs_fs_err = -(int64_t)errno; return a; }
+    xs_fs_err = 0;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        const char *n = de->d_name;
+        if (n[0] == '.' && (n[1] == 0 || (n[1] == '.' && n[2] == 0))) continue;
+        char k = 'u';
+#ifdef DT_DIR
+        switch (de->d_type) {
+        case DT_REG: k = 'f'; break; case DT_DIR: k = 'd'; break; case DT_LNK: k = 'l'; break; case DT_BLK: k = 'b'; break;
+        case DT_CHR: k = 'c'; break; case DT_FIFO: k = 'p'; break; case DT_SOCK: k = 's'; break; default: break;
+        }
+#endif
+        size_t len = strlen(n);
+        xs_str *s = xs_str_alloc((int64_t)len + 1);
+        s->data[0] = k;
+        memcpy(s->data + 1, n, len + 1);
+        xs_arr_ref_push(a, s);
+    }
+    closedir(d);
+    /* (insertion sort by the names: directories are small, and the order is strcmp's) */
+    for (int64_t i = 1; i < a->len; i++) {
+        void *x = a->data[i];
+        int64_t j = i;
+        while (j > 0 && strcmp(((xs_str *)a->data[j - 1])->data + 1, ((xs_str *)x)->data + 1) > 0) { a->data[j] = a->data[j - 1]; j--; }
+        a->data[j] = x;
+    }
+    return a;
+#endif
+}
+static xs_str *xs_fs_str_or_err(const char *s, int e) {
+    if (!s) { xs_fs_err = -(int64_t)e; return xs_str_new("", 0); }
+    xs_fs_err = 0;
+    return xs_str_new(s, strlen(s));
+}
+XS_NOINLINE xs_str *xs_fs_realpath(xs_str *p) {
+#ifdef _WIN32
+    return xs_fs_str_or_err(NULL, ENOSYS);
+#else
+    char buf[PATH_MAX];
+    const char *r = realpath(p->data, buf);
+    return xs_fs_str_or_err(r, errno);
+#endif
+}
+XS_NOINLINE xs_str *xs_fs_readlink(xs_str *p) {
+#ifdef _WIN32
+    return xs_fs_str_or_err(NULL, ENOSYS);
+#else
+    char buf[PATH_MAX];
+    ssize_t n = readlink(p->data, buf, sizeof buf - 1);
+    if (n < 0) return xs_fs_str_or_err(NULL, errno);
+    buf[n] = 0;
+    return xs_fs_str_or_err(buf, 0);
+#endif
+}
+XS_NOINLINE xs_str *xs_fs_mkdtemp(xs_str *prefix) {
+#ifdef _WIN32
+    return xs_fs_str_or_err(NULL, ENOSYS);
+#else
+    size_t n = (size_t)prefix->len;
+    char *t = malloc(n + 7);
+    memcpy(t, prefix->data, n);
+    memcpy(t + n, "XXXXXX", 7);
+    const char *r = mkdtemp(t);
+    xs_str *s = xs_fs_str_or_err(r, errno);
+    free(t);
+    return s;
+#endif
+}
+/* open flags as Node's strings: r r+ rs+ w wx w+ wx+ a ax a+ ax+ as as+ */
+static int xs_fs_oflags(const char *f) {
+    bool plus = strchr(f, '+') != NULL, excl = strchr(f, 'x') != NULL;
+    int fl = f[0] == 'w' ? (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_TRUNC : f[0] == 'a' ? (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_APPEND : plus ? O_RDWR : O_RDONLY;
+    if (excl) fl |= O_EXCL;
+#ifdef O_CLOEXEC
+    fl |= O_CLOEXEC;
+#endif
+    return fl;
+}
+/* writeFileSync / appendFileSync: the bytes into the file opened with flags (0 or -errno) */
+static int64_t xs_fs_put(const char *path, const char *data, size_t n, xs_str *flags, int64_t mode) {
+    int fd = open(path, xs_fs_oflags(flags->data), (int)mode);
+    if (fd < 0) return -(int64_t)errno;
+    while (n > 0) {
+        ssize_t w = write(fd, data, n);
+        if (w < 0) { if (errno == EINTR) continue; int e = errno; close(fd); return -(int64_t)e; }
+        data += w;
+        n -= (size_t)w;
+    }
+    return XS_FS_RC(close(fd));
+}
+XS_NOINLINE int64_t xs_fs_write_str(xs_str *p, xs_str *data, xs_str *flags, int64_t mode) { return xs_fs_put(p->data, data->data, (size_t)data->len, flags, mode); }
+/* copyFileSync: src's bytes into dest (excl: fails when dest exists), with src's mode */
+XS_NOINLINE int64_t xs_fs_copy_file(xs_str *src, xs_str *dest, bool excl) {
+    int in = open(src->data, O_RDONLY);
+    if (in < 0) return -(int64_t)errno;
+    struct stat st;
+    if (fstat(in, &st) != 0) { int e = errno; close(in); return -(int64_t)e; }
+    if (S_ISDIR(st.st_mode)) { close(in); return -EISDIR; }
+    int out = open(dest->data, O_WRONLY | O_CREAT | O_TRUNC | (excl ? O_EXCL : 0), (int)(st.st_mode & 07777));
+    if (out < 0) { int e = errno; close(in); return -(int64_t)e; }
+    enum { XS_FS_COPY_BUF = 65536 };
+    char *buf = malloc(XS_FS_COPY_BUF); /* (not on the stack: the event loop's coroutines have small ones) */
+    int64_t rc = 0;
+    for (;;) {
+        ssize_t r = read(in, buf, XS_FS_COPY_BUF);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) { rc = -(int64_t)errno; break; }
+        if (r == 0) break;
+        for (ssize_t o = 0; o < r;) {
+            ssize_t w = write(out, buf + o, (size_t)(r - o));
+            if (w < 0 && errno == EINTR) continue;
+            if (w < 0) { rc = -(int64_t)errno; break; }
+            o += w;
+        }
+        if (rc) break;
+    }
+    free(buf);
+#ifndef _WIN32
+    if (!rc) fchmod(out, st.st_mode & 07777);
+#endif
+    close(in);
+    if (close(out) != 0 && !rc) rc = -(int64_t)errno;
+    return rc;
+}
+XS_NOINLINE xs_str *xs_fs_errcode_of(int64_t e) { /* the errno's name ("ENOENT"), or with e < 0 its words */
+    const char *text, *code = xs_fs_err_name(e, &text);
+    const char *s = e < 0 ? text : code;
+    return xs_str_new(s, strlen(s));
+}
 
 /* ---- bytes: Uint8Array (and Buffer, the same object printed the Node way), TextEncoder/Decoder, base64/hex ----
    An array owns its bytes, or is a view (subarray) on another one's, which it keeps alive. Indexing is bounds
@@ -8578,7 +8855,8 @@ XS_NOINLINE xs_Uint8Array *xs_fs_read_stdin_bytes(void) {
 /* readFileSync(path) without an encoding: the bytes (a Buffer); writeFileSync(path, bytes) */
 XS_NOINLINE xs_Uint8Array *xs_fs_read_bytes(xs_str *path) {
     FILE *f = fopen(path->data, "rb");
-    if (!f) xs_panicf("ENOENT: no such file or directory, open '%s'", path->data);
+    if (!f) xs_fs_fail(errno, "open", path);
+    xs_fs_check_dir(f);
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     if (n < 0) { /* not a regular file: read until the end */
@@ -8597,34 +8875,22 @@ XS_NOINLINE xs_Uint8Array *xs_fs_read_bytes(xs_str *path) {
     fclose(f);
     return b;
 }
+XS_NOINLINE int64_t xs_fs_write_buf(xs_str *p, xs_Uint8Array *b, xs_str *flags, int64_t mode) { return xs_fs_put(p->data, (const char *)b->data, (size_t)b->f_length, flags, mode); }
 XS_NOINLINE void xs_fs_write_bytes(xs_str *path, xs_Uint8Array *b) {
     FILE *f = fopen(path->data, "wb");
-    if (!f) xs_panicf("EACCES: cannot open '%s' for writing", path->data);
+    if (!f) xs_fs_fail(errno, "open", path);
     fwrite(b->data, 1, (size_t)b->f_length, f);
     fclose(f);
 }
 
-/* node:fs on file descriptors (checker: check_fs_fd_call): openSync, closeSync, fstatSync, readSync */
+/* node:fs on file descriptors (checker: check_fs_fd_call): openSync, closeSync, readSync (fstatSync: xs_fs_stat) */
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-typedef struct xs_Stats { xs_hdr hdr; int64_t f_size; int64_t mode; } xs_Stats;
-static void xs_Stats_print(void *p) { fprintf(XS_OUT, "Stats { size: %lld }", (long long)((xs_Stats *)p)->f_size); }
-static void xs_Stats_free(void *p) { xs_obj_free(p); }
-XS_NOINLINE xs_Stats *xs_fs_fstat(int64_t fd) {
-    struct stat st;
-    if (fstat((int)fd, &st) != 0) { char m_[96]; snprintf(m_, sizeof m_, "EBADF: bad file descriptor, fstat (%lld)", (long long)fd); xs_panic(m_); }
-    xs_Stats *s = xs_obj_alloc(sizeof *s, xs_Stats_free, xs_Stats_print);
-    s->f_size = (int64_t)st.st_size;
-    s->mode = (int64_t)st.st_mode;
-    return s;
-}
-static bool xs_Stats_isFile(xs_Stats *s) { return S_ISREG((mode_t)s->mode); }
-static bool xs_Stats_isDirectory(xs_Stats *s) { return S_ISDIR((mode_t)s->mode); }
 XS_NOINLINE int64_t xs_fs_open(xs_str *path, xs_str *flags) {
     int fl = strcmp(flags->data, "w") == 0 ? O_WRONLY | O_CREAT | O_TRUNC : strcmp(flags->data, "a") == 0 ? O_WRONLY | O_CREAT | O_APPEND : strcmp(flags->data, "r+") == 0 ? O_RDWR : O_RDONLY;
     int fd = open(path->data, fl, 0666);
-    if (fd < 0) xs_panicf("ENOENT: no such file or directory, open '%s'", path->data);
+    if (fd < 0) xs_fs_fail(errno, "open", path);
     return fd;
 }
 XS_NOINLINE void xs_fs_close(int64_t fd) {
@@ -8673,7 +8939,7 @@ XS_NOINLINE xs_str *xs_exec_sync(xs_str *cmd) {
     if (st != 0) { free(b.data); xs_panicf("Command failed: %s", cmd->data); }
     return xs_sb_finish(&b);
 }
-XS_NOINLINE void xs_fs_unlink(xs_str *path) { if (unlink(path->data) != 0) xs_panicf("ENOENT: no such file or directory, unlink '%s'", path->data); }
+XS_NOINLINE void xs_fs_unlink(xs_str *path) { if (unlink(path->data) != 0) xs_fs_fail(errno, "unlink", path); }
 
 /* BigInt: arbitrary-precision integers, immutable values as in JavaScript.
    Sign and magnitude, 64-bit limbs (least significant first) in the object itself; products and the
