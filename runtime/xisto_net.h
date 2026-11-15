@@ -4303,7 +4303,16 @@ XS_NOINLINE xs_arr_int *xs_cp_spawn(xs_str *file, xs_arr_ref *args, xs_str *cwd,
     for (int i = 0; i < 6; i++) posix_spawn_file_actions_addclose(&fa, fds[i]);
     if (cwd->len > 0) {
 #if defined(__APPLE__) || (defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 29)))
+        /* the macOS 26 SDK marks the _np name deprecated (posix_spawn_file_actions_addchdir replaces it, from macOS 26
+           only); the _np one stays, so the program runs on older macOS, and its warning would reach `xisto build` */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
         posix_spawn_file_actions_addchdir_np(&fa, cwd->data);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 #endif
     }
     char **argv = calloc((size_t)args->len + 2, sizeof(char *));
