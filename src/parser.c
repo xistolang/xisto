@@ -101,8 +101,9 @@ static void tp_push(char **names, int n) { /* the type parameters in scope: the 
 
 static void next(Parser *p) {
     p->prev_end = p->tok.start ? p->tok.start + p->tok.len : NULL;
+    TokKind before = p->tok.kind;
     p->tok = lexer_next(&p->lx);
-    if (p->nalias && p->tok.kind == TK_IDENT)
+    if (p->nalias && p->tok.kind == TK_IDENT && before != TK_DOT && before != TK_QDOT) /* (o.a: a property, never an import's alias) */
         for (int i = 0; i < p->nalias; i++)
             if (strcmp(p->tok.str, p->alias_from[i]) == 0) { p->tok.str = p->alias_to[i]; break; }
 }
@@ -122,11 +123,22 @@ static Token expect(Parser *p, TokKind k, const char *help) {
     return t;
 }
 
+/* the name a property was written with: an identifier the module's import aliases renamed (import { a as b } reads
+   b as a, and a module's own a as a__local) is, as a property, still the name written (XB-224) */
+static char *prop_raw(Parser *p, Token t) {
+    if (t.kind != TK_IDENT || !t.start || ((int)strlen(t.str) == t.len && !strncmp(t.str, t.start, (size_t)t.len))) return t.str;
+    for (int i = 0; i < p->nalias; i++)
+        if (p->alias_to[i] == t.str && (int)strlen(p->alias_from[i]) == t.len && !strncmp(p->alias_from[i], t.start, (size_t)t.len))
+            return p->alias_from[i];
+    return t.str;
+}
 /* a property name: an identifier or any keyword (obj.default, { default: 0 }, interface { delete?: x }) */
 static Token expect_prop_name(Parser *p, const char *help) {
     const char *w = tok_keyword_text(p->tok.kind);
     if (w) { Token t = p->tok; t.kind = TK_IDENT; t.str = (char *)w; next(p); return t; }
-    return expect(p, TK_IDENT, help);
+    Token t = expect(p, TK_IDENT, help);
+    t.str = prop_raw(p, t);
+    return t;
 }
 
 static bool accept(Parser *p, TokKind k) {
@@ -1548,7 +1560,7 @@ static Expr *parse_primary(Parser *p) {
                 val->str = key.str;
             }
             if (e->args.len == cap) { cap = cap ? cap * 2 : 4; e->keys = realloc(e->keys, sizeof(char *) * (size_t)cap); }
-            e->keys[e->args.len] = key.str;
+            e->keys[e->args.len] = prop_raw(p, key); /* ({ a: 1 }, { a }: the key as written, the value through the aliases) */
             expr_list_push(&e->args, val);
             if (!accept(p, TK_COMMA)) break;
         }
