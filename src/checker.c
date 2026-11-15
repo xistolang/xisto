@@ -346,6 +346,15 @@ static void init_builtins(void) {
 }
 
 static Enum *find_enum(const char *name) {
+    const char *q = strchr(name, '\x01'); /* "E\x01m": the enum E of the import from "m" (XB-117, XB-223) */
+    if (q) {
+        char *base = xs_strndup(name, (size_t)(q - name));
+        SYM_EACH(enums_by_name, base, e) {
+            Enum *en = e->decl;
+            if (en->exported && imports_name(cur_mod, en->mod, name)) return en;
+        }
+        return NULL;
+    }
     SYM_EACH(enums_by_name, name, e) {
         Enum *en = e->decl;
         if (en->mod == cur_mod || (en->exported && imports_name(cur_mod, en->mod, name))) return en;
@@ -2964,9 +2973,12 @@ static Func *lookup_func(const char *name) {
     const char *q = strchr(name, '\x01'); /* "f\x01m": the function f of the import from "m" (XB-117) */
     if (q) {
         char *base = xs_strndup(name, (size_t)(q - name));
+        const char *st = strstr(base, "__s_"); /* "C__s_m\x01m": a static of the class C of that import (XB-223) */
+        char *cls = st ? xs_sprintf("%.*s%s", (int)(st - base), base, q) : NULL;
         SYM_EACH(funcs_by_name, base, e) {
             Func *f = e->decl;
             if (f->exported && imports_name(cur_mod, f->mod, name)) return f;
+            if (cls && f->exported && imports_name(cur_mod, f->mod, cls)) return f;
         }
         return NULL;
     }
@@ -10841,7 +10853,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (err) {
                     chain = xs_alloc(sizeof *chain);
                     chain->kind = E_MEMBER; chain->pos = e->pos; chain->field = -1; chain->lhs = pure_copy(obj); chain->str = "name";
-                } else chain = str_lit(e->pos, c->name);
+                } else chain = str_lit(e->pos, xs_src_name(c->name));
                 for (int depth = 1; depth < 64; depth++) {
                     bool any_at = false;
                     for (int i = 0; i < prog->nclasses; i++) {
@@ -10857,7 +10869,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                         io->kind = E_BINARY; io->pos = e->pos; io->field = -1; io->op = TK_IDENT; io->lhs = pure_copy(obj); io->rhs = id;
                         Expr *cd = xs_alloc(sizeof *cd);
                         cd->kind = E_COND; cd->pos = e->pos; cd->field = -1; cd->lhs = io;
-                        expr_list_push(&cd->args, str_lit(e->pos, k->name));
+                        expr_list_push(&cd->args, str_lit(e->pos, xs_src_name(k->name)));
                         expr_list_push(&cd->args, chain);
                         chain = cd;
                     }
@@ -11212,14 +11224,16 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (e->lhs->kind == E_IDENT && !lookup(e->lhs->str)) {
             const char *ns = e->lhs->str;
             Class *sc = find_class(ns);
+            const char *nsq = strchr(ns, '\x01'); /* (ns.C.m with ns's C read as "C\x01m": C__s_m of that import, XB-223) */
             for (int k = 0; sc && !sc->builtin && k < sc->nstatics_user; k++) { /* Class.staticMember */
                 if (strcmp(sc->static_names[k], e->str) != 0) continue;
+                const char *gen = nsq ? xs_sprintf("%s%s", sc->static_gen[k], nsq) : sc->static_gen[k];
                 if (sc->static_is_method[k]) {
                     if (!e->is_call) xs_error(XS8123, e->pos, "call it: Class.method(...)", "static methods are not values");
                     Expr *callee = xs_alloc(sizeof *callee);
                     callee->kind = E_IDENT;
                     callee->pos = e->pos;
-                    callee->str = sc->static_gen[k];
+                    callee->str = (char *)gen;
                     callee->field = -1;
                     e->kind = E_CALL;
                     e->lhs = callee;
@@ -11229,7 +11243,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 }
                 if (e->is_call) xs_error(XS8051, e->pos, NULL, "'%s' is a static field of %s, not a method", e->str, sc->name);
                 e->kind = E_IDENT;
-                e->str = sc->static_gen[k];
+                e->str = (char *)gen;
                 e->lhs = NULL;
                 check_expr(e, expected);
                 return;
@@ -18219,11 +18233,13 @@ void check_program(Program *p) {
                     }
                 }
                 size_t nl = strlen(im->names[k]);
+                bool qualified = im->qualified && im->qualified[k] && im->path; /* (read here as "x\x01m" only: XB-117, XB-223) */
                 for (Binding *b = src->head; b; b = b->next) {
                     bool is_static = strncmp(b->name, im->names[k], nl) == 0 && strncmp(b->name + nl, "__s_", 4) == 0; /* Class.static */
                     if (strcmp(b->name, im->names[k]) != 0 && !is_static) continue;
                     Binding *alias = xs_alloc(sizeof *alias);
                     *alias = *b;
+                    if (qualified) alias->name = xs_sprintf("%s\x01%s", b->name, im->path);
                     alias->origin = b;
                     alias->is_const = true;
                     alias->next = scope->head;

@@ -22,6 +22,13 @@ char *xs_strndup(const char *s, size_t n) {
     return d;
 }
 
+/* a declaration's name as the program wrote it: a module's own A, read as A__local next to an import { A as B }
+   (XB-224), is still A to the running program (constructor.name, console.log) */
+const char *xs_src_name(const char *name) {
+    size_t n = name ? strlen(name) : 0;
+    return n > 7 && !strcmp(name + n - 7, "__local") ? xs_strndup(name, n - 7) : name;
+}
+
 char *xs_sprintf(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
