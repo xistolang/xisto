@@ -25,6 +25,7 @@ Available modules include:
 - `http`: Node's `createServer`/`request`/`get` (below), and xisto's own `Server` with `fetch`, with TLS for
   `https://` (AWS-LC by default, or BearSSL)
 - `events` (`EventEmitter`), `process`, `timers`, `http`, `net`, `dns`, `child_process` (see below)
+- `readline`, `readline/promises` and `tty`, with `process.stdin` (see [readline](#readline) and [tty](#tty))
 - `util`, `querystring`, `string_decoder` (below)
 - `http` / `https`: a server and `fetch`, with TLS (AWS-LC by default, or BearSSL)
 - `crypto`: hashes, HMAC, AES ciphers, pbkdf2/scrypt/hkdf, keys and RSA/ECDSA signatures (see [crypto](#crypto))
@@ -204,9 +205,67 @@ Beyond `process.argv`, `process.env`, `process.pid`, `process.cwd()`, `process.e
 | `on('SIGINT' \| 'SIGTERM' \| 'SIGHUP' \| 'SIGUSR1' \| 'SIGUSR2' ...)` | a listener replaces the default action; it also takes precedence over the HTTP server's graceful shutdown |
 | `kill(pid, signal)`, `chdir(dir)`, `umask()`, `getuid()`/`getgid()`/`geteuid()`/`getegid()`, `emitWarning()`, `abort()` | errors carry Node's messages (`ENOENT: no such file or directory, chdir ...`) |
 
-Differences from Node: `'uncaughtException'` and `'unhandledRejection'` listeners are not called (an uncaught
-error ends the program with exit code 1, as when no listener is set). `process.stdin` is not available yet; read standard
-input with `xisto:io`.
+| `on('uncaughtException' \| 'uncaughtExceptionMonitor')`, `setUncaughtExceptionCaptureCallback(fn)`, `hasUncaughtExceptionCaptureCallback()` | the listener gets `(err, origin)`; the work the error interrupted ends and the event loop goes on (an interval keeps firing). A listener that throws ends the program with code 7 |
+| `on('unhandledRejection')` | `(reason, promise)` once the microtasks have run; with no such listener the rejection goes to `'uncaughtException'` with the origin `"unhandledRejection"` (Node's default `--unhandled-rejections=throw`) |
+| `stdin`, `stdout`, `stderr` as streams | `process.stdin` is a `Readable` over fd 0 (see [tty](#tty)); `process.stdout`/`stderr` are `Writable`s (`isTTY`, `columns`, `rows`, a `pipe()` target); `process.stdout.write(x)` itself stays the built-in fast path |
+
+With no `'uncaughtException'` listener an uncaught error is printed (`uncaught Error: message` and its stack) and the
+program ends with code 1, after the `'exit'` listeners, as in Node.
+
+Differences from Node:
+
+- the promise an `'unhandledRejection'` listener gets is typed `unknown` (`(reason: Error, promise: unknown) => ...`):
+  a `Promise<void>` parameter cannot be checked at run time;
+- an error thrown by the top level reports the origin `"unhandledRejection"` (Node runs a `.ts` file with an import or
+  an export as an ES module, whose top level is a promise; a CommonJS file reports `"uncaughtException"`), and only the
+  `'uncaughtException'` listeners get it, as in Node 26;
+- an `async` function called without `await` whose body throws before its first real wait (one that parks) throws
+  synchronously, so it reaches `'uncaughtException'`, not `'unhandledRejection'`;
+- `'rejectionHandled'` is not emitted, and `'warning'` only by `process.emitWarning`;
+- a program that listens for `'uncaughtException'` (or `'exit'`) keeps its top-level variables as globals (main has
+  a landing for the errors a listener takes); other programs compile as before.
+
+## readline
+
+`node:readline` and `node:readline/promises` (also `readline.promises`) read lines from any `Readable`:
+`process.stdin`, `fs.createReadStream`, a stream of your own.
+
+| API | Notes |
+|---|---|
+| `createInterface({ input, output, prompt, crlfDelay, terminal })`, `createInterface(input, output)` | `'line'` for each line, `'close'` at the end of the input (or `rl.close()`), `'pause'`, `'resume'` |
+| `rl.question(query, cb)`; `readline/promises`: `await rl.question(query)` | the query goes to `output`; the next line is the answer. A pending promise is rejected (`AbortError`) when the interface closes |
+| `rl.prompt()`, `setPrompt()`, `getPrompt()`, `write(data)`, `pause()`, `resume()`, `close()`, `closed` | |
+| `for await (const line of rl)` | the input pauses while 1024 lines wait to be read |
+| `clearLine`, `clearScreenDown`, `cursorTo`, `moveCursor`; `readline/promises`' `Readline` (`commit()`) | ANSI sequences written to the stream |
+
+Lines end at `\n`, `\r\n` or a lone `\r` (a `\r\n` split across two chunks is one ending when the `\n` comes within
+`crlfDelay` ms); the last line is emitted at the end of the input even without a newline. As in Node, with piped
+input every line already read is emitted at once: answers of `await rl.question()` asked one after another can be
+lost (the callback form, which asks the next question from the callback, gets each line).
+
+Differences from Node: there is no terminal line editing, history, completion or `'keypress'` event; on a terminal
+the input is read in its normal (cooked) mode, so the terminal echoes and edits the line, and `rl.line` and
+`rl.cursor` stay empty. No `'SIGINT'`/`'SIGTSTP'`/`'SIGCONT'` events; `emitKeypressEvents` does nothing.
+
+## tty
+
+| API | Notes |
+|---|---|
+| `isatty(fd)` | |
+| `process.stdin` (`tty.ReadStream`) | `'data'` (Buffers, or strings after `setEncoding`), `'end'`, `'close'` (on a pipe or a terminal), `pause()`/`resume()`, `pipe()`, `for await`; `isTTY` (true, or `undefined` off a terminal), `setRawMode(mode)`, `isRaw` |
+| `process.stdout`/`stderr` (`tty.WriteStream`) | `write`, `end`, `pipe()` target, `isTTY`, `columns`/`rows` (TIOCGWINSZ), `getWindowSize()`, `getColorDepth(env?)`/`hasColors(count?, env?)` with Node's rules (`FORCE_COLOR`, `NO_COLOR`, `TERM`, `COLORTERM`, `TMUX`, `CI`, `TERM_PROGRAM`) |
+
+`process.stdin` works over a pipe, a file, `/dev/null` and a terminal. It is read on the event loop in 64 KiB
+chunks, only while someone reads it (a `'data'` listener, `read()`, `pipe()`, `for await`, a readline interface):
+a paused or untouched stdin does not keep the program alive, as in Node. The descriptor is not made non-blocking (it
+is shared with the shell): a read comes only once the event loop says there is data.
+
+Differences from Node: `process.stdin` is a `tty.ReadStream` whatever fd 0 is (Node: a `net.Socket` for a pipe, an
+`fs.ReadStream` for a file); writes to `process.stdout`/`stderr` are synchronous (Node: asynchronous on pipes), and
+their `end()` ends the stream object only (the descriptor stays open, `console.log` goes on); `pipe()` into
+`process.stdout` ends that stream object when the source ends (Node leaves stdout open); there is no `'resize'`
+event (`getWindowSize()` reads the size again); `new tty.WriteStream(fd)` also works on a descriptor that is not a
+terminal.
 
 ## Default imports
 
