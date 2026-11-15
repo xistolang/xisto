@@ -2849,7 +2849,7 @@ XS_NOINLINE xs_str *xs_uset_key(void *v) {
         return xs_str_new(buf, (size_t)n);
     }
     if (f == xs_box_bool_free) return xs_str_new(((xs_box_i *)v)->v ? "bt" : "bf", 2);
-    int n = snprintf(buf, sizeof buf, "p%p", v);
+    int n = snprintf(buf, sizeof buf, "p%p", xs_fn_origin(v)); /* (a function through an adapter: the function) */
     return xs_str_new(buf, (size_t)n);
 }
 static void xs_print_any_quoted(void *p);
@@ -3453,7 +3453,7 @@ XS_NOINLINE bool xs_dyn_eq(void *a, void *b) {
         return x->len == y->len && memcmp(x->data, y->data, (size_t)x->len) == 0;
     }
     if (ta->free == xs_box_bool_free && tb->free == xs_box_bool_free) return ((xs_box_i *)a)->v == ((xs_box_i *)b)->v;
-    return false;
+    return (ta->origin || tb->origin) && xs_fn_origin(a) == xs_fn_origin(b); /* (one function through two adapters) */
 }
 /* Number(x) / arithmetic on an any: as JavaScript converts (null is 0, a string is parsed, an object is NaN) */
 XS_NOINLINE double xs_dyn_num(void *v) {

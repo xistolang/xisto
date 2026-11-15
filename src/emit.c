@@ -3397,8 +3397,12 @@ static void emit_expr_raw(Expr *e) {
         }
         /* an adapter around a function value (checker: rest_any_adapter): the function it wraps, for === */
         const char *origin_fn = "NULL";
-        if (f->origin && f->origin->kind == E_CALL && f->origin->lhs) {
-            Expr *o = f->origin->lhs; /* (the call the adapter makes: o is the function value it wraps) */
+        Expr *ocall = f->origin;
+        /* (the call may have been wrapped since: its result boxed for an unknown, xs_box_num(call), or read as R) */
+        while (ocall && ((ocall->kind == E_CALL && !ocall->lhs && ocall->builtin.cfn && ocall->args.len == 1) || ocall->kind == E_AS))
+            ocall = ocall->kind == E_AS ? ocall->lhs : ocall->args.items[0];
+        if (ocall && ocall->kind == E_CALL && ocall->lhs) {
+            Expr *o = ocall->lhs; /* (the call the adapter makes: o is the function value it wraps) */
             Capture *oc = NULL;
             for (int i = 0; i < a->ncaptures; i++)
                 if (!a->captures[i].is_this && o->str && strcmp(a->captures[i].name, o->str) == 0) oc = &a->captures[i];
@@ -3408,11 +3412,11 @@ static void emit_expr_raw(Expr *e) {
             } else if (!oc && o->kind == E_IDENT && o->cname) { /* a top-level variable */
                 buf_printf(out, "static void *%s_origin(void *p) { (void)p; return (void *)%s; }\n", f->cname, o->cname);
                 origin_fn = xs_sprintf("%s_origin", f->cname);
-            } else if (!oc && (f->origin->func || o->func) && (o->kind == E_FUNC_REF || o->kind == E_IDENT)) {
+            } else if (!oc && (ocall->func || o->func) && (o->kind == E_FUNC_REF || o->kind == E_IDENT)) {
                 /* a top-level function (or a const arrow compiled as one): its static closure, as the value reads elsewhere */
                 Expr fr = *o;
                 fr.kind = E_FUNC_REF;
-                fr.func = o->func ? o->func : f->origin->func;
+                fr.func = o->func ? o->func : ocall->func;
                 Buf ob = {0};
                 Buf *keep = out;
                 out = &ob;
@@ -3761,12 +3765,25 @@ static void emit_expr_raw(Expr *e) {
             buf_puts(out, ")))");
             return;
         }
-        if ((e->op == TK_EQ || e->op == TK_NEQ) && e->builtin.cfn && strcmp(e->builtin.cfn, "ref_eq") == 0) { /* the same object */
-            buf_puts(out, "((void *)(");
+        if ((e->op == TK_EQ || e->op == TK_NEQ) && ty_strip_null(e->lhs->type)->kind == TY_UNKNOWN &&
+            ty_strip_null(e->rhs->type)->kind == TY_UNKNOWN && !e->builtin.cfn) {
+            /* two unknowns: a function held through the adapters the checker made (its result boxed) is itself */
+            buf_puts(out, "(xs_fn_origin((void *)(");
             emit_borrowed(e->lhs);
-            buf_printf(out, ") %s (void *)(", e->op == TK_EQ ? "==" : "!=");
+            buf_printf(out, ")) %s xs_fn_origin((void *)(", e->op == TK_EQ ? "==" : "!=");
             emit_borrowed(e->rhs);
-            buf_puts(out, "))");
+            buf_puts(out, ")))");
+            return;
+        }
+        if ((e->op == TK_EQ || e->op == TK_NEQ) && e->builtin.cfn && strcmp(e->builtin.cfn, "ref_eq") == 0) { /* the same object */
+            /* an unknown (or any) may hold a function through an adapter the checker made: the function itself */
+            bool fo = ty_strip_null(e->lhs->type)->kind == TY_UNKNOWN || ty_strip_null(e->rhs->type)->kind == TY_UNKNOWN ||
+                      ty_is_any(e->lhs->type) || ty_is_any(e->rhs->type);
+            buf_puts(out, fo ? "(xs_fn_origin((void *)(" : "((void *)(");
+            emit_borrowed(e->lhs);
+            buf_printf(out, fo ? ")) %s xs_fn_origin((void *)(" : ") %s (void *)(", e->op == TK_EQ ? "==" : "!=");
+            emit_borrowed(e->rhs);
+            buf_puts(out, fo ? ")))" : "))");
             return;
         }
         if ((e->op == TK_EQ || e->op == TK_NEQ) && ((union_lit_field(e->lhs) && e->rhs->kind == E_STRING) || (union_lit_field(e->rhs) && e->lhs->kind == E_STRING))) {
@@ -14039,6 +14056,7 @@ static const char xs_nkey_c[] =
 static const char xs_okey_c[] =
     "static xs_str *xs_okey_text(void *k) {\n"
     "    char b[40];\n"
+    "    k = xs_fn_origin(k); /* (a function through the checker's adapters: the function itself) */\n"
     "    int n = k ? snprintf(b, sizeof b, \"p%p\", k) : snprintf(b, sizeof b, \"z\");\n"
     "    return xs_str_new(b, (size_t)n);\n"
     "}\n";
