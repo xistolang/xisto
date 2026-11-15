@@ -517,6 +517,8 @@ static bool cloned_per_site(Func *f) {
 }
 static void emit_func_body(Func *f);
 static void emit_signature(Func *f);
+static void prof_fn_note(Func *f, const char *cname, const char *storage);
+static void prof_inl_note(int site, Func *callee, bool inlined);
 static char *emit_clone(Func *f, int csite);
 static int fx_find(const char *c);
 static void ix_prove(Stmt *body);
@@ -2910,6 +2912,7 @@ static void emit_expr_(Expr *e) {
     /* (inside a region's code, a callee with a region version calls that version: it has no per-site clone) */
     bool rg_version = rg_hoist_on && cur_rg && callee && callee->rg_hoist == cur_rg && callee->rg_used;
     char *clone = user_call && !e->par_native && !rg_version && cloned_per_site(callee) ? emit_clone(callee, id) : NULL;
+    if (callee) prof_inl_note(id, callee, clone != NULL);
     Expr *saved_b = bracketing;
     bool is_void = !e->type || e->type->kind == TY_VOID;
     buf_puts(out, is_void ? "({ " : "({ __auto_type xr_ = ");
@@ -3159,6 +3162,7 @@ static void emit_expr_raw(Expr *e) {
         buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, xs_print_closure, %s%s};\n", f->cname, f->cname,
                    env_cyc ? xs_sprintf("%s_visit", f->cname) : "NULL",
                    strcmp(origin_fn, "NULL") ? xs_sprintf(", .origin = %s", origin_fn) : ""); /* (no adapter: the C as before) */
+        prof_fn_note(f, f->cname, "XS_FN");
         buf_printf(out, "XS_FN %s%s%s(%s_env *env", ctype(f->ret), ctype(f->ret)[strlen(ctype(f->ret)) - 1] == '*' ? "" : " ", f->cname, f->cname);
         for (int i = 0; i < f->nparams; i++) {
             buf_puts(out, ", ");
@@ -11407,8 +11411,46 @@ static void emit_stmt_(Stmt *s) {
 
 /* ---------- declarations ---------- */
 
+/* ---- xisto:profiler: names for the sampled code (runtime/xisto_prof.h) ----
+   xs_prof_fntab: each function the C compiler can keep out of line (XS_FN, XS_FI; not the always-inlined XS_FA and
+   XS_FII, whose code is their caller's) by its C name, which the executable's symbol table gives for an address;
+   by name, not by address, so that the table changes nothing in what the C compiler inlines.
+   xs_prof_inltab: the call sites of functions that are always inlined (XS_FA, XS_FII, the per-call-site copies):
+   code just before such a site's label is the callee's. Only for a program that imports the profiler. */
+static Buf prof_tab, prof_inl;
+static int nprof_fns, nprof_inl;
+static bool prof_defs;   /* emitting definitions (not prototypes) */
+static const char *prof_name(Func *f) {
+    return f->name && strcmp(f->name, "arrow") == 0 && !f->cls ? "(anonymous)" : dbg_func_name(f);
+}
+static void prof_entry(Buf *b, Func *f) {
+    site_str(b, prof_name(f));
+    buf_puts(b, ", ");
+    Module *m = f->mod ? f->mod : f->cls ? f->cls->mod : NULL;
+    site_str(b, m && m->file ? xs_display_path(m->file) : "?");
+    buf_printf(b, ", %d}", f->pos.line);
+}
+static void prof_fn_note(Func *f, const char *cname, const char *storage) {
+    if (!prof_defs || !prog || !prog->uses_profiler || !f || !cname) return;
+    if (strcmp(storage, "XS_FA") == 0 || strcmp(storage, "XS_FII") == 0) return;
+    buf_printf(&prof_tab, "%s    {\"%s\", ", nprof_fns ? ",\n" : "", cname);
+    prof_entry(&prof_tab, f);
+    nprof_fns++;
+}
+static void prof_inl_note(int site, Func *callee, bool inlined) {
+    if (!prog || !prog->uses_profiler || !callee || !callee->body) return;
+    if (!inlined) {
+        const char *st = fn_storage(callee);
+        if (strcmp(st, "XS_FA") != 0 && strcmp(st, "XS_FII") != 0) return;
+    }
+    buf_printf(&prof_inl, "%s    {&xs_sitetab[%d], ", nprof_inl ? ",\n" : "", site);
+    prof_entry(&prof_inl, callee);
+    nprof_inl++;
+}
+
 static void emit_signature(Func *f) {
     if (f->run_once && strcmp(fn_storage(f), "XS_FA") != 0 && strcmp(fn_storage(f), "XS_FII") != 0) buf_puts(out, "XS_RUN_ONCE "); /* (always_inline wins) */
+    prof_fn_note(f, f->cname, fn_storage(f));
     if (f->is_ctor) {
         buf_printf(out, "%s %s *%s(", fn_storage(f), f->cls->cname, f->cname);
     } else {
@@ -13897,6 +13939,11 @@ void emit_program(Program *p, Buf *o) {
     Buf body = {0};
     Buf *main_out = out;
     out = &body;
+    prof_defs = true;
+    prof_tab.len = prof_inl.len = 0;
+    if (prof_tab.data) prof_tab.data[0] = 0;
+    if (prof_inl.data) prof_inl.data[0] = 0;
+    nprof_fns = nprof_inl = 0;
     json_fns.len = 0;
     bce_rows_helper = bce_cmp_helper = bce_blocks_helper = false;
     if (json_fns.data) json_fns.data[0] = 0;
@@ -14301,6 +14348,11 @@ void emit_program(Program *p, Buf *o) {
     /* call sites for stack traces: read only when an error is reported */
     if (!nsites) buf_puts(&site_tab, "    {0}");
     buf_printf(out, "\n__attribute__((used)) const xs_site xs_sitetab[] = {\n%s\n};\n", site_tab.data);
+    if (p->uses_profiler) { /* (xisto:profiler) */
+        buf_printf(out, "\nconst xs_pfn xs_prof_fntab[] = {\n%s\n};\nconst int64_t xs_prof_nfn = %d;\n", nprof_fns ? prof_tab.data : "    {0, 0, 0, 0}", nprof_fns);
+        buf_printf(out, "const xs_pinl xs_prof_inltab[] = {\n%s\n};\nconst int64_t xs_prof_ninl = %d;\n", nprof_inl ? prof_inl.data : "    {0, 0, 0, 0}", nprof_inl);
+    }
+    prof_defs = false;
     if (xs_debug) {
         buf_printf(out, "\nconst xs_dbg_point xs_dbg_points[] = {\n%s\n};\nconst int xs_dbg_npoints = %d;\n", ndbg ? dbg_tab.data : "    {\"\", 0, 0}", ndbg);
         dbg_tab.len = 0;

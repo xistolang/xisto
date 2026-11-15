@@ -3612,6 +3612,21 @@ XS_NOINLINE xs_str *xs_os_arch_name(void) {
     return xs_str_new("x64", 3);
 #endif
 }
+/* os.release() and os.version(): the kernel's release and version strings (uname), as Node gives them */
+#if !defined(_WIN32)
+#include <sys/utsname.h>
+#endif
+XS_NOINLINE xs_str *xs_os_kernel_text(int64_t which) {
+#if defined(_WIN32)
+    (void)which;
+    return xs_str_new("", 0);
+#else
+    struct utsname u;
+    if (uname(&u) != 0) return xs_str_new("", 0);
+    const char *s = which == 0 ? u.release : u.version;
+    return xs_str_new(s, strlen(s));
+#endif
+}
 /* ---- fs.createReadStream / fs.createWriteStream (runtime/node/stream.ts): open, read, write and close that give
    -errno instead of throwing (the stream turns it into its 'error' event, with Node's code and message) */
 XS_NOINLINE int64_t xs_fs_stream_open(xs_str *path, xs_str *flags, int64_t mode) {

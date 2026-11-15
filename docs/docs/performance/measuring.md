@@ -28,6 +28,38 @@ Each call reads the clock twice. That makes a small function such as `fib` about
 find where the time goes, not how much there is. In a recursive function "total" counts nested calls more than
 once; read "self". The instrumentation exists only in a `--profile` build and only in the C backend.
 
+## `xisto:profiler`: sampling CPU profiles (pprof)
+
+`--profile` changes the program it measures. `xisto:profiler` samples the program as it is, in production too:
+99 times per second of CPU time, every thread, it records the stack of the running code. `collect()` returns the
+samples since the last call as a [pprof](https://github.com/google/pprof) profile (`profile.proto`, not
+compressed), which `go tool pprof`, Datadog and other tools read.
+
+```ts
+import { start, stop, collect } from "xisto:profiler";
+import { writeFileSync } from "xisto:fs";
+
+start(); // 99 Hz; start(hz) for another rate (1 to 1000)
+work();
+stop();
+writeFileSync("cpu.pprof", collect());
+```
+
+The sample types are `sample`/`count` and `cpu`/`nanoseconds`. Frames are the TypeScript functions, with file
+and line, including the ones the C compiler inlined; runtime code appears under its C name (`xs_loop_run`,
+`xs_str_concat`) and system libraries under theirs. A sample is worth the process's CPU time while sampling
+divided by the samples taken: macOS checks the timer on its 100 Hz clock and delivers fewer signals than asked,
+so the CPU time per function stays right even there.
+
+The signal handler walks the frame pointers xisto keeps for stack traces, reading each frame through the kernel
+(it cannot crash on a stray pointer), and counts the stack in a table without allocating or locking. One process
+has one profiler (`start()` returns false the second time). Not on Windows, not with `--backend=qbe`. The cost,
+measured on an M4 with three alternating runs: none visible in a CPU-bound program (2.44 s either way), 2 to 4%
+fewer requests per second in the Todo API under `oha` (a server that spends half its CPU in `read` and `write`:
+each signal interrupts a system call). A program that imports the module but does not call `start()` runs the
+same code as without it: the compiler only adds two tables of names.
+The dd-trace package uses it for Datadog's Profiles tab (`tracer.init({ profiling: true })`).
+
 ## `XISTO_RC_STATS=1`: allocations and leaks
 
 Any xisto executable run with this variable prints two counts at exit:
