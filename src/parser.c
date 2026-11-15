@@ -1149,6 +1149,11 @@ static void prepend_param_decls(Func *f) {
 }
 
 static Expr *ident_expr(Pos pos, const char *name);
+/* const f = () => ..., { next: () => ... }, x = function () {}: JavaScript names the function after what it is
+   given to (console.log shows [Function: f]) */
+static void fn_value_name(Expr *v, const char *name) {
+    if (v && v->kind == E_ARROW && v->arrow && v->arrow->fn && !v->arrow->fn->js_name && name) v->arrow->fn->js_name = (char *)name;
+}
 static Expr *parse_arrow(Parser *p) {
     Pos pos = p->tok.pos;
     Expr *e = new_expr(E_ARROW, pos);
@@ -1160,7 +1165,7 @@ static Expr *parse_arrow(Parser *p) {
     int cap = 0;
     bool is_fn = accept(p, TK_FUNCTION); /* function (a: A): R { ... }: an arrow (no `this` of its own) */
     Type *this_t = NULL; /* function (this: T, ...): T */
-    if (is_fn && at(p, TK_IDENT)) next(p);
+    if (is_fn && at(p, TK_IDENT)) { f->js_name = p->tok.str; next(p); } /* (function g() {}: its name, g) */
     /* <T>(sql: string): Promise<T | null> => ...: a generic arrow, held as a function of unknowns (T erased) whose
        signature as written stays with it (Arrow.gen_sig): a call queryOne<Row>(...) converts the result to Row */
     char **gtp = NULL;
@@ -1572,7 +1577,7 @@ static Expr *parse_primary(Parser *p) {
             else if (tok_keyword_text(p->tok.kind) && (p->tok.kind != TK_THIS)) { key = expect_prop_name(p, NULL); }
             else { xs_error(XS1018, p->tok.pos, "keys are names or strings: { id: 1, \"Content-Type\": \"x\" }", "expected a key in the object literal"); return NULL; }
             Expr *val;
-            if (accept(p, TK_COLON)) val = parse_assign(p);
+            if (accept(p, TK_COLON)) { val = parse_assign(p); fn_value_name(val, key.str); }
             else { /* shorthand { id } */
                 if (key.kind != TK_IDENT) xs_error(XS8078, key.pos, NULL, "a string key needs a value");
                 val = new_expr(E_IDENT, key.pos);
@@ -2172,6 +2177,7 @@ static Expr *parse_assign(Parser *p) {
         e->op = op;
         e->lhs = lhs;
         e->rhs = parse_assign(p);
+        if (op == TK_ASSIGN && lhs->kind == E_IDENT) fn_value_name(e->rhs, lhs->str); /* (x = () => 7: x; o.f = ...: anonymous) */
         return e;
     }
     return lhs;
@@ -2582,6 +2588,7 @@ static Stmt *parse_var(Parser *p) {
             xs_error(XS8146, p->tok.pos, "xisto has no 'undefined', so every variable starts with a value", "variable '%s' must be initialized", s->name);
         next(p);
         s->init = parse_expr(p);
+        fn_value_name(s->init, s->name);
         self_ref_split(p, s);
     }
     while (at(p, TK_COMMA)) { /* let a = 1, b = 2: the next ones follow as their own declarations */
@@ -2600,6 +2607,7 @@ static Stmt *parse_var(Parser *p) {
                 xs_error(XS8146, p->tok.pos, "xisto has no 'undefined', so every variable starts with a value", "variable '%s' must be initialized", d->name);
             next(p);
             d->init = parse_expr(p);
+            fn_value_name(d->init, d->name);
         }
         stmt_list_push(&p->pending, d);
     }
@@ -4075,7 +4083,7 @@ static void parse_fields_body(Parser *p, Class *c) {
                 fd.type_src = span(p, tfrom);
             }
             if (fd.optional) fd.type = ty_optional_of(fd.type);
-            if (accept(p, TK_ASSIGN)) fd.init = parse_expr(p);
+            if (accept(p, TK_ASSIGN)) { fd.init = parse_expr(p); fn_value_name(fd.init, name.str); }
             if (!accept(p, TK_SEMI) && !at(p, TK_RBRACE)) accept(p, TK_COMMA); /* interfaces also separate with ',' or nothing */
             if (mods & MOD_ABSTRACT) xs_error(XS8106, pos, NULL, "fields cannot be abstract");
             if (mods & MOD_STATIC) { /* a top-level variable, made by the caller where the class is declared */

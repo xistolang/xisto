@@ -3329,6 +3329,7 @@ static bool json_ok(Type *t, int depth) {
                 continue; /* total?: SearchTotalHits | number: a JSON object read as the one object member, the rest by kind */
             if (k == TY_OBJECT && json_ok_union_objs && !t->params[i]->cls->builtin && json_ok(t->params[i], depth + 1))
                 continue; /* (written: DocRollout | DocGlobal, each object by its class at run time, as an unknown is) */
+            if (k == TY_FUNC) continue; /* string | ((a) => string): a function is left out, as JSON.stringify does (never read) */
             if (k != TY_NUMBER && k != TY_INT && k != TY_STRING && k != TY_BOOLEAN) return false;
         }
         return true;
@@ -3349,8 +3350,11 @@ static bool json_ok(Type *t, int depth) {
             bool ok = true;
             bool wu = json_ok_union_objs;
             if (t->cls->json_written) json_ok_union_objs = true;
-            for (int i = 0; i < t->cls->nfields && ok; i++)
-                if (!json_ok(t->cls->fields[i].type, depth + 1)) ok = false;
+            for (int i = 0; i < t->cls->nfields && ok; i++) {
+                Type *ft = t->cls->fields[i].type;
+                if (ft->kind == TY_NULLABLE && ft->elem->kind == TY_FUNC) continue; /* next?: (v: T) => void: left out, as JSON.stringify does */
+                if (!json_ok(ft, depth + 1)) ok = false;
+            }
             json_ok_union_objs = wu;
             nopen--;
             return ok;
@@ -3439,6 +3443,7 @@ static bool always_returns(Stmt *s);
 static void check_block(Stmt *b);
 static Binding *narrow_target(Expr *cond, bool *not_null);
 static const char *path_key(Expr *m);
+static const char *upath_key(Expr *m);
 typedef struct { Binding *b[8]; int n; } NSet;
 static void narrow_set(Expr *c, bool when, NSet *out);
 static void shadow_set(NSet *s);
@@ -4056,6 +4061,7 @@ static Type *union_member_for(Type *u, Type *t, Expr *e) {
     }
     return NULL;
 }
+static bool shape_copy(Expr *e, Type *want);
 /* a value goes into a union: boxed like an unknown (a union of fewer members is already one) */
 static bool enter_union(Expr *e, Type *want) {
     Type *u = want->kind == TY_NULLABLE ? want->elem : want;
@@ -4072,6 +4078,9 @@ static bool enter_union(Expr *e, Type *want) {
     if (!m && gb->kind == TY_ARRAY && g->kind != TY_NULLABLE) /* string[] where Record<string, unknown> | unknown[] goes */
         for (int i = 0; i < u->nparams && !m; i++)
             if (u->params[i]->kind == TY_ARRAY && elem_widens(gb->elem, u->params[i]->elem)) { arr_convert(e, u->params[i]->elem); m = u->params[i]; }
+    if (!m && gb->kind == TY_OBJECT && g->kind != TY_NULLABLE) /* { next } where Partial<Observer<T>> | ((v: T) => void) goes: copied into the object member its fields fit */
+        for (int i = 0; i < u->nparams && !m; i++)
+            if (u->params[i]->kind == TY_OBJECT && shape_copy(e, u->params[i])) m = u->params[i];
     if (!m) return false;
     if (g->kind == TY_LITINT) coerce_lit(e, m);
     to_unknown(e);
@@ -6625,6 +6634,13 @@ static void unify(Type *pat, Type *got, Func *tmpl, Type **bind) {
             if (pm->kind == TY_PROMISE) unify(pm->elem, g, tmpl, bind);
             else if (pm->kind == TY_TPARAM) unify(pm, g, tmpl, bind);
         }
+        /* Partial<Observer<T>> | ((value: T) => void) given a function: T from the function member (given an object:
+           from the object members, field by field) */
+        int nf = 0, fi = -1;
+        for (int m = 0; m < pat->nparams; m++) if (pat->params[m]->kind == TY_FUNC) { nf++; fi = m; }
+        if (got->kind == TY_FUNC && nf == 1) unify(pat->params[fi], got, tmpl, bind);
+        else if (got->kind == TY_OBJECT)
+            for (int m = 0; m < pat->nparams; m++) if (pat->params[m]->kind == TY_OBJECT) unify(pat->params[m], got, tmpl, bind);
         return;
     }
     if (pat->kind == TY_PROMISE && got->kind != TY_PROMISE) { unify(pat->elem, got, tmpl, bind); return; } /* () => Promise<T> against an async function's R */
@@ -6792,6 +6808,7 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
         bool arrow = e->args.items[i]->kind == E_ARROW;
         if (arrow != (pass == 1)) continue;
         Type *pt = tmpl->params[i].type, *ctx = NULL;
+        if (arrow && pt->kind == TY_NULLABLE && pt->elem->kind == TY_UNION) pt = pt->elem; /* (cb?: Obs<T> | ((v: T) => void)) */
         if (arrow && pt->kind == TY_UNION) { /* trabalho: Promise<T> | ((sinal: S) => Promise<T>) given an arrow: its function type */
             Type *fm = NULL;
             int nf = 0;
@@ -6999,6 +7016,21 @@ static void check_object_member(Expr *e, Class *c) {
         }
     }
 }
+/* e becomes v (a union, checked) seen as its member t: an unchecked conversion; a function returning a primitive is held
+   in the union returning it boxed (to_unknown), so it is read back through an adapter that unboxes the result */
+static void fn_adapt(Expr *e, Expr *x, Type *ft, Type *ret, Type *unbox);
+static void union_member_read(Expr *e, Expr *v, Type *t) {
+    memset(e, 0, sizeof *e);
+    e->kind = E_AS; e->op = TK_DOT; e->pos = v->pos; e->lhs = v; e->field = -1;
+    e->type = t; e->elem_type = t;
+    if (t->kind == TY_FUNC && t->ret && !ty_is_heap(t->ret) && t->ret->kind != TY_VOID && t->ret->kind != TY_UNKNOWN && !t->async_ret) {
+        Type *g = ty_func(t->params, t->nparams, ty_unknown);
+        Expr *x = expr_copy(e);
+        x->type = g; x->elem_type = g;
+        x->prechecked = true;
+        fn_adapt(e, x, g, t->ret, t->ret);
+    }
+}
 static void check_object_member_in(Expr *e, Class *c) {
     Type *mexp = member_expected;
     member_expected = NULL;
@@ -7036,17 +7068,41 @@ static void check_object_member_in(Expr *e, Class *c) {
     Field *f = find_field(c, e->str, &idx);
     bool null_fn = f && e->is_call && e->opt_call && f->type->kind == TY_NULLABLE && f->type->elem->kind == TY_FUNC;
     bool narrowed_fn = f && e->is_call && !e->opt_call && f->type->kind == TY_NULLABLE && f->type->elem->kind == TY_FUNC && tsc_checked();
-    if (f && e->is_call && (f->type->kind == TY_FUNC || null_fn || narrowed_fn)) { /* obj.run(x) where run is a function-valued field (obj.run?.(x): may be null) */
-        Type *ft = f->type->kind == TY_NULLABLE ? f->type->elem : f->type;
+    bool path_nn = false;
+    Type *ufn = NULL; /* o.message(a) after typeof o.message === "function": the function member */
+    if (f && e->is_call && !e->opt_call && ty_strip_null(f->type)->kind == TY_UNION && !c->builtin) {
+        Expr probe = {.kind = E_MEMBER, .pos = e->pos, .lhs = e->lhs, .field = idx, .type = f->type, .cls = c, .str = e->str};
+        const char *key = upath_key(&probe);
+        Binding *pb = key ? lookup(key) : NULL;
+        if (pb && pb->union_narrow && pb->type->kind == TY_FUNC) ufn = pb->type;
+    }
+    if (f && e->is_call && !e->opt_call && !narrowed_fn && f->type->kind == TY_NULLABLE && f->type->elem->kind == TY_FUNC && !c->builtin) {
+        /* if (o.next) o.next(v): the path o.next narrowed to not null by the test */
+        Expr probe = {.kind = E_MEMBER, .pos = e->pos, .lhs = e->lhs, .field = idx, .type = f->type, .cls = c, .str = e->str};
+        const char *key = path_key(&probe);
+        Binding *pb = key ? lookup(key) : NULL;
+        narrowed_fn = path_nn = pb && pb->type->kind != TY_NULLABLE;
+    }
+    if (f && e->is_call && (f->type->kind == TY_FUNC || null_fn || narrowed_fn || ufn)) { /* obj.run(x) where run is a function-valued field (obj.run?.(x): may be null) */
+        Type *ft = ufn ? ufn : f->type->kind == TY_NULLABLE ? f->type->elem : f->type;
         Expr *fld = expr_copy(e);
         fld->is_call = false;
         fld->args.len = 0;
         fld->args.items = NULL;
         fld->field = idx;
         fld->type = null_fn ? f->type : ft;
-        if (!null_fn && f->type->kind == TY_NULLABLE) { /* this.f(x) after if (this.f): tsc narrowed it; read as this.f! */
+        if (ufn) {
+            Expr *in = expr_copy(fld);
+            in->type = f->type;
+            in->cls = c;
+            union_member_read(fld, in, ufn);
+        } else if (!null_fn && f->type->kind == TY_NULLABLE) { /* this.f(x) after if (this.f): tsc narrowed it; read as this.f! */
             fld->type = f->type;
-            nonnull_checked(fld, xs_sprintf("'%s'", f->name));
+            if (path_nn) { /* (narrowed by xisto too: the same checked read, no warning) */
+                Expr *in = expr_copy(fld);
+                memset(fld, 0, sizeof *fld);
+                fld->kind = E_AS; fld->op = TK_NOT; fld->pos = in->pos; fld->lhs = in; fld->field = -1; fld->type = in->type->elem;
+            } else nonnull_checked(fld, xs_sprintf("'%s'", f->name));
         }
         e->kind = E_CALL;
         e->lhs = fld;
@@ -7083,6 +7139,16 @@ static void check_object_member_in(Expr *e, Class *c) {
         e->field = idx;
         e->type = f->type;
         e->cls = c;
+        if (ty_strip_null(e->type)->kind == TY_UNION) { /* narrowed by typeof o.f === "function" (instanceof, ...): read as
+                                                         that member, as a narrowed variable is */
+            const char *key = upath_key(e);
+            Binding *pb = key ? lookup(key) : NULL;
+            if (pb && pb->union_narrow && pb->type != e->type) {
+                if (pb->type->kind == TY_UNION) e->type = pb->type;
+                else union_member_read(e, expr_copy(e), pb->type);
+                return;
+            }
+        }
         if (e->type->kind == TY_NULLABLE) { /* narrowed by o.f !== null: read as o.f! (checked) */
             const char *key = path_key(e);
             Binding *pb = key ? lookup(key) : NULL;
@@ -8813,14 +8879,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (b->union_narrow && b->type->kind != TY_UNION) { /* seen as one member: read through an (unchecked) conversion */
             Expr *v = expr_copy(e);
             v->type = b->orig;
-            memset(e, 0, sizeof *e);
-            e->kind = E_AS;
-            e->pos = v->pos;
-            e->lhs = v;
-            e->op = TK_DOT;
-            e->type = b->type;
-            e->elem_type = b->type;
-            e->field = -1;
+            union_member_read(e, v, b->type);
         }
         return;
     }
@@ -9675,6 +9734,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             }
         }
         const char *path_assigned = NULL; /* o.f = v: the field path, narrowed or not by what v is */
+        const char *upath_assigned = NULL; /* (o.f narrowed to a member of its union: seen as the whole union after) */
         if (e->kind == E_ASSIGN && target->kind == E_MEMBER && !target->is_call && (rereadable(target->lhs) || e->op == TK_ASSIGN || cast_path(target->lhs)) &&
             !(target->lhs->kind == E_IDENT && !lookup(target->lhs->str))) { /* obj.x = v with set x(v) (not Class.static); (u as C).x = v
                                                                                 (read once: no getter call, so any receiver) */
@@ -9728,6 +9788,11 @@ static void check_expr_in(Expr *e, Type *expected) {
             /* o.f = v with o.f narrowed: the target is the field itself, not its checked read (inner reads, as
                the n.next of n.next.next = v, stay checked reads) */
             if (target->kind == E_AS && target->op == TK_NOT && !target->elem_type && target->lhs->kind == E_MEMBER) *target = *target->lhs;
+            if (target->kind == E_AS && target->op == TK_DOT && target->elem_type && target->lhs->kind == E_MEMBER) {
+                /* o.message = v with o.message narrowed to a member of its union: the field itself, its union again after */
+                *target = *target->lhs;
+                upath_assigned = upath_key(target);
+            }
             path_assigned = path_key(target); /* settled after the value is checked (below) */
         }
         Binding *narrowed = NULL;
@@ -9850,6 +9915,19 @@ static void check_expr_in(Expr *e, Type *expected) {
             Binding *b = lookup(target->str);
             if (b && b->type->kind == TY_NULLABLE && strncmp(b->cname, "env->", 5) != 0) shadow_narrowed(b); /* (in a cell too: its reads checked) */
         }
+        if (upath_assigned) {
+            Binding *ub = lookup(upath_assigned);
+            if (ub && ub->union_narrow && ub->orig) {
+                Binding *n = xs_alloc(sizeof *n);
+                *n = *ub;
+                n->origin = ub;
+                n->type = ub->orig;
+                n->orig = NULL;
+                n->union_narrow = false;
+                n->next = scope->head;
+                scope->head = n;
+            }
+        }
         if (path_assigned) { /* as TypeScript: after o.f = <not null>, o.f is not null; after o.f = <maybe null>, it may be */
             Binding *pb = lookup(path_assigned);
             bool nonnull = e->op == TK_ASSIGN && e->rhs->type->kind != TY_NULLABLE && e->rhs->kind != E_NULL;
@@ -9930,8 +10008,17 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
+        bool lhs_done = false;
+        if (e->lhs->kind == E_IDENT && e->lhs->str && !lookup_func(e->lhs->str)) {
+            /* x() with x: number | (() => number) narrowed to the function: held in the union returning its result boxed,
+               so it is called through the read that unboxes it (union_member_read) */
+            Binding *ub = lookup(e->lhs->str);
+            Type *t = ub && ub->union_narrow ? ub->type : NULL;
+            if (t && t->kind == TY_FUNC && t->ret && !ty_is_heap(t->ret) && t->ret->kind != TY_VOID && t->ret->kind != TY_UNKNOWN && !t->async_ret)
+                { check_expr(e->lhs, NULL); lhs_done = true; }
+        }
         if (e->lhs->kind != E_IDENT) { /* (() => ...)(), f(a)(b): the function value an expression gives */
-            check_expr(e->lhs, NULL);
+            if (!lhs_done) check_expr(e->lhs, NULL);
             Type *ft = e->lhs->type;
             if (ft->kind == TY_NULLABLE && ft->elem->kind == TY_FUNC && tsc_checked()) { /* F[k](v) with F a Record of functions */
                 nonnull_checked(e->lhs, "the called function");
@@ -11770,7 +11857,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     Type *t = e->args.items[i]->type;
                     if (ty_is_undef(t)) { undef_text(e->args.items[i]); continue; } /* console.log(f()) with f(): undefined */
                     if (t->kind == TY_JSON) { from_json(e->args.items[i], ty_unknown); continue; } /* (an object: its JSON text read back, printed as the value) */
-                    if (t->kind == TY_VOID || t->kind == TY_FUNC)
+                    if (t->kind == TY_VOID) /* (a function: [Function: f], as Node shows it) */
                         xs_error(XS8097, e->args.items[i]->pos, NULL, "cannot print a %s value", ty_name(t));
                 }
                 e->type = ty_void;
@@ -14470,6 +14557,7 @@ static bool cond_truthy_type(Type *t) {
 }
 static bool rereadable(Expr *e) {
     if (e->kind == E_IDENT || e->kind == E_THIS) return true;
+    if (e->kind == E_AS && e->op == TK_DOT && e->elem_type && e->lhs && e->lhs->kind == E_IDENT) return true; /* x seen as a member of its union */
     return e->kind == E_MEMBER && !e->is_call && e->field >= 0 && rereadable(e->lhs);
 }
 /* a checked condition the types decide: typeof n === "object" with n a number, false && x (TypeScript narrows the
@@ -14998,7 +15086,7 @@ static void check_cond(Expr *c, const char *what) {
    the scopes, from the variable's C name (unique, so an inner `o` that shadows it is another path), or NULL */
 /* the stable reference a path starts from: x, this, x.f, this.f.g (fields only, no calls), or NULL */
 static const char *path_base(Expr *e) {
-    while (e && e->kind == E_AS && e->op == TK_NOT && !e->elem_type) e = e->lhs; /* o.f narrowed already: the same path */
+    while (e && e->kind == E_AS && ((e->op == TK_NOT && !e->elem_type) || (e->op == TK_DOT && e->elem_type))) e = e->lhs; /* o.f narrowed already (to not null, or to a member of its union): the same path */
     if (!e) return NULL;
     if (e->kind == E_THIS) return "this";
     if (e->kind == E_IDENT) {
@@ -15162,6 +15250,29 @@ static Expr *union_ident(Expr *e) { /* x, or x seen through a narrowing */
     if (e->kind == E_AS && e->op == TK_DOT) e = e->lhs;
     return e->kind == E_IDENT ? e : NULL;
 }
+/* a field of a union type read through a variable or `this` (o.message, this.h.f): the name its union narrowing goes by
+   in the scopes (as path_key's for a null test) */
+static const char *upath_key(Expr *m) {
+    while (m && m->kind == E_AS && ((m->op == TK_DOT && m->elem_type) || (m->op == TK_NOT && !m->elem_type))) m = m->lhs; /* (narrowed
+                                                                                 already by an outer test: to a member, or not null) */
+    if (!m || m->kind != E_MEMBER || m->is_call || m->field < 0 || !m->type || !m->cls || m->cls->builtin) return NULL;
+    if (ty_strip_null(m->type)->kind != TY_UNION) return NULL;
+    const char *in = path_base(m->lhs);
+    return in ? xs_sprintf("\x01u%s.%d.%s", in, m->field, m->cls->name) : NULL;
+}
+static Binding *upath_binding(Expr *m) {
+    const char *key = upath_key(m);
+    if (!key) return NULL;
+    Binding *b = lookup(key);
+    if (b) return b;
+    Type *t = m->type; /* (this.h after this.h !== null: the union without null) */
+    while (m->kind == E_AS) m = m->lhs;
+    b = xs_alloc(sizeof *b);
+    b->name = (char *)key;
+    b->type = t;
+    b->cname = "";
+    return b;
+}
 static UNarrow union_narrow(Expr *c) {
     UNarrow r = {0};
     if (c->kind == E_UNARY && c->op == TK_NOT) { /* !(x instanceof C): the branches swap */
@@ -15235,25 +15346,26 @@ static UNarrow union_narrow(Expr *c) {
     bool is_ufield = c->kind == E_MEMBER && c->builtin.cfn && strcmp(c->builtin.cfn, "union_field") == 0;
     if (c->kind != E_BINARY && !is_ufield) return r;
     bool neg = c->kind == E_BINARY && c->op == TK_NEQ;
-    Expr *id = NULL, *lit = NULL, *bfield = NULL;
+    Expr *id = NULL, *lit = NULL, *bfield = NULL, *subj = NULL;
     bool bwant = true;
     int how = 0; /* 1 typeof, 2 instanceof, 3 discriminant field, 4 boolean discriminant ({ ok: true } | { ok: false }) */
-    if (is_ufield) { id = union_ident(c->lhs); how = 4; bfield = c; }
+    if (is_ufield) { subj = c->lhs; how = 4; bfield = c; }
     else if ((c->op == TK_EQ || c->op == TK_NEQ) && (c->rhs->kind == E_BOOL || c->lhs->kind == E_BOOL)) {
         Expr *a = c->rhs->kind == E_BOOL ? c->lhs : c->rhs, *bl = c->rhs->kind == E_BOOL ? c->rhs : c->lhs;
-        if (a->kind == E_MEMBER && a->builtin.cfn && strcmp(a->builtin.cfn, "union_field") == 0) { id = union_ident(a->lhs); how = 4; bfield = a; bwant = bl->boolean; }
+        if (a->kind == E_MEMBER && a->builtin.cfn && strcmp(a->builtin.cfn, "union_field") == 0) { subj = a->lhs; how = 4; bfield = a; bwant = bl->boolean; }
     }
-    else if (c->op == TK_IDENT) { id = union_ident(c->lhs); how = 2; }
+    else if (c->op == TK_IDENT) { subj = c->lhs; how = 2; }
     else if (c->op == TK_EQ || c->op == TK_NEQ) {
         Expr *a = c->lhs, *b = c->rhs;
         if (b->kind != E_STRING) { Expr *t = a; a = b; b = t; }
         if (b->kind != E_STRING) return r;
         lit = b;
-        if (a->kind == E_UNARY && a->op == TK_IDENT) { id = union_ident(a->lhs); how = 1; }
-        else if (a->kind == E_MEMBER && a->builtin.cfn && strcmp(a->builtin.cfn, "union_field") == 0) { id = union_ident(a->lhs); how = 3; }
+        if (a->kind == E_UNARY && a->op == TK_IDENT) { subj = a->lhs; how = 1; }
+        else if (a->kind == E_MEMBER && a->builtin.cfn && strcmp(a->builtin.cfn, "union_field") == 0) { subj = a->lhs; how = 3; }
     }
-    if (!id) return r;
-    Binding *b = lookup(id->str);
+    if (!subj) return r;
+    id = union_ident(subj);
+    Binding *b = id ? lookup(id->str) : upath_binding(subj); /* (o.message: the field path, as TypeScript narrows it) */
     if (!b) return r;
     if (how == 2 && !neg && b->type->kind == TY_OBJECT && b->type->cls->builtin && strcmp(b->type->cls->name, "Error") == 0 &&
         c->rhs->cls && is_error_class(c->rhs->cls)) { /* catch (e) { if (e instanceof HttpException) ... }: e is the thrown object */
