@@ -3164,7 +3164,7 @@ XS_NOINLINE double xs_math_min_ints(xs_arr_int *a) { double m = INFINITY; for (s
    field). An object made as an any ({} or { a: 1 } typed any) is a Record<string, unknown>. ---- */
 enum { XD_NUM, XD_INT, XD_BOOL, XD_NNUM, XD_NINT, XD_NBOOL, XD_STR, XD_REF, XD_ANY };
 typedef struct { const char *name; uint32_t len, off; uint8_t kind, nullable, optional; bool (*isa)(void *); const char *tname; } xs_dyn_field;
-typedef struct xs_dyn_cls { const char *name; int32_t n; const xs_dyn_field *f; int32_t nm; const char *const *m; int32_t shape; } xs_dyn_cls; /* m: its methods' names; shape: an interface's (made from literals: an optional field left out is not there) */
+typedef struct xs_dyn_cls { const char *name; int32_t n; const xs_dyn_field *f; int32_t nm; const char *const *m; int32_t shape; int32_t err; } xs_dyn_cls; /* m: its methods' names; shape: an interface's (made from literals: an optional field left out is not there); err: a class that extends Error */
 /* a method read by name through an any (typeof x.toJSON === "function"): a function whose call is not supported yet */
 XS_NOINLINE void xs_dyn_method_called(void) { xs_panic("TypeError: a method read through an any cannot be called (call it on a value of its class)"); }
 static xs_closure xs_dyn_method_cl = {{XS_IMMORTAL, 0}, (void *)xs_dyn_method_called};
@@ -3233,6 +3233,9 @@ XS_NOINLINE void *xs_dyn_get(void *o, xs_str *k) {
     const xs_type *t = xs_type_of(o);
     if (t->dyn) {
         const xs_dyn_field *f = xs_dyn_field_of(t->dyn, k);
+        if (!f && t->dyn->err && k->len == 5 && memcmp(k->data, "stack", 5) == 0) /* err.stack, err a TypeError (a class that
+                                                                                    extends Error): through the Error that wraps it */
+            return xs_retain_(xs_Error_stack(xs_ar(xs_Error_wrap_err(o))));
         if (!f) return xs_dyn_has_method(t->dyn, k) ? xs_cl_static(&xs_dyn_method_cl) : NULL; /* a field the class does not
                                 declare reads as undefined, as in JavaScript (err?.status || 500); writing one is still an error */
         return xs_dyn_load(f, o);

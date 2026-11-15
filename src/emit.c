@@ -2670,8 +2670,8 @@ static void emit_dyn_tables(Program *p) {
                 nm++;
             }
         if (nm) buf_puts(&tabs, "};\n");
-        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s, %d};\n", c->cname, c->name, c->nfields, c->nfields ? xs_sprintf("%s_dynf", c->cname) : "NULL",
-                   nm, nm ? xs_sprintf("%s_dynm", c->cname) : "NULL", c->is_interface ? 1 : 0);
+        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s, %d, %d};\n", c->cname, c->name, c->nfields, c->nfields ? xs_sprintf("%s_dynf", c->cname) : "NULL",
+                   nm, nm ? xs_sprintf("%s_dynm", c->cname) : "NULL", c->is_interface ? 1 : 0, !c->builtin && is_error_class(c) ? 1 : 0);
     }
     if (fns.data) buf_puts(out, fns.data);
     if (tabs.data) buf_puts(out, tabs.data);
@@ -2998,6 +2998,13 @@ static void emit_expr_raw(Expr *e) {
             Type *lt = e->lhs->type;
             if (t->kind == TY_OBJECT && is_error_class(t->cls) && lt && lt->kind == TY_OBJECT && lt->cls->builtin && strcmp(lt->cls->name, "Error") == 0) {
                 buf_printf(out, "((%s)xs_Error_thrown(%s))", ctype(t), b.data); /* catch (e) { if (e instanceof X) e.code } */
+                free(b.data);
+                return;
+            }
+            if (t->kind == TY_OBJECT && t->cls->builtin && !strcmp(t->cls->name, "Error") && lt && (lt->kind == TY_UNKNOWN || lt->kind == TY_UNION)) {
+                /* err: unknown narrowed by instanceof Error: a TypeError object (a class that extends Error) read as the
+                   Error that wraps it, as where an Error goes */
+                buf_puts(out, from_unknown(t, b.data)); /* (an arena string) */
                 free(b.data);
                 return;
             }

@@ -61,6 +61,11 @@ static bool wants_okmap; /* WeakMap, or Map<object, V>, was written: xisto:okmap
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
 static void import_process(Program *prog, Module *m);
 static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... was named: xisto:url is loaded */
+static bool wants_errors; /* TypeError, RangeError, SyntaxError or ReferenceError was named: xisto:errors is loaded */
+static bool is_js_error_name(const char *n) {
+    return n && (!strcmp(n, "TypeError") || !strcmp(n, "RangeError") || !strcmp(n, "SyntaxError") || !strcmp(n, "ReferenceError") ||
+                 !strcmp(n, "URIError"));
+}
 static bool is_url_global_name(const char *n);
 /* generics: the type parameters in scope while a template is parsed, or their types while an instance is */
 static int no_dyn_note; /* inside generated code: its anys are not the program's uses */
@@ -157,6 +162,7 @@ static Type *parse_type(Parser *p);
 /* Unresolved class names are stored as objects of a placeholder class; the checker resolves them. */
 static Type *named_type(Parser *p, Token name) {
     if (is_url_global_name(name.str)) wants_url = true; /* (a URL or AbortSignal parameter) */
+    if (is_js_error_name(name.str)) wants_errors = true; /* (a TypeError parameter, field or return type) */
     Class *c = xs_alloc(sizeof *c);
     c->name = name.str;
     c->pos = name.pos;
@@ -1261,12 +1267,7 @@ static Expr *parse_arrow(Parser *p) {
 }
 
 static bool tmpl_raw; /* parsing the template of String.raw`...` */
-static bool wants_errors; /* TypeError, RangeError, SyntaxError or ReferenceError was named: xisto:errors is loaded */
 static bool wants_intl; /* Intl.X was named: xisto:intl is loaded (Intl.DateTimeFormat is its class Intl_DateTimeFormat) */
-static bool is_js_error_name(const char *n) {
-    return n && (!strcmp(n, "TypeError") || !strcmp(n, "RangeError") || !strcmp(n, "SyntaxError") || !strcmp(n, "ReferenceError") ||
-                 !strcmp(n, "URIError"));
-}
 /* the web globals xisto:url declares (runtime/node/url.ts) */
 static bool is_url_global_name(const char *n) {
     return n && (!strcmp(n, "URL") || !strcmp(n, "URLSearchParams") || !strcmp(n, "AbortController") || !strcmp(n, "AbortSignal") ||
@@ -3611,6 +3612,7 @@ static Class *parse_class_ex(Parser *p, bool abstract) {
         next(p);
         c->base_pos = p->tok.pos;
         Token bt = expect(p, TK_IDENT, NULL);
+        if (is_js_error_name(bt.str)) wants_errors = true; /* (class E extends TypeError) */
         bool mapped = !strcmp(bt.str, "PartialType") || !strcmp(bt.str, "OmitType") || !strcmp(bt.str, "PickType") || !strcmp(bt.str, "IntersectionType");
         if (at(p, TK_LPAREN) && mapped) c->mixin = parse_mixin_rest(p, bt); /* extends PartialType(CreateDto) */
         else if (at(p, TK_LPAREN)) { /* extends PassportStrategy(Strategy, "jwt"), AuthGuard(["jwt"]): a class factory as the

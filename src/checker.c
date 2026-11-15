@@ -6792,6 +6792,14 @@ static void check_object_member_in(Expr *e, Class *c) {
     Type *mexp = member_expected;
     member_expected = NULL;
     e->cls = c;
+    if (!c->builtin && is_error_class(c) && !e->is_call && strcmp(e->str, "stack") == 0 && !find_field(c, "stack", NULL)) {
+        /* err.stack with err a TypeError (an object of a class that extends Error): read through the Error it is
+           where an Error goes (its name and message; the trace from here, the object keeps none) */
+        Class *ec = find_class("Error");
+        wrap_call(e->lhs, "xs_Error_wrap_err", ty_object_of(ec));
+        c = ec;
+        e->cls = ec;
+    }
     if (c->builtin && strcmp(c->name, "Error") == 0 && !e->is_call && strcmp(e->str, "stack") == 0) {
         /* e.stack: built from the trace captured at creation, the first time it is read */
         e->field = -1;
@@ -12703,7 +12711,10 @@ static void check_expr_in(Expr *e, Type *expected) {
             Type *w = want->kind == TY_NULLABLE ? want->elem : want;
             bool lit = v->type->kind == TY_LITINT;
             if (v->type->kind == TY_ENUM && v->type->en->is_string && want->kind == TY_STRING) { *e = *v; e->type = ty_string; return; }
-            bool up = (want->kind == TY_NULLABLE && (ty_equal(v->type, w) || (lit && is_numeric(w)))) ||
+            Type *vs = ty_strip_null(v->type);
+            bool up = (w->kind == TY_OBJECT && w->cls->builtin && !strcmp(w->cls->name, "Error") && vs->kind == TY_OBJECT && !vs->cls->builtin &&
+                       is_error_class(vs->cls) && (v->type->kind != TY_NULLABLE || want->kind == TY_NULLABLE)) || /* (new TypeError(m) as Error) */
+                      (want->kind == TY_NULLABLE && (ty_equal(v->type, w) || (lit && is_numeric(w)))) ||
                       (w->kind == TY_UNION && v->type->kind != TY_UNION && v->type->kind != TY_NULLABLE &&
                        union_member_for(w, lit ? ty_number : v->type, NULL));
             if (up) {
