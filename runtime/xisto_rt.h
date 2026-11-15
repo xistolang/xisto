@@ -2077,6 +2077,13 @@ static xs_str *xs_Error_stack(xs_Error *e) {
     }
     return e->stack;
 }
+/* process.on('uncaughtException') (runtime/node/process.ts, xisto_net.h): set only once a program listens; it
+   returns only when nothing listens, and the error is printed as below. xs_uncaught_main: main's landing (emitted
+   only in a program that can set the hook), where a top-level error a listener took goes on to the event loop. Node
+   runs a .ts program as an ES module: an error of its top level has the origin "unhandledRejection" */
+static XS_TLS void (*xs_uncaught_hook)(void *err);
+static XS_TLS jmp_buf *xs_uncaught_main;
+static XS_TLS bool xs_uncaught_top; /* the top level is running (the origin of its errors: xs_uncaught_run) */
 /* takes an owned Error */
 static void xs_throw(void *err) {
 #ifdef XS_DEBUG
@@ -2101,6 +2108,7 @@ static void xs_throw(void *err) {
         xs_cln_unwind(xs_recover_cln);
         _longjmp(*xs_recover, 1);
     }
+    if (xs_uncaught_hook) xs_uncaught_hook(err);
     fflush(stdout);
     fprintf(stderr, "uncaught Error: %s\n", e->f_message->data);
     if (e->trace) xs_trace_print(e->trace, stderr);
@@ -5975,7 +5983,12 @@ static int xs_exit_code_; /* process.exitCode: the status when the program ends 
 /* process.on('exit' | 'beforeExit'): runtime/node/process.ts's dispatcher, called with (code, before) */
 static xs_closure *xs_pexit_cb;
 static void (*xs_rt_cleanup)(void); /* (process.ts's signal dispatcher, let go at the end) */
-XS_NOINLINE void xs_process_on_exit(xs_closure *cb) { if (!xs_pexit_cb) xs_pexit_cb = xs_retain(cb); }
+static void (*xs_uncaught_cleanup)(void); /* (process.ts's error dispatchers, let go at the end) */
+static void xs_uncaught_exit(void *err);
+XS_NOINLINE void xs_process_on_exit(xs_closure *cb) {
+    if (!xs_pexit_cb) xs_pexit_cb = xs_retain(cb);
+    if (!xs_uncaught_hook) xs_uncaught_hook = xs_uncaught_exit;
+}
 XS_NOINLINE void xs_pexit_call(xs_closure *cb, int64_t code, bool before) {
     size_t mark = xs_ar_mark();
     ((void (*)(void *, int64_t, bool))cb->fn)(cb, code, before);
@@ -5990,6 +6003,17 @@ XS_NOINLINE void xs_process_exit(int64_t code) {
     }
     fflush(stdout);
     exit((int)code);
+}
+/* an error nothing catches in a program with 'exit' listeners (and none for the error): printed as xs_throw does,
+   then 'exit' with the code 1, as in Node */
+static inline void xs_out_drain(void);
+static void xs_uncaught_exit(void *err) {
+    xs_Error *e = err;
+    fflush(stdout);
+    xs_out_drain();
+    fprintf(stderr, "uncaught Error: %s\n", e->f_message->data);
+    if (e->trace) xs_trace_print(e->trace, stderr);
+    xs_process_exit(1);
 }
 static int64_t xs_process_set_exit_code(int64_t code) { xs_exit_code_ = (int)code; return code; }
 /* process.stdout.write / process.stderr.write: through the same FILE as console.log, so the order is kept */
@@ -10489,6 +10513,7 @@ XS_NOINLINE void xs_before_exit(void) {
         xs_release(cb);
     }
     if (xs_rt_cleanup) { void (*c)(void) = xs_rt_cleanup; xs_rt_cleanup = NULL; c(); }
+    if (xs_uncaught_cleanup) { void (*c)(void) = xs_uncaught_cleanup; xs_uncaught_cleanup = NULL; c(); }
 }
 /* ---- regions (the compiler's region.c) ----
    The objects of a region class are made in one loop and cannot outlive an iteration of it: they come from an

@@ -13368,6 +13368,7 @@ static void fnrefs_stmt(Stmt *s, NameSet *ns, bool in_fn) {
     for (int i = 0; i < s->ncases; i++) { fnrefs_expr(s->cases[i].value, ns, in_fn); fnrefs_stmt(s->cases[i].body, ns, in_fn); }
 }
 static NameSet main_locals; /* top-level variables declared in main */
+static bool uncaught_land; /* main has a landing for the errors an 'uncaughtException' listener takes */
 /* a top-level const of a number, int or boolean literal (const IM: int = 139968): a C constant, not a global
    assigned in main, so the C compiler folds it (x % IM becomes a multiplication, overflow checks with it go) */
 static bool const_lit_global(Stmt *s) {
@@ -14125,8 +14126,11 @@ void emit_program(Program *p, Buf *o) {
         }
         buf_puts(out, " };\n");
     }
+    uncaught_land = false; /* process.on('uncaughtException') can be reached: main gets a landing (xs_uncaught_main) */
+    for (int i = 0; i < p->nfuncs && !uncaught_land; i++)
+        if (p->funcs[i]->is_native && p->funcs[i]->used && strcmp(p->funcs[i]->name, "process_on_uncaught") == 0) uncaught_land = true;
     {
-        bool top_try = false;
+        bool top_try = uncaught_land; /* (the top-level variables are globals then: a longjmp keeps them) */
         for (int i = 0; i < p->top.len; i++) if (stmt_has_try(p->top.items[i])) top_try = true;
         find_main_locals(p, top_try);
     }
@@ -14370,6 +14374,7 @@ void emit_program(Program *p, Buf *o) {
         vol_locals = mvol;
     }
     emit_dbg_enter(NULL);
+    if (uncaught_land) { nl(); buf_puts(out, "jmp_buf land_; if (_setjmp(land_)) goto xs_landed; xs_uncaught_main = &land_; xs_uncaught_top = true;"); }
     epush(true);
     for (int i = 0; i < p->top.len; i++) {
         Stmt *s = p->top.items[i];
@@ -14382,6 +14387,7 @@ void emit_program(Program *p, Buf *o) {
     }
     emit_releases(escope);
     epop();
+    if (uncaught_land) { nl(); buf_puts(out, "xs_landed: xs_uncaught_top = false; xs_ar_drain(ar_mark);"); }
     emit_dbg_finish();
     if (wbody) { /* main: the setup once, then the program, as any thread */
         /* the body's own top-level locals: each thread releases its own here (main cannot see them) */

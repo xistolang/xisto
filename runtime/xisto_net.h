@@ -1164,9 +1164,29 @@ XS_NOINLINE void xs_promise_reject(xs_promise *p, void *err) {
     p->err = err;
     xs_promise_settled(p);
 }
+/* process.on('unhandledRejection') (runtime/node/process.ts): its dispatcher, (reason, promise) => handled */
+static XS_TLS xs_closure *xs_rejection_cb;
+XS_NOINLINE void xs_unh_dispatch(void) {
+    while (xs_unh) {
+        xs_promise *p = xs_unh;
+        while (p->unh_next) p = p->unh_next; /* the first rejected */
+        xs_retain_(p);
+        xs_unh_drop(p);
+        p->handled = true;
+        size_t mark = xs_ar_mark();
+        bool handled = ((bool (*)(void *, void *, void *))xs_rejection_cb->fn)(xs_rejection_cb, p->err, p);
+        xs_ar_drain(mark);
+        if (!handled) { /* nothing listens (any more): back on the list, for the message below */
+            p->in_unh = true; p->unh_next = xs_unh; xs_unh = p;
+            return;
+        }
+        xs_release_(p);
+    }
+}
 /* a rejection that no handler took by the time the loop has nothing ready: the program ends, as in Node */
-static void xs_unh_check(void) {
+XS_NOINLINE void xs_unh_check(void) {
     if (!xs_unh) return;
+    if (xs_rejection_cb) { xs_unh_dispatch(); if (!xs_unh) return; }
     xs_promise *p = xs_unh;
     while (p->unh_next) p = p->unh_next; /* the first rejected */
     xs_Error *e = p->err;
@@ -1174,7 +1194,7 @@ static void xs_unh_check(void) {
     xs_out_drain();
     fprintf(stderr, "uncaught Error (in promise): %s\n", e->f_message->data);
     if (e->trace) xs_trace_print(e->trace, stderr);
-    if (!xs_never) exit(1);
+    if (!xs_never) xs_process_exit(1); /* (as exit(1), after the 'exit' listeners) */
 }
 
 /* resume a coroutine from inside another (a call that makes a promise starts its coroutine at once): the outer
@@ -1261,7 +1281,7 @@ XS_NOINLINE xs_promise *xs_promise_rejected(int kind, void *err) {
 }
 
 /* await p */
-static bool xs_promise_stop(void *p) {
+XS_NOINLINE bool xs_promise_stop(void *p) {
     xs_promise *q = p;
     if (q->state != 0) return true;
     if (xs_tasks_live == 0 && !xs_ready_head) { /* nothing left that could settle it: Node's loop would be empty */
@@ -3919,6 +3939,70 @@ XS_NOINLINE void xs_process_signal_unwatch(int64_t sig) {
     sigaction((int)sig, &sa, NULL);
 }
 
+/* process.on('uncaughtException' | 'uncaughtExceptionMonitor') and setUncaughtExceptionCaptureCallback: an error
+   nothing catches goes to process.ts's dispatcher, (err, origin) => handled. Taken, the work it interrupted ends
+   (a coroutine finishes; on main's stack, the rest of the top level is skipped) and the event loop goes on, as in
+   Node; a timer's callback runs under a catch (xs_call_guarded), so an interval keeps going */
+static XS_TLS xs_closure *xs_uncaught_cb;
+static void xs_uncaught_print(void *err, int code) {
+    xs_Error *e = err;
+    fflush(stdout);
+    xs_out_drain();
+    fprintf(stderr, "uncaught Error: %s\n", e->f_message->data);
+    if (e->trace) xs_trace_print(e->trace, stderr);
+    xs_process_exit(code); /* ('exit' listeners run, with the code, as in Node) */
+}
+static void xs_uncaught_again(void *err) { xs_uncaught_print(err, 7); } /* a listener threw: Node's exit code 7 */
+XS_NOINLINE bool xs_uncaught_call(void *err, const char *origin) {
+    void (*hook)(void *) = xs_uncaught_hook;
+    xs_uncaught_hook = xs_uncaught_again;
+    xs_str *o = xs_str_new(origin, strlen(origin));
+    size_t mark = xs_ar_mark();
+    bool handled = ((bool (*)(void *, void *, xs_str *))xs_uncaught_cb->fn)(xs_uncaught_cb, err, o);
+    xs_ar_drain(mark);
+    xs_release(o);
+    xs_uncaught_hook = hook;
+    return handled;
+}
+XS_NOINLINE void xs_uncaught_run(void *err) { /* (xs_uncaught_hook: from xs_throw, with no catch on this stack) */
+    /* (an error of the top level: Node reports the module's rejection as the origin, to these listeners only) */
+    bool handled = xs_uncaught_call(err, xs_uncaught_top && !xs_cur_coro ? "unhandledRejection" : "uncaughtException");
+    if (!handled) xs_uncaught_print(err, 1);
+    xs_release(err);
+    xs_cln_unwind(0);
+    if (xs_cur_coro) { xs_ar_drain(0); xs_coro_finish(); }
+    if (xs_uncaught_main) _longjmp(*xs_uncaught_main, 1);
+    xs_before_exit(); /* (no landing: the loop runs from here) */
+    fflush(stdout);
+    exit(xs_exit_code_);
+}
+XS_NOINLINE void xs_call_guarded(xs_closure *cb) {
+    jmp_buf jb;
+    xs_try_push(&jb);
+    if (_setjmp(jb) == 0) {
+        ((void (*)(void *))cb->fn)(cb);
+        xs_try_pop();
+        return;
+    }
+    void *err = xs_caught();
+    if (!xs_uncaught_cb || !xs_uncaught_call(err, "uncaughtException")) xs_uncaught_print(err, 1);
+    xs_release(err);
+}
+static void xs_uncaught_release(void) {
+    xs_closure *a = xs_uncaught_cb, *b = xs_rejection_cb;
+    xs_uncaught_cb = xs_rejection_cb = NULL;
+    xs_uncaught_hook = NULL;
+    if (a) xs_release(a);
+    if (b) xs_release(b);
+}
+XS_NOINLINE void xs_process_on_uncaught(xs_closure *uncaught, xs_closure *rejection) {
+    if (xs_uncaught_cb) return;
+    xs_uncaught_cb = xs_retain(uncaught);
+    xs_rejection_cb = xs_retain(rejection);
+    xs_uncaught_hook = xs_uncaught_run;
+    xs_uncaught_cleanup = xs_uncaught_release;
+}
+
 #ifdef XS_THREADS
 /* the listener's coroutine: each message, in order, to the closure; ends when the sender is done */
 typedef struct { xs_wq *q; xs_closure **cb; uint8_t *kind; xs_hdr *owner; } xs_wlisten; /* kind: what the listener takes (XS_WM_...) */
@@ -3987,6 +4071,156 @@ XS_NOINLINE void xs_wt_listen_start(xs_wq *q, xs_closure **cb, uint8_t *kind, xs
     xs_ready_push(co); /* it starts when the loop runs: after the code that set the listener up */
 }
 #endif
+/* ---- process.stdin and node:tty (runtime/node/tty.ts) ----
+   A read of a stream on a descriptor (stdin) is a coroutine: it waits until the descriptor is readable (a pipe, a
+   socket, a terminal; a file or /dev/null is read at once, as epoll cannot wait on them), reads one chunk into the
+   caller's buffer and calls back with the count (0: the end, < 0: -errno). While it is pending it keeps the program
+   alive, as a flowing stdin does in Node; xs_fd_read_cancel lets it go (pause()). The descriptor is not made
+   non-blocking (it is shared with the parent shell): a read comes only after the wait says there is data. */
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+#endif
+typedef struct xs_fdrd { int fd; bool stop, parked; xs_closure *cb; xs_Uint8Array *buf; xs_coro *co; struct xs_fdrd *next; } xs_fdrd;
+static XS_TLS xs_fdrd *xs_fdrds; /* the reads in flight */
+static bool xs_fd_pollable(int fd) {
+#if defined(_WIN32)
+    return false;
+#else
+    struct stat st;
+    if (fstat(fd, &st) != 0) return false;
+    return S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode) || (S_ISCHR(st.st_mode) && isatty(fd));
+#endif
+}
+XS_NOINLINE bool xs_fd_is_stream(int64_t fd) { return xs_fd_pollable((int)fd); } /* (a pipe, a socket, a terminal) */
+XS_NOINLINE void xs_fd_read_run(void *p) {
+    xs_fdrd *r = p;
+    if (r->stop) return;
+    ssize_t n;
+    for (;;) {
+        if (xs_fd_pollable(r->fd)) {
+            r->parked = true;
+            xs_wait_fd(r->fd, EVFILT_READ);
+            r->parked = false;
+            if (r->stop) return;
+        }
+        n = read(r->fd, r->buf->data, (size_t)r->buf->f_length);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && errno == EAGAIN) continue; /* (someone made it non-blocking: wait again) */
+        break;
+    }
+    for (xs_fdrd **pp = &xs_fdrds; *pp; pp = &(*pp)->next) /* done: a read the callback starts is a new one */
+        if (*pp == r) { *pp = r->next; break; }
+    int64_t res = n < 0 ? -(int64_t)errno : (int64_t)n;
+    size_t mark = xs_ar_mark();
+    if (xs_uncaught_hook) { /* (process.on('uncaughtException'): a throwing 'data' listener does not end the reads) */
+        jmp_buf jb;
+        xs_try_push(&jb);
+        if (_setjmp(jb) == 0) {
+            ((void (*)(void *, int64_t))r->cb->fn)(r->cb, res);
+            xs_try_pop();
+        } else {
+            void *err = xs_caught();
+            if (!xs_uncaught_cb || !xs_uncaught_call(err, "uncaughtException")) xs_uncaught_print(err, 1);
+            xs_release(err);
+        }
+    } else ((void (*)(void *, int64_t))r->cb->fn)(r->cb, res);
+    xs_ar_drain(mark);
+}
+static void xs_fd_read_done(xs_coro *co) {
+    xs_fdrd *r = co->arg;
+    xs_tasks_live--;
+    xs_coro_recycle(co);
+    for (xs_fdrd **pp = &xs_fdrds; *pp; pp = &(*pp)->next)
+        if (*pp == r) { *pp = r->next; break; }
+    xs_release(r->cb);
+    xs_release(r->buf);
+    free(r);
+}
+XS_NOINLINE void xs_fd_read_start(int64_t fd, xs_Uint8Array *buf, xs_closure *cb) {
+    if (xs_kq < 0) xs_kq = kqueue();
+    xs_fdrd *r = calloc(1, sizeof *r);
+    r->fd = (int)fd;
+    r->cb = xs_retain(cb);
+    r->buf = xs_retain(buf);
+    r->next = xs_fdrds;
+    xs_fdrds = r;
+    xs_coro *co = xs_coro_new_shared(xs_fd_read_run, r);
+    r->co = co;
+    co->on_done = xs_fd_read_done;
+    xs_tasks_live++;
+    xs_exit_hook = xs_tasks_drain;
+    xs_ready_push(co);
+}
+/* the read in flight on fd ends without calling back (true when there was one) */
+XS_NOINLINE bool xs_fd_read_cancel(int64_t fd) {
+    for (xs_fdrd **pp = &xs_fdrds; *pp; pp = &(*pp)->next) {
+        xs_fdrd *r = *pp;
+        if (r->fd != (int)fd) continue;
+        *pp = r->next;
+        r->next = NULL;
+        r->stop = true;
+        if (r->parked) xs_ready_push(r->co); /* (waiting on the descriptor: woken, it stops watching it and ends) */
+        return true;
+    }
+    return false;
+}
+XS_NOINLINE bool xs_tty_isatty(int64_t fd) {
+#if defined(_WIN32)
+    return _isatty((int)fd) != 0;
+#else
+    return fd >= 0 && isatty((int)fd) == 1;
+#endif
+}
+/* [columns, rows] of the terminal on fd (empty: not a terminal) */
+XS_NOINLINE xs_arr_int *xs_tty_size(int64_t fd) {
+    xs_arr_int *a = xs_arr_int_new(0, 0);
+#if !defined(_WIN32)
+    struct winsize ws;
+    if (ioctl((int)fd, TIOCGWINSZ, &ws) == 0) {
+        xs_arr_int_push(a, ws.ws_col);
+        xs_arr_int_push(a, ws.ws_row);
+    }
+#endif
+    return a;
+}
+#if !defined(_WIN32)
+static struct termios xs_tty_orig;
+static int xs_tty_orig_fd = -1;
+static void xs_tty_restore(void) { if (xs_tty_orig_fd >= 0) tcsetattr(xs_tty_orig_fd, TCSANOW, &xs_tty_orig); }
+#endif
+/* setRawMode: raw (no echo, no line discipline, no signals from keys) or back to the mode it had; 0 or the errno */
+XS_NOINLINE int64_t xs_tty_set_raw(int64_t fd, bool raw) {
+#if defined(_WIN32)
+    return ENOTTY;
+#else
+    if (xs_tty_orig_fd < 0) {
+        if (tcgetattr((int)fd, &xs_tty_orig) != 0) return errno;
+        xs_tty_orig_fd = (int)fd;
+        atexit(xs_tty_restore); /* (the terminal is given back as it was, as libuv does) */
+    }
+    struct termios t = xs_tty_orig;
+    if (raw) { /* (libuv's UV_TTY_MODE_RAW) */
+        t.c_iflag &= ~(tcflag_t)(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+        t.c_oflag |= ONLCR;
+        t.c_cflag |= CS8;
+        t.c_lflag &= ~(tcflag_t)(ECHO | ICANON | IEXTEN | ISIG);
+        t.c_cc[VMIN] = 1;
+        t.c_cc[VTIME] = 0;
+    }
+    return tcsetattr((int)fd, TCSADRAIN, &t) == 0 ? 0 : errno;
+#endif
+}
+/* a chunk written to stdout or stderr by their streams (tty.WriteStream): the same FILEs as console.log */
+XS_NOINLINE void xs_tty_write(int64_t fd, xs_Uint8Array *b) {
+    xs_out_drain();
+    fwrite(b->data, 1, (size_t)b->f_length, fd == 2 ? stderr : XS_OUT);
+    if (fd == 2) fflush(stderr);
+}
+/* on a terminal what the stream wrote shows now (a prompt has no newline) */
+XS_NOINLINE void xs_tty_flush(int64_t fd) { xs_out_drain(); fflush(fd == 2 ? stderr : XS_OUT); }
+
 /* ---- setTimeout / setInterval (Node's globals): each timer is a coroutine on the event loop. It starts when the
    loop runs (a server's, or the one the program's exit waits on), sleeps, then calls its callback; an interval goes
    on until clearInterval. Like Node, a pending timer keeps the program alive. */
@@ -4006,7 +4240,8 @@ XS_NOINLINE void xs_ttask_run(void *p) {
         }
         if (t->cancelled) return;
         size_t mark = xs_ar_mark();
-        ((void (*)(void *))t->cb->fn)(t->cb);
+        if (xs_uncaught_hook) xs_call_guarded(t->cb); /* (process.on('uncaughtException'): the timer goes on) */
+        else ((void (*)(void *))t->cb->fn)(t->cb);
         xs_ar_drain(mark);
         if (!t->repeat || t->cancelled) return;
     }

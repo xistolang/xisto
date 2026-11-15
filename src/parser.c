@@ -60,6 +60,7 @@ static bool wants_settled; /* Promise.allSettled was named: xisto:settled is loa
 static bool wants_okmap; /* WeakMap, or Map<object, V>, was written: xisto:okmap is loaded */
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
 static void import_process(Program *prog, Module *m);
+static void import_stdio(Program *prog, Module *m);
 static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... was named: xisto:url is loaded */
 static bool wants_errors; /* TypeError, RangeError, SyntaxError or ReferenceError was named: xisto:errors is loaded */
 static bool is_js_error_name(const char *n) {
@@ -1479,6 +1480,11 @@ static Expr *parse_primary(Parser *p) {
                 static const char *const core[] = {"argv", "env", "pid", "cwd", "exit", "stdout", "stderr", NULL};
                 bool is_core = false;
                 for (int i = 0; core[i]; i++) if (look.tok.str && strcmp(look.tok.str, core[i]) == 0) is_core = true;
+                if (look.tok.str && !strcmp(look.tok.str, "stdin")) is_core = true, import_stdio(p->prog, p->mod);
+                else if (look.tok.str && (!strcmp(look.tok.str, "stdout") || !strcmp(look.tok.str, "stderr"))) {
+                    next(&look); /* process.stdout as a stream (not .write(x), the built-in): xisto:tty */
+                    if (!at(&look, TK_DOT) || (next(&look), !look.tok.str || strcmp(look.tok.str, "write") != 0)) import_stdio(p->prog, p->mod);
+                }
                 if (!is_core) import_process(p->prog, p->mod);
             }
         }
@@ -4688,29 +4694,33 @@ static bool src_has_default_export(const char *src) {
     }
     return false;
 }
+/* process.stdin, and process.stdout / process.stderr used as streams: XistoStdio from xisto:tty (runtime/node/tty.ts) */
+static void import_builtin_class(Program *prog, Module *m, const char *path, const char *name);
+static void import_stdio(Program *prog, Module *m) { import_builtin_class(prog, m, "xisto:tty", "XistoStdio"); }
 /* process.X beyond the members the compiler builds in: the module reads XistoProcess.X (checker), so it imports
    XistoProcess from xisto:process (runtime/node/process.ts), once */
-static void import_process(Program *prog, Module *m) {
+static void import_builtin_class(Program *prog, Module *m, const char *path, const char *name) {
     if (!m) return;
     for (int i = 0; i < m->nimports; i++)
-        if (m->imports[i].path && strcmp(m->imports[i].path, "xisto:process") == 0) return;
+        if (m->imports[i].path && strcmp(m->imports[i].path, path) == 0) return;
     Import im = {0};
     im.pos = (Pos){1, 1};
     im.names = xs_alloc(sizeof(char *));
     im.positions = xs_alloc(sizeof(Pos));
-    im.names[0] = "XistoProcess";
+    im.names[0] = (char *)name;
     im.positions[0] = im.pos;
     im.n = 1;
-    im.path = "xisto:process";
+    im.path = path;
     /* (loaded now: the module's own imports were loaded before its body, where process.X usually is) */
     const char *sf = xs_file_name, *ss = xs_source;
     Program *spp = parsing_prog;
     Module *spm = parsing_mod;
-    im.from = load_module(prog, "xisto:process", im.pos, m->path);
+    im.from = load_module(prog, path, im.pos, m->path);
     xs_file_name = sf; xs_source = ss; parsing_prog = spp; parsing_mod = spm;
     m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
     m->imports[m->nimports++] = im;
 }
+static void import_process(Program *prog, Module *m) { import_builtin_class(prog, m, "xisto:process", "XistoProcess"); }
 static void parse_import(Parser *p, Module *m) {
     Pos pos = p->tok.pos;
     expect(p, TK_IMPORT, NULL);
@@ -6518,6 +6528,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
     }
     { /* Node's modules written in xisto over runtime functions (runtime/node/NAME.ts, NODE_TS in the Makefile) */
         extern const unsigned char xs_node_events_ts[], xs_node_process_ts[], xs_node_http_ts[], xs_node_net_ts[], xs_node_dns_ts[], xs_node_child_process_ts[], xs_node_https_ts[], xs_node_tls_ts[], xs_node_diagnostics_channel_ts[], xs_node_buffer_ts[], xs_node_util_ts[], xs_node_querystring_ts[], xs_node_string_decoder_ts[], xs_node_zlib_ts[], xs_node_stream_ts[], xs_node_stream_promises_ts[], xs_node_stream_web_ts[];
+        extern const unsigned char xs_node_tty_ts[], xs_node_readline_ts[], xs_node_readline_promises_ts[];
         static const struct { const char *name; const unsigned char *src; bool net; bool tls; } node_ts[] = {
             {"events", xs_node_events_ts, false},
             {"process", xs_node_process_ts, true}, /* (signals and the exit hook live with the event loop) */
@@ -6536,6 +6547,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
             {"stream", xs_node_stream_ts, true}, /* (streams defer with process.nextTick and setImmediate) */
             {"stream/promises", xs_node_stream_promises_ts, true}, /* (a name with a slash: runtime/node/stream_promises.ts) */
             {"stream/web", xs_node_stream_web_ts, true},
+            {"tty", xs_node_tty_ts, true}, {"readline", xs_node_readline_ts, true}, {"readline/promises", xs_node_readline_promises_ts, true},
         };
         for (size_t i = 0; i < sizeof node_ts / sizeof node_ts[0]; i++) {
             if (strcmp(name, node_ts[i].name) != 0) continue;
