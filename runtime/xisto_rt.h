@@ -600,6 +600,8 @@ typedef struct __attribute__((aligned(64))) xs_type {
     /* closures only: an adapter the compiler made around a function value (a typed listener given where
        (...args: any[]) => void goes) returns the function it wraps, so === sees the same function (off(handler)) */
     void *(*origin)(void *);
+    /* closures only: how console.log shows the function ("Function: f", "AsyncFunction: g"); NULL: anonymous */
+    const char *fname;
 } xs_type;
 _Static_assert(sizeof(xs_type) == 64, "xs_type is one cache line: a field more must replace one");
 /* hdr.cls: the size class in the low bits, then the flags */
@@ -654,6 +656,8 @@ static inline __attribute__((always_inline)) const xs_type *xs_type_of(const voi
     int32_t d = (int32_t)(((const xs_hdr *)p)->cls - XS_TIX(base)) >> 10; /* (the low 10 bits never borrow) */
     return (const xs_type *)(base + (uintptr_t)((intptr_t)d << 6));
 }
+/* a value held as an unknown (a union member) is a function */
+static inline bool xs_is_closure(const void *p) { return p && xs_type_of(p)->print == xs_print_closure; }
 static inline __attribute__((always_inline)) void xs_set_type(xs_hdr *h, const xs_type *t) {
     h->cls = (h->cls & 0x3ff) | XS_TIX(t);
 }
@@ -2806,6 +2810,11 @@ static inline __attribute__((always_inline)) xs_closure *xs_cl_static(xs_closure
     if (__builtin_expect(c->hdr.cls == 0, 0)) c->hdr.cls = XS_TIX(&xs_immortal_closure_type);
     return c;
 }
+/* the same, for a function of the program: its own descriptor, which carries its name */
+static inline __attribute__((always_inline)) xs_closure *xs_cl_static_t(xs_closure *c, const xs_type *t) {
+    if (__builtin_expect(c->hdr.cls == 0, 0)) c->hdr.cls = XS_TIX(t);
+    return c;
+}
 
 /* ---- unknown: any value by reference. Primitives are boxed; `x as T` checks the object's type (its free
    function is unique per type) and fails with a TypeError, like a bad cast in a checked language. ---- */
@@ -3155,7 +3164,11 @@ XS_NOINLINE xs_str *xs_typeof(void *v) {
     if (xs_type_of(v)->print == xs_print_closure) return xs_typeof_lit("function");
     return xs_typeof_lit("object");
 }
-static void xs_print_closure(void *p) { (void)p; fputs("[Function]", XS_OUT); }
+static void xs_print_closure(void *p) {
+    p = xs_fn_origin(p); /* (a function through an adapter: the function) */
+    const char *n = xs_type_of(p)->fname;
+    fprintf(XS_OUT, "[%s]", n ? n : "Function (anonymous)");
+}
 
 /* Math.max(...xs) / Math.min(...xs): -Infinity / Infinity for an empty array, NaN when an element is */
 XS_NOINLINE double xs_math_max_nums(xs_arr_num *a) { double m = -INFINITY; for (size_t i = 0; i < a->len; i++) { if (a->data[i] != a->data[i]) return NAN; if (a->data[i] > m) m = a->data[i]; } return m; }
