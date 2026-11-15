@@ -62,6 +62,7 @@ static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: x
 static void import_process(Program *prog, Module *m);
 static void import_stdio(Program *prog, Module *m);
 static void import_builtin_class(Program *prog, Module *m, const char *path, const char *name);
+static bool declares_top_from(const char *src, const char *q, const char *name);
 static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... was named: xisto:url is loaded */
 static bool wants_errors; /* TypeError, RangeError, SyntaxError or ReferenceError was named: xisto:errors is loaded */
 static bool is_js_error_name(const char *n) {
@@ -1293,6 +1294,61 @@ static bool is_url_global_name(const char *n) {
     return n && (!strcmp(n, "URL") || !strcmp(n, "URLSearchParams") || !strcmp(n, "AbortController") || !strcmp(n, "AbortSignal") ||
                  !strcmp(n, "DOMException") || !strcmp(n, "RequestInit") || !strcmp(n, "HeadersInit") || !strcmp(n, "fetch") || !strcmp(n, "BufferEncoding"));
 }
+/* globalThis: the standard globals of Node, each with what typeof gives for it there. globalThis.X is the global X
+   (read as X), typeof globalThis.X is that string ("undefined" for a name Node does not have), "X" in globalThis is
+   true for these names. A global is a static name here, so globalThis is never a value: assigning a new property
+   (globalThis.foo = 1), reading one of a name not listed, or passing globalThis around is an error that says so */
+static const struct { const char *name, *type; } js_globals[] = {
+    {"globalThis", "object"}, {"global", "object"}, {"console", "object"}, {"process", "object"}, {"performance", "object"},
+    {"crypto", "object"}, {"Math", "object"}, {"JSON", "object"}, {"Reflect", "object"}, {"Intl", "object"}, {"Atomics", "object"},
+    {"navigator", "object"}, {"setTimeout", "function"}, {"setInterval", "function"}, {"setImmediate", "function"},
+    {"clearTimeout", "function"}, {"clearInterval", "function"}, {"clearImmediate", "function"}, {"queueMicrotask", "function"},
+    {"structuredClone", "function"}, {"fetch", "function"}, {"atob", "function"}, {"btoa", "function"}, {"parseInt", "function"},
+    {"parseFloat", "function"}, {"isNaN", "function"}, {"isFinite", "function"}, {"encodeURIComponent", "function"},
+    {"decodeURIComponent", "function"}, {"encodeURI", "function"}, {"decodeURI", "function"}, {"String", "function"},
+    {"Number", "function"}, {"Boolean", "function"}, {"Array", "function"}, {"Object", "function"}, {"Map", "function"},
+    {"Set", "function"}, {"WeakMap", "function"}, {"WeakSet", "function"}, {"WeakRef", "function"}, {"Promise", "function"},
+    {"Date", "function"}, {"RegExp", "function"}, {"Error", "function"}, {"TypeError", "function"}, {"RangeError", "function"},
+    {"SyntaxError", "function"}, {"ReferenceError", "function"}, {"URIError", "function"}, {"EvalError", "function"},
+    {"AggregateError", "function"}, {"Symbol", "function"}, {"BigInt", "function"}, {"Function", "function"}, {"Proxy", "function"},
+    {"Buffer", "function"}, {"URL", "function"}, {"URLSearchParams", "function"}, {"TextEncoder", "function"}, {"TextDecoder", "function"},
+    {"AbortController", "function"}, {"AbortSignal", "function"}, {"DOMException", "function"}, {"Uint8Array", "function"},
+    {"Uint8ClampedArray", "function"}, {"Int8Array", "function"}, {"Uint16Array", "function"}, {"Int16Array", "function"},
+    {"Uint32Array", "function"}, {"Int32Array", "function"}, {"Float32Array", "function"}, {"Float64Array", "function"},
+    {"BigInt64Array", "function"}, {"BigUint64Array", "function"}, {"ArrayBuffer", "function"}, {"SharedArrayBuffer", "function"},
+    {"DataView", "function"}, {"Headers", "function"}, {"Request", "function"}, {"Response", "function"}, {"FormData", "function"},
+    {"Blob", "function"}, {"File", "function"}, {"WebSocket", "function"}, {"EventTarget", "function"}, {"Event", "function"},
+    {"CustomEvent", "function"}, {"MessageChannel", "function"}, {"MessagePort", "function"}, {"BroadcastChannel", "function"},
+    {"ReadableStream", "function"}, {"WritableStream", "function"}, {"TransformStream", "function"}, {"CompressionStream", "function"},
+    {"DecompressionStream", "function"}, {"TextEncoderStream", "function"}, {"TextDecoderStream", "function"},
+    {"PerformanceEntry", "function"}, {"PerformanceMark", "function"}, {"PerformanceMeasure", "function"},
+    {"Crypto", "function"}, {"CryptoKey", "function"}, {"SubtleCrypto", "function"}, {"NaN", "number"}, {"Infinity", "number"},
+    {"undefined", "undefined"},
+};
+static const char *js_global_type(const char *n) {
+    for (size_t i = 0; n && i < sizeof js_globals / sizeof *js_globals; i++)
+        if (strcmp(js_globals[i].name, n) == 0) return js_globals[i].type;
+    return NULL;
+}
+/* the global objects of other runtimes (browsers, Deno, Bun): typeof window is "undefined" on Node, as here */
+static bool is_foreign_global(const char *n) {
+    static const char *const names[] = {"window", "document", "self", "location", "Deno", "Bun", "importScripts", "WorkerGlobalScope", NULL};
+    for (int i = 0; names[i]; i++) if (strcmp(names[i], n) == 0) return true;
+    return false;
+}
+/* the module binds the name itself: an import (named, default or namespace), or a top-level declaration */
+static bool binds_name(Parser *p, const char *n) {
+    if (p->mod)
+        for (int i = 0; i < p->mod->nimports; i++)
+            for (int k = 0; k < p->mod->imports[i].n; k++)
+                if (strcmp(p->mod->imports[i].names[k], n) == 0) return true;
+    for (int i = 0; i < p->nns; i++) if (strcmp(p->ns_alias[i], n) == 0) return true;
+    for (int i = 0; i < p->nalias; i++) if (strcmp(p->alias_from[i], n) == 0) return true;
+    return declares_top_from(p->lx.src, p->lx.src, n);
+}
+static const char *globalthis_help =
+    "globalThis reads the standard globals (globalThis.setTimeout, globalThis.crypto...); a value shared across modules is "
+    "an exported module variable: export let config = ...";
 /* import.meta.url / dirname / filename: the module's source file as the build found it (an absolute path, symbolic
    links resolved, as Node gives the main module's). xisto compiles ahead of time, so this is where the source was
    built, not where the binary runs: what new URL("./x", import.meta.url) and fileURLToPath(import.meta.url) want to
@@ -1506,6 +1562,36 @@ static Expr *parse_primary(Parser *p) {
             next(p);
             return new_expr(E_NULL, pos);
         }
+        if (strcmp(p->tok.str, "globalThis") == 0 && !binds_name(p, "globalThis")) { /* globalThis.X: the global X (js_globals) */
+            next(p);
+            if (!at(p, TK_DOT) && !at(p, TK_QDOT))
+                xs_error(XS7151, pos, globalthis_help, "globalThis as a value is not supported (its properties are the program's static globals)");
+            next(p);
+            if (!at(p, TK_IDENT)) xs_error(XS7151, p->tok.pos, globalthis_help, "globalThis[...] is not supported: write globalThis.name");
+            const char *gn = p->tok.str;
+            if (!js_global_type(gn) || !strcmp(gn, "globalThis") || !strcmp(gn, "global"))
+                xs_error(XS7150, p->tok.pos, globalthis_help, "globalThis.%s is not a global xisto knows", gn);
+            Parser look = *p;
+            next(&look);
+            if (at(&look, TK_ASSIGN))
+                xs_error(XS7151, p->tok.pos, globalthis_help, "assigning globalThis.%s is not supported: the globals are fixed when the program is compiled", gn);
+            if (!strcmp(gn, "crypto")) { /* (globalThis.crypto is the global one even where the module has a crypto of its own) */
+                import_builtin_class(p->prog, p->mod, "xisto:crypto", "__xs_crypto");
+                p->tok.str = "__xs_crypto";
+            }
+            return parse_primary(p); /* (the global itself, as if written without globalThis.) */
+        }
+        if (strcmp(p->tok.str, "crypto") == 0) { /* crypto.randomUUID() & co: the global Web Crypto, xisto:crypto's webcrypto */
+            Parser look = *p;
+            next(&look);
+            if (at(&look, TK_DOT) && peek_is_ident(&look) && !binds_name(p, "crypto")) {
+                next(&look);
+                if (!strcmp(look.tok.str, "randomUUID") || !strcmp(look.tok.str, "getRandomValues") || !strcmp(look.tok.str, "subtle")) {
+                    import_builtin_class(p->prog, p->mod, "xisto:crypto", "__xs_crypto");
+                    p->tok.str = "__xs_crypto";
+                }
+            }
+        }
         if (is_url_global_name(p->tok.str)) wants_url = true; /* (AbortSignal.timeout(n): a member read made here) */
         if (strcmp(p->tok.str, "process") == 0) { /* process.on(...), process.platform...: xisto:process */
             Parser look = *p;
@@ -1687,6 +1773,12 @@ static Expr *parse_primary(Parser *p) {
             expr_list_push(&c->args, arr);
             wants_reflect = true;
             return c;
+        }
+        if (at_ident(p, "globalThis") && peek_is(p, TK_DOT) && !binds_name(p, "globalThis")) { /* new globalThis.URL(...): new URL(...) */
+            next(p);
+            next(p);
+            if (!at(p, TK_IDENT) || !js_global_type(p->tok.str) || strcmp(js_global_type(p->tok.str), "function") != 0)
+                xs_error(XS7150, p->tok.pos, globalthis_help, "globalThis.%s is not a global xisto knows", at(p, TK_IDENT) ? p->tok.str : "?");
         }
         Token name = expect(p, TK_IDENT, NULL);
         if (strcmp(name.str, "Intl") == 0 && at(p, TK_DOT)) { /* new Intl.DateTimeFormat(...): xisto:intl's Intl_DateTimeFormat */
@@ -2012,6 +2104,27 @@ static Expr *parse_unary(Parser *p) {
         Expr *e = new_expr(E_UNARY, p->tok.pos);
         e->op = TK_IDENT;
         next(p);
+        { /* typeof globalThis.X, typeof window: known when the program is compiled (js_globals) */
+            Parser look = *p;
+            const char *gn = NULL;
+            if (at_ident(&look, "globalThis") && !binds_name(p, "globalThis")) {
+                next(&look);
+                if (at(&look, TK_DOT) || at(&look, TK_QDOT)) {
+                    next(&look);
+                    if (at(&look, TK_IDENT)) { gn = look.tok.str; next(&look); }
+                } else gn = "globalThis";
+            } else if (at(&look, TK_IDENT) && is_foreign_global(look.tok.str) && !binds_name(p, look.tok.str)) {
+                gn = look.tok.str;
+                next(&look);
+            }
+            if (gn && !at(&look, TK_DOT) && !at(&look, TK_QDOT) && !at(&look, TK_LBRACKET) && !at(&look, TK_LPAREN)) {
+                const char *ty = js_global_type(gn);
+                *p = look;
+                Expr *s = new_expr(E_STRING, e->pos);
+                s->str = (char *)(ty ? ty : "undefined");
+                return s;
+            }
+        }
         e->lhs = parse_unary(p);
         return e;
     }
@@ -2138,6 +2251,17 @@ static Expr *parse_rel(Parser *p) {
         Pos pos = p->tok.pos;
         if (at_ident(p, "in")) { /* "key" in obj */
             next(p);
+            if (e->kind == E_STRING && at_ident(p, "globalThis") && !binds_name(p, "globalThis")) { /* "fetch" in globalThis: js_globals */
+                Parser look = *p;
+                next(&look);
+                if (!at(&look, TK_DOT) && !at(&look, TK_QDOT) && !at(&look, TK_LBRACKET)) {
+                    *p = look;
+                    Expr *b = new_expr(E_BOOL, pos);
+                    b->boolean = js_global_type(e->str) && strcmp(e->str, "undefined") != 0;
+                    e = b;
+                    continue;
+                }
+            }
             e = binary(TK_IN, pos, e, parse_rel_base(p));
             continue;
         }
@@ -6750,7 +6874,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
     { /* Node's modules written in xisto over runtime functions (runtime/node/NAME.ts, NODE_TS in the Makefile) */
         extern const unsigned char xs_node_events_ts[], xs_node_process_ts[], xs_node_http_ts[], xs_node_net_ts[], xs_node_dns_ts[], xs_node_child_process_ts[], xs_node_https_ts[], xs_node_tls_ts[], xs_node_diagnostics_channel_ts[], xs_node_buffer_ts[], xs_node_util_ts[], xs_node_querystring_ts[], xs_node_string_decoder_ts[], xs_node_zlib_ts[], xs_node_stream_ts[], xs_node_stream_promises_ts[], xs_node_stream_web_ts[];
         extern const unsigned char xs_node_tty_ts[], xs_node_readline_ts[], xs_node_readline_promises_ts[];
-        extern const unsigned char xs_node_console_ts[], xs_node_perf_hooks_ts[];
+        extern const unsigned char xs_node_console_ts[], xs_node_perf_hooks_ts[], xs_node_assert_ts[], xs_node_assert_strict_ts[], xs_node_test_ts[];
         static const struct { const char *name; const unsigned char *src; bool net; bool tls; } node_ts[] = {
             {"events", xs_node_events_ts, false},
             {"process", xs_node_process_ts, true}, /* (signals and the exit hook live with the event loop) */
@@ -6770,7 +6894,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
             {"stream/promises", xs_node_stream_promises_ts, true}, /* (a name with a slash: runtime/node/stream_promises.ts) */
             {"stream/web", xs_node_stream_web_ts, true},
             {"tty", xs_node_tty_ts, true}, {"readline", xs_node_readline_ts, true}, {"readline/promises", xs_node_readline_promises_ts, true},
-            {"console", xs_node_console_ts, false}, {"perf_hooks", xs_node_perf_hooks_ts, false},
+            {"console", xs_node_console_ts, false}, {"perf_hooks", xs_node_perf_hooks_ts, false}, {"assert", xs_node_assert_ts, false}, {"assert/strict", xs_node_assert_strict_ts, false}, {"test", xs_node_test_ts, true},
         };
         for (size_t i = 0; i < sizeof node_ts / sizeof node_ts[0]; i++) {
             if (strcmp(name, node_ts[i].name) != 0) continue;

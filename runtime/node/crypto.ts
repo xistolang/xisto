@@ -1607,3 +1607,6 @@ export class WebCrypto {
 }
 export const webcrypto: WebCrypto = new WebCrypto();
 export const subtle: SubtleCrypto = webcrypto.subtle;
+/** The global crypto (Node 20+: globalThis.crypto is webcrypto): the compiler reads crypto.randomUUID(),
+ *  crypto.getRandomValues(a) and crypto.subtle as members of this object when the module binds no crypto of its own. */
+export const __xs_crypto: WebCrypto = webcrypto;
