@@ -12402,15 +12402,19 @@ static void emit_par_variant(Func *f) {
     buf_printf(out, ");\n    free(r_.slots);\n%s}\n", is_void ? "" : "    return res_;\n");
 }
 
+/* the function whose entry declared the profiler's locals: a return elsewhere (a closure's or a generator body's,
+   emitted while that function is, XB-227) has none to close */
+static Func *prof_fn;
 static void emit_prof_enter(Func *f) {
     if (!xs_profile) return;
+    prof_fn = f;
     nl();
     buf_printf(out, "static xs_prof prof_ = {\"%s%s%s\"}; uint64_t prof_t0_, prof_cm_; xs_prof_enter(&prof_, &prof_t0_, &prof_cm_);",
                f->cls ? f->cls->name : "", f->cls ? "." : "", f->name);
 }
 
 static void emit_prof_leave(void) {
-    if (!xs_profile) return;
+    if (!xs_profile || !cur_func || cur_func != prof_fn) return;
     nl();
     buf_puts(out, "xs_prof_leave(&prof_, prof_t0_, prof_cm_);");
 }
