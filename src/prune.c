@@ -25,6 +25,31 @@ static void walk_expr(Expr *e);
 static void walk_stmt(Stmt *s);
 static void use_type(Type *t);
 
+/* XB-232: which classes can have objects (made), for the TLS decision: a method reached only through its base's
+   dispatch (an interface's other implementation) cannot run when no object of its class exists. Made: new C, an
+   object literal of C, and what decoding, casts and the runtime's calls give (their result type, its fields too). */
+static void made_type(Type *t);
+static void made_class(Class *c) {
+    if (!c || c->made || c->builtin) return;
+    c->made = true;
+    for (int i = 0; i < c->nfields; i++) made_type(c->fields[i].type);
+}
+static void made_type(Type *t) {
+    if (!t) return;
+    switch (t->kind) {
+    case TY_OBJECT: made_class(t->cls); break;
+    case TY_ARRAY: case TY_SET: case TY_NULLABLE: made_type(t->elem); break;
+    case TY_MAP: made_type(t->key); made_type(t->elem); break;
+    case TY_UNION: for (int i = 0; i < t->nparams; i++) made_type(t->params[i]); break;
+    default: break;
+    }
+}
+static bool made_or_sub(Class *c, int depth) {
+    if (!c || c->made || depth > 64) return c != NULL;
+    for (int i = 0; i < c->nsubs; i++) if (made_or_sub(c->subs[i], depth + 1)) return true;
+    return false;
+}
+
 static void use_class(Class *c) {
     if (!c || c->used || c->builtin) return;
     c->used = true;
@@ -55,6 +80,11 @@ static void use_type(Type *t) {
 static void walk_expr(Expr *e) {
     if (!e) return;
     use_type(e->type);
+    if (e->kind == E_NEW_OBJ || e->kind == E_OBJLIT) made_class(e->cls);
+    if (e->kind == E_AS || ((e->kind == E_CALL || e->kind == E_MEMBER) && (e->builtin.cfn || (e->func && e->func->is_native)))) {
+        made_type(e->type);
+        made_type(e->elem_type);
+    }
     switch (e->kind) {
     case E_CALL:
         if (e->builtin.cfn && strncmp(e->builtin.cfn, "__reflect_", 10) == 0) use_type(e->elem_type); /* decoder/encoder of T */
@@ -135,7 +165,15 @@ void prune_program(Program *p) {
         for (int i = 0; i < nasif_n; i++)
             for (int k = 0; k < asif_reached[i]->nadapters; k++) {
                 Class *a = asif_reached[i]->adapters[k];
-                if (!a->used && a->adapter_of->used) { use_class(a); more = true; }
+                if (!a->used && a->adapter_of->used) { use_class(a); made_class(a); more = true; }
             }
+    }
+    /* TLS (XB-232): a fetch that may be https counts when its function is reachable, and, for a method or a
+       constructor, when an object of its class (or of a subclass) can exist */
+    for (int i = 0; i < p->ntls_fns && !p->uses_tls; i++) {
+        Func *f = p->tls_fns[i];
+        if (!f->used) continue;
+        if (f->cls && !f->static_of && !f->cls->builtin && !made_or_sub(f->cls, 0)) continue;
+        p->uses_tls = true;
     }
 }
