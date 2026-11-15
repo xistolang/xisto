@@ -45,4 +45,3 @@ setTimeout(() => {
   }
 }, 50);
 setTimeout(() => console.log("last timer"), 60);
-

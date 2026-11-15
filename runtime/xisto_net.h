@@ -1166,7 +1166,7 @@ XS_NOINLINE void xs_promise_reject(xs_promise *p, void *err) {
 }
 /* process.on('unhandledRejection') (runtime/node/process.ts): its dispatcher, (reason, promise) => handled */
 static XS_TLS xs_closure *xs_rejection_cb;
-static void xs_unh_dispatch(void) {
+XS_NOINLINE void xs_unh_dispatch(void) {
     while (xs_unh) {
         xs_promise *p = xs_unh;
         while (p->unh_next) p = p->unh_next; /* the first rejected */
@@ -1184,7 +1184,7 @@ static void xs_unh_dispatch(void) {
     }
 }
 /* a rejection that no handler took by the time the loop has nothing ready: the program ends, as in Node */
-static void xs_unh_check(void) {
+XS_NOINLINE void xs_unh_check(void) {
     if (!xs_unh) return;
     if (xs_rejection_cb) { xs_unh_dispatch(); if (!xs_unh) return; }
     xs_promise *p = xs_unh;
@@ -1281,7 +1281,7 @@ XS_NOINLINE xs_promise *xs_promise_rejected(int kind, void *err) {
 }
 
 /* await p */
-static bool xs_promise_stop(void *p) {
+XS_NOINLINE bool xs_promise_stop(void *p) {
     xs_promise *q = p;
     if (q->state != 0) return true;
     if (xs_tasks_live == 0 && !xs_ready_head) { /* nothing left that could settle it: Node's loop would be empty */
@@ -3953,7 +3953,7 @@ static void xs_uncaught_print(void *err, int code) {
     xs_process_exit(code); /* ('exit' listeners run, with the code, as in Node) */
 }
 static void xs_uncaught_again(void *err) { xs_uncaught_print(err, 7); } /* a listener threw: Node's exit code 7 */
-static bool xs_uncaught_call(void *err, const char *origin) {
+XS_NOINLINE bool xs_uncaught_call(void *err, const char *origin) {
     void (*hook)(void *) = xs_uncaught_hook;
     xs_uncaught_hook = xs_uncaught_again;
     xs_str *o = xs_str_new(origin, strlen(origin));
