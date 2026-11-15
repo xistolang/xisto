@@ -59,7 +59,17 @@ async function who(req: HttpRequest): Promise<HttpResponse> {
   return HttpResponse.text(`who=${req.param("name")} id=${req.header("X-Id") ?? "none"} n=${req.query("n") ?? "none"};`);
 }
 
+// HttpResponse.json(body, status) / text(body, status): the content type is the method's, the status optional (XB-229)
+function byStatus(req: HttpRequest): HttpResponse {
+  const kind = req.param("kind");
+  if (kind === "created") return HttpResponse.json(JSON.stringify({ id: 1 }), 201);
+  if (kind === "missing") return HttpResponse.json(`{"error":"not found"}`, 404);
+  if (kind === "list") return HttpResponse.json("[1, 2]");
+  return HttpResponse.status(418, "{teapot");
+}
+
 const app: Server = new Server();
+app.get("/status/:kind", byStatus);
 app.get("/wait", wait);
 app.post("/publish", publish);
 app.post("/echo", echo);
