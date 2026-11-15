@@ -12,7 +12,8 @@ instead. Intended differences are in [Divergences from TypeScript](./divergences
 
 - **Object rest from an untyped value.** `const { a, ...rest } = { a: 1, b: 2 }` needs the source typed
   (XS6006); with an interface or class it works.
-- **Generators as values.** No `.next()`, no spread, no `Array.from`: consume them with `for…of`.
+- **Generators as values.** No `.next()` and no spread: consume them with `for…of`, `Array.from(g)` or the
+  [iterator helpers](./builtins.md#iterator-helpers-es2025) (`g.take(3).toArray()`).
 - **`yield` inside `try … finally`** (XS6011).
 - **`export * as ns from`** (XS1039): re-export the names one by one.
 - **Side-effect imports.** `import "./x.ts"` does not run the module's top-level code. Export a function and
@@ -20,9 +21,12 @@ instead. Intended differences are in [Divergences from TypeScript](./divergences
 - **Nested classes and enums** (XS6027): declare them at the top level.
 - **String indexing** `s[i]` (XS6033): use `s.slice(i, i + 1)`.
 - **`(boolean | null)[]`** (XS6039): `(int | null)[]` and `(T | null)[]` of objects and strings work.
-- **Array methods.** `find` on arrays of numbers (XS7056: use `findIndex`); `splice` only as `splice(i, 1)`;
-  `toSorted` and other recent methods (XS6038).
-- **`Object.is`** and some other `Object` statics are missing.
+- **Array methods.** `find` on arrays of numbers (XS7056: use `findIndex`, or `findLast`, which takes numbers);
+  `splice` only as `splice(i, 1)` or `splice(i)` (`toSpliced` takes every form). The recent methods are listed in
+  [Recent built-in methods](./builtins.md).
+- **`Object.isFrozen`, `isSealed`, `isExtensible`** (XS8015): `Object.freeze` returns the object unchanged.
+  `Object.defineProperty` takes a `value` only (no getter or setter).
+- **`Iterator.from`, `Promise.try`**, and the Set methods' set-like arguments (a `Set` is needed).
 - **Interfaces that mix fields and methods,** passed from a class that does not `implements` them: write
   `implements` on the class.
 - **Generic arrow values** inside functions are erased: their results are copied through JSON (XS2110).

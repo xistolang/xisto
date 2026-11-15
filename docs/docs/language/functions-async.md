@@ -99,7 +99,7 @@ Cost, measured on an Apple M4 (12 Nov 2026), 2 million calls: `await f()` 0.7–
 (`const p = f(); await p`) about 73 ns. Node: about 20 ns for both. Await directly where you can. How waiting
 works underneath, and why: [Why coroutines](../performance/coroutines.md).
 
-## Promise.all, race, allSettled
+## Promise.all, race, allSettled, any
 
 `Promise.all` and `Promise.race` over an array literal run each element as a task:
 
@@ -108,7 +108,12 @@ const [x, y] = await Promise.all([a(), b()]);                      // different 
 const first = await Promise.race([work("slow", 30), work("fast", 5)]);
 const rs = await Promise.allSettled(ps);                           // ps: Promise<number>[]
 for (const r of rs) console.log(r.status);                         // fulfilled / rejected
+const v = await Promise.any([fail(5), value(30, 1), value(15, 2)]); // the first to fulfil: 2
+const { promise, resolve } = Promise.withResolvers<string>();
 ```
+
+`Promise.any` rejects with an `AggregateError` when every promise rejects; `Promise.withResolvers<T>()` needs its
+type argument. See [Recent built-in methods](./builtins.md#promise).
 
 ## Unhandled rejection
 

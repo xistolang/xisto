@@ -83,6 +83,9 @@ print `-0`, as on Node. It is lost in a reassigned `int` variable or an `int[]` 
 ## `bigint`
 
 `bigint` literals (`123n`) and arithmetic work as on Node: `2n ** 70n`, `%`, `typeof x === "bigint"`.
+`BigInt(x)` converts an `int`, a `number` (an integer: `BigInt(1.5)` is a `RangeError`), a string (`"0x1f"`,
+`"0b101"`, `" 12 "`) or a boolean; `b.toString(radix)` takes a radix from 2 to 36; `BigInt.asUintN` and
+`BigInt.asIntN` wrap to a width of bits.
 
 ## See also
 

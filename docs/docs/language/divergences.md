@@ -49,7 +49,10 @@ Every row was checked on 12 Nov 2026 by running the same program with xisto and 
 | `s[i]` | a character | error XS6033 | use `s.slice(i, i + 1)` |
 | `s.match("text")` | converts to a RegExp | error XS7096 | no implicit conversion |
 | `s.normalize("NFD")` | decomposes | returns the string unchanged | no Unicode tables |
-| `m.keys()`, `m.values()` | iterators | arrays | |
+| `m.keys()`, `m.values()` | iterators | arrays (`take`, `drop`, `toArray` make them lazy iterators) | |
+| `xs.at(99)`, `xs.findLast(f)` with no match | `undefined` | `null` | one empty value |
+| `Object.freeze(o)`, then `o.x = 1` | `TypeError` (strict mode) | the write happens; `Object.isFrozen` is refused | no flag per object |
+| `console.log(new AggregateError(es, m))` | the stack, then `[errors]` | `AggregateError: m {` `[errors]: ... }` | xisto prints no frames |
 | `m.set(new, …)` inside `for…of` over `m` | the loop sees it | the loop does not see it | |
 | `numbers.sort()` without comparator | sorts as strings | error XS7089 (strings sort as on Node) | the default surprises |
 | `const a = []` | `any[]` | error XS3008 | a type is needed |
