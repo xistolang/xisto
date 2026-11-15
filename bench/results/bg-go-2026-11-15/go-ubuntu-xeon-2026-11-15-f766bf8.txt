@@ -1,0 +1,76 @@
+# xisto bg f766bf8 vs go, 2026-11-15T18:04Z, Linux x86_64, go version go1.27.2 linux/amd64; go programs from ~/gobg (46 built; regexredux_4/_5 need PCRE1, not in this Ubuntu)
+steal before 154661
+# Linux x86_64, 2 cpu; median of 3
+spectralnorm   xisto  spectralnorm            0.541s     1.05cpu      2.3MB  par  2.0  same
+spectralnorm   xisto  spectralnorm-2          1.399s     2.71cpu      2.3MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-3          0.608s     1.05cpu      2.4MB  par  1.7  same
+spectralnorm   xisto  spectralnorm-4          0.510s     0.96cpu      2.4MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-5          0.463s     0.89cpu      2.3MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-6          0.461s     0.89cpu      2.4MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-7          0.453s     0.90cpu      2.3MB  par  2.0  same
+spectralnorm   xisto  spectralnorm-8          0.425s     0.85cpu      2.3MB  par  2.0  same
+spectralnorm   go     spectralnorm            4.015s     4.03cpu      2.9MB  par  1.0  same
+spectralnorm   go     spectralnorm_2          1.124s     2.17cpu      2.4MB  par  1.9  same
+spectralnorm   go     spectralnorm_4          1.112s     2.17cpu      3.2MB  par  2.0  same
+spectralnorm   go     spectralnorm_8          4.007s     4.02cpu      2.9MB  par  1.0  same
+nbody          xisto  nbody                   2.451s     2.45cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-2                 7.459s     7.46cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-3                 5.150s     5.15cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-4                 3.618s     3.62cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-5                 2.574s     2.57cpu      2.0MB  par  1.0  same
+nbody          go     nbody                   4.797s     4.81cpu      2.1MB  par  1.0  same
+nbody          go     nbody_2                 4.804s     4.82cpu      2.1MB  par  1.0  same
+nbody          go     nbody_3                 3.669s     3.68cpu      2.1MB  par  1.0  same
+nbody          go     nbody_8                 3.641s     3.65cpu      1.9MB  par  1.0  same
+fannkuchredux  xisto  fannkuchredux           8.667s    17.21cpu      2.1MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-2        11.494s    22.80cpu      2.3MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-3        11.415s    22.68cpu      2.4MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-4         8.019s    15.83cpu      2.3MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-5         6.815s    13.49cpu      2.4MB  par  2.0  same
+fannkuchredux  go     fannkuchredux          17.456s    34.83cpu      5.4MB  par  2.0  same
+fannkuchredux  go     fannkuchredux_2        17.536s    34.99cpu     20.4MB  par  2.0  same
+fannkuchredux  go     fannkuchredux_3        17.082s    34.07cpu      5.2MB  par  2.0  same
+fannkuchredux  go     fannkuchredux_8        42.683s    42.82cpu      2.1MB  par  1.0  same
+binarytrees    xisto  binarytrees             1.642s     3.07cpu     70.1MB  par  1.9  same
+binarytrees    xisto  binarytrees-2           1.663s     3.16cpu    119.8MB  par  1.9  same
+binarytrees    xisto  binarytrees-3           1.538s     2.99cpu    114.3MB  par  1.9  same
+binarytrees    xisto  binarytrees-4           2.997s     3.00cpu     65.7MB  par  1.0  same
+binarytrees    go     binarytrees            21.204s    33.38cpu    249.2MB  par  1.6  same
+binarytrees    go     binarytrees_2          16.001s    31.78cpu    636.8MB  par  2.0  same
+binarytrees    go     binarytrees_3          16.168s    31.93cpu    312.9MB  par  2.0  same
+binarytrees    go     binarytrees_5          16.604s    32.92cpu    307.2MB  par  2.0  same
+binarytrees    go     binarytrees_6          27.558s    28.37cpu    429.8MB  par  1.0  same
+binarytrees    go     binarytrees_7          20.806s    32.92cpu    263.6MB  par  1.6  same
+mandelbrot     xisto  mandelbrot              2.120s     3.98cpu     33.5MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-2            3.067s     5.84cpu     32.9MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-3            2.332s     4.39cpu     32.9MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-4            2.151s     4.06cpu     32.9MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-5            2.037s     3.84cpu     33.1MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-6            1.323s     2.51cpu      7.3MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-7            1.892s     3.66cpu      7.3MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-8            1.690s     3.24cpu      7.3MB  par  1.9  same
+mandelbrot     go     mandelbrot              7.155s    14.03cpu     33.2MB  par  2.0  same
+mandelbrot     go     mandelbrot_2           14.042s    27.78cpu     32.9MB  par  2.0  same
+mandelbrot     go     mandelbrot_3            7.255s    14.25cpu     35.2MB  par  2.0  same
+mandelbrot     go     mandelbrot_4            7.275s    14.27cpu     35.2MB  par  2.0  same
+mandelbrot     go     mandelbrot_6           14.224s    28.14cpu     32.6MB  par  2.0  same
+mandelbrot     go     mandelbrot_8           27.849s    27.93cpu      2.1MB  par  1.0  same
+fasta          xisto  fasta                   1.135s     0.36cpu      2.4MB  par  0.3  same
+fasta          xisto  fasta-2                 1.291s     0.55cpu      2.1MB  par  0.4  same
+fasta          go     fasta                   4.824s     4.37cpu      1.9MB  par  0.9  same
+fasta          go     fasta_2                 3.021s     4.44cpu     10.3MB  par  1.5  same
+fasta          go     fasta_3                 3.198s     4.15cpu      3.6MB  par  1.3  same
+fasta          go     fasta_8                 8.207s     8.04cpu      7.5MB  par  1.0  same
+Traceback (most recent call last):
+  File "/home/ubuntu/te-main/bench/benchmarksgame/langs.py", line 92, in <module>
+    main()
+    ~~~~^^
+  File "/home/ubuntu/te-main/bench/benchmarksgame/langs.py", line 77, in main
+    timed(cmd, stdin)  # warm-up
+    ~~~~~^^^^^^^^^^^^
+  File "/home/ubuntu/te-main/bench/benchmarksgame/langs.py", line 27, in timed
+    f = open(f"{OUT}/{stdin}", "rb") if stdin else subprocess.DEVNULL
+        ~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'bench/benchmarksgame/out/fasta-25000000.txt'
+steal after 154880
+DONE
