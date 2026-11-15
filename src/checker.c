@@ -3104,16 +3104,18 @@ static Func *assert_func_overload(Expr *e, Func *f) {
     bool dn = !strcmp(f->name, "doesNotThrow") || !strcmp(f->name, "doesNotReject");
     if (!th && !rj && !dn) return f;
     Expr *a = e->args.items[1];
-    bool cls = a->kind == E_IDENT && !lookup(a->str) && find_class(a->str) && !lookup_func(a->str);
+    bool done = a->kind == E_ARROW && a->arrow && a->arrow->fn->nparams == 1 && a->arrow->fn->params[0].name &&
+                !strncmp(a->arrow->fn->params[0].name, "__ae", 4); /* (a call checked again: already the class form) */
+    bool cls = !done && a->kind == E_IDENT && !lookup(a->str) && find_class(a->str) && !lookup_func(a->str);
     bool msg = a->kind == E_STRING || a->kind == E_TEMPLATE;
-    if (dn && (msg || (!cls && a->kind != E_REGEX))) { /* (fn, message), or (fn, validate, message): (fn, message) */
+    if (dn && (msg || (!cls && !done && a->kind != E_REGEX))) { /* (fn, message), or (fn, validate, message): (fn, message) */
         if (a->kind == E_ARROW) {
             for (int i = 1; i + 1 < e->args.len; i++) e->args.items[i] = e->args.items[i + 1];
             e->args.len--;
         }
         return f;
     }
-    const char *form = cls ? "Class" : a->kind == E_REGEX ? "Re" : a->kind == E_ARROW ? "Fn" : msg ? "Msg" : NULL;
+    const char *form = cls || done ? "Class" : a->kind == E_REGEX ? "Re" : a->kind == E_ARROW ? "Fn" : msg ? "Msg" : NULL;
     if (!form) return f;
     if (cls) { /* (e: any): boolean => e instanceof C, then the class's name */
         static int nisa;

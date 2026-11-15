@@ -616,7 +616,9 @@ those still fails where it is used.
 
 The global `crypto` is Web Crypto, as in Node 20+: `crypto.randomUUID()`, `crypto.getRandomValues(bytes)` and
 `crypto.subtle` (`digest` with SHA-1/256/384/512, HMAC `importKey`/`sign`/`verify`/`exportKey`), the same object as
-`import { webcrypto } from "node:crypto"`; a module that imports or declares its own `crypto` keeps it. As with
+`import { webcrypto } from "node:crypto"`; a module that imports or declares (at its top level) its own `crypto`
+keeps it, but a parameter or local variable named `crypto` whose `randomUUID`, `getRandomValues` or `subtle` is
+read is taken for the global: rename it. As with
 node:crypto's `subtle`, `digest` and `sign` give a `Buffer` (Node: an `ArrayBuffer`); `getRandomValues` takes a
 `Uint8Array`; `subtle` has no RSA, ECDSA or AES keys (see [crypto](#crypto)).
 
