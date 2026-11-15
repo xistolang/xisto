@@ -10915,6 +10915,28 @@ static void check_expr_in(Expr *e, Type *expected) {
             check_expr(e, expected);
             return;
         }
+        if (e->is_call && e->str && !strcmp(e->str, "call") && e->args.len >= 1 && e->lhs && e->lhs->kind == E_IDENT &&
+            !lookup_func(e->lhs->str) && lookup(e->lhs->str) && lookup(e->lhs->str)->type &&
+            ty_strip_null(lookup(e->lhs->str)->type)->kind == TY_FUNC && ty_strip_null(lookup(e->lhs->str)->type)->rest) {
+            /* original.call(this, a, b) of a function value of (...args): __xs_apply(original, this, [a, b]) (XB-107) */
+            Expr *f = e->lhs, *self = e->args.items[0];
+            Expr *arr = xs_alloc(sizeof *arr);
+            arr->kind = E_ARRAY_LIT; arr->pos = e->pos; arr->field = -1;
+            for (int i = 1; i < e->args.len; i++) {
+                Expr *a = e->args.items[i];
+                if (a->kind == E_UNARY && a->op == TK_ELLIPSIS) arr->spread = true;
+                expr_list_push(&arr->args, a);
+            }
+            memset(e, 0, sizeof *e);
+            e->kind = E_CALL; e->pos = f->pos; e->field = -1;
+            e->lhs = xs_alloc(sizeof *e->lhs);
+            e->lhs->kind = E_IDENT; e->lhs->pos = f->pos; e->lhs->field = -1; e->lhs->str = "__xs_apply";
+            expr_list_push(&e->args, f);
+            expr_list_push(&e->args, self);
+            expr_list_push(&e->args, arr);
+            check_expr(e, expected);
+            return;
+        }
         if (e->is_call && e->str && !strcmp(e->str, "defineProperty") && e->lhs && e->lhs->kind == E_IDENT && !strcmp(e->lhs->str, "Object") &&
             !lookup("Object") && e->args.len == 3 && (e->args.items[0]->kind == E_IDENT || e->args.items[0]->kind == E_MEMBER) &&
             ({ check_expr(e->args.items[0], NULL); e->args.items[0]->prechecked = true; ty_strip_null(e->args.items[0]->type)->kind == TY_FUNC; })) {
@@ -17806,7 +17828,7 @@ static void deco_stub_text(Buf *b, Func *f, const char *rs, const char *inner, b
     buf_printf(b, ")%s;\n}\n", is_void ? "" : xs_sprintf(" as %s", inner));
 }
 /* the slot of C.m (once per method: stacked decorators wrap what the previous one left) */
-static bool deco_slot(Program *p, Module *m, const char *cn, const char *mn, int at, int *added) {
+static bool deco_slot(Program *p, Module *m, const char *cn, const char *mn, int at, int *added, bool stub) {
     *added = 0;
     Class *c = find_class(cn);
     Func *f = c ? find_method(c, mn) : NULL;
@@ -17821,13 +17843,85 @@ static bool deco_slot(Program *p, Module *m, const char *cn, const char *mn, int
     buf_puts(&b, "));\n}\n");
     buf_printf(&b, "let __xs_slot_%s_%s: (...args: unknown[]) => unknown = __xs_orig_%s_%s;\n", cn, mn, cn, mn);
     const char *rs = f->ret_src;
-    if (rs) { /* (written: the stub now; inferred: deco_late_stubs, once the class's bodies are checked) */
+    if (!stub) { /* (no decorator of it replaces descriptor.value: its calls stay direct, the slot only read) */
+    } else if (rs) { /* (written: the stub now; inferred: deco_late_stubs, once the class's bodies are checked) */
         bool async = f->is_async || !strncmp(rs, "Promise<", 8);
         const char *inner = !strncmp(rs, "Promise<", 8) ? xs_strndup(rs + 8, strlen(rs) - 9) : rs;
         deco_stub_text(&b, f, rs, inner, async, !strcmp(inner, "void"));
     } else f->deco_late = true;
     StmtList decls = {0};
     deco_funcs(p, m, b.data, f->pos, f, &decls);
+    for (int k = 0; k < decls.len; k++) { /* (before the decorator's statement) */
+        stmt_list_push(&p->top, NULL);
+        memmove(p->top.items + at + 1, p->top.items + at, sizeof(Stmt *) * (size_t)(p->top.len - 1 - at));
+        p->top.items[at] = decls.items[k];
+        at++;
+        (*added)++;
+    }
+    return true;
+}
+/* the slot of a static method C.m (the module's function C__s_m, named mn here): its own body moves to a copy,
+   __xs_sorig_C__s_m, that __xs_orig_C_C__s_m calls; C__s_m keeps its name and signature (its calls stay direct) and
+   its body becomes the stub's: the call of the slot. Its return type written, its parameters typed, not a generator:
+   otherwise no slot (the decorator's call is left out, as before) */
+static bool deco_static_slot(Program *p, Module *m, const char *cn, const char *mn, int at, int *added, bool stub) {
+    *added = 0;
+    Class *c = find_class(cn);
+    Func *f = NULL;
+    SYM_EACH(funcs_by_name, mn, e) { Func *g = e->decl; if (g->static_of == c && g->mod == m) f = g; }
+    if (!c || !f || !f->body || f->ntparams || f->is_gen || !f->ret_src) return false;
+    if (f->deco_slotted) return true;
+    for (int i = 0; i < f->nparams; i++) if (!f->params[i].type_src || f->params[i].rest) return false;
+    f->deco_slotted = true;
+    if (!stub) { /* (no decorator of it replaces descriptor.value: C__s_m stays as it is, the slot only read) */
+        Buf b = {0};
+        buf_printf(&b, "function __xs_orig_%s_%s(...args: unknown[]): unknown {\n  return __xs_ret_unknown(%s(", cn, mn, mn);
+        for (int i = 0; i < f->nparams; i++) buf_printf(&b, "%sargs[%d] as %s", i ? ", " : "", i, param_text(&f->params[i]));
+        buf_puts(&b, "));\n}\n");
+        buf_printf(&b, "let __xs_slot_%s_%s: (...args: unknown[]) => unknown = __xs_orig_%s_%s;\n", cn, mn, cn, mn);
+        StmtList decls = {0};
+        Func dummy = {0};
+        dummy.cls = c; dummy.name = (char *)mn;
+        deco_funcs(p, m, b.data, f->pos, &dummy, &decls);
+        for (int k = 0; k < decls.len; k++) {
+            stmt_list_push(&p->top, NULL);
+            memmove(p->top.items + at + 1, p->top.items + at, sizeof(Stmt *) * (size_t)(p->top.len - 1 - at));
+            p->top.items[at++] = decls.items[k];
+            (*added)++;
+        }
+        return true;
+    }
+    Func *o = xs_alloc(sizeof *o); /* (its own body, under another name) */
+    *o = *f;
+    o->name = xs_sprintf("__xs_sorig_%s", mn);
+    o->cname = xs_sprintf("f%d_%s", m->id, o->name);
+    o->decos = (DecoList){0};
+    o->used = true;
+    p->funcs = realloc(p->funcs, sizeof(Func *) * (size_t)(p->nfuncs + 1));
+    p->funcs[p->nfuncs++] = o;
+    sym_add(&funcs_by_name, o->name, o);
+    const char *rs = f->ret_src;
+    bool async = f->is_async || !strncmp(rs, "Promise<", 8);
+    const char *inner = !strncmp(rs, "Promise<", 8) ? xs_strndup(rs + 8, strlen(rs) - 9) : rs;
+    bool is_void = !strcmp(inner, "void");
+    Buf b = {0};
+    buf_printf(&b, "function __xs_orig_%s_%s(...args: unknown[]): unknown {\n  return __xs_ret_unknown(%s(", cn, mn, o->name);
+    for (int i = 0; i < f->nparams; i++) buf_printf(&b, "%sargs[%d] as %s", i ? ", " : "", i, param_text(&f->params[i]));
+    buf_puts(&b, "));\n}\n");
+    buf_printf(&b, "let __xs_slot_%s_%s: (...args: unknown[]) => unknown = __xs_orig_%s_%s;\n", cn, mn, cn, mn);
+    buf_printf(&b, "{\n  __xs_this_set(null);\n  %s__xs_slot_%s_%s(", is_void ? "" : "return ", cn, mn);
+    for (int i = 0; i < f->nparams; i++) buf_printf(&b, "%s%s", i ? ", " : "", f->params[i].name);
+    buf_printf(&b, ")%s;\n}\n", is_void ? "" : xs_sprintf(" as %s", inner));
+    (void)async;
+    StmtList decls = {0};
+    Func dummy = {0};
+    dummy.cls = c; dummy.name = (char *)mn;
+    deco_funcs(p, m, b.data, f->pos, &dummy, &decls);
+    Stmt *sb = decls.len ? decls.items[decls.len - 1] : NULL; /* (the block: C__s_m's body from now on) */
+    if (!sb || sb->kind != S_BLOCK) xs_error(XS9902, f->pos, NULL, "internal: the stub of %s", mn);
+    sb->generated = false;
+    f->body = sb;
+    decls.len--;
     for (int k = 0; k < decls.len; k++) { /* (before the decorator's statement) */
         stmt_list_push(&p->top, NULL);
         memmove(p->top.items + at + 1, p->top.items + at, sizeof(Stmt *) * (size_t)(p->top.len - 1 - at));
@@ -17921,7 +18015,7 @@ static void proto_walk(Stmt *s, Stmt **vars, int *nvars, Stmt **asg, int *nasg) 
     for (int i = 0; i < s->stmts.len; i++) proto_walk(s->stmts.items[i], vars, nvars, asg, nasg);
     for (int i = 0; i < s->ncases; i++) proto_walk(s->cases[i].body, vars, nvars, asg, nasg);
 }
-static bool deco_slot(Program *p, Module *m, const char *cn, const char *mn, int at, int *added);
+static bool deco_slot(Program *p, Module *m, const char *cn, const char *mn, int at, int *added, bool stub);
 static void deco_funcs(Program *p, Module *m, const char *text, Pos pos, Func *f, StmtList *decls);
 /* prototype patching (Isa, 12/11): `const proto = Object.getPrototypeOf(ds.createQueryRunner()...); proto.query = ...`.
    Before any module's code is checked, each such function is read: the class its receiver is declared to give (a
@@ -18007,7 +18101,7 @@ static void proto_func(Program *p, Func *f) {
             enter_module(r->mod);
             int added = 0;
             bool already = mf->deco_slotted;
-            if (deco_slot(p, r->mod, r->name, mf->name, at, &added) && !proto_accessor(r, mf->name, false)) {
+            if (deco_slot(p, r->mod, r->name, mf->name, at, &added, true) && !proto_accessor(r, mf->name, false)) {
                 (void)already;
                 Buf b = {0};
                 buf_printf(&b, "function __xs_slot_get_%s_%s(): (...args: unknown[]) => unknown {\n  return __xs_slot_%s_%s;\n}\n", r->name, mf->name, r->name, mf->name);
@@ -18029,6 +18123,121 @@ static void proto_prepass(Program *p) {
         if (!c->mod || c->builtin) continue;
         for (int k = 0; k < c->nmethods; k++) if (c->methods[k]->cls == c) { enter_module(c->mod); proto_func(p, c->methods[k]); }
     }
+}
+/* XB-107: whether a TypeScript method decorator may replace descriptor.value. It does not when its descriptor
+   parameter is only read (d.value, d.writable...), tested (!d, d === null, typeof d) or given back as it is (return d):
+   then its method needs no stub, and an undecorated method's calls cost the same with it (direct). Anything else (an
+   assignment to d.x, d passed on or captured into another value, another descriptor returned, a decorator whose code
+   is not at hand) may */
+static bool dw_expr(Expr *e, const char *d);
+static bool dw_stmt(Stmt *s, const char *d, bool own) {
+    if (!s) return false;
+    if (s->kind == S_RETURN && own && s->expr) {
+        Expr *x = s->expr;
+        while (x->kind == E_AS && x->lhs) x = x->lhs;
+        if (x->kind == E_IDENT && x->str && !strcmp(x->str, d)) return false;
+        if (x->kind == E_NULL) return false;
+        return true;
+    }
+    if (dw_expr(s->init, d) || dw_expr(s->expr, d) || dw_expr(s->cond, d) || dw_expr(s->for_update, d)) return true;
+    if (dw_stmt(s->for_init, d, own) || dw_stmt(s->body, d, own) || dw_stmt(s->else_body, d, own)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (dw_stmt(s->stmts.items[i], d, own)) return true;
+    for (int i = 0; i < s->ncases; i++) if (dw_expr(s->cases[i].value, d) || dw_stmt(s->cases[i].body, d, own)) return true;
+    return false;
+}
+static bool dw_is(Expr *e, const char *d) {
+    while (e && e->kind == E_AS && e->lhs) e = e->lhs;
+    return e && e->kind == E_IDENT && e->str && !strcmp(e->str, d);
+}
+static bool dw_expr(Expr *e, const char *d) {
+    if (!e) return false;
+    switch (e->kind) {
+    case E_IDENT: return e->str && !strcmp(e->str, d); /* (d itself as a value: passed on, kept) */
+    case E_ASSIGN: {
+        Expr *t = e->lhs;
+        while (t && (t->kind == E_MEMBER || t->kind == E_INDEX) && t->lhs) { if (dw_is(t->lhs, d)) return true; t = t->lhs; }
+        break;
+    }
+    case E_MEMBER:
+        if (dw_is(e->lhs, d)) { /* d.value read; a call on it (d.value(...)) runs the method: read too */
+            if (!e->is_call) return false;
+            for (int i = 0; i < e->args.len; i++) if (dw_expr(e->args.items[i], d)) return true;
+            return false;
+        }
+        break;
+    case E_UNARY:
+        if (dw_is(e->lhs, d) && e->op != TK_ELLIPSIS) return false; /* (!d, typeof d) */
+        break;
+    case E_BINARY:
+        if (e->op == TK_EQ || e->op == TK_NEQ) {
+            bool l = dw_is(e->lhs, d), r = dw_is(e->rhs, d);
+            if (l || r) return (!l && dw_expr(e->lhs, d)) || (!r && dw_expr(e->rhs, d));
+        }
+        break;
+    case E_ARROW:
+        return e->arrow && e->arrow->fn && dw_stmt(e->arrow->fn->body, d, false);
+    default: break;
+    }
+    if (dw_expr(e->lhs, d) || dw_expr(e->rhs, d)) return true;
+    for (int i = 0; i < e->args.len; i++) if (dw_expr(e->args.items[i], d)) return true;
+    return false;
+}
+static int dw_returns(Stmt *s) { /* the returns of a function's own body (not its closures') */
+    if (!s) return 0;
+    int n = s->kind == S_RETURN;
+    n += dw_returns(s->for_init) + dw_returns(s->body) + dw_returns(s->else_body);
+    for (int i = 0; i < s->stmts.len; i++) n += dw_returns(s->stmts.items[i]);
+    for (int i = 0; i < s->ncases; i++) n += dw_returns(s->cases[i].body);
+    return n;
+}
+static bool deco_writes(Expr *src) {
+    Func *fn = NULL;
+    if (src->kind == E_CALL && src->lhs && src->lhs->kind == E_IDENT) { /* a factory: the decorator it returns */
+        Func *f = lookup_func(src->lhs->str);
+        if (!f || !f->body) return true;
+        for (int i = f->body->stmts.len - 1; i >= 0 && !fn; i--) {
+            Stmt *st = f->body->stmts.items[i];
+            if (!st || st->kind != S_RETURN) continue;
+            if (!st->expr) return true;
+            Expr *x = st->expr;
+            while (x && x->kind == E_AS && x->lhs) x = x->lhs;
+            if (!x || x->kind != E_ARROW || !x->arrow || !x->arrow->fn) return true;
+            fn = x->arrow->fn;
+        }
+        if (fn && dw_returns(f->body) != 1) return true; /* (one return only: a decorator chosen at run time may be any) */
+    } else if (src->kind == E_IDENT) fn = lookup_func(src->str);
+    if (!fn || !fn->body) return true;
+    if (fn->nparams < 3) return false; /* ((target, key): no descriptor to replace) */
+    const char *d = fn->params[2].name;
+    if (!d) return true;
+    return dw_stmt(fn->body, d, true);
+}
+static bool deco_is_ts(Expr *src);
+/* the TypeScript decorators of C.m in the module, from the statement at i on: does any replace descriptor.value? */
+static bool deco_method_writes(Program *p, Module *m, int i, const char *cn, const char *mn) {
+    for (int j = i; j < p->top.len; j++) {
+        Stmt *s = p->top.items[j];
+        if (s->mod != m || s->kind != S_IF || !s->generated || !s->cond || s->cond->kind != E_CALL || !s->cond->lhs ||
+            s->cond->lhs->kind != E_IDENT || !s->cond->lhs->str || strcmp(s->cond->lhs->str, "__xs_ts_deco") != 0 || s->cond->args.len != 3)
+            continue;
+        Expr *c = s->cond;
+        if (strcmp(c->args.items[1]->str, cn) != 0 || strcmp(c->args.items[2]->str, mn) != 0) continue;
+        const char *dn = c->args.items[0]->str;
+        Expr *src = NULL;
+        for (int k = j - 1; k >= 0 && !src; k--) {
+            Stmt *dd = p->top.items[k];
+            if (dd->mod == m && dd->kind == S_VAR && dd->name && !strcmp(dd->name, dn)) src = dd->init;
+        }
+        if (!src || getenv("XISTO_XB107_ALWAYS_STUB")) return true;
+        bool ts = false;
+        jmp_buf *outer = xs_error_recover;
+        bool was_failed = failed_;
+        RECOVER_BEGIN ts = deco_is_ts(src); RECOVER_END
+        xs_error_recover = outer;
+        failed_ = was_failed;
+        if (ts && deco_writes(src)) return true;
+    }
+    return false;
 }
 static void deco_prepass(Program *p, Module *m) {
     for (int i = 0; i < p->top.len; i++) {
@@ -18056,7 +18265,9 @@ static void deco_prepass(Program *p, Module *m) {
         if (ts) {
             int at = i;
             for (int k = i - 1; k >= 0; k--) { Stmt *d = p->top.items[k]; if (d->mod == m && d->kind == S_VAR && d->name && !strcmp(d->name, dn)) { at = k; break; } }
-            ts = deco_slot(p, m, cn, mn, at, &added);
+            bool stub = deco_method_writes(p, m, i, cn, mn);
+            enter_module(m);
+            ts = strstr(mn, "__s_") ? deco_static_slot(p, m, cn, mn, at, &added, stub) : deco_slot(p, m, cn, mn, at, &added, stub);
             enter_module(m);
         }
         s = p->top.items[i + added];

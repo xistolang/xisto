@@ -1,0 +1,19 @@
+24
+loaded a
+15
+3 6
+s fact(4)
+s fact(3)
+s fact(2)
+s fact(1)
+start load
+end load
+v note(hi)
+note hi
+start save
+saved 6
+end save
+after save
+i scale(5)
+i scale(1)
+i scale(2)

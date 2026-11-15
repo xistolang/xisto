@@ -41,6 +41,7 @@ typedef struct {
 } Parser;
 
 static void rest_param(Parser *p, Func *f, Type *t);
+static bool this_alias_used; /* a `this` read Parser.this_alias (function () { this }: the function takes its object) */
 static void vt_push(Parser *p, const char *name, Type *t) {
     char **n = xs_alloc(sizeof(char *) * (size_t)(p->nvt + 1)); /* (new arrays: copies of the parser may hold the old ones) */
     Type **ty = xs_alloc(sizeof(Type *) * (size_t)(p->nvt + 1));
@@ -1254,13 +1255,33 @@ static Expr *parse_arrow(Parser *p) {
     }
     if (is_fn) { if (!at(p, TK_LBRACE)) expect(p, TK_LBRACE, NULL); }
     else expect(p, TK_ARROW, NULL);
-    if (at(p, TK_LBRACE) && this_t) { /* const __selfN: T = __xs_this_take() as T; then the body, its `this` that local */
-        static int nself;
-        const char *alias = xs_sprintf("__self%d", ++nself);
+    bool implicit_this = false;
+    const char *ialias = NULL;
+    if (is_fn && !this_t && at(p, TK_LBRACE)) { /* function () { this }: its `this` is the object it is called on, as
+        function (this: any) (TypeScript types it by the context: descriptor.value = function () { orig.apply(this, args) }) */
+        static int nimpl;
+        ialias = xs_sprintf("__selfi%d", ++nimpl);
         const char *was = p->this_alias;
-        p->this_alias = alias;
+        bool used_was = this_alias_used;
+        p->this_alias = ialias;
+        this_alias_used = false;
         f->body = parse_block(p);
         p->this_alias = was;
+        implicit_this = this_alias_used; /* (the body names `this`: it takes the object; otherwise nothing changes) */
+        this_alias_used = used_was;
+        if (implicit_this) this_t = ty_any;
+    }
+    if (this_t && (implicit_this || at(p, TK_LBRACE))) { /* const __selfN: T = __xs_this_take() as T; then the body, its `this` that local */
+        static int nself;
+        const char *alias = implicit_this ? ialias : xs_sprintf("__self%d", ++nself);
+        if (!implicit_this) {
+            const char *was = p->this_alias;
+            bool used_was = this_alias_used;
+            p->this_alias = alias;
+            f->body = parse_block(p);
+            p->this_alias = was;
+            this_alias_used = used_was;
+        }
         Stmt *d = new_stmt(S_VAR, f->pos);
         d->name = (char *)alias;
         d->is_const = true;
@@ -1275,6 +1296,7 @@ static Expr *parse_arrow(Parser *p) {
         memmove(f->body->stmts.items + 1, f->body->stmts.items, sizeof(Stmt *) * (size_t)(f->body->stmts.len - 1));
         f->body->stmts.items[0] = d;
         wants_reflect = true;
+    } else if (f->body) { /* (function () { }: parsed above, its `this` not named) */
     } else if (at(p, TK_LBRACE)) {
         f->body = parse_block(p);
     } else {
@@ -1372,7 +1394,7 @@ static Expr *parse_primary(Parser *p) {
     }
     case TK_THIS: {
         next(p);
-        if (p->this_alias) return ident_expr(pos, p->this_alias); /* (function (this: T) { this.x }) */
+        if (p->this_alias) { this_alias_used = true; return ident_expr(pos, p->this_alias); } /* (function (this: T) { this.x }) */
         return new_expr(E_THIS, pos);
     }
     case TK_TEMPLATE: {
@@ -3631,7 +3653,15 @@ static Class *parse_interface(Parser *p) {
 
 static Class *parse_class_ex(Parser *p, bool abstract);
 static Class *parse_class(Parser *p) { return parse_class_ex(p, false); }
-static Class *parse_class_ex(Parser *p, bool abstract) {
+static Class *parse_class_ex0(Parser *p, bool abstract);
+static Class *parse_class_ex(Parser *p, bool abstract) { /* (a class inside function () { this }: its methods' `this` is their own) */
+    const char *was = p->this_alias;
+    p->this_alias = NULL;
+    Class *c = parse_class_ex0(p, abstract);
+    p->this_alias = was;
+    return c;
+}
+static Class *parse_class_ex0(Parser *p, bool abstract) {
     Class *c = xs_alloc(sizeof *c);
     c->pos = p->tok.pos;
     c->is_abstract = abstract;
@@ -5006,6 +5036,7 @@ static bool class_decorated(Class *c) {
         for (int k = 0; k < c->methods[i]->nparams; k++) if (c->methods[i]->params[k].decos.len) return true;
     }
     if (c->ctor) for (int k = 0; k < c->ctor->nparams; k++) if (c->ctor->params[k].decos.len) return true;
+    for (int i = 0; i < c->nsmethods; i++) if (c->smethods[i]->decos.len) return true;
     return false;
 }
 static void tinfo(Buf *b, const char *t) {
@@ -5159,10 +5190,12 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
         for (int i = f->nparams - 1; i >= 0; i--)
             for (int d = f->params[i].decos.len - 1; d >= 0; d--)
                 apply(g, &f->params[i].decos.items[d], xs_sprintf("%s, %s.methods[%d], %d", ci_name, ci_name, rk, i));
+        int n0 = ndeco; /* (as TypeScript: the decorators' expressions evaluated top-down, then applied bottom-up) */
+        for (int d = 0; d < f->decos.len; d++) buf_printf(g, "const __deco%d = %s;\n", n0 + d, f->decos.items[d].src);
+        ndeco += f->decos.len;
         for (int d = f->decos.len - 1; d >= 0; d--) { /* (xisto's (c, m) or TypeScript's (target, key, descriptor): the checker
                                                        keeps the branch the decorator's type takes, see deco_prepass) */
-            int n = ndeco++;
-            buf_printf(g, "const __deco%d = %s;\n", n, f->decos.items[d].src);
+            int n = n0 + d;
             buf_printf(g, "if (__xs_ts_deco(__deco%d, \"%s\", \"%s\")) {\n"
                           "  const __dd%d = new PropertyDescriptor(__xs_slot_%s_%s);\n"
                           "  __xs_desc_enter(%s, \"%s\", __dd%d);\n"
@@ -5173,6 +5206,24 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
                        n, c->name, f->name, n, c->name, f->name, ci_name, f->name, n, n, ci_name, f->name, n, n, c->name, f->name, n, n, ci_name, ci_name, rk);
         }
         rk++;
+    }
+    for (int k = 0; k < c->nsmethods; k++) { /* a static method (C__s_m, a function of the module): TypeScript's decorators
+                                               may replace it too; xisto's (c, m) take an instance method, none here */
+        Func *f = c->smethods[k];
+        if (!f->decos.len || f->ntparams) continue;
+        const char *on = c->static_names && c->nsfields + k < c->nstatics_user ? c->static_names[c->nsfields + k] : f->name;
+        int n0 = ndeco;
+        for (int d = 0; d < f->decos.len; d++) buf_printf(g, "const __deco%d = %s;\n", n0 + d, f->decos.items[d].src);
+        ndeco += f->decos.len;
+        for (int d = f->decos.len - 1; d >= 0; d--) {
+            int n = n0 + d;
+            buf_printf(g, "if (__xs_ts_deco(__deco%d, \"%s\", \"%s\")) {\n"
+                          "  const __dd%d = new PropertyDescriptor(__xs_slot_%s_%s);\n"
+                          "  __xs_ts_apply(__deco%d(%s, \"%s\", __dd%d), __dd%d);\n"
+                          "  __xs_slot_%s_%s = __dd%d.value;\n"
+                          "} else {\n}\n",
+                       n, c->name, f->name, n, c->name, f->name, n, ci_name, on, n, n, c->name, f->name, n);
+        }
     }
     for (int k = 0; k < c->nfields; k++)
         for (int d = c->fields[k].decos.len - 1; d >= 0; d--) apply(g, &c->fields[k].decos.items[d], xs_sprintf("%s, %s.fields[%d]", ci_name, ci_name, k));
