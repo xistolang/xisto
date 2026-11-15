@@ -18097,8 +18097,10 @@ void check_program(Program *p) {
             if (p->classes[j]->mod == c->mod && strcmp(c->name, p->classes[j]->name) == 0) xs_error(XS9015, c->pos, NULL, "class '%s' is declared twice", c->name);
         for (int j = 0; j < nbuiltins; j++)
             if (strcmp(c->name, builtins[j]->name) == 0 && !((strcmp(c->name, "Worker") == 0 || strcmp(c->name, "MessagePort") == 0) && !wt_imports(c->mod, c->name)) &&
-                strcmp(c->name, "Response") != 0 && strcmp(c->name, "ReadableStream") != 0) /* (Express's Response, node:stream/web's
-                                                       ReadableStream: a module's own class comes first where it is declared or imported) */
+                strcmp(c->name, "Response") != 0 && strcmp(c->name, "ReadableStream") != 0 &&
+                !(strcmp(c->name, "Server") == 0 && c->mod && c->mod->file && strcmp(c->mod->file, "xisto:http") == 0))
+                /* (Express's Response, node:stream/web's ReadableStream, node:http's Server: a module's own class comes
+                   first where it is declared or imported) */
                 xs_error(XS9002, c->pos, NULL, "'%s' is a built-in class", c->name);
         SYM_EACH(funcs_by_name, c->name, e)
             if (((Func *)e->decl)->mod == c->mod) xs_error(XS9006, c->pos, NULL, "'%s' is both a class and a function", c->name);
