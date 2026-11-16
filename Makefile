@@ -79,13 +79,16 @@ build/qbe: $(wildcard third_party/qbe/*.c third_party/qbe/*/*.c) | build
 	$(MAKE) -s -C third_party/qbe qbe
 	cp third_party/qbe/qbe $@
 
+# the x86-64 floor of the programs' runtime (XS_X86_FLOOR in src/main.c): x86-64-v2, SSSE3's pshufb included
+RT_ARCH := $(if $(filter x86_64 amd64,$(shell uname -m)),-march=x86-64-v2)
+
 # frame pointers: stack traces walk them
 build/xisto_rt.o: runtime/xisto_rt.c runtime/xisto_rt.h | build
-	$(CC) -std=c11 -O2 -ffp-contract=off -fno-omit-frame-pointer -Wno-unused-function -c -o $@ $<
+	$(CC) -std=c11 -O2 $(RT_ARCH) -ffp-contract=off -fno-omit-frame-pointer -Wno-unused-function -c -o $@ $<
 
 # the same runtime for --debug --backend=qbe: the debugger agent and the xr_dbg_* entry points (docs/debugger.md)
 build/xisto_rt_dbg.o: runtime/xisto_rt.c runtime/xisto_rt.h runtime/xisto_dbg.h runtime/xisto_dbg_json.h | build
-	$(CC) -std=c11 -O0 -g -DXS_DEBUG -D_GNU_SOURCE -ffp-contract=off -fno-omit-frame-pointer -Wno-unused-function -c -o $@ $<
+	$(CC) -std=c11 -O0 -g $(RT_ARCH) -DXS_DEBUG -D_GNU_SOURCE -ffp-contract=off -fno-omit-frame-pointer -Wno-unused-function -c -o $@ $<
 
 build/xisto: $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $(OBJ) -lm
