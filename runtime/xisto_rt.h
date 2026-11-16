@@ -945,8 +945,13 @@ static void *xs_ar_(void *p) {
 }
 #define xs_ar(x) ({ __auto_type xs_arv_ = (x); (__typeof__(xs_arv_))xs_ar_((void *)xs_arv_); }) /* (once: see xs_retain) */
 
-static inline void xs_ar_drain(size_t mark) {
+/* the temporaries a statement made, released at its end: the test inline, the releases in one function (a drain
+   inlined its release loop at every statement that made a temporary) */
+XS_NOINLINE void xs_ar_drain_(size_t mark) {
     while (xs_ar_len > mark) xs_release_(xs_ar_pool[--xs_ar_len]);
+}
+static inline void xs_ar_drain(size_t mark) {
+    if (xs_ar_len > mark) xs_ar_drain_(mark);
 }
 
 /* An array length is below 2^40 (arrays are created under that limit; growing past it would take terabytes):
