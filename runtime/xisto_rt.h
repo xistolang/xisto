@@ -4877,8 +4877,8 @@ static void *xs_json_undef(void) { return xs_cl_static(&xs_json_undef_cl); }
 /* the replacer (reviver) the runtime is calling now, as its function (xs_fn_origin): a function declared elsewhere
    returns JSON's undefined only then, and null (undefined) when it is called directly */
 static XS_TLS void *xs_json_cb;
-/* set while a JSON.stringify leaves the members that are null out of objects (the project's "json": { "omitNull": true }):
-   read by the extended path */
+/* set while a JSON.stringify leaves the members that are null out of objects (the project's "json": { "omitNull": true },
+   or a replacer (k, v) => v ?? undefined): read by the extended path and by the writers of such a program */
 static XS_TLS int xs_json_omitn_;
 static void *xs_json_undef_if(void *self) { return self && xs_fn_origin(self) == xs_json_cb ? xs_json_undef() : NULL; }
 XS_NOINLINE void *xs_json_cb_call(xs_closure *cl, xs_str *key, void *val) {

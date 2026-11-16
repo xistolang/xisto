@@ -3971,7 +3971,37 @@ static void json_undef_returns(Stmt *s, Expr *named) {
    one-argument JSON text. replacer: null/undefined, a string[] (the keys kept, at every level) or a function
    (key: string, value: any) => any; space: a number or a string. The one-argument call keeps its own path */
 bool xs_json_ext_used; /* (emit: xs_json_unknown is generated for the replacer's values) */
-static bool omit_warned; /* (XS2111 is said once) */
+/* JSON.stringify(v, (k, v) => v ?? undefined) / (k, v) => v === null ? undefined : v: Node leaves the members that are
+   null out of objects (an array's element stays null: undefined there is written null). Recognized here: the replacer
+   is dropped and the call writes as the project's "omitNull" writes (json_omit in emit.c), with no call per member */
+bool xs_json_omit_dyn;
+static bool is_name(Expr *x, const char *n) { return x && x->kind == E_IDENT && x->str && n && !strcmp(x->str, n); }
+static bool is_undef(Expr *x) { return is_name(x, "undefined") && !lookup("undefined"); }
+static bool omit_warned;
+static bool json_omit_replacer(Expr *e) {
+    Expr *r = e->args.items[1];
+    if (r->kind != E_ARROW || !r->arrow || !r->arrow->fn || r->arrow->fn->nparams != 2 || !r->arrow->expr_body) return false;
+    const char *v = r->arrow->fn->params[1].name;
+    Stmt *b = r->arrow->fn->body;
+    Expr *x = b && b->kind == S_BLOCK && b->stmts.len == 1 && b->stmts.items[0]->kind == S_RETURN ? b->stmts.items[0]->expr : NULL;
+    if (!x) return false;
+    bool ok = false;
+    if (x->kind == E_BINARY && x->op == TK_QQ) ok = is_name(x->lhs, v) && is_undef(x->rhs); /* v ?? undefined */
+    else if (x->kind == E_COND && x->args.len == 2 && x->lhs && x->lhs->kind == E_BINARY && (x->lhs->op == TK_EQ || x->lhs->op == TK_NEQ)) {
+        Expr *c = x->lhs; /* v === null ? undefined : v (or v !== null ? v : undefined; null === v) */
+        bool vnull = (is_name(c->lhs, v) && c->rhs->kind == E_NULL) || (is_name(c->rhs, v) && c->lhs->kind == E_NULL);
+        Expr *when_null = c->op == TK_EQ ? x->args.items[0] : x->args.items[1], *other = c->op == TK_EQ ? x->args.items[1] : x->args.items[0];
+        ok = vnull && is_undef(when_null) && is_name(other, v);
+    }
+    if (!ok) return false;
+    e->json_omit = true;
+    if (!xs_json_omit_null) xs_json_omit_dyn = true;
+    if (e->args.len == 2) { e->args.len = 1; return true; } /* (written by the program's own writers) */
+    Expr *n = xs_alloc(sizeof *n); /* (with a space: the extended path, no replacer) */
+    n->kind = E_NULL; n->pos = r->pos; n->field = -1;
+    e->args.items[1] = n;
+    return true;
+}
 static void json_stringify_ext(Expr *e) {
     Expr *v = e->args.items[0];
     check_expr(v, NULL);
@@ -13569,7 +13599,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     xs_warn_rule(XS2111, e->pos, "remove \"json\": { \"omitNull\": true } from xisto.json to write nulls as Node does",
                                  "JSON.stringify leaves out the members that are null (xisto.json \"omitNull\"): the JSON differs from Node's");
                 }
-                if (strcmp(e->str, "stringify") == 0 && e->args.len >= 2 && e->args.len <= 3) { json_stringify_ext(e); return; }
+                if (strcmp(e->str, "stringify") == 0 && e->args.len >= 2 && e->args.len <= 3 && !(json_omit_replacer(e) && e->args.len == 1)) { json_stringify_ext(e); return; }
                 if (strcmp(e->str, "parse") == 0 && e->args.len == 2) json_parse_reviver(e); /* (then parsed as one argument) */
                 if (e->args.len != 1) xs_error(XS7025, e->pos, NULL, strcmp(e->str, "stringify") == 0 ? "JSON.stringify takes one to three arguments" : "JSON.%s takes exactly one argument", e->str);
                 if (strcmp(e->str, "stringify") == 0) {

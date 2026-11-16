@@ -242,6 +242,7 @@ extern Type *ty_number, *ty_int, *ty_litint, *ty_boolean, *ty_string, *ty_void, 
 /* a field no program sees by name: a #private one (__hp_<class id>_x), or the mark of a generator's result whose value is
    undefined (xisto:iter's __XsGenResult): left out of console.log, JSON, Object.keys/values/entries and spreads */
 extern bool xs_json_omit_null; /* parser.c: the project's xisto.json "json": { "omitNull": true } */
+extern bool xs_json_omit_dyn; /* checker.c: a JSON.stringify(v, (k, v) => v ?? undefined) leaves nulls out, at run time */
 static inline bool xs_hidden_field(const char *n) { return n[0] == '_' && n[1] == '_' && (!strncmp(n, "__hp_", 5) || !strcmp(n, "__xs_undef")); }
 static inline bool ty_is_undef(const Type *t) { return t && t->kind == TY_UNKNOWN && !t->tname && t->absent; } /* the type undefined */
 extern bool xs_any_used; /* checker.c: the program reads or writes an any by name */
@@ -327,6 +328,7 @@ struct Expr {
     bool boolean;      /* E_BOOL */
     bool spread_read;  /* (a field read that a spread or Object.assign made: a TS private field is copied, as JS does) */
     bool own_in;       /* (k in o from Object.hasOwn / hasOwnProperty.call: own fields only, not the class's methods) */
+    bool json_omit;    /* JSON.stringify(v, (k, v) => v ?? undefined): the nulls of objects left out (checker: json_omit_replacer) */
     bool xn_in;        /* "nick" in o, nick?: T | null: o.nick != null, or a null given (emit: its xn_ bit) */
     bool prechecked;   /* checked already (its type is final): check_expr leaves it as it is */
     bool want_tuple;   /* E_ARRAY_LIT: [k, v] returned to new Map(xs.map(...)): a tuple, as TypeScript reads it there */

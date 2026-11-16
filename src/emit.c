@@ -1934,8 +1934,8 @@ static const char *xn_bit(Expr *v) {
     return "1";
 }
 /* when JSON.stringify leaves nulls out of objects: "1" (the project's "json": { "omitNull": true }: every call, decided
-   here), or NULL (never: Node's output) */
-static const char *json_omit(void) { return xs_json_omit_null ? "1" : NULL; }
+   here), xs_json_omitn_ (a call whose replacer is (k, v) => v ?? undefined: that call's), or NULL (never: Node's output) */
+static const char *json_omit(void) { return xs_json_omit_null ? "1" : xs_json_omit_dyn ? "xs_json_omitn_" : NULL; }
 /* the fields of c as a JSON object's members (ord: in that order, NULL: the declaration's) */
 static void json_put_fields(Buf *b, Class *c, const int *ord, int nord) {
     for (int oi = 0; oi < nord; oi++) {
@@ -2255,18 +2255,20 @@ static void emit_member(Expr *e) {
         const char *fn = e->builtin.cfn;
         if (strcmp(fn, "json_stringify") == 0) {
             Expr *a = e->args.items[0];
-            buf_printf(out, "({ xs_sb sb_ = {0}; xs_sb *sb = &sb_; %s ja_ = ", ctype(a->type)); /* the borrowed argument, read once
+            bool dyn = e->json_omit && !xs_json_omit_null; /* (this call leaves nulls out: the writers read xs_json_omitn_) */
+            buf_printf(out, "({ %sxs_sb sb_ = {0}; xs_sb *sb = &sb_; %s ja_ = ", dyn ? "int jw_ = xs_json_omitn_; xs_json_omitn_ = 1; " : "",
+                       ctype(a->type)); /* the borrowed argument, read once
                                    (a T | null is tested, then written: one placeholder replaced would miss the second read) */
             emit_borrowed(a);
             buf_puts(out, "; ");
             json_emit_value(out, a->type, "ja_");
-            buf_puts(out, " xs_sb_finish(sb); })");
+            buf_puts(out, dyn ? " xs_str *jr_ = xs_sb_finish(sb); xs_json_omitn_ = jw_; jr_; })" : " xs_sb_finish(sb); })");
             return;
         }
         if (strcmp(fn, "json_stringify_ext") == 0) { /* JSON.stringify(value, replacer, space): the value's text, rewritten */
             Expr *a = e->args.items[0], *r = e->args.items[1], *s = e->args.len > 2 ? e->args.items[2] : NULL;
             json_unknown_used = true;
-            bool omit = xs_json_omit_null; /* (xs_jx_member leaves a null member out while xs_json_omitn_ is set) */
+            bool omit = e->json_omit || xs_json_omit_null; /* (xs_jx_member leaves a null member out while xs_json_omitn_ is set) */
             buf_printf(out, "({ %sxs_sb sb_ = {0}; xs_sb *sb = &sb_; %s ja_ = ", omit ? "int jw_ = xs_json_omitn_; xs_json_omitn_ = 1; " : "", ctype(a->type));
             emit_borrowed(a);
             buf_puts(out, "; ");
