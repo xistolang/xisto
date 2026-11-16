@@ -15,6 +15,8 @@ typedef struct {
     bool in_gen;          /* inside a generator body: `yield` is a statement */
     const char *static_base; /* inside a static member of a class that extends Base: `super` reads "super\x03Base" (the
                                 checker: Base's statics, with `this` the class the static was called on) */
+    int iterobj;          /* in the body of [Symbol.iterator](): Iterator<T> (2: async): Iterator<T> and IterableIterator<T> are the
+                             iterator object's type (xisto:iter's __XsIterator<T>), not a generator's */
     int hp_id;            /* inside a class body: its number, which names its #private members (__hp_<id>_name) apart from a
                              base's or a subclass's members of the same name */
     /* import { setTimeout as sleep }: in the rest of the module the alias reads as the exported name */
@@ -64,6 +66,9 @@ static int npending_overloads;
 static bool wants_arrays; /* a .reduce( / .flatMap( / .flat( call, or an Iterable<T> type, was parsed: xisto:arrays is loaded */
 static bool wants_settled; /* Promise.allSettled was named: xisto:settled is loaded */
 static bool wants_okmap; /* WeakMap, or Map<object, V>, was written: xisto:okmap is loaded */
+static bool wants_iter; /* IteratorResult, or a [Symbol.iterator]() that returns an iterator object: xisto:iter is loaded */
+static const char *iterobj_t, *aiterobj_t; /* (parse_fields_body) the T of the class's [Symbol.iterator](): Iterator<T> and
+                                               [Symbol.asyncIterator](): AsyncIterator<T> that return iterator objects */
 static bool wants_tagged; /* a tagged template (tag`...`) or TemplateStringsArray was written: xisto:tagged is loaded */
 static StmtList tsa_decls; /* const __xs_tsa_M_L_C = __xs_tsa([cooked...], [raw...]): one per tagged template, the strings
                               array its tag receives on every call (one identity per call site, as in JavaScript); put at
@@ -879,6 +884,19 @@ static Type *parse_type(Parser *p) {
         t = ty_array_of(ty_string);
         t->tsa = true;
         wants_tagged = true;
+    } else if (p->iterobj && (strcmp(n, "Iterator") == 0 || strcmp(n, "IterableIterator") == 0 || strcmp(n, "AsyncIterator") == 0 ||
+                              strcmp(n, "AsyncIterableIterator") == 0)) { /* (the iterator object a [Symbol.iterator]() returns) */
+        bool as = n[0] == 'A';
+        expect(p, TK_LT, NULL);
+        Type *a = parse_type(p);
+        while (accept(p, TK_COMMA)) parse_type(p);
+        expect(p, TK_GT, NULL);
+        Token nm = {0};
+        nm.kind = TK_IDENT; nm.pos = tpos; nm.str = as ? "__XsAsyncIterator" : "__XsIterator";
+        t = named_type(p, nm);
+        t->targs = xs_alloc(sizeof(Type *));
+        t->targs[0] = a;
+        t->ntargs = 1;
     } else if (strcmp(n, "Generator") == 0 || strcmp(n, "Iterable") == 0 || strcmp(n, "IterableIterator") == 0 || strcmp(n, "Iterator") == 0 ||
                strcmp(n, "AsyncGenerator") == 0 || strcmp(n, "AsyncIterable") == 0 || strcmp(n, "AsyncIterableIterator") == 0) {
         /* (async ones too: an async generator's waits park its consumer, so for await reads it as for...of) */
@@ -1017,6 +1035,8 @@ static Type *parse_type(Parser *p) {
                 else import_add_name(im, name);
             }
         }
+        bool itres = !strcmp(name.str, "IteratorResult") || !strcmp(name.str, "IteratorYieldResult") || !strcmp(name.str, "IteratorReturnResult");
+        if (itres) { wants_iter = true; name.str = "IteratorResult"; } /* (TypeScript's global: xisto:iter's { value?: T; done?: boolean }) */
         t = named_type(p, name);
         if (at(p, TK_LT)) { /* Name<A, B>: a generic interface */
             next(p);
@@ -1025,6 +1045,7 @@ static Type *parse_type(Parser *p) {
                 t->targs[t->ntargs++] = parse_type(p);
             } while (accept(p, TK_COMMA));
             expect(p, TK_GT, NULL);
+            if (itres) t->ntargs = 1; /* (IteratorResult<T, TReturn>: a done result's value is held as T) */
         }
     }
     if (at(p, TK_AMP)) t = inter_rest(p, t, open, tpos);
@@ -1588,6 +1609,24 @@ static Expr *parse_primary(Parser *p) {
                 e->spread = true;
                 if (!accept(p, TK_COMMA)) break;
                 continue;
+            }
+            if (at(p, TK_LBRACKET) && p->iterobj) { /* { next() { ... }, [Symbol.iterator]() { return this; } }: an iterator object's
+                                                     own iterator is itself (the generator that reads it calls next() only) */
+                Parser l_ = *p;
+                next(&l_);
+                if (at_ident(&l_, "Symbol")) {
+                    next(&l_);
+                    if (accept(&l_, TK_DOT) && at_ident(&l_, "iterator")) {
+                        next(&l_);
+                        if (accept(&l_, TK_RBRACKET) && at(&l_, TK_LPAREN)) {
+                            *p = l_;
+                            p->method_fn = true;
+                            (void)parse_arrow(p);
+                            if (!accept(p, TK_COMMA)) break;
+                            continue;
+                        }
+                    }
+                }
             }
             if (at(p, TK_ELLIPSIS) || at(p, TK_LBRACKET)) {
                 /* { ...base, x: 1 }: base's fields in place; { [k]: v }: a key computed at run time (a Record). The
@@ -3946,6 +3985,8 @@ Class *xs_parse_class_instance(Class *tmpl, Type **args, const char *name) {
 static void parse_fields_body(Parser *p, Class *c) {
     static int hp_ids;
     int hp_was = p->hp_id;
+    const char *it_was = iterobj_t, *ait_was = aiterobj_t; /* (a class declared inside a method: its own) */
+    iterobj_t = aiterobj_t = NULL;
     p->hp_id = ++hp_ids;
     expect(p, TK_LBRACE, NULL);
     char **sn0 = subst_names;
@@ -4022,6 +4063,19 @@ static void parse_fields_body(Parser *p, Class *c) {
                 xs_error(XS6029, sym.pos, NULL, "only [Symbol.iterator] (and async *[Symbol.asyncIterator]) are supported as computed method names");
             expect(p, TK_RBRACKET, NULL);
         }
+        int iter_obj = 0; /* [Symbol.iterator](): Iterator<T> returning an iterator object (1; 2: [Symbol.asyncIterator]) */
+        if (!gen_method && !c->is_interface && at(p, TK_LBRACKET)) {
+            Parser l_ = *p;
+            next(&l_);
+            if (at_ident(&l_, "Symbol")) {
+                next(&l_);
+                if (accept(&l_, TK_DOT) && (at_ident(&l_, "iterator") || at_ident(&l_, "asyncIterator"))) {
+                    iter_obj = at_ident(&l_, "iterator") ? 1 : 2;
+                    next(&l_);
+                    if (at(&l_, TK_RBRACKET)) { next(&l_); *p = l_; } else iter_obj = 0;
+                }
+            }
+        }
         bool sym_iter = gen_method && at(p, TK_LPAREN) && p->prev_end && p->prev_end[-1] == ']';
         int accessor = 0; /* get x() / set x(v) */
         if (!gen_method && (at_ident(p, "get") || at_ident(p, "set")) && peek_is(p, TK_IDENT) && !c->is_interface) {
@@ -4030,6 +4084,7 @@ static void parse_fields_body(Parser *p, Class *c) {
         }
         Token name;
         if (sym_iter) { name = p->tok; name.kind = TK_IDENT; name.str = "__iterator"; name.pos = pos; }
+        else if (iter_obj) { name = p->tok; name.kind = TK_IDENT; name.str = iter_obj == 1 ? "__iterobj" : "__aiterobj"; name.pos = pos; }
         else if (at(p, TK_STRING)) { name = p->tok; name.kind = TK_IDENT; next(p); } /* '@timestamp': string */
         else if (at(p, TK_LBRACKET) && ({ Parser l_ = *p; next(&l_); bool ok_ = at(&l_, TK_IDENT); if (ok_) { next(&l_); ok_ = at(&l_, TK_RBRACKET); } ok_; })) {
             /* [AUDIT_CONTEXT_KEY]?: T with const AUDIT_CONTEXT_KEY = '__audit': the field named by the constant's text */
@@ -4121,6 +4176,20 @@ static void parse_fields_body(Parser *p, Class *c) {
                     const char *rfrom = p->tok.start;
                     f->ret = parse_type(p);
                     f->ret_src = span(p, rfrom);
+                    if (iter_obj) { /* Iterator<T> (IterableIterator<T>, AsyncIterator<T>): the object it returns has next() */
+                        const char *lt = strchr(f->ret_src, '<'), *gt = strrchr(f->ret_src, '>');
+                        if (!lt || !gt || gt < lt || !(!strncmp(f->ret_src, "Iterator<", 9) || !strncmp(f->ret_src, "IterableIterator<", 17) ||
+                                                       !strncmp(f->ret_src, "AsyncIterator<", 14) || !strncmp(f->ret_src, "AsyncIterableIterator<", 22)))
+                            xs_error(XS6029, pos, iter_obj == 1 ? "write [Symbol.iterator](): Iterator<T> { return { next() { ... } }; }" : "write [Symbol.asyncIterator](): AsyncIterator<T> { ... }",
+                                     "the result type of [Symbol.%s]() is not an iterator type", iter_obj == 1 ? "iterator" : "asyncIterator");
+                        char *tt = xs_strndup(lt + 1, (size_t)(gt - lt - 1));
+                        wants_iter = true;
+                        Parser tp = *p;
+                        lexer_init(&tp.lx, xs_sprintf("%s<%s>    ", iter_obj == 1 ? "__XsIterator" : "__XsAsyncIterator", tt));
+                        next(&tp);
+                        f->ret = parse_type(&tp);
+                        if (iter_obj == 1) iterobj_t = tt; else aiterobj_t = tt;
+                    }
                 }
                 if (c->nmethods == c->cap_methods) {
                     c->cap_methods = c->cap_methods ? c->cap_methods * 2 : 4;
@@ -4169,7 +4238,10 @@ static void parse_fields_body(Parser *p, Class *c) {
             const char *was_alias = p->this_alias;
             bool used_was = this_alias_used;
             if (mods & MOD_STATIC) { p->this_alias = XS_STATIC_THIS; this_alias_used = false; } /* `this`: the class it is called on */
+            int iterobj_was = p->iterobj;
+            p->iterobj = !strcmp(f->name, "__iterobj") ? 1 : !strcmp(f->name, "__aiterobj") ? 2 : 0;
             f->body = parse_block(p);
+            p->iterobj = iterobj_was;
             if ((mods & MOD_STATIC) && this_alias_used && !c->ntparams) {
                 Parser *st = xs_alloc(sizeof *st);
                 *st = at_params;
@@ -4327,6 +4399,25 @@ static void parse_fields_body(Parser *p, Class *c) {
     subst_names = sn0; subst_types = st0; nsubst = sk0;
     p->hp_id = hp_was;
     p->static_base = NULL;
+    if (iterobj_t || aiterobj_t) { /* [Symbol.iterator]() returning an iterator object: the generator for...of, spreads
+                                      and Array.from use pulls its next() until done */
+        const char *it = iterobj_t, *ait = aiterobj_t;
+        iterobj_t = aiterobj_t = NULL;
+        Buf g = {0};
+        buf_puts(&g, "{\n");
+        if (it) buf_printf(&g, "*[Symbol.iterator](): Generator<%s> { const it__ = this.__iterobj(); while (true) { const r__ = it__.next(); "
+                              "if (r__.done === true) { return; } yield r__.value!; } }\n", it);
+        if (ait) buf_printf(&g, "async *[Symbol.asyncIterator](): AsyncGenerator<%s> { const it__ = this.__aiterobj(); while (true) { "
+                               "const r__ = await it__.next(); if (r__.done === true) { return; } yield r__.value!; } }\n", ait);
+        buf_puts(&g, "}\n\n\n\n");
+        Parser sub = *p;
+        lexer_init(&sub.lx, g.data);
+        sub.lx.fixed = c->pos;
+        next(&sub);
+        parse_fields_body(&sub, c);
+    }
+    iterobj_t = it_was;
+    aiterobj_t = ait_was;
     next(p);
 }
 
@@ -6823,6 +6914,12 @@ static const char xs_profiler_src[] =
     "export function lastSamples(): int {\n  return cpuprof_last_samples();\n}\n";
 /* xisto:okmap: Map<object, V> and WeakMap<K, V>: keys by identity (the object kept while it is a key: a WeakMap's entries
    are observed only through get/set/has/delete, as JavaScript allows) */
+/* xisto:iter: TypeScript's IteratorResult, and the iterator object a class's [Symbol.iterator]() (or
+   [Symbol.asyncIterator]()) returns, read by the generator the parser adds next to it (parse_fields_body) */
+static const char xs_iter_src[] =
+    "export interface IteratorResult<T> { value?: T; done?: boolean; }\n"
+    "export interface __XsIterator<T> { next(): IteratorResult<T>; }\n"
+    "export interface __XsAsyncIterator<T> { next(): Promise<IteratorResult<T>>; }\n";
 static const char xs_okmap_src[] =
     "declare function okey_text(k: unknown): string;\n"
     "export class OkMap<V> {\n"
@@ -6936,6 +7033,15 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->builtin = false;
         m->file = "xisto:arrays";
         m->src = (char *)xs_arrays_src;
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
+    if (strcmp(name, "iter") == 0) { /* xisto:iter: IteratorResult and the iterator objects [Symbol.iterator]() returns (see xs_iter_src) */
+        m->builtin = false;
+        m->file = "xisto:iter";
+        m->src = (char *)xs_iter_src;
         m->loading = true;
         parse_module(prog, m);
         m->loading = false;
@@ -7278,6 +7384,7 @@ Program *parse_program(const char *entry_file) {
     if (wants_settled) load_module(prog, "xisto:settled", (Pos){1, 1}, entry_file);
     if (wants_okmap) load_module(prog, "xisto:okmap", (Pos){1, 1}, entry_file);
     if (wants_tagged) load_module(prog, "xisto:tagged", (Pos){1, 1}, entry_file);
+    if (wants_iter) load_module(prog, "xisto:iter", (Pos){1, 1}, entry_file);
     if (wants_url) load_module(prog, "xisto:url", (Pos){1, 1}, entry_file); /* (before errors: its DOMException extends Error) */
     if (wants_errors) load_module(prog, "xisto:errors", (Pos){1, 1}, entry_file);
     if (wants_intl) load_module(prog, "xisto:intl", (Pos){1, 1}, entry_file);

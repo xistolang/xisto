@@ -411,6 +411,7 @@ static Class *find_class(const char *name) {
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:url") == 0 && c->exported) return c; /* (URL & co: web globals) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:intl") == 0 && strncmp(name, "Intl_", 5) == 0) return c; /* (Intl.X: global) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:okmap") == 0 && !strcmp(name, "OkMap")) return c; /* (Map<object, V>) */
+        if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:iter") == 0) return c; /* (IteratorResult: TypeScript's global) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:reflect") == 0 && !strcmp(name, "PropertyDescriptor"))
             return c; /* (TypeScript's global, as a method decorator receives it: XB-107) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:reflect") == 0 && strlen(name) > 9 && !strcmp(name + strlen(name) - 9, "Decorator"))
@@ -3117,6 +3118,26 @@ static const char *objlit_str(Expr *o, const char *key) {
     return NULL;
 }
 static Func *find_method(Class *c, const char *name);
+/* a generator's stream, or an object whose class has [Symbol.iterator](), where an array goes ([...g()], Array.from(g()),
+   Math.max(...g())): x.toArray() (x[Symbol.iterator]().toArray()), in place; false when x is neither */
+static bool iter_to_array(Expr *x) {
+    Type *t = x->type;
+    if (!t) return false;
+    Expr *src = xs_alloc(sizeof *src);
+    *src = *x;
+    src->prechecked = true;
+    Func *itm = t->kind == TY_OBJECT && !t->cls->builtin ? find_method(t->cls, "__iterator") : NULL;
+    if (itm && !itm->nparams) {
+        Expr *it = xs_alloc(sizeof *it);
+        it->kind = E_MEMBER; it->pos = x->pos; it->field = -1; it->lhs = src; it->str = "__iterator"; it->is_call = true;
+        src = it;
+    } else if (t->kind != TY_STREAM) return false;
+    Expr *call = xs_alloc(sizeof *call);
+    call->kind = E_MEMBER; call->pos = x->pos; call->field = -1; call->lhs = src; call->str = "toArray"; call->is_call = true;
+    *x = *call;
+    check_expr(x, NULL);
+    return x->type && x->type->kind == TY_ARRAY;
+}
 static void crypto_method_overload(Expr *e, Class *c) {
     Func *bm = find_method(c, xs_sprintf("__%s_bytes", e->str));
     if (bm && find_method(c, e->str) && e->args.len <= bm->nparams) { e->str = bm->name; return; }
@@ -3546,6 +3567,7 @@ static void check_spread_lit(Expr *e, Type *elem) {
             continue;
         }
         check_expr(a->lhs, elem && !is_numeric(elem) ? ty_array_of(elem) : NULL);
+        iter_to_array(a->lhs);
         Type *st = a->lhs->type;
         const char *m = st->kind == TY_STRING ? "split" : st->kind == TY_SET ? "values" : st->kind == TY_MAP ? "entries" : NULL;
         if (m) { /* an array of its own */
@@ -6115,6 +6137,7 @@ static void check_math(Expr *e) {
         if (minmax && e->args.len == 1 && is_spread(e->args.items[0])) { /* Math.max(...xs): over the array (-Infinity when empty) */
             Expr *a = e->args.items[0]->lhs;
             check_expr(a, NULL);
+            iter_to_array(a);
             Type *at = a->type;
             if (at->kind != TY_ARRAY || !is_numeric(at->elem)) xs_error(XS7026, a->pos, NULL, "Math.%s(...xs) takes an array of numbers", fn);
             Pos pos = e->pos;
@@ -7900,6 +7923,7 @@ static void infer_new_collection(Expr *e, Type *expected) {
         arr_convert(a, ty_unknown);
         t = a->type;
     }
+    if (iter_to_array(a)) t = a->type; /* new Set(g()): of the generator's values */
     if (is_map && t->kind == TY_MAP && !t->record) { e->elem_type = ty_map_of(t->key, t->elem); return; } /* new Map(other): its types */
     if (t->kind != TY_ARRAY && t->kind != TY_SET) xs_error(XS3006, a->pos, hint, "cannot infer the type of this %s", is_map ? "Map" : "Set");
     if (!is_map) { e->elem_type = ty_set_of(t->elem); return; }
@@ -12130,6 +12154,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (e->args.len != 1) xs_error(XS7001, e->pos, "Array.from(array, Set or Map); Array.isArray(x)", "Array.%s takes one argument here", e->str);
                 Expr *src = e->args.items[0];
                 check_expr(src, expected && strcmp(e->str, "from") == 0 ? expected : NULL);
+                if (e->str[0] == 'f' && iter_to_array(src)) { *e = *src; return; } /* Array.from(g()): its values, an array of their own */
                 Type *st = src->type;
                 if (e->str[0] == 'i' && (st->kind == TY_UNKNOWN || st->kind == TY_UNION || (st->kind == TY_NULLABLE && st->elem->kind == TY_UNION))) {
                     /* Array.isArray(v) with v: unknown (or any, or a union): what v holds, at run time */
@@ -14135,6 +14160,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 want = ty_array_of(tuple_type(ps, 2, e->pos));
             } else want = ty_array_of(e->type->elem);
             if (!e->args.items[0]->type) check_expr(e->args.items[0], want); /* (checked already when it gave the type) */
+            iter_to_array(e->args.items[0]); /* (new Set(g()): of the generator's values) */
             Expr *src = e->args.items[0];
             if ((is_map && src->type->kind == TY_MAP && !src->type->record) || (!is_map && src->type->kind == TY_SET)) {
                 /* new Map(otherMap) / new Set(otherSet) (and Object.fromEntries(map)): a copy, [...other] */
@@ -18211,7 +18237,9 @@ static void fake_object(Expr *e, Class *t) {
             Expr *body = fv->kind == E_ARROW && fv->arrow->expr_body && fv->arrow->fn->body && fv->arrow->fn->body->stmts.len == 1 ?
                          fv->arrow->fn->body->stmts.items[0]->expr : NULL;
             bool loose = m->ret && ty_is_heap(m->ret) && m->ret->kind != TY_UNKNOWN && !m->ret_promise &&
-                         !(body && (body->kind == E_OBJLIT || body->kind == E_ARRAY_LIT)); /* (a literal result takes the type) */
+                         !(body && (body->kind == E_OBJLIT || body->kind == E_ARRAY_LIT)) && /* (a literal result takes the type) */
+                         !(fv->kind == E_ARROW && fv->arrow->fn->ret && fv->arrow->fn->ret->kind == TY_OBJECT && m->ret->kind == TY_OBJECT);
+                         /* (next(): R { ... }: a class written as its result type: checked as that) */
             ft = ty_func(ps, m->nparams, loose ? ty_unknown : m->ret);
             ft->async_ret = m->ret_promise;
             Field *nf = &a->fields[a->nfields++];
