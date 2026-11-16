@@ -92,13 +92,15 @@ extern const unsigned char xs_runtime_zlib_h[];
 extern const unsigned char xs_runtime_prof_h[];
 extern const unsigned char xs_runtime_regex_h[];
 extern const unsigned char xs_runtime_regex_bt_h[];
-extern const unsigned char xs_runtime_unicode_h[], xs_runtime_text_h[];
+extern const unsigned char xs_runtime_unicode_h[], xs_runtime_text_h[], xs_runtime_uprops_h[];
+bool checker_uprop_used(int id);
+int checker_uprop_count(void);
 static void regex_with_bt(Buf *b);
 extern const unsigned char xs_runtime_dbg_json_h[];
 extern const unsigned char xs_runtime_dbg_h[];
 /* the runtime split in two (tools/rtsplit.py): what a program includes, and the library compiled once */
 #define XS_RT_PAIR(n) extern const unsigned char xs_runtime_##n##_h_decl[], xs_runtime_##n##_h_impl[];
-XS_RT_PAIR(rt) XS_RT_PAIR(net) XS_RT_PAIR(sqlite) XS_RT_PAIR(tls) XS_RT_PAIR(tls_awslc) XS_RT_PAIR(crypto) XS_RT_PAIR(zlib) XS_RT_PAIR(prof) XS_RT_PAIR(unicode) XS_RT_PAIR(text) XS_RT_PAIR(regex)
+XS_RT_PAIR(rt) XS_RT_PAIR(net) XS_RT_PAIR(sqlite) XS_RT_PAIR(tls) XS_RT_PAIR(tls_awslc) XS_RT_PAIR(crypto) XS_RT_PAIR(zlib) XS_RT_PAIR(prof) XS_RT_PAIR(unicode) XS_RT_PAIR(text) XS_RT_PAIR(uprops) XS_RT_PAIR(regex)
 static bool split_rt;     /* the runtime is a cached object, the program only includes its declarations */
 static Buf rt_src;        /* the runtime's translation unit for this program's configuration */
 int cmd_debug(int argc, char **argv); /* src/debug.c */
@@ -507,6 +509,12 @@ static Buf compile_to_c(const char *path) {
         if (p->uses_normalize) buf_puts(&b, "#define XS_RT_NORMALIZE 1\n");
         if (p->uses_normalize_k) buf_puts(&b, "#define XS_RT_NORMALIZE_K 1\n");
         bool with_text = p->uses_normalize; /* (Unicode data: runtime/xisto_unicode.h and its users, runtime/xisto_text.h) */
+        bool with_uprops = false; /* (RegExp property escapes: runtime/xisto_uprops.h, the tables of the properties named) */
+        if (p->uses_regex) {
+            if (p->uprops_all) { buf_puts(&b, "#define XR_UP_ALL 1\n"); with_uprops = true; }
+            else for (int i = 0; i < checker_uprop_count(); i++) if (checker_uprop_used(i)) { buf_printf(&b, "#define XR_UP_%d 1\n", i); with_uprops = true; }
+            if (with_uprops) buf_puts(&b, "#define XS_RT_UPROPS 1\n");
+        }
         rt_src.len = 0;
         if (split_rt && !p->uses_rebt) { /* the same configuration for the library */
             buf_puts(&rt_src, b.data ? b.data : "");
@@ -519,6 +527,7 @@ static Buf compile_to_c(const char *path) {
             if (p->uses_zlib) { XS_RT_ADD(zlib); link_zlib = true; }
             if (p->uses_profiler) XS_RT_ADD(prof);
             if (with_text) { XS_RT_ADD(unicode); XS_RT_ADD(text); }
+            if (with_uprops) XS_RT_ADD(uprops);
             if (p->uses_regex) XS_RT_ADD(regex);
 #undef XS_RT_ADD
         } else {
@@ -531,6 +540,7 @@ static Buf compile_to_c(const char *path) {
             if (p->uses_zlib) { buf_puts(&b, (const char *)xs_runtime_zlib_h); link_zlib = true; }
             if (p->uses_profiler) buf_puts(&b, (const char *)xs_runtime_prof_h);
             if (with_text) { buf_puts(&b, (const char *)xs_runtime_unicode_h); buf_puts(&b, (const char *)xs_runtime_text_h); }
+            if (with_uprops) buf_puts(&b, (const char *)xs_runtime_uprops_h);
             if (p->uses_regex && p->uses_rebt) regex_with_bt(&b);
             else if (p->uses_regex) buf_puts(&b, (const char *)xs_runtime_regex_h);
         }

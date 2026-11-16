@@ -1,5 +1,8 @@
 #include "xisto.h"
 #define XR_CORE_ONLY 1
+#define XS_RT_UPROPS 1 /* (every property's table: the patterns' \p{...} are checked here, and the ones named recorded) */
+#define XR_UP_ALL 1
+#include "../runtime/xisto_uprops.h"
 #include "../runtime/xisto_regex.h" /* patterns of /literals/ are compiled here once, to report their errors */
 #include "../runtime/xisto_regex_bt.h" /* (and those only backtracking can match) */
 #include <ctype.h>
@@ -14252,6 +14255,9 @@ static void check_expr_in(Expr *e, Type *expected) {
                 prog->uses_regex = true;
                 { /* new RegExp(text): a pattern only backtracking can match, or one not known until it runs, brings that engine */
                     Expr *src = e->args.items[0];
+                    /* (a pattern known only at run time with flag u or v, or flags not known: every property table) */
+                    Expr *fx = e->args.len > 1 ? e->args.items[1] : NULL;
+                    if (src->kind != E_STRING && (!fx || fx->kind != E_STRING || strchr(fx->str, 'u') || strchr(fx->str, 'v'))) prog->uprops_all = true;
                     if (src->kind != E_STRING) prog->uses_rebt = true;
                     else {
                         const char *err = NULL;
@@ -19656,3 +19662,7 @@ static bool reexports_or_has(Module *m, const char *name) {
     }
     return false;
 }
+
+/* the Unicode properties the program's patterns name (\p{...}): main.c links their tables (XR_UP_<n>) */
+bool checker_uprop_used(int id) { return id < XR_UP_COUNT && (xr_up_seen[id / 64] >> (id % 64)) & 1; }
+int checker_uprop_count(void) { return XR_UP_COUNT; }

@@ -9,7 +9,9 @@
 
    Not supported (they need backtracking): backreferences (\1, \k<name>) and lookaround ((?=, (?!, (?<=,
    (?<!); they are rejected when the pattern is compiled, with that reason. Case folding (flag i) covers
-   ASCII, Latin-1, Greek and Cyrillic. Positions are code points, as everywhere in xisto strings.
+   ASCII, Latin-1, Greek and Cyrillic. Positions are code points, as everywhere in xisto strings. Property escapes
+   (\p{...}, flag u or v) take their sets from runtime/xisto_uprops.h; flag v also brings the class set notation
+   ([A--B], [A&&B], nested classes; not strings).
 
    This part needs only libc: the compiler includes it (XR_CORE_ONLY) to report pattern errors at compile time. */
 #ifndef XISTO_REGEX_H
@@ -36,7 +38,7 @@ enum { XR_CHAR, XR_CLASS, XR_ANY, XR_ANYNL, XR_SPLIT, XR_JMP, XR_SAVE, XR_ASSERT
        XR_PEEK /* (?=c) (?!c): the next character is (not) c (x: the char or class, y: XP_* flags); consumes nothing */ };
 enum { XP_NEG = 1, XP_CLASS = 2, XP_ANY = 4, XP_ANYNL = 8 };
 enum { XA_BOT, XA_EOT, XA_BOL, XA_EOL, XA_WB, XA_NWB, XA_PEEK, XA_NPEEK /* (?= (?! of one character: node a */ };
-enum { XF_G = 1, XF_I = 2, XF_M = 4, XF_S = 8, XF_U = 16, XF_Y = 32, XF_D = 64 };
+enum { XF_G = 1, XF_I = 2, XF_M = 4, XF_S = 8, XF_U = 16, XF_Y = 32, XF_D = 64, XF_V = 128 /* (v: with XF_U, and the class set notation) */ };
 enum { XC_WORD = 1, XC_NL = 2, XC_EDGE = 4 }; /* the context of a position's neighbour, for assertions */
 
 typedef struct { uint32_t lo, hi; } xr_range;
@@ -334,6 +336,53 @@ static int xr_set_node(xr_parser *p, xr_rset *s) {
     return n;
 }
 
+/* \p{Name}, \p{Name=Value} (flag u or v; after the p): the property's code points into set, from runtime/xisto_uprops.h
+   (General_Category values alone or as gc=, Script as sc=, Script_Extensions as scx=, and the binary properties). Names
+   are exact, as ECMAScript's. */
+#ifdef XS_RT_UPROPS
+#ifdef XR_CORE_ONLY
+static uint64_t xr_up_seen[(XR_UP_COUNT + 63) / 64]; /* (the compiler: the properties patterns name, the ones the program links) */
+#endif
+static int xr_uprop(xr_parser *p, xr_rset *set) {
+    if (xr_peek(p) != '{') return xr_fail(p, "Invalid property name");
+    size_t st = ++p->i, eq = 0;
+    while (!xr_end(p) && p->s[p->i] != '}') {
+        int ch = p->s[p->i];
+        if (ch == '=' && !eq) eq = p->i;
+        else if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_')) return xr_fail(p, "Invalid property name");
+        p->i++;
+    }
+    if (xr_end(p)) return xr_fail(p, "Invalid property name");
+    const char *nm = (const char *)p->s + st;
+    size_t nl = p->i - st;
+    p->i++;
+    int want = -1; /* -1: a binary property or a General_Category value */
+    if (eq) {
+        size_t kl = eq - st;
+        if ((kl == 16 && !memcmp(nm, "General_Category", 16)) || (kl == 2 && !memcmp(nm, "gc", 2))) want = 1;
+        else if ((kl == 6 && !memcmp(nm, "Script", 6)) || (kl == 2 && !memcmp(nm, "sc", 2))) want = 2;
+        else if ((kl == 17 && !memcmp(nm, "Script_Extensions", 17)) || (kl == 3 && !memcmp(nm, "scx", 3))) want = 3;
+        else return xr_fail(p, "Invalid property name");
+        nm += kl + 1;
+        nl -= kl + 1;
+    }
+    for (size_t k = 0; k < sizeof xr_uprops / sizeof xr_uprops[0]; k++) {
+        const xr_uprop_t *u = &xr_uprops[k];
+        if (want < 0 ? u->kind > 1 : u->kind != want) continue;
+        if (strlen(u->name) != nl || memcmp(u->name, nm, nl)) continue;
+#ifdef XR_CORE_ONLY
+        xr_up_seen[u->id / 64] |= 1ull << (u->id % 64);
+#endif
+        if (!u->r) return xr_fail(p, "internal: this property's table is not linked");
+        for (int i = 0; i < u->n; i++) xr_rs_add(set, u->r[i][0], u->r[i][1]);
+        return 0;
+    }
+    return xr_fail(p, "Invalid property name");
+}
+#else
+static int xr_uprop(xr_parser *p, xr_rset *set) { (void)set; return xr_fail(p, "internal: the Unicode property tables are not linked"); }
+#endif
+
 /* an escape after '\': a single char (*cp, returns 0), a class (fills *set, returns 1), or an assertion
    (returns 2 with *cp the kind); -1 on error */
 static int xr_escape(xr_parser *p, bool in_class, uint32_t *cp, xr_rset *set) {
@@ -400,7 +449,12 @@ static int xr_escape(xr_parser *p, bool in_class, uint32_t *cp, xr_rset *set) {
         *cp = 'k';
         return 0;
     case 'p': case 'P':
-        if (p->flags & XF_U) return xr_fail(p, "Unicode property escapes (\\p{...}) are not supported yet");
+        if (p->flags & XF_U) {
+            p->i++;
+            if (xr_uprop(p, set) < 0) return -1;
+            if (c == 'P') xr_rs_negate(set);
+            return 1;
+        }
         p->i++;
         *cp = (uint32_t)c;
         return 0;
@@ -414,7 +468,88 @@ static int xr_escape(xr_parser *p, bool in_class, uint32_t *cp, xr_rset *set) {
     }
 }
 
+/* ranges of a and b (both normalized) that are in both: into a */
+static void xr_rs_and(xr_rset *a, xr_rset *b) {
+    xr_rs_norm(a);
+    xr_rs_norm(b);
+    xr_rset o = {0};
+    for (int i = 0, j = 0; i < a->n && j < b->n;) {
+        uint32_t lo = a->r[i].lo > b->r[j].lo ? a->r[i].lo : b->r[j].lo, hi = a->r[i].hi < b->r[j].hi ? a->r[i].hi : b->r[j].hi;
+        if (lo <= hi) xr_rs_add(&o, lo, hi);
+        if (a->r[i].hi < b->r[j].hi) i++; else j++;
+    }
+    free(a->r);
+    *a = o;
+}
+/* flag v: a class in the set notation, [A--B] [A&&B] [A[B]\p{X}], nested classes; after '[' (strings, \q{...}, are not
+   supported). Operands are classes, escapes, characters and ranges (in a union) */
+static int xr_vclass(xr_parser *p, xr_rset *out);
+static int xr_voperand(xr_parser *p, xr_rset *set, bool range_ok) {
+    if (xr_end(p)) return xr_fail(p, "unterminated character class");
+    uint32_t lo;
+    if (p->s[p->i] == '[') { p->i++; return xr_vclass(p, set); }
+    if (p->s[p->i] == '\\') {
+        p->i++;
+        if (xr_peek(p) == 'q') return xr_fail(p, "strings in a class (\\q{...}) are not supported");
+        int k = xr_escape(p, true, &lo, set);
+        if (k < 0) return -1;
+        if (k == 1) return 0;
+    } else lo = xr_next_cp(p);
+    if (range_ok && xr_peek(p) == '-' && p->i + 1 < p->n && p->s[p->i + 1] != '-') {
+        p->i++;
+        uint32_t hi;
+        if (xr_end(p)) return xr_fail(p, "unterminated character class");
+        if (p->s[p->i] == '\\') {
+            p->i++;
+            xr_rset sub = {0};
+            int k = xr_escape(p, true, &hi, &sub);
+            free(sub.r);
+            if (k != 0) return k < 0 ? -1 : xr_fail(p, "invalid character class range");
+        } else hi = xr_next_cp(p);
+        if (hi < lo) return xr_fail(p, "range out of order in character class");
+        xr_rs_add(set, lo, hi);
+        return 0;
+    }
+    xr_rs_add(set, lo, lo);
+    return 0;
+}
+static bool xr_vop(xr_parser *p, char c) { return p->i + 1 < p->n && p->s[p->i] == c && p->s[p->i + 1] == c; }
+static int xr_vclass(xr_parser *p, xr_rset *out) {
+    bool neg = false;
+    if (xr_peek(p) == '^') { neg = true; p->i++; }
+    xr_rset s = {0};
+    if (xr_peek(p) != ']') {
+        if (xr_voperand(p, &s, true) < 0) { free(s.r); return -1; }
+        char op = xr_vop(p, '&') ? '&' : xr_vop(p, '-') ? '-' : 0;
+        while (!xr_end(p) && p->s[p->i] != ']') {
+            if (op) {
+                if (!xr_vop(p, op)) { free(s.r); return xr_fail(p, "invalid set operation in character class"); }
+                p->i += 2;
+            }
+            xr_rset b = {0};
+            if (xr_voperand(p, &b, !op) < 0) { free(s.r); free(b.r); return -1; }
+            if (op == '&') xr_rs_and(&s, &b);
+            else if (op == '-') { xr_rs_negate(&b); xr_rs_and(&s, &b); }
+            else for (int i = 0; i < b.n; i++) xr_rs_add(&s, b.r[i].lo, b.r[i].hi);
+            free(b.r);
+        }
+    }
+    if (xr_end(p)) { free(s.r); return xr_fail(p, "unterminated character class"); }
+    p->i++;
+    if (p->flags & XF_I) xr_rs_fold(&s);
+    if (neg) xr_rs_negate(&s);
+    xr_rs_norm(&s);
+    for (int i = 0; i < s.n; i++) xr_rs_add(out, s.r[i].lo, s.r[i].hi);
+    free(s.r);
+    return 0;
+}
+
 static int xr_parse_class(xr_parser *p) { /* after '[' */
+    if (p->flags & XF_V) {
+        xr_rset s = {0};
+        if (xr_vclass(p, &s) < 0) { free(s.r); return -1; }
+        return xr_set_node(p, &s);
+    }
     bool neg = false;
     if (xr_peek(p) == '^') { neg = true; p->i++; }
     xr_rset s = {0};
@@ -911,9 +1046,9 @@ static void xr_free(xr_re *re) {
 static int xr_parse_flags(const char *f, size_t n, const char **err) {
     int fl = 0;
     for (size_t i = 0; i < n; i++) {
-        int b = f[i] == 'g' ? XF_G : f[i] == 'i' ? XF_I : f[i] == 'm' ? XF_M : f[i] == 's' ? XF_S : f[i] == 'u' ? XF_U : f[i] == 'y' ? XF_Y : f[i] == 'd' ? XF_D : f[i] == 'v' ? XF_U : 0;
-        if (!b || (fl & b)) { *err = "invalid regular expression flags"; return -1; }
-        fl |= b;
+        int b = f[i] == 'g' ? XF_G : f[i] == 'i' ? XF_I : f[i] == 'm' ? XF_M : f[i] == 's' ? XF_S : f[i] == 'u' ? XF_U : f[i] == 'y' ? XF_Y : f[i] == 'd' ? XF_D : f[i] == 'v' ? XF_V : 0;
+        if (!b || (fl & b) || (b == XF_V && (fl & XF_U)) || (b == XF_U && (fl & XF_V))) { *err = "invalid regular expression flags"; return -1; }
+        fl |= b == XF_V ? XF_V | XF_U : b;
     }
     return fl;
 }
@@ -2351,7 +2486,7 @@ static xs_RegExp *xr_wrap(xr_re *re, xs_str *source, xs_str *flags) {
     r->f_multiline = f & XF_M;
     r->f_sticky = f & XF_Y;
     r->f_dotAll = f & XF_S;
-    r->f_unicode = f & XF_U;
+    r->f_unicode = (f & XF_U) && !(f & XF_V);
     r->f_hasIndices = f & XF_D;
     return r;
 }
@@ -2364,7 +2499,7 @@ static xs_str *xr_flags_str(int f) {
     if (f & XF_I) b[n++] = 'i';
     if (f & XF_M) b[n++] = 'm';
     if (f & XF_S) b[n++] = 's';
-    if (f & XF_U) b[n++] = 'u';
+    if (f & XF_U) b[n++] = f & XF_V ? 'v' : 'u';
     if (f & XF_Y) b[n++] = 'y';
     return xs_str_new(b, (size_t)n);
 }
