@@ -69,7 +69,8 @@ Node does: set to `null` (`u.nick = null`, `{ nick: null }`, or read by `JSON.pa
 written `"nick":null` by `JSON.stringify` and `nick: null` by `console.log`, listed by `Object.keys`, and `"nick" in
 o` is `true`; never set, or set to `undefined`, it is left out. Reading it gives `null` either way. The flag costs one byte in the objects of such a class, and nothing
 in a class without such a field. An optional field without `null` in its type (`nick?: string`) holds absent and
-`null` as one value, left out of the JSON.
+`null` as one value, left out of the JSON. To leave out every `null` of the JSON a program writes, see
+[JSON and nulls](../guides/node-compatibility.md#json-and-nulls).
 
 ## `?.`, `??`, `??=`
 

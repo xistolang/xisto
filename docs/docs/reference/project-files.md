@@ -28,6 +28,7 @@ What the project is and what you asked for:
 | `name` | the project's name; `xisto build` names the executable after it |
 | `main` | the entry that `xisto build` and `xisto run` compile when no file is given |
 | `dependencies` | the packages added directly, name → spec |
+| `json` | options of the JSON the program writes: `{ "omitNull": true }` leaves the `null` members out of every `JSON.stringify` (`xisto init` writes it; [JSON and nulls](../guides/node-compatibility.md#json-and-nulls)) |
 
 A dependency's spec is one of:
 

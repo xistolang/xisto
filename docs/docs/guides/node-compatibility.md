@@ -541,6 +541,36 @@ Differences from Node:
 - When the replacer drops the root, the result is the string `"undefined"` (Node: the value `undefined`).
 - `this` inside a replacer is not the holder object.
 
+### JSON and nulls
+
+By default `JSON.stringify` writes a member that is `null` as `"k":null`, as Node does. A project can leave those
+members out of every JSON it writes, in its `xisto.json`:
+
+```json
+{
+  "name": "app",
+  "main": "src/main.ts",
+  "json": { "omitNull": true }
+}
+```
+
+`xisto init` writes this option into a new project. With it, `JSON.stringify` leaves out the fields of objects and
+the entries of a `Record` (or of an `any`) whose value is `null`, at every level; an array keeps its `null`
+elements, and a `null` value itself is still `"null"`. The choice is made when compiling: the writers the compiler
+generates test for `null` where a field can hold it, with no cost at run time. Because the JSON then differs from
+Node's, the build says so once, with warning `XS2111` at the first `JSON.stringify`; remove the option (or set it to
+`false`) to write Node's JSON.
+
+The option also changes what the program sends to other services, which may treat `null` and a missing member
+differently: in an Elasticsearch partial update, `{"doc":{"nick":null}}` clears the field, while a `doc` without
+`nick` leaves it as it is. With `omitNull`, `JSON.stringify` cannot write the first form: keep the option off in a
+project that must send `null` to clear a field, or write that body's text yourself (`` `{"doc":{"nick":null}}` ``).
+
+Without the option, the usual replacer that leaves nulls out, `JSON.stringify(v, (k, v) => v ?? undefined)` (or
+`(k, v) => v === null ? undefined : v`), is recognized and compiled the same way: no call per member, the same
+output as Node's (`null` array elements stay `null`). One difference: `JSON.stringify(null, (k, v) => v ?? undefined)`
+is `"null"` in xisto, the value `undefined` on Node.
+
 ## console.log and inspect
 
 Strings inside objects are quoted as Node quotes them: `'...'`, or `"..."` when the string has a `'`, or `` `...` ``
