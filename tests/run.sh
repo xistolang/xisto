@@ -1,6 +1,11 @@
 #!/bin/sh
 # Test runner: programs in tests/ok must print exactly what Node prints;
 # programs in tests/err must fail to compile with the message in their "// expect:" line.
+# Usage: sh tests/run.sh [NAME...]  With no NAME, the whole suite. Each NAME (a shell glob, or a path such as
+# tests/ok/arrays.ts) selects the tests of that name in every folder: tests/ok, tests/err, tests/stderr,
+# tests/qbe, tests/check (also check-NAME), bench/polybench/ts (also polybench-NAME), and the named groups:
+# warnings fmt unit http techempower crypto mem tls stack profiler noinline tlsgate pkg pkg-registry debug dev
+# size rt-lean.
 export XISTO_NODE_COMPAT=1 # these programs also run on Node for comparison: node: imports allowed
 export TZ=America/New_York # date-local checks DST edges: the same zone for xisto, Node and the Linux run
 cd "$(dirname "$0")/.." || exit 1
@@ -11,11 +16,23 @@ pass=0
 fail=0
 qbe=0
 
+SEL=
+for a in "$@"; do a=${a%/}; a=${a##*/}; SEL="$SEL ${a%.ts}"; done
+# sel NAME...: whether this run includes a test known by any of these names (always, with no NAME arguments; it
+# sets only sel_name and sel_pat)
+sel() {
+    [ -z "$SEL" ] && return 0
+    set -f   # the patterns are matched against names, not expanded against files
+    for sel_name in "$@"; do for sel_pat in $SEL; do case $sel_name in $sel_pat) set +f; return 0 ;; esac; done; done
+    set +f; return 1
+}
+
 # a program that does not end (an event loop that waits on nothing) fails instead of hanging the run
 LIMIT_S=120
 LIMIT=; command -v perl > /dev/null 2>&1 && LIMIT="perl -e alarm(shift);exec(@ARGV) $LIMIT_S"
 for f in tests/ok/*.ts; do
     name=$(basename "$f" .ts)
+    sel "$name" || continue
     in=/dev/null; [ -f "${f%.ts}.stdin" ] && in="${f%.ts}.stdin"   # NAME.stdin next to the program: its standard input, for Node and for xisto
     # oracle: Node; Bun when Node cannot run the file (Node strips types but does not transform enums)
     if [ -f "${f%.ts}.expected" ]; then
@@ -70,6 +87,7 @@ done
 
 for f in tests/err/*.ts; do
     name=$(basename "$f" .ts)
+    sel "$name" || continue
     want=$(sed -n '1s|^// expect: ||p' "$f")
     case "$want" in
     "runtime error"*)
@@ -100,6 +118,7 @@ done
 for d in tests/check/*/; do
     d=${d%/}
     name=check-$(basename "$d")
+    sel "$name" "$(basename "$d")" || continue
     $XISTO check "$d" > "$OUT/$name.summary" 2>&1; rc=$?
     $XISTO check --details "$d" > "$OUT/$name.details" 2>&1
     # (a folder with an `entry` file: also checked from that .ts file, whose report counts the packages the libs it
@@ -115,6 +134,7 @@ for d in tests/check/*/; do
 done
 # rule warnings (XB-118): a build prints one line with their count and still builds; --deny-warnings makes them
 # errors in the build and changes in xisto check
+if sel warnings; then
 $XISTO build tests/check/warnings/main.ts -o "$OUT/warnings-bin" > "$OUT/warnings-build.txt" 2>&1; wrc=$?
 $XISTO build --deny-warnings tests/check/warnings/main.ts -o "$OUT/warnings-deny" > /dev/null 2>&1; drc=$?
 $XISTO check --deny-warnings tests/check/warnings > /dev/null 2>&1; crc=$?
@@ -123,11 +143,13 @@ if [ "$wrc" = 0 ] && [ "$drc" = 1 ] && [ "$crc" = 1 ] && [ "$(wc -l < "$OUT/warn
 else
     echo "FAIL rule warnings: build rc=$wrc, --deny-warnings rc=$drc, check --deny-warnings rc=$crc"; cat "$OUT/warnings-build.txt" | head -5; fail=$((fail+1))
 fi
+fi
 
 # stderr: console.error/warn go to stderr and log/info/debug to stdout, each as Node writes it (the expected files are
 # Node's two streams, checked in: the tests/ok oracle merges them)
 for f in tests/stderr/*.ts; do
     name=stderr-$(basename "$f" .ts)
+    sel "$name" "$(basename "$f" .ts)" || continue
     if ! $XISTO build -o "$OUT/$name" "$f" > "$OUT/$name.build" 2>&1; then echo "FAIL $f: xisto build failed"; cat "$OUT/$name.build"; fail=$((fail+1)); continue; fi
     "$OUT/$name" > "$OUT/$name.out" 2> "$OUT/$name.err" < /dev/null
     if cmp -s "$OUT/$name.out" "${f%.ts}.stdout" && cmp -s "$OUT/$name.err" "${f%.ts}.stderr"; then pass=$((pass+1));
@@ -138,6 +160,7 @@ done
 # byte for byte as Node's (Bun's when Node cannot run the file; XISTO_ORACLE_DIR as in tests/ok)
 for f in bench/polybench/ts/*.ts; do
     name=polybench-$(basename "$f" .ts)
+    sel "$name" "$(basename "$f" .ts)" || continue
     if [ -n "$XISTO_ORACLE_DIR" ] && [ -f "$XISTO_ORACLE_DIR/$name.node.err" ]; then
         cp "$XISTO_ORACLE_DIR/$name.node.out" "$OUT/$name.node.out"; cp "$XISTO_ORACLE_DIR/$name.node.err" "$OUT/$name.node.err"
     elif ! node "$f" MINI > "$OUT/$name.node.out" 2> "$OUT/$name.node.err" < /dev/null && ! bun "$f" MINI > "$OUT/$name.node.out" 2> "$OUT/$name.node.err" < /dev/null; then
@@ -150,18 +173,23 @@ for f in bench/polybench/ts/*.ts; do
 done
 
 # xisto fmt: the messy file formats to the gabarito, and the whole tree is already formatted
+if sel fmt; then
 cp tests/fmt/messy.input "$OUT/messy.ts"
 $XISTO fmt "$OUT/messy.ts" > /dev/null 2>&1
 if cmp -s "$OUT/messy.ts" tests/fmt/messy.expected && $XISTO fmt --check "$OUT/messy.ts" > /dev/null 2>&1; then pass=$((pass+1)); else echo "FAIL fmt: messy.input does not format to messy.expected"; diff tests/fmt/messy.expected "$OUT/messy.ts" | head; fail=$((fail+1)); fi
 if $XISTO fmt --check $(find tests bench/programs bench/http bench/streams -name '*.ts') > "$OUT/fmt-check.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL fmt --check:"; head "$OUT/fmt-check.txt"; fail=$((fail+1)); fi
+fi
 # xisto test: the unit tests pass; a failing test is reported as a failure
+if sel unit; then
 if $XISTO test tests/unit > "$OUT/unit.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL xisto test tests/unit:"; cat "$OUT/unit.txt"; fail=$((fail+1)); fi
 mkdir -p "$OUT/unit-fail" && cp tests/unit/failing.test.ts.disabled "$OUT/unit-fail/failing.test.ts"
 if $XISTO test "$OUT/unit-fail" > "$OUT/unit-fail.txt" 2>&1; then echo "FAIL xisto test: a failing assert was reported as passing"; fail=$((fail+1));
 elif grep -q "assertion failed: math is broken" "$OUT/unit-fail.txt"; then pass=$((pass+1)); else echo "FAIL xisto test: no assertion message"; cat "$OUT/unit-fail.txt"; fail=$((fail+1)); fi
+fi
 
 # HTTP: fetch options and timeout, non-blocking sleeps, graceful shutdown (SKIP_NET=1 skips: it needs port 8080)
 if [ -n "$SKIP_NET" ]; then :; else
+if sel http; then
 sh tests/http/run.sh > "$OUT/http.txt" 2>&1
 if grep -q "200 POST abc123 7 xisto" "$OUT/http.txt" && grep -q "bytes body: 200 bytes xisto http://127.0.0.1:8080/echo" "$OUT/http.txt" && grep -q "init: 200 POST init 7 200 slept 1" "$OUT/http.txt" && grep -q "relay: 200 relay xisto" "$OUT/http.txt" && grep -q "timeout: The operation was aborted due to timeout TimeoutError" "$OUT/http.txt" \
    && grep -q "abort: true AbortError This operation was aborted true" "$OUT/http.txt" && grep -q "aborted before: AbortError" "$OUT/http.txt" \
@@ -169,11 +197,15 @@ if grep -q "200 POST abc123 7 xisto" "$OUT/http.txt" && grep -q "bytes body: 200
    && grep -q "overlapped (20 ok)" "$OUT/http.txt" && grep -q "during SIGTERM: slept 700" "$OUT/http.txt" && grep -q "refused: True" "$OUT/http.txt" \
    && grep -q "server exit code: 0" "$OUT/http.txt" && grep -q "channel delivered: True" "$OUT/http.txt" \
    && grep -q "pipelined: 3 responses" "$OUT/http.txt" && grep -q "pipelined distinct requests: own data" "$OUT/http.txt" && grep -q "upload: TimeoutError within the limit" "$OUT/http.txt" && grep -q 'head parser: {"method":"POST","token":"t1","body":123}, closed' "$OUT/http.txt" && grep -q "async local storage per request: isolated (30 ok)" "$OUT/http.txt" && grep -q "parked client left: idle cpu" "$OUT/http.txt" && grep -q "status content types: 201 application/json, 404 application/json, 200 application/json, 418 text/plain; charset=utf-8" "$OUT/http.txt"; then pass=$((pass+1)); else echo "FAIL http:"; cat "$OUT/http.txt"; fail=$((fail+1)); fi
+fi
 # TechEmpower phase 1: the native app passes the TFB checks for /plaintext and /json (a free port, 1 and 2 workers)
+if sel techempower; then
 sh tests/techempower/run.sh > "$OUT/techempower.txt" 2>&1
 if [ "$(grep -c ' PASS$' "$OUT/techempower.txt")" -eq 4 ] && ! grep -q "FAIL" "$OUT/techempower.txt"; then pass=$((pass+1)); else echo "FAIL techempower:"; cat "$OUT/techempower.txt"; fail=$((fail+1)); fi
+fi
 # crypto patches to BearSSL (third_party/bearssl/XISTO_PATCHES.md): differential tests
 for t in p256_comb p256_sign p256_montymul; do
+    sel crypto "$t" || continue
     extra=""; [ $t = p256_sign ] && extra=tests/crypto/ecdsa_sign_orig.c
     # p256_montymul: on arm64 the assembly against the C code; elsewhere the C code against a slow reference
     if cc -O2 -Ibuild/bearssl-inc -Ithird_party/bearssl/inc -Ithird_party/bearssl/src -o "$OUT/$t" tests/crypto/$t.c $extra build/libbearssl.a > "$OUT/$t.build" 2>&1 \
@@ -181,6 +213,7 @@ for t in p256_comb p256_sign p256_montymul; do
 done
 # memory: loop and if conditions that make temporaries stay flat (C and QBE), peak RSS under 20 MB
 for be in c qbe; do
+    sel mem loop-temps || continue
     flag=""; [ $be = qbe ] && flag="--backend=qbe"
     $XISTO build $flag -o "$OUT/loop-temps-$be" tests/mem/loop-temps.ts > /dev/null 2>&1
     peak=$(python3 -c "
@@ -202,38 +235,41 @@ tls_ok() {
    && grep -q "empty host error: fetch: invalid URL (empty host)" "$1" && grep -q "crlf value error: fetch: invalid value" "$1" \
    && grep -q "default protocol: $2" "$1"
 }
+if sel tls; then
 XISTO_TLS=bearssl sh tests/tls/run.sh > "$OUT/tls.txt" 2>&1
 if tls_ok "$OUT/tls.txt" TLSv1.2; then pass=$((pass+1)); else echo "FAIL tls (bearssl):"; cat "$OUT/tls.txt"; fail=$((fail+1)); fi
 if [ -f build/awslc/lib/libssl.a ]; then
     XISTO_TLS=awslc sh tests/tls/run.sh > "$OUT/tls-awslc.txt" 2>&1
     if tls_ok "$OUT/tls-awslc.txt" TLSv1.3; then pass=$((pass+1)); else echo "FAIL tls (awslc):"; cat "$OUT/tls-awslc.txt"; fail=$((fail+1)); fi
 fi
+fi
 # stack traces: exact frames for runtime errors, throws and e.stack (both backends), HTTP 500 without details
-if sh tests/stack/run.sh > "$OUT/stack.txt" 2>&1 && grep -q 'boom: 500 {"error":"internal error"}' "$OUT/stack.txt" \
+if ! sel stack; then :; elif sh tests/stack/run.sh > "$OUT/stack.txt" 2>&1 && grep -q 'boom: 500 {"error":"internal error"}' "$OUT/stack.txt" \
    && grep -q 'leak: 500 {"error":"internal error"}' "$OUT/stack.txt" \
    && grep -q "item: 400 {'error': \"JSON: 'id' must be an integer\"}" "$OUT/stack.txt" \
    && grep -q "    at pick (tests/stack/server.ts:7:11)" "$OUT/stack.txt" && grep -q "    at boom (tests/stack/server.ts:10:31)" "$OUT/stack.txt" \
    && grep -q "    at late (tests/stack/server.ts:14:9)" "$OUT/stack.txt" && ! grep -q "warning" "$OUT/stack.txt"; then pass=$((pass+1)); else echo "FAIL stack:"; cat "$OUT/stack.txt"; fail=$((fail+1)); fi
 # xisto:profiler: the sampled pprof against what the program measured (work split, CPU time, inlined frames)
-if sh tests/profiler/run.sh > "$OUT/profiler.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL profiler:"; cat "$OUT/profiler.txt"; fail=$((fail+1)); fi
+if ! sel profiler; then :; elif sh tests/profiler/run.sh > "$OUT/profiler.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL profiler:"; cat "$OUT/profiler.txt"; fail=$((fail+1)); fi
 # runtime functions that can fail or call back into user code must not be inlined (stack traces)
-if python3 tools/noinline-scan.py --check runtime/xisto_rt.h runtime/xisto_net.h runtime/xisto_sqlite.h runtime/xisto_tls.h runtime/xisto_tls_awslc.h runtime/xisto_regex.h > "$OUT/noinline.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL noinline:"; cat "$OUT/noinline.txt"; fail=$((fail+1)); fi
+if ! sel noinline; then :; elif python3 tools/noinline-scan.py --check runtime/xisto_rt.h runtime/xisto_net.h runtime/xisto_sqlite.h runtime/xisto_tls.h runtime/xisto_tls_awslc.h runtime/xisto_regex.h > "$OUT/noinline.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL noinline:"; cat "$OUT/noinline.txt"; fail=$((fail+1)); fi
 # TLS is linked only when the program can use https
-if sh tests/tlsgate/run.sh > "$OUT/tlsgate.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL tlsgate:"; cat "$OUT/tlsgate.txt"; fail=$((fail+1)); fi
+if ! sel tlsgate; then :; elif sh tests/tlsgate/run.sh > "$OUT/tlsgate.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL tlsgate:"; cat "$OUT/tlsgate.txt"; fail=$((fail+1)); fi
 fi
 
 # packages: xisto add / install from a local git repository
-if sh tests/pkg/run.sh > "$OUT/pkg.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg.txt")" -ge 9 ] && ! grep -q FAIL "$OUT/pkg.txt"; then pass=$((pass+1)); else echo "FAIL packages:"; cat "$OUT/pkg.txt"; fail=$((fail+1)); fi
+if ! sel pkg; then :; elif sh tests/pkg/run.sh > "$OUT/pkg.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg.txt")" -ge 9 ] && ! grep -q FAIL "$OUT/pkg.txt"; then pass=$((pass+1)); else echo "FAIL packages:"; cat "$OUT/pkg.txt"; fail=$((fail+1)); fi
 # packages: xisto init / add NAME / install against a local monorepo registry (tests/pkg/registry.sh)
-if sh tests/pkg/registry.sh > "$OUT/pkg-registry.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg-registry.txt")" -ge 32 ] && ! grep -q FAIL "$OUT/pkg-registry.txt"; then pass=$((pass+1)); else echo "FAIL package registry:"; cat "$OUT/pkg-registry.txt"; fail=$((fail+1)); fi
+if ! sel pkg-registry; then :; elif sh tests/pkg/registry.sh > "$OUT/pkg-registry.txt" 2>&1 && [ "$(grep -c '^ok' "$OUT/pkg-registry.txt")" -ge 32 ] && ! grep -q FAIL "$OUT/pkg-registry.txt"; then pass=$((pass+1)); else echo "FAIL package registry:"; cat "$OUT/pkg-registry.txt"; fail=$((fail+1)); fi
 
 
 
 # debugger: CLI transcripts and the agent driven over DAP (docs/debugger.md)
-if sh tests/debug/run.sh > "$OUT/debug.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL debugger:"; cat "$OUT/debug.txt"; fail=$((fail+1)); fi
+if ! sel debug; then :; elif sh tests/debug/run.sh > "$OUT/debug.txt" 2>&1; then pass=$((pass+1)); else echo "FAIL debugger:"; cat "$OUT/debug.txt"; fail=$((fail+1)); fi
 
 # qbe: what it does not support is a compile error, never a crash (XB-013: calling a function value)
 for f in tests/qbe/*.ts; do
+    sel "$(basename "$f" .ts)" "qbe-$(basename "$f" .ts)" || continue
     want=$(sed -n '1s|^// expect: ||p' "$f")
     $XISTO build --backend=qbe -o "$OUT/qbe-unsup" "$f" > "$OUT/qbe-unsup.txt" 2>&1; rc=$?
     if [ $rc -eq 1 ] && grep -qF -- "$want" "$OUT/qbe-unsup.txt"; then pass=$((pass+1)); else echo "FAIL qbe $f (exit $rc)"; head -3 "$OUT/qbe-unsup.txt"; fail=$((fail+1)); fi
@@ -241,12 +277,14 @@ done
 # --dev (the runtime as a library, tools/rtsplit.py): a few programs must build and print what Node prints. Nothing
 # else in the suite builds with --dev, and a runtime comment once broke every --dev build unnoticed
 for n in arrays classes closures-ref nullish write-behind xisto-collections dev-timers; do
+    sel dev || continue
     f=tests/ok/$n.ts
     [ -f "$f" ] && [ -f "$OUT/$n.node" ] || continue
     if $XISTO run --dev "$f" < /dev/null > "$OUT/$n.dev" 2>&1 && cmp -s "$OUT/$n.node" "$OUT/$n.dev"; then pass=$((pass+1)); else echo "FAIL --dev $f"; head -5 "$OUT/$n.dev"; fail=$((fail+1)); fi
 done
 # size budget: a program importing a 200-function module and using one must produce the same binary as the function alone
 for backend in "" "--backend=qbe"; do
+    sel size || continue
     $XISTO build $backend -o "$OUT/size-one" tests/size/uses-one.ts > /dev/null 2>&1 && $XISTO build $backend -o "$OUT/size-alone" tests/size/standalone.ts > /dev/null 2>&1 || { echo "FAIL size budget: build failed ($backend)"; fail=$((fail+1)); continue; }
     a=$(stat -f%z "$OUT/size-one"); b=$(stat -f%z "$OUT/size-alone")
     if [ "$("$OUT/size-one")" != "$("$OUT/size-alone")" ]; then echo "FAIL size budget: outputs differ"; fail=$((fail+1)); continue; fi
@@ -257,11 +295,12 @@ for backend in "" "--backend=qbe"; do
     fi
 done
 # runtime budget (XB-250): Date, bytes, bigint and an imported module's unused timers/fetch/async/try cost no event loop
-if $XISTO emit tests/ok/rt-lean.ts > "$OUT/rt-lean.c" 2>&1 && ! grep -q 'Xisto network runtime' "$OUT/rt-lean.c" \
+if ! sel rt-lean; then :; elif $XISTO emit tests/ok/rt-lean.ts > "$OUT/rt-lean.c" 2>&1 && ! grep -q 'Xisto network runtime' "$OUT/rt-lean.c" \
    && ! grep -q '^#define XS_THREADS' "$OUT/rt-lean.c" && ! sed -n '/^\/\* ---- program ---- \*\//,$p' "$OUT/rt-lean.c" | grep -q 'xs_cln_'; then
     pass=$((pass+1))
 else
     echo "FAIL runtime budget: tests/ok/rt-lean.ts pulls in the network runtime, threads or the cleanup stack"; fail=$((fail+1))
 fi
+if [ -n "$SEL" ] && [ $((pass + fail)) -eq 0 ]; then echo "no test matches:$SEL"; exit 1; fi
 echo "tests: $pass passed, $fail failed ($qbe programs also verified through the qbe backend)"
 [ "$fail" -eq 0 ]
