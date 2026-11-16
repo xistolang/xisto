@@ -376,7 +376,7 @@ queries (`resolveMx`, `resolveTxt`, `reverse`...) are not there yet. `promises.l
 
 | API | Notes |
 |---|---|
-| `spawn(file, args, { cwd, env, shell })` | `stdout`/`stderr` give `'data'` as the child writes (`setEncoding` for text); `stdin.write`/`end`; `kill(signal)`; `'spawn'`, `'exit'` (code, signal), `'close'`, `'error'` (`spawn x ENOENT`) |
+| `spawn(file, args, { cwd, env, shell })` | `stdout`/`stderr` give `'data'` as the child writes (`setEncoding` for text); `stdin.write`/`end`; `kill(signal)`; `unref()`/`ref()` (an unref'd child does not keep the program alive); `'spawn'`, `'exit'` (code, signal), `'close'`, `'error'` (`spawn x ENOENT`) |
 | `exec(command, cb)`, `execFile(file, args, cb)` | `cb(error, stdout, stderr)`; a failure is Node's `Command failed: ...` error with `code` |
 | `spawnSync(file, args, { input, cwd, encoding })` | `status`, `signal`, `stdout`, `stderr`, `error` |
 | `execFileSync`, `execSync` | the output; a failure is thrown |

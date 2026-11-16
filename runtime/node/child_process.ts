@@ -16,6 +16,8 @@ declare function net_read(fd: int): Uint8Array;
 declare function net_close(fd: int): void;
 declare function exec_sync(command: string): string;
 declare function os_platform_name(): string;
+declare function net_task(): int;
+declare function net_task_ref(task: int, ref: boolean): void;
 
 const SIGNAMES_DARWIN: string[] = ["", "SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP", "SIGABRT", "SIGEMT", "SIGFPE", "SIGKILL",
   "SIGBUS", "SIGSEGV", "SIGSYS", "SIGPIPE", "SIGALRM", "SIGTERM", "SIGURG", "SIGSTOP", "SIGTSTP", "SIGCONT", "SIGCHLD", "SIGTTIN",
@@ -86,21 +88,33 @@ export class ExecError extends Error {
 /** One of a child's output pipes: 'data' (Buffers, or strings after setEncoding), then 'end' and 'close'. */
 export class ChildOutput extends EventEmitter {
   private encoding: string = "";
+  private io: int = 0;
+  private refd: boolean = true;
   setEncoding(encoding: string = "utf8"): ChildOutput {
     this.encoding = encoding;
     return this;
   }
   /** (internal) reads the pipe to its end. */
-  async _pump(fd: int): Promise<void> {
+  async _pump(fd: int, done: () => void): Promise<void> {
+    this.io = net_task();
+    if (!this.refd && this.io !== 0) net_task_ref(this.io, false);
     for (;;) {
       const chunk = net_read(fd);
       if (chunk.length === 0) break;
       if (this.encoding.length > 0) this.emit("data", new TextDecoder().decode(chunk));
       else this.emit("data", Buffer.from(chunk));
     }
+    if (!this.refd && this.io !== 0) net_task_ref(this.io, true);
+    this.io = 0;
     net_close(fd);
     this.emit("end");
     this.emit("close");
+    done();
+  }
+  /** (internal) whether reading the pipe keeps the program alive (the child's ref/unref). */
+  _setRef(ref: boolean): void {
+    if (this.refd !== ref && this.io !== 0) net_task_ref(this.io, ref);
+    this.refd = ref;
   }
 }
 
@@ -137,6 +151,9 @@ export class ChildProcess extends EventEmitter {
   stdout: ChildOutput = new ChildOutput();
   stderr: ChildOutput = new ChildOutput();
   private task: Promise<void> | null = null;
+  private outTask: Promise<void> | null = null;
+  private errTask: Promise<void> | null = null;
+  private left: int = 0;
 
   constructor(file: string, args: string[]) {
     super();
@@ -163,17 +180,47 @@ export class ChildProcess extends EventEmitter {
     this.stdin = new ChildInput(r[1]);
     this.task = this.watch(r[2], r[3]);
   }
+  // The pipes are read on tasks of their own (what unref() lets go of: they wait on the pipes); once both are at their
+  // end, the exit status, as Node gives 'exit' and 'close' after the output.
   private async watch(outFd: int, errFd: int): Promise<void> {
     this.emit("spawn");
-    const out = this.stdout._pump(outFd); // (both read at once, each on a task of its own)
-    const err = this.stderr._pump(errFd);
-    await out;
-    await err;
+    this.left = 2;
+    this.outTask = this.stdout._pump(outFd, (): void => this.pumped(false));
+    this.errTask = this.stderr._pump(errFd, (): void => this.pumped(true));
+  }
+  // one pipe is at its end; after the second, the exit comes as an await of each pump in turn gave it: a microtask
+  // after stderr's end, two after stdout's
+  private pumped(isErr: boolean): void {
+    this.left--;
+    if (this.left > 0) return;
+    if (isErr) {
+      queueMicrotask((): void => this.finish());
+    } else {
+      queueMicrotask((): void => {
+        queueMicrotask((): void => this.finish());
+      });
+    }
+  }
+  private finish(): void {
+    this.outTask = null;
+    this.errTask = null;
     const st = cp_wait(this.pid);
     this.exitCode = st[1] > 0 ? null : st[0];
     this.signalCode = signalName(st[1]);
     this.emit("exit", this.exitCode, this.signalCode);
     this.emit("close", this.exitCode, this.signalCode);
+  }
+  /** The child does not keep the program alive: the program can end while it runs (it goes on running). */
+  unref(): void {
+    this.setRef(false);
+  }
+  /** The child keeps the program alive again (the default). */
+  ref(): void {
+    this.setRef(true);
+  }
+  private setRef(ref: boolean): void {
+    this.stdout._setRef(ref);
+    this.stderr._setRef(ref);
   }
   /** Sends a signal (SIGTERM by default); true when it was sent. */
   kill(signal: string | int = "SIGTERM"): boolean {

@@ -348,6 +348,13 @@ static void init_builtins(void) {
         bi_method(wkr, "terminate", "xs_Worker_terminate", ty_void, 0); /* (Node returns a Promise of the exit code) */
         bi_method(mport, "on", "xs_MessagePort_on", ty_object_of(mport), 2, ty_string, listener);
         bi_method(mport, "postMessage", "xs_MessagePort_postMessage", ty_void, 1, ty_string);
+        bi_method(wkr, "ref", "xs_Worker_ref", ty_void, 0);
+        bi_method(wkr, "unref", "xs_Worker_unref", ty_void, 0);
+        bi_method(mport, "ref", "xs_MessagePort_ref", ty_void, 0);
+        bi_method(mport, "unref", "xs_MessagePort_unref", ty_void, 0);
+        bi_method(mport, "hasRef", "xs_MessagePort_hasRef", ty_boolean, 0);
+        bi_method(mport, "start", "xs_MessagePort_start", ty_void, 0);
+        bi_method(mport, "close", "xs_MessagePort_close", ty_void, 0);
     }
 
     Class *srv = bi_class("Server", "xs_Server");

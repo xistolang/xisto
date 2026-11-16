@@ -3884,9 +3884,18 @@ static XS_TLS xs_wq *xs_wt_in, *xs_wt_out; /* a worker's queues: from its parent
 static XS_TLS int64_t xs_wt_tid;
 static int64_t xs_wt_next_id = 1;
 
-typedef struct xs_MessagePort { xs_hdr hdr; xs_wq *in, *out; xs_closure *on_msg; bool listening; uint8_t on_kind; } xs_MessagePort;
-typedef struct xs_Worker { xs_hdr hdr; xs_wq *to_main, *to_worker; xs_closure *on_msg; bool listening; uint8_t on_kind; } xs_Worker;
-static void xs_MessagePort_free(void *p) { xs_MessagePort *m = p; xs_release(m->on_msg); xs_obj_free(p); }
+/* lco: the listener's coroutine while it runs; unref: it does not keep the program alive (unref()); owns: a
+   MessageChannel's port, which holds a count of its two queues (parentPort's are the thread's) */
+typedef struct xs_MessagePort { xs_hdr hdr; xs_wq *in, *out; xs_closure *on_msg; bool listening; uint8_t on_kind; bool unref, owns; struct xs_coro *lco; } xs_MessagePort;
+typedef struct xs_Worker { xs_hdr hdr; xs_wq *to_main, *to_worker; xs_closure *on_msg; bool listening; uint8_t on_kind; bool unref; struct xs_coro *lco; } xs_Worker;
+static void xs_wq_unref(xs_wq *q);
+static void xs_task_ref_co(xs_coro *co, bool ref);
+static void xs_MessagePort_free(void *p) {
+    xs_MessagePort *m = p;
+    xs_release(m->on_msg);
+    if (m->owns) { xs_wq_unref(m->in); xs_wq_unref(m->out); }
+    xs_obj_free(p);
+}
 static void xs_MessagePort_print(void *p) { (void)p; fputs("MessagePort {}", XS_OUT); }
 static void xs_Worker_free(void *p) {
     xs_Worker *w = p;
@@ -4527,7 +4536,7 @@ XS_NOINLINE void xs_process_on_uncaught(xs_closure *uncaught, xs_closure *reject
 
 #ifdef XS_THREADS
 /* the listener's coroutine: each message, in order, to the closure; ends when the sender is done */
-typedef struct { xs_wq *q; xs_closure **cb; uint8_t *kind; xs_hdr *owner; } xs_wlisten; /* kind: what the listener takes (XS_WM_...) */
+typedef struct { xs_wq *q; xs_closure **cb; uint8_t *kind; xs_hdr *owner; struct xs_coro **slot; } xs_wlisten; /* kind: what the listener takes (XS_WM_...); slot: the owner's lco */
 XS_NOINLINE void xs_wt_listen(void *p) {
     xs_wlisten *L = p;
     static const char *const kinds[] = {"string", "Uint8Array", "SharedArrayBuffer", "Float64Array"};
@@ -4569,7 +4578,9 @@ XS_NOINLINE void xs_wt_listen(void *p) {
 }
 static void xs_wt_listen_done(xs_coro *co) {
     xs_wlisten *L = co->arg;
-    xs_tasks_live--;
+    if (co->unref) { co->unref = false; xs_tasks_unref--; } else xs_tasks_live--; /* (unref'd: xs_task_ref_co) */
+    co->kill = false;
+    *L->slot = NULL;
     xs_coro_recycle(co);
     /* nothing more can arrive: the listener goes, and with it the cycle it usually makes (a closure that
        captures its worker, to postMessage the next task, held by that worker) */
@@ -4579,18 +4590,21 @@ static void xs_wt_listen_done(xs_coro *co) {
     xs_release(L->owner);
     free(L);
 }
-XS_NOINLINE void xs_wt_listen_start(xs_wq *q, xs_closure **cb, uint8_t *kind, xs_hdr *owner) {
+XS_NOINLINE xs_coro *xs_wt_listen_start(xs_wq *q, xs_closure **cb, uint8_t *kind, xs_hdr *owner, xs_coro **slot) {
     if (xs_kq < 0) xs_kq = kqueue();
     xs_wlisten *L = malloc(sizeof *L);
     L->q = q;
     L->cb = cb;
     L->kind = kind;
     L->owner = xs_retain(owner);
+    L->slot = slot;
     xs_coro *co = xs_coro_new_shared(xs_wt_listen, L);
     co->on_done = xs_wt_listen_done;
     xs_tasks_live++;
     xs_exit_hook = xs_tasks_drain;
     xs_ready_push(co); /* it starts when the loop runs: after the code that set the listener up */
+    *slot = co;
+    return co;
 }
 #endif
 /* ---- process.stdin and node:tty (runtime/node/tty.ts) ----
@@ -4940,7 +4954,11 @@ XS_NOINLINE xs_Worker *xs_Worker_on_k(xs_Worker *w, xs_str *ev, xs_closure *cb, 
     xs_wt_check_event(ev, "worker");
     xs_assign(w->on_msg, xs_retain(cb));
     w->on_kind = kind;
-    if (!w->listening) { w->listening = true; xs_wt_listen_start(w->to_main, &w->on_msg, &w->on_kind, &w->hdr); }
+    if (!w->listening) {
+        w->listening = true;
+        xs_coro *co = xs_wt_listen_start(w->to_main, &w->on_msg, &w->on_kind, &w->hdr, &w->lco);
+        if (w->unref) xs_task_ref_co(co, false);
+    }
     return xs_retain(w);
 }
 XS_NOINLINE xs_Worker *xs_Worker_on(xs_Worker *w, xs_str *ev, xs_closure *cb) { return xs_Worker_on_k(w, ev, cb, XS_WM_TEXT); }
@@ -4953,12 +4971,55 @@ XS_NOINLINE void xs_Worker_postSab(xs_Worker *w, xs_SharedArrayBuffer *s) { xs_w
 XS_NOINLINE void xs_Worker_postF64(xs_Worker *w, xs_Float64Array *a) { xs_wq_put_f64(w->to_worker, a); }
 /* the worker's parentPort gets no more messages: its listener ends, and the worker with it once it is idle */
 XS_NOINLINE void xs_Worker_terminate(xs_Worker *w) { xs_wq_close(w->to_worker); }
+/* worker.unref(): its 'message' listener (what keeps the main thread waiting for it) does not keep the program alive;
+   at the end the worker's thread ends with the process, as in Node. ref() undoes it. */
+XS_NOINLINE void xs_Worker_unref(xs_Worker *w) {
+    if (w->unref) return;
+    w->unref = true;
+    if (w->lco) xs_task_ref_co(w->lco, false);
+}
+XS_NOINLINE void xs_Worker_ref(xs_Worker *w) {
+    if (!w->unref) return;
+    w->unref = false;
+    if (w->lco) xs_task_ref_co(w->lco, true);
+}
+XS_NOINLINE void xs_MessagePort_unref(xs_MessagePort *p) {
+    if (p->unref) return;
+    p->unref = true;
+    if (p->lco) xs_task_ref_co(p->lco, false);
+}
+XS_NOINLINE void xs_MessagePort_ref(xs_MessagePort *p) {
+    if (!p->unref) return;
+    p->unref = false;
+    if (p->lco) xs_task_ref_co(p->lco, true);
+}
+/* whether the port keeps the program alive: a listener that runs, not unref'd */
+XS_NOINLINE bool xs_MessagePort_hasRef(xs_MessagePort *p) { return p->lco != NULL && !p->unref; }
+/* start(): on('message') starts the port already */
+XS_NOINLINE void xs_MessagePort_start(xs_MessagePort *p) { (void)p; }
+/* close(): the channel is done both ways: what was sent before is still given, then both ports' listeners end */
+XS_NOINLINE void xs_MessagePort_close(xs_MessagePort *p) {
+    if (p->in) xs_wq_close(p->in);
+    if (p->out) xs_wq_close(p->out);
+}
+/* new MessageChannel(): port1 (peer null: two new queues), then port2 (peer: port1, its queues the other way) */
+XS_NOINLINE xs_MessagePort *xs_wt_channel_port(xs_MessagePort *peer) {
+    xs_MessagePort *m = xs_obj_alloc(sizeof(xs_MessagePort), xs_MessagePort_free, xs_MessagePort_print);
+    m->owns = true;
+    if (!peer) { m->in = xs_wq_new(); m->out = xs_wq_new(); }
+    else { m->in = peer->out; m->out = peer->in; }
+    return m;
+}
 XS_NOINLINE xs_MessagePort *xs_MessagePort_on_k(xs_MessagePort *p, xs_str *ev, xs_closure *cb, uint8_t kind) {
     xs_wt_check_event(ev, "parentPort");
     if (!p->in) xs_panic("parentPort is null on the main thread");
     xs_assign(p->on_msg, xs_retain(cb));
     p->on_kind = kind;
-    if (!p->listening) { p->listening = true; xs_wt_listen_start(p->in, &p->on_msg, &p->on_kind, &p->hdr); }
+    if (!p->listening) {
+        p->listening = true;
+        xs_coro *co = xs_wt_listen_start(p->in, &p->on_msg, &p->on_kind, &p->hdr, &p->lco);
+        if (p->unref) xs_task_ref_co(co, false);
+    }
     return xs_retain(p);
 }
 XS_NOINLINE xs_MessagePort *xs_MessagePort_on(xs_MessagePort *p, xs_str *ev, xs_closure *cb) { return xs_MessagePort_on_k(p, ev, cb, XS_WM_TEXT); }
@@ -5243,9 +5304,9 @@ static void xs_unref_kill_all(void) {
     }
     xs_coro_flush_dead();
 }
-XS_NOINLINE void xs_net_task_ref(int64_t task, bool ref) {
-    xs_coro *co = (xs_coro *)(intptr_t)task;
-    if (!xs_task_countable(co) || co->unref == !ref) return;
+/* (xs_net_task_ref, and a worker's or a port's listener: Worker.unref, MessagePort.unref) */
+static void xs_task_ref_co(xs_coro *co, bool ref) {
+    if (!co || co->done || co->unref == !ref) return;
     if (!ref) {
         int i = 0;
         while (i < xs_n_unref_cos && xs_unref_cos[i] != co) i++;
@@ -5264,6 +5325,11 @@ XS_NOINLINE void xs_net_task_ref(int64_t task, bool ref) {
     bool counted = !timer_unref && !co->wwait; /* (a write wait counts it either way) */
     if (ref) { xs_tasks_unref--; if (counted) xs_tasks_live++; xs_exit_hook = xs_tasks_drain; }
     else { xs_tasks_unref++; if (counted) xs_tasks_live--; }
+}
+XS_NOINLINE void xs_net_task_ref(int64_t task, bool ref) {
+    xs_coro *co = (xs_coro *)(intptr_t)task;
+    if (!xs_task_countable(co) || co->unref == !ref) return;
+    xs_task_ref_co(co, ref);
 }
 /* node:dns: lookup through the system resolver (getaddrinfo), as Node's dns.lookup; "" when the name is unknown */
 XS_NOINLINE xs_arr_ref *xs_dns_lookup_all(xs_str *host, int64_t family) {

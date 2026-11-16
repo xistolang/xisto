@@ -7977,7 +7977,18 @@ static const char xs_worker_threads_src[] =
     "export const isMainThread: boolean = wt_is_main();\n"
     "export const workerData: string = wt_data();\n"
     "export const parentPort: MessagePort = wt_port();\n"
-    "export const threadId: int = wt_id();\n";
+    "export const threadId: int = wt_id();\n"
+    "declare function wt_channel_port(peer: MessagePort | null): MessagePort;\n"
+    "/** Two entangled ports in this thread: what one posts, the other's 'message' listener gets (text, bytes or\n"
+    " * shared memory, as with a worker); close() on either ends both. */\n"
+    "export class MessageChannel {\n"
+    "  port1: MessagePort;\n"
+    "  port2: MessagePort;\n"
+    "  constructor() {\n"
+    "    this.port1 = wt_channel_port(null);\n"
+    "    this.port2 = wt_channel_port(this.port1);\n"
+    "  }\n"
+    "}\n";
 /* xisto:os: what a program needs to size its workers */
 /* xisto:v8 (node:v8): the heap's figures and serialize's size, as far as a program reads them (a cache's budget):
    heap_size_limit as V8 sets it by default on 64 bits (a quarter of the memory, at most 4 GiB); serialize gives the
