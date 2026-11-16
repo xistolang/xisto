@@ -1899,6 +1899,7 @@ static void json_emit_read(Buf *b, Type *t, const char *jv, const char *where) {
 
 static void buf_insert(Buf *b, size_t at, const char *text);
 static void emit_class_print(Class *c, const char *fname, const int *ord, int nord);
+static bool clone_plain_print; /* (structuredClone: a class's twin printer, as a plain object) */
 /* the fields of c as a JSON object's members (ord: in that order, NULL: the declaration's) */
 static void json_put_fields(Buf *b, Class *c, const int *ord, int nord) {
     for (int oi = 0; oi < nord; oi++) {
@@ -4047,10 +4048,11 @@ static void emit_expr_raw(Expr *e) {
                 buf_puts(out, "); })");
                 return;
             }
+            bool unplain = prog->uses_clone && !c->builtin && !c->is_interface; /* (a structuredClone copy is a plain object) */
             if (in_hierarchy(c)) {
-                buf_printf(out, "%s((void *)(", isa_fn(c));
+                buf_printf(out, "%s(%s(void *)(", isa_fn(c), unplain ? "xs_unplain((void *)" : "");
                 emit_borrowed(e->lhs);
-                buf_puts(out, "))");
+                buf_puts(out, unplain ? ")))" : "))");
                 return;
             }
             if (c->builtin && strcmp(c->name, "Error") == 0 && !(lt->kind == TY_OBJECT && lt->cls->builtin)) {
@@ -4067,8 +4069,9 @@ static void emit_expr_raw(Expr *e) {
                 buf_puts(out, ")); })");
                 return;
             }
-            buf_puts(out, "xs_is_a(");
+            buf_puts(out, unplain ? "xs_is_a(xs_unplain(" : "xs_is_a(");
             emit_borrowed(e->lhs);
+            if (unplain) buf_puts(out, ")");
             buf_printf(out, ", %s)", strcmp(c->name, "Error") == 0 ? "xs_Error_free" : c->builtin && strcmp(c->name, "Date") == 0 ? "xs_Date_free" :
                        c->builtin && strcmp(c->name, "RegExp") == 0 ? "xs_RegExp_free" :
                        c->builtin && (strcmp(c->name, "Uint8Array") == 0 || strcmp(c->name, "Buffer") == 0) ? "xs_u8_free" :
@@ -13491,7 +13494,7 @@ static void emit_class_print(Class *c, const char *fname, const int *ord, int no
         ord = fk;
     }
     if (!ord) nord = c->nfields;
-    bool plain = c->is_interface || c->fake;
+    bool plain = c->is_interface || c->fake || clone_plain_print;
     buf_printf(out, "static void %s(void *p) {", fname);
     indent++;
     nl();
@@ -14456,7 +14459,8 @@ void emit_program(Program *p, Buf *o) {
     out = o;
     prog = p;
     if (p->uses_this_reg) buf_puts(out, xs_this_reg_c);
-    if (p->uses_clone) buf_puts(out, "static void *xs_structured_clone(void *v);\n");
+    if (p->uses_clone) buf_puts(out, "static void *xs_structured_clone(void *v);\nstatic const char xs_clone_plain[] = \"(a copy)\";\n"
+                                     "static inline void *xs_unplain(void *v) { return v && xs_type_of(v)->fname == xs_clone_plain ? NULL : v; }\n");
     if (p->uses_plain) buf_puts(out, "static bool xs_is_plain(void *v);\n");
     if (p->uses_v8) buf_puts(out, xs_v8_c);
     if (p->uses_unk_map) buf_puts(out, xs_unk_map_c);
@@ -14954,6 +14958,7 @@ void emit_program(Program *p, Buf *o) {
                      "    if (!v) xs_panic(\"TypeError: Cannot convert undefined or null to object\");\n"
                      "    void (*f_)(void *) = xs_type_of(v)->free;\n"
                      "    if (f_ == xs_map_free) return ((xs_map *)v)->record;\n");
+        if (p->uses_clone) buf_puts(&u, "    if (xs_type_of(v)->fname == xs_clone_plain) return true; /* (a class's copy) */\n");
         for (int i = 0; i < p->nclasses; i++) {
             Class *c = p->classes[i];
             if (!c->used || c->builtin || c->nohdr || !c->is_interface) continue;
@@ -14964,59 +14969,107 @@ void emit_program(Program *p, Buf *o) {
         free(u.data);
     }
     if (p->uses_clone) { /* structuredClone: by the value's type at run time; a class's copy takes its fields, each one copied */
+        /* A class's copy is a plain object, as Node's: the same layout and fields under a twin descriptor that prints no
+           class name, is not an instance of the class (xs_unplain) and is a plain object to Object.getPrototypeOf. The
+           twin's fname (a closure's name otherwise) marks it. */
+        for (int i = 0; i < p->nclasses; i++) {
+            Class *c = p->classes[i];
+            if (!c->used || c->builtin || c->nohdr || c->region || c->rdual || c->is_interface || c->fake || c->is_tuple || c->adapter_of || c->cptr) continue;
+            buf_printf(out, "static void %s_cpl_print(void *p);\n", c->cname);
+            buf_printf(out, "static const xs_type XS_TYPE_SEC %s_cpl_type = {%s_free, %s_cpl_print, %s%s, .fname = xs_clone_plain};\n", c->cname, c->cname, c->cname,
+                       class_cyclic(c) ? xs_sprintf("%s_visit", c->cname) : "NULL", dyn_ref(c));
+            clone_plain_print = true;
+            emit_class_print(c, xs_sprintf("%s_cpl_print", c->cname), NULL, 0);
+            clone_plain_print = false;
+        }
         Buf u = {0};
-        buf_puts(&u, "static void *xs_clone_in(void *v);\n");
+        /* the copies made so far, by original (shared references stay shared, a cycle is copied as a cycle); the check
+           walk uses it as the set of objects already looked at */
+        buf_puts(&u, "typedef struct { void **k, **v; size_t n, cap; } xs_clmemo;\n"
+                     "static void **xs_clmemo_slot(xs_clmemo *m, void *k) {\n"
+                     "    size_t h = ((uintptr_t)k >> 4) * 0x9E3779B97F4A7C15ull, i = h & (m->cap - 1);\n"
+                     "    while (m->k[i] && m->k[i] != k) i = (i + 1) & (m->cap - 1);\n"
+                     "    return &m->k[i];\n"
+                     "}\n"
+                     "static void *xs_clmemo_get(xs_clmemo *m, void *k) { if (!m->cap) return NULL; void **s = xs_clmemo_slot(m, k); return *s ? m->v[s - m->k] : NULL; }\n"
+                     "static void xs_clmemo_put(xs_clmemo *m, void *k, void *v) {\n"
+                     "    if ((m->n + 1) * 2 > m->cap) {\n"
+                     "        xs_clmemo o = *m;\n"
+                     "        m->cap = o.cap ? o.cap * 2 : 16; m->n = 0;\n"
+                     "        m->k = calloc(m->cap, sizeof(void *)); m->v = calloc(m->cap, sizeof(void *));\n"
+                     "        for (size_t i = 0; i < o.cap; i++) if (o.k[i]) xs_clmemo_put(m, o.k[i], o.v[i]);\n"
+                     "        free(o.k); free(o.v);\n"
+                     "    }\n"
+                     "    void **s = xs_clmemo_slot(m, k);\n"
+                     "    if (!*s) m->n++;\n"
+                     "    *s = k; m->v[s - m->k] = v;\n"
+                     "}\n"
+                     "static void *xs_clone_in(void *v, xs_clmemo *m);\n"
+                     "XS_NOINLINE void xs_clone_fail(const char *what) {\n"
+                     "    xs_str *m_ = xs_str_new(what, strlen(what));\n"
+                     "    xs_Error *e_ = xs_Error_new(m_);\n"
+                     "    xs_release(m_);\n"
+                     "    xs_release(e_->f_name);\n"
+                     "    e_->f_name = xs_str_new(\"DataCloneError\", 14);\n"
+                     "    xs_throw(e_);\n"
+                     "}\n");
         /* first a walk that only checks (a function, a value of no known kind: DataCloneError before anything is made) */
-        buf_puts(&u, "static void xs_clone_check(void *v, int depth) {\n"
+        buf_puts(&u, "static void xs_clone_check(void *v, int depth, xs_clmemo *seen) {\n"
                      "    if (!v) return;\n"
-                     "    if (depth > 10000) xs_panic(\"DataCloneError: the value holds itself (a cycle) or is too deep\");\n"
+                     "    if (depth > 100000) xs_panic(\"RangeError: Maximum call stack size exceeded\");\n"
                      "    const xs_type *t_ = xs_type_of(v);\n"
-                     "    if (t_->print == xs_print_closure) xs_panic(\"DataCloneError: a function could not be cloned\");\n"
+                     "    if (t_->print == xs_print_closure) xs_clone_fail(\"function could not be cloned.\");\n"
                      "    void (*f_)(void *) = t_->free;\n"
                      "    if (f_ == xs_str_free || f_ == xs_box_int_free || f_ == xs_box_num_free || f_ == xs_box_bool_free || f_ == xs_Date_free ||\n"
                      "        f_ == xs_arr_num_free || f_ == xs_arr_int_free || f_ == xs_arr_bool_free || f_ == xs_arr_nbool_free) return;\n"
-                     "    if (f_ == xs_arr_ref_free) { xs_arr_ref *a_ = v; for (size_t i_ = 0; i_ < a_->len; i_++) xs_clone_check(a_->data[i_], depth + 1); return; }\n"
-                     "    if (f_ == xs_map_free) { xs_map *m_ = v; xs_map_entry *e_; if (m_->val_kind == 3) XS_MAP_EACH(m_, e_) xs_clone_check(e_->val.p, depth + 1); return; }\n");
+                     "    if (xs_clmemo_get(seen, v)) return;\n"
+                     "    xs_clmemo_put(seen, v, v);\n"
+                     "    if (f_ == xs_arr_ref_free) { xs_arr_ref *a_ = v; for (size_t i_ = 0; i_ < a_->len; i_++) xs_clone_check(a_->data[i_], depth + 1, seen); return; }\n"
+                     "    if (f_ == xs_map_free) { xs_map *m_ = v; xs_map_entry *e_; if (m_->val_kind == 3) XS_MAP_EACH(m_, e_) xs_clone_check(e_->val.p, depth + 1, seen); return; }\n");
         for (int i = 0; i < p->nclasses; i++) {
             Class *c = p->classes[i];
             if (!c->used || c->builtin || c->nohdr || c->region || c->rdual) continue;
             buf_printf(&u, "    if (f_ == %s_free) {", c->cname);
             for (int k = 0; k < c->nfields; k++)
-                if (cref(c->fields[k].type)) buf_printf(&u, " xs_clone_check(((%s *)v)->%s, depth + 1);", c->cname, c->fields[k].cname);
+                if (cref(c->fields[k].type)) buf_printf(&u, " xs_clone_check(((%s *)v)->%s, depth + 1, seen);", c->cname, c->fields[k].cname);
             buf_puts(&u, " return; }\n");
         }
-        buf_puts(&u, "    xs_panic(\"DataCloneError: this value could not be cloned\");\n}\n");
+        buf_puts(&u, "    xs_clone_fail(\"object could not be cloned.\");\n}\n");
         for (int i = 0; i < p->nclasses; i++) {
             Class *c = p->classes[i];
             if (!c->used || c->builtin || c->nohdr || c->region || c->rdual) continue;
-            buf_printf(&u, "static void *xs_clone_%s(%s *o) {\n    %s *n = xs_obj_alloc_t(sizeof(%s), xs_type_of(o));\n"
-                           "    memcpy((char *)n + sizeof(xs_hdr), (char *)o + sizeof(xs_hdr), sizeof(%s) - sizeof(xs_hdr));\n",
-                       c->cname, c->cname, c->cname, c->cname, c->cname);
+            bool twin = !(c->is_interface || c->fake || c->is_tuple || c->adapter_of || c->cptr);
+            buf_printf(&u, "static void *xs_clone_%s(%s *o, xs_clmemo *m) {\n    %s *n = xs_obj_alloc_t(sizeof(%s), %s);\n"
+                           "    memcpy((char *)n + sizeof(xs_hdr), (char *)o + sizeof(xs_hdr), sizeof(%s) - sizeof(xs_hdr));\n"
+                           "    xs_clmemo_put(m, o, n);\n",
+                       c->cname, c->cname, c->cname, c->cname, twin ? xs_sprintf("&%s_cpl_type", c->cname) : "xs_type_of(o)", c->cname);
             for (int k = 0; k < c->nfields; k++)
-                if (cref(c->fields[k].type)) buf_printf(&u, "    if (n->%s) n->%s = xs_clone_in(n->%s);\n", c->fields[k].cname, c->fields[k].cname, c->fields[k].cname);
+                if (cref(c->fields[k].type)) buf_printf(&u, "    if (n->%s) n->%s = xs_clone_in(n->%s, m);\n", c->fields[k].cname, c->fields[k].cname, c->fields[k].cname);
             buf_puts(&u, "    return n;\n}\n");
         }
-        buf_puts(&u, "static void *xs_clone_in(void *v) {\n"
+        buf_puts(&u, "static void *xs_clone_in(void *v, xs_clmemo *m) {\n"
                      "    if (!v) return NULL;\n"
                      "    const xs_type *t_ = xs_type_of(v);\n"
-                     "    if (t_->print == xs_print_closure) xs_panic(\"DataCloneError: a function could not be cloned\");\n"
                      "    void (*f_)(void *) = t_->free;\n"
                      "    if (f_ == xs_str_free || f_ == xs_box_int_free || f_ == xs_box_num_free || f_ == xs_box_bool_free) return xs_retain(v); /* (immutable) */\n"
-                     "    if (f_ == xs_Date_free) return xs_date_make(((xs_Date *)v)->t);\n"
-                     "#define XS_CL_ARR_(T, E) if (f_ == T##_free) { T *a_ = v; T *n_ = T##_new((int64_t)a_->len, (E)0); if (a_->len) memcpy(n_->data, a_->data, a_->len * sizeof(E)); return n_; }\n"
+                     "    void *seen_ = xs_clmemo_get(m, v);\n"
+                     "    if (seen_) return xs_retain(seen_);\n"
+                     "    if (f_ == xs_Date_free) { void *n_ = xs_date_make(((xs_Date *)v)->t); xs_clmemo_put(m, v, n_); return n_; }\n"
+                     "#define XS_CL_ARR_(T, E) if (f_ == T##_free) { T *a_ = v; T *n_ = T##_new((int64_t)a_->len, (E)0); if (a_->len) memcpy(n_->data, a_->data, a_->len * sizeof(E)); xs_clmemo_put(m, v, n_); return n_; }\n"
                      "    XS_CL_ARR_(xs_arr_num, double)\n"
                      "    XS_CL_ARR_(xs_arr_int, int64_t)\n"
                      "    XS_CL_ARR_(xs_arr_bool, bool)\n"
                      "    XS_CL_ARR_(xs_arr_nbool, int8_t)\n"
                      "#undef XS_CL_ARR_\n"
-                     "    if (f_ == xs_arr_ref_free) { xs_arr_ref *a_ = v; xs_arr_ref *n_ = xs_arr_ref_new(a_->len, a_->print_elem); for (size_t i_ = 0; i_ < a_->len; i_++) xs_arr_ref_push(n_, xs_clone_in(a_->data[i_])); return n_; }\n"
+                     "    if (f_ == xs_arr_ref_free) { xs_arr_ref *a_ = v; xs_arr_ref *n_ = xs_arr_ref_new(a_->len, a_->print_elem); xs_clmemo_put(m, v, n_); for (size_t i_ = 0; i_ < a_->len; i_++) xs_arr_ref_push(n_, xs_clone_in(a_->data[i_], m)); return n_; }\n"
                      "    if (f_ == xs_map_free) {\n"
                      "        xs_map *m_ = v; xs_map_entry *e_;\n"
                      "        xs_map *n_ = xs_map_new(m_->is_map, m_->str_keys, m_->val_kind, m_->print_key, m_->print_val);\n"
                      "        n_->record = m_->record; n_->ukeys = m_->ukeys;\n"
+                     "        xs_clmemo_put(m, v, n_);\n"
                      "        XS_MAP_EACH(m_, e_) {\n"
                      "            xs_val x_ = e_->val;\n"
-                     "            if (m_->val_kind == 3) x_.p = xs_clone_in(x_.p);\n"
+                     "            if (m_->val_kind == 3) x_.p = xs_clone_in(x_.p, m);\n"
                      "            xs_map_put(n_, m_->str_keys ? e_->skey : NULL, m_->str_keys ? 0 : e_->ikey, x_);\n"
                      "        }\n"
                      "        return n_;\n"
@@ -15024,10 +15077,17 @@ void emit_program(Program *p, Buf *o) {
         for (int i = 0; i < p->nclasses; i++) {
             Class *c = p->classes[i];
             if (!c->used || c->builtin || c->nohdr || c->region || c->rdual) continue;
-            buf_printf(&u, "    if (f_ == %s_free) return xs_clone_%s(v);\n", c->cname, c->cname);
+            buf_printf(&u, "    if (f_ == %s_free) return xs_clone_%s(v, m);\n", c->cname, c->cname);
         }
-        buf_puts(&u, "    xs_panic(\"DataCloneError: this value could not be cloned\");\n    return NULL;\n}\n");
-        buf_puts(&u, "static void *xs_structured_clone(void *v) { xs_clone_check(v, 0); return xs_clone_in(v); }\n");
+        buf_puts(&u, "    xs_clone_fail(\"object could not be cloned.\");\n    return NULL;\n}\n");
+        buf_puts(&u, "static void *xs_structured_clone(void *v) {\n"
+                     "    xs_clmemo m = {0};\n"
+                     "    xs_clone_check(v, 0, &m);\n"
+                     "    free(m.k); free(m.v); m = (xs_clmemo){0};\n"
+                     "    void *n = xs_clone_in(v, &m);\n"
+                     "    free(m.k); free(m.v);\n"
+                     "    return n;\n"
+                     "}\n");
         buf_puts(out, u.data);
         free(u.data);
     }
