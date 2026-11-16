@@ -13,6 +13,8 @@ typedef struct {
     Module *mod;
     const char *prev_end; /* end of the last token consumed: source spans for reflection */
     bool in_gen;          /* inside a generator body: `yield` is a statement */
+    const char *static_base; /* inside a static member of a class that extends Base: `super` reads "super\x03Base" (the
+                                checker: Base's statics, with `this` the class the static was called on) */
     int hp_id;            /* inside a class body: its number, which names its #private members (__hp_<id>_name) apart from a
                              base's or a subclass's members of the same name */
     /* import { setTimeout as sleep }: in the rest of the module the alias reads as the exported name */
@@ -110,6 +112,10 @@ static void next(Parser *p) {
     if (p->nalias && p->tok.kind == TK_IDENT && before != TK_DOT && before != TK_QDOT) /* (o.a: a property, never an import's alias) */
         for (int i = 0; i < p->nalias; i++)
             if (strcmp(p->tok.str, p->alias_from[i]) == 0) { p->tok.str = p->alias_to[i]; break; }
+    if (p->static_base && p->tok.kind == TK_IDENT && !strcmp(p->tok.str, "super")) {
+        p->tok.str = xs_sprintf("super\x03%s", p->static_base);
+        this_alias_used = true; /* (it reads the class the static was called on: copied for a subclass that inherits it) */
+    }
     if (!p->hp_id && p->tok.kind == TK_IDENT && p->tok.len && p->tok.start[0] == '#')
         xs_error(XS8055, p->tok.pos, "read it through a method of the class", "'%.*s' is private to the class that declares it", p->tok.len, p->tok.start);
     if (p->hp_id && p->tok.kind == TK_IDENT && p->tok.len && p->tok.start[0] == '#')
@@ -3940,6 +3946,7 @@ static void parse_fields_body(Parser *p, Class *c) {
         parse_decorators(p, &decos);
         Pos pos = p->tok.pos;
         int mods = skip_modifiers(p);
+        p->static_base = (mods & MOD_STATIC) && c->base_name && !c->mixin_call ? c->base_name : NULL; /* (super in a static member) */
         if ((mods & MOD_ABSTRACT) && !c->is_abstract) xs_error(XS8080, pos, "write abstract class Name", "an abstract member needs an abstract class");
         if ((mods & MOD_STATIC) && c->is_interface) xs_error(XS8109, pos, NULL, "interfaces have no static members");
         if ((mods & MOD_STATIC) && !c->is_interface && at(p, TK_LBRACE)) {
@@ -4293,6 +4300,7 @@ static void parse_fields_body(Parser *p, Class *c) {
     }
     subst_names = sn0; subst_types = st0; nsubst = sk0;
     p->hp_id = hp_was;
+    p->static_base = NULL;
     next(p);
 }
 

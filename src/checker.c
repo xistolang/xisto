@@ -10042,6 +10042,43 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
+        if (e->kind == E_ASSIGN && e->op == TK_ASSIGN && target->kind == E_MEMBER && !target->is_call && target->lhs->kind == E_IDENT &&
+            !strcmp(target->lhs->str, "super") && !lookup("super")) { /* super.x = v with set x(v) in a base: that setter */
+            Class *cc = cur_func && cur_func->cls ? cur_func->cls : cur_class;
+            const char *sn = xs_sprintf("__set_%s", target->str);
+            if (!cc || !cc->base || !find_method(cc->base, sn))
+                xs_error(XS8138, target->pos, "assign this.x, or declare set x(v) in the base class", "super.%s is assigned, and the base class has no setter '%s'", target->str, target->str);
+            Expr *val = e->rhs;
+            e->kind = E_MEMBER;
+            e->lhs = target->lhs;
+            e->str = (char *)sn;
+            e->is_call = true;
+            e->rhs = NULL;
+            e->args = (ExprList){0};
+            expr_list_push(&e->args, val);
+            check_expr(e, NULL);
+            return;
+        }
+        if (e->kind == E_ASSIGN && e->op == TK_ASSIGN && target->kind == E_MEMBER && !target->is_call && target->lhs->kind == E_IDENT &&
+            !lookup(target->lhs->str) && find_class(!strncmp(target->lhs->str, "super\x03", 6) ? target->lhs->str + 6 : target->lhs->str)) {
+            /* Class.x = v with static set x(v) (in a base too): its call (super.x = v in a static member: the base's) */
+            Class *sc = find_class(!strncmp(target->lhs->str, "super\x03", 6) ? target->lhs->str + 6 : target->lhs->str);
+            bool plain = false, setter = false;
+            const char *sn = xs_sprintf("__set_%s", target->str);
+            for (Class *b = sc; b && !b->builtin && !plain && !setter; b = b->base) { plain = has_static(b, target->str); setter = has_static(b, sn); }
+            if (setter) {
+                Expr *val = e->rhs;
+                e->kind = E_MEMBER;
+                e->lhs = target->lhs;
+                e->str = (char *)sn;
+                e->is_call = true;
+                e->rhs = NULL;
+                e->args = (ExprList){0};
+                expr_list_push(&e->args, val);
+                check_expr(e, NULL);
+                return;
+            }
+        }
         const char *path_assigned = NULL; /* o.f = v: the field path, narrowed or not by what v is */
         if (e->kind == E_ASSIGN && target->kind == E_MEMBER && !target->is_call && (rereadable(target->lhs) || e->op == TK_ASSIGN || cast_path(target->lhs)) &&
             !(target->lhs->kind == E_IDENT && !lookup(target->lhs->str))) { /* obj.x = v with set x(v) (not Class.static); (u as C).x = v
@@ -11834,8 +11871,13 @@ static void check_expr_in(Expr *e, Type *expected) {
             return;
         }
         if (e->lhs->kind == E_IDENT && strcmp(e->lhs->str, "super") == 0 && !lookup("super")) { /* super.m(...) */
-            Class *cc = cur_func ? cur_func->cls : NULL;
+            Class *cc = cur_func && cur_func->cls ? cur_func->cls : cur_class;
             if (!cc || !cc->base) xs_error(XS8124, e->pos, NULL, "super is used inside a class that extends another");
+            if (!e->is_call && find_method(cc->base, xs_sprintf("__get_%s", e->str)) && !find_field(cc->base, e->str, NULL)) {
+                e->str = xs_sprintf("__get_%s", e->str); /* super.x with get x() in a base: that getter, not this class's */
+                e->is_call = true;
+                e->args = (ExprList){0};
+            }
             if (!e->is_call || !find_method(cc->base, e->str))
                 xs_error(XS8014, e->pos, xs_sprintf("read fields with this.%s", e->str), "%s has no method '%s'", cc->base->name, e->str);
             Expr *self = xs_alloc(sizeof *self);
@@ -11851,8 +11893,22 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         if (e->lhs->kind == E_IDENT && !lookup(e->lhs->str)) {
             const char *ns = e->lhs->str;
-            Class *sc0 = find_class(ns), *sc = sc0;
+            bool sup = !strncmp(ns, "super\x03", 6); /* super.m() / super.x in a static member (the parser names the base) */
+            Class *sc0 = sup ? static_this_class() : find_class(ns), *sc = sup ? find_class(ns + 6) : sc0;
+            if (sup && (!sc0 || !sc)) xs_error(XS8124, e->pos, NULL, "super is used inside a class that extends another");
             const char *nsq = strchr(ns, '\x01'); /* (ns.C.m with ns's C read as "C\x01m": C__s_m of that import, XB-223) */
+            if (sc && !sc->builtin && !e->is_call && !nsq) { /* Class.x with static get x(): its call (the class's own, or a base's) */
+                bool plain = false, getter = false;
+                const char *gn = xs_sprintf("__get_%s", e->str);
+                for (Class *b = sc; b && !b->builtin && !plain && !getter; b = b->base) { plain = has_static(b, e->str); getter = has_static(b, gn); }
+                if (getter) {
+                    e->str = (char *)gn;
+                    e->is_call = true;
+                    e->args = (ExprList){0};
+                    check_expr(e, expected);
+                    return;
+                }
+            }
             if (sc && !sc->builtin && !has_static(sc, e->str)) /* B.m() with m a static of a base A: A's (JavaScript's prototype chain) */
                 for (Class *b = sc->base; b && !b->builtin; b = b->base) if (has_static(b, e->str)) { sc = b; break; }
             for (int k = 0; sc && !sc->builtin && k < sc->nstatics_user; k++) { /* Class.staticMember */
