@@ -22,14 +22,14 @@ compares every program's output with Node's byte for byte, but expect gaps and b
 
 ## Install
 
-macOS on Apple silicon:
-
 ```sh
 brew install xistolang/tap/xisto
 ```
 
-xisto calls the system C compiler (`clang` from the Xcode Command Line Tools: `xcode-select --install`).
-Linux and Intel Macs: build from source (below).
+macOS on Apple silicon, and Linux x86-64 and ARM64 with [Homebrew on Linux](https://docs.brew.sh/Homebrew-on-Linux).
+xisto calls the system C compiler: `clang` from the Xcode Command Line Tools on macOS (`xcode-select --install`),
+`build-essential` (gcc) or clang on Linux. Linux without Homebrew: the release archives
+([install](https://xisto-lang.org/docs/getting-started/install)). Intel Macs: build from source (below).
 
 ## Use
 
