@@ -7361,7 +7361,7 @@ static inline const uint8_t *xs_memchr(const uint8_t *p, int c, size_t n) {
 #if !defined(_WIN32)
 #include <pthread.h>
 #include <stdatomic.h>
-typedef struct {
+typedef struct xs_rap_job_ {
     uint8_t *d; xs_u8_tr_ctx c; int keep;
     const uint8_t *src, *map; /* phase 2: d[i] = map[src[i]] over [start, end) in ntask pieces */
     int64_t start, end, m, half, blk, nblk, ntask;
@@ -7372,6 +7372,7 @@ typedef struct {
     unsigned char *gdst; int64_t *gcount; /* phase 5: code points of csrc in ntask pieces into gcount; 6: csrc copied to gdst */
     const char *gneedle; size_t gnn; atomic_int_fast64_t gfirst; /* phase 7: the first piece with a hit of gneedle in csrc (gcount: its offset or -1) */
     int phase;
+    void (*task)(struct xs_rap_job_ *j, int64_t t); /* the phase's task: only the tasks a program's calls reach are linked */
     atomic_int_fast64_t next;
     bool publish; atomic_uchar *tdone; atomic_int_fast64_t cont; /* phase 1 in a begun part: the tasks done in order, so the front up to there is final */
 } xs_rap_job;
@@ -7600,10 +7601,7 @@ static void xs_rap_work(xs_rap_job *j) {
     for (;;) {
         int64_t t = atomic_fetch_add(&j->next, 1);
         if (t >= n) break;
-        if (j->phase == 2) xs_map_task(j, t);
-        else if (j->phase == 3 || j->phase == 4) xs_chain_task(j, t);
-        else if (j->phase >= 5 && j->phase <= 7) xs_gen_task(j, t);
-        else xs_rap_task(j, t);
+        j->task(j, t);
     }
 }
 static void *xs_rap_worker(void *arg) {
@@ -7622,8 +7620,9 @@ static void *xs_rap_worker(void *arg) {
     }
     return NULL;
 }
-static void xs_rap_run(xs_rap_job *j, int phase) {
+static void xs_rap_run(xs_rap_job *j, int phase, void (*task)(xs_rap_job *, int64_t)) {
     j->phase = phase;
+    j->task = task;
     atomic_store(&j->next, 0);
     pthread_mutex_lock(&xs_rap_mu);
     xs_rap_cur = j;
@@ -7666,7 +7665,7 @@ XS_NOINLINE bool xs_u8_map_par(xs_Uint8Array *D, xs_Uint8Array *S, xs_Uint8Array
     memset(&j, 0, sizeof j);
     j.d = D->data; j.src = S->data; j.map = T->data; j.start = lo; j.end = hi;
     j.ntask = (int64_t)(xs_rap_nthreads + 1) * 4;
-    xs_rap_run(&j, 2);
+    xs_rap_run(&j, 2, xs_map_task);
     xs_rap_release();
     return true;
 }
@@ -7734,7 +7733,7 @@ XS_NOINLINE bool xs_u8_rev_par(xs_Uint8Array *buf, xs_Uint8Array *table, int64_t
         j.pre = malloc(sizeof(int64_t) * (size_t)(j.nblk + 1));
         if (!j.pre) { xs_rap_release(); return false; }
         j.pre[0] = 0;
-        xs_rap_run(&j, 0);
+        xs_rap_run(&j, 0, xs_rap_task);
         for (int64_t b = 0; b < j.nblk; b++) j.pre[b + 1] += j.pre[b];
         j.m = j.pre[j.nblk];
         if (atomic_load(&j.fw_bad)) j.fw = 0;
@@ -7746,7 +7745,7 @@ XS_NOINLINE bool xs_u8_rev_par(xs_Uint8Array *buf, xs_Uint8Array *table, int64_t
         j.tdone = calloc((size_t)j.ntask, sizeof *j.tdone);
         if (j.tdone) { j.publish = true; xs_lent_publish(j.d + start); }
     }
-    if (j.half > 0) xs_rap_run(&j, 1);
+    if (j.half > 0) xs_rap_run(&j, 1, xs_rap_task);
     free(j.tdone);
     if (j.m & 1) { int64_t p = xs_rap_pos(&j, j.half); j.d[p] = j.c.T[j.d[p]]; }
     free(j.pre);
@@ -7770,7 +7769,7 @@ static bool xs_ulen_par(const unsigned char *d, int64_t n, int64_t *count) {
     j.ntask = (int64_t)(xs_rap_nthreads + 1) * 4;
     j.gcount = malloc(sizeof(int64_t) * (size_t)j.ntask);
     if (!j.gcount) { xs_rap_release(); return false; }
-    xs_rap_run(&j, 5);
+    xs_rap_run(&j, 5, xs_gen_task);
     int64_t c = 0;
     for (int64_t t = 0; t < j.ntask; t++) c += j.gcount[t];
     free(j.gcount);
@@ -7804,7 +7803,7 @@ static bool xs_find_par(const char *h, size_t hn, const char *nd, size_t nn, con
     atomic_store(&j.gfirst, j.ntask);
     j.gcount = malloc(sizeof(int64_t) * (size_t)j.ntask);
     if (!j.gcount) { xs_rap_release(); return false; }
-    xs_rap_run(&j, 7);
+    xs_rap_run(&j, 7, xs_gen_task);
     int64_t f = atomic_load(&j.gfirst);
     *hit = f < j.ntask ? h + j.gcount[f] : NULL;
     free(j.gcount);
@@ -7822,7 +7821,7 @@ static bool xs_copy_par(unsigned char *dst, const unsigned char *src, int64_t n)
     memset(&j, 0, sizeof j);
     j.csrc = src; j.gdst = dst; j.start = 0; j.end = n;
     j.ntask = (int64_t)(xs_rap_nthreads + 1) * 4;
-    xs_rap_run(&j, 6);
+    xs_rap_run(&j, 6, xs_gen_task);
     xs_rap_release();
     return true;
 }
@@ -7841,9 +7840,9 @@ static bool xs_str_chain_par(const unsigned char *p, int64_t len, unsigned char 
     j.ckept = malloc(sizeof(int64_t) * (size_t)(j.ntask + 1));
     if (!j.ckept) { xs_rap_release(); return false; }
     j.ckept[0] = 0;
-    xs_rap_run(&j, 3);
+    xs_rap_run(&j, 3, xs_chain_task);
     for (int64_t t = 0; t < j.ntask; t++) j.ckept[t + 1] += j.ckept[t];
-    xs_rap_run(&j, 4);
+    xs_rap_run(&j, 4, xs_chain_task);
     *written = j.ckept[j.ntask];
     free(j.ckept);
     xs_rap_release();

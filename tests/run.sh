@@ -313,6 +313,19 @@ for backend in "" "--backend=qbe"; do
         pass=$((pass+1)); echo "size budget ok ($backend): $a vs $b bytes"
     fi
 done
+# lean binary: what the program does not use is not linked (tests/size/lean.ts)
+if sel lean; then
+    lean_ok=1
+    if [ "$(uname)" = Darwin ]; then lean_gc="-Wl,-dead_strip"; else lean_gc="-ffunction-sections -fdata-sections -Wl,--gc-sections"; fi
+    if ! $XISTO emit tests/size/lean.ts > "$OUT/lean.c" 2> /dev/null || ! cc -std=c11 -O1 -w $lean_gc -o "$OUT/lean" "$OUT/lean.c" -lm -lpthread > /dev/null 2>&1; then
+        echo "FAIL lean: build failed"; lean_ok=0
+    elif [ "$("$OUT/lean")" != "$(node tests/size/lean.ts)" ]; then echo "FAIL lean: output differs from node"; lean_ok=0
+    else
+        # the parallel runtime's tasks are reached only by the calls that run them (xs_rap_run's task argument)
+        if nm "$OUT/lean" | grep -E 'xs_(chain_pass|map_task|rap_task|chain_task)$' > /dev/null; then echo "FAIL lean: a parallel task is linked"; lean_ok=0; fi
+    fi
+    if [ $lean_ok = 1 ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
+fi
 # runtime budget (XB-250): Date, bytes, bigint and an imported module's unused timers/fetch/async/try cost no event loop
 if ! sel rt-lean; then :; elif $XISTO emit tests/ok/rt-lean.ts > "$OUT/rt-lean.c" 2>&1 && ! grep -q 'Xisto network runtime' "$OUT/rt-lean.c" \
    && ! grep -q '^#define XS_THREADS' "$OUT/rt-lean.c" && ! sed -n '/^\/\* ---- program ---- \*\//,$p' "$OUT/rt-lean.c" | grep -q 'xs_cln_'; then
