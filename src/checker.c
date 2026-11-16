@@ -16517,6 +16517,17 @@ static const char **ii_cnames; static Expr **ii_cinit; static int ii_cn; /* cons
 /* let end = a.indexOf(x); if (end < 0) end = a.length: an integer when its start and every assignment are */
 static const char **ii_lnames; static Expr **ii_linit; static int ii_ln;
 static Stmt *ii_body; /* the function being inferred */
+/* every declaration of a name in the function (parameters too): a name declared twice (in two blocks, or a parameter
+   of a closure) is an int by its form only when no declaration of it says otherwise */
+typedef struct { const char *name; Stmt *s; Type *t; const void *key; } IIDecl;
+static IIDecl *ii_decls; static int ii_dn;
+static void ii_decl(const char *name, Stmt *s, Type *t, const void *key) {
+    if (!name) return;
+    for (int i = 0; i < ii_dn; i++) /* (seen already: a closure's parameter, seen from the function around it first) */
+        if (ii_decls[i].key == key) { if (t) ii_decls[i].t = t; return; }
+    ii_decls = realloc(ii_decls, sizeof(IIDecl) * (size_t)(ii_dn + 1));
+    ii_decls[ii_dn++] = (IIDecl){name, s, t, key};
+}
 static bool ii_stmt_ok(Stmt *s, const char *self);
 static int ii_depth;
 static bool ii_in(const char **l, int n, const char *s) { for (int i = 0; i < n; i++) if (strcmp(l[i], s) == 0) return true; return false; }
@@ -16525,8 +16536,31 @@ static void ii_typed(const char *name, Type *t) {
     if (t->kind == TY_INT) { ii_tnames = realloc(ii_tnames, sizeof(char *) * (size_t)(ii_tn + 1)); ii_tnames[ii_tn++] = name; }
     else if (t->kind == TY_ARRAY && t->elem && t->elem->kind == TY_INT) { ii_anames = realloc(ii_anames, sizeof(char *) * (size_t)(ii_an + 1)); ii_anames[ii_an++] = name; }
 }
+/* the declarations inside closures (their parameters too): what ii_expr_ok reaches when it reads their bodies */
+static void ii_decls_s(Stmt *s);
+static void ii_decls_e(Expr *e) {
+    if (!e) return;
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) {
+        Func *f = e->arrow->fn;
+        for (int i = 0; i < f->nparams; i++) ii_decl(f->params[i].name, NULL, f->params[i].type, &f->params[i]);
+        ii_decls_s(f->body);
+    }
+    ii_decls_e(e->lhs); ii_decls_e(e->rhs);
+    for (int i = 0; i < e->args.len; i++) ii_decls_e(e->args.items[i]);
+}
+static void ii_decls_s(Stmt *s) {
+    if (!s) return;
+    if ((s->kind == S_VAR || s->kind == S_FOROF) && s->name) ii_decl(s->name, s, NULL, s);
+    ii_decls_e(s->init); ii_decls_e(s->expr); ii_decls_e(s->cond); ii_decls_e(s->for_update);
+    ii_decls_s(s->for_init); ii_decls_s(s->body); ii_decls_s(s->else_body);
+    for (int i = 0; i < s->stmts.len; i++) ii_decls_s(s->stmts.items[i]);
+    for (int i = 0; i < s->ncases; i++) { ii_decls_e(s->cases[i].value); ii_decls_s(s->cases[i].body); }
+}
 static void ii_scan(Stmt *s) {
     if (!s) return;
+    if ((s->kind == S_VAR || s->kind == S_FOROF) && s->name) ii_decl(s->name, s, NULL, s);
+    ii_decls_e(s->init); ii_decls_e(s->expr); ii_decls_e(s->cond); ii_decls_e(s->for_update);
+    for (int i = 0; i < s->ncases; i++) ii_decls_e(s->cases[i].value);
     if ((s->kind == S_VAR || s->kind == S_FOROF) && s->decl_type) ii_typed(s->name, s->decl_type);
     if (s->kind == S_FOROF && !s->decl_type && s->name && s->expr && s->expr->kind == E_IDENT && s->expr->str && ii_in(ii_anames, ii_an, s->expr->str))
         ii_typed(s->name, ty_int); /* for (const x of a) with a: int[]: x is an int, as a[i] is (XB-210) */
@@ -16543,9 +16577,9 @@ static void ii_scan(Stmt *s) {
     for (int i = 0; i < s->ncases; i++) ii_scan(s->cases[i].body);
 }
 static void ii_enter(Func *f, bool reset) {
-    if (reset) ii_tn = ii_an = ii_cn = ii_ln = 0;
+    if (reset) ii_tn = ii_an = ii_cn = ii_ln = ii_dn = 0;
     ii_body = f->body;
-    for (int i = 0; i < f->nparams; i++) ii_typed(f->params[i].name, f->params[i].type);
+    for (int i = 0; i < f->nparams; i++) { ii_typed(f->params[i].name, f->params[i].type); ii_decl(f->params[i].name, NULL, f->params[i].type, &f->params[i]); }
     ii_scan(f->body);
 }
 /* XB-088: modular state (an LCG, a hash): `last = (last * A + C) % M`. A product is no int by its form (it can pass
@@ -16642,13 +16676,45 @@ static double ii_bound(Expr *e, const char *self) { /* |e| at most this, or -1 *
     if (e->kind == E_BINARY && e->op == TK_PERCENT) { double k = ii_mod_k(e); return k > 0 ? k : -1; }
     return -1;
 }
+static bool ii_candidate(Stmt *s);
+static bool ii_cand_off(Stmt *v);
+static bool int_shaped(Expr *e, const char *self);
+/* a name declared more than once in the function where one of its declarations is not an int (arr: not an int[]) by
+   its form: { const j = 1; t += j; } { const j = xs[0]; t += j; } leaves t a number */
+static bool ii_conflict(const char *name, bool arr) {
+    int n = 0;
+    for (int i = 0; i < ii_dn; i++) if (strcmp(ii_decls[i].name, name) == 0) n++;
+    if (n < 2) return false;
+    for (int i = 0; i < ii_dn; i++) {
+        IIDecl *d = &ii_decls[i];
+        if (strcmp(d->name, name) != 0) continue;
+        Type *t = d->s ? d->s->decl_type : d->t;
+        if (t) {
+            if (arr ? !(t->kind == TY_ARRAY && t->elem && t->elem->kind == TY_INT) : t->kind != TY_INT) return true;
+            continue;
+        }
+        if (!d->s || arr) return true; /* (a parameter typed by its context; an array not declared int[]) */
+        Stmt *v = d->s;
+        if (ii_depth > 8) return true;
+        bool ok;
+        ii_depth++;
+        if (v->kind == S_FOROF) ok = v->expr && v->expr->kind == E_IDENT && v->expr->str && ii_in(ii_anames, ii_an, v->expr->str) && !ii_conflict(v->expr->str, true);
+        else if (ii_candidate(v)) ok = !ii_cand_off(v);
+        else ok = v->init && int_shaped(v->init, name) && (v->is_const || !ii_body || ii_stmt_ok(ii_body, name));
+        ii_depth--;
+        if (!ok) return true;
+    }
+    return false;
+}
 static bool int_shaped(Expr *e, const char *self) {
     if (!e) return false;
     switch (e->kind) {
     case E_NUMBER: return e->is_int_lit;
     case E_IDENT:
         if (!e->str) return false;
-        if (strcmp(e->str, self) == 0 || ii_known(e->str) || ii_in(ii_tnames, ii_tn, e->str)) return true;
+        if (strcmp(e->str, self) == 0) return true;
+        if (ii_conflict(e->str, false)) return false;
+        if (ii_known(e->str) || ii_in(ii_tnames, ii_tn, e->str)) return true;
         for (int i = ii_cn - 1; i >= 0; i--)
             if (strcmp(ii_cnames[i], e->str) == 0) {
                 if (ii_depth > 8) return false;
@@ -16662,7 +16728,7 @@ static bool int_shaped(Expr *e, const char *self) {
                 return r;
             }
         return false;
-    case E_INDEX: return e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && ii_in(ii_anames, ii_an, e->lhs->str);
+    case E_INDEX: return e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && ii_in(ii_anames, ii_an, e->lhs->str) && !ii_conflict(e->lhs->str, true);
     case E_MEMBER: /* (not x.length: it can be a getter of the program's own that gives a number, and the
                       types are not known yet here; i < a.length is a comparison, not an assignment, and is fine) */
         if (!e->is_call) { /* x.length: an int on a string, an array, a typed array; unless the program has a
@@ -16787,6 +16853,11 @@ static void infer_ints(Stmt *s) {
    they are declared and however deep. */
 typedef struct { Stmt *v; StmtList *list; int idx; Stmt *loop; bool on; } IICand;
 static IICand *iic; static int iicn, iicap;
+static bool ii_fix_on; /* (deciding a function's candidates together: iic holds them) */
+static bool ii_cand_off(Stmt *v) { /* a candidate found not to be an int (so far) */
+    if (ii_fix_on) for (int c = 0; c < iicn; c++) if (iic[c].v == v) return !iic[c].on;
+    return false;
+}
 static void ii_collect(Stmt *s) {
     if (!s) return;
     if (s->kind == S_FOR && ii_candidate(s->for_init)) {
@@ -16810,6 +16881,7 @@ static void infer_ints_fn(Stmt *body) {
     iicn = 0;
     ii_collect(body);
     int base = ii_n;
+    ii_fix_on = true;
     for (bool changed = true; changed;) {
         changed = false;
         ii_n = base;
@@ -16823,13 +16895,14 @@ static void infer_ints_fn(Stmt *body) {
             if (!ok) { k->on = false; changed = true; }
         }
     }
+    ii_fix_on = false;
     ii_n = base;
     for (int c = 0; c < iicn; c++) ii_mark(iic[c].v, iic[c].on);
 }
 
 /* top-level `let`s are globals: functions may assign them too */
 static void infer_ints_top(Program *p) {
-    ii_tn = ii_an = ii_cn = 0; /* the top level's typed names and consts (const lim = Math.max(1, n)), as in a function */
+    ii_tn = ii_an = ii_cn = ii_dn = 0; /* the top level's typed names and consts (const lim = Math.max(1, n)), as in a function */
     for (int i = 0; i < p->top.len; i++) ii_scan(p->top.items[i]);
     for (int i = 0; i < p->top.len; i++) {
         Stmt *v = p->top.items[i];
@@ -18771,6 +18844,7 @@ static Type *fret(Func *f, Pos pos) {
     II_SAVE(ii_anames, ii_an, const char *)
     II_SAVE(ii_lnames, ii_ln, const char *)
     II_SAVE(ii_cnames, ii_cn, const char *)
+    II_SAVE(ii_decls, ii_dn, IIDecl)
     Expr **cinit_s = ii_cn_s ? xs_alloc(sizeof(Expr *) * (size_t)ii_cn_s) : NULL; if (ii_cn_s) memcpy(cinit_s, ii_cinit, sizeof(Expr *) * (size_t)ii_cn_s);
     Expr **linit_s = ii_ln_s ? xs_alloc(sizeof(Expr *) * (size_t)ii_ln_s) : NULL; if (ii_ln_s) memcpy(linit_s, ii_linit, sizeof(Expr *) * (size_t)ii_ln_s);
     jmp_buf *outer = xs_error_recover;
@@ -18792,6 +18866,7 @@ static Type *fret(Func *f, Pos pos) {
     II_BACK(ii_anames, ii_an, const char *)
     II_BACK(ii_lnames, ii_ln, const char *)
     II_BACK(ii_cnames, ii_cn, const char *)
+    II_BACK(ii_decls, ii_dn, IIDecl)
     if (ii_cn_s) { ii_cinit = realloc(ii_cinit, sizeof(Expr *) * (size_t)ii_cn_s); memcpy(ii_cinit, cinit_s, sizeof(Expr *) * (size_t)ii_cn_s); }
     if (ii_ln_s) { ii_linit = realloc(ii_linit, sizeof(Expr *) * (size_t)ii_ln_s); memcpy(ii_linit, linit_s, sizeof(Expr *) * (size_t)ii_ln_s); }
     if (!ok || !f->ret || f->ret_failed) { /* its body had an error (reported there): what uses it stops quietly */
