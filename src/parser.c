@@ -8407,10 +8407,12 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
     }
     { /* Node's modules written in xisto over runtime functions (runtime/node/NAME.ts, NODE_TS in the Makefile) */
         extern const unsigned char xs_node_events_ts[], xs_node_process_ts[], xs_node_http_ts[], xs_node_net_ts[], xs_node_dns_ts[], xs_node_child_process_ts[], xs_node_https_ts[], xs_node_tls_ts[], xs_node_diagnostics_channel_ts[], xs_node_buffer_ts[], xs_node_util_ts[], xs_node_querystring_ts[], xs_node_string_decoder_ts[], xs_node_zlib_ts[], xs_node_stream_ts[], xs_node_stream_promises_ts[], xs_node_stream_web_ts[];
+        extern const unsigned char xs_node_path_posix_ts[], xs_node_path_win32_ts[];
         extern const unsigned char xs_node_tty_ts[], xs_node_readline_ts[], xs_node_readline_promises_ts[];
         extern const unsigned char xs_node_console_ts[], xs_node_perf_hooks_ts[], xs_node_assert_ts[], xs_node_assert_strict_ts[], xs_node_test_ts[];
         static const struct { const char *name; const unsigned char *src; bool net; bool tls; } node_ts[] = {
             {"events", xs_node_events_ts, false},
+            {"path/posix", xs_node_path_posix_ts, false}, {"path/win32", xs_node_path_win32_ts, false},
             {"process", xs_node_process_ts, true}, /* (signals and the exit hook live with the event loop) */
             {"http", xs_node_http_ts, true},
             {"https", xs_node_https_ts, true, true},
@@ -8492,7 +8494,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         prog->uses_okmap = true;
         return m;
     }
-    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:stream, xisto:stream/promises, xisto:stream/web, xisto:buffer, xisto:util, xisto:querystring, xisto:string_decoder, xisto:zlib, xisto:timers, xisto:http, xisto:https, xisto:tls, xisto:diagnostics_channel, xisto:net, xisto:dns, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random, xisto:profiler, xisto:assert, xisto:assert/strict, xisto:test", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:path/posix, xisto:path/win32, xisto:events, xisto:stream, xisto:stream/promises, xisto:stream/web, xisto:buffer, xisto:util, xisto:querystring, xisto:string_decoder, xisto:zlib, xisto:timers, xisto:http, xisto:https, xisto:tls, xisto:diagnostics_channel, xisto:net, xisto:dns, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random, xisto:profiler, xisto:assert, xisto:assert/strict, xisto:test", "unknown built-in module '%s'", spec);
     return NULL;
 }
 
