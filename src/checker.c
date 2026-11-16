@@ -4020,6 +4020,7 @@ static Expr *bv_ident(Pos pos, const char *name) {
     return id;
 }
 typedef Expr *(*BoundCall)(Pos pos, Expr **bound, int nb, ExprList *own, void *ctx);
+static Func *bound_method; /* (method_value with nothing bound but the object: Arrow.mv_method) */
 static void bound_closure(Expr *e, Expr **xs, Type **xts, int nx, Type **ps, int np, bool rest, Type *ret, bool is_async, BoundCall mk, void *ctx) {
     Pos pos = e->pos;
     static int nbound; /* (names of their own: one of these may be made inside another's arguments) */
@@ -4057,6 +4058,8 @@ static void bound_closure(Expr *e, Expr **xs, Type **xts, int nx, Type **ps, int
     in->body = ib;
     Arrow *ia = xs_alloc(sizeof *ia);
     ia->pos = pos; ia->fn = in; ia->expr_body = ret->kind != TY_VOID;
+    if (bound_method && nx == 1) ia->mv_method = bound_method;
+    bound_method = NULL;
     Expr *inner = xs_alloc(sizeof *inner);
     inner->kind = E_ARROW; inner->pos = pos; inner->field = -1; inner->arrow = ia;
     Func *out = xs_alloc(sizeof *out);
@@ -4132,11 +4135,12 @@ static void bound_args(Expr *e, Expr *recv, Type *rt, Type **ps, int nps, bool r
 /* recv.m as a value (recv checked, of class c), with the arguments partial bound first (f.bind(recv, ...partial)):
    a closure bound to recv. JavaScript reads a method unbound (calling it alone loses `this`); bound here, a program
    that is correct in JavaScript does the same, and one that would lose `this` keeps it */
-static void method_value(Expr *e, Expr *recv, Type *rt, Func *m, Expr **partial, int npartial) {
+static void method_value(Expr *e, Expr *recv, Type *rt, Func *m, Expr **partial, int npartial, bool bind) {
     if (m->ntparams) xs_error(XS8049, e->pos, xs_sprintf("wrap it: (x: Type) => obj.%s(x)", m->name), "the generic method '%s' is not a value", m->name);
     Type **mps = xs_alloc(sizeof(Type *) * (size_t)(m->nparams + 1));
     for (int i = 0; i < m->nparams; i++) mps[i] = m->params[i].type;
     bool mrest = m->nparams && m->params[m->nparams - 1].rest;
+    bound_method = npartial == 0 && !bind ? m : NULL; /* (o.m.bind(o) is a new function each time, as in JavaScript) */
     bound_args(e, recv, rt, mps, m->nparams, mrest, partial, npartial, fret(m, e->pos), m->is_async || m->ret_promise, m->name);
 }
 /* f.bind(thisArg, ...partial) on a function value (thisArg is not used: an arrow's and a function's own this is not
@@ -4169,7 +4173,7 @@ static bool fn_member(Expr *e, Type *expected) {
     if (x->kind == E_IDENT) {
         Binding *b = lookup(x->str);
         if (b ? !(b->type && b->type->kind == TY_FUNC) : !lookup_func(x->str)) return false;
-        if (isapply && e->args.len == 2 && b && b->type->rest) return false; /* (original.apply(this, args): XB-107's __xs_apply) */
+        if ((iscall || (isapply && e->args.len == 2)) && b && b->type->rest) return false; /* (original.call(this, ...args), original.apply(this, args): XB-107's __xs_apply) */
     } else if (x->kind == E_MEMBER && !x->is_call && x->lhs && x->str) {
         if (x->lhs->kind == E_IDENT && !lookup(x->lhs->str)) {
             Class *sc = find_class(x->lhs->str); /* Class.staticMethod */
@@ -4210,7 +4214,7 @@ static bool fn_member(Expr *e, Type *expected) {
                         if (pt) expect_type(e->args.items[i], pt, "a bound argument");
                         e->args.items[i]->prechecked = true;
                     }
-                    method_value(e, recv, ty_object_of(mc), m, e->args.items + 1, e->args.len - 1);
+                    method_value(e, recv, ty_object_of(mc), m, e->args.items + 1, e->args.len - 1, true);
                     return true;
                 }
                 /* o.m.call(t, a, b) / o.m.apply(t, [a, b]): t.m(a, b) */
@@ -7967,7 +7971,7 @@ static void check_object_member_in(Expr *e, Class *c) {
         check_access(m->access, m->cls, prop_name(m->name), e->pos);
         Expr *recv = e->lhs;
         recv->prechecked = true;
-        method_value(e, recv, recv->type, m, NULL, 0);
+        method_value(e, recv, recv->type, m, NULL, 0, false);
         return;
     }
     if (!c->builtin) check_access(m->access, m->cls, prop_name(m->name), e->pos);

@@ -378,6 +378,8 @@ struct Arrow {
     Type *gen_in;      /* <T>(xs: T[], ...) => ...: its parameters as written (Type.gen_in) */
     Type *gen_sig;     /* async <T>(sql: string): Promise<T | null> => ...: its signature as written (Type.gen_sig); the body
                           reads T as unknown */
+    Func *mv_method;   /* o.m read as a value (checker: method_value): the method m. Its closures are one function for ===
+                          (their origin, xs_fn_origin), as o.m and p.m of one class are in JavaScript */
 };
 
 typedef enum { S_VAR, S_EXPR, S_IF, S_WHILE, S_FOR, S_RETURN, S_BLOCK, S_SWITCH, S_BREAK, S_CONTINUE, S_FOROF, S_TRY, S_THROW, S_YIELD } StmtKind;

@@ -3652,6 +3652,21 @@ static void emit_expr_raw(Expr *e) {
                 origin_fn = xs_sprintf("%s_origin", f->cname);
             }
         }
+        if (a->mv_method && !strcmp(origin_fn, "NULL")) {
+            /* o.m as a value: its origin is one immortal function per method, so o.m === o.m and o.m === p.m (one
+               function of the class in JavaScript), and emitter.off(e, this.onX) finds what on(e, this.onX) added */
+            Func *m = a->mv_method;
+            bool have = false;
+            for (int i = 0; i < ntramps; i++) if (strcmp(tramp_names[i], xs_sprintf("%s_mvo", m->cname)) == 0) have = true;
+            if (!have) {
+                tramp_names = realloc(tramp_names, sizeof(char *) * (size_t)(ntramps + 1));
+                tramp_names[ntramps++] = xs_sprintf("%s_mvo", m->cname);
+                buf_printf(&tramp_fns, "static xs_closure %s_mvo = {{XS_IMMORTAL, 0}, NULL};\n", m->cname);
+                buf_printf(&tramp_fns, "static const xs_type XS_TYPE_SEC %s_mvotype = {NULL, xs_print_closure%s};\n", m->cname, fn_label(m, m->name));
+            }
+            buf_printf(out, "static void *%s_origin(void *p) { (void)p; return xs_cl_static_t(&%s_mvo, &%s_mvotype); }\n", f->cname, m->cname, m->cname);
+            origin_fn = xs_sprintf("%s_origin", f->cname);
+        }
         buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, xs_print_closure, %s%s%s};\n", f->cname, f->cname,
                    env_cyc ? xs_sprintf("%s_visit", f->cname) : "NULL",
                    strcmp(origin_fn, "NULL") ? xs_sprintf(", .origin = %s", origin_fn) : "", /* (no adapter: the C as before) */
