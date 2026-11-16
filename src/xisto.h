@@ -744,6 +744,7 @@ struct Module {
                              the declaration `import x from "m"` reads as x */
     bool loading, loaded;
     bool builtin;      /* "node:fs" and friends: functions provided by the runtime */
+    bool pkg;          /* a package's module (XISTO_PKGS, .xisto/pkgs, or imported by one): not the program's own code */
     bool missing;      /* xisto check: a module that could not be loaded (reported); its imported names are not reported again */
     bool dyn_target;   /* named by an import("...") somewhere: xs_lazy_m<id>() runs its top level (once; nothing when it ran at start) */
     bool lazy;         /* (emit) reached only through import(): its top level waits for the first import() */

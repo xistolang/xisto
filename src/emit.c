@@ -377,10 +377,17 @@ static bool pulls_loop(Func *f) {
     f->pulls_loop = r ? 1 : 2;
     return r;
 }
+/* a package's function that runs once (Func.once: every call runs once; loops of its own allowed): compiled for size
+   on its own (XS_RUN_ONCE), as the program's run-once code is; the program's own functions with loops (a kernel
+   called once) keep -O3 */
+static bool pkg_once(Func *f) {
+    Module *m = f->mod ? f->mod : f->cls ? f->cls->mod : NULL;
+    return f->once && m && m->pkg && !getenv("XISTO_PKG_O3");
+}
 static bool inlined_once(Func *f) {
     if (getenv("XISTO_NO_TRACE")) return false;
     if (f->ncalls != 1 || !f->call1 || f->is_async || !f->body || stmt_has_try(f->body) || f->virt_target || f->is_gen) return false;
-    if (f->run_once && !pulls_loop(f)) return false; /* (code that runs once is compiled for size, on its own: XS_RUN_ONCE;
+    if ((f->run_once && !pulls_loop(f)) || pkg_once(f)) return false; /* (code that runs once is compiled for size, on its own: XS_RUN_ONCE;
                                                           not when a function with a loop is inlined into it) */
     /* not recursive, directly or through other functions inlined into their only caller */
     int steps = 0; /* (a cycle among its callers that does not reach f: two functions that only call each other) */
@@ -12321,7 +12328,7 @@ static void prof_inl_note(int site, Func *callee, bool inlined) {
 }
 
 static void emit_signature(Func *f) {
-    if (f->run_once && strcmp(fn_storage(f), "XS_FA") != 0 && strcmp(fn_storage(f), "XS_FII") != 0) buf_puts(out, "XS_RUN_ONCE "); /* (always_inline wins) */
+    if ((f->run_once || pkg_once(f)) && strcmp(fn_storage(f), "XS_FA") != 0 && strcmp(fn_storage(f), "XS_FII") != 0) buf_puts(out, "XS_RUN_ONCE "); /* (always_inline wins) */
     prof_fn_note(f, f->cname, fn_storage(f));
     if (f->is_ctor) {
         buf_printf(out, "%s %s *%s(", fn_storage(f), f->cls->cname, f->cname);

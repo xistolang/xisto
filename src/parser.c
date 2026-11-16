@@ -8370,6 +8370,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
 /* Resolves "./x" or "./x.ts" relative to the importing file, loads it once, dependencies first. */
 static Module *load_module(Program *prog, const char *file, Pos from_pos, const char *from_file) {
     char path[PATH_MAX];
+    bool via_pkg = false; /* a package's (XISTO_PKGS, .xisto/pkgs): code that runs once there is compiled for size */
     pending_prefix = NULL;
     if (from_file && (strncmp(file, "node:", 5) == 0 || strncmp(file, "xisto:", 6) == 0 || strcmp(file, "fs") == 0 || strcmp(file, "sqlite") == 0))
         return load_builtin_module(prog, file, from_pos);
@@ -8384,6 +8385,7 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
     } else if (alias) {
         snprintf(path, sizeof path, "%s", alias);
     } else if (from_file) {
+        via_pkg = file[0] != '/';
         /* a package: <project>/.xisto/pkgs/<name>/, entry from its xisto.json "main", else index.ts or src/index.ts.
            A deep import ("rxjs/operators", "@scope/pkg/sub/file") is the file <package>/<sub>(.ts, or its index.ts),
            as Node resolves a subpath of a package without "exports" */
@@ -8483,6 +8485,9 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
         }
     }
     Module *m = xs_alloc(sizeof *m);
+    m->pkg = via_pkg;
+    for (int i = 0; i < prog->nmodules && from_file && !m->pkg; i++) /* (a module of a package's own) */
+        if (prog->modules[i]->pkg && !strcmp(prog->modules[i]->path, from_file)) m->pkg = true;
     m->native_prefix = (char *)pending_prefix;
     pending_prefix = NULL;
     m->path = xs_strndup(real, strlen(real));
