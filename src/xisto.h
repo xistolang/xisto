@@ -536,6 +536,9 @@ struct Func {
     bool run_once;     /* straight-line code called only from code that runs once: not optimized (build time) */
     int8_t pulls_loop; /* emitter: 0 unknown, 1 a function with a loop is inlined into it (inlined_once), 2 not */
     bool once;         /* called only from calls that run once (it may have loops of its own): its calls outside loops run once */
+    int fold_ncalls;   /* fold.c: its calls in the program (1000 more if it is also a value, a dispatched method...) */
+    struct Expr *fold_call; /* ... the first one */
+    bool fold_seen;    /* fold.c: reached from the top level */
     bool escapes;      /* used as a value or dispatched: who calls it, and how often, is not known */
     /* generic functions and methods (function f<T>(x: T): T): a template, instantiated per list of types */
     char **tparams;
@@ -600,6 +603,7 @@ struct Class {
     bool is_default;   /* export default class X, or export default X; of a class declared here */
     bool used;
     bool made;         /* prune.c: an object of it can exist (new, a literal, a decoder) */
+    bool fold_seen;    /* fold.c: an object of it is made in reached code (its field initializers counted) */
     bool printable;    /* emitter (find_printable): console.log & co can print an object of it; else its print function is empty */
     Field *fields;
     int nfields, cap_fields;
@@ -829,6 +833,8 @@ extern bool region_allow_dual; /* set before region_compute: dual classes allowe
 extern int region_count;
 /* stackalloc.c: objects that cannot outlive the call making them (Stmt.on_stack, Class.stack_at) */
 void stack_compute(Program *p, bool (*cyclic)(Class *));
+/* fold.c: the literal arguments of a function called once, read as literals in its body (before prune.c) */
+void fold_program(Program *p);
 void emit_program(Program *p, Buf *out);
 void emit_program_qbe(Program *p, Buf *out);
 

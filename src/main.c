@@ -471,6 +471,7 @@ static Buf compile_to_c(const char *path) {
     double t1 = now_ms();
     check_program(p);
     double t2 = now_ms();
+    fold_program(p);
     prune_program(p);
     double t3 = now_ms();
     /* functions nobody can reach and nobody else can import */

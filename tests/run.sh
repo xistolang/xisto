@@ -327,6 +327,9 @@ if sel lean; then
         if grep -E 'f[0-9]+_check_k[0-9]+' "$OUT/lean.c" > /dev/null; then echo "FAIL lean: a call that runs once has its own copy of the function"; lean_ok=0; fi
         # new RangeError(m) without decorators: no ClassInfo (xisto:reflect) for the error classes (parser.c, class_decorated)
         if grep -q 'ClassInfo' "$OUT/lean.c"; then echo "FAIL lean: an error class carries reflection metadata"; lean_ok=0; fi
+        # literal arguments of a function called once decide its branches when compiling (src/fold.c): the
+        # percent branch of tests/ok/fold-literal-args.ts, which its literal options do not take, is not compiled
+        if $XISTO emit tests/ok/fold-literal-args.ts 2> /dev/null | grep -q 'xs_str_immortal("%"'; then echo "FAIL lean: a branch literal arguments rule out was compiled"; lean_ok=0; fi
         # Opts is never printed: its print function is empty (emit.c, find_printable; tests/ok/print-reach.ts prints through other types)
         if ! grep -E 'static void c[0-9]+_Opts_print\(void \*p\) \{ \(void\)p; \}' "$OUT/lean.c" > /dev/null; then echo "FAIL lean: a class nothing prints has its print function"; lean_ok=0; fi
     fi
