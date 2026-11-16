@@ -1741,12 +1741,16 @@ static inline void xs_rd_free(void *p) { free(*(void **)p); }
 XS_ARRAY(double, xs_arr_num)
 XS_ARRAY(int64_t, xs_arr_int)
 XS_ARRAY(bool, xs_arr_bool)
+/* (boolean | null)[]: a byte per element, 0, 1 or the null sentinel XS_NULL_BOOL (as a boolean | null variable) */
+XS_ARRAY(int8_t, xs_arr_nbool)
 #define xs_at_num xs_at_xs_arr_num
 #define xs_at_int xs_at_xs_arr_int
 #define xs_at_bool xs_at_xs_arr_bool
 #define xs_at_num_s xs_at_xs_arr_num_s
 #define xs_at_int_s xs_at_xs_arr_int_s
 #define xs_at_bool_s xs_at_xs_arr_bool_s
+#define xs_at_nbool xs_at_xs_arr_nbool
+#define xs_at_nbool_s xs_at_xs_arr_nbool_s
 
 /* Arrays of strings and objects: the array owns one reference per element. */
 typedef struct xs_arr_ref { xs_hdr hdr; size_t len; void **data; size_t cap; void (*print_elem)(void *); } xs_arr_ref;
@@ -3207,7 +3211,7 @@ static const char *xs_dyn_what(void *v) {
     if (t->free == xs_box_int_free || t->free == xs_box_num_free) return "a number";
     if (t->free == xs_box_bool_free) return "a boolean";
     if (t->free == xs_map_free) return "a Map";
-    if (t->free == xs_arr_ref_free || t->free == xs_arr_num_free || t->free == xs_arr_int_free || t->free == xs_arr_bool_free) return "an array";
+    if (t->free == xs_arr_ref_free || t->free == xs_arr_num_free || t->free == xs_arr_int_free || t->free == xs_arr_bool_free || t->free == xs_arr_nbool_free) return "an array";
     if (t->print == xs_print_closure) return "a function";
     return "an object";
 }
@@ -3285,6 +3289,7 @@ XS_NOINLINE void *xs_dyn_get(void *o, xs_str *k) {
         if (t->free == xs_arr_num_free) return xs_box_int((int64_t)((xs_arr_num *)o)->len);
         if (t->free == xs_arr_int_free) return xs_box_int((int64_t)((xs_arr_int *)o)->len);
         if (t->free == xs_arr_bool_free) return xs_box_int((int64_t)((xs_arr_bool *)o)->len);
+        if (t->free == xs_arr_nbool_free) return xs_box_int((int64_t)((xs_arr_nbool *)o)->len);
     }
     return NULL; /* (undefined, as above) */
 }
@@ -3298,6 +3303,7 @@ XS_NOINLINE void *xs_dyn_at(void *o, int64_t i) {
     if (t->free == xs_arr_num_free) { xs_arr_num *a = o; return i >= 0 && (size_t)i < a->len ? xs_box_num(a->data[i]) : NULL; }
     if (t->free == xs_arr_int_free) { xs_arr_int *a = o; return i >= 0 && (size_t)i < a->len ? xs_box_int(a->data[i]) : NULL; }
     if (t->free == xs_arr_bool_free) { xs_arr_bool *a = o; return i >= 0 && (size_t)i < a->len ? xs_box_bool(a->data[i]) : NULL; }
+    if (t->free == xs_arr_nbool_free) { xs_arr_nbool *a = o; return i >= 0 && (size_t)i < a->len ? xs_box_bool_or_null(a->data[i]) : NULL; }
     xs_str *k = xs_str_from_int(i);
     void *r = xs_dyn_get(o, k);
     xs_release(k);
@@ -3585,6 +3591,7 @@ XS_NOINLINE void *xs_dyn_add(void *a, void *b) {
 XS_ARR_CALLBACKS(xs_arr_num, double, XS_ID)
 XS_ARR_CALLBACKS(xs_arr_int, int64_t, XS_ID)
 XS_ARR_CALLBACKS(xs_arr_bool, bool, XS_ID)
+XS_ARR_CALLBACKS(xs_arr_nbool, int8_t, XS_ID)
 /* reference arrays: xs_arr_ref_new takes (cap, printer) and pushes take ownership */
 XS_NOINLINE void xs_arr_forEach_xs_arr_ref(xs_arr_ref *a, xs_closure *cl, int arity) {
     for (size_t i = 0; i < a->len; i++) {
@@ -3647,35 +3654,43 @@ static xs_arr_ref *xs_arr_slice_xs_arr_ref(xs_arr_ref *a, int64_t start, int64_t
 #define xs_arr_forEach_num xs_arr_forEach_xs_arr_num
 #define xs_arr_forEach_int xs_arr_forEach_xs_arr_int
 #define xs_arr_forEach_bool xs_arr_forEach_xs_arr_bool
+#define xs_arr_forEach_nbool xs_arr_forEach_xs_arr_nbool
 #define xs_arr_forEach_ref xs_arr_forEach_xs_arr_ref
 #define xs_arr_filter_num xs_arr_filter_xs_arr_num
 #define xs_arr_filter_int xs_arr_filter_xs_arr_int
 #define xs_arr_filter_bool xs_arr_filter_xs_arr_bool
+#define xs_arr_filter_nbool xs_arr_filter_xs_arr_nbool
 #define xs_arr_filter_ref xs_arr_filter_xs_arr_ref
 #define xs_arr_findIndex_num xs_arr_findIndex_xs_arr_num
 #define xs_arr_findIndex_int xs_arr_findIndex_xs_arr_int
 #define xs_arr_findIndex_bool xs_arr_findIndex_xs_arr_bool
+#define xs_arr_findIndex_nbool xs_arr_findIndex_xs_arr_nbool
 #define xs_arr_findIndex_ref xs_arr_findIndex_xs_arr_ref
 #define xs_arr_find_ref xs_arr_find_xs_arr_ref
 #define xs_arr_some_num xs_arr_some_xs_arr_num
 #define xs_arr_some_int xs_arr_some_xs_arr_int
 #define xs_arr_some_bool xs_arr_some_xs_arr_bool
+#define xs_arr_some_nbool xs_arr_some_xs_arr_nbool
 #define xs_arr_some_ref xs_arr_some_xs_arr_ref
 #define xs_arr_every_num xs_arr_every_xs_arr_num
 #define xs_arr_every_int xs_arr_every_xs_arr_int
 #define xs_arr_every_bool xs_arr_every_xs_arr_bool
+#define xs_arr_every_nbool xs_arr_every_xs_arr_nbool
 #define xs_arr_every_ref xs_arr_every_xs_arr_ref
 #define xs_arr_sort_num xs_arr_sort_xs_arr_num
 #define xs_arr_sort_int xs_arr_sort_xs_arr_int
 #define xs_arr_sort_bool xs_arr_sort_xs_arr_bool
+#define xs_arr_sort_nbool xs_arr_sort_xs_arr_nbool
 #define xs_arr_sort_ref xs_arr_sort_xs_arr_ref
 #define xs_arr_reverse_num xs_arr_reverse_xs_arr_num
 #define xs_arr_reverse_int xs_arr_reverse_xs_arr_int
 #define xs_arr_reverse_bool xs_arr_reverse_xs_arr_bool
+#define xs_arr_reverse_nbool xs_arr_reverse_xs_arr_nbool
 #define xs_arr_reverse_ref xs_arr_reverse_xs_arr_ref
 #define xs_arr_slice_num xs_arr_slice_xs_arr_num
 #define xs_arr_slice_int xs_arr_slice_xs_arr_int
 #define xs_arr_slice_bool xs_arr_slice_xs_arr_bool
+#define xs_arr_slice_nbool xs_arr_slice_xs_arr_nbool
 #define xs_arr_slice_ref xs_arr_slice_xs_arr_ref
 
 /* map: from any kind to any kind */
@@ -3693,16 +3708,19 @@ static xs_arr_ref *xs_arr_slice_xs_arr_ref(xs_arr_ref *a, int64_t start, int64_t
     XS_ARR_MAP(from, FT, xs_arr_num, double, xs_arr_num_new(0, 0), xs_arr_num_push, fsfx, num)             \
     XS_ARR_MAP(from, FT, xs_arr_int, int64_t, xs_arr_int_new(0, 0), xs_arr_int_push, fsfx, int)            \
     XS_ARR_MAP(from, FT, xs_arr_bool, bool, xs_arr_bool_new(0, false), xs_arr_bool_push, fsfx, bool)       \
+    XS_ARR_MAP(from, FT, xs_arr_nbool, int8_t, xs_arr_nbool_new(0, 0), xs_arr_nbool_push, fsfx, nbool)     \
     XS_ARR_MAP(from, FT, xs_arr_ref, void *, xs_arr_ref_new(a->len, pr), xs_arr_ref_push, fsfx, ref)
 XS_MAP_ALL_TO(xs_arr_num, double, num)
 XS_MAP_ALL_TO(xs_arr_int, int64_t, int)
 XS_MAP_ALL_TO(xs_arr_bool, bool, bool)
+XS_MAP_ALL_TO(xs_arr_nbool, int8_t, nbool)
 XS_MAP_ALL_TO(xs_arr_ref, void *, ref)
 /* (`bool` is a macro of <stdbool.h>: the names pasted with it came out as _Bool; the emitter writes bool) */
 #define xs_arr_map_bool_num xs_arr_map__Bool_num
 #define xs_arr_map_bool_int xs_arr_map__Bool_int
 #define xs_arr_map_bool_bool xs_arr_map__Bool_bool
 #define xs_arr_map_bool_ref xs_arr_map__Bool_ref
+#define xs_arr_map_bool_nbool xs_arr_map__Bool_nbool
 
 /* indexOf / join by value */
 static int64_t xs_arr_index_of_num(xs_arr_num *a, double v) {
@@ -3715,6 +3733,7 @@ static int64_t xs_arr_index_of_num(xs_arr_num *a, double v) {
 }
 static int64_t xs_arr_index_of_int(xs_arr_int *a, int64_t v) { for (size_t i = 0; i < a->len; i++) if (a->data[i] == v) return (int64_t)i; return -1; }
 static int64_t xs_arr_index_of_bool(xs_arr_bool *a, bool v) { for (size_t i = 0; i < a->len; i++) if (a->data[i] == v) return (int64_t)i; return -1; }
+static int64_t xs_arr_index_of_nbool(xs_arr_nbool *a, int8_t v) { for (size_t i = 0; i < a->len; i++) if (a->data[i] == v) return (int64_t)i; return -1; }
 /* strings by content; in a (string | null)[] null matches null */
 /* (unknown[]).includes(v) / indexOf(v): === as JavaScript's (strings and boxed numbers by value, objects by identity) */
 XS_NOINLINE int64_t xs_arr_index_of_ref(xs_arr_ref *a, void *v) {
@@ -3743,6 +3762,8 @@ static void xs_join_str(xs_sb *b, void *ctx, size_t i) { xs_str *s = ((xs_arr_re
 static xs_str *xs_arr_join_num(xs_arr_num *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_num, a); }
 static xs_str *xs_arr_join_int(xs_arr_int *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_int, a); }
 static xs_str *xs_arr_join_bool(xs_arr_bool *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_bool, a); }
+static void xs_join_nbool(xs_sb *b, void *ctx, size_t i) { int8_t v = ((xs_arr_nbool *)ctx)->data[i]; if (v != XS_NULL_BOOL) xs_sb_bool(b, v != 0); } /* (null: "", as JavaScript's join) */
+static xs_str *xs_arr_join_nbool(xs_arr_nbool *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_nbool, a); }
 static xs_str *xs_arr_join_str(xs_arr_ref *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_str, a); }
 /* an unknown[] / any[] (or another array of references): each value as String(x), null as "" (JavaScript's join) */
 static void xs_join_ref(xs_sb *b, void *ctx, size_t i) {
@@ -4505,7 +4526,7 @@ XS_NOINLINE xs_jv *xs_json_obj(xs_jv *v, const char *where) { if (v->kind != XJ_
 XS_NOINLINE bool xs_is_array(void *v) {
     if (!v) return false;
     void (*f)(void *) = xs_type_of(v)->free;
-    return f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free;
+    return f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free || f == xs_arr_nbool_free;
 }
 /* a < b on strings: by their characters (UTF-8 bytes order as code points do) */
 /* a.localeCompare(b): the order of ICU's root collation for Latin text, as Node gives it by default: first the
@@ -4619,6 +4640,7 @@ static void xs_sb_num(xs_sb *b, double v) {
 }
 static void xs_sb_int(xs_sb *b, int64_t v) { char buf[24]; size_t n = xs_itoa(v, buf); xs_sb_put(b, buf, n); }
 static void xs_sb_bool(xs_sb *b, bool v) { xs_sb_puts(b, v ? "true" : "false"); }
+static void xs_sb_bool_or_null_(xs_sb *b, int8_t v) { xs_sb_puts(b, v == XS_NULL_BOOL ? "null" : v ? "true" : "false"); } /* ((boolean | null)[]) */
 static void xs_sb_str(xs_sb *b, xs_str *s) {
     xs_sb_put(b, "\"", 1);
     for (int64_t i = 0; i < s->len; i++) {
@@ -4859,6 +4881,9 @@ static void xs_print_int_or_null_(int64_t v) { if (v == XS_NULL_INT) fputs("null
     }
 XS_PRINT_ARRAY_N(xs_print_arr_num_n, xs_arr_num, xs_print_num_or_null_)
 XS_PRINT_ARRAY_N(xs_print_arr_int_n, xs_arr_int, xs_print_int_or_null_)
+static void xs_print_bool_or_null_(int8_t v) { if (v == XS_NULL_BOOL) fputs("null", XS_OUT); else xs_print_bool(v != 0); }
+XS_PRINT_ARRAY(xs_arr_nbool, xs_print_bool_or_null_, false)
+#define xs_print_arr_nbool xs_print_xs_arr_nbool
 
 /* ---- internal indicators ----
    Built with --profile, every function counts calls and time; the table goes to stderr at exit.
@@ -7929,7 +7954,7 @@ XS_NOINLINE int64_t xs_util_kind(void *v) {
     if (f == xs_str_free) return 1;
     if (f == xs_box_num_free || f == xs_box_int_free) return 2;
     if (f == xs_box_bool_free) return 3;
-    if (f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free) return 4;
+    if (f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free || f == xs_arr_nbool_free) return 4;
     if (f == xs_map_free) { xs_map *m = v; return m->record ? 20 : m->is_map ? 5 : 6; }
     if (f == xs_Date_free) return 7;
     if (f == xs_Error_free) return 9;
@@ -7985,10 +8010,11 @@ static xs_uv xs_uv_arr_at(void *a, size_t i) {
     if (f == xs_arr_ref_free) return xs_uv_ref(((xs_arr_ref *)a)->data[i]);
     if (f == xs_arr_num_free) { double d = ((xs_arr_num *)a)->data[i]; if (xs_isnull_num(d)) return u; u.k = 1; u.d = d; return u; }
     if (f == xs_arr_int_free) { int64_t x = ((xs_arr_int *)a)->data[i]; if (x == XS_NULL_INT) return u; u.k = 1; u.d = (double)x; return u; }
+    if (f == xs_arr_nbool_free) { int8_t x = ((xs_arr_nbool *)a)->data[i]; if (x == XS_NULL_BOOL) return u; u.k = 2; u.d = x; return u; }
     u.k = 2; u.d = ((xs_arr_bool *)a)->data[i];
     return u;
 }
-static bool xs_is_arr(void (*f)(void *)) { return f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free; }
+static bool xs_is_arr(void (*f)(void *)) { return f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free || f == xs_arr_nbool_free; }
 /* the own enumerable keys of a plain object (an interface's object: its fields, an optional one left out not
    counted; a Record: its entries) and the value under a key; false when the object has no such key */
 static int64_t xs_plain_count(void *o) {

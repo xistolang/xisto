@@ -3291,8 +3291,9 @@ static Binding *declare(Pos pos, const char *name, Type *type, bool is_const, bo
 /* ---------- helpers ---------- */
 
 static bool is_numeric(Type *t) { return t->kind == TY_NUMBER || t->kind == TY_INT; }
-/* (number | null)[] / (int | null)[]: a number[] / int[] holding the null sentinel (XB-136) */
-static bool nullnum_elem(Type *t) { return t->kind == TY_NULLABLE && !ty_is_heap(t->elem) && is_numeric(t->elem); }
+/* (number | null)[] / (int | null)[]: a number[] / int[] holding the null sentinel (XB-136); (boolean | null)[]: a byte
+   per element, with the boolean's null sentinel (XB-150) */
+static bool nullnum_elem(Type *t) { return t->kind == TY_NULLABLE && !ty_is_heap(t->elem) && (is_numeric(t->elem) || t->elem->kind == TY_BOOLEAN); }
 
 static void check_type_supported(Pos pos, Type *t) {
     if (t->kind == TY_ARRAY && (t->elem->kind == TY_VOID || (t->elem->kind == TY_NULLABLE && !ty_is_heap(t->elem) && !nullnum_elem(t->elem))))
@@ -17869,8 +17870,20 @@ static void fake_object(Expr *e, Class *t) {
         bool dup = false;
         for (int j = 0; j < a->nmethods; j++) if (!strcmp(a->methods[j]->name, tm->name)) dup = true;
         if (dup) continue;
-        bool given = false;
-        for (int i = 0; i < e->args.len; i++) if (!strcmp(e->keys[i], tm->name)) given = true;
+        bool given = false, takes_this = false;
+        for (int i = 0; i < e->args.len; i++)
+            if (!strcmp(e->keys[i], tm->name)) {
+                given = true;
+                /* { m() { this.n } }: a method of the literal that names `this` (the parser's function (this: any) prologue,
+                   const __selfiN = __xs_this_take() as any): `this` is the object, typed as the target, set by the call */
+                Expr *fv = e->args.items[i];
+                Stmt *s0 = fv->kind == E_ARROW && fv->arrow->fn->body && fv->arrow->fn->body->stmts.len ? fv->arrow->fn->body->stmts.items[0] : NULL;
+                if (s0 && s0->kind == S_VAR && s0->name && !strncmp(s0->name, "__selfi", 7) && s0->init && s0->init->kind == E_AS) {
+                    s0->decl_type = ty_object_of(t);
+                    s0->init->elem_type = ty_object_of(t);
+                    takes_this = true;
+                }
+            }
         Func *f = xs_alloc(sizeof *f);
         f->name = tm->name; f->pos = pos; f->mod = cur_mod; f->cls = a;
         f->params = xs_alloc(sizeof(Param) * (size_t)(tm->nparams + 1));
@@ -17896,6 +17909,16 @@ static void fake_object(Expr *e, Class *t) {
             Expr *call = xs_alloc(sizeof *call);
             call->kind = E_CALL; call->pos = pos; call->field = -1; call->lhs = mem;
             for (int q = 0; q < tm->nparams; q++) expr_list_push(&call->args, ad_ident(pos, f->params[q].name));
+            if (takes_this) { /* __xs_this_set(this); then the call */
+                Expr *ts = xs_alloc(sizeof *ts);
+                ts->kind = E_CALL; ts->pos = pos; ts->field = -1; ts->lhs = ad_ident(pos, "__xs_this_set");
+                Expr *self2 = xs_alloc(sizeof *self2);
+                self2->kind = E_THIS; self2->pos = pos; self2->field = -1;
+                expr_list_push(&ts->args, self2);
+                Stmt *s0 = xs_alloc(sizeof *s0);
+                s0->kind = S_EXPR; s0->pos = pos; s0->expr = ts;
+                f->body = ad_block(pos, s0);
+            }
             if (!tm->ret || tm->ret->kind == TY_VOID) { s1->kind = S_EXPR; s1->expr = call; }
             else {
                 Expr *v = call;
@@ -17915,7 +17938,8 @@ static void fake_object(Expr *e, Class *t) {
             expr_list_push(&ne->args, str_lit(pos, tm->name));
             s1->kind = S_THROW; s1->expr = ne;
         }
-        f->body = ad_block(pos, s1);
+        if (f->body) stmt_list_push(&f->body->stmts, s1);
+        else f->body = ad_block(pos, s1);
         a->methods = realloc(a->methods, sizeof(Func *) * (size_t)(a->nmethods + 1));
         a->methods[a->nmethods++] = f;
     }

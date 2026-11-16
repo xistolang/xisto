@@ -63,6 +63,9 @@ static char *not_null(Type *t, const char *expr) {
 static bool int_like(Type *t) { return t->kind == TY_INT || (t->kind == TY_ENUM && !t->en->is_string); }
 /* the element type that picks an array's C struct: (number | null)[] and (int | null)[] are number[] and int[]
    holding the null sentinel (xs_null_num / XS_NULL_INT), as a T | null variable does */
+/* (boolean | null)[]: a byte per element with the null sentinel XS_NULL_BOOL (xs_arr_nbool), as a boolean | null
+   variable holds it */
+static bool nbool_elem(Type *elem) { return elem->kind == TY_NULLABLE && elem->elem->kind == TY_BOOLEAN; }
 static Type *arr_ek(Type *elem) {
     if (elem->kind == TY_NULLABLE && (elem->elem->kind == TY_NUMBER || int_like(elem->elem))) return elem->elem;
     return elem;
@@ -853,7 +856,7 @@ static const char *ctype(Type *t) {
     case TY_BOOLEAN: return "bool";
     case TY_STRING: return "xs_str *";
     case TY_VOID: return "void";
-    case TY_ARRAY: return arr_ek(t->elem)->kind == TY_NUMBER ? "xs_arr_num *" : int_like(arr_ek(t->elem)) ? "xs_arr_int *" : t->elem->kind == TY_BOOLEAN ? "xs_arr_bool *" : "xs_arr_ref *";
+    case TY_ARRAY: return arr_ek(t->elem)->kind == TY_NUMBER ? "xs_arr_num *" : int_like(arr_ek(t->elem)) ? "xs_arr_int *" : t->elem->kind == TY_BOOLEAN ? "xs_arr_bool *" : nbool_elem(t->elem) ? "xs_arr_nbool *" : "xs_arr_ref *";
     case TY_OBJECT: return xs_sprintf("%s *", t->cls->cname);
     case TY_FUNC: return "xs_closure *";
     case TY_ENUM: return t->en->is_string ? "xs_str *" : "int64_t";
@@ -899,7 +902,7 @@ static Buf tramp_fns;     /* trampolines turning top-level functions into closur
 static int ntramps;
 static char **tramp_names;
 
-static const char *arr_suffix(Type *arr) { return arr_ek(arr->elem)->kind == TY_NUMBER ? "num" : int_like(arr_ek(arr->elem)) ? "int" : arr->elem->kind == TY_BOOLEAN ? "bool" : "ref"; }
+static const char *arr_suffix(Type *arr) { return arr_ek(arr->elem)->kind == TY_NUMBER ? "num" : int_like(arr_ek(arr->elem)) ? "int" : arr->elem->kind == TY_BOOLEAN ? "bool" : nbool_elem(arr->elem) ? "nbool" : "ref"; }
 static bool arr_is_ref(Type *arr) { return cref(arr->elem); }
 /* console.log of an array: (number | null)[] and (int | null)[] print their nulls as null */
 static const char *arr_print_suffix(Type *arr) {
@@ -933,7 +936,7 @@ static const char *cell_struct(Type *t) {
     buf_printf(&cell_fns, "static %s *%s_new(void) { return xs_obj_alloc_t(sizeof(%s), &%s_type); }\n", n.data, n.data, n.data, n.data);
     return n.data;
 }
-static const char *arr_struct(Type *arr) { return arr_is_ref(arr) ? "xs_arr_ref" : arr_ek(arr->elem)->kind == TY_NUMBER ? "xs_arr_num" : int_like(arr_ek(arr->elem)) ? "xs_arr_int" : "xs_arr_bool"; }
+static const char *arr_struct(Type *arr) { return arr_is_ref(arr) ? "xs_arr_ref" : arr_ek(arr->elem)->kind == TY_NUMBER ? "xs_arr_num" : int_like(arr_ek(arr->elem)) ? "xs_arr_int" : nbool_elem(arr->elem) ? "xs_arr_nbool" : "xs_arr_bool"; }
 static const char *elem_printer(Type *elem) {
     if (elem->kind == TY_NULLABLE) /* (T | null)[]: null prints as null */
         return elem->elem->kind == TY_STRING || (elem->elem->kind == TY_ENUM && elem->elem->en->is_string) ? "xs_print_str_quoted_or_null_" : "xs_print_obj_or_null";
@@ -1752,6 +1755,35 @@ static void emit_print_arg(Expr *a) {
 
 static Buf json_fns;          /* generated helper functions, placed before the program */
 static Buf json_protos;       /* their prototypes, placed before all of them (a helper may call one made later) */
+/* XB-169: JavaScript keeps an object's keys in the order they were made, so an object literal of an interface prints
+   and serializes in the literal's order, not the declaration's. A literal whose order differs gets a descriptor of its
+   own (C_oN_type: the class's free, a print in that order), set in its header; JSON.stringify of C checks for those
+   descriptors only in a program that has one, so other classes write as before */
+typedef struct { Class *c; int *ord; int n; } LitOrd;
+static LitOrd *lit_ords;
+static int nlit_ords;
+static int lit_order(Class *c, Expr *e) {
+    if (!c || c->builtin || c->is_tuple || c->nohdr || c->region || c->rdual || c->cptr || c->adapter_of || c->fake || !e->keys || c->nfields < 2) return -1;
+    int *ord = xs_alloc(sizeof(int) * (size_t)c->nfields), n = 0;
+    bool *seen = xs_alloc(sizeof(bool) * (size_t)c->nfields);
+    for (int i = 0; i < e->args.len; i++)
+        for (int k = 0; k < c->nfields; k++)
+            if (!seen[k] && !strcmp(c->fields[k].name, e->keys[i])) { seen[k] = true; ord[n++] = k; break; }
+    for (int k = 0; k < c->nfields; k++) if (!seen[k]) ord[n++] = k; /* (keys set later: after the literal's, as JavaScript adds them) */
+    bool same = true;
+    for (int k = 0; k < n; k++) if (ord[k] != k) same = false;
+    if (same) return -1;
+    for (int i = 0; i < nlit_ords; i++)
+        if (lit_ords[i].c == c && !memcmp(lit_ords[i].ord, ord, sizeof(int) * (size_t)n)) return i;
+    lit_ords = realloc(lit_ords, sizeof(LitOrd) * (size_t)(nlit_ords + 1));
+    lit_ords[nlit_ords] = (LitOrd){c, ord, n};
+    return nlit_ords++;
+}
+static const char *lit_ord_name(int i) {
+    int k = 0;
+    for (int j = 0; j < i; j++) if (lit_ords[j].c == lit_ords[i].c) k++;
+    return xs_sprintf("%s_o%d", lit_ords[i].c->cname, k);
+}
 static Type **json_types;     /* types that already have helpers */
 static int njson, cap_json;
 
@@ -1859,6 +1891,63 @@ static void json_emit_read(Buf *b, Type *t, const char *jv, const char *where) {
     }
 }
 
+static void buf_insert(Buf *b, size_t at, const char *text);
+static void emit_class_print(Class *c, const char *fname, const int *ord, int nord);
+/* the fields of c as a JSON object's members (ord: in that order, NULL: the declaration's) */
+static void json_put_fields(Buf *b, Class *c, const int *ord, int nord) {
+    for (int oi = 0; oi < nord; oi++) {
+        Field *f = &c->fields[ord ? ord[oi] : oi];
+        if (ty_is_undef(f->type)) continue; /* r: undefined: JSON.stringify leaves it out */
+        if (json_fn_field(f->type)) continue; /* a function: left out, as JSON.stringify does */
+        /* optional fields that are null are left out, like undefined in JSON.stringify (and a value that is a function) */
+        bool may_fn = json_may_fn(f->type);
+        if (f->optional || may_fn) {
+            const char *v = xs_sprintf("o->%s", f->cname);
+            buf_printf(b, "    if (%s && %s) {\n", f->optional ? not_null(f->type, v) : "true",
+                       may_fn ? xs_sprintf("!xs_is_closure(%s)", v) : "true");
+        }
+        buf_printf(b, "    if (!first_) xs_sb_put(sb, \",\", 1);\n    first_ = false;\n    xs_sb_put(sb, \"\\\"%s\\\":\", %zu);\n    ", f->name, strlen(f->name) + 3);
+        /* (x?: unknown is unknown, which holds null already: no nullable wrapper around it) */
+        Type *ft = f->optional && f->type->kind == TY_NULLABLE ? f->type->elem : f->type;
+        json_emit_value(b, ft, f->optional && ft->kind == TY_BOOLEAN && f->type->kind == TY_NULLABLE ? xs_sprintf("(bool)o->%s", f->cname) : xs_sprintf("o->%s", f->cname));
+        buf_puts(b, "\n");
+        if (f->optional || may_fn) buf_puts(b, "    }\n");
+    }
+}
+/* the JSON writers of the classes some object literal orders its own way (lit_order): each order its writer, and
+   C's writer hands such an object to it (at the marker ensure_json leaves) */
+static void json_fill_orders(Buf *fns, Buf *protos) {
+    for (int ci = 0; ci < nlit_ords; ci++) {
+        Class *c = lit_ords[ci].c;
+        bool first = true;
+        for (int j = 0; j < ci; j++) if (lit_ords[j].c == c) first = false;
+        if (!first) continue;
+        const char *mark = xs_sprintf("    /*@XSORD %s@*/\n", c->cname);
+        char *at = fns->data ? strstr(fns->data, mark) : NULL;
+        if (!at) continue;
+        Buf disp = {0}, defs = {0};
+        for (int i = ci; i < nlit_ords; i++) {
+            if (lit_ords[i].c != c) continue;
+            const char *on = lit_ord_name(i);
+            buf_printf(&disp, "    if (xs_type_of(o) == &%s_type) { json_put_%s(sb, o); return; }\n", on, on);
+            buf_printf(protos, "static void json_put_%s(xs_sb *sb, %s *o);\n", on, c->cname);
+            buf_printf(&defs, "static void json_put_%s(xs_sb *sb, %s *o) {\n    xs_sb_put(sb, \"{\", 1);\n    bool first_ = true; (void)first_;\n", on, c->cname);
+            json_put_fields(&defs, c, lit_ords[i].ord, lit_ords[i].n);
+            buf_puts(&defs, "    xs_sb_put(sb, \"}\", 1);\n}\n");
+        }
+        size_t off = (size_t)(at - fns->data);
+        memmove(fns->data + off, fns->data + off + strlen(mark), fns->len - off - strlen(mark) + 1);
+        fns->len -= strlen(mark);
+        buf_insert(fns, off, disp.data);
+        buf_puts(fns, defs.data);
+    }
+    /* (the markers of classes without such literals: nothing) */
+    for (char *at; fns->data && (at = strstr(fns->data, "    /*@XSORD ")) != NULL;) {
+        char *e = strstr(at, "@*/\n") + 4;
+        memmove(at, e, strlen(e) + 1);
+        fns->len -= (size_t)(e - at);
+    }
+}
 static void ensure_json(Type *t) {
     for (int i = 0; i < njson; i++) if (ty_equal(json_types[i], t)) return;
     { /* two types the checker keeps apart can share a tag (and so a C function name): one set of helpers */
@@ -1940,25 +2029,9 @@ static void ensure_json(Type *t) {
                        type_tag(ty_object_of(src)), a->cname, a->fields[0].cname);
         }
     }
+    if (!tj) buf_printf(b, "    /*@XSORD %s@*/\n", c->cname); /* (json_fill_orders) */
     buf_puts(b, "    xs_sb_put(sb, \"{\", 1);\n    bool first_ = true; (void)first_;\n");
-    for (int i = 0; i < c->nfields; i++) {
-        Field *f = &c->fields[i];
-        if (ty_is_undef(f->type)) continue; /* r: undefined: JSON.stringify leaves it out */
-        if (json_fn_field(f->type)) continue; /* a function: left out, as JSON.stringify does */
-        /* optional fields that are null are left out, like undefined in JSON.stringify (and a value that is a function) */
-        bool may_fn = json_may_fn(f->type);
-        if (f->optional || may_fn) {
-            const char *v = xs_sprintf("o->%s", f->cname);
-            buf_printf(b, "    if (%s && %s) {\n", f->optional ? not_null(f->type, v) : "true",
-                       may_fn ? xs_sprintf("!xs_is_closure(%s)", v) : "true");
-        }
-        buf_printf(b, "    if (!first_) xs_sb_put(sb, \",\", 1);\n    first_ = false;\n    xs_sb_put(sb, \"\\\"%s\\\":\", %zu);\n    ", f->name, strlen(f->name) + 3);
-        /* (x?: unknown is unknown, which holds null already: no nullable wrapper around it) */
-        Type *ft = f->optional && f->type->kind == TY_NULLABLE ? f->type->elem : f->type;
-        json_emit_value(b, ft, f->optional && ft->kind == TY_BOOLEAN && f->type->kind == TY_NULLABLE ? xs_sprintf("(bool)o->%s", f->cname) : xs_sprintf("o->%s", f->cname));
-        buf_puts(b, "\n");
-        if (f->optional || may_fn) buf_puts(b, "    }\n");
-    }
+    json_put_fields(b, c, NULL, c->nfields);
     buf_puts(b, tj ? "    xs_sb_put(sb, \"}\", 1);\n    }\n}\n" : "    xs_sb_put(sb, \"}\", 1);\n}\n");
     /* parse: allocate the object without running the constructor, then fill every field from the JSON */
     buf_printf(b, "static %s *json_get_%s(xs_jv *v, const char *where) {\n", c->cname, tag);
@@ -2931,6 +3004,24 @@ static const char *dyn_isa(Program *p, Type *t, Buf *fns) {
     free(body.data);
     return name;
 }
+/* one field's entry in a class's table for `any` (emit_dyn_tables) */
+static void dyn_field_entry(Program *p, Class *c, Field *f, Buf *tabs_, Buf *fns_) {
+    Buf *tabs = tabs_, *fns = fns_;
+    Type *t = f->type;
+    bool nul = t->kind == TY_NULLABLE;
+    Type *b = nul ? t->elem : t;
+    const char *kind, *isa = NULL;
+    if (b->kind == TY_NUMBER) kind = nul ? "XD_NNUM" : "XD_NUM";
+    else if (int_like(b) || b->kind == TY_LITINT) kind = nul ? "XD_NINT" : "XD_INT";
+    else if (b->kind == TY_BOOLEAN) kind = nul ? "XD_NBOOL" : "XD_BOOL";
+    else if (b->kind == TY_STRING || b->kind == TY_ENUM) kind = "XD_STR";
+    else if (b->kind == TY_UNKNOWN || b->kind == TY_UNION) kind = "XD_ANY";
+    else { kind = "XD_REF"; isa = dyn_isa(p, b, fns); }
+    buf_printf(tabs, "    {\"%s\", %zu, (uint32_t)offsetof(%s, %s), %s, %d, %d, %s, ", f->name, strlen(f->name), c->cname, f->cname, kind,
+               nul || f->optional, f->optional, isa ? isa : "NULL");
+    { Buf *so = out; out = tabs; emit_c_string(ty_name(b)); out = so; } /* (a literal type's name has its quotes: 'A' is "A") */
+    buf_puts(tabs, "},\n");
+}
 static void emit_dyn_tables(Program *p) {
     for (int i = 0; i < p->nclasses; i++)
         if (p->classes[i]->used && !p->classes[i]->builtin) buf_printf(out, "static void %s_free(void *p);\n", p->classes[i]->cname);
@@ -2939,23 +3030,7 @@ static void emit_dyn_tables(Program *p) {
         Class *c = p->classes[i];
         if (!c->used || c->builtin) continue;
         if (c->nfields) buf_printf(&tabs, "static const xs_dyn_field %s_dynf[] = {\n", c->cname);
-        for (int k = 0; k < c->nfields; k++) {
-            Field *f = &c->fields[k];
-            Type *t = f->type;
-            bool nul = t->kind == TY_NULLABLE;
-            Type *b = nul ? t->elem : t;
-            const char *kind, *isa = NULL;
-            if (b->kind == TY_NUMBER) kind = nul ? "XD_NNUM" : "XD_NUM";
-            else if (int_like(b) || b->kind == TY_LITINT) kind = nul ? "XD_NINT" : "XD_INT";
-            else if (b->kind == TY_BOOLEAN) kind = nul ? "XD_NBOOL" : "XD_BOOL";
-            else if (b->kind == TY_STRING || b->kind == TY_ENUM) kind = "XD_STR";
-            else if (b->kind == TY_UNKNOWN || b->kind == TY_UNION) kind = "XD_ANY";
-            else { kind = "XD_REF"; isa = dyn_isa(p, b, &fns); }
-            buf_printf(&tabs, "    {\"%s\", %zu, (uint32_t)offsetof(%s, %s), %s, %d, %d, %s, ", f->name, strlen(f->name), c->cname, f->cname, kind,
-                       nul || f->optional, f->optional, isa ? isa : "NULL");
-            { Buf *so = out; out = &tabs; emit_c_string(ty_name(b)); out = so; } /* (a literal type's name has its quotes: 'A' is "A") */
-            buf_puts(&tabs, "},\n");
-        }
+        for (int k = 0; k < c->nfields; k++) dyn_field_entry(p, c, &c->fields[k], &tabs, &fns);
         if (c->nfields) buf_puts(&tabs, "};\n");
         int nm = 0; /* its methods' names, its bases' too (typeof x.toJSON === "function" through an any) */
         for (Class *k = c; k; k = k->base)
@@ -2967,6 +3042,17 @@ static void emit_dyn_tables(Program *p) {
         if (nm) buf_puts(&tabs, "};\n");
         buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s, %d, %d};\n", c->cname, xs_src_name(c->name), c->nfields, c->nfields ? xs_sprintf("%s_dynf", c->cname) : "NULL",
                    nm, nm ? xs_sprintf("%s_dynm", c->cname) : "NULL", c->is_interface ? 1 : 0, !c->builtin && is_error_class(c) ? 1 : 0);
+    }
+    for (int i = 0; i < nlit_ords; i++) { /* an object literal's own key order (lit_order): its fields in that order */
+        Class *c = lit_ords[i].c;
+        const char *on = lit_ord_name(i);
+        buf_printf(&tabs, "static const xs_dyn_field %s_dynf[] = {\n", on);
+        for (int k = 0; k < lit_ords[i].n; k++) dyn_field_entry(p, c, &c->fields[lit_ords[i].ord[k]], &tabs, &fns);
+        buf_puts(&tabs, "};\n");
+        int nm = 0;
+        for (Class *k = c; k; k = k->base) nm += k->nmethods;
+        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s_dynf, %d, %s, %d, %d};\n", on, xs_src_name(c->name), c->nfields, on,
+                   nm, nm ? xs_sprintf("%s_dynm", c->cname) : "NULL", c->is_interface ? 1 : 0, is_error_class(c) ? 1 : 0);
     }
     if (fns.data) buf_puts(out, fns.data);
     if (tabs.data) buf_puts(out, tabs.data);
@@ -3456,6 +3542,8 @@ static void emit_expr_raw(Expr *e) {
             }
         }
         if (guard) buf_puts(out, " xs_cln_n -= 1;");
+        int lo = lit_order(c, e);
+        if (lo >= 0) buf_printf(out, " xs_set_type(&o_->hdr, &%s_type);", lit_ord_name(lo)); /* (its keys' order: lit_order) */
         buf_puts(out, " o_; })");
         return;
     }
@@ -4615,7 +4703,7 @@ static void emit_expr_raw(Expr *e) {
             }
         }
         buf_printf(out, "%s_lit(%d, (%s[]){", arr_struct(e->type), e->args.len,
-                   arr_ek(e->type->elem)->kind == TY_NUMBER ? "double" : int_like(arr_ek(e->type->elem)) ? "int64_t" : "bool");
+                   arr_ek(e->type->elem)->kind == TY_NUMBER ? "double" : int_like(arr_ek(e->type->elem)) ? "int64_t" : nbool_elem(e->type->elem) ? "int8_t" : "bool");
         if (e->args.len == 0) buf_puts(out, "0");
         for (int i = 0; i < e->args.len; i++) {
             if (i) buf_puts(out, ", ");
@@ -13370,6 +13458,84 @@ static void mark_init_stores(Class *c, Func *ctor) {
     }
     free(seen);
 }
+/* Node-style printing: Name { a: 1, s: 'x' }. ord: the fields in the order an object literal gave them (XB-169: as
+   JavaScript keeps its keys), NULL for the declaration's order; a fake (an object literal standing for a class with
+   methods) prints as the plain object it is in JavaScript: its keys in the literal's order, its functions by name */
+static void emit_class_print(Class *c, const char *fname, const int *ord, int nord) {
+    int *fk = NULL;
+    if (!ord && c->fake && c->ctor && c->ctor->body) { /* (the constructor sets each key the literal gave, in its order) */
+        fk = xs_alloc(sizeof(int) * (size_t)(c->nfields + 1));
+        for (int i = 0; i < c->ctor->body->stmts.len; i++) {
+            Stmt *st = c->ctor->body->stmts.items[i];
+            Expr *as = st && st->kind == S_EXPR ? st->expr : NULL;
+            if (!as || as->kind != E_ASSIGN || !as->lhs || as->lhs->kind != E_MEMBER || !as->lhs->str) continue;
+            for (int k = 0; k < c->nfields; k++) if (!strcmp(c->fields[k].name, as->lhs->str)) { fk[nord++] = k; break; }
+        }
+        ord = fk;
+    }
+    if (!ord) nord = c->nfields;
+    bool plain = c->is_interface || c->fake;
+    buf_printf(out, "static void %s(void *p) {", fname);
+    indent++;
+    nl();
+    buf_printf(out, "%s *self = p;", c->cname);
+    nl();
+    buf_puts(out, "(void)self;");
+    nl();
+    /* util.inspect's layout (runtime: xs_insp_*): each field an entry, the container decides lines and depth */
+    { /* an object whose fields are all optional and absent prints as an empty one */
+        int always = 0, opt = 0;
+        for (int i = 0; i < c->nfields; i++) { if (c->fields[i].optional) opt++; else always++; }
+        const char *empty_s = plain ? "{}" : xs_sprintf("%s {}", xs_src_name(c->name));
+        if (always || !opt) {
+            buf_printf(out, "xs_insp fr_; if (!xs_insp_begin(&fr_, p, \"%s\", %s)) return;", plain ? "Object" : xs_src_name(c->name),
+                       always ? "NULL" : xs_sprintf("\"%s\"", empty_s));
+        } else {
+            Buf cond = {0};
+            for (int i = 0; i < c->nfields; i++) buf_printf(&cond, "%s%s", i ? " || " : "", not_null(c->fields[i].type, xs_sprintf("self->%s", c->fields[i].cname)));
+            buf_printf(out, "xs_insp fr_; if (!xs_insp_begin(&fr_, p, \"%s\", (%s) ? NULL : \"%s\")) return;", plain ? "Object" : xs_src_name(c->name), cond.data, empty_s);
+        }
+    }
+    for (int oi = 0; oi < nord; oi++) {
+        Field *fd = &c->fields[ord ? ord[oi] : oi];
+        const char *shown = c->fake && !strncmp(fd->name, "__fake_", 7) ? fd->name + 7 : fd->name;
+        nl();
+        if (fd->optional) buf_printf(out, "if (%s) {", not_null(fd->type, xs_sprintf("self->%s", fd->cname)));
+        nl();
+        if (c->is_tuple) buf_puts(out, "xs_insp_entry(&fr_);"); /* [ 'a', 1 ]: elements, no names */
+        else buf_printf(out, "xs_insp_entry(&fr_); fputs(\"%s: \", XS_OUT);", shown);
+        nl();
+        switch (fd->type->kind) {
+        case TY_NUMBER: buf_printf(out, "xs_print_num(self->%s);", fd->cname); break;
+        case TY_INT: buf_printf(out, "xs_print_int(self->%s);", fd->cname); break;
+        case TY_BOOLEAN: buf_printf(out, "xs_print_bool(self->%s);", fd->cname); break;
+        case TY_STRING: buf_printf(out, "xs_print_str_quoted(self->%s);", fd->cname); break;
+        case TY_ARRAY: buf_printf(out, "xs_print_arr_%s(self->%s);", arr_print_suffix(fd->type), fd->cname); break;
+        case TY_OBJECT: buf_printf(out, "xs_print_obj(self->%s);", fd->cname); break;
+        case TY_ENUM: buf_printf(out, fd->type->en->is_string ? "xs_print_str_quoted(self->%s);" : "xs_print_int(self->%s);", fd->cname); break;
+        case TY_NULLABLE:
+            buf_printf(out, "if (!%s) fputs(\"null\", XS_OUT); else %s(self->%s);", not_null(fd->type, xs_sprintf("self->%s", fd->cname)),
+                       fd->type->elem->kind == TY_STRING ? "xs_print_str_quoted" : printer_for(fd->type->elem), fd->cname);
+            break;
+        case TY_MAP: case TY_SET: buf_printf(out, "xs_print_map(self->%s);", fd->cname); break;
+        case TY_UNION: buf_printf(out, "xs_print_any_quoted(self->%s);", fd->cname); break;
+        case TY_NULL: buf_puts(out, "fputs(\"null\", XS_OUT);"); break; /* { a: null } */
+        case TY_FUNC: buf_printf(out, "xs_print_closure(self->%s);", fd->cname); break; /* { next: [Function: next] } */
+        case TY_UNKNOWN:
+            if (ty_is_undef(fd->type)) buf_puts(out, "fputs(\"undefined\", XS_OUT);");
+            else buf_printf(out, "xs_print_any_quoted(self->%s);", fd->cname); /* ({ a: null }: an unknown holding null) */
+            break;
+        default: break;
+        }
+        if (fd->optional) buf_puts(out, " }");
+    }
+    nl();
+    if (c->is_tuple) buf_puts(out, "xs_insp_end(&fr_, \"[\", \"]\", true, false, false);");
+    else buf_printf(out, "xs_insp_end(&fr_, \"%s\", \"}\", false, false, false);", plain ? "{" : xs_sprintf("%s {", xs_src_name(c->name)));
+    indent--;
+    nl();
+    buf_puts(out, "}\n");
+}
 static void emit_class(Class *c) {
     cur_class = c;
     cur_mod = c->mod;
@@ -13442,68 +13608,7 @@ static void emit_class(Class *c) {
         buf_printf(out, "static void *%s_origin(void *p) { return ((%s *)p)->%s; }\n", c->cname, c->cname, c->fields[0].cname);
     } else if (c->cptr) { /* (header-less: never printed, nohdr_compute) */
         buf_printf(out, "static void %s_print(void *p) { (void)p; }\n", c->cname);
-    } else {
-    /* Node-style printing: Name { a: 1, s: 'x' } */
-    buf_printf(out, "static void %s_print(void *p) {", c->cname);
-    indent++;
-    nl();
-    buf_printf(out, "%s *self = p;", c->cname);
-    nl();
-    buf_puts(out, "(void)self;");
-    nl();
-    /* util.inspect's layout (runtime: xs_insp_*): each field an entry, the container decides lines and depth */
-    { /* an object whose fields are all optional and absent prints as an empty one */
-        int always = 0, opt = 0;
-        for (int i = 0; i < c->nfields; i++) { if (c->fields[i].optional) opt++; else always++; }
-        const char *empty_s = c->is_interface ? "{}" : xs_sprintf("%s {}", xs_src_name(c->name));
-        if (always || !opt) {
-            buf_printf(out, "xs_insp fr_; if (!xs_insp_begin(&fr_, p, \"%s\", %s)) return;", c->is_interface ? "Object" : xs_src_name(c->name),
-                       always ? "NULL" : xs_sprintf("\"%s\"", empty_s));
-        } else {
-            Buf cond = {0};
-            for (int i = 0; i < c->nfields; i++) buf_printf(&cond, "%s%s", i ? " || " : "", not_null(c->fields[i].type, xs_sprintf("self->%s", c->fields[i].cname)));
-            buf_printf(out, "xs_insp fr_; if (!xs_insp_begin(&fr_, p, \"%s\", (%s) ? NULL : \"%s\")) return;", c->is_interface ? "Object" : xs_src_name(c->name), cond.data, empty_s);
-        }
-    }
-    for (int i = 0; i < c->nfields; i++) {
-        Field *fd = &c->fields[i];
-        nl();
-        if (fd->optional) buf_printf(out, "if (%s) {", not_null(fd->type, xs_sprintf("self->%s", fd->cname)));
-        nl();
-        if (c->is_tuple) buf_puts(out, "xs_insp_entry(&fr_);"); /* [ 'a', 1 ]: elements, no names */
-        else buf_printf(out, "xs_insp_entry(&fr_); fputs(\"%s: \", XS_OUT);", fd->name);
-        nl();
-        switch (fd->type->kind) {
-        case TY_NUMBER: buf_printf(out, "xs_print_num(self->%s);", fd->cname); break;
-        case TY_INT: buf_printf(out, "xs_print_int(self->%s);", fd->cname); break;
-        case TY_BOOLEAN: buf_printf(out, "xs_print_bool(self->%s);", fd->cname); break;
-        case TY_STRING: buf_printf(out, "xs_print_str_quoted(self->%s);", fd->cname); break;
-        case TY_ARRAY: buf_printf(out, "xs_print_arr_%s(self->%s);", arr_print_suffix(fd->type), fd->cname); break;
-        case TY_OBJECT: buf_printf(out, "xs_print_obj(self->%s);", fd->cname); break;
-        case TY_ENUM: buf_printf(out, fd->type->en->is_string ? "xs_print_str_quoted(self->%s);" : "xs_print_int(self->%s);", fd->cname); break;
-        case TY_NULLABLE:
-            buf_printf(out, "if (!%s) fputs(\"null\", XS_OUT); else %s(self->%s);", not_null(fd->type, xs_sprintf("self->%s", fd->cname)),
-                       fd->type->elem->kind == TY_STRING ? "xs_print_str_quoted" : printer_for(fd->type->elem), fd->cname);
-            break;
-        case TY_MAP: case TY_SET: buf_printf(out, "xs_print_map(self->%s);", fd->cname); break;
-        case TY_UNION: buf_printf(out, "xs_print_any_quoted(self->%s);", fd->cname); break;
-        case TY_NULL: buf_puts(out, "fputs(\"null\", XS_OUT);"); break; /* { a: null } */
-        case TY_FUNC: buf_printf(out, "xs_print_closure(self->%s);", fd->cname); break; /* { next: [Function: next] } */
-        case TY_UNKNOWN:
-            if (ty_is_undef(fd->type)) buf_puts(out, "fputs(\"undefined\", XS_OUT);");
-            else buf_printf(out, "xs_print_any_quoted(self->%s);", fd->cname); /* ({ a: null }: an unknown holding null) */
-            break;
-        default: break;
-        }
-        if (fd->optional) buf_puts(out, " }");
-    }
-    nl();
-    if (c->is_tuple) buf_puts(out, "xs_insp_end(&fr_, \"[\", \"]\", true, false, false);");
-    else buf_printf(out, "xs_insp_end(&fr_, \"%s\", \"}\", false, false, false);", c->is_interface ? "{" : xs_sprintf("%s {", xs_src_name(c->name)));
-    indent--;
-    nl();
-    buf_puts(out, "}\n");
-    }
+    } else emit_class_print(c, xs_sprintf("%s_print", c->cname), NULL, 0);
 
     if (in_hierarchy(c)) { emit_hier_ctor(c); goto methods; }
     /* constructor */
@@ -14741,6 +14846,13 @@ void emit_program(Program *p, Buf *o) {
             } else
             buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, %s_print, %s%s};\n", c->cname, c->cname, c->cname, cy ? xs_sprintf("%s_visit", c->cname) : "NULL", dyn_ref(c));
         }
+    for (int i = 0; i < nlit_ords; i++) { /* an object literal's own key order (lit_order): its class's descriptor, printed in that order */
+        Class *c = lit_ords[i].c;
+        const char *on = lit_ord_name(i);
+        buf_printf(out, "static void %s_print(void *p);\n", on);
+        buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, %s_print, %s%s};\n", on, c->cname, on,
+                   class_cyclic(c) ? xs_sprintf("%s_visit", c->cname) : "NULL", xs_any_used ? xs_sprintf(", .dyn = &%s_dyn", on) : "");
+    }
     {
         /* literal declarations and their initializer, for the literals the emitted code references */
         Buf lits = {0};
@@ -14789,6 +14901,7 @@ void emit_program(Program *p, Buf *o) {
                      "    XS_JU_ARR_(xs_arr_num, xs_sb_num)\n"
                      "    XS_JU_ARR_(xs_arr_int, xs_sb_int)\n"
                      "    XS_JU_ARR_(xs_arr_bool, xs_sb_bool)\n"
+                     "    XS_JU_ARR_(xs_arr_nbool, xs_sb_bool_or_null_)\n"
                      "    XS_JU_ARR_(xs_arr_ref, xs_json_unknown)\n"
                      "#undef XS_JU_ARR_\n");
         /* a Record<string, V> (an object made as an any, or a literal where an unknown goes) */
@@ -14807,12 +14920,14 @@ void emit_program(Program *p, Buf *o) {
             buf_printf(&u, "    if (f_ == %s_free) { json_put_%s(sb, (%s *)v); return; }\n", cls[i]->cname, type_tag(ty_object_of(cls[i])), cls[i]->cname);
         buf_puts(&u, "    xs_panic(\"TypeError: this value cannot be written as JSON\");\n}\n");
         buf_puts(out, "static void xs_json_unknown(xs_sb *sb, void *v);\n");
+        json_fill_orders(&json_fns, &json_protos);
         if (json_protos.data) buf_puts(out, json_protos.data);
         if (json_fns.data) buf_puts(out, json_fns.data);
         buf_puts(out, u.data);
         free(u.data);
         json_unknown_used = false;
     } else if (json_fns.data) {
+        json_fill_orders(&json_fns, &json_protos);
         if (json_protos.data) buf_puts(out, json_protos.data);
         buf_puts(out, json_fns.data);
     }
@@ -14842,7 +14957,7 @@ void emit_program(Program *p, Buf *o) {
                      "    if (t_->print == xs_print_closure) xs_panic(\"DataCloneError: a function could not be cloned\");\n"
                      "    void (*f_)(void *) = t_->free;\n"
                      "    if (f_ == xs_str_free || f_ == xs_box_int_free || f_ == xs_box_num_free || f_ == xs_box_bool_free || f_ == xs_Date_free ||\n"
-                     "        f_ == xs_arr_num_free || f_ == xs_arr_int_free || f_ == xs_arr_bool_free) return;\n"
+                     "        f_ == xs_arr_num_free || f_ == xs_arr_int_free || f_ == xs_arr_bool_free || f_ == xs_arr_nbool_free) return;\n"
                      "    if (f_ == xs_arr_ref_free) { xs_arr_ref *a_ = v; for (size_t i_ = 0; i_ < a_->len; i_++) xs_clone_check(a_->data[i_], depth + 1); return; }\n"
                      "    if (f_ == xs_map_free) { xs_map *m_ = v; xs_map_entry *e_; if (m_->val_kind == 3) XS_MAP_EACH(m_, e_) xs_clone_check(e_->val.p, depth + 1); return; }\n");
         for (int i = 0; i < p->nclasses; i++) {
@@ -14875,6 +14990,7 @@ void emit_program(Program *p, Buf *o) {
                      "    XS_CL_ARR_(xs_arr_num, double)\n"
                      "    XS_CL_ARR_(xs_arr_int, int64_t)\n"
                      "    XS_CL_ARR_(xs_arr_bool, bool)\n"
+                     "    XS_CL_ARR_(xs_arr_nbool, int8_t)\n"
                      "#undef XS_CL_ARR_\n"
                      "    if (f_ == xs_arr_ref_free) { xs_arr_ref *a_ = v; xs_arr_ref *n_ = xs_arr_ref_new(a_->len, a_->print_elem); for (size_t i_ = 0; i_ < a_->len; i_++) xs_arr_ref_push(n_, xs_clone_in(a_->data[i_])); return n_; }\n"
                      "    if (f_ == xs_map_free) {\n"
@@ -14913,6 +15029,8 @@ void emit_program(Program *p, Buf *o) {
     if (arrow_fns.data) buf_puts(out, arrow_fns.data);
     if (gen_fns.data) { buf_puts(out, gen_fns.data); gen_fns.len = 0; gen_fns.data[0] = 0; }
     buf_puts(out, body.data ? body.data : "");
+    for (int i = 0; i < nlit_ords; i++) emit_class_print(lit_ords[i].c, xs_sprintf("%s_print", lit_ord_name(i)), lit_ords[i].ord, lit_ords[i].n);
+    nlit_ords = 0;
     if (jam_used) { /* the jam versions of the callbacks (XB-083) */
         buf_printf(out, "\nstatic void *xs_jam8_of(void *fn) {\n%s    (void)fn;\n    return NULL;\n}\n", jam_tab.data ? jam_tab.data : "");
     }
