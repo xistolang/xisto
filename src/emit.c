@@ -2945,7 +2945,23 @@ static void emit_spawn(Expr *e) {
         if (!sp_plain(mc->lhs)) slot[n++] = &mc->lhs;
         if (!sp_plain(mc->args.items[0])) slot[n++] = &mc->args.items[0];
     } else
-        for (int i = 0; i < c->args.len && n < 128; i++) if (!sp_plain(c->args.items[i])) slot[n++] = &c->args.items[i];
+        for (int i = 0; i < c->args.len && n < 128; i++) {
+            Expr *a = c->args.items[i];
+            if (a->kind == E_OBJLIT && !a->cls && c->builtin.cfn && !strcmp(c->builtin.cfn, "xs_fetch")) {
+                /* fetch's options, written in place (no object of their own): each value evaluated here, the literal
+                   kept for the call (its headers literal too; signal: AbortSignal.timeout(ms) its ms) */
+                for (int j = 0; j < a->args.len && n < 128; j++) {
+                    Expr *v = a->args.items[j];
+                    if (v->kind == E_OBJLIT && !v->cls) {
+                        for (int h = 0; h < v->args.len && n < 128; h++) if (!sp_plain(v->args.items[h])) slot[n++] = &v->args.items[h];
+                    } else if (v->kind == E_MEMBER && v->is_call && v->args.len == 1) {
+                        if (!sp_plain(v->args.items[0])) slot[n++] = &v->args.items[0];
+                    } else if (!sp_plain(v)) slot[n++] = &a->args.items[j];
+                }
+                continue;
+            }
+            if (!sp_plain(a)) slot[n++] = &c->args.items[i];
+        }
     Expr *orig[128];
     Expr *fake = xs_alloc(sizeof(Expr) * (size_t)(n ? n : 1));
     for (int i = 0; i < n; i++) {
@@ -4554,8 +4570,8 @@ static void emit_expr_raw(Expr *e) {
                 if (strcmp(k, "method") == 0) method = init->args.items[i];
                 else if (strcmp(k, "body") == 0) body = init->args.items[i];
                 else if (strcmp(k, "headers") == 0) headers = init->args.items[i];
-                else if (init->args.items[i]->kind == E_MEMBER && !init->args.items[i]->is_call) abort = init->args.items[i]; /* signal.__flag */
-                else timeout = init->args.items[i]->args.items[0];
+                else if (init->args.items[i]->kind == E_MEMBER && init->args.items[i]->is_call) timeout = init->args.items[i]->args.items[0];
+                else abort = init->args.items[i]; /* signal.__flag (or, in a spawned fetch, the copy taken when it started) */
             }
             if (headers && headers->kind != E_OBJLIT) { /* headers from a Record<string, string> */
                 buf_puts(out, "xs_fetch_hmap(");
