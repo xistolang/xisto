@@ -5253,6 +5253,61 @@ static Class *reflected_base(Program *prog, Class *c) {
     }
     return found && class_decorated(found) ? found : NULL;
 }
+/* a class by the name module m reads it under: m's own, else one another module exports (as reflected_base finds it) */
+static Class *class_named(Program *prog, Module *m, const char *name) {
+    Class *found = NULL;
+    for (int i = 0; i < prog->nclasses; i++) {
+        Class *k = prog->classes[i];
+        if (k->builtin || !k->name || strcmp(k->name, name) != 0) continue;
+        if (k->mod == m) return k;
+        if (!found && k->exported) found = k;
+    }
+    return found;
+}
+static bool field_decorated(Class *c) {
+    for (int k = 0; k < c->nfields; k++) if (c->fields[k].decos.len) return true;
+    return false;
+}
+/* the fields class X extends PartialType(Y) (OmitType, PickType, IntersectionType) gets from Y (the checker copies them,
+   apply_mixin): each with the class that declares it, optional under PartialType; NULL when a side is not a class the
+   parser can name (a generic instance, a type alias) */
+typedef struct { Field *f; Class *owner; bool optional; } MixField;
+static void mf_add(MixField **out, int *n, Field *f, Class *owner, bool optional) {
+    for (int i = 0; i < *n; i++) if (!strcmp((*out)[i].f->name, f->name)) { (*out)[i] = (MixField){f, owner, optional}; return; }
+    *out = realloc(*out, sizeof(MixField) * (size_t)(*n + 1));
+    (*out)[(*n)++] = (MixField){f, owner, optional};
+}
+static bool class_fields_parsed(Program *prog, Class *k, MixField **out, int *n, int depth);
+static bool mixin_fields(Program *prog, Module *m, Mixin *x, MixField **out, int *n, int depth) {
+    if (!x || depth > 16) return false;
+    if (!x->kind) {
+        Class *k = x->klass ? x->klass : x->cls ? class_named(prog, m, x->cls) : NULL;
+        return k && class_fields_parsed(prog, k, out, n, depth + 1);
+    }
+    MixField *a = NULL;
+    int na = 0;
+    if (!mixin_fields(prog, m, x->a, &a, &na, depth + 1)) return false;
+    bool partial = !strcmp(x->kind, "PartialType"), omit = !strcmp(x->kind, "OmitType"), pick = !strcmp(x->kind, "PickType");
+    if (!strcmp(x->kind, "IntersectionType") && !mixin_fields(prog, m, x->b, &a, &na, depth + 1)) return false;
+    if ((omit || pick) && x->keyty) return false; /* (keys given as a type: the checker reads them) */
+    for (int i = 0; i < na; i++) {
+        bool listed = false;
+        for (int k = 0; k < x->nkeys; k++) if (!strcmp(x->keys[k], a[i].f->name)) listed = true;
+        if ((omit && listed) || (pick && !listed)) continue;
+        mf_add(out, n, a[i].f, a[i].owner, a[i].optional || partial);
+    }
+    return true;
+}
+static bool class_fields_parsed(Program *prog, Class *k, MixField **out, int *n, int depth) {
+    if (k->ntparams || k->is_interface || depth > 16) return false;
+    if (k->mixin && !mixin_fields(prog, k->mod, k->mixin, out, n, depth + 1)) return false;
+    if (k->base_name && !k->mixin) {
+        Class *b = class_named(prog, k->mod, k->base_name);
+        if (!b || !class_fields_parsed(prog, b, out, n, depth + 1)) return false;
+    }
+    for (int i = 0; i < k->nfields; i++) mf_add(out, n, &k->fields[i], k, k->fields[i].optional);
+    return true;
+}
 static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
     const char *ci_name = xs_sprintf("__ci_%s", c->name);
     if (c->ntparams) { /* a generic class (PagedResultDto<T>): no one type to describe; its fields are listed by name */
@@ -5345,9 +5400,26 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
         buf_printf(g, ");%s } }", is_void ? " return null;" : "");
     }
     buf_puts(g, "],\n  fields: [");
+    /* class UpdateDto extends PartialType(CreateDto): the fields copied in come first (as the checker lays them out), typed
+       by the class itself (UpdateDto["name"]: the copy's type, whose names are the other module's); their decorators run
+       again on them through the declaring module's __xs_fdeco_<Class> (as @nestjs/mapped-types inherits the metadata) */
+    MixField *mf = NULL;
+    int nmf = 0;
+    if (c->mixin && !mixin_fields(prog, m, c->mixin, &mf, &nmf, 0)) nmf = 0;
+    for (int i = 0; i < nmf; i++) {
+        for (int k = 0; k < c->nfields; k++) if (!strcmp(c->fields[k].name, mf[i].f->name)) mf[i].f = NULL; /* (redeclared) */
+    }
+    int nfi = 0;
+    for (int i = 0; i < nmf; i++) {
+        if (!mf[i].f) continue;
+        const char *fname = mf[i].f->name;
+        buf_printf(g, "%s\n    { name: \"%s\", optional: %s, type: ", nfi++ ? "," : "", fname, mf[i].optional ? "true" : "false");
+        tinfo(g, xs_sprintf("%s[\"%s\"]", c->name, fname));
+        buf_printf(g, ", get: (o: unknown): unknown => (o as %s)[\"%s\"] }", c->name, fname);
+    }
     for (int k = 0; k < c->nfields; k++) {
         Field *fd = &c->fields[k];
-        buf_printf(g, "%s\n    { name: \"%s\", optional: %s, type: ", k ? "," : "", fd->name, fd->optional ? "true" : "false");
+        buf_printf(g, "%s\n    { name: \"%s\", optional: %s, type: ", nfi + k ? "," : "", fd->name, fd->optional ? "true" : "false");
         tinfo(g, fd->type_src ? fd->type_src : "unknown");
         bool ident = isalpha((unsigned char)fd->name[0]) || fd->name[0] == '_' || fd->name[0] == '$';
         for (const char *q = fd->name; *q && ident; q++) ident = isalnum((unsigned char)*q) || *q == '_' || *q == '$';
@@ -5397,8 +5469,25 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
                        n, c->name, f->name, n, c->name, f->name, n, ci_name, on, n, n, c->name, f->name, n);
         }
     }
+    for (int i = 0, fi = 0; i < nmf; i++) { /* (the copied fields' decorators, by the module that wrote them) */
+        if (!mf[i].f) continue;
+        if (mf[i].f->decos.len && class_decorated(mf[i].owner))
+            buf_printf(g, "__xs_fdeco_%d_%s(%s, %s.fields[%d], \"%s\");\n", mf[i].owner->mod->id, mf[i].owner->name, ci_name, ci_name, fi, mf[i].f->name);
+        fi++;
+    }
     for (int k = 0; k < c->nfields; k++)
-        for (int d = c->fields[k].decos.len - 1; d >= 0; d--) apply(g, &c->fields[k].decos.items[d], xs_sprintf("%s, %s.fields[%d]", ci_name, ci_name, k));
+        for (int d = c->fields[k].decos.len - 1; d >= 0; d--) apply(g, &c->fields[k].decos.items[d], xs_sprintf("%s, %s.fields[%d]", ci_name, ci_name, nfi + k));
+    if (field_decorated(c)) { /* (see above: what a class extends PartialType(this one) runs on its copies) */
+        buf_printf(g, "const __xs_fdeco_%d_%s = (c: ClassInfo, f: ClassInfo[\"fields\"][number], k: string): void => {\n", m->id, c->name);
+        for (int k = 0; k < c->nfields; k++) {
+            if (!c->fields[k].decos.len) continue;
+            buf_printf(g, "  if (k === \"%s\") {\n", c->fields[k].name);
+            for (int d = c->fields[k].decos.len - 1; d >= 0; d--) apply(g, &c->fields[k].decos.items[d], "c, f");
+            buf_puts(g, "  }\n");
+        }
+        buf_puts(g, "};\n");
+    }
+    free(mf);
     if (c->ctor)
         for (int i = c->ctor->nparams - 1; i >= 0; i--)
             for (int d = c->ctor->params[i].decos.len - 1; d >= 0; d--)

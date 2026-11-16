@@ -8672,7 +8672,9 @@ static bool early_global(const char *name) {
         bool here = s->mod == cur_mod;
         const char *st = strstr(name, "__s_"); /* (Dec.ZERO: Dec__s_ZERO, imported with Dec) */
         const char *iname = st ? xs_strndup(name, (size_t)(st - name)) : name;
-        if (!here && !(cur_mod && imports_name(cur_mod, s->mod, iname) && (s->exported || st))) continue;
+        bool fdeco = !strncmp(name, "__xs_fdeco_", 11); /* (a class's field decorators, run on the copies of a mapped type in
+                                                           another module: named with its module's id, read from anywhere) */
+        if (!here && !fdeco && !(cur_mod && imports_name(cur_mod, s->mod, iname) && (s->exported || st))) continue;
         if (s->top_state != 0) { /* checked already (a module that imports this one in a cycle bound its imports first) */
             if (here) continue;
             for (Binding *b = mod_scopes[s->mod->id]->head; b; b = b->next)
@@ -10798,6 +10800,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         Func *f = crypto_func_overload(e, lookup_func(name));
         if (!f) {
             Binding *b = lookup(name);
+            if (!b && !strncmp(name, "__xs_fdeco_", 11) && early_global(name)) b = lookup(name); /* (see early_global) */
             if (b && b->type->kind == TY_FUNC) { /* calling a function value */
                 Type *ft = b->type;
                 e->lhs->type = ft;

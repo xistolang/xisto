@@ -1,0 +1,15 @@
+check Base id int false
+check CreateDto name string false
+check CreateDto age min false
+check UpdateDto id int true
+check UpdateDto name string true
+check UpdateDto age min true
+UpdateDto id?:{"type":"number","nullable":true} name?:{"type":"string","nullable":true} age?:{"type":"number","nullable":true} role?:{"type":"string","enum":["a","b"],"nullable":true} tags?:{"type":"array","items":{"type":"string"},"nullable":true}
+check NoAge id int false
+check NoAge name string false
+check NoAge extra bool false
+NoAge id:{"type":"number"} name:{"type":"string"} role:{"type":"string","enum":["a","b"]} tags?:{"type":"array","items":{"type":"string"},"nullable":true} extra:{"type":"boolean"}
+check OnlyName name string false
+OnlyName name:{"type":"string"}
+{"id":0,"name":"x","age":0,"role":"a"}
+id=0 name="x" age=0 role="a" tags=null
