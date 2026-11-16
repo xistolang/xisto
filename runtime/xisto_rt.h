@@ -71,12 +71,14 @@ static int xs_wfclose(FILE *f) {
    breakLength 80, compact 3): one line if it fits, else one entry per line indented; arrays of more than six
    entries in aligned columns; deeper than two levels "[Name]"; a cycle "[Circular *n]", with "<ref *n>" on the
    object it points back to (written after the children, which is why entries go to a buffer first). */
-/* code that runs once (literal setup, a main that only wires things up): optimizing it buys nothing and was a
-   third of a release build of the Conduit API (312 ms of -O2 on the decorator registrations alone) */
+/* code that runs once (literal setup, a main that only wires things up, a constructor called once): optimized for
+   size. -O2 on it buys nothing and was a third of a release build of the Conduit API (312 ms on the decorator
+   registrations alone); -O0 (optnone, before) was as quick to build but its code twice as big: a Nest application's
+   binary is 33 KB smaller with minsize, built 3% slower (16/11) */
 #if defined(__clang__)
-#define XS_RUN_ONCE __attribute__((optnone, noinline, cold))
+#define XS_RUN_ONCE __attribute__((minsize, noinline, cold))
 #else
-#define XS_RUN_ONCE __attribute__((cold, optimize("O0")))
+#define XS_RUN_ONCE __attribute__((cold, noinline, optimize("Os")))
 #endif
 static XS_TLS FILE *xs_out_f;
 #define XS_OUT (xs_out_f ? xs_out_f : stdout)

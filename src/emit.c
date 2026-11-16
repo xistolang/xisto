@@ -358,6 +358,7 @@ static void fixparam_compute(Program *p) {
 static bool inlined_once(Func *f) {
     if (getenv("XISTO_NO_TRACE")) return false;
     if (f->ncalls != 1 || !f->call1 || f->is_async || !f->body || stmt_has_try(f->body) || f->virt_target || f->is_gen) return false;
+    if (f->run_once) return false; /* (code that runs once is compiled for size, on its own: XS_RUN_ONCE) */
     /* not recursive, directly or through other functions inlined into their only caller */
     int steps = 0; /* (a cycle among its callers that does not reach f: two functions that only call each other) */
     for (Func *g = f->call1_in; g; g = g->ncalls == 1 ? g->call1_in : NULL) if (g == f || ++steps > 256) return false;
