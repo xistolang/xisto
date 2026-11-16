@@ -14,6 +14,7 @@
 void *xs_alloc(size_t n);
 char *xs_strndup(const char *s, size_t n);
 const char *xs_src_name(const char *name);
+const char *xs_sym_field_shown(const char *name); /* a symbol-keyed field's key as console.log shows it (checker) */
 char *xs_sprintf(const char *fmt, ...);
 
 typedef struct {
@@ -335,6 +336,7 @@ struct Expr {
     Expr *lhs, *rhs;
     ExprList args;
     bool is_call;
+    bool this_call;    /* E_CALL: f(obj, ...) made from f.call(obj, ...) of a function with a `this` parameter */
     bool opt_call;     /* x.f?.(args): f may be a function that is null (then the call is skipped) */      /* E_MEMBER */
     bool spread;       /* E_ARRAY_LIT with ...x elements (each an E_UNARY TK_ELLIPSIS): built by emit_spread_lit */
     Type *elem_type;   /* E_NEW_ARRAY */
@@ -515,6 +517,7 @@ struct Func {
     bool is_abstract;  /* abstract m(): T; no body, every concrete subclass overrides it */
     int access;        /* 0 public, 1 protected, 2 private */
     bool is_getter, is_setter; /* get x(): T / set x(v: T): named __get_x / __set_x, used as obj.x */
+    bool this_param;   /* function f(this: T, ...): its first parameter is the object (f.call(obj, ...), f.apply(obj, [...])) */
     bool is_gen;       /* function* f(): Generator<T>: returns a Stream<T> whose values the body yields */
     struct Func *outer_fn; /* an arrow or function expression: the function it is written in (NULL: top level) */
     struct Func **overrides; /* methods of subclasses that override this one (all levels) */
@@ -709,6 +712,7 @@ typedef struct {
     bool star;         /* export * from "m": every name m exports (names is empty) */
     char **as_names;   /* export { a as b } from "m": the name each entry is exported under here (NULL: its own name) */
     bool *qualified;   /* import { A as B } next to another import of A: B reads as "A\x01m", A is not visible plainly from here */
+    bool dynamic;      /* import("m") in an expression: loaded with the others, its top level run on the first call (lazy) */
 } Import;
 
 struct Module {
@@ -727,6 +731,8 @@ struct Module {
     bool loading, loaded;
     bool builtin;      /* "node:fs" and friends: functions provided by the runtime */
     bool missing;      /* xisto check: a module that could not be loaded (reported); its imported names are not reported again */
+    bool dyn_target;   /* named by an import("...") somewhere: xs_lazy_m<id>() runs its top level (once; nothing when it ran at start) */
+    bool lazy;         /* (emit) reached only through import(): its top level waits for the first import() */
     char *native_prefix; /* package modules: C names of `declare` functions and classes start with this ("xn_pg_") */
 };
 
@@ -737,6 +743,8 @@ typedef struct {
     int nclasses, cap_classes;
     StmtList top;      /* top-level statements of every module, dependencies first */
     Module **modules;  /* dependencies first; the entry module is last */
+    Module **dyn_mods; /* the modules some import("...") names (Module.dyn_target) */
+    int ndyn_mods;
     int nmodules, cap_modules;
     Enum **enums;
     int nenums, cap_enums;

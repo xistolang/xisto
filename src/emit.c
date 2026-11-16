@@ -1901,6 +1901,10 @@ static void json_emit_read(Buf *b, Type *t, const char *jv, const char *where) {
 static void buf_insert(Buf *b, size_t at, const char *text);
 static void emit_class_print(Class *c, const char *fname, const int *ord, int nord);
 static bool clone_plain_print; /* (structuredClone: a class's twin printer, as a plain object) */
+static int find_field_idx(Class *c, const char *name) {
+    for (int i = 0; i < c->nfields; i++) if (!strcmp(c->fields[i].name, name)) return i;
+    return -1;
+}
 /* the fields of c as a JSON object's members (ord: in that order, NULL: the declaration's) */
 static void json_put_fields(Buf *b, Class *c, const int *ord, int nord) {
     for (int oi = 0; oi < nord; oi++) {
@@ -1908,6 +1912,7 @@ static void json_put_fields(Buf *b, Class *c, const int *ord, int nord) {
         if (ty_is_undef(f->type)) continue; /* r: undefined: JSON.stringify leaves it out */
         if (xs_hidden_field(f->name)) continue; /* #x: not an own property: JSON.stringify leaves it out */
         if (json_fn_field(f->type)) continue; /* a function: left out, as JSON.stringify does */
+        if (xs_sym_field_shown(f->name)) continue; /* a symbol key: left out, as JSON.stringify does */
         /* optional fields that are null are left out, like undefined in JSON.stringify (and a value that is a function) */
         bool may_fn = json_may_fn(f->type);
         if (f->optional || may_fn) {
@@ -3083,10 +3088,10 @@ static void emit_dyn_tables(Program *p) {
     for (int i = 0; i < p->nclasses; i++) {
         Class *c = p->classes[i];
         if (!c->used || c->builtin) continue;
-        int nf = 0; /* (#x fields: not reachable by name, as in JavaScript) */
-        for (int k = 0; k < c->nfields; k++) if (!xs_hidden_field(c->fields[k].name)) nf++;
+        int nf = 0; /* (#x fields and symbol keys: not reachable by name, as in JavaScript) */
+        for (int k = 0; k < c->nfields; k++) if (!xs_hidden_field(c->fields[k].name) && !xs_sym_field_shown(c->fields[k].name)) nf++;
         if (nf) buf_printf(&tabs, "static const xs_dyn_field %s_dynf[] = {\n", c->cname);
-        for (int k = 0; k < c->nfields; k++) if (!xs_hidden_field(c->fields[k].name)) dyn_field_entry(p, c, &c->fields[k], &tabs, &fns);
+        for (int k = 0; k < c->nfields; k++) if (!xs_hidden_field(c->fields[k].name) && !xs_sym_field_shown(c->fields[k].name)) dyn_field_entry(p, c, &c->fields[k], &tabs, &fns);
         if (nf) buf_puts(&tabs, "};\n");
         int nm = 0; /* its methods' names, its bases' too (typeof x.toJSON === "function" through an any) */
         for (Class *k = c; k; k = k->base)
@@ -3103,11 +3108,14 @@ static void emit_dyn_tables(Program *p) {
         Class *c = lit_ords[i].c;
         const char *on = lit_ord_name(i);
         buf_printf(&tabs, "static const xs_dyn_field %s_dynf[] = {\n", on);
-        for (int k = 0; k < lit_ords[i].n; k++) dyn_field_entry(p, c, &c->fields[lit_ords[i].ord[k]], &tabs, &fns);
+        int nd = 0;
+        for (int k = 0; k < lit_ords[i].n; k++)
+            if (!xs_sym_field_shown(c->fields[lit_ords[i].ord[k]].name)) { dyn_field_entry(p, c, &c->fields[lit_ords[i].ord[k]], &tabs, &fns); nd++; }
+        if (!nd) buf_puts(&tabs, "{0}\n");
         buf_puts(&tabs, "};\n");
         int nm = 0;
         for (Class *k = c; k; k = k->base) nm += k->nmethods;
-        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s_dynf, %d, %s, %d, %d};\n", on, xs_src_name(c->name), c->nfields, on,
+        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s_dynf, %d, %s, %d, %d};\n", on, xs_src_name(c->name), nd, on,
                    nm, nm ? xs_sprintf("%s_dynm", c->cname) : "NULL", c->is_interface ? 1 : 0, is_error_class(c) ? 1 : 0);
     }
     if (fns.data) buf_puts(out, fns.data);
@@ -4703,7 +4711,8 @@ static void emit_expr_raw(Expr *e) {
         for (int i = 0; i < e->args.len; i++) {
             if (i) buf_puts(out, ", ");
             bool val = i == e->args.len - 1 && e->type && e->type->kind != TY_VOID; /* (const r = <void call>: then null) */
-            buf_puts(out, val ? "(" : "(void)(");
+            bool rel = !val && is_fresh(e->args.items[i]); /* (a new object no one keeps: released) */
+            buf_puts(out, val ? "(" : rel ? "xs_release(" : "(void)(");
             emit_expr(e->args.items[i]);
             buf_puts(out, ")");
         }
@@ -13596,10 +13605,14 @@ static void emit_class_print(Class *c, const char *fname, const int *ord, int no
             buf_printf(out, "xs_insp fr_; if (!xs_insp_begin(&fr_, p, \"%s\", (%s) ? NULL : \"%s\")) return;", plain ? "Object" : xs_src_name(c->name), cond.data, empty_s);
         }
     }
+    for (int pass = 0; pass < 2; pass++) /* (symbol keys after the others, as Node lists them) */
     for (int oi = 0; oi < nord; oi++) {
         Field *fd = &c->fields[ord ? ord[oi] : oi];
         const char *shown = c->fake && !strncmp(fd->name, "__fake_", 7) ? fd->name + 7 : fd->name;
         if (xs_hidden_field(fd->name)) continue; /* #x: not shown (Node's inspect leaves hard-private fields out) */
+        const char *sym = xs_sym_field_shown(fd->name);
+        if ((sym != NULL) != (pass == 1)) continue;
+        if (sym) shown = sym;
         nl();
         if (fd->optional) buf_printf(out, "if (%s) {", not_null(fd->type, xs_sprintf("self->%s", fd->cname)));
         nl();
@@ -13726,6 +13739,10 @@ static void emit_class(Class *c) {
             buf_printf(out, "    fputs(\" {\\n  [errors]: \", XS_OUT); xs_print_arr_%s(self->%s); fputs(\"\\n}\", XS_OUT);\n", arr_print_suffix(fe->type), fe->cname);
         }
         buf_puts(out, "}\n");
+    } else if (c->mod && c->mod->file && !strcmp(c->mod->file, "xisto:okmap") && find_field_idx(c, "vals") >= 0 && find_field_idx(c, "ks") >= 0) {
+        /* (a Map<symbol, V>: printed as Node prints the Map) */
+        buf_printf(out, "static void %s_print(void *p) { xs_print_okmap(p, ((%s *)p)->%s, ((%s *)p)->%s); }\n", c->cname, c->cname,
+                   c->fields[find_field_idx(c, "vals")].cname, c->cname, c->fields[find_field_idx(c, "ks")].cname);
     } else emit_class_print(c, xs_sprintf("%s_print", c->cname), NULL, 0);
 
     if (in_hierarchy(c)) { emit_hier_ctor(c); goto methods; }
@@ -14591,10 +14608,62 @@ static const char xs_okey_c[] =
     "    k = xs_fn_origin(k); /* (a function through the checker's adapters: the function itself) */\n"
     "    int n = k ? snprintf(b, sizeof b, \"p%p\", k) : snprintf(b, sizeof b, \"z\");\n"
     "    return xs_str_new(b, (size_t)n);\n"
+    "}\n"
+    "/* xisto:okmap's OkMap (a Map<symbol, V> or Map<object, V>) shown as the Map it stands for: ks holds each key, vals its value */\n"
+    "static void xs_print_okmap(void *p, xs_map *vals, xs_map *ks) {\n"
+    "    xs_insp fr;\n"
+    "    if (!xs_insp_begin(&fr, p, \"Map\", vals->count ? NULL : \"Map(0) {}\")) return;\n"
+    "    xs_map_entry *e;\n"
+    "    XS_MAP_EACH(ks, e) {\n"
+    "        xs_map_entry *v = xs_map_lookup(vals, e->skey, 0);\n"
+    "        if (!v) continue;\n"
+    "        xs_insp_entry(&fr);\n"
+    "        if (ks->val_kind == 3) { if (e->val.p) ks->print_val(e->val.p); else fputs(\"null\", XS_OUT); }\n"
+    "        else ks->print_val(&e->val);\n"
+    "        fputs(\" => \", XS_OUT);\n"
+    "        if (vals->val_kind == 3) { if (v->val.p) vals->print_val(v->val.p); else fputs(\"null\", XS_OUT); }\n"
+    "        else vals->print_val(&v->val);\n"
+    "    }\n"
+    "    char open[48];\n"
+    "    snprintf(open, sizeof open, \"Map(%zu) {\", vals->count);\n"
+    "    xs_insp_end(&fr, open, \"}\", false, false, false);\n"
     "}\n";
+/* import("./x"): the modules only an import() reaches (not the entry's static imports, directly or through others)
+   are lazy: their top level runs in xs_lazy_m<id>() on the first import() (Node evaluates them then), not at start */
+static void lazy_compute(Program *p) {
+    if (!p->ndyn_mods || !p->nmodules) return;
+    int maxid = 0;
+    for (int i = 0; i < p->nmodules; i++) if (p->modules[i]->id > maxid) maxid = p->modules[i]->id;
+    char *reach = calloc((size_t)maxid + 1, 1), *dynr = calloc((size_t)maxid + 1, 1);
+    Module **st = malloc(sizeof(Module *) * (size_t)(p->nmodules + 1));
+    for (int pass = 0; pass < 2; pass++) {
+        char *mark = pass ? dynr : reach;
+        int n = 0;
+        if (pass) for (int i = 0; i < p->ndyn_mods; i++) { if (!mark[p->ndyn_mods ? p->dyn_mods[i]->id : 0]) { mark[p->dyn_mods[i]->id] = 1; st[n++] = p->dyn_mods[i]; } }
+        else { Module *entry = p->modules[p->nmodules - 1]; mark[entry->id] = 1; st[n++] = entry; }
+        while (n) {
+            Module *m = st[--n];
+            for (int k = 0; k < m->nimports; k++) {
+                Module *f = m->imports[k].from;
+                if (m->imports[k].dynamic || !f || f->id > maxid || mark[f->id]) continue;
+                mark[f->id] = 1;
+                st[n++] = f;
+            }
+        }
+    }
+    for (int i = 0; i < p->nmodules; i++) {
+        Module *m = p->modules[i];
+        m->lazy = dynr[m->id] && !reach[m->id] && !m->builtin && !(m->path && !strncmp(m->path, "builtin:", 8));
+    }
+    free(reach); free(dynr); free(st);
+}
 void emit_program(Program *p, Buf *o) {
     out = o;
     prog = p;
+    lazy_compute(p);
+    for (int i = 0; i < p->nmodules; i++)
+        if ((p->modules[i]->dyn_target && !p->modules[i]->builtin) || p->modules[i]->lazy) buf_printf(out, "static void xs_lazy_m%d(void);\n", p->modules[i]->id);
+    if (p->ndyn_mods) buf_puts(out, "static inline void xs_lazy_none(void) {}\n");
     if (p->uses_this_reg) buf_puts(out, xs_this_reg_c);
     if (p->uses_clone) buf_puts(out, "static void *xs_structured_clone(void *v);\nstatic const char xs_clone_plain[] = \"(a copy)\";\n"
                                      "static inline void *xs_unplain(void *v) { return v && xs_type_of(v)->fname == xs_clone_plain ? NULL : v; }\n");
@@ -14835,6 +14904,25 @@ void emit_program(Program *p, Buf *o) {
             i = j;
         }
     }
+    Module **run_lazy = calloc((size_t)(p->top.len + 1), sizeof(Module *)); /* by run id: the lazy module it is */
+    for (int i = 0; i < p->top.len;) { /* a lazy module's top level: a run of its own, not called by main (lazy_compute) */
+        Module *m = p->top.items[i]->mod;
+        int j = i;
+        while (j < p->top.len && p->top.items[j]->mod == m) j++;
+        if (m && m->lazy) {
+            bool ok = !xs_debug && !wbody;
+            for (int k = 0; k < p->top.len && ok; k++) if ((k < i || k >= j) && p->top.items[k]->mod == m) ok = false;
+            for (int k = i; k < j && ok; k++) if (p->top.items[k]->kind == S_VAR && nzv_has(p->top.items[k]->cname)) ok = false;
+            if (ok) {
+                if (top_run[i] <= 0) {
+                    top_run[i] = ++nmodfn;
+                    for (int k = i + 1; k < j; k++) top_run[k] = -1;
+                }
+                run_lazy[top_run[i]] = m;
+            } else m->lazy = false; /* (its top level stays in main: at start, as a static import's) */
+        }
+        i = j;
+    }
     Buf *main_buf = out;
     size_t main_at = out->len; /* the module functions go here, before main */
     { /* a top level without loops (a server, an app: it wires things up and hands over) is not optimized */
@@ -14884,6 +14972,13 @@ void emit_program(Program *p, Buf *o) {
             }
             bool rloops = false, rtry = false;
             for (int k = i; k < j; k++) { rloops = rloops || stmt_has_loop(p->top.items[k]); rtry = rtry || stmt_has_try(p->top.items[k]); }
+            Module *lz = run_lazy[top_run[i]];
+            if (lz) { /* the first import() runs it (and, first, the lazy modules it imports) */
+                buf_printf(out, "XS_NOINLINE void xs_lazy_m%d(void) { /* %s */\n    static bool done_;\n    if (done_) return;\n    done_ = true;", lz->id,
+                           lz->path ? path_base_name(lz->path) : "module");
+                for (int k = 0; k < lz->nimports; k++)
+                    if (!lz->imports[k].dynamic && lz->imports[k].from && lz->imports[k].from->lazy) buf_printf(out, "\n    xs_lazy_m%d();", lz->imports[k].from->id);
+            } else
             buf_printf(out, "%s void xs_init_m%d(void) { /* %s */", rloops ? "XS_NOINLINE" : "XS_RUN_ONCE static", top_run[i], p->top.items[i]->mod->path ? path_base_name(p->top.items[i]->mod->path) : "module");
             indent = 1;
             vol_locals = rtry;
@@ -14912,6 +15007,7 @@ void emit_program(Program *p, Buf *o) {
     epush(true);
     for (int i = 0; i < p->top.len; i++) {
         Stmt *s = p->top.items[i];
+        if (top_run[i] > 0 && run_lazy[top_run[i]]) continue; /* (its import() runs it) */
         if (top_run[i] > 0) { nl(); buf_printf(out, "xs_init_m%d();", top_run[i]); continue; }
         if (top_run[i] < 0) continue;
         cur_mod = s->mod;
@@ -14964,6 +15060,22 @@ void emit_program(Program *p, Buf *o) {
     indent--;
     nl();
     buf_puts(out, "}\n");
+    for (int i = 0; i < p->nmodules; i++) { /* import() of a module whose top level ran at start (or has none): nothing to run */
+        Module *m = p->modules[i];
+        bool has_fn = false;
+        for (int r = 1; r <= nmodfn && !has_fn; r++) has_fn = run_lazy[r] == m;
+        if ((m->dyn_target && !m->builtin) || m->lazy)
+            if (!has_fn) {
+                buf_printf(&modfns, "static void xs_lazy_m%d(void) {", m->id);
+                if (m->lazy) { /* (no top level of its own: the lazy modules it imports) */
+                    buf_puts(&modfns, " static bool done_; if (done_) return; done_ = true;");
+                    for (int k = 0; k < m->nimports; k++)
+                        if (!m->imports[k].dynamic && m->imports[k].from && m->imports[k].from->lazy) buf_printf(&modfns, " xs_lazy_m%d();", m->imports[k].from->id);
+                }
+                buf_puts(&modfns, "}\n");
+            }
+    }
+    free(run_lazy);
     if (modfns.len) buf_insert(main_buf, main_at, modfns.data);
     free(modfns.data);
     out = main_out;

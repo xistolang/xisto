@@ -47,6 +47,9 @@ typedef struct Binding {
     bool null_const;  /* const x = null (no type written): each read of x is null */
     bool fn_assigned; /* a module variable some function, method or closure of its module assigns (fn_assigned_global) */
     struct Class *proto_of; /* const p = Object.getPrototypeOf(x): the prototype of x's class (its methods' slots, an expando) */
+    const char *sym_desc; /* const T = Symbol('t'): how a key T shows ("Symbol(t)"); NULL for another value */
+    bool frozen;     /* given to Object.freeze, or its result: writes through it are compile errors (frozen_at: where) */
+    Pos frozen_at;
     struct Binding *next;
 } Binding;
 
@@ -2806,7 +2809,7 @@ static Type *resolve(Type *t, Pos pos) {
             t->key = ty_string;
             t->nkey = true;
         }
-        if (prog->uses_okmap && !t->record && (t->key->kind == TY_JSON || (t->key->kind == TY_OBJECT && !t->key->cls->builtin))) {
+        if (prog->uses_okmap && !t->record && (t->key->kind == TY_JSON || (t->key->kind == TY_OBJECT && (!t->key->cls->builtin || !strcmp(t->key->cls->name, "symbol"))))) {
             /* Map<object, V>, WeakMap<K, V>: keys by identity, kept while they are keys (xisto:okmap's OkMap<V>) */
             Class *ok = find_class("OkMap");
             if (ok) {
@@ -2826,7 +2829,9 @@ static Type *resolve(Type *t, Pos pos) {
             if (strs) t->key = ty_string;
         }
         if (t->key->kind != TY_STRING && t->key->kind != TY_INT)
-            xs_error(XS6035, pos, "Map keys are string or int in xisto", "unsupported Map key type '%s'", ty_name(t->key));
+            xs_error(XS6035, pos, t->record && t->key->kind == TY_OBJECT && t->key->cls->builtin && !strcmp(t->key->cls->name, "symbol")
+                                      ? "keep entries keyed by symbols in a Map<symbol, V>, or write each key in an object: { [KEY]: v }"
+                                      : "Map keys are string or int in xisto", "unsupported Map key type '%s'", ty_name(t->key));
         return t;
     case TY_NULLABLE:
         t->elem = resolve(t->elem, pos);
@@ -3087,6 +3092,59 @@ static Binding *lookup(const char *name) {
     }
     return NULL;
 }
+/* Object.freeze(x): the value x itself, the binding it was read from (and the one its result goes into) marked
+   frozen. Node's frozen object ignores a write (sloppy code) or throws a TypeError (strict code, a module); here a
+   write through a frozen binding is a compile error (TypeScript's Readonly<T>). A write through another path to the
+   same object (a parameter it was passed to) is not seen: it changes the object, where Node would not. */
+static Expr *frozen_val; /* the last Object.freeze(...) checked (its node, now the value) */
+static bool this_call_rewrite(Expr *e, Type *expected);
+/* { [T]: v } and o[T] with T a const symbol: a field of its own, named __sym_<T's C name> (no other name can be), shown
+   by console.log as Node shows it, after the string keys, and left out of JSON.stringify and Object.keys */
+static const char **sym_fields, **sym_shown;
+static int nsym_fields;
+const char *xs_sym_field_shown(const char *name) {
+    for (int i = 0; i < nsym_fields; i++) if (!strcmp(sym_fields[i], name)) return sym_shown[i];
+    return NULL;
+}
+static const char *sym_key_field(Expr *k) {
+    if (!k || k->kind != E_IDENT || !k->str) return NULL;
+    Binding *b = lookup(k->str), *root = b;
+    while (root && root->origin) root = root->origin;
+    if (!root || !root->sym_desc) return NULL;
+    const char *n = xs_sprintf("__sym_%s", root->cname);
+    for (int i = 0; i < nsym_fields; i++) if (!strcmp(sym_fields[i], n)) return sym_fields[i];
+    sym_fields = realloc(sym_fields, sizeof(char *) * (size_t)(nsym_fields + 1));
+    sym_shown = realloc(sym_shown, sizeof(char *) * (size_t)(nsym_fields + 1));
+    sym_fields[nsym_fields] = n;
+    sym_shown[nsym_fields++] = xs_sprintf("Symbol(%s)", root->sym_desc);
+    if (b) b->used = true;
+    return n;
+}
+static Binding *frozen_binding(Expr *x) {
+    if (!x || x->kind != E_IDENT || !x->str) return NULL;
+    for (Binding *b = lookup(x->str); b; b = b->origin) if (b->frozen) return b;
+    return NULL;
+}
+static void frozen_write(Expr *t, Pos pos) {
+    while (t && t->kind == E_AS && t->lhs) t = t->lhs;
+    if (!t || !((t->kind == E_MEMBER && !t->is_call) || t->kind == E_INDEX)) return;
+    Binding *b = frozen_binding(t->lhs);
+    if (b) xs_error(XS8152, pos, "write to a copy: const copy = { ...x } (or [...xs])",
+                    "cannot write to '%s': it was frozen with Object.freeze (line %d)", t->lhs->str, b->frozen_at.line);
+}
+static void frozen_call(Expr *e) { /* xs.push(v) on a frozen array, r.delete(k) on a frozen Record (delete r[k]) */
+    static const char *const muts[] = {"push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin", "delete", "set", "clear", NULL};
+    if (!e->is_call || !e->str || !e->lhs) return;
+    Binding *b = frozen_binding(e->lhs);
+    if (!b) return;
+    Type *t = b->type ? ty_strip_null(b->type) : NULL;
+    if (!t || !(t->kind == TY_ARRAY || (t->kind == TY_MAP && t->record))) return; /* (a frozen Map's entries still change, as in Node) */
+    for (int i = 0; muts[i]; i++)
+        if (!strcmp(e->str, muts[i]))
+            xs_error(XS8152, e->pos, "change a copy: const copy = [...xs]",
+                     "cannot write to '%s': it was frozen with Object.freeze (line %d)", e->lhs->str, b->frozen_at.line);
+}
+
 
 /* `this` inside an arrow: captured from the method */
 static const char *this_cname(void) {
@@ -4210,6 +4268,16 @@ static bool fn_member(Expr *e, Type *expected) {
         Binding *b = lookup(x->str);
         if (b ? !(b->type && b->type->kind == TY_FUNC) : !lookup_func(x->str)) return false;
         if ((iscall || (isapply && e->args.len == 2)) && b && b->type->rest) return false; /* (original.call(this, ...args), original.apply(this, args): XB-107's __xs_apply) */
+        if ((iscall || isapply) && e->args.len >= 1) {
+            /* f.call(obj, ...) / f.apply(obj, [...]) of a function or a function variable: this_call_rewrite (obj as the
+               `this` of a function that declares it, evaluated when it is not a plain read); here only f.apply(obj, xs)
+               spread into a rest parameter, and f.apply(obj, null) */
+            Func *uf = b ? NULL : lookup_func(x->str);
+            bool rest = b ? b->type->rest : uf && uf->nparams && uf->params[uf->nparams - 1].rest;
+            Expr *arr = isapply && e->args.len == 2 ? e->args.items[1] : NULL;
+            bool nolist = arr && (arr->kind == E_NULL || (arr->kind == E_IDENT && !strcmp(arr->str, "undefined")));
+            if (!(arr && arr->kind != E_ARRAY_LIT && (rest || nolist))) return false;
+        }
     } else if (x->kind == E_MEMBER && !x->is_call && x->lhs && x->str) {
         if (x->lhs->kind == E_IDENT && !lookup(x->lhs->str)) {
             Class *sc = find_class(x->lhs->str); /* Class.staticMethod */
@@ -10852,6 +10920,9 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     case E_ASSIGN:
     case E_POSTFIX: {
+        frozen_write(e->lhs, e->pos);
+        if (e->kind == E_ASSIGN && e->op == TK_ASSIGN && e->lhs && e->lhs->kind == E_IDENT && e->lhs->str) /* x = other: x no longer the frozen one */
+            for (Binding *b = lookup(e->lhs->str); b; b = b->origin) b->frozen = false;
         if (e->lhs && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->str && e->lhs->lhs && e->lhs->lhs->kind == E_IDENT &&
             !lookup(e->lhs->lhs->str)) { /* B.count = v (or this.count++ in a static method B inherits) with count a static of a base A:
                                             JavaScript makes B a property of its own there, which xisto's one variable per static is not */
@@ -11335,6 +11406,19 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     }
     case E_CALL: {
+        if (e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && !strcmp(e->lhs->str, "__xs_construct") && e->args.len == 2) {
+            Expr *k = e->args.items[0]; /* new (F as any)(): F a function */
+            while (k->kind == E_AS && k->lhs) k = k->lhs;
+            if (k->kind == E_IDENT && k->str && !lookup(k->str) && !find_class(k->str) && lookup_func(k->str))
+                xs_error(XS6046, e->pos, xs_sprintf("write a class: class %s { constructor(...) { this.x = ...; } }", k->str),
+                         "'%s' is a function: 'new' makes objects of classes only", k->str);
+        }
+        if (!e->this_call && e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && !lookup(e->lhs->str)) {
+            Func *tf = lookup_func(e->lhs->str);
+            if (tf && tf->this_param)
+                xs_error(XS6047, e->pos, "the object goes first: f.call(obj, a, b)", "'%s' declares 'this': call it as %s.call(obj, ...) or %s.apply(obj, [...])",
+                         tf->name, tf->name, tf->name);
+        }
         if (e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && !strncmp(e->lhs->str, "__deco", 6) && e->args.len == 2 &&
             ((e->args.items[1]->kind == E_INDEX && e->args.items[1]->lhs && e->args.items[1]->lhs->kind == E_MEMBER &&
               e->args.items[1]->lhs->str && !strcmp(e->args.items[1]->lhs->str, "fields")) ||
@@ -12125,6 +12209,12 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     }
     case E_INDEX:
+        if (sym_key_field(e->rhs)) { /* o[T], T a const symbol: o's field for T */
+            Expr *k = e->rhs;
+            e->kind = E_MEMBER; e->str = (char *)sym_key_field(k); e->rhs = NULL; e->field = -1;
+            check_expr(e, expected);
+            return;
+        }
         {   /* o[k] read, k a union of o's field names: that field */
             const char **names; int n;
             if (e != dyn_lvalue && lit_key_fields(e, &names, &n)) {
@@ -12405,6 +12495,23 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
+        if (e->is_call && e->str && !strcmp(e->str, "toString") && e->args.len == 0 && e->lhs && pure_read(e->lhs)) {
+            /* sym.toString(): String(sym), "Symbol(desc)" */
+            Expr *probe = pure_copy(e->lhs);
+            if (probe) {
+                check_expr(probe, NULL);
+                Type *t = probe->type;
+                if (t && t->kind == TY_OBJECT && t->cls->builtin && !strcmp(t->cls->name, "symbol")) {
+                    Expr *v = e->lhs;
+                    memset(e, 0, sizeof *e);
+                    e->kind = E_CALL; e->pos = v->pos; e->field = -1;
+                    e->lhs = xs_alloc(sizeof *e->lhs); e->lhs->kind = E_IDENT; e->lhs->pos = v->pos; e->lhs->field = -1; e->lhs->str = "String";
+                    expr_list_push(&e->args, v);
+                    check_expr(e, expected);
+                    return;
+                }
+            }
+        }
         if (e->is_call && e->str && !strcmp(e->str, "toString") && e->args.len == 0 && e->lhs && tsc_checked()) {
             /* v.toString() with v an unknown (narrowed by typeof to a number or a bigint): String(v) */
             check_expr(e->lhs, NULL);
@@ -12456,6 +12563,52 @@ static void check_expr_in(Expr *e, Type *expected) {
             expr_list_push(&e->args, self);
             expr_list_push(&e->args, arr);
             check_expr(e, expected);
+            return;
+        }
+        frozen_call(e);
+        if (e->is_call && e->str && (!strcmp(e->str, "call") || !strcmp(e->str, "apply")) && e->lhs && e->args.len >= 1 &&
+            this_call_rewrite(e, expected)) return;
+        if (e->is_call && e->str && !strcmp(e->str, "defineProperty") && e->lhs && e->lhs->kind == E_IDENT && !strcmp(e->lhs->str, "Object") &&
+            !lookup("Object") && e->args.len == 3 && e->args.items[2]->kind == E_OBJLIT) {
+            Expr *d = e->args.items[2];
+            for (int i = 0; i < d->args.len && d->keys; i++)
+                if (d->keys[i] && (!strcmp(d->keys[i], "get") || !strcmp(d->keys[i], "set")))
+                    xs_error(XS6045, e->pos, "declare the property in a class: get name(): T { ... } and set name(v: T) { ... }",
+                             "Object.defineProperty with get/set is not supported: a property computed by a function is a class accessor here");
+        }
+        if (e->is_call && e->str && !strcmp(e->str, "freeze") && e->lhs && e->lhs->kind == E_IDENT && !strcmp(e->lhs->str, "Object") &&
+            !lookup("Object") && e->args.len == 1) {
+            /* Object.freeze(x): x itself, read-only from here (frozen_write) */
+            Expr *x = e->args.items[0];
+            Pos at = e->pos;
+            check_expr(x, expected);
+            if (x->kind == E_IDENT && x->str) {
+                Binding *b = lookup(x->str);
+                if (b) for (Binding *o = b; o; o = o->origin) if (!o->frozen) { o->frozen = true; o->frozen_at = at; }
+            }
+            *e = *x;
+            e->pos = at;
+            e->prechecked = true;
+            frozen_val = e;
+            return;
+        }
+        if (e->is_call && e->str && !strcmp(e->str, "isFrozen") && e->lhs && e->lhs->kind == E_IDENT && !strcmp(e->lhs->str, "Object") &&
+            !lookup("Object") && e->args.len == 1) {
+            /* Object.isFrozen(x): what the compiler knows; a primitive is frozen (as in Node), an object when it went
+               through Object.freeze under this name */
+            Expr *x = e->args.items[0];
+            check_expr(x, NULL);
+            Type *t = ty_strip_null(x->type);
+            bool prim = !ty_is_heap(t) || t->kind == TY_STRING;
+            bool v = false;
+            if (prim || x->kind == E_NULL) v = true;
+            else if (x == frozen_val || frozen_binding(x)) v = true;
+            else if (x->kind == E_IDENT || x->kind == E_OBJLIT || x->kind == E_ARRAY_LIT || x->kind == E_NEW_OBJ || x->kind == E_NEW_MAP) v = false;
+            else xs_error(XS8153, x->pos, "give it the variable the object was frozen through: Object.isFrozen(cfg)",
+                          "Object.isFrozen answers from what the compiler knows: give it a variable");
+            Pos at = e->pos;
+            memset(e, 0, sizeof *e);
+            e->kind = E_BOOL; e->pos = at; e->field = -1; e->boolean = v; e->type = ty_boolean;
             return;
         }
         if (e->is_call && e->str && !strcmp(e->str, "defineProperty") && e->lhs && e->lhs->kind == E_IDENT && !strcmp(e->lhs->str, "Object") &&
@@ -12937,6 +13090,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->args = (ExprList){0};
                 for (int i = 0; i < c->nfields; i++) {
                     if (xs_hidden_field(c->fields[i].name)) continue; /* #x: not a key */
+                    if (xs_sym_field_shown(c->fields[i].name)) continue; /* (a symbol key: not listed, as in Node) */
                     Expr *k = xs_alloc(sizeof *k);
                     k->kind = E_STRING; k->pos = e->pos; k->field = -1; k->str = (char *)c->fields[i].name;
                     expr_list_push(&e->args, k);
@@ -13460,6 +13614,19 @@ static void check_expr_in(Expr *e, Type *expected) {
             Expr *na = e->lhs;
             if (!e->is_call || strcmp(e->str, "fill") != 0)
                 xs_error(XS6017, e->pos, "write: new Array<T>(n).fill(x)", "a new array must be filled before use");
+            if (!na->elem_type) { /* new Array(n).fill(x): the element type is the fill value's (a T[] expected: T) */
+                Type *x = expected ? ty_strip_null(expected) : NULL;
+                if (x && x->kind == TY_ARRAY) na->elem_type = x->elem;
+                else if (e->args.len == 1) {
+                    Expr *v = e->args.items[0];
+                    check_expr(v, NULL);
+                    settle(v);
+                    if (v->type->kind == TY_NULL || v->type->kind == TY_VOID)
+                        xs_error(XS1019, e->pos, "write the element type: new Array<T | null>(n).fill(null)", "new Array(n).fill(null) needs its element type here");
+                    na->elem_type = v->type;
+                    v->prechecked = true;
+                } else xs_error(XS1019, e->pos, "write the element type: new Array<number>(n)", "new Array(n) needs its element type here");
+            }
             na->elem_type = resolve(na->elem_type, na->pos);
             check_type_supported(na->pos, ty_array_of(na->elem_type));
             check_expr(na->lhs, ty_int);
@@ -14820,6 +14987,25 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     }
     case E_OBJLIT: {
+        for (int i = 0; e->keys && i < e->args.len; i++) { /* { [T]: v }, T a const symbol: a field of its own */
+            Expr *a = e->args.items[i];
+            if (strcmp(e->keys[i], "[]") || !a || a->kind != E_UNARY || a->op != TK_LBRACKET) continue;
+            const char *fname = sym_key_field(a->lhs);
+            if (!fname && a->lhs && a->lhs->kind == E_IDENT && a->lhs->str && lookup(a->lhs->str)) {
+                Type *kt = lookup(a->lhs->str)->type;
+                if (kt && kt->kind == TY_OBJECT && kt->cls && kt->cls->builtin && !strcmp(kt->cls->name, "symbol"))
+                    xs_error(XS6049, a->lhs->pos, "declare the key once at the top level: const KEY = Symbol(\"key\");",
+                             "a symbol key here must be a constant made by Symbol(\"description\")");
+            }
+            if (!fname) continue;
+            e->keys[i] = (char *)fname;
+            e->args.items[i] = a->rhs;
+        }
+        if (e->keys && e->spread) {
+            bool any = false;
+            for (int i = 0; i < e->args.len; i++) if (!strcmp(e->keys[i], "[]") || !strcmp(e->keys[i], "...")) any = true;
+            if (!any) e->spread = false;
+        }
         if (e->keys && e->args.len >= 2 && !strcmp(e->keys[e->args.len - 1], "...")) {
             /* { ...entity, ...Object.fromEntries(pairs) }: entity's copy, then each pair written into it by key (as
                JavaScript's spread does: the values as they are, a Date stays a Date):
@@ -15335,6 +15521,9 @@ static void check_expr_in(Expr *e, Type *expected) {
     case E_NEW_OBJ: {
         if (e->str && strcmp(e->str, "Promise") == 0 && !find_class("Promise")) { check_pr_new(e, expected); return; }
         Class *c = e->cls && e->cls->adapter_of ? e->cls : find_class(e->str); /* (an adapter has no name to find) */
+        if (!c && e->str && !lookup(e->str) && lookup_func(e->str))
+            xs_error(XS6046, e->pos, xs_sprintf("write a class: class %s { constructor(...) { this.x = ...; } }", e->str),
+                     "'%s' is a function: 'new' makes objects of classes only", e->str);
         if (!c) {
             int n; const char **cands = class_names(&n);
             if (missing_name(e->str)) xs_error_quiet();
@@ -16092,6 +16281,81 @@ static void check_block(Stmt *b) {
 }
 
 static Expr *proto_call_of(Expr *x);
+/* f.call(obj, a, b) / f.apply(obj, [a, b]): f(obj, a, b) for a function declared with `this: T` (its first parameter),
+   f(a, b) for another function (obj unused: evaluated when it is not a plain read); m.call(obj, a) of a method
+   (x.m, C.prototype.m): obj.m(a). Returns whether e was rewritten (and checked). */
+static bool this_call_rewrite(Expr *e, Type *expected) {
+    bool apply = e->str[0] == 'a';
+    Expr *fx = e->lhs, *self = e->args.items[0];
+    Func *uf = NULL;
+    Class *mc = NULL; /* a method of this class */
+    Expr *fval = NULL; /* a field or variable holding a function */
+    if (fx->kind == E_IDENT && fx->str && !lookup(fx->str)) uf = lookup_func(fx->str);
+    else if (fx->kind == E_IDENT && fx->str) {
+        Binding *b = lookup(fx->str);
+        Type *t = b && b->type ? ty_strip_null(b->type) : NULL;
+        if (t && t->kind == TY_FUNC && !t->rest) fval = fx;
+    } else if (fx->kind == E_MEMBER && !fx->is_call && fx->str && fx->lhs) {
+        Expr *o = fx->lhs;
+        if (o->kind == E_MEMBER && !o->is_call && o->str && !strcmp(o->str, "prototype") && o->lhs && o->lhs->kind == E_IDENT &&
+            !lookup(o->lhs->str)) { /* C.prototype.m.call(obj, ...) */
+            Class *c = find_class(o->lhs->str);
+            if (c && find_method(c, fx->str)) mc = c;
+        } else if (pure_read(o)) {
+            Expr *probe = pure_copy(o);
+            if (probe) {
+                check_expr(probe, NULL);
+                Type *t = ty_strip_null(probe->type);
+                if (t->kind == TY_OBJECT && !t->cls->builtin && find_method(t->cls, fx->str)) mc = t->cls;
+                else if (t->kind == TY_OBJECT && !t->cls->builtin) {
+                    for (int i = 0; i < t->cls->nfields; i++)
+                        if (!strcmp(t->cls->fields[i].name, fx->str) && ty_strip_null(t->cls->fields[i].type)->kind == TY_FUNC &&
+                            !ty_strip_null(t->cls->fields[i].type)->rest) fval = fx;
+                }
+            }
+        }
+    }
+    if (!uf && !mc && !fval) return false;
+    ExprList rest = {0};
+    if (apply) {
+        if (e->args.len > 2) return false;
+        if (e->args.len == 2) {
+            Expr *arr = e->args.items[1];
+            if (arr->kind != E_ARRAY_LIT || arr->spread)
+                xs_error(XS6048, arr->pos, xs_sprintf("pass them one by one: %s.call(obj, a, b)", uf ? uf->name : fx->str ? fx->str : "f"),
+                         "%s.apply takes its arguments as an array literal here", uf ? uf->name : fx->str ? fx->str : "f");
+            for (int i = 0; i < arr->args.len; i++) expr_list_push(&rest, arr->args.items[i]);
+        }
+    } else for (int i = 1; i < e->args.len; i++) expr_list_push(&rest, e->args.items[i]);
+    Pos at = e->pos;
+    Expr *c = xs_alloc(sizeof *c);
+    c->field = -1; c->pos = at;
+    bool keep_self = false;
+    if (mc) { /* obj.m(...) */
+        c->kind = E_MEMBER; c->is_call = true; c->str = fx->str; c->lhs = self;
+        c->args = rest;
+    } else {
+        if (fval && fval->kind == E_MEMBER) { c->kind = E_MEMBER; c->is_call = true; c->str = fval->str; c->lhs = fval->lhs; }
+        else { c->kind = E_CALL; c->lhs = fx; }
+        if (uf && uf->this_param) { expr_list_push(&c->args, self); c->this_call = true; }
+        else keep_self = !(self->kind == E_NULL || self->kind == E_THIS || pure_read(self));
+        for (int i = 0; i < rest.len; i++) expr_list_push(&c->args, rest.items[i]);
+    }
+    if (keep_self) { /* (obj evaluated first, as JavaScript does) */
+        check_expr(self, NULL);
+        check_expr(c, expected);
+        Expr *seq = xs_alloc(sizeof *seq);
+        seq->kind = E_SEQ; seq->pos = at; seq->field = -1; seq->type = c->type;
+        expr_list_push(&seq->args, self);
+        expr_list_push(&seq->args, c);
+        *e = *seq;
+        return true;
+    }
+    *e = *c;
+    check_expr(e, expected);
+    return true;
+}
+
 static void check_var(Stmt *s, bool global) {
     if (s->init && proto_call_of(s->init)) {
         /* const proto = Object.getPrototypeOf(x) [as {...}]: the prototype of x's class, read and written by name: a method
@@ -16186,6 +16450,12 @@ static void check_var(Stmt *s, bool global) {
     settle(s->init);
     s->type = s->decl_type ? s->decl_type : s->init->type;
     Binding *b = declare(s->pos, s->name, s->type, s->is_const, global, false);
+    if (s->init == frozen_val && frozen_val) { b->frozen = true; b->frozen_at = s->init->pos; }
+    if (s->is_const && s->init->kind == E_CALL && s->init->builtin.cfn && !strcmp(s->init->builtin.cfn, "xs_Symbol_new") && s->init->args.len == 1) {
+        Expr *d = s->init->args.items[0]; /* const T = Symbol('t'): a key of objects (sym_key_field) */
+        if (d->kind == E_STRING && d->str) b->sym_desc = d->str;
+        else if (d->kind == E_NULL) b->sym_desc = "";
+    }
     if (!s->decl_type && !s->is_const && s->type->kind == TY_NUMBER) b->lit_number = true;
     if (null_init) b->null_const = true;
     if (s->is_const && s->init->kind == E_ARROW) b->arrow_fn = s->init->arrow->fn;
