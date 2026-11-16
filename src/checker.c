@@ -1,5 +1,8 @@
 #include "xisto.h"
 #define XR_CORE_ONLY 1
+#define XS_RT_UPROPS 1 /* (every property's table: the patterns' \p{...} are checked here, and the ones named recorded) */
+#define XR_UP_ALL 1
+#include "../runtime/xisto_uprops.h"
 #include "../runtime/xisto_regex.h" /* patterns of /literals/ are compiled here once, to report their errors */
 #include "../runtime/xisto_regex_bt.h" /* (and those only backtracking can match) */
 #include <ctype.h>
@@ -5022,6 +5025,7 @@ static void check_pr_member(Expr *e, Type *expected) {
         if (ok->type->kind != TY_FUNC) xs_error(XS8018, ok->pos, NULL, "the argument of %s must be a function, but this is %s", m, ty_name(ok->type));
         okr = ok->type->ret;
         okk = pr_cb_kind(&okr);
+        if (okk != 5 && ok->kind == E_ARROW && (ok->arrow->fn->is_async || ok->arrow->fn->ret_promise)) okk |= 8; /* (its value through a promise: Node's two more turns) */
         if (!how) R = okr;
     }
     if (err) {
@@ -5036,6 +5040,7 @@ static void check_pr_member(Expr *e, Type *expected) {
         if (err->type->kind != TY_FUNC) xs_error(XS8018, err->pos, NULL, "the argument of %s must be a function, but this is %s", m, ty_name(err->type));
         errr = err->type->ret;
         errk = pr_cb_kind(&errr);
+        if (errk != 5 && err->kind == E_ARROW && (err->arrow->fn->is_async || err->arrow->fn->ret_promise)) errk |= 8;
         if (never && errr->kind == TY_VOID) errr = R; /* it returns nothing because it never returns */
         if (!ty_equal(errr, R) && discard) R = ty_void; /* the promise it makes is dropped: no one type needed */
         else if (!ty_equal(errr, R)) {
@@ -6767,6 +6772,17 @@ static bool check_string_member_more(Expr *e) {
             sp->kind = E_STRING; sp->pos = e->pos; sp->str = " "; sp->type = ty_string; sp->field = -1;
             sp->lit_id = intern(" ");
             expr_list_push(&e->args, sp);
+        }
+        if (!strcmp(e->str, "normalize")) { /* (the Unicode tables join the program; the compatibility ones only for NFKC/NFKD) */
+            if (e->args.len == 0) {
+                Expr *nf = xs_alloc(sizeof *nf);
+                nf->kind = E_STRING; nf->pos = e->pos; nf->str = "NFC"; nf->type = ty_string; nf->field = -1;
+                nf->lit_id = intern("NFC");
+                expr_list_push(&e->args, nf);
+            }
+            Expr *fa = e->args.items[0];
+            prog->uses_normalize = true;
+            if (fa->kind != E_STRING || !strncmp(fa->str, "NFK", 3)) prog->uses_normalize_k = true;
         }
         if (ms[i].ret == 3 && e->args.len == 0) { /* s.charCodeAt(): index 0 */
             Expr *z = xs_alloc(sizeof *z);
@@ -9907,6 +9923,9 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (k != 3 && k != 4) xs_error(XS2006, e->pos, "check it first: if (p !== null) await p;", "awaiting a %s that may be null", ty_name(e->lhs->type));
             wrap_call(e->lhs, k == 4 ? "xs_promise_await_v" : "xs_promise_await_p", k == 4 ? ty_void : ty_nullable_of(ty_strip_null(t)));
         }
+        else if (!pr_async_call(e->lhs) && !(e->lhs->kind == E_CALL && e->lhs->func && e->lhs->func->is_async))
+            e->await_tick = 1; /* (await null, await of a plain value: a microtask turn) */
+        else e->await_tick = 2; /* (an async function called here runs as a call: its promise's turn only while the coroutine starts) */
         e->type = e->lhs->type;
         { /* await queryOne<Row>(sql): what the await gives, as a Row */
             Expr *c = e->lhs->kind == E_SPAWN ? e->lhs->lhs : e->lhs;
@@ -15302,6 +15321,9 @@ static void check_expr_in(Expr *e, Type *expected) {
                 prog->uses_regex = true;
                 { /* new RegExp(text): a pattern only backtracking can match, or one not known until it runs, brings that engine */
                     Expr *src = e->args.items[0];
+                    /* (a pattern known only at run time with flag u or v, or flags not known: every property table) */
+                    Expr *fx = e->args.len > 1 ? e->args.items[1] : NULL;
+                    if (src->kind != E_STRING && (!fx || fx->kind != E_STRING || strchr(fx->str, 'u') || strchr(fx->str, 'v'))) prog->uprops_all = true;
                     if (src->kind != E_STRING) prog->uses_rebt = true;
                     else {
                         const char *err = NULL;
@@ -20711,3 +20733,7 @@ static bool reexports_or_has(Module *m, const char *name) {
     }
     return false;
 }
+
+/* the Unicode properties the program's patterns name (\p{...}): main.c links their tables (XR_UP_<n>) */
+bool checker_uprop_used(int id) { return id < XR_UP_COUNT && (xr_up_seen[id / 64] >> (id % 64)) & 1; }
+int checker_uprop_count(void) { return XR_UP_COUNT; }

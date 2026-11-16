@@ -353,6 +353,8 @@ struct Expr {
     bool par_native;   /* E_CALL of xisto:parallel whose fn was proved independent (parallel.c): the pool version */
     bool rng_set;      /* E_IDENT: a range the pass that built it proved (distribute.c's pair slot counter) */
     bool loose;        /* E_BINARY: written == or != (the same as === / !== when no coercion could happen) */
+    uint8_t await_tick; /* E_AWAIT: 1 of a value that is no promise (await null): one turn of the microtasks, as Node's,
+                          on a coroutine (emit.c, xs_await_tick); 2 of an async function called directly (xs_await_call_tick) */
     long long rng_lo, rng_hi;
     Type *gen_ret;     /* E_CALL of a generic function value with type arguments (f<Row>(x)): the result type its
                           signature gives; the unknown it returns is converted to it (here, or by the await around it) */
@@ -748,6 +750,8 @@ typedef struct {
     bool uses_regex;    /* RegExp: runtime/xisto_regex.h joins the program */
     bool uses_rebt; /* a RegExp that needs backtracking (or one built from text at run time): runtime/xisto_regex_bt.h joins */
     bool uses_plain; /* Object.getPrototypeOf(u) of an unknown: xs_is_plain, by the value's class (emitted only then) */
+    bool uprops_all; /* a RegExp known only at run time that may have flag u: every \\p{...} table joins (checker_uprop_used: the named ones) */
+    bool uses_normalize, uses_normalize_k; /* s.normalize(): runtime/xisto_unicode.h's tables (the compatibility ones for NFKC/NFKD) */
     bool uses_clone; /* structuredClone: a copy by the value's class at run time (emitted only then) */
     bool uses_profiler; /* xisto:profiler: its runtime (xisto_prof.h) and the table of the program's functions (emit.c) */
     bool uses_v8, uses_unk_map, uses_symbol_for, uses_nkey, uses_okmap; /* xisto:v8, x instanceof Map/Set of an unknown, Symbol.for: their runtime joins the program */

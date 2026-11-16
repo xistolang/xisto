@@ -35,7 +35,7 @@ instead. Intended differences are in [Divergences from TypeScript](./divergences
 ## Runtime and library
 
 - `Map` and `Set` `for…of` does not see entries added during the loop.
-- `String.prototype.normalize` returns the string unchanged; `localeCompare` and `Date` have no ICU data:
+- `localeCompare` and `Date` have no ICU data:
   `Date.toString()` shows the zone abbreviation (`-03`), not its long name.
 - `Map.get` of a missing key with an `int`, `number` or `boolean` value, read where only that type fits
   (`m.get(k) + 1`), is a run-time error: test with `has`, or write `m.get(k) ?? 0`.
