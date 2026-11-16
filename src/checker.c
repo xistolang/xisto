@@ -18794,6 +18794,12 @@ static void infer_ints_fn(Stmt *body) {
     for (int c = 0; c < iicn; c++) ii_mark(iic[c].v, iic[c].on);
 }
 
+/* a function of a built-in module (runtime/node/*.ts...) cannot assign a variable of another module: its own local
+   of the same name (a `let k` in a nested block, which ii_shadows does not see) must not make the program's `k` a
+   number */
+static bool ii_foreign(Module *fm, Module *vm) {
+    return fm && vm && fm != vm && fm->file && strncmp(fm->file, "xisto:", 6) == 0;
+}
 /* top-level `let`s are globals: functions may assign them too */
 static void infer_ints_top(Program *p) {
     ii_tn = ii_an = ii_cn = ii_dn = 0; /* the top level's typed names and consts (const lim = Math.max(1, n)), as in a function */
@@ -18803,9 +18809,11 @@ static void infer_ints_top(Program *p) {
         if (ii_candidate(v)) {
             bool ok = true;
             for (int k = i + 1; k < p->top.len && ok; k++) ok = ii_stmt_ok(p->top.items[k], v->name);
-            for (int f = 0; f < p->nfuncs && ok; f++) ok = ii_shadows(p->funcs[f], v->name) || ii_stmt_ok(p->funcs[f]->body, v->name);
+            for (int f = 0; f < p->nfuncs && ok; f++)
+                ok = ii_foreign(p->funcs[f]->mod, v->mod) || ii_shadows(p->funcs[f], v->name) || ii_stmt_ok(p->funcs[f]->body, v->name);
             for (int c = 0; c < p->nclasses && ok; c++) {
                 Class *cl = p->classes[c];
+                if (ii_foreign(cl->mod, v->mod)) continue;
                 for (int m = 0; m < cl->nmethods && ok; m++) ok = ii_shadows(cl->methods[m], v->name) || ii_stmt_ok(cl->methods[m]->body, v->name);
                 if (cl->ctor) ok = ok && (ii_shadows(cl->ctor, v->name) || ii_stmt_ok(cl->ctor->body, v->name));
             }
