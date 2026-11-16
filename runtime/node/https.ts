@@ -10,6 +10,8 @@ declare function tlss_accept(cred: int, fd: int): int;
 declare function tlss_read(h: int): Uint8Array;
 declare function tlss_send(h: int, bytes: Uint8Array, off: int): int;
 declare function tlss_write(h: int, bytes: Uint8Array, off: int): int;
+declare function tlss_pending(h: int): boolean;
+declare function tlss_end(h: int): boolean;
 declare function tlss_close(h: int): void;
 declare function tlsc_connect(host: string, port: int, servername: string): int;
 declare function tlsc_last(): string;
@@ -46,7 +48,14 @@ class TlsServerTransport extends HttpTransport {
   override writeAll(b: Uint8Array, off: int): int {
     return tlss_write(this.h, b, off);
   }
+  override pending(): boolean {
+    return tlss_pending(this.h);
+  }
+  override endWrite(): boolean {
+    return tlss_end(this.h);
+  }
   override shutdown(how: int): void {
+    if (how === 1) tlss_end(this.h); // (close_notify first, as far as the socket takes it now)
     net_shutdown(this.fd, how);
   }
   override close(): void {

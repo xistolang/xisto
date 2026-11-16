@@ -151,3 +151,4 @@ static ssize_t xs_tls_srv_write(xs_tls *t, int fd, const char *p, size_t n) {
    which the caller already tracks as unsent output */
 static bool xs_tls_srv_pending(xs_tls *t) { (void)t; return false; }
 static void xs_tls_srv_close_notify(xs_tls *t, int fd) { xs_tls_bind(t, fd); SSL_shutdown(t->ssl); ERR_clear_error(); }
+static void xs_tls_srv_close_start(xs_tls *t, int fd) { xs_tls_srv_close_notify(t, fd); } /* (best effort, as at close) */

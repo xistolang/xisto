@@ -134,6 +134,15 @@ export class HttpTransport {
   writeAll(b: Uint8Array, off: int): int {
     return net_write(this.fd, off === 0 ? b : b.subarray(off));
   }
+  /** true while bytes send() took are still held (TLS records the socket did not take yet): writeAll(EMPTY, 0)
+   * writes them out. */
+  pending(): boolean {
+    return false;
+  }
+  /** Starts the end of the writing side (TLS: close_notify); true when nothing is left to write before shutdown(1). */
+  endWrite(): boolean {
+    return true;
+  }
   /** 0: no more reads, 1: no more writes (the peer reads the end), 2: both. */
   shutdown(how: int): void {
     net_shutdown(this.fd, how);
@@ -869,7 +878,17 @@ export class HttpConnection {
   private endAfterWrites(): void {
     this.state = 3;
     if (this.flushing) this.closeAfter = true;
-    else if (!this.closed) this.t.shutdown(1);
+    else if (!this.closed) this.endWriting();
+  }
+  /** The end of the writing side once the transport has written all it holds (TLS: its records, then close_notify). */
+  private endWriting(): void {
+    if (this.t.endWrite()) {
+      this.t.shutdown(1);
+      return;
+    }
+    this.closeAfter = true;
+    this.flushing = true;
+    this.flushTask = this.flush();
   }
   /** (internal) ends the connection now (server.close() on an idle one, closeAllConnections()). */
   _destroy(): void {
@@ -886,10 +905,12 @@ export class HttpConnection {
         this.fail();
         return false;
       }
-      if (w === b.length) return true;
-      this.out.push(w === 0 ? b : b.subarray(w));
-      this.queued += b.length - w;
-      this.flushing = true;
+      if (w === b.length && !this.t.pending()) return true;
+      if (w < b.length) {
+        this.out.push(w === 0 ? b : b.subarray(w));
+        this.queued += b.length - w;
+      }
+      this.flushing = true; // (all taken but not all written, as TLS records: the task writes them out)
       this.flushTask = this.flush();
       return this.queued < HIGH_WATER;
     }
@@ -898,12 +919,16 @@ export class HttpConnection {
     return this.queued < HIGH_WATER;
   }
   private async flush(): Promise<void> {
-    while (this.out.length > 0 && !this.gone) {
-      const b = this.out[0];
-      const r = this.t.writeAll(b, 0);
-      this.out.shift();
-      this.queued -= b.length;
-      if (r < 0) this.fail();
+    for (;;) {
+      while (this.out.length > 0 && !this.gone) {
+        const b = this.out[0];
+        const r = this.t.writeAll(b, 0);
+        this.out.shift();
+        this.queued -= b.length;
+        if (r < 0) this.fail();
+      }
+      if (this.gone || !this.t.pending()) break;
+      if (this.t.writeAll(EMPTY, 0) < 0) this.fail(); // (what the transport still holds; more may be queued meanwhile)
     }
     this.out = [];
     this.queued = 0;
@@ -929,7 +954,7 @@ export class HttpConnection {
     }
     if (this.closeAfter) {
       this.closeAfter = false;
-      if (!this.closed) this.t.shutdown(1);
+      if (!this.closed) this.endWriting();
     }
   }
   /** A write failed (the peer reset the connection): the reading wakes and ends too. */

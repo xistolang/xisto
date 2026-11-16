@@ -1742,6 +1742,7 @@ static ssize_t xs_tls_srv_read(xs_tls *t, int fd, char *out, size_t cap);
 static ssize_t xs_tls_srv_write(xs_tls *t, int fd, const char *p, size_t n);
 static bool xs_tls_srv_pending(xs_tls *t);
 static void xs_tls_srv_close_notify(xs_tls *t, int fd);
+static void xs_tls_srv_close_start(xs_tls *t, int fd);
 static void xs_tls_free(xs_tls *t);
 #define XS_TLS_FREE(t) do { if (t) xs_tls_free(t); } while (0)
 static int xs_tls_last_error(xs_tls *t);
@@ -5280,7 +5281,9 @@ XS_NOINLINE xs_arr_int *xs_cp_run_sync(xs_str *file, xs_arr_ref *args, xs_str *c
 #ifdef XS_WITH_TLS
 /* ---- node:tls (runtime/node/tls.ts): client sockets over the runtime's TLS (AWS-LC or BearSSL); a socket is a
    slot number; reads and writes park the task on the socket as node:net's do ---- */
-typedef struct { xs_tls *t; int fd; bool used; } xs_tlsc;
+typedef struct { xs_tls *t; int fd; bool used; bool ending; int wwait; } xs_tlsc;
+/* ending: close_notify queued (xs_tlss_end); wwait: tasks parked in xs_tlss_write (a socket has one waiter per
+   direction: kqueue keeps one event per fd and filter, so a second task waiting to write would never wake) */
 static xs_tlsc *xs_tlscs;
 static int64_t xs_ntlscs;
 XS_NOINLINE void xs_tls_add_ca(xs_str *pem) { /* tls.connect / https.request option ca */
@@ -5305,7 +5308,7 @@ XS_NOINLINE int64_t xs_tlsc_connect(xs_str *host, int64_t port, xs_str *serverna
     int64_t h = 0;
     while (h < xs_ntlscs && xs_tlscs[h].used) h++;
     if (h == xs_ntlscs) { xs_tlscs = realloc(xs_tlscs, sizeof *xs_tlscs * (size_t)(xs_ntlscs + 1)); xs_ntlscs++; }
-    xs_tlscs[h] = (xs_tlsc){t, (int)fd, true};
+    xs_tlscs[h] = (xs_tlsc){t, (int)fd, true, false, 0};
     return h;
 }
 XS_NOINLINE xs_str *xs_tlsc_last(void) { return xs_str_new(xs_tlsc_why, strlen(xs_tlsc_why)); }
@@ -5361,7 +5364,7 @@ XS_NOINLINE int64_t xs_tlss_accept(int64_t cred, int64_t fd) { /* the slot of an
     int64_t h = 0;
     while (h < xs_ntlscs && xs_tlscs[h].used) h++;
     if (h == xs_ntlscs) { xs_tlscs = realloc(xs_tlscs, sizeof *xs_tlscs * (size_t)(xs_ntlscs + 1)); xs_ntlscs++; }
-    xs_tlscs[h] = (xs_tlsc){t, (int)fd, true};
+    xs_tlscs[h] = (xs_tlsc){t, (int)fd, true, false, 0};
     return h;
 }
 XS_NOINLINE xs_Uint8Array *xs_tlss_read(int64_t h) { /* the next plaintext bytes (parks); empty at the end or on an error */
@@ -5377,7 +5380,8 @@ XS_NOINLINE xs_Uint8Array *xs_tlss_read(int64_t h) { /* the next plaintext bytes
         }
         if (r < 0) return xs_u8_new(0);
         int fd = s->fd;
-        xs_wait_fd(fd, xs_tls_srv_pending(s->t) ? EVFILT_WRITE : EVFILT_READ);
+        /* (records to write first, as in the handshake: unless a writer task is already waiting to write them) */
+        xs_wait_fd(fd, xs_tls_srv_pending(s->t) && !s->wwait ? EVFILT_WRITE : EVFILT_READ);
         if (!xs_tlscs[h].used) return xs_u8_new(0);
     }
 }
@@ -5388,22 +5392,37 @@ XS_NOINLINE int64_t xs_tlss_send(int64_t h, xs_Uint8Array *bytes, int64_t off) {
     return w < 0 ? -7 : (int64_t)w;
 }
 XS_NOINLINE bool xs_tlss_pending(int64_t h) { return h >= 0 && h < xs_ntlscs && xs_tlscs[h].used && xs_tls_srv_pending(xs_tlscs[h].t); }
-XS_NOINLINE int64_t xs_tlss_write(int64_t h, xs_Uint8Array *bytes, int64_t off) { /* all of it (parks while the socket is full): 0, or -7 */
+/* all of it, and the records the engine still holds (parks while the socket is full): 0, or -7. With no bytes
+   left (an empty Buffer), it only writes out what the engine holds */
+XS_NOINLINE int64_t xs_tlss_write(int64_t h, xs_Uint8Array *bytes, int64_t off) {
     for (;;) {
         if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return -7;
         int fd = xs_tlscs[h].fd;
-        if (off < bytes->f_length) {
-            ssize_t w = xs_tls_srv_write(xs_tlscs[h].t, fd, (const char *)bytes->data + off, (size_t)(bytes->f_length - off));
-            if (w < 0) return -7;
-            off += w;
-        }
+        int64_t n = off < bytes->f_length ? bytes->f_length - off : 0;
+        ssize_t w = xs_tls_srv_write(xs_tlscs[h].t, fd, (const char *)bytes->data + (n ? off : 0), (size_t)n); /* (n == 0: the pending records) */
+        if (w < 0) return xs_tlscs[h].ending ? 0 : -7; /* (closed after our close_notify: nothing more to write) */
+        off += w;
         if (off >= bytes->f_length && !xs_tls_srv_pending(xs_tlscs[h].t)) return 0;
+        xs_tlscs[h].wwait++;
         xs_wait_fd(fd, EVFILT_WRITE);
+        if (h < xs_ntlscs) xs_tlscs[h].wwait--;
     }
 }
-XS_NOINLINE void xs_tlss_close(int64_t h) { /* close_notify, then as the client's */
+/* the end of the writing side: close_notify queued (once) and written as far as the socket takes it now; true when
+   nothing is left in the engine (the socket can be shut down), false: write the rest first (xs_tlss_write) */
+XS_NOINLINE bool xs_tlss_end(int64_t h) {
+    if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return true;
+    xs_tlsc *s = &xs_tlscs[h];
+    if (!s->ending) {
+        s->ending = true;
+        xs_tls_srv_close_start(s->t, s->fd);
+    }
+    if (xs_tls_srv_write(s->t, s->fd, NULL, 0) < 0) return true;
+    return !xs_tls_srv_pending(s->t);
+}
+XS_NOINLINE void xs_tlss_close(int64_t h) { /* close_notify (unless already sent), then as the client's */
     if (h < 0 || h >= xs_ntlscs || !xs_tlscs[h].used) return;
-    xs_tls_srv_close_notify(xs_tlscs[h].t, xs_tlscs[h].fd);
+    if (!xs_tlscs[h].ending) xs_tls_srv_close_notify(xs_tlscs[h].t, xs_tlscs[h].fd);
     xs_tlsc_close(h);
 }
 #endif

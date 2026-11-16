@@ -380,6 +380,11 @@ static void xs_tls_srv_close_notify(xs_tls *t, int fd) {
         br_ssl_engine_sendrec_ack(t->eng, (size_t)w);
     }
 }
+/* close_notify into the engine, for xs_tls_srv_write to write out (with the records before it) */
+static void xs_tls_srv_close_start(xs_tls *t, int fd) {
+    (void)fd;
+    if (!(br_ssl_engine_current_state(t->eng) & BR_SSL_CLOSED)) br_ssl_engine_close(t->eng);
+}
 static void xs_tls_free(xs_tls *t) { free(t->iobuf); free(t); }
 static bool xs_tls_srv_pending(xs_tls *t) { return (br_ssl_engine_current_state(t->eng) & BR_SSL_SENDREC) != 0; }
 
