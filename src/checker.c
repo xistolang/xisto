@@ -12453,6 +12453,19 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->type = ty_string;
             return;
         }
+        if (e->lhs->type->kind == TY_OBJECT && e->lhs->type->cls->builtin && strcmp(e->lhs->type->cls->name, "RegExpGroups") == 0 &&
+            e->rhs->type->kind == TY_STRING) { /* m.groups["name"], m.groups[k]: the group of that name, as m.groups.name */
+            Expr *k = e->rhs;
+            e->kind = E_MEMBER; e->rhs = NULL; e->field = -1; e->is_call = false;
+            e->cls = e->lhs->type->cls;
+            e->str = k->kind == E_STRING ? k->str : "";
+            e->args.len = 0;
+            if (k->kind == E_STRING) k->lit_id = intern(k->str);
+            expr_list_push(&e->args, k);
+            e->type = ty_string;
+            e->builtin.cfn = "xs_RegExpGroups_get";
+            return;
+        }
         if (e->lhs->type->kind != TY_ARRAY) xs_error(XS8091, e->pos, NULL, "cannot index a value of type %s", ty_name(e->lhs->type));
         if (e->rhs->type->kind == TY_NUMBER && tsc_checked()) { /* xs[i] with i: number (--tsc-checked): a whole number, checked */
             xs_warn_rule(XS2109, e->rhs->pos, "declare the index as int, or convert it with Math.trunc(x)", "array index is a number where an int goes: checked to be whole at run time");
