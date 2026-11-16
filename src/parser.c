@@ -8638,8 +8638,31 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
     return m;
 }
 
+/* the project's JSON options: "json": { "omitNull": true } in the xisto.json nearest above the entry file (the
+   program's own project: a package's xisto.json does not set them) */
+bool xs_json_omit_null;
+static void project_json_options(const char *entry_file) {
+    char dir[PATH_MAX];
+    if (!xs_real_path(entry_file, dir)) snprintf(dir, sizeof dir, "%s", entry_file);
+    for (char *sl; (sl = strrchr(dir, '/')); ) {
+        *sl = 0;
+        if (strstr(dir, "/.xisto/pkgs")) continue;
+        char *meta = xs_read_file(xs_sprintf("%s/xisto.json", *dir ? dir : ""));
+        if (!meta) continue;
+        const char *j = strstr(meta, "\"json\"");
+        const char *o = j ? strstr(j, "\"omitNull\"") : NULL;
+        const char *end = j ? strchr(j, '}') : NULL;
+        if (o && (!end || o < end)) {
+            o += 10;
+            while (*o == ' ' || *o == '\t' || *o == '\n' || *o == '\r' || *o == ':') o++;
+            xs_json_omit_null = !strncmp(o, "true", 4);
+        }
+        return;
+    }
+}
 Program *parse_program(const char *entry_file) {
     Program *prog = xs_alloc(sizeof *prog);
+    project_json_options(entry_file);
     load_module(prog, entry_file, (Pos){0, 0}, NULL);
     if (wants_arrays) load_module(prog, "xisto:arrays", (Pos){1, 1}, entry_file);
     if (wants_settled) load_module(prog, "xisto:settled", (Pos){1, 1}, entry_file);

@@ -23,6 +23,7 @@ that you should know about. These are the rule warnings, each with a stable code
 | XS2108 | implicit | `--tsc-checked`: an `unknown` where a type goes | type it where it is made, or `x as T` |
 | XS2109 | implicit | `--tsc-checked`: a `number` where an `int` goes, truncated | declare it `int`, or `Math.trunc` |
 | XS2110 | implicit | the result of a generic function value is copied through JSON | a concrete return type, or a generic function |
+| XS2111 | semantic | `xisto.json` `"json": { "omitNull": true }`: `JSON.stringify` leaves `null` members out, unlike Node | remove the option to write Node's JSON |
 
 Each comes with its place and a `help:` line:
 

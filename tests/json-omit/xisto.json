@@ -1,0 +1,6 @@
+{
+  "name": "json-omit",
+  "main": "main.ts",
+  "json": { "omitNull": true },
+  "dependencies": {}
+}

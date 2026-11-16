@@ -4,7 +4,7 @@
 # Usage: sh tests/run.sh [NAME...]  With no NAME, the whole suite. Each NAME (a shell glob, or a path such as
 # tests/ok/arrays.ts) selects the tests of that name in every folder: tests/ok, tests/err, tests/stderr,
 # tests/qbe, tests/check (also check-NAME), bench/polybench/ts (also polybench-NAME), and the named groups:
-# warnings fmt unit http techempower crypto mem tls stack profiler noinline tlsgate pkg pkg-registry debug dev
+# warnings json-omit fmt unit http techempower crypto mem tls stack profiler noinline tlsgate pkg pkg-registry debug dev
 # size rt-lean.
 export XISTO_NODE_COMPAT=1 # these programs also run on Node for comparison: node: imports allowed
 export TZ=America/New_York # date-local checks DST edges: the same zone for xisto, Node and the Linux run
@@ -142,6 +142,17 @@ if [ "$wrc" = 0 ] && [ "$drc" = 1 ] && [ "$crc" = 1 ] && [ "$(wc -l < "$OUT/warn
     pass=$((pass+1))
 else
     echo "FAIL rule warnings: build rc=$wrc, --deny-warnings rc=$drc, check --deny-warnings rc=$crc"; cat "$OUT/warnings-build.txt" | head -5; fail=$((fail+1))
+fi
+fi
+
+# "json": { "omitNull": true } in a project's xisto.json: every JSON.stringify leaves the null members out (the
+# expected output is Node's with the replacer (k, v) => v ?? undefined), and the build says so once (XS2111)
+if sel json-omit; then
+$XISTO build tests/json-omit/main.ts -o "$OUT/json-omit" > "$OUT/json-omit.build" 2>&1 && "$OUT/json-omit" > "$OUT/json-omit.txt" 2>&1
+if cmp -s "$OUT/json-omit.txt" tests/json-omit/expected.txt && grep -q 'XS2111 1' "$OUT/json-omit.build"; then
+    pass=$((pass+1))
+else
+    echo "FAIL json-omit"; cat "$OUT/json-omit.build" | head -5; diff tests/json-omit/expected.txt "$OUT/json-omit.txt" | head; fail=$((fail+1))
 fi
 fi
 

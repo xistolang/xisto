@@ -1,0 +1,17 @@
+{"id":1,"tags":["a",null],"addr":{"city":"Recife"},"extra":{"a":1}}
+{
+  "id": 1,
+  "tags": [
+    "a",
+    null
+  ],
+  "addr": {
+    "city": "Recife"
+  },
+  "extra": {
+    "a": 1
+  }
+}
+{"x":"1"}
+{"b":[null,1],"c":{"e":2}}
+[null,{},{"k":1}]

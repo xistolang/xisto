@@ -241,6 +241,7 @@ typedef struct Type {
 extern Type *ty_number, *ty_int, *ty_litint, *ty_boolean, *ty_string, *ty_void, *ty_null, *ty_json, *ty_unknown, *ty_any, *ty_undef;
 /* a field no program sees by name: a #private one (__hp_<class id>_x), or the mark of a generator's result whose value is
    undefined (xisto:iter's __XsGenResult): left out of console.log, JSON, Object.keys/values/entries and spreads */
+extern bool xs_json_omit_null; /* parser.c: the project's xisto.json "json": { "omitNull": true } */
 static inline bool xs_hidden_field(const char *n) { return n[0] == '_' && n[1] == '_' && (!strncmp(n, "__hp_", 5) || !strcmp(n, "__xs_undef")); }
 static inline bool ty_is_undef(const Type *t) { return t && t->kind == TY_UNKNOWN && !t->tname && t->absent; } /* the type undefined */
 extern bool xs_any_used; /* checker.c: the program reads or writes an any by name */

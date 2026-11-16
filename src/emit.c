@@ -1933,6 +1933,9 @@ static const char *xn_bit(Expr *v) {
     if (v->type && v->type->kind == TY_NULLABLE && v->type->absent && v->kind != E_NULL) return "0";
     return "1";
 }
+/* when JSON.stringify leaves nulls out of objects: "1" (the project's "json": { "omitNull": true }: every call, decided
+   here), or NULL (never: Node's output) */
+static const char *json_omit(void) { return xs_json_omit_null ? "1" : NULL; }
 /* the fields of c as a JSON object's members (ord: in that order, NULL: the declaration's) */
 static void json_put_fields(Buf *b, Class *c, const int *ord, int nord) {
     for (int oi = 0; oi < nord; oi++) {
@@ -1942,14 +1945,20 @@ static void json_put_fields(Buf *b, Class *c, const int *ord, int nord) {
         if (json_fn_field(f->type)) continue; /* a function: left out, as JSON.stringify does */
         if (xs_sym_field_shown(f->name)) continue; /* a symbol key: left out, as JSON.stringify does */
         /* optional fields that are null are left out, like undefined in JSON.stringify (and a value that is a function);
-           one that holds an explicit null (nick?: T | null set to null: its xn_ bit) is written as null */
+           one that holds an explicit null (nick?: T | null set to null: its xn_ bit) is written as null. With the
+           nulls left out (json_omit), every member that is null is left out too */
         bool may_fn = json_may_fn(f->type);
         const char *v = xs_sprintf("o->%s", f->cname);
+        const char *om = json_omit();
         bool xn = f->optional && f->opt_null;
         const char *present = NULL; /* (NULL: written whatever it holds) */
         if (f->optional) {
             present = not_null(f->type, v);
-            if (xn) present = xs_sprintf("(%s || o->xn_%s)", present, f->cname);
+            if (xn && !(om && !strcmp(om, "1")))
+                present = xs_sprintf("(%s || (o->xn_%s%s))", present, f->cname, om ? xs_sprintf(" && !%s", om) : "");
+        } else if (om && (f->type->kind == TY_NULLABLE || f->type->kind == TY_UNKNOWN || f->type->kind == TY_UNION || f->type->kind == TY_NULL)) {
+            const char *nn = f->type->kind == TY_NULLABLE ? not_null(f->type, v) : f->type->kind == TY_NULL ? "false" : xs_sprintf("(%s != NULL)", v);
+            present = !strcmp(om, "1") ? nn : xs_sprintf("(%s || !%s)", nn, om);
         }
         if (present || may_fn) buf_printf(b, "    if (%s && %s) {\n", present ? present : "true", may_fn ? xs_sprintf("!xs_is_closure(%s)", v) : "true");
         buf_printf(b, "    if (!first_) xs_sb_put(sb, \",\", 1);\n    first_ = false;\n    xs_sb_put(sb, \"\\\"%s\\\":\", %zu);\n    ", f->name, strlen(f->name) + 3);
@@ -2010,7 +2019,10 @@ static void ensure_json(Type *t) {
         const char *vexpr = vk == 3 ? xs_sprintf("((%s)e->val.p)", ctype(t->elem)) : vk == 0 ? "e->val.d" : vk == 1 ? "e->val.i" : "(bool)e->val.i";
         buf_printf(&json_protos, "static void json_put_%s(xs_sb *sb, xs_map *m);\nstatic xs_map *json_get_%s(xs_jv *v, const char *where);\n", tag, tag);
         buf_printf(b, "static void json_put_%s(xs_sb *sb, xs_map *m) {\n    xs_sb_put(sb, \"{\", 1);\n    bool first = true;\n    xs_map_entry *e;\n"
-                      "    XS_MAP_EACH(m, e) {\n        if (!first) xs_sb_put(sb, \",\", 1);\n        first = false;\n        xs_sb_str(sb, e->skey);\n        xs_sb_put(sb, \":\", 1);\n        ", tag);
+                      "    XS_MAP_EACH(m, e) {\n", tag);
+        if (json_omit() && (t->elem->kind == TY_NULLABLE || t->elem->kind == TY_UNKNOWN || t->elem->kind == TY_UNION)) /* (an entry that is null: left out) */
+            buf_printf(b, "        if (%s && !%s) continue;\n", json_omit(), t->elem->kind == TY_NULLABLE ? not_null(t->elem, vexpr) : xs_sprintf("(%s != NULL)", vexpr));
+        buf_puts(b, "        if (!first) xs_sb_put(sb, \",\", 1);\n        first = false;\n        xs_sb_str(sb, e->skey);\n        xs_sb_put(sb, \":\", 1);\n        ");
         json_emit_value(b, t->elem, vexpr);
         buf_puts(b, "\n    }\n    xs_sb_put(sb, \"}\", 1);\n}\n");
         buf_printf(b, "static xs_map *json_get_%s(xs_jv *v, const char *where) {\n    if (v->kind != XJ_OBJ) xs_json_obj(v, where);\n"
@@ -2254,18 +2266,19 @@ static void emit_member(Expr *e) {
         if (strcmp(fn, "json_stringify_ext") == 0) { /* JSON.stringify(value, replacer, space): the value's text, rewritten */
             Expr *a = e->args.items[0], *r = e->args.items[1], *s = e->args.len > 2 ? e->args.items[2] : NULL;
             json_unknown_used = true;
-            buf_printf(out, "({ xs_sb sb_ = {0}; xs_sb *sb = &sb_; %s ja_ = ", ctype(a->type));
+            bool omit = xs_json_omit_null; /* (xs_jx_member leaves a null member out while xs_json_omitn_ is set) */
+            buf_printf(out, "({ %sxs_sb sb_ = {0}; xs_sb *sb = &sb_; %s ja_ = ", omit ? "int jw_ = xs_json_omitn_; xs_json_omitn_ = 1; " : "", ctype(a->type));
             emit_borrowed(a);
             buf_puts(out, "; ");
             json_emit_value(out, a->type, "ja_");
-            buf_puts(out, " xs_json_ext(xs_sb_finish(sb), ");
+            buf_puts(out, omit ? " xs_str *jr_ = xs_json_ext(xs_sb_finish(sb), " : " xs_json_ext(xs_sb_finish(sb), ");
             if (r->type->kind == TY_ARRAY) { buf_puts(out, "(xs_arr_ref *)("); emit_borrowed(r); buf_puts(out, "), NULL, "); }
             else if (r->type->kind == TY_FUNC) { buf_puts(out, "NULL, (void *)("); emit_borrowed(r); buf_puts(out, "), "); }
             else { if (r->kind != E_NULL) { buf_puts(out, "((void)("); emit_expr(r); buf_puts(out, "), NULL), NULL, "); } else buf_puts(out, "NULL, NULL, "); }
             if (s && s->type->kind == TY_STRING) { buf_puts(out, "0, "); emit_borrowed(s); }
             else if (s && s->type->kind != TY_NULL) { buf_puts(out, "(double)("); emit_expr(s); buf_puts(out, "), NULL"); }
             else buf_puts(out, "0, NULL");
-            buf_puts(out, ", xs_json_unknown); })");
+            buf_puts(out, omit ? ", xs_json_unknown); xs_json_omitn_ = jw_; jr_; })" : ", xs_json_unknown); })");
             return;
         }
         if (strcmp(fn, "json_parse") == 0) {
@@ -15261,6 +15274,7 @@ void emit_program(Program *p, Buf *o) {
             cls[ncls++] = c;
         }
         Buf u = {0};
+        buf_printf(&u, "#define XS_JSON_OMIT_ %s\n", json_omit() ? json_omit() : "0");
         buf_puts(&u, "static void xs_json_unknown(xs_sb *sb, void *v) {\n"
                      "    if (!v || xs_type_of(v)->print == xs_print_closure) { xs_sb_put(sb, \"null\", 4); return; } /* (a function: null, as in an array) */\n"
                      "    void (*f_)(void *) = xs_type_of(v)->free;\n"
@@ -15280,6 +15294,7 @@ void emit_program(Program *p, Buf *o) {
                          "        xs_map *m_ = v; xs_map_entry *e_; bool first_ = true; xs_sb_put(sb, \"{\", 1);\n"
                          "        XS_MAP_EACH(m_, e_) {\n"
                          "            if (m_->val_kind > 2 && e_->val.p && xs_type_of(e_->val.p)->print == xs_print_closure) continue; /* (a function: left out, as JSON.stringify does) */\n"
+                         "            if (XS_JSON_OMIT_ && m_->val_kind > 2 && !e_->val.p) continue; /* (null, with the nulls left out) */\n"
                          "            if (!first_) xs_sb_put(sb, \",\", 1); first_ = false; xs_sb_str(sb, e_->skey); xs_sb_put(sb, \":\", 1);\n"
                          "            if (m_->val_kind == 0) xs_sb_num(sb, e_->val.d); else if (m_->val_kind == 1) xs_sb_int(sb, e_->val.i);\n"
                          "            else if (m_->val_kind == 2) xs_sb_bool(sb, e_->val.i != 0); else xs_json_unknown(sb, e_->val.p);\n"

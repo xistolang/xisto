@@ -3971,6 +3971,7 @@ static void json_undef_returns(Stmt *s, Expr *named) {
    one-argument JSON text. replacer: null/undefined, a string[] (the keys kept, at every level) or a function
    (key: string, value: any) => any; space: a number or a string. The one-argument call keeps its own path */
 bool xs_json_ext_used; /* (emit: xs_json_unknown is generated for the replacer's values) */
+static bool omit_warned; /* (XS2111 is said once) */
 static void json_stringify_ext(Expr *e) {
     Expr *v = e->args.items[0];
     check_expr(v, NULL);
@@ -13562,6 +13563,12 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (strcmp(ns, "JSON") == 0) {
                 if (!e->is_call || (strcmp(e->str, "stringify") != 0 && strcmp(e->str, "parse") != 0))
                     xs_error(XS7107, e->pos, "supported: JSON.stringify(value), JSON.parse(text) assigned to a typed variable", "unknown JSON member '%s'", e->str);
+                if (strcmp(e->str, "stringify") == 0 && xs_json_omit_null && !omit_warned) {
+                    /* (the project's "json": { "omitNull": true }: said once, at the first JSON.stringify) */
+                    omit_warned = true;
+                    xs_warn_rule(XS2111, e->pos, "remove \"json\": { \"omitNull\": true } from xisto.json to write nulls as Node does",
+                                 "JSON.stringify leaves out the members that are null (xisto.json \"omitNull\"): the JSON differs from Node's");
+                }
                 if (strcmp(e->str, "stringify") == 0 && e->args.len >= 2 && e->args.len <= 3) { json_stringify_ext(e); return; }
                 if (strcmp(e->str, "parse") == 0 && e->args.len == 2) json_parse_reviver(e); /* (then parsed as one argument) */
                 if (e->args.len != 1) xs_error(XS7025, e->pos, NULL, strcmp(e->str, "stringify") == 0 ? "JSON.stringify takes one to three arguments" : "JSON.%s takes exactly one argument", e->str);
