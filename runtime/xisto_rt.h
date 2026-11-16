@@ -795,11 +795,18 @@ static inline __attribute__((always_inline)) void *xs_obj_alloc_raw(size_t size,
 #define xs_obj_alloc(size, free_fn, print_fn) xs_obj_alloc_t((size), ({ static const xs_type xs_t_ XS_TYPE_SEC = {(free_fn), (print_fn)}; &xs_t_; }))
 
 static inline __attribute__((always_inline)) void xs_obj_free_block(void *p, uint32_t k);
+/* XS_SIX, on an object without XS_CYC (a string; no string is cyclic, so the collector's bit is free there): the
+   string has an entry in its thread's index cache (xs_str_byte_at), which its free removes before the memory can
+   hold another string. Testing it rides on the test xs_obj_free already makes: nothing on the common path. */
+#define XS_SIX XS_BUF
+static void xs_six_free(void *s, uint32_t k);
+static void xs_six_forget(void *s);
 static inline __attribute__((always_inline)) void xs_obj_free(void *p) {
     xs_live--;
     uint32_t k = ((xs_hdr *)p)->cls;
     if (__builtin_expect(k & (XS_BUF | XS_STACK), 0)) {
         if (k & XS_STACK) return; /* its frame owns the memory: only the fields were released */
+        if (!(k & XS_CYC)) { xs_six_free(p, k); return; } /* (XS_SIX) */
         ((xs_hdr *)p)->cls |= XS_DEAD; /* a suspect: the collector gives the block back (xs_gc_step) */
         xs_sus_n--;
         return;
@@ -994,6 +1001,7 @@ static void xs_str_free(void *p) { xs_obj_free(p); }
 static bool xs_str_share(xs_str *s) {
     if (s->len < ((int64_t)64 << 10) || s->hdr.rc < 1) return false;
     if (s->hdr.rc >= XS_SHARED_RC) { __atomic_add_fetch(&s->hdr.rc, 1, __ATOMIC_RELAXED); return true; } /* (the message's own) */
+    if ((s->hdr.cls & (XS_SIX | XS_CYC)) == XS_SIX) xs_six_forget(s); /* (another thread will read it) */
     if (s->hdr.rc >= XS_IMMORTAL / 2 || (s->hdr.cls & (XS_CLS_MASK | XS_STACK | XS_RGN | XS_CYC | XS_BUF | XS_DEAD))) return false;
     if (xs_type_of(s)->free != xs_str_free || getenv("XISTO_NO_STR_SHARE")) return false;
     xs_live--; /* (no thread's allocation any more) */
@@ -1112,25 +1120,123 @@ static int64_t xs_str_len(xs_str *s) {
     return s->ulen;
 }
 
-/* Byte offset of the code point at index i (clamped to the end). */
-static int64_t xs_str_byte_at(xs_str *s, int64_t i) {
-    if (xs_str_len(s) == s->len) return i < s->len ? i : s->len; /* ASCII */
-    int64_t n = 0;
-    for (int64_t b = 0; b < s->len; b++) {
-        if ((s->data[b] & 0xC0) != 0x80) {
-            if (n == i) return b;
-            n++;
-        }
-    }
-    return s->len;
+/* ---- code point index <-> byte offset on a string that is not ASCII (XB-214) ----
+   Each thread keeps the last position it reached (index, byte offset) in a few strings, and the next lookup in
+   one of them walks from whichever is nearest of that position, the start and the end. A loop over a text,
+   forwards or backwards (s.substring(i, i + k), s.slice(i - k, i), charAt, charCodeAt, indexOf from i), walks a
+   few characters per step instead of from the start: O(n) instead of O(n^2) (86 s -> under a second on
+   counter-deferred). The walk counts eight bytes at a time.
+   A string with an entry carries XS_SIX (defined at xs_obj_free): its free removes the entry, so a later string
+   at the same address cannot find it, and a new string's header never has the bit. Only strings the thread owns
+   are entered: not from a frame or a region (their memory is reused without a free), not shared between threads
+   (XS_SHARED_RC; a literal is, but it is never freed and is entered without the bit), and none during a parallel
+   job (the pool's threads read the program's strings at the same time, and what a worker makes belongs to main
+   afterwards). Strings shorter than XS_SIX_MIN bytes are walked from the start: a few words. ASCII strings never
+   get here (their index is their byte offset). A string changed in place (append, replaceAll) leaves the cache
+   when its characters move. */
+#define XS_SIX_N 4
+#define XS_SIX_MIN 64
+typedef struct { xs_str *s; int64_t cp, b; } xs_six_ent;
+static XS_TLS xs_six_ent xs_six[XS_SIX_N];
+static XS_TLS unsigned xs_six_next;
+#ifdef XS_PARALLEL
+static XS_TLS bool xs_pool_inside; /* this thread is running a job: a nested parallel call runs as the loop */
+#endif
+XS_NOINLINE void xs_six_forget(void *p) {
+    for (int k = 0; k < XS_SIX_N; k++)
+        if (xs_six[k].s == p) xs_six[k].s = NULL;
+    ((xs_hdr *)p)->cls &= ~(uint32_t)XS_SIX;
 }
-
-static int64_t xs_str_cp_at_byte(xs_str *s, int64_t b) {
-    if (xs_str_len(s) == s->len) return b;
+/* xs_obj_free of a string with an entry (out of line: the free sites stay as small as before) */
+XS_NOINLINE void xs_six_free(void *p, uint32_t k) {
+    xs_six_forget(p);
+    xs_obj_free_block(p, k);
+}
+/* a literal: never freed, and read by every thread (server workers), so its header is left alone */
+static inline bool xs_six_immortal(xs_str *s) { return s->hdr.rc >= XS_IMMORTAL / 2 && s->hdr.rc < XS_SHARED_RC; }
+/* s's entry, made when it has none and may have one; NULL: walk without */
+static xs_six_ent *xs_six_entry(xs_str *s) {
+    uint32_t k = s->hdr.cls;
+    bool lit = xs_six_immortal(s);
+    if ((k & XS_SIX) || lit)
+        for (int j = 0; j < XS_SIX_N; j++)
+            if (xs_six[j].s == s) return &xs_six[j];
+    if (s->len < XS_SIX_MIN || (k & (XS_STACK | XS_RGN | XS_CYC | XS_DEAD)) || s->hdr.rc >= XS_SHARED_RC) return NULL;
+#ifdef XS_PARALLEL
+    if (xs_pool_inside) return NULL;
+#endif
+    xs_six_ent *e = &xs_six[xs_six_next++ % XS_SIX_N];
+    if (e->s && !xs_six_immortal(e->s)) e->s->hdr.cls &= ~(uint32_t)XS_SIX; /* (an entry's string is alive: its free would have removed it) */
+    e->s = s;
+    e->cp = 0, e->b = 0;
+    if (!lit) s->hdr.cls = k | XS_SIX;
+    return e;
+}
+/* how many bytes of the word are not UTF-8 continuation bytes (10xxxxxx): the characters starting in it */
+static inline int xs_u8_leads8(const char *p) {
+    uint64_t w;
+    memcpy(&w, p, 8);
+    uint64_t c = (w & ~(w << 1) & 0x8080808080808080ULL) >> 7;
+    return 8 - (int)((c * 0x0101010101010101ULL) >> 56);
+}
+#define XS_U8_LEAD(c) (((unsigned char)(c) & 0xC0) != 0x80)
+/* the byte offset of the k-th character start at or after byte b (there is one) */
+static int64_t xs_u8_fwd(const char *d, int64_t len, int64_t b, int64_t k) {
+    while (b + 8 <= len) {
+        int m = xs_u8_leads8(d + b);
+        if (m > k) break;
+        b += 8, k -= m;
+    }
+    for (;; b++)
+        if (XS_U8_LEAD(d[b]) && k-- == 0) return b;
+}
+/* the byte offset of the k-th character start before byte b, counting back (k >= 1, there is one) */
+static int64_t xs_u8_back(const char *d, int64_t b, int64_t k) {
+    while (b >= 8) {
+        int m = xs_u8_leads8(d + b - 8);
+        if (m >= k) break;
+        b -= 8, k -= m;
+    }
+    for (;;)
+        if (XS_U8_LEAD(d[--b]) && --k == 0) return b;
+}
+/* the characters starting in d[a, b) */
+static int64_t xs_u8_count(const char *d, int64_t a, int64_t b) {
     int64_t n = 0;
-    for (int64_t i = 0; i < b; i++)
-        if ((s->data[i] & 0xC0) != 0x80) n++;
+    for (; a + 8 <= b; a += 8) n += xs_u8_leads8(d + a);
+    for (; a < b; a++) n += XS_U8_LEAD(d[a]);
     return n;
+}
+XS_NOINLINE int64_t xs_str_byte_at_(xs_str *s, int64_t i, int64_t n) {
+    xs_six_ent *e = xs_six_entry(s);
+    int64_t cp = 0, b = 0; /* the nearest known position: the start, the end or the entry's */
+    if (n - i < i) cp = n, b = s->len;
+    if (e && (e->cp > i ? e->cp - i : i - e->cp) < (cp > i ? cp - i : i - cp)) cp = e->cp, b = e->b;
+    b = i >= cp ? xs_u8_fwd(s->data, s->len, b, i - cp) : xs_u8_back(s->data, b, cp - i);
+    if (e) e->cp = i, e->b = b;
+    return b;
+}
+/* Byte offset of the code point at index i (clamped to the end). */
+static inline int64_t xs_str_byte_at(xs_str *s, int64_t i) {
+    int64_t n = xs_str_len(s);
+    if (n == s->len) return i < s->len ? i : s->len; /* ASCII */
+    if (i < 0 || i >= n) return s->len;
+    return xs_str_byte_at_(s, i, n);
+}
+/* the index of the code point starting at byte b */
+XS_NOINLINE int64_t xs_str_cp_at_byte_(xs_str *s, int64_t b) {
+    int64_t n = xs_str_len(s);
+    xs_six_ent *e = xs_six_entry(s);
+    int64_t cp = 0, a = 0;
+    if (s->len - b < b) cp = n, a = s->len;
+    if (e && (e->b > b ? e->b - b : b - e->b) < (a > b ? a - b : b - a)) cp = e->cp, a = e->b;
+    cp = b >= a ? cp + xs_u8_count(s->data, a, b) : cp - xs_u8_count(s->data, b, a);
+    if (e && b < s->len && XS_U8_LEAD(s->data[b])) e->cp = cp, e->b = b;
+    return cp;
+}
+static inline int64_t xs_str_cp_at_byte(xs_str *s, int64_t b) {
+    if (xs_str_len(s) == s->len) return b;
+    return xs_str_cp_at_byte_(s, b);
 }
 
 /* the length of a + b when a's is known: b's is counted (b is copied anyway), so `s += t; s.length` does not count
@@ -1170,11 +1276,13 @@ static xs_str *xs_str_append_to(xs_str **slot, xs_str *b) {
     xs_str *a = *slot;
     int64_t n = a->len + b->len;
     size_t need = offsetof(xs_str, data) + (size_t)n + 1;
-    if (a != b && a->hdr.rc == 1 && !(a->hdr.cls & (XS_CLS_MASK | XS_STACK | XS_RGN | XS_CYC | XS_BUF | XS_DEAD)) &&
-        xs_type_of(a)->free == xs_str_free && need > XS_SMALL_MAX) {
+    if (a != b && a->hdr.rc == 1 && !(a->hdr.cls & (XS_CLS_MASK | XS_STACK | XS_RGN | XS_CYC | XS_DEAD)) &&
+        xs_type_of(a)->free == xs_str_free && need > XS_SMALL_MAX) { /* (XS_SIX may be set: what is there stays, and an
+        index cache entry stays right; a block that moves leaves it) */
         size_t cap = xs_msize(a);
         if (cap) {
             if (need > cap) {
+                if (a->hdr.cls & XS_SIX) xs_six_forget(a);
                 xs_str *r = realloc(a, need + need / 2);
                 if (!r) xs_panic("out of memory");
                 a = *slot = r;
@@ -1499,6 +1607,7 @@ XS_NOINLINE xs_str *xs_str_replace_impl2(xs_str *s, xs_str *a, xs_str *b, bool a
     if (all && b->len <= a->len && s->len > XS_SMALL_MAX) { /* a long text that does not grow: one pass into a buffer
         of its size (the result is at most as long; finding every match twice cost as much as the copy) */
         inplace = inplace && s->hdr.rc == 1 && b != s && a != s;
+        if (inplace && (s->hdr.cls & XS_SIX)) xs_six_forget(s); /* (its characters move) */
         xs_str *r = inplace ? s : xs_str_alloc(s->len);
         int32_t ulen0 = s->ulen;
         char *o = r->data;
@@ -10712,7 +10821,6 @@ static xs_pool_job *xs_pool_cur;
 static uint64_t xs_pool_gen;
 static int xs_pool_nthreads = -1; /* workers besides main (-1: pool not made yet) */
 static int xs_pool_busy;          /* workers still on the current job */
-static XS_TLS bool xs_pool_inside; /* this thread is running a job: a nested parallel call runs as the loop */
 
 static void xs_pool_chunks(xs_pool_job *j) {
     bool was = xs_pool_inside;
