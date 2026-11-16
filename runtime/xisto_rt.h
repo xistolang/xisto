@@ -5306,6 +5306,20 @@ static inline uint64_t xs_now(void) {
 #if !defined(_WIN32)
 #include <unistd.h>
 #endif
+/* xisto:tz: the zone the system runs in when $TZ is not set (/etc/localtime links to .../zoneinfo/Area/City, as
+   Node's ICU reads it), or "" when that is not known */
+XS_NOINLINE xs_str *xs_tz_local(void) {
+#if !defined(_WIN32)
+    char b[512];
+    ssize_t n = readlink("/etc/localtime", b, sizeof b - 1);
+    if (n > 0) {
+        b[n] = 0;
+        const char *z = strstr(b, "zoneinfo/");
+        if (z) return xs_str_new(z + 9, strlen(z + 9));
+    }
+#endif
+    return xs_str_new("", 0);
+}
 /* xisto:tz (the intl package's Intl.DateTimeFormat with a timeZone): the wall clock of a zone of the system TZ database at an instant,
    as [year, month 1-12, day, hour, minute, second, weekday]; a zone the system does not know is a RangeError, as in Node */
 XS_NOINLINE xs_arr_int *xs_tz_fields(double ms, xs_str *zone) {

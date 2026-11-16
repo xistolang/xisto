@@ -8180,6 +8180,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
     }
     if (strcmp(name, "tz") == 0) { /* xisto:tz: the wall clock of a time zone (the intl package's Intl.DateTimeFormat) */
         add_func(prog, builtin_func(m, "__xs_tz_fields", "xs_tz_fields", ty_array_of(ty_int), 2, ty_number, ty_string));
+        add_func(prog, builtin_func(m, "__xs_tz_local", "xs_tz_local", ty_string, 0, NULL, NULL));
         return m;
     }
     if (strcmp(name, "errors") == 0) { /* xisto:errors: TypeError & co (see xs_errors_src) */
