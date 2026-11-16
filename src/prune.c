@@ -65,10 +65,19 @@ static void use_class(Class *c) {
             push_func(c->methods[i]);
 }
 
+/* a built-in class whose struct lives in runtime/xisto_net.h (as checker.c's net_class): a field, parameter or
+   value of that type needs the struct declared, so the network runtime, even when no member of it is used
+   (a class with an `HttpRequest | null` field in a program that runs no server) */
+static bool net_struct(const Class *c) {
+    static const char *const names[] = {"Response", "ReadableStream", "HttpRequest", "HttpResponse", "Server", "Worker", "MessagePort"};
+    if (!c || !c->builtin) return false;
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) if (strcmp(c->name, names[i]) == 0) return true;
+    return false;
+}
 static void use_type(Type *t) {
     if (!t) return;
     switch (t->kind) {
-    case TY_OBJECT: use_class(t->cls); break;
+    case TY_OBJECT: if (net_struct(t->cls)) prog->uses_net = true; use_class(t->cls); break;
     case TY_ARRAY: case TY_SET: case TY_NULLABLE: use_type(t->elem); break;
     case TY_MAP: use_type(t->key); use_type(t->elem); break;
     case TY_FUNC: for (int i = 0; i < t->nparams; i++) use_type(t->params[i]); use_type(t->ret); break;
