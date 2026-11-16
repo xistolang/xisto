@@ -44,6 +44,8 @@ typedef struct Binding {
     bool null_const;  /* const x = null (no type written): each read of x is null */
     bool fn_assigned; /* a module variable some function, method or closure of its module assigns (fn_assigned_global) */
     struct Class *proto_of; /* const p = Object.getPrototypeOf(x): the prototype of x's class (its methods' slots, an expando) */
+    bool frozen;     /* given to Object.freeze, or its result: writes through it are compile errors (frozen_at: where) */
+    Pos frozen_at;
     struct Binding *next;
 } Binding;
 
@@ -3016,6 +3018,36 @@ static Binding *lookup(const char *name) {
     }
     return NULL;
 }
+/* Object.freeze(x): the value x itself, the binding it was read from (and the one its result goes into) marked
+   frozen. Node's frozen object ignores a write (sloppy code) or throws a TypeError (strict code, a module); here a
+   write through a frozen binding is a compile error (TypeScript's Readonly<T>). A write through another path to the
+   same object (a parameter it was passed to) is not seen: it changes the object, where Node would not. */
+static Expr *frozen_val; /* the last Object.freeze(...) checked (its node, now the value) */
+static Binding *frozen_binding(Expr *x) {
+    if (!x || x->kind != E_IDENT || !x->str) return NULL;
+    for (Binding *b = lookup(x->str); b; b = b->origin) if (b->frozen) return b;
+    return NULL;
+}
+static void frozen_write(Expr *t, Pos pos) {
+    while (t && t->kind == E_AS && t->lhs) t = t->lhs;
+    if (!t || !((t->kind == E_MEMBER && !t->is_call) || t->kind == E_INDEX)) return;
+    Binding *b = frozen_binding(t->lhs);
+    if (b) xs_error(XS8152, pos, "write to a copy: const copy = { ...x } (or [...xs])",
+                    "cannot write to '%s': it was frozen with Object.freeze (line %d)", t->lhs->str, b->frozen_at.line);
+}
+static void frozen_call(Expr *e) { /* xs.push(v) on a frozen array, r.delete(k) on a frozen Record (delete r[k]) */
+    static const char *const muts[] = {"push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin", "delete", "set", "clear", NULL};
+    if (!e->is_call || !e->str || !e->lhs) return;
+    Binding *b = frozen_binding(e->lhs);
+    if (!b) return;
+    Type *t = b->type ? ty_strip_null(b->type) : NULL;
+    if (!t || !(t->kind == TY_ARRAY || (t->kind == TY_MAP && t->record))) return; /* (a frozen Map's entries still change, as in Node) */
+    for (int i = 0; muts[i]; i++)
+        if (!strcmp(e->str, muts[i]))
+            xs_error(XS8152, e->pos, "change a copy: const copy = [...xs]",
+                     "cannot write to '%s': it was frozen with Object.freeze (line %d)", e->lhs->str, b->frozen_at.line);
+}
+
 
 /* `this` inside an arrow: captured from the method */
 static const char *this_cname(void) {
@@ -9779,6 +9811,9 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     case E_ASSIGN:
     case E_POSTFIX: {
+        frozen_write(e->lhs, e->pos);
+        if (e->kind == E_ASSIGN && e->op == TK_ASSIGN && e->lhs && e->lhs->kind == E_IDENT && e->lhs->str) /* x = other: x no longer the frozen one */
+            for (Binding *b = lookup(e->lhs->str); b; b = b->origin) b->frozen = false;
         if (e->lhs && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->str && e->lhs->lhs && e->lhs->lhs->kind == E_IDENT &&
             !lookup(e->lhs->lhs->str)) { /* B.count = v (or this.count++ in a static method B inherits) with count a static of a base A:
                                             JavaScript makes B a property of its own there, which xisto's one variable per static is not */
@@ -11308,6 +11343,50 @@ static void check_expr_in(Expr *e, Type *expected) {
             expr_list_push(&e->args, self);
             expr_list_push(&e->args, arr);
             check_expr(e, expected);
+            return;
+        }
+        frozen_call(e);
+        if (e->is_call && e->str && !strcmp(e->str, "defineProperty") && e->lhs && e->lhs->kind == E_IDENT && !strcmp(e->lhs->str, "Object") &&
+            !lookup("Object") && e->args.len == 3 && e->args.items[2]->kind == E_OBJLIT) {
+            Expr *d = e->args.items[2];
+            for (int i = 0; i < d->args.len && d->keys; i++)
+                if (d->keys[i] && (!strcmp(d->keys[i], "get") || !strcmp(d->keys[i], "set")))
+                    xs_error(XS6045, e->pos, "declare the property in a class: get name(): T { ... } and set name(v: T) { ... }",
+                             "Object.defineProperty with get/set is not supported: a property computed by a function is a class accessor here");
+        }
+        if (e->is_call && e->str && !strcmp(e->str, "freeze") && e->lhs && e->lhs->kind == E_IDENT && !strcmp(e->lhs->str, "Object") &&
+            !lookup("Object") && e->args.len == 1) {
+            /* Object.freeze(x): x itself, read-only from here (frozen_write) */
+            Expr *x = e->args.items[0];
+            Pos at = e->pos;
+            check_expr(x, expected);
+            if (x->kind == E_IDENT && x->str) {
+                Binding *b = lookup(x->str);
+                if (b) for (Binding *o = b; o; o = o->origin) if (!o->frozen) { o->frozen = true; o->frozen_at = at; }
+            }
+            *e = *x;
+            e->pos = at;
+            e->prechecked = true;
+            frozen_val = e;
+            return;
+        }
+        if (e->is_call && e->str && !strcmp(e->str, "isFrozen") && e->lhs && e->lhs->kind == E_IDENT && !strcmp(e->lhs->str, "Object") &&
+            !lookup("Object") && e->args.len == 1) {
+            /* Object.isFrozen(x): what the compiler knows; a primitive is frozen (as in Node), an object when it went
+               through Object.freeze under this name */
+            Expr *x = e->args.items[0];
+            check_expr(x, NULL);
+            Type *t = ty_strip_null(x->type);
+            bool prim = !ty_is_heap(t) || t->kind == TY_STRING;
+            bool v;
+            if (prim || x->kind == E_NULL) v = true;
+            else if (x == frozen_val || frozen_binding(x)) v = true;
+            else if (x->kind == E_IDENT || x->kind == E_OBJLIT || x->kind == E_ARRAY_LIT || x->kind == E_NEW_OBJ || x->kind == E_NEW_MAP) v = false;
+            else xs_error(XS8153, x->pos, "give it the variable the object was frozen through: Object.isFrozen(cfg)",
+                          "Object.isFrozen answers from what the compiler knows: give it a variable");
+            Pos at = e->pos;
+            memset(e, 0, sizeof *e);
+            e->kind = E_BOOL; e->pos = at; e->field = -1; e->boolean = v; e->type = ty_boolean;
             return;
         }
         if (e->is_call && e->str && !strcmp(e->str, "defineProperty") && e->lhs && e->lhs->kind == E_IDENT && !strcmp(e->lhs->str, "Object") &&
@@ -14923,6 +15002,7 @@ static void check_var(Stmt *s, bool global) {
     settle(s->init);
     s->type = s->decl_type ? s->decl_type : s->init->type;
     Binding *b = declare(s->pos, s->name, s->type, s->is_const, global, false);
+    if (s->init == frozen_val && frozen_val) { b->frozen = true; b->frozen_at = s->init->pos; }
     if (!s->decl_type && !s->is_const && s->type->kind == TY_NUMBER) b->lit_number = true;
     if (null_init) b->null_const = true;
     if (s->is_const && s->init->kind == E_ARROW) b->arrow_fn = s->init->arrow->fn;
