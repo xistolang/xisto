@@ -930,8 +930,9 @@ static void run_cc_target(const char *cfile, const char *outfile, bool dev) {
         extra = xs_sprintf("%s -I%s %s %s", extra, xs_q(xisto_dir), xs_q(zl), xs_q(bl));
     }
     bool win = strstr(xs_target, "windows") != NULL;
+    /* -DXS_SITES_RETAIN: the call-site table survives lld's --gc-sections (stack traces and the profiler's frames) */
     char *cmd = xs_sprintf("%s -std=c11 %s -mllvm -hot-cold-split=false -ffp-contract=off -fno-omit-frame-pointer -ffunction-sections -fdata-sections "
-                           "%s -static -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
+                           "-DXS_SITES_RETAIN %s -static -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
                            "-Wno-ignored-qualifiers -Wno-return-type -Wno-incompatible-pointer-types-discards-qualifiers -o %s %s %s -lm -lpthread%s",
                            cc, flags, win ? "" : "-Wl,--gc-sections", xs_q(outfile), xs_q(cfile), xs_sprintf("%s %s", extra, tls_extra), win ? " -lws2_32" : "");
     if (xs_sh(cmd) != 0) {
