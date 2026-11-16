@@ -409,6 +409,7 @@ static Class *find_class(const char *name) {
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:url") == 0 && c->exported) return c; /* (URL & co: web globals) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:intl") == 0 && strncmp(name, "Intl_", 5) == 0) return c; /* (Intl.X: global) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:okmap") == 0 && !strcmp(name, "OkMap")) return c; /* (Map<object, V>) */
+        if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:iter") == 0) return c; /* (IteratorResult: TypeScript's global) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:reflect") == 0 && !strcmp(name, "PropertyDescriptor"))
             return c; /* (TypeScript's global, as a method decorator receives it: XB-107) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:reflect") == 0 && strlen(name) > 9 && !strcmp(name + strlen(name) - 9, "Decorator"))
@@ -3159,6 +3160,8 @@ static Func *lookup_func(const char *name) {
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:settled") == 0) return f; /* (Promise.allSettled) */
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:builtins") == 0) return f; /* (xs.at & co) */
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:promises") == 0) return f; /* (Promise.any) */
+        if (strncmp(name, "__xs_tsa", 8) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:tagged") == 0) return f; /* (tagged templates) */
+        if (strncmp(name, "__xs_gen_", 9) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:iter") == 0) return f; /* (g.next()) */
         if ((!strcmp(name, "__xs_construct") || !strcmp(name, "__xs_ci_params") || !strcmp(name, "__xs_apply") || !strcmp(name, "__xs_use_desc") || !strcmp(name, "__xs_desc_enter") || !strcmp(name, "__xs_desc_leave") || !strcmp(name, "__xs_deco_target") || !strcmp(name, "__xs_target_ctor")) &&
             f->mod && f->mod->file && !strcmp(f->mod->file, "xisto:reflect")) return f; /* (new (c)(); XB-107's f.apply and descriptors) */
         if (f->exported && (strstr(name, "__s_") || !strcmp(name, "__xs_fetch")) && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:url") == 0) return f; /* (URL.canParse, AbortSignal.timeout: statics of globals; fetch with its options in a value) */
@@ -3188,6 +3191,26 @@ static const char *objlit_str(Expr *o, const char *key) {
     return NULL;
 }
 static Func *find_method(Class *c, const char *name);
+/* a generator's stream, or an object whose class has [Symbol.iterator](), where an array goes ([...g()], Array.from(g()),
+   Math.max(...g())): x.toArray() (x[Symbol.iterator]().toArray()), in place; false when x is neither */
+static bool iter_to_array(Expr *x) {
+    Type *t = x->type;
+    if (!t) return false;
+    Expr *src = xs_alloc(sizeof *src);
+    *src = *x;
+    src->prechecked = true;
+    Func *itm = t->kind == TY_OBJECT && !t->cls->builtin ? find_method(t->cls, "__iterator") : NULL;
+    if (itm && !itm->nparams) {
+        Expr *it = xs_alloc(sizeof *it);
+        it->kind = E_MEMBER; it->pos = x->pos; it->field = -1; it->lhs = src; it->str = "__iterator"; it->is_call = true;
+        src = it;
+    } else if (t->kind != TY_STREAM) return false;
+    Expr *call = xs_alloc(sizeof *call);
+    call->kind = E_MEMBER; call->pos = x->pos; call->field = -1; call->lhs = src; call->str = "toArray"; call->is_call = true;
+    *x = *call;
+    check_expr(x, NULL);
+    return x->type && x->type->kind == TY_ARRAY;
+}
 static void crypto_method_overload(Expr *e, Class *c) {
     Func *bm = find_method(c, xs_sprintf("__%s_bytes", e->str));
     if (bm && find_method(c, e->str) && e->args.len <= bm->nparams) { e->str = bm->name; return; }
@@ -3679,6 +3702,7 @@ static void check_spread_lit(Expr *e, Type *elem) {
             continue;
         }
         check_expr(a->lhs, elem && !is_numeric(elem) ? ty_array_of(elem) : NULL);
+        iter_to_array(a->lhs);
         Type *st = a->lhs->type;
         const char *m = st->kind == TY_STRING ? "split" : st->kind == TY_SET ? "values" : st->kind == TY_MAP ? "entries" : NULL;
         if (m) { /* an array of its own */
@@ -4386,6 +4410,8 @@ static void to_unknown(Expr *e) {
    is any. */
 static Expr *dyn_lvalue; /* the target of the assignment being checked: xs[i] = v of an any[] stays an element */
 bool xs_any_used; /* the program reads or writes an any by name: the emitter gives every class its field table */
+bool xs_gen_sent_used; /* a generator receives values (const v = yield x) or a program calls next() on one: the emitter adds
+                          their runtime (xs_gen_c) */
 bool xs_buf_view_used; /* Buffer.from(b.buffer, offset, length): the emitter writes xs_buf_view_of */
 bool xs_any_call_used; /* x.m() on an any: the emitter writes its two failures (xs_dyn_not_function, xs_dyn_null_call) */
 static Field *find_field(Class *c, const char *name, int *index);
@@ -6182,11 +6208,20 @@ static Expr *dflt_subst(Expr *d, Func *f, Expr **args, int nargs, Pos at) {
 }
 
 static bool is_spread(Expr *a) { return a && a->kind == E_UNARY && a->op == TK_ELLIPSIS; }
+/* f(...g()) into ...xs: T[]: a generator's (or an iterable object's) values, as an array */
+static Expr *rest_spread(Expr *u) {
+    Expr *x = u->lhs;
+    if (x->kind == E_CALL || x->kind == E_NEW_OBJ || (x->kind == E_MEMBER && x->is_call)) {
+        check_expr(x, NULL);
+        if (x->type && (x->type->kind == TY_STREAM || x->type->kind == TY_OBJECT) && iter_to_array(x)) x->prechecked = true;
+    }
+    return x;
+}
 /* a call through a function value whose last parameter is ...xs: T[]: the arguments from there on, one array */
 static void pack_rest(Expr *e, Type *ft) {
     if (!ft || !ft->rest || !ft->nparams) return;
     int r = ft->nparams - 1;
-    if (e->args.len == ft->nparams && is_spread(e->args.items[r])) { e->args.items[r] = e->args.items[r]->lhs; return; }
+    if (e->args.len == ft->nparams && is_spread(e->args.items[r])) { e->args.items[r] = rest_spread(e->args.items[r]); return; }
     if (e->args.len < r) return; /* (too few: reported by the caller) */
     Expr *arr = xs_alloc(sizeof *arr);
     arr->kind = E_ARRAY_LIT; arr->pos = e->args.len > r ? e->args.items[r]->pos : e->pos; arr->field = -1;
@@ -6580,7 +6615,7 @@ static void variance_arg_t(Expr *a, Func *f, int i, Type *ptype) {
 static void check_args(Expr *e, Func *f, const char *what) {
     if (f->nparams && f->params[f->nparams - 1].rest) { /* ...xs: T[]: the arguments from there on, one array (or f(...ys): ys) */
         int r = f->nparams - 1;
-        if (e->args.len == f->nparams && is_spread(e->args.items[r])) e->args.items[r] = e->args.items[r]->lhs;
+        if (e->args.len == f->nparams && is_spread(e->args.items[r])) e->args.items[r] = rest_spread(e->args.items[r]);
         else if (e->args.len > r) {
             Expr *arr = xs_alloc(sizeof *arr);
             arr->kind = E_ARRAY_LIT; arr->pos = e->args.items[r]->pos; arr->field = -1;
@@ -6643,6 +6678,7 @@ static void check_math(Expr *e) {
         if (minmax && e->args.len == 1 && is_spread(e->args.items[0])) { /* Math.max(...xs): over the array (-Infinity when empty) */
             Expr *a = e->args.items[0]->lhs;
             check_expr(a, NULL);
+            iter_to_array(a);
             Type *at = a->type;
             if (at->kind != TY_ARRAY || !is_numeric(at->elem)) xs_error(XS7026, a->pos, NULL, "Math.%s(...xs) takes an array of numbers", fn);
             Pos pos = e->pos;
@@ -6915,6 +6951,55 @@ static void check_stream_member(Expr *e) {
         check_expr(e->args.items[0], cbt);
         expect_type(e->args.items[0], cbt, "callback of Stream.reduce");
         e->type = acc;
+        e->builtin.cfn = m;
+        return;
+    }
+    if (strcmp(m, "next") == 0 || strcmp(m, "return") == 0) { /* g.next(), g.next(v), g.return(v): xisto:iter's { value, done } */
+        if (e->args.len > 1) xs_error(XS7039, e->pos, NULL, "%s takes at most one argument", m);
+        if (!lookup_func("__xs_gen_next")) xs_error(XS7037, e->pos, NULL, "Stream has no method '%s'", m);
+        Expr *g = e->lhs;
+        g->prechecked = true;
+        Expr *callee = xs_alloc(sizeof *callee);
+        callee->kind = E_IDENT; callee->pos = e->pos; callee->field = -1;
+        Expr *c = xs_alloc(sizeof *c);
+        c->kind = E_CALL; c->pos = e->pos; c->field = -1; c->lhs = callee;
+        if (m[0] == 'n') {
+            callee->str = "__xs_gen_next";
+            if (e->args.len) { /* g.next(v): v handed to the yield the generator is waiting at, then the next step */
+                Expr *snd = xs_alloc(sizeof *snd);
+                snd->kind = E_MEMBER; snd->pos = e->pos; snd->field = -1; snd->lhs = g; snd->str = "__send"; snd->is_call = true;
+                expr_list_push(&snd->args, e->args.items[0]);
+                g = snd;
+            }
+            expr_list_push(&c->args, g);
+        } else {
+            callee->str = e->args.len ? "__xs_gen_return" : "__xs_gen_return0";
+            expr_list_push(&c->args, g);
+            if (e->args.len) expr_list_push(&c->args, e->args.items[0]);
+        }
+        xs_gen_sent_used = true;
+        *e = *c;
+        check_expr(e, NULL);
+        return;
+    }
+    if (strcmp(m, "throw") == 0)
+        xs_error(XS7037, e->pos, "throw the error where next() is called, or end the generator with g.return()", "g.throw(e) on a generator is not supported");
+    if (!strcmp(m, "__pull") || !strcmp(m, "__ended") || !strcmp(m, "__close")) { /* (xisto:iter) */
+        NARGS(0);
+        e->type = m[2] == 'p' ? elem : m[2] == 'e' ? ty_boolean : ty_void;
+        e->builtin.cfn = m;
+        return;
+    }
+    if (!strcmp(m, "__send")) { /* (g.next(v)) */
+        NARGS(1);
+        Type *n = t->key ? resolve(t->key, e->pos) : NULL;
+        if (n) { check_expr(e->args.items[0], n); expect_type(e->args.items[0], n, "the value next(v) sends"); }
+        else check_expr(e->args.items[0], NULL);
+        Type *at = e->args.items[0]->type;
+        if (at->kind == TY_LITINT) { coerce_lit(e->args.items[0], ty_number); at = e->args.items[0]->type; }
+        if (at->kind != TY_NUMBER && at->kind != TY_INT && at->kind != TY_BOOLEAN && !ty_is_heap(at) && at->kind != TY_NULLABLE && at->kind != TY_NULL)
+            xs_error(XS6040, e->pos, "send a number, an int, a boolean, a string or an object", "next(v) cannot send %s", ty_name(at));
+        e->type = t;
         e->builtin.cfn = m;
         return;
     }
@@ -7738,8 +7823,14 @@ static void check_access(int access, Class *owner, const char *name, Pos pos) {
     Class *in = cur_class ? cur_class : cur_func ? (cur_func->cls ? cur_func->cls : cur_func->static_of) : NULL;
     if (in && in != owner && (in->generic_of ? in->generic_of : in) == (owner->generic_of ? owner->generic_of : owner))
         in = owner; /* Query<L, T> written in Query<R, T>'s code (lean()): one class for TypeScript, two instances here */
-    if (access == 2 && in != owner)
+    if (access == 2 && in != owner) {
+        const char *bare = strncmp(name, "__get_", 6) == 0 || strncmp(name, "__set_", 6) == 0 ? name + 6 : name;
+        if (!strncmp(bare, "__hp_", 5)) { /* #x (__hp_<class id>_x) */
+            const char *u = strchr(bare + 5, '_');
+            xs_error(XS8055, pos, xs_sprintf("use it inside %s, or declare a public member that reads it", owner->name), "'#%s' is private to %s", u ? u + 1 : bare + 5, owner->name);
+        }
         xs_error(XS8055, pos, xs_sprintf("use it inside %s, or make it public", owner->name), "'%s' is private to %s", name, owner->name);
+    }
     if (access == 1 && !(in && is_subclass(in, owner)))
         xs_error(XS8056, pos, xs_sprintf("use it inside %s or a class that extends it", owner->name), "'%s' is protected in %s", name, owner->name);
 }
@@ -8441,6 +8532,7 @@ static void infer_new_collection(Expr *e, Type *expected) {
         arr_convert(a, ty_unknown);
         t = a->type;
     }
+    if (iter_to_array(a)) t = a->type; /* new Set(g()): of the generator's values */
     if (is_map && t->kind == TY_MAP && !t->record) { e->elem_type = ty_map_of(t->key, t->elem); return; } /* new Map(other): its types */
     if (t->kind != TY_ARRAY && t->kind != TY_SET) xs_error(XS3006, a->pos, hint, "cannot infer the type of this %s", is_map ? "Map" : "Set");
     if (!is_map) { e->elem_type = ty_set_of(t->elem); return; }
@@ -8929,6 +9021,7 @@ static bool objlit_expand(Expr *e, Type *expected) {
         Class *sc = st->cls;
         for (int k = 0; k < sc->nfields; k++) {
             const char *fname = sc->fields[k].name;
+            if (xs_hidden_field(fname)) continue; /* #x: not an own property, a spread does not copy it */
             if (target && !find_field(target, fname, NULL)) continue; /* (TypeScript allows extra fields from a spread) */
             Expr *m = member_of(pure_copy(src), fname, a->pos);
             m->spread_read = true;
@@ -9934,6 +10027,21 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     }
     case E_IDENT: {
+        if (e->str[0] == '_' && !strcmp(e->str, "__xs_sent") && cur_func && cur_func->is_gen && !lookup(e->str)) {
+            /* const v = yield x;: the value the consumer's next(v) sent (taken once, right after the yield) */
+            Type *n = cur_func->ret ? cur_func->ret->key : NULL;
+            if (!n) xs_error(XS3012, e->pos, xs_sprintf("write the type of what next(v) sends: function* %s(): Generator<T, void, N>", cur_func->name),
+                             "the value of 'yield' is the one next(v) sends, and its type is not written");
+            n = resolve(n, e->pos);
+            int k = n->kind == TY_NUMBER ? 0 : n->kind == TY_INT ? 1 : n->kind == TY_BOOLEAN ? 2 : ty_is_heap(n) || n->kind == TY_NULLABLE ? 3 : -1;
+            if (k < 0 || (n->kind == TY_NULLABLE && !ty_is_heap(n->elem))) xs_error(XS6040, e->pos, "send a number, an int, a boolean, a string or an object", "next(v) cannot send %s here", ty_name(n));
+            e->kind = E_CALL;
+            e->str = NULL;
+            e->builtin.cfn = k == 0 ? "xs_gen_take_d" : k == 1 ? "xs_gen_take_i" : k == 2 ? "xs_gen_take_b" : "xs_gen_take_p";
+            e->type = n;
+            xs_gen_sent_used = true;
+            return;
+        }
         Binding *b = lookup(e->str);
         if (b && (b->null_const || (b->origin && b->origin->null_const))) { /* const x = null: x is null */
             b->used = true;
@@ -10163,6 +10271,20 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (ln && e->rhs->kind == E_IDENT) e->rhs->cell_raw = true;
         }
         if (e->op == TK_QQ) { check_nullish(e, expected); return; }
+        if (e->op == TK_IN && e->lhs->kind == E_IDENT && e->lhs->str && !strncmp(e->lhs->str, "__hp_", 5)) {
+            /* #x in o: o was made by the class that declares #x (its constructor installs every #member): o instanceof it */
+            Class *k = cur_class ? cur_class : static_this_class();
+            if (!k) xs_error(XS8015, e->pos, NULL, "'#%s in' is used inside the class that declares #%s", e->lhs->str + 5, e->lhs->str + 5);
+            Field *fd = find_field(k, e->lhs->str, NULL);
+            Class *owner = fd && fd->owner ? fd->owner : k;
+            Expr *cn = xs_alloc(sizeof *cn);
+            cn->kind = E_IDENT; cn->pos = e->lhs->pos; cn->field = -1; cn->str = owner->name;
+            e->op = TK_IDENT; /* (instanceof) */
+            e->lhs = e->rhs;
+            e->rhs = cn;
+            check_expr(e, expected);
+            return;
+        }
         if (e->op == TK_IN) { /* "k" in m: m.has(k) on a Record; on an object, whether the field is there */
             check_expr(e->rhs, NULL);
             Type *rt = e->rhs->type;
@@ -10967,6 +11089,43 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->is_call = true;
                 e->args = (ExprList){0};
                 expr_list_push(&e->args, key);
+                expr_list_push(&e->args, val);
+                check_expr(e, NULL);
+                return;
+            }
+        }
+        if (e->kind == E_ASSIGN && e->op == TK_ASSIGN && target->kind == E_MEMBER && !target->is_call && target->lhs->kind == E_IDENT &&
+            !strcmp(target->lhs->str, "super") && !lookup("super")) { /* super.x = v with set x(v) in a base: that setter */
+            Class *cc = cur_func && cur_func->cls ? cur_func->cls : cur_class;
+            const char *sn = xs_sprintf("__set_%s", target->str);
+            if (!cc || !cc->base || !find_method(cc->base, sn))
+                xs_error(XS8138, target->pos, "assign this.x, or declare set x(v) in the base class", "super.%s is assigned, and the base class has no setter '%s'", target->str, target->str);
+            Expr *val = e->rhs;
+            e->kind = E_MEMBER;
+            e->lhs = target->lhs;
+            e->str = (char *)sn;
+            e->is_call = true;
+            e->rhs = NULL;
+            e->args = (ExprList){0};
+            expr_list_push(&e->args, val);
+            check_expr(e, NULL);
+            return;
+        }
+        if (e->kind == E_ASSIGN && e->op == TK_ASSIGN && target->kind == E_MEMBER && !target->is_call && target->lhs->kind == E_IDENT &&
+            !lookup(target->lhs->str) && find_class(!strncmp(target->lhs->str, "super\x03", 6) ? target->lhs->str + 6 : target->lhs->str)) {
+            /* Class.x = v with static set x(v) (in a base too): its call (super.x = v in a static member: the base's) */
+            Class *sc = find_class(!strncmp(target->lhs->str, "super\x03", 6) ? target->lhs->str + 6 : target->lhs->str);
+            bool plain = false, setter = false;
+            const char *sn = xs_sprintf("__set_%s", target->str);
+            for (Class *b = sc; b && !b->builtin && !plain && !setter; b = b->base) { plain = has_static(b, target->str); setter = has_static(b, sn); }
+            if (setter) {
+                Expr *val = e->rhs;
+                e->kind = E_MEMBER;
+                e->lhs = target->lhs;
+                e->str = (char *)sn;
+                e->is_call = true;
+                e->rhs = NULL;
+                e->args = (ExprList){0};
                 expr_list_push(&e->args, val);
                 check_expr(e, NULL);
                 return;
@@ -12777,6 +12936,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->is_call = false;
                 e->args = (ExprList){0};
                 for (int i = 0; i < c->nfields; i++) {
+                    if (xs_hidden_field(c->fields[i].name)) continue; /* #x: not a key */
                     Expr *k = xs_alloc(sizeof *k);
                     k->kind = E_STRING; k->pos = e->pos; k->field = -1; k->str = (char *)c->fields[i].name;
                     expr_list_push(&e->args, k);
@@ -12830,8 +12990,13 @@ static void check_expr_in(Expr *e, Type *expected) {
             return;
         }
         if (e->lhs->kind == E_IDENT && strcmp(e->lhs->str, "super") == 0 && !lookup("super")) { /* super.m(...) */
-            Class *cc = cur_func ? cur_func->cls : NULL;
+            Class *cc = cur_func && cur_func->cls ? cur_func->cls : cur_class;
             if (!cc || !cc->base) xs_error(XS8124, e->pos, NULL, "super is used inside a class that extends another");
+            if (!e->is_call && find_method(cc->base, xs_sprintf("__get_%s", e->str)) && !find_field(cc->base, e->str, NULL)) {
+                e->str = xs_sprintf("__get_%s", e->str); /* super.x with get x() in a base: that getter, not this class's */
+                e->is_call = true;
+                e->args = (ExprList){0};
+            }
             if (!e->is_call || !find_method(cc->base, e->str))
                 xs_error(XS8014, e->pos, xs_sprintf("read fields with this.%s", e->str), "%s has no method '%s'", cc->base->name, e->str);
             Expr *self = xs_alloc(sizeof *self);
@@ -12847,8 +13012,22 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         if (e->lhs->kind == E_IDENT && !lookup(e->lhs->str)) {
             const char *ns = e->lhs->str;
-            Class *sc0 = find_class(ns), *sc = sc0;
+            bool sup = !strncmp(ns, "super\x03", 6); /* super.m() / super.x in a static member (the parser names the base) */
+            Class *sc0 = sup ? static_this_class() : find_class(ns), *sc = sup ? find_class(ns + 6) : sc0;
+            if (sup && (!sc0 || !sc)) xs_error(XS8124, e->pos, NULL, "super is used inside a class that extends another");
             const char *nsq = strchr(ns, '\x01'); /* (ns.C.m with ns's C read as "C\x01m": C__s_m of that import, XB-223) */
+            if (sc && !sc->builtin && !e->is_call && !nsq) { /* Class.x with static get x(): its call (the class's own, or a base's) */
+                bool plain = false, getter = false;
+                const char *gn = xs_sprintf("__get_%s", e->str);
+                for (Class *b = sc; b && !b->builtin && !plain && !getter; b = b->base) { plain = has_static(b, e->str); getter = has_static(b, gn); }
+                if (getter) {
+                    e->str = (char *)gn;
+                    e->is_call = true;
+                    e->args = (ExprList){0};
+                    check_expr(e, expected);
+                    return;
+                }
+            }
             if (sc && !sc->builtin && !has_static(sc, e->str)) /* B.m() with m a static of a base A: A's (JavaScript's prototype chain) */
                 for (Class *b = sc->base; b && !b->builtin; b = b->base) if (has_static(b, e->str)) { sc = b; break; }
             for (int k = 0; sc && !sc->builtin && k < sc->nstatics_user; k++) { /* Class.staticMember */
@@ -13081,6 +13260,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (e->args.len != 1) xs_error(XS7001, e->pos, "Array.from(array, Set or Map); Array.isArray(x)", "Array.%s takes one argument here", e->str);
                 Expr *src = e->args.items[0];
                 check_expr(src, expected && strcmp(e->str, "from") == 0 ? expected : NULL);
+                if (e->str[0] == 'f' && iter_to_array(src)) { *e = *src; return; } /* Array.from(g()): its values, an array of their own */
                 Type *st = src->type;
                 if (e->str[0] == 'i' && (st->kind == TY_UNKNOWN || st->kind == TY_UNION || (st->kind == TY_NULLABLE && st->elem->kind == TY_UNION))) {
                     /* Array.isArray(v) with v: unknown (or any, or a union): what v holds, at run time */
@@ -13571,6 +13751,18 @@ static void check_expr_in(Expr *e, Type *expected) {
             Type *elem = e->lhs->type->elem;
             if (!e->is_call && strcmp(e->str, "length") == 0) {
                 e->type = ty_int;
+                return;
+            }
+            if (!e->is_call && strcmp(e->str, "raw") == 0 && e->lhs->type->tsa && lookup_func("__xs_tsa_raw")) {
+                /* strings.raw of a tagged template's strings: their texts as written (xisto:tagged) */
+                Expr *callee = xs_alloc(sizeof *callee);
+                callee->kind = E_IDENT; callee->pos = e->pos; callee->str = "__xs_tsa_raw"; callee->field = -1;
+                Expr *c = xs_alloc(sizeof *c);
+                c->kind = E_CALL; c->pos = e->pos; c->field = -1;
+                c->lhs = callee;
+                expr_list_push(&c->args, e->lhs);
+                *e = *c;
+                check_expr(e, expected);
                 return;
             }
             if (e->is_call && strcmp(e->str, "push") == 0 && e->args.len > 1 && rereadable(e->lhs)) {
@@ -15124,6 +15316,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 want = ty_array_of(tuple_type(ps, 2, e->pos));
             } else want = ty_array_of(e->type->elem);
             if (!e->args.items[0]->type) check_expr(e->args.items[0], want); /* (checked already when it gave the type) */
+            iter_to_array(e->args.items[0]); /* (new Set(g()): of the generator's values) */
             Expr *src = e->args.items[0];
             if ((is_map && src->type->kind == TY_MAP && !src->type->record) || (!is_map && src->type->kind == TY_SET)) {
                 /* new Map(otherMap) / new Set(otherSet) (and Object.fromEntries(map)): a copy, [...other] */
@@ -19206,7 +19399,9 @@ static void fake_object(Expr *e, Class *t) {
             Expr *body = fv->kind == E_ARROW && fv->arrow->expr_body && fv->arrow->fn->body && fv->arrow->fn->body->stmts.len == 1 ?
                          fv->arrow->fn->body->stmts.items[0]->expr : NULL;
             bool loose = m->ret && ty_is_heap(m->ret) && m->ret->kind != TY_UNKNOWN && !m->ret_promise &&
-                         !(body && (body->kind == E_OBJLIT || body->kind == E_ARRAY_LIT)); /* (a literal result takes the type) */
+                         !(body && (body->kind == E_OBJLIT || body->kind == E_ARRAY_LIT)) && /* (a literal result takes the type) */
+                         !(fv->kind == E_ARROW && fv->arrow->fn->ret && fv->arrow->fn->ret->kind == TY_OBJECT && m->ret->kind == TY_OBJECT);
+                         /* (next(): R { ... }: a class written as its result type: checked as that) */
             ft = ty_func(ps, m->nparams, loose ? ty_unknown : m->ret);
             ft->async_ret = m->ret_promise;
             Field *nf = &a->fields[a->nfields++];

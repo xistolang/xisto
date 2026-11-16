@@ -13,6 +13,12 @@ typedef struct {
     Module *mod;
     const char *prev_end; /* end of the last token consumed: source spans for reflection */
     bool in_gen;          /* inside a generator body: `yield` is a statement */
+    const char *static_base; /* inside a static member of a class that extends Base: `super` reads "super\x03Base" (the
+                                checker: Base's statics, with `this` the class the static was called on) */
+    int iterobj;          /* in the body of [Symbol.iterator](): Iterator<T> (2: async): Iterator<T> and IterableIterator<T> are the
+                             iterator object's type (xisto:iter's __XsIterator<T>), not a generator's */
+    int hp_id;            /* inside a class body: its number, which names its #private members (__hp_<id>_name) apart from a
+                             base's or a subclass's members of the same name */
     /* import { setTimeout as sleep }: in the rest of the module the alias reads as the exported name */
     char **alias_from, **alias_to;
     int nalias;
@@ -70,6 +76,15 @@ static bool is_builtins_member(const char *n) {
     return false;
 }
 static bool wants_okmap; /* WeakMap, or Map<object, V>, was written: xisto:okmap is loaded */
+static bool wants_iter; /* IteratorResult, or a [Symbol.iterator]() that returns an iterator object: xisto:iter is loaded */
+static const char *iterobj_t, *aiterobj_t; /* (parse_fields_body) the T of the class's [Symbol.iterator](): Iterator<T> and
+                                               [Symbol.asyncIterator](): AsyncIterator<T> that return iterator objects */
+static bool wants_tagged; /* a tagged template (tag`...`) or TemplateStringsArray was written: xisto:tagged is loaded */
+static StmtList tsa_decls; /* const __xs_tsa_M_L_C = __xs_tsa([cooked...], [raw...]): one per tagged template, the strings
+                              array its tag receives on every call (one identity per call site, as in JavaScript); put at
+                              the start of the module by parse_module */
+static char **tsa_names;
+static int ntsa_names;
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
 static void import_process(Program *prog, Module *m);
 static void import_stdio(Program *prog, Module *m);
@@ -125,6 +140,14 @@ static void next(Parser *p) {
     if (p->nalias && p->tok.kind == TK_IDENT && before != TK_DOT && before != TK_QDOT) /* (o.a: a property, never an import's alias) */
         for (int i = 0; i < p->nalias; i++)
             if (strcmp(p->tok.str, p->alias_from[i]) == 0) { p->tok.str = p->alias_to[i]; break; }
+    if (p->static_base && p->tok.kind == TK_IDENT && !strcmp(p->tok.str, "super")) {
+        p->tok.str = xs_sprintf("super\x03%s", p->static_base);
+        this_alias_used = true; /* (it reads the class the static was called on: copied for a subclass that inherits it) */
+    }
+    if (!p->hp_id && p->tok.kind == TK_IDENT && p->tok.len && p->tok.start[0] == '#')
+        xs_error(XS8055, p->tok.pos, "read it through a method of the class", "'%.*s' is private to the class that declares it", p->tok.len, p->tok.start);
+    if (p->hp_id && p->tok.kind == TK_IDENT && p->tok.len && p->tok.start[0] == '#')
+        p->tok.str = xs_sprintf("__hp_%d_%s", p->hp_id, p->tok.str + 5); /* #x in this class's body: this class's #x */
 }
 /* the source text from `from` to the end of the last consumed token */
 static char *span(Parser *p, const char *from) { return from && p->prev_end > from ? xs_strndup(from, (size_t)(p->prev_end - from)) : xs_sprintf("%s", ""); }
@@ -874,6 +897,23 @@ static Type *parse_type(Parser *p) {
         expect(p, TK_LT, "write Promise<T>");
         t = ty_promise_of(parse_type(p));
         expect(p, TK_GT, NULL);
+    } else if (strcmp(n, "TemplateStringsArray") == 0) { /* a tagged template's strings: string[] with .raw */
+        t = ty_array_of(ty_string);
+        t->tsa = true;
+        wants_tagged = true;
+    } else if (p->iterobj && (strcmp(n, "Iterator") == 0 || strcmp(n, "IterableIterator") == 0 || strcmp(n, "AsyncIterator") == 0 ||
+                              strcmp(n, "AsyncIterableIterator") == 0)) { /* (the iterator object a [Symbol.iterator]() returns) */
+        bool as = n[0] == 'A';
+        expect(p, TK_LT, NULL);
+        Type *a = parse_type(p);
+        while (accept(p, TK_COMMA)) parse_type(p);
+        expect(p, TK_GT, NULL);
+        Token nm = {0};
+        nm.kind = TK_IDENT; nm.pos = tpos; nm.str = as ? "__XsAsyncIterator" : "__XsIterator";
+        t = named_type(p, nm);
+        t->targs = xs_alloc(sizeof(Type *));
+        t->targs[0] = a;
+        t->ntargs = 1;
     } else if (strcmp(n, "Generator") == 0 || strcmp(n, "Iterable") == 0 || strcmp(n, "IterableIterator") == 0 || strcmp(n, "Iterator") == 0 ||
                strcmp(n, "AsyncGenerator") == 0 || strcmp(n, "AsyncIterable") == 0 || strcmp(n, "AsyncIterableIterator") == 0) {
         /* (async ones too: an async generator's waits park its consumer, so for await reads it as for...of) */
@@ -881,7 +921,10 @@ static Type *parse_type(Parser *p) {
         expect(p, TK_LT, xs_sprintf("write %s<T>", n));
         if (!strcmp(n, "Iterable") || !strcmp(n, "AsyncIterable")) wants_arrays = true; /* (an array where it goes: __xs_iter) */
         t = ty_stream_of(parse_type(p));
-        while (accept(p, TK_COMMA)) parse_type(p);
+        for (int k = 1; accept(p, TK_COMMA); k++) { /* Generator<T, TReturn, TNext>: TNext, what next(v) sends (key) */
+            Type *x = parse_type(p);
+            if (k == 2 && !strcmp(n, "Generator") && x->kind != TY_VOID && !(x->kind == TY_UNKNOWN && !ty_is_undef(x) && !x->tname)) t->key = x;
+        }
         expect(p, TK_GT, NULL);
     } else if (strcmp(n, "readonly") == 0) { /* readonly T[]: T[] (that it is not written to is TypeScript's check) */
         t = parse_type(p);
@@ -1012,6 +1055,8 @@ static Type *parse_type(Parser *p) {
                 else import_add_name(im, name);
             }
         }
+        bool itres = !strcmp(name.str, "IteratorResult") || !strcmp(name.str, "IteratorYieldResult") || !strcmp(name.str, "IteratorReturnResult");
+        if (itres) { wants_iter = true; name.str = "IteratorResult"; } /* (TypeScript's global: xisto:iter's { value?: T; done?: boolean }) */
         t = named_type(p, name);
         if (at(p, TK_LT)) { /* Name<A, B>: a generic interface */
             next(p);
@@ -1020,6 +1065,7 @@ static Type *parse_type(Parser *p) {
                 t->targs[t->ntargs++] = parse_type(p);
             } while (accept(p, TK_COMMA));
             expect(p, TK_GT, NULL);
+            if (itres) t->ntargs = 1; /* (IteratorResult<T, TReturn>: a done result's value is held as T) */
         }
     }
     if (at(p, TK_AMP)) t = inter_rest(p, t, open, tpos);
@@ -1339,6 +1385,7 @@ static Expr *parse_arrow(Parser *p) {
 }
 
 static bool tmpl_raw; /* parsing the template of String.raw`...` */
+static Expr *parse_tagged(Parser *p, Expr *tag);
 static bool wants_intl; /* Intl.X was named: xisto:intl is loaded (Intl.DateTimeFormat is its class Intl_DateTimeFormat) */
 /* the web globals xisto:url declares (runtime/node/url.ts) */
 static bool is_url_global_name(const char *n) {
@@ -1582,6 +1629,7 @@ static Expr *parse_primary(Parser *p) {
                 sub.ns_alias = p->ns_alias; sub.ns_import = p->ns_import; sub.nns = p->nns;
                 sub.vt_names = p->vt_names; sub.vt_types = p->vt_types; sub.nvt = p->nvt;
                 sub.this_alias = p->this_alias;
+                sub.hp_id = p->hp_id; /* (${this.#x}) */
                 next(&sub);
                 if (at(&sub, TK_EOF)) xs_error(XS1007, (Pos){line, col}, NULL, "empty ${} in template literal");
                 Expr *inner = parse_expr(&sub);
@@ -1636,6 +1684,8 @@ static Expr *parse_primary(Parser *p) {
             next(p);
             return new_expr(E_NULL, pos);
         }
+        if (p->in_gen && strcmp(p->tok.str, "yield") == 0)
+            xs_error(XS8070, pos, "receive the value on its own line: const v = yield x; (or v = yield x;)", "'yield' inside an expression is not supported");
         if (strcmp(p->tok.str, "globalThis") == 0 && !binds_name(p, "globalThis")) { /* globalThis.X: the global X (js_globals) */
             next(p);
             if (!at(p, TK_DOT) && !at(p, TK_QDOT))
@@ -1799,6 +1849,24 @@ static Expr *parse_primary(Parser *p) {
                 if (!accept(p, TK_COMMA)) break;
                 continue;
             }
+            if (at(p, TK_LBRACKET) && p->iterobj) { /* { next() { ... }, [Symbol.iterator]() { return this; } }: an iterator object's
+                                                     own iterator is itself (the generator that reads it calls next() only) */
+                Parser l_ = *p;
+                next(&l_);
+                if (at_ident(&l_, "Symbol")) {
+                    next(&l_);
+                    if (accept(&l_, TK_DOT) && at_ident(&l_, "iterator")) {
+                        next(&l_);
+                        if (accept(&l_, TK_RBRACKET) && at(&l_, TK_LPAREN)) {
+                            *p = l_;
+                            p->method_fn = true;
+                            (void)parse_arrow(p);
+                            if (!accept(p, TK_COMMA)) break;
+                            continue;
+                        }
+                    }
+                }
+            }
             if (at(p, TK_ELLIPSIS) || at(p, TK_LBRACKET)) {
                 /* { ...base, x: 1 }: base's fields in place; { [k]: v }: a key computed at run time (a Record). The
                    checker expands both; the key is a marker no name can be */
@@ -1891,7 +1959,19 @@ static Expr *parse_primary(Parser *p) {
         c->pos = pos;
         c->name = xs_sprintf("__AnonClass%d", ++nanon);
         next(p);
-        if (at(p, TK_IDENT)) next(p); /* (class Name { }: its own name, kept local to the expression in JavaScript) */
+        if (at(p, TK_IDENT) && !at_ident(p, "extends") && !at_ident(p, "implements")) next(p); /* (class Name { }: its own name, kept local to the expression in JavaScript) */
+        if (at_ident(p, "extends")) { /* class extends Base { }: a class of the module as the base */
+            next(p);
+            c->base_pos = p->tok.pos;
+            Token bt = expect(p, TK_IDENT, NULL);
+            for (int i = 0; i < p->nvt; i++)
+                if (!strcmp(p->vt_names[i], bt.str))
+                    xs_error(XS6022, bt.pos, "declare each combination as a class: class LoudBase extends Base { ... }",
+                             "a class that extends a parameter or a variable (a mixin) is not supported");
+            c->base_name = bt.str;
+            if (at(p, TK_LT) || at(p, TK_LPAREN)) xs_error(XS6022, p->tok.pos, "declare the class: class Name extends Base<T> { ... }", "this base of a class expression is not supported");
+        }
+        if (at_ident(p, "implements")) { next(p); do { expect(p, TK_IDENT, NULL); if (at(p, TK_LT)) { int depth = 0; do { if (at(p, TK_LT)) depth++; else if (at(p, TK_GT)) depth--; next(p); } while (depth > 0 && !at(p, TK_EOF)); } } while (accept(p, TK_COMMA)); }
         parse_fields_body(p, c);
         c->mod = p->mod;
         c->as_value = true;
@@ -2157,6 +2237,7 @@ static Expr *parse_postfix(Parser *p) {
             if (!strcmp(name.str, "allSettled")) wants_settled = true;
             if (is_builtins_member(name.str)) wants_builtins = true;
             if ((!strcmp(name.str, "withResolvers") || !strcmp(name.str, "any")) && e->kind == E_IDENT && !strcmp(e->str, "Promise")) wants_promises = true;
+            if ((!strcmp(name.str, "next") || !strcmp(name.str, "return")) && at(p, TK_LPAREN)) wants_iter = true; /* (g.next(): xisto:iter) */
             if (!strcmp(name.str, "next") && e->kind == E_MEMBER && e->str && (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")))
                 wants_arrays = true; /* m.keys().next().value: __xs_first */
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs);
@@ -2203,6 +2284,7 @@ static Expr *parse_postfix(Parser *p) {
             if (!strcmp(name.str, "allSettled")) wants_settled = true;
             if (is_builtins_member(name.str)) wants_builtins = true;
             if ((!strcmp(name.str, "withResolvers") || !strcmp(name.str, "any")) && e->kind == E_IDENT && !strcmp(e->str, "Promise")) wants_promises = true;
+            if ((!strcmp(name.str, "next") || !strcmp(name.str, "return")) && at(p, TK_LPAREN)) wants_iter = true; /* (g.next(): xisto:iter) */
             if (!strcmp(name.str, "next") && e->kind == E_MEMBER && e->str && (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")))
                 wants_arrays = true; /* m.keys().next().value: __xs_first */
             if (!strcmp(name.str, "length") && at(p, TK_ASSIGN)) wants_arrays = true; /* xs.length = 0 */
@@ -2225,6 +2307,8 @@ static Expr *parse_postfix(Parser *p) {
             tmpl_raw = true;
             e = parse_primary(p);
             tmpl_raw = false;
+        } else if (at(p, TK_TEMPLATE) && !nopt && (e->kind == E_IDENT || (e->kind == E_MEMBER && !e->is_call) || e->kind == E_CALL)) {
+            e = parse_tagged(p, e);
         } else if (at(p, TK_LPAREN) && !nopt && e->kind != E_IDENT && !(e->kind == E_MEMBER && !e->is_call)) {
             /* (() => { ... })(), f(a)(b): a call of the function value the expression gives */
             Expr *c = new_expr(E_CALL, pos);
@@ -2930,6 +3014,20 @@ static Stmt *parse_var(Parser *p) {
         /* let x;: TypeScript types it by what is assigned to it; here by the first assignment the checker meets */
         s->init = new_expr(E_NULL, p->tok.pos);
         s->init->unset = true;
+    } else if (p->in_gen && at(p, TK_ASSIGN) && ({ Parser l_ = *p; next(&l_); at_ident(&l_, "yield") && !peek_is(&l_, TK_STAR); })) {
+        /* const v = yield x;: the yield, then v declared with the value next(v) sent (pending: after the statement returned) */
+        next(p);
+        Stmt *y = new_stmt(S_YIELD, p->tok.pos);
+        next(p);
+        if (at(p, TK_SEMI) || at(p, TK_COMMA)) xs_error(XS8075, y->pos, "yield a value: const v = yield x;", "a generator yields values");
+        y->expr = parse_expr(p);
+        s->init = ident_expr(y->pos, "__xs_sent");
+        StmtList rest = p->pending;
+        p->pending = (StmtList){0};
+        stmt_list_push(&p->pending, s);
+        for (int i = 0; i < rest.len; i++) stmt_list_push(&p->pending, rest.items[i]);
+        if (at(p, TK_COMMA)) xs_error(XS1008, p->tok.pos, "declare it on its own: const v = yield x;", "expected ';' after a yield");
+        return y;
     } else {
         if (!at(p, TK_ASSIGN))
             xs_error(XS8146, p->tok.pos, "xisto has no 'undefined', so every variable starts with a value", "variable '%s' must be initialized", s->name);
@@ -3118,6 +3216,25 @@ static Stmt *parse_stmt(Parser *p) {
     }
     if (!p->in_gen && at_ident(p, "yield") && !peek_is(p, TK_ASSIGN) && !peek_is(p, TK_LPAREN) && !peek_is(p, TK_DOT) && !peek_is(p, TK_SEMI))
         xs_error(XS8070, pos, "make it a generator: function* name(): Generator<T> { ... }", "'yield' is used inside a generator");
+    if (p->in_gen && at(p, TK_IDENT) && peek_is(p, TK_ASSIGN) && ({ Parser l_ = *p; next(&l_); next(&l_); at_ident(&l_, "yield") && !peek_is(&l_, TK_STAR); })) {
+        /* v = yield x;: the yield, then v assigned the value next(v) sent */
+        Token vn = p->tok;
+        next(p);
+        next(p);
+        Stmt *y = new_stmt(S_YIELD, p->tok.pos);
+        next(p);
+        if (at(p, TK_SEMI)) xs_error(XS8075, y->pos, "yield a value: v = yield x;", "a generator yields values");
+        y->expr = parse_expr(p);
+        expect_semi(p);
+        Stmt *as = new_stmt(S_EXPR, vn.pos);
+        Expr *a = new_expr(E_ASSIGN, vn.pos);
+        a->op = TK_ASSIGN;
+        a->lhs = ident_expr(vn.pos, vn.str);
+        a->rhs = ident_expr(y->pos, "__xs_sent");
+        as->expr = a;
+        stmt_list_push(&p->pending, as);
+        return y;
+    }
     if (p->in_gen && at_ident(p, "yield")) { /* yield v;  yield* other;  (statements, in a generator) */
         next(p);
         if (accept(p, TK_STAR)) { /* for (const v of other) yield v; */
@@ -4059,7 +4176,8 @@ static bool const_class_ahead(Parser *p) {
     next(&l);
     if (!at(&l, TK_CLASS)) return false;
     next(&l);
-    return at(&l, TK_LBRACE) || at_ident(&l, "extends") || at_ident(&l, "implements"); /* (class Inner { }: K.name is "Inner") */
+    if (at(&l, TK_IDENT) && !at_ident(&l, "extends") && !at_ident(&l, "implements")) { next(&l); return at(&l, TK_LBRACE) || at_ident(&l, "extends") || at_ident(&l, "implements"); }
+    return at(&l, TK_LBRACE) || at_ident(&l, "extends") || at_ident(&l, "implements");
 }
 static Class *parse_class_ex(Parser *p, bool abstract);
 static Class *parse_class(Parser *p) { return parse_class_ex(p, false); }
@@ -4210,6 +4328,11 @@ Class *xs_parse_class_instance(Class *tmpl, Type **args, const char *name) {
 }
 
 static void parse_fields_body(Parser *p, Class *c) {
+    static int hp_ids;
+    int hp_was = p->hp_id;
+    const char *it_was = iterobj_t, *ait_was = aiterobj_t; /* (a class declared inside a method: its own) */
+    iterobj_t = aiterobj_t = NULL;
+    p->hp_id = ++hp_ids;
     expect(p, TK_LBRACE, NULL);
     char **sn0 = subst_names;
     Type **st0 = subst_types;
@@ -4235,6 +4358,7 @@ static void parse_fields_body(Parser *p, Class *c) {
         parse_decorators(p, &decos);
         Pos pos = p->tok.pos;
         int mods = skip_modifiers(p);
+        p->static_base = (mods & MOD_STATIC) && c->base_name && !c->mixin_call ? c->base_name : NULL; /* (super in a static member) */
         if ((mods & MOD_ABSTRACT) && !c->is_abstract) xs_error(XS8080, pos, "write abstract class Name", "an abstract member needs an abstract class");
         if ((mods & MOD_STATIC) && c->is_interface) xs_error(XS8109, pos, NULL, "interfaces have no static members");
         if ((mods & MOD_STATIC) && !c->is_interface && at(p, TK_LBRACE)) {
@@ -4284,6 +4408,19 @@ static void parse_fields_body(Parser *p, Class *c) {
                 xs_error(XS6029, sym.pos, NULL, "only [Symbol.iterator] (and async *[Symbol.asyncIterator]) are supported as computed method names");
             expect(p, TK_RBRACKET, NULL);
         }
+        int iter_obj = 0; /* [Symbol.iterator](): Iterator<T> returning an iterator object (1; 2: [Symbol.asyncIterator]) */
+        if (!gen_method && !c->is_interface && at(p, TK_LBRACKET)) {
+            Parser l_ = *p;
+            next(&l_);
+            if (at_ident(&l_, "Symbol")) {
+                next(&l_);
+                if (accept(&l_, TK_DOT) && (at_ident(&l_, "iterator") || at_ident(&l_, "asyncIterator"))) {
+                    iter_obj = at_ident(&l_, "iterator") ? 1 : 2;
+                    next(&l_);
+                    if (at(&l_, TK_RBRACKET)) { next(&l_); *p = l_; } else iter_obj = 0;
+                }
+            }
+        }
         bool sym_iter = gen_method && at(p, TK_LPAREN) && p->prev_end && p->prev_end[-1] == ']';
         int accessor = 0; /* get x() / set x(v) */
         if (!gen_method && (at_ident(p, "get") || at_ident(p, "set")) && peek_is(p, TK_IDENT) && !c->is_interface) {
@@ -4292,6 +4429,7 @@ static void parse_fields_body(Parser *p, Class *c) {
         }
         Token name;
         if (sym_iter) { name = p->tok; name.kind = TK_IDENT; name.str = "__iterator"; name.pos = pos; }
+        else if (iter_obj) { name = p->tok; name.kind = TK_IDENT; name.str = iter_obj == 1 ? "__iterobj" : "__aiterobj"; name.pos = pos; }
         else if (at(p, TK_STRING)) { name = p->tok; name.kind = TK_IDENT; next(p); } /* '@timestamp': string */
         else if (at(p, TK_LBRACKET) && ({ Parser l_ = *p; next(&l_); bool ok_ = at(&l_, TK_IDENT); if (ok_) { next(&l_); ok_ = at(&l_, TK_RBRACKET); } ok_; })) {
             /* [AUDIT_CONTEXT_KEY]?: T with const AUDIT_CONTEXT_KEY = '__audit': the field named by the constant's text */
@@ -4312,6 +4450,7 @@ static void parse_fields_body(Parser *p, Class *c) {
             name.str = (char *)val;
         }
         else name = expect_prop_name(p, NULL);
+        if (!strncmp(name.str, "__hp_", 5)) mods |= MOD_PRIVATE; /* #name: hard private (the lexer's name for it) */
         if (gen_method && !at(p, TK_LPAREN) && !at(p, TK_LT)) xs_error(XS8064, name.pos, NULL, "'*' marks a generator method: *%s(): Generator<T> { ... }", name.str);
         if (accessor) {
             if (!at(p, TK_LPAREN)) xs_error(XS1037, p->tok.pos, NULL, "write %s %s(...) { ... }", accessor == 1 ? "get" : "set", name.str);
@@ -4382,6 +4521,20 @@ static void parse_fields_body(Parser *p, Class *c) {
                     const char *rfrom = p->tok.start;
                     f->ret = parse_type(p);
                     f->ret_src = span(p, rfrom);
+                    if (iter_obj) { /* Iterator<T> (IterableIterator<T>, AsyncIterator<T>): the object it returns has next() */
+                        const char *lt = strchr(f->ret_src, '<'), *gt = strrchr(f->ret_src, '>');
+                        if (!lt || !gt || gt < lt || !(!strncmp(f->ret_src, "Iterator<", 9) || !strncmp(f->ret_src, "IterableIterator<", 17) ||
+                                                       !strncmp(f->ret_src, "AsyncIterator<", 14) || !strncmp(f->ret_src, "AsyncIterableIterator<", 22)))
+                            xs_error(XS6029, pos, iter_obj == 1 ? "write [Symbol.iterator](): Iterator<T> { return { next() { ... } }; }" : "write [Symbol.asyncIterator](): AsyncIterator<T> { ... }",
+                                     "the result type of [Symbol.%s]() is not an iterator type", iter_obj == 1 ? "iterator" : "asyncIterator");
+                        char *tt = xs_strndup(lt + 1, (size_t)(gt - lt - 1));
+                        wants_iter = true;
+                        Parser tp = *p;
+                        lexer_init(&tp.lx, xs_sprintf("%s<%s>    ", iter_obj == 1 ? "__XsIterator" : "__XsAsyncIterator", tt));
+                        next(&tp);
+                        f->ret = parse_type(&tp);
+                        if (iter_obj == 1) iterobj_t = tt; else aiterobj_t = tt;
+                    }
                 }
                 if (c->nmethods == c->cap_methods) {
                     c->cap_methods = c->cap_methods ? c->cap_methods * 2 : 4;
@@ -4430,7 +4583,10 @@ static void parse_fields_body(Parser *p, Class *c) {
             const char *was_alias = p->this_alias;
             bool used_was = this_alias_used;
             if (mods & MOD_STATIC) { p->this_alias = XS_STATIC_THIS; this_alias_used = false; } /* `this`: the class it is called on */
+            int iterobj_was = p->iterobj;
+            p->iterobj = !strcmp(f->name, "__iterobj") ? 1 : !strcmp(f->name, "__aiterobj") ? 2 : 0;
             f->body = parse_block(p);
+            p->iterobj = iterobj_was;
             if ((mods & MOD_STATIC) && this_alias_used && !c->ntparams) {
                 Parser *st = xs_alloc(sizeof *st);
                 *st = at_params;
@@ -4586,6 +4742,27 @@ static void parse_fields_body(Parser *p, Class *c) {
         }
     }
     subst_names = sn0; subst_types = st0; nsubst = sk0;
+    p->hp_id = hp_was;
+    p->static_base = NULL;
+    if (iterobj_t || aiterobj_t) { /* [Symbol.iterator]() returning an iterator object: the generator for...of, spreads
+                                      and Array.from use pulls its next() until done */
+        const char *it = iterobj_t, *ait = aiterobj_t;
+        iterobj_t = aiterobj_t = NULL;
+        Buf g = {0};
+        buf_puts(&g, "{\n");
+        if (it) buf_printf(&g, "*[Symbol.iterator](): Generator<%s> { const it__ = this.__iterobj(); while (true) { const r__ = it__.next(); "
+                              "if (r__.done === true) { return; } yield r__.value!; } }\n", it);
+        if (ait) buf_printf(&g, "async *[Symbol.asyncIterator](): AsyncGenerator<%s> { const it__ = this.__aiterobj(); while (true) { "
+                               "const r__ = await it__.next(); if (r__.done === true) { return; } yield r__.value!; } }\n", ait);
+        buf_puts(&g, "}\n\n\n\n");
+        Parser sub = *p;
+        lexer_init(&sub.lx, g.data);
+        sub.lx.fixed = c->pos;
+        next(&sub);
+        parse_fields_body(&sub, c);
+    }
+    iterobj_t = it_was;
+    aiterobj_t = ait_was;
     next(p);
 }
 
@@ -6308,6 +6485,87 @@ static void fs_extras(Program *prog, Module *m, Import *im) {
     if (fs_names(m->src, im, fs_stream_names)) fs_reexport(prog, fs, "xisto:stream", fs_stream_names);
 }
 
+/* the texts of a template's parts, n + 1 for n values (the parser leaves empty parts out of E_TEMPLATE; its own parts
+   have the template's position, a ${"text"} its own) */
+static int tsa_parts(Expr *t, Pos tpos, char ***out, ExprList *vals) {
+    int n = 0;
+    char *seg = NULL;
+    *out = NULL;
+    for (int i = 0; i < t->args.len; i++) {
+        Expr *a = t->args.items[i];
+        if (a->kind == E_STRING && a->pos.line == tpos.line && a->pos.col == tpos.col) { seg = a->str; continue; }
+        *out = realloc(*out, sizeof(char *) * (size_t)(n + 2));
+        (*out)[n++] = seg ? seg : "";
+        seg = NULL;
+        if (vals) expr_list_push(vals, a);
+    }
+    *out = realloc(*out, sizeof(char *) * (size_t)(n + 2));
+    (*out)[n++] = seg ? seg : "";
+    return n;
+}
+static Expr *str_array_lit(Pos pos, char **xs, int n) {
+    Expr *a = new_expr(E_ARRAY_LIT, pos);
+    for (int i = 0; i < n; i++) {
+        Expr *s = new_expr(E_STRING, pos);
+        s->str = xs[i];
+        expr_list_push(&a->args, s);
+    }
+    return a;
+}
+/* tag`a${x}b`: tag(strings, x), strings the constant of this call site (cooked texts, with .raw the texts as written) */
+static Expr *parse_tagged(Parser *p, Expr *tag) {
+    Pos tpos = p->tok.pos;
+    Expr *rawt = NULL;
+    if (strchr(p->tok.str, '\\')) { /* (a backslash: the raw texts differ from the cooked ones) */
+        Parser look = *p;
+        tmpl_raw = true;
+        rawt = parse_primary(&look);
+        tmpl_raw = false;
+    }
+    Expr *t = parse_primary(p);
+    ExprList vals = {0};
+    char **cooked, **raw;
+    int n = tsa_parts(t, tpos, &cooked, &vals);
+    if (rawt) {
+        int nr = tsa_parts(rawt, tpos, &raw, NULL);
+        if (nr != n) xs_error(XS1028, tpos, NULL, "this tagged template is not supported");
+    } else raw = cooked;
+    const char *name = xs_sprintf("__xs_tsa_%d_%d_%d", p->mod ? p->mod->id : 0, tpos.line, tpos.col);
+    bool seen = false;
+    for (int i = 0; i < ntsa_names && !seen; i++) seen = !strcmp(tsa_names[i], name);
+    if (!seen) {
+        tsa_names = realloc(tsa_names, sizeof(char *) * (size_t)(ntsa_names + 1));
+        tsa_names[ntsa_names++] = (char *)name;
+        Stmt *r = new_stmt(S_VAR, tpos); /* (the raw texts: a constant of their own, which the program releases at its end) */
+        r->name = xs_sprintf("%s_raw", name);
+        r->is_const = true;
+        r->decl_type = ty_array_of(ty_string);
+        r->init = str_array_lit(tpos, raw, n);
+        r->mod = p->mod;
+        stmt_list_push(&tsa_decls, r);
+        Stmt *d = new_stmt(S_VAR, tpos);
+        d->name = (char *)name;
+        d->is_const = true;
+        Type *tt = ty_array_of(ty_string);
+        tt->tsa = true;
+        d->decl_type = tt;
+        Expr *mk = new_expr(E_CALL, tpos);
+        mk->lhs = ident_expr(tpos, "__xs_tsa");
+        expr_list_push(&mk->args, str_array_lit(tpos, cooked, n));
+        expr_list_push(&mk->args, ident_expr(tpos, r->name));
+        d->init = mk;
+        d->mod = p->mod;
+        stmt_list_push(&tsa_decls, d);
+    }
+    wants_tagged = true;
+    Expr *c;
+    if (tag->kind == E_MEMBER) { c = tag; c->is_call = true; }
+    else { c = new_expr(E_CALL, tag->pos); c->lhs = tag; }
+    expr_list_push(&c->args, ident_expr(tpos, name));
+    for (int i = 0; i < vals.len; i++) expr_list_push(&c->args, vals.items[i]);
+    return c;
+}
+
 static void parse_module(Program *prog, Module *m) {
     xs_file_name = m->file;
     xs_source = m->src;
@@ -6497,10 +6755,19 @@ static void parse_module(Program *prog, Module *m) {
             if (is_default) m->default_name = f->name;
             add_func(prog, f);
         } else if (at(&p, TK_CLASS) || (at_ident(&p, "abstract") && peek_is(&p, TK_CLASS)) || const_class_ahead(&p)) {
+            const char *bound_alias = NULL;
             if (at(&p, TK_CONST)) { /* const K = class { static tag = 1 }: the class K, as if declared so (K.tag, new K()) */
                 next(&p);
                 class_bound_name = expect(&p, TK_IDENT, NULL).str;
                 expect(&p, TK_ASSIGN, NULL);
+                Parser l_ = p;
+                next(&l_);
+                if (at(&l_, TK_IDENT) && !at_ident(&l_, "extends") && !at_ident(&l_, "implements")) {
+                    /* const K = class Named { ... }: the class Named (K.name is "Named", as Named inside), K another name for it */
+                    bound_alias = class_bound_name;
+                    class_bound_name = NULL;
+                    if (exported) xs_error(XS6029, p.tok.pos, xs_sprintf("export class %s { ... } and use one name", bound_alias), "an exported constant bound to a named class expression is not supported");
+                }
             }
             bool abstract = at_ident(&p, "abstract");
             if (abstract) next(&p);
@@ -6524,6 +6791,7 @@ static void parse_module(Program *prog, Module *m) {
             if (is_default) m->default_name = c->name;
             add_class(prog, c);
             add_statics(prog, m, c);
+            if (bound_alias) add_alias(&p, bound_alias, c->name);
             accept(&p, TK_SEMI); /* (const K = class { ... };) */
         } else if (at_ident(&p, "interface") || (at_ident(&p, "type") && peek_is_ident(&p))) {
             Class *c = parse_interface(&p);
@@ -6584,6 +6852,13 @@ static void parse_module(Program *prog, Module *m) {
         }
     }
     if (xs_keep_going) xs_error_recover = outer_recover;
+    if (tsa_decls.len) { /* the strings of the module's tagged templates, first (a function above may run one) */
+        int k = tsa_decls.len;
+        for (int i = 0; i < k; i++) stmt_list_push(&prog->top, NULL);
+        memmove(&prog->top.items[top_start + k], &prog->top.items[top_start], sizeof(Stmt *) * (size_t)(prog->top.len - k - top_start));
+        for (int i = 0; i < k; i++) { prog->top.items[top_start + i] = tsa_decls.items[i]; tsa_decls.items[i]->mod = m; }
+        tsa_decls.len = 0;
+    }
     apply_local_exports(prog, m, top_start);
     reflect_module(prog, m, top_start, &p);
 }
@@ -7398,6 +7673,28 @@ static const char xs_profiler_src[] =
     "export function lastSamples(): int {\n  return cpuprof_last_samples();\n}\n";
 /* xisto:okmap: Map<object, V> and WeakMap<K, V>: keys by identity (the object kept while it is a key: a WeakMap's entries
    are observed only through get/set/has/delete, as JavaScript allows) */
+/* xisto:iter: TypeScript's IteratorResult, and the iterator object a class's [Symbol.iterator]() (or
+   [Symbol.asyncIterator]()) returns, read by the generator the parser adds next to it (parse_fields_body) */
+static const char xs_iter_src[] =
+    "export interface IteratorResult<T> { value?: T; done?: boolean; }\n"
+    "export interface __XsIterator<T> { next(): IteratorResult<T>; }\n"
+    "export interface __XsAsyncIterator<T> { next(): Promise<IteratorResult<T>>; }\n"
+    "// g.next(), g.next(v), g.return(v) on a generator: { value, done } (__xs_undef: value prints as undefined)\n"
+    "export interface __XsGenResult<T> { value: T; done: boolean; __xs_undef: boolean; }\n"
+    "export function __xs_gen_next<T>(g: Generator<T>): __XsGenResult<T> {\n"
+    "  const v: T = g.__pull();\n"
+    "  const d = g.__ended();\n"
+    "  return { value: v, done: d, __xs_undef: d };\n"
+    "}\n"
+    "export function __xs_gen_return<T>(g: Generator<T>, v: T): __XsGenResult<T> {\n"
+    "  g.__close();\n"
+    "  return { value: v, done: true, __xs_undef: false };\n"
+    "}\n"
+    "export function __xs_gen_return0<T>(g: Generator<T>): __XsGenResult<T> {\n"
+    "  g.__close();\n"
+    "  const v: T = g.__pull();\n"
+    "  return { value: v, done: true, __xs_undef: true };\n"
+    "}\n";
 static const char xs_okmap_src[] =
     "declare function okey_text(k: unknown): string;\n"
     "export class OkMap<V> {\n"
@@ -7623,6 +7920,24 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->loading = true;
         parse_module(prog, m);
         m->loading = false;
+        return m;
+    }
+    if (strcmp(name, "iter") == 0) { /* xisto:iter: IteratorResult and the iterator objects [Symbol.iterator]() returns (see xs_iter_src) */
+        m->builtin = false;
+        m->file = "xisto:iter";
+        m->src = (char *)xs_iter_src;
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
+    if (strcmp(name, "tagged") == 0) { /* xisto:tagged: a tagged template's strings (TemplateStringsArray), made and read by the runtime */
+        m->file = "xisto:tagged";
+        prog->uses_tagged = true;
+        Type *tsa = ty_array_of(ty_string);
+        tsa->tsa = true;
+        add_func(prog, builtin_func(m, "__xs_tsa", "xs_tsa", tsa, 2, ty_array_of(ty_string), ty_array_of(ty_string)));
+        add_func(prog, builtin_func(m, "__xs_tsa_raw", "xs_tsa_raw", ty_array_of(ty_string), 1, ty_array_of(ty_string), NULL));
         return m;
     }
     if (strcmp(name, "tz") == 0) { /* xisto:tz: the wall clock of a time zone (xisto:intl) */
@@ -7971,6 +8286,8 @@ Program *parse_program(const char *entry_file) {
     if (wants_builtins) load_module(prog, "xisto:builtins", (Pos){1, 1}, entry_file);
     if (wants_promises) load_module(prog, "xisto:promises", (Pos){1, 1}, entry_file); /* (before errors: it names AggregateError) */
     if (wants_okmap) load_module(prog, "xisto:okmap", (Pos){1, 1}, entry_file);
+    if (wants_tagged) load_module(prog, "xisto:tagged", (Pos){1, 1}, entry_file);
+    if (wants_iter) load_module(prog, "xisto:iter", (Pos){1, 1}, entry_file);
     if (wants_url) load_module(prog, "xisto:url", (Pos){1, 1}, entry_file); /* (before errors: its DOMException extends Error) */
     if (wants_errors) load_module(prog, "xisto:errors", (Pos){1, 1}, entry_file);
     if (wants_intl) load_module(prog, "xisto:intl", (Pos){1, 1}, entry_file);

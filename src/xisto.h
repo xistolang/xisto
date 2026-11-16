@@ -222,6 +222,7 @@ typedef struct Type {
     int nparams;
     struct Type *ret;     /* TY_FUNC */
     bool rest;            /* TY_FUNC: the last parameter is ...xs: T[] (the arguments from there on, one array) */
+    bool tsa;             /* TY_ARRAY written TemplateStringsArray (a tagged template's strings): .raw reads their raw texts */
     bool async_ret;       /* TY_FUNC: written (..) => Promise<R> (ret is R): a call not awaited can be kept as a promise */
     const char *tname;    /* TY_TPARAM; TY_STRING: a string literal type ("circle"), the only value allowed */
     const char **slits;   /* TY_STRING of a union of string literals ('error' | 'warn'): the values it was written with (any
@@ -237,8 +238,12 @@ typedef struct Type {
 } Type;
 
 extern Type *ty_number, *ty_int, *ty_litint, *ty_boolean, *ty_string, *ty_void, *ty_null, *ty_json, *ty_unknown, *ty_any, *ty_undef;
+/* a field no program sees by name: a #private one (__hp_<class id>_x), or the mark of a generator's result whose value is
+   undefined (xisto:iter's __XsGenResult): left out of console.log, JSON, Object.keys/values/entries and spreads */
+static inline bool xs_hidden_field(const char *n) { return n[0] == '_' && n[1] == '_' && (!strncmp(n, "__hp_", 5) || !strcmp(n, "__xs_undef")); }
 static inline bool ty_is_undef(const Type *t) { return t && t->kind == TY_UNKNOWN && !t->tname && t->absent; } /* the type undefined */
 extern bool xs_any_used; /* checker.c: the program reads or writes an any by name */
+extern bool xs_gen_sent_used; /* checker.c: generators receive values or are stepped with next() (emit.c: xs_gen_c) */
 extern bool xs_buf_view_used; /* checker.c: the program makes a Buffer on another one's memory */
 extern bool xs_any_call_used; /* checker.c: the program calls a method on an any */
 static inline bool ty_is_any(const Type *t) { return t && t->kind == TY_UNKNOWN && t->tname; } /* any: the dynamic path */
@@ -754,7 +759,7 @@ typedef struct {
     bool uses_normalize, uses_normalize_k; /* s.normalize(): runtime/xisto_unicode.h's tables (the compatibility ones for NFKC/NFKD) */
     bool uses_clone; /* structuredClone: a copy by the value's class at run time (emitted only then) */
     bool uses_profiler; /* xisto:profiler: its runtime (xisto_prof.h) and the table of the program's functions (emit.c) */
-    bool uses_v8, uses_unk_map, uses_symbol_for, uses_nkey, uses_okmap; /* xisto:v8, x instanceof Map/Set of an unknown, Symbol.for: their runtime joins the program */
+    bool uses_v8, uses_unk_map, uses_symbol_for, uses_nkey, uses_okmap, uses_tagged; /* xisto:v8, x instanceof Map/Set of an unknown, Symbol.for: their runtime joins the program */
     bool uses_this_reg; /* XB-107: function (this: T) / method slots: the this register's helpers join the program */
     bool uses_tls;
     struct Func **tls_fns; /* XB-232: functions with a fetch that may be https (checker); TLS joins when prune finds one of

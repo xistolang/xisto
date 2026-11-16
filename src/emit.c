@@ -1906,6 +1906,7 @@ static void json_put_fields(Buf *b, Class *c, const int *ord, int nord) {
     for (int oi = 0; oi < nord; oi++) {
         Field *f = &c->fields[ord ? ord[oi] : oi];
         if (ty_is_undef(f->type)) continue; /* r: undefined: JSON.stringify leaves it out */
+        if (xs_hidden_field(f->name)) continue; /* #x: not an own property: JSON.stringify leaves it out */
         if (json_fn_field(f->type)) continue; /* a function: left out, as JSON.stringify does */
         /* optional fields that are null are left out, like undefined in JSON.stringify (and a value that is a function) */
         bool may_fn = json_may_fn(f->type);
@@ -2393,6 +2394,31 @@ static void emit_member(Expr *e) {
             buf_puts(out, ", ");
             if (ak == 3) { buf_printf(out, "(void *)"); emit_owned(e->args.items[1]); } else emit_expr(e->args.items[1]);
             buf_puts(out, ak == 3 ? "))" : ")");
+            return;
+        }
+        if (op[0] == '_' && op[1] == '_') { /* (xisto:iter's g.next() and g.return(): xs_gen_c) */
+            if (!strcmp(op, "__pull")) {
+                if (ek == 3) buf_printf(out, "((%s)", ctype(elem));
+                buf_printf(out, "xs_gen_pull_%c(", "dibp"[ek]);
+                emit_borrowed(base);
+                buf_puts(out, ek == 3 ? "))" : ")");
+            } else if (!strcmp(op, "__ended")) {
+                buf_puts(out, "(");
+                emit_borrowed(base);
+                buf_puts(out, ")->done");
+            } else if (!strcmp(op, "__close")) {
+                buf_puts(out, "xs_stream_end(");
+                emit_borrowed(base);
+                buf_puts(out, ")");
+            } else { /* __send */
+                Expr *v = e->args.items[0];
+                int vk = v->type->kind == TY_NULL ? 3 : val_kind(v->type);
+                buf_printf(out, "xs_gen_send_%c(", "dibp"[vk]);
+                emit_borrowed(base);
+                buf_puts(out, ", ");
+                if (vk == 3) { buf_puts(out, "(void *)"); emit_owned(v); } else emit_expr(v);
+                buf_puts(out, ")");
+            }
             return;
         }
         if (strcmp(op, "toArray") == 0) {
@@ -3057,9 +3083,11 @@ static void emit_dyn_tables(Program *p) {
     for (int i = 0; i < p->nclasses; i++) {
         Class *c = p->classes[i];
         if (!c->used || c->builtin) continue;
-        if (c->nfields) buf_printf(&tabs, "static const xs_dyn_field %s_dynf[] = {\n", c->cname);
-        for (int k = 0; k < c->nfields; k++) dyn_field_entry(p, c, &c->fields[k], &tabs, &fns);
-        if (c->nfields) buf_puts(&tabs, "};\n");
+        int nf = 0; /* (#x fields: not reachable by name, as in JavaScript) */
+        for (int k = 0; k < c->nfields; k++) if (!xs_hidden_field(c->fields[k].name)) nf++;
+        if (nf) buf_printf(&tabs, "static const xs_dyn_field %s_dynf[] = {\n", c->cname);
+        for (int k = 0; k < c->nfields; k++) if (!xs_hidden_field(c->fields[k].name)) dyn_field_entry(p, c, &c->fields[k], &tabs, &fns);
+        if (nf) buf_puts(&tabs, "};\n");
         int nm = 0; /* its methods' names, its bases' too (typeof x.toJSON === "function" through an any) */
         for (Class *k = c; k; k = k->base)
             for (int j = 0; j < k->nmethods; j++) {
@@ -3068,7 +3096,7 @@ static void emit_dyn_tables(Program *p) {
                 nm++;
             }
         if (nm) buf_puts(&tabs, "};\n");
-        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s, %d, %d};\n", c->cname, xs_src_name(c->name), c->nfields, c->nfields ? xs_sprintf("%s_dynf", c->cname) : "NULL",
+        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s, %d, %d};\n", c->cname, xs_src_name(c->name), nf, nf ? xs_sprintf("%s_dynf", c->cname) : "NULL",
                    nm, nm ? xs_sprintf("%s_dynm", c->cname) : "NULL", c->is_interface ? 1 : 0, !c->builtin && is_error_class(c) ? 1 : 0);
     }
     for (int i = 0; i < nlit_ords; i++) { /* an object literal's own key order (lit_order): its fields in that order */
@@ -4455,6 +4483,10 @@ static void emit_expr_raw(Expr *e) {
         buf_puts(out, e->op == TK_PLUSPLUS ? "++)" : "--)");
         return;
     case E_CALL:
+        if (e->builtin.cfn && !e->lhs && !strcmp(e->builtin.cfn, "xs_gen_take_p")) { /* const v = yield x (owned) */
+            buf_printf(out, "((%s)xs_gen_take_p())", ctype(e->type));
+            return;
+        }
         if (e->builtin.cfn && !e->lhs && strcmp(e->builtin.cfn, "xs_promise_await_p") == 0 && e->type && ty_is_heap(e->type) && !e->func) {
             /* (await p).length: the awaited object as its type (the runtime gives a void *) */
             static Expr *await_cast;
@@ -13525,6 +13557,10 @@ static void mark_init_stores(Class *c, Func *ctor) {
 /* Node-style printing: Name { a: 1, s: 'x' }. ord: the fields in the order an object literal gave them (XB-169: as
    JavaScript keeps its keys), NULL for the declaration's order; a fake (an object literal standing for a class with
    methods) prints as the plain object it is in JavaScript: its keys in the literal's order, its functions by name */
+static Field *find_field_c(Class *c, const char *name) {
+    for (int k = 0; k < c->nfields; k++) if (!strcmp(c->fields[k].name, name)) return &c->fields[k];
+    return NULL;
+}
 static void emit_class_print(Class *c, const char *fname, const int *ord, int nord) {
     int *fk = NULL;
     if (!ord && c->fake && c->ctor && c->ctor->body) { /* (the constructor sets each key the literal gave, in its order) */
@@ -13549,7 +13585,7 @@ static void emit_class_print(Class *c, const char *fname, const int *ord, int no
     /* util.inspect's layout (runtime: xs_insp_*): each field an entry, the container decides lines and depth */
     { /* an object whose fields are all optional and absent prints as an empty one */
         int always = 0, opt = 0;
-        for (int i = 0; i < c->nfields; i++) { if (c->fields[i].optional) opt++; else always++; }
+        for (int i = 0; i < c->nfields; i++) { if (xs_hidden_field(c->fields[i].name)) continue; if (c->fields[i].optional) opt++; else always++; }
         const char *empty_s = plain ? "{}" : xs_sprintf("%s {}", xs_src_name(c->name));
         if (always || !opt) {
             buf_printf(out, "xs_insp fr_; if (!xs_insp_begin(&fr_, p, \"%s\", %s)) return;", plain ? "Object" : xs_src_name(c->name),
@@ -13563,12 +13599,15 @@ static void emit_class_print(Class *c, const char *fname, const int *ord, int no
     for (int oi = 0; oi < nord; oi++) {
         Field *fd = &c->fields[ord ? ord[oi] : oi];
         const char *shown = c->fake && !strncmp(fd->name, "__fake_", 7) ? fd->name + 7 : fd->name;
+        if (xs_hidden_field(fd->name)) continue; /* #x: not shown (Node's inspect leaves hard-private fields out) */
         nl();
         if (fd->optional) buf_printf(out, "if (%s) {", not_null(fd->type, xs_sprintf("self->%s", fd->cname)));
         nl();
         if (c->is_tuple) buf_puts(out, "xs_insp_entry(&fr_);"); /* [ 'a', 1 ]: elements, no names */
         else buf_printf(out, "xs_insp_entry(&fr_); fputs(\"%s: \", XS_OUT);", shown);
         nl();
+        Field *undef = !strcmp(fd->name, "value") ? find_field_c(c, "__xs_undef") : NULL;
+        if (undef) buf_printf(out, "if (self->%s) fputs(\"undefined\", XS_OUT); else ", undef->cname); /* (a generator's result) */
         switch (fd->type->kind) {
         case TY_NUMBER: buf_printf(out, "xs_print_num(self->%s);", fd->cname); break;
         case TY_INT: buf_printf(out, "xs_print_int(self->%s);", fd->cname); break;
@@ -14507,6 +14546,44 @@ static const char xs_nkey_c[] =
     "    int n = snprintf(b, sizeof b, \"n%.17g\", d);\n"
     "    return xs_str_new(b, (size_t)n);\n"
     "}\n";
+/* generators that receive values (const v = yield x) and next(v), next() and return(v) on them: the value sent waits
+   here until the generator, resumed, takes it (right after its yield); one not taken is dropped after the step.
+   Nothing sent reads as NaN, 0, false or null (JavaScript's undefined) */
+static const char xs_gen_c[] =
+    "static xs_val xs_gen_sent_;\n"
+    "static int xs_gen_sent_k_ = -1;\n"
+    "static void xs_gen_drop_(void) { if (xs_gen_sent_k_ == 3) xs_release(xs_gen_sent_.p); xs_gen_sent_k_ = -1; }\n"
+    "static xs_stream *xs_gen_send_(xs_stream *st, int k, xs_val v) { xs_gen_drop_(); xs_gen_sent_ = v; xs_gen_sent_k_ = k; return xs_retain(st); }\n"
+    "static __attribute__((unused)) xs_stream *xs_gen_send_d(xs_stream *st, double d) { xs_val v; v.d = d; return xs_gen_send_(st, 0, v); }\n"
+    "static __attribute__((unused)) xs_stream *xs_gen_send_i(xs_stream *st, int64_t i) { xs_val v; v.i = i; return xs_gen_send_(st, 1, v); }\n"
+    "static __attribute__((unused)) xs_stream *xs_gen_send_b(xs_stream *st, bool b) { xs_val v; v.i = b; return xs_gen_send_(st, 2, v); }\n"
+    "static __attribute__((unused)) xs_stream *xs_gen_send_p(xs_stream *st, void *p) { xs_val v; v.p = p; return xs_gen_send_(st, 3, v); }\n"
+    "static __attribute__((unused)) double xs_gen_take_d(void) { double d = xs_gen_sent_k_ == 0 ? xs_gen_sent_.d : xs_gen_sent_k_ == 1 ? (double)xs_gen_sent_.i : NAN; xs_gen_drop_(); return d; }\n"
+    "static __attribute__((unused)) int64_t xs_gen_take_i(void) { int64_t i = xs_gen_sent_k_ == 1 || xs_gen_sent_k_ == 2 ? xs_gen_sent_.i : 0; xs_gen_drop_(); return i; }\n"
+    "static __attribute__((unused)) bool xs_gen_take_b(void) { bool b = xs_gen_sent_k_ == 2 ? xs_gen_sent_.i != 0 : false; xs_gen_drop_(); return b; }\n"
+    "static __attribute__((unused)) void *xs_gen_take_p(void) { void *p = xs_gen_sent_k_ == 3 ? xs_gen_sent_.p : NULL; xs_gen_sent_k_ = -1; return p; }\n"
+    "static __attribute__((unused)) double xs_gen_pull_d(xs_stream *st) { xs_val v; bool ok = xs_stream_pull(st, &v); xs_gen_drop_(); return ok ? v.d : 0; }\n"
+    "static __attribute__((unused)) int64_t xs_gen_pull_i(xs_stream *st) { xs_val v; bool ok = xs_stream_pull(st, &v); xs_gen_drop_(); return ok ? v.i : 0; }\n"
+    "static __attribute__((unused)) bool xs_gen_pull_b(xs_stream *st) { xs_val v; bool ok = xs_stream_pull(st, &v); xs_gen_drop_(); return ok ? v.i != 0 : false; }\n"
+    "static __attribute__((unused)) void *xs_gen_pull_p(xs_stream *st) { xs_val v; bool ok = xs_stream_pull(st, &v); xs_gen_drop_(); return ok ? v.p : NULL; }\n";
+/* xisto:tagged: a tagged template's strings. Each call site has two module constants, its texts and their raw form
+   (the program releases them at its end); xs_tsa notes the pair, and strings.raw finds the raw texts by the array's
+   identity */
+static const char xs_tagged_c[] =
+    "static xs_arr_ref **xs_tsa_cooked, **xs_tsa_raws;\n"
+    "static size_t xs_tsa_n;\n"
+    "static xs_arr_ref *xs_tsa(xs_arr_ref *cooked, xs_arr_ref *raw) {\n"
+    "    xs_tsa_cooked = realloc(xs_tsa_cooked, sizeof(xs_arr_ref *) * (xs_tsa_n + 1));\n"
+    "    xs_tsa_raws = realloc(xs_tsa_raws, sizeof(xs_arr_ref *) * (xs_tsa_n + 1));\n"
+    "    if (!xs_tsa_cooked || !xs_tsa_raws) xs_panic(\"out of memory\");\n"
+    "    xs_tsa_cooked[xs_tsa_n] = cooked;\n"
+    "    xs_tsa_raws[xs_tsa_n++] = raw;\n"
+    "    return xs_retain(cooked);\n"
+    "}\n"
+    "static xs_arr_ref *xs_tsa_raw(xs_arr_ref *cooked) {\n"
+    "    for (size_t i = 0; i < xs_tsa_n; i++) if (xs_tsa_cooked[i] == cooked) return xs_retain(xs_tsa_raws[i]);\n"
+    "    return xs_retain(cooked); /* (an array the program made itself: its texts are what it holds) */\n"
+    "}\n";
 /* xisto:okmap's key: the object's identity as text (the map keeps the object: its address is not reused meanwhile) */
 static const char xs_okey_c[] =
     "static xs_str *xs_okey_text(void *k) {\n"
@@ -14527,6 +14604,8 @@ void emit_program(Program *p, Buf *o) {
     if (p->uses_symbol_for) buf_puts(out, xs_symbol_for_c);
     if (p->uses_nkey) buf_puts(out, xs_nkey_c);
     if (p->uses_okmap) buf_puts(out, xs_okey_c);
+    if (p->uses_tagged) buf_puts(out, xs_tagged_c);
+    if (xs_gen_sent_used) buf_puts(out, xs_gen_c);
     indent = 0;
     site_tab.len = 0;
     if (site_tab.data) site_tab.data[0] = 0;
