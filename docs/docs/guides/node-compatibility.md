@@ -242,7 +242,7 @@ server.listen(3000, () => console.log("listening"));
 loop as its timers and other sockets. `close()` lets the program end normally.
 
 The client side, `http.request(url | options, cb)` and `http.get(...)`, runs on `fetch`. You get a
-`ClientRequest` (`setHeader`, `write`, `end`, `'response'`, `'error'`) and an `IncomingMessage` response
+`ClientRequest` (`setHeader`, `write`, `end`, `'socket'`, `'response'`, `'error'`) and an `IncomingMessage` response
 (`statusCode`, `statusMessage`, `headers`, `'data'`/`'end'`). `STATUS_CODES` and `METHODS` are there too.
 
 Differences from Node:
@@ -254,6 +254,9 @@ Differences from Node:
 - The server class is `HttpServer`. The name `Server` is xisto's built-in server, so `import { Server } from
   "node:http"` does not work; `http.createServer` does.
 - `Agent` is not there yet.
+- `req.socket` (and the `'socket'` event's argument) is a `net.Socket` whose `unref()`/`ref()` work: an
+  unref'd request in flight does not keep the program alive, as an APM agent's send in Node. Its other methods
+  and fields do not act on the request's connection, which is `fetch`'s.
 
 ## net
 
@@ -261,10 +264,11 @@ Differences from Node:
 and sockets:
 
 - **Socket:** `'connect'`, `'data'` (Buffers, or strings after `setEncoding`), `'end'`, `'close'` (with `hadError`)
-  and `'error'` (with Node's `code`: `ECONNREFUSED`, `ENOTFOUND`...). Methods `write(data, cb)`, `end(data)` and
-  `destroy()`. Fields `remoteAddress`/`remotePort`/`localAddress`/`localPort`, `bytesRead`/`bytesWritten`.
+  and `'error'` (with Node's `code`: `ECONNREFUSED`, `ENOTFOUND`...). Methods `write(data, cb)`, `end(data)`,
+  `destroy()`, and `unref()`/`ref()`: an unref'd socket does not keep the program alive while it waits for data
+  (it still does while it connects or writes, as in Node). Fields `remoteAddress`/`remotePort`/`localAddress`/`localPort`, `bytesRead`/`bytesWritten`.
 - **Server:** `listen(port, host, cb)` (port 0 picks a free one), `address()`, `close(cb)` (waits for the open
-  connections), `getConnections`.
+  connections), `getConnections`, `unref()`/`ref()`.
 - `isIP`, `isIPv4`, `isIPv6`.
 
 Each socket reads on a task of its own, so `'data'` arrives as the bytes do.
