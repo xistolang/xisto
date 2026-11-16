@@ -17,7 +17,7 @@ through `xisto:parallel` or `worker_threads`. Every output is checked bit for bi
 | Xisto vs Rust (main `4a2f388`) | — | 9 wins, 1 tie | 9 wins, 1 tie | [Xisto vs Rust](./vs-rust.md) |
 | Xisto vs Node 26 (main `e5fb066`) | 10 wins | 9 wins (fasta not scored) | 9 wins (fasta not scored) | [Xisto vs Node](./vs-node.md) |
 | Xisto vs Bun 1.4 (main `e5fb066`) | 10 wins | 9 wins (reverse-complement not scored) | 10 wins | [Xisto vs Bun](./vs-bun.md) |
-| Xisto vs Go 1.27 (main `f766bf8`, 15 Nov) | — | 9 wins (regex-redux not scored) | — | [Xisto vs Go](./vs-go.md) |
+| Xisto vs Go 1.27 (main `f766bf8`, 15 Nov) | — | 10 wins | — | [Xisto vs Go](./vs-go.md) |
 
 No problem is lost anywhere, and xisto's peak memory is below the other side's on every scored row but one:
 fannkuch-redux against Rust on the Xeon, 2.3 against 2.2 MB (see [Xisto vs Rust](./vs-rust.md)). Each page

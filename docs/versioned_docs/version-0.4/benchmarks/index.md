@@ -84,10 +84,9 @@ xisto uses less CPU on every row but regex-redux against Bun on the M4 (0.37 s a
 
 ## Benchmarks Game against Go
 
-15 Nov 2026, main `f766bf8` against every official Go program (Go 1.27.2) on the Xeon: 9 wins out of 9 scored
-problems, from 1.2× (reverse-complement) to 10.8× (binary-trees), with less CPU on every row and less memory on 8
-of 9 (n-body 2.0 against 1.9 MB). regex-redux is not scored: Go's fastest programs for it need PCRE 1, which
-Ubuntu 26.04 no longer ships. The table is on [Xisto vs Go](./benchmarks-game/vs-go.md).
+15 Nov 2026, main `f766bf8` against every official Go program (Go 1.27.2, regex-redux with PCRE 8.45 and its JIT)
+on the Xeon: 10 wins out of 10, from 1.2× (reverse-complement) to 10.8× (binary-trees), with less CPU on every row
+and less memory on 9 of 10 (n-body 2.0 against 1.9 MB). The table is on [Xisto vs Go](./benchmarks-game/vs-go.md).
 
 ## Servers
 
