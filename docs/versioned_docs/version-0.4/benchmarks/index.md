@@ -46,6 +46,10 @@ of 3 (close kernels re-measured with the sides interleaved), a tie within 3%, ag
 
 The per-kernel tables, with the C reference beside them, are on [PolyBench](./polybench/index.md).
 
+Against Node v26.12 and Bun 1.4.4 running the very same `.ts` files (15 Nov, after the `gemm` fix): Xisto wins all
+30 kernels against both on both VMs, 3× to 33× faster than Node and 1.4× to 25× faster than Bun. Tables:
+[Xisto vs Node](./polybench/vs-node.md), [Xisto vs Bun](./polybench/vs-bun.md).
+
 ## TechEmpower (json, plaintext)
 
 15 Nov 2026, main `f766bf8`, the TFB's rules: servers on the Xeon, wrk on the Graviton2 over the private network,

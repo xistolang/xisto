@@ -50,7 +50,7 @@ const sidebars = {
           type: 'category',
           label: 'PolyBench',
           link: {type: 'doc', id: 'benchmarks/polybench/index'},
-          items: ['benchmarks/polybench/vs-rust', 'benchmarks/polybench/vs-go'],
+          items: ['benchmarks/polybench/vs-rust', 'benchmarks/polybench/vs-go', 'benchmarks/polybench/vs-node', 'benchmarks/polybench/vs-bun'],
         },
         {
           type: 'category',
