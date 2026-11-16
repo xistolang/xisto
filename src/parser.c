@@ -4802,10 +4802,15 @@ static void parse_fields_body(Parser *p, Class *c) {
             if (!accept(p, TK_SEMI) && !at(p, TK_RBRACE)) accept(p, TK_COMMA); /* interfaces also separate with ',' or nothing */
             if (mods & MOD_ABSTRACT) xs_error(XS8106, pos, NULL, "fields cannot be abstract");
             if (mods & MOD_STATIC) { /* a top-level variable, made by the caller where the class is declared */
+                /* static v: T; without a value (a static block or a static method sets it): a top-level `let v: T;`,
+                   which starts as T's empty value (0, "", false, null for T | null, [] for an array) where Node starts
+                   it undefined */
+                bool ro = (mods & MOD_READONLY) && fd.init; /* (static readonly v: T; is set once, later) */
+                if (!fd.init && fd.type) fd.init = unset_value(fd.type, pos);
                 if (!fd.init) xs_error(XS8077, pos, xs_sprintf("static %s: T = value;", name.str), "a static field needs a value");
                 c->sfields = realloc(c->sfields, sizeof(Field) * (size_t)(c->nsfields + 1));
                 c->sfield_ro = realloc(c->sfield_ro, sizeof(bool) * (size_t)(c->nsfields + 1));
-                c->sfield_ro[c->nsfields] = (mods & MOD_READONLY) != 0;
+                c->sfield_ro[c->nsfields] = ro;
                 c->sfields[c->nsfields++] = fd;
                 continue;
             }
