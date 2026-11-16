@@ -1215,6 +1215,31 @@ class FreeConn {
   }
 }
 
+/** (internal) what a ClientRequest asks of its Agent, as functions the Agent made: a request does not name the
+ * Agent's methods, so a program that makes no client request (a server) carries none of the Agent's code. */
+export class __PoolOps {
+  owner: EventEmitter;
+  keep: () => boolean;
+  full: (name: string) => boolean;
+  slot: (name: string) => Promise<void>;
+  take: (name: string) => void;
+  handed: (name: string) => HttpTransport | null;
+  reuse: (name: string) => HttpTransport | null;
+  done: (name: string, t: HttpTransport | null, reusable: boolean) => void;
+  constructor(owner: EventEmitter, keep: () => boolean, full: (name: string) => boolean, slot: (name: string) => Promise<void>,
+    take: (name: string) => void, handed: (name: string) => HttpTransport | null, reuse: (name: string) => HttpTransport | null,
+    done: (name: string, t: HttpTransport | null, reusable: boolean) => void) {
+    this.owner = owner;
+    this.keep = keep;
+    this.full = full;
+    this.slot = slot;
+    this.take = take;
+    this.handed = handed;
+    this.reuse = reuse;
+    this.done = done;
+  }
+}
+
 /** Node's http.Agent: the connections of the requests made with it. With keepAlive, a connection whose response
  * ended goes back to the agent and the next request to the same host and port takes it (req.reusedSocket); the
  * request says "Connection: keep-alive" (else "Connection: close", and each request has its own connection).
@@ -1239,8 +1264,13 @@ export class Agent extends EventEmitter {
   private nbusy: int = 0;
   private nfree: int = 0;
 
-  constructor(options: AgentOptions | null = null) {
+  /** (keepAliveGlobal: the module's globalAgent, keep-alive with a 5 s idle timeout, as Node's) */
+  constructor(options: AgentOptions | null = null, keepAliveGlobal: boolean = false) {
     super();
+    if (keepAliveGlobal) {
+      this.keepAlive = true;
+      this.timeout = 5000;
+    }
     if (options !== null) {
       this.keepAlive = options.keepAlive ?? false;
       this.keepAliveMsecs = options.keepAliveMsecs ?? 1000;
@@ -1296,6 +1326,20 @@ export class Agent extends EventEmitter {
   // a request may open (or take) a connection now: below maxSockets for its host and maxTotalSockets in all
   private room(name: string): boolean {
     return this.busyOf(name) < this.maxSockets && this.nbusy < this.maxTotalSockets;
+  }
+  _keep(): boolean {
+    return this.keepAlive;
+  }
+  private ops: __PoolOps | null = null;
+  /** (internal) its functions for the requests that use it */
+  _ops(): __PoolOps {
+    const o = this.ops;
+    if (o !== null) return o;
+    const made = new __PoolOps(this, (): boolean => this._keep(), (n: string): boolean => this._full(n), (n: string): Promise<void> => this._slot(n),
+      (n: string): void => this._take(n), (n: string): HttpTransport | null => this._handed(n), (n: string): HttpTransport | null => this._reuse(n),
+      (n: string, t: HttpTransport | null, r: boolean): void => this._done(n, t, r));
+    this.ops = made;
+    return made;
   }
   /** (internal) waits until the request may have a connection of this host, then counts it in use. */
   async _slot(name: string): Promise<void> {
@@ -1379,13 +1423,9 @@ export class Agent extends EventEmitter {
 }
 
 /** The Agent of the requests that name none: keepAlive, as Node's since v19. */
-export let globalAgent: Agent = keepAliveAgent(new Agent(null));
-// (set field by field: an options object here would be compiled into every program that loads the module)
-function keepAliveAgent(a: Agent): Agent {
-  a.keepAlive = true;
-  a.timeout = 5000;
-  return a;
-}
+// (a `new` alone: the compiler makes it only in a program that reads globalAgent, src/prune.c lazy_var; an options
+// object here would be compiled into every program that loads the module)
+export let globalAgent: Agent = new Agent(null, true);
 
 export type ResponseListener = (res: IncomingMessage) => void;
 
@@ -1404,8 +1444,8 @@ export class ClientRequest extends Writable {
   _diag: any = null;
   reusedSocket: boolean = false;
   aborted: boolean = false;
-  /** the Agent whose connection it uses (null: agent: false, a connection of its own) */
-  agent: Agent | null = null;
+  /** (internal) the Agent whose connections it uses (null: agent: false, a connection of its own) */
+  _pool: __PoolOps | null = null;
   private killed: boolean = false;
   /** the request's socket, from 'socket' on (null before): socket.unref() lets the program end while it is in flight
    * (an APM agent's send). Only ref()/unref() act on it: the connection itself is the request's HttpTransport. */
@@ -1419,6 +1459,11 @@ export class ClientRequest extends Writable {
   private timer: int = -1;
   private gotResponse: boolean = false;
   private agentKey: string = "";
+  /** The Agent whose connections it uses (null: agent: false). */
+  get agent(): Agent | null {
+    const a = this._pool;
+    return a !== null ? (a.owner as Agent) : null;
+  }
 
   constructor(url: string, method: string) {
     super(null);
@@ -1556,8 +1601,8 @@ export class ClientRequest extends Writable {
   }
   // the connection after the exchange: back to the agent (kept when reusable), or closed
   private release(t: HttpTransport, reusable: boolean): void {
-    const agent = this.agent;
-    if (agent !== null) agent._done(this.agentKey, t, reusable);
+    const agent = this._pool;
+    if (agent !== null) agent.done(this.agentKey, t, reusable);
     else t.close();
     this.t = null;
   }
@@ -1585,17 +1630,17 @@ export class ClientRequest extends Writable {
       return;
     }
     const port = this.port.length > 0 ? Math.trunc(Number(this.port)) : this.defaultPort();
-    const agent = this.agent;
+    const agent = this._pool;
     const key = this.host + ":" + String(port) + ":";
     let handed: HttpTransport | null = null;
     if (agent !== null) {
-      if (agent._full(key)) {
-        await agent._slot(key);
-        handed = agent._handed(key);
-      } else agent._take(key);
+      if (agent.full(key)) {
+        await agent.slot(key);
+        handed = agent.handed(key);
+      } else agent.take(key);
     }
     let t: HttpTransport;
-    const reused = agent !== null && handed === null ? agent._reuse(key) : null;
+    const reused = agent !== null && handed === null ? agent.reuse(key) : null;
     if (handed !== null) {
       t = handed;
     } else if (reused !== null) {
@@ -1605,7 +1650,7 @@ export class ClientRequest extends Writable {
       try {
         t = this.open(this.host, port);
       } catch (e) {
-        if (agent !== null) agent._done(key, null, false);
+        if (agent !== null) agent.done(key, null, false);
         this.fail(e as Error);
         return;
       }
@@ -1628,7 +1673,7 @@ export class ClientRequest extends Writable {
     for (const k of this.headers.keys()) head += k + ": " + (this.headers.get(k) ?? "") + "\r\n";
     const m = this.method;
     if (!hasLen && (body.length > 0 || !(m === "GET" || m === "HEAD" || m === "DELETE" || m === "OPTIONS" || m === "TRACE" || m === "CONNECT"))) head += "Content-Length: " + String(body.length) + "\r\n";
-    if (!hasConn) head += agent !== null && agent.keepAlive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
+    if (!hasConn) head += agent !== null && agent.keep() ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
     head += "\r\n";
     const out = body.length > 0 ? concat([Buffer.from(head), body]) : Buffer.from(head);
     if (t.writeAll(out, 0) < 0 && !this.killed) {
@@ -1822,11 +1867,11 @@ export function _toUrl(target: string | URL | RequestOptions, defaultProtocol: s
 /** (internal) the method and headers of request(), given to a ClientRequest made by http or https. */
 export function _setup(req: ClientRequest, target: string | URL | RequestOptions, callback: ResponseListener | null, defaultAgent: Agent | null = null): ClientRequest {
   const opts: RequestOptions | null = typeof target === "string" || target instanceof URL ? null : (target as RequestOptions);
-  req.agent = defaultAgent;
+  req._pool = defaultAgent !== null ? defaultAgent._ops() : null;
   if (opts !== null) {
     const a = opts.agent;
-    if (a instanceof Agent) req.agent = a as Agent;
-    else if (a === false) req.agent = null;
+    if (a instanceof Agent) req._pool = (a as Agent)._ops();
+    else if (a === false) req._pool = null;
   }
   if (opts !== null && opts.headers !== null) {
     const hs = opts.headers as Record<string, string>;

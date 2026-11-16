@@ -86,8 +86,23 @@ static void use_type(Type *t) {
     }
 }
 
+/* a top-level `let/const X = new C(...)` of a built-in module (xisto:http's globalAgent): made only when the program
+   reads X (a construction has no other effect worth keeping), else the statement and C itself are left out */
+static Stmt **lazy_vars;
+static bool *lazy_done;
+static int nlazy;
+static bool lazy_var(Stmt *s) {
+    return s->kind == S_VAR && s->cname && s->init && s->init->kind == E_NEW_OBJ && s->mod && s->mod->file &&
+           strncmp(s->mod->file, "xisto:", 6) == 0;
+}
 static void walk_expr(Expr *e) {
     if (!e) return;
+    if (e->kind == E_IDENT && e->cname && nlazy)
+        for (int i = 0; i < nlazy; i++)
+            if (!lazy_done[i] && strcmp(lazy_vars[i]->cname, e->cname) == 0) {
+                lazy_done[i] = true;
+                walk_stmt(lazy_vars[i]);
+            }
     use_type(e->type);
     if (e->kind == E_NEW_OBJ || e->kind == E_OBJLIT) made_class(e->cls);
     if (e->kind == E_AS || ((e->kind == E_CALL || e->kind == E_MEMBER) && (e->builtin.cfn || (e->func && e->func->is_native)))) {
@@ -170,7 +185,15 @@ void prune_program(Program *p) {
         if (c->used && !c->builtin)
             for (int k = 0; k < c->nfields; k++) use_type(c->fields[k].type);
     }
-    for (int i = 0; i < p->top.len; i++) walk_stmt(p->top.items[i]);
+    for (int i = 0; i < p->top.len; i++)
+        if (lazy_var(p->top.items[i])) {
+            lazy_vars = realloc(lazy_vars, sizeof(Stmt *) * (size_t)(nlazy + 1));
+            lazy_done = realloc(lazy_done, sizeof(bool) * (size_t)(nlazy + 1));
+            lazy_vars[nlazy] = p->top.items[i];
+            lazy_done[nlazy++] = false;
+        }
+    for (int i = 0; i < p->top.len; i++)
+        if (!lazy_var(p->top.items[i])) walk_stmt(p->top.items[i]);
     for (bool more = true; more;) {
         while (nwork > 0) {
             Func *f = work[--nwork];
@@ -187,6 +210,16 @@ void prune_program(Program *p) {
                 Class *a = asif_reached[i]->adapters[k];
                 if (!a->used && a->adapter_of->used) { use_class(a); made_class(a); more = true; }
             }
+    }
+    { /* the lazy variables nothing reachable reads: left out of the program */
+        int w = 0;
+        for (int i = 0; i < p->top.len; i++) {
+            Stmt *s = p->top.items[i];
+            bool drop = false;
+            for (int k = 0; k < nlazy; k++) if (lazy_vars[k] == s && !lazy_done[k]) drop = true;
+            if (!drop) p->top.items[w++] = s;
+        }
+        p->top.len = w;
     }
     /* the network runtime (XB-250): needed when a function with such code is reachable; a function the program does
        not list (an arrow outside any function, a generic instance) counts as reachable */

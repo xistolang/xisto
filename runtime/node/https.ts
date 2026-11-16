@@ -142,21 +142,17 @@ export class HttpsClientRequest extends ClientRequest {
 /** Node's https.Agent: an http.Agent for https: (port 443). Its options and limits are http.Agent's; a TLS
  * connection is not reused (each request has its own), so keepAlive changes only the Connection header. */
 export class Agent extends HttpAgent {
-  constructor(options: AgentOptions | null = null) {
-    super(options);
+  constructor(options: AgentOptions | null = null, keepAliveGlobal: boolean = false) {
+    super(options, keepAliveGlobal);
     this.defaultPort = 443;
     this.protocol = "https:";
   }
 }
 
 /** The Agent of the https requests that name none. */
-export let globalAgent: Agent = keepAliveAgent(new Agent(null));
-// (set field by field: an options object here would be compiled into every program that loads the module)
-function keepAliveAgent(a: Agent): Agent {
-  a.keepAlive = true;
-  a.timeout = 5000;
-  return a;
-}
+// (a `new` alone: the compiler makes it only in a program that reads globalAgent, src/prune.c lazy_var; an options
+// object here would be compiled into every program that loads the module)
+export let globalAgent: Agent = new Agent(null, true);
 
 /** Makes an https request: call end() (with a body) to send it. With options.ca, that CA is trusted too (for the
  * whole program, from now on). */

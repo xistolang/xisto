@@ -90,29 +90,35 @@ export class ChildOutput extends EventEmitter {
   private encoding: string = "";
   private io: int = 0;
   private refd: boolean = true;
+  // what changes whether the pipe's task keeps the program alive: set by the child's first ref()/unref(), so a
+  // program that never calls them does not carry that runtime
+  private refHook: ((io: int, ref: boolean) => void) | null = null;
   setEncoding(encoding: string = "utf8"): ChildOutput {
     this.encoding = encoding;
     return this;
   }
   /** (internal) reads the pipe to its end. */
-  async _pump(fd: int, done: () => void): Promise<void> {
+  async _pump(fd: int, owner: ChildProcess, isErr: boolean): Promise<void> {
     this.io = net_task();
-    if (!this.refd && this.io !== 0) net_task_ref(this.io, false);
+    const h0 = this.refHook;
+    if (!this.refd && h0 !== null && this.io !== 0) h0(this.io, false);
     for (;;) {
       const chunk = net_read(fd);
       if (chunk.length === 0) break;
       if (this.encoding.length > 0) this.emit("data", new TextDecoder().decode(chunk));
       else this.emit("data", Buffer.from(chunk));
     }
-    if (!this.refd && this.io !== 0) net_task_ref(this.io, true);
+    const h1 = this.refHook;
+    if (!this.refd && h1 !== null && this.io !== 0) h1(this.io, true);
     this.io = 0;
     net_close(fd);
     this.emit("end");
     this.emit("close");
-    done();
+    owner._pumped(isErr);
   }
   /** (internal) whether reading the pipe keeps the program alive (the child's ref/unref). */
   _setRef(ref: boolean): void {
+    if (this.refHook === null) this.refHook = (io: int, r: boolean): void => net_task_ref(io, r);
     if (this.refd !== ref && this.io !== 0) net_task_ref(this.io, ref);
     this.refd = ref;
   }
@@ -151,8 +157,6 @@ export class ChildProcess extends EventEmitter {
   stdout: ChildOutput = new ChildOutput();
   stderr: ChildOutput = new ChildOutput();
   private task: Promise<void> | null = null;
-  private outTask: Promise<void> | null = null;
-  private errTask: Promise<void> | null = null;
   private left: int = 0;
 
   constructor(file: string, args: string[]) {
@@ -185,12 +189,13 @@ export class ChildProcess extends EventEmitter {
   private async watch(outFd: int, errFd: int): Promise<void> {
     this.emit("spawn");
     this.left = 2;
-    this.outTask = this.stdout._pump(outFd, (): void => this.pumped(false));
-    this.errTask = this.stderr._pump(errFd, (): void => this.pumped(true));
+    this.stdout._pump(outFd, this, false);
+    this.stderr._pump(errFd, this, true);
   }
   // one pipe is at its end; after the second, the exit comes as an await of each pump in turn gave it: a microtask
   // after stderr's end, two after stdout's
-  private pumped(isErr: boolean): void {
+  /** (internal) one of its pipes is at its end. */
+  _pumped(isErr: boolean): void {
     this.left--;
     if (this.left > 0) return;
     if (isErr) {
@@ -202,8 +207,6 @@ export class ChildProcess extends EventEmitter {
     }
   }
   private finish(): void {
-    this.outTask = null;
-    this.errTask = null;
     const st = cp_wait(this.pid);
     this.exitCode = st[1] > 0 ? null : st[0];
     this.signalCode = signalName(st[1]);
