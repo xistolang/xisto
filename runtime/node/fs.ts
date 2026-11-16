@@ -254,13 +254,13 @@ export interface CopyOptions {
 
 // ---- files ----
 
-function writeAll(path: string, data: string | Uint8Array, options: string | WriteFileOptions | undefined, flag: string, other: boolean): void {
+function writeAll(path: string, data: string | Uint8Array, options: string | WriteFileOptions | null, flag: string, other: boolean): void {
   let enc = "utf8";
   let mode: int = 0o666;
   let fl = flag;
   if (typeof options === "string") {
     enc = options;
-  } else if (options !== undefined) {
+  } else if (options !== null) {
     enc = options.encoding ?? "utf8";
     mode = options.mode ?? 0o666;
     fl = options.flag ?? flag;
@@ -391,14 +391,14 @@ export function mkdtempSync(prefix: string, options: string | null = null): stri
 
 // ---- directories ----
 
-// mkdir -p: the first directory made (undefined when all were there); errors name `asked`, the path asked for
-function mkdirp(path: string, mode: int, asked: string): string | undefined {
+// mkdir -p: the first directory made (null, undefined in Node, when all were there); errors name `asked`, the path asked for
+function mkdirp(path: string, mode: int, asked: string): string | null {
   const r = fs_mkdir(path, mode);
   if (r === 0) return path;
   const code = __fsCode(r);
   if (code === "EEXIST") {
     const st = fs_stat(path, true, -1);
-    if (st.length > 0 && (Math.trunc(st[1]) & 0o170000) === 0o040000) return undefined;
+    if (st.length > 0 && (Math.trunc(st[1]) & 0o170000) === 0o040000) return null;
     fs_throw(r, "mkdir", asked, "");
   }
   if (code !== "ENOENT") fs_throw(r, "mkdir", asked, "");
@@ -407,28 +407,28 @@ function mkdirp(path: string, mode: int, asked: string): string | undefined {
   const first = mkdirp(parent, mode, asked);
   const r2 = fs_mkdir(path, mode);
   if (r2 < 0 && __fsCode(r2) !== "EEXIST") fs_throw(r2, "mkdir", asked, "");
-  return first !== undefined ? first : r2 === 0 ? path : undefined;
+  return first !== null ? first : r2 === 0 ? path : null;
 }
 
 /** Makes a directory; with { recursive: true } its missing parents too, and gives the first one it made. */
-export function mkdirSync(path: string, options?: int | MkdirOptions): string | undefined {
+export function mkdirSync(path: string, options?: int | MkdirOptions): string | null {
   let mode: int = 0o777;
   let recursive = false;
   if (typeof options === "number") {
     mode = options;
-  } else if (options !== undefined) {
+  } else if (options !== null) {
     mode = options.mode ?? 0o777;
     recursive = options.recursive === true;
   }
   if (!recursive) {
     __fsCheck(fs_mkdir(path, mode), "mkdir", path);
-    return undefined;
+    return null;
   }
   return mkdirp(path, mode, path);
 }
 
 export function rmdirSync(path: string, options?: RmdirOptions): void {
-  if (options !== undefined && options.recursive === true) {
+  if (options !== null && options.recursive === true) {
     rmSync(path, { recursive: true, force: false });
     return;
   }
@@ -451,8 +451,8 @@ function rmTree(path: string): void {
 
 /** Removes a file or (with { recursive: true }) a directory and what it holds; { force: true }: no error when missing. */
 export function rmSync(path: string, options?: RmOptions): void {
-  const recursive = options !== undefined && options.recursive === true;
-  const force = options !== undefined && options.force === true;
+  const recursive = options !== null && options.recursive === true;
+  const force = options !== null && options.force === true;
   const st = fs_stat(path, false, -1);
   if (st.length === 0) {
     const r = fs_last_err();
@@ -498,7 +498,7 @@ export function readdirSync(path: string, options?: string | ReaddirOptions): st
   let recursive = false;
   if (typeof options === "string") {
     recursive = false;
-  } else if (options !== undefined) {
+  } else if (options !== null) {
     recursive = options.recursive === true;
   }
   const out: string[] = [];
@@ -536,10 +536,10 @@ export function statSync(path: string, options?: StatOptions): Stats {
 }
 
 /** statSync(path, { throwIfNoEntry: false }): undefined when the file is not there. */
-export function statSync__throwIfNoEntry_false(path: string, options: StatOptions): Stats | undefined {
+export function statSync__throwIfNoEntry_false(path: string, options: StatOptions): Stats | null {
   const v = fs_stat(path, true, -1);
   const r = fs_last_err();
-  if (r < 0 && (__fsCode(r) === "ENOENT" || __fsCode(r) === "ENOTDIR")) return undefined;
+  if (r < 0 && (__fsCode(r) === "ENOENT" || __fsCode(r) === "ENOTDIR")) return null;
   __fsCheck(r, "stat", path);
   return new Stats(v);
 }
@@ -551,10 +551,10 @@ export function lstatSync(path: string, options?: StatOptions): Stats {
   return new Stats(v);
 }
 
-export function lstatSync__throwIfNoEntry_false(path: string, options: StatOptions): Stats | undefined {
+export function lstatSync__throwIfNoEntry_false(path: string, options: StatOptions): Stats | null {
   const v = fs_stat(path, false, -1);
   const r = fs_last_err();
-  if (r < 0 && (__fsCode(r) === "ENOENT" || __fsCode(r) === "ENOTDIR")) return undefined;
+  if (r < 0 && (__fsCode(r) === "ENOENT" || __fsCode(r) === "ENOTDIR")) return null;
   __fsCheck(r, "lstat", path);
   return new Stats(v);
 }
@@ -570,7 +570,7 @@ export function fstatSync(fd: int): Stats {
 
 function cpTree(src: string, dest: string, o: CopyOptions): void {
   const filter = o.filter;
-  if (filter !== undefined && !filter(src, dest)) return;
+  if (filter !== null && !filter(src, dest)) return;
   const st = fs_stat(src, o.dereference === true, -1);
   __fsCheck(fs_last_err(), "lstat", src);
   const mode = Math.trunc(st[1]) & 0o170000;
@@ -605,5 +605,5 @@ function cpTree(src: string, dest: string, o: CopyOptions): void {
 
 /** Copies a file, or (with { recursive: true }) a directory and what it holds. */
 export function cpSync(src: string, dest: string, options?: CopyOptions): void {
-  cpTree(src, dest, options !== undefined ? options : {});
+  cpTree(src, dest, options !== null ? options : {});
 }

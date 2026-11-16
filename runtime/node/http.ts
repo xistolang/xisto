@@ -265,7 +265,7 @@ export class IncomingMessage extends Readable {
       this.rawHeaders.push(v);
       const k = name.toLowerCase();
       const cur = this.headers[k];
-      if (cur === null || cur === undefined) this.headers[k] = v;
+      if (cur === null) this.headers[k] = v;
       else this.headers[k] = cur + (k === "cookie" ? "; " : ", ") + v;
     }
   }
@@ -399,7 +399,7 @@ export class ServerResponse extends Writable {
     if (hs !== null) {
       for (const k of Object.keys(hs)) {
         const v = hs[k];
-        if (v !== null && v !== undefined) this.setHeader(k, v);
+        if (v !== null) this.setHeader(k, v);
       }
     }
     this.headersSent = true;
@@ -439,7 +439,7 @@ export class ServerResponse extends Writable {
       }
       return false;
     }
-    if (chunk === null || chunk === undefined) throw new TypeError('The "chunk" argument must be of type string or an instance of Buffer or Uint8Array. Received null');
+    if (chunk === null) throw new TypeError('The "chunk" argument must be of type string or an instance of Buffer or Uint8Array. Received null');
     this.headersSent = true;
     const ok = this.out(toBytes(chunk, enc), false);
     if (f !== null) this.later(f as ErrorCallback);
@@ -470,7 +470,7 @@ export class ServerResponse extends Writable {
       this.once("finish", () => g(null));
     }
     if (this.conn === null) return this;
-    this.out(c === null || c === undefined ? null : toBytes(c, enc), true);
+    this.out(c === null ? null : toBytes(c, enc), true);
     const conn = this.conn as HttpConnection;
     conn._responseEnded(this, this.keepAlive);
     return this;
@@ -749,10 +749,14 @@ export class HttpConnection {
     const cl = msg.headers["content-length"];
     this.chunked = false;
     this.left = 0;
-    if (te !== null && te !== undefined && te.toLowerCase().includes("chunked")) {
+    if (te !== null && cl !== null) { // (both: a request smuggling vector, which Node's parser answers with 400)
+      this.reject(400, "Bad Request");
+      return;
+    }
+    if (te !== null && te.toLowerCase().includes("chunked")) {
       this.chunked = true;
       this.chunkLeft = -1;
-    } else if (cl !== null && cl !== undefined) {
+    } else if (cl !== null) {
       const n = Number(cl);
       if (!(n >= 0) || Math.floor(n) !== n) {
         this.reject(400, "Bad Request");
@@ -761,7 +765,7 @@ export class HttpConnection {
       this.left = Math.floor(n);
     }
     const conn = msg.headers["connection"];
-    const connLc = conn === null || conn === undefined ? "" : conn.toLowerCase();
+    const connLc = conn === null ? "" : conn.toLowerCase();
     let keepAlive = msg.httpVersionMinor >= 1 ? !connLc.includes("close") : connLc.includes("keep-alive");
     this.http10KeepAlive = msg.httpVersionMinor === 0 && keepAlive;
     if (this.srv.closing()) keepAlive = false;
@@ -772,7 +776,7 @@ export class HttpConnection {
     this.state = 1;
     const expect = msg.headers["expect"];
     const srv = this.srv;
-    if (expect !== null && expect !== undefined && expect.toLowerCase() === "100-continue") {
+    if (expect !== null && expect.toLowerCase() === "100-continue") {
       if (srv.listenerCount("checkContinue") > 0) {
         srv.emit("checkContinue", msg, res);
         if (!this.chunked && this.left === 0) this.bodyDone();
@@ -836,8 +840,8 @@ export class HttpConnection {
         }
         const semi = line.indexOf(";");
         const hex = semi >= 0 ? line.slice(0, semi).trim() : line;
-        const size = parseInt(hex, 16);
-        if (hex.length === 0 || !(size >= 0)) {
+        const size = hexSize(hex);
+        if (size < 0) {
           this.reject(400, "Bad Request");
           return false;
         }
@@ -1292,7 +1296,7 @@ export class ClientRequest extends Writable {
       c = null;
     }
     if (this.ended) return this;
-    if (c !== null && c !== undefined) this.chunks.push(toBytes(c, enc));
+    if (c !== null) this.chunks.push(toBytes(c, enc));
     this.ended = true;
     const ws = this._writableState;
     if (ws !== null) {
@@ -1443,9 +1447,9 @@ export class ClientRequest extends Writable {
     let ok = true;
     if (this.method === "HEAD" || code === 204 || code === 304) {
       // (no body)
-    } else if (te !== null && te !== undefined && te.toLowerCase().includes("chunked")) {
+    } else if (te !== null && te.toLowerCase().includes("chunked")) {
       ok = await this.chunkedBody(t, msg, buf, pos);
-    } else if (cl !== null && cl !== undefined) {
+    } else if (cl !== null) {
       let left = Math.trunc(Number(cl));
       if (buf.length > pos && left > 0) {
         const n = buf.length - pos < left ? buf.length - pos : left;
@@ -1520,8 +1524,8 @@ export class ClientRequest extends Writable {
             }
           } else {
             const semi = line.indexOf(";");
-            const size = parseInt(semi >= 0 ? line.slice(0, semi) : line, 16);
-            if (!(size >= 0)) return false;
+            const size = hexSize((semi >= 0 ? line.slice(0, semi) : line).trim());
+            if (size < 0) return false;
             left = size === 0 ? -2 : Math.trunc(size);
           }
         }
@@ -1536,6 +1540,16 @@ export class ClientRequest extends Writable {
   }
 }
 
+/** A chunk's size line: its hex digits only (parseInt would take "1g" as 1), -1 when it is not one. */
+function hexSize(hex: string): number {
+  if (hex.length === 0 || hex.length > 13) return -1;
+  for (let i = 0; i < hex.length; i++) {
+    const c = hex.charCodeAt(i);
+    if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102))) return -1;
+  }
+  return parseInt(hex, 16);
+}
+
 /** (internal) the URL of a request()'s target. */
 export function _toUrl(target: string | URL | RequestOptions, defaultProtocol: string): string {
   if (typeof target === "string") return target as string;
@@ -1544,7 +1558,7 @@ export function _toUrl(target: string | URL | RequestOptions, defaultProtocol: s
   const protocol = o.protocol ?? defaultProtocol;
   let host = o.hostname ?? o.host ?? "localhost";
   const op = o.port;
-  let port: int = op === null || op === undefined ? 0 : typeof op === "string" ? Math.trunc(Number(op as string)) : Math.trunc(op as number);
+  let port: int = op === null ? 0 : typeof op === "string" ? Math.trunc(Number(op as string)) : Math.trunc(op as number);
   if (o.hostname === null && o.host !== null) { // (host may carry the port: "example.com:8080")
     const colon = host.lastIndexOf(":");
     if (colon > 0 && !host.includes("]") && host.indexOf(":") === colon) {

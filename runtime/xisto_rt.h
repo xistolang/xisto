@@ -6392,8 +6392,8 @@ static const char *xs_fs_err_name(int64_t e, const char **text) {
     int a = (int)(e < 0 ? -e : e);
     for (size_t i = 0; i < sizeof t / sizeof t[0]; i++)
         if (t[i].e == a) { *text = t[i].text; return t[i].code; }
-    *text = strerror(a);
-    return "EIO";
+    *text = "unknown error"; /* (libuv's UV_UNKNOWN, as Node reports an errno it has no name for) */
+    return "UNKNOWN";
 }
 /* throws Node's error for -errno e of syscall (owned) on path (dest: rename, copyfile, symlink and link name two;
    both borrowed, NULL or empty when not given) */
@@ -6482,6 +6482,9 @@ XS_NOINLINE xs_arr_num *xs_fs_stat(xs_str *p, bool follow, int64_t fd) {
 }
 /* a directory's entries, sorted as libuv's scandir sorts them (strcmp), each its kind's letter and its name: f file,
    d directory, l symbolic link, b c p s devices, FIFOs and sockets, u unknown */
+static int xs_fs_name_cmp(const void *x, const void *y) { /* (an entry's name follows its kind's letter) */
+    return strcmp((*(xs_str *const *)x)->data + 1, (*(xs_str *const *)y)->data + 1);
+}
 XS_NOINLINE xs_arr_ref *xs_fs_readdir(xs_str *p) {
     xs_arr_ref *a = xs_arr_ref_new(0, xs_print_str_quoted_);
 #ifdef _WIN32
@@ -6509,13 +6512,7 @@ XS_NOINLINE xs_arr_ref *xs_fs_readdir(xs_str *p) {
         xs_arr_ref_push(a, s);
     }
     closedir(d);
-    /* (insertion sort by the names: directories are small, and the order is strcmp's) */
-    for (int64_t i = 1; i < a->len; i++) {
-        void *x = a->data[i];
-        int64_t j = i;
-        while (j > 0 && strcmp(((xs_str *)a->data[j - 1])->data + 1, ((xs_str *)x)->data + 1) > 0) { a->data[j] = a->data[j - 1]; j--; }
-        a->data[j] = x;
-    }
+    if (a->len > 1) qsort(a->data, (size_t)a->len, sizeof a->data[0], xs_fs_name_cmp); /* (by the names, as strcmp orders them) */
     return a;
 #endif
 }

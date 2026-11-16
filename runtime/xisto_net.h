@@ -3331,12 +3331,18 @@ XS_NOINLINE void xs_Server_listen(xs_Server *s, int64_t port) {
 XS_NOINLINE char *xs_pem_tmp(xs_str *pem) {
     const char *dir = getenv("TMPDIR");
     char *path = malloc(4096);
+    if (!path) xs_panic("out of memory");
     snprintf(path, 4096, "%s/xisto-pem-XXXXXX", dir && *dir ? dir : "/tmp");
     int fd = mkstemp(path);
     if (fd < 0) xs_panic("https: cannot write the certificate to a temporary file");
     fchmod(fd, 0600);
-    ssize_t w = write(fd, pem->data, (size_t)pem->len);
-    (void)w;
+    size_t off = 0;
+    while (off < (size_t)pem->len) {
+        ssize_t w = write(fd, pem->data + off, (size_t)pem->len - off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) { close(fd); unlink(path); xs_panic("https: cannot write the certificate to a temporary file"); }
+        off += (size_t)w;
+    }
     close(fd);
     return path;
 }
@@ -4486,7 +4492,16 @@ XS_NOINLINE void xs_fd_read_run(void *p) {
         }
         n = read(r->fd, r->buf->data, (size_t)r->buf->f_length);
         if (n < 0 && errno == EINTR) continue;
-        if (n < 0 && errno == EAGAIN) continue; /* (someone made it non-blocking: wait again) */
+        if (n < 0 && errno == EAGAIN) { /* (someone made it non-blocking: wait again; a descriptor kqueue cannot watch
+                                              is tried again a little later instead of at once) */
+            if (!xs_fd_pollable(r->fd)) {
+                r->parked = true;
+                xs_sleep_ms(2);
+                r->parked = false;
+                if (r->stop) return;
+            }
+            continue;
+        }
         break;
     }
     for (xs_fdrd **pp = &xs_fdrds; *pp; pp = &(*pp)->next) /* done: a read the callback starts is a new one */
@@ -5355,15 +5370,24 @@ XS_NOINLINE int64_t xs_tlss_cred(xs_str *cert, xs_str *key) {
     free(kp);
     xs_release(c);
     xs_release(k);
-    xs_tlss_creds = realloc(xs_tlss_creds, sizeof *xs_tlss_creds * (size_t)(xs_ntlss_creds + 1));
+    void **nc = realloc(xs_tlss_creds, sizeof *xs_tlss_creds * (size_t)(xs_ntlss_creds + 1));
+    if (!nc) xs_panic("out of memory");
+    xs_tlss_creds = nc;
     xs_tlss_creds[xs_ntlss_creds] = cr;
     return xs_ntlss_creds++;
 }
 XS_NOINLINE int64_t xs_tlss_accept(int64_t cred, int64_t fd) { /* the slot of an accepted connection */
+    if (cred < 0 || cred >= xs_ntlss_creds) xs_panic("https: no such server credential");
     xs_tls *t = xs_tls_server_new(xs_tlss_creds[cred]);
+    if (!t) xs_panic("out of memory");
     int64_t h = 0;
     while (h < xs_ntlscs && xs_tlscs[h].used) h++;
-    if (h == xs_ntlscs) { xs_tlscs = realloc(xs_tlscs, sizeof *xs_tlscs * (size_t)(xs_ntlscs + 1)); xs_ntlscs++; }
+    if (h == xs_ntlscs) {
+        xs_tlsc *ns = realloc(xs_tlscs, sizeof *xs_tlscs * (size_t)(xs_ntlscs + 1));
+        if (!ns) xs_panic("out of memory");
+        xs_tlscs = ns;
+        xs_ntlscs++;
+    }
     xs_tlscs[h] = (xs_tlsc){t, (int)fd, true, false, 0};
     return h;
 }
