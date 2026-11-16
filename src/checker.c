@@ -14571,6 +14571,12 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (bb->kind == TY_NULL) bb = ba;
             if (ba->kind != TY_NULL && ty_equal(ba, bb)) u = ba;
             else if (is_numeric(ba) && is_numeric(bb)) u = ty_number; /* Math.trunc(n) : null-or-number: a number */
+            /* c ? e.getStatus() : HttpStatus.INTERNAL_SERVER_ERROR: a number and a member of a numeric enum make the number,
+               as in TypeScript (a string enum's member and a string: the string) */
+            else if (is_numeric(ba) && bb->kind == TY_ENUM && !bb->en->is_string) u = ba;
+            else if (is_numeric(bb) && ba->kind == TY_ENUM && !ba->en->is_string) u = bb;
+            else if (ba->kind == TY_STRING && !ba->tname && bb->kind == TY_ENUM && bb->en->is_string) u = ba;
+            else if (bb->kind == TY_STRING && !bb->tname && ba->kind == TY_ENUM && ba->en->is_string) u = bb;
             else if (ty_is_any(ta) || ty_is_any(tb)) { u = ty_any; nul = false; } /* data ? user[data] : user: an any (the other side read by name too) */
             else if (ta->kind == TY_UNKNOWN || tb->kind == TY_UNKNOWN) { u = ty_unknown; nul = false; } /* d ? new Date(d) : row.x: unknown, as TypeScript */
             else if (ba->kind == TY_OBJECT && bb->kind == TY_OBJECT && !ba->cls->is_interface && !bb->cls->is_interface)
