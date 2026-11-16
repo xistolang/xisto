@@ -6190,10 +6190,23 @@ XS_NOINLINE void xs_process_on_exit(xs_closure *cb) {
     if (!xs_pexit_cb) xs_pexit_cb = xs_retain(cb);
     if (!xs_uncaught_hook) xs_uncaught_hook = xs_uncaught_exit;
 }
-XS_NOINLINE void xs_pexit_call(xs_closure *cb, int64_t code, bool before) {
+/* process.on('uncaughtException') (xisto_net.h): runs f(a) under a catch, the error going to the listener; true when
+   it threw. NULL: nothing listens, an error goes on as it would */
+static XS_TLS bool (*xs_uncaught_guard)(void (*f)(void *), void *a);
+typedef struct { xs_closure *cb; int64_t code; bool before; } xs_pexit_args;
+XS_NOINLINE void xs_pexit_run(void *p) {
+    xs_pexit_args *a = p;
+    ((void (*)(void *, int64_t, bool))a->cb->fn)(a->cb, a->code, a->before);
+}
+/* true when a listener threw and process.on('uncaughtException') took the error (Node goes on: 'beforeExit' again) */
+XS_NOINLINE bool xs_pexit_call(xs_closure *cb, int64_t code, bool before) {
     size_t mark = xs_ar_mark();
-    ((void (*)(void *, int64_t, bool))cb->fn)(cb, code, before);
+    xs_pexit_args a = {cb, code, before};
+    bool threw = false;
+    if (xs_uncaught_guard) threw = xs_uncaught_guard(xs_pexit_run, &a);
+    else xs_pexit_run(&a);
     xs_ar_drain(mark);
+    return threw;
 }
 XS_NOINLINE void xs_process_exit(int64_t code) {
     xs_exit_code_ = (int)code;
@@ -11119,11 +11132,11 @@ XS_NOINLINE void xs_before_exit(void) {
     if (xs_pexit_cb) {
         /* 'beforeExit' each time the work runs out (its listeners may start more), then 'exit' */
         for (;;) {
-            xs_pexit_call(xs_pexit_cb, xs_exit_code_, true);
+            bool threw = xs_pexit_call(xs_pexit_cb, xs_exit_code_, true);
             void (*more)(void) = xs_exit_hook;
             xs_exit_hook = NULL;
-            if (!more) break;
-            more();
+            if (!more && !threw) break; /* (a listener that threw, its error taken: 'beforeExit' again, as Node) */
+            if (more) more();
         }
         xs_closure *cb = xs_pexit_cb;
         xs_pexit_cb = NULL;

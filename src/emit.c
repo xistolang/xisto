@@ -14830,7 +14830,7 @@ void emit_program(Program *p, Buf *o) {
     }
     emit_releases(escope);
     epop();
-    if (uncaught_land) { nl(); buf_puts(out, "xs_landed: xs_uncaught_top = false; xs_ar_drain(ar_mark);"); }
+    if (uncaught_land) { nl(); buf_puts(out, "xs_landed: xs_uncaught_main = NULL; xs_uncaught_top = false; xs_ar_drain(ar_mark);"); }
     emit_dbg_finish();
     if (wbody) { /* main: the setup once, then the program, as any thread */
         /* the body's own top-level locals: each thread releases its own here (main cannot see them) */

@@ -1230,6 +1230,16 @@ XS_NOINLINE void xs_promise_reject(xs_promise *p, void *err) {
 }
 /* process.on('unhandledRejection') (runtime/node/process.ts): its dispatcher, (reason, promise) => handled */
 static XS_TLS xs_closure *xs_rejection_cb;
+static XS_TLS bool xs_unh_handled;
+XS_NOINLINE void xs_unh_run(void *p) {
+    xs_unh_handled = ((bool (*)(void *, void *, void *))xs_rejection_cb->fn)(xs_rejection_cb, ((xs_promise *)p)->err, p);
+}
+XS_NOINLINE bool xs_unh_call(xs_promise *p) { /* the listener; one that throws hands its error to 'uncaughtException' (handled) */
+    xs_unh_handled = false;
+    if (xs_uncaught_guard && xs_uncaught_guard(xs_unh_run, p)) return true;
+    if (!xs_uncaught_guard) xs_unh_run(p);
+    return xs_unh_handled;
+}
 XS_NOINLINE void xs_unh_dispatch(void) {
     while (xs_unh) {
         xs_promise *p = xs_unh;
@@ -1238,7 +1248,7 @@ XS_NOINLINE void xs_unh_dispatch(void) {
         xs_unh_drop(p);
         p->handled = true;
         size_t mark = xs_ar_mark();
-        bool handled = ((bool (*)(void *, void *, void *))xs_rejection_cb->fn)(xs_rejection_cb, p->err, p);
+        bool handled = xs_unh_call(p);
         xs_ar_drain(mark);
         if (!handled) { /* nothing listens (any more): back on the list, for the message below */
             p->in_unh = true; p->unh_next = xs_unh; xs_unh = p;
@@ -4384,7 +4394,9 @@ XS_NOINLINE void xs_uncaught_run(void *err) { /* (xs_uncaught_hook: from xs_thro
     xs_cln_unwind(0);
     if (xs_cur_coro) { xs_ar_drain(0); xs_coro_finish(); }
     if (xs_uncaught_main) _longjmp(*xs_uncaught_main, 1);
-    xs_before_exit(); /* (no landing: the loop runs from here) */
+    /* (no landing: the top level is done. The loop runs from here, the work it had left included) */
+    if (!xs_exit_hook) xs_exit_hook = xs_tasks_drain;
+    xs_before_exit();
     fflush(stdout);
     exit(xs_exit_code_);
 }
@@ -4400,10 +4412,25 @@ XS_NOINLINE void xs_call_guarded(xs_closure *cb) {
     if (!xs_uncaught_cb || !xs_uncaught_call(err, "uncaughtException")) xs_uncaught_print(err, 1);
     xs_release(err);
 }
+/* f(a) under a catch: an error goes to the 'uncaughtException' listener (xs_uncaught_guard); true when f threw */
+XS_NOINLINE bool xs_uncaught_guarded(void (*f)(void *), void *a) {
+    jmp_buf jb;
+    xs_try_push(&jb);
+    if (_setjmp(jb) == 0) {
+        f(a);
+        xs_try_pop();
+        return false;
+    }
+    void *err = xs_caught();
+    if (!xs_uncaught_cb || !xs_uncaught_call(err, "uncaughtException")) xs_uncaught_print(err, 1);
+    xs_release(err);
+    return true;
+}
 static void xs_uncaught_release(void) {
     xs_closure *a = xs_uncaught_cb, *b = xs_rejection_cb;
     xs_uncaught_cb = xs_rejection_cb = NULL;
     xs_uncaught_hook = NULL;
+    xs_uncaught_guard = NULL;
     if (a) xs_release(a);
     if (b) xs_release(b);
 }
@@ -4412,6 +4439,7 @@ XS_NOINLINE void xs_process_on_uncaught(xs_closure *uncaught, xs_closure *reject
     xs_uncaught_cb = xs_retain(uncaught);
     xs_rejection_cb = xs_retain(rejection);
     xs_uncaught_hook = xs_uncaught_run;
+    xs_uncaught_guard = xs_uncaught_guarded;
     xs_uncaught_cleanup = xs_uncaught_release;
 }
 
