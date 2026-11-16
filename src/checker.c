@@ -3838,30 +3838,39 @@ static void from_json(Expr *e, Type *want) {
 }
 static bool json_target(Type *t) { return (t->kind == TY_OBJECT || t->kind == TY_ARRAY) && json_ok(t, 0); }
 /* undefined returned by a replacer arrow (xisto's undefined is its null): the runtime's own undefined, so the member is
-   left out while a null returned stays null; the returns of the body and the branches of c ? a : b there */
-static void json_undef_expr(Expr **slot) {
+   left out while a null returned stays null; the returns of the body (`return;` too) and the branches of c ? a : b
+   there. In a function declared elsewhere (named: its value, an E_FUNC_REF), only while the runtime calls it as the
+   replacer (xs_json_undef_if): a direct call of it still returns undefined (null) */
+static Expr *json_undef_mark(Pos pos, Expr *named) {
+    Expr *u = xs_alloc(sizeof *u);
+    u->kind = E_CALL; u->pos = pos; u->field = -1; u->type = ty_any; u->prechecked = true;
+    u->builtin.cfn = named ? "xs_json_undef_if" : "xs_json_undef";
+    if (named) expr_list_push(&u->args, expr_copy(named));
+    return u;
+}
+static void json_undef_expr(Expr **slot, Expr *named) {
     Expr *x = *slot;
     if (!x) return;
     if ((x->kind == E_IDENT && x->str && strcmp(x->str, "undefined") == 0 && !lookup("undefined")) ||
         (x->kind == E_NULL && x->str && strcmp(x->str, "undefined") == 0)) { /* (before or after it was checked) */
-        Expr *u = xs_alloc(sizeof *u);
-        u->kind = E_CALL; u->pos = x->pos; u->field = -1; u->type = ty_any; u->prechecked = true;
-        u->builtin.cfn = "xs_json_undef";
-        *slot = u;
+        *slot = json_undef_mark(x->pos, named);
     } else if (x->kind == E_COND && x->args.len == 2) {
-        json_undef_expr(&x->args.items[0]);
-        json_undef_expr(&x->args.items[1]);
+        json_undef_expr(&x->args.items[0], named);
+        json_undef_expr(&x->args.items[1], named);
     }
 }
-static void json_undef_returns(Stmt *s) {
+static void json_undef_returns(Stmt *s, Expr *named) {
     if (!s) return;
     switch (s->kind) {
-    case S_RETURN: json_undef_expr(&s->expr); break;
-    case S_BLOCK: for (int i = 0; i < s->stmts.len; i++) json_undef_returns(s->stmts.items[i]); break;
-    case S_IF: json_undef_returns(s->body); json_undef_returns(s->else_body); break;
-    case S_WHILE: case S_FOR: case S_FOROF: json_undef_returns(s->body); break;
-    case S_SWITCH: for (int i = 0; i < s->ncases; i++) json_undef_returns(s->cases[i].body); break;
-    case S_TRY: json_undef_returns(s->body); json_undef_returns(s->else_body); json_undef_returns(s->for_init); break;
+    case S_RETURN:
+        if (!s->expr) s->expr = json_undef_mark(s->pos, named); /* (return;: undefined) */
+        else json_undef_expr(&s->expr, named);
+        break;
+    case S_BLOCK: for (int i = 0; i < s->stmts.len; i++) json_undef_returns(s->stmts.items[i], named); break;
+    case S_IF: json_undef_returns(s->body, named); json_undef_returns(s->else_body, named); break;
+    case S_WHILE: case S_FOR: case S_FOROF: json_undef_returns(s->body, named); break;
+    case S_SWITCH: for (int i = 0; i < s->ncases; i++) json_undef_returns(s->cases[i].body, named); break;
+    case S_TRY: json_undef_returns(s->body, named); json_undef_returns(s->else_body, named); json_undef_returns(s->for_init, named); break;
     default: break;
     }
 }
@@ -3885,12 +3894,12 @@ static void json_stringify_ext(Expr *e) {
     Type **ps = xs_alloc(sizeof(Type *) * 2);
     ps[0] = ty_string; ps[1] = ty_any;
     Type *ft = ty_func(ps, 2, ty_any);
-    if (r->kind == E_ARROW && r->arrow && r->arrow->fn) json_undef_returns(r->arrow->fn->body);
+    if (r->kind == E_ARROW && r->arrow && r->arrow->fn) json_undef_returns(r->arrow->fn->body, NULL);
     check_expr(r, rnull ? NULL : r->kind == E_ARROW ? ft : NULL);
     settle(r);
-    /* a function declared elsewhere as the replacer: its `return undefined` leaves the member out, too (that function
-       returns JSON's undefined from then on, wherever it is called) */
-    if (r->kind == E_FUNC_REF && r->func && r->func->body && r->func->ret && r->func->ret->kind == TY_UNKNOWN) json_undef_returns(r->func->body);
+    /* a function declared elsewhere as the replacer: its `return undefined` leaves the member out, too (only when
+       the runtime calls it as the replacer: a direct call still gives undefined) */
+    if (r->kind == E_FUNC_REF && r->func && r->func->body && r->func->ret && r->func->ret->kind == TY_UNKNOWN) json_undef_returns(r->func->body, r);
     if (!rnull) {
         Type *rt = r->type;
         if (rt->kind == TY_FUNC) expect_type(r, ft, "the replacer of JSON.stringify");
@@ -3919,10 +3928,10 @@ static void json_parse_reviver(Expr *e) {
     Type **ps = xs_alloc(sizeof(Type *) * 2);
     ps[0] = ty_string; ps[1] = ty_any;
     Type *ft = ty_func(ps, 2, ty_any);
-    if (rv->kind == E_ARROW && rv->arrow && rv->arrow->fn) json_undef_returns(rv->arrow->fn->body);
+    if (rv->kind == E_ARROW && rv->arrow && rv->arrow->fn) json_undef_returns(rv->arrow->fn->body, NULL);
     check_expr(rv, rv->kind == E_ARROW ? ft : NULL);
     settle(rv);
-    if (rv->kind == E_FUNC_REF && rv->func && rv->func->body && rv->func->ret && rv->func->ret->kind == TY_UNKNOWN) json_undef_returns(rv->func->body);
+    if (rv->kind == E_FUNC_REF && rv->func && rv->func->body && rv->func->ret && rv->func->ret->kind == TY_UNKNOWN) json_undef_returns(rv->func->body, rv);
     if (rv->type->kind != TY_FUNC)
         xs_error(XS7025, rv->pos, "a function (key: string, value: any) => any", "the reviver of JSON.parse cannot be %s", ty_name(rv->type));
     expect_type(rv, ft, "the reviver of JSON.parse");
@@ -17602,9 +17611,12 @@ static void check_stmt_one(Stmt *s) {
                 s->expr->type->kind != TY_VOID && s->expr->type->kind != TY_LITINT) /* xs.filter((x) => x.items.length): a predicate's value, as a condition */
                 make_truthy(s->expr, "predicate");
             expect_type(s->expr, cur_func->ret, xs_sprintf("return value of '%s'", cur_func->name));
-        } else if (ty_is_undef(cur_func->ret)) { /* return; in f(): undefined: its one value */
+        } else if (ty_is_undef(cur_func->ret) || (cur_func->ret->kind == TY_UNKNOWN && !cur_func->is_gen)) {
+            /* return; in f(): undefined (its one value), or in f(): any / unknown: undefined, as TypeScript allows (a JSON
+               replacer's `return;` leaves the member out: the str marks it for json_undef_expr) */
             s->expr = xs_alloc(sizeof *s->expr);
             s->expr->kind = E_NULL; s->expr->pos = s->pos; s->expr->field = -1;
+            if (!ty_is_undef(cur_func->ret)) s->expr->str = "undefined";
             check_expr(s->expr, cur_func->ret);
         } else if (cur_func->ret->kind != TY_VOID && !cur_func->is_gen) {
             xs_error(XS8059, s->pos, NULL, "'%s' must return a value of type %s", cur_func->name, ty_name(cur_func->ret));
