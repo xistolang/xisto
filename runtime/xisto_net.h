@@ -504,6 +504,8 @@ struct xs_coro {
     void (*entry)(void *); void *arg;
     bool holds_lock;
     bool unref;               /* socket.unref(): it does not keep the program alive (not counted in xs_tasks_live) */
+    bool starting;            /* a promise's coroutine running from its call (xs_promise_spawn) until its first wait: an
+                                 await there gives the caller its turn, as Node's async function does */
     bool wwait;               /* parked until its socket is writable: counted even when unref'd */
     bool kill;                /* the program is ending with it parked, unref'd: it unwinds when resumed */
     void (*on_done)(struct xs_coro *); /* not a request: what to do when it finishes (Promise.all tasks) */
@@ -969,32 +971,49 @@ static void xs_task_done(xs_coro *co) {
 static void xs_task_after(xs_coro *co) { if (co->done && co->on_done) co->on_done(co); }
 static bool xs_par_settled(xs_tgroup *g) { return g->mode == 1 ? g->winner >= 0 : g->pending == 0; }
 /* runs the loop from plain code until stop() (or nothing more can happen) */
-/* runs the ready coroutines (microtasks, woken tasks), the nextTick callbacks first, until none is left */
+/* runs the ready coroutines (microtasks, woken tasks) and the nextTick callbacks until none is left, as Node's
+   processTicksAndRejections: every nextTick callback (those they queue too), then every microtask (those they queue
+   too: a nextTick a microtask queues waits for the microtasks), and again while either has more */
 static void xs_run_ready(void (*after)(xs_coro *)) {
     while (xs_ready_head || xs_tick_head) {
-        xs_coro *co;
-        if (xs_esm_first && !xs_ready_head) xs_esm_first = false;
-        if (xs_tick_head && !xs_esm_first) { /* process.nextTick first */
-            co = xs_tick_head;
-            xs_tick_head = co->next;
-            if (!xs_tick_head) xs_tick_tail = NULL;
-        } else {
-            co = xs_ready_head;
+        if (!xs_esm_first)
+            while (xs_tick_head) {
+                xs_coro *co = xs_tick_head;
+                xs_tick_head = co->next;
+                if (!xs_tick_head) xs_tick_tail = NULL;
+                xs_coro_resume(co);
+                after(co);
+            }
+        while (xs_ready_head) {
+            xs_coro *co = xs_ready_head;
             xs_ready_head = co->next;
             if (!xs_ready_head) xs_ready_tail = NULL;
+            xs_coro_resume(co);
+            after(co);
         }
-        xs_coro_resume(co);
-        after(co);
+        xs_esm_first = false;
     }
 }
-/* the check phase: the immediates queued so far go to the ready list (those they queue wait for the next one) */
+/* the check phase: the immediates queued so far (those they queue wait for the next one), each followed by the
+   nextTick callbacks and microtasks it queued, as Node's */
+static XS_TLS xs_coro *xs_chk_head;
+static XS_TLS xs_coro *xs_chk_tail;
 static bool xs_imm_phase(void) {
     if (!xs_imm_head) return false;
-    xs_coro *first = xs_imm_head, *last = xs_imm_tail;
+    if (xs_chk_tail) xs_chk_tail->next = xs_imm_head; else xs_chk_head = xs_imm_head;
+    xs_chk_tail = xs_imm_tail;
     xs_imm_head = xs_imm_tail = NULL;
-    if (xs_ready_tail) xs_ready_tail->next = first; else xs_ready_head = first;
-    xs_ready_tail = last;
     return true;
+}
+static void xs_run_check(void (*after)(xs_coro *)) {
+    while (xs_chk_head) {
+        xs_coro *co = xs_chk_head;
+        xs_chk_head = co->next;
+        if (!xs_chk_head) xs_chk_tail = NULL;
+        xs_coro_resume(co);
+        after(co);
+        xs_run_ready(after);
+    }
 }
 /* What console.log left in stdio's buffer goes out before the loop waits. Writing to a pipe or a file, stdio holds a
    full buffer: a server or a timer program that logs a few lines and then waits for the next event kept them there
@@ -1017,10 +1036,11 @@ XS_NOINLINE void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_m
     for (;;) {
         xs_run_ready(xs_task_after);
         xs_esm_first = false;
-        /* the immediates queued so far go to the ready list for the next turn: this one still goes through the timers
-           and the events (kevent does not wait while there are ready tasks), so an immediate that queues another
-           cannot hold them back (Node's phases: timers, poll, check) */
+        /* the check phase (Node's phases: timers, poll, check): the immediates queued until now, each with the
+           ticks and microtasks it queues; those they queue wait for the next turn, which still goes through the timers
+           and the events, so an immediate that queues another cannot hold them back */
         xs_imm_phase();
+        xs_run_check(xs_task_after);
         xs_coro_flush_dead();
         xs_unh_check();
         if (stop && stop(arg)) return;
@@ -1028,14 +1048,15 @@ XS_NOINLINE void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_m
         if (deadline_ms >= 0) { wait = deadline_ms - (int64_t)xs_date_now(); if (wait <= 0) return; }
         if (!stop && xs_tasks_live == 0 && deadline_ms < 0) return;
         struct timespec ts = {wait / 1000, (wait % 1000) * 1000000}, tt;
-        if (!stop && deadline_ms < 0 && !xs_ready_head && xs_fd_waits == 0 && !xs_tmr_timeout(&tt)) {
+        if (!stop && deadline_ms < 0 && !xs_ready_head && !xs_imm_head && xs_fd_waits == 0 && !xs_tmr_timeout(&tt)) {
             xs_preg_drop(); /* (the program's end: reactions left on promises nothing can settle any more, as Node exits with them) */
             return;
         }
         bool has_w = wait >= 0;
         if (xs_tmr_timeout(&tt) && (!has_w || tt.tv_sec < ts.tv_sec || (tt.tv_sec == ts.tv_sec && tt.tv_nsec < ts.tv_nsec))) { ts = tt; has_w = true; }
-        if (!xs_ready_head) xs_stdout_before_wait();
-        int n = kevent(xs_kq, NULL, 0, evs, 64, xs_ready_head ? &(struct timespec){0, 0} : has_w ? &ts : NULL);
+        bool busy = xs_ready_head || xs_tick_head || xs_imm_head;
+        if (!busy) xs_stdout_before_wait();
+        int n = kevent(xs_kq, NULL, 0, evs, 64, busy ? &(struct timespec){0, 0} : has_w ? &ts : NULL);
         xs_batch++;
         if (n < 0) { if (errno == EINTR) continue; xs_panic("kevent failed"); }
         xs_tmr_fire(xs_task_after);
@@ -1049,6 +1070,7 @@ XS_NOINLINE void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_m
             if (!co) continue; /* plain code waiting on its socket (xs_wait_fd_loop): it sees fired */
             xs_coro_resume(co);
             if (co->done && co->on_done) co->on_done(co);
+            xs_run_ready(xs_task_after); /* (each I/O callback followed by its ticks and microtasks, as Node's) */
         }
     }
 }
@@ -1135,14 +1157,19 @@ XS_NOINLINE void xs_tasks_drain(void) {
    the order their promises settle. await of a pending promise parks the coroutine (from plain code, runs the loop);
    a rejection nobody handles ends the program as Node does (exit code 1). */
 typedef struct xs_promise xs_promise;
-typedef struct xs_pwait { xs_coro *co; struct xs_pwait *next; } xs_pwait; /* on the heap: a parked task's stack moves */
-typedef struct xs_preact {
-    int how;                /* 0 then (ok and/or err), 1 finally (ok, no argument) */
+typedef struct xs_preact xs_preact;
+struct xs_preact {
+    int how;                /* 0 then (ok and/or err), 1 finally (ok, no argument); the runtime's own: 2 ok called with no
+                               argument and dst settled as src (Promise.all/race), 3 an await (co resumes), 4 dst takes src's
+                               outcome, 5 a finally's second step (dst takes the value of fin, or src's rejection) */
     xs_closure *ok, *err;
-    int okk, errk;          /* what each returns: a val kind, 4 nothing, 5 a promise (awaited) */
+    int okk, errk;          /* what each returns: a val kind, 4 nothing, 5 a promise; + 8: an async callback's value (as
+                               a promise it resolves: two more turns before the next promise settles, as Node's) */
     xs_promise *src, *dst;
+    xs_promise *fin;        /* (5) the promise finally was called on */
+    xs_coro *co;            /* (3) the coroutine waiting */
     struct xs_preact *next;
-} xs_preact;
+};
 struct xs_promise {
     xs_hdr hdr;
     int8_t state;           /* 0 pending, 1 fulfilled, 2 rejected */
@@ -1150,7 +1177,6 @@ struct xs_promise {
     bool handled, in_unh;
     xs_val val;             /* fulfilled: owned when a reference */
     void *err;              /* rejected: the Error, owned */
-    xs_pwait *waiters;
     xs_preact *reacts, *reacts_tail;
     xs_promise *unh_next;
     int32_t reg_ix;         /* + 1: its place in xs_preg while it is pending with reactions */
@@ -1207,8 +1233,6 @@ static void xs_unh_drop(xs_promise *p) {
 }
 XS_NOINLINE void xs_preact_sched(xs_preact *r);
 XS_NOINLINE void xs_promise_settled(xs_promise *p) {
-    for (xs_pwait *w = p->waiters, *n; w; w = n) { n = w->next; xs_ready_push(w->co); free(w); }
-    p->waiters = NULL;
     xs_preact *r = p->reacts;
     p->reacts = p->reacts_tail = NULL;
     xs_preg_del(p);
@@ -1302,7 +1326,9 @@ XS_NOINLINE xs_promise *xs_promise_spawn(int kind, xs_val (*run)(void *), void (
     xs_coro *co = xs_coro_new(xs_spawn_entry, s);
     co->on_done = xs_spawn_done;
     xs_tasks_live++;
+    co->starting = true;
     xs_coro_resume_any(co); /* runs until its first wait, as an async function does */
+    co->starting = false;
     if (co->done) { co->on_done(co); if (!xs_cur_coro) xs_coro_flush_dead(); }
     return p;
 }
@@ -1327,6 +1353,7 @@ XS_NOINLINE xs_promise *xs_promise_rejected(int kind, void *err) {
 }
 
 /* await p */
+XS_NOINLINE void xs_preact_add(xs_promise *p, xs_preact *r);
 static bool xs_promise_stop(void *p) {
     xs_promise *q = p;
     if (q->state != 0) return true;
@@ -1346,15 +1373,17 @@ XS_NOINLINE xs_val xs_promise_await(xs_promise *p) {
     p->handled = true;
     xs_unh_drop(p);
     if (xs_cur_coro && xs_kq >= 0) {
-        if (p->state != 0 && xs_ready_head) { xs_ready_push(xs_cur_coro); xs_coro_yield(); } /* one tick: the reactions queued before go first */
-        while (p->state == 0) {
-            xs_pwait *w = malloc(sizeof *w);
-            w->co = xs_cur_coro;
-            w->next = NULL;
-            xs_pwait **pp = &p->waiters;
-            while (*pp) pp = &(*pp)->next;
-            *pp = w;
-            xs_coro_yield();
+        /* as Node's await: a reaction on p, its turn one microtask after p settles (at once when it has: the reactions
+           queued before go first; the caller that started this coroutine goes on meanwhile) */
+        if (p->state != 0) { /* (when nothing else could run in between, the turn is not taken: no cost) */
+            if (xs_ready_head || xs_tick_head || xs_cur_coro->starting) { xs_cur_coro->starting = false; xs_ready_push(xs_cur_coro); xs_coro_yield(); }
+        } else {
+            xs_cur_coro->starting = false;
+            xs_preact *r = calloc(1, sizeof *r);
+            r->how = 3;
+            r->co = xs_cur_coro;
+            xs_preact_add(p, r);
+            while (p->state == 0) xs_coro_yield();
         }
     } else if (p->state == 0 || xs_ready_head) {
         if (xs_kq < 0) xs_kq = kqueue();
@@ -1375,6 +1404,34 @@ XS_NOINLINE int64_t xs_promise_await_i(xs_promise *p) { return xs_promise_await(
 XS_NOINLINE bool xs_promise_await_b(xs_promise *p) { return xs_promise_await(p).i != 0; }
 XS_NOINLINE void *xs_promise_await_p(xs_promise *p) { return p ? xs_promise_await(p).p : NULL; } /* (await of null: null) */
 XS_NOINLINE void xs_promise_await_v(xs_promise *p) { if (p) (void)xs_promise_await(p); }
+/* await of a value that is no promise (await null): on a coroutine, a turn after the microtasks queued before (the
+   caller that started it goes on meanwhile), as Node's; plain code goes on at once */
+XS_NOINLINE void xs_await_tick(void) {
+    if (xs_cur_coro && xs_kq >= 0 && (xs_ready_head || xs_tick_head || xs_cur_coro->starting)) {
+        xs_cur_coro->starting = false;
+        xs_ready_push(xs_cur_coro);
+        xs_coro_yield();
+    }
+}
+/* after `await f()` with f an async function called directly: the turn its promise would take, while the coroutine is
+   still running from its call (its caller goes on first, as with Node); later on, no turn (no cost) */
+XS_NOINLINE void xs_await_call_tick(void) {
+    if (xs_cur_coro && xs_cur_coro->starting && xs_kq >= 0) { xs_cur_coro->starting = false; xs_ready_push(xs_cur_coro); xs_coro_yield(); }
+}
+/* the value of a promise that has settled (Promise.all's, once all have): no turn of the loop, its rejection thrown */
+XS_NOINLINE xs_val xs_promise_got(xs_promise *p) {
+    if (!p) return (xs_val){0};
+    if (p->state == 0) return xs_promise_await(p);
+    if (p->state == 2) xs_throw(xs_retain_(p->err));
+    xs_val v = p->val;
+    if (p->kind == 3) xs_retain_(v.p);
+    return v;
+}
+XS_NOINLINE double xs_promise_got_d(xs_promise *p) { return xs_promise_got(p).d; }
+XS_NOINLINE int64_t xs_promise_got_i(xs_promise *p) { return xs_promise_got(p).i; }
+XS_NOINLINE bool xs_promise_got_b(xs_promise *p) { return xs_promise_got(p).i != 0; }
+XS_NOINLINE void *xs_promise_got_p(xs_promise *p) { return xs_promise_got(p).p; }
+XS_NOINLINE void xs_promise_got_v(xs_promise *p) { (void)xs_promise_got(p); }
 
 /* calls a callback: argument of kind ak (5: none), result of kind rk (4: none, 5: a promise, awaited) */
 XS_NOINLINE xs_val xs_pcall(xs_closure *cl, int ak, xs_val a, int rk) {
@@ -1393,6 +1450,7 @@ XS_NOINLINE xs_val xs_pcall(xs_closure *cl, int ak, xs_val a, int rk) {
     case 2: XS_PCALL(bool, v.i =) break;
     case 3: XS_PCALL(void *, v.p =) break;
     case 4: XS_PCALL(void, ) break;
+    case 6: XS_PCALL(void *, v.p =) break; /* (a promise, given back as it is) */
     default: {
         XS_PCALL(void *, v.p =)
         xs_promise *q = v.p;
@@ -1407,19 +1465,79 @@ XS_NOINLINE xs_val xs_pcall(xs_closure *cl, int ak, xs_val a, int rk) {
 #undef XS_PCALL
     return v;
 }
+/* d takes the outcome of s (a value of s->kind given as d->kind) */
+XS_NOINLINE void xs_promise_take(xs_promise *d, xs_promise *s) {
+    if (s->state == 2) { xs_promise_reject(d, xs_retain_(s->err)); return; }
+    xs_val v = s->val;
+    if (s->kind == 3) { if (d->kind == 3) xs_retain_(v.p); else v.p = NULL; }
+    xs_promise_fulfill(d, v);
+}
+/* resolving d with the promise q a callback returned (NewPromiseResolveThenableJob): a microtask later, d follows q */
+typedef struct { xs_promise *q, *d; xs_promise *fin; int how; } xs_padopt;
+XS_NOINLINE void xs_padopt_run(void *x) {
+    xs_padopt *a = x;
+    xs_preact *r = calloc(1, sizeof *r);
+    r->how = a->how;
+    r->src = a->q; /* (the references move to the reaction) */
+    r->dst = a->d;
+    r->fin = a->fin;
+    xs_tasks_live++;
+    xs_preact_add(a->q, r);
+}
+static void xs_padopt_done(xs_coro *co) {
+    void *a = co->arg;
+    xs_tasks_live--;
+    xs_coro_recycle(co);
+    free(a);
+}
+XS_NOINLINE void xs_padopt_sched(xs_promise *q, xs_promise *d, xs_promise *fin, int how) {
+    xs_padopt *a = malloc(sizeof *a);
+    a->q = q; a->d = xs_retain_(d); a->fin = fin; a->how = how;
+    xs_coro *co = xs_coro_new_shared(xs_padopt_run, a);
+    co->on_done = xs_padopt_done;
+    xs_tasks_live++;
+    xs_ready_push(co);
+}
 XS_NOINLINE void xs_preact_run(void *x) {
     xs_preact *r = x;
     xs_promise *s = r->src, *d = r->dst;
+    if (r->how == 4) { xs_promise_take(d, s); return; }
+    if (r->how == 5) { /* finally's second step: the value of the promise finally was called on, or this one's rejection */
+        if (s->state == 2) xs_promise_reject(d, xs_retain_(s->err));
+        else xs_promise_take(d, r->fin);
+        return;
+    }
     size_t mark = xs_ar_mark();
     jmp_buf jb;
     xs_try_push(&jb);
     if (_setjmp(jb) == 0) {
         if (r->how == 1) {
-            xs_val ig = xs_pcall(r->ok, 5, (xs_val){0}, r->okk);
+            /* p.finally(f) as Node's: f(), then Promise.resolve(its result).then(() => p's outcome), which resolves the
+               promise finally gave a microtask later (the steps take Node's turns: XB-254) */
+            xs_promise *q;
+            int fk = r->okk & 7;
+            if (fk == 5) q = xs_pcall(r->ok, 5, (xs_val){0}, 6).p; /* (the promise itself) */
+            else {
+                xs_val ig = xs_pcall(r->ok, 5, (xs_val){0}, fk);
+                if (fk == 3) xs_release_(ig.p);
+                q = xs_promise_resolved_v();
+            }
+            xs_try_pop();
+            xs_promise *p2 = xs_promise_make(d->kind);
+            p2->handled = true;
+            xs_preact *f = calloc(1, sizeof *f);
+            f->how = 5;
+            f->src = q;
+            f->dst = xs_retain_(p2);
+            f->fin = xs_retain_(s);
+            xs_tasks_live++;
+            xs_preact_add(q, f);
+            xs_padopt_sched(p2, d, NULL, 4);
+        } else if (r->how == 2) {
+            xs_val ig = xs_pcall(r->ok, 5, (xs_val){0}, r->okk); /* (the runtime's: a plain kind) */
             if (r->okk == 3) xs_release_(ig.p);
             xs_try_pop();
-            if (s->state == 1) { xs_val v = s->val; if (s->kind == 3) xs_retain_(v.p); xs_promise_fulfill(d, v); }
-            else xs_promise_reject(d, xs_retain_(s->err));
+            xs_promise_take(d, s);
         } else {
             bool ok = s->state == 1;
             xs_closure *cb = ok ? r->ok : r->err;
@@ -1429,10 +1547,20 @@ XS_NOINLINE void xs_preact_run(void *x) {
                 else xs_promise_reject(d, xs_retain_(s->err));
             } else {
                 int ck = ok ? r->okk : r->errk;
-                xs_val v = xs_pcall(cb, ok ? (s->kind == 4 ? 5 : s->kind) : 3, ok ? s->val : (xs_val){.p = s->err}, ck);
+                bool viap = ck & 8;
+                ck &= 7;
+                xs_val v = xs_pcall(cb, ok ? (s->kind == 4 ? 5 : s->kind) : 3, ok ? s->val : (xs_val){.p = s->err}, ck == 5 ? 6 : ck);
                 xs_try_pop();
-                if (d->kind == 4 && ck == 3 && v.p) { xs_release_(v.p); v.p = NULL; } /* a dropped promise's value */
-                xs_promise_fulfill(d, v);
+                if (ck == 5 && v.p) xs_padopt_sched(v.p, d, NULL, 4); /* a promise: d follows it, a microtask later (as Node) */
+                else if (ck == 5) xs_promise_fulfill(d, (xs_val){0});
+                else if (viap) { /* an async callback's value: as the promise it resolved */
+                    xs_promise *q = xs_promise_resolved(ck == 4 ? 4 : ck, v);
+                    if (ck == 3 && v.p) xs_release_(v.p);
+                    xs_padopt_sched(q, d, NULL, 4);
+                } else {
+                    if (d->kind == 4 && ck == 3 && v.p) { xs_release_(v.p); v.p = NULL; } /* a dropped promise's value */
+                    xs_promise_fulfill(d, v);
+                }
             }
         }
     } else {
@@ -1440,20 +1568,34 @@ XS_NOINLINE void xs_preact_run(void *x) {
     }
     xs_ar_drain(mark);
 }
-static void xs_preact_done(xs_coro *co) {
-    xs_preact *r = co->arg;
-    xs_tasks_live--;
-    xs_coro_recycle(co);
+static void xs_preact_free(xs_preact *r) {
     xs_release_(r->src);
     xs_release_(r->dst);
+    if (r->fin) xs_release_(r->fin);
     if (r->ok) xs_release_(r->ok);
     if (r->err) xs_release_(r->err);
     free(r);
 }
+static void xs_preact_done(xs_coro *co) {
+    xs_preact *r = co->arg;
+    xs_tasks_live--;
+    xs_coro_recycle(co);
+    xs_preact_free(r);
+}
 XS_NOINLINE void xs_preact_sched(xs_preact *r) {
+    if (r->how == 3) { xs_ready_push(r->co); free(r); return; } /* (an await: its coroutine's turn) */
     xs_coro *co = xs_coro_new_shared(xs_preact_run, r);
     co->on_done = xs_preact_done;
     xs_ready_push(co);
+}
+/* r on p: a microtask now if p has settled, else when it does (in the order the reactions were added) */
+XS_NOINLINE void xs_preact_add(xs_promise *p, xs_preact *r) {
+    if (p->state != 0) xs_preact_sched(r);
+    else {
+        if (p->reacts_tail) p->reacts_tail->next = r; else p->reacts = r;
+        p->reacts_tail = r;
+        xs_preg_add(p);
+    }
 }
 /* p.then(ok, err) / p.catch(err) / p.finally(ok): the new promise (kind dk) */
 XS_NOINLINE xs_promise *xs_promise_then(xs_promise *p, int how, xs_closure *ok, int okk, xs_closure *err, int errk, int dk) {
@@ -1471,12 +1613,7 @@ XS_NOINLINE xs_promise *xs_promise_then(xs_promise *p, int how, xs_closure *ok, 
     xs_tasks_live++;
     p->handled = true;
     xs_unh_drop(p);
-    if (p->state != 0) xs_preact_sched(r);
-    else {
-        if (p->reacts_tail) p->reacts_tail->next = r; else p->reacts = r;
-        p->reacts_tail = r;
-        xs_preg_add(p);
-    }
+    xs_preact_add(p, r);
     return d;
 }
 /* the program's end with reactions left on promises nothing can settle any more (a timer cleared, a race's loser):
@@ -1489,12 +1626,9 @@ static void xs_preg_drop(void) {
         p->reacts = p->reacts_tail = NULL;
         for (xs_preact *n; r; r = n) {
             n = r->next;
+            if (r->how == 3) { free(r); continue; } /* (an await that cannot end: its coroutine stays parked) */
             xs_tasks_live--;
-            if (r->ok) xs_release_(r->ok);
-            if (r->err) xs_release_(r->err);
-            xs_release_(r->dst);
-            xs_release_(r->src);
-            free(r);
+            xs_preact_free(r);
         }
     }
 }
@@ -1518,7 +1652,7 @@ XS_NOINLINE xs_promise *xs_promise_race_arr(xs_arr_ref *ps) {
         cl->c.fn = (void *)xs_prace_cb;
         cl->to = xs_retain_(to);
         cl->from = xs_retain_(q);
-        xs_promise *d = xs_promise_then(q, 1, &cl->c, 4, NULL, 4, q->kind);
+        xs_promise *d = xs_promise_then(q, 2, &cl->c, 4, NULL, 4, q->kind);
         d->handled = true;
         xs_release_(d);
         xs_release_(cl);
@@ -1547,7 +1681,7 @@ XS_NOINLINE xs_promise *xs_promise_all_arr(xs_arr_ref *ps) {
         cl->c.fn = (void *)xs_pall_cb;
         cl->to = xs_retain_(to);
         cl->from = xs_retain_(q);
-        xs_promise *d = xs_promise_then(q, 1, &cl->c, 4, NULL, 4, q->kind); /* (marks q handled) */
+        xs_promise *d = xs_promise_then(q, 2, &cl->c, 4, NULL, 4, q->kind); /* (marks q handled) */
         d->handled = true;
         xs_release_(d);
         xs_release_(cl);
@@ -3397,14 +3531,16 @@ XS_NOINLINE void *xs_server_worker(void *arg) {
             _exit(0);
         }
         xs_run_ready(xs_coro_after); /* coroutines woken by a channel, microtasks, nextTick callbacks */
-        xs_imm_phase();              /* (setImmediate's: run next turn, after this turn's timers and events) */
+        xs_run_check(xs_coro_after); /* (setImmediate's: the check phase, those queued before the last wait) */
+        xs_imm_phase();
         xs_coro_flush_dead();
         xs_clients_flush_dead();
         struct timespec zero = {0, 0}, tick = {0, 200000000}, tt;
         bool has_t = xs_tmr_timeout(&tt);
         if (xs_shutting_down && (!has_t || tt.tv_sec > 0 || tt.tv_nsec > tick.tv_nsec)) { tt = tick; has_t = true; }
-        if (!xs_ready_head) xs_stdout_before_wait();
-        int n = kevent(kq, NULL, 0, events, 256, xs_ready_head ? &zero : has_t ? &tt : NULL);
+        bool busy = xs_ready_head || xs_tick_head || xs_chk_head;
+        if (!busy) xs_stdout_before_wait();
+        int n = kevent(kq, NULL, 0, events, 256, busy ? &zero : has_t ? &tt : NULL);
         xs_loop_ns = xs_now();
         xs_batch++;
         if (xs_shutting_down && xs_shutdown_t0 && xs_now() - xs_shutdown_t0 > 10000000000ull) { /* handlers parked forever: give up after 10 s */

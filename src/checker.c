@@ -4501,6 +4501,7 @@ static void check_pr_member(Expr *e, Type *expected) {
         if (ok->type->kind != TY_FUNC) xs_error(XS8018, ok->pos, NULL, "the argument of %s must be a function, but this is %s", m, ty_name(ok->type));
         okr = ok->type->ret;
         okk = pr_cb_kind(&okr);
+        if (okk != 5 && ok->kind == E_ARROW && (ok->arrow->fn->is_async || ok->arrow->fn->ret_promise)) okk |= 8; /* (its value through a promise: Node's two more turns) */
         if (!how) R = okr;
     }
     if (err) {
@@ -4515,6 +4516,7 @@ static void check_pr_member(Expr *e, Type *expected) {
         if (err->type->kind != TY_FUNC) xs_error(XS8018, err->pos, NULL, "the argument of %s must be a function, but this is %s", m, ty_name(err->type));
         errr = err->type->ret;
         errk = pr_cb_kind(&errr);
+        if (errk != 5 && err->kind == E_ARROW && (err->arrow->fn->is_async || err->arrow->fn->ret_promise)) errk |= 8;
         if (never && errr->kind == TY_VOID) errr = R; /* it returns nothing because it never returns */
         if (!ty_equal(errr, R) && discard) R = ty_void; /* the promise it makes is dropped: no one type needed */
         else if (!ty_equal(errr, R)) {
@@ -8994,6 +8996,9 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (k != 3 && k != 4) xs_error(XS2006, e->pos, "check it first: if (p !== null) await p;", "awaiting a %s that may be null", ty_name(e->lhs->type));
             wrap_call(e->lhs, k == 4 ? "xs_promise_await_v" : "xs_promise_await_p", k == 4 ? ty_void : ty_nullable_of(ty_strip_null(t)));
         }
+        else if (!pr_async_call(e->lhs) && !(e->lhs->kind == E_CALL && e->lhs->func && e->lhs->func->is_async))
+            e->await_tick = 1; /* (await null, await of a plain value: a microtask turn) */
+        else e->await_tick = 2; /* (an async function called here runs as a call: its promise's turn only while the coroutine starts) */
         e->type = e->lhs->type;
         { /* await queryOne<Row>(sql): what the await gives, as a Row */
             Expr *c = e->lhs->kind == E_SPAWN ? e->lhs->lhs : e->lhs;

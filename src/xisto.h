@@ -351,6 +351,8 @@ struct Expr {
     bool par_native;   /* E_CALL of xisto:parallel whose fn was proved independent (parallel.c): the pool version */
     bool rng_set;      /* E_IDENT: a range the pass that built it proved (distribute.c's pair slot counter) */
     bool loose;        /* E_BINARY: written == or != (the same as === / !== when no coercion could happen) */
+    uint8_t await_tick; /* E_AWAIT: 1 of a value that is no promise (await null): one turn of the microtasks, as Node's,
+                          on a coroutine (emit.c, xs_await_tick); 2 of an async function called directly (xs_await_call_tick) */
     long long rng_lo, rng_hi;
     Type *gen_ret;     /* E_CALL of a generic function value with type arguments (f<Row>(x)): the result type its
                           signature gives; the unknown it returns is converted to it (here, or by the await around it) */

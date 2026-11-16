@@ -2795,13 +2795,13 @@ static void emit_promise(Expr *e) {
         }
         /* (XB-204: first all settled, or the first rejection, with every promise handled meanwhile; then the values) */
         buf_printf(out, "xs_promise_await_v(xs_ar(xs_promise_all_arr(pa%d_))); ", id);
-        if (k == 4) { buf_printf(out, "for (size_t i_ = 0; i_ < pa%d_->len; i_++) xs_promise_await_v(pa%d_->data[i_]); })", id, id); return; }
+        if (k == 4) { buf_printf(out, "for (size_t i_ = 0; i_ < pa%d_->len; i_++) xs_promise_got_v(pa%d_->data[i_]); })", id, id); return; }
         Type *at = e->type;
         if (arr_is_ref(at))
             buf_printf(out, "xs_arr_ref *pr%d_ = xs_arr_ref_new(pa%d_->len, %s); ", id, id, elem_printer(t));
         else
             buf_printf(out, "%s *pr%d_ = %s_new(0, 0); ", arr_struct(at), id, arr_struct(at));
-        buf_printf(out, "for (size_t i_ = 0; i_ < pa%d_->len; i_++) %s_push(pr%d_, xs_promise_await_%s(pa%d_->data[i_])); pr%d_; })",
+        buf_printf(out, "for (size_t i_ = 0; i_ < pa%d_->len; i_++) %s_push(pr%d_, xs_promise_got_%s(pa%d_->data[i_])); pr%d_; })",
                    id, arr_is_ref(at) ? "xs_arr_ref" : arr_struct(at), id, sf, id, id);
         return;
     }
@@ -3413,7 +3413,15 @@ static void emit_expr_raw(Expr *e) {
         return;
     }
     case E_THIS: buf_puts(out, ren(e->cname ? e->cname : "self")); return;
-    case E_AWAIT: emit_expr(e->lhs); return;
+    case E_AWAIT:
+        if (e->await_tick && (prog->uses_net || prog->uses_gen)) { /* the microtask turn Node's await takes, on a coroutine */
+            const char *tk = e->await_tick == 1 ? "xs_await_tick" : "xs_await_call_tick";
+            if (e->type->kind == TY_VOID) { buf_puts(out, "({ "); emit_expr(e->lhs); buf_printf(out, "; %s(); })", tk); return; }
+            buf_puts(out, "({ __auto_type at_ = ("); emit_expr(e->lhs); buf_printf(out, "); %s(); at_; })", tk);
+            return;
+        }
+        emit_expr(e->lhs);
+        return;
     case E_SPAWN: emit_spawn(e); return;
     case E_NULL: buf_puts(out, e->type ? null_value(e->type) : "NULL"); return;
     case E_UPCAST: /* a subclass as its base: the same object */
