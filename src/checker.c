@@ -9043,7 +9043,10 @@ static void check_expr_in(Expr *e, Type *expected) {
             v->type = b->orig;
             /* (a variable in a cell, or a module variable a function assigns: a call made since the test may have assigned
                another member, as TypeScript does not look; the read is checked, a TypeError then, as a field path's) */
-            if ((b->cell || b->fn_assigned) && b->orig && b->orig->kind == TY_UNION && b->type->kind == TY_OBJECT) {
+            /* (x: Shape, an interface or a base class, narrowed by x instanceof Sq: read as x as Sq) */
+            Type *ob = b->orig && b->orig->kind == TY_NULLABLE ? b->orig->elem : b->orig;
+            if (b->orig && b->type->kind == TY_OBJECT && (((b->cell || b->fn_assigned) && b->orig->kind == TY_UNION) ||
+                                                          (ob->kind == TY_OBJECT && ob->cls && !ob->cls->builtin))) {
                 v->prechecked = true;
                 memset(e, 0, sizeof *e);
                 e->kind = E_AS; e->pos = v->pos; e->lhs = v; e->field = -1; e->elem_type = b->type;
@@ -15642,6 +15645,16 @@ static UNarrow union_narrow(Expr *c) {
         r.b = b;
         r.then_t = ty_object_of(c->rhs->cls);
         return r;
+    }
+    if (how == 2 && c->rhs->cls && !c->rhs->cls->is_interface && !c->rhs->cls->builtin && !(c->rhs->cls->ntparams && !c->rhs->cls->generic_of)) {
+        /* x: Shape (an interface, or a base class; or either | null): x instanceof Sq makes it an Sq there (XB-166) */
+        Type *t = b->type->kind == TY_NULLABLE ? b->type->elem : b->type;
+        if (t->kind == TY_OBJECT && t->cls && !t->cls->builtin && t->cls != c->rhs->cls && !is_error_class(t->cls) &&
+            (t->cls->is_interface || is_subclass(c->rhs->cls, t->cls))) {
+            r.b = b;
+            if (neg) r.else_t = ty_object_of(c->rhs->cls); else r.then_t = ty_object_of(c->rhs->cls);
+            return r;
+        }
     }
     if (b->type->kind == TY_UNKNOWN && (how == 1 || how == 2)) { /* x: unknown (or any): x instanceof C / typeof x === "string" */
         Type *t = NULL;
