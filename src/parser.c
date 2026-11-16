@@ -7397,7 +7397,7 @@ static const char xs_arrays_src[] =
     "  return out;\n"
     "}\n"
     "export function __xs_truncate<T>(xs: T[], n: int): int {\n"
-    "  if (n > xs.length) throw new Error(\"RangeError: xisto cannot make an array longer by setting its length\");\n"
+    "  if (n > xs.length) throw new Error(`RangeError: xisto cannot make an array longer by setting its length (from ${xs.length} to ${n}): add the elements with push(...), or make the array at its size with new Array(n).fill(value)`);\n"
     "  while (xs.length > n) xs.pop();\n"
     "  return n;\n"
     "}\n"

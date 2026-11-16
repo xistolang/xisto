@@ -36,6 +36,12 @@ indices are
 `int`, as everywhere in xisto. `s.isWellFormed()` is `true` and `s.toWellFormed()` is `s`: a string of xisto is
 UTF-8 and cannot hold a lone surrogate.
 
+Setting `xs.length` cuts an array (`xs.length = 0` empties it), as in Node, but it never makes one longer: xisto
+arrays have no holes. Where the compiler knows the array's length (`const xs = [1, 2]` or
+`new Array(3).fill(0)`, with no other use of `xs` before the assignment, and the new length an integer literal or a
+`const` of one) a longer length is error XS6052; elsewhere it is a `RangeError` at run time. Both say what to write
+instead: `push(...)` to add elements, or `new Array(n).fill(value)` for an array of a given size.
+
 ## Object
 
 ```ts

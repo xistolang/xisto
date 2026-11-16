@@ -142,6 +142,7 @@ DIAG(XS6048, DC_UNSUPPORTED, "%s.apply takes its arguments as an array literal h
 DIAG(XS6049, DC_UNSUPPORTED, "a symbol key here must be a constant made by Symbol(\"description\")")
 DIAG(XS6050, DC_UNSUPPORTED, "import() takes a string literal: a native binary knows its modules when it is built")
 DIAG(XS6051, DC_UNSUPPORTED, "the module of import() is read through its names (m.x), not as a value")
+DIAG(XS6052, DC_UNSUPPORTED, "setting the length of '%s' to %lld makes it longer (its length is %lld here): xisto arrays do not grow by their length")
 DIAG(XS7001, DC_RUNTIME_API, "Array.%s takes one argument here")
 DIAG(XS7002, DC_RUNTIME_API, "BigInt() converts int, number or string, but this is %s")
 DIAG(XS7003, DC_RUNTIME_API, "BigInt() takes exactly one argument")

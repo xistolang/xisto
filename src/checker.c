@@ -20994,7 +20994,143 @@ static void link_base(Class *c) {
     b->subs = realloc(b->subs, sizeof(Class *) * (size_t)(b->nsubs + 1));
     b->subs[b->nsubs++] = c;
 }
+/* ---- xs.length = N making a known array longer (XS6052) ----
+   Isa's decision for array-sparse-push: an array does not grow by its length. When the compiler can tell (N an integer
+   literal, or a const of one, and xs's length known where it is set: right after [a, b], new Array(k)
+   or new Array(k).fill(v), with no other use of xs in between), it is a compile error; otherwise the run-time
+   RangeError of __xs_truncate. Shrinking (and length = 0) stays as JavaScript has it. */
+typedef struct { const char *name; long long len; } LgVar;
+static bool lg_int_lit(Expr *e, long long *v) {
+    if (e && e->kind == E_NUMBER && e->is_int_lit) { *v = (long long)e->num; return true; }
+    return false;
+}
+/* the length an initializer gives, or -1 */
+static long long lg_init_len(Expr *e) {
+    if (!e) return -1;
+    if (e->kind == E_ARRAY_LIT) return e->spread ? -1 : e->args.len;
+    long long n;
+    if (e->kind == E_MEMBER && e->is_call && e->str && !strcmp(e->str, "fill") && e->lhs) e = e->lhs; /* new Array(k).fill(v) */
+    if (e->kind == E_NEW_ARRAY && lg_int_lit(e->lhs, &n) && n >= 0) return n;
+    return -1;
+}
+static bool lg_mentions_e(Expr *e, const char *name);
+static bool lg_mentions_s(Stmt *s, const char *name) {
+    if (!s) return false;
+    if (s->kind == S_VAR && s->name && !strcmp(s->name, name)) return true; /* (shadowed: stop) */
+    if (lg_mentions_e(s->init, name) || lg_mentions_e(s->expr, name) || lg_mentions_e(s->cond, name) || lg_mentions_e(s->for_update, name)) return true;
+    if (lg_mentions_s(s->for_init, name) || lg_mentions_s(s->body, name) || lg_mentions_s(s->else_body, name)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (lg_mentions_s(s->stmts.items[i], name)) return true;
+    for (int i = 0; i < s->ncases; i++) if (lg_mentions_e(s->cases[i].value, name) || lg_mentions_s(s->cases[i].body, name)) return true;
+    return false;
+}
+static bool lg_mentions_e(Expr *e, const char *name) {
+    if (!e) return false;
+    if (e->kind == E_IDENT && e->str && !strcmp(e->str, name)) return true;
+    if (e->kind == E_ARROW) return true; /* (a closure may hold it: no longer known) */
+    if (lg_mentions_e(e->lhs, name) || lg_mentions_e(e->rhs, name)) return true;
+    for (int i = 0; i < e->args.len; i++) if (lg_mentions_e(e->args.items[i], name)) return true;
+    return false;
+}
+static void lg_scan(Stmt *s);
+static Module *lg_mod; /* the module being scanned, and its top-level consts of integer literals (const LEN = 4) */
+static LgVar *lg_g;
+static int lg_ng;
+static Module **lg_gm;
+static void lg_list(StmtList *l, Module *only) {
+    LgVar *vs = NULL;
+    int nv = 0;
+    LgVar *cs = NULL; /* consts of integer literals */
+    int nc = 0;
+    for (int i = 0; i < l->len; i++) {
+        Stmt *st = l->items[i];
+        if (!st) continue;
+        if (only && st->mod != only) continue;
+        bool handled = false;
+        if (st->kind == S_EXPR && st->expr && st->expr->kind == E_ASSIGN && st->expr->op == TK_ASSIGN) {
+            Expr *t = st->expr->lhs, *r = st->expr->rhs;
+            if (t && t->kind == E_MEMBER && !t->is_call && t->str && !strcmp(t->str, "length") && t->lhs && t->lhs->kind == E_IDENT && t->lhs->str) {
+                long long n = -1;
+                if (!lg_int_lit(r, &n) && r && r->kind == E_IDENT && r->str)
+                    for (int k = 0; k < nc; k++) if (!strcmp(cs[k].name, r->str)) n = cs[k].len;
+                bool byname = r && r->kind == E_IDENT && r->str;
+                bool local = !byname; /* (a name this block declares is not the module's const) */
+                for (int k = 0; k < i && !local; k++) {
+                    Stmt *d = l->items[k];
+                    local = d && d->kind == S_VAR && d->name && !strcmp(d->name, r->str) && (!only || d->mod == only) && only == NULL;
+                }
+                for (int k = 0; n < 0 && !local && k < lg_ng; k++) if (lg_gm[k] == lg_mod && !strcmp(lg_g[k].name, r->str)) n = lg_g[k].len;
+                for (int k = 0; k < nv; k++) {
+                    if (strcmp(vs[k].name, t->lhs->str) != 0) continue;
+                    if (n > vs[k].len)
+                        xs_error(XS6052, st->expr->pos, "add the elements with push(...), or make the array at its size: new Array(n).fill(value)",
+                                 "setting the length of '%s' to %lld makes it longer (its length is %lld here): xisto arrays do not grow by their length",
+                                 vs[k].name, n, vs[k].len);
+                    if (n >= 0) vs[k].len = n; /* (shrunk to n: still known) */
+                    else vs[k] = vs[--nv];
+                    handled = true;
+                    break;
+                }
+            }
+        }
+        if (!handled)
+            for (int k = 0; k < nv; k++)
+                if (lg_mentions_s(st, vs[k].name)) { vs[k] = vs[--nv]; k--; }
+        if (st->kind == S_VAR && st->name) {
+            long long n = lg_init_len(st->init);
+            if (n >= 0) { vs = realloc(vs, sizeof *vs * (size_t)(nv + 1)); vs[nv++] = (LgVar){st->name, n}; }
+            long long c;
+            if (st->is_const && lg_int_lit(st->init, &c)) { cs = realloc(cs, sizeof *cs * (size_t)(nc + 1)); cs[nc++] = (LgVar){st->name, c}; }
+        }
+        lg_scan(st);
+    }
+    free(vs);
+    free(cs);
+}
+static void lg_scan(Stmt *s) {
+    if (!s) return;
+    if (s->kind == S_BLOCK) { lg_list(&s->stmts, NULL); return; }
+    lg_scan(s->body);
+    lg_scan(s->else_body);
+    for (int i = 0; i < s->ncases; i++) lg_scan(s->cases[i].body);
+}
+static void lg_enter(Module *m) { /* (before the module scopes exist: only where errors are reported) */
+    lg_mod = m;
+    xs_file_name = m->file;
+    xs_source = m->src;
+}
+static void lg_program(Program *p) {
+    for (int i = 0; i < p->top.len; i++) {
+        Stmt *st = p->top.items[i];
+        long long c;
+        if (st && st->kind == S_VAR && st->name && st->is_const && lg_int_lit(st->init, &c)) {
+            lg_g = realloc(lg_g, sizeof *lg_g * (size_t)(lg_ng + 1));
+            lg_gm = realloc(lg_gm, sizeof *lg_gm * (size_t)(lg_ng + 1));
+            lg_g[lg_ng] = (LgVar){st->name, c};
+            lg_gm[lg_ng++] = st->mod;
+        }
+    }
+    for (int m = 0; m < p->nmodules; m++) {
+        Module *mod = p->modules[m];
+        if (!mod->file || !strncmp(mod->file, "xisto:", 6)) continue;
+        lg_enter(mod);
+        lg_list(&p->top, mod);
+    }
+    for (int f = 0; f < p->nfuncs; f++)
+        if (p->funcs[f]->mod && p->funcs[f]->mod->file && strncmp(p->funcs[f]->mod->file, "xisto:", 6)) {
+            lg_enter(p->funcs[f]->mod);
+            lg_scan(p->funcs[f]->body);
+        }
+    for (int c = 0; c < p->nclasses; c++) {
+        Class *cl = p->classes[c];
+        if (!cl->mod || !cl->mod->file || !strncmp(cl->mod->file, "xisto:", 6)) continue;
+        lg_enter(cl->mod);
+        for (int m = 0; m < cl->nmethods; m++) lg_scan(cl->methods[m]->body);
+        if (cl->ctor) lg_scan(cl->ctor->body);
+    }
+}
+
 void check_program(Program *p) {
+    lg_program(p);
     for (int i = 0; i < p->nmodules; i++)
         if (p->modules[i]->file && !strcmp(p->modules[i]->file, "xisto:stream/web")) webstreams_global = true;
     prog = p;
