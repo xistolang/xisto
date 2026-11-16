@@ -1904,6 +1904,7 @@ static void json_put_fields(Buf *b, Class *c, const int *ord, int nord) {
     for (int oi = 0; oi < nord; oi++) {
         Field *f = &c->fields[ord ? ord[oi] : oi];
         if (ty_is_undef(f->type)) continue; /* r: undefined: JSON.stringify leaves it out */
+        if (!strncmp(f->name, "__hp_", 5)) continue; /* #x: not an own property: JSON.stringify leaves it out */
         if (json_fn_field(f->type)) continue; /* a function: left out, as JSON.stringify does */
         /* optional fields that are null are left out, like undefined in JSON.stringify (and a value that is a function) */
         bool may_fn = json_may_fn(f->type);
@@ -3035,9 +3036,11 @@ static void emit_dyn_tables(Program *p) {
     for (int i = 0; i < p->nclasses; i++) {
         Class *c = p->classes[i];
         if (!c->used || c->builtin) continue;
-        if (c->nfields) buf_printf(&tabs, "static const xs_dyn_field %s_dynf[] = {\n", c->cname);
-        for (int k = 0; k < c->nfields; k++) dyn_field_entry(p, c, &c->fields[k], &tabs, &fns);
-        if (c->nfields) buf_puts(&tabs, "};\n");
+        int nf = 0; /* (#x fields: not reachable by name, as in JavaScript) */
+        for (int k = 0; k < c->nfields; k++) if (strncmp(c->fields[k].name, "__hp_", 5) != 0) nf++;
+        if (nf) buf_printf(&tabs, "static const xs_dyn_field %s_dynf[] = {\n", c->cname);
+        for (int k = 0; k < c->nfields; k++) if (strncmp(c->fields[k].name, "__hp_", 5) != 0) dyn_field_entry(p, c, &c->fields[k], &tabs, &fns);
+        if (nf) buf_puts(&tabs, "};\n");
         int nm = 0; /* its methods' names, its bases' too (typeof x.toJSON === "function" through an any) */
         for (Class *k = c; k; k = k->base)
             for (int j = 0; j < k->nmethods; j++) {
@@ -3046,7 +3049,7 @@ static void emit_dyn_tables(Program *p) {
                 nm++;
             }
         if (nm) buf_puts(&tabs, "};\n");
-        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s, %d, %d};\n", c->cname, xs_src_name(c->name), c->nfields, c->nfields ? xs_sprintf("%s_dynf", c->cname) : "NULL",
+        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s, %d, %d};\n", c->cname, xs_src_name(c->name), nf, nf ? xs_sprintf("%s_dynf", c->cname) : "NULL",
                    nm, nm ? xs_sprintf("%s_dynm", c->cname) : "NULL", c->is_interface ? 1 : 0, !c->builtin && is_error_class(c) ? 1 : 0);
     }
     for (int i = 0; i < nlit_ords; i++) { /* an object literal's own key order (lit_order): its fields in that order */
@@ -13502,7 +13505,7 @@ static void emit_class_print(Class *c, const char *fname, const int *ord, int no
     /* util.inspect's layout (runtime: xs_insp_*): each field an entry, the container decides lines and depth */
     { /* an object whose fields are all optional and absent prints as an empty one */
         int always = 0, opt = 0;
-        for (int i = 0; i < c->nfields; i++) { if (c->fields[i].optional) opt++; else always++; }
+        for (int i = 0; i < c->nfields; i++) { if (!strncmp(c->fields[i].name, "__hp_", 5)) continue; if (c->fields[i].optional) opt++; else always++; }
         const char *empty_s = plain ? "{}" : xs_sprintf("%s {}", xs_src_name(c->name));
         if (always || !opt) {
             buf_printf(out, "xs_insp fr_; if (!xs_insp_begin(&fr_, p, \"%s\", %s)) return;", plain ? "Object" : xs_src_name(c->name),
@@ -13516,6 +13519,7 @@ static void emit_class_print(Class *c, const char *fname, const int *ord, int no
     for (int oi = 0; oi < nord; oi++) {
         Field *fd = &c->fields[ord ? ord[oi] : oi];
         const char *shown = c->fake && !strncmp(fd->name, "__fake_", 7) ? fd->name + 7 : fd->name;
+        if (!strncmp(fd->name, "__hp_", 5)) continue; /* #x: not shown (Node's inspect leaves hard-private fields out) */
         nl();
         if (fd->optional) buf_printf(out, "if (%s) {", not_null(fd->type, xs_sprintf("self->%s", fd->cname)));
         nl();

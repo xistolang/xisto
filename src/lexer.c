@@ -266,6 +266,16 @@ Token lexer_next(Lexer *lx) {
         return t;
     }
 
+    if (c == '#' && (isalpha((unsigned char)peek(lx, 1)) || peek(lx, 1) == '_' || peek(lx, 1) == '$')) {
+        /* #name: a hard-private member (or `#name in obj`), read as the private member __hp_name; the printers, JSON and
+           Object.keys leave such members out, as Node does */
+        advance(lx);
+        while (isalnum((unsigned char)peek(lx, 0)) || peek(lx, 0) == '_' || peek(lx, 0) == '$') advance(lx);
+        Token t = make(lx, TK_IDENT, pos, start);
+        t.str = xs_sprintf("__hp_%.*s", t.len - 1, t.start + 1);
+        return t;
+    }
+
     if (isdigit((unsigned char)c) || (c == '.' && isdigit((unsigned char)peek(lx, 1)))) {
         if (c == '0' && (peek(lx, 1) == 'x' || peek(lx, 1) == 'X')) {
             advance(lx);

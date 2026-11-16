@@ -13,6 +13,8 @@ typedef struct {
     Module *mod;
     const char *prev_end; /* end of the last token consumed: source spans for reflection */
     bool in_gen;          /* inside a generator body: `yield` is a statement */
+    int hp_id;            /* inside a class body: its number, which names its #private members (__hp_<id>_name) apart from a
+                             base's or a subclass's members of the same name */
     /* import { setTimeout as sleep }: in the rest of the module the alias reads as the exported name */
     char **alias_from, **alias_to;
     int nalias;
@@ -108,6 +110,10 @@ static void next(Parser *p) {
     if (p->nalias && p->tok.kind == TK_IDENT && before != TK_DOT && before != TK_QDOT) /* (o.a: a property, never an import's alias) */
         for (int i = 0; i < p->nalias; i++)
             if (strcmp(p->tok.str, p->alias_from[i]) == 0) { p->tok.str = p->alias_to[i]; break; }
+    if (!p->hp_id && p->tok.kind == TK_IDENT && p->tok.len && p->tok.start[0] == '#')
+        xs_error(XS8055, p->tok.pos, "read it through a method of the class", "'%.*s' is private to the class that declares it", p->tok.len, p->tok.start);
+    if (p->hp_id && p->tok.kind == TK_IDENT && p->tok.len && p->tok.start[0] == '#')
+        p->tok.str = xs_sprintf("__hp_%d_%s", p->hp_id, p->tok.str + 5); /* #x in this class's body: this class's #x */
 }
 /* the source text from `from` to the end of the last consumed token */
 static char *span(Parser *p, const char *from) { return from && p->prev_end > from ? xs_strndup(from, (size_t)(p->prev_end - from)) : xs_sprintf("%s", ""); }
@@ -1458,6 +1464,7 @@ static Expr *parse_primary(Parser *p) {
                 sub.ns_alias = p->ns_alias; sub.ns_import = p->ns_import; sub.nns = p->nns;
                 sub.vt_names = p->vt_names; sub.vt_types = p->vt_types; sub.nvt = p->nvt;
                 sub.this_alias = p->this_alias;
+                sub.hp_id = p->hp_id; /* (${this.#x}) */
                 next(&sub);
                 if (at(&sub, TK_EOF)) xs_error(XS1007, (Pos){line, col}, NULL, "empty ${} in template literal");
                 Expr *inner = parse_expr(&sub);
@@ -3905,6 +3912,9 @@ Class *xs_parse_class_instance(Class *tmpl, Type **args, const char *name) {
 }
 
 static void parse_fields_body(Parser *p, Class *c) {
+    static int hp_ids;
+    int hp_was = p->hp_id;
+    p->hp_id = ++hp_ids;
     expect(p, TK_LBRACE, NULL);
     char **sn0 = subst_names;
     Type **st0 = subst_types;
@@ -4007,6 +4017,7 @@ static void parse_fields_body(Parser *p, Class *c) {
             name.str = (char *)val;
         }
         else name = expect_prop_name(p, NULL);
+        if (!strncmp(name.str, "__hp_", 5)) mods |= MOD_PRIVATE; /* #name: hard private (the lexer's name for it) */
         if (gen_method && !at(p, TK_LPAREN) && !at(p, TK_LT)) xs_error(XS8064, name.pos, NULL, "'*' marks a generator method: *%s(): Generator<T> { ... }", name.str);
         if (accessor) {
             if (!at(p, TK_LPAREN)) xs_error(XS1037, p->tok.pos, NULL, "write %s %s(...) { ... }", accessor == 1 ? "get" : "set", name.str);
@@ -4281,6 +4292,7 @@ static void parse_fields_body(Parser *p, Class *c) {
         }
     }
     subst_names = sn0; subst_types = st0; nsubst = sk0;
+    p->hp_id = hp_was;
     next(p);
 }
 

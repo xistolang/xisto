@@ -7198,8 +7198,14 @@ static void check_access(int access, Class *owner, const char *name, Pos pos) {
     Class *in = cur_class ? cur_class : cur_func ? (cur_func->cls ? cur_func->cls : cur_func->static_of) : NULL;
     if (in && in != owner && (in->generic_of ? in->generic_of : in) == (owner->generic_of ? owner->generic_of : owner))
         in = owner; /* Query<L, T> written in Query<R, T>'s code (lean()): one class for TypeScript, two instances here */
-    if (access == 2 && in != owner)
+    if (access == 2 && in != owner) {
+        const char *bare = strncmp(name, "__get_", 6) == 0 || strncmp(name, "__set_", 6) == 0 ? name + 6 : name;
+        if (!strncmp(bare, "__hp_", 5)) { /* #x (__hp_<class id>_x) */
+            const char *u = strchr(bare + 5, '_');
+            xs_error(XS8055, pos, xs_sprintf("use it inside %s, or declare a public member that reads it", owner->name), "'#%s' is private to %s", u ? u + 1 : bare + 5, owner->name);
+        }
         xs_error(XS8055, pos, xs_sprintf("use it inside %s, or make it public", owner->name), "'%s' is private to %s", name, owner->name);
+    }
     if (access == 1 && !(in && is_subclass(in, owner)))
         xs_error(XS8056, pos, xs_sprintf("use it inside %s or a class that extends it", owner->name), "'%s' is protected in %s", name, owner->name);
 }
@@ -8381,6 +8387,7 @@ static bool objlit_expand(Expr *e, Type *expected) {
         Class *sc = st->cls;
         for (int k = 0; k < sc->nfields; k++) {
             const char *fname = sc->fields[k].name;
+            if (!strncmp(fname, "__hp_", 5)) continue; /* #x: not an own property, a spread does not copy it */
             if (target && !find_field(target, fname, NULL)) continue; /* (TypeScript allows extra fields from a spread) */
             Expr *m = member_of(pure_copy(src), fname, a->pos);
             if (nsrc) { /* (spreading null adds nothing: x === null ? null : x.f) */
@@ -9217,6 +9224,20 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (ln && e->rhs->kind == E_IDENT) e->rhs->cell_raw = true;
         }
         if (e->op == TK_QQ) { check_nullish(e, expected); return; }
+        if (e->op == TK_IN && e->lhs->kind == E_IDENT && e->lhs->str && !strncmp(e->lhs->str, "__hp_", 5)) {
+            /* #x in o: o was made by the class that declares #x (its constructor installs every #member): o instanceof it */
+            Class *k = cur_class ? cur_class : static_this_class();
+            if (!k) xs_error(XS8015, e->pos, NULL, "'#%s in' is used inside the class that declares #%s", e->lhs->str + 5, e->lhs->str + 5);
+            Field *fd = find_field(k, e->lhs->str, NULL);
+            Class *owner = fd && fd->owner ? fd->owner : k;
+            Expr *cn = xs_alloc(sizeof *cn);
+            cn->kind = E_IDENT; cn->pos = e->lhs->pos; cn->field = -1; cn->str = owner->name;
+            e->op = TK_IDENT; /* (instanceof) */
+            e->lhs = e->rhs;
+            e->rhs = cn;
+            check_expr(e, expected);
+            return;
+        }
         if (e->op == TK_IN) { /* "k" in m: m.has(k) on a Record; on an object, whether the field is there */
             check_expr(e->rhs, NULL);
             Type *rt = e->rhs->type;
@@ -11765,6 +11786,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->is_call = false;
                 e->args = (ExprList){0};
                 for (int i = 0; i < c->nfields; i++) {
+                    if (!strncmp(c->fields[i].name, "__hp_", 5)) continue; /* #x: not a key */
                     Expr *k = xs_alloc(sizeof *k);
                     k->kind = E_STRING; k->pos = e->pos; k->field = -1; k->str = (char *)c->fields[i].name;
                     expr_list_push(&e->args, k);
