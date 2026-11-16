@@ -898,6 +898,14 @@ static void xs_str_free(void *p);
 /* a string's release out of line: a class's free function releases each string field with one call, not the
    inlined test-and-free (Intl.DateTimeFormatOptions: 16 fields, 2.9 KB inline) */
 XS_NOINLINE void xs_str_release(void *p) { xs_release_as(p, xs_str_free); }
+#ifdef XS_REL_OOL
+/* experiment (XISTO_REL_OOL=1): every string release, hot code included, is the out-of-line call; the other kinds
+   stay inline (the comparison of free_fn with xs_str_free folds) */
+#undef xs_release_as
+#define xs_release_as(x, free_fn) do { if ((void *)(free_fn) == (void *)xs_str_free) xs_str_release((void *)(x)); else { xs_hdr *h_ = (xs_hdr *)(x); \
+    if (h_) { XS_HEAP_CHECK_REL(h_) if (--h_->rc == 0) free_fn(h_); \
+              else if (__builtin_expect((h_->cls & (XS_CYC | XS_BUF)) == XS_CYC, 0)) xs_gc_suspect(h_); } } } while (0)
+#endif
 XS_NOINLINE void xs_release_ool(void *p) { xs_release_(p); } /* (the release of code that runs once: a call) */
 #define xs_retain(x) ({ __auto_type xs_rtv_ = (x); (__typeof__(xs_rtv_))xs_retain_((void *)xs_rtv_); })
 #define xs_release(x) xs_release_((void *)(x))
