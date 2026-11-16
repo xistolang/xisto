@@ -177,6 +177,8 @@ static Stmt *parse_stmt(Parser *p);
 static Type *parse_type(Parser *p);
 
 /* Unresolved class names are stored as objects of a placeholder class; the checker resolves them. */
+/* a symbol type as parsed (the checker resolves it to the built-in class) */
+static bool sym_type(Type *t) { return t && t->kind == TY_OBJECT && t->cls && t->cls->name && !strcmp(t->cls->name, "symbol"); }
 static Type *named_type(Parser *p, Token name) {
     if (is_url_global_name(name.str)) wants_url = true; /* (a URL or AbortSignal parameter) */
     if (is_js_error_name(name.str)) wants_errors = true; /* (a TypeError parameter, field or return type) */
@@ -879,7 +881,7 @@ static Type *parse_type(Parser *p) {
     } else if (strcmp(n, "Map") == 0 || strcmp(n, "ReadonlyMap") == 0 || strcmp(n, "WeakMap") == 0) {
         expect(p, TK_LT, "write Map<K, V>");
         Type *k = parse_type(p);
-        if (n[0] == 'W' || k->kind == TY_JSON) wants_okmap = true; /* (keys by identity: xisto:okmap) */
+        if (n[0] == 'W' || k->kind == TY_JSON || sym_type(k)) wants_okmap = true; /* (keys by identity: xisto:okmap) */
         expect(p, TK_COMMA, "write Map<K, V>");
         Type *v = parse_type(p);
         expect(p, TK_GT, NULL);
@@ -1749,7 +1751,7 @@ static Expr *parse_primary(Parser *p) {
             if (at(p, TK_LT)) {
                 next(p);
                 Type *k = parse_type(p);
-                if (is_map && k->kind == TY_JSON) wants_okmap = true;
+                if (is_map && (k->kind == TY_JSON || sym_type(k))) wants_okmap = true;
                 if (is_map) {
                     expect(p, TK_COMMA, "write new Map<K, V>()");
                     Type *v = parse_type(p);

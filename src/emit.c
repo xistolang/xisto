@@ -1899,12 +1899,17 @@ static void json_emit_read(Buf *b, Type *t, const char *jv, const char *where) {
 
 static void buf_insert(Buf *b, size_t at, const char *text);
 static void emit_class_print(Class *c, const char *fname, const int *ord, int nord);
+static int find_field_idx(Class *c, const char *name) {
+    for (int i = 0; i < c->nfields; i++) if (!strcmp(c->fields[i].name, name)) return i;
+    return -1;
+}
 /* the fields of c as a JSON object's members (ord: in that order, NULL: the declaration's) */
 static void json_put_fields(Buf *b, Class *c, const int *ord, int nord) {
     for (int oi = 0; oi < nord; oi++) {
         Field *f = &c->fields[ord ? ord[oi] : oi];
         if (ty_is_undef(f->type)) continue; /* r: undefined: JSON.stringify leaves it out */
         if (json_fn_field(f->type)) continue; /* a function: left out, as JSON.stringify does */
+        if (xs_sym_field_shown(f->name)) continue; /* a symbol key: left out, as JSON.stringify does */
         /* optional fields that are null are left out, like undefined in JSON.stringify (and a value that is a function) */
         bool may_fn = json_may_fn(f->type);
         if (f->optional || may_fn) {
@@ -3035,9 +3040,11 @@ static void emit_dyn_tables(Program *p) {
     for (int i = 0; i < p->nclasses; i++) {
         Class *c = p->classes[i];
         if (!c->used || c->builtin) continue;
-        if (c->nfields) buf_printf(&tabs, "static const xs_dyn_field %s_dynf[] = {\n", c->cname);
-        for (int k = 0; k < c->nfields; k++) dyn_field_entry(p, c, &c->fields[k], &tabs, &fns);
-        if (c->nfields) buf_puts(&tabs, "};\n");
+        int nd = 0; /* (its fields by name: a symbol key has none) */
+        for (int k = 0; k < c->nfields; k++) if (!xs_sym_field_shown(c->fields[k].name)) nd++;
+        if (nd) buf_printf(&tabs, "static const xs_dyn_field %s_dynf[] = {\n", c->cname);
+        for (int k = 0; k < c->nfields; k++) if (!xs_sym_field_shown(c->fields[k].name)) dyn_field_entry(p, c, &c->fields[k], &tabs, &fns);
+        if (nd) buf_puts(&tabs, "};\n");
         int nm = 0; /* its methods' names, its bases' too (typeof x.toJSON === "function" through an any) */
         for (Class *k = c; k; k = k->base)
             for (int j = 0; j < k->nmethods; j++) {
@@ -3046,18 +3053,21 @@ static void emit_dyn_tables(Program *p) {
                 nm++;
             }
         if (nm) buf_puts(&tabs, "};\n");
-        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s, %d, %d};\n", c->cname, xs_src_name(c->name), c->nfields, c->nfields ? xs_sprintf("%s_dynf", c->cname) : "NULL",
+        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s, %d, %d};\n", c->cname, xs_src_name(c->name), nd, nd ? xs_sprintf("%s_dynf", c->cname) : "NULL",
                    nm, nm ? xs_sprintf("%s_dynm", c->cname) : "NULL", c->is_interface ? 1 : 0, !c->builtin && is_error_class(c) ? 1 : 0);
     }
     for (int i = 0; i < nlit_ords; i++) { /* an object literal's own key order (lit_order): its fields in that order */
         Class *c = lit_ords[i].c;
         const char *on = lit_ord_name(i);
         buf_printf(&tabs, "static const xs_dyn_field %s_dynf[] = {\n", on);
-        for (int k = 0; k < lit_ords[i].n; k++) dyn_field_entry(p, c, &c->fields[lit_ords[i].ord[k]], &tabs, &fns);
+        int nd = 0;
+        for (int k = 0; k < lit_ords[i].n; k++)
+            if (!xs_sym_field_shown(c->fields[lit_ords[i].ord[k]].name)) { dyn_field_entry(p, c, &c->fields[lit_ords[i].ord[k]], &tabs, &fns); nd++; }
+        if (!nd) buf_puts(&tabs, "{0}\n");
         buf_puts(&tabs, "};\n");
         int nm = 0;
         for (Class *k = c; k; k = k->base) nm += k->nmethods;
-        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s_dynf, %d, %s, %d, %d};\n", on, xs_src_name(c->name), c->nfields, on,
+        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s_dynf, %d, %s, %d, %d};\n", on, xs_src_name(c->name), nd, on,
                    nm, nm ? xs_sprintf("%s_dynm", c->cname) : "NULL", c->is_interface ? 1 : 0, is_error_class(c) ? 1 : 0);
     }
     if (fns.data) buf_puts(out, fns.data);
@@ -13514,9 +13524,13 @@ static void emit_class_print(Class *c, const char *fname, const int *ord, int no
             buf_printf(out, "xs_insp fr_; if (!xs_insp_begin(&fr_, p, \"%s\", (%s) ? NULL : \"%s\")) return;", plain ? "Object" : xs_src_name(c->name), cond.data, empty_s);
         }
     }
+    for (int pass = 0; pass < 2; pass++) /* (symbol keys after the others, as Node lists them) */
     for (int oi = 0; oi < nord; oi++) {
         Field *fd = &c->fields[ord ? ord[oi] : oi];
         const char *shown = c->fake && !strncmp(fd->name, "__fake_", 7) ? fd->name + 7 : fd->name;
+        const char *sym = xs_sym_field_shown(fd->name);
+        if ((sym != NULL) != (pass == 1)) continue;
+        if (sym) shown = sym;
         nl();
         if (fd->optional) buf_printf(out, "if (%s) {", not_null(fd->type, xs_sprintf("self->%s", fd->cname)));
         nl();
@@ -13626,6 +13640,10 @@ static void emit_class(Class *c) {
         buf_printf(out, "static void *%s_origin(void *p) { return ((%s *)p)->%s; }\n", c->cname, c->cname, c->fields[0].cname);
     } else if (c->cptr) { /* (header-less: never printed, nohdr_compute) */
         buf_printf(out, "static void %s_print(void *p) { (void)p; }\n", c->cname);
+    } else if (c->mod && c->mod->file && !strcmp(c->mod->file, "xisto:okmap") && find_field_idx(c, "vals") >= 0 && find_field_idx(c, "ks") >= 0) {
+        /* (a Map<symbol, V>: printed as Node prints the Map) */
+        buf_printf(out, "static void %s_print(void *p) { xs_print_okmap(p, ((%s *)p)->%s, ((%s *)p)->%s); }\n", c->cname, c->cname,
+                   c->fields[find_field_idx(c, "vals")].cname, c->cname, c->fields[find_field_idx(c, "ks")].cname);
     } else emit_class_print(c, xs_sprintf("%s_print", c->cname), NULL, 0);
 
     if (in_hierarchy(c)) { emit_hier_ctor(c); goto methods; }

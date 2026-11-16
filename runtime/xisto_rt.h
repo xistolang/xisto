@@ -2417,6 +2417,26 @@ static void xs_print_map(void *p) {
     snprintf(open, sizeof open, "%s(%zu) {", m->is_map ? "Map" : "Set", m->count);
     xs_insp_end(&fr, open, "}", false, false, m->count > 100);
 }
+static xs_map_entry *xs_map_lookup(xs_map *m, xs_str *skey, int64_t ikey);
+/* xisto:okmap's OkMap (a Map<symbol, V> or Map<object, V>) shown as the Map it stands for: ks holds each key, vals its value */
+static void xs_print_okmap(void *p, xs_map *vals, xs_map *ks) {
+    xs_insp fr;
+    if (!xs_insp_begin(&fr, p, "Map", vals->count ? NULL : "Map(0) {}")) return;
+    xs_map_entry *e;
+    XS_MAP_EACH(ks, e) {
+        xs_map_entry *v = xs_map_lookup(vals, e->skey, 0);
+        if (!v) continue;
+        xs_insp_entry(&fr);
+        if (ks->val_kind == 3) { if (e->val.p) ks->print_val(e->val.p); else fputs("null", XS_OUT); }
+        else ks->print_val(&e->val);
+        fputs(" => ", XS_OUT);
+        if (vals->val_kind == 3) { if (v->val.p) vals->print_val(v->val.p); else fputs("null", XS_OUT); }
+        else vals->print_val(&v->val);
+    }
+    char open[48];
+    snprintf(open, sizeof open, "Map(%zu) {", vals->count);
+    xs_insp_end(&fr, open, "}", false, false, false);
+}
 
 /* an empty table of cap slots (a power of two, 16 or more) */
 static void xs_map_alloc(xs_map *m, size_t cap) {

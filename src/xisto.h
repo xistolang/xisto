@@ -14,6 +14,7 @@
 void *xs_alloc(size_t n);
 char *xs_strndup(const char *s, size_t n);
 const char *xs_src_name(const char *name);
+const char *xs_sym_field_shown(const char *name); /* a symbol-keyed field's key as console.log shows it (checker) */
 char *xs_sprintf(const char *fmt, ...);
 
 typedef struct {

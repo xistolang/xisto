@@ -44,6 +44,7 @@ typedef struct Binding {
     bool null_const;  /* const x = null (no type written): each read of x is null */
     bool fn_assigned; /* a module variable some function, method or closure of its module assigns (fn_assigned_global) */
     struct Class *proto_of; /* const p = Object.getPrototypeOf(x): the prototype of x's class (its methods' slots, an expando) */
+    const char *sym_desc; /* const T = Symbol('t'): how a key T shows ("Symbol(t)"); NULL for another value */
     bool frozen;     /* given to Object.freeze, or its result: writes through it are compile errors (frozen_at: where) */
     Pos frozen_at;
     struct Binding *next;
@@ -2737,7 +2738,7 @@ static Type *resolve(Type *t, Pos pos) {
             t->key = ty_string;
             t->nkey = true;
         }
-        if (prog->uses_okmap && !t->record && (t->key->kind == TY_JSON || (t->key->kind == TY_OBJECT && !t->key->cls->builtin))) {
+        if (prog->uses_okmap && !t->record && (t->key->kind == TY_JSON || (t->key->kind == TY_OBJECT && (!t->key->cls->builtin || !strcmp(t->key->cls->name, "symbol"))))) {
             /* Map<object, V>, WeakMap<K, V>: keys by identity, kept while they are keys (xisto:okmap's OkMap<V>) */
             Class *ok = find_class("OkMap");
             if (ok) {
@@ -2757,7 +2758,9 @@ static Type *resolve(Type *t, Pos pos) {
             if (strs) t->key = ty_string;
         }
         if (t->key->kind != TY_STRING && t->key->kind != TY_INT)
-            xs_error(XS6035, pos, "Map keys are string or int in xisto", "unsupported Map key type '%s'", ty_name(t->key));
+            xs_error(XS6035, pos, t->record && t->key->kind == TY_OBJECT && t->key->cls->builtin && !strcmp(t->key->cls->name, "symbol")
+                                      ? "keep entries keyed by symbols in a Map<symbol, V>, or write each key in an object: { [KEY]: v }"
+                                      : "Map keys are string or int in xisto", "unsupported Map key type '%s'", ty_name(t->key));
         return t;
     case TY_NULLABLE:
         t->elem = resolve(t->elem, pos);
@@ -3024,6 +3027,28 @@ static Binding *lookup(const char *name) {
    same object (a parameter it was passed to) is not seen: it changes the object, where Node would not. */
 static Expr *frozen_val; /* the last Object.freeze(...) checked (its node, now the value) */
 static bool this_call_rewrite(Expr *e, Type *expected);
+/* { [T]: v } and o[T] with T a const symbol: a field of its own, named __sym_<T's C name> (no other name can be), shown
+   by console.log as Node shows it, after the string keys, and left out of JSON.stringify and Object.keys */
+static const char **sym_fields, **sym_shown;
+static int nsym_fields;
+const char *xs_sym_field_shown(const char *name) {
+    for (int i = 0; i < nsym_fields; i++) if (!strcmp(sym_fields[i], name)) return sym_shown[i];
+    return NULL;
+}
+static const char *sym_key_field(Expr *k) {
+    if (!k || k->kind != E_IDENT || !k->str) return NULL;
+    Binding *b = lookup(k->str), *root = b;
+    while (root && root->origin) root = root->origin;
+    if (!root || !root->sym_desc) return NULL;
+    const char *n = xs_sprintf("__sym_%s", root->cname);
+    for (int i = 0; i < nsym_fields; i++) if (!strcmp(sym_fields[i], n)) return sym_fields[i];
+    sym_fields = realloc(sym_fields, sizeof(char *) * (size_t)(nsym_fields + 1));
+    sym_shown = realloc(sym_shown, sizeof(char *) * (size_t)(nsym_fields + 1));
+    sym_fields[nsym_fields] = n;
+    sym_shown[nsym_fields++] = xs_sprintf("Symbol(%s)", root->sym_desc);
+    if (b) b->used = true;
+    return n;
+}
 static Binding *frozen_binding(Expr *x) {
     if (!x || x->kind != E_IDENT || !x->str) return NULL;
     for (Binding *b = lookup(x->str); b; b = b->origin) if (b->frozen) return b;
@@ -11027,6 +11052,12 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     }
     case E_INDEX:
+        if (sym_key_field(e->rhs)) { /* o[T], T a const symbol: o's field for T */
+            Expr *k = e->rhs;
+            e->kind = E_MEMBER; e->str = (char *)sym_key_field(k); e->rhs = NULL; e->field = -1;
+            check_expr(e, expected);
+            return;
+        }
         {   /* o[k] read, k a union of o's field names: that field */
             const char **names; int n;
             if (e != dyn_lvalue && lit_key_fields(e, &names, &n)) {
@@ -11304,6 +11335,23 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (ea) expr_list_push(&e->args, ea);
                 check_expr(e, expected);
                 return;
+            }
+        }
+        if (e->is_call && e->str && !strcmp(e->str, "toString") && e->args.len == 0 && e->lhs && pure_read(e->lhs)) {
+            /* sym.toString(): String(sym), "Symbol(desc)" */
+            Expr *probe = pure_copy(e->lhs);
+            if (probe) {
+                check_expr(probe, NULL);
+                Type *t = probe->type;
+                if (t && t->kind == TY_OBJECT && t->cls->builtin && !strcmp(t->cls->name, "symbol")) {
+                    Expr *v = e->lhs;
+                    memset(e, 0, sizeof *e);
+                    e->kind = E_CALL; e->pos = v->pos; e->field = -1;
+                    e->lhs = xs_alloc(sizeof *e->lhs); e->lhs->kind = E_IDENT; e->lhs->pos = v->pos; e->lhs->field = -1; e->lhs->str = "String";
+                    expr_list_push(&e->args, v);
+                    check_expr(e, expected);
+                    return;
+                }
             }
         }
         if (e->is_call && e->str && !strcmp(e->str, "toString") && e->args.len == 0 && e->lhs && tsc_checked()) {
@@ -11860,6 +11908,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->is_call = false;
                 e->args = (ExprList){0};
                 for (int i = 0; i < c->nfields; i++) {
+                    if (xs_sym_field_shown(c->fields[i].name)) continue; /* (a symbol key: not listed, as in Node) */
                     Expr *k = xs_alloc(sizeof *k);
                     k->kind = E_STRING; k->pos = e->pos; k->field = -1; k->str = (char *)c->fields[i].name;
                     expr_list_push(&e->args, k);
@@ -13656,6 +13705,25 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     }
     case E_OBJLIT: {
+        for (int i = 0; e->keys && i < e->args.len; i++) { /* { [T]: v }, T a const symbol: a field of its own */
+            Expr *a = e->args.items[i];
+            if (strcmp(e->keys[i], "[]") || !a || a->kind != E_UNARY || a->op != TK_LBRACKET) continue;
+            const char *fname = sym_key_field(a->lhs);
+            if (!fname && a->lhs && a->lhs->kind == E_IDENT && a->lhs->str && lookup(a->lhs->str)) {
+                Type *kt = lookup(a->lhs->str)->type;
+                if (kt && kt->kind == TY_OBJECT && kt->cls && kt->cls->builtin && !strcmp(kt->cls->name, "symbol"))
+                    xs_error(XS6049, a->lhs->pos, "declare the key once at the top level: const KEY = Symbol(\"key\");",
+                             "a symbol key here must be a constant made by Symbol(\"description\")");
+            }
+            if (!fname) continue;
+            e->keys[i] = (char *)fname;
+            e->args.items[i] = a->rhs;
+        }
+        if (e->keys && e->spread) {
+            bool any = false;
+            for (int i = 0; i < e->args.len; i++) if (!strcmp(e->keys[i], "[]") || !strcmp(e->keys[i], "...")) any = true;
+            if (!any) e->spread = false;
+        }
         if (e->keys && e->args.len >= 2 && !strcmp(e->keys[e->args.len - 1], "...")) {
             /* { ...entity, ...Object.fromEntries(pairs) }: entity's copy, then each pair written into it by key (as
                JavaScript's spread does: the values as they are, a Date stays a Date):
@@ -15097,6 +15165,11 @@ static void check_var(Stmt *s, bool global) {
     s->type = s->decl_type ? s->decl_type : s->init->type;
     Binding *b = declare(s->pos, s->name, s->type, s->is_const, global, false);
     if (s->init == frozen_val && frozen_val) { b->frozen = true; b->frozen_at = s->init->pos; }
+    if (s->is_const && s->init->kind == E_CALL && s->init->builtin.cfn && !strcmp(s->init->builtin.cfn, "xs_Symbol_new") && s->init->args.len == 1) {
+        Expr *d = s->init->args.items[0]; /* const T = Symbol('t'): a key of objects (sym_key_field) */
+        if (d->kind == E_STRING && d->str) b->sym_desc = d->str;
+        else if (d->kind == E_NULL) b->sym_desc = "";
+    }
     if (!s->decl_type && !s->is_const && s->type->kind == TY_NUMBER) b->lit_number = true;
     if (null_init) b->null_const = true;
     if (s->is_const && s->init->kind == E_ARROW) b->arrow_fn = s->init->arrow->fn;
