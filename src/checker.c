@@ -3089,6 +3089,7 @@ static Func *lookup_func(const char *name) {
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:arrays") == 0) return f; /* (reduce & co) */
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:settled") == 0) return f; /* (Promise.allSettled) */
         if (strncmp(name, "__xs_tsa", 8) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:tagged") == 0) return f; /* (tagged templates) */
+        if (strncmp(name, "__xs_gen_", 9) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:iter") == 0) return f; /* (g.next()) */
         if ((!strcmp(name, "__xs_construct") || !strcmp(name, "__xs_ci_params") || !strcmp(name, "__xs_apply") || !strcmp(name, "__xs_use_desc") || !strcmp(name, "__xs_desc_enter") || !strcmp(name, "__xs_desc_leave") || !strcmp(name, "__xs_deco_target") || !strcmp(name, "__xs_target_ctor")) &&
             f->mod && f->mod->file && !strcmp(f->mod->file, "xisto:reflect")) return f; /* (new (c)(); XB-107's f.apply and descriptors) */
         if (f->exported && (strstr(name, "__s_") || !strcmp(name, "__xs_fetch")) && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:url") == 0) return f; /* (URL.canParse, AbortSignal.timeout: statics of globals; fetch with its options in a value) */
@@ -3882,6 +3883,8 @@ static void to_unknown(Expr *e) {
    is any. */
 static Expr *dyn_lvalue; /* the target of the assignment being checked: xs[i] = v of an any[] stays an element */
 bool xs_any_used; /* the program reads or writes an any by name: the emitter gives every class its field table */
+bool xs_gen_sent_used; /* a generator receives values (const v = yield x) or a program calls next() on one: the emitter adds
+                          their runtime (xs_gen_c) */
 bool xs_buf_view_used; /* Buffer.from(b.buffer, offset, length): the emitter writes xs_buf_view_of */
 bool xs_any_call_used; /* x.m() on an any: the emitter writes its two failures (xs_dyn_not_function, xs_dyn_null_call) */
 static Field *find_field(Class *c, const char *name, int *index);
@@ -5676,11 +5679,20 @@ static Expr *dflt_subst(Expr *d, Func *f, Expr **args, int nargs, Pos at) {
 }
 
 static bool is_spread(Expr *a) { return a && a->kind == E_UNARY && a->op == TK_ELLIPSIS; }
+/* f(...g()) into ...xs: T[]: a generator's (or an iterable object's) values, as an array */
+static Expr *rest_spread(Expr *u) {
+    Expr *x = u->lhs;
+    if (x->kind == E_CALL || x->kind == E_NEW_OBJ || (x->kind == E_MEMBER && x->is_call)) {
+        check_expr(x, NULL);
+        if (x->type && (x->type->kind == TY_STREAM || x->type->kind == TY_OBJECT) && iter_to_array(x)) x->prechecked = true;
+    }
+    return x;
+}
 /* a call through a function value whose last parameter is ...xs: T[]: the arguments from there on, one array */
 static void pack_rest(Expr *e, Type *ft) {
     if (!ft || !ft->rest || !ft->nparams) return;
     int r = ft->nparams - 1;
-    if (e->args.len == ft->nparams && is_spread(e->args.items[r])) { e->args.items[r] = e->args.items[r]->lhs; return; }
+    if (e->args.len == ft->nparams && is_spread(e->args.items[r])) { e->args.items[r] = rest_spread(e->args.items[r]); return; }
     if (e->args.len < r) return; /* (too few: reported by the caller) */
     Expr *arr = xs_alloc(sizeof *arr);
     arr->kind = E_ARRAY_LIT; arr->pos = e->args.len > r ? e->args.items[r]->pos : e->pos; arr->field = -1;
@@ -6074,7 +6086,7 @@ static void variance_arg_t(Expr *a, Func *f, int i, Type *ptype) {
 static void check_args(Expr *e, Func *f, const char *what) {
     if (f->nparams && f->params[f->nparams - 1].rest) { /* ...xs: T[]: the arguments from there on, one array (or f(...ys): ys) */
         int r = f->nparams - 1;
-        if (e->args.len == f->nparams && is_spread(e->args.items[r])) e->args.items[r] = e->args.items[r]->lhs;
+        if (e->args.len == f->nparams && is_spread(e->args.items[r])) e->args.items[r] = rest_spread(e->args.items[r]);
         else if (e->args.len > r) {
             Expr *arr = xs_alloc(sizeof *arr);
             arr->kind = E_ARRAY_LIT; arr->pos = e->args.items[r]->pos; arr->field = -1;
@@ -6399,6 +6411,55 @@ static void check_stream_member(Expr *e) {
         check_expr(e->args.items[0], cbt);
         expect_type(e->args.items[0], cbt, "callback of Stream.reduce");
         e->type = acc;
+        e->builtin.cfn = m;
+        return;
+    }
+    if (strcmp(m, "next") == 0 || strcmp(m, "return") == 0) { /* g.next(), g.next(v), g.return(v): xisto:iter's { value, done } */
+        if (e->args.len > 1) xs_error(XS7039, e->pos, NULL, "%s takes at most one argument", m);
+        if (!lookup_func("__xs_gen_next")) xs_error(XS7037, e->pos, NULL, "Stream has no method '%s'", m);
+        Expr *g = e->lhs;
+        g->prechecked = true;
+        Expr *callee = xs_alloc(sizeof *callee);
+        callee->kind = E_IDENT; callee->pos = e->pos; callee->field = -1;
+        Expr *c = xs_alloc(sizeof *c);
+        c->kind = E_CALL; c->pos = e->pos; c->field = -1; c->lhs = callee;
+        if (m[0] == 'n') {
+            callee->str = "__xs_gen_next";
+            if (e->args.len) { /* g.next(v): v handed to the yield the generator is waiting at, then the next step */
+                Expr *snd = xs_alloc(sizeof *snd);
+                snd->kind = E_MEMBER; snd->pos = e->pos; snd->field = -1; snd->lhs = g; snd->str = "__send"; snd->is_call = true;
+                expr_list_push(&snd->args, e->args.items[0]);
+                g = snd;
+            }
+            expr_list_push(&c->args, g);
+        } else {
+            callee->str = e->args.len ? "__xs_gen_return" : "__xs_gen_return0";
+            expr_list_push(&c->args, g);
+            if (e->args.len) expr_list_push(&c->args, e->args.items[0]);
+        }
+        xs_gen_sent_used = true;
+        *e = *c;
+        check_expr(e, NULL);
+        return;
+    }
+    if (strcmp(m, "throw") == 0)
+        xs_error(XS7037, e->pos, "throw the error where next() is called, or end the generator with g.return()", "g.throw(e) on a generator is not supported");
+    if (!strcmp(m, "__pull") || !strcmp(m, "__ended") || !strcmp(m, "__close")) { /* (xisto:iter) */
+        NARGS(0);
+        e->type = m[2] == 'p' ? elem : m[2] == 'e' ? ty_boolean : ty_void;
+        e->builtin.cfn = m;
+        return;
+    }
+    if (!strcmp(m, "__send")) { /* (g.next(v)) */
+        NARGS(1);
+        Type *n = t->key ? resolve(t->key, e->pos) : NULL;
+        if (n) { check_expr(e->args.items[0], n); expect_type(e->args.items[0], n, "the value next(v) sends"); }
+        else check_expr(e->args.items[0], NULL);
+        Type *at = e->args.items[0]->type;
+        if (at->kind == TY_LITINT) { coerce_lit(e->args.items[0], ty_number); at = e->args.items[0]->type; }
+        if (at->kind != TY_NUMBER && at->kind != TY_INT && at->kind != TY_BOOLEAN && !ty_is_heap(at) && at->kind != TY_NULLABLE && at->kind != TY_NULL)
+            xs_error(XS6040, e->pos, "send a number, an int, a boolean, a string or an object", "next(v) cannot send %s", ty_name(at));
+        e->type = t;
         e->builtin.cfn = m;
         return;
     }
@@ -8412,7 +8473,7 @@ static bool objlit_expand(Expr *e, Type *expected) {
         Class *sc = st->cls;
         for (int k = 0; k < sc->nfields; k++) {
             const char *fname = sc->fields[k].name;
-            if (!strncmp(fname, "__hp_", 5)) continue; /* #x: not an own property, a spread does not copy it */
+            if (xs_hidden_field(fname)) continue; /* #x: not an own property, a spread does not copy it */
             if (target && !find_field(target, fname, NULL)) continue; /* (TypeScript allows extra fields from a spread) */
             Expr *m = member_of(pure_copy(src), fname, a->pos);
             if (nsrc) { /* (spreading null adds nothing: x === null ? null : x.f) */
@@ -9020,6 +9081,21 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     }
     case E_IDENT: {
+        if (e->str[0] == '_' && !strcmp(e->str, "__xs_sent") && cur_func && cur_func->is_gen && !lookup(e->str)) {
+            /* const v = yield x;: the value the consumer's next(v) sent (taken once, right after the yield) */
+            Type *n = cur_func->ret ? cur_func->ret->key : NULL;
+            if (!n) xs_error(XS3012, e->pos, xs_sprintf("write the type of what next(v) sends: function* %s(): Generator<T, void, N>", cur_func->name),
+                             "the value of 'yield' is the one next(v) sends, and its type is not written");
+            n = resolve(n, e->pos);
+            int k = n->kind == TY_NUMBER ? 0 : n->kind == TY_INT ? 1 : n->kind == TY_BOOLEAN ? 2 : ty_is_heap(n) || n->kind == TY_NULLABLE ? 3 : -1;
+            if (k < 0 || (n->kind == TY_NULLABLE && !ty_is_heap(n->elem))) xs_error(XS6040, e->pos, "send a number, an int, a boolean, a string or an object", "next(v) cannot send %s here", ty_name(n));
+            e->kind = E_CALL;
+            e->str = NULL;
+            e->builtin.cfn = k == 0 ? "xs_gen_take_d" : k == 1 ? "xs_gen_take_i" : k == 2 ? "xs_gen_take_b" : "xs_gen_take_p";
+            e->type = n;
+            xs_gen_sent_used = true;
+            return;
+        }
         Binding *b = lookup(e->str);
         if (b && (b->null_const || (b->origin && b->origin->null_const))) { /* const x = null: x is null */
             b->used = true;
@@ -11848,7 +11924,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->is_call = false;
                 e->args = (ExprList){0};
                 for (int i = 0; i < c->nfields; i++) {
-                    if (!strncmp(c->fields[i].name, "__hp_", 5)) continue; /* #x: not a key */
+                    if (xs_hidden_field(c->fields[i].name)) continue; /* #x: not a key */
                     Expr *k = xs_alloc(sizeof *k);
                     k->kind = E_STRING; k->pos = e->pos; k->field = -1; k->str = (char *)c->fields[i].name;
                     expr_list_push(&e->args, k);

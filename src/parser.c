@@ -904,7 +904,10 @@ static Type *parse_type(Parser *p) {
         expect(p, TK_LT, xs_sprintf("write %s<T>", n));
         if (!strcmp(n, "Iterable") || !strcmp(n, "AsyncIterable")) wants_arrays = true; /* (an array where it goes: __xs_iter) */
         t = ty_stream_of(parse_type(p));
-        while (accept(p, TK_COMMA)) parse_type(p);
+        for (int k = 1; accept(p, TK_COMMA); k++) { /* Generator<T, TReturn, TNext>: TNext, what next(v) sends (key) */
+            Type *x = parse_type(p);
+            if (k == 2 && !strcmp(n, "Generator") && x->kind != TY_VOID && !(x->kind == TY_UNKNOWN && !ty_is_undef(x) && !x->tname)) t->key = x;
+        }
         expect(p, TK_GT, NULL);
     } else if (strcmp(n, "readonly") == 0) { /* readonly T[]: T[] (that it is not written to is TypeScript's check) */
         t = parse_type(p);
@@ -1557,6 +1560,8 @@ static Expr *parse_primary(Parser *p) {
             next(p);
             return new_expr(E_NULL, pos);
         }
+        if (p->in_gen && strcmp(p->tok.str, "yield") == 0)
+            xs_error(XS8070, pos, "receive the value on its own line: const v = yield x; (or v = yield x;)", "'yield' inside an expression is not supported");
         if (is_url_global_name(p->tok.str)) wants_url = true; /* (AbortSignal.timeout(n): a member read made here) */
         if (strcmp(p->tok.str, "process") == 0) { /* process.on(...), process.platform...: xisto:process */
             Parser look = *p;
@@ -1970,6 +1975,7 @@ static Expr *parse_postfix(Parser *p) {
             if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from") ||
                 !strcmp(name.str, "fromEntries")) wants_arrays = true;
             if (!strcmp(name.str, "allSettled")) wants_settled = true;
+            if ((!strcmp(name.str, "next") || !strcmp(name.str, "return")) && at(p, TK_LPAREN)) wants_iter = true; /* (g.next(): xisto:iter) */
             if (!strcmp(name.str, "next") && e->kind == E_MEMBER && e->str && (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")))
                 wants_arrays = true; /* m.keys().next().value: __xs_first */
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs);
@@ -2011,6 +2017,7 @@ static Expr *parse_postfix(Parser *p) {
             if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from") ||
                 !strcmp(name.str, "fromEntries")) wants_arrays = true;
             if (!strcmp(name.str, "allSettled")) wants_settled = true;
+            if ((!strcmp(name.str, "next") || !strcmp(name.str, "return")) && at(p, TK_LPAREN)) wants_iter = true; /* (g.next(): xisto:iter) */
             if (!strcmp(name.str, "next") && e->kind == E_MEMBER && e->str && (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")))
                 wants_arrays = true; /* m.keys().next().value: __xs_first */
             if (!strcmp(name.str, "length") && at(p, TK_ASSIGN)) wants_arrays = true; /* xs.length = 0 */
@@ -2705,6 +2712,20 @@ static Stmt *parse_var(Parser *p) {
         /* let x;: TypeScript types it by what is assigned to it; here by the first assignment the checker meets */
         s->init = new_expr(E_NULL, p->tok.pos);
         s->init->unset = true;
+    } else if (p->in_gen && at(p, TK_ASSIGN) && ({ Parser l_ = *p; next(&l_); at_ident(&l_, "yield") && !peek_is(&l_, TK_STAR); })) {
+        /* const v = yield x;: the yield, then v declared with the value next(v) sent (pending: after the statement returned) */
+        next(p);
+        Stmt *y = new_stmt(S_YIELD, p->tok.pos);
+        next(p);
+        if (at(p, TK_SEMI) || at(p, TK_COMMA)) xs_error(XS8075, y->pos, "yield a value: const v = yield x;", "a generator yields values");
+        y->expr = parse_expr(p);
+        s->init = ident_expr(y->pos, "__xs_sent");
+        StmtList rest = p->pending;
+        p->pending = (StmtList){0};
+        stmt_list_push(&p->pending, s);
+        for (int i = 0; i < rest.len; i++) stmt_list_push(&p->pending, rest.items[i]);
+        if (at(p, TK_COMMA)) xs_error(XS1008, p->tok.pos, "declare it on its own: const v = yield x;", "expected ';' after a yield");
+        return y;
     } else {
         if (!at(p, TK_ASSIGN))
             xs_error(XS8146, p->tok.pos, "xisto has no 'undefined', so every variable starts with a value", "variable '%s' must be initialized", s->name);
@@ -2893,6 +2914,25 @@ static Stmt *parse_stmt(Parser *p) {
     }
     if (!p->in_gen && at_ident(p, "yield") && !peek_is(p, TK_ASSIGN) && !peek_is(p, TK_LPAREN) && !peek_is(p, TK_DOT) && !peek_is(p, TK_SEMI))
         xs_error(XS8070, pos, "make it a generator: function* name(): Generator<T> { ... }", "'yield' is used inside a generator");
+    if (p->in_gen && at(p, TK_IDENT) && peek_is(p, TK_ASSIGN) && ({ Parser l_ = *p; next(&l_); next(&l_); at_ident(&l_, "yield") && !peek_is(&l_, TK_STAR); })) {
+        /* v = yield x;: the yield, then v assigned the value next(v) sent */
+        Token vn = p->tok;
+        next(p);
+        next(p);
+        Stmt *y = new_stmt(S_YIELD, p->tok.pos);
+        next(p);
+        if (at(p, TK_SEMI)) xs_error(XS8075, y->pos, "yield a value: v = yield x;", "a generator yields values");
+        y->expr = parse_expr(p);
+        expect_semi(p);
+        Stmt *as = new_stmt(S_EXPR, vn.pos);
+        Expr *a = new_expr(E_ASSIGN, vn.pos);
+        a->op = TK_ASSIGN;
+        a->lhs = ident_expr(vn.pos, vn.str);
+        a->rhs = ident_expr(y->pos, "__xs_sent");
+        as->expr = a;
+        stmt_list_push(&p->pending, as);
+        return y;
+    }
     if (p->in_gen && at_ident(p, "yield")) { /* yield v;  yield* other;  (statements, in a generator) */
         next(p);
         if (accept(p, TK_STAR)) { /* for (const v of other) yield v; */
@@ -6919,7 +6959,23 @@ static const char xs_profiler_src[] =
 static const char xs_iter_src[] =
     "export interface IteratorResult<T> { value?: T; done?: boolean; }\n"
     "export interface __XsIterator<T> { next(): IteratorResult<T>; }\n"
-    "export interface __XsAsyncIterator<T> { next(): Promise<IteratorResult<T>>; }\n";
+    "export interface __XsAsyncIterator<T> { next(): Promise<IteratorResult<T>>; }\n"
+    "// g.next(), g.next(v), g.return(v) on a generator: { value, done } (__xs_undef: value prints as undefined)\n"
+    "export interface __XsGenResult<T> { value: T; done: boolean; __xs_undef: boolean; }\n"
+    "export function __xs_gen_next<T>(g: Generator<T>): __XsGenResult<T> {\n"
+    "  const v: T = g.__pull();\n"
+    "  const d = g.__ended();\n"
+    "  return { value: v, done: d, __xs_undef: d };\n"
+    "}\n"
+    "export function __xs_gen_return<T>(g: Generator<T>, v: T): __XsGenResult<T> {\n"
+    "  g.__close();\n"
+    "  return { value: v, done: true, __xs_undef: false };\n"
+    "}\n"
+    "export function __xs_gen_return0<T>(g: Generator<T>): __XsGenResult<T> {\n"
+    "  g.__close();\n"
+    "  const v: T = g.__pull();\n"
+    "  return { value: v, done: true, __xs_undef: true };\n"
+    "}\n";
 static const char xs_okmap_src[] =
     "declare function okey_text(k: unknown): string;\n"
     "export class OkMap<V> {\n"
