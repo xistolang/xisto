@@ -2339,6 +2339,35 @@ static Type *ty_union2(Type *a, Type *b) {
     }
     return nul ? ty_nullable_of(u) : u;
 }
+/* T of an element type T | T[] (what flat() takes apart in one level), else NULL */
+static Type *flat_mixed(Type *u) {
+    if (!u || u->kind != TY_UNION || u->nparams != 2) return NULL;
+    for (int i = 0; i < 2; i++) {
+        Type *a = u->params[i], *b = u->params[1 - i];
+        if (b->kind == TY_ARRAY && ty_equal(b->elem, a)) return a;
+    }
+    return NULL;
+}
+/* the element type of an array literal whose elements are values and arrays nested to different depths: two arrays
+   merge element-wise ([1] and [2, [3]]: (number | number[])[]), numbers are number, other kinds a union */
+static Type *lit_merge(Type *a, Type *b) {
+    if (!a) return b;
+    if (ty_equal(a, b)) return a;
+    if (a->kind == TY_ARRAY && b->kind == TY_ARRAY) return ty_array_of(lit_merge(a->elem, b->elem));
+    if (is_numeric(a) && is_numeric(b)) return ty_number;
+    return ty_union2(a, b);
+}
+static void expect_type(Expr *e, Type *want, const char *what);
+/* an array literal already checked, given the (wider) array type t that lit_merge chose: its elements converted */
+static void relabel_lit(Expr *a, Type *t) {
+    if (ty_equal(a->type, t)) return;
+    for (int i = 0; i < a->args.len; i++) {
+        Expr *c = a->args.items[i];
+        if (c->kind == E_ARRAY_LIT && t->elem->kind == TY_ARRAY) relabel_lit(c, t->elem);
+        else expect_type(c, t->elem, "array element");
+    }
+    a->type = t;
+}
 /* class_fields_all where a function's locals are in scope (it enters the class's module: the scope comes back after) */
 static void fields_here(Class *c, FieldSet *out) {
     Module *was = cur_mod;
@@ -14116,6 +14145,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                 /* xs.reduce(f, a) / xs.flatMap(f) / xs.flat(): the loop of xisto:arrays, __xs_reduce(xs, f, a) */
                 const char *m = e->str;
                 const char *fn = !strcmp(m, "flat") ? "__xs_flat" : !strcmp(m, "flatMap") ? "__xs_flatMap" : e->args.len >= 2 ? "__xs_reduce" : "__xs_reduce1";
+                if (!strcmp(m, "flat") && e->args.len == 0 && e->lhs->type && e->lhs->type->kind == TY_ARRAY && flat_mixed(e->lhs->type->elem))
+                    expr_list_push(&e->args, num_lit(e->pos, 1, true)); /* [1, [2]].flat(): one level, as flat(1) */
                 if (!strcmp(m, "flat") && e->args.len == 1 && lookup_func("__xs_flat")) {
                     /* xs.flat(depth), the depth written as a number (or Infinity): __xs_flat once per level, as deep as the
                        type goes; flat(0), a copy */
@@ -14126,9 +14157,16 @@ static void check_expr_in(Expr *e, Type *expected) {
                     Expr *x = e->lhs;
                     x->prechecked = true;
                     int k = 0;
-                    for (; k < dv && x->type->kind == TY_ARRAY && x->type->elem->kind == TY_ARRAY; k++) {
+                    for (; k < dv && x->type->kind == TY_ARRAY && (x->type->elem->kind == TY_ARRAY || flat_mixed(x->type->elem)); k++) {
                         Expr *c = xs_alloc(sizeof *c);
-                        c->kind = E_CALL; c->pos = e->pos; c->field = -1; c->lhs = mk_ident(e->pos, "__xs_flat");
+                        c->kind = E_CALL; c->pos = e->pos; c->field = -1;
+                        if (x->type->elem->kind == TY_ARRAY) c->lhs = mk_ident(e->pos, "__xs_flat");
+                        else { /* (T | T[])[]: __xs_flatU<T> */
+                            c->lhs = mk_ident(e->pos, "__xs_flatU");
+                            c->targs = xs_alloc(sizeof(Type *));
+                            c->targs[0] = flat_mixed(x->type->elem);
+                            c->ntargs = 1;
+                        }
                         expr_list_push(&c->args, x);
                         check_expr(c, NULL);
                         c->prechecked = true;
@@ -16015,6 +16053,31 @@ static void check_expr_in(Expr *e, Type *expected) {
                 for (int i = 0; i < e->args.len; i++) expect_type(e->args.items[i], ty_unknown, "array element");
                 e->type = arr_unknown3;
                 return;
+            }
+        }
+        if (!elem && e->args.len > 1) { /* [2, [3]], [[1], [2, [3]]]: values and arrays nested to different depths, as
+                                            TypeScript infers them: (number | number[])[], (number | number[])[][] */
+            Type *m = NULL;
+            bool ok = true, arrays = false, differ = false;
+            for (int i = 0; i < e->args.len && ok; i++) {
+                Type *t = e->args.items[i]->type;
+                if (t->kind == TY_LITINT) t = ty_number;
+                if (t->kind == TY_ARRAY) arrays = true;
+                else if (!(is_numeric(t) || t->kind == TY_STRING || t->kind == TY_BOOLEAN || t->kind == TY_UNION)) ok = false;
+                if (m && !ty_equal(m, t)) differ = true;
+                m = lit_merge(m, t);
+            }
+            for (int i = 0; i < e->args.len && ok && arrays && differ; i++) { /* (an array that is not a literal keeps its type) */
+                Expr *a = e->args.items[i];
+                if (a->type->kind == TY_ARRAY && a->kind != E_ARRAY_LIT && !ty_equal(a->type, m)) ok = false;
+            }
+            if (ok && arrays && differ) {
+                for (int i = 0; i < e->args.len; i++) {
+                    Expr *a = e->args.items[i];
+                    settle(a);
+                    if (a->kind == E_ARRAY_LIT && m->kind == TY_ARRAY) relabel_lit(a, m);
+                }
+                elem = m;
             }
         }
         if (!elem) {

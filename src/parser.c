@@ -7407,6 +7407,15 @@ static const char xs_arrays_src[] =
     "  const out: U[] = [];\n"
     "  for (const ys of xs) for (const y of ys) out.push(y);\n"
     "  return out;\n"
+    "}\n"
+    "// one level of flat() over values and arrays of them ((number | number[])[]: [2, [3]] gives [2, 3])\n"
+    "export function __xs_flatU<U>(xs: (U | U[])[]): U[] {\n"
+    "  const out: U[] = [];\n"
+    "  for (const x of xs) {\n"
+    "    if (Array.isArray(x)) for (const y of x as U[]) out.push(y);\n"
+    "    else out.push(x as U);\n"
+    "  }\n"
+    "  return out;\n"
     "}\n";
 /* xisto:settled: Promise.allSettled (loaded only by a program that names it: its try blocks stay out of the others) */
 static const char xs_settled_src[] =
