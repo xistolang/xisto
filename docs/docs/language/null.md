@@ -5,8 +5,9 @@ sidebar_position: 3
 
 # null and absent values
 
-xisto has one empty value: `null`. `T | null` is the nullable type. There is no separate `undefined` value: where
-code writes `undefined`, the compiler reads `null` and warns.
+xisto has one empty value: `null`. `T | null` is the nullable type. There is no separate `undefined` value:
+`undefined` is accepted as a deprecated synonym of `null`. Where code writes it, the compiler reads `null` and warns
+(XS2101).
 
 ```text
 x.ts:1:29: warning[XS2101]: 'undefined' is deprecated in xisto: it is read as null
@@ -15,6 +16,31 @@ x.ts:1:29: warning[XS2101]: 'undefined' is deprecated in xisto: it is read as nu
 ```
 
 `T | undefined` and `x?: T` are accepted and mean `T | null`. `null` alone is not a type (XS2008).
+
+## `undefined` as a value
+
+Every form compiles, each with one XS2101 warning at the place it is written:
+
+| Written | Read as |
+|---|---|
+| `undefined`, `void 0` (any literal after `void`) | `null` |
+| `x === undefined`, `x == undefined` | `x == null` |
+| `x !== undefined`, `x != undefined` | `x != null` |
+| `typeof x === "undefined"` (`!==`), with `x` a `T \| null` or `unknown` | `x == null` (`x != null`) |
+| `return undefined;` in a `void` function | `return;` |
+
+`typeof x === "undefined"` with `x` never null stays the typeof test: always `false`, as on Node, without a warning.
+
+On an optional field, `undefined` means absent, not `null`: `o.nick = undefined` and `{ nick: undefined }` leave the
+field out, so `JSON.stringify` leaves it out as Node does, and `o.nick === undefined` is `true`.
+
+What stays visible, because the value is `null` (see [Divergences](./divergences.md)):
+
+- `console.log(v)` of a variable that held `undefined` prints `null`, and `typeof v` is `"object"`.
+- `x === undefined` is `true` for an `x` that holds `null` (Node: `false`); `typeof x === "undefined"` too.
+- `[1, undefined]` prints `[ 1, null ]` (Node: `[ 1, undefined ]`); `JSON.stringify` gives `[1,null]` on both.
+- An optional field set to `undefined` is absent: `Object.keys` and `console.log` leave it out, where Node lists
+  the key and prints `nick: undefined`.
 
 ## Why
 
@@ -36,7 +62,11 @@ console.log(a.nick ?? "(none)", a.nick?.length);   // (none) undefined
 ```
 
 An absent field reads as `null`. So `a.admin === null` is `true` in xisto and `false` on Node. Test emptiness with
-`x == null`, which is the same on both.
+`x == null`, which is the same on both. `typeof a.nick` is `"undefined"`, as on Node.
+
+An optional field holds absent and `null` as one value: a field set to `null` (`{ nick: null }`, or read by
+`JSON.parse` from `"nick":null`) is left out of `JSON.stringify`, `Object.keys` and `console.log` too, where Node
+keeps `"nick":null`. Declare the field `nick: string | null` (not optional) when the `null` must reach the JSON.
 
 ## `?.`, `??`, `??=`
 

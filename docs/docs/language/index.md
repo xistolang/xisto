@@ -37,7 +37,7 @@ Most typed TypeScript compiles as written. The rules you meet first:
 | Rule | Page |
 |---|---|
 | `int` and `number` are different types | [Numbers](./types.md) |
-| `null` is the only empty value; `undefined` reads as `null` | [null and absent values](./null.md) |
+| `null` is the only empty value; `undefined` is a deprecated synonym of it | [null and absent values](./null.md) |
 | `==` never converts; numbers are not conditions | [Equality and truthiness](./equality-and-truthiness.md) |
 | `any` works, but takes a slower, checked path | [any](./any.md) |
 | generics are compiled once per type | [Classes, interfaces and generics](./classes-interfaces-generics.md) |
