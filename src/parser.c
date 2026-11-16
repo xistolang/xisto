@@ -1670,7 +1670,19 @@ static Expr *parse_primary(Parser *p) {
         c->pos = pos;
         c->name = xs_sprintf("__AnonClass%d", ++nanon);
         next(p);
-        if (at(p, TK_IDENT)) next(p); /* (class Name { }: its own name, kept local to the expression in JavaScript) */
+        if (at(p, TK_IDENT) && !at_ident(p, "extends") && !at_ident(p, "implements")) next(p); /* (class Name { }: its own name, kept local to the expression in JavaScript) */
+        if (at_ident(p, "extends")) { /* class extends Base { }: a class of the module as the base */
+            next(p);
+            c->base_pos = p->tok.pos;
+            Token bt = expect(p, TK_IDENT, NULL);
+            for (int i = 0; i < p->nvt; i++)
+                if (!strcmp(p->vt_names[i], bt.str))
+                    xs_error(XS6022, bt.pos, "declare each combination as a class: class LoudBase extends Base { ... }",
+                             "a class that extends a parameter or a variable (a mixin) is not supported");
+            c->base_name = bt.str;
+            if (at(p, TK_LT) || at(p, TK_LPAREN)) xs_error(XS6022, p->tok.pos, "declare the class: class Name extends Base<T> { ... }", "this base of a class expression is not supported");
+        }
+        if (at_ident(p, "implements")) { next(p); do { expect(p, TK_IDENT, NULL); if (at(p, TK_LT)) { int depth = 0; do { if (at(p, TK_LT)) depth++; else if (at(p, TK_GT)) depth--; next(p); } while (depth > 0 && !at(p, TK_EOF)); } } while (accept(p, TK_COMMA)); }
         parse_fields_body(p, c);
         c->mod = p->mod;
         c->as_value = true;
@@ -3767,7 +3779,8 @@ static bool const_class_ahead(Parser *p) {
     next(&l);
     if (!at(&l, TK_CLASS)) return false;
     next(&l);
-    return at(&l, TK_LBRACE) || at_ident(&l, "extends") || at_ident(&l, "implements"); /* (class Inner { }: K.name is "Inner") */
+    if (at(&l, TK_IDENT) && !at_ident(&l, "extends") && !at_ident(&l, "implements")) { next(&l); return at(&l, TK_LBRACE) || at_ident(&l, "extends") || at_ident(&l, "implements"); }
+    return at(&l, TK_LBRACE) || at_ident(&l, "extends") || at_ident(&l, "implements");
 }
 static Class *parse_class_ex(Parser *p, bool abstract);
 static Class *parse_class(Parser *p) { return parse_class_ex(p, false); }
@@ -6116,10 +6129,19 @@ static void parse_module(Program *prog, Module *m) {
             if (is_default) m->default_name = f->name;
             add_func(prog, f);
         } else if (at(&p, TK_CLASS) || (at_ident(&p, "abstract") && peek_is(&p, TK_CLASS)) || const_class_ahead(&p)) {
+            const char *bound_alias = NULL;
             if (at(&p, TK_CONST)) { /* const K = class { static tag = 1 }: the class K, as if declared so (K.tag, new K()) */
                 next(&p);
                 class_bound_name = expect(&p, TK_IDENT, NULL).str;
                 expect(&p, TK_ASSIGN, NULL);
+                Parser l_ = p;
+                next(&l_);
+                if (at(&l_, TK_IDENT) && !at_ident(&l_, "extends") && !at_ident(&l_, "implements")) {
+                    /* const K = class Named { ... }: the class Named (K.name is "Named", as Named inside), K another name for it */
+                    bound_alias = class_bound_name;
+                    class_bound_name = NULL;
+                    if (exported) xs_error(XS6029, p.tok.pos, xs_sprintf("export class %s { ... } and use one name", bound_alias), "an exported constant bound to a named class expression is not supported");
+                }
             }
             bool abstract = at_ident(&p, "abstract");
             if (abstract) next(&p);
@@ -6143,6 +6165,7 @@ static void parse_module(Program *prog, Module *m) {
             if (is_default) m->default_name = c->name;
             add_class(prog, c);
             add_statics(prog, m, c);
+            if (bound_alias) add_alias(&p, bound_alias, c->name);
             accept(&p, TK_SEMI); /* (const K = class { ... };) */
         } else if (at_ident(&p, "interface") || (at_ident(&p, "type") && peek_is_ident(&p))) {
             Class *c = parse_interface(&p);
