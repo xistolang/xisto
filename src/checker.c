@@ -12555,7 +12555,9 @@ static void check_expr_in(Expr *e, Type *expected) {
                         if (cb->kind == E_ARROW && !cb->arrow->fn->ret) { /* infer the element type of the result */
                             /* (xs.map((c) => ({ ... })) where an Achado[] goes: each result is an Achado) */
                             cbt->ret = expected && expected->kind == TY_ARRAY && (expected->elem->kind == TY_OBJECT ||
+                                       (expected->elem->kind == TY_NULLABLE && (ty_is_heap(expected->elem->elem) || nullnum_elem(expected->elem))) ||
                                        (expected->elem->kind == TY_UNION && cb->kind == E_ARROW && cb->arrow->expr_body)) ? expected->elem : NULL;
+                            /* (xs.map(() => null) where an (R | null)[] goes: each result an R | null, XB-165) */
                             /* (xs.map((d) => ({ provide, useFactory })) where Provider[] goes: each result the member it is) */
                             check_expr(cb, cbt);
                         } else {
