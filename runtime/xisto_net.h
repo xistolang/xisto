@@ -5342,6 +5342,221 @@ XS_NOINLINE void xs_net_task_ref(int64_t task, bool ref) {
     if (!xs_task_countable(co) || co->unref == !ref) return;
     xs_task_ref_co(co, ref);
 }
+/* ---- fs.watch (runtime/node/fs_callbacks.ts, FSWatcher): a watcher is an fd the loop can wait on, and a table entry.
+   macOS: a kqueue of its own (pollable by the loop's) with EVFILT_VNODE on the path, and for a directory on each of its
+   entries: the directory's NOTE_WRITE is a rescan whose added and removed names are 'rename', an entry's write
+   'change'. Linux: inotify. xs_fsw_next parks until there are events and gives them as "type\tname" (none: closed). */
+#if !defined(_WIN32)
+#include <dirent.h>
+#endif
+#if defined(__linux__)
+#include <sys/inotify.h>
+#endif
+typedef struct xs_fswent { char *name; int fd; } xs_fswent;
+typedef struct xs_fsw {
+    int fd;                /* what the loop waits on: the kqueue, or the inotify fd */
+    int wd, dirfd;         /* inotify's watch; macOS: the path's own fd */
+    bool isdir, closing, used;
+    char *path, *base;
+    xs_fswent *ents;       /* macOS, a directory: its entries (names, and an fd watched for writes) */
+    int nents;
+} xs_fsw;
+static XS_TLS xs_fsw *xs_fsws;
+static XS_TLS int xs_nfsws;
+#if defined(__APPLE__)
+static void xs_fsw_watch_fd(xs_fsw *w, int fd, intptr_t idx, bool dir) {
+    struct kevent ev;
+    EV_SET(&ev, fd, EVFILT_VNODE, EV_ADD | EV_CLEAR, dir ? (NOTE_WRITE | NOTE_DELETE | NOTE_RENAME) :
+           (NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_DELETE | NOTE_RENAME), 0, (void *)idx);
+    kevent(w->fd, &ev, 1, NULL, 0, NULL);
+}
+static void xs_fsw_add_ent(xs_fsw *w, const char *name) {
+    w->ents = realloc(w->ents, sizeof *w->ents * (size_t)(w->nents + 1));
+    xs_fswent *e = &w->ents[w->nents];
+    e->name = strdup(name);
+    char p[PATH_MAX];
+    snprintf(p, sizeof p, "%s/%s", w->path, name);
+    e->fd = open(p, O_EVTONLY | O_CLOEXEC);
+    if (e->fd >= 0) xs_fsw_watch_fd(w, e->fd, (intptr_t)w->nents + 1, false);
+    w->nents++;
+}
+#endif
+static int xs_fsw_name_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+static char **xs_fsw_list(const char *path, int *n) { /* a directory's names, sorted */
+    char **out = NULL;
+    *n = 0;
+#if !defined(_WIN32)
+    DIR *d = opendir(path);
+    if (!d) return NULL;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (de->d_name[0] == '.' && (de->d_name[1] == 0 || (de->d_name[1] == '.' && de->d_name[2] == 0))) continue;
+        out = realloc(out, sizeof *out * (size_t)(*n + 1));
+        out[(*n)++] = strdup(de->d_name);
+    }
+    closedir(d);
+    if (*n > 1) qsort(out, (size_t)*n, sizeof *out, xs_fsw_name_cmp);
+#endif
+    return out;
+}
+/* a watcher on path: its handle (>= 0), or -errno */
+XS_NOINLINE int64_t xs_fsw_open(xs_str *path) {
+#if defined(__APPLE__) || defined(__linux__)
+    struct stat st;
+    if (stat(path->data, &st) != 0) return -(int64_t)errno;
+    int h = 0;
+    while (h < xs_nfsws && xs_fsws[h].used) h++;
+    if (h == xs_nfsws) { xs_fsws = realloc(xs_fsws, sizeof *xs_fsws * (size_t)(xs_nfsws + 1)); xs_nfsws++; }
+    xs_fsw *w = &xs_fsws[h];
+    memset(w, 0, sizeof *w);
+    w->used = true;
+    w->isdir = S_ISDIR(st.st_mode);
+    w->path = strdup(path->data);
+    const char *slash = strrchr(w->path, '/');
+    w->base = strdup(slash ? slash + 1 : w->path);
+#if defined(__APPLE__)
+    w->fd = kqueue();
+    w->dirfd = open(w->path, O_EVTONLY | O_CLOEXEC);
+    if (w->fd < 0 || w->dirfd < 0) { int e = errno; if (w->fd >= 0) close(w->fd); w->used = false; return -(int64_t)e; }
+    fcntl(w->fd, F_SETFD, FD_CLOEXEC);
+    xs_fsw_watch_fd(w, w->dirfd, 0, w->isdir);
+    struct kevent u;
+    EV_SET(&u, 1, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL); /* (close() triggers it: the waiting task wakes) */
+    kevent(w->fd, &u, 1, NULL, 0, NULL);
+    if (w->isdir) {
+        int n;
+        char **names = xs_fsw_list(w->path, &n);
+        for (int i = 0; i < n; i++) { xs_fsw_add_ent(w, names[i]); free(names[i]); }
+        free(names);
+    }
+#else
+    w->fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (w->fd < 0) { w->used = false; return -(int64_t)errno; }
+    w->wd = inotify_add_watch(w->fd, w->path, IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_MODIFY | IN_ATTRIB |
+                                                  IN_DELETE_SELF | IN_MOVE_SELF | IN_CLOSE_WRITE);
+    if (w->wd < 0) { int e = errno; close(w->fd); w->used = false; return -(int64_t)e; }
+#endif
+    return h;
+#else
+    (void)path;
+    return -ENOSYS;
+#endif
+}
+/* (the array is made with its first event: a task parked with nothing made yet can be let go at the program's end,
+   an unref'd watcher, without anything left behind) */
+static void xs_fsw_push(xs_arr_ref **ap, const char *type, const char *name) {
+    if (!*ap) *ap = xs_arr_ref_new(0, xs_print_str_quoted_);
+    xs_arr_ref *a = *ap;
+    char line[PATH_MAX + 16];
+    int k = snprintf(line, sizeof line, "%s\t%s", type, name);
+    xs_arr_ref_push(a, xs_str_new(line, (size_t)k));
+}
+/* the next events of watcher h (parks until there are some); none once it is closed (its resources go then) */
+XS_NOINLINE xs_arr_ref *xs_fsw_next(int64_t h) {
+    xs_arr_ref *a = NULL;
+#if defined(__APPLE__) || defined(__linux__)
+    if (h < 0 || h >= xs_nfsws || !xs_fsws[h].used) return xs_arr_ref_new(0, xs_print_str_quoted_);
+    while (!a) {
+        xs_fsw *w = &xs_fsws[h];
+        if (w->closing) break;
+        if (xs_kq < 0) xs_kq = kqueue();
+        xs_wait_fd(w->fd, EVFILT_READ);
+        w = &xs_fsws[h]; /* (the table may have grown while parked) */
+        if (w->closing) break;
+#if defined(__APPLE__)
+        struct kevent evs[64];
+        struct timespec zero = {0, 0};
+        int n = kevent(w->fd, NULL, 0, evs, 64, &zero);
+        bool rescan = false;
+        for (int i = 0; i < n; i++) {
+            if (evs[i].filter == EVFILT_USER) continue;
+            intptr_t idx = (intptr_t)evs[i].udata;
+            if (idx == 0) {
+                if (w->isdir && (evs[i].fflags & NOTE_WRITE)) rescan = true;
+                else if (!w->isdir) xs_fsw_push(&a, (evs[i].fflags & (NOTE_DELETE | NOTE_RENAME)) ? "rename" : "change", w->base);
+                else if (evs[i].fflags & (NOTE_DELETE | NOTE_RENAME)) xs_fsw_push(&a, "rename", w->base);
+            } else if (idx - 1 < w->nents && (evs[i].fflags & (NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB)) && !(evs[i].fflags & (NOTE_DELETE | NOTE_RENAME))) {
+                xs_fsw_push(&a, "change", w->ents[idx - 1].name);
+            }
+        }
+        if (rescan) { /* the names that came and went */
+            int n2;
+            char **now = xs_fsw_list(w->path, &n2);
+            for (int i = 0; i < w->nents; i++) {
+                bool still = false;
+                for (int k = 0; k < n2 && !still; k++) still = now[k] && strcmp(now[k], w->ents[i].name) == 0;
+                if (!still) {
+                    xs_fsw_push(&a, "rename", w->ents[i].name);
+                    if (w->ents[i].fd >= 0) close(w->ents[i].fd);
+                    free(w->ents[i].name);
+                    w->ents[i] = w->ents[--w->nents];
+                    i--;
+                }
+            }
+            for (int k = 0; k < n2; k++) {
+                bool had = false;
+                for (int i = 0; i < w->nents && !had; i++) had = strcmp(now[k], w->ents[i].name) == 0;
+                if (!had) {
+                    xs_fsw_push(&a, "rename", now[k]);
+                    xs_fsw_add_ent(w, now[k]);
+                }
+                free(now[k]);
+            }
+            free(now);
+            /* (an entry's udata is its place: re-registered after the moves above) */
+            for (int i = 0; i < w->nents; i++) if (w->ents[i].fd >= 0) xs_fsw_watch_fd(w, w->ents[i].fd, (intptr_t)i + 1, false);
+        }
+#else
+        char buf[8192] __attribute__((aligned(__alignof__(struct inotify_event))));
+        ssize_t len;
+        while ((len = read(w->fd, buf, sizeof buf)) > 0) {
+            for (char *p = buf; p < buf + len;) {
+                struct inotify_event *ev = (struct inotify_event *)p;
+                const char *name = ev->len ? ev->name : w->base;
+                if (ev->mask & IN_IGNORED) w->closing = true;
+                else if (ev->mask & (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF)) xs_fsw_push(&a, "rename", name);
+                else if (ev->mask & (IN_MODIFY | IN_ATTRIB)) xs_fsw_push(&a, "change", name);
+                p += sizeof(struct inotify_event) + ev->len;
+            }
+        }
+        if (w->closing && !a) break;
+#endif
+    }
+    xs_fsw *w = &xs_fsws[h];
+    if (w->closing) { /* the task's end: the watcher's resources go */
+        close(w->fd);
+#if defined(__APPLE__)
+        if (w->dirfd >= 0) close(w->dirfd);
+        for (int i = 0; i < w->nents; i++) { if (w->ents[i].fd >= 0) close(w->ents[i].fd); free(w->ents[i].name); }
+        free(w->ents);
+#endif
+        free(w->path);
+        free(w->base);
+        w->used = false;
+    }
+#else
+    (void)h;
+#endif
+    return a ? a : xs_arr_ref_new(0, xs_print_str_quoted_);
+}
+/* close(): the waiting task wakes and ends (its next xs_fsw_next gives nothing) */
+XS_NOINLINE void xs_fsw_close(int64_t h) {
+#if defined(__APPLE__) || defined(__linux__)
+    if (h < 0 || h >= xs_nfsws || !xs_fsws[h].used || xs_fsws[h].closing) return;
+    xs_fsw *w = &xs_fsws[h];
+    w->closing = true;
+#if defined(__APPLE__)
+    struct kevent u;
+    EV_SET(&u, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+    kevent(w->fd, &u, 1, NULL, 0, NULL);
+#else
+    inotify_rm_watch(w->fd, w->wd);
+#endif
+#else
+    (void)h;
+#endif
+}
+
 /* node:dns: lookup through the system resolver (getaddrinfo), as Node's dns.lookup; "" when the name is unknown */
 XS_NOINLINE xs_arr_ref *xs_dns_lookup_all(xs_str *host, int64_t family) {
     xs_arr_ref *out = xs_arr_ref_new(0, xs_print_str_quoted_);

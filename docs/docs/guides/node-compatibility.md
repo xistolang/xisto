@@ -921,6 +921,11 @@ a directory without `recursive` is Node's `SystemError` `ERR_FS_EISDIR`.
 `utimes`, and on file descriptors `open`, `read`, `write`, `close` (and `exists(path, cb)`): the work and the
 callback happen on a later turn of the event loop, `err` is `null` when it worked. `fs.glob(pattern, options?, cb)`
 and `fs.promises.glob(pattern, options?)` (an async iterator) give `globSync`'s matches.
+`fs.watch(path, options?, listener?)` gives an `FSWatcher` (`'change'` with `(eventType, filename)`, `close()` and
+`'close'`, `ref()`/`unref()`, `{ persistent: false }`): a name created, removed or renamed in a watched directory is
+`"rename"`, a write `"change"`. Linux uses inotify, as Node; macOS uses kqueue where Node uses FSEvents, so the event
+types can differ there (FSEvents reports a write as `"rename"` at times, and what happened just before the watcher
+started). `recursive` is accepted, but only the directory's own entries are watched.
 
 **Promises**: `node:fs/promises` and `fs.promises` (also `import { promises } from "node:fs"`): `readFile`
 (text with an encoding, else a `Buffer`), `writeFile`, `appendFile`, `unlink`, `mkdir`, `readdir`, `stat`,

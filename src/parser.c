@@ -6823,7 +6823,7 @@ static void apply_local_exports(Program *prog, Module *m, int top_start) {
    import { X }, makes it a re-export of xisto:fs. */
 static const char *const fs_cb_names[] = {"readFile", "writeFile", "appendFile", "mkdir", "readdir", "stat", "lstat", "fstat", "rm",
                                           "rmdir", "rename", "access", "unlink", "copyFile", "cp", "realpath", "mkdtemp", "readlink",
-                                          "symlink", "link", "chmod", "truncate", "utimes", NULL};
+                                          "symlink", "link", "chmod", "truncate", "utimes", "watch", "FSWatcher", NULL};
 static const char *const fs_stream_names[] = {"createReadStream", "createWriteStream", "ReadStream", "WriteStream", NULL};
 static bool fs_names(const char *src, Import *im, const char *const *names) {
     for (const char *const *n = names; *n; n++) {
