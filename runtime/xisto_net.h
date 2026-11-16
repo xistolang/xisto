@@ -856,7 +856,11 @@ static XS_TLS xs_coro *xs_tick_head, *xs_tick_tail, *xs_imm_head, *xs_imm_tail; 
    before its nextTick callbacks. Afterwards (in callbacks), the nextTick queue comes first. */
 static XS_TLS bool xs_esm_first = true;
 static void xs_preg_drop(void);
-static void xs_unh_check(void); /* (Promise values, below) */
+static XS_TLS xs_promise *xs_unh; /* (Promise values, below) rejected, no handler yet */
+XS_NOINLINE void xs_unh_check_slow(void);
+/* a rejection nothing handled: checked each loop turn, so only a load when there is none (a macro: the slow part
+   is what can fail, and stays a call) */
+#define xs_unh_check() do { if (xs_unh) xs_unh_check_slow(); } while (0)
 /* setTimeout from node:timers/promises: inside a handler the coroutine sleeps and the server keeps going */
 XS_NOINLINE void xs_sleep_ms(int64_t ms) {
     if (ms < 0) ms = 0;
@@ -1113,13 +1117,11 @@ XS_NOINLINE void xs_par_check(xs_tgroup *g) {
 }
 static inline xs_val xs_par_take(xs_tgroup *g, int i) { g->t[i].taken = true; return g->t[i].out; }
 /* the program ends when the background tasks (race losers) do, as in Node */
-/* set only by programs that use them (the runtime's sections are compiled in only when used): node:http's server,
-   which runs the loop until it is closed, and the timers that were unref'd, let go at the end */
-static XS_TLS void (*xs_http_pending)(void); /* (per thread: a worker's drain must not run the main thread's server) */
+/* set only by programs that use them (the runtime's sections are compiled in only when used): the timers that were
+   unref'd, let go at the end */
 static XS_TLS void (*xs_unref_drop)(void);
 static XS_TLS void (*xs_unref_kill)(void); /* (the tasks of unref'd sockets, parked: below) */
 XS_NOINLINE void xs_tasks_drain(void) {
-    if (xs_http_pending && !xs_cur_coro) { void (*h)(void) = xs_http_pending; xs_http_pending = NULL; h(); }
     if (xs_tasks_live > 0 && !xs_cur_coro) xs_loop_run(NULL, NULL, -1);
     xs_unh_check();
     if (xs_unref_drop) xs_unref_drop();
@@ -1172,7 +1174,6 @@ static void xs_preg_del(xs_promise *p) {
     last->reg_ix = i + 1;
     p->reg_ix = 0;
 }
-static XS_TLS xs_promise *xs_unh; /* rejected, no handler yet */
 static void xs_promise_free(void *p) {
     xs_promise *q = p;
     if (q->state == 1 && q->kind == 3) xs_release_(q->val.p);
@@ -1258,8 +1259,7 @@ XS_NOINLINE void xs_unh_dispatch(void) {
     }
 }
 /* a rejection that no handler took by the time the loop has nothing ready: the program ends, as in Node */
-XS_NOINLINE void xs_unh_check(void) {
-    if (!xs_unh) return;
+XS_NOINLINE void xs_unh_check_slow(void) {
     if (xs_rejection_cb) { xs_unh_dispatch(); if (!xs_unh) return; }
     xs_promise *p = xs_unh;
     while (p->unh_next) p = p->unh_next; /* the first rejected */
@@ -3177,11 +3177,10 @@ static bool xs_server_flush(xs_client *c) {
     return true;
 }
 
-typedef struct { xs_Server *s; int64_t port; int index; int lfd; bool inline_loop; } xs_worker_args; /* inline_loop: node:http (below) */
+typedef struct { xs_Server *s; int64_t port; int index; int lfd; } xs_worker_args;
 
 /* ---- graceful shutdown: SIGTERM/SIGINT stop accepting, in-flight requests finish, then the process exits ---- */
 static volatile sig_atomic_t xs_shutting_down;
-static bool xs_http_closing; /* node:http's server.close() (xs_http_close, below) */
 static uint64_t xs_psig_mask; /* the signals process.on watches (runtime/node/process.ts): the server leaves them to it */
 static uint64_t xs_shutdown_t0;
 static int xs_sig_pipe[2] = {-1, -1};
@@ -3325,32 +3324,9 @@ XS_NOINLINE void xs_Server_listen(xs_Server *s, int64_t port) {
     xs_server_worker(&a);
 }
 
-/* ---- node:http (runtime/node/http.ts): server.listen() binds at once and returns, as Node's does; the server
-   runs on the program's event loop once the program's own code is done (xs_tasks_drain), and server.close() lets
-   the loop end (the program then exits when nothing else is pending) instead of exiting at once ---- */
-static xs_Server *xs_http_srv;
-static int xs_http_lfd = -1;
-static int64_t xs_http_port;
-XS_NOINLINE void xs_http_serve(void);
-XS_NOINLINE int64_t xs_http_bind(xs_Server *s, int64_t port) {
-    if (xs_http_srv) xs_panic("node:http: one server per program (xisto)");
-    xs_resolver_warm();
-    signal(SIGPIPE, SIG_IGN);
-    int lfd = xs_listen_socket(port);
-    struct sockaddr_in a;
-    socklen_t al = sizeof a;
-    if (getsockname(lfd, (struct sockaddr *)&a, &al) == 0) port = ntohs(a.sin_port);
-    xs_http_srv = xs_retain(s);
-    xs_http_lfd = lfd;
-    xs_http_port = port;
-    if (xs_kq < 0) xs_kq = kqueue();
-    xs_http_pending = xs_http_serve;
-    xs_exit_hook = xs_tasks_drain;
-    return port;
-}
 #ifdef XS_WITH_TLS
-/* node:https: the certificate and key come as PEM text (Node's options); the TLS layer reads files, so they go
-   through two private temporary files, removed once read */
+/* node:https (xs_tlss_cred): the certificate and key come as PEM text (Node's options); the TLS layer reads files,
+   so they go through two private temporary files, removed once read */
 XS_NOINLINE char *xs_pem_tmp(xs_str *pem) {
     const char *dir = getenv("TMPDIR");
     char *path = malloc(4096);
@@ -3363,35 +3339,7 @@ XS_NOINLINE char *xs_pem_tmp(xs_str *pem) {
     close(fd);
     return path;
 }
-XS_NOINLINE int64_t xs_https_bind(xs_Server *s, int64_t port, xs_str *cert, xs_str *key) {
-    char *cp = xs_pem_tmp(cert), *kp = xs_pem_tmp(key);
-    xs_str *c = xs_str_new(cp, strlen(cp)), *k = xs_str_new(kp, strlen(kp));
-    s->cred = xs_tls_cred_load_any(c, k);
-    unlink(cp);
-    unlink(kp);
-    free(cp);
-    free(kp);
-    xs_release(c);
-    xs_release(k);
-    return xs_http_bind(s, port);
-}
 #endif
-XS_NOINLINE void xs_http_close(void) {
-    if (xs_http_lfd < 0 && !xs_http_srv) return;
-    xs_http_closing = true;
-    xs_shutting_down = 1;
-    if (!xs_shutdown_t0) xs_shutdown_t0 = xs_now();
-}
-XS_NOINLINE void xs_http_serve(void) {
-    xs_Server *s = xs_http_srv;
-    xs_worker_args a = {s, xs_http_port, 0, xs_http_lfd, true};
-    if (!xs_http_closing) xs_server_worker(&a);
-    else close(xs_http_lfd);
-    xs_http_srv = NULL;
-    xs_http_lfd = -1;
-    xs_shutdown_t0 = 0;
-    xs_release(s);
-}
 XS_NOINLINE void *xs_server_worker(void *arg) {
     xs_worker_args *wa = arg;
     xs_Server *s = wa->s;
@@ -3399,28 +3347,18 @@ XS_NOINLINE void *xs_server_worker(void *arg) {
     int lfd = wa->lfd;
     int one = 1;
 
-    /* node:http's server shares the program's event loop: its pending timers and sockets go on (xs_kq) */
-    int kq = wa->inline_loop && xs_kq >= 0 ? xs_kq : kqueue();
+    int kq = kqueue();
     xs_kq = kq;
     struct kevent ev;
     EV_SET(&ev, lfd, EVFILT_READ, EV_ADD, 0, 0, &xs_listen_tag);
     kevent(kq, &ev, 1, NULL, 0, NULL);
-    if (wa->index == 0 && !wa->inline_loop) fprintf(stderr, "xisto: listening on %s://127.0.0.1:%lld\n", s->cred ? "https" : "http", (long long)port);
+    if (wa->index == 0) fprintf(stderr, "xisto: listening on %s://127.0.0.1:%lld\n", s->cred ? "https" : "http", (long long)port);
     fflush(stdout);
 
     xs_server_signals(kq);
     struct kevent events[256];
     for (;;) {
         xs_coro_flush_dead();
-        if (xs_shutting_down && xs_inflight_total == 0 && wa->inline_loop && xs_http_closing) {
-            /* node:http's server.close(): no more connections; the program goes on (its loop, then its end) */
-            EV_SET(&ev, lfd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-            kevent(kq, &ev, 1, NULL, 0, NULL);
-            close(lfd); /* (idle keep-alive connections stay open until the program ends; their events are ignored) */
-            xs_shutting_down = 0;
-            xs_http_closing = false;
-            return NULL;
-        }
         if (xs_shutting_down && xs_inflight_total == 0) {
             if (wa->index == 0) fprintf(stderr, "xisto: shutdown complete\n");
             fflush(stdout);
