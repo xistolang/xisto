@@ -93,4 +93,47 @@ printf 'import "nothere";\nconsole.log("x");\n' > missing.ts
 $X build -o app missing.ts 2>&1 | grep -q "cannot resolve 'nothere'" && echo "ok: import \"pkg\" of a missing package is reported"
 printf 'import "reflect-metadata";\nconsole.log("no package");\n' > refl.ts
 $X build -o app refl.ts && [ "$(./app)" = "no package" ] && echo "ok: import \"reflect-metadata\" without the package still builds (as before)"
+# Intl is the intl package's (xisto add intl), not built in: Intl.X is its class Intl_X, and n.toLocaleString(locale),
+# d.toLocaleDateString(locale) and s.localeCompare(t, locale) go to its __intl_* functions; without it, an error
+mkdir -p "$W/intlapp/.xisto/pkgs/intl" && cd "$W/intlapp"
+cat > .xisto/pkgs/intl/index.ts <<'TS'
+export interface Intl_NumberFormatOptions {
+  style?: string;
+}
+export class Intl_NumberFormat {
+  tag: string;
+  constructor(locales: string | null = null, options: Intl_NumberFormatOptions | null = null) {
+    this.tag = (locales ?? "default") + "/" + ((options ?? {}).style ?? "decimal");
+  }
+  format(n: number): string {
+    return "nf(" + this.tag + "):" + n;
+  }
+}
+export function __intl_number_to_locale(n: number, locales: string | null = null, options: Intl_NumberFormatOptions | null = null): string {
+  return new Intl_NumberFormat(locales, options).format(n);
+}
+export function __intl_date_to_locale(d: Date, kind: string, locales: string | null = null, options: Intl_NumberFormatOptions | null = null): string {
+  return kind + "(" + (locales ?? "") + "):" + d.getUTCFullYear();
+}
+export function __intl_locale_compare(a: string, b: string, locales: string | null = null, options: Intl_NumberFormatOptions | null = null): number {
+  return a < b ? -2 : 2;
+}
+TS
+cat > main.ts <<'TS'
+const o: Intl.NumberFormatOptions = { style: "percent" };
+console.log(new Intl.NumberFormat("pt-BR", o).format(1));
+const d = new Date(Date.UTC(2026, 0, 2));
+console.log((5).toLocaleString("pt-BR"), d.toLocaleDateString("pt-BR"), d.toLocaleString("en-US", {}), "a".localeCompare("b", "pt-BR"));
+TS
+want=$(printf 'nf(pt-BR/percent):1\nnf(pt-BR/decimal):5 date(pt-BR):2026 any(en-US):2026 -2')
+$X build -o app main.ts && [ "$(./app)" = "$want" ] && echo "ok: Intl and toLocaleString / localeCompare with a locale are the intl package's"
+cat > plain.ts <<'TS'
+console.log((5).toLocaleString(), "a".localeCompare("b"));
+TS
+$X build -o app plain.ts && [ "$(./app)" = "5 -1" ] && echo "ok: toLocaleString() and localeCompare(t) without a locale stay built in"
+rm -rf .xisto
+$X build -o app main.ts 2>&1 | grep -q "package 'intl' is not installed" && $X build -o app main.ts 2>&1 | grep -q "xisto add intl" && echo "ok: Intl without the intl package: an error that says xisto add intl"
+printf 'console.log((1234.5).toLocaleString("pt-BR"));\n' > builtin.ts
+$X build -o app builtin.ts && [ "$(./app)" = "1.234,5" ] && echo "ok: n.toLocaleString(locale) without the package: the built-in pt-BR / en-US form (as before)"
+cd "$W"
 rm -rf "$W"
