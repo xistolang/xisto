@@ -325,6 +325,8 @@ if sel lean; then
         if nm "$OUT/lean" | grep -E 'xs_(chain_pass|map_task|rap_task|chain_task)$' > /dev/null; then echo "FAIL lean: a parallel task is linked"; lean_ok=0; fi
         # check() is called twice from the top level, once each: no copy of it per call (emit.c, cold_site)
         if grep -E 'f[0-9]+_check_k[0-9]+' "$OUT/lean.c" > /dev/null; then echo "FAIL lean: a call that runs once has its own copy of the function"; lean_ok=0; fi
+        # Opts is never printed: its print function is empty (emit.c, find_printable; tests/ok/print-reach.ts prints through other types)
+        if ! grep -E 'static void c[0-9]+_Opts_print\(void \*p\) \{ \(void\)p; \}' "$OUT/lean.c" > /dev/null; then echo "FAIL lean: a class nothing prints has its print function"; lean_ok=0; fi
     fi
     if [ $lean_ok = 1 ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
 fi

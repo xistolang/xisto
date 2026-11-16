@@ -599,6 +599,7 @@ struct Class {
     bool is_default;   /* export default class X, or export default X; of a class declared here */
     bool used;
     bool made;         /* prune.c: an object of it can exist (new, a literal, a decoder) */
+    bool printable;    /* emitter (find_printable): console.log & co can print an object of it; else its print function is empty */
     Field *fields;
     int nfields, cap_fields;
     Func **methods;

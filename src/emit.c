@@ -13845,7 +13845,9 @@ static void emit_class(Class *c) {
         /* (a Map<symbol, V>: printed as Node prints the Map) */
         buf_printf(out, "static void %s_print(void *p) { xs_print_okmap(p, ((%s *)p)->%s, ((%s *)p)->%s); }\n", c->cname, c->cname,
                    c->fields[find_field_idx(c, "vals")].cname, c->cname, c->fields[find_field_idx(c, "ks")].cname);
-    } else emit_class_print(c, xs_sprintf("%s_print", c->cname), NULL, 0);
+    } else if (!c->printable) /* (nothing prints it: find_printable) */
+        buf_printf(out, "static void %s_print(void *p) { (void)p; }\n", c->cname);
+    else emit_class_print(c, xs_sprintf("%s_print", c->cname), NULL, 0);
 
     if (in_hierarchy(c)) { emit_hier_ctor(c); goto methods; }
     /* constructor */
@@ -14153,6 +14155,96 @@ static void find_run_once(Program *p) {
     for (int k = 0; k < nro; k++) ro_edges[k].site->cold_site = !ro_edges[k].hot && (!ro_edges[k].caller || ro_edges[k].caller->once);
     free(all);
     #undef RO_PUSH
+}
+
+/* ---- classes a program can print ----
+   console.log of a value prints it through its type's print function, which for a class is code generated from its
+   fields: a program that never prints an object of a class has no use for that code (an options class of a package,
+   its locale data). A class is printable when a value whose type can hold one of its objects (the class, a base, an
+   interface it is made from, an array, map, union... of those, a field of a printable class) reaches console.*, a
+   throw, an Error's arguments (the cause is printed), or a parameter of type unknown or object (util.inspect, a
+   logger). An unknown anywhere in the program (it can hold any object), and --debug (the debugger prints
+   variables), make every class printable. */
+static bool print_all;
+static void pr_mark_class(Class *c);
+static void pr_mark(Type *t) {
+    if (!t || print_all) return;
+    switch (t->kind) {
+    case TY_OBJECT: if (t->cls) pr_mark_class(t->cls); break;
+    case TY_ARRAY: case TY_SET: case TY_STREAM: case TY_NULLABLE: case TY_PROMISE: case TY_CHAN: pr_mark(t->elem); break;
+    case TY_MAP: pr_mark(t->key); pr_mark(t->elem); break;
+    case TY_UNION: case TY_TUPLE: for (int i = 0; i < t->nparams; i++) pr_mark(t->params[i]); break;
+    case TY_UNKNOWN: case TY_TPARAM: print_all = true; break;
+    default: break;
+    }
+}
+static void pr_mark_class(Class *c) {
+    if (!c || c->printable || c->builtin) return;
+    c->printable = true;
+    for (int i = 0; i < c->nfields; i++) pr_mark(c->fields[i].type);
+    for (int i = 0; i < c->nsubs; i++) pr_mark_class(c->subs[i]);
+    for (int i = 0; i < c->nadapters; i++) pr_mark_class(c->adapters[i]);
+    if (c->adapter_of) pr_mark_class(c->adapter_of);
+}
+static bool pr_dynamic(Type *t) { /* a type that holds any object */
+    if (!t || ty_is_undef(t)) return false;
+    switch (t->kind) {
+    case TY_UNKNOWN: case TY_TPARAM: return true;
+    case TY_ARRAY: case TY_SET: case TY_STREAM: case TY_NULLABLE: case TY_PROMISE: case TY_CHAN: return pr_dynamic(t->elem);
+    case TY_MAP: return pr_dynamic(t->key) || pr_dynamic(t->elem);
+    case TY_UNION: case TY_TUPLE: for (int i = 0; i < t->nparams; i++) if (pr_dynamic(t->params[i])) return true; return false;
+    default: return false;
+    }
+}
+static bool pr_is_error(Class *c) {
+    for (; c; c = c->base) if (!strcmp(c->name, "Error") || strstr(c->name, "Error")) return true;
+    return false;
+}
+static void pr_stmt(Stmt *s);
+static void pr_expr(Expr *e) {
+    if (!e || print_all) return;
+    if (pr_dynamic(e->type)) { print_all = true; return; }
+    bool sink = false;
+    if (e->kind == E_MEMBER && e->is_call && e->lhs && e->lhs->kind == E_IDENT && !e->lhs->cname && e->lhs->str && !strcmp(e->lhs->str, "console")) sink = true;
+    if (e->kind == E_NEW_OBJ && e->cls && pr_is_error(e->cls)) sink = true; /* (its cause, its errors) */
+    const char *cfn = e->builtin.cfn;
+    if (cfn && (strstr(cfn, "reject") || strstr(cfn, "print") || strstr(cfn, "inspect") || strstr(cfn, "format") || strstr(cfn, "assert"))) sink = true;
+    if (sink) for (int i = 0; i < e->args.len; i++) pr_mark(e->args.items[i]->type);
+    Func *f = e->kind == E_NEW_OBJ ? (e->cls ? e->cls->ctor : NULL) : (e->kind == E_CALL || (e->kind == E_MEMBER && e->is_call)) ? e->func : NULL;
+    if (f) /* an argument passed where any object goes (a parameter unknown, or of a template) */
+        for (int i = 0; i < e->args.len && i < f->nparams; i++) if (pr_dynamic(f->params[i].type)) pr_mark(e->args.items[i]->type);
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) pr_stmt(e->arrow->fn->body);
+    pr_expr(e->lhs);
+    pr_expr(e->rhs);
+    for (int i = 0; i < e->args.len; i++) pr_expr(e->args.items[i]);
+}
+static void pr_stmt(Stmt *s) {
+    if (!s || print_all) return;
+    if (s->kind == S_THROW && s->expr) pr_mark(s->expr->type); /* (an uncaught throw prints what it threw) */
+    if (pr_dynamic(s->type)) { print_all = true; return; }
+    pr_expr(s->init); pr_expr(s->expr); pr_expr(s->cond); pr_expr(s->for_update);
+    pr_stmt(s->for_init); pr_stmt(s->body); pr_stmt(s->else_body);
+    for (int i = 0; i < s->stmts.len; i++) pr_stmt(s->stmts.items[i]);
+    for (int i = 0; i < s->ncases; i++) { pr_expr(s->cases[i].value); pr_stmt(s->cases[i].body); }
+}
+static void pr_func(Func *f) {
+    if (!f || print_all || f->ntparams) return; /* (a template: its instances are walked) */
+    for (int i = 0; i < f->nparams; i++) if (pr_dynamic(f->params[i].type)) print_all = true;
+    if (pr_dynamic(f->ret)) print_all = true;
+    pr_stmt(f->body);
+}
+static void find_printable(Program *p) {
+    print_all = xs_debug || getenv("XISTO_PRINT_ALL") != NULL;
+    for (int i = 0; i < p->nfuncs && !print_all; i++) if (p->funcs[i]->used && p->funcs[i]->body) pr_func(p->funcs[i]);
+    for (int i = 0; i < p->nclasses && !print_all; i++) {
+        Class *c = p->classes[i];
+        if (!c->used || c->builtin || c->ntparams) continue;
+        for (int k = 0; k < c->nfields; k++) { if (pr_dynamic(c->fields[k].type)) print_all = true; pr_expr(c->fields[k].init); }
+        if (c->ctor) pr_func(c->ctor);
+        for (int k = 0; k < c->nmethods; k++) if (c->methods[k]->cls == c && c->methods[k]->body) pr_func(c->methods[k]);
+    }
+    for (int i = 0; i < p->top.len && !print_all; i++) pr_stmt(p->top.items[i]);
+    if (print_all) for (int i = 0; i < p->nclasses; i++) p->classes[i]->printable = true;
 }
 
 /* ---- objects without a header ----
@@ -14820,6 +14912,7 @@ void emit_program(Program *p, Buf *o) {
     use_cln = (p->uses_net || program_has_try(p)) && !getenv("XISTO_NO_CLN"); /* XISTO_NO_CLN: measuring knob */
     find_consumed(p);
     find_run_once(p);
+    find_printable(p);
     nohdr_compute(p);
     cptr_compute(p);
     once_compute(p);
@@ -15492,7 +15585,9 @@ void emit_program(Program *p, Buf *o) {
     if (arrow_fns.data) buf_puts(out, arrow_fns.data);
     if (gen_fns.data) { buf_puts(out, gen_fns.data); gen_fns.len = 0; gen_fns.data[0] = 0; }
     buf_puts(out, body.data ? body.data : "");
-    for (int i = 0; i < nlit_ords; i++) emit_class_print(lit_ords[i].c, xs_sprintf("%s_print", lit_ord_name(i)), lit_ords[i].ord, lit_ords[i].n);
+    for (int i = 0; i < nlit_ords; i++)
+        if (lit_ords[i].c->printable) emit_class_print(lit_ords[i].c, xs_sprintf("%s_print", lit_ord_name(i)), lit_ords[i].ord, lit_ords[i].n);
+        else buf_printf(out, "static void %s_print(void *p) { (void)p; }\n", lit_ord_name(i));
     nlit_ords = 0;
     if (jam_used) { /* the jam versions of the callbacks (XB-083) */
         buf_printf(out, "\nstatic void *xs_jam8_of(void *fn) {\n%s    (void)fn;\n    return NULL;\n}\n", jam_tab.data ? jam_tab.data : "");
