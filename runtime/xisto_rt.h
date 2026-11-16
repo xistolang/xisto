@@ -6204,6 +6204,7 @@ static xs_str *xs_process_cwd(void) { /* process.cwd() */
     return xs_str_new(b, strlen(b));
 }
 static int xs_exit_code_; /* process.exitCode: the status when the program ends on its own */
+static bool xs_exit_code_set_; /* (process.exitCode reads null until it is set, as on Node) */
 /* process.on('exit' | 'beforeExit'): runtime/node/process.ts's dispatcher, called with (code, before) */
 static xs_closure *xs_pexit_cb;
 static void (*xs_rt_cleanup)(void); /* (process.ts's signal dispatcher, let go at the end) */
@@ -6233,6 +6234,7 @@ XS_NOINLINE bool xs_pexit_call(xs_closure *cb, int64_t code, bool before) {
 }
 XS_NOINLINE void xs_process_exit(int64_t code) {
     xs_exit_code_ = (int)code;
+    xs_exit_code_set_ = true;
     if (xs_pexit_cb) { /* 'exit' (not 'beforeExit'), as Node does for process.exit() */
         xs_closure *cb = xs_pexit_cb;
         xs_pexit_cb = NULL;
@@ -6252,7 +6254,7 @@ static void xs_uncaught_exit(void *err) {
     if (e->trace) xs_trace_print(e->trace, stderr);
     xs_process_exit(1);
 }
-static int64_t xs_process_set_exit_code(int64_t code) { xs_exit_code_ = (int)code; return code; }
+static int64_t xs_process_set_exit_code(int64_t code) { xs_exit_code_ = (int)code; xs_exit_code_set_ = true; return code; }
 /* process.stdout.write / process.stderr.write: through the same FILE as console.log, so the order is kept */
 static inline void xs_out_drain(void);
 static bool xs_stdout_write_str(xs_str *s) { xs_out_drain(); fwrite(s->data, 1, (size_t)s->len, XS_OUT); return true; }

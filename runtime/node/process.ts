@@ -22,6 +22,7 @@ declare function process_kill(pid: int, sig: int): int;
 declare function process_umask(mask: int): int;
 declare function process_ids(which: int): int;
 declare function process_get_exit_code(): int;
+declare function process_exit_code_set(): boolean;
 declare function process_on_exit(cb: (code: int, before: boolean) => void): void;
 declare function process_signal_watch(sig: int, cb: (sig: int) => void): void;
 declare function process_signal_unwatch(sig: int): void;
@@ -256,8 +257,9 @@ export class XistoProcess {
   static getegid(): int {
     return process_ids(3);
   }
-  static getExitCode(): int {
-    return process_get_exit_code();
+  /** process.exitCode: null until it is set (by process.exitCode = n or process.exit(n)), as on Node */
+  static getExitCode(): int | null {
+    return process_exit_code_set() ? process_get_exit_code() : null;
   }
   static abort(): void {
     XistoProcess.kill(process.pid, "SIGABRT");

@@ -4395,6 +4395,7 @@ XS_NOINLINE int64_t xs_process_ids(int64_t which) { /* 0 uid, 1 gid, 2 euid, 3 e
 #endif
 }
 XS_NOINLINE int64_t xs_process_get_exit_code(void) { return xs_exit_code_; }
+XS_NOINLINE bool xs_process_exit_code_set(void) { return xs_exit_code_set_; }
 /* process.on('SIGINT' | 'SIGTERM' | ...): the handler writes the signal's number to a pipe; a coroutine on the event
    loop reads it and calls the dispatcher (process.ts), which emits the event. It does not keep the program alive. */
 static int xs_psig_pipe[2] = {-1, -1};
