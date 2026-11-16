@@ -1,5 +1,6 @@
-/* TLS for Xisto with AWS-LC (OpenSSL-compatible API, BoringSSL fork): PoC backend selected with
-   XISTO_TLS=awslc at build time, same interface as runtime/xisto_tls.h (BearSSL).
+/* TLS for Xisto with AWS-LC (OpenSSL-compatible API, BoringSSL fork): the default backend when AWS-LC was built
+   next to xisto (build/awslc); --tls=bearssl or XISTO_TLS=bearssl choose runtime/xisto_tls.h (BearSSL, TLS 1.2)
+   instead. The same interface as that file.
    Client: system CA bundle (SSL_CERT_FILE overrides, NODE_EXTRA_CA_CERTS adds), host name checked.
    Server: PEM chain + key; TLS 1.2 and 1.3; session cache and tickets on by default. */
 #include <openssl/ssl.h>

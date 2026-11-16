@@ -1,5 +1,12 @@
-/* Xisto network runtime: HTTP/1.1 client (fetch) and server (Server). Embedded only when the program uses them.
-   Single thread, kqueue, non-blocking sockets, keep-alive, no TLS. */
+/* Xisto network runtime: the event loop and what runs on it. Embedded only when the program can reach it (an
+   await, a timer, fetch, a server, a stream...: the checker decides, XB-250).
+   - The loop: kqueue (macOS), a kqueue look-alike over epoll (Linux) or WSAPoll (Windows); non-blocking sockets;
+     each request handler, timer and async function a coroutine on a small stack of its own.
+   - HTTP/1.1 client (fetch) and server (Server, node:http) with keep-alive and graceful shutdown; HTTPS through
+     runtime/xisto_tls.h (BearSSL) or runtime/xisto_tls_awslc.h (AWS-LC), appended when the program can use TLS.
+   - node:net, node:tls client sockets, node:child_process, fs streams, setTimeout/setImmediate/process.nextTick
+     in Node's order, generators, Promise.all/race.
+   - Threads (XS_THREADS): server workers (XISTO_WORKERS, one loop per thread) and worker_threads. */
 #if defined(_WIN32)
 /* ======== Windows: the POSIX layer the rest of this file needs ======== */
 /* Windows (xisto build --target=windows-x64): the POSIX calls the network runtime makes, over Winsock and

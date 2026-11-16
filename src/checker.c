@@ -11044,7 +11044,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             return;
         }
         if (e->lhs->type->kind == TY_STRING)
-            xs_error(XS6033, e->pos, "use s.slice(i, i + 1)", "strings cannot be indexed in xisto-2");
+            xs_error(XS6033, e->pos, "use s.charAt(i) ('' past the end) or s.slice(i, i + 1), or build with --tsc-checked", "strings cannot be indexed: s[i] past the end is undefined, which xisto does not have");
         if (is_bytes(e->lhs->type)) { /* b[i]: a byte, as an int (bounds checked) */
             expect_type(e->rhs, ty_int, "byte index");
             e->builtin.cfn = "xs_u8_get";
