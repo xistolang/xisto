@@ -3098,6 +3098,14 @@ static Binding *lookup(const char *name) {
    same object (a parameter it was passed to) is not seen: it changes the object, where Node would not. */
 static Expr *frozen_val; /* the last Object.freeze(...) checked (its node, now the value) */
 static bool this_call_rewrite(Expr *e, Type *expected);
+/* o[k] with o an any and k a symbol: refused (an object's keys are names here; symbol-keyed entries go in a Map) */
+static bool dyn_key_symbol(Expr *k) {
+    Type *t = k->type ? ty_strip_null(k->type) : NULL;
+    if (!(t && t->kind == TY_OBJECT && t->cls && t->cls->builtin && !strcmp(t->cls->name, "symbol"))) return false;
+    xs_error(XS6035, k->pos, "keep entries keyed by symbols in a Map<symbol, V> (m.set(k, v), m.get(k)), or give the object a type with the key: { [KEY]: v }",
+             "an any is not indexed by a symbol: its keys are names");
+    return true;
+}
 /* { [T]: v } and o[T] with T a const symbol: a field of its own, named __sym_<T's C name> (no other name can be), shown
    by console.log as Node shows it, after the string keys, and left out of JSON.stringify and Object.keys */
 static const char **sym_fields, **sym_shown;
@@ -11105,6 +11113,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     key = target->rhs;
                     check_expr(key, NULL);
                     if (key->type->kind == TY_LITINT) coerce_lit(key, ty_int); else settle(key);
+                    dyn_key_symbol(key);
                     if (key->type->kind != TY_STRING) { to_any(key); fn = "xs_dyn_set_any"; }
                 }
                 check_expr(e->rhs, ty_any);
@@ -11152,6 +11161,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     key = target->rhs;
                     check_expr(key, NULL);
                     if (key->type->kind == TY_LITINT) coerce_lit(key, ty_int); else settle(key);
+                    dyn_key_symbol(key);
                     if (key->type->kind != TY_STRING) { to_any(key); fn = "xs_dyn_set_any"; }
                 }
                 check_expr(e->rhs, ty_any);
@@ -12235,6 +12245,12 @@ static void check_expr_in(Expr *e, Type *expected) {
     case E_INDEX:
         if (sym_key_field(e->rhs)) { /* o[T], T a const symbol: o's field for T */
             Expr *k = e->rhs;
+            check_expr(e->lhs, NULL);
+            e->lhs->prechecked = true;
+            if (ty_is_any(e->lhs->type)) { /* (an any is read by name: its symbol keys are not looked up) */
+                check_expr(k, NULL);
+                dyn_key_symbol(k);
+            }
             e->kind = E_MEMBER; e->str = (char *)sym_key_field(k); e->rhs = NULL; e->field = -1;
             check_expr(e, expected);
             return;
@@ -12318,6 +12334,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (k->type->kind == TY_STRING) dyn_call(e, "xs_dyn_get", ty_any, e->lhs, k, NULL);
             else if (k->type->kind == TY_INT) dyn_call(e, "xs_dyn_at", ty_any, e->lhs, k, NULL);
             else if (ty_is_any(k->type)) dyn_call(e, "xs_dyn_get_any", ty_any, e->lhs, k, NULL);
+            else if (dyn_key_symbol(k)) return;
             else xs_error(XS8091, k->pos, NULL, "an any is indexed by a string or an int, not %s", ty_name(k->type));
             return;
         }
