@@ -26,6 +26,7 @@ declare function net_address(fd: int, peer: boolean): string;
 declare function net_wake(port: int): void;
 declare function nhttp_parse(bytes: Uint8Array, start: int, end: int): string[];
 declare function nhttp_end(): int;
+declare function net_idle_alive(fd: int): boolean;
 
 /** The reason phrase of each status code. */
 export const STATUS_CODES: Record<string, string> = {
@@ -152,6 +153,10 @@ export class HttpTransport {
   }
   encrypted(): boolean {
     return false;
+  }
+  /** (http.Agent) an idle connection that can carry another request: still open, nothing unread on it. */
+  alive(): boolean {
+    return net_idle_alive(this.fd);
   }
 }
 
@@ -1175,6 +1180,211 @@ export interface RequestOptions {
   ca?: string | Uint8Array;
   /** (node:https) the name the certificate must have (SNI), when it is not the host's */
   servername?: string;
+  /** the Agent whose connections the request uses (false: a connection of its own, closed after it); by default
+   * the module's globalAgent */
+  agent?: Agent | boolean | null;
+}
+
+/** new Agent(options): keepAlive (reuse connections), keepAliveMsecs, maxSockets (per host), maxTotalSockets,
+ * maxFreeSockets, timeout (ms an idle connection is kept), scheduling ("lifo" or "fifo"). */
+export interface AgentOptions {
+  keepAlive?: boolean;
+  keepAliveMsecs?: number;
+  maxSockets?: number;
+  maxTotalSockets?: number;
+  maxFreeSockets?: number;
+  timeout?: number;
+  scheduling?: string;
+}
+
+/** What Agent.getName() reads: the host, the port, the local address and the family. */
+export interface AgentNameOptions {
+  host?: string;
+  port?: number | string;
+  localAddress?: string;
+  family?: number;
+}
+
+// an idle connection in an Agent's pool, and since when (ms)
+class FreeConn {
+  t: HttpTransport;
+  since: number;
+  constructor(t: HttpTransport) {
+    this.t = t;
+    this.since = Date.now();
+  }
+}
+
+/** Node's http.Agent: the connections of the requests made with it. With keepAlive, a connection whose response
+ * ended goes back to the agent and the next request to the same host and port takes it (req.reusedSocket); the
+ * request says "Connection: keep-alive" (else "Connection: close", and each request has its own connection).
+ * maxSockets limits the connections per host at a time (the other requests wait), maxTotalSockets all of them;
+ * maxFreeSockets the idle ones kept per host. An idle connection does not keep the program alive, and one the
+ * server closed is not reused. */
+export class Agent extends EventEmitter {
+  keepAlive: boolean = false;
+  keepAliveMsecs: number = 1000;
+  maxSockets: number = Infinity;
+  maxFreeSockets: number = 256;
+  maxTotalSockets: number = Infinity;
+  scheduling: string = "lifo";
+  timeout: number = 0;
+  defaultPort: int = 80;
+  protocol: string = "http:";
+  private free: Map<string, FreeConn[]> = new Map<string, FreeConn[]>();
+  private busy: Map<string, int> = new Map<string, int>();
+  private waiting: (() => void)[] = [];
+  private waitingFor: string[] = [];
+  private handed: Map<string, HttpTransport[]> = new Map<string, HttpTransport[]>();
+  private nbusy: int = 0;
+  private nfree: int = 0;
+
+  constructor(options: AgentOptions | null = null) {
+    super();
+    if (options !== null) {
+      this.keepAlive = options.keepAlive ?? false;
+      this.keepAliveMsecs = options.keepAliveMsecs ?? 1000;
+      this.maxSockets = options.maxSockets ?? Infinity;
+      this.maxFreeSockets = options.maxFreeSockets ?? 256;
+      this.maxTotalSockets = options.maxTotalSockets ?? Infinity;
+      this.scheduling = options.scheduling ?? "lifo";
+      this.timeout = options.timeout ?? 0;
+    }
+  }
+  /** The connections it has now, in use and idle. */
+  get totalSocketCount(): int {
+    return this.nbusy + this.nfree;
+  }
+  /** The key of a host's connections: "host:port:localAddress" (and ":family" for 4 or 6). */
+  getName(options: AgentNameOptions | null = null): string {
+    let name = "localhost";
+    if (options !== null) {
+      const h = options.host ?? "";
+      if (h.length > 0) name = h;
+    }
+    name += ":";
+    if (options !== null) {
+      const port = options.port;
+      if (typeof port === "number") {
+        if ((port as number) !== 0) name += String(port as number);
+      } else if (typeof port === "string") name += port as string;
+    }
+    name += ":";
+    if (options !== null) {
+      name += options.localAddress ?? "";
+      const fam = options.family ?? 0;
+      if (fam === 4 || fam === 6) name += ":" + String(fam);
+    }
+    return name;
+  }
+  /** Closes its idle connections (the ones in use close when their requests end); they leave totalSocketCount on the
+   * next tick, as their 'close' events do in Node. */
+  destroy(): void {
+    let n: int = 0;
+    for (const list of this.free.values()) {
+      for (const c of list) c.t.close();
+      n += list.length;
+    }
+    this.free.clear();
+    process.nextTick((): void => {
+      this.nfree -= n;
+    });
+  }
+  private busyOf(name: string): int {
+    return this.busy.get(name) ?? 0;
+  }
+  // a request may open (or take) a connection now: below maxSockets for its host and maxTotalSockets in all
+  private room(name: string): boolean {
+    return this.busyOf(name) < this.maxSockets && this.nbusy < this.maxTotalSockets;
+  }
+  /** (internal) waits until the request may have a connection of this host, then counts it in use. */
+  async _slot(name: string): Promise<void> {
+    while (!this.room(name)) {
+      await new Promise<void>((resolve) => {
+        this.waiting.push(resolve);
+        this.waitingFor.push(name);
+      });
+    }
+    this.busy.set(name, this.busyOf(name) + 1);
+    this.nbusy++;
+  }
+  /** (internal) whether the request has to wait for a connection (maxSockets reached). */
+  _full(name: string): boolean {
+    return !this.room(name);
+  }
+  /** (internal) counts a connection in use without waiting (there is room). */
+  _take(name: string): void {
+    this.busy.set(name, this.busyOf(name) + 1);
+    this.nbusy++;
+  }
+  /** (internal) an idle connection of this host to use again, or null (the stale ones are closed). */
+  _reuse(name: string): HttpTransport | null {
+    if (!this.keepAlive) return null;
+    const list = this.free.get(name);
+    if (list === null) return null;
+    while (list.length > 0) {
+      const c = this.scheduling === "fifo" ? (list.shift() as FreeConn) : (list.pop() as FreeConn);
+      this.nfree--;
+      const old = this.timeout > 0 && Date.now() - c.since > this.timeout;
+      if (!old && c.t.alive()) return c.t;
+      c.t.close();
+    }
+    return null;
+  }
+  /** (internal) the connection a request that waited was given (as Node hands a socket to a queued request: not
+   * counted as reused), or null. */
+  _handed(name: string): HttpTransport | null {
+    const list = this.handed.get(name);
+    if (list === null || list.length === 0) return null;
+    this.nfree--;
+    return list.shift() as HttpTransport;
+  }
+  private waits(name: string): boolean {
+    for (const w of this.waitingFor) if (w === name) return true;
+    return false;
+  }
+  /** (internal) the request is done with its connection: given to a request waiting for this host, kept for the next
+   * one (keepAlive, reusable) or closed. */
+  _done(name: string, t: HttpTransport | null, reusable: boolean): void {
+    this.busy.set(name, this.busyOf(name) - 1);
+    this.nbusy--;
+    if (t !== null && reusable && this.keepAlive && this.waits(name)) {
+      const found = this.handed.get(name);
+      const list: HttpTransport[] = found !== null ? found : [];
+      if (found === null) this.handed.set(name, list);
+      list.push(t);
+      this.nfree++;
+    } else if (t !== null) {
+      const found = this.free.get(name);
+      const list: FreeConn[] = found !== null ? found : [];
+      if (reusable && this.keepAlive && list.length < this.maxFreeSockets) {
+        if (found === null) this.free.set(name, list);
+        list.push(new FreeConn(t));
+        this.nfree++;
+      } else {
+        t.close();
+      }
+    }
+    // the first request waiting for a connection that there is room for now
+    for (let i = 0; i < this.waiting.length; i++) {
+      if (this.room(this.waitingFor[i])) {
+        const w = this.waiting[i];
+        this.waiting.splice(i, 1);
+        this.waitingFor.splice(i, 1);
+        w();
+        break;
+      }
+    }
+  }
+}
+
+/** The Agent of the requests that name none: keepAlive, as Node's since v19. */
+export let globalAgent: Agent = keepAliveAgent(new Agent(null));
+// (set field by field: an options object here would be compiled into every program that loads the module)
+function keepAliveAgent(a: Agent): Agent {
+  a.keepAlive = true;
+  a.timeout = 5000;
+  return a;
 }
 
 export type ResponseListener = (res: IncomingMessage) => void;
@@ -1194,6 +1404,8 @@ export class ClientRequest extends Writable {
   _diag: any = null;
   reusedSocket: boolean = false;
   aborted: boolean = false;
+  /** the Agent whose connection it uses (null: agent: false, a connection of its own) */
+  agent: Agent | null = null;
   private killed: boolean = false;
   /** the request's socket, from 'socket' on (null before): socket.unref() lets the program end while it is in flight
    * (an APM agent's send). Only ref()/unref() act on it: the connection itself is the request's HttpTransport. */
@@ -1206,6 +1418,7 @@ export class ClientRequest extends Writable {
   private task: Promise<void> | null = null;
   private timer: int = -1;
   private gotResponse: boolean = false;
+  private agentKey: string = "";
 
   constructor(url: string, method: string) {
     super(null);
@@ -1341,6 +1554,13 @@ export class ClientRequest extends Writable {
     this.emit("error", err);
     this.done();
   }
+  // the connection after the exchange: back to the agent (kept when reusable), or closed
+  private release(t: HttpTransport, reusable: boolean): void {
+    const agent = this.agent;
+    if (agent !== null) agent._done(this.agentKey, t, reusable);
+    else t.close();
+    this.t = null;
+  }
   private done(): void {
     if (this.timer >= 0) {
       clearTimeout(this.timer);
@@ -1365,14 +1585,33 @@ export class ClientRequest extends Writable {
       return;
     }
     const port = this.port.length > 0 ? Math.trunc(Number(this.port)) : this.defaultPort();
+    const agent = this.agent;
+    const key = this.host + ":" + String(port) + ":";
+    let handed: HttpTransport | null = null;
+    if (agent !== null) {
+      if (agent._full(key)) {
+        await agent._slot(key);
+        handed = agent._handed(key);
+      } else agent._take(key);
+    }
     let t: HttpTransport;
-    try {
-      t = this.open(this.host, port);
-    } catch (e) {
-      this.fail(e as Error);
-      return;
+    const reused = agent !== null && handed === null ? agent._reuse(key) : null;
+    if (handed !== null) {
+      t = handed;
+    } else if (reused !== null) {
+      t = reused;
+      this.reusedSocket = true;
+    } else {
+      try {
+        t = this.open(this.host, port);
+      } catch (e) {
+        if (agent !== null) agent._done(key, null, false);
+        this.fail(e as Error);
+        return;
+      }
     }
     this.t = t;
+    this.agentKey = key;
     const body = this.chunks.length === 1 ? this.chunks[0] : concat(this.chunks);
     this.chunks = [];
     let head = `${this.method} ${this.path.length > 0 ? this.path : "/"} HTTP/1.1\r\n`;
@@ -1389,11 +1628,11 @@ export class ClientRequest extends Writable {
     for (const k of this.headers.keys()) head += k + ": " + (this.headers.get(k) ?? "") + "\r\n";
     const m = this.method;
     if (!hasLen && (body.length > 0 || !(m === "GET" || m === "HEAD" || m === "DELETE" || m === "OPTIONS" || m === "TRACE" || m === "CONNECT"))) head += "Content-Length: " + String(body.length) + "\r\n";
-    if (!hasConn) head += "Connection: keep-alive\r\n";
+    if (!hasConn) head += agent !== null && agent.keepAlive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
     head += "\r\n";
     const out = body.length > 0 ? concat([Buffer.from(head), body]) : Buffer.from(head);
     if (t.writeAll(out, 0) < 0 && !this.killed) {
-      t.close();
+      this.release(t, false);
       this.fail(new HttpSystemError("EPIPE", "write", ""));
       return;
     }
@@ -1428,7 +1667,7 @@ export class ClientRequest extends Writable {
       pos = 0;
     }
     if (parts.length < 3) {
-      t.close();
+      this.release(t, false);
       this.fail(new HttpSystemError("ECONNRESET", "socket", " hang up"));
       return;
     }
@@ -1451,6 +1690,7 @@ export class ClientRequest extends Writable {
     const cl = msg.headers["content-length"];
     const code = msg.statusCode;
     let ok = true;
+    let delimited = true; // (the body's end is known: the connection can carry another request)
     if (this.method === "HEAD" || code === 204 || code === 304) {
       // (no body)
     } else if (te !== null && te.toLowerCase().includes("chunked")) {
@@ -1473,6 +1713,7 @@ export class ClientRequest extends Writable {
         left -= n;
       }
     } else {
+      delimited = false;
       if (buf.length > pos) msg._data(buf.subarray(pos));
       for (;;) {
         const chunk = t.read();
@@ -1480,7 +1721,9 @@ export class ClientRequest extends Writable {
         msg._data(chunk);
       }
     }
-    t.close();
+    const conn = msg.headers["connection"];
+    const keep = ok && delimited && !this.killed && parts[0] !== "1.0" && !(conn !== null && conn.toLowerCase().includes("close"));
+    this.release(t, keep);
     sock._closed();
     if (ok) msg._end();
     else {
@@ -1577,8 +1820,14 @@ export function _toUrl(target: string | URL | RequestOptions, defaultProtocol: s
 }
 
 /** (internal) the method and headers of request(), given to a ClientRequest made by http or https. */
-export function _setup(req: ClientRequest, target: string | URL | RequestOptions, callback: ResponseListener | null): ClientRequest {
+export function _setup(req: ClientRequest, target: string | URL | RequestOptions, callback: ResponseListener | null, defaultAgent: Agent | null = null): ClientRequest {
   const opts: RequestOptions | null = typeof target === "string" || target instanceof URL ? null : (target as RequestOptions);
+  req.agent = defaultAgent;
+  if (opts !== null) {
+    const a = opts.agent;
+    if (a instanceof Agent) req.agent = a as Agent;
+    else if (a === false) req.agent = null;
+  }
   if (opts !== null && opts.headers !== null) {
     const hs = opts.headers as Record<string, string>;
     for (const k of Object.keys(hs)) req.setHeader(k, hs[k] ?? "");
@@ -1597,7 +1846,7 @@ export function _method(target: string | URL | RequestOptions): string {
 
 /** Makes a request: call end() (with a body) to send it. */
 export function request(target: string | URL | RequestOptions, callback: ResponseListener | null = null): ClientRequest {
-  return _setup(new ClientRequest(_toUrl(target, "http:"), _method(target)), target, callback);
+  return _setup(new ClientRequest(_toUrl(target, "http:"), _method(target)), target, callback, globalAgent);
 }
 
 /** A GET request, sent at once. */

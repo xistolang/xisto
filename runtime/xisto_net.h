@@ -5125,6 +5125,17 @@ XS_NOINLINE int64_t xs_net_write(int64_t fd, xs_Uint8Array *bytes) { /* 0 when a
 }
 XS_NOINLINE void xs_net_shutdown(int64_t fd, int64_t how) { shutdown((int)fd, how == 0 ? SHUT_RD : how == 1 ? SHUT_WR : SHUT_RDWR); }
 XS_NOINLINE void xs_net_close(int64_t fd) { close((int)fd); }
+/* an idle keep-alive connection (http.Agent's free sockets) can be used again: nothing to read on it, not even its
+   end (a peer that closed it, or sent bytes nobody asked for, makes it unusable) */
+XS_NOINLINE bool xs_net_idle_alive(int64_t fd) {
+    if (fd < 0) return false;
+    struct pollfd p = {(int)fd, POLLIN, 0};
+    int r;
+    while ((r = poll(&p, 1, 0)) < 0 && errno == EINTR) {}
+    if (r < 0) return false;
+    if (r == 0) return true;
+    return false; /* (readable: its end, an error, or stray bytes) */
+}
 XS_NOINLINE int64_t xs_net_listen(xs_str *host, int64_t port) { /* the listening socket, or an error */
     signal(SIGPIPE, SIG_IGN);
     int lfd = socket(AF_INET, SOCK_STREAM, 0);

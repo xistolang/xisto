@@ -325,10 +325,21 @@ The client side, `http.request(url | options, cb)` and `http.get(...)`, gives a 
 (`statusCode`, `statusMessage`, `headers`, `'data'`/`'end'`). The response's body comes as it arrives (a
 server-sent events stream can be read), as Buffers. `STATUS_CODES` and `METHODS` are there too.
 
+Connections go through an `http.Agent` (`https.Agent`), as in Node: `http.globalAgent` by default (keep-alive, as
+Node's since v19), the `agent` option for another one, `agent: false` for a connection of the request's own.
+`new Agent({ keepAlive, keepAliveMsecs, maxSockets, maxTotalSockets, maxFreeSockets, timeout, scheduling })`: with
+`keepAlive` a connection whose response ended is used again by the next request to the same host and port
+(`req.reusedSocket`) and the request says `Connection: keep-alive`, else `Connection: close`; `maxSockets` makes the
+other requests to a host wait; `getName()`, `destroy()`, `totalSocketCount`. An idle connection does not keep the
+program alive, and one the server closed is not used again.
+
 Differences from Node:
 
 - A client request's body is sent at `end()` with a `Content-Length` (Node streams it chunked when `write()` came
-  before `end()`). Each request opens its own connection: there is no `Agent` and no connection reuse yet.
+  before `end()`).
+- `http.Agent`: no `sockets`/`freeSockets`/`requests` objects, no `createConnection`/`keepSocketAlive` hooks to
+  override (so no proxy agents built on them), and `keepAliveMsecs` (TCP keep-alive probes) is not applied. An https
+  connection is not reused: each https request has its own.
 - A request body is not held back: `req.pause()` does not stop the reading of the socket, so a large upload the
   handler does not read is kept in memory.
 - `headersTimeout`, `requestTimeout` and `server.setTimeout` are accepted but not enforced; idle keep-alive

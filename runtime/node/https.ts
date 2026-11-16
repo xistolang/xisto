@@ -4,6 +4,8 @@
 // and cert are PEM text (or Buffers of it); ca adds to the CAs the whole program trusts; passphrase, SNI on the server
 // and client certificates are not supported yet.
 import { Server as HttpServer, HttpTransport, HttpSystemError, RequestListener, ClientRequest, RequestOptions, ResponseListener, _setup, _toUrl, _method } from "xisto:http";
+import { Agent as HttpAgent } from "xisto:http";
+import type { AgentOptions } from "xisto:http";
 
 declare function tlss_cred(cert: string, key: string): int;
 declare function tlss_accept(cred: int, fd: int): int;
@@ -92,6 +94,10 @@ class TlsClientTransport extends HttpTransport {
   override encrypted(): boolean {
     return true;
   }
+  /** (http.Agent) TLS connections are not reused: whether the peer ended one is not known without reading it. */
+  override alive(): boolean {
+    return false;
+  }
 }
 
 /** Node's https.Server: an http server whose connections are TLS. */
@@ -133,6 +139,25 @@ export class HttpsClientRequest extends ClientRequest {
   }
 }
 
+/** Node's https.Agent: an http.Agent for https: (port 443). Its options and limits are http.Agent's; a TLS
+ * connection is not reused (each request has its own), so keepAlive changes only the Connection header. */
+export class Agent extends HttpAgent {
+  constructor(options: AgentOptions | null = null) {
+    super(options);
+    this.defaultPort = 443;
+    this.protocol = "https:";
+  }
+}
+
+/** The Agent of the https requests that name none. */
+export let globalAgent: Agent = keepAliveAgent(new Agent(null));
+// (set field by field: an options object here would be compiled into every program that loads the module)
+function keepAliveAgent(a: Agent): Agent {
+  a.keepAlive = true;
+  a.timeout = 5000;
+  return a;
+}
+
 /** Makes an https request: call end() (with a body) to send it. With options.ca, that CA is trusted too (for the
  * whole program, from now on). */
 export function request(target: string | URL | RequestOptions, callback: ResponseListener | null = null): ClientRequest {
@@ -140,7 +165,7 @@ export function request(target: string | URL | RequestOptions, callback: Respons
     const o = target as RequestOptions;
     if (o.ca !== null) tls_add_ca(pem(o.ca as string | Uint8Array));
   }
-  return _setup(new HttpsClientRequest(_toUrl(target, "https:"), _method(target)), target, callback);
+  return _setup(new HttpsClientRequest(_toUrl(target, "https:"), _method(target)), target, callback, globalAgent);
 }
 
 /** An https GET request, sent at once. */
