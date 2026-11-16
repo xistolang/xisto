@@ -476,6 +476,22 @@ export class URL {
     this.query = text.length > 0 ? text : null;
   }
 
+  /** url.format(url, options): the href without the fragment, the query or the credentials when they are false. */
+  __format(fragment: boolean, search: boolean, auth: boolean): string {
+    let out = this.scheme + ":";
+    if (this.hasAuthority) {
+      out += "//";
+      if (auth && (this.user.length > 0 || this.pass.length > 0)) {
+        out += this.user + (this.pass.length > 0 ? ":" + this.pass : "") + "@";
+      }
+      out += this.host;
+    }
+    out += this.path;
+    if (search && this.query !== null) out += "?" + this.query;
+    if (fragment && this.fragment !== null) out += "#" + this.fragment;
+    return out;
+  }
+
   /** The whole URL as text. */
   get href(): string {
     let out = this.scheme + ":";
@@ -716,4 +732,744 @@ export function pathToFileURL(path: string): URL {
     out += keep ? String.fromCharCode(b) : pct(b);
   }
   return new URL(out);
+}
+
+// ---- the legacy API: url.parse, url.format, url.resolve (Node's lib/url.js, the same algorithm) ----
+// Differences from Node: non-ASCII host names are kept as written (Node converts them to punycode); with
+// parseQueryString the query is a Record<string, string | string[]> and prints as a plain object (Node:
+// [Object: null prototype]); a query object given to format() is a Record of strings, numbers, booleans and string
+// arrays. (The query strings are read and written here as node:querystring does by default, without loading it:
+// its any-typed functions would make every program that names URL carry the field tables of `any`.)
+
+/** What url.format() takes: the parts of a URL, each one optional. */
+export interface UrlObject {
+  protocol?: string | null;
+  slashes?: boolean | null;
+  auth?: string | null;
+  host?: string | null;
+  hostname?: string | null;
+  port?: string | number | null;
+  pathname?: string | null;
+  search?: string | null;
+  query?: LegacyQueryInput | string | null;
+  hash?: string | null;
+  href?: string | null;
+  path?: string | null;
+}
+
+/** url.format(URL, options)'s options: which parts to keep (all by default; unicode is accepted and ignored). */
+export interface URLFormatOptions {
+  auth?: boolean | null;
+  fragment?: boolean | null;
+  search?: boolean | null;
+  unicode?: boolean | null;
+}
+
+/** A query given to format() as an object: each value a string, number, boolean or string[]. */
+export type LegacyQueryInput = Record<string, string | number | boolean | string[]>;
+
+// (http, https, ftp, gopher, file, ws, wss: always written with //)
+function slashedProtocol(p0: string | null): boolean {
+  if (p0 === null) return false;
+  const p = p0.endsWith(":") ? p0.slice(0, p0.length - 1) : p0;
+  return p === "http" || p === "https" || p === "ftp" || p === "gopher" || p === "file" || p === "ws" || p === "wss";
+}
+
+// node:querystring's parse with its defaults: & and =, at most 1000 pairs, + as a space, %XX as UTF-8 (a malformed
+// sequence kept as written), a key given more than once collected into an array
+function legacyQsParse(qs: string): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
+  if (qs.length === 0) return out;
+  const order: string[] = [];
+  const values = new Map<string, string[]>();
+  let pairs = 0;
+  for (const seg of qs.split("&")) {
+    if (seg.length === 0) continue;
+    if (pairs === 1000) break;
+    pairs++;
+    const eq = seg.indexOf("=");
+    const k = formDecode(eq < 0 ? seg : seg.slice(0, eq));
+    const v = eq < 0 ? "" : formDecode(seg.slice(eq + 1));
+    const cur = values.get(k);
+    if (cur === undefined || cur === null) {
+      order.push(k);
+      values.set(k, [v]);
+    } else {
+      cur.push(v);
+    }
+  }
+  for (const k of order) {
+    const vs = values.get(k) as string[];
+    if (vs.length === 1) out[k] = vs[0];
+    else out[k] = vs;
+  }
+  return out;
+}
+function qsValue(v: string | number | boolean): string {
+  if (typeof v === "string") return encodeURIComponent(v as string);
+  if (typeof v === "number") {
+    const n = v as number;
+    return Number.isFinite(n) ? encodeURIComponent(String(n)) : "";
+  }
+  return (v as boolean) ? "true" : "false";
+}
+// node:querystring's stringify with its defaults (a non-finite number is an empty value, an empty array no pair)
+function legacyQsStringify(obj: LegacyQueryInput): string {
+  let fields = "";
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    const ks = encodeURIComponent(k) + "=";
+    if (Array.isArray(v)) {
+      const arr = v as string[];
+      if (arr.length === 0) continue;
+      for (const x of arr) {
+        if (fields.length > 0) fields += "&";
+        fields += ks + encodeURIComponent(x);
+      }
+    } else {
+      if (fields.length > 0) fields += "&";
+      fields += ks + qsValue(v as string | number | boolean);
+    }
+  }
+  return fields;
+}
+function legacyQsStringifyParsed(obj: Record<string, string | string[]>): string {
+  let fields = "";
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    const ks = encodeURIComponent(k) + "=";
+    if (typeof v === "string") {
+      if (fields.length > 0) fields += "&";
+      fields += ks + encodeURIComponent(v as string);
+    } else {
+      for (const x of v as string[]) {
+        if (fields.length > 0) fields += "&";
+        fields += ks + encodeURIComponent(x);
+      }
+    }
+  }
+  return fields;
+}
+// (javascript: never has a host, and its "unsafe" characters are not escaped)
+function hostlessProtocol(p: string | null): boolean {
+  return p === "javascript" || p === "javascript:";
+}
+// (two nullable strings compared without boxing them)
+function sameStr(a: string | null, b: string | null): boolean {
+  if (a === null || b === null) return a === null && b === null;
+  return (a as string) === (b as string);
+}
+function nonEmpty(s: string | null): boolean {
+  return s !== null && s.length > 0;
+}
+function jsSpace(c: number): boolean {
+  return c === 9 || c === 10 || c === 11 || c === 12 || c === 13 || c === 32 || c === 0xa0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
+}
+function isIpv6Hostname(h: string): boolean {
+  return h.length > 0 && h.charAt(0) === "[" && h.charAt(h.length - 1) === "]";
+}
+function legacyAutoEscape(c: number): string {
+  if (c === 9) return "%09";
+  if (c === 10) return "%0A";
+  if (c === 13) return "%0D";
+  if (c === 32) return "%20";
+  if (c === 34) return "%22";
+  if (c === 39) return "%27";
+  if (c === 60) return "%3C";
+  if (c === 62) return "%3E";
+  if (c === 92) return "%5C";
+  if (c === 94) return "%5E";
+  if (c === 96) return "%60";
+  if (c === 123) return "%7B";
+  if (c === 124) return "%7C";
+  if (c === 125) return "%7D";
+  return "";
+}
+// RFC 2396's delimiters and unwise characters (and the single quote) percent-encoded
+function autoEscapeStr(rest: string): string {
+  let escaped = "";
+  let lastEscapedPos = 0;
+  for (let i = 0; i < rest.length; ++i) {
+    const e = legacyAutoEscape(rest.charCodeAt(i));
+    if (e.length > 0) {
+      if (i > lastEscapedPos) escaped += rest.slice(lastEscapedPos, i);
+      escaped += e;
+      lastEscapedPos = i + 1;
+    }
+  }
+  if (lastEscapedPos === 0) return rest;
+  if (lastEscapedPos < rest.length) escaped += rest.slice(lastEscapedPos);
+  return escaped;
+}
+// the auth of format(): every character but A-Z a-z 0-9 ! - . _ ~ ' ( ) * : percent-encoded as UTF-8
+function encodeAuth(s: string): string {
+  let out = "";
+  const bytes = utf8(s);
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    const keep = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 33 || b === 45 || b === 46 || b === 95 ||
+      b === 126 || b === 39 || b === 40 || b === 41 || b === 42 || b === 58;
+    out += keep ? String.fromCharCode(b) : pct(b);
+  }
+  return out;
+}
+// the length of a scheme and its ":" at the start of s (/^[a-z0-9.+-]+:/i), 0 for none
+function protocolLength(s: string): int {
+  let i = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    const ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c === 46 || c === 43 || c === 45;
+    if (!ok) break;
+    i++;
+  }
+  return i > 0 && i < s.length && s.charAt(i) === ":" ? i + 1 : 0;
+}
+// /^\/\/[^@/]+@[^@/]+/: "//user@host"
+function hostPatternTest(s: string): boolean {
+  if (!s.startsWith("//")) return false;
+  let i = 2;
+  while (i < s.length && s.charAt(i) !== "@" && s.charAt(i) !== "/") i++;
+  if (i === 2 || i >= s.length || s.charAt(i) !== "@") return false;
+  return i + 1 < s.length && s.charAt(i + 1) !== "@" && s.charAt(i + 1) !== "/";
+}
+// /^(\/\/?(?!\/)[^?\s]*)(\?[^\s]*)?$/: a path (and query) alone; where its query starts (-1: none), -2 for no match
+function simplePathMatch(s: string): int {
+  if (!s.startsWith("/")) return -2;
+  let i = 1;
+  if (s.charAt(1) === "/") i = 2;
+  if (s.charAt(i) === "/") return -2;
+  while (i < s.length && s.charAt(i) !== "?" && !jsSpace(s.charCodeAt(i))) i++;
+  if (i === s.length) return -1;
+  if (s.charAt(i) !== "?") return -2;
+  for (let j = i + 1; j < s.length; j++) if (jsSpace(s.charCodeAt(j))) return -2;
+  return i;
+}
+function forbiddenHostChar(h: string, ipv6: boolean): boolean {
+  for (let i = 0; i < h.length; i++) {
+    const c = h.charAt(i);
+    if (c === "\0" || c === "\t" || c === "\n" || c === "\r" || c === " " || c === "#" || c === "%" || c === "/" || c === "<" || c === ">" ||
+      c === "?" || c === "@" || c === "\\" || c === "^" || c === "|") return true;
+    if (!ipv6 && (c === ":" || c === "[" || c === "]")) return true;
+  }
+  return false;
+}
+
+let legacyWarned = false;
+// DEP0169, once, as Node prints it for url.parse() called from the program's own code
+function warnUrlParse(): void {
+  if (legacyWarned) return;
+  legacyWarned = true;
+  if (process.env["NODE_NO_WARNINGS"] === "1") return;
+  const text = `(node:${process.pid}) [DEP0169] DeprecationWarning: \`url.parse()\` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for \`url.parse()\` vulnerabilities.\n(Use \`node --trace-deprecation ...\` to show where the warning was created)`;
+  Promise.resolve(0).then((_: number) => {
+    console.error(text);
+  });
+}
+
+/** A URL as the legacy url.parse() splits it; a part that is not there is null. */
+export class Url {
+  protocol: string | null = null;
+  slashes: boolean | null = null;
+  auth: string | null = null;
+  host: string | null = null;
+  port: string | null = null;
+  hostname: string | null = null;
+  hash: string | null = null;
+  search: string | null = null;
+  query: any = null;
+  pathname: string | null = null;
+  path: string | null = null;
+  href: string | null = null;
+
+  /** Fills this Url from the text (Node's Url.prototype.parse). */
+  parse(url: string, parseQueryString: boolean = false, slashesDenoteHost: boolean = false): Url {
+    let hasHash = false;
+    let hasAt = false;
+    let start = -1;
+    let end = -1;
+    let rest = "";
+    let lastPos = 0;
+    let inWs = false;
+    let split = false;
+    for (let i = 0; i < url.length; ++i) {
+      const code = url.charCodeAt(i);
+      const isWs = code < 33 || code === 0xa0 || code === 0xfeff;
+      if (start === -1) {
+        if (isWs) continue;
+        lastPos = start = i;
+      } else if (inWs) {
+        if (!isWs) {
+          end = -1;
+          inWs = false;
+        }
+      } else if (isWs) {
+        end = i;
+        inWs = true;
+      }
+      if (!split) {
+        if (code === 64) {
+          hasAt = true;
+        } else if (code === 35) {
+          hasHash = true;
+          split = true;
+        } else if (code === 63) {
+          split = true;
+        } else if (code === 92) {
+          if (i - lastPos > 0) rest += url.slice(lastPos, i);
+          rest += "/";
+          lastPos = i + 1;
+        }
+      } else if (!hasHash && code === 35) {
+        hasHash = true;
+      }
+    }
+    if (start !== -1) {
+      if (lastPos === start) {
+        if (end === -1) rest = start === 0 ? url : url.slice(start);
+        else rest = url.slice(start, end);
+      } else if (end === -1 && lastPos < url.length) {
+        rest += url.slice(lastPos);
+      } else if (end !== -1 && lastPos < end) {
+        rest += url.slice(lastPos, end);
+      }
+    }
+
+    if (!slashesDenoteHost && !hasHash && !hasAt) {
+      const q = simplePathMatch(rest);
+      if (q !== -2) {
+        this.path = rest;
+        this.href = rest;
+        this.pathname = q === -1 ? rest : rest.slice(0, q);
+        if (q !== -1) {
+          this.search = rest.slice(q);
+          if (parseQueryString) this.query = legacyQsParse(rest.slice(q + 1));
+          else this.query = rest.slice(q + 1);
+        } else if (parseQueryString) {
+          this.search = null;
+          this.query = legacyQsParse("");
+        }
+        return this;
+      }
+    }
+
+    let lowerProto: string | null = null;
+    let proto = "";
+    const plen = protocolLength(rest);
+    if (plen > 0) {
+      proto = rest.slice(0, plen);
+      lowerProto = proto.toLowerCase();
+      this.protocol = lowerProto;
+      rest = rest.slice(plen);
+    }
+
+    let slashes = false;
+    if (slashesDenoteHost || plen > 0 || hostPatternTest(rest)) {
+      slashes = rest.startsWith("//");
+      if (slashes && !(plen > 0 && hostlessProtocol(lowerProto))) {
+        rest = rest.slice(2);
+        this.slashes = true;
+      }
+    }
+
+    if (!hostlessProtocol(lowerProto) && (slashes || (plen > 0 && !slashedProtocol(proto)))) {
+      let hostEnd = -1;
+      let atSign = -1;
+      let nonHost = -1;
+      for (let i = 0; i < rest.length; ++i) {
+        const c = rest.charCodeAt(i);
+        if (c === 9 || c === 10 || c === 13) {
+          rest = rest.slice(0, i) + rest.slice(i + 1);
+          i -= 1;
+        } else if (c === 32 || c === 34 || c === 37 || c === 39 || c === 59 || c === 60 || c === 62 || c === 92 || c === 94 || c === 96 ||
+          c === 123 || c === 124 || c === 125) {
+          if (nonHost === -1) nonHost = i;
+        } else if (c === 35 || c === 47 || c === 63) {
+          if (nonHost === -1) nonHost = i;
+          hostEnd = i;
+        } else if (c === 64) {
+          atSign = i;
+          nonHost = -1;
+        }
+        if (hostEnd !== -1) break;
+      }
+      start = 0;
+      if (atSign !== -1) {
+        this.auth = decodeURIComponent(rest.slice(0, atSign));
+        start = atSign + 1;
+      }
+      if (nonHost === -1) {
+        this.host = rest.slice(start);
+        rest = "";
+      } else {
+        this.host = rest.slice(start, nonHost);
+        rest = rest.slice(nonHost);
+      }
+      this.parseHost();
+      if (this.hostname === null) this.hostname = "";
+      let hostname = this.hostname ?? "";
+      const ipv6Hostname = isIpv6Hostname(hostname);
+      if (!ipv6Hostname) {
+        for (let i = 0; i < hostname.length; ++i) {
+          const c = hostname.charAt(i);
+          if (c === "/" || c === "\\" || c === "#" || c === "?" || c === ":") {
+            if (c === ":") throw new UrlCodeError("ERR_INVALID_ARG_VALUE", `The argument 'url' ${url}. Received 'Invalid port in url'`);
+            this.hostname = hostname.slice(0, i);
+            rest = "/" + hostname.slice(i) + rest;
+            break;
+          }
+        }
+      }
+      hostname = this.hostname ?? "";
+      if (hostname.length > 255) this.hostname = "";
+      else this.hostname = hostname.toLowerCase();
+      const hn = this.hostname ?? "";
+      if (hn !== "" && forbiddenHostChar(hn, ipv6Hostname)) throw new UrlCodeError("ERR_INVALID_URL", "Invalid URL");
+      const p = nonEmpty(this.port) ? ":" + (this.port ?? "") : "";
+      this.host = hn + p;
+      if (ipv6Hostname) {
+        this.hostname = hn.slice(1, hn.length - 1);
+        if (!rest.startsWith("/")) rest = "/" + rest;
+      }
+    }
+
+    if (!hostlessProtocol(lowerProto)) rest = autoEscapeStr(rest);
+
+    let questionIdx = -1;
+    let hashIdx = -1;
+    for (let i = 0; i < rest.length; ++i) {
+      const c = rest.charAt(i);
+      if (c === "#") {
+        this.hash = rest.slice(i);
+        hashIdx = i;
+        break;
+      } else if (c === "?" && questionIdx === -1) {
+        questionIdx = i;
+      }
+    }
+    if (questionIdx !== -1) {
+      let q = "";
+      if (hashIdx === -1) {
+        this.search = rest.slice(questionIdx);
+        q = rest.slice(questionIdx + 1);
+      } else {
+        this.search = rest.slice(questionIdx, hashIdx);
+        q = rest.slice(questionIdx + 1, hashIdx);
+      }
+      if (parseQueryString) this.query = legacyQsParse(q);
+      else this.query = q;
+    } else if (parseQueryString) {
+      this.search = null;
+      this.query = legacyQsParse("");
+    }
+    const useQuestionIdx = questionIdx !== -1 && (hashIdx === -1 || questionIdx < hashIdx);
+    const firstIdx = useQuestionIdx ? questionIdx : hashIdx;
+    if (firstIdx === -1) {
+      if (rest.length > 0) this.pathname = rest;
+    } else if (firstIdx > 0) {
+      this.pathname = rest.slice(0, firstIdx);
+    }
+    if (slashedProtocol(lowerProto) && nonEmpty(this.hostname) && !nonEmpty(this.pathname)) this.pathname = "/";
+    if (nonEmpty(this.pathname) || nonEmpty(this.search)) this.path = (this.pathname ?? "") + (this.search ?? "");
+    this.href = this.format();
+    return this;
+  }
+
+  /** The port at the end of host, taken out of it into port; the rest is the hostname. */
+  parseHost(): void {
+    let host = this.host ?? "";
+    let i = host.length;
+    while (i > 0 && host.charCodeAt(i - 1) >= 48 && host.charCodeAt(i - 1) <= 57) i--;
+    if (i > 0 && host.charAt(i - 1) === ":") {
+      const port = host.slice(i - 1);
+      if (port !== ":") this.port = port.slice(1);
+      host = host.slice(0, host.length - port.length);
+    }
+    if (host.length > 0) this.hostname = host;
+  }
+
+  /** The URL as text, from its parts (Node's Url.prototype.format). */
+  format(): string {
+    let q = "";
+    const query: any = this.query;
+    if (query !== null && typeof query === "object") q = legacyQsStringifyParsed(query as Record<string, string | string[]>);
+    return legacyFormat(this.protocol, this.slashes, this.auth, this.host, this.hostname, this.port, this.pathname, this.search, q, this.hash);
+  }
+
+  /** The URL that relative names from this one, as text. */
+  resolve(relative: string): string {
+    warnUrlParse();
+    const r = new Url();
+    r.parse(relative, false, true);
+    return this.resolveObject(r).format();
+  }
+
+  /** The URL that relative names from this one (Node's Url.prototype.resolveObject). */
+  resolveObject(rel: string | Url): Url {
+    let relative = new Url();
+    if (typeof rel === "string") relative.parse(rel as string, false, true);
+    else relative = rel as Url;
+    const result = new Url();
+    copyUrl(result, this);
+    result.hash = relative.hash;
+    if (relative.href === "") {
+      result.href = result.format();
+      return result;
+    }
+    if (relative.slashes === true && !nonEmpty(relative.protocol)) {
+      const keep = result.protocol;
+      copyUrl(result, relative);
+      result.protocol = keep;
+      if (slashedProtocol(result.protocol) && nonEmpty(result.hostname) && !nonEmpty(result.pathname)) {
+        result.pathname = "/";
+        result.path = "/";
+      }
+      result.href = result.format();
+      return result;
+    }
+    if (nonEmpty(relative.protocol) && !sameStr(relative.protocol, result.protocol)) {
+      if (!slashedProtocol(relative.protocol)) {
+        copyUrl(result, relative);
+        result.href = result.format();
+        return result;
+      }
+      result.protocol = relative.protocol;
+      const rp = relative.protocol ?? "";
+      if (!nonEmpty(relative.host) && rp !== "file" && rp !== "file:" && !hostlessProtocol(rp)) {
+        const relPath = (relative.pathname ?? "").split("/");
+        relative.host = null;
+        while (relPath.length > 0) {
+          const h = relPath.shift() as string;
+          relative.host = h;
+          if (h.length > 0) break;
+        }
+        if (!nonEmpty(relative.host)) relative.host = "";
+        if (!nonEmpty(relative.hostname)) relative.hostname = "";
+        if (relPath.length === 0 || relPath[0] !== "") relPath.unshift("");
+        if (relPath.length < 2) relPath.unshift("");
+        result.pathname = relPath.join("/");
+      } else {
+        result.pathname = relative.pathname;
+      }
+      result.search = relative.search;
+      result.query = relative.query;
+      result.host = nonEmpty(relative.host) ? relative.host : "";
+      result.auth = relative.auth;
+      result.hostname = nonEmpty(relative.hostname) ? relative.hostname : relative.host;
+      result.port = relative.port;
+      if (nonEmpty(result.pathname) || nonEmpty(result.search)) result.path = (result.pathname ?? "") + (result.search ?? "");
+      if (result.slashes !== true) result.slashes = relative.slashes;
+      result.href = result.format();
+      return result;
+    }
+
+    const isSourceAbs = nonEmpty(result.pathname) && (result.pathname ?? "").charAt(0) === "/";
+    const isRelAbs = nonEmpty(relative.host) || (nonEmpty(relative.pathname) && (relative.pathname ?? "").charAt(0) === "/");
+    let mustEndAbs = isRelAbs || isSourceAbs || (nonEmpty(result.host) && nonEmpty(relative.pathname));
+    const removeAllDots = mustEndAbs;
+    let srcPath: string[] = nonEmpty(result.pathname) ? (result.pathname ?? "").split("/") : [];
+    const relPath: string[] = nonEmpty(relative.pathname) ? (relative.pathname ?? "").split("/") : [];
+    const noLeadingSlashes = nonEmpty(result.protocol) && !slashedProtocol(result.protocol);
+
+    if (noLeadingSlashes) {
+      result.hostname = "";
+      result.port = null;
+      if (nonEmpty(result.host)) {
+        if (srcPath.length > 0 && srcPath[0] === "") srcPath[0] = result.host ?? "";
+        else srcPath.unshift(result.host ?? "");
+      }
+      result.host = "";
+      if (nonEmpty(relative.protocol)) {
+        relative.hostname = null;
+        relative.port = null;
+        result.auth = null;
+        if (nonEmpty(relative.host)) {
+          if (relPath.length > 0 && relPath[0] === "") relPath[0] = relative.host ?? "";
+          else relPath.unshift(relative.host ?? "");
+        }
+        relative.host = null;
+      }
+      mustEndAbs = mustEndAbs && ((relPath.length > 0 && relPath[0] === "") || (srcPath.length > 0 && srcPath[0] === ""));
+    }
+
+    if (isRelAbs) {
+      if (relative.host !== null) {
+        if (!sameStr(result.host, relative.host)) result.auth = null;
+        result.host = relative.host;
+        result.port = relative.port;
+      }
+      if (relative.hostname !== null) {
+        if (!sameStr(result.hostname, relative.hostname)) result.auth = null;
+        result.hostname = relative.hostname;
+      }
+      result.search = relative.search;
+      result.query = relative.query;
+      srcPath = relPath;
+    } else if (relPath.length > 0) {
+      if (srcPath.length > 0) srcPath.pop();
+      for (const part of relPath) srcPath.push(part);
+      result.search = relative.search;
+      result.query = relative.query;
+    } else if (relative.search !== null) {
+      if (noLeadingSlashes) {
+        const h: string | null = srcPath.length > 0 ? (srcPath.shift() as string) : null;
+        result.hostname = h;
+        result.host = h;
+        if (h !== null && h.indexOf("@") > 0) {
+          const authInHost = h.split("@");
+          result.auth = authInHost.shift() as string;
+          const rest = authInHost.shift() as string;
+          result.host = rest;
+          result.hostname = rest;
+        }
+      }
+      result.search = relative.search;
+      result.query = relative.query;
+      if (result.pathname !== null || result.search !== null) result.path = (result.pathname ?? "") + (result.search ?? "");
+      result.href = result.format();
+      return result;
+    }
+
+    if (srcPath.length === 0) {
+      result.pathname = null;
+      result.path = nonEmpty(result.search) ? "/" + (result.search ?? "") : null;
+      result.href = result.format();
+      return result;
+    }
+
+    let last = srcPath[srcPath.length - 1];
+    const hasTrailingSlash = ((nonEmpty(result.host) || nonEmpty(relative.host) || srcPath.length > 1) && (last === "." || last === "..")) || last === "";
+    let up = 0;
+    for (let i = srcPath.length - 1; i >= 0; i--) {
+      last = srcPath[i];
+      if (last === ".") {
+        srcPath.splice(i, 1);
+      } else if (last === "..") {
+        srcPath.splice(i, 1);
+        up++;
+      } else if (up > 0) {
+        srcPath.splice(i, 1);
+        up--;
+      }
+    }
+    if (!mustEndAbs && !removeAllDots) {
+      while (up-- > 0) srcPath.unshift("..");
+    }
+    if (mustEndAbs && (srcPath.length === 0 || (srcPath[0] !== "" && srcPath[0].charAt(0) !== "/"))) srcPath.unshift("");
+    if (hasTrailingSlash && !srcPath.join("/").endsWith("/")) srcPath.push("");
+    const isAbsolute = srcPath.length > 0 && (srcPath[0] === "" || srcPath[0].charAt(0) === "/");
+    if (noLeadingSlashes) {
+      const h = isAbsolute ? "" : srcPath.length > 0 ? (srcPath.shift() as string) : "";
+      result.hostname = h;
+      result.host = h;
+      if (h.indexOf("@") > 0) {
+        const authInHost = h.split("@");
+        result.auth = authInHost.shift() as string;
+        const rest = authInHost.shift() as string;
+        result.host = rest;
+        result.hostname = rest;
+      }
+    }
+    mustEndAbs = mustEndAbs || (nonEmpty(result.host) && srcPath.length > 0);
+    if (mustEndAbs && !isAbsolute) srcPath.unshift("");
+    if (srcPath.length === 0) {
+      result.pathname = null;
+      result.path = null;
+    } else {
+      result.pathname = srcPath.join("/");
+    }
+    if (result.pathname !== null || result.search !== null) result.path = (result.pathname ?? "") + (result.search ?? "");
+    if (nonEmpty(relative.auth)) result.auth = relative.auth;
+    if (result.slashes !== true) result.slashes = relative.slashes;
+    result.href = result.format();
+    return result;
+  }
+}
+
+function copyUrl(to: Url, from: Url): void {
+  to.protocol = from.protocol;
+  to.slashes = from.slashes;
+  to.auth = from.auth;
+  to.host = from.host;
+  to.port = from.port;
+  to.hostname = from.hostname;
+  to.hash = from.hash;
+  to.search = from.search;
+  to.query = from.query;
+  to.pathname = from.pathname;
+  to.path = from.path;
+  to.href = from.href;
+}
+
+function legacyFormat(protocol0: string | null, slashes: boolean | null, auth0: string | null, host0: string | null, hostname: string | null,
+  port: string | null, pathname0: string | null, search0: string | null, q: string, hash0: string | null): string {
+  let auth = auth0 ?? "";
+  if (auth.length > 0) auth = encodeAuth(auth) + "@";
+  let protocol = protocol0 ?? "";
+  if (protocol.length > 0 && !protocol.endsWith(":")) protocol += ":";
+  let pathname = pathname0 ?? "";
+  let hash = hash0 ?? "";
+  let host = "";
+  if (nonEmpty(host0)) {
+    host = auth + (host0 ?? "");
+  } else if (nonEmpty(hostname)) {
+    const hn = hostname ?? "";
+    host = auth + (hn.indexOf(":") !== -1 && !isIpv6Hostname(hn) ? "[" + hn + "]" : hn);
+    if (nonEmpty(port)) host += ":" + (port ?? "");
+  }
+  let search = nonEmpty(search0) ? (search0 ?? "") : q.length > 0 ? "?" + q : "";
+  if (pathname.indexOf("#") !== -1 || pathname.indexOf("?") !== -1) pathname = pathname.replaceAll("#", "%23").replaceAll("?", "%3F");
+  if (slashes === true || slashedProtocol(protocol)) {
+    if (slashes === true || host.length > 0) {
+      if (pathname.length > 0 && pathname.charAt(0) !== "/") pathname = "/" + pathname;
+      host = "//" + host;
+    } else if (protocol.startsWith("file")) {
+      host = "//";
+    }
+  }
+  if (search.indexOf("#") !== -1) search = search.replaceAll("#", "%23");
+  if (hash.length > 0 && hash.charAt(0) !== "#") hash = "#" + hash;
+  if (search.length > 0 && search.charAt(0) !== "?") search = "?" + search;
+  return protocol + host + pathname + search + hash;
+}
+
+/** Splits a URL into its parts, the legacy way (Node's url.parse; prefer new URL()). parseQueryString: query as an object. */
+export function parse(url: string, parseQueryString: boolean = false, slashesDenoteHost: boolean = false): Url {
+  warnUrlParse();
+  const u = new Url();
+  u.parse(url, parseQueryString, slashesDenoteHost);
+  return u;
+}
+
+/** The URL as text: from a string (parsed and written back), a WHATWG URL (with options), or the parts of one. */
+export function format(urlObject: string | URL | UrlObject, options: URLFormatOptions | null = null): string {
+  if (typeof urlObject === "string") return parse(urlObject as string).format();
+  if (urlObject instanceof URL) {
+    const u = urlObject as URL;
+    let fragment = true;
+    let search = true;
+    let auth = true;
+    if (options !== null) {
+      if (options.fragment !== null && options.fragment !== undefined) fragment = options.fragment as boolean;
+      if (options.search !== null && options.search !== undefined) search = options.search as boolean;
+      if (options.auth !== null && options.auth !== undefined) auth = options.auth as boolean;
+    }
+    return u.__format(fragment, search, auth);
+  }
+  const o = urlObject as UrlObject;
+  const port: string | number | null | undefined = o.port;
+  let ports: string | null = null;
+  if (typeof port === "number") ports = String(port as number);
+  else if (typeof port === "string") ports = port as string;
+  const sl = o.slashes;
+  const query = o.query;
+  let q = "";
+  if (query !== null && query !== undefined && typeof query !== "string") q = legacyQsStringify(query as LegacyQueryInput);
+  return legacyFormat(o.protocol ?? null, sl === true ? true : null, o.auth ?? null, o.host ?? null, o.hostname ?? null, ports, o.pathname ?? null,
+    o.search ?? null, q, o.hash ?? null);
+}
+
+/** The URL that to names relative to from, the legacy way (Node's url.resolve). */
+export function resolve(from: string, to: string): string {
+  return parse(from, false, true).resolve(to);
 }
