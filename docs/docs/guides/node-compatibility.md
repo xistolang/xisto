@@ -908,7 +908,8 @@ directory made), `readdirSync` (`{ withFileTypes }`: `Dirent`s with `name`, `par
 `isDirectory()`, `isSymbolicLink()`...; `{ throwIfNoEntry: false }`), `rmSync` (`{ recursive, force }`),
 `rmdirSync`, `renameSync`, `copyFileSync` (`COPYFILE_EXCL`), `cpSync` (`{ recursive, force, errorOnExist,
 filter }`), `mkdtempSync`, `realpathSync`, `accessSync`, `chmodSync`, `symlinkSync`, `readlinkSync`, `linkSync`,
-`truncateSync`, `utimesSync`/`lutimesSync`, `openSync`/`closeSync`/`readSync`/`writeSync`, and `fs.constants` (`F_OK`, `R_OK`,
+`truncateSync`, `utimesSync`/`lutimesSync`, `openSync`/`closeSync`/`readSync`/`writeSync`, `globSync` (a pattern or
+several, `cwd`, `exclude` as patterns or a function of the path, `withFileTypes`; Node's results and order), and `fs.constants` (`F_OK`, `R_OK`,
 `W_OK`, `X_OK`, `COPYFILE_EXCL`, `S_IF*`...). Errors are Node's: the message (`ENOENT: no such file or directory,
 open '/x'`, `EEXIST: file already exists, mkdir '/x'`, `rename 'a' -> 'b'`...) and `err.code`, `errno` (this
 system's, negative), `syscall`, `path` and `dest`, read through an `any` (`catch (e: any)`) or a cast; `rmSync` of
@@ -918,7 +919,8 @@ a directory without `recursive` is Node's `SystemError` `ERR_FS_EISDIR`.
 `writeFile`, `appendFile`, `mkdir`, `readdir` (`withFileTypes`), `stat`, `lstat`, `fstat`, `rm`, `rmdir`, `rename`,
 `access`, `unlink`, `copyFile`, `cp`, `realpath`, `mkdtemp`, `readlink`, `symlink`, `link`, `chmod`, `truncate`,
 `utimes`, and on file descriptors `open`, `read`, `write`, `close` (and `exists(path, cb)`): the work and the
-callback happen on a later turn of the event loop, `err` is `null` when it worked.
+callback happen on a later turn of the event loop, `err` is `null` when it worked. `fs.glob(pattern, options?, cb)`
+and `fs.promises.glob(pattern, options?)` (an async iterator) give `globSync`'s matches.
 
 **Promises**: `node:fs/promises` and `fs.promises` (also `import { promises } from "node:fs"`): `readFile`
 (text with an encoding, else a `Buffer`), `writeFile`, `appendFile`, `unlink`, `mkdir`, `readdir`, `stat`,
