@@ -2527,6 +2527,17 @@ function destroyer(stream: Stream, err0: Error | null): void {
   stream.destroy(err);
 }
 
+/** Destroys the stream: with err, or with an AbortError when there is none and the stream is not done yet (Node's
+ * stream.destroy). A stream already destroyed is left as it is. */
+export function destroy(stream: Stream, err: Error | null = null): void {
+  destroyer(stream, err);
+}
+
+/** Whether the stream has been destroyed. */
+export function isDestroyed(stream: Stream): boolean {
+  return isDestroyedS(stream);
+}
+
 // ---- pipeline ----
 
 /** What pipeline() calls at the end: the first error, or nothing. */

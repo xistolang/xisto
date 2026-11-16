@@ -156,8 +156,9 @@ Supported: `on`/`addListener`, `once`, `prependListener`, `prependOnceListener`,
 `removeAllListeners`, `emit`, `listenerCount` (with a listener too), `listeners`, `rawListeners`, `eventNames`,
 `setMaxListeners`/`getMaxListeners` (with Node's warning on stderr), `EventEmitter.defaultMaxListeners`, the
 `'newListener'` and `'removeListener'` events, an `'error'` with no listener thrown, `errorMonitor`, and the
-functions `once(emitter, name)` (a promise of the arguments, rejected by an `'error'`), `getEventListeners`,
-`setMaxListeners`, `getMaxListeners`, `listenerCount`.
+functions `once(emitter, name)` (a promise of the arguments, rejected by an `'error'`), `on(emitter, name, { close })`
+(the emits' arguments as an async iterator: `for await (const [a, b] of on(emitter, "data"))`), `getEventListeners`,
+`setMaxListeners`, `getMaxListeners`, `listenerCount`, also as statics of `EventEmitter`.
 
 A listener with its own parameter types, `(i: number, n: number) => void`, is accepted where Node's typings say
 `(...args: any[]) => void`. The compiler wraps it so that each argument is checked as the listener takes it, and
@@ -171,7 +172,9 @@ Differences from Node:
 - `on()` and the other chaining methods return `EventEmitter`. xisto has no `this` return type, so a subclass
   chain `new Job().on(...)` is typed as `EventEmitter`.
 - `rawListeners()` gives the listeners themselves, without the once wrappers.
-- Not available yet: `events.on(emitter, name)` (async iteration), `captureRejections`, `EventTarget` helpers.
+- `events.on()`: leaving the `for await` loop with `break` does not remove its listeners; end it with the `close`
+  option when the emitter lives on. No `signal` option.
+- Not available yet: `captureRejections`, `EventTarget` helpers.
 
 ## timers
 

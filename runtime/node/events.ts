@@ -5,7 +5,10 @@
 //   - event names are strings; errorMonitor is a reserved string, not a symbol;
 //   - a listener called with fewer arguments than it declares gets null for the missing ones (Node: undefined),
 //     and a missing argument of a non-nullable type is a TypeError;
-//   - rawListeners() gives the listeners themselves (no once wrappers); events.on() (async iteration) is missing.
+//   - rawListeners() gives the listeners themselves (no once wrappers);
+//   - events.on(): a break out of for await (or the iterator's return()) does not remove its listeners: end it with
+//     the close option when the emitter lives on; the signal option is not there (an AbortSignal here would load
+//     xisto:url into every program that uses events).
 
 /** A listener: any function; its arguments are what emit() is given after the event name. */
 export type Listener = (...args: any[]) => void;
@@ -189,6 +192,31 @@ export class EventEmitter {
   getMaxListeners(): int {
     return this._maxListeners < 0 ? EventEmitter.defaultMaxListeners : this._maxListeners;
   }
+
+  /** The number of listeners of an emitter's event (Node's deprecated EventEmitter.listenerCount). */
+  static listenerCount(emitter: EventEmitter, event: string): int {
+    return emitter.listenerCount(event);
+  }
+  /** events.once as a static: a promise of the arguments of the next emit of the event. */
+  static once(emitter: EventEmitter, event: string): Promise<any[]> {
+    return once(emitter, event);
+  }
+  /** events.on as a static: the event's emits as an async iterator. */
+  static on(emitter: EventEmitter, event: string, options: OnOptions | null = null): AsyncGenerator<any[]> {
+    return on(emitter, event, options);
+  }
+  /** events.getEventListeners as a static. */
+  static getEventListeners(emitter: EventEmitter, event: string): Listener[] {
+    return emitter.listeners(event);
+  }
+  /** events.getMaxListeners as a static. */
+  static getMaxListeners(emitter: EventEmitter): int {
+    return emitter.getMaxListeners();
+  }
+  /** events.setMaxListeners as a static. */
+  static setMaxListeners(n: int, ...emitters: EventEmitter[]): void {
+    setMaxListeners(n, ...emitters);
+  }
 }
 
 export default EventEmitter;
@@ -232,4 +260,98 @@ export function getMaxListeners(emitter: EventEmitter): int {
 /** The number of listeners of an emitter's event (deprecated in Node: emitter.listenerCount(event)). */
 export function listenerCount(emitter: EventEmitter, event: string): int {
   return emitter.listenerCount(event);
+}
+
+/** events.on()'s options: the names of events that end the iteration (Node's close). */
+export interface OnOptions {
+  close?: string[] | null;
+}
+
+// the emits that events.on() has received and not yet given, and the read waiting for the next one
+class EventQueue {
+  private emitter: EventEmitter;
+  private event: string;
+  private queue: any[][] = [];
+  private wake: (() => void) | null = null;
+  private error: Error | null = null;
+  finished: boolean = false;
+  private onEvent: Listener;
+  private onError: Listener;
+  private onClose: Listener;
+  private closeEvents: string[] = [];
+
+  constructor(emitter: EventEmitter, event: string, options: OnOptions | null) {
+    this.emitter = emitter;
+    this.event = event;
+    this.onEvent = (...args: any[]): void => {
+      this.queue.push(args);
+      this.wakeup();
+    };
+    this.onError = (...errs: any[]): void => this.fail(errs[0] as Error);
+    this.onClose = (...a: any[]): void => this.close();
+    emitter.on(event, this.onEvent);
+    if (event !== "error") emitter.on("error", this.onError);
+    if (options !== null) {
+      const close = options.close;
+      if (close !== null && close !== undefined) {
+        for (const c of close) {
+          this.closeEvents.push(c);
+          emitter.on(c, this.onClose);
+        }
+      }
+    }
+  }
+
+  private wakeup(): void {
+    const w = this.wake;
+    this.wake = null;
+    if (w !== null) w();
+  }
+
+  private fail(err: Error): void {
+    if (this.finished) return;
+    this.error = err;
+    this.close();
+  }
+
+  /** Removes the listeners; what is queued is still given, then the end. */
+  close(): void {
+    if (this.finished) return;
+    this.finished = true;
+    this.emitter.removeListener(this.event, this.onEvent);
+    if (this.event !== "error") this.emitter.removeListener("error", this.onError);
+    for (const c of this.closeEvents) this.emitter.removeListener(c, this.onClose);
+    this.wakeup();
+  }
+
+  /** The next emit's arguments (null at the end); throws the error that ended the iteration. */
+  async take(): Promise<any[] | null> {
+    while (true) {
+      if (this.queue.length > 0) return this.queue.shift() as any[];
+      const e = this.error;
+      if (e !== null) {
+        this.error = null;
+        throw e;
+      }
+      if (this.finished) return null;
+      await new Promise<void>((resolve) => {
+        this.wake = (): void => resolve();
+      });
+    }
+  }
+}
+
+async function* drainEvents(q: EventQueue): AsyncGenerator<any[]> {
+  while (true) {
+    const v = await q.take();
+    if (v === null) return;
+    yield v;
+  }
+}
+
+/** The event's emits as an async iterator of their arguments: for await (const [a, b] of on(emitter, "data")).
+ * It ends with an 'error' emit (thrown by the loop) or one of the close events. The
+ * listeners are added at once, so emits before the loop starts are queued. */
+export function on(emitter: EventEmitter, event: string, options: OnOptions | null = null): AsyncGenerator<any[]> {
+  return drainEvents(new EventQueue(emitter, event, options));
 }
