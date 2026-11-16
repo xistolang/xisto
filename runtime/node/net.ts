@@ -17,6 +17,8 @@ declare function net_accept(lfd: int): int;
 declare function net_address(fd: int, peer: boolean): string;
 declare function net_port(fd: int, peer: boolean): int;
 declare function net_wake(port: int): void;
+declare function net_task(): int;
+declare function net_task_ref(task: int, ref: boolean): void;
 
 /** A socket error, with Node's code and message. */
 export class SystemError extends Error {
@@ -67,6 +69,9 @@ export class Socket extends EventEmitter {
   private ending: boolean = false;
   private task: Promise<void> | null = null;
   private hadError: boolean = false;
+  /** the task its I/O runs on (0: none now), and whether it keeps the program alive (unref()) */
+  private io: int = 0;
+  private refd: boolean = true;
 
   /** (internal) a socket on an accepted connection: its addresses now, its reading once the server's
    * 'connection' listeners have set theirs (_start). */
@@ -95,6 +100,7 @@ export class Socket extends EventEmitter {
     return this;
   }
   private async run(port: int, host: string): Promise<void> {
+    this._bindTask();
     const fd = net_connect(host, port);
     this.connecting = false;
     if (fd < 0) {
@@ -113,6 +119,7 @@ export class Socket extends EventEmitter {
     await this.pump();
   }
   private async pump(): Promise<void> {
+    if (this.io === 0) this._bindTask();
     for (;;) {
       const chunk = net_read(this.fd);
       if (chunk.length === 0) break;
@@ -129,6 +136,7 @@ export class Socket extends EventEmitter {
     this.finish();
   }
   private finish(): void {
+    this._unbindTask();
     if (this.fd >= 0) net_close(this.fd);
     this.fd = -1;
     this.destroyed = true;
@@ -194,11 +202,27 @@ export class Socket extends EventEmitter {
     if (callback !== null) this.once("timeout", callback);
     return this;
   }
+  /** The socket keeps the program alive again (the default). */
   ref(): Socket {
+    if (!this.refd && this.io !== 0) net_task_ref(this.io, true);
+    this.refd = true;
     return this;
   }
+  /** The socket does not keep the program alive: it ends when only unref'd sockets (and timers) are left. */
   unref(): Socket {
+    if (this.refd && this.io !== 0) net_task_ref(this.io, false);
+    this.refd = false;
     return this;
+  }
+  /** (internal) the task running now does this socket's I/O (an http request's, for its socket). */
+  _bindTask(): void {
+    this.io = net_task();
+    if (!this.refd && this.io !== 0) net_task_ref(this.io, false);
+  }
+  /** (internal) its I/O is done: the task ends (or goes on with other work, which unref() does not cover). */
+  _unbindTask(): void {
+    if (!this.refd && this.io !== 0) net_task_ref(this.io, true);
+    this.io = 0;
   }
   address(): AddressInfo {
     return new AddressInfo(this.localAddress, this.localAddress.includes(":") ? "IPv6" : "IPv4", this.localPort);
@@ -227,6 +251,8 @@ export class NetServer extends EventEmitter {
   private closing: boolean = false;
   private open: int = 0;
   private task: Promise<void> | null = null;
+  private io: int = 0;
+  private refd: boolean = true;
 
   constructor(listener: ConnectionListener | null = null) {
     super();
@@ -259,6 +285,8 @@ export class NetServer extends EventEmitter {
     else process.nextTick(emit);
   }
   private async acceptAll(): Promise<void> {
+    this.io = net_task();
+    if (!this.refd && this.io !== 0) net_task_ref(this.io, false);
     for (;;) {
       const fd = net_accept(this.lfd);
       if (this.closing) {
@@ -276,6 +304,8 @@ export class NetServer extends EventEmitter {
       this.emit("connection", s);
       s._start();
     }
+    if (!this.refd && this.io !== 0) net_task_ref(this.io, true);
+    this.io = 0;
     net_close(this.lfd);
     this.lfd = -1;
     this.maybeClosed();
@@ -292,6 +322,18 @@ export class NetServer extends EventEmitter {
     if (this.closing || this.lfd < 0) return this;
     this.closing = true;
     net_wake(this.port); // (the accepting task wakes, sees closing and stops)
+    return this;
+  }
+  /** The server keeps the program alive again (the default). */
+  ref(): NetServer {
+    if (!this.refd && this.io !== 0) net_task_ref(this.io, true);
+    this.refd = true;
+    return this;
+  }
+  /** The server does not keep the program alive while it waits for connections. */
+  unref(): NetServer {
+    if (this.refd && this.io !== 0) net_task_ref(this.io, false);
+    this.refd = false;
     return this;
   }
   address(): AddressInfo | null {

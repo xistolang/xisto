@@ -503,6 +503,9 @@ struct xs_coro {
     uint64_t req_t0;
     void (*entry)(void *); void *arg;
     bool holds_lock;
+    bool unref;               /* socket.unref(): it does not keep the program alive (not counted in xs_tasks_live) */
+    bool wwait;               /* parked until its socket is writable: counted even when unref'd */
+    bool kill;                /* the program is ending with it parked, unref'd: it unwinds when resumed */
     void (*on_done)(struct xs_coro *); /* not a request: what to do when it finishes (Promise.all tasks) */
     /* a shared-stack coroutine (Promise.all tasks) runs on the thread's one task stack; parked, the part it
        uses lives here and is copied back to the same addresses before it runs again */
@@ -799,6 +802,8 @@ static void xs_tmr_fire(void (*after)(xs_coro *)) {
     }
 }
 
+static XS_TLS int64_t xs_tasks_live; /* Promise.all/race tasks not finished yet */
+static XS_TLS int64_t xs_tasks_unref; /* tasks of unref'd sockets, parked: not counted above, still served by the loop */
 static XS_TLS int64_t xs_fd_waits; /* coroutines parked on a socket (what, besides a timer, can wake a parked task) */
 /* Waits until fd is readable/writable or the timeout (ms, -1 = none) passes. Yields inside a coroutine,
    polls from plain code. Returns false on timeout. */
@@ -813,9 +818,20 @@ XS_NOINLINE bool xs_wait_fd_ms(int fd, int16_t filter, int64_t timeout_ms) {
         EV_SET(&ev, fd, filter, EV_ADD | EV_ONESHOT, 0, 0, &co->fdw);
         kevent(xs_kq, &ev, 1, NULL, 0, NULL);
         if (timeout_ms >= 0) xs_timer_arm(&co->tmw, timeout_ms);
+        /* an unref'd socket's task still keeps the program alive while it connects or writes (libuv's requests do;
+           only its handle, the wait for data, is unref'd) */
+        co->wwait = filter == EVFILT_WRITE;
+        if (co->wwait && co->unref) xs_tasks_live++;
         xs_fd_waits++;
         xs_coro_yield();
         xs_fd_waits--;
+        if (co->kill) { /* (xs_unref_kill) the program ends: let go of what its frames hold and finish it there */
+            xs_cln_unwind(0);
+            xs_ar_drain(0);
+            xs_coro_finish();
+        }
+        if (co->wwait && co->unref) xs_tasks_live--;
+        co->wwait = false;
         bool ready = co->fdw.fired;
         if (co->fdw.armed) { /* the timer won: stop watching the socket */
             co->fdw.armed = false;
@@ -834,7 +850,6 @@ XS_NOINLINE bool xs_wait_fd_ms(int fd, int16_t filter, int64_t timeout_ms) {
 }
 XS_NOINLINE void xs_wait_fd(int fd, int16_t filter) { xs_wait_fd_ms(fd, filter, -1); }
 
-static XS_TLS int64_t xs_tasks_live; /* Promise.all/race tasks not finished yet */
 static void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_ms);
 static XS_TLS xs_coro *xs_tick_head, *xs_tick_tail, *xs_imm_head, *xs_imm_tail; /* process.nextTick, setImmediate (below) */
 /* Node runs a .ts program as an ES module, whose body is itself a microtask: the microtasks the body queues run
@@ -852,7 +867,7 @@ XS_NOINLINE void xs_sleep_ms(int64_t ms) {
         xs_timer_disarm(&co->tmw);
         return;
     }
-    if (xs_tasks_live > 0) { xs_loop_run(NULL, NULL, (int64_t)xs_date_now() + ms); return; } /* background tasks go on meanwhile */
+    if (xs_tasks_live > 0 || xs_tasks_unref > 0) { xs_loop_run(NULL, NULL, (int64_t)xs_date_now() + ms); return; } /* background tasks go on meanwhile */
     struct timespec ts = {ms / 1000, (ms % 1000) * 1000000};
     while (nanosleep(&ts, &ts) < 0 && errno == EINTR) {}
 }
@@ -1026,7 +1041,7 @@ XS_NOINLINE void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_m
    1 ready, 0 timed out, -1 when nothing else could run (the caller just polls). */
 static bool xs_fdwait_stop(void *w) { return ((xs_waiter *)w)->fired; }
 XS_NOINLINE int xs_wait_fd_loop(int fd, int16_t filter, int64_t timeout_ms) {
-    if (xs_cur_coro || timeout_ms == 0 || !(xs_ntmr || xs_tasks_live > 0 || xs_ready_head || xs_imm_head || xs_tick_head)) return -1;
+    if (xs_cur_coro || timeout_ms == 0 || !(xs_ntmr || xs_tasks_live > 0 || xs_tasks_unref > 0 || xs_ready_head || xs_imm_head || xs_tick_head)) return -1;
     if (xs_kq < 0) xs_kq = kqueue();
     xs_waiter w = {.kind = 2, .co = NULL, .armed = true, .fired = false, .tfd = -1, .armed_batch = xs_batch};
     struct kevent ev;
@@ -1086,11 +1101,13 @@ static inline xs_val xs_par_take(xs_tgroup *g, int i) { g->t[i].taken = true; re
    which runs the loop until it is closed, and the timers that were unref'd, let go at the end */
 static XS_TLS void (*xs_http_pending)(void); /* (per thread: a worker's drain must not run the main thread's server) */
 static XS_TLS void (*xs_unref_drop)(void);
+static XS_TLS void (*xs_unref_kill)(void); /* (the tasks of unref'd sockets, parked: below) */
 XS_NOINLINE void xs_tasks_drain(void) {
     if (xs_http_pending && !xs_cur_coro) { void (*h)(void) = xs_http_pending; xs_http_pending = NULL; h(); }
     if (xs_tasks_live > 0 && !xs_cur_coro) xs_loop_run(NULL, NULL, -1);
     xs_unh_check();
     if (xs_unref_drop) xs_unref_drop();
+    if (xs_unref_kill && !xs_cur_coro) xs_unref_kill();
 }
 
 /* ---- Promise values (XB-106) ----
@@ -1249,7 +1266,9 @@ XS_NOINLINE void xs_spawn_entry(void *x) {
 }
 static void xs_spawn_done(xs_coro *co) {
     xs_spawn *s = co->arg;
-    xs_tasks_live--;
+    if (co->unref) { co->unref = false; xs_tasks_unref--; } else xs_tasks_live--;
+    co->kill = false;
+    if (s->args) { s->afree(s->args); s->args = NULL; } /* (a task unwound at the end: its arguments are still held) */
     xs_coro_recycle(co);
     xs_release_(s->p);
     free(s);
@@ -4045,7 +4064,8 @@ XS_NOINLINE void xs_ttask_run(void *p) {
 }
 static void xs_ttask_done(xs_coro *co) {
     xs_ttask *t = co->arg;
-    if (!t->unref) xs_tasks_live--;
+    if (co->unref) { co->unref = false; xs_tasks_unref--; } else if (!t->unref) xs_tasks_live--;
+    co->kill = false;
     xs_coro_recycle(co);
     for (xs_ttask **pp = &xs_ttasks; *pp; pp = &(*pp)->next)
         if (*pp == t) { *pp = t->next; break; }
@@ -4117,12 +4137,12 @@ static xs_ttask *xs_ttask_find(int64_t id) {
 static void xs_ttasks_unref_drop(void);
 XS_NOINLINE int64_t xs_timer_unref(int64_t id) {
     xs_ttask *t = xs_ttask_find(id);
-    if (t && !t->unref && !t->cancelled) { t->unref = true; xs_tasks_live--; xs_unref_drop = xs_ttasks_unref_drop; }
+    if (t && !t->unref && !t->cancelled) { t->unref = true; if (!t->co->unref) xs_tasks_live--; xs_unref_drop = xs_ttasks_unref_drop; }
     return id;
 }
 XS_NOINLINE int64_t xs_timer_ref(int64_t id) {
     xs_ttask *t = xs_ttask_find(id);
-    if (t && t->unref && !t->cancelled) { t->unref = false; xs_tasks_live++; xs_exit_hook = xs_tasks_drain; }
+    if (t && t->unref && !t->cancelled) { t->unref = false; if (!t->co->unref) xs_tasks_live++; xs_exit_hook = xs_tasks_drain; }
     return id;
 }
 XS_NOINLINE bool xs_timer_has_ref(int64_t id) {
@@ -4386,6 +4406,50 @@ XS_NOINLINE void xs_net_wake(int64_t port) { /* a connection to our own listener
     int64_t fd = xs_net_connect(h, port);
     xs_release(h);
     if (fd >= 0) close((int)fd);
+}
+/* socket.unref() / ref() (XB-226): a socket's I/O runs on a task (the coroutine of its reading, or of an http request);
+   unref'd, that task stops counting as work that keeps the program alive, so the program ends when only such tasks
+   are left (they are dropped parked, as Node exits with unref'd handles open). Only the tasks counted in
+   xs_tasks_live can be: a promise's or a timer's (immediate's) coroutine. net_task() gives the running one (0: none). */
+static bool xs_task_countable(xs_coro *co) { return co && !co->done && (co->on_done == xs_spawn_done || co->on_done == xs_ttask_done); }
+XS_NOINLINE int64_t xs_net_task(void) { return xs_task_countable(xs_cur_coro) ? (int64_t)(intptr_t)xs_cur_coro : 0; }
+/* the program's end: each task still parked unref'd is resumed once to unwind (its frames' references released, as
+   a throw would, but no code of it runs), so the program ends with nothing held, as Node's does */
+static XS_TLS xs_coro **xs_unref_cos;
+static XS_TLS int xs_n_unref_cos, xs_cap_unref_cos;
+static void xs_unref_kill_all(void) {
+    while (xs_n_unref_cos > 0) {
+        xs_coro *co = xs_unref_cos[--xs_n_unref_cos];
+        if (co->done || !co->unref) continue;
+        co->fdw.armed = false; /* (its socket's event, if one comes, is ignored) */
+        if (co->tmw.armed) xs_timer_disarm(&co->tmw);
+        co->kill = true;
+        xs_coro_resume(co);
+        if (co->done && co->on_done) co->on_done(co);
+    }
+    xs_coro_flush_dead();
+}
+XS_NOINLINE void xs_net_task_ref(int64_t task, bool ref) {
+    xs_coro *co = (xs_coro *)(intptr_t)task;
+    if (!xs_task_countable(co) || co->unref == !ref) return;
+    if (!ref) {
+        int i = 0;
+        while (i < xs_n_unref_cos && xs_unref_cos[i] != co) i++;
+        if (i == xs_n_unref_cos) {
+            if (xs_n_unref_cos == xs_cap_unref_cos) {
+                xs_cap_unref_cos = xs_cap_unref_cos ? xs_cap_unref_cos * 2 : 8;
+                xs_unref_cos = realloc(xs_unref_cos, sizeof *xs_unref_cos * (size_t)xs_cap_unref_cos);
+                if (!xs_unref_cos) xs_panic("out of memory");
+            }
+            xs_unref_cos[xs_n_unref_cos++] = co;
+        }
+        xs_unref_kill = xs_unref_kill_all;
+    }
+    bool timer_unref = co->on_done == xs_ttask_done && ((xs_ttask *)co->arg)->unref; /* (not counted already) */
+    co->unref = !ref;
+    bool counted = !timer_unref && !co->wwait; /* (a write wait counts it either way) */
+    if (ref) { xs_tasks_unref--; if (counted) xs_tasks_live++; xs_exit_hook = xs_tasks_drain; }
+    else { xs_tasks_unref++; if (counted) xs_tasks_live--; }
 }
 /* node:dns: lookup through the system resolver (getaddrinfo), as Node's dns.lookup; "" when the name is unknown */
 XS_NOINLINE xs_arr_ref *xs_dns_lookup_all(xs_str *host, int64_t family) {

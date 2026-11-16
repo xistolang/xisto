@@ -7,6 +7,7 @@
 import { EventEmitter, Listener } from "xisto:events";
 import { Readable } from "xisto:stream";
 import { channel, _skipNextFetch } from "xisto:diagnostics_channel";
+import { Socket } from "xisto:net";
 
 declare function http_bind(s: Server, port: int): int;
 declare function http_close(): void;
@@ -323,6 +324,9 @@ export class ClientRequest extends EventEmitter {
   port: string = "";
   /** for node:diagnostics_channel's subscribers (an APM agent's span for this request) */
   _diag: any = null;
+  /** the request's socket, from 'socket' on (null before): socket.unref() lets the program end while it is in flight
+   * (an APM agent's send). Only ref()/unref() act on it: the request's connection is fetch's. */
+  socket: Socket | null = null;
   private url: string;
   private headers: Map<string, string> = new Map<string, string>();
   private chunks: string[] = [];
@@ -372,6 +376,10 @@ export class ClientRequest extends EventEmitter {
     return this;
   }
   private async send(): Promise<void> {
+    const sock = new Socket();
+    this.socket = sock;
+    sock._bindTask();
+    this.emit("socket", sock);
     const startCh = channel("http.client.request.start");
     if (startCh.hasSubscribers) startCh.publish(new HttpChannelMessage(this)); // (a subscriber may setHeader())
     const h: Record<string, string> = {};
@@ -407,6 +415,7 @@ export class ClientRequest extends EventEmitter {
       }
       this.emit("error", err as Error);
     }
+    sock._unbindTask();
   }
 }
 
