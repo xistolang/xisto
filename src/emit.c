@@ -3482,7 +3482,8 @@ static void emit_expr_(Expr *e) {
     bool user_call = callee && callee->body && !e->builtin.cfn && e->kind != E_NEW_OBJ && !(e->kind == E_MEMBER && (!e->cls || e->cls->builtin));
     /* (inside a region's code, a callee with a region version calls that version: it has no per-site clone) */
     bool rg_version = rg_hoist_on && cur_rg && callee && callee->rg_hoist == cur_rg && callee->rg_used;
-    char *clone = user_call && !e->par_native && !rg_version && cloned_per_site(callee) ? emit_clone(callee, id) : NULL;
+    /* (a call that runs once calls the function: a copy there would only make the program bigger) */
+    char *clone = user_call && !e->par_native && !rg_version && !e->cold_site && cloned_per_site(callee) ? emit_clone(callee, id) : NULL;
     if (callee) prof_inl_note(id, callee, clone != NULL);
     Expr *saved_b = bracketing;
     bool is_void = !e->type || e->type->kind == TY_VOID;
@@ -14032,21 +14033,21 @@ static bool stmt_has_loop(Stmt *s) {
    A function with no loop and no recursion, called only from code that itself runs once (main's top level
    outside loops, or another such function) and never used as a value: its body runs a single time, so the
    optimizer's work on it is wasted. Typically the wiring of an application (decorators, routes, modules). */
-typedef struct { Func *callee, *caller; bool hot; } RoEdge;
+typedef struct { Func *callee, *caller; bool hot; Expr *site; } RoEdge;
 static RoEdge *ro_edges;
 static int nro, capro;
-static void ro_add(Func *callee, Func *caller, bool hot) {
+static void ro_add(Func *callee, Func *caller, bool hot, Expr *site) {
     if (!callee) return;
     if (nro == capro) { capro = capro ? capro * 2 : 256; ro_edges = realloc(ro_edges, sizeof(RoEdge) * (size_t)capro); }
-    ro_edges[nro++] = (RoEdge){callee, caller, hot};
+    ro_edges[nro++] = (RoEdge){callee, caller, hot, site};
 }
 static void ro_stmt(Stmt *s, Func *ctx, int loop);
 static void ro_expr(Expr *e, Func *ctx, int loop) {
     if (!e) return;
     switch (e->kind) {
-    case E_CALL: if (e->func) ro_add(e->func, ctx, loop > 0); break;
-    case E_MEMBER: if (e->is_call && e->func) { if (e->virt) e->func->escapes = true; ro_add(e->func, ctx, loop > 0); } break;
-    case E_NEW_OBJ: if (e->cls && !e->cls->builtin && e->cls->ctor) ro_add(e->cls->ctor, ctx, loop > 0); break;
+    case E_CALL: if (e->func) ro_add(e->func, ctx, loop > 0, e); break;
+    case E_MEMBER: if (e->is_call && e->func) { if (e->virt) e->func->escapes = true; ro_add(e->func, ctx, loop > 0, e); } break;
+    case E_NEW_OBJ: if (e->cls && !e->cls->builtin && e->cls->ctor) ro_add(e->cls->ctor, ctx, loop > 0, e); break;
     case E_FUNC_REF: if (e->func) e->func->escapes = true; break;
     case E_ARROW: if (e->arrow && e->arrow->fn) ro_stmt(e->arrow->fn->body, ctx, loop + 1000); return; /* a closure may run many times */
     default: break;
@@ -14132,6 +14133,24 @@ static void find_run_once(Program *p) {
             if (e->hot || (e->caller && !e->caller->run_once)) { e->callee->run_once = false; changed = true; }
         }
     }
+    /* once: the same, loops of its own allowed (a constructor that reads its options with a loop); the calls it makes
+       outside its loops run once too (cold_site: a small function that can fail is called there, not copied) */
+    for (int i = 0; i < nall; i++) {
+        Func *f = all[i];
+        f->once = !f->escapes && !f->virt_target && !f->is_gen && !f->is_async && !(f->cls && in_hierarchy(f->cls)) && !f->ntparams;
+        bool any = false;
+        for (int k = 0; k < nro; k++) if (ro_edges[k].callee == f) { any = true; if (ro_edges[k].caller == f) f->once = false; }
+        if (!any) f->once = false;
+    }
+    for (changed = true; changed;) {
+        changed = false;
+        for (int k = 0; k < nro; k++) {
+            RoEdge *e = &ro_edges[k];
+            if (!e->callee->once) continue;
+            if (e->hot || (e->caller && !e->caller->once)) { e->callee->once = false; changed = true; }
+        }
+    }
+    for (int k = 0; k < nro; k++) ro_edges[k].site->cold_site = !ro_edges[k].hot && (!ro_edges[k].caller || ro_edges[k].caller->once);
     free(all);
     #undef RO_PUSH
 }

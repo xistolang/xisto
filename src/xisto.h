@@ -362,6 +362,7 @@ struct Expr {
     int ntargs;
     int region;        /* E_ARRAY_LIT of region objects made inside that region's loop (region.c): lives in the region */
     bool par_native;   /* E_CALL of xisto:parallel whose fn was proved independent (parallel.c): the pool version */
+    bool cold_site;    /* emitter (find_run_once): a call that runs once (no loop or closure around it, in code that runs once) */
     bool rng_set;      /* E_IDENT: a range the pass that built it proved (distribute.c's pair slot counter) */
     bool loose;        /* E_BINARY: written == or != (the same as === / !== when no coercion could happen) */
     uint8_t await_tick; /* E_AWAIT: 1 of a value that is no promise (await null): one turn of the microtasks, as Node's,
@@ -533,6 +534,7 @@ struct Func {
     struct Func *deco_stub; /* a method a TypeScript decorator wraps (XB-107): its calls go through this function (its
                                slot); its own body is emitted as <cname>__orig */
     bool run_once;     /* straight-line code called only from code that runs once: not optimized (build time) */
+    bool once;         /* called only from calls that run once (it may have loops of its own): its calls outside loops run once */
     bool escapes;      /* used as a value or dispatched: who calls it, and how often, is not known */
     /* generic functions and methods (function f<T>(x: T): T): a template, instantiated per list of types */
     char **tparams;
