@@ -328,6 +328,7 @@ struct Expr {
     Expr *lhs, *rhs;
     ExprList args;
     bool is_call;
+    bool this_call;    /* E_CALL: f(obj, ...) made from f.call(obj, ...) of a function with a `this` parameter */
     bool opt_call;     /* x.f?.(args): f may be a function that is null (then the call is skipped) */      /* E_MEMBER */
     bool spread;       /* E_ARRAY_LIT with ...x elements (each an E_UNARY TK_ELLIPSIS): built by emit_spread_lit */
     Type *elem_type;   /* E_NEW_ARRAY */
@@ -504,6 +505,7 @@ struct Func {
     bool is_abstract;  /* abstract m(): T; no body, every concrete subclass overrides it */
     int access;        /* 0 public, 1 protected, 2 private */
     bool is_getter, is_setter; /* get x(): T / set x(v: T): named __get_x / __set_x, used as obj.x */
+    bool this_param;   /* function f(this: T, ...): its first parameter is the object (f.call(obj, ...), f.apply(obj, [...])) */
     bool is_gen;       /* function* f(): Generator<T>: returns a Stream<T> whose values the body yields */
     struct Func *outer_fn; /* an arrow or function expression: the function it is written in (NULL: top level) */
     struct Func **overrides; /* methods of subclasses that override this one (all levels) */

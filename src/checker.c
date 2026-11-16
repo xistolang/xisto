@@ -3023,6 +3023,7 @@ static Binding *lookup(const char *name) {
    write through a frozen binding is a compile error (TypeScript's Readonly<T>). A write through another path to the
    same object (a parameter it was passed to) is not seen: it changes the object, where Node would not. */
 static Expr *frozen_val; /* the last Object.freeze(...) checked (its node, now the value) */
+static bool this_call_rewrite(Expr *e, Type *expected);
 static Binding *frozen_binding(Expr *x) {
     if (!x || x->kind != E_IDENT || !x->str) return NULL;
     for (Binding *b = lookup(x->str); b; b = b->origin) if (b->frozen) return b;
@@ -10258,6 +10259,19 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     }
     case E_CALL: {
+        if (e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && !strcmp(e->lhs->str, "__xs_construct") && e->args.len == 2) {
+            Expr *k = e->args.items[0]; /* new (F as any)(): F a function */
+            while (k->kind == E_AS && k->lhs) k = k->lhs;
+            if (k->kind == E_IDENT && k->str && !lookup(k->str) && !find_class(k->str) && lookup_func(k->str))
+                xs_error(XS6046, e->pos, xs_sprintf("write a class: class %s { constructor(...) { this.x = ...; } }", k->str),
+                         "'%s' is a function: 'new' makes objects of classes only", k->str);
+        }
+        if (!e->this_call && e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && !lookup(e->lhs->str)) {
+            Func *tf = lookup_func(e->lhs->str);
+            if (tf && tf->this_param)
+                xs_error(XS6047, e->pos, "the object goes first: f.call(obj, a, b)", "'%s' declares 'this': call it as %s.call(obj, ...) or %s.apply(obj, [...])",
+                         tf->name, tf->name, tf->name);
+        }
         if (e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && !strncmp(e->lhs->str, "__deco", 6) && e->args.len == 2 &&
             e->args.items[1]->kind == E_INDEX && e->args.items[1]->lhs && e->args.items[1]->lhs->kind == E_MEMBER &&
             e->args.items[1]->lhs->str && !strcmp(e->args.items[1]->lhs->str, "fields")) {
@@ -11346,6 +11360,8 @@ static void check_expr_in(Expr *e, Type *expected) {
             return;
         }
         frozen_call(e);
+        if (e->is_call && e->str && (!strcmp(e->str, "call") || !strcmp(e->str, "apply")) && e->lhs && e->args.len >= 1 &&
+            this_call_rewrite(e, expected)) return;
         if (e->is_call && e->str && !strcmp(e->str, "defineProperty") && e->lhs && e->lhs->kind == E_IDENT && !strcmp(e->lhs->str, "Object") &&
             !lookup("Object") && e->args.len == 3 && e->args.items[2]->kind == E_OBJLIT) {
             Expr *d = e->args.items[2];
@@ -14154,6 +14170,9 @@ static void check_expr_in(Expr *e, Type *expected) {
     case E_NEW_OBJ: {
         if (e->str && strcmp(e->str, "Promise") == 0 && !find_class("Promise")) { check_pr_new(e, expected); return; }
         Class *c = e->cls && e->cls->adapter_of ? e->cls : find_class(e->str); /* (an adapter has no name to find) */
+        if (!c && e->str && !lookup(e->str) && lookup_func(e->str))
+            xs_error(XS6046, e->pos, xs_sprintf("write a class: class %s { constructor(...) { this.x = ...; } }", e->str),
+                     "'%s' is a function: 'new' makes objects of classes only", e->str);
         if (!c) {
             int n; const char **cands = class_names(&n);
             if (missing_name(e->str)) xs_error_quiet();
@@ -14908,6 +14927,81 @@ static void check_block(Stmt *b) {
 }
 
 static Expr *proto_call_of(Expr *x);
+/* f.call(obj, a, b) / f.apply(obj, [a, b]): f(obj, a, b) for a function declared with `this: T` (its first parameter),
+   f(a, b) for another function (obj unused: evaluated when it is not a plain read); m.call(obj, a) of a method
+   (x.m, C.prototype.m): obj.m(a). Returns whether e was rewritten (and checked). */
+static bool this_call_rewrite(Expr *e, Type *expected) {
+    bool apply = e->str[0] == 'a';
+    Expr *fx = e->lhs, *self = e->args.items[0];
+    Func *uf = NULL;
+    Class *mc = NULL; /* a method of this class */
+    Expr *fval = NULL; /* a field or variable holding a function */
+    if (fx->kind == E_IDENT && fx->str && !lookup(fx->str)) uf = lookup_func(fx->str);
+    else if (fx->kind == E_IDENT && fx->str) {
+        Binding *b = lookup(fx->str);
+        Type *t = b && b->type ? ty_strip_null(b->type) : NULL;
+        if (t && t->kind == TY_FUNC && !t->rest) fval = fx;
+    } else if (fx->kind == E_MEMBER && !fx->is_call && fx->str && fx->lhs) {
+        Expr *o = fx->lhs;
+        if (o->kind == E_MEMBER && !o->is_call && o->str && !strcmp(o->str, "prototype") && o->lhs && o->lhs->kind == E_IDENT &&
+            !lookup(o->lhs->str)) { /* C.prototype.m.call(obj, ...) */
+            Class *c = find_class(o->lhs->str);
+            if (c && find_method(c, fx->str)) mc = c;
+        } else if (pure_read(o)) {
+            Expr *probe = pure_copy(o);
+            if (probe) {
+                check_expr(probe, NULL);
+                Type *t = ty_strip_null(probe->type);
+                if (t->kind == TY_OBJECT && !t->cls->builtin && find_method(t->cls, fx->str)) mc = t->cls;
+                else if (t->kind == TY_OBJECT && !t->cls->builtin) {
+                    for (int i = 0; i < t->cls->nfields; i++)
+                        if (!strcmp(t->cls->fields[i].name, fx->str) && ty_strip_null(t->cls->fields[i].type)->kind == TY_FUNC &&
+                            !ty_strip_null(t->cls->fields[i].type)->rest) fval = fx;
+                }
+            }
+        }
+    }
+    if (!uf && !mc && !fval) return false;
+    ExprList rest = {0};
+    if (apply) {
+        if (e->args.len > 2) return false;
+        if (e->args.len == 2) {
+            Expr *arr = e->args.items[1];
+            if (arr->kind != E_ARRAY_LIT || arr->spread)
+                xs_error(XS6048, arr->pos, xs_sprintf("pass them one by one: %s.call(obj, a, b)", uf ? uf->name : fx->str ? fx->str : "f"),
+                         "%s.apply takes its arguments as an array literal here", uf ? uf->name : fx->str ? fx->str : "f");
+            for (int i = 0; i < arr->args.len; i++) expr_list_push(&rest, arr->args.items[i]);
+        }
+    } else for (int i = 1; i < e->args.len; i++) expr_list_push(&rest, e->args.items[i]);
+    Pos at = e->pos;
+    Expr *c = xs_alloc(sizeof *c);
+    c->field = -1; c->pos = at;
+    bool keep_self = false;
+    if (mc) { /* obj.m(...) */
+        c->kind = E_MEMBER; c->is_call = true; c->str = fx->str; c->lhs = self;
+        c->args = rest;
+    } else {
+        if (fval && fval->kind == E_MEMBER) { c->kind = E_MEMBER; c->is_call = true; c->str = fval->str; c->lhs = fval->lhs; }
+        else { c->kind = E_CALL; c->lhs = fx; }
+        if (uf && uf->this_param) { expr_list_push(&c->args, self); c->this_call = true; }
+        else keep_self = !(self->kind == E_NULL || self->kind == E_THIS || pure_read(self));
+        for (int i = 0; i < rest.len; i++) expr_list_push(&c->args, rest.items[i]);
+    }
+    if (keep_self) { /* (obj evaluated first, as JavaScript does) */
+        check_expr(self, NULL);
+        check_expr(c, expected);
+        Expr *seq = xs_alloc(sizeof *seq);
+        seq->kind = E_SEQ; seq->pos = at; seq->field = -1; seq->type = c->type;
+        expr_list_push(&seq->args, self);
+        expr_list_push(&seq->args, c);
+        *e = *seq;
+        return true;
+    }
+    *e = *c;
+    check_expr(e, expected);
+    return true;
+}
+
 static void check_var(Stmt *s, bool global) {
     if (s->init && proto_call_of(s->init)) {
         /* const proto = Object.getPrototypeOf(x) [as {...}]: the prototype of x's class, read and written by name: a method

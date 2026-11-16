@@ -4624,7 +4624,8 @@ static void emit_expr_raw(Expr *e) {
         for (int i = 0; i < e->args.len; i++) {
             if (i) buf_puts(out, ", ");
             bool val = i == e->args.len - 1 && e->type && e->type->kind != TY_VOID; /* (const r = <void call>: then null) */
-            buf_puts(out, val ? "(" : "(void)(");
+            bool rel = !val && is_fresh(e->args.items[i]); /* (a new object no one keeps: released) */
+            buf_puts(out, val ? "(" : rel ? "xs_release(" : "(void)(");
             emit_expr(e->args.items[i]);
             buf_puts(out, ")");
         }

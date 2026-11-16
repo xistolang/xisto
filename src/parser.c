@@ -3406,6 +3406,20 @@ static void parse_params_ex(Parser *p, Func *f, bool is_ctor) {
             f->params = realloc(f->params, sizeof(Param) * (size_t)cap);
         }
         Param prm = {0};
+        if (!is_ctor && f->nparams == 0 && !f->this_param && at(p, TK_THIS) && peek_is(p, TK_COLON)) {
+            /* function f(this: T, ...): the object it is called on (f.call(obj, ...)), its first parameter here */
+            next(p);
+            next(p);
+            prm.name = "__this";
+            const char *tfrom = p->tok.start;
+            prm.type = parse_type(p);
+            prm.type_src = span(p, tfrom);
+            f->this_param = true;
+            f->params[f->nparams++] = prm;
+            vt_push(p, prm.name, prm.type);
+            if (!accept(p, TK_COMMA)) break;
+            continue;
+        }
         parse_decorators(p, &prm.decos);
         Pos mpos = p->tok.pos;
         while (at_ident(p, "public") || at_ident(p, "private") || at_ident(p, "protected") || at_ident(p, "readonly")) {
@@ -3497,6 +3511,13 @@ static void parse_generic_rest(Parser *p, Func *f, bool method) {
     Parser pv_st = *p; /* (a function not async declared Promise<T>: kept below, for its promise version, XB-231) */
     if (method) parse_params_ex(p, f, false);
     else parse_params(p, f);
+    if (method && f->this_param) { /* m(this: C, ...): the method's own object, as TypeScript checks it */
+        memmove(f->params, f->params + 1, sizeof(Param) * (size_t)(f->nparams - 1));
+        f->nparams--;
+        f->this_param = false;
+    }
+    const char *this_was = p->this_alias;
+    if (f->this_param) p->this_alias = "__this";
     if (!at(p, TK_COLON) && (at(p, TK_LBRACE) || (f->gen_arrow && at(p, TK_ARROW))) && !f->is_gen) {
         f->ret = NULL; /* function total(a: number, b: number) { return a + b; }: the checker infers it from the returns */
     } else {
@@ -3516,6 +3537,7 @@ static void parse_generic_rest(Parser *p, Func *f, bool method) {
     if (!method && !f->gen_arrow && at(p, TK_SEMI)) { /* function f<A>(a: A): R;  an overload signature */
         next(p);
         f->overload_sig = true;
+        p->this_alias = this_was;
         tp_names = saved;
         ntp = saved_n;
         return;
@@ -3534,6 +3556,7 @@ static void parse_generic_rest(Parser *p, Func *f, bool method) {
         }
         expect_semi(p);
     } else f->body = parse_block(p);
+    p->this_alias = this_was;
     prepend_param_decls(f);
     p->in_gen = saved_gen;
     tp_names = saved;
