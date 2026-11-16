@@ -144,6 +144,7 @@ static void site_str(Buf *b, const char *s) {
     buf_putc(b, '"');
 }
 static bool inlined_once(Func *f);
+static bool pkg_once(Func *f);
 static bool stmt_has_try(Stmt *s);
 static int cur_rg; /* rg-hoist: the dual region being emitted (definition and notes below, with the region versions) */
 static bool rg_hoist_on; /* (defined with cur_rg below) */
@@ -855,7 +856,9 @@ static void emit_releases(EScope *s) {
             }
         }
         const char *kf = s->types ? known_free(s->types[i]) : NULL;
-        if (kf) buf_printf(out, "xs_release_as(%s, %s);", s->names[i], kf);
+        if (cur_func && (cur_func->run_once || pkg_once(cur_func))) /* (code that runs once: one call, not the inlined release) */
+            buf_printf(out, "%s(%s);", kf && !strcmp(kf, "xs_str_free") ? "xs_str_release" : "xs_release_ool", s->names[i]);
+        else if (kf) buf_printf(out, "xs_release_as(%s, %s);", s->names[i], kf);
         else buf_printf(out, "xs_release(%s);", s->names[i]);
     }
     if (use_cln && s->n) { nl(); buf_printf(out, "xs_cln_n -= %d;", s->n); }
@@ -13836,7 +13839,7 @@ static void emit_class(Class *c) {
         Class *fc = ft->kind == TY_OBJECT ? ft->cls : NULL;
         if (fc && !fc->builtin && !fc->nsubs && !fc->region && !fc->is_interface && fc->used) /* its free is known */
             buf_printf(out, "xs_release_as(self->%s, %s_free);", c->fields[i].cname, fc->cname);
-        else if (ft->kind == TY_STRING) buf_printf(out, "xs_release_as(self->%s, xs_str_free);", c->fields[i].cname);
+        else if (ft->kind == TY_STRING) buf_printf(out, "xs_str_release(self->%s);", c->fields[i].cname); /* (out of line) */
         else buf_printf(out, "xs_release(self->%s);", c->fields[i].cname);
     }
     nl();

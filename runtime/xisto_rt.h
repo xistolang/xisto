@@ -895,6 +895,10 @@ static void xs_str_free(void *p);
               else if (__builtin_expect((h_->cls & (XS_CYC | XS_BUF)) == XS_CYC, 0)) xs_gc_suspect(h_); } } while (0)
 /* the argument appears once in the expansion: a chain of calls nests these macros, and a copy for __typeof__ doubled
    the text at every level (a 20-call query builder chain became ~1M copies and took clang past 10 GB, 11/11) */
+/* a string's release out of line: a class's free function releases each string field with one call, not the
+   inlined test-and-free (Intl.DateTimeFormatOptions: 16 fields, 2.9 KB inline) */
+XS_NOINLINE void xs_str_release(void *p) { xs_release_as(p, xs_str_free); }
+XS_NOINLINE void xs_release_ool(void *p) { xs_release_(p); } /* (the release of code that runs once: a call) */
 #define xs_retain(x) ({ __auto_type xs_rtv_ = (x); (__typeof__(xs_rtv_))xs_retain_((void *)xs_rtv_); })
 #define xs_release(x) xs_release_((void *)(x))
 /* node:async_hooks: read and replace the current context (xs_als_cur, above) */

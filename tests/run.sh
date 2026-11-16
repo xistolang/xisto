@@ -334,6 +334,8 @@ if sel lean; then
         lean_pkg=$(XISTO_PKGS="$PWD/tests/size/pkgs" $XISTO emit tests/size/lean-pkg.ts 2> /dev/null)
         if ! echo "$lean_pkg" | grep -q '^XS_RUN_ONCE .*_setup(' || echo "$lean_pkg" | grep -q '^XS_RUN_ONCE .*_kernel('; then
             echo "FAIL lean: a package's run-once function is not compiled for size, or the program's kernel is"; lean_ok=0; fi
+        # a free function releases a string field with one out-of-line call (xs_str_release), not an inlined release
+        if ! grep -q 'xs_str_release(self->f_a)' "$OUT/lean.c"; then echo "FAIL lean: a string field's release is inlined in the free function"; lean_ok=0; fi
         # Opts is never printed: its print function is empty (emit.c, find_printable; tests/ok/print-reach.ts prints through other types)
         if ! grep -E 'static void c[0-9]+_Opts_print\(void \*p\) \{ \(void\)p; \}' "$OUT/lean.c" > /dev/null; then echo "FAIL lean: a class nothing prints has its print function"; lean_ok=0; fi
     fi
