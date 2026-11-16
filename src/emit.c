@@ -3050,7 +3050,8 @@ static void emit_spawn(Expr *e) {
         if (crc(orig[i]->type)) emit_owned(orig[i]); else emit_expr(orig[i]);
         buf_puts(out, "; ");
     }
-    buf_printf(out, "xs_promise_spawn(%d, xs_sp%d_run, xs_sp%d_free, sp%d_); })", k, id, id, id);
+    if (e->floating) buf_printf(out, "xs_promise_spawn_fl(%d, xs_sp%d_run, xs_sp%d_free, sp%d_, %d); })", k, id, id, id, e->floating == 2);
+    else buf_printf(out, "xs_promise_spawn(%d, xs_sp%d_run, xs_sp%d_free, sp%d_); })", k, id, id, id);
 }
 
 /* emits f's copy for the call whose site is csite (into clone_fns) and returns its C name */

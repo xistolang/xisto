@@ -364,6 +364,7 @@ struct Expr {
     bool par_native;   /* E_CALL of xisto:parallel whose fn was proved independent (parallel.c): the pool version */
     bool rng_set;      /* E_IDENT: a range the pass that built it proved (distribute.c's pair slot counter) */
     bool loose;        /* E_BINARY: written == or != (the same as === / !== when no coercion could happen) */
+    uint8_t floating;  /* E_SPAWN of a floating call f(); (checker fl_finish): 1 in a function, 2 at the top level */
     bool voided;       /* written `void expr` (the parser drops the operator): a promise left floating on purpose (XS2112) */
     uint8_t await_tick; /* E_AWAIT: 1 of a value that is no promise (await null): one turn of the microtasks, as Node's,
                           on a coroutine (emit.c, xs_await_tick); 2 of an async function called directly (xs_await_call_tick) */
@@ -765,6 +766,7 @@ typedef struct {
     bool uses_parallel; /* imports xisto:parallel (parser) */
     bool par_native;   /* some call of it runs on the thread pool (parallel.c): per-thread runtime state (XS_THREADS),
                           the program globals shared */
+    bool uses_float;   /* a floating call f(); runs as a task (xs_promise_spawn_fl; the runtime's XS_FLOAT part) */
     bool uses_gen;     /* generators: the coroutine runtime, without worker threads (plain globals, no TLS) */
     bool uses_sqlite;
     bool uses_regex;    /* RegExp: runtime/xisto_regex.h joins the program */

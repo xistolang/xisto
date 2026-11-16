@@ -96,9 +96,15 @@ work("bare", 20);          // start bare
 console.log("after bare"); // after bare; end bare comes later, from the timer
 ```
 
-A callee that never waits (no `await`, no async call it waits for) runs to its end at the call, with no promise and
-no task: the same cost as a plain call. One that waits runs as a task with its own promise, which nothing reads. A
-rejection of that promise is an unhandled rejection (see below), as in Node.
+A callee that never waits (no `await`, no async call it waits for) and cannot throw runs to its end at the call,
+with no promise and no task: the same cost as a plain call. Any other runs as a task with its own promise, which
+nothing reads: a throw in it, even before its first `await`, rejects that promise and does not reach the caller's
+`try`/`catch`, as in Node. A rejection nobody handles is an unhandled rejection (see below).
+
+Floating tasks run on a shared task stack: a waiting one keeps only the bytes it used (10,000 pending calls, each
+waiting on a timer: 32 MB peak RSS; Node 26: 88 MB). A floating call written as a statement of the top level
+(`main();` with more code after it) gets a stack as large as the main thread's, so deep recursion that worked there
+still works.
 
 The build warns about each one (XS2112), because its errors are not caught where it is called. `xisto build`
 and `xisto run` print the count; `--warnings` (or `xisto check --details`) shows each place:
@@ -119,7 +125,7 @@ Write `void sendEmail(user);` when running it in the background is what you want
 
 A call written as a statement of a module's top level, such as the usual `main();`, is not warned: a rejection
 there ends the program with its error, as an uncaught `throw` does. When `main();` is the program's last statement,
-it runs on the main stack as before (nothing of the top level is left to go on).
+it runs on the main stack itself (nothing of the top level is left to go on, so the order is Node's).
 
 Cost, measured on an Apple M4 (12 Nov 2026), 2 million calls: `await f()` 0.7–0.9 ns per call; a kept promise
 (`const p = f(); await p`) about 73 ns. Node: about 20 ns for both. Await directly where you can. How waiting

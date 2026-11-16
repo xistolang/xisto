@@ -5065,25 +5065,86 @@ static void fl_spawn(Expr *e, Stmt *st) {
     fl_sites[nfl_sites] = e;
     fl_in[nfl_sites++] = cur_func;
 }
+/* can it throw? (conservative: any call but to a plain function of the program that cannot, any index, cast,
+   template, int arithmetic (overflow checks), new of a built-in, member of a value that may be null) */
+static bool fl_stmt_throws(Stmt *s, int depth);
+static bool fl_func_throws(Func *f, int depth) {
+    if (!f || !f->body || f->is_async || f->ret_promise || f->is_native || f->is_gen || f->noverrides || f->is_abstract || f->deco_stub ||
+        f->decos.len || depth > 8) return true;
+    return fl_stmt_throws(f->body, depth + 1);
+}
+static bool fl_expr_throws(Expr *e, int depth) {
+    if (!e) return false;
+    switch (e->kind) {
+    case E_NUMBER: case E_STRING: case E_BOOL: case E_NULL: case E_IDENT: case E_THIS: case E_ARROW: case E_FUNC_REF: return false;
+    case E_CALL:
+        if (e->func && !e->builtin.cfn && e->lhs && e->lhs->kind == E_IDENT && !fl_func_throws(e->func, depth)) break;
+        return true;
+    case E_MEMBER:
+        if (e->is_call) {
+            if (e->func && !e->builtin.cfn && e->cls && !e->cls->builtin && !fl_func_throws(e->func, depth)) break;
+            return true;
+        }
+        if (!e->lhs || !e->lhs->type || e->lhs->type->kind != TY_OBJECT || !e->cls || e->cls->builtin || e->field < 0) return true; /* (a field of a class object) */
+        break;
+    case E_NEW_OBJ:
+        if (!e->cls || e->cls->builtin || (e->cls->ctor && fl_func_throws(e->cls->ctor, depth))) return true;
+        for (int i = 0; i < e->cls->nfields; i++) if (fl_expr_throws(e->cls->fields[i].init, depth)) return true;
+        break;
+    case E_BINARY: case E_UNARY: case E_POSTFIX: case E_ASSIGN:
+        if ((e->type && e->type->kind == TY_INT) || (e->lhs && e->lhs->type && e->lhs->type->kind == TY_INT)) return true;
+        if (e->kind == E_ASSIGN && e->lhs && e->lhs->kind != E_IDENT && e->lhs->kind != E_MEMBER) return true;
+        break;
+    default: return true; /* (index, cast, template, await, spawn, ...) */
+    }
+    if (fl_expr_throws(e->lhs, depth) || fl_expr_throws(e->rhs, depth)) return true;
+    for (int i = 0; i < e->args.len; i++) if (fl_expr_throws(e->args.items[i], depth)) return true;
+    return false;
+}
+static bool fl_stmt_throws(Stmt *s, int depth) {
+    if (!s) return false;
+    switch (s->kind) {
+    case S_BLOCK: case S_EXPR: case S_RETURN: case S_IF: case S_VAR: break;
+    default: return true; /* (throw, try, loops, switch...) */
+    }
+    if (fl_expr_throws(s->init, depth) || fl_expr_throws(s->expr, depth) || fl_expr_throws(s->cond, depth)) return true;
+    if (fl_stmt_throws(s->body, depth) || fl_stmt_throws(s->else_body, depth)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (fl_stmt_throws(s->stmts.items[i], depth)) return true;
+    return false;
+}
 static bool fl_never_waits(Expr *c) { /* the callee is known (no dispatch) and its body has no wait */
     Func *f = c->func;
     if (!f || !f->body || f->is_native || f->is_gen || f->noverrides || f->is_abstract || f->deco_stub || f->decos.len || f->sig_failed) return false;
     if (c->kind != E_CALL && !(c->kind == E_MEMBER && c->is_call)) return false;
     if (c->kind == E_CALL && (!c->lhs || c->lhs->kind != E_IDENT)) return false; /* (a function value: who it is is not known) */
-    return !pv_body_waits(f->body);
+    return !pv_body_waits(f->body) && !fl_stmt_throws(f->body, 0);
 }
+/* the program's last statement at the top level of the user's modules (xisto's own modules loaded on demand, such
+   as xisto:reflect, come after it in prog->top: their declarations, not code of the program that runs after it) */
+static bool fl_internal(Module *m) { return !m || m->builtin || (m->file && (!strncmp(m->file, "xisto:", 6) || !strncmp(m->file, "node:", 5))); }
+static bool fl_last_top(Stmt *s) {
+    if (!s || fl_internal(s->mod)) return false;
+    int i = prog->top.len - 1;
+    while (i >= 0 && fl_internal(prog->top.items[i]->mod)) i--;
+    return i >= 0 && prog->top.items[i] == s;
+}
+static bool fl_in_top(Stmt *s);
 static void fl_finish(void) {
     for (int i = 0; i < nfl_sites; i++) {
         Expr *e = fl_sites[i];
         if (e->kind != E_SPAWN) continue;
         /* main(); as the program's last statement: nothing of the top level is left to go on, so it runs at the call,
            on the main stack (its waits run the event loop), as before: the same order as Node's */
-        bool last = !fl_in[i] && prog->top.len && prog->top.items[prog->top.len - 1] == fl_stmt[i];
+        bool last = !fl_in[i] && fl_last_top(fl_stmt[i]);
         if (!getenv("XISTO_FLOAT_ALWAYS") && (last || fl_never_waits(e->lhs))) {
             Expr *c = e->lhs;
             *e = *c;
             continue;
         }
+        /* (2: a statement of the top level itself, such as main();: a stack as large as the main thread's it ran on; in
+           a loop or a block there, as in a function, the shared task stack: thousands of them would reserve 8 MB each) */
+        e->floating = fl_in[i] || !fl_in_top(fl_stmt[i]) ? 1 : 2;
+        prog->uses_float = true;
         gen_site(fl_in[i]);
     }
 }
@@ -5099,11 +5160,11 @@ static const char *fl_name(Expr *e) { /* f, obj.m, this.svc.m: the callee as wri
         return xs_sprintf("%s.%s.%s", o->lhs->kind == E_THIS ? "this" : o->lhs->str, o->str, e->str);
     return e->str;
 }
-static bool fl_top_stmt(Stmt *s) { /* a statement of a module's top level itself (not in a block or a loop there) */
-    if (cur_func) return false;
+static bool fl_in_top(Stmt *s) { /* a statement of a module's top level itself (not in a block or a loop there) */
     for (int i = 0; i < prog->top.len; i++) if (prog->top.items[i] == s) return true;
     return false;
 }
+static bool fl_top_stmt(Stmt *s) { return !cur_func && fl_in_top(s); }
 static void fl_warn(Expr *e, const char *name, Pos pos) {
     if (e->voided || !pr_is_call(e)) return;
     bool async_call = pr_async_call(e) && !(e->func && e->func->ret_maybe_sync);
