@@ -74,7 +74,10 @@ void xs_error_quiet(void); /* back to the recovery point without a message: the 
 bool xs_node_core_name(const char *spec);                  /* "path", "fs/promises": a Node module without "node:" */
 char *xs_tsconfig_resolve(const char *from_file, const char *spec); /* a tsconfig "paths" name: its file or folder, or NULL */
 extern bool xs_lex_skipping; /* xisto check: the parser is skipping a declaration that did not parse (no lexer errors there) */
-extern bool xs_check_mode; /* xisto check: report every error (no limit of 20) and keep going where possible */
+extern bool xs_check_mode; /* xisto check: report every error (no limit) as one JSON object each */
+extern bool xs_keep_going; /* build and check (XB-113): an error costs its declaration or import, and checking goes on */
+extern int xs_max_errors;  /* a build stops after this many errors (--max-errors N; 0: no limit) */
+void xs_error_summary(void); /* the closing line of a build with errors: the total, by code and by file */
 extern int xs_quiet_count;   /* follow-on errors kept quiet (a use of a declaration that failed) */
 void xs_error_continue(DiagCode code, Pos pos, const char *help, const char *fmt, ...); /* report, count, go on */
 void xs_warn(Pos pos, const char *help, const char *fmt, ...);
@@ -83,8 +86,10 @@ void xs_note_dynamic_record(Pos pos); /* an object made as any (a Record): XS200
 void xs_warn_rule(DiagCode code, Pos pos, const char *help, const char *fmt, ...); /* XB-118: compiles, with a warning */
 void xs_warn_rule_summary(void);
 extern bool xs_show_warnings, xs_deny_warnings;
-extern jmp_buf *xs_error_recover; /* when set, xs_error longjmps here instead of exiting (up to 20 errors) */
+extern jmp_buf *xs_error_recover; /* when set, xs_error longjmps here instead of exiting (up to xs_max_errors) */
 extern int xs_error_count;
+extern bool xs_diag_mute;   /* (XB-231: a promise version is checked without reporting) */
+extern int xs_muted_errors;
 extern bool xs_warnings;
 /* --tls=off: never link TLS; a dynamic fetch URL is then assumed to be http:// (TLS ends at the load balancer) */
 extern bool xs_tls_off;
@@ -317,6 +322,7 @@ struct Expr {
     bool own_in;       /* (k in o from Object.hasOwn / hasOwnProperty.call: own fields only, not the class's methods) */
     bool prechecked;   /* checked already (its type is final): check_expr leaves it as it is */
     bool want_tuple;   /* E_ARRAY_LIT: [k, v] returned to new Map(xs.map(...)): a tuple, as TypeScript reads it there */
+    bool upath;        /* E_AS: a union-typed field path (r.data, this.state, t[0]) read as the member a test narrowed it to (checked) */
     bool cell_raw;     /* E_IDENT tested against null (x === null, x ?? d): a narrowed variable in a cell read as declared (T | null) */
     bool gl_hold;      /* E_IDENT of a module variable some function assigns (XB-215): held for the length of a call it is passed to */
     char *str;         /* E_STRING literal, E_IDENT name, E_MEMBER member name, E_NEW_OBJ class name */
@@ -458,6 +464,8 @@ typedef struct {
 struct Func {
     Expr *origin;      /* an adapter arrow the checker made around a function value: that value (emit: the type's origin) */
     char *name;
+    char *js_name;     /* an arrow or function expression: the name JavaScript gives it (const f = () => ..., { next: () => ... },
+                          function g() {}), printed as [Function: f]; NULL: anonymous */
     Pos pos;
     Module *mod;
     bool exported;
@@ -469,8 +477,16 @@ struct Func {
     bool is_async;
     bool ret_maybe_sync; /* declared T | Promise<T> and not async: a call kept gives its value (JavaScript's T when it returns one) */
     bool ret_promise;  /* declared to return Promise<T> (ret is T): async whether or not it is written async */
+    void *pv_state;    /* not async, declared Promise<T>: where its parameters start, to parse it again as its promise version */
+    struct Type **inst_args; /* a generic instance: its type arguments (its promise version is parsed with them) */
+    struct Func *pver; /* XB-231: its version that returns the promise its body hands back (no await, no coroutine), for the
+                          calls whose promise is kept; used when pv_ok */
+    struct Func *pv_of; /* a promise version: the function it was made from */
+    bool pv_ok;        /* a promise version whose body never waits: its calls replace the spawned ones */
     Class *cls;        /* owning class for methods, else NULL */
     Class *static_of;  /* a static method (lowered to Class__s_name): its class, which reaches its private members */
+    void *static_state; /* a static method whose body names `this` (the class it is called on): the parser state at its
+                           parameters, to parse it again for a subclass that inherits it (xs_parse_static_copy) */
     bool is_ctor;
     char *cname;
     DecoList decos;
@@ -491,6 +507,7 @@ struct Func {
     int access;        /* 0 public, 1 protected, 2 private */
     bool is_getter, is_setter; /* get x(): T / set x(v: T): named __get_x / __set_x, used as obj.x */
     bool is_gen;       /* function* f(): Generator<T>: returns a Stream<T> whose values the body yields */
+    struct Func *outer_fn; /* an arrow or function expression: the function it is written in (NULL: top level) */
     struct Func **overrides; /* methods of subclasses that override this one (all levels) */
     int noverrides;
     bool virt_target;  /* called through a dispatcher: never inlined into one call site */
@@ -551,6 +568,7 @@ typedef struct {
     int access;        /* 0 public, 1 protected, 2 private */
     bool readonly;     /* assigned only in the constructor of its class */
     struct Class *owner; /* the class that declares it (inheritance copies fields down) */
+    bool static_block; /* (sfields) static { ... }: init is the call of the static method that holds the block */
 } Field;
 
 struct Class {
@@ -560,6 +578,7 @@ struct Class {
     bool exported;
     bool is_default;   /* export default class X, or export default X; of a class declared here */
     bool used;
+    bool made;         /* prune.c: an object of it can exist (new, a literal, a decoder) */
     Field *fields;
     int nfields, cap_fields;
     Func **methods;
@@ -732,6 +751,14 @@ typedef struct {
     bool uses_v8, uses_unk_map, uses_symbol_for, uses_nkey, uses_okmap; /* xisto:v8, x instanceof Map/Set of an unknown, Symbol.for: their runtime joins the program */
     bool uses_this_reg; /* XB-107: function (this: T) / method slots: the this register's helpers join the program */
     bool uses_tls;
+    struct Func **tls_fns; /* XB-232: functions with a fetch that may be https (checker); TLS joins when prune finds one of
+                              them reachable (a method: and an object of its class made) */
+    int ntls_fns;
+    struct Func **net_fns; /* XB-250: functions whose code needs the event loop/network runtime (checker); uses_net joins
+                              when prune finds one of them reachable */
+    int nnet_fns;
+    struct Func **gen_fns; /* XB-250: likewise for the coroutines (generators, promises): uses_gen */
+    int ngen_fns;
     bool uses_crypto;  /* node:crypto, or a native package that needs it */
     bool uses_zlib;    /* node:zlib: runtime/xisto_zlib.h joins the program, zlib (build/libxszlib.a) is linked */
     char **native_files; /* C sources of native packages (xisto.json "native"), compiled with the program */
@@ -760,6 +787,9 @@ extern bool xs_rsten; /* emit.c: U of the jam of j and of k (main.c: by target) 
 extern bool xs_wide_f64; /* distribute.c: the target has 4-lane double vectors (AVX2): the slow consts that read no column go in a flat loop */
 void prune_program(Program *p); /* marks what main reaches; emitters skip the rest */
 Func *xs_parse_instance(Func *tmpl, Type **args);
+Func *xs_parse_promise_version(Func *f);
+Func *xs_parse_static_copy(Func *f);
+#define XS_STATIC_THIS "\x02this" /* `this` in a static method: the class it is called on (checker: static_this_class) */
 Class *xs_parse_class_instance(Class *tmpl, Type **args, const char *name); /* parser.c: a generic function parsed again with its T bound */
 extern bool xs_debug;   /* --debug: statement hooks and the debugger agent (docs/debugger.md) */
 extern bool xs_profile; /* --profile: instrument every function with call counts and timing */

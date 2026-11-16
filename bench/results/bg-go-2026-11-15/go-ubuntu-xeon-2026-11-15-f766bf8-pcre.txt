@@ -1,0 +1,10 @@
+# xisto bg f766bf8 vs go, regex-redux with PCRE 8.45 (built from source, ~/pcre1, JIT), 2026-11-16T00:56Z, Linux x86_64
+steal before 167202
+# Linux x86_64, 2 cpu; median of 3
+regexredux     xisto  regexredux              0.955s     0.96cpu    149.0MB  par  1.0  same
+regexredux     xisto  regexredux-2            0.680s     0.97cpu    149.1MB  par  1.4  same
+regexredux     go     regexredux             27.819s    45.32cpu    385.1MB  par  1.6  same
+regexredux     go     regexredux_3           27.685s    46.02cpu    401.7MB  par  1.7  same
+regexredux     go     regexredux_4           17.494s    29.54cpu    390.2MB  par  1.7  same
+regexredux     go     regexredux_5            3.582s     5.27cpu    312.7MB  par  1.5  same
+steal after 167247

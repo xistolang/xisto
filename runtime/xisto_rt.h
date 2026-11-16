@@ -413,6 +413,13 @@ extern const xs_srec __stop_xs_sites[] __attribute__((weak));
 #define XS_SEC_PUSH ".pushsection xs_sites$m,\"dw\"\n\t"
 #define XS_L ".L"
 #define XS_TAB "xs_sitetab"
+#elif defined(XS_SITES_RETAIN)
+/* (--target, linked by zig's lld: with --gc-sections it drops a section only __start_/__stop_ name, so every frame
+   read as unknown, XB-245; "R" (SHF_GNU_RETAIN) keeps it. Not for the host's cc: GNU as before 2.36 rejects it, and
+   GNU ld keeps the section anyway) */
+#define XS_SEC_PUSH ".pushsection xs_sites,\"awR\"\n\t"
+#define XS_L ".L"
+#define XS_TAB "xs_sitetab"
 #else
 #define XS_SEC_PUSH ".pushsection xs_sites,\"aw\"\n\t"
 #define XS_L ".L"
@@ -600,6 +607,8 @@ typedef struct __attribute__((aligned(64))) xs_type {
     /* closures only: an adapter the compiler made around a function value (a typed listener given where
        (...args: any[]) => void goes) returns the function it wraps, so === sees the same function (off(handler)) */
     void *(*origin)(void *);
+    /* closures only: how console.log shows the function ("Function: f", "AsyncFunction: g"); NULL: anonymous */
+    const char *fname;
 } xs_type;
 _Static_assert(sizeof(xs_type) == 64, "xs_type is one cache line: a field more must replace one");
 /* hdr.cls: the size class in the low bits, then the flags */
@@ -654,6 +663,8 @@ static inline __attribute__((always_inline)) const xs_type *xs_type_of(const voi
     int32_t d = (int32_t)(((const xs_hdr *)p)->cls - XS_TIX(base)) >> 10; /* (the low 10 bits never borrow) */
     return (const xs_type *)(base + (uintptr_t)((intptr_t)d << 6));
 }
+/* a value held as an unknown (a union member) is a function */
+static inline bool xs_is_closure(const void *p) { return p && xs_type_of(p)->print == xs_print_closure; }
 static inline __attribute__((always_inline)) void xs_set_type(xs_hdr *h, const xs_type *t) {
     h->cls = (h->cls & 0x3ff) | XS_TIX(t);
 }
@@ -784,11 +795,18 @@ static inline __attribute__((always_inline)) void *xs_obj_alloc_raw(size_t size,
 #define xs_obj_alloc(size, free_fn, print_fn) xs_obj_alloc_t((size), ({ static const xs_type xs_t_ XS_TYPE_SEC = {(free_fn), (print_fn)}; &xs_t_; }))
 
 static inline __attribute__((always_inline)) void xs_obj_free_block(void *p, uint32_t k);
+/* XS_SIX, on an object without XS_CYC (a string; no string is cyclic, so the collector's bit is free there): the
+   string has an entry in its thread's index cache (xs_str_byte_at), which its free removes before the memory can
+   hold another string. Testing it rides on the test xs_obj_free already makes: nothing on the common path. */
+#define XS_SIX XS_BUF
+static void xs_six_free(void *s, uint32_t k);
+static void xs_six_forget(void *s);
 static inline __attribute__((always_inline)) void xs_obj_free(void *p) {
     xs_live--;
     uint32_t k = ((xs_hdr *)p)->cls;
     if (__builtin_expect(k & (XS_BUF | XS_STACK), 0)) {
         if (k & XS_STACK) return; /* its frame owns the memory: only the fields were released */
+        if (!(k & XS_CYC)) { xs_six_free(p, k); return; } /* (XS_SIX) */
         ((xs_hdr *)p)->cls |= XS_DEAD; /* a suspect: the collector gives the block back (xs_gc_step) */
         xs_sus_n--;
         return;
@@ -983,6 +1001,7 @@ static void xs_str_free(void *p) { xs_obj_free(p); }
 static bool xs_str_share(xs_str *s) {
     if (s->len < ((int64_t)64 << 10) || s->hdr.rc < 1) return false;
     if (s->hdr.rc >= XS_SHARED_RC) { __atomic_add_fetch(&s->hdr.rc, 1, __ATOMIC_RELAXED); return true; } /* (the message's own) */
+    if ((s->hdr.cls & (XS_SIX | XS_CYC)) == XS_SIX) xs_six_forget(s); /* (another thread will read it) */
     if (s->hdr.rc >= XS_IMMORTAL / 2 || (s->hdr.cls & (XS_CLS_MASK | XS_STACK | XS_RGN | XS_CYC | XS_BUF | XS_DEAD))) return false;
     if (xs_type_of(s)->free != xs_str_free || getenv("XISTO_NO_STR_SHARE")) return false;
     xs_live--; /* (no thread's allocation any more) */
@@ -1101,25 +1120,123 @@ static int64_t xs_str_len(xs_str *s) {
     return s->ulen;
 }
 
-/* Byte offset of the code point at index i (clamped to the end). */
-static int64_t xs_str_byte_at(xs_str *s, int64_t i) {
-    if (xs_str_len(s) == s->len) return i < s->len ? i : s->len; /* ASCII */
-    int64_t n = 0;
-    for (int64_t b = 0; b < s->len; b++) {
-        if ((s->data[b] & 0xC0) != 0x80) {
-            if (n == i) return b;
-            n++;
-        }
-    }
-    return s->len;
+/* ---- code point index <-> byte offset on a string that is not ASCII (XB-214) ----
+   Each thread keeps the last position it reached (index, byte offset) in a few strings, and the next lookup in
+   one of them walks from whichever is nearest of that position, the start and the end. A loop over a text,
+   forwards or backwards (s.substring(i, i + k), s.slice(i - k, i), charAt, charCodeAt, indexOf from i), walks a
+   few characters per step instead of from the start: O(n) instead of O(n^2) (86 s -> under a second on
+   counter-deferred). The walk counts eight bytes at a time.
+   A string with an entry carries XS_SIX (defined at xs_obj_free): its free removes the entry, so a later string
+   at the same address cannot find it, and a new string's header never has the bit. Only strings the thread owns
+   are entered: not from a frame or a region (their memory is reused without a free), not shared between threads
+   (XS_SHARED_RC; a literal is, but it is never freed and is entered without the bit), and none during a parallel
+   job (the pool's threads read the program's strings at the same time, and what a worker makes belongs to main
+   afterwards). Strings shorter than XS_SIX_MIN bytes are walked from the start: a few words. ASCII strings never
+   get here (their index is their byte offset). A string changed in place (append, replaceAll) leaves the cache
+   when its characters move. */
+#define XS_SIX_N 4
+#define XS_SIX_MIN 64
+typedef struct { xs_str *s; int64_t cp, b; } xs_six_ent;
+static XS_TLS xs_six_ent xs_six[XS_SIX_N];
+static XS_TLS unsigned xs_six_next;
+#ifdef XS_PARALLEL
+static XS_TLS bool xs_pool_inside; /* this thread is running a job: a nested parallel call runs as the loop */
+#endif
+XS_NOINLINE void xs_six_forget(void *p) {
+    for (int k = 0; k < XS_SIX_N; k++)
+        if (xs_six[k].s == p) xs_six[k].s = NULL;
+    ((xs_hdr *)p)->cls &= ~(uint32_t)XS_SIX;
 }
-
-static int64_t xs_str_cp_at_byte(xs_str *s, int64_t b) {
-    if (xs_str_len(s) == s->len) return b;
+/* xs_obj_free of a string with an entry (out of line: the free sites stay as small as before) */
+XS_NOINLINE void xs_six_free(void *p, uint32_t k) {
+    xs_six_forget(p);
+    xs_obj_free_block(p, k);
+}
+/* a literal: never freed, and read by every thread (server workers), so its header is left alone */
+static inline bool xs_six_immortal(xs_str *s) { return s->hdr.rc >= XS_IMMORTAL / 2 && s->hdr.rc < XS_SHARED_RC; }
+/* s's entry, made when it has none and may have one; NULL: walk without */
+static xs_six_ent *xs_six_entry(xs_str *s) {
+    uint32_t k = s->hdr.cls;
+    bool lit = xs_six_immortal(s);
+    if ((k & XS_SIX) || lit)
+        for (int j = 0; j < XS_SIX_N; j++)
+            if (xs_six[j].s == s) return &xs_six[j];
+    if (s->len < XS_SIX_MIN || (k & (XS_STACK | XS_RGN | XS_CYC | XS_DEAD)) || s->hdr.rc >= XS_SHARED_RC) return NULL;
+#ifdef XS_PARALLEL
+    if (xs_pool_inside) return NULL;
+#endif
+    xs_six_ent *e = &xs_six[xs_six_next++ % XS_SIX_N];
+    if (e->s && !xs_six_immortal(e->s)) e->s->hdr.cls &= ~(uint32_t)XS_SIX; /* (an entry's string is alive: its free would have removed it) */
+    e->s = s;
+    e->cp = 0, e->b = 0;
+    if (!lit) s->hdr.cls = k | XS_SIX;
+    return e;
+}
+/* how many bytes of the word are not UTF-8 continuation bytes (10xxxxxx): the characters starting in it */
+static inline int xs_u8_leads8(const char *p) {
+    uint64_t w;
+    memcpy(&w, p, 8);
+    uint64_t c = (w & ~(w << 1) & 0x8080808080808080ULL) >> 7;
+    return 8 - (int)((c * 0x0101010101010101ULL) >> 56);
+}
+#define XS_U8_LEAD(c) (((unsigned char)(c) & 0xC0) != 0x80)
+/* the byte offset of the k-th character start at or after byte b (there is one) */
+static int64_t xs_u8_fwd(const char *d, int64_t len, int64_t b, int64_t k) {
+    while (b + 8 <= len) {
+        int m = xs_u8_leads8(d + b);
+        if (m > k) break;
+        b += 8, k -= m;
+    }
+    for (;; b++)
+        if (XS_U8_LEAD(d[b]) && k-- == 0) return b;
+}
+/* the byte offset of the k-th character start before byte b, counting back (k >= 1, there is one) */
+static int64_t xs_u8_back(const char *d, int64_t b, int64_t k) {
+    while (b >= 8) {
+        int m = xs_u8_leads8(d + b - 8);
+        if (m >= k) break;
+        b -= 8, k -= m;
+    }
+    for (;;)
+        if (XS_U8_LEAD(d[--b]) && --k == 0) return b;
+}
+/* the characters starting in d[a, b) */
+static int64_t xs_u8_count(const char *d, int64_t a, int64_t b) {
     int64_t n = 0;
-    for (int64_t i = 0; i < b; i++)
-        if ((s->data[i] & 0xC0) != 0x80) n++;
+    for (; a + 8 <= b; a += 8) n += xs_u8_leads8(d + a);
+    for (; a < b; a++) n += XS_U8_LEAD(d[a]);
     return n;
+}
+XS_NOINLINE int64_t xs_str_byte_at_(xs_str *s, int64_t i, int64_t n) {
+    xs_six_ent *e = xs_six_entry(s);
+    int64_t cp = 0, b = 0; /* the nearest known position: the start, the end or the entry's */
+    if (n - i < i) cp = n, b = s->len;
+    if (e && (e->cp > i ? e->cp - i : i - e->cp) < (cp > i ? cp - i : i - cp)) cp = e->cp, b = e->b;
+    b = i >= cp ? xs_u8_fwd(s->data, s->len, b, i - cp) : xs_u8_back(s->data, b, cp - i);
+    if (e) e->cp = i, e->b = b;
+    return b;
+}
+/* Byte offset of the code point at index i (clamped to the end). */
+static inline int64_t xs_str_byte_at(xs_str *s, int64_t i) {
+    int64_t n = xs_str_len(s);
+    if (n == s->len) return i < s->len ? i : s->len; /* ASCII */
+    if (i < 0 || i >= n) return s->len;
+    return xs_str_byte_at_(s, i, n);
+}
+/* the index of the code point starting at byte b */
+XS_NOINLINE int64_t xs_str_cp_at_byte_(xs_str *s, int64_t b) {
+    int64_t n = xs_str_len(s);
+    xs_six_ent *e = xs_six_entry(s);
+    int64_t cp = 0, a = 0;
+    if (s->len - b < b) cp = n, a = s->len;
+    if (e && (e->b > b ? e->b - b : b - e->b) < (a > b ? a - b : b - a)) cp = e->cp, a = e->b;
+    cp = b >= a ? cp + xs_u8_count(s->data, a, b) : cp - xs_u8_count(s->data, b, a);
+    if (e && b < s->len && XS_U8_LEAD(s->data[b])) e->cp = cp, e->b = b;
+    return cp;
+}
+static inline int64_t xs_str_cp_at_byte(xs_str *s, int64_t b) {
+    if (xs_str_len(s) == s->len) return b;
+    return xs_str_cp_at_byte_(s, b);
 }
 
 /* the length of a + b when a's is known: b's is counted (b is copied anyway), so `s += t; s.length` does not count
@@ -1159,11 +1276,13 @@ static xs_str *xs_str_append_to(xs_str **slot, xs_str *b) {
     xs_str *a = *slot;
     int64_t n = a->len + b->len;
     size_t need = offsetof(xs_str, data) + (size_t)n + 1;
-    if (a != b && a->hdr.rc == 1 && !(a->hdr.cls & (XS_CLS_MASK | XS_STACK | XS_RGN | XS_CYC | XS_BUF | XS_DEAD)) &&
-        xs_type_of(a)->free == xs_str_free && need > XS_SMALL_MAX) {
+    if (a != b && a->hdr.rc == 1 && !(a->hdr.cls & (XS_CLS_MASK | XS_STACK | XS_RGN | XS_CYC | XS_DEAD)) &&
+        xs_type_of(a)->free == xs_str_free && need > XS_SMALL_MAX) { /* (XS_SIX may be set: what is there stays, and an
+        index cache entry stays right; a block that moves leaves it) */
         size_t cap = xs_msize(a);
         if (cap) {
             if (need > cap) {
+                if (a->hdr.cls & XS_SIX) xs_six_forget(a);
                 xs_str *r = realloc(a, need + need / 2);
                 if (!r) xs_panic("out of memory");
                 a = *slot = r;
@@ -1488,6 +1607,7 @@ XS_NOINLINE xs_str *xs_str_replace_impl2(xs_str *s, xs_str *a, xs_str *b, bool a
     if (all && b->len <= a->len && s->len > XS_SMALL_MAX) { /* a long text that does not grow: one pass into a buffer
         of its size (the result is at most as long; finding every match twice cost as much as the copy) */
         inplace = inplace && s->hdr.rc == 1 && b != s && a != s;
+        if (inplace && (s->hdr.cls & XS_SIX)) xs_six_forget(s); /* (its characters move) */
         xs_str *r = inplace ? s : xs_str_alloc(s->len);
         int32_t ulen0 = s->ulen;
         char *o = r->data;
@@ -1737,12 +1857,16 @@ static inline void xs_rd_free(void *p) { free(*(void **)p); }
 XS_ARRAY(double, xs_arr_num)
 XS_ARRAY(int64_t, xs_arr_int)
 XS_ARRAY(bool, xs_arr_bool)
+/* (boolean | null)[]: a byte per element, 0, 1 or the null sentinel XS_NULL_BOOL (as a boolean | null variable) */
+XS_ARRAY(int8_t, xs_arr_nbool)
 #define xs_at_num xs_at_xs_arr_num
 #define xs_at_int xs_at_xs_arr_int
 #define xs_at_bool xs_at_xs_arr_bool
 #define xs_at_num_s xs_at_xs_arr_num_s
 #define xs_at_int_s xs_at_xs_arr_int_s
 #define xs_at_bool_s xs_at_xs_arr_bool_s
+#define xs_at_nbool xs_at_xs_arr_nbool
+#define xs_at_nbool_s xs_at_xs_arr_nbool_s
 
 /* Arrays of strings and objects: the array owns one reference per element. */
 typedef struct xs_arr_ref { xs_hdr hdr; size_t len; void **data; size_t cap; void (*print_elem)(void *); } xs_arr_ref;
@@ -2832,6 +2956,11 @@ static inline __attribute__((always_inline)) xs_closure *xs_cl_static(xs_closure
     if (__builtin_expect(c->hdr.cls == 0, 0)) c->hdr.cls = XS_TIX(&xs_immortal_closure_type);
     return c;
 }
+/* the same, for a function of the program: its own descriptor, which carries its name */
+static inline __attribute__((always_inline)) xs_closure *xs_cl_static_t(xs_closure *c, const xs_type *t) {
+    if (__builtin_expect(c->hdr.cls == 0, 0)) c->hdr.cls = XS_TIX(t);
+    return c;
+}
 
 /* ---- unknown: any value by reference. Primitives are boxed; `x as T` checks the object's type (its free
    function is unique per type) and fails with a TypeError, like a bad cast in a checked language. ---- */
@@ -2875,7 +3004,7 @@ XS_NOINLINE xs_str *xs_uset_key(void *v) {
         return xs_str_new(buf, (size_t)n);
     }
     if (f == xs_box_bool_free) return xs_str_new(((xs_box_i *)v)->v ? "bt" : "bf", 2);
-    int n = snprintf(buf, sizeof buf, "p%p", v);
+    int n = snprintf(buf, sizeof buf, "p%p", xs_fn_origin(v)); /* (a function through an adapter: the function) */
     return xs_str_new(buf, (size_t)n);
 }
 static void xs_print_any_quoted(void *p);
@@ -3135,6 +3264,17 @@ static xs_str *xs_typeof_lit(const char *s) {
         }
     return xs_typeof_lit("object");
 }
+/* typeof of an `object` (held as its JSON text): what the text holds, as typeof of the value JSON.parse gives back */
+XS_NOINLINE xs_str *xs_json_typeof(xs_str *t) {
+    if (!t) return xs_typeof_lit("object");
+    const char *p = t->data, *end = t->data + t->len;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+    if (p == end) return xs_typeof_lit("object");
+    if (*p == '"') return xs_typeof_lit("string");
+    if (*p == 't' || *p == 'f') return xs_typeof_lit("boolean");
+    if (*p == '-' || (*p >= '0' && *p <= '9')) return xs_typeof_lit("number");
+    return xs_typeof_lit("object"); /* {...}, [...] and null */
+}
 static void xs_print_closure(void *p);
 /* ---- symbol: Symbol("desc"), a value equal only to itself (Nest's injection tokens); description as given ---- */
 typedef struct xs_Symbol { xs_hdr hdr; xs_str *f_description; int64_t f___id; } xs_Symbol;
@@ -3181,7 +3321,11 @@ XS_NOINLINE xs_str *xs_typeof(void *v) {
     if (xs_type_of(v)->print == xs_print_closure) return xs_typeof_lit("function");
     return xs_typeof_lit("object");
 }
-static void xs_print_closure(void *p) { (void)p; fputs("[Function]", XS_OUT); }
+static void xs_print_closure(void *p) {
+    p = xs_fn_origin(p); /* (a function through an adapter: the function) */
+    const char *n = xs_type_of(p)->fname;
+    fprintf(XS_OUT, "[%s]", n ? n : "Function (anonymous)");
+}
 
 /* Math.max(...xs) / Math.min(...xs): -Infinity / Infinity for an empty array, NaN when an element is */
 XS_NOINLINE double xs_math_max_nums(xs_arr_num *a) { double m = -INFINITY; for (size_t i = 0; i < a->len; i++) { if (a->data[i] != a->data[i]) return NAN; if (a->data[i] > m) m = a->data[i]; } return m; }
@@ -3220,7 +3364,7 @@ static const char *xs_dyn_what(void *v) {
     if (t->free == xs_box_int_free || t->free == xs_box_num_free) return "a number";
     if (t->free == xs_box_bool_free) return "a boolean";
     if (t->free == xs_map_free) return "a Map";
-    if (t->free == xs_arr_ref_free || t->free == xs_arr_num_free || t->free == xs_arr_int_free || t->free == xs_arr_bool_free) return "an array";
+    if (t->free == xs_arr_ref_free || t->free == xs_arr_num_free || t->free == xs_arr_int_free || t->free == xs_arr_bool_free || t->free == xs_arr_nbool_free) return "an array";
     if (t->print == xs_print_closure) return "a function";
     return "an object";
 }
@@ -3304,6 +3448,7 @@ XS_NOINLINE void *xs_dyn_get(void *o, xs_str *k) {
         if (t->free == xs_arr_num_free) return xs_box_int((int64_t)((xs_arr_num *)o)->len);
         if (t->free == xs_arr_int_free) return xs_box_int((int64_t)((xs_arr_int *)o)->len);
         if (t->free == xs_arr_bool_free) return xs_box_int((int64_t)((xs_arr_bool *)o)->len);
+        if (t->free == xs_arr_nbool_free) return xs_box_int((int64_t)((xs_arr_nbool *)o)->len);
     }
     return NULL; /* (undefined, as above) */
 }
@@ -3317,6 +3462,7 @@ XS_NOINLINE void *xs_dyn_at(void *o, int64_t i) {
     if (t->free == xs_arr_num_free) { xs_arr_num *a = o; return i >= 0 && (size_t)i < a->len ? xs_box_num(a->data[i]) : NULL; }
     if (t->free == xs_arr_int_free) { xs_arr_int *a = o; return i >= 0 && (size_t)i < a->len ? xs_box_int(a->data[i]) : NULL; }
     if (t->free == xs_arr_bool_free) { xs_arr_bool *a = o; return i >= 0 && (size_t)i < a->len ? xs_box_bool(a->data[i]) : NULL; }
+    if (t->free == xs_arr_nbool_free) { xs_arr_nbool *a = o; return i >= 0 && (size_t)i < a->len ? xs_box_bool_or_null(a->data[i]) : NULL; }
     xs_str *k = xs_str_from_int(i);
     void *r = xs_dyn_get(o, k);
     xs_release(k);
@@ -3381,6 +3527,7 @@ XS_NOINLINE void xs_dyn_set(void *o, xs_str *k, void *v) {
    to the copy does not change the object). Borrowed, as a cast's value is: the copy lives until the arena drains. */
 XS_NOINLINE void *xs_as_record(void *v, int nullable, const char *what) {
     if (!v) { if (nullable) return NULL; xs_as_fail(what); }
+    v = xs_fn_origin(v); /* (an object through an interface adapter: the object; XB-233) */
     const xs_type *t = xs_type_of(v);
     if (t->free == xs_map_free && ((xs_map *)v)->str_keys) return v;
     if (!t->dyn) xs_as_fail(what);
@@ -3485,7 +3632,7 @@ XS_NOINLINE bool xs_dyn_eq(void *a, void *b) {
         return x->len == y->len && memcmp(x->data, y->data, (size_t)x->len) == 0;
     }
     if (ta->free == xs_box_bool_free && tb->free == xs_box_bool_free) return ((xs_box_i *)a)->v == ((xs_box_i *)b)->v;
-    return false;
+    return (ta->origin || tb->origin) && xs_fn_origin(a) == xs_fn_origin(b); /* (one function through two adapters) */
 }
 /* Number(x) / arithmetic on an any: as JavaScript converts (null is 0, a string is parsed, an object is NaN) */
 XS_NOINLINE double xs_dyn_num(void *v) {
@@ -3603,6 +3750,7 @@ XS_NOINLINE void *xs_dyn_add(void *a, void *b) {
 XS_ARR_CALLBACKS(xs_arr_num, double, XS_ID)
 XS_ARR_CALLBACKS(xs_arr_int, int64_t, XS_ID)
 XS_ARR_CALLBACKS(xs_arr_bool, bool, XS_ID)
+XS_ARR_CALLBACKS(xs_arr_nbool, int8_t, XS_ID)
 /* reference arrays: xs_arr_ref_new takes (cap, printer) and pushes take ownership */
 XS_NOINLINE void xs_arr_forEach_xs_arr_ref(xs_arr_ref *a, xs_closure *cl, int arity) {
     for (size_t i = 0; i < a->len; i++) {
@@ -3665,35 +3813,43 @@ static xs_arr_ref *xs_arr_slice_xs_arr_ref(xs_arr_ref *a, int64_t start, int64_t
 #define xs_arr_forEach_num xs_arr_forEach_xs_arr_num
 #define xs_arr_forEach_int xs_arr_forEach_xs_arr_int
 #define xs_arr_forEach_bool xs_arr_forEach_xs_arr_bool
+#define xs_arr_forEach_nbool xs_arr_forEach_xs_arr_nbool
 #define xs_arr_forEach_ref xs_arr_forEach_xs_arr_ref
 #define xs_arr_filter_num xs_arr_filter_xs_arr_num
 #define xs_arr_filter_int xs_arr_filter_xs_arr_int
 #define xs_arr_filter_bool xs_arr_filter_xs_arr_bool
+#define xs_arr_filter_nbool xs_arr_filter_xs_arr_nbool
 #define xs_arr_filter_ref xs_arr_filter_xs_arr_ref
 #define xs_arr_findIndex_num xs_arr_findIndex_xs_arr_num
 #define xs_arr_findIndex_int xs_arr_findIndex_xs_arr_int
 #define xs_arr_findIndex_bool xs_arr_findIndex_xs_arr_bool
+#define xs_arr_findIndex_nbool xs_arr_findIndex_xs_arr_nbool
 #define xs_arr_findIndex_ref xs_arr_findIndex_xs_arr_ref
 #define xs_arr_find_ref xs_arr_find_xs_arr_ref
 #define xs_arr_some_num xs_arr_some_xs_arr_num
 #define xs_arr_some_int xs_arr_some_xs_arr_int
 #define xs_arr_some_bool xs_arr_some_xs_arr_bool
+#define xs_arr_some_nbool xs_arr_some_xs_arr_nbool
 #define xs_arr_some_ref xs_arr_some_xs_arr_ref
 #define xs_arr_every_num xs_arr_every_xs_arr_num
 #define xs_arr_every_int xs_arr_every_xs_arr_int
 #define xs_arr_every_bool xs_arr_every_xs_arr_bool
+#define xs_arr_every_nbool xs_arr_every_xs_arr_nbool
 #define xs_arr_every_ref xs_arr_every_xs_arr_ref
 #define xs_arr_sort_num xs_arr_sort_xs_arr_num
 #define xs_arr_sort_int xs_arr_sort_xs_arr_int
 #define xs_arr_sort_bool xs_arr_sort_xs_arr_bool
+#define xs_arr_sort_nbool xs_arr_sort_xs_arr_nbool
 #define xs_arr_sort_ref xs_arr_sort_xs_arr_ref
 #define xs_arr_reverse_num xs_arr_reverse_xs_arr_num
 #define xs_arr_reverse_int xs_arr_reverse_xs_arr_int
 #define xs_arr_reverse_bool xs_arr_reverse_xs_arr_bool
+#define xs_arr_reverse_nbool xs_arr_reverse_xs_arr_nbool
 #define xs_arr_reverse_ref xs_arr_reverse_xs_arr_ref
 #define xs_arr_slice_num xs_arr_slice_xs_arr_num
 #define xs_arr_slice_int xs_arr_slice_xs_arr_int
 #define xs_arr_slice_bool xs_arr_slice_xs_arr_bool
+#define xs_arr_slice_nbool xs_arr_slice_xs_arr_nbool
 #define xs_arr_slice_ref xs_arr_slice_xs_arr_ref
 
 /* map: from any kind to any kind */
@@ -3711,16 +3867,19 @@ static xs_arr_ref *xs_arr_slice_xs_arr_ref(xs_arr_ref *a, int64_t start, int64_t
     XS_ARR_MAP(from, FT, xs_arr_num, double, xs_arr_num_new(0, 0), xs_arr_num_push, fsfx, num)             \
     XS_ARR_MAP(from, FT, xs_arr_int, int64_t, xs_arr_int_new(0, 0), xs_arr_int_push, fsfx, int)            \
     XS_ARR_MAP(from, FT, xs_arr_bool, bool, xs_arr_bool_new(0, false), xs_arr_bool_push, fsfx, bool)       \
+    XS_ARR_MAP(from, FT, xs_arr_nbool, int8_t, xs_arr_nbool_new(0, 0), xs_arr_nbool_push, fsfx, nbool)     \
     XS_ARR_MAP(from, FT, xs_arr_ref, void *, xs_arr_ref_new(a->len, pr), xs_arr_ref_push, fsfx, ref)
 XS_MAP_ALL_TO(xs_arr_num, double, num)
 XS_MAP_ALL_TO(xs_arr_int, int64_t, int)
 XS_MAP_ALL_TO(xs_arr_bool, bool, bool)
+XS_MAP_ALL_TO(xs_arr_nbool, int8_t, nbool)
 XS_MAP_ALL_TO(xs_arr_ref, void *, ref)
 /* (`bool` is a macro of <stdbool.h>: the names pasted with it came out as _Bool; the emitter writes bool) */
 #define xs_arr_map_bool_num xs_arr_map__Bool_num
 #define xs_arr_map_bool_int xs_arr_map__Bool_int
 #define xs_arr_map_bool_bool xs_arr_map__Bool_bool
 #define xs_arr_map_bool_ref xs_arr_map__Bool_ref
+#define xs_arr_map_bool_nbool xs_arr_map__Bool_nbool
 
 /* indexOf / join by value */
 static int64_t xs_arr_index_of_num(xs_arr_num *a, double v) {
@@ -3733,6 +3892,7 @@ static int64_t xs_arr_index_of_num(xs_arr_num *a, double v) {
 }
 static int64_t xs_arr_index_of_int(xs_arr_int *a, int64_t v) { for (size_t i = 0; i < a->len; i++) if (a->data[i] == v) return (int64_t)i; return -1; }
 static int64_t xs_arr_index_of_bool(xs_arr_bool *a, bool v) { for (size_t i = 0; i < a->len; i++) if (a->data[i] == v) return (int64_t)i; return -1; }
+static int64_t xs_arr_index_of_nbool(xs_arr_nbool *a, int8_t v) { for (size_t i = 0; i < a->len; i++) if (a->data[i] == v) return (int64_t)i; return -1; }
 /* strings by content; in a (string | null)[] null matches null */
 /* (unknown[]).includes(v) / indexOf(v): === as JavaScript's (strings and boxed numbers by value, objects by identity) */
 XS_NOINLINE int64_t xs_arr_index_of_ref(xs_arr_ref *a, void *v) {
@@ -3761,6 +3921,8 @@ static void xs_join_str(xs_sb *b, void *ctx, size_t i) { xs_str *s = ((xs_arr_re
 static xs_str *xs_arr_join_num(xs_arr_num *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_num, a); }
 static xs_str *xs_arr_join_int(xs_arr_int *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_int, a); }
 static xs_str *xs_arr_join_bool(xs_arr_bool *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_bool, a); }
+static void xs_join_nbool(xs_sb *b, void *ctx, size_t i) { int8_t v = ((xs_arr_nbool *)ctx)->data[i]; if (v != XS_NULL_BOOL) xs_sb_bool(b, v != 0); } /* (null: "", as JavaScript's join) */
+static xs_str *xs_arr_join_nbool(xs_arr_nbool *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_nbool, a); }
 static xs_str *xs_arr_join_str(xs_arr_ref *a, xs_str *sep) { return xs_arr_join_generic(a->len, sep, xs_join_str, a); }
 /* an unknown[] / any[] (or another array of references): each value as String(x), null as "" (JavaScript's join) */
 static void xs_join_ref(xs_sb *b, void *ctx, size_t i) {
@@ -4391,7 +4553,7 @@ static inline bool xs_json_digit(xs_jp *j) { return j->p < j->end && *j->p >= '0
 XS_NOINLINE xs_jv *xs_json_value(xs_jp *j) {
     xs_json_ws(j);
     if (j->p >= j->end) xs_json_fail(j, XJE_TOKEN);
-    if (++j->depth > 200) xs_json_fail(j, XJE_DEEP);
+    if (++j->depth > 10000) xs_json_fail(j, XJE_DEEP); /* (recursive: JSON nested deeper than 10000 levels is refused; V8 takes any depth) */
     char c = *j->p;
     xs_jv *v;
     if (c == '{') {
@@ -4523,7 +4685,7 @@ XS_NOINLINE xs_jv *xs_json_obj(xs_jv *v, const char *where) { if (v->kind != XJ_
 XS_NOINLINE bool xs_is_array(void *v) {
     if (!v) return false;
     void (*f)(void *) = xs_type_of(v)->free;
-    return f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free;
+    return f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free || f == xs_arr_nbool_free;
 }
 /* a < b on strings: by their characters (UTF-8 bytes order as code points do) */
 /* a.localeCompare(b): the order of ICU's root collation for Latin text, as Node gives it by default: first the
@@ -4637,6 +4799,7 @@ static void xs_sb_num(xs_sb *b, double v) {
 }
 static void xs_sb_int(xs_sb *b, int64_t v) { char buf[24]; size_t n = xs_itoa(v, buf); xs_sb_put(b, buf, n); }
 static void xs_sb_bool(xs_sb *b, bool v) { xs_sb_puts(b, v ? "true" : "false"); }
+static void xs_sb_bool_or_null_(xs_sb *b, int8_t v) { xs_sb_puts(b, v == XS_NULL_BOOL ? "null" : v ? "true" : "false"); } /* ((boolean | null)[]) */
 static void xs_sb_str(xs_sb *b, xs_str *s) {
     xs_sb_put(b, "\"", 1);
     for (int64_t i = 0; i < s->len; i++) {
@@ -5088,6 +5251,9 @@ static void xs_print_int_or_null_(int64_t v) { if (v == XS_NULL_INT) fputs("null
     }
 XS_PRINT_ARRAY_N(xs_print_arr_num_n, xs_arr_num, xs_print_num_or_null_)
 XS_PRINT_ARRAY_N(xs_print_arr_int_n, xs_arr_int, xs_print_int_or_null_)
+static void xs_print_bool_or_null_(int8_t v) { if (v == XS_NULL_BOOL) fputs("null", XS_OUT); else xs_print_bool(v != 0); }
+XS_PRINT_ARRAY(xs_arr_nbool, xs_print_bool_or_null_, false)
+#define xs_print_arr_nbool xs_print_xs_arr_nbool
 
 /* ---- internal indicators ----
    Built with --profile, every function counts calls and time; the table goes to stderr at exit.
@@ -5977,6 +6143,17 @@ static xs_arr_ref *xs_process_argv(void) { return xs_argv; }
 static xs_map *xs_process_env(void) { return xs_env; }
 static int64_t xs_process_pid(void) { return (int64_t)getpid(); } /* process.pid */
 /* a key of a Map<number, V> / an element of a Set<number>: held as an int, so it must be a whole number */
+/* a number written through an interface field (number) into the int field of a class used as that interface (XB-233) */
+XS_NOINLINE int64_t xs_ifld_int(double d, const char *cls, const char *field) {
+    if (d != d || d != trunc(d) || fabs(d) > 9007199254740991.0) {
+        char b[40];
+        snprintf(b, sizeof b, "%.17g", d);
+        char m[256];
+        snprintf(m, sizeof m, "%s.%s is an int (xisto): a number written to it must be whole, got %s", cls, field, b);
+        xs_panic(m);
+    }
+    return (int64_t)d;
+}
 XS_NOINLINE int64_t xs_num_key(double d) {
     if (d != d || d != trunc(d) || fabs(d) > 9007199254740991.0) {
         char b[40];
@@ -6430,11 +6607,24 @@ static inline void xs_u8x16_store(uint8_t *p, xs_u8x16 v) { memcpy(p, &v, 16); }
 #if defined(__SSSE3__)
 #include <tmmintrin.h>
 static inline xs_u8x16 xs_u8x16_shuffle(xs_u8x16 v, xs_u8x16 m) { return (xs_u8x16)_mm_shuffle_epi8((__m128i)v, (__m128i)m); }
+#define XS_U8X16_TBL 1
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
 static inline xs_u8x16 xs_u8x16_shuffle(xs_u8x16 v, xs_u8x16 m) { return (xs_u8x16)vqtbl1q_u8((uint8x16_t)v, (uint8x16_t)m); }
+#define XS_U8X16_TBL 1
 #else
-static inline xs_u8x16 xs_u8x16_shuffle(xs_u8x16 v, xs_u8x16 m) { xs_u8x16 r; for (int i = 0; i < 16; i++) r[i] = (m[i] & 0x80) ? 0 : v[m[i] & 15]; return r; }
+/* (no byte shuffle, as on x86 below the x86-64 floor: the lanes go through memory, every byte store before the
+   one 16-byte load. Writing each lane into the vector put a 16-byte load after every byte store, which the store
+   cannot forward to: 16 stalls of ~12 cycles in a chain per shuffle, fannkuch-redux 3.3x slower, XB-211) */
+static inline xs_u8x16 xs_u8x16_shuffle(xs_u8x16 v, xs_u8x16 m) {
+    uint8_t a[16], k[16], r[16];
+    memcpy(a, &v, 16);
+    memcpy(k, &m, 16);
+    for (int i = 0; i < 16; i++) r[i] = (k[i] & 0x80) ? 0 : a[k[i] & 15];
+    xs_u8x16 o;
+    memcpy(&o, r, 16);
+    return o;
+}
 #endif
 /* A local Uint8Array(N <= 16) that a loop only indexes (emit.c u8reg) lives in one of these for the loop's
    duration, loaded before and stored after: reads, writes, the reversal and the copy idioms never touch
@@ -6467,7 +6657,13 @@ static inline void xs_v16_store(uint8_t *d, xs_u8x16 v, int64_t n) { if (n >= 16
 /* an int[] of n <= 16 elements, each a byte (proved), in a register and back */
 static inline xs_u8x16 xs_v16_load_i64(const int64_t *d, int64_t n) { xs_u8x16 v = xs_u8x16_splat(0); for (int64_t i = 0; i < n; i++) v[i] = (uint8_t)d[i]; return v; }
 static inline void xs_v16_store_i64(int64_t *d, xs_u8x16 v, int64_t n) { for (int64_t i = 0; i < n; i++) d[i] = (int64_t)v[i]; }
+/* lane i (< 16): a shuffle where it is one instruction, else a load from the vector stored (a 1-byte load is
+   forwarded from the 16-byte store) */
+#if defined(XS_U8X16_TBL)
 static inline int64_t xs_v16_get_nc(xs_u8x16 v, int64_t i) { return (int64_t)xs_u8x16_shuffle(v, xs_u8x16_splat((uint8_t)i))[0]; }
+#else
+static inline int64_t xs_v16_get_nc(xs_u8x16 v, int64_t i) { uint8_t a[16]; memcpy(a, &v, 16); return a[i & 15]; }
+#endif
 static inline int64_t xs_v16_get(xs_u8x16 v, int64_t i, int64_t n, const xs_site *s) {
     if ((uint64_t)i >= (uint64_t)XS_V16_LEN(n)) XS_FAIL(XS_V16_OOB(n), s);
     return xs_v16_get_nc(v, i);
@@ -8438,7 +8634,7 @@ XS_NOINLINE int64_t xs_util_kind(void *v) {
     if (f == xs_str_free) return 1;
     if (f == xs_box_num_free || f == xs_box_int_free) return 2;
     if (f == xs_box_bool_free) return 3;
-    if (f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free) return 4;
+    if (f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free || f == xs_arr_nbool_free) return 4;
     if (f == xs_map_free) { xs_map *m = v; return m->record ? 20 : m->is_map ? 5 : 6; }
     if (f == xs_Date_free) return 7;
     if (f == xs_Error_free) return 9;
@@ -8558,10 +8754,11 @@ static xs_uv xs_uv_arr_at(void *a, size_t i) {
     if (f == xs_arr_ref_free) return xs_uv_ref(((xs_arr_ref *)a)->data[i]);
     if (f == xs_arr_num_free) { double d = ((xs_arr_num *)a)->data[i]; if (xs_isnull_num(d)) return u; u.k = 1; u.d = d; return u; }
     if (f == xs_arr_int_free) { int64_t x = ((xs_arr_int *)a)->data[i]; if (x == XS_NULL_INT) return u; u.k = 1; u.d = (double)x; return u; }
+    if (f == xs_arr_nbool_free) { int8_t x = ((xs_arr_nbool *)a)->data[i]; if (x == XS_NULL_BOOL) return u; u.k = 2; u.d = x; return u; }
     u.k = 2; u.d = ((xs_arr_bool *)a)->data[i];
     return u;
 }
-static bool xs_is_arr(void (*f)(void *)) { return f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free; }
+static bool xs_is_arr(void (*f)(void *)) { return f == xs_arr_ref_free || f == xs_arr_num_free || f == xs_arr_int_free || f == xs_arr_bool_free || f == xs_arr_nbool_free; }
 /* the own enumerable keys of a plain object (an interface's object: its fields, an optional one left out not
    counted; a Record: its entries) and the value under a key; false when the object has no such key */
 static int64_t xs_plain_count(void *o) {
@@ -11281,7 +11478,6 @@ static xs_pool_job *xs_pool_cur;
 static uint64_t xs_pool_gen;
 static int xs_pool_nthreads = -1; /* workers besides main (-1: pool not made yet) */
 static int xs_pool_busy;          /* workers still on the current job */
-static XS_TLS bool xs_pool_inside; /* this thread is running a job: a nested parallel call runs as the loop */
 
 static void xs_pool_chunks(xs_pool_job *j) {
     bool was = xs_pool_inside;

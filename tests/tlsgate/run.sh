@@ -14,6 +14,9 @@ check http_template ""          "xisto: tls not linked"
 check https_literal "--tls=bearssl" "xisto: tls BearSSL"
 check dynamic       "--tls=bearssl" "xisto: tls BearSSL"
 check listen_cert   "--tls=bearssl" "xisto: tls BearSSL"
+check dead_impl     "--tls=bearssl" "xisto: tls not linked"   # (XB-232: a fetch in code that cannot run)
+check live_impl     "--tls=bearssl" "xisto: tls BearSSL"
+check sub_impl      "--tls=bearssl" "xisto: tls BearSSL"
 if [ -f build/awslc/lib/libssl.a ] || [ -n "${XISTO_AWSLC:-}" ]; then
     check https_literal "" "xisto: tls AWS-LC"
     check dynamic       "" "xisto: tls AWS-LC"
@@ -22,7 +25,7 @@ check dynamic       "--tls=off" "xisto: tls not linked"
 check https_literal "--tls=off" "error: https URL, but the program is built with --tls=off"
 check listen_cert   "--tls=off" "error: HTTPS server, but the program is built with --tls=off"
 $X build --tls=off -o $O/dyn $D/dynamic.ts && msg=$($O/dyn https://127.0.0.1:1 2>&1)
-case "$msg" in *"https is not available: the program was built with --tls=off"*) echo "ok   runtime https under --tls=off";; *) echo "FAIL runtime: $msg"; fail=1;; esac
+case "$msg" in *"https is not available: TLS is not linked into this program"*) echo "ok   runtime https under --tls=off";; *) echo "FAIL runtime: $msg"; fail=1;; esac
 rm -rf $O
 [ $fail = 0 ] && echo "tlsgate: all ok"
 exit $fail

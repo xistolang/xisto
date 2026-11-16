@@ -318,7 +318,7 @@ task on the program's event loop, next to its timers and other sockets, and `clo
 normally once its connections are closed.
 
 The client side, `http.request(url | options, cb)` and `http.get(...)`, gives a `ClientRequest` (`setHeader`,
-`write`, `end`, `setTimeout`, `destroy`, `'response'`, `'error'`, `'close'`) and an `IncomingMessage` response
+`write`, `end`, `setTimeout`, `'socket'`, `destroy`, `'response'`, `'error'`, `'close'`) and an `IncomingMessage` response
 (`statusCode`, `statusMessage`, `headers`, `'data'`/`'end'`). The response's body comes as it arrives (a
 server-sent events stream can be read), as Buffers. `STATUS_CODES` and `METHODS` are there too.
 
@@ -330,7 +330,10 @@ Differences from Node:
   handler does not read is kept in memory.
 - `headersTimeout`, `requestTimeout` and `server.setTimeout` are accepted but not enforced; idle keep-alive
   connections are closed after `keepAliveTimeout`. HTTP/1.1 only (no HTTP/2, no `upgrade`/`CONNECT` events).
-- `req.socket` is a small socket object (addresses, `destroy()`, `'close'`), not a `net.Socket`.
+- `req.socket` is a small socket object (addresses, `destroy()`, `'close'`), not a `net.Socket`. A client
+  request's `'socket'` event (and its `req.socket`) gives a `net.Socket` whose `unref()`/`ref()` work: an unref'd
+  request in flight does not keep the program alive, as an APM agent's send in Node. Its other methods and fields
+  do not act on the request's connection.
 - `new http.Server()` and `import { Server } from "node:http"` name node:http's server where they are imported;
   elsewhere `Server` is xisto's built-in server.
 
@@ -340,10 +343,11 @@ Differences from Node:
 and sockets:
 
 - **Socket:** `'connect'`, `'data'` (Buffers, or strings after `setEncoding`), `'end'`, `'close'` (with `hadError`)
-  and `'error'` (with Node's `code`: `ECONNREFUSED`, `ENOTFOUND`...). Methods `write(data, cb)`, `end(data)` and
-  `destroy()`. Fields `remoteAddress`/`remotePort`/`localAddress`/`localPort`, `bytesRead`/`bytesWritten`.
+  and `'error'` (with Node's `code`: `ECONNREFUSED`, `ENOTFOUND`...). Methods `write(data, cb)`, `end(data)`,
+  `destroy()`, and `unref()`/`ref()`: an unref'd socket does not keep the program alive while it waits for data
+  (it still does while it connects or writes, as in Node). Fields `remoteAddress`/`remotePort`/`localAddress`/`localPort`, `bytesRead`/`bytesWritten`.
 - **Server:** `listen(port, host, cb)` (port 0 picks a free one), `address()`, `close(cb)` (waits for the open
-  connections), `getConnections`.
+  connections), `getConnections`, `unref()`/`ref()`.
 - `isIP`, `isIPv4`, `isIPv6`.
 
 Each socket reads on a task of its own, so `'data'` arrives as the bytes do.

@@ -29,6 +29,12 @@ function fib(n: int): int {
 
 const out = process.argv.length > 2 ? process.argv[2] : "cpu.pprof";
 const ms = process.argv.length > 3 ? Number(process.argv[3]) : 2000;
+// the process's CPU time in ms: the profiler samples CPU time, so the work split is measured in CPU time too (in wall
+// time, a machine busy with other work gives each phase a different share of a core, and the two splits differ)
+function cpuMs(): number {
+  const u = process.cpuUsage();
+  return (u.user + u.system) / 1000;
+}
 const cpu0 = process.cpuUsage();
 console.log("started:", start(99));
 console.log("second start:", start(99)); // (one profiler per process)
@@ -38,14 +44,18 @@ let acc = 0;
 let heavyMs = 0;
 let lightMs = 0;
 // phases of 300 ms and 100 ms of each function alone, not calls in turn: a sample every 10 ms of CPU must not beat
-// with the period of the loop
+// with the period of the loop. The phases end by the clock (cheap to read), and what each got is its CPU time, read
+// at its ends only (on macOS a SIGPROF lands when the kernel returns, so a CPU-time read in the loop would take the
+// samples)
 for (let round = 0; round < Math.max(1, Math.trunc(ms / 400)); round++) {
   let a = performance.now();
+  let c = cpuMs();
   while (performance.now() - a < 300) acc += heavy(30000) % 7;
-  heavyMs += performance.now() - a;
+  heavyMs += cpuMs() - c;
   a = performance.now();
+  c = cpuMs();
   while (performance.now() - a < 100) acc += light(30000) % 7;
-  lightMs += performance.now() - a;
+  lightMs += cpuMs() - c;
 }
 const t1 = Date.now();
 while (Date.now() - t1 < ms / 4) {
@@ -55,7 +65,7 @@ while (Date.now() - t1 < ms / 4) {
 stop();
 const cpu1 = process.cpuUsage();
 const prof = collect();
-// (what the profile must match: the time each function took, and the CPU time of the process meanwhile)
+// (what the profile must match: the CPU time each function took, and the CPU time of the process meanwhile)
 console.error(`measured ${(heavyMs / lightMs).toFixed(3)} ${Math.round((cpu1.user + cpu1.system - cpu0.user - cpu0.system) / 1000)}`);
 console.log("samples > 0:", lastSamples() > 0, "bytes > 0:", prof.length > 0, acc >= 0);
 writeFileSync(out, prof);

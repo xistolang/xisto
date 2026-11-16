@@ -1,5 +1,12 @@
-/* Xisto network runtime: HTTP/1.1 client (fetch) and server (Server). Embedded only when the program uses them.
-   Single thread, kqueue, non-blocking sockets, keep-alive, no TLS. */
+/* Xisto network runtime: the event loop and what runs on it. Embedded only when the program can reach it (an
+   await, a timer, fetch, a server, a stream...: the checker decides, XB-250).
+   - The loop: kqueue (macOS), a kqueue look-alike over epoll (Linux) or WSAPoll (Windows); non-blocking sockets;
+     each request handler, timer and async function a coroutine on a small stack of its own.
+   - HTTP/1.1 client (fetch) and server (Server, node:http) with keep-alive and graceful shutdown; HTTPS through
+     runtime/xisto_tls.h (BearSSL) or runtime/xisto_tls_awslc.h (AWS-LC), appended when the program can use TLS.
+   - node:net, node:tls client sockets, node:child_process, fs streams, setTimeout/setImmediate/process.nextTick
+     in Node's order, generators, Promise.all/race.
+   - Threads (XS_THREADS): server workers (XISTO_WORKERS, one loop per thread) and worker_threads. */
 #if defined(_WIN32)
 /* ======== Windows: the POSIX layer the rest of this file needs ======== */
 /* Windows (xisto build --target=windows-x64): the POSIX calls the network runtime makes, over Winsock and
@@ -496,6 +503,9 @@ struct xs_coro {
     uint64_t req_t0;
     void (*entry)(void *); void *arg;
     bool holds_lock;
+    bool unref;               /* socket.unref(): it does not keep the program alive (not counted in xs_tasks_live) */
+    bool wwait;               /* parked until its socket is writable: counted even when unref'd */
+    bool kill;                /* the program is ending with it parked, unref'd: it unwinds when resumed */
     void (*on_done)(struct xs_coro *); /* not a request: what to do when it finishes (Promise.all tasks) */
     /* a shared-stack coroutine (Promise.all tasks) runs on the thread's one task stack; parked, the part it
        uses lives here and is copied back to the same addresses before it runs again */
@@ -792,10 +802,13 @@ static void xs_tmr_fire(void (*after)(xs_coro *)) {
     }
 }
 
+static XS_TLS int64_t xs_tasks_live; /* Promise.all/race tasks not finished yet */
+static XS_TLS int64_t xs_tasks_unref; /* tasks of unref'd sockets, parked: not counted above, still served by the loop */
 static XS_TLS int64_t xs_fd_waits; /* coroutines parked on a socket (what, besides a timer, can wake a parked task) */
 /* Waits until fd is readable/writable or the timeout (ms, -1 = none) passes. Yields inside a coroutine,
    polls from plain code. Returns false on timeout. */
-static bool xs_wait_fd_ms(int fd, int16_t filter, int64_t timeout_ms) {
+XS_NOINLINE int xs_wait_fd_loop(int fd, int16_t filter, int64_t timeout_ms);
+XS_NOINLINE bool xs_wait_fd_ms(int fd, int16_t filter, int64_t timeout_ms) {
     if (xs_cur_coro && xs_kq >= 0) {
         xs_coro *co = xs_cur_coro;
         struct kevent ev;
@@ -805,9 +818,20 @@ static bool xs_wait_fd_ms(int fd, int16_t filter, int64_t timeout_ms) {
         EV_SET(&ev, fd, filter, EV_ADD | EV_ONESHOT, 0, 0, &co->fdw);
         kevent(xs_kq, &ev, 1, NULL, 0, NULL);
         if (timeout_ms >= 0) xs_timer_arm(&co->tmw, timeout_ms);
+        /* an unref'd socket's task still keeps the program alive while it connects or writes (libuv's requests do;
+           only its handle, the wait for data, is unref'd) */
+        co->wwait = filter == EVFILT_WRITE;
+        if (co->wwait && co->unref) xs_tasks_live++;
         xs_fd_waits++;
         xs_coro_yield();
         xs_fd_waits--;
+        if (co->kill) { /* (xs_unref_kill) the program ends: let go of what its frames hold and finish it there */
+            xs_cln_unwind(0);
+            xs_ar_drain(0);
+            xs_coro_finish();
+        }
+        if (co->wwait && co->unref) xs_tasks_live--;
+        co->wwait = false;
         bool ready = co->fdw.fired;
         if (co->fdw.armed) { /* the timer won: stop watching the socket */
             co->fdw.armed = false;
@@ -817,14 +841,15 @@ static bool xs_wait_fd_ms(int fd, int16_t filter, int64_t timeout_ms) {
         if (timeout_ms >= 0) xs_timer_disarm(&co->tmw);
         return ready;
     }
+    int lw = xs_wait_fd_loop(fd, filter, timeout_ms);
+    if (lw >= 0) return lw != 0;
     struct pollfd p = {fd, filter == EVFILT_READ ? POLLIN : POLLOUT, 0};
     int r;
     while ((r = poll(&p, 1, timeout_ms < 0 ? -1 : (int)timeout_ms)) < 0 && errno == EINTR) {}
     return r > 0;
 }
-static void xs_wait_fd(int fd, int16_t filter) { xs_wait_fd_ms(fd, filter, -1); }
+XS_NOINLINE void xs_wait_fd(int fd, int16_t filter) { xs_wait_fd_ms(fd, filter, -1); }
 
-static XS_TLS int64_t xs_tasks_live; /* Promise.all/race tasks not finished yet */
 static void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_ms);
 static XS_TLS xs_coro *xs_tick_head, *xs_tick_tail, *xs_imm_head, *xs_imm_tail; /* process.nextTick, setImmediate (below) */
 /* Node runs a .ts program as an ES module, whose body is itself a microtask: the microtasks the body queues run
@@ -842,7 +867,7 @@ XS_NOINLINE void xs_sleep_ms(int64_t ms) {
         xs_timer_disarm(&co->tmw);
         return;
     }
-    if (xs_tasks_live > 0) { xs_loop_run(NULL, NULL, (int64_t)xs_date_now() + ms); return; } /* background tasks go on meanwhile */
+    if (xs_tasks_live > 0 || xs_tasks_unref > 0) { xs_loop_run(NULL, NULL, (int64_t)xs_date_now() + ms); return; } /* background tasks go on meanwhile */
     struct timespec ts = {ms / 1000, (ms % 1000) * 1000000};
     while (nanosleep(&ts, &ts) < 0 && errno == EINTR) {}
 }
@@ -971,6 +996,21 @@ static bool xs_imm_phase(void) {
     xs_ready_tail = last;
     return true;
 }
+/* What console.log left in stdio's buffer goes out before the loop waits. Writing to a pipe or a file, stdio holds a
+   full buffer: a server or a timer program that logs a few lines and then waits for the next event kept them there
+   (docker logs showed nothing until the buffer filled or the program ended), where Node writes each line at once. A
+   loop that is busy keeps batching; one that is about to wait writes what it holds (XB-186). */
+#if defined(_WIN32)
+#define XS_STDOUT_PENDING() true
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+#define XS_STDOUT_PENDING() (stdout->_p > stdout->_bf._base)
+#else
+#include <stdio_ext.h>
+#define XS_STDOUT_PENDING() (__fpending(stdout) > 0)
+#endif
+static inline void xs_stdout_before_wait(void) {
+    if (XS_STDOUT_PENDING()) fflush(stdout);
+}
 XS_NOINLINE void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_ms) {
     if (xs_kq < 0) xs_kq = kqueue();
     struct kevent evs[64];
@@ -994,6 +1034,7 @@ XS_NOINLINE void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_m
         }
         bool has_w = wait >= 0;
         if (xs_tmr_timeout(&tt) && (!has_w || tt.tv_sec < ts.tv_sec || (tt.tv_sec == ts.tv_sec && tt.tv_nsec < ts.tv_nsec))) { ts = tt; has_w = true; }
+        if (!xs_ready_head) xs_stdout_before_wait();
         int n = kevent(xs_kq, NULL, 0, evs, 64, xs_ready_head ? &(struct timespec){0, 0} : has_w ? &ts : NULL);
         xs_batch++;
         if (n < 0) { if (errno == EINTR) continue; xs_panic("kevent failed"); }
@@ -1005,10 +1046,31 @@ XS_NOINLINE void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_m
             w->armed = false;
             w->fired = true;
             xs_coro *co = w->co;
+            if (!co) continue; /* plain code waiting on its socket (xs_wait_fd_loop): it sees fired */
             xs_coro_resume(co);
             if (co->done && co->on_done) co->on_done(co);
         }
     }
+}
+/* A socket wait from plain code (an async main() called at the top, its fetch) while timers, immediates or tasks are
+   pending: the loop runs meanwhile, as Node's does, so a setTimeout that aborts the fetch fires (XB-225). Returns
+   1 ready, 0 timed out, -1 when nothing else could run (the caller just polls). */
+static bool xs_fdwait_stop(void *w) { return ((xs_waiter *)w)->fired; }
+XS_NOINLINE int xs_wait_fd_loop(int fd, int16_t filter, int64_t timeout_ms) {
+    if (xs_cur_coro || timeout_ms == 0 || !(xs_ntmr || xs_tasks_live > 0 || xs_tasks_unref > 0 || xs_ready_head || xs_imm_head || xs_tick_head)) return -1;
+    if (xs_kq < 0) xs_kq = kqueue();
+    xs_waiter w = {.kind = 2, .co = NULL, .armed = true, .fired = false, .tfd = -1, .armed_batch = xs_batch};
+    struct kevent ev;
+    EV_SET(&ev, fd, filter, EV_ADD | EV_ONESHOT, 0, 0, &w);
+    kevent(xs_kq, &ev, 1, NULL, 0, NULL);
+    xs_fd_waits++;
+    xs_loop_run(xs_fdwait_stop, &w, timeout_ms < 0 ? -1 : (int64_t)xs_date_now() + timeout_ms);
+    xs_fd_waits--;
+    if (w.armed) { /* the deadline came first: stop watching the socket */
+        EV_SET(&ev, fd, filter, EV_DELETE, 0, 0, NULL);
+        kevent(xs_kq, &ev, 1, NULL, 0, NULL);
+    }
+    return w.fired ? 1 : 0;
 }
 static bool xs_par_stop(void *g) { return xs_par_settled(g); }
 /* runs the group's tasks; returns when it settles (all done, or the first for race) */
@@ -1055,11 +1117,13 @@ static inline xs_val xs_par_take(xs_tgroup *g, int i) { g->t[i].taken = true; re
    which runs the loop until it is closed, and the timers that were unref'd, let go at the end */
 static XS_TLS void (*xs_http_pending)(void); /* (per thread: a worker's drain must not run the main thread's server) */
 static XS_TLS void (*xs_unref_drop)(void);
+static XS_TLS void (*xs_unref_kill)(void); /* (the tasks of unref'd sockets, parked: below) */
 XS_NOINLINE void xs_tasks_drain(void) {
     if (xs_http_pending && !xs_cur_coro) { void (*h)(void) = xs_http_pending; xs_http_pending = NULL; h(); }
     if (xs_tasks_live > 0 && !xs_cur_coro) xs_loop_run(NULL, NULL, -1);
     xs_unh_check();
     if (xs_unref_drop) xs_unref_drop();
+    if (xs_unref_kill && !xs_cur_coro) xs_unref_kill();
 }
 
 /* ---- Promise values (XB-106) ----
@@ -1238,7 +1302,9 @@ XS_NOINLINE void xs_spawn_entry(void *x) {
 }
 static void xs_spawn_done(xs_coro *co) {
     xs_spawn *s = co->arg;
-    xs_tasks_live--;
+    if (co->unref) { co->unref = false; xs_tasks_unref--; } else xs_tasks_live--;
+    co->kill = false;
+    if (s->args) { s->afree(s->args); s->args = NULL; } /* (a task unwound at the end: its arguments are still held) */
     xs_coro_recycle(co);
     xs_release_(s->p);
     free(s);
@@ -1660,8 +1726,8 @@ XS_NOINLINE void xs_tls_add_ca_file(const char *path);
 static void xs_tls_free(xs_tls *t);
 static const char *xs_tls_err(xs_tls *t);
 static const char *xs_tls_err(xs_tls *t);
-static bool xs_tls_write_all(xs_tls *t, int fd, const char *p, size_t n, int64_t timeout_ms, uint64_t deadline);
-static ssize_t xs_tls_read_some(xs_tls *t, int fd, char *out, size_t cap, int64_t timeout_ms, uint64_t deadline);
+XS_NOINLINE bool xs_tls_write_all(xs_tls *t, int fd, const char *p, size_t n, int64_t timeout_ms, uint64_t deadline);
+XS_NOINLINE ssize_t xs_tls_read_some(xs_tls *t, int fd, char *out, size_t cap, int64_t timeout_ms, uint64_t deadline);
 static ssize_t xs_tls_srv_read(xs_tls *t, int fd, char *out, size_t cap);
 static ssize_t xs_tls_srv_write(xs_tls *t, int fd, const char *p, size_t n);
 static bool xs_tls_srv_pending(xs_tls *t);
@@ -1740,8 +1806,8 @@ static xs_HttpResponse *xs_HttpResponse_make(int64_t status, xs_str *body, const
     r->content_type = ctype;
     return r;
 }
-static xs_HttpResponse *xs_HttpResponse_text(xs_str *body) { return xs_HttpResponse_make(200, body, "text/plain; charset=utf-8"); }
-static xs_HttpResponse *xs_HttpResponse_json(xs_str *body) { return xs_HttpResponse_make(200, body, "application/json"); }
+static xs_HttpResponse *xs_HttpResponse_text(xs_str *body, int64_t code) { return xs_HttpResponse_make(code, body, "text/plain; charset=utf-8"); }
+static xs_HttpResponse *xs_HttpResponse_json(xs_str *body, int64_t code) { return xs_HttpResponse_make(code, body, "application/json"); }
 static xs_HttpResponse *xs_HttpResponse_status(int64_t code, xs_str *body) { return xs_HttpResponse_make(code, body, "text/plain; charset=utf-8"); }
 static bool xs_has_ctl(const char *p, size_t n);
 /* HttpResponse.of(status, contentType, body) */
@@ -1831,7 +1897,8 @@ static bool xs_route_match(xs_str *pattern, const char *path, size_t plen, xs_Ht
         p++; q++;
     }
     if (req) req->nparams = n;
-    return p == pe && q == qe;
+    /* one slash after the path is the same route (/items/ is /items), as Express routes by default (strict: false) */
+    return p == pe && (q == qe || (q + 1 == qe && *q == '/' && pe > pattern->data && pe[-1] != '/'));
 }
 
 static xs_str *xs_HttpRequest_param(xs_HttpRequest *r, xs_str *name) {
@@ -2250,7 +2317,7 @@ static void xs_conn_drop(xs_conn *c) { close(c->fd); XS_TLS_FREE(c->tls); free(c
    (its window full) is waited for in slices and given up on at the deadline or the abort: false, as on an error.
    (A fetch whose body is larger than the socket's buffers, to a server that accepts and never reads, used to wait
    here forever, past its AbortSignal.timeout.) */
-static bool xs_write_until(int fd, const char *p, size_t n, uint64_t deadline, xs_Uint8Array *abort) {
+XS_NOINLINE bool xs_write_until(int fd, const char *p, size_t n, uint64_t deadline, xs_Uint8Array *abort) {
     while (n > 0) {
         ssize_t w = write(fd, p, n);
         if (w < 0) {
@@ -2274,7 +2341,7 @@ static bool xs_write_until(int fd, const char *p, size_t n, uint64_t deadline, x
     }
     return true;
 }
-static bool xs_write_all(int fd, const char *p, size_t n) { return xs_write_until(fd, p, n, 0, NULL); }
+XS_NOINLINE bool xs_write_all(int fd, const char *p, size_t n) { return xs_write_until(fd, p, n, 0, NULL); }
 
 static xs_Response *xs_fetch_full(xs_str *url, xs_str *method, xs_str *body, int nh, xs_str **hdrs, int64_t timeout_ms, xs_Uint8Array *abort);
 XS_NOINLINE xs_Response *xs_fetch(xs_str *url) { return xs_fetch_full(url, NULL, NULL, 0, NULL, -1, NULL); }
@@ -2421,7 +2488,7 @@ XS_NOINLINE xs_Response *xs_fetch_once(xs_str *url, xs_str *method, xs_str *body
     bool https = strncmp(u, "https://", 8) == 0;
     if (!https && strncmp(u, "http://", 7) != 0) xs_panic("fetch: the URL must start with http:// or https://");
 #ifndef XS_WITH_TLS
-    if (https) xs_panic("fetch: https is not available: the program was built with --tls=off");
+    if (https) xs_panic("fetch: https is not available: TLS is not linked into this program (built with --tls=off, or the compiler saw no https fetch that can run here: please report it)");
 #endif
     u += https ? 8 : 7;
     const char *path = strchr(u, '/');
@@ -2630,7 +2697,7 @@ static void xs_clients_flush_dead(void) {
     }
     xs_clients_trim();
 }
-typedef struct { xs_Server *s; xs_client *c; xs_HttpRequest *req; xs_route *route; bool keep_alive; } xs_request_job;
+typedef struct { xs_Server *s; xs_client *c; xs_HttpRequest *req; xs_route *route; bool keep_alive; bool head; } xs_request_job;
 
 /* TLS backpressure: while the engine holds records it cannot write, it accepts no input either, so the
    peer's bytes would sit in the socket and a level-triggered read event would fire forever (a client that
@@ -2665,15 +2732,73 @@ static void xs_client_close(int kq, xs_client *c) {
     xs_client_free_later(c);
 }
 
+/* the reason phrase of a status line, as Node's http.STATUS_CODES ("unknown" for a code it does not name) */
 static const char *xs_status_text(int64_t s) {
     switch (s) {
+    case 100: return "Continue";
+    case 101: return "Switching Protocols";
+    case 102: return "Processing";
+    case 103: return "Early Hints";
     case 200: return "OK";
     case 201: return "Created";
+    case 202: return "Accepted";
+    case 203: return "Non-Authoritative Information";
     case 204: return "No Content";
+    case 205: return "Reset Content";
+    case 206: return "Partial Content";
+    case 207: return "Multi-Status";
+    case 208: return "Already Reported";
+    case 226: return "IM Used";
+    case 300: return "Multiple Choices";
+    case 301: return "Moved Permanently";
+    case 302: return "Found";
+    case 303: return "See Other";
+    case 304: return "Not Modified";
+    case 305: return "Use Proxy";
+    case 307: return "Temporary Redirect";
+    case 308: return "Permanent Redirect";
     case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 402: return "Payment Required";
+    case 403: return "Forbidden";
     case 404: return "Not Found";
+    case 405: return "Method Not Allowed";
+    case 406: return "Not Acceptable";
+    case 407: return "Proxy Authentication Required";
+    case 408: return "Request Timeout";
+    case 409: return "Conflict";
+    case 410: return "Gone";
+    case 411: return "Length Required";
+    case 412: return "Precondition Failed";
+    case 413: return "Payload Too Large";
+    case 414: return "URI Too Long";
+    case 415: return "Unsupported Media Type";
+    case 416: return "Range Not Satisfiable";
+    case 417: return "Expectation Failed";
+    case 418: return "I'm a Teapot";
+    case 421: return "Misdirected Request";
+    case 422: return "Unprocessable Entity";
+    case 423: return "Locked";
+    case 424: return "Failed Dependency";
+    case 425: return "Too Early";
+    case 426: return "Upgrade Required";
+    case 428: return "Precondition Required";
+    case 429: return "Too Many Requests";
+    case 431: return "Request Header Fields Too Large";
+    case 451: return "Unavailable For Legal Reasons";
     case 500: return "Internal Server Error";
-    default: return "Status";
+    case 501: return "Not Implemented";
+    case 502: return "Bad Gateway";
+    case 503: return "Service Unavailable";
+    case 504: return "Gateway Timeout";
+    case 505: return "HTTP Version Not Supported";
+    case 506: return "Variant Also Negotiates";
+    case 507: return "Insufficient Storage";
+    case 508: return "Loop Detected";
+    case 509: return "Bandwidth Limit Exceeded";
+    case 510: return "Not Extended";
+    case 511: return "Network Authentication Required";
+    default: return "unknown";
     }
 }
 
@@ -2689,6 +2814,7 @@ static void xs_server_respond(xs_client *c, int64_t status, const char *ctype, c
    worker: the second comes from the coarse clock, which the vDSO serves even where a precise clock read is a system call */
 static XS_TLS char xs_date_line[48];
 static XS_TLS bool xs_resp_has_date; /* the response being written brought its own Date */
+static XS_TLS bool xs_resp_no_body; /* the answer to a HEAD request: the head (Content-Length of the body) without the body */
 static XS_TLS int64_t xs_date_line_sec = -1;
 static const char *xs_http_date_line(void) {
 #if defined(CLOCK_REALTIME_COARSE)
@@ -2726,6 +2852,7 @@ static void xs_server_respond_x(xs_client *c, int64_t status, const char *ctype,
     if (ctl) { memcpy(h, "\r\nContent-Type: ", 16); h += 16; memcpy(h, ctype, ctl); h += ctl; } /* "" sends none */
     memcpy(h, "\r\nContent-Length: ", 18); h += 18;
     h += xs_itoa((int64_t)body_len, h);
+    if (xs_resp_no_body) body_len = 0;
     if (!xs_resp_has_date) { memcpy(h, xs_http_date_line(), 37); h += 37; }
     if (extra && extra->len) { memcpy(h, "\r\n", 2); h += 2; memcpy(h, extra->data, (size_t)extra->len - 2); h += extra->len - 2; }
     if (keep_alive) { memcpy(h, "\r\nConnection: keep-alive\r\n\r\n", 28); h += 28; }
@@ -2757,7 +2884,7 @@ static void xs_server_respond_x(xs_client *c, int64_t status, const char *ctype,
 static bool xs_server_flush(xs_client *c);
 
 /* writes to the client socket from inside the request coroutine, yielding when the socket is full */
-static bool xs_client_write_all(xs_client *c, const char *p, size_t n) {
+XS_NOINLINE bool xs_client_write_all(xs_client *c, const char *p, size_t n) {
 #ifdef XS_WITH_TLS
     if (c->tls) {
         while (n > 0 || xs_tls_srv_pending(c->tls)) {
@@ -2785,7 +2912,7 @@ static bool xs_client_write_all(xs_client *c, const char *p, size_t n) {
 }
 
 /* chunked transfer: the stream is pulled only as fast as the client reads, so the file behind it is too */
-static void xs_server_respond_stream(xs_client *c, xs_HttpResponse *res, bool keep_alive) {
+XS_NOINLINE void xs_server_respond_stream(xs_client *c, xs_HttpResponse *res, bool keep_alive) {
     if (!xs_server_flush(c)) return; /* anything queued before */
     char head[256];
     int n = snprintf(head, sizeof head, "HTTP/1.1 %lld %s\r\nContent-Type: %s%s\r\nTransfer-Encoding: chunked\r\nConnection: %s\r\n\r\n",
@@ -2840,8 +2967,10 @@ XS_NOINLINE void xs_request_run(void *arg) {
             if (res->stream) xs_server_respond_stream(c, res, job->keep_alive);
             else {
                 xs_resp_has_date = res->has_date;
+                xs_resp_no_body = job->head;
                 xs_server_respond_x(c, res->f_status, res->content_type, res->f_body->data, (size_t)res->f_body->len, job->keep_alive, res->extra);
                 xs_resp_has_date = false;
+                xs_resp_no_body = false;
             }
         }
         xs_release(res);
@@ -2866,7 +2995,9 @@ XS_NOINLINE void xs_request_run(void *arg) {
         } else {
             n = (size_t)snprintf(body, sizeof body, "{\"error\":\"internal error\"}");
         }
+        xs_resp_no_body = job->head;
         if (!c->closed) xs_server_respond(c, client ? 400 : 500, "application/json", body, n, job->keep_alive);
+        xs_resp_no_body = false;
         xs_metrics_end(route, client ? 400 : 500);
         if (!client) {
             char tb[4096];
@@ -2970,12 +3101,14 @@ XS_NOINLINE bool xs_server_process(xs_Server *s, xs_client *c) {
         xs_route *route = NULL;
         bool path_known = false;
         xs_route *fallback = NULL;
+        /* HEAD runs the GET route, as Express does, and gets its head without the body */
+        bool head_req = mlen == 4 && memcmp(line, "HEAD", 4) == 0;
         for (int i = 0; i < s->nroutes; i++) {
             xs_route *r = &s->routes[i];
             if (r->method[0] == '*') { fallback = r; continue; }
             if (xs_route_match(r->path, target, plen, req)) {
                 path_known = true;
-                if (strlen(r->method) == mlen && memcmp(line, r->method, mlen) == 0) { route = r; break; }
+                if ((strlen(r->method) == mlen && memcmp(line, r->method, mlen) == 0) || (head_req && strcmp(r->method, "GET") == 0)) { route = r; break; }
             }
         }
         if (!route && fallback) route = fallback;
@@ -2996,7 +3129,7 @@ XS_NOINLINE bool xs_server_process(xs_Server *s, xs_client *c) {
             req->headers_len = headers_len;
             /* run the handler in its own coroutine: an `await` inside it yields to the event loop */
             xs_request_job *job = malloc(sizeof *job);
-            job->s = s; job->c = c; job->req = req; job->route = route; job->keep_alive = keep_alive;
+            job->s = s; job->c = c; job->req = req; job->route = route; job->keep_alive = keep_alive; job->head = head_req;
             c->inflight++;
             __atomic_fetch_add(&xs_inflight_total, 1, __ATOMIC_RELAXED);
             free(chunked.data);
@@ -3290,6 +3423,7 @@ XS_NOINLINE void *xs_server_worker(void *arg) {
         struct timespec zero = {0, 0}, tick = {0, 200000000}, tt;
         bool has_t = xs_tmr_timeout(&tt);
         if (xs_shutting_down && (!has_t || tt.tv_sec > 0 || tt.tv_nsec > tick.tv_nsec)) { tt = tick; has_t = true; }
+        if (!xs_ready_head) xs_stdout_before_wait();
         int n = kevent(kq, NULL, 0, events, 256, xs_ready_head ? &zero : has_t ? &tt : NULL);
         xs_loop_ns = xs_now();
         xs_batch++;
@@ -3333,6 +3467,7 @@ XS_NOINLINE void *xs_server_worker(void *arg) {
                 w->armed = false;
                 w->fired = true;
                 xs_coro *co = w->co;
+                if (!co) continue; /* (plain code's own wait: xs_wait_fd_loop) */
                 xs_coro_resume(co);
                 xs_coro_after(co);
                 continue;
@@ -4525,7 +4660,8 @@ XS_NOINLINE void xs_ttask_run(void *p) {
 }
 static void xs_ttask_done(xs_coro *co) {
     xs_ttask *t = co->arg;
-    if (!t->unref) xs_tasks_live--;
+    if (co->unref) { co->unref = false; xs_tasks_unref--; } else if (!t->unref) xs_tasks_live--;
+    co->kill = false;
     xs_coro_recycle(co);
     for (xs_ttask **pp = &xs_ttasks; *pp; pp = &(*pp)->next)
         if (*pp == t) { *pp = t->next; break; }
@@ -4597,12 +4733,12 @@ static xs_ttask *xs_ttask_find(int64_t id) {
 static void xs_ttasks_unref_drop(void);
 XS_NOINLINE int64_t xs_timer_unref(int64_t id) {
     xs_ttask *t = xs_ttask_find(id);
-    if (t && !t->unref && !t->cancelled) { t->unref = true; xs_tasks_live--; xs_unref_drop = xs_ttasks_unref_drop; }
+    if (t && !t->unref && !t->cancelled) { t->unref = true; if (!t->co->unref) xs_tasks_live--; xs_unref_drop = xs_ttasks_unref_drop; }
     return id;
 }
 XS_NOINLINE int64_t xs_timer_ref(int64_t id) {
     xs_ttask *t = xs_ttask_find(id);
-    if (t && t->unref && !t->cancelled) { t->unref = false; xs_tasks_live++; xs_exit_hook = xs_tasks_drain; }
+    if (t && t->unref && !t->cancelled) { t->unref = false; if (!t->co->unref) xs_tasks_live++; xs_exit_hook = xs_tasks_drain; }
     return id;
 }
 XS_NOINLINE bool xs_timer_has_ref(int64_t id) {
@@ -4965,6 +5101,50 @@ XS_NOINLINE xs_arr_ref *xs_nhttp_parse(xs_Uint8Array *bytes, int64_t start, int6
     }
     xs_nhttp_end_ = (int64_t)(hend + 4 - bytes->data);
     return out;
+}
+/* socket.unref() / ref() (XB-226): a socket's I/O runs on a task (the coroutine of its reading, or of an http request);
+   unref'd, that task stops counting as work that keeps the program alive, so the program ends when only such tasks
+   are left (they are dropped parked, as Node exits with unref'd handles open). Only the tasks counted in
+   xs_tasks_live can be: a promise's or a timer's (immediate's) coroutine. net_task() gives the running one (0: none). */
+static bool xs_task_countable(xs_coro *co) { return co && !co->done && (co->on_done == xs_spawn_done || co->on_done == xs_ttask_done); }
+XS_NOINLINE int64_t xs_net_task(void) { return xs_task_countable(xs_cur_coro) ? (int64_t)(intptr_t)xs_cur_coro : 0; }
+/* the program's end: each task still parked unref'd is resumed once to unwind (its frames' references released, as
+   a throw would, but no code of it runs), so the program ends with nothing held, as Node's does */
+static XS_TLS xs_coro **xs_unref_cos;
+static XS_TLS int xs_n_unref_cos, xs_cap_unref_cos;
+static void xs_unref_kill_all(void) {
+    while (xs_n_unref_cos > 0) {
+        xs_coro *co = xs_unref_cos[--xs_n_unref_cos];
+        if (co->done || !co->unref) continue;
+        co->fdw.armed = false; /* (its socket's event, if one comes, is ignored) */
+        if (co->tmw.armed) xs_timer_disarm(&co->tmw);
+        co->kill = true;
+        xs_coro_resume(co);
+        if (co->done && co->on_done) co->on_done(co);
+    }
+    xs_coro_flush_dead();
+}
+XS_NOINLINE void xs_net_task_ref(int64_t task, bool ref) {
+    xs_coro *co = (xs_coro *)(intptr_t)task;
+    if (!xs_task_countable(co) || co->unref == !ref) return;
+    if (!ref) {
+        int i = 0;
+        while (i < xs_n_unref_cos && xs_unref_cos[i] != co) i++;
+        if (i == xs_n_unref_cos) {
+            if (xs_n_unref_cos == xs_cap_unref_cos) {
+                xs_cap_unref_cos = xs_cap_unref_cos ? xs_cap_unref_cos * 2 : 8;
+                xs_unref_cos = realloc(xs_unref_cos, sizeof *xs_unref_cos * (size_t)xs_cap_unref_cos);
+                if (!xs_unref_cos) xs_panic("out of memory");
+            }
+            xs_unref_cos[xs_n_unref_cos++] = co;
+        }
+        xs_unref_kill = xs_unref_kill_all;
+    }
+    bool timer_unref = co->on_done == xs_ttask_done && ((xs_ttask *)co->arg)->unref; /* (not counted already) */
+    co->unref = !ref;
+    bool counted = !timer_unref && !co->wwait; /* (a write wait counts it either way) */
+    if (ref) { xs_tasks_unref--; if (counted) xs_tasks_live++; xs_exit_hook = xs_tasks_drain; }
+    else { xs_tasks_unref++; if (counted) xs_tasks_live--; }
 }
 /* node:dns: lookup through the system resolver (getaddrinfo), as Node's dns.lookup; "" when the name is unknown */
 XS_NOINLINE xs_arr_ref *xs_dns_lookup_all(xs_str *host, int64_t family) {

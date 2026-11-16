@@ -61,4 +61,36 @@ const t: nodef.Tracer = new nodef.Tracer();
 console.log(nodef.double(21), nodef.NAME, t.startSpan("a"), hello());
 TS
 $X build -o app main.ts && [ "$(./app)" = "42 nodef span:a hi" ] && echo "ok: import x from a package without a default export reads the package"
+# import "pkg" (only for its effects, XB-184): the package's top level runs, once, before the importer's, also when
+# another module imports it by name; a deep import ("pkg/register") too; an effect import of a package not there fails
+mkdir -p "$W/fxapp/.xisto/pkgs/polyfx" && cd "$W/fxapp"
+cat > .xisto/pkgs/polyfx/index.ts <<'TS'
+export const installed: string[] = [];
+installed.push("polyfx");
+console.log("polyfx top");
+TS
+cat > .xisto/pkgs/polyfx/register.ts <<'TS'
+import { installed } from "./index.ts";
+installed.push("register");
+console.log("polyfx/register top");
+TS
+cat > other.ts <<'TS'
+import { installed } from "polyfx";
+export function count(): number {
+  return installed.length;
+}
+TS
+cat > main.ts <<'TS'
+import "polyfx";
+import "polyfx/register";
+import { count } from "./other.ts";
+import "polyfx";
+console.log("main", count());
+TS
+want=$(printf 'polyfx top\npolyfx/register top\nmain 2')
+$X build -o app main.ts && [ "$(./app)" = "$want" ] && echo "ok: import \"pkg\" runs the package's top level once, in order"
+printf 'import "nothere";\nconsole.log("x");\n' > missing.ts
+$X build -o app missing.ts 2>&1 | grep -q "cannot resolve 'nothere'" && echo "ok: import \"pkg\" of a missing package is reported"
+printf 'import "reflect-metadata";\nconsole.log("no package");\n' > refl.ts
+$X build -o app refl.ts && [ "$(./app)" = "no package" ] && echo "ok: import \"reflect-metadata\" without the package still builds (as before)"
 rm -rf "$W"

@@ -9,6 +9,7 @@
 import { EventEmitter } from "xisto:events";
 import { Readable, Writable, ErrorCallback } from "xisto:stream";
 import { channel } from "xisto:diagnostics_channel";
+import { Socket } from "xisto:net";
 
 declare function net_listen(host: string, port: int): int;
 declare function net_accept(lfd: int): int;
@@ -1159,6 +1160,9 @@ export class ClientRequest extends Writable {
   reusedSocket: boolean = false;
   aborted: boolean = false;
   private killed: boolean = false;
+  /** the request's socket, from 'socket' on (null before): socket.unref() lets the program end while it is in flight
+   * (an APM agent's send). Only ref()/unref() act on it: the connection itself is the request's HttpTransport. */
+  socket: Socket | null = null;
   private url: string;
   private headers: Map<string, string> = new Map<string, string>(); // name as set -> value
   private chunks: Uint8Array[] = [];
@@ -1309,7 +1313,16 @@ export class ClientRequest extends Writable {
     }
     this.emit("close");
   }
+  /** The request's task: the socket's I/O (its unref()/ref() act on this task) until the response's body ended. */
   private async send(): Promise<void> {
+    const sock = new Socket();
+    this.socket = sock;
+    sock._bindTask();
+    this.emit("socket", sock);
+    await this.exchange();
+    sock._unbindTask();
+  }
+  private async exchange(): Promise<void> {
     const startCh = channel("http.client.request.start");
     if (startCh.hasSubscribers) startCh.publish(new HttpChannelMessage(this)); // (a subscriber may setHeader())
     if (this.killed) {

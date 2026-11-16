@@ -13,8 +13,9 @@ static int nmissing_names;
 extern const char **xs_failed_decls;
 extern int xs_nfailed_decls;
 static bool missing_name(const char *name) {
-    if (!xs_check_mode) return false;
-    if (strncmp(name, "__", 2) == 0) return true; /* a name the compiler made (a decorator's value...): its cause was reported */
+    if (!xs_keep_going) return false;
+    if (strncmp(name, "__", 2) == 0 && xs_error_count) return true; /* a name the compiler made (a decorator's value...): its
+                                                                        cause was reported (none reported: this one is shown, XB-174) */
     for (int i = 0; i < nmissing_names; i++) if (strcmp(missing_names[i], name) == 0) return true;
     for (int i = 0; i < xs_nfailed_decls; i++) if (strcmp(xs_failed_decls[i], name) == 0) return true;
     return false;
@@ -167,6 +168,16 @@ static Class *bi_class(const char *name, const char *cname) {
     return c;
 }
 
+/* XB-250: the built-in classes whose struct and members live in runtime/xisto_net.h (the event loop, sockets,
+   workers): a member of one needs that runtime; Date, the bytes, bigint, Stats... live in xisto_rt.h */
+static void gen_site(Func *f);
+static bool net_class(Class *c) {
+    static const char *const names[] = {"Response", "ReadableStream", "HttpRequest", "HttpResponse", "Server", "Worker", "MessagePort"};
+    if (!c || !c->builtin) return false;
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) if (strcmp(c->name, names[i]) == 0) return true;
+    return false;
+}
+
 static void bi_field(Class *c, const char *name, Type *type) {
     c->fields = realloc(c->fields, sizeof(Field) * (size_t)(c->nfields + 1));
     Field f = {0};
@@ -190,6 +201,7 @@ static Func *bi_func(const char *name, const char *cfn, Type *ret, int nparams, 
     return f;
 }
 
+static Expr *num_lit(Pos pos, double v, bool is_int);
 static void bi_method(Class *c, const char *name, const char *cfn, Type *ret, int nparams, ...) {
     va_list ap;
     va_start(ap, nparams);
@@ -240,8 +252,11 @@ static void init_builtins(void) {
     Class *res = bi_class("HttpResponse", "xs_HttpResponse");
     bi_field(res, "status", ty_int);
     bi_field(res, "body", ty_string);
-    bi_static(res, "text", "xs_HttpResponse_text", ty_object_of(res), 1, ty_string);
-    bi_static(res, "json", "xs_HttpResponse_json", ty_object_of(res), 1, ty_string);
+    /* text(body, status = 200) / json(body, status = 200): the content type is the method's, the status optional
+       (XB-229: HttpResponse.json(body, 201) instead of status(201, body) answering text/plain) */
+    bi_static(res, "text", "xs_HttpResponse_text", ty_object_of(res), 2, ty_string, ty_int);
+    bi_static(res, "json", "xs_HttpResponse_json", ty_object_of(res), 2, ty_string, ty_int);
+    for (int k = res->nstatics - 2; k < res->nstatics; k++) res->statics[k]->params[1].dflt = num_lit((Pos){0}, 200, true);
     bi_static(res, "status", "xs_HttpResponse_status", ty_object_of(res), 2, ty_int, ty_string);
     bi_static(res, "of", "xs_HttpResponse_of", ty_object_of(res), 3, ty_int, ty_string, ty_string);
     bi_method(res, "header", "xs_HttpResponse_header", ty_object_of(res), 2, ty_string, ty_string);
@@ -370,7 +385,9 @@ static bool wt_imports(Module *m, const char *name) {
     return false;
 }
 /* Classes visible from the current module: its own, the ones it imports, and the built-ins. */
+static Class *static_this_class(void);
 static Class *find_class(const char *name) {
+    if (name[0] == '\x02' && !strcmp(name, XS_STATIC_THIS)) return static_this_class(); /* `this` in a static method */
     const char *q = strchr(name, '\x01'); /* "A\x01m": the class A of the import from "m" (an alias next to another A, XB-117) */
     if (q) {
         char *base = xs_strndup(name, (size_t)(q - name));
@@ -1316,7 +1333,7 @@ static void check_promise(Expr *e, Type *expected) {
         if (e->args.len == 0) { /* Promise.resolve(): a Promise<void> */
             wrap_call(e, "xs_promise_resolved_v", ty_promise_of(ty_void));
             e->args = (ExprList){0};
-            prog->uses_gen = true;
+            gen_site(cur_func);
             return;
         }
         Expr *v = e->args.items[0];
@@ -1343,7 +1360,7 @@ static void check_promise(Expr *e, Type *expected) {
         expr_list_push(&e->args, num_lit(e->pos, pr_kind(T), true));
         expr_list_push(&e->args, x);
         e->type = ty_promise_of(T);
-        prog->uses_gen = true;
+        gen_site(cur_func);
         return;
     }
     if ((!strcmp(m, "all") || !strcmp(m, "race") || !strcmp(m, "any") || !strcmp(m, "allSettled")) && e->args.len == 1 &&
@@ -1437,7 +1454,7 @@ static void check_promise(Expr *e, Type *expected) {
     if (!race && strcmp(m, "all") != 0) xs_error(XS7111, e->pos, "supported: Promise.all, Promise.race, Promise.any, Promise.resolve, Promise.reject", "unknown Promise member '%s'", m);
     if (e->args.len != 1) xs_error(XS7032, e->pos, NULL, "Promise.%s takes an array", m);
     Expr *a = e->args.items[0];
-    prog->uses_gen = true; /* the coroutines and the event loop */
+    gen_site(cur_func); /* the coroutines and the event loop */
     if (race && tsc_checked() && a->kind == E_ARRAY_LIT && !a->spread && a->args.len > 0) {
         /* Promise.race([medida.then(...), sentinela.then(...)]): promises already made; the race is on them (no task waits on
            a loser: a promise left pending, its timer cleared, keeps nothing alive, as in Node); objects of several shapes: their union */
@@ -1468,7 +1485,7 @@ static void check_promise(Expr *e, Type *expected) {
                 for (int i = 0; i < a->args.len; i++) a->args.items[i]->type = ty_promise_of(u); /* (an object, or a union of them: one reference) */
                 a->type = ty_array_of(ty_promise_of(u));
                 a->prechecked = true;
-                prog->uses_gen = true;
+                gen_site(cur_func);
                 e->builtin.cfn = "promise_race_arr";
                 e->elem_type = u;
                 e->type = u;
@@ -1481,15 +1498,23 @@ static void check_promise(Expr *e, Type *expected) {
         /* Promise.race([stored, wait]) of promises kept in variables, all of one type: the race is on them, as an array kept
            (XB-162). A task awaiting each would stay parked on a loser that never settles (its timer cleared) */
         Type *u = NULL;
-        bool kept = true;
+        bool kept = true, var = false;
         for (int i = 0; i < a->args.len && kept; i++) {
             Expr *x = a->args.items[i];
             Binding *b = x->kind == E_IDENT && x->str ? lookup(x->str) : NULL;
             Type *bt = b && b->type ? b->type : NULL;
             kept = bt && bt->kind == TY_PROMISE && bt->elem->kind != TY_VOID && (!u || ty_equal(u, bt->elem));
-            if (kept) u = bt->elem;
+            if (kept) { u = bt->elem; var = true; }
+            else if (x->kind == E_CALL && x->lhs && x->lhs->kind == E_IDENT && x->lhs->str && !lookup(x->lhs->str)) {
+                /* Promise.race([quick(), wait]): a call of an async function of the same type, kept as a promise too
+                   (it runs to its end; the race does not park a task on the loser, XB-231) */
+                Func *f = lookup_func(x->lhs->str);
+                kept = f && (f->is_async || f->ret_promise) && f->ntparams == 0 && f->ret && f->ret->kind != TY_VOID && f->ret->kind != TY_PROMISE &&
+                       (!u || ty_equal(u, f->ret));
+                if (kept) u = f->ret;
+            }
         }
-        if (kept) {
+        if (kept && var) { /* (calls only: each a task, below) */
             check_expr(a, ty_array_of(ty_promise_of(u)));
             if (a->type->kind == TY_ARRAY && a->type->elem->kind == TY_PROMISE && ty_equal(a->type->elem->elem, u)) {
                 e->builtin.cfn = "promise_race_arr";
@@ -1609,7 +1634,8 @@ static void check_promise(Expr *e, Type *expected) {
         return;
     }
     check_expr(a, expected && !race ? expected : NULL);
-    if (a->kind == E_MEMBER && a->is_call && a->builtin.cfn && strcmp(a->builtin.cfn, "map") == 0 && a->lhs->type->kind == TY_ARRAY && a->field == 1) {
+    if (a->kind == E_MEMBER && a->is_call && a->builtin.cfn && strcmp(a->builtin.cfn, "map") == 0 && a->lhs->type->kind == TY_ARRAY && a->field == 1 &&
+        a->type->elem->kind != TY_PROMISE) { /* (a callback that gives a promise kept, such as f(x).then(...): the array of promises below, XB-230) */
         /* xs.map(f): f(x) for each element as a task */
         e->builtin.cfn = race ? "promise_race_map" : "promise_all_map";
         e->elem_type = a->type->elem;
@@ -2611,6 +2637,7 @@ static Type *resolve(Type *t, Pos pos) {
         Binding *fb = f ? NULL : lookup(t->tname + 12);
         if (fb && fb->type && fb->type->kind == TY_FUNC && fb->type->ret) { *t = *fb->type->ret; return t; } /* (a const holding an arrow) */
         if (!f || f->ntparams) xs_error(XS1019, pos, "write the type itself", "ReturnType<typeof %s>: no function '%s' here", t->tname + 12, t->tname + 12);
+        if (!f->ret && !f->ret_infer) resolve_signature(f); /* (named before its declaration: its return type is inferred here, XB-109) */
         Type *r = fret(f, pos);
         *t = *r; /* (in place: whoever holds it now holds the function's type) */
         return t;
@@ -3013,6 +3040,14 @@ static Binding *lookup(const char *name) {
                 return b;
             }
             mark_used(b);
+            if (nb > 0 && global && b->union_narrow && b->orig) {
+                /* a module variable narrowed out here, read in a callback: it may run after the variable was assigned
+                   another member, so it is seen as declared there (as TypeScript does when it is assigned after) */
+                Binding *d = xs_alloc(sizeof *d);
+                *d = *b;
+                d->origin = b; d->type = b->orig; d->orig = NULL; d->union_narrow = false;
+                return d;
+            }
             if (nb == 0 || global) return b;
             /* capture into each arrow from the outermost boundary inward */
             Binding *cur = b;
@@ -3020,7 +3055,8 @@ static Binding *lookup(const char *name) {
                 Arrow *a = boundaries[i]->arrow;
                 /* (a variable in a cell narrowed here: a callback sees it as declared, as in TypeScript, since it
                    may run after the variable was set to null again) */
-                Type *ctype_ = cell_narrowed(cur) ? cur->orig : cur->type;
+                bool cell_union = cur->union_narrow && cur->cell && cur->orig; /* (a union narrowed here, in a cell: as declared too) */
+                Type *ctype_ = cell_narrowed(cur) || cell_union ? cur->orig : cur->type;
                 Capture *c = add_capture(a, name, cur->cell ? cur->cell : cur->cname, ctype_, false);
                 Binding *nbind = xs_alloc(sizeof *nbind);
                 *nbind = *cur;
@@ -3028,6 +3064,7 @@ static Binding *lookup(const char *name) {
                 nbind->origin = cur;
                 nbind->is_param = false;
                 nbind->orig = NULL;
+                if (cell_union) nbind->union_narrow = false;
                 if (cur->cell) { /* shared with the enclosing function through the cell: reads and writes see each other */
                     c->boxed = true;
                     nbind->cell = xs_sprintf("env->c_%s", cap_cid(name));
@@ -3060,6 +3097,44 @@ static const char *this_cname(void) {
     return name;
 }
 
+/* `this` in a static method (and the arrows written in it): the class it was called on (the method's own class, or the
+   subclass its copy was made for) */
+static Class *static_this_class(void) {
+    Func *f = cur_func;
+    while (f && !f->static_of && f->outer_fn) f = f->outer_fn;
+    return f ? f->static_of : NULL;
+}
+static bool has_static(Class *c, const char *name) {
+    for (int k = 0; k < c->nstatics_user; k++) if (!strcmp(c->static_names[k], name)) return true;
+    return false;
+}
+/* a static method f of class A that names `this`, called as B.m() with B a subclass that inherits it: f parsed again for B
+   (once per subclass), `this` reading B there, as JavaScript's this is the class the call was made on */
+static void resolve_signature(Func *f);
+static Func **gen_work;
+static int ngen_work;
+static Func *static_copy(Func *f, Class *sub) {
+    for (int i = 0; i < f->ninstances; i++) if (f->instances[i]->static_of == sub) return f->instances[i];
+    Func *g = xs_parse_static_copy(f);
+    g->name = xs_sprintf("__xs_sthis_%s_%s", sub->cname ? sub->cname : sub->name, f->name);
+    g->cname = xs_sprintf("f%d_%s", g->mod->id, g->name);
+    g->static_of = sub;
+    f->instances = realloc(f->instances, sizeof(Func *) * (size_t)(f->ninstances + 1));
+    f->instances[f->ninstances++] = g; /* (kept here to be found again; the program gets it through gen_work) */
+    sym_add(&funcs_by_name, g->name, g);
+    Module *sm = cur_mod;
+    Scope *ss = scope;
+    const char *sfn = xs_file_name, *ssrc = xs_source;
+    enter_module(g->mod);
+    resolve_signature(g);
+    cur_mod = sm;
+    scope = ss;
+    xs_file_name = sfn;
+    xs_source = ssrc;
+    gen_work = realloc(gen_work, sizeof(Func *) * (size_t)(ngen_work + 1));
+    gen_work[ngen_work++] = g;
+    return g;
+}
 static Func *lookup_func(const char *name) {
     const char *q = strchr(name, '\x01'); /* "f\x01m": the function f of the import from "m" (XB-117) */
     if (q) {
@@ -3076,6 +3151,7 @@ static Func *lookup_func(const char *name) {
     SYM_EACH(funcs_by_name, name, e) {
         Func *f = e->decl;
         if (f->mod == cur_mod || (f->exported && imports_name(cur_mod, f->mod, name))) return f;
+        if (!strncmp(name, "__xs_sthis_", 11)) return f; /* (a static method's copy for a subclass: static_copy) */
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:arrays") == 0) return f; /* (reduce & co) */
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:settled") == 0) return f; /* (Promise.allSettled) */
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:builtins") == 0) return f; /* (xs.at & co) */
@@ -3088,6 +3164,7 @@ static Func *lookup_func(const char *name) {
         if (!strncmp(name, "Reflect__s_", 11) && f->exported && f->mod && f->mod->file && strstr(f->mod->file, "/reflect-metadata/"))
             return f; /* (Reflect.defineMetadata & co: statics of the global Reflect, see find_class) */
         const char *st = strstr(name, "__s_"); /* a static method: visible where its class is imported */
+        if (st && f->static_of && f->static_of == static_this_class()) return f; /* (this.m() in a static method's copy, XB: static this) */
         if (st && f->exported) {
             char *cls = xs_strndup(name, (size_t)(st - name));
             if (imports_name(cur_mod, f->mod, cls)) return f;
@@ -3237,7 +3314,8 @@ static const char **member_names(Class *c, int *n) {
 /* ---- closures that capture by reference: a variable a closure captures and someone reassigns lives in a heap
    cell shared by the function and its closures; every other capture stays a copy (no cost). Found by name per
    function (or module): a use at a deeper arrow than the declaration, and an assignment anywhere. A `let` in a
-   for header keeps JavaScript's copy per iteration unless a closure itself assigns it. ---- */
+   for header keeps JavaScript's copy per iteration unless a closure or the body assigns it (then a cell per
+   iteration, emit_for_); the loop's own update alone does not need one. ---- */
 typedef struct { const char *name; int depth; char kind; } ScanEv; /* d declared, u used, a assigned; b / e: a block or closure opens / closes (name "") */
 static ScanEv *sev;
 static int nsev, cap_sev;
@@ -3249,10 +3327,16 @@ static void scan_ev(const char *name, int depth, char kind) {
 }
 static void scan_stmt(Stmt *s, int depth);
 static void scan_stmt_inner(Stmt *s, int depth);
+/* a for loop's update (k++, or i++, j-- of `let i = 0, j = n`) assigns between two iterations, after the copy to the
+   next one: kind 'p', which a closure of the iteration that ended never sees (an assignment in the body is 'a': it
+   does); for any other variable 'p' counts as 'a' */
+static bool scan_upd;
+static int scan_upd_depth;
 static void scan_expr(Expr *e, int depth) {
     if (!e) return;
     if (e->kind == E_IDENT && e->str) scan_ev(e->str, depth, 'u');
-    if ((e->kind == E_ASSIGN || e->kind == E_POSTFIX) && e->lhs && e->lhs->kind == E_IDENT) scan_ev(e->lhs->str, depth, 'a');
+    if ((e->kind == E_ASSIGN || e->kind == E_POSTFIX) && e->lhs && e->lhs->kind == E_IDENT)
+        scan_ev(e->lhs->str, depth, scan_upd && depth == scan_upd_depth ? 'p' : 'a');
     if (e->kind == E_ARROW) {
         scan_ev("", depth + 1, 'b');
         for (int i = 0; i < e->arrow->fn->nparams; i++) scan_ev(e->arrow->fn->params[i].name, depth + 1, 'd');
@@ -3280,14 +3364,22 @@ static void scan_stmt_inner(Stmt *s, int depth) {
     scan_expr(s->expr, depth);
     scan_expr(s->cond, depth);
     scan_stmt(s->for_init, depth);
-    scan_expr(s->for_update, depth);
+    {
+        bool un = scan_upd;
+        int ud = scan_upd_depth;
+        scan_upd = s->kind == S_FOR;
+        scan_upd_depth = depth;
+        scan_expr(s->for_update, depth);
+        scan_upd = un;
+        scan_upd_depth = ud;
+    }
     scan_stmt(s->body, depth);
     scan_stmt(s->else_body, depth);
     for (int i = 0; i < s->stmts.len; i++) scan_stmt(s->stmts.items[i], depth);
     for (int i = 0; i < s->ncases; i++) { scan_expr(s->cases[i].value, depth); scan_stmt(s->cases[i].body, depth); }
 }
 static bool boxed_name(const char *name, int decl_depth, bool for_init) {
-    bool captured = false, assigned = false, assigned_inside = false;
+    bool captured = false, assigned = false, assigned_inside = false, assigned_body = false;
     int nest = 0, shadow = -1; /* a closure's own variable of this name (a loop's k inside a closure): its events are another variable's */
     for (int i = 0; i < nsev; i++) {
         if (sev[i].kind == 'b') { nest++; continue; }
@@ -3296,9 +3388,10 @@ static bool boxed_name(const char *name, int decl_depth, bool for_init) {
         if (sev[i].kind == 'd' && sev[i].depth > decl_depth && shadow < 0) shadow = nest;
         if (shadow >= 0) continue;
         if (sev[i].kind == 'u' && sev[i].depth > decl_depth) captured = true;
-        if (sev[i].kind == 'a') { assigned = true; if (sev[i].depth > decl_depth) assigned_inside = true; }
+        if (sev[i].kind == 'a' || sev[i].kind == 'p') { assigned = true; if (sev[i].depth > decl_depth) assigned_inside = true; }
+        if (sev[i].kind == 'a') assigned_body = true;
     }
-    return captured && (for_init ? assigned_inside : assigned);
+    return captured && (for_init ? assigned_inside || assigned_body : assigned);
 }
 /* XB-202, XB-215: the names a module's functions, methods and closures assign. A module variable of one of those names
    may change during any call: narrowed to not null, each read after is checked (as a variable in a cell is); passed
@@ -3383,8 +3476,9 @@ static Binding *declare(Pos pos, const char *name, Type *type, bool is_const, bo
 /* ---------- helpers ---------- */
 
 static bool is_numeric(Type *t) { return t->kind == TY_NUMBER || t->kind == TY_INT; }
-/* (number | null)[] / (int | null)[]: a number[] / int[] holding the null sentinel (XB-136) */
-static bool nullnum_elem(Type *t) { return t->kind == TY_NULLABLE && !ty_is_heap(t->elem) && is_numeric(t->elem); }
+/* (number | null)[] / (int | null)[]: a number[] / int[] holding the null sentinel (XB-136); (boolean | null)[]: a byte
+   per element, with the boolean's null sentinel (XB-150) */
+static bool nullnum_elem(Type *t) { return t->kind == TY_NULLABLE && !ty_is_heap(t->elem) && (is_numeric(t->elem) || t->elem->kind == TY_BOOLEAN); }
 
 static void check_type_supported(Pos pos, Type *t) {
     if (t->kind == TY_ARRAY && (t->elem->kind == TY_VOID || (t->elem->kind == TY_NULLABLE && !ty_is_heap(t->elem) && !nullnum_elem(t->elem))))
@@ -3431,6 +3525,7 @@ static bool json_ok(Type *t, int depth) {
                 continue; /* total?: SearchTotalHits | number: a JSON object read as the one object member, the rest by kind */
             if (k == TY_OBJECT && json_ok_union_objs && !t->params[i]->cls->builtin && json_ok(t->params[i], depth + 1))
                 continue; /* (written: DocRollout | DocGlobal, each object by its class at run time, as an unknown is) */
+            if (k == TY_FUNC) continue; /* string | ((a) => string): a function is left out, as JSON.stringify does (never read) */
             if (k != TY_NUMBER && k != TY_INT && k != TY_STRING && k != TY_BOOLEAN) return false;
         }
         return true;
@@ -3451,8 +3546,11 @@ static bool json_ok(Type *t, int depth) {
             bool ok = true;
             bool wu = json_ok_union_objs;
             if (t->cls->json_written) json_ok_union_objs = true;
-            for (int i = 0; i < t->cls->nfields && ok; i++)
-                if (!json_ok(t->cls->fields[i].type, depth + 1)) ok = false;
+            for (int i = 0; i < t->cls->nfields && ok; i++) {
+                Type *ft = t->cls->fields[i].type;
+                if (ft->kind == TY_NULLABLE && ft->elem->kind == TY_FUNC) continue; /* next?: (v: T) => void: left out, as JSON.stringify does */
+                if (!json_ok(ft, depth + 1)) ok = false;
+            }
             json_ok_union_objs = wu;
             nopen--;
             return ok;
@@ -3513,11 +3611,39 @@ static Expr *rec_get_nn(Expr *x) {
 }
 /* x, this, x.a.b before checking: a path with no call in it, safe to check twice */
 static bool plain_path(Expr *e) { return e->kind == E_IDENT || e->kind == E_THIS || (e->kind == E_MEMBER && !e->is_call && e->op != TK_QDOT && plain_path(e->lhs)); }
+/* (u as C), (u as unknown as C) before checking: a cast of a plain path, read again with no other effect (the receiver
+   of (u as C).x += 1 through a setter: read for the getter and for the setter) */
+static bool cast_path(Expr *e) { return e->kind == E_AS && e->elem_type && e->op != TK_NOT && (plain_path(e->lhs) || cast_path(e->lhs)); }
+static Field *find_field(Class *c, const char *name, int *idx);
+/* (t as unknown as { name: string }).name, read or written, with t (a plain path) an object of a class that has that
+   field of that type: the member becomes t.name, the field of t itself (JavaScript's cast converts nothing; a shape's
+   copy would lose the write). 0: left as it is; 1: done; 2: done, and the field is private or protected (TypeScript
+   checks nothing through the cast: the caller checks the member without the access rule) */
+static int cast_peel(Expr *e) {
+    if (e->kind != E_MEMBER || e->is_call || !e->str || !e->lhs || !cast_path(e->lhs) || e->lhs->prechecked) return 0;
+    Expr *in = e->lhs;
+    while (in->kind == E_AS && !in->prechecked) in = in->lhs;
+    if (in->prechecked || !plain_path(in)) return 0;
+    Type *want = resolve(e->lhs->elem_type, e->lhs->pos);
+    Field *fw = want && want->kind == TY_OBJECT && !want->cls->builtin ? find_field(want->cls, e->str, NULL) : NULL;
+    if (!fw) return 0;
+    check_expr(in, NULL); /* (a plain path: checked again as the member's receiver) */
+    Type *it = in->type;
+    Field *fc = it && it->kind == TY_OBJECT && !it->cls->builtin && !it->cls->adapter_of && it->cls != want->cls ? find_field(it->cls, e->str, NULL) : NULL;
+    if (!fc || !fc->type || !fw->type || !ty_equal(fc->type, fw->type)) return 0;
+    e->lhs = in;
+    return fc->access ? 2 : 1;
+}
 static const char **member_names(Class *c, int *n);
 static bool always_returns(Stmt *s);
 static void check_block(Stmt *b);
 static Binding *narrow_target(Expr *cond, bool *not_null);
 static const char *path_key(Expr *m);
+static void upath_read(Expr *e);
+static const char *upath_key(Expr *m);
+static void upath_invalidate(Expr *target);
+static void assign_unnarrow(Binding *b);
+static Type *objlit_member(Type *u, Expr *lit);
 typedef struct { Binding *b[8]; int n; } NSet;
 static void narrow_set(Expr *c, bool when, NSet *out);
 static void shadow_set(NSet *s);
@@ -3855,6 +3981,7 @@ static void fn_adapt(Expr *e, Expr *x, Type *ft, Type *ret, Type *unbox) {
     ir->kind = S_RETURN; ir->pos = pos; ir->expr = val;
     stmt_list_push(&ib->stmts, ir);
     in->body = ib;
+    in->origin = call; /* (the function it wraps, for identity: ===, Map and Set keys; emit reads the capture __fo) */
     Arrow *ia = xs_alloc(sizeof *ia);
     ia->pos = pos; ia->fn = in; ia->expr_body = true;
     Expr *inner = xs_alloc(sizeof *inner);
@@ -4197,6 +4324,7 @@ static void to_unknown(Expr *e) {
             r->kind = S_RETURN; r->pos = pos; r->expr = call;
             stmt_list_push(&b->stmts, r);
             f->body = b;
+            f->origin = call; /* (the function it wraps, for identity) */
             Arrow *a = xs_alloc(sizeof *a);
             a->pos = pos; a->fn = f; a->expr_body = true;
             memset(e, 0, sizeof *e);
@@ -4513,6 +4641,7 @@ static Type *union_member_for(Type *u, Type *t, Expr *e) {
     }
     return NULL;
 }
+static bool shape_copy(Expr *e, Type *want);
 /* a value goes into a union: boxed like an unknown (a union of fewer members is already one) */
 static bool enter_union(Expr *e, Type *want) {
     Type *u = want->kind == TY_NULLABLE ? want->elem : want;
@@ -4529,6 +4658,9 @@ static bool enter_union(Expr *e, Type *want) {
     if (!m && gb->kind == TY_ARRAY && g->kind != TY_NULLABLE) /* string[] where Record<string, unknown> | unknown[] goes */
         for (int i = 0; i < u->nparams && !m; i++)
             if (u->params[i]->kind == TY_ARRAY && elem_widens(gb->elem, u->params[i]->elem)) { arr_convert(e, u->params[i]->elem); m = u->params[i]; }
+    if (!m && gb->kind == TY_OBJECT && g->kind != TY_NULLABLE) /* { next } where Partial<Observer<T>> | ((v: T) => void) goes: copied into the object member its fields fit */
+        for (int i = 0; i < u->nparams && !m; i++)
+            if (u->params[i]->kind == TY_OBJECT && shape_copy(e, u->params[i])) m = u->params[i];
     if (!m) return false;
     if (g->kind == TY_LITINT) coerce_lit(e, m);
     to_unknown(e);
@@ -4625,13 +4757,136 @@ static bool pr_async_call(Expr *e) {
     if (e->builtin.cfn && (!strcmp(e->builtin.cfn, "promise_all_map") || !strcmp(e->builtin.cfn, "promise_race_map"))) return true;
     return false;
 }
+/* XB-231: a function not written async but declared Promise<T> is async here (its returns await what they hand
+   back), so a call whose promise is kept runs on a coroutine parked on that promise: `return w` with w a promise it
+   keeps in a map left the task parked for good (alive at exit) and f(k) !== map.get(k). Such a function gets a promise
+   version, its body checked again with Promise<T> as written (no await, no coroutine); when that body never waits
+   (pv_body_waits), the kept calls call it instead (pv_finish). Its calls that are awaited stay as they were. */
+static Func **pv_funcs;
+static int npv_funcs;
+static Expr **pv_sites;
+static int npv_sites;
+static Func **gen_work;
+static int ngen_work;
+static Expr **pv_awaits; /* await f(k) with f such a function: its version too when f's body starts async calls (pv_fires) */
+static int npv_awaits;
+static bool pv_can(Func *f) {
+    return f && !f->pv_of && !f->is_async && f->ret_promise && !f->ret_maybe_sync && !f->cls && !f->is_gen && !f->is_native && f->body &&
+           !f->decos.len && !f->deco_stub && !f->sig_failed && !f->mod->builtin && (f->pv_state || (f->template_of && f->inst_args)) &&
+           !getenv("XISTO_NO_PV");
+}
+static Func *pv_version(Func *f) {
+    if (!pv_can(f)) return NULL;
+    if (f->pver) return f->pver;
+    Func *v = xs_parse_promise_version(f);
+    v->cname = xs_sprintf("%s_pv", f->cname);
+    f->pver = v;
+    Module *sm = cur_mod;
+    Scope *ss = scope;
+    const char *sfn = xs_file_name, *ssrc = xs_source;
+    enter_module(f->mod);
+    resolve_signature(v);
+    cur_mod = sm;
+    scope = ss;
+    xs_file_name = sfn;
+    xs_source = ssrc;
+    pv_funcs = realloc(pv_funcs, sizeof(Func *) * (size_t)(npv_funcs + 1));
+    pv_funcs[npv_funcs++] = v;
+    gen_work = realloc(gen_work, sizeof(Func *) * (size_t)(ngen_work + 1));
+    gen_work[ngen_work++] = v;
+    return v;
+}
+/* the body waits somewhere (an await, an async call that runs in it): its promise version would not keep the order */
+static bool pv_expr_waits(Expr *e) {
+    if (!e || e->kind == E_ARROW) return false; /* (a closure's body runs when it is called) */
+    if (e->kind == E_AWAIT) return true;
+    if (e->kind == E_SPAWN) { /* (a task of its own: the arguments are evaluated here) */
+        Expr *c = e->lhs;
+        if (c->kind == E_MEMBER && pv_expr_waits(c->lhs)) return true;
+        for (int i = 0; i < c->args.len; i++) if (pv_expr_waits(c->args.items[i])) return true;
+        return false;
+    }
+    if ((e->kind == E_CALL || (e->kind == E_MEMBER && e->is_call)) &&
+        ((e->builtin.cfn && !strncmp(e->builtin.cfn, "xs_promise_await", 16)) || pr_async_call(e))) return true;
+    if (pv_expr_waits(e->lhs) || pv_expr_waits(e->rhs)) return true;
+    for (int i = 0; i < e->args.len; i++) if (pv_expr_waits(e->args.items[i])) return true;
+    return false;
+}
+static bool pv_body_waits(Stmt *s) {
+    if (!s) return false;
+    if (pv_expr_waits(s->init) || pv_expr_waits(s->expr) || pv_expr_waits(s->cond) || pv_expr_waits(s->for_update)) return true;
+    if (pv_body_waits(s->for_init) || pv_body_waits(s->body) || pv_body_waits(s->else_body)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (pv_body_waits(s->stmts.items[i])) return true;
+    for (int i = 0; i < s->ncases; i++) if (pv_expr_waits(s->cases[i].value) || pv_body_waits(s->cases[i].body)) return true;
+    return false;
+}
+/* f(); with f async, as a statement of the body (not in a closure): the version starts it and goes on, as JavaScript
+   does, where the function itself waits for it; so an awaited call takes the version too (the same order as Node) */
+static bool pv_body_fires(Stmt *s) {
+    if (!s) return false;
+    if (s->kind == S_EXPR && s->expr && s->expr->kind != E_SPAWN && pr_async_call(s->expr)) return true;
+    if (pv_body_fires(s->for_init) || pv_body_fires(s->body) || pv_body_fires(s->else_body)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (pv_body_fires(s->stmts.items[i])) return true;
+    for (int i = 0; i < s->ncases; i++) if (pv_body_fires(s->cases[i].body)) return true;
+    return false;
+}
+/* the awaited calls of functions whose body starts async calls: their versions, to be checked (true: some made) */
+static bool pv_more(void) {
+    bool made = false;
+    for (int i = 0; i < npv_awaits; i++) {
+        Expr *c = pv_awaits[i]->lhs;
+        if (c->kind != E_CALL || !c->func || c->func->pver || !pv_can(c->func) || !pv_body_fires(c->func->body)) continue;
+        pv_version(c->func);
+        made = true;
+    }
+    return made;
+}
+/* after every body is checked: the promise versions that never wait replace the spawned calls */
+static void pv_finish(void) {
+    for (int i = 0; i < npv_funcs; i++) {
+        Func *v = pv_funcs[i];
+        if (v->pv_ok && (!v->ret || v->ret->kind != TY_PROMISE || pv_body_waits(v->body))) v->pv_ok = false;
+        if (getenv("XISTO_PV_LOG")) fprintf(stderr, "pv: %s %s\n", v->name, v->pv_ok ? "ok" : "not used");
+    }
+    for (int i = 0; i < npv_sites; i++) {
+        Expr *e = pv_sites[i];
+        if (e->kind != E_SPAWN || e->lhs->kind != E_CALL || !e->lhs->func || !e->lhs->func->pver || !e->lhs->func->pver->pv_ok) continue;
+        Type *t = e->type;
+        Expr *c = e->lhs;
+        *e = *c;
+        e->func = c->func->pver;
+        e->type = t;
+        if (e->lhs && e->lhs->kind == E_IDENT && e->lhs->cname && c->func->cname && !strcmp(e->lhs->cname, c->func->cname)) {
+            Expr *l = expr_copy(e->lhs);
+            l->cname = e->func->cname;
+            e->lhs = l;
+        }
+    }
+    for (int i = 0; i < npv_awaits; i++) {
+        Expr *c = pv_awaits[i]->lhs;
+        Func *f = c->kind == E_CALL ? c->func : NULL;
+        if (!f || !f->pver || !f->pver->pv_ok || !pv_body_fires(f->body)) continue;
+        c->func = f->pver;
+        c->type = f->pver->ret;
+        if (c->lhs && c->lhs->kind == E_IDENT && c->lhs->cname && f->cname && !strcmp(c->lhs->cname, f->cname)) {
+            Expr *l = expr_copy(c->lhs);
+            l->cname = f->pver->cname;
+            c->lhs = l;
+        }
+        pr_await(c); /* (its value, as before: the await around it is the identity) */
+    }
+}
 static void pr_spawn(Expr *e) { /* the call e (checked), kept as a promise */
+    if (e->kind == E_CALL && e->func && !e->builtin.cfn && pv_version(e->func)) {
+        pv_sites = realloc(pv_sites, sizeof(Expr *) * (size_t)(npv_sites + 1));
+        pv_sites[npv_sites++] = e; /* (the E_SPAWN it becomes below) */
+    }
     Expr *c = xs_alloc(sizeof *c);
     *c = *e;
     memset(e, 0, sizeof *e);
     e->kind = E_SPAWN; e->pos = c->pos; e->field = -1; e->lhs = c;
     e->type = ty_promise_of(c->type);
-    prog->uses_gen = true;
+    gen_site(cur_func);
     if (getenv("XISTO_SPAWN_LOG")) fprintf(stderr, "spawn: %s:%d:%d\n", xs_file_name ? xs_file_name : "?", c->pos.line, c->pos.col);
 }
 static void pr_resolved(Expr *e) { /* a value already computed, as a fulfilled promise */
@@ -4639,7 +4894,7 @@ static void pr_resolved(Expr *e) { /* a value already computed, as a fulfilled p
     const char *sfx = pr_sfx(pr_kind(t));
     /* (a void or null value: xs_promise_resolved_v takes none; _vx evaluates it and drops it) */
     wrap_call(e, xs_sprintf("xs_promise_resolved_%s", strcmp(sfx, "v") == 0 ? "vx" : sfx), ty_promise_of(t));
-    prog->uses_gen = true;
+    gen_site(cur_func);
 }
 static void pr_await(Expr *e) { /* await p, p a promise: its value (or its rejection thrown) */
     Type *t = e->type->elem;
@@ -4797,7 +5052,7 @@ static void check_pr_member(Expr *e, Type *expected) {
     expr_list_push(&e->args, num_lit(e->pos, errk, true));
     expr_list_push(&e->args, num_lit(e->pos, pr_kind(R), true));
     e->type = ty_promise_of(R);
-    prog->uses_gen = true;
+    gen_site(cur_func);
 }
 /* Promise<X> where Promise<Y> goes, one of them unknown (a cache of promises of different types, XB-135):
    p.then((v: X): Y => v as Y), a new promise that settles with p (its value boxed into, or checked out of, the
@@ -4862,7 +5117,7 @@ static void check_pr_new(Expr *e, Type *expected) {
     expr_list_push(&e->args, num_lit(e->pos, pr_kind(T), true));
     expr_list_push(&e->args, x);
     e->type = ty_promise_of(T);
-    prog->uses_gen = true;
+    gen_site(cur_func);
 }
 /* Number, String, Boolean, Date as values. Where a function goes (xs.map(Number), .filter(Boolean)): the
    conversion, as an arrow (v) => Number(v). Elsewhere (type: Number in a Swagger option, @Type(() => Date)):
@@ -7024,8 +7279,6 @@ static int super_calls; /* super(...) calls met while checking a constructor */
 
 /* ---- generics: function f<T>(x: T): T is a template; each list of types used makes an instance (parsed again
    with T bound, checked like any function, compiled on its own: no cost at run time) ---- */
-static Func **gen_work;
-static int ngen_work;
 static bool has_tparam(Type *t) {
     if (!t) return false;
     switch (t->kind) {
@@ -7082,6 +7335,13 @@ static void unify(Type *pat, Type *got, Func *tmpl, Type **bind) {
             if (pm->kind == TY_PROMISE) unify(pm->elem, g, tmpl, bind);
             else if (pm->kind == TY_TPARAM) unify(pm, g, tmpl, bind);
         }
+        /* Partial<Observer<T>> | ((value: T) => void) given a function: T from the function member (given an object:
+           from the object members, field by field) */
+        int nf = 0, fi = -1;
+        for (int m = 0; m < pat->nparams; m++) if (pat->params[m]->kind == TY_FUNC) { nf++; fi = m; }
+        if (got->kind == TY_FUNC && nf == 1) unify(pat->params[fi], got, tmpl, bind);
+        else if (got->kind == TY_OBJECT)
+            for (int m = 0; m < pat->nparams; m++) if (pat->params[m]->kind == TY_OBJECT) unify(pat->params[m], got, tmpl, bind);
         return;
     }
     if (pat->kind == TY_PROMISE && got->kind != TY_PROMISE) { unify(pat->elem, got, tmpl, bind); return; } /* () => Promise<T> against an async function's R */
@@ -7162,6 +7422,8 @@ static Func *instantiate_func(Func *tmpl, Type **args) {
     for (int i = 0; i < tmpl->ninstances; i++) if (strcmp(tmpl->inst_keys[i], key.data) == 0) { free(key.data); return tmpl->instances[i]; }
     Func *inst = xs_parse_instance(tmpl, args);
     inst->cname = xs_sprintf("%s_g%d", tmpl->cname, tmpl->ninstances);
+    inst->inst_args = xs_alloc(sizeof(Type *) * (size_t)tmpl->ntparams);
+    memcpy(inst->inst_args, args, sizeof(Type *) * (size_t)tmpl->ntparams);
     tmpl->instances = realloc(tmpl->instances, sizeof(Func *) * (size_t)(tmpl->ninstances + 1));
     tmpl->inst_keys = realloc(tmpl->inst_keys, sizeof(char *) * (size_t)(tmpl->ninstances + 1));
     tmpl->instances[tmpl->ninstances] = inst;
@@ -7249,6 +7511,7 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
         bool arrow = e->args.items[i]->kind == E_ARROW;
         if (arrow != (pass == 1)) continue;
         Type *pt = tmpl->params[i].type, *ctx = NULL;
+        if (arrow && pt->kind == TY_NULLABLE && pt->elem->kind == TY_UNION) pt = pt->elem; /* (cb?: Obs<T> | ((v: T) => void)) */
         if (arrow && pt->kind == TY_UNION) { /* trabalho: Promise<T> | ((sinal: S) => Promise<T>) given an arrow: its function type */
             Type *fm = NULL;
             int nf = 0;
@@ -7292,8 +7555,48 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
                 cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
             }
         }
+        Expr *ol = e->args.items[i]->kind == E_OBJLIT ? e->args.items[i] : NULL;
+        int oln = ol ? ol->args.len : 0;
+        bool olnull = false; /* ({ a: 1, b: null }) */
+        for (int k = 0; k < oln; k++) if (ol->args.items[k]->kind == E_NULL) olnull = true;
+        Type *rp0 = ty_strip_null(tmpl->params[i].type);
+        if (olnull && !ctx && rp0->kind == TY_MAP && rp0->record && rp0->elem->kind == TY_TPARAM) {
+            /* ({ a: 1, b: null }) where Record<string, T> goes: T from the values that are not null, made nullable, and
+               the literal checked as that Record */
+            for (int k = 0; k < oln; k++) {
+                Expr *v = ol->args.items[k];
+                if (v->kind == E_NULL) continue;
+                check_expr(v, NULL);
+                settle(v);
+                if (v->type->kind != TY_NULL) unify(rp0->elem, v->type->kind == TY_INT && v->kind != E_NUMBER ? ty_number : v->type, tmpl, bind);
+            }
+            Type *sb = NULL;
+            for (int k = 0; k < tmpl->ntparams; k++)
+                if (bind[k] && !strcmp(tmpl->tparams[k], rp0->elem->tname)) {
+                    if (bind[k]->kind != TY_NULLABLE && bind[k]->kind != TY_UNKNOWN) bind[k] = ty_nullable_of(bind[k]);
+                    sb = xs_alloc(sizeof *sb);
+                    *sb = *rp0;
+                    sb->elem = bind[k];
+                }
+            if (sb && !has_tparam(sb)) {
+                for (int k = 0; k < oln; k++) if (ol->args.items[k]->kind != E_NULL) ol->args.items[k]->prechecked = true;
+                Module *dm = tmpl->cls ? tmpl->cls->mod : tmpl->mod;
+                Module *was = cur_mod;
+                Scope *ss = scope;
+                const char *sfn = xs_file_name, *ssrc = xs_source;
+                if (dm && dm != cur_mod) enter_module(dm);
+                ctx = resolve(sb, e->pos);
+                cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
+            }
+        }
         check_expr(e->args.items[i], ctx);
         done[i] = true;
+        Type *at = e->args.items[i]->type, *rp = ty_strip_null(tmpl->params[i].type);
+        if (ol && !ctx && rp->kind == TY_MAP && rp->record && at && at->kind == TY_OBJECT && at->cls && at->cls->nfields == oln) {
+            /* f({ a: 1, b: 2 }) with o: Record<string, T>: T from the literal's values, as TypeScript infers it */
+            for (int k = 0; k < oln; k++) unify(rp->elem, at->cls->fields[k].type, tmpl, bind);
+            continue;
+        }
         unify(arrow ? pt : tmpl->params[i].type, e->args.items[i]->type, tmpl, bind);
     }
     if (expected && tmpl->ret && has_tparam(tmpl->ret) && !ty_is_any(expected) && expected->kind != TY_UNKNOWN && expected->kind != TY_VOID)
@@ -7456,6 +7759,21 @@ static void check_object_member(Expr *e, Class *c) {
         }
     }
 }
+/* e becomes v (a union, checked) seen as its member t: an unchecked conversion; a function returning a primitive is held
+   in the union returning it boxed (to_unknown), so it is read back through an adapter that unboxes the result */
+static void fn_adapt(Expr *e, Expr *x, Type *ft, Type *ret, Type *unbox);
+static void union_member_read(Expr *e, Expr *v, Type *t) {
+    memset(e, 0, sizeof *e);
+    e->kind = E_AS; e->op = TK_DOT; e->pos = v->pos; e->lhs = v; e->field = -1;
+    e->type = t; e->elem_type = t;
+    if (t->kind == TY_FUNC && t->ret && !ty_is_heap(t->ret) && t->ret->kind != TY_VOID && t->ret->kind != TY_UNKNOWN && !t->async_ret) {
+        Type *g = ty_func(t->params, t->nparams, ty_unknown);
+        Expr *x = expr_copy(e);
+        x->type = g; x->elem_type = g;
+        x->prechecked = true;
+        fn_adapt(e, x, g, t->ret, t->ret);
+    }
+}
 static void check_object_member_in(Expr *e, Class *c) {
     Type *mexp = member_expected;
     member_expected = NULL;
@@ -7493,17 +7811,45 @@ static void check_object_member_in(Expr *e, Class *c) {
     Field *f = find_field(c, e->str, &idx);
     bool null_fn = f && e->is_call && e->opt_call && f->type->kind == TY_NULLABLE && f->type->elem->kind == TY_FUNC;
     bool narrowed_fn = f && e->is_call && !e->opt_call && f->type->kind == TY_NULLABLE && f->type->elem->kind == TY_FUNC && tsc_checked();
-    if (f && e->is_call && (f->type->kind == TY_FUNC || null_fn || narrowed_fn)) { /* obj.run(x) where run is a function-valued field (obj.run?.(x): may be null) */
-        Type *ft = f->type->kind == TY_NULLABLE ? f->type->elem : f->type;
+    bool path_nn = false;
+    Type *ufn = NULL; /* o.message(a) after typeof o.message === "function": the function member */
+    if (f && e->is_call && !e->opt_call && ty_strip_null(f->type)->kind == TY_UNION && !c->builtin) {
+        Expr probe = {.kind = E_MEMBER, .pos = e->pos, .lhs = e->lhs, .field = idx, .type = f->type, .cls = c, .str = e->str};
+        const char *key = upath_key(&probe);
+        Binding *pb = key ? lookup(key) : NULL;
+        if (pb && pb->union_narrow && pb->type->kind == TY_FUNC) ufn = pb->type;
+    }
+    if (f && e->is_call && !e->opt_call && !narrowed_fn && f->type->kind == TY_NULLABLE && f->type->elem->kind == TY_FUNC && !c->builtin) {
+        /* if (o.next) o.next(v): the path o.next narrowed to not null by the test */
+        Expr probe = {.kind = E_MEMBER, .pos = e->pos, .lhs = e->lhs, .field = idx, .type = f->type, .cls = c, .str = e->str};
+        const char *key = path_key(&probe);
+        Binding *pb = key ? lookup(key) : NULL;
+        narrowed_fn = path_nn = pb && pb->type->kind != TY_NULLABLE;
+    }
+    if (f && e->is_call && (f->type->kind == TY_FUNC || null_fn || narrowed_fn || ufn)) { /* obj.run(x) where run is a function-valued field (obj.run?.(x): may be null) */
+        Type *ft = ufn ? ufn : f->type->kind == TY_NULLABLE ? f->type->elem : f->type;
         Expr *fld = expr_copy(e);
         fld->is_call = false;
         fld->args.len = 0;
         fld->args.items = NULL;
         fld->field = idx;
         fld->type = null_fn ? f->type : ft;
-        if (!null_fn && f->type->kind == TY_NULLABLE) { /* this.f(x) after if (this.f): tsc narrowed it; read as this.f! */
+        if (ufn) { /* (the field read as its narrowed member: a checked conversion, as every narrowed path's read) */
             fld->type = f->type;
-            nonnull_checked(fld, xs_sprintf("'%s'", f->name));
+            fld->cls = c;
+            if (f->type->kind == TY_NULLABLE) { /* (this.h: A | B | null, tested against null first: read as this.h!) */
+                Expr *in = expr_copy(fld);
+                memset(fld, 0, sizeof *fld);
+                fld->kind = E_AS; fld->op = TK_NOT; fld->pos = in->pos; fld->lhs = in; fld->field = -1; fld->type = in->type->elem;
+            }
+            upath_read(fld);
+        } else if (!null_fn && f->type->kind == TY_NULLABLE) { /* this.f(x) after if (this.f): tsc narrowed it; read as this.f! */
+            fld->type = f->type;
+            if (path_nn) { /* (narrowed by xisto too: the same checked read, no warning) */
+                Expr *in = expr_copy(fld);
+                memset(fld, 0, sizeof *fld);
+                fld->kind = E_AS; fld->op = TK_NOT; fld->pos = in->pos; fld->lhs = in; fld->field = -1; fld->type = in->type->elem;
+            } else nonnull_checked(fld, xs_sprintf("'%s'", f->name));
         }
         e->kind = E_CALL;
         e->lhs = fld;
@@ -7540,6 +7886,7 @@ static void check_object_member_in(Expr *e, Class *c) {
         e->field = idx;
         e->type = f->type;
         e->cls = c;
+        if (e->type->kind == TY_UNION) { upath_read(e); return; } /* narrowed by o.f.kind === "a" (XB-146) */
         if (e->type->kind == TY_NULLABLE) { /* narrowed by o.f !== null: read as o.f! (checked) */
             const char *key = path_key(e);
             Binding *pb = key ? lookup(key) : NULL;
@@ -7554,6 +7901,7 @@ static void check_object_member_in(Expr *e, Class *c) {
                 e->field = -1;
                 e->type = inner->type->elem;
             }
+            if (ty_strip_null(e->type)->kind == TY_UNION) upath_read(e); /* (this.h: A | B | null, narrowed by typeof too) */
         }
         return;
     }
@@ -7665,6 +8013,29 @@ static void check_object_member_in(Expr *e, Class *c) {
         xs_error(XS2010, e->pos, NULL, "cannot check %s at run time", ty_name(cast_to));
 }
 
+/* a fetch that may be https: TLS joins the program when this code can run (XB-232). Top-level code runs; a
+   function's fetch counts when prune finds the function reachable (an arrow's: the function it is written in) */
+static void tls_site(void) {
+    Func *f = cur_func;
+    for (int guard = 0; f && f->outer_fn && guard < 256; guard++) f = f->outer_fn;
+    if (!f) { prog->uses_tls = true; return; }
+    for (int i = 0; i < prog->ntls_fns; i++) if (prog->tls_fns[i] == f) return;
+    prog->tls_fns = realloc(prog->tls_fns, sizeof(Func *) * (size_t)(prog->ntls_fns + 1));
+    prog->tls_fns[prog->ntls_fns++] = f;
+}
+/* XB-250: code that needs runtime/xisto_net.h (timers, fetch, servers, workers...): the network runtime, its event loop
+   and the cleanup stack join the program when prune finds the function it is written in reachable, so a function
+   nobody calls (an imported module's) costs nothing; at top level, at once */
+static void rt_site(Func *f, bool *flag, Func ***fns, int *n) {
+    for (int guard = 0; f && f->outer_fn && guard < 256; guard++) f = f->outer_fn;
+    if (!f) { *flag = true; return; }
+    for (int i = 0; i < *n; i++) if ((*fns)[i] == f) return;
+    *fns = realloc(*fns, sizeof(Func *) * (size_t)(*n + 1));
+    (*fns)[(*n)++] = f;
+}
+static void net_site(void) { rt_site(cur_func, &prog->uses_net, &prog->net_fns, &prog->nnet_fns); }
+/* the coroutines (generators, async code, promises: uses_gen) the same way */
+static void gen_site(Func *f) { rt_site(f, &prog->uses_gen, &prog->gen_fns, &prog->ngen_fns); }
 /* The scheme of a fetch URL when it is known at compile time: 1 https, 0 http, -1 only known at run time.
    Looks at the leading literal of "...", `...${x}` and "..." + x. */
 static int url_scheme(Expr *u) {
@@ -8862,7 +9233,9 @@ static bool early_global(const char *name) {
         bool here = s->mod == cur_mod;
         const char *st = strstr(name, "__s_"); /* (Dec.ZERO: Dec__s_ZERO, imported with Dec) */
         const char *iname = st ? xs_strndup(name, (size_t)(st - name)) : name;
-        if (!here && !(cur_mod && imports_name(cur_mod, s->mod, iname) && (s->exported || st))) continue;
+        bool fdeco = !strncmp(name, "__xs_fdeco_", 11); /* (a class's field decorators, run on the copies of a mapped type in
+                                                           another module: named with its module's id, read from anywhere) */
+        if (!here && !fdeco && !(cur_mod && imports_name(cur_mod, s->mod, iname) && (s->exported || st))) continue;
         if (s->top_state != 0) { /* checked already (a module that imports this one in a cycle bound its imports first) */
             if (here) continue;
             for (Binding *b = mod_scopes[s->mod->id]->head; b; b = b->next)
@@ -8870,7 +9243,7 @@ static bool early_global(const char *name) {
                     Binding *alias = xs_alloc(sizeof *alias);
                     *alias = *b;
                     alias->origin = b;
-                    alias->is_const = true;
+                    alias->is_const = st ? b->is_const : true; /* (a static field stays assignable unless readonly: XB-228) */
                     Scope *ms = mod_scopes[cur_mod->id];
                     alias->next = ms->head;
                     ms->head = alias;
@@ -8904,7 +9277,7 @@ static bool early_global(const char *name) {
             Binding *alias = xs_alloc(sizeof *alias);
             *alias = *b;
             alias->origin = b;
-            alias->is_const = true;
+            alias->is_const = st ? b->is_const : true;
             Scope *ms = mod_scopes[cur_mod->id];
             alias->next = ms->head;
             ms->head = alias;
@@ -9510,6 +9883,10 @@ static void check_expr_in(Expr *e, Type *expected) {
             check_expr(e->lhs, expected);
         }
         pr_awaited = was;
+        if (e->lhs->kind == E_CALL && !e->lhs->builtin.cfn && pv_can(e->lhs->func)) { /* (XB-231: pv_more) */
+            pv_awaits = realloc(pv_awaits, sizeof(Expr *) * (size_t)(npv_awaits + 1));
+            pv_awaits[npv_awaits++] = e;
+        }
         if (e->lhs->type->kind == TY_PROMISE) pr_await(e->lhs); /* a promise kept: its value */
         else if (e->lhs->type->kind == TY_NULLABLE && e->lhs->type->elem->kind == TY_PROMISE) { /* await of a Promise<T> | null: null gives null */
             Type *t = e->lhs->type->elem->elem;
@@ -9663,14 +10040,19 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (b->union_narrow && b->type->kind != TY_UNION) { /* seen as one member: read through an (unchecked) conversion */
             Expr *v = expr_copy(e);
             v->type = b->orig;
-            memset(e, 0, sizeof *e);
-            e->kind = E_AS;
-            e->pos = v->pos;
-            e->lhs = v;
-            e->op = TK_DOT;
-            e->type = b->type;
-            e->elem_type = b->type;
-            e->field = -1;
+            /* (a variable in a cell, or a module variable a function assigns: a call made since the test may have assigned
+               another member, as TypeScript does not look; the read is checked, a TypeError then, as a field path's) */
+            /* (x: Shape, an interface or a base class, narrowed by x instanceof Sq: read as x as Sq) */
+            Type *ob = b->orig && b->orig->kind == TY_NULLABLE ? b->orig->elem : b->orig;
+            if (b->orig && b->type->kind == TY_OBJECT && (((b->cell || b->fn_assigned) && b->orig->kind == TY_UNION) ||
+                                                          (ob->kind == TY_OBJECT && ob->cls && !ob->cls->builtin))) {
+                v->prechecked = true;
+                memset(e, 0, sizeof *e);
+                e->kind = E_AS; e->pos = v->pos; e->lhs = v; e->field = -1; e->elem_type = b->type;
+                check_expr(e, NULL);
+                return;
+            }
+            union_member_read(e, v, b->type);
         }
         return;
     }
@@ -9686,6 +10068,12 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
             Type *b = t->kind == TY_NULLABLE ? t->elem : t;
+            if (b->kind == TY_JSON) { /* an `object` holds any JSON value: typeof says what its text holds (getResponse() of a
+                                         Nest exception made with a string is one: typeof r === "string") */
+                e->builtin.cfn = "xs_json_typeof";
+                e->type = ty_string;
+                return;
+            }
             const char *v = is_big(b) ? "bigint" : b->kind == TY_OBJECT && b->cls->builtin && strcmp(b->cls->name, "symbol") == 0 ? "symbol" : b->kind == TY_STRING || (b->kind == TY_ENUM && b->en->is_string) ? "string"
                           : is_numeric(b) || b->kind == TY_ENUM ? "number" : b->kind == TY_BOOLEAN ? "boolean" : b->kind == TY_FUNC ? "function"
                           : b->kind == TY_OBJECT && b->cls->mod && b->cls->mod->file && !strcmp(b->cls->mod->file, "xisto:reflect") && !strcmp(b->cls->name, "ClassInfo")
@@ -10002,6 +10390,9 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (!c || c->is_interface) xs_error(XS9010, e->rhs->pos, "instanceof tests classes (interfaces have no run-time identity)", "'%s' is not a class", e->rhs->str);
             if (c && c->builtin && strcmp(c->name, "RegExp") == 0) prog->uses_regex = true; /* (the test reads xs_RegExp_free) */
             if (!ty_is_heap(e->lhs->type)) xs_error(XS8108, e->lhs->pos, NULL, "instanceof needs an object, but this is %s", ty_name(e->lhs->type));
+            if (c && ty_strip_null(e->lhs->type)->kind == TY_JSON) /* (an object is JSON data: the class is gone) */
+                xs_error(XS8150, e->pos, xs_sprintf("keep the class: declare the value as %s (or a union of classes), or as unknown to check it at run time", c->name),
+                         "'instanceof' on an 'object' is always false: an object holds a copy of the data, not the %s object", c->name);
             e->rhs->cls = c;
             e->rhs->type = ty_object_of(c);
             e->type = ty_boolean;
@@ -10148,6 +10539,18 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         case TK_EQ: case TK_NEQ: {
             if (e->loose) check_loose_eq(e); /* == / !=: the same as === / !== when nothing would be converted */
+            for (int side = 0; side < 2; side++) { /* f(k) === p, p a promise: f's promise (XB-231), as in JavaScript */
+                Expr *c = side ? e->rhs : e->lhs, *o = side ? e->lhs : e->rhs;
+                Type *ot = ty_strip_null(o->type);
+                if (ot->kind == TY_PROMISE && pr_async_call(c) && c->type && (ty_equal(c->type, ot->elem) || ot->elem->kind == TY_VOID) &&
+                    !(c->func && c->func->ret_maybe_sync))
+                    pr_spawn(c);
+            }
+            if (ty_strip_null(e->lhs->type)->kind == TY_PROMISE && ty_strip_null(e->rhs->type)->kind == TY_PROMISE) {
+                e->type = ty_boolean; /* (two promises: the same one; a call's promise is a temporary, let go after) */
+                e->builtin.cfn = "ref_eq";
+                return;
+            }
             /* objects, arrays and functions compare by reference (the same object), as in JS; T | null too */
             Type *lt = e->lhs->type->kind == TY_NULLABLE ? e->lhs->type->elem : e->lhs->type;
             Type *rt = e->rhs->type->kind == TY_NULLABLE ? e->rhs->type->elem : e->rhs->type;
@@ -10295,6 +10698,17 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     case E_ASSIGN:
     case E_POSTFIX: {
+        if (e->lhs && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->str && e->lhs->lhs && e->lhs->lhs->kind == E_IDENT &&
+            !lookup(e->lhs->lhs->str)) { /* B.count = v (or this.count++ in a static method B inherits) with count a static of a base A:
+                                            JavaScript makes B a property of its own there, which xisto's one variable per static is not */
+            Class *sc = find_class(e->lhs->lhs->str);
+            if (sc && !sc->builtin && !has_static(sc, e->lhs->str))
+                for (Class *b = sc->base; b && !b->builtin; b = b->base) {
+                    if (!has_static(b, e->lhs->str)) continue;
+                    xs_error(XS8151, e->lhs->pos, xs_sprintf("write it through the class that declares it: %s.%s", b->name, e->lhs->str),
+                             "%s.%s is a static field of %s: writing it through %s would give %s a field of its own", sc->name, e->lhs->str, b->name, sc->name, sc->name);
+                }
+        }
         {   /* d[CONTADOR[motivo]]++ with the key a union of d's field names: that field's ++ */
             const char **names; int n;
             if (e->lhs && e->lhs->kind == E_INDEX && (!e->rhs || pure_read(e->rhs)) && lit_key_fields(e->lhs, &names, &n)) {
@@ -10385,6 +10799,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         Expr *target = e->lhs;
         bool dyn_target = false;
+        int peeled = cast_peel(target); /* ((t as unknown as { name: string }).name = v: t.name = v) */
         if (target->kind == E_INDEX && target->lhs && target->rhs && rereadable(target->lhs) &&
             (target->rhs->kind == E_STRING || (target->rhs->kind == E_IDENT && const_string_of(target->rhs->str)))) {
             /* req[AUDIT_CONTEXT_KEY] = v with a key known when compiling: the property of that name (an open class's
@@ -10526,7 +10941,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             }
         }
         const char *path_assigned = NULL; /* o.f = v: the field path, narrowed or not by what v is */
-        if (e->kind == E_ASSIGN && target->kind == E_MEMBER && !target->is_call && (rereadable(target->lhs) || e->op == TK_ASSIGN) &&
+        if (e->kind == E_ASSIGN && target->kind == E_MEMBER && !target->is_call && (rereadable(target->lhs) || e->op == TK_ASSIGN || cast_path(target->lhs)) &&
             !(target->lhs->kind == E_IDENT && !lookup(target->lhs->str))) { /* obj.x = v with set x(v) (not Class.static); (u as C).x = v
                                                                                 (read once: no getter call, so any receiver) */
             check_expr(target->lhs, NULL);
@@ -10571,7 +10986,10 @@ static void check_expr_in(Expr *e, Type *expected) {
         if (ub && ub->union_narrow) { target->type = ub->orig; target->cname = ub->cname; } /* x = ...: the union again */
         else {
             dyn_lvalue = target;
+            bool was_gen = checking_generated;
+            if (peeled == 2) checking_generated = true;
             check_expr(target, NULL);
+            checking_generated = was_gen;
             dyn_lvalue = NULL;
             /* o.f = v with o.f narrowed: the target is the field itself, not its checked read (inner reads, as
                the n.next of n.next.next = v, stay checked reads) */
@@ -10585,6 +11003,12 @@ static void check_expr_in(Expr *e, Type *expected) {
             for (Binding *o = b; o; o = o->origin) if (o->lit_number) widen_rhs = true;
             if (strncmp(b->cname, "env->", 5) == 0)
                 xs_error(XS8085, e->pos, "arrow functions capture by value; keep the state in an object or array and change that", "cannot assign to '%s', captured from the enclosing function", target->str);
+            const char *sst = b->is_const && !target->boolean ? strstr(target->str, "__s_") : NULL;
+            if (sst) { /* Class.x = v with x a static readonly field (Class__s_x) */
+                const char *fe = strchr(sst + 4, '\x01');
+                xs_error(XS8087, e->pos, "remove readonly from the field if it changes", "cannot assign to '%.*s.%.*s': it is a readonly static field",
+                         (int)(sst - target->str), target->str, fe ? (int)(fe - sst - 4) : (int)strlen(sst + 4), sst + 4);
+            }
             if (b->is_const && !target->boolean) xs_error(XS8087, e->pos, "declare it with 'let' if it changes", "cannot assign to constant '%s'", target->str);
             if (b->is_param && ty_is_heap(b->type))
                 xs_error(XS8099, e->pos, "copy it into a local first: let s: string = param;", "cannot reassign parameter '%s' of reference type", target->str);
@@ -10628,9 +11052,11 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (e->op != TK_ASSIGN && e->op != TK_PLUS_ASSIGN && e->op != TK_MINUS_ASSIGN && e->op != TK_STAR_ASSIGN && e->op != TK_SLASH_ASSIGN)
                 xs_error(XS8122, e->pos, NULL, "%s is not supported on an Int32Array element", tok_kind_name(e->op));
             e->type = e->op == TK_ASSIGN ? e->rhs->type : (e->rhs->type->kind == TY_NUMBER || e->op == TK_SLASH_ASSIGN) ? ty_number : ty_int;
-            if (narrowed) unnarrow(narrowed);
+            if (narrowed) assign_unnarrow(narrowed);
             return;
         }
+        Expr *assigned_lit = e->op == TK_ASSIGN && e->rhs->kind == E_OBJLIT ? e->rhs : NULL; /* (read before it is checked) */
+        if (assigned_lit) { Expr *c = xs_alloc(sizeof *c); *c = *assigned_lit; assigned_lit = c; }
         check_expr(e->rhs, target->type);
         if (e->op != TK_ASSIGN && is_big(target->type)) { /* acc += x: acc = acc + x (a bigint is a value: a new one) */
             const char *f = big_op(e->op);
@@ -10659,7 +11085,8 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->rhs = bin;
             e->op = TK_ASSIGN;
             e->type = target->type;
-            if (narrowed) unnarrow(narrowed);
+            if (narrowed) assign_unnarrow(narrowed);
+            upath_invalidate(target);
             return;
         }
         if (tk_bitop_of_assign(e->op)) { /* x &= m: x must hold the int result */
@@ -10687,7 +11114,19 @@ static void check_expr_in(Expr *e, Type *expected) {
             dyn_wrap(e->rhs, "xs_dyn_str", ty_string); /* s += x with x an any: String(x), as s = s + x (a Buffer: its text) */
         expect_type(e->rhs, target->type, e->op == TK_ASSIGN ? "assigned value" : "right side of compound assignment");
         e->type = target->type;
-        if (narrowed) unnarrow(narrowed);
+        if (narrowed) assign_unnarrow(narrowed);
+        upath_invalidate(target);
+        if (target->kind == E_IDENT && e->op == TK_ASSIGN && (assigned_lit || (e->rhs->type && e->rhs->type->kind == TY_OBJECT))) {
+            /* r = { kind: "ok", ... } with r: Ok | Err: r is the Ok from here on, as TypeScript narrows by assignment */
+            Binding *b = lookup(target->str);
+            Type *u = b ? b->type : NULL;
+            if (u && u->kind == TY_UNION && !b->cell && !b->fn_assigned && strncmp(b->cname, "env->", 5) != 0) {
+                Type *m = assigned_lit ? objlit_member(u, assigned_lit) : NULL;
+                for (int i = 0; !m && i < u->nparams; i++)
+                    if (ty_equal(u->params[i], e->rhs->type)) m = u->params[i];
+                if (m) shadow_union(b, m);
+            }
+        }
         if (target->kind == E_IDENT && e->op == TK_ASSIGN && e->rhs->type->kind != TY_NULLABLE && e->rhs->type->kind != TY_NULL &&
             e->rhs->kind != E_NULL && !ty_is_any(e->rhs->type) && e->rhs->type->kind != TY_UNKNOWN) {
             /* as TypeScript: after x = <not null>, x is not null (until it is assigned again) */
@@ -10774,8 +11213,17 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
         }
+        bool lhs_done = false;
+        if (e->lhs->kind == E_IDENT && e->lhs->str && !lookup_func(e->lhs->str)) {
+            /* x() with x: number | (() => number) narrowed to the function: held in the union returning its result boxed,
+               so it is called through the read that unboxes it (union_member_read) */
+            Binding *ub = lookup(e->lhs->str);
+            Type *t = ub && ub->union_narrow ? ub->type : NULL;
+            if (t && t->kind == TY_FUNC && t->ret && !ty_is_heap(t->ret) && t->ret->kind != TY_VOID && t->ret->kind != TY_UNKNOWN && !t->async_ret)
+                { check_expr(e->lhs, NULL); lhs_done = true; }
+        }
         if (e->lhs->kind != E_IDENT) { /* (() => ...)(), f(a)(b): the function value an expression gives */
-            check_expr(e->lhs, NULL);
+            if (!lhs_done) check_expr(e->lhs, NULL);
             Type *ft = e->lhs->type;
             if (ft->kind == TY_NULLABLE && ft->elem->kind == TY_FUNC && tsc_checked()) { /* F[k](v) with F a Record of functions */
                 nonnull_checked(e->lhs, "the called function");
@@ -10899,7 +11347,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     expect_type(e->args.items[0], cbt, "callback of setImmediate");
                     e->type = ty_int;
                     e->builtin.cfn = "xs_set_immediate";
-                    prog->uses_net = true;
+                    net_site();
                     return;
                 }
             }
@@ -10910,7 +11358,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 expect_type(e->args.items[0], cbt, xs_sprintf("callback of %s", name));
                 e->type = ty_void;
                 e->builtin.cfn = name[0] == 'q' ? "xs_queue_microtask" : "xs_next_tick";
-                prog->uses_net = true;
+                net_site();
                 return;
             }
             if (strcmp(name, "__xs_cmp16") == 0 && e->args.len == 2 && !lookup_func(name)) {
@@ -10948,7 +11396,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (at->kind != TY_ARRAY || at->elem->kind != TY_PROMISE) xs_error(XS7033, e->pos, NULL, "internal: __xs_promises_handled takes an array of promises");
                 e->type = ty_void;
                 e->builtin.cfn = "xs_promises_handled";
-                prog->uses_net = true;
+                net_site();
                 return;
             }
             if (strcmp(name, "clearImmediate") == 0) name = "clearTimeout";
@@ -10962,7 +11410,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 expect_type(e->args.items[1], ty_number, "the delay");
                 e->type = ty_int;
                 e->builtin.cfn = name[3] == 'T' ? "xs_set_timeout" : "xs_set_interval";
-                prog->uses_net = true; /* timers live with the event loop */
+                net_site(); /* timers live with the event loop */
                 return;
             }
             if (strcmp(name, "clearTimeout") == 0 || strcmp(name, "clearInterval") == 0) {
@@ -10973,14 +11421,14 @@ static void check_expr_in(Expr *e, Type *expected) {
                     /* let timer: ReturnType<typeof setTimeout> | undefined: clearTimeout(timer) of none does nothing, as Node */
                     e->type = ty_void;
                     e->builtin.cfn = idt->elem->kind == TY_INT ? "xs_clear_timer_ni" : "xs_clear_timer_nn";
-                    prog->uses_net = true;
+                    net_site();
                     return;
                 }
                 if (e->args.items[0]->type->kind == TY_LITINT) coerce_lit(e->args.items[0], ty_number);
                 expect_type(e->args.items[0], ty_number, "the timer's id");
                 e->type = ty_void;
                 e->builtin.cfn = "xs_clear_timer";
-                prog->uses_net = true;
+                net_site();
                 return;
             }
             if (strcmp(name, "btoa") == 0 || strcmp(name, "atob") == 0) { /* base64 of a string of bytes (code points 0..255) */
@@ -11257,8 +11705,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                     if (generic) { /* options in a value or with spreads: xisto:url's __xs_fetch(url, init: RequestInit) */
                         int gscheme = url_scheme(e->args.items[0]); /* (TLS by this URL: __xs_fetch's own fetch does not decide it) */
                         if (gscheme == 1 && xs_tls_off) xs_error(XS7059, e->args.items[0]->pos, "remove --tls=off, or call the service over http://", "https URL, but the program is built with --tls=off");
-                        if (gscheme == 1 || (gscheme == -1 && !xs_tls_off)) prog->uses_tls = true;
-                        prog->uses_net = true;
+                        if (gscheme == 1 || (gscheme == -1 && !xs_tls_off)) tls_site();
+                        net_site();
                         Expr *callee = xs_alloc(sizeof *callee);
                         callee->kind = E_IDENT; callee->pos = e->pos; callee->field = -1; callee->str = "__xs_fetch";
                         e->lhs = callee;
@@ -11331,18 +11779,19 @@ static void check_expr_in(Expr *e, Type *expected) {
                     e->type = ty_object_of(fr);
                 }
                 e->builtin.cfn = "xs_fetch";
-                prog->uses_net = true;
+                net_site();
                 /* TLS is linked only when https can happen: an http:// URL (TLS ends at the load balancer) costs nothing */
                 int scheme = url_scheme(e->args.items[0]);
                 if (cur_mod && cur_mod->file && !strcmp(cur_mod->file, "xisto:url")) return; /* (__xs_fetch: its caller's URL decides TLS) */
                 if (scheme == 1 && xs_tls_off) xs_error(XS7059, e->args.items[0]->pos, "remove --tls=off, or call the service over http://", "https URL, but the program is built with --tls=off");
-                if (scheme == 1 || (scheme == -1 && !xs_tls_off)) prog->uses_tls = true;
+                if (scheme == 1 || (scheme == -1 && !xs_tls_off)) tls_site();
                 return;
             }
         }
         Func *f = assert_func_overload(e, crypto_func_overload(e, lookup_func(name)));
         if (!f) {
             Binding *b = lookup(name);
+            if (!b && !strncmp(name, "__xs_fdeco_", 11) && early_global(name)) b = lookup(name); /* (see early_global) */
             if (b && b->type->kind == TY_FUNC) { /* calling a function value */
                 Type *ft = b->type;
                 e->lhs->type = ft;
@@ -11477,7 +11926,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         e->func = f;
         e->type = fret(f, e->pos);
         if (f->noverloads && tsc_checked() && overload_typed(e, f, &ov_args)) return;
-        if (f->mod && f->mod->builtin && strcmp(f->cname, "xs_sleep_ms") == 0) prog->uses_net = true; /* timers live with the event loop */
+        if (f->mod && f->mod->builtin && strcmp(f->cname, "xs_sleep_ms") == 0) net_site(); /* timers live with the event loop */
         return;
     }
     case E_INDEX:
@@ -11639,6 +12088,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->field = (int)k;
             e->cls = tc;
             e->type = tc->fields[k].type;
+            if (e->type->kind == TY_UNION) upath_read(e); /* if (t[0].ok) t[0].value (XB-146) */
             return;
         }
         if (e->lhs->type->kind == TY_STRING && tsc_checked()) { /* s[i] with --tsc-checked: s.charAt(i) ('' past the end, where JavaScript gives undefined) */
@@ -11654,7 +12104,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             return;
         }
         if (e->lhs->type->kind == TY_STRING)
-            xs_error(XS6033, e->pos, "use s.slice(i, i + 1)", "strings cannot be indexed in xisto-2");
+            xs_error(XS6033, e->pos, "use s.charAt(i) ('' past the end) or s.slice(i, i + 1), or build with --tsc-checked", "strings cannot be indexed: s[i] past the end is undefined, which xisto does not have");
         if (is_bytes(e->lhs->type)) { /* b[i]: a byte, as an int (bounds checked) */
             expect_type(e->rhs, ty_int, "byte index");
             e->builtin.cfn = "xs_u8_get";
@@ -11689,6 +12139,13 @@ static void check_expr_in(Expr *e, Type *expected) {
         e->type = e->lhs->type->elem;
         return;
     case E_MEMBER:
+        if (cast_peel(e) == 2) {
+            bool was = checking_generated; /* (a private field too: TypeScript checks nothing through the cast) */
+            checking_generated = true;
+            check_expr(e, expected);
+            checking_generated = was;
+            return;
+        }
         if (fn_member(e, expected)) return; /* f.bind(t), o.m.call(t, a), f.name, f.length (a function value) */
         if (!e->is_call && e->str && !strcmp(e->str, "prototype") && e->lhs && e->lhs->kind == E_IDENT && !strcmp(e->lhs->str, "Object") &&
             !lookup("Object") && tsc_checked() && prog->uses_plain) { /* proto === Object.prototype: the mark of a plain object (see check_var) */
@@ -11781,6 +12238,28 @@ static void check_expr_in(Expr *e, Type *expected) {
             expr_list_push(&e->args, f);
             expr_list_push(&e->args, self);
             expr_list_push(&e->args, args);
+            check_expr(e, expected);
+            return;
+        }
+        if (e->is_call && e->str && !strcmp(e->str, "call") && e->args.len >= 1 && e->lhs && e->lhs->kind == E_IDENT &&
+            !lookup_func(e->lhs->str) && lookup(e->lhs->str) && lookup(e->lhs->str)->type &&
+            ty_strip_null(lookup(e->lhs->str)->type)->kind == TY_FUNC && ty_strip_null(lookup(e->lhs->str)->type)->rest) {
+            /* original.call(this, a, b) of a function value of (...args): __xs_apply(original, this, [a, b]) (XB-107) */
+            Expr *f = e->lhs, *self = e->args.items[0];
+            Expr *arr = xs_alloc(sizeof *arr);
+            arr->kind = E_ARRAY_LIT; arr->pos = e->pos; arr->field = -1;
+            for (int i = 1; i < e->args.len; i++) {
+                Expr *a = e->args.items[i];
+                if (a->kind == E_UNARY && a->op == TK_ELLIPSIS) arr->spread = true;
+                expr_list_push(&arr->args, a);
+            }
+            memset(e, 0, sizeof *e);
+            e->kind = E_CALL; e->pos = f->pos; e->field = -1;
+            e->lhs = xs_alloc(sizeof *e->lhs);
+            e->lhs->kind = E_IDENT; e->lhs->pos = f->pos; e->lhs->field = -1; e->lhs->str = "__xs_apply";
+            expr_list_push(&e->args, f);
+            expr_list_push(&e->args, self);
+            expr_list_push(&e->args, arr);
             check_expr(e, expected);
             return;
         }
@@ -11922,6 +12401,36 @@ static void check_expr_in(Expr *e, Type *expected) {
                         chain = cd;
                     }
                     if (!any_at) break;
+                }
+                *e = *chain;
+                check_expr(e, expected);
+                return;
+            }
+            bool members = ot->kind == TY_UNION;
+            for (int i = 0; members && i < ot->nparams; i++) {
+                Type *m = ot->params[i];
+                members = m->kind == TY_OBJECT && !m->cls->is_interface && !made_shape(m->cls) && !inline_cls(m);
+            }
+            if (members) { /* x.constructor.name with x: A | B: x instanceof A ? (x as A).constructor.name : ... (each member's
+                              own chain, its subclasses first) */
+                Expr *chain = NULL;
+                for (int i = ot->nparams - 1; i >= 0; i--) {
+                    Expr *as = xs_alloc(sizeof *as);
+                    as->kind = E_AS; as->pos = e->pos; as->field = -1; as->lhs = pure_copy(obj); as->elem_type = ot->params[i];
+                    Expr *ctor = xs_alloc(sizeof *ctor);
+                    ctor->kind = E_MEMBER; ctor->pos = e->pos; ctor->field = -1; ctor->lhs = as; ctor->str = "constructor";
+                    Expr *nm = xs_alloc(sizeof *nm);
+                    nm->kind = E_MEMBER; nm->pos = e->pos; nm->field = -1; nm->lhs = ctor; nm->str = "name";
+                    if (!chain) { chain = nm; continue; }
+                    Expr *id = xs_alloc(sizeof *id);
+                    id->kind = E_IDENT; id->pos = e->pos; id->field = -1; id->str = ot->params[i]->cls->name;
+                    Expr *io = xs_alloc(sizeof *io);
+                    io->kind = E_BINARY; io->pos = e->pos; io->field = -1; io->op = TK_IDENT; io->lhs = pure_copy(obj); io->rhs = id;
+                    Expr *cd = xs_alloc(sizeof *cd);
+                    cd->kind = E_COND; cd->pos = e->pos; cd->field = -1; cd->lhs = io;
+                    expr_list_push(&cd->args, nm);
+                    expr_list_push(&cd->args, chain);
+                    chain = cd;
                 }
                 *e = *chain;
                 check_expr(e, expected);
@@ -12202,6 +12711,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                    it has (an optional one left out is not there), read through its class's field table */
                 bool opt = false;
                 for (int i = 0; i < st->cls->nfields; i++) if (st->cls->fields[i].optional) opt = true;
+                if (st->cls->iface_base) opt = true; /* (an interface with methods: maybe a class's adapter, whose object has the
+                                                         fields of its own class: read at run time, XB-233) */
                 if (opt || strcmp(e->str, "keys") != 0) {
                     Expr *u = expr_copy(o);
                     to_unknown(u);
@@ -12300,11 +12811,19 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         if (e->lhs->kind == E_IDENT && !lookup(e->lhs->str)) {
             const char *ns = e->lhs->str;
-            Class *sc = find_class(ns);
+            Class *sc0 = find_class(ns), *sc = sc0;
             const char *nsq = strchr(ns, '\x01'); /* (ns.C.m with ns's C read as "C\x01m": C__s_m of that import, XB-223) */
+            if (sc && !sc->builtin && !has_static(sc, e->str)) /* B.m() with m a static of a base A: A's (JavaScript's prototype chain) */
+                for (Class *b = sc->base; b && !b->builtin; b = b->base) if (has_static(b, e->str)) { sc = b; break; }
             for (int k = 0; sc && !sc->builtin && k < sc->nstatics_user; k++) { /* Class.staticMember */
                 if (strcmp(sc->static_names[k], e->str) != 0) continue;
                 const char *gen = nsq ? xs_sprintf("%s%s", sc->static_gen[k], nsq) : sc->static_gen[k];
+                if (sc != sc0 && sc->static_is_method[k]) { /* inherited: called as is, or (it names `this`) its copy for sc0 */
+                    Func *sf = NULL;
+                    SYM_EACH(funcs_by_name, sc->static_gen[k], fe) { Func *g = fe->decl; if (g->static_of == sc) sf = g; }
+                    if (sf && sf->static_state) gen = static_copy(sf, sc0)->name;
+                    else if (nsq) gen = sc->static_gen[k]; /* (the base's own name: visible through the import of the class) */
+                }
                 if (sc->static_is_method[k]) {
                     if (!e->is_call) { /* Class.staticMethod as a value: the function it is lowered to */
                         e->kind = E_IDENT;
@@ -12324,7 +12843,31 @@ static void check_expr_in(Expr *e, Type *expected) {
                     check_expr(e, expected);
                     return;
                 }
-                if (e->is_call) xs_error(XS8051, e->pos, NULL, "'%s' is a static field of %s, not a method", e->str, sc->name);
+                if (e->is_call) { /* Class.hook(...) with a static field of function type: a call of its value */
+                    Expr *callee = xs_alloc(sizeof *callee);
+                    callee->kind = E_IDENT;
+                    callee->pos = e->pos;
+                    callee->str = (char *)gen;
+                    callee->field = -1;
+                    e->kind = E_CALL;
+                    e->lhs = callee;
+                    e->is_call = false;
+                    check_expr(e, expected);
+                    return;
+                }
+                if (sc->mod && cur_mod && sc->mod != cur_mod && !lookup(gen) && sc == static_this_class()) {
+                    /* this.x in a static method's copy for a subclass of another module: that module's variable */
+                    for (Binding *b = mod_scopes[sc->mod->id]->head; b; b = b->next)
+                        if (b->name && !strcmp(b->name, gen)) {
+                            Binding *alias = xs_alloc(sizeof *alias);
+                            *alias = *b;
+                            alias->origin = b;
+                            Scope *ms = mod_scopes[cur_mod->id];
+                            alias->next = ms->head;
+                            ms->head = alias;
+                            break;
+                        }
+                }
                 e->kind = E_IDENT;
                 e->str = (char *)gen;
                 e->lhs = NULL;
@@ -12612,6 +13155,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                 check_expr(e->args.items[0], ty_string);
                 if (e->args.items[0]->type->kind == TY_JSON) e->args.items[0]->type = ty_string; /* JSON text already */
                 expect_type(e->args.items[0], ty_string, "argument of JSON.parse");
+                if (!expected && e->builtin.cfn && !strcmp(e->builtin.cfn, "json_parse") && e->type) expected = e->type; /* (checked again:
+                    the copy an 'as' made, (o as Record<string, string>)["k"], keeps the type it was made for) */
                 if (!expected && tsc_checked()) expected = ty_any; /* TypeScript's JSON.parse gives any: the dynamic path */
                 if (!expected) xs_error(XS3003, e->pos, "write the type: const t: Todo = JSON.parse(text);", "JSON.parse needs to know the type it produces");
                 if (ty_is_any(expected)) { /* JSON.parse(text) as an any: Records, unknown[] and boxed values */
@@ -12649,7 +13194,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                     settle(e->args.items[i]);
                     Type *t = e->args.items[i]->type;
                     if (ty_is_undef(t)) { undef_text(e->args.items[i]); continue; } /* console.log(f()) with f(): undefined */
-                    if (t->kind == TY_VOID || t->kind == TY_FUNC)
+                    if (t->kind == TY_JSON) { from_json(e->args.items[i], ty_unknown); continue; } /* (an object: its JSON text read back, printed as the value) */
+                    if (t->kind == TY_VOID) /* (a function: [Function: f], as Node shows it) */
                         xs_error(XS8097, e->args.items[i]->pos, NULL, "cannot print a %s value", ty_name(t));
                 }
                 e->type = ty_void;
@@ -12690,7 +13236,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->cls = c;
                 e->type = fret(m, e->pos);
                 e->builtin.cfn = m->cname;
-                prog->uses_net = true;
+                if (net_class(c)) net_site();
                 return;
             }
         }
@@ -12867,7 +13413,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             check_expr(e, expected && expected->kind != TY_UNKNOWN ? expected : ty_any);
             return;
         }
-        if (e->lhs->type->kind == TY_UNION && e->is_call && e->str && rereadable(e->lhs)) {
+        if (e->lhs->type->kind == TY_UNION && e->is_call && e->str) {
             /* exec.query(sql) with exec: DataSource | EntityManager (Pick<A | B, 'query'>), every member a class with the
                method: called on the class the object has, exec instanceof A ? (exec as A).query(sql) : ... (one runs,
                so the arguments, copies of plain expressions, are evaluated once) */
@@ -12878,13 +13424,20 @@ static void check_expr_in(Expr *e, Type *expected) {
                 all = c && !c->builtin && !c->is_interface && find_method(c, e->str);
             }
             for (int i = 0; i < e->args.len && all; i++) all = branch_copy(e->args.items[i]) != NULL;
+            /* (pick().query(sql), xs[i].m(): the receiver evaluated once, the parameter of an arrow called in place:
+               ((__u) => __u instanceof A ? ... : ...)(pick()); async, its branches awaited, when the call is awaited) */
+            bool hoist = all && !rereadable(e->lhs);
+            static int nuh;
+            char *un = hoist ? xs_sprintf("__u%d", ++nuh) : NULL;
             if (all) {
                 bool awaited = pr_awaited == e;
                 Expr *chain = NULL;
+                Expr *recv = e->lhs;
+                if (hoist) { recv = xs_alloc(sizeof *recv); recv->kind = E_IDENT; recv->pos = e->lhs->pos; recv->field = -1; recv->str = un; }
                 for (int i = u->nparams - 1; i >= 0; i--) {
                     Class *c = u->params[i]->cls;
                     Expr *as = xs_alloc(sizeof *as);
-                    as->kind = E_AS; as->pos = e->pos; as->field = -1; as->lhs = pure_copy(e->lhs); as->elem_type = u->params[i];
+                    as->kind = E_AS; as->pos = e->pos; as->field = -1; as->lhs = pure_copy(recv); as->elem_type = u->params[i];
                     Expr *call = xs_alloc(sizeof *call);
                     call->kind = E_MEMBER; call->pos = e->pos; call->field = -1; call->is_call = true; call->str = e->str; call->lhs = as;
                     call->targs = e->targs; call->ntargs = e->ntargs;
@@ -12895,12 +13448,33 @@ static void check_expr_in(Expr *e, Type *expected) {
                     Expr *cn = xs_alloc(sizeof *cn);
                     cn->kind = E_IDENT; cn->pos = e->pos; cn->field = -1; cn->str = c->name;
                     Expr *io = xs_alloc(sizeof *io);
-                    io->kind = E_BINARY; io->op = TK_IDENT; io->pos = e->pos; io->field = -1; io->lhs = pure_copy(e->lhs); io->rhs = cn;
+                    io->kind = E_BINARY; io->op = TK_IDENT; io->pos = e->pos; io->field = -1; io->lhs = pure_copy(recv); io->rhs = cn;
                     Expr *cond = xs_alloc(sizeof *cond);
                     cond->kind = E_COND; cond->pos = e->pos; cond->field = -1; cond->lhs = io;
                     expr_list_push(&cond->args, br);
                     expr_list_push(&cond->args, chain);
                     chain = cond;
+                }
+                if (hoist) {
+                    Expr *arrow = thunk_of(chain);
+                    Func *f = arrow->arrow->fn;
+                    f->params = xs_alloc(sizeof(Param));
+                    f->params[0].name = un;
+                    f->params[0].type = u;
+                    f->nparams = 1;
+                    f->is_async = awaited;
+                    Expr *recv0 = e->lhs;
+                    recv0->prechecked = true;
+                    Pos at = e->pos;
+                    memset(e, 0, sizeof *e);
+                    e->kind = E_CALL; e->pos = at; e->field = -1; e->is_call = true;
+                    e->lhs = arrow;
+                    expr_list_push(&e->args, recv0);
+                    check_expr(arrow, NULL);
+                    e->type = arrow->type->ret;
+                    if (awaited) pr_awaited = e;
+                    check_expr(e, expected);
+                    return;
                 }
                 *e = *chain;
                 check_expr(e, expected);
@@ -13173,7 +13747,9 @@ static void check_expr_in(Expr *e, Type *expected) {
                         if (cb->kind == E_ARROW && !cb->arrow->fn->ret) { /* infer the element type of the result */
                             /* (xs.map((c) => ({ ... })) where an Achado[] goes: each result is an Achado) */
                             cbt->ret = expected && expected->kind == TY_ARRAY && (expected->elem->kind == TY_OBJECT ||
+                                       (expected->elem->kind == TY_NULLABLE && (ty_is_heap(expected->elem->elem) || nullnum_elem(expected->elem))) ||
                                        (expected->elem->kind == TY_UNION && cb->kind == E_ARROW && cb->arrow->expr_body)) ? expected->elem : NULL;
+                            /* (xs.map(() => null) where an (R | null)[] goes: each result an R | null, XB-165) */
                             /* (xs.map((d) => ({ provide, useFactory })) where Provider[] goes: each result the member it is) */
                             check_expr(cb, cbt);
                         } else {
@@ -13412,7 +13988,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->builtin.cfn = "xs_Server_listen_tls";
                 e->builtin.self_first = true;
                 if (xs_tls_off) xs_error(XS7024, o->pos, "remove --tls=off, or listen without cert/key behind the load balancer", "HTTPS server, but the program is built with --tls=off");
-                prog->uses_net = true;
+                net_site();
                 prog->uses_tls = true;
                 return;
             }
@@ -13432,7 +14008,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                         e->type = ty_void;
                         e->builtin.cfn = xs_sprintf("xs_%s_post%s", w ? "Worker" : "MessagePort", bytes ? "Bytes" : is_sab(t) ? "Sab" : "F64");
                         e->builtin.self_first = true;
-                        prog->uses_net = true;
+                        net_site();
                         return;
                     }
                 }
@@ -13450,7 +14026,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                         e->type = ty_object_of(oc);
                         e->builtin.cfn = xs_sprintf("xs_%s_on_%s", w ? "Worker" : "MessagePort", pt->cls == u8 ? "bytes" : is_sab(pt) ? "sab" : "f64");
                         e->builtin.self_first = true;
-                        prog->uses_net = true;
+                        net_site();
                         return;
                     }
                 }
@@ -13458,7 +14034,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             member_expected = expected;
             check_object_member(e, oc);
             if (oc->builtin && (strcmp(oc->name, "DatabaseSync") == 0 || strcmp(oc->name, "RunResult") == 0)) prog->uses_sqlite = true;
-            else if (oc->builtin && strcmp(oc->name, "Error") != 0) prog->uses_net = true;
+            else if (net_class(oc)) net_site();
             return;
         }
         case TY_INT: case TY_NUMBER: case TY_LITINT:
@@ -13470,7 +14046,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->builtin.cfn = has ? "xs_timer_has_ref" : close ? "xs_timer_close" : !strcmp(e->str, "unref") ? "xs_timer_unref" :
                                  !strcmp(e->str, "ref") ? "xs_timer_ref" : "xs_timer_refresh";
                 e->type = has ? ty_boolean : close ? ty_void : ty_int;
-                prog->uses_net = true;
+                net_site();
                 return;
             }
             if (e->is_call && strcmp(e->str, "toString") == 0 && e->args.len <= 1) { /* n.toString(), n.toString(radix) */
@@ -14394,6 +14970,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         Func *saved_func = cur_func;
         int saved_loop = loop_depth, saved_switch = switch_depth, saved_fin = finally_depth;
         loop_depth = switch_depth = finally_depth = 0;
+        if (saved_func != f) f->outer_fn = saved_func;
         cur_func = f;
         push_scope();
         scope->arrow = a;
@@ -14500,7 +15077,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             Type *el = e->type->elem;
             if (el->kind == TY_VOID || el->kind == TY_FUNC || el->kind == TY_NULLABLE || el->kind == TY_NULL)
                 xs_error(XS6040, e->pos, NULL, "unsupported channel element type '%s'", ty_name(el));
-            prog->uses_net = true; /* parked receivers and senders are coroutines of the event loop */
+            net_site(); /* parked receivers and senders are coroutines of the event loop */
         } else if (e->args.len == 1) { /* new Map<K, V>([[k, v], ...]) / new Set<T>([a, b]): an array of entries or values */
             bool is_map = e->type->kind == TY_MAP;
             Type *want;
@@ -14568,7 +15145,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 expr_list_push(&e->args, data);
                 if (data->kind == E_STRING && !data->type) check_expr(data, ty_string);
                 e->builtin.cfn = "xs_Worker_new";
-                prog->uses_net = true;
+                net_site();
                 prog->uses_workers = true;
                 return;
             }
@@ -14745,7 +15322,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 xs_error(XS8003, e->pos, NULL, "%s cannot be constructed directly", c->name);
             if (e->args.len != 0) xs_error(XS7074, e->pos, NULL, "new Server() takes no arguments");
             e->builtin.cfn = "xs_Server_new";
-            prog->uses_net = true;
+            net_site();
             return;
         }
         if (c->is_interface) xs_error(XS9005, e->pos, xs_sprintf("write an object literal: const x: %s = { ... };", c->name), "'%s' is an interface; it has no constructor", c->name);
@@ -14853,6 +15430,21 @@ static void check_expr_in(Expr *e, Type *expected) {
                 else if (i && !ty_equal(t, e->args.items[0]->type)) differ = true;
             }
             json_ok_unknown = ju;
+            bool classes = e->args.len > 1, cdiffer = false;
+            for (int i = 0; i < e->args.len && classes; i++) {
+                Type *t = e->args.items[i]->type;
+                classes = t->kind == TY_OBJECT && !t->cls->builtin && !t->cls->is_tuple && !made_shape(t->cls) && !t->cls->is_interface &&
+                          !t->cls->adapter_of && !t->cls->fake && !t->cls->tparams;
+                if (classes && i && !ty_equal(t, e->args.items[0]->type)) cdiffer = true;
+            }
+            classes = classes && cdiffer;
+            if (classes) { /* [new A(), new B()]: objects of classes, (A | B)[] as TypeScript infers it (each keeps its class) */
+                Type *u = NULL;
+                for (int i = 0; i < e->args.len; i++) u = ty_union2(u, e->args.items[i]->type);
+                for (int i = 0; i < e->args.len; i++) expect_type(e->args.items[i], u, "array element");
+                e->type = ty_array_of(u);
+                return;
+            }
             if (objs && differ) {
                 for (int i = 0; i < e->args.len; i++) expect_type(e->args.items[i], ty_json, "array element");
                 e->type = ty_array_of(ty_json);
@@ -15133,6 +15725,12 @@ static void check_expr_in(Expr *e, Type *expected) {
             if (bb->kind == TY_NULL) bb = ba;
             if (ba->kind != TY_NULL && ty_equal(ba, bb)) u = ba;
             else if (is_numeric(ba) && is_numeric(bb)) u = ty_number; /* Math.trunc(n) : null-or-number: a number */
+            /* c ? e.getStatus() : HttpStatus.INTERNAL_SERVER_ERROR: a number and a member of a numeric enum make the number,
+               as in TypeScript (a string enum's member and a string: the string) */
+            else if (is_numeric(ba) && bb->kind == TY_ENUM && !bb->en->is_string) u = ba;
+            else if (is_numeric(bb) && ba->kind == TY_ENUM && !ba->en->is_string) u = bb;
+            else if (ba->kind == TY_STRING && !ba->tname && bb->kind == TY_ENUM && bb->en->is_string) u = ba;
+            else if (bb->kind == TY_STRING && !bb->tname && ba->kind == TY_ENUM && ba->en->is_string) u = bb;
             else if (ty_is_any(ta) || ty_is_any(tb)) { u = ty_any; nul = false; } /* data ? user[data] : user: an any (the other side read by name too) */
             else if (ta->kind == TY_UNKNOWN || tb->kind == TY_UNKNOWN) { u = ty_unknown; nul = false; } /* d ? new Date(d) : row.x: unknown, as TypeScript */
             else if (ba->kind == TY_OBJECT && bb->kind == TY_OBJECT && !ba->cls->is_interface && !bb->cls->is_interface)
@@ -15144,6 +15742,15 @@ static void check_expr_in(Expr *e, Type *expected) {
                 else u = ty_nullable_of(u);
             }
             if (!u && expected && (expected->kind == TY_UNION || (expected->kind == TY_NULLABLE && expected->elem->kind == TY_UNION))) u = expected; /* both go into the union */
+            if (!u && expected && ty_strip_null(expected)->kind == TY_JSON && (!nul || expected->kind == TY_NULLABLE)) {
+                /* typeof x === 'string' ? { message: x } : x where an object goes, x: string | object: both are objects (JSON) */
+                bool ju = json_ok_unknown;
+                json_ok_unknown = true;
+                if ((ba->kind == TY_JSON || json_ok(ba, 0)) && (bb->kind == TY_JSON || json_ok(bb, 0)) && ba->kind != TY_NULL && bb->kind != TY_NULL &&
+                    !cond_prim(ba) && !cond_prim(bb))
+                    u = expected;
+                json_ok_unknown = ju;
+            }
             if (!u && cond_prim(ba) && cond_prim(bb)) { /* c ? 'a' : 1: string | number, as TypeScript */
                 Type *un = xs_alloc(sizeof *un);
                 un->kind = TY_UNION; un->nparams = 2;
@@ -15370,6 +15977,7 @@ static bool cond_truthy_type(Type *t) {
 }
 static bool rereadable(Expr *e) {
     if (e->kind == E_IDENT || e->kind == E_THIS) return true;
+    if (e->kind == E_AS && e->op == TK_DOT && e->elem_type && e->lhs && e->lhs->kind == E_IDENT) return true; /* x seen as a member of its union */
     return e->kind == E_MEMBER && !e->is_call && e->field >= 0 && rereadable(e->lhs);
 }
 /* a checked condition the types decide: typeof n === "object" with n a number, false && x (TypeScript narrows the
@@ -15898,7 +16506,8 @@ static void check_cond(Expr *c, const char *what) {
    the scopes, from the variable's C name (unique, so an inner `o` that shadows it is another path), or NULL */
 /* the stable reference a path starts from: x, this, x.f, this.f.g (fields only, no calls), or NULL */
 static const char *path_base(Expr *e) {
-    while (e && e->kind == E_AS && e->op == TK_NOT && !e->elem_type) e = e->lhs; /* o.f narrowed already: the same path */
+    while (e && e->kind == E_AS && ((e->op == TK_NOT && !e->elem_type) || e->upath || (e->op == TK_DOT && e->elem_type && e->lhs && e->lhs->kind == E_IDENT)))
+        e = e->lhs; /* o.f narrowed already (o too, to a member of its union): the same path */
     if (!e) return NULL;
     if (e->kind == E_THIS) return "this";
     if (e->kind == E_IDENT) {
@@ -15917,8 +16526,93 @@ static const char *path_key(Expr *m) {
     if (!in) return NULL;
     return xs_sprintf("\x01%s.%d.%s", in, m->field, m->cls->name);
 }
-/* `x !== null` / `x === null` on a nullable local: returns the binding and whether the test is "not null". */
+/* A union-typed field path (r.data, this.state, t[0], a.b.c) narrowed by a test as a variable is (XB-146): the key its
+   narrowing goes by in the scopes (a "\x01" key, so a callback written in the source does not see it, as for o.f !== null).
+   As TypeScript does, the narrowing holds until the path or a prefix of it is assigned; a call in between keeps it (the
+   called code may change the field: TypeScript does not look, so each read is a checked conversion, a TypeError when the
+   object is not that member any more, where TypeScript's program would read undefined). */
+static Expr *upath_strip(Expr *e) {
+    while (e && e->kind == E_AS && (e->upath || (e->op == TK_NOT && !e->elem_type))) e = e->lhs;
+    return e;
+}
+static const char *upath_key(Expr *m) {
+    m = upath_strip(m);
+    if (!m || m->kind != E_MEMBER || m->is_call || m->field < 0 || !m->cls || m->cls->builtin || !m->type || ty_strip_null(m->type)->kind != TY_UNION) return NULL;
+    const char *in = path_base(m->lhs); /* (this.h: A | B | null too, narrowed after a test against null) */
+    return in ? xs_sprintf("\x01\x02%s.%d.%s", in, m->field, m->cls->name) : NULL;
+}
+/* a field read of a union type: the member (or fewer members) a test narrowed its path to */
+static void upath_read(Expr *e) {
+    if (e == dyn_lvalue) return; /* (the target of an assignment: the field as declared) */
+    const char *key = upath_key(e);
+    Binding *pb = key ? lookup(key) : NULL;
+    if (!pb || !pb->union_narrow || !pb->type || pb->type == e->type) return;
+    if (pb->type->kind == TY_UNION) { e->type = pb->type; return; } /* fewer members: held as the union is */
+    Expr *inner = xs_alloc(sizeof *inner);
+    *inner = *e;
+    inner->prechecked = true;
+    memset(e, 0, sizeof *e);
+    e->kind = E_AS; e->pos = inner->pos; e->lhs = inner; e->field = -1; e->elem_type = pb->type; e->upath = true;
+    check_expr(e, NULL);
+}
+/* the variable or field path a union narrowing is about: a binding (for a path, the one in scope or a new one as declared) */
 static Expr *union_ident(Expr *e);
+static Binding *union_subject(Expr *e) {
+    Expr *id = union_ident(e);
+    if (id) return lookup(id->str);
+    const char *key = upath_key(e);
+    if (!key) return NULL;
+    Binding *pb = lookup(key);
+    if (pb) return pb;
+    pb = xs_alloc(sizeof *pb);
+    pb->name = (char *)key;
+    Expr *s = e; /* (this.h after this.h !== null: the union without null, as read there) */
+    while (s && s->kind == E_AS && s->upath) s = s->lhs;
+    pb->type = s->type;
+    pb->cname = "";
+    return pb;
+}
+/* { kind: "ok", value: 1 } for Ok | Err: the one member whose literal fields (kind: "ok", ok: true) the object literal
+   gives those values, or NULL */
+static Type *objlit_member(Type *u, Expr *lit) {
+    if (!lit->keys) return NULL;
+    Type *found = NULL;
+    for (int i = 0; i < u->nparams; i++) {
+        Type *m = u->params[i];
+        if (m->kind != TY_OBJECT || m->cls->builtin) return NULL;
+        bool all = true, any = false;
+        for (int f = 0; f < m->cls->nfields && all; f++) {
+            Field *fd = &m->cls->fields[f];
+            if (!fd->type->tname || (fd->type->kind != TY_STRING && fd->type->kind != TY_BOOLEAN)) continue;
+            any = true;
+            Expr *v = NULL;
+            for (int k = 0; k < lit->args.len; k++) if (lit->keys[k] && !strcmp(lit->keys[k], fd->name)) v = lit->args.items[k];
+            if (!v) all = false;
+            else if (v->kind == E_STRING) all = fd->type->kind == TY_STRING && !strcmp(v->str, fd->type->tname);
+            else if (v->kind == E_BOOL) all = fd->type->kind == TY_BOOLEAN && !strcmp(fd->type->tname, v->boolean ? "true" : "false");
+            else all = false;
+        }
+        if (all && any) { if (found) return NULL; found = m; }
+    }
+    return found;
+}
+/* x = v, o.f = v: the union narrowings of the paths that start there end (as TypeScript's) */
+static void upath_invalidate(Expr *target) {
+    Expr *t = upath_strip(target);
+    const char *in = NULL;
+    if (t && t->kind == E_IDENT) { Binding *b = lookup(t->str); in = b && b->cname ? b->cname : NULL; }
+    else if (t && t->kind == E_MEMBER) in = path_base(t);
+    if (!in) return;
+    const char *pre = xs_sprintf("\x01\x02%s", in);
+    size_t n = strlen(pre);
+    for (Scope *s = scope; s; s = s->parent)
+        for (Binding *b = s->head; b; b = b->next)
+            if (!strncmp(b->name, pre, n) && (b->name[n] == '.' || b->name[n] == 0)) {
+                Binding *cur = lookup(b->name);
+                if (cur && cur->union_narrow) unnarrow(cur);
+            }
+}
+/* `x !== null` / `x === null` on a nullable local: returns the binding and whether the test is "not null". */
 static Binding *narrow_target(Expr *cond, bool *not_null) {
     if (cond->kind == E_BINARY && cond->op == TK_AND) {
         Binding *b = narrow_target(cond->lhs, not_null);
@@ -16135,31 +16829,41 @@ static UNarrow union_narrow(Expr *c) {
     bool is_ufield = c->kind == E_MEMBER && c->builtin.cfn && strcmp(c->builtin.cfn, "union_field") == 0;
     if (c->kind != E_BINARY && !is_ufield) return r;
     bool neg = c->kind == E_BINARY && c->op == TK_NEQ;
-    Expr *id = NULL, *lit = NULL, *bfield = NULL;
+    Expr *id = NULL, *lit = NULL, *bfield = NULL; /* (id: the variable or field path narrowed) */
     bool bwant = true;
     int how = 0; /* 1 typeof, 2 instanceof, 3 discriminant field, 4 boolean discriminant ({ ok: true } | { ok: false }) */
-    if (is_ufield) { id = union_ident(c->lhs); how = 4; bfield = c; }
+    if (is_ufield) { id = c->lhs; how = 4; bfield = c; }
     else if ((c->op == TK_EQ || c->op == TK_NEQ) && (c->rhs->kind == E_BOOL || c->lhs->kind == E_BOOL)) {
         Expr *a = c->rhs->kind == E_BOOL ? c->lhs : c->rhs, *bl = c->rhs->kind == E_BOOL ? c->rhs : c->lhs;
-        if (a->kind == E_MEMBER && a->builtin.cfn && strcmp(a->builtin.cfn, "union_field") == 0) { id = union_ident(a->lhs); how = 4; bfield = a; bwant = bl->boolean; }
+        if (a->kind == E_MEMBER && a->builtin.cfn && strcmp(a->builtin.cfn, "union_field") == 0) { id = a->lhs; how = 4; bfield = a; bwant = bl->boolean; }
     }
-    else if (c->op == TK_IDENT) { id = union_ident(c->lhs); how = 2; }
+    else if (c->op == TK_IDENT) { id = c->lhs; how = 2; }
     else if (c->op == TK_EQ || c->op == TK_NEQ) {
         Expr *a = c->lhs, *b = c->rhs;
         if (b->kind != E_STRING) { Expr *t = a; a = b; b = t; }
         if (b->kind != E_STRING) return r;
         lit = b;
-        if (a->kind == E_UNARY && a->op == TK_IDENT) { id = union_ident(a->lhs); how = 1; }
-        else if (a->kind == E_MEMBER && a->builtin.cfn && strcmp(a->builtin.cfn, "union_field") == 0) { id = union_ident(a->lhs); how = 3; }
+        if (a->kind == E_UNARY && a->op == TK_IDENT) { id = a->lhs; how = 1; }
+        else if (a->kind == E_MEMBER && a->builtin.cfn && strcmp(a->builtin.cfn, "union_field") == 0) { id = a->lhs; how = 3; }
     }
     if (!id) return r;
-    Binding *b = lookup(id->str);
+    Binding *b = union_subject(id);
     if (!b) return r;
     if (how == 2 && !neg && b->type->kind == TY_OBJECT && b->type->cls->builtin && strcmp(b->type->cls->name, "Error") == 0 &&
         c->rhs->cls && is_error_class(c->rhs->cls)) { /* catch (e) { if (e instanceof HttpException) ... }: e is the thrown object */
         r.b = b;
         r.then_t = ty_object_of(c->rhs->cls);
         return r;
+    }
+    if (how == 2 && c->rhs->cls && !c->rhs->cls->is_interface && !c->rhs->cls->builtin && !(c->rhs->cls->ntparams && !c->rhs->cls->generic_of)) {
+        /* x: Shape (an interface, or a base class; or either | null): x instanceof Sq makes it an Sq there (XB-166) */
+        Type *t = b->type->kind == TY_NULLABLE ? b->type->elem : b->type;
+        if (t->kind == TY_OBJECT && t->cls && !t->cls->builtin && t->cls != c->rhs->cls && !is_error_class(t->cls) &&
+            (t->cls->is_interface || is_subclass(c->rhs->cls, t->cls))) {
+            r.b = b;
+            if (neg) r.else_t = ty_object_of(c->rhs->cls); else r.then_t = ty_object_of(c->rhs->cls);
+            return r;
+        }
     }
     if (b->type->kind == TY_UNKNOWN && (how == 1 || how == 2)) { /* x: unknown (or any): x instanceof C / typeof x === "string" */
         Type *t = NULL;
@@ -16343,7 +17047,53 @@ static bool cond_as_if(Stmt *s) {
     s->kind = S_IF; s->pos = x->pos; s->cond = c; s->body = ba; s->else_body = bb;
     return true;
 }
+/* ---- a union variable narrowed by a test, assigned inside the region the test narrows (XB-146): from there on it is the
+   declared union again, as in TypeScript. The assignment ends it in its own scope; the kill is kept and, after each
+   statement that holds it ends, applied in the enclosing scope too (so the rest of the region sees the union, while a
+   sibling branch checked before that, the else of the if, keeps the narrowing). A loop whose body assigns it sees the
+   union from its start (the assignment flows back to the top). ---- */
+static struct { Binding *root; Scope *at; } *ukill; /* (at: the scope of the assignment, where its own effect stands) */
+static int nukill, capukill;
+static Binding *b_root(Binding *b) { while (b && b->origin) b = b->origin; return b; }
+static Binding *lookup_here(const char *name) { /* (no capture: stops at the enclosing arrow) */
+    for (Scope *s = scope; s; s = s->parent) {
+        for (Binding *b = s->head; b; b = b->next) if (strcmp(b->name, name) == 0) return b;
+        if (s->arrow) break;
+    }
+    return NULL;
+}
+static void assign_unnarrow(Binding *b) {
+    bool un = b->union_narrow;
+    unnarrow(b);
+    if (!un) return;
+    if (nukill == capukill) { capukill = capukill ? capukill * 2 : 16; ukill = realloc(ukill, sizeof *ukill * (size_t)capukill); }
+    ukill[nukill].root = b_root(b);
+    ukill[nukill++].at = scope;
+}
+static void loop_unnarrow(Stmt *s) {
+    for (Scope *sc = scope; sc; sc = sc->parent) {
+        for (Binding *b = sc->head; b; b = b->next) {
+            if (!b->union_narrow || b->name[0] == '\x01' || lookup_here(b->name) != b) continue;
+            Expr id = {.kind = E_IDENT, .str = b->name, .field = -1};
+            bool assigned = false;
+            io_scan_s(s, &id, NULL, false, &assigned);
+            if (assigned) unnarrow(b);
+        }
+        if (sc->arrow) break;
+    }
+}
+static void check_stmt_one(Stmt *s);
 static void check_stmt(Stmt *s) {
+    if (s->kind == S_WHILE || s->kind == S_FOR || s->kind == S_FOROF) loop_unnarrow(s);
+    int mark = nukill;
+    check_stmt_one(s);
+    for (int i = mark; i < nukill; i++) {
+        if (ukill[i].at == scope) continue;
+        Binding *cur = lookup_here(ukill[i].root->name);
+        if (cur && cur->union_narrow && b_root(cur) == ukill[i].root) unnarrow(cur);
+    }
+}
+static void check_stmt_one(Stmt *s) {
     switch (s->kind) {
     case S_VAR:
         if (s->for_head) { /* for (let i = 0, j = n - 1; ...): the loop's variables, a copy per iteration */
@@ -16391,6 +17141,8 @@ static void check_stmt(Stmt *s) {
         check_expr(s->expr, NULL);
         pr_discard = false;
         settle(s->expr);
+        if (cur_func && cur_func->pv_of && pr_async_call(s->expr) && !(s->expr->func && s->expr->func->ret_maybe_sync))
+            pr_spawn(s->expr); /* f(); in a promise version (XB-231): started, as in JavaScript, not waited for (the caller goes on) */
         return;
     case S_IF: {
         instanceof_path_narrow(s);
@@ -16413,6 +17165,11 @@ static void check_stmt(Stmt *s) {
                 else check_stmt(s->else_body);
                 pop_scope();
             } else if (always_exits(s->body)) { shadow_union(un.b, un.else_t); shadow_set(&ufs); }
+            if (s->else_body) { /* if (m.kind === "a") { return; } else { ... }: the rest sees the members of the branch that goes on */
+                bool te = always_exits(s->body), ee = always_exits(s->else_body);
+                if (te && !ee) { shadow_union(un.b, un.else_t); shadow_set(&ufs); }
+                else if (ee && !te) { shadow_union(un.b, un.then_t); shadow_set(&uts); }
+            }
             return;
         }
         NSet ts = {0}, fs = {0};
@@ -16430,6 +17187,8 @@ static void check_stmt(Stmt *s) {
         }
         /* if (x === null || y === null) { return; }  →  x and y are not null for the rest of the block */
         if (!s->else_body && always_exits(s->body)) shadow_set(&fs);
+        else if (s->else_body && always_exits(s->body) && !always_exits(s->else_body)) shadow_set(&fs); /* (an else that goes on: the same) */
+        else if (s->else_body && always_exits(s->else_body) && !always_exits(s->body)) shadow_set(&ts);
         else if (!s->else_body) /* if (!x) { x = new Map(); }  →  x is not null after it */
             for (int i = 0; i < fs.n; i++)
                 if (assigns_non_null(s->body, fs.b[i]->name)) shadow_narrowed(fs.b[i]);
@@ -16641,12 +17400,39 @@ static void check_stmt(Stmt *s) {
         check_expr(s->expr, NULL);
         settle(s->expr);
         Type *t = s->expr->type;
-        if (t->kind == TY_NULLABLE && (is_numeric(t->elem) || t->elem->kind == TY_STRING) && !t->elem->tname) {
+        Expr *nsubj = NULL; /* switch (x) with x: T | null: x, which each case for a value narrows to T (XB-147) */
+        bool *null_case = NULL; /* the cases null can reach: case null:, default: */
+        if (t->kind == TY_NULLABLE && (is_numeric(t->elem) || t->elem->kind == TY_STRING)) {
             /* switch (pflIn) with pflIn: number | null: null matches none of the cases (JavaScript's ===), so the switch
-               is on pflIn ?? a value no case has (NaN, equal to nothing; a string no case is) */
+               is on pflIn ?? a value no case has (NaN, equal to nothing; a string no case is). With a case null: (XB-147)
+               a string's is that same value; a number's switch becomes switch (true) { case x === v: ... case x === null: } */
             bool case_null = false;
-            for (int i = 0; i < s->ncases; i++) if (s->cases[i].value && s->cases[i].value->kind == E_NULL) case_null = true;
-            if (!case_null) {
+            nsubj = s->expr;
+            null_case = xs_alloc(sizeof(bool) * (size_t)(s->ncases + 1));
+            for (int i = 0; i < s->ncases; i++) {
+                null_case[i] = !s->cases[i].value || s->cases[i].value->kind == E_NULL;
+                if (s->cases[i].value && s->cases[i].value->kind == E_NULL) case_null = true;
+            }
+            if (case_null && t->elem->kind != TY_STRING) {
+                if (!rereadable(s->expr))
+                    xs_error(XS8127, s->expr->pos, "store it in a const first: const v = ...; switch (v)", "a switch with case null on a number needs a variable or a field");
+                for (int i = 0; i < s->ncases; i++) {
+                    Case *c = &s->cases[i];
+                    if (!c->value) continue;
+                    Expr *eq = xs_alloc(sizeof *eq);
+                    eq->kind = E_BINARY; eq->pos = c->value->pos; eq->field = -1; eq->op = TK_EQ;
+                    eq->lhs = fresh_path(s->expr); eq->rhs = c->value;
+                    c->value = eq;
+                }
+                Expr *tr = xs_alloc(sizeof *tr);
+                tr->kind = E_BOOL; tr->pos = s->expr->pos; tr->field = -1; tr->boolean = true;
+                s->expr = tr;
+                check_expr(tr, NULL);
+                t = tr->type;
+            } else {
+                if (case_null) /* case null: the value the switch reads for null */
+                    for (int i = 0; i < s->ncases; i++)
+                        if (s->cases[i].value && s->cases[i].value->kind == E_NULL) s->cases[i].value = str_lit(s->cases[i].value->pos, "\x01(null)\x01");
                 Expr *d;
                 if (is_numeric(t->elem)) {
                     d = xs_alloc(sizeof *d); d->kind = E_IDENT; d->pos = s->expr->pos; d->field = -1; d->str = "NaN";
@@ -16670,7 +17456,7 @@ static void check_stmt(Stmt *s) {
                 expect_type(c->value, t, "case value");
             }
         }
-        if (tsc_checked() && t->kind == TY_STRING && t->nslits > 0) {
+        if (tsc_checked() && t->kind == TY_STRING && t->nslits > 0 && !nsubj) { /* (T | null: null gets past them) */
             /* switch (input.subprogram) over 'a' | 'b' with a case for each and no default: TypeScript knows no value gets past
                it; here a value outside the type (data not checked) throws there instead of falling off the function's end */
             bool has_default = false, all = true;
@@ -16700,8 +17486,8 @@ static void check_stmt(Stmt *s) {
         }
         switch_depth++;
         Expr *sx = s->expr;
-        Expr *sid = sx->kind == E_MEMBER && sx->builtin.cfn && strcmp(sx->builtin.cfn, "union_field") == 0 ? union_ident(sx->lhs) : NULL;
-        Binding *sb = sid ? lookup(sid->str) : NULL;
+        Binding *sb = sx->kind == E_MEMBER && sx->builtin.cfn && strcmp(sx->builtin.cfn, "union_field") == 0 ? union_subject(sx->lhs) : NULL;
+        bool null_in = false; /* the case before falls through into this one, maybe with null */
         for (int i = 0; i < s->ncases; i++) {
             Case *c = &s->cases[i];
             if (sb && sb->type->kind == TY_UNION && c->value && c->value->kind == E_STRING) { /* case "circle": that member */
@@ -16714,6 +17500,12 @@ static void check_stmt(Stmt *s) {
                 Type *t = union_subset(u, keep);
                 if (!t) xs_error(XS8114, c->value->pos, NULL, "no member of %s has %s \"%s\"", ty_name(u), sx->str, c->value->str);
                 check_block_union(c->body, sb, t);
+            } else if (nsubj) {
+                /* case "a": x is not null there, unless null can fall through into it (from case null: or default:) */
+                NSet ns = {0};
+                if (!null_case[i] && !null_in) narrow_set(null_test_of(nsubj), true, &ns);
+                check_block_narrowed_set(c->body, &ns);
+                null_in = (null_case[i] || null_in) && !always_exits(c->body);
             } else check_block(c->body);
         }
         switch_depth--;
@@ -16919,7 +17711,7 @@ static void resolve_signature(Func *f) {
     {
         Type *decl = f->ret;
         bool as = false;
-        f->ret = ret_unpromise(f->ret, &as);
+        if (!f->pv_of) f->ret = ret_unpromise(f->ret, &as); /* (a promise version returns the promise itself, XB-231) */
         if (as) f->ret_promise = true; /* (): Promise<T>: T, and async (XB-106) */
         if (as && tsc_checked() && !f->is_async && decl && ty_strip_null(decl)->kind == TY_UNION) f->ret_maybe_sync = true;
     }
@@ -16944,6 +17736,17 @@ static const char **ii_cnames; static Expr **ii_cinit; static int ii_cn; /* cons
 /* let end = a.indexOf(x); if (end < 0) end = a.length: an integer when its start and every assignment are */
 static const char **ii_lnames; static Expr **ii_linit; static int ii_ln;
 static Stmt *ii_body; /* the function being inferred */
+/* every declaration of a name in the function (parameters too): a name declared twice (in two blocks, or a parameter
+   of a closure) is an int by its form only when no declaration of it says otherwise */
+typedef struct { const char *name; Stmt *s; Type *t; const void *key; } IIDecl;
+static IIDecl *ii_decls; static int ii_dn;
+static void ii_decl(const char *name, Stmt *s, Type *t, const void *key) {
+    if (!name) return;
+    for (int i = 0; i < ii_dn; i++) /* (seen already: a closure's parameter, seen from the function around it first) */
+        if (ii_decls[i].key == key) { if (t) ii_decls[i].t = t; return; }
+    ii_decls = realloc(ii_decls, sizeof(IIDecl) * (size_t)(ii_dn + 1));
+    ii_decls[ii_dn++] = (IIDecl){name, s, t, key};
+}
 static bool ii_stmt_ok(Stmt *s, const char *self);
 static int ii_depth;
 static bool ii_in(const char **l, int n, const char *s) { for (int i = 0; i < n; i++) if (strcmp(l[i], s) == 0) return true; return false; }
@@ -16952,9 +17755,34 @@ static void ii_typed(const char *name, Type *t) {
     if (t->kind == TY_INT) { ii_tnames = realloc(ii_tnames, sizeof(char *) * (size_t)(ii_tn + 1)); ii_tnames[ii_tn++] = name; }
     else if (t->kind == TY_ARRAY && t->elem && t->elem->kind == TY_INT) { ii_anames = realloc(ii_anames, sizeof(char *) * (size_t)(ii_an + 1)); ii_anames[ii_an++] = name; }
 }
+/* the declarations inside closures (their parameters too): what ii_expr_ok reaches when it reads their bodies */
+static void ii_decls_s(Stmt *s);
+static void ii_decls_e(Expr *e) {
+    if (!e) return;
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) {
+        Func *f = e->arrow->fn;
+        for (int i = 0; i < f->nparams; i++) ii_decl(f->params[i].name, NULL, f->params[i].type, &f->params[i]);
+        ii_decls_s(f->body);
+    }
+    ii_decls_e(e->lhs); ii_decls_e(e->rhs);
+    for (int i = 0; i < e->args.len; i++) ii_decls_e(e->args.items[i]);
+}
+static void ii_decls_s(Stmt *s) {
+    if (!s) return;
+    if ((s->kind == S_VAR || s->kind == S_FOROF) && s->name) ii_decl(s->name, s, NULL, s);
+    ii_decls_e(s->init); ii_decls_e(s->expr); ii_decls_e(s->cond); ii_decls_e(s->for_update);
+    ii_decls_s(s->for_init); ii_decls_s(s->body); ii_decls_s(s->else_body);
+    for (int i = 0; i < s->stmts.len; i++) ii_decls_s(s->stmts.items[i]);
+    for (int i = 0; i < s->ncases; i++) { ii_decls_e(s->cases[i].value); ii_decls_s(s->cases[i].body); }
+}
 static void ii_scan(Stmt *s) {
     if (!s) return;
+    if ((s->kind == S_VAR || s->kind == S_FOROF) && s->name) ii_decl(s->name, s, NULL, s);
+    ii_decls_e(s->init); ii_decls_e(s->expr); ii_decls_e(s->cond); ii_decls_e(s->for_update);
+    for (int i = 0; i < s->ncases; i++) ii_decls_e(s->cases[i].value);
     if ((s->kind == S_VAR || s->kind == S_FOROF) && s->decl_type) ii_typed(s->name, s->decl_type);
+    if (s->kind == S_FOROF && !s->decl_type && s->name && s->expr && s->expr->kind == E_IDENT && s->expr->str && ii_in(ii_anames, ii_an, s->expr->str))
+        ii_typed(s->name, ty_int); /* for (const x of a) with a: int[]: x is an int, as a[i] is (XB-210) */
     if (s->kind == S_VAR && s->is_const && !s->decl_type && s->init && s->name) {
         ii_cnames = realloc(ii_cnames, sizeof(char *) * (size_t)(ii_cn + 1)); ii_cinit = realloc(ii_cinit, sizeof(Expr *) * (size_t)(ii_cn + 1));
         ii_cnames[ii_cn] = s->name; ii_cinit[ii_cn++] = s->init;
@@ -16968,9 +17796,9 @@ static void ii_scan(Stmt *s) {
     for (int i = 0; i < s->ncases; i++) ii_scan(s->cases[i].body);
 }
 static void ii_enter(Func *f, bool reset) {
-    if (reset) ii_tn = ii_an = ii_cn = ii_ln = 0;
+    if (reset) ii_tn = ii_an = ii_cn = ii_ln = ii_dn = 0;
     ii_body = f->body;
-    for (int i = 0; i < f->nparams; i++) ii_typed(f->params[i].name, f->params[i].type);
+    for (int i = 0; i < f->nparams; i++) { ii_typed(f->params[i].name, f->params[i].type); ii_decl(f->params[i].name, NULL, f->params[i].type, &f->params[i]); }
     ii_scan(f->body);
 }
 /* XB-088: modular state (an LCG, a hash): `last = (last * A + C) % M`. A product is no int by its form (it can pass
@@ -17067,13 +17895,45 @@ static double ii_bound(Expr *e, const char *self) { /* |e| at most this, or -1 *
     if (e->kind == E_BINARY && e->op == TK_PERCENT) { double k = ii_mod_k(e); return k > 0 ? k : -1; }
     return -1;
 }
+static bool ii_candidate(Stmt *s);
+static bool ii_cand_off(Stmt *v);
+static bool int_shaped(Expr *e, const char *self);
+/* a name declared more than once in the function where one of its declarations is not an int (arr: not an int[]) by
+   its form: { const j = 1; t += j; } { const j = xs[0]; t += j; } leaves t a number */
+static bool ii_conflict(const char *name, bool arr) {
+    int n = 0;
+    for (int i = 0; i < ii_dn; i++) if (strcmp(ii_decls[i].name, name) == 0) n++;
+    if (n < 2) return false;
+    for (int i = 0; i < ii_dn; i++) {
+        IIDecl *d = &ii_decls[i];
+        if (strcmp(d->name, name) != 0) continue;
+        Type *t = d->s ? d->s->decl_type : d->t;
+        if (t) {
+            if (arr ? !(t->kind == TY_ARRAY && t->elem && t->elem->kind == TY_INT) : t->kind != TY_INT) return true;
+            continue;
+        }
+        if (!d->s || arr) return true; /* (a parameter typed by its context; an array not declared int[]) */
+        Stmt *v = d->s;
+        if (ii_depth > 8) return true;
+        bool ok;
+        ii_depth++;
+        if (v->kind == S_FOROF) ok = v->expr && v->expr->kind == E_IDENT && v->expr->str && ii_in(ii_anames, ii_an, v->expr->str) && !ii_conflict(v->expr->str, true);
+        else if (ii_candidate(v)) ok = !ii_cand_off(v);
+        else ok = v->init && int_shaped(v->init, name) && (v->is_const || !ii_body || ii_stmt_ok(ii_body, name));
+        ii_depth--;
+        if (!ok) return true;
+    }
+    return false;
+}
 static bool int_shaped(Expr *e, const char *self) {
     if (!e) return false;
     switch (e->kind) {
     case E_NUMBER: return e->is_int_lit;
     case E_IDENT:
         if (!e->str) return false;
-        if (strcmp(e->str, self) == 0 || ii_known(e->str) || ii_in(ii_tnames, ii_tn, e->str)) return true;
+        if (strcmp(e->str, self) == 0) return true;
+        if (ii_conflict(e->str, false)) return false;
+        if (ii_known(e->str) || ii_in(ii_tnames, ii_tn, e->str)) return true;
         for (int i = ii_cn - 1; i >= 0; i--)
             if (strcmp(ii_cnames[i], e->str) == 0) {
                 if (ii_depth > 8) return false;
@@ -17087,7 +17947,7 @@ static bool int_shaped(Expr *e, const char *self) {
                 return r;
             }
         return false;
-    case E_INDEX: return e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && ii_in(ii_anames, ii_an, e->lhs->str);
+    case E_INDEX: return e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && ii_in(ii_anames, ii_an, e->lhs->str) && !ii_conflict(e->lhs->str, true);
     case E_MEMBER: /* (not x.length: it can be a getter of the program's own that gives a number, and the
                       types are not known yet here; i < a.length is a comparison, not an assignment, and is fine) */
         if (!e->is_call) { /* x.length: an int on a string, an array, a typed array; unless the program has a
@@ -17212,6 +18072,11 @@ static void infer_ints(Stmt *s) {
    they are declared and however deep. */
 typedef struct { Stmt *v; StmtList *list; int idx; Stmt *loop; bool on; } IICand;
 static IICand *iic; static int iicn, iicap;
+static bool ii_fix_on; /* (deciding a function's candidates together: iic holds them) */
+static bool ii_cand_off(Stmt *v) { /* a candidate found not to be an int (so far) */
+    if (ii_fix_on) for (int c = 0; c < iicn; c++) if (iic[c].v == v) return !iic[c].on;
+    return false;
+}
 static void ii_collect(Stmt *s) {
     if (!s) return;
     if (s->kind == S_FOR && ii_candidate(s->for_init)) {
@@ -17235,6 +18100,7 @@ static void infer_ints_fn(Stmt *body) {
     iicn = 0;
     ii_collect(body);
     int base = ii_n;
+    ii_fix_on = true;
     for (bool changed = true; changed;) {
         changed = false;
         ii_n = base;
@@ -17248,13 +18114,14 @@ static void infer_ints_fn(Stmt *body) {
             if (!ok) { k->on = false; changed = true; }
         }
     }
+    ii_fix_on = false;
     ii_n = base;
     for (int c = 0; c < iicn; c++) ii_mark(iic[c].v, iic[c].on);
 }
 
 /* top-level `let`s are globals: functions may assign them too */
 static void infer_ints_top(Program *p) {
-    ii_tn = ii_an = ii_cn = 0; /* the top level's typed names and consts (const lim = Math.max(1, n)), as in a function */
+    ii_tn = ii_an = ii_cn = ii_dn = 0; /* the top level's typed names and consts (const lim = Math.max(1, n)), as in a function */
     for (int i = 0; i < p->top.len; i++) ii_scan(p->top.items[i]);
     for (int i = 0; i < p->top.len; i++) {
         Stmt *v = p->top.items[i];
@@ -17490,7 +18357,7 @@ static void check_func(Func *f) {
     }
     if (f->is_gen) {
         if (f->ret->kind != TY_STREAM) xs_error(XS8073, f->pos, "write the return type: function* f(): Generator<T>", "a generator returns Generator<T> (or Iterable<T>)");
-        prog->uses_gen = true; /* its body runs on a coroutine stack */
+        gen_site(f); /* its body runs on a coroutine stack */
     }
     check_block(f->body);
     pop_scope();
@@ -17996,6 +18863,23 @@ static bool method_fits(Func *cm, Func *im, Class *src, Class *ifc, bool infer, 
     }
     return true;
 }
+/* XB-233: an interface field the adapter of src holds in a slot of its own (the emitter's ifld_fn points there):
+   AD_FIELD_ABSENT, an optional field src does not declare (null until written through the interface; TypeScript lets
+   the class leave it out); AD_FIELD_NUM, an int field of src where the interface says number (the slot is the number
+   read from src at each access, and a write through the interface goes back to src's int: see emit's ifld_put).
+   0: a field of src of the same type, reached in place */
+enum { AD_FIELD_ABSENT = 1, AD_FIELD_NUM = 2 };
+static int ad_field_kind(Class *src, Field *iff) {
+    Field *sf = find_field(src, iff->name, NULL);
+    if (!iff->type) return 0;
+    if (!sf) {
+        if (iff->optional && iff->type->kind == TY_NULLABLE && !find_method(src, xs_sprintf("__get_%s", iff->name)) && !find_method(src, iff->name))
+            return AD_FIELD_ABSENT;
+        return 0;
+    }
+    if (sf->type && sf->type->kind == TY_INT && iff->type->kind == TY_NUMBER) return AD_FIELD_NUM;
+    return 0;
+}
 static bool iface_fits(Class *src, Class *ifc, bool infer, Pos pos, int depth, char **why) {
     if (depth > 4 || src == ifc || src->builtin || src->gen_state) return false;
     /* XB-200: the adapter has no fields of its own; a read or write of an interface field goes to the class's field of the
@@ -18003,6 +18887,7 @@ static bool iface_fits(Class *src, Class *ifc, bool infer, Pos pos, int depth, c
        to it is handed out), not one that converts or is left out. */
     for (int k = 0; k < ifc->nfields; k++) {
         Field *iff = &ifc->fields[k], *sf = find_field(src, iff->name, NULL);
+        if (ad_field_kind(src, iff)) continue; /* (an optional field the class leaves out, an int field where a number goes: XB-233) */
         if (!sf || !sf->type || !iff->type || !ty_equal(sf->type, iff->type)) {
             if (why) {
                 if (!sf) *why = xs_sprintf("%s has no field '%s' (declare it, or write `implements %s`)", src->name, iff->name, ifc->name);
@@ -18065,7 +18950,20 @@ static Class *make_adapter(Class *src, Class *ifc) {
     a->fields[0].readonly = true;
     a->fields[0].owner = a;
     a->nfields = a->cap_fields = 1;
-    a->nbase_fields = 0; /* (an interface with methods has no fields) */
+    for (int k = 0; k < ifc->nfields; k++) { /* __slot_<f>: the interface fields held here (ad_field_kind) */
+        int kind = ad_field_kind(src, &ifc->fields[k]);
+        if (!kind) continue;
+        a->fields = realloc(a->fields, sizeof(Field) * (size_t)(a->nfields + 1));
+        Field *sl = &a->fields[a->nfields++];
+        memset(sl, 0, sizeof *sl);
+        sl->name = xs_sprintf("__slot_%s", ifc->fields[k].name);
+        sl->pos = pos;
+        sl->type = kind == AD_FIELD_NUM ? ty_number : ifc->fields[k].type;
+        sl->cname = field_cname(sl->name);
+        sl->owner = a;
+    }
+    a->cap_fields = a->nfields;
+    a->nbase_fields = 0; /* (the interface's fields are reached through __t, or held in the slots above) */
     a->flattened = true;
     Func *ct = xs_alloc(sizeof *ct);
     ct->name = "constructor"; ct->pos = pos; ct->mod = src->mod; ct->cls = a; ct->is_ctor = true; ct->ret = ty_void;
@@ -18080,6 +18978,22 @@ static Class *make_adapter(Class *src, Class *ifc) {
         Stmt *s = xs_alloc(sizeof *s);
         s->kind = S_EXPR; s->pos = pos; s->expr = as;
         ct->body = ad_block(pos, s);
+        for (int k = 1; k < a->nfields; k++) { /* this.__slot_f = null (an absent optional field starts empty), or 0 (a number
+                                                   slot, read from the class at each access) */
+            Expr *self = xs_alloc(sizeof *self);
+            self->kind = E_THIS; self->pos = pos; self->field = -1;
+            Expr *m = xs_alloc(sizeof *m);
+            m->kind = E_MEMBER; m->pos = pos; m->field = -1; m->lhs = self; m->str = a->fields[k].name;
+            Expr *z = xs_alloc(sizeof *z);
+            z->pos = pos; z->field = -1;
+            if (a->fields[k].type->kind == TY_NULLABLE) z->kind = E_NULL;
+            else { z->kind = E_NUMBER; z->num = 0; }
+            Expr *set = xs_alloc(sizeof *set);
+            set->kind = E_ASSIGN; set->op = TK_ASSIGN; set->pos = pos; set->field = -1; set->lhs = m; set->rhs = z;
+            Stmt *s2 = xs_alloc(sizeof *s2);
+            s2->kind = S_EXPR; s2->pos = pos; s2->expr = set;
+            stmt_list_push(&ct->body->stmts, s2);
+        }
     }
     a->ctor = ct;
     for (int k = 0; k < ifc->nmethods; k++) {
@@ -18283,8 +19197,20 @@ static void fake_object(Expr *e, Class *t) {
         bool dup = false;
         for (int j = 0; j < a->nmethods; j++) if (!strcmp(a->methods[j]->name, tm->name)) dup = true;
         if (dup) continue;
-        bool given = false;
-        for (int i = 0; i < e->args.len; i++) if (!strcmp(e->keys[i], tm->name)) given = true;
+        bool given = false, takes_this = false;
+        for (int i = 0; i < e->args.len; i++)
+            if (!strcmp(e->keys[i], tm->name)) {
+                given = true;
+                /* { m() { this.n } }: a method of the literal that names `this` (the parser's function (this: any) prologue,
+                   const __selfiN = __xs_this_take() as any): `this` is the object, typed as the target, set by the call */
+                Expr *fv = e->args.items[i];
+                Stmt *s0 = fv->kind == E_ARROW && fv->arrow->fn->body && fv->arrow->fn->body->stmts.len ? fv->arrow->fn->body->stmts.items[0] : NULL;
+                if (s0 && s0->kind == S_VAR && s0->name && !strncmp(s0->name, "__selfi", 7) && s0->init && s0->init->kind == E_AS) {
+                    s0->decl_type = ty_object_of(t);
+                    s0->init->elem_type = ty_object_of(t);
+                    takes_this = true;
+                }
+            }
         Func *f = xs_alloc(sizeof *f);
         f->name = tm->name; f->pos = pos; f->mod = cur_mod; f->cls = a;
         f->params = xs_alloc(sizeof(Param) * (size_t)(tm->nparams + 1));
@@ -18310,6 +19236,16 @@ static void fake_object(Expr *e, Class *t) {
             Expr *call = xs_alloc(sizeof *call);
             call->kind = E_CALL; call->pos = pos; call->field = -1; call->lhs = mem;
             for (int q = 0; q < tm->nparams; q++) expr_list_push(&call->args, ad_ident(pos, f->params[q].name));
+            if (takes_this) { /* __xs_this_set(this); then the call */
+                Expr *ts = xs_alloc(sizeof *ts);
+                ts->kind = E_CALL; ts->pos = pos; ts->field = -1; ts->lhs = ad_ident(pos, "__xs_this_set");
+                Expr *self2 = xs_alloc(sizeof *self2);
+                self2->kind = E_THIS; self2->pos = pos; self2->field = -1;
+                expr_list_push(&ts->args, self2);
+                Stmt *s0 = xs_alloc(sizeof *s0);
+                s0->kind = S_EXPR; s0->pos = pos; s0->expr = ts;
+                f->body = ad_block(pos, s0);
+            }
             if (!tm->ret || tm->ret->kind == TY_VOID) { s1->kind = S_EXPR; s1->expr = call; }
             else {
                 Expr *v = call;
@@ -18329,7 +19265,8 @@ static void fake_object(Expr *e, Class *t) {
             expr_list_push(&ne->args, str_lit(pos, tm->name));
             s1->kind = S_THROW; s1->expr = ne;
         }
-        f->body = ad_block(pos, s1);
+        if (f->body) stmt_list_push(&f->body->stmts, s1);
+        else f->body = ad_block(pos, s1);
         a->methods = realloc(a->methods, sizeof(Func *) * (size_t)(a->nmethods + 1));
         a->methods[a->nmethods++] = f;
     }
@@ -18436,12 +19373,14 @@ static bool iface_adapt(Expr *e, Type *want, const char *what) {
     e->type = want;
     return true;
 }
-/* `x as I` from unknown (an injector's construct(args)): the decorated classes that fit I get their adapters now, so
-   that the cast can wrap an object of one of them (the emitter's table: class -> adapter); true when there is any */
+/* `x as I` from unknown (an injector's construct(args), or any class put into an unknown): the classes that fit I get
+   their adapters now, so that the cast can wrap an object of one of them (the emitter's table: class -> adapter); true
+   when there is any */
 static bool iface_runtime(Class *ifc, Pos pos) {
     for (int i = 0; i < prog->nclasses; i++) {
         Class *c = prog->classes[i];
-        if (!c->decos.len || c->builtin || c->is_interface || c->iface_base || c->gen_state || c->adapter_of || is_subclass(c, ifc)) continue;
+        if (c->builtin || c->is_interface || c->iface_base || c->gen_state || c->adapter_of || c->fake || c->tparams || made_shape(c) ||
+            is_subclass(c, ifc)) continue;
         bool named = true; /* (cheap first: every method name is there) */
         for (int k = 0; k < ifc->nmethods && named; k++)
             if (ifc->methods[k]->is_abstract && !find_method(c, ifc->methods[k]->name)) named = false;
@@ -18555,15 +19494,15 @@ static void check_field_init(Class *c) {
 /* Each declaration is checked under a recovery point: an error is reported, the checker state is put
    back, and checking goes on with the next declaration, so one run reports every independent error. */
 #define RECOVER_BEGIN { \
-    jmp_buf rb_; Scope *sc_ = scope; Func *cf_ = cur_func; Class *cc_ = cur_class; Module *cm_ = cur_mod; \
-    int ld_ = loop_depth, sd_ = switch_depth, fd_ = finally_depth; failed_ = false; \
+    jmp_buf rb_; jmp_buf *outer_ = xs_error_recover; Scope *sc_ = scope; Func *cf_ = cur_func; Class *cc_ = cur_class; \
+    Module *cm_ = cur_mod; int ld_ = loop_depth, sd_ = switch_depth, fd_ = finally_depth; failed_ = false; \
     xs_error_recover = &rb_; \
     if (_setjmp(rb_) == 0) {
 #define RECOVER_END } else { \
         failed_ = true; scope = sc_; cur_func = cf_; cur_class = cc_; loop_depth = ld_; switch_depth = sd_; finally_depth = fd_; mapnull_ok = 0; \
         if (cm_) enter_module(cm_); \
     } \
-    xs_error_recover = NULL; }
+    xs_error_recover = outer_; } /* (nested: the outer recovery point again) */
 
 
 /* the return type of f, inferred now when it was left out and f's body is not checked yet: f is checked here, in
@@ -18657,7 +19596,7 @@ static void deco_stub_text(Buf *b, Func *f, const char *rs, const char *inner, b
     buf_printf(b, ")%s;\n}\n", is_void ? "" : xs_sprintf(" as %s", inner));
 }
 /* the slot of C.m (once per method: stacked decorators wrap what the previous one left) */
-static bool deco_slot(Program *p, Module *m, const char *cn, const char *mn, int at, int *added) {
+static bool deco_slot(Program *p, Module *m, const char *cn, const char *mn, int at, int *added, bool stub) {
     *added = 0;
     Class *c = find_class(cn);
     Func *f = c ? find_method(c, mn) : NULL;
@@ -18672,13 +19611,85 @@ static bool deco_slot(Program *p, Module *m, const char *cn, const char *mn, int
     buf_puts(&b, "));\n}\n");
     buf_printf(&b, "let __xs_slot_%s_%s: (...args: unknown[]) => unknown = __xs_orig_%s_%s;\n", cn, mn, cn, mn);
     const char *rs = f->ret_src;
-    if (rs) { /* (written: the stub now; inferred: deco_late_stubs, once the class's bodies are checked) */
+    if (!stub) { /* (no decorator of it replaces descriptor.value: its calls stay direct, the slot only read) */
+    } else if (rs) { /* (written: the stub now; inferred: deco_late_stubs, once the class's bodies are checked) */
         bool async = f->is_async || !strncmp(rs, "Promise<", 8);
         const char *inner = !strncmp(rs, "Promise<", 8) ? xs_strndup(rs + 8, strlen(rs) - 9) : rs;
         deco_stub_text(&b, f, rs, inner, async, !strcmp(inner, "void"));
     } else f->deco_late = true;
     StmtList decls = {0};
     deco_funcs(p, m, b.data, f->pos, f, &decls);
+    for (int k = 0; k < decls.len; k++) { /* (before the decorator's statement) */
+        stmt_list_push(&p->top, NULL);
+        memmove(p->top.items + at + 1, p->top.items + at, sizeof(Stmt *) * (size_t)(p->top.len - 1 - at));
+        p->top.items[at] = decls.items[k];
+        at++;
+        (*added)++;
+    }
+    return true;
+}
+/* the slot of a static method C.m (the module's function C__s_m, named mn here): its own body moves to a copy,
+   __xs_sorig_C__s_m, that __xs_orig_C_C__s_m calls; C__s_m keeps its name and signature (its calls stay direct) and
+   its body becomes the stub's: the call of the slot. Its return type written, its parameters typed, not a generator:
+   otherwise no slot (the decorator's call is left out, as before) */
+static bool deco_static_slot(Program *p, Module *m, const char *cn, const char *mn, int at, int *added, bool stub) {
+    *added = 0;
+    Class *c = find_class(cn);
+    Func *f = NULL;
+    SYM_EACH(funcs_by_name, mn, e) { Func *g = e->decl; if (g->static_of == c && g->mod == m) f = g; }
+    if (!c || !f || !f->body || f->ntparams || f->is_gen || !f->ret_src) return false;
+    if (f->deco_slotted) return true;
+    for (int i = 0; i < f->nparams; i++) if (!f->params[i].type_src || f->params[i].rest) return false;
+    f->deco_slotted = true;
+    if (!stub) { /* (no decorator of it replaces descriptor.value: C__s_m stays as it is, the slot only read) */
+        Buf b = {0};
+        buf_printf(&b, "function __xs_orig_%s_%s(...args: unknown[]): unknown {\n  return __xs_ret_unknown(%s(", cn, mn, mn);
+        for (int i = 0; i < f->nparams; i++) buf_printf(&b, "%sargs[%d] as %s", i ? ", " : "", i, param_text(&f->params[i]));
+        buf_puts(&b, "));\n}\n");
+        buf_printf(&b, "let __xs_slot_%s_%s: (...args: unknown[]) => unknown = __xs_orig_%s_%s;\n", cn, mn, cn, mn);
+        StmtList decls = {0};
+        Func dummy = {0};
+        dummy.cls = c; dummy.name = (char *)mn;
+        deco_funcs(p, m, b.data, f->pos, &dummy, &decls);
+        for (int k = 0; k < decls.len; k++) {
+            stmt_list_push(&p->top, NULL);
+            memmove(p->top.items + at + 1, p->top.items + at, sizeof(Stmt *) * (size_t)(p->top.len - 1 - at));
+            p->top.items[at++] = decls.items[k];
+            (*added)++;
+        }
+        return true;
+    }
+    Func *o = xs_alloc(sizeof *o); /* (its own body, under another name) */
+    *o = *f;
+    o->name = xs_sprintf("__xs_sorig_%s", mn);
+    o->cname = xs_sprintf("f%d_%s", m->id, o->name);
+    o->decos = (DecoList){0};
+    o->used = true;
+    p->funcs = realloc(p->funcs, sizeof(Func *) * (size_t)(p->nfuncs + 1));
+    p->funcs[p->nfuncs++] = o;
+    sym_add(&funcs_by_name, o->name, o);
+    const char *rs = f->ret_src;
+    bool async = f->is_async || !strncmp(rs, "Promise<", 8);
+    const char *inner = !strncmp(rs, "Promise<", 8) ? xs_strndup(rs + 8, strlen(rs) - 9) : rs;
+    bool is_void = !strcmp(inner, "void");
+    Buf b = {0};
+    buf_printf(&b, "function __xs_orig_%s_%s(...args: unknown[]): unknown {\n  return __xs_ret_unknown(%s(", cn, mn, o->name);
+    for (int i = 0; i < f->nparams; i++) buf_printf(&b, "%sargs[%d] as %s", i ? ", " : "", i, param_text(&f->params[i]));
+    buf_puts(&b, "));\n}\n");
+    buf_printf(&b, "let __xs_slot_%s_%s: (...args: unknown[]) => unknown = __xs_orig_%s_%s;\n", cn, mn, cn, mn);
+    buf_printf(&b, "{\n  __xs_this_set(null);\n  %s__xs_slot_%s_%s(", is_void ? "" : "return ", cn, mn);
+    for (int i = 0; i < f->nparams; i++) buf_printf(&b, "%s%s", i ? ", " : "", f->params[i].name);
+    buf_printf(&b, ")%s;\n}\n", is_void ? "" : xs_sprintf(" as %s", inner));
+    (void)async;
+    StmtList decls = {0};
+    Func dummy = {0};
+    dummy.cls = c; dummy.name = (char *)mn;
+    deco_funcs(p, m, b.data, f->pos, &dummy, &decls);
+    Stmt *sb = decls.len ? decls.items[decls.len - 1] : NULL; /* (the block: C__s_m's body from now on) */
+    if (!sb || sb->kind != S_BLOCK) xs_error(XS9902, f->pos, NULL, "internal: the stub of %s", mn);
+    sb->generated = false;
+    f->body = sb;
+    decls.len--;
     for (int k = 0; k < decls.len; k++) { /* (before the decorator's statement) */
         stmt_list_push(&p->top, NULL);
         memmove(p->top.items + at + 1, p->top.items + at, sizeof(Stmt *) * (size_t)(p->top.len - 1 - at));
@@ -18772,7 +19783,7 @@ static void proto_walk(Stmt *s, Stmt **vars, int *nvars, Stmt **asg, int *nasg) 
     for (int i = 0; i < s->stmts.len; i++) proto_walk(s->stmts.items[i], vars, nvars, asg, nasg);
     for (int i = 0; i < s->ncases; i++) proto_walk(s->cases[i].body, vars, nvars, asg, nasg);
 }
-static bool deco_slot(Program *p, Module *m, const char *cn, const char *mn, int at, int *added);
+static bool deco_slot(Program *p, Module *m, const char *cn, const char *mn, int at, int *added, bool stub);
 static void deco_funcs(Program *p, Module *m, const char *text, Pos pos, Func *f, StmtList *decls);
 /* prototype patching (Isa, 12/11): `const proto = Object.getPrototypeOf(ds.createQueryRunner()...); proto.query = ...`.
    Before any module's code is checked, each such function is read: the class its receiver is declared to give (a
@@ -18858,7 +19869,7 @@ static void proto_func(Program *p, Func *f) {
             enter_module(r->mod);
             int added = 0;
             bool already = mf->deco_slotted;
-            if (deco_slot(p, r->mod, r->name, mf->name, at, &added) && !proto_accessor(r, mf->name, false)) {
+            if (deco_slot(p, r->mod, r->name, mf->name, at, &added, true) && !proto_accessor(r, mf->name, false)) {
                 (void)already;
                 Buf b = {0};
                 buf_printf(&b, "function __xs_slot_get_%s_%s(): (...args: unknown[]) => unknown {\n  return __xs_slot_%s_%s;\n}\n", r->name, mf->name, r->name, mf->name);
@@ -18880,6 +19891,121 @@ static void proto_prepass(Program *p) {
         if (!c->mod || c->builtin) continue;
         for (int k = 0; k < c->nmethods; k++) if (c->methods[k]->cls == c) { enter_module(c->mod); proto_func(p, c->methods[k]); }
     }
+}
+/* XB-107: whether a TypeScript method decorator may replace descriptor.value. It does not when its descriptor
+   parameter is only read (d.value, d.writable...), tested (!d, d === null, typeof d) or given back as it is (return d):
+   then its method needs no stub, and an undecorated method's calls cost the same with it (direct). Anything else (an
+   assignment to d.x, d passed on or captured into another value, another descriptor returned, a decorator whose code
+   is not at hand) may */
+static bool dw_expr(Expr *e, const char *d);
+static bool dw_stmt(Stmt *s, const char *d, bool own) {
+    if (!s) return false;
+    if (s->kind == S_RETURN && own && s->expr) {
+        Expr *x = s->expr;
+        while (x->kind == E_AS && x->lhs) x = x->lhs;
+        if (x->kind == E_IDENT && x->str && !strcmp(x->str, d)) return false;
+        if (x->kind == E_NULL) return false;
+        return true;
+    }
+    if (dw_expr(s->init, d) || dw_expr(s->expr, d) || dw_expr(s->cond, d) || dw_expr(s->for_update, d)) return true;
+    if (dw_stmt(s->for_init, d, own) || dw_stmt(s->body, d, own) || dw_stmt(s->else_body, d, own)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (dw_stmt(s->stmts.items[i], d, own)) return true;
+    for (int i = 0; i < s->ncases; i++) if (dw_expr(s->cases[i].value, d) || dw_stmt(s->cases[i].body, d, own)) return true;
+    return false;
+}
+static bool dw_is(Expr *e, const char *d) {
+    while (e && e->kind == E_AS && e->lhs) e = e->lhs;
+    return e && e->kind == E_IDENT && e->str && !strcmp(e->str, d);
+}
+static bool dw_expr(Expr *e, const char *d) {
+    if (!e) return false;
+    switch (e->kind) {
+    case E_IDENT: return e->str && !strcmp(e->str, d); /* (d itself as a value: passed on, kept) */
+    case E_ASSIGN: {
+        Expr *t = e->lhs;
+        while (t && (t->kind == E_MEMBER || t->kind == E_INDEX) && t->lhs) { if (dw_is(t->lhs, d)) return true; t = t->lhs; }
+        break;
+    }
+    case E_MEMBER:
+        if (dw_is(e->lhs, d)) { /* d.value read; a call on it (d.value(...)) runs the method: read too */
+            if (!e->is_call) return false;
+            for (int i = 0; i < e->args.len; i++) if (dw_expr(e->args.items[i], d)) return true;
+            return false;
+        }
+        break;
+    case E_UNARY:
+        if (dw_is(e->lhs, d) && e->op != TK_ELLIPSIS) return false; /* (!d, typeof d) */
+        break;
+    case E_BINARY:
+        if (e->op == TK_EQ || e->op == TK_NEQ) {
+            bool l = dw_is(e->lhs, d), r = dw_is(e->rhs, d);
+            if (l || r) return (!l && dw_expr(e->lhs, d)) || (!r && dw_expr(e->rhs, d));
+        }
+        break;
+    case E_ARROW:
+        return e->arrow && e->arrow->fn && dw_stmt(e->arrow->fn->body, d, false);
+    default: break;
+    }
+    if (dw_expr(e->lhs, d) || dw_expr(e->rhs, d)) return true;
+    for (int i = 0; i < e->args.len; i++) if (dw_expr(e->args.items[i], d)) return true;
+    return false;
+}
+static int dw_returns(Stmt *s) { /* the returns of a function's own body (not its closures') */
+    if (!s) return 0;
+    int n = s->kind == S_RETURN;
+    n += dw_returns(s->for_init) + dw_returns(s->body) + dw_returns(s->else_body);
+    for (int i = 0; i < s->stmts.len; i++) n += dw_returns(s->stmts.items[i]);
+    for (int i = 0; i < s->ncases; i++) n += dw_returns(s->cases[i].body);
+    return n;
+}
+static bool deco_writes(Expr *src) {
+    Func *fn = NULL;
+    if (src->kind == E_CALL && src->lhs && src->lhs->kind == E_IDENT) { /* a factory: the decorator it returns */
+        Func *f = lookup_func(src->lhs->str);
+        if (!f || !f->body) return true;
+        for (int i = f->body->stmts.len - 1; i >= 0 && !fn; i--) {
+            Stmt *st = f->body->stmts.items[i];
+            if (!st || st->kind != S_RETURN) continue;
+            if (!st->expr) return true;
+            Expr *x = st->expr;
+            while (x && x->kind == E_AS && x->lhs) x = x->lhs;
+            if (!x || x->kind != E_ARROW || !x->arrow || !x->arrow->fn) return true;
+            fn = x->arrow->fn;
+        }
+        if (fn && dw_returns(f->body) != 1) return true; /* (one return only: a decorator chosen at run time may be any) */
+    } else if (src->kind == E_IDENT) fn = lookup_func(src->str);
+    if (!fn || !fn->body) return true;
+    if (fn->nparams < 3) return false; /* ((target, key): no descriptor to replace) */
+    const char *d = fn->params[2].name;
+    if (!d) return true;
+    return dw_stmt(fn->body, d, true);
+}
+static bool deco_is_ts(Expr *src);
+/* the TypeScript decorators of C.m in the module, from the statement at i on: does any replace descriptor.value? */
+static bool deco_method_writes(Program *p, Module *m, int i, const char *cn, const char *mn) {
+    for (int j = i; j < p->top.len; j++) {
+        Stmt *s = p->top.items[j];
+        if (s->mod != m || s->kind != S_IF || !s->generated || !s->cond || s->cond->kind != E_CALL || !s->cond->lhs ||
+            s->cond->lhs->kind != E_IDENT || !s->cond->lhs->str || strcmp(s->cond->lhs->str, "__xs_ts_deco") != 0 || s->cond->args.len != 3)
+            continue;
+        Expr *c = s->cond;
+        if (strcmp(c->args.items[1]->str, cn) != 0 || strcmp(c->args.items[2]->str, mn) != 0) continue;
+        const char *dn = c->args.items[0]->str;
+        Expr *src = NULL;
+        for (int k = j - 1; k >= 0 && !src; k--) {
+            Stmt *dd = p->top.items[k];
+            if (dd->mod == m && dd->kind == S_VAR && dd->name && !strcmp(dd->name, dn)) src = dd->init;
+        }
+        if (!src || getenv("XISTO_XB107_ALWAYS_STUB")) return true;
+        bool ts = false;
+        jmp_buf *outer = xs_error_recover;
+        bool was_failed = failed_;
+        RECOVER_BEGIN ts = deco_is_ts(src); RECOVER_END
+        xs_error_recover = outer;
+        failed_ = was_failed;
+        if (ts && deco_writes(src)) return true;
+    }
+    return false;
 }
 static void deco_prepass(Program *p, Module *m) {
     for (int i = 0; i < p->top.len; i++) {
@@ -18907,7 +20033,9 @@ static void deco_prepass(Program *p, Module *m) {
         if (ts) {
             int at = i;
             for (int k = i - 1; k >= 0; k--) { Stmt *d = p->top.items[k]; if (d->mod == m && d->kind == S_VAR && d->name && !strcmp(d->name, dn)) { at = k; break; } }
-            ts = deco_slot(p, m, cn, mn, at, &added);
+            bool stub = deco_method_writes(p, m, i, cn, mn);
+            enter_module(m);
+            ts = strstr(mn, "__s_") ? deco_static_slot(p, m, cn, mn, at, &added, stub) : deco_slot(p, m, cn, mn, at, &added, stub);
             enter_module(m);
         }
         s = p->top.items[i + added];
@@ -18935,6 +20063,7 @@ static Type *fret(Func *f, Pos pos) {
     II_SAVE(ii_anames, ii_an, const char *)
     II_SAVE(ii_lnames, ii_ln, const char *)
     II_SAVE(ii_cnames, ii_cn, const char *)
+    II_SAVE(ii_decls, ii_dn, IIDecl)
     Expr **cinit_s = ii_cn_s ? xs_alloc(sizeof(Expr *) * (size_t)ii_cn_s) : NULL; if (ii_cn_s) memcpy(cinit_s, ii_cinit, sizeof(Expr *) * (size_t)ii_cn_s);
     Expr **linit_s = ii_ln_s ? xs_alloc(sizeof(Expr *) * (size_t)ii_ln_s) : NULL; if (ii_ln_s) memcpy(linit_s, ii_linit, sizeof(Expr *) * (size_t)ii_ln_s);
     jmp_buf *outer = xs_error_recover;
@@ -18956,6 +20085,7 @@ static Type *fret(Func *f, Pos pos) {
     II_BACK(ii_anames, ii_an, const char *)
     II_BACK(ii_lnames, ii_ln, const char *)
     II_BACK(ii_cnames, ii_cn, const char *)
+    II_BACK(ii_decls, ii_dn, IIDecl)
     if (ii_cn_s) { ii_cinit = realloc(ii_cinit, sizeof(Expr *) * (size_t)ii_cn_s); memcpy(ii_cinit, cinit_s, sizeof(Expr *) * (size_t)ii_cn_s); }
     if (ii_ln_s) { ii_linit = realloc(ii_linit, sizeof(Expr *) * (size_t)ii_ln_s); memcpy(ii_linit, linit_s, sizeof(Expr *) * (size_t)ii_ln_s); }
     if (!ok || !f->ret || f->ret_failed) { /* its body had an error (reported there): what uses it stops quietly */
@@ -18966,6 +20096,27 @@ static Type *fret(Func *f, Pos pos) {
     return f->ret;
 }
 
+/* the first `this` (or super.m) in a statement, arrows included (they would capture the object before it exists) */
+static Expr *this_use_s(Stmt *s);
+static Expr *this_use_e(Expr *e) {
+    if (!e) return NULL;
+    if (e->kind == E_THIS) return e;
+    if (e->kind == E_IDENT && e->str && strcmp(e->str, "super") == 0) return e;
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) return this_use_s(e->arrow->fn->body);
+    Expr *r;
+    if ((r = this_use_e(e->lhs)) || (r = this_use_e(e->rhs))) return r;
+    for (int i = 0; i < e->args.len; i++) if ((r = this_use_e(e->args.items[i]))) return r;
+    return NULL;
+}
+static Expr *this_use_s(Stmt *s) {
+    if (!s) return NULL;
+    Expr *r;
+    if ((r = this_use_e(s->init)) || (r = this_use_e(s->expr)) || (r = this_use_e(s->cond)) || (r = this_use_e(s->for_update))) return r;
+    if ((r = this_use_s(s->for_init)) || (r = this_use_s(s->body)) || (r = this_use_s(s->else_body))) return r;
+    for (int i = 0; i < s->stmts.len; i++) if ((r = this_use_s(s->stmts.items[i]))) return r;
+    for (int i = 0; i < s->ncases; i++) if ((r = this_use_e(s->cases[i].value)) || (r = this_use_s(s->cases[i].body))) return r;
+    return NULL;
+}
 /* a class's field initializers, constructor and methods */
 static void check_class_bodies(Class *c) {
     enter_module(c->mod);
@@ -18987,13 +20138,21 @@ static void check_class_bodies(Class *c) {
             if (needs_super) {
                 StmtList *l = &c->ctor->body->stmts;
                 Stmt *s0 = l->len ? l->items[0] : NULL;
-                /* statements before super(...) that do not use `this` (TypeScript checks that; tsc-checked code only) */
-                if (tsc_checked())
-                    for (int k = 0; k < l->len; k++) {
-                        Stmt *sk = l->items[k];
-                        if (sk->kind == S_EXPR && sk->expr->kind == E_CALL && sk->expr->lhs && sk->expr->lhs->kind == E_IDENT &&
-                            strcmp(sk->expr->lhs->str, "super") == 0) { s0 = sk; break; }
+                /* statements before super(...) (TypeScript 4.6+) that do not use `this` (or super.m()): the object
+                   does not exist yet there (XB-153); the field initializers run right after super(...) (emit) */
+                for (int k = 0; k < l->len; k++) {
+                    Stmt *sk = l->items[k];
+                    if (sk->kind == S_EXPR && sk->expr->kind == E_CALL && sk->expr->lhs && sk->expr->lhs->kind == E_IDENT &&
+                        strcmp(sk->expr->lhs->str, "super") == 0) {
+                        for (int j = 0; j < k; j++) {
+                            Expr *th = this_use_s(l->items[j]);
+                            if (th) xs_error(XS8131, th->pos, "'this' (and super.m()) can be used once super(...) has run",
+                                             "the constructor of %s must call super(...) first", c->name);
+                        }
+                        s0 = sk;
+                        break;
                     }
+                }
                 if (!s0 || s0->kind != S_EXPR || s0->expr->kind != E_CALL || !s0->expr->lhs || s0->expr->lhs->kind != E_IDENT || strcmp(s0->expr->lhs->str, "super") != 0)
                     xs_error(XS8131, s0 ? s0->pos : c->ctor->pos, xs_sprintf("start the constructor with super(...): %s extends %s", c->name, c->base->name),
                              "the constructor of %s must call super(...) first", c->name);
@@ -19115,6 +20274,36 @@ static void sig_failed(Func *f) {
     f->ret_infer = 3;
     f->sig_failed = true;
 }
+/* class C extends B: B found (an instance for B<A>), C linked under it (check_program, bases first) */
+static void link_base(Class *c) {
+    Class *b = find_class(c->base_name);
+    if (b && b->alias) b = alias_base(b, c->base_pos); /* (implements XContract = Contract<In, Out>: that instance) */
+    if (!b) {
+        int n; const char **cands = class_names(&n);
+        if (missing_name(c->base_name)) xs_error_quiet();
+        xs_error(XS9031, c->base_pos, xs_help_suggest(c->base_name, cands, n, NULL), "unknown class '%s'", c->base_name);
+    }
+    if (c->nbase_targs && !c->ntparams) { /* class X extends Base<A>: the instance Base<A> is the base */
+        if (b->ntparams != c->nbase_targs)
+            xs_error(XS8063, c->base_pos, NULL, "'%s' takes %d type argument(s), got %d", b->name, b->ntparams, c->nbase_targs);
+        Type **args = xs_alloc(sizeof(Type *) * (size_t)c->nbase_targs);
+        for (int k = 0; k < c->nbase_targs; k++) args[k] = resolve(c->base_targs[k], c->base_pos);
+        if (xs_keep_going) { /* an instance naming what could not be loaded costs this base only */
+            Class *tb = b;
+            b = NULL;
+            RECOVER_BEGIN b = instantiate_class(tb, args, c->base_pos); RECOVER_END
+            enter_module(c->mod);
+            if (!b) { c->base_name = NULL; return; }
+        } else b = instantiate_class(b, args, c->base_pos);
+        enter_module(c->mod);
+    } else if (c->nbase_targs) xs_error(XS6022, c->base_pos, NULL, "a generic class extending a generic class is not supported yet");
+    if (b->is_interface) xs_error(XS9004, c->base_pos, xs_sprintf("class %s implements %s", c->name, b->name), "'%s' is an interface; a class extends classes", b->name);
+    if (b->builtin && strcmp(b->name, "Error") == 0) { error_class(c); return; }
+    if (b->builtin) xs_error(XS6024, c->base_pos, "wrap it in a field instead", "extending the built-in class %s is not supported", b->name);
+    c->base = b;
+    b->subs = realloc(b->subs, sizeof(Class *) * (size_t)(b->nsubs + 1));
+    b->subs[b->nsubs++] = c;
+}
 void check_program(Program *p) {
     prog = p;
     init_builtins();
@@ -19211,7 +20400,7 @@ void check_program(Program *p) {
                 }
                 if (!found) {
                     enter_module(m);
-                    if (xs_check_mode) { /* xisto check: reported, and checking goes on (its uses are quiet, as a missing module's) */
+                    if (xs_keep_going) { /* reported, and checking goes on (its uses are quiet, as a missing module's) */
                         xs_error_continue(XS9012, im->positions[k], xs_sprintf("add 'export' in front of its declaration in %s", im->from->file), "'%s' is not exported by '%s'", name, im->path);
                         missing_names = realloc(missing_names, sizeof(char *) * (size_t)(nmissing_names + 1));
                         missing_names[nmissing_names++] = (char *)name;
@@ -19226,7 +20415,7 @@ void check_program(Program *p) {
         if (p->funcs[i]->mod->builtin) continue;
         enter_module(p->funcs[i]->mod);
         if (p->funcs[i]->ntparams) continue; /* a template resolves per instance */
-        if (!xs_check_mode) { resolve_signature(p->funcs[i]); continue; }
+        if (!xs_keep_going) { resolve_signature(p->funcs[i]); continue; }
         RECOVER_BEGIN resolve_signature(p->funcs[i]); RECOVER_END /* xisto check: a type of a module that is not there (reported) costs this function */
         if (failed_) sig_failed(p->funcs[i]);
     }
@@ -19244,7 +20433,7 @@ void check_program(Program *p) {
             if (b && b->iface_methods && !b->ntparams) { c->base_name = c->iface_bases[0]; c->base_pos = c->pos; c->niface_bases = 0; }
         }
         if (c->ntparams || c->niface_bases) { /* (fields: the base's, which the implementation declares again) */
-            if (xs_check_mode) { /* xisto check: reported, and the rest of the program is still checked */
+            if (xs_keep_going) { /* reported, and the rest of the program is still checked */
                 xs_error_continue(XS8113, c->pos, "keep the methods in an interface of their own (or use an abstract class)",
                                   "interface '%s' has methods and %s", c->name, c->ntparams ? "type parameters" : c->nfields ? "fields" : "bases");
                 continue;
@@ -19271,35 +20460,11 @@ void check_program(Program *p) {
         Class *c = p->classes[i];
         enter_module(c->mod);
         if (c->mixin) apply_mixin(c);
-        if (c->base_name) {
-            Class *b = find_class(c->base_name);
-            if (b && b->alias) b = alias_base(b, c->base_pos); /* (implements XContract = Contract<In, Out>: that instance) */
-            if (!b) {
-                int n; const char **cands = class_names(&n);
-                if (missing_name(c->base_name)) xs_error_quiet();
-                xs_error(XS9031, c->base_pos, xs_help_suggest(c->base_name, cands, n, NULL), "unknown class '%s'", c->base_name);
-            }
-            if (c->nbase_targs && !c->ntparams) { /* class X extends Base<A>: the instance Base<A> is the base */
-                if (b->ntparams != c->nbase_targs)
-                    xs_error(XS8063, c->base_pos, NULL, "'%s' takes %d type argument(s), got %d", b->name, b->ntparams, c->nbase_targs);
-                Type **args = xs_alloc(sizeof(Type *) * (size_t)c->nbase_targs);
-                for (int k = 0; k < c->nbase_targs; k++) args[k] = resolve(c->base_targs[k], c->base_pos);
-                if (xs_check_mode) { /* xisto check: an instance naming what could not be loaded costs this base only */
-                    Class *tb = b;
-                    b = NULL;
-                    RECOVER_BEGIN b = instantiate_class(tb, args, c->base_pos); RECOVER_END
-                    enter_module(c->mod);
-                    if (!b) { c->base_name = NULL; continue; }
-                } else b = instantiate_class(b, args, c->base_pos);
-                enter_module(c->mod);
-            } else if (c->nbase_targs) xs_error(XS6022, c->base_pos, NULL, "a generic class extending a generic class is not supported yet");
-            if (b->is_interface) xs_error(XS9004, c->base_pos, xs_sprintf("class %s implements %s", c->name, b->name), "'%s' is an interface; a class extends classes", b->name);
-            if (b->builtin && strcmp(b->name, "Error") == 0) { error_class(c); continue; }
-            if (b->builtin) xs_error(XS6024, c->base_pos, "wrap it in a field instead", "extending the built-in class %s is not supported", b->name);
-            c->base = b;
-            b->subs = realloc(b->subs, sizeof(Class *) * (size_t)(b->nsubs + 1));
-            b->subs[b->nsubs++] = c;
-        }
+        if (!c->base_name) continue;
+        if (!xs_keep_going) { link_base(c); continue; }
+        RECOVER_BEGIN link_base(c); RECOVER_END /* (a base that cannot be linked: reported, the class has none) */
+        enter_module(c->mod);
+        if (failed_ && !c->base) c->base_name = NULL;
     }
     for (int i = 0; i < p->nclasses; i++) flatten_fields(p->classes[i], 0);
     for (int i = 0; i < p->nclasses; i++) {
@@ -19313,7 +20478,7 @@ void check_program(Program *p) {
             Field *fd = &c->fields[k];
             for (int j = 0; j < k; j++)
                 if (strcmp(fd->name, c->fields[j].name) == 0) xs_error(XS9023, fd->pos, NULL, "field '%s' is declared twice", fd->name);
-            if (!fd->type && xs_check_mode) { /* xisto check: a field whose value cannot type it reads as unknown */
+            if (!fd->type && xs_keep_going) { /* a field whose value cannot type it reads as unknown */
                 bool ok = false;
                 RECOVER_BEGIN infer_field_type(c, fd); ok = true; RECOVER_END
                 enter_module(c->mod);
@@ -19323,7 +20488,7 @@ void check_program(Program *p) {
             if (!fd->type) { fd->cname = field_cname(fd->name); continue; } /* (typed later, late_fields) */
             Module *fmod = fd->owner && fd->owner->mod ? fd->owner->mod : c->mod; /* an inherited field: its type reads where it is written */
             if (fmod != cur_mod) enter_module(fmod);
-            if (xs_check_mode) { /* xisto check: a field naming what could not be loaded reads as unknown */
+            if (xs_keep_going) { /* a field naming what could not be loaded reads as unknown */
                 Type *ft = fd->type;
                 bool ok = false;
                 RECOVER_BEGIN ft = resolve(ft, fd->pos); ok = true; RECOVER_END
@@ -19340,12 +20505,12 @@ void check_program(Program *p) {
                 if (strcmp(m->name, c->methods[j]->name) == 0) xs_error(XS9027, m->pos, NULL, "method '%s' is declared twice", m->name);
             if (find_field(c, m->name, NULL)) xs_error(XS9007, m->pos, NULL, "'%s' is both a field and a method of %s", m->name, c->name);
             if (!m->is_native) m->cname = xs_sprintf("m%d_%s_%s", c->mod->id, c->name, m->name);
-            if (!m->ntparams && xs_check_mode) { RECOVER_BEGIN resolve_signature(m); RECOVER_END enter_module(c->mod); cur_class = NULL; if (failed_) sig_failed(m); }
+            if (!m->ntparams && xs_keep_going) { RECOVER_BEGIN resolve_signature(m); RECOVER_END enter_module(c->mod); cur_class = NULL; if (failed_) sig_failed(m); }
             else if (!m->ntparams) resolve_signature(m);
         }
         if (c->ctor) {
             if (!c->ctor->is_native) c->ctor->cname = xs_sprintf("c%d_%s_new", c->mod->id, c->name);
-            if (xs_check_mode) {
+            if (xs_keep_going) {
                 RECOVER_BEGIN resolve_signature(c->ctor); RECOVER_END
                 enter_module(c->mod);
                 cur_class = NULL;
@@ -19355,7 +20520,7 @@ void check_program(Program *p) {
     }
     for (int i = 0; i < p->nclasses; i++) {
         enter_module(p->classes[i]->mod);
-        if (xs_check_mode) { RECOVER_BEGIN flatten_methods(p->classes[i]); RECOVER_END cur_class = NULL; } /* (xisto check: reported, on to the next) */
+        if (xs_keep_going) { RECOVER_BEGIN flatten_methods(p->classes[i]); RECOVER_END cur_class = NULL; } /* (reported, on to the next) */
         else flatten_methods(p->classes[i]);
     }
     /* fields typed by a value that calls a function or a method: now that every signature is known */
@@ -19415,7 +20580,7 @@ void check_program(Program *p) {
                     *alias = *b;
                     if (qualified) alias->name = xs_sprintf("%s\x01%s", b->name, im->path);
                     alias->origin = b;
-                    alias->is_const = true;
+                    alias->is_const = is_static ? b->is_const : true; /* Class.x = v from another module, as in TypeScript, unless readonly (XB-228) */
                     alias->next = scope->head;
                     scope->head = alias;
                 }
@@ -19450,11 +20615,17 @@ void check_program(Program *p) {
     for (int i = 0; i < p->nfuncs; i++)
         if (!p->funcs[i]->mod->builtin && !p->funcs[i]->ntparams && !p->funcs[i]->sig_failed) { RECOVER_BEGIN check_func(p->funcs[i]); RECOVER_END }
     /* generic instances, classes and functions (an instance can make more); then they join the program */
-    for (int w = 0, cw = 0; w < ngen_work || cw < nclass_work;) {
+    for (int w = 0, cw = 0; w < ngen_work || cw < nclass_work || (w == ngen_work && pv_more());) {
         if (cw < nclass_work) { check_class_bodies(class_work[cw++]); continue; }
-        RECOVER_BEGIN check_func(gen_work[w]); RECOVER_END
+        Func *gf = gen_work[w];
+        int muted = xs_muted_errors;
+        xs_diag_mute = gf->pv_of != NULL; /* (a promise version: the function's own errors were reported with it) */
+        RECOVER_BEGIN check_func(gf); RECOVER_END
+        xs_diag_mute = false;
+        if (gf->pv_of) gf->pv_ok = xs_muted_errors == muted && !failed_;
         w++;
-    }
+    } /* (pv_more: the promise versions awaited calls need, XB-231, checked in turn) */
+    pv_finish();
     {   /* the templates of generic classes leave the program: only their instances are emitted */
         int k = 0;
         for (int i = 0; i < p->nclasses; i++) if (!p->classes[i]->gen_state) p->classes[k++] = p->classes[i];
@@ -19462,6 +20633,7 @@ void check_program(Program *p) {
     }
     for (int w = 0; w < ngen_work; w++) {
         Func *f = gen_work[w];
+        if (f->pv_of && !f->pv_ok) continue; /* (a promise version not used) */
         if (f->cls) {
             f->cls->methods = realloc(f->cls->methods, sizeof(Func *) * (size_t)(f->cls->nmethods + 1));
             f->cls->methods[f->cls->nmethods++] = f;
@@ -19474,7 +20646,7 @@ void check_program(Program *p) {
     xs_error_recover = NULL;
     xs_warn_rule_summary(); /* (one line: the rule warnings, XB-118) */
     if (xs_error_count) {
-        if (!xs_json_errors) fprintf(stderr, "xisto: %d error%s\n", xs_error_count, xs_error_count == 1 ? "" : "s");
+        xs_error_summary();
         exit(1);
     }
 }

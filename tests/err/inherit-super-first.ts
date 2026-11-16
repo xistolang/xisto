@@ -7,7 +7,7 @@ class A {
 }
 class B extends A {
   constructor() {
-    console.log("before");
+    console.log("before", this.x);
     super(1);
   }
 }

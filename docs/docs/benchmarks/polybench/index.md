@@ -30,7 +30,9 @@ optimizations. The Benchmarks Game measures programs; PolyBench measures the **c
 ## Score
 
 One page per contestant, with kernel time, CPU and memory per kernel and the C reference beside them:
-[Xisto vs Rust](./vs-rust.md), [Xisto vs Go](./vs-go.md).
+[Xisto vs Rust](./vs-rust.md), [Xisto vs Go](./vs-go.md), [Xisto vs Node](./vs-node.md),
+[Xisto vs Bun](./vs-bun.md). Node and Bun run the very same `.ts` files Xisto compiles: Xisto wins all 30 kernels
+against both on both VMs (15 Nov), 3× to 33× faster than Node and 1.4× to 25× faster than Bun.
 
 
 | machine | Xisto wins | ties | losses |

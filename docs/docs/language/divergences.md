@@ -29,6 +29,8 @@ Every row was checked on 12 Nov 2026 by running the same program with xisto and 
 | `Map.get` of a missing key | `undefined` | `null`; with an `int`, `number` or `boolean` value that is so wherever the result can be absent: `m.get(k) ?? d`, `m.get(k) \|\| d`, `m.get(k) === undefined`, a condition, `const v = m.get(k)` (`v` is `T \| null`) and a `T \| undefined` return, argument or field; where only a `T` fits (`m.get(k) + 1`) it is a run-time error (check with `has()` first) | no `undefined` |
 | field missing on an `any` | `undefined` | `null` | |
 | `x!`, `x as T`, `base as Sub` | trusted | checked: `TypeError` | nothing silent |
+| `x instanceof C`, `x: object` | `true` for a `C` | error XS8150 | an `object` holds JSON data, not the instance: declare `C`, a union or `unknown` |
+| `Sub.x = v` (or `this.x = v` in a static method `Sub` inherits), `x` a static field of a base | `Sub` gets a property of its own | error XS8151 | one variable per static: write it through the class that declares it |
 | `arr[i]`, `bytes[i]` out of bounds | `undefined` | run-time error (catchable) | |
 
 ## Conditions and operators

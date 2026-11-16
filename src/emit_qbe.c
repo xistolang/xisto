@@ -1384,7 +1384,7 @@ Unit *emit_program_qbe_units(Program *p, int *nunits) {
         }
         for (int i = 0; i < p->nfuncs; i++) {
             Func *f = p->funcs[i];
-            if (f->mod != m || !f->used) continue;
+            if (f->mod != m || !f->used || f->is_native || !f->body) continue; /* (a native one is the runtime's C) */
             if (!any) buf_printf(out, "# module %s\n", m->file);
             any = true;
             emit_func(f);

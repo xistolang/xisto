@@ -1,0 +1,18 @@
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+top - 01:35:22 up 3 days, 45 min,  0 users,  load average: 0.88, 0.64, 0.32
+Tasks: 144 total,   1 running, 143 sleeping,   0 stopped,   0 zombie
+%Cpu(s):  5.6 us, 22.2 sy,  0.0 ni, 50.0 id,  0.0 wa,  0.0 hi, 22.2 si,  0.0 st
+MiB Mem :   1840.8 total,    308.7 free,    501.3 used,   1030.8 buff/cache
+MiB Swap:      0.0 total,      0.0 free,      0.0 used.   1125.9 avail Mem 
+
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 530823 ec2-user  20   0  442120 172376   3448 S  60.0   9.1   0:12.36 wrk.real
+      1 root      20   0  184724  13316   7236 S   0.0   0.7   0:47.49 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.15 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+      5 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+      6 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+      7 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+

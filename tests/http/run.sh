@@ -135,6 +135,31 @@ def cpu():
 c0 = cpu(); time.sleep(1.0); c1 = cpu()
 print("parked client left: %s (%.2f s of CPU in 1 s)" % ("idle cpu" if c1 - c0 < 0.2 else "SPINNING", c1 - c0))
 PY
+# Node's status lines (http.STATUS_CODES); HEAD runs the GET route and gets its head without the body; one slash after
+# the path is the same route (Express); what a handler printed is out while the server waits for the next request
+python3 - "$T/server.log" <<'PY'
+import socket, sys, time
+def raw(req):
+    s = socket.create_connection(("127.0.0.1", 8080)); s.settimeout(3)
+    s.sendall(req); data = b""
+    try:
+        while True:
+            c = s.recv(65536)
+            if not c: break
+            data += c
+    except socket.timeout: pass
+    s.close(); return data
+lines = [raw(b"GET /status/%s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n" % k).split(b"\r\n")[0].decode() for k in (b"created", b"missing", b"tea")]
+print("status lines:", " | ".join(lines))
+h = raw(b"HEAD /status/list HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+head, _, body = h.partition(b"\r\n\r\n")
+print("head request:", head.split(b"\r\n")[0].decode(), "length", [l for l in head.split(b"\r\n") if l.lower().startswith(b"content-length")][0].decode(), "body bytes", len(body))
+t = raw(b"GET /who/ann/?n=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").partition(b"\r\n\r\n")[2].decode()
+print("trailing slash:", t.split(";")[0])
+raw(b"GET /logged?n=7 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+time.sleep(0.3)
+print("stdout while waiting:", "out" if "handled 7" in open(sys.argv[1]).read() else "HELD")
+PY
 # SIGTERM with a request in flight: it completes, new connections are refused, the process exits 0
 python3 - "$SRV" <<'PY'
 import os, signal, sys, threading, time, urllib.request, socket

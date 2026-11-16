@@ -44,13 +44,13 @@ const sidebars = {
           type: 'category',
           label: 'Benchmarks Game',
           link: {type: 'doc', id: 'benchmarks/benchmarks-game/index'},
-          items: ['benchmarks/benchmarks-game/vs-rust', 'benchmarks/benchmarks-game/vs-node', 'benchmarks/benchmarks-game/vs-bun'],
+          items: ['benchmarks/benchmarks-game/vs-rust', 'benchmarks/benchmarks-game/vs-node', 'benchmarks/benchmarks-game/vs-bun', 'benchmarks/benchmarks-game/vs-go'],
         },
         {
           type: 'category',
           label: 'PolyBench',
           link: {type: 'doc', id: 'benchmarks/polybench/index'},
-          items: ['benchmarks/polybench/vs-rust', 'benchmarks/polybench/vs-go'],
+          items: ['benchmarks/polybench/vs-rust', 'benchmarks/polybench/vs-go', 'benchmarks/polybench/vs-node', 'benchmarks/polybench/vs-bun'],
         },
         {
           type: 'category',

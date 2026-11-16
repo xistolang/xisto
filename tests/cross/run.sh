@@ -18,6 +18,14 @@ for t in linux-arm64 linux-x64; do
         build/xisto build --target=$t "$f" -o "$W/bin/$t/$n" > "$W/bin/$t/$n.build" 2>&1 || { echo "FAIL build $t $n"; fail=$((fail+1)); }
     done
 done
+# the call-site table (stack traces, the profiler's frames) survives zig's linker (XB-245: lld's --gc-sections dropped
+# it, and every frame of a cross build was unknown)
+RE=$(command -v llvm-readelf || ls /opt/homebrew/opt/llvm/bin/llvm-readelf 2> /dev/null)
+if [ -n "$RE" ]; then
+    for t in linux-arm64 linux-x64; do
+        "$RE" -S "$W/bin/$t/classes" | grep -q ' xs_sites ' || { echo "FAIL $t: no xs_sites section in the executable"; fail=$((fail+1)); }
+    done
+fi
 cat > "$W/run.sh" <<'IN'
 cd /tmp && cp -r /x/ok /tmp/ok && cd /tmp/ok
 pass=0; fail=0

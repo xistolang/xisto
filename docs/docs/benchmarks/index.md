@@ -46,6 +46,10 @@ of 3 (close kernels re-measured with the sides interleaved), a tie within 3%, ag
 
 The per-kernel tables, with the C reference beside them, are on [PolyBench](./polybench/index.md).
 
+Against Node v26.12 and Bun 1.4.4 running the very same `.ts` files (15 Nov, after the `gemm` fix): Xisto wins all
+30 kernels against both on both VMs, 3× to 33× faster than Node and 1.4× to 25× faster than Bun. Tables:
+[Xisto vs Node](./polybench/vs-node.md), [Xisto vs Bun](./polybench/vs-bun.md).
+
 ## TechEmpower (json, plaintext)
 
 15 Nov 2026, main `f766bf8`, the TFB's rules: servers on the Xeon, wrk on the Graviton2 over the private network,
@@ -81,6 +85,12 @@ time and on memory: from 1.3× (regex-redux against Bun on the M4) to 200× (k-n
 Most xisto variants use every core while the Node programs use one, so the CPU columns are the fairer comparison;
 xisto uses less CPU on every row but regex-redux against Bun on the M4 (0.37 s against 0.34 s). The tables are on
 [Xisto vs Node](./benchmarks-game/vs-node.md) and [Xisto vs Bun](./benchmarks-game/vs-bun.md).
+
+## Benchmarks Game against Go
+
+15 Nov 2026, main `f766bf8` against every official Go program (Go 1.27.2, regex-redux with PCRE 8.45 and its JIT)
+on the Xeon: 10 wins out of 10, from 1.2× (reverse-complement) to 10.8× (binary-trees), with less CPU on every row
+and less memory on 9 of 10 (n-body 2.0 against 1.9 MB). The table is on [Xisto vs Go](./benchmarks-game/vs-go.md).
 
 ## Servers
 

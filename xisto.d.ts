@@ -12,8 +12,11 @@ declare class HttpRequest {
 declare class HttpResponse {
   readonly status: int;
   readonly body: string;
-  static text(body: string): HttpResponse;
-  static json(body: string): HttpResponse;
+  /** text/plain; the status defaults to 200. */
+  static text(body: string, status?: int): HttpResponse;
+  /** application/json (the body is already JSON text); the status defaults to 200. */
+  static json(body: string, status?: int): HttpResponse;
+  /** text/plain with this status; for a JSON body use json(body, status). */
   static status(code: int, body: string): HttpResponse;
 }
 declare class Server {

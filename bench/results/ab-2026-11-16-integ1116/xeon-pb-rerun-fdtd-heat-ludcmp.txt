@@ -1,0 +1,49 @@
+## pb 3f8ed5e
+fdtd-2d        xisto  fdtd-2d.ts              1.758s     1.76cpu     29.6MB  par  1.0  kern    1.730s  same
+heat-3d        xisto  heat-3d.ts              1.825s     1.82cpu     31.3MB  par  1.0  kern    1.794s  same
+ludcmp         xisto  ludcmp.ts               8.344s     8.34cpu     63.2MB  par  1.0  kern    2.381s  same
+## pb 16860db
+fdtd-2d        xisto  fdtd-2d.ts              1.682s     1.68cpu     29.5MB  par  1.0  kern    1.656s  same
+heat-3d        xisto  heat-3d.ts              1.860s     1.86cpu     31.3MB  par  1.0  kern    1.833s  same
+ludcmp         xisto  ludcmp.ts               8.374s     8.37cpu     63.2MB  par  1.0  kern    2.389s  same
+## pb 16860db
+fdtd-2d        xisto  fdtd-2d.ts              1.636s     1.64cpu     29.5MB  par  1.0  kern    1.610s  same
+heat-3d        xisto  heat-3d.ts              1.809s     1.81cpu     31.4MB  par  1.0  kern    1.781s  same
+ludcmp         xisto  ludcmp.ts               8.443s     8.44cpu     63.3MB  par  1.0  kern    2.337s  same
+## pb 3f8ed5e
+fdtd-2d        xisto  fdtd-2d.ts              1.601s     1.60cpu     29.6MB  par  1.0  kern    1.575s  same
+heat-3d        xisto  heat-3d.ts              1.886s     1.88cpu     31.3MB  par  1.0  kern    1.858s  same
+ludcmp         xisto  ludcmp.ts               8.415s     8.41cpu     63.3MB  par  1.0  kern    2.325s  same
+## pb 3f8ed5e
+fdtd-2d        xisto  fdtd-2d.ts              1.644s     1.64cpu     29.6MB  par  1.0  kern    1.615s  same
+heat-3d        xisto  heat-3d.ts              1.788s     1.79cpu     31.3MB  par  1.0  kern    1.761s  same
+ludcmp         xisto  ludcmp.ts               8.397s     8.39cpu     63.2MB  par  1.0  kern    2.296s  same
+## pb 16860db
+fdtd-2d        xisto  fdtd-2d.ts              1.650s     1.65cpu     29.6MB  par  1.0  kern    1.624s  same
+heat-3d        xisto  heat-3d.ts              1.803s     1.80cpu     31.3MB  par  1.0  kern    1.777s  same
+ludcmp         xisto  ludcmp.ts               8.395s     8.39cpu     63.2MB  par  1.0  kern    2.334s  same
+## pb 16860db
+fdtd-2d        xisto  fdtd-2d.ts              1.694s     1.69cpu     29.5MB  par  1.0  kern    1.668s  same
+heat-3d        xisto  heat-3d.ts              1.816s     1.81cpu     31.3MB  par  1.0  kern    1.789s  same
+ludcmp         xisto  ludcmp.ts               8.355s     8.35cpu     63.2MB  par  1.0  kern    2.307s  same
+## pb 3f8ed5e
+fdtd-2d        xisto  fdtd-2d.ts              1.680s     1.68cpu     29.6MB  par  1.0  kern    1.655s  same
+heat-3d        xisto  heat-3d.ts              1.834s     1.83cpu     31.3MB  par  1.0  kern    1.807s  same
+ludcmp         xisto  ludcmp.ts               8.349s     8.35cpu     63.2MB  par  1.0  kern    2.330s  same
+## pb 3f8ed5e
+fdtd-2d        xisto  fdtd-2d.ts              1.683s     1.68cpu     29.6MB  par  1.0  kern    1.656s  same
+heat-3d        xisto  heat-3d.ts              1.850s     1.85cpu     31.3MB  par  1.0  kern    1.820s  same
+ludcmp         xisto  ludcmp.ts               8.284s     8.28cpu     63.3MB  par  1.0  kern    2.363s  same
+## pb 16860db
+fdtd-2d        xisto  fdtd-2d.ts              1.641s     1.64cpu     29.6MB  par  1.0  kern    1.614s  same
+heat-3d        xisto  heat-3d.ts              1.869s     1.87cpu     31.3MB  par  1.0  kern    1.841s  same
+ludcmp         xisto  ludcmp.ts               8.373s     8.37cpu     63.2MB  par  1.0  kern    2.309s  same
+## pb 16860db
+fdtd-2d        xisto  fdtd-2d.ts              1.649s     1.65cpu     29.6MB  par  1.0  kern    1.625s  same
+heat-3d        xisto  heat-3d.ts              1.856s     1.85cpu     31.3MB  par  1.0  kern    1.828s  same
+ludcmp         xisto  ludcmp.ts               8.312s     8.31cpu     63.3MB  par  1.0  kern    2.303s  same
+## pb 3f8ed5e
+fdtd-2d        xisto  fdtd-2d.ts              1.683s     1.68cpu     29.6MB  par  1.0  kern    1.657s  same
+heat-3d        xisto  heat-3d.ts              1.874s     1.87cpu     31.3MB  par  1.0  kern    1.847s  same
+ludcmp         xisto  ludcmp.ts               8.318s     8.32cpu     63.3MB  par  1.0  kern    2.367s  same
+DONE

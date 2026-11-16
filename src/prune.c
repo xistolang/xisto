@@ -25,6 +25,31 @@ static void walk_expr(Expr *e);
 static void walk_stmt(Stmt *s);
 static void use_type(Type *t);
 
+/* XB-232: which classes can have objects (made), for the TLS decision: a method reached only through its base's
+   dispatch (an interface's other implementation) cannot run when no object of its class exists. Made: new C, an
+   object literal of C, and what decoding, casts and the runtime's calls give (their result type, its fields too). */
+static void made_type(Type *t);
+static void made_class(Class *c) {
+    if (!c || c->made || c->builtin) return;
+    c->made = true;
+    for (int i = 0; i < c->nfields; i++) made_type(c->fields[i].type);
+}
+static void made_type(Type *t) {
+    if (!t) return;
+    switch (t->kind) {
+    case TY_OBJECT: made_class(t->cls); break;
+    case TY_ARRAY: case TY_SET: case TY_NULLABLE: made_type(t->elem); break;
+    case TY_MAP: made_type(t->key); made_type(t->elem); break;
+    case TY_UNION: for (int i = 0; i < t->nparams; i++) made_type(t->params[i]); break;
+    default: break;
+    }
+}
+static bool made_or_sub(Class *c, int depth) {
+    if (!c || c->made || depth > 64) return c != NULL;
+    for (int i = 0; i < c->nsubs; i++) if (made_or_sub(c->subs[i], depth + 1)) return true;
+    return false;
+}
+
 static void use_class(Class *c) {
     if (!c || c->used || c->builtin) return;
     c->used = true;
@@ -40,10 +65,19 @@ static void use_class(Class *c) {
             push_func(c->methods[i]);
 }
 
+/* a built-in class whose struct lives in runtime/xisto_net.h (as checker.c's net_class): a field, parameter or
+   value of that type needs the struct declared, so the network runtime, even when no member of it is used
+   (a class with an `HttpRequest | null` field in a program that runs no server) */
+static bool net_struct(const Class *c) {
+    static const char *const names[] = {"Response", "ReadableStream", "HttpRequest", "HttpResponse", "Server", "Worker", "MessagePort"};
+    if (!c || !c->builtin) return false;
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) if (strcmp(c->name, names[i]) == 0) return true;
+    return false;
+}
 static void use_type(Type *t) {
     if (!t) return;
     switch (t->kind) {
-    case TY_OBJECT: use_class(t->cls); break;
+    case TY_OBJECT: if (net_struct(t->cls)) prog->uses_net = true; use_class(t->cls); break;
     case TY_ARRAY: case TY_SET: case TY_NULLABLE: use_type(t->elem); break;
     case TY_MAP: use_type(t->key); use_type(t->elem); break;
     case TY_FUNC: for (int i = 0; i < t->nparams; i++) use_type(t->params[i]); use_type(t->ret); break;
@@ -55,6 +89,11 @@ static void use_type(Type *t) {
 static void walk_expr(Expr *e) {
     if (!e) return;
     use_type(e->type);
+    if (e->kind == E_NEW_OBJ || e->kind == E_OBJLIT) made_class(e->cls);
+    if (e->kind == E_AS || ((e->kind == E_CALL || e->kind == E_MEMBER) && (e->builtin.cfn || (e->func && e->func->is_native)))) {
+        made_type(e->type);
+        made_type(e->elem_type);
+    }
     switch (e->kind) {
     case E_CALL:
         if (e->builtin.cfn && strncmp(e->builtin.cfn, "__reflect_", 10) == 0) use_type(e->elem_type); /* decoder/encoder of T */
@@ -111,6 +150,17 @@ static void walk_stmt(Stmt *s) {
     }
 }
 
+static bool listed_func(Program *p, Func *f) {
+    for (int i = 0; i < p->nfuncs; i++) if (p->funcs[i] == f) return true;
+    for (int i = 0; i < p->nclasses; i++) {
+        Class *c = p->classes[i];
+        if (c->ctor == f) return true;
+        for (int k = 0; k < c->nmethods; k++) if (c->methods[k] == f) return true;
+        for (int k = 0; k < c->nstatics; k++) if (c->statics[k] == f) return true;
+    }
+    return false;
+}
+
 void prune_program(Program *p) {
     prog = p;
     /* the checker marks generic instances and anonymous literals used when it makes them: their fields'
@@ -135,7 +185,25 @@ void prune_program(Program *p) {
         for (int i = 0; i < nasif_n; i++)
             for (int k = 0; k < asif_reached[i]->nadapters; k++) {
                 Class *a = asif_reached[i]->adapters[k];
-                if (!a->used && a->adapter_of->used) { use_class(a); more = true; }
+                if (!a->used && a->adapter_of->used) { use_class(a); made_class(a); more = true; }
             }
+    }
+    /* the network runtime (XB-250): needed when a function with such code is reachable; a function the program does
+       not list (an arrow outside any function, a generic instance) counts as reachable */
+    for (int i = 0; i < p->nnet_fns && !p->uses_net; i++) {
+        Func *f = p->net_fns[i];
+        if (f->used || !listed_func(p, f)) p->uses_net = true;
+    }
+    for (int i = 0; i < p->ngen_fns && !p->uses_gen; i++) {
+        Func *f = p->gen_fns[i];
+        if (f->used || !listed_func(p, f)) p->uses_gen = true;
+    }
+    /* TLS (XB-232): a fetch that may be https counts when its function is reachable, and, for a method or a
+       constructor, when an object of its class (or of a subclass) can exist */
+    for (int i = 0; i < p->ntls_fns && !p->uses_tls; i++) {
+        Func *f = p->tls_fns[i];
+        if (!f->used) continue;
+        if (f->cls && !f->static_of && !f->cls->builtin && !made_or_sub(f->cls, 0)) continue;
+        p->uses_tls = true;
     }
 }

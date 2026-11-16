@@ -152,7 +152,55 @@ const char *xs_diag_cat_title(DiagCat c) { return c < DC_COUNT ? cat_table[c].ti
 const char *xs_diag_cat_fix(DiagCat c) { return c < DC_COUNT ? cat_table[c].fix : ""; }
 const char *xs_diag_cat_id(DiagCat c) { return c < DC_COUNT ? cat_table[c].id : ""; }
 bool xs_check_mode;
+bool xs_keep_going = true;
+int xs_max_errors = 100;
 bool xs_lex_skipping;
+
+/* the errors reported, by code and by file: the closing summary of a build (XB-113) */
+static int err_by_code[XS_DIAG_COUNT];
+static const char **err_files;
+static int *err_file_counts;
+static int nerr_files;
+static void count_error(DiagCode code) {
+    err_by_code[code < XS_DIAG_COUNT ? code : 0]++;
+    const char *f = xs_file_name ? xs_file_name : "";
+    for (int i = 0; i < nerr_files; i++)
+        if (err_files[i] == f || strcmp(err_files[i], f) == 0) { err_file_counts[i]++; return; }
+    err_files = realloc(err_files, sizeof(char *) * (size_t)(nerr_files + 1));
+    err_file_counts = realloc(err_file_counts, sizeof(int) * (size_t)(nerr_files + 1));
+    err_files[nerr_files] = f;
+    err_file_counts[nerr_files++] = 1;
+}
+void xs_error_summary(void) {
+    if (xs_json_errors || !xs_error_count) return;
+    fprintf(stderr, "xisto: %d error%s", xs_error_count, xs_error_count == 1 ? "" : "s");
+    int ncodes = 0;
+    for (int c = 0; c < XS_DIAG_COUNT; c++) if (err_by_code[c]) ncodes++;
+    if (xs_error_count > 1 && ncodes) { /* (XS8018 5, XS9034 2): most frequent first */
+        bool *done = xs_alloc(sizeof(bool) * XS_DIAG_COUNT);
+        fputs(" (", stderr);
+        for (int k = 0; k < ncodes; k++) {
+            int best = -1;
+            for (int c = 0; c < XS_DIAG_COUNT; c++) if (err_by_code[c] && !done[c] && (best < 0 || err_by_code[c] > err_by_code[best])) best = c;
+            done[best] = true;
+            fprintf(stderr, "%s%s %d", k ? ", " : "", best ? xs_diag_name((DiagCode)best) : "other", err_by_code[best]);
+        }
+        fputc(')', stderr);
+    }
+    fputc('\n', stderr);
+    if (nerr_files > 1) { /* by file, most errors first (the first 10) */
+        bool *done = xs_alloc(sizeof(bool) * (size_t)nerr_files);
+        fprintf(stderr, "xisto: in %d files:", nerr_files);
+        for (int k = 0; k < nerr_files && k < 10; k++) {
+            int best = -1;
+            for (int i = 0; i < nerr_files; i++) if (!done[i] && (best < 0 || err_file_counts[i] > err_file_counts[best])) best = i;
+            done[best] = true;
+            fprintf(stderr, "%s %s %d", k ? "," : "", xs_display_path(err_files[best]), err_file_counts[best]);
+        }
+        if (nerr_files > 10) fprintf(stderr, ", %d more", nerr_files - 10);
+        fputc('\n', stderr);
+    }
+}
 int xs_quiet_count;
 
 static void report(DiagCode code, const char *severity, Pos pos, const char *help, const char *msg) {
@@ -183,30 +231,44 @@ static char *vformat(const char *fmt, va_list ap) {
     return msg;
 }
 
+/* checking code the program may not use (a promise version, XB-231): its errors are counted here, not reported */
+bool xs_diag_mute;
+int xs_muted_errors;
 void xs_error(DiagCode code, Pos pos, const char *help, const char *fmt, ...) {
+    if (xs_diag_mute) {
+        xs_muted_errors++;
+        if (xs_error_recover) _longjmp(*xs_error_recover, 1);
+    }
     va_list ap;
     va_start(ap, fmt);
     char *msg = vformat(fmt, ap);
     va_end(ap);
     report(code, "error", pos, help, msg);
     xs_error_count++;
-    if (xs_error_recover && (xs_error_count < 20 || xs_check_mode)) _longjmp(*xs_error_recover, 1);
-    if (xs_error_recover && !xs_json_errors) fprintf(stderr, "xisto: stopping after %d errors\n", xs_error_count);
+    count_error(code);
+    if (xs_error_recover && (xs_check_mode || !xs_max_errors || xs_error_count < xs_max_errors)) _longjmp(*xs_error_recover, 1);
+    if (xs_error_recover && !xs_json_errors) { /* (--max-errors) */
+        fprintf(stderr, "xisto: stopping after %d errors (--max-errors N: another limit, 0: none)\n", xs_error_count);
+        xs_error_summary();
+    } else if (xs_error_count > 1) xs_error_summary(); /* (an error no declaration recovers from, after others) */
     exit(1);
 }
 
 void xs_error_continue(DiagCode code, Pos pos, const char *help, const char *fmt, ...) {
+    if (xs_diag_mute) { xs_muted_errors++; return; }
     va_list ap;
     va_start(ap, fmt);
     char *msg = vformat(fmt, ap);
     va_end(ap);
     report(code, "error", pos, help, msg);
     xs_error_count++;
+    count_error(code);
 }
 
 /* stops checking the current statement for an error already reported (a use of a failed declaration) */
 void xs_error_quiet(void) {
-    xs_quiet_count++;
+    if (xs_diag_mute) xs_muted_errors++;
+    else xs_quiet_count++;
     if (xs_error_recover) _longjmp(*xs_error_recover, 1);
     exit(1);
 }
@@ -217,7 +279,7 @@ bool xs_node_compat = false;
 int xs_warning_count;
 
 void xs_warn(Pos pos, const char *help, const char *fmt, ...) {
-    if (!xs_warnings) return;
+    if (!xs_warnings || xs_diag_mute) return;
     va_list ap;
     va_start(ap, fmt);
     char *msg = vformat(fmt, ap);
@@ -264,13 +326,13 @@ static bool warned_before(DiagCode code, Pos pos) {
     return false;
 }
 void xs_warn_rule(DiagCode code, Pos pos, const char *help, const char *fmt, ...) {
-    if (in_package_file()) return;
+    if (in_package_file() || xs_diag_mute) return;
     if (warned_before(code, pos)) return;
     va_list ap;
     va_start(ap, fmt);
     char *msg = vformat(fmt, ap);
     va_end(ap);
-    if (xs_deny_warnings) { report(code, "error", pos, help, msg); xs_error_count++; return; } /* (checking goes on) */
+    if (xs_deny_warnings) { report(code, "error", pos, help, msg); xs_error_count++; count_error(code); return; } /* (checking goes on) */
     rule_warn_counts[code]++;
     if (xs_check_mode) { if (xs_json_errors) report(code, "warning", pos, help, msg); return; }
     if (xs_show_warnings || xs_json_errors) report(code, "warning", pos, help, msg);

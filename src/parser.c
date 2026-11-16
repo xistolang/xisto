@@ -38,9 +38,11 @@ typedef struct {
     char **rest_keys;
     int nrest_keys;
     const char *this_alias; /* inside function (this: T, ...) { }: `this` reads this local (its prologue takes it) */
+    bool method_fn;       /* { m(x) { } }: the next parse_arrow reads a method as a function expression */
 } Parser;
 
 static void rest_param(Parser *p, Func *f, Type *t);
+static bool this_alias_used; /* a `this` read Parser.this_alias (function () { this }: the function takes its object) */
 static void vt_push(Parser *p, const char *name, Type *t) {
     char **n = xs_alloc(sizeof(char *) * (size_t)(p->nvt + 1)); /* (new arrays: copies of the parser may hold the old ones) */
     Type **ty = xs_alloc(sizeof(Type *) * (size_t)(p->nvt + 1));
@@ -263,12 +265,21 @@ static bool looks_like_fn_type(Parser *p) {
 }
 static Type *union_of(Type *a, Type *b);
 static Type *parse_type(Parser *p);
+/* `| null` or `| undefined` after T (the keyword consumed here): T | null. T | undefined with no null in the union is the
+   same type whose null is absent (ty_optional_of): it prints as undefined, as JavaScript's value would; a null anywhere
+   in the union makes it the plain T | null */
+static Type *nullable_kw(Parser *p, Type *t) {
+    bool undef = at_ident(p, "undefined");
+    next(p);
+    if (undef) return t->kind == TY_NULLABLE ? t : ty_optional_of(t);
+    if (t->kind == TY_NULLABLE && t->absent) return ty_nullable_of(t->elem);
+    return ty_nullable_of(t);
+}
 /* after '|': the rest of a union, where null and undefined make it nullable (T | null | U, 'a' | 'b' | null) */
 static Type *union_rest(Parser *p, Type *t) {
     for (;;) {
         if (at_ident(p, "null") || at_ident(p, "undefined")) {
-            next(p);
-            t = ty_nullable_of(t);
+            t = nullable_kw(p, t);
             if (!accept(p, TK_PIPE)) return t;
             continue;
         }
@@ -678,7 +689,7 @@ static Type *parse_type(Parser *p) {
         }
         while (at(p, TK_LBRACKET) && peek_is(p, TK_RBRACKET)) { next(p); next(p); t = ty_array_of(t); }
         if (accept(p, TK_PIPE)) {
-            if (at_ident(p, "null") || at_ident(p, "undefined")) { next(p); t = ty_nullable_of(t); if (accept(p, TK_PIPE)) t = union_of(t, parse_type(p)); }
+            if (at_ident(p, "null") || at_ident(p, "undefined")) { t = nullable_kw(p, t); if (accept(p, TK_PIPE)) t = union_of(t, parse_type(p)); }
             else t = union_of(t, parse_type(p));
         }
         return t;
@@ -1022,11 +1033,10 @@ suffix:
         next(p);
         if (at_ident(p, "null") || at_ident(p, "undefined")) { /* T | undefined: the same nullable type (xisto has one
                                                                     empty, null; an absent optional reads as it) */
-            next(p);
-            t = ty_nullable_of(t);
+            t = nullable_kw(p, t);
             while (at(p, TK_PIPE)) {
                 next(p);
-                if (at_ident(p, "null") || at_ident(p, "undefined")) { next(p); continue; }
+                if (at_ident(p, "null") || at_ident(p, "undefined")) { t = nullable_kw(p, t); continue; }
                 t = union_of(t, parse_type(p));
                 break;
             }
@@ -1158,6 +1168,11 @@ static void prepend_param_decls(Func *f) {
 }
 
 static Expr *ident_expr(Pos pos, const char *name);
+/* const f = () => ..., { next: () => ... }, x = function () {}: JavaScript names the function after what it is
+   given to (console.log shows [Function: f]) */
+static void fn_value_name(Expr *v, const char *name) {
+    if (v && v->kind == E_ARROW && v->arrow && v->arrow->fn && !v->arrow->fn->js_name && name) v->arrow->fn->js_name = (char *)name;
+}
 static Expr *parse_arrow(Parser *p) {
     Pos pos = p->tok.pos;
     Expr *e = new_expr(E_ARROW, pos);
@@ -1167,9 +1182,10 @@ static Expr *parse_arrow(Parser *p) {
     f->pos = pos;
     f->name = "arrow";
     int cap = 0;
-    bool is_fn = accept(p, TK_FUNCTION); /* function (a: A): R { ... }: an arrow (no `this` of its own) */
+    bool is_fn = accept(p, TK_FUNCTION) || p->method_fn; /* function (a: A): R { ... }: an arrow (no `this` of its own) */
+    p->method_fn = false;
     Type *this_t = NULL; /* function (this: T, ...): T */
-    if (is_fn && at(p, TK_IDENT)) next(p);
+    if (is_fn && at(p, TK_IDENT)) { f->js_name = p->tok.str; next(p); } /* (function g() {}: its name, g) */
     /* <T>(sql: string): Promise<T | null> => ...: a generic arrow, held as a function of unknowns (T erased) whose
        signature as written stays with it (Arrow.gen_sig): a call queryOne<Row>(...) converts the result to Row */
     char **gtp = NULL;
@@ -1263,13 +1279,33 @@ static Expr *parse_arrow(Parser *p) {
     }
     if (is_fn) { if (!at(p, TK_LBRACE)) expect(p, TK_LBRACE, NULL); }
     else expect(p, TK_ARROW, NULL);
-    if (at(p, TK_LBRACE) && this_t) { /* const __selfN: T = __xs_this_take() as T; then the body, its `this` that local */
-        static int nself;
-        const char *alias = xs_sprintf("__self%d", ++nself);
+    bool implicit_this = false;
+    const char *ialias = NULL;
+    if (is_fn && !this_t && at(p, TK_LBRACE)) { /* function () { this }: its `this` is the object it is called on, as
+        function (this: any) (TypeScript types it by the context: descriptor.value = function () { orig.apply(this, args) }) */
+        static int nimpl;
+        ialias = xs_sprintf("__selfi%d", ++nimpl);
         const char *was = p->this_alias;
-        p->this_alias = alias;
+        bool used_was = this_alias_used;
+        p->this_alias = ialias;
+        this_alias_used = false;
         f->body = parse_block(p);
         p->this_alias = was;
+        implicit_this = this_alias_used; /* (the body names `this`: it takes the object; otherwise nothing changes) */
+        this_alias_used = used_was;
+        if (implicit_this) this_t = ty_any;
+    }
+    if (this_t && (implicit_this || at(p, TK_LBRACE))) { /* const __selfN: T = __xs_this_take() as T; then the body, its `this` that local */
+        static int nself;
+        const char *alias = implicit_this ? ialias : xs_sprintf("__self%d", ++nself);
+        if (!implicit_this) {
+            const char *was = p->this_alias;
+            bool used_was = this_alias_used;
+            p->this_alias = alias;
+            f->body = parse_block(p);
+            p->this_alias = was;
+            this_alias_used = used_was;
+        }
         Stmt *d = new_stmt(S_VAR, f->pos);
         d->name = (char *)alias;
         d->is_const = true;
@@ -1284,6 +1320,7 @@ static Expr *parse_arrow(Parser *p) {
         memmove(f->body->stmts.items + 1, f->body->stmts.items, sizeof(Stmt *) * (size_t)(f->body->stmts.len - 1));
         f->body->stmts.items[0] = d;
         wants_reflect = true;
+    } else if (f->body) { /* (function () { }: parsed above, its `this` not named) */
     } else if (at(p, TK_LBRACE)) {
         f->body = parse_block(p);
     } else {
@@ -1488,7 +1525,7 @@ static Expr *parse_primary(Parser *p) {
     }
     case TK_THIS: {
         next(p);
-        if (p->this_alias) return ident_expr(pos, p->this_alias); /* (function (this: T) { this.x }) */
+        if (p->this_alias) { this_alias_used = true; return ident_expr(pos, p->this_alias); } /* (function (this: T) { this.x }) */
         return new_expr(E_THIS, pos);
     }
     case TK_TEMPLATE: {
@@ -1540,6 +1577,11 @@ static Expr *parse_primary(Parser *p) {
                 sub.lx.col = col;
                 sub.prog = p->prog;
                 sub.mod = p->mod;
+                /* (what the module's imports and the functions around make names read as: ${ns.x}, ${sleep(1)}) */
+                sub.alias_from = p->alias_from; sub.alias_to = p->alias_to; sub.nalias = p->nalias;
+                sub.ns_alias = p->ns_alias; sub.ns_import = p->ns_import; sub.nns = p->nns;
+                sub.vt_names = p->vt_names; sub.vt_types = p->vt_types; sub.nvt = p->nvt;
+                sub.this_alias = p->this_alias;
                 next(&sub);
                 if (at(&sub, TK_EOF)) xs_error(XS1007, (Pos){line, col}, NULL, "empty ${} in template literal");
                 Expr *inner = parse_expr(&sub);
@@ -1789,11 +1831,25 @@ static Expr *parse_primary(Parser *p) {
                 if (!accept(p, TK_COMMA)) break;
                 continue;
             }
+            bool m_async = false; /* { async m() { } }: an async method */
+            if (at(p, TK_ASYNC)) {
+                Parser look = *p;
+                next(&look);
+                m_async = at(&look, TK_IDENT) || at(&look, TK_STRING) || tok_keyword_text(look.tok.kind);
+                if (m_async) next(p);
+            }
             if (at(p, TK_IDENT) || at(p, TK_STRING)) { key = p->tok; next(p); }
             else if (tok_keyword_text(p->tok.kind) && (p->tok.kind != TK_THIS)) { key = expect_prop_name(p, NULL); }
             else { xs_error(XS1018, p->tok.pos, "keys are names or strings: { id: 1, \"Content-Type\": \"x\" }", "expected a key in the object literal"); return NULL; }
             Expr *val;
-            if (accept(p, TK_COLON)) val = parse_assign(p);
+            if (m_async || at(p, TK_LPAREN) || at(p, TK_LT)) {
+                /* { m(x: T) { ... } }: a method, read as m: function (x: T) { ... } */
+                if (!at(p, TK_LPAREN) && !at(p, TK_LT)) expect(p, TK_LPAREN, NULL);
+                p->method_fn = true;
+                val = parse_arrow(p);
+                if (m_async) val->arrow->fn->is_async = true;
+                fn_value_name(val, key.str);
+            } else if (accept(p, TK_COLON)) { val = parse_assign(p); fn_value_name(val, key.str); }
             else { /* shorthand { id } */
                 if (key.kind != TK_IDENT) xs_error(XS8078, key.pos, NULL, "a string key needs a value");
                 val = new_expr(E_IDENT, key.pos);
@@ -1867,7 +1923,14 @@ static Expr *parse_primary(Parser *p) {
             if (!at(p, TK_IDENT) || !js_global_type(p->tok.str) || strcmp(js_global_type(p->tok.str), "function") != 0)
                 xs_error(XS7150, p->tok.pos, globalthis_help, "globalThis.%s is not a global xisto knows", at(p, TK_IDENT) ? p->tok.str : "?");
         }
-        Token name = expect(p, TK_IDENT, NULL);
+        Token name;
+        if (at(p, TK_THIS) && p->this_alias && !strcmp(p->this_alias, XS_STATIC_THIS)) { /* new this(...) in a static method: the class it is called on */
+            name = p->tok;
+            name.kind = TK_IDENT;
+            name.str = XS_STATIC_THIS;
+            this_alias_used = true;
+            next(p);
+        } else name = expect(p, TK_IDENT, NULL);
         if (strcmp(name.str, "Intl") == 0 && at(p, TK_DOT)) { /* new Intl.DateTimeFormat(...): xisto:intl's Intl_DateTimeFormat */
             next(p);
             Token k = expect(p, TK_IDENT, NULL);
@@ -2459,6 +2522,7 @@ static Expr *parse_assign(Parser *p) {
         e->op = op;
         e->lhs = lhs;
         e->rhs = parse_assign(p);
+        if (op == TK_ASSIGN && lhs->kind == E_IDENT) fn_value_name(e->rhs, lhs->str); /* (x = () => 7: x; o.f = ...: anonymous) */
         return e;
     }
     return lhs;
@@ -2871,6 +2935,7 @@ static Stmt *parse_var(Parser *p) {
             xs_error(XS8146, p->tok.pos, "xisto has no 'undefined', so every variable starts with a value", "variable '%s' must be initialized", s->name);
         next(p);
         s->init = parse_expr(p);
+        fn_value_name(s->init, s->name);
         self_ref_split(p, s);
     }
     while (at(p, TK_COMMA)) { /* let a = 1, b = 2: the next ones follow as their own declarations */
@@ -2889,6 +2954,7 @@ static Stmt *parse_var(Parser *p) {
                 xs_error(XS8146, p->tok.pos, "xisto has no 'undefined', so every variable starts with a value", "variable '%s' must be initialized", d->name);
             next(p);
             d->init = parse_expr(p);
+            fn_value_name(d->init, d->name);
         }
         stmt_list_push(&p->pending, d);
     }
@@ -3727,6 +3793,7 @@ static void parse_generic_rest(Parser *p, Func *f, bool method) {
         f->gen_subst = subst_save();
         tp_push(f->tparams, f->ntparams);
     }
+    Parser pv_st = *p; /* (a function not async declared Promise<T>: kept below, for its promise version, XB-231) */
     if (method) parse_params_ex(p, f, false);
     else parse_params(p, f);
     if (!at(p, TK_COLON) && (at(p, TK_LBRACE) || (f->gen_arrow && at(p, TK_ARROW))) && !f->is_gen) {
@@ -3739,6 +3806,11 @@ static void parse_generic_rest(Parser *p, Func *f, bool method) {
         const char *rfrom = p->tok.start;
         f->ret = parse_type(p);
         f->ret_src = span(p, rfrom);
+        if (!method && !f->ntparams && !f->is_async && !f->is_gen && !f->gen_arrow && f->ret_src && !strncmp(f->ret_src, "Promise<", 8)) {
+            Parser *st = xs_alloc(sizeof *st);
+            *st = pv_st;
+            f->pv_state = st;
+        }
     }
     if (!method && !f->gen_arrow && at(p, TK_SEMI)) { /* function f<A>(a: A): R;  an overload signature */
         next(p);
@@ -3799,6 +3871,61 @@ Func *xs_parse_instance(Func *tmpl, Type **args) {
     subst_types = st;
     nsubst = sk;
     return f;
+}
+
+/* a static method that names `this` parsed again (from its parameters), for a subclass that inherits it: `this` there is
+   that subclass (the checker's static_this_class) */
+Func *xs_parse_static_copy(Func *f) {
+    Parser p = *(Parser *)f->static_state;
+    Func *g = xs_alloc(sizeof *g);
+    g->pos = f->pos;
+    g->name = f->name;
+    g->is_async = f->is_async;
+    g->is_gen = f->is_gen;
+    g->access = f->access;
+    g->is_getter = f->is_getter;
+    g->is_setter = f->is_setter;
+    g->mod = f->mod;
+    g->exported = f->exported;
+    parse_params_ex(&p, g, false);
+    if (g->is_setter && !at(&p, TK_COLON)) g->ret = ty_void;
+    else if (!at(&p, TK_COLON)) g->ret = NULL;
+    else {
+        next(&p);
+        const char *rfrom = p.tok.start;
+        g->ret = parse_type(&p);
+        g->ret_src = span(&p, rfrom);
+    }
+    const char *was = p.this_alias;
+    bool used_was = this_alias_used;
+    bool saved_gen = p.in_gen;
+    p.this_alias = XS_STATIC_THIS;
+    p.in_gen = g->is_gen;
+    g->body = parse_block(&p);
+    p.this_alias = was;
+    p.in_gen = saved_gen;
+    this_alias_used = used_was;
+    prepend_param_decls(g);
+    return g;
+}
+
+/* XB-231: f (not async, declared Promise<T>) parsed again, as the function its promise version is made from */
+Func *xs_parse_promise_version(Func *f) {
+    Func *v;
+    if (f->template_of) v = xs_parse_instance(f->template_of, f->inst_args);
+    else {
+        Parser p = *(Parser *)f->pv_state;
+        v = xs_alloc(sizeof *v);
+        v->pos = f->pos;
+        v->name = f->name;
+        v->mod = f->mod;
+        v->exported = f->exported;
+        parse_generic_rest(&p, v, false);
+    }
+    v->template_of = NULL;
+    v->pv_state = NULL;
+    v->pv_of = f;
+    return v;
 }
 
 /* member modifiers: public, private, protected, override are accepted; static, abstract and readonly are kept */
@@ -3921,14 +4048,39 @@ static Class *parse_interface(Parser *p) {
     return c;
 }
 
+/* const K = class ...: a class expression bound to a module constant (no type written) */
+static bool const_class_ahead(Parser *p) {
+    if (!at(p, TK_CONST)) return false;
+    Parser l = *p;
+    next(&l);
+    if (!at(&l, TK_IDENT)) return false;
+    next(&l);
+    if (!at(&l, TK_ASSIGN)) return false;
+    next(&l);
+    if (!at(&l, TK_CLASS)) return false;
+    next(&l);
+    return at(&l, TK_LBRACE) || at_ident(&l, "extends") || at_ident(&l, "implements"); /* (class Inner { }: K.name is "Inner") */
+}
 static Class *parse_class_ex(Parser *p, bool abstract);
 static Class *parse_class(Parser *p) { return parse_class_ex(p, false); }
-static Class *parse_class_ex(Parser *p, bool abstract) {
+static Class *parse_class_ex0(Parser *p, bool abstract);
+static Class *parse_class_ex(Parser *p, bool abstract) { /* (a class inside function () { this }: its methods' `this` is their own) */
+    const char *was = p->this_alias;
+    p->this_alias = NULL;
+    Class *c = parse_class_ex0(p, abstract);
+    p->this_alias = was;
+    return c;
+}
+static const char *class_bound_name; /* const K = class { ... }: the class takes the constant's name (parse_class_ex0) */
+static Class *parse_class_ex0(Parser *p, bool abstract) {
     Class *c = xs_alloc(sizeof *c);
     c->pos = p->tok.pos;
     c->is_abstract = abstract;
     expect(p, TK_CLASS, NULL);
-    c->name = expect(p, TK_IDENT, NULL).str;
+    if (class_bound_name) { /* (anonymous: JavaScript names it after the constant too) */
+        c->name = (char *)class_bound_name;
+        class_bound_name = NULL;
+    } else c->name = expect(p, TK_IDENT, NULL).str;
     if (at(p, TK_LT)) { /* class Name<T, U>: a template, parsed again per list of type arguments */
         next(p);
         do {
@@ -4085,6 +4237,40 @@ static void parse_fields_body(Parser *p, Class *c) {
         int mods = skip_modifiers(p);
         if ((mods & MOD_ABSTRACT) && !c->is_abstract) xs_error(XS8080, pos, "write abstract class Name", "an abstract member needs an abstract class");
         if ((mods & MOD_STATIC) && c->is_interface) xs_error(XS8109, pos, NULL, "interfaces have no static members");
+        if ((mods & MOD_STATIC) && !c->is_interface && at(p, TK_LBRACE)) {
+            /* static { ... }: a static method with `this` as the class, called where the class is declared, in order
+               with the static field initializers (add_statics) */
+            if (decos.len) xs_error(XS1008, pos, NULL, "a static block takes no decorators");
+            Func *f = xs_alloc(sizeof *f);
+            f->pos = pos;
+            f->name = xs_sprintf("__static_block%d", c->nsfields);
+            f->ret = ty_void;
+            const char *was = p->this_alias;
+            bool used_was = this_alias_used;
+            p->this_alias = c->name;
+            bool saved_gen = p->in_gen;
+            p->in_gen = false;
+            f->body = parse_block(p);
+            p->in_gen = saved_gen;
+            p->this_alias = was;
+            this_alias_used = used_was;
+            c->smethods = realloc(c->smethods, sizeof(Func *) * (size_t)(c->nsmethods + 1));
+            c->smethods[c->nsmethods++] = f;
+            Field fd = {0};
+            fd.name = f->name;
+            fd.pos = pos;
+            fd.owner = c;
+            fd.static_block = true;
+            Expr *call = new_expr(E_CALL, pos);
+            call->lhs = ident_expr(pos, xs_sprintf("%s__s_%s", c->name, f->name)); /* (the name add_statics gives it) */
+            fd.init = call;
+            c->sfields = realloc(c->sfields, sizeof(Field) * (size_t)(c->nsfields + 1));
+            c->sfield_ro = realloc(c->sfield_ro, sizeof(bool) * (size_t)(c->nsfields + 1));
+            c->sfield_ro[c->nsfields] = false;
+            c->sfields[c->nsfields++] = fd;
+            accept(p, TK_SEMI);
+            continue;
+        }
         bool is_async = at(p, TK_ASYNC) && !peek_is(p, TK_QUESTION) && !peek_is(p, TK_COLON) && !peek_is(p, TK_SEMI) &&
                         !peek_is(p, TK_ASSIGN) && accept(p, TK_ASYNC); /* (async?: boolean: a field named async) */
         bool gen_method = !c->is_interface && accept(p, TK_STAR); /* *values(): a generator method */
@@ -4160,7 +4346,10 @@ static void parse_fields_body(Parser *p, Class *c) {
             if (at(p, TK_LT)) { /* a generic method: m<T>(x: T): T */
                 if (strcmp(name.str, "constructor") == 0) xs_error(XS6012, pos, NULL, "a constructor has no type parameters");
                 parse_tparams(p, f);
+                const char *was_alias = p->this_alias;
+                if (mods & MOD_STATIC) p->this_alias = XS_STATIC_THIS; /* (`this`: its class; not parsed again for a subclass) */
                 parse_generic_rest(p, f, true);
+                p->this_alias = was_alias;
                 if (mods & MOD_STATIC) {
                     c->smethods = realloc(c->smethods, sizeof(Func *) * (size_t)(c->nsmethods + 1));
                     c->smethods[c->nsmethods++] = f;
@@ -4174,6 +4363,7 @@ static void parse_fields_body(Parser *p, Class *c) {
                 }
                 continue;
             }
+            Parser at_params = *p; /* (a static method naming `this`: parsed again for the subclasses that call it) */
             parse_params_ex(p, f, strcmp(name.str, "constructor") == 0);
             if (strcmp(name.str, "constructor") == 0) {
                 f->is_ctor = true;
@@ -4237,7 +4427,17 @@ static void parse_fields_body(Parser *p, Class *c) {
             }
             bool saved_gen = p->in_gen;
             p->in_gen = f->is_gen;
+            const char *was_alias = p->this_alias;
+            bool used_was = this_alias_used;
+            if (mods & MOD_STATIC) { p->this_alias = XS_STATIC_THIS; this_alias_used = false; } /* `this`: the class it is called on */
             f->body = parse_block(p);
+            if ((mods & MOD_STATIC) && this_alias_used && !c->ntparams) {
+                Parser *st = xs_alloc(sizeof *st);
+                *st = at_params;
+                f->static_state = st;
+            }
+            p->this_alias = was_alias;
+            this_alias_used = used_was;
             prepend_param_decls(f);
             p->in_gen = saved_gen;
             if (f->is_ctor) {
@@ -4367,7 +4567,7 @@ static void parse_fields_body(Parser *p, Class *c) {
                 fd.type_src = span(p, tfrom);
             }
             if (fd.optional) fd.type = ty_optional_of(fd.type);
-            if (accept(p, TK_ASSIGN)) fd.init = parse_expr(p);
+            if (accept(p, TK_ASSIGN)) { fd.init = parse_expr(p); fn_value_name(fd.init, name.str); }
             if (!accept(p, TK_SEMI) && !at(p, TK_RBRACE)) accept(p, TK_COMMA); /* interfaces also separate with ',' or nothing */
             if (mods & MOD_ABSTRACT) xs_error(XS8106, pos, NULL, "fields cannot be abstract");
             if (mods & MOD_STATIC) { /* a top-level variable, made by the caller where the class is declared */
@@ -4464,6 +4664,17 @@ static void add_statics(Program *prog, Module *m, Class *c) {
     c->static_is_method = xs_alloc(sizeof(bool) * (size_t)n);
     for (int i = 0; i < c->nsfields; i++) {
         Field *fd = &c->sfields[i];
+        if (fd->static_block) { /* static { ... }: its method called here */
+            Stmt *st = new_stmt(S_EXPR, fd->pos);
+            st->expr = fd->init;
+            st->mod = m;
+            stmt_list_push(&prog->top, st);
+            int k = c->nstatics_user++; /* (a slot no member name matches: static_names keeps the fields' order) */
+            c->static_names[k] = "";
+            c->static_gen[k] = "";
+            c->static_is_method[k] = false;
+            continue;
+        }
         Stmt *st = new_stmt(S_VAR, fd->pos);
         st->name = xs_sprintf("%s__s_%s", c->name, fd->name);
         st->decl_type = fd->type;
@@ -5092,12 +5303,16 @@ static void parse_import(Parser *p, Module *m) {
         im.n = 1;
         goto from;
     }
-    if (at(p, TK_STRING)) { /* import "x": for its effects on Node; xisto loads nothing for it, but "reflect-metadata", whose
-                               package gives the global Reflect (when the program's packages have it) */
+    if (at(p, TK_STRING)) { /* import "x": for its effects (XB-184): the module is loaded with no names, so its top level
+                               runs where Node runs it (dependencies first, once). A Node core module has no effect to
+                               run; "reflect-metadata" without the package is the built-in Reflect */
         const char *spec = p->tok.str;
+        im.pos = p->tok.pos;
         next(p);
         expect_semi(p);
-        if (!strcmp(spec, "reflect-metadata") && pkg_available(m->path, spec)) {
+        bool core = !strncmp(spec, "node:", 5) || xs_node_core_name(spec);
+        bool builtin_reflect = !strcmp(spec, "reflect-metadata") && !pkg_available(m->path, spec);
+        if (!core && !builtin_reflect) {
             im.path = spec;
             m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
             m->imports[m->nimports++] = im;
@@ -5347,6 +5562,7 @@ static bool class_decorated(Class *c) {
         for (int k = 0; k < c->methods[i]->nparams; k++) if (c->methods[i]->params[k].decos.len) return true;
     }
     if (c->ctor) for (int k = 0; k < c->ctor->nparams; k++) if (c->ctor->params[k].decos.len) return true;
+    for (int i = 0; i < c->nsmethods; i++) if (c->smethods[i]->decos.len) return true;
     return false;
 }
 static void tinfo(Buf *b, const char *t) {
@@ -5391,19 +5607,92 @@ static Class *reflected_base(Program *prog, Class *c) {
     }
     return found && class_decorated(found) ? found : NULL;
 }
+/* a type as written that names one of the class's type parameters (T[], Map<string, T>, T | null) */
+static bool names_tparam_src(const char *src, Class *c) {
+    for (const char *q = src; *q; q++) {
+        if (!(isalpha((unsigned char)*q) || *q == '_' || *q == '$')) continue;
+        const char *w = q;
+        while (*q && (isalnum((unsigned char)*q) || *q == '_' || *q == '$')) q++;
+        for (int i = 0; i < c->ntparams; i++)
+            if (strlen(c->tparams[i]) == (size_t)(q - w) && !strncmp(c->tparams[i], w, (size_t)(q - w))) return true;
+        if (!*q) break;
+    }
+    return false;
+}
+/* a class by the name module m reads it under: m's own, else one another module exports (as reflected_base finds it) */
+static Class *class_named(Program *prog, Module *m, const char *name) {
+    Class *found = NULL;
+    for (int i = 0; i < prog->nclasses; i++) {
+        Class *k = prog->classes[i];
+        if (k->builtin || !k->name || strcmp(k->name, name) != 0) continue;
+        if (k->mod == m) return k;
+        if (!found && k->exported) found = k;
+    }
+    return found;
+}
+static bool field_decorated(Class *c) {
+    for (int k = 0; k < c->nfields; k++) if (c->fields[k].decos.len) return true;
+    return false;
+}
+/* the fields class X extends PartialType(Y) (OmitType, PickType, IntersectionType) gets from Y (the checker copies them,
+   apply_mixin): each with the class that declares it, optional under PartialType; NULL when a side is not a class the
+   parser can name (a generic instance, a type alias) */
+typedef struct { Field *f; Class *owner; bool optional; } MixField;
+static void mf_add(MixField **out, int *n, Field *f, Class *owner, bool optional) {
+    for (int i = 0; i < *n; i++) if (!strcmp((*out)[i].f->name, f->name)) { (*out)[i] = (MixField){f, owner, optional}; return; }
+    *out = realloc(*out, sizeof(MixField) * (size_t)(*n + 1));
+    (*out)[(*n)++] = (MixField){f, owner, optional};
+}
+static bool class_fields_parsed(Program *prog, Class *k, MixField **out, int *n, int depth);
+static bool mixin_fields(Program *prog, Module *m, Mixin *x, MixField **out, int *n, int depth) {
+    if (!x || depth > 16) return false;
+    if (!x->kind) {
+        Class *k = x->klass ? x->klass : x->cls ? class_named(prog, m, x->cls) : NULL;
+        return k && class_fields_parsed(prog, k, out, n, depth + 1);
+    }
+    MixField *a = NULL;
+    int na = 0;
+    if (!mixin_fields(prog, m, x->a, &a, &na, depth + 1)) return false;
+    bool partial = !strcmp(x->kind, "PartialType"), omit = !strcmp(x->kind, "OmitType"), pick = !strcmp(x->kind, "PickType");
+    if (!strcmp(x->kind, "IntersectionType") && !mixin_fields(prog, m, x->b, &a, &na, depth + 1)) return false;
+    if ((omit || pick) && x->keyty) return false; /* (keys given as a type: the checker reads them) */
+    for (int i = 0; i < na; i++) {
+        bool listed = false;
+        for (int k = 0; k < x->nkeys; k++) if (!strcmp(x->keys[k], a[i].f->name)) listed = true;
+        if ((omit && listed) || (pick && !listed)) continue;
+        mf_add(out, n, a[i].f, a[i].owner, a[i].optional || partial);
+    }
+    return true;
+}
+static bool class_fields_parsed(Program *prog, Class *k, MixField **out, int *n, int depth) {
+    if (k->ntparams || k->is_interface || depth > 16) return false;
+    if (k->mixin && !mixin_fields(prog, k->mod, k->mixin, out, n, depth + 1)) return false;
+    if (k->base_name && !k->mixin) {
+        Class *b = class_named(prog, k->mod, k->base_name);
+        if (!b || !class_fields_parsed(prog, b, out, n, depth + 1)) return false;
+    }
+    for (int i = 0; i < k->nfields; i++) mf_add(out, n, &k->fields[i], k, k->fields[i].optional);
+    return true;
+}
 static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
     const char *ci_name = xs_sprintf("__ci_%s", c->name);
-    if (c->ntparams) { /* a generic class (PagedResultDto<T>): no one type to describe; its fields are listed by name */
+    if (c->ntparams) { /* a generic class (PagedResultDto<T>): one ClassInfo for all its instances, as JavaScript has one
+                          class: its fields typed where the type does not name a type parameter (unknown where it does, as
+                          TypeScript's design:type erases T), its field and class decorators applied (XB-119); not
+                          constructed, its methods not described (no instance to call them on) */
         buf_printf(g, "const %s: ClassInfo = {\n  id: \"%s#%s\",\n  name: \"%s\",\n  params: [],\n"
                       "  construct: (args: unknown[]): unknown => { throw new Error(\"%s is generic: not constructed by reflection\"); },\n  methods: [],\n  fields: [",
                    ci_name, xs_display_path(m->file), c->name, c->name, c->name);
         for (int k = 0; k < c->nfields; k++) {
             Field *fd = &c->fields[k];
             buf_printf(g, "%s\n    { name: \"%s\", optional: %s, type: ", k ? "," : "", fd->name, fd->optional ? "true" : "false");
-            tinfo(g, "unknown");
+            tinfo(g, fd->type_src && !names_tparam_src(fd->type_src, c) ? fd->type_src : "unknown");
             buf_puts(g, ", get: (o: unknown): unknown => null }");
         }
         buf_puts(g, "],\n  isInstance: (value: unknown): boolean => false,\n  base: null,\n};\n");
+        for (int k = 0; k < c->nfields; k++)
+            for (int d = c->fields[k].decos.len - 1; d >= 0; d--) apply(g, &c->fields[k].decos.items[d], xs_sprintf("%s, %s.fields[%d]", ci_name, ci_name, k));
+        for (int d = c->decos.len - 1; d >= 0; d--) apply(g, &c->decos.items[d], ci_name);
         return;
     }
     buf_printf(g, "const %s: ClassInfo = {\n  id: \"%s#%s\",\n  name: \"%s\",\n  params: ", ci_name, xs_display_path(m->file), c->name, c->name);
@@ -5483,9 +5772,26 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
         buf_printf(g, ");%s } }", is_void ? " return null;" : "");
     }
     buf_puts(g, "],\n  fields: [");
+    /* class UpdateDto extends PartialType(CreateDto): the fields copied in come first (as the checker lays them out), typed
+       by the class itself (UpdateDto["name"]: the copy's type, whose names are the other module's); their decorators run
+       again on them through the declaring module's __xs_fdeco_<Class> (as @nestjs/mapped-types inherits the metadata) */
+    MixField *mf = NULL;
+    int nmf = 0;
+    if (c->mixin && !mixin_fields(prog, m, c->mixin, &mf, &nmf, 0)) nmf = 0;
+    for (int i = 0; i < nmf; i++) {
+        for (int k = 0; k < c->nfields; k++) if (!strcmp(c->fields[k].name, mf[i].f->name)) mf[i].f = NULL; /* (redeclared) */
+    }
+    int nfi = 0;
+    for (int i = 0; i < nmf; i++) {
+        if (!mf[i].f) continue;
+        const char *fname = mf[i].f->name;
+        buf_printf(g, "%s\n    { name: \"%s\", optional: %s, type: ", nfi++ ? "," : "", fname, mf[i].optional ? "true" : "false");
+        tinfo(g, xs_sprintf("%s[\"%s\"]", c->name, fname));
+        buf_printf(g, ", get: (o: unknown): unknown => (o as %s)[\"%s\"] }", c->name, fname);
+    }
     for (int k = 0; k < c->nfields; k++) {
         Field *fd = &c->fields[k];
-        buf_printf(g, "%s\n    { name: \"%s\", optional: %s, type: ", k ? "," : "", fd->name, fd->optional ? "true" : "false");
+        buf_printf(g, "%s\n    { name: \"%s\", optional: %s, type: ", nfi + k ? "," : "", fd->name, fd->optional ? "true" : "false");
         tinfo(g, fd->type_src ? fd->type_src : "unknown");
         bool ident = isalpha((unsigned char)fd->name[0]) || fd->name[0] == '_' || fd->name[0] == '$';
         for (const char *q = fd->name; *q && ident; q++) ident = isalnum((unsigned char)*q) || *q == '_' || *q == '$';
@@ -5500,10 +5806,12 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
         for (int i = f->nparams - 1; i >= 0; i--)
             for (int d = f->params[i].decos.len - 1; d >= 0; d--)
                 apply(g, &f->params[i].decos.items[d], xs_sprintf("%s, %s.methods[%d], %d", ci_name, ci_name, rk, i));
+        int n0 = ndeco; /* (as TypeScript: the decorators' expressions evaluated top-down, then applied bottom-up) */
+        for (int d = 0; d < f->decos.len; d++) buf_printf(g, "const __deco%d = %s;\n", n0 + d, f->decos.items[d].src);
+        ndeco += f->decos.len;
         for (int d = f->decos.len - 1; d >= 0; d--) { /* (xisto's (c, m) or TypeScript's (target, key, descriptor): the checker
                                                        keeps the branch the decorator's type takes, see deco_prepass) */
-            int n = ndeco++;
-            buf_printf(g, "const __deco%d = %s;\n", n, f->decos.items[d].src);
+            int n = n0 + d;
             buf_printf(g, "if (__xs_ts_deco(__deco%d, \"%s\", \"%s\")) {\n"
                           "  const __dd%d = new PropertyDescriptor(__xs_slot_%s_%s);\n"
                           "  __xs_desc_enter(%s, \"%s\", __dd%d);\n"
@@ -5515,8 +5823,43 @@ static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
         }
         rk++;
     }
+    for (int k = 0; k < c->nsmethods; k++) { /* a static method (C__s_m, a function of the module): TypeScript's decorators
+                                               may replace it too; xisto's (c, m) take an instance method, none here */
+        Func *f = c->smethods[k];
+        if (!f->decos.len || f->ntparams) continue;
+        const char *on = c->static_names && c->nsfields + k < c->nstatics_user ? c->static_names[c->nsfields + k] : f->name;
+        int n0 = ndeco;
+        for (int d = 0; d < f->decos.len; d++) buf_printf(g, "const __deco%d = %s;\n", n0 + d, f->decos.items[d].src);
+        ndeco += f->decos.len;
+        for (int d = f->decos.len - 1; d >= 0; d--) {
+            int n = n0 + d;
+            buf_printf(g, "if (__xs_ts_deco(__deco%d, \"%s\", \"%s\")) {\n"
+                          "  const __dd%d = new PropertyDescriptor(__xs_slot_%s_%s);\n"
+                          "  __xs_ts_apply(__deco%d(%s, \"%s\", __dd%d), __dd%d);\n"
+                          "  __xs_slot_%s_%s = __dd%d.value;\n"
+                          "} else {\n}\n",
+                       n, c->name, f->name, n, c->name, f->name, n, ci_name, on, n, n, c->name, f->name, n);
+        }
+    }
+    for (int i = 0, fi = 0; i < nmf; i++) { /* (the copied fields' decorators, by the module that wrote them) */
+        if (!mf[i].f) continue;
+        if (mf[i].f->decos.len && class_decorated(mf[i].owner))
+            buf_printf(g, "__xs_fdeco_%d_%s(%s, %s.fields[%d], \"%s\");\n", mf[i].owner->mod->id, mf[i].owner->name, ci_name, ci_name, fi, mf[i].f->name);
+        fi++;
+    }
     for (int k = 0; k < c->nfields; k++)
-        for (int d = c->fields[k].decos.len - 1; d >= 0; d--) apply(g, &c->fields[k].decos.items[d], xs_sprintf("%s, %s.fields[%d]", ci_name, ci_name, k));
+        for (int d = c->fields[k].decos.len - 1; d >= 0; d--) apply(g, &c->fields[k].decos.items[d], xs_sprintf("%s, %s.fields[%d]", ci_name, ci_name, nfi + k));
+    if (field_decorated(c)) { /* (see above: what a class extends PartialType(this one) runs on its copies) */
+        buf_printf(g, "const __xs_fdeco_%d_%s = (c: ClassInfo, f: ClassInfo[\"fields\"][number], k: string): void => {\n", m->id, c->name);
+        for (int k = 0; k < c->nfields; k++) {
+            if (!c->fields[k].decos.len) continue;
+            buf_printf(g, "  if (k === \"%s\") {\n", c->fields[k].name);
+            for (int d = c->fields[k].decos.len - 1; d >= 0; d--) apply(g, &c->fields[k].decos.items[d], "c, f");
+            buf_puts(g, "  }\n");
+        }
+        buf_puts(g, "};\n");
+    }
+    free(mf);
     if (c->ctor)
         for (int i = c->ctor->nparams - 1; i >= 0; i--)
             for (int d = c->ctor->params[i].decos.len - 1; d >= 0; d--)
@@ -5614,6 +5957,18 @@ static void note_failed_decl(const char *src, int line) {
     }
 }
 
+/* the declarations a failed one took with it: each line from `from` to `to` (exclusive) that starts at column 1 */
+static void note_failed_lines(const char *src, int from, int to) {
+    const char *s = src;
+    int l = 1;
+    for (; *s && l < from; s++) if (*s == '\n') l++;
+    for (; *s && l < to; l++) {
+        if (*s != ' ' && *s != '\t' && *s != '\n' && *s != '}' && *s != ')' && *s != ']') note_failed_decl(src, l);
+        while (*s && *s != '\n') s++;
+        if (*s) s++;
+    }
+}
+
 /* a token that can start a top-level declaration (xisto check resumes there after an error, at column 1) */
 static bool at_top_start(Parser *p) {
     switch (p->tok.kind) {
@@ -5667,7 +6022,7 @@ static bool reexport_ahead(Parser *p) {
 static void load_import(Program *prog, Module *m, Import *im) {
     Program *pp = parsing_prog;
     Module *pm = parsing_mod;
-    if (xs_check_mode) {
+    if (xs_keep_going) {
         jmp_buf *saved = xs_error_recover;
         jmp_buf ib;
         xs_error_recover = &ib;
@@ -5768,7 +6123,16 @@ static void fix_import_names(Parser *p, Module *m, int i0) {
                 continue;
             }
             bool renamed = false; /* import { b as c }: c already reads as b, now as o */
-            for (int q = 0; q < p->nalias; q++) if (strcmp(p->alias_to[q], n) == 0) { p->alias_to[q] = (char *)o; renamed = true; }
+            size_t nn = strlen(n);
+            for (int q = 0; q < p->nalias; q++) {
+                if (strcmp(p->alias_to[q], n) == 0) { p->alias_to[q] = (char *)o; renamed = true; }
+                else if (!strncmp(p->alias_to[q], n, nn) && p->alias_to[q][nn] == '\x01' && ni.path && !strcmp(p->alias_to[q] + nn + 1, ni.path)) {
+                    /* (import { b as c } qualified as "b\x01m" next to another b, XB-117: now "o\x01m", the name
+                       this import gives, as its module declares it: a local b read as b__local there, XB-194) */
+                    p->alias_to[q] = xs_sprintf("%s\x01%s", o, ni.path);
+                    renamed = true;
+                }
+            }
             if (!renamed) add_alias(p, n, o);
             if (declares_top(p, o)) add_alias(p, o, xs_sprintf("%s__local", o));
         }
@@ -5957,7 +6321,7 @@ static void parse_module(Program *prog, Module *m) {
     jmp_buf prb;
     volatile int recoveries = 0;
     volatile int last_line = -1, last_col = -1;
-    if (xs_check_mode) { /* xisto check: an import that does not parse costs that import, not the file */
+    if (xs_keep_going) { /* an import that does not parse costs that import, not the file */
         xs_error_recover = &prb;
         if (_setjmp(prb) != 0) {
             xs_file_name = m->file;
@@ -5973,7 +6337,7 @@ static void parse_module(Program *prog, Module *m) {
     }
     for (int i = 0; i < m->nimports; i++) {
         Import *im = &m->imports[i];
-        if (xs_check_mode) { /* a module or package that cannot be loaded: reported, and checking goes on without it */
+        if (xs_keep_going) { /* a module or package that cannot be loaded: reported, and checking goes on without it */
             jmp_buf ib;
             xs_error_recover = &ib;
             if (_setjmp(ib) == 0) im->from = load_module(prog, im->path, im->pos, m->path);
@@ -5989,7 +6353,7 @@ static void parse_module(Program *prog, Module *m) {
     parsing_mod = m;
     int top_start = prog->top.len;
     volatile int decl_line = 0;
-    if (xs_check_mode) if (_setjmp(prb) != 0) { /* a declaration that does not parse: on to the next line that starts one */
+    if (xs_keep_going) if (_setjmp(prb) != 0) { /* a declaration that does not parse: on to the next line that starts one */
         xs_file_name = m->file;
         xs_source = m->src;
         if (decl_line) note_failed_decl(m->src, decl_line); /* its name: uses of it were reported with it */
@@ -6008,6 +6372,8 @@ static void parse_module(Program *prog, Module *m) {
         /* the next line that starts at column 1 and does not close a block: a declaration or a top-level statement */
         while (!at(&p, TK_EOF) && !(p.tok.pos.col == 1 && !at(&p, TK_RBRACE) && !at(&p, TK_RPAREN) && !at(&p, TK_RBRACKET))) next(&p);
         xs_lex_skipping = false;
+        if (decl_line) note_failed_lines(m->src, decl_line + 1, at(&p, TK_EOF) ? INT_MAX : p.tok.pos.line); /* (the
+            declarations read or skipped with the failed one: their uses are quiet too) */
     }
     while (!at(&p, TK_EOF)) {
         decl_line = p.tok.pos.line;
@@ -6090,7 +6456,7 @@ static void parse_module(Program *prog, Module *m) {
             } else if (at(&p, TK_IMPORT)) parse_import(&p, m); else parse_require(&p, m);
             for (int i = n0; i < m->nimports; i++) {
                 Import *im = &m->imports[i];
-                if (xs_check_mode) {
+                if (xs_keep_going) {
                     jmp_buf ib;
                     jmp_buf *saved = xs_error_recover;
                     xs_error_recover = &ib;
@@ -6130,7 +6496,12 @@ static void parse_module(Program *prog, Module *m) {
             }
             if (is_default) m->default_name = f->name;
             add_func(prog, f);
-        } else if (at(&p, TK_CLASS) || (at_ident(&p, "abstract") && peek_is(&p, TK_CLASS))) {
+        } else if (at(&p, TK_CLASS) || (at_ident(&p, "abstract") && peek_is(&p, TK_CLASS)) || const_class_ahead(&p)) {
+            if (at(&p, TK_CONST)) { /* const K = class { static tag = 1 }: the class K, as if declared so (K.tag, new K()) */
+                next(&p);
+                class_bound_name = expect(&p, TK_IDENT, NULL).str;
+                expect(&p, TK_ASSIGN, NULL);
+            }
             bool abstract = at_ident(&p, "abstract");
             if (abstract) next(&p);
             Class *c = parse_class_ex(&p, abstract);
@@ -6153,6 +6524,7 @@ static void parse_module(Program *prog, Module *m) {
             if (is_default) m->default_name = c->name;
             add_class(prog, c);
             add_statics(prog, m, c);
+            accept(&p, TK_SEMI); /* (const K = class { ... };) */
         } else if (at_ident(&p, "interface") || (at_ident(&p, "type") && peek_is_ident(&p))) {
             Class *c = parse_interface(&p);
             c->mod = m;
@@ -6211,7 +6583,7 @@ static void parse_module(Program *prog, Module *m) {
             drain_pending(&p, &prog->top, m, exported);
         }
     }
-    if (xs_check_mode) xs_error_recover = outer_recover;
+    if (xs_keep_going) xs_error_recover = outer_recover;
     apply_local_exports(prog, m, top_start);
     reflect_module(prog, m, top_start, &p);
 }

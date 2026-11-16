@@ -44,8 +44,8 @@ def pair(a, b, unit):
     elif b < a: sb = f"**{sb}**"
     return sa, sb
 
-OTHER = sys.argv[2] if len(sys.argv) > 2 else "rust"  # the other side's label (rust, node, bun, c)
-OTHER_NAME = "C" if OTHER == "c" else "Rust"  # the column titles (c: PolyBench, bench/polybench/run.py)
+OTHER = sys.argv[2] if len(sys.argv) > 2 else "rust"  # the other side's label (rust, go, node, bun, c)
+OTHER_NAME = {"c": "C", "rust": "Rust", "go": "Go", "node": "Node", "bun": "Bun"}.get(OTHER, OTHER)  # column titles
 rows = {}
 for line in open(sys.argv[1]):
     p = line.split()

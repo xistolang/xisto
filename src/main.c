@@ -54,11 +54,31 @@
 #define XS_HOST_ARCH "cpu"
 #endif
 #define XS_HOST XS_HOST_OS "-" XS_HOST_ARCH
-#ifdef XS_CLANG_FLAGS
-#define XS_CC_KEY XS_LINK_FLAGS " " XS_CLANG_FLAGS " -O3"
+/* x86-64 release builds start every loop on a 64-byte line. Where a hot loop starts inside its line is decided by
+   whatever code comes before it, so an unrelated change in the runtime moved binary-trees and spectral-norm by 32
+   bytes and cost them 4-8% on the Xeon E5 (Broadwell: one more i-cache line per iteration, another DSB set; the
+   instructions were byte for byte the same). With the loops aligned both sides measured the same, at the faster
+   level; aligning functions too made binary-trees slower. Not on arm64: the Graviton2 and the M4 showed no effect.
+   Cost: ~4.5 KB of padding per program. (15/11/2026, bench/results: the integ-1115 A/B) */
+#define XS_X86_ALIGN " -falign-loops=64"
+/* The x86-64 floor: x86-64-v2 (SSE4.2, SSSE3, POPCNT; every x86 processor since 2009), the oldest x86 xisto
+   supports, so the default (portable) build targets it rather than the 2003 baseline (SSE2) the C compilers
+   default to. Without SSSE3 there is no pshufb: each xs_u8x16_shuffle became 16 lanes, each one a 16-byte store,
+   a byte store into it and a 16-byte load back, a store the load cannot forward from (~12 cycles on Broadwell,
+   chained lane after lane), and fannkuch-redux ran 3.3x slower than with --cpu=native on the Xeon E5 (13/11,
+   XB-211). revcomp's translate (xs_u8_trade, xs_rap_*: table lookup and newline scans) takes its SSSE3 path too.
+   --cpu=X replaces it; every x86 compile gets it otherwise (the runtime object of --dev too: struct layouts in
+   the runtime depend on __SSSE3__). zig spells the name with underscores. */
+#define XS_X86_FLOOR " -march=x86-64-v2"
+#define XS_ZIG_X86_FLOOR " -march=x86_64_v2"
+#if defined(__x86_64__)
+#define XS_HOST_ALIGN XS_X86_ALIGN
+#define XS_HOST_FLOOR XS_X86_FLOOR
 #else
-#define XS_CC_KEY XS_LINK_FLAGS " " XS_CLANG_FLAGS " -O3"
+#define XS_HOST_ALIGN ""
+#define XS_HOST_FLOOR ""
 #endif
+#define XS_CC_KEY XS_LINK_FLAGS " " XS_CLANG_FLAGS " -O3" XS_HOST_ALIGN XS_HOST_FLOOR
 static bool show_time;
 static double now_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6; }
 
@@ -133,15 +153,18 @@ static void usage(void) {
     fprintf(stderr,
             "usage:\n"
             "  xisto build [--dev] [--backend=c|qbe] [-o OUT] FILE.ts   compile to a native executable\n"
-            "    --target=linux-arm64|linux-x64|windows-x64             an executable for another system, from any host (needs zig)\n"
+            "    --target=linux-arm64|linux-x64|windows-x64|windows-arm64  an executable for another system, from any host (needs zig);\n"
+            "                                                           --target=native: this machine (the default)\n"
+            "    --pkgs DIR                                             packages installed in DIR instead of the project's (also run, check)\n"
             "  xisto emit [--backend=c|qbe] FILE.ts                     print the generated C or QBE IL\n"
             "  xisto run [--dev] [--backend=c|qbe] FILE.ts [ARGS...]    compile to a temp file and run it\n"
-            "  xisto debug [--batch CMDS] FILE.ts [ARGS...]             run under the debugger\n"
+            "  xisto debug [--batch CMDS] [--backend=c|qbe] FILE.ts [ARGS...]  run under the debugger (qbe: variables read-only)\n"
             "  xisto dap                                                debug adapter for IDEs (DAP over stdin/stdout)\n"
             "  xisto clean [DIR]                                        remove the build cache (.xisto/cache) of a project\n"
             "  xisto fmt [--check] FILE.ts...                           format in place (--check: exit 1 if any file would change)\n"
-            "  xisto check [--details] [--deny-warnings] [--tsc-checked] [--pkgs DIR] [PATH...]  what a project needs to change to compile with xisto\n"
-            "                                                           (PATH: a folder, a tsconfig.json or .ts files; --details: every place)\n"
+            "  xisto check [--details] [--tests] [--deny-warnings] [--tsc-checked] [--pkgs DIR] [PATH...]  what a project needs to change to compile with xisto\n"
+            "                                                           (PATH: a folder, a tsconfig.json or .ts files; --details: every place;\n"
+            "                                                           --tests: the test files counted too)\n"
             "  xisto test [DIR]                                         build and run every *.test.ts under DIR\n"
             "  xisto init [DIR]                                         start a project: xisto.json, src/main.ts, .gitignore\n"
             "  xisto add NAME[@REF]...                                  add packages of the registry (github.com/xistolang/packages;\n"
@@ -155,9 +178,11 @@ static void usage(void) {
             "  --debug        a debuggable binary: -O0 -g, statement hooks and the debugger agent (never in release)\n"
             "  --json         report each error and warning as one JSON object per line on stderr (editors, AI agents)\n"
             "  --no-warnings  do not report unused variables and functions\n"
+            "  --max-errors N report at most N errors, then stop (default 100; 0: every error)\n"
             "  --warnings     list each rule warning (undefined read as null, int mixed with number...); a build prints their count\n"
             "  --deny-warnings  rule warnings are errors (CI); also for xisto check\n"
             "  --profile      count calls and time per function; the table goes to stderr at exit (C backend)\n"
+            "  --time         print how long each step of the build took (emit, compile, link) to stderr\n"
             "  --backend=qbe  generate QBE IL and machine code directly, without C\n"
             "  --cpu=native   code for this machine's processor (AVX2, ...), as Rust's target-cpu=native; XISTO_CPU=native\n"
             "  --node-compat  accept node:fs, node:sqlite... as names of xisto's own modules (xisto:fs...)\n"
@@ -448,7 +473,8 @@ static Buf compile_to_c(const char *path) {
     /* functions nobody can reach and nobody else can import */
     for (int i = 0; i < p->nfuncs; i++) {
         Func *f = p->funcs[i];
-        if (f->used || f->exported || f->mod->builtin || f->name[0] == '_' || f->template_of || (f->ntparams && f->ninstances)) continue;
+        if (f->used || f->exported || f->mod->builtin || f->name[0] == '_' || f->template_of || ((f->ntparams || f->static_state) && f->ninstances) || f->pv_of ||
+            (f->pver && f->pver->used)) continue;
         const char *pk = getenv("XISTO_PKGS"); /* (--pkgs DIR) */
         if (f->mod->file && (strncmp(f->mod->file, "xisto:", 6) == 0 || strstr(f->mod->file, "/.xisto/pkgs/") || (pk && *pk && strncmp(f->mod->file, pk, strlen(pk)) == 0)))
             continue; /* a package's helpers, unused by this program */
@@ -625,7 +651,7 @@ static void run_cc(const char *cfile, const char *outfile, bool dev) {
     const char *cc = host_cc();
     uint64_t h = fnv(cc_text, cc_len) ^ (fnv(cc, strlen(cc)) * 31) ^ (dev ? 0x9e3779b97f4a7c15ull : 0) ^ (fnv(XS_HOST, strlen(XS_HOST)) * 3) ^
                  (xs_debug ? 0x51afd7ed558ccdull : 0) ^ (link_tls ? 0x2545f4914f6cdd1dull : 0) ^ (link_sqlite ? 0x27d4eb2f165667c5ull : 0) ^ (link_zlib ? 0x85ebca77c2b2ae63ull : 0) ^ (link_crypto ? 0xc2b2ae3d27d4eb4full : 0) ^
-                 (xs_target ? fnv(xs_target, strlen(xs_target)) * 7 : 0) ^ (build_dylib ? 0x165667b19e3779f9ull : 0) ^
+                 (xs_target ? fnv(xs_target, strlen(xs_target)) * 7 : 0) ^ (xs_target && strstr(xs_target, "x86_64") ? fnv(XS_X86_ALIGN XS_ZIG_X86_FLOOR, strlen(XS_X86_ALIGN XS_ZIG_X86_FLOOR)) * 17 : 0) ^ (build_dylib ? 0x165667b19e3779f9ull : 0) ^
                  fnv(XS_CC_KEY, strlen(XS_CC_KEY)) * 11 ^ /* the compiler flags this xisto passes: a new set rebuilds */
                  (xs_cpu ? fnv(xs_cpu, strlen(xs_cpu)) * 13 : 0);
     char *hit = xs_sprintf("%s/%016llx", cache, (unsigned long long)h);
@@ -643,7 +669,7 @@ static char *runtime_object(const char *cc) {
     if (!split_rt || rt_src.len == 0) return NULL;
     const char *home = getenv("HOME");
     char *cache = xs_sprintf("%s/.cache/xisto/rt", home ? home : "/tmp");
-    uint64_t h = fnv(rt_src.data, rt_src.len) ^ (fnv(cc, strlen(cc)) * 31) ^ (fnv(XS_HOST, strlen(XS_HOST)) * 3);
+    uint64_t h = fnv(rt_src.data, rt_src.len) ^ (fnv(cc, strlen(cc)) * 31) ^ (fnv(XS_HOST, strlen(XS_HOST)) * 3) ^ (fnv(XS_HOST_FLOOR, strlen(XS_HOST_FLOOR)) * 5);
     char *obj = xs_sprintf("%s/%016llx.o", cache, (unsigned long long)h);
     if (access(obj, R_OK) == 0) return obj;
     double t0 = now_ms();
@@ -662,9 +688,9 @@ static char *runtime_object(const char *cc) {
     if (link_tls && tls_awslc()) inc = xs_sprintf("%s -I'%s/include'", inc, awslc_dir());
     if (need_bearssl()) inc = xs_sprintf("%s -I'%s/bearssl-inc'", inc, xisto_dir);
     char *tmp = xs_sprintf("%s.%d.tmp", obj, (int)getpid());
-    char *cmd = xs_sprintf("%s -std=c11 -O2 %s -ffp-contract=off -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
+    char *cmd = xs_sprintf("%s -std=c11 -O2%s %s -ffp-contract=off -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
                            "-Wno-ignored-qualifiers -Wno-return-type -Wno-unused-command-line-argument %s %s -c -o '%s' '%s'",
-                           cc, extra, XS_LINK_FLAGS, inc, tmp, src);
+                           cc, XS_HOST_FLOOR, extra, XS_LINK_FLAGS, inc, tmp, src);
     if (system(cmd) != 0 || rename(tmp, obj) != 0) {
         fprintf(stderr, "xisto: the runtime library did not compile (this is a bug in xisto; source kept at %s)\n", src);
         exit(1);
@@ -890,6 +916,8 @@ static void run_cc_target(const char *cfile, const char *outfile, bool dev) {
         tls_extra = xs_sprintf("-I%s %s", xs_q(xs_sprintf("%s/inc", src)), xs_q(lib));
     }
     const char *flags = xs_debug ? "-O0 -g" : dev ? "-O0" : "-O3"; /* (as on the host, run_cc_raw) */
+    if (!dev && !xs_debug && strstr(xs_target, "x86_64")) flags = xs_sprintf("%s%s", flags, XS_X86_ALIGN);
+    if (strstr(xs_target, "x86_64")) flags = xs_sprintf("%s%s", flags, XS_ZIG_X86_FLOOR); /* (the x86-64 floor, above) */
     char *extra = "";
     if (link_sqlite) {
         char *dir = tdir;
@@ -916,8 +944,9 @@ static void run_cc_target(const char *cfile, const char *outfile, bool dev) {
         extra = xs_sprintf("%s -I%s %s %s", extra, xs_q(xisto_dir), xs_q(zl), xs_q(bl));
     }
     bool win = strstr(xs_target, "windows") != NULL;
+    /* -DXS_SITES_RETAIN: the call-site table survives lld's --gc-sections (stack traces and the profiler's frames) */
     char *cmd = xs_sprintf("%s -std=c11 %s -mllvm -hot-cold-split=false -ffp-contract=off -fno-omit-frame-pointer -ffunction-sections -fdata-sections "
-                           "%s -static -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
+                           "-DXS_SITES_RETAIN %s -static -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
                            "-Wno-ignored-qualifiers -Wno-return-type -Wno-incompatible-pointer-types-discards-qualifiers -o %s %s %s -lm -lpthread%s",
                            cc, flags, win ? "" : "-Wl,--gc-sections", xs_q(outfile), xs_q(cfile), xs_sprintf("%s %s", extra, tls_extra), win ? " -lws2_32" : "");
     if (xs_sh(cmd) != 0) {
@@ -938,7 +967,9 @@ static void run_cc_raw(const char *cfile, const char *outfile, bool dev) {
 #else
         flags = xs_sprintf("%s -march=%s", flags, xs_cpu);
 #endif
-    }
+    } else
+        flags = xs_sprintf("%s%s", flags, XS_HOST_FLOOR); /* (the x86-64 floor, above; nothing on arm64) */
+    if (!dev && !xs_debug) flags = xs_sprintf("%s%s", flags, XS_HOST_ALIGN);
     /* JS semantics are strict IEEE 754: no fused multiply-add. */
 #ifdef XS_CLANG_FLAGS
     if (cc_is_clang(cc)) flags = xs_sprintf("%s %s", flags, XS_CLANG_FLAGS);
@@ -1191,6 +1222,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--profile") == 0) xs_profile = true;
         else if (strcmp(argv[i], "--time") == 0) show_time = true;
         else if (strcmp(argv[i], "--no-warnings") == 0) xs_warnings = false;
+        else if (strcmp(argv[i], "--max-errors") == 0 && i + 1 < argc) xs_max_errors = atoi(argv[++i]);
+        else if (strncmp(argv[i], "--max-errors=", 13) == 0) xs_max_errors = atoi(argv[i] + 13);
         else if (strcmp(argv[i], "--split-init") == 0) setenv("XISTO_MOD_INIT_MIN", "0", 1); /* each imported module's top level in its own C function, however small the program (XB-176) */
         else if (strcmp(argv[i], "--warnings") == 0) xs_show_warnings = true;
         else if (strcmp(argv[i], "--deny-warnings") == 0) xs_deny_warnings = true;
