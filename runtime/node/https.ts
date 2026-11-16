@@ -3,7 +3,7 @@
 // default, or BearSSL). Differences from Node (docs/docs/guides/node-compatibility.md): the same as node:http's; key
 // and cert are PEM text (or Buffers of it); ca adds to the CAs the whole program trusts; passphrase, SNI on the server
 // and client certificates are not supported yet.
-import { Server, HttpTransport, HttpSystemError, RequestListener, ClientRequest, RequestOptions, ResponseListener, _setup, _toUrl, _method } from "xisto:http";
+import { Server as HttpServer, HttpTransport, HttpSystemError, RequestListener, ClientRequest, RequestOptions, ResponseListener, _setup, _toUrl, _method } from "xisto:http";
 
 declare function tlss_cred(cert: string, key: string): int;
 declare function tlss_accept(cred: int, fd: int): int;
@@ -95,7 +95,7 @@ class TlsClientTransport extends HttpTransport {
 }
 
 /** Node's https.Server: an http server whose connections are TLS. */
-export class HttpsServer extends Server {
+export class Server extends HttpServer {
   private cred: int;
   constructor(options: ServerOptions, listener: RequestListener | null = null) {
     super(listener);
@@ -106,9 +106,12 @@ export class HttpsServer extends Server {
   }
 }
 
+/** The server class under the name xisto used before (https.Server). */
+export type HttpsServer = Server;
+
 /** A TLS server that calls the listener for each request. */
-export function createServer(options: ServerOptions, listener: RequestListener | null = null): HttpsServer {
-  return new HttpsServer(options, listener);
+export function createServer(options: ServerOptions, listener: RequestListener | null = null): Server {
+  return new Server(options, listener);
 }
 
 /** A request over TLS. */

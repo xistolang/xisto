@@ -358,7 +358,7 @@ Differences from Node:
 - No read backpressure (`pause()`).
 - `write()` writes before it returns.
 - The socket is an `EventEmitter`, not a `stream.Duplex` (no `pipe()`).
-- The server class is `NetServer`, because `Server` is xisto's built-in.
+- `https.Server` extends `http.Server` (Node: `tls.Server`), so `instanceof http.Server` is true for it.
 
 ## dns
 
