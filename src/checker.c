@@ -12237,6 +12237,19 @@ static void check_expr_in(Expr *e, Type *expected) {
             Expr *na = e->lhs;
             if (!e->is_call || strcmp(e->str, "fill") != 0)
                 xs_error(XS6017, e->pos, "write: new Array<T>(n).fill(x)", "a new array must be filled before use");
+            if (!na->elem_type) { /* new Array(n).fill(x): the element type is the fill value's (a T[] expected: T) */
+                Type *x = expected ? ty_strip_null(expected) : NULL;
+                if (x && x->kind == TY_ARRAY) na->elem_type = x->elem;
+                else if (e->args.len == 1) {
+                    Expr *v = e->args.items[0];
+                    check_expr(v, NULL);
+                    settle(v);
+                    if (v->type->kind == TY_NULL || v->type->kind == TY_VOID)
+                        xs_error(XS1019, e->pos, "write the element type: new Array<T | null>(n).fill(null)", "new Array(n).fill(null) needs its element type here");
+                    na->elem_type = v->type;
+                    v->prechecked = true;
+                } else xs_error(XS1019, e->pos, "write the element type: new Array<number>(n)", "new Array(n) needs its element type here");
+            }
             na->elem_type = resolve(na->elem_type, na->pos);
             check_type_supported(na->pos, ty_array_of(na->elem_type));
             check_expr(na->lhs, ty_int);

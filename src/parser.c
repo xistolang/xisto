@@ -1536,6 +1536,12 @@ static Expr *parse_primary(Parser *p) {
             c->targs = targs;
             c->ntargs = ntargs;
             parse_args(p, &c->args);
+            if (!strcmp(e->str, "Array") && c->args.len == 1 && ntargs <= 1) { /* Array(n), Array<T>(n): new Array(n) */
+                Expr *na = new_expr(E_NEW_ARRAY, pos);
+                na->elem_type = ntargs ? targs[0] : NULL;
+                na->lhs = c->args.items[0];
+                return na;
+            }
             return c;
         }
         return e;
