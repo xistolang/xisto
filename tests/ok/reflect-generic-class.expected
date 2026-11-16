@@ -1,0 +1,5 @@
+prop PagedResultDto items {} the page
+prop PagedResultDto total {"type":"number"} count
+prop PagedResultDto next {"type":"string","nullable":true} maybe
+model PagedResultDto items:other total:number next:string cursor:other
+1 1 null

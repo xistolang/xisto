@@ -5253,6 +5253,18 @@ static Class *reflected_base(Program *prog, Class *c) {
     }
     return found && class_decorated(found) ? found : NULL;
 }
+/* a type as written that names one of the class's type parameters (T[], Map<string, T>, T | null) */
+static bool names_tparam_src(const char *src, Class *c) {
+    for (const char *q = src; *q; q++) {
+        if (!(isalpha((unsigned char)*q) || *q == '_' || *q == '$')) continue;
+        const char *w = q;
+        while (*q && (isalnum((unsigned char)*q) || *q == '_' || *q == '$')) q++;
+        for (int i = 0; i < c->ntparams; i++)
+            if (strlen(c->tparams[i]) == (size_t)(q - w) && !strncmp(c->tparams[i], w, (size_t)(q - w))) return true;
+        if (!*q) break;
+    }
+    return false;
+}
 /* a class by the name module m reads it under: m's own, else one another module exports (as reflected_base finds it) */
 static Class *class_named(Program *prog, Module *m, const char *name) {
     Class *found = NULL;
@@ -5310,17 +5322,23 @@ static bool class_fields_parsed(Program *prog, Class *k, MixField **out, int *n,
 }
 static void reflect_class(Buf *g, Program *prog, Module *m, Class *c) {
     const char *ci_name = xs_sprintf("__ci_%s", c->name);
-    if (c->ntparams) { /* a generic class (PagedResultDto<T>): no one type to describe; its fields are listed by name */
+    if (c->ntparams) { /* a generic class (PagedResultDto<T>): one ClassInfo for all its instances, as JavaScript has one
+                          class: its fields typed where the type does not name a type parameter (unknown where it does, as
+                          TypeScript's design:type erases T), its field and class decorators applied (XB-119); not
+                          constructed, its methods not described (no instance to call them on) */
         buf_printf(g, "const %s: ClassInfo = {\n  id: \"%s#%s\",\n  name: \"%s\",\n  params: [],\n"
                       "  construct: (args: unknown[]): unknown => { throw new Error(\"%s is generic: not constructed by reflection\"); },\n  methods: [],\n  fields: [",
                    ci_name, xs_display_path(m->file), c->name, c->name, c->name);
         for (int k = 0; k < c->nfields; k++) {
             Field *fd = &c->fields[k];
             buf_printf(g, "%s\n    { name: \"%s\", optional: %s, type: ", k ? "," : "", fd->name, fd->optional ? "true" : "false");
-            tinfo(g, "unknown");
+            tinfo(g, fd->type_src && !names_tparam_src(fd->type_src, c) ? fd->type_src : "unknown");
             buf_puts(g, ", get: (o: unknown): unknown => null }");
         }
         buf_puts(g, "],\n  isInstance: (value: unknown): boolean => false,\n  base: null,\n};\n");
+        for (int k = 0; k < c->nfields; k++)
+            for (int d = c->fields[k].decos.len - 1; d >= 0; d--) apply(g, &c->fields[k].decos.items[d], xs_sprintf("%s, %s.fields[%d]", ci_name, ci_name, k));
+        for (int d = c->decos.len - 1; d >= 0; d--) apply(g, &c->decos.items[d], ci_name);
         return;
     }
     buf_printf(g, "const %s: ClassInfo = {\n  id: \"%s#%s\",\n  name: \"%s\",\n  params: ", ci_name, xs_display_path(m->file), c->name, c->name);
