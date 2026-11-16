@@ -12359,7 +12359,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             check_expr(e, expected && expected->kind != TY_UNKNOWN ? expected : ty_any);
             return;
         }
-        if (e->lhs->type->kind == TY_UNION && e->is_call && e->str && rereadable(e->lhs)) {
+        if (e->lhs->type->kind == TY_UNION && e->is_call && e->str) {
             /* exec.query(sql) with exec: DataSource | EntityManager (Pick<A | B, 'query'>), every member a class with the
                method: called on the class the object has, exec instanceof A ? (exec as A).query(sql) : ... (one runs,
                so the arguments, copies of plain expressions, are evaluated once) */
@@ -12370,13 +12370,20 @@ static void check_expr_in(Expr *e, Type *expected) {
                 all = c && !c->builtin && !c->is_interface && find_method(c, e->str);
             }
             for (int i = 0; i < e->args.len && all; i++) all = branch_copy(e->args.items[i]) != NULL;
+            /* (pick().query(sql), xs[i].m(): the receiver evaluated once, the parameter of an arrow called in place:
+               ((__u) => __u instanceof A ? ... : ...)(pick()); async, its branches awaited, when the call is awaited) */
+            bool hoist = all && !rereadable(e->lhs);
+            static int nuh;
+            char *un = hoist ? xs_sprintf("__u%d", ++nuh) : NULL;
             if (all) {
                 bool awaited = pr_awaited == e;
                 Expr *chain = NULL;
+                Expr *recv = e->lhs;
+                if (hoist) { recv = xs_alloc(sizeof *recv); recv->kind = E_IDENT; recv->pos = e->lhs->pos; recv->field = -1; recv->str = un; }
                 for (int i = u->nparams - 1; i >= 0; i--) {
                     Class *c = u->params[i]->cls;
                     Expr *as = xs_alloc(sizeof *as);
-                    as->kind = E_AS; as->pos = e->pos; as->field = -1; as->lhs = pure_copy(e->lhs); as->elem_type = u->params[i];
+                    as->kind = E_AS; as->pos = e->pos; as->field = -1; as->lhs = pure_copy(recv); as->elem_type = u->params[i];
                     Expr *call = xs_alloc(sizeof *call);
                     call->kind = E_MEMBER; call->pos = e->pos; call->field = -1; call->is_call = true; call->str = e->str; call->lhs = as;
                     call->targs = e->targs; call->ntargs = e->ntargs;
@@ -12387,12 +12394,33 @@ static void check_expr_in(Expr *e, Type *expected) {
                     Expr *cn = xs_alloc(sizeof *cn);
                     cn->kind = E_IDENT; cn->pos = e->pos; cn->field = -1; cn->str = c->name;
                     Expr *io = xs_alloc(sizeof *io);
-                    io->kind = E_BINARY; io->op = TK_IDENT; io->pos = e->pos; io->field = -1; io->lhs = pure_copy(e->lhs); io->rhs = cn;
+                    io->kind = E_BINARY; io->op = TK_IDENT; io->pos = e->pos; io->field = -1; io->lhs = pure_copy(recv); io->rhs = cn;
                     Expr *cond = xs_alloc(sizeof *cond);
                     cond->kind = E_COND; cond->pos = e->pos; cond->field = -1; cond->lhs = io;
                     expr_list_push(&cond->args, br);
                     expr_list_push(&cond->args, chain);
                     chain = cond;
+                }
+                if (hoist) {
+                    Expr *arrow = thunk_of(chain);
+                    Func *f = arrow->arrow->fn;
+                    f->params = xs_alloc(sizeof(Param));
+                    f->params[0].name = un;
+                    f->params[0].type = u;
+                    f->nparams = 1;
+                    f->is_async = awaited;
+                    Expr *recv0 = e->lhs;
+                    recv0->prechecked = true;
+                    Pos at = e->pos;
+                    memset(e, 0, sizeof *e);
+                    e->kind = E_CALL; e->pos = at; e->field = -1; e->is_call = true;
+                    e->lhs = arrow;
+                    expr_list_push(&e->args, recv0);
+                    check_expr(arrow, NULL);
+                    e->type = arrow->type->ret;
+                    if (awaited) pr_awaited = e;
+                    check_expr(e, expected);
+                    return;
                 }
                 *e = *chain;
                 check_expr(e, expected);
