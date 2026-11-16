@@ -2568,6 +2568,7 @@ static Type *resolve(Type *t, Pos pos) {
         Binding *fb = f ? NULL : lookup(t->tname + 12);
         if (fb && fb->type && fb->type->kind == TY_FUNC && fb->type->ret) { *t = *fb->type->ret; return t; } /* (a const holding an arrow) */
         if (!f || f->ntparams) xs_error(XS1019, pos, "write the type itself", "ReturnType<typeof %s>: no function '%s' here", t->tname + 12, t->tname + 12);
+        if (!f->ret && !f->ret_infer) resolve_signature(f); /* (named before its declaration: its return type is inferred here, XB-109) */
         Type *r = fret(f, pos);
         *t = *r; /* (in place: whoever holds it now holds the function's type) */
         return t;
