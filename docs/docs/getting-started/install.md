@@ -38,7 +38,8 @@ xisto --version
 
 xisto calls the system C compiler, so install clang (or gcc) first: `sudo apt-get install clang` on Debian and
 Ubuntu, `sudo dnf install clang` on Fedora and Amazon Linux. The executables xisto makes need nothing installed.
-The Linux archives use BearSSL for TLS.
+The Linux archives use BearSSL for TLS and run on glibc 2.28 or newer (RHEL/Alma/Rocky 8+, Amazon
+Linux 2023, Debian 10+, Ubuntu 20.04+) from 0.4.5 on; the 0.4.4 archives need glibc 2.38 (Ubuntu 24.04+, Debian 13).
 
 ## Intel Macs and other systems: build from source
 

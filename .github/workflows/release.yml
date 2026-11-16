@@ -116,7 +116,10 @@ jobs:
           git push -q origin HEAD
 
   # Linux x64 and arm64: the same build, smoke test and archive, added to the release the macOS job created.
-  # TLS through BearSSL (built from source, no cmake/Go needed); programs are compiled with the system's clang.
+  # Built inside AlmaLinux 8 (glibc 2.28), like Python's manylinux wheels: built against a newer glibc, xisto and
+  # its runtime objects called __isoc23_strtol & co (GLIBC_2.38), and the 0.4.4 archives did not run on Amazon
+  # Linux 2023, Debian 12, Ubuntu 22.04 or RHEL 9. TLS through BearSSL (built from source, no cmake/Go needed);
+  # programs are compiled with the system's clang.
   linux:
     needs: macos-arm64
     strategy:
@@ -124,8 +127,12 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
+    container: almalinux:8
     timeout-minutes: 60
     steps:
+      - name: Tools
+        run: dnf install -y -q clang make python3 vim-common git tar gzip which diffutils binutils
+
       - uses: actions/checkout@v4
 
       - name: Version
@@ -136,9 +143,6 @@ jobs:
           V="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
           echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' || { echo "bad version: $V"; exit 1; }
           echo "version=$V" >> "$GITHUB_OUTPUT"
-
-      - name: Tools
-        run: sudo apt-get update -q && sudo apt-get install -y -q clang xxd
 
       - name: Build
         run: make -j"$(nproc)" CC=clang TLS=bearssl VERSION=${{ steps.v.outputs.version }}
@@ -171,11 +175,36 @@ jobs:
           "$X" --version | grep -qx "xisto ${{ steps.v.outputs.version }}"
           cd "$RUNNER_TEMP/smoke" && "$X" build --node-compat -o smoke2 smoke.ts && test "$(./smoke2)" = "ok 42 true 2,4,6"
 
-      - name: Add to the release
+      - name: Check the glibc it needs (at most 2.28)
+        run: |
+          set -eu
+          need=$(objdump -T build/xisto | grep -oE 'GLIBC_2\.[0-9]+' | sort -V | tail -1)
+          echo "build/xisto needs $need"
+          case "$need" in GLIBC_2.[0-9]|GLIBC_2.1[0-9]|GLIBC_2.2[0-8]) ;; *) echo "::error::needs $need"; exit 1 ;; esac
+          ! nm build/xisto_rt.o | grep -q __isoc23
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.runner }}
+          path: dist/xisto-*.tar.gz*
+
+  linux-publish:
+    name: Add the Linux archives to the release
+    needs: linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Upload
         env:
           GH_TOKEN: ${{ github.token }}
-          V: ${{ steps.v.outputs.version }}
-        run: gh release upload "v$V" dist/xisto-*.tar.gz dist/xisto-*.tar.gz.sha256 --clobber
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          V="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
+          ls -la dist
+          gh release upload "v$V" dist/xisto-*.tar.gz dist/xisto-*.tar.gz.sha256 --clobber --repo "$GITHUB_REPOSITORY"
 
   # a docs version per minor release (x.y.0 freezes "x.y"; patches and pre-releases do not), then publish the site
   docs-version:
