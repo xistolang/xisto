@@ -64,9 +64,12 @@ console.log(a.nick ?? "(none)", a.nick?.length);   // (none) undefined
 An absent field reads as `null`. So `a.admin === null` is `true` in xisto and `false` on Node. Test emptiness with
 `x == null`, which is the same on both. `typeof a.nick` is `"undefined"`, as on Node.
 
-An optional field holds absent and `null` as one value: a field set to `null` (`{ nick: null }`, or read by
-`JSON.parse` from `"nick":null`) is left out of `JSON.stringify`, `Object.keys` and `console.log` too, where Node
-keeps `"nick":null`. Declare the field `nick: string | null` (not optional) when the `null` must reach the JSON.
+An optional field declared with `null` in its type (`nick?: string | null`) tells a `null` given from absent, as
+Node does: set to `null` (`u.nick = null`, `{ nick: null }`, or read by `JSON.parse` from `"nick":null`), it is
+written `"nick":null` by `JSON.stringify` and `nick: null` by `console.log`, listed by `Object.keys`, and `"nick" in
+o` is `true`; never set, or set to `undefined`, it is left out. Reading it gives `null` either way. The flag costs one byte in the objects of such a class, and nothing
+in a class without such a field. An optional field without `null` in its type (`nick?: string`) holds absent and
+`null` as one value, left out of the JSON.
 
 ## `?.`, `??`, `??=`
 

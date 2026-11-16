@@ -1905,6 +1905,34 @@ static int find_field_idx(Class *c, const char *name) {
     for (int i = 0; i < c->nfields; i++) if (!strcmp(c->fields[i].name, name)) return i;
     return -1;
 }
+/* the xn_ bit a value stored into a nick?: T | null field gives: 0 for undefined (absent), and for a value whose own type
+   says it may be absent (x?: T); 1 otherwise (a null given is a null) */
+static bool xn_busy; /* (emitting the store itself, after its xn_ bit) */
+/* an object read twice with no effect: a name, this, a field of one, an element at a name or a literal index */
+static bool xn_plain(Expr *o) {
+    if (!o) return false;
+    if (o->kind == E_IDENT || o->kind == E_THIS) return true;
+    if (o->kind == E_MEMBER && !o->is_call && !o->builtin.cfn) return xn_plain(o->lhs);
+    if (o->kind == E_INDEX && !o->builtin.cfn && o->rhs && (o->rhs->kind == E_NUMBER || o->rhs->kind == E_IDENT)) return xn_plain(o->lhs);
+    return false;
+}
+static const char *xn_bit(Expr *v) {
+    if (v->kind == E_NULL && v->str && !strcmp(v->str, "undefined")) return "0";
+    if (v->kind == E_MEMBER && !v->is_call && v->cls && v->field >= 0 && v->field < v->cls->nfields && v->cls->fields[v->field].optional) {
+        /* o.nick read from another object (a copy: Object.assign, a spread): its own bit; an optional field without
+           null in its type: absent when null */
+        Field *sf = &v->cls->fields[v->field];
+        if (!sf->opt_null || !xn_plain(v->lhs)) return sf->opt_null ? "1" : "0";
+        Buf t = {0};
+        Buf *so = out;
+        out = &t;
+        emit_borrowed(v->lhs);
+        out = so;
+        return xs_sprintf("(%s)->xn_%s", t.data, sf->cname);
+    }
+    if (v->type && v->type->kind == TY_NULLABLE && v->type->absent && v->kind != E_NULL) return "0";
+    return "1";
+}
 /* the fields of c as a JSON object's members (ord: in that order, NULL: the declaration's) */
 static void json_put_fields(Buf *b, Class *c, const int *ord, int nord) {
     for (int oi = 0; oi < nord; oi++) {
@@ -1913,19 +1941,23 @@ static void json_put_fields(Buf *b, Class *c, const int *ord, int nord) {
         if (xs_hidden_field(f->name)) continue; /* #x: not an own property: JSON.stringify leaves it out */
         if (json_fn_field(f->type)) continue; /* a function: left out, as JSON.stringify does */
         if (xs_sym_field_shown(f->name)) continue; /* a symbol key: left out, as JSON.stringify does */
-        /* optional fields that are null are left out, like undefined in JSON.stringify (and a value that is a function) */
+        /* optional fields that are null are left out, like undefined in JSON.stringify (and a value that is a function);
+           one that holds an explicit null (nick?: T | null set to null: its xn_ bit) is written as null */
         bool may_fn = json_may_fn(f->type);
-        if (f->optional || may_fn) {
-            const char *v = xs_sprintf("o->%s", f->cname);
-            buf_printf(b, "    if (%s && %s) {\n", f->optional ? not_null(f->type, v) : "true",
-                       may_fn ? xs_sprintf("!xs_is_closure(%s)", v) : "true");
+        const char *v = xs_sprintf("o->%s", f->cname);
+        bool xn = f->optional && f->opt_null;
+        const char *present = NULL; /* (NULL: written whatever it holds) */
+        if (f->optional) {
+            present = not_null(f->type, v);
+            if (xn) present = xs_sprintf("(%s || o->xn_%s)", present, f->cname);
         }
+        if (present || may_fn) buf_printf(b, "    if (%s && %s) {\n", present ? present : "true", may_fn ? xs_sprintf("!xs_is_closure(%s)", v) : "true");
         buf_printf(b, "    if (!first_) xs_sb_put(sb, \",\", 1);\n    first_ = false;\n    xs_sb_put(sb, \"\\\"%s\\\":\", %zu);\n    ", f->name, strlen(f->name) + 3);
         /* (x?: unknown is unknown, which holds null already: no nullable wrapper around it) */
-        Type *ft = f->optional && f->type->kind == TY_NULLABLE ? f->type->elem : f->type;
-        json_emit_value(b, ft, f->optional && ft->kind == TY_BOOLEAN && f->type->kind == TY_NULLABLE ? xs_sprintf("(bool)o->%s", f->cname) : xs_sprintf("o->%s", f->cname));
+        Type *ft = f->optional && f->type->kind == TY_NULLABLE && !xn ? f->type->elem : f->type;
+        json_emit_value(b, ft, f->optional && ft->kind == TY_BOOLEAN && f->type->kind == TY_NULLABLE ? xs_sprintf("(bool)o->%s", f->cname) : v);
         buf_puts(b, "\n");
-        if (f->optional || may_fn) buf_puts(b, "    }\n");
+        if (present || may_fn) buf_puts(b, "    }\n");
     }
 }
 /* the JSON writers of the classes some object literal orders its own way (lit_order): each order its writer, and
@@ -2057,8 +2089,9 @@ static void ensure_json(Type *t) {
         Field *f = &c->fields[i];
         buf_printf(b, "    o->%s = ", f->cname);
         if (json_fn_field(f->type)) { buf_puts(b, "NULL;\n"); continue; } /* (a function: JSON has none, so it is not there) */
-        if (f->optional) { /* absent or null: null */
-            buf_printf(b, "({ xs_jv *fv_ = xs_json_field_opt(v, \"%s\"); fv_ && fv_->kind != XJ_NULL ? ", f->name);
+        if (f->optional) { /* absent or null: null (nick?: T | null: whether it was there, null or not, in xn_) */
+            buf_printf(b, "({ xs_jv *fv_ = xs_json_field_opt(v, \"%s\"); %sfv_ && fv_->kind != XJ_NULL ? ", f->name,
+                       f->opt_null ? xs_sprintf("o->xn_%s = fv_ != NULL; ", f->cname) : "");
             json_emit_read(b, f->type->kind == TY_NULLABLE ? f->type->elem : f->type, "fv_", f->name);
             buf_printf(b, " : %s; })", null_value(f->type));
         } else if (c->data_only && (f->type->kind == TY_STRING || f->type->kind == TY_INT || f->type->kind == TY_NUMBER || f->type->kind == TY_BOOLEAN || f->type->kind == TY_ARRAY)) {
@@ -3095,6 +3128,7 @@ static void dyn_field_entry(Program *p, Class *c, Field *f, Buf *tabs_, Buf *fns
     buf_printf(tabs, "    {\"%s\", %zu, (uint32_t)offsetof(%s, %s), %s, %d, %d, %s, ", f->name, strlen(f->name), c->cname, f->cname, kind,
                nul || f->optional, f->optional, isa ? isa : "NULL");
     { Buf *so = out; out = tabs; emit_c_string(ty_name(b)); out = so; } /* (a literal type's name has its quotes: 'A' is "A") */
+    if (f->optional && f->opt_null) buf_printf(tabs, ", (uint32_t)offsetof(%s, xn_%s) + 1", c->cname, f->cname); /* (a null given: there) */
     buf_puts(tabs, "},\n");
 }
 static void emit_dyn_tables(Program *p) {
@@ -3447,6 +3481,17 @@ static void emit_expr_(Expr *e) {
     buf_printf(out, is_void ? "; XS_POST(%d); })" : "; XS_POST(%d); xr_; })", id);
 }
 static void emit_expr_raw(Expr *e) {
+    if (e->xn_in && e->kind == E_BINARY && e->lhs->kind == E_MEMBER && e->lhs->cls && e->lhs->field >= 0) {
+        /* "nick" in o (nick?: T | null): o.nick != null, or a null given */
+        e->xn_in = false;
+        buf_puts(out, "(");
+        emit_expr_raw(e);
+        buf_puts(out, " || (");
+        emit_borrowed(e->lhs->lhs);
+        buf_printf(out, ")->xn_%s)", e->lhs->cls->fields[e->lhs->field].cname);
+        e->xn_in = true;
+        return;
+    }
     switch (e->kind) {
     case E_NUMBER:
         if (e->type->kind == TY_INT) {
@@ -3628,6 +3673,7 @@ static void emit_expr_raw(Expr *e) {
                 emit_expr(e->args.items[i]);
                 buf_puts(out, ";");
             }
+            if (fd->optional && fd->opt_null) buf_printf(out, " o_->xn_%s = %s;", fd->cname, xn_bit(e->args.items[i]));
         }
         if (guard) buf_puts(out, " xs_cln_n -= 1;");
         int lo = lit_order(c, e);
@@ -4225,7 +4271,22 @@ static void emit_expr_raw(Expr *e) {
         emit_expr(e->rhs);
         buf_puts(out, ")");
         return;
-    case E_ASSIGN:
+    case E_ASSIGN: {
+        bool xn_skip = xn_busy; /* (the store itself, its bit already written) */
+        xn_busy = false;
+        if (e->op == TK_ASSIGN && !xn_skip && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->cls && e->lhs->field >= 0 &&
+            e->lhs->field < e->lhs->cls->nfields && e->lhs->cls->fields[e->lhs->field].optional && e->lhs->cls->fields[e->lhs->field].opt_null &&
+            xn_plain(e->lhs->lhs)) {
+            /* o.nick = v with nick?: T | null: whether a null is given (xn_bit), then the store */
+            buf_puts(out, "((");
+            emit_borrowed(e->lhs->lhs);
+            buf_printf(out, ")->xn_%s = %s, ", e->lhs->cls->fields[e->lhs->field].cname, xn_bit(e->rhs));
+            xn_busy = true;
+            emit_expr_raw(e);
+            buf_puts(out, ")");
+            return;
+        }
+        }
         if (emit_ifld_put(e)) return; /* (XB-233) */
         if (e->op == TK_ASSIGN) hole_set_target = e->lhs; /* (XB-216) */
         if (bce_fw_loop && e->op == TK_ASSIGN)
@@ -13263,9 +13324,15 @@ static void emit_func_body(Func *f) {
 }
 
 /* the class's own fields (not the inherited ones): null sentinels, then initializers, in order */
+static const char *xn_bit(Expr *v);
 static void emit_own_field_inits(Class *c) {
     for (int i = c->nbase_fields; i < c->nfields; i++)
         if (!c->fields[i].init && null_prim(c->fields[i].type)) { nl(); buf_printf(out, "self->%s = %s;", c->fields[i].cname, null_value(c->fields[i].type)); }
+    for (int i = 0; i < c->nfields; i++) /* nick?: T | null [= v]: a value given (null too) is there, none is absent */
+        if (c->fields[i].optional && c->fields[i].opt_null && (i >= c->nbase_fields || (c->fields[i].init && c->fields[i].owner == c))) {
+            nl();
+            buf_printf(out, "self->xn_%s = %s;", c->fields[i].cname, c->fields[i].init ? xn_bit(c->fields[i].init) : "0");
+        }
     for (int i = 0; i < c->nfields; i++) {
         Field *fd = &c->fields[i];
         if (!fd->init) continue;
@@ -13618,7 +13685,8 @@ static void emit_class_print(Class *c, const char *fname, const int *ord, int no
                        always ? "NULL" : xs_sprintf("\"%s\"", empty_s));
         } else {
             Buf cond = {0};
-            for (int i = 0; i < c->nfields; i++) buf_printf(&cond, "%s%s", i ? " || " : "", not_null(c->fields[i].type, xs_sprintf("self->%s", c->fields[i].cname)));
+            for (int i = 0; i < c->nfields; i++) buf_printf(&cond, "%s%s%s", i ? " || " : "", not_null(c->fields[i].type, xs_sprintf("self->%s", c->fields[i].cname)),
+                                                            c->fields[i].optional && c->fields[i].opt_null ? xs_sprintf(" || self->xn_%s", c->fields[i].cname) : "");
             buf_printf(out, "xs_insp fr_; if (!xs_insp_begin(&fr_, p, \"%s\", (%s) ? NULL : \"%s\")) return;", plain ? "Object" : xs_src_name(c->name), cond.data, empty_s);
         }
     }
@@ -13631,7 +13699,8 @@ static void emit_class_print(Class *c, const char *fname, const int *ord, int no
         if ((sym != NULL) != (pass == 1)) continue;
         if (sym) shown = sym;
         nl();
-        if (fd->optional) buf_printf(out, "if (%s) {", not_null(fd->type, xs_sprintf("self->%s", fd->cname)));
+        if (fd->optional) buf_printf(out, "if (%s%s) {", not_null(fd->type, xs_sprintf("self->%s", fd->cname)),
+                                     fd->opt_null ? xs_sprintf(" || self->xn_%s", fd->cname) : "");
         nl();
         if (c->is_tuple) buf_puts(out, "xs_insp_entry(&fr_);"); /* [ 'a', 1 ]: elements, no names */
         else buf_printf(out, "xs_insp_entry(&fr_); fputs(\"%s: \", XS_OUT);", shown);
@@ -13799,6 +13868,11 @@ static void emit_class(Class *c) {
     }
     for (int i = 0; i < c->nfields; i++) /* nullable primitives start as their null sentinel, not 0 */
         if (!c->fields[i].init && null_prim(c->fields[i].type)) { nl(); buf_printf(out, "self->%s = %s;", c->fields[i].cname, null_value(c->fields[i].type)); }
+    for (int i = 0; i < c->nfields; i++) /* nick?: T | null [= v]: a value given (null too) is there, none is absent */
+        if (c->fields[i].optional && c->fields[i].opt_null) {
+            nl();
+            buf_printf(out, "self->xn_%s = %s;", c->fields[i].cname, c->fields[i].init ? xn_bit(c->fields[i].init) : "0");
+        }
     nl();
     buf_puts(out, "size_t ar_mark = xs_ar_mark();");
     nl();
@@ -14743,6 +14817,8 @@ void emit_program(Program *p, Buf *o) {
             if (cp_field(c, k)) buf_printf(out, "XS_CPREF(%s) %s", cp_target(c, k), c->fields[k].cname); /* 32 bits (cptr_compute) */
             else emit_decl(c->fields[k].type, c->fields[k].cname);
             buf_puts(out, ";");
+            /* nick?: T | null: whether null was given (not absent), next to the field (a subclass keeps the layout) */
+            if (c->fields[k].optional && c->fields[k].opt_null) buf_printf(out, " bool xn_%s;", c->fields[k].cname);
         }
         buf_puts(out, " };\n");
     }

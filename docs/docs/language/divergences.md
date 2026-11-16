@@ -29,7 +29,7 @@ Every row was checked on 12 Nov 2026 by running the same program with xisto and 
 | a variable that held `undefined`: `console.log(v)`, `typeof v` | `undefined`, `"undefined"` | `null`, `"object"` | it holds `null` |
 | `[1, undefined]` printed | `[ 1, undefined ]` | `[ 1, null ]` | (`JSON.stringify` is `[1,null]` on both) |
 | optional field set to `undefined`: `Object.keys`, `console.log` | key listed, `nick: undefined` | left out | the field is absent; `JSON.stringify` leaves it out on both |
-| optional field set to `null`: `JSON.stringify`, `Object.keys`, `console.log` | `"nick":null`, key listed | left out | an optional field holds absent and `null` as one value |
+| optional field set to `null`, declared without `null` (`nick?: string`): `JSON.stringify`, `Object.keys`, `console.log` | `"nick":null`, key listed | left out | such a field holds absent and `null` as one value; declare `nick?: string \| null` to keep the `null` |
 | absent optional field `=== null` | `false` | `true` | absent reads as `null`; use `== null` |
 | `Map.get` of a missing key | `undefined` | `null`; with an `int`, `number` or `boolean` value that is so wherever the result can be absent: `m.get(k) ?? d`, `m.get(k) \|\| d`, `m.get(k) === undefined`, a condition, `const v = m.get(k)` (`v` is `T \| null`) and a `T \| undefined` return, argument or field; where only a `T` fits (`m.get(k) + 1`) it is a run-time error (check with `has()` first) | no `undefined` |
 | field missing on an `any` | `undefined` | `null` | |

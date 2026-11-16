@@ -3344,7 +3344,10 @@ XS_NOINLINE double xs_math_min_ints(xs_arr_int *a) { double m = INFINITY; for (s
    of its own; a name the class does not have is a TypeError (JavaScript would read undefined, or add the
    field). An object made as an any ({} or { a: 1 } typed any) is a Record<string, unknown>. ---- */
 enum { XD_NUM, XD_INT, XD_BOOL, XD_NNUM, XD_NINT, XD_NBOOL, XD_STR, XD_REF, XD_ANY };
-typedef struct { const char *name; uint32_t len, off; uint8_t kind, nullable, optional; bool (*isa)(void *); const char *tname; } xs_dyn_field;
+typedef struct { const char *name; uint32_t len, off; uint8_t kind, nullable, optional; bool (*isa)(void *); const char *tname;
+                 uint32_t xn; /* nick?: T | null: 1 + the offset of its xn_ bit (a null given, not absent); 0: none */ } xs_dyn_field;
+/* an optional field that holds null: there all the same when the null was given (nick?: T | null) */
+static inline bool xs_dyn_given(const xs_dyn_field *f, void *o) { return f->xn && ((const bool *)o)[f->xn - 1]; }
 typedef struct xs_dyn_cls { const char *name; int32_t n; const xs_dyn_field *f; int32_t nm; const char *const *m; int32_t shape; int32_t err; } xs_dyn_cls; /* m: its methods' names; shape: an interface's (made from literals: an optional field left out is not there); err: a class that extends Error */
 /* a method read by name through an any (typeof x.toJSON === "function"): a function whose call is not supported yet */
 XS_NOINLINE void xs_dyn_method_called(void) { xs_panic("TypeError: a method read through an any cannot be called (call it on a value of its class)"); }
@@ -3542,7 +3545,7 @@ XS_NOINLINE void *xs_as_record(void *v, int nullable, const char *what) {
         xs_str *k = xs_str_new(f->name, f->len);
         xs_val x;
         x.p = xs_dyn_load(f, v);
-        if (t->dyn->shape && f->optional && !x.p) { xs_release_(k); continue; } /* (no key of the literal it was made from) */
+        if (t->dyn->shape && f->optional && !x.p && !xs_dyn_given(f, v)) { xs_release_(k); continue; } /* (no key of the literal it was made from) */
         xs_map_set_s(m, k, x);
         xs_release_(k);
     }
@@ -3592,7 +3595,7 @@ XS_NOINLINE bool xs_dyn_has(void *o, xs_str *k) {
     if (t->dyn) {
         const xs_dyn_field *f = xs_dyn_field_of(t->dyn, k);
         if (!f) return false;
-        if (!f->optional) return true;
+        if (!f->optional || xs_dyn_given(f, o)) return true;
         void *v = xs_dyn_load(f, o);
         bool has = v != NULL;
         xs_release(v);
@@ -8731,7 +8734,7 @@ XS_NOINLINE xs_arr_ref *xs_util_keys(void *v) {
     if (t->dyn) {
         for (int32_t i = 0; i < t->dyn->n; i++) {
             const xs_dyn_field *f = &t->dyn->f[i];
-            if (f->optional) {
+            if (f->optional && !xs_dyn_given(f, v)) {
                 void *fv = xs_dyn_load(f, v);
                 bool has = fv != NULL;
                 xs_release(fv);
@@ -8801,7 +8804,7 @@ static int64_t xs_plain_count(void *o) {
     const xs_dyn_cls *c = xs_type_of(o)->dyn;
     int64_t n = 0;
     for (int32_t i = 0; i < c->n; i++) {
-        if (c->f[i].optional) { void *v = xs_dyn_load(&c->f[i], o); bool there = v != NULL; xs_release(v); if (!there) continue; }
+        if (c->f[i].optional && !xs_dyn_given(&c->f[i], o)) { void *v = xs_dyn_load(&c->f[i], o); bool there = v != NULL; xs_release(v); if (!there) continue; }
         n++;
     }
     return n;
@@ -8818,7 +8821,7 @@ static bool xs_plain_get(void *o, const char *k, size_t kl, void **out) {
     for (int32_t i = 0; i < c->n; i++)
         if (c->f[i].len == kl && memcmp(c->f[i].name, k, kl) == 0) {
             *out = xs_dyn_load(&c->f[i], o);
-            if (!*out && c->f[i].optional) return false;
+            if (!*out && c->f[i].optional && !xs_dyn_given(&c->f[i], o)) return false;
             return true;
         }
     return false;
@@ -8841,7 +8844,7 @@ static bool xs_plain_eq(void *a, void *b, int depth) {
     const xs_dyn_cls *c = xs_type_of(a)->dyn;
     for (int32_t i = 0; i < c->n && eq; i++) {
         void *av = xs_dyn_load(&c->f[i], a), *bv;
-        if (!av && c->f[i].optional) continue;
+        if (!av && c->f[i].optional && !xs_dyn_given(&c->f[i], a)) continue;
         if (!xs_plain_get(b, c->f[i].name, c->f[i].len, &bv)) { xs_release(av); return false; }
         eq = xs_uv_eq(xs_uv_ref(av), xs_uv_ref(bv), depth);
         xs_release(av);

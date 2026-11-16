@@ -326,6 +326,7 @@ struct Expr {
     bool boolean;      /* E_BOOL */
     bool spread_read;  /* (a field read that a spread or Object.assign made: a TS private field is copied, as JS does) */
     bool own_in;       /* (k in o from Object.hasOwn / hasOwnProperty.call: own fields only, not the class's methods) */
+    bool xn_in;        /* "nick" in o, nick?: T | null: o.nick != null, or a null given (emit: its xn_ bit) */
     bool prechecked;   /* checked already (its type is final): check_expr leaves it as it is */
     bool want_tuple;   /* E_ARRAY_LIT: [k, v] returned to new Map(xs.map(...)): a tuple, as TypeScript reads it there */
     bool upath;        /* E_AS: a union-typed field path (r.data, this.state, t[0]) read as the member a test narrowed it to (checked) */
@@ -574,6 +575,8 @@ typedef struct {
     Expr *init;        /* may be NULL */
     char *cname;
     bool optional;     /* `name?: T`: T | null, starts as null */
+    bool opt_null;     /* `name?: T | null`: an explicit null is told from absent (JSON, console.log): the C struct has a
+                          bool xn_<cname> right after the field, set when a value other than undefined is stored */
     bool definite;     /* `name!: T`: assigned before it is read (TypeScript trusts it), outside the constructor too */
     DecoList decos;
     char *type_src;    /* the type as written, without the ? (reflection) */

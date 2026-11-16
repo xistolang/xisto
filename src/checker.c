@@ -10430,6 +10430,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     e->op = TK_NEQ;
                     e->lhs = mem;
                     e->rhs = nul;
+                    e->xn_in = fd->opt_null && (mem->lhs->kind == E_IDENT || mem->lhs->kind == E_THIS); /* (a null given is there too; o a name) */
                     check_expr(e, expected);
                     return;
                 }

@@ -2,4 +2,4 @@ true true true null object
 false false
 [ 'name' ] { name: 'ana' }
 [ 1, null ] [1,null]
-{"name":"ana"} [ 'name' ]
+{"name":"ana","nick":null} [ 'name', 'nick' ]

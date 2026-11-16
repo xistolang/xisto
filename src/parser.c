@@ -4839,6 +4839,14 @@ static void parse_fields_body(Parser *p, Class *c) {
                 fd.type = parse_type(p);
                 fd.type_src = span(p, tfrom);
             }
+            if (fd.optional && fd.type_src) { /* nick?: string | null: null is a value of its own, apart from absent */
+                const char *n = fd.type_src;
+                while ((n = strstr(n, "null"))) {
+                    bool word = (n == fd.type_src || !(isalnum((unsigned char)n[-1]) || n[-1] == '_')) && !(isalnum((unsigned char)n[4]) || n[4] == '_');
+                    if (word) { fd.opt_null = true; break; }
+                    n += 4;
+                }
+            }
             if (fd.optional) fd.type = ty_optional_of(fd.type);
             if (accept(p, TK_ASSIGN)) { fd.init = parse_expr(p); fn_value_name(fd.init, name.str); }
             if (!accept(p, TK_SEMI) && !at(p, TK_RBRACE)) accept(p, TK_COMMA); /* interfaces also separate with ',' or nothing */
