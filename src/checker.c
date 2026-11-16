@@ -11158,15 +11158,19 @@ static void check_expr_in(Expr *e, Type *expected) {
     }
     case E_CALL: {
         if (e->lhs && e->lhs->kind == E_IDENT && e->lhs->str && !strncmp(e->lhs->str, "__deco", 6) && e->args.len == 2 &&
-            e->args.items[1]->kind == E_INDEX && e->args.items[1]->lhs && e->args.items[1]->lhs->kind == E_MEMBER &&
-            e->args.items[1]->lhs->str && !strcmp(e->args.items[1]->lhs->str, "fields")) {
-            /* a field's decorator (reflection's __decoN(C, C.fields[k])) written as TypeScript's, (target: object,
-               key: string): it gets a target whose .constructor is the class, and the field's name */
+            ((e->args.items[1]->kind == E_INDEX && e->args.items[1]->lhs && e->args.items[1]->lhs->kind == E_MEMBER &&
+              e->args.items[1]->lhs->str && !strcmp(e->args.items[1]->lhs->str, "fields")) ||
+             (e->args.items[0]->kind == E_IDENT && e->args.items[0]->str && !strcmp(e->args.items[0]->str, "c") &&
+              e->args.items[1]->kind == E_IDENT && e->args.items[1]->str && !strcmp(e->args.items[1]->str, "f") &&
+              cur_func && cur_func->name && !strcmp(cur_func->name, "arrow")))) {
+            /* a field's decorator (reflection's __decoN(C, C.fields[k]), or __decoN(c, f) in the class's __xs_fdeco_ that
+               a mapped type's copies run) written as TypeScript's, (target: object, key: string): it gets a target whose
+               .constructor is the class, and the field's name */
             Binding *b = lookup(e->lhs->str);
             Type *ft = b && b->type ? ty_strip_null(b->type) : NULL;
             Type *p1 = ft && ft->kind == TY_FUNC && ft->nparams == 2 ? ft->params[1] : NULL;
             bool key = p1 && (p1->kind == TY_STRING || (p1->kind == TY_UNION && union_member_for(p1, ty_string, NULL)));
-            if (key) {
+                if (key) {
                 Expr *callee = xs_alloc(sizeof *callee);
                 callee->kind = E_IDENT; callee->pos = e->pos; callee->field = -1; callee->str = "__xs_deco_target";
                 Expr *tg = xs_alloc(sizeof *tg);
