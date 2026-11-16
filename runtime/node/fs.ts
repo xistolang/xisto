@@ -999,10 +999,10 @@ class GlobPattern {
     for (const i of this.indexes) if (!this.symlinks.has(i)) return true;
     return false;
   }
-  child(indexes: Set<int>, symlinks: Set<int> = new Set<int>()): GlobPattern {
+  childWith(indexes: Set<int>, symlinks: Set<int> = new Set<int>()): GlobPattern {
     return new GlobPattern(this.parts, this.strings, indexes, symlinks, this.isAbsolute);
   }
-  test(i: int, name: string): boolean {
+  testAt(i: int, name: string): boolean {
     const p = this.part(i);
     if (p === null || i < 0) return false;
     if (p.kind === 1) return true;
@@ -1016,6 +1016,15 @@ class GlobPattern {
       if (k !== this.strings.length - 1) key += "/";
     }
     return key;
+  }
+}
+
+// an exclude pattern's parts (a class, not a GlobPart[][]: an array of arrays is made where it is typed, so its
+// element class would be compiled into every node:fs program)
+class GlobExclude {
+  parts: GlobPart[];
+  constructor(parts: GlobPart[]) {
+    this.parts = parts;
   }
 }
 
@@ -1053,7 +1062,7 @@ function globKind(path: string): string {
 class GlobWalk {
   root: string;
   excludeFn: ((path: string) => boolean) | null = null;
-  excludeParts: GlobPart[][] = [];
+  excludeParts: GlobExclude[] = [];
   results: string[] = [];
   private resultSet: Set<string> = new Set<string>();
   private queue: GlobQueueItem[] = [];
@@ -1107,7 +1116,7 @@ class GlobWalk {
   isExcluded(full: string): boolean {
     if (this.excludeParts.length === 0) return false;
     const segs = full.split("/");
-    for (const parts of this.excludeParts) if (globMatchFrom(parts, 0, segs, 0)) return true;
+    for (const x of this.excludeParts) if (globMatchFrom(x.parts, 0, segs, 0)) return true;
     return false;
   }
   private addResult(path: string): void {
@@ -1131,7 +1140,9 @@ class GlobWalk {
     while (this.queue.length > 0) {
       const item = this.queue.pop() as GlobQueueItem;
       for (const p of item.patterns) this.addSubpatterns(item.path, p);
-      for (const [path, pats] of this.sub) this.queue.push(new GlobQueueItem(path, pats));
+      // (keys, then get: a [path, patterns] pair would be a tuple class made where it is typed, and with it these
+      // classes in every program that loads node:fs)
+      for (const path of this.sub.keys()) this.queue.push(new GlobQueueItem(path, this.sub.get(path) as GlobPattern[]));
       this.sub.clear();
     }
   }
@@ -1153,15 +1164,15 @@ class GlobWalk {
     const isFirst = pattern.indexes.has(0);
     if (this.isExcluded(full)) return;
     if (isFirst && pattern.isLit(0, "")) {
-      this.addSubpattern("/", pattern.child(this.one(1)));
+      this.addSubpattern("/", pattern.childWith(this.one(1)));
       return;
     }
     if (isFirst && pattern.isLit(0, "..")) {
-      this.addSubpattern("../", pattern.child(this.one(1)));
+      this.addSubpattern("../", pattern.childWith(this.one(1)));
       return;
     }
     if (isFirst && pattern.isLit(0, ".")) {
-      this.addSubpattern(".", pattern.child(this.one(1)));
+      this.addSubpattern(".", pattern.childWith(this.one(1)));
       return;
     }
     const lastPart = pattern.part(-1) as GlobPart;
@@ -1206,10 +1217,10 @@ class GlobWalk {
         const fromSymlink = pattern.symlinks.has(index);
         if (current !== null && current.kind === 1) {
           const isDot = entry.name.startsWith(".");
-          const nextMatches = pattern.test(nextIndex, entry.name);
+          const nextMatches = pattern.testAt(nextIndex, entry.name);
           let nextNonGlob = nextIndex;
           while (pattern.isStar(nextNonGlob)) nextNonGlob++;
-          const matchesDot = isDot && pattern.test(nextNonGlob, entry.name);
+          const matchesDot = isDot && pattern.testAt(nextNonGlob, entry.name);
           const fn = this.excludeFn;
           if ((isDot && !matchesDot) || (fn !== null && fn(entry.name))) continue;
           if (!fromSymlink && entryIsDir) subs.add(index);
@@ -1221,34 +1232,34 @@ class GlobWalk {
           if (pattern.isLit(nextIndex, "..") && entryIsDir) {
             const parent = __pjoin(path, "..");
             if (nextIndex < last) {
-              if (!this.sub.has(path) && !this.seen(path, pattern, nextIndex + 1)) this.sub.set(path, [pattern.child(this.one(nextIndex + 1))]);
-              if (!this.sub.has(parent) && !this.seen(parent, pattern, nextIndex + 1)) this.sub.set(parent, [pattern.child(this.one(nextIndex + 1))]);
+              if (!this.sub.has(path) && !this.seen(path, pattern, nextIndex + 1)) this.sub.set(path, [pattern.childWith(this.one(nextIndex + 1))]);
+              if (!this.sub.has(parent) && !this.seen(parent, pattern, nextIndex + 1)) this.sub.set(parent, [pattern.childWith(this.one(nextIndex + 1))]);
             } else {
               if (!this.seen(path, pattern, nextIndex)) {
-                this.add(path, pattern.child(this.one(nextIndex)));
+                this.add(path, pattern.childWith(this.one(nextIndex)));
                 this.addResult(path);
               }
               if (!this.seen(path, pattern, nextIndex) || !this.seen(parent, pattern, nextIndex)) {
-                this.add(parent, pattern.child(this.one(nextIndex)));
+                this.add(parent, pattern.childWith(this.one(nextIndex)));
                 this.addResult(parent);
               }
             }
           }
         }
         if (current !== null && current.kind === 0) {
-          if (pattern.test(index, entry.name) && index !== last) {
+          if (pattern.testAt(index, entry.name) && index !== last) {
             subs.add(nextIndex);
-          } else if (current.s === "." && pattern.test(nextIndex, entry.name)) {
+          } else if (current.s === "." && pattern.testAt(nextIndex, entry.name)) {
             if (nextIndex === last) this.addResult(entryPath);
             else subs.add(nextIndex + 1);
           }
         }
-        if (current !== null && current.kind === 2 && pattern.test(index, entry.name)) {
+        if (current !== null && current.kind === 2 && pattern.testAt(index, entry.name)) {
           if (index === last) this.addResult(entryPath);
           else if (entryIsDir) subs.add(nextIndex);
         }
       }
-      if (subs.size > 0) this.addSubpattern(entryPath, pattern.child(subs, nSymlinks));
+      if (subs.size > 0) this.addSubpattern(entryPath, pattern.childWith(subs, nSymlinks));
     }
   }
 }
@@ -1262,7 +1273,7 @@ function globWalk(pattern: string | string[], options: GlobOptions | null): Glob
     if (ex !== null && ex !== undefined) {
       if (Array.isArray(ex)) {
         for (const e of ex as string[]) {
-          for (const x of braceExpand(__presolve(cwd, e))) w.excludeParts.push(globParts(globSegments(x), true));
+          for (const x of braceExpand(__presolve(cwd, e))) w.excludeParts.push(new GlobExclude(globParts(globSegments(x), true)));
         }
       } else {
         w.excludeFn = ex as (path: string) => boolean;
