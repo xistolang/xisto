@@ -123,7 +123,9 @@ Differences from Node:
 `node:stream/web` has `ReadableStream` (with `getReader()`/`read()`/`releaseLock()`, `cancel`, `pipeTo`,
 `pipeThrough`, `tee`, `for await`), `WritableStream` (`getWriter()` with `write`/`close`/`abort`/`ready`/
 `closed`/`desiredSize`), `TransformStream`, `TextEncoderStream`, `TextDecoderStream`,
-`CountQueuingStrategy` and `ByteLengthQueuingStrategy`. They are not globals: import them. A source, sink or
+`CountQueuingStrategy` and `ByteLengthQueuingStrategy`. They are globals too, as in Node: a program that makes a
+`new ReadableStream(...)` (or names `WritableStream`, `TransformStream`...) gets them without an import, and
+`ReadableStream<string>` takes its type arguments (the chunks are read as `any`). A source, sink or
 transformer is an object of functions written as properties (`start: (c) => { ... }`), each returning nothing or a
 promise.
 

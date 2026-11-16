@@ -399,6 +399,9 @@ static bool wt_imports(Module *m, const char *name) {
 }
 /* Classes visible from the current module: its own, the ones it imports, and the built-ins. */
 static Class *static_this_class(void);
+static bool webstreams_global; /* the program named the web streams (src/parser.c loaded xisto:stream/web for it) */
+/* xisto:stream/web's classes take type arguments and leave them out (ReadableStream<string>: the chunks are anys) */
+static bool targs_erased(Class *c) { return c && c->mod && c->mod->file && strcmp(c->mod->file, "xisto:stream/web") == 0; }
 static Class *find_class(const char *name) {
     if (name[0] == '\x02' && !strcmp(name, XS_STATIC_THIS)) return static_this_class(); /* `this` in a static method */
     const char *q = strchr(name, '\x01'); /* "A\x01m": the class A of the import from "m" (an alias next to another A, XB-117) */
@@ -417,6 +420,8 @@ static Class *find_class(const char *name) {
         if (!strcmp(name, "Reflect") && c->exported && c->mod && c->mod->file && strstr(c->mod->file, "/reflect-metadata/"))
             return c; /* (Reflect.getMetadata & co: the global that import 'reflect-metadata' installs, the package's class) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:url") == 0 && c->exported) return c; /* (URL & co: web globals) */
+        if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:stream/web") == 0 && c->exported && webstreams_global)
+            return c; /* (ReadableStream & co: web globals, once the program makes one: xisto:stream/web is loaded then) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:intl") == 0 && strncmp(name, "Intl_", 5) == 0) return c; /* (Intl.X: global) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:okmap") == 0 && !strcmp(name, "OkMap")) return c; /* (Map<object, V>) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:iter") == 0) return c; /* (IteratorResult: TypeScript's global) */
@@ -15668,7 +15673,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             xs_error(XS9031, e->pos, xs_help_suggest(e->str, cands, n, "declare it: class Name { ... }"), "unknown class '%s'", e->str);
         }
         if (c->gen_state) c = generic_new(e, c, expected);
-        else if (e->ntargs) xs_error(XS6005, e->pos, NULL, "'%s' is not generic", c->name);
+        else if (e->ntargs && !targs_erased(c)) xs_error(XS6005, e->pos, NULL, "'%s' is not generic", c->name);
         e->cls = c;
         e->type = ty_object_of(c);
         if (c->builtin && c->ctor && c->ctor->is_native) { /* a native package's class: its C constructor */
@@ -20990,6 +20995,8 @@ static void link_base(Class *c) {
     b->subs[b->nsubs++] = c;
 }
 void check_program(Program *p) {
+    for (int i = 0; i < p->nmodules; i++)
+        if (p->modules[i]->file && !strcmp(p->modules[i]->file, "xisto:stream/web")) webstreams_global = true;
     prog = p;
     init_builtins();
     for (int i = 0; i < p->nfuncs; i++) sym_add(&funcs_by_name, p->funcs[i]->name, p->funcs[i]);

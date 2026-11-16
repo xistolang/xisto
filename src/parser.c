@@ -95,12 +95,15 @@ static bool is_test_path(const char *path);
 static struct Expr *ns_member(Parser *p, struct Expr *e, Token name);
 static void assert_src_arg(Parser *p, struct Expr *call, const char *start);
 static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... was named: xisto:url is loaded */
+static bool wants_webstreams; /* new ReadableStream(...), WritableStream, TransformStream... in the program: xisto:stream/web */
 static bool wants_errors; /* TypeError, RangeError, SyntaxError or ReferenceError was named: xisto:errors is loaded */
 static bool is_js_error_name(const char *n) {
     return n && (!strcmp(n, "TypeError") || !strcmp(n, "RangeError") || !strcmp(n, "SyntaxError") || !strcmp(n, "ReferenceError") ||
                  !strcmp(n, "URIError") || !strcmp(n, "AggregateError"));
 }
 static bool is_url_global_name(const char *n);
+static bool is_webstream_global_name(const char *n);
+static bool user_module(Parser *p);
 /* generics: the type parameters in scope while a template is parsed, or their types while an instance is */
 static int no_dyn_note; /* inside generated code: its anys are not the program's uses */
 static char **tp_names;
@@ -236,6 +239,7 @@ static Type *parse_type(Parser *p);
 static bool sym_type(Type *t) { return t && t->kind == TY_OBJECT && t->cls && t->cls->name && !strcmp(t->cls->name, "symbol"); }
 static Type *named_type(Parser *p, Token name) {
     if (is_url_global_name(name.str)) wants_url = true; /* (a URL or AbortSignal parameter) */
+    if (is_webstream_global_name(name.str) && user_module(p)) wants_webstreams = true;
     if (is_js_error_name(name.str)) wants_errors = true; /* (a TypeError parameter, field or return type) */
     Class *c = xs_alloc(sizeof *c);
     c->name = name.str;
@@ -1415,6 +1419,17 @@ static bool tmpl_raw; /* parsing the template of String.raw`...` */
 static Expr *parse_tagged(Parser *p, Expr *tag);
 static bool wants_intl; /* Intl.X was named: xisto:intl is loaded (Intl.DateTimeFormat is its class Intl_DateTimeFormat) */
 /* the web globals xisto:url declares (runtime/node/url.ts) */
+/* the web streams' globals (xisto:stream/web): ReadableStream only as new ReadableStream(...) (the name alone is
+   still the built-in one of fetch's Response.body); named by the program, not by a built-in module */
+static bool is_webstream_global_name(const char *n) {
+    static const char *const names[] = {"WritableStream", "TransformStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController",
+        "WritableStreamDefaultWriter", "WritableStreamDefaultController", "TransformStreamDefaultController", "CountQueuingStrategy",
+        "ByteLengthQueuingStrategy", "TextEncoderStream", "TextDecoderStream", "UnderlyingSource", "UnderlyingSink", "Transformer",
+        "QueuingStrategy", "ReadableStreamReadResult", NULL};
+    for (int i = 0; n && names[i]; i++) if (!strcmp(n, names[i])) return true;
+    return false;
+}
+static bool user_module(Parser *p) { return p->mod && p->mod->file && strncmp(p->mod->file, "xisto:", 6) != 0; }
 static bool is_url_global_name(const char *n) {
     return n && (!strcmp(n, "URL") || !strcmp(n, "URLSearchParams") || !strcmp(n, "AbortController") || !strcmp(n, "AbortSignal") ||
                  !strcmp(n, "DOMException") || !strcmp(n, "RequestInit") || !strcmp(n, "HeadersInit") || !strcmp(n, "fetch") || !strcmp(n, "BufferEncoding"));
@@ -2160,6 +2175,7 @@ static Expr *parse_primary(Parser *p) {
         e->str = name.str;
         if (is_js_error_name(name.str)) wants_errors = true;
         if (is_url_global_name(name.str)) wants_url = true;
+        if ((is_webstream_global_name(name.str) || !strcmp(name.str, "ReadableStream")) && user_module(p)) wants_webstreams = true;
         if (at(p, TK_LT)) { /* new Stack<number>(): a generic class's type arguments */
             next(p);
             do {
@@ -8747,6 +8763,7 @@ Program *parse_program(const char *entry_file) {
     if (wants_tagged) load_module(prog, "xisto:tagged", (Pos){1, 1}, entry_file);
     if (wants_iter) load_module(prog, "xisto:iter", (Pos){1, 1}, entry_file);
     if (wants_url) load_module(prog, "xisto:url", (Pos){1, 1}, entry_file); /* (before errors: its DOMException extends Error) */
+    if (wants_webstreams) load_module(prog, "xisto:stream/web", (Pos){1, 1}, entry_file);
     if (wants_errors) load_module(prog, "xisto:errors", (Pos){1, 1}, entry_file);
     if (wants_intl) load_module(prog, "xisto:intl", (Pos){1, 1}, entry_file);
     if (wants_reflect) load_module(prog, "xisto:reflect", (Pos){1, 1}, entry_file);
