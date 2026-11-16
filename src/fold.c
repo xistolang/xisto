@@ -70,6 +70,10 @@ static void fc_func(Func *f) {
 }
 
 /* ---- literals ---- */
+static bool ascii_only(const char *s) {
+    for (; *s; s++) if ((unsigned char)*s >= 0x80) return false;
+    return true;
+}
 static bool is_lit(const Expr *e) { return e && (e->kind == E_STRING || e->kind == E_NUMBER || e->kind == E_BOOL || e->kind == E_NULL); }
 static bool objlit_ok(const Expr *e) {
     if (!e || e->kind != E_OBJLIT || !e->keys || e->spread) return false;
@@ -241,6 +245,14 @@ static Expr *fold_expr(Expr *e) {
     e->rhs = fold_expr(e->rhs);
     fold_list(&e->args);
     bool t;
+    if (e->kind == E_MEMBER && e->lhs && e->lhs->kind == E_STRING && e->lhs->str && ascii_only(e->lhs->str) && e->str) {
+        long long len = (long long)strlen(e->lhs->str);
+        if (!e->is_call && !strcmp(e->str, "length")) return mk_num((double)len, e); /* "BRL".length */
+        if (e->is_call && !strcmp(e->str, "charCodeAt") && e->args.len == 1 && e->args.items[0]->kind == E_NUMBER) {
+            double i = e->args.items[0]->num; /* "BRL".charCodeAt(0): an ASCII literal's code units are its bytes */
+            if (i >= 0 && i < (double)len && i == (double)(long long)i) return mk_num((double)(unsigned char)e->lhs->str[(long long)i], e);
+        }
+    }
     switch (e->kind) {
     case E_BINARY:
         if (e->op == TK_QQ && is_lit(e->lhs)) {
@@ -267,6 +279,12 @@ static Expr *fold_expr(Expr *e) {
             case TK_PLUS: return mk_num(a + c, e);
             case TK_MINUS: return mk_num(a - c, e);
             case TK_STAR: return mk_num(a * c, e);
+            case TK_PIPE: case TK_AMP: case TK_CARET:
+                if (a == (double)(int32_t)a && c == (double)(int32_t)c) { /* (32-bit integers, as JavaScript's bitwise operators) */
+                    int32_t x = (int32_t)a, y = (int32_t)c;
+                    return mk_num((double)(e->op == TK_PIPE ? (x | y) : e->op == TK_AMP ? (x & y) : (x ^ y)), e);
+                }
+                break;
             default: break;
             }
         }

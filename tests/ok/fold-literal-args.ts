@@ -44,3 +44,10 @@ function keep(o: Opts): string {
 }
 console.log(new Fmt("pt-BR", { style: "currency", digits: 4, grouping: false, label: "L" }).text);
 console.log(pick("b", 7), twice("x"), twice("z"), mutated(1), passOn({ style: "s" }));
+// a literal's length and code units, and bitwise operators over literals, decided when compiling
+function code3(c: string): string {
+  const a = c.length === 3 ? c.charCodeAt(0) | 32 : 0;
+  const z = "é".length === 1 ? 1 : 0;
+  return a === 98 ? `ok ${a & 15} ${a ^ 1} ${z}` : "bad";
+}
+console.log(code3("BRL"));
