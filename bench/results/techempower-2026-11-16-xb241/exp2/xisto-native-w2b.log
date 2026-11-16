@@ -1,0 +1,5 @@
+plaintext http://127.0.0.1:9100 PASS
+# 2026-11-16T01:36:08 gen=wrk levels=16384 duration=15s repeat=3 xisto_workers=2 cpus=2
+# test side name req/s p50_ms p99_ms cpu_ms_per_1k_req rss_MB valid
+plaintext-c16384 xisto xisto-native 388198 286.280 3020.000 4.1 42.4 ok
+# saved /home/ubuntu/xb241-exp2/xisto-native-w2b.txt
