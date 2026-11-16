@@ -5406,6 +5406,18 @@ static void note_failed_decl(const char *src, int line) {
     }
 }
 
+/* the declarations a failed one took with it: each line from `from` to `to` (exclusive) that starts at column 1 */
+static void note_failed_lines(const char *src, int from, int to) {
+    const char *s = src;
+    int l = 1;
+    for (; *s && l < from; s++) if (*s == '\n') l++;
+    for (; *s && l < to; l++) {
+        if (*s != ' ' && *s != '\t' && *s != '\n' && *s != '}' && *s != ')' && *s != ']') note_failed_decl(src, l);
+        while (*s && *s != '\n') s++;
+        if (*s) s++;
+    }
+}
+
 /* a token that can start a top-level declaration (xisto check resumes there after an error, at column 1) */
 static bool at_top_start(Parser *p) {
     switch (p->tok.kind) {
@@ -5459,7 +5471,7 @@ static bool reexport_ahead(Parser *p) {
 static void load_import(Program *prog, Module *m, Import *im) {
     Program *pp = parsing_prog;
     Module *pm = parsing_mod;
-    if (xs_check_mode) {
+    if (xs_keep_going) {
         jmp_buf *saved = xs_error_recover;
         jmp_buf ib;
         xs_error_recover = &ib;
@@ -5713,7 +5725,7 @@ static void parse_module(Program *prog, Module *m) {
     jmp_buf prb;
     volatile int recoveries = 0;
     volatile int last_line = -1, last_col = -1;
-    if (xs_check_mode) { /* xisto check: an import that does not parse costs that import, not the file */
+    if (xs_keep_going) { /* an import that does not parse costs that import, not the file */
         xs_error_recover = &prb;
         if (_setjmp(prb) != 0) {
             xs_file_name = m->file;
@@ -5729,7 +5741,7 @@ static void parse_module(Program *prog, Module *m) {
     }
     for (int i = 0; i < m->nimports; i++) {
         Import *im = &m->imports[i];
-        if (xs_check_mode) { /* a module or package that cannot be loaded: reported, and checking goes on without it */
+        if (xs_keep_going) { /* a module or package that cannot be loaded: reported, and checking goes on without it */
             jmp_buf ib;
             xs_error_recover = &ib;
             if (_setjmp(ib) == 0) im->from = load_module(prog, im->path, im->pos, m->path);
@@ -5744,7 +5756,7 @@ static void parse_module(Program *prog, Module *m) {
     parsing_mod = m;
     int top_start = prog->top.len;
     volatile int decl_line = 0;
-    if (xs_check_mode) if (_setjmp(prb) != 0) { /* a declaration that does not parse: on to the next line that starts one */
+    if (xs_keep_going) if (_setjmp(prb) != 0) { /* a declaration that does not parse: on to the next line that starts one */
         xs_file_name = m->file;
         xs_source = m->src;
         if (decl_line) note_failed_decl(m->src, decl_line); /* its name: uses of it were reported with it */
@@ -5763,6 +5775,8 @@ static void parse_module(Program *prog, Module *m) {
         /* the next line that starts at column 1 and does not close a block: a declaration or a top-level statement */
         while (!at(&p, TK_EOF) && !(p.tok.pos.col == 1 && !at(&p, TK_RBRACE) && !at(&p, TK_RPAREN) && !at(&p, TK_RBRACKET))) next(&p);
         xs_lex_skipping = false;
+        if (decl_line) note_failed_lines(m->src, decl_line + 1, at(&p, TK_EOF) ? INT_MAX : p.tok.pos.line); /* (the
+            declarations read or skipped with the failed one: their uses are quiet too) */
     }
     while (!at(&p, TK_EOF)) {
         decl_line = p.tok.pos.line;
@@ -5845,7 +5859,7 @@ static void parse_module(Program *prog, Module *m) {
             } else if (at(&p, TK_IMPORT)) parse_import(&p, m); else parse_require(&p, m);
             for (int i = n0; i < m->nimports; i++) {
                 Import *im = &m->imports[i];
-                if (xs_check_mode) {
+                if (xs_keep_going) {
                     jmp_buf ib;
                     jmp_buf *saved = xs_error_recover;
                     xs_error_recover = &ib;
@@ -5965,7 +5979,7 @@ static void parse_module(Program *prog, Module *m) {
             drain_pending(&p, &prog->top, m, exported);
         }
     }
-    if (xs_check_mode) xs_error_recover = outer_recover;
+    if (xs_keep_going) xs_error_recover = outer_recover;
     apply_local_exports(prog, m, top_start);
     reflect_module(prog, m, top_start, &p);
 }
