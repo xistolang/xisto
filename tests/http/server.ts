@@ -68,8 +68,15 @@ function byStatus(req: HttpRequest): HttpResponse {
   return HttpResponse.status(418, "{teapot");
 }
 
+// a line on stdout, then the server waits: the line must be out while it waits (a pipe or a file), as Node's
+function logged(req: HttpRequest): HttpResponse {
+  console.log("handled " + req.query("n"));
+  return HttpResponse.text("logged");
+}
+
 const app: Server = new Server();
 app.get("/status/:kind", byStatus);
+app.get("/logged", logged);
 app.get("/wait", wait);
 app.post("/publish", publish);
 app.post("/echo", echo);

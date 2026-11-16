@@ -9066,6 +9066,12 @@ static void check_expr_in(Expr *e, Type *expected) {
                 return;
             }
             Type *b = t->kind == TY_NULLABLE ? t->elem : t;
+            if (b->kind == TY_JSON) { /* an `object` holds any JSON value: typeof says what its text holds (getResponse() of a
+                                         Nest exception made with a string is one: typeof r === "string") */
+                e->builtin.cfn = "xs_json_typeof";
+                e->type = ty_string;
+                return;
+            }
             const char *v = is_big(b) ? "bigint" : b->kind == TY_OBJECT && b->cls->builtin && strcmp(b->cls->name, "symbol") == 0 ? "symbol" : b->kind == TY_STRING || (b->kind == TY_ENUM && b->en->is_string) ? "string"
                           : is_numeric(b) || b->kind == TY_ENUM ? "number" : b->kind == TY_BOOLEAN ? "boolean" : b->kind == TY_FUNC ? "function"
                           : b->kind == TY_OBJECT && b->cls->mod && b->cls->mod->file && !strcmp(b->cls->mod->file, "xisto:reflect") && !strcmp(b->cls->name, "ClassInfo")

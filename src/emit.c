@@ -3821,6 +3821,7 @@ static void emit_expr_raw(Expr *e) {
     case E_UNARY:
         if (e->op == TK_IDENT) { /* typeof on an unknown or a nullable primitive */
             if (strcmp(e->builtin.cfn, "xs_typeof") == 0) { buf_puts(out, "xs_typeof("); emit_borrowed(e->lhs); buf_puts(out, ")"); return; /* (typeof g(): the fresh value released) */ }
+            if (strcmp(e->builtin.cfn, "xs_json_typeof") == 0) { buf_puts(out, "xs_json_typeof("); emit_borrowed(e->lhs); buf_puts(out, ")"); return; }
             Buf b = {0};
             Buf *saved = out;
             out = &b;
