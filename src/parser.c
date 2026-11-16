@@ -3743,6 +3743,19 @@ static Class *parse_interface(Parser *p) {
     return c;
 }
 
+/* const K = class ...: a class expression bound to a module constant (no type written) */
+static bool const_class_ahead(Parser *p) {
+    if (!at(p, TK_CONST)) return false;
+    Parser l = *p;
+    next(&l);
+    if (!at(&l, TK_IDENT)) return false;
+    next(&l);
+    if (!at(&l, TK_ASSIGN)) return false;
+    next(&l);
+    if (!at(&l, TK_CLASS)) return false;
+    next(&l);
+    return at(&l, TK_LBRACE) || at_ident(&l, "extends") || at_ident(&l, "implements"); /* (class Inner { }: K.name is "Inner") */
+}
 static Class *parse_class_ex(Parser *p, bool abstract);
 static Class *parse_class(Parser *p) { return parse_class_ex(p, false); }
 static Class *parse_class_ex0(Parser *p, bool abstract);
@@ -3753,12 +3766,16 @@ static Class *parse_class_ex(Parser *p, bool abstract) { /* (a class inside func
     p->this_alias = was;
     return c;
 }
+static const char *class_bound_name; /* const K = class { ... }: the class takes the constant's name (parse_class_ex0) */
 static Class *parse_class_ex0(Parser *p, bool abstract) {
     Class *c = xs_alloc(sizeof *c);
     c->pos = p->tok.pos;
     c->is_abstract = abstract;
     expect(p, TK_CLASS, NULL);
-    c->name = expect(p, TK_IDENT, NULL).str;
+    if (class_bound_name) { /* (anonymous: JavaScript names it after the constant too) */
+        c->name = (char *)class_bound_name;
+        class_bound_name = NULL;
+    } else c->name = expect(p, TK_IDENT, NULL).str;
     if (at(p, TK_LT)) { /* class Name<T, U>: a template, parsed again per list of type arguments */
         next(p);
         do {
@@ -5971,7 +5988,12 @@ static void parse_module(Program *prog, Module *m) {
             }
             if (is_default) m->default_name = f->name;
             add_func(prog, f);
-        } else if (at(&p, TK_CLASS) || (at_ident(&p, "abstract") && peek_is(&p, TK_CLASS))) {
+        } else if (at(&p, TK_CLASS) || (at_ident(&p, "abstract") && peek_is(&p, TK_CLASS)) || const_class_ahead(&p)) {
+            if (at(&p, TK_CONST)) { /* const K = class { static tag = 1 }: the class K, as if declared so (K.tag, new K()) */
+                next(&p);
+                class_bound_name = expect(&p, TK_IDENT, NULL).str;
+                expect(&p, TK_ASSIGN, NULL);
+            }
             bool abstract = at_ident(&p, "abstract");
             if (abstract) next(&p);
             Class *c = parse_class_ex(&p, abstract);
@@ -5994,6 +6016,7 @@ static void parse_module(Program *prog, Module *m) {
             if (is_default) m->default_name = c->name;
             add_class(prog, c);
             add_statics(prog, m, c);
+            accept(&p, TK_SEMI); /* (const K = class { ... };) */
         } else if (at_ident(&p, "interface") || (at_ident(&p, "type") && peek_is_ident(&p))) {
             Class *c = parse_interface(&p);
             c->mod = m;
