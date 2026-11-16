@@ -8455,18 +8455,21 @@ XS_NOINLINE int64_t xs_util_kind(void *v) {
 /* console.group: the indentation (spaces) of what console.log & co print (xisto:console changes it). A program that
    names console.group emits each console.log between xs_grp_begin and xs_grp_end: inside a group the line is
    printed into memory, then written with the indentation at the start of each of its lines, as Node does */
-static int64_t xs_grp_indent;
+static int64_t xs_grp_indent, xs_grp_depth; /* (depth: a begin inside a begin, as a log whose argument logs, nests) */
 static FILE *xs_grp_mem, *xs_grp_saved;
 static char *xs_grp_buf;
 static size_t xs_grp_size;
 XS_NOINLINE void xs_console_group_indent(int64_t n) { xs_grp_indent = n < 0 ? 0 : n; }
 XS_NOINLINE void xs_grp_begin(void) {
-    if (!xs_grp_indent) return;
+    if (xs_grp_depth++ || !xs_grp_indent) return; /* (an inner begin prints into the outer one's memory) */
+    FILE *m = open_memstream(&xs_grp_buf, &xs_grp_size);
+    if (!m) return; /* (no memory for it: the line is printed without the indentation) */
     xs_grp_saved = xs_out_f;
-    xs_grp_mem = open_memstream(&xs_grp_buf, &xs_grp_size);
-    xs_out_f = xs_grp_mem;
+    xs_grp_mem = m;
+    xs_out_f = m;
 }
 XS_NOINLINE void xs_grp_end(void) {
+    if (xs_grp_depth > 0 && --xs_grp_depth) return;
     if (!xs_grp_mem) return;
     fclose(xs_grp_mem);
     xs_grp_mem = NULL;
@@ -9312,25 +9315,29 @@ XS_NOINLINE xs_big *xs_big_from_num(double v) {
 }
 
 /* the default order of xs.sort(): by UTF-16 code units, as JavaScript compares strings. UTF-8 bytes order by code
-   point, which agrees except where a character past U+FFFF (a surrogate pair, D800-DBFF first) meets one of
-   U+E000-U+FFFF: at the first character that differs, a code point past U+FFFF is weighed as its high surrogate */
-XS_NOINLINE int64_t xs_str_cmp16(xs_str *a, xs_str *b) {
+   point, which agrees except where a character past U+FFFF (lead byte F0-F4, a surrogate pair D800-DBFF in UTF-16)
+   meets one of U+E000-U+FFFF (lead byte EE or EF): there the character past U+FFFF comes first. So the bytes decide,
+   and only those two lead bytes at the first difference need a look; no character is decoded. The common prefix is
+   scanned 8 bytes at a time (sorting paths with a long shared prefix is a hot path). */
+static inline int64_t xs_str_cmp16(xs_str *a, xs_str *b) {
     int64_t n = a->len < b->len ? a->len : b->len, i = 0;
-    while (i < n && a->data[i] == b->data[i]) i++;
-    if (i == n) return a->len < b->len ? -1 : a->len > b->len ? 1 : 0;
-    while (i > 0 && ((unsigned char)a->data[i] & 0xC0) == 0x80) i--; /* (the start of the character, the same in both) */
-    uint32_t ca = 0, cb = 0;
-    for (int k = 0; k < 2; k++) {
-        const unsigned char *s = (const unsigned char *)(k ? b->data : a->data) + i;
-        uint32_t c = s[0];
-        if (c >= 0xF0) c = ((c & 7) << 18) | ((s[1] & 63u) << 12) | ((s[2] & 63u) << 6) | (s[3] & 63u);
-        else if (c >= 0xE0) c = ((c & 15) << 12) | ((s[1] & 63u) << 6) | (s[2] & 63u);
-        else if (c >= 0xC0) c = ((c & 31) << 6) | (s[1] & 63u);
-        if (k) cb = c; else ca = c;
+    const unsigned char *pa = (const unsigned char *)a->data, *pb = (const unsigned char *)b->data;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    for (; i + 8 <= n; i += 8) {
+        uint64_t wa, wb;
+        memcpy(&wa, pa + i, 8);
+        memcpy(&wb, pb + i, 8);
+        if (wa != wb) { i += __builtin_ctzll(wa ^ wb) >> 3; goto differ; }
     }
-    uint32_t ka = ca >= 0x10000 ? 0xD800 + ((ca - 0x10000) >> 10) : ca, kb = cb >= 0x10000 ? 0xD800 + ((cb - 0x10000) >> 10) : cb;
-    if (ka != kb) return ka < kb ? -1 : 1;
-    return ca < cb ? -1 : ca > cb ? 1 : 0;
+#endif
+    while (i < n && pa[i] == pb[i]) i++;
+    if (i == n) return a->len < b->len ? -1 : a->len > b->len ? 1 : 0;
+differ:;
+    int64_t j = i;
+    while (j > 0 && (pa[j] & 0xC0) == 0x80) j--; /* (the lead byte of the character, the same in both before i) */
+    unsigned la = pa[j], lb = pb[j];
+    if (la >= 0xEE && lb >= 0xEE && (la >= 0xF0) != (lb >= 0xF0)) return la >= 0xF0 ? -1 : 1;
+    return pa[i] < pb[i] ? -1 : 1;
 }
 
 /* xisto:builtins' __xs_throw("RangeError: ..."): an Error of that name, as the runtime raises its own */
@@ -9823,6 +9830,42 @@ XS_NOINLINE xs_big *xs_big_neg(xs_big *a) {
     memcpy(r->d, a->d, 8 * (size_t)a->n);
     r->neg = a->n ? !a->neg : 0;
     return r;
+}
+
+/* BigInt.asUintN(bits, b) (sgn 0) and asIntN (sgn 1): b modulo 2^bits, as an unsigned or a two's complement value.
+   Limb by limb on the low ceil(bits/64) limbs; no power of two is built. A value that already fits comes back as
+   a copy at once. */
+XS_NOINLINE xs_big *xs_big_as_n(int64_t bits, xs_big *b, int64_t sgn) {
+    if (bits <= 0) return xs_big_from_int(0);
+    int64_t bl = b->n ? (int64_t)b->n * 64 - __builtin_clzll(b->d[b->n - 1]) : 0; /* the bit length of |b| */
+    bool fits = sgn ? bl <= bits - 1 : !b->neg && bl <= bits;
+    if (!fits && sgn && b->neg && bl == bits) { /* -2^(bits-1) fits too */
+        fits = (b->d[b->n - 1] & (b->d[b->n - 1] - 1)) == 0;
+        for (int32_t k = 0; fits && k < b->n - 1; k++) fits = b->d[k] == 0;
+    }
+    if (fits) {
+        xs_big *r = xs_big_alloc(b->n);
+        memcpy(r->d, b->d, 8 * (size_t)b->n);
+        r->neg = b->neg;
+        return r;
+    }
+    int64_t L = (bits + 63) / 64;
+    xs_big *r = xs_big_alloc(L);
+    int64_t c = L < b->n ? L : b->n;
+    memcpy(r->d, b->d, 8 * (size_t)c);
+    memset(r->d + c, 0, 8 * (size_t)(L - c));
+    uint64_t top = bits % 64 ? ((uint64_t)1 << (bits % 64)) - 1 : ~(uint64_t)0;
+    #define XS_NEG_L_() do { uint64_t cy_ = 1; for (int64_t k = 0; k < L; k++) { uint64_t v_ = ~r->d[k] + cy_; cy_ = cy_ && v_ == 0; r->d[k] = v_; } } while (0)
+    if (b->neg) XS_NEG_L_(); /* 2^bits - |b| mod 2^bits: the two's complement over the L limbs */
+    r->d[L - 1] &= top;
+    r->neg = 0;
+    if (sgn && (r->d[(bits - 1) / 64] >> ((bits - 1) % 64)) & 1) { /* the sign bit: r - 2^bits */
+        XS_NEG_L_();
+        r->d[L - 1] &= top;
+        r->neg = 1;
+    }
+    #undef XS_NEG_L_
+    return xs_big_norm(r);
 }
 
 XS_NOINLINE xs_big *xs_big_mul(xs_big *a, xs_big *b) {

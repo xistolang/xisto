@@ -7536,7 +7536,7 @@ static void check_object_member_in(Expr *e, Class *c) {
     }
     if (f) {
         if (e->is_call) xs_error(XS8048, e->pos, NULL, "'%s' is a field of %s, not a method", e->str, c->name);
-        check_access(f->access, f->owner, f->name, e->pos);
+        if (!e->spread_read) check_access(f->access, f->owner, f->name, e->pos);
         e->field = idx;
         e->type = f->type;
         e->cls = c;
@@ -8531,6 +8531,7 @@ static bool objlit_expand(Expr *e, Type *expected) {
             const char *fname = sc->fields[k].name;
             if (target && !find_field(target, fname, NULL)) continue; /* (TypeScript allows extra fields from a spread) */
             Expr *m = member_of(pure_copy(src), fname, a->pos);
+            m->spread_read = true;
             if (nsrc) { /* (spreading null adds nothing: x === null ? null : x.f) */
                 Expr *z = xs_alloc(sizeof *z);
                 z->kind = E_NULL; z->pos = a->pos; z->field = -1;
@@ -9315,10 +9316,10 @@ static bool check_es_static(Expr *e, const char *ns, Type *expected) {
         return true;
     }
     if (strcmp(ns, "Object") != 0) return false;
-    if (!strcmp(m, "hasOwn") && n == 2) { /* Object.hasOwn(o, k): k in o */
+    if (!strcmp(m, "hasOwn") && n == 2) { /* Object.hasOwn(o, k): k in o, own fields only (a method is the class's) */
         Expr *o = e->args.items[0], *k = e->args.items[1];
         memset(e, 0, sizeof *e);
-        e->kind = E_BINARY; e->op = TK_IN; e->pos = pos; e->field = -1; e->lhs = k; e->rhs = o;
+        e->kind = E_BINARY; e->op = TK_IN; e->pos = pos; e->field = -1; e->lhs = k; e->rhs = o; e->own_in = true;
         check_expr(e, expected);
         return true;
     }
@@ -9789,7 +9790,11 @@ static void check_expr_in(Expr *e, Type *expected) {
                     check_expr(e, expected);
                     return;
                 }
-                bool has = fd != NULL || find_method(ot->cls, e->lhs->str) != NULL;
+                bool has = fd != NULL;
+                if (!has && !e->own_in) /* (a method or an accessor is the class's, not own: in sees it, hasOwn does not) */
+                    for (Class *c = ot->cls; c && !has; c = c->base)
+                        has = find_method(c, e->lhs->str) || find_method(c, xs_sprintf("__get_%s", e->lhs->str)) ||
+                              find_method(c, xs_sprintf("__set_%s", e->lhs->str));
                 e->kind = E_BOOL;
                 e->boolean = has;
                 e->lhs = e->rhs = NULL;
@@ -10915,6 +10920,18 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->builtin.cfn = "xs_str_cmp16";
                 return;
             }
+            if (strcmp(name, "__xs_big_asn") == 0 && e->args.len == 3 && cur_mod && cur_mod->file && !strcmp(cur_mod->file, "xisto:builtins")) {
+                /* (BigInt.asUintN/asIntN: xs_big_as_n(bits, b, signed), on the limbs) */
+                check_expr(e->args.items[0], ty_number);
+                expect_type(e->args.items[0], ty_number, "internal: the bits of __xs_big_asn");
+                check_expr(e->args.items[1], NULL);
+                if (!is_big(e->args.items[1]->type)) xs_error(XS8020, e->args.items[1]->pos, NULL, "internal: __xs_big_asn takes a bigint");
+                check_expr(e->args.items[2], ty_int);
+                expect_type(e->args.items[2], ty_int, "internal: the sign of __xs_big_asn");
+                e->type = e->args.items[1]->type;
+                e->builtin.cfn = "xs_big_as_n";
+                return;
+            }
             if (strcmp(name, "__xs_throw") == 0 && e->args.len == 1 && cur_mod && cur_mod->file && !strcmp(cur_mod->file, "xisto:builtins")) {
                 /* (xisto:builtins: __xs_throw("RangeError: ...") raises the error the runtime would, of that name: the
                    module needs no class of xisto:errors) */
@@ -11938,11 +11955,11 @@ static void check_expr_in(Expr *e, Type *expected) {
             e->lhs->str && !strcmp(e->lhs->str, "hasOwnProperty") && e->lhs->lhs && e->lhs->lhs->kind == E_MEMBER && e->lhs->lhs->str &&
             !strcmp(e->lhs->lhs->str, "prototype") && e->lhs->lhs->lhs && e->lhs->lhs->lhs->kind == E_IDENT &&
             !strcmp(e->lhs->lhs->lhs->str, "Object") && !lookup("Object")) {
-            /* Object.prototype.hasOwnProperty.call(o, k): k in o (a Record's key, a field an object has) */
+            /* Object.prototype.hasOwnProperty.call(o, k): k in o (a Record's key, a field an object has; not a method) */
             Expr *o = e->args.items[0], *k = e->args.items[1];
             Pos at = e->pos;
             memset(e, 0, sizeof *e);
-            e->kind = E_BINARY; e->op = TK_IN; e->pos = at; e->field = -1; e->lhs = k; e->rhs = o;
+            e->kind = E_BINARY; e->op = TK_IN; e->pos = at; e->field = -1; e->lhs = k; e->rhs = o; e->own_in = true;
             check_expr(e, expected);
             return;
         }
@@ -13036,6 +13053,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     Expr *d = e->args.items[0];
                     double dv = d->kind == E_NUMBER ? d->num : d->kind == E_IDENT && d->str && !strcmp(d->str, "Infinity") && !lookup("Infinity") ? INFINITY : -1;
                     if (dv < 0) xs_error(XS7001, d->pos, "write the depth in place: xs.flat(2), xs.flat(Infinity)", "the depth of flat must be a number written in place");
+                    if (isfinite(dv)) dv = trunc(dv); /* (flat(1.5) is flat(1), as JavaScript's ToIntegerOrInfinity) */
                     Expr *x = e->lhs;
                     x->prechecked = true;
                     int k = 0;

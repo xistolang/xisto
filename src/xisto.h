@@ -313,6 +313,8 @@ struct Expr {
     void *ctx;         /* checker: where its names resolve when that is not where it is checked (a parameter's default) */
     bool unset;        /* E_NULL: the start of `let x: Cls;` (assigned before any read, TypeScript checks it) */
     bool boolean;      /* E_BOOL */
+    bool spread_read;  /* (a field read that a spread or Object.assign made: a TS private field is copied, as JS does) */
+    bool own_in;       /* (k in o from Object.hasOwn / hasOwnProperty.call: own fields only, not the class's methods) */
     bool prechecked;   /* checked already (its type is final): check_expr leaves it as it is */
     bool want_tuple;   /* E_ARRAY_LIT: [k, v] returned to new Map(xs.map(...)): a tuple, as TypeScript reads it there */
     bool cell_raw;     /* E_IDENT tested against null (x === null, x ?? d): a narrowed variable in a cell read as declared (T | null) */

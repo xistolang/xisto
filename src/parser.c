@@ -1308,36 +1308,54 @@ static bool is_url_global_name(const char *n) {
     return n && (!strcmp(n, "URL") || !strcmp(n, "URLSearchParams") || !strcmp(n, "AbortController") || !strcmp(n, "AbortSignal") ||
                  !strcmp(n, "DOMException") || !strcmp(n, "RequestInit") || !strcmp(n, "HeadersInit") || !strcmp(n, "fetch") || !strcmp(n, "BufferEncoding"));
 }
-/* globalThis: the standard globals of Node, each with what typeof gives for it there. globalThis.X is the global X
-   (read as X), typeof globalThis.X is that string ("undefined" for a name Node does not have), "X" in globalThis is
-   true for these names. A global is a static name here, so globalThis is never a value: assigning a new property
-   (globalThis.foo = 1), reading one of a name not listed, or passing globalThis around is an error that says so */
+/* globalThis: every global of Node (26, a module's own scope; the globals of node -e and the REPL are left out),
+   each with what typeof gives for it there. The list is complete, so a feature test answers as on Node: typeof
+   globalThis.X is that string, "X" in globalThis is true exactly for these names, and a name Node does not have is
+   "undefined"/false there too (a program cannot add one: assigning globalThis.foo is an error). globalThis.X is the
+   global X (read as X); one xisto does not implement (WebAssembly...) is then an unknown name, an error at compile
+   time, never a silent undefined. A global is a static name here, so globalThis is never a value: reading a name not
+   listed or passing globalThis around is an error that says so */
 static const struct { const char *name, *type; } js_globals[] = {
-    {"globalThis", "object"}, {"global", "object"}, {"console", "object"}, {"process", "object"}, {"performance", "object"},
-    {"crypto", "object"}, {"Math", "object"}, {"JSON", "object"}, {"Reflect", "object"}, {"Intl", "object"}, {"Atomics", "object"},
-    {"navigator", "object"}, {"setTimeout", "function"}, {"setInterval", "function"}, {"setImmediate", "function"},
-    {"clearTimeout", "function"}, {"clearInterval", "function"}, {"clearImmediate", "function"}, {"queueMicrotask", "function"},
-    {"structuredClone", "function"}, {"fetch", "function"}, {"atob", "function"}, {"btoa", "function"}, {"parseInt", "function"},
-    {"parseFloat", "function"}, {"isNaN", "function"}, {"isFinite", "function"}, {"encodeURIComponent", "function"},
-    {"decodeURIComponent", "function"}, {"encodeURI", "function"}, {"decodeURI", "function"}, {"String", "function"},
-    {"Number", "function"}, {"Boolean", "function"}, {"Array", "function"}, {"Object", "function"}, {"Map", "function"},
-    {"Set", "function"}, {"WeakMap", "function"}, {"WeakSet", "function"}, {"WeakRef", "function"}, {"Promise", "function"},
-    {"Date", "function"}, {"RegExp", "function"}, {"Error", "function"}, {"TypeError", "function"}, {"RangeError", "function"},
-    {"SyntaxError", "function"}, {"ReferenceError", "function"}, {"URIError", "function"}, {"EvalError", "function"},
-    {"AggregateError", "function"}, {"Symbol", "function"}, {"BigInt", "function"}, {"Function", "function"}, {"Proxy", "function"},
-    {"Buffer", "function"}, {"URL", "function"}, {"URLSearchParams", "function"}, {"TextEncoder", "function"}, {"TextDecoder", "function"},
-    {"AbortController", "function"}, {"AbortSignal", "function"}, {"DOMException", "function"}, {"Uint8Array", "function"},
-    {"Uint8ClampedArray", "function"}, {"Int8Array", "function"}, {"Uint16Array", "function"}, {"Int16Array", "function"},
-    {"Uint32Array", "function"}, {"Int32Array", "function"}, {"Float32Array", "function"}, {"Float64Array", "function"},
-    {"BigInt64Array", "function"}, {"BigUint64Array", "function"}, {"ArrayBuffer", "function"}, {"SharedArrayBuffer", "function"},
-    {"DataView", "function"}, {"Headers", "function"}, {"Request", "function"}, {"Response", "function"}, {"FormData", "function"},
-    {"Blob", "function"}, {"File", "function"}, {"WebSocket", "function"}, {"EventTarget", "function"}, {"Event", "function"},
-    {"CustomEvent", "function"}, {"MessageChannel", "function"}, {"MessagePort", "function"}, {"BroadcastChannel", "function"},
-    {"ReadableStream", "function"}, {"WritableStream", "function"}, {"TransformStream", "function"}, {"CompressionStream", "function"},
-    {"DecompressionStream", "function"}, {"TextEncoderStream", "function"}, {"TextDecoderStream", "function"},
-    {"PerformanceEntry", "function"}, {"PerformanceMark", "function"}, {"PerformanceMeasure", "function"},
-    {"Crypto", "function"}, {"CryptoKey", "function"}, {"SubtleCrypto", "function"}, {"NaN", "number"}, {"Infinity", "number"},
-    {"undefined", "undefined"},
+    {"AbortController", "function"}, {"AbortSignal", "function"}, {"AggregateError", "function"}, {"Array", "function"},
+    {"ArrayBuffer", "function"}, {"AsyncDisposableStack", "function"}, {"Atomics", "object"}, {"BigInt", "function"},
+    {"BigInt64Array", "function"}, {"BigUint64Array", "function"}, {"Blob", "function"}, {"Boolean", "function"},
+    {"BroadcastChannel", "function"}, {"Buffer", "function"}, {"ByteLengthQueuingStrategy", "function"},
+    {"CloseEvent", "function"}, {"CompressionStream", "function"}, {"CountQueuingStrategy", "function"},
+    {"Crypto", "function"}, {"CryptoKey", "function"}, {"CustomEvent", "function"}, {"DOMException", "function"},
+    {"DataView", "function"}, {"Date", "function"}, {"DecompressionStream", "function"},
+    {"DisposableStack", "function"}, {"Error", "function"}, {"ErrorEvent", "function"}, {"EvalError", "function"},
+    {"Event", "function"}, {"EventTarget", "function"}, {"File", "function"}, {"FinalizationRegistry", "function"},
+    {"Float16Array", "function"}, {"Float32Array", "function"}, {"Float64Array", "function"}, {"FormData", "function"},
+    {"Function", "function"}, {"Headers", "function"}, {"Infinity", "number"}, {"Int16Array", "function"},
+    {"Int32Array", "function"}, {"Int8Array", "function"}, {"Intl", "object"}, {"Iterator", "function"},
+    {"JSON", "object"}, {"Map", "function"}, {"Math", "object"}, {"MessageChannel", "function"},
+    {"MessageEvent", "function"}, {"MessagePort", "function"}, {"NaN", "number"}, {"Navigator", "function"},
+    {"Number", "function"}, {"Object", "function"}, {"Performance", "function"}, {"PerformanceEntry", "function"},
+    {"PerformanceMark", "function"}, {"PerformanceMeasure", "function"}, {"PerformanceObserver", "function"},
+    {"PerformanceObserverEntryList", "function"}, {"PerformanceResourceTiming", "function"}, {"Promise", "function"},
+    {"Proxy", "function"}, {"QuotaExceededError", "function"}, {"RangeError", "function"},
+    {"ReadableByteStreamController", "function"}, {"ReadableStream", "function"},
+    {"ReadableStreamBYOBReader", "function"}, {"ReadableStreamBYOBRequest", "function"},
+    {"ReadableStreamDefaultController", "function"}, {"ReadableStreamDefaultReader", "function"},
+    {"ReferenceError", "function"}, {"Reflect", "object"}, {"RegExp", "function"}, {"Request", "function"},
+    {"Response", "function"}, {"Set", "function"}, {"SharedArrayBuffer", "function"}, {"Storage", "function"},
+    {"String", "function"}, {"SubtleCrypto", "function"}, {"SuppressedError", "function"}, {"Symbol", "function"},
+    {"SyntaxError", "function"}, {"Temporal", "object"}, {"TextDecoder", "function"}, {"TextDecoderStream", "function"},
+    {"TextEncoder", "function"}, {"TextEncoderStream", "function"}, {"TransformStream", "function"},
+    {"TransformStreamDefaultController", "function"}, {"TypeError", "function"}, {"URIError", "function"},
+    {"URL", "function"}, {"URLPattern", "function"}, {"URLSearchParams", "function"}, {"Uint16Array", "function"},
+    {"Uint32Array", "function"}, {"Uint8Array", "function"}, {"Uint8ClampedArray", "function"}, {"WeakMap", "function"},
+    {"WeakRef", "function"}, {"WeakSet", "function"}, {"WebAssembly", "object"}, {"WebSocket", "function"},
+    {"WritableStream", "function"}, {"WritableStreamDefaultController", "function"},
+    {"WritableStreamDefaultWriter", "function"}, {"atob", "function"}, {"btoa", "function"},
+    {"clearImmediate", "function"}, {"clearInterval", "function"}, {"clearTimeout", "function"}, {"console", "object"},
+    {"crypto", "object"}, {"decodeURI", "function"}, {"decodeURIComponent", "function"}, {"encodeURI", "function"},
+    {"encodeURIComponent", "function"}, {"escape", "function"}, {"eval", "function"}, {"fetch", "function"},
+    {"global", "object"}, {"globalThis", "object"}, {"isFinite", "function"}, {"isNaN", "function"},
+    {"localStorage", "undefined"}, {"navigator", "object"}, {"parseFloat", "function"}, {"parseInt", "function"},
+    {"performance", "object"}, {"process", "object"}, {"queueMicrotask", "function"}, {"sessionStorage", "object"},
+    {"setImmediate", "function"}, {"setInterval", "function"}, {"setTimeout", "function"},
+    {"structuredClone", "function"}, {"undefined", "undefined"}, {"unescape", "function"},
 };
 static const char *js_global_type(const char *n) {
     for (size_t i = 0; n && i < sizeof js_globals / sizeof *js_globals; i++)
@@ -2354,7 +2372,7 @@ static Expr *parse_rel(Parser *p) {
                 if (!at(&look, TK_DOT) && !at(&look, TK_QDOT) && !at(&look, TK_LBRACKET)) {
                     *p = look;
                     Expr *b = new_expr(E_BOOL, pos);
-                    b->boolean = js_global_type(e->str) && strcmp(e->str, "undefined") != 0;
+                    b->boolean = js_global_type(e->str) != NULL;
                     e = b;
                     continue;
                 }
@@ -6513,8 +6531,10 @@ static const char xs_builtins_src[] =
     "// iterator helpers (ES2025) that the generators' own (map, filter, take, forEach, reduce, toArray) do not cover\n"
     "// (the count is checked when the helper is called, as JavaScript does: the generators below are lazy)\n"
     "export function __xs_it_drop<T>(g: Generator<T>, n: number): Generator<T> {\n"
-    "  if (!(n >= 0)) __xs_throw(\"RangeError: \" + n + \" must be positive\");\n"
-    "  return __xs_it_drop_(g, n);\n"
+    "  // (the count as an integer, as JavaScript's ToIntegerOrInfinity: 1.5 is 1, -0.5 is 0; NaN and below 0 throw)\n"
+    "  const k: number = n !== n ? -1 : Math.trunc(n);\n"
+    "  if (!(k >= 0)) __xs_throw(\"RangeError: \" + n + \" must be positive\");\n"
+    "  return __xs_it_drop_(g, k);\n"
     "}\n"
     "export function* __xs_it_drop_<T>(g: Generator<T>, n: number): Generator<T> {\n"
     "  let i = 0;\n"
@@ -6524,8 +6544,10 @@ static const char xs_builtins_src[] =
     "  }\n"
     "}\n"
     "export function __xs_it_take<T>(g: Generator<T>, n: number): Generator<T> {\n"
-    "  if (!(n >= 0)) __xs_throw(\"RangeError: \" + n + \" must be positive\");\n"
-    "  return __xs_it_take_(g, n);\n"
+    "  // (the count as an integer, as JavaScript's ToIntegerOrInfinity: 1.5 is 1, -0.5 is 0; NaN and below 0 throw)\n"
+    "  const k: number = n !== n ? -1 : Math.trunc(n);\n"
+    "  if (!(k >= 0)) __xs_throw(\"RangeError: \" + n + \" must be positive\");\n"
+    "  return __xs_it_take_(g, k);\n"
     "}\n"
     "export function* __xs_it_take_<T>(g: Generator<T>, n: number): Generator<T> {\n"
     "  if (n === 0) return;\n"
@@ -6601,22 +6623,18 @@ static const char xs_builtins_src[] =
     "}\n"
     "// BigInt.asUintN / asIntN, bigint.toString(radix)\n"
     "export function __xs_asUintN(bits: number, b: bigint): bigint {\n"
-    "  if (!(bits >= 0 && bits <= 9007199254740991 && Math.trunc(bits) === bits)) __xs_throw(\"RangeError: Invalid value: not (convertible to) a safe integer\");\n"
-    "  if (bits === 0) return 0n;\n"
-    "  const m = 2n ** BigInt(bits);\n"
-    "  let r = b % m;\n"
-    "  if (r < 0n) r += m;\n"
-    "  return r;\n"
+    "  const n: number = bits !== bits ? 0 : Math.trunc(bits);\n"
+    "  if (!(n >= 0 && n <= 9007199254740991)) __xs_throw(\"RangeError: Invalid value: not (convertible to) a safe integer\");\n"
+    "  return __xs_big_asn(n, b, 0);\n"
     "}\n"
     "export function __xs_asIntN(bits: number, b: bigint): bigint {\n"
-    "  const r = __xs_asUintN(bits, b);\n"
-    "  if (bits === 0) return r;\n"
-    "  const h = 2n ** BigInt(bits - 1);\n"
-    "  return r >= h ? r - h - h : r;\n"
+    "  const n: number = bits !== bits ? 0 : Math.trunc(bits);\n"
+    "  if (!(n >= 0 && n <= 9007199254740991)) __xs_throw(\"RangeError: Invalid value: not (convertible to) a safe integer\");\n"
+    "  return __xs_big_asn(n, b, 1);\n"
     "}\n"
     "export function __xs_big_radix(b: bigint, radix: number): string {\n"
-    "  if (!(radix >= 2 && radix <= 36)) __xs_throw(\"RangeError: toString() radix argument must be between 2 and 36\");\n"
-    "  const r: number = Math.trunc(radix);\n"
+    "  const r: number = radix !== radix ? 0 : Math.trunc(radix);\n"
+    "  if (!(r >= 2 && r <= 36)) __xs_throw(\"RangeError: toString() radix argument must be between 2 and 36\");\n"
     "  if (r === 10) return String(b);\n"
     "  const neg = b < 0n;\n"
     "  let x = neg ? -b : b;\n"
