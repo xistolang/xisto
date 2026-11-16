@@ -5566,6 +5566,7 @@ static void emit_block_kind(Stmt *b, ScopeKind kind) {
     buf_puts(out, "}");
 }
 
+static int super_stmt_at(Stmt *b);
 static void emit_block(Stmt *b, bool func_root) {
     buf_puts(out, "{");
     indent++;
@@ -5588,7 +5589,8 @@ static void emit_block(Stmt *b, bool func_root) {
         blk_prev_stmt = i > 0 ? b->stmts.items[i - 1] : NULL;
         if (b->stmts.items[i] == fz_skip) { fz_skip = NULL; continue; } /* (emitted with the one before: rs_fuse) */
         { Stmt *sb = blk_cur; int si = blk_cur_i; blk_cur = b; blk_cur_i = i; emit_stmt(b->stmts.items[i]); blk_cur = sb; blk_cur_i = si; }
-        if (i == 0 && after_super) emit_own_field_inits(after_super); /* super(...) ran: now the class's own fields */
+        if (after_super && (i == super_stmt_at(b) || (i == 0 && super_stmt_at(b) < 0))) /* super(...) ran: now the class's own fields */
+            emit_own_field_inits(after_super);
     }
     emit_releases(escope);
     epop();
@@ -5597,6 +5599,14 @@ static void emit_block(Stmt *b, bool func_root) {
     buf_puts(out, "}");
 }
 
+/* the index of the constructor body's super(...) statement (statements may come before it, XB-153), or -1 */
+static int super_stmt_at(Stmt *b) {
+    for (int i = 0; i < b->stmts.len; i++) {
+        Stmt *s = b->stmts.items[i];
+        if (s->kind == S_EXPR && s->expr && s->expr->kind == E_SUPER_CALL) return i;
+    }
+    return -1;
+}
 static void drain_if_needed(void) {
     if (used_ar) {
         nl();

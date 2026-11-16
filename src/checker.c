@@ -18810,6 +18810,27 @@ static Type *fret(Func *f, Pos pos) {
     return f->ret;
 }
 
+/* the first `this` (or super.m) in a statement, arrows included (they would capture the object before it exists) */
+static Expr *this_use_s(Stmt *s);
+static Expr *this_use_e(Expr *e) {
+    if (!e) return NULL;
+    if (e->kind == E_THIS) return e;
+    if (e->kind == E_IDENT && e->str && strcmp(e->str, "super") == 0) return e;
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) return this_use_s(e->arrow->fn->body);
+    Expr *r;
+    if ((r = this_use_e(e->lhs)) || (r = this_use_e(e->rhs))) return r;
+    for (int i = 0; i < e->args.len; i++) if ((r = this_use_e(e->args.items[i]))) return r;
+    return NULL;
+}
+static Expr *this_use_s(Stmt *s) {
+    if (!s) return NULL;
+    Expr *r;
+    if ((r = this_use_e(s->init)) || (r = this_use_e(s->expr)) || (r = this_use_e(s->cond)) || (r = this_use_e(s->for_update))) return r;
+    if ((r = this_use_s(s->for_init)) || (r = this_use_s(s->body)) || (r = this_use_s(s->else_body))) return r;
+    for (int i = 0; i < s->stmts.len; i++) if ((r = this_use_s(s->stmts.items[i]))) return r;
+    for (int i = 0; i < s->ncases; i++) if ((r = this_use_e(s->cases[i].value)) || (r = this_use_s(s->cases[i].body))) return r;
+    return NULL;
+}
 /* a class's field initializers, constructor and methods */
 static void check_class_bodies(Class *c) {
     enter_module(c->mod);
@@ -18831,13 +18852,21 @@ static void check_class_bodies(Class *c) {
             if (needs_super) {
                 StmtList *l = &c->ctor->body->stmts;
                 Stmt *s0 = l->len ? l->items[0] : NULL;
-                /* statements before super(...) that do not use `this` (TypeScript checks that; tsc-checked code only) */
-                if (tsc_checked())
-                    for (int k = 0; k < l->len; k++) {
-                        Stmt *sk = l->items[k];
-                        if (sk->kind == S_EXPR && sk->expr->kind == E_CALL && sk->expr->lhs && sk->expr->lhs->kind == E_IDENT &&
-                            strcmp(sk->expr->lhs->str, "super") == 0) { s0 = sk; break; }
+                /* statements before super(...) (TypeScript 4.6+) that do not use `this` (or super.m()): the object
+                   does not exist yet there (XB-153); the field initializers run right after super(...) (emit) */
+                for (int k = 0; k < l->len; k++) {
+                    Stmt *sk = l->items[k];
+                    if (sk->kind == S_EXPR && sk->expr->kind == E_CALL && sk->expr->lhs && sk->expr->lhs->kind == E_IDENT &&
+                        strcmp(sk->expr->lhs->str, "super") == 0) {
+                        for (int j = 0; j < k; j++) {
+                            Expr *th = this_use_s(l->items[j]);
+                            if (th) xs_error(XS8131, th->pos, "'this' (and super.m()) can be used once super(...) has run",
+                                             "the constructor of %s must call super(...) first", c->name);
+                        }
+                        s0 = sk;
+                        break;
                     }
+                }
                 if (!s0 || s0->kind != S_EXPR || s0->expr->kind != E_CALL || !s0->expr->lhs || s0->expr->lhs->kind != E_IDENT || strcmp(s0->expr->lhs->str, "super") != 0)
                     xs_error(XS8131, s0 ? s0->pos : c->ctor->pos, xs_sprintf("start the constructor with super(...): %s extends %s", c->name, c->base->name),
                              "the constructor of %s must call super(...) first", c->name);
