@@ -974,6 +974,21 @@ static bool xs_imm_phase(void) {
     xs_ready_tail = last;
     return true;
 }
+/* What console.log left in stdio's buffer goes out before the loop waits. Writing to a pipe or a file, stdio holds a
+   full buffer: a server or a timer program that logs a few lines and then waits for the next event kept them there
+   (docker logs showed nothing until the buffer filled or the program ended), where Node writes each line at once. A
+   loop that is busy keeps batching; one that is about to wait writes what it holds (XB-186). */
+#if defined(_WIN32)
+#define XS_STDOUT_PENDING() true
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+#define XS_STDOUT_PENDING() (stdout->_p > stdout->_bf._base)
+#else
+#include <stdio_ext.h>
+#define XS_STDOUT_PENDING() (__fpending(stdout) > 0)
+#endif
+static inline void xs_stdout_before_wait(void) {
+    if (XS_STDOUT_PENDING()) fflush(stdout);
+}
 XS_NOINLINE void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_ms) {
     if (xs_kq < 0) xs_kq = kqueue();
     struct kevent evs[64];
@@ -997,6 +1012,7 @@ XS_NOINLINE void xs_loop_run(bool (*stop)(void *), void *arg, int64_t deadline_m
         }
         bool has_w = wait >= 0;
         if (xs_tmr_timeout(&tt) && (!has_w || tt.tv_sec < ts.tv_sec || (tt.tv_sec == ts.tv_sec && tt.tv_nsec < ts.tv_nsec))) { ts = tt; has_w = true; }
+        if (!xs_ready_head) xs_stdout_before_wait();
         int n = kevent(xs_kq, NULL, 0, evs, 64, xs_ready_head ? &(struct timespec){0, 0} : has_w ? &ts : NULL);
         xs_batch++;
         if (n < 0) { if (errno == EINTR) continue; xs_panic("kevent failed"); }
@@ -1835,7 +1851,8 @@ static bool xs_route_match(xs_str *pattern, const char *path, size_t plen, xs_Ht
         p++; q++;
     }
     if (req) req->nparams = n;
-    return p == pe && q == qe;
+    /* one slash after the path is the same route (/items/ is /items), as Express routes by default (strict: false) */
+    return p == pe && (q == qe || (q + 1 == qe && *q == '/' && pe > pattern->data && pe[-1] != '/'));
 }
 
 static xs_str *xs_HttpRequest_param(xs_HttpRequest *r, xs_str *name) {
@@ -2634,7 +2651,7 @@ static void xs_clients_flush_dead(void) {
     }
     xs_clients_trim();
 }
-typedef struct { xs_Server *s; xs_client *c; xs_HttpRequest *req; xs_route *route; bool keep_alive; } xs_request_job;
+typedef struct { xs_Server *s; xs_client *c; xs_HttpRequest *req; xs_route *route; bool keep_alive; bool head; } xs_request_job;
 
 /* TLS backpressure: while the engine holds records it cannot write, it accepts no input either, so the
    peer's bytes would sit in the socket and a level-triggered read event would fire forever (a client that
@@ -2669,15 +2686,73 @@ static void xs_client_close(int kq, xs_client *c) {
     xs_client_free_later(c);
 }
 
+/* the reason phrase of a status line, as Node's http.STATUS_CODES ("unknown" for a code it does not name) */
 static const char *xs_status_text(int64_t s) {
     switch (s) {
+    case 100: return "Continue";
+    case 101: return "Switching Protocols";
+    case 102: return "Processing";
+    case 103: return "Early Hints";
     case 200: return "OK";
     case 201: return "Created";
+    case 202: return "Accepted";
+    case 203: return "Non-Authoritative Information";
     case 204: return "No Content";
+    case 205: return "Reset Content";
+    case 206: return "Partial Content";
+    case 207: return "Multi-Status";
+    case 208: return "Already Reported";
+    case 226: return "IM Used";
+    case 300: return "Multiple Choices";
+    case 301: return "Moved Permanently";
+    case 302: return "Found";
+    case 303: return "See Other";
+    case 304: return "Not Modified";
+    case 305: return "Use Proxy";
+    case 307: return "Temporary Redirect";
+    case 308: return "Permanent Redirect";
     case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 402: return "Payment Required";
+    case 403: return "Forbidden";
     case 404: return "Not Found";
+    case 405: return "Method Not Allowed";
+    case 406: return "Not Acceptable";
+    case 407: return "Proxy Authentication Required";
+    case 408: return "Request Timeout";
+    case 409: return "Conflict";
+    case 410: return "Gone";
+    case 411: return "Length Required";
+    case 412: return "Precondition Failed";
+    case 413: return "Payload Too Large";
+    case 414: return "URI Too Long";
+    case 415: return "Unsupported Media Type";
+    case 416: return "Range Not Satisfiable";
+    case 417: return "Expectation Failed";
+    case 418: return "I'm a Teapot";
+    case 421: return "Misdirected Request";
+    case 422: return "Unprocessable Entity";
+    case 423: return "Locked";
+    case 424: return "Failed Dependency";
+    case 425: return "Too Early";
+    case 426: return "Upgrade Required";
+    case 428: return "Precondition Required";
+    case 429: return "Too Many Requests";
+    case 431: return "Request Header Fields Too Large";
+    case 451: return "Unavailable For Legal Reasons";
     case 500: return "Internal Server Error";
-    default: return "Status";
+    case 501: return "Not Implemented";
+    case 502: return "Bad Gateway";
+    case 503: return "Service Unavailable";
+    case 504: return "Gateway Timeout";
+    case 505: return "HTTP Version Not Supported";
+    case 506: return "Variant Also Negotiates";
+    case 507: return "Insufficient Storage";
+    case 508: return "Loop Detected";
+    case 509: return "Bandwidth Limit Exceeded";
+    case 510: return "Not Extended";
+    case 511: return "Network Authentication Required";
+    default: return "unknown";
     }
 }
 
@@ -2693,6 +2768,7 @@ static void xs_server_respond(xs_client *c, int64_t status, const char *ctype, c
    worker: the second comes from the coarse clock, which the vDSO serves even where a precise clock read is a system call */
 static XS_TLS char xs_date_line[48];
 static XS_TLS bool xs_resp_has_date; /* the response being written brought its own Date */
+static XS_TLS bool xs_resp_no_body; /* the answer to a HEAD request: the head (Content-Length of the body) without the body */
 static XS_TLS int64_t xs_date_line_sec = -1;
 static const char *xs_http_date_line(void) {
 #if defined(CLOCK_REALTIME_COARSE)
@@ -2730,6 +2806,7 @@ static void xs_server_respond_x(xs_client *c, int64_t status, const char *ctype,
     if (ctl) { memcpy(h, "\r\nContent-Type: ", 16); h += 16; memcpy(h, ctype, ctl); h += ctl; } /* "" sends none */
     memcpy(h, "\r\nContent-Length: ", 18); h += 18;
     h += xs_itoa((int64_t)body_len, h);
+    if (xs_resp_no_body) body_len = 0;
     if (!xs_resp_has_date) { memcpy(h, xs_http_date_line(), 37); h += 37; }
     if (extra && extra->len) { memcpy(h, "\r\n", 2); h += 2; memcpy(h, extra->data, (size_t)extra->len - 2); h += extra->len - 2; }
     if (keep_alive) { memcpy(h, "\r\nConnection: keep-alive\r\n\r\n", 28); h += 28; }
@@ -2844,8 +2921,10 @@ XS_NOINLINE void xs_request_run(void *arg) {
             if (res->stream) xs_server_respond_stream(c, res, job->keep_alive);
             else {
                 xs_resp_has_date = res->has_date;
+                xs_resp_no_body = job->head;
                 xs_server_respond_x(c, res->f_status, res->content_type, res->f_body->data, (size_t)res->f_body->len, job->keep_alive, res->extra);
                 xs_resp_has_date = false;
+                xs_resp_no_body = false;
             }
         }
         xs_release(res);
@@ -2870,7 +2949,9 @@ XS_NOINLINE void xs_request_run(void *arg) {
         } else {
             n = (size_t)snprintf(body, sizeof body, "{\"error\":\"internal error\"}");
         }
+        xs_resp_no_body = job->head;
         if (!c->closed) xs_server_respond(c, client ? 400 : 500, "application/json", body, n, job->keep_alive);
+        xs_resp_no_body = false;
         xs_metrics_end(route, client ? 400 : 500);
         if (!client) {
             char tb[4096];
@@ -2974,12 +3055,14 @@ XS_NOINLINE bool xs_server_process(xs_Server *s, xs_client *c) {
         xs_route *route = NULL;
         bool path_known = false;
         xs_route *fallback = NULL;
+        /* HEAD runs the GET route, as Express does, and gets its head without the body */
+        bool head_req = mlen == 4 && memcmp(line, "HEAD", 4) == 0;
         for (int i = 0; i < s->nroutes; i++) {
             xs_route *r = &s->routes[i];
             if (r->method[0] == '*') { fallback = r; continue; }
             if (xs_route_match(r->path, target, plen, req)) {
                 path_known = true;
-                if (strlen(r->method) == mlen && memcmp(line, r->method, mlen) == 0) { route = r; break; }
+                if ((strlen(r->method) == mlen && memcmp(line, r->method, mlen) == 0) || (head_req && strcmp(r->method, "GET") == 0)) { route = r; break; }
             }
         }
         if (!route && fallback) route = fallback;
@@ -3000,7 +3083,7 @@ XS_NOINLINE bool xs_server_process(xs_Server *s, xs_client *c) {
             req->headers_len = headers_len;
             /* run the handler in its own coroutine: an `await` inside it yields to the event loop */
             xs_request_job *job = malloc(sizeof *job);
-            job->s = s; job->c = c; job->req = req; job->route = route; job->keep_alive = keep_alive;
+            job->s = s; job->c = c; job->req = req; job->route = route; job->keep_alive = keep_alive; job->head = head_req;
             c->inflight++;
             __atomic_fetch_add(&xs_inflight_total, 1, __ATOMIC_RELAXED);
             free(chunked.data);
@@ -3294,6 +3377,7 @@ XS_NOINLINE void *xs_server_worker(void *arg) {
         struct timespec zero = {0, 0}, tick = {0, 200000000}, tt;
         bool has_t = xs_tmr_timeout(&tt);
         if (xs_shutting_down && (!has_t || tt.tv_sec > 0 || tt.tv_nsec > tick.tv_nsec)) { tt = tick; has_t = true; }
+        if (!xs_ready_head) xs_stdout_before_wait();
         int n = kevent(kq, NULL, 0, events, 256, xs_ready_head ? &zero : has_t ? &tt : NULL);
         xs_loop_ns = xs_now();
         xs_batch++;

@@ -3118,6 +3118,17 @@ static xs_str *xs_typeof_lit(const char *s) {
         }
     return xs_typeof_lit("object");
 }
+/* typeof of an `object` (held as its JSON text): what the text holds, as typeof of the value JSON.parse gives back */
+XS_NOINLINE xs_str *xs_json_typeof(xs_str *t) {
+    if (!t) return xs_typeof_lit("object");
+    const char *p = t->data, *end = t->data + t->len;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+    if (p == end) return xs_typeof_lit("object");
+    if (*p == '"') return xs_typeof_lit("string");
+    if (*p == 't' || *p == 'f') return xs_typeof_lit("boolean");
+    if (*p == '-' || (*p >= '0' && *p <= '9')) return xs_typeof_lit("number");
+    return xs_typeof_lit("object"); /* {...}, [...] and null */
+}
 static void xs_print_closure(void *p);
 /* ---- symbol: Symbol("desc"), a value equal only to itself (Nest's injection tokens); description as given ---- */
 typedef struct xs_Symbol { xs_hdr hdr; xs_str *f_description; int64_t f___id; } xs_Symbol;
