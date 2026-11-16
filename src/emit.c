@@ -14448,6 +14448,24 @@ static const char xs_nkey_c[] =
     "    int n = snprintf(b, sizeof b, \"n%.17g\", d);\n"
     "    return xs_str_new(b, (size_t)n);\n"
     "}\n";
+/* xisto:tagged: a tagged template's strings. Each call site has two module constants, its texts and their raw form
+   (the program releases them at its end); xs_tsa notes the pair, and strings.raw finds the raw texts by the array's
+   identity */
+static const char xs_tagged_c[] =
+    "static xs_arr_ref **xs_tsa_cooked, **xs_tsa_raws;\n"
+    "static size_t xs_tsa_n;\n"
+    "static xs_arr_ref *xs_tsa(xs_arr_ref *cooked, xs_arr_ref *raw) {\n"
+    "    xs_tsa_cooked = realloc(xs_tsa_cooked, sizeof(xs_arr_ref *) * (xs_tsa_n + 1));\n"
+    "    xs_tsa_raws = realloc(xs_tsa_raws, sizeof(xs_arr_ref *) * (xs_tsa_n + 1));\n"
+    "    if (!xs_tsa_cooked || !xs_tsa_raws) xs_panic(\"out of memory\");\n"
+    "    xs_tsa_cooked[xs_tsa_n] = cooked;\n"
+    "    xs_tsa_raws[xs_tsa_n++] = raw;\n"
+    "    return xs_retain(cooked);\n"
+    "}\n"
+    "static xs_arr_ref *xs_tsa_raw(xs_arr_ref *cooked) {\n"
+    "    for (size_t i = 0; i < xs_tsa_n; i++) if (xs_tsa_cooked[i] == cooked) return xs_retain(xs_tsa_raws[i]);\n"
+    "    return xs_retain(cooked); /* (an array the program made itself: its texts are what it holds) */\n"
+    "}\n";
 /* xisto:okmap's key: the object's identity as text (the map keeps the object: its address is not reused meanwhile) */
 static const char xs_okey_c[] =
     "static xs_str *xs_okey_text(void *k) {\n"
@@ -14467,6 +14485,7 @@ void emit_program(Program *p, Buf *o) {
     if (p->uses_symbol_for) buf_puts(out, xs_symbol_for_c);
     if (p->uses_nkey) buf_puts(out, xs_nkey_c);
     if (p->uses_okmap) buf_puts(out, xs_okey_c);
+    if (p->uses_tagged) buf_puts(out, xs_tagged_c);
     indent = 0;
     site_tab.len = 0;
     if (site_tab.data) site_tab.data[0] = 0;

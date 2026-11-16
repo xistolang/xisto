@@ -222,6 +222,7 @@ typedef struct Type {
     int nparams;
     struct Type *ret;     /* TY_FUNC */
     bool rest;            /* TY_FUNC: the last parameter is ...xs: T[] (the arguments from there on, one array) */
+    bool tsa;             /* TY_ARRAY written TemplateStringsArray (a tagged template's strings): .raw reads their raw texts */
     bool async_ret;       /* TY_FUNC: written (..) => Promise<R> (ret is R): a call not awaited can be kept as a promise */
     const char *tname;    /* TY_TPARAM; TY_STRING: a string literal type ("circle"), the only value allowed */
     const char **slits;   /* TY_STRING of a union of string literals ('error' | 'warn'): the values it was written with (any
@@ -745,7 +746,7 @@ typedef struct {
     bool uses_plain; /* Object.getPrototypeOf(u) of an unknown: xs_is_plain, by the value's class (emitted only then) */
     bool uses_clone; /* structuredClone: a copy by the value's class at run time (emitted only then) */
     bool uses_profiler; /* xisto:profiler: its runtime (xisto_prof.h) and the table of the program's functions (emit.c) */
-    bool uses_v8, uses_unk_map, uses_symbol_for, uses_nkey, uses_okmap; /* xisto:v8, x instanceof Map/Set of an unknown, Symbol.for: their runtime joins the program */
+    bool uses_v8, uses_unk_map, uses_symbol_for, uses_nkey, uses_okmap, uses_tagged; /* xisto:v8, x instanceof Map/Set of an unknown, Symbol.for: their runtime joins the program */
     bool uses_this_reg; /* XB-107: function (this: T) / method slots: the this register's helpers join the program */
     bool uses_tls;
     struct Func **tls_fns; /* XB-232: functions with a fetch that may be https (checker); TLS joins when prune finds one of

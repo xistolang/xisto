@@ -3087,6 +3087,7 @@ static Func *lookup_func(const char *name) {
         if (!strncmp(name, "__xs_sthis_", 11)) return f; /* (a static method's copy for a subclass: static_copy) */
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:arrays") == 0) return f; /* (reduce & co) */
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:settled") == 0) return f; /* (Promise.allSettled) */
+        if (strncmp(name, "__xs_tsa", 8) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:tagged") == 0) return f; /* (tagged templates) */
         if ((!strcmp(name, "__xs_construct") || !strcmp(name, "__xs_ci_params") || !strcmp(name, "__xs_apply") || !strcmp(name, "__xs_use_desc") || !strcmp(name, "__xs_desc_enter") || !strcmp(name, "__xs_desc_leave") || !strcmp(name, "__xs_deco_target") || !strcmp(name, "__xs_target_ctor")) &&
             f->mod && f->mod->file && !strcmp(f->mod->file, "xisto:reflect")) return f; /* (new (c)(); XB-107's f.apply and descriptors) */
         if (f->exported && (strstr(name, "__s_") || !strcmp(name, "__xs_fetch")) && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:url") == 0) return f; /* (URL.canParse, AbortSignal.timeout: statics of globals; fetch with its options in a value) */
@@ -12605,6 +12606,18 @@ static void check_expr_in(Expr *e, Type *expected) {
             Type *elem = e->lhs->type->elem;
             if (!e->is_call && strcmp(e->str, "length") == 0) {
                 e->type = ty_int;
+                return;
+            }
+            if (!e->is_call && strcmp(e->str, "raw") == 0 && e->lhs->type->tsa && lookup_func("__xs_tsa_raw")) {
+                /* strings.raw of a tagged template's strings: their texts as written (xisto:tagged) */
+                Expr *callee = xs_alloc(sizeof *callee);
+                callee->kind = E_IDENT; callee->pos = e->pos; callee->str = "__xs_tsa_raw"; callee->field = -1;
+                Expr *c = xs_alloc(sizeof *c);
+                c->kind = E_CALL; c->pos = e->pos; c->field = -1;
+                c->lhs = callee;
+                expr_list_push(&c->args, e->lhs);
+                *e = *c;
+                check_expr(e, expected);
                 return;
             }
             if (e->is_call && strcmp(e->str, "push") == 0 && e->args.len > 1 && rereadable(e->lhs)) {

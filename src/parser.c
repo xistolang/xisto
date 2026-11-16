@@ -64,6 +64,12 @@ static int npending_overloads;
 static bool wants_arrays; /* a .reduce( / .flatMap( / .flat( call, or an Iterable<T> type, was parsed: xisto:arrays is loaded */
 static bool wants_settled; /* Promise.allSettled was named: xisto:settled is loaded */
 static bool wants_okmap; /* WeakMap, or Map<object, V>, was written: xisto:okmap is loaded */
+static bool wants_tagged; /* a tagged template (tag`...`) or TemplateStringsArray was written: xisto:tagged is loaded */
+static StmtList tsa_decls; /* const __xs_tsa_M_L_C = __xs_tsa([cooked...], [raw...]): one per tagged template, the strings
+                              array its tag receives on every call (one identity per call site, as in JavaScript); put at
+                              the start of the module by parse_module */
+static char **tsa_names;
+static int ntsa_names;
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
 static void import_process(Program *prog, Module *m);
 static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... was named: xisto:url is loaded */
@@ -869,6 +875,10 @@ static Type *parse_type(Parser *p) {
         expect(p, TK_LT, "write Promise<T>");
         t = ty_promise_of(parse_type(p));
         expect(p, TK_GT, NULL);
+    } else if (strcmp(n, "TemplateStringsArray") == 0) { /* a tagged template's strings: string[] with .raw */
+        t = ty_array_of(ty_string);
+        t->tsa = true;
+        wants_tagged = true;
     } else if (strcmp(n, "Generator") == 0 || strcmp(n, "Iterable") == 0 || strcmp(n, "IterableIterator") == 0 || strcmp(n, "Iterator") == 0 ||
                strcmp(n, "AsyncGenerator") == 0 || strcmp(n, "AsyncIterable") == 0 || strcmp(n, "AsyncIterableIterator") == 0) {
         /* (async ones too: an async generator's waits park its consumer, so for await reads it as for...of) */
@@ -1334,6 +1344,7 @@ static Expr *parse_arrow(Parser *p) {
 }
 
 static bool tmpl_raw; /* parsing the template of String.raw`...` */
+static Expr *parse_tagged(Parser *p, Expr *tag);
 static bool wants_intl; /* Intl.X was named: xisto:intl is loaded (Intl.DateTimeFormat is its class Intl_DateTimeFormat) */
 /* the web globals xisto:url declares (runtime/node/url.ts) */
 static bool is_url_global_name(const char *n) {
@@ -1982,6 +1993,8 @@ static Expr *parse_postfix(Parser *p) {
             tmpl_raw = true;
             e = parse_primary(p);
             tmpl_raw = false;
+        } else if (at(p, TK_TEMPLATE) && !nopt && (e->kind == E_IDENT || (e->kind == E_MEMBER && !e->is_call) || e->kind == E_CALL)) {
+            e = parse_tagged(p, e);
         } else if (at(p, TK_LPAREN) && !nopt && e->kind != E_IDENT && !(e->kind == E_MEMBER && !e->is_call)) {
             /* (() => { ... })(), f(a)(b): a call of the function value the expression gives */
             Expr *c = new_expr(E_CALL, pos);
@@ -5942,6 +5955,87 @@ static void apply_local_exports(Program *prog, Module *m, int top_start) {
     }
 }
 
+/* the texts of a template's parts, n + 1 for n values (the parser leaves empty parts out of E_TEMPLATE; its own parts
+   have the template's position, a ${"text"} its own) */
+static int tsa_parts(Expr *t, Pos tpos, char ***out, ExprList *vals) {
+    int n = 0;
+    char *seg = NULL;
+    *out = NULL;
+    for (int i = 0; i < t->args.len; i++) {
+        Expr *a = t->args.items[i];
+        if (a->kind == E_STRING && a->pos.line == tpos.line && a->pos.col == tpos.col) { seg = a->str; continue; }
+        *out = realloc(*out, sizeof(char *) * (size_t)(n + 2));
+        (*out)[n++] = seg ? seg : "";
+        seg = NULL;
+        if (vals) expr_list_push(vals, a);
+    }
+    *out = realloc(*out, sizeof(char *) * (size_t)(n + 2));
+    (*out)[n++] = seg ? seg : "";
+    return n;
+}
+static Expr *str_array_lit(Pos pos, char **xs, int n) {
+    Expr *a = new_expr(E_ARRAY_LIT, pos);
+    for (int i = 0; i < n; i++) {
+        Expr *s = new_expr(E_STRING, pos);
+        s->str = xs[i];
+        expr_list_push(&a->args, s);
+    }
+    return a;
+}
+/* tag`a${x}b`: tag(strings, x), strings the constant of this call site (cooked texts, with .raw the texts as written) */
+static Expr *parse_tagged(Parser *p, Expr *tag) {
+    Pos tpos = p->tok.pos;
+    Expr *rawt = NULL;
+    if (strchr(p->tok.str, '\\')) { /* (a backslash: the raw texts differ from the cooked ones) */
+        Parser look = *p;
+        tmpl_raw = true;
+        rawt = parse_primary(&look);
+        tmpl_raw = false;
+    }
+    Expr *t = parse_primary(p);
+    ExprList vals = {0};
+    char **cooked, **raw;
+    int n = tsa_parts(t, tpos, &cooked, &vals);
+    if (rawt) {
+        int nr = tsa_parts(rawt, tpos, &raw, NULL);
+        if (nr != n) xs_error(XS1028, tpos, NULL, "this tagged template is not supported");
+    } else raw = cooked;
+    const char *name = xs_sprintf("__xs_tsa_%d_%d_%d", p->mod ? p->mod->id : 0, tpos.line, tpos.col);
+    bool seen = false;
+    for (int i = 0; i < ntsa_names && !seen; i++) seen = !strcmp(tsa_names[i], name);
+    if (!seen) {
+        tsa_names = realloc(tsa_names, sizeof(char *) * (size_t)(ntsa_names + 1));
+        tsa_names[ntsa_names++] = (char *)name;
+        Stmt *r = new_stmt(S_VAR, tpos); /* (the raw texts: a constant of their own, which the program releases at its end) */
+        r->name = xs_sprintf("%s_raw", name);
+        r->is_const = true;
+        r->decl_type = ty_array_of(ty_string);
+        r->init = str_array_lit(tpos, raw, n);
+        r->mod = p->mod;
+        stmt_list_push(&tsa_decls, r);
+        Stmt *d = new_stmt(S_VAR, tpos);
+        d->name = (char *)name;
+        d->is_const = true;
+        Type *tt = ty_array_of(ty_string);
+        tt->tsa = true;
+        d->decl_type = tt;
+        Expr *mk = new_expr(E_CALL, tpos);
+        mk->lhs = ident_expr(tpos, "__xs_tsa");
+        expr_list_push(&mk->args, str_array_lit(tpos, cooked, n));
+        expr_list_push(&mk->args, ident_expr(tpos, r->name));
+        d->init = mk;
+        d->mod = p->mod;
+        stmt_list_push(&tsa_decls, d);
+    }
+    wants_tagged = true;
+    Expr *c;
+    if (tag->kind == E_MEMBER) { c = tag; c->is_call = true; }
+    else { c = new_expr(E_CALL, tag->pos); c->lhs = tag; }
+    expr_list_push(&c->args, ident_expr(tpos, name));
+    for (int i = 0; i < vals.len; i++) expr_list_push(&c->args, vals.items[i]);
+    return c;
+}
+
 static void parse_module(Program *prog, Module *m) {
     xs_file_name = m->file;
     xs_source = m->src;
@@ -6226,6 +6320,13 @@ static void parse_module(Program *prog, Module *m) {
         }
     }
     if (xs_keep_going) xs_error_recover = outer_recover;
+    if (tsa_decls.len) { /* the strings of the module's tagged templates, first (a function above may run one) */
+        int k = tsa_decls.len;
+        for (int i = 0; i < k; i++) stmt_list_push(&prog->top, NULL);
+        memmove(&prog->top.items[top_start + k], &prog->top.items[top_start], sizeof(Stmt *) * (size_t)(prog->top.len - k - top_start));
+        for (int i = 0; i < k; i++) { prog->top.items[top_start + i] = tsa_decls.items[i]; tsa_decls.items[i]->mod = m; }
+        tsa_decls.len = 0;
+    }
     apply_local_exports(prog, m, top_start);
     reflect_module(prog, m, top_start, &p);
 }
@@ -6840,6 +6941,15 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->loading = false;
         return m;
     }
+    if (strcmp(name, "tagged") == 0) { /* xisto:tagged: a tagged template's strings (TemplateStringsArray), made and read by the runtime */
+        m->file = "xisto:tagged";
+        prog->uses_tagged = true;
+        Type *tsa = ty_array_of(ty_string);
+        tsa->tsa = true;
+        add_func(prog, builtin_func(m, "__xs_tsa", "xs_tsa", tsa, 2, ty_array_of(ty_string), ty_array_of(ty_string)));
+        add_func(prog, builtin_func(m, "__xs_tsa_raw", "xs_tsa_raw", ty_array_of(ty_string), 1, ty_array_of(ty_string), NULL));
+        return m;
+    }
     if (strcmp(name, "tz") == 0) { /* xisto:tz: the wall clock of a time zone (xisto:intl) */
         add_func(prog, builtin_func(m, "__xs_tz_fields", "xs_tz_fields", ty_array_of(ty_int), 2, ty_number, ty_string));
         return m;
@@ -7167,6 +7277,7 @@ Program *parse_program(const char *entry_file) {
     if (wants_arrays) load_module(prog, "xisto:arrays", (Pos){1, 1}, entry_file);
     if (wants_settled) load_module(prog, "xisto:settled", (Pos){1, 1}, entry_file);
     if (wants_okmap) load_module(prog, "xisto:okmap", (Pos){1, 1}, entry_file);
+    if (wants_tagged) load_module(prog, "xisto:tagged", (Pos){1, 1}, entry_file);
     if (wants_url) load_module(prog, "xisto:url", (Pos){1, 1}, entry_file); /* (before errors: its DOMException extends Error) */
     if (wants_errors) load_module(prog, "xisto:errors", (Pos){1, 1}, entry_file);
     if (wants_intl) load_module(prog, "xisto:intl", (Pos){1, 1}, entry_file);
