@@ -238,7 +238,7 @@ export class NetServer extends EventEmitter {
     const fd = net_listen(host, port);
     if (fd < 0) {
       const code = net_code(fd);
-      setImmediate(() => {
+      this.afterLookup(host, () => {
         this.emit("error", new SystemError(code, "listen", ` ${host.length > 0 ? host : "::"}:${port}`));
       });
       return this;
@@ -246,11 +246,17 @@ export class NetServer extends EventEmitter {
     this.lfd = fd;
     this.port = net_port(fd, false);
     this.listening = true;
-    setImmediate(() => {
+    this.afterLookup(host, () => {
       this.emit("listening");
     });
     this.task = this.acceptAll();
     return this;
+  }
+  /** 'listening' (or the listen error) as Node emits it: on the next tick, before the event loop polls (so before any
+   * socket event), and with a host one tick later still (Node's dns.lookup of the host answers on a tick of its own). */
+  private afterLookup(host: string, emit: () => void): void {
+    if (host.length > 0) process.nextTick((): void => process.nextTick(emit));
+    else process.nextTick(emit);
   }
   private async acceptAll(): Promise<void> {
     for (;;) {
