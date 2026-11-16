@@ -127,8 +127,8 @@ Rules (by design):
   field table. A field the class does not declare is a TypeError (JS would read `undefined`). An `any` where a `T`
   goes is checked at run time. Arithmetic, `===`, truthiness, `??`, `?.`, templates, JSON and console.log work on
   `any`; **calling a method on an `any` is refused (XS2017)**: give it its type.
-- **Promises:** `await f()` and a bare `f();` are direct calls (a bare `f();` runs to the end before the next line;
-  Node runs it to its first await). A promise exists only where it is kept: `const p = f()`, `Promise<T>`
+- **Promises:** `await f()` is a direct call. A bare `f();` starts `f` as Node does (it runs to its first wait, then
+  the next line runs; warning XS2112, silenced by `void f();` or `.catch(...)`). A promise exists only where it is kept: `const p = f()`, `Promise<T>`
   fields/params/arrays, `.then/.catch/.finally`, `new Promise`, `Promise.resolve/reject`. `XISTO_SPAWN_LOG=1 xisto
   build …` prints every call kept as a promise. Not yet: `Promise.allSettled`.
 - Structural copies are copies: a class object passed where a data shape goes is copied field by field, so writing

@@ -84,16 +84,33 @@ A function returning `Promise<T>` is async. Promises are created only where the 
 | Form | What happens |
 |---|---|
 | `await f()` | a direct call; no promise object |
-| `f();` as a statement | a direct call that **runs to the end** before the next line |
+| `f();` as a statement | started as in Node: `f` runs until its first wait, then the next line runs (warning XS2112) |
 | `const p = f()`, `Promise<T>` fields, parameters, arrays | a real promise; `f` runs as a task |
 | `.then` / `.catch` / `.finally`, `new Promise`, `Promise.resolve` / `reject` | real promises, microtasks |
 
-The bare `f();` is a divergence. Node runs `f` until its first `await` and goes on:
+A bare `f();` (a floating promise) behaves as in Node. `f` runs from its call until its first `await` of something
+pending; then the caller goes on, and `f` resumes later from the event loop. The order matches Node's:
 
 ```ts
-work("bare", 20);          // xisto: start bare, end bare, after bare
-console.log("after bare"); // Node:  start bare, after bare, … end bare later
+work("bare", 20);          // start bare
+console.log("after bare"); // after bare; end bare comes later, from the timer
 ```
+
+A callee that never waits (no `await`, no async call it waits for) runs to its end at the call, with no promise and
+no task: the same cost as a plain call. One that waits runs as a task with its own promise, which nothing reads. A
+rejection of that promise is an unhandled rejection (see below), as in Node.
+
+The build warns about each one (XS2112), because its errors are not caught where it is called:
+
+```text
+x.ts:7:3: warning[XS2112]: the promise of 'sendEmail()' is not awaited: the call runs concurrently and its errors are not caught here
+     7 |   sendEmail(user);
+       |   ^
+  help: await it; or, to start it on purpose, write `void f();` or add .catch((err) => ...) to handle its errors
+```
+
+Write `void sendEmail(user);` when running it in the background is what you want, or chain
+`.catch((err) => ...)` to handle its errors. Both silence the warning.
 
 Cost, measured on an Apple M4 (12 Nov 2026), 2 million calls: `await f()` 0.7–0.9 ns per call; a kept promise
 (`const p = f(); await p`) about 73 ns. Node: about 20 ns for both. Await directly where you can. How waiting

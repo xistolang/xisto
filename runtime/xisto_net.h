@@ -674,8 +674,11 @@ __attribute__((constructor)) static void xs_asan_hook(void) { xs_asan_after_jump
 #else
 #define xs_stack_copy memcpy
 #endif
+/* shared-stack coroutines running now (one, or one that resumed others from inside it, xs_coro_resume_any): while
+   it is not 0 the task stack is in use, and a coroutine started there would overwrite the frames of the one running */
+static XS_TLS int xs_sh_active;
 /* Runs or continues a coroutine until it yields or finishes. */
-static void xs_coro_resume(xs_coro *co) {
+static void xs_coro_resume1(xs_coro *co) {
     /* park the scheduler's runtime state, install the coroutine's */
     xs_main_ar_pool = xs_ar_pool; xs_main_ar_len = xs_ar_len; xs_main_ar_cap = xs_ar_cap;
     xs_main_try = xs_try_stack; xs_main_try_depth = xs_try_depth; xs_main_thrown = xs_thrown;
@@ -692,7 +695,9 @@ static void xs_coro_resume(xs_coro *co) {
 #ifdef XS_ASAN
     else if (co->stack) __asan_unpoison_memory_region(co->stack + XS_PAGE, XS_CORO_STACK - XS_PAGE); /* (a reused stack keeps another run's shadow) */
 #endif
+    xs_sh_active += co->shared;
     xs_ctx_swap(&xs_sched_sp, co->sp);
+    xs_sh_active -= co->shared;
     if (co->shared && !co->done) { /* parked: keep the part of the task stack it uses */
         char *lo = xs_shstack_low(co);
         size_t n = (size_t)(xs_shstack + XS_SHSTACK - lo);
@@ -714,6 +719,18 @@ static void xs_coro_resume(xs_coro *co) {
     xs_ar_pool = xs_main_ar_pool; xs_ar_len = xs_main_ar_len; xs_ar_cap = xs_main_ar_cap;
     xs_try_stack = xs_main_try; xs_try_depth = xs_main_try_depth; xs_thrown = xs_main_thrown;
     xs_recover = xs_main_recover; xs_recover_msg = xs_main_recover_msg;
+}
+/* a task on the task stack that starts another (xs_promise_spawn) parks to let it run there: the new one runs until
+   its first wait (or its end), then the task that started it goes on at once */
+static XS_TLS xs_coro *xs_spawn_req;
+static void xs_coro_resume(xs_coro *co) {
+    xs_coro_resume1(co);
+    while (xs_spawn_req && !co->done) {
+        xs_coro *ch = xs_spawn_req;
+        xs_spawn_req = NULL;
+        xs_coro_resume(ch);
+        xs_coro_resume1(co);
+    }
 }
 
 static bool xs_handler_lock;
@@ -1353,11 +1370,15 @@ XS_NOINLINE xs_promise *xs_promise_spawn(int kind, xs_val (*run)(void *), void (
     s->run = run;
     s->afree = afree;
     s->args = args;
-    xs_coro *co = xs_coro_new(xs_spawn_entry, s);
+    /* on the task stack when it is free (a parked task keeps only the bytes it used: 10k pending calls, each waiting,
+       do not hold 10k stacks); started from inside a task that runs there, a stack of its own */
+    bool from_sh = xs_cur_coro && xs_cur_coro->shared && xs_sh_active == 1; /* (started by the task on the task stack) */
+    xs_coro *co = xs_sh_active && !from_sh ? xs_coro_new(xs_spawn_entry, s) : xs_coro_new_shared(xs_spawn_entry, s);
     co->on_done = xs_spawn_done;
     xs_tasks_live++;
     co->starting = true;
-    xs_coro_resume_any(co); /* runs until its first wait, as an async function does */
+    if (from_sh) { xs_spawn_req = co; xs_coro_yield(); } /* (the caller parks; xs_coro_resume runs co, then the caller) */
+    else xs_coro_resume_any(co); /* runs until its first wait, as an async function does */
     co->starting = false;
     if (co->done) { co->on_done(co); if (!xs_cur_coro) xs_coro_flush_dead(); }
     return p;

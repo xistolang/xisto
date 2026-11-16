@@ -5043,6 +5043,73 @@ static void pr_spawn(Expr *e) { /* the call e (checked), kept as a promise */
     gen_site(cur_func);
     if (getenv("XISTO_SPAWN_LOG")) fprintf(stderr, "spawn: %s:%d:%d\n", xs_file_name ? xs_file_name : "?", c->pos.line, c->pos.col);
 }
+/* f(); with f async, a statement (a floating promise): f runs from its call until its first wait, then the caller goes
+   on and f resumes from the event loop, as in Node; its promise is dropped (a rejection nobody handles is reported as
+   Node's). A callee whose body never waits (no await, no async call it waits for) runs to its end at the call either
+   way: fl_finish puts the plain call back (no coroutine, no promise: the cost of the call before). */
+static bool checking_generated;
+static Expr **fl_sites;
+static Func **fl_in;
+static Stmt **fl_stmt;
+static int nfl_sites;
+static void fl_spawn(Expr *e, Stmt *st) {
+    bool cg = prog->uses_gen;
+    int ng = prog->ngen_fns;
+    pr_spawn(e);
+    prog->uses_gen = cg; /* (gen_site once fl_finish keeps it) */
+    prog->ngen_fns = ng;
+    fl_sites = realloc(fl_sites, sizeof(Expr *) * (size_t)(nfl_sites + 1));
+    fl_in = realloc(fl_in, sizeof(Func *) * (size_t)(nfl_sites + 1));
+    fl_stmt = realloc(fl_stmt, sizeof(Stmt *) * (size_t)(nfl_sites + 1));
+    fl_stmt[nfl_sites] = st;
+    fl_sites[nfl_sites] = e;
+    fl_in[nfl_sites++] = cur_func;
+}
+static bool fl_never_waits(Expr *c) { /* the callee is known (no dispatch) and its body has no wait */
+    Func *f = c->func;
+    if (!f || !f->body || f->is_native || f->is_gen || f->noverrides || f->is_abstract || f->deco_stub || f->decos.len || f->sig_failed) return false;
+    if (c->kind != E_CALL && !(c->kind == E_MEMBER && c->is_call)) return false;
+    if (c->kind == E_CALL && (!c->lhs || c->lhs->kind != E_IDENT)) return false; /* (a function value: who it is is not known) */
+    return !pv_body_waits(f->body);
+}
+static void fl_finish(void) {
+    for (int i = 0; i < nfl_sites; i++) {
+        Expr *e = fl_sites[i];
+        if (e->kind != E_SPAWN) continue;
+        /* main(); as the program's last statement: nothing of the top level is left to go on, so it runs at the call,
+           on the main stack (its waits run the event loop), as before: the same order as Node's */
+        bool last = !fl_in[i] && prog->top.len && prog->top.items[prog->top.len - 1] == fl_stmt[i];
+        if (!getenv("XISTO_FLOAT_ALWAYS") && (last || fl_never_waits(e->lhs))) {
+            Expr *c = e->lhs;
+            *e = *c;
+            continue;
+        }
+        gen_site(fl_in[i]);
+    }
+}
+/* XS2112: a promise made by a statement and dropped (a floating promise): not awaited, returned, kept or chained with
+   .then/.catch/.finally. `void f();` says it is on purpose. */
+static const char *fl_name(Expr *e) { /* f, obj.m, this.svc.m: the callee as written */
+    if (e->kind == E_CALL && e->lhs && e->lhs->kind == E_IDENT && e->lhs->str) return e->lhs->str;
+    if (e->kind != E_MEMBER || !e->is_call || !e->str) return NULL;
+    Expr *o = e->lhs;
+    if (o && o->kind == E_IDENT && o->str) return xs_sprintf("%s.%s", o->str, e->str);
+    if (o && o->kind == E_THIS) return xs_sprintf("this.%s", e->str);
+    if (o && o->kind == E_MEMBER && !o->is_call && o->str && o->lhs && (o->lhs->kind == E_THIS || (o->lhs->kind == E_IDENT && o->lhs->str)))
+        return xs_sprintf("%s.%s.%s", o->lhs->kind == E_THIS ? "this" : o->lhs->str, o->str, e->str);
+    return e->str;
+}
+static void fl_warn(Expr *e, const char *name, Pos pos) {
+    if (e->voided || !pr_is_call(e)) return;
+    bool async_call = pr_async_call(e) && !(e->func && e->func->ret_maybe_sync);
+    bool promise = (e->type && e->type->kind == TY_PROMISE) || (e->builtin.cfn && !strcmp(e->builtin.cfn, "xs_fetch")); /* (fetch: its Response) */
+    if (!async_call && !promise) return;
+    if (e->kind == E_MEMBER && e->str && (!strcmp(e->str, "then") || !strcmp(e->str, "catch") || !strcmp(e->str, "finally"))) return;
+    if (getenv("XISTO_FLOAT_LOG")) fprintf(stderr, "float: %s:%d:%d %s in %s gen=%d\n", xs_file_name ? xs_file_name : "?", pos.line, pos.col, name ? name : "?", cur_func && cur_func->name ? cur_func->name : "(top)", checking_generated);
+    const char *what = name ? xs_sprintf("'%s()'", name) : "this call";
+    xs_warn_rule(XS2112, pos, "await it; or, to start it on purpose, write `void f();` or add .catch((err) => ...) to handle its errors",
+                 "the promise of %s is not awaited: the call runs concurrently and its errors are not caught here", what);
+}
 static void pr_resolved(Expr *e) { /* a value already computed, as a fulfilled promise */
     Type *t = e->type;
     const char *sfx = pr_sfx(pr_kind(t));
@@ -7929,7 +7996,7 @@ static void tuple_view(Expr *e, Func *tmpl, Type **orig) {
     check_expr(e, NULL);
 }
 /* private: the declaring class only; protected: it and its subclasses (checked at compile time, as TypeScript) */
-static bool checking_generated; /* the compiler's own code (reflection adapters) reaches private members */
+/* (declared above) checking_generated: the compiler's own code (reflection adapters) reaches private members */
 static void check_access(int access, Class *owner, const char *name, Pos pos) {
     if (!access || !owner || checking_generated) return;
     Class *in = cur_class ? cur_class : cur_func ? (cur_func->cls ? cur_func->cls : cur_func->static_of) : NULL;
@@ -17733,11 +17800,18 @@ static void check_stmt_one(Stmt *s) {
             Expr *x = s->expr->kind == E_AWAIT && s->expr->lhs ? s->expr->lhs : s->expr;
             pr_discard = x->kind == E_MEMBER && x->is_call && x->str && (strcmp(x->str, "then") == 0 || strcmp(x->str, "catch") == 0);
         }
+        /* (p.then/.catch/.finally(...): chained, not floating; the checker rewrites the call) */
+        bool chained = s->expr->kind == E_MEMBER && s->expr->is_call && s->expr->str &&
+                       (!strcmp(s->expr->str, "then") || !strcmp(s->expr->str, "catch") || !strcmp(s->expr->str, "finally"));
+        const char *fname = fl_name(s->expr); /* (as written: the checker may rewrite the call) */
+        Pos fpos = s->pos;
         check_expr(s->expr, NULL);
         pr_discard = false;
         settle(s->expr);
-        if (cur_func && cur_func->pv_of && pr_async_call(s->expr) && !(s->expr->func && s->expr->func->ret_maybe_sync))
-            pr_spawn(s->expr); /* f(); in a promise version (XB-231): started, as in JavaScript, not waited for (the caller goes on) */
+        if (!chained && !checking_generated) fl_warn(s->expr, fname, fpos);
+        /* (the compiler's own code, decorator stubs and adapters: its bare calls are waited for, as it was written for) */
+        if ((!checking_generated || (cur_func && cur_func->pv_of)) && pr_async_call(s->expr) && !(s->expr->func && s->expr->func->ret_maybe_sync))
+            fl_spawn(s->expr, s); /* f(); not awaited: started, as in JavaScript (the caller goes on at its first wait) */
         return;
     case S_IF: {
         instanceof_path_narrow(s);
@@ -21232,6 +21306,7 @@ void check_program(Program *p) {
         if (gf->pv_of) gf->pv_ok = xs_muted_errors == muted && !failed_;
         w++;
     } /* (pv_more: the promise versions awaited calls need, XB-231, checked in turn) */
+    fl_finish(); /* (before pv_finish: a statement f() whose f never waits stays a plain call) */
     pv_finish();
     {   /* the templates of generic classes leave the program: only their instances are emitted */
         int k = 0;
