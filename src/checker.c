@@ -5099,6 +5099,11 @@ static const char *fl_name(Expr *e) { /* f, obj.m, this.svc.m: the callee as wri
         return xs_sprintf("%s.%s.%s", o->lhs->kind == E_THIS ? "this" : o->lhs->str, o->str, e->str);
     return e->str;
 }
+static bool fl_top_stmt(Stmt *s) { /* a statement of a module's top level itself (not in a block or a loop there) */
+    if (cur_func) return false;
+    for (int i = 0; i < prog->top.len; i++) if (prog->top.items[i] == s) return true;
+    return false;
+}
 static void fl_warn(Expr *e, const char *name, Pos pos) {
     if (e->voided || !pr_is_call(e)) return;
     bool async_call = pr_async_call(e) && !(e->func && e->func->ret_maybe_sync);
@@ -17808,7 +17813,9 @@ static void check_stmt_one(Stmt *s) {
         check_expr(s->expr, NULL);
         pr_discard = false;
         settle(s->expr);
-        if (!chained && !checking_generated) fl_warn(s->expr, fname, fpos);
+        /* (not a statement of a module's top level: `main();` there is the usual entry, and its rejection ends the program with
+           its error as an uncaught throw does; inside a function the caller's try/catch would not see it) */
+        if (!chained && !checking_generated && !fl_top_stmt(s)) fl_warn(s->expr, fname, fpos);
         /* (the compiler's own code, decorator stubs and adapters: its bare calls are waited for, as it was written for) */
         if ((!checking_generated || (cur_func && cur_func->pv_of)) && pr_async_call(s->expr) && !(s->expr->func && s->expr->func->ret_maybe_sync))
             fl_spawn(s->expr, s); /* f(); not awaited: started, as in JavaScript (the caller goes on at its first wait) */

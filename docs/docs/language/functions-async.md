@@ -100,7 +100,12 @@ A callee that never waits (no `await`, no async call it waits for) runs to its e
 no task: the same cost as a plain call. One that waits runs as a task with its own promise, which nothing reads. A
 rejection of that promise is an unhandled rejection (see below), as in Node.
 
-The build warns about each one (XS2112), because its errors are not caught where it is called:
+The build warns about each one (XS2112), because its errors are not caught where it is called. `xisto build`
+and `xisto run` print the count; `--warnings` (or `xisto check --details`) shows each place:
+
+```text
+xisto: 1 warning (XS2112 1): --warnings lists them, xisto check --details shows where
+```
 
 ```text
 x.ts:7:3: warning[XS2112]: the promise of 'sendEmail()' is not awaited: the call runs concurrently and its errors are not caught here
@@ -111,6 +116,10 @@ x.ts:7:3: warning[XS2112]: the promise of 'sendEmail()' is not awaited: the call
 
 Write `void sendEmail(user);` when running it in the background is what you want, or chain
 `.catch((err) => ...)` to handle its errors. Both silence the warning.
+
+A call written as a statement of a module's top level, such as the usual `main();`, is not warned: a rejection
+there ends the program with its error, as an uncaught `throw` does. When `main();` is the program's last statement,
+it runs on the main stack as before (nothing of the top level is left to go on).
 
 Cost, measured on an Apple M4 (12 Nov 2026), 2 million calls: `await f()` 0.7–0.9 ns per call; a kept promise
 (`const p = f(); await p`) about 73 ns. Node: about 20 ns for both. Await directly where you can. How waiting
