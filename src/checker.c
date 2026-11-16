@@ -14590,6 +14590,15 @@ static void check_expr_in(Expr *e, Type *expected) {
                 else u = ty_nullable_of(u);
             }
             if (!u && expected && (expected->kind == TY_UNION || (expected->kind == TY_NULLABLE && expected->elem->kind == TY_UNION))) u = expected; /* both go into the union */
+            if (!u && expected && ty_strip_null(expected)->kind == TY_JSON && (!nul || expected->kind == TY_NULLABLE)) {
+                /* typeof x === 'string' ? { message: x } : x where an object goes, x: string | object: both are objects (JSON) */
+                bool ju = json_ok_unknown;
+                json_ok_unknown = true;
+                if ((ba->kind == TY_JSON || json_ok(ba, 0)) && (bb->kind == TY_JSON || json_ok(bb, 0)) && ba->kind != TY_NULL && bb->kind != TY_NULL &&
+                    !cond_prim(ba) && !cond_prim(bb))
+                    u = expected;
+                json_ok_unknown = ju;
+            }
             if (!u && cond_prim(ba) && cond_prim(bb)) { /* c ? 'a' : 1: string | number, as TypeScript */
                 Type *un = xs_alloc(sizeof *un);
                 un->kind = TY_UNION; un->nparams = 2;
