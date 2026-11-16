@@ -177,6 +177,11 @@ static void uses_expr(Expr *e, bool obj, Expr *parent) {
         use_ok = false;
         return;
     }
+    if ((e->kind == E_ASSIGN || e->kind == E_POSTFIX || (e->kind == E_UNARY && (e->op == TK_PLUSPLUS || e->op == TK_MINUSMINUS))) &&
+        e->lhs && (e->lhs->kind == E_MEMBER || e->lhs->kind == E_INDEX) && is_name(e->lhs->lhs)) {
+        use_ok = false; /* (o.f = v: the object is changed, its fields are not the literal's) */
+        return;
+    }
     if (e->kind == E_ARROW) { /* (a closure that names it: left alone) */
         if (e->arrow && e->arrow->fn) uses_stmt(e->arrow->fn->body, obj);
         return;
