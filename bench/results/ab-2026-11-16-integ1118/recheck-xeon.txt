@@ -1,0 +1,37 @@
+## pb ba9030f
+ludcmp         xisto  ludcmp.ts               8.189s     8.19cpu     63.3MB  par  1.0  kern    2.302s  same
+heat-3d        xisto  heat-3d.ts              1.799s     1.80cpu     31.3MB  par  1.0  kern    1.770s  same
+## pb 4c356d7
+ludcmp         xisto  ludcmp.ts               8.316s     8.30cpu     63.2MB  par  1.0  kern    2.269s  same
+heat-3d        xisto  heat-3d.ts              1.830s     1.83cpu     31.3MB  par  1.0  kern    1.802s  same
+## pb 4c356d7
+ludcmp         xisto  ludcmp.ts               8.279s     8.28cpu     63.3MB  par  1.0  kern    2.273s  same
+heat-3d        xisto  heat-3d.ts              1.927s     1.93cpu     31.3MB  par  1.0  kern    1.899s  same
+## pb ba9030f
+ludcmp         xisto  ludcmp.ts               8.325s     8.32cpu     63.2MB  par  1.0  kern    2.268s  same
+heat-3d        xisto  heat-3d.ts              1.812s     1.81cpu     31.3MB  par  1.0  kern    1.785s  same
+## pb ba9030f
+ludcmp         xisto  ludcmp.ts               8.313s     8.31cpu     63.2MB  par  1.0  kern    2.278s  same
+heat-3d        xisto  heat-3d.ts              1.844s     1.84cpu     31.3MB  par  1.0  kern    1.816s  same
+## pb 4c356d7
+ludcmp         xisto  ludcmp.ts               8.400s     8.40cpu     63.2MB  par  1.0  kern    2.349s  same
+heat-3d        xisto  heat-3d.ts              1.875s     1.87cpu     31.3MB  par  1.0  kern    1.846s  same
+## pb 4c356d7
+ludcmp         xisto  ludcmp.ts               8.261s     8.26cpu     63.2MB  par  1.0  kern    2.313s  same
+heat-3d        xisto  heat-3d.ts              1.780s     1.78cpu     31.3MB  par  1.0  kern    1.753s  same
+## pb ba9030f
+ludcmp         xisto  ludcmp.ts               8.216s     8.21cpu     63.2MB  par  1.0  kern    2.265s  same
+heat-3d        xisto  heat-3d.ts              1.838s     1.84cpu     31.3MB  par  1.0  kern    1.811s  same
+## pb ba9030f
+ludcmp         xisto  ludcmp.ts               8.393s     8.39cpu     63.2MB  par  1.0  kern    2.331s  same
+heat-3d        xisto  heat-3d.ts              1.829s     1.83cpu     31.3MB  par  1.0  kern    1.800s  same
+## pb 4c356d7
+ludcmp         xisto  ludcmp.ts               8.485s     8.48cpu     63.2MB  par  1.0  kern    2.364s  same
+heat-3d        xisto  heat-3d.ts              1.817s     1.81cpu     31.4MB  par  1.0  kern    1.789s  same
+## pb 4c356d7
+ludcmp         xisto  ludcmp.ts               8.228s     8.23cpu     63.2MB  par  1.0  kern    2.207s  same
+heat-3d        xisto  heat-3d.ts              1.806s     1.80cpu     31.3MB  par  1.0  kern    1.778s  same
+## pb ba9030f
+ludcmp         xisto  ludcmp.ts               8.322s     8.32cpu     63.3MB  par  1.0  kern    2.253s  same
+heat-3d        xisto  heat-3d.ts              1.838s     1.84cpu     31.3MB  par  1.0  kern    1.811s  same
+DONE

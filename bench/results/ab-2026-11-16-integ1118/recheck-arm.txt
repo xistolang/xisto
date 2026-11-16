@@ -1,0 +1,289 @@
+## pb ba9030f
+3mm            xisto  3mm.ts                  3.002s     3.00cpu     53.0MB  par  1.0  kern    2.959s  same
+covariance     xisto  covariance.ts           2.055s     2.05cpu     25.4MB  par  1.0  kern    2.037s  same
+correlation    xisto  correlation.ts          2.143s     2.14cpu     25.4MB  par  1.0  kern    2.123s  same
+nussinov       xisto  nussinov.ts             7.226s     7.22cpu     25.4MB  par  1.0  kern    7.211s  same
+2mm            xisto  2mm.ts                  1.730s     1.73cpu     37.0MB  par  1.0  kern    1.695s  same
+## bg ba9030f
+knucleotide    xisto  knucleotide             3.222s     6.30cpu    362.9MB  par  2.0  same
+knucleotide    xisto  knucleotide-2           8.664s    16.37cpu    368.7MB  par  1.9  same
+knucleotide    xisto  knucleotide-3           9.128s    17.44cpu    362.9MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           4.830s     8.82cpu    153.4MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           4.883s     9.10cpu    148.0MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           3.347s     6.46cpu    154.8MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           2.967s     5.88cpu     64.6MB  par  2.0  same
+revcomp        xisto  revcomp                 0.296s     0.28cpu    243.9MB  par  1.0  same
+revcomp        xisto  revcomp-10              0.293s     0.31cpu     10.1MB  par  1.0  same
+revcomp        xisto  revcomp-2               0.495s     0.34cpu    243.8MB  par  0.7  same
+revcomp        xisto  revcomp-3               0.521s     0.43cpu    486.1MB  par  0.8  same
+revcomp        xisto  revcomp-4               0.340s     0.22cpu    244.1MB  par  0.7  same
+revcomp        xisto  revcomp-5               0.337s     0.29cpu    308.1MB  par  0.9  same
+revcomp        xisto  revcomp-6               0.301s     0.26cpu    188.5MB  par  0.9  same
+revcomp        xisto  revcomp-7               0.344s     0.27cpu    188.0MB  par  0.8  same
+revcomp        xisto  revcomp-8               0.357s     0.36cpu     68.3MB  par  1.0  same
+revcomp        xisto  revcomp-9               0.306s     0.33cpu     10.1MB  par  1.1  same
+## pb 4c356d7
+3mm            xisto  3mm.ts                  2.580s     2.58cpu     53.0MB  par  1.0  kern    2.536s  same
+covariance     xisto  covariance.ts           2.163s     2.16cpu     25.4MB  par  1.0  kern    2.144s  same
+correlation    xisto  correlation.ts          2.085s     2.08cpu     25.4MB  par  1.0  kern    2.066s  same
+nussinov       xisto  nussinov.ts             7.164s     7.16cpu     25.4MB  par  1.0  kern    7.149s  same
+2mm            xisto  2mm.ts                  1.960s     1.93cpu     37.0MB  par  1.0  kern    1.925s  same
+## bg 4c356d7
+knucleotide    xisto  knucleotide             3.364s     6.54cpu    363.1MB  par  1.9  same
+knucleotide    xisto  knucleotide-2           8.885s    16.82cpu    368.7MB  par  1.9  same
+knucleotide    xisto  knucleotide-3           8.727s    16.74cpu    363.0MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           4.880s     8.84cpu    153.5MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           4.171s     8.13cpu    150.1MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           3.287s     6.38cpu    153.3MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           3.064s     6.02cpu     62.5MB  par  2.0  same
+revcomp        xisto  revcomp                 0.314s     0.28cpu    243.9MB  par  0.9  same
+revcomp        xisto  revcomp-10              0.297s     0.31cpu     10.3MB  par  1.0  same
+revcomp        xisto  revcomp-2               0.502s     0.34cpu    243.8MB  par  0.7  same
+revcomp        xisto  revcomp-3               0.528s     0.43cpu    486.4MB  par  0.8  same
+revcomp        xisto  revcomp-4               0.342s     0.22cpu    244.3MB  par  0.6  same
+revcomp        xisto  revcomp-5               0.338s     0.29cpu    308.3MB  par  0.9  same
+revcomp        xisto  revcomp-6               0.303s     0.27cpu    189.1MB  par  0.9  same
+revcomp        xisto  revcomp-7               0.346s     0.26cpu    189.2MB  par  0.8  same
+revcomp        xisto  revcomp-8               0.356s     0.36cpu     68.3MB  par  1.0  same
+revcomp        xisto  revcomp-9               0.306s     0.33cpu     10.4MB  par  1.1  same
+## pb 4c356d7
+3mm            xisto  3mm.ts                  2.827s     2.82cpu     53.0MB  par  1.0  kern    2.784s  same
+covariance     xisto  covariance.ts           2.013s     2.01cpu     25.3MB  par  1.0  kern    1.994s  same
+correlation    xisto  correlation.ts          1.924s     1.92cpu     25.4MB  par  1.0  kern    1.906s  same
+nussinov       xisto  nussinov.ts             7.445s     7.44cpu     25.4MB  par  1.0  kern    7.430s  same
+2mm            xisto  2mm.ts                  1.648s     1.65cpu     37.0MB  par  1.0  kern    1.613s  same
+## bg 4c356d7
+knucleotide    xisto  knucleotide             3.366s     6.54cpu    363.1MB  par  1.9  same
+knucleotide    xisto  knucleotide-2           9.030s    16.72cpu    368.2MB  par  1.9  same
+knucleotide    xisto  knucleotide-3           9.235s    17.08cpu    363.1MB  par  1.8  same
+knucleotide    xisto  knucleotide-4           4.894s     8.91cpu    154.2MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           4.370s     8.40cpu    150.7MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           3.669s     7.02cpu    154.8MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           2.933s     5.74cpu     64.3MB  par  2.0  same
+revcomp        xisto  revcomp                 0.296s     0.28cpu    243.9MB  par  0.9  same
+revcomp        xisto  revcomp-10              0.301s     0.32cpu     10.5MB  par  1.0  same
+revcomp        xisto  revcomp-2               0.504s     0.34cpu    243.8MB  par  0.7  same
+revcomp        xisto  revcomp-3               0.526s     0.44cpu    486.4MB  par  0.8  same
+revcomp        xisto  revcomp-4               0.351s     0.23cpu    244.2MB  par  0.6  same
+revcomp        xisto  revcomp-5               0.336s     0.29cpu    308.3MB  par  0.9  same
+revcomp        xisto  revcomp-6               0.298s     0.26cpu    187.8MB  par  0.9  same
+revcomp        xisto  revcomp-7               0.345s     0.26cpu    189.0MB  par  0.7  same
+revcomp        xisto  revcomp-8               0.355s     0.36cpu     68.3MB  par  1.0  same
+revcomp        xisto  revcomp-9               0.320s     0.34cpu     10.3MB  par  1.1  same
+## pb ba9030f
+3mm            xisto  3mm.ts                  2.957s     2.95cpu     53.0MB  par  1.0  kern    2.912s  same
+covariance     xisto  covariance.ts           2.006s     2.00cpu     25.4MB  par  1.0  kern    1.987s  same
+correlation    xisto  correlation.ts          2.033s     2.03cpu     25.4MB  par  1.0  kern    2.013s  same
+nussinov       xisto  nussinov.ts             7.177s     7.17cpu     25.4MB  par  1.0  kern    7.162s  same
+2mm            xisto  2mm.ts                  1.587s     1.58cpu     36.9MB  par  1.0  kern    1.552s  same
+## bg ba9030f
+knucleotide    xisto  knucleotide             3.123s     6.07cpu    363.0MB  par  1.9  same
+knucleotide    xisto  knucleotide-2           8.628s    16.06cpu    368.6MB  par  1.9  same
+knucleotide    xisto  knucleotide-3           8.758s    16.95cpu    362.9MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           4.864s     8.74cpu    155.0MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           4.051s     7.86cpu    153.6MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           3.104s     6.02cpu    154.9MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           2.850s     5.58cpu     64.1MB  par  2.0  same
+revcomp        xisto  revcomp                 0.300s     0.28cpu    243.9MB  par  0.9  same
+revcomp        xisto  revcomp-10              0.319s     0.31cpu     10.1MB  par  1.0  same
+revcomp        xisto  revcomp-2               0.498s     0.35cpu    243.8MB  par  0.7  same
+revcomp        xisto  revcomp-3               0.518s     0.45cpu    486.3MB  par  0.9  same
+revcomp        xisto  revcomp-4               0.350s     0.23cpu    244.1MB  par  0.6  same
+revcomp        xisto  revcomp-5               0.332s     0.29cpu    308.1MB  par  0.9  same
+revcomp        xisto  revcomp-6               0.293s     0.26cpu    188.8MB  par  0.9  same
+revcomp        xisto  revcomp-7               0.337s     0.26cpu    189.4MB  par  0.8  same
+revcomp        xisto  revcomp-8               0.355s     0.36cpu     68.2MB  par  1.0  same
+revcomp        xisto  revcomp-9               0.316s     0.33cpu     10.1MB  par  1.0  same
+## pb ba9030f
+3mm            xisto  3mm.ts                  2.578s     2.58cpu     53.0MB  par  1.0  kern    2.534s  same
+covariance     xisto  covariance.ts           1.990s     1.99cpu     25.4MB  par  1.0  kern    1.971s  same
+correlation    xisto  correlation.ts          2.131s     2.13cpu     25.4MB  par  1.0  kern    2.111s  same
+nussinov       xisto  nussinov.ts             7.398s     7.38cpu     25.4MB  par  1.0  kern    7.383s  same
+2mm            xisto  2mm.ts                  1.653s     1.65cpu     37.0MB  par  1.0  kern    1.617s  same
+## bg ba9030f
+knucleotide    xisto  knucleotide             3.314s     6.50cpu    363.1MB  par  2.0  same
+knucleotide    xisto  knucleotide-2           8.922s    16.68cpu    366.4MB  par  1.9  same
+knucleotide    xisto  knucleotide-3           9.269s    17.77cpu    362.8MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           5.018s     9.08cpu    154.4MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           4.261s     8.31cpu    149.0MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           3.468s     6.67cpu    154.8MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           3.149s     6.14cpu     63.7MB  par  2.0  same
+revcomp        xisto  revcomp                 0.325s     0.28cpu    243.8MB  par  0.9  same
+revcomp        xisto  revcomp-10              0.303s     0.32cpu     10.1MB  par  1.1  same
+revcomp        xisto  revcomp-2               0.513s     0.35cpu    243.8MB  par  0.7  same
+revcomp        xisto  revcomp-3               0.533s     0.45cpu    486.2MB  par  0.8  same
+revcomp        xisto  revcomp-4               0.350s     0.22cpu    244.0MB  par  0.6  same
+revcomp        xisto  revcomp-5               0.336s     0.30cpu    308.2MB  par  0.9  same
+revcomp        xisto  revcomp-6               0.295s     0.25cpu    188.4MB  par  0.9  same
+revcomp        xisto  revcomp-7               0.336s     0.26cpu    189.3MB  par  0.8  same
+revcomp        xisto  revcomp-8               0.357s     0.36cpu     68.2MB  par  1.0  same
+revcomp        xisto  revcomp-9               0.316s     0.33cpu     10.1MB  par  1.1  same
+## pb 4c356d7
+3mm            xisto  3mm.ts                  2.922s     2.92cpu     53.0MB  par  1.0  kern    2.877s  same
+covariance     xisto  covariance.ts           2.014s     2.01cpu     25.4MB  par  1.0  kern    1.995s  same
+correlation    xisto  correlation.ts          1.973s     1.97cpu     25.4MB  par  1.0  kern    1.954s  same
+nussinov       xisto  nussinov.ts             7.374s     7.37cpu     25.4MB  par  1.0  kern    7.358s  same
+2mm            xisto  2mm.ts                  1.450s     1.45cpu     37.0MB  par  1.0  kern    1.415s  same
+## bg 4c356d7
+knucleotide    xisto  knucleotide             3.302s     6.44cpu    363.1MB  par  2.0  same
+knucleotide    xisto  knucleotide-2           9.037s    16.57cpu    368.8MB  par  1.8  same
+knucleotide    xisto  knucleotide-3           8.758s    16.90cpu    363.1MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           4.936s     8.87cpu    153.5MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           4.235s     8.21cpu    153.4MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           3.482s     6.67cpu    154.3MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           3.184s     6.24cpu     62.5MB  par  2.0  same
+revcomp        xisto  revcomp                 0.305s     0.29cpu    243.9MB  par  0.9  same
+revcomp        xisto  revcomp-10              0.300s     0.32cpu     10.3MB  par  1.1  same
+revcomp        xisto  revcomp-2               0.504s     0.34cpu    243.7MB  par  0.7  same
+revcomp        xisto  revcomp-3               0.531s     0.44cpu    486.3MB  par  0.8  same
+revcomp        xisto  revcomp-4               0.349s     0.22cpu    244.2MB  par  0.6  same
+revcomp        xisto  revcomp-5               0.340s     0.30cpu    308.3MB  par  0.9  same
+revcomp        xisto  revcomp-6               0.301s     0.26cpu    188.5MB  par  0.9  same
+revcomp        xisto  revcomp-7               0.347s     0.26cpu    189.4MB  par  0.8  same
+revcomp        xisto  revcomp-8               0.374s     0.39cpu     68.3MB  par  1.0  same
+revcomp        xisto  revcomp-9               0.307s     0.33cpu     10.3MB  par  1.1  same
+## pb 4c356d7
+3mm            xisto  3mm.ts                  2.800s     2.80cpu     53.0MB  par  1.0  kern    2.757s  same
+covariance     xisto  covariance.ts           2.160s     2.16cpu     25.4MB  par  1.0  kern    2.141s  same
+correlation    xisto  correlation.ts          2.059s     2.06cpu     25.4MB  par  1.0  kern    2.040s  same
+nussinov       xisto  nussinov.ts             7.234s     7.23cpu     25.4MB  par  1.0  kern    7.218s  same
+2mm            xisto  2mm.ts                  1.578s     1.58cpu     37.0MB  par  1.0  kern    1.544s  same
+## bg 4c356d7
+knucleotide    xisto  knucleotide             3.264s     6.39cpu    363.1MB  par  2.0  same
+knucleotide    xisto  knucleotide-2           8.914s    16.58cpu    368.8MB  par  1.9  same
+knucleotide    xisto  knucleotide-3           8.692s    16.72cpu    363.0MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           4.955s     8.89cpu    154.5MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           4.210s     8.03cpu    153.1MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           3.230s     6.22cpu    154.0MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           3.031s     5.96cpu     64.9MB  par  2.0  same
+revcomp        xisto  revcomp                 0.310s     0.29cpu    243.9MB  par  0.9  same
+revcomp        xisto  revcomp-10              0.306s     0.32cpu     10.3MB  par  1.1  same
+revcomp        xisto  revcomp-2               0.506s     0.35cpu    243.8MB  par  0.7  same
+revcomp        xisto  revcomp-3               0.529s     0.44cpu    486.4MB  par  0.8  same
+revcomp        xisto  revcomp-4               0.361s     0.23cpu    244.2MB  par  0.6  same
+revcomp        xisto  revcomp-5               0.348s     0.31cpu    308.2MB  par  0.9  same
+revcomp        xisto  revcomp-6               0.301s     0.26cpu    188.7MB  par  0.9  same
+revcomp        xisto  revcomp-7               0.357s     0.27cpu    188.7MB  par  0.8  same
+revcomp        xisto  revcomp-8               0.361s     0.36cpu     68.2MB  par  1.0  same
+revcomp        xisto  revcomp-9               0.325s     0.34cpu     10.3MB  par  1.1  same
+## pb ba9030f
+3mm            xisto  3mm.ts                  2.925s     2.92cpu     53.0MB  par  1.0  kern    2.882s  same
+covariance     xisto  covariance.ts           2.117s     2.11cpu     25.4MB  par  1.0  kern    2.098s  same
+correlation    xisto  correlation.ts          2.065s     2.06cpu     25.4MB  par  1.0  kern    2.046s  same
+nussinov       xisto  nussinov.ts             7.089s     7.09cpu     25.4MB  par  1.0  kern    7.073s  same
+2mm            xisto  2mm.ts                  2.145s     2.14cpu     37.0MB  par  1.0  kern    2.109s  same
+## bg ba9030f
+knucleotide    xisto  knucleotide             3.200s     6.24cpu    363.0MB  par  2.0  same
+knucleotide    xisto  knucleotide-2           8.987s    16.53cpu    368.5MB  par  1.8  same
+knucleotide    xisto  knucleotide-3           8.796s    16.96cpu    362.8MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           5.042s     9.14cpu    154.3MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           4.148s     8.04cpu    150.0MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           3.161s     6.10cpu    152.0MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           3.034s     5.95cpu     65.1MB  par  2.0  same
+revcomp        xisto  revcomp                 0.295s     0.29cpu    243.8MB  par  1.0  same
+revcomp        xisto  revcomp-10              0.294s     0.31cpu     10.1MB  par  1.1  same
+revcomp        xisto  revcomp-2               0.500s     0.34cpu    243.8MB  par  0.7  same
+revcomp        xisto  revcomp-3               0.529s     0.44cpu    486.3MB  par  0.8  same
+revcomp        xisto  revcomp-4               0.344s     0.22cpu    244.1MB  par  0.7  same
+revcomp        xisto  revcomp-5               0.335s     0.29cpu    308.2MB  par  0.9  same
+revcomp        xisto  revcomp-6               0.299s     0.26cpu    188.6MB  par  0.9  same
+revcomp        xisto  revcomp-7               0.357s     0.27cpu    189.3MB  par  0.7  same
+revcomp        xisto  revcomp-8               0.352s     0.36cpu     68.3MB  par  1.0  same
+revcomp        xisto  revcomp-9               0.324s     0.33cpu     10.1MB  par  1.0  same
+## pb ba9030f
+3mm            xisto  3mm.ts                  2.769s     2.77cpu     53.0MB  par  1.0  kern    2.726s  same
+covariance     xisto  covariance.ts           2.101s     2.10cpu     25.4MB  par  1.0  kern    2.082s  same
+correlation    xisto  correlation.ts          2.038s     2.03cpu     25.4MB  par  1.0  kern    2.019s  same
+nussinov       xisto  nussinov.ts             7.155s     7.15cpu     25.4MB  par  1.0  kern    7.140s  same
+2mm            xisto  2mm.ts                  1.502s     1.50cpu     37.0MB  par  1.0  kern    1.467s  same
+## bg ba9030f
+knucleotide    xisto  knucleotide             3.673s     7.03cpu    363.0MB  par  1.9  same
+knucleotide    xisto  knucleotide-2           8.936s    16.79cpu    368.7MB  par  1.9  same
+knucleotide    xisto  knucleotide-3           8.899s    17.10cpu    362.8MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           4.865s     8.85cpu    154.7MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           4.269s     8.28cpu    150.7MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           3.255s     6.23cpu    152.4MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           3.308s     6.46cpu     64.8MB  par  2.0  same
+revcomp        xisto  revcomp                 0.302s     0.28cpu    244.0MB  par  0.9  same
+revcomp        xisto  revcomp-10              0.299s     0.32cpu     10.1MB  par  1.1  same
+revcomp        xisto  revcomp-2               0.502s     0.35cpu    243.8MB  par  0.7  same
+revcomp        xisto  revcomp-3               0.530s     0.45cpu    486.3MB  par  0.9  same
+revcomp        xisto  revcomp-4               0.353s     0.23cpu    244.1MB  par  0.6  same
+revcomp        xisto  revcomp-5               0.331s     0.29cpu    308.4MB  par  0.9  same
+revcomp        xisto  revcomp-6               0.301s     0.27cpu    188.1MB  par  0.9  same
+revcomp        xisto  revcomp-7               0.344s     0.26cpu    189.6MB  par  0.8  same
+revcomp        xisto  revcomp-8               0.376s     0.38cpu     68.2MB  par  1.0  same
+revcomp        xisto  revcomp-9               0.325s     0.34cpu     10.2MB  par  1.0  same
+## pb 4c356d7
+3mm            xisto  3mm.ts                  2.846s     2.84cpu     53.0MB  par  1.0  kern    2.803s  same
+covariance     xisto  covariance.ts           2.124s     2.12cpu     25.4MB  par  1.0  kern    2.104s  same
+correlation    xisto  correlation.ts          2.072s     2.07cpu     25.4MB  par  1.0  kern    2.052s  same
+nussinov       xisto  nussinov.ts             7.180s     7.18cpu     25.4MB  par  1.0  kern    7.164s  same
+2mm            xisto  2mm.ts                  1.573s     1.57cpu     37.0MB  par  1.0  kern    1.538s  same
+## bg 4c356d7
+knucleotide    xisto  knucleotide             3.260s     6.39cpu    363.2MB  par  2.0  same
+knucleotide    xisto  knucleotide-2           9.100s    17.11cpu    368.8MB  par  1.9  same
+knucleotide    xisto  knucleotide-3           8.828s    17.05cpu    363.1MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           4.900s     8.94cpu    153.9MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           4.206s     8.18cpu    149.3MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           3.458s     6.60cpu    154.7MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           3.101s     6.08cpu     65.0MB  par  2.0  same
+revcomp        xisto  revcomp                 0.291s     0.28cpu    243.8MB  par  1.0  same
+revcomp        xisto  revcomp-10              0.300s     0.32cpu     10.3MB  par  1.1  same
+revcomp        xisto  revcomp-2               0.523s     0.35cpu    243.7MB  par  0.7  same
+revcomp        xisto  revcomp-3               0.549s     0.45cpu    486.6MB  par  0.8  same
+revcomp        xisto  revcomp-4               0.355s     0.22cpu    244.2MB  par  0.6  same
+revcomp        xisto  revcomp-5               0.327s     0.29cpu    308.4MB  par  0.9  same
+revcomp        xisto  revcomp-6               0.305s     0.26cpu    188.0MB  par  0.8  same
+revcomp        xisto  revcomp-7               0.341s     0.26cpu    188.0MB  par  0.8  same
+revcomp        xisto  revcomp-8               0.350s     0.36cpu     68.2MB  par  1.0  same
+revcomp        xisto  revcomp-9               0.305s     0.33cpu     10.3MB  par  1.1  same
+## pb 4c356d7
+3mm            xisto  3mm.ts                  3.169s     3.17cpu     53.0MB  par  1.0  kern    3.125s  same
+covariance     xisto  covariance.ts           2.055s     2.05cpu     25.3MB  par  1.0  kern    2.035s  same
+correlation    xisto  correlation.ts          2.161s     2.16cpu     25.4MB  par  1.0  kern    2.141s  same
+nussinov       xisto  nussinov.ts             7.269s     7.27cpu     25.4MB  par  1.0  kern    7.254s  same
+2mm            xisto  2mm.ts                  1.774s     1.77cpu     37.0MB  par  1.0  kern    1.739s  same
+## bg 4c356d7
+knucleotide    xisto  knucleotide             3.491s     6.80cpu    363.1MB  par  1.9  same
+knucleotide    xisto  knucleotide-2           8.932s    16.77cpu    368.7MB  par  1.9  same
+knucleotide    xisto  knucleotide-3           8.990s    17.16cpu    363.0MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           4.920s     8.89cpu    154.6MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           4.541s     8.87cpu    151.9MB  par  2.0  same
+knucleotide    xisto  knucleotide-6           3.310s     6.39cpu    154.4MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           3.101s     6.10cpu     64.5MB  par  2.0  same
+revcomp        xisto  revcomp                 0.306s     0.28cpu    243.9MB  par  0.9  same
+revcomp        xisto  revcomp-10              0.318s     0.31cpu     10.3MB  par  1.0  same
+revcomp        xisto  revcomp-2               0.502s     0.35cpu    243.8MB  par  0.7  same
+revcomp        xisto  revcomp-3               0.534s     0.44cpu    486.4MB  par  0.8  same
+revcomp        xisto  revcomp-4               0.355s     0.23cpu    244.3MB  par  0.6  same
+revcomp        xisto  revcomp-5               0.339s     0.30cpu    308.4MB  par  0.9  same
+revcomp        xisto  revcomp-6               0.291s     0.25cpu    188.4MB  par  0.9  same
+revcomp        xisto  revcomp-7               0.341s     0.26cpu    189.4MB  par  0.8  same
+revcomp        xisto  revcomp-8               0.353s     0.36cpu     68.2MB  par  1.0  same
+revcomp        xisto  revcomp-9               0.315s     0.34cpu     10.3MB  par  1.1  same
+## pb ba9030f
+3mm            xisto  3mm.ts                  2.991s     2.98cpu     53.0MB  par  1.0  kern    2.947s  same
+covariance     xisto  covariance.ts           2.178s     2.18cpu     25.4MB  par  1.0  kern    2.159s  same
+correlation    xisto  correlation.ts          2.205s     2.20cpu     25.4MB  par  1.0  kern    2.187s  same
+nussinov       xisto  nussinov.ts             7.240s     7.24cpu     25.4MB  par  1.0  kern    7.223s  same
+2mm            xisto  2mm.ts                  1.831s     1.83cpu     37.0MB  par  1.0  kern    1.796s  same
+## bg ba9030f
+knucleotide    xisto  knucleotide             3.520s     6.87cpu    363.0MB  par  2.0  same
+knucleotide    xisto  knucleotide-2           9.226s    17.27cpu    368.6MB  par  1.9  same
+knucleotide    xisto  knucleotide-3           9.022s    17.24cpu    362.8MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           4.899s     8.90cpu    153.9MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           4.458s     8.67cpu    148.2MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           3.544s     6.84cpu    154.3MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           3.223s     6.21cpu     64.4MB  par  1.9  same
+revcomp        xisto  revcomp                 0.308s     0.28cpu    243.9MB  par  0.9  same
+revcomp        xisto  revcomp-10              0.295s     0.31cpu     10.1MB  par  1.1  same
+revcomp        xisto  revcomp-2               0.501s     0.35cpu    243.8MB  par  0.7  same
+revcomp        xisto  revcomp-3               0.537s     0.45cpu    486.3MB  par  0.8  same
+revcomp        xisto  revcomp-4               0.350s     0.23cpu    244.1MB  par  0.6  same
+revcomp        xisto  revcomp-5               0.334s     0.30cpu    308.2MB  par  0.9  same
+revcomp        xisto  revcomp-6               0.296s     0.26cpu    188.5MB  par  0.9  same
+revcomp        xisto  revcomp-7               0.342s     0.27cpu    189.3MB  par  0.8  same
+revcomp        xisto  revcomp-8               0.353s     0.36cpu     68.3MB  par  1.0  same
+revcomp        xisto  revcomp-9               0.314s     0.33cpu     10.1MB  par  1.1  same
+DONE

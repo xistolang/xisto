@@ -1,0 +1,44 @@
+== ba9030f-1
+# 2026-11-16T19:54:36 gen=wrk levels=256,4096 duration=15s repeat=3 xisto_workers=2 cpus=2
+# test side name req/s p50_ms p99_ms cpu_ms_per_1k_req rss_MB valid
+plaintext-c256 xisto xisto-native 630735 3.700 153.880 3.1 39.5 ok
+plaintext-c4096 xisto xisto-native 539365 67.020 621.120 3.6 39.7 ok
+json-c256 xisto xisto-native 68872 2.340 76.140 25.9 40.1 ok
+json-c4096 xisto xisto-native 63713 34.130 581.660 28.3 40.3 ok
+plaintext-c256 xisto xisto-nest-procs 239944 10.650 26.600 8.3 72.1 ok
+plaintext-c4096 xisto xisto-nest-procs 204239 169.610 399.490 9.7 72.2 ok
+json-c256 xisto xisto-nest-procs 52115 2.960 18.140 37.5 72.0 ok
+json-c4096 xisto xisto-nest-procs 45660 54.350 298.650 42.5 72.1 ok
+== 4c356d7-1
+# 2026-11-16T20:03:19 gen=wrk levels=256,4096 duration=15s repeat=3 xisto_workers=2 cpus=2
+# test side name req/s p50_ms p99_ms cpu_ms_per_1k_req rss_MB valid
+plaintext-c256 xisto xisto-native 641189 3.740 0.000 3.0 39.4 ok
+plaintext-c4096 xisto xisto-native 525367 69.270 661.040 3.7 39.7 ok
+json-c256 xisto xisto-native 70718 2.380 75.770 24.9 40.1 ok
+json-c4096 xisto xisto-native 63332 33.570 562.000 28.7 40.3 ok
+plaintext-c256 xisto xisto-nest-procs 241244 10.320 25.690 8.2 72.3 ok
+plaintext-c4096 xisto xisto-nest-procs 208232 170.770 424.260 9.5 72.3 ok
+json-c256 xisto xisto-nest-procs 52731 3.450 17.640 37.0 72.1 ok
+json-c4096 xisto xisto-nest-procs 45795 53.550 296.320 42.3 72.4 ok
+== 4c356d7-2
+# 2026-11-16T20:12:01 gen=wrk levels=256,4096 duration=15s repeat=3 xisto_workers=2 cpus=2
+# test side name req/s p50_ms p99_ms cpu_ms_per_1k_req rss_MB valid
+plaintext-c256 xisto xisto-native 646717 4.240 0.000 3.0 39.6 ok
+plaintext-c4096 xisto xisto-native 549444 65.910 515.290 3.5 39.8 ok
+json-c256 xisto xisto-native 70427 2.330 75.710 25.0 40.1 ok
+json-c4096 xisto xisto-native 63130 34.840 538.640 28.9 40.3 ok
+plaintext-c256 xisto xisto-nest-procs 240966 9.300 24.845 8.2 72.3 ok
+plaintext-c4096 xisto xisto-nest-procs 207446 170.060 611.900 9.5 72.3 ok
+json-c256 xisto xisto-nest-procs 52800 2.900 18.730 37.0 72.3 ok
+json-c4096 xisto xisto-nest-procs 45429 55.430 335.280 42.5 72.1 ok
+== ba9030f-2
+# 2026-11-16T20:20:25 gen=wrk levels=256,4096 duration=15s repeat=3 xisto_workers=2 cpus=2
+# test side name req/s p50_ms p99_ms cpu_ms_per_1k_req rss_MB valid
+plaintext-c256 xisto xisto-native 640081 3.830 0.000 3.1 39.4 ok
+plaintext-c4096 xisto xisto-native 540159 66.900 752.800 3.6 39.7 ok
+json-c256 xisto xisto-native 70165 2.400 67.080 26.1 40.1 ok
+json-c4096 xisto xisto-native 63326 34.810 582.590 29.2 40.2 ok
+plaintext-c256 xisto xisto-nest-procs 239926 9.340 24.140 8.2 71.9 ok
+plaintext-c4096 xisto xisto-nest-procs 208274 168.010 477.490 9.5 72.1 ok
+json-c256 xisto xisto-nest-procs 53124 3.730 22.050 36.5 72.1 ok
+json-c4096 xisto xisto-nest-procs 45879 52.920 292.650 42.0 72.1 ok
