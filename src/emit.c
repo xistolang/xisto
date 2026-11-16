@@ -355,10 +355,33 @@ static void fixparam_compute(Program *p) {
         for (int i = 0; i < f->nparams; i++) if (f->fixparam[i] < 0 || fixp_seen[k] != f->ncalls) f->fixparam[i] = 0;
     }
 }
+/* does a function with a loop end up in f, inlined into its only caller (always_inline, XS_FA) one or more times over? */
+static bool stmt_has_loop(Stmt *s);
+static bool pulls_loop(Func *f) {
+    if (f->pulls_loop) return f->pulls_loop == 1;
+    f->pulls_loop = 2; /* (a cycle: no) */
+    bool r = false;
+    for (int i = 0; i < prog->nfuncs && !r; i++) {
+        Func *g = prog->funcs[i];
+        if (g->ncalls == 1 && g->call1_in == f && g->body && (stmt_has_loop(g->body) || pulls_loop(g))) r = true;
+    }
+    for (int i = 0; i < prog->nclasses && !r; i++) {
+        Class *c = prog->classes[i];
+        if (!c->used || c->builtin) continue;
+        Func *fs[1] = {c->ctor};
+        for (int k = -1; k < c->nmethods && !r; k++) {
+            Func *g = k < 0 ? fs[0] : c->methods[k];
+            if (g && g->ncalls == 1 && g->call1_in == f && g->body && (stmt_has_loop(g->body) || pulls_loop(g))) r = true;
+        }
+    }
+    f->pulls_loop = r ? 1 : 2;
+    return r;
+}
 static bool inlined_once(Func *f) {
     if (getenv("XISTO_NO_TRACE")) return false;
     if (f->ncalls != 1 || !f->call1 || f->is_async || !f->body || stmt_has_try(f->body) || f->virt_target || f->is_gen) return false;
-    if (f->run_once) return false; /* (code that runs once is compiled for size, on its own: XS_RUN_ONCE) */
+    if (f->run_once && !pulls_loop(f)) return false; /* (code that runs once is compiled for size, on its own: XS_RUN_ONCE;
+                                                          not when a function with a loop is inlined into it) */
     /* not recursive, directly or through other functions inlined into their only caller */
     int steps = 0; /* (a cycle among its callers that does not reach f: two functions that only call each other) */
     for (Func *g = f->call1_in; g; g = g->ncalls == 1 ? g->call1_in : NULL) if (g == f || ++steps > 256) return false;

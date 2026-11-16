@@ -534,6 +534,7 @@ struct Func {
     struct Func *deco_stub; /* a method a TypeScript decorator wraps (XB-107): its calls go through this function (its
                                slot); its own body is emitted as <cname>__orig */
     bool run_once;     /* straight-line code called only from code that runs once: not optimized (build time) */
+    int8_t pulls_loop; /* emitter: 0 unknown, 1 a function with a loop is inlined into it (inlined_once), 2 not */
     bool once;         /* called only from calls that run once (it may have loops of its own): its calls outside loops run once */
     bool escapes;      /* used as a value or dispatched: who calls it, and how often, is not known */
     /* generic functions and methods (function f<T>(x: T): T): a template, instantiated per list of types */
