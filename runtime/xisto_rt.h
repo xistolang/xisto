@@ -5304,7 +5304,7 @@ static inline uint64_t xs_now(void) {
 #if !defined(_WIN32)
 #include <unistd.h>
 #endif
-/* Intl.DateTimeFormat with a timeZone (xisto:intl): the wall clock of a zone of the system TZ database at an instant,
+/* xisto:tz (the intl package's Intl.DateTimeFormat with a timeZone): the wall clock of a zone of the system TZ database at an instant,
    as [year, month 1-12, day, hour, minute, second, weekday]; a zone the system does not know is a RangeError, as in Node */
 XS_NOINLINE xs_arr_int *xs_tz_fields(double ms, xs_str *zone) {
     char z[160];
