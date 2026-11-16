@@ -16528,6 +16528,8 @@ static void ii_typed(const char *name, Type *t) {
 static void ii_scan(Stmt *s) {
     if (!s) return;
     if ((s->kind == S_VAR || s->kind == S_FOROF) && s->decl_type) ii_typed(s->name, s->decl_type);
+    if (s->kind == S_FOROF && !s->decl_type && s->name && s->expr && s->expr->kind == E_IDENT && s->expr->str && ii_in(ii_anames, ii_an, s->expr->str))
+        ii_typed(s->name, ty_int); /* for (const x of a) with a: int[]: x is an int, as a[i] is (XB-210) */
     if (s->kind == S_VAR && s->is_const && !s->decl_type && s->init && s->name) {
         ii_cnames = realloc(ii_cnames, sizeof(char *) * (size_t)(ii_cn + 1)); ii_cinit = realloc(ii_cinit, sizeof(Expr *) * (size_t)(ii_cn + 1));
         ii_cnames[ii_cn] = s->name; ii_cinit[ii_cn++] = s->init;
