@@ -167,6 +167,16 @@ static Class *bi_class(const char *name, const char *cname) {
     return c;
 }
 
+/* XB-250: the built-in classes whose struct and members live in runtime/xisto_net.h (the event loop, sockets,
+   workers): a member of one needs that runtime; Date, the bytes, bigint, Stats... live in xisto_rt.h */
+static void gen_site(Func *f);
+static bool net_class(Class *c) {
+    static const char *const names[] = {"Response", "ReadableStream", "HttpRequest", "HttpResponse", "Server", "Worker", "MessagePort"};
+    if (!c || !c->builtin) return false;
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) if (strcmp(c->name, names[i]) == 0) return true;
+    return false;
+}
+
 static void bi_field(Class *c, const char *name, Type *type) {
     c->fields = realloc(c->fields, sizeof(Field) * (size_t)(c->nfields + 1));
     Field f = {0};
@@ -1284,7 +1294,7 @@ static void check_promise(Expr *e, Type *expected) {
         if (e->args.len == 0) { /* Promise.resolve(): a Promise<void> */
             wrap_call(e, "xs_promise_resolved_v", ty_promise_of(ty_void));
             e->args = (ExprList){0};
-            prog->uses_gen = true;
+            gen_site(cur_func);
             return;
         }
         Expr *v = e->args.items[0];
@@ -1311,7 +1321,7 @@ static void check_promise(Expr *e, Type *expected) {
         expr_list_push(&e->args, num_lit(e->pos, pr_kind(T), true));
         expr_list_push(&e->args, x);
         e->type = ty_promise_of(T);
-        prog->uses_gen = true;
+        gen_site(cur_func);
         return;
     }
     if (strcmp(m, "allSettled") == 0 && lookup_func("__xs_allSettled")) { /* the outcome of each promise: xisto:arrays */
@@ -1374,7 +1384,7 @@ static void check_promise(Expr *e, Type *expected) {
     if (!race && strcmp(m, "all") != 0) xs_error(XS7111, e->pos, "supported: Promise.all, Promise.race, Promise.any, Promise.resolve, Promise.reject", "unknown Promise member '%s'", m);
     if (e->args.len != 1) xs_error(XS7032, e->pos, NULL, "Promise.%s takes an array", m);
     Expr *a = e->args.items[0];
-    prog->uses_gen = true; /* the coroutines and the event loop */
+    gen_site(cur_func); /* the coroutines and the event loop */
     if (race && tsc_checked() && a->kind == E_ARRAY_LIT && !a->spread && a->args.len > 0) {
         /* Promise.race([medida.then(...), sentinela.then(...)]): promises already made; the race is on them (no task waits on
            a loser: a promise left pending, its timer cleared, keeps nothing alive, as in Node); objects of several shapes: their union */
@@ -1405,7 +1415,7 @@ static void check_promise(Expr *e, Type *expected) {
                 for (int i = 0; i < a->args.len; i++) a->args.items[i]->type = ty_promise_of(u); /* (an object, or a union of them: one reference) */
                 a->type = ty_array_of(ty_promise_of(u));
                 a->prechecked = true;
-                prog->uses_gen = true;
+                gen_site(cur_func);
                 e->builtin.cfn = "promise_race_arr";
                 e->elem_type = u;
                 e->type = u;
@@ -4320,7 +4330,7 @@ static void pr_spawn(Expr *e) { /* the call e (checked), kept as a promise */
     memset(e, 0, sizeof *e);
     e->kind = E_SPAWN; e->pos = c->pos; e->field = -1; e->lhs = c;
     e->type = ty_promise_of(c->type);
-    prog->uses_gen = true;
+    gen_site(cur_func);
     if (getenv("XISTO_SPAWN_LOG")) fprintf(stderr, "spawn: %s:%d:%d\n", xs_file_name ? xs_file_name : "?", c->pos.line, c->pos.col);
 }
 static void pr_resolved(Expr *e) { /* a value already computed, as a fulfilled promise */
@@ -4328,7 +4338,7 @@ static void pr_resolved(Expr *e) { /* a value already computed, as a fulfilled p
     const char *sfx = pr_sfx(pr_kind(t));
     /* (a void or null value: xs_promise_resolved_v takes none; _vx evaluates it and drops it) */
     wrap_call(e, xs_sprintf("xs_promise_resolved_%s", strcmp(sfx, "v") == 0 ? "vx" : sfx), ty_promise_of(t));
-    prog->uses_gen = true;
+    gen_site(cur_func);
 }
 static void pr_await(Expr *e) { /* await p, p a promise: its value (or its rejection thrown) */
     Type *t = e->type->elem;
@@ -4486,7 +4496,7 @@ static void check_pr_member(Expr *e, Type *expected) {
     expr_list_push(&e->args, num_lit(e->pos, errk, true));
     expr_list_push(&e->args, num_lit(e->pos, pr_kind(R), true));
     e->type = ty_promise_of(R);
-    prog->uses_gen = true;
+    gen_site(cur_func);
 }
 /* Promise<X> where Promise<Y> goes, one of them unknown (a cache of promises of different types, XB-135):
    p.then((v: X): Y => v as Y), a new promise that settles with p (its value boxed into, or checked out of, the
@@ -4551,7 +4561,7 @@ static void check_pr_new(Expr *e, Type *expected) {
     expr_list_push(&e->args, num_lit(e->pos, pr_kind(T), true));
     expr_list_push(&e->args, x);
     e->type = ty_promise_of(T);
-    prog->uses_gen = true;
+    gen_site(cur_func);
 }
 /* Number, String, Boolean, Date as values. Where a function goes (xs.map(Number), .filter(Boolean)): the
    conversion, as an arrow (v) => Number(v). Elsewhere (type: Number in a Swagger option, @Type(() => Date)):
@@ -7409,6 +7419,19 @@ static void tls_site(void) {
     prog->tls_fns = realloc(prog->tls_fns, sizeof(Func *) * (size_t)(prog->ntls_fns + 1));
     prog->tls_fns[prog->ntls_fns++] = f;
 }
+/* XB-250: code that needs runtime/xisto_net.h (timers, fetch, servers, workers...): the network runtime, its event loop
+   and the cleanup stack join the program when prune finds the function it is written in reachable, so a function
+   nobody calls (an imported module's) costs nothing; at top level, at once */
+static void rt_site(Func *f, bool *flag, Func ***fns, int *n) {
+    for (int guard = 0; f && f->outer_fn && guard < 256; guard++) f = f->outer_fn;
+    if (!f) { *flag = true; return; }
+    for (int i = 0; i < *n; i++) if ((*fns)[i] == f) return;
+    *fns = realloc(*fns, sizeof(Func *) * (size_t)(*n + 1));
+    (*fns)[(*n)++] = f;
+}
+static void net_site(void) { rt_site(cur_func, &prog->uses_net, &prog->net_fns, &prog->nnet_fns); }
+/* the coroutines (generators, async code, promises: uses_gen) the same way */
+static void gen_site(Func *f) { rt_site(f, &prog->uses_gen, &prog->gen_fns, &prog->ngen_fns); }
 /* The scheme of a fetch URL when it is known at compile time: 1 https, 0 http, -1 only known at run time.
    Looks at the leading literal of "...", `...${x}` and "..." + x. */
 static int url_scheme(Expr *u) {
@@ -10296,7 +10319,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     expect_type(e->args.items[0], cbt, "callback of setImmediate");
                     e->type = ty_int;
                     e->builtin.cfn = "xs_set_immediate";
-                    prog->uses_net = true;
+                    net_site();
                     return;
                 }
             }
@@ -10307,7 +10330,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 expect_type(e->args.items[0], cbt, xs_sprintf("callback of %s", name));
                 e->type = ty_void;
                 e->builtin.cfn = name[0] == 'q' ? "xs_queue_microtask" : "xs_next_tick";
-                prog->uses_net = true;
+                net_site();
                 return;
             }
             if (strcmp(name, "__xs_promises_handled") == 0 && e->args.len == 1 && cur_mod && cur_mod->file && !strcmp(cur_mod->file, "xisto:settled")) {
@@ -10317,7 +10340,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 if (at->kind != TY_ARRAY || at->elem->kind != TY_PROMISE) xs_error(XS7033, e->pos, NULL, "internal: __xs_promises_handled takes an array of promises");
                 e->type = ty_void;
                 e->builtin.cfn = "xs_promises_handled";
-                prog->uses_net = true;
+                net_site();
                 return;
             }
             if (strcmp(name, "clearImmediate") == 0) name = "clearTimeout";
@@ -10331,7 +10354,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 expect_type(e->args.items[1], ty_number, "the delay");
                 e->type = ty_int;
                 e->builtin.cfn = name[3] == 'T' ? "xs_set_timeout" : "xs_set_interval";
-                prog->uses_net = true; /* timers live with the event loop */
+                net_site(); /* timers live with the event loop */
                 return;
             }
             if (strcmp(name, "clearTimeout") == 0 || strcmp(name, "clearInterval") == 0) {
@@ -10342,14 +10365,14 @@ static void check_expr_in(Expr *e, Type *expected) {
                     /* let timer: ReturnType<typeof setTimeout> | undefined: clearTimeout(timer) of none does nothing, as Node */
                     e->type = ty_void;
                     e->builtin.cfn = idt->elem->kind == TY_INT ? "xs_clear_timer_ni" : "xs_clear_timer_nn";
-                    prog->uses_net = true;
+                    net_site();
                     return;
                 }
                 if (e->args.items[0]->type->kind == TY_LITINT) coerce_lit(e->args.items[0], ty_number);
                 expect_type(e->args.items[0], ty_number, "the timer's id");
                 e->type = ty_void;
                 e->builtin.cfn = "xs_clear_timer";
-                prog->uses_net = true;
+                net_site();
                 return;
             }
             if (strcmp(name, "btoa") == 0 || strcmp(name, "atob") == 0) { /* base64 of a string of bytes (code points 0..255) */
@@ -10626,7 +10649,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                         int gscheme = url_scheme(e->args.items[0]); /* (TLS by this URL: __xs_fetch's own fetch does not decide it) */
                         if (gscheme == 1 && xs_tls_off) xs_error(XS7059, e->args.items[0]->pos, "remove --tls=off, or call the service over http://", "https URL, but the program is built with --tls=off");
                         if (gscheme == 1 || (gscheme == -1 && !xs_tls_off)) tls_site();
-                        prog->uses_net = true;
+                        net_site();
                         Expr *callee = xs_alloc(sizeof *callee);
                         callee->kind = E_IDENT; callee->pos = e->pos; callee->field = -1; callee->str = "__xs_fetch";
                         e->lhs = callee;
@@ -10699,7 +10722,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     e->type = ty_object_of(fr);
                 }
                 e->builtin.cfn = "xs_fetch";
-                prog->uses_net = true;
+                net_site();
                 /* TLS is linked only when https can happen: an http:// URL (TLS ends at the load balancer) costs nothing */
                 int scheme = url_scheme(e->args.items[0]);
                 if (cur_mod && cur_mod->file && !strcmp(cur_mod->file, "xisto:url")) return; /* (__xs_fetch: its caller's URL decides TLS) */
@@ -10843,7 +10866,7 @@ static void check_expr_in(Expr *e, Type *expected) {
         e->func = f;
         e->type = fret(f, e->pos);
         if (f->noverloads && tsc_checked() && overload_typed(e, f, &ov_args)) return;
-        if (f->mod && f->mod->builtin && strcmp(f->cname, "xs_sleep_ms") == 0) prog->uses_net = true; /* timers live with the event loop */
+        if (f->mod && f->mod->builtin && strcmp(f->cname, "xs_sleep_ms") == 0) net_site(); /* timers live with the event loop */
         return;
     }
     case E_INDEX:
@@ -12075,7 +12098,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->cls = c;
                 e->type = fret(m, e->pos);
                 e->builtin.cfn = m->cname;
-                prog->uses_net = true;
+                if (net_class(c)) net_site();
                 return;
             }
         }
@@ -12760,7 +12783,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->builtin.cfn = "xs_Server_listen_tls";
                 e->builtin.self_first = true;
                 if (xs_tls_off) xs_error(XS7024, o->pos, "remove --tls=off, or listen without cert/key behind the load balancer", "HTTPS server, but the program is built with --tls=off");
-                prog->uses_net = true;
+                net_site();
                 prog->uses_tls = true;
                 return;
             }
@@ -12780,7 +12803,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                         e->type = ty_void;
                         e->builtin.cfn = xs_sprintf("xs_%s_post%s", w ? "Worker" : "MessagePort", bytes ? "Bytes" : is_sab(t) ? "Sab" : "F64");
                         e->builtin.self_first = true;
-                        prog->uses_net = true;
+                        net_site();
                         return;
                     }
                 }
@@ -12798,7 +12821,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                         e->type = ty_object_of(oc);
                         e->builtin.cfn = xs_sprintf("xs_%s_on_%s", w ? "Worker" : "MessagePort", pt->cls == u8 ? "bytes" : is_sab(pt) ? "sab" : "f64");
                         e->builtin.self_first = true;
-                        prog->uses_net = true;
+                        net_site();
                         return;
                     }
                 }
@@ -12806,7 +12829,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             member_expected = expected;
             check_object_member(e, oc);
             if (oc->builtin && (strcmp(oc->name, "DatabaseSync") == 0 || strcmp(oc->name, "RunResult") == 0)) prog->uses_sqlite = true;
-            else if (oc->builtin && strcmp(oc->name, "Error") != 0) prog->uses_net = true;
+            else if (net_class(oc)) net_site();
             return;
         }
         case TY_INT: case TY_NUMBER: case TY_LITINT:
@@ -12818,7 +12841,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->builtin.cfn = has ? "xs_timer_has_ref" : close ? "xs_timer_close" : !strcmp(e->str, "unref") ? "xs_timer_unref" :
                                  !strcmp(e->str, "ref") ? "xs_timer_ref" : "xs_timer_refresh";
                 e->type = has ? ty_boolean : close ? ty_void : ty_int;
-                prog->uses_net = true;
+                net_site();
                 return;
             }
             if (e->is_call && strcmp(e->str, "toString") == 0 && e->args.len <= 1) { /* n.toString(), n.toString(radix) */
@@ -13849,7 +13872,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             Type *el = e->type->elem;
             if (el->kind == TY_VOID || el->kind == TY_FUNC || el->kind == TY_NULLABLE || el->kind == TY_NULL)
                 xs_error(XS6040, e->pos, NULL, "unsupported channel element type '%s'", ty_name(el));
-            prog->uses_net = true; /* parked receivers and senders are coroutines of the event loop */
+            net_site(); /* parked receivers and senders are coroutines of the event loop */
         } else if (e->args.len == 1) { /* new Map<K, V>([[k, v], ...]) / new Set<T>([a, b]): an array of entries or values */
             bool is_map = e->type->kind == TY_MAP;
             Type *want;
@@ -13917,7 +13940,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 expr_list_push(&e->args, data);
                 if (data->kind == E_STRING && !data->type) check_expr(data, ty_string);
                 e->builtin.cfn = "xs_Worker_new";
-                prog->uses_net = true;
+                net_site();
                 prog->uses_workers = true;
                 return;
             }
@@ -14094,7 +14117,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                 xs_error(XS8003, e->pos, NULL, "%s cannot be constructed directly", c->name);
             if (e->args.len != 0) xs_error(XS7074, e->pos, NULL, "new Server() takes no arguments");
             e->builtin.cfn = "xs_Server_new";
-            prog->uses_net = true;
+            net_site();
             return;
         }
         if (c->is_interface) xs_error(XS9005, e->pos, xs_sprintf("write an object literal: const x: %s = { ... };", c->name), "'%s' is an interface; it has no constructor", c->name);
@@ -17029,7 +17052,7 @@ static void check_func(Func *f) {
     }
     if (f->is_gen) {
         if (f->ret->kind != TY_STREAM) xs_error(XS8073, f->pos, "write the return type: function* f(): Generator<T>", "a generator returns Generator<T> (or Iterable<T>)");
-        prog->uses_gen = true; /* its body runs on a coroutine stack */
+        gen_site(f); /* its body runs on a coroutine stack */
     }
     check_block(f->body);
     pop_scope();

@@ -141,6 +141,17 @@ static void walk_stmt(Stmt *s) {
     }
 }
 
+static bool listed_func(Program *p, Func *f) {
+    for (int i = 0; i < p->nfuncs; i++) if (p->funcs[i] == f) return true;
+    for (int i = 0; i < p->nclasses; i++) {
+        Class *c = p->classes[i];
+        if (c->ctor == f) return true;
+        for (int k = 0; k < c->nmethods; k++) if (c->methods[k] == f) return true;
+        for (int k = 0; k < c->nstatics; k++) if (c->statics[k] == f) return true;
+    }
+    return false;
+}
+
 void prune_program(Program *p) {
     prog = p;
     /* the checker marks generic instances and anonymous literals used when it makes them: their fields'
@@ -167,6 +178,16 @@ void prune_program(Program *p) {
                 Class *a = asif_reached[i]->adapters[k];
                 if (!a->used && a->adapter_of->used) { use_class(a); made_class(a); more = true; }
             }
+    }
+    /* the network runtime (XB-250): needed when a function with such code is reachable; a function the program does
+       not list (an arrow outside any function, a generic instance) counts as reachable */
+    for (int i = 0; i < p->nnet_fns && !p->uses_net; i++) {
+        Func *f = p->net_fns[i];
+        if (f->used || !listed_func(p, f)) p->uses_net = true;
+    }
+    for (int i = 0; i < p->ngen_fns && !p->uses_gen; i++) {
+        Func *f = p->gen_fns[i];
+        if (f->used || !listed_func(p, f)) p->uses_gen = true;
     }
     /* TLS (XB-232): a fetch that may be https counts when its function is reachable, and, for a method or a
        constructor, when an object of its class (or of a subclass) can exist */
