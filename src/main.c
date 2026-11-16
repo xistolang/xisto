@@ -153,15 +153,18 @@ static void usage(void) {
     fprintf(stderr,
             "usage:\n"
             "  xisto build [--dev] [--backend=c|qbe] [-o OUT] FILE.ts   compile to a native executable\n"
-            "    --target=linux-arm64|linux-x64|windows-x64             an executable for another system, from any host (needs zig)\n"
+            "    --target=linux-arm64|linux-x64|windows-x64|windows-arm64  an executable for another system, from any host (needs zig);\n"
+            "                                                           --target=native: this machine (the default)\n"
+            "    --pkgs DIR                                             packages installed in DIR instead of the project's (also run, check)\n"
             "  xisto emit [--backend=c|qbe] FILE.ts                     print the generated C or QBE IL\n"
             "  xisto run [--dev] [--backend=c|qbe] FILE.ts [ARGS...]    compile to a temp file and run it\n"
-            "  xisto debug [--batch CMDS] FILE.ts [ARGS...]             run under the debugger\n"
+            "  xisto debug [--batch CMDS] [--backend=c|qbe] FILE.ts [ARGS...]  run under the debugger (qbe: variables read-only)\n"
             "  xisto dap                                                debug adapter for IDEs (DAP over stdin/stdout)\n"
             "  xisto clean [DIR]                                        remove the build cache (.xisto/cache) of a project\n"
             "  xisto fmt [--check] FILE.ts...                           format in place (--check: exit 1 if any file would change)\n"
-            "  xisto check [--details] [--deny-warnings] [--tsc-checked] [--pkgs DIR] [PATH...]  what a project needs to change to compile with xisto\n"
-            "                                                           (PATH: a folder, a tsconfig.json or .ts files; --details: every place)\n"
+            "  xisto check [--details] [--tests] [--deny-warnings] [--tsc-checked] [--pkgs DIR] [PATH...]  what a project needs to change to compile with xisto\n"
+            "                                                           (PATH: a folder, a tsconfig.json or .ts files; --details: every place;\n"
+            "                                                           --tests: the test files counted too)\n"
             "  xisto test [DIR]                                         build and run every *.test.ts under DIR\n"
             "  xisto init [DIR]                                         start a project: xisto.json, src/main.ts, .gitignore\n"
             "  xisto add NAME[@REF]...                                  add packages of the registry (github.com/xistolang/packages;\n"
@@ -179,6 +182,7 @@ static void usage(void) {
             "  --warnings     list each rule warning (undefined read as null, int mixed with number...); a build prints their count\n"
             "  --deny-warnings  rule warnings are errors (CI); also for xisto check\n"
             "  --profile      count calls and time per function; the table goes to stderr at exit (C backend)\n"
+            "  --time         print how long each step of the build took (emit, compile, link) to stderr\n"
             "  --backend=qbe  generate QBE IL and machine code directly, without C\n"
             "  --cpu=native   code for this machine's processor (AVX2, ...), as Rust's target-cpu=native; XISTO_CPU=native\n"
             "  --node-compat  accept node:fs, node:sqlite... as names of xisto's own modules (xisto:fs...)\n"
@@ -940,8 +944,9 @@ static void run_cc_target(const char *cfile, const char *outfile, bool dev) {
         extra = xs_sprintf("%s -I%s %s %s", extra, xs_q(xisto_dir), xs_q(zl), xs_q(bl));
     }
     bool win = strstr(xs_target, "windows") != NULL;
+    /* -DXS_SITES_RETAIN: the call-site table survives lld's --gc-sections (stack traces and the profiler's frames) */
     char *cmd = xs_sprintf("%s -std=c11 %s -mllvm -hot-cold-split=false -ffp-contract=off -fno-omit-frame-pointer -ffunction-sections -fdata-sections "
-                           "%s -static -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
+                           "-DXS_SITES_RETAIN %s -static -Wno-unused-value -Wno-unused-variable -Wno-unused-function -Wno-parentheses-equality "
                            "-Wno-ignored-qualifiers -Wno-return-type -Wno-incompatible-pointer-types-discards-qualifiers -o %s %s %s -lm -lpthread%s",
                            cc, flags, win ? "" : "-Wl,--gc-sections", xs_q(outfile), xs_q(cfile), xs_sprintf("%s %s", extra, tls_extra), win ? " -lws2_32" : "");
     if (xs_sh(cmd) != 0) {

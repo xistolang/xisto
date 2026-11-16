@@ -413,6 +413,13 @@ extern const xs_srec __stop_xs_sites[] __attribute__((weak));
 #define XS_SEC_PUSH ".pushsection xs_sites$m,\"dw\"\n\t"
 #define XS_L ".L"
 #define XS_TAB "xs_sitetab"
+#elif defined(XS_SITES_RETAIN)
+/* (--target, linked by zig's lld: with --gc-sections it drops a section only __start_/__stop_ name, so every frame
+   read as unknown, XB-245; "R" (SHF_GNU_RETAIN) keeps it. Not for the host's cc: GNU as before 2.36 rejects it, and
+   GNU ld keeps the section anyway) */
+#define XS_SEC_PUSH ".pushsection xs_sites,\"awR\"\n\t"
+#define XS_L ".L"
+#define XS_TAB "xs_sitetab"
 #else
 #define XS_SEC_PUSH ".pushsection xs_sites,\"aw\"\n\t"
 #define XS_L ".L"
