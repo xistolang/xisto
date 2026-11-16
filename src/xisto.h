@@ -483,6 +483,8 @@ struct Func {
     bool pv_ok;        /* a promise version whose body never waits: its calls replace the spawned ones */
     Class *cls;        /* owning class for methods, else NULL */
     Class *static_of;  /* a static method (lowered to Class__s_name): its class, which reaches its private members */
+    void *static_state; /* a static method whose body names `this` (the class it is called on): the parser state at its
+                           parameters, to parse it again for a subclass that inherits it (xs_parse_static_copy) */
     bool is_ctor;
     char *cname;
     DecoList decos;
@@ -783,6 +785,8 @@ extern bool xs_wide_f64; /* distribute.c: the target has 4-lane double vectors (
 void prune_program(Program *p); /* marks what main reaches; emitters skip the rest */
 Func *xs_parse_instance(Func *tmpl, Type **args);
 Func *xs_parse_promise_version(Func *f);
+Func *xs_parse_static_copy(Func *f);
+#define XS_STATIC_THIS "\x02this" /* `this` in a static method: the class it is called on (checker: static_this_class) */
 Class *xs_parse_class_instance(Class *tmpl, Type **args, const char *name); /* parser.c: a generic function parsed again with its T bound */
 extern bool xs_debug;   /* --debug: statement hooks and the debugger agent (docs/debugger.md) */
 extern bool xs_profile; /* --profile: instrument every function with call counts and timing */

@@ -390,7 +390,9 @@ static bool wt_imports(Module *m, const char *name) {
     return false;
 }
 /* Classes visible from the current module: its own, the ones it imports, and the built-ins. */
+static Class *static_this_class(void);
 static Class *find_class(const char *name) {
+    if (name[0] == '\x02' && !strcmp(name, XS_STATIC_THIS)) return static_this_class(); /* `this` in a static method */
     const char *q = strchr(name, '\x01'); /* "A\x01m": the class A of the import from "m" (an alias next to another A, XB-117) */
     if (q) {
         char *base = xs_strndup(name, (size_t)(q - name));
@@ -3027,6 +3029,44 @@ static const char *this_cname(void) {
     return name;
 }
 
+/* `this` in a static method (and the arrows written in it): the class it was called on (the method's own class, or the
+   subclass its copy was made for) */
+static Class *static_this_class(void) {
+    Func *f = cur_func;
+    while (f && !f->static_of && f->outer_fn) f = f->outer_fn;
+    return f ? f->static_of : NULL;
+}
+static bool has_static(Class *c, const char *name) {
+    for (int k = 0; k < c->nstatics_user; k++) if (!strcmp(c->static_names[k], name)) return true;
+    return false;
+}
+/* a static method f of class A that names `this`, called as B.m() with B a subclass that inherits it: f parsed again for B
+   (once per subclass), `this` reading B there, as JavaScript's this is the class the call was made on */
+static void resolve_signature(Func *f);
+static Func **gen_work;
+static int ngen_work;
+static Func *static_copy(Func *f, Class *sub) {
+    for (int i = 0; i < f->ninstances; i++) if (f->instances[i]->static_of == sub) return f->instances[i];
+    Func *g = xs_parse_static_copy(f);
+    g->name = xs_sprintf("__xs_sthis_%s_%s", sub->cname ? sub->cname : sub->name, f->name);
+    g->cname = xs_sprintf("f%d_%s", g->mod->id, g->name);
+    g->static_of = sub;
+    f->instances = realloc(f->instances, sizeof(Func *) * (size_t)(f->ninstances + 1));
+    f->instances[f->ninstances++] = g; /* (kept here to be found again; the program gets it through gen_work) */
+    sym_add(&funcs_by_name, g->name, g);
+    Module *sm = cur_mod;
+    Scope *ss = scope;
+    const char *sfn = xs_file_name, *ssrc = xs_source;
+    enter_module(g->mod);
+    resolve_signature(g);
+    cur_mod = sm;
+    scope = ss;
+    xs_file_name = sfn;
+    xs_source = ssrc;
+    gen_work = realloc(gen_work, sizeof(Func *) * (size_t)(ngen_work + 1));
+    gen_work[ngen_work++] = g;
+    return g;
+}
 static Func *lookup_func(const char *name) {
     const char *q = strchr(name, '\x01'); /* "f\x01m": the function f of the import from "m" (XB-117) */
     if (q) {
@@ -3043,6 +3083,7 @@ static Func *lookup_func(const char *name) {
     SYM_EACH(funcs_by_name, name, e) {
         Func *f = e->decl;
         if (f->mod == cur_mod || (f->exported && imports_name(cur_mod, f->mod, name))) return f;
+        if (!strncmp(name, "__xs_sthis_", 11)) return f; /* (a static method's copy for a subclass: static_copy) */
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:arrays") == 0) return f; /* (reduce & co) */
         if (strncmp(name, "__xs_", 5) == 0 && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:settled") == 0) return f; /* (Promise.allSettled) */
         if ((!strcmp(name, "__xs_construct") || !strcmp(name, "__xs_ci_params") || !strcmp(name, "__xs_apply") || !strcmp(name, "__xs_use_desc") || !strcmp(name, "__xs_desc_enter") || !strcmp(name, "__xs_desc_leave") || !strcmp(name, "__xs_deco_target") || !strcmp(name, "__xs_target_ctor")) &&
@@ -3053,6 +3094,7 @@ static Func *lookup_func(const char *name) {
         if (!strncmp(name, "Reflect__s_", 11) && f->exported && f->mod && f->mod->file && strstr(f->mod->file, "/reflect-metadata/"))
             return f; /* (Reflect.defineMetadata & co: statics of the global Reflect, see find_class) */
         const char *st = strstr(name, "__s_"); /* a static method: visible where its class is imported */
+        if (st && f->static_of && f->static_of == static_this_class()) return f; /* (this.m() in a static method's copy, XB: static this) */
         if (st && f->exported) {
             char *cls = xs_strndup(name, (size_t)(st - name));
             if (imports_name(cur_mod, f->mod, cls)) return f;
@@ -9694,6 +9736,17 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     case E_ASSIGN:
     case E_POSTFIX: {
+        if (e->lhs && e->lhs->kind == E_MEMBER && !e->lhs->is_call && e->lhs->str && e->lhs->lhs && e->lhs->lhs->kind == E_IDENT &&
+            !lookup(e->lhs->lhs->str)) { /* B.count = v (or this.count++ in a static method B inherits) with count a static of a base A:
+                                            JavaScript makes B a property of its own there, which xisto's one variable per static is not */
+            Class *sc = find_class(e->lhs->lhs->str);
+            if (sc && !sc->builtin && !has_static(sc, e->lhs->str))
+                for (Class *b = sc->base; b && !b->builtin; b = b->base) {
+                    if (!has_static(b, e->lhs->str)) continue;
+                    xs_error(XS8151, e->lhs->pos, xs_sprintf("write it through the class that declares it: %s.%s", b->name, e->lhs->str),
+                             "%s.%s is a static field of %s: writing it through %s would give %s a field of its own", sc->name, e->lhs->str, b->name, sc->name, sc->name);
+                }
+        }
         {   /* d[CONTADOR[motivo]]++ with the key a union of d's field names: that field's ++ */
             const char **names; int n;
             if (e->lhs && e->lhs->kind == E_INDEX && (!e->rhs || pure_read(e->rhs)) && lit_key_fields(e->lhs, &names, &n)) {
@@ -11732,11 +11785,19 @@ static void check_expr_in(Expr *e, Type *expected) {
         }
         if (e->lhs->kind == E_IDENT && !lookup(e->lhs->str)) {
             const char *ns = e->lhs->str;
-            Class *sc = find_class(ns);
+            Class *sc0 = find_class(ns), *sc = sc0;
             const char *nsq = strchr(ns, '\x01'); /* (ns.C.m with ns's C read as "C\x01m": C__s_m of that import, XB-223) */
+            if (sc && !sc->builtin && !has_static(sc, e->str)) /* B.m() with m a static of a base A: A's (JavaScript's prototype chain) */
+                for (Class *b = sc->base; b && !b->builtin; b = b->base) if (has_static(b, e->str)) { sc = b; break; }
             for (int k = 0; sc && !sc->builtin && k < sc->nstatics_user; k++) { /* Class.staticMember */
                 if (strcmp(sc->static_names[k], e->str) != 0) continue;
                 const char *gen = nsq ? xs_sprintf("%s%s", sc->static_gen[k], nsq) : sc->static_gen[k];
+                if (sc != sc0 && sc->static_is_method[k]) { /* inherited: called as is, or (it names `this`) its copy for sc0 */
+                    Func *sf = NULL;
+                    SYM_EACH(funcs_by_name, sc->static_gen[k], fe) { Func *g = fe->decl; if (g->static_of == sc) sf = g; }
+                    if (sf && sf->static_state) gen = static_copy(sf, sc0)->name;
+                    else if (nsq) gen = sc->static_gen[k]; /* (the base's own name: visible through the import of the class) */
+                }
                 if (sc->static_is_method[k]) {
                     if (!e->is_call) xs_error(XS8123, e->pos, "call it: Class.method(...)", "static methods are not values");
                     Expr *callee = xs_alloc(sizeof *callee);
@@ -11761,6 +11822,19 @@ static void check_expr_in(Expr *e, Type *expected) {
                     e->is_call = false;
                     check_expr(e, expected);
                     return;
+                }
+                if (sc->mod && cur_mod && sc->mod != cur_mod && !lookup(gen) && sc == static_this_class()) {
+                    /* this.x in a static method's copy for a subclass of another module: that module's variable */
+                    for (Binding *b = mod_scopes[sc->mod->id]->head; b; b = b->next)
+                        if (b->name && !strcmp(b->name, gen)) {
+                            Binding *alias = xs_alloc(sizeof *alias);
+                            *alias = *b;
+                            alias->origin = b;
+                            Scope *ms = mod_scopes[cur_mod->id];
+                            alias->next = ms->head;
+                            ms->head = alias;
+                            break;
+                        }
                 }
                 e->kind = E_IDENT;
                 e->str = (char *)gen;

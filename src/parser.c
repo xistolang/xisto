@@ -1683,7 +1683,14 @@ static Expr *parse_primary(Parser *p) {
             wants_reflect = true;
             return c;
         }
-        Token name = expect(p, TK_IDENT, NULL);
+        Token name;
+        if (at(p, TK_THIS) && p->this_alias && !strcmp(p->this_alias, XS_STATIC_THIS)) { /* new this(...) in a static method: the class it is called on */
+            name = p->tok;
+            name.kind = TK_IDENT;
+            name.str = XS_STATIC_THIS;
+            this_alias_used = true;
+            next(p);
+        } else name = expect(p, TK_IDENT, NULL);
         if (strcmp(name.str, "Intl") == 0 && at(p, TK_DOT)) { /* new Intl.DateTimeFormat(...): xisto:intl's Intl_DateTimeFormat */
             next(p);
             Token k = expect(p, TK_IDENT, NULL);
@@ -3561,6 +3568,42 @@ Func *xs_parse_instance(Func *tmpl, Type **args) {
     return f;
 }
 
+/* a static method that names `this` parsed again (from its parameters), for a subclass that inherits it: `this` there is
+   that subclass (the checker's static_this_class) */
+Func *xs_parse_static_copy(Func *f) {
+    Parser p = *(Parser *)f->static_state;
+    Func *g = xs_alloc(sizeof *g);
+    g->pos = f->pos;
+    g->name = f->name;
+    g->is_async = f->is_async;
+    g->is_gen = f->is_gen;
+    g->access = f->access;
+    g->is_getter = f->is_getter;
+    g->is_setter = f->is_setter;
+    g->mod = f->mod;
+    g->exported = f->exported;
+    parse_params_ex(&p, g, false);
+    if (g->is_setter && !at(&p, TK_COLON)) g->ret = ty_void;
+    else if (!at(&p, TK_COLON)) g->ret = NULL;
+    else {
+        next(&p);
+        const char *rfrom = p.tok.start;
+        g->ret = parse_type(&p);
+        g->ret_src = span(&p, rfrom);
+    }
+    const char *was = p.this_alias;
+    bool used_was = this_alias_used;
+    bool saved_gen = p.in_gen;
+    p.this_alias = XS_STATIC_THIS;
+    p.in_gen = g->is_gen;
+    g->body = parse_block(&p);
+    p.this_alias = was;
+    p.in_gen = saved_gen;
+    this_alias_used = used_was;
+    prepend_param_decls(g);
+    return g;
+}
+
 /* XB-231: f (not async, declared Promise<T>) parsed again, as the function its promise version is made from */
 Func *xs_parse_promise_version(Func *f) {
     Func *v;
@@ -3981,7 +4024,10 @@ static void parse_fields_body(Parser *p, Class *c) {
             if (at(p, TK_LT)) { /* a generic method: m<T>(x: T): T */
                 if (strcmp(name.str, "constructor") == 0) xs_error(XS6012, pos, NULL, "a constructor has no type parameters");
                 parse_tparams(p, f);
+                const char *was_alias = p->this_alias;
+                if (mods & MOD_STATIC) p->this_alias = XS_STATIC_THIS; /* (`this`: its class; not parsed again for a subclass) */
                 parse_generic_rest(p, f, true);
+                p->this_alias = was_alias;
                 if (mods & MOD_STATIC) {
                     c->smethods = realloc(c->smethods, sizeof(Func *) * (size_t)(c->nsmethods + 1));
                     c->smethods[c->nsmethods++] = f;
@@ -3995,6 +4041,7 @@ static void parse_fields_body(Parser *p, Class *c) {
                 }
                 continue;
             }
+            Parser at_params = *p; /* (a static method naming `this`: parsed again for the subclasses that call it) */
             parse_params_ex(p, f, strcmp(name.str, "constructor") == 0);
             if (strcmp(name.str, "constructor") == 0) {
                 f->is_ctor = true;
@@ -4058,7 +4105,17 @@ static void parse_fields_body(Parser *p, Class *c) {
             }
             bool saved_gen = p->in_gen;
             p->in_gen = f->is_gen;
+            const char *was_alias = p->this_alias;
+            bool used_was = this_alias_used;
+            if (mods & MOD_STATIC) { p->this_alias = XS_STATIC_THIS; this_alias_used = false; } /* `this`: the class it is called on */
             f->body = parse_block(p);
+            if ((mods & MOD_STATIC) && this_alias_used && !c->ntparams) {
+                Parser *st = xs_alloc(sizeof *st);
+                *st = at_params;
+                f->static_state = st;
+            }
+            p->this_alias = was_alias;
+            this_alias_used = used_was;
             prepend_param_decls(f);
             p->in_gen = saved_gen;
             if (f->is_ctor) {
