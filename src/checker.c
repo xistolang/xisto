@@ -7002,8 +7002,48 @@ static Func *check_generic_call(Expr *e, Func *tmpl, Type *expected, const char 
                 cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
             }
         }
+        Expr *ol = e->args.items[i]->kind == E_OBJLIT ? e->args.items[i] : NULL;
+        int oln = ol ? ol->args.len : 0;
+        bool olnull = false; /* ({ a: 1, b: null }) */
+        for (int k = 0; k < oln; k++) if (ol->args.items[k]->kind == E_NULL) olnull = true;
+        Type *rp0 = ty_strip_null(tmpl->params[i].type);
+        if (olnull && !ctx && rp0->kind == TY_MAP && rp0->record && rp0->elem->kind == TY_TPARAM) {
+            /* ({ a: 1, b: null }) where Record<string, T> goes: T from the values that are not null, made nullable, and
+               the literal checked as that Record */
+            for (int k = 0; k < oln; k++) {
+                Expr *v = ol->args.items[k];
+                if (v->kind == E_NULL) continue;
+                check_expr(v, NULL);
+                settle(v);
+                if (v->type->kind != TY_NULL) unify(rp0->elem, v->type->kind == TY_INT && v->kind != E_NUMBER ? ty_number : v->type, tmpl, bind);
+            }
+            Type *sb = NULL;
+            for (int k = 0; k < tmpl->ntparams; k++)
+                if (bind[k] && !strcmp(tmpl->tparams[k], rp0->elem->tname)) {
+                    if (bind[k]->kind != TY_NULLABLE && bind[k]->kind != TY_UNKNOWN) bind[k] = ty_nullable_of(bind[k]);
+                    sb = xs_alloc(sizeof *sb);
+                    *sb = *rp0;
+                    sb->elem = bind[k];
+                }
+            if (sb && !has_tparam(sb)) {
+                for (int k = 0; k < oln; k++) if (ol->args.items[k]->kind != E_NULL) ol->args.items[k]->prechecked = true;
+                Module *dm = tmpl->cls ? tmpl->cls->mod : tmpl->mod;
+                Module *was = cur_mod;
+                Scope *ss = scope;
+                const char *sfn = xs_file_name, *ssrc = xs_source;
+                if (dm && dm != cur_mod) enter_module(dm);
+                ctx = resolve(sb, e->pos);
+                cur_mod = was; scope = ss; xs_file_name = sfn; xs_source = ssrc;
+            }
+        }
         check_expr(e->args.items[i], ctx);
         done[i] = true;
+        Type *at = e->args.items[i]->type, *rp = ty_strip_null(tmpl->params[i].type);
+        if (ol && !ctx && rp->kind == TY_MAP && rp->record && at && at->kind == TY_OBJECT && at->cls && at->cls->nfields == oln) {
+            /* f({ a: 1, b: 2 }) with o: Record<string, T>: T from the literal's values, as TypeScript infers it */
+            for (int k = 0; k < oln; k++) unify(rp->elem, at->cls->fields[k].type, tmpl, bind);
+            continue;
+        }
         unify(arrow ? pt : tmpl->params[i].type, e->args.items[i]->type, tmpl, bind);
     }
     if (expected && tmpl->ret && has_tparam(tmpl->ret) && !ty_is_any(expected) && expected->kind != TY_UNKNOWN && expected->kind != TY_VOID)
