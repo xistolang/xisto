@@ -6,6 +6,7 @@
 // Errors are Node's: "ENOENT: no such file or directory, open '/x'", with err.code, errno, syscall and path (dest
 // for the calls on two paths). Paths are strings (not Buffers or URLs: fileURLToPath(url) gives one).
 export { readFileSync, existsSync, openSync, closeSync, readSync } from "xisto:fs_native";
+import { existsSync as __existsSync } from "xisto:fs_native";
 
 declare function fs_throw(e: int, syscall: string, path: string, dest: string): void;
 declare function fs_last_err(): int;
@@ -29,6 +30,10 @@ declare function fs_write_str(path: string, data: string, flags: string, mode: i
 declare function fs_write_buf(path: string, data: Uint8Array, flags: string, mode: int): int;
 declare function fs_copy_file(src: string, dest: string, excl: boolean): int;
 declare function fs_date_ms(d: Date): number;
+declare function fs_open_fd(path: string, flags: string, mode: int): int;
+declare function fs_close_fd(fd: int): int;
+declare function fs_read_fd(fd: int, b: Uint8Array, off: int, len: int, pos: int): int;
+declare function fs_write_fd(fd: int, b: Uint8Array, off: int, len: int, pos: int): int;
 
 // ---- errors ----
 
@@ -606,4 +611,147 @@ function cpTree(src: string, dest: string, o: CopyOptions): void {
 /** Copies a file, or (with { recursive: true }) a directory and what it holds. */
 export function cpSync(src: string, dest: string, options?: CopyOptions): void {
   cpTree(src, dest, options !== null ? options : {});
+}
+
+// ---- file descriptors: writeSync, and the callback calls open, close, read, write (and exists) ----
+// (here rather than in xisto:fs_callbacks: their names are too common to find in a program's text, and code that is
+// not reached is not compiled, so a program that does not call them does not get the event loop for them)
+
+// the bytes of text in an encoding (UTF-8 by default)
+function textBytes(text: string, enc: string | null): Uint8Array {
+  if (enc === null || enc === "utf8" || enc === "utf-8") return new TextEncoder().encode(text);
+  return Buffer.alloc(Buffer.byteLength(text, enc), text, enc);
+}
+// Node's checks of offset and length against the buffer (ERR_OUT_OF_RANGE), in Node's order and with its texts
+function checkSpan(b: Uint8Array, off: int, len: int, write: boolean): void {
+  const range = (what: string, must: string, got: int): Error =>
+    new FsCodeError("RangeError", "ERR_OUT_OF_RANGE", `The value of "${what}" is out of range. It must be ${must}. Received ${got}`, 0, "", "");
+  if (off < 0) throw range("offset", ">= 0 && <= 9007199254740991", off);
+  if (write) {
+    if (off > b.length) throw range("offset", `<= ${b.length}`, off);
+    if (len > b.length - off) throw range("length", `<= ${b.length - off}`, len);
+    if (len < 0) throw range("length", ">= 0", len);
+    return;
+  }
+  if (len < 0) throw range("length", ">= 0", len);
+  if (len > b.length - off) throw range("length", `<= ${b.length - off}`, len);
+}
+function writeFd(fd: int, data: string | Uint8Array, a: int | null, b: int | string | null, c: int | null): int {
+  let r: int = 0;
+  if (typeof data === "string") {
+    const bytes = textBytes(data as string, typeof b === "string" ? (b as string) : null);
+    r = fs_write_fd(fd, bytes, 0, bytes.length, a ?? -1);
+  } else {
+    const buf = data as Uint8Array;
+    const off: int = a ?? 0;
+    const len: int = typeof b === "number" ? (b as int) : buf.length - off;
+    checkSpan(buf, off, len, true);
+    r = fs_write_fd(fd, buf, off, len, c ?? -1);
+  }
+  __fsCheck(r, "write", "");
+  return r;
+}
+
+/** Writes to a file descriptor and gives the number of bytes written: a buffer (from offset, length bytes, at
+ * position: null for where the descriptor is) or text (at position, in the encoding: UTF-8 by default). */
+export function writeSync(fd: int, data: string | Uint8Array, offsetOrPosition: int | null = null, lengthOrEncoding: int | string | null = null,
+  position: int | null = null): int {
+  return writeFd(fd, data, offsetOrPosition, lengthOrEncoding, position);
+}
+
+const OPEN_FLAGS: string = " r rs sr r+ rs+ sr+ w wx xw w+ wx+ xw+ a ax xa as sa a+ ax+ xa+ as+ sa+ ";
+
+// the error a failed call gives its callback (Node's, as the synchronous call throws it)
+function fdError(r: int, syscall: string, path: string): Error | null {
+  if (r >= 0) return null;
+  try {
+    __fsCheck(r, syscall, path);
+  } catch (e) {
+    return e as Error;
+  }
+  return null;
+}
+
+/** What open() gives its callback: an error, or the file descriptor. */
+export type OpenCallback = (err: Error | null, fd: int) => void;
+/** What read() gives its callback: the number of bytes read and the buffer. */
+export type ReadCallback = (err: Error | null, bytesRead: int, buffer: Uint8Array) => void;
+/** What write() gives its callback: the number of bytes written and what was written. */
+export type WriteCallback = (err: Error | null, written: int, data: string | Uint8Array) => void;
+
+/** Opens a file (flags "r" by default, mode 0o666) and gives its descriptor to the callback. */
+export function open(path: string, flags: string | OpenCallback, mode: int | OpenCallback | null = null, callback: OpenCallback | null = null): void {
+  let fl = "r";
+  let md: int = 0o666;
+  let cb: OpenCallback | null = callback;
+  if (typeof flags === "string") fl = flags as string;
+  else cb = flags as OpenCallback;
+  if (typeof mode === "number") md = mode as int;
+  else if (mode !== null) cb = mode as OpenCallback;
+  if (OPEN_FLAGS.indexOf(" " + fl + " ") < 0) {
+    throw new FsCodeError("TypeError", "ERR_INVALID_ARG_VALUE", `The argument 'flags' is invalid. Received '${fl}'`, 0, "", "");
+  }
+  const done: OpenCallback = cb as OpenCallback;
+  setImmediate((): void => {
+    const fd = fs_open_fd(path, fl, md);
+    done(fdError(fd, "open", path), fd < 0 ? -1 : fd);
+  });
+}
+
+/** Closes a file descriptor; the callback gets the error, if any. */
+export function close(fd: int, callback: ((err: Error | null) => void) | null = null): void {
+  setImmediate((): void => {
+    const r = fs_close_fd(fd);
+    if (callback !== null) callback(fdError(r, "close", ""));
+  });
+}
+
+/** Reads from a file descriptor into buffer (from offset, length bytes, at position: null for where the descriptor
+ * is); the callback gets the number of bytes read (0 at the end) and the buffer. Also read(fd, buffer, callback). */
+export function read(fd: int, buffer: Uint8Array, offset: int | ReadCallback, length: int | null = null, position: int | null = null,
+  callback: ReadCallback | null = null): void {
+  let off: int = 0;
+  let cb: ReadCallback | null = callback;
+  if (typeof offset === "number") off = offset as int;
+  else cb = offset as ReadCallback;
+  const len: int = length ?? buffer.length - off;
+  checkSpan(buffer, off, len, false);
+  const done: ReadCallback = cb as ReadCallback;
+  setImmediate((): void => {
+    const r = fs_read_fd(fd, buffer, off, len, position ?? -1);
+    done(fdError(r, "read", ""), r < 0 ? 0 : r, buffer);
+  });
+}
+
+/** Writes to a file descriptor: write(fd, buffer, offset?, length?, position?, callback) or
+ * write(fd, text, position?, encoding?, callback); the callback gets the number of bytes written and the data. */
+export function write(fd: int, data: string | Uint8Array, a: int | string | WriteCallback | null = null, b: int | string | WriteCallback | null = null,
+  c: int | WriteCallback | null = null, callback: WriteCallback | null = null): void {
+  let cb: WriteCallback | null = callback;
+  let x: int | null = null;
+  let y: int | string | null = null;
+  let z: int | null = null;
+  if (typeof a === "function") cb = a as WriteCallback;
+  else if (typeof a === "number") x = a as int;
+  if (typeof b === "function") cb = b as WriteCallback;
+  else if (typeof b === "number") y = b as int;
+  else if (typeof b === "string") y = b as string;
+  if (typeof c === "function") cb = c as WriteCallback;
+  else if (typeof c === "number") z = c as int;
+  const done: WriteCallback = cb as WriteCallback;
+  setImmediate((): void => {
+    let err: Error | null = null;
+    let n: int = 0;
+    try {
+      n = writeFd(fd, data, x, y, z);
+    } catch (e) {
+      err = e as Error;
+    }
+    done(err, n, data);
+  });
+}
+
+/** Whether the path exists, to the callback (deprecated in Node: use stat or access). */
+export function exists(path: string, callback: (exists: boolean) => void): void {
+  setImmediate((): void => callback(__existsSync(path)));
 }

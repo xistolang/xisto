@@ -894,7 +894,7 @@ directory made), `readdirSync` (`{ withFileTypes }`: `Dirent`s with `name`, `par
 `isDirectory()`, `isSymbolicLink()`...; `{ throwIfNoEntry: false }`), `rmSync` (`{ recursive, force }`),
 `rmdirSync`, `renameSync`, `copyFileSync` (`COPYFILE_EXCL`), `cpSync` (`{ recursive, force, errorOnExist,
 filter }`), `mkdtempSync`, `realpathSync`, `accessSync`, `chmodSync`, `symlinkSync`, `readlinkSync`, `linkSync`,
-`truncateSync`, `utimesSync`/`lutimesSync`, `openSync`/`closeSync`/`readSync`, and `fs.constants` (`F_OK`, `R_OK`,
+`truncateSync`, `utimesSync`/`lutimesSync`, `openSync`/`closeSync`/`readSync`/`writeSync`, and `fs.constants` (`F_OK`, `R_OK`,
 `W_OK`, `X_OK`, `COPYFILE_EXCL`, `S_IF*`...). Errors are Node's: the message (`ENOENT: no such file or directory,
 open '/x'`, `EEXIST: file already exists, mkdir '/x'`, `rename 'a' -> 'b'`...) and `err.code`, `errno` (this
 system's, negative), `syscall`, `path` and `dest`, read through an `any` (`catch (e: any)`) or a cast; `rmSync` of
@@ -903,7 +903,8 @@ a directory without `recursive` is Node's `SystemError` `ERR_FS_EISDIR`.
 **Callbacks**: `fs.readFile(path, options?, callback)` (`"utf8"` or `{ encoding }`: text; otherwise a `Buffer`),
 `writeFile`, `appendFile`, `mkdir`, `readdir` (`withFileTypes`), `stat`, `lstat`, `fstat`, `rm`, `rmdir`, `rename`,
 `access`, `unlink`, `copyFile`, `cp`, `realpath`, `mkdtemp`, `readlink`, `symlink`, `link`, `chmod`, `truncate`,
-`utimes`: the work and the callback happen on a later turn of the event loop, `err` is `null` when it worked.
+`utimes`, and on file descriptors `open`, `read`, `write`, `close` (and `exists(path, cb)`): the work and the
+callback happen on a later turn of the event loop, `err` is `null` when it worked.
 
 **Promises**: `node:fs/promises` and `fs.promises` (also `import { promises } from "node:fs"`): `readFile`
 (text with an encoding, else a `Buffer`), `writeFile`, `appendFile`, `unlink`, `mkdir`, `readdir`, `stat`,
@@ -915,8 +916,9 @@ The callback API, `fs.promises` and the streams are loaded only by programs that
 
 **`node:path`**: POSIX `join`, `resolve`, `normalize`, `relative`, `dirname`, `basename`, `extname`,
 `isAbsolute`, `parse`, `format`, `toNamespacedPath`, `sep`, `delimiter`; `path.posix` (the same) and
-`path.win32` (`normalize`, `join`, `isAbsolute`, `dirname`, `basename`, `extname`, `parse`, `format`,
-`toNamespacedPath`, `sep`, `delimiter`, with drive letters and UNC roots as Node's).
+`path.win32` (`normalize`, `join`, `resolve`, `relative`, `isAbsolute`, `dirname`, `basename`, `extname`, `parse`,
+`format`, `toNamespacedPath`, `sep`, `delimiter`, with drive letters and UNC roots as Node's), also as the modules
+`node:path/posix` and `node:path/win32`.
 
 **`node:os`**: `platform`, `type`, `arch`, `machine`, `release`, `version`, `hostname`, `homedir`, `tmpdir`,
 `endianness`, `EOL`, `devNull`, `uptime`, `loadavg`, `totalmem`, `freemem`, `availableParallelism`, `cpus`,
@@ -924,7 +926,8 @@ The callback API, `fs.promises` and the streams are loaded only by programs that
 `mac`, `internal`, `cidr`, `scopeid`) and `os.constants` (`signals` and `errno` with this system's numbers,
 `priority`).
 
-**`node:url`**: `fileURLToPath(url)` and `pathToFileURL(path)`, encoded as Node encodes them (spaces, `%`, `#`, `?`,
+**`node:url`**: the legacy `url.parse` (DEP0169 printed once, as Node does), `url.format` and `url.resolve`, and
+`fileURLToPath(url)` and `pathToFileURL(path)`, encoded as Node encodes them (spaces, `%`, `#`, `?`,
 `\`, non-ASCII), with Node's errors (`ERR_INVALID_URL_SCHEME`, `ERR_INVALID_FILE_URL_HOST`,
 `ERR_INVALID_FILE_URL_PATH`).
 
@@ -939,12 +942,13 @@ files next to the binary and find them with `process.execPath` instead). `import
 Differences from Node:
 
 - Paths are strings: not `Buffer`s or `URL`s (`fileURLToPath(url)` gives one), no file descriptors where a path
-  goes (beyond `fstatSync`, `readSync` and the streams).
+  goes (beyond `fstatSync`, `readSync`, `writeSync`, `open`/`read`/`write`/`close` and the streams).
 - `readFileSync` takes `"utf8"`/`"utf-8"` (or `{ encoding }` with one) for text; another encoding is
   `readFileSync(path).toString(encoding)`. `writeFileSync`/`appendFileSync` write text in another encoding
   (`"latin1"`, `"base64"`...) when the encoding is written in the call (a literal; one held in a variable throws
   an error that says so). `openSync` takes the flags `r`, `w`, `a`, `r+`.
-- On an error the callback's result is empty (`""`, an empty `Buffer` or array, a `Stats` of zeros) where Node
+- On an error the callback's result is empty (`""`, an empty `Buffer` or array, a `Stats` of zeros, `-1` for
+  `open`'s descriptor) where Node
   passes `undefined`; a missing optional value (`mkdirSync`'s result, `err.dest`) prints as `null` in
   `console.log`.
 - `console.log(err)` prints `Error: <message>` (no `{ errno, code, syscall, path }` block and no stack);

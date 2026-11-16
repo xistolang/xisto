@@ -9487,6 +9487,50 @@ XS_NOINLINE int64_t xs_fs_read_sync(int64_t fd, xs_Uint8Array *b, int64_t off, i
     return (int64_t)r;
 }
 
+/* fs.writeSync, fs.open/read/write/close (runtime/node/fs.ts, fs_callbacks.ts): -errno instead of a throw (the
+   caller makes Node's error); flags as Node reads them (r, r+, rs+, w, wx, w+, wx+, a, ax, a+, ax+, as, as+), -EINVAL
+   for another; a position of -1: where the descriptor is (and it moves) */
+XS_NOINLINE int64_t xs_fs_open_fd(xs_str *path, xs_str *flags, int64_t mode) {
+    const char *f = flags->data;
+    bool plus = strchr(f, '+') != NULL, excl = strchr(f, 'x') != NULL;
+    int fl;
+    if (strcmp(f, "r") == 0 || strcmp(f, "rs") == 0 || strcmp(f, "sr") == 0) fl = O_RDONLY;
+    else if (strcmp(f, "r+") == 0 || strcmp(f, "rs+") == 0 || strcmp(f, "sr+") == 0) fl = O_RDWR;
+    else if (f[0] == 'w' || (f[0] == 'x' && f[1] == 'w')) fl = (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_TRUNC;
+    else if (f[0] == 'a' || (f[0] == 'x' && f[1] == 'a') || (f[0] == 's' && f[1] == 'a')) fl = (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_APPEND;
+    else return -EINVAL;
+    if (excl) fl |= O_EXCL;
+#ifdef O_CLOEXEC
+    fl |= O_CLOEXEC;
+#endif
+    int fd = open(path->data, fl, (mode_t)mode);
+    return fd < 0 ? -(int64_t)errno : fd;
+}
+XS_NOINLINE int64_t xs_fs_close_fd(int64_t fd) { return close((int)fd) != 0 ? -(int64_t)errno : 0; }
+XS_NOINLINE int64_t xs_fs_read_fd(int64_t fd, xs_Uint8Array *b, int64_t off, int64_t len, int64_t pos) {
+    if (len == 0) return 0;
+#ifdef _WIN32
+    ssize_t r;
+    if (pos >= 0) { off_t cur = lseek((int)fd, 0, SEEK_CUR); lseek((int)fd, (off_t)pos, SEEK_SET); r = read((int)fd, b->data + off, (size_t)len); lseek((int)fd, cur, SEEK_SET); }
+    else r = read((int)fd, b->data + off, (size_t)len);
+#else
+    ssize_t r = pos >= 0 ? pread((int)fd, b->data + off, (size_t)len, (off_t)pos) : read((int)fd, b->data + off, (size_t)len);
+#endif
+    return r < 0 ? -(int64_t)errno : (int64_t)r;
+}
+XS_NOINLINE int64_t xs_fs_write_fd(int64_t fd, xs_Uint8Array *b, int64_t off, int64_t len, int64_t pos) {
+    if (fd == 1) { xs_out_drain(); fflush(XS_OUT); } /* (what console.log printed comes first) */
+    if (fd == 2) fflush(stderr);
+#ifdef _WIN32
+    ssize_t r;
+    if (pos >= 0) { off_t cur = lseek((int)fd, 0, SEEK_CUR); lseek((int)fd, (off_t)pos, SEEK_SET); r = write((int)fd, b->data + off, (size_t)len); lseek((int)fd, cur, SEEK_SET); }
+    else r = write((int)fd, b->data + off, (size_t)len);
+#else
+    ssize_t r = pos >= 0 ? pwrite((int)fd, b->data + off, (size_t)len, (off_t)pos) : write((int)fd, b->data + off, (size_t)len);
+#endif
+    return r < 0 ? -(int64_t)errno : (int64_t)r;
+}
+
 /* execSync from node:child_process: runs the command through /bin/sh and returns its standard output */
 XS_NOINLINE xs_str *xs_exec_sync(xs_str *cmd) {
     fflush(stdout);
