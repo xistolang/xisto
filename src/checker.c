@@ -12078,6 +12078,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                 check_expr(e->args.items[0], ty_string);
                 if (e->args.items[0]->type->kind == TY_JSON) e->args.items[0]->type = ty_string; /* JSON text already */
                 expect_type(e->args.items[0], ty_string, "argument of JSON.parse");
+                if (!expected && e->builtin.cfn && !strcmp(e->builtin.cfn, "json_parse") && e->type) expected = e->type; /* (checked again:
+                    the copy an 'as' made, (o as Record<string, string>)["k"], keeps the type it was made for) */
                 if (!expected && tsc_checked()) expected = ty_any; /* TypeScript's JSON.parse gives any: the dynamic path */
                 if (!expected) xs_error(XS3003, e->pos, "write the type: const t: Todo = JSON.parse(text);", "JSON.parse needs to know the type it produces");
                 if (ty_is_any(expected)) { /* JSON.parse(text) as an any: Records, unknown[] and boxed values */
