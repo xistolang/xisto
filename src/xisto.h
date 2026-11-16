@@ -74,7 +74,10 @@ void xs_error_quiet(void); /* back to the recovery point without a message: the 
 bool xs_node_core_name(const char *spec);                  /* "path", "fs/promises": a Node module without "node:" */
 char *xs_tsconfig_resolve(const char *from_file, const char *spec); /* a tsconfig "paths" name: its file or folder, or NULL */
 extern bool xs_lex_skipping; /* xisto check: the parser is skipping a declaration that did not parse (no lexer errors there) */
-extern bool xs_check_mode; /* xisto check: report every error (no limit of 20) and keep going where possible */
+extern bool xs_check_mode; /* xisto check: report every error (no limit) as one JSON object each */
+extern bool xs_keep_going; /* build and check (XB-113): an error costs its declaration or import, and checking goes on */
+extern int xs_max_errors;  /* a build stops after this many errors (--max-errors N; 0: no limit) */
+void xs_error_summary(void); /* the closing line of a build with errors: the total, by code and by file */
 extern int xs_quiet_count;   /* follow-on errors kept quiet (a use of a declaration that failed) */
 void xs_error_continue(DiagCode code, Pos pos, const char *help, const char *fmt, ...); /* report, count, go on */
 void xs_warn(Pos pos, const char *help, const char *fmt, ...);
@@ -83,7 +86,7 @@ void xs_note_dynamic_record(Pos pos); /* an object made as any (a Record): XS200
 void xs_warn_rule(DiagCode code, Pos pos, const char *help, const char *fmt, ...); /* XB-118: compiles, with a warning */
 void xs_warn_rule_summary(void);
 extern bool xs_show_warnings, xs_deny_warnings;
-extern jmp_buf *xs_error_recover; /* when set, xs_error longjmps here instead of exiting (up to 20 errors) */
+extern jmp_buf *xs_error_recover; /* when set, xs_error longjmps here instead of exiting (up to xs_max_errors) */
 extern int xs_error_count;
 extern bool xs_diag_mute;   /* (XB-231: a promise version is checked without reporting) */
 extern int xs_muted_errors;
@@ -561,6 +564,7 @@ typedef struct {
     int access;        /* 0 public, 1 protected, 2 private */
     bool readonly;     /* assigned only in the constructor of its class */
     struct Class *owner; /* the class that declares it (inheritance copies fields down) */
+    bool static_block; /* (sfields) static { ... }: init is the call of the static method that holds the block */
 } Field;
 
 struct Class {

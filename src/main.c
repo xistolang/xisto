@@ -163,6 +163,7 @@ static void usage(void) {
             "  --debug        a debuggable binary: -O0 -g, statement hooks and the debugger agent (never in release)\n"
             "  --json         report each error and warning as one JSON object per line on stderr (editors, AI agents)\n"
             "  --no-warnings  do not report unused variables and functions\n"
+            "  --max-errors N report at most N errors, then stop (default 100; 0: every error)\n"
             "  --warnings     list each rule warning (undefined read as null, int mixed with number...); a build prints their count\n"
             "  --deny-warnings  rule warnings are errors (CI); also for xisto check\n"
             "  --profile      count calls and time per function; the table goes to stderr at exit (C backend)\n"
@@ -1202,6 +1203,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--profile") == 0) xs_profile = true;
         else if (strcmp(argv[i], "--time") == 0) show_time = true;
         else if (strcmp(argv[i], "--no-warnings") == 0) xs_warnings = false;
+        else if (strcmp(argv[i], "--max-errors") == 0 && i + 1 < argc) xs_max_errors = atoi(argv[++i]);
+        else if (strncmp(argv[i], "--max-errors=", 13) == 0) xs_max_errors = atoi(argv[i] + 13);
         else if (strcmp(argv[i], "--split-init") == 0) setenv("XISTO_MOD_INIT_MIN", "0", 1); /* each imported module's top level in its own C function, however small the program (XB-176) */
         else if (strcmp(argv[i], "--warnings") == 0) xs_show_warnings = true;
         else if (strcmp(argv[i], "--deny-warnings") == 0) xs_deny_warnings = true;

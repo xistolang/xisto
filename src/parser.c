@@ -3856,6 +3856,40 @@ static void parse_fields_body(Parser *p, Class *c) {
         int mods = skip_modifiers(p);
         if ((mods & MOD_ABSTRACT) && !c->is_abstract) xs_error(XS8080, pos, "write abstract class Name", "an abstract member needs an abstract class");
         if ((mods & MOD_STATIC) && c->is_interface) xs_error(XS8109, pos, NULL, "interfaces have no static members");
+        if ((mods & MOD_STATIC) && !c->is_interface && at(p, TK_LBRACE)) {
+            /* static { ... }: a static method with `this` as the class, called where the class is declared, in order
+               with the static field initializers (add_statics) */
+            if (decos.len) xs_error(XS1008, pos, NULL, "a static block takes no decorators");
+            Func *f = xs_alloc(sizeof *f);
+            f->pos = pos;
+            f->name = xs_sprintf("__static_block%d", c->nsfields);
+            f->ret = ty_void;
+            const char *was = p->this_alias;
+            bool used_was = this_alias_used;
+            p->this_alias = c->name;
+            bool saved_gen = p->in_gen;
+            p->in_gen = false;
+            f->body = parse_block(p);
+            p->in_gen = saved_gen;
+            p->this_alias = was;
+            this_alias_used = used_was;
+            c->smethods = realloc(c->smethods, sizeof(Func *) * (size_t)(c->nsmethods + 1));
+            c->smethods[c->nsmethods++] = f;
+            Field fd = {0};
+            fd.name = f->name;
+            fd.pos = pos;
+            fd.owner = c;
+            fd.static_block = true;
+            Expr *call = new_expr(E_CALL, pos);
+            call->lhs = ident_expr(pos, xs_sprintf("%s__s_%s", c->name, f->name)); /* (the name add_statics gives it) */
+            fd.init = call;
+            c->sfields = realloc(c->sfields, sizeof(Field) * (size_t)(c->nsfields + 1));
+            c->sfield_ro = realloc(c->sfield_ro, sizeof(bool) * (size_t)(c->nsfields + 1));
+            c->sfield_ro[c->nsfields] = false;
+            c->sfields[c->nsfields++] = fd;
+            accept(p, TK_SEMI);
+            continue;
+        }
         bool is_async = at(p, TK_ASYNC) && !peek_is(p, TK_QUESTION) && !peek_is(p, TK_COLON) && !peek_is(p, TK_SEMI) &&
                         !peek_is(p, TK_ASSIGN) && accept(p, TK_ASYNC); /* (async?: boolean: a field named async) */
         bool gen_method = !c->is_interface && accept(p, TK_STAR); /* *values(): a generator method */
@@ -4235,6 +4269,17 @@ static void add_statics(Program *prog, Module *m, Class *c) {
     c->static_is_method = xs_alloc(sizeof(bool) * (size_t)n);
     for (int i = 0; i < c->nsfields; i++) {
         Field *fd = &c->sfields[i];
+        if (fd->static_block) { /* static { ... }: its method called here */
+            Stmt *st = new_stmt(S_EXPR, fd->pos);
+            st->expr = fd->init;
+            st->mod = m;
+            stmt_list_push(&prog->top, st);
+            int k = c->nstatics_user++; /* (a slot no member name matches: static_names keeps the fields' order) */
+            c->static_names[k] = "";
+            c->static_gen[k] = "";
+            c->static_is_method[k] = false;
+            continue;
+        }
         Stmt *st = new_stmt(S_VAR, fd->pos);
         st->name = xs_sprintf("%s__s_%s", c->name, fd->name);
         st->decl_type = fd->type;
@@ -5361,6 +5406,18 @@ static void note_failed_decl(const char *src, int line) {
     }
 }
 
+/* the declarations a failed one took with it: each line from `from` to `to` (exclusive) that starts at column 1 */
+static void note_failed_lines(const char *src, int from, int to) {
+    const char *s = src;
+    int l = 1;
+    for (; *s && l < from; s++) if (*s == '\n') l++;
+    for (; *s && l < to; l++) {
+        if (*s != ' ' && *s != '\t' && *s != '\n' && *s != '}' && *s != ')' && *s != ']') note_failed_decl(src, l);
+        while (*s && *s != '\n') s++;
+        if (*s) s++;
+    }
+}
+
 /* a token that can start a top-level declaration (xisto check resumes there after an error, at column 1) */
 static bool at_top_start(Parser *p) {
     switch (p->tok.kind) {
@@ -5414,7 +5471,7 @@ static bool reexport_ahead(Parser *p) {
 static void load_import(Program *prog, Module *m, Import *im) {
     Program *pp = parsing_prog;
     Module *pm = parsing_mod;
-    if (xs_check_mode) {
+    if (xs_keep_going) {
         jmp_buf *saved = xs_error_recover;
         jmp_buf ib;
         xs_error_recover = &ib;
@@ -5515,7 +5572,16 @@ static void fix_import_names(Parser *p, Module *m, int i0) {
                 continue;
             }
             bool renamed = false; /* import { b as c }: c already reads as b, now as o */
-            for (int q = 0; q < p->nalias; q++) if (strcmp(p->alias_to[q], n) == 0) { p->alias_to[q] = (char *)o; renamed = true; }
+            size_t nn = strlen(n);
+            for (int q = 0; q < p->nalias; q++) {
+                if (strcmp(p->alias_to[q], n) == 0) { p->alias_to[q] = (char *)o; renamed = true; }
+                else if (!strncmp(p->alias_to[q], n, nn) && p->alias_to[q][nn] == '\x01' && ni.path && !strcmp(p->alias_to[q] + nn + 1, ni.path)) {
+                    /* (import { b as c } qualified as "b\x01m" next to another b, XB-117: now "o\x01m", the name
+                       this import gives, as its module declares it: a local b read as b__local there, XB-194) */
+                    p->alias_to[q] = xs_sprintf("%s\x01%s", o, ni.path);
+                    renamed = true;
+                }
+            }
             if (!renamed) add_alias(p, n, o);
             if (declares_top(p, o)) add_alias(p, o, xs_sprintf("%s__local", o));
         }
@@ -5659,7 +5725,7 @@ static void parse_module(Program *prog, Module *m) {
     jmp_buf prb;
     volatile int recoveries = 0;
     volatile int last_line = -1, last_col = -1;
-    if (xs_check_mode) { /* xisto check: an import that does not parse costs that import, not the file */
+    if (xs_keep_going) { /* an import that does not parse costs that import, not the file */
         xs_error_recover = &prb;
         if (_setjmp(prb) != 0) {
             xs_file_name = m->file;
@@ -5675,7 +5741,7 @@ static void parse_module(Program *prog, Module *m) {
     }
     for (int i = 0; i < m->nimports; i++) {
         Import *im = &m->imports[i];
-        if (xs_check_mode) { /* a module or package that cannot be loaded: reported, and checking goes on without it */
+        if (xs_keep_going) { /* a module or package that cannot be loaded: reported, and checking goes on without it */
             jmp_buf ib;
             xs_error_recover = &ib;
             if (_setjmp(ib) == 0) im->from = load_module(prog, im->path, im->pos, m->path);
@@ -5690,7 +5756,7 @@ static void parse_module(Program *prog, Module *m) {
     parsing_mod = m;
     int top_start = prog->top.len;
     volatile int decl_line = 0;
-    if (xs_check_mode) if (_setjmp(prb) != 0) { /* a declaration that does not parse: on to the next line that starts one */
+    if (xs_keep_going) if (_setjmp(prb) != 0) { /* a declaration that does not parse: on to the next line that starts one */
         xs_file_name = m->file;
         xs_source = m->src;
         if (decl_line) note_failed_decl(m->src, decl_line); /* its name: uses of it were reported with it */
@@ -5709,6 +5775,8 @@ static void parse_module(Program *prog, Module *m) {
         /* the next line that starts at column 1 and does not close a block: a declaration or a top-level statement */
         while (!at(&p, TK_EOF) && !(p.tok.pos.col == 1 && !at(&p, TK_RBRACE) && !at(&p, TK_RPAREN) && !at(&p, TK_RBRACKET))) next(&p);
         xs_lex_skipping = false;
+        if (decl_line) note_failed_lines(m->src, decl_line + 1, at(&p, TK_EOF) ? INT_MAX : p.tok.pos.line); /* (the
+            declarations read or skipped with the failed one: their uses are quiet too) */
     }
     while (!at(&p, TK_EOF)) {
         decl_line = p.tok.pos.line;
@@ -5791,7 +5859,7 @@ static void parse_module(Program *prog, Module *m) {
             } else if (at(&p, TK_IMPORT)) parse_import(&p, m); else parse_require(&p, m);
             for (int i = n0; i < m->nimports; i++) {
                 Import *im = &m->imports[i];
-                if (xs_check_mode) {
+                if (xs_keep_going) {
                     jmp_buf ib;
                     jmp_buf *saved = xs_error_recover;
                     xs_error_recover = &ib;
@@ -5911,7 +5979,7 @@ static void parse_module(Program *prog, Module *m) {
             drain_pending(&p, &prog->top, m, exported);
         }
     }
-    if (xs_check_mode) xs_error_recover = outer_recover;
+    if (xs_keep_going) xs_error_recover = outer_recover;
     apply_local_exports(prog, m, top_start);
     reflect_module(prog, m, top_start, &p);
 }

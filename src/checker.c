@@ -13,8 +13,9 @@ static int nmissing_names;
 extern const char **xs_failed_decls;
 extern int xs_nfailed_decls;
 static bool missing_name(const char *name) {
-    if (!xs_check_mode) return false;
-    if (strncmp(name, "__", 2) == 0) return true; /* a name the compiler made (a decorator's value...): its cause was reported */
+    if (!xs_keep_going) return false;
+    if (strncmp(name, "__", 2) == 0 && xs_error_count) return true; /* a name the compiler made (a decorator's value...): its
+                                                                        cause was reported (none reported: this one is shown, XB-174) */
     for (int i = 0; i < nmissing_names; i++) if (strcmp(missing_names[i], name) == 0) return true;
     for (int i = 0; i < xs_nfailed_decls; i++) if (strcmp(xs_failed_decls[i], name) == 0) return true;
     return false;
@@ -18166,15 +18167,15 @@ static void check_field_init(Class *c) {
 /* Each declaration is checked under a recovery point: an error is reported, the checker state is put
    back, and checking goes on with the next declaration, so one run reports every independent error. */
 #define RECOVER_BEGIN { \
-    jmp_buf rb_; Scope *sc_ = scope; Func *cf_ = cur_func; Class *cc_ = cur_class; Module *cm_ = cur_mod; \
-    int ld_ = loop_depth, sd_ = switch_depth, fd_ = finally_depth; failed_ = false; \
+    jmp_buf rb_; jmp_buf *outer_ = xs_error_recover; Scope *sc_ = scope; Func *cf_ = cur_func; Class *cc_ = cur_class; \
+    Module *cm_ = cur_mod; int ld_ = loop_depth, sd_ = switch_depth, fd_ = finally_depth; failed_ = false; \
     xs_error_recover = &rb_; \
     if (_setjmp(rb_) == 0) {
 #define RECOVER_END } else { \
         failed_ = true; scope = sc_; cur_func = cf_; cur_class = cc_; loop_depth = ld_; switch_depth = sd_; finally_depth = fd_; mapnull_ok = 0; \
         if (cm_) enter_module(cm_); \
     } \
-    xs_error_recover = NULL; }
+    xs_error_recover = outer_; } /* (nested: the outer recovery point again) */
 
 
 /* the return type of f, inferred now when it was left out and f's body is not checked yet: f is checked here, in
@@ -18915,6 +18916,36 @@ static void sig_failed(Func *f) {
     f->ret_infer = 3;
     f->sig_failed = true;
 }
+/* class C extends B: B found (an instance for B<A>), C linked under it (check_program, bases first) */
+static void link_base(Class *c) {
+    Class *b = find_class(c->base_name);
+    if (b && b->alias) b = alias_base(b, c->base_pos); /* (implements XContract = Contract<In, Out>: that instance) */
+    if (!b) {
+        int n; const char **cands = class_names(&n);
+        if (missing_name(c->base_name)) xs_error_quiet();
+        xs_error(XS9031, c->base_pos, xs_help_suggest(c->base_name, cands, n, NULL), "unknown class '%s'", c->base_name);
+    }
+    if (c->nbase_targs && !c->ntparams) { /* class X extends Base<A>: the instance Base<A> is the base */
+        if (b->ntparams != c->nbase_targs)
+            xs_error(XS8063, c->base_pos, NULL, "'%s' takes %d type argument(s), got %d", b->name, b->ntparams, c->nbase_targs);
+        Type **args = xs_alloc(sizeof(Type *) * (size_t)c->nbase_targs);
+        for (int k = 0; k < c->nbase_targs; k++) args[k] = resolve(c->base_targs[k], c->base_pos);
+        if (xs_keep_going) { /* an instance naming what could not be loaded costs this base only */
+            Class *tb = b;
+            b = NULL;
+            RECOVER_BEGIN b = instantiate_class(tb, args, c->base_pos); RECOVER_END
+            enter_module(c->mod);
+            if (!b) { c->base_name = NULL; return; }
+        } else b = instantiate_class(b, args, c->base_pos);
+        enter_module(c->mod);
+    } else if (c->nbase_targs) xs_error(XS6022, c->base_pos, NULL, "a generic class extending a generic class is not supported yet");
+    if (b->is_interface) xs_error(XS9004, c->base_pos, xs_sprintf("class %s implements %s", c->name, b->name), "'%s' is an interface; a class extends classes", b->name);
+    if (b->builtin && strcmp(b->name, "Error") == 0) { error_class(c); return; }
+    if (b->builtin) xs_error(XS6024, c->base_pos, "wrap it in a field instead", "extending the built-in class %s is not supported", b->name);
+    c->base = b;
+    b->subs = realloc(b->subs, sizeof(Class *) * (size_t)(b->nsubs + 1));
+    b->subs[b->nsubs++] = c;
+}
 void check_program(Program *p) {
     prog = p;
     init_builtins();
@@ -19009,7 +19040,7 @@ void check_program(Program *p) {
                 }
                 if (!found) {
                     enter_module(m);
-                    if (xs_check_mode) { /* xisto check: reported, and checking goes on (its uses are quiet, as a missing module's) */
+                    if (xs_keep_going) { /* reported, and checking goes on (its uses are quiet, as a missing module's) */
                         xs_error_continue(XS9012, im->positions[k], xs_sprintf("add 'export' in front of its declaration in %s", im->from->file), "'%s' is not exported by '%s'", name, im->path);
                         missing_names = realloc(missing_names, sizeof(char *) * (size_t)(nmissing_names + 1));
                         missing_names[nmissing_names++] = (char *)name;
@@ -19024,7 +19055,7 @@ void check_program(Program *p) {
         if (p->funcs[i]->mod->builtin) continue;
         enter_module(p->funcs[i]->mod);
         if (p->funcs[i]->ntparams) continue; /* a template resolves per instance */
-        if (!xs_check_mode) { resolve_signature(p->funcs[i]); continue; }
+        if (!xs_keep_going) { resolve_signature(p->funcs[i]); continue; }
         RECOVER_BEGIN resolve_signature(p->funcs[i]); RECOVER_END /* xisto check: a type of a module that is not there (reported) costs this function */
         if (failed_) sig_failed(p->funcs[i]);
     }
@@ -19042,7 +19073,7 @@ void check_program(Program *p) {
             if (b && b->iface_methods && !b->ntparams) { c->base_name = c->iface_bases[0]; c->base_pos = c->pos; c->niface_bases = 0; }
         }
         if (c->ntparams || c->niface_bases) { /* (fields: the base's, which the implementation declares again) */
-            if (xs_check_mode) { /* xisto check: reported, and the rest of the program is still checked */
+            if (xs_keep_going) { /* reported, and the rest of the program is still checked */
                 xs_error_continue(XS8113, c->pos, "keep the methods in an interface of their own (or use an abstract class)",
                                   "interface '%s' has methods and %s", c->name, c->ntparams ? "type parameters" : c->nfields ? "fields" : "bases");
                 continue;
@@ -19069,35 +19100,11 @@ void check_program(Program *p) {
         Class *c = p->classes[i];
         enter_module(c->mod);
         if (c->mixin) apply_mixin(c);
-        if (c->base_name) {
-            Class *b = find_class(c->base_name);
-            if (b && b->alias) b = alias_base(b, c->base_pos); /* (implements XContract = Contract<In, Out>: that instance) */
-            if (!b) {
-                int n; const char **cands = class_names(&n);
-                if (missing_name(c->base_name)) xs_error_quiet();
-                xs_error(XS9031, c->base_pos, xs_help_suggest(c->base_name, cands, n, NULL), "unknown class '%s'", c->base_name);
-            }
-            if (c->nbase_targs && !c->ntparams) { /* class X extends Base<A>: the instance Base<A> is the base */
-                if (b->ntparams != c->nbase_targs)
-                    xs_error(XS8063, c->base_pos, NULL, "'%s' takes %d type argument(s), got %d", b->name, b->ntparams, c->nbase_targs);
-                Type **args = xs_alloc(sizeof(Type *) * (size_t)c->nbase_targs);
-                for (int k = 0; k < c->nbase_targs; k++) args[k] = resolve(c->base_targs[k], c->base_pos);
-                if (xs_check_mode) { /* xisto check: an instance naming what could not be loaded costs this base only */
-                    Class *tb = b;
-                    b = NULL;
-                    RECOVER_BEGIN b = instantiate_class(tb, args, c->base_pos); RECOVER_END
-                    enter_module(c->mod);
-                    if (!b) { c->base_name = NULL; continue; }
-                } else b = instantiate_class(b, args, c->base_pos);
-                enter_module(c->mod);
-            } else if (c->nbase_targs) xs_error(XS6022, c->base_pos, NULL, "a generic class extending a generic class is not supported yet");
-            if (b->is_interface) xs_error(XS9004, c->base_pos, xs_sprintf("class %s implements %s", c->name, b->name), "'%s' is an interface; a class extends classes", b->name);
-            if (b->builtin && strcmp(b->name, "Error") == 0) { error_class(c); continue; }
-            if (b->builtin) xs_error(XS6024, c->base_pos, "wrap it in a field instead", "extending the built-in class %s is not supported", b->name);
-            c->base = b;
-            b->subs = realloc(b->subs, sizeof(Class *) * (size_t)(b->nsubs + 1));
-            b->subs[b->nsubs++] = c;
-        }
+        if (!c->base_name) continue;
+        if (!xs_keep_going) { link_base(c); continue; }
+        RECOVER_BEGIN link_base(c); RECOVER_END /* (a base that cannot be linked: reported, the class has none) */
+        enter_module(c->mod);
+        if (failed_ && !c->base) c->base_name = NULL;
     }
     for (int i = 0; i < p->nclasses; i++) flatten_fields(p->classes[i], 0);
     for (int i = 0; i < p->nclasses; i++) {
@@ -19111,7 +19118,7 @@ void check_program(Program *p) {
             Field *fd = &c->fields[k];
             for (int j = 0; j < k; j++)
                 if (strcmp(fd->name, c->fields[j].name) == 0) xs_error(XS9023, fd->pos, NULL, "field '%s' is declared twice", fd->name);
-            if (!fd->type && xs_check_mode) { /* xisto check: a field whose value cannot type it reads as unknown */
+            if (!fd->type && xs_keep_going) { /* a field whose value cannot type it reads as unknown */
                 bool ok = false;
                 RECOVER_BEGIN infer_field_type(c, fd); ok = true; RECOVER_END
                 enter_module(c->mod);
@@ -19121,7 +19128,7 @@ void check_program(Program *p) {
             if (!fd->type) { fd->cname = field_cname(fd->name); continue; } /* (typed later, late_fields) */
             Module *fmod = fd->owner && fd->owner->mod ? fd->owner->mod : c->mod; /* an inherited field: its type reads where it is written */
             if (fmod != cur_mod) enter_module(fmod);
-            if (xs_check_mode) { /* xisto check: a field naming what could not be loaded reads as unknown */
+            if (xs_keep_going) { /* a field naming what could not be loaded reads as unknown */
                 Type *ft = fd->type;
                 bool ok = false;
                 RECOVER_BEGIN ft = resolve(ft, fd->pos); ok = true; RECOVER_END
@@ -19138,12 +19145,12 @@ void check_program(Program *p) {
                 if (strcmp(m->name, c->methods[j]->name) == 0) xs_error(XS9027, m->pos, NULL, "method '%s' is declared twice", m->name);
             if (find_field(c, m->name, NULL)) xs_error(XS9007, m->pos, NULL, "'%s' is both a field and a method of %s", m->name, c->name);
             if (!m->is_native) m->cname = xs_sprintf("m%d_%s_%s", c->mod->id, c->name, m->name);
-            if (!m->ntparams && xs_check_mode) { RECOVER_BEGIN resolve_signature(m); RECOVER_END enter_module(c->mod); cur_class = NULL; if (failed_) sig_failed(m); }
+            if (!m->ntparams && xs_keep_going) { RECOVER_BEGIN resolve_signature(m); RECOVER_END enter_module(c->mod); cur_class = NULL; if (failed_) sig_failed(m); }
             else if (!m->ntparams) resolve_signature(m);
         }
         if (c->ctor) {
             if (!c->ctor->is_native) c->ctor->cname = xs_sprintf("c%d_%s_new", c->mod->id, c->name);
-            if (xs_check_mode) {
+            if (xs_keep_going) {
                 RECOVER_BEGIN resolve_signature(c->ctor); RECOVER_END
                 enter_module(c->mod);
                 cur_class = NULL;
@@ -19153,7 +19160,7 @@ void check_program(Program *p) {
     }
     for (int i = 0; i < p->nclasses; i++) {
         enter_module(p->classes[i]->mod);
-        if (xs_check_mode) { RECOVER_BEGIN flatten_methods(p->classes[i]); RECOVER_END cur_class = NULL; } /* (xisto check: reported, on to the next) */
+        if (xs_keep_going) { RECOVER_BEGIN flatten_methods(p->classes[i]); RECOVER_END cur_class = NULL; } /* (reported, on to the next) */
         else flatten_methods(p->classes[i]);
     }
     /* fields typed by a value that calls a function or a method: now that every signature is known */
@@ -19279,7 +19286,7 @@ void check_program(Program *p) {
     xs_error_recover = NULL;
     xs_warn_rule_summary(); /* (one line: the rule warnings, XB-118) */
     if (xs_error_count) {
-        if (!xs_json_errors) fprintf(stderr, "xisto: %d error%s\n", xs_error_count, xs_error_count == 1 ? "" : "s");
+        xs_error_summary();
         exit(1);
     }
 }
