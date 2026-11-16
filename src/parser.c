@@ -184,6 +184,17 @@ static Token expect_prop_name(Parser *p, const char *help) {
 }
 
 static Import *ns_import_of(Parser *p, const char *alias);
+/* namespace N { ... } (TypeScript's namespaces, in a module): each name the body declares is a top-level name of
+   its own, N__ns_name (xs_src_name shows it as name); in the body the plain name reads as that (a token alias), and
+   N.name anywhere in the module (an expression, a type, new N.C()) reads it too */
+typedef struct { Module *m; const char *q, *name, *to; } LnsRec;
+static LnsRec *lns_recs;
+static int nlns_recs;
+static const char *lns_find(Parser *p, const char *q, const char *name) {
+    for (int i = nlns_recs - 1; i >= 0; i--)
+        if (lns_recs[i].m == p->mod && !strcmp(lns_recs[i].q, q) && !strcmp(lns_recs[i].name, name)) return lns_recs[i].to;
+    return NULL;
+}
 static Expr *parse_dyn_import(Parser *p, int *idx);
 static void ns_alias_push(Parser *p, const char *alias, int idx);
 static char *ns_name(Parser *p, Import *im, Token name);
@@ -1038,6 +1049,16 @@ static Type *parse_type(Parser *p) {
         nm.str = xs_sprintf("Intl_%s", k.str);
         t = named_type(p, nm);
     } else {
+        while (nlns_recs && at(p, TK_DOT) && peek_is_ident(p)) { /* N.Type, A.B.Type: a namespace's own (lns_find) */
+            Parser l_ = *p;
+            next(&l_);
+            const char *to = lns_find(p, name.str, l_.tok.str);
+            if (!to) break;
+            next(p);
+            name = p->tok;
+            name.str = (char *)to;
+            next(p);
+        }
         if (at(p, TK_DOT) && peek_is_ident(p) && p->mod) { /* Types.ObjectId (or ns.Type): the type Types's module exports as
                                                               ObjectId, imported from there with it */
             Import *im = ns_import_of(p, name.str);
@@ -2056,7 +2077,18 @@ static Expr *parse_primary(Parser *p) {
             Token k = expect(p, TK_IDENT, NULL);
             name.str = xs_sprintf("Intl_%s", k.str);
             wants_intl = true;
-        } else if (at(p, TK_DOT) && peek_is_ident(p) && p->mod) { /* new Types.ObjectId(x) (or new ns.C(x)): the class Types's
+        }
+        while (nlns_recs && at(p, TK_DOT) && peek_is_ident(p)) { /* new N.C(), new A.B.C(): a namespace's class */
+            Parser l_ = *p;
+            next(&l_);
+            const char *to = lns_find(p, name.str, l_.tok.str);
+            if (!to) break;
+            next(p);
+            name = p->tok;
+            name.str = (char *)to;
+            next(p);
+        }
+        if (at(p, TK_DOT) && peek_is_ident(p) && p->mod) { /* new Types.ObjectId(x) (or new ns.C(x)): the class Types's
                                                                      module exports as ObjectId, as Types.ObjectId in a type */
             Import *im = ns_import_of(p, name.str);
             bool isns = im != NULL;
@@ -2578,6 +2610,16 @@ static Expr *parse_rel(Parser *p) {
         next(p);
         Expr *c = new_expr(E_IDENT, p->tok.pos);
         c->str = expect(p, TK_IDENT, "write a class name: x instanceof Foo").str;
+        while (nlns_recs && at(p, TK_DOT) && peek_is_ident(p)) { /* x instanceof N.C: a namespace's class */
+            Parser l_ = *p;
+            next(&l_);
+            const char *to = lns_find(p, c->str, l_.tok.str);
+            if (!to) break;
+            next(p);
+            c->pos = p->tok.pos;
+            c->str = (char *)to;
+            next(p);
+        }
         Import *nsi = at(p, TK_DOT) && peek_is_ident(p) ? ns_import_of(p, c->str) : NULL;
         if (nsi) { /* x instanceof ns.C: the class C of ns's module */
             next(p);
@@ -5434,6 +5476,10 @@ static Import *ns_import_of(Parser *p, const char *alias) {
     return NULL;
 }
 static Expr *ns_member(Parser *p, Expr *e, Token name) {
+    if (e->kind == E_IDENT && nlns_recs) { /* N.name of a namespace N of this module */
+        const char *to = lns_find(p, e->str, name.str);
+        if (to) return ident_expr(name.pos, to);
+    }
     if (e->kind != E_IDENT || !p->nns || !p->mod) return NULL;
     Import *im = ns_import_of(p, e->str);
     if (!im) return NULL;
@@ -6437,6 +6483,85 @@ static void add_alias(Parser *p, const char *from, const char *to) {
     p->alias_to = t;
     p->nalias++;
 }
+/* the namespaces open around the module's top level (namespace A { namespace B { ... } }, namespace A.B { ... }) */
+typedef struct { int nalias, nundo, count; } LnsFrame;
+static LnsFrame *lns_frames;
+static int nlns_frames;
+typedef struct { int idx; char *to; } LnsUndo;
+static LnsUndo *lns_undo;
+static int nlns_undo;
+/* name reads as `to` in the namespace's body: a new alias, or the one already there (an outer namespace's name or
+   an import's) replaced until the body ends */
+static void lns_alias(Parser *p, const char *name, const char *to) {
+    for (int i = 0; i < p->nalias; i++)
+        if (!strcmp(p->alias_from[i], name)) {
+            lns_undo = realloc(lns_undo, sizeof(LnsUndo) * (size_t)(nlns_undo + 1));
+            lns_undo[nlns_undo++] = (LnsUndo){i, p->alias_to[i]};
+            p->alias_to[i] = (char *)to;
+            return;
+        }
+    add_alias(p, name, to);
+}
+static void lns_add(Parser *p, const char *q, const char *name) {
+    if (lns_find(p, q, name)) return;
+    lns_recs = realloc(lns_recs, sizeof(LnsRec) * (size_t)(nlns_recs + 1));
+    lns_recs[nlns_recs++] = (LnsRec){p->mod, q, name, xs_sprintf("%s__ns_%s", q, name)};
+}
+/* the names the body (p at its '{') declares at its own level */
+static void lns_scan(Parser *p, const char *q) {
+    Parser l = *p;
+    next(&l);
+    int depth = 1;
+    TokKind prev = TK_LBRACE;
+    while (depth > 0 && !at(&l, TK_EOF)) {
+        if (at(&l, TK_LBRACE)) depth++;
+        else if (at(&l, TK_RBRACE)) depth--;
+        else if (depth == 1 && prev != TK_DOT && prev != TK_QDOT) {
+            bool decl = at(&l, TK_CONST) || at(&l, TK_LET) || at(&l, TK_FUNCTION) || at(&l, TK_CLASS) || at(&l, TK_ENUM) ||
+                        at_ident(&l, "var") || at_ident(&l, "namespace") || at_ident(&l, "module") || at_ident(&l, "interface") ||
+                        at_ident(&l, "type");
+            if (decl) {
+                bool is_type = at_ident(&l, "type");
+                prev = l.tok.kind;
+                next(&l);
+                if (at(&l, TK_STAR)) next(&l); /* (function* g) */
+                if (at(&l, TK_IDENT) && (!is_type || peek_is(&l, TK_ASSIGN) || peek_is(&l, TK_LT)))
+                    lns_add(p, q, xs_strndup(l.tok.start, (size_t)l.tok.len));
+                continue;
+            }
+        }
+        prev = l.tok.kind;
+        next(&l);
+    }
+}
+/* namespace N { (p at N): opens N's body, or A.B's */
+static void lns_open(Parser *p) {
+    LnsFrame fr = {p->nalias, nlns_undo, 0};
+    const char *q = expect(p, TK_IDENT, NULL).str;
+    while (at(p, TK_DOT)) { /* namespace A.B: B a name of A */
+        next(p);
+        Token b = expect(p, TK_IDENT, NULL);
+        const char *bn = xs_strndup(b.start, (size_t)b.len);
+        lns_add(p, q, bn);
+        q = lns_find(p, q, bn);
+        fr.count++;
+    }
+    if (!at(p, TK_LBRACE)) xs_error(XS1008, p->tok.pos, "namespace N { ... }", "expected '{' after the namespace's name");
+    lns_scan(p, q);
+    for (int i = 0; i < nlns_recs; i++) /* (this body's names and those of N's other bodies: read by their plain names) */
+        if (lns_recs[i].m == p->mod && !strcmp(lns_recs[i].q, q)) lns_alias(p, lns_recs[i].name, lns_recs[i].to);
+    fr.count++;
+    lns_frames = realloc(lns_frames, sizeof(LnsFrame) * (size_t)(nlns_frames + 1));
+    lns_frames[nlns_frames++] = fr;
+    next(p); /* (the '{': the next token read with the body's names) */
+}
+/* the '}' that ends the innermost namespace body */
+static void lns_close(Parser *p) {
+    LnsFrame fr = lns_frames[--nlns_frames];
+    while (nlns_undo > fr.nundo) { nlns_undo--; p->alias_to[lns_undo[nlns_undo].idx] = lns_undo[nlns_undo].to; }
+    p->nalias = fr.nalias;
+    next(p);
+}
 static bool declares_top(Parser *p, const char *name);
 /* after the imports from i0 on are loaded: a name their module exports under another name (export { a as b },
    export default) is imported by its declared name, from the module that declares it (an import of its own), and
@@ -6844,14 +6969,30 @@ static void parse_module(Program *prog, Module *m) {
         if (decl_line) note_failed_lines(m->src, decl_line + 1, at(&p, TK_EOF) ? INT_MAX : p.tok.pos.line); /* (the
             declarations read or skipped with the failed one: their uses are quiet too) */
     }
+    int lns_base = nlns_frames;
     while (!at(&p, TK_EOF)) {
         decl_line = p.tok.pos.line;
+        if (nlns_frames > lns_base && at(&p, TK_RBRACE)) { lns_close(&p); continue; } /* (the end of a namespace's body) */
         if (reexport_ahead(&p)) { parse_reexport(&p, m, prog, true); continue; } /* (also after declarations) */
         DecoList decos = {0};
         parse_decorators(&p, &decos);
         bool exported = accept(&p, TK_EXPORT);
         bool is_default = exported && at(&p, TK_DEFAULT) && (next(&p), true);
         bool is_declare = at_ident(&p, "declare") && (next(&p), true);
+        if ((at_ident(&p, "namespace") || at_ident(&p, "module")) && ({ Parser l_ = p; next(&l_); at(&l_, TK_IDENT) || (is_declare && at(&l_, TK_STRING)); })) {
+            next(&p);
+            if (is_declare) { /* declare namespace N { ... }, declare module "m" { ... }: types only, nothing to compile */
+                next(&p);
+                while (accept(&p, TK_DOT)) next(&p);
+                int d = 0;
+                if (at(&p, TK_LBRACE)) do { if (at(&p, TK_LBRACE)) d++; else if (at(&p, TK_RBRACE)) d--; next(&p); } while (d > 0 && !at(&p, TK_EOF));
+                else accept(&p, TK_SEMI);
+                continue;
+            }
+            lns_open(&p);
+            continue;
+        }
+        if (nlns_frames > lns_base) exported = false; /* (export in a namespace: N.name, not the module's export) */
         if (is_declare && at_ident(&p, "global") && peek_is(&p, TK_LBRACE)) { /* declare global { ... }: TypeScript's own types, augmented */
             next(&p);
             int d = 0;

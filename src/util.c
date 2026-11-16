@@ -26,6 +26,8 @@ char *xs_strndup(const char *s, size_t n) {
    (XB-224), is still A to the running program (constructor.name, console.log) */
 const char *xs_src_name(const char *name) {
     size_t n = name ? strlen(name) : 0;
+    const char *ns = name ? strstr(name, "__ns_") : NULL; /* N__ns_name, a namespace's name (parser.c, lns_add): name */
+    if (ns) { while (strstr(ns + 5, "__ns_")) ns = strstr(ns + 5, "__ns_"); return xs_src_name(ns + 5); }
     return n > 7 && !strcmp(name + n - 7, "__local") ? xs_strndup(name, n - 7) : name;
 }
 

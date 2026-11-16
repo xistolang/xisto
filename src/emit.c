@@ -3318,7 +3318,7 @@ static const char *fn_src_name(Func *f) {
     if (!n) return NULL;
     const char *st = strstr(n, "__s_");
     if (st) n = st + 4;
-    return n;
+    return xs_src_name(n); /* (a namespace's N__ns_f: f) */
 }
 static void emit_expr_(Expr *e);
 /* a boolean that is cheap to compute and cannot fail or have an effect: comparisons, !, && and || of

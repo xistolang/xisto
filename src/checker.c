@@ -4368,6 +4368,7 @@ static bool fn_member(Expr *e, Type *expected) {
         if (x->kind == E_FUNC_REF && x->func) nm = x->func->name;
         else if (x->kind == E_IDENT && x->func && x->func->name && strcmp(x->func->name, "arrow")) nm = x->func->name;
         if (!nm) return false;
+        nm = xs_src_name(nm); /* (a namespace's N__ns_f: f) */
         if (!strncmp(nm, "__get_", 6)) nm += 6;
         Pos pos = e->pos;
         memset(e, 0, sizeof *e);
@@ -13649,7 +13650,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                     if (strcmp(c->statics[i]->name, e->str) == 0) m = c->statics[i];
                 if (!m && !e->is_call && strcmp(e->str, "name") == 0) { /* MyService.name: the class's name, as a string */
                     e->kind = E_STRING;
-                    e->str = c->name;
+                    e->str = (char *)xs_src_name(c->name);
                     e->lhs = NULL;
                     check_expr(e, expected);
                     return;
