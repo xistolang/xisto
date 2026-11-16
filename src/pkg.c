@@ -738,7 +738,8 @@ int xs_cmd_init(int argc, char **argv) {
     Buf meta = {0};
     buf_puts(&meta, "{\n  \"name\": ");
     js_put(&meta, name);
-    buf_puts(&meta, ",\n  \"main\": \"src/main.ts\",\n  \"dependencies\": {}\n}\n");
+    /* (JSON.stringify leaves nulls out in a new project: what services usually want; xisto.json says it, and the build warns) */
+    buf_puts(&meta, ",\n  \"main\": \"src/main.ts\",\n  \"json\": { \"omitNull\": true },\n  \"dependencies\": {}\n}\n");
     Buf ign = {0};
     buf_puts(&ign, "# the build cache and the installed packages (`xisto install` restores them from xisto.lock)\n.xisto/\n");
     buf_printf(&ign, "# the executable `xisto build` makes\n/%s\n/%s.exe\n", plain ? name : "main", plain ? name : "main");

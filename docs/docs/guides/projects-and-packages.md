@@ -12,7 +12,8 @@ xisto init hello      # or `xisto init` in the current folder
 
 `xisto init [DIR]` creates three files (an existing one is left as it is):
 
-- `xisto.json`: the project's `name`, its `main` (`src/main.ts`) and its `dependencies` (empty).
+- `xisto.json`: the project's `name`, its `main` (`src/main.ts`), `"json": { "omitNull": true }` (`JSON.stringify`
+  leaves `null` members out; [JSON and nulls](./node-compatibility.md#json-and-nulls)) and its `dependencies` (empty).
 - `src/main.ts`: a hello world, the program's entry.
 - `.gitignore`: ignores `.xisto/` (the build cache and the installed packages) and the executable `xisto build`
   makes.

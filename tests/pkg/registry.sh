@@ -50,6 +50,7 @@ export XISTO_REGISTRY="$W/reg"
 cd "$W" && "$X" init app > init.txt
 check "init creates xisto.json, src/main.ts and .gitignore" test -f app/xisto.json -a -f app/src/main.ts -a -f app/.gitignore
 check "init's xisto.json names the project and its main" grep -q '"main": "src/main.ts"' app/xisto.json
+check "init's xisto.json leaves nulls out of JSON" grep -q '"json": { "omitNull": true }' app/xisto.json
 check "init's .gitignore ignores .xisto/ and the executable" sh -c "grep -qx '.xisto/' app/.gitignore && grep -qx '/app' app/.gitignore"
 check "init prints the next steps" grep -q "xisto add <package>" init.txt
 "$X" init app > init2.txt
