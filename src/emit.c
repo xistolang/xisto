@@ -722,13 +722,19 @@ static bool expr_has_try(Expr *e) {
     for (int i = 0; i < e->args.len; i++) if (expr_has_try(e->args.items[i])) return true;
     return false;
 }
+/* a try in what is compiled: the functions, classes and methods reachable from main (prune.c), as emitted below,
+   so a try in an imported module's unused function costs nothing (XB-250) */
 static bool program_has_try(Program *p) {
     for (int i = 0; i < p->top.len; i++) if (stmt_has_try_deep(p->top.items[i])) return true;
-    for (int i = 0; i < p->nfuncs; i++) if (p->funcs[i]->body && stmt_has_try_deep(p->funcs[i]->body)) return true;
+    for (int i = 0; i < p->nfuncs; i++) {
+        Func *f = p->funcs[i];
+        if (f->used && !f->mod->builtin && !f->is_native && f->body && stmt_has_try_deep(f->body)) return true;
+    }
     for (int i = 0; i < p->nclasses; i++) {
         Class *c = p->classes[i];
+        if (!c->used || c->builtin) continue;
         if (c->ctor && stmt_has_try_deep(c->ctor->body)) return true;
-        for (int k = 0; k < c->nmethods; k++) if (c->methods[k]->body && stmt_has_try_deep(c->methods[k]->body)) return true;
+        for (int k = 0; k < c->nmethods; k++) if (c->methods[k]->used && c->methods[k]->body && stmt_has_try_deep(c->methods[k]->body)) return true;
         for (int f = 0; f < c->nfields; f++) if (expr_has_try(c->fields[f].init)) return true;
     }
     return false;

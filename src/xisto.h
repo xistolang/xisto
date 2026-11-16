@@ -745,6 +745,11 @@ typedef struct {
     struct Func **tls_fns; /* XB-232: functions with a fetch that may be https (checker); TLS joins when prune finds one of
                               them reachable (a method: and an object of its class made) */
     int ntls_fns;
+    struct Func **net_fns; /* XB-250: functions whose code needs the event loop/network runtime (checker); uses_net joins
+                              when prune finds one of them reachable */
+    int nnet_fns;
+    struct Func **gen_fns; /* XB-250: likewise for the coroutines (generators, promises): uses_gen */
+    int ngen_fns;
     bool uses_crypto;  /* node:crypto, or a native package that needs it */
     bool uses_zlib;    /* node:zlib: runtime/xisto_zlib.h joins the program, zlib (build/libxszlib.a) is linked */
     char **native_files; /* C sources of native packages (xisto.json "native"), compiled with the program */

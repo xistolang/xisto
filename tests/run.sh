@@ -256,5 +256,12 @@ for backend in "" "--backend=qbe"; do
         pass=$((pass+1)); echo "size budget ok ($backend): $a vs $b bytes"
     fi
 done
+# runtime budget (XB-250): Date, bytes, bigint and an imported module's unused timers/fetch/async/try cost no event loop
+if $XISTO emit tests/ok/rt-lean.ts > "$OUT/rt-lean.c" 2>&1 && ! grep -q 'Xisto network runtime' "$OUT/rt-lean.c" \
+   && ! grep -q '^#define XS_THREADS' "$OUT/rt-lean.c" && ! sed -n '/^\/\* ---- program ---- \*\//,$p' "$OUT/rt-lean.c" | grep -q 'xs_cln_'; then
+    pass=$((pass+1))
+else
+    echo "FAIL runtime budget: tests/ok/rt-lean.ts pulls in the network runtime, threads or the cleanup stack"; fail=$((fail+1))
+fi
 echo "tests: $pass passed, $fail failed ($qbe programs also verified through the qbe backend)"
 [ "$fail" -eq 0 ]
