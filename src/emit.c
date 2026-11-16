@@ -1826,6 +1826,7 @@ static const char *where_elem(int i) { return xs_sprintf("[%d]", i); }
    the value's type at run time: a string, a boxed number or boolean, an array, or an object of one of the
    program's classes (each class JSON can write gets its json_put_ function then) */
 static bool json_unknown_used;
+extern bool xs_json_ext_used; /* (checker.c) */
 static void json_emit_value(Buf *b, Type *t, const char *expr) { /* appends into xs_sb *sb */
     switch (t->kind) {
     case TY_NUMBER: buf_printf(b, "xs_sb_num(sb, %s);", expr); break;
@@ -2210,6 +2211,23 @@ static void emit_member(Expr *e) {
             buf_puts(out, " xs_sb_finish(sb); })");
             return;
         }
+        if (strcmp(fn, "json_stringify_ext") == 0) { /* JSON.stringify(value, replacer, space): the value's text, rewritten */
+            Expr *a = e->args.items[0], *r = e->args.items[1], *s = e->args.len > 2 ? e->args.items[2] : NULL;
+            json_unknown_used = true;
+            buf_printf(out, "({ xs_sb sb_ = {0}; xs_sb *sb = &sb_; %s ja_ = ", ctype(a->type));
+            emit_borrowed(a);
+            buf_puts(out, "; ");
+            json_emit_value(out, a->type, "ja_");
+            buf_puts(out, " xs_json_ext(xs_sb_finish(sb), ");
+            if (r->type->kind == TY_ARRAY) { buf_puts(out, "(xs_arr_ref *)("); emit_borrowed(r); buf_puts(out, "), NULL, "); }
+            else if (r->type->kind == TY_FUNC) { buf_puts(out, "NULL, (void *)("); emit_borrowed(r); buf_puts(out, "), "); }
+            else { if (r->kind != E_NULL) { buf_puts(out, "((void)("); emit_expr(r); buf_puts(out, "), NULL), NULL, "); } else buf_puts(out, "NULL, NULL, "); }
+            if (s && s->type->kind == TY_STRING) { buf_puts(out, "0, "); emit_borrowed(s); }
+            else if (s && s->type->kind != TY_NULL) { buf_puts(out, "(double)("); emit_expr(s); buf_puts(out, "), NULL"); }
+            else buf_puts(out, "0, NULL");
+            buf_puts(out, ", xs_json_unknown); })");
+            return;
+        }
         if (strcmp(fn, "json_parse") == 0) {
             /* a generated function, not inlined: whatever fails while parsing returns to one labelled call */
             static int nparse;
@@ -2265,6 +2283,7 @@ static void emit_member(Expr *e) {
         buf_puts(out, "xs_out_drain(); "); /* (XB-091: stdout written behind goes out first) */
         bool to_err = strcmp(e->str, "error") == 0 || strcmp(e->str, "warn") == 0; /* (as Node: error, warn -> stderr) */
         if (to_err) buf_puts(out, "fflush(stdout); FILE *pf_ = xs_out_f; xs_out_f = stderr; ");
+        if (prog->uses_console_group) buf_puts(out, "xs_grp_begin(); "); /* (inside a console.group: the line is indented) */
         for (int i = 0; i < e->args.len; i++) {
             Expr *a = e->args.items[i];
             if (i) buf_puts(out, "xs_print_sep(); ");
@@ -2275,7 +2294,9 @@ static void emit_member(Expr *e) {
             emit_print_arg(&tmpv);
             buf_puts(out, "; ");
         }
-        buf_puts(out, to_err ? "xs_print_nl(); xs_out_f = pf_; })" : "xs_print_nl(); })");
+        if (prog->uses_console_group) buf_puts(out, "xs_print_nl(); xs_grp_end(); ");
+        else buf_puts(out, "xs_print_nl(); ");
+        buf_puts(out, to_err ? "xs_out_f = pf_; })" : "})");
         return;
     }
     if (base->kind == E_IDENT && !base->cname && e->cls && e->cls->builtin && e->func && e->field < 0 && e->builtin.cfn && !e->builtin.self_first) {
@@ -3630,6 +3651,21 @@ static void emit_expr_raw(Expr *e) {
                 buf_printf(out, "static void *%s_origin(void *p) { (void)p; return (void *)(%s); }\n", f->cname, ob.data ? ob.data : "NULL");
                 origin_fn = xs_sprintf("%s_origin", f->cname);
             }
+        }
+        if (a->mv_method && !strcmp(origin_fn, "NULL")) {
+            /* o.m as a value: its origin is one immortal function per method, so o.m === o.m and o.m === p.m (one
+               function of the class in JavaScript), and emitter.off(e, this.onX) finds what on(e, this.onX) added */
+            Func *m = a->mv_method;
+            bool have = false;
+            for (int i = 0; i < ntramps; i++) if (strcmp(tramp_names[i], xs_sprintf("%s_mvo", m->cname)) == 0) have = true;
+            if (!have) {
+                tramp_names = realloc(tramp_names, sizeof(char *) * (size_t)(ntramps + 1));
+                tramp_names[ntramps++] = xs_sprintf("%s_mvo", m->cname);
+                buf_printf(&tramp_fns, "static xs_closure %s_mvo = {{XS_IMMORTAL, 0}, NULL};\n", m->cname);
+                buf_printf(&tramp_fns, "static const xs_type XS_TYPE_SEC %s_mvotype = {NULL, xs_print_closure%s};\n", m->cname, fn_label(m, m->name));
+            }
+            buf_printf(out, "static void *%s_origin(void *p) { (void)p; return xs_cl_static_t(&%s_mvo, &%s_mvotype); }\n", f->cname, m->cname, m->cname);
+            origin_fn = xs_sprintf("%s_origin", f->cname);
         }
         buf_printf(out, "static const xs_type XS_TYPE_SEC %s_type = {%s_free, xs_print_closure, %s%s%s};\n", f->cname, f->cname,
                    env_cyc ? xs_sprintf("%s_visit", f->cname) : "NULL",
@@ -13625,6 +13661,21 @@ static void emit_class(Class *c) {
         buf_printf(out, "static void *%s_origin(void *p) { return ((%s *)p)->%s; }\n", c->cname, c->cname, c->fields[0].cname);
     } else if (c->cptr) { /* (header-less: never printed, nohdr_compute) */
         buf_printf(out, "static void %s_print(void *p) { (void)p; }\n", c->cname);
+    } else if (c->mod && c->mod->file && !strcmp(c->mod->file, "xisto:errors") && !strcmp(c->name, "AggregateError")) {
+        /* as Node prints one (its stack's first line, as xisto prints an Error), its errors below: AggregateError: m {
+           [errors]: [ ... ] } */
+        Field *fm = NULL, *fn = NULL, *fe = NULL;
+        for (int i = 0; i < c->nfields; i++) {
+            if (!strcmp(c->fields[i].name, "message")) fm = &c->fields[i];
+            else if (!strcmp(c->fields[i].name, "name")) fn = &c->fields[i];
+            else if (!strcmp(c->fields[i].name, "errors")) fe = &c->fields[i];
+        }
+        buf_printf(out, "static void %s_print(void *p) {\n    %s *self = p; (void)self;\n", c->cname, c->cname);
+        if (fm && fn && fe && fe->type->kind == TY_ARRAY) {
+            buf_printf(out, "    xs_print_str(self->%s); fputs(\": \", XS_OUT); xs_print_str(self->%s);\n", fn->cname, fm->cname);
+            buf_printf(out, "    fputs(\" {\\n  [errors]: \", XS_OUT); xs_print_arr_%s(self->%s); fputs(\"\\n}\", XS_OUT);\n", arr_print_suffix(fe->type), fe->cname);
+        }
+        buf_puts(out, "}\n");
     } else emit_class_print(c, xs_sprintf("%s_print", c->cname), NULL, 0);
 
     if (in_hierarchy(c)) { emit_hier_ctor(c); goto methods; }
@@ -13759,6 +13810,7 @@ static void fnrefs_stmt(Stmt *s, NameSet *ns, bool in_fn) {
     for (int i = 0; i < s->ncases; i++) { fnrefs_expr(s->cases[i].value, ns, in_fn); fnrefs_stmt(s->cases[i].body, ns, in_fn); }
 }
 static NameSet main_locals; /* top-level variables declared in main */
+static bool uncaught_land; /* main has a landing for the errors an 'uncaughtException' listener takes */
 /* a top-level const of a number, int or boolean literal (const IM: int = 139968): a C constant, not a global
    assigned in main, so the C compiler folds it (x % IM becomes a multiplication, overflow checks with it go) */
 static bool const_lit_global(Stmt *s) {
@@ -14517,8 +14569,11 @@ void emit_program(Program *p, Buf *o) {
         }
         buf_puts(out, " };\n");
     }
+    uncaught_land = false; /* process.on('uncaughtException') can be reached: main gets a landing (xs_uncaught_main) */
+    for (int i = 0; i < p->nfuncs && !uncaught_land; i++)
+        if (p->funcs[i]->is_native && p->funcs[i]->used && strcmp(p->funcs[i]->name, "process_on_uncaught") == 0) uncaught_land = true;
     {
-        bool top_try = false;
+        bool top_try = uncaught_land; /* (the top-level variables are globals then: a longjmp keeps them) */
         for (int i = 0; i < p->top.len; i++) if (stmt_has_try(p->top.items[i])) top_try = true;
         find_main_locals(p, top_try);
     }
@@ -14762,6 +14817,7 @@ void emit_program(Program *p, Buf *o) {
         vol_locals = mvol;
     }
     emit_dbg_enter(NULL);
+    if (uncaught_land) { nl(); buf_puts(out, "jmp_buf land_; if (_setjmp(land_)) goto xs_landed; xs_uncaught_main = &land_; xs_uncaught_top = true;"); }
     epush(true);
     for (int i = 0; i < p->top.len; i++) {
         Stmt *s = p->top.items[i];
@@ -14774,6 +14830,7 @@ void emit_program(Program *p, Buf *o) {
     }
     emit_releases(escope);
     epop();
+    if (uncaught_land) { nl(); buf_puts(out, "xs_landed: xs_uncaught_main = NULL; xs_uncaught_top = false; xs_ar_drain(ar_mark);"); }
     emit_dbg_finish();
     if (wbody) { /* main: the setup once, then the program, as any thread */
         /* the body's own top-level locals: each thread releases its own here (main cannot see them) */
@@ -14894,6 +14951,7 @@ void emit_program(Program *p, Buf *o) {
     }
     if (cell_fns.data) { buf_puts(out, cell_fns.data); cell_fns.len = 0; cell_fns.data[0] = 0; ncell = 0; }
     if (ifld_fns.data) { buf_puts(out, ifld_fns.data); ifld_fns.len = 0; ifld_fns.data[0] = 0; nifld = 0; nifld_puts = 0; }
+    if (xs_json_ext_used) json_unknown_used = true; /* (JSON.stringify with a replacer or a space, JSON.parse with a reviver) */
     if (json_unknown_used) {
         /* every class JSON can write, for the values an unknown holds */
         int ncls = 0;

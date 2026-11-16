@@ -1,0 +1,2 @@
+uncaught Error: ENOENT: no such file or directory, open '/nonexistent-xisto-dir/b.txt'
+    at tests/stderr/uncaught-runtime-error-exit.ts:8:4

@@ -59,14 +59,31 @@ static Func **pending_overloads; /* function f(...): R; signatures waiting for t
 static int npending_overloads;
 static bool wants_arrays; /* a .reduce( / .flatMap( / .flat( call, or an Iterable<T> type, was parsed: xisto:arrays is loaded */
 static bool wants_settled; /* Promise.allSettled was named: xisto:settled is loaded */
+static bool wants_builtins; /* xs.at(i), Object.groupBy, a Set method of ES2025... was named: xisto:builtins is loaded */
+static bool wants_promises; /* Promise.withResolvers or Promise.any was named: xisto:promises is loaded */
+/* the member names whose call the checker may turn into a function of xisto:builtins */
+static bool is_builtins_member(const char *n) {
+    static const char *const names[] = {"at", "findLast", "findLastIndex", "with", "toSpliced", "copyWithin", "values", "keys",
+        "groupBy", "union", "intersection", "difference", "symmetricDifference", "isSubsetOf", "isSupersetOf", "isDisjointFrom",
+        "drop", "flatMap", "some", "every", "find", "toArray", "is", "assign", "asUintN", "asIntN"};
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) if (!strcmp(n, names[i])) return true;
+    return false;
+}
 static bool wants_okmap; /* WeakMap, or Map<object, V>, was written: xisto:okmap is loaded */
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
 static void import_process(Program *prog, Module *m);
+static void import_stdio(Program *prog, Module *m);
+static void import_builtin_class(Program *prog, Module *m, const char *path, const char *name);
+static bool declares_top_from(const char *src, const char *q, const char *name);
+static bool is_assert_path(const char *path);
+static bool is_test_path(const char *path);
+static struct Expr *ns_member(Parser *p, struct Expr *e, Token name);
+static void assert_src_arg(Parser *p, struct Expr *call, const char *start);
 static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... was named: xisto:url is loaded */
 static bool wants_errors; /* TypeError, RangeError, SyntaxError or ReferenceError was named: xisto:errors is loaded */
 static bool is_js_error_name(const char *n) {
     return n && (!strcmp(n, "TypeError") || !strcmp(n, "RangeError") || !strcmp(n, "SyntaxError") || !strcmp(n, "ReferenceError") ||
-                 !strcmp(n, "URIError"));
+                 !strcmp(n, "URIError") || !strcmp(n, "AggregateError"));
 }
 static bool is_url_global_name(const char *n);
 /* generics: the type parameters in scope while a template is parsed, or their types while an instance is */
@@ -1328,8 +1345,115 @@ static bool is_url_global_name(const char *n) {
     return n && (!strcmp(n, "URL") || !strcmp(n, "URLSearchParams") || !strcmp(n, "AbortController") || !strcmp(n, "AbortSignal") ||
                  !strcmp(n, "DOMException") || !strcmp(n, "RequestInit") || !strcmp(n, "HeadersInit") || !strcmp(n, "fetch") || !strcmp(n, "BufferEncoding"));
 }
+/* globalThis: every global of Node (26, a module's own scope; the globals of node -e and the REPL are left out),
+   each with what typeof gives for it there. The list is complete, so a feature test answers as on Node: typeof
+   globalThis.X is that string, "X" in globalThis is true exactly for these names, and a name Node does not have is
+   "undefined"/false there too (a program cannot add one: assigning globalThis.foo is an error). globalThis.X is the
+   global X (read as X); one xisto does not implement (WebAssembly...) is then an unknown name, an error at compile
+   time, never a silent undefined. A global is a static name here, so globalThis is never a value: reading a name not
+   listed or passing globalThis around is an error that says so */
+static const struct { const char *name, *type; } js_globals[] = {
+    {"AbortController", "function"}, {"AbortSignal", "function"}, {"AggregateError", "function"}, {"Array", "function"},
+    {"ArrayBuffer", "function"}, {"AsyncDisposableStack", "function"}, {"Atomics", "object"}, {"BigInt", "function"},
+    {"BigInt64Array", "function"}, {"BigUint64Array", "function"}, {"Blob", "function"}, {"Boolean", "function"},
+    {"BroadcastChannel", "function"}, {"Buffer", "function"}, {"ByteLengthQueuingStrategy", "function"},
+    {"CloseEvent", "function"}, {"CompressionStream", "function"}, {"CountQueuingStrategy", "function"},
+    {"Crypto", "function"}, {"CryptoKey", "function"}, {"CustomEvent", "function"}, {"DOMException", "function"},
+    {"DataView", "function"}, {"Date", "function"}, {"DecompressionStream", "function"},
+    {"DisposableStack", "function"}, {"Error", "function"}, {"ErrorEvent", "function"}, {"EvalError", "function"},
+    {"Event", "function"}, {"EventTarget", "function"}, {"File", "function"}, {"FinalizationRegistry", "function"},
+    {"Float16Array", "function"}, {"Float32Array", "function"}, {"Float64Array", "function"}, {"FormData", "function"},
+    {"Function", "function"}, {"Headers", "function"}, {"Infinity", "number"}, {"Int16Array", "function"},
+    {"Int32Array", "function"}, {"Int8Array", "function"}, {"Intl", "object"}, {"Iterator", "function"},
+    {"JSON", "object"}, {"Map", "function"}, {"Math", "object"}, {"MessageChannel", "function"},
+    {"MessageEvent", "function"}, {"MessagePort", "function"}, {"NaN", "number"}, {"Navigator", "function"},
+    {"Number", "function"}, {"Object", "function"}, {"Performance", "function"}, {"PerformanceEntry", "function"},
+    {"PerformanceMark", "function"}, {"PerformanceMeasure", "function"}, {"PerformanceObserver", "function"},
+    {"PerformanceObserverEntryList", "function"}, {"PerformanceResourceTiming", "function"}, {"Promise", "function"},
+    {"Proxy", "function"}, {"QuotaExceededError", "function"}, {"RangeError", "function"},
+    {"ReadableByteStreamController", "function"}, {"ReadableStream", "function"},
+    {"ReadableStreamBYOBReader", "function"}, {"ReadableStreamBYOBRequest", "function"},
+    {"ReadableStreamDefaultController", "function"}, {"ReadableStreamDefaultReader", "function"},
+    {"ReferenceError", "function"}, {"Reflect", "object"}, {"RegExp", "function"}, {"Request", "function"},
+    {"Response", "function"}, {"Set", "function"}, {"SharedArrayBuffer", "function"}, {"Storage", "function"},
+    {"String", "function"}, {"SubtleCrypto", "function"}, {"SuppressedError", "function"}, {"Symbol", "function"},
+    {"SyntaxError", "function"}, {"Temporal", "object"}, {"TextDecoder", "function"}, {"TextDecoderStream", "function"},
+    {"TextEncoder", "function"}, {"TextEncoderStream", "function"}, {"TransformStream", "function"},
+    {"TransformStreamDefaultController", "function"}, {"TypeError", "function"}, {"URIError", "function"},
+    {"URL", "function"}, {"URLPattern", "function"}, {"URLSearchParams", "function"}, {"Uint16Array", "function"},
+    {"Uint32Array", "function"}, {"Uint8Array", "function"}, {"Uint8ClampedArray", "function"}, {"WeakMap", "function"},
+    {"WeakRef", "function"}, {"WeakSet", "function"}, {"WebAssembly", "object"}, {"WebSocket", "function"},
+    {"WritableStream", "function"}, {"WritableStreamDefaultController", "function"},
+    {"WritableStreamDefaultWriter", "function"}, {"atob", "function"}, {"btoa", "function"},
+    {"clearImmediate", "function"}, {"clearInterval", "function"}, {"clearTimeout", "function"}, {"console", "object"},
+    {"crypto", "object"}, {"decodeURI", "function"}, {"decodeURIComponent", "function"}, {"encodeURI", "function"},
+    {"encodeURIComponent", "function"}, {"escape", "function"}, {"eval", "function"}, {"fetch", "function"},
+    {"global", "object"}, {"globalThis", "object"}, {"isFinite", "function"}, {"isNaN", "function"},
+    {"localStorage", "undefined"}, {"navigator", "object"}, {"parseFloat", "function"}, {"parseInt", "function"},
+    {"performance", "object"}, {"process", "object"}, {"queueMicrotask", "function"}, {"sessionStorage", "object"},
+    {"setImmediate", "function"}, {"setInterval", "function"}, {"setTimeout", "function"},
+    {"structuredClone", "function"}, {"undefined", "undefined"}, {"unescape", "function"},
+};
+static const char *js_global_type(const char *n) {
+    for (size_t i = 0; n && i < sizeof js_globals / sizeof *js_globals; i++)
+        if (strcmp(js_globals[i].name, n) == 0) return js_globals[i].type;
+    return NULL;
+}
+/* the global objects of other runtimes (browsers, Deno, Bun): typeof window is "undefined" on Node, as here */
+static bool is_foreign_global(const char *n) {
+    static const char *const names[] = {"window", "document", "self", "location", "Deno", "Bun", "importScripts", "WorkerGlobalScope", NULL};
+    for (int i = 0; names[i]; i++) if (strcmp(names[i], n) == 0) return true;
+    return false;
+}
+/* the module binds the name itself: an import (named, default or namespace), or a top-level declaration */
+static bool binds_name(Parser *p, const char *n) {
+    if (p->mod)
+        for (int i = 0; i < p->mod->nimports; i++)
+            for (int k = 0; k < p->mod->imports[i].n; k++)
+                if (strcmp(p->mod->imports[i].names[k], n) == 0) return true;
+    for (int i = 0; i < p->nns; i++) if (strcmp(p->ns_alias[i], n) == 0) return true;
+    for (int i = 0; i < p->nalias; i++) if (strcmp(p->alias_from[i], n) == 0) return true;
+    return declares_top_from(p->lx.src, p->lx.src, n);
+}
+static const char *globalthis_help =
+    "globalThis reads the standard globals (globalThis.setTimeout, globalThis.crypto...); a value shared across modules is "
+    "an exported module variable: export let config = ...";
+/* import.meta.url / dirname / filename: the module's source file as the build found it (an absolute path, symbolic
+   links resolved, as Node gives the main module's). xisto compiles ahead of time, so this is where the source was
+   built, not where the binary runs: what new URL("./x", import.meta.url) and fileURLToPath(import.meta.url) want to
+   find files kept next to the source. The URL is percent-encoded as Node's pathToFileURL encodes it. */
+static Expr *parse_import_meta(Parser *p) {
+    Pos pos = p->tok.pos;
+    expect(p, TK_IMPORT, NULL);
+    expect(p, TK_DOT, NULL);
+    if (!at_ident(p, "meta")) xs_error(XS1021, p->tok.pos, "import.meta.url, import.meta.dirname, import.meta.filename", "expected an expression but found 'import'");
+    next(p);
+    expect(p, TK_DOT, "import.meta.url, import.meta.dirname or import.meta.filename");
+    Token name = expect(p, TK_IDENT, NULL);
+    const char *file = p->mod && p->mod->path && p->mod->path[0] == '/' ? p->mod->path : NULL;
+    char abs[PATH_MAX];
+    if (!file && p->mod && p->mod->path && realpath(p->mod->path, abs)) file = abs;
+    if (!file) file = p->mod && p->mod->path ? p->mod->path : "";
+    Expr *e = new_expr(E_STRING, pos);
+    if (strcmp(name.str, "filename") == 0) e->str = xs_strndup(file, strlen(file));
+    else if (strcmp(name.str, "dirname") == 0) {
+        const char *sl = strrchr(file, '/');
+        e->str = sl == file ? "/" : xs_strndup(file, sl ? (size_t)(sl - file) : 0);
+    } else if (strcmp(name.str, "url") == 0) {
+        Buf b = {0};
+        buf_puts(&b, "file://");
+        for (const unsigned char *c = (const unsigned char *)file; *c; c++) {
+            if (isalnum(*c) || strchr("-._!$&'()*+,;=:@/", *c)) buf_printf(&b, "%c", *c);
+            else buf_printf(&b, "%%%02X", *c);
+        }
+        e->str = b.data ? b.data : "file://";
+    } else xs_error(XS1021, name.pos, "import.meta.url, import.meta.dirname, import.meta.filename", "import.meta.%s is not supported", name.str);
+    return e;
+}
+
 static Expr *parse_primary(Parser *p) {
     Pos pos = p->tok.pos;
+    if (at(p, TK_IMPORT) && peek_is(p, TK_DOT)) return parse_import_meta(p);
     if (at(p, TK_IDENT) && strncmp(p->tok.str, "__reflect_", 10) == 0) { /* __reflect_kind(T) & co: generated code only */
         Expr *e = new_expr(E_CALL, pos);
         e->builtin.cfn = p->tok.str;
@@ -1512,6 +1636,36 @@ static Expr *parse_primary(Parser *p) {
             next(p);
             return new_expr(E_NULL, pos);
         }
+        if (strcmp(p->tok.str, "globalThis") == 0 && !binds_name(p, "globalThis")) { /* globalThis.X: the global X (js_globals) */
+            next(p);
+            if (!at(p, TK_DOT) && !at(p, TK_QDOT))
+                xs_error(XS7151, pos, globalthis_help, "globalThis as a value is not supported (its properties are the program's static globals)");
+            next(p);
+            if (!at(p, TK_IDENT)) xs_error(XS7151, p->tok.pos, globalthis_help, "globalThis[...] is not supported: write globalThis.name");
+            const char *gn = p->tok.str;
+            if (!js_global_type(gn) || !strcmp(gn, "globalThis") || !strcmp(gn, "global"))
+                xs_error(XS7150, p->tok.pos, globalthis_help, "globalThis.%s is not a global xisto knows", gn);
+            Parser look = *p;
+            next(&look);
+            if (at(&look, TK_ASSIGN))
+                xs_error(XS7151, p->tok.pos, globalthis_help, "assigning globalThis.%s is not supported: the globals are fixed when the program is compiled", gn);
+            if (!strcmp(gn, "crypto")) { /* (globalThis.crypto is the global one even where the module has a crypto of its own) */
+                import_builtin_class(p->prog, p->mod, "xisto:crypto", "__xs_crypto");
+                p->tok.str = "__xs_crypto";
+            }
+            return parse_primary(p); /* (the global itself, as if written without globalThis.) */
+        }
+        if (strcmp(p->tok.str, "crypto") == 0) { /* crypto.randomUUID() & co: the global Web Crypto, xisto:crypto's webcrypto */
+            Parser look = *p;
+            next(&look);
+            if (at(&look, TK_DOT) && peek_is_ident(&look) && !binds_name(p, "crypto")) {
+                next(&look);
+                if (!strcmp(look.tok.str, "randomUUID") || !strcmp(look.tok.str, "getRandomValues") || !strcmp(look.tok.str, "subtle")) {
+                    import_builtin_class(p->prog, p->mod, "xisto:crypto", "__xs_crypto");
+                    p->tok.str = "__xs_crypto";
+                }
+            }
+        }
         if (is_url_global_name(p->tok.str)) wants_url = true; /* (AbortSignal.timeout(n): a member read made here) */
         if (strcmp(p->tok.str, "process") == 0) { /* process.on(...), process.platform...: xisto:process */
             Parser look = *p;
@@ -1521,7 +1675,87 @@ static Expr *parse_primary(Parser *p) {
                 static const char *const core[] = {"argv", "env", "pid", "cwd", "exit", "stdout", "stderr", NULL};
                 bool is_core = false;
                 for (int i = 0; core[i]; i++) if (look.tok.str && strcmp(look.tok.str, core[i]) == 0) is_core = true;
+                if (look.tok.str && !strcmp(look.tok.str, "stdin")) is_core = true, import_stdio(p->prog, p->mod);
+                else if (look.tok.str && (!strcmp(look.tok.str, "stdout") || !strcmp(look.tok.str, "stderr"))) {
+                    next(&look); /* process.stdout as a stream (not .write(x), the built-in): xisto:tty */
+                    if (!at(&look, TK_DOT) || (next(&look), !look.tok.str || strcmp(look.tok.str, "write") != 0)) import_stdio(p->prog, p->mod);
+                }
                 if (!is_core) import_process(p->prog, p->mod);
+            }
+        }
+        if (strcmp(p->tok.str, "performance") == 0) { /* performance.mark & co: XistoPerformance of xisto:perf_hooks */
+            Parser look = *p;
+            next(&look);
+            if (at(&look, TK_DOT)) {
+                next(&look);
+                if (look.tok.str && strcmp(look.tok.str, "now") != 0) import_builtin_class(p->prog, p->mod, "xisto:perf_hooks", "XistoPerformance");
+            }
+        }
+        if (strcmp(p->tok.str, "console") == 0) { /* console.time, console.table...: XistoConsole of xisto:console (runtime/node/console.ts) */
+            Parser look = *p;
+            next(&look);
+            if (at(&look, TK_DOT)) {
+                next(&look);
+                const char *mn = look.tok.str;
+                if (mn && strcmp(mn, "log") != 0 && strcmp(mn, "info") != 0 && strcmp(mn, "debug") != 0 && strcmp(mn, "error") != 0 && strcmp(mn, "warn") != 0) {
+                    import_builtin_class(p->prog, p->mod, "xisto:console", "XistoConsole");
+                    if (!strcmp(mn, "group") || !strcmp(mn, "groupCollapsed")) p->prog->uses_console_group = true;
+                }
+            }
+        }
+        if (peek_is(p, TK_DOT) && p->mod) { /* test.skip(...) & co of node:test (a named import): __test_skip(...) */
+            const char *tn = p->tok.str;
+            bool t_or_d = !strcmp(tn, "test") || !strcmp(tn, "it") || !strcmp(tn, "describe") || !strcmp(tn, "suite");
+            bool imported = false;
+            for (int i = 0; t_or_d && i < p->mod->nimports; i++)
+                for (int k = 0; k < p->mod->imports[i].n; k++)
+                    if (!strcmp(p->mod->imports[i].names[k], tn) && is_test_path(p->mod->imports[i].path)) imported = true;
+            Parser look = *p;
+            next(&look);
+            next(&look);
+            if (imported && at(&look, TK_IDENT) && (!strcmp(look.tok.str, "skip") || !strcmp(look.tok.str, "todo") || !strcmp(look.tok.str, "only")) &&
+                peek_is(&look, TK_LPAREN)) {
+                const char *fname = xs_sprintf("__%s_%s", tn[0] == 't' || tn[0] == 'i' ? "test" : "describe", look.tok.str);
+                import_builtin_class(p->prog, p->mod, "xisto:test", fname);
+                next(&look);
+                *p = look;
+                Expr *c = new_expr(E_CALL, pos);
+                c->lhs = ident_expr(pos, fname);
+                parse_args(p, &c->args);
+                return c;
+            }
+        }
+        if (peek_is(p, TK_LPAREN) && ns_import_of(p, p->tok.str) && is_test_path(ns_import_of(p, p->tok.str)->path)) {
+            Token tn = p->tok; /* test(...) with test the default import of node:test (the module): its test() */
+            tn.str = "test";
+            Expr *callee = ns_member(p, ident_expr(pos, p->tok.str), tn);
+            next(p);
+            Expr *c = new_expr(E_CALL, pos);
+            c->lhs = callee;
+            parse_args(p, &c->args);
+            return c;
+        }
+        if (peek_is(p, TK_LPAREN)) { /* assert(x) with assert the namespace of node:assert: assert.ok(x); ok(x) of node:assert */
+            const char *start = p->tok.start;
+            Import *ai = ns_import_of(p, p->tok.str);
+            bool named_ok = false;
+            if (!ai && !strcmp(p->tok.str, "ok") && p->mod)
+                for (int i = 0; i < p->mod->nimports; i++)
+                    for (int k = 0; k < p->mod->imports[i].n; k++)
+                        if (!strcmp(p->mod->imports[i].names[k], "ok") && is_assert_path(p->mod->imports[i].path)) named_ok = true;
+            if ((ai && is_assert_path(ai->path)) || named_ok) {
+                Expr *callee;
+                if (ai) {
+                    Token okn = p->tok;
+                    okn.str = "ok";
+                    callee = ns_member(p, ident_expr(pos, p->tok.str), okn);
+                } else callee = ident_expr(pos, "ok");
+                next(p);
+                Expr *c = new_expr(E_CALL, pos);
+                c->lhs = callee;
+                parse_args(p, &c->args);
+                assert_src_arg(p, c, start);
+                return c;
             }
         }
         Expr *e = new_expr(E_IDENT, pos);
@@ -1683,6 +1917,12 @@ static Expr *parse_primary(Parser *p) {
             wants_reflect = true;
             return c;
         }
+        if (at_ident(p, "globalThis") && peek_is(p, TK_DOT) && !binds_name(p, "globalThis")) { /* new globalThis.URL(...): new URL(...) */
+            next(p);
+            next(p);
+            if (!at(p, TK_IDENT) || !js_global_type(p->tok.str) || strcmp(js_global_type(p->tok.str), "function") != 0)
+                xs_error(XS7150, p->tok.pos, globalthis_help, "globalThis.%s is not a global xisto knows", at(p, TK_IDENT) ? p->tok.str : "?");
+        }
         Token name;
         if (at(p, TK_THIS) && p->this_alias && !strcmp(p->this_alias, XS_STATIC_THIS)) { /* new this(...) in a static method: the class it is called on */
             name = p->tok;
@@ -1829,7 +2069,27 @@ static int parse_type_args(Parser *p, Type ***out) {
 static int noptc;
 static Expr *ident_expr(Pos pos, const char *name);
 static Expr *ns_member(Parser *p, Expr *e, Token name);
+/* node:assert: the module (or assert/strict) by the path of an import */
+static bool is_assert_path(const char *path) {
+    if (!path) return false;
+    const char *b = !strncmp(path, "node:", 5) ? path + 5 : !strncmp(path, "xisto:", 6) ? path + 6 : path;
+    return !strcmp(b, "assert") || !strcmp(b, "assert/strict");
+}
+static bool is_test_path(const char *path) {
+    return path && (!strcmp(path, "node:test") || !strcmp(path, "xisto:test") || !strcmp(path, "test"));
+}
+static Import *ns_import_of(Parser *p, const char *alias);
+/* assert.ok(value) / assert(value) with no message: the call as written (from start to the end of its ')') goes
+   after a null message, for "The expression evaluated to a falsy value:\n\n  assert(x)\n" (xisto:assert's ok) */
+static void assert_src_arg(Parser *p, Expr *call, const char *start) {
+    if (call->args.len != 1 || !start || !p->prev_end || p->prev_end <= start) return;
+    expr_list_push(&call->args, new_expr(E_NULL, call->pos));
+    Expr *s = new_expr(E_STRING, call->pos);
+    s->str = xs_strndup(start, (size_t)(p->prev_end - start));
+    expr_list_push(&call->args, s);
+}
 static Expr *parse_postfix(Parser *p) {
+    const char *pstart = p->tok.start; /* (assert.ok(x): the source of the call) */
     Expr *e = parse_primary(p);
     if (e && e->kind == E_IDENT && is_js_error_name(e->str)) wants_errors = true;
     if (e && e->kind == E_IDENT && is_url_global_name(e->str)) wants_url = true;
@@ -1895,6 +2155,8 @@ static Expr *parse_postfix(Parser *p) {
             if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from") ||
                 !strcmp(name.str, "fromEntries")) wants_arrays = true;
             if (!strcmp(name.str, "allSettled")) wants_settled = true;
+            if (is_builtins_member(name.str)) wants_builtins = true;
+            if ((!strcmp(name.str, "withResolvers") || !strcmp(name.str, "any")) && e->kind == E_IDENT && !strcmp(e->str, "Promise")) wants_promises = true;
             if (!strcmp(name.str, "next") && e->kind == E_MEMBER && e->str && (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")))
                 wants_arrays = true; /* m.keys().next().value: __xs_first */
             if (at(p, TK_LT) && looks_like_type_args(p)) m->ntargs = parse_type_args(p, &m->targs);
@@ -1905,6 +2167,7 @@ static Expr *parse_postfix(Parser *p) {
                 at_push_call = false;
                 if (!strcmp(m->str, "splice") && m->args.len == 1) wants_arrays = true; /* xs.splice(i): __xs_spliceFrom */
                 if (!strcmp(m->str, "entries") && m->args.len == 0) wants_arrays = true; /* xs.entries(): __xs_entries */
+                if (!strcmp(m->str, "toString") && m->args.len == 1) wants_builtins = true; /* big.toString(radix): __xs_big_radix */
                 if (m->args.len == 1 && m->args.items[0]->kind == E_ARROW && m->args.items[0]->arrow->fn->nparams == 3)
                     wants_arrays = true; /* xs.filter((x, i, arr) => ...): __xs_filter3 */
             }
@@ -1921,11 +2184,13 @@ static Expr *parse_postfix(Parser *p) {
             Token name = expect_prop_name(p, NULL);
             Expr *nsx = ns_member(p, e, name);
             if (nsx) { /* ns.f(...), ns.x: the module's own name */
+                bool aok = e->kind == E_IDENT && !strcmp(name.str, "ok") && ns_import_of(p, e->str) && is_assert_path(ns_import_of(p, e->str)->path);
                 e = nsx;
                 if (at(p, TK_LPAREN)) {
                     Expr *c = new_expr(E_CALL, name.pos);
                     c->lhs = e;
                     parse_args(p, &c->args);
+                    if (aok) assert_src_arg(p, c, pstart);
                     e = c;
                 }
                 continue;
@@ -1936,6 +2201,8 @@ static Expr *parse_postfix(Parser *p) {
             if (!strcmp(name.str, "reduce") || !strcmp(name.str, "flatMap") || !strcmp(name.str, "flat") || !strcmp(name.str, "from") ||
                 !strcmp(name.str, "fromEntries")) wants_arrays = true;
             if (!strcmp(name.str, "allSettled")) wants_settled = true;
+            if (is_builtins_member(name.str)) wants_builtins = true;
+            if ((!strcmp(name.str, "withResolvers") || !strcmp(name.str, "any")) && e->kind == E_IDENT && !strcmp(e->str, "Promise")) wants_promises = true;
             if (!strcmp(name.str, "next") && e->kind == E_MEMBER && e->str && (!strcmp(e->str, "keys") || !strcmp(e->str, "values") || !strcmp(e->str, "entries")))
                 wants_arrays = true; /* m.keys().next().value: __xs_first */
             if (!strcmp(name.str, "length") && at(p, TK_ASSIGN)) wants_arrays = true; /* xs.length = 0 */
@@ -1948,6 +2215,7 @@ static Expr *parse_postfix(Parser *p) {
                 at_push_call = false;
                 if (!strcmp(m->str, "splice") && m->args.len == 1) wants_arrays = true; /* xs.splice(i): __xs_spliceFrom */
                 if (!strcmp(m->str, "entries") && m->args.len == 0) wants_arrays = true; /* xs.entries(): __xs_entries */
+                if (!strcmp(m->str, "toString") && m->args.len == 1) wants_builtins = true; /* big.toString(radix): __xs_big_radix */
                 if (m->args.len == 1 && m->args.items[0]->kind == E_ARROW && m->args.items[0]->arrow->fn->nparams == 3)
                     wants_arrays = true; /* xs.filter((x, i, arr) => ...): __xs_filter3 */
             }
@@ -2014,6 +2282,27 @@ static Expr *parse_unary(Parser *p) {
         Expr *e = new_expr(E_UNARY, p->tok.pos);
         e->op = TK_IDENT;
         next(p);
+        { /* typeof globalThis.X, typeof window: known when the program is compiled (js_globals) */
+            Parser look = *p;
+            const char *gn = NULL;
+            if (at_ident(&look, "globalThis") && !binds_name(p, "globalThis")) {
+                next(&look);
+                if (at(&look, TK_DOT) || at(&look, TK_QDOT)) {
+                    next(&look);
+                    if (at(&look, TK_IDENT)) { gn = look.tok.str; next(&look); }
+                } else gn = "globalThis";
+            } else if (at(&look, TK_IDENT) && is_foreign_global(look.tok.str) && !binds_name(p, look.tok.str)) {
+                gn = look.tok.str;
+                next(&look);
+            }
+            if (gn && !at(&look, TK_DOT) && !at(&look, TK_QDOT) && !at(&look, TK_LBRACKET) && !at(&look, TK_LPAREN)) {
+                const char *ty = js_global_type(gn);
+                *p = look;
+                Expr *s = new_expr(E_STRING, e->pos);
+                s->str = (char *)(ty ? ty : "undefined");
+                return s;
+            }
+        }
         e->lhs = parse_unary(p);
         return e;
     }
@@ -2140,6 +2429,17 @@ static Expr *parse_rel(Parser *p) {
         Pos pos = p->tok.pos;
         if (at_ident(p, "in")) { /* "key" in obj */
             next(p);
+            if (e->kind == E_STRING && at_ident(p, "globalThis") && !binds_name(p, "globalThis")) { /* "fetch" in globalThis: js_globals */
+                Parser look = *p;
+                next(&look);
+                if (!at(&look, TK_DOT) && !at(&look, TK_QDOT) && !at(&look, TK_LBRACKET)) {
+                    *p = look;
+                    Expr *b = new_expr(E_BOOL, pos);
+                    b->boolean = js_global_type(e->str) != NULL;
+                    e = b;
+                    continue;
+                }
+            }
             e = binary(TK_IN, pos, e, parse_rel_base(p));
             continue;
         }
@@ -2560,6 +2860,7 @@ static Stmt *tdz_split(Parser *p, Stmt *s) {
 static bool tok_ident_is(Parser *q, const char *s);
 static void fix_import_names(Parser *p, Module *m, int i0);
 static void ns_register(Parser *p, Module *m, const char *alias);
+static void fs_extras(Program *prog, Module *m, Import *im);
 static Module *load_module(Program *prog, const char *file, Pos from_pos, const char *from_file);
 static Stmt *parse_var(Parser *p) {
     Stmt *s = new_stmt(S_VAR, p->tok.pos);
@@ -2604,6 +2905,7 @@ static Stmt *parse_var(Parser *p) {
                             m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
                             m->imports[m->nimports++] = im;
                             m->imports[n0].from = load_module(prog, pa, nm.pos, m->path);
+                            fs_extras(prog, m, &m->imports[n0]);
                             xs_file_name = m->file;
                             xs_source = m->src;
                             parsing_prog = prog;
@@ -3155,6 +3457,8 @@ static Stmt *parse_stmt(Parser *p) {
         return s;
     }
     case TK_IMPORT:
+        if (peek_is(p, TK_DOT)) goto expression; /* import.meta.url ... */
+        /* fallthrough */
     case TK_EXPORT:
         xs_error(XS6004, pos, "imports and exports go at the top level of the file", "'%s' is not allowed here", p->tok.kind == TK_IMPORT ? "import" : "export");
         return NULL;
@@ -3162,7 +3466,8 @@ static Stmt *parse_stmt(Parser *p) {
     case TK_ENUM:
         xs_error(XS6027, pos, "move it to the top level of the file", "nested classes and enums are not supported");
         return NULL;
-    default: {
+    default:
+    expression: {
         Stmt *s = new_stmt(S_EXPR, pos);
         bool so = p->spread_ok; Expr *sa = p->spread_arg;
         p->spread_ok = true;
@@ -4899,29 +5204,35 @@ static bool src_has_default_export(const char *src) {
     }
     return false;
 }
+/* process.stdin, and process.stdout / process.stderr used as streams: XistoStdio from xisto:tty (runtime/node/tty.ts) */
+static void import_builtin_class(Program *prog, Module *m, const char *path, const char *name);
+static void import_stdio(Program *prog, Module *m) { import_builtin_class(prog, m, "xisto:tty", "XistoStdio"); }
 /* process.X beyond the members the compiler builds in: the module reads XistoProcess.X (checker), so it imports
    XistoProcess from xisto:process (runtime/node/process.ts), once */
-static void import_process(Program *prog, Module *m) {
+static void import_builtin_class(Program *prog, Module *m, const char *path, const char *name) {
     if (!m) return;
     for (int i = 0; i < m->nimports; i++)
-        if (m->imports[i].path && strcmp(m->imports[i].path, "xisto:process") == 0) return;
+        if (m->imports[i].path && strcmp(m->imports[i].path, path) == 0)
+            for (int k = 0; k < m->imports[i].n; k++)
+                if (strcmp(m->imports[i].names[k], name) == 0) return; /* (this name of this module, once) */
     Import im = {0};
     im.pos = (Pos){1, 1};
     im.names = xs_alloc(sizeof(char *));
     im.positions = xs_alloc(sizeof(Pos));
-    im.names[0] = "XistoProcess";
+    im.names[0] = (char *)name;
     im.positions[0] = im.pos;
     im.n = 1;
-    im.path = "xisto:process";
+    im.path = path;
     /* (loaded now: the module's own imports were loaded before its body, where process.X usually is) */
     const char *sf = xs_file_name, *ss = xs_source;
     Program *spp = parsing_prog;
     Module *spm = parsing_mod;
-    im.from = load_module(prog, "xisto:process", im.pos, m->path);
+    im.from = load_module(prog, path, im.pos, m->path);
     xs_file_name = sf; xs_source = ss; parsing_prog = spp; parsing_mod = spm;
     m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
     m->imports[m->nimports++] = im;
 }
+static void import_process(Program *prog, Module *m) { import_builtin_class(prog, m, "xisto:process", "XistoProcess"); }
 static void parse_import(Parser *p, Module *m) {
     Pos pos = p->tok.pos;
     expect(p, TK_IMPORT, NULL);
@@ -5016,6 +5327,33 @@ static void parse_import(Parser *p, Module *m) {
         ns_register(p, m, ns.str);
         goto from;
     }
+    { /* import { strict as assert } from "node:assert" (or { strict }): import * as assert from "node:assert/strict" */
+        Parser look = *p;
+        if (at(&look, TK_LBRACE)) {
+            next(&look);
+            if (at_ident(&look, "strict")) {
+                Token local = look.tok;
+                next(&look);
+                if (at_ident(&look, "as")) { next(&look); local = look.tok; next(&look); }
+                if (at(&look, TK_RBRACE) && local.kind == TK_IDENT) {
+                    next(&look);
+                    if (at_ident(&look, "from")) {
+                        next(&look);
+                        if (at(&look, TK_STRING) && is_assert_path(look.tok.str) && !strstr(look.tok.str, "/strict")) {
+                            next(&look);
+                            *p = look;
+                            ns_register(p, m, local.str);
+                            expect_semi(p);
+                            im.path = "node:assert/strict";
+                            m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+                            m->imports[m->nimports++] = im;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
     if (!at(p, TK_LBRACE))
         xs_error(XS1016, p->tok.pos, "xisto supports named imports only: import { a, b } from \"./file\";", "expected '{' after import");
     next(p);
@@ -5088,10 +5426,26 @@ from:
             m->imports[m->nimports++] = st;
         }
     }
+    if (!im.star && !im.is_default && im.n && (!strcmp(im.path, "perf_hooks") || !strcmp(im.path, "node:perf_hooks") || !strcmp(im.path, "xisto:perf_hooks"))) {
+        /* import { performance } from "node:perf_hooks": the global performance (performance.now() is built in; its other
+           members load xisto:perf_hooks where they are named), so the name alone does not load the module */
+        int keep = 0;
+        for (int i = 0; i < im.n; i++)
+            if (strcmp(im.names[i], "performance") != 0) { im.names[keep] = im.names[i]; im.positions[keep++] = im.positions[i]; }
+        im.n = keep;
+        if (!keep && !has_dflt) return;
+    }
     m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
     m->imports[m->nimports++] = im;
     if (im.n) alias_collisions(p, m, alias_first, &m->imports[m->nimports - 1]);
-    if (has_dflt) {
+    if (has_dflt && (is_assert_path(path.str) || is_test_path(path.str))) { /* (import assert, { x } from "node:assert": the module) */
+        ns_register(p, m, dflt.str);
+        Import d = {0};
+        d.pos = pos;
+        d.path = path.str;
+        m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+        m->imports[m->nimports++] = d;
+    } else if (has_dflt) {
         Import d = {0};
         d.pos = pos;
         d.is_default = true;
@@ -5198,8 +5552,8 @@ static Enum *parse_enum(Parser *p) {
    first) then the member's decorators (bottom up); constructor parameters; then the class (bottom up). */
 static bool class_decorated(Class *c) {
     if (c->decos.len || c->as_value) return true;
-    if (c->base_name && strcmp(c->base_name, "Error") == 0 && !(c->mod && c->mod->file && (!strcmp(c->mod->file, "xisto:crypto") || !strcmp(c->mod->file, "xisto:zlib"))))
-        return true; /* an error class: a value too (@Catch(MyError)); not node:crypto's and node:zlib's errors with a code, which
+    if (c->base_name && strcmp(c->base_name, "Error") == 0 && !(c->mod && c->mod->file && (!strcmp(c->mod->file, "xisto:crypto") || !strcmp(c->mod->file, "xisto:zlib") || !strcmp(c->mod->file, "xisto:fs"))))
+        return true; /* an error class: a value too (@Catch(MyError)); not node:crypto's, node:zlib's and node:fs's errors with a code, which
                         would make every program that imports them carry xisto:reflect (~40 KB) */
     if (c->mixin) return true; /* class UpdateDto extends PartialType(CreateDto) {}: a value too (@Body() dto: UpdateDto) */
     for (int i = 0; i < c->nfields; i++) if (c->fields[i].decos.len) return true;
@@ -5909,6 +6263,51 @@ static void apply_local_exports(Program *prog, Module *m, int top_start) {
     }
 }
 
+/* node:fs's parts that only the programs naming them load (runtime/node/fs.ts holds the synchronous API): the callback
+   API (fs.readFile & co, xisto:fs_callbacks: it runs on the event loop), fs.promises (xisto:fs/promises) and the
+   streams (fs.createReadStream & co, xisto:stream). A module that imports xisto:fs and names one of them, as fs.X or
+   import { X }, makes it a re-export of xisto:fs. */
+static const char *const fs_cb_names[] = {"readFile", "writeFile", "appendFile", "mkdir", "readdir", "stat", "lstat", "fstat", "rm",
+                                          "rmdir", "rename", "access", "unlink", "copyFile", "cp", "realpath", "mkdtemp", "readlink",
+                                          "symlink", "link", "chmod", "truncate", "utimes", NULL};
+static const char *const fs_stream_names[] = {"createReadStream", "createWriteStream", "ReadStream", "WriteStream", NULL};
+static bool fs_names(const char *src, Import *im, const char *const *names) {
+    for (const char *const *n = names; *n; n++) {
+        for (int i = 0; i < im->n; i++) if (strcmp(im->names[i], *n) == 0) return true;
+        size_t len = strlen(*n);
+        for (const char *q = strstr(src, *n); q; q = strstr(q + 1, *n)) /* fs.readFile( / fs.ReadStream */
+            if (q > src && q[-1] == '.' && !isalnum((unsigned char)q[len]) && q[len] != '_' && q[len] != '$') return true;
+    }
+    return false;
+}
+static void fs_reexport(Program *prog, Module *fs, const char *path, const char *const *names) {
+    for (int i = 0; i < fs->nimports; i++) if (fs->imports[i].reexport && strcmp(fs->imports[i].path, path) == 0) return;
+    Import im = {0};
+    im.pos = (Pos){1, 1};
+    im.reexport = true;
+    im.path = (char *)path;
+    if (!names) im.star = true;
+    else
+        for (const char *const *n = names; *n; n++) {
+            im.names = realloc(im.names, sizeof(char *) * (size_t)(im.n + 1));
+            im.positions = realloc(im.positions, sizeof(Pos) * (size_t)(im.n + 1));
+            im.as_names = realloc(im.as_names, sizeof(char *) * (size_t)(im.n + 1));
+            im.names[im.n] = im.as_names[im.n] = (char *)*n;
+            im.positions[im.n++] = im.pos;
+        }
+    fs->imports = realloc(fs->imports, sizeof(Import) * (size_t)(fs->nimports + 1));
+    fs->imports[fs->nimports++] = im;
+    load_import(prog, fs, &fs->imports[fs->nimports - 1]);
+}
+static void fs_extras(Program *prog, Module *m, Import *im) {
+    Module *fs = im->from;
+    if (!fs || fs->missing || !fs->file || strcmp(fs->file, "xisto:fs") != 0 || !m->src || !strncmp(m->file, "xisto:", 6)) return;
+    static const char *const promises[] = {"promises", NULL};
+    if (fs_names(m->src, im, fs_cb_names)) fs_reexport(prog, fs, "xisto:fs_callbacks", NULL);
+    if (fs_names(m->src, im, promises)) fs_reexport(prog, fs, "xisto:fs/promises", promises);
+    if (fs_names(m->src, im, fs_stream_names)) fs_reexport(prog, fs, "xisto:stream", fs_stream_names);
+}
+
 static void parse_module(Program *prog, Module *m) {
     xs_file_name = m->file;
     xs_source = m->src;
@@ -5932,7 +6331,7 @@ static void parse_module(Program *prog, Module *m) {
             xs_lex_skipping = false;
         }
     }
-    while (at(&p, TK_IMPORT) || reexport_ahead(&p)) {
+    while ((at(&p, TK_IMPORT) && !peek_is(&p, TK_DOT)) || reexport_ahead(&p)) { /* (import.meta.url: an expression) */
         if (at(&p, TK_IMPORT)) parse_import(&p, m);
         else parse_reexport(&p, m, prog, false);
     }
@@ -5945,6 +6344,7 @@ static void parse_module(Program *prog, Module *m) {
             else im->from = missing_module(prog, im->path);
             xs_error_recover = &prb;
         } else im->from = load_module(prog, im->path, im->pos, m->path);
+        fs_extras(prog, m, &m->imports[i]);
         xs_file_name = m->file;
         xs_source = m->src;
     }
@@ -6043,7 +6443,7 @@ static void parse_module(Program *prog, Module *m) {
         char *treq_name = NULL, *treq_path = NULL;
         Pos treq_pos = p.tok.pos;
         bool treq = at(&p, TK_LET) && try_require_ahead(&p, &treq_name, &treq_path);
-        if (treq || at(&p, TK_IMPORT) || require_ahead(&p)) { /* an import after declarations (ES hoists it): read and loaded here; names resolve in the
+        if (treq || (at(&p, TK_IMPORT) && !peek_is(&p, TK_DOT)) || require_ahead(&p)) { /* an import after declarations (ES hoists it): read and loaded here; names resolve in the
                                     checker, after the whole file, so declarations above may use them */
             int n0 = m->nimports;
             if (treq) {
@@ -6064,6 +6464,7 @@ static void parse_module(Program *prog, Module *m) {
                     else im->from = missing_module(prog, im->path);
                     xs_error_recover = saved;
                 } else im->from = load_module(prog, im->path, im->pos, m->path);
+                fs_extras(prog, m, &m->imports[i]);
                 xs_file_name = m->file;
                 xs_source = m->src;
                 parsing_prog = prog;
@@ -6367,6 +6768,322 @@ static const char xs_settled_src[] =
     "  }\n"
     "  return out;\n"
     "}\n";
+/* xisto:builtins: the ES2022-ES2025 methods written in xisto (Array at/findLast/with/toSpliced, Object.groupBy,
+   the Set methods, iterator helpers, BigInt.asUintN...): the checker turns xs.at(i) into __xs_at(xs, i) and so on;
+   loaded only by a program that names one of them. Its errors are the runtime's (__xs_throw): no class of xisto:errors */
+static const char xs_builtins_src[] =
+    "// arrays (ES2022-ES2023): the compiler turns xs.at(i) into __xs_at(xs, i) and so on\n"
+    "export function __xs_at<T>(xs: T[], i: int): T | null {\n"
+    "  const k = i < 0 ? xs.length + i : i;\n"
+    "  if (k < 0 || k >= xs.length) return null;\n"
+    "  return xs[k];\n"
+    "}\n"
+    "export function __xs_str_at(s: string, i: int): string | null {\n"
+    "  const k = i < 0 ? s.length + i : i;\n"
+    "  if (k < 0 || k >= s.length) return null;\n"
+    "  return s.charAt(k);\n"
+    "}\n"
+    "// a typed array's at(i): its length and a reader of its elements (written at the call, on the array there)\n"
+    "export function __xs_ta_at<E>(n: int, i: int, get: (k: int) => E): E | null {\n"
+    "  const k = i < 0 ? n + i : i;\n"
+    "  if (k < 0 || k >= n) return null;\n"
+    "  return get(k);\n"
+    "}\n"
+    "export function __xs_findLast<T>(xs: T[], f: (x: T, i: int) => boolean): T | null {\n"
+    "  for (let i = xs.length - 1; i >= 0; i--) if (f(xs[i], i)) return xs[i];\n"
+    "  return null;\n"
+    "}\n"
+    "export function __xs_findLastIndex<T>(xs: T[], f: (x: T, i: int) => boolean): int {\n"
+    "  for (let i = xs.length - 1; i >= 0; i--) if (f(xs[i], i)) return i;\n"
+    "  return -1;\n"
+    "}\n"
+    "export function __xs_with<T>(xs: T[], i: int, v: T): T[] {\n"
+    "  const k = i < 0 ? xs.length + i : i;\n"
+    "  if (k < 0 || k >= xs.length) __xs_throw(\"RangeError: Invalid index : \" + i);\n"
+    "  const out: T[] = [];\n"
+    "  for (let j = 0; j < xs.length; j++) out.push(j === k ? v : xs[j]);\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_toSpliced<T>(xs: T[], start: int, del: int, items: T[]): T[] {\n"
+    "  const n = xs.length;\n"
+    "  const s = start < 0 ? Math.max(n + start, 0) : Math.min(start, n);\n"
+    "  const d = Math.min(Math.max(del, 0), n - s);\n"
+    "  const out: T[] = [];\n"
+    "  for (let j = 0; j < s; j++) out.push(xs[j]);\n"
+    "  for (const x of items) out.push(x);\n"
+    "  for (let j = s + d; j < n; j++) out.push(xs[j]);\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_copyWithin<T>(xs: T[], target: int, start: int, end: int): T[] {\n"
+    "  const n = xs.length;\n"
+    "  const to = target < 0 ? Math.max(n + target, 0) : Math.min(target, n);\n"
+    "  const from = start < 0 ? Math.max(n + start, 0) : Math.min(start, n);\n"
+    "  const fin = end < 0 ? Math.max(n + end, 0) : Math.min(end, n);\n"
+    "  const count = Math.min(fin - from, n - to);\n"
+    "  if (count <= 0) return xs;\n"
+    "  const tmp: T[] = [];\n"
+    "  for (let j = 0; j < count; j++) tmp.push(xs[from + j]);\n"
+    "  for (let j = 0; j < count; j++) xs[to + j] = tmp[j];\n"
+    "  return xs;\n"
+    "}\n"
+    "// xs.values() / xs.keys(): iterators (generators) over the array, read as it is at each step\n"
+    "export function* __xs_values<T>(xs: T[]): Generator<T> {\n"
+    "  for (let i = 0; i < xs.length; i++) yield xs[i];\n"
+    "}\n"
+    "export function* __xs_keys<T>(xs: T[]): Generator<int> {\n"
+    "  for (let i = 0; i < xs.length; i++) yield i;\n"
+    "}\n"
+    "// Object.groupBy / Map.groupBy (ES2024)\n"
+    "export function __xs_groupBy<T>(xs: T[], f: (x: T, i: int) => string): Record<string, T[]> {\n"
+    "  const out: Record<string, T[]> = {};\n"
+    "  for (let i = 0; i < xs.length; i++) {\n"
+    "    const k = f(xs[i], i);\n"
+    "    const g = out[k];\n"
+    "    if (g === null) out[k] = [xs[i]];\n"
+    "    else g.push(xs[i]);\n"
+    "  }\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_mapGroupBy<K, T>(xs: T[], f: (x: T, i: int) => K): Map<K, T[]> {\n"
+    "  const out = new Map<K, T[]>();\n"
+    "  for (let i = 0; i < xs.length; i++) {\n"
+    "    const k = f(xs[i], i);\n"
+    "    const g = out.get(k);\n"
+    "    if (g === null) out.set(k, [xs[i]]);\n"
+    "    else g.push(xs[i]);\n"
+    "  }\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_set_values<T>(s: Set<T>): T[] {\n"
+    "  const out: T[] = [];\n"
+    "  for (const x of s) out.push(x);\n"
+    "  return out;\n"
+    "}\n"
+    "// Set methods (ES2025), in the order of the specification's steps\n"
+    "export function __xs_set_union<T>(a: Set<T>, b: Set<T>): Set<T> {\n"
+    "  const out = new Set<T>();\n"
+    "  for (const x of a) out.add(x);\n"
+    "  for (const x of b) out.add(x);\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_set_intersection<T>(a: Set<T>, b: Set<T>): Set<T> {\n"
+    "  const out = new Set<T>();\n"
+    "  if (a.size <= b.size) { for (const x of a) if (b.has(x)) out.add(x); }\n"
+    "  else { for (const x of b) if (a.has(x)) out.add(x); }\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_set_difference<T>(a: Set<T>, b: Set<T>): Set<T> {\n"
+    "  const out = new Set<T>();\n"
+    "  for (const x of a) out.add(x);\n"
+    "  if (a.size <= b.size) { for (const x of a) if (b.has(x)) out.delete(x); }\n"
+    "  else { for (const x of b) out.delete(x); }\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_set_symmetricDifference<T>(a: Set<T>, b: Set<T>): Set<T> {\n"
+    "  const out = new Set<T>();\n"
+    "  for (const x of a) out.add(x);\n"
+    "  for (const x of b) { if (a.has(x)) out.delete(x); else out.add(x); }\n"
+    "  return out;\n"
+    "}\n"
+    "export function __xs_set_isSubsetOf<T>(a: Set<T>, b: Set<T>): boolean {\n"
+    "  if (a.size > b.size) return false;\n"
+    "  for (const x of a) if (!b.has(x)) return false;\n"
+    "  return true;\n"
+    "}\n"
+    "export function __xs_set_isSupersetOf<T>(a: Set<T>, b: Set<T>): boolean {\n"
+    "  if (a.size < b.size) return false;\n"
+    "  for (const x of b) if (!a.has(x)) return false;\n"
+    "  return true;\n"
+    "}\n"
+    "export function __xs_set_isDisjointFrom<T>(a: Set<T>, b: Set<T>): boolean {\n"
+    "  if (a.size <= b.size) { for (const x of a) if (b.has(x)) return false; }\n"
+    "  else { for (const x of b) if (a.has(x)) return false; }\n"
+    "  return true;\n"
+    "}\n"
+    "// iterator helpers (ES2025) that the generators' own (map, filter, take, forEach, reduce, toArray) do not cover\n"
+    "// (the count is checked when the helper is called, as JavaScript does: the generators below are lazy)\n"
+    "export function __xs_it_drop<T>(g: Generator<T>, n: number): Generator<T> {\n"
+    "  // (the count as an integer, as JavaScript's ToIntegerOrInfinity: 1.5 is 1, -0.5 is 0; NaN and below 0 throw)\n"
+    "  const k: number = n !== n ? -1 : Math.trunc(n);\n"
+    "  if (!(k >= 0)) __xs_throw(\"RangeError: \" + n + \" must be positive\");\n"
+    "  return __xs_it_drop_(g, k);\n"
+    "}\n"
+    "export function* __xs_it_drop_<T>(g: Generator<T>, n: number): Generator<T> {\n"
+    "  let i = 0;\n"
+    "  for (const x of g) {\n"
+    "    if (i < n) { i++; continue; }\n"
+    "    yield x;\n"
+    "  }\n"
+    "}\n"
+    "export function __xs_it_take<T>(g: Generator<T>, n: number): Generator<T> {\n"
+    "  // (the count as an integer, as JavaScript's ToIntegerOrInfinity: 1.5 is 1, -0.5 is 0; NaN and below 0 throw)\n"
+    "  const k: number = n !== n ? -1 : Math.trunc(n);\n"
+    "  if (!(k >= 0)) __xs_throw(\"RangeError: \" + n + \" must be positive\");\n"
+    "  return __xs_it_take_(g, k);\n"
+    "}\n"
+    "export function* __xs_it_take_<T>(g: Generator<T>, n: number): Generator<T> {\n"
+    "  if (n === 0) return;\n"
+    "  let i = 0;\n"
+    "  for (const x of g) {\n"
+    "    yield x;\n"
+    "    i++;\n"
+    "    if (i >= n) return;\n"
+    "  }\n"
+    "}\n"
+    "export function* __xs_it_map<T, U>(g: Generator<T>, f: (x: T, i: int) => U): Generator<U> {\n"
+    "  let i = 0;\n"
+    "  for (const x of g) yield f(x, i++);\n"
+    "}\n"
+    "export function* __xs_it_filter<T>(g: Generator<T>, f: (x: T, i: int) => boolean): Generator<T> {\n"
+    "  let i = 0;\n"
+    "  for (const x of g) if (f(x, i++)) yield x;\n"
+    "}\n"
+    "export function* __xs_it_flatMap<T, U>(g: Generator<T>, f: (x: T, i: int) => U[]): Generator<U> {\n"
+    "  let i = 0;\n"
+    "  for (const x of g) for (const y of f(x, i++)) yield y;\n"
+    "}\n"
+    "export function __xs_it_forEach<T>(g: Generator<T>, f: (x: T, i: int) => void): void {\n"
+    "  let i = 0;\n"
+    "  for (const x of g) f(x, i++);\n"
+    "}\n"
+    "export function __xs_it_some<T>(g: Generator<T>, f: (x: T, i: int) => boolean): boolean {\n"
+    "  let i = 0;\n"
+    "  for (const x of g) if (f(x, i++)) return true;\n"
+    "  return false;\n"
+    "}\n"
+    "export function __xs_it_every<T>(g: Generator<T>, f: (x: T, i: int) => boolean): boolean {\n"
+    "  let i = 0;\n"
+    "  for (const x of g) if (!f(x, i++)) return false;\n"
+    "  return true;\n"
+    "}\n"
+    "export function __xs_it_find<T>(g: Generator<T>, f: (x: T, i: int) => boolean): T | null {\n"
+    "  let i = 0;\n"
+    "  for (const x of g) if (f(x, i++)) return x;\n"
+    "  return null;\n"
+    "}\n"
+    "export function __xs_it_reduce<A, T>(g: Generator<T>, f: (acc: A, x: T, i: int) => A, init: A): A {\n"
+    "  let acc: A = init;\n"
+    "  let i = 0;\n"
+    "  for (const x of g) acc = f(acc, x, i++);\n"
+    "  return acc;\n"
+    "}\n"
+    "export function __xs_it_reduce1<T>(g: Generator<T>, f: (acc: T, x: T, i: int) => T): T {\n"
+    "  let acc: T | null = null;\n"
+    "  let i = 0;\n"
+    "  for (const x of g) {\n"
+    "    if (i === 0) acc = x;\n"
+    "    else acc = f(acc!, x, i);\n"
+    "    i++;\n"
+    "  }\n"
+    "  if (i === 0) __xs_throw(\"TypeError: Reduce of a done iterator with no initial value\");\n"
+    "  return acc!;\n"
+    "}\n"
+    "export function __xs_it_toArray<T>(g: Generator<T>): T[] {\n"
+    "  const out: T[] = [];\n"
+    "  for (const x of g) out.push(x);\n"
+    "  return out;\n"
+    "}\n"
+    "// Object.is of numbers (NaN is NaN; 0 is not -0), Object.assign of Records\n"
+    "export function __xs_is_num(a: number, b: number): boolean {\n"
+    "  if (a !== a) return b !== b;\n"
+    "  if (a === 0 && b === 0) return 1 / a === 1 / b;\n"
+    "  return a === b;\n"
+    "}\n"
+    "export function __xs_assign_rec<V>(t: Record<string, V>, s: Record<string, V>): Record<string, V> {\n"
+    "  for (const k of Object.keys(s)) t[k] = s[k];\n"
+    "  return t;\n"
+    "}\n"
+    "// BigInt.asUintN / asIntN, bigint.toString(radix)\n"
+    "export function __xs_asUintN(bits: number, b: bigint): bigint {\n"
+    "  const n: number = bits !== bits ? 0 : Math.trunc(bits);\n"
+    "  if (!(n >= 0 && n <= 9007199254740991)) __xs_throw(\"RangeError: Invalid value: not (convertible to) a safe integer\");\n"
+    "  return __xs_big_asn(n, b, 0);\n"
+    "}\n"
+    "export function __xs_asIntN(bits: number, b: bigint): bigint {\n"
+    "  const n: number = bits !== bits ? 0 : Math.trunc(bits);\n"
+    "  if (!(n >= 0 && n <= 9007199254740991)) __xs_throw(\"RangeError: Invalid value: not (convertible to) a safe integer\");\n"
+    "  return __xs_big_asn(n, b, 1);\n"
+    "}\n"
+    "export function __xs_big_radix(b: bigint, radix: number): string {\n"
+    "  const r: number = radix !== radix ? 0 : Math.trunc(radix);\n"
+    "  if (!(r >= 2 && r <= 36)) __xs_throw(\"RangeError: toString() radix argument must be between 2 and 36\");\n"
+    "  if (r === 10) return String(b);\n"
+    "  const neg = b < 0n;\n"
+    "  let x = neg ? -b : b;\n"
+    "  if (x === 0n) return \"0\";\n"
+    "  const digits = \"0123456789abcdefghijklmnopqrstuvwxyz\";\n"
+    "  // a chunk of k digits at a time: r^k below 2^53\n"
+    "  let k = 1;\n"
+    "  let rk: number = r;\n"
+    "  while (rk * r < 9007199254740992) { rk *= r; k++; }\n"
+    "  const R = BigInt(rk);\n"
+    "  const parts: string[] = [];\n"
+    "  while (x > 0n) {\n"
+    "    let c: number = Number(x % R);\n"
+    "    x = x / R;\n"
+    "    let s = \"\";\n"
+    "    for (let j = 0; j < k; j++) {\n"
+    "      s = digits.charAt(c % r) + s;\n"
+    "      c = Math.trunc(c / r);\n"
+    "      if (x === 0n && c === 0) break;\n"
+    "    }\n"
+    "    parts.push(s);\n"
+    "  }\n"
+    "  let out = \"\";\n"
+    "  for (let j = parts.length - 1; j >= 0; j--) out += parts[j];\n"
+    "  return neg ? \"-\" + out : out;\n"
+    "}\n";
+
+/* xisto:promises: Promise.withResolvers and Promise.any (whose rejection is an AggregateError of xisto:errors);
+   loaded only by a program that names them on Promise */
+static const char xs_promises_src[] =
+    "// Promise.withResolvers (ES2024) and Promise.any (ES2021)\n"
+    "export interface PromiseWithResolvers<T> {\n"
+    "  promise: Promise<T>;\n"
+    "  resolve: (v: T) => void;\n"
+    "  reject: (e: Error) => void;\n"
+    "}\n"
+    "export function __xs_withResolvers<T>(): PromiseWithResolvers<T> {\n"
+    "  let res: ((v: T) => void) | null = null;\n"
+    "  let rej: ((e: Error) => void) | null = null;\n"
+    "  const promise = new Promise<T>((a, b) => { res = a; rej = b; });\n"
+    "  return { promise, resolve: res!, reject: rej! };\n"
+    "}\n"
+    "export function __xs_any<T>(ps: Promise<T>[]): Promise<T> {\n"
+    "  return new Promise<T>((resolve, reject) => {\n"
+    "    const errs: Error[] = [];\n"
+    "    let left = ps.length;\n"
+    "    let done = false;\n"
+    "    if (left === 0) { reject(new AggregateError(errs, \"All promises were rejected\")); return; }\n"
+    "    for (let i = 0; i < ps.length; i++) {\n"
+    "      errs.push(new Error(\"\"));\n"
+    "      const k = i;\n"
+    "      ps[i].then((v) => { if (!done) { done = true; resolve(v); } }, (e) => {\n"
+    "        errs[k] = e;\n"
+    "        left--;\n"
+    "        if (left === 0 && !done) { done = true; reject(new AggregateError(errs, \"All promises were rejected\")); }\n"
+    "      });\n"
+    "    }\n"
+    "  });\n"
+    "}\n"
+    "export function __xs_anyVoid(ps: Promise<void>[]): Promise<void> {\n"
+    "  return new Promise<void>((resolve, reject) => {\n"
+    "    const errs: Error[] = [];\n"
+    "    let left = ps.length;\n"
+    "    let done = false;\n"
+    "    if (left === 0) { reject(new AggregateError(errs, \"All promises were rejected\")); return; }\n"
+    "    for (let i = 0; i < ps.length; i++) {\n"
+    "      errs.push(new Error(\"\"));\n"
+    "      const k = i;\n"
+    "      ps[i].then(() => { if (!done) { done = true; resolve(); } }, (e) => {\n"
+    "        errs[k] = e;\n"
+    "        left--;\n"
+    "        if (left === 0 && !done) { done = true; reject(new AggregateError(errs, \"All promises were rejected\")); }\n"
+    "      });\n"
+    "    }\n"
+    "  });\n"
+    "}\n";
+
 /* xisto:errors: JavaScript's Error subclasses, visible in every module like Error itself */
 /* xisto:intl: Intl.DateTimeFormat (en-US, en-GB, pt-BR; numeric and 2-digit fields; a timeZone of the system TZ
    database), as Node formats it; loaded when the program names Intl */
@@ -6517,7 +7234,9 @@ static const char xs_errors_src[] =
     "export class RangeError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"RangeError\"; }\n}\n"
     "export class SyntaxError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"SyntaxError\"; }\n}\n"
     "export class ReferenceError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"ReferenceError\"; }\n}\n"
-    "export class URIError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"URIError\"; }\n}\n";
+    "export class URIError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"URIError\"; }\n}\n"
+    "export class AggregateError extends Error {\n  errors: unknown[];\n"
+    "  constructor(errors: unknown[], message: string = \"\") { super(message); this.name = \"AggregateError\"; this.errors = errors; }\n}\n";
 /* xisto:reflect: the descriptors the compiler builds for decorated classes (see "static reflection") */
 static const char xs_reflect_src[] =
     "// What a type is, and how to read and write a value of it as JSON.\n"
@@ -6729,7 +7448,102 @@ static const char xs_os_src[] =
     "export function version(): string {\n  return os_kernel_text(1);\n}\n"
     "export function tmpdir(): string {\n  return os_tmp_dir();\n}\n"
     "export function homedir(): string {\n  return os_home_dir();\n}\n"
-    "export const EOL: string = \"\\n\";\n";
+    "export const EOL: string = \"\\n\";\n"
+    "export const devNull: string = \"/dev/null\";\n"
+    "declare function os_machine_name(): string;\n"
+    "declare function os_figures(): number[];\n"
+    "declare function os_user_info(): string[];\n"
+    "declare function os_interfaces(): string[];\n"
+    "declare function os_constant_list(kind: int): string[];\n"
+    "export function machine(): string {\n"
+    "  return os_machine_name();\n"
+    "}\n"
+    "export function endianness(): string {\n"
+    "  return \"LE\";\n"
+    "}\n"
+    "export function uptime(): number {\n"
+    "  return os_figures()[0];\n"
+    "}\n"
+    "export function loadavg(): number[] {\n"
+    "  const f = os_figures();\n"
+    "  return [f[1], f[2], f[3]];\n"
+    "}\n"
+    "export function totalmem(): number {\n"
+    "  return os_figures()[4];\n"
+    "}\n"
+    "export function freemem(): number {\n"
+    "  return os_figures()[5];\n"
+    "}\n"
+    "export function availableMemory(): number {\n"
+    "  return os_figures()[5];\n"
+    "}\n"
+    "export interface UserInfo {\n"
+    "  uid: int;\n"
+    "  gid: int;\n"
+    "  username: string;\n"
+    "  homedir: string;\n"
+    "  shell: string | null;\n"
+    "}\n"
+    "export function userInfo(options: object | null = null): UserInfo {\n"
+    "  const u = os_user_info();\n"
+    "  if (u.length < 5) return { uid: -1, gid: -1, username: \"\", homedir: os_home_dir(), shell: null };\n"
+    "  return { uid: Math.trunc(parseInt(u[0], 10)), gid: Math.trunc(parseInt(u[1], 10)), username: u[2], homedir: u[3], shell: u[4] };\n"
+    "}\n"
+    "export interface NetworkInterfaceInfo {\n"
+    "  address: string;\n"
+    "  netmask: string;\n"
+    "  family: string;\n"
+    "  mac: string;\n"
+    "  internal: boolean;\n"
+    "  cidr: string | null;\n"
+    "  scopeid?: int;\n"
+    "}\n"
+    "function __os_prefix(mask: string, v6: boolean): int {\n"
+    "  let bits = 0;\n"
+    "  for (const part of mask.split(v6 ? \":\" : \".\")) {\n"
+    "    let n = part.length === 0 ? 0 : Math.trunc(parseInt(part, v6 ? 16 : 10));\n"
+    "    while (n > 0) {\n"
+    "      bits += n & 1;\n"
+    "      n = n >> 1;\n"
+    "    }\n"
+    "  }\n"
+    "  return bits;\n"
+    "}\n"
+    "export function networkInterfaces(): Record<string, NetworkInterfaceInfo[]> {\n"
+    "  const out: Record<string, NetworkInterfaceInfo[]> = {};\n"
+    "  for (const line of os_interfaces()) {\n"
+    "    const f = line.split(\"\\t\");\n"
+    "    const v6 = f[1] === \"IPv6\";\n"
+    "    const info: NetworkInterfaceInfo = { address: f[2], netmask: f[3], family: f[1], mac: f[4], internal: f[5] === \"1\", cidr: f[2] + \"/\" + __os_prefix(f[3], v6) };\n"
+    "    if (v6) info.scopeid = Math.trunc(parseInt(f[6], 10));\n"
+    "    const list = out[f[0]];\n"
+    "    if (list === undefined) out[f[0]] = [info];\n"
+    "    else list.push(info);\n"
+    "  }\n"
+    "  return out;\n"
+    "}\n"
+    "function __os_table(kind: int): Record<string, int> {\n"
+    "  const r: Record<string, int> = {};\n"
+    "  for (const line of os_constant_list(kind)) {\n"
+    "    const t = line.indexOf(\"\\t\");\n"
+    "    r[line.slice(0, t)] = Math.trunc(parseInt(line.slice(t + 1), 10));\n"
+    "  }\n"
+    "  return r;\n"
+    "}\n"
+    "export interface OsPriority {\n"
+    "  PRIORITY_LOW: int;\n"
+    "  PRIORITY_BELOW_NORMAL: int;\n"
+    "  PRIORITY_NORMAL: int;\n"
+    "  PRIORITY_ABOVE_NORMAL: int;\n"
+    "  PRIORITY_HIGH: int;\n"
+    "  PRIORITY_HIGHEST: int;\n"
+    "}\n"
+    "/** os.constants: the signals' and errno's numbers on this system, and the scheduling priorities. */\n"
+    "export class constants {\n"
+    "  static readonly signals: Record<string, int> = __os_table(0);\n"
+    "  static readonly errno: Record<string, int> = __os_table(1);\n"
+    "  static readonly priority: OsPriority = { PRIORITY_LOW: 19, PRIORITY_BELOW_NORMAL: 10, PRIORITY_NORMAL: 0, PRIORITY_ABOVE_NORMAL: -7, PRIORITY_HIGH: -14, PRIORITY_HIGHEST: -20 };\n"
+    "}\n";
 static void parse_module(Program *prog, Module *m);
 
 /* xisto:fs is the canonical name of a built-in module; node:fs (and the bare fs, sqlite) only in Node
@@ -6759,16 +7573,12 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
     }
     m->id = prog->nmodules;
     prog->modules[prog->nmodules++] = m;
-    if (strcmp(name, "fs") == 0) {
+    if (strcmp(name, "fs_native") == 0) { /* what runtime/node/fs.ts (xisto:fs) re-exports of the runtime's own */
         add_func(prog, builtin_func(m, "readFileSync", "xs_fs_read", ty_string, 2, ty_string, ty_string));
-        add_func(prog, builtin_func(m, "writeFileSync", "xs_fs_write", ty_void, 2, ty_string, ty_string));
-        add_func(prog, builtin_func(m, "appendFileSync", "xs_fs_append", ty_void, 2, ty_string, ty_string));
         add_func(prog, builtin_func(m, "existsSync", "xs_fs_exists", ty_boolean, 1, ty_string, NULL));
-        add_func(prog, builtin_func(m, "unlinkSync", "xs_fs_unlink", ty_void, 1, ty_string, NULL));
         /* file descriptors (checker: check_fs_fd_call fixes the arities and types) */
         add_func(prog, builtin_func(m, "openSync", "xs_fs_open", ty_int, 2, ty_string, ty_string));
         add_func(prog, builtin_func(m, "closeSync", "xs_fs_close", ty_void, 1, ty_int, NULL));
-        add_func(prog, builtin_func(m, "fstatSync", "xs_fs_fstat", ty_int, 1, ty_int, NULL));
         add_func(prog, builtin_func(m, "readSync", "xs_fs_read_sync", ty_int, 2, ty_int, ty_int));
         return m;
     }
@@ -6783,6 +7593,24 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->builtin = false;
         m->file = "xisto:settled";
         m->src = (char *)xs_settled_src;
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
+    if (strcmp(name, "promises") == 0) { /* xisto:promises: Promise.withResolvers, Promise.any (see xs_promises_src) */
+        m->builtin = false;
+        m->file = "xisto:promises";
+        m->src = (char *)xs_promises_src;
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
+    if (strcmp(name, "builtins") == 0) { /* xisto:builtins: at, groupBy, the Set methods... (see xs_builtins_src) */
+        m->builtin = false;
+        m->file = "xisto:builtins";
+        m->src = (char *)xs_builtins_src;
         m->loading = true;
         parse_module(prog, m);
         m->loading = false;
@@ -6878,6 +7706,20 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         m->loading = false;
         return m;
     }
+    if (strcmp(name, "fs") == 0 || strcmp(name, "fs_callbacks") == 0) {
+        /* Node's fs, written in xisto: runtime/node/fs.ts (synchronous), fs_callbacks.ts (fs.readFile & co, see fs_extras) */
+        extern const unsigned char xs_node_fs_ts[], xs_node_fs_callbacks_ts[];
+        bool cb = strcmp(name, "fs_callbacks") == 0;
+        m->builtin = false;
+        m->file = cb ? "xisto:fs_callbacks" : "xisto:fs";
+        m->src = (char *)(cb ? xs_node_fs_callbacks_ts : xs_node_fs_ts);
+        m->native_prefix = "xs_";
+        if (cb) prog->uses_net = true; /* (the callbacks come on the event loop) */
+        m->loading = true;
+        parse_module(prog, m);
+        m->loading = false;
+        return m;
+    }
     if (strcmp(name, "fs/promises") == 0) { /* Node's fs/promises for text files, written in xisto: runtime/node/fs_promises.ts */
         extern const unsigned char xs_node_fs_promises_ts[];
         m->builtin = false;
@@ -6890,6 +7732,8 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
     }
     { /* Node's modules written in xisto over runtime functions (runtime/node/NAME.ts, NODE_TS in the Makefile) */
         extern const unsigned char xs_node_events_ts[], xs_node_process_ts[], xs_node_http_ts[], xs_node_net_ts[], xs_node_dns_ts[], xs_node_child_process_ts[], xs_node_https_ts[], xs_node_tls_ts[], xs_node_diagnostics_channel_ts[], xs_node_buffer_ts[], xs_node_util_ts[], xs_node_querystring_ts[], xs_node_string_decoder_ts[], xs_node_zlib_ts[], xs_node_stream_ts[], xs_node_stream_promises_ts[], xs_node_stream_web_ts[];
+        extern const unsigned char xs_node_tty_ts[], xs_node_readline_ts[], xs_node_readline_promises_ts[];
+        extern const unsigned char xs_node_console_ts[], xs_node_perf_hooks_ts[], xs_node_assert_ts[], xs_node_assert_strict_ts[], xs_node_test_ts[];
         static const struct { const char *name; const unsigned char *src; bool net; bool tls; } node_ts[] = {
             {"events", xs_node_events_ts, false},
             {"process", xs_node_process_ts, true}, /* (signals and the exit hook live with the event loop) */
@@ -6908,6 +7752,8 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
             {"stream", xs_node_stream_ts, true}, /* (streams defer with process.nextTick and setImmediate) */
             {"stream/promises", xs_node_stream_promises_ts, true}, /* (a name with a slash: runtime/node/stream_promises.ts) */
             {"stream/web", xs_node_stream_web_ts, true},
+            {"tty", xs_node_tty_ts, true}, {"readline", xs_node_readline_ts, true}, {"readline/promises", xs_node_readline_promises_ts, true},
+            {"console", xs_node_console_ts, false}, {"perf_hooks", xs_node_perf_hooks_ts, false}, {"assert", xs_node_assert_ts, false}, {"assert/strict", xs_node_assert_strict_ts, false}, {"test", xs_node_test_ts, true},
         };
         for (size_t i = 0; i < sizeof node_ts / sizeof node_ts[0]; i++) {
             if (strcmp(name, node_ts[i].name) != 0) continue;
@@ -6924,7 +7770,6 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
             return m;
         }
     }
-    if (strcmp(name, "perf_hooks") == 0) return m; /* performance is built in (performance.now()) */
     if (strcmp(name, "timers") == 0) return m; /* setTimeout & co are the built-in globals (checker: import check) */
     if (strcmp(name, "worker_threads") == 0 || strcmp(name, "os") == 0) { /* written in xisto over runtime functions */
         bool wt = strcmp(name, "worker_threads") == 0;
@@ -6972,7 +7817,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         prog->uses_okmap = true;
         return m;
     }
-    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:stream, xisto:stream/promises, xisto:stream/web, xisto:buffer, xisto:util, xisto:querystring, xisto:string_decoder, xisto:zlib, xisto:timers, xisto:http, xisto:https, xisto:tls, xisto:diagnostics_channel, xisto:net, xisto:dns, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random, xisto:profiler", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:stream, xisto:stream/promises, xisto:stream/web, xisto:buffer, xisto:util, xisto:querystring, xisto:string_decoder, xisto:zlib, xisto:timers, xisto:http, xisto:https, xisto:tls, xisto:diagnostics_channel, xisto:net, xisto:dns, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random, xisto:profiler, xisto:assert, xisto:assert/strict, xisto:test", "unknown built-in module '%s'", spec);
     return NULL;
 }
 
@@ -7123,6 +7968,8 @@ Program *parse_program(const char *entry_file) {
     load_module(prog, entry_file, (Pos){0, 0}, NULL);
     if (wants_arrays) load_module(prog, "xisto:arrays", (Pos){1, 1}, entry_file);
     if (wants_settled) load_module(prog, "xisto:settled", (Pos){1, 1}, entry_file);
+    if (wants_builtins) load_module(prog, "xisto:builtins", (Pos){1, 1}, entry_file);
+    if (wants_promises) load_module(prog, "xisto:promises", (Pos){1, 1}, entry_file); /* (before errors: it names AggregateError) */
     if (wants_okmap) load_module(prog, "xisto:okmap", (Pos){1, 1}, entry_file);
     if (wants_url) load_module(prog, "xisto:url", (Pos){1, 1}, entry_file); /* (before errors: its DOMException extends Error) */
     if (wants_errors) load_module(prog, "xisto:errors", (Pos){1, 1}, entry_file);

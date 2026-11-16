@@ -52,6 +52,8 @@ Most typed TypeScript compiles as written. The rules you meet first:
 - [Classes, interfaces and generics](./classes-interfaces-generics.md): dispatch, adapters, unions, tuples.
 - [Functions and async](./functions-async.md): closures, promises, timers.
 - [Generators](./generators.md): `function*` and `for…of`.
+- [Recent built-in methods](./builtins.md): `at`, `toSorted`, `Object.groupBy`, Set methods, iterator helpers,
+  `Promise.any`.
 - [Modules](./modules.md): imports, barrels, `xisto:` and `node:`, packages.
 - [Errors](./errors.md): `throw`, `try`, stack traces.
 - [Decorators](./decorators.md): static reflection and method decorators.

@@ -318,6 +318,8 @@ struct Expr {
     void *ctx;         /* checker: where its names resolve when that is not where it is checked (a parameter's default) */
     bool unset;        /* E_NULL: the start of `let x: Cls;` (assigned before any read, TypeScript checks it) */
     bool boolean;      /* E_BOOL */
+    bool spread_read;  /* (a field read that a spread or Object.assign made: a TS private field is copied, as JS does) */
+    bool own_in;       /* (k in o from Object.hasOwn / hasOwnProperty.call: own fields only, not the class's methods) */
     bool prechecked;   /* checked already (its type is final): check_expr leaves it as it is */
     bool want_tuple;   /* E_ARRAY_LIT: [k, v] returned to new Map(xs.map(...)): a tuple, as TypeScript reads it there */
     bool upath;        /* E_AS: a union-typed field path (r.data, this.state, t[0]) read as the member a test narrowed it to (checked) */
@@ -376,6 +378,8 @@ struct Arrow {
     Type *gen_in;      /* <T>(xs: T[], ...) => ...: its parameters as written (Type.gen_in) */
     Type *gen_sig;     /* async <T>(sql: string): Promise<T | null> => ...: its signature as written (Type.gen_sig); the body
                           reads T as unknown */
+    Func *mv_method;   /* o.m read as a value (checker: method_value): the method m. Its closures are one function for ===
+                          (their origin, xs_fn_origin), as o.m and p.m of one class are in JavaScript */
 };
 
 typedef enum { S_VAR, S_EXPR, S_IF, S_WHILE, S_FOR, S_RETURN, S_BLOCK, S_SWITCH, S_BREAK, S_CONTINUE, S_FOROF, S_TRY, S_THROW, S_YIELD } StmtKind;
@@ -734,6 +738,7 @@ typedef struct {
     char **lits;       /* interned string literals */
     int nlits, cap_lits;
     bool uses_net;
+    bool uses_console_group; /* console.group or console.groupCollapsed was named: console.log & co are emitted with the group's indentation (xs_grp_begin) */
     bool uses_workers; /* imports xisto:worker_threads: per-thread globals, the program body callable (emit.c) */
     bool uses_parallel; /* imports xisto:parallel (parser) */
     bool par_native;   /* some call of it runs on the thread pool (parallel.c): per-thread runtime state (XS_THREADS),

@@ -1,8 +1,8 @@
-// expect: methods are not values
+// expect: the generic method 'f' is not a value
 class A {
-  f(): int {
-    return 1;
+  f<T>(x: T): T {
+    return x;
   }
 }
 const a: A = new A();
-const g: A = a.f;
+const g = a.f;

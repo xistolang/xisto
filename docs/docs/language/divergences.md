@@ -51,9 +51,11 @@ Every row was checked on 12 Nov 2026 by running the same program with xisto and 
 | `s[i]` | a character | error XS6033 | use `s.slice(i, i + 1)` |
 | `s.match("text")` | converts to a RegExp | error XS7096 | no implicit conversion |
 | `s.normalize("NFD")` | decomposes | returns the string unchanged | no Unicode tables |
-| `m.keys()`, `m.values()` | iterators | arrays | |
+| `m.keys()`, `m.values()` | iterators | arrays (`take`, `drop`, `toArray` make them lazy iterators) | |
+| `xs.at(99)`, `xs.findLast(f)` with no match | `undefined` | `null` | one empty value |
+| `Object.freeze(o)`, then `o.x = 1` | `TypeError` (strict mode) | the write happens; `Object.isFrozen` is refused | no flag per object |
+| `console.log(new AggregateError(es, m))` | the stack, then `[errors]` | `AggregateError: m {` `[errors]: ... }` | xisto prints no frames |
 | `m.set(new, …)` inside `for…of` over `m` | the loop sees it | the loop does not see it | |
-| `numbers.sort()` without comparator | sorts as strings | error XS7089 (strings sort as on Node) | the default surprises |
 | `const a = []` | `any[]` | error XS3008 | a type is needed |
 | `new Date("bad").getFullYear()` | `NaN` | `0` | getters return `int` |
 | `Date.toString()` zone name | `(Brasilia Standard Time)` | `(-03)` | no ICU data |
@@ -67,6 +69,10 @@ Every row was checked on 12 Nov 2026 by running the same program with xisto and 
 | bare `f();` of an async function | runs to its first `await` | runs to the end | no promise unless kept |
 | function that can reach its end without `return` | allowed | error XS8058 | |
 | `throw "text"` | allowed | error XS8005 | only objects can be thrown |
+| `const g = obj.method; g()` | `this` is lost (`TypeError`) | bound to `obj` | correct programs run the same |
+| `obj.method === obj.method` | `true` | `false` (a new bound function per read) | keep it in a variable for `on`/`off` |
+| `a.m.bind(b)`, `a.m.call(b)` | `a`'s `m` with `this = b` | `b`'s `m` | dispatch on the object it runs on |
+| `JSON.stringify(x, replacer)` | the replacer sees class instances | it sees them as plain objects | the value is rewritten from its JSON |
 | `catch (e)` | `unknown` | `Error` | |
 | class object passed as a data interface | the same object | a copy | fixed layouts |
 | class object passed as a method interface without `implements` | the same object | an adapter: `===` differs | |
@@ -79,7 +85,9 @@ Every row was checked on 12 Nov 2026 by running the same program with xisto and 
 
 Earlier versions refused these; they now behave as on Node: `==` without conversion, `int` mixed with `number`
 (warning XS2103), optional `boolean`/`int` fields, `(int | null)[]`, regex backreferences and lookaround,
-`extends Error`, `Promise.all` of different types (a tuple), `Buffer`, `string[].sort()`, `process.env.X`.
+`extends Error`, `Promise.all` of different types (a tuple), `Buffer`, `string[].sort()`, `process.env.X`, `sort()` and `toSorted()` without a comparator on numbers, bigints,
+booleans and `unknown[]` (the elements' `String()` forms by UTF-16 code units, as on Node: `[1, 10, 2, 3]`),
+`Object.assign({}, a)`, `Promise.reject(e)` beside other promises in `Promise.all`/`race`/`any`/`allSettled`.
 
 ## See also
 

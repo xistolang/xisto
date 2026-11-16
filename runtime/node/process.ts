@@ -1,9 +1,9 @@
 // xisto:process: the members of Node's process beyond argv, env, pid, cwd(), exit(), exitCode and
 // stdout/stderr.write (those are built into the compiler). The compiler reads process.X for any other X as
 // XistoProcess.X (src/checker.c), and loads this module when the program names one (src/parser.c).
-// Differences from Node (docs/docs/guides/node-compatibility.md): 'uncaughtException' and 'unhandledRejection'
-// listeners are not called (an uncaught error ends the program as before); memoryUsage().heapUsed is an estimate
-// from the number of live objects; process.version is the Node version whose API xisto follows.
+// Differences from Node (docs/docs/guides/node-compatibility.md): memoryUsage().heapUsed is an estimate from the
+// number of live objects; process.version is the Node version whose API xisto follows; 'rejectionHandled' is not
+// emitted.
 import { EventEmitter, Listener } from "xisto:events";
 
 declare function os_platform_name(): string;
@@ -26,6 +26,7 @@ declare function process_on_exit(cb: (code: int, before: boolean) => void): void
 declare function process_signal_watch(sig: int, cb: (sig: int) => void): void;
 declare function process_signal_unwatch(sig: int): void;
 declare function next_tick(cb: () => void): void;
+declare function process_on_uncaught(uncaught: (err: Error, origin: string) => boolean, rejection: (reason: Error, p: Promise<void>) => boolean): void;
 
 /** What process.memoryUsage() gives, in bytes. */
 export class MemoryUsage {
@@ -115,6 +116,35 @@ function onExit(code: int, before: boolean): void {
 }
 
 let exitHooked = false;
+
+// an error nothing caught (xs_uncaught_run, xs_call_guarded): true when a listener took it and the program goes on
+let captureCallback: ((err: Error) => void) | null = null;
+function onUncaught(err: Error, origin: string): boolean {
+  if (captureCallback !== null) {
+    const cb = captureCallback as (err: Error) => void;
+    cb(err);
+    return true;
+  }
+  XistoProcess.emitter.emit("uncaughtExceptionMonitor", err, origin);
+  if (XistoProcess.emitter.listenerCount("uncaughtException") === 0) return false;
+  XistoProcess.emitter.emit("uncaughtException", err, origin);
+  return true;
+}
+// a rejection no handler took by the end of the microtasks (xs_unh_check): 'unhandledRejection', else (Node's
+// --unhandled-rejections=throw) 'uncaughtException' with the origin "unhandledRejection"
+function onRejection(reason: Error, p: Promise<void>): boolean {
+  if (XistoProcess.emitter.listenerCount("unhandledRejection") > 0) {
+    XistoProcess.emitter.emit("unhandledRejection", reason, p);
+    return true;
+  }
+  return onUncaught(reason, "unhandledRejection");
+}
+let errorsHooked = false;
+function hookErrors(): void {
+  if (errorsHooked) return;
+  errorsHooked = true;
+  process_on_uncaught(onUncaught, onRejection);
+}
 
 function systemError(code: string, syscall: string, detail: string): Error {
   const texts: Map<string, string> = new Map<string, string>([
@@ -242,8 +272,20 @@ export class XistoProcess {
     console.error(`(node:${process.pid}) ${c}${name}: ${text}\n(Use \`node --trace-warnings ...\` to show where the warning was created)`);
   }
 
+  /** process.setUncaughtExceptionCaptureCallback(fn): fn takes the uncaught errors instead of 'uncaughtException'. */
+  static setUncaughtExceptionCaptureCallback(fn: ((err: Error) => void) | null): void {
+    if (fn !== null && captureCallback !== null)
+      throw new Error("`process.setupUncaughtExceptionCapture()` was called while a capture callback was already active");
+    captureCallback = fn;
+    if (fn !== null) hookErrors();
+  }
+  static hasUncaughtExceptionCaptureCallback(): boolean {
+    return captureCallback !== null;
+  }
+
   private static hook(event: string): void {
-    if ((event === "exit" || event === "beforeExit") && !exitHooked) {
+    if (event === "uncaughtException" || event === "uncaughtExceptionMonitor" || event === "unhandledRejection") hookErrors();
+    else if ((event === "exit" || event === "beforeExit") && !exitHooked) {
       exitHooked = true;
       process_on_exit(onExit);
     } else if (isSignal(event) && !watched.has(event)) {

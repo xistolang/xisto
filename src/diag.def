@@ -261,6 +261,8 @@ DIAG(XS7124, DC_RUNTIME_API, "new Int32Array takes a length or a SharedArrayBuff
 DIAG(XS7125, DC_RUNTIME_API, "unknown Atomics member '%s'")
 DIAG(XS7126, DC_RUNTIME_API, "Atomics.%s takes %d to %d arguments, got %d")
 DIAG(XS7127, DC_RUNTIME_API, "Atomics.%s works on an Int32Array, not %s")
+DIAG(XS7150, DC_UNSUPPORTED, "globalThis.%s is not a global xisto knows")
+DIAG(XS7151, DC_UNSUPPORTED, "%s")
 DIAG(XS8001, DC_TYPE_RULE, "%s cannot be built from a row")
 DIAG(XS8002, DC_TYPE_RULE, "%s cannot be built from an object literal")
 DIAG(XS8003, DC_TYPE_RULE, "%s cannot be constructed directly")

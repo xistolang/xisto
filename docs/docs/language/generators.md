@@ -49,7 +49,18 @@ error[XS6011]: 'yield' inside a try with finally is not supported yet
 ```
 
 - `.next()` is not available: iterate with `for…of`.
-- A generator cannot be spread (`[...g]`) or passed to `Array.from`. Collect with a loop and `push`.
+- A generator cannot be spread (`[...g]`): collect it with `Array.from(g)` or `g.toArray()`.
+
+## Iterator helpers
+
+Generators have the iterator helpers of ES2025, lazy as on Node: `map`, `filter`, `take`, `drop`, `flatMap`,
+`forEach`, `reduce`, `some`, `every`, `find`, `toArray`. An array's `values()` and `keys()` are generators too.
+See [Recent built-in methods](./builtins.md#iterator-helpers-es2025).
+
+```ts
+function* fib(): Generator<number> { let a = 0, b = 1; while (true) { yield a; [a, b] = [b, a + b]; } }
+console.log(fib().filter((x) => x % 2 === 0).take(5).toArray());   // [ 0, 2, 8, 34, 144 ]
+```
 
 ## See also
 
