@@ -139,6 +139,8 @@ DIAG(XS6046, DC_UNSUPPORTED, "'%s' is a function: 'new' makes objects of classes
 DIAG(XS6047, DC_UNSUPPORTED, "'%s' declares 'this': call it as %s.call(obj, ...) or %s.apply(obj, [...])")
 DIAG(XS6048, DC_UNSUPPORTED, "%s.apply takes its arguments as an array literal here")
 DIAG(XS6049, DC_UNSUPPORTED, "a symbol key here must be a constant made by Symbol(\"description\")")
+DIAG(XS6050, DC_UNSUPPORTED, "import() takes a string literal: a native binary knows its modules when it is built")
+DIAG(XS6051, DC_UNSUPPORTED, "the module of import() is read through its names (m.x), not as a value")
 DIAG(XS7001, DC_RUNTIME_API, "Array.%s takes one argument here")
 DIAG(XS7002, DC_RUNTIME_API, "BigInt() converts int, number or string, but this is %s")
 DIAG(XS7003, DC_RUNTIME_API, "BigInt() takes exactly one argument")

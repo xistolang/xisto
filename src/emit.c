@@ -14471,9 +14471,42 @@ static const char xs_okey_c[] =
     "    int n = k ? snprintf(b, sizeof b, \"p%p\", k) : snprintf(b, sizeof b, \"z\");\n"
     "    return xs_str_new(b, (size_t)n);\n"
     "}\n";
+/* import("./x"): the modules only an import() reaches (not the entry's static imports, directly or through others)
+   are lazy: their top level runs in xs_lazy_m<id>() on the first import() (Node evaluates them then), not at start */
+static void lazy_compute(Program *p) {
+    if (!p->ndyn_mods || !p->nmodules) return;
+    int maxid = 0;
+    for (int i = 0; i < p->nmodules; i++) if (p->modules[i]->id > maxid) maxid = p->modules[i]->id;
+    char *reach = calloc((size_t)maxid + 1, 1), *dynr = calloc((size_t)maxid + 1, 1);
+    Module **st = malloc(sizeof(Module *) * (size_t)(p->nmodules + 1));
+    for (int pass = 0; pass < 2; pass++) {
+        char *mark = pass ? dynr : reach;
+        int n = 0;
+        if (pass) for (int i = 0; i < p->ndyn_mods; i++) { if (!mark[p->ndyn_mods ? p->dyn_mods[i]->id : 0]) { mark[p->dyn_mods[i]->id] = 1; st[n++] = p->dyn_mods[i]; } }
+        else { Module *entry = p->modules[p->nmodules - 1]; mark[entry->id] = 1; st[n++] = entry; }
+        while (n) {
+            Module *m = st[--n];
+            for (int k = 0; k < m->nimports; k++) {
+                Module *f = m->imports[k].from;
+                if (m->imports[k].dynamic || !f || f->id > maxid || mark[f->id]) continue;
+                mark[f->id] = 1;
+                st[n++] = f;
+            }
+        }
+    }
+    for (int i = 0; i < p->nmodules; i++) {
+        Module *m = p->modules[i];
+        m->lazy = dynr[m->id] && !reach[m->id] && !m->builtin && !(m->path && !strncmp(m->path, "builtin:", 8));
+    }
+    free(reach); free(dynr); free(st);
+}
 void emit_program(Program *p, Buf *o) {
     out = o;
     prog = p;
+    lazy_compute(p);
+    for (int i = 0; i < p->nmodules; i++)
+        if ((p->modules[i]->dyn_target && !p->modules[i]->builtin) || p->modules[i]->lazy) buf_printf(out, "static void xs_lazy_m%d(void);\n", p->modules[i]->id);
+    if (p->ndyn_mods) buf_puts(out, "static inline void xs_lazy_none(void) {}\n");
     if (p->uses_this_reg) buf_puts(out, xs_this_reg_c);
     if (p->uses_clone) buf_puts(out, "static void *xs_structured_clone(void *v);\n");
     if (p->uses_plain) buf_puts(out, "static bool xs_is_plain(void *v);\n");
@@ -14708,6 +14741,25 @@ void emit_program(Program *p, Buf *o) {
             i = j;
         }
     }
+    Module **run_lazy = calloc((size_t)(p->top.len + 1), sizeof(Module *)); /* by run id: the lazy module it is */
+    for (int i = 0; i < p->top.len;) { /* a lazy module's top level: a run of its own, not called by main (lazy_compute) */
+        Module *m = p->top.items[i]->mod;
+        int j = i;
+        while (j < p->top.len && p->top.items[j]->mod == m) j++;
+        if (m && m->lazy) {
+            bool ok = !xs_debug && !wbody;
+            for (int k = 0; k < p->top.len && ok; k++) if ((k < i || k >= j) && p->top.items[k]->mod == m) ok = false;
+            for (int k = i; k < j && ok; k++) if (p->top.items[k]->kind == S_VAR && nzv_has(p->top.items[k]->cname)) ok = false;
+            if (ok) {
+                if (top_run[i] <= 0) {
+                    top_run[i] = ++nmodfn;
+                    for (int k = i + 1; k < j; k++) top_run[k] = -1;
+                }
+                run_lazy[top_run[i]] = m;
+            } else m->lazy = false; /* (its top level stays in main: at start, as a static import's) */
+        }
+        i = j;
+    }
     Buf *main_buf = out;
     size_t main_at = out->len; /* the module functions go here, before main */
     { /* a top level without loops (a server, an app: it wires things up and hands over) is not optimized */
@@ -14757,6 +14809,13 @@ void emit_program(Program *p, Buf *o) {
             }
             bool rloops = false, rtry = false;
             for (int k = i; k < j; k++) { rloops = rloops || stmt_has_loop(p->top.items[k]); rtry = rtry || stmt_has_try(p->top.items[k]); }
+            Module *lz = run_lazy[top_run[i]];
+            if (lz) { /* the first import() runs it (and, first, the lazy modules it imports) */
+                buf_printf(out, "XS_NOINLINE void xs_lazy_m%d(void) { /* %s */\n    static bool done_;\n    if (done_) return;\n    done_ = true;", lz->id,
+                           lz->path ? path_base_name(lz->path) : "module");
+                for (int k = 0; k < lz->nimports; k++)
+                    if (!lz->imports[k].dynamic && lz->imports[k].from && lz->imports[k].from->lazy) buf_printf(out, "\n    xs_lazy_m%d();", lz->imports[k].from->id);
+            } else
             buf_printf(out, "%s void xs_init_m%d(void) { /* %s */", rloops ? "XS_NOINLINE" : "XS_RUN_ONCE static", top_run[i], p->top.items[i]->mod->path ? path_base_name(p->top.items[i]->mod->path) : "module");
             indent = 1;
             vol_locals = rtry;
@@ -14784,6 +14843,7 @@ void emit_program(Program *p, Buf *o) {
     epush(true);
     for (int i = 0; i < p->top.len; i++) {
         Stmt *s = p->top.items[i];
+        if (top_run[i] > 0 && run_lazy[top_run[i]]) continue; /* (its import() runs it) */
         if (top_run[i] > 0) { nl(); buf_printf(out, "xs_init_m%d();", top_run[i]); continue; }
         if (top_run[i] < 0) continue;
         cur_mod = s->mod;
@@ -14835,6 +14895,22 @@ void emit_program(Program *p, Buf *o) {
     indent--;
     nl();
     buf_puts(out, "}\n");
+    for (int i = 0; i < p->nmodules; i++) { /* import() of a module whose top level ran at start (or has none): nothing to run */
+        Module *m = p->modules[i];
+        bool has_fn = false;
+        for (int r = 1; r <= nmodfn && !has_fn; r++) has_fn = run_lazy[r] == m;
+        if ((m->dyn_target && !m->builtin) || m->lazy)
+            if (!has_fn) {
+                buf_printf(&modfns, "static void xs_lazy_m%d(void) {", m->id);
+                if (m->lazy) { /* (no top level of its own: the lazy modules it imports) */
+                    buf_puts(&modfns, " static bool done_; if (done_) return; done_ = true;");
+                    for (int k = 0; k < m->nimports; k++)
+                        if (!m->imports[k].dynamic && m->imports[k].from && m->imports[k].from->lazy) buf_printf(&modfns, " xs_lazy_m%d();", m->imports[k].from->id);
+                }
+                buf_puts(&modfns, "}\n");
+            }
+    }
+    free(run_lazy);
     if (modfns.len) buf_insert(main_buf, main_at, modfns.data);
     free(modfns.data);
     out = main_out;

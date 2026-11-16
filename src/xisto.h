@@ -701,6 +701,7 @@ typedef struct {
     bool star;         /* export * from "m": every name m exports (names is empty) */
     char **as_names;   /* export { a as b } from "m": the name each entry is exported under here (NULL: its own name) */
     bool *qualified;   /* import { A as B } next to another import of A: B reads as "A\x01m", A is not visible plainly from here */
+    bool dynamic;      /* import("m") in an expression: loaded with the others, its top level run on the first call (lazy) */
 } Import;
 
 struct Module {
@@ -719,6 +720,8 @@ struct Module {
     bool loading, loaded;
     bool builtin;      /* "node:fs" and friends: functions provided by the runtime */
     bool missing;      /* xisto check: a module that could not be loaded (reported); its imported names are not reported again */
+    bool dyn_target;   /* named by an import("...") somewhere: xs_lazy_m<id>() runs its top level (once; nothing when it ran at start) */
+    bool lazy;         /* (emit) reached only through import(): its top level waits for the first import() */
     char *native_prefix; /* package modules: C names of `declare` functions and classes start with this ("xn_pg_") */
 };
 
@@ -729,6 +732,8 @@ typedef struct {
     int nclasses, cap_classes;
     StmtList top;      /* top-level statements of every module, dependencies first */
     Module **modules;  /* dependencies first; the entry module is last */
+    Module **dyn_mods; /* the modules some import("...") names (Module.dyn_target) */
+    int ndyn_mods;
     int nmodules, cap_modules;
     Enum **enums;
     int nenums, cap_enums;

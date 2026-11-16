@@ -144,6 +144,8 @@ static Token expect_prop_name(Parser *p, const char *help) {
 }
 
 static Import *ns_import_of(Parser *p, const char *alias);
+static Expr *parse_dyn_import(Parser *p, int *idx);
+static void ns_alias_push(Parser *p, const char *alias, int idx);
 static char *ns_name(Parser *p, Import *im, Token name);
 
 static bool accept(Parser *p, TokKind k) {
@@ -1501,6 +1503,27 @@ static Expr *parse_primary(Parser *p) {
         e->lhs = parse_expr(p);
         return e;
     }
+    case TK_IMPORT: {
+        if (!peek_is(p, TK_LPAREN)) break;
+        int idx;
+        Expr *e = parse_dyn_import(p, &idx);
+        /* import("./x").then((m) => m.f()): m reads as the module's namespace in the callback */
+        Parser look = *p;
+        if (at(&look, TK_DOT) && peek_is_ident(&look)) {
+            next(&look);
+            if (!strcmp(look.tok.str, "then") && peek_is(&look, TK_LPAREN)) {
+                next(&look);
+                next(&look);
+                bool paren = accept(&look, TK_LPAREN);
+                if (at(&look, TK_IDENT)) {
+                    const char *nm = look.tok.str;
+                    next(&look);
+                    if ((paren && at(&look, TK_RPAREN)) || (!paren && at(&look, TK_ARROW))) ns_alias_push(p, nm, idx);
+                }
+            }
+        }
+        return e;
+    }
     case TK_ASYNC: {
         next(p);
         if (!at(p, TK_FUNCTION) && !looks_like_arrow(p)) xs_error(XS1020, pos, NULL, "expected an arrow function after 'async'");
@@ -1525,6 +1548,12 @@ static Expr *parse_primary(Parser *p) {
                 for (int i = 0; core[i]; i++) if (look.tok.str && strcmp(look.tok.str, core[i]) == 0) is_core = true;
                 if (!is_core) import_process(p->prog, p->mod);
             }
+        }
+        if (p->nns && !peek_is(p, TK_DOT) && p->mod) { /* m of const m = await import("x"), not as m.x */
+            Import *ni = ns_import_of(p, p->tok.str);
+            if (ni && ni->dynamic)
+                xs_error(XS6051, pos, xs_sprintf("read what it exports: %s.name, or destructure it: const { a, b } = await import(\"...\")", p->tok.str),
+                         "the module of import() is read through its names (m.x), not as a value");
         }
         Expr *e = new_expr(E_IDENT, pos);
         e->str = p->tok.str;
@@ -2683,7 +2712,7 @@ static Stmt *parse_block(Parser *p) {
        destructuring queued stay for the outer scope, not this body */
     StmtList outer = p->pending;
     p->pending = (StmtList){0};
-    int nalias = p->nalias, nvt = p->nvt;
+    int nalias = p->nalias, nvt = p->nvt, nns = p->nns;
     while (!at(p, TK_RBRACE)) {
         if (at(p, TK_EOF)) xs_error(XS1031, p->tok.pos, NULL, "unexpected end of file inside a block");
         stmt_list_push(&b->stmts, parse_stmt(p));
@@ -2692,6 +2721,7 @@ static Stmt *parse_block(Parser *p) {
     p->pending = outer;
     p->nalias = nalias; /* (the names of the types declared in it end with it) */
     p->nvt = nvt;
+    if (p->nns > nns && p->mod) p->nns = nns; /* (const m = await import("x") in it: m's names end with it) */
     next(p);
     return b;
 }
@@ -2808,8 +2838,10 @@ static Stmt *lower_label(Pos pos, const char *label, Stmt *loop) {
 static void add_alias(Parser *p, const char *from, const char *to);
 static Class *parse_interface(Parser *p);
 static void add_class(Program *prog, Class *c);
+static Stmt *dyn_import_decl(Parser *p);
 static Stmt *parse_stmt(Parser *p) {
     Pos pos = p->tok.pos;
+    { Stmt *di = dyn_import_decl(p); if (di) return di; }
     if ((at_ident(p, "interface") || at_ident(p, "type")) && peek_is_ident(p) && p->mod) {
         /* type X = ... / interface X { ... } inside a function: a type of the module under a name of its own, which X
            reads as until the end of the block */
@@ -3163,6 +3195,8 @@ static Stmt *parse_stmt(Parser *p) {
         return s;
     }
     case TK_IMPORT:
+        if (peek_is(p, TK_LPAREN)) goto expr_stmt; /* import("x"): an expression */
+        /* fall through */
     case TK_EXPORT:
         xs_error(XS6004, pos, "imports and exports go at the top level of the file", "'%s' is not allowed here", p->tok.kind == TK_IMPORT ? "import" : "export");
         return NULL;
@@ -3170,7 +3204,7 @@ static Stmt *parse_stmt(Parser *p) {
     case TK_ENUM:
         xs_error(XS6027, pos, "move it to the top level of the file", "nested classes and enums are not supported");
         return NULL;
-    default: {
+    default: expr_stmt: {
         Stmt *s = new_stmt(S_EXPR, pos);
         bool so = p->spread_ok; Expr *sa = p->spread_arg;
         p->spread_ok = true;
@@ -4629,6 +4663,117 @@ static bool declares_top_from(const char *src, const char *q, const char *name) 
     }
     return false;
 }
+/* the import of path in m (static or dynamic), -1 when none */
+static int dyn_import_index(Module *m, const char *path) {
+    for (int i = 0; i < m->nimports; i++)
+        if (m->imports[i].path && !m->imports[i].reexport && !strcmp(m->imports[i].path, path)) return i;
+    return -1;
+}
+static void ns_alias_push(Parser *p, const char *alias, int idx) {
+    p->ns_alias = realloc(p->ns_alias, sizeof(char *) * (size_t)(p->nns + 1));
+    p->ns_import = realloc(p->ns_import, sizeof(int) * (size_t)(p->nns + 1));
+    p->ns_alias[p->nns] = (char *)alias;
+    p->ns_import[p->nns++] = idx;
+}
+static void load_import(Program *prog, Module *m, Import *im);
+/* import("./x") (at `import`): a promise that runs x's top level (once, when it did not run at start: xs_lazy_m<id>,
+   emit.c) and gives null; its names are read through the namespace the caller binds (*idx: x's import) */
+static Expr *parse_dyn_import(Parser *p, int *idx) {
+    Pos pos = p->tok.pos;
+    expect(p, TK_IMPORT, NULL);
+    expect(p, TK_LPAREN, NULL);
+    if (!at(p, TK_STRING) || !peek_is(p, TK_RPAREN) || !p->mod)
+        xs_error(XS6050, pos, "import it statically (import * as m from \"./x\"), or pick among literal imports: if (name === \"a\") await import(\"./a\")",
+                 "import() takes a string literal: a native binary knows its modules when it is built");
+    const char *path = p->tok.str;
+    next(p);
+    expect(p, TK_RPAREN, NULL);
+    Module *m = p->mod;
+    int i = dyn_import_index(m, path);
+    if (i < 0) { /* (not seen by the scan: a template's ${import("x")}) */
+        Import im = {0};
+        im.pos = pos;
+        im.path = (char *)path;
+        im.dynamic = true;
+        m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+        m->imports[m->nimports++] = im;
+        i = m->nimports - 1;
+    }
+    if (!m->imports[i].from) load_import(p->prog, m, &m->imports[i]);
+    *idx = i;
+    Module *to = m->imports[i].from;
+    if (to && !to->dyn_target) {
+        to->dyn_target = true;
+        p->prog->dyn_mods = realloc(p->prog->dyn_mods, sizeof(Module *) * (size_t)(p->prog->ndyn_mods + 1));
+        p->prog->dyn_mods[p->prog->ndyn_mods++] = to;
+    }
+    static const char snip[] = "Promise.resolve().then((): unknown => { __xs_lazy__(); return null; })";
+    char *src = xs_alloc(sizeof snip + 4);
+    memcpy(src, snip, sizeof snip);
+    Parser sub = {0};
+    lexer_init(&sub.lx, src);
+    sub.lx.line = pos.line;
+    sub.lx.col = pos.col;
+    sub.prog = p->prog;
+    sub.mod = p->mod;
+    next(&sub);
+    Expr *e = parse_expr(&sub);
+    Expr *c = e->args.items[0]->arrow->fn->body->stmts.items[0]->expr; /* __xs_lazy__() */
+    c->lhs = NULL;
+    c->builtin.cfn = to && !to->builtin ? xs_sprintf("xs_lazy_m%d", to->id) : "xs_lazy_none";
+    c->type = ty_void;
+    return e;
+}
+/* const m = await import("./x"); / const { a, b } = await import("./x");: m.f reads x's f (as import * as m), a and
+   b x's a and b (as import { a, b }); the statement awaits the import */
+static Stmt *dyn_import_decl(Parser *p) {
+    if (!at(p, TK_CONST) && !at(p, TK_LET)) return NULL;
+    Parser look = *p;
+    next(&look);
+    const char *name = NULL;
+    Token names[32];
+    int nn = 0;
+    if (at(&look, TK_LBRACE)) {
+        next(&look);
+        while (at(&look, TK_IDENT) && nn < 32) {
+            names[nn++] = look.tok;
+            next(&look);
+            if (!accept(&look, TK_COMMA)) break;
+        }
+        if (!at(&look, TK_RBRACE)) return NULL;
+        next(&look);
+    } else if (at(&look, TK_IDENT)) {
+        name = look.tok.str;
+        next(&look);
+    } else return NULL;
+    if (!at(&look, TK_ASSIGN)) return NULL;
+    next(&look);
+    if (!at(&look, TK_AWAIT)) return NULL;
+    Pos apos = look.tok.pos;
+    next(&look);
+    if (!at(&look, TK_IMPORT) || !peek_is(&look, TK_LPAREN)) return NULL;
+    {   /* (await import("x").then(...): another form) */
+        Parser q = look;
+        next(&q); next(&q);
+        if (!at(&q, TK_STRING)) return NULL;
+        next(&q); next(&q);
+        if (at(&q, TK_DOT)) return NULL;
+    }
+    *p = look;
+    int idx;
+    Expr *imp = parse_dyn_import(p, &idx);
+    expect_semi(p);
+    if (name) ns_alias_push(p, name, idx);
+    else {
+        Import *im = &p->mod->imports[idx];
+        for (int k = 0; k < nn; k++) import_add_name(im, names[k]);
+    }
+    Expr *aw = new_expr(E_AWAIT, apos);
+    aw->lhs = imp;
+    Stmt *s = new_stmt(S_EXPR, apos);
+    s->expr = aw;
+    return s;
+}
 static void ns_register(Parser *p, Module *m, const char *alias) {
     p->ns_alias = realloc(p->ns_alias, sizeof(char *) * (size_t)(p->nns + 1));
     p->ns_import = realloc(p->ns_import, sizeof(int) * (size_t)(p->nns + 1));
@@ -5963,9 +6108,29 @@ static void parse_module(Program *prog, Module *m) {
             xs_lex_skipping = false;
         }
     }
-    while (at(&p, TK_IMPORT) || reexport_ahead(&p)) {
+    while ((at(&p, TK_IMPORT) && !peek_is(&p, TK_LPAREN)) || reexport_ahead(&p)) {
         if (at(&p, TK_IMPORT)) parse_import(&p, m);
         else parse_reexport(&p, m, prog, false);
+    }
+    if (strstr(m->src, "import(") || strstr(m->src, "import (")) { /* import("./x") anywhere in the file: loaded with the static imports */
+        Parser look = p;
+        while (!at(&look, TK_EOF)) {
+            if (at(&look, TK_IMPORT) && peek_is(&look, TK_LPAREN)) {
+                Pos ipos = look.tok.pos;
+                next(&look);
+                next(&look);
+                if (at(&look, TK_STRING) && peek_is(&look, TK_RPAREN) && dyn_import_index(m, look.tok.str) < 0) {
+                    Import im = {0};
+                    im.pos = ipos;
+                    im.path = look.tok.str;
+                    im.dynamic = true;
+                    m->imports = realloc(m->imports, sizeof(Import) * (size_t)(m->nimports + 1));
+                    m->imports[m->nimports++] = im;
+                }
+                continue;
+            }
+            next(&look);
+        }
     }
     for (int i = 0; i < m->nimports; i++) {
         Import *im = &m->imports[i];
@@ -6074,7 +6239,7 @@ static void parse_module(Program *prog, Module *m) {
         char *treq_name = NULL, *treq_path = NULL;
         Pos treq_pos = p.tok.pos;
         bool treq = at(&p, TK_LET) && try_require_ahead(&p, &treq_name, &treq_path);
-        if (treq || at(&p, TK_IMPORT) || require_ahead(&p)) { /* an import after declarations (ES hoists it): read and loaded here; names resolve in the
+        if (treq || (at(&p, TK_IMPORT) && !peek_is(&p, TK_LPAREN)) || require_ahead(&p)) { /* an import after declarations (ES hoists it): read and loaded here; names resolve in the
                                     checker, after the whole file, so declarations above may use them */
             int n0 = m->nimports;
             if (treq) {
