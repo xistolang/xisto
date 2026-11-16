@@ -24,7 +24,12 @@ Every row was checked on 12 Nov 2026 by running the same program with xisto and 
 
 | What | Node | xisto | Why |
 |---|---|---|---|
-| `undefined` | a value | read as `null`, warning XS2101 | one empty value |
+| `undefined`, `void 0` | a value | a deprecated synonym of `null`, warning XS2101 | one empty value |
+| `x === undefined` with `x` holding `null`; `typeof x === "undefined"` | `false` | `true`: read as `x == null` | `undefined` and `null` are one |
+| a variable that held `undefined`: `console.log(v)`, `typeof v` | `undefined`, `"undefined"` | `null`, `"object"` | it holds `null` |
+| `[1, undefined]` printed | `[ 1, undefined ]` | `[ 1, null ]` | (`JSON.stringify` is `[1,null]` on both) |
+| optional field set to `undefined`: `Object.keys`, `console.log` | key listed, `nick: undefined` | left out | the field is absent; `JSON.stringify` leaves it out on both |
+| optional field set to `null`: `JSON.stringify`, `Object.keys`, `console.log` | `"nick":null`, key listed | left out | an optional field holds absent and `null` as one value |
 | absent optional field `=== null` | `false` | `true` | absent reads as `null`; use `== null` |
 | `Map.get` of a missing key | `undefined` | `null`; with an `int`, `number` or `boolean` value that is so wherever the result can be absent: `m.get(k) ?? d`, `m.get(k) \|\| d`, `m.get(k) === undefined`, a condition, `const v = m.get(k)` (`v` is `T \| null`) and a `T \| undefined` return, argument or field; where only a `T` fits (`m.get(k) + 1`) it is a run-time error (check with `has()` first) | no `undefined` |
 | field missing on an `any` | `undefined` | `null` | |

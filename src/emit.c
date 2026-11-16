@@ -3908,7 +3908,8 @@ static void emit_expr_raw(Expr *e) {
             out = &b;
             emit_expr(e->lhs);
             out = saved;
-            buf_printf(out, "(%s ? xs_typeof_lit(\"%s\") : xs_typeof_lit(\"object\"))", not_null(e->lhs->type, b.data), e->str);
+            buf_printf(out, "(%s ? xs_typeof_lit(\"%s\") : xs_typeof_lit(\"%s\"))", not_null(e->lhs->type, b.data), e->str,
+                       e->lhs->type->absent ? "undefined" : "object"); /* (x?: T left out: undefined, as on Node) */
             free(b.data);
             return;
         }

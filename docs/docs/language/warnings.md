@@ -13,7 +13,7 @@ that you should know about. These are the rule warnings, each with a stable code
 | Code | Category | Means | Fix |
 |---|---|---|---|
 | XS2007 | dynamic-path | `any` is used: access by name, checked at run time, about 10× slower | declare a type ([any](./any.md)) |
-| XS2101 | deprecated | `undefined` is read as `null` | write `null` |
+| XS2101 | deprecated | `undefined` (or `void 0`, `typeof x === "undefined"`) is read as `null` | write `null` (`x == null`) |
 | XS2102 | deprecated | comparing a value that is never null with `null`: always the same result | remove the test, or declare `T \| null` |
 | XS2103 | implicit | `int` mixed with `number`: the result is `number` | `Number(i)` or `Math.trunc(x)` |
 | XS2104 | implicit | a type parameter could not be inferred: it is `unknown` | pass it: `empty<Type>(...)` |

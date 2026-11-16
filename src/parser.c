@@ -2384,8 +2384,16 @@ static Expr *parse_postfix(Parser *p) {
 static Expr *parse_unary(Parser *p) {
     if (at_ident(p, "void") && !peek_is(p, TK_SEMI) && !peek_is(p, TK_RPAREN) && !peek_is(p, TK_COMMA)) {
         /* void expr: evaluated for its effects, its value dropped (void promise(); () => void f()) */
+        Pos vpos = p->tok.pos;
         next(p);
-        return parse_unary(p);
+        Expr *x = parse_unary(p);
+        if (x->kind == E_NUMBER || x->kind == E_STRING || x->kind == E_BOOL || x->kind == E_NULL) {
+            /* void 0: undefined, which xisto reads as null (the checker warns) */
+            Expr *u = new_expr(E_IDENT, vpos);
+            u->str = "undefined";
+            return u;
+        }
+        return x;
     }
     if (at_ident(p, "delete") && peek_is(p, TK_IDENT)) { /* delete m[k] / delete m.k: m.delete(k) (a Record, a Map) */
         Pos dpos = p->tok.pos;
@@ -3070,7 +3078,7 @@ static Stmt *parse_var(Parser *p) {
         return y;
     } else {
         if (!at(p, TK_ASSIGN))
-            xs_error(XS8146, p->tok.pos, "xisto has no 'undefined', so every variable starts with a value", "variable '%s' must be initialized", s->name);
+            xs_error(XS8146, p->tok.pos, "give it a starting value (null for an empty one): every variable starts with a value", "variable '%s' must be initialized", s->name);
         next(p);
         s->init = parse_expr(p);
         fn_value_name(s->init, s->name);
@@ -3089,7 +3097,7 @@ static Stmt *parse_var(Parser *p) {
             d->init->unset = true;
         } else {
             if (!at(p, TK_ASSIGN))
-                xs_error(XS8146, p->tok.pos, "xisto has no 'undefined', so every variable starts with a value", "variable '%s' must be initialized", d->name);
+                xs_error(XS8146, p->tok.pos, "give it a starting value (null for an empty one): every variable starts with a value", "variable '%s' must be initialized", d->name);
             next(p);
             d->init = parse_expr(p);
             fn_value_name(d->init, d->name);

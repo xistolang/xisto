@@ -10286,7 +10286,7 @@ static void check_expr_in(Expr *e, Type *expected) {
                           : is_numeric(b) || b->kind == TY_ENUM ? "number" : b->kind == TY_BOOLEAN ? "boolean" : b->kind == TY_FUNC ? "function"
                           : b->kind == TY_OBJECT && b->cls->mod && b->cls->mod->file && !strcmp(b->cls->mod->file, "xisto:reflect") && !strcmp(b->cls->name, "ClassInfo")
                           ? "function" /* (a class as a value: JavaScript's class is a function) */ : "object";
-            if (t->kind == TY_NULLABLE && b->kind != TY_OBJECT) { e->builtin.cfn = "xs_typeof_nullable"; e->str = (char *)v; e->type = ty_string; return; }
+            if (t->kind == TY_NULLABLE && (b->kind != TY_OBJECT || t->absent)) { e->builtin.cfn = "xs_typeof_nullable"; e->str = (char *)v; e->type = ty_string; return; }
             e->kind = E_STRING;
             e->str = (char *)v;
             e->lit_id = intern(v);
@@ -10332,6 +10332,26 @@ static void check_expr_in(Expr *e, Type *expected) {
         return;
     case E_BINARY:
         if (e->op == TK_QQ && e->lhs->kind == E_IDENT) e->lhs->cell_raw = true;
+        if ((e->op == TK_EQ || e->op == TK_NEQ) && e->lhs && e->rhs) {
+            /* typeof x === "undefined" with x: T | null (or unknown): x == null, undefined being null (XB-118 rule 2);
+               with x never null it stays the typeof test (always false, as on Node) */
+            Expr *ty = e->lhs->kind == E_UNARY && e->lhs->op == TK_IDENT ? e->lhs : e->rhs->kind == E_UNARY && e->rhs->op == TK_IDENT ? e->rhs : NULL;
+            Expr *lit = ty == e->lhs ? e->rhs : e->lhs;
+            if (ty && !ty->prechecked && lit->kind == E_STRING && lit->str && !strcmp(lit->str, "undefined")) {
+                Expr *x = ty->lhs;
+                if (x->kind == E_IDENT) x->cell_raw = true;
+                check_expr(x, NULL);
+                settle(x);
+                x->prechecked = true;
+                if (x->type->kind == TY_NULLABLE || x->type->kind == TY_UNKNOWN || x->type->kind == TY_NULL) {
+                    xs_warn_rule(XS2101, lit->pos, "write x == null: xisto has one empty value", "'undefined' is deprecated in xisto: it is read as null");
+                    Expr *nul = xs_alloc(sizeof *nul);
+                    nul->kind = E_NULL; nul->pos = lit->pos; nul->field = -1;
+                    e->lhs = x;
+                    e->rhs = nul;
+                }
+            }
+        }
         if ((e->op == TK_EQ || e->op == TK_NEQ) && e->lhs && e->rhs) {
             bool ln = e->lhs->kind == E_NULL || (e->lhs->kind == E_IDENT && e->lhs->str && !strcmp(e->lhs->str, "undefined"));
             bool rn = e->rhs->kind == E_NULL || (e->rhs->kind == E_IDENT && e->rhs->str && !strcmp(e->rhs->str, "undefined"));
@@ -14592,7 +14612,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             case TY_ENUM: case TY_INT: case TY_NUMBER: e->kind = E_NUMBER; e->num = 0; e->is_int_lit = true; check_expr(e, expected); return;
             case TY_STRING: e->kind = E_STRING; e->str = ""; check_expr(e, expected); return;
             case TY_BOOLEAN: e->kind = E_BOOL; e->boolean = false; check_expr(e, expected); return;
-            default: xs_error(XS8146, e->pos, "xisto has no 'undefined', so every variable starts with a value", "variable of type %s must be initialized", ty_name(expected));
+            default: xs_error(XS8146, e->pos, "give it a starting value (null for an empty one): every variable starts with a value", "variable of type %s must be initialized", ty_name(expected));
             }
         }
         e->type = ty_null;
@@ -18039,6 +18059,13 @@ static void check_stmt_one(Stmt *s) {
                     check_stmt(s);
                     return;
                 }
+            }
+            if (cur_func->ret->kind == TY_VOID && s->expr->kind == E_IDENT && s->expr->str && !strcmp(s->expr->str, "undefined") && !lookup("undefined")) {
+                /* return undefined; (return void 0;) in a void function: return; */
+                xs_warn_rule(XS2101, s->expr->pos, "write return;", "'undefined' is deprecated in xisto: it is read as null");
+                s->expr = NULL;
+                check_stmt(s);
+                return;
             }
             if (cur_func->ret->kind == TY_VOID) {
                 /* return f(); where f is void too (TypeScript allows it; a generic run<R> instantiated with void):

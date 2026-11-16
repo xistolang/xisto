@@ -15,7 +15,7 @@ mechanisms behind each row.
 | pattern | what happens | do this instead |
 |---|---|---|
 | `any`, `as any`, `(x as any)[k]` | Dynamic path, warning XS2007. A field read costs about 9 ns against 0.4 ns typed (10 million reads, Apple M4, 12 Nov 2026). An object created as `any` is a `Record`, larger than a struct. | Declare an interface, a class or `Record<string, T>`. See [`any`](/docs/language/any). |
-| `undefined` | Read as `null`, warning XS2101. A comparison of a never-null value with `null` is always the same: XS2102. | Write `null`; test with `x == null`. |
+| `undefined` | A deprecated synonym of `null`, warning XS2101. A comparison of a never-null value with `null` is always the same: XS2102. | Write `null`; test with `x == null`. |
 | `a == b` where JavaScript would convert (int and string, say) | Error XS8148. | Convert explicitly: `Number(s) === n` or `String(n) === s`. |
 | `if (n)` with an `int` | Read as `n !== 0`, warning XS2105. A `number` as a condition is accepted only with `--tsc-checked`. | Compare explicitly: `n !== 0`, `n > 0`. |
 | `int` mixed with `number` | The result is `number`, warning XS2103. The loop can leave integer registers. | Keep counters and indices `int`; convert once, where you mean it. |
