@@ -516,6 +516,7 @@ static XS_TLS xs_trace xs_recover_trace; /* where the error that reached the HTT
 static XS_TLS bool xs_recover_client;    /* that error came from reading JSON (a bad request body: 400, not 500) */
 static XS_TLS xs_trace xs_panic_trace;
 __attribute__((noinline)) static void xs_panic_at(const char *msg, const xs_site *site);
+static XS_TLS void (*xs_uncaught_hook)(void *err); /* (below, at xs_throw) */
 /* from inline code: the barrier keeps the call from becoming a tail call, which would drop the frame; after it
    the path ends (xs_panic_at throws or exits), which the compiler is told here, at the check, and not on
    xs_panic_at itself (see docs/poc8-stacktrace.md): otherwise every failed check "may return" having changed
@@ -551,6 +552,10 @@ __attribute__((noinline)) static void xs_panic_at(const char *msg, const xs_site
         xs_recover_msg = msg;
         xs_cln_unwind(xs_recover_cln);
         _longjmp(*xs_recover, 1);
+    } else if (xs_uncaught_hook) { /* process.on('uncaughtException' | 'exit'): the error goes there, as a thrown one does */
+        xs_panic_msg_pending = msg;
+        xs_panic_pending = true;
+        xs_throw(xs_Error_new(NULL));
     }
     fflush(stdout);
     fprintf(stderr, "runtime error: %s\n", msg);
@@ -2219,8 +2224,8 @@ static xs_str *xs_Error_stack(xs_Error *e) {
 /* process.on('uncaughtException') (runtime/node/process.ts, xisto_net.h): set only once a program listens; it
    returns only when nothing listens, and the error is printed as below. xs_uncaught_main: main's landing (emitted
    only in a program that can set the hook), where a top-level error a listener took goes on to the event loop. Node
-   runs a .ts program as an ES module: an error of its top level has the origin "unhandledRejection" */
-static XS_TLS void (*xs_uncaught_hook)(void *err);
+   runs a .ts program as an ES module: an error of its top level has the origin "unhandledRejection".
+   (xs_uncaught_hook is declared above xs_panic_at, which also hands it a runtime error) */
 static XS_TLS jmp_buf *xs_uncaught_main;
 static XS_TLS bool xs_uncaught_top; /* the top level is running (the origin of its errors: xs_uncaught_run) */
 /* takes an owned Error */
@@ -6379,7 +6384,7 @@ static void xs_fs_raise(int64_t e, xs_str *syscall, xs_str *path, xs_str *dest) 
     bool hp = path && path->len, hd = dest && dest->len;
     if (hp && n >= 0 && (size_t)n < sizeof m) n += snprintf(m + n, sizeof m - (size_t)n, " '%s'", path->data);
     if (hd && n >= 0 && (size_t)n < sizeof m) snprintf(m + n, sizeof m - (size_t)n, " -> '%s'", dest->data);
-    if (xs_try_depth == 0) { xs_release(syscall); xs_panic(m); } /* (no Error is made: the program ends, or an HTTP handler fails) */
+    if (xs_try_depth == 0 && (xs_recover || !xs_uncaught_hook)) { xs_release(syscall); xs_panic(m); } /* (no Error is made: the program ends, or an HTTP handler fails) */
     xs_fs_errinfo *i = calloc(1, sizeof *i);
     i->errnum = e < 0 ? e : -e;
     i->syscall = syscall;
