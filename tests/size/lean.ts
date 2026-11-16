@@ -13,3 +13,9 @@ const o = new Opts();
 const s = "ação";
 console.log(s.length, [1, 2, 3].map((x: number): number => x * 2).join(","), o.a, o.b);
 console.log(check(1, 5) + check(2, 5));
+// TypeError, RangeError & co carry no reflection metadata in a program without decorators (XB-258)
+try {
+  if (check(3, 5) > 2) throw new RangeError("too far");
+} catch (e) {
+  console.log(e instanceof RangeError, (e as Error).name, (e as Error).message);
+}

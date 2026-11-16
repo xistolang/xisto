@@ -102,6 +102,7 @@ static StmtList tsa_decls; /* const __xs_tsa_M_L_C = __xs_tsa([cooked...], [raw.
 static char **tsa_names;
 static int ntsa_names;
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
+static bool reflect_loaded; /* xisto:reflect is loaded (a decorated class, a decorator type, a class used as a value) */
 static void import_process(Program *prog, Module *m);
 static void import_stdio(Program *prog, Module *m);
 static void import_builtin_class(Program *prog, Module *m, const char *path, const char *name);
@@ -5993,8 +5994,11 @@ static Enum *parse_enum(Parser *p) {
 static bool class_decorated(Class *c) {
     if (c->decos.len || c->as_value) return true;
     if (c->base_name && strcmp(c->base_name, "Error") == 0 && !(c->mod && c->mod->file && (!strcmp(c->mod->file, "xisto:crypto") || !strcmp(c->mod->file, "xisto:zlib") || !strcmp(c->mod->file, "xisto:fs"))))
-        return true; /* an error class: a value too (@Catch(MyError)); not node:crypto's, node:zlib's and node:fs's errors with a code, which
-                        would make every program that imports them carry xisto:reflect (~40 KB) */
+        /* an error class: a value too (@Catch(MyError)); not node:crypto's, node:zlib's and node:fs's errors with a code, which
+           would make every program that imports them carry xisto:reflect (~40 KB); TypeError, RangeError & co (xisto:errors,
+           loaded after the program's modules) only in a program that has reflection already: `throw new RangeError(m)`
+           alone does not carry it (XB-258) */
+        return !(c->mod && c->mod->file && !strcmp(c->mod->file, "xisto:errors")) || reflect_loaded || wants_reflect;
     if (c->mixin) return true; /* class UpdateDto extends PartialType(CreateDto) {}: a value too (@Body() dto: UpdateDto) */
     for (int i = 0; i < c->nfields; i++) if (c->fields[i].decos.len) return true;
     for (int i = 0; i < c->nmethods; i++) {
@@ -8188,6 +8192,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         return m;
     }
     if (strcmp(name, "reflect") == 0) { /* xisto:reflect: written in xisto, parsed like any module */
+        reflect_loaded = true;
         m->builtin = false;
         m->file = "xisto:reflect";
         m->src = (char *)xs_reflect_src;

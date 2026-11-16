@@ -325,6 +325,8 @@ if sel lean; then
         if nm "$OUT/lean" | grep -E 'xs_(chain_pass|map_task|rap_task|chain_task)$' > /dev/null; then echo "FAIL lean: a parallel task is linked"; lean_ok=0; fi
         # check() is called twice from the top level, once each: no copy of it per call (emit.c, cold_site)
         if grep -E 'f[0-9]+_check_k[0-9]+' "$OUT/lean.c" > /dev/null; then echo "FAIL lean: a call that runs once has its own copy of the function"; lean_ok=0; fi
+        # new RangeError(m) without decorators: no ClassInfo (xisto:reflect) for the error classes (parser.c, class_decorated)
+        if grep -q 'ClassInfo' "$OUT/lean.c"; then echo "FAIL lean: an error class carries reflection metadata"; lean_ok=0; fi
         # Opts is never printed: its print function is empty (emit.c, find_printable; tests/ok/print-reach.ts prints through other types)
         if ! grep -E 'static void c[0-9]+_Opts_print\(void \*p\) \{ \(void\)p; \}' "$OUT/lean.c" > /dev/null; then echo "FAIL lean: a class nothing prints has its print function"; lean_ok=0; fi
     fi
