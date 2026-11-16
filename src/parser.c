@@ -38,6 +38,7 @@ typedef struct {
     char **rest_keys;
     int nrest_keys;
     const char *this_alias; /* inside function (this: T, ...) { }: `this` reads this local (its prologue takes it) */
+    bool method_fn;       /* { m(x) { } }: the next parse_arrow reads a method as a function expression */
 } Parser;
 
 static void rest_param(Parser *p, Func *f, Type *t);
@@ -1164,7 +1165,8 @@ static Expr *parse_arrow(Parser *p) {
     f->pos = pos;
     f->name = "arrow";
     int cap = 0;
-    bool is_fn = accept(p, TK_FUNCTION); /* function (a: A): R { ... }: an arrow (no `this` of its own) */
+    bool is_fn = accept(p, TK_FUNCTION) || p->method_fn; /* function (a: A): R { ... }: an arrow (no `this` of its own) */
+    p->method_fn = false;
     Type *this_t = NULL; /* function (this: T, ...): T */
     if (is_fn && at(p, TK_IDENT)) { f->js_name = p->tok.str; next(p); } /* (function g() {}: its name, g) */
     /* <T>(sql: string): Promise<T | null> => ...: a generic arrow, held as a function of unknowns (T erased) whose
@@ -1595,11 +1597,25 @@ static Expr *parse_primary(Parser *p) {
                 if (!accept(p, TK_COMMA)) break;
                 continue;
             }
+            bool m_async = false; /* { async m() { } }: an async method */
+            if (at(p, TK_ASYNC)) {
+                Parser look = *p;
+                next(&look);
+                m_async = at(&look, TK_IDENT) || at(&look, TK_STRING) || tok_keyword_text(look.tok.kind);
+                if (m_async) next(p);
+            }
             if (at(p, TK_IDENT) || at(p, TK_STRING)) { key = p->tok; next(p); }
             else if (tok_keyword_text(p->tok.kind) && (p->tok.kind != TK_THIS)) { key = expect_prop_name(p, NULL); }
             else { xs_error(XS1018, p->tok.pos, "keys are names or strings: { id: 1, \"Content-Type\": \"x\" }", "expected a key in the object literal"); return NULL; }
             Expr *val;
-            if (accept(p, TK_COLON)) { val = parse_assign(p); fn_value_name(val, key.str); }
+            if (m_async || at(p, TK_LPAREN) || at(p, TK_LT)) {
+                /* { m(x: T) { ... } }: a method, read as m: function (x: T) { ... } */
+                if (!at(p, TK_LPAREN) && !at(p, TK_LT)) expect(p, TK_LPAREN, NULL);
+                p->method_fn = true;
+                val = parse_arrow(p);
+                if (m_async) val->arrow->fn->is_async = true;
+                fn_value_name(val, key.str);
+            } else if (accept(p, TK_COLON)) { val = parse_assign(p); fn_value_name(val, key.str); }
             else { /* shorthand { id } */
                 if (key.kind != TK_IDENT) xs_error(XS8078, key.pos, NULL, "a string key needs a value");
                 val = new_expr(E_IDENT, key.pos);
