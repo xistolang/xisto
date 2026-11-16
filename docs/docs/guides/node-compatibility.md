@@ -76,8 +76,10 @@ Supported:
 | `Writable` | `write` (false above the `highWaterMark`), `'drain'`, `end(chunk?, encoding?, cb?)`, `'finish'`/`'prefinish'`, `_write`/`_writev`/`_final`, `cork`/`uncork`, `setDefaultEncoding`, `decodeStrings`, `objectMode`, the `writable*` properties |
 | `Duplex`, `Transform`, `PassThrough` | `allowHalfOpen`, `readable`/`writable: false`, `readableObjectMode`/`writableObjectMode`, `_transform` (pushing, or `callback(null, data)`), `_flush` |
 | all | `_construct`, `_destroy`, `destroy(err, cb)`, `autoDestroy`, `emitClose`, `destroyed`/`closed`/`errored` |
-| functions | `pipeline(...streams, cb)`, `finished(stream, [options], cb)`, `isReadable`, `isWritable`, `isErrored`, `isDisturbed`, `getDefaultHighWaterMark`/`setDefaultHighWaterMark` (64 KiB, 16 objects) |
+| functions | `pipeline(...streams, cb)`, `finished(stream, [options], cb)`, `destroy(stream, err?)`, `isDestroyed`, `isReadable`, `isWritable`, `isErrored`, `isDisturbed`, `getDefaultHighWaterMark`/`setDefaultHighWaterMark` (64 KiB, 16 objects) |
+| `Stream` | the module itself, as in Node: `Stream.Readable`, `Stream.Transform`, `Stream.pipeline`... (also `stream.Stream.X`), in `new`, `extends`, `instanceof` and calls; a plain `Stream`'s `pipe` is Node's legacy one, a `Writable`'s emits `ERR_STREAM_CANNOT_PIPE` |
 | `node:stream/promises` | `pipeline(...streams)`, `finished(stream, options?)` |
+| `node:stream/consumers` | `text`, `json`, `buffer`, `bytes`, `arrayBuffer` (a `Uint8Array`: xisto has no `ArrayBuffer`) of a `Readable`; no `blob` |
 | `node:fs` | `createReadStream(path, { start, end, highWaterMark, encoding, fd, flags, autoClose })` (by name or as `fs.createReadStream`) and `createWriteStream(path, { flags, encoding, start, fd })`, `ReadStream`/`WriteStream` (`'open'`, `'ready'`, `bytesRead`/`bytesWritten`, `close()`); errors as Node's (`ENOENT: no such file or directory, open '...'`, `code`, `syscall`) |
 
 Errors carry Node's `code` and message (`ERR_STREAM_PUSH_AFTER_EOF`, `ERR_STREAM_WRITE_AFTER_END`,

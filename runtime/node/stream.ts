@@ -537,6 +537,18 @@ export class Stream extends EventEmitter {
   }
 
   /** Destroys the stream: _destroy, then 'error' (when err is given) and 'close' on later ticks. */
+  /** A Readable's pipe: sends every chunk to dest (pausing while dest asks to wait), and ends dest at the end unless
+   * { end: false }. A Writable's is Node's: an 'error' (ERR_STREAM_CANNOT_PIPE: it is not readable; Node returns
+   * undefined, this gives dest). A plain Stream's is Node's legacy one: its 'data' written to dest, dest ended at its
+   * 'end' (destroyed at its 'close'), the errors of both forwarded, 'pipe' on dest. (One method for all three: a
+   * Readable is a Writable here, and a generic method cannot be overridden.) */
+  pipe<W extends Writable>(dest: W, pipeOpts: PipeOptions | null = null): W {
+    if (this._readableState !== null) pipeTo(this as Stream as Readable, dest, pipeOpts);
+    else if (this._writableState !== null) errorOrDestroy(this, new StreamError("ERR_STREAM_CANNOT_PIPE", "Cannot pipe, not readable"), false);
+    else legacyPipe(this, dest, pipeOpts);
+    return dest;
+  }
+
   destroy(err: Error | null = null, cb: ErrorCallback | null = null): Stream {
     const r = this._readableState;
     const w = this._writableState;
@@ -823,6 +835,59 @@ export class Writable extends Stream {
     const w = this._writableState;
     return w !== null && !w.writableOff && (w.destroyed || w.errored !== null) && !w.finished;
   }
+}
+
+// Node's lib/internal/streams/legacy.js: Stream.prototype.pipe
+function legacyPipe(source: Stream, dest: Writable, options: PipeOptions | null): void {
+  let didOnEnd = false;
+  let cleanup: () => void = (): void => {};
+  const ondata: Listener = (...a: any[]): void => {
+    if (dest.writable && dest.write(a[0]) === false) source.emit("pause");
+  };
+  const ondrain: Listener = (...a: any[]): void => {};
+  const onend: Listener = (...a: any[]): void => {
+    if (didOnEnd) return;
+    didOnEnd = true;
+    dest.end();
+  };
+  const onclose: Listener = (...a: any[]): void => {
+    if (didOnEnd) return;
+    didOnEnd = true;
+    dest.destroy();
+  };
+  const onerrorSource: Listener = (...a: any[]): void => {
+    cleanup();
+    if (source.listenerCount("error") === 0) source.emit("error", a[0]);
+  };
+  const onerrorDest: Listener = (...a: any[]): void => {
+    cleanup();
+    if (dest.listenerCount("error") === 0) dest.emit("error", a[0]);
+  };
+  const end = options === null || options.end !== false;
+  source.on("data", ondata);
+  dest.on("drain", ondrain);
+  if (end) {
+    source.on("end", onend);
+    source.on("close", onclose);
+  }
+  source.prependListener("error", onerrorSource);
+  dest.prependListener("error", onerrorDest);
+  const clean: Listener = (...a: any[]): void => cleanup();
+  cleanup = (): void => {
+    source.removeListener("data", ondata);
+    dest.removeListener("drain", ondrain);
+    source.removeListener("end", onend);
+    source.removeListener("close", onclose);
+    source.removeListener("error", onerrorSource);
+    dest.removeListener("error", onerrorDest);
+    source.removeListener("end", clean);
+    source.removeListener("close", clean);
+    dest.removeListener("close", clean);
+  };
+  source.on("end", clean);
+  source.on("close", clean);
+  dest.on("close", clean);
+  dest.emit("pipe", source);
 }
 
 function mustWritable(s: Stream): WritableState {
@@ -1247,11 +1312,6 @@ export class Readable extends Writable {
     return ret;
   }
 
-  /** Sends every chunk to dest (pausing while dest asks to wait), and ends dest at the end unless { end: false }. */
-  pipe<W extends Writable>(dest: W, pipeOpts: PipeOptions | null = null): W {
-    pipeTo(this, dest, pipeOpts);
-    return dest;
-  }
   /** Stops sending chunks to dest (to every destination when none is given). */
   unpipe(dest: Writable | null = null): Readable {
     const state = mustReadable(this);

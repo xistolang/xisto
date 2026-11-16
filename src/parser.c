@@ -184,6 +184,8 @@ static Token expect_prop_name(Parser *p, const char *help) {
 }
 
 static Import *ns_import_of(Parser *p, const char *alias);
+static Expr *stream_member(Parser *p, Expr *e, Token name);
+static bool import_dotted(Parser *p, Token *t);
 /* namespace N { ... } (TypeScript's namespaces, in a module): each name the body declares is a top-level name of
    its own, N__ns_name (xs_src_name shows it as name); in the body the plain name reads as that (a token alias), and
    N.name anywhere in the module (an expression, a type, new N.C()) reads it too */
@@ -2336,6 +2338,7 @@ static Expr *parse_postfix(Parser *p) {
             next(p);
             Token name = expect_prop_name(p, NULL);
             Expr *nsx = ns_member(p, e, name);
+            if (!nsx) nsx = stream_member(p, e, name);
             if (nsx) { /* ns.f(...), ns.x: the module's own name */
                 bool aok = e->kind == E_IDENT && !strcmp(name.str, "ok") && ns_import_of(p, e->str) && is_assert_path(ns_import_of(p, e->str)->path);
                 e = nsx;
@@ -2620,13 +2623,12 @@ static Expr *parse_rel(Parser *p) {
             c->str = (char *)to;
             next(p);
         }
-        Import *nsi = at(p, TK_DOT) && peek_is_ident(p) ? ns_import_of(p, c->str) : NULL;
-        if (nsi) { /* x instanceof ns.C: the class C of ns's module */
-            next(p);
-            Token cn = p->tok;
-            next(p);
-            c->pos = cn.pos;
-            c->str = ns_name(p, nsi, cn);
+        Token ct = {0};
+        ct.str = c->str;
+        ct.pos = c->pos;
+        if (import_dotted(p, &ct)) { /* x instanceof ns.C, x instanceof Stream.PassThrough: the class C of that module */
+            c->pos = ct.pos;
+            c->str = ct.str;
         }
         if (is_js_error_name(c->str)) wants_errors = true; /* (x instanceof SyntaxError with no other mention of it) */
         if (is_url_global_name(c->str)) wants_url = true;
@@ -4333,6 +4335,7 @@ static Class *parse_class_ex0(Parser *p, bool abstract) {
         next(p);
         c->base_pos = p->tok.pos;
         Token bt = expect(p, TK_IDENT, NULL);
+        import_dotted(p, &bt); /* (extends stream.Transform, extends Stream.Transform) */
         if (is_js_error_name(bt.str)) wants_errors = true; /* (class E extends TypeError) */
         bool mapped = !strcmp(bt.str, "PartialType") || !strcmp(bt.str, "OmitType") || !strcmp(bt.str, "PickType") || !strcmp(bt.str, "IntersectionType");
         if (at(p, TK_LPAREN) && mapped) c->mixin = parse_mixin_rest(p, bt); /* extends PartialType(CreateDto) */
@@ -5482,6 +5485,56 @@ static Import *ns_import_of(Parser *p, const char *alias) {
     if (!p->mod) return NULL;
     for (int i = 0; i < p->nns; i++) if (strcmp(p->ns_alias[i], alias) == 0) return &p->mod->imports[p->ns_import[i]];
     return NULL;
+}
+/* the import (not import * as) that brings name, unaliased, to the module being parsed */
+static Import *named_import_of(Parser *p, const char *name) {
+    if (!p->mod) return NULL;
+    for (int i = 0; i < p->mod->nimports; i++) {
+        Import *q = &p->mod->imports[i];
+        if (q->reexport || q->star) continue;
+        for (int k = 0; k < q->n; k++)
+            if (strcmp(q->names[k], name) == 0 && (!q->as_names || !q->as_names[k] || strcmp(q->as_names[k], name) == 0)) return q;
+    }
+    return NULL;
+}
+static bool is_stream_path(const char *s) {
+    return s && (!strcmp(s, "stream") || !strcmp(s, "node:stream") || !strcmp(s, "xisto:stream"));
+}
+/* Stream.Readable, stream.Stream.pipeline...: node:stream's Stream is the module itself in Node (its statics are the
+   module's exports), so Stream.name reads as the module's name (as an import of it). NULL when e is not that Stream. */
+static Expr *stream_member(Parser *p, Expr *e, Token name) {
+    if (e->kind != E_IDENT || !p->mod) return NULL;
+    const char *nm = e->str, *q = strchr(nm, '\x01');
+    size_t n = q ? (size_t)(q - nm) : strlen(nm);
+    if (n != 6 || strncmp(nm, "Stream", 6) != 0) return NULL;
+    for (int i = 0; i < p->mod->nimports; i++) {
+        Import *im = &p->mod->imports[i];
+        if (im->reexport || im->star || !is_stream_path(im->path)) continue;
+        for (int k = 0; k < im->n; k++) {
+            if (strcmp(im->names[k], "Stream") != 0) continue;
+            if (im->as_names && im->as_names[k] && strcmp(im->as_names[k], "Stream") != 0) continue;
+            return ident_expr(name.pos, ns_name(p, im, name));
+        }
+    }
+    return NULL;
+}
+/* extends A.B, x instanceof A.B: B of the module A is imported from (import * as A, or a class A imported by name:
+   Stream.Transform), as new A.B() reads it; false when A is neither */
+static bool import_dotted(Parser *p, Token *t) {
+    if (!at(p, TK_DOT) || !peek_is_ident(p) || !p->mod) return false;
+    Import *ns = ns_import_of(p, t->str);
+    Import *im = ns ? ns : named_import_of(p, t->str);
+    if (!im) return false;
+    int depth = 0;
+    while (at(p, TK_DOT) && peek_is_ident(p)) {
+        next(p);
+        *t = p->tok;
+        next(p);
+        depth++;
+    }
+    if (ns && depth == 1) t->str = ns_name(p, im, *t);
+    else import_add_name(im, *t);
+    return true;
 }
 static Expr *ns_member(Parser *p, Expr *e, Token name) {
     if (e->kind == E_IDENT && nlns_recs) { /* N.name of a namespace N of this module */
