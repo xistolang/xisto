@@ -373,7 +373,8 @@ Differences from Node:
 - IPv4 listeners only. No Unix domain sockets.
 - No read backpressure (`pause()`).
 - `write()` writes before it returns.
-- The socket is an `EventEmitter`, not a `stream.Duplex` (no `pipe()`).
+- The socket is an `EventEmitter`, not a `stream.Duplex`: `pipe(dest)` takes another `net.Socket` (an echo
+  server's `c.pipe(c)`, a proxy), with `{ end }` and the `'pipe'` event, but no backpressure.
 - `https.Server` extends `http.Server` (Node: `tls.Server`), so `instanceof http.Server` is true for it.
 
 ## dns

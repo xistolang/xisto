@@ -52,6 +52,11 @@ export interface NetConnectOpts {
 }
 
 /** A TCP connection: 'connect', 'data' (Buffers, or strings after setEncoding), 'end', 'close', 'error'. */
+/** Socket.pipe()'s options. */
+export interface SocketPipeOptions {
+  end?: boolean;
+}
+
 export class Socket extends EventEmitter {
   remoteAddress: string = "";
   remotePort: int = 0;
@@ -73,6 +78,19 @@ export class Socket extends EventEmitter {
   private io: int = 0;
   private refd: boolean = true;
 
+  /** Sends what it reads to dest (another socket: an echo server's c.pipe(c), a proxy), and ends dest at its end
+   * unless { end: false }; 'pipe' on dest. Node's backpressure is not there (write() sends at once here). */
+  pipe(dest: Socket, options: SocketPipeOptions | null = null): Socket {
+    const end = options === null || options.end !== false;
+    this.on("data", (d: Uint8Array | string): void => {
+      dest.write(d);
+    });
+    if (end) this.on("end", (): void => {
+      dest.end();
+    });
+    dest.emit("pipe", this);
+    return dest;
+  }
   /** (internal) a socket on an accepted connection: its addresses now, its reading once the server's
    * 'connection' listeners have set theirs (_start). */
   _attach(fd: int): void {
