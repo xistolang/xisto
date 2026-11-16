@@ -4368,13 +4368,17 @@ static bool fn_member(Expr *e, Type *expected) {
         return true;
     }
     if (isbind) {
-        for (int i = 1; i < e->args.len; i++) {
-            Type *pt = i - 1 < x->type->nparams - (x->type->rest ? 1 : 0) ? x->type->params[i - 1] : x->type->rest ? x->type->params[x->type->nparams - 1]->elem : NULL;
+        /* f.bind(obj, a) of a function declared with `this: T`: obj is its first parameter, bound like a */
+        Func *tf = x->kind == E_FUNC_REF || x->kind == E_IDENT ? x->func : NULL;
+        int off = tf && tf->this_param ? 0 : 1;
+        for (int i = off; i < e->args.len; i++) {
+            int pi = i - off;
+            Type *pt = pi < x->type->nparams - (x->type->rest ? 1 : 0) ? x->type->params[pi] : x->type->rest ? x->type->params[x->type->nparams - 1]->elem : NULL;
             check_expr(e->args.items[i], pt);
-            if (pt) expect_type(e->args.items[i], pt, "a bound argument");
+            if (pt) expect_type(e->args.items[i], pt, off ? "a bound argument" : "the object bind gives");
             e->args.items[i]->prechecked = true;
         }
-        fn_bind_value(e, x, e->args.len > 1 ? e->args.items + 1 : NULL, e->args.len > 1 ? e->args.len - 1 : 0);
+        fn_bind_value(e, x, e->args.len > off ? e->args.items + off : NULL, e->args.len > off ? e->args.len - off : 0);
         return true;
     }
     /* f.call(t, a, b) / f.apply(t, [a, b]): f(a, b) (t not used, as bind) */
