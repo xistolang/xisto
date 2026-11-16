@@ -1031,13 +1031,19 @@ export class Server extends EventEmitter {
     return this.stopping;
   }
   /** Starts listening on the port (0: any free port), on every address or the host given; the callback runs on
-   * 'listening'. listen(port, cb), listen(port, host, cb). */
-  listen(port: int | string = 0, hostOrCallback: string | (() => void) | null = null, callback: (() => void) | null = null): Server {
+   * 'listening'. listen(cb), listen(port, cb), listen(port, host, cb), listen(port, host, backlog, cb) (the backlog
+   * is the system's). */
+  listen(port: number | string | (() => void) | null = 0, hostOrCallback: string | number | (() => void) | null = null,
+         backlogOrCallback: number | (() => void) | null = null, callback: (() => void) | null = null): Server {
     let host = "";
     let cb: (() => void) | null = callback;
+    let p: int = 0;
+    if (typeof port === "number") p = Math.trunc(port as number);
+    else if (typeof port === "string") p = Math.trunc(Number(port as string));
+    else if (port !== null) cb = port as () => void;
     if (typeof hostOrCallback === "string") host = hostOrCallback as string;
-    else if (hostOrCallback !== null) cb = hostOrCallback as () => void;
-    const p: int = typeof port === "string" ? Math.trunc(Number(port as string)) : (port as int);
+    else if (typeof hostOrCallback === "function") cb = hostOrCallback as () => void;
+    if (typeof backlogOrCallback === "function") cb = backlogOrCallback as () => void;
     if (cb !== null) this.once("listening", cb as () => void);
     const fd = net_listen(host === "localhost" ? "127.0.0.1" : host, p);
     if (fd < 0) {

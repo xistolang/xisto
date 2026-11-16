@@ -230,14 +230,14 @@ export class Socket extends EventEmitter {
 }
 
 /** A connected socket (the listener runs on 'connect'). */
-export function createConnection(port: int | NetConnectOpts, host: string | null = null, listener: (() => void) | null = null): Socket {
+export function createConnection(port: number | NetConnectOpts, host: string | null = null, listener: (() => void) | null = null): Socket {
   const s = new Socket();
-  if (typeof port === "number") return s.connect(port as int, host ?? "localhost", listener);
+  if (typeof port === "number") return s.connect(Math.trunc(port as number), host ?? "localhost", listener);
   const o = port as NetConnectOpts;
   return s.connect(o.port, o.host ?? "localhost", listener);
 }
 /** The same as createConnection(). */
-export function connect(port: int | NetConnectOpts, host: string | null = null, listener: (() => void) | null = null): Socket {
+export function connect(port: number | NetConnectOpts, host: string | null = null, listener: (() => void) | null = null): Socket {
   return createConnection(port, host, listener);
 }
 
@@ -258,9 +258,21 @@ export class NetServer extends EventEmitter {
     super();
     if (listener !== null) this.on("connection", listener);
   }
-  /** Listens on the port (0: any free one), on every address or the host given; the callback runs on 'listening'. */
-  listen(port: int = 0, host: string = "", callback: (() => void) | null = null): NetServer {
-    if (callback !== null) this.once("listening", callback);
+  /** Listens on the port (0: any free one), on every address or the host given; the callback runs on 'listening'.
+   * Node's forms: listen(cb), listen(port, cb), listen(port, host, cb), listen(port, host, backlog, cb) (the backlog
+   * is the system's). */
+  listen(portOrCallback: number | string | (() => void) | null = 0, hostOrCallback: string | number | (() => void) | null = null,
+         backlogOrCallback: number | (() => void) | null = null, callback: (() => void) | null = null): NetServer {
+    let port: int = 0;
+    let host = "";
+    let cb: (() => void) | null = callback;
+    if (typeof portOrCallback === "number") port = Math.trunc(portOrCallback as number);
+    else if (typeof portOrCallback === "string") port = Math.trunc(Number(portOrCallback as string));
+    else if (portOrCallback !== null) cb = portOrCallback as () => void;
+    if (typeof hostOrCallback === "string") host = hostOrCallback as string;
+    else if (typeof hostOrCallback === "function") cb = hostOrCallback as () => void;
+    if (typeof backlogOrCallback === "function") cb = backlogOrCallback as () => void;
+    if (cb !== null) this.once("listening", cb as () => void);
     const fd = net_listen(host, port);
     if (fd < 0) {
       const code = net_code(fd);
