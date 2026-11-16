@@ -4703,8 +4703,6 @@ XS_NOINLINE int64_t xs_str_locale_compare(xs_str *a, xs_str *b, ...) {
     for (int l = 0; l < 3; l++) { int c = xs_lc_level(a, b, l); if (c) return c; }
     return 0;
 }
-/* s.normalize(form): the text as it is (source text and the database's are NFC already; a gap for NFD input) */
-XS_NOINLINE xs_str *xs_str_normalize(xs_str *s, ...) { return xs_retain(s); }
 XS_NOINLINE int64_t xs_str_order(xs_str *a, xs_str *b) {
     size_t n = a->len < b->len ? (size_t)a->len : (size_t)b->len;
     int c = memcmp(a->data, b->data, n);

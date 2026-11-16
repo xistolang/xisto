@@ -6244,6 +6244,17 @@ static bool check_string_member_more(Expr *e) {
             sp->lit_id = intern(" ");
             expr_list_push(&e->args, sp);
         }
+        if (!strcmp(e->str, "normalize")) { /* (the Unicode tables join the program; the compatibility ones only for NFKC/NFKD) */
+            if (e->args.len == 0) {
+                Expr *nf = xs_alloc(sizeof *nf);
+                nf->kind = E_STRING; nf->pos = e->pos; nf->str = "NFC"; nf->type = ty_string; nf->field = -1;
+                nf->lit_id = intern("NFC");
+                expr_list_push(&e->args, nf);
+            }
+            Expr *fa = e->args.items[0];
+            prog->uses_normalize = true;
+            if (fa->kind != E_STRING || !strncmp(fa->str, "NFK", 3)) prog->uses_normalize_k = true;
+        }
         if (ms[i].ret == 3 && e->args.len == 0) { /* s.charCodeAt(): index 0 */
             Expr *z = xs_alloc(sizeof *z);
             z->kind = E_NUMBER; z->pos = e->pos; z->is_int_lit = true; z->type = ty_int; z->field = -1;

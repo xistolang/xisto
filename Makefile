@@ -108,7 +108,7 @@ build/checker.o: runtime/xisto_regex.h runtime/xisto_regex_bt.h
 # Node's modules written in xisto (runtime/node/NAME.ts), embedded in the compiler as xs_node_NAME_ts
 NODE_TS := async_hooks crypto stream stream_promises stream_web path fs_promises url events process http https net dns child_process tls buffer util querystring string_decoder zlib diagnostics_channel
 
-build/rt_embed.c: tools/rtsplit.py $(NODE_TS:%=runtime/node/%.ts) packages/xisto/io.ts packages/xisto/bytes.ts packages/xisto/parallel.ts packages/xisto/collections.ts packages/xisto/fractal.ts packages/xisto/random.ts runtime/xisto_regex.h runtime/xisto_regex_bt.h runtime/xisto_rt.h runtime/xisto_net.h runtime/xisto_sqlite.h runtime/xisto_tls.h runtime/xisto_tls_awslc.h runtime/xisto_crypto.h runtime/xisto_zlib.h runtime/xisto_prof.h runtime/xisto_dbg_json.h runtime/xisto_dbg.h | build
+build/rt_embed.c: tools/rtsplit.py $(NODE_TS:%=runtime/node/%.ts) packages/xisto/io.ts packages/xisto/bytes.ts packages/xisto/parallel.ts packages/xisto/collections.ts packages/xisto/fractal.ts packages/xisto/random.ts runtime/xisto_regex.h runtime/xisto_regex_bt.h runtime/xisto_unicode.h runtime/xisto_text.h runtime/xisto_rt.h runtime/xisto_net.h runtime/xisto_sqlite.h runtime/xisto_tls.h runtime/xisto_tls_awslc.h runtime/xisto_crypto.h runtime/xisto_zlib.h runtime/xisto_prof.h runtime/xisto_dbg_json.h runtime/xisto_dbg.h | build
 	{ echo 'const unsigned char xs_runtime_h[] = {'; xxd -i < runtime/xisto_rt.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_net_h[] = {'; xxd -i < runtime/xisto_net.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_sqlite_h[] = {'; xxd -i < runtime/xisto_sqlite.h; echo ', 0x00 };'; \
@@ -119,6 +119,8 @@ build/rt_embed.c: tools/rtsplit.py $(NODE_TS:%=runtime/node/%.ts) packages/xisto
 	  echo 'const unsigned char xs_runtime_prof_h[] = {'; xxd -i < runtime/xisto_prof.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_regex_h[] = {'; xxd -i < runtime/xisto_regex.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_regex_bt_h[] = {'; xxd -i < runtime/xisto_regex_bt.h; echo ', 0x00 };'; \
+	  echo 'const unsigned char xs_runtime_unicode_h[] = {'; xxd -i < runtime/xisto_unicode.h; echo ', 0x00 };'; \
+	  echo 'const unsigned char xs_runtime_text_h[] = {'; xxd -i < runtime/xisto_text.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_dbg_json_h[] = {'; xxd -i < runtime/xisto_dbg_json.h; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_runtime_dbg_h[] = {'; xxd -i < runtime/xisto_dbg.h; echo ', 0x00 };'; \
 	  for n in $(NODE_TS); do echo "const unsigned char xs_node_$${n}_ts[] = {"; xxd -i < runtime/node/$$n.ts; echo ', 0x00 };'; done; \
@@ -128,7 +130,7 @@ build/rt_embed.c: tools/rtsplit.py $(NODE_TS:%=runtime/node/%.ts) packages/xisto
 	  echo 'const unsigned char xs_pkg_collections_ts[] = {'; xxd -i < packages/xisto/collections.ts; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_pkg_fractal_ts[] = {'; xxd -i < packages/xisto/fractal.ts; echo ', 0x00 };'; \
 	  echo 'const unsigned char xs_pkg_random_ts[] = {'; xxd -i < packages/xisto/random.ts; echo ', 0x00 };'; \
-	  for h in rt net sqlite tls tls_awslc crypto zlib prof regex; do for m in decl impl; do \
+	  for h in rt net sqlite tls tls_awslc crypto zlib prof unicode text regex; do for m in decl impl; do \
 	    echo "const unsigned char xs_runtime_$${h}_h_$$m[] = {"; python3 tools/rtsplit.py $$m runtime/xisto_$$h.h | xxd -i; echo ', 0x00 };'; \
 	  done; done; } > $@
 

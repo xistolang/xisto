@@ -50,7 +50,6 @@ Every row was checked on 12 Nov 2026 by running the same program with xisto and 
 | `s.length`, `slice`, `indexOf` | UTF-16 units | code points (`"héllo👋".length` is 6, Node 7) | UTF-8 strings |
 | `s[i]` | a character | error XS6033 | use `s.slice(i, i + 1)` |
 | `s.match("text")` | converts to a RegExp | error XS7096 | no implicit conversion |
-| `s.normalize("NFD")` | decomposes | returns the string unchanged | no Unicode tables |
 | `m.keys()`, `m.values()` | iterators | arrays | |
 | `m.set(new, …)` inside `for…of` over `m` | the loop sees it | the loop does not see it | |
 | `numbers.sort()` without comparator | sorts as strings | error XS7089 (strings sort as on Node) | the default surprises |
