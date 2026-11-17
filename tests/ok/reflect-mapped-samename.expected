@@ -1,0 +1,13 @@
+check CreateDto code string false
+check CreateDto company int false
+check UpdateDto code string true
+check UpdateDto company int true
+UpdateDto code?:{"type":"string","nullable":true} company?:{"type":"number","nullable":true}
+check CreateDto code string false
+check CreateDto active bool true
+check UpdateContractDto code string true
+check UpdateContractDto active bool true
+UpdateContractDto code?:{"type":"string","nullable":true} active?:{"type":"boolean","nullable":true}
+{"code":"c1","active":true}
+code="c1" active=true
+{"code":"","company":7}

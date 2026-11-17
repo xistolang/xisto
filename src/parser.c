@@ -6133,8 +6133,46 @@ static bool names_tparam_src(const char *src, Class *c) {
     }
     return false;
 }
-/* a class by the name module m reads it under: m's own, else one another module exports (as reflected_base finds it) */
+/* the class module m exports as `name`: declared there, or re-exported from another module (export { A } from,
+   export * from), or NULL */
+static Class *class_exported_by(Program *prog, Module *m, const char *name, int depth) {
+    if (!m || depth > 32) return NULL;
+    for (int i = 0; i < prog->nclasses; i++) {
+        Class *k = prog->classes[i];
+        if (k->mod == m && !k->builtin && k->name && strcmp(k->name, name) == 0) return k;
+    }
+    for (int i = 0; i < m->nimports; i++) {
+        Import *im = &m->imports[i];
+        if (!im->reexport || !im->from) continue;
+        if (im->star) {
+            Class *k = class_exported_by(prog, im->from, name, depth + 1);
+            if (k) return k;
+            continue;
+        }
+        for (int j = 0; j < im->n; j++)
+            if (strcmp(im->as_names && im->as_names[j] ? im->as_names[j] : im->names[j], name) == 0)
+                return class_exported_by(prog, im->from, im->names[j], depth + 1);
+    }
+    return NULL;
+}
+/* a class by the name module m reads it under: m's own, else the one m imports under that name (two modules may
+   declare classes of one name: CreateDto in two feature folders), else one another module exports (as reflected_base
+   finds it) */
 static Class *class_named(Program *prog, Module *m, const char *name) {
+    for (int i = 0; m && i < m->nimports; i++) {
+        Import *im = &m->imports[i];
+        if (im->reexport || im->is_default || !im->from) continue;
+        for (int j = 0; j < im->n; j++)
+            if (strcmp(im->names[j], name) == 0) {
+                Class *k = class_exported_by(prog, im->from, name, 0);
+                if (k) {
+                    for (int c = 0; c < prog->nclasses; c++) /* (m's own class of that name still comes first) */
+                        if (prog->classes[c]->mod == m && !prog->classes[c]->builtin && prog->classes[c]->name &&
+                            !strcmp(prog->classes[c]->name, name)) return prog->classes[c];
+                    return k;
+                }
+            }
+    }
     Class *found = NULL;
     for (int i = 0; i < prog->nclasses; i++) {
         Class *k = prog->classes[i];
