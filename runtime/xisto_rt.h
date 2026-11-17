@@ -7254,6 +7254,14 @@ static inline bool xs_u8_tr_is5(const uint8_t *T, uint8_t *L, uint8_t *M) {
     }
     return true;
 }
+/* bytes on a SharedArrayBuffer (or a subarray of one): other threads may be writing the bytes next to any range of
+   them. A 16-byte block that reads and stores back bytes outside the range it was asked for (the masked short
+   paths of xs_u8_trade and xs_u8_rev) would then put back a neighbour's old bytes over what that thread just
+   wrote: revcomp-5/-6 split a sequence's pairs into one range per worker, and a range's last run, below 16
+   bytes, rewrote the first bytes of the next worker's range (TSan: a race in the trade; 1 run in ~300 with
+   wrong bytes there). On such bytes those paths store only the range's own bytes. */
+static void xs_sab_free(void *p);
+static inline bool xs_u8_on_sab(const xs_Uint8Array *b) { return b->owner && xs_type_of(b->owner)->free == xs_sab_free; }
 static inline xs_u8_tr_ctx xs_u8_tr_setup(xs_Uint8Array *T) {
     xs_u8_tr_ctx c;
     c.T = T->data;
@@ -7339,7 +7347,8 @@ static inline void xs_u8_trade(const xs_u8_tr_ctx *c, xs_Uint8Array *buf, int64_
             xs_u8x16_store(d + fb, nRf);
             return;
         }
-        if (a + 16 <= len && b - 15 >= 0) { /* a short run: one masked pair; blocks past the run keep their bytes */
+        if (a + 16 <= len && b - 15 >= 0 && !xs_u8_on_sab(buf)) { /* a short run: one masked pair; blocks past the
+                                                                        run keep their bytes (not on shared memory: above) */
             xs_u8x16 A = xs_u8x16_load(d + a), R = xs_u8x16_load(d + b - 15);
             xs_u8x16 lane = xs_u8x16_iota();
             xs_u8x16 inA = (xs_u8x16)(lane < xs_u8x16_splat((uint8_t)run));          /* lanes 0..run-1 of the a block */
@@ -7720,29 +7729,17 @@ XS_NOINLINE bool xs_u8_rev_par(xs_Uint8Array *buf, xs_Uint8Array *table, int64_t
         xs_rap_seq(&j);
         return true;
     }
-    if (xs_rap_nthreads < 0) {
-        const char *s = getenv("XISTO_THREADS");
-        long t = s && *s ? strtol(s, NULL, 10) : sysconf(_SC_NPROCESSORS_ONLN);
-        if (t > 64) t = 64;
-        xs_rap_nthreads = 0;
-        for (long k = 1; k < t; k++) {
-            pthread_t th;
-            if (pthread_create(&th, NULL, xs_rap_worker, NULL) == 0) { pthread_detach(th); xs_rap_nthreads++; }
-        }
-    }
     static int min_threads = -1; /* the fewest extra threads that split the pairs (XISTO_REV_PAR_MIN): one, since the count
                                     and the stretch scans go 16 bytes at a time (Graviton2, 2 cores, 254 MB: 114 -> 73 ms;
                                     with a memchr per kept byte the count ate the gain: 31 ms either way on the M4) */
     if (min_threads < 0) { const char *m = getenv("XISTO_REV_PAR_MIN"); min_threads = m && *m ? (int)strtol(m, NULL, 10) : 1; }
-    if (xs_rap_nthreads < min_threads) { /* one thread, here */
-        if (keep < 0 || seq_off) return false;
-        xs_rap_job j;
-        memset(&j, 0, sizeof j);
-        j.d = buf->data; j.c = xs_u8_tr_setup(table); j.keep = (int)keep; j.start = start; j.end = end;
-        xs_rap_seq(&j);
-        return true;
-    }
-    if (!xs_rap_acquire()) { /* the threads busy with another caller's job (XB-096): one thread, here */
+    /* the threads are started by the caller that holds them: two worker threads reversing at once used to both
+       start a pool before taking it, with xs_rap_nthreads counted by both (not atomically), so a job could wait
+       for fewer threads than took it and return while some still worked */
+    bool held = xs_rap_acquire();
+    if (held) xs_rap_start_threads();
+    if (!held || xs_rap_nthreads < min_threads) { /* one thread, here (the threads busy with another caller's job: XB-096) */
+        if (held) xs_rap_release();
         if (keep < 0 || seq_off) return false;
         xs_rap_job j;
         memset(&j, 0, sizeof j);
@@ -7894,7 +7891,7 @@ static inline void xs_u8_rev(xs_Uint8Array *a, int64_t lo, int64_t hi, const xs_
     if (lo < 0 || (uint64_t)hi >= (uint64_t)a->f_length) XS_FAIL("index out of bounds", s);
     uint8_t *d = a->data;
 #if defined(__SSSE3__) || defined(__ARM_NEON)
-    if (hi < 16 && a->f_length >= 16) {
+    if (hi < 16 && a->f_length >= 16 && !xs_u8_on_sab(a)) { /* (not on shared memory: xs_u8_on_sab) */
         /* mask[i] = i outside [lo, hi], lo + hi - i inside */
         xs_u8x16 idx = xs_u8x16_iota(), rev = xs_u8x16_splat((uint8_t)(lo + hi)) - idx;
         xs_u8x16 in = (idx >= xs_u8x16_splat((uint8_t)lo)) & (idx <= xs_u8x16_splat((uint8_t)hi));
