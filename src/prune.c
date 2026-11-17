@@ -178,13 +178,6 @@ static bool listed_func(Program *p, Func *f) {
 
 void prune_program(Program *p) {
     prog = p;
-    /* the checker marks generic instances and anonymous literals used when it makes them: their fields'
-       classes must be reached too (Wrapped<Article> lays out an Article) */
-    for (int i = 0; i < p->nclasses; i++) {
-        Class *c = p->classes[i];
-        if (c->used && !c->builtin)
-            for (int k = 0; k < c->nfields; k++) use_type(c->fields[k].type);
-    }
     for (int i = 0; i < p->top.len; i++)
         if (lazy_var(p->top.items[i])) {
             lazy_vars = realloc(lazy_vars, sizeof(Stmt *) * (size_t)(nlazy + 1));
@@ -192,6 +185,19 @@ void prune_program(Program *p) {
             lazy_vars[nlazy] = p->top.items[i];
             lazy_done[nlazy++] = false;
         }
+    /* the checker marks generic instances, anonymous literals and some classes (DI tokens) used when it makes them:
+       their fields' classes must be reached too (Wrapped<Article> lays out an Article), and, as use_class does,
+       their constructor and field initializers: the class's _init is emitted and calls what they call */
+    for (int i = 0; i < p->nclasses; i++) {
+        Class *c = p->classes[i];
+        if (c->used && !c->builtin) {
+            for (int k = 0; k < c->nfields; k++) {
+                use_type(c->fields[k].type);
+                if (c->fields[k].init) walk_expr(c->fields[k].init);
+            }
+            if (c->ctor) push_func(c->ctor);
+        }
+    }
     for (int i = 0; i < p->top.len; i++)
         if (!lazy_var(p->top.items[i])) walk_stmt(p->top.items[i]);
     for (bool more = true; more;) {
