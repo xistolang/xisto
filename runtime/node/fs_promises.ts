@@ -5,7 +5,7 @@ import {
   readFileSync, writeFileSync, appendFileSync, unlinkSync, mkdirSync, readdirSync, statSync, lstatSync, rmSync, rmdirSync,
   renameSync, copyFileSync, cpSync, mkdtempSync, realpathSync, accessSync, chmodSync, readlinkSync, symlinkSync, linkSync,
   utimesSync, lutimesSync, truncateSync, Stats, Dirent, MkdirOptions, RmOptions, RmdirOptions, ReaddirOptions, StatOptions,
-  WriteFileOptions, CopyOptions,
+  WriteFileOptions, CopyOptions, globSync, globSync__withFileTypes, GlobOptions,
 } from "xisto:fs";
 
 export interface ReadFileOptions {
@@ -133,6 +133,14 @@ export async function truncate(path: string, len: int = 0): Promise<void> {
 }
 
 /** fs.promises (and require("fs").promises): the functions above, as its static methods. */
+/** The matches of the pattern(s), as an async iterator: for await (const f of glob("src/*.ts")). */
+export async function* glob(pattern: string | string[], options: GlobOptions | null = null): AsyncGenerator<string> {
+  for (const f of globSync(pattern, options)) yield f;
+}
+export async function* glob__withFileTypes(pattern: string | string[], options: GlobOptions): AsyncGenerator<Dirent> {
+  for (const d of globSync__withFileTypes(pattern, options)) yield d;
+}
+
 export class promises {
   static readFile(path: string, options: ReadFileOptions | null = null): Promise<Buffer> {
     return readFile(path, options);
@@ -151,6 +159,9 @@ export class promises {
   }
   static mkdir(path: string, options?: int | MkdirOptions): Promise<string | undefined> {
     return mkdir(path, options);
+  }
+  static glob(pattern: string | string[], options: GlobOptions | null = null): AsyncGenerator<string> {
+    return glob(pattern, options);
   }
   static readdir(path: string, options?: string | ReaddirOptions): Promise<string[]> {
     return readdir(path, options);

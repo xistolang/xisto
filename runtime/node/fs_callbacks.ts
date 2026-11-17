@@ -6,8 +6,9 @@ import {
   readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, statSync, lstatSync, fstatSync, rmSync, rmdirSync,
   renameSync, accessSync, unlinkSync, copyFileSync, cpSync, realpathSync, mkdtempSync, readlinkSync, symlinkSync, linkSync,
   chmodSync, truncateSync, utimesSync, Stats, Dirent, MkdirOptions, RmOptions, RmdirOptions, ReaddirOptions, StatOptions,
-  WriteFileOptions, CopyOptions,
+  WriteFileOptions, CopyOptions, __fsCheck,
 } from "xisto:fs";
+import { EventEmitter } from "xisto:events";
 
 export type NoParamCallback = (err: Error | null) => void;
 type BytesCallback = (err: Error | null, data: Buffer) => void;
@@ -261,4 +262,93 @@ export function truncate(path: string, len: int | NoParamCallback | undefined, c
 
 export function utimes(path: string, atime: number | Date, mtime: number | Date, callback: NoParamCallback): void {
   done(callback, (): void => utimesSync(path, atime, mtime));
+}
+
+// ---- fs.watch ----
+
+declare function fsw_open(path: string): int;
+declare function fsw_next(h: int): string[];
+declare function fsw_close(h: int): void;
+declare function net_task(): int;
+declare function net_task_ref(task: int, ref: boolean): void;
+
+/** fs.watch()'s options: persistent (false: the watcher does not keep the program alive); recursive and encoding are
+ * accepted (a directory's own entries are watched, names are UTF-8). */
+export interface WatchOptions {
+  persistent?: boolean | null;
+  recursive?: boolean | null;
+  encoding?: string | null;
+}
+/** What a watcher's listener gets: "rename" (a name came or went) or "change" (its content), and the name. */
+export type WatchListener = (eventType: string, filename: string) => void;
+
+/** Node's FSWatcher: 'change' (eventType, filename) for each change of the path (a directory: of its entries),
+ * 'close' after close(), 'error'. A file created, removed or renamed is "rename", written "change". (macOS: kqueue,
+ * where Node uses FSEvents, so a write may be "change" here where Node says "rename"; Linux: inotify, as Node.) */
+export class FSWatcher extends EventEmitter {
+  private h: int;
+  private closed: boolean = false;
+  private refd: boolean = true;
+  private io: int = 0;
+  /** (internal) its task */
+  _task: Promise<void> | null = null;
+  constructor(h: int) {
+    super();
+    this.h = h;
+  }
+  /** (internal) the watcher's task: its events, until close() */
+  async _run(): Promise<void> {
+    this.io = net_task();
+    if (!this.refd && this.io !== 0) net_task_ref(this.io, false);
+    for (;;) {
+      const evs = fsw_next(this.h);
+      if (evs.length === 0) break;
+      for (const e of evs) {
+        if (this.closed) break;
+        const tab = e.indexOf("\t");
+        this.emit("change", e.slice(0, tab), e.slice(tab + 1));
+      }
+    }
+    if (!this.refd && this.io !== 0) net_task_ref(this.io, true);
+    this.io = 0;
+  }
+  /** Stops watching; 'close' follows. */
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    fsw_close(this.h);
+    process.nextTick((): void => {
+      this.emit("close");
+    });
+  }
+  /** The watcher does not keep the program alive. */
+  unref(): FSWatcher {
+    if (this.refd && this.io !== 0) net_task_ref(this.io, false);
+    this.refd = false;
+    return this;
+  }
+  /** It keeps the program alive again (the default). */
+  ref(): FSWatcher {
+    if (!this.refd && this.io !== 0) net_task_ref(this.io, true);
+    this.refd = true;
+    return this;
+  }
+}
+
+/** Watches a file or a directory: the listener (a 'change' listener) gets each change. Throws Node's error when the
+ * path is not there (ENOENT: no such file or directory, watch '...'). */
+export function watch(path: string, options: WatchOptions | string | WatchListener | null = null, listener: WatchListener | null = null): FSWatcher {
+  let cb: WatchListener | null = listener;
+  let persistent = true;
+  if (options !== null) {
+    if (typeof options === "function") cb = options as WatchListener;
+    else if (typeof options !== "string") persistent = (options as WatchOptions).persistent !== false;
+  }
+  const h = fsw_open(path);
+  __fsCheck(h, "watch", path);
+  const w = new FSWatcher(h);
+  if (cb !== null) w.on("change", cb as WatchListener);
+  if (!persistent) w.unref();
+  w._task = w._run();
+  return w;
 }

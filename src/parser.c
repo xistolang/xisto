@@ -112,12 +112,15 @@ static bool is_test_path(const char *path);
 static struct Expr *ns_member(Parser *p, struct Expr *e, Token name);
 static void assert_src_arg(Parser *p, struct Expr *call, const char *start);
 static bool wants_url; /* URL, URLSearchParams, AbortController, AbortSignal... was named: xisto:url is loaded */
+static bool wants_webstreams; /* new ReadableStream(...), WritableStream, TransformStream... in the program: xisto:stream/web */
 static bool wants_errors; /* TypeError, RangeError, SyntaxError or ReferenceError was named: xisto:errors is loaded */
 static bool is_js_error_name(const char *n) {
     return n && (!strcmp(n, "TypeError") || !strcmp(n, "RangeError") || !strcmp(n, "SyntaxError") || !strcmp(n, "ReferenceError") ||
                  !strcmp(n, "URIError") || !strcmp(n, "AggregateError"));
 }
 static bool is_url_global_name(const char *n);
+static bool is_webstream_global_name(const char *n);
+static bool user_module(Parser *p);
 /* generics: the type parameters in scope while a template is parsed, or their types while an instance is */
 static int no_dyn_note; /* inside generated code: its anys are not the program's uses */
 static char **tp_names;
@@ -201,6 +204,8 @@ static Token expect_prop_name(Parser *p, const char *help) {
 }
 
 static Import *ns_import_of(Parser *p, const char *alias);
+static Expr *stream_member(Parser *p, Expr *e, Token name);
+static bool import_dotted(Parser *p, Token *t);
 /* namespace N { ... } (TypeScript's namespaces, in a module): each name the body declares is a top-level name of
    its own, N__ns_name (xs_src_name shows it as name); in the body the plain name reads as that (a token alias), and
    N.name anywhere in the module (an expression, a type, new N.C()) reads it too */
@@ -251,6 +256,7 @@ static Type *parse_type(Parser *p);
 static bool sym_type(Type *t) { return t && t->kind == TY_OBJECT && t->cls && t->cls->name && !strcmp(t->cls->name, "symbol"); }
 static Type *named_type(Parser *p, Token name) {
     if (is_url_global_name(name.str)) wants_url = true; /* (a URL or AbortSignal parameter) */
+    if (is_webstream_global_name(name.str) && user_module(p)) wants_webstreams = true;
     if (is_js_error_name(name.str)) wants_errors = true; /* (a TypeError parameter, field or return type) */
     Class *c = xs_alloc(sizeof *c);
     c->name = name.str;
@@ -1429,6 +1435,17 @@ static Expr *parse_arrow(Parser *p) {
 static bool tmpl_raw; /* parsing the template of String.raw`...` */
 static Expr *parse_tagged(Parser *p, Expr *tag);
 /* the web globals xisto:url declares (runtime/node/url.ts) */
+/* the web streams' globals (xisto:stream/web): ReadableStream only as new ReadableStream(...) (the name alone is
+   still the built-in one of fetch's Response.body); named by the program, not by a built-in module */
+static bool is_webstream_global_name(const char *n) {
+    static const char *const names[] = {"WritableStream", "TransformStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController",
+        "WritableStreamDefaultWriter", "WritableStreamDefaultController", "TransformStreamDefaultController", "CountQueuingStrategy",
+        "ByteLengthQueuingStrategy", "TextEncoderStream", "TextDecoderStream", "UnderlyingSource", "UnderlyingSink", "Transformer",
+        "QueuingStrategy", "ReadableStreamReadResult", NULL};
+    for (int i = 0; n && names[i]; i++) if (!strcmp(n, names[i])) return true;
+    return false;
+}
+static bool user_module(Parser *p) { return p->mod && p->mod->file && strncmp(p->mod->file, "xisto:", 6) != 0; }
 static bool is_url_global_name(const char *n) {
     return n && (!strcmp(n, "URL") || !strcmp(n, "URLSearchParams") || !strcmp(n, "AbortController") || !strcmp(n, "AbortSignal") ||
                  !strcmp(n, "DOMException") || !strcmp(n, "RequestInit") || !strcmp(n, "HeadersInit") || !strcmp(n, "fetch") || !strcmp(n, "BufferEncoding"));
@@ -2174,6 +2191,7 @@ static Expr *parse_primary(Parser *p) {
         e->str = name.str;
         if (is_js_error_name(name.str)) wants_errors = true;
         if (is_url_global_name(name.str)) wants_url = true;
+        if ((is_webstream_global_name(name.str) || !strcmp(name.str, "ReadableStream")) && user_module(p)) wants_webstreams = true;
         if (at(p, TK_LT)) { /* new Stack<number>(): a generic class's type arguments */
             next(p);
             do {
@@ -2354,6 +2372,7 @@ static Expr *parse_postfix(Parser *p) {
             next(p);
             Token name = expect_prop_name(p, NULL);
             Expr *nsx = ns_member(p, e, name);
+            if (!nsx) nsx = stream_member(p, e, name);
             if (nsx) { /* ns.f(...), ns.x: the module's own name */
                 bool aok = e->kind == E_IDENT && !strcmp(name.str, "ok") && ns_import_of(p, e->str) && is_assert_path(ns_import_of(p, e->str)->path);
                 e = nsx;
@@ -2640,13 +2659,12 @@ static Expr *parse_rel(Parser *p) {
             c->str = (char *)to;
             next(p);
         }
-        Import *nsi = at(p, TK_DOT) && peek_is_ident(p) ? ns_import_of(p, c->str) : NULL;
-        if (nsi) { /* x instanceof ns.C: the class C of ns's module */
-            next(p);
-            Token cn = p->tok;
-            next(p);
-            c->pos = cn.pos;
-            c->str = ns_name(p, nsi, cn);
+        Token ct = {0};
+        ct.str = c->str;
+        ct.pos = c->pos;
+        if (import_dotted(p, &ct)) { /* x instanceof ns.C, x instanceof Stream.PassThrough: the class C of that module */
+            c->pos = ct.pos;
+            c->str = ct.str;
         }
         if (is_js_error_name(c->str)) wants_errors = true; /* (x instanceof SyntaxError with no other mention of it) */
         if (is_url_global_name(c->str)) wants_url = true;
@@ -4353,6 +4371,7 @@ static Class *parse_class_ex0(Parser *p, bool abstract) {
         next(p);
         c->base_pos = p->tok.pos;
         Token bt = expect(p, TK_IDENT, NULL);
+        import_dotted(p, &bt); /* (extends stream.Transform, extends Stream.Transform) */
         if (is_js_error_name(bt.str)) wants_errors = true; /* (class E extends TypeError) */
         bool mapped = !strcmp(bt.str, "PartialType") || !strcmp(bt.str, "OmitType") || !strcmp(bt.str, "PickType") || !strcmp(bt.str, "IntersectionType");
         if (at(p, TK_LPAREN) && mapped) c->mixin = parse_mixin_rest(p, bt); /* extends PartialType(CreateDto) */
@@ -5502,6 +5521,56 @@ static Import *ns_import_of(Parser *p, const char *alias) {
     if (!p->mod) return NULL;
     for (int i = 0; i < p->nns; i++) if (strcmp(p->ns_alias[i], alias) == 0) return &p->mod->imports[p->ns_import[i]];
     return NULL;
+}
+/* the import (not import * as) that brings name, unaliased, to the module being parsed */
+static Import *named_import_of(Parser *p, const char *name) {
+    if (!p->mod) return NULL;
+    for (int i = 0; i < p->mod->nimports; i++) {
+        Import *q = &p->mod->imports[i];
+        if (q->reexport || q->star) continue;
+        for (int k = 0; k < q->n; k++)
+            if (strcmp(q->names[k], name) == 0 && (!q->as_names || !q->as_names[k] || strcmp(q->as_names[k], name) == 0)) return q;
+    }
+    return NULL;
+}
+static bool is_stream_path(const char *s) {
+    return s && (!strcmp(s, "stream") || !strcmp(s, "node:stream") || !strcmp(s, "xisto:stream"));
+}
+/* Stream.Readable, stream.Stream.pipeline...: node:stream's Stream is the module itself in Node (its statics are the
+   module's exports), so Stream.name reads as the module's name (as an import of it). NULL when e is not that Stream. */
+static Expr *stream_member(Parser *p, Expr *e, Token name) {
+    if (e->kind != E_IDENT || !p->mod) return NULL;
+    const char *nm = e->str, *q = strchr(nm, '\x01');
+    size_t n = q ? (size_t)(q - nm) : strlen(nm);
+    if (n != 6 || strncmp(nm, "Stream", 6) != 0) return NULL;
+    for (int i = 0; i < p->mod->nimports; i++) {
+        Import *im = &p->mod->imports[i];
+        if (im->reexport || im->star || !is_stream_path(im->path)) continue;
+        for (int k = 0; k < im->n; k++) {
+            if (strcmp(im->names[k], "Stream") != 0) continue;
+            if (im->as_names && im->as_names[k] && strcmp(im->as_names[k], "Stream") != 0) continue;
+            return ident_expr(name.pos, ns_name(p, im, name));
+        }
+    }
+    return NULL;
+}
+/* extends A.B, x instanceof A.B: B of the module A is imported from (import * as A, or a class A imported by name:
+   Stream.Transform), as new A.B() reads it; false when A is neither */
+static bool import_dotted(Parser *p, Token *t) {
+    if (!at(p, TK_DOT) || !peek_is_ident(p) || !p->mod) return false;
+    Import *ns = ns_import_of(p, t->str);
+    Import *im = ns ? ns : named_import_of(p, t->str);
+    if (!im) return false;
+    int depth = 0;
+    while (at(p, TK_DOT) && peek_is_ident(p)) {
+        next(p);
+        *t = p->tok;
+        next(p);
+        depth++;
+    }
+    if (ns && depth == 1) t->str = ns_name(p, im, *t);
+    else import_add_name(im, *t);
+    return true;
 }
 static Expr *ns_member(Parser *p, Expr *e, Token name) {
     if (e->kind == E_IDENT && nlns_recs) { /* N.name of a namespace N of this module */
@@ -6793,7 +6862,7 @@ static void apply_local_exports(Program *prog, Module *m, int top_start) {
    import { X }, makes it a re-export of xisto:fs. */
 static const char *const fs_cb_names[] = {"readFile", "writeFile", "appendFile", "mkdir", "readdir", "stat", "lstat", "fstat", "rm",
                                           "rmdir", "rename", "access", "unlink", "copyFile", "cp", "realpath", "mkdtemp", "readlink",
-                                          "symlink", "link", "chmod", "truncate", "utimes", NULL};
+                                          "symlink", "link", "chmod", "truncate", "utimes", "watch", "FSWatcher", NULL};
 static const char *const fs_stream_names[] = {"createReadStream", "createWriteStream", "ReadStream", "WriteStream", NULL};
 static bool fs_names(const char *src, Import *im, const char *const *names) {
     for (const char *const *n = names; *n; n++) {
@@ -7351,7 +7420,7 @@ static const char xs_arrays_src[] =
     "  return out;\n"
     "}\n"
     "export function __xs_truncate<T>(xs: T[], n: int): int {\n"
-    "  if (n > xs.length) throw new Error(\"RangeError: xisto cannot make an array longer by setting its length\");\n"
+    "  if (n > xs.length) throw new Error(`RangeError: xisto cannot make an array longer by setting its length (from ${xs.length} to ${n}): add the elements with push(...), or make the array at its size with new Array(n).fill(value)`);\n"
     "  while (xs.length > n) xs.pop();\n"
     "  return n;\n"
     "}\n"
@@ -7376,6 +7445,15 @@ static const char xs_arrays_src[] =
     "export function __xs_flat<U>(xs: U[][]): U[] {\n"
     "  const out: U[] = [];\n"
     "  for (const ys of xs) for (const y of ys) out.push(y);\n"
+    "  return out;\n"
+    "}\n"
+    "// one level of flat() over values and arrays of them ((number | number[])[]: [2, [3]] gives [2, 3])\n"
+    "export function __xs_flatU<U>(xs: (U | U[])[]): U[] {\n"
+    "  const out: U[] = [];\n"
+    "  for (const x of xs) {\n"
+    "    if (Array.isArray(x)) for (const y of x as U[]) out.push(y);\n"
+    "    else out.push(x as U);\n"
+    "  }\n"
     "  return out;\n"
     "}\n";
 /* xisto:settled: Promise.allSettled (loaded only by a program that names it: its try blocks stay out of the others) */
@@ -7856,7 +7934,18 @@ static const char xs_worker_threads_src[] =
     "export const isMainThread: boolean = wt_is_main();\n"
     "export const workerData: string = wt_data();\n"
     "export const parentPort: MessagePort = wt_port();\n"
-    "export const threadId: int = wt_id();\n";
+    "export const threadId: int = wt_id();\n"
+    "declare function wt_channel_port(peer: MessagePort | null): MessagePort;\n"
+    "/** Two entangled ports in this thread: what one posts, the other's 'message' listener gets (text, bytes or\n"
+    " * shared memory, as with a worker); close() on either ends both. */\n"
+    "export class MessageChannel {\n"
+    "  port1: MessagePort;\n"
+    "  port2: MessagePort;\n"
+    "  constructor() {\n"
+    "    this.port1 = wt_channel_port(null);\n"
+    "    this.port2 = wt_channel_port(this.port1);\n"
+    "  }\n"
+    "}\n";
 /* xisto:os: what a program needs to size its workers */
 /* xisto:v8 (node:v8): the heap's figures and serialize's size, as far as a program reads them (a cache's budget):
    heap_size_limit as V8 sets it by default on 64 bits (a quarter of the memory, at most 4 GiB); serialize gives the
@@ -8279,10 +8368,12 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
     }
     { /* Node's modules written in xisto over runtime functions (runtime/node/NAME.ts, NODE_TS in the Makefile) */
         extern const unsigned char xs_node_events_ts[], xs_node_process_ts[], xs_node_http_ts[], xs_node_net_ts[], xs_node_dns_ts[], xs_node_child_process_ts[], xs_node_https_ts[], xs_node_tls_ts[], xs_node_diagnostics_channel_ts[], xs_node_buffer_ts[], xs_node_util_ts[], xs_node_querystring_ts[], xs_node_string_decoder_ts[], xs_node_zlib_ts[], xs_node_stream_ts[], xs_node_stream_promises_ts[], xs_node_stream_web_ts[];
+        extern const unsigned char xs_node_path_posix_ts[], xs_node_path_win32_ts[], xs_node_util_types_ts[], xs_node_stream_consumers_ts[];
         extern const unsigned char xs_node_tty_ts[], xs_node_readline_ts[], xs_node_readline_promises_ts[];
         extern const unsigned char xs_node_console_ts[], xs_node_perf_hooks_ts[], xs_node_assert_ts[], xs_node_assert_strict_ts[], xs_node_test_ts[];
         static const struct { const char *name; const unsigned char *src; bool net; bool tls; } node_ts[] = {
             {"events", xs_node_events_ts, false},
+            {"path/posix", xs_node_path_posix_ts, false}, {"path/win32", xs_node_path_win32_ts, false},
             {"process", xs_node_process_ts, true}, /* (signals and the exit hook live with the event loop) */
             {"http", xs_node_http_ts, true},
             {"https", xs_node_https_ts, true, true},
@@ -8292,13 +8383,13 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
             {"child_process", xs_node_child_process_ts, true}, /* (execSync: xs_exec_sync, as before) */
             {"diagnostics_channel", xs_node_diagnostics_channel_ts, true}, /* (fetch's hooks live with the event loop) */
             {"buffer", xs_node_buffer_ts, false}, /* (Buffer itself is a built-in class: the import check accepts it) */
-            {"util", xs_node_util_ts, false},
+            {"util", xs_node_util_ts, false}, {"util/types", xs_node_util_types_ts, false},
             {"querystring", xs_node_querystring_ts, false},
             {"string_decoder", xs_node_string_decoder_ts, false},
             {"zlib", xs_node_zlib_ts, false},
             {"stream", xs_node_stream_ts, true}, /* (streams defer with process.nextTick and setImmediate) */
             {"stream/promises", xs_node_stream_promises_ts, true}, /* (a name with a slash: runtime/node/stream_promises.ts) */
-            {"stream/web", xs_node_stream_web_ts, true},
+            {"stream/web", xs_node_stream_web_ts, true}, {"stream/consumers", xs_node_stream_consumers_ts, true},
             {"tty", xs_node_tty_ts, true}, {"readline", xs_node_readline_ts, true}, {"readline/promises", xs_node_readline_promises_ts, true},
             {"console", xs_node_console_ts, false}, {"perf_hooks", xs_node_perf_hooks_ts, false}, {"assert", xs_node_assert_ts, false}, {"assert/strict", xs_node_assert_strict_ts, false}, {"test", xs_node_test_ts, true},
         };
@@ -8364,7 +8455,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         prog->uses_okmap = true;
         return m;
     }
-    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:events, xisto:stream, xisto:stream/promises, xisto:stream/web, xisto:buffer, xisto:util, xisto:querystring, xisto:string_decoder, xisto:zlib, xisto:timers, xisto:http, xisto:https, xisto:tls, xisto:diagnostics_channel, xisto:net, xisto:dns, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random, xisto:profiler, xisto:assert, xisto:assert/strict, xisto:test", "unknown built-in module '%s'", spec);
+    xs_error(XS5006, from_pos, "built-in modules: xisto:fs, xisto:path, xisto:path/posix, xisto:path/win32, xisto:events, xisto:stream, xisto:stream/promises, xisto:stream/web, xisto:stream/consumers, xisto:buffer, xisto:util, xisto:util/types, xisto:querystring, xisto:string_decoder, xisto:zlib, xisto:timers, xisto:http, xisto:https, xisto:tls, xisto:diagnostics_channel, xisto:net, xisto:dns, xisto:perf_hooks, xisto:sqlite, xisto:timers/promises, xisto:fs/promises, xisto:child_process, xisto:crypto, xisto:worker_threads, xisto:os, xisto:v8, xisto:io, xisto:bytes, xisto:parallel, xisto:collections, xisto:fractal, xisto:random, xisto:profiler, xisto:assert, xisto:assert/strict, xisto:test", "unknown built-in module '%s'", spec);
     return NULL;
 }
 
@@ -8551,6 +8642,7 @@ Program *parse_program(const char *entry_file) {
     if (wants_tagged) load_module(prog, "xisto:tagged", (Pos){1, 1}, entry_file);
     if (wants_iter) load_module(prog, "xisto:iter", (Pos){1, 1}, entry_file);
     if (wants_url) load_module(prog, "xisto:url", (Pos){1, 1}, entry_file); /* (before errors: its DOMException extends Error) */
+    if (wants_webstreams) load_module(prog, "xisto:stream/web", (Pos){1, 1}, entry_file);
     if (wants_errors) load_module(prog, "xisto:errors", (Pos){1, 1}, entry_file);
     if (wants_reflect) load_module(prog, "xisto:reflect", (Pos){1, 1}, entry_file);
     /* top-level statements were appended in parse order (entry first); reorder by module order */

@@ -3,7 +3,9 @@
 // default, or BearSSL). Differences from Node (docs/docs/guides/node-compatibility.md): the same as node:http's; key
 // and cert are PEM text (or Buffers of it); ca adds to the CAs the whole program trusts; passphrase, SNI on the server
 // and client certificates are not supported yet.
-import { Server, HttpTransport, HttpSystemError, RequestListener, ClientRequest, RequestOptions, ResponseListener, _setup, _toUrl, _method } from "xisto:http";
+import { Server as HttpServer, HttpTransport, HttpSystemError, RequestListener, ClientRequest, RequestOptions, ResponseListener, _setup, _toUrl, _method } from "xisto:http";
+import { Agent as HttpAgent } from "xisto:http";
+import type { AgentOptions } from "xisto:http";
 
 declare function tlss_cred(cert: string, key: string): int;
 declare function tlss_accept(cred: int, fd: int): int;
@@ -92,10 +94,14 @@ class TlsClientTransport extends HttpTransport {
   override encrypted(): boolean {
     return true;
   }
+  /** (http.Agent) TLS connections are not reused: whether the peer ended one is not known without reading it. */
+  override alive(): boolean {
+    return false;
+  }
 }
 
 /** Node's https.Server: an http server whose connections are TLS. */
-export class HttpsServer extends Server {
+export class Server extends HttpServer {
   private cred: int;
   constructor(options: ServerOptions, listener: RequestListener | null = null) {
     super(listener);
@@ -106,9 +112,12 @@ export class HttpsServer extends Server {
   }
 }
 
+/** The server class under the name xisto used before (https.Server). */
+export type HttpsServer = Server;
+
 /** A TLS server that calls the listener for each request. */
-export function createServer(options: ServerOptions, listener: RequestListener | null = null): HttpsServer {
-  return new HttpsServer(options, listener);
+export function createServer(options: ServerOptions, listener: RequestListener | null = null): Server {
+  return new Server(options, listener);
 }
 
 /** A request over TLS. */
@@ -130,6 +139,21 @@ export class HttpsClientRequest extends ClientRequest {
   }
 }
 
+/** Node's https.Agent: an http.Agent for https: (port 443). Its options and limits are http.Agent's; a TLS
+ * connection is not reused (each request has its own), so keepAlive changes only the Connection header. */
+export class Agent extends HttpAgent {
+  constructor(options: AgentOptions | null = null, keepAliveGlobal: boolean = false) {
+    super(options, keepAliveGlobal);
+    this.defaultPort = 443;
+    this.protocol = "https:";
+  }
+}
+
+/** The Agent of the https requests that name none. */
+// (a `new` alone: the compiler makes it only in a program that reads globalAgent, src/prune.c lazy_var; an options
+// object here would be compiled into every program that loads the module)
+export let globalAgent: Agent = new Agent(null, true);
+
 /** Makes an https request: call end() (with a body) to send it. With options.ca, that CA is trusted too (for the
  * whole program, from now on). */
 export function request(target: string | URL | RequestOptions, callback: ResponseListener | null = null): ClientRequest {
@@ -137,7 +161,7 @@ export function request(target: string | URL | RequestOptions, callback: Respons
     const o = target as RequestOptions;
     if (o.ca !== null) tls_add_ca(pem(o.ca as string | Uint8Array));
   }
-  return _setup(new HttpsClientRequest(_toUrl(target, "https:"), _method(target)), target, callback);
+  return _setup(new HttpsClientRequest(_toUrl(target, "https:"), _method(target)), target, callback, globalAgent);
 }
 
 /** An https GET request, sent at once. */

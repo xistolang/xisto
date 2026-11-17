@@ -1,0 +1,507 @@
+"http://user:pw@Host.COM:8080/p/a/t/h?query=string#hash" Url {
+  protocol: 'http:',
+  slashes: true,
+  auth: 'user:pw',
+  host: 'host.com:8080',
+  port: '8080',
+  hostname: 'host.com',
+  hash: '#hash',
+  search: '?query=string',
+  query: 'query=string',
+  pathname: '/p/a/t/h',
+  path: '/p/a/t/h?query=string',
+  href: 'http://user:pw@host.com:8080/p/a/t/h?query=string#hash'
+}
+"https://example.com" Url {
+  protocol: 'https:',
+  slashes: true,
+  auth: null,
+  host: 'example.com',
+  port: null,
+  hostname: 'example.com',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: '/',
+  path: '/',
+  href: 'https://example.com/'
+}
+"HTTP://www.Example.com/" Url {
+  protocol: 'http:',
+  slashes: true,
+  auth: null,
+  host: 'www.example.com',
+  port: null,
+  hostname: 'www.example.com',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: '/',
+  path: '/',
+  href: 'http://www.example.com/'
+}
+"//some/path?x=1" Url {
+  protocol: null,
+  slashes: null,
+  auth: null,
+  host: null,
+  port: null,
+  hostname: null,
+  hash: null,
+  search: '?x=1',
+  query: 'x=1',
+  pathname: '//some/path',
+  path: '//some/path?x=1',
+  href: '//some/path?x=1'
+}
+"/just/a/path?with=query&a=b#frag" Url {
+  protocol: null,
+  slashes: null,
+  auth: null,
+  host: null,
+  port: null,
+  hostname: null,
+  hash: '#frag',
+  search: '?with=query&a=b',
+  query: 'with=query&a=b',
+  pathname: '/just/a/path',
+  path: '/just/a/path?with=query&a=b',
+  href: '/just/a/path?with=query&a=b#frag'
+}
+"/plain" Url {
+  protocol: null,
+  slashes: null,
+  auth: null,
+  host: null,
+  port: null,
+  hostname: null,
+  hash: null,
+  search: null,
+  query: null,
+  pathname: '/plain',
+  path: '/plain',
+  href: '/plain'
+}
+"relative/path" Url {
+  protocol: null,
+  slashes: null,
+  auth: null,
+  host: null,
+  port: null,
+  hostname: null,
+  hash: null,
+  search: null,
+  query: null,
+  pathname: 'relative/path',
+  path: 'relative/path',
+  href: 'relative/path'
+}
+"mailto:someone@example.com" Url {
+  protocol: 'mailto:',
+  slashes: null,
+  auth: 'someone',
+  host: 'example.com',
+  port: null,
+  hostname: 'example.com',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: null,
+  path: null,
+  href: 'mailto:someone@example.com'
+}
+"javascript:alert('hi there')" Url {
+  protocol: 'javascript:',
+  slashes: null,
+  auth: null,
+  host: null,
+  port: null,
+  hostname: null,
+  hash: null,
+  search: null,
+  query: null,
+  pathname: "alert('hi there')",
+  path: "alert('hi there')",
+  href: "javascript:alert('hi there')"
+}
+"file:///etc/passwd" Url {
+  protocol: 'file:',
+  slashes: true,
+  auth: null,
+  host: '',
+  port: null,
+  hostname: '',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: '/etc/passwd',
+  path: '/etc/passwd',
+  href: 'file:///etc/passwd'
+}
+"file://localhost/tmp/x" Url {
+  protocol: 'file:',
+  slashes: true,
+  auth: null,
+  host: 'localhost',
+  port: null,
+  hostname: 'localhost',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: '/tmp/x',
+  path: '/tmp/x',
+  href: 'file://localhost/tmp/x'
+}
+"  http://trim.me/x  " Url {
+  protocol: 'http:',
+  slashes: true,
+  auth: null,
+  host: 'trim.me',
+  port: null,
+  hostname: 'trim.me',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: '/x',
+  path: '/x',
+  href: 'http://trim.me/x'
+}
+"http:\\\\evil.com\\foo\\bar?x\\y" Url {
+  protocol: 'http:',
+  slashes: true,
+  auth: null,
+  host: 'evil.com',
+  port: null,
+  hostname: 'evil.com',
+  hash: null,
+  search: '?x%5Cy',
+  query: 'x%5Cy',
+  pathname: '/foo/bar',
+  path: '/foo/bar?x%5Cy',
+  href: 'http://evil.com/foo/bar?x%5Cy'
+}
+"http://a@b@c/" Url {
+  protocol: 'http:',
+  slashes: true,
+  auth: 'a@b',
+  host: 'c',
+  port: null,
+  hostname: 'c',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: '/',
+  path: '/',
+  href: 'http://a%40b@c/'
+}
+"http://a@b?@c" Url {
+  protocol: 'http:',
+  slashes: true,
+  auth: 'a',
+  host: 'b',
+  port: null,
+  hostname: 'b',
+  hash: null,
+  search: '?@c',
+  query: '@c',
+  pathname: '/',
+  path: '/?@c',
+  href: 'http://a@b/?@c'
+}
+"http://[::1]:3000/ipv6" Url {
+  protocol: 'http:',
+  slashes: true,
+  auth: null,
+  host: '[::1]:3000',
+  port: '3000',
+  hostname: '::1',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: '/ipv6',
+  path: '/ipv6',
+  href: 'http://[::1]:3000/ipv6'
+}
+"http://x.com/path with spaces/<>\"'`{}|^" Url {
+  protocol: 'http:',
+  slashes: true,
+  auth: null,
+  host: 'x.com',
+  port: null,
+  hostname: 'x.com',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: '/path%20with%20spaces/%3C%3E%22%27%60%7B%7D%7C%5E',
+  path: '/path%20with%20spaces/%3C%3E%22%27%60%7B%7D%7C%5E',
+  href: 'http://x.com/path%20with%20spaces/%3C%3E%22%27%60%7B%7D%7C%5E'
+}
+"http://host:/empty-port" Url {
+  protocol: 'http:',
+  slashes: true,
+  auth: null,
+  host: 'host',
+  port: null,
+  hostname: 'host',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: '/empty-port',
+  path: '/empty-port',
+  href: 'http://host/empty-port'
+}
+"ftp://ftp.example.org/file.txt" Url {
+  protocol: 'ftp:',
+  slashes: true,
+  auth: null,
+  host: 'ftp.example.org',
+  port: null,
+  hostname: 'ftp.example.org',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: '/file.txt',
+  path: '/file.txt',
+  href: 'ftp://ftp.example.org/file.txt'
+}
+"xmpp:isaacschlueter@jabber.org" Url {
+  protocol: 'xmpp:',
+  slashes: null,
+  auth: 'isaacschlueter',
+  host: 'jabber.org',
+  port: null,
+  hostname: 'jabber.org',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: null,
+  path: null,
+  href: 'xmpp:isaacschlueter@jabber.org'
+}
+"?only=query" Url {
+  protocol: null,
+  slashes: null,
+  auth: null,
+  host: null,
+  port: null,
+  hostname: null,
+  hash: null,
+  search: '?only=query',
+  query: 'only=query',
+  pathname: null,
+  path: '?only=query',
+  href: '?only=query'
+}
+"#only-hash" Url {
+  protocol: null,
+  slashes: null,
+  auth: null,
+  host: null,
+  port: null,
+  hostname: null,
+  hash: '#only-hash',
+  search: null,
+  query: null,
+  pathname: null,
+  path: null,
+  href: '#only-hash'
+}
+"" Url {
+  protocol: null,
+  slashes: null,
+  auth: null,
+  host: null,
+  port: null,
+  hostname: null,
+  hash: null,
+  search: null,
+  query: null,
+  pathname: null,
+  path: null,
+  href: ''
+}
+"http://ex.com/a?b=c#d?e#f" Url {
+  protocol: 'http:',
+  slashes: true,
+  auth: null,
+  host: 'ex.com',
+  port: null,
+  hostname: 'ex.com',
+  hash: '#d?e#f',
+  search: '?b=c',
+  query: 'b=c',
+  pathname: '/a',
+  path: '/a?b=c',
+  href: 'http://ex.com/a?b=c#d?e#f'
+}
+"HTTP://USER:PASS@EXAMPLE.COM:443/" Url {
+  protocol: 'http:',
+  slashes: true,
+  auth: 'USER:PASS',
+  host: 'example.com:443',
+  port: '443',
+  hostname: 'example.com',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: '/',
+  path: '/',
+  href: 'http://USER:PASS@example.com:443/'
+}
+"http://user%20name:p%40ss@host.com/" Url {
+  protocol: 'http:',
+  slashes: true,
+  auth: 'user name:p@ss',
+  host: 'host.com',
+  port: null,
+  hostname: 'host.com',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: '/',
+  path: '/',
+  href: 'http://user%20name:p%40ss@host.com/'
+}
+"svn+ssh://foo/bar" Url {
+  protocol: 'svn+ssh:',
+  slashes: true,
+  auth: null,
+  host: 'foo',
+  port: null,
+  hostname: 'foo',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: '/bar',
+  path: '/bar',
+  href: 'svn+ssh://foo/bar'
+}
+"dash-test://foo/bar" Url {
+  protocol: 'dash-test:',
+  slashes: true,
+  auth: null,
+  host: 'foo',
+  port: null,
+  hostname: 'foo',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: '/bar',
+  path: '/bar',
+  href: 'dash-test://foo/bar'
+}
+"http://a.com/\ttab\nnl" Url {
+  protocol: 'http:',
+  slashes: true,
+  auth: null,
+  host: 'a.com',
+  port: null,
+  hostname: 'a.com',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: '/%09tab%0Anl',
+  path: '/%09tab%0Anl',
+  href: 'http://a.com/%09tab%0Anl'
+}
+"news:comp.lang.javascript" Url {
+  protocol: 'news:',
+  slashes: null,
+  auth: null,
+  host: 'comp.lang.javascript',
+  port: null,
+  hostname: 'comp.lang.javascript',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: null,
+  path: null,
+  href: 'news:comp.lang.javascript'
+}
+"http://x/%zz" Url {
+  protocol: 'http:',
+  slashes: true,
+  auth: null,
+  host: 'x',
+  port: null,
+  hostname: 'x',
+  hash: null,
+  search: null,
+  query: null,
+  pathname: '/%zz',
+  path: '/%zz',
+  href: 'http://x/%zz'
+}
+?a=1&b=2&a=3&c {"a":["1","3"],"b":"2","c":""} [ '1', '3' ] 
+/p {"x":" y"}
+null {}
+host /path true
+TypeError The argument 'url' http://host:abc/bad-port. Received 'Invalid port in url' ERR_INVALID_ARG_VALUE
+TypeError The argument 'url' http://a:1:2/. Received 'Invalid port in url' ERR_INVALID_ARG_VALUE
+TypeError Invalid URL ERR_INVALID_URL
+https://example.com/some/path?page=1&format=json
+http://a.com:81/x?q=1#h
+http://[::1]:8080/v6
+mailto:me@x.org
+file:///tmp/f
+http://a%20b:c%40d@h/p%23x%3Fy?s%23t
+/only ""
+http://example.com/a%20b
+https://u:p@example.com:8443/a/b?c=1#frag https://example.com:8443/a/b https://example.com:8443/a/b?c=1#frag
+"/foo/bar/baz" "quux" "/foo/bar/quux"
+"/foo/bar/baz" "quux/asdf" "/foo/bar/quux/asdf"
+"/foo/bar/baz" "quux/baz" "/foo/bar/quux/baz"
+"/foo/bar/baz" "../quux/baz" "/foo/quux/baz"
+"/foo/bar/baz" "/bar" "/bar"
+"/foo/bar/baz/" "quux" "/foo/bar/baz/quux"
+"/foo/bar/baz/" "quux/baz" "/foo/bar/baz/quux/baz"
+"/foo/bar/baz" "../../../../../../../../quux/baz" "/quux/baz"
+"/foo/bar/baz" "../../../../../../../quux/baz" "/quux/baz"
+"/foo" "." "/"
+"/foo" ".." "/"
+"/foo/" "." "/foo/"
+"/foo/" ".." "/"
+"/foo/bar" "." "/foo/"
+"/foo/bar" ".." "/"
+"/foo/bar/" "." "/foo/bar/"
+"/foo/bar/" ".." "/foo/"
+"foo/bar" "../../../baz" "../../baz"
+"foo/bar/" "../../../baz" "../baz"
+"http://example.com/b//c//d;p?q#blarg" "https:#hash2" "https:///#hash2"
+"http://example.com/b//c//d;p?q#blarg" "https:/p/a/t/h?s#hash2" "https://p/a/t/h?s#hash2"
+"http://example.com/b//c//d;p?q#blarg" "https://u:p@h.com/p/a/t/h?s#hash2" "https://u:p@h.com/p/a/t/h?s#hash2"
+"http://example.com/b//c//d;p?q#blarg" "https:/a/b/c/d" "https://a/b/c/d"
+"http://example.com/b//c//d;p?q#blarg" "http:#hash2" "http://example.com/b//c//d;p?q#hash2"
+"http://example.com/b//c//d;p?q#blarg" "http:/p/a/t/h?s#hash2" "http://example.com/p/a/t/h?s#hash2"
+"http://example.com/b//c//d;p?q#blarg" "http://u:p@h.com/p/a/t/h?s#hash2" "http://u:p@h.com/p/a/t/h?s#hash2"
+"http://example.com/b//c//d;p?q#blarg" "http:/a/b/c/d" "http://example.com/a/b/c/d"
+"/foo/bar/baz" "/../etc/passwd" "/etc/passwd"
+"http://localhost" "file:///Users/foo" "file:///Users/foo"
+"http://localhost" "file://foo/Users" "file://foo/Users"
+"https://registry.npmjs.org" "@foo/bar" "https://registry.npmjs.org/@foo/bar"
+"http://a/b/c/d;p?q" "g:h" "g:h"
+"http://a/b/c/d;p?q" "g" "http://a/b/c/g"
+"http://a/b/c/d;p?q" "./g" "http://a/b/c/g"
+"http://a/b/c/d;p?q" "g/" "http://a/b/c/g/"
+"http://a/b/c/d;p?q" "/g" "http://a/g"
+"http://a/b/c/d;p?q" "//g" "http://g/"
+"http://a/b/c/d;p?q" "?y" "http://a/b/c/d;p?y"
+"http://a/b/c/d;p?q" "g?y" "http://a/b/c/g?y"
+"http://a/b/c/d;p?q" "#s" "http://a/b/c/d;p?q#s"
+"http://a/b/c/d;p?q" "g#s" "http://a/b/c/g#s"
+"http://a/b/c/d;p?q" "" "http://a/b/c/d;p?q"
+"http://a/b/c/d;p?q" "../../../g" "http://a/g"
+"http://a/b/c/d;p?q" "g;x=1/../y" "http://a/b/c/y"
+"http://a/b/c/d;p?q" "http:g" "http://a/b/c/g"
+"mailto:local1@domain1" "local2@domain2" "mailto:local2@domain2"
+"mailto:local1@domain1" "?subject=hi" "mailto:local1@domain1?subject=hi"
+"mailto:a@b" "mailto:c@d" "mailto:c@d"
+"http://user:pass@a.com/" "http://b.com/x" "http://b.com/x"
+"http://a.com/x" "//b.com/y" "http://b.com/y"
+"http://a.com" "x" "http://a.com/x"
+"http://a.com/?q" "" "http://a.com/?q"
+"foo" "bar" "bar"
+"" "x/y" "x/y"
+"http://example.com/a/b/" "./c/../d/." "http://example.com/a/b/d/"
+http://a.com/q?r /q ?r null true
+http://a.com/abs http://other/p

@@ -550,6 +550,162 @@ function winParse(path: string): ParsedPath {
   return r;
 }
 
+// Node's win32.resolve: right to left until an absolute path on a known device; the current directory (its / made \)
+// fills in. (Node also reads the per-drive directory of the "=C:" variables Windows sets; on POSIX there are none.)
+function winResolve(args: string[]): string {
+  let resolvedDevice = "";
+  let resolvedTail = "";
+  let resolvedAbsolute = false;
+  for (let i = args.length - 1; i >= -1; i--) {
+    let path = "";
+    if (i >= 0) {
+      path = args[i];
+      if (path.length === 0) continue;
+    } else if (resolvedDevice.length === 0) {
+      path = process.cwd();
+      if (args.length === 0 || (args.length === 1 && (args[0] === "" || args[0] === ".") && isSep(path.charAt(0), true))) {
+        return path.replaceAll("/", "\\");
+      }
+    } else {
+      path = process.cwd();
+      if (path.slice(0, 2).toLowerCase() !== resolvedDevice.toLowerCase() && path.charAt(2) === "\\") path = resolvedDevice + "\\";
+    }
+    const len = path.length;
+    let rootEnd = 0;
+    let device = "";
+    let absolute = false;
+    const c = path.charAt(0);
+    if (len === 1) {
+      if (isSep(c, true)) {
+        rootEnd = 1;
+        absolute = true;
+      }
+    } else if (isSep(c, true)) {
+      absolute = true;
+      if (isSep(path.charAt(1), true)) {
+        let j = 2;
+        let last = j;
+        while (j < len && !isSep(path.charAt(j), true)) j++;
+        if (j < len && j !== last) {
+          const firstPart = path.slice(last, j);
+          last = j;
+          while (j < len && isSep(path.charAt(j), true)) j++;
+          if (j < len && j !== last) {
+            last = j;
+            while (j < len && !isSep(path.charAt(j), true)) j++;
+            if (j === len || j !== last) {
+              if (firstPart !== "." && firstPart !== "?") {
+                device = "\\\\" + firstPart + "\\" + path.slice(last, j);
+                rootEnd = j;
+              } else {
+                device = "\\\\" + firstPart;
+                rootEnd = 4;
+              }
+            }
+          }
+        }
+      } else {
+        rootEnd = 1;
+      }
+    } else if (isDriveLetter(c) && path.charAt(1) === ":") {
+      device = path.slice(0, 2);
+      rootEnd = 2;
+      if (len > 2 && isSep(path.charAt(2), true)) {
+        absolute = true;
+        rootEnd = 3;
+      }
+    }
+    if (device.length > 0) {
+      if (resolvedDevice.length > 0) {
+        if (device.toLowerCase() !== resolvedDevice.toLowerCase()) continue;
+      } else {
+        resolvedDevice = device;
+      }
+    }
+    if (resolvedAbsolute) {
+      if (resolvedDevice.length > 0) break;
+    } else {
+      resolvedTail = path.slice(rootEnd) + "\\" + resolvedTail;
+      resolvedAbsolute = absolute;
+      if (absolute && resolvedDevice.length > 0) break;
+    }
+  }
+  resolvedTail = normalizeParts(resolvedTail, !resolvedAbsolute, "\\", true);
+  if (resolvedAbsolute) return resolvedDevice + "\\" + resolvedTail;
+  const r = resolvedDevice + resolvedTail;
+  return r.length > 0 ? r : ".";
+}
+
+// Node's win32.relative: case-insensitive, over the resolved paths
+function winRelative(fromIn: string, toIn: string): string {
+  if (fromIn === toIn) return "";
+  const fromOrig = winResolve([fromIn]);
+  const toOrig = winResolve([toIn]);
+  if (fromOrig === toOrig) return "";
+  const from = fromOrig.toLowerCase();
+  const to = toOrig.toLowerCase();
+  if (from === to) return "";
+  if (fromOrig.length !== from.length || toOrig.length !== to.length) {
+    const fromSplit = fromOrig.split("\\");
+    const toSplit = toOrig.split("\\");
+    if (fromSplit[fromSplit.length - 1] === "") fromSplit.pop();
+    if (toSplit[toSplit.length - 1] === "") toSplit.pop();
+    const fromLen = fromSplit.length;
+    const toLen = toSplit.length;
+    const length = fromLen < toLen ? fromLen : toLen;
+    let i = 0;
+    for (; i < length; i++) {
+      if (fromSplit[i].toLowerCase() !== toSplit[i].toLowerCase()) break;
+    }
+    if (i === 0) return toOrig;
+    if (i === length) {
+      if (toLen > length) return toSplit.slice(i).join("\\");
+      if (fromLen > length) return "..\\".repeat(fromLen - 1 - i) + "..";
+      return "";
+    }
+    return "..\\".repeat(fromLen - i) + toSplit.slice(i).join("\\");
+  }
+  let fromStart = 0;
+  while (fromStart < from.length && from.charAt(fromStart) === "\\") fromStart++;
+  let fromEnd = from.length;
+  while (fromEnd - 1 > fromStart && from.charAt(fromEnd - 1) === "\\") fromEnd--;
+  const fromLen = fromEnd - fromStart;
+  let toStart = 0;
+  while (toStart < to.length && to.charAt(toStart) === "\\") toStart++;
+  let toEnd = to.length;
+  while (toEnd - 1 > toStart && to.charAt(toEnd - 1) === "\\") toEnd--;
+  const toLen = toEnd - toStart;
+  const length = fromLen < toLen ? fromLen : toLen;
+  let lastCommonSep = -1;
+  let i = 0;
+  for (; i < length; i++) {
+    const fc = from.charAt(fromStart + i);
+    if (fc !== to.charAt(toStart + i)) break;
+    else if (fc === "\\") lastCommonSep = i;
+  }
+  if (i !== length) {
+    if (lastCommonSep === -1) return toOrig;
+  } else {
+    if (toLen > length) {
+      if (to.charAt(toStart + i) === "\\") return toOrig.slice(toStart + i + 1);
+      if (i === 2) return toOrig.slice(toStart + i);
+    }
+    if (fromLen > length) {
+      if (from.charAt(fromStart + i) === "\\") lastCommonSep = i;
+      else if (i === 2) lastCommonSep = 3;
+    }
+    if (lastCommonSep === -1) lastCommonSep = 0;
+  }
+  let out = "";
+  for (i = fromStart + lastCommonSep + 1; i <= fromEnd; ++i) {
+    if (i === fromEnd || from.charAt(i) === "\\") out += out.length === 0 ? ".." : "\\..";
+  }
+  toStart += lastCommonSep;
+  if (out.length > 0) return out + toOrig.slice(toStart, toEnd);
+  if (toOrig.charAt(toStart) === "\\") ++toStart;
+  return toOrig.slice(toStart, toEnd);
+}
+
 /** Node's path.win32: Windows paths (C:\ and \\server\share roots, \ and / separators), on any system. */
 export class win32 {
   static readonly sep: string = "\\";
@@ -559,6 +715,12 @@ export class win32 {
   }
   static join(...parts: string[]): string {
     return winJoin(parts);
+  }
+  static resolve(...parts: string[]): string {
+    return winResolve(parts);
+  }
+  static relative(from: string, to: string): string {
+    return winRelative(from, to);
   }
   static isAbsolute(p: string): boolean {
     return winIsAbsolute(p);

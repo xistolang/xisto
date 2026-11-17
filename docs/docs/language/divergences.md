@@ -61,6 +61,7 @@ Every row was checked on 12 Nov 2026 by running the same program with xisto and 
 | `console.log(new AggregateError(es, m))` | the stack, then `[errors]` | `AggregateError: m {` `[errors]: ... }` | xisto prints no frames |
 | `m.set(new, …)` inside `for…of` over `m` | the loop sees it | the loop does not see it | |
 | `const a = []` | `any[]` | error XS3008 | a type is needed |
+| `xs.length = 5` on a 3-element array | grows it (holes up to index 4) | error XS6052 when the length is known there (`[1, 2]`, `new Array(3).fill(0)` just before); else a `RangeError` at run time | an array has no holes: add with `push(...)`, or make it `new Array(n).fill(v)` |
 | `new Date("bad").getFullYear()` | `NaN` | `0` | getters return `int` |
 | `Date.toString()` zone name | `(Brasilia Standard Time)` | `(-03)` | no ICU data |
 | `JSON.parse(t) as T` with a `Date` field | the field stays a string | a `Date` | the declared type is decoded |

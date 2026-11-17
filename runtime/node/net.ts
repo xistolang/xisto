@@ -52,6 +52,11 @@ export interface NetConnectOpts {
 }
 
 /** A TCP connection: 'connect', 'data' (Buffers, or strings after setEncoding), 'end', 'close', 'error'. */
+/** Socket.pipe()'s options. */
+export interface SocketPipeOptions {
+  end?: boolean;
+}
+
 export class Socket extends EventEmitter {
   remoteAddress: string = "";
   remotePort: int = 0;
@@ -73,6 +78,19 @@ export class Socket extends EventEmitter {
   private io: int = 0;
   private refd: boolean = true;
 
+  /** Sends what it reads to dest (another socket: an echo server's c.pipe(c), a proxy), and ends dest at its end
+   * unless { end: false }; 'pipe' on dest. Node's backpressure is not there (write() sends at once here). */
+  pipe(dest: Socket, options: SocketPipeOptions | null = null): Socket {
+    const end = options === null || options.end !== false;
+    this.on("data", (d: Uint8Array | string): void => {
+      dest.write(d);
+    });
+    if (end) this.on("end", (): void => {
+      dest.end();
+    });
+    dest.emit("pipe", this);
+    return dest;
+  }
   /** (internal) a socket on an accepted connection: its addresses now, its reading once the server's
    * 'connection' listeners have set theirs (_start). */
   _attach(fd: int): void {
@@ -243,8 +261,8 @@ export function connect(port: number | NetConnectOpts, host: string | null = nul
 
 export type ConnectionListener = (socket: Socket) => void;
 
-/** A TCP server (Node's net.Server; the name Server is xisto's built-in HTTP server): 'connection' (socket) for each client, 'listening', 'close', 'error'. */
-export class NetServer extends EventEmitter {
+/** A TCP server (Node's net.Server): 'connection' (socket) for each client, 'listening', 'close', 'error'. */
+export class Server extends EventEmitter {
   listening: boolean = false;
   private lfd: int = -1;
   private port: int = 0;
@@ -262,7 +280,7 @@ export class NetServer extends EventEmitter {
    * Node's forms: listen(cb), listen(port, cb), listen(port, host, cb), listen(port, host, backlog, cb) (the backlog
    * is the system's). */
   listen(portOrCallback: number | string | (() => void) | null = 0, hostOrCallback: string | number | (() => void) | null = null,
-         backlogOrCallback: number | (() => void) | null = null, callback: (() => void) | null = null): NetServer {
+         backlogOrCallback: number | (() => void) | null = null, callback: (() => void) | null = null): Server {
     let port: int = 0;
     let host = "";
     let cb: (() => void) | null = callback;
@@ -329,7 +347,7 @@ export class NetServer extends EventEmitter {
     }
   }
   /** Stops accepting; 'close' (and the callback) once the open connections end. */
-  close(callback: (() => void) | null = null): NetServer {
+  close(callback: (() => void) | null = null): Server {
     if (callback !== null) this.once("close", callback);
     if (this.closing || this.lfd < 0) return this;
     this.closing = true;
@@ -337,13 +355,13 @@ export class NetServer extends EventEmitter {
     return this;
   }
   /** The server keeps the program alive again (the default). */
-  ref(): NetServer {
+  ref(): Server {
     if (!this.refd && this.io !== 0) net_task_ref(this.io, true);
     this.refd = true;
     return this;
   }
   /** The server does not keep the program alive while it waits for connections. */
-  unref(): NetServer {
+  unref(): Server {
     if (this.refd && this.io !== 0) net_task_ref(this.io, false);
     this.refd = false;
     return this;
@@ -352,7 +370,7 @@ export class NetServer extends EventEmitter {
     return this.lfd < 0 && !this.listening ? null : new AddressInfo("0.0.0.0", "IPv4", this.port);
   }
   /** The number of open connections, to the callback. */
-  getConnections(callback: (err: Error | null, count: int) => void): NetServer {
+  getConnections(callback: (err: Error | null, count: int) => void): Server {
     const n = this.open;
     setImmediate(() => {
       callback(null, n);
@@ -361,9 +379,12 @@ export class NetServer extends EventEmitter {
   }
 }
 
+/** The server class under the name xisto used before (net.Server). */
+export type NetServer = Server;
+
 /** A server that calls the listener for each connection. */
-export function createServer(listener: ConnectionListener | null = null): NetServer {
-  return new NetServer(listener);
+export function createServer(listener: ConnectionListener | null = null): Server {
+  return new Server(listener);
 }
 
 function isV4(s: string): boolean {

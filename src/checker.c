@@ -348,6 +348,13 @@ static void init_builtins(void) {
         bi_method(wkr, "terminate", "xs_Worker_terminate", ty_void, 0); /* (Node returns a Promise of the exit code) */
         bi_method(mport, "on", "xs_MessagePort_on", ty_object_of(mport), 2, ty_string, listener);
         bi_method(mport, "postMessage", "xs_MessagePort_postMessage", ty_void, 1, ty_string);
+        bi_method(wkr, "ref", "xs_Worker_ref", ty_void, 0);
+        bi_method(wkr, "unref", "xs_Worker_unref", ty_void, 0);
+        bi_method(mport, "ref", "xs_MessagePort_ref", ty_void, 0);
+        bi_method(mport, "unref", "xs_MessagePort_unref", ty_void, 0);
+        bi_method(mport, "hasRef", "xs_MessagePort_hasRef", ty_boolean, 0);
+        bi_method(mport, "start", "xs_MessagePort_start", ty_void, 0);
+        bi_method(mport, "close", "xs_MessagePort_close", ty_void, 0);
     }
 
     Class *srv = bi_class("Server", "xs_Server");
@@ -392,6 +399,9 @@ static bool wt_imports(Module *m, const char *name) {
 }
 /* Classes visible from the current module: its own, the ones it imports, and the built-ins. */
 static Class *static_this_class(void);
+static bool webstreams_global; /* the program named the web streams (src/parser.c loaded xisto:stream/web for it) */
+/* xisto:stream/web's classes take type arguments and leave them out (ReadableStream<string>: the chunks are anys) */
+static bool targs_erased(Class *c) { return c && c->mod && c->mod->file && strcmp(c->mod->file, "xisto:stream/web") == 0; }
 static Class *find_class(const char *name) {
     if (name[0] == '\x02' && !strcmp(name, XS_STATIC_THIS)) return static_this_class(); /* `this` in a static method */
     const char *q = strchr(name, '\x01'); /* "A\x01m": the class A of the import from "m" (an alias next to another A, XB-117) */
@@ -410,6 +420,8 @@ static Class *find_class(const char *name) {
         if (!strcmp(name, "Reflect") && c->exported && c->mod && c->mod->file && strstr(c->mod->file, "/reflect-metadata/"))
             return c; /* (Reflect.getMetadata & co: the global that import 'reflect-metadata' installs, the package's class) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:url") == 0 && c->exported) return c; /* (URL & co: web globals) */
+        if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:stream/web") == 0 && c->exported && webstreams_global)
+            return c; /* (ReadableStream & co: web globals, once the program makes one: xisto:stream/web is loaded then) */
         if (c->exported && c->mod && c->mod->file && strstr(c->mod->file, "/intl/") && strncmp(name, "Intl_", 5) == 0)
             return c; /* (Intl.X: the global the intl package gives, its class Intl_X) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:okmap") == 0 && !strcmp(name, "OkMap")) return c; /* (Map<object, V>) */
@@ -2358,6 +2370,35 @@ static Type *ty_union2(Type *a, Type *b) {
         else { u = xs_alloc(sizeof *u); u->kind = TY_UNION; u->params = ps; u->nparams = n; }
     }
     return nul ? ty_nullable_of(u) : u;
+}
+/* T of an element type T | T[] (what flat() takes apart in one level), else NULL */
+static Type *flat_mixed(Type *u) {
+    if (!u || u->kind != TY_UNION || u->nparams != 2) return NULL;
+    for (int i = 0; i < 2; i++) {
+        Type *a = u->params[i], *b = u->params[1 - i];
+        if (b->kind == TY_ARRAY && ty_equal(b->elem, a)) return a;
+    }
+    return NULL;
+}
+/* the element type of an array literal whose elements are values and arrays nested to different depths: two arrays
+   merge element-wise ([1] and [2, [3]]: (number | number[])[]), numbers are number, other kinds a union */
+static Type *lit_merge(Type *a, Type *b) {
+    if (!a) return b;
+    if (ty_equal(a, b)) return a;
+    if (a->kind == TY_ARRAY && b->kind == TY_ARRAY) return ty_array_of(lit_merge(a->elem, b->elem));
+    if (is_numeric(a) && is_numeric(b)) return ty_number;
+    return ty_union2(a, b);
+}
+static void expect_type(Expr *e, Type *want, const char *what);
+/* an array literal already checked, given the (wider) array type t that lit_merge chose: its elements converted */
+static void relabel_lit(Expr *a, Type *t) {
+    if (ty_equal(a->type, t)) return;
+    for (int i = 0; i < a->args.len; i++) {
+        Expr *c = a->args.items[i];
+        if (c->kind == E_ARRAY_LIT && t->elem->kind == TY_ARRAY) relabel_lit(c, t->elem);
+        else expect_type(c, t->elem, "array element");
+    }
+    a->type = t;
 }
 /* class_fields_all where a function's locals are in scope (it enters the class's module: the scope comes back after) */
 static void fields_here(Class *c, FieldSet *out) {
@@ -14273,6 +14314,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                 /* xs.reduce(f, a) / xs.flatMap(f) / xs.flat(): the loop of xisto:arrays, __xs_reduce(xs, f, a) */
                 const char *m = e->str;
                 const char *fn = !strcmp(m, "flat") ? "__xs_flat" : !strcmp(m, "flatMap") ? "__xs_flatMap" : e->args.len >= 2 ? "__xs_reduce" : "__xs_reduce1";
+                if (!strcmp(m, "flat") && e->args.len == 0 && e->lhs->type && e->lhs->type->kind == TY_ARRAY && flat_mixed(e->lhs->type->elem))
+                    expr_list_push(&e->args, num_lit(e->pos, 1, true)); /* [1, [2]].flat(): one level, as flat(1) */
                 if (!strcmp(m, "flat") && e->args.len == 1 && lookup_func("__xs_flat")) {
                     /* xs.flat(depth), the depth written as a number (or Infinity): __xs_flat once per level, as deep as the
                        type goes; flat(0), a copy */
@@ -14283,9 +14326,16 @@ static void check_expr_in(Expr *e, Type *expected) {
                     Expr *x = e->lhs;
                     x->prechecked = true;
                     int k = 0;
-                    for (; k < dv && x->type->kind == TY_ARRAY && x->type->elem->kind == TY_ARRAY; k++) {
+                    for (; k < dv && x->type->kind == TY_ARRAY && (x->type->elem->kind == TY_ARRAY || flat_mixed(x->type->elem)); k++) {
                         Expr *c = xs_alloc(sizeof *c);
-                        c->kind = E_CALL; c->pos = e->pos; c->field = -1; c->lhs = mk_ident(e->pos, "__xs_flat");
+                        c->kind = E_CALL; c->pos = e->pos; c->field = -1;
+                        if (x->type->elem->kind == TY_ARRAY) c->lhs = mk_ident(e->pos, "__xs_flat");
+                        else { /* (T | T[])[]: __xs_flatU<T> */
+                            c->lhs = mk_ident(e->pos, "__xs_flatU");
+                            c->targs = xs_alloc(sizeof(Type *));
+                            c->targs[0] = flat_mixed(x->type->elem);
+                            c->ntargs = 1;
+                        }
                         expr_list_push(&c->args, x);
                         check_expr(c, NULL);
                         c->prechecked = true;
@@ -15789,7 +15839,7 @@ static void check_expr_in(Expr *e, Type *expected) {
             xs_error(XS9031, e->pos, xs_help_suggest(e->str, cands, n, "declare it: class Name { ... }"), "unknown class '%s'", e->str);
         }
         if (c->gen_state) c = generic_new(e, c, expected);
-        else if (e->ntargs) xs_error(XS6005, e->pos, NULL, "'%s' is not generic", c->name);
+        else if (e->ntargs && !targs_erased(c)) xs_error(XS6005, e->pos, NULL, "'%s' is not generic", c->name);
         e->cls = c;
         e->type = ty_object_of(c);
         if (c->builtin && c->ctor && c->ctor->is_native) { /* a native package's class: its C constructor */
@@ -16174,6 +16224,31 @@ static void check_expr_in(Expr *e, Type *expected) {
                 for (int i = 0; i < e->args.len; i++) expect_type(e->args.items[i], ty_unknown, "array element");
                 e->type = arr_unknown3;
                 return;
+            }
+        }
+        if (!elem && e->args.len > 1) { /* [2, [3]], [[1], [2, [3]]]: values and arrays nested to different depths, as
+                                            TypeScript infers them: (number | number[])[], (number | number[])[][] */
+            Type *m = NULL;
+            bool ok = true, arrays = false, differ = false;
+            for (int i = 0; i < e->args.len && ok; i++) {
+                Type *t = e->args.items[i]->type;
+                if (t->kind == TY_LITINT) t = ty_number;
+                if (t->kind == TY_ARRAY) arrays = true;
+                else if (!(is_numeric(t) || t->kind == TY_STRING || t->kind == TY_BOOLEAN || t->kind == TY_UNION)) ok = false;
+                if (m && !ty_equal(m, t)) differ = true;
+                m = lit_merge(m, t);
+            }
+            for (int i = 0; i < e->args.len && ok && arrays && differ; i++) { /* (an array that is not a literal keeps its type) */
+                Expr *a = e->args.items[i];
+                if (a->type->kind == TY_ARRAY && a->kind != E_ARRAY_LIT && !ty_equal(a->type, m)) ok = false;
+            }
+            if (ok && arrays && differ) {
+                for (int i = 0; i < e->args.len; i++) {
+                    Expr *a = e->args.items[i];
+                    settle(a);
+                    if (a->kind == E_ARRAY_LIT && m->kind == TY_ARRAY) relabel_lit(a, m);
+                }
+                elem = m;
             }
         }
         if (!elem) {
@@ -18899,6 +18974,12 @@ static void infer_ints_fn(Stmt *body) {
     for (int c = 0; c < iicn; c++) ii_mark(iic[c].v, iic[c].on);
 }
 
+/* a function of a built-in module (runtime/node/*.ts...) cannot assign a variable of another module: its own local
+   of the same name (a `let k` in a nested block, which ii_shadows does not see) must not make the program's `k` a
+   number */
+static bool ii_foreign(Module *fm, Module *vm) {
+    return fm && vm && fm != vm && fm->file && strncmp(fm->file, "xisto:", 6) == 0;
+}
 /* top-level `let`s are globals: functions may assign them too */
 static void infer_ints_top(Program *p) {
     ii_tn = ii_an = ii_cn = ii_dn = 0; /* the top level's typed names and consts (const lim = Math.max(1, n)), as in a function */
@@ -18908,9 +18989,11 @@ static void infer_ints_top(Program *p) {
         if (ii_candidate(v)) {
             bool ok = true;
             for (int k = i + 1; k < p->top.len && ok; k++) ok = ii_stmt_ok(p->top.items[k], v->name);
-            for (int f = 0; f < p->nfuncs && ok; f++) ok = ii_shadows(p->funcs[f], v->name) || ii_stmt_ok(p->funcs[f]->body, v->name);
+            for (int f = 0; f < p->nfuncs && ok; f++)
+                ok = ii_foreign(p->funcs[f]->mod, v->mod) || ii_shadows(p->funcs[f], v->name) || ii_stmt_ok(p->funcs[f]->body, v->name);
             for (int c = 0; c < p->nclasses && ok; c++) {
                 Class *cl = p->classes[c];
+                if (ii_foreign(cl->mod, v->mod)) continue;
                 for (int m = 0; m < cl->nmethods && ok; m++) ok = ii_shadows(cl->methods[m], v->name) || ii_stmt_ok(cl->methods[m]->body, v->name);
                 if (cl->ctor) ok = ok && (ii_shadows(cl->ctor, v->name) || ii_stmt_ok(cl->ctor->body, v->name));
             }
@@ -21086,7 +21169,145 @@ static void link_base(Class *c) {
     b->subs = realloc(b->subs, sizeof(Class *) * (size_t)(b->nsubs + 1));
     b->subs[b->nsubs++] = c;
 }
+/* ---- xs.length = N making a known array longer (XS6052) ----
+   Isa's decision for array-sparse-push: an array does not grow by its length. When the compiler can tell (N an integer
+   literal, or a const of one, and xs's length known where it is set: right after [a, b], new Array(k)
+   or new Array(k).fill(v), with no other use of xs in between), it is a compile error; otherwise the run-time
+   RangeError of __xs_truncate. Shrinking (and length = 0) stays as JavaScript has it. */
+typedef struct { const char *name; long long len; } LgVar;
+static bool lg_int_lit(Expr *e, long long *v) {
+    if (e && e->kind == E_NUMBER && e->is_int_lit) { *v = (long long)e->num; return true; }
+    return false;
+}
+/* the length an initializer gives, or -1 */
+static long long lg_init_len(Expr *e) {
+    if (!e) return -1;
+    if (e->kind == E_ARRAY_LIT) return e->spread ? -1 : e->args.len;
+    long long n;
+    if (e->kind == E_MEMBER && e->is_call && e->str && !strcmp(e->str, "fill") && e->lhs) e = e->lhs; /* new Array(k).fill(v) */
+    if (e->kind == E_NEW_ARRAY && lg_int_lit(e->lhs, &n) && n >= 0) return n;
+    return -1;
+}
+static bool lg_mentions_e(Expr *e, const char *name);
+static bool lg_mentions_s(Stmt *s, const char *name) {
+    if (!s) return false;
+    if (s->kind == S_VAR && s->name && !strcmp(s->name, name)) return true; /* (shadowed: stop) */
+    if (lg_mentions_e(s->init, name) || lg_mentions_e(s->expr, name) || lg_mentions_e(s->cond, name) || lg_mentions_e(s->for_update, name)) return true;
+    if (lg_mentions_s(s->for_init, name) || lg_mentions_s(s->body, name) || lg_mentions_s(s->else_body, name)) return true;
+    for (int i = 0; i < s->stmts.len; i++) if (lg_mentions_s(s->stmts.items[i], name)) return true;
+    for (int i = 0; i < s->ncases; i++) if (lg_mentions_e(s->cases[i].value, name) || lg_mentions_s(s->cases[i].body, name)) return true;
+    return false;
+}
+static bool lg_mentions_e(Expr *e, const char *name) {
+    if (!e) return false;
+    if (e->kind == E_IDENT && e->str && !strcmp(e->str, name)) return true;
+    if (e->kind == E_ARROW) return true; /* (a closure may hold it: no longer known) */
+    if (lg_mentions_e(e->lhs, name) || lg_mentions_e(e->rhs, name)) return true;
+    for (int i = 0; i < e->args.len; i++) if (lg_mentions_e(e->args.items[i], name)) return true;
+    return false;
+}
+static void lg_scan(Stmt *s);
+static Module *lg_mod; /* the module being scanned, and its top-level consts of integer literals (const LEN = 4) */
+static LgVar *lg_g;
+static int lg_ng;
+static Module **lg_gm;
+static void lg_list(StmtList *l, Module *only) {
+    LgVar *vs = NULL;
+    int nv = 0;
+    LgVar *cs = NULL; /* consts of integer literals */
+    int nc = 0;
+    for (int i = 0; i < l->len; i++) {
+        Stmt *st = l->items[i];
+        if (!st) continue;
+        if (only && st->mod != only) continue;
+        bool handled = false;
+        if (st->kind == S_EXPR && st->expr && st->expr->kind == E_ASSIGN && st->expr->op == TK_ASSIGN) {
+            Expr *t = st->expr->lhs, *r = st->expr->rhs;
+            if (t && t->kind == E_MEMBER && !t->is_call && t->str && !strcmp(t->str, "length") && t->lhs && t->lhs->kind == E_IDENT && t->lhs->str) {
+                long long n = -1;
+                if (!lg_int_lit(r, &n) && r && r->kind == E_IDENT && r->str)
+                    for (int k = 0; k < nc; k++) if (!strcmp(cs[k].name, r->str)) n = cs[k].len;
+                bool byname = r && r->kind == E_IDENT && r->str;
+                bool local = !byname; /* (a name this block declares is not the module's const) */
+                for (int k = 0; k < i && !local; k++) {
+                    Stmt *d = l->items[k];
+                    local = d && d->kind == S_VAR && d->name && !strcmp(d->name, r->str) && (!only || d->mod == only) && only == NULL;
+                }
+                for (int k = 0; n < 0 && !local && k < lg_ng; k++) if (lg_gm[k] == lg_mod && !strcmp(lg_g[k].name, r->str)) n = lg_g[k].len;
+                for (int k = 0; k < nv; k++) {
+                    if (strcmp(vs[k].name, t->lhs->str) != 0) continue;
+                    if (n > vs[k].len)
+                        xs_error(XS6052, st->expr->pos, "add the elements with push(...), or make the array at its size: new Array(n).fill(value)",
+                                 "setting the length of '%s' to %lld makes it longer (its length is %lld here): xisto arrays do not grow by their length",
+                                 vs[k].name, n, vs[k].len);
+                    if (n >= 0) vs[k].len = n; /* (shrunk to n: still known) */
+                    else vs[k] = vs[--nv];
+                    handled = true;
+                    break;
+                }
+            }
+        }
+        if (!handled)
+            for (int k = 0; k < nv; k++)
+                if (lg_mentions_s(st, vs[k].name)) { vs[k] = vs[--nv]; k--; }
+        if (st->kind == S_VAR && st->name) {
+            long long n = lg_init_len(st->init);
+            if (n >= 0) { vs = realloc(vs, sizeof *vs * (size_t)(nv + 1)); vs[nv++] = (LgVar){st->name, n}; }
+            long long c;
+            if (st->is_const && lg_int_lit(st->init, &c)) { cs = realloc(cs, sizeof *cs * (size_t)(nc + 1)); cs[nc++] = (LgVar){st->name, c}; }
+        }
+        lg_scan(st);
+    }
+    free(vs);
+    free(cs);
+}
+static void lg_scan(Stmt *s) {
+    if (!s) return;
+    if (s->kind == S_BLOCK) { lg_list(&s->stmts, NULL); return; }
+    lg_scan(s->body);
+    lg_scan(s->else_body);
+    for (int i = 0; i < s->ncases; i++) lg_scan(s->cases[i].body);
+}
+static void lg_enter(Module *m) { /* (before the module scopes exist: only where errors are reported) */
+    lg_mod = m;
+    xs_file_name = m->file;
+    xs_source = m->src;
+}
+static void lg_program(Program *p) {
+    for (int i = 0; i < p->top.len; i++) {
+        Stmt *st = p->top.items[i];
+        long long c;
+        if (st && st->kind == S_VAR && st->name && st->is_const && lg_int_lit(st->init, &c)) {
+            lg_g = realloc(lg_g, sizeof *lg_g * (size_t)(lg_ng + 1));
+            lg_gm = realloc(lg_gm, sizeof *lg_gm * (size_t)(lg_ng + 1));
+            lg_g[lg_ng] = (LgVar){st->name, c};
+            lg_gm[lg_ng++] = st->mod;
+        }
+    }
+    for (int m = 0; m < p->nmodules; m++) {
+        Module *mod = p->modules[m];
+        if (!mod->file || !strncmp(mod->file, "xisto:", 6)) continue;
+        lg_enter(mod);
+        lg_list(&p->top, mod);
+    }
+    for (int f = 0; f < p->nfuncs; f++)
+        if (p->funcs[f]->mod && p->funcs[f]->mod->file && strncmp(p->funcs[f]->mod->file, "xisto:", 6)) {
+            lg_enter(p->funcs[f]->mod);
+            lg_scan(p->funcs[f]->body);
+        }
+    for (int c = 0; c < p->nclasses; c++) {
+        Class *cl = p->classes[c];
+        if (!cl->mod || !cl->mod->file || !strncmp(cl->mod->file, "xisto:", 6)) continue;
+        lg_enter(cl->mod);
+        for (int m = 0; m < cl->nmethods; m++) lg_scan(cl->methods[m]->body);
+        if (cl->ctor) lg_scan(cl->ctor->body);
+    }
+}
+
 void check_program(Program *p) {
+    lg_program(p);
+    for (int i = 0; i < p->nmodules; i++)
+        if (p->modules[i]->file && !strcmp(p->modules[i]->file, "xisto:stream/web")) webstreams_global = true;
     prog = p;
     init_builtins();
     for (int i = 0; i < p->nfuncs; i++) sym_add(&funcs_by_name, p->funcs[i]->name, p->funcs[i]);
@@ -21111,9 +21332,10 @@ void check_program(Program *p) {
         for (int j = 0; j < nbuiltins; j++)
             if (strcmp(c->name, builtins[j]->name) == 0 && !((strcmp(c->name, "Worker") == 0 || strcmp(c->name, "MessagePort") == 0) && !wt_imports(c->mod, c->name)) &&
                 strcmp(c->name, "Response") != 0 && strcmp(c->name, "ReadableStream") != 0 &&
-                !(strcmp(c->name, "Server") == 0 && c->mod && c->mod->file && strcmp(c->mod->file, "xisto:http") == 0))
-                /* (Express's Response, node:stream/web's ReadableStream, node:http's Server: a module's own class comes
-                   first where it is declared or imported) */
+                !(strcmp(c->name, "Server") == 0 && c->mod && c->mod->file &&
+                  (strcmp(c->mod->file, "xisto:http") == 0 || strcmp(c->mod->file, "xisto:https") == 0 || strcmp(c->mod->file, "xisto:net") == 0)))
+                /* (Express's Response, node:stream/web's ReadableStream, node:http's, node:https' and node:net's Server: a
+                   module's own class comes first where it is declared or imported) */
                 xs_error(XS9002, c->pos, NULL, "'%s' is a built-in class", c->name);
         SYM_EACH(funcs_by_name, c->name, e)
             if (((Func *)e->decl)->mod == c->mod) xs_error(XS9006, c->pos, NULL, "'%s' is both a class and a function", c->name);

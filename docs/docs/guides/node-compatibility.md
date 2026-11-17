@@ -76,8 +76,10 @@ Supported:
 | `Writable` | `write` (false above the `highWaterMark`), `'drain'`, `end(chunk?, encoding?, cb?)`, `'finish'`/`'prefinish'`, `_write`/`_writev`/`_final`, `cork`/`uncork`, `setDefaultEncoding`, `decodeStrings`, `objectMode`, the `writable*` properties |
 | `Duplex`, `Transform`, `PassThrough` | `allowHalfOpen`, `readable`/`writable: false`, `readableObjectMode`/`writableObjectMode`, `_transform` (pushing, or `callback(null, data)`), `_flush` |
 | all | `_construct`, `_destroy`, `destroy(err, cb)`, `autoDestroy`, `emitClose`, `destroyed`/`closed`/`errored` |
-| functions | `pipeline(...streams, cb)`, `finished(stream, [options], cb)`, `isReadable`, `isWritable`, `isErrored`, `isDisturbed`, `getDefaultHighWaterMark`/`setDefaultHighWaterMark` (64 KiB, 16 objects) |
+| functions | `pipeline(...streams, cb)`, `finished(stream, [options], cb)`, `destroy(stream, err?)`, `isDestroyed`, `isReadable`, `isWritable`, `isErrored`, `isDisturbed`, `getDefaultHighWaterMark`/`setDefaultHighWaterMark` (64 KiB, 16 objects) |
+| `Stream` | the module itself, as in Node: `Stream.Readable`, `Stream.Transform`, `Stream.pipeline`... (also `stream.Stream.X`), in `new`, `extends`, `instanceof` and calls; a plain `Stream`'s `pipe` is Node's legacy one, a `Writable`'s emits `ERR_STREAM_CANNOT_PIPE` |
 | `node:stream/promises` | `pipeline(...streams)`, `finished(stream, options?)` |
+| `node:stream/consumers` | `text`, `json`, `buffer`, `bytes`, `arrayBuffer` (a `Uint8Array`: xisto has no `ArrayBuffer`) of a `Readable`; no `blob` |
 | `node:fs` | `createReadStream(path, { start, end, highWaterMark, encoding, fd, flags, autoClose })` (by name or as `fs.createReadStream`) and `createWriteStream(path, { flags, encoding, start, fd })`, `ReadStream`/`WriteStream` (`'open'`, `'ready'`, `bytesRead`/`bytesWritten`, `close()`); errors as Node's (`ENOENT: no such file or directory, open '...'`, `code`, `syscall`) |
 
 Errors carry Node's `code` and message (`ERR_STREAM_PUSH_AFTER_EOF`, `ERR_STREAM_WRITE_AFTER_END`,
@@ -121,7 +123,9 @@ Differences from Node:
 `node:stream/web` has `ReadableStream` (with `getReader()`/`read()`/`releaseLock()`, `cancel`, `pipeTo`,
 `pipeThrough`, `tee`, `for await`), `WritableStream` (`getWriter()` with `write`/`close`/`abort`/`ready`/
 `closed`/`desiredSize`), `TransformStream`, `TextEncoderStream`, `TextDecoderStream`,
-`CountQueuingStrategy` and `ByteLengthQueuingStrategy`. They are not globals: import them. A source, sink or
+`CountQueuingStrategy` and `ByteLengthQueuingStrategy`. They are globals too, as in Node: a program that makes a
+`new ReadableStream(...)` (or names `WritableStream`, `TransformStream`...) gets them without an import, and
+`ReadableStream<string>` takes its type arguments (the chunks are read as `any`). A source, sink or
 transformer is an object of functions written as properties (`start: (c) => { ... }`), each returning nothing or a
 promise.
 
@@ -156,8 +160,9 @@ Supported: `on`/`addListener`, `once`, `prependListener`, `prependOnceListener`,
 `removeAllListeners`, `emit`, `listenerCount` (with a listener too), `listeners`, `rawListeners`, `eventNames`,
 `setMaxListeners`/`getMaxListeners` (with Node's warning on stderr), `EventEmitter.defaultMaxListeners`, the
 `'newListener'` and `'removeListener'` events, an `'error'` with no listener thrown, `errorMonitor`, and the
-functions `once(emitter, name)` (a promise of the arguments, rejected by an `'error'`), `getEventListeners`,
-`setMaxListeners`, `getMaxListeners`, `listenerCount`.
+functions `once(emitter, name)` (a promise of the arguments, rejected by an `'error'`), `on(emitter, name, { close })`
+(the emits' arguments as an async iterator: `for await (const [a, b] of on(emitter, "data"))`), `getEventListeners`,
+`setMaxListeners`, `getMaxListeners`, `listenerCount`, also as statics of `EventEmitter`.
 
 A listener with its own parameter types, `(i: number, n: number) => void`, is accepted where Node's typings say
 `(...args: any[]) => void`. The compiler wraps it so that each argument is checked as the listener takes it, and
@@ -171,7 +176,9 @@ Differences from Node:
 - `on()` and the other chaining methods return `EventEmitter`. xisto has no `this` return type, so a subclass
   chain `new Job().on(...)` is typed as `EventEmitter`.
 - `rawListeners()` gives the listeners themselves, without the once wrappers.
-- Not available yet: `events.on(emitter, name)` (async iteration), `captureRejections`, `EventTarget` helpers.
+- `events.on()`: leaving the `for await` loop with `break` does not remove its listeners; end it with the `close`
+  option when the emitter lives on. No `signal` option.
+- Not available yet: `captureRejections`, `EventTarget` helpers.
 
 ## timers
 
@@ -322,10 +329,21 @@ The client side, `http.request(url | options, cb)` and `http.get(...)`, gives a 
 (`statusCode`, `statusMessage`, `headers`, `'data'`/`'end'`). The response's body comes as it arrives (a
 server-sent events stream can be read), as Buffers. `STATUS_CODES` and `METHODS` are there too.
 
+Connections go through an `http.Agent` (`https.Agent`), as in Node: `http.globalAgent` by default (keep-alive, as
+Node's since v19), the `agent` option for another one, `agent: false` for a connection of the request's own.
+`new Agent({ keepAlive, keepAliveMsecs, maxSockets, maxTotalSockets, maxFreeSockets, timeout, scheduling })`: with
+`keepAlive` a connection whose response ended is used again by the next request to the same host and port
+(`req.reusedSocket`) and the request says `Connection: keep-alive`, else `Connection: close`; `maxSockets` makes the
+other requests to a host wait; `getName()`, `destroy()`, `totalSocketCount`. An idle connection does not keep the
+program alive, and one the server closed is not used again.
+
 Differences from Node:
 
 - A client request's body is sent at `end()` with a `Content-Length` (Node streams it chunked when `write()` came
-  before `end()`). Each request opens its own connection: there is no `Agent` and no connection reuse yet.
+  before `end()`).
+- `http.Agent`: no `sockets`/`freeSockets`/`requests` objects, no `createConnection`/`keepSocketAlive` hooks to
+  override (so no proxy agents built on them), and `keepAliveMsecs` (TCP keep-alive probes) is not applied. An https
+  connection is not reused: each https request has its own.
 - A request body is not held back: `req.pause()` does not stop the reading of the socket, so a large upload the
   handler does not read is kept in memory.
 - `headersTimeout`, `requestTimeout` and `server.setTimeout` are accepted but not enforced; idle keep-alive
@@ -357,8 +375,9 @@ Differences from Node:
 - IPv4 listeners only. No Unix domain sockets.
 - No read backpressure (`pause()`).
 - `write()` writes before it returns.
-- The socket is an `EventEmitter`, not a `stream.Duplex` (no `pipe()`).
-- The server class is `NetServer`, because `Server` is xisto's built-in.
+- The socket is an `EventEmitter`, not a `stream.Duplex`: `pipe(dest)` takes another `net.Socket` (an echo
+  server's `c.pipe(c)`, a proxy), with `{ end }` and the `'pipe'` event, but no backpressure.
+- `https.Server` extends `http.Server` (Node: `tls.Server`), so `instanceof http.Server` is true for it.
 
 ## dns
 
@@ -373,7 +392,7 @@ queries (`resolveMx`, `resolveTxt`, `reverse`...) are not there yet. `promises.l
 
 | API | Notes |
 |---|---|
-| `spawn(file, args, { cwd, env, shell })` | `stdout`/`stderr` give `'data'` as the child writes (`setEncoding` for text); `stdin.write`/`end`; `kill(signal)`; `'spawn'`, `'exit'` (code, signal), `'close'`, `'error'` (`spawn x ENOENT`) |
+| `spawn(file, args, { cwd, env, shell })` | `stdout`/`stderr` give `'data'` as the child writes (`setEncoding` for text); `stdin.write`/`end`; `kill(signal)`; `unref()`/`ref()` (an unref'd child does not keep the program alive); `'spawn'`, `'exit'` (code, signal), `'close'`, `'error'` (`spawn x ENOENT`) |
 | `exec(command, cb)`, `execFile(file, args, cb)` | `cb(error, stdout, stderr)`; a failure is Node's `Command failed: ...` error with `code` |
 | `spawnSync(file, args, { input, cwd, encoding })` | `status`, `signal`, `stdout`, `stderr`, `error` |
 | `execFileSync`, `execSync` | the output; a failure is thrown |
@@ -891,7 +910,8 @@ directory made), `readdirSync` (`{ withFileTypes }`: `Dirent`s with `name`, `par
 `isDirectory()`, `isSymbolicLink()`...; `{ throwIfNoEntry: false }`), `rmSync` (`{ recursive, force }`),
 `rmdirSync`, `renameSync`, `copyFileSync` (`COPYFILE_EXCL`), `cpSync` (`{ recursive, force, errorOnExist,
 filter }`), `mkdtempSync`, `realpathSync`, `accessSync`, `chmodSync`, `symlinkSync`, `readlinkSync`, `linkSync`,
-`truncateSync`, `utimesSync`/`lutimesSync`, `openSync`/`closeSync`/`readSync`, and `fs.constants` (`F_OK`, `R_OK`,
+`truncateSync`, `utimesSync`/`lutimesSync`, `openSync`/`closeSync`/`readSync`/`writeSync`, `globSync` (a pattern or
+several, `cwd`, `exclude` as patterns or a function of the path, `withFileTypes`; Node's results and order), and `fs.constants` (`F_OK`, `R_OK`,
 `W_OK`, `X_OK`, `COPYFILE_EXCL`, `S_IF*`...). Errors are Node's: the message (`ENOENT: no such file or directory,
 open '/x'`, `EEXIST: file already exists, mkdir '/x'`, `rename 'a' -> 'b'`...) and `err.code`, `errno` (this
 system's, negative), `syscall`, `path` and `dest`, read through an `any` (`catch (e: any)`) or a cast; `rmSync` of
@@ -900,7 +920,14 @@ a directory without `recursive` is Node's `SystemError` `ERR_FS_EISDIR`.
 **Callbacks**: `fs.readFile(path, options?, callback)` (`"utf8"` or `{ encoding }`: text; otherwise a `Buffer`),
 `writeFile`, `appendFile`, `mkdir`, `readdir` (`withFileTypes`), `stat`, `lstat`, `fstat`, `rm`, `rmdir`, `rename`,
 `access`, `unlink`, `copyFile`, `cp`, `realpath`, `mkdtemp`, `readlink`, `symlink`, `link`, `chmod`, `truncate`,
-`utimes`: the work and the callback happen on a later turn of the event loop, `err` is `null` when it worked.
+`utimes`, and on file descriptors `open`, `read`, `write`, `close` (and `exists(path, cb)`): the work and the
+callback happen on a later turn of the event loop, `err` is `null` when it worked. `fs.glob(pattern, options?, cb)`
+and `fs.promises.glob(pattern, options?)` (an async iterator) give `globSync`'s matches.
+`fs.watch(path, options?, listener?)` gives an `FSWatcher` (`'change'` with `(eventType, filename)`, `close()` and
+`'close'`, `ref()`/`unref()`, `{ persistent: false }`): a name created, removed or renamed in a watched directory is
+`"rename"`, a write `"change"`. Linux uses inotify, as Node; macOS uses kqueue where Node uses FSEvents, so the event
+types can differ there (FSEvents reports a write as `"rename"` at times, and what happened just before the watcher
+started). `recursive` is accepted, but only the directory's own entries are watched.
 
 **Promises**: `node:fs/promises` and `fs.promises` (also `import { promises } from "node:fs"`): `readFile`
 (text with an encoding, else a `Buffer`), `writeFile`, `appendFile`, `unlink`, `mkdir`, `readdir`, `stat`,
@@ -912,8 +939,9 @@ The callback API, `fs.promises` and the streams are loaded only by programs that
 
 **`node:path`**: POSIX `join`, `resolve`, `normalize`, `relative`, `dirname`, `basename`, `extname`,
 `isAbsolute`, `parse`, `format`, `toNamespacedPath`, `sep`, `delimiter`; `path.posix` (the same) and
-`path.win32` (`normalize`, `join`, `isAbsolute`, `dirname`, `basename`, `extname`, `parse`, `format`,
-`toNamespacedPath`, `sep`, `delimiter`, with drive letters and UNC roots as Node's).
+`path.win32` (`normalize`, `join`, `resolve`, `relative`, `isAbsolute`, `dirname`, `basename`, `extname`, `parse`,
+`format`, `toNamespacedPath`, `sep`, `delimiter`, with drive letters and UNC roots as Node's), also as the modules
+`node:path/posix` and `node:path/win32`.
 
 **`node:os`**: `platform`, `type`, `arch`, `machine`, `release`, `version`, `hostname`, `homedir`, `tmpdir`,
 `endianness`, `EOL`, `devNull`, `uptime`, `loadavg`, `totalmem`, `freemem`, `availableParallelism`, `cpus`,
@@ -921,7 +949,8 @@ The callback API, `fs.promises` and the streams are loaded only by programs that
 `mac`, `internal`, `cidr`, `scopeid`) and `os.constants` (`signals` and `errno` with this system's numbers,
 `priority`).
 
-**`node:url`**: `fileURLToPath(url)` and `pathToFileURL(path)`, encoded as Node encodes them (spaces, `%`, `#`, `?`,
+**`node:url`**: the legacy `url.parse` (DEP0169 printed once, as Node does), `url.format` and `url.resolve`, and
+`fileURLToPath(url)` and `pathToFileURL(path)`, encoded as Node encodes them (spaces, `%`, `#`, `?`,
 `\`, non-ASCII), with Node's errors (`ERR_INVALID_URL_SCHEME`, `ERR_INVALID_FILE_URL_HOST`,
 `ERR_INVALID_FILE_URL_PATH`).
 
@@ -936,12 +965,13 @@ files next to the binary and find them with `process.execPath` instead). `import
 Differences from Node:
 
 - Paths are strings: not `Buffer`s or `URL`s (`fileURLToPath(url)` gives one), no file descriptors where a path
-  goes (beyond `fstatSync`, `readSync` and the streams).
+  goes (beyond `fstatSync`, `readSync`, `writeSync`, `open`/`read`/`write`/`close` and the streams).
 - `readFileSync` takes `"utf8"`/`"utf-8"` (or `{ encoding }` with one) for text; another encoding is
   `readFileSync(path).toString(encoding)`. `writeFileSync`/`appendFileSync` write text in another encoding
   (`"latin1"`, `"base64"`...) when the encoding is written in the call (a literal; one held in a variable throws
   an error that says so). `openSync` takes the flags `r`, `w`, `a`, `r+`.
-- On an error the callback's result is empty (`""`, an empty `Buffer` or array, a `Stats` of zeros) where Node
+- On an error the callback's result is empty (`""`, an empty `Buffer` or array, a `Stats` of zeros, `-1` for
+  `open`'s descriptor) where Node
   passes `undefined`; a missing optional value (`mkdirSync`'s result, `err.dest`) prints as `null` in
   `console.log`.
 - `console.log(err)` prints `Error: <message>` (no `{ errno, code, syscall, path }` block and no stack);
