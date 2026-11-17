@@ -504,7 +504,9 @@ static Buf compile_to_c(const char *path) {
         if (p->uses_parallel && !xs_debug) par_analyze(p); /* (the debugger, like the QBE backend, runs the plain loops) */
         if (p->par_native) in_process = false; /* (xisto:parallel: a thread pool, so per-thread runtime state) */
         if ((p->uses_net || p->par_native) && !in_process) buf_puts(&b, "#define XS_THREADS 1\n"); /* servers may run worker threads */
-        if (getenv("XISTO_REL_OOL") && *getenv("XISTO_REL_OOL") == '1') buf_puts(&b, "#define XS_REL_OOL 1\n"); /* (experiment: every string release out of line) */
+        /* every string release out of line (XS_REL_OOL), hot code included: the A/B on both VMs was neutral and the
+           binaries smaller; XISTO_REL_INLINE=1 keeps them inlined (the old XISTO_REL_OOL=1 is now the default: ignored) */
+        if (!(getenv("XISTO_REL_INLINE") && *getenv("XISTO_REL_INLINE") == '1')) buf_puts(&b, "#define XS_REL_OOL 1\n");
         if (p->par_native) buf_puts(&b, "#define XS_PARALLEL 1\n");
         if (p->uses_float) buf_puts(&b, "#define XS_FLOAT 1\n"); /* (floating calls: their spawn and the shared stack's bookkeeping) */
         if (p->uses_tls) { buf_puts(&b, "#define XS_WITH_TLS 1\n"); link_tls = true; }

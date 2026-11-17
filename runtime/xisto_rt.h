@@ -899,8 +899,8 @@ static void xs_str_free(void *p);
    inlined test-and-free (Intl.DateTimeFormatOptions: 16 fields, 2.9 KB inline) */
 XS_NOINLINE void xs_str_release(void *p) { xs_release_as(p, xs_str_free); }
 #ifdef XS_REL_OOL
-/* experiment (XISTO_REL_OOL=1): every string release, hot code included, is the out-of-line call; the other kinds
-   stay inline (the comparison of free_fn with xs_str_free folds) */
+/* the default (src/main.c defines it unless XISTO_REL_INLINE=1): every string release, hot code included, is the
+   out-of-line call; the other kinds stay inline (the comparison of free_fn with xs_str_free folds) */
 #undef xs_release_as
 #define xs_release_as(x, free_fn) do { if ((void *)(free_fn) == (void *)xs_str_free) xs_str_release((void *)(x)); else { xs_hdr *h_ = (xs_hdr *)(x); \
     if (h_) { XS_HEAP_CHECK_REL(h_) if (--h_->rc == 0) free_fn(h_); \
