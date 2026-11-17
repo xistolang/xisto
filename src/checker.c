@@ -19713,8 +19713,19 @@ static bool method_fits(Func *cm, Func *im, Class *src, Class *ifc, bool infer, 
         if (why) *why = xs_sprintf("%s.%s is %s; %s.%s is public", cn, mn, cm->access == 2 ? "private" : "protected", iname, mn);
         return false;
     }
-    if (cm->ntparams && !im->ntparams && fn_required(cm) <= im->nparams) return true; /* (query<T = any>(sql, ..): Promise<T> where
+    if (cm->ntparams && !im->ntparams && fn_required(cm) <= im->nparams) { /* (query<T = any>(sql, ..): Promise<T> where
         the interface's query(sql, binds?): R goes: the adapter calls it, its T taken from R; the call is checked there) */
+        for (int k = 0; k < fn_required(cm) && k < im->nparams; k++) { /* (but a required parameter that does not name its T must take
+            what the interface passes: Connection.execute<T>(sql: string, ...) is not a Contract<I, O>'s execute(input: I)) */
+            Param *cp = &cm->params[k], *ip = &im->params[k];
+            if (cp->rest || ip->rest || !cp->type || !ip->type || has_tparam(cp->type)) continue;
+            if (!conv_ok(ip->type, cp->type, depth)) {
+                if (why) *why = xs_sprintf("parameter '%s' of %s.%s is %s, but %s.%s passes %s", cp->name, cn, mn, ad_tname(cp->type), iname, mn, ad_tname(ip->type));
+                return false;
+            }
+        }
+        return true;
+    }
     if (cm->ntparams || im->ntparams) {
         if (why) *why = xs_sprintf("%s.%s is generic: write the same signature as %s.%s, or implement %s", cn, mn, iname, mn, iname);
         return false;
