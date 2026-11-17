@@ -124,7 +124,7 @@ export class Stats {
   gid: int = 0;
   rdev: int = 0;
   blksize: int = 0;
-  ino: int = 0;
+  ino: number = 0; // (a number, as Node's: a pipe's inode on macOS is above 2^53, which no int holds)
   size: int = 0;
   blocks: int = 0;
   atimeMs: number = 0;
@@ -140,7 +140,7 @@ export class Stats {
     this.gid = Math.trunc(v[4]);
     this.rdev = Math.trunc(v[5]);
     this.blksize = Math.trunc(v[6]);
-    this.ino = Math.trunc(v[7]);
+    this.ino = v[7];
     this.size = Math.trunc(v[8]);
     this.blocks = Math.trunc(v[9]);
     this.atimeMs = v[10];
