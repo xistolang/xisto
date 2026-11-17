@@ -17373,7 +17373,10 @@ static Expr *upath_strip(Expr *e) {
 }
 static const char *upath_key(Expr *m) {
     m = upath_strip(m);
-    if (!m || m->kind != E_MEMBER || m->is_call || m->field < 0 || !m->cls || m->cls->builtin || !m->type || ty_strip_null(m->type)->kind != TY_UNION) return NULL;
+    if (!m || m->kind != E_MEMBER || m->is_call || m->field < 0 || !m->cls || m->cls->builtin || !m->type) return NULL;
+    Type *mt = m->type;
+    if (mt->kind == TY_UNKNOWN && m->field < m->cls->nfields) mt = m->cls->fields[m->field].type; /* (the field read as the boxed value of its union, under a conversion) */
+    if (ty_strip_null(mt)->kind != TY_UNION) return NULL;
     const char *in = path_base(m->lhs); /* (this.h: A | B | null too, narrowed after a test against null) */
     return in ? xs_sprintf("\x01\x02%s.%d.%s", in, m->field, m->cls->name) : NULL;
 }
@@ -17387,9 +17390,19 @@ static void upath_read(Expr *e) {
     Expr *inner = xs_alloc(sizeof *inner);
     *inner = *e;
     inner->prechecked = true;
+    if (inner->type && inner->type->kind == TY_NULLABLE && pb->type->kind != TY_NULLABLE && pb->type->kind != TY_UNKNOWN) {
+        /* v.from: number | string | null after typeof v.from === "number": the test excludes null too, so the field is
+           read as v.from! (checked) before it is seen as the member */
+        Expr *nn = xs_alloc(sizeof *nn);
+        nn->kind = E_AS; nn->op = TK_NOT; nn->pos = inner->pos; nn->lhs = inner; nn->field = -1;
+        nn->type = inner->type->elem; nn->prechecked = true;
+        inner = nn;
+    }
     memset(e, 0, sizeof *e);
     e->kind = E_AS; e->pos = inner->pos; e->lhs = inner; e->field = -1; e->elem_type = pb->type; e->upath = true;
     check_expr(e, NULL);
+    if (e->kind == E_AS && e->elem_type) e->upath = true; /* (a conversion check_expr rewrote, string | null of number | string | null:
+                                                            still this path, for the next test) */
 }
 /* the variable or field path a union narrowing is about: a binding (for a path, the one in scope or a new one as declared) */
 static Expr *union_ident(Expr *e);
@@ -17405,6 +17418,8 @@ static Binding *union_subject(Expr *e) {
     Expr *s = e; /* (this.h after this.h !== null: the union without null, as read there) */
     while (s && s->kind == E_AS && s->upath) s = s->lhs;
     pb->type = s->type;
+    if (pb->type->kind == TY_UNKNOWN && s->kind == E_MEMBER && s->cls && s->field >= 0 && s->field < s->cls->nfields)
+        pb->type = s->cls->fields[s->field].type; /* (read through a conversion: the field as declared) */
     pb->cname = "";
     return pb;
 }
@@ -17718,6 +17733,14 @@ static UNarrow union_narrow(Expr *c) {
     Type *u = b->type;
     bool nul = u->kind == TY_NULLABLE && u->elem->kind == TY_UNION; /* number | string | null: null stays on the other side */
     if (nul) u = u->elem;
+    if (how == 1 && b->union_narrow && u->kind == TY_NULLABLE && u->elem->kind != TY_UNION && strcmp(lit->str, "object") &&
+        strcmp(typeof_name(u->elem), lit->str) == 0) {
+        /* number | string | null, after typeof x === "number" returned: string | null; typeof x === "string" then
+           leaves the string (typeof null is "object", so only that test keeps null) */
+        r.b = b;
+        if (neg) r.else_t = u->elem; else r.then_t = u->elem;
+        return r;
+    }
     if (u->kind != TY_UNION) return r;
     bool *keep = xs_alloc(sizeof(bool) * (size_t)u->nparams), *other = xs_alloc(sizeof(bool) * (size_t)u->nparams);
     for (int i = 0; i < u->nparams; i++) {
