@@ -103,6 +103,7 @@ fix. One cause often hides hundreds of lines.
 |---|---|---|
 | module or package not available | npm package or `node:` module not ported | port the package (xistolang/packages) or the module |
 | Node module import | `node:x` / bare `fs`, `path`... | automatic: `xisto:x`, or `--node-compat` |
+| `Intl` (XS5005 `package 'intl' is not installed`), `toLocaleDateString(locale)` (XS7014) | `Intl` is a package, not built in | `xisto add intl` |
 | syntax xisto does not read | a language gap (see [The language](../language/index.md)) | compiler |
 | missing type annotation | a field, parameter or return without a type | annotate, or compiler inference |
 | dynamic value | `any`, `unknown` misuse, `undefined` | `null` and `T \| null`, typed values |

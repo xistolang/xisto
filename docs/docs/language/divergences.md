@@ -64,6 +64,7 @@ Every row was checked on 12 Nov 2026 by running the same program with xisto and 
 | `xs.length = 5` on a 3-element array | grows it (holes up to index 4) | error XS6052 when the length is known there (`[1, 2]`, `new Array(3).fill(0)` just before); else an error at run time (`RangeError: xisto cannot make an array longer...`) | an array has no holes: add with `push(...)`, or make it `new Array(n).fill(v)` |
 | `new Date("bad").getFullYear()` | `NaN` | `0` | getters return `int` |
 | `Date.toString()` zone name | `(Brasilia Standard Time)` | `(-03)` | no ICU data |
+| `new Intl.NumberFormat(...)`, `d.toLocaleDateString("pt-BR")` | built in | error XS5005 (`Intl`) or XS7014 until `xisto add intl` | `Intl` is the `intl` package, en-US and pt-BR |
 | `JSON.parse(t) as T` with a `Date` field | the field stays a string | a `Date` | the declared type is decoded |
 | `execSync(cmd)` without `encoding` | `Buffer` | `string` | |
 

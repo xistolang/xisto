@@ -150,6 +150,52 @@ BigInt.asIntN(8, 255n);    // -1n
 `Uint8Array`, `Buffer`, `Float64Array`, `Float32Array` and `Int32Array` have `at(i)`. Their other recent
 methods (`toSorted`, `with`, `findLast`) are not there yet.
 
+## Intl and locales
+
+`Intl` is not built into xisto: it is the `intl` package, from
+[xistolang/packages](https://github.com/xistolang/packages). Add it to the project:
+
+```sh
+xisto add intl
+```
+
+With it, the program uses `Intl` as on Node, and the locale forms of the built-in methods go through it:
+
+```ts
+const brl = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
+console.log(brl.format(1234.5));                                         // R$ 1.234,50
+console.log((1234.5).toLocaleString("en-US", { style: "currency", currency: "USD" })); // $1,234.50
+const d = new Date(Date.UTC(2026, 10, 17, 15, 30));
+console.log(d.toLocaleDateString("pt-BR", { timeZone: "UTC", dateStyle: "long" }));  // 17 de novembro de 2026
+console.log(["é", "f", "e", "Z"].sort(new Intl.Collator("pt-BR").compare));         // [ 'e', 'é', 'f', 'Z' ]
+```
+
+The package has `Intl.NumberFormat`, `Intl.DateTimeFormat` and `Intl.Collator`, and takes over
+`n.toLocaleString(locale, options)`, `d.toLocaleString`/`toLocaleDateString`/`toLocaleTimeString(locale, options)`
+and `s.localeCompare(t, locale, options)`. Its locales are en-US and pt-BR (another `pt-*` formats as pt-BR, any
+other locale as en-US); the header of its `index.ts` lists the options it supports and how it differs from Node.
+Only what a program uses is compiled into it.
+
+Without the package:
+
+- Naming `Intl` is an error that says what to do:
+
+  ```text
+  x.ts:1:15: error[XS5005]: package 'intl' is not installed
+       1 | const f = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
+         |               ^
+    help: Intl is not built into xisto: install it with xisto add intl
+  ```
+
+- `d.toLocaleString()`, `toLocaleDateString()` and `toLocaleTimeString()` without arguments give en-US, as Node by
+  default; with a locale or options they are error XS7014, whose help names the package.
+- `n.toLocaleString(locale?, options?)` keeps a built-in form: pt-BR separators for a `pt` locale, en-US for any
+  other, and the options `style: "currency"`, `currency`, `minimumFractionDigits` and `maximumFractionDigits`
+  written as literals.
+- `s.localeCompare(t)` (and `s.localeCompare(t, locale)`, whose locale is not read) uses ICU's root order for Latin
+  text, Node's default: the letters, then the accents, then the case (lower first); other scripts come after Latin,
+  by code point. The options argument needs the package.
+
 ## See also
 
 - [Generators](./generators.md)

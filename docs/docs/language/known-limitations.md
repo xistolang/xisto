@@ -35,8 +35,9 @@ instead. Intended differences are in [Divergences from TypeScript](./divergences
 ## Runtime and library
 
 - `Map` and `Set` `for…of` does not see entries added during the loop.
-- `localeCompare` and `Date` have no ICU data:
-  `Date.toString()` shows the zone abbreviation (`-03`), not its long name.
+- `Intl` is not built in: it is the `intl` package (`xisto add intl`; see [Intl and locales](./builtins.md#intl-and-locales)),
+  with the en-US and pt-BR locales. Without it, `localeCompare` knows only Latin text's order.
+- `Date` has no ICU data: `Date.toString()` shows the zone abbreviation (`-03`), not its long name.
 - `Map.get` of a missing key with an `int`, `number` or `boolean` value, read where only that type fits
   (`m.get(k) + 1`), is a run-time error: test with `has`, or write `m.get(k) ?? 0`.
 - Stack traces stop after 39 frames and do not show runtime frames.
