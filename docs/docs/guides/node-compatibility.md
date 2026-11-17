@@ -30,8 +30,9 @@ Available modules include:
 - `http` / `https`: a server and `fetch`, with TLS (AWS-LC by default, or BearSSL)
 - `crypto`: hashes, HMAC, AES ciphers, pbkdf2/scrypt/hkdf, keys and RSA/ECDSA signatures (see [crypto](#crypto))
 - `zlib`: deflate, gzip, raw deflate and Brotli (see [zlib](#zlib))
-- `stream`, `stream/promises`, `stream/web`, and `fs.createReadStream`/`createWriteStream` (see [stream](#stream))
+- `stream`, `stream/promises`, `stream/consumers`, `stream/web`, and `fs.createReadStream`/`createWriteStream` (see [stream](#stream))
 - `async_hooks` (`AsyncLocalStorage`)
+- `worker_threads` (see [worker_threads](#worker_threads))
 - `buffer` (`Buffer`, also a global; see [Buffer](#buffer))
 - `sqlite`
 - `assert` and `assert/strict` (see [assert](#assert)), `test` (see [test](#test)), `perf_hooks` (see
@@ -404,6 +405,54 @@ Differences from Node:
 - The synchronous calls return text: Node returns a Buffer when no `encoding` is given, so pass `{ encoding:
   "utf8" }` to have the same result on both.
 - Not on Windows yet.
+## worker_threads
+
+A worker runs the same program again on another thread, as `new Worker(__filename)` does in Node; `isMainThread`
+tells the two apart:
+
+```ts
+import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
+
+class Task {
+  from: int = 0;
+  to: int = 0;
+}
+
+if (isMainThread) {
+  const parts = [{ from: 1, to: 500 }, { from: 501, to: 1000 }];
+  let total = 0;
+  let left = parts.length;
+  for (const part of parts) {
+    const w = new Worker(__filename, { workerData: JSON.stringify(part) });
+    w.on("message", (m: string) => {
+      total += parseInt(m);
+      left--;
+      if (left === 0) console.log("sum of squares:", total); // sum of squares: 333833500
+    });
+  }
+} else {
+  const t = JSON.parse(workerData) as Task;
+  let s = 0;
+  for (let i = t.from; i <= t.to; i++) s += i * i;
+  parentPort.postMessage(String(s));
+}
+```
+
+| API | Notes |
+|---|---|
+| `new Worker(__filename, { workerData })` | the file must be `__filename`; `workerData` is text (`JSON.stringify` on one side, a typed `JSON.parse` on the other) |
+| `Worker` | `postMessage(m)`, `on("message", listener)`, `terminate()` (returns nothing; Node: a promise of the exit code), `ref()`/`unref()` (an unref'd worker does not keep the program alive) |
+| `isMainThread`, `threadId`, `workerData`, `parentPort` | per thread; `parentPort.postMessage(m)` and `parentPort.on("message", ...)` in the worker |
+| `MessageChannel` | `port1` and `port2`, two entangled ports in this thread: what one posts, the other's `'message'` listener gets |
+| `MessagePort` | `postMessage`, `on("message")`, `close()` (ends both ports, after what was already sent), `start()`, `ref()`/`unref()`/`hasRef()` |
+
+A message is a string, a `Uint8Array` (copied), a `Float64Array` (copied) or a `SharedArrayBuffer` (and a
+`Float64Array` over one), which arrives as a view on the same memory; the listener's parameter type says which.
+
+Differences from Node: `"message"` is the only event (no `'error'`, `'exit'` or `'online'`; another name stops the
+program); no other script file, `eval`, `resourceLimits` or `transferList`; a port cannot be sent to a worker, and a
+port has no `'close'` event. For CPU work over arrays, `xisto:parallel` needs no messages at all.
+
 ## Buffer
 
 `Buffer` is a global and is exported by `buffer` / `node:buffer` / `xisto:buffer`, together with `isUtf8`, `isAscii`,
