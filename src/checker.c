@@ -16762,9 +16762,10 @@ static void check_var(Stmt *s, bool global) {
     if ((!s->decl_type || s->decl_type->kind == TY_NULLABLE) && !s->init->prechecked) missing_get(s->init); /* const v = m.get(k): T | null, as in TypeScript (XB-217) */
     if (!s->decl_type && pr_async_call(s->init) && !(s->init->func && s->init->func->ret_maybe_sync))
         pr_spawn(s->init); /* const p = f(): the promise (XB-106); f(): T | Promise<T> not async: its value, as JavaScript's sync return */
-    if (s->init->type->kind == TY_VOID && tsc_checked() && (!s->decl_type || s->decl_type->kind == TY_UNKNOWN || s->decl_type->kind == TY_VOID)) {
+    if (s->init->type->kind == TY_VOID && (tsc_checked() || (cur_func && cur_func->template_of)) &&
+        (!s->decl_type || s->decl_type->kind == TY_UNKNOWN || s->decl_type->kind == TY_VOID)) {
         /* const r = await fn() with fn's T = void (a generic instance): JavaScript stores undefined; here the call runs
-           and r is an unknown that holds null */
+           and r is an unknown that holds null (in a generic's instance always: trace<T>(fn: () => T): T given a void fn) */
         Expr *seq = xs_alloc(sizeof *seq);
         seq->kind = E_SEQ; seq->pos = s->init->pos; seq->field = -1; seq->type = ty_unknown;
         expr_list_push(&seq->args, s->init);
@@ -18419,7 +18420,7 @@ static void check_stmt_one(Stmt *s) {
                 check_expr(s->expr, NULL);
                 if (cur_func->ret_promise && s->expr->type && s->expr->type->kind == TY_PROMISE) pr_await(s->expr); /* return p: its settling */
                 /* return r where r held a T = void result (const r = await fn() in a generic instance): nothing to return */
-                bool void_held = tsc_checked() && s->expr->type && s->expr->type->kind == TY_UNKNOWN && s->expr->kind == E_IDENT;
+                bool void_held = (tsc_checked() || cur_func->template_of) && s->expr->type && s->expr->type->kind == TY_UNKNOWN && s->expr->kind == E_IDENT;
                 if ((!s->expr->type || s->expr->type->kind != TY_VOID) && !void_held)
                     xs_error(XS8057, s->expr->pos, NULL, "'%s' is void and cannot return a value", cur_func->name);
                 settle(s->expr);
