@@ -1,0 +1,26 @@
+A/B before v0.5.0: main 2c80e26 vs integ-v05 (1b4f335 for BG/PolyBench, 7151586 for rechecks and HTTP).
+Xeon c7i (x86_64) and Graviton (arm64), XISTO_CPU=native, build cache off.
+
+Benchmarks Game, every variant, median of 3, two rounds A B / B A (bg-pb-*.txt):
+  flagged +3-4%: revcomp (both), binarytrees-4 (Xeon), fannkuchredux-3 (arm), knucleotide-7 (arm, one round).
+PolyBench LARGE, median of 3, two rounds: nothing worse; lu, nussinov, syrk, 2mm 4-6% better.
+
+Recheck, fixed binaries, 10 interleaved rounds (recheck-*.txt), v05/main median:
+  revcomp Xeon 0.982 arm 1.030; revcomp-5 0.995/1.017; revcomp-6 0.991/1.004;
+  binarytrees-4 Xeon 1.031 arm 1.004; fannkuchredux-3 Xeon 1.000 arm 1.040; knucleotide-7 1.001/1.007.
+fannkuchredux-3 on arm (rel-inline-*, aligned-arrow2-*):
+  with XISTO_REL_INLINE=1 1.001; 99.97% of the time is in arrow2, whose assembly is identical with and without
+  XS_REL_OOL; only its address differs (0x...b20 vs 0x...b40). Forced to the same alignment both sides time the
+  same: aligned(64) 11.679 vs 11.680 s. Code placement, not code (backlog XB-265).
+binarytrees-4 on Xeon: the program's C is identical; with functions and loops 64-aligned on both sides
+  (aligned-binarytrees4-xeon.txt) 1.008. Same kind.
+revcomp-5/6 correctness after the shared-memory fix: 0/40 wrong (fasta-25M) and 0/60 (odd-length input), both VMs.
+fs.watch on Linux (inotify): same output as Node on both VMs (in recheck-*.txt).
+
+HTTP (TechEmpower plaintext/json, xisto-native and Nest, 256/4096 connections, A B B A, 3 runs each; http-*.txt):
+  native plaintext 0.993/0.978, json 1.009/1.013; Nest plaintext 1.030/1.034, json 0.992/0.993; RSS and CPU per
+  request equal. Native plaintext c4096 rechecked main/v05/v05+REL_INLINE (http-native-plaintext-*.txt): within the
+  run-to-run spread (565k/560k/543k with CPU credit; all ~233k after the Xeon lost it).
+
+Suites on a fresh build of 52752c2 (xisto 0.4.5-167-g52752c2): xisto 937 passed 0 failed; packages (intl branch
+13e0acc) 32 passed, 4 skipped (no Redis), 0 failed.

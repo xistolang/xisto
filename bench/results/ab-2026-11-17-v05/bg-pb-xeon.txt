@@ -1,0 +1,397 @@
+# ab05 x86_64 2026-11-17T00:52Z
+built 2c80e26
+built 1b4f335
+tests/ok/node-fs-watch.ts:2:1: error[XS4001]: 'node:fs' is xisto's implementation of a Node module, not Node itself
+     2 | import * as fs from "node:fs";
+       | ^
+  help: import it as "xisto:fs", or build with --node-compat (XISTO_NODE_COMPAT=1) to keep the Node name
+tests/ok/node-fs-watch.ts:3:1: error[XS4001]: 'node:os' is xisto's implementation of a Node module, not Node itself
+     3 | import * as os from "node:os";
+       | ^
+  help: import it as "xisto:os", or build with --node-compat (XISTO_NODE_COMPAT=1) to keep the Node name
+tests/ok/node-fs-watch.ts:4:1: error[XS4001]: 'node:path' is xisto's implementation of a Node module, not Node itself
+     4 | import * as path from "node:path";
+       | ^
+  help: import it as "xisto:path", or build with --node-compat (XISTO_NODE_COMPAT=1) to keep the Node name
+tests/ok/node-fs-watch.ts:20:3: warning: 'sawNew' is declared but never used
+    20 |   let sawNew = false;
+       |   ^
+  help: remove it, or name it _sawNew if it is unused on purpose
+xisto: 2 warnings (XS2007 2): --warnings lists them, xisto check --details shows where
+xisto: 3 errors (XS4001 3)
+fs.watch rc=1
+== node
+node:internal/modules/esm/get_format:219
+  throw new ERR_UNKNOWN_FILE_EXTENSION(ext, filepath);
+        ^
+
+TypeError [ERR_UNKNOWN_FILE_EXTENSION]: Unknown file extension ".ts" for /home/ubuntu/ab05-1b4f335/tests/ok/node-fs-watch.ts
+    at Object.getFileProtocolModuleFormat [as file:] (node:internal/modules/esm/get_format:219:9)
+    at defaultGetFormat (node:internal/modules/esm/get_format:245:36)
+    at defaultLoad (node:internal/modules/esm/load:98:16)
+    at ModuleLoader.load (node:internal/modules/esm/loader:815:12)
+    at ModuleLoader.loadAndTranslate (node:internal/modules/esm/loader:594:31)
+    at #createModuleJob (node:internal/modules/esm/loader:624:36)
+    at #getJobFromResolveResult (node:internal/modules/esm/loader:343:34)
+    at ModuleLoader.getModuleJobForImport (node:internal/modules/esm/loader:311:41)
+    at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:664:25) {
+  code: 'ERR_UNKNOWN_FILE_EXTENSION'
+}
+
+Node.js v22.22.1
+total 297868
+drwxrwxr-x 2 ubuntu ubuntu      4096 Nov  7 22:16 .
+drwxrwxr-x 4 ubuntu ubuntu      4096 Nov  7 23:00 ..
+-rw-rw-r-- 1 ubuntu ubuntu 254166745 Nov  7 22:16 fasta-25000000.txt
+-rw-rw-r-- 1 ubuntu ubuntu  50833411 Nov  7 22:16 fasta-5000000.txt
+steal before 222646
+## bg 2c80e26
+# Linux x86_64, 2 cpu; median of 3
+spectralnorm   xisto  spectralnorm            0.468s     0.91cpu      2.3MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-2          1.355s     2.62cpu      2.4MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-3          0.545s     0.92cpu      2.3MB  par  1.7  same
+spectralnorm   xisto  spectralnorm-4          0.462s     0.89cpu      2.4MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-5          0.462s     0.89cpu      2.4MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-6          0.460s     0.89cpu      2.4MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-7          0.463s     0.92cpu      2.2MB  par  2.0  same
+spectralnorm   xisto  spectralnorm-8          0.428s     0.85cpu      2.3MB  par  2.0  same
+nbody          xisto  nbody                   2.451s     2.45cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-2                 6.953s     6.95cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-3                 5.217s     5.22cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-4                 3.633s     3.63cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-5                 2.580s     2.58cpu      2.0MB  par  1.0  same
+fannkuchredux  xisto  fannkuchredux           8.548s    16.99cpu      2.0MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-2        11.404s    22.59cpu      2.4MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-3        11.364s    22.46cpu      2.4MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-4         8.258s    16.25cpu      2.4MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-5         6.741s    13.35cpu      2.4MB  par  2.0  same
+binarytrees    xisto  binarytrees             1.644s     3.08cpu     70.1MB  par  1.9  same
+binarytrees    xisto  binarytrees-2           1.645s     3.15cpu    119.7MB  par  1.9  same
+binarytrees    xisto  binarytrees-3           1.583s     3.08cpu    114.4MB  par  1.9  same
+binarytrees    xisto  binarytrees-4           3.057s     3.06cpu     65.7MB  par  1.0  same
+mandelbrot     xisto  mandelbrot              2.140s     4.04cpu     33.5MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-2            3.056s     5.85cpu     33.0MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-3            2.324s     4.40cpu     33.0MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-4            2.224s     4.21cpu     33.1MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-5            2.031s     3.84cpu     33.1MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-6            1.333s     2.53cpu      7.5MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-7            1.892s     3.66cpu      7.5MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-8            1.591s     3.06cpu      7.5MB  par  1.9  same
+fasta          xisto  fasta                   1.130s     0.36cpu      2.4MB  par  0.3  same
+fasta          xisto  fasta-2                 1.342s     0.63cpu      2.1MB  par  0.5  same
+knucleotide    xisto  knucleotide             1.383s     2.64cpu    364.4MB  par  1.9  same
+knucleotide    xisto  knucleotide-2           4.168s     7.14cpu    366.3MB  par  1.7  same
+knucleotide    xisto  knucleotide-3           3.649s     6.96cpu    364.0MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           2.595s     4.63cpu    161.5MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           2.116s     4.07cpu    158.7MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           1.335s     2.51cpu    159.0MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           1.390s     2.70cpu     69.4MB  par  1.9  same
+revcomp        xisto  revcomp                 0.883s     0.28cpu    244.5MB  par  0.3  same
+revcomp        xisto  revcomp-10              0.841s     0.25cpu     10.9MB  par  0.3  same
+revcomp        xisto  revcomp-2               1.036s     0.30cpu    244.5MB  par  0.3  same
+revcomp        xisto  revcomp-3               1.041s     0.36cpu    487.0MB  par  0.3  same
+revcomp        xisto  revcomp-4               0.932s     0.22cpu    244.9MB  par  0.2  same
+revcomp        xisto  revcomp-5               0.892s     0.30cpu    309.0MB  par  0.3  same
+revcomp        xisto  revcomp-6               0.867s     0.30cpu    189.1MB  par  0.3  same
+revcomp        xisto  revcomp-7               0.913s     0.28cpu    189.6MB  par  0.3  same
+revcomp        xisto  revcomp-8               0.875s     0.31cpu     68.9MB  par  0.4  same
+revcomp        xisto  revcomp-9               0.843s     0.27cpu     10.9MB  par  0.3  same
+regexredux     xisto  regexredux              0.942s     0.95cpu    148.9MB  par  1.0  same
+regexredux     xisto  regexredux-2            0.689s     0.96cpu    149.2MB  par  1.4  same
+pidigits       xisto  pidigits                0.633s     0.63cpu      2.6MB  par  1.0  same
+## bg 1b4f335
+# Linux x86_64, 2 cpu; median of 3
+spectralnorm   xisto  spectralnorm            0.467s     0.90cpu      2.1MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-2          1.370s     2.62cpu      2.4MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-3          0.534s     0.93cpu      2.4MB  par  1.7  same
+spectralnorm   xisto  spectralnorm-4          0.463s     0.89cpu      2.4MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-5          0.461s     0.89cpu      2.4MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-6          0.461s     0.89cpu      2.4MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-7          0.462s     0.92cpu      2.2MB  par  2.0  same
+spectralnorm   xisto  spectralnorm-8          0.424s     0.84cpu      2.2MB  par  2.0  same
+nbody          xisto  nbody                   2.452s     2.45cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-2                 6.942s     6.94cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-3                 5.216s     5.21cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-4                 3.627s     3.63cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-5                 2.578s     2.58cpu      2.0MB  par  1.0  same
+fannkuchredux  xisto  fannkuchredux           8.614s    17.01cpu      2.1MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-2        11.435s    22.59cpu      2.4MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-3        11.372s    22.57cpu      2.4MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-4         8.165s    16.23cpu      2.4MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-5         6.765s    13.33cpu      2.4MB  par  2.0  same
+binarytrees    xisto  binarytrees             1.663s     3.12cpu     70.1MB  par  1.9  same
+binarytrees    xisto  binarytrees-2           1.633s     3.14cpu    119.6MB  par  1.9  same
+binarytrees    xisto  binarytrees-3           1.575s     3.07cpu    114.4MB  par  2.0  same
+binarytrees    xisto  binarytrees-4           3.158s     3.16cpu     65.7MB  par  1.0  same
+mandelbrot     xisto  mandelbrot              2.100s     3.95cpu     33.6MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-2            3.053s     5.86cpu     32.9MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-3            2.361s     4.46cpu     32.9MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-4            2.146s     4.07cpu     33.1MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-5            2.032s     3.84cpu     33.1MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-6            1.332s     2.54cpu      7.5MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-7            1.906s     3.68cpu      7.5MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-8            1.593s     3.05cpu      7.5MB  par  1.9  same
+fasta          xisto  fasta                   1.087s     0.29cpu      2.4MB  par  0.3  same
+fasta          xisto  fasta-2                 1.305s     0.57cpu      2.1MB  par  0.4  same
+knucleotide    xisto  knucleotide             1.395s     2.65cpu    364.2MB  par  1.9  same
+knucleotide    xisto  knucleotide-2           4.156s     7.12cpu    366.4MB  par  1.7  same
+knucleotide    xisto  knucleotide-3           3.724s     7.04cpu    364.3MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           2.640s     4.70cpu    160.7MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           2.095s     4.02cpu    158.1MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           1.341s     2.53cpu    159.4MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           1.376s     2.68cpu     71.5MB  par  1.9  same
+revcomp        xisto  revcomp                 0.903s     0.29cpu    244.5MB  par  0.3  same
+revcomp        xisto  revcomp-10              0.858s     0.26cpu     10.8MB  par  0.3  same
+revcomp        xisto  revcomp-2               1.040s     0.30cpu    244.5MB  par  0.3  same
+revcomp        xisto  revcomp-3               1.036s     0.36cpu    487.0MB  par  0.4  same
+revcomp        xisto  revcomp-4               0.930s     0.22cpu    244.9MB  par  0.2  same
+revcomp        xisto  revcomp-5               0.894s     0.30cpu    309.0MB  par  0.3  same
+revcomp        xisto  revcomp-6               0.863s     0.29cpu    188.9MB  par  0.3  same
+revcomp        xisto  revcomp-7               0.905s     0.28cpu    189.8MB  par  0.3  same
+revcomp        xisto  revcomp-8               0.881s     0.32cpu     69.0MB  par  0.4  same
+revcomp        xisto  revcomp-9               0.860s     0.29cpu     11.0MB  par  0.3  same
+regexredux     xisto  regexredux              0.938s     0.95cpu    148.9MB  par  1.0  same
+regexredux     xisto  regexredux-2            0.691s     0.97cpu    149.2MB  par  1.4  same
+pidigits       xisto  pidigits                0.629s     0.63cpu      2.6MB  par  1.0  same
+## bg 1b4f335
+# Linux x86_64, 2 cpu; median of 3
+spectralnorm   xisto  spectralnorm            0.461s     0.89cpu      2.3MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-2          1.397s     2.61cpu      2.3MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-3          0.543s     0.92cpu      2.4MB  par  1.7  same
+spectralnorm   xisto  spectralnorm-4          0.464s     0.89cpu      2.4MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-5          0.464s     0.89cpu      2.4MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-6          0.462s     0.89cpu      2.4MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-7          0.455s     0.90cpu      2.3MB  par  2.0  same
+spectralnorm   xisto  spectralnorm-8          0.426s     0.85cpu      2.3MB  par  2.0  same
+nbody          xisto  nbody                   2.447s     2.45cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-2                 6.946s     6.94cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-3                 5.216s     5.21cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-4                 3.625s     3.62cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-5                 2.577s     2.58cpu      2.0MB  par  1.0  same
+fannkuchredux  xisto  fannkuchredux           8.568s    17.02cpu      2.1MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-2        11.513s    22.95cpu      2.4MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-3        11.529s    22.88cpu      2.4MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-4         8.193s    16.29cpu      2.4MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-5         6.741s    13.33cpu      2.4MB  par  2.0  same
+binarytrees    xisto  binarytrees             1.626s     3.05cpu     70.1MB  par  1.9  same
+binarytrees    xisto  binarytrees-2           1.620s     3.13cpu    119.8MB  par  1.9  same
+binarytrees    xisto  binarytrees-3           1.581s     3.08cpu    114.4MB  par  2.0  same
+binarytrees    xisto  binarytrees-4           3.184s     3.18cpu     65.7MB  par  1.0  same
+mandelbrot     xisto  mandelbrot              2.098s     3.96cpu     33.5MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-2            3.050s     5.85cpu     32.9MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-3            2.342s     4.39cpu     32.9MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-4            2.142s     4.06cpu     33.1MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-5            2.039s     3.84cpu     33.0MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-6            1.330s     2.54cpu      7.5MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-7            1.893s     3.66cpu      7.5MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-8            1.595s     3.06cpu      7.5MB  par  1.9  same
+fasta          xisto  fasta                   1.074s     0.29cpu      2.4MB  par  0.3  same
+fasta          xisto  fasta-2                 1.295s     0.56cpu      2.1MB  par  0.4  same
+knucleotide    xisto  knucleotide             1.403s     2.67cpu    364.2MB  par  1.9  same
+knucleotide    xisto  knucleotide-2           4.130s     7.10cpu    367.2MB  par  1.7  same
+knucleotide    xisto  knucleotide-3           3.771s     7.11cpu    364.3MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           2.535s     4.50cpu    160.2MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           2.105s     4.03cpu    158.5MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           1.341s     2.53cpu    160.4MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           1.391s     2.69cpu     69.4MB  par  1.9  same
+revcomp        xisto  revcomp                 0.895s     0.29cpu    244.4MB  par  0.3  same
+revcomp        xisto  revcomp-10              0.850s     0.25cpu     11.0MB  par  0.3  same
+revcomp        xisto  revcomp-2               1.038s     0.30cpu    244.5MB  par  0.3  same
+revcomp        xisto  revcomp-3               1.047s     0.38cpu    487.0MB  par  0.4  same
+revcomp        xisto  revcomp-4               0.954s     0.25cpu    244.9MB  par  0.3  same
+revcomp        xisto  revcomp-5               0.892s     0.30cpu    309.0MB  par  0.3  same
+revcomp        xisto  revcomp-6               0.859s     0.29cpu    188.9MB  par  0.3  same
+revcomp        xisto  revcomp-7               0.906s     0.27cpu    189.6MB  par  0.3  same
+revcomp        xisto  revcomp-8               0.888s     0.32cpu     69.0MB  par  0.4  same
+revcomp        xisto  revcomp-9               0.842s     0.26cpu     10.9MB  par  0.3  same
+regexredux     xisto  regexredux              0.931s     0.94cpu    149.0MB  par  1.0  same
+regexredux     xisto  regexredux-2            0.678s     0.94cpu    149.2MB  par  1.4  same
+pidigits       xisto  pidigits                0.631s     0.63cpu      2.6MB  par  1.0  same
+## bg 2c80e26
+# Linux x86_64, 2 cpu; median of 3
+spectralnorm   xisto  spectralnorm            0.476s     0.93cpu      2.3MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-2          1.466s     2.61cpu      2.5MB  par  1.8  same
+spectralnorm   xisto  spectralnorm-3          0.546s     0.92cpu      2.4MB  par  1.7  same
+spectralnorm   xisto  spectralnorm-4          0.467s     0.89cpu      2.4MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-5          0.468s     0.89cpu      2.3MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-6          0.460s     0.89cpu      2.4MB  par  1.9  same
+spectralnorm   xisto  spectralnorm-7          0.455s     0.90cpu      2.3MB  par  2.0  same
+spectralnorm   xisto  spectralnorm-8          0.428s     0.85cpu      2.4MB  par  2.0  same
+nbody          xisto  nbody                   2.451s     2.45cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-2                 6.961s     6.96cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-3                 5.223s     5.22cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-4                 3.627s     3.63cpu      2.0MB  par  1.0  same
+nbody          xisto  nbody-5                 2.579s     2.58cpu      2.0MB  par  1.0  same
+fannkuchredux  xisto  fannkuchredux           8.517s    16.92cpu      2.1MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-2        11.401s    22.64cpu      2.4MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-3        11.317s    22.48cpu      2.4MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-4         8.213s    16.28cpu      2.4MB  par  2.0  same
+fannkuchredux  xisto  fannkuchredux-5         6.777s    13.43cpu      2.4MB  par  2.0  same
+binarytrees    xisto  binarytrees             1.647s     3.11cpu     70.2MB  par  1.9  same
+binarytrees    xisto  binarytrees-2           1.645s     3.14cpu    119.8MB  par  1.9  same
+binarytrees    xisto  binarytrees-3           1.578s     3.06cpu    114.4MB  par  1.9  same
+binarytrees    xisto  binarytrees-4           3.054s     3.05cpu     65.7MB  par  1.0  same
+mandelbrot     xisto  mandelbrot              2.100s     3.95cpu     33.5MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-2            3.049s     5.85cpu     33.0MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-3            2.327s     4.39cpu     33.0MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-4            2.145s     4.07cpu     33.1MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-5            2.033s     3.84cpu     33.1MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-6            1.329s     2.53cpu      7.5MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-7            1.900s     3.66cpu      7.5MB  par  1.9  same
+mandelbrot     xisto  mandelbrot-8            1.594s     3.06cpu      7.5MB  par  1.9  same
+fasta          xisto  fasta                   1.093s     0.30cpu      2.4MB  par  0.3  same
+fasta          xisto  fasta-2                 1.316s     0.61cpu      2.1MB  par  0.5  same
+knucleotide    xisto  knucleotide             1.394s     2.65cpu    364.2MB  par  1.9  same
+knucleotide    xisto  knucleotide-2           4.166s     7.14cpu    365.5MB  par  1.7  same
+knucleotide    xisto  knucleotide-3           3.668s     6.98cpu    364.0MB  par  1.9  same
+knucleotide    xisto  knucleotide-4           2.629s     4.69cpu    162.5MB  par  1.8  same
+knucleotide    xisto  knucleotide-5           2.081s     4.01cpu    158.9MB  par  1.9  same
+knucleotide    xisto  knucleotide-6           1.318s     2.49cpu    159.5MB  par  1.9  same
+knucleotide    xisto  knucleotide-7           1.375s     2.69cpu     69.1MB  par  2.0  same
+revcomp        xisto  revcomp                 0.864s     0.28cpu    244.5MB  par  0.3  same
+revcomp        xisto  revcomp-10              0.846s     0.25cpu     11.0MB  par  0.3  same
+revcomp        xisto  revcomp-2               1.048s     0.31cpu    244.5MB  par  0.3  same
+revcomp        xisto  revcomp-3               1.034s     0.36cpu    487.0MB  par  0.3  same
+revcomp        xisto  revcomp-4               0.938s     0.23cpu    244.9MB  par  0.2  same
+revcomp        xisto  revcomp-5               0.897s     0.30cpu    309.0MB  par  0.3  same
+revcomp        xisto  revcomp-6               0.860s     0.28cpu    188.9MB  par  0.3  same
+revcomp        xisto  revcomp-7               0.903s     0.27cpu    189.6MB  par  0.3  same
+revcomp        xisto  revcomp-8               0.881s     0.31cpu     69.0MB  par  0.4  same
+revcomp        xisto  revcomp-9               0.852s     0.28cpu     11.0MB  par  0.3  same
+regexredux     xisto  regexredux              0.943s     0.95cpu    148.9MB  par  1.0  same
+regexredux     xisto  regexredux-2            0.680s     0.95cpu    149.2MB  par  1.4  same
+pidigits       xisto  pidigits                0.631s     0.63cpu      2.6MB  par  1.0  same
+## pb 2c80e26
+2mm            xisto  2mm.ts                  0.663s     0.66cpu     37.4MB  par  1.0  kern    0.627s  same
+3mm            xisto  3mm.ts                  1.079s     1.08cpu     53.3MB  par  1.0  kern    1.030s  same
+xisto: 3 warnings (XS2103 3): --warnings lists them, xisto check --details shows where
+xisto: 3 warnings (XS2103 3): --warnings lists them, xisto check --details shows where
+adi            xisto  adi.ts                  6.352s     6.35cpu     32.8MB  par  1.0  kern    6.326s  same
+atax           xisto  atax.ts                 0.041s     0.04cpu     32.4MB  par  1.0  kern    0.008s  same
+bicg           xisto  bicg.ts                 0.040s     0.04cpu     32.5MB  par  1.0  kern    0.007s  same
+cholesky       xisto  cholesky.ts             8.009s     8.01cpu     63.0MB  par  1.0  kern    1.981s  same
+correlation    xisto  correlation.ts          0.748s     0.75cpu     25.9MB  par  1.0  kern    0.727s  same
+covariance     xisto  covariance.ts           0.750s     0.75cpu     25.9MB  par  1.0  kern    0.729s  same
+deriche        xisto  deriche.ts              0.269s     0.27cpu    138.4MB  par  1.0  kern    0.165s  same
+doitgen        xisto  doitgen.ts              0.126s     0.12cpu     29.0MB  par  1.0  kern    0.097s  same
+durbin         xisto  durbin.ts               0.005s     0.00cpu      1.9MB  par  0.8  kern    0.004s  same
+fdtd-2d        xisto  fdtd-2d.ts              1.764s     1.76cpu     29.6MB  par  1.0  kern    1.737s  same
+floyd-warshall xisto  floyd-warshall.ts      10.987s    10.98cpu     32.0MB  par  1.0  kern   10.929s  same
+gemm           xisto  gemm.ts                 0.467s     0.47cpu     29.6MB  par  1.0  kern    0.436s  same
+gemver         xisto  gemver.ts               0.042s     0.04cpu     32.6MB  par  1.0  kern    0.009s  same
+gesummv        xisto  gesummv.ts              0.031s     0.03cpu     27.7MB  par  1.0  kern    0.003s  same
+gramschmidt    xisto  gramschmidt.ts          1.429s     1.43cpu     31.4MB  par  1.0  kern    1.403s  same
+heat-3d        xisto  heat-3d.ts              1.830s     1.83cpu     31.3MB  par  1.0  kern    1.802s  same
+jacobi-1d      xisto  jacobi-1d.ts            0.002s     0.00cpu      1.9MB  par  0.6  kern    0.001s  same
+jacobi-2d      xisto  jacobi-2d.ts            1.305s     1.30cpu     27.9MB  par  1.0  kern    1.279s  same
+lu             xisto  lu.ts                   8.395s     8.39cpu     63.1MB  par  1.0  kern    2.412s  same
+ludcmp         xisto  ludcmp.ts               8.374s     8.37cpu     63.3MB  par  1.0  kern    2.285s  same
+mvt            xisto  mvt.ts                  0.039s     0.04cpu     32.5MB  par  1.0  kern    0.006s  same
+nussinov       xisto  nussinov.ts             4.180s     4.18cpu     26.0MB  par  1.0  kern    4.159s  same
+seidel-2d      xisto  seidel-2d.ts            4.869s     4.87cpu     32.5MB  par  1.0  kern    4.839s  same
+symm           xisto  symm.ts                 1.166s     1.16cpu     28.0MB  par  1.0  kern    1.140s  same
+syr2k          xisto  syr2k.ts                1.150s     1.15cpu     31.4MB  par  1.0  kern    1.119s  same
+syrk           xisto  syrk.ts                 0.574s     0.57cpu     22.1MB  par  1.0  kern    0.552s  same
+trisolv        xisto  trisolv.ts              0.031s     0.03cpu     32.5MB  par  0.9  kern    0.003s  same
+trmm           xisto  trmm.ts                 0.284s     0.28cpu     18.7MB  par  1.0  kern    0.265s  same
+## pb 1b4f335
+2mm            xisto  2mm.ts                  0.648s     0.65cpu     37.4MB  par  1.0  kern    0.611s  same
+3mm            xisto  3mm.ts                  1.090s     1.09cpu     53.3MB  par  1.0  kern    1.040s  same
+xisto: 3 warnings (XS2103 3): --warnings lists them, xisto check --details shows where
+xisto: 3 warnings (XS2103 3): --warnings lists them, xisto check --details shows where
+adi            xisto  adi.ts                  6.456s     6.45cpu     32.8MB  par  1.0  kern    6.430s  same
+atax           xisto  atax.ts                 0.041s     0.04cpu     32.3MB  par  1.0  kern    0.007s  same
+bicg           xisto  bicg.ts                 0.039s     0.04cpu     32.5MB  par  1.0  kern    0.007s  same
+cholesky       xisto  cholesky.ts             8.089s     8.09cpu     63.0MB  par  1.0  kern    2.028s  same
+correlation    xisto  correlation.ts          0.770s     0.77cpu     25.8MB  par  1.0  kern    0.748s  same
+covariance     xisto  covariance.ts           0.752s     0.75cpu     25.9MB  par  1.0  kern    0.732s  same
+deriche        xisto  deriche.ts              0.268s     0.27cpu    138.4MB  par  1.0  kern    0.164s  same
+doitgen        xisto  doitgen.ts              0.124s     0.12cpu     29.0MB  par  1.0  kern    0.096s  same
+durbin         xisto  durbin.ts               0.006s     0.00cpu      1.8MB  par  0.8  kern    0.003s  same
+fdtd-2d        xisto  fdtd-2d.ts              1.747s     1.75cpu     29.6MB  par  1.0  kern    1.721s  same
+floyd-warshall xisto  floyd-warshall.ts      10.646s    10.64cpu     32.0MB  par  1.0  kern   10.588s  same
+gemm           xisto  gemm.ts                 0.468s     0.47cpu     29.6MB  par  1.0  kern    0.438s  same
+gemver         xisto  gemver.ts               0.044s     0.04cpu     32.6MB  par  1.0  kern    0.010s  same
+gesummv        xisto  gesummv.ts              0.031s     0.03cpu     27.7MB  par  1.0  kern    0.003s  same
+gramschmidt    xisto  gramschmidt.ts          1.417s     1.42cpu     31.4MB  par  1.0  kern    1.391s  same
+heat-3d        xisto  heat-3d.ts              1.798s     1.80cpu     31.3MB  par  1.0  kern    1.769s  same
+jacobi-1d      xisto  jacobi-1d.ts            0.002s     0.00cpu      1.8MB  par  0.5  kern    0.001s  same
+jacobi-2d      xisto  jacobi-2d.ts            1.246s     1.24cpu     27.8MB  par  1.0  kern    1.221s  same
+lu             xisto  lu.ts                   8.438s     8.44cpu     63.1MB  par  1.0  kern    2.300s  same
+ludcmp         xisto  ludcmp.ts               8.401s     8.40cpu     63.3MB  par  1.0  kern    2.293s  same
+mvt            xisto  mvt.ts                  0.038s     0.04cpu     32.5MB  par  1.0  kern    0.007s  same
+nussinov       xisto  nussinov.ts             4.016s     4.01cpu     26.0MB  par  1.0  kern    3.997s  same
+seidel-2d      xisto  seidel-2d.ts            4.901s     4.90cpu     32.5MB  par  1.0  kern    4.871s  same
+symm           xisto  symm.ts                 1.280s     1.28cpu     28.0MB  par  1.0  kern    1.254s  same
+syr2k          xisto  syr2k.ts                1.217s     1.22cpu     31.4MB  par  1.0  kern    1.186s  same
+syrk           xisto  syrk.ts                 0.564s     0.56cpu     22.1MB  par  1.0  kern    0.543s  same
+trisolv        xisto  trisolv.ts              0.030s     0.03cpu     32.5MB  par  1.0  kern    0.004s  same
+trmm           xisto  trmm.ts                 0.291s     0.29cpu     18.7MB  par  1.0  kern    0.271s  same
+## pb 1b4f335
+2mm            xisto  2mm.ts                  0.663s     0.66cpu     37.4MB  par  1.0  kern    0.627s  same
+3mm            xisto  3mm.ts                  1.079s     1.08cpu     53.3MB  par  1.0  kern    1.030s  same
+xisto: 3 warnings (XS2103 3): --warnings lists them, xisto check --details shows where
+xisto: 3 warnings (XS2103 3): --warnings lists them, xisto check --details shows where
+adi            xisto  adi.ts                  6.381s     6.38cpu     32.7MB  par  1.0  kern    6.356s  same
+atax           xisto  atax.ts                 0.040s     0.04cpu     32.4MB  par  1.0  kern    0.008s  same
+bicg           xisto  bicg.ts                 0.039s     0.04cpu     32.5MB  par  1.0  kern    0.007s  same
+cholesky       xisto  cholesky.ts             7.856s     7.85cpu     63.0MB  par  1.0  kern    1.978s  same
+correlation    xisto  correlation.ts          0.743s     0.74cpu     25.9MB  par  1.0  kern    0.723s  same
+covariance     xisto  covariance.ts           0.739s     0.74cpu     25.9MB  par  1.0  kern    0.718s  same
+deriche        xisto  deriche.ts              0.271s     0.27cpu    138.4MB  par  1.0  kern    0.167s  same
+doitgen        xisto  doitgen.ts              0.122s     0.12cpu     29.0MB  par  1.0  kern    0.093s  same
+durbin         xisto  durbin.ts               0.005s     0.00cpu      1.8MB  par  0.7  kern    0.003s  same
+fdtd-2d        xisto  fdtd-2d.ts              1.644s     1.64cpu     29.6MB  par  1.0  kern    1.617s  same
+floyd-warshall xisto  floyd-warshall.ts      11.161s    11.16cpu     32.0MB  par  1.0  kern   11.102s  same
+gemm           xisto  gemm.ts                 0.467s     0.47cpu     29.6MB  par  1.0  kern    0.438s  same
+gemver         xisto  gemver.ts               0.043s     0.04cpu     32.6MB  par  1.0  kern    0.010s  same
+gesummv        xisto  gesummv.ts              0.031s     0.03cpu     27.7MB  par  0.9  kern    0.003s  same
+gramschmidt    xisto  gramschmidt.ts          1.440s     1.44cpu     31.4MB  par  1.0  kern    1.412s  same
+heat-3d        xisto  heat-3d.ts              1.825s     1.82cpu     31.3MB  par  1.0  kern    1.799s  same
+jacobi-1d      xisto  jacobi-1d.ts            0.003s     0.00cpu      1.8MB  par  0.6  kern    0.001s  same
+jacobi-2d      xisto  jacobi-2d.ts            1.302s     1.30cpu     27.8MB  par  1.0  kern    1.275s  same
+lu             xisto  lu.ts                   8.297s     8.29cpu     63.1MB  par  1.0  kern    2.144s  same
+ludcmp         xisto  ludcmp.ts               8.270s     8.27cpu     63.2MB  par  1.0  kern    2.326s  same
+mvt            xisto  mvt.ts                  0.039s     0.04cpu     32.5MB  par  1.0  kern    0.007s  same
+nussinov       xisto  nussinov.ts             4.061s     4.06cpu     26.0MB  par  1.0  kern    4.041s  same
+seidel-2d      xisto  seidel-2d.ts            4.869s     4.87cpu     32.5MB  par  1.0  kern    4.839s  same
+symm           xisto  symm.ts                 1.140s     1.14cpu     28.0MB  par  1.0  kern    1.113s  same
+syr2k          xisto  syr2k.ts                1.121s     1.12cpu     31.4MB  par  1.0  kern    1.089s  same
+syrk           xisto  syrk.ts                 0.551s     0.55cpu     22.1MB  par  1.0  kern    0.528s  same
+trisolv        xisto  trisolv.ts              0.031s     0.03cpu     32.4MB  par  1.0  kern    0.004s  same
+trmm           xisto  trmm.ts                 0.288s     0.29cpu     18.7MB  par  1.0  kern    0.270s  same
+## pb 2c80e26
+2mm            xisto  2mm.ts                  0.641s     0.64cpu     37.4MB  par  1.0  kern    0.606s  same
+3mm            xisto  3mm.ts                  1.074s     1.07cpu     53.3MB  par  1.0  kern    1.024s  same
+xisto: 3 warnings (XS2103 3): --warnings lists them, xisto check --details shows where
+xisto: 3 warnings (XS2103 3): --warnings lists them, xisto check --details shows where
+adi            xisto  adi.ts                  6.637s     6.63cpu     32.8MB  par  1.0  kern    6.611s  same
+atax           xisto  atax.ts                 0.040s     0.04cpu     32.4MB  par  1.0  kern    0.008s  same
+bicg           xisto  bicg.ts                 0.039s     0.04cpu     32.5MB  par  1.0  kern    0.007s  same
+cholesky       xisto  cholesky.ts             8.035s     8.03cpu     63.0MB  par  1.0  kern    1.981s  same
+correlation    xisto  correlation.ts          0.758s     0.76cpu     25.9MB  par  1.0  kern    0.737s  same
+covariance     xisto  covariance.ts           0.763s     0.76cpu     25.9MB  par  1.0  kern    0.742s  same
+deriche        xisto  deriche.ts              0.273s     0.27cpu    138.4MB  par  1.0  kern    0.166s  same
+doitgen        xisto  doitgen.ts              0.123s     0.12cpu     29.0MB  par  1.0  kern    0.094s  same
+durbin         xisto  durbin.ts               0.005s     0.00cpu      1.9MB  par  0.9  kern    0.004s  same
+fdtd-2d        xisto  fdtd-2d.ts              1.683s     1.68cpu     29.5MB  par  1.0  kern    1.656s  same
+floyd-warshall xisto  floyd-warshall.ts      10.832s    10.83cpu     32.0MB  par  1.0  kern   10.774s  same
+gemm           xisto  gemm.ts                 0.482s     0.48cpu     29.6MB  par  1.0  kern    0.453s  same
+gemver         xisto  gemver.ts               0.042s     0.04cpu     32.6MB  par  1.0  kern    0.010s  same
+gesummv        xisto  gesummv.ts              0.031s     0.03cpu     27.7MB  par  1.0  kern    0.002s  same
+gramschmidt    xisto  gramschmidt.ts          1.447s     1.45cpu     31.4MB  par  1.0  kern    1.419s  same
+heat-3d        xisto  heat-3d.ts              1.902s     1.90cpu     31.3MB  par  1.0  kern    1.875s  same
+jacobi-1d      xisto  jacobi-1d.ts            0.002s     0.00cpu      1.9MB  par  0.6  kern    0.000s  same
+jacobi-2d      xisto  jacobi-2d.ts            1.282s     1.28cpu     27.9MB  par  1.0  kern    1.256s  same
+lu             xisto  lu.ts                   8.316s     8.31cpu     63.1MB  par  1.0  kern    2.247s  same
+ludcmp         xisto  ludcmp.ts               8.248s     8.24cpu     63.2MB  par  1.0  kern    2.283s  same
+mvt            xisto  mvt.ts                  0.037s     0.04cpu     32.5MB  par  1.0  kern    0.006s  same
+nussinov       xisto  nussinov.ts             4.157s     4.15cpu     26.0MB  par  1.0  kern    4.135s  same
+seidel-2d      xisto  seidel-2d.ts            4.887s     4.88cpu     32.5MB  par  1.0  kern    4.857s  same
+symm           xisto  symm.ts                 1.200s     1.20cpu     28.0MB  par  1.0  kern    1.173s  same
+syr2k          xisto  syr2k.ts                1.096s     1.09cpu     31.4MB  par  1.0  kern    1.065s  same
+syrk           xisto  syrk.ts                 0.565s     0.56cpu     22.1MB  par  1.0  kern    0.542s  same
+trisolv        xisto  trisolv.ts              0.031s     0.03cpu     32.5MB  par  1.0  kern    0.004s  same
+trmm           xisto  trmm.ts                 0.286s     0.28cpu     18.7MB  par  1.0  kern    0.267s  same
+steal after 223585
+DONE
