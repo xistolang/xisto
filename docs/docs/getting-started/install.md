@@ -37,7 +37,7 @@ brew install xistolang/tap/xisto
 Every release has a Linux archive for each architecture. Unpack it anywhere and put its `bin/` on your `PATH`:
 
 ```sh
-V=0.4.5
+V=0.5.0
 ARCH=$(uname -m | sed -e 's/x86_64/x64/' -e 's/aarch64/arm64/')
 curl -fsSLO https://github.com/xistolang/xisto/releases/download/v$V/xisto-$V-linux-$ARCH.tar.gz
 tar -xzf xisto-$V-linux-$ARCH.tar.gz
