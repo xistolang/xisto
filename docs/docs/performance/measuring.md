@@ -121,7 +121,9 @@ columns: bodies in main: 3 Body as columns
 
 Debugging knobs such as `XISTO_REGION_CHECK=1` (verify every region iteration at run time) exist too. The
 `XISTO_NO_<OPTIMIZATION>` variables switch single optimizations off; they are for measuring the compiler and may
-change between versions.
+change between versions. Two more trade binary size for code layout: `XISTO_PKG_O3=1` compiles a package's code that
+runs once at `-O3` instead of for size, and `XISTO_REL_INLINE=1` inlines every string release instead of calling
+one function for it.
 
 ## A workflow for a slow server
 

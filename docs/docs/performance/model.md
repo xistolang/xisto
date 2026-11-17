@@ -68,6 +68,12 @@ threshold (10,000 at start, growing with live objects). A program without cyclic
 - **Bounds-check elimination.** An index proved inside the array skips the check.
 - **Compiler flags.** `-O3` for release (objects: 5.2 → 3.7 ns per iteration, M4, 7 Nov). No machine outliner on
   macOS (nbody: 1.87 → 0.73 s). `-fno-math-errno` on Linux keeps `sqrt` inline (Graviton2: 6.29 → 4.90 s).
+- **Code that runs once is compiled for size.** Straight-line code that only code running once calls (an
+  application's wiring, a constructor called once, a `main` without loops) gets `minsize` and its own frame instead
+  of being inlined into `main` at `-O3`. A package's run-once code gets it even with loops (`XISTO_PKG_O3=1` turns
+  that off); the program's own loops keep `-O3`. Literal arguments of a function called once are folded into its body.
+  Releasing a string is an out-of-line call (`XISTO_REL_INLINE=1` inlines it again): smaller binaries, no
+  measured cost (Benchmarks Game and PolyBench, medians within ±2%).
 
 ## Calls, inlining and stack traces
 
