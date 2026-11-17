@@ -516,6 +516,9 @@ struct xs_coro {
     size_t copy_len, copy_cap;
     void *als;                /* its node:async_hooks context (an owned reference; xs_als_cur while it runs) */
     struct xs_coro *next;     /* free list */
+#ifdef XS_FLOAT
+    bool big;                 /* a floating call of the top level: a stack the size of the main thread's (xs_coro_new_big) */
+#endif
 };
 static XS_TLS xs_coro *xs_coro_dead; /* finished during this event batch: recycled after it */
 
@@ -576,6 +579,48 @@ XS_NOINLINE xs_coro *xs_coro_new(void (*entry)(void *), void *arg) {
     co->sp = f;
     return co;
 }
+#ifdef XS_FLOAT
+/* a floating call written at the top level (main(); with more top-level code after it): it ran on the main thread's
+   stack before, so it gets one as large (reserved, not touched: only the pages it uses count), and deep recursion
+   that worked there still works */
+#define XS_BIG_STACK (8 * 1024 * 1024)
+static XS_TLS xs_coro *xs_coro_free_big;
+XS_NOINLINE xs_coro *xs_coro_new_big(void (*entry)(void *), void *arg) {
+    xs_coro *co = xs_coro_free_big;
+    if (co) {
+        xs_coro_free_big = co->next;
+    } else {
+        co = calloc(1, sizeof *co);
+        co->kind = 1;
+        co->fdw.kind = co->tmw.kind = 2;
+        co->fdw.co = co->tmw.co = co;
+        co->fdw.tfd = co->tmw.tfd = -1;
+        co->big = true;
+        co->stack = mmap(NULL, XS_BIG_STACK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (co->stack == MAP_FAILED) xs_panic("cannot allocate a coroutine stack");
+        mprotect(co->stack, XS_PAGE, PROT_NONE); /* guard page */
+        co->ar_cap = 64;
+        co->ar_pool = malloc(co->ar_cap * sizeof(void *));
+        co->try_stack = NULL;
+    }
+    if (co->als) xs_release_(co->als);
+    co->als = xs_als_cur ? xs_retain_(xs_als_cur) : NULL;
+    co->done = false;
+    co->on_done = NULL;
+    co->ar_len = 0;
+    co->try_depth = 0;
+    co->thrown = NULL;
+    co->recover = NULL;
+    co->entry = entry;
+    co->arg = arg;
+    uint64_t *top = (uint64_t *)(co->stack + XS_BIG_STACK);
+    uint64_t *f = top - XS_FRAME_WORDS;
+    memset(f, 0, XS_FRAME_WORDS * sizeof(uint64_t));
+    XS_FRAME_INIT(f, entry, arg);
+    co->sp = f;
+    return co;
+}
+#endif
 
 /* ---- shared-stack coroutines ----
    10k tasks parked at once had 10k stacks: one page each at least (16 KB on macOS) and a page fault to start
@@ -647,6 +692,9 @@ static void xs_coro_flush_dead(void) {
         xs_coro *co = xs_coro_dead;
         xs_coro_dead = co->next;
         if (co->shared) { co->next = xs_coro_free_sh; xs_coro_free_sh = co; }
+#ifdef XS_FLOAT
+        else if (co->big) { co->next = xs_coro_free_big; xs_coro_free_big = co; }
+#endif
         else { co->next = xs_coro_free; xs_coro_free = co; }
     }
 }
@@ -674,6 +722,12 @@ __attribute__((constructor)) static void xs_asan_hook(void) { xs_asan_after_jump
 #else
 #define xs_stack_copy memcpy
 #endif
+#ifdef XS_FLOAT
+/* shared-stack coroutines running now (one, or one that resumed others from inside it, xs_coro_resume_any): while
+   it is not 0 the task stack is in use, and a coroutine started there would overwrite the frames of the one running */
+static XS_TLS int xs_sh_active;
+#define xs_coro_resume xs_coro_resume1
+#endif
 /* Runs or continues a coroutine until it yields or finishes. */
 static void xs_coro_resume(xs_coro *co) {
     /* park the scheduler's runtime state, install the coroutine's */
@@ -692,7 +746,13 @@ static void xs_coro_resume(xs_coro *co) {
 #ifdef XS_ASAN
     else if (co->stack) __asan_unpoison_memory_region(co->stack + XS_PAGE, XS_CORO_STACK - XS_PAGE); /* (a reused stack keeps another run's shadow) */
 #endif
+#ifdef XS_FLOAT
+    xs_sh_active += co->shared;
+#endif
     xs_ctx_swap(&xs_sched_sp, co->sp);
+#ifdef XS_FLOAT
+    xs_sh_active -= co->shared;
+#endif
     if (co->shared && !co->done) { /* parked: keep the part of the task stack it uses */
         char *lo = xs_shstack_low(co);
         size_t n = (size_t)(xs_shstack + XS_SHSTACK - lo);
@@ -715,6 +775,21 @@ static void xs_coro_resume(xs_coro *co) {
     xs_try_stack = xs_main_try; xs_try_depth = xs_main_try_depth; xs_thrown = xs_main_thrown;
     xs_recover = xs_main_recover; xs_recover_msg = xs_main_recover_msg;
 }
+#ifdef XS_FLOAT
+#undef xs_coro_resume
+/* a task on the task stack that starts a floating call (xs_promise_spawn_fl) parks to let it run there: the new one
+   runs until its first wait (or its end), then the task that started it goes on at once */
+static XS_TLS xs_coro *xs_spawn_req;
+static void xs_coro_resume(xs_coro *co) {
+    xs_coro_resume1(co);
+    while (xs_spawn_req && !co->done) {
+        xs_coro *ch = xs_spawn_req;
+        xs_spawn_req = NULL;
+        xs_coro_resume(ch);
+        xs_coro_resume1(co);
+    }
+}
+#endif
 
 static bool xs_handler_lock;
 static pthread_mutex_t xs_handler_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -1362,6 +1437,31 @@ XS_NOINLINE xs_promise *xs_promise_spawn(int kind, xs_val (*run)(void *), void (
     if (co->done) { co->on_done(co); if (!xs_cur_coro) xs_coro_flush_dead(); }
     return p;
 }
+#ifdef XS_FLOAT
+/* f(); not awaited (a floating promise): as xs_promise_spawn, on the shared task stack (a parked call keeps only the
+   bytes it used; 10k pending calls do not hold 10k stacks); top: written at the top level, on a stack as large as
+   the main thread's. Kept promises (xs_promise_spawn) keep their own 64 KB stacks. */
+XS_NOINLINE xs_promise *xs_promise_spawn_fl(int kind, xs_val (*run)(void *), void (*afree)(void *), void *args, int top) {
+    if (xs_kq < 0) xs_kq = kqueue();
+    xs_exit_hook = xs_tasks_drain;
+    xs_promise *p = xs_promise_make(kind);
+    xs_spawn *s = malloc(sizeof *s);
+    s->p = xs_retain_(p);
+    s->run = run;
+    s->afree = afree;
+    s->args = args;
+    bool from_sh = !top && xs_cur_coro && xs_cur_coro->shared && xs_sh_active == 1; /* (started by the task on the task stack) */
+    xs_coro *co = top ? xs_coro_new_big(xs_spawn_entry, s) : xs_sh_active && !from_sh ? xs_coro_new(xs_spawn_entry, s) : xs_coro_new_shared(xs_spawn_entry, s);
+    co->on_done = xs_spawn_done;
+    xs_tasks_live++;
+    co->starting = true;
+    if (from_sh) { xs_spawn_req = co; xs_coro_yield(); } /* (the caller parks; xs_coro_resume runs co, then the caller) */
+    else xs_coro_resume_any(co); /* runs until its first wait, as an async function does */
+    co->starting = false;
+    if (co->done) { co->on_done(co); if (!xs_cur_coro) xs_coro_flush_dead(); }
+    return p;
+}
+#endif
 XS_NOINLINE xs_promise *xs_promise_resolved(int kind, xs_val v) {
     xs_promise *p = xs_promise_make(kind);
     if (kind == 3) xs_retain_(v.p);

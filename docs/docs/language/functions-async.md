@@ -84,16 +84,48 @@ A function returning `Promise<T>` is async. Promises are created only where the 
 | Form | What happens |
 |---|---|
 | `await f()` | a direct call; no promise object |
-| `f();` as a statement | a direct call that **runs to the end** before the next line |
+| `f();` as a statement | started as in Node: `f` runs until its first wait, then the next line runs (warning XS2112) |
 | `const p = f()`, `Promise<T>` fields, parameters, arrays | a real promise; `f` runs as a task |
 | `.then` / `.catch` / `.finally`, `new Promise`, `Promise.resolve` / `reject` | real promises, microtasks |
 
-The bare `f();` is a divergence. Node runs `f` until its first `await` and goes on:
+A bare `f();` (a floating promise) behaves as in Node. `f` runs from its call until its first `await` of something
+pending; then the caller goes on, and `f` resumes later from the event loop. The order matches Node's:
 
 ```ts
-work("bare", 20);          // xisto: start bare, end bare, after bare
-console.log("after bare"); // Node:  start bare, after bare, … end bare later
+work("bare", 20);          // start bare
+console.log("after bare"); // after bare; end bare comes later, from the timer
 ```
+
+A callee that never waits (no `await`, no async call it waits for) and cannot throw runs to its end at the call,
+with no promise and no task: the same cost as a plain call. Any other runs as a task with its own promise, which
+nothing reads: a throw in it, even before its first `await`, rejects that promise and does not reach the caller's
+`try`/`catch`, as in Node. A rejection nobody handles is an unhandled rejection (see below).
+
+Floating tasks run on a shared task stack: a waiting one keeps only the bytes it used (10,000 pending calls, each
+waiting on a timer: 32 MB peak RSS; Node 26: 88 MB). A floating call written as a statement of the top level
+(`main();` with more code after it) gets a stack as large as the main thread's, so deep recursion that worked there
+still works.
+
+The build warns about each one (XS2112), because its errors are not caught where it is called. `xisto build`
+and `xisto run` print the count; `--warnings` (or `xisto check --details`) shows each place:
+
+```text
+xisto: 1 warning (XS2112 1): --warnings lists them, xisto check --details shows where
+```
+
+```text
+x.ts:7:3: warning[XS2112]: the promise of 'sendEmail()' is not awaited: the call runs concurrently and its errors are not caught here
+     7 |   sendEmail(user);
+       |   ^
+  help: await it; or, to start it on purpose, write `void f();` or add .catch((err) => ...) to handle its errors
+```
+
+Write `void sendEmail(user);` when running it in the background is what you want, or chain
+`.catch((err) => ...)` to handle its errors. Both silence the warning.
+
+A call written as a statement of a module's top level, such as the usual `main();`, is not warned: a rejection
+there ends the program with its error, as an uncaught `throw` does. When `main();` is the program's last statement,
+it runs on the main stack itself (nothing of the top level is left to go on, so the order is Node's).
 
 Cost, measured on an Apple M4 (12 Nov 2026), 2 million calls: `await f()` 0.7–0.9 ns per call; a kept promise
 (`const p = f(); await p`) about 73 ns. Node: about 20 ns for both. Await directly where you can. How waiting

@@ -2444,6 +2444,7 @@ static Expr *parse_unary(Parser *p) {
             u->str = "undefined";
             return u;
         }
+        x->voided = true;
         return x;
     }
     if (at_ident(p, "delete") && peek_is(p, TK_IDENT)) { /* delete m[k] / delete m.k: m.delete(k) (a Record, a Map) */

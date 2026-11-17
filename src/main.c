@@ -506,6 +506,7 @@ static Buf compile_to_c(const char *path) {
         if ((p->uses_net || p->par_native) && !in_process) buf_puts(&b, "#define XS_THREADS 1\n"); /* servers may run worker threads */
         if (getenv("XISTO_REL_OOL") && *getenv("XISTO_REL_OOL") == '1') buf_puts(&b, "#define XS_REL_OOL 1\n"); /* (experiment: every string release out of line) */
         if (p->par_native) buf_puts(&b, "#define XS_PARALLEL 1\n");
+        if (p->uses_float) buf_puts(&b, "#define XS_FLOAT 1\n"); /* (floating calls: their spawn and the shared stack's bookkeeping) */
         if (p->uses_tls) { buf_puts(&b, "#define XS_WITH_TLS 1\n"); link_tls = true; }
         if (p->uses_regex) buf_puts(&b, "#define XS_RT_REGEX 1\n");
         if (p->uses_normalize) buf_puts(&b, "#define XS_RT_NORMALIZE 1\n");

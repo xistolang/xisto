@@ -24,6 +24,7 @@ that you should know about. These are the rule warnings, each with a stable code
 | XS2109 | implicit | `--tsc-checked`: a `number` where an `int` goes, truncated | declare it `int`, or `Math.trunc` |
 | XS2110 | implicit | the result of a generic function value is copied through JSON | a concrete return type, or a generic function |
 | XS2111 | semantic | `xisto.json` `"json": { "omitNull": true }`: `JSON.stringify` leaves `null` members out, unlike Node | remove the option to write Node's JSON |
+| XS2112 | implicit | an async call (or another promise) used as a statement inside a function and not awaited: it runs concurrently and its errors are not caught there | `await` it; `void f();` or `.catch(...)` when it is meant to run in the background |
 
 Each comes with its place and a `help:` line:
 
