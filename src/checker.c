@@ -410,7 +410,8 @@ static Class *find_class(const char *name) {
         if (!strcmp(name, "Reflect") && c->exported && c->mod && c->mod->file && strstr(c->mod->file, "/reflect-metadata/"))
             return c; /* (Reflect.getMetadata & co: the global that import 'reflect-metadata' installs, the package's class) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:url") == 0 && c->exported) return c; /* (URL & co: web globals) */
-        if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:intl") == 0 && strncmp(name, "Intl_", 5) == 0) return c; /* (Intl.X: global) */
+        if (c->exported && c->mod && c->mod->file && strstr(c->mod->file, "/intl/") && strncmp(name, "Intl_", 5) == 0)
+            return c; /* (Intl.X: the global the intl package gives, its class Intl_X) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:okmap") == 0 && !strcmp(name, "OkMap")) return c; /* (Map<object, V>) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:iter") == 0) return c; /* (IteratorResult: TypeScript's global) */
         if (c->mod && c->mod->file && strcmp(c->mod->file, "xisto:reflect") == 0 && !strcmp(name, "PropertyDescriptor"))
@@ -455,6 +456,29 @@ static Expr *num_lit(Pos pos, double v, bool is_int) {
     z->kind = E_NUMBER; z->pos = pos; z->num = v; z->ival = (long long)v; z->is_int_lit = is_int; z->type = is_int ? ty_int : ty_number; z->field = -1;
     return z;
 }
+/* x.m(args) with the intl package installed: its function fname(x, [kind,] args...) (n.toLocaleString(locale, options)
+   is __intl_number_to_locale(n, locale, options)); false when the package is not loaded */
+static Func *lookup_func(const char *name);
+static int intern(const char *s);
+static bool intl_route(Expr *e, const char *fname, const char *kind) {
+    if (!lookup_func(fname)) return false;
+    Expr *self = e->lhs;
+    ExprList args = e->args;
+    Pos pos = e->pos;
+    memset(e, 0, sizeof *e);
+    e->kind = E_CALL; e->pos = pos; e->field = -1;
+    e->lhs = xs_alloc(sizeof *e->lhs);
+    e->lhs->kind = E_IDENT; e->lhs->pos = pos; e->lhs->field = -1; e->lhs->str = (char *)fname;
+    expr_list_push(&e->args, self);
+    if (kind) {
+        Expr *k = xs_alloc(sizeof *k);
+        k->kind = E_STRING; k->pos = pos; k->str = (char *)kind; k->field = -1; k->lit_id = intern(kind);
+        expr_list_push(&e->args, k);
+    }
+    for (int i = 0; i < args.len; i++) expr_list_push(&e->args, args.items[i]);
+    check_expr(e, NULL);
+    return true;
+}
 /* d.getFullYear(), d.toISOString(), d.setHours(h, m?, s?, ms?) ... (runtime/xisto_rt.h, Date) */
 static void check_date_member(Expr *e) {
     static const struct { const char *name; int ret; } gets[] = { /* ret: 0 int, 1 number, 2 string */
@@ -475,7 +499,10 @@ static void check_date_member(Expr *e) {
     for (size_t i = 0; i < sizeof gets / sizeof gets[0]; i++) {
         if (strcmp(m, gets[i].name) != 0) continue;
         if (e->args.len != 0) {
-            if (strncmp(m, "toLocale", 8) == 0) xs_error(XS7014, e->pos, "call it without arguments (en-US, as Node by default); Intl is not supported yet", "Date.%s with locales and options is not supported", m);
+            if (strncmp(m, "toLocale", 8) == 0 && e->args.len <= 2 &&
+                intl_route(e, "__intl_date_to_locale", !strcmp(m, "toLocaleDateString") ? "date" : !strcmp(m, "toLocaleTimeString") ? "time" : "any"))
+                return; /* (the intl package's Intl.DateTimeFormat) */
+            if (strncmp(m, "toLocale", 8) == 0) xs_error(XS7014, e->pos, "call it without arguments (en-US, as Node by default), or install the intl package: xisto add intl", "Date.%s with locales and options is not supported", m);
             xs_error(XS7013, e->pos, NULL, "Date.%s takes no arguments", m);
         }
         const char *cf = strcmp(m, "valueOf") == 0 ? "getTime" : strcmp(m, "toJSON") == 0 ? "toISOString" : strcmp(m, "toGMTString") == 0 ? "toUTCString" : m;
@@ -3233,6 +3260,8 @@ static Func *lookup_func(const char *name) {
         if (f->exported && (strstr(name, "__s_") || !strcmp(name, "__xs_fetch")) && f->mod && f->mod->file && strcmp(f->mod->file, "xisto:url") == 0) return f; /* (URL.canParse, AbortSignal.timeout: statics of globals; fetch with its options in a value) */
         if (!strncmp(name, "__xs_slot_get_", 14) || !strncmp(name, "__xs_slot_set_", 14) || !strncmp(name, "__xs_proto_get_", 15) ||
             !strncmp(name, "__xs_proto_set_", 15)) return f; /* (a patched prototype's slot or expando) */
+        if (!strncmp(name, "__intl_", 7) && f->exported && f->mod && f->mod->file && strstr(f->mod->file, "/intl/"))
+            return f; /* (n.toLocaleString(locale), s.localeCompare(t, locale): the intl package's, see intl_route) */
         if (!strncmp(name, "Reflect__s_", 11) && f->exported && f->mod && f->mod->file && strstr(f->mod->file, "/reflect-metadata/"))
             return f; /* (Reflect.defineMetadata & co: statics of the global Reflect, see find_class) */
         const char *st = strstr(name, "__s_"); /* a static method: visible where its class is imported */
@@ -6888,6 +6917,8 @@ static bool check_string_regex(Expr *e) {
 }
 
 static bool check_string_member_more(Expr *e) {
+    if (e->is_call && !strcmp(e->str, "localeCompare") && e->args.len >= 2 && e->args.len <= 3 && intl_route(e, "__intl_locale_compare", NULL))
+        return true; /* s.localeCompare(t, locale, options): the intl package's Intl.Collator */
     static const struct { const char *name; const char *cfn; int min, max; TypeKind a1, a2; int ret; } ms[] = {
         {"split", "xs_str_split", 1, 1, TY_STRING, TY_VOID, 0},
         {"replace", "xs_str_replace", 2, 2, TY_STRING, TY_STRING, 1},
@@ -14568,6 +14599,8 @@ static void check_expr_in(Expr *e, Type *expected) {
                 e->type = ty_string;
                 return;
             }
+            if (e->is_call && strcmp(e->str, "toLocaleString") == 0 && e->args.len >= 1 && e->args.len <= 2 && intl_route(e, "__intl_number_to_locale", NULL))
+                return; /* n.toLocaleString(locale, options): the intl package's Intl.NumberFormat */
             if (e->is_call && strcmp(e->str, "toLocaleString") == 0 && e->args.len <= 2) {
                 /* n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL', minimumFractionDigits: 2 }): the
                    options written in place (read here); pt-BR and en-US separators (runtime/xisto_rt.h) */

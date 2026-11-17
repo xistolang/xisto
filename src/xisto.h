@@ -362,6 +362,7 @@ struct Expr {
     int ntargs;
     int region;        /* E_ARRAY_LIT of region objects made inside that region's loop (region.c): lives in the region */
     bool par_native;   /* E_CALL of xisto:parallel whose fn was proved independent (parallel.c): the pool version */
+    bool cold_site;    /* emitter (find_run_once): a call that runs once (no loop or closure around it, in code that runs once) */
     bool rng_set;      /* E_IDENT: a range the pass that built it proved (distribute.c's pair slot counter) */
     bool loose;        /* E_BINARY: written == or != (the same as === / !== when no coercion could happen) */
     uint8_t await_tick; /* E_AWAIT: 1 of a value that is no promise (await null): one turn of the microtasks, as Node's,
@@ -533,6 +534,11 @@ struct Func {
     struct Func *deco_stub; /* a method a TypeScript decorator wraps (XB-107): its calls go through this function (its
                                slot); its own body is emitted as <cname>__orig */
     bool run_once;     /* straight-line code called only from code that runs once: not optimized (build time) */
+    int8_t pulls_loop; /* emitter: 0 unknown, 1 a function with a loop is inlined into it (inlined_once), 2 not */
+    bool once;         /* called only from calls that run once (it may have loops of its own): its calls outside loops run once */
+    int fold_ncalls;   /* fold.c: its calls in the program (1000 more if it is also a value, a dispatched method...) */
+    struct Expr *fold_call; /* ... the first one */
+    bool fold_seen;    /* fold.c: reached from the top level */
     bool escapes;      /* used as a value or dispatched: who calls it, and how often, is not known */
     /* generic functions and methods (function f<T>(x: T): T): a template, instantiated per list of types */
     char **tparams;
@@ -597,6 +603,8 @@ struct Class {
     bool is_default;   /* export default class X, or export default X; of a class declared here */
     bool used;
     bool made;         /* prune.c: an object of it can exist (new, a literal, a decoder) */
+    bool fold_seen;    /* fold.c: an object of it is made in reached code (its field initializers counted) */
+    bool printable;    /* emitter (find_printable): console.log & co can print an object of it; else its print function is empty */
     Field *fields;
     int nfields, cap_fields;
     Func **methods;
@@ -736,6 +744,7 @@ struct Module {
                              the declaration `import x from "m"` reads as x */
     bool loading, loaded;
     bool builtin;      /* "node:fs" and friends: functions provided by the runtime */
+    bool pkg;          /* a package's module (XISTO_PKGS, .xisto/pkgs, or imported by one): not the program's own code */
     bool missing;      /* xisto check: a module that could not be loaded (reported); its imported names are not reported again */
     bool dyn_target;   /* named by an import("...") somewhere: xs_lazy_m<id>() runs its top level (once; nothing when it ran at start) */
     bool lazy;         /* (emit) reached only through import(): its top level waits for the first import() */
@@ -825,6 +834,8 @@ extern bool region_allow_dual; /* set before region_compute: dual classes allowe
 extern int region_count;
 /* stackalloc.c: objects that cannot outlive the call making them (Stmt.on_stack, Class.stack_at) */
 void stack_compute(Program *p, bool (*cyclic)(Class *));
+/* fold.c: the literal arguments of a function called once, read as literals in its body (before prune.c) */
+void fold_program(Program *p);
 void emit_program(Program *p, Buf *out);
 void emit_program_qbe(Program *p, Buf *out);
 

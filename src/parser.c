@@ -60,7 +60,23 @@ static void vt_push(Parser *p, const char *name, Type *t) {
     p->nvt++;
 }
 
-static bool wants_intl;
+static bool wants_intl; /* Intl.X was named: the intl package is loaded (Intl.NumberFormat is its class Intl_NumberFormat) */
+static bool wants_intl_opt; /* n.toLocaleString(locale), s.localeCompare(t, locale): the intl package, when installed, formats them */
+static bool pkg_available(const char *from_file, const char *name);
+/* Intl.X named in the module p parses: Intl is the intl package's (it is not built in), an error without it */
+static void need_intl(Parser *p, Pos pos) {
+    if (wants_intl) return;
+    if (!pkg_available(p->mod ? p->mod->path : NULL, "intl"))
+        xs_error(XS5005, pos, "Intl is not built into xisto: install it with xisto add intl", "package '%s' is not installed", "intl");
+    wants_intl = true;
+}
+/* x.toLocaleString(locale...), x.toLocaleDateString(locale...), s.localeCompare(t, locale...): the intl package's when
+   it is installed (the checker routes them to it); the built-in forms otherwise */
+static void note_locale_call(Parser *p, Expr *m) {
+    if (wants_intl || wants_intl_opt || !m->is_call || !m->str) return;
+    bool loc = (!strncmp(m->str, "toLocale", 8) && m->args.len >= 1) || (!strcmp(m->str, "localeCompare") && m->args.len >= 2);
+    if (loc && pkg_available(p->mod ? p->mod->path : NULL, "intl")) wants_intl_opt = true;
+}
 static Func **pending_overloads; /* function f(...): R; signatures waiting for their implementation */
 static int npending_overloads;
 static bool wants_arrays; /* a .reduce( / .flatMap( / .flat( call, or an Iterable<T> type, was parsed: xisto:arrays is loaded */
@@ -86,6 +102,7 @@ static StmtList tsa_decls; /* const __xs_tsa_M_L_C = __xs_tsa([cooked...], [raw.
 static char **tsa_names;
 static int ntsa_names;
 static bool wants_reflect; /* a decorator type (MethodDecorator...) was named: xisto:reflect is loaded */
+static bool reflect_loaded; /* xisto:reflect is loaded (a decorated class, a decorator type, a class used as a value) */
 static void import_process(Program *prog, Module *m);
 static void import_stdio(Program *prog, Module *m);
 static void import_builtin_class(Program *prog, Module *m, const char *path, const char *name);
@@ -1040,11 +1057,11 @@ static Type *parse_type(Parser *p) {
     } else if (!strcmp(n, "ClassDecorator") || !strcmp(n, "MethodDecorator") || !strcmp(n, "PropertyDecorator") || !strcmp(n, "ParameterDecorator")) {
         wants_reflect = true; /* (xisto:reflect's, global) */
         t = named_type(p, name);
-    } else if (strcmp(n, "Intl") == 0 && at(p, TK_DOT) && peek_is_ident(p)) { /* Intl.DateTimeFormatOptions: xisto:intl's */
+    } else if (strcmp(n, "Intl") == 0 && at(p, TK_DOT) && peek_is_ident(p)) { /* Intl.NumberFormatOptions: the intl package's */
+        need_intl(p, name.pos);
         next(p);
         Token k = p->tok;
         next(p);
-        wants_intl = true;
         Token nm = name;
         nm.str = xs_sprintf("Intl_%s", k.str);
         t = named_type(p, nm);
@@ -1411,7 +1428,6 @@ static Expr *parse_arrow(Parser *p) {
 
 static bool tmpl_raw; /* parsing the template of String.raw`...` */
 static Expr *parse_tagged(Parser *p, Expr *tag);
-static bool wants_intl; /* Intl.X was named: xisto:intl is loaded (Intl.DateTimeFormat is its class Intl_DateTimeFormat) */
 /* the web globals xisto:url declares (runtime/node/url.ts) */
 static bool is_url_global_name(const char *n) {
     return n && (!strcmp(n, "URL") || !strcmp(n, "URLSearchParams") || !strcmp(n, "AbortController") || !strcmp(n, "AbortSignal") ||
@@ -2072,11 +2088,11 @@ static Expr *parse_primary(Parser *p) {
             this_alias_used = true;
             next(p);
         } else name = expect(p, TK_IDENT, NULL);
-        if (strcmp(name.str, "Intl") == 0 && at(p, TK_DOT)) { /* new Intl.DateTimeFormat(...): xisto:intl's Intl_DateTimeFormat */
+        if (strcmp(name.str, "Intl") == 0 && at(p, TK_DOT)) { /* new Intl.NumberFormat(...): the intl package's Intl_NumberFormat */
+            need_intl(p, name.pos);
             next(p);
             Token k = expect(p, TK_IDENT, NULL);
             name.str = xs_sprintf("Intl_%s", k.str);
-            wants_intl = true;
         }
         while (nlns_recs && at(p, TK_DOT) && peek_is_ident(p)) { /* new N.C(), new A.B.C(): a namespace's class */
             Parser l_ = *p;
@@ -2319,6 +2335,7 @@ static Expr *parse_postfix(Parser *p) {
                 parse_args(p, &m->args);
                 at_push_call = false;
                 if (!strcmp(m->str, "splice") && m->args.len == 1) wants_arrays = true; /* xs.splice(i): __xs_spliceFrom */
+                note_locale_call(p, m);
                 if (!strcmp(m->str, "entries") && m->args.len == 0) wants_arrays = true; /* xs.entries(): __xs_entries */
                 if (!strcmp(m->str, "toString") && m->args.len == 1) wants_builtins = true; /* big.toString(radix): __xs_big_radix */
                 if (m->args.len == 1 && m->args.items[0]->kind == E_ARROW && m->args.items[0]->arrow->fn->nparams == 3)
@@ -2333,6 +2350,7 @@ static Expr *parse_postfix(Parser *p) {
             expect(p, TK_RBRACKET, NULL);
             e = ix;
         } else if (at(p, TK_DOT)) {
+            if (e->kind == E_IDENT && e->str && !strcmp(e->str, "Intl")) need_intl(p, e->pos); /* (Intl.X, not after new) */
             next(p);
             Token name = expect_prop_name(p, NULL);
             Expr *nsx = ns_member(p, e, name);
@@ -2368,6 +2386,7 @@ static Expr *parse_postfix(Parser *p) {
                 parse_args(p, &m->args);
                 at_push_call = false;
                 if (!strcmp(m->str, "splice") && m->args.len == 1) wants_arrays = true; /* xs.splice(i): __xs_spliceFrom */
+                note_locale_call(p, m);
                 if (!strcmp(m->str, "entries") && m->args.len == 0) wants_arrays = true; /* xs.entries(): __xs_entries */
                 if (!strcmp(m->str, "toString") && m->args.len == 1) wants_builtins = true; /* big.toString(radix): __xs_big_radix */
                 if (m->args.len == 1 && m->args.items[0]->kind == E_ARROW && m->args.items[0]->arrow->fn->nparams == 3)
@@ -5975,8 +5994,11 @@ static Enum *parse_enum(Parser *p) {
 static bool class_decorated(Class *c) {
     if (c->decos.len || c->as_value) return true;
     if (c->base_name && strcmp(c->base_name, "Error") == 0 && !(c->mod && c->mod->file && (!strcmp(c->mod->file, "xisto:crypto") || !strcmp(c->mod->file, "xisto:zlib") || !strcmp(c->mod->file, "xisto:fs"))))
-        return true; /* an error class: a value too (@Catch(MyError)); not node:crypto's, node:zlib's and node:fs's errors with a code, which
-                        would make every program that imports them carry xisto:reflect (~40 KB) */
+        /* an error class: a value too (@Catch(MyError)); not node:crypto's, node:zlib's and node:fs's errors with a code, which
+           would make every program that imports them carry xisto:reflect (~40 KB); TypeError, RangeError & co (xisto:errors,
+           loaded after the program's modules) only in a program that has reflection already: `throw new RangeError(m)`
+           alone does not carry it (XB-258) */
+        return !(c->mod && c->mod->file && !strcmp(c->mod->file, "xisto:errors")) || reflect_loaded || wants_reflect;
     if (c->mixin) return true; /* class UpdateDto extends PartialType(CreateDto) {}: a value too (@Body() dto: UpdateDto) */
     for (int i = 0; i < c->nfields; i++) if (c->fields[i].decos.len) return true;
     for (int i = 0; i < c->nmethods; i++) {
@@ -7720,150 +7742,6 @@ static const char xs_promises_src[] =
     "}\n";
 
 /* xisto:errors: JavaScript's Error subclasses, visible in every module like Error itself */
-/* xisto:intl: Intl.DateTimeFormat (en-US, en-GB, pt-BR; numeric and 2-digit fields; a timeZone of the system TZ
-   database), as Node formats it; loaded when the program names Intl */
-static const char xs_intl_src[] =
-    "import { __xs_tz_fields } from \"xisto:tz\";\n"
-    "export interface Intl_DateTimeFormatOptions {\n"
-    "  timeZone?: string;\n"
-    "  year?: string;\n"
-    "  month?: string;\n"
-    "  day?: string;\n"
-    "  hour?: string;\n"
-    "  minute?: string;\n"
-    "  second?: string;\n"
-    "  hourCycle?: string;\n"
-    "  hour12?: boolean;\n"
-    "  weekday?: string;\n"
-    "  era?: string;\n"
-    "  timeZoneName?: string;\n"
-    "  dateStyle?: string;\n"
-    "  timeStyle?: string;\n"
-    "}\n"
-    "export interface Intl_DateTimeFormatPart {\n"
-    "  type: string;\n"
-    "  value: string;\n"
-    "}\n"
-    "function __xs_intl_pad2(n: number): string {\n"
-    "  return n < 10 ? \"0\" + n : \"\" + n;\n"
-    "}\n"
-    "function __xs_intl_opt(name: string, v: string | null): void {\n"
-    "  if (v !== null && v !== \"numeric\" && v !== \"2-digit\")\n"
-    "    throw new Error(\"RangeError: xisto: Intl.DateTimeFormat \" + name + \": '\" + v + \"' is not supported yet (numeric and 2-digit are)\");\n"
-    "}\n"
-    "export class Intl_DateTimeFormat {\n"
-    "  dmy: boolean = true;\n"
-    "  h12: boolean = false;\n"
-    "  zone: string | null = null;\n"
-    "  y: string | null = null;\n"
-    "  mo: string | null = null;\n"
-    "  d: string | null = null;\n"
-    "  h: string | null = null;\n"
-    "  mi: string | null = null;\n"
-    "  s: string | null = null;\n"
-    "  constructor(locale: string | null = null, options: Intl_DateTimeFormatOptions | null = null) {\n"
-    "    const loc = locale ?? \"en-US\";\n"
-    "    if (loc === \"en-US\" || loc === \"en\") this.dmy = false;\n"
-    "    else if (loc === \"en-GB\" || loc === \"pt-BR\" || loc === \"pt\" || loc === \"pt-PT\") this.dmy = true;\n"
-    "    else throw new Error(\"RangeError: xisto: Intl.DateTimeFormat locale '\" + loc + \"' is not supported yet (en-US, en-GB, pt-BR are)\");\n"
-    "    const o: Intl_DateTimeFormatOptions = options ?? {};\n"
-    "    if (o.weekday != null || o.era != null || o.timeZoneName != null || o.dateStyle != null || o.timeStyle != null)\n"
-    "      throw new Error(\"RangeError: xisto: Intl.DateTimeFormat supports timeZone, year, month, day, hour, minute, second, hourCycle and hour12\");\n"
-    "    this.zone = o.timeZone ?? null;\n"
-    "    this.y = o.year ?? null;\n"
-    "    this.mo = o.month ?? null;\n"
-    "    this.d = o.day ?? null;\n"
-    "    this.h = o.hour ?? null;\n"
-    "    this.mi = o.minute ?? null;\n"
-    "    this.s = o.second ?? null;\n"
-    "    __xs_intl_opt(\"year\", this.y);\n"
-    "    __xs_intl_opt(\"month\", this.mo);\n"
-    "    __xs_intl_opt(\"day\", this.d);\n"
-    "    __xs_intl_opt(\"hour\", this.h);\n"
-    "    __xs_intl_opt(\"minute\", this.mi);\n"
-    "    __xs_intl_opt(\"second\", this.s);\n"
-    "    if (this.y === null && this.mo === null && this.d === null && this.h === null && this.mi === null && this.s === null) {\n"
-    "      this.y = \"numeric\";\n"
-    "      this.mo = \"numeric\";\n"
-    "      this.d = \"numeric\";\n"
-    "    }\n"
-    "    const hc = o.hourCycle ?? null;\n"
-    "    const h12 = o.hour12 ?? null;\n"
-    "    if (h12 !== null) this.h12 = h12;\n"
-    "    else if (hc !== null) this.h12 = hc === \"h11\" || hc === \"h12\";\n"
-    "    else this.h12 = !this.dmy;\n"
-    "  }\n"
-    "  formatToParts(date: Date): Intl_DateTimeFormatPart[] {\n"
-    "    let yy: number = 0;\n"
-    "    let mm: number = 0;\n"
-    "    let dd: number = 0;\n"
-    "    let hh: number = 0;\n"
-    "    let mn: number = 0;\n"
-    "    let ss: number = 0;\n"
-    "    if (this.zone !== null) {\n"
-    "      const f = __xs_tz_fields(date.getTime(), this.zone!);\n"
-    "      yy = f[0];\n"
-    "      mm = f[1];\n"
-    "      dd = f[2];\n"
-    "      hh = f[3];\n"
-    "      mn = f[4];\n"
-    "      ss = f[5];\n"
-    "    } else {\n"
-    "      yy = date.getFullYear();\n"
-    "      mm = date.getMonth() + 1;\n"
-    "      dd = date.getDate();\n"
-    "      hh = date.getHours();\n"
-    "      mn = date.getMinutes();\n"
-    "      ss = date.getSeconds();\n"
-    "    }\n"
-    "    const out: Intl_DateTimeFormatPart[] = [];\n"
-    "    const lit = (v: string): void => {\n"
-    "      out.push({ type: \"literal\", value: v });\n"
-    "    };\n"
-    "    const dateParts: Intl_DateTimeFormatPart[] = [];\n"
-    "    const dayP: Intl_DateTimeFormatPart | null = this.d === null ? null : { type: \"day\", value: this.dmy || this.d === \"2-digit\" ? __xs_intl_pad2(dd) : \"\" + dd };\n"
-    "    const monP: Intl_DateTimeFormatPart | null = this.mo === null ? null : { type: \"month\", value: this.dmy || this.mo === \"2-digit\" ? __xs_intl_pad2(mm) : \"\" + mm };\n"
-    "    const yearP: Intl_DateTimeFormatPart | null = this.y === null ? null : { type: \"year\", value: this.y === \"2-digit\" ? __xs_intl_pad2(yy % 100) : \"\" + yy };\n"
-    "    if (this.dmy) {\n"
-    "      if (dayP !== null) dateParts.push(dayP);\n"
-    "      if (monP !== null) dateParts.push(monP);\n"
-    "    } else {\n"
-    "      if (monP !== null) dateParts.push(monP);\n"
-    "      if (dayP !== null) dateParts.push(dayP);\n"
-    "    }\n"
-    "    if (yearP !== null) dateParts.push(yearP);\n"
-    "    for (let i = 0; i < dateParts.length; i++) {\n"
-    "      if (i > 0) lit(\"/\");\n"
-    "      out.push(dateParts[i]);\n"
-    "    }\n"
-    "    const timeParts: Intl_DateTimeFormatPart[] = [];\n"
-    "    if (this.h !== null) {\n"
-    "      const hv = this.h12 ? (hh % 12 === 0 ? 12 : hh % 12) : hh;\n"
-    "      const padH = this.h === \"2-digit\" || (!this.h12 && this.s !== null);\n"
-    "      timeParts.push({ type: \"hour\", value: padH ? __xs_intl_pad2(hv) : \"\" + hv });\n"
-    "    }\n"
-    "    if (this.mi !== null) timeParts.push({ type: \"minute\", value: this.h !== null || this.mi === \"2-digit\" ? __xs_intl_pad2(mn) : \"\" + mn });\n"
-    "    if (this.s !== null) timeParts.push({ type: \"second\", value: this.mi !== null || this.s === \"2-digit\" ? __xs_intl_pad2(ss) : \"\" + ss });\n"
-    "    if (timeParts.length > 0) {\n"
-    "      if (out.length > 0) lit(\", \");\n"
-    "      for (let i = 0; i < timeParts.length; i++) {\n"
-    "        if (i > 0) lit(\":\");\n"
-    "        out.push(timeParts[i]);\n"
-    "      }\n"
-    "      if (this.h12 && this.h !== null) {\n"
-    "        lit(\" \");\n"
-    "        out.push({ type: \"dayPeriod\", value: hh < 12 ? \"AM\" : \"PM\" });\n"
-    "      }\n"
-    "    }\n"
-    "    return out;\n"
-    "  }\n"
-    "  format(date: Date): string {\n"
-    "    let r = \"\";\n"
-    "    for (const p of this.formatToParts(date)) r += p.value;\n"
-    "    return r;\n"
-    "  }\n"
-    "}\n"
-;
 static const char xs_errors_src[] =
     "export class TypeError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"TypeError\"; }\n}\n"
     "export class RangeError extends Error {\n  constructor(message: string = \"\") { super(message); this.name = \"RangeError\"; }\n}\n"
@@ -8300,17 +8178,9 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         add_func(prog, builtin_func(m, "__xs_tsa_raw", "xs_tsa_raw", ty_array_of(ty_string), 1, ty_array_of(ty_string), NULL));
         return m;
     }
-    if (strcmp(name, "tz") == 0) { /* xisto:tz: the wall clock of a time zone (xisto:intl) */
+    if (strcmp(name, "tz") == 0) { /* xisto:tz: the wall clock of a time zone (the intl package's Intl.DateTimeFormat) */
         add_func(prog, builtin_func(m, "__xs_tz_fields", "xs_tz_fields", ty_array_of(ty_int), 2, ty_number, ty_string));
-        return m;
-    }
-    if (strcmp(name, "intl") == 0) { /* xisto:intl: Intl.DateTimeFormat (see xs_intl_src) */
-        m->builtin = false;
-        m->file = "xisto:intl";
-        m->src = (char *)xs_intl_src;
-        m->loading = true;
-        parse_module(prog, m);
-        m->loading = false;
+        add_func(prog, builtin_func(m, "__xs_tz_local", "xs_tz_local", ty_string, 0, NULL, NULL));
         return m;
     }
     if (strcmp(name, "errors") == 0) { /* xisto:errors: TypeError & co (see xs_errors_src) */
@@ -8323,6 +8193,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
         return m;
     }
     if (strcmp(name, "reflect") == 0) { /* xisto:reflect: written in xisto, parsed like any module */
+        reflect_loaded = true;
         m->builtin = false;
         m->file = "xisto:reflect";
         m->src = (char *)xs_reflect_src;
@@ -8499,6 +8370,7 @@ static Module *load_builtin_module(Program *prog, const char *spec, Pos from_pos
 /* Resolves "./x" or "./x.ts" relative to the importing file, loads it once, dependencies first. */
 static Module *load_module(Program *prog, const char *file, Pos from_pos, const char *from_file) {
     char path[PATH_MAX];
+    bool via_pkg = false; /* a package's (XISTO_PKGS, .xisto/pkgs): code that runs once there is compiled for size */
     pending_prefix = NULL;
     if (from_file && (strncmp(file, "node:", 5) == 0 || strncmp(file, "xisto:", 6) == 0 || strcmp(file, "fs") == 0 || strcmp(file, "sqlite") == 0))
         return load_builtin_module(prog, file, from_pos);
@@ -8513,6 +8385,7 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
     } else if (alias) {
         snprintf(path, sizeof path, "%s", alias);
     } else if (from_file) {
+        via_pkg = file[0] != '/';
         /* a package: <project>/.xisto/pkgs/<name>/, entry from its xisto.json "main", else index.ts or src/index.ts.
            A deep import ("rxjs/operators", "@scope/pkg/sub/file") is the file <package>/<sub>(.ts, or its index.ts),
            as Node resolves a subpath of a package without "exports" */
@@ -8612,6 +8485,9 @@ static Module *load_module(Program *prog, const char *file, Pos from_pos, const 
         }
     }
     Module *m = xs_alloc(sizeof *m);
+    m->pkg = via_pkg;
+    for (int i = 0; i < prog->nmodules && from_file && !m->pkg; i++) /* (a module of a package's own) */
+        if (prog->modules[i]->pkg && !strcmp(prog->modules[i]->path, from_file)) m->pkg = true;
     m->native_prefix = (char *)pending_prefix;
     pending_prefix = NULL;
     m->path = xs_strndup(real, strlen(real));
@@ -8664,6 +8540,8 @@ Program *parse_program(const char *entry_file) {
     Program *prog = xs_alloc(sizeof *prog);
     project_json_options(entry_file);
     load_module(prog, entry_file, (Pos){0, 0}, NULL);
+    /* the intl package (Intl, toLocaleString with a locale) first: what its code names (TypeError...) loads below */
+    if (wants_intl || wants_intl_opt) load_module(prog, "intl", (Pos){1, 1}, entry_file);
     if (wants_arrays) load_module(prog, "xisto:arrays", (Pos){1, 1}, entry_file);
     if (wants_settled) load_module(prog, "xisto:settled", (Pos){1, 1}, entry_file);
     if (wants_builtins) load_module(prog, "xisto:builtins", (Pos){1, 1}, entry_file);
@@ -8673,7 +8551,6 @@ Program *parse_program(const char *entry_file) {
     if (wants_iter) load_module(prog, "xisto:iter", (Pos){1, 1}, entry_file);
     if (wants_url) load_module(prog, "xisto:url", (Pos){1, 1}, entry_file); /* (before errors: its DOMException extends Error) */
     if (wants_errors) load_module(prog, "xisto:errors", (Pos){1, 1}, entry_file);
-    if (wants_intl) load_module(prog, "xisto:intl", (Pos){1, 1}, entry_file);
     if (wants_reflect) load_module(prog, "xisto:reflect", (Pos){1, 1}, entry_file);
     /* top-level statements were appended in parse order (entry first); reorder by module order */
     StmtList ordered = {0};

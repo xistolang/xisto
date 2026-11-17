@@ -313,6 +313,34 @@ for backend in "" "--backend=qbe"; do
         pass=$((pass+1)); echo "size budget ok ($backend): $a vs $b bytes"
     fi
 done
+# lean binary: what the program does not use is not linked (tests/size/lean.ts)
+if sel lean; then
+    lean_ok=1
+    if [ "$(uname)" = Darwin ]; then lean_gc="-Wl,-dead_strip"; else lean_gc="-ffunction-sections -fdata-sections -Wl,--gc-sections"; fi
+    if ! $XISTO emit tests/size/lean.ts > "$OUT/lean.c" 2> /dev/null || ! cc -std=c11 -O1 -w $lean_gc -o "$OUT/lean" "$OUT/lean.c" -lm -lpthread > /dev/null 2>&1; then
+        echo "FAIL lean: build failed"; lean_ok=0
+    elif [ "$("$OUT/lean")" != "$(node tests/size/lean.ts)" ]; then echo "FAIL lean: output differs from node"; lean_ok=0
+    else
+        # the parallel runtime's tasks are reached only by the calls that run them (xs_rap_run's task argument)
+        if nm "$OUT/lean" | grep -E 'xs_(chain_pass|map_task|rap_task|chain_task)$' > /dev/null; then echo "FAIL lean: a parallel task is linked"; lean_ok=0; fi
+        # check() is called twice from the top level, once each: no copy of it per call (emit.c, cold_site)
+        if grep -E 'f[0-9]+_check_k[0-9]+' "$OUT/lean.c" > /dev/null; then echo "FAIL lean: a call that runs once has its own copy of the function"; lean_ok=0; fi
+        # new RangeError(m) without decorators: no ClassInfo (xisto:reflect) for the error classes (parser.c, class_decorated)
+        if grep -q 'ClassInfo' "$OUT/lean.c"; then echo "FAIL lean: an error class carries reflection metadata"; lean_ok=0; fi
+        # literal arguments of a function called once decide its branches when compiling (src/fold.c): the
+        # percent branch of tests/ok/fold-literal-args.ts, which its literal options do not take, is not compiled
+        if $XISTO emit tests/ok/fold-literal-args.ts 2> /dev/null | grep -q 'xs_str_immortal("%"'; then echo "FAIL lean: a branch literal arguments rule out was compiled"; lean_ok=0; fi
+        # a package's code that runs once is compiled for size, the program's own kernel is not (emit.c, pkg_once)
+        lean_pkg=$(XISTO_PKGS="$PWD/tests/size/pkgs" $XISTO emit tests/size/lean-pkg.ts 2> /dev/null)
+        if ! echo "$lean_pkg" | grep -q '^XS_RUN_ONCE .*_setup(' || echo "$lean_pkg" | grep -q '^XS_RUN_ONCE .*_kernel('; then
+            echo "FAIL lean: a package's run-once function is not compiled for size, or the program's kernel is"; lean_ok=0; fi
+        # a free function releases a string field with one out-of-line call (xs_str_release), not an inlined release
+        if ! grep -q 'xs_str_release(self->f_a)' "$OUT/lean.c"; then echo "FAIL lean: a string field's release is inlined in the free function"; lean_ok=0; fi
+        # Opts is never printed: its print function is empty (emit.c, find_printable; tests/ok/print-reach.ts prints through other types)
+        if ! grep -E 'static void c[0-9]+_Opts_print\(void \*p\) \{ \(void\)p; \}' "$OUT/lean.c" > /dev/null; then echo "FAIL lean: a class nothing prints has its print function"; lean_ok=0; fi
+    fi
+    if [ $lean_ok = 1 ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
+fi
 # runtime budget (XB-250): Date, bytes, bigint and an imported module's unused timers/fetch/async/try cost no event loop
 if ! sel rt-lean; then :; elif $XISTO emit tests/ok/rt-lean.ts > "$OUT/rt-lean.c" 2>&1 && ! grep -q 'Xisto network runtime' "$OUT/rt-lean.c" \
    && ! grep -q '^#define XS_THREADS' "$OUT/rt-lean.c" && ! sed -n '/^\/\* ---- program ---- \*\//,$p' "$OUT/rt-lean.c" | grep -q 'xs_cln_'; then

@@ -71,12 +71,14 @@ static int xs_wfclose(FILE *f) {
    breakLength 80, compact 3): one line if it fits, else one entry per line indented; arrays of more than six
    entries in aligned columns; deeper than two levels "[Name]"; a cycle "[Circular *n]", with "<ref *n>" on the
    object it points back to (written after the children, which is why entries go to a buffer first). */
-/* code that runs once (literal setup, a main that only wires things up): optimizing it buys nothing and was a
-   third of a release build of the Conduit API (312 ms of -O2 on the decorator registrations alone) */
+/* code that runs once (literal setup, a main that only wires things up, a constructor called once): optimized for
+   size. -O2 on it buys nothing and was a third of a release build of the Conduit API (312 ms on the decorator
+   registrations alone); -O0 (optnone, before) was as quick to build but its code twice as big: a Nest application's
+   binary is 33 KB smaller with minsize, built 3% slower (16/11) */
 #if defined(__clang__)
-#define XS_RUN_ONCE __attribute__((optnone, noinline, cold))
+#define XS_RUN_ONCE __attribute__((minsize, noinline, cold))
 #else
-#define XS_RUN_ONCE __attribute__((cold, optimize("O0")))
+#define XS_RUN_ONCE __attribute__((cold, noinline, optimize("Os")))
 #endif
 static XS_TLS FILE *xs_out_f;
 #define XS_OUT (xs_out_f ? xs_out_f : stdout)
@@ -893,6 +895,18 @@ static void xs_str_free(void *p);
               else if (__builtin_expect((h_->cls & (XS_CYC | XS_BUF)) == XS_CYC, 0)) xs_gc_suspect(h_); } } while (0)
 /* the argument appears once in the expansion: a chain of calls nests these macros, and a copy for __typeof__ doubled
    the text at every level (a 20-call query builder chain became ~1M copies and took clang past 10 GB, 11/11) */
+/* a string's release out of line: a class's free function releases each string field with one call, not the
+   inlined test-and-free (Intl.DateTimeFormatOptions: 16 fields, 2.9 KB inline) */
+XS_NOINLINE void xs_str_release(void *p) { xs_release_as(p, xs_str_free); }
+#ifdef XS_REL_OOL
+/* experiment (XISTO_REL_OOL=1): every string release, hot code included, is the out-of-line call; the other kinds
+   stay inline (the comparison of free_fn with xs_str_free folds) */
+#undef xs_release_as
+#define xs_release_as(x, free_fn) do { if ((void *)(free_fn) == (void *)xs_str_free) xs_str_release((void *)(x)); else { xs_hdr *h_ = (xs_hdr *)(x); \
+    if (h_) { XS_HEAP_CHECK_REL(h_) if (--h_->rc == 0) free_fn(h_); \
+              else if (__builtin_expect((h_->cls & (XS_CYC | XS_BUF)) == XS_CYC, 0)) xs_gc_suspect(h_); } } } while (0)
+#endif
+XS_NOINLINE void xs_release_ool(void *p) { xs_release_(p); } /* (the release of code that runs once: a call) */
 #define xs_retain(x) ({ __auto_type xs_rtv_ = (x); (__typeof__(xs_rtv_))xs_retain_((void *)xs_rtv_); })
 #define xs_release(x) xs_release_((void *)(x))
 /* node:async_hooks: read and replace the current context (xs_als_cur, above) */
@@ -931,8 +945,13 @@ static void *xs_ar_(void *p) {
 }
 #define xs_ar(x) ({ __auto_type xs_arv_ = (x); (__typeof__(xs_arv_))xs_ar_((void *)xs_arv_); }) /* (once: see xs_retain) */
 
-static inline void xs_ar_drain(size_t mark) {
+/* the temporaries a statement made, released at its end: the test inline, the releases in one function (a drain
+   inlined its release loop at every statement that made a temporary) */
+XS_NOINLINE void xs_ar_drain_(size_t mark) {
     while (xs_ar_len > mark) xs_release_(xs_ar_pool[--xs_ar_len]);
+}
+static inline void xs_ar_drain(size_t mark) {
+    if (xs_ar_len > mark) xs_ar_drain_(mark);
 }
 
 /* An array length is below 2^40 (arrays are created under that limit; growing past it would take terabytes):
@@ -5304,7 +5323,21 @@ static inline uint64_t xs_now(void) {
 #if !defined(_WIN32)
 #include <unistd.h>
 #endif
-/* Intl.DateTimeFormat with a timeZone (xisto:intl): the wall clock of a zone of the system TZ database at an instant,
+/* xisto:tz: the zone the system runs in when $TZ is not set (/etc/localtime links to .../zoneinfo/Area/City, as
+   Node's ICU reads it), or "" when that is not known */
+XS_NOINLINE xs_str *xs_tz_local(void) {
+#if !defined(_WIN32)
+    char b[512];
+    ssize_t n = readlink("/etc/localtime", b, sizeof b - 1);
+    if (n > 0) {
+        b[n] = 0;
+        const char *z = strstr(b, "zoneinfo/");
+        if (z) return xs_str_new(z + 9, strlen(z + 9));
+    }
+#endif
+    return xs_str_new("", 0);
+}
+/* xisto:tz (the intl package's Intl.DateTimeFormat with a timeZone): the wall clock of a zone of the system TZ database at an instant,
    as [year, month 1-12, day, hour, minute, second, weekday]; a zone the system does not know is a RangeError, as in Node */
 XS_NOINLINE xs_arr_int *xs_tz_fields(double ms, xs_str *zone) {
     char z[160];
@@ -7361,7 +7394,7 @@ static inline const uint8_t *xs_memchr(const uint8_t *p, int c, size_t n) {
 #if !defined(_WIN32)
 #include <pthread.h>
 #include <stdatomic.h>
-typedef struct {
+typedef struct xs_rap_job_ {
     uint8_t *d; xs_u8_tr_ctx c; int keep;
     const uint8_t *src, *map; /* phase 2: d[i] = map[src[i]] over [start, end) in ntask pieces */
     int64_t start, end, m, half, blk, nblk, ntask;
@@ -7372,6 +7405,7 @@ typedef struct {
     unsigned char *gdst; int64_t *gcount; /* phase 5: code points of csrc in ntask pieces into gcount; 6: csrc copied to gdst */
     const char *gneedle; size_t gnn; atomic_int_fast64_t gfirst; /* phase 7: the first piece with a hit of gneedle in csrc (gcount: its offset or -1) */
     int phase;
+    void (*task)(struct xs_rap_job_ *j, int64_t t); /* the phase's task: only the tasks a program's calls reach are linked */
     atomic_int_fast64_t next;
     bool publish; atomic_uchar *tdone; atomic_int_fast64_t cont; /* phase 1 in a begun part: the tasks done in order, so the front up to there is final */
 } xs_rap_job;
@@ -7600,10 +7634,7 @@ static void xs_rap_work(xs_rap_job *j) {
     for (;;) {
         int64_t t = atomic_fetch_add(&j->next, 1);
         if (t >= n) break;
-        if (j->phase == 2) xs_map_task(j, t);
-        else if (j->phase == 3 || j->phase == 4) xs_chain_task(j, t);
-        else if (j->phase >= 5 && j->phase <= 7) xs_gen_task(j, t);
-        else xs_rap_task(j, t);
+        j->task(j, t);
     }
 }
 static void *xs_rap_worker(void *arg) {
@@ -7622,8 +7653,9 @@ static void *xs_rap_worker(void *arg) {
     }
     return NULL;
 }
-static void xs_rap_run(xs_rap_job *j, int phase) {
+static void xs_rap_run(xs_rap_job *j, int phase, void (*task)(xs_rap_job *, int64_t)) {
     j->phase = phase;
+    j->task = task;
     atomic_store(&j->next, 0);
     pthread_mutex_lock(&xs_rap_mu);
     xs_rap_cur = j;
@@ -7666,7 +7698,7 @@ XS_NOINLINE bool xs_u8_map_par(xs_Uint8Array *D, xs_Uint8Array *S, xs_Uint8Array
     memset(&j, 0, sizeof j);
     j.d = D->data; j.src = S->data; j.map = T->data; j.start = lo; j.end = hi;
     j.ntask = (int64_t)(xs_rap_nthreads + 1) * 4;
-    xs_rap_run(&j, 2);
+    xs_rap_run(&j, 2, xs_map_task);
     xs_rap_release();
     return true;
 }
@@ -7734,7 +7766,7 @@ XS_NOINLINE bool xs_u8_rev_par(xs_Uint8Array *buf, xs_Uint8Array *table, int64_t
         j.pre = malloc(sizeof(int64_t) * (size_t)(j.nblk + 1));
         if (!j.pre) { xs_rap_release(); return false; }
         j.pre[0] = 0;
-        xs_rap_run(&j, 0);
+        xs_rap_run(&j, 0, xs_rap_task);
         for (int64_t b = 0; b < j.nblk; b++) j.pre[b + 1] += j.pre[b];
         j.m = j.pre[j.nblk];
         if (atomic_load(&j.fw_bad)) j.fw = 0;
@@ -7746,7 +7778,7 @@ XS_NOINLINE bool xs_u8_rev_par(xs_Uint8Array *buf, xs_Uint8Array *table, int64_t
         j.tdone = calloc((size_t)j.ntask, sizeof *j.tdone);
         if (j.tdone) { j.publish = true; xs_lent_publish(j.d + start); }
     }
-    if (j.half > 0) xs_rap_run(&j, 1);
+    if (j.half > 0) xs_rap_run(&j, 1, xs_rap_task);
     free(j.tdone);
     if (j.m & 1) { int64_t p = xs_rap_pos(&j, j.half); j.d[p] = j.c.T[j.d[p]]; }
     free(j.pre);
@@ -7770,7 +7802,7 @@ static bool xs_ulen_par(const unsigned char *d, int64_t n, int64_t *count) {
     j.ntask = (int64_t)(xs_rap_nthreads + 1) * 4;
     j.gcount = malloc(sizeof(int64_t) * (size_t)j.ntask);
     if (!j.gcount) { xs_rap_release(); return false; }
-    xs_rap_run(&j, 5);
+    xs_rap_run(&j, 5, xs_gen_task);
     int64_t c = 0;
     for (int64_t t = 0; t < j.ntask; t++) c += j.gcount[t];
     free(j.gcount);
@@ -7804,7 +7836,7 @@ static bool xs_find_par(const char *h, size_t hn, const char *nd, size_t nn, con
     atomic_store(&j.gfirst, j.ntask);
     j.gcount = malloc(sizeof(int64_t) * (size_t)j.ntask);
     if (!j.gcount) { xs_rap_release(); return false; }
-    xs_rap_run(&j, 7);
+    xs_rap_run(&j, 7, xs_gen_task);
     int64_t f = atomic_load(&j.gfirst);
     *hit = f < j.ntask ? h + j.gcount[f] : NULL;
     free(j.gcount);
@@ -7822,7 +7854,7 @@ static bool xs_copy_par(unsigned char *dst, const unsigned char *src, int64_t n)
     memset(&j, 0, sizeof j);
     j.csrc = src; j.gdst = dst; j.start = 0; j.end = n;
     j.ntask = (int64_t)(xs_rap_nthreads + 1) * 4;
-    xs_rap_run(&j, 6);
+    xs_rap_run(&j, 6, xs_gen_task);
     xs_rap_release();
     return true;
 }
@@ -7841,9 +7873,9 @@ static bool xs_str_chain_par(const unsigned char *p, int64_t len, unsigned char 
     j.ckept = malloc(sizeof(int64_t) * (size_t)(j.ntask + 1));
     if (!j.ckept) { xs_rap_release(); return false; }
     j.ckept[0] = 0;
-    xs_rap_run(&j, 3);
+    xs_rap_run(&j, 3, xs_chain_task);
     for (int64_t t = 0; t < j.ntask; t++) j.ckept[t + 1] += j.ckept[t];
-    xs_rap_run(&j, 4);
+    xs_rap_run(&j, 4, xs_chain_task);
     *written = j.ckept[j.ntask];
     free(j.ckept);
     xs_rap_release();

@@ -144,6 +144,7 @@ static void site_str(Buf *b, const char *s) {
     buf_putc(b, '"');
 }
 static bool inlined_once(Func *f);
+static bool pkg_once(Func *f);
 static bool stmt_has_try(Stmt *s);
 static int cur_rg; /* rg-hoist: the dual region being emitted (definition and notes below, with the region versions) */
 static bool rg_hoist_on; /* (defined with cur_rg below) */
@@ -355,9 +356,40 @@ static void fixparam_compute(Program *p) {
         for (int i = 0; i < f->nparams; i++) if (f->fixparam[i] < 0 || fixp_seen[k] != f->ncalls) f->fixparam[i] = 0;
     }
 }
+/* does a function with a loop end up in f, inlined into its only caller (always_inline, XS_FA) one or more times over? */
+static bool stmt_has_loop(Stmt *s);
+static bool pulls_loop(Func *f) {
+    if (f->pulls_loop) return f->pulls_loop == 1;
+    f->pulls_loop = 2; /* (a cycle: no) */
+    bool r = false;
+    for (int i = 0; i < prog->nfuncs && !r; i++) {
+        Func *g = prog->funcs[i];
+        if (g->ncalls == 1 && g->call1_in == f && g->body && (stmt_has_loop(g->body) || pulls_loop(g))) r = true;
+    }
+    for (int i = 0; i < prog->nclasses && !r; i++) {
+        Class *c = prog->classes[i];
+        if (!c->used || c->builtin) continue;
+        Func *fs[1] = {c->ctor};
+        for (int k = -1; k < c->nmethods && !r; k++) {
+            Func *g = k < 0 ? fs[0] : c->methods[k];
+            if (g && g->ncalls == 1 && g->call1_in == f && g->body && (stmt_has_loop(g->body) || pulls_loop(g))) r = true;
+        }
+    }
+    f->pulls_loop = r ? 1 : 2;
+    return r;
+}
+/* a package's function that runs once (Func.once: every call runs once; loops of its own allowed): compiled for size
+   on its own (XS_RUN_ONCE), as the program's run-once code is; the program's own functions with loops (a kernel
+   called once) keep -O3 */
+static bool pkg_once(Func *f) {
+    Module *m = f->mod ? f->mod : f->cls ? f->cls->mod : NULL;
+    return f->once && m && m->pkg && !getenv("XISTO_PKG_O3");
+}
 static bool inlined_once(Func *f) {
     if (getenv("XISTO_NO_TRACE")) return false;
     if (f->ncalls != 1 || !f->call1 || f->is_async || !f->body || stmt_has_try(f->body) || f->virt_target || f->is_gen) return false;
+    if ((f->run_once && !pulls_loop(f)) || pkg_once(f)) return false; /* (code that runs once is compiled for size, on its own: XS_RUN_ONCE;
+                                                          not when a function with a loop is inlined into it) */
     /* not recursive, directly or through other functions inlined into their only caller */
     int steps = 0; /* (a cycle among its callers that does not reach f: two functions that only call each other) */
     for (Func *g = f->call1_in; g; g = g->ncalls == 1 ? g->call1_in : NULL) if (g == f || ++steps > 256) return false;
@@ -824,7 +856,9 @@ static void emit_releases(EScope *s) {
             }
         }
         const char *kf = s->types ? known_free(s->types[i]) : NULL;
-        if (kf) buf_printf(out, "xs_release_as(%s, %s);", s->names[i], kf);
+        if (cur_func && (cur_func->run_once || pkg_once(cur_func))) /* (code that runs once: one call, not the inlined release) */
+            buf_printf(out, "%s(%s);", kf && !strcmp(kf, "xs_str_free") ? "xs_str_release" : "xs_release_ool", s->names[i]);
+        else if (kf) buf_printf(out, "xs_release_as(%s, %s);", s->names[i], kf);
         else buf_printf(out, "xs_release(%s);", s->names[i]);
     }
     if (use_cln && s->n) { nl(); buf_printf(out, "xs_cln_n -= %d;", s->n); }
@@ -3482,7 +3516,8 @@ static void emit_expr_(Expr *e) {
     bool user_call = callee && callee->body && !e->builtin.cfn && e->kind != E_NEW_OBJ && !(e->kind == E_MEMBER && (!e->cls || e->cls->builtin));
     /* (inside a region's code, a callee with a region version calls that version: it has no per-site clone) */
     bool rg_version = rg_hoist_on && cur_rg && callee && callee->rg_hoist == cur_rg && callee->rg_used;
-    char *clone = user_call && !e->par_native && !rg_version && cloned_per_site(callee) ? emit_clone(callee, id) : NULL;
+    /* (a call that runs once calls the function: a copy there would only make the program bigger) */
+    char *clone = user_call && !e->par_native && !rg_version && !e->cold_site && cloned_per_site(callee) ? emit_clone(callee, id) : NULL;
     if (callee) prof_inl_note(id, callee, clone != NULL);
     Expr *saved_b = bracketing;
     bool is_void = !e->type || e->type->kind == TY_VOID;
@@ -12296,7 +12331,7 @@ static void prof_inl_note(int site, Func *callee, bool inlined) {
 }
 
 static void emit_signature(Func *f) {
-    if (f->run_once && strcmp(fn_storage(f), "XS_FA") != 0 && strcmp(fn_storage(f), "XS_FII") != 0) buf_puts(out, "XS_RUN_ONCE "); /* (always_inline wins) */
+    if ((f->run_once || pkg_once(f)) && strcmp(fn_storage(f), "XS_FA") != 0 && strcmp(fn_storage(f), "XS_FII") != 0) buf_puts(out, "XS_RUN_ONCE "); /* (always_inline wins) */
     prof_fn_note(f, f->cname, fn_storage(f));
     if (f->is_ctor) {
         buf_printf(out, "%s %s *%s(", fn_storage(f), f->cls->cname, f->cname);
@@ -13804,7 +13839,7 @@ static void emit_class(Class *c) {
         Class *fc = ft->kind == TY_OBJECT ? ft->cls : NULL;
         if (fc && !fc->builtin && !fc->nsubs && !fc->region && !fc->is_interface && fc->used) /* its free is known */
             buf_printf(out, "xs_release_as(self->%s, %s_free);", c->fields[i].cname, fc->cname);
-        else if (ft->kind == TY_STRING) buf_printf(out, "xs_release_as(self->%s, xs_str_free);", c->fields[i].cname);
+        else if (ft->kind == TY_STRING) buf_printf(out, "xs_str_release(self->%s);", c->fields[i].cname); /* (out of line) */
         else buf_printf(out, "xs_release(self->%s);", c->fields[i].cname);
     }
     nl();
@@ -13844,7 +13879,9 @@ static void emit_class(Class *c) {
         /* (a Map<symbol, V>: printed as Node prints the Map) */
         buf_printf(out, "static void %s_print(void *p) { xs_print_okmap(p, ((%s *)p)->%s, ((%s *)p)->%s); }\n", c->cname, c->cname,
                    c->fields[find_field_idx(c, "vals")].cname, c->cname, c->fields[find_field_idx(c, "ks")].cname);
-    } else emit_class_print(c, xs_sprintf("%s_print", c->cname), NULL, 0);
+    } else if (!c->printable) /* (nothing prints it: find_printable) */
+        buf_printf(out, "static void %s_print(void *p) { (void)p; }\n", c->cname);
+    else emit_class_print(c, xs_sprintf("%s_print", c->cname), NULL, 0);
 
     if (in_hierarchy(c)) { emit_hier_ctor(c); goto methods; }
     /* constructor */
@@ -14032,21 +14069,21 @@ static bool stmt_has_loop(Stmt *s) {
    A function with no loop and no recursion, called only from code that itself runs once (main's top level
    outside loops, or another such function) and never used as a value: its body runs a single time, so the
    optimizer's work on it is wasted. Typically the wiring of an application (decorators, routes, modules). */
-typedef struct { Func *callee, *caller; bool hot; } RoEdge;
+typedef struct { Func *callee, *caller; bool hot; Expr *site; } RoEdge;
 static RoEdge *ro_edges;
 static int nro, capro;
-static void ro_add(Func *callee, Func *caller, bool hot) {
+static void ro_add(Func *callee, Func *caller, bool hot, Expr *site) {
     if (!callee) return;
     if (nro == capro) { capro = capro ? capro * 2 : 256; ro_edges = realloc(ro_edges, sizeof(RoEdge) * (size_t)capro); }
-    ro_edges[nro++] = (RoEdge){callee, caller, hot};
+    ro_edges[nro++] = (RoEdge){callee, caller, hot, site};
 }
 static void ro_stmt(Stmt *s, Func *ctx, int loop);
 static void ro_expr(Expr *e, Func *ctx, int loop) {
     if (!e) return;
     switch (e->kind) {
-    case E_CALL: if (e->func) ro_add(e->func, ctx, loop > 0); break;
-    case E_MEMBER: if (e->is_call && e->func) { if (e->virt) e->func->escapes = true; ro_add(e->func, ctx, loop > 0); } break;
-    case E_NEW_OBJ: if (e->cls && !e->cls->builtin && e->cls->ctor) ro_add(e->cls->ctor, ctx, loop > 0); break;
+    case E_CALL: if (e->func) ro_add(e->func, ctx, loop > 0, e); break;
+    case E_MEMBER: if (e->is_call && e->func) { if (e->virt) e->func->escapes = true; ro_add(e->func, ctx, loop > 0, e); } break;
+    case E_NEW_OBJ: if (e->cls && !e->cls->builtin && e->cls->ctor) ro_add(e->cls->ctor, ctx, loop > 0, e); break;
     case E_FUNC_REF: if (e->func) e->func->escapes = true; break;
     case E_ARROW: if (e->arrow && e->arrow->fn) ro_stmt(e->arrow->fn->body, ctx, loop + 1000); return; /* a closure may run many times */
     default: break;
@@ -14132,8 +14169,116 @@ static void find_run_once(Program *p) {
             if (e->hot || (e->caller && !e->caller->run_once)) { e->callee->run_once = false; changed = true; }
         }
     }
+    /* once: the same, loops of its own allowed (a constructor that reads its options with a loop); the calls it makes
+       outside its loops run once too (cold_site: a small function that can fail is called there, not copied) */
+    for (int i = 0; i < nall; i++) {
+        Func *f = all[i];
+        f->once = !f->escapes && !f->virt_target && !f->is_gen && !f->is_async && !(f->cls && in_hierarchy(f->cls)) && !f->ntparams;
+        bool any = false;
+        for (int k = 0; k < nro; k++) if (ro_edges[k].callee == f) { any = true; if (ro_edges[k].caller == f) f->once = false; }
+        if (!any) f->once = false;
+    }
+    for (changed = true; changed;) {
+        changed = false;
+        for (int k = 0; k < nro; k++) {
+            RoEdge *e = &ro_edges[k];
+            if (!e->callee->once) continue;
+            if (e->hot || (e->caller && !e->caller->once)) { e->callee->once = false; changed = true; }
+        }
+    }
+    for (int k = 0; k < nro; k++) ro_edges[k].site->cold_site = !ro_edges[k].hot && (!ro_edges[k].caller || ro_edges[k].caller->once);
     free(all);
     #undef RO_PUSH
+}
+
+/* ---- classes a program can print ----
+   console.log of a value prints it through its type's print function, which for a class is code generated from its
+   fields: a program that never prints an object of a class has no use for that code (an options class of a package,
+   its locale data). A class is printable when a value whose type can hold one of its objects (the class, a base, an
+   interface it is made from, an array, map, union... of those, a field of a printable class) reaches console.*, a
+   throw, an Error's arguments (the cause is printed), or a parameter of type unknown or object (util.inspect, a
+   logger). An unknown anywhere in the program (it can hold any object), and --debug (the debugger prints
+   variables), make every class printable. */
+static bool print_all;
+static void pr_mark_class(Class *c);
+static void pr_mark(Type *t) {
+    if (!t || print_all) return;
+    switch (t->kind) {
+    case TY_OBJECT: if (t->cls) pr_mark_class(t->cls); break;
+    case TY_ARRAY: case TY_SET: case TY_STREAM: case TY_NULLABLE: case TY_PROMISE: case TY_CHAN: pr_mark(t->elem); break;
+    case TY_MAP: pr_mark(t->key); pr_mark(t->elem); break;
+    case TY_UNION: case TY_TUPLE: for (int i = 0; i < t->nparams; i++) pr_mark(t->params[i]); break;
+    case TY_UNKNOWN: case TY_TPARAM: print_all = true; break;
+    default: break;
+    }
+}
+static void pr_mark_class(Class *c) {
+    if (!c || c->printable || c->builtin) return;
+    c->printable = true;
+    for (int i = 0; i < c->nfields; i++) pr_mark(c->fields[i].type);
+    for (int i = 0; i < c->nsubs; i++) pr_mark_class(c->subs[i]);
+    for (int i = 0; i < c->nadapters; i++) pr_mark_class(c->adapters[i]);
+    if (c->adapter_of) pr_mark_class(c->adapter_of);
+}
+static bool pr_dynamic(Type *t) { /* a type that holds any object */
+    if (!t || ty_is_undef(t)) return false;
+    switch (t->kind) {
+    case TY_UNKNOWN: case TY_TPARAM: return true;
+    case TY_ARRAY: case TY_SET: case TY_STREAM: case TY_NULLABLE: case TY_PROMISE: case TY_CHAN: return pr_dynamic(t->elem);
+    case TY_MAP: return pr_dynamic(t->key) || pr_dynamic(t->elem);
+    case TY_UNION: case TY_TUPLE: for (int i = 0; i < t->nparams; i++) if (pr_dynamic(t->params[i])) return true; return false;
+    default: return false;
+    }
+}
+static bool pr_is_error(Class *c) {
+    for (; c; c = c->base) if (!strcmp(c->name, "Error") || strstr(c->name, "Error")) return true;
+    return false;
+}
+static void pr_stmt(Stmt *s);
+static void pr_expr(Expr *e) {
+    if (!e || print_all) return;
+    if (pr_dynamic(e->type)) { print_all = true; return; }
+    bool sink = false;
+    if (e->kind == E_MEMBER && e->is_call && e->lhs && e->lhs->kind == E_IDENT && !e->lhs->cname && e->lhs->str && !strcmp(e->lhs->str, "console")) sink = true;
+    if (e->kind == E_NEW_OBJ && e->cls && pr_is_error(e->cls)) sink = true; /* (its cause, its errors) */
+    const char *cfn = e->builtin.cfn;
+    if (cfn && (strstr(cfn, "reject") || strstr(cfn, "print") || strstr(cfn, "inspect") || strstr(cfn, "format") || strstr(cfn, "assert"))) sink = true;
+    if (sink) for (int i = 0; i < e->args.len; i++) pr_mark(e->args.items[i]->type);
+    Func *f = e->kind == E_NEW_OBJ ? (e->cls ? e->cls->ctor : NULL) : (e->kind == E_CALL || (e->kind == E_MEMBER && e->is_call)) ? e->func : NULL;
+    if (f) /* an argument passed where any object goes (a parameter unknown, or of a template) */
+        for (int i = 0; i < e->args.len && i < f->nparams; i++) if (pr_dynamic(f->params[i].type)) pr_mark(e->args.items[i]->type);
+    if (e->kind == E_ARROW && e->arrow && e->arrow->fn) pr_stmt(e->arrow->fn->body);
+    pr_expr(e->lhs);
+    pr_expr(e->rhs);
+    for (int i = 0; i < e->args.len; i++) pr_expr(e->args.items[i]);
+}
+static void pr_stmt(Stmt *s) {
+    if (!s || print_all) return;
+    if (s->kind == S_THROW && s->expr) pr_mark(s->expr->type); /* (an uncaught throw prints what it threw) */
+    if (pr_dynamic(s->type)) { print_all = true; return; }
+    pr_expr(s->init); pr_expr(s->expr); pr_expr(s->cond); pr_expr(s->for_update);
+    pr_stmt(s->for_init); pr_stmt(s->body); pr_stmt(s->else_body);
+    for (int i = 0; i < s->stmts.len; i++) pr_stmt(s->stmts.items[i]);
+    for (int i = 0; i < s->ncases; i++) { pr_expr(s->cases[i].value); pr_stmt(s->cases[i].body); }
+}
+static void pr_func(Func *f) {
+    if (!f || print_all || f->ntparams) return; /* (a template: its instances are walked) */
+    for (int i = 0; i < f->nparams; i++) if (pr_dynamic(f->params[i].type)) print_all = true;
+    if (pr_dynamic(f->ret)) print_all = true;
+    pr_stmt(f->body);
+}
+static void find_printable(Program *p) {
+    print_all = xs_debug || getenv("XISTO_PRINT_ALL") != NULL;
+    for (int i = 0; i < p->nfuncs && !print_all; i++) if (p->funcs[i]->used && p->funcs[i]->body) pr_func(p->funcs[i]);
+    for (int i = 0; i < p->nclasses && !print_all; i++) {
+        Class *c = p->classes[i];
+        if (!c->used || c->builtin || c->ntparams) continue;
+        for (int k = 0; k < c->nfields; k++) { if (pr_dynamic(c->fields[k].type)) print_all = true; pr_expr(c->fields[k].init); }
+        if (c->ctor) pr_func(c->ctor);
+        for (int k = 0; k < c->nmethods; k++) if (c->methods[k]->cls == c && c->methods[k]->body) pr_func(c->methods[k]);
+    }
+    for (int i = 0; i < p->top.len && !print_all; i++) pr_stmt(p->top.items[i]);
+    if (print_all) for (int i = 0; i < p->nclasses; i++) p->classes[i]->printable = true;
 }
 
 /* ---- objects without a header ----
@@ -14801,6 +14946,7 @@ void emit_program(Program *p, Buf *o) {
     use_cln = (p->uses_net || program_has_try(p)) && !getenv("XISTO_NO_CLN"); /* XISTO_NO_CLN: measuring knob */
     find_consumed(p);
     find_run_once(p);
+    find_printable(p);
     nohdr_compute(p);
     cptr_compute(p);
     once_compute(p);
@@ -15473,7 +15619,9 @@ void emit_program(Program *p, Buf *o) {
     if (arrow_fns.data) buf_puts(out, arrow_fns.data);
     if (gen_fns.data) { buf_puts(out, gen_fns.data); gen_fns.len = 0; gen_fns.data[0] = 0; }
     buf_puts(out, body.data ? body.data : "");
-    for (int i = 0; i < nlit_ords; i++) emit_class_print(lit_ords[i].c, xs_sprintf("%s_print", lit_ord_name(i)), lit_ords[i].ord, lit_ords[i].n);
+    for (int i = 0; i < nlit_ords; i++)
+        if (lit_ords[i].c->printable) emit_class_print(lit_ords[i].c, xs_sprintf("%s_print", lit_ord_name(i)), lit_ords[i].ord, lit_ords[i].n);
+        else buf_printf(out, "static void %s_print(void *p) { (void)p; }\n", lit_ord_name(i));
     nlit_ords = 0;
     if (jam_used) { /* the jam versions of the callbacks (XB-083) */
         buf_printf(out, "\nstatic void *xs_jam8_of(void *fn) {\n%s    (void)fn;\n    return NULL;\n}\n", jam_tab.data ? jam_tab.data : "");
