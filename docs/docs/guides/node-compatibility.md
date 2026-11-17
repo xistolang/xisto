@@ -21,12 +21,13 @@ xisto build --node-compat -o app main.ts
 
 Available modules include:
 
-- `fs`, `fs/promises`, `path`, `os`, `url` and `import.meta` (see [fs, path, os, url](#fs-path-os-url))
+- `fs`, `fs/promises`, `path` (with `path/posix` and `path/win32`), `os`, `url` and `import.meta` (see
+  [fs, path, os, url](#fs-path-os-url))
 - `http`: Node's `createServer`/`request`/`get` (below), and xisto's own `Server` with `fetch`, with TLS for
   `https://` (AWS-LC by default, or BearSSL)
 - `events` (`EventEmitter`), `process`, `timers`, `http`, `net`, `dns`, `child_process` (see below)
 - `readline`, `readline/promises` and `tty`, with `process.stdin` (see [readline](#readline) and [tty](#tty))
-- `util`, `querystring`, `string_decoder` (below)
+- `util`, `util/types`, `querystring`, `string_decoder` (below)
 - `http` / `https`: a server and `fetch`, with TLS (AWS-LC by default, or BearSSL)
 - `crypto`: hashes, HMAC, AES ciphers, pbkdf2/scrypt/hkdf, keys and RSA/ECDSA signatures (see [crypto](#crypto))
 - `zlib`: deflate, gzip, raw deflate and Brotli (see [zlib](#zlib))
@@ -108,7 +109,8 @@ Differences from Node:
 - `Readable` is a subclass of `Writable` in xisto, so that `Duplex` can be both (xisto classes have one base): a
   `Duplex`, `Transform` or `PassThrough` goes wherever a `Readable` or a `Writable` goes, as in Node. The price:
   `x instanceof Writable` is also true for a plain `Readable` (`instanceof Readable` is exact; test
-  `x.writable`), and a `Readable` has `write()`/`end()`, which throw. `Writable` has no `pipe()`.
+  `x.writable`), and a `Readable` has `write()`/`end()`, which throw. A `Writable`'s `pipe()` emits
+  Node's `ERR_STREAM_CANNOT_PIPE` error and returns the destination (Node returns `undefined`).
 - `Readable.from(generator)` runs the generator as a task: a value is produced when the previous one has been
   read, one step later than Node, which reads one ahead. For an array it reads as Node does.
 - Breaking out of `for await (const c of readable)` does not destroy the stream (xisto's generators have no
@@ -366,7 +368,8 @@ and sockets:
   `destroy()`, and `unref()`/`ref()`: an unref'd socket does not keep the program alive while it waits for data
   (it still does while it connects or writes, as in Node). Fields `remoteAddress`/`remotePort`/`localAddress`/`localPort`, `bytesRead`/`bytesWritten`.
 - **Server:** `listen(port, host, cb)` (port 0 picks a free one), `address()`, `close(cb)` (waits for the open
-  connections), `getConnections`, `unref()`/`ref()`.
+  connections), `getConnections`, `unref()`/`ref()`. The class is `net.Server`, as in Node: a type
+  (`let s: net.Server`) and a constructor (`new net.Server((socket) => ...)`).
 - `isIP`, `isIPv4`, `isIPv6`.
 
 Each socket reads on a task of its own, so `'data'` arrives as the bytes do.
@@ -378,7 +381,6 @@ Differences from Node:
 - `write()` writes before it returns.
 - The socket is an `EventEmitter`, not a `stream.Duplex`: `pipe(dest)` takes another `net.Socket` (an echo
   server's `c.pipe(c)`, a proxy), with `{ end }` and the `'pipe'` event, but no backpressure.
-- `https.Server` extends `http.Server` (Node: `tls.Server`), so `instanceof http.Server` is true for it.
 
 ## dns
 
@@ -529,8 +531,8 @@ Differences from Node:
 - `types` has `isDate`, `isRegExp`, `isMap`, `isSet`, `isNativeError` (also a class that extends `Error`),
   `isPromise`, `isUint8Array` (also a `Buffer`), `isFloat64Array`, `isInt32Array`, `isTypedArray`,
   `isArrayBufferView`, `isSharedArrayBuffer`, `isAnyArrayBuffer`. The checks for kinds of value xisto does not
-  have (`isArrayBuffer`, `isProxy`, `isWeakMap`, boxed primitives...) return `false`. `node:util/types` cannot be
-  imported; use `types` from `node:util`.
+  have (`isArrayBuffer`, `isProxy`, `isWeakMap`, boxed primitives...) return `false`. The same checks, every name
+  Node exports, are the module `node:util/types` (`import { isDate } from "node:util/types"`).
 - `parseArgs` follows Node's algorithm and error messages (`err.code` is `ERR_PARSE_ARGS_UNKNOWN_OPTION`,
   `ERR_PARSE_ARGS_INVALID_OPTION_VALUE` or `ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL`), with `strict`,
   `allowPositionals`, `allowNegative`, `tokens`, short and long options, groups (`-abc`), `string` and `boolean`
@@ -813,8 +815,9 @@ Differences from Node: the class is `DiagnosticsChannel`, because `Channel` is x
 ## https and tls
 
 `https.createServer({ key, cert }, listener)` is `http.createServer` over TLS. `key` and `cert` are PEM text or
-Buffers, as in Node. `https.request`/`get` make https requests. The `ca` option trusts one more CA certificate,
-on top of the system's and `NODE_EXTRA_CA_CERTS`.
+Buffers, as in Node; the server's class is `https.Server`. `https.request`/`get` make https requests, through
+`https.globalAgent` or the `agent` given (an `https.Agent`, with `http.Agent`'s options; see [http](#http)). The `ca`
+option trusts one more CA certificate, on top of the system's and `NODE_EXTRA_CA_CERTS`.
 
 `tls.connect({ host, port, servername, ca }, cb)` gives a `TLSSocket`:
 
@@ -834,6 +837,7 @@ Differences from Node:
 - Not available yet: `tls.createServer` (`node:https` serves TLS), client certificates, `passphrase`, SNI
   callbacks. `node:https` has node:http's behavior otherwise: binary bodies, streaming, several servers.
 - `TLSSocket` is an `EventEmitter`, not a `stream.Duplex`.
+- `https.Server` extends `http.Server` (Node: `tls.Server`), so `instanceof http.Server` is true for it.
 
 ## TLS
 
@@ -955,7 +959,7 @@ Differences from Node:
 object: `{ encoding, flag, mode }`), `existsSync`, `unlinkSync`, `mkdirSync` (`{ recursive }`: gives the first
 directory made), `readdirSync` (`{ withFileTypes }`: `Dirent`s with `name`, `parentPath`, `isFile()`,
 `isDirectory()`, `isSymbolicLink()`...; `{ recursive }`), `statSync`/`lstatSync`/`fstatSync` (`Stats`: `size`,
-`mode`, `nlink`, `uid`, `ino`..., `atimeMs`/`mtimeMs`/`ctimeMs`/`birthtimeMs` and their `Date`s, `isFile()`,
+`mode`, `nlink`, `uid`, `ino` (a `number`, as in Node: a pipe's inode on macOS is above 2^53)..., `atimeMs`/`mtimeMs`/`ctimeMs`/`birthtimeMs` and their `Date`s, `isFile()`,
 `isDirectory()`, `isSymbolicLink()`...; `{ throwIfNoEntry: false }`), `rmSync` (`{ recursive, force }`),
 `rmdirSync`, `renameSync`, `copyFileSync` (`COPYFILE_EXCL`), `cpSync` (`{ recursive, force, errorOnExist,
 filter }`), `mkdtempSync`, `realpathSync`, `accessSync`, `chmodSync`, `symlinkSync`, `readlinkSync`, `linkSync`,
@@ -1028,11 +1032,12 @@ Differences from Node:
   `os.constants.priority` print without `[Object: null prototype]`.
 - `fs.promises` calls run when awaited, on the calling thread (Node: its thread pool), and the callback API
   runs the call on a later turn of the event loop (Node: in parallel).
-- Not there: `fs.watch`/`watchFile`, `fs.glob`/`globSync`, `opendirSync`/`Dir`, `FileHandle`
-  (`fs/promises` `open`), `fs.read`/`write` on descriptors with callbacks, `statfs`, `bigint` stats,
-  `path.matchesGlob`, `path.win32.resolve`/`relative` (and `toNamespacedPath` of a relative Windows path, which
-  Node resolves against the current directory first), `os.setPriority`/`getPriority`, `os.cpus()` models and
-  speeds (empty and 0).
+- The glob functions have no extglobs (`+(a|b)`...), `followSymlinks` or `maxDepth`, and an `exclude` function
+  always gets the path (Node gives it a `Dirent` with `withFileTypes`).
+- `url.parse` does not convert a non-ASCII host name to punycode, and a parsed `query` prints as a plain object.
+- Not there: `fs.watchFile`, `opendirSync`/`Dir`, `FileHandle` (`fs/promises` `open`), `statfs`, `bigint` stats,
+  `path.matchesGlob`, `toNamespacedPath` of a relative Windows path (Node resolves it against the current directory
+  first), `os.setPriority`/`getPriority`, `os.cpus()` models and speeds (empty and 0).
 
 ## npm packages
 
