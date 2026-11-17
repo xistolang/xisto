@@ -13638,25 +13638,48 @@ static void cyc_compute(Program *p) {
         }
         if (any) for (int j = 0; j < n; j++) if (!p->classes[j]->builtin) adj[(size_t)i * N + (size_t)j] = true;
     }
-    /* reach = transitive closure of adj */
-    bool *reach = malloc(N * N);
-    memcpy(reach, adj, N * N);
-    for (int k = 0; k < n; k++)
-        for (int i = 0; i < n; i++)
-            if (reach[(size_t)i * N + (size_t)k])
-                for (int j = 0; j < n; j++) if (reach[(size_t)k * N + (size_t)j]) reach[(size_t)i * N + (size_t)j] = true;
-    /* cyclic: some cycle through it contains an edge that can be written after construction */
-    for (int c = 0; c < n; c++) {
-        if (p->classes[c]->builtin) continue;
-        for (int u = 0; u < n && !cls_cyc[c]; u++) {
-            if (u != c && !reach[(size_t)c * N + (size_t)u]) continue;
-            for (int v = 0; v < n; v++) {
-                if (!madj[(size_t)u * N + (size_t)v]) continue;
-                if (v == c || reach[(size_t)v * N + (size_t)c]) { cls_cyc[c] = true; break; }
+    /* cyclic: some cycle through it contains an edge that can be written after construction, that is a mutable
+       edge u -> v with u, v and it in one strongly connected component (u = v = it: an edge to itself). The
+       components come from Tarjan's algorithm over the matrix, O(classes^2): the transitive closure it replaces was
+       O(classes^3), most of a 1400-module program's build */
+    int *comp = malloc(sizeof(int) * N), *low = malloc(sizeof(int) * N), *idx = malloc(sizeof(int) * N);
+    int *stk = malloc(sizeof(int) * N), *cs = malloc(sizeof(int) * N), *cj = malloc(sizeof(int) * N);
+    bool *on = calloc(N, sizeof(bool));
+    for (int i = 0; i < n; i++) { idx[i] = -1; comp[i] = -1; }
+    int counter = 0, sp = 0, ncomp = 0;
+    for (int r = 0; r < n; r++) {
+        if (idx[r] >= 0) continue;
+        int csp = 0;
+        cs[csp] = r; cj[csp] = 0; csp++;
+        idx[r] = low[r] = counter++; stk[sp++] = r; on[r] = true;
+        while (csp) {
+            int u = cs[csp - 1];
+            int j = cj[csp - 1];
+            while (j < n && !adj[(size_t)u * N + (size_t)j]) j++;
+            if (j < n) {
+                cj[csp - 1] = j + 1;
+                if (idx[j] < 0) {
+                    idx[j] = low[j] = counter++; stk[sp++] = j; on[j] = true;
+                    cs[csp] = j; cj[csp] = 0; csp++;
+                } else if (on[j] && idx[j] < low[u]) low[u] = idx[j];
+                continue;
             }
+            if (low[u] == idx[u]) {
+                int w;
+                do { w = stk[--sp]; on[w] = false; comp[w] = ncomp; } while (w != u);
+                ncomp++;
+            }
+            csp--;
+            if (csp && low[u] < low[cs[csp - 1]]) low[cs[csp - 1]] = low[u];
         }
     }
-    free(adj); free(madj); free(reach);
+    bool *comp_cyc = calloc((size_t)(ncomp ? ncomp : 1), sizeof(bool));
+    for (int u = 0; u < n; u++)
+        for (int v = 0; v < n; v++)
+            if (madj[(size_t)u * N + (size_t)v] && comp[u] == comp[v]) comp_cyc[comp[u]] = true;
+    for (int c = 0; c < n; c++) if (!p->classes[c]->builtin && comp_cyc[comp[c]]) cls_cyc[c] = true;
+    free(comp); free(low); free(idx); free(stk); free(cs); free(cj); free(on); free(comp_cyc);
+    free(adj); free(madj);
     for (int c = 0; c < n; c++) if (p->classes[c]->region) cls_cyc[c] = false; /* freed with their region, never one by one */
 }
 static bool class_cyclic(Class *c) { int i = cls_index(c); return i >= 0 && cls_cyc[i]; }

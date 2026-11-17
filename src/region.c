@@ -35,18 +35,69 @@ static Program *rp;
 static RNode *nodes;
 static int nnodes, cnodes;
 
-static int node_of_func(Func *f) {
-    for (int i = 1; i < nnodes; i++) if (nodes[i].fn == f) return i;
-    return -1;
+/* node lookups by pointer (a hash: a linear search per call and per `new`, redone for every loop's home, made
+   region_compute take most of a 1400-module program's build); the first node of a key wins, as the search did */
+typedef struct { const void *k; int v; } PtrSlot;
+typedef struct { PtrSlot *s; int cap, n; } PtrMap;
+static PtrMap fn_nodes, init_nodes;
+static unsigned ptr_hash(const void *k) { uintptr_t x = (uintptr_t)k; x ^= x >> 17; x *= 0xed5ad4bbu; x ^= x >> 11; return (unsigned)x; }
+static int pm_get(PtrMap *m, const void *k) {
+    if (!m->cap) return -1;
+    for (unsigned i = ptr_hash(k) & (unsigned)(m->cap - 1);; i = (i + 1) & (unsigned)(m->cap - 1)) {
+        if (!m->s[i].k) return -1;
+        if (m->s[i].k == k) return m->s[i].v;
+    }
 }
-static int node_of_init(Class *c) {
-    for (int i = 1; i < nnodes; i++) if (!nodes[i].fn && nodes[i].cls == c) return i;
-    return -1;
+static void pm_put_first(PtrMap *m, const void *k, int v) {
+    if (pm_get(m, k) >= 0) return;
+    if ((m->n + 1) * 2 > m->cap) {
+        PtrMap g = {calloc((size_t)(m->cap ? m->cap * 2 : 1024), sizeof(PtrSlot)), m->cap ? m->cap * 2 : 1024, 0};
+        for (int i = 0; i < m->cap; i++) if (m->s[i].k) pm_put_first(&g, m->s[i].k, m->s[i].v);
+        free(m->s);
+        *m = g;
+    }
+    unsigned i = ptr_hash(k) & (unsigned)(m->cap - 1);
+    while (m->s[i].k) i = (i + 1) & (unsigned)(m->cap - 1);
+    m->s[i].k = k; m->s[i].v = v; m->n++;
 }
+static void pm_clear(PtrMap *m) { free(m->s); *m = (PtrMap){0}; }
+/* class -> its index in rp->classes (classes listed twice keep the linear scans: class_dups) */
+static PtrMap class_idx;
+static bool class_dups;
+static int class_index(Class *c) { return c ? pm_get(&class_idx, c) : -1; }
+static int node_of_func(Func *f) { return f ? pm_get(&fn_nodes, f) : -1; }
+static int node_of_init(Class *c) { return c ? pm_get(&init_nodes, c) : -1; }
 static int add_node(Func *fn, Class *cls) {
     if (nnodes == cnodes) { cnodes = cnodes ? cnodes * 2 : 256; nodes = realloc(nodes, sizeof(RNode) * (size_t)cnodes); }
     nodes[nnodes] = (RNode){.fn = fn, .cls = cls};
+    if (nnodes > 0) { /* (node 0, the top level, is never looked up) */
+        if (fn) pm_put_first(&fn_nodes, fn, nnodes);
+        else if (cls) pm_put_first(&init_nodes, cls, nnodes);
+    }
     return nnodes++;
+}
+/* the nodes of every method named like f (a dispatched call may land on any of them), found once per name */
+typedef struct { const char *name; int *v; int n; } VirtSet;
+static VirtSet *virt_sets;
+static int nvirt_sets, cvirt_sets;
+static PtrMap virt_by_fn; /* f -> its VirtSet */
+static VirtSet *virt_nodes(Func *f) {
+    int at = pm_get(&virt_by_fn, f);
+    if (at >= 0) return &virt_sets[at];
+    for (int i = 0; i < nvirt_sets; i++)
+        if (strcmp(virt_sets[i].name, f->name) == 0) { pm_put_first(&virt_by_fn, f, i); return &virt_sets[i]; }
+    if (nvirt_sets == cvirt_sets) { cvirt_sets = cvirt_sets ? cvirt_sets * 2 : 64; virt_sets = realloc(virt_sets, sizeof(VirtSet) * (size_t)cvirt_sets); }
+    VirtSet *vs = &virt_sets[nvirt_sets];
+    *vs = (VirtSet){f->name, NULL, 0};
+    int cap = 0;
+    for (int i = 0; i < rp->nclasses; i++)
+        for (int k = 0; k < rp->classes[i]->nmethods; k++)
+            if (strcmp(rp->classes[i]->methods[k]->name, f->name) == 0) {
+                if (vs->n == cap) { cap = cap ? cap * 2 : 8; vs->v = realloc(vs->v, sizeof(int) * (size_t)cap); }
+                vs->v[vs->n++] = node_of_func(rp->classes[i]->methods[k]);
+            }
+    pm_put_first(&virt_by_fn, f, nvirt_sets);
+    return &virt_sets[nvirt_sets++];
 }
 static void push_call(RNode *n, int to) {
     if (to < 0) return;
@@ -100,10 +151,10 @@ static void walk_expr(RNode *n, Expr *e) {
     case E_MEMBER:
         if (e->func) {
             push_call(n, node_of_func(e->func));
-            if (e->virt) /* dispatched at run time: every method of that name may run */
-                for (int i = 0; i < rp->nclasses; i++)
-                    for (int k = 0; k < rp->classes[i]->nmethods; k++)
-                        if (strcmp(rp->classes[i]->methods[k]->name, e->func->name) == 0) push_call(n, node_of_func(rp->classes[i]->methods[k]));
+            if (e->virt) { /* dispatched at run time: every method of that name may run */
+                VirtSet *vs = virt_nodes(e->func);
+                for (int i = 0; i < vs->n; i++) push_call(n, vs->v[i]);
+            }
         }
         break;
     default: break;
@@ -155,6 +206,7 @@ static bool mentions(Type *t, bool *inR) {
     if (!t) return false;
     switch (t->kind) {
     case TY_OBJECT: {
+        if (!class_dups) { int i = class_index(t->cls); return i >= 0 && inR[i]; }
         for (int i = 0; i < rp->nclasses; i++) if (inR[i] && rp->classes[i] == t->cls) return true;
         return false;
     }
@@ -166,7 +218,10 @@ static bool mentions(Type *t, bool *inR) {
 static void unmark_mentioned(Type *t, bool *inR) {
     if (!t) return;
     switch (t->kind) {
-    case TY_OBJECT: for (int i = 0; i < rp->nclasses; i++) if (rp->classes[i] == t->cls) inR[i] = false; return;
+    case TY_OBJECT:
+        if (!class_dups) { int i = class_index(t->cls); if (i >= 0) inR[i] = false; return; }
+        for (int i = 0; i < rp->nclasses; i++) if (rp->classes[i] == t->cls) inR[i] = false;
+        return;
     case TY_ARRAY: case TY_NULLABLE: case TY_SET: unmark_mentioned(t->elem, inR); return;
     case TY_MAP: unmark_mentioned(t->key, inR); unmark_mentioned(t->elem, inR); return;
     default: return;
@@ -354,7 +409,8 @@ static void try_loop(Stmt *L, int home) {
             if (!ext[k]) continue;
             for (int a = 0; a < nodes[k].nallocs; a++) {
                 Class *c = nodes[k].allocs[a];
-                for (int i = 0; i < nc; i++) if (rp->classes[i] == c) inR[i] = true;
+                if (!class_dups) { int i = class_index(c); if (i >= 0) inR[i] = true; }
+                else for (int i = 0; i < nc; i++) if (rp->classes[i] == c) inR[i] = true;
             }
         }
         for (int i = 0; i < nc; i++) {
@@ -501,6 +557,20 @@ static bool fn_valued(Func *f) {
     for (int i = 0; i < nvalued; i++) if (valued[i] == f) return true;
     return false;
 }
+/* the classes a cast's type mentions are casted (one pass over the type: asking every class whether the type
+   mentions it was O(classes^2) per cast, 46 minutes of a 1400-module program's build) */
+static void mark_casted(Type *t) {
+    if (!t) return;
+    switch (t->kind) {
+    case TY_OBJECT:
+        if (!class_dups) { int i = class_index(t->cls); if (i >= 0) casted[i] = true; return; }
+        for (int i = 0; i < rp->nclasses; i++) if (rp->classes[i] == t->cls) casted[i] = true;
+        return;
+    case TY_ARRAY: case TY_NULLABLE: case TY_SET: mark_casted(t->elem); return;
+    case TY_MAP: mark_casted(t->key); mark_casted(t->elem); return;
+    default: return;
+    }
+}
 static void cast_expr(Expr *e) {
     if (!e) return;
     if (e->kind == E_FUNC_REF && e->func && !fn_valued(e->func)) {
@@ -508,13 +578,8 @@ static void cast_expr(Expr *e) {
         valued[nvalued++] = e->func;
     }
     if (e->kind == E_AS && e->op != TK_NOT) { /* (x! is no cast: the same class, without null) */
-        Type *t = e->elem_type ? e->elem_type : e->type;
-        for (int i = 0; i < rp->nclasses; i++) {
-            bool one[rp->nclasses > 0 ? rp->nclasses : 1];
-            memset(one, 0, sizeof one);
-            one[i] = true;
-            if (mentions(t, one) || mentions(e->type, one)) casted[i] = true;
-        }
+        mark_casted(e->elem_type ? e->elem_type : e->type);
+        mark_casted(e->type);
     }
     if (e->kind == E_ARROW && e->arrow && e->arrow->fn) {
         Stmt *b = e->arrow->fn->body;
@@ -532,6 +597,7 @@ static void cast_stmt(Stmt *s) {
     for (int i = 0; i < s->ncases; i++) { cast_expr(s->cases[i].value); cast_stmt(s->cases[i].body); }
 }
 static bool class_casted(Class *c) {
+    if (!class_dups) { int i = class_index(c); return i >= 0 ? casted[i] : true; }
     for (int i = 0; i < rp->nclasses; i++) if (rp->classes[i] == c) return casted[i];
     return true;
 }
@@ -541,6 +607,14 @@ void region_compute(Program *p) {
     region_count = 0;
     if (getenv("XISTO_NO_REGIONS")) return;
     nnodes = 0;
+    pm_clear(&fn_nodes); pm_clear(&init_nodes); pm_clear(&virt_by_fn); pm_clear(&class_idx);
+    class_dups = false;
+    for (int i = 0; i < p->nclasses; i++) {
+        if (class_index(p->classes[i]) >= 0) class_dups = true;
+        else pm_put_first(&class_idx, p->classes[i], i);
+    }
+    for (int i = 0; i < nvirt_sets; i++) free(virt_sets[i].v);
+    nvirt_sets = 0;
     add_node(NULL, NULL); /* 0: the top level */
     for (int i = 0; i < p->nfuncs; i++) if (p->funcs[i]->body && !p->funcs[i]->is_native) add_node(p->funcs[i], NULL);
     for (int i = 0; i < p->nclasses; i++) {
