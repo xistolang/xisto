@@ -39,8 +39,31 @@ UTF-8 and cannot hold a lone surrogate.
 Setting `xs.length` cuts an array (`xs.length = 0` empties it), as in Node, but it never makes one longer: xisto
 arrays have no holes. Where the compiler knows the array's length (`const xs = [1, 2]` or
 `new Array(3).fill(0)`, with no other use of `xs` before the assignment, and the new length an integer literal or a
-`const` of one) a longer length is error XS6052; elsewhere it is a `RangeError` at run time. Both say what to write
+`const` of one) a longer length is error XS6052; elsewhere it is an error at run time. Both say what to write
 instead: `push(...)` to add elements, or `new Array(n).fill(value)` for an array of a given size.
+
+```text
+x.ts:2:11: error[XS6052]: setting the length of 'xs' to 5 makes it longer (its length is 3 here): xisto arrays do not grow by their length
+     2 | xs.length = 5;
+       |           ^
+  help: add the elements with push(...), or make the array at its size: new Array(n).fill(value)
+```
+
+At run time (`xs.length = n` in a function that got `xs` as a parameter):
+
+```text
+uncaught Error: RangeError: xisto cannot make an array longer by setting its length (from 3 to 5): add the elements with push(...), or make the array at its size with new Array(n).fill(value)
+```
+
+An array literal can mix values and arrays nested to different depths; it gets TypeScript's type, and `flat()`
+gives Node's result:
+
+```ts
+const rows = [1, [2, 3], 4];       // (number | number[])[], as TypeScript types it
+console.log(rows.flat());          // [ 1, 2, 3, 4 ]
+const tree = [[1], [2, [3]]];
+console.log(tree.flat(2));         // [ 1, 2, 3 ]
+```
 
 ## Object
 
