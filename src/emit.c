@@ -887,6 +887,15 @@ static bool stmt_has_try(Stmt *s) {
 
 static void emit_local_decl(Type *t, const char *name);
 
+/* s with '"' and '\\' escaped, for the inside of a C string literal (a class name may hold a string literal type:
+   the name of a tuple type [string | "A", int]) */
+static const char *cesc(const char *s) {
+    if (!strpbrk(s, "\"\\")) return s;
+    Buf b = {0};
+    for (; *s; s++) { if (*s == '"' || *s == '\\') buf_putc(&b, '\\'); buf_putc(&b, *s); }
+    return b.data;
+}
+
 /* ---------- types ---------- */
 
 static const char *ctype(Type *t) {
@@ -3201,7 +3210,7 @@ static void emit_dyn_tables(Program *p) {
                 nm++;
             }
         if (nm) buf_puts(&tabs, "};\n");
-        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s, %d, %d};\n", c->cname, xs_src_name(c->name), nf, nf ? xs_sprintf("%s_dynf", c->cname) : "NULL",
+        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s, %d, %s, %d, %d};\n", c->cname, cesc(xs_src_name(c->name)), nf, nf ? xs_sprintf("%s_dynf", c->cname) : "NULL",
                    nm, nm ? xs_sprintf("%s_dynm", c->cname) : "NULL", c->is_interface ? 1 : 0, !c->builtin && is_error_class(c) ? 1 : 0);
     }
     for (int i = 0; i < nlit_ords; i++) { /* an object literal's own key order (lit_order): its fields in that order */
@@ -3215,7 +3224,7 @@ static void emit_dyn_tables(Program *p) {
         buf_puts(&tabs, "};\n");
         int nm = 0;
         for (Class *k = c; k; k = k->base) nm += k->nmethods;
-        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s_dynf, %d, %s, %d, %d};\n", on, xs_src_name(c->name), nd, on,
+        buf_printf(&tabs, "static const xs_dyn_cls %s_dyn = {\"%s\", %d, %s_dynf, %d, %s, %d, %d};\n", on, cesc(xs_src_name(c->name)), nd, on,
                    nm, nm ? xs_sprintf("%s_dynm", c->cname) : "NULL", c->is_interface ? 1 : 0, is_error_class(c) ? 1 : 0);
     }
     if (fns.data) buf_puts(out, fns.data);
@@ -13732,13 +13741,13 @@ static void emit_class_print(Class *c, const char *fname, const int *ord, int no
         for (int i = 0; i < c->nfields; i++) { if (xs_hidden_field(c->fields[i].name)) continue; if (c->fields[i].optional) opt++; else always++; }
         const char *empty_s = plain ? "{}" : xs_sprintf("%s {}", xs_src_name(c->name));
         if (always || !opt) {
-            buf_printf(out, "xs_insp fr_; if (!xs_insp_begin(&fr_, p, \"%s\", %s)) return;", plain ? "Object" : xs_src_name(c->name),
+            buf_printf(out, "xs_insp fr_; if (!xs_insp_begin(&fr_, p, \"%s\", %s)) return;", plain ? "Object" : cesc(xs_src_name(c->name)),
                        always ? "NULL" : xs_sprintf("\"%s\"", empty_s));
         } else {
             Buf cond = {0};
             for (int i = 0; i < c->nfields; i++) buf_printf(&cond, "%s%s%s", i ? " || " : "", not_null(c->fields[i].type, xs_sprintf("self->%s", c->fields[i].cname)),
                                                             c->fields[i].optional && c->fields[i].opt_null ? xs_sprintf(" || self->xn_%s", c->fields[i].cname) : "");
-            buf_printf(out, "xs_insp fr_; if (!xs_insp_begin(&fr_, p, \"%s\", (%s) ? NULL : \"%s\")) return;", plain ? "Object" : xs_src_name(c->name), cond.data, empty_s);
+            buf_printf(out, "xs_insp fr_; if (!xs_insp_begin(&fr_, p, \"%s\", (%s) ? NULL : \"%s\")) return;", plain ? "Object" : cesc(xs_src_name(c->name)), cond.data, empty_s);
         }
     }
     for (int pass = 0; pass < 2; pass++) /* (symbol keys after the others, as Node lists them) */
@@ -13784,7 +13793,7 @@ static void emit_class_print(Class *c, const char *fname, const int *ord, int no
     }
     nl();
     if (c->is_tuple) buf_puts(out, "xs_insp_end(&fr_, \"[\", \"]\", true, false, false);");
-    else buf_printf(out, "xs_insp_end(&fr_, \"%s\", \"}\", false, false, false);", plain ? "{" : xs_sprintf("%s {", xs_src_name(c->name)));
+    else buf_printf(out, "xs_insp_end(&fr_, \"%s\", \"}\", false, false, false);", plain ? "{" : xs_sprintf("%s {", cesc(xs_src_name(c->name))));
     indent--;
     nl();
     buf_puts(out, "}\n");
